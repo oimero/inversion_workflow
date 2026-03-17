@@ -1,0 +1,37 @@
+site_name: WTIE API 文档
+site_description: WTIE 库内部 API 参考文档（中文）
+repo_name: libra_workflow_standardize
+
+theme:
+  name: material
+  language: zh
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths:
+            - src
+          options:
+            show_source: false
+            show_root_heading: true
+            show_root_toc_entry: true
+            show_signature_annotations: true
+            separate_signature: true
+            show_if_no_docstring: true
+            inherited_members: true
+            load_external_modules: false
+
+nav:
+  - 首页: index.md
+  - API 总览: api/index.md
+  - API:
+      - 建模 modeling: api/modeling.md
+      - 学习 learning: api/learning.md
+      - 处理 processing: api/processing.md
+      - 优化 optimize: api/optimize.md
+      - 工具 utils: api/utils.md
+  - 指南:
+      - 导入路径: guide/import-paths.md
+      - 常见问题: guide/troubleshooting.md

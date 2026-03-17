@@ -1,6 +1,6 @@
-site_name: WTIE API 文档
-site_description: WTIE 库内部 API 参考文档（中文）
-repo_name: libra_workflow_standardize
+site_name: API 文档
+site_description: API 参考文档
+repo_name: inversion_workflow
 
 theme:
   name: material
@@ -27,11 +27,13 @@ nav:
   - 首页: index.md
   - API 总览: api/index.md
   - API:
-      - 建模 modeling: api/modeling.md
-      - 学习 learning: api/learning.md
-      - 处理 processing: api/processing.md
-      - 优化 optimize: api/optimize.md
-      - 工具 utils: api/utils.md
+    - wtie:
+      - 命名空间总览: api/wtie/index.md
+      - wtie.modeling: api/wtie/modeling.md
+      - wtie.learning: api/wtie/learning.md
+      - wtie.processing: api/wtie/processing.md
+      - wtie.optimize: api/wtie/optimize.md
+      - wtie.utils: api/wtie/utils.md
   - 指南:
       - 导入路径: guide/import-paths.md
       - 常见问题: guide/troubleshooting.md

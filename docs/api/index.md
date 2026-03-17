@@ -1,10 +1,10 @@
 # API 总览
 
-第一版按子包组织 API 页面，优先保证可查可搜。
+文档按命名空间组织，优先保证后续可扩展性。
 
 ## 顶层公开入口
 
-WTIE 顶层入口定义在 wtie 包初始化文件中，首批重点关注以下对象：
+`wtie` 顶层入口定义在包初始化文件中，首批重点关注以下对象：
 
 - wtie.modeling
 - wtie.learning
@@ -15,8 +15,11 @@ WTIE 顶层入口定义在 wtie 包初始化文件中，首批重点关注以下
 
 ## 子包导航
 
-- 建模 modeling
-- 学习 learning
-- 处理 processing
-- 优化 optimize
-- 工具 utils
+- `api/wtie/` 下是当前首个命名空间
+- 新增包时，建议按 `api/<package_name>/` 平行扩展
+- 当前子模块页：
+	- `wtie.modeling`
+	- `wtie.learning`
+	- `wtie.processing`
+	- `wtie.optimize`
+	- `wtie.utils`

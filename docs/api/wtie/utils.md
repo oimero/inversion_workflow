@@ -1,7 +1,5 @@
 # wtie.utils
 
-::: wtie.dataset
-
 ::: wtie.utils.data
 
 ::: wtie.utils.logger

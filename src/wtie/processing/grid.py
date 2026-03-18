@@ -1,3 +1,30 @@
+"""wtie.processing.grid: 井震对齐基础网格与轨迹数据结构。
+
+本模块提供 1D 轨迹、叠前道集、测井集合、时深关系表与井轨迹对象，
+以及常用的重采样、滤波和坐标域转换工具函数。
+
+边界说明
+--------
+- 本模块不负责反演优化策略、训练流程或可视化渲染细节。
+- 本模块仅处理数据组织与基础数值变换，输入质量控制需在上游完成。
+
+核心公开对象
+------------
+1. BaseTrace / BasePrestackTrace: 统一轨迹与叠前道集抽象。
+2. LogSet: 同井同采样基准测井集合。
+3. TimeDepthTable: TWT-深度关系（支持 TVDSS 或 MD 域）。
+4. WellPath: 井斜轨迹（MD 与 TVDSS 对应）。
+5. convert_log_from_md_to_twt: MD 测井转换到 TWT 的入口函数。
+
+Examples
+--------
+>>> import numpy as np
+>>> from wtie.processing.grid import Log, TimeDepthTable
+>>> vp = Log(np.array([2000., 2100., 2200.]), np.array([0., 10., 20.]), "md")
+>>> td = TimeDepthTable(twt=np.array([0.0, 0.01, 0.02]), md=np.array([0., 10., 20.]))
+>>> vp_twt = vp if vp.is_twt else vp
+"""
+
 import warnings
 from collections import namedtuple
 
@@ -42,6 +69,21 @@ def _inverted_name(name):
 # CLASSES
 ##############################
 class BaseObject:
+    """带有统一坐标基准标识的基础对象。
+
+    Parameters
+    ----------
+    basis_type : str
+        坐标基准类型键，取值需来自 EXISTING_BASIS_TYPES。
+
+    Attributes
+    ----------
+    basis_type : str
+        基准显示名，如 TWT [s]、MD (kb) [m]。
+    is_twt, is_md, is_tvdss, is_tvdmsl, is_tvdkb, is_tlag, is_zlag : bool
+        当前对象是否属于对应坐标域。
+    """
+
     def __init__(self, basis_type):
         self.basis_type = _NAMES_DICT[basis_type]
 
@@ -56,10 +98,29 @@ class BaseObject:
 
 
 class BaseTrace(BaseObject):
-    """1D trace together with the sampling coordinates.
-    Unit of basis is expected to be the default SI (i.e. meters or seconds).
+    """一维轨迹对象，封装振幅序列及其采样坐标。
 
-    Do NOT instanciate directly this object. Use instead the children classes.
+    该类约定基础 shape 为 (n_samples,)，基准坐标需等采样。
+    通常通过子类 Log、Seismic、Wavelet、XCorr 使用，不建议直接实例化。
+
+    Attributes
+    ----------
+    values : np.ndarray
+        振幅值数组，shape 为 (n_samples,)。
+    basis : np.ndarray
+        采样坐标数组，shape 为 (n_samples,)。单位由 basis_type 决定。
+    basis_type : str
+        基准名称，例如 TWT [s]、MD (kb) [m]。
+    sampling_rate : float
+        采样间隔 dt（s 或 m）。
+    size : int
+        采样点数 n。
+    shape : tuple
+        轨迹 shape，固定为 (n_samples,)。
+    duration : float
+        坐标跨度，等于 basis[-1] - basis[0]。
+    name : str or None
+        轨迹名称。
     """
 
     def __init__(
@@ -71,31 +132,35 @@ class BaseTrace(BaseObject):
         unit: str = None,
         allow_nan: bool = True,
     ):
-        """
+        """初始化一维轨迹。
+
         Parameters
         ----------
         values : np.ndarray
-            Amplitude values of the trace.
+            轨迹振幅值，shape 为 (n_samples,)。
         basis : np.ndarray
-            Amplitude values of the basis.
+            采样坐标值，shape 为 (n_samples,)。
         basis_type : str
-            Type of the basis (e.g. two-way-time). Allowed typed are listed in the variable
-            `grid.EXISTING_BASIS_TYPES`. Units must be the same as specified.
+            基准类型键，例如 "twt"、"md"、"tvdss"。
+            允许值见 EXISTING_BASIS_TYPES，单位需与类型约定一致。
         name : str, optional
-            Name of the object.
+            轨迹名称。
         unit : str, optional
-            Unit of the amplitude values (e.g m/s for a Vp log).
+            振幅物理单位，如 m/s、g/cc。
         allow_nan : bool, optional
-            If set to false, will raise a ValueError in case of missing values
-            in the trace.
+            是否允许 NaN。False 时若检测到 NaN 将触发断言。
 
-        Example
-        -------
-        seismic_values = np.random.normal(size=(101,))
-        seismic_basis = 1.2 + np.arange(101)*0.004 # in seconds
-        basis_type = 'twt' # two-way-time
+        Raises
+        ------
+        AssertionError
+            当 values 或 basis 不是一维、长度不一致、采样不等间隔，
+            或 allow_nan=False 且 values 含 NaN 时触发。
 
-        my_obj = BaseTrace(seismic_values, seismic_basis, basis_type, name='my obj')
+        Examples
+        --------
+        >>> values = np.random.normal(size=(101,))
+        >>> basis = 1.2 + np.arange(101) * 0.004
+        >>> tr = BaseTrace(values, basis, "twt", name="demo")
 
         """
         super().__init__(basis_type)
@@ -126,6 +191,25 @@ class BaseTrace(BaseObject):
         self.duration = self.basis[-1] - self.basis[0]
 
     def time_slice(self, tmin: float, tmax: float) -> "BaseTrace":
+        """按坐标区间截取轨迹。
+
+        Parameters
+        ----------
+        tmin : float
+            截取起点（含邻近采样点）。
+        tmax : float
+            截取终点（含邻近采样点）。
+
+        Returns
+        -------
+        BaseTrace
+            与原对象同类型的新轨迹，shape 为 (n_samples_slice,)。
+
+        Raises
+        ------
+        AssertionError
+            当 tmin 或 tmax 超出当前 basis 可容忍边界时触发。
+        """
         assert tmin >= self.basis[0] - self.sampling_rate / 2
         assert tmax <= self.basis[-1] + self.sampling_rate / 2
         idx_min = np.argmin(np.abs(self.basis - tmin))
@@ -143,10 +227,12 @@ class BaseTrace(BaseObject):
 
     @property
     def values(self) -> np.ndarray:
+        """轨迹振幅值数组，shape 为 (n_samples,)。"""
         return self.series.values
 
     @property
     def basis(self) -> np.ndarray:
+        """轨迹采样坐标数组，shape 为 (n_samples,)。"""
         return self.series.index.values
 
     @basis.setter
@@ -158,6 +244,7 @@ class BaseTrace(BaseObject):
 
     @property
     def name(self):
+        """轨迹名称。"""
         return self._name
 
     @name.setter
@@ -193,11 +280,20 @@ class BaseTrace(BaseObject):
 
 
 class Log(BaseTrace):
+    """测井曲线轨迹对象。"""
+
     def __init__(self, values, basis, basis_type, **kwargs):
         super().__init__(values, basis, basis_type, **kwargs)
 
 
 class Reflectivity(BaseTrace):
+    """反射系数轨迹。
+
+    Notes
+    -----
+    构造时 basis_type 参数仅用于接口兼容，内部固定按 TWT 域处理。
+    """
+
     def __init__(self, values, basis, basis_type=None, theta: int = 0, **kwargs):
         # basis_type not used as always assumed twt, there for api compat
         super().__init__(values, basis, "twt", **kwargs)
@@ -207,6 +303,8 @@ class Reflectivity(BaseTrace):
 
 
 class Seismic(BaseTrace):
+    """地震道轨迹对象，可携带单角度信息。"""
+
     def __init__(self, values, basis, basis_type, theta: int = 0, **kwargs):
         super().__init__(values, basis, basis_type, **kwargs)
 
@@ -221,6 +319,8 @@ WaveletUncertainties = namedtuple("WaveletUncertainties", ("ff", "ampl_mean", "a
 
 
 class Wavelet(BaseTrace):
+    """子波轨迹对象，可携带频谱不确定性描述。"""
+
     def __init__(
         self, values, basis, basis_type=None, theta: int = 0, uncertainties: WaveletUncertainties = None, **kwargs
     ):
@@ -234,6 +334,7 @@ class Wavelet(BaseTrace):
 
     @property
     def uncertainties(self):
+        """子波频域不确定性，类型为 WaveletUncertainties 或 None。"""
         return self.uncertainties_
 
     @uncertainties.setter
@@ -242,23 +343,34 @@ class Wavelet(BaseTrace):
 
 
 class DynamicLag(BaseTrace):
+    """动态时差或深差轨迹。"""
+
     def __init__(self, values, basis, basis_type, **kwargs):
         # basis_type not used as always assumed twt, there for api compat
         super().__init__(values, basis, basis_type, **kwargs)
 
 
 class XCorr(BaseTrace):
+    """归一化互相关曲线。
+
+    Notes
+    -----
+    仅支持 lag 域基准：时间时差 tlag 或深度时差 zlag。
+    """
+
     def __init__(self, values, basis, basis_type, **kwargs):
         assert (basis_type == _inverted_name(TIMELAG_NAME)) or (basis_type == _inverted_name(ZLAG_NAME))
         super().__init__(values, basis, basis_type, **kwargs)
 
     @property
     def lag(self) -> float:
+        """最大相关系数对应的时差/深差（单位由 basis 决定）。"""
         lag_idx = np.argmax(self.values)
         return self.basis[lag_idx]
 
     @property
     def R(self) -> float:
+        """互相关最大值，通常为无量纲量。"""
         # _max = self.values.max()
         # _min = self.values.min()
         # return _max if (abs(_max) >= abs(_min)) else _min
@@ -266,10 +378,25 @@ class XCorr(BaseTrace):
 
     @property
     def Rc(self) -> float:
+        """零时差（中心采样点）相关值，通常为无量纲量。"""
         return self.values[self.size // 2]
 
 
 class DynamicXCorr(BaseObject):
+    """动态互相关矩阵及其坐标描述。
+
+    Attributes
+    ----------
+    values : np.ndarray
+        动态互相关矩阵，shape 为 (n_traces, n_samples)。
+    basis : np.ndarray
+        第一维对应的主坐标。
+    lags_basis : np.ndarray
+        第二维 lag 轴坐标。
+    lag_type : str
+        lag 坐标名称，TWT 域对应 Lag [s]，深度域对应 Lag [m]。
+    """
+
     def __init__(self, dxcorr, basis, basis_type, name=None):
         super().__init__(basis_type)
         self.name = name
@@ -292,16 +419,40 @@ class DynamicXCorr(BaseObject):
 
 
 class BasePrestackTrace:
-    """Collection of `Trace` objects at different angles. For simplicity
-    only single azimuth angle gathers are considered."""
+    """叠前道集对象，按入射角组织多个一维轨迹。
+
+    约定仅处理单方位角道集，二维数组 shape 为 (n_traces, n_samples)。
+
+    Attributes
+    ----------
+    traces : tuple[BaseTrace]
+        按角度排序的轨迹集合。
+    angles : np.ndarray
+        角度序列（度），等间隔递增。
+    delta_theta : int
+        角度采样间隔。
+    angle_range : tuple[int, int, int]
+        (起始角, 结束角, 角度间隔)。
+    values : np.ndarray
+        道集振幅矩阵，shape 为 (n_traces, n_samples)。
+    basis : np.ndarray
+        共享采样坐标，shape 为 (n_samples,)。
+    """
 
     def __init__(self, traces: Tuple[BaseTrace], name: str = None):
-        """
+        """初始化叠前道集。
+
         Parameters
         ----------
         traces : Tuple[BaseTrace]
-            Tuple of `BaseTrace` objects. Each trace must have a unique angle
-            stored in the variable trace.theta.
+            轨迹元组。每条轨迹必须提供唯一的 theta 值，并共享同一 basis。
+        name : str, optional
+            道集名称。
+
+        Raises
+        ------
+        AssertionError
+            当 basis 不一致、角度非等间隔或非递增时触发。
         """
         self.name = name
 
@@ -337,8 +488,23 @@ class BasePrestackTrace:
         self.num_traces = len(traces)
 
     def __getitem__(self, theta: int) -> BaseTrace:
-        """Select trace based on angle value in degrees.
-        Use self.traces to select based on index."""
+        """按角度值选择单条轨迹。
+
+        Parameters
+        ----------
+        theta : int
+            角度值（度）。
+
+        Returns
+        -------
+        BaseTrace
+            对应角度轨迹。
+
+        Raises
+        ------
+        AssertionError
+            当 theta 不在当前道集角度序列中时触发。
+        """
         assert theta in self.angles, f"Angle {theta}° not in gather."
         idx = np.where(self.angles == theta)[0].item()
         return self.traces[idx]
@@ -355,6 +521,7 @@ class BasePrestackTrace:
 
     @property
     def values(self) -> np.ndarray:
+        """道集振幅矩阵，shape 为 (n_traces, n_samples)。"""
         # (angles, samples)
         values = np.empty(self.shape, dtype=float)
 
@@ -387,6 +554,7 @@ class BasePrestackTrace:
     def decimate_angles(
         trace: "BasePrestackTrace", start_angle: int, end_angle: int, delta_angle: int
     ) -> "BasePrestackTrace":
+        """按角度步长抽取子道集。"""
         assert start_angle in trace.angles
         assert end_angle in trace.angles
         assert delta_angle >= trace.delta_theta
@@ -398,8 +566,22 @@ class BasePrestackTrace:
 
     @staticmethod
     def partial_stacking(ps_trace: "BasePrestackTrace", n: int) -> "BasePrestackTrace":
-        """Creates new traces by stacking with the `n` neighbours to the left
-        and `n` to the right."""
+        """执行局部角度叠加。
+
+        对每个角度道，将其左右各 n 条邻道与自身做平均，输出同角度数的新道集。
+
+        Parameters
+        ----------
+        ps_trace : BasePrestackTrace
+            输入叠前道集。
+        n : int
+            左右邻道数，必须满足 1 <= n < 角度道数。
+
+        Returns
+        -------
+        BasePrestackTrace
+            叠加后的叠前道集，shape 保持为 (n_traces, n_samples)。
+        """
         assert n >= 1
         assert n < ps_trace.angles.size
         num_angles = ps_trace.shape[0]
@@ -438,21 +620,29 @@ class BasePrestackTrace:
 
 
 class PreStackReflectivity(BasePrestackTrace):
+    """叠前反射系数道集。"""
+
     def __init__(self, reflectivities: Tuple[Reflectivity], name: str = "P-P reflectivity"):
         super().__init__(reflectivities, name=name)
 
 
 class PreStackSeismic(BasePrestackTrace):
+    """叠前地震道集。"""
+
     def __init__(self, seismics: Tuple[Seismic], name: str = "Angle gather"):
         super().__init__(seismics, name=name)
 
 
 class PreStackWavelet(BasePrestackTrace):
+    """叠前子波道集。"""
+
     def __init__(self, wavelets: Tuple[Wavelet], name: str = "Prestack wavelet"):
         super().__init__(wavelets, name=name)
 
 
 class PreStackXCorr(BasePrestackTrace):
+    """叠前互相关道集。"""
+
     def __init__(self, traces: Tuple[XCorr], name: str = "Prestack normalized x-correlation"):
         super().__init__(traces, name=name)
         self.is_tlag = traces[0].is_tlag
@@ -460,15 +650,18 @@ class PreStackXCorr(BasePrestackTrace):
 
     @property
     def lag(self) -> np.ndarray:
+        """每个角度道的最大相关 lag，shape 为 (n_traces,)。"""
         lag_indices = np.argmax(self.values, axis=-1)
         return np.array([self.basis[idx] for idx in lag_indices])
 
     @property
     def R(self) -> np.ndarray:
+        """每个角度道的最大相关幅值，shape 为 (n_traces,)。"""
         return np.abs(self.values).max(axis=-1)
 
     @property
     def Rc(self) -> np.ndarray:
+        """每个角度道中心 lag 处相关值，shape 为 (n_traces,)。"""
         return self.values[:, self.trace_size // 2]
 
 
@@ -482,10 +675,21 @@ trace_t = Union[BaseTrace, BasePrestackTrace]
 
 # @dataclass
 class LogSet:
-    """Class to store together `Log` objects that belong to the same well
-    and have the same basis. For simplicity enforce the use of the 3 follwoing
-    keys: 'Vp', 'Rho' and 'Vs'. Logs stored under those keys will be the ones
-    used in the well tie process.
+    """同井同基准测井集合。
+
+    该对象以字典方式管理多条 Log，要求至少包含 Vp 与 Rho，
+    并保证所有曲线共用同一采样基准。Vs 在叠前流程中通常必需。
+
+    Attributes
+    ----------
+    Vp, Rho, Vs : Log or None
+        核心测井对象。
+    vp, rho, vs : np.ndarray or None
+        对应振幅数组，shape 为 (n_samples,)。
+    basis : np.ndarray
+        共享采样坐标。
+    sampling_rate : float
+        采样间隔 dt。
     """
 
     # The follwoing key convention must be followed
@@ -493,14 +697,18 @@ class LogSet:
     optional_keys = ["Vs", "GR", "Cali"]  # , no in use so far
 
     def __init__(self, logs: Dict[str, Log]):
-        """
+        """初始化测井集合。
+
         Parameters
         ----------
         logs : Dict[str, Log]
-            Dictionary, the key represents the log type and the item the
-            corresponding `Log` object. The disct must at leat contain the
-            keys listed in the member vairable `mandatory_keys`. In additon,
-            the key 'Vs' is required for prestack well-tie.
+            键为测井类型名（如 Vp、Rho、Vs），值为对应 Log 对象。
+            必须至少包含 mandatory_keys 中定义的键。
+
+        Raises
+        ------
+        AssertionError
+            缺少必需键，或任意 Log 的 basis 与基准类型不一致时触发。
         """
         # logs dict must at least contain the keys 'Vp' and 'Rho'
         for key in LogSet.mandatory_keys:
@@ -564,18 +772,18 @@ class LogSet:
 
     @property
     def AI(self) -> Log:
-        """Acoustic impedence"""
+        """声阻抗曲线（AI = Vp * Rho）。"""
         ai = self.vp * self.rho
         return Log(ai, self.basis, _inverted_name(self.basis_type), name="AI")
 
     @property
     def ai(self) -> np.ndarray:
-        """Acoustic impedence"""
+        """声阻抗数组，shape 为 (n_samples,)。"""
         return self.AI.values
 
     @property
     def Vp_Vs_ratio(self):
-        """P ratio"""
+        """Vp/Vs 比值曲线。"""
         assert self.vs is not None, "You did not provide a Vs log."
         assert (self.vs > 1e-8).all(), "There are null/negative values in the Vs log."
         ratio = self.vp / self.vs
@@ -583,6 +791,7 @@ class LogSet:
 
     @property
     def vp_vs_ratio(self):
+        """Vp/Vs 比值数组，shape 为 (n_samples,)。"""
         return self.Vp_Vs_ratio.values
 
     def __str__(self):
@@ -594,19 +803,40 @@ class LogSet:
 
 
 class TimeDepthTable:
-    """Time Depth Table. Supports TVDSS [m] vs TWT [s] or MD [m] vs TWT [s]."""
+    """时深关系表，支持 TWT-TVDSS 或 TWT-MD 两种域。
+
+    该类用于保存并插值两程时与深度映射，不负责 checkshot 质量控制。
+
+    Attributes
+    ----------
+    twt : np.ndarray
+        两程时序列，单位 s，shape 为 (n_samples,)。
+    depth : np.ndarray
+        当前域深度序列（TVDSS 或 MD），单位 m，shape 为 (n_samples,)。
+    is_md_domain : bool
+        是否为 MD 域。
+    size : int
+        采样点数 n。
+    """
 
     def __init__(self, twt: _sequence_t, tvdss: _sequence_t = None, md: _sequence_t = None):
-        """
+        """初始化时深关系。
+
         Parameters
         ----------
         twt : _sequence_t
-            Two-way travel-time [s]
+            两程时序列，单位 s。
         tvdss : _sequence_t, optional
-            True vertical depth w.r.t sea surface (mean sea level)
-            (corrected for well trajectory) [m]
+            真垂深（海平面基准）序列，单位 m。
         md : _sequence_t, optional
-            Measured depth [m]
+            井深 MD 序列，单位 m。
+
+        Raises
+        ------
+        ValueError
+            同时未提供 tvdss 与 md，或二者同时提供时触发。
+        AssertionError
+            当 twt 非严格递增，或深度非非降序时触发。
         """
         dtype = float
 
@@ -635,28 +865,32 @@ class TimeDepthTable:
 
     @property
     def twt(self) -> np.ndarray:
+        """两程时数组，单位 s，shape 为 (n_samples,)。"""
         return self.table.loc[:, TWT_NAME].values
 
     @property
     def tvdss(self) -> np.ndarray:
+        """TVDSS 深度数组，单位 m，shape 为 (n_samples,)。"""
         if self._is_md_domain:
             raise ValueError("This TimeDepthTable is in MD domain. Use '.md' property instead.")
         return self.table.loc[:, TVDSS_NAME].values
 
     @property
     def md(self) -> np.ndarray:
+        """MD 深度数组，单位 m，shape 为 (n_samples,)。"""
         if not self._is_md_domain:
             raise ValueError("This TimeDepthTable is in TVDSS domain. Use '.tvdss' property instead.")
         return self.table.loc[:, MD_NAME].values
 
     @property
     def depth(self) -> np.ndarray:
-        """Generic depth accessor. Returns either TVDSS or MD depending on mode."""
+        """通用深度访问器，返回当前域深度数组（TVDSS 或 MD）。"""
         # The depth column is always the second column (index 1)
         return self.table.iloc[:, 1].values
 
     @property
     def is_md_domain(self) -> bool:
+        """是否使用 MD 域（True 表示 depth 对应 MD）。"""
         return self._is_md_domain
 
     @property
@@ -667,17 +901,34 @@ class TimeDepthTable:
         return self.size
 
     def slope_velocity_twt(self, dt: float = 0.004) -> Log:
-        """Before computing the velocity, the table must be interpolated to
-        a regular sampling.
+        """在 TWT 等采样网格上计算区间速度。
+
+        Parameters
+        ----------
+        dt : float, default=0.004
+            时间采样间隔 dt，单位 s。
+
+        Returns
+        -------
+        Log
+            区间速度曲线，单位 m/s，basis 为 twt[1:]，shape 为 (n_samples-1,)。
         """
         table = self.temporal_interpolation(dt)
         slope = self._compute_slope_from_table(table)
         return Log(slope, table.twt[1:], "twt", name="Slope velocity")
 
     def slope_velocity_depth(self, dz: float = 5) -> Log:
-        """Generic slope velocity calculation for any depth domain.
-        Before computing the velocity, the table must be interpolated to
-        a regular sampling.
+        """在深度等采样网格上计算区间速度。
+
+        Parameters
+        ----------
+        dz : float, default=5
+            深度采样间隔 dz，单位 m。
+
+        Returns
+        -------
+        Log
+            区间速度曲线，单位 m/s；若当前域为 MD 则 basis_type 为 md，否则为 tvdss。
         """
         table = self.depth_interpolation(dz)
         slope = self._compute_slope_from_table(table)
@@ -685,7 +936,12 @@ class TimeDepthTable:
         return Log(slope, table.depth[1:], domain_name, name="Slope velocity")
 
     def slope_velocity_tvdss(self, dz: float = 5) -> Log:
-        """Backward compatibility wrapper. Use slope_velocity_depth() instead."""
+        """兼容接口：调用 slope_velocity_depth。
+
+        Notes
+        -----
+        当对象处于 MD 域时会发出警告，但仍返回 depth 域区间速度。
+        """
         if self._is_md_domain:
             warnings.warn("Table is in MD domain. Consider using slope_velocity_depth() instead.")
         return self.slope_velocity_depth(dz)
@@ -709,17 +965,19 @@ class TimeDepthTable:
         return TimeDepthTable(table.twt + t, tvdss=table.tvdss)
 
     def temporal_interpolation(self, dt: float, mode: str = "linear") -> "TimeDepthTable":
-        """Interpolate TD curves to desired time sampling.
+        """按给定时间采样间隔插值时深关系。
+
         Parameters
         ----------
         dt : float
-            constant time sampling in seconds.
-        mode : intepolation mode
-            see scipy doc of scipy.interpolate.interp1d
-            ('linear', 'nearest', ...)
+            目标时间采样间隔 dt，单位 s。
+        mode : str, default="linear"
+            插值模式，透传至 scipy.interpolate.interp1d。
+
         Returns
-        ----------
-        A new instance of `TimeDepthTable`.
+        -------
+        TimeDepthTable
+            新的时深表，twt 为等采样。
         """
         current_twt = self.twt
         current_depth = self.depth
@@ -737,17 +995,19 @@ class TimeDepthTable:
         return TimeDepthTable(new_twt, tvdss=new_depth)
 
     def depth_interpolation(self, dz: float, mode: str = "linear") -> "TimeDepthTable":
-        """Interpolate TD curves to desired depth sampling.
+        """按给定深度采样间隔插值时深关系。
+
         Parameters
         ----------
         dz : float
-            constant depth sampling in meters.
-        mode : intepolation mode
-            see scipy doc of scipy.interpolate.interp1d
-            ('linear', 'nearest', ...)
+            目标深度采样间隔 dz，单位 m。
+        mode : str, default="linear"
+            插值模式，透传至 scipy.interpolate.interp1d。
+
         Returns
-        ----------
-        A new instance of `TimeDepthTable`.
+        -------
+        TimeDepthTable
+            新的时深表，depth 为等采样。
         """
         current_twt = self.twt
         current_depth = self.depth
@@ -811,8 +1071,23 @@ class TimeDepthTable:
 
     @staticmethod
     def get_twt_start_from_checkshots(Vp: Log, wp: "WellPath", checkshots: "TimeDepthTable", return_error: bool = True):
-        """If checkshot table is available, one can compute the
-        t_start for the alternative table obtained by integrating the sonic log.
+        """由 checkshot 估计声波积分曲线的起始 TWT。
+
+        Parameters
+        ----------
+        Vp : Log
+            速度曲线，要求 MD 域。
+        wp : WellPath
+            井轨迹，用于 MD 到 TVDSS 转换。
+        checkshots : TimeDepthTable
+            参考时深关系。
+        return_error : bool, default=True
+            True 时返回 (t_start, z_error)，否则仅返回 t_start。
+
+        Returns
+        -------
+        float or tuple[float, float]
+            起始时间 t_start（s），以及首样点深度匹配误差 z_error（m，可选）。
         """
 
         # md to tvdss
@@ -834,8 +1109,21 @@ class TimeDepthTable:
 
     @staticmethod
     def get_tvdss_start_from_checkshots(Vp: Log, checkshots: "TimeDepthTable", return_error: bool = True):
-        """If checkshot table is available, one can compute the
-        tvdss_start for the alternative table obtained by integrating the sonic log.
+        """由 checkshot 估计声波积分曲线的起始 TVDSS。
+
+        Parameters
+        ----------
+        Vp : Log
+            速度曲线，要求 TWT 域。
+        checkshots : TimeDepthTable
+            参考时深关系。
+        return_error : bool, default=True
+            True 时返回 (tvdss_start, t_error)，否则仅返回 tvdss_start。
+
+        Returns
+        -------
+        float or tuple[float, float]
+            起始深度 tvdss_start（m），以及首样点时间匹配误差 t_error（s，可选）。
         """
 
         # md to tvdss
@@ -856,19 +1144,36 @@ class TimeDepthTable:
 
 
 class WellPath:
-    """Well trajectory information. To link Measured Depth to True Vertical Depth."""
+    """井轨迹对象，用于建立 MD 与 TVDSS 的对应关系。
+
+    Attributes
+    ----------
+    md : np.ndarray
+        井深序列，单位 m，shape 为 (n_samples,)。
+    tvdss : np.ndarray
+        真垂深序列，单位 m，shape 为 (n_samples,)。
+    tvdkb : np.ndarray
+        井口基准真垂深序列，单位 m，shape 为 (n_samples,)。
+    kb : float or None
+        Kelly Bushing 高程，单位 m。
+    """
 
     def __init__(self, md: _sequence_t, tvdss: _sequence_t = None, kb: float = None):
-        """
+        """初始化井轨迹。
+
         Parameters
         ----------
         md : np.ndarray
-            Measured depth sequence in meters.
+            井深序列，单位 m。首元素需接近 0。
         tvdss : np.ndarray , optional
-            True vertical depth sequence in meters. Measured from sea surface /
-            mean sea level. If not provided, well is assumed vertical.
+            真垂深序列，单位 m。未提供时按垂直井处理（tvdss=md）。
         kb : float, optional
-            KellyBushing height in meters.
+            Kelly Bushing 高程，单位 m。
+
+        Raises
+        ------
+        AssertionError
+            当 md 非严格递增，或起点不接近 0 时触发。
         """
 
         dtype = float
@@ -903,6 +1208,7 @@ class WellPath:
 
     @property
     def size(self):
+        """轨迹采样点数 n。"""
         return self.md.size
 
     def __len__(self):
@@ -910,19 +1216,35 @@ class WellPath:
 
     @property
     def tvdss(self) -> np.ndarray:
+        """TVDSS 序列，单位 m，shape 为 (n_samples,)。"""
         return self.table.loc[:, TVDSS_NAME].values
 
     @property
     def tvdkb(self) -> np.ndarray:
+        """TVDKB 序列，单位 m，等于 tvdss + kb。"""
         return self.tvdss + self.kb
 
     @property
     def md(self) -> np.ndarray:
+        """MD 序列，单位 m，shape 为 (n_samples,)。"""
         return self.table.loc[:, MD_NAME].values
 
     @staticmethod
     def get_tvdkb_from_inclination(md: _sequence_t, inclination: _sequence_t) -> np.ndarray:
-        """Inclination/deviation in degrees. Measured from the vertical."""
+        """由井斜角计算 TVDKB 轨迹。
+
+        Parameters
+        ----------
+        md : _sequence_t
+            井深序列，单位 m，长度为 n，且首值需为 0。
+        inclination : _sequence_t
+            井斜角序列（相对竖直方向），单位度，长度为 n-1。
+
+        Returns
+        -------
+        np.ndarray
+            TVDKB 序列，单位 m，shape 为 (n_samples,)。
+        """
         assert md[0] == 0.0, "Deviation survey should start at 0 meters [MD]"
         assert len(inclination) == len(md) - 1
         md = np.array(md, dtype=float)
@@ -937,19 +1259,56 @@ class WellPath:
 
     @staticmethod
     def tvdss_to_tvdkb(tvdss: np.ndarray, kb: float) -> np.ndarray:
-        """Shift reference datum with Kelly Bushing.
-        Must be specified in meters [m]."""
+        """将 TVDSS 转换为 TVDKB。
+
+        Parameters
+        ----------
+        tvdss : np.ndarray
+            TVDSS 序列，单位 m。
+        kb : float
+            Kelly Bushing 高程，单位 m。
+
+        Returns
+        -------
+        np.ndarray
+            TVDKB 序列，单位 m。
+        """
         return tvdss + kb
 
     @staticmethod
     def tvdkb_to_tvdss(tvdkb: np.ndarray, kb: float) -> np.ndarray:
-        """Shift reference datum with Kelly Bushing.
-        Must be specified in meters [m]."""
+        """将 TVDKB 转换为 TVDSS。
+
+        Parameters
+        ----------
+        tvdkb : np.ndarray
+            TVDKB 序列，单位 m。
+        kb : float
+            Kelly Bushing 高程，单位 m。
+
+        Returns
+        -------
+        np.ndarray
+            TVDSS 序列，单位 m。
+        """
 
         return tvdkb - kb
 
     def md_interpolation(self, dz: float, mode: str = "linear"):
-        """Interpolate trajectory at new constant measured depth sampling."""
+        """在 MD 轴上对井轨迹重采样。
+
+        Parameters
+        ----------
+        dz : float
+            目标井深采样间隔，单位 m。
+        mode : str, default="linear"
+            插值模式，透传至 scipy.interpolate.interp1d。
+
+        Returns
+        -------
+        WellPath
+            重采样后的井轨迹对象。
+        """
         # new md
         md_start = self.md[0]
         md_end = self.md[-1]
@@ -968,6 +1327,20 @@ class WellPath:
 # FUNCTIONS
 ##############################
 def update_trace_values(new_values: np.ndarray, original_trace: BaseTrace) -> BaseTrace:
+    """用新振幅数组更新轨迹并保留原坐标与元信息。
+
+    Parameters
+    ----------
+    new_values : np.ndarray
+        新振幅数组，期望 shape 与 original_trace.values 一致。
+    original_trace : BaseTrace
+        参考轨迹。
+
+    Returns
+    -------
+    BaseTrace
+        与 original_trace 同类型的新对象。
+    """
     return type(original_trace)(
         new_values, original_trace.basis, _inverted_name(original_trace.basis_type), name=original_trace.name
     )
@@ -976,6 +1349,25 @@ def update_trace_values(new_values: np.ndarray, original_trace: BaseTrace) -> Ba
 def get_matching_traces(
     trace1: Union[BaseTrace, BasePrestackTrace], trace2: Union[BaseTrace, BasePrestackTrace]
 ) -> Union[Tuple[BaseTrace], Tuple[BasePrestackTrace]]:
+    """对齐两条轨迹或两组叠前道集的公共坐标区间。
+
+    Parameters
+    ----------
+    trace1, trace2 : BaseTrace or BasePrestackTrace
+        待对齐对象。二者必须同基准类型、同采样间隔；若为叠前对象，角度序列需一致。
+
+    Returns
+    -------
+    tuple
+        对齐后的 (trace1_match, trace2_match)。
+
+    Raises
+    ------
+    AssertionError
+        当基准类型、采样间隔、叠前角度或对齐后长度不满足要求时触发。
+    NotImplementedError
+        输入类型组合不受支持时触发。
+    """
     # assert same basis
     assert trace1.basis_type == trace2.basis_type
     assert np.allclose(trace1.sampling_rate, trace2.sampling_rate, rtol=1e-4)
@@ -1054,6 +1446,7 @@ def get_matching_traces(
 
 
 def _lowpass_filter_trace(trace: BaseTrace, highcut: float, order: int = 5) -> BaseTrace:
+    """对单条轨迹执行零相位巴特沃斯低通滤波。"""
     fs = 1 / trace.sampling_rate
     fN = fs / 2.0
     assert highcut < fN
@@ -1067,6 +1460,22 @@ def _lowpass_filter_trace(trace: BaseTrace, highcut: float, order: int = 5) -> B
 def lowpass_filter_trace(
     trace: Union[BaseTrace, BasePrestackTrace], highcut: float, order: int = 5
 ) -> Union[BaseTrace, BasePrestackTrace]:
+    """对单道或叠前道集执行低通滤波。
+
+    Parameters
+    ----------
+    trace : BaseTrace or BasePrestackTrace
+        输入轨迹对象。
+    highcut : float
+        截止频率，单位 Hz，要求小于 Nyquist 频率。
+    order : int, default=5
+        巴特沃斯滤波器阶数。
+
+    Returns
+    -------
+    BaseTrace or BasePrestackTrace
+        滤波后的同类型对象。
+    """
     if issubclass(type(trace), BaseTrace):
         return _lowpass_filter_trace(trace, highcut, order=order)
     elif issubclass(type(trace), BasePrestackTrace):
@@ -1097,10 +1506,25 @@ def _apply_trace_process_to_logset(process: FunctionType, logset: LogSet, *args,
 
 
 def lowpass_filter_logset(logset: LogSet, highcut: float, order: int = 5) -> LogSet:
+    """对 LogSet 中每条曲线执行低通滤波。"""
     return _apply_trace_process_to_logset(lowpass_filter_trace, logset, highcut, order=order)
 
 
 def downsample_trace(trace: BaseTrace, new_sampling: float) -> BaseTrace:
+    """对单条轨迹降采样。
+
+    Parameters
+    ----------
+    trace : BaseTrace
+        输入轨迹。
+    new_sampling : float
+        新采样间隔，必须大于当前采样间隔。
+
+    Returns
+    -------
+    BaseTrace
+        降采样后的同类型轨迹。
+    """
     assert new_sampling > trace.sampling_rate
     # lowpass and decimate
     div_factor = int(round(new_sampling / trace.sampling_rate))
@@ -1117,16 +1541,19 @@ def downsample_trace(trace: BaseTrace, new_sampling: float) -> BaseTrace:
 
 
 def downsample_logset(logset: LogSet, new_sampling: float) -> LogSet:
+    """对 LogSet 中每条曲线执行降采样。"""
     return _apply_trace_process_to_logset(downsample_trace, logset, new_sampling)
 
 
 def resample_logset(logset: LogSet, new_sampling: float) -> LogSet:
+    """对 LogSet 中每条曲线执行重采样。"""
     return _apply_trace_process_to_logset(resample_trace, logset, new_sampling)
 
 
 def resample_trace(
     trace: Union[BaseTrace, BasePrestackTrace], new_sampling: float
 ) -> Union[BaseTrace, BasePrestackTrace]:
+    """按目标采样间隔重采样轨迹或叠前道集。"""
     if issubclass(type(trace), BaseTrace):
         return _resample_trace(trace, new_sampling)
     elif issubclass(type(trace), BasePrestackTrace):
@@ -1147,11 +1574,19 @@ def _resample_trace(trace: BaseTrace, new_sampling: float) -> BaseTrace:
 
 
 def upsample_trace(trace: BaseTrace, new_sampling: float) -> BaseTrace:
-    """
-    sinc interpolation
+    """使用 sinc 插值对轨迹升采样。
 
-    from Matlab:
-    http://phaseportrait.blogspot.com/2008/06/sinc-interpolation-in-matlab.html
+    Parameters
+    ----------
+    trace : BaseTrace
+        输入轨迹。
+    new_sampling : float
+        新采样间隔，必须小于当前采样间隔。
+
+    Returns
+    -------
+    BaseTrace
+        升采样后的同类型轨迹。
     """
     # Find the period
     assert new_sampling < trace.sampling_rate
@@ -1168,7 +1603,24 @@ def upsample_trace(trace: BaseTrace, new_sampling: float) -> BaseTrace:
 def _convert_log_from_md_to_tvdss(
     log: Log, trajectory: WellPath, dz: float = None, interpolation: str = "linear"
 ) -> Log:
-    """Account for the deviation of the well."""
+    """将 MD 域测井转换到 TVDSS 域，并按线性深度采样重采样。
+
+    Parameters
+    ----------
+    log : Log
+        输入测井，必须在 MD 域。
+    trajectory : WellPath
+        井轨迹对象。
+    dz : float, optional
+        目标 TVDSS 采样间隔，单位 m。None 时沿用 log.sampling_rate。
+    interpolation : str, default="linear"
+        插值模式，透传至 scipy.interpolate.interp1d。
+
+    Returns
+    -------
+    Log
+        TVDSS 域测井。
+    """
     # input log
     assert log.is_md
 
@@ -1212,6 +1664,26 @@ def _convert_log_from_md_to_tvdss(
 def convert_log_from_md_to_tvdss_to_twt(
     log: Log, table: TimeDepthTable, trajectory: WellPath, dt: float, interpolation: str = "linear"
 ) -> Log:
+    """通过 MD->TVDSS->TWT 路径将测井转换到 TWT 域。
+
+    Parameters
+    ----------
+    log : Log
+        输入测井，必须在 MD 域。
+    table : TimeDepthTable
+        时深关系表，当前实现按 TVDSS 访问。
+    trajectory : WellPath
+        井轨迹，用于 MD 到 TVDSS 映射。
+    dt : float
+        输出时间采样间隔 dt，单位 s。
+    interpolation : str, default="linear"
+        插值模式，透传至 scipy.interpolate.interp1d。
+
+    Returns
+    -------
+    Log
+        TWT 域测井。
+    """
     # input log
     assert log.is_md
     dz = log.sampling_rate
@@ -1247,19 +1719,41 @@ def convert_log_from_md_to_tvdss_to_twt(
 
     return Log(values_at_dt, linear_twt, "twt", name=log.name, allow_nan=log.allow_nan)
 
+
 def convert_log_from_md_to_twt(
     log: Log, table: TimeDepthTable, trajectory: WellPath, dt: float, interpolation: str = "linear"
 ) -> Log:
-    """
-    Directly converts logs from MD to TWT using an MD-based TimeDepthTable.
-    If a trajectory is provided, it assumes the user wants to perform MD -> TVDSS -> TWT conversion
-    and redirects to that function.
+    """将 MD 域测井转换到 TWT 域。
+
+    当 trajectory 不为 None 时，函数会发出警告并自动切换为
+    MD->TVDSS->TWT 路径；否则使用 MD 域时深表直接转换。
+
+    Parameters
+    ----------
+    log : Log
+        输入测井，必须为 MD 域。
+    table : TimeDepthTable
+        时深关系表。trajectory 为 None 时必须是 MD 域。
+    trajectory : WellPath
+        井轨迹。提供后将触发间接转换路径。
+    dt : float
+        输出时间采样间隔 dt，单位 s。
+    interpolation : str, default="linear"
+        插值模式，透传至 scipy.interpolate.interp1d。
+
+    Returns
+    -------
+    Log
+        TWT 域测井。
+
+    Raises
+    ------
+    AssertionError
+        当输入 log 不是 MD 域，或无 trajectory 时 table 不是 MD 域。
     """
     # Redirect if trajectory is present
     if trajectory is not None:
-        warnings.warn(
-            "Well trajectory provided. Switching to MD -> TVDSS -> TWT conversion mode."
-        )
+        warnings.warn("Well trajectory provided. Switching to MD -> TVDSS -> TWT conversion mode.")
         return convert_log_from_md_to_tvdss_to_twt(log, table, trajectory, dt, interpolation)
 
     # Direct MD -> TWT conversion logic
@@ -1276,9 +1770,7 @@ def convert_log_from_md_to_twt(
 
     # Truncate log if longer than table relationship
     if idx_start + len(log) >= len(table_at_dz):
-        warnings.warn(
-            "Truncating log as the time-depth table (MD) does not reach the maximum depth."
-        )
+        warnings.warn("Truncating log as the time-depth table (MD) does not reach the maximum depth.")
         max_idx = len(table_at_dz) - idx_start
         log = Log(
             log.values[:max_idx],
@@ -1293,12 +1785,11 @@ def convert_log_from_md_to_twt(
     # Interpolate to regular TWT sampling (dt)
     linear_twt = np.arange(log_twt[0], log_twt[-1] + dt, dt)
 
-    interp = _interp1d(
-        log_twt, log.values, bounds_error=False, fill_value=log.values[-1], kind=interpolation
-    )
+    interp = _interp1d(log_twt, log.values, bounds_error=False, fill_value=log.values[-1], kind=interpolation)
     values_at_dt = interp(linear_twt)
 
     return Log(values_at_dt, linear_twt, "twt", name=log.name, allow_nan=log.allow_nan)
+
 
 ################################
 # UTILS

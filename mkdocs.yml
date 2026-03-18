@@ -14,13 +14,14 @@ plugins:
           paths:
             - src
           options:
+            docstring_style: numpy
             show_source: false
             show_root_heading: true
             show_root_toc_entry: true
             show_signature_annotations: true
             separate_signature: true
-            show_if_no_docstring: true
-            inherited_members: true
+            show_if_no_docstring: false
+            inherited_members: false
             load_external_modules: false
 
 nav:

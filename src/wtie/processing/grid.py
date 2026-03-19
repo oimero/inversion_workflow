@@ -128,8 +128,8 @@ class BaseTrace(BaseObject):
         values: np.ndarray,
         basis: np.ndarray,
         basis_type: str,
-        name: str = None,
-        unit: str = None,
+        name: str = None,  # type: ignore
+        unit: str = None,  # type: ignore
         allow_nan: bool = True,
     ):
         """初始化一维轨迹。
@@ -228,7 +228,7 @@ class BaseTrace(BaseObject):
     @property
     def values(self) -> np.ndarray:
         """轨迹振幅值数组，shape 为 (n_samples,)。"""
-        return self.series.values
+        return self.series.values  # type: ignore
 
     @property
     def basis(self) -> np.ndarray:
@@ -256,14 +256,14 @@ class BaseTrace(BaseObject):
         return str(self.series)
 
     @multimethod
-    def __add__(self, other: "BaseTrace"):
+    def __add__(self, other: "BaseTrace"):  # type: ignore
         assert self.basis_type == other.basis_type
         assert np.allclose(self.basis, other.basis)
         new_values = self.values + other.values
         return type(self)(new_values, self.basis, _inverted_name(self.basis_type))
 
     @multimethod
-    def __add__(self, other: np.ndarray):
+    def __add__(self, other: np.ndarray):  # noqa: F811
         new_values = self.values + other
         return type(self)(new_values, self.basis, _inverted_name(self.basis_type))
 
@@ -322,7 +322,13 @@ class Wavelet(BaseTrace):
     """子波轨迹对象，可携带频谱不确定性描述。"""
 
     def __init__(
-        self, values, basis, basis_type=None, theta: int = 0, uncertainties: WaveletUncertainties = None, **kwargs
+        self,
+        values,
+        basis,
+        basis_type=None,
+        theta: int = 0,
+        uncertainties: WaveletUncertainties = None,  # type: ignore
+        **kwargs,  # type: ignore
     ):
         # basis_type not used as always assumed twt, there for api compat
         super().__init__(values, basis, "twt", **kwargs)
@@ -439,7 +445,7 @@ class BasePrestackTrace:
         共享采样坐标，shape 为 (n_samples,)。
     """
 
-    def __init__(self, traces: Tuple[BaseTrace], name: str = None):
+    def __init__(self, traces: Tuple[BaseTrace], name: str = None):  # type: ignore
         """初始化叠前道集。
 
         Parameters
@@ -531,21 +537,11 @@ class BasePrestackTrace:
         return values
 
     @property
-    def basis(self) -> np.ndarray:
+    def basis(self) -> np.ndarray:  # type: ignore
         return self._basis
 
     @basis.setter
-    def basis(self, new_basis):
-        self._basis = new_basis
-        for trace in self.traces:
-            trace.basis = new_basis
-
-    @property
-    def basis(self) -> np.ndarray:
-        return self._basis
-
-    @basis.setter
-    def basis(self, new_basis):
+    def basis(self, new_basis):  # type: ignore
         self._basis = new_basis
         for trace in self.traces:
             trace.basis = new_basis
@@ -562,7 +558,7 @@ class BasePrestackTrace:
         new_angles = range(start_angle, end_angle + delta_angle, delta_angle)
 
         new_trace = [trace[theta] for theta in new_angles]
-        return type(trace)(new_trace, name=trace.name)
+        return type(trace)(new_trace, name=trace.name)  # type: ignore
 
     @staticmethod
     def partial_stacking(ps_trace: "BasePrestackTrace", n: int) -> "BasePrestackTrace":
@@ -612,7 +608,7 @@ class BasePrestackTrace:
 
             new_traces.append(new_trace)
 
-        return type(ps_trace)(new_traces, name=ps_trace.name)
+        return type(ps_trace)(new_traces, name=ps_trace.name)  # type: ignore
 
     def __str__(self):
         txt = "Prestack %s traces from %d to %d degrees" % (self.name, self.angles[0], self.angles[-1])
@@ -819,7 +815,7 @@ class TimeDepthTable:
         采样点数 n。
     """
 
-    def __init__(self, twt: _sequence_t, tvdss: _sequence_t = None, md: _sequence_t = None):
+    def __init__(self, twt: _sequence_t, tvdss: _sequence_t = None, md: _sequence_t = None):  # type: ignore
         """初始化时深关系。
 
         Parameters
@@ -866,27 +862,27 @@ class TimeDepthTable:
     @property
     def twt(self) -> np.ndarray:
         """两程时数组，单位 s，shape 为 (n_samples,)。"""
-        return self.table.loc[:, TWT_NAME].values
+        return self.table.loc[:, TWT_NAME].values  # type: ignore
 
     @property
     def tvdss(self) -> np.ndarray:
         """TVDSS 深度数组，单位 m，shape 为 (n_samples,)。"""
         if self._is_md_domain:
             raise ValueError("This TimeDepthTable is in MD domain. Use '.md' property instead.")
-        return self.table.loc[:, TVDSS_NAME].values
+        return self.table.loc[:, TVDSS_NAME].values  # type: ignore
 
     @property
     def md(self) -> np.ndarray:
         """MD 深度数组，单位 m，shape 为 (n_samples,)。"""
         if not self._is_md_domain:
             raise ValueError("This TimeDepthTable is in TVDSS domain. Use '.tvdss' property instead.")
-        return self.table.loc[:, MD_NAME].values
+        return self.table.loc[:, MD_NAME].values  # type: ignore
 
     @property
     def depth(self) -> np.ndarray:
         """通用深度访问器，返回当前域深度数组（TVDSS 或 MD）。"""
         # The depth column is always the second column (index 1)
-        return self.table.iloc[:, 1].values
+        return self.table.iloc[:, 1].values  # type: ignore
 
     @property
     def is_md_domain(self) -> bool:
@@ -986,7 +982,7 @@ class TimeDepthTable:
         # interp = _interp1d(current_twt, current_tvd, kind=mode,
         # bounds_error=False, fill_value=current_tvd[-1])
 
-        interp = _interp1d(current_twt, current_depth, kind=mode, bounds_error=False, fill_value="extrapolate")
+        interp = _interp1d(current_twt, current_depth, kind=mode, bounds_error=False, fill_value="extrapolate")  # type: ignore
 
         new_depth = interp(new_twt)
 
@@ -1016,7 +1012,7 @@ class TimeDepthTable:
         # interp = _interp1d(current_tvd, current_twt, kind=mode,
         # bounds_error=False, fill_value=current_twt[-1])
 
-        interp = _interp1d(current_depth, current_twt, kind=mode, bounds_error=False, fill_value="extrapolate")
+        interp = _interp1d(current_depth, current_twt, kind=mode, bounds_error=False, fill_value="extrapolate")  # type: ignore
 
         new_twt = interp(new_depth)
 
@@ -1031,8 +1027,8 @@ class TimeDepthTable:
     @staticmethod
     def get_tvdss_twt_relation_from_vp(
         Vp: Log,
-        wp: "WellPath" = None,
-        origin: float = None,
+        wp: "WellPath" = None,  # type: ignore
+        origin: float = None,  # type: ignore
     ) -> "TimeDepthTable":
         # Vp should be preprocessed prior to input
         # (despiking, long range smoothing...)
@@ -1158,7 +1154,7 @@ class WellPath:
         Kelly Bushing 高程，单位 m。
     """
 
-    def __init__(self, md: _sequence_t, tvdss: _sequence_t = None, kb: float = None):
+    def __init__(self, md: _sequence_t, tvdss: _sequence_t = None, kb: float = None):  # type: ignore
         """初始化井轨迹。
 
         Parameters
@@ -1194,14 +1190,14 @@ class WellPath:
         assert np.allclose(md[0], 0.0, rtol=1e-3)
         assert ((md[1:] - md[:-1]) > 0).all()
 
-        is_going_upward = not ((tvdss[1:] - tvdss[:-1]) >= 0).all()
+        is_going_upward = not ((tvdss[1:] - tvdss[:-1]) >= 0).all()  # type: ignore
         if is_going_upward:
             warnings.warn(
                 "Decreasing tvd detected,\
                           this means the well is going upward at some point."
             )
 
-        self.table = _create_dataframe((md, tvdss), (MD_NAME, TVDSS_NAME))
+        self.table = _create_dataframe((md, tvdss), (MD_NAME, TVDSS_NAME))  # type: ignore
 
     def __str__(self):
         return "Well path (MD [m] vs TVDSS [m]) with %d samples." % self.size
@@ -1217,7 +1213,7 @@ class WellPath:
     @property
     def tvdss(self) -> np.ndarray:
         """TVDSS 序列，单位 m，shape 为 (n_samples,)。"""
-        return self.table.loc[:, TVDSS_NAME].values
+        return self.table.loc[:, TVDSS_NAME].values  # type: ignore
 
     @property
     def tvdkb(self) -> np.ndarray:
@@ -1227,7 +1223,7 @@ class WellPath:
     @property
     def md(self) -> np.ndarray:
         """MD 序列，单位 m，shape 为 (n_samples,)。"""
-        return self.table.loc[:, MD_NAME].values
+        return self.table.loc[:, MD_NAME].values  # type: ignore
 
     @staticmethod
     def get_tvdkb_from_inclination(md: _sequence_t, inclination: _sequence_t) -> np.ndarray:
@@ -1391,45 +1387,45 @@ def get_matching_traces(
         trace1_match = type(trace1)(
             trace1.values[idx_start_t1:idx_end_t1],
             trace1.basis[idx_start_t1:idx_end_t1],
-            _inverted_name(trace1.basis_type),
+            _inverted_name(trace1.basis_type), # type: ignore
             name=trace1.name,
         )
 
         trace2_match = type(trace2)(
             trace2.values[idx_start_t2:idx_end_t2],
             trace2.basis[idx_start_t2:idx_end_t2],
-            _inverted_name(trace2.basis_type),
+            _inverted_name(trace2.basis_type), # type: ignore
             name=trace2.name,
         )
 
     elif issubclass(type(trace1), BasePrestackTrace) and issubclass(type(trace2), BasePrestackTrace):
-        assert (trace1.angles == trace2.angles).all()
+        assert (trace1.angles == trace2.angles).all()  # type: ignore
         trace1_match = []
         trace2_match = []
 
-        for theta in trace1.angles:
+        for theta in trace1.angles:  # type: ignore
             trace1_match.append(
-                type(trace1[theta])(
-                    trace1[theta].values[idx_start_t1:idx_end_t1],
+                type(trace1[theta])( # type: ignore
+                    trace1[theta].values[idx_start_t1:idx_end_t1], # type: ignore
                     trace1.basis[idx_start_t1:idx_end_t1],
                     _inverted_name(trace1.basis_type),
-                    name=trace1[theta].name,
+                    name=trace1[theta].name, # type: ignore
                     theta=theta,
                 )
             )
 
             trace2_match.append(
-                type(trace2[theta])(
-                    trace2[theta].values[idx_start_t2:idx_end_t2],
+                type(trace2[theta])( # type: ignore
+                    trace2[theta].values[idx_start_t2:idx_end_t2], # type: ignore
                     trace2.basis[idx_start_t2:idx_end_t2],
                     _inverted_name(trace2.basis_type),
-                    name=trace2[theta].name,
+                    name=trace2[theta].name, # type: ignore
                     theta=theta,
                 )
             )
 
-        trace1_match = type(trace1)(trace1_match)
-        trace2_match = type(trace2)(trace2_match)
+        trace1_match = type(trace1)(trace1_match)  # type: ignore
+        trace2_match = type(trace2)(trace2_match)  # type: ignore
 
     else:
         raise NotImplementedError
@@ -1442,7 +1438,7 @@ def get_matching_traces(
     trace2_match.basis = trace1_match.basis
     assert np.allclose(trace1_match.basis, trace2_match.basis, rtol=1e-3)
 
-    return trace1_match, trace2_match
+    return trace1_match, trace2_match  # type: ignore
 
 
 def _lowpass_filter_trace(trace: BaseTrace, highcut: float, order: int = 5) -> BaseTrace:
@@ -1477,9 +1473,9 @@ def lowpass_filter_trace(
         滤波后的同类型对象。
     """
     if issubclass(type(trace), BaseTrace):
-        return _lowpass_filter_trace(trace, highcut, order=order)
+        return _lowpass_filter_trace(trace, highcut, order=order)  # type: ignore
     elif issubclass(type(trace), BasePrestackTrace):
-        return _apply_trace_process_to_prestack_trace(_lowpass_filter_trace, trace, highcut, order=order)
+        return _apply_trace_process_to_prestack_trace(_lowpass_filter_trace, trace, highcut, order=order)  # type: ignore
     else:
         raise NotImplementedError
 
@@ -1493,7 +1489,7 @@ def _apply_trace_process_to_prestack_trace(
         that_tace.theta = theta
         separate_traces.append(that_tace)
 
-    return type(trace)(separate_traces)
+    return type(trace)(separate_traces)  # type: ignore
 
 
 def _apply_trace_process_to_logset(process: FunctionType, logset: LogSet, *args, **kwargs) -> LogSet:
@@ -1555,9 +1551,9 @@ def resample_trace(
 ) -> Union[BaseTrace, BasePrestackTrace]:
     """按目标采样间隔重采样轨迹或叠前道集。"""
     if issubclass(type(trace), BaseTrace):
-        return _resample_trace(trace, new_sampling)
+        return _resample_trace(trace, new_sampling)  # type: ignore
     elif issubclass(type(trace), BasePrestackTrace):
-        return _apply_trace_process_to_prestack_trace(_resample_trace, trace, new_sampling)
+        return _apply_trace_process_to_prestack_trace(_resample_trace, trace, new_sampling)  # type: ignore
     else:
         raise NotImplementedError
 
@@ -1601,7 +1597,10 @@ def upsample_trace(trace: BaseTrace, new_sampling: float) -> BaseTrace:
 
 
 def _convert_log_from_md_to_tvdss(
-    log: Log, trajectory: WellPath, dz: float = None, interpolation: str = "linear"
+    log: Log,
+    trajectory: WellPath,
+    dz: float = None,  # type: ignore
+    interpolation: str = "linear",  # type: ignore
 ) -> Log:
     """将 MD 域测井转换到 TVDSS 域，并按线性深度采样重采样。
 

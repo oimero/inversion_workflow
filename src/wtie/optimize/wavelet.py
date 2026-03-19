@@ -1,4 +1,28 @@
-"""Tools using global black-box optimization to improve wavelets"""
+"""wtie.optimize.wavelet: 子波估计、筛选与幅值缩放工具集。
+
+本模块提供叠后/叠前子波的期望估计、候选网格搜索、合成地震生成与
+基于黑盒优化（Ax）的绝对幅值缩放流程。
+
+边界说明
+--------
+- 本模块不负责井震标定流程编排，流程级调用由 wtie.optimize.tie/autotie 负责。
+- 本模块不负责神经网络训练，仅调用外部 evaluator 的推理接口。
+
+核心公开对象
+------------
+1. compute_expected_wavelet: 估计叠后期望子波并可计算谱不确定性。
+2. grid_search_best_wavelet: 在采样子波集合中搜索最优叠后子波。
+3. scale_wavelet: 通过 Ax 估计叠后子波绝对幅值缩放系数。
+4. compute_expected_prestack_wavelet: 分角度估计叠前期望子波。
+5. grid_search_best_prestack_wavelet: 分角度搜索叠前最优子波。
+6. scale_prestack_wavelet: 分角度缩放叠前子波。
+
+Examples
+--------
+>>> wlt = compute_expected_wavelet(evaluator, seismic, reflectivity)
+>>> scaled_wlt, ax_client = scale_wavelet(wlt, seismic, reflectivity, modeler)
+>>> synth = compute_synthetic_seismic(modeler, scaled_wlt, reflectivity)
+"""
 
 import numpy as np
 from ax.modelbridge.generation_strategy import GenerationStep, GenerationStrategy
@@ -16,6 +40,20 @@ from wtie.utils.types_ import FunctionType, List
 
 
 def _preprocess_real_seismic(seismic: grid.Seismic, inverse_polarity: bool = False) -> np.ndarray:
+    """将叠后真实地震归一化并整理为网络输入张量。
+
+    Parameters
+    ----------
+    seismic : grid.Seismic
+        叠后地震对象，原始振幅 shape 为 ``(n_samples,)``。
+    inverse_polarity : bool, default=False
+        是否执行极性反转。为 ``True`` 时输出整体乘以 ``-1``。
+
+    Returns
+    -------
+    numpy.ndarray
+        网络输入张量，shape 为 ``(1, 1, n_samples)``，dtype 为 ``float32``。
+    """
     # norm
     abs_max = max(seismic.values.max(), -seismic.values.min())
     new_seismic = seismic.values / abs_max
@@ -25,6 +63,18 @@ def _preprocess_real_seismic(seismic: grid.Seismic, inverse_polarity: bool = Fal
 
 
 def _preprocess_reflectivity(reflectivity: grid.Reflectivity) -> np.ndarray:
+    """将叠后反射系数归一化并整理为网络输入张量。
+
+    Parameters
+    ----------
+    reflectivity : grid.Reflectivity
+        叠后反射系数对象，shape 为 ``(n_samples,)``。
+
+    Returns
+    -------
+    numpy.ndarray
+        网络输入张量，shape 为 ``(1, 1, n_samples)``，dtype 为 ``float32``。
+    """
     # norm
     abs_max = max(reflectivity.values.max(), -reflectivity.values.min())
     new_ref = reflectivity.values / abs_max
@@ -32,13 +82,41 @@ def _preprocess_reflectivity(reflectivity: grid.Reflectivity) -> np.ndarray:
 
 
 def _prepare_for_input_to_network(x: np.ndarray) -> np.ndarray:
+    """将一维序列升维为网络输入格式。
+
+    Parameters
+    ----------
+    x : numpy.ndarray
+        输入一维数组，shape 为 ``(n_samples,)``。
+
+    Returns
+    -------
+    numpy.ndarray
+        输出数组，shape 为 ``(1, 1, n_samples)``，dtype 为 ``float32``。
+    """
     # tensor shape
     x = x[np.newaxis, :]  # batch
     x = x[np.newaxis, :]  # channels
     return x.astype(np.float32)
 
 
-def _get_wavelet_object(wavelet: np.ndarray, dt: float, name: str = None) -> grid.Wavelet:
+def _get_wavelet_object(wavelet: np.ndarray, dt: float, name: str = None) -> grid.Wavelet:  # type: ignore
+    """把子波样值数组封装为 ``grid.Wavelet`` 对象。
+
+    Parameters
+    ----------
+    wavelet : numpy.ndarray
+        子波振幅序列，shape 为 ``(n_samples,)``。
+    dt : float
+        采样间隔 ``dt``，单位通常为 s。
+    name : str, optional
+        子波名称。
+
+    Returns
+    -------
+    grid.Wavelet
+        子波对象，时间基准由 ``[-duration/2, duration/2)`` 等间隔构造。
+    """
     duration = wavelet.size * dt
     # t = np.arange(-duration/2, (duration-dt)/2, dt)
     t = np.arange(-duration / 2, duration / 2, dt)
@@ -46,16 +124,56 @@ def _get_wavelet_object(wavelet: np.ndarray, dt: float, name: str = None) -> gri
 
 
 def zero_phasing_wavelet(wavelet: grid.Wavelet) -> grid.Wavelet:
+    """对输入子波执行零相位处理。
+
+    Parameters
+    ----------
+    wavelet : grid.Wavelet
+        输入叠后子波。
+
+    Returns
+    -------
+    grid.Wavelet
+        零相位子波，保留原 ``basis`` 与 ``name``。
+    """
     wlt_0 = _zero_phasing(wavelet.values)
     return grid.Wavelet(wlt_0, wavelet.basis, name=wavelet.name)
 
 
-def get_phase(wavelet: grid.Wavelet, to_degree: bool = True) -> np.ndarray:
+def get_phase(wavelet: grid.Wavelet, to_degree: bool = True):
+    """计算子波相位谱。
+
+    Parameters
+    ----------
+    wavelet : grid.Wavelet
+        输入叠后子波。
+    to_degree : bool, default=True
+        是否将相位单位转换为角度（degree）。
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        ``(ff, phase)``：频率轴（Hz）与相位谱。
+    """
     ff, ampl, power, phase = _compute_spectrum(wavelet.values, wavelet.sampling_rate, to_degree=to_degree)
     return ff, phase
 
 
-def get_spectrum(wavelet: grid.Wavelet, to_degree: bool = True) -> np.ndarray:
+def get_spectrum(wavelet: grid.Wavelet, to_degree: bool = True):
+    """计算子波频谱特征。
+
+    Parameters
+    ----------
+    wavelet : grid.Wavelet
+        输入叠后子波。
+    to_degree : bool, default=True
+        是否将相位单位转换为角度（degree）。
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        ``(ff, ampl, power, phase)``：频率轴（Hz）、振幅谱、功率谱与相位谱。
+    """
     ff, ampl, power, phase = _compute_spectrum(wavelet.values, wavelet.sampling_rate, to_degree=to_degree)
     return ff, ampl, power, phase
 
@@ -68,6 +186,41 @@ def compute_expected_wavelet(
     inverse_polarity: bool = False,
     zero_phasing: bool = False,
 ) -> grid.Wavelet:
+    """估计叠后期望子波，并可附带频谱不确定性统计。
+
+    当 ``zero_phasing=False`` 时，会额外采样 ``n_sampling`` 个子波，计算
+    振幅谱与相位谱均值/标准差并写入 ``Wavelet.uncertainties``。
+
+    Parameters
+    ----------
+    evaluator : BaseEvaluator
+        子波评估器，需支持 ``expected_wavelet`` 与 ``sample_n_times``。
+    seismic : grid.Seismic
+        叠后地震，shape 为 ``(n_samples,)``。
+    reflectivity : grid.Reflectivity
+        叠后反射系数，shape 为 ``(n_samples,)``。
+    n_sampling : int, default=50
+        估计不确定性时的采样次数 ``n``。
+    inverse_polarity : bool, default=False
+        是否对输入/输出执行极性反转。
+    zero_phasing : bool, default=False
+        是否强制输出零相位子波。
+
+    Returns
+    -------
+    grid.Wavelet
+        期望子波对象；当 ``zero_phasing=False`` 时包含谱不确定性。
+
+    Raises
+    ------
+    AssertionError
+        当 ``seismic`` 与 ``reflectivity`` 时间基准不一致，或
+        ``seismic.sampling_rate`` 与 ``evaluator.expected_sampling`` 不一致时触发。
+
+    Examples
+    --------
+    >>> wlt = compute_expected_wavelet(evaluator, seismic, reflectivity, n_sampling=80)
+    """
     assert np.allclose(seismic.basis, reflectivity.basis, rtol=1e-3)
     assert np.allclose(seismic.sampling_rate, evaluator.expected_sampling, rtol=1e-3)
 
@@ -75,7 +228,7 @@ def compute_expected_wavelet(
     ref_ = _preprocess_reflectivity(reflectivity)
 
     # Expected wavelet
-    expected_wlt = evaluator.expected_wavelet(seismic=seismic_, reflectivity=ref_, squeeze=True)
+    expected_wlt = evaluator.expected_wavelet(seismic=seismic_, reflectivity=ref_, squeeze=True)  # type: ignore
     if inverse_polarity:
         expected_wlt *= -1.0
 
@@ -85,7 +238,7 @@ def compute_expected_wavelet(
         expected_wlt = zero_phasing_wavelet(expected_wlt)
     else:
         # Uncertainties
-        wavelets = evaluator.sample_n_times(seismic=seismic_, reflectivity=ref_, n=n_sampling)
+        wavelets = evaluator.sample_n_times(seismic=seismic_, reflectivity=ref_, n=n_sampling)  # type: ignore
         amp_spectrums = []
         phase_spectrums = []
         for wlt in wavelets:
@@ -115,20 +268,45 @@ def compute_expected_prestack_wavelet(
     zero_phasing: bool = False,
     inverse_polarity: bool = False,
 ) -> grid.PreStackWavelet:
+    """分角度估计叠前期望子波。
+
+    Parameters
+    ----------
+    evaluator : BaseEvaluator
+        子波评估器。
+    seismic : grid.PreStackSeismic
+        叠前地震，常见 shape 为 ``(n_traces, n_samples)``。
+    reflectivity : grid.PreStackReflectivity
+        叠前反射系数，shape 与角度集合需与 ``seismic`` 一致。
+    zero_phasing : bool, default=False
+        是否对每个角度子波执行零相位处理。
+    inverse_polarity : bool, default=False
+        是否执行极性反转。
+
+    Returns
+    -------
+    grid.PreStackWavelet
+        叠前子波集合，每个子波 ``theta`` 与输入角度对应。
+
+    Raises
+    ------
+    AssertionError
+        当 ``seismic.angles`` 与 ``reflectivity.angles`` 不一致时触发。
+    """
     assert (seismic.angles == reflectivity.angles).all()
 
     wavelets = []
     for theta in seismic.angles:
         wlt_ = compute_expected_wavelet(
             evaluator,
-            seismic[theta],
-            reflectivity[theta],
+            seismic[theta],  # type: ignore
+            reflectivity[theta],  # type: ignore
             zero_phasing=zero_phasing,
             inverse_polarity=inverse_polarity,
         )
         wlt_.theta = theta
         wavelets.append(wlt_)
-    return grid.PreStackWavelet(wavelets)
+    return grid.PreStackWavelet(wavelets)  # type: ignore
 
 
 def grid_search_best_wavelet(
@@ -141,9 +319,49 @@ def grid_search_best_wavelet(
     inverse_polarity: bool = False,
     zero_phasing: bool = False,
 ) -> grid.Wavelet:
-    """Brut force search...
-    Tow possible critera: best in terms of fit
-    or best in terms of minimum absolute phase...
+    """在候选子波样本中网格搜索叠后最优子波。
+
+    评分策略为：
+    1) 先按相似度得分降序；
+    2) 取前 10% 候选；
+    3) 若 ``zero_phasing=False``，再按 0-60 Hz 区间平均绝对相位最小化筛选。
+
+    Parameters
+    ----------
+    evaluator : BaseEvaluator
+        子波评估器，需支持 ``sample_n_times``。
+    seismic : grid.Seismic
+        叠后真实地震。
+    reflectivity : grid.Reflectivity
+        叠后反射系数。
+    modeler : ModelingCallable
+        正演算子。
+    similarity : FunctionType
+        相似度函数，输入为两个一维数组，返回无量纲分数（范围待确认）。
+    num_wavelets : int, default=60
+        候选子波数量 ``n``。
+    inverse_polarity : bool, default=False
+        是否反转极性。
+    zero_phasing : bool, default=False
+        是否对候选子波先做零相位处理。
+
+    Returns
+    -------
+    grid.Wavelet
+        搜索得到的最优子波，且写入候选集合统计得到的不确定性。
+
+    Raises
+    ------
+    AssertionError
+        当输入采样率或时间基准不满足一致性约束时触发。
+    IndexError
+        当 ``num_wavelets`` 过小导致前 10% 候选为空时可能触发。
+
+    Examples
+    --------
+    >>> best = grid_search_best_wavelet(
+    ...     evaluator, seismic, reflectivity, modeler, _similarity.normalized_xcorr_maximum
+    ... )
     """
     assert np.allclose(seismic.basis, reflectivity.basis, rtol=1e-3)
     assert np.allclose(seismic.sampling_rate, evaluator.expected_sampling, rtol=1e-3)
@@ -151,7 +369,7 @@ def grid_search_best_wavelet(
     seismic_ = _preprocess_real_seismic(seismic, inverse_polarity=inverse_polarity)
     ref_ = _preprocess_reflectivity(reflectivity)
 
-    wavelets = evaluator.sample_n_times(seismic=seismic_, reflectivity=ref_, n=num_wavelets)
+    wavelets = evaluator.sample_n_times(seismic=seismic_, reflectivity=ref_, n=num_wavelets)  # type: ignore
     # uncertainties
     amp_spectrums = []
     phase_spectrums = []
@@ -224,15 +442,43 @@ def grid_search_best_prestack_wavelet(
     num_wavelets: int = 60,
     zero_phasing: bool = False,
 ) -> grid.Wavelet:
-    """ """
+    """分角度执行叠前最优子波搜索。
+
+    Parameters
+    ----------
+    evaluator : BaseEvaluator
+        子波评估器。
+    seismic : grid.PreStackSeismic
+        叠前真实地震。
+    reflectivity : grid.PreStackReflectivity
+        叠前反射系数。
+    modeler : ModelingCallable
+        正演算子。
+    similarity : FunctionType
+        相似度函数。
+    num_wavelets : int, default=60
+        每个角度的候选子波数量 ``n``。
+    zero_phasing : bool, default=False
+        是否对子波执行零相位处理。
+
+    Returns
+    -------
+    grid.PreStackWavelet
+        叠前最优子波集合。
+
+    Raises
+    ------
+    AssertionError
+        当输入角度集合不一致时触发。
+    """
     assert (seismic.angles == reflectivity.angles).all()
 
     best_wavelet = []
     for i in range(seismic.num_traces):
         wlt = grid_search_best_wavelet(
             evaluator,
-            seismic.traces[i],
-            reflectivity.traces[i],
+            seismic.traces[i],  # type: ignore
+            reflectivity.traces[i],  # type: ignore
             modeler,
             similarity,
             num_wavelets=num_wavelets,
@@ -241,7 +487,7 @@ def grid_search_best_prestack_wavelet(
         wlt.theta = seismic.angles[i]
         best_wavelet.append(wlt)
 
-    return grid.PreStackWavelet(best_wavelet)
+    return grid.PreStackWavelet(best_wavelet)  # type: ignore
 
 
 def compute_synthetic_seismic(
@@ -249,10 +495,32 @@ def compute_synthetic_seismic(
     wavelet: grid.Wavelet,
     reflectivity: grid.Reflectivity,
 ) -> grid.Seismic:
+    """由叠后子波与反射系数生成叠后合成地震。
+
+    Parameters
+    ----------
+    modeler : ModelingCallable
+        正演算子，输入为 ``(wavelet.values, reflectivity.values)``。
+    wavelet : grid.Wavelet
+        叠后子波，shape 为 ``(n_samples,)``。
+    reflectivity : grid.Reflectivity
+        叠后反射系数，shape 为 ``(n_samples,)``，域需为 TWT。
+
+    Returns
+    -------
+    grid.Seismic
+        合成叠后地震对象，名称固定为 ``"Synthetic seismic"``。
+
+    Raises
+    ------
+    AssertionError
+        当 ``wavelet`` 与 ``reflectivity`` 采样率不一致或
+        ``reflectivity`` 不在 TWT 域时触发。
+    """
     assert np.allclose(wavelet.sampling_rate, reflectivity.sampling_rate)
     assert reflectivity.is_twt
 
-    seismic = modeler(wavelet.values, reflectivity.values)
+    seismic = modeler(wavelet.values, reflectivity.values)  # type: ignore
     return grid.Seismic(seismic, reflectivity.basis, "twt", name="Synthetic seismic")
 
 
@@ -261,14 +529,35 @@ def compute_synthetic_prestack_seismic(
     wavelet: grid.PreStackWavelet,
     reflectivity: grid.PreStackReflectivity,
 ) -> grid.PreStackSeismic:
+    """由叠前子波与叠前反射系数生成叠前合成地震。
+
+    Parameters
+    ----------
+    modeler : ModelingCallable
+        正演算子。
+    wavelet : grid.PreStackWavelet
+        叠前子波集合。
+    reflectivity : grid.PreStackReflectivity
+        叠前反射系数集合。
+
+    Returns
+    -------
+    grid.PreStackSeismic
+        叠前合成地震集合，角度标签与输入一致。
+
+    Raises
+    ------
+    AssertionError
+        当 ``wavelet.angles`` 与 ``reflectivity.angles`` 不一致时触发。
+    """
     assert (wavelet.angles == reflectivity.angles).all()
 
     seismics = []
     for theta in wavelet.angles:
-        seis_ = compute_synthetic_seismic(modeler, wavelet[theta], reflectivity[theta])
+        seis_ = compute_synthetic_seismic(modeler, wavelet[theta], reflectivity[theta])  # type: ignore
         seis_.theta = theta
         seismics.append(seis_)
-    return grid.PreStackSeismic(seismics)
+    return grid.PreStackSeismic(seismics)  # type: ignore
 
 
 ############################################################
@@ -280,10 +569,31 @@ def select_best_wavelet(
     seismic: np.ndarray,
     reflectivity: np.ndarray,
     modeler: ModelingCallable,
-    num_iters: int = None,
+    num_iters: int = None,  # type: ignore
     noise_perc: float = 10,
 ):
-    """ """
+    """从候选子波集合中选择最优子波（当前未实现）。
+
+    Parameters
+    ----------
+    wavelets : List[numpy.ndarray]
+        候选子波列表，每个元素 shape 为 ``(n_samples,)``。
+    seismic : numpy.ndarray
+        目标地震道，shape 为 ``(n_samples,)``。
+    reflectivity : numpy.ndarray
+        反射系数道，shape 为 ``(n_samples,)``。
+    modeler : ModelingCallable
+        正演算子。
+    num_iters : int, optional
+        计划迭代次数。当前实现未使用。
+    noise_perc : float, default=10
+        噪声百分比。当前实现未使用。
+
+    Raises
+    ------
+    NotImplementedError
+        函数入口立即抛出，后续代码当前不可达。
+    """
     raise NotImplementedError()
 
     if num_iters is None:
@@ -351,8 +661,43 @@ def scale_wavelet(
     noise_perc: float = 5,
     is_tqdm: bool = True,
 ):
+    """估计叠后子波的绝对幅值缩放系数。
+
+    该函数使用 Ax（Sobol + BoTorch）最小化能量比误差：
+    ``abs(E(synth)/E(real) - 1)``。
+
+    Parameters
+    ----------
+    wavelet : grid.Wavelet
+        待缩放子波。
+    seismic : grid.Seismic
+        目标真实地震。
+    reflectivity : grid.Reflectivity
+        反射系数。
+    modeler : ModelingCallable
+        正演算子。
+    min_scale : float, default=0.01
+        缩放系数下界。
+    max_scale : float, default=100
+        缩放系数上界。
+    num_iters : int, default=80
+        优化迭代次数 ``n``。
+    noise_perc : float, default=5
+        噪声比例（百分数），用于误差不确定度估计。
+    is_tqdm : bool, default=True
+        是否显示进度条。
+
+    Returns
+    -------
+    tuple
+        ``(scaled_wlt, ax_client)``：
+        - ``scaled_wlt`` 为缩放后的 ``grid.Wavelet``；
+        - ``ax_client`` 为保存试验历史的 AxClient。
+
+    Examples
+    --------
+    >>> scaled_wlt, ax_client = scale_wavelet(wlt, seismic, reflectivity, modeler)
     """
-    TODO: refactor like scale_prestack_wavelet"""
 
     n_sobol = int(0.65 * num_iters)  # 65%
     n_bayes = num_iters - n_sobol  # 35%
@@ -372,7 +717,7 @@ def scale_wavelet(
 
     ax_client.create_experiment(
         name="wavelet_absolute_scale_estimation",
-        parameters=search_space,
+        parameters=search_space,  # type: ignore
         objectives={"scaling_loss": ObjectiveProperties(minimize=True)},
         choose_generation_strategy_kwargs=None,
     )
@@ -397,7 +742,7 @@ def scale_wavelet(
 
         ax_client.complete_trial(trial_index=trial_index, raw_data=(error, error_std))
 
-    best_scaler = ax_client.get_best_parameters()[0]["scaler"]
+    best_scaler = ax_client.get_best_parameters()[0]["scaler"]  # type: ignore
 
     scaled_wlt = grid.Wavelet(
         best_scaler * wavelet.values,
@@ -420,6 +765,39 @@ def scale_prestack_wavelet(
     num_iters: int = 50,
     noise_perc: float = 5,
 ):
+    """按角度缩放叠前子波集合的绝对幅值。
+
+    Parameters
+    ----------
+    wavelet : grid.PreStackWavelet
+        叠前子波集合。
+    seismic : grid.PreStackSeismic
+        叠前真实地震集合。
+    reflectivity : grid.PreStackReflectivity
+        叠前反射系数集合。
+    modeler : ModelingCallable
+        正演算子。
+    min_scale : float, default=0.01
+        每个角度缩放系数下界。
+    max_scale : float, default=100
+        每个角度缩放系数上界。
+    num_iters : int, default=50
+        每个角度优化迭代次数 ``n``。
+    noise_perc : float, default=5
+        噪声比例（百分数）。
+
+    Returns
+    -------
+    tuple
+        ``(scaled_wavelet, ax_clients)``：
+        - ``scaled_wavelet`` 为缩放后的 ``grid.PreStackWavelet``；
+        - ``ax_clients`` 为各角度对应的 AxClient 列表。
+
+    Raises
+    ------
+    AssertionError
+        当 ``wavelet``、``seismic``、``reflectivity`` 的角度集合不一致时触发。
+    """
     assert (wavelet.angles == seismic.angles).all()
     assert (wavelet.angles == reflectivity.angles).all()
 
@@ -428,9 +806,9 @@ def scale_prestack_wavelet(
 
     for i in tqdm(range(wavelet.num_traces)):
         wlt, ax_client = scale_wavelet(
-            wavelet.traces[i],
-            seismic.traces[i],
-            reflectivity.traces[i],
+            wavelet.traces[i],  # type: ignore
+            seismic.traces[i],  # type: ignore
+            reflectivity.traces[i],  # type: ignore
             modeler,
             min_scale=min_scale,
             max_scale=max_scale,
@@ -444,4 +822,4 @@ def scale_prestack_wavelet(
         scaled_wavelet.append(wlt)
         ax_clients.append(ax_client)
 
-    return grid.PreStackWavelet(scaled_wavelet, name=wavelet.name), ax_clients
+    return grid.PreStackWavelet(scaled_wavelet, name=wavelet.name), ax_clients  # type: ignore

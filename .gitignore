@@ -1,6 +1,8 @@
+.vscode/*
 data/*
 note/*
 site/*
+tests/*
 */output/*
 *.pyc
 *.prompt.md

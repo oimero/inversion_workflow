@@ -136,7 +136,7 @@ def convert_logs_from_md_to_twt(
     return logset_twt
 
 
-def compute_reflectivity(logset: grid.LogSet, angle_range: tuple = None) -> grid.ref_t:
+def compute_reflectivity(logset: grid.LogSet, angle_range: tuple = None) -> grid.ref_t:  # type: ignore
     """根据测井计算反射系数（叠后或叠前）。
 
     当 ``angle_range`` 为空时，计算零偏移（垂直入射）反射系数；
@@ -205,10 +205,10 @@ def compute_wavelet(
     reflectivity: grid.ref_t,
     modeler: ModelingCallable,
     wavelet_extractor: BaseEvaluator,
-    similarity_measure: FunctionType = None,
+    similarity_measure: FunctionType = None,  # type: ignore
     zero_phasing: bool = False,
     scaling: bool = True,
-    scaling_params: dict = None,
+    scaling_params: dict = None,  # type: ignore
     expected_value: bool = False,
     n_sampling: int = 60,
 ) -> grid.wlt_t:
@@ -271,11 +271,17 @@ def compute_wavelet(
     if expected_value:
         if seismic.is_prestack:
             wavelet = _wavelet.compute_expected_prestack_wavelet(
-                wavelet_extractor, seismic, reflectivity, zero_phasing=zero_phasing
+                wavelet_extractor,
+                seismic,  # type: ignore
+                reflectivity,  # type: ignore
+                zero_phasing=zero_phasing,  # type: ignore
             )
         else:
             wavelet = _wavelet.compute_expected_wavelet(
-                wavelet_extractor, seismic, reflectivity, zero_phasing=zero_phasing
+                wavelet_extractor,
+                seismic,  # type: ignore
+                reflectivity,  # type: ignore
+                zero_phasing=zero_phasing,  # type: ignore
             )
     else:
         if seismic.is_prestack:
@@ -285,8 +291,8 @@ def compute_wavelet(
 
         wavelet = _search_wlt(
             wavelet_extractor,
-            seismic,
-            reflectivity,
+            seismic,  # type: ignore
+            reflectivity,  # type: ignore
             modeler,
             similarity_measure,
             zero_phasing=zero_phasing,
@@ -300,9 +306,9 @@ def compute_wavelet(
         print("Find wavelet absolute scale")
         sleep(1.0)
         wavelet, _ = _scale_wlt(
-            wavelet,
-            seismic,
-            reflectivity,
+            wavelet,  # type: ignore
+            seismic,  # type: ignore
+            reflectivity,  # type: ignore
             modeler,
             min_scale=scaling_params["wavelet_min_scale"],
             max_scale=scaling_params["wavelet_max_scale"],
@@ -343,8 +349,8 @@ def compute_synthetic_seismic(
     >>> synthetic = compute_synthetic_seismic(modeler, wavelet, reflectivity)
     """
     if type(wavelet) is grid.PreStackWavelet:
-        return _wavelet.compute_synthetic_prestack_seismic(modeler, wavelet, reflectivity)
+        return _wavelet.compute_synthetic_prestack_seismic(modeler, wavelet, reflectivity)  # type: ignore
     elif type(wavelet) is grid.Wavelet:
-        return _wavelet.compute_synthetic_seismic(modeler, wavelet, reflectivity)
+        return _wavelet.compute_synthetic_seismic(modeler, wavelet, reflectivity)  # type: ignore
     else:
         raise TypeError

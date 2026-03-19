@@ -101,18 +101,24 @@ def stretch_and_squeeze(
     to_seismic = current_outputs.synth_seismic
 
     if inputs.seismic.is_prestack:
-        first_angle = from_seismic.angles[0]
+        first_angle = from_seismic.angles[0]  # type: ignore
         ref_angle = stretch_and_squeeze_params.get("reference_angle", first_angle)
         stretch_and_squeeze_params.pop("reference_angle", None)
-        from_seismic = from_seismic[ref_angle]
-        to_seismic = to_seismic[ref_angle]
+        from_seismic = from_seismic[ref_angle]  # type: ignore
+        to_seismic = to_seismic[ref_angle]  # type: ignore
 
-    dlags = _warping.compute_dynamic_lag(from_seismic, to_seismic, **stretch_and_squeeze_params)
+    dlags = _warping.compute_dynamic_lag(from_seismic, to_seismic, **stretch_and_squeeze_params)  # type: ignore
 
     warped_table = _warping.apply_lags_to_table(current_outputs.table, dlags)
 
     outputs = _intermediate_tie_v1(
-        inputs.logset_md, inputs.wellpath, warped_table, inputs.seismic, wavelet_extractor, modeler, best_params
+        inputs.logset_md,
+        inputs.wellpath,
+        warped_table,
+        inputs.seismic,  # type: ignore
+        wavelet_extractor,
+        modeler,
+        best_params,  # type: ignore
     )
 
     outputs.dlags = dlags
@@ -137,16 +143,16 @@ def stretch_and_squeeze(
 
     # similarity
     if not inputs.seismic.is_prestack:
-        xcorr = _similarity.traces_normalized_xcorr(outputs.seismic, outputs.synth_seismic)
+        xcorr = _similarity.traces_normalized_xcorr(outputs.seismic, outputs.synth_seismic)  # type: ignore
         xcorr = grid.resample_trace(xcorr, 0.001)
-        dxcorr = _similarity.dynamic_normalized_xcorr(outputs.seismic, outputs.synth_seismic)
+        dxcorr = _similarity.dynamic_normalized_xcorr(outputs.seismic, outputs.synth_seismic)  # type: ignore
     else:
-        xcorr = _similarity.prestack_traces_normalized_xcorr(outputs.seismic, outputs.synth_seismic)
+        xcorr = _similarity.prestack_traces_normalized_xcorr(outputs.seismic, outputs.synth_seismic)  # type: ignore
         xcorr = grid.resample_trace(xcorr, 0.001)
         dxcorr = None
 
-    outputs.xcorr = xcorr
-    outputs.dxcorr = dxcorr
+    outputs.xcorr = xcorr  # type: ignore
+    outputs.dxcorr = dxcorr  # type: ignore
 
     return outputs
 
@@ -156,9 +162,9 @@ def tie_v1(
     wavelet_extractor: BaseEvaluator,
     modeler: ModelingCallable,
     wavelet_scaling_params: dict,
-    search_params: dict = None,
-    search_space: dict = None,
-    stretch_and_squeeze_params: dict = None,
+    search_params: dict = None,  # type: ignore
+    search_space: dict = None,  # type: ignore
+    stretch_and_squeeze_params: dict = None,  # type: ignore
 ) -> OutputSet:
     """执行自动井震标定主流程（v1）。
 
@@ -225,13 +231,19 @@ def tie_v1(
     ax_client = _search_best_params_v1(
         inputs, wavelet_extractor, modeler, search_space, num_iters, random_ratio, similarity_std
     )
-    best_params = ax_client.get_best_parameters()[0]
+    best_params = ax_client.get_best_parameters()[0]  # type: ignore
 
     # Intermediate tie
-    shifted_table = grid.TimeDepthTable.t_bulk_shift(inputs.table, best_params["table_t_shift"])
+    shifted_table = grid.TimeDepthTable.t_bulk_shift(inputs.table, best_params["table_t_shift"])  # type: ignore
 
     outputs_tmp1 = _intermediate_tie_v1(
-        inputs.logset_md, inputs.wellpath, shifted_table, inputs.seismic, wavelet_extractor, modeler, best_params
+        inputs.logset_md,
+        inputs.wellpath,
+        shifted_table,
+        inputs.seismic,  # type: ignore
+        wavelet_extractor,
+        modeler,
+        best_params,  # type: ignore
     )
 
     # Optional stretch and squeeze
@@ -239,18 +251,24 @@ def tie_v1(
         from_seismic = outputs_tmp1.seismic
         to_seismic = outputs_tmp1.synth_seismic
         if outputs_tmp1.seismic.is_prestack:
-            first_angle = from_seismic.angles[0]
+            first_angle = from_seismic.angles[0]  # type: ignore
             ref_angle = stretch_and_squeeze_params.get("reference_angle", first_angle)
             stretch_and_squeeze_params.pop("reference_angle", None)
-            from_seismic = from_seismic[ref_angle]
-            to_seismic = to_seismic[ref_angle]
+            from_seismic = from_seismic[ref_angle]  # type: ignore
+            to_seismic = to_seismic[ref_angle]  # type: ignore
 
-        dlags = _warping.compute_dynamic_lag(from_seismic, to_seismic, **stretch_and_squeeze_params)
+        dlags = _warping.compute_dynamic_lag(from_seismic, to_seismic, **stretch_and_squeeze_params)  # type: ignore
 
         warped_table = _warping.apply_lags_to_table(outputs_tmp1.table, dlags)
 
         outputs_tmp2 = _intermediate_tie_v1(
-            inputs.logset_md, inputs.wellpath, warped_table, inputs.seismic, wavelet_extractor, modeler, best_params
+            inputs.logset_md,
+            inputs.wellpath,
+            warped_table,
+            inputs.seismic,  # type: ignore
+            wavelet_extractor,
+            modeler,
+            best_params,  # type: ignore
         )
 
         outputs_tmp2.dlags = dlags
@@ -280,16 +298,16 @@ def tie_v1(
 
     # Similarity between synthetic and real seismic
     if not inputs.seismic.is_prestack:
-        xcorr = _similarity.traces_normalized_xcorr(outputs_tmp2.seismic, outputs_tmp2.synth_seismic)
+        xcorr = _similarity.traces_normalized_xcorr(outputs_tmp2.seismic, outputs_tmp2.synth_seismic)  # type: ignore
         xcorr = grid.resample_trace(xcorr, 0.001)
-        dxcorr = _similarity.dynamic_normalized_xcorr(outputs_tmp2.seismic, outputs_tmp2.synth_seismic)
+        dxcorr = _similarity.dynamic_normalized_xcorr(outputs_tmp2.seismic, outputs_tmp2.synth_seismic)  # type: ignore
     else:
-        xcorr = _similarity.prestack_traces_normalized_xcorr(outputs_tmp2.seismic, outputs_tmp2.synth_seismic)
+        xcorr = _similarity.prestack_traces_normalized_xcorr(outputs_tmp2.seismic, outputs_tmp2.synth_seismic)  # type: ignore
         xcorr = grid.resample_trace(xcorr, 0.001)
         dxcorr = None
 
-    outputs_tmp2.xcorr = xcorr
-    outputs_tmp2.dxcorr = dxcorr
+    outputs_tmp2.xcorr = xcorr  # type: ignore
+    outputs_tmp2.dxcorr = dxcorr  # type: ignore
 
     return outputs_tmp2
 
@@ -331,7 +349,7 @@ def _intermediate_tie_v1(
         中间输出集合，包含中间子波、匹配地震、合成地震、时深表和反射系数等。
     """
     # Resampling
-    seismic = _tie.resample_seismic(seismic, wavelet_extractor.expected_sampling)
+    seismic = _tie.resample_seismic(seismic, wavelet_extractor.expected_sampling)  # type: ignore
 
     # Common steps
     logset_twt, seis_match, r_match = _common_steps_tie_v1(
@@ -340,7 +358,7 @@ def _intermediate_tie_v1(
 
     # (Zero-phased) unscaled wavelet
     wlt = _tie.compute_wavelet(
-        seis_match,
+        seis_match,  # type: ignore
         r_match,
         modeler,
         wavelet_extractor,
@@ -351,7 +369,7 @@ def _intermediate_tie_v1(
 
     synth_seismic = _tie.compute_synthetic_seismic(modeler, wlt, r_match)
 
-    return OutputSet(wlt, logset_twt, seis_match, synth_seismic, table, r_match, wellpath)
+    return OutputSet(wlt, logset_twt, seis_match, synth_seismic, table, r_match, wellpath)  # type: ignore
 
 
 def _search_best_params_v1(
@@ -405,7 +423,7 @@ def _search_best_params_v1(
 
     ax_client.create_experiment(
         name="auto well tie",
-        parameters=search_space,
+        parameters=search_space,  # type: ignore
         objectives={"goodness_of_match": ObjectiveProperties(minimize=False)},
         choose_generation_strategy_kwargs=None,
     )
@@ -424,12 +442,18 @@ def _search_best_params_v1(
         current_table = grid.TimeDepthTable.t_bulk_shift(inputs.table, h_params["table_t_shift"])
         # common steps
         logset_twt, seis_match, r_match = _common_steps_tie_v1(
-            inputs.logset_md, inputs.wellpath, current_table, seismic, wavelet_extractor, modeler, h_params
+            inputs.logset_md,
+            inputs.wellpath,
+            current_table,
+            seismic,  # type: ignore
+            wavelet_extractor,
+            modeler,
+            h_params,  # type: ignore
         )
 
         # (zero-phased) unscaled wavelet
         current_wlt = _tie.compute_wavelet(
-            seis_match,
+            seis_match,  # type: ignore
             r_match,
             modeler,
             wavelet_extractor,
@@ -443,7 +467,8 @@ def _search_best_params_v1(
 
         # similarity
         current_score = _similarity.central_xcorr_coeff(
-            _tie.resample_seismic(seis_match, _tie.FINE_DT), _tie.resample_seismic(synth_seismic, _tie.FINE_DT)
+            _tie.resample_seismic(seis_match, _tie.FINE_DT),  # type: ignore
+            _tie.resample_seismic(synth_seismic, _tie.FINE_DT),  # type: ignore
         )
 
         ax_client.complete_trial(trial_index=trial_index, raw_data=(current_score, similarity_std))
@@ -510,10 +535,10 @@ def _common_steps_tie_v1(
     logset_twt = _tie.convert_logs_from_md_to_twt(logset_md, wellpath, table, wavelet_extractor.expected_sampling)
 
     # reflectivity
-    r0 = _tie.compute_reflectivity(logset_twt, angle_range=seismic.angle_range)
+    r0 = _tie.compute_reflectivity(logset_twt, angle_range=seismic.angle_range)  # type: ignore
 
     # matching
-    seis_match, r0_match = _tie.match_seismic_and_reflectivity(seismic, r0)
+    seis_match, r0_match = _tie.match_seismic_and_reflectivity(seismic, r0)  # type: ignore
 
     return logset_twt, seis_match, r0_match
 

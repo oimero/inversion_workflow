@@ -128,7 +128,7 @@ def extract_vp_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[st
     unit = _get_curve_unit(las_file, selected)
     vp = _convert_sonic_to_velocity_mps(las_df.loc[:, selected].to_numpy(), unit, "Vp")
     vp = interpolate_nans(vp, method="linear")
-    return grid.Log(vp, las_df.index.values, "md", name="Vp", unit="m/s", allow_nan=True)
+    return grid.Log(vp, las_df.index.values, "md", name="Vp", unit="m/s", allow_nan=False)
 
 
 def extract_vs_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[str] = None) -> grid.Log:
@@ -157,7 +157,7 @@ def extract_vs_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[st
     unit = _get_curve_unit(las_file, selected)
     vs = _convert_sonic_to_velocity_mps(las_df.loc[:, selected].to_numpy(), unit, "Vs")
     vs = interpolate_nans(vs, method="linear")
-    return grid.Log(vs, las_df.index.values, "md", name="Vs", unit="m/s", allow_nan=True)
+    return grid.Log(vs, las_df.index.values, "md", name="Vs", unit="m/s", allow_nan=False)
 
 
 def extract_rho_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[str] = None) -> grid.Log:
@@ -186,7 +186,7 @@ def extract_rho_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[s
     unit = _get_curve_unit(las_file, selected)
     rho = _convert_density_to_g_cm3(las_df.loc[:, selected].to_numpy(), unit)
     rho = interpolate_nans(rho, method="linear")
-    return grid.Log(rho, las_df.index.values, "md", name="Rho", unit="g/cm3", allow_nan=True)
+    return grid.Log(rho, las_df.index.values, "md", name="Rho", unit="g/cm3", allow_nan=False)
 
 
 def extract_gr_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[str] = None) -> grid.Log:
@@ -216,7 +216,7 @@ def extract_gr_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[st
     if np.all(np.isnan(gr)):
         raise ValueError("GR 曲线在异常值处理后全部为 NaN。")
     gr = interpolate_nans(gr, method="linear")
-    return grid.Log(gr, las_df.index.values, "md", name="GR", allow_nan=True)
+    return grid.Log(gr, las_df.index.values, "md", name="GR", allow_nan=False)
 
 
 def _read_text_lines_with_fallback(file_path: Path, encodings: Optional[List[str]] = None) -> List[str]:

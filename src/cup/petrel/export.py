@@ -1,12 +1,20 @@
 """Petrel/LAS 导出工具。"""
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TypedDict
 
 import lasio
 import numpy as np
 
 from wtie.processing import grid
+
+
+class ExportLogsetsSummary(TypedDict):
+    """`export_logsets_to_las` 的结构化返回类型。"""
+
+    exported_files: List[Path]
+    skipped_wells: List[Dict[str, str]]
+    skipped_curves: List[Dict[str, str]]
 
 
 def _resolve_export_curve(logset: grid.LogSet, curve_name: str) -> grid.Log:
@@ -51,7 +59,7 @@ def export_logsets_to_las(
     output_dir: Path,
     curve_names: Optional[List[str]] = None,
     null_value: float = -999.25,
-) -> Dict[str, object]:
+) -> ExportLogsetsSummary:
     """按井批量导出 LogSet 到 LAS 文件。
 
     Parameters
@@ -69,7 +77,7 @@ def export_logsets_to_las(
 
     Returns
     -------
-    Dict[str, object]
+    ExportLogsetsSummary
             导出汇总信息，包含：
             - exported_files: List[Path]
             - skipped_wells: List[dict]

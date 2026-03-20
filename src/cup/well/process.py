@@ -1,6 +1,6 @@
 """井曲线处理工具。"""
 
-from typing import Dict
+from typing import Dict, cast
 
 import pandas as pd
 
@@ -35,6 +35,10 @@ def clip_logsets_by_well_tops(
     base_surface_name: str,
 ) -> Dict[str, grid.LogSet]:
     """按井分层在 MD 域裁剪井曲线集合（包含端点）。
+
+    当层位区间超出曲线范围时，会自动钳制到曲线边界：
+    - 起始层位浅于曲线起点时，使用曲线起点；
+    - 终止层位深于曲线终点时，使用曲线终点。
 
     Parameters
     ----------
@@ -75,7 +79,22 @@ def clip_logsets_by_well_tops(
                 f"井 {well_name} 层位深度反转: {top_surface_name}={top_md} m, {base_surface_name}={base_md} m。"
             )
 
-        clipped_logs = {name: log.time_slice(top_md, base_md) for name, log in logset.Logs.items()}
+        clip_start_md = max(top_md, float(logset.basis[0]))
+        clip_end_md = min(base_md, float(logset.basis[-1]))
+
+        if clip_start_md > clip_end_md:
+            raise ValueError(
+                f"井 {well_name} 的层位区间与日志 MD 范围无重叠: "
+                f"[{top_md}, {base_md}] m vs [{float(logset.basis[0])}, {float(logset.basis[-1])}] m。"
+            )
+
+        clipped_logs: Dict[str, grid.Log] = {}
+        for name, log in logset.Logs.items():
+            sliced = log.time_slice(clip_start_md, clip_end_md)
+            if not isinstance(sliced, grid.Log):
+                raise TypeError(f"井 {well_name} 的曲线 {name} 裁剪后类型不是 Log。")
+            clipped_logs[name] = cast(grid.Log, sliced)
+
         clipped_logsets[well_name] = grid.LogSet(clipped_logs)
 
     return clipped_logsets

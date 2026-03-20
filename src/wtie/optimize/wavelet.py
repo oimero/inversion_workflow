@@ -140,7 +140,7 @@ def zero_phasing_wavelet(wavelet: grid.Wavelet) -> grid.Wavelet:
     return grid.Wavelet(wlt_0, wavelet.basis, name=wavelet.name)
 
 
-def get_phase(wavelet: grid.Wavelet, to_degree: bool = True):
+def get_phase(wavelet: grid.Wavelet, to_degree: bool = True) -> tuple[np.ndarray, np.ndarray]:
     """计算子波相位谱。
 
     Parameters
@@ -159,7 +159,9 @@ def get_phase(wavelet: grid.Wavelet, to_degree: bool = True):
     return ff, phase
 
 
-def get_spectrum(wavelet: grid.Wavelet, to_degree: bool = True):
+def get_spectrum(
+    wavelet: grid.Wavelet, to_degree: bool = True
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """计算子波频谱特征。
 
     Parameters

@@ -1,38 +1,244 @@
-"""Utilities for loading well and seismic data."""
+"""井与地震数据加载工具。"""
 
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import lasio
 import numpy as np
 import pandas as pd
-import pyzgy
 
 from wtie.processing import grid
 from wtie.processing.logs import interpolate_nans
 
+_VP_MNEMONICS = ("DT", "DTC", "DTCO", "DTC1", "AC")
+_VS_MNEMONICS = ("DTS", "DTSM", "DTS1")
+_RHO_MNEMONICS = ("DEN", "RHOB", "RHOZ", "HDRA")
+_GR_MNEMONICS = ("GR",)
+_SENTINEL_VALUES = (-999.0, -999.25)
+
+
+def _normalize_mnemonic(name: str) -> str:
+    return str(name).strip().upper()
+
+
+def _select_curve_mnemonic(
+    las_df: pd.DataFrame,
+    candidate_mnemonics: Tuple[str, ...],
+    property_name: str,
+    curve_mnemonic: Optional[str] = None,
+) -> str:
+    columns = [str(c) for c in las_df.columns]
+    norm_to_original = {_normalize_mnemonic(c): c for c in columns}
+
+    if curve_mnemonic is not None:
+        norm_user = _normalize_mnemonic(curve_mnemonic)
+        if norm_user not in norm_to_original:
+            raise ValueError(f"指定的 {property_name} 曲线简称不存在: {curve_mnemonic}. 可用曲线: {columns}")
+        return norm_to_original[norm_user]
+
+    wanted = {_normalize_mnemonic(m) for m in candidate_mnemonics}
+    matched = [col for col in columns if _normalize_mnemonic(col) in wanted]
+
+    if len(matched) == 0:
+        raise ValueError(f"未找到 {property_name} 曲线。候选简称: {list(candidate_mnemonics)}; 可用曲线: {columns}")
+
+    if len(matched) > 1:
+        raise ValueError(
+            f"检测到多个 {property_name} 候选曲线: {matched}. 请通过 curve_mnemonic 显式指定要使用的简称。"
+        )
+
+    return matched[0]
+
+
+def _get_curve_unit(las_file: lasio.LASFile, selected_mnemonic: str) -> str:
+    norm_selected = _normalize_mnemonic(selected_mnemonic)
+    for curve in las_file.curves:
+        if _normalize_mnemonic(curve.mnemonic) == norm_selected:
+            return str(curve.unit or "")
+    return ""
+
+
+def _replace_sentinel_values(values: object) -> np.ndarray:
+    out = np.asarray(values, dtype=float).copy()
+    for sentinel in _SENTINEL_VALUES:
+        out[np.isclose(out, sentinel, equal_nan=False)] = np.nan
+    out[~np.isfinite(out)] = np.nan
+    return out
+
+
+def _convert_sonic_to_velocity_mps(sonic_values: object, unit: str, property_name: str) -> np.ndarray:
+    sonic = _replace_sentinel_values(sonic_values)
+    sonic[sonic <= 0] = np.nan
+
+    unit_norm = str(unit).strip().lower().replace(" ", "")
+    if unit_norm in {"us/ft", "μs/ft", "µs/ft"}:
+        velocity = 0.3048 * 1e6 / sonic
+    elif unit_norm in {"us/m", "μs/m", "µs/m"}:
+        velocity = 1e6 / sonic
+    else:
+        raise ValueError(f"{property_name} 曲线单位不受支持: '{unit}'. 当前仅支持 us/ft 或 us/m。")
+
+    if np.all(np.isnan(velocity)):
+        raise ValueError(f"{property_name} 曲线在异常值处理与单位转换后全部为 NaN。")
+
+    return velocity
+
+
+def _convert_density_to_g_cm3(density_values: object, unit: str) -> np.ndarray:
+    density = _replace_sentinel_values(density_values)
+
+    unit_norm = str(unit).strip().lower().replace(" ", "")
+    if unit_norm in {"g/cm3", "g/cc", "g/cm^3"}:
+        density_g_cm3 = density
+    elif unit_norm in {"kg/m3", "kg/m^3"}:
+        density_g_cm3 = density / 1000.0
+    else:
+        raise ValueError(f"Rho 曲线单位不受支持: '{unit}'. 当前仅支持 g/cm3、g/cc 或 kg/m3。")
+
+    if np.all(np.isnan(density_g_cm3)):
+        raise ValueError("Rho 曲线在异常值处理与单位转换后全部为 NaN。")
+
+    return density_g_cm3
+
+
+def extract_vp_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[str] = None) -> grid.Log:
+    """
+    从 LAS 文件中提取纵波速度曲线（Vp），输出单位统一为 m/s。
+
+    Parameters
+    ----------
+    las_file : lasio.LASFile
+        已加载的 LAS 文件对象。
+    curve_mnemonic : str, optional
+        指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
+
+    Returns
+    -------
+    grid.Log
+        纵波速度曲线，单位为 m/s。
+
+    Raises
+    ------
+    ValueError
+        曲线缺失、候选歧义或单位不受支持时抛出。
+    """
+    las_df = las_file.df()
+    selected = _select_curve_mnemonic(las_df, _VP_MNEMONICS, "Vp", curve_mnemonic)
+    unit = _get_curve_unit(las_file, selected)
+    vp = _convert_sonic_to_velocity_mps(las_df.loc[:, selected].to_numpy(), unit, "Vp")
+    vp = interpolate_nans(vp, method="linear")
+    return grid.Log(vp, las_df.index.values, "md", name="Vp", unit="m/s", allow_nan=True)
+
+
+def extract_vs_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[str] = None) -> grid.Log:
+    """
+    从 LAS 文件中提取横波速度曲线（Vs），输出单位统一为 m/s。
+
+    Parameters
+    ----------
+    las_file : lasio.LASFile
+        已加载的 LAS 文件对象。
+    curve_mnemonic : str, optional
+        指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
+
+    Returns
+    -------
+    grid.Log
+        横波速度曲线，单位为 m/s。
+
+    Raises
+    ------
+    ValueError
+        曲线缺失、候选歧义或单位不受支持时抛出。
+    """
+    las_df = las_file.df()
+    selected = _select_curve_mnemonic(las_df, _VS_MNEMONICS, "Vs", curve_mnemonic)
+    unit = _get_curve_unit(las_file, selected)
+    vs = _convert_sonic_to_velocity_mps(las_df.loc[:, selected].to_numpy(), unit, "Vs")
+    vs = interpolate_nans(vs, method="linear")
+    return grid.Log(vs, las_df.index.values, "md", name="Vs", unit="m/s", allow_nan=True)
+
+
+def extract_rho_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[str] = None) -> grid.Log:
+    """
+    从 LAS 文件中提取密度曲线（Rho），输出单位统一为 g/cm3。
+
+    Parameters
+    ----------
+    las_file : lasio.LASFile
+        已加载的 LAS 文件对象。
+    curve_mnemonic : str, optional
+        指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
+
+    Returns
+    -------
+    grid.Log
+        密度曲线，单位为 g/cm3。
+
+    Raises
+    ------
+    ValueError
+        曲线缺失、候选歧义或单位不受支持时抛出。
+    """
+    las_df = las_file.df()
+    selected = _select_curve_mnemonic(las_df, _RHO_MNEMONICS, "Rho", curve_mnemonic)
+    unit = _get_curve_unit(las_file, selected)
+    rho = _convert_density_to_g_cm3(las_df.loc[:, selected].to_numpy(), unit)
+    rho = interpolate_nans(rho, method="linear")
+    return grid.Log(rho, las_df.index.values, "md", name="Rho", unit="g/cm3", allow_nan=True)
+
+
+def extract_gr_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[str] = None) -> grid.Log:
+    """
+    从 LAS 文件中提取伽马曲线（GR）。
+
+    Parameters
+    ----------
+    las_file : lasio.LASFile
+        已加载的 LAS 文件对象。
+    curve_mnemonic : str, optional
+        指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
+
+    Returns
+    -------
+    grid.Log
+        伽马曲线。
+
+    Raises
+    ------
+    ValueError
+        曲线缺失或候选歧义时抛出。
+    """
+    las_df = las_file.df()
+    selected = _select_curve_mnemonic(las_df, _GR_MNEMONICS, "GR", curve_mnemonic)
+    gr = _replace_sentinel_values(las_df.loc[:, selected].to_numpy())
+    if np.all(np.isnan(gr)):
+        raise ValueError("GR 曲线在异常值处理后全部为 NaN。")
+    gr = interpolate_nans(gr, method="linear")
+    return grid.Log(gr, las_df.index.values, "md", name="GR", allow_nan=True)
+
 
 def _read_text_lines_with_fallback(file_path: Path, encodings: Optional[List[str]] = None) -> List[str]:
     """
-    Read text file lines with encoding fallbacks.
+    使用编码回退策略读取文本文件行。
 
     Parameters
     ----------
     file_path : Path
-        Target file path.
+        目标文件路径。
     encodings : List[str], optional
-        Candidate encodings to try in order.
+        按顺序尝试的候选编码列表。
 
     Returns
     -------
     List[str]
-        File lines decoded to Python strings.
+        解码后的文本行列表。
 
     Raises
     ------
     UnicodeDecodeError
-        If all candidate encodings fail.
+        当所有候选编码均解码失败时抛出。
     """
     if encodings is None:
         encodings = ["utf-8", "utf-8-sig", "gb18030", "cp1252", "latin-1"]
@@ -53,13 +259,12 @@ def _read_text_lines_with_fallback(file_path: Path, encodings: Optional[List[str
 
 def _split_petrel_data_line(line: str) -> List[str]:
     """
-    Split a Petrel data line by whitespace while preserving double-quoted fields.
+    按空白符拆分 Petrel 数据行，同时保留双引号包裹字段的完整性。
 
     Notes
     -----
-    Petrel exports may contain single quotes in unquoted tokens (for example
-    latitude/longitude DMS text). We therefore only treat double quotes as
-    field wrappers.
+    Petrel 导出内容中，未加引号的 token 里可能包含单引号（例如经纬度
+    DMS 文本）。因此这里只将双引号视为字段包裹符。
     """
     tokens = re.findall(r'"[^"]*"|\S+', line)
     return [t[1:-1] if len(t) >= 2 and t[0] == '"' and t[-1] == '"' else t for t in tokens]
@@ -67,24 +272,24 @@ def _split_petrel_data_line(line: str) -> List[str]:
 
 def import_well_heads_petrel(well_heads_file: Path) -> pd.DataFrame:
     """
-    Import Petrel well heads file and keep only required columns.
+    导入 Petrel 井头文件，并仅保留所需列。
 
     Parameters
     ----------
     well_heads_file : Path
-        Path to a Petrel exported well heads text file.
+        Petrel 导出的井头文本文件路径。
 
     Returns
     -------
     pd.DataFrame
-        DataFrame with exactly these columns:
+        仅包含以下列的 DataFrame：
         ['Name', 'Surface X', 'Surface Y', 'Well datum name',
          'Well datum value', 'Bottom hole X', 'Bottom hole Y']
 
     Raises
     ------
     ValueError
-        If required columns are missing in file header.
+        当文件头中缺少必需列时抛出。
     """
     required_columns = [
         "Name",
@@ -143,26 +348,26 @@ def import_well_heads_petrel(well_heads_file: Path) -> pd.DataFrame:
 
 def import_well_tops_petrel(well_tops_file: Path) -> pd.DataFrame:
     """
-    Import Petrel well tops file and keep only required columns.
+    导入 Petrel 分层文件，并仅保留所需列。
 
-    The function reads header definitions between ``BEGIN HEADER`` and
-    ``END HEADER`` then parses data lines with quote-aware tokenization.
+    函数会先读取 ``BEGIN HEADER`` 与 ``END HEADER`` 之间的表头定义，
+    然后使用感知引号的分词方式解析数据行。
 
     Parameters
     ----------
     well_tops_file : Path
-        Path to a Petrel exported well tops text file.
+        Petrel 导出的分层文本文件路径。
 
     Returns
     -------
     pd.DataFrame
-        DataFrame with exactly these columns:
+        仅包含以下列的 DataFrame：
         ['Well', 'Surface', 'X', 'Y', 'Z', 'MD', 'PVD auto']
 
     Raises
     ------
     ValueError
-        If required columns are missing in file header.
+        当文件头中缺少必需列时抛出。
     """
     required_columns = ["Well", "Surface", "X", "Y", "Z", "MD", "PVD auto"]
 
@@ -209,4 +414,3 @@ def import_well_tops_petrel(well_tops_file: Path) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     return df
-

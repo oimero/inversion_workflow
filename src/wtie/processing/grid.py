@@ -757,7 +757,21 @@ class LogSet:
     def __getitem__(self, key: str):
         return self.Logs[key]
 
-    def __setitem__(self, log: Log, key: str):
+    def add_log(self, key: str, log: Log):
+        """显式向 LogSet 新增一条曲线。
+
+        Parameters
+        ----------
+        key : str
+            曲线键名，例如 'Vs'、'GR'、'Cali'。
+        log : Log
+            待插入的曲线对象，需与当前 LogSet 共享同一 basis 与 basis_type。
+
+        Raises
+        ------
+        AssertionError
+            当 key 已存在，或输入曲线与当前 LogSet 基准不一致时触发。
+        """
         self._verify_log(log)
         assert key not in self.Logs.keys()
         self.Logs[key] = log
@@ -765,6 +779,10 @@ class LogSet:
         if key == "Vs":
             self.Vs = log
             self.vs = log.values
+
+    def __setitem__(self, key: str, log: Log):
+        """按映射协议插入曲线，等价于 add_log(key, log)。"""
+        self.add_log(key, log)
 
     @property
     def AI(self) -> Log:
@@ -1387,14 +1405,14 @@ def get_matching_traces(
         trace1_match = type(trace1)(
             trace1.values[idx_start_t1:idx_end_t1],
             trace1.basis[idx_start_t1:idx_end_t1],
-            _inverted_name(trace1.basis_type), # type: ignore
+            _inverted_name(trace1.basis_type),  # type: ignore
             name=trace1.name,
         )
 
         trace2_match = type(trace2)(
             trace2.values[idx_start_t2:idx_end_t2],
             trace2.basis[idx_start_t2:idx_end_t2],
-            _inverted_name(trace2.basis_type), # type: ignore
+            _inverted_name(trace2.basis_type),  # type: ignore
             name=trace2.name,
         )
 
@@ -1405,21 +1423,21 @@ def get_matching_traces(
 
         for theta in trace1.angles:  # type: ignore
             trace1_match.append(
-                type(trace1[theta])( # type: ignore
-                    trace1[theta].values[idx_start_t1:idx_end_t1], # type: ignore
+                type(trace1[theta])(  # type: ignore
+                    trace1[theta].values[idx_start_t1:idx_end_t1],  # type: ignore
                     trace1.basis[idx_start_t1:idx_end_t1],
                     _inverted_name(trace1.basis_type),
-                    name=trace1[theta].name, # type: ignore
+                    name=trace1[theta].name,  # type: ignore
                     theta=theta,
                 )
             )
 
             trace2_match.append(
-                type(trace2[theta])( # type: ignore
-                    trace2[theta].values[idx_start_t2:idx_end_t2], # type: ignore
+                type(trace2[theta])(  # type: ignore
+                    trace2[theta].values[idx_start_t2:idx_end_t2],  # type: ignore
                     trace2.basis[idx_start_t2:idx_end_t2],
                     _inverted_name(trace2.basis_type),
-                    name=trace2[theta].name, # type: ignore
+                    name=trace2[theta].name,  # type: ignore
                     theta=theta,
                 )
             )

@@ -8,14 +8,11 @@ import lasio
 import numpy as np
 import pandas as pd
 
+from cup.well.mnemonics import _GR_MNEMONICS, _RHO_MNEMONICS, _VP_MNEMONICS, _VS_MNEMONICS
 from wtie.processing import grid
 from wtie.processing.logs import interpolate_nans
 
-_VP_MNEMONICS = ("DT", "DTC", "DTCO", "DTC1", "AC")
-_VS_MNEMONICS = ("DTS", "DTSM", "DTS1")
-_RHO_MNEMONICS = ("DEN", "RHOB", "RHOZ", "HDRA")
-_GR_MNEMONICS = ("GR",)
-_SENTINEL_VALUES = (-999.0, -999.25)
+_SENTINEL_VALUES = (-999.0, -999.25, -99999)
 
 
 def _normalize_mnemonic(name: str) -> str:
@@ -41,7 +38,9 @@ def _select_curve_mnemonic(
     matched = [col for col in columns if _normalize_mnemonic(col) in wanted]
 
     if len(matched) == 0:
-        raise ValueError(f"未找到 {property_name} 曲线。候选简称: {list(candidate_mnemonics)}; 可用曲线: {columns}")
+        raise ValueError(
+            f"未找到 {property_name} 曲线。候选简称: {list(candidate_mnemonics)}. 请检查是否存在其他可用简称？"
+        )
 
     if len(matched) > 1:
         raise ValueError(

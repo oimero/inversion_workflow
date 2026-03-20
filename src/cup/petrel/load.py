@@ -219,6 +219,46 @@ def extract_gr_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[st
     return grid.Log(gr, las_df.index.values, "md", name="GR", allow_nan=False)
 
 
+def load_vp_rho_logset_from_las(
+    las_file_path: Path,
+    vp_mnemonic: Optional[str] = None,
+    rho_mnemonic: Optional[str] = None,
+) -> grid.LogSet:
+    """
+    从 LAS 文件路径读取 Vp 与 Rho 曲线并组装为 LogSet。
+
+    Parameters
+    ----------
+    las_file_path : Path
+        LAS 文件路径。
+    vp_mnemonic : str, optional
+        指定 Vp 使用的曲线简称。未指定时按候选简称自动匹配，若匹配到多个则报错。
+    rho_mnemonic : str, optional
+        指定 Rho 使用的曲线简称。未指定时按候选简称自动匹配，若匹配到多个则报错。
+
+    Returns
+    -------
+    grid.LogSet
+        至少包含 Vp 与 Rho 两条曲线的 LogSet。
+
+    Raises
+    ------
+    ValueError
+        曲线不存在、候选歧义或单位不受支持时抛出。
+    FileNotFoundError
+        输入 LAS 文件路径不存在时抛出。
+    """
+    las_file_path = Path(las_file_path)
+    if not las_file_path.exists():
+        raise FileNotFoundError(f"LAS 文件不存在: {las_file_path}")
+
+    las_file = lasio.read(las_file_path)
+    vp_log = extract_vp_log_from_las(las_file, curve_mnemonic=vp_mnemonic)
+    rho_log = extract_rho_log_from_las(las_file, curve_mnemonic=rho_mnemonic)
+
+    return grid.LogSet({"Vp": vp_log, "Rho": rho_log})
+
+
 def _read_text_lines_with_fallback(file_path: Path, encodings: Optional[List[str]] = None) -> List[str]:
     """
     使用编码回退策略读取文本文件行。

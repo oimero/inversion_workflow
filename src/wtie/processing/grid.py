@@ -237,7 +237,7 @@ class BaseTrace(BaseObject):
 
     @basis.setter
     def basis(self, new_value):
-        self.series.set_axis(new_value, copy=False)
+        self.series = self.series.set_axis(new_value, axis="index", copy=False)
 
     def __len__(self):
         return self.size

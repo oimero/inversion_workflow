@@ -218,6 +218,47 @@ def extract_gr_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[st
     return grid.Log(gr, las_df.index.values, "md", name="GR", allow_nan=False)
 
 
+def extract_any_log_from_las(las_file: lasio.LASFile, curve_mnemonic: str) -> grid.Log:
+    """
+    从 LAS 文件中提取任意单条曲线。
+
+    Parameters
+    ----------
+    las_file : lasio.LASFile
+        已加载的 LAS 文件对象。
+    curve_mnemonic : str
+        目标曲线简称，大小写不敏感。
+
+    Returns
+    -------
+    grid.Log
+        提取后的曲线。仅做异常值替换，不做插值；允许包含 NaN。
+
+    Raises
+    ------
+    ValueError
+        当 curve_mnemonic 为空、曲线不存在或异常值处理后全部为 NaN 时抛出。
+    """
+    curve_mnemonic = str(curve_mnemonic).strip()
+    if not curve_mnemonic:
+        raise ValueError("curve_mnemonic 不能为空。")
+
+    las_df = las_file.df()
+    columns = [str(c) for c in las_df.columns]
+    norm_to_original = {_normalize_mnemonic(c): c for c in columns}
+
+    norm_user = _normalize_mnemonic(curve_mnemonic)
+    if norm_user not in norm_to_original:
+        raise ValueError(f"指定曲线简称不存在: {curve_mnemonic}. 可用曲线: {columns}")
+
+    selected = norm_to_original[norm_user]
+    values = _replace_sentinel_values(las_df.loc[:, selected].to_numpy())
+    if np.all(np.isnan(values)):
+        raise ValueError(f"{selected} 曲线在异常值处理后全部为 NaN。")
+
+    return grid.Log(values, las_df.index.values, "md", name=curve_mnemonic, unit="", allow_nan=True)
+
+
 def load_vp_rho_logset_from_las(
     las_file_path: Path,
     vp_mnemonic: Optional[str] = None,

@@ -8,7 +8,7 @@ import lasio
 import numpy as np
 import pandas as pd
 
-from cup.well.mnemonics import _GR_MNEMONICS, _RHO_MNEMONICS, _VP_MNEMONICS, _VS_MNEMONICS
+from cup.well.mnemonics import _RHO_MNEMONICS, _VP_MNEMONICS, _VS_MNEMONICS
 from wtie.processing import grid
 from wtie.processing.logs import interpolate_nans
 
@@ -188,34 +188,34 @@ def extract_rho_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[s
     return grid.Log(rho, las_df.index.values, "md", name="Rho", unit="g/cm3", allow_nan=False)
 
 
-def extract_gr_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[str] = None) -> grid.Log:
-    """
-    从 LAS 文件中提取伽马曲线（GR）。
+# def extract_gr_log_from_las(las_file: lasio.LASFile, curve_mnemonic: Optional[str] = None) -> grid.Log:
+#     """
+#     从 LAS 文件中提取伽马曲线（GR）。
 
-    Parameters
-    ----------
-    las_file : lasio.LASFile
-        已加载的 LAS 文件对象。
-    curve_mnemonic : str, optional
-        指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
+#     Parameters
+#     ----------
+#     las_file : lasio.LASFile
+#         已加载的 LAS 文件对象。
+#     curve_mnemonic : str, optional
+#         指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
 
-    Returns
-    -------
-    grid.Log
-        伽马曲线。
+#     Returns
+#     -------
+#     grid.Log
+#         伽马曲线。
 
-    Raises
-    ------
-    ValueError
-        曲线缺失或候选歧义时抛出。
-    """
-    las_df = las_file.df()
-    selected = _select_curve_mnemonic(las_df, _GR_MNEMONICS, "GR", curve_mnemonic)
-    gr = _replace_sentinel_values(las_df.loc[:, selected].to_numpy())
-    if np.all(np.isnan(gr)):
-        raise ValueError("GR 曲线在异常值处理后全部为 NaN。")
-    gr = interpolate_nans(gr, method="linear")
-    return grid.Log(gr, las_df.index.values, "md", name="GR", allow_nan=False)
+#     Raises
+#     ------
+#     ValueError
+#         曲线缺失或候选歧义时抛出。
+#     """
+#     las_df = las_file.df()
+#     selected = _select_curve_mnemonic(las_df, _GR_MNEMONICS, "GR", curve_mnemonic)
+#     gr = _replace_sentinel_values(las_df.loc[:, selected].to_numpy())
+#     if np.all(np.isnan(gr)):
+#         raise ValueError("GR 曲线在异常值处理后全部为 NaN。")
+#     gr = interpolate_nans(gr, method="linear")
+#     return grid.Log(gr, las_df.index.values, "md", name="GR", allow_nan=False)
 
 
 def extract_any_log_from_las(las_file: lasio.LASFile, curve_mnemonic: str) -> grid.Log:

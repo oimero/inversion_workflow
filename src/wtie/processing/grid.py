@@ -1168,21 +1168,21 @@ class WellPath:
         真垂深序列，单位 m，shape 为 (n_samples,)。
     tvdkb : np.ndarray
         井口基准真垂深序列，单位 m，shape 为 (n_samples,)。
-    kb : float or None
+    kb : float
         Kelly Bushing 高程，单位 m。
     """
 
-    def __init__(self, md: _sequence_t, tvdss: _sequence_t = None, kb: float = None):  # type: ignore
+    def __init__(self, md: _sequence_t, kb: float, tvdss: _sequence_t = None):  # type: ignore
         """初始化井轨迹。
 
         Parameters
         ----------
         md : np.ndarray
             井深序列，单位 m。首元素需接近 0。
-        tvdss : np.ndarray , optional
-            真垂深序列，单位 m。未提供时按垂直井处理（tvdss=md）。
-        kb : float, optional
+        kb : float
             Kelly Bushing 高程，单位 m。
+        tvdss : np.ndarray , optional
+            真垂深序列，单位 m。未提供时按垂直井处理并使用 tvdss=md-kb。
 
         Raises
         ------
@@ -1195,14 +1195,14 @@ class WellPath:
         md = np.array(md, dtype=dtype)
 
         # kelly bushing
-        self.kb = kb
+        self.kb = float(kb)
 
         if tvdss is None:
             warnings.warn(
                 "You did not provide a true vertical depth (SS) series,\
                           the well is therefore assumed to be vertical."
             )
-            tvdss = np.copy(md)
+            tvdss = md - self.kb
 
         # md is strictly increasing
         assert np.allclose(md[0], 0.0, rtol=1e-3)
@@ -1334,7 +1334,7 @@ class WellPath:
 
         new_tvd = interp(md_linear_dz)
 
-        return WellPath(md=md_linear_dz, tvdss=new_tvd)
+        return WellPath(md=md_linear_dz, tvdss=new_tvd, kb=self.kb)
 
 
 ##############################

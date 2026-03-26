@@ -1,24 +1,19 @@
-import os
-import subprocess
-import sys
-from datetime import datetime, timedelta
-from pathlib import Path
+"""wtie.utils.logger: 轻量日志与终端输出工具。
 
-"""轻量日志与终端输出工具。
+本模块提供文件日志记录器与终端输出辅助函数，覆盖初始化环境信息记录、
+耗时格式化、进度百分比输出与标准输出即时刷新等常见需求。
 
-该模块用于将运行事件写入文本日志文件，并提供简单的耗时展示、进度输出与标准输出刷新工具；
-不负责日志分级管理、日志轮转、多进程/多线程并发安全或 `logging` 标准库兼容配置。
+边界说明
+--------
+- 本模块不负责日志分级、日志轮转、结构化日志或并发写入安全。
+- 本模块不实现训练流程控制、地球物理算法计算或可视化渲染细节。
 
 核心公开对象
 ------------
-1. Logger
-    面向文件的简单日志记录器。
-2. display_time_from_seconds
-    将秒数格式化为可读字符串。
-3. simple_progressbar
-    在终端打印单行进度百分比。
-4. sysout
-    不换行输出并立即刷新。
+1. Logger: 面向文件的简单日志记录器。
+2. display_time_from_seconds: 将秒数格式化为天/时/分/秒字符串。
+3. simple_progressbar: 在终端按刷新频率输出进度百分比。
+4. sysout: 不换行写入标准输出并立即刷新。
 
 Examples
 --------
@@ -27,6 +22,12 @@ Examples
 >>> display_time_from_seconds(3661)
 'days:hours:min:sec - 0:1:1:1'
 """
+
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
 
 # TODO: look at python logging module
 

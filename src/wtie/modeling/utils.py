@@ -112,7 +112,7 @@ def create_or_load_synthetic_dataset(
         random_base_wavelet_gens=rand_base_wlt_funcs,
         perturbations=perts,  # type: ignore
         taper=taper,  # type: ignore
-    )  # type: ignore
+    )
     # -------------
     # Reflectivity
     # -------------
@@ -146,7 +146,7 @@ def create_or_load_synthetic_dataset(
     # random callable
     rnd_ref_callable = RandomReflectivityCallable(
         [rnd_u_chooser, rnd_weak_u_chooser, rnd_s_chooser, rnd_biu_chooser, spike_ref]  # type: ignore
-    )  # type: ignore
+    )
 
     # -------------
     # Noise

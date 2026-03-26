@@ -1,6 +1,6 @@
 """wtie.utils.viz: 井震对齐结果与中间量可视化工具。
 
-本模块提供叠后/叠前地震道、反射系数、波子、相关性矩阵、
+本模块提供叠后/叠前地震道、反射系数、子波、相关性矩阵、
 测井曲线与井轨迹的 Matplotlib 绘图函数，
 用于井震对齐过程中的质检、对比分析与结果展示。
 
@@ -14,7 +14,7 @@
 1. plot_trace / plot_prestack_trace: 1D 轨迹与叠前道集基础曲线图。
 2. plot_wiggle_trace / plot_prestack_wiggle_trace: wiggle 填充显示。
 3. plot_tie_window / plot_prestack_tie_window: 叠后与叠前井震对齐综合窗口。
-4. plot_wavelet / plot_prestack_wavelet: 波子时域与频域展示。
+4. plot_wavelet / plot_prestack_wavelet: 子波时域与频域展示。
 5. plot_dynamic_xcorr / plot_trace_as_pixels: 相关矩阵与像素化显示。
 
 Examples
@@ -614,12 +614,12 @@ def plot_wavelet(
     abs_t_max: float = None,  # type: ignore
     fig_axes: tuple = None,  # type: ignore
 ) -> tuple:
-    """绘制单道波子时域波形及频谱（振幅/相位）。
+    """绘制单道子波时域波形及频谱（振幅/相位）。
 
     Parameters
     ----------
     wavelet : grid.Wavelet
-        波子对象，``values`` shape 为 ``(n_samples,)``，采样间隔为 ``dt = sampling_rate``（s）。
+        子波对象，``values`` shape 为 ``(n_samples,)``，采样间隔为 ``dt = sampling_rate``（s）。
     figsize : Tuple[int, int], optional
         新建图窗尺寸（英寸）。当 ``fig_axes`` 提供时忽略。
     title : str, default="Predicted wavelet"
@@ -745,12 +745,12 @@ def plot_prestack_wavelet(
     fmax: float = None,  # type: ignore
     phi_max: float = 100,
 ) -> tuple:
-    """绘制叠前波子在三个角度下的时域与频域特征。
+    """绘制叠前子波在三个角度下的时域与频域特征。
 
     Parameters
     ----------
     wavelet : grid.PreStackWavelet
-        叠前波子集合，``values`` shape 为 ``(n_traces, n_samples)``。
+        叠前子波集合，``values`` shape 为 ``(n_traces, n_samples)``。
     figsize : Tuple[int, int], default=(9, 6)
         图幅尺寸（英寸）。
     three_angles : Tuple[int], optional

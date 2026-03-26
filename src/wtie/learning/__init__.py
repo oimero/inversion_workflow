@@ -1,1 +1,1 @@
-import wtie.learning.model
+"""Learning subpackage."""

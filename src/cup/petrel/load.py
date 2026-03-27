@@ -1,4 +1,4 @@
-"""井与地震数据加载工具。"""
+"""Petrel数据加载工具。"""
 
 import re
 from pathlib import Path

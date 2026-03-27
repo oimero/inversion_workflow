@@ -1,7 +1,7 @@
 """wtie.learning.model: 训练、轻量超参搜索与推理评估模型。
 
 本模块提供确定性/变分网络训练器、超参数搜索场景下的轻量训练器，
-以及基于已训练网络的波子波推理评估接口。
+以及基于已训练网络的子波推理评估接口。
 
 边界说明
 --------
@@ -1109,7 +1109,7 @@ class LightVariationalModel(BaseLightModel):
 
 
 class BaseEvaluator:
-    """推理评估基类：根据地震与反射率计算波子波。
+    """推理评估基类：根据地震与反射率计算子波。
 
     该类管理推理设备与网络参数加载，不负责训练与数据预处理。
 
@@ -1177,7 +1177,7 @@ class BaseEvaluator:
 
 
 class VariationalEvaluator(BaseEvaluator):
-    """变分网络推理器，支持期望波子波与随机采样。"""
+    """变分网络推理器，支持期望子波与随机采样。"""
 
     def __init__(self, network, expected_sampling, state_dict=None, device=None, verbose=True):
         """初始化变分推理器。
@@ -1206,7 +1206,7 @@ class VariationalEvaluator(BaseEvaluator):
         reflectivity: tensor_or_ndarray,
         squeeze: bool = True,
     ) -> np.ndarray:
-        """计算变分网络的期望波子波。
+        """计算变分网络的期望子波。
 
         Parameters
         ----------
@@ -1220,7 +1220,7 @@ class VariationalEvaluator(BaseEvaluator):
         Returns
         -------
         numpy.ndarray
-            期望波子波数组；当 `squeeze=True` 时会移除长度为 1 的维度。
+            期望子波数组；当 `squeeze=True` 时会移除长度为 1 的维度。
         """
 
         with torch.no_grad():
@@ -1246,7 +1246,7 @@ class VariationalEvaluator(BaseEvaluator):
         reflectivity: tensor_or_ndarray,
         squeeze: bool = True,
     ) -> np.ndarray:
-        """从变分网络分布中采样一次波子波。
+        """从变分网络分布中采样一次子波。
 
         Parameters
         ----------
@@ -1260,7 +1260,7 @@ class VariationalEvaluator(BaseEvaluator):
         Returns
         -------
         numpy.ndarray
-            单次采样波子波。
+            单次采样子波。
         """
 
         with torch.no_grad():
@@ -1287,7 +1287,7 @@ class VariationalEvaluator(BaseEvaluator):
         n: int,
         squeeze: bool = True,
     ) -> List[np.ndarray]:
-        """从变分网络分布中重复采样波子波。
+        """从变分网络分布中重复采样子波。
 
         Parameters
         ----------
@@ -1330,7 +1330,7 @@ class VariationalEvaluator(BaseEvaluator):
 
 
 class Evaluator(BaseEvaluator):
-    """确定性网络推理器：根据地震与反射率计算波子波。"""
+    """确定性网络推理器：根据地震与反射率计算子波。"""
 
     def __init__(self, network, expected_sampling, state_dict=None, device=None, verbose=True):
         """初始化确定性推理器。
@@ -1360,7 +1360,7 @@ class Evaluator(BaseEvaluator):
         squeeze: bool = False,
         scale_factor: float = None,  # type: ignore
     ) -> np.ndarray:
-        """执行一次确定性推理并返回波子波。
+        """执行一次确定性推理并返回子波。
 
         Parameters
         ----------
@@ -1376,7 +1376,7 @@ class Evaluator(BaseEvaluator):
         Returns
         -------
         numpy.ndarray
-            推理得到的波子波数组。
+            推理得到的子波数组。
         """
 
         with torch.no_grad():

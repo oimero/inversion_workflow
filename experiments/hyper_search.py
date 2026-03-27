@@ -1,4 +1,4 @@
-# File must be started with ../hyper_search.sh
+# File must be started with ../network_training_hyper_search.sh
 
 print("Loading modules...")
 
@@ -42,7 +42,7 @@ SEARCH_SPACE = [v for k, v in _params.items() if k != "meta"]
 def main():
     # init
     start_time = time.time()
-    logger = Logger(WORKDIR / "search.log")
+    logger = Logger(WORKDIR / "search.log")  # type: ignore
 
     # hyper param optim
     logger.write("\nSTART SEARCH...", highlight=True)
@@ -50,7 +50,7 @@ def main():
 
     # log
     logger.write("\nTOTAL TIME:", highlight=True)
-    logger.write(display_time_from_seconds(time.time() - start_time))
+    logger.write(display_time_from_seconds(time.time() - start_time))  # type: ignore
     logger.write("\nDONE.", highlight=True)
 
 
@@ -59,7 +59,7 @@ def prepare_dataset(save_dir):
     start_time = time.time()
 
     # log
-    logger = Logger(WORKDIR / "search.log")
+    logger = Logger(WORKDIR / "search.log")  # type: ignore
 
     # files
     h5_file = save_dir / "dataset.h5"
@@ -79,7 +79,7 @@ def prepare_dataset(save_dir):
     base_val_dataset = BaseDataset(data_creator=val_creator)
 
     logger.write("Dataset creation/loading time:")
-    logger.write(display_time_from_seconds(time.time() - start_time))
+    logger.write(display_time_from_seconds(time.time() - start_time))  # type: ignore
 
     return base_train_dataset, base_val_dataset
 
@@ -88,7 +88,7 @@ def search():
     start_time = time.time()
 
     # log
-    logger = Logger(WORKDIR / "search.log")
+    logger = Logger(WORKDIR / "search.log")  # type: ignore
 
     # dataset
     # save directory
@@ -142,10 +142,10 @@ def search():
 
         ax_client.complete_trial(trial_index=trial_index, raw_data=learner.train_and_validate())
 
-    ax_client.save_to_json_file(save_dir / "search_results.json")
+    ax_client.save_to_json_file(save_dir / "search_results.json")  # type: ignore
 
     logger.write("Total search time:")
-    logger.write(display_time_from_seconds(time.time() - start_time))
+    logger.write(display_time_from_seconds(time.time() - start_time))  # type: ignore
 
 
 if __name__ == "__main__":

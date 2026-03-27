@@ -1,9 +1,10 @@
+import math
 import warnings
 
-import math
 import numpy as np
 
 from wtie.learning.losses import VariationalLoss
+
 
 class EarlyStopping:
     """Original implementation:

@@ -1,12 +1,12 @@
 # See https://github.com/pytorch/pytorch/pull/24895/files
 
 
-from typing import List, Callable, Union, Any, TypeVar, Tuple, Iterable, Dict
-from types import FunctionType
-
-import torch
-import numpy as np
 import pathlib
+from types import FunctionType
+from typing import Any, Callable, Dict, Iterable, List, Tuple, TypeVar, Union
+
+import numpy as np
+import torch
 
 # from torch import tensor as Tensor
 

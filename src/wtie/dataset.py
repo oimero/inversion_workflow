@@ -1,6 +1,5 @@
 """Base dataset creation and handling."""
 
-
 from pathlib import Path
 
 import h5py
@@ -19,55 +18,50 @@ from wtie.utils.types_ import Dict, Tensor
 ############################
 class BaseDataset:
     """In-memory data feeder."""
-    def __init__(self,
-                 data_creator: "SyntheticDataCreator"):
+
+    def __init__(self, data_creator: "SyntheticDataCreator"):
 
         # instance of SyntheticDataCreator
         self.data_creator = data_creator
 
         # load data in memory
-        with h5py.File(data_creator.h5_file, 'r') as h5f:
-            self.wavelets = h5f[data_creator.h5_group]['wavelets'][:]
-            self.dt = h5f[data_creator.h5_group]['wavelets'].attrs['dt']
-            self.wavelet_t = h5f[data_creator.h5_group]['wavelets'].attrs['t']
+        with h5py.File(data_creator.h5_file, "r") as h5f:
+            self.wavelets = h5f[data_creator.h5_group]["wavelets"][:]
+            self.dt = h5f[data_creator.h5_group]["wavelets"].attrs["dt"]
+            self.wavelet_t = h5f[data_creator.h5_group]["wavelets"].attrs["t"]
 
-            self.reflectivities = h5f[data_creator.h5_group]['reflectivities'][:]
-            self.seismics = h5f[data_creator.h5_group]['seismics'][:]
+            self.reflectivities = h5f[data_creator.h5_group]["reflectivities"][:]
+            self.seismics = h5f[data_creator.h5_group]["seismics"][:]
 
         assert self.wavelets.shape[0] == len(self)
         assert self.reflectivities.shape[0] == len(self)
 
-
         # gather some useful attributes
-        self.wavelet_size = self.wavelets[0,:].size
+        self.wavelet_size = self.wavelets[0, :].size
         self.wavelet_duration = self.wavelet_size * self.dt
-        self.reflectivity_size = self.reflectivities[0,:].size
-        self.reflectivity_duration = self.reflectivity_size * self.dt # assumes same sampling as wavelets
+        self.reflectivity_size = self.reflectivities[0, :].size
+        self.reflectivity_duration = self.reflectivity_size * self.dt  # assumes same sampling as wavelets
         self.reflectivity_t = self.dt * np.arange(self.reflectivity_size)
 
     def __len__(self):
         return self.data_creator.num_examples
 
     def __getitem__(self, idx: int) -> Dict[str, np.ndarray]:
-        wlt = self.wavelets[idx,:]
-        ref = self.reflectivities[idx,:]
+        wlt = self.wavelets[idx, :]
+        ref = self.reflectivities[idx, :]
 
         # new noise everytime
         noise_ = self.data_creator.noise_callable()
 
-        #seismic = self.data_creator.modeler(wavelet=wlt, reflectivity=ref, noise=_noise)
-        seismic = self.seismics[idx,:]
+        # seismic = self.data_creator.modeler(wavelet=wlt, reflectivity=ref, noise=_noise)
+        seismic = self.seismics[idx, :]
         seismic += noise_
 
-        return {'wavelet': wlt,
-                'reflectivity': ref,
-                'noise': noise_,
-                'seismic': seismic
-                }
+        return {"wavelet": wlt, "reflectivity": ref, "noise": noise_, "seismic": seismic}
 
     def prepare_for_network_input(self, data: np.ndarray) -> np.ndarray:
-        data = data[np.newaxis,:]
-        data = data[np.newaxis,:]
+        data = data[np.newaxis, :]
+        data = data[np.newaxis, :]
         return data.astype(np.float32)
 
 
@@ -76,10 +70,10 @@ class BaseDataset:
 ################################
 class PytorchDataset(torch.utils.data.Dataset):
     """ """
+
     def __init__(self, base_dataset: BaseDataset):
         super().__init__()
         self.base = base_dataset
-
 
     def __len__(self):
         return len(self.base)
@@ -90,29 +84,30 @@ class PytorchDataset(torch.utils.data.Dataset):
         # convert numpy arrays to torch tensors and cast to <f4
         data_pt = {}
         for key, value in data.items():
-            #add channel for input data
-            if key in ['seismic', 'reflectivity']:
-                value = value[np.newaxis,:]
+            # add channel for input data
+            if key in ["seismic", "reflectivity"]:
+                value = value[np.newaxis, :]
             value = value.astype(np.float32)
             data_pt[key] = torch.from_numpy(value)
 
         return data_pt
 
 
-
 ############################
 # SYNTHETIC DATASET CREATION
 ############################
 class SyntheticDataCreator:
-    def __init__(self,
-                 num_examples: int,
-                 rnd_wlt_callable: RandomWaveletCallable,
-                 rnd_ref_callable: RandomReflectivityCallable,
-                 noise_callable: NoiseCallable,
-                 modeler: ModelingCallable,
-                 h5_file: str,
-                 h5_group: str,
-                 from_scratch: bool=False):
+    def __init__(
+        self,
+        num_examples: int,
+        rnd_wlt_callable: RandomWaveletCallable,
+        rnd_ref_callable: RandomReflectivityCallable,
+        noise_callable: NoiseCallable,
+        modeler: ModelingCallable,
+        h5_file: str,
+        h5_group: str,
+        from_scratch: bool = False,
+    ):
 
         self.num_examples = num_examples
 
@@ -139,7 +134,6 @@ class SyntheticDataCreator:
                 if h5_group not in h5f:
                     create = True
 
-
         if create:
             create_wavelet_dataset(num_examples, rnd_wlt_callable, h5_file, h5_group)
             create_reflectivity_dataset(num_examples, rnd_ref_callable, h5_file, h5_group)
@@ -147,55 +141,42 @@ class SyntheticDataCreator:
         else:
             print("%s -> %s dataset already exists." % (h5_file, h5_group))
 
-
         assert self.h5_file.is_file()
-
-
-
-
 
 
 ###############################
 # UTILS FUNCTIONS
 ###############################
-def create_seismic_dataset(modeler: ModelingCallable,
-                           h5_file: str,
-                           h5_group: str
-                           ) -> None:
+def create_seismic_dataset(modeler: ModelingCallable, h5_file: str, h5_group: str) -> None:
 
     print("Create seismic traces from wavelets and reflectivities and save them in %s -> %s" % (h5_file, h5_group))
 
-    with h5py.File(h5_file, 'r') as h5f:
-        wavelets = h5f[h5_group]['wavelets'][:]
-        #dt = h5f[h5_group]['wavelets'].attrs['dt']
-        #wavelet_t = h5f[h5_group]['wavelets'].attrs['t']
-        reflectivities = h5f[h5_group]['reflectivities'][:]
+    with h5py.File(h5_file, "r") as h5f:
+        wavelets = h5f[h5_group]["wavelets"][:]
+        # dt = h5f[h5_group]['wavelets'].attrs['dt']
+        # wavelet_t = h5f[h5_group]['wavelets'].attrs['t']
+        reflectivities = h5f[h5_group]["reflectivities"][:]
 
     seismics = np.zeros_like(reflectivities)
     for i in range(seismics.shape[0]):
-        seismics[i,:] = modeler(wavelet=wavelets[i,:], reflectivity=reflectivities[i,:])
-
+        seismics[i, :] = modeler(wavelet=wavelets[i, :], reflectivity=reflectivities[i, :])
 
     # save to h5 file
-    with h5py.File(h5_file, 'a') as h5f:
+    with h5py.File(h5_file, "a") as h5f:
         group = h5f.require_group(h5_group)
-        seis_ = group.create_dataset('seismics', data=seismics)
+        seis_ = group.create_dataset("seismics", data=seismics)
 
 
+def create_wavelet_dataset(
+    num_examples: int,
+    rnd_wlt_callable: RandomWaveletCallable,
+    h5_file: str,
+    h5_group: str,
+) -> None:
 
-def create_wavelet_dataset(num_examples: int,
-                           rnd_wlt_callable: RandomWaveletCallable,
-                           h5_file: str,
-                           h5_group: str,
-                           ) -> None:
-
-
-    print("Create %d wavelets and save them in %s -> %s" % (num_examples,
-                                                          h5_file,
-                                                          h5_group))
+    print("Create %d wavelets and save them in %s -> %s" % (num_examples, h5_file, h5_group))
     # initialization
-    #simple_progressbar(0, num_examples-1)
-
+    # simple_progressbar(0, num_examples-1)
 
     wlt_i = rnd_wlt_callable()
     t = wlt_i.t
@@ -206,35 +187,29 @@ def create_wavelet_dataset(num_examples: int,
     wlts[0] = wlt_i.y
 
     # creatre n wavelets
-    #count = 1
+    # count = 1
     for i in range(1, num_examples):
         wlt_i = rnd_wlt_callable()
         wlts[i] = wlt_i.y
-        #count += 1
-        #simple_progressbar(count, num_examples-1)
-
+        # count += 1
+        # simple_progressbar(count, num_examples-1)
 
     # save to h5 file
-    with h5py.File(h5_file, 'a') as h5f:
+    with h5py.File(h5_file, "a") as h5f:
         group = h5f.require_group(h5_group)
-        wlts_ = group.create_dataset('wavelets', data=wlts)
-        wlts_.attrs['dt'] = dt
-        wlts_.attrs['t'] = t
+        wlts_ = group.create_dataset("wavelets", data=wlts)
+        wlts_.attrs["dt"] = dt
+        wlts_.attrs["t"] = t
 
 
+def create_reflectivity_dataset(
+    num_examples: int, rnd_ref_callable: RandomReflectivityCallable, h5_file: str, h5_group: str
+) -> None:
 
-def create_reflectivity_dataset(num_examples: int,
-                                rnd_ref_callable: RandomReflectivityCallable,
-                                h5_file: str,
-                                h5_group: str
-                                ) -> None:
-
-    print("Create %d 1d reflectivities and save them in %s -> %s" % (num_examples,
-                                                                    h5_file,
-                                                                    h5_group))
+    print("Create %d 1d reflectivities and save them in %s -> %s" % (num_examples, h5_file, h5_group))
 
     # initialization
-    #simple_progressbar(0, num_examples-1)
+    # simple_progressbar(0, num_examples-1)
 
     ref_i = rnd_ref_callable()
     n_samples = len(ref_i)
@@ -243,14 +218,13 @@ def create_reflectivity_dataset(num_examples: int,
     refs[0] = ref_i
 
     # creatre n wavelets
-    #count = 1
+    # count = 1
     for i in range(1, num_examples):
         refs[i] = rnd_ref_callable()
-        #count += 1
-        #simple_progressbar(count, num_examples-1)
+        # count += 1
+        # simple_progressbar(count, num_examples-1)
 
     # save to h5 file
-    with h5py.File(h5_file, 'a') as h5f:
+    with h5py.File(h5_file, "a") as h5f:
         group = h5f.require_group(h5_group)
-        refs_ = group.create_dataset('reflectivities', data=refs)
-
+        refs_ = group.create_dataset("reflectivities", data=refs)

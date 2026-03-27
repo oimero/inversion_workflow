@@ -1,10 +1,11 @@
 """Loss classes"""
 
-import torch
 import math
 
-from wtie.utils.types_ import Tensor, Dict
+import torch
+
 from wtie.processing.spectral import pt_convolution
+from wtie.utils.types_ import Dict, Tensor
 
 
 class AbstractLoss(object):

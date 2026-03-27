@@ -7,11 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from wtie.learning.blocks import DoubleConv1d, Down1d, LinearLrelu
-
-from wtie.utils.types_ import List, Tuple, Tensor
-
-
-
+from wtie.utils.types_ import List, Tensor, Tuple
 
 ##################################
 # Constants

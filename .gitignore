@@ -1,5 +1,7 @@
 .vscode/*
 data/*
+experiments/optim/*
+experiments/results/*
 note/*
 site/*
 tests/*

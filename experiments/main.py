@@ -1,4 +1,4 @@
-# File must be started with ../main.sh
+# File must be started with ../train_network.sh
 
 print("Loading modules...")
 

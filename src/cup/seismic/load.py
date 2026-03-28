@@ -118,6 +118,120 @@ def _segy_read_trace_by_index(segy, trace_idx: int, sample_idx_start: int, sampl
     return segy.collect(trace_idx, trace_idx + 1, sample_idx_start, sample_idx_end).squeeze()
 
 
+def _segy_build_geometry_context(segy) -> Dict:
+    import cigsegy
+
+    meta = cigsegy.tools.get_metaInfo(segy)
+
+    offset_keyloc = int(meta.get("offset", 37))
+    ostep = int(meta.get("ostep", 1))
+    segy.setLocations(int(meta["iline"]), int(meta["xline"]), offset_keyloc)
+    segy.setSteps(int(meta["istep"]), int(meta["xstep"]), ostep)
+    segy.setXYLocations(int(meta["xloc"]), int(meta["yloc"]))
+    segy.set_segy_type(3)
+    segy.scan()
+
+    geominfo = cigsegy.tools.full_scan(
+        segy,
+        iline=int(meta["iline"]),
+        xline=int(meta["xline"]),
+        offset=offset_keyloc,
+        is4d=False,
+    )
+    geom = np.asarray(geominfo["geom"])
+    if geom.ndim != 2:
+        raise ValueError("Only 3D post-stack SEG-Y is supported.")
+
+    (i0, j0), (i1, j1), (i2, j2) = _segy_pick_affine_reference_points_from_geom(geom)
+    idx0 = int(geom[i0, j0])
+    idx1 = int(geom[i1, j1])
+    idx2 = int(geom[i2, j2])
+
+    p0 = (float(segy.coordx(idx0)), float(segy.coordy(idx0)))
+    p1 = (float(segy.coordx(idx1)), float(segy.coordy(idx1)))
+    p2 = (float(segy.coordx(idx2)), float(segy.coordy(idx2)))
+
+    return {
+        "meta": meta,
+        "geom": geom,
+        "i0": float(i0),
+        "j0": float(j0),
+        "p0": p0,
+        "p1": p1,
+        "p2": p2,
+        "min_iline": float(geominfo["iline"]["min_iline"]),
+        "min_xline": float(geominfo["xline"]["min_xline"]),
+        "istep": float(geominfo["iline"]["istep"]),
+        "xstep": float(geominfo["xline"]["xstep"]),
+    }
+
+
+def _segy_coord_to_line_from_context(ctx: Dict, x: float, y: float) -> Tuple[float, float]:
+    i, j = _segy_coord_to_index_from_3points(x, y, ctx["p0"], ctx["p1"], ctx["p2"], ctx["i0"], ctx["j0"])
+
+    ni, nx = ctx["geom"].shape
+    if not (0 <= i <= ni - 1):
+        raise ValueError(f"Point is outside SEG-Y inline range: {i}")
+    if not (0 <= j <= nx - 1):
+        raise ValueError(f"Point is outside SEG-Y crossline range: {j}")
+
+    il_no = ctx["min_iline"] + i * ctx["istep"]
+    xl_no = ctx["min_xline"] + j * ctx["xstep"]
+    return il_no, xl_no
+
+
+def _segy_line_to_index_from_context(ctx: Dict, il_no: float, xl_no: float) -> Tuple[float, float]:
+    i = (il_no - ctx["min_iline"]) / ctx["istep"]
+    j = (xl_no - ctx["min_xline"]) / ctx["xstep"]
+
+    ni, nx = ctx["geom"].shape
+    if not (0 <= i <= ni - 1):
+        raise ValueError(f"Inline is outside SEG-Y range: {il_no}")
+    if not (0 <= j <= nx - 1):
+        raise ValueError(f"Crossline is outside SEG-Y range: {xl_no}")
+
+    return i, j
+
+
+def _segy_line_to_coord_from_context(ctx: Dict, il_no: float, xl_no: float) -> Tuple[float, float]:
+    i, j = _segy_line_to_index_from_context(ctx, il_no, xl_no)
+
+    dx_il = ctx["p1"][0] - ctx["p0"][0]
+    dy_il = ctx["p1"][1] - ctx["p0"][1]
+    dx_xl = ctx["p2"][0] - ctx["p0"][0]
+    dy_xl = ctx["p2"][1] - ctx["p0"][1]
+    di = i - ctx["i0"]
+    dj = j - ctx["j0"]
+
+    x = ctx["p0"][0] + di * dx_il + dj * dx_xl
+    y = ctx["p0"][1] + di * dy_il + dj * dy_xl
+    return x, y
+
+
+def _segy_coord_to_line(segy_file: Path, x: float, y: float) -> Tuple[float, float]:
+    """将 SEG-Y 中的 XY 坐标转换为 (inline_no, crossline_no)。"""
+    import cigsegy
+
+    segy = cigsegy.Pysegy(str(segy_file))
+    try:
+        ctx = _segy_build_geometry_context(segy)
+        return _segy_coord_to_line_from_context(ctx, x, y)
+    finally:
+        segy.close()
+
+
+def _segy_line_to_coord(segy_file: Path, il_no: float, xl_no: float) -> Tuple[float, float]:
+    """将 SEG-Y 中的 (inline_no, crossline_no) 转换为 XY 坐标。"""
+    import cigsegy
+
+    segy = cigsegy.Pysegy(str(segy_file))
+    try:
+        ctx = _segy_build_geometry_context(segy)
+        return _segy_line_to_coord_from_context(ctx, il_no, xl_no)
+    finally:
+        segy.close()
+
+
 def _import_seismic_at_well_segy(
     segy_file: Path,
     well_x: float,
@@ -130,37 +244,12 @@ def _import_seismic_at_well_segy(
 
     segy = cigsegy.Pysegy(str(segy_file))
     try:
-        meta = cigsegy.tools.get_metaInfo(segy)
+        ctx = _segy_build_geometry_context(segy)
+        meta = ctx["meta"]
+        geom = ctx["geom"]
 
-        offset_keyloc = int(meta.get("offset", 37))
-        ostep = int(meta.get("ostep", 1))
-        segy.setLocations(int(meta["iline"]), int(meta["xline"]), offset_keyloc)
-        segy.setSteps(int(meta["istep"]), int(meta["xstep"]), ostep)
-        segy.setXYLocations(int(meta["xloc"]), int(meta["yloc"]))
-        segy.set_segy_type(3)
-        segy.scan()
-
-        geominfo = cigsegy.tools.full_scan(
-            segy,
-            iline=int(meta["iline"]),
-            xline=int(meta["xline"]),
-            offset=offset_keyloc,
-            is4d=False,
-        )
-        geom = np.asarray(geominfo["geom"])
-        if geom.ndim != 2:
-            raise ValueError("Only 3D post-stack SEG-Y is supported.")
-
-        (i0, j0), (i1, j1), (i2, j2) = _segy_pick_affine_reference_points_from_geom(geom)
-        idx0 = int(geom[i0, j0])
-        idx1 = int(geom[i1, j1])
-        idx2 = int(geom[i2, j2])
-
-        p0 = (float(segy.coordx(idx0)), float(segy.coordy(idx0)))
-        p1 = (float(segy.coordx(idx1)), float(segy.coordy(idx1)))
-        p2 = (float(segy.coordx(idx2)), float(segy.coordy(idx2)))
-
-        i, j = _segy_coord_to_index_from_3points(well_x, well_y, p0, p1, p2, float(i0), float(j0))
+        il_no, xl_no = _segy_coord_to_line_from_context(ctx, well_x, well_y)
+        i, j = _segy_line_to_index_from_context(ctx, il_no, xl_no)
 
         i_floor = int(np.floor(i))
         i_ceil = int(np.ceil(i))
@@ -327,5 +416,33 @@ def import_seismic_at_well(
         return _import_seismic_at_well_zgy(seismic_file, well_x, well_y, sample_start, sample_end, domain)
     if seismic_type_lower == "segy":
         return _import_seismic_at_well_segy(seismic_file, well_x, well_y, sample_start, sample_end, domain)
+
+    raise ValueError(f"Unsupported seismic_type: {seismic_type}. Expect 'segy' or 'zgy'.")
+
+
+def coord_to_line(seismic_file: Path, x: float, y: float, seismic_type: str = "segy") -> Tuple[float, float]:
+    """将 XY 坐标转换为 (inline_no, crossline_no)。"""
+    seismic_type_lower = seismic_type.lower()
+    if seismic_type_lower == "segy":
+        return _segy_coord_to_line(seismic_file, x, y)
+    if seismic_type_lower == "zgy":
+        import pyzgy
+
+        with pyzgy.open(str(seismic_file), mode="r") as reader:
+            return _zgy_coord_to_line(reader, x, y)
+
+    raise ValueError(f"Unsupported seismic_type: {seismic_type}. Expect 'segy' or 'zgy'.")
+
+
+def line_to_coord(seismic_file: Path, il_no: float, xl_no: float, seismic_type: str = "segy") -> Tuple[float, float]:
+    """将 (inline_no, crossline_no) 转换为 XY 坐标。"""
+    seismic_type_lower = seismic_type.lower()
+    if seismic_type_lower == "segy":
+        return _segy_line_to_coord(seismic_file, il_no, xl_no)
+    if seismic_type_lower == "zgy":
+        import pyzgy
+
+        with pyzgy.open(str(seismic_file), mode="r") as reader:
+            return _zgy_line_to_coord(reader, il_no, xl_no)
 
     raise ValueError(f"Unsupported seismic_type: {seismic_type}. Expect 'segy' or 'zgy'.")

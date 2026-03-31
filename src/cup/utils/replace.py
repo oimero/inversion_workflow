@@ -12,14 +12,14 @@ mnemonic，同时按曲线类型补齐标准单位。
 核心公开对象
 ------------
 1. replace_smi_las_curve_section: 处理字符串形式的 LAS 文本。
-2. replace_smi_las_curve_section_in_file: 对文件就地替换并写回。
+2. replace_smi_las_curve_section_in_file: 输出到同目录 output 子目录。
 
 Examples
 --------
 >>> from cup.utils.replace import replace_smi_las_curve_section
->>> text = "~Curve\\nGR_QYZ . :\\nRHOZ_QYZ . :\\n"
+>>> text = "~Curve\\nDTCO_QYZ . :\\nRHOZ_QYZ . :\\n"
 >>> out = replace_smi_las_curve_section(text)
->>> "GR .gAPI" in out
+>>> "DTCO .us/ft" in out
 True
 """
 
@@ -28,7 +28,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from cup.well.mnemonics import _GR_MNEMONICS, _RHO_MNEMONICS, _VP_MNEMONICS, _VS_MNEMONICS
+from cup.well.mnemonics import _RHO_MNEMONICS, _VP_MNEMONICS, _VS_MNEMONICS
 
 
 def _resolve_curve_base_name(raw_name: str) -> str | None:
@@ -47,11 +47,11 @@ def _resolve_curve_base_name(raw_name: str) -> str | None:
 
     Notes
     -----
-    - 识别集合来自 ``cup.well.mnemonics`` 中的 Vp/Vs/Rho/GR 常量。
+    - 识别集合来自 ``cup.well.mnemonics`` 中的 Vp/Vs/Rho 常量。
     - 按长度降序匹配，避免 ``DT`` 抢先匹配 ``DTCO``。
     """
     name = raw_name.strip().upper()
-    candidates = tuple(set(_GR_MNEMONICS + _RHO_MNEMONICS + _VP_MNEMONICS + _VS_MNEMONICS))
+    candidates = tuple(set(_RHO_MNEMONICS + _VP_MNEMONICS + _VS_MNEMONICS))
 
     # 优先匹配更长前缀，避免 DT 误匹配 DTCO。
     for candidate in sorted(candidates, key=len, reverse=True):
@@ -60,7 +60,7 @@ def _resolve_curve_base_name(raw_name: str) -> str | None:
     return None
 
 
-def _unit_for_curve(base_name: str, sonic_unit: str, density_unit: str, gr_unit: str) -> str:
+def _unit_for_curve(base_name: str, sonic_unit: str, density_unit: str) -> str:
     """根据基础曲线简称选择目标单位。
 
     Parameters
@@ -71,9 +71,6 @@ def _unit_for_curve(base_name: str, sonic_unit: str, density_unit: str, gr_unit:
         声波相关曲线（Vp/Vs）目标单位。
     density_unit : str
         密度曲线目标单位。
-    gr_unit : str
-        GR 曲线目标单位。
-
     Returns
     -------
     str
@@ -88,8 +85,6 @@ def _unit_for_curve(base_name: str, sonic_unit: str, density_unit: str, gr_unit:
         return sonic_unit
     if base_name in _RHO_MNEMONICS:
         return density_unit
-    if base_name in _GR_MNEMONICS:
-        return gr_unit
     raise ValueError(f"Unsupported base mnemonic: {base_name}")
 
 
@@ -97,7 +92,6 @@ def replace_smi_las_curve_section(
     text: str,
     sonic_unit: str = "us/ft",
     density_unit: str = "g/cm3",
-    gr_unit: str = "gAPI",
 ) -> str:
     """替换 SMI LAS 文本 ``~Curve`` 段内的曲线简称与单位。
 
@@ -109,8 +103,6 @@ def replace_smi_las_curve_section(
         声波曲线（Vp/Vs）默认单位。
     density_unit : str, default="g/cm3"
         密度曲线默认单位。
-    gr_unit : str, default="gAPI"
-        GR 曲线默认单位。
 
     Returns
     -------
@@ -120,7 +112,7 @@ def replace_smi_las_curve_section(
     Notes
     -----
     - 仅在 ``~Curve`` 与下一段 ``~`` 标记之间处理。
-    - 识别 ``<MNEMONIC>_...`` 形式（如 ``DTCO_QYZ``、``GR_QYZ``），并归一为基础简称。
+    - 识别 ``<MNEMONIC>_...`` 形式（如 ``DTCO_QYZ``、``RHOZ_QYZ``），并归一为基础简称。
     - 输出曲线简称统一为大写。
     - 同类曲线全部保留，不做去重。
     """
@@ -162,7 +154,7 @@ def replace_smi_las_curve_section(
             new_lines.append(line)
             continue
 
-        unit = _unit_for_curve(base_name, sonic_unit=sonic_unit, density_unit=density_unit, gr_unit=gr_unit)
+        unit = _unit_for_curve(base_name, sonic_unit=sonic_unit, density_unit=density_unit)
         indent = match.group("indent")
         newline = "\n" if line.endswith("\n") else ""
         new_lines.append(f"{indent}{base_name} .{unit:<20}: {base_name}{newline}")
@@ -174,10 +166,9 @@ def replace_smi_las_curve_section_in_file(
     file_path: Path,
     sonic_unit: str = "us/ft",
     density_unit: str = "g/cm3",
-    gr_unit: str = "gAPI",
     encoding: str = "utf-8",
-) -> None:
-    """对单个 LAS 文件执行 ``~Curve`` 段替换并覆盖写回。
+) -> Path:
+    """对单个 LAS 文件执行 ``~Curve`` 段替换并输出到 output 子目录。
 
     Parameters
     ----------
@@ -187,10 +178,13 @@ def replace_smi_las_curve_section_in_file(
         声波曲线（Vp/Vs）默认单位。
     density_unit : str, default="g/cm3"
         密度曲线默认单位。
-    gr_unit : str, default="gAPI"
-        GR 曲线默认单位。
     encoding : str, default="utf-8"
         文件读写编码。
+
+    Returns
+    -------
+    Path
+        输出文件路径：``<原目录>/output/<原文件名>``。
     """
     file_path = Path(file_path)
     raw_text = file_path.read_text(encoding=encoding)
@@ -198,6 +192,9 @@ def replace_smi_las_curve_section_in_file(
         raw_text,
         sonic_unit=sonic_unit,
         density_unit=density_unit,
-        gr_unit=gr_unit,
     )
-    file_path.write_text(new_text, encoding=encoding)
+    output_dir = file_path.parent / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / file_path.name
+    output_path.write_text(new_text, encoding=encoding)
+    return output_path

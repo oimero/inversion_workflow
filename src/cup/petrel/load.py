@@ -13,6 +13,13 @@ from wtie.processing import grid
 from wtie.processing.logs import interpolate_nans
 
 _SENTINEL_VALUES = (-999.0, -999.25, -99999)
+_INTERPRETATION_LINE_PATTERN = re.compile(
+    r"^\s*INLINE\s*:\s*([+-]?\d+)\s+XLINE\s*:\s*([+-]?\d+)\s+"
+    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+"
+    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+"
+    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*$",
+    flags=re.IGNORECASE,
+)
 
 
 def _normalize_mnemonic(name: str) -> str:
@@ -463,4 +470,62 @@ def import_well_tops_petrel(well_tops_file: Path) -> pd.DataFrame:
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    return df
+
+
+def import_interpretation_petrel(interpretation_file: Path) -> pd.DataFrame:
+    """
+    导入 Petrel 层位解释文本，返回固定五列 DataFrame。
+
+    输入行格式示例::
+
+        INLINE :   1501 XLINE :   4199    167767.05023   7264082.47336      5466.60010
+
+    Returns
+    -------
+    pd.DataFrame
+        列名固定为 ['inline', 'xline', 'x', 'y', 'interpretation']。
+        按 (inline, xline) 去重，仅保留首次出现记录。
+
+    Raises
+    ------
+    ValueError
+        当任一数据行不符合固定格式时抛出。
+    """
+    lines = _read_text_lines_with_fallback(Path(interpretation_file))
+    records = []
+
+    for line_no, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        match = _INTERPRETATION_LINE_PATTERN.match(line)
+        if match is None:
+            raise ValueError(f"Invalid interpretation line at {line_no}: {raw_line.rstrip()}")
+
+        records.append(
+            {
+                "inline": int(match.group(1)),
+                "xline": int(match.group(2)),
+                "x": float(match.group(3)),
+                "y": float(match.group(4)),
+                "interpretation": float(match.group(5)),
+            }
+        )
+
+    df = pd.DataFrame.from_records(records, columns=["inline", "xline", "x", "y", "interpretation"])
+    if df.empty:
+        return df
+
+    df = df.drop_duplicates(subset=["inline", "xline"], keep="first", ignore_index=True)
+    df = df.astype(
+        {
+            "inline": "int64",
+            "xline": "int64",
+            "x": "float64",
+            "y": "float64",
+            "interpretation": "float64",
+        }
+    )
     return df

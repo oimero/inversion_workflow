@@ -1,4 +1,4 @@
-"""Petrel/LAS 导出工具。"""
+"""Petrel数据导出工具。"""
 
 from pathlib import Path
 from typing import Dict, List, Optional, TypedDict

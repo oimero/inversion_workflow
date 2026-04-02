@@ -1,4 +1,4 @@
-"""地震工区信息查询与处理模块。"""
+"""地震工区信息查询与数据处理模块。"""
 
 from __future__ import annotations
 
@@ -148,7 +148,14 @@ class SegySurveyContext:
     xstep: float
 
     @classmethod
-    def from_file(cls, seismic_file: Path) -> "SegySurveyContext":
+    def from_file(
+        cls,
+        seismic_file: Path,
+        iline: Optional[int] = None,
+        xline: Optional[int] = None,
+        istep: Optional[int] = None,
+        xstep: Optional[int] = None,
+    ) -> "SegySurveyContext":
         import cigsegy
 
         segy = cigsegy.Pysegy(str(seismic_file))
@@ -157,16 +164,21 @@ class SegySurveyContext:
 
             offset_keyloc = int(meta.get("offset", 37))
             ostep = int(meta.get("ostep", 1))
-            segy.setLocations(int(meta["iline"]), int(meta["xline"]), offset_keyloc)
-            segy.setSteps(int(meta["istep"]), int(meta["xstep"]), ostep)
+            iline_keyloc = int(meta["iline"]) if iline is None else int(iline)
+            xline_keyloc = int(meta["xline"]) if xline is None else int(xline)
+            il_step = int(meta["istep"]) if istep is None else int(istep)
+            xl_step = int(meta["xstep"]) if xstep is None else int(xstep)
+
+            segy.setLocations(iline_keyloc, xline_keyloc, offset_keyloc)
+            segy.setSteps(il_step, xl_step, ostep)
             segy.setXYLocations(int(meta["xloc"]), int(meta["yloc"]))
             segy.set_segy_type(3)
             segy.scan()
 
             geominfo = cigsegy.tools.full_scan(
                 segy,
-                iline=int(meta["iline"]),
-                xline=int(meta["xline"]),
+                iline=iline_keyloc,
+                xline=xline_keyloc,
                 offset=offset_keyloc,
                 is4d=False,
             )
@@ -465,10 +477,23 @@ class ZgySurveyContext:
         return grid.Seismic(values=trace_data, basis=trace_axis, basis_type=basis_type, name=trace_name)
 
 
-def _resolve_context(seismic_file: Path, seismic_type: str):
+def _resolve_context(
+    seismic_file: Path,
+    seismic_type: str,
+    iline: Optional[int] = None,
+    xline: Optional[int] = None,
+    istep: Optional[int] = None,
+    xstep: Optional[int] = None,
+):
     seismic_type_lower = seismic_type.lower()
     if seismic_type_lower == "segy":
-        return SegySurveyContext.from_file(seismic_file)
+        return SegySurveyContext.from_file(
+            seismic_file,
+            iline=iline,
+            xline=xline,
+            istep=istep,
+            xstep=xstep,
+        )
     if seismic_type_lower == "zgy":
         return ZgySurveyContext.from_file(seismic_file)
     raise ValueError(f"Unsupported seismic_type: {seismic_type}. Expect 'segy' or 'zgy'.")
@@ -478,9 +503,20 @@ def query_seismic_geometry(
     seismic_file: Path,
     seismic_type: str = "segy",
     domain: Optional[str] = "time",
+    iline: Optional[int] = None,
+    xline: Optional[int] = None,
+    istep: Optional[int] = None,
+    xstep: Optional[int] = None,
 ) -> Dict[str, Any]:
     """查询地震几何信息（工区范围与采样轴）。"""
-    ctx = _resolve_context(seismic_file, seismic_type)
+    ctx = _resolve_context(
+        seismic_file,
+        seismic_type,
+        iline=iline,
+        xline=xline,
+        istep=istep,
+        xstep=xstep,
+    )
     return ctx.query_geometry(domain=domain)
 
 
@@ -492,9 +528,20 @@ def import_seismic_at_well(
     sample_end: Optional[float] = None,
     domain: str = "time",
     seismic_type: str = "segy",
+    iline: Optional[int] = None,
+    xline: Optional[int] = None,
+    istep: Optional[int] = None,
+    xstep: Optional[int] = None,
 ) -> grid.Seismic:
     """提取井位处的复合地震道（双线性插值）。"""
-    ctx = _resolve_context(seismic_file, seismic_type)
+    ctx = _resolve_context(
+        seismic_file,
+        seismic_type,
+        iline=iline,
+        xline=xline,
+        istep=istep,
+        xstep=xstep,
+    )
     return ctx.import_seismic_at_well(
         well_x=well_x,
         well_y=well_y,
@@ -504,13 +551,45 @@ def import_seismic_at_well(
     )
 
 
-def coord_to_line(seismic_file: Path, x: float, y: float, seismic_type: str = "segy") -> Tuple[float, float]:
+def coord_to_line(
+    seismic_file: Path,
+    x: float,
+    y: float,
+    seismic_type: str = "segy",
+    iline: Optional[int] = None,
+    xline: Optional[int] = None,
+    istep: Optional[int] = None,
+    xstep: Optional[int] = None,
+) -> Tuple[float, float]:
     """将 XY 坐标转换为 (inline_no, crossline_no)。"""
-    ctx = _resolve_context(seismic_file, seismic_type)
+    ctx = _resolve_context(
+        seismic_file,
+        seismic_type,
+        iline=iline,
+        xline=xline,
+        istep=istep,
+        xstep=xstep,
+    )
     return ctx.coord_to_line(x, y)
 
 
-def line_to_coord(seismic_file: Path, il_no: float, xl_no: float, seismic_type: str = "segy") -> Tuple[float, float]:
+def line_to_coord(
+    seismic_file: Path,
+    il_no: float,
+    xl_no: float,
+    seismic_type: str = "segy",
+    iline: Optional[int] = None,
+    xline: Optional[int] = None,
+    istep: Optional[int] = None,
+    xstep: Optional[int] = None,
+) -> Tuple[float, float]:
     """将 (inline_no, crossline_no) 转换为 XY 坐标。"""
-    ctx = _resolve_context(seismic_file, seismic_type)
+    ctx = _resolve_context(
+        seismic_file,
+        seismic_type,
+        iline=iline,
+        xline=xline,
+        istep=istep,
+        xstep=xstep,
+    )
     return ctx.line_to_coord(il_no, xl_no)

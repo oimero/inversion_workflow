@@ -1,4 +1,4 @@
-"""原生las曲线数据处理工具。"""
+"""原生las曲线处理工具。"""
 
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Sequence

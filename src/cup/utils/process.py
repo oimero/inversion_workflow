@@ -1,4 +1,4 @@
-"""通用曲线处理工具。"""
+"""通用曲线对象处理工具。"""
 
 from __future__ import annotations
 

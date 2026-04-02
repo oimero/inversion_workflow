@@ -1,4 +1,4 @@
-"""井曲线处理工具。"""
+"""井曲线对象处理工具。"""
 
 from typing import Dict, cast
 

@@ -1,0 +1,45 @@
+name: pinn_inversion
+channels:
+  # 强制仅使用官方 main 频道，保持底层 C 库自洽
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+  - nodefaults
+dependencies:
+  # 1. 基础环境
+  - python=3.10
+  - mkl
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - scikit-image
+  - h5py
+  - ipykernel
+  - numba
+  - tensorboard
+  - colorama
+  - plotly
+  - pip
+  - pip:
+    # 2. PyTorch
+    - --extra-index-url https://download.pytorch.org/whl/cu128
+    - torch==2.9.0+cu128
+    - torchvision==0.24.0+cu128
+
+    # 3. 贝叶斯优化核心包
+    - ax-platform==0.5.0
+    - botorch==0.13.0
+    - gpytorch==1.14
+
+    # 4. 地质物探领域冷门包
+    - lasio==0.32
+    - cigsegy==1.2.0
+    - pylops==2.6.0
+    - gempy==2025.2.0
+
+    # 5. 其他杂项包
+    - multimethod
+    - noise
+    - pyzgy
+    - pyvista
+    - mkdocs-material
+    - mkdocstrings[python]

@@ -1204,8 +1204,9 @@ class WellPath:
             )
             tvdss = md - self.kb
 
+        # 将该检查滞后到 get_tvdkb_from_inclination
+        # assert np.allclose(md[0], 0.0, rtol=1e-3)
         # md is strictly increasing
-        assert np.allclose(md[0], 0.0, rtol=1e-3)
         assert ((md[1:] - md[:-1]) > 0).all()
 
         is_going_upward = not ((tvdss[1:] - tvdss[:-1]) >= 0).all()  # type: ignore

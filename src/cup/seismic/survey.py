@@ -130,6 +130,15 @@ def _segy_coord_to_index_from_3points(
     return i0 + di, j0 + dj
 
 
+def _segy_coord_scalar_to_factor(coord_scalar: float) -> float:
+    """Convert SEG-Y coordinate scalar to multiplicative factor."""
+    if coord_scalar == 0:
+        return 1.0
+    if coord_scalar > 0:
+        return float(coord_scalar)
+    return 1.0 / abs(float(coord_scalar))
+
+
 @dataclass(frozen=True)
 class SegySurveyContext:
     """SEG-Y 工区上下文，封装坐标映射与井旁道提取。"""
@@ -160,7 +169,7 @@ class SegySurveyContext:
 
         segy = cigsegy.Pysegy(str(seismic_file))
         try:
-            meta = cigsegy.tools.get_metaInfo(segy)
+            meta = cigsegy.tools.get_metaInfo(segy, apply_scalar=True)
 
             offset_keyloc = int(meta.get("offset", 37))
             ostep = int(meta.get("ostep", 1))
@@ -191,9 +200,11 @@ class SegySurveyContext:
             idx1 = int(geom[i1, j1])
             idx2 = int(geom[i2, j2])
 
-            p0 = (float(segy.coordx(idx0)), float(segy.coordy(idx0)))
-            p1 = (float(segy.coordx(idx1)), float(segy.coordy(idx1)))
-            p2 = (float(segy.coordx(idx2)), float(segy.coordy(idx2)))
+            coord_factor = _segy_coord_scalar_to_factor(float(meta.get("scalar", 1.0)))
+
+            p0 = (float(segy.coordx(idx0)) * coord_factor, float(segy.coordy(idx0)) * coord_factor)
+            p1 = (float(segy.coordx(idx1)) * coord_factor, float(segy.coordy(idx1)) * coord_factor)
+            p2 = (float(segy.coordx(idx2)) * coord_factor, float(segy.coordy(idx2)) * coord_factor)
 
             return cls(
                 seismic_file=Path(seismic_file),

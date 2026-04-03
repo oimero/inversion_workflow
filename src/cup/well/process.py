@@ -1,12 +1,208 @@
 """井曲线对象处理工具。"""
 
-from typing import Dict, cast
+from typing import Any, Dict, Iterable, Optional, Sequence, cast
 
+import numpy as np
 import pandas as pd
 
 from wtie.processing import grid
 
 _REQUIRED_TOPS_COLUMNS = ("Well", "Surface", "MD")
+_SENTINEL_VALUES = (-999.0, -999.25, -99999.0)
+_DEFAULT_ANOMALY_VALUE = -999.25
+
+
+def _normalize_curve_name_set(
+    names: Optional[Sequence[str]],
+    param_name: str,
+) -> Optional[set[str]]:
+    """标准化曲线名称参数，返回集合或 None。"""
+    if names is None:
+        return None
+
+    if isinstance(names, str):
+        result = {names}
+    elif isinstance(names, Iterable):
+        result = set(names)
+    else:
+        raise TypeError(f"{param_name} 必须是字符串序列或 None。")
+
+    if any(not isinstance(name, str) for name in result):
+        raise TypeError(f"{param_name} 中所有元素都必须是字符串。")
+    if any(name.strip() == "" for name in result):
+        raise ValueError(f"{param_name} 中不允许空字符串。")
+
+    return result
+
+
+def _replace_constant_runs_with_anomaly(
+    values: np.ndarray,
+    min_run_length: int,
+    anomaly_value: float,
+) -> tuple[np.ndarray, int, int]:
+    """将连续相同值且长度达阈值的区间替换为异常值。"""
+    cleaned = values.copy()
+    # NaN 与约定哨兵值均视为缺失值，不参与连续相同值判定。
+    missing_mask = np.isnan(cleaned) | np.isin(cleaned, _SENTINEL_VALUES)
+
+    run_count = 0
+    replaced_points = 0
+    i = 0
+    n = cleaned.size
+    while i < n:
+        if missing_mask[i]:
+            i += 1
+            continue
+
+        j = i + 1
+        while j < n and (not missing_mask[j]) and cleaned[j] == cleaned[i]:
+            j += 1
+
+        run_len = j - i
+        if run_len >= min_run_length:
+            cleaned[i:j] = anomaly_value
+            run_count += 1
+            replaced_points += run_len
+
+        i = j
+
+    return cleaned, run_count, replaced_points
+
+
+def replace_constant_value_intervals_in_log_dicts(
+    logsets: Dict[str, Dict[str, grid.Log]],
+    min_run_length: int,
+    curve_names: Optional[Sequence[str]] = None,
+    exclude_curve_names: Optional[Sequence[str]] = None,
+    anomaly_value: float = _DEFAULT_ANOMALY_VALUE,
+) -> Dict[str, Any]:
+    """批量替换 Dict[str, grid.Log] 中连续常值区间。
+
+    判定规则：
+    - 连续相同值采用严格相等判定；
+    - 当连续长度大于等于 ``min_run_length`` 时，该区间全部替换为 ``anomaly_value``；
+    - 缺失值（NaN、-999.0、-999.25、-99999）不参与连续区间判定。
+
+    Parameters
+    ----------
+    logsets : Dict[str, Dict[str, grid.Log]]
+            键为井名，值为该井曲线字典（曲线名 -> ``grid.Log``）。
+    min_run_length : int
+            连续相同值触发替换的最小长度（大于等于该值触发）。
+    curve_names : Optional[Sequence[str]], default=None
+            仅处理这些曲线名；若为 None，则处理每口井全部曲线。
+    exclude_curve_names : Optional[Sequence[str]], default=None
+            从处理范围中排除这些曲线名。
+    anomaly_value : float, default=-999.25
+            用于替换目标区间的异常值。
+
+    Returns
+    -------
+    Dict[str, Any]
+            处理结果，包含：
+            - processed_logsets: Dict[str, Dict[str, grid.Log]]
+            - anomaly_value: float
+            - target_curve_count: int
+            - curves_with_replacement: int
+            - total_replaced_points: int
+            - curve_reports: List[dict]
+
+    Raises
+    ------
+    ValueError
+            当参数不合法、曲线名冲突、井内曲线名不存在时抛出。
+    TypeError
+            当输入结构或曲线对象类型不符合约定时抛出。
+    """
+    if isinstance(min_run_length, bool) or not isinstance(min_run_length, int) or min_run_length < 1:
+        raise ValueError(f"min_run_length 必须是大于等于 1 的整数，当前为: {min_run_length}")
+
+    if isinstance(anomaly_value, bool):
+        raise ValueError(f"anomaly_value 必须是数值类型，当前为: {anomaly_value}")
+    try:
+        anomaly_value = float(anomaly_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"anomaly_value 必须是数值类型，当前为: {anomaly_value}") from exc
+    if np.isnan(anomaly_value):
+        raise ValueError("anomaly_value 不能为 NaN。")
+
+    include_set = _normalize_curve_name_set(curve_names, "curve_names")
+    exclude_set = _normalize_curve_name_set(exclude_curve_names, "exclude_curve_names")
+
+    if include_set and exclude_set:
+        overlap = include_set & exclude_set
+        if overlap:
+            raise ValueError(f"curve_names 与 exclude_curve_names 存在冲突项: {sorted(overlap)}")
+
+    processed_logsets: Dict[str, Dict[str, grid.Log]] = {}
+    per_curve_report: list[Dict[str, Any]] = []
+    total_target_curve_count = 0
+    total_replaced_points = 0
+
+    for well_name, logs in logsets.items():
+        if not isinstance(logs, dict) or not logs:
+            raise TypeError(f"井 {well_name} 的曲线映射必须是非空 Dict[str, grid.Log]。")
+
+        available_curve_names = set(logs.keys())
+        if include_set:
+            missing_include = sorted(include_set - available_curve_names)
+            if missing_include:
+                raise ValueError(f"井 {well_name} 的 curve_names 中存在未找到曲线: {missing_include}")
+
+        if exclude_set:
+            missing_exclude = sorted(exclude_set - available_curve_names)
+            if missing_exclude:
+                raise ValueError(f"井 {well_name} 的 exclude_curve_names 中存在未找到曲线: {missing_exclude}")
+
+        processed_logs: Dict[str, grid.Log] = {}
+        for curve_name, log in logs.items():
+            if not isinstance(log, grid.Log):
+                raise TypeError(f"井 {well_name} 的曲线 {curve_name} 不是 grid.Log。")
+
+            if include_set is not None and curve_name not in include_set:
+                processed_logs[curve_name] = log
+                continue
+            if exclude_set is not None and curve_name in exclude_set:
+                processed_logs[curve_name] = log
+                continue
+
+            total_target_curve_count += 1
+
+            numeric_values = pd.to_numeric(pd.Series(log.values), errors="coerce").to_numpy(dtype=float)
+            cleaned_values, run_count, replaced_points = _replace_constant_runs_with_anomaly(
+                numeric_values,
+                min_run_length=min_run_length,
+                anomaly_value=anomaly_value,
+            )
+
+            if replaced_points > 0:
+                updated_log = cast(grid.Log, grid.update_trace_values(cleaned_values, log))
+                if hasattr(log, "unit"):
+                    setattr(updated_log, "unit", getattr(log, "unit"))
+                processed_logs[curve_name] = updated_log
+
+                per_curve_report.append(
+                    {
+                        "well": well_name,
+                        "curve": curve_name,
+                        "run_count": run_count,
+                        "replaced_points": replaced_points,
+                    }
+                )
+                total_replaced_points += replaced_points
+            else:
+                processed_logs[curve_name] = log
+
+        processed_logsets[well_name] = processed_logs
+
+    return {
+        "processed_logsets": processed_logsets,
+        "anomaly_value": anomaly_value,
+        "target_curve_count": total_target_curve_count,
+        "curves_with_replacement": len(per_curve_report),
+        "total_replaced_points": total_replaced_points,
+        "curve_reports": per_curve_report,
+    }
 
 
 def _get_unique_surface_md(

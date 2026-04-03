@@ -1328,7 +1328,7 @@ class WellPath:
         md_start = self.md[0]
         md_end = self.md[-1]
 
-        md_linear_dz = np.arange(md_start, md_end, dz)
+        md_linear_dz = np.arange(md_start, md_end + dz, dz)
 
         # interpolate tvd
         interp = _interp1d(self.md, self.tvdss, bounds_error=False, fill_value=self.tvdss[-1], kind=mode)

@@ -1,8 +1,8 @@
-"""cup.utils.replace: 文本替换与 LAS 曲线段规范化工具。
+"""cup.utils.replace: LAS 曲线段规范化工具。
 
-本模块提供面向文本内容的正则替换能力，当前聚焦 SMI 软件导出的
-LAS 文件 ``~Curve`` 段规范化：识别带后缀的曲线简称并归一为基础
-mnemonic，同时按曲线类型补齐标准单位。
+本模块聚焦 SMI 软件导出的 LAS 文件 ``~Curve`` 段规范化：
+识别带后缀的曲线简称并归一为基础 mnemonic，同时按曲线类型
+补齐标准单位。
 
 边界说明
 --------
@@ -11,15 +11,14 @@ mnemonic，同时按曲线类型补齐标准单位。
 
 核心公开对象
 ------------
-1. replace_smi_las_curve_section: 处理字符串形式的 LAS 文本。
-2. replace_smi_las_curve_section_in_file: 输出到同目录 output 子目录。
+1. replace_smi_las_curve_section_in_file: 读取单文件并输出到同目录 output 子目录。
 
 Examples
 --------
->>> from cup.utils.replace import replace_smi_las_curve_section
->>> text = "~Curve\\nDTCO_QYZ . :\\nRHOZ_QYZ . :\\n"
->>> out = replace_smi_las_curve_section(text)
->>> "DTCO .us/ft" in out
+>>> from pathlib import Path
+>>> from cup.utils.replace import replace_smi_las_curve_section_in_file
+>>> out_path = replace_smi_las_curve_section_in_file(Path("example.Las"))
+>>> out_path.parent.name == "output"
 True
 """
 
@@ -88,26 +87,29 @@ def _unit_for_curve(base_name: str, sonic_unit: str, density_unit: str) -> str:
     raise ValueError(f"Unsupported base mnemonic: {base_name}")
 
 
-def replace_smi_las_curve_section(
-    text: str,
+def replace_smi_las_curve_section_in_file(
+    file_path: Path,
     sonic_unit: str = "us/ft",
     density_unit: str = "g/cm3",
-) -> str:
-    """替换 SMI LAS 文本 ``~Curve`` 段内的曲线简称与单位。
+    encoding: str = "utf-8",
+) -> Path:
+    """对单个 LAS 文件执行 ``~Curve`` 段替换并输出到 output 子目录。
 
     Parameters
     ----------
-    text : str
-        输入 LAS 文本内容。
+    file_path : Path
+        待处理 LAS 文件路径。
     sonic_unit : str, default="us/ft"
         声波曲线（Vp/Vs）默认单位。
     density_unit : str, default="g/cm3"
         密度曲线默认单位。
+    encoding : str, default="utf-8"
+        文件读写编码。
 
     Returns
     -------
-    str
-        替换后的 LAS 文本内容。
+    Path
+        输出文件路径：``<原目录>/output/<原文件名(后缀统一为.las)>``。
 
     Notes
     -----
@@ -116,7 +118,9 @@ def replace_smi_las_curve_section(
     - 输出曲线简称统一为大写。
     - 同类曲线全部保留，不做去重。
     """
-    lines = text.splitlines(keepends=True)
+    file_path = Path(file_path)
+    raw_text = file_path.read_text(encoding=encoding)
+    lines = raw_text.splitlines(keepends=True)
     in_curve = False
     curve_line_pattern = re.compile(r"^(?P<indent>\s*)(?P<name>[^\s\.]+)\s*\.\s*(?P<unit>[^:\s]*)\s*:\s*(?P<desc>.*)$")
 
@@ -159,42 +163,9 @@ def replace_smi_las_curve_section(
         newline = "\n" if line.endswith("\n") else ""
         new_lines.append(f"{indent}{base_name} .{unit:<20}: {base_name}{newline}")
 
-    return "".join(new_lines)
-
-
-def replace_smi_las_curve_section_in_file(
-    file_path: Path,
-    sonic_unit: str = "us/ft",
-    density_unit: str = "g/cm3",
-    encoding: str = "utf-8",
-) -> Path:
-    """对单个 LAS 文件执行 ``~Curve`` 段替换并输出到 output 子目录。
-
-    Parameters
-    ----------
-    file_path : Path
-        待处理 LAS 文件路径。
-    sonic_unit : str, default="us/ft"
-        声波曲线（Vp/Vs）默认单位。
-    density_unit : str, default="g/cm3"
-        密度曲线默认单位。
-    encoding : str, default="utf-8"
-        文件读写编码。
-
-    Returns
-    -------
-    Path
-        输出文件路径：``<原目录>/output/<原文件名>``。
-    """
-    file_path = Path(file_path)
-    raw_text = file_path.read_text(encoding=encoding)
-    new_text = replace_smi_las_curve_section(
-        raw_text,
-        sonic_unit=sonic_unit,
-        density_unit=density_unit,
-    )
+    new_text = "".join(new_lines)
     output_dir = file_path.parent / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / file_path.name
+    output_path = output_dir / file_path.with_suffix(".las").name
     output_path.write_text(new_text, encoding=encoding)
     return output_path

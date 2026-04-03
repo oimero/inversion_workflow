@@ -1,83 +1,124 @@
 """Petrel数据导出工具。"""
 
 from pathlib import Path
-from typing import Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 import lasio
 import numpy as np
 
 from wtie.processing import grid
 
-
-class ExportLogsetsSummary(TypedDict):
-    """`export_logsets_to_las` 的结构化返回类型。"""
-
-    exported_files: List[Path]
-    skipped_wells: List[Dict[str, str]]
-    skipped_curves: List[Dict[str, str]]
+WellExportInput = Union[grid.LogSet, Dict[str, grid.Log]]
 
 
-def _resolve_export_curve(logset: grid.LogSet, curve_name: str) -> grid.Log:
-    """按曲线名从 LogSet 获取可导出曲线（含派生曲线）。"""
-    if curve_name in logset.Logs:
-        return logset.Logs[curve_name]
+def _extract_logs_mapping(well_data: WellExportInput) -> Mapping[str, grid.Log]:
+    """从单井数据中提取曲线映射。"""
+    if hasattr(well_data, "Logs"):
+        logs = getattr(well_data, "Logs")
+    elif isinstance(well_data, Mapping):
+        logs = well_data
+    else:
+        logs = None
 
-    if curve_name == "AI":
-        return logset.AI
+    if not isinstance(logs, Mapping) or not logs:
+        raise KeyError("单井数据缺少有效的日志映射")
 
-    if curve_name == "Vp_Vs_ratio":
-        return logset.Vp_Vs_ratio
+    for curve_name, curve in logs.items():
+        if not isinstance(curve, grid.Log):
+            raise TypeError(f"曲线 {curve_name} 不是 grid.Log")
+
+    return logs
+
+
+def _extract_basis(well_data: WellExportInput) -> np.ndarray:
+    """从单井数据中提取深度基准。"""
+    if hasattr(well_data, "basis"):
+        basis = getattr(well_data, "basis")
+    else:
+        logs = _extract_logs_mapping(well_data)
+        first_log = next(iter(logs.values()))
+        basis = first_log.basis
+        first_basis_type = first_log.basis_type
+        for curve_name, log in logs.items():
+            if not np.allclose(basis, log.basis):
+                raise ValueError(f"曲线 {curve_name} 的 basis 与首条曲线不一致")
+            if log.basis_type != first_basis_type:
+                raise ValueError(f"曲线 {curve_name} 的 basis_type 与首条曲线不一致")
+
+    if basis is None:
+        raise KeyError("单井数据缺少 basis")
+
+    return np.asarray(basis, dtype=float)
+
+
+def _resolve_export_curve(well_data: WellExportInput, curve_name: str) -> grid.Log:
+    """按曲线名获取可导出曲线。"""
+    logs = _extract_logs_mapping(well_data)
+    if curve_name in logs:
+        return logs[curve_name]
+
+    if hasattr(well_data, "AI") and curve_name == "AI":
+        return getattr(well_data, "AI")
+
+    if hasattr(well_data, "Vp_Vs_ratio") and curve_name == "Vp_Vs_ratio":
+        return getattr(well_data, "Vp_Vs_ratio")
 
     raise KeyError(f"曲线不存在: {curve_name}")
 
 
-def _build_las_from_logset(
+def _extract_curve_values_and_unit(curve: grid.Log) -> tuple[np.ndarray, str]:
+    """统一提取曲线数据与单位。"""
+    values = np.asarray(curve.values, dtype=float)
+    unit = "" if getattr(curve, "unit", None) is None else str(getattr(curve, "unit"))
+    return values, unit
+
+
+def _build_las_from_well_data(
     well_name: str,
-    logset: grid.LogSet,
+    well_data: WellExportInput,
     selected_curve_names: List[str],
     null_value: float,
 ) -> lasio.LASFile:
-    """将单井 LogSet 组装为 LASFile。"""
+    """将单井数据组装为 LASFile。"""
     las = lasio.LASFile()
     las.well["WELL"].value = well_name
     las.well["NULL"].value = float(null_value)
 
-    basis = np.asarray(logset.basis, dtype=float)
+    basis = _extract_basis(well_data)
     las.append_curve("DEPT", basis, unit="m", descr="Depth")
 
     for curve_name in selected_curve_names:
-        log = _resolve_export_curve(logset, curve_name)
-        values = np.asarray(log.values, dtype=float)
-        unit = "" if log.unit is None else str(log.unit)
+        curve = _resolve_export_curve(well_data, curve_name)
+        values, unit = _extract_curve_values_and_unit(curve)
         las.append_curve(curve_name, values, unit=unit, descr=curve_name)
 
     return las
 
 
 def export_logsets_to_las(
-    logsets: Dict[str, grid.LogSet],
+    logsets: Dict[str, WellExportInput],
     output_dir: Path,
     curve_names: Optional[List[str]] = None,
     null_value: float = -999.25,
-) -> ExportLogsetsSummary:
-    """按井批量导出 LogSet 到 LAS 文件。
+) -> Dict[str, Any]:
+    """按井批量导出 LogSet/类 LogSet 字典到 LAS 文件。
 
     Parameters
     ----------
-    logsets : Dict[str, grid.LogSet]
-            键为井名，值为对应 LogSet。
+    logsets : Dict[str, WellExportInput]
+            键为井名，值为对应 LogSet 或 ``Dict[str, grid.Log]``。
     output_dir : Path
             LAS 输出目录。
     curve_names : List[str], optional
             指定导出曲线列表，按传入顺序导出。
-            若为 None，则导出该井 LogSet 中全部已有曲线。
-            支持派生曲线名称: ``AI``、``Vp_Vs_ratio``。
+            若为 None，则导出该井全部已有曲线。
+            对 LogSet 输入额外支持派生曲线名称: ``AI``、``Vp_Vs_ratio``。
     null_value : float, default -999.25
             导出 LAS 的 NULL 指示值。
 
     Returns
     -------
-    ExportLogsetsSummary
+    Dict[str, Any]
             导出汇总信息，包含：
             - exported_files: List[Path]
             - skipped_wells: List[dict]
@@ -97,17 +138,18 @@ def export_logsets_to_las(
     skipped_wells: List[Dict[str, str]] = []
     skipped_curves: List[Dict[str, str]] = []
 
-    for well_name, logset in logsets.items():
+    for well_name, well_data in logsets.items():
         try:
+            logs_mapping = _extract_logs_mapping(well_data)
             if curve_names is None:
-                requested_curve_names = list(logset.Logs.keys())
+                requested_curve_names = list(logs_mapping.keys())
             else:
                 requested_curve_names = list(curve_names)
 
             available_curve_names: List[str] = []
             for curve_name in requested_curve_names:
                 try:
-                    _resolve_export_curve(logset, curve_name)
+                    _resolve_export_curve(well_data, curve_name)
                     available_curve_names.append(curve_name)
                 except Exception as exc:
                     skipped_curves.append({"well": well_name, "curve": curve_name, "reason": str(exc)})
@@ -116,9 +158,9 @@ def export_logsets_to_las(
                 skipped_wells.append({"well": well_name, "reason": "无可导出曲线"})
                 continue
 
-            las = _build_las_from_logset(
+            las = _build_las_from_well_data(
                 well_name=well_name,
-                logset=logset,
+                well_data=well_data,
                 selected_curve_names=available_curve_names,
                 null_value=null_value,
             )

@@ -42,5 +42,6 @@ dependencies:
     - noise
     - pyzgy
     - pyvista
+    - pytest
     - mkdocs-material
     - mkdocstrings[python]

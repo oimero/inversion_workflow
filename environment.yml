@@ -20,7 +20,8 @@ dependencies:
   - plotly
   - pip
   - pip:
-    # 2. PyTorch
+    # 2. PyTorch，注意，请在 *\envs\pinn_inversion\Lib\site-packages\torch\lib 目录里
+    # 找到里面的 libiomp5md.dll 文件，直接将其删除或重命名为 .bak 备份
     - --extra-index-url https://download.pytorch.org/whl/cu128
     - torch==2.9.0+cu128
     - torchvision==0.24.0+cu128

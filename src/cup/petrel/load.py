@@ -65,22 +65,6 @@ def _get_curve_unit(las_file: lasio.LASFile, selected_mnemonic: str) -> str:
     return ""
 
 
-def _resolve_input_unit(
-    las_file: lasio.LASFile,
-    selected_mnemonic: str,
-    property_name: str,
-    provided_unit: Optional[str],
-) -> str:
-    if provided_unit is not None:
-        return str(provided_unit)
-
-    unit_from_las = _get_curve_unit(las_file, selected_mnemonic).strip()
-    if not unit_from_las:
-        raise ValueError(f"{property_name} 曲线未读取到单位信息。请通过 unit 参数显式指定输入单位。")
-
-    return unit_from_las
-
-
 def _replace_sentinel_values(values: object) -> np.ndarray:
     out = np.asarray(values, dtype=float).copy()
     for sentinel in _SENTINEL_VALUES:
@@ -127,7 +111,7 @@ def _convert_density_to_g_cm3(density_values: object, unit: str) -> np.ndarray:
 def extract_vp_log_from_las(
     las_file: lasio.LASFile,
     curve_mnemonic: Optional[str] = None,
-    unit: Optional[str] = None,
+    unit: str = "us/ft",
 ) -> grid.Log:
     """
     从 LAS 文件中提取纵波速度曲线（Vp），输出单位统一为 m/s。
@@ -138,9 +122,8 @@ def extract_vp_log_from_las(
         已加载的 LAS 文件对象。
     curve_mnemonic : str, optional
         指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
-    unit : str, optional
-        输入曲线单位。若提供，则完全覆盖 LAS 中的单位信息；
-        若不提供，则尝试从 LAS 读取单位，读取失败时会报错。
+    unit : str
+        输入曲线单位。需显式提供有效单位写法。
 
     Returns
     -------
@@ -150,12 +133,11 @@ def extract_vp_log_from_las(
     Raises
     ------
     ValueError
-        曲线缺失、候选歧义、单位缺失或单位不受支持时抛出。
+        曲线缺失、候选歧义或单位不受支持时抛出。
     """
     las_df = las_file.df()
     selected = _select_curve_mnemonic(las_df, _VP_MNEMONICS, "Vp", curve_mnemonic)
-    resolved_unit = _resolve_input_unit(las_file, selected, "Vp", unit)
-    vp = _convert_sonic_to_velocity_mps(las_df.loc[:, selected].to_numpy(), resolved_unit, "Vp")
+    vp = _convert_sonic_to_velocity_mps(las_df.loc[:, selected].to_numpy(), unit, "Vp")
     vp = interpolate_nans(vp, method="linear")
     return grid.Log(vp, las_df.index.values, "md", name="Vp", unit="m/s", allow_nan=False)
 
@@ -163,7 +145,7 @@ def extract_vp_log_from_las(
 def extract_vs_log_from_las(
     las_file: lasio.LASFile,
     curve_mnemonic: Optional[str] = None,
-    unit: Optional[str] = None,
+    unit: str = "us/ft",
 ) -> grid.Log:
     """
     从 LAS 文件中提取横波速度曲线（Vs），输出单位统一为 m/s。
@@ -174,9 +156,8 @@ def extract_vs_log_from_las(
         已加载的 LAS 文件对象。
     curve_mnemonic : str, optional
         指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
-    unit : str, optional
-        输入曲线单位。若提供，则完全覆盖 LAS 中的单位信息；
-        若不提供，则尝试从 LAS 读取单位，读取失败时会报错。
+    unit : str
+        输入曲线单位。需显式提供有效单位写法。
 
     Returns
     -------
@@ -186,12 +167,11 @@ def extract_vs_log_from_las(
     Raises
     ------
     ValueError
-        曲线缺失、候选歧义、单位缺失或单位不受支持时抛出。
+        曲线缺失、候选歧义或单位不受支持时抛出。
     """
     las_df = las_file.df()
     selected = _select_curve_mnemonic(las_df, _VS_MNEMONICS, "Vs", curve_mnemonic)
-    resolved_unit = _resolve_input_unit(las_file, selected, "Vs", unit)
-    vs = _convert_sonic_to_velocity_mps(las_df.loc[:, selected].to_numpy(), resolved_unit, "Vs")
+    vs = _convert_sonic_to_velocity_mps(las_df.loc[:, selected].to_numpy(), unit, "Vs")
     vs = interpolate_nans(vs, method="linear")
     return grid.Log(vs, las_df.index.values, "md", name="Vs", unit="m/s", allow_nan=False)
 
@@ -199,7 +179,7 @@ def extract_vs_log_from_las(
 def extract_rho_log_from_las(
     las_file: lasio.LASFile,
     curve_mnemonic: Optional[str] = None,
-    unit: Optional[str] = None,
+    unit: str = "g/cm3",
 ) -> grid.Log:
     """
     从 LAS 文件中提取密度曲线（Rho），输出单位统一为 g/cm3。
@@ -210,9 +190,8 @@ def extract_rho_log_from_las(
         已加载的 LAS 文件对象。
     curve_mnemonic : str, optional
         指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
-    unit : str, optional
-        输入曲线单位。若提供，则完全覆盖 LAS 中的单位信息；
-        若不提供，则尝试从 LAS 读取单位，读取失败时会报错。
+    unit : str
+        输入曲线单位。需显式提供有效单位写法。
 
     Returns
     -------
@@ -222,12 +201,11 @@ def extract_rho_log_from_las(
     Raises
     ------
     ValueError
-        曲线缺失、候选歧义、单位缺失或单位不受支持时抛出。
+        曲线缺失、候选歧义或单位不受支持时抛出。
     """
     las_df = las_file.df()
     selected = _select_curve_mnemonic(las_df, _RHO_MNEMONICS, "Rho", curve_mnemonic)
-    resolved_unit = _resolve_input_unit(las_file, selected, "Rho", unit)
-    rho = _convert_density_to_g_cm3(las_df.loc[:, selected].to_numpy(), resolved_unit)
+    rho = _convert_density_to_g_cm3(las_df.loc[:, selected].to_numpy(), unit)
     rho = interpolate_nans(rho, method="linear")
     return grid.Log(rho, las_df.index.values, "md", name="Rho", unit="g/cm3", allow_nan=False)
 
@@ -270,15 +248,17 @@ def extract_any_log_from_las(las_file: lasio.LASFile, curve_mnemonic: str) -> gr
     if np.all(np.isnan(values)):
         raise ValueError(f"{selected} 曲线在异常值处理后全部为 NaN。")
 
-    return grid.Log(values, las_df.index.values, "md", name=curve_mnemonic, unit="", allow_nan=True)
+    unit_from_las = _get_curve_unit(las_file, selected)
+
+    return grid.Log(values, las_df.index.values, "md", name=curve_mnemonic, unit=unit_from_las, allow_nan=True)
 
 
 def load_vp_rho_logset_from_las(
     las_file_path: Path,
     vp_mnemonic: Optional[str] = None,
     rho_mnemonic: Optional[str] = None,
-    vp_unit: Optional[str] = None,
-    rho_unit: Optional[str] = None,
+    vp_unit: Optional[str] = "us/ft",
+    rho_unit: Optional[str] = "g/cm3",
 ) -> grid.LogSet:
     """
     从 LAS 文件路径读取 Vp 与 Rho 曲线并组装为 LogSet。
@@ -292,11 +272,9 @@ def load_vp_rho_logset_from_las(
     rho_mnemonic : str, optional
         指定 Rho 使用的曲线简称。未指定时按候选简称自动匹配，若匹配到多个则报错。
     vp_unit : str, optional
-        Vp 输入单位。若提供，则完全覆盖 LAS 中的单位信息；
-        若不提供，则尝试从 LAS 读取单位，读取失败时会报错。
+        Vp 输入单位。默认值为 us/ft。
     rho_unit : str, optional
-        Rho 输入单位。若提供，则完全覆盖 LAS 中的单位信息；
-        若不提供，则尝试从 LAS 读取单位，读取失败时会报错。
+        Rho 输入单位。默认值为 g/cm3。
 
     Returns
     -------
@@ -315,8 +293,12 @@ def load_vp_rho_logset_from_las(
         raise FileNotFoundError(f"LAS 文件不存在: {las_file_path}")
 
     las_file = lasio.read(las_file_path)
-    vp_log = extract_vp_log_from_las(las_file, curve_mnemonic=vp_mnemonic, unit=vp_unit)
-    rho_log = extract_rho_log_from_las(las_file, curve_mnemonic=rho_mnemonic, unit=rho_unit)
+    vp_log = extract_vp_log_from_las(
+        las_file, curve_mnemonic=vp_mnemonic, unit=vp_unit if vp_unit is not None else "us/ft"
+    )
+    rho_log = extract_rho_log_from_las(
+        las_file, curve_mnemonic=rho_mnemonic, unit=rho_unit if rho_unit is not None else "g/cm3"
+    )
 
     return grid.LogSet({"Vp": vp_log, "Rho": rho_log})
 

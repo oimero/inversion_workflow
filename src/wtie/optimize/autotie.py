@@ -24,6 +24,7 @@ Examples
 ... )
 """
 
+import warnings
 from time import sleep
 
 from tqdm import tqdm
@@ -45,6 +46,63 @@ from wtie.utils.datasets.utils import InputSet, OutputSet
 # when INTERMEDIATE_EXPECTED_VALUE is False, prestack auto-tie can take twice as long.
 INTERMEDIATE_ZERO_PHASING: bool = True
 INTERMEDIATE_EXPECTED_VALUE: bool = True
+
+
+def _configure_runtime_warning_filters(show_all_warnings: bool = False, suppress_runtime_warnings: bool = True) -> None:
+    """配置运行期 warning 过滤规则，降低重复噪声。
+
+    Notes
+    -----
+    - 默认抑制高频重复 warning，避免优化循环刷屏。
+    - 可通过 ``show_all_warnings=True`` 关闭过滤，输出全部 warning。
+    """
+    if show_all_warnings:
+        return
+
+    # Ax 参数定义与早期随机模型拟合提示：对结果影响有限，默认静默。
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*is_ordered.*ChoiceParameter.*",
+        category=Warning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*sort_values.*ChoiceParameter.*",
+        category=Warning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*RandomModelBridge does not support prediction.*",
+        category=UserWarning,
+    )
+
+    if suppress_runtime_warnings:
+        # 业务侧高频 warning：默认静默。需要排查时可通过 show_all_warnings=True 打开。
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*Well trajectory provided\. Switching to MD -> TVDSS -> TWT conversion mode\..*",
+            category=UserWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*Truncating log as the well path information does not reach\s+the maximum depth\..*",
+            category=UserWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*Truncating log as the time-depth table does not reach\s+the maximum depth\..*",
+            category=UserWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*Casting complex values to real discards the imaginary part.*",
+            category=Warning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*Wavelet has more samples than relfectivity\..*",
+            category=UserWarning,
+        )
 
 
 def stretch_and_squeeze(
@@ -224,6 +282,12 @@ def tie_v1(
     # at this point, the wavelet is zero-phased
     if search_params is None:
         search_params = {}
+
+    _configure_runtime_warning_filters(
+        show_all_warnings=search_params.get("show_all_warnings", False),
+        suppress_runtime_warnings=search_params.get("suppress_runtime_warnings", True),
+    )
+
     num_iters = search_params.get("num_iters", 80)
     similarity_std = search_params.get("similarity_std", 0.01)
     random_ratio = search_params.get("random_ratio", 0.6)
@@ -567,12 +631,17 @@ def get_default_search_space_v1():
     True
     """
     median_length_choice = dict(
-        name="logs_median_size", type="choice", values=[i for i in range(11, 73, 2)], value_type="int"
+        name="logs_median_size",
+        type="choice",
+        values=[i for i in range(55, 365, 10)],
+        value_type="int",
+        is_ordered=True,
+        sort_values=True,
     )
 
     median_th_choice = dict(name="logs_median_threshold", type="range", bounds=[0.1, 5.5], value_type="float")
 
-    std_choice = dict(name="logs_std", type="range", bounds=[0.5, 6.5], value_type="float")
+    std_choice = dict(name="logs_std", type="range", bounds=[2.5, 32.5], value_type="float")
 
     table_t_shift_choice = dict(name="table_t_shift", type="range", bounds=[-0.012, 0.012], value_type="float")
 

@@ -8,10 +8,10 @@ import numpy as np
 
 from wtie.processing import grid
 
-WellExportInput = Union[grid.LogSet, Dict[str, grid.Log]]
+LogsetInput = Union[grid.LogSet, Dict[str, grid.Log]]
 
 
-def _extract_logs_mapping(well_data: WellExportInput) -> Mapping[str, grid.Log]:
+def _extract_logs_mapping(well_data: LogsetInput) -> Mapping[str, grid.Log]:
     """从单井数据中提取曲线映射。"""
     if hasattr(well_data, "Logs"):
         logs = getattr(well_data, "Logs")
@@ -30,7 +30,7 @@ def _extract_logs_mapping(well_data: WellExportInput) -> Mapping[str, grid.Log]:
     return logs
 
 
-def _extract_basis(well_data: WellExportInput) -> np.ndarray:
+def _extract_basis(well_data: LogsetInput) -> np.ndarray:
     """从单井数据中提取深度基准。"""
     if hasattr(well_data, "basis"):
         basis = getattr(well_data, "basis")
@@ -51,7 +51,7 @@ def _extract_basis(well_data: WellExportInput) -> np.ndarray:
     return np.asarray(basis, dtype=float)
 
 
-def _resolve_export_curve(well_data: WellExportInput, curve_name: str) -> grid.Log:
+def _resolve_export_curve(well_data: LogsetInput, curve_name: str) -> grid.Log:
     """按曲线名获取可导出曲线。"""
     logs = _extract_logs_mapping(well_data)
     if curve_name in logs:
@@ -75,7 +75,7 @@ def _extract_curve_values_and_unit(curve: grid.Log) -> tuple[np.ndarray, str]:
 
 def _build_las_from_well_data(
     well_name: str,
-    well_data: WellExportInput,
+    well_data: LogsetInput,
     selected_curve_names: List[str],
     null_value: float,
 ) -> lasio.LASFile:
@@ -96,7 +96,7 @@ def _build_las_from_well_data(
 
 
 def export_logsets_to_las(
-    logsets: Dict[str, WellExportInput],
+    logsets: Dict[str, LogsetInput],
     output_dir: Path,
     curve_names: Optional[List[str]] = None,
     null_value: float = -999.25,
@@ -106,7 +106,7 @@ def export_logsets_to_las(
 
     Parameters
     ----------
-    logsets : Dict[str, WellExportInput]
+    logsets : Dict[str, LogsetInput]
             键为井名，值为对应 LogSet 或 ``Dict[str, grid.Log]``。
     output_dir : Path
             LAS 输出目录。

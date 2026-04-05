@@ -1,6 +1,6 @@
-"""ginn.model — 1D 膨胀卷积残差网络（Dilated ResNet）。
+"""ginn.model — 1D 膨胀卷积残差网络 (Dilated ResNet)。
 
-网络接收 2 通道输入（地震 + LMF），输出 1 通道阻抗残差。
+网络接收 2 通道输入 (地震 + LMF), 输出 1 通道阻抗残差。
 阻抗残差加上 LMF 即得到完整声阻抗。
 """
 
@@ -21,11 +21,11 @@ class DilatedResBlock(nn.Module):
     Parameters
     ----------
     channels : int
-        输入与输出通道数（保持不变）。
+        输入与输出通道数 (保持不变)。
     kernel_size : int
         卷积核长度。
     dilation : int
-        膨胀倍率；padding = dilation 保证输入输出等长。
+        膨胀倍率; padding = dilation 保证输入输出等长。
     """
 
     def __init__(self, channels: int, kernel_size: int = 3, dilation: int = 1) -> None:
@@ -57,12 +57,12 @@ class DilatedResBlock(nn.Module):
         Parameters
         ----------
         x : Tensor
-            输入张量，shape ``(B, C, T)``。
+            输入张量, shape ``(B, C, T)``。
 
         Returns
         -------
         Tensor
-            输出张量，shape ``(B, C, T)``，与输入等长。
+            输出张量, shape ``(B, C, T)``, 与输入等长。
         """
         identity = x
 
@@ -92,15 +92,15 @@ class DilatedResNet1D(nn.Module):
     Parameters
     ----------
     in_channels : int
-        输入通道数，默认 2（地震 + LMF）。
+        输入通道数, 默认 2 (地震 + LMF)。
     hidden_channels : int
-        残差块内部通道数，默认 64。
+        残差块内部通道数, 默认 64。
     out_channels : int
-        输出通道数，默认 1（阻抗残差）。
+        输出通道数, 默认 1 (阻抗残差)。
     dilations : sequence of int
         各残差块的膨胀倍率。
     kernel_size : int
-        残差块卷积核长度，默认 3。
+        残差块卷积核长度, 默认 3。
     """
 
     def __init__(
@@ -144,12 +144,12 @@ class DilatedResNet1D(nn.Module):
         Parameters
         ----------
         x : Tensor
-            输入张量，shape ``(B, in_channels, T)``。
+            输入张量, shape ``(B, in_channels, T)``。
 
         Returns
         -------
         Tensor
-            阻抗残差，shape ``(B, out_channels, T)``。
+            阻抗残差, shape ``(B, out_channels, T)``。
         """
         x = self.head(x)
         x = self.res_blocks(x)

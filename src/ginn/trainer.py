@@ -1,6 +1,6 @@
 """ginn.trainer — 主训练循环。
 
-串联 DilatedResNet1D + ForwardModel + MaskedMAELoss，执行标准的
+串联 DilatedResNet1D + ForwardModel + MaskedMAELoss, 执行标准的
 前向传播 → 物理正演 → 损失计算 → 反向传播训练流程。
 """
 
@@ -70,6 +70,7 @@ class Trainer:
 
         # ── 损失 ──
         self.criterion = GINNLoss(lambda_reg=cfg.lambda_reg)
+        logger.info("Loss domain: normalized seismic amplitude (obs pre-divided by RMS)")
 
         # ── 优化器 ──
         self.optimizer = torch.optim.Adam(
@@ -92,27 +93,27 @@ class Trainer:
         self.best_loss = float("inf")
 
     def train_one_epoch(self) -> float:
-        """训练一个 epoch，返回 epoch 平均损失。"""
+        """训练一个 epoch, 返回 epoch 平均损失。"""
         self.model.train()
         epoch_loss = 0.0
         n_batches = 0
 
         for batch_idx, batch in enumerate(self.dataloader):
-            x = batch["input"].to(self.device)            # (B, 2, T)
-            d_obs = batch["obs"].to(self.device)           # (B, 1, T)
-            mask = batch["mask"].to(self.device)            # (B, 1, T)
-            lmf_raw = batch["lmf_raw"].to(self.device)     # (B, 1, T)
+            x = batch["input"].to(self.device)  # (B, 2, T)
+            d_obs = batch["obs"].to(self.device)  # (B, 1, T)
+            mask = batch["mask"].to(self.device)  # (B, 1, T)
+            lmf_raw = batch["lmf_raw"].to(self.device)  # (B, 1, T)
 
             # 1. 网络前向：输出阻抗残差
-            residual = self.model(x)                        # (B, 1, T)
+            residual = self.model(x)  # (B, 1, T)
 
             # 2. 恢复完整阻抗
-            ai = residual + lmf_raw                         # (B, 1, T)
+            ai = residual + lmf_raw  # (B, 1, T)
 
             # 3. 物理正演
-            d_syn = self.forward_model(ai)                  # (B, 1, T)
+            d_syn = self.forward_model(ai)  # (B, 1, T)
 
-            # 4. 损失（包含波形 MAE + 残差 L2 正则化）
+            # 4. 损失（obs 已在数据管线中归一化）
             loss, loss_dict = self.criterion(d_syn, d_obs, mask, residual)
 
             # 5. 反向传播
@@ -132,9 +133,13 @@ class Trainer:
                 lr = self.optimizer.param_groups[0]["lr"]
                 logger.info(
                     "  [Epoch %d | Batch %d/%d] loss=%.6f (mae=%.6f reg=%.6f) lr=%.2e",
-                    self.epoch + 1, batch_idx + 1, len(self.dataloader),
-                    loss_dict["total"], loss_dict["waveform_mae"],
-                    loss_dict["residual_l2"], lr,
+                    self.epoch + 1,
+                    batch_idx + 1,
+                    len(self.dataloader),
+                    loss_dict["total"],
+                    loss_dict["waveform_mae"],
+                    loss_dict["reg_term"],
+                    lr,
                 )
 
         avg_loss = epoch_loss / max(n_batches, 1)
@@ -184,7 +189,11 @@ class Trainer:
 
             logger.info(
                 "Epoch %d/%d  loss=%.6f  lr=%.2e  time=%.1fs",
-                epoch + 1, self.cfg.epochs, avg_loss, lr, elapsed,
+                epoch + 1,
+                self.cfg.epochs,
+                avg_loss,
+                lr,
+                elapsed,
             )
 
             # 保存最优模型
@@ -196,7 +205,7 @@ class Trainer:
             if (epoch + 1) % self.cfg.save_every == 0:
                 self.save_checkpoint()
 
-        # 训练结束，保存最终模型
+        # 训练结束, 保存最终模型
         self.save_checkpoint("final.pt")
 
         total_time = time.time() - total_start
@@ -207,12 +216,12 @@ class Trainer:
 
     @torch.no_grad()
     def predict_volume(self) -> np.ndarray:
-        """推理整个数据体，返回阻抗体。
+        """推理整个数据体, 返回阻抗体。
 
         Returns
         -------
         np.ndarray
-            预测阻抗体，shape ``(n_il, n_xl, n_t)``。
+            预测阻抗体, shape ``(n_il, n_xl, n_t)``。
         """
         self.model.eval()
 

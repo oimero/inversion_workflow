@@ -5,6 +5,7 @@ experiments/results/*
 note/*
 site/*
 tests/*
+tmp/*
 */output/*
 *.pyc
 *.prompt.md

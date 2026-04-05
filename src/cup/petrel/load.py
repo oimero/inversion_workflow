@@ -110,8 +110,8 @@ def _convert_density_to_g_cm3(density_values: object, unit: str) -> np.ndarray:
 
 def extract_vp_log_from_las(
     las_file: lasio.LASFile,
+    unit: str,
     curve_mnemonic: Optional[str] = None,
-    unit: str = "us/ft",
 ) -> grid.Log:
     """
     从 LAS 文件中提取纵波速度曲线（Vp），输出单位统一为 m/s。
@@ -120,10 +120,10 @@ def extract_vp_log_from_las(
     ----------
     las_file : lasio.LASFile
         已加载的 LAS 文件对象。
+    unit : str
+        输入曲线单位（必选）。仅支持 ``us/ft`` 或 ``us/m``。
     curve_mnemonic : str, optional
         指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
-    unit : str
-        输入曲线单位。需显式提供有效单位写法。
 
     Returns
     -------
@@ -144,8 +144,8 @@ def extract_vp_log_from_las(
 
 def extract_vs_log_from_las(
     las_file: lasio.LASFile,
+    unit: str,
     curve_mnemonic: Optional[str] = None,
-    unit: str = "us/ft",
 ) -> grid.Log:
     """
     从 LAS 文件中提取横波速度曲线（Vs），输出单位统一为 m/s。
@@ -154,10 +154,10 @@ def extract_vs_log_from_las(
     ----------
     las_file : lasio.LASFile
         已加载的 LAS 文件对象。
+    unit : str
+        输入曲线单位（必选）。仅支持 ``us/ft`` 或 ``us/m``。
     curve_mnemonic : str, optional
         指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
-    unit : str
-        输入曲线单位。需显式提供有效单位写法。
 
     Returns
     -------
@@ -178,8 +178,8 @@ def extract_vs_log_from_las(
 
 def extract_rho_log_from_las(
     las_file: lasio.LASFile,
+    unit: str,
     curve_mnemonic: Optional[str] = None,
-    unit: str = "g/cm3",
 ) -> grid.Log:
     """
     从 LAS 文件中提取密度曲线（Rho），输出单位统一为 g/cm3。
@@ -188,10 +188,10 @@ def extract_rho_log_from_las(
     ----------
     las_file : lasio.LASFile
         已加载的 LAS 文件对象。
+    unit : str
+        输入曲线单位（必选）。仅支持 ``g/cm3`` 或 ``kg/m3``。
     curve_mnemonic : str, optional
         指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
-    unit : str
-        输入曲线单位。需显式提供有效单位写法。
 
     Returns
     -------
@@ -257,7 +257,7 @@ def load_vp_rho_logset_from_las(
     las_file_path: Path,
     vp_mnemonic: Optional[str] = None,
     rho_mnemonic: Optional[str] = None,
-    vp_unit: Optional[str] = "us/ft",
+    vp_unit: Optional[str] = "us/m",
     rho_unit: Optional[str] = "g/cm3",
 ) -> grid.LogSet:
     """
@@ -272,7 +272,7 @@ def load_vp_rho_logset_from_las(
     rho_mnemonic : str, optional
         指定 Rho 使用的曲线简称。未指定时按候选简称自动匹配，若匹配到多个则报错。
     vp_unit : str, optional
-        Vp 输入单位。默认值为 us/ft。
+        Vp 输入单位。默认值为 us/m。
     rho_unit : str, optional
         Rho 输入单位。默认值为 g/cm3。
 
@@ -294,7 +294,7 @@ def load_vp_rho_logset_from_las(
 
     las_file = lasio.read(las_file_path)
     vp_log = extract_vp_log_from_las(
-        las_file, curve_mnemonic=vp_mnemonic, unit=vp_unit if vp_unit is not None else "us/ft"
+        las_file, curve_mnemonic=vp_mnemonic, unit=vp_unit if vp_unit is not None else "us/m"
     )
     rho_log = extract_rho_log_from_las(
         las_file, curve_mnemonic=rho_mnemonic, unit=rho_unit if rho_unit is not None else "g/cm3"

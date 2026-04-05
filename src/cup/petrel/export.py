@@ -100,6 +100,7 @@ def export_logsets_to_las(
     output_dir: Path,
     curve_names: Optional[List[str]] = None,
     null_value: float = -999.25,
+    write_fmt: str = "%.6f",
 ) -> Dict[str, Any]:
     """按井批量导出 LogSet/类 LogSet 字典到 LAS 文件。
 
@@ -115,6 +116,8 @@ def export_logsets_to_las(
             对 LogSet 输入额外支持派生曲线名称: ``AI``、``Vp_Vs_ratio``。
     null_value : float, default -999.25
             导出 LAS 的 NULL 指示值。
+    write_fmt : str, default "%.6f"
+        LAS 写出数值格式。用于统一数据区与 NULL 字段的小数显示位数。
 
     Returns
     -------
@@ -133,6 +136,13 @@ def export_logsets_to_las(
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not isinstance(write_fmt, str) or write_fmt.strip() == "":
+        raise ValueError("write_fmt 必须是非空字符串，例如 '%.5f'。")
+    try:
+        _ = write_fmt % 1.2345
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"write_fmt 非法: {write_fmt}，请使用类似 '%.5f' 的格式字符串。") from exc
 
     exported_files: List[Path] = []
     skipped_wells: List[Dict[str, str]] = []
@@ -165,8 +175,10 @@ def export_logsets_to_las(
                 null_value=null_value,
             )
 
+            las.well["NULL"].value = write_fmt % float(null_value)
+
             output_file = output_dir / f"{well_name}.las"
-            las.write(str(output_file), version=2.0, wrap=False)
+            las.write(str(output_file), version=2.0, wrap=False, fmt=write_fmt)
             exported_files.append(output_file)
 
         except Exception as exc:

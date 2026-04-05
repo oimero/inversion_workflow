@@ -1,6 +1,6 @@
 """井曲线对象处理工具。"""
 
-from typing import Any, Dict, Iterable, Optional, Sequence, cast
+from typing import Any, Dict, Iterable, Optional, Sequence, Union, cast
 
 import numpy as np
 import pandas as pd
@@ -10,6 +10,7 @@ from wtie.processing import grid
 _REQUIRED_TOPS_COLUMNS = ("Well", "Surface", "MD")
 _SENTINEL_VALUES = (-999.0, -999.25, -99999.0)
 _DEFAULT_ANOMALY_VALUE = -999.25
+LogsetInput = Union[grid.LogSet, Dict[str, grid.Log]]
 
 
 def _normalize_curve_name_set(
@@ -69,8 +70,33 @@ def _replace_constant_runs_with_anomaly(
     return cleaned, run_count, replaced_points
 
 
+def _normalize_logset_input(
+    logset_input: LogsetInput,
+    well_name: str,
+    *,
+    require_non_empty: bool = True,
+) -> tuple[Dict[str, grid.Log], bool]:
+    """将单井输入标准化为曲线字典，并返回是否原始为 LogSet。"""
+    if isinstance(logset_input, grid.LogSet):
+        logs = dict(logset_input.Logs)
+        if require_non_empty and not logs:
+            raise TypeError(f"井 {well_name} 的 LogSet 不能为空。")
+        return logs, True
+
+    if not isinstance(logset_input, dict):
+        raise TypeError(f"井 {well_name} 的输入必须是 grid.LogSet 或 Dict[str, grid.Log]。")
+
+    if require_non_empty and not logset_input:
+        raise TypeError(f"井 {well_name} 的曲线映射必须是非空 Dict[str, grid.Log]。")
+
+    if any(not isinstance(name, str) for name in logset_input.keys()):
+        raise TypeError(f"井 {well_name} 的曲线名必须是字符串。")
+
+    return cast(Dict[str, grid.Log], logset_input), False
+
+
 def replace_constant_value_intervals_in_log_dicts(
-    logsets: Dict[str, Dict[str, grid.Log]],
+    logsets: Dict[str, LogsetInput],
     min_run_length: int,
     curve_names: Optional[Sequence[str]] = None,
     exclude_curve_names: Optional[Sequence[str]] = None,
@@ -134,14 +160,13 @@ def replace_constant_value_intervals_in_log_dicts(
         if overlap:
             raise ValueError(f"curve_names 与 exclude_curve_names 存在冲突项: {sorted(overlap)}")
 
-    processed_logsets: Dict[str, Dict[str, grid.Log]] = {}
+    processed_logsets: Dict[str, LogsetInput] = {}
     per_curve_report: list[Dict[str, Any]] = []
     total_target_curve_count = 0
     total_replaced_points = 0
 
-    for well_name, logs in logsets.items():
-        if not isinstance(logs, dict) or not logs:
-            raise TypeError(f"井 {well_name} 的曲线映射必须是非空 Dict[str, grid.Log]。")
+    for well_name, logset_input in logsets.items():
+        logs, input_is_logset = _normalize_logset_input(logset_input, well_name, require_non_empty=True)
 
         available_curve_names = set(logs.keys())
         if include_set:
@@ -193,7 +218,10 @@ def replace_constant_value_intervals_in_log_dicts(
             else:
                 processed_logs[curve_name] = log
 
-        processed_logsets[well_name] = processed_logs
+        if input_is_logset:
+            processed_logsets[well_name] = grid.LogSet(processed_logs)
+        else:
+            processed_logsets[well_name] = processed_logs
 
     return {
         "processed_logsets": processed_logsets,
@@ -226,11 +254,11 @@ def _get_unique_surface_md(
 
 def clip_logsets_by_well_tops(
     well_tops_df: pd.DataFrame,
-    logsets: Dict[str, grid.LogSet],
+    logsets: Dict[str, LogsetInput],
     top_surface_name: str,
     base_surface_name: str,
     extend: int = 0,
-) -> Dict[str, grid.LogSet]:
+) -> Dict[str, Any]:
     """按井分层在 MD 域裁剪井曲线集合（包含端点）。
 
     当层位区间超出曲线范围时，会自动钳制到曲线边界：
@@ -251,10 +279,15 @@ def clip_logsets_by_well_tops(
     extend : int, default=0
         在 top_surface 上方、base_surface 下方额外扩展的采样点数。
 
-    Returns
-    -------
-    Dict[str, grid.LogSet]
-            按层位范围裁剪后的新字典，键与输入一致。
+        Returns
+        -------
+        Dict[str, Any]
+            处理结果，包含：
+            - processed_logsets: Dict[str, LogsetInput]
+            - target_well_count: int
+            - wells_with_fallback: int
+            - surface_fallback_count: int
+            - surface_fallback_reports: List[dict]
 
     Raises
     ------
@@ -268,19 +301,62 @@ def clip_logsets_by_well_tops(
     if isinstance(extend, bool) or not isinstance(extend, int) or extend < 0:
         raise ValueError(f"extend 必须是大于等于 0 的整数，当前为: {extend}")
 
-    clipped_logsets: Dict[str, grid.LogSet] = {}
+    clipped_logsets: Dict[str, LogsetInput] = {}
+    surface_fallback_reports: list[Dict[str, Any]] = []
 
-    for well_name, logset in logsets.items():
+    for well_name, logset_input in logsets.items():
+        logs, input_is_logset = _normalize_logset_input(logset_input, well_name, require_non_empty=True)
+        if input_is_logset:
+            logset = cast(grid.LogSet, logset_input)
+        else:
+            logset = grid.LogSet(logs)
+
         if not logset.is_md:
             raise ValueError(f"井 {well_name} 的 LogSet 不是 MD 域，无法按 MD 裁剪。")
 
-        top_md = _get_unique_surface_md(well_tops_df, well_name, top_surface_name)
-        base_md = _get_unique_surface_md(well_tops_df, well_name, base_surface_name)
+        default_md = float(logset.basis[0])
+        top_fallback = False
+        base_fallback = False
+
+        try:
+            top_md = _get_unique_surface_md(well_tops_df, well_name, top_surface_name)
+        except ValueError as exc:
+            if "未查询到层位" not in str(exc):
+                raise
+            top_md = default_md
+            top_fallback = True
+            surface_fallback_reports.append(
+                {
+                    "well": well_name,
+                    "surface": top_surface_name,
+                    "fallback_md": top_md,
+                    "reason": "surface_not_found",
+                }
+            )
+
+        try:
+            base_md = _get_unique_surface_md(well_tops_df, well_name, base_surface_name)
+        except ValueError as exc:
+            if "未查询到层位" not in str(exc):
+                raise
+            base_md = default_md
+            base_fallback = True
+            surface_fallback_reports.append(
+                {
+                    "well": well_name,
+                    "surface": base_surface_name,
+                    "fallback_md": base_md,
+                    "reason": "surface_not_found",
+                }
+            )
 
         if top_md > base_md:
-            raise ValueError(
-                f"井 {well_name} 层位深度反转: {top_surface_name}={top_md} m, {base_surface_name}={base_md} m。"
-            )
+            if top_fallback or base_fallback:
+                top_md, base_md = min(top_md, base_md), max(top_md, base_md)
+            else:
+                raise ValueError(
+                    f"井 {well_name} 层位深度反转: {top_surface_name}={top_md} m, {base_surface_name}={base_md} m。"
+                )
 
         clip_start_md = max(top_md, float(logset.basis[0]))
         clip_end_md = min(base_md, float(logset.basis[-1]))
@@ -294,6 +370,8 @@ def clip_logsets_by_well_tops(
         basis = logset.basis
         idx_start = max(0, int((abs(basis - clip_start_md)).argmin()) - extend)
         idx_end = min(basis.size - 1, int((abs(basis - clip_end_md)).argmin()) + extend)
+        if idx_start == idx_end and basis.size > 1:
+            idx_end = min(basis.size - 1, idx_end + 1)
         slice_start_md = float(basis[idx_start])
         slice_end_md = float(basis[idx_end])
 
@@ -304,6 +382,15 @@ def clip_logsets_by_well_tops(
                 raise TypeError(f"井 {well_name} 的曲线 {name} 裁剪后类型不是 Log。")
             clipped_logs[name] = cast(grid.Log, sliced)
 
-        clipped_logsets[well_name] = grid.LogSet(clipped_logs)
+        if input_is_logset:
+            clipped_logsets[well_name] = grid.LogSet(clipped_logs)
+        else:
+            clipped_logsets[well_name] = clipped_logs
 
-    return clipped_logsets
+    return {
+        "processed_logsets": clipped_logsets,
+        "target_well_count": len(logsets),
+        "wells_with_fallback": len({report["well"] for report in surface_fallback_reports}),
+        "surface_fallback_count": len(surface_fallback_reports),
+        "surface_fallback_reports": surface_fallback_reports,
+    }

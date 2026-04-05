@@ -75,6 +75,24 @@ def _configure_runtime_warning_filters(show_all_warnings: bool = False, suppress
         message=r".*RandomModelBridge does not support prediction.*",
         category=UserWarning,
     )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*A not p\.d\., added jitter of .* to the diagonal.*",
+        category=Warning,
+        module=r"linear_operator\.utils\.cholesky",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Optimization failed in `gen_candidates_scipy` with the following warning\(s\):.*",
+        category=RuntimeWarning,
+        module=r"botorch\.optim\.optimize",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Optimization failed within `scipy\.optimize\.minimize` with status .*ABNORMAL: .*",
+        category=RuntimeWarning,
+        module=r"botorch\.optim\.optimize",
+    )
 
     if suppress_runtime_warnings:
         # 业务侧高频 warning：默认静默。需要排查时可通过 show_all_warnings=True 打开。
@@ -633,7 +651,7 @@ def get_default_search_space_v1():
     median_length_choice = dict(
         name="logs_median_size",
         type="choice",
-        values=[i for i in range(55, 365, 10)],
+        values=[i for i in range(11, 73, 2)],
         value_type="int",
         is_ordered=True,
         sort_values=True,
@@ -641,7 +659,7 @@ def get_default_search_space_v1():
 
     median_th_choice = dict(name="logs_median_threshold", type="range", bounds=[0.1, 5.5], value_type="float")
 
-    std_choice = dict(name="logs_std", type="range", bounds=[2.5, 32.5], value_type="float")
+    std_choice = dict(name="logs_std", type="range", bounds=[0.5, 6.5], value_type="float")
 
     table_t_shift_choice = dict(name="table_t_shift", type="range", bounds=[-0.012, 0.012], value_type="float")
 

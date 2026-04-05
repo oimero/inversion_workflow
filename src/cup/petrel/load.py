@@ -26,6 +26,13 @@ def _normalize_mnemonic(name: str) -> str:
     return str(name).strip().upper()
 
 
+def _matches_mnemonic_with_optional_suffix(column_name: str, base_mnemonic: str) -> bool:
+    """判断列名是否匹配“基础缩写 + 可选下划线后缀”规则。"""
+    col_norm = _normalize_mnemonic(column_name)
+    base_norm = _normalize_mnemonic(base_mnemonic)
+    return col_norm == base_norm or col_norm.startswith(f"{base_norm}_")
+
+
 def _select_curve_mnemonic(
     las_df: pd.DataFrame,
     candidate_mnemonics: Tuple[str, ...],
@@ -41,8 +48,11 @@ def _select_curve_mnemonic(
             raise ValueError(f"指定的 {property_name} 曲线简称不存在: {curve_mnemonic}. 可用曲线: {columns}")
         return norm_to_original[norm_user]
 
-    wanted = {_normalize_mnemonic(m) for m in candidate_mnemonics}
-    matched = [col for col in columns if _normalize_mnemonic(col) in wanted]
+    matched = [
+        col
+        for col in columns
+        if any(_matches_mnemonic_with_optional_suffix(col, candidate) for candidate in candidate_mnemonics)
+    ]
 
     if len(matched) == 0:
         raise ValueError(

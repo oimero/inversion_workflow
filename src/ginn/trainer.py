@@ -102,16 +102,16 @@ class Trainer:
             x = batch["input"].to(self.device)  # (B, 2, T)
             d_obs = batch["obs"].to(self.device)  # (B, 1, T)
             mask = batch["mask"].to(self.device)  # (B, 1, T)
+            lmf_raw = batch["lmf_raw"].to(self.device)  # (B, 1, T)
 
-            # 1. 网络前向：输出无量纲阻抗残差
+            # 1. 网络前向：输出阻抗残差
             residual = self.model(x)  # (B, 1, T)
 
-            # 2. 在归一化阻抗空间恢复完整阻抗，避免 raw 阻抗量级导致梯度过小
-            lmf_norm = x[:, 1:2, :]  # 第二通道即 lmf_norm
-            ai_norm = residual + lmf_norm  # (B, 1, T)
+            # 2. 恢复完整阻抗
+            ai = residual + lmf_raw  # (B, 1, T)
 
             # 3. 物理正演
-            d_syn = self.forward_model(ai_norm)  # (B, 1, T)
+            d_syn = self.forward_model(ai)  # (B, 1, T)
 
             # 4. 损失（obs 已在数据管线中归一化）
             loss, loss_dict = self.criterion(d_syn, d_obs, mask, residual)
@@ -131,16 +131,14 @@ class Trainer:
 
             if (batch_idx + 1) % self.cfg.log_interval == 0:
                 lr = self.optimizer.param_groups[0]["lr"]
-                residual_mean = residual.abs().mean().item()
                 logger.info(
-                    "  [Epoch %d | Batch %d/%d] loss=%.6f (mae=%.6f reg=%.3e res=%.3e) lr=%.2e",
+                    "  [Epoch %d | Batch %d/%d] loss=%.6f (mae=%.6f reg=%.6f) lr=%.2e",
                     self.epoch + 1,
                     batch_idx + 1,
                     len(self.dataloader),
                     loss_dict["total"],
                     loss_dict["waveform_mae"],
                     loss_dict["reg_term"],
-                    residual_mean,
                     lr,
                 )
 
@@ -241,16 +239,14 @@ class Trainer:
         )
 
         predictions = []
+        indices = []
 
         for batch in full_loader:
             x = batch["input"].to(self.device)
-            lmf_norm = x[:, 1:2, :]
+            lmf_raw = batch["lmf_raw"].to(self.device)
 
             residual = self.model(x)
-            ai_norm = residual + lmf_norm  # (B, 1, T)
-
-            # 从归一化阻抗恢复到原始物理量纲
-            ai = ai_norm * self.dataset.lmf_scale
+            ai = residual + lmf_raw  # (B, 1, T)
 
             predictions.append(ai.squeeze(1).cpu().numpy())
 

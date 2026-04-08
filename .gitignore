@@ -9,4 +9,3 @@ tmp/*
 */output/*
 *.pyc
 *.prompt.md
-checkpoint_*.pt

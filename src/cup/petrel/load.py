@@ -22,6 +22,67 @@ _INTERPRETATION_LINE_PATTERN = re.compile(
 )
 
 
+def import_seismic(
+    seismic_file: Path,
+    seismic_type: str = "segy",
+    iline: Optional[int] = None,
+    xline: Optional[int] = None,
+    istep: Optional[int] = None,
+    xstep: Optional[int] = None,
+) -> np.ndarray:
+    """读取整块地震体并返回 ``(n_il, n_xl, n_samples)`` 数据体。
+
+    Parameters
+    ----------
+    seismic_file : Path
+        地震文件路径。
+    seismic_type : str, optional
+        地震类型，支持 ``"segy"`` 和 ``"zgy"``。
+    iline, xline, istep, xstep : int | None, optional
+        SEG-Y 读取参数。配置优先；为 ``None`` 时由底层库自动推断。
+
+    Returns
+    -------
+    np.ndarray
+        三维地震体，``dtype=float32``。
+    """
+    seismic_type_lower = str(seismic_type).lower()
+
+    if seismic_type_lower == "segy":
+        import cigsegy
+
+        segy_kwargs = {}
+        if iline is not None:
+            segy_kwargs["iline"] = int(iline)
+        if xline is not None:
+            segy_kwargs["xline"] = int(xline)
+        if istep is not None:
+            segy_kwargs["istep"] = int(istep)
+        if xstep is not None:
+            segy_kwargs["xstep"] = int(xstep)
+
+        volume = cigsegy.fromfile(
+            str(seismic_file),
+            **segy_kwargs,
+        )
+        volume = np.asarray(volume, dtype=np.float32)
+        if volume.ndim != 3:
+            raise ValueError(f"Only 3D post-stack SEG-Y is supported, got ndim={volume.ndim}")
+        return volume
+
+    if seismic_type_lower == "zgy":
+        from pyzgy.read import SeismicReader
+
+        with SeismicReader(str(seismic_file)) as reader:
+            volume = reader.read_volume()
+        volume = np.asarray(volume, dtype=np.float32)
+        if volume.ndim != 3:
+            raise ValueError(f"Only 3D ZGY volume is supported, got ndim={volume.ndim}")
+        return volume
+
+    raise ValueError(f"Unsupported seismic_type: {seismic_type}. Expect 'segy' or 'zgy'.")
+
+
 def _normalize_mnemonic(name: str) -> str:
     return str(name).strip().upper()
 

@@ -571,30 +571,6 @@ def open_survey(
     raise ValueError(f"Unsupported seismic_type: {seismic_type}. Expect 'segy' or 'zgy'.")
 
 
-def query_seismic_geometry(
-    seismic_file: Path,
-    seismic_type: str = "segy",
-    domain: Optional[str] = "time",
-    iline: Optional[int] = None,
-    xline: Optional[int] = None,
-    istep: Optional[int] = None,
-    xstep: Optional[int] = None,
-) -> Dict[str, Any]:
-    """查询地震几何信息（工区范围与采样轴）。
-
-    便捷函数：批量查询建议先调用 open_survey 后复用上下文。
-    """
-    ctx = _resolve_context(
-        seismic_file,
-        seismic_type,
-        iline=iline,
-        xline=xline,
-        istep=istep,
-        xstep=xstep,
-    )
-    return ctx.query_geometry(domain=domain)
-
-
 def import_seismic_at_well(
     seismic_file: Path,
     well_x: float,

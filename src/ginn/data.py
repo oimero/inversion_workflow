@@ -29,73 +29,73 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════
 
 
-def load_segy_volume(
-    segy_path: Path,
-    iline: Optional[int] = None,
-    xline: Optional[int] = None,
-    istep: Optional[int] = None,
-    xstep: Optional[int] = None,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """读取三维叠后 SEG-Y 数据体。
+# def load_segy_volume(
+#     segy_path: Path,
+#     iline: Optional[int] = None,
+#     xline: Optional[int] = None,
+#     istep: Optional[int] = None,
+#     xstep: Optional[int] = None,
+# ) -> Tuple[np.ndarray, Dict[str, Any]]:
+#     """读取三维叠后 SEG-Y 数据体。
 
-    Parameters
-    ----------
-    segy_path : Path
-        SEG-Y 文件路径。
-    iline, xline : int | None
-        Inline/Crossline 头字节位置。为 ``None`` 时自动推断。
-    istep, xstep : int | None
-        Inline/Crossline 步长。为 ``None`` 时自动推断。
+#     Parameters
+#     ----------
+#     segy_path : Path
+#         SEG-Y 文件路径。
+#     iline, xline : int | None
+#         Inline/Crossline 头字节位置。为 ``None`` 时自动推断。
+#     istep, xstep : int | None
+#         Inline/Crossline 步长。为 ``None`` 时自动推断。
 
-    Returns
-    -------
-    volume : np.ndarray
-        三维数据体，shape ``(n_il, n_xl, n_t)``，float32。
-    meta : dict
-        几何元信息，包含 ``n_il``, ``n_xl``, ``n_t``,
-        ``il_min``, ``xl_min``, ``il_step``, ``xl_step``, ``dt_ms``。
-    """
-    import cigsegy
+#     Returns
+#     -------
+#     volume : np.ndarray
+#         三维数据体，shape ``(n_il, n_xl, n_t)``，float32。
+#     meta : dict
+#         几何元信息，包含 ``n_il``, ``n_xl``, ``n_t``,
+#         ``il_min``, ``xl_min``, ``il_step``, ``xl_step``, ``dt_ms``。
+#     """
+#     import cigsegy
 
-    # 配置优先：传入的 keyloc/step 直接使用；缺失项由 cigsegy 自动推断。
-    meta_info = cigsegy.tools.get_metaInfo(
-        str(segy_path),
-        iline=iline,  # type: ignore
-        xline=xline,  # type: ignore
-        istep=istep,  # type: ignore
-        xstep=xstep,  # type: ignore
-        apply_scalar=True,
-    )
+#     # 配置优先：传入的 keyloc/step 直接使用；缺失项由 cigsegy 自动推断。
+#     meta_info = cigsegy.tools.get_metaInfo(
+#         str(segy_path),
+#         iline=iline,  # type: ignore
+#         xline=xline,  # type: ignore
+#         istep=istep,  # type: ignore
+#         xstep=xstep,  # type: ignore
+#         apply_scalar=True,
+#     )
 
-    volume = cigsegy.fromfile(
-        str(segy_path),
-        iline=iline,  # type: ignore
-        xline=xline,  # type: ignore
-        istep=istep,  # type: ignore
-        xstep=xstep,  # type: ignore
-    )
-    if volume.ndim != 3:
-        raise ValueError(f"Only 3D post-stack SEG-Y is supported, got ndim={volume.ndim}")
-    volume = np.asarray(volume, dtype=np.float32)
+#     volume = cigsegy.fromfile(
+#         str(segy_path),
+#         iline=iline,  # type: ignore
+#         xline=xline,  # type: ignore
+#         istep=istep,  # type: ignore
+#         xstep=xstep,  # type: ignore
+#     )
+#     if volume.ndim != 3:
+#         raise ValueError(f"Only 3D post-stack SEG-Y is supported, got ndim={volume.ndim}")
+#     volume = np.asarray(volume, dtype=np.float32)
 
-    n_il, n_xl, n_t = volume.shape
-    dt_ms = float(meta_info["dt"]) / 1000.0  # μs → ms
+#     n_il, n_xl, n_t = volume.shape
+#     dt_ms = float(meta_info["dt"]) / 1000.0  # μs → ms
 
-    # 兼容现有下游 meta 契约。
-    meta = {
-        "n_il": int(n_il),
-        "n_xl": int(n_xl),
-        "n_t": int(n_t),
-        "il_min": float(meta_info.get("start_iline", 0.0)),
-        "xl_min": float(meta_info.get("start_xline", 0.0)),
-        "il_step": float(meta_info.get("istep", 1.0)),
-        "xl_step": float(meta_info.get("xstep", 1.0)),
-        "dt_ms": dt_ms,
-        "start_time_ms": float(meta_info.get("start_time", 0.0)),
-    }
+#     # 兼容现有下游 meta 契约。
+#     meta = {
+#         "n_il": int(n_il),
+#         "n_xl": int(n_xl),
+#         "n_t": int(n_t),
+#         "il_min": float(meta_info.get("start_iline", 0.0)),
+#         "xl_min": float(meta_info.get("start_xline", 0.0)),
+#         "il_step": float(meta_info.get("istep", 1.0)),
+#         "xl_step": float(meta_info.get("xstep", 1.0)),
+#         "dt_ms": dt_ms,
+#         "start_time_ms": float(meta_info.get("start_time", 0.0)),
+#     }
 
-    logger.info("Loaded SEG-Y: %s  shape=%s  dt=%.1f ms", segy_path.name, volume.shape, dt_ms)
-    return volume, meta
+#     logger.info("Loaded SEG-Y: %s  shape=%s  dt=%.1f ms", segy_path.name, volume.shape, dt_ms)
+#     return volume, meta
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -206,110 +206,110 @@ def make_wavelet(
 # ═══════════════════════════════════════════════════════════════
 
 
-def load_horizon_mask(
-    top_horizon_file: Path,
-    bot_horizon_file: Path,
-    seismic_file: Path,
-    n_il: int,
-    n_xl: int,
-    n_t: int,
-    dt_s: float = 0.001,
-    start_time_ms: float = 0.0,
-    erosion: int = 0,
-    iline: int = 5,
-    xline: int = 21,
-    istep: int = 1,
-    xstep: int = 4,
-) -> np.ndarray:
-    """从 Petrel 层位文件生成三维布尔掩码。
+# def load_horizon_mask(
+#     top_horizon_file: Path,
+#     bot_horizon_file: Path,
+#     seismic_file: Path,
+#     n_il: int,
+#     n_xl: int,
+#     n_t: int,
+#     dt_s: float = 0.001,
+#     start_time_ms: float = 0.0,
+#     erosion: int = 0,
+#     iline: int = 5,
+#     xline: int = 21,
+#     istep: int = 1,
+#     xstep: int = 4,
+# ) -> np.ndarray:
+#     """从 Petrel 层位文件生成三维布尔掩码。
 
-    Parameters
-    ----------
-    top_horizon_file : Path
-        顶层位文件路径。
-    bot_horizon_file : Path
-        底层位文件路径。
-    seismic_file : Path
-        地震体文件路径（用于获取几何信息）。
-    n_il, n_xl, n_t : int
-        数据体 inline/crossline/采样维度大小。
-    dt_s : float
-        采样间隔 (s)。
-    start_time_ms : float
-        地震道起始时间 (ms)。层位绝对时间会减去此值后转为采样索引。
-    erosion : int
-        掩码边界收缩采样点数。
+#     Parameters
+#     ----------
+#     top_horizon_file : Path
+#         顶层位文件路径。
+#     bot_horizon_file : Path
+#         底层位文件路径。
+#     seismic_file : Path
+#         地震体文件路径（用于获取几何信息）。
+#     n_il, n_xl, n_t : int
+#         数据体 inline/crossline/采样维度大小。
+#     dt_s : float
+#         采样间隔 (s)。
+#     start_time_ms : float
+#         地震道起始时间 (ms)。层位绝对时间会减去此值后转为采样索引。
+#     erosion : int
+#         掩码边界收缩采样点数。
 
-    Returns
-    -------
-    np.ndarray
-        布尔掩码，shape ``(n_il, n_xl, n_t)``。
-        True 表示该点位于收缩后的有效区域内。
-    """
-    from cup.petrel.load import import_interpretation_petrel
-    from cup.seismic.process import interpolate_interpretation_surface
-    from cup.seismic.survey import query_seismic_geometry
+#     Returns
+#     -------
+#     np.ndarray
+#         布尔掩码，shape ``(n_il, n_xl, n_t)``。
+#         True 表示该点位于收缩后的有效区域内。
+#     """
+#     from cup.petrel.load import import_interpretation_petrel
+#     from cup.seismic.process import interpolate_interpretation_surface
+#     from cup.seismic.survey import query_seismic_geometry
 
-    geometry = query_seismic_geometry(
-        seismic_file,
-        seismic_type="segy",
-        domain="time",
-        iline=iline,
-        xline=xline,
-        istep=istep,
-        xstep=xstep,
-    )
+#     geometry = query_seismic_geometry(
+#         seismic_file,
+#         seismic_type="segy",
+#         domain="time",
+#         iline=iline,
+#         xline=xline,
+#         istep=istep,
+#         xstep=xstep,
+#     )
 
-    def _load_surface(path: Path) -> np.ndarray:
-        df = import_interpretation_petrel(path)
-        interp_df = interpolate_interpretation_surface(
-            interpretation_df=df,
-            geometry=geometry,
-            outlier_threshold=20.0,
-            min_neighbor_count=2,
-            keep_nan=True,
-        )
-        # 层位以 ms 为单位 → 转为采样索引
-        il_min = int(geometry["inline_min"])
-        xl_min = int(geometry["xline_min"])
-        il_step = int(geometry["inline_step"])
-        xl_step = int(geometry["xline_step"])
+#     def _load_surface(path: Path) -> np.ndarray:
+#         df = import_interpretation_petrel(path)
+#         interp_df = interpolate_interpretation_surface(
+#             interpretation_df=df,
+#             geometry=geometry,
+#             outlier_threshold=20.0,
+#             min_neighbor_count=2,
+#             keep_nan=True,
+#         )
+#         # 层位以 ms 为单位 → 转为采样索引
+#         il_min = int(geometry["inline_min"])
+#         xl_min = int(geometry["xline_min"])
+#         il_step = int(geometry["inline_step"])
+#         xl_step = int(geometry["xline_step"])
 
-        surface_grid = np.full((n_il, n_xl), np.nan, dtype=np.float64)
-        for _, row in interp_df.iterrows():
-            il_idx = int((row["inline"] - il_min) / il_step)
-            xl_idx = int((row["xline"] - xl_min) / xl_step)
-            if 0 <= il_idx < n_il and 0 <= xl_idx < n_xl:
-                val = row["interpretation"]
-                if np.isfinite(val):
-                    # 层位绝对时间 (ms) → 相对采样索引
-                    surface_grid[il_idx, xl_idx] = (val - start_time_ms) / (dt_s * 1000.0)
-        return surface_grid
+#         surface_grid = np.full((n_il, n_xl), np.nan, dtype=np.float64)
+#         for _, row in interp_df.iterrows():
+#             il_idx = int((row["inline"] - il_min) / il_step)
+#             xl_idx = int((row["xline"] - xl_min) / xl_step)
+#             if 0 <= il_idx < n_il and 0 <= xl_idx < n_xl:
+#                 val = row["interpretation"]
+#                 if np.isfinite(val):
+#                     # 层位绝对时间 (ms) → 相对采样索引
+#                     surface_grid[il_idx, xl_idx] = (val - start_time_ms) / (dt_s * 1000.0)
+#         return surface_grid
 
-    top_surface = _load_surface(top_horizon_file)
-    bot_surface = _load_surface(bot_horizon_file)
+#     top_surface = _load_surface(top_horizon_file)
+#     bot_surface = _load_surface(bot_horizon_file)
 
-    mask = np.zeros((n_il, n_xl, n_t), dtype=bool)
-    for i in range(n_il):
-        for j in range(n_xl):
-            t_top = top_surface[i, j]
-            t_bot = bot_surface[i, j]
-            if np.isfinite(t_top) and np.isfinite(t_bot):
-                # 边界收缩：顶向下 + 底向上
-                idx_top = max(0, int(np.round(t_top)) + erosion)
-                idx_bot = min(n_t, int(np.round(t_bot)) + 1 - erosion)
-                if idx_top < idx_bot:
-                    mask[i, j, idx_top:idx_bot] = True
+#     mask = np.zeros((n_il, n_xl, n_t), dtype=bool)
+#     for i in range(n_il):
+#         for j in range(n_xl):
+#             t_top = top_surface[i, j]
+#             t_bot = bot_surface[i, j]
+#             if np.isfinite(t_top) and np.isfinite(t_bot):
+#                 # 边界收缩：顶向下 + 底向上
+#                 idx_top = max(0, int(np.round(t_top)) + erosion)
+#                 idx_bot = min(n_t, int(np.round(t_bot)) + 1 - erosion)
+#                 if idx_top < idx_bot:
+#                     mask[i, j, idx_top:idx_bot] = True
 
-    n_valid = mask.sum()
-    coverage = n_valid / mask.size * 100
-    logger.info(
-        "Horizon mask: %d valid points (%.1f%%), erosion=%d samples",
-        n_valid,
-        coverage,
-        erosion,
-    )
-    return mask
+#     n_valid = mask.sum()
+#     coverage = n_valid / mask.size * 100
+#     logger.info(
+#         "Horizon mask: %d valid points (%.1f%%), erosion=%d samples",
+#         n_valid,
+#         coverage,
+#         erosion,
+#     )
+#     return mask
 
 
 # ═══════════════════════════════════════════════════════════════

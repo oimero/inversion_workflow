@@ -9,9 +9,6 @@ from scipy.interpolate import griddata
 from scipy.ndimage import generic_filter
 from scipy.spatial import QhullError
 
-from cup.petrel.load import import_interpretation_petrel
-from cup.seismic.survey import query_seismic_geometry
-
 
 def _build_line_axis(line_min: int, line_max: int, line_step: int) -> np.ndarray:
     """根据最小值、最大值和步长构建完整轴。"""

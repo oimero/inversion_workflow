@@ -31,10 +31,10 @@ logger = logging.getLogger(__name__)
 
 def load_segy_volume(
     segy_path: Path,
-    iline: int = 5,
-    xline: int = 21,
-    istep: int = 1,
-    xstep: int = 4,
+    iline: Optional[int] = None,
+    xline: Optional[int] = None,
+    istep: Optional[int] = None,
+    xstep: Optional[int] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """读取三维叠后 SEG-Y 数据体。
 
@@ -42,10 +42,10 @@ def load_segy_volume(
     ----------
     segy_path : Path
         SEG-Y 文件路径。
-    iline, xline : int
-        Inline/Crossline 头字节位置。
-    istep, xstep : int
-        Inline/Crossline 步长。
+    iline, xline : int | None
+        Inline/Crossline 头字节位置。为 ``None`` 时自动推断。
+    istep, xstep : int | None
+        Inline/Crossline 步长。为 ``None`` 时自动推断。
 
     Returns
     -------
@@ -57,53 +57,42 @@ def load_segy_volume(
     """
     import cigsegy
 
-    segy = cigsegy.Pysegy(str(segy_path))
-    try:
-        meta_info = cigsegy.tools.get_metaInfo(segy, apply_scalar=True)
+    # 配置优先：传入的 keyloc/step 直接使用；缺失项由 cigsegy 自动推断。
+    meta_info = cigsegy.tools.get_metaInfo(
+        str(segy_path),
+        iline=iline,  # type: ignore
+        xline=xline,  # type: ignore
+        istep=istep,  # type: ignore
+        xstep=xstep,  # type: ignore
+        apply_scalar=True,
+    )
 
-        offset_keyloc = int(meta_info.get("offset", 37))
-        ostep = int(meta_info.get("ostep", 1))
+    volume = cigsegy.fromfile(
+        str(segy_path),
+        iline=iline,  # type: ignore
+        xline=xline,  # type: ignore
+        istep=istep,  # type: ignore
+        xstep=xstep,  # type: ignore
+    )
+    if volume.ndim != 3:
+        raise ValueError(f"Only 3D post-stack SEG-Y is supported, got ndim={volume.ndim}")
+    volume = np.asarray(volume, dtype=np.float32)
 
-        segy.setLocations(iline, xline, offset_keyloc)
-        segy.setSteps(istep, xstep, ostep)
-        segy.set_segy_type(3)
-        segy.scan()
+    n_il, n_xl, n_t = volume.shape
+    dt_ms = float(meta_info["dt"]) / 1000.0  # μs → ms
 
-        geominfo = cigsegy.tools.full_scan(
-            segy,
-            iline=iline,
-            xline=xline,
-            offset=offset_keyloc,
-            is4d=False,
-        )
-        geom = np.asarray(geominfo["geom"])
-        n_il, n_xl = geom.shape
-        n_t = int(meta_info["nt"])
-        dt_ms = float(meta_info["dt"]) / 1000.0  # μs → ms
-
-        # 读取全部道
-        volume = np.zeros((n_il, n_xl, n_t), dtype=np.float32)
-        for i in range(n_il):
-            for j in range(n_xl):
-                trace_idx = int(geom[i, j])
-                if trace_idx < 0:
-                    continue  # 缺失道保持零
-                trace = segy.collect(trace_idx, trace_idx + 1, 0, n_t).squeeze()
-                volume[i, j, :] = trace
-
-        meta = {
-            "n_il": n_il,
-            "n_xl": n_xl,
-            "n_t": n_t,
-            "il_min": float(geominfo["iline"]["min_iline"]),
-            "xl_min": float(geominfo["xline"]["min_xline"]),
-            "il_step": float(geominfo["iline"]["istep"]),
-            "xl_step": float(geominfo["xline"]["xstep"]),
-            "dt_ms": dt_ms,
-            "start_time_ms": float(meta_info.get("start_time", 0)),
-        }
-    finally:
-        segy.close()
+    # 兼容现有下游 meta 契约。
+    meta = {
+        "n_il": int(n_il),
+        "n_xl": int(n_xl),
+        "n_t": int(n_t),
+        "il_min": float(meta_info.get("start_iline", 0.0)),
+        "xl_min": float(meta_info.get("start_xline", 0.0)),
+        "il_step": float(meta_info.get("istep", 1.0)),
+        "xl_step": float(meta_info.get("xstep", 1.0)),
+        "dt_ms": dt_ms,
+        "start_time_ms": float(meta_info.get("start_time", 0.0)),
+    }
 
     logger.info("Loaded SEG-Y: %s  shape=%s  dt=%.1f ms", segy_path.name, volume.shape, dt_ms)
     return volume, meta
@@ -175,7 +164,7 @@ def make_wavelet(
     wavelet_type: str = "ricker",
     freq: float = 25.0,
     dt: float = 0.001,
-    length: int = 301,
+    length: int = 101,
     gain: float = 1.0,
 ) -> np.ndarray:
     """生成理论子波。

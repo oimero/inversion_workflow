@@ -4,11 +4,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Protocol, Tuple
 
 import numpy as np
 
 from wtie.processing import grid
+
+
+class SurveyContext(Protocol):
+    """统一地震工区上下文接口。"""
+
+    def query_geometry(self, domain: Optional[str] = "time") -> Dict[str, Any]: ...
+
+    def coord_to_line(self, x: float, y: float) -> Tuple[float, float]: ...
+
+    def line_to_coord(self, il_no: float, xl_no: float) -> Tuple[float, float]: ...
+
+    def import_seismic_at_well(
+        self,
+        well_x: float,
+        well_y: float,
+        sample_start: Optional[float] = None,
+        sample_end: Optional[float] = None,
+        domain: str = "time",
+    ) -> grid.Seismic: ...
 
 
 def _axis_stats(axis: np.ndarray) -> Dict[str, float]:
@@ -495,17 +514,59 @@ def _resolve_context(
     xline: Optional[int] = None,
     istep: Optional[int] = None,
     xstep: Optional[int] = None,
-):
+) -> SurveyContext:
+    return open_survey(
+        seismic_file,
+        seismic_type=seismic_type,
+        segy_options=_build_segy_options(iline=iline, xline=xline, istep=istep, xstep=xstep),
+    )
+
+
+def _build_segy_options(
+    iline: Optional[int] = None,
+    xline: Optional[int] = None,
+    istep: Optional[int] = None,
+    xstep: Optional[int] = None,
+) -> Dict[str, int]:
+    options: Dict[str, int] = {}
+    if iline is not None:
+        options["iline"] = int(iline)
+    if xline is not None:
+        options["xline"] = int(xline)
+    if istep is not None:
+        options["istep"] = int(istep)
+    if xstep is not None:
+        options["xstep"] = int(xstep)
+    return options
+
+
+def open_survey(
+    seismic_file: Path,
+    seismic_type: str = "segy",
+    *,
+    segy_options: Optional[Dict[str, int]] = None,
+) -> SurveyContext:
+    """打开地震工区并返回可复用的上下文对象。
+
+    建议批量调用场景优先使用本函数：先打开一次，再复用上下文执行多次查询。
+    """
     seismic_type_lower = seismic_type.lower()
     if seismic_type_lower == "segy":
+        options = dict(segy_options or {})
+        unsupported = set(options) - {"iline", "xline", "istep", "xstep"}
+        if unsupported:
+            unsupported_keys = ", ".join(sorted(unsupported))
+            raise ValueError(f"Unsupported SEG-Y options: {unsupported_keys}")
         return SegySurveyContext.from_file(
             seismic_file,
-            iline=iline,
-            xline=xline,
-            istep=istep,
-            xstep=xstep,
+            iline=options.get("iline"),
+            xline=options.get("xline"),
+            istep=options.get("istep"),
+            xstep=options.get("xstep"),
         )
     if seismic_type_lower == "zgy":
+        if segy_options:
+            raise ValueError("segy_options is only valid when seismic_type='segy'.")
         return ZgySurveyContext.from_file(seismic_file)
     raise ValueError(f"Unsupported seismic_type: {seismic_type}. Expect 'segy' or 'zgy'.")
 
@@ -519,7 +580,10 @@ def query_seismic_geometry(
     istep: Optional[int] = None,
     xstep: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """查询地震几何信息（工区范围与采样轴）。"""
+    """查询地震几何信息（工区范围与采样轴）。
+
+    便捷函数：批量查询建议先调用 open_survey 后复用上下文。
+    """
     ctx = _resolve_context(
         seismic_file,
         seismic_type,
@@ -544,7 +608,10 @@ def import_seismic_at_well(
     istep: Optional[int] = None,
     xstep: Optional[int] = None,
 ) -> grid.Seismic:
-    """提取井位处的复合地震道（双线性插值）。"""
+    """提取井位处的复合地震道（双线性插值）。
+
+    便捷函数：批量井提取建议先调用 open_survey 后复用上下文。
+    """
     ctx = _resolve_context(
         seismic_file,
         seismic_type,
@@ -572,7 +639,10 @@ def coord_to_line(
     istep: Optional[int] = None,
     xstep: Optional[int] = None,
 ) -> Tuple[float, float]:
-    """将 XY 坐标转换为 (inline_no, crossline_no)。"""
+    """将 XY 坐标转换为 (inline_no, crossline_no)。
+
+    便捷函数：批量坐标转换建议先调用 open_survey 后复用上下文。
+    """
     ctx = _resolve_context(
         seismic_file,
         seismic_type,
@@ -594,7 +664,10 @@ def line_to_coord(
     istep: Optional[int] = None,
     xstep: Optional[int] = None,
 ) -> Tuple[float, float]:
-    """将 (inline_no, crossline_no) 转换为 XY 坐标。"""
+    """将 (inline_no, crossline_no) 转换为 XY 坐标。
+
+    便捷函数：批量坐标转换建议先调用 open_survey 后复用上下文。
+    """
     ctx = _resolve_context(
         seismic_file,
         seismic_type,

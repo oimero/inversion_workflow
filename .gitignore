@@ -1,3 +1,4 @@
+.conda/*
 .vscode/*
 data/*
 experiments/optim/*

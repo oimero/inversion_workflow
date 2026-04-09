@@ -34,7 +34,7 @@ class GINNConfig:
     wavelet_type: str = "ricker"
     wavelet_freq: float = 25.0  # Hz
     wavelet_dt: float = 0.001  # s
-    wavelet_length: int = 301  # 采样点数（奇数，中心对称）
+    wavelet_length: int = 101  # 采样点数（奇数，中心对称）
     wavelet_gain: float = 10.0  # 子波振幅增益
 
     # ── 低频模型 ──────────────────────────────────────────────

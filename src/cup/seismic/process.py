@@ -245,22 +245,22 @@ def interpolate_interpretation_surface(
     return out_df[np.isfinite(out_df["interpretation"])].reset_index(drop=True)
 
 
-def import_and_interpolate_interpretation_petrel(
-    interpretation_file: Path,
-    seismic_file: Path,
-    outlier_threshold: float,
-    seismic_type: str = "segy",
-    domain: Optional[str] = "time",
-    min_neighbor_count: int = 2,
-    keep_nan: bool = True,
-) -> pd.DataFrame:
-    """导入 Petrel 层位并执行去孤立点+全域插值。"""
-    interpretation_df = import_interpretation_petrel(interpretation_file)
-    geometry = query_seismic_geometry(seismic_file, seismic_type=seismic_type, domain=domain)
-    return interpolate_interpretation_surface(
-        interpretation_df=interpretation_df,
-        geometry=geometry,
-        outlier_threshold=outlier_threshold,
-        min_neighbor_count=min_neighbor_count,
-        keep_nan=keep_nan,
-    )
+# def import_and_interpolate_interpretation_petrel(
+#     interpretation_file: Path,
+#     seismic_file: Path,
+#     outlier_threshold: float,
+#     seismic_type: str = "segy",
+#     domain: Optional[str] = "time",
+#     min_neighbor_count: int = 2,
+#     keep_nan: bool = True,
+# ) -> pd.DataFrame:
+#     """导入 Petrel 层位并执行去孤立点+全域插值。"""
+#     interpretation_df = import_interpretation_petrel(interpretation_file)
+#     geometry = query_seismic_geometry(seismic_file, seismic_type=seismic_type, domain=domain)
+#     return interpolate_interpretation_surface(
+#         interpretation_df=interpretation_df,
+#         geometry=geometry,
+#         outlier_threshold=outlier_threshold,
+#         min_neighbor_count=min_neighbor_count,
+#         keep_nan=keep_nan,
+#     )

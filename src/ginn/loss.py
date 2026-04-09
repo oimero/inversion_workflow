@@ -77,10 +77,14 @@ class GINNLoss(nn.Module):
         # 总损失
         total_loss = waveform_mae + self.lambda_reg * residual_l2
 
+        reg_term = self.lambda_reg * residual_l2
+
         loss_dict = {
             "total": total_loss.item(),
             "waveform_mae": waveform_mae.item(),
             "residual_l2": residual_l2.item(),
+            "reg_term": reg_term.item(),
+            "lambda_reg": float(self.lambda_reg),
         }
 
         return total_loss, loss_dict

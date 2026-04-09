@@ -65,8 +65,8 @@ class ForwardModel(nn.Module):
         Tensor
             反射率，shape ``(B, 1, T-1)``。
         """
-        ai_upper = impedance[..., :-1]   # AI[t]
-        ai_lower = impedance[..., 1:]    # AI[t+1]
+        ai_upper = impedance[..., :-1]  # AI[t]
+        ai_lower = impedance[..., 1:]  # AI[t+1]
         # 加 eps 防止除零
         r = (ai_lower - ai_upper) / (ai_lower + ai_upper + 1e-10)
         return r

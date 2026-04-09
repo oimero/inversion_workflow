@@ -33,7 +33,8 @@ class DilatedResBlock(nn.Module):
         padding = dilation * (kernel_size - 1) // 2  # 保持序列等长
 
         self.conv1 = nn.Conv1d(
-            channels, channels,
+            channels,
+            channels,
             kernel_size=kernel_size,
             dilation=dilation,
             padding=padding,
@@ -43,7 +44,8 @@ class DilatedResBlock(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
         self.conv2 = nn.Conv1d(
-            channels, channels,
+            channels,
+            channels,
             kernel_size=kernel_size,
             dilation=dilation,
             padding=padding,
@@ -115,22 +117,26 @@ class DilatedResNet1D(nn.Module):
 
         # ── 头部：升维 ──
         self.head = nn.Sequential(
-            nn.Conv1d(in_channels, hidden_channels, kernel_size=kernel_size,
-                      padding=kernel_size // 2, bias=False),
+            nn.Conv1d(in_channels, hidden_channels, kernel_size=kernel_size, padding=kernel_size // 2, bias=False),
             nn.BatchNorm1d(hidden_channels),
             nn.ReLU(inplace=True),
         )
 
         # ── 主体：膨胀残差块 ──
-        self.res_blocks = nn.Sequential(*[
-            DilatedResBlock(hidden_channels, kernel_size=kernel_size, dilation=d)
-            for d in dilations
-        ])
+        self.res_blocks = nn.Sequential(
+            *[DilatedResBlock(hidden_channels, kernel_size=kernel_size, dilation=d) for d in dilations]
+        )
 
         # ── 平滑层：消除膨胀卷积的网格效应 ──
         self.smooth = nn.Sequential(
-            nn.Conv1d(hidden_channels, hidden_channels, kernel_size=kernel_size,
-                      padding=kernel_size // 2, dilation=1, bias=False),
+            nn.Conv1d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=kernel_size,
+                padding=kernel_size // 2,
+                dilation=1,
+                bias=False,
+            ),
             nn.BatchNorm1d(hidden_channels),
             nn.ReLU(inplace=True),
         )

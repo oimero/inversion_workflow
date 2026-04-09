@@ -70,6 +70,7 @@ class Trainer:
 
         # ── 损失 ──
         self.criterion = GINNLoss(lambda_reg=cfg.lambda_reg)
+        logger.info("Loss domain: normalized seismic amplitude (obs pre-divided by RMS)")
 
         # ── 优化器 ──
         self.optimizer = torch.optim.Adam(
@@ -98,21 +99,21 @@ class Trainer:
         n_batches = 0
 
         for batch_idx, batch in enumerate(self.dataloader):
-            x = batch["input"].to(self.device)            # (B, 2, T)
-            d_obs = batch["obs"].to(self.device)           # (B, 1, T)
-            mask = batch["mask"].to(self.device)            # (B, 1, T)
-            lmf_raw = batch["lmf_raw"].to(self.device)     # (B, 1, T)
+            x = batch["input"].to(self.device)  # (B, 2, T)
+            d_obs = batch["obs"].to(self.device)  # (B, 1, T)
+            mask = batch["mask"].to(self.device)  # (B, 1, T)
+            lmf_raw = batch["lmf_raw"].to(self.device)  # (B, 1, T)
 
             # 1. 网络前向：输出阻抗残差
-            residual = self.model(x)                        # (B, 1, T)
+            residual = self.model(x)  # (B, 1, T)
 
-            # 2. 恢复完整阻抗
-            ai = residual + lmf_raw                         # (B, 1, T)
+            # 2. 指数相乘模型: AI_abs = LMF_abs * exp(Δ)
+            ai = lmf_raw * torch.exp(residual)  # (B, 1, T)
 
             # 3. 物理正演
-            d_syn = self.forward_model(ai)                  # (B, 1, T)
+            d_syn = self.forward_model(ai)  # (B, 1, T)
 
-            # 4. 损失（包含波形 MAE + 残差 L2 正则化）
+            # 4. 损失
             loss, loss_dict = self.criterion(d_syn, d_obs, mask, residual)
 
             # 5. 反向传播
@@ -130,11 +131,17 @@ class Trainer:
 
             if (batch_idx + 1) % self.cfg.log_interval == 0:
                 lr = self.optimizer.param_groups[0]["lr"]
+                residual_mean = residual.abs().mean().item()
                 logger.info(
-                    "  [Epoch %d | Batch %d/%d] loss=%.6f (mae=%.6f reg=%.6f) lr=%.2e",
-                    self.epoch + 1, batch_idx + 1, len(self.dataloader),
-                    loss_dict["total"], loss_dict["waveform_mae"],
-                    loss_dict["residual_l2"], lr,
+                    "  [Epoch %d | Batch %d/%d] loss=%.6f (mae=%.6f reg=%.3e res=%.3e) lr=%.2e",
+                    self.epoch + 1,
+                    batch_idx + 1,
+                    len(self.dataloader),
+                    loss_dict["total"],
+                    loss_dict["waveform_mae"],
+                    loss_dict["reg_term"],
+                    residual_mean,
+                    lr,
                 )
 
         avg_loss = epoch_loss / max(n_batches, 1)
@@ -184,7 +191,11 @@ class Trainer:
 
             logger.info(
                 "Epoch %d/%d  loss=%.6f  lr=%.2e  time=%.1fs",
-                epoch + 1, self.cfg.epochs, avg_loss, lr, elapsed,
+                epoch + 1,
+                self.cfg.epochs,
+                avg_loss,
+                lr,
+                elapsed,
             )
 
             # 保存最优模型
@@ -237,7 +248,7 @@ class Trainer:
             lmf_raw = batch["lmf_raw"].to(self.device)
 
             residual = self.model(x)
-            ai = residual + lmf_raw  # (B, 1, T)
+            ai = lmf_raw * torch.exp(residual)  # (B, 1, T)
 
             predictions.append(ai.squeeze(1).cpu().numpy())
 

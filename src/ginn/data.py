@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 #  SEG-Y I/O
 # ═══════════════════════════════════════════════════════════════
 
+
 def load_segy_volume(
     segy_path: Path,
     iline: int = 5,
@@ -69,7 +70,11 @@ def load_segy_volume(
         segy.scan()
 
         geominfo = cigsegy.tools.full_scan(
-            segy, iline=iline, xline=xline, offset=offset_keyloc, is4d=False,
+            segy,
+            iline=iline,
+            xline=xline,
+            offset=offset_keyloc,
+            is4d=False,
         )
         geom = np.asarray(geominfo["geom"])
         n_il, n_xl = geom.shape
@@ -108,6 +113,7 @@ def load_segy_volume(
 #  低频模型
 # ═══════════════════════════════════════════════════════════════
 
+
 def make_lowfreq_model(
     impedance_volume: np.ndarray,
     dt_s: float = 0.001,
@@ -144,12 +150,18 @@ def make_lowfreq_model(
             if np.all(trace == 0):
                 continue
             lmf[i, j, :] = apply_butter_lowpass_filter(
-                trace, highcut=cutoff_hz, fs=fs, order=order, zero_phase=True,
+                trace,
+                highcut=cutoff_hz,
+                fs=fs,
+                order=order,
+                zero_phase=True,
             )
 
     logger.info(
         "Generated LMF: cutoff=%.1f Hz, order=%d, shape=%s",
-        cutoff_hz, order, lmf.shape,
+        cutoff_hz,
+        order,
+        lmf.shape,
     )
     return lmf.astype(np.float32)
 
@@ -158,11 +170,13 @@ def make_lowfreq_model(
 #  子波
 # ═══════════════════════════════════════════════════════════════
 
+
 def make_wavelet(
     wavelet_type: str = "ricker",
     freq: float = 25.0,
     dt: float = 0.001,
     length: int = 301,
+    gain: float = 1.0,
 ) -> np.ndarray:
     """生成理论子波。
 
@@ -176,6 +190,8 @@ def make_wavelet(
         采样间隔 (s)。
     length : int
         采样点数。
+    gain : float
+        子波振幅增益参数。
 
     Returns
     -------
@@ -184,17 +200,22 @@ def make_wavelet(
     """
     if wavelet_type == "ricker":
         from wtie.modeling.wavelet import ricker
+
         _, y = ricker(freq, dt, length)
     else:
         raise ValueError(f"Unsupported wavelet_type: {wavelet_type}")
+    y = y * float(gain)
 
-    logger.info("Generated %s wavelet: freq=%.1f Hz, dt=%.4f s, length=%d", wavelet_type, freq, dt, length)
+    logger.info(
+        "Generated %s wavelet: freq=%.1f Hz, dt=%.4f s, length=%d, gain=%.2f", wavelet_type, freq, dt, length, gain
+    )
     return y.astype(np.float32)
 
 
 # ═══════════════════════════════════════════════════════════════
 #  层位掩码
 # ═══════════════════════════════════════════════════════════════
+
 
 def load_horizon_mask(
     top_horizon_file: Path,
@@ -241,8 +262,13 @@ def load_horizon_mask(
     from cup.seismic.survey import query_seismic_geometry
 
     geometry = query_seismic_geometry(
-        seismic_file, seismic_type="segy", domain="time",
-        iline=iline, xline=xline, istep=istep, xstep=xstep,
+        seismic_file,
+        seismic_type="segy",
+        domain="time",
+        iline=iline,
+        xline=xline,
+        istep=istep,
+        xstep=xstep,
     )
 
     def _load_surface(path: Path) -> np.ndarray:
@@ -290,7 +316,9 @@ def load_horizon_mask(
     coverage = n_valid / mask.size * 100
     logger.info(
         "Horizon mask: %d valid points (%.1f%%), erosion=%d samples",
-        n_valid, coverage, erosion,
+        n_valid,
+        coverage,
+        erosion,
     )
     return mask
 
@@ -299,12 +327,13 @@ def load_horizon_mask(
 #  PyTorch Dataset
 # ═══════════════════════════════════════════════════════════════
 
+
 class SeismicTraceDataset(Dataset):
     """逐道 1D 地震数据 Dataset。
 
     每个 item 包含：
     - ``input``：(2, n_t) — 归一化地震道 + 归一化 LMF
-    - ``obs``：(1, n_t) — 原始地震道（用于损失计算）
+    - ``obs``：(1, n_t) — 归一化观测地震道（用于损失计算）
     - ``mask``：(1, n_t) — 布尔掩码
     - ``lmf_raw``：(1, n_t) — 原始 LMF（用于正演时恢复阻抗）
 
@@ -339,7 +368,7 @@ class SeismicTraceDataset(Dataset):
 
         # 全局归一化统计量（仅在有效掩码区域内计算）
         valid_seis = seismic[mask]
-        self._seis_rms = float(np.sqrt(np.mean(valid_seis ** 2))) + 1e-10
+        self._seis_rms = float(np.sqrt(np.mean(valid_seis**2))) + 1e-10
 
         # LMF 归一化：除以全局绝对最大值（保持正值，避免负数导致反射率除零）
         valid_lmf = lmf[mask]
@@ -347,7 +376,10 @@ class SeismicTraceDataset(Dataset):
 
         logger.info(
             "Dataset: %d valid traces / %d total, seis_rms=%.4f, lmf_scale=%.2f",
-            len(valid_indices), n_il * n_xl, self._seis_rms, self._lmf_scale,
+            len(valid_indices),
+            n_il * n_xl,
+            self._seis_rms,
+            self._lmf_scale,
         )
 
     def __len__(self) -> int:
@@ -366,12 +398,11 @@ class SeismicTraceDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         flat_idx = self._valid_indices[idx]
 
-        seis = self._seismic_flat[flat_idx].copy()       # (n_t,)
-        lmf = self._lmf_flat[flat_idx].copy()            # (n_t,)
-        m = self._mask_flat[flat_idx].copy()              # (n_t,)
+        seis = self._seismic_flat[flat_idx].copy()  # (n_t,)
+        lmf = self._lmf_flat[flat_idx].copy()  # (n_t,)
+        m = self._mask_flat[flat_idx].copy()  # (n_t,)
 
-        # 记录原始值
-        obs = seis.copy()
+        # 保留 LMF 原始量纲用于物理正演
         lmf_raw = lmf.copy()
 
         # 归一化：地震道除以 RMS，LMF 除以全局最大值（保持正值）
@@ -382,9 +413,9 @@ class SeismicTraceDataset(Dataset):
         x = np.stack([seis_norm, lmf_norm], axis=0)  # (2, n_t)
 
         return {
-            "input": torch.from_numpy(x).float(),                       # (2, n_t)
-            "obs": torch.from_numpy(obs[np.newaxis]).float(),           # (1, n_t)
-            "mask": torch.from_numpy(m[np.newaxis]).bool(),             # (1, n_t)
+            "input": torch.from_numpy(x).float(),  # (2, n_t)
+            "obs": torch.from_numpy(seis_norm[np.newaxis]).float(),  # (1, n_t)
+            "mask": torch.from_numpy(m[np.newaxis]).bool(),  # (1, n_t)
             "lmf_raw": torch.from_numpy(lmf_raw[np.newaxis]).float(),  # (1, n_t)
         }
 
@@ -402,15 +433,19 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
     logger.info("Loading seismic volume...")
     seismic, meta = load_segy_volume(
         cfg.seismic_file,
-        iline=cfg.segy_iline, xline=cfg.segy_xline,
-        istep=cfg.segy_istep, xstep=cfg.segy_xstep,
+        iline=cfg.segy_iline,
+        xline=cfg.segy_xline,
+        istep=cfg.segy_istep,
+        xstep=cfg.segy_xstep,
     )
 
     logger.info("Loading inversion volume...")
     inversion, _ = load_segy_volume(
         cfg.inversion_file,
-        iline=cfg.segy_iline, xline=cfg.segy_xline,
-        istep=cfg.segy_istep, xstep=cfg.segy_xstep,
+        iline=cfg.segy_iline,
+        xline=cfg.segy_xline,
+        istep=cfg.segy_istep,
+        xstep=cfg.segy_xstep,
     )
 
     logger.info("Generating low-frequency model...")
@@ -427,19 +462,26 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
         freq=cfg.wavelet_freq,
         dt=cfg.wavelet_dt,
         length=cfg.wavelet_length,
+        gain=cfg.wavelet_gain,
     )
 
-    logger.info("Building horizon mask (erosion=%d, start_time=%.0f ms)...", cfg.mask_erosion_samples, meta["start_time_ms"])
+    logger.info(
+        "Building horizon mask (erosion=%d, start_time=%.0f ms)...", cfg.mask_erosion_samples, meta["start_time_ms"]
+    )
     mask = load_horizon_mask(
         top_horizon_file=cfg.top_horizon_file,
         bot_horizon_file=cfg.bot_horizon_file,
         seismic_file=cfg.seismic_file,
-        n_il=meta["n_il"], n_xl=meta["n_xl"], n_t=meta["n_t"],
+        n_il=meta["n_il"],
+        n_xl=meta["n_xl"],
+        n_t=meta["n_t"],
         dt_s=cfg.dt,
         start_time_ms=meta["start_time_ms"],
         erosion=cfg.mask_erosion_samples,
-        iline=cfg.segy_iline, xline=cfg.segy_xline,
-        istep=cfg.segy_istep, xstep=cfg.segy_xstep,
+        iline=cfg.segy_iline,
+        xline=cfg.segy_xline,
+        istep=cfg.segy_istep,
+        xstep=cfg.segy_xstep,
     )
 
     dataset = SeismicTraceDataset(seismic, lmf, mask)

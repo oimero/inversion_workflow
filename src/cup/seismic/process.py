@@ -1,5 +1,6 @@
 """地震解释数据的预处理与插值工具。"""
 
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -8,6 +9,8 @@ import pandas as pd
 from scipy.interpolate import griddata
 from scipy.ndimage import generic_filter
 from scipy.spatial import QhullError
+
+OUTLIER_REMOVAL_WARNING_RATIO = 0.05
 
 
 def _build_line_axis(line_min: int, line_max: int, line_step: int) -> np.ndarray:
@@ -67,17 +70,18 @@ def _to_surface_grid(
     return grid
 
 
-def _remove_isolated_outliers(
+def _remove_isolated_outliers_with_stats(
     surface: np.ndarray,
     threshold: float,
     min_neighbor_count: int = 2,
-) -> np.ndarray:
-    """基于十字邻域中值剔除孤立跳变点。"""
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    """基于十字邻域中值剔除孤立跳变点，并返回剔除统计。"""
     if min_neighbor_count < 1:
         raise ValueError(f"min_neighbor_count must be >= 1, got {min_neighbor_count}.")
 
     out = surface.copy()
     valid_mask = np.isfinite(out)
+    total_count = int(np.count_nonzero(valid_mask))
     footprint = np.array(
         [
             [0, 1, 0],
@@ -111,7 +115,28 @@ def _remove_isolated_outliers(
     )
 
     out[isolated_mask] = np.nan
-    return out
+    removed_count = int(np.count_nonzero(isolated_mask))
+    removed_ratio = float(removed_count / total_count) if total_count else 0.0
+    stats = {
+        "total_points": total_count,
+        "removed_points": removed_count,
+        "removed_ratio": removed_ratio,
+        "warning_ratio": OUTLIER_REMOVAL_WARNING_RATIO,
+        "threshold": float(threshold),
+        "min_neighbor_count": int(min_neighbor_count),
+    }
+
+    if total_count and removed_ratio > OUTLIER_REMOVAL_WARNING_RATIO:
+        warnings.warn(
+            "Isolated outlier removal dropped "
+            f"{removed_count}/{total_count} interpretation point(s) "
+            f"({removed_ratio:.2%}), exceeding the "
+            f"{OUTLIER_REMOVAL_WARNING_RATIO:.0%} warning threshold.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    return out, stats
 
 
 def _interpolate_whole_mesh_linear_then_nearest(surface: np.ndarray) -> np.ndarray:
@@ -180,23 +205,6 @@ def _validate_geometry_keys(geometry: Dict[str, Any]) -> None:
     missing_geometry_keys = geometry_keys - set(geometry)
     if missing_geometry_keys:
         raise ValueError(f"geometry is missing required keys: {sorted(missing_geometry_keys)}")
-
-
-def _interpolate_interpretation_surface_grid(
-    interpretation_df: pd.DataFrame,
-    il_axis: np.ndarray,
-    xl_axis: np.ndarray,
-    outlier_threshold: float,
-    min_neighbor_count: int = 2,
-) -> np.ndarray:
-    """对单个层位执行去孤立点与全域插值，返回 2D 网格。"""
-    surface = _to_surface_grid(interpretation_df, il_axis, xl_axis)
-    surface_despiked = _remove_isolated_outliers(
-        surface,
-        threshold=outlier_threshold,
-        min_neighbor_count=min_neighbor_count,
-    )
-    return _interpolate_whole_mesh_linear_then_nearest(surface_despiked)
 
 
 def _normalize_interpretation_unit_for_geometry(
@@ -425,6 +433,7 @@ def interpolate_interpretation_surface(
     -------
     pd.DataFrame
             列为 `inline`, `xline`, `interpretation`。
+            剔除统计写入 ``df.attrs["outlier_removal"]``。
     """
     _validate_geometry_keys(geometry)
 
@@ -441,13 +450,20 @@ def interpolate_interpretation_surface(
 
     normalized_interpretation_df = _normalize_interpretation_unit_for_geometry(interpretation_df, geometry)
 
-    surface_filled = _interpolate_interpretation_surface_grid(
-        interpretation_df=normalized_interpretation_df,
-        il_axis=il_axis,
-        xl_axis=xl_axis,
-        outlier_threshold=outlier_threshold,
+    input_values = normalized_interpretation_df[["inline", "xline", "interpretation"]].to_numpy(
+        dtype=float,
+        copy=False,
+    )
+    valid_input_count = int(np.count_nonzero(np.isfinite(input_values).all(axis=1)))
+    surface = _to_surface_grid(normalized_interpretation_df, il_axis, xl_axis)
+    surface_despiked, outlier_stats = _remove_isolated_outliers_with_stats(
+        surface,
+        threshold=outlier_threshold,
         min_neighbor_count=min_neighbor_count,
     )
+    outlier_stats["input_valid_points"] = valid_input_count
+    outlier_stats["gridded_valid_points"] = outlier_stats["total_points"]
+    surface_filled = _interpolate_whole_mesh_linear_then_nearest(surface_despiked)
 
     il_grid, xl_grid = np.meshgrid(il_axis, xl_axis, indexing="ij")
     out_df = pd.DataFrame(
@@ -457,7 +473,10 @@ def interpolate_interpretation_surface(
             "interpretation": surface_filled.ravel(),
         }
     )
+    out_df.attrs["outlier_removal"] = outlier_stats
 
     if keep_nan:
         return out_df
-    return out_df[np.isfinite(out_df["interpretation"])].reset_index(drop=True)
+    out_df_valid = out_df[np.isfinite(out_df["interpretation"])].reset_index(drop=True)
+    out_df_valid.attrs["outlier_removal"] = outlier_stats
+    return out_df_valid

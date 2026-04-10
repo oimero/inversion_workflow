@@ -305,14 +305,14 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
     top_df_interp = interpolate_interpretation_surface(
         interpretation_df=top_df_raw,
         geometry=geometry,
-        outlier_threshold=20.0,
+        outlier_threshold=0.02,
         min_neighbor_count=2,
         keep_nan=True,
     )
     bot_df_interp = interpolate_interpretation_surface(
         interpretation_df=bot_df_raw,
         geometry=geometry,
-        outlier_threshold=20.0,
+        outlier_threshold=0.02,
         min_neighbor_count=2,
         keep_nan=True,
     )

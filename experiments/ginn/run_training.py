@@ -75,7 +75,7 @@ def main() -> None:
         num_workers=0,
         pin_memory=True,
         # ── 掩码 ──────────────────────────────────────────────────
-        mask_erosion_samples=30,  # 实际间距最小 69ms，安全收缩 30 点/侧
+        # mask_erosion_samples=30,  # 实际间距最小 69ms，安全收缩 30 点/侧
         # ── 输出 ──────────────────────────────────────────────────
         checkpoint_dir=_script_dir / "checkpoints",
         log_interval=50,

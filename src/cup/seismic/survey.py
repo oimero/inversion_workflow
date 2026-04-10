@@ -96,9 +96,9 @@ def _segy_build_samples(meta: Dict[str, Any], domain: str) -> np.ndarray:
     domain_lower = _normalize_domain(domain)
     nt = int(meta["nt"])
     if domain_lower == "time":
-        start_time_ms = float(meta.get("start_time", 0.0))
-        dt_ms = float(meta["dt"]) / 1000.0
-        return start_time_ms + np.arange(nt, dtype=np.float64) * dt_ms
+        start_time_s = float(meta.get("start_time", 0.0)) / 1000.0
+        dt_s = float(meta["dt"]) / 1_000_000.0
+        return start_time_s + np.arange(nt, dtype=np.float64) * dt_s
 
     start_depth = float(meta.get("start_depth", meta.get("start_time", 0.0)))
     dz = float(meta.get("dz", meta["dt"])) / 1000.0
@@ -253,14 +253,17 @@ class SegySurveyContext:
         xline_stats = _axis_stats(xlines)
         sample_stats = _axis_stats(samples)
 
-        sample_unit = "ms" if domain_value == "time" else "m"
+        sample_unit = "s" if domain_value == "time" else "m"
         return {
+            "n_il": int(self.geom.shape[0]),
             "inline_min": inline_stats["min"],
             "inline_max": inline_stats["max"],
             "inline_step": inline_stats["step"],
+            "n_xl": int(self.geom.shape[1]),
             "xline_min": xline_stats["min"],
             "xline_max": xline_stats["max"],
             "xline_step": xline_stats["step"],
+            "n_sample": int(self.meta["nt"]),
             "sample_min": sample_stats["min"],
             "sample_max": sample_stats["max"],
             "sample_step": sample_stats["step"],
@@ -356,8 +359,6 @@ class SegySurveyContext:
 
         trace_data = _interpolate_trace_from_4_neighbors(i, j, t00, t01, t10, t11)
         trace_axis = raw_samples[sample_idx_start:sample_idx_end]
-        if domain_value == "time":
-            trace_axis = trace_axis / 1000.0
 
         basis_type = _domain_to_basis_type(domain_value)
         trace_name = "Seismic Trace" if basis_type == "twt" else "Seismic Trace (Depth)"
@@ -413,16 +414,20 @@ class ZgySurveyContext:
         domain_value = _normalize_domain(domain)
         inline_stats = _axis_stats(self.ilines)
         xline_stats = _axis_stats(self.xlines)
-        sample_stats = _axis_stats(self.samples)
+        sample_values = self.samples / 1000.0 if domain_value == "time" else self.samples
+        sample_stats = _axis_stats(sample_values)
 
-        sample_unit = "ms" if domain_value == "time" else "m"
+        sample_unit = "s" if domain_value == "time" else "m"
         return {
+            "n_il": int(self.n_ilines),
             "inline_min": inline_stats["min"],
             "inline_max": inline_stats["max"],
             "inline_step": inline_stats["step"],
+            "n_xl": int(self.n_xlines),
             "xline_min": xline_stats["min"],
             "xline_max": xline_stats["max"],
             "xline_step": xline_stats["step"],
+            "n_sample": int(sample_values.size),
             "sample_min": sample_stats["min"],
             "sample_max": sample_stats["max"],
             "sample_step": sample_stats["step"],
@@ -487,7 +492,7 @@ class ZgySurveyContext:
         if not (0 <= j_floor < self.n_xlines and 0 <= j_ceil < self.n_xlines):
             raise ValueError(f"Well is outside seismic crossline range: {j_floor}, {j_ceil}")
 
-        raw_samples = self.samples
+        raw_samples = self.samples / 1000.0 if domain_value == "time" else self.samples
         sample_idx_start, sample_idx_end = _resolve_sample_window(raw_samples, sample_start, sample_end)
 
         with pyzgy.open(str(self.seismic_file), mode="r") as reader:
@@ -499,8 +504,6 @@ class ZgySurveyContext:
         trace_data = _interpolate_trace_from_4_neighbors(i, j, t00, t01, t10, t11)
 
         trace_axis = raw_samples[sample_idx_start:sample_idx_end]
-        if domain_value == "time":
-            trace_axis = trace_axis / 1000.0
 
         basis_type = _domain_to_basis_type(domain_value)
         trace_name = "Seismic Trace" if basis_type == "twt" else "Seismic Trace (Depth)"

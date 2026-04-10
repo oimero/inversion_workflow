@@ -167,6 +167,230 @@ def _interpolate_whole_mesh_linear_then_nearest(surface: np.ndarray) -> np.ndarr
     return out
 
 
+def _validate_geometry_keys(geometry: Dict[str, Any]) -> None:
+    """校验几何信息是否包含插值必需键。"""
+    geometry_keys = {
+        "inline_min",
+        "inline_max",
+        "inline_step",
+        "xline_min",
+        "xline_max",
+        "xline_step",
+    }
+    missing_geometry_keys = geometry_keys - set(geometry)
+    if missing_geometry_keys:
+        raise ValueError(f"geometry is missing required keys: {sorted(missing_geometry_keys)}")
+
+
+def _interpolate_interpretation_surface_grid(
+    interpretation_df: pd.DataFrame,
+    il_axis: np.ndarray,
+    xl_axis: np.ndarray,
+    outlier_threshold: float,
+    min_neighbor_count: int = 2,
+) -> np.ndarray:
+    """对单个层位执行去孤立点与全域插值，返回 2D 网格。"""
+    surface = _to_surface_grid(interpretation_df, il_axis, xl_axis)
+    surface_despiked = _remove_isolated_outliers(
+        surface,
+        threshold=outlier_threshold,
+        min_neighbor_count=min_neighbor_count,
+    )
+    return _interpolate_whole_mesh_linear_then_nearest(surface_despiked)
+
+
+def _normalize_interpretation_unit_for_geometry(
+    interpretation_df: pd.DataFrame,
+    geometry: Dict[str, Any],
+) -> pd.DataFrame:
+    """按 geometry 自动归一化 interpretation 单位（当前支持 time+s 自动识别 ms）。"""
+    sample_domain = str(geometry.get("sample_domain", "")).lower()
+    sample_unit = str(geometry.get("sample_unit", "")).lower()
+    if sample_domain != "time" or sample_unit != "s":
+        return interpretation_df
+
+    if "interpretation" not in interpretation_df.columns:
+        return interpretation_df
+
+    z = interpretation_df["interpretation"].to_numpy(dtype=float, copy=False)
+    finite = np.isfinite(z)
+    if not np.any(finite):
+        return interpretation_df
+
+    # 经验规则：秒域层位通常数量级不超过 10；若明显超出，按 ms 输入自动换算为 s。
+    if float(np.nanmax(np.abs(z[finite]))) <= 10.0:
+        return interpretation_df
+
+    out_df = interpretation_df.copy()
+    converted = out_df["interpretation"].to_numpy(dtype=float, copy=True)
+    converted[finite] = converted[finite] / 1000.0
+    out_df["interpretation"] = converted
+    return out_df
+
+
+class TargetLayer:
+    """目的层对象：持有已插值层位并做顶底约束校验。"""
+
+    def __init__(
+        self,
+        interpolated_horizon_dfs: Dict[str, pd.DataFrame],
+        geometry: Dict[str, Any],
+        top_name: str,
+        bottom_name: str,
+    ) -> None:
+        """初始化目的层并校验已插值顶底层位关系。"""
+        if len(interpolated_horizon_dfs) < 2:
+            raise ValueError("interpolated_horizon_dfs must contain at least two horizons.")
+        if top_name not in interpolated_horizon_dfs:
+            raise ValueError(f"top_name '{top_name}' is not in interpolated_horizon_dfs.")
+        if bottom_name not in interpolated_horizon_dfs:
+            raise ValueError(f"bottom_name '{bottom_name}' is not in interpolated_horizon_dfs.")
+
+        _validate_geometry_keys(geometry)
+
+        self.geometry = dict(geometry)
+        self.interpolated_horizon_dfs = {name: df.copy() for name, df in interpolated_horizon_dfs.items()}
+        self.top_name = top_name
+        self.bottom_name = bottom_name
+
+        self._assert_top_strictly_smaller_than_bottom()
+
+    def _assert_top_strictly_smaller_than_bottom(self) -> None:
+        """在共址样点上断言顶层位解释值严格小于底层位解释值。"""
+        required_cols = ["inline", "xline", "interpretation"]
+        top_df = self.interpolated_horizon_dfs[self.top_name][required_cols].copy()
+        bot_df = self.interpolated_horizon_dfs[self.bottom_name][required_cols].copy()
+
+        top_df = top_df[np.isfinite(top_df["interpretation"])].rename(columns={"interpretation": "interpretation_top"})
+        bot_df = bot_df[np.isfinite(bot_df["interpretation"])].rename(
+            columns={"interpretation": "interpretation_bottom"}
+        )
+
+        aligned = pd.merge(top_df, bot_df, on=["inline", "xline"], how="inner")
+        if aligned.empty:
+            raise AssertionError(
+                "No overlapping (inline, xline) samples were found between top and bottom horizons; "
+                "cannot assert top < bottom."
+            )
+
+        violated = aligned[aligned["interpretation_top"] >= aligned["interpretation_bottom"]]
+        assert violated.empty, (
+            f"Top horizon must be strictly smaller than bottom horizon on overlapping samples. "
+            f"Found {len(violated)} violation(s)."
+        )
+
+    def convert_horizon_to_relative_sample_index(
+        self,
+        horizon_name: str,
+    ) -> pd.DataFrame:
+        """将绝对层位值转换为相对采样索引，并强制校验采样范围。"""
+        if horizon_name not in self.interpolated_horizon_dfs:
+            raise ValueError(f"horizon_name '{horizon_name}' is not in interpolated_horizon_dfs.")
+
+        required_geometry_keys = {"sample_min", "sample_max", "sample_step"}
+        missing_geometry_keys = required_geometry_keys - set(self.geometry)
+        if missing_geometry_keys:
+            raise ValueError(f"geometry is missing required keys for sample indexing: {sorted(missing_geometry_keys)}")
+
+        sample_min = float(self.geometry["sample_min"])
+        sample_max = float(self.geometry["sample_max"])
+        sample_step = float(self.geometry["sample_step"])
+        if sample_step <= 0:
+            raise ValueError(f"sample_step must be positive, got {sample_step}.")
+
+        horizon_df = self.interpolated_horizon_dfs[horizon_name].copy()
+        required_cols = {"inline", "xline", "interpretation"}
+        missing_cols = required_cols - set(horizon_df.columns)
+        if missing_cols:
+            raise ValueError(
+                f"interpolated_horizon_dfs['{horizon_name}'] is missing required columns: {sorted(missing_cols)}"
+            )
+
+        normalized_horizon_df = _normalize_interpretation_unit_for_geometry(horizon_df, self.geometry)
+
+        interpretation = normalized_horizon_df["interpretation"].to_numpy(dtype=float, copy=False)
+        sample_index = np.full(interpretation.shape, np.nan, dtype=float)
+        finite_mask = np.isfinite(interpretation)
+        sample_index[finite_mask] = (interpretation[finite_mask] - sample_min) / sample_step
+
+        if np.any(finite_mask):
+            tol = 1e-6
+            out_of_range = finite_mask & ((interpretation < sample_min - tol) | (interpretation > sample_max + tol))
+            if np.any(out_of_range):
+                bad_rows = normalized_horizon_df.loc[out_of_range, ["inline", "xline", "interpretation"]].head(5)
+                raise ValueError(
+                    "Horizon values are out of sample range. "
+                    f"Expected within [{sample_min}, {sample_max}], "
+                    f"found {int(np.count_nonzero(out_of_range))} out-of-range points. "
+                    f"Examples: {bad_rows.to_dict(orient='records')}"
+                )
+
+        out_df = normalized_horizon_df[["inline", "xline", "interpretation"]].copy()
+        out_df["sample_index"] = sample_index
+        return out_df
+
+    def to_mask(
+        self,
+        top_name: Optional[str] = None,
+        bottom_name: Optional[str] = None,
+    ) -> np.ndarray:
+        """根据顶/底层位生成三维布尔掩码。"""
+        top_name = self.top_name if top_name is None else top_name
+        bottom_name = self.bottom_name if bottom_name is None else bottom_name
+
+        il_axis = _build_line_axis(
+            int(self.geometry["inline_min"]),
+            int(self.geometry["inline_max"]),
+            int(self.geometry["inline_step"]),
+        )
+        xl_axis = _build_line_axis(
+            int(self.geometry["xline_min"]),
+            int(self.geometry["xline_max"]),
+            int(self.geometry["xline_step"]),
+        )
+
+        n_il = int(self.geometry.get("n_il", il_axis.size))
+        n_xl = int(self.geometry.get("n_xl", xl_axis.size))
+        if n_il != il_axis.size:
+            raise ValueError(f"geometry n_il={n_il} does not match axis size {il_axis.size}.")
+        if n_xl != xl_axis.size:
+            raise ValueError(f"geometry n_xl={n_xl} does not match axis size {xl_axis.size}.")
+
+        if "n_sample" in self.geometry:
+            n_sample = int(self.geometry["n_sample"])
+        else:
+            required_keys = {"sample_min", "sample_max", "sample_step"}
+            missing = required_keys - set(self.geometry)
+            if missing:
+                raise ValueError(f"geometry is missing required keys for n_sample: {sorted(missing)}")
+            sample_max = float(self.geometry["sample_max"])
+            sample_min = float(self.geometry["sample_min"])
+            sample_step = float(self.geometry["sample_step"])
+            n_sample = int(round((sample_max - sample_min) / sample_step)) + 1
+
+        top_idx_df = self.convert_horizon_to_relative_sample_index(top_name)
+        bot_idx_df = self.convert_horizon_to_relative_sample_index(bottom_name)
+
+        top_grid_df = top_idx_df[["inline", "xline", "sample_index"]].rename(columns={"sample_index": "interpretation"})
+        bot_grid_df = bot_idx_df[["inline", "xline", "sample_index"]].rename(columns={"sample_index": "interpretation"})
+
+        top_grid = _to_surface_grid(top_grid_df, il_axis, xl_axis)
+        bot_grid = _to_surface_grid(bot_grid_df, il_axis, xl_axis)
+
+        mask = np.zeros((n_il, n_xl, n_sample), dtype=bool)
+        for i in range(n_il):
+            for j in range(n_xl):
+                t_top = top_grid[i, j]
+                t_bot = bot_grid[i, j]
+                if np.isfinite(t_top) and np.isfinite(t_bot):
+                    idx_top = max(0, int(np.round(t_top)))
+                    idx_bot = min(n_sample, int(np.round(t_bot)) + 1)
+                    if idx_top < idx_bot:
+                        mask[i, j, idx_top:idx_bot] = True
+
+        return mask
+
+
 def interpolate_interpretation_surface(
     interpretation_df: pd.DataFrame,
     geometry: Dict[str, Any],
@@ -185,29 +409,24 @@ def interpolate_interpretation_surface(
             `xline_min`, `xline_max`, `xline_step`。
     outlier_threshold : float
             孤立点判定阈值。若样点与邻域中值差值绝对值超过该阈值，则剔除为 NaN。
-            单位与 `interpretation` 一致（例如 ms 或 m）。
+            单位与 `interpretation` 一致（例如 s 或 m）。
     min_neighbor_count : int, default=2
             执行孤立点判断所需的最小有效邻居数（十字邻域，不含中心点）。
     keep_nan : bool, default=True
             为 True 时返回完整网格；
             为 False 时仅返回有效解释点。
 
+    Notes
+    -----
+    当 geometry 指定为 ``sample_domain='time'`` 且 ``sample_unit='s'`` 时，
+    若 interpretation 数值量级明显超过秒域常见范围（>10），会自动按 ms 输入除以 1000 转为 s。
+
     Returns
     -------
     pd.DataFrame
             列为 `inline`, `xline`, `interpretation`。
     """
-    geometry_keys = {
-        "inline_min",
-        "inline_max",
-        "inline_step",
-        "xline_min",
-        "xline_max",
-        "xline_step",
-    }
-    missing_geometry_keys = geometry_keys - set(geometry)
-    if missing_geometry_keys:
-        raise ValueError(f"geometry is missing required keys: {sorted(missing_geometry_keys)}")
+    _validate_geometry_keys(geometry)
 
     il_axis = _build_line_axis(
         int(geometry["inline_min"]),
@@ -220,13 +439,15 @@ def interpolate_interpretation_surface(
         int(geometry["xline_step"]),
     )
 
-    surface = _to_surface_grid(interpretation_df, il_axis, xl_axis)
-    surface_despiked = _remove_isolated_outliers(
-        surface,
-        threshold=outlier_threshold,
+    normalized_interpretation_df = _normalize_interpretation_unit_for_geometry(interpretation_df, geometry)
+
+    surface_filled = _interpolate_interpretation_surface_grid(
+        interpretation_df=normalized_interpretation_df,
+        il_axis=il_axis,
+        xl_axis=xl_axis,
+        outlier_threshold=outlier_threshold,
         min_neighbor_count=min_neighbor_count,
     )
-    surface_filled = _interpolate_whole_mesh_linear_then_nearest(surface_despiked)
 
     il_grid, xl_grid = np.meshgrid(il_axis, xl_axis, indexing="ij")
     out_df = pd.DataFrame(
@@ -240,24 +461,3 @@ def interpolate_interpretation_surface(
     if keep_nan:
         return out_df
     return out_df[np.isfinite(out_df["interpretation"])].reset_index(drop=True)
-
-
-# def import_and_interpolate_interpretation_petrel(
-#     interpretation_file: Path,
-#     seismic_file: Path,
-#     outlier_threshold: float,
-#     seismic_type: str = "segy",
-#     domain: Optional[str] = "time",
-#     min_neighbor_count: int = 2,
-#     keep_nan: bool = True,
-# ) -> pd.DataFrame:
-#     """导入 Petrel 层位并执行去孤立点+全域插值。"""
-#     interpretation_df = import_interpretation_petrel(interpretation_file)
-#     geometry = query_seismic_geometry(seismic_file, seismic_type=seismic_type, domain=domain)
-#     return interpolate_interpretation_surface(
-#         interpretation_df=interpretation_df,
-#         geometry=geometry,
-#         outlier_threshold=outlier_threshold,
-#         min_neighbor_count=min_neighbor_count,
-#         keep_nan=keep_nan,
-#     )

@@ -41,7 +41,7 @@ class Trainer:
 
         # ── 数据 ──
         logger.info("Building dataset...")
-        self.dataset, wavelet, self.meta = build_dataset(cfg)
+        self.dataset, wavelet, self.geometry = build_dataset(cfg)
 
         self.dataloader = DataLoader(
             self.dataset,
@@ -227,9 +227,9 @@ class Trainer:
         """
         self.model.eval()
 
-        n_il = self.meta["n_il"]
-        n_xl = self.meta["n_xl"]
-        n_t = self.meta["n_t"]
+        n_il = int(self.geometry["n_il"])
+        n_xl = int(self.geometry["n_xl"])
+        n_t = int(self.geometry["n_sample"])
 
         # 使用全部道（包含无效道）进行推理
         full_loader = DataLoader(
@@ -241,7 +241,6 @@ class Trainer:
         )
 
         predictions = []
-        indices = []
 
         for batch in full_loader:
             x = batch["input"].to(self.device)

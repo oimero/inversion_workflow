@@ -19,6 +19,9 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from cup.petrel.load import import_interpretation_petrel, import_seismic
+from cup.seismic.process import TargetLayer, interpolate_interpretation_surface
+from cup.seismic.survey import open_survey
 from ginn.config import GINNConfig
 
 logger = logging.getLogger(__name__)
@@ -27,75 +30,6 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════
 #  SEG-Y I/O
 # ═══════════════════════════════════════════════════════════════
-
-
-# def load_segy_volume(
-#     segy_path: Path,
-#     iline: Optional[int] = None,
-#     xline: Optional[int] = None,
-#     istep: Optional[int] = None,
-#     xstep: Optional[int] = None,
-# ) -> Tuple[np.ndarray, Dict[str, Any]]:
-#     """读取三维叠后 SEG-Y 数据体。
-
-#     Parameters
-#     ----------
-#     segy_path : Path
-#         SEG-Y 文件路径。
-#     iline, xline : int | None
-#         Inline/Crossline 头字节位置。为 ``None`` 时自动推断。
-#     istep, xstep : int | None
-#         Inline/Crossline 步长。为 ``None`` 时自动推断。
-
-#     Returns
-#     -------
-#     volume : np.ndarray
-#         三维数据体，shape ``(n_il, n_xl, n_t)``，float32。
-#     meta : dict
-#         几何元信息，包含 ``n_il``, ``n_xl``, ``n_t``,
-#         ``il_min``, ``xl_min``, ``il_step``, ``xl_step``, ``dt_ms``。
-#     """
-#     import cigsegy
-
-#     # 配置优先：传入的 keyloc/step 直接使用；缺失项由 cigsegy 自动推断。
-#     meta_info = cigsegy.tools.get_metaInfo(
-#         str(segy_path),
-#         iline=iline,  # type: ignore
-#         xline=xline,  # type: ignore
-#         istep=istep,  # type: ignore
-#         xstep=xstep,  # type: ignore
-#         apply_scalar=True,
-#     )
-
-#     volume = cigsegy.fromfile(
-#         str(segy_path),
-#         iline=iline,  # type: ignore
-#         xline=xline,  # type: ignore
-#         istep=istep,  # type: ignore
-#         xstep=xstep,  # type: ignore
-#     )
-#     if volume.ndim != 3:
-#         raise ValueError(f"Only 3D post-stack SEG-Y is supported, got ndim={volume.ndim}")
-#     volume = np.asarray(volume, dtype=np.float32)
-
-#     n_il, n_xl, n_t = volume.shape
-#     dt_ms = float(meta_info["dt"]) / 1000.0  # μs → ms
-
-#     # 兼容现有下游 meta 契约。
-#     meta = {
-#         "n_il": int(n_il),
-#         "n_xl": int(n_xl),
-#         "n_t": int(n_t),
-#         "il_min": float(meta_info.get("start_iline", 0.0)),
-#         "xl_min": float(meta_info.get("start_xline", 0.0)),
-#         "il_step": float(meta_info.get("istep", 1.0)),
-#         "xl_step": float(meta_info.get("xstep", 1.0)),
-#         "dt_ms": dt_ms,
-#         "start_time_ms": float(meta_info.get("start_time", 0.0)),
-#     }
-
-#     logger.info("Loaded SEG-Y: %s  shape=%s  dt=%.1f ms", segy_path.name, volume.shape, dt_ms)
-#     return volume, meta
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -114,7 +48,7 @@ def make_lowfreq_model(
     Parameters
     ----------
     impedance_volume : np.ndarray
-        反演阻抗体，shape ``(n_il, n_xl, n_t)``。
+        反演阻抗体，shape ``(n_il, n_xl, n_sample)``。
     dt_s : float
         采样间隔，秒。
     cutoff_hz : float
@@ -130,7 +64,7 @@ def make_lowfreq_model(
     from wtie.processing.spectral import apply_butter_lowpass_filter
 
     fs = 1.0 / dt_s
-    n_il, n_xl, n_t = impedance_volume.shape
+    n_il, n_xl, n_sample = impedance_volume.shape
     lmf = np.zeros_like(impedance_volume)
 
     for i in range(n_il):
@@ -204,112 +138,6 @@ def make_wavelet(
 # ═══════════════════════════════════════════════════════════════
 #  层位掩码
 # ═══════════════════════════════════════════════════════════════
-
-
-# def load_horizon_mask(
-#     top_horizon_file: Path,
-#     bot_horizon_file: Path,
-#     seismic_file: Path,
-#     n_il: int,
-#     n_xl: int,
-#     n_t: int,
-#     dt_s: float = 0.001,
-#     start_time_ms: float = 0.0,
-#     erosion: int = 0,
-#     iline: int = 5,
-#     xline: int = 21,
-#     istep: int = 1,
-#     xstep: int = 4,
-# ) -> np.ndarray:
-#     """从 Petrel 层位文件生成三维布尔掩码。
-
-#     Parameters
-#     ----------
-#     top_horizon_file : Path
-#         顶层位文件路径。
-#     bot_horizon_file : Path
-#         底层位文件路径。
-#     seismic_file : Path
-#         地震体文件路径（用于获取几何信息）。
-#     n_il, n_xl, n_t : int
-#         数据体 inline/crossline/采样维度大小。
-#     dt_s : float
-#         采样间隔 (s)。
-#     start_time_ms : float
-#         地震道起始时间 (ms)。层位绝对时间会减去此值后转为采样索引。
-#     erosion : int
-#         掩码边界收缩采样点数。
-
-#     Returns
-#     -------
-#     np.ndarray
-#         布尔掩码，shape ``(n_il, n_xl, n_t)``。
-#         True 表示该点位于收缩后的有效区域内。
-#     """
-#     from cup.petrel.load import import_interpretation_petrel
-#     from cup.seismic.process import interpolate_interpretation_surface
-#     from cup.seismic.survey import query_seismic_geometry
-
-#     geometry = query_seismic_geometry(
-#         seismic_file,
-#         seismic_type="segy",
-#         domain="time",
-#         iline=iline,
-#         xline=xline,
-#         istep=istep,
-#         xstep=xstep,
-#     )
-
-#     def _load_surface(path: Path) -> np.ndarray:
-#         df = import_interpretation_petrel(path)
-#         interp_df = interpolate_interpretation_surface(
-#             interpretation_df=df,
-#             geometry=geometry,
-#             outlier_threshold=20.0,
-#             min_neighbor_count=2,
-#             keep_nan=True,
-#         )
-#         # 层位以 ms 为单位 → 转为采样索引
-#         il_min = int(geometry["inline_min"])
-#         xl_min = int(geometry["xline_min"])
-#         il_step = int(geometry["inline_step"])
-#         xl_step = int(geometry["xline_step"])
-
-#         surface_grid = np.full((n_il, n_xl), np.nan, dtype=np.float64)
-#         for _, row in interp_df.iterrows():
-#             il_idx = int((row["inline"] - il_min) / il_step)
-#             xl_idx = int((row["xline"] - xl_min) / xl_step)
-#             if 0 <= il_idx < n_il and 0 <= xl_idx < n_xl:
-#                 val = row["interpretation"]
-#                 if np.isfinite(val):
-#                     # 层位绝对时间 (ms) → 相对采样索引
-#                     surface_grid[il_idx, xl_idx] = (val - start_time_ms) / (dt_s * 1000.0)
-#         return surface_grid
-
-#     top_surface = _load_surface(top_horizon_file)
-#     bot_surface = _load_surface(bot_horizon_file)
-
-#     mask = np.zeros((n_il, n_xl, n_t), dtype=bool)
-#     for i in range(n_il):
-#         for j in range(n_xl):
-#             t_top = top_surface[i, j]
-#             t_bot = bot_surface[i, j]
-#             if np.isfinite(t_top) and np.isfinite(t_bot):
-#                 # 边界收缩：顶向下 + 底向上
-#                 idx_top = max(0, int(np.round(t_top)) + erosion)
-#                 idx_bot = min(n_t, int(np.round(t_bot)) + 1 - erosion)
-#                 if idx_top < idx_bot:
-#                     mask[i, j, idx_top:idx_bot] = True
-
-#     n_valid = mask.sum()
-#     coverage = n_valid / mask.size * 100
-#     logger.info(
-#         "Horizon mask: %d valid points (%.1f%%), erosion=%d samples",
-#         n_valid,
-#         coverage,
-#         erosion,
-#     )
-#     return mask
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -416,26 +244,85 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
     -------
     dataset : SeismicTraceDataset
     wavelet : np.ndarray
-    meta : dict
+    geometry : dict
         地震体几何元信息。
     """
     logger.info("Loading seismic volume...")
-    seismic, meta = load_segy_volume(
+    seismic = import_seismic(
         cfg.seismic_file,
+        seismic_type="segy",
         iline=cfg.segy_iline,
         xline=cfg.segy_xline,
         istep=cfg.segy_istep,
         xstep=cfg.segy_xstep,
     )
 
-    logger.info("Loading inversion volume...")
-    inversion, _ = load_segy_volume(
-        cfg.inversion_file,
-        iline=cfg.segy_iline,
-        xline=cfg.segy_xline,
-        istep=cfg.segy_istep,
-        xstep=cfg.segy_xstep,
+    seismic_ctx = open_survey(
+        cfg.seismic_file,
+        seismic_type="segy",
+        segy_options={
+            "iline": cfg.segy_iline,
+            "xline": cfg.segy_xline,
+            "istep": cfg.segy_istep,
+            "xstep": cfg.segy_xstep,
+        },
     )
+    geometry = seismic_ctx.query_geometry(domain="time")
+
+    n_il, n_xl, n_sample = seismic.shape
+    geometry_n_il = int(geometry["n_il"])
+    geometry_n_xl = int(geometry["n_xl"])
+    geometry_n_sample = int(geometry["n_sample"])
+    if (n_il, n_xl, n_sample) != (geometry_n_il, geometry_n_xl, geometry_n_sample):
+        raise ValueError(
+            "Seismic volume shape does not match queried geometry: "
+            f"volume={(n_il, n_xl, n_sample)}, geometry={(geometry_n_il, geometry_n_xl, geometry_n_sample)}"
+        )
+
+    # 在这里实例化 TargetLayer 对象，顺便输出一个层位解释的三维布尔体
+    # TODO：理论上，低频模型应该由 TargetLayer 构建
+    # 然后将 TargetLayer 跑出来的低频模型跑一遍确定性反演
+    # 再将这个反演体作为网络的输入
+
+    logger.info("Loading inversion volume...")
+    inversion = import_seismic(
+        cfg.inversion_file,
+        seismic_type="segy",
+        # iline=cfg.segy_iline,
+        # xline=cfg.segy_xline,
+        # istep=cfg.segy_istep,
+        # xstep=cfg.segy_xstep,
+    )
+    if inversion.shape != seismic.shape:
+        raise ValueError(f"Inversion shape {inversion.shape} does not match seismic shape {seismic.shape}.")
+
+    logger.info("Loading and interpolating top/bottom interpretation horizons...")
+    top_df_raw = import_interpretation_petrel(cfg.top_horizon_file)
+    bot_df_raw = import_interpretation_petrel(cfg.bot_horizon_file)
+
+    top_df_interp = interpolate_interpretation_surface(
+        interpretation_df=top_df_raw,
+        geometry=geometry,
+        outlier_threshold=20.0,
+        min_neighbor_count=2,
+        keep_nan=True,
+    )
+    bot_df_interp = interpolate_interpretation_surface(
+        interpretation_df=bot_df_raw,
+        geometry=geometry,
+        outlier_threshold=20.0,
+        min_neighbor_count=2,
+        keep_nan=True,
+    )
+
+    logger.info("Building horizon mask from TargetLayer...")
+    target_layer = TargetLayer(
+        interpolated_horizon_dfs={"top": top_df_interp, "bottom": bot_df_interp},
+        geometry=geometry,
+        top_name="top",
+        bottom_name="bottom",
+    )
+    mask = target_layer.to_mask()
 
     logger.info("Generating low-frequency model...")
     lmf = make_lowfreq_model(
@@ -454,24 +341,9 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
         gain=cfg.wavelet_gain,
     )
 
-    logger.info(
-        "Building horizon mask (erosion=%d, start_time=%.0f ms)...", cfg.mask_erosion_samples, meta["start_time_ms"]
-    )
-    mask = load_horizon_mask(
-        top_horizon_file=cfg.top_horizon_file,
-        bot_horizon_file=cfg.bot_horizon_file,
-        seismic_file=cfg.seismic_file,
-        n_il=meta["n_il"],
-        n_xl=meta["n_xl"],
-        n_t=meta["n_t"],
-        dt_s=cfg.dt,
-        start_time_ms=meta["start_time_ms"],
-        erosion=cfg.mask_erosion_samples,
-        iline=cfg.segy_iline,
-        xline=cfg.segy_xline,
-        istep=cfg.segy_istep,
-        xstep=cfg.segy_xstep,
-    )
+    logger.info("Building horizon mask from TargetLayer (erosion disabled for now)...")
+    if mask.shape != seismic.shape:
+        raise ValueError(f"Mask shape {mask.shape} does not match seismic shape {seismic.shape}.")
 
     dataset = SeismicTraceDataset(seismic, lmf, mask)
-    return dataset, wavelet, meta
+    return dataset, wavelet, geometry

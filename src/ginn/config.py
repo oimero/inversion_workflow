@@ -61,7 +61,7 @@ class GINNConfig:
     pin_memory: bool = True
 
     # ── 掩码 ──────────────────────────────────────────────────
-    mask_erosion_samples: int = 30  # 掩码边界收缩采样点数（实际间距最小 69ms，安全上限 ~34）
+    # mask_erosion_samples: int = 30  # 掩码边界收缩采样点数（实际间距最小 69ms，安全上限 ~34）
 
     # ── 输出 ──────────────────────────────────────────────────
     checkpoint_dir: Path = Path("checkpoints")

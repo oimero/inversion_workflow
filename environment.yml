@@ -36,6 +36,7 @@ dependencies:
     - cigsegy==1.2.0
     - pylops==2.6.0
     - gempy==2025.2.0
+    - gstools==1.7.0
 
     # 5. 其他杂项包
     - multimethod

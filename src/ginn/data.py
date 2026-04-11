@@ -321,8 +321,7 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
     target_layer = TargetLayer(
         interpolated_horizon_dfs={"top": top_df_interp, "bottom": bot_df_interp},
         geometry=geometry,
-        top_name="top",
-        bottom_name="bottom",
+        horizon_names=["top", "bottom"],
     )
     mask = target_layer.to_mask()
 

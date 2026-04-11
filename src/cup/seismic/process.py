@@ -237,37 +237,42 @@ def _normalize_interpretation_unit_for_geometry(
 
 
 class TargetLayer:
-    """目的层对象：持有已插值层位并做顶底约束校验。"""
+    """目的层对象：持有有序层位并提供逐层段边界操作。"""
 
     def __init__(
         self,
         interpolated_horizon_dfs: Dict[str, pd.DataFrame],
         geometry: Dict[str, Any],
-        top_name: str,
-        bottom_name: str,
+        horizon_names: list[str],
     ) -> None:
-        """初始化目的层并校验已插值顶底层位关系。"""
+        """初始化目的层并校验相邻层位顺序。"""
         if len(interpolated_horizon_dfs) < 2:
             raise ValueError("interpolated_horizon_dfs must contain at least two horizons.")
-        if top_name not in interpolated_horizon_dfs:
-            raise ValueError(f"top_name '{top_name}' is not in interpolated_horizon_dfs.")
-        if bottom_name not in interpolated_horizon_dfs:
-            raise ValueError(f"bottom_name '{bottom_name}' is not in interpolated_horizon_dfs.")
+        if len(horizon_names) < 2:
+            raise ValueError("horizon_names must contain at least two ordered horizons.")
+        if len(set(horizon_names)) != len(horizon_names):
+            raise ValueError("horizon_names must be unique.")
+        missing_horizon_names = [name for name in horizon_names if name not in interpolated_horizon_dfs]
+        if missing_horizon_names:
+            raise ValueError(f"horizon_names not found in interpolated_horizon_dfs: {missing_horizon_names}")
 
         _validate_geometry_keys(geometry)
 
         self.geometry = dict(geometry)
         self.interpolated_horizon_dfs = {name: df.copy() for name, df in interpolated_horizon_dfs.items()}
-        self.top_name = top_name
-        self.bottom_name = bottom_name
+        self.horizon_names = list(horizon_names)
 
-        self._assert_top_strictly_smaller_than_bottom()
+        self._assert_horizon_sequence_is_strictly_increasing()
 
-    def _assert_top_strictly_smaller_than_bottom(self) -> None:
-        """在共址样点上断言顶层位解释值严格小于底层位解释值。"""
+    def iter_zones(self) -> list[tuple[str, str]]:
+        """返回按层位顺序构成的相邻层段列表。"""
+        return list(zip(self.horizon_names[:-1], self.horizon_names[1:]))
+
+    def _assert_horizon_pair_is_strictly_increasing(self, top_name: str, bottom_name: str) -> None:
+        """在共址样点上断言相邻层位解释值严格递增。"""
         required_cols = ["inline", "xline", "interpretation"]
-        top_df = self.interpolated_horizon_dfs[self.top_name][required_cols].copy()
-        bot_df = self.interpolated_horizon_dfs[self.bottom_name][required_cols].copy()
+        top_df = self.interpolated_horizon_dfs[top_name][required_cols].copy()
+        bot_df = self.interpolated_horizon_dfs[bottom_name][required_cols].copy()
 
         top_df = top_df[np.isfinite(top_df["interpretation"])].rename(columns={"interpretation": "interpretation_top"})
         bot_df = bot_df[np.isfinite(bot_df["interpretation"])].rename(
@@ -277,15 +282,45 @@ class TargetLayer:
         aligned = pd.merge(top_df, bot_df, on=["inline", "xline"], how="inner")
         if aligned.empty:
             raise AssertionError(
-                "No overlapping (inline, xline) samples were found between top and bottom horizons; "
-                "cannot assert top < bottom."
+                "No overlapping (inline, xline) samples were found between adjacent horizons; "
+                f"cannot assert order for '{top_name}' < '{bottom_name}'."
             )
 
         violated = aligned[aligned["interpretation_top"] >= aligned["interpretation_bottom"]]
         assert violated.empty, (
-            f"Top horizon must be strictly smaller than bottom horizon on overlapping samples. "
+            f"Horizon '{top_name}' must be strictly smaller than '{bottom_name}' on overlapping samples. "
             f"Found {len(violated)} violation(s)."
         )
+
+    def _assert_horizon_sequence_is_strictly_increasing(self) -> None:
+        """校验所有相邻层位在共址样点上的顺序。"""
+        for top_name, bottom_name in self.iter_zones():
+            self._assert_horizon_pair_is_strictly_increasing(top_name, bottom_name)
+
+    def _build_axes(self) -> tuple[np.ndarray, np.ndarray]:
+        il_axis = _build_line_axis(
+            int(self.geometry["inline_min"]),
+            int(self.geometry["inline_max"]),
+            int(self.geometry["inline_step"]),
+        )
+        xl_axis = _build_line_axis(
+            int(self.geometry["xline_min"]),
+            int(self.geometry["xline_max"]),
+            int(self.geometry["xline_step"]),
+        )
+        return il_axis, xl_axis
+
+    def _resolve_zone(self, zone: Optional[tuple[str, str]]) -> tuple[str, str]:
+        if zone is None:
+            raise ValueError("zone must be provided for zone-specific operations.")
+        top_name, bottom_name = zone
+        if top_name not in self.horizon_names or bottom_name not in self.horizon_names:
+            raise ValueError(f"zone contains unknown horizons: {zone}")
+        top_idx = self.horizon_names.index(top_name)
+        bottom_idx = self.horizon_names.index(bottom_name)
+        if bottom_idx != top_idx + 1:
+            raise ValueError(f"zone must contain adjacent horizons, got {zone}")
+        return top_name, bottom_name
 
     def convert_horizon_to_relative_sample_index(
         self,
@@ -337,25 +372,24 @@ class TargetLayer:
         out_df["sample_index"] = sample_index
         return out_df
 
+    def get_horizon_sample_index_grid(self, horizon_name: str) -> np.ndarray:
+        """将层位转换为规则网格上的相对采样索引。"""
+        il_axis, xl_axis = self._build_axes()
+        sample_idx_df = self.convert_horizon_to_relative_sample_index(horizon_name)
+        grid_df = sample_idx_df[["inline", "xline", "sample_index"]].rename(columns={"sample_index": "interpretation"})
+        return _to_surface_grid(grid_df, il_axis, xl_axis)
+
+    def get_zone_sample_index_grids(self, zone: tuple[str, str]) -> tuple[np.ndarray, np.ndarray]:
+        """返回某个相邻层段的顶底采样索引网格。"""
+        top_name, bottom_name = self._resolve_zone(zone)
+        return self.get_horizon_sample_index_grid(top_name), self.get_horizon_sample_index_grid(bottom_name)
+
     def to_mask(
         self,
-        top_name: Optional[str] = None,
-        bottom_name: Optional[str] = None,
+        zone: Optional[tuple[str, str]] = None,
     ) -> np.ndarray:
-        """根据顶/底层位生成三维布尔掩码。"""
-        top_name = self.top_name if top_name is None else top_name
-        bottom_name = self.bottom_name if bottom_name is None else bottom_name
-
-        il_axis = _build_line_axis(
-            int(self.geometry["inline_min"]),
-            int(self.geometry["inline_max"]),
-            int(self.geometry["inline_step"]),
-        )
-        xl_axis = _build_line_axis(
-            int(self.geometry["xline_min"]),
-            int(self.geometry["xline_max"]),
-            int(self.geometry["xline_step"]),
-        )
+        """根据相邻层段生成三维布尔掩码；zone=None 时返回所有层段并集。"""
+        il_axis, xl_axis = self._build_axes()
 
         n_il = int(self.geometry.get("n_il", il_axis.size))
         n_xl = int(self.geometry.get("n_xl", xl_axis.size))
@@ -366,6 +400,8 @@ class TargetLayer:
 
         if "n_sample" in self.geometry:
             n_sample = int(self.geometry["n_sample"])
+        elif "n_t" in self.geometry:
+            n_sample = int(self.geometry["n_t"])
         else:
             required_keys = {"sample_min", "sample_max", "sample_step"}
             missing = required_keys - set(self.geometry)
@@ -376,25 +412,20 @@ class TargetLayer:
             sample_step = float(self.geometry["sample_step"])
             n_sample = int(round((sample_max - sample_min) / sample_step)) + 1
 
-        top_idx_df = self.convert_horizon_to_relative_sample_index(top_name)
-        bot_idx_df = self.convert_horizon_to_relative_sample_index(bottom_name)
-
-        top_grid_df = top_idx_df[["inline", "xline", "sample_index"]].rename(columns={"sample_index": "interpretation"})
-        bot_grid_df = bot_idx_df[["inline", "xline", "sample_index"]].rename(columns={"sample_index": "interpretation"})
-
-        top_grid = _to_surface_grid(top_grid_df, il_axis, xl_axis)
-        bot_grid = _to_surface_grid(bot_grid_df, il_axis, xl_axis)
-
         mask = np.zeros((n_il, n_xl, n_sample), dtype=bool)
-        for i in range(n_il):
-            for j in range(n_xl):
-                t_top = top_grid[i, j]
-                t_bot = bot_grid[i, j]
-                if np.isfinite(t_top) and np.isfinite(t_bot):
-                    idx_top = max(0, int(np.round(t_top)))
-                    idx_bot = min(n_sample, int(np.round(t_bot)) + 1)
-                    if idx_top < idx_bot:
-                        mask[i, j, idx_top:idx_bot] = True
+
+        zones = [self._resolve_zone(zone)] if zone is not None else self.iter_zones()
+        for zone_top, zone_bottom in zones:
+            top_grid, bot_grid = self.get_zone_sample_index_grids((zone_top, zone_bottom))
+            for i in range(n_il):
+                for j in range(n_xl):
+                    t_top = top_grid[i, j]
+                    t_bot = bot_grid[i, j]
+                    if np.isfinite(t_top) and np.isfinite(t_bot):
+                        idx_top = max(0, int(np.round(t_top)))
+                        idx_bot = min(n_sample, int(np.round(t_bot)) + 1)
+                        if idx_top < idx_bot:
+                            mask[i, j, idx_top:idx_bot] = True
 
         return mask
 

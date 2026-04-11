@@ -51,10 +51,10 @@ def compute_spectrum(signal: np.ndarray, dt: float,
     if to_degree:
         phase = np.rad2deg(phase)
 
-    return freq, ampl, power, phase
+    return freq, ampl, power, phase # type: ignore
 
 
-def zero_phasing(signal: np.ndarray, dt: float=None) -> np.ndarray:
+def zero_phasing(signal: np.ndarray, dt: float=None) -> np.ndarray: # type: ignore
     """
     Parameters
     ----------
@@ -112,11 +112,11 @@ def butter_bandpass(lowcut: float, highcut: float, fs: float, order: int):
     n_high = highcut / nyq
 
     if n_low > 0 and n_high > 0:
-        b, a = butter(order, [n_low, n_high], btype='band')
+        b, a = butter(order, [n_low, n_high], btype='band') # type: ignore
     elif n_low == 0 and n_high > 0:
-        b, a = butter(order, n_high, btype='low', analog=False)
+        b, a = butter(order, n_high, btype='low', analog=False) # type: ignore
     elif n_low > 0 and n_high == 0:
-        b, a = butter(order, n_low, btype='high', analog=False)
+        b, a = butter(order, n_low, btype='high', analog=False) # type: ignore
     else:
         raise ValueError('Frequencies must be positive and at least one non-null')
 
@@ -138,7 +138,7 @@ def apply_butter_bandpass_filter(data: np.ndarray,
     else:
         b, a = butter_bandpass(lowcut, highcut, fs, order=order)
         y = lfilter(b, a, data)
-    return y
+    return y # type: ignore
 
 
 def apply_butter_lowpass_filter(data: np.ndarray,
@@ -155,7 +155,7 @@ def apply_butter_lowpass_filter(data: np.ndarray,
     else:
         b, a = butter_bandpass(0, highcut, fs, order=order)
         y = lfilter(b, a, data)
-    return y
+    return y # type: ignore
 
 
 
@@ -169,11 +169,11 @@ def apply_notch_filter(data: np.ndarray, dt: float, freq: float, band: float,
     high = freq + band/2.0
     low  = low/nyq
     high = high/nyq
-    b, a = iirfilter(order//2, [low, high],btype='bandstop', analog=False)
+    b, a = iirfilter(order//2, [low, high],btype='bandstop', analog=False) # type: ignore
 
     y_tmp = lfilter(b,a, data[::-1])
     y = lfilter(b,a,y_tmp[::-1])
-    return y
+    return y # type: ignore
 
 
 def phase_rotation_test(wavelet: np.ndarray, delta_theta: int = 1):

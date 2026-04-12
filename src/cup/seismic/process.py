@@ -1,4 +1,45 @@
-"""地震解释数据的预处理与插值工具。"""
+"""cup.seismic.process: 地震解释层位预处理、插值与目的层对象。
+
+本模块提供离散层位解释点到规则 inline/xline 网格的预处理与插值能力，
+并封装 `TargetLayer` 对象，用于按层序组织多个层位、查询浮点位置解释值、
+转换到相对采样索引以及生成层段三维布尔掩码。
+
+边界说明
+--------
+- 本模块不负责解释点文件读取、地震体几何查询或低频模型反演流程。
+- 本模块假定输入层位已经位于同一 inline/xline 坐标系，且 geometry 由上游提供。
+- 当 ``sample_domain='time'`` 且 ``sample_unit='s'`` 时，会按经验规则自动识别
+  毫秒输入并换算为秒。
+
+核心公开对象
+------------
+1. interpolate_interpretation_surface: 清洗并插值单个层位面。
+2. TargetLayer: 管理有序层位并提供层段相关操作。
+3. TargetLayer.get_interpretation_values_at_location: 查询浮点位置上的层位值。
+4. TargetLayer.to_mask: 将相邻层位转换为三维布尔掩码。
+
+Examples
+--------
+>>> import pandas as pd
+>>> from cup.seismic.process import TargetLayer, interpolate_interpretation_surface
+>>> geometry = {
+...     "inline_min": 0, "inline_max": 1, "inline_step": 1,
+...     "xline_min": 0, "xline_max": 1, "xline_step": 1,
+...     "sample_min": 0.0, "sample_max": 3.0, "sample_step": 1.0,
+...     "sample_domain": "time", "sample_unit": "s",
+... }
+>>> h1 = pd.DataFrame(
+...     {"inline": [0, 0, 1, 1], "xline": [0, 1, 0, 1], "interpretation": [1.0, 1.1, 1.2, 1.3]}
+... )
+>>> h2 = pd.DataFrame(
+...     {"inline": [0, 0, 1, 1], "xline": [0, 1, 0, 1], "interpretation": [2.0, 2.1, 2.2, 2.3]}
+... )
+>>> h1_interp = interpolate_interpretation_surface(h1, geometry, outlier_threshold=0.05)
+>>> h2_interp = interpolate_interpretation_surface(h2, geometry, outlier_threshold=0.05)
+>>> target = TargetLayer({"h1": h1_interp, "h2": h2_interp}, geometry, ["h1", "h2"])
+>>> sorted(target.get_interpretation_values_at_location(0.5, 0.5))
+['h1', 'h2']
+"""
 
 import warnings
 from pathlib import Path
@@ -236,8 +277,110 @@ def _normalize_interpretation_unit_for_geometry(
     return out_df
 
 
+def _resolve_axis_interpolation_window(
+    axis: np.ndarray,
+    coord_float: float,
+    axis_name: str,
+) -> tuple[int, int, float]:
+    """将浮点坐标映射到规则轴上的双线性插值窗口。"""
+    if axis.ndim != 1 or axis.size < 1:
+        raise ValueError(f"{axis_name} axis must be a non-empty 1D array.")
+
+    coord = float(coord_float)
+    axis_min = float(axis[0])
+    axis_max = float(axis[-1])
+
+    if axis.size == 1:
+        if not np.isclose(coord, axis_min, atol=1e-8):
+            raise ValueError(f"{axis_name}_float={coord} is out of bounds [{axis_min}, {axis_max}].")
+        return 0, 0, 0.0
+
+    axis_step = float(axis[1] - axis[0])
+    tol = max(abs(axis_step), 1.0) * 1e-8
+    if coord < axis_min - tol or coord > axis_max + tol:
+        raise ValueError(f"{axis_name}_float={coord} is out of bounds [{axis_min}, {axis_max}].")
+
+    k = (coord - axis_min) / axis_step
+    k_rounded = round(k)
+    if np.isclose(k, k_rounded, atol=1e-8):
+        k = float(k_rounded)
+
+    k0 = int(np.floor(k))
+    k1 = int(np.ceil(k))
+    max_idx = axis.size - 1
+    if k0 < 0:
+        k0 = 0
+    if k1 > max_idx:
+        k1 = max_idx
+    if k0 > max_idx or k1 < 0:
+        raise ValueError(f"{axis_name}_float={coord} is out of bounds [{axis_min}, {axis_max}].")
+
+    weight = 0.0 if k1 == k0 else float(k - k0)
+    return k0, k1, weight
+
+
+def _bilinear_interpolate_surface_at_location(
+    surface: np.ndarray,
+    il_axis: np.ndarray,
+    xl_axis: np.ndarray,
+    il_float: float,
+    xl_float: float,
+) -> float:
+    """在规则 inline/xline 网格上对单个层位面执行双线性插值。"""
+    if surface.shape != (il_axis.size, xl_axis.size):
+        raise ValueError(
+            "surface shape does not match axis sizes: "
+            f"surface.shape={surface.shape}, il_axis.size={il_axis.size}, xl_axis.size={xl_axis.size}."
+        )
+
+    il0_idx, il1_idx, wi = _resolve_axis_interpolation_window(il_axis, il_float, "inline")
+    xl0_idx, xl1_idx, wj = _resolve_axis_interpolation_window(xl_axis, xl_float, "xline")
+
+    node_indices = {
+        (il0_idx, xl0_idx),
+        (il0_idx, xl1_idx),
+        (il1_idx, xl0_idx),
+        (il1_idx, xl1_idx),
+    }
+    for il_idx, xl_idx in node_indices:
+        value = float(surface[il_idx, xl_idx])
+        if not np.isfinite(value):
+            raise ValueError(
+                f"missing interpretation node: inline={int(il_axis[il_idx])}, xline={int(xl_axis[xl_idx])}"
+            )
+
+    t00 = float(surface[il0_idx, xl0_idx])
+    t01 = float(surface[il0_idx, xl1_idx])
+    t10 = float(surface[il1_idx, xl0_idx])
+    t11 = float(surface[il1_idx, xl1_idx])
+
+    return float((1.0 - wi) * (1.0 - wj) * t00 + (1.0 - wi) * wj * t01 + wi * (1.0 - wj) * t10 + wi * wj * t11)
+
+
 class TargetLayer:
-    """目的层对象：持有有序层位并提供逐层段边界操作。"""
+    """按层序组织多个层位并提供层段边界操作。
+
+    Parameters
+    ----------
+    interpolated_horizon_dfs : Dict[str, pd.DataFrame]
+        层位名到层位 DataFrame 的映射。每个 DataFrame 至少包含
+        ``inline``、``xline`` 和 ``interpretation`` 三列，通常为规则网格上的
+        插值结果，也允许包含 NaN。
+    geometry : Dict[str, Any]
+        地震几何信息。
+    horizon_names : list[str]
+        从顶到底排序后的层位名列表。列表中的名称必须唯一，且都存在于
+        ``interpolated_horizon_dfs`` 中。
+
+    Notes
+    -----
+    构造时会：
+
+    - 根据 geometry 构建规则 inline/xline 轴；
+    - 在秒域场景下按经验规则归一化层位单位；
+    - 校验相邻层位在共址样点上的解释值顺序；
+    - 为后续插值查询预构建 2D 层位网格。
+    """
 
     def __init__(
         self,
@@ -245,7 +388,7 @@ class TargetLayer:
         geometry: Dict[str, Any],
         horizon_names: list[str],
     ) -> None:
-        """初始化目的层并校验相邻层位顺序。"""
+        """初始化目的层对象。"""
         if len(interpolated_horizon_dfs) < 2:
             raise ValueError("interpolated_horizon_dfs must contain at least two horizons.")
         if len(horizon_names) < 2:
@@ -261,11 +404,31 @@ class TargetLayer:
         self.geometry = dict(geometry)
         self.interpolated_horizon_dfs = {name: df.copy() for name, df in interpolated_horizon_dfs.items()}
         self.horizon_names = list(horizon_names)
+        self._il_axis, self._xl_axis = self._build_axes()
+        self._normalized_horizon_dfs = {
+            name: _normalize_interpretation_unit_for_geometry(df, self.geometry)
+            for name, df in self.interpolated_horizon_dfs.items()
+        }
+        self._horizon_grids = {
+            name: _to_surface_grid(df, self._il_axis, self._xl_axis)
+            for name, df in self._normalized_horizon_dfs.items()
+        }
 
         self._assert_horizon_sequence_is_strictly_increasing()
 
     def iter_zones(self) -> list[tuple[str, str]]:
-        """返回按层位顺序构成的相邻层段列表。"""
+        """返回按层位顺序构成的相邻层段列表。
+
+        Returns
+        -------
+        list[tuple[str, str]]
+            相邻层位对列表，每个元素为 ``(top_name, bottom_name)``。
+
+        Examples
+        --------
+        >>> target_layer.iter_zones()
+        [('h1', 'h2'), ('h2', 'h3')]
+        """
         return list(zip(self.horizon_names[:-1], self.horizon_names[1:]))
 
     def _assert_horizon_pair_is_strictly_increasing(self, top_name: str, bottom_name: str) -> None:
@@ -310,6 +473,73 @@ class TargetLayer:
         )
         return il_axis, xl_axis
 
+    def get_horizon_interpretation_at_location(
+        self,
+        horizon_name: str,
+        il_float: float,
+        xl_float: float,
+    ) -> float:
+        """返回单个层位在浮点位置上的双线性插值解释值。
+
+        Parameters
+        ----------
+        horizon_name : str
+            目标层位名称。
+        il_float : float
+            查询点的 inline 坐标，可位于规则轴的相邻节点之间。
+        xl_float : float
+            查询点的 xline 坐标，可位于规则轴的相邻节点之间。
+
+        Returns
+        -------
+        float
+            指定层位在该位置上的插值解释值。
+
+        Raises
+        ------
+        ValueError
+            当层位名称不存在、查询坐标越界，或双线性插值所需网格节点存在 NaN 时抛出。
+        """
+        if horizon_name not in self._horizon_grids:
+            raise ValueError(f"horizon_name '{horizon_name}' is not in interpolated_horizon_dfs.")
+
+        return _bilinear_interpolate_surface_at_location(
+            surface=self._horizon_grids[horizon_name],
+            il_axis=self._il_axis,
+            xl_axis=self._xl_axis,
+            il_float=il_float,
+            xl_float=xl_float,
+        )
+
+    def get_interpretation_values_at_location(
+        self,
+        il_float: float,
+        xl_float: float,
+    ) -> Dict[str, float]:
+        """返回所有层位在浮点位置上的双线性插值解释值。
+
+        Parameters
+        ----------
+        il_float : float
+            查询点的 inline 坐标。
+        xl_float : float
+            查询点的 xline 坐标。
+
+        Returns
+        -------
+        Dict[str, float]
+            层位名到插值解释值的映射，顺序与 ``horizon_names`` 一致。
+
+        Raises
+        ------
+        ValueError
+            当任一层位在该位置无法完成插值时抛出。
+        """
+        return {
+            horizon_name: self.get_horizon_interpretation_at_location(horizon_name, il_float, xl_float)
+            for horizon_name in self.horizon_names
+        }
+
     def _resolve_zone(self, zone: Optional[tuple[str, str]]) -> tuple[str, str]:
         if zone is None:
             raise ValueError("zone must be provided for zone-specific operations.")
@@ -326,7 +556,26 @@ class TargetLayer:
         self,
         horizon_name: str,
     ) -> pd.DataFrame:
-        """将绝对层位值转换为相对采样索引，并强制校验采样范围。"""
+        """将单个层位的绝对解释值转换为相对采样索引。
+
+        Parameters
+        ----------
+        horizon_name : str
+            需要转换的层位名称。
+
+        Returns
+        -------
+        pd.DataFrame
+            包含 ``inline``、``xline``、``interpretation`` 和 ``sample_index`` 四列
+            的新 DataFrame。其中 ``sample_index`` 以
+            ``(interpretation - sample_min) / sample_step`` 计算。
+
+        Raises
+        ------
+        ValueError
+            当 geometry 缺少采样轴信息、``sample_step`` 非正、层位缺列，
+            或层位值超出采样范围时抛出。
+        """
         if horizon_name not in self.interpolated_horizon_dfs:
             raise ValueError(f"horizon_name '{horizon_name}' is not in interpolated_horizon_dfs.")
 
@@ -349,7 +598,7 @@ class TargetLayer:
                 f"interpolated_horizon_dfs['{horizon_name}'] is missing required columns: {sorted(missing_cols)}"
             )
 
-        normalized_horizon_df = _normalize_interpretation_unit_for_geometry(horizon_df, self.geometry)
+        normalized_horizon_df = self._normalized_horizon_dfs[horizon_name].copy()
 
         interpretation = normalized_horizon_df["interpretation"].to_numpy(dtype=float, copy=False)
         sample_index = np.full(interpretation.shape, np.nan, dtype=float)
@@ -372,24 +621,47 @@ class TargetLayer:
         out_df["sample_index"] = sample_index
         return out_df
 
-    def get_horizon_sample_index_grid(self, horizon_name: str) -> np.ndarray:
-        """将层位转换为规则网格上的相对采样索引。"""
-        il_axis, xl_axis = self._build_axes()
+    def _get_horizon_sample_index_grid(self, horizon_name: str) -> np.ndarray:
+        """返回单个层位在规则网格上的相对采样索引面。"""
         sample_idx_df = self.convert_horizon_to_relative_sample_index(horizon_name)
         grid_df = sample_idx_df[["inline", "xline", "sample_index"]].rename(columns={"sample_index": "interpretation"})
-        return _to_surface_grid(grid_df, il_axis, xl_axis)
+        return _to_surface_grid(grid_df, self._il_axis, self._xl_axis)
 
-    def get_zone_sample_index_grids(self, zone: tuple[str, str]) -> tuple[np.ndarray, np.ndarray]:
-        """返回某个相邻层段的顶底采样索引网格。"""
+    def _get_zone_sample_index_grids(self, zone: tuple[str, str]) -> tuple[np.ndarray, np.ndarray]:
+        """返回相邻层段顶底界面的采样索引网格。"""
         top_name, bottom_name = self._resolve_zone(zone)
-        return self.get_horizon_sample_index_grid(top_name), self.get_horizon_sample_index_grid(bottom_name)
+        return self._get_horizon_sample_index_grid(top_name), self._get_horizon_sample_index_grid(bottom_name)
 
     def to_mask(
         self,
         zone: Optional[tuple[str, str]] = None,
     ) -> np.ndarray:
-        """根据相邻层段生成三维布尔掩码；zone=None 时返回所有层段并集。"""
-        il_axis, xl_axis = self._build_axes()
+        """根据相邻层段生成三维布尔掩码。
+
+        Parameters
+        ----------
+        zone : Optional[tuple[str, str]], default=None
+            指定单个目标层段 ``(top_name, bottom_name)``。为 ``None`` 时，
+            返回所有相邻层段的并集掩码。
+
+        Returns
+        -------
+        np.ndarray
+            形状为 ``(n_inline, n_xline, n_sample)`` 的布尔数组。True 表示对应体素
+            落在目标层段内。
+
+        Raises
+        ------
+        ValueError
+            当 geometry 中的 inline/xline 维度与规则轴不一致，或缺少生成掩码所需的
+            采样轴信息时抛出。
+
+        Notes
+        -----
+        当前实现使用四舍五入后的顶底采样索引，并将底界面按切片右端点纳入掩码范围。
+        因此相邻层段在共享 horizon 处可能出现单个 sample 的重叠归属。
+        """
+        il_axis, xl_axis = self._il_axis, self._xl_axis
 
         n_il = int(self.geometry.get("n_il", il_axis.size))
         n_xl = int(self.geometry.get("n_xl", xl_axis.size))
@@ -400,8 +672,6 @@ class TargetLayer:
 
         if "n_sample" in self.geometry:
             n_sample = int(self.geometry["n_sample"])
-        elif "n_t" in self.geometry:
-            n_sample = int(self.geometry["n_t"])
         else:
             required_keys = {"sample_min", "sample_max", "sample_step"}
             missing = required_keys - set(self.geometry)
@@ -416,7 +686,7 @@ class TargetLayer:
 
         zones = [self._resolve_zone(zone)] if zone is not None else self.iter_zones()
         for zone_top, zone_bottom in zones:
-            top_grid, bot_grid = self.get_zone_sample_index_grids((zone_top, zone_bottom))
+            top_grid, bot_grid = self._get_zone_sample_index_grids((zone_top, zone_bottom))
             for i in range(n_il):
                 for j in range(n_xl):
                     t_top = top_grid[i, j]
@@ -437,34 +707,59 @@ def interpolate_interpretation_surface(
     min_neighbor_count: int = 2,
     keep_nan: bool = True,
 ) -> pd.DataFrame:
-    """层位面插值：先去孤立异常点，再执行全域插值。
+    """对单个层位面执行去异常与规则网格插值。
 
     Parameters
     ----------
     interpretation_df : pd.DataFrame
-            输入离散解释点，至少包含 `inline`, `xline`, `interpretation` 三列。
+        输入离散解释点，至少包含 ``inline``、``xline``、``interpretation`` 三列。
     geometry : Dict[str, Any]
-            地震几何信息，至少包含 `inline_min`, `inline_max`, `inline_step`,
-            `xline_min`, `xline_max`, `xline_step`。
+        地震几何信息，至少包含 ``inline_min``、``inline_max``、``inline_step``、
+        ``xline_min``、``xline_max``、``xline_step``。
     outlier_threshold : float
-            孤立点判定阈值。若样点与邻域中值差值绝对值超过该阈值，则剔除为 NaN。
-            单位与 `interpretation` 一致（例如 s 或 m）。
+        孤立点判定阈值。若样点与邻域中值差值绝对值超过该阈值，则剔除为 NaN。
+        单位与 ``interpretation`` 一致，例如 s 或 m。
     min_neighbor_count : int, default=2
-            执行孤立点判断所需的最小有效邻居数（十字邻域，不含中心点）。
+        执行孤立点判断所需的最小有效邻居数（十字邻域，不含中心点）。
     keep_nan : bool, default=True
-            为 True 时返回完整网格；
-            为 False 时仅返回有效解释点。
+        为 ``True`` 时返回完整规则网格；
+        为 ``False`` 时仅返回有效解释点。
 
     Notes
     -----
     当 geometry 指定为 ``sample_domain='time'`` 且 ``sample_unit='s'`` 时，
     若 interpretation 数值量级明显超过秒域常见范围（>10），会自动按 ms 输入除以 1000 转为 s。
 
+    插值流程为：
+
+    1. 将离散解释点映射到规则 inline/xline 网格；
+    2. 基于十字邻域中值剔除孤立异常点；
+    3. 先使用 linear 插值填补凸包内空洞，再使用 nearest 兜底。
+
     Returns
     -------
     pd.DataFrame
-            列为 `inline`, `xline`, `interpretation`。
-            剔除统计写入 ``df.attrs["outlier_removal"]``。
+        列为 ``inline``、``xline``、``interpretation`` 的 DataFrame。
+        剔除统计写入 ``df.attrs["outlier_removal"]``。
+
+    Raises
+    ------
+    ValueError
+        当 geometry 缺少规则轴信息，或输入 DataFrame 缺少必需列时抛出。
+
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> df = pd.DataFrame(
+    ...     {"inline": [0, 0, 1, 1], "xline": [0, 1, 0, 1], "interpretation": [1.0, 1.2, 1.1, 1.3]}
+    ... )
+    >>> geometry = {
+    ...     "inline_min": 0, "inline_max": 1, "inline_step": 1,
+    ...     "xline_min": 0, "xline_max": 1, "xline_step": 1,
+    ... }
+    >>> out = interpolate_interpretation_surface(df, geometry, outlier_threshold=0.05)
+    >>> sorted(out.columns)
+    ['inline', 'interpretation', 'xline']
     """
     _validate_geometry_keys(geometry)
 

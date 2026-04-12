@@ -425,6 +425,81 @@ def _split_petrel_data_line(line: str) -> List[str]:
     return [t[1:-1] if len(t) >= 2 and t[0] == '"' and t[-1] == '"' else t for t in tokens]
 
 
+def import_checkshots_petrel(checkshots_file: Path) -> pd.DataFrame:
+    """
+    导入 Petrel checkshots/时深表文本，并统一为项目内部单位约定。
+
+    Parameters
+    ----------
+    checkshots_file : Path
+        Petrel 导出的 checkshots 文本路径。
+
+    Returns
+    -------
+    pd.DataFrame
+        至少包含以下列：
+        ['X', 'Y', 'Z', 'MD', 'TWT', 'Well name']
+
+        若源文件包含 ``Average velocity`` 或 ``Interval velocity``，
+        则会一并保留。
+
+    Notes
+    -----
+    - ``Z`` 在 Petrel 文件中通常为负值，导入后统一转为正值 TVDSS。
+    - ``TWT`` 在 Petrel 文件中单位为 ms，导入后统一转为 s。
+    """
+    required_columns = ["X", "Y", "Z", "MD", "TWT", "Well name"]
+    optional_columns = ["Average velocity", "Interval velocity"]
+
+    lines = _read_text_lines_with_fallback(checkshots_file)
+
+    begin_idx = None
+    end_idx = None
+    for i, line in enumerate(lines):
+        token = line.strip()
+        if token == "BEGIN HEADER":
+            begin_idx = i
+        elif token == "END HEADER":
+            end_idx = i
+            break
+
+    if begin_idx is None or end_idx is None or end_idx <= begin_idx:
+        raise ValueError(f"Invalid Petrel checkshots header block: {checkshots_file}")
+
+    header_columns = [line.strip() for line in lines[begin_idx + 1 : end_idx] if line.strip()]
+    col_to_index = {name: idx for idx, name in enumerate(header_columns)}
+
+    missing = [c for c in required_columns if c not in col_to_index]
+    if missing:
+        raise ValueError(f"Required columns missing in Petrel header: {missing}")
+
+    selected_columns = required_columns + [c for c in optional_columns if c in col_to_index]
+
+    records = []
+    for raw_line in lines[end_idx + 1 :]:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        tokens = _split_petrel_data_line(line)
+        if len(tokens) < len(header_columns):
+            continue
+
+        record = {col: tokens[col_to_index[col]] for col in selected_columns}
+        records.append(record)
+
+    df = pd.DataFrame.from_records(records, columns=selected_columns)
+
+    numeric_cols = [col for col in ["X", "Y", "Z", "MD", "TWT", *optional_columns] if col in df.columns]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["Z"] = np.abs(df["Z"])
+    df["TWT"] = df["TWT"] / 1000.0
+
+    return df
+
+
 def import_well_heads_petrel(well_heads_file: Path) -> pd.DataFrame:
     """
     导入 Petrel 井头文件，并仅保留所需列。
@@ -567,6 +642,9 @@ def import_well_tops_petrel(well_tops_file: Path) -> pd.DataFrame:
     numeric_cols = ["X", "Y", "Z", "MD", "PVD auto"]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["Z"] = np.abs(df["Z"])
+    df["PVD auto"] = np.abs(df["PVD auto"])
 
     return df
 

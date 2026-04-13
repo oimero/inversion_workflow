@@ -309,3 +309,160 @@ def export_vertical_tdt_to_petrel_checkshots(
 
     output_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output_file
+
+
+def format_artifact_tag(value: Union[str, float, int]) -> str:
+    """将文件名中的标签值转为稳定字符串。"""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("标签字符串不能为空。")
+        return text
+    return str(value)
+
+
+def _write_two_column_csv(
+    output_file: Path,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    x_name: str,
+    y_name: str,
+    fmt: str = "%.9g",
+) -> Path:
+    """写出两列数值 CSV。"""
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    x_arr = np.asarray(x_values, dtype=float).reshape(-1)
+    y_arr = np.asarray(y_values, dtype=float).reshape(-1)
+    if x_arr.size != y_arr.size:
+        raise ValueError(f"CSV 列长度不一致: {x_name}={x_arr.size}, {y_name}={y_arr.size}")
+
+    stacked = np.column_stack([x_arr, y_arr])
+    np.savetxt(
+        output_file,
+        stacked,
+        delimiter=",",
+        header=f"{x_name},{y_name}",
+        comments="",
+        fmt=fmt,
+    )
+    return output_file
+
+
+def export_twt_log_to_csv(
+    output_file: Path,
+    log: grid.Log,
+    value_name: str = "value",
+    fmt: str = "%.9g",
+) -> Path:
+    """导出 TWT 域单条曲线到两列 CSV。"""
+    if not log.is_twt:
+        raise ValueError("仅支持导出 TWT 域曲线。")
+    return _write_two_column_csv(
+        output_file=output_file,
+        x_values=np.asarray(log.basis, dtype=float),
+        y_values=np.asarray(log.values, dtype=float),
+        x_name="twt_s",
+        y_name=value_name,
+        fmt=fmt,
+    )
+
+
+def export_wavelet_to_csv(
+    output_file: Path,
+    wavelet: Any,
+    fmt: str = "%.9g",
+) -> Path:
+    """导出单道子波到两列 CSV。"""
+    if hasattr(wavelet, "basis") and hasattr(wavelet, "values"):
+        time_values = np.asarray(getattr(wavelet, "basis"), dtype=float)
+        amplitude_values = np.asarray(getattr(wavelet, "values"), dtype=float)
+    elif hasattr(wavelet, "t") and hasattr(wavelet, "y"):
+        time_values = np.asarray(getattr(wavelet, "t"), dtype=float)
+        amplitude_values = np.asarray(getattr(wavelet, "y"), dtype=float)
+    else:
+        raise TypeError("wavelet 必须提供 'basis/values' 或 't/y' 属性。")
+
+    return _write_two_column_csv(
+        output_file=output_file,
+        x_values=time_values,
+        y_values=amplitude_values,
+        x_name="time_s",
+        y_name="amplitude",
+        fmt=fmt,
+    )
+
+
+def export_vertical_wtie_artifacts(
+    output_dir: Path,
+    outputs: Any,
+    *,
+    well_name: str,
+    interpretation_offset: Union[str, float, int],
+    kb: float,
+    x: float,
+    y: float,
+    csv_fmt: str = "%.9g",
+) -> Dict[str, Path]:
+    """导出直井自动井震标定的关键成果。
+
+    导出内容包括：
+    - 优化后的 TVDSS-TWT 时深表（Petrel checkshots 文本）
+    - 优化后的 TWT 域 AI 曲线（CSV）
+    - 优化后的子波（CSV）
+    """
+    if not hasattr(outputs, "table"):
+        raise AttributeError("outputs 缺少 table 属性。")
+    if not hasattr(outputs, "logset_twt"):
+        raise AttributeError("outputs 缺少 logset_twt 属性。")
+    if not hasattr(outputs, "wavelet"):
+        raise AttributeError("outputs 缺少 wavelet 属性。")
+
+    tag = format_artifact_tag(interpretation_offset)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    tdt_dir = output_dir / "tdtable"
+    ai_dir = output_dir / "ai"
+    wavelet_dir = output_dir / "wavelet"
+    tdt_dir.mkdir(parents=True, exist_ok=True)
+    ai_dir.mkdir(parents=True, exist_ok=True)
+    wavelet_dir.mkdir(parents=True, exist_ok=True)
+
+    tdt_file = tdt_dir / f"{well_name}_{tag}.txt"
+    ai_file = ai_dir / f"{well_name}_{tag}.csv"
+    wavelet_file = wavelet_dir / f"{well_name}_{tag}.csv"
+
+    tdt = getattr(outputs, "table")
+    logset_twt = getattr(outputs, "logset_twt")
+    wavelet = getattr(outputs, "wavelet")
+    if not hasattr(logset_twt, "AI"):
+        raise AttributeError("outputs.logset_twt 缺少 AI 属性。")
+    ai_log = getattr(logset_twt, "AI")
+
+    export_vertical_tdt_to_petrel_checkshots(
+        output_file=tdt_file,
+        tdt=tdt,
+        well_name=well_name,
+        kb=kb,
+        x=x,
+        y=y,
+    )
+    export_twt_log_to_csv(
+        output_file=ai_file,
+        log=ai_log,
+        value_name="ai",
+        fmt=csv_fmt,
+    )
+    export_wavelet_to_csv(
+        output_file=wavelet_file,
+        wavelet=wavelet,
+        fmt=csv_fmt,
+    )
+
+    return {
+        "tdtable_file": tdt_file,
+        "ai_file": ai_file,
+        "wavelet_file": wavelet_file,
+    }

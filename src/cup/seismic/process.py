@@ -627,7 +627,7 @@ class TargetLayer:
         grid_df = sample_idx_df[["inline", "xline", "sample_index"]].rename(columns={"sample_index": "interpretation"})
         return _to_surface_grid(grid_df, self._il_axis, self._xl_axis)
 
-    def _get_zone_sample_index_grids(self, zone: tuple[str, str]) -> tuple[np.ndarray, np.ndarray]:
+    def get_zone_sample_index_grids(self, zone: tuple[str, str]) -> tuple[np.ndarray, np.ndarray]:
         """返回相邻层段顶底界面的采样索引网格。"""
         top_name, bottom_name = self._resolve_zone(zone)
         return self._get_horizon_sample_index_grid(top_name), self._get_horizon_sample_index_grid(bottom_name)
@@ -686,7 +686,7 @@ class TargetLayer:
 
         zones = [self._resolve_zone(zone)] if zone is not None else self.iter_zones()
         for zone_top, zone_bottom in zones:
-            top_grid, bot_grid = self._get_zone_sample_index_grids((zone_top, zone_bottom))
+            top_grid, bot_grid = self.get_zone_sample_index_grids((zone_top, zone_bottom))
             for i in range(n_il):
                 for j in range(n_xl):
                     t_top = top_grid[i, j]

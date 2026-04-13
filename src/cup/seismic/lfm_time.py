@@ -62,6 +62,7 @@ class _PreparedLfmTimeWell:
     original_basis_type: str
     twt_conversion_mode: str
     td_table_extended: bool
+    input_log_filtered: bool
 
 
 def _build_line_axis(line_min: float, line_max: float, line_step: float) -> np.ndarray:
@@ -275,6 +276,8 @@ def _prepare_well(
     target_layer: TargetLayer,
     survey: Optional[SurveyContext],
     dt: float,
+    filter_cutoff_hz: float,
+    filter_order: int,
 ) -> _PreparedLfmTimeWell:
     inline, xline = _resolve_well_position(well, survey)
     horizon_times = target_layer.get_interpretation_values_at_location(inline, xline)
@@ -283,12 +286,19 @@ def _prepare_well(
     if not np.isfinite(required_twt_min) or not np.isfinite(required_twt_max) or required_twt_max <= required_twt_min:
         raise ValueError(f"well '{well.well_name}' has invalid horizon time coverage for target layer.")
 
-    td_table, was_extended = _maybe_extend_time_depth_table(well.time_depth_table, required_twt_min, required_twt_max, dt)
+    td_table, was_extended = _maybe_extend_time_depth_table(
+        well.time_depth_table, required_twt_min, required_twt_max, dt
+    )
     property_log_twt, conversion_mode = _convert_property_log_to_twt(
         well.property_log,
         td_table,
         well.trajectory,
         dt,
+    )
+    property_log_twt = lowpass_twt_log(
+        property_log_twt,
+        cutoff_hz=filter_cutoff_hz,
+        order=filter_order,
     )
     metadata = {} if well.metadata is None else dict(well.metadata)
     return _PreparedLfmTimeWell(
@@ -306,6 +316,7 @@ def _prepare_well(
         original_basis_type=well.property_log.basis_type,
         twt_conversion_mode=conversion_mode,
         td_table_extended=was_extended,
+        input_log_filtered=True,
     )
 
 
@@ -357,7 +368,7 @@ def _apply_post_vertical_filter(
     fs = 1.0 / sample_step
     nyquist = 0.5 * fs
     if cutoff_hz <= 0.0 or cutoff_hz >= nyquist:
-        raise ValueError(f"post_filter_cutoff_hz must be within (0, {nyquist}), got {cutoff_hz}.")
+        raise ValueError(f"filter_cutoff_hz must be within (0, {nyquist}), got {cutoff_hz}.")
 
     n_il, n_xl, _ = filtered_volume.shape
     for i_il in range(n_il):
@@ -395,9 +406,9 @@ def build_lfm_time_model(
     variogram: str = "spherical",
     exact: bool = True,
     nugget: float = 0.0,
+    filter_cutoff_hz: float = 10.0,
+    filter_order: int = 5,
     post_vertical_filter: bool = False,
-    post_filter_cutoff_hz: Optional[float] = None,
-    post_filter_order: int = 5,
 ) -> LfmTimeModelResult:
     """构建时间域层位约束低频模型。"""
     if not wells:
@@ -413,7 +424,17 @@ def build_lfm_time_model(
     if dt <= 0.0:
         raise ValueError(f"target_layer.geometry['sample_step'] must be positive, got {dt}.")
 
-    prepared_wells = [_prepare_well(well, target_layer, survey, dt) for well in wells]
+    prepared_wells = [
+        _prepare_well(
+            well,
+            target_layer,
+            survey,
+            dt,
+            filter_cutoff_hz=float(filter_cutoff_hz),
+            filter_order=int(filter_order),
+        )
+        for well in wells
+    ]
     property_names = {well.property_name for well in prepared_wells}
     if len(property_names) != 1:
         raise ValueError(f"All wells must share the same property_name, got {sorted(property_names)}.")
@@ -448,11 +469,12 @@ def build_lfm_time_model(
             "original_basis_type": well.original_basis_type,
             "twt_conversion_mode": well.twt_conversion_mode,
             "td_table_extended": bool(well.td_table_extended),
+            "input_log_filtered": bool(well.input_log_filtered),
             "horizon_times": dict(well.horizon_times),
         }
 
     for top_name, bottom_name in target_layer.iter_zones():
-        top_grid, bottom_grid = target_layer._get_zone_sample_index_grids((top_name, bottom_name))
+        top_grid, bottom_grid = target_layer.get_zone_sample_index_grids((top_name, bottom_name))
         zone_slice_values = np.full((n_slices, n_il, n_xl), np.nan, dtype=float)
         zone_slice_variance = np.full((n_slices, n_il, n_xl), np.nan, dtype=float)
         slice_control_counts = np.zeros(n_slices, dtype=int)
@@ -565,13 +587,11 @@ def build_lfm_time_model(
                 variance_volume[i_il, i_xl, last_idx + 1 :] = variance_volume[i_il, i_xl, last_idx]
 
     if post_vertical_filter:
-        if post_filter_cutoff_hz is None:
-            raise ValueError("post_filter_cutoff_hz must be provided when post_vertical_filter=True.")
         volume = _apply_post_vertical_filter(
             volume,
             sample_step=float(target_layer.geometry["sample_step"]),
-            cutoff_hz=float(post_filter_cutoff_hz),
-            order=int(post_filter_order),
+            cutoff_hz=float(filter_cutoff_hz),
+            order=int(filter_order),
         )
 
     metadata = {
@@ -582,13 +602,13 @@ def build_lfm_time_model(
         "exact": bool(exact),
         "nugget": float(nugget),
         "n_slices": int(n_slices),
+        "filter_cutoff_hz": float(filter_cutoff_hz),
+        "filter_order": int(filter_order),
         "coord_system": "inline_xline",
         "horizon_names": list(target_layer.horizon_names),
         "zone_names": [list(zone) for zone in target_layer.iter_zones()],
         "well_names": [well.well_name for well in prepared_wells],
         "post_vertical_filter": bool(post_vertical_filter),
-        "post_filter_cutoff_hz": None if post_filter_cutoff_hz is None else float(post_filter_cutoff_hz),
-        "post_filter_order": int(post_filter_order),
         "variance_volume_included": True,
     }
 

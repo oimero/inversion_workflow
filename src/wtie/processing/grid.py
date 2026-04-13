@@ -1008,6 +1008,96 @@ class TimeDepthTable:
             return TimeDepthTable(new_twt, md=new_depth)
         return TimeDepthTable(new_twt, tvdss=new_depth)
 
+    def extend_to_twt_range(
+        self,
+        twt_min: float,
+        twt_max: float,
+        dt: float,
+        fit_points: int = 3,
+    ) -> "TimeDepthTable":
+        """按局部线性趋势将时深表外推到指定 TWT 范围。
+
+        Parameters
+        ----------
+        twt_min, twt_max : float
+            目标覆盖的 TWT 范围，单位 s。
+        dt : float
+            目标时间采样间隔，单位 s。
+        fit_points : int, default=3
+            首尾局部线性拟合使用的样点数，至少为 2。
+
+        Returns
+        -------
+        TimeDepthTable
+            覆盖目标时间范围的新时深表。
+
+        Raises
+        ------
+        ValueError
+            当输入范围无效、``dt`` 非正，或样点数不足以拟合趋势时抛出。
+        """
+        twt_min = float(twt_min)
+        twt_max = float(twt_max)
+        dt = float(dt)
+        fit_points = int(fit_points)
+
+        if dt <= 0.0:
+            raise ValueError(f"dt must be positive, got {dt}.")
+        if twt_max < twt_min:
+            raise ValueError(f"twt_max must be >= twt_min, got twt_min={twt_min}, twt_max={twt_max}.")
+        if fit_points < 2:
+            raise ValueError(f"fit_points must be >= 2, got {fit_points}.")
+        if self.size < fit_points:
+            raise ValueError(
+                f"TimeDepthTable must contain at least {fit_points} samples for trend fitting, got {self.size}."
+            )
+
+        current_twt = self.twt.astype(float, copy=False)
+        current_depth = self.depth.astype(float, copy=False)
+        if current_twt[0] <= twt_min and current_twt[-1] >= twt_max:
+            if self._is_md_domain:
+                return TimeDepthTable(current_twt.copy(), md=current_depth.copy())
+            return TimeDepthTable(current_twt.copy(), tvdss=current_depth.copy())
+
+        head_count = 0
+        if twt_min < current_twt[0]:
+            head_count = int(np.ceil((current_twt[0] - twt_min) / dt))
+        tail_count = 0
+        if twt_max > current_twt[-1]:
+            tail_count = int(np.ceil((twt_max - current_twt[-1]) / dt))
+
+        pieces_twt = []
+        pieces_depth = []
+
+        if head_count > 0:
+            fit_twt = current_twt[:fit_points]
+            fit_depth = current_depth[:fit_points]
+            head_slope, head_intercept = np.polyfit(fit_twt, fit_depth, 1)
+            head_twt = current_twt[0] - np.arange(head_count, 0, -1, dtype=float) * dt
+            head_depth = head_slope * head_twt + head_intercept
+            pieces_twt.append(head_twt)
+            pieces_depth.append(head_depth)
+
+        pieces_twt.append(current_twt)
+        pieces_depth.append(current_depth)
+
+        if tail_count > 0:
+            fit_twt = current_twt[-fit_points:]
+            fit_depth = current_depth[-fit_points:]
+            tail_slope, tail_intercept = np.polyfit(fit_twt, fit_depth, 1)
+            tail_twt = current_twt[-1] + np.arange(1, tail_count + 1, dtype=float) * dt
+            tail_depth = tail_slope * tail_twt + tail_intercept
+            pieces_twt.append(tail_twt)
+            pieces_depth.append(tail_depth)
+
+        new_twt = np.concatenate(pieces_twt)
+        new_depth = np.concatenate(pieces_depth)
+        new_depth = np.maximum.accumulate(new_depth)
+
+        if self._is_md_domain:
+            return TimeDepthTable(new_twt, md=new_depth)
+        return TimeDepthTable(new_twt, tvdss=new_depth)
+
     def depth_interpolation(self, dz: float, mode: str = "linear") -> "TimeDepthTable":
         """按给定深度采样间隔插值时深关系。
 

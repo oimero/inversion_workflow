@@ -1,5 +1,7 @@
 """Petrel数据加载工具。"""
 
+from __future__ import annotations
+
 import re
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -425,7 +427,7 @@ def _split_petrel_data_line(line: str) -> List[str]:
     return [t[1:-1] if len(t) >= 2 and t[0] == '"' and t[-1] == '"' else t for t in tokens]
 
 
-def import_checkshots_petrel(checkshots_file: Path) -> pd.DataFrame:
+def _parse_checkshots_petrel_dataframe(checkshots_file: Path) -> pd.DataFrame:
     """
     导入 Petrel checkshots/时深表文本，并统一为项目内部单位约定。
 
@@ -437,16 +439,7 @@ def import_checkshots_petrel(checkshots_file: Path) -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame
-        至少包含以下列：
-        ['X', 'Y', 'Z', 'MD', 'TWT', 'Well name']
-
-        若源文件包含 ``Average velocity`` 或 ``Interval velocity``，
-        则会一并保留。
-
-    Notes
-    -----
-    - ``Z`` 在 Petrel 文件中通常为负值，导入后统一转为正值 TVDSS。
-    - ``TWT`` 在 Petrel 文件中单位为 ms，导入后统一转为 s。
+        归一化后的原始表格数据。
     """
     required_columns = ["X", "Y", "Z", "MD", "TWT", "Well name"]
     optional_columns = ["Average velocity", "Interval velocity"]
@@ -498,6 +491,41 @@ def import_checkshots_petrel(checkshots_file: Path) -> pd.DataFrame:
     df["TWT"] = df["TWT"] / 1000.0
 
     return df
+
+
+def import_checkshots_petrel(checkshots_file: Path, depth_domain: str = "md") -> grid.TimeDepthTable:
+    """
+    导入 Petrel checkshots/时深表文本，并返回内部 ``TimeDepthTable`` 对象。
+
+    Parameters
+    ----------
+    checkshots_file : Path
+        Petrel 导出的 checkshots 文本路径。
+    depth_domain : str, default="md"
+        深度域类型，支持 ``"md"`` 与 ``"tvdss"``。
+
+    Returns
+    -------
+    grid.TimeDepthTable
+        统一单位后的时深关系对象。``TWT`` 单位固定为 s，深度单位固定为 m。
+
+    Raises
+    ------
+    ValueError
+        当 ``depth_domain`` 非法时抛出。
+    """
+    depth_domain = str(depth_domain).strip().lower()
+    if depth_domain not in {"md", "tvdss"}:
+        raise ValueError(f"Unsupported depth_domain: {depth_domain}. Expect 'md' or 'tvdss'.")
+
+    df = _parse_checkshots_petrel_dataframe(checkshots_file)
+    twt = df["TWT"].to_numpy(dtype=float, copy=False)
+    if depth_domain == "md":
+        depth = df["MD"].to_numpy(dtype=float, copy=False)
+        return grid.TimeDepthTable(twt=twt, md=depth)
+
+    depth = df["Z"].to_numpy(dtype=float, copy=False)
+    return grid.TimeDepthTable(twt=twt, tvdss=depth)
 
 
 def import_well_heads_petrel(well_heads_file: Path) -> pd.DataFrame:

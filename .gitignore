@@ -1,8 +1,7 @@
 .conda/*
 .vscode/*
 data/*
-experiments/optim/*
-experiments/results/*
+experiments/*
 note/*
 site/*
 tests/*
@@ -10,4 +9,3 @@ tmp/*
 */output/*
 *.pyc
 *.prompt.md
-*.pt

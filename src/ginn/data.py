@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -163,6 +164,85 @@ def make_wavelet(
         "Generated %s wavelet: freq=%.1f Hz, dt=%.4f s, length=%d, gain=%.2f", wavelet_type, freq, dt, length, gain
     )
     return y.astype(np.float32)
+
+
+def estimate_wavelet_gain(
+    seismic: np.ndarray,
+    lmf: np.ndarray,
+    mask: np.ndarray,
+    unit_wavelet: np.ndarray,
+    *,
+    seis_rms: float,
+    max_traces: int,
+    batch_size: int = 64,
+) -> float:
+    """基于样本道估计使合成地震与归一化观测同量级的子波增益。
+
+    思路：
+    1. 用单位增益子波对 LMF 做正演，得到 ``d_syn_unit``；
+    2. 在同一批掩码样本上计算 ``d_syn_unit`` 的 RMS；
+    3. 计算该批观测地震归一化后的 RMS；
+    4. 令 ``gain = obs_norm_rms / syn_unit_rms``。
+    """
+    from ginn.physics import ForwardModel
+
+    n_sample = seismic.shape[-1]
+    seismic_flat = seismic.reshape(-1, n_sample)
+    lmf_flat = lmf.reshape(-1, n_sample)
+    mask_flat = mask.reshape(-1, n_sample).astype(bool, copy=False)
+
+    valid_trace_indices = np.flatnonzero(mask_flat.any(axis=1))
+    if valid_trace_indices.size == 0:
+        raise ValueError("Cannot auto-estimate wavelet gain because no valid traces were found in the mask.")
+
+    n_selected = min(max_traces, valid_trace_indices.size)
+    if n_selected < valid_trace_indices.size:
+        rng = np.random.default_rng(0)
+        selected = np.sort(rng.choice(valid_trace_indices, size=n_selected, replace=False))
+    else:
+        selected = valid_trace_indices
+
+    forward_model = ForwardModel(unit_wavelet).cpu()
+    syn_sq_sum = 0.0
+    obs_norm_sq_sum = 0.0
+    n_valid = 0
+
+    with torch.no_grad():
+        for start in range(0, selected.size, batch_size):
+            batch_indices = selected[start : start + batch_size]
+
+            lmf_batch = torch.from_numpy(lmf_flat[batch_indices][:, np.newaxis, :]).float()
+            mask_batch = mask_flat[batch_indices][:, np.newaxis, :]
+            d_syn_unit = forward_model(lmf_batch).cpu().numpy()
+
+            seismic_batch = seismic_flat[batch_indices][:, np.newaxis, :] / float(seis_rms)
+            valid_values = mask_batch
+
+            syn_values = d_syn_unit[valid_values]
+            obs_norm_values = seismic_batch[valid_values]
+
+            syn_sq_sum += float(np.square(syn_values, dtype=np.float64).sum())
+            obs_norm_sq_sum += float(np.square(obs_norm_values, dtype=np.float64).sum())
+            n_valid += int(valid_values.sum())
+
+    if n_valid <= 0:
+        raise ValueError("Cannot auto-estimate wavelet gain because sampled valid point count is zero.")
+
+    syn_rms = math.sqrt(syn_sq_sum / n_valid)
+    obs_norm_rms = math.sqrt(obs_norm_sq_sum / n_valid)
+    if syn_rms <= 0.0:
+        raise ValueError(f"Cannot auto-estimate wavelet gain because synthetic RMS is non-positive: {syn_rms}.")
+
+    gain = obs_norm_rms / syn_rms
+    logger.info(
+        "Auto wavelet gain from sampled traces: traces=%d, valid_points=%d, obs_norm_rms=%.4f, syn_unit_rms=%.4f, gain=%.4f",
+        selected.size,
+        n_valid,
+        obs_norm_rms,
+        syn_rms,
+        gain,
+    )
+    return float(gain)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -364,15 +444,6 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
     else:
         raise ValueError(f"Unsupported lmf_source: {cfg.lmf_source}")
 
-    logger.info("Generating wavelet...")
-    wavelet = make_wavelet(
-        wavelet_type=cfg.wavelet_type,
-        freq=cfg.wavelet_freq,
-        dt=cfg.wavelet_dt,
-        length=cfg.wavelet_length,
-        gain=cfg.wavelet_gain,
-    )
-
     logger.info("Building horizon mask from TargetLayer (erosion disabled for now)...")
     if mask.shape != seismic.shape:
         raise ValueError(f"Mask shape {mask.shape} does not match seismic shape {seismic.shape}.")
@@ -380,4 +451,32 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
         raise ValueError(f"LMF shape {lmf.shape} does not match seismic shape {seismic.shape}.")
 
     dataset = SeismicTraceDataset(seismic, lmf, mask)
+
+    logger.info("Generating wavelet...")
+    resolved_wavelet_gain = cfg.wavelet_gain
+    if resolved_wavelet_gain is None:
+        unit_wavelet = make_wavelet(
+            wavelet_type=cfg.wavelet_type,
+            freq=cfg.wavelet_freq,
+            dt=cfg.wavelet_dt,
+            length=cfg.wavelet_length,
+            gain=1.0,
+        )
+        resolved_wavelet_gain = estimate_wavelet_gain(
+            seismic,
+            lmf,
+            mask,
+            unit_wavelet,
+            seis_rms=dataset.seis_rms,
+            max_traces=cfg.wavelet_gain_num_traces,
+        )
+        cfg.wavelet_gain = resolved_wavelet_gain
+
+    wavelet = make_wavelet(
+        wavelet_type=cfg.wavelet_type,
+        freq=cfg.wavelet_freq,
+        dt=cfg.wavelet_dt,
+        length=cfg.wavelet_length,
+        gain=float(resolved_wavelet_gain),
+    )
     return dataset, wavelet, geometry

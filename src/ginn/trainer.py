@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Optional
@@ -92,6 +93,65 @@ class Trainer:
         self.epoch = 0
         self.global_step = 0
         self.best_loss = float("inf")
+        self.residual_tanh_scale = self._resolve_residual_tanh_scale()
+        logger.info(
+            "Residual bounding: tanh_scale=%.4f, zero_outside_mask=%s",
+            self.residual_tanh_scale,
+            self.cfg.zero_residual_outside_mask,
+        )
+
+    def _resolve_residual_tanh_scale(self) -> float:
+        """解析对数扰动上界。
+
+        若配置中显式给出 ``residual_tanh_scale``，则直接使用。
+        否则根据有效区 LMF 上限和 ``residual_max_ai_offset`` 自动换算：
+
+        ``scale = log((lmf_upper + offset) / lmf_upper)``.
+        """
+        if self.cfg.residual_tanh_scale is not None:
+            return float(self.cfg.residual_tanh_scale)
+
+        lmf_upper = float(self.dataset.lmf_scale)
+        if lmf_upper <= 0.0:
+            raise ValueError(f"LMF upper bound must be positive to auto-compute tanh scale, got {lmf_upper}.")
+
+        offset = float(self.cfg.residual_max_ai_offset)
+        target_ai_upper = lmf_upper + offset
+        scale = math.log(target_ai_upper / lmf_upper)
+
+        logger.info(
+            "Auto residual tanh scale from LMF upper bound: lmf_upper=%.2f, ai_offset=%.2f, target_ai_upper=%.2f, tanh_scale=%.4f",
+            lmf_upper,
+            offset,
+            target_ai_upper,
+            scale,
+        )
+        return scale
+
+    def _compose_impedance(
+        self,
+        x: torch.Tensor,
+        lmf_raw: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """网络输出对数扰动并与 LMF 合成阻抗。
+
+        Notes
+        -----
+        - 使用 ``scale * tanh(raw)`` 限制对数扰动幅度，防止 ``exp`` 放大失控。
+        - 若启用 ``zero_residual_outside_mask``，则将目的层外残差压回 0，
+          使层外阻抗退回到 ``lmf_raw``。
+        """
+        raw_residual = self.model(x)
+        residual = self.residual_tanh_scale * torch.tanh(raw_residual)
+
+        if self.cfg.zero_residual_outside_mask:
+            if mask is None:
+                raise ValueError("Mask is required when zero_residual_outside_mask is enabled.")
+            residual = residual * mask.to(dtype=residual.dtype)
+
+        ai = lmf_raw * torch.exp(residual)
+        return ai, residual
 
     def train_one_epoch(self) -> float:
         """训练一个 epoch，返回 epoch 平均损失。"""
@@ -105,19 +165,16 @@ class Trainer:
             mask = batch["mask"].to(self.device)  # (B, 1, T)
             lmf_raw = batch["lmf_raw"].to(self.device)  # (B, 1, T)
 
-            # 1. 网络前向：输出阻抗残差
-            residual = self.model(x)  # (B, 1, T)
+            # 1. 网络前向 + 阻抗合成
+            ai, residual = self._compose_impedance(x, lmf_raw, mask)
 
-            # 2. 指数相乘模型: AI_abs = LMF_abs * exp(Δ)
-            ai = lmf_raw * torch.exp(residual)  # (B, 1, T)
-
-            # 3. 物理正演
+            # 2. 物理正演
             d_syn = self.forward_model(ai)  # (B, 1, T)
 
-            # 4. 损失
+            # 3. 损失
             loss, loss_dict = self.criterion(d_syn, d_obs, mask, residual)
 
-            # 5. 反向传播
+            # 4. 反向传播
             self.optimizer.zero_grad()
             loss.backward()
 
@@ -252,9 +309,9 @@ class Trainer:
         for batch in full_loader:
             x = batch["input"].to(self.device)
             lmf_raw = batch["lmf_raw"].to(self.device)
+            mask = batch["mask"].to(self.device)
 
-            residual = self.model(x)
-            ai = lmf_raw * torch.exp(residual)  # (B, 1, T)
+            ai, _ = self._compose_impedance(x, lmf_raw, mask)
 
             predictions.append(ai.squeeze(1).cpu().numpy())
 

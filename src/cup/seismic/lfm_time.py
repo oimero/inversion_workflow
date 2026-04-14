@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+import gstools as gs
 import numpy as np
 
 from cup.seismic.process import TargetLayer
@@ -123,14 +124,6 @@ def _krige_slice_on_line_domain(
         constant_grid = np.full((ilines.size, xlines.size), float(control_values[0]), dtype=float)
         zero_var = np.zeros_like(constant_grid)
         return constant_grid, zero_var
-
-    try:
-        import gstools as gs
-    except ImportError as exc:
-        raise ImportError(
-            "GSTools is required for kriging-based low-frequency model building. "
-            "Please install 'gstools' from environment.yml."
-        ) from exc
 
     model_name = variogram.lower()
     model_cls_map = {

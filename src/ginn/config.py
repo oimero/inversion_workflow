@@ -6,10 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Literal, Tuple
 
-try:
-    import yaml
-except ImportError:  # pragma: no cover - 依赖缺失时在运行期给出清晰报错
-    yaml = None
+import yaml
 
 LmfSource = Literal["wtie_time_lfm", "filtered_inversion_lmf"]
 
@@ -50,7 +47,8 @@ class GINNConfig:
     wavelet_freq: float = 25.0  # Hz
     wavelet_dt: float = 0.001  # s
     wavelet_length: int = 101  # 采样点数（奇数，中心对称）
-    wavelet_gain: float = 10.0  # 子波振幅增益
+    wavelet_gain: float | None = None  # 若为空，则按样本道自动估计
+    wavelet_gain_num_traces: int = 256  # 自动估计 wavelet_gain 时采样的有效道数
 
     # ── 低频模型 ──────────────────────────────────────────────
     lmf_source: LmfSource = "filtered_inversion_lmf"
@@ -73,6 +71,9 @@ class GINNConfig:
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     lambda_reg: float = 0.1  # 残差 L2 正则化权重（防止尺度发散）
+    residual_tanh_scale: float | None = None  # 若为空，则按 LMF 上限 + offset 自动换算
+    residual_max_ai_offset: float = 2000.0  # 允许 AI 相对 LMF 上限额外抬升的绝对量
+    zero_residual_outside_mask: bool = True  # 将目的层外残差钳回 0，避免层外失控污染层内
     device: str = "cuda"
     num_workers: int = 0  # Windows 下大数组无法 pickle，设 0
     pin_memory: bool = True
@@ -102,6 +103,15 @@ class GINNConfig:
         if self.lmf_source not in valid_lmf_sources:
             raise ValueError(f"Unsupported lmf_source={self.lmf_source!r}, expected one of {sorted(valid_lmf_sources)}")
 
+        if self.wavelet_gain is not None and self.wavelet_gain <= 0.0:
+            raise ValueError(f"wavelet_gain must be positive when provided, got {self.wavelet_gain}.")
+        if self.wavelet_gain_num_traces <= 0:
+            raise ValueError(f"wavelet_gain_num_traces must be positive, got {self.wavelet_gain_num_traces}.")
+        if self.residual_tanh_scale is not None and self.residual_tanh_scale <= 0.0:
+            raise ValueError(f"residual_tanh_scale must be positive when provided, got {self.residual_tanh_scale}.")
+        if self.residual_max_ai_offset <= 0.0:
+            raise ValueError(f"residual_max_ai_offset must be positive, got {self.residual_max_ai_offset}.")
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "GINNConfig":
         normalized = dict(data)
@@ -122,9 +132,6 @@ class GINNConfig:
 
     @classmethod
     def from_yaml(cls, config_file: str | Path, *, base_dir: Path | None = None) -> "GINNConfig":
-        if yaml is None:
-            raise ImportError("PyYAML is required to load GINN YAML configs. Please install `pyyaml` first.")
-
         config_path = Path(config_file).resolve()
         with config_path.open("r", encoding="utf-8") as fp:
             raw_data = yaml.safe_load(fp) or {}

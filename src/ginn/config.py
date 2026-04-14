@@ -1,12 +1,26 @@
-"""ginn.config — 全局超参数配置。"""
+"""ginn.config — GINN 配置 schema、校验与加载。"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal, Tuple
+from typing import Any, Dict, Literal, Tuple
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - 依赖缺失时在运行期给出清晰报错
+    yaml = None
 
 LmfSource = Literal["wtie_time_lfm", "filtered_inversion_lmf"]
+
+_PATH_FIELDS = {
+    "seismic_file",
+    "inversion_file",
+    "top_horizon_file",
+    "bot_horizon_file",
+    "precomputed_lmf_file",
+    "checkpoint_dir",
+}
 
 
 @dataclass
@@ -30,7 +44,6 @@ class GINNConfig:
 
     # ── 采样参数 ──────────────────────────────────────────────
     dt: float = 0.001  # 采样间隔 (s)
-    n_samples: int = 1201  # 每道采样点数
 
     # ── 子波 ──────────────────────────────────────────────────
     wavelet_type: str = "ricker"
@@ -73,6 +86,14 @@ class GINNConfig:
     save_every: int = 5  # 每 N 个 epoch 保存 checkpoint
 
     def __post_init__(self) -> None:
+        for field_name in _PATH_FIELDS:
+            value = getattr(self, field_name)
+            if not isinstance(value, Path):
+                setattr(self, field_name, Path(value))
+
+        if not isinstance(self.dilations, tuple):
+            self.dilations = tuple(self.dilations)
+
         # 确保 dilations 长度与 num_res_blocks 一致
         if len(self.dilations) != self.num_res_blocks:
             raise ValueError(f"len(dilations)={len(self.dilations)} != num_res_blocks={self.num_res_blocks}")
@@ -80,3 +101,51 @@ class GINNConfig:
         valid_lmf_sources = {"wtie_time_lfm", "filtered_inversion_lmf"}
         if self.lmf_source not in valid_lmf_sources:
             raise ValueError(f"Unsupported lmf_source={self.lmf_source!r}, expected one of {sorted(valid_lmf_sources)}")
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "GINNConfig":
+        normalized = dict(data)
+
+        for field_name in _PATH_FIELDS:
+            if field_name not in normalized or normalized[field_name] is None:
+                continue
+
+            path = Path(normalized[field_name])
+            if base_dir is not None and not path.is_absolute():
+                path = (base_dir / path).resolve()
+            normalized[field_name] = path
+
+        if "dilations" in normalized and normalized["dilations"] is not None:
+            normalized["dilations"] = tuple(normalized["dilations"])
+
+        return cls(**normalized)
+
+    @classmethod
+    def from_yaml(cls, config_file: str | Path, *, base_dir: Path | None = None) -> "GINNConfig":
+        if yaml is None:
+            raise ImportError("PyYAML is required to load GINN YAML configs. Please install `pyyaml` first.")
+
+        config_path = Path(config_file).resolve()
+        with config_path.open("r", encoding="utf-8") as fp:
+            raw_data = yaml.safe_load(fp) or {}
+
+        if not isinstance(raw_data, dict):
+            raise ValueError(f"Expected a mapping in config file {config_path}, got {type(raw_data).__name__}.")
+
+        resolved_base_dir = config_path.parent if base_dir is None else Path(base_dir).resolve()
+        return cls.from_dict(raw_data, base_dir=resolved_base_dir)
+
+    def to_json_dict(self) -> Dict[str, Any]:
+        return _to_json_compatible(asdict(self))
+
+
+def _to_json_compatible(value: Any) -> Any:
+    if isinstance(value, Path):
+        return value.as_posix()
+    if isinstance(value, tuple):
+        return [_to_json_compatible(item) for item in value]
+    if isinstance(value, list):
+        return [_to_json_compatible(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _to_json_compatible(item) for key, item in value.items()}
+    return value

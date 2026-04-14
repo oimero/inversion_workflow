@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -152,6 +153,7 @@ class Trainer:
         if filename is None:
             filename = f"checkpoint_epoch{self.epoch:03d}.pt"
         path = self.cfg.checkpoint_dir / filename
+        config_payload = self.cfg.to_json_dict()
         torch.save(
             {
                 "epoch": self.epoch,
@@ -160,7 +162,7 @@ class Trainer:
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "best_loss": self.best_loss,
-                "config": self.cfg,
+                "config": config_payload,
                 "normalization": {
                     "seis_rms": self.dataset.seis_rms,
                     "lmf_scale": self.dataset.lmf_scale,
@@ -168,7 +170,12 @@ class Trainer:
             },
             path,
         )
+        config_path = path.with_suffix(".config.json")
+        with config_path.open("w", encoding="utf-8") as fp:
+            json.dump(config_payload, fp, ensure_ascii=False, indent=2)
+
         logger.info("Checkpoint saved: %s", path)
+        logger.info("Checkpoint config saved: %s", config_path)
         return path
 
     def train(self) -> None:

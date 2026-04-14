@@ -42,9 +42,9 @@ logger = logging.getLogger(__name__)
 
 def make_lowfreq_model(
     impedance_volume: np.ndarray,
-    dt_s: float = 0.001,
-    cutoff_hz: float = 10.0,
-    order: int = 6,
+    dt_s: float,
+    cutoff_hz: float,
+    order: int,
 ) -> np.ndarray:
     """对反演阻抗体沿时间轴做 Butterworth 零相位低通滤波，生成低频模型。
 
@@ -125,11 +125,11 @@ def load_lowfreq_model(lowfreq_file: Path) -> np.ndarray:
 
 
 def make_wavelet(
-    wavelet_type: str = "ricker",
-    freq: float = 25.0,
-    dt: float = 0.001,
-    length: int = 101,
-    gain: float = 1.0,
+    wavelet_type: str,
+    freq: float,
+    dt: float,
+    length: int,
+    gain: float,
 ) -> np.ndarray:
     """生成理论子波。
 

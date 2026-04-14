@@ -12,6 +12,7 @@ dependencies:
   - pandas
   - matplotlib
   - scikit-image
+  - pyyaml
   - h5py
   - ipykernel
   - numba

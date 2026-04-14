@@ -12,6 +12,8 @@ from cup.seismic.survey import SurveyContext
 from wtie.processing import grid
 from wtie.processing.spectral import apply_butter_lowpass_filter
 
+POST_SLICE_SMOOTHING_KERNEL = np.asarray([0.1, 0.2, 0.4, 0.2, 0.1], dtype=float)
+
 
 @dataclass
 class LfmTimeWell:
@@ -358,43 +360,44 @@ def _fill_missing_slices_with_neighbors(
         slice_modes[slice_idx] = "neighbor_slice_fill"
 
 
-def _apply_post_vertical_filter(
-    volume: np.ndarray,
-    sample_step: float,
-    cutoff_hz: float,
-    order: int,
-) -> np.ndarray:
-    filtered_volume = volume.copy()
-    fs = 1.0 / sample_step
-    nyquist = 0.5 * fs
-    if cutoff_hz <= 0.0 or cutoff_hz >= nyquist:
-        raise ValueError(f"filter_cutoff_hz must be within (0, {nyquist}), got {cutoff_hz}.")
+def _apply_post_slice_smoothing(
+    slice_values: np.ndarray,
+    slice_variance: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """沿 zone 的 slice 维做轻度平滑，减弱相邻 slice 面的突变。"""
+    if slice_values.shape != slice_variance.shape:
+        raise ValueError(
+            "slice_values and slice_variance must share the same shape, "
+            f"got {slice_values.shape} and {slice_variance.shape}."
+        )
+    if slice_values.ndim != 3:
+        raise ValueError(f"Expected 3D slice arrays, got ndim={slice_values.ndim}.")
 
-    n_il, n_xl, _ = filtered_volume.shape
-    for i_il in range(n_il):
-        for i_xl in range(n_xl):
-            trace = filtered_volume[i_il, i_xl]
-            finite = np.isfinite(trace)
-            if not np.any(finite):
+    kernel = POST_SLICE_SMOOTHING_KERNEL
+    radius = kernel.size // 2
+    n_slices = slice_values.shape[0]
+
+    smoothed_values = np.zeros_like(slice_values, dtype=float)
+    smoothed_variance = np.zeros_like(slice_variance, dtype=float)
+
+    for slice_idx in range(n_slices):
+        weight_sum = 0.0
+        for kernel_idx, weight in enumerate(kernel):
+            neighbor_idx = slice_idx + kernel_idx - radius
+            if not (0 <= neighbor_idx < n_slices):
                 continue
 
-            valid_indices = np.flatnonzero(finite)
-            first_idx = int(valid_indices[0])
-            last_idx = int(valid_indices[-1])
-            segment = trace[first_idx : last_idx + 1]
-            if segment.size < 3 or not np.all(np.isfinite(segment)):
-                continue
+            smoothed_values[slice_idx] += float(weight) * slice_values[neighbor_idx]
+            smoothed_variance[slice_idx] += float(weight) * slice_variance[neighbor_idx]
+            weight_sum += float(weight)
 
-            filtered = apply_butter_lowpass_filter(
-                segment.astype(np.float64),
-                highcut=cutoff_hz,
-                fs=fs,
-                order=order,
-                zero_phase=True,
-            )
-            filtered_volume[i_il, i_xl, first_idx : last_idx + 1] = filtered.astype(np.float32)
+        if weight_sum <= 0.0:
+            raise ValueError("Post-slice smoothing kernel has no valid support for current slice index.")
 
-    return filtered_volume
+        smoothed_values[slice_idx] /= weight_sum
+        smoothed_variance[slice_idx] /= weight_sum
+
+    return smoothed_values, smoothed_variance
 
 
 def build_lfm_time_model(
@@ -408,7 +411,7 @@ def build_lfm_time_model(
     nugget: float = 0.0,
     filter_cutoff_hz: float = 10.0,
     filter_order: int = 5,
-    post_vertical_filter: bool = False,
+    post_slice_smoothing: bool = True,
 ) -> LfmTimeModelResult:
     """构建时间域层位约束低频模型。"""
     if not wells:
@@ -540,6 +543,11 @@ def build_lfm_time_model(
             slice_modes=slice_modes,
             valid_slice_mask=valid_slice_mask,
         )
+        if post_slice_smoothing:
+            zone_slice_values, zone_slice_variance = _apply_post_slice_smoothing(
+                slice_values=zone_slice_values,
+                slice_variance=zone_slice_variance,
+            )
 
         zone_key = f"{top_name}->{bottom_name}"
         coverage_stats["zones"][zone_key] = {
@@ -586,14 +594,6 @@ def build_lfm_time_model(
                 trace[last_idx + 1 :] = trace[last_idx]
                 variance_volume[i_il, i_xl, last_idx + 1 :] = variance_volume[i_il, i_xl, last_idx]
 
-    if post_vertical_filter:
-        volume = _apply_post_vertical_filter(
-            volume,
-            sample_step=float(target_layer.geometry["sample_step"]),
-            cutoff_hz=float(filter_cutoff_hz),
-            order=int(filter_order),
-        )
-
     metadata = {
         "backend": "gstools",
         "slice_mode": "proportional",
@@ -608,7 +608,8 @@ def build_lfm_time_model(
         "horizon_names": list(target_layer.horizon_names),
         "zone_names": [list(zone) for zone in target_layer.iter_zones()],
         "well_names": [well.well_name for well in prepared_wells],
-        "post_vertical_filter": bool(post_vertical_filter),
+        "post_slice_smoothing": bool(post_slice_smoothing),
+        "post_slice_smoothing_kernel": POST_SLICE_SMOOTHING_KERNEL.tolist(),
         "variance_volume_included": True,
     }
 

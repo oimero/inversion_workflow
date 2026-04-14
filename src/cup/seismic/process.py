@@ -42,6 +42,7 @@ Examples
 """
 
 import warnings
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -52,6 +53,13 @@ from scipy.ndimage import generic_filter
 from scipy.spatial import QhullError
 
 OUTLIER_REMOVAL_WARNING_RATIO = 0.05
+
+
+def _sanitize_debug_token(value: str) -> str:
+    """将任意名称规整为适合作为调试文件名的片段。"""
+    token = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(value).strip())
+    token = token.strip("_")
+    return token or "unnamed"
 
 
 def _build_line_axis(line_min: int, line_max: int, line_step: int) -> np.ndarray:
@@ -371,6 +379,8 @@ class TargetLayer:
     horizon_names : list[str]
         从顶到底排序后的层位名列表。列表中的名称必须唯一，且都存在于
         ``interpolated_horizon_dfs`` 中。
+    debug_dir : str or pathlib.Path, optional
+        当相邻层位顺序校验失败时，将违例点 CSV 写入该目录，便于定位问题位置。
 
     Notes
     -----
@@ -379,6 +389,7 @@ class TargetLayer:
     - 根据 geometry 构建规则 inline/xline 轴；
     - 在秒域场景下按经验规则归一化层位单位；
     - 校验相邻层位在共址样点上的解释值顺序；
+    - 若配置 ``debug_dir``，在校验失败时导出违例样点日志；
     - 为后续插值查询预构建 2D 层位网格。
     """
 
@@ -387,6 +398,7 @@ class TargetLayer:
         interpolated_horizon_dfs: Dict[str, pd.DataFrame],
         geometry: Dict[str, Any],
         horizon_names: list[str],
+        debug_dir: Optional[str | Path] = None,
     ) -> None:
         """初始化目的层对象。"""
         if len(interpolated_horizon_dfs) < 2:
@@ -404,6 +416,7 @@ class TargetLayer:
         self.geometry = dict(geometry)
         self.interpolated_horizon_dfs = {name: df.copy() for name, df in interpolated_horizon_dfs.items()}
         self.horizon_names = list(horizon_names)
+        self.debug_dir = Path(debug_dir) if debug_dir is not None else None
         self._il_axis, self._xl_axis = self._build_axes()
         self._normalized_horizon_dfs = {
             name: _normalize_interpretation_unit_for_geometry(df, self.geometry)
@@ -433,6 +446,28 @@ class TargetLayer:
 
     def _assert_horizon_pair_is_strictly_increasing(self, top_name: str, bottom_name: str) -> None:
         """在共址样点上断言相邻层位解释值严格递增。"""
+        aligned = self._build_horizon_pair_alignment(top_name, bottom_name)
+        if aligned.empty:
+            raise AssertionError(
+                "No overlapping (inline, xline) samples were found between adjacent horizons; "
+                f"cannot assert order for '{top_name}' < '{bottom_name}'."
+            )
+
+        violated = aligned[aligned["interpretation_top"] >= aligned["interpretation_bottom"]].copy()
+        if violated.empty:
+            return
+
+        debug_path = self._write_horizon_pair_violation_log(top_name, bottom_name, violated)
+        error_message = (
+            f"Horizon '{top_name}' must be strictly smaller than '{bottom_name}' on overlapping samples. "
+            f"Found {len(violated)} violation(s)."
+        )
+        if debug_path is not None:
+            error_message += f" Debug log saved to '{debug_path.as_posix()}'."
+        raise AssertionError(error_message)
+
+    def _build_horizon_pair_alignment(self, top_name: str, bottom_name: str) -> pd.DataFrame:
+        """返回相邻层位在共址样点上的对齐结果。"""
         required_cols = ["inline", "xline", "interpretation"]
         top_df = self.interpolated_horizon_dfs[top_name][required_cols].copy()
         bot_df = self.interpolated_horizon_dfs[bottom_name][required_cols].copy()
@@ -442,18 +477,43 @@ class TargetLayer:
             columns={"interpretation": "interpretation_bottom"}
         )
 
-        aligned = pd.merge(top_df, bot_df, on=["inline", "xline"], how="inner")
-        if aligned.empty:
-            raise AssertionError(
-                "No overlapping (inline, xline) samples were found between adjacent horizons; "
-                f"cannot assert order for '{top_name}' < '{bottom_name}'."
-            )
+        return pd.merge(top_df, bot_df, on=["inline", "xline"], how="inner").sort_values(
+            ["inline", "xline"]
+        ).reset_index(drop=True)
 
-        violated = aligned[aligned["interpretation_top"] >= aligned["interpretation_bottom"]]
-        assert violated.empty, (
-            f"Horizon '{top_name}' must be strictly smaller than '{bottom_name}' on overlapping samples. "
-            f"Found {len(violated)} violation(s)."
-        )
+    def _write_horizon_pair_violation_log(
+        self,
+        top_name: str,
+        bottom_name: str,
+        violated: pd.DataFrame,
+    ) -> Optional[Path]:
+        """将层位顺序违例点导出到调试目录。"""
+        if self.debug_dir is None or violated.empty:
+            return None
+
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_top = _sanitize_debug_token(top_name)
+        safe_bottom = _sanitize_debug_token(bottom_name)
+        log_path = self.debug_dir / f"horizon_order_violation__{safe_top}__lt__{safe_bottom}__{timestamp}.csv"
+
+        log_df = violated.copy()
+        log_df.insert(0, "bottom_name", bottom_name)
+        log_df.insert(0, "top_name", top_name)
+        log_df["interpretation_delta"] = log_df["interpretation_top"] - log_df["interpretation_bottom"]
+        log_df = log_df[
+            [
+                "top_name",
+                "bottom_name",
+                "inline",
+                "xline",
+                "interpretation_top",
+                "interpretation_bottom",
+                "interpretation_delta",
+            ]
+        ]
+        log_df.to_csv(log_path, index=False, encoding="utf-8-sig")
+        return log_path.resolve()
 
     def _assert_horizon_sequence_is_strictly_increasing(self) -> None:
         """校验所有相邻层位在共址样点上的顺序。"""

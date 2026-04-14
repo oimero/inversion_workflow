@@ -151,19 +151,19 @@ class SeismicTraceDataset(Dataset):
     """逐道 1D 地震数据 Dataset。
 
     每个 item 包含：
-    - ``input``：(2, n_t) — 归一化地震道 + 归一化 LMF
-    - ``obs``：(1, n_t) — 归一化观测地震道（用于损失计算）
-    - ``mask``：(1, n_t) — 布尔掩码
-    - ``lmf_raw``：(1, n_t) — 原始 LMF（用于正演时恢复阻抗）
+    - ``input``：(2, n_sample) — 归一化地震道 + 归一化 LMF
+    - ``obs``：(1, n_sample) — 归一化观测地震道（用于损失计算）
+    - ``mask``：(1, n_sample) — 布尔掩码
+    - ``lmf_raw``：(1, n_sample) — 原始 LMF（用于正演时恢复阻抗）
 
     Parameters
     ----------
     seismic : np.ndarray
-        地震体，shape ``(n_il, n_xl, n_t)``。
+        地震体，shape ``(n_il, n_xl, n_sample)``。
     lmf : np.ndarray
-        低频模型，shape ``(n_il, n_xl, n_t)``。
+        低频模型，shape ``(n_il, n_xl, n_sample)``。
     mask : np.ndarray
-        布尔掩码，shape ``(n_il, n_xl, n_t)``。
+        布尔掩码，shape ``(n_il, n_xl, n_sample)``。
     """
 
     def __init__(
@@ -172,17 +172,17 @@ class SeismicTraceDataset(Dataset):
         lmf: np.ndarray,
         mask: np.ndarray,
     ) -> None:
-        n_il, n_xl, n_t = seismic.shape
+        n_il, n_xl, n_sample = seismic.shape
         assert lmf.shape == seismic.shape
         assert mask.shape == seismic.shape
 
         # 找出掩码中至少有 1 个 True 的道
-        has_valid = mask.reshape(n_il * n_xl, n_t).any(axis=1)
+        has_valid = mask.reshape(n_il * n_xl, n_sample).any(axis=1)
         valid_indices = np.flatnonzero(has_valid)
 
-        self._seismic_flat = seismic.reshape(n_il * n_xl, n_t)
-        self._lmf_flat = lmf.reshape(n_il * n_xl, n_t)
-        self._mask_flat = mask.reshape(n_il * n_xl, n_t)
+        self._seismic_flat = seismic.reshape(n_il * n_xl, n_sample)
+        self._lmf_flat = lmf.reshape(n_il * n_xl, n_sample)
+        self._mask_flat = mask.reshape(n_il * n_xl, n_sample)
         self._valid_indices = valid_indices
 
         # 全局归一化统计量（仅在有效掩码区域内计算）
@@ -217,9 +217,9 @@ class SeismicTraceDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         flat_idx = self._valid_indices[idx]
 
-        seis = self._seismic_flat[flat_idx].copy()  # (n_t,)
-        lmf = self._lmf_flat[flat_idx].copy()  # (n_t,)
-        m = self._mask_flat[flat_idx].copy()  # (n_t,)
+        seis = self._seismic_flat[flat_idx].copy()  # (n_sample,)
+        lmf = self._lmf_flat[flat_idx].copy()  # (n_sample,)
+        m = self._mask_flat[flat_idx].copy()  # (n_sample,)
 
         # 保留 LMF 原始量纲用于物理正演
         lmf_raw = lmf.copy()
@@ -229,13 +229,13 @@ class SeismicTraceDataset(Dataset):
         lmf_norm = lmf / self._lmf_scale
 
         # 构造 2 通道输入
-        x = np.stack([seis_norm, lmf_norm], axis=0)  # (2, n_t)
+        x = np.stack([seis_norm, lmf_norm], axis=0)  # (2, n_sample)
 
         return {
-            "input": torch.from_numpy(x).float(),  # (2, n_t)
-            "obs": torch.from_numpy(seis_norm[np.newaxis]).float(),  # (1, n_t)
-            "mask": torch.from_numpy(m[np.newaxis]).bool(),  # (1, n_t)
-            "lmf_raw": torch.from_numpy(lmf_raw[np.newaxis]).float(),  # (1, n_t)
+            "input": torch.from_numpy(x).float(),  # (2, n_sample)
+            "obs": torch.from_numpy(seis_norm[np.newaxis]).float(),  # (1, n_sample)
+            "mask": torch.from_numpy(m[np.newaxis]).bool(),  # (1, n_sample)
+            "lmf_raw": torch.from_numpy(lmf_raw[np.newaxis]).float(),  # (1, n_sample)
         }
 
 

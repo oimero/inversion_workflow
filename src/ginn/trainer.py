@@ -223,13 +223,13 @@ class Trainer:
         Returns
         -------
         np.ndarray
-            预测阻抗体，shape ``(n_il, n_xl, n_t)``。
+            预测阻抗体，shape ``(n_il, n_xl, n_sample)``。
         """
         self.model.eval()
 
         n_il = int(self.geometry["n_il"])
         n_xl = int(self.geometry["n_xl"])
-        n_t = int(self.geometry["n_sample"])
+        n_sample = int(self.geometry["n_sample"])
 
         # 使用全部道（包含无效道）进行推理
         full_loader = DataLoader(
@@ -254,8 +254,8 @@ class Trainer:
         predictions = np.concatenate(predictions, axis=0)  # (N_valid, T)
 
         # 放回原始 3D 位置
-        volume = np.zeros((n_il * n_xl, n_t), dtype=np.float32)
+        volume = np.zeros((n_il * n_xl, n_sample), dtype=np.float32)
         valid_indices = self.dataset._valid_indices
         volume[valid_indices] = predictions
 
-        return volume.reshape(n_il, n_xl, n_t)
+        return volume.reshape(n_il, n_xl, n_sample)

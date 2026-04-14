@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Literal, Tuple
+
+LmfSource = Literal["wtie_time_lfm", "filtered_inversion_lmf"]
 
 
 @dataclass
@@ -38,6 +40,8 @@ class GINNConfig:
     wavelet_gain: float = 10.0  # 子波振幅增益
 
     # ── 低频模型 ──────────────────────────────────────────────
+    lmf_source: LmfSource = "filtered_inversion_lmf"
+    precomputed_lmf_file: Path = Path("data/lfm_time_from_wtie_output/lfm_time_from_wtie.npz")
     lmf_cutoff_hz: float = 10.0  # Butterworth 低通截止频率 (Hz)
     lmf_filter_order: int = 6  # 零相位滤波器阶数
 
@@ -72,3 +76,7 @@ class GINNConfig:
         # 确保 dilations 长度与 num_res_blocks 一致
         if len(self.dilations) != self.num_res_blocks:
             raise ValueError(f"len(dilations)={len(self.dilations)} != num_res_blocks={self.num_res_blocks}")
+
+        valid_lmf_sources = {"wtie_time_lfm", "filtered_inversion_lmf"}
+        if self.lmf_source not in valid_lmf_sources:
+            raise ValueError(f"Unsupported lmf_source={self.lmf_source!r}, expected one of {sorted(valid_lmf_sources)}")

@@ -55,6 +55,8 @@ def main() -> None:
         wavelet_length=301,
         wavelet_gain=10.0,
         # ── 低频模型 ──────────────────────────────────────────────
+        lmf_source="wtie_time_lfm",
+        precomputed_lmf_file=data_root / "lfm_time_from_wtie_output" / "lfm_time_from_wtie.npz",
         lmf_cutoff_hz=10.0,
         lmf_filter_order=6,
         # ── 网络 ──────────────────────────────────────────────────

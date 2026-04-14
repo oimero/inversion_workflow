@@ -3,7 +3,7 @@
 职责
 ----
 1. 读取 SEG-Y 地震体和反演体
-2. 从反演体生成低频模型（Butterworth 低通滤波）
+2. 读取预计算低频模型或从反演体生成低频模型
 3. 生成理论子波（Ricker）
 4. 从层位文件生成 3D 布尔掩码
 5. 封装为 PyTorch Dataset
@@ -11,12 +11,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import numpy as np
 import torch
+from scipy.signal import butter, sosfiltfilt
 from torch.utils.data import Dataset
 
 from cup.petrel.load import import_interpretation_petrel, import_seismic
@@ -44,7 +46,7 @@ def make_lowfreq_model(
     cutoff_hz: float = 10.0,
     order: int = 6,
 ) -> np.ndarray:
-    """对反演阻抗体逐道做 Butterworth 零相位低通滤波，生成低频模型。
+    """对反演阻抗体沿时间轴做 Butterworth 零相位低通滤波，生成低频模型。
 
     Parameters
     ----------
@@ -62,24 +64,22 @@ def make_lowfreq_model(
     np.ndarray
         低频模型，shape 与输入相同。
     """
-    from wtie.processing.spectral import apply_butter_lowpass_filter
-
     fs = 1.0 / dt_s
     n_il, n_xl, n_sample = impedance_volume.shape
-    lmf = np.zeros_like(impedance_volume)
+    nyquist = 0.5 * fs
+    if cutoff_hz <= 0.0 or cutoff_hz >= nyquist:
+        raise ValueError(f"cutoff_hz must be within (0, {nyquist}), got {cutoff_hz}.")
 
-    for i in range(n_il):
-        for j in range(n_xl):
-            trace = impedance_volume[i, j, :].astype(np.float64)
-            if np.all(trace == 0):
-                continue
-            lmf[i, j, :] = apply_butter_lowpass_filter(
-                trace,
-                highcut=cutoff_hz,
-                fs=fs,
-                order=order,
-                zero_phase=True,
-            )
+    # 与旧实现保持一致：零相位前后各做一次滤波，因此单程滤波器阶数取 order // 2。
+    single_pass_order = max(1, order // 2)
+    sos = butter(single_pass_order, cutoff_hz, btype="low", fs=fs, output="sos")
+
+    traces = impedance_volume.reshape(n_il * n_xl, n_sample).astype(np.float64, copy=False)
+    active_mask = np.any(traces != 0.0, axis=1)
+    filtered = traces.copy()
+    if np.any(active_mask):
+        filtered[active_mask] = sosfiltfilt(sos, traces[active_mask], axis=-1)
+    lmf = filtered.reshape(n_il, n_xl, n_sample)
 
     logger.info(
         "Generated LMF: cutoff=%.1f Hz, order=%d, shape=%s",
@@ -88,6 +88,35 @@ def make_lowfreq_model(
         lmf.shape,
     )
     return lmf.astype(np.float32)
+
+
+def load_lowfreq_model(lowfreq_file: Path) -> np.ndarray:
+    """从 ``.npz`` 或 ``.npy`` 文件读取预计算低频模型体。"""
+    lowfreq_path = Path(lowfreq_file)
+    if not lowfreq_path.exists():
+        raise FileNotFoundError(lowfreq_path)
+
+    suffix = lowfreq_path.suffix.lower()
+    if suffix == ".npy":
+        volume = np.load(lowfreq_path, allow_pickle=False)
+    elif suffix == ".npz":
+        with np.load(lowfreq_path, allow_pickle=False) as archive:
+            if "volume" in archive.files:
+                volume = archive["volume"]
+            elif len(archive.files) == 1:
+                volume = archive[archive.files[0]]
+            else:
+                raise ValueError(
+                    f"Expected key 'volume' in precomputed LMF archive or exactly one array, got {archive.files}."
+                )
+
+            if "metadata_json" in archive.files:
+                metadata = json.loads(np.asarray(archive["metadata_json"]).item())
+                logger.info("Loaded precomputed LMF metadata: %s", metadata)
+    else:
+        raise ValueError(f"Unsupported low-frequency model file type: {lowfreq_path.suffix}")
+
+    return np.asarray(volume, dtype=np.float32)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -286,18 +315,6 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
     # 然后将 TargetLayer 跑出来的低频模型跑一遍确定性反演
     # 再将这个反演体作为网络的输入
 
-    logger.info("Loading inversion volume...")
-    inversion = import_seismic(
-        cfg.inversion_file,
-        seismic_type="segy",
-        # iline=cfg.segy_iline,
-        # xline=cfg.segy_xline,
-        # istep=cfg.segy_istep,
-        # xstep=cfg.segy_xstep,
-    )
-    if inversion.shape != seismic.shape:
-        raise ValueError(f"Inversion shape {inversion.shape} does not match seismic shape {seismic.shape}.")
-
     logger.info("Loading and interpolating top/bottom interpretation horizons...")
     top_df_raw = import_interpretation_petrel(cfg.top_horizon_file)
     bot_df_raw = import_interpretation_petrel(cfg.bot_horizon_file)
@@ -325,13 +342,27 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
     )
     mask = target_layer.to_mask()
 
-    logger.info("Generating low-frequency model...")
-    lmf = make_lowfreq_model(
-        inversion,
-        dt_s=cfg.dt,
-        cutoff_hz=cfg.lmf_cutoff_hz,
-        order=cfg.lmf_filter_order,
-    )
+    if cfg.lmf_source == "wtie_time_lfm":
+        logger.info("Loading precomputed low-frequency model from %s...", cfg.precomputed_lmf_file)
+        lmf = load_lowfreq_model(cfg.precomputed_lmf_file)
+    elif cfg.lmf_source == "filtered_inversion_lmf":
+        logger.info("Loading inversion volume...")
+        inversion = import_seismic(
+            cfg.inversion_file,
+            seismic_type="segy",
+        )
+        if inversion.shape != seismic.shape:
+            raise ValueError(f"Inversion shape {inversion.shape} does not match seismic shape {seismic.shape}.")
+
+        logger.info("Generating low-frequency model from inversion volume...")
+        lmf = make_lowfreq_model(
+            inversion,
+            dt_s=cfg.dt,
+            cutoff_hz=cfg.lmf_cutoff_hz,
+            order=cfg.lmf_filter_order,
+        )
+    else:
+        raise ValueError(f"Unsupported lmf_source: {cfg.lmf_source}")
 
     logger.info("Generating wavelet...")
     wavelet = make_wavelet(
@@ -345,6 +376,8 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
     logger.info("Building horizon mask from TargetLayer (erosion disabled for now)...")
     if mask.shape != seismic.shape:
         raise ValueError(f"Mask shape {mask.shape} does not match seismic shape {seismic.shape}.")
+    if lmf.shape != seismic.shape:
+        raise ValueError(f"LMF shape {lmf.shape} does not match seismic shape {seismic.shape}.")
 
     dataset = SeismicTraceDataset(seismic, lmf, mask)
     return dataset, wavelet, geometry

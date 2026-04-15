@@ -71,8 +71,8 @@ class GINNConfig:
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     lambda_reg: float = 0.1  # 残差 L2 正则化权重（防止尺度发散）
-    residual_tanh_scale: float | None = None  # 若为空，则按 LMF 上限 + offset 自动换算
-    residual_max_ai_offset: float = 8000.0  # 允许 AI 相对 LMF 上限额外抬升的绝对量
+    ai_min: float = 4000.0  # 目标层内允许的 AI 下界
+    ai_max: float = 20000.0  # 目标层内允许的 AI 上界
     zero_residual_outside_mask: bool = True  # 用 core+halo taper 将层外残差平滑压回 0
     device: str = "cuda"
     num_workers: int = 0  # Windows 下大数组无法 pickle，设 0
@@ -107,10 +107,10 @@ class GINNConfig:
             raise ValueError(f"wavelet_gain must be positive when provided, got {self.wavelet_gain}.")
         if self.wavelet_gain_num_traces <= 0:
             raise ValueError(f"wavelet_gain_num_traces must be positive, got {self.wavelet_gain_num_traces}.")
-        if self.residual_tanh_scale is not None and self.residual_tanh_scale <= 0.0:
-            raise ValueError(f"residual_tanh_scale must be positive when provided, got {self.residual_tanh_scale}.")
-        if self.residual_max_ai_offset <= 0.0:
-            raise ValueError(f"residual_max_ai_offset must be positive, got {self.residual_max_ai_offset}.")
+        if self.ai_min <= 0.0:
+            raise ValueError(f"ai_min must be positive, got {self.ai_min}.")
+        if self.ai_max <= self.ai_min:
+            raise ValueError(f"ai_max must be greater than ai_min, got ai_min={self.ai_min}, ai_max={self.ai_max}.")
         if self.mask_erosion_samples < 0:
             raise ValueError(f"mask_erosion_samples must be non-negative, got {self.mask_erosion_samples}.")
 

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import time
 from pathlib import Path
 from typing import Optional
@@ -93,40 +92,12 @@ class Trainer:
         self.epoch = 0
         self.global_step = 0
         self.best_loss = float("inf")
-        self.residual_tanh_scale = self._resolve_residual_tanh_scale()
         logger.info(
-            "Residual bounding: tanh_scale=%.4f, zero_outside_mask=%s",
-            self.residual_tanh_scale,
+            "AI bounding: ai_min=%.2f, ai_max=%.2f, zero_outside_mask=%s",
+            self.cfg.ai_min,
+            self.cfg.ai_max,
             self.cfg.zero_residual_outside_mask,
         )
-
-    def _resolve_residual_tanh_scale(self) -> float:
-        """解析对数残差上界。
-
-        若配置中显式给出 ``residual_tanh_scale``，则直接使用。
-        否则根据有效区 LMF 上限和 ``residual_max_ai_offset`` 自动换算：
-
-        ``scale = log((lmf_upper + offset) / lmf_upper)``.
-        """
-        if self.cfg.residual_tanh_scale is not None:
-            return float(self.cfg.residual_tanh_scale)
-
-        lmf_upper = float(self.dataset.lmf_scale)
-        if lmf_upper <= 0.0:
-            raise ValueError(f"LMF upper bound must be positive to auto-compute tanh scale, got {lmf_upper}.")
-
-        offset = float(self.cfg.residual_max_ai_offset)
-        target_ai_upper = lmf_upper + offset
-        scale = math.log(target_ai_upper / lmf_upper)
-
-        logger.info(
-            "Auto residual tanh scale from LMF upper bound: lmf_upper=%.2f, ai_offset=%.2f, target_ai_upper=%.2f, tanh_scale=%.4f",
-            lmf_upper,
-            offset,
-            target_ai_upper,
-            scale,
-        )
-        return scale
 
     def _compose_impedance(
         self,
@@ -134,16 +105,22 @@ class Trainer:
         lmf_raw: torch.Tensor,
         taper_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """网络输出对数残差并与 LMF 合成阻抗。
+        """网络输出区间有界的对数残差并与 LMF 合成阻抗。
 
         Notes
         -----
-        - 使用 ``scale * tanh(raw)`` 限制对数残差幅度，防止 ``exp`` 放大失控。
+        - 使用 ``sigmoid(raw)`` 将目标层内 AI 严格限制到 ``[ai_min, ai_max]``。
+        - 先由 ``log(ai / lmf_raw)`` 反算有界残差，再在 halo 区通过 taper 平滑收口，
+          使层外阻抗退回到 ``lmf_raw``。
         - 若启用 ``zero_residual_outside_mask``，则用 core+halo taper 将层外残差
           平滑压回 0，避免在目的层边界处形成新的硬切。
         """
         raw_residual = self.model(x)
-        residual = self.residual_tanh_scale * torch.tanh(raw_residual)
+        safe_lmf = torch.clamp(lmf_raw, min=1e-6)
+        residual_lo = torch.log(torch.full_like(safe_lmf, float(self.cfg.ai_min)) / safe_lmf)
+        residual_hi = torch.log(torch.full_like(safe_lmf, float(self.cfg.ai_max)) / safe_lmf)
+        alpha = torch.sigmoid(raw_residual)
+        residual = residual_lo + (residual_hi - residual_lo) * alpha
 
         if self.cfg.zero_residual_outside_mask:
             if taper_weight is None:

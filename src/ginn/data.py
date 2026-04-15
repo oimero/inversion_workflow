@@ -347,6 +347,11 @@ def _build_residual_taper(mask_flat: np.ndarray, halo_samples: int) -> np.ndarra
     return taper
 
 
+def _get_valid_trace_indices(mask_flat: np.ndarray) -> np.ndarray:
+    """返回至少有一个有效采样点的道的展平索引。"""
+    return np.flatnonzero(mask_flat.any(axis=1))
+
+
 def _select_spatial_validation_split(
     valid_indices: np.ndarray,
     *,
@@ -471,48 +476,45 @@ class SeismicTraceDataset(Dataset):
 
     Parameters
     ----------
-    seismic : np.ndarray
-        地震体，shape ``(n_il, n_xl, n_sample)``。
-    lmf : np.ndarray
-        低频模型，shape ``(n_il, n_xl, n_sample)``。
-    mask : np.ndarray
-        布尔掩码，shape ``(n_il, n_xl, n_sample)``。
+    seismic_flat : np.ndarray
+        展平地震数据，shape ``(n_traces, n_sample)``。
+    lmf_flat : np.ndarray
+        展平低频模型，shape ``(n_traces, n_sample)``。
+    mask_flat : np.ndarray
+        展平布尔掩码，shape ``(n_traces, n_sample)``。
+    loss_mask_flat : np.ndarray
+        展平 eroded 损失掩码，shape ``(n_traces, n_sample)``。
+    taper_flat : np.ndarray
+        展平 taper 权重，shape ``(n_traces, n_sample)``。
+    selected_indices : np.ndarray
+        要使用的展平道索引。
+    normalization_stats : tuple[float, float] | None
+        如果提供，使用指定的 ``(seis_rms, lmf_scale)`` 而不是自行估计。
     """
 
     def __init__(
         self,
-        seismic: np.ndarray,
-        lmf: np.ndarray,
-        mask: np.ndarray,
+        seismic_flat: np.ndarray,
+        lmf_flat: np.ndarray,
+        mask_flat: np.ndarray,
+        loss_mask_flat: np.ndarray,
+        taper_flat: np.ndarray,
+        selected_indices: np.ndarray,
         *,
-        mask_erosion_samples: int = 0,
-        selected_flat_indices: np.ndarray | None = None,
         normalization_stats: tuple[float, float] | None = None,
     ) -> None:
-        n_il, n_xl, n_sample = seismic.shape
-        assert lmf.shape == seismic.shape
-        assert mask.shape == seismic.shape
+        n_traces, n_sample = seismic_flat.shape
+        assert lmf_flat.shape == seismic_flat.shape
+        assert mask_flat.shape == seismic_flat.shape
+        assert loss_mask_flat.shape == seismic_flat.shape
+        assert taper_flat.shape == seismic_flat.shape
 
-        mask_flat = mask.reshape(n_il * n_xl, n_sample)
-        loss_mask_flat = _build_eroded_loss_mask(mask_flat, erosion_samples=mask_erosion_samples)
-        taper_flat = _build_residual_taper(mask_flat, halo_samples=mask_erosion_samples)
+        selected_indices = np.asarray(selected_indices, dtype=np.int64).reshape(-1)
+        if selected_indices.size == 0:
+            raise ValueError("selected_indices must contain at least one trace.")
 
-        # 找出掩码中至少有 1 个 True 的道
-        has_valid = mask_flat.any(axis=1)
-        valid_indices = np.flatnonzero(has_valid)
-        if selected_flat_indices is None:
-            selected_indices = valid_indices
-        else:
-            selected_indices = np.asarray(selected_flat_indices, dtype=np.int64).reshape(-1)
-            if selected_indices.size == 0:
-                raise ValueError("selected_flat_indices must contain at least one trace.")
-            if selected_indices.min() < 0 or selected_indices.max() >= n_il * n_xl:
-                raise ValueError("selected_flat_indices contains out-of-range trace indices.")
-            if not np.all(has_valid[selected_indices]):
-                raise ValueError("selected_flat_indices must refer only to traces with at least one valid mask sample.")
-
-        self._seismic_flat = seismic.reshape(n_il * n_xl, n_sample)
-        self._lmf_flat = lmf.reshape(n_il * n_xl, n_sample)
+        self._seismic_flat = seismic_flat
+        self._lmf_flat = lmf_flat
         self._mask_flat = mask_flat
         self._loss_mask_flat = loss_mask_flat
         self._taper_flat = taper_flat
@@ -523,11 +525,9 @@ class SeismicTraceDataset(Dataset):
             selected_seismic = self._seismic_flat[self._valid_indices]
             selected_lmf = self._lmf_flat[self._valid_indices]
 
-            # 归一化统计量仅从当前样本集合中估计，避免 train/val 之间的信息泄漏。
             valid_seis = selected_seismic[selected_mask]
             self._seis_rms = float(np.sqrt(np.mean(valid_seis**2))) + 1e-10
 
-            # LMF 归一化：除以全局绝对最大值（保持正值，避免负数导致反射率除零）
             valid_lmf = selected_lmf[selected_mask]
             self._lmf_scale = float(np.abs(valid_lmf).max()) + 1e-10
         else:
@@ -535,12 +535,11 @@ class SeismicTraceDataset(Dataset):
             self._lmf_scale = float(normalization_stats[1])
 
         logger.info(
-            "Dataset: %d valid traces / %d total, seis_rms=%.4f, lmf_scale=%.2f, mask_erosion_samples=%d",
+            "Dataset: %d selected traces / %d total, seis_rms=%.4f, lmf_scale=%.2f",
             len(self._valid_indices),
-            n_il * n_xl,
+            n_traces,
             self._seis_rms,
             self._lmf_scale,
-            mask_erosion_samples,
         )
 
     def __len__(self) -> int:
@@ -685,14 +684,21 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     if lmf.shape != seismic.shape:
         raise ValueError(f"LMF shape {lmf.shape} does not match seismic shape {seismic.shape}.")
 
-    base_dataset = SeismicTraceDataset(
-        seismic,
-        lmf,
-        mask,
-        mask_erosion_samples=cfg.mask_erosion_samples,
+    # ── 展平并预计算掩码 / taper（只算一次） ──
+    seismic_flat = seismic.reshape(n_il * n_xl, n_sample)
+    lmf_flat = lmf.reshape(n_il * n_xl, n_sample)
+    mask_flat = mask.reshape(n_il * n_xl, n_sample)
+    loss_mask_flat = _build_eroded_loss_mask(mask_flat, erosion_samples=cfg.mask_erosion_samples)
+    taper_flat = _build_residual_taper(mask_flat, halo_samples=cfg.mask_erosion_samples)
+    all_valid_indices = _get_valid_trace_indices(mask_flat)
+    logger.info(
+        "Preprocessed masks: %d valid traces, mask_erosion_samples=%d",
+        all_valid_indices.size,
+        cfg.mask_erosion_samples,
     )
 
-    train_indices = base_dataset.valid_indices
+    # ── 验证集切分 ──
+    train_indices = all_valid_indices
     val_indices: np.ndarray | None = None
     split_metadata: Dict[str, Any] = {
         "mode": "none",
@@ -702,7 +708,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     }
     if cfg.validation_split_mode == "spatial_block" and cfg.validation_fraction > 0.0:
         train_indices, val_indices, split_metadata = _select_spatial_validation_split(
-            base_dataset.valid_indices,
+            all_valid_indices,
             n_il=n_il,
             n_xl=n_xl,
             validation_fraction=cfg.validation_fraction,
@@ -713,30 +719,18 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     else:
         logger.info("Validation split disabled.")
 
-    train_dataset = SeismicTraceDataset(
-        seismic,
-        lmf,
-        mask,
-        mask_erosion_samples=cfg.mask_erosion_samples,
-        selected_flat_indices=train_indices,
-    )
+    # ── 构建数据集（共享预计算的掩码 / taper，不重复计算） ──
+    shared = (seismic_flat, lmf_flat, mask_flat, loss_mask_flat, taper_flat)
+    train_dataset = SeismicTraceDataset(*shared, train_indices)
     train_norm_stats = (train_dataset.seis_rms, train_dataset.lmf_scale)
     val_dataset = None
     if val_indices is not None and val_indices.size > 0:
         val_dataset = SeismicTraceDataset(
-            seismic,
-            lmf,
-            mask,
-            mask_erosion_samples=cfg.mask_erosion_samples,
-            selected_flat_indices=val_indices,
+            *shared, val_indices,
             normalization_stats=train_norm_stats,
         )
     inference_dataset = SeismicTraceDataset(
-        seismic,
-        lmf,
-        mask,
-        mask_erosion_samples=cfg.mask_erosion_samples,
-        selected_flat_indices=base_dataset.valid_indices,
+        *shared, all_valid_indices,
         normalization_stats=train_norm_stats,
     )
 

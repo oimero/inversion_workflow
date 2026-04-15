@@ -111,6 +111,7 @@ class Trainer:
         self.global_step = 0
         self.best_loss = float("inf")
         self.best_epoch = 0
+        self._es_best = float("inf")
         logger.info(
             "AI bounding: ai_min=%.2f, ai_max=%.2f, zero_outside_mask=%s",
             self.cfg.ai_min,
@@ -318,32 +319,39 @@ class Trainer:
                 monitor_value = val_metrics["loss"]
                 monitor_name = "val_loss"
 
-            # 保存最优模型
-            if monitor_value < (self.best_loss - self.cfg.early_stopping_min_delta):
+            # 保存最优模型（任何改善都保存，不受 min_delta 约束）
+            if monitor_value < self.best_loss:
                 self.best_loss = monitor_value
                 self.best_epoch = epoch + 1
-                epochs_without_improvement = 0
                 self.save_checkpoint("best.pt")
                 logger.info("New best model at epoch %d: %s=%.6f", epoch + 1, monitor_name, monitor_value)
-            elif self.val_dataloader is not None and (epoch + 1) >= self.cfg.early_stopping_warmup:
-                epochs_without_improvement += 1
-                logger.info(
-                    "No validation improvement for %d epoch(s) (best %s=%.6f at epoch %d).",
-                    epochs_without_improvement,
-                    monitor_name,
-                    self.best_loss,
-                    self.best_epoch,
-                )
-                if (
-                    self.cfg.early_stopping_patience > 0
-                    and epochs_without_improvement >= self.cfg.early_stopping_patience
-                ):
+
+            # Early stopping（独立跟踪，用 min_delta 判定“有效改善”）
+            if self.val_dataloader is not None and (epoch + 1) >= self.cfg.early_stopping_warmup:
+                if monitor_value < (self._es_best - self.cfg.early_stopping_min_delta):
+                    self._es_best = monitor_value
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
                     logger.info(
-                        "Early stopping triggered at epoch %d after %d stale validation epochs.",
-                        epoch + 1,
+                        "No significant validation improvement for %d epoch(s) "
+                        "(best %s=%.6f at epoch %d, es_ref=%.6f).",
                         epochs_without_improvement,
+                        monitor_name,
+                        self.best_loss,
+                        self.best_epoch,
+                        self._es_best,
                     )
-                    break
+                    if (
+                        self.cfg.early_stopping_patience > 0
+                        and epochs_without_improvement >= self.cfg.early_stopping_patience
+                    ):
+                        logger.info(
+                            "Early stopping triggered at epoch %d after %d stale validation epochs.",
+                            epoch + 1,
+                            epochs_without_improvement,
+                        )
+                        break
 
             # 定期保存
             if (epoch + 1) % self.cfg.save_every == 0:

@@ -42,7 +42,8 @@ class GINNLoss(nn.Module):
         self,
         d_syn: Tensor,
         d_obs: Tensor,
-        mask: Tensor,
+        waveform_mask: Tensor,
+        residual_mask: Tensor,
         residual: Tensor,
     ) -> tuple[Tensor, dict[str, float]]:
         """计算组合损失。
@@ -53,8 +54,10 @@ class GINNLoss(nn.Module):
             合成地震记录，shape ``(B, 1, T)``。
         d_obs : Tensor
             观测地震记录，shape ``(B, 1, T)``。
-        mask : Tensor
-            布尔掩码，shape ``(B, 1, T)``，True 表示有效区域。
+        waveform_mask : Tensor
+            波形误差掩码，shape ``(B, 1, T)``，True 表示参与 waveform loss 的区域。
+        residual_mask : Tensor
+            残差正则掩码，shape ``(B, 1, T)``，True 表示参与 residual L2 的区域。
         residual : Tensor
             网络输出的阻抗残差 Δ，shape ``(B, 1, T)``。
 
@@ -65,14 +68,16 @@ class GINNLoss(nn.Module):
         loss_dict : dict
             包含各分项的浮点值，用于日志记录。
         """
-        mask_f = mask.float()
-        n_valid = mask_f.sum().clamp(min=1.0)
+        waveform_mask_f = waveform_mask.float()
+        residual_mask_f = residual_mask.float()
+        n_waveform_valid = waveform_mask_f.sum().clamp(min=1.0)
+        n_residual_valid = residual_mask_f.sum().clamp(min=1.0)
 
         # 波形 MAE
-        waveform_mae = ((d_syn - d_obs).abs() * mask_f).sum() / n_valid
+        waveform_mae = ((d_syn - d_obs).abs() * waveform_mask_f).sum() / n_waveform_valid
 
         # 残差 L2 正则化（仅在掩码区域内）
-        residual_l2 = (residual.pow(2) * mask_f).sum() / n_valid
+        residual_l2 = (residual.pow(2) * residual_mask_f).sum() / n_residual_valid
 
         # 总损失
         total_loss = waveform_mae + self.lambda_reg * residual_l2

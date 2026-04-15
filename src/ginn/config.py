@@ -73,13 +73,13 @@ class GINNConfig:
     lambda_reg: float = 0.1  # 残差 L2 正则化权重（防止尺度发散）
     residual_tanh_scale: float | None = None  # 若为空，则按 LMF 上限 + offset 自动换算
     residual_max_ai_offset: float = 8000.0  # 允许 AI 相对 LMF 上限额外抬升的绝对量
-    zero_residual_outside_mask: bool = True  # 将目的层外残差钳回 0，避免层外失控污染层内
+    zero_residual_outside_mask: bool = True  # 用 core+halo taper 将层外残差平滑压回 0
     device: str = "cuda"
     num_workers: int = 0  # Windows 下大数组无法 pickle，设 0
     pin_memory: bool = True
 
     # ── 掩码 ──────────────────────────────────────────────────
-    # mask_erosion_samples: int = 30  # 掩码边界收缩采样点数（实际间距最小 69ms，安全上限 ~34）
+    mask_erosion_samples: int = 30  # 同时用于 loss mask 收缩与 residual halo/taper 宽度
 
     # ── 输出 ──────────────────────────────────────────────────
     checkpoint_dir: Path = Path("checkpoints")
@@ -111,6 +111,8 @@ class GINNConfig:
             raise ValueError(f"residual_tanh_scale must be positive when provided, got {self.residual_tanh_scale}.")
         if self.residual_max_ai_offset <= 0.0:
             raise ValueError(f"residual_max_ai_offset must be positive, got {self.residual_max_ai_offset}.")
+        if self.mask_erosion_samples < 0:
+            raise ValueError(f"mask_erosion_samples must be non-negative, got {self.mask_erosion_samples}.")
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "GINNConfig":

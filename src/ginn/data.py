@@ -248,7 +248,87 @@ def estimate_wavelet_gain(
 #  层位掩码
 # ═══════════════════════════════════════════════════════════════
 
-# TODO：待提取为单独函数
+
+def _resolve_mask_bounds(mask_flat: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """从逐道布尔掩码解析 core 区间的起止采样点。
+
+    Notes
+    -----
+    当前目的层 mask 由 top/bottom horizon 构造，按设计每条有效道只包含一个
+    连续区间。这里利用该性质为所有道一次性解析边界，用于后续 erosion 与 halo。
+    """
+    if mask_flat.ndim != 2:
+        raise ValueError(f"mask_flat must be a 2D array, got shape={mask_flat.shape}.")
+
+    n_trace, n_sample = mask_flat.shape
+    has_valid = mask_flat.any(axis=1)
+    start = np.zeros(n_trace, dtype=np.int64)
+    end = np.zeros(n_trace, dtype=np.int64)
+
+    if np.any(has_valid):
+        valid_mask = mask_flat[has_valid]
+        start[has_valid] = np.argmax(valid_mask, axis=1)
+        end[has_valid] = n_sample - np.argmax(valid_mask[:, ::-1], axis=1)
+
+    return start, end, has_valid  # type: ignore
+
+
+def _build_eroded_loss_mask(mask_flat: np.ndarray, erosion_samples: int) -> np.ndarray:
+    """基于 core mask 构造用于 waveform loss 的内缩掩码。"""
+    start, end, has_valid = _resolve_mask_bounds(mask_flat)
+    n_sample = mask_flat.shape[1]
+    sample_index = np.arange(n_sample, dtype=np.int64)[np.newaxis, :]
+    lengths = end - start
+
+    # 对过薄层段自动减小 erosion，至少保留 1 个采样点，避免整条道 loss 失效。
+    erosion = np.minimum(int(erosion_samples), np.maximum((lengths - 1) // 2, 0))
+    loss_start = start + erosion
+    loss_end = end - erosion
+
+    return (
+        has_valid[:, np.newaxis]
+        & (sample_index >= loss_start[:, np.newaxis])
+        & (sample_index < loss_end[:, np.newaxis])
+    )
+
+
+def _build_residual_taper(mask_flat: np.ndarray, halo_samples: int) -> np.ndarray:
+    """为 residual 构造 core+halo 支撑区的平滑 taper 权重。"""
+    start, end, has_valid = _resolve_mask_bounds(mask_flat)
+    n_sample = mask_flat.shape[1]
+    sample_index = np.arange(n_sample, dtype=np.int64)[np.newaxis, :]
+    halo = int(halo_samples)
+
+    support_start = np.maximum(start - halo, 0)
+    support_end = np.minimum(end + halo, n_sample)
+
+    core_region = (
+        has_valid[:, np.newaxis] & (sample_index >= start[:, np.newaxis]) & (sample_index < end[:, np.newaxis])
+    )
+    left_region = (
+        has_valid[:, np.newaxis]
+        & (sample_index >= support_start[:, np.newaxis])
+        & (sample_index < start[:, np.newaxis])
+    )
+    right_region = (
+        has_valid[:, np.newaxis] & (sample_index >= end[:, np.newaxis]) & (sample_index < support_end[:, np.newaxis])
+    )
+
+    taper = np.zeros(mask_flat.shape, dtype=np.float32)
+    taper[core_region] = 1.0
+
+    if halo > 0:
+        left_denom = (start - support_start + 1).astype(np.float32)[:, np.newaxis]
+        right_denom = (support_end - end + 1).astype(np.float32)[:, np.newaxis]
+
+        left_weight = (sample_index - support_start[:, np.newaxis] + 1).astype(np.float32) / left_denom
+        right_weight = (support_end[:, np.newaxis] - sample_index).astype(np.float32) / right_denom
+
+        taper[left_region] = left_weight[left_region]
+        taper[right_region] = right_weight[right_region]
+
+    return taper
+
 
 # ═══════════════════════════════════════════════════════════════
 #  PyTorch Dataset
@@ -261,7 +341,9 @@ class SeismicTraceDataset(Dataset):
     每个 item 包含：
     - ``input``：(2, n_sample) — 归一化地震道 + 归一化 LMF
     - ``obs``：(1, n_sample) — 归一化观测地震道（用于损失计算）
-    - ``mask``：(1, n_sample) — 布尔掩码
+    - ``mask``：(1, n_sample) — core 布尔掩码（与旧接口兼容）
+    - ``loss_mask``：(1, n_sample) — eroded core 掩码，仅用于 waveform loss
+    - ``taper_weight``：(1, n_sample) — core+halo 平滑权重，用于 residual 收口
     - ``lmf_raw``：(1, n_sample) — 原始 LMF（用于正演时恢复阻抗）
 
     Parameters
@@ -279,18 +361,26 @@ class SeismicTraceDataset(Dataset):
         seismic: np.ndarray,
         lmf: np.ndarray,
         mask: np.ndarray,
+        *,
+        mask_erosion_samples: int = 0,
     ) -> None:
         n_il, n_xl, n_sample = seismic.shape
         assert lmf.shape == seismic.shape
         assert mask.shape == seismic.shape
 
+        mask_flat = mask.reshape(n_il * n_xl, n_sample)
+        loss_mask_flat = _build_eroded_loss_mask(mask_flat, erosion_samples=mask_erosion_samples)
+        taper_flat = _build_residual_taper(mask_flat, halo_samples=mask_erosion_samples)
+
         # 找出掩码中至少有 1 个 True 的道
-        has_valid = mask.reshape(n_il * n_xl, n_sample).any(axis=1)
+        has_valid = mask_flat.any(axis=1)
         valid_indices = np.flatnonzero(has_valid)
 
         self._seismic_flat = seismic.reshape(n_il * n_xl, n_sample)
         self._lmf_flat = lmf.reshape(n_il * n_xl, n_sample)
-        self._mask_flat = mask.reshape(n_il * n_xl, n_sample)
+        self._mask_flat = mask_flat
+        self._loss_mask_flat = loss_mask_flat
+        self._taper_flat = taper_flat
         self._valid_indices = valid_indices
 
         # 全局归一化统计量（仅在有效掩码区域内计算）
@@ -302,11 +392,12 @@ class SeismicTraceDataset(Dataset):
         self._lmf_scale = float(np.abs(valid_lmf).max()) + 1e-10
 
         logger.info(
-            "Dataset: %d valid traces / %d total, seis_rms=%.4f, lmf_scale=%.2f",
+            "Dataset: %d valid traces / %d total, seis_rms=%.4f, lmf_scale=%.2f, mask_erosion_samples=%d",
             len(valid_indices),
             n_il * n_xl,
             self._seis_rms,
             self._lmf_scale,
+            mask_erosion_samples,
         )
 
     def __len__(self) -> int:
@@ -327,7 +418,9 @@ class SeismicTraceDataset(Dataset):
 
         seis = self._seismic_flat[flat_idx].copy()  # (n_sample,)
         lmf = self._lmf_flat[flat_idx].copy()  # (n_sample,)
-        m = self._mask_flat[flat_idx].copy()  # (n_sample,)
+        core_mask = self._mask_flat[flat_idx].copy()  # (n_sample,)
+        loss_mask = self._loss_mask_flat[flat_idx].copy()  # (n_sample,)
+        taper_weight = self._taper_flat[flat_idx].copy()  # (n_sample,)
 
         # 保留 LMF 原始量纲用于物理正演
         lmf_raw = lmf.copy()
@@ -342,7 +435,9 @@ class SeismicTraceDataset(Dataset):
         return {
             "input": torch.from_numpy(x).float(),  # (2, n_sample)
             "obs": torch.from_numpy(seis_norm[np.newaxis]).float(),  # (1, n_sample)
-            "mask": torch.from_numpy(m[np.newaxis]).bool(),  # (1, n_sample)
+            "mask": torch.from_numpy(core_mask[np.newaxis]).bool(),  # (1, n_sample)
+            "loss_mask": torch.from_numpy(loss_mask[np.newaxis]).bool(),  # (1, n_sample)
+            "taper_weight": torch.from_numpy(taper_weight[np.newaxis]).float(),  # (1, n_sample)
             "lmf_raw": torch.from_numpy(lmf_raw[np.newaxis]).float(),  # (1, n_sample)
         }
 
@@ -449,7 +544,12 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
     if lmf.shape != seismic.shape:
         raise ValueError(f"LMF shape {lmf.shape} does not match seismic shape {seismic.shape}.")
 
-    dataset = SeismicTraceDataset(seismic, lmf, mask)
+    dataset = SeismicTraceDataset(
+        seismic,
+        lmf,
+        mask,
+        mask_erosion_samples=cfg.mask_erosion_samples,
+    )
 
     logger.info("Generating wavelet...")
     resolved_wavelet_gain = cfg.wavelet_gain

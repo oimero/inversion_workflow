@@ -132,23 +132,23 @@ class Trainer:
         self,
         x: torch.Tensor,
         lmf_raw: torch.Tensor,
-        mask: torch.Tensor | None = None,
+        taper_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """网络输出对数残差并与 LMF 合成阻抗。
 
         Notes
         -----
         - 使用 ``scale * tanh(raw)`` 限制对数残差幅度，防止 ``exp`` 放大失控。
-        - 若启用 ``zero_residual_outside_mask``，则将目的层外残差压回 0，
-          使层外阻抗退回到 ``lmf_raw``。
+        - 若启用 ``zero_residual_outside_mask``，则用 core+halo taper 将层外残差
+          平滑压回 0，避免在目的层边界处形成新的硬切。
         """
         raw_residual = self.model(x)
         residual = self.residual_tanh_scale * torch.tanh(raw_residual)
 
         if self.cfg.zero_residual_outside_mask:
-            if mask is None:
-                raise ValueError("Mask is required when zero_residual_outside_mask is enabled.")
-            residual = residual * mask.to(dtype=residual.dtype)
+            if taper_weight is None:
+                raise ValueError("taper_weight is required when zero_residual_outside_mask is enabled.")
+            residual = residual * taper_weight.to(dtype=residual.dtype)
 
         ai = lmf_raw * torch.exp(residual)
         return ai, residual
@@ -162,17 +162,19 @@ class Trainer:
         for batch_idx, batch in enumerate(self.dataloader):
             x = batch["input"].to(self.device)  # (B, 2, T)
             d_obs = batch["obs"].to(self.device)  # (B, 1, T)
-            mask = batch["mask"].to(self.device)  # (B, 1, T)
+            core_mask = batch["mask"].to(self.device)  # (B, 1, T)
+            loss_mask = batch["loss_mask"].to(self.device)  # (B, 1, T)
+            taper_weight = batch["taper_weight"].to(self.device)  # (B, 1, T)
             lmf_raw = batch["lmf_raw"].to(self.device)  # (B, 1, T)
 
             # 1. 网络前向 + 阻抗合成
-            ai, residual = self._compose_impedance(x, lmf_raw, mask)
+            ai, residual = self._compose_impedance(x, lmf_raw, taper_weight)
 
             # 2. 物理正演
             d_syn = self.forward_model(ai)  # (B, 1, T)
 
             # 3. 损失
-            loss, loss_dict = self.criterion(d_syn, d_obs, mask, residual)
+            loss, loss_dict = self.criterion(d_syn, d_obs, loss_mask, core_mask, residual)
 
             # 4. 反向传播
             self.optimizer.zero_grad()
@@ -308,9 +310,9 @@ class Trainer:
         for batch in full_loader:
             x = batch["input"].to(self.device)
             lmf_raw = batch["lmf_raw"].to(self.device)
-            mask = batch["mask"].to(self.device)
+            taper_weight = batch["taper_weight"].to(self.device)
 
-            ai, _ = self._compose_impedance(x, lmf_raw, mask)
+            ai, _ = self._compose_impedance(x, lmf_raw, taper_weight)
 
             predictions.append(ai.squeeze(1).cpu().numpy())
 

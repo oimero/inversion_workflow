@@ -75,6 +75,7 @@ class GINNConfig:
 
     # ── 损失与物理约束 ────────────────────────────────────────
     lambda_reg: float = 0.1  # 残差 L2 正则化权重，约束阻抗尺度不要漂移。
+    lambda_tv: float = 0.0  # 残差 TV 正则化权重，抑制目标层边界附近的高频 ringing。
     ai_min: float = 4000.0  # 目标层内允许的波阻抗下界。
     ai_max: float = 20000.0  # 目标层内允许的波阻抗上界。
     zero_residual_outside_mask: bool = True  # 是否将层外残差通过 taper 平滑压回 0。
@@ -130,6 +131,8 @@ class GINNConfig:
             raise ValueError(f"wavelet_gain must be positive when provided, got {self.wavelet_gain}.")
         if self.wavelet_gain_num_traces <= 0:
             raise ValueError(f"wavelet_gain_num_traces must be positive, got {self.wavelet_gain_num_traces}.")
+        if self.lambda_tv < 0.0:
+            raise ValueError(f"lambda_tv must be non-negative, got {self.lambda_tv}.")
         if self.ai_min <= 0.0:
             raise ValueError(f"ai_min must be positive, got {self.ai_min}.")
         if self.ai_max <= self.ai_min:

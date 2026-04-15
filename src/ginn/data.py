@@ -484,11 +484,6 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
             f"volume={(n_il, n_xl, n_sample)}, geometry={(geometry_n_il, geometry_n_xl, geometry_n_sample)}"
         )
 
-    # 在这里实例化 TargetLayer 对象，顺便输出一个层位解释的三维布尔体
-    # TODO：理论上，低频模型应该由 TargetLayer 构建
-    # 然后将 TargetLayer 跑出来的低频模型跑一遍确定性反演
-    # 再将这个反演体作为网络的输入
-
     logger.info("Loading and interpolating top/bottom interpretation horizons...")
     top_df_raw = import_interpretation_petrel(cfg.top_horizon_file)
     bot_df_raw = import_interpretation_petrel(cfg.bot_horizon_file)

@@ -71,9 +71,9 @@ class GINNConfig:
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     lambda_reg: float = 0.1  # 残差 L2 正则化权重（防止尺度发散）
-    ai_min: float = 4000.0  # 目标层内允许的 AI 下界
-    ai_max: float = 20000.0  # 目标层内允许的 AI 上界
-    zero_residual_outside_mask: bool = True  # 用 core+halo taper 将层外残差平滑压回 0
+    ai_min: float = 4000.0  # 目标层内允许的波阻抗下界
+    ai_max: float = 20000.0  # 目标层内允许的波阻抗上界
+    zero_residual_outside_mask: bool = True  # 将层外残差平滑压回 0
     device: str = "cuda"
     num_workers: int = 0  # Windows 下大数组无法 pickle，设 0
     pin_memory: bool = True

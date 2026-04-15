@@ -490,7 +490,7 @@ def build_lfm_time_model(
     nugget: float = 0.0,
     filter_cutoff_hz: float = 10.0,
     filter_order: int = 5,
-    post_slice_smoothing: bool = True,
+    post_slice_smoothing: bool = False,
 ) -> LfmTimeModelResult:
     """构建时间域层位约束低频模型。
 

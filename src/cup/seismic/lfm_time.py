@@ -41,6 +41,8 @@ from wtie.processing import grid
 from wtie.processing.spectral import apply_butter_lowpass_filter
 
 POST_SLICE_SMOOTHING_KERNEL = np.asarray([0.1, 0.2, 0.4, 0.2, 0.1], dtype=float)
+DEFAULT_FILTER_BUFFER_CYCLES = 2.0
+VALID_FILTER_BUFFER_MODES = {"reflect", "edge"}
 
 
 @dataclass
@@ -241,6 +243,8 @@ def lowpass_twt_log(
     log: grid.Log,
     cutoff_hz: float = 10.0,
     order: int = 5,
+    buffer_seconds: Optional[float] = None,
+    buffer_mode: str = "reflect",
 ) -> grid.Log:
     """对 TWT 域单条曲线执行 Butterworth 低通滤波。
 
@@ -252,6 +256,13 @@ def lowpass_twt_log(
         低通截止频率，单位 Hz。
     order : int, default=5
         滤波器阶数。启用零相位滤波时，内部会按当前实现调用双向滤波。
+    buffer_seconds : float, optional
+        滤波前在曲线两端附加的缓冲时长，单位 s。若未提供，则按
+        ``DEFAULT_FILTER_BUFFER_CYCLES / cutoff_hz`` 自动估算，并限制在
+        曲线长度允许的范围内。
+    buffer_mode : {"reflect", "edge"}, default="reflect"
+        生成缓冲样本的方式。``reflect`` 适合减弱端点突变带来的边界效应，
+        ``edge`` 则使用端点常值外延。
 
     Returns
     -------
@@ -265,19 +276,52 @@ def lowpass_twt_log(
     """
     if not log.is_twt:
         raise ValueError("lowpass_twt_log only supports TWT-domain logs.")
+    if buffer_mode not in VALID_FILTER_BUFFER_MODES:
+        raise ValueError(
+            f"buffer_mode must be one of {sorted(VALID_FILTER_BUFFER_MODES)}, got {buffer_mode!r}."
+        )
 
     fs = 1.0 / log.sampling_rate
     nyquist = 0.5 * fs
     if cutoff_hz <= 0.0 or cutoff_hz >= nyquist:
         raise ValueError(f"cutoff_hz must be within (0, {nyquist}), got {cutoff_hz}.")
 
+    values = log.values.astype(np.float64)
+    if values.size <= 1:
+        return grid.Log(
+            values.copy(),
+            log.basis.copy(),
+            "twt",
+            name=log.name,
+            unit=getattr(log, "unit", None),
+        )
+
+    dt = float(log.sampling_rate)
+    resolved_buffer_seconds = (
+        max(DEFAULT_FILTER_BUFFER_CYCLES / cutoff_hz, 3.0 * order * dt)
+        if buffer_seconds is None
+        else float(buffer_seconds)
+    )
+    if resolved_buffer_seconds < 0.0:
+        raise ValueError(f"buffer_seconds must be non-negative when provided, got {buffer_seconds}.")
+
+    pad_samples = int(np.ceil(resolved_buffer_seconds / dt))
+    pad_samples = min(max(pad_samples, 0), values.size - 1)
+    values_to_filter = (
+        np.pad(values, (pad_samples, pad_samples), mode=buffer_mode)
+        if pad_samples > 0
+        else values
+    )
+
     filtered = apply_butter_lowpass_filter(
-        log.values.astype(np.float64),
+        values_to_filter,
         highcut=cutoff_hz,
         fs=fs,
         order=order,
         zero_phase=True,
     )
+    if pad_samples > 0:
+        filtered = filtered[pad_samples : pad_samples + values.size]
     return grid.Log(
         filtered.astype(np.float64),
         log.basis.copy(),
@@ -359,6 +403,8 @@ def _prepare_well(
     dt: float,
     filter_cutoff_hz: float,
     filter_order: int,
+    filter_buffer_seconds: Optional[float],
+    filter_buffer_mode: str,
 ) -> _PreparedLfmTimeWell:
     inline, xline = _resolve_well_position(well, survey)
     horizon_times = target_layer.get_interpretation_values_at_location(inline, xline)
@@ -380,6 +426,8 @@ def _prepare_well(
         property_log_twt,
         cutoff_hz=filter_cutoff_hz,
         order=filter_order,
+        buffer_seconds=filter_buffer_seconds,
+        buffer_mode=filter_buffer_mode,
     )
     metadata = {} if well.metadata is None else dict(well.metadata)
     return _PreparedLfmTimeWell(
@@ -490,6 +538,8 @@ def build_lfm_time_model(
     nugget: float = 0.0,
     filter_cutoff_hz: float = 10.0,
     filter_order: int = 5,
+    filter_buffer_seconds: Optional[float] = None,
+    filter_buffer_mode: str = "reflect",
     post_slice_smoothing: bool = False,
 ) -> LfmTimeModelResult:
     """构建时间域层位约束低频模型。
@@ -515,6 +565,10 @@ def build_lfm_time_model(
         井曲线转换到 TWT 域后的低通滤波截止频率。
     filter_order : int, default=5
         井曲线低通滤波阶数。
+    filter_buffer_seconds : float, optional
+        滤波前在井曲线上下两端附加的缓冲时长，单位 s。默认按截止频率自动估算。
+    filter_buffer_mode : {"reflect", "edge"}, default="reflect"
+        曲线两端缓冲样本的生成方式。
     post_slice_smoothing : bool, default=True
         是否对各层段的比例切片结果沿 slice 维做轻度平滑。
 
@@ -560,6 +614,8 @@ def build_lfm_time_model(
             dt,
             filter_cutoff_hz=float(filter_cutoff_hz),
             filter_order=int(filter_order),
+            filter_buffer_seconds=filter_buffer_seconds,
+            filter_buffer_mode=str(filter_buffer_mode),
         )
         for well in wells
     ]
@@ -729,6 +785,8 @@ def build_lfm_time_model(
         "n_slices": int(n_slices),
         "filter_cutoff_hz": float(filter_cutoff_hz),
         "filter_order": int(filter_order),
+        "filter_buffer_seconds": None if filter_buffer_seconds is None else float(filter_buffer_seconds),
+        "filter_buffer_mode": str(filter_buffer_mode),
         "coord_system": "inline_xline",
         "horizon_names": list(target_layer.horizon_names),
         "zone_names": [list(zone) for zone in target_layer.iter_zones()],

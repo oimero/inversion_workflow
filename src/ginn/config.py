@@ -14,10 +14,10 @@ ValidationBlockAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"
 
 _PATH_FIELDS = {
     "seismic_file",
-    "inversion_file",
     "top_horizon_file",
     "bot_horizon_file",
     "precomputed_lmf_file",
+    "lmf_reference_impedance_file",
     "checkpoint_dir",
 }
 
@@ -30,70 +30,72 @@ class GINNConfig:
     """
 
     # ── 数据路径 ──────────────────────────────────────────────
-    seismic_file: Path = Path("data/raw/mero se 0116_1ms_new_84_coord.Sgy")
-    inversion_file: Path = Path("data/raw/inverted_Zp.sgy")
-    top_horizon_file: Path = Path("data/interpre_time/bve_top_t")
-    bot_horizon_file: Path = Path("data/interpre_time/itp_bot_t")
+    seismic_file: Path = Path("data/raw/mero se 0116_1ms_new_84_coord.Sgy")  # 输入地震体路径。
+    top_horizon_file: Path = Path("data/interpre_time/bve_top_t")  # 目标层顶界解释面路径。
+    bot_horizon_file: Path = Path("data/interpre_time/itp_bot_t")  # 目标层底界解释面路径。
 
     # ── 地震几何（SEG-Y 头字节位置与步长，与 notebook 一致） ──
-    segy_iline: int = 5
-    segy_xline: int = 21
-    segy_istep: int = 1
-    segy_xstep: int = 4
+    segy_iline: int = 5  # inline 头字节位置。
+    segy_xline: int = 21  # xline 头字节位置。
+    segy_istep: int = 1  # inline 抽样步长。
+    segy_xstep: int = 4  # xline 抽样步长。
 
     # ── 采样参数 ──────────────────────────────────────────────
-    dt: float = 0.001  # 采样间隔 (s)
+    dt: float = 0.001  # 体数据采样间隔（秒）。
 
     # ── 子波 ──────────────────────────────────────────────────
-    wavelet_type: str = "ricker"
-    wavelet_freq: float = 25.0  # Hz
-    wavelet_dt: float = 0.001  # s
-    wavelet_length: int = 101  # 采样点数（奇数，中心对称）
-    wavelet_gain: float | None = None  # 若为空，则按样本道自动估计
-    wavelet_gain_num_traces: int = 256  # 自动估计 wavelet_gain 时采样的有效道数
+    wavelet_type: str = "ricker"  # 正演使用的子波类型。
+    wavelet_freq: float = 25.0  # 子波主频（Hz）。
+    wavelet_dt: float = 0.001  # 子波采样间隔（秒）。
+    wavelet_length: int = 101  # 子波长度（采样点数，建议奇数）。
+    wavelet_gain: float | None = None  # 子波增益；为空时根据样本道自动估计。
+    wavelet_gain_num_traces: int = 256  # 自动估计子波增益时采样的有效道数。
 
     # ── 低频模型 ──────────────────────────────────────────────
-    lmf_source: LmfSource = "filtered_inversion_lmf"
-    precomputed_lmf_file: Path = Path("data/output_lfm_time_from_wtie/lfm_time_from_wtie.npz")
-    lmf_cutoff_hz: float = 10.0  # Butterworth 低通截止频率 (Hz)
-    lmf_filter_order: int = 6  # 零相位滤波器阶数
+    lmf_source: LmfSource = "filtered_inversion_lmf"  # 低频模型来源：预计算结果或对阻抗体低通。
+    precomputed_lmf_file: Path = Path("data/output_lfm_time_from_wtie/lfm_time_from_wtie.npz")  # 预计算 LMF 文件。
+    lmf_reference_impedance_file: Path = Path("data/raw/inverted_Zp.sgy")  # 生成 filtered_inversion_lmf 时使用的阻抗体。
+    lmf_cutoff_hz: float = 10.0  # 生成 LMF 时的 Butterworth 低通截止频率（Hz）。
+    lmf_filter_order: int = 6  # 生成 LMF 时的零相位滤波器阶数。
 
-    # ── 网络 ──────────────────────────────────────────────────
-    in_channels: int = 2  # 地震 + LMF
-    hidden_channels: int = 64
-    out_channels: int = 1
-    num_res_blocks: int = 8
-    dilations: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
-    kernel_size: int = 3
+    # ── 网络结构 ──────────────────────────────────────────────
+    in_channels: int = 2  # 网络输入通道数，默认是地震 + LMF。
+    hidden_channels: int = 64  # 残差块内部的隐藏通道数。
+    out_channels: int = 1  # 网络输出通道数，对应阻抗残差。
+    num_res_blocks: int = 8  # 残差块数量。
+    dilations: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)  # 各残差块的 dilation 序列。
+    kernel_size: int = 3  # 一维卷积核大小。
 
-    # ── 训练 ──────────────────────────────────────────────────
-    batch_size: int = 16
-    epochs: int = 50
-    lr: float = 1e-3
-    weight_decay: float = 1e-4
-    grad_clip: float = 1.0
-    lambda_reg: float = 0.1  # 残差 L2 正则化权重（防止尺度发散）
-    ai_min: float = 4000.0  # 目标层内允许的波阻抗下界
-    ai_max: float = 20000.0  # 目标层内允许的波阻抗上界
-    zero_residual_outside_mask: bool = True  # 将层外残差平滑压回 0
-    device: str = "cuda"
-    num_workers: int = 0  # Windows 下大数组无法 pickle，设 0
-    pin_memory: bool = True
-    validation_split_mode: ValidationSplitMode = "spatial_block"
-    validation_fraction: float = 0.10
-    validation_gap_traces: int = 8
-    validation_block_anchor: ValidationBlockAnchor = "maxmax"
-    early_stopping_patience: int = 8
-    early_stopping_min_delta: float = 1e-4
-    early_stopping_warmup: int = 5
+    # ── 优化与训练循环 ────────────────────────────────────────
+    batch_size: int = 16  # 每个 batch 的道数。
+    epochs: int = 50  # 最大训练轮数。
+    lr: float = 1e-3  # Adam 初始学习率。
+    weight_decay: float = 1e-4  # Adam 权重衰减系数。
+    grad_clip: float = 1.0  # 梯度裁剪阈值。
 
-    # ── 掩码 ──────────────────────────────────────────────────
-    mask_erosion_samples: int = 30  # 同时用于 loss mask 收缩与 residual halo/taper 宽度
+    # ── 损失与物理约束 ────────────────────────────────────────
+    lambda_reg: float = 0.1  # 残差 L2 正则化权重，约束阻抗尺度不要漂移。
+    ai_min: float = 4000.0  # 目标层内允许的波阻抗下界。
+    ai_max: float = 20000.0  # 目标层内允许的波阻抗上界。
+    zero_residual_outside_mask: bool = True  # 是否将层外残差通过 taper 平滑压回 0。
+    mask_erosion_samples: int = 30  # 同时用于 waveform loss 内缩和 residual halo 宽度。
 
-    # ── 输出 ──────────────────────────────────────────────────
-    checkpoint_dir: Path = Path("checkpoints")
-    log_interval: int = 50  # 每 N 个 batch 打印一次
-    save_every: int = 5  # 每 N 个 epoch 保存 checkpoint
+    # ── 验证与早停 ────────────────────────────────────────────
+    validation_split_mode: ValidationSplitMode = "spatial_block"  # 验证集切分方式。
+    validation_fraction: float = 0.10  # 验证集目标占比。
+    validation_gap_traces: int = 8  # 训练区与验证区之间保留的空间缓冲带宽度（道数）。
+    validation_block_anchor: ValidationBlockAnchor = "maxmin"  # 验证块落在工区哪个角/位置。
+    early_stopping_patience: int = 8  # 连续多少个 epoch 无显著改善后停止训练。
+    early_stopping_min_delta: float = 1e-4  # 视为“显著改善”的最小 val_loss 降幅。
+    early_stopping_warmup: int = 5  # 早停开始生效前至少先训练的 epoch 数。
+
+    # ── 运行时与输出 ──────────────────────────────────────────
+    device: str = "cuda"  # 首选训练设备；若 CUDA 不可用会自动回退到 CPU。
+    num_workers: int = 0  # DataLoader worker 数；Windows 下默认 0 更稳妥。
+    pin_memory: bool = True  # CUDA 训练时是否启用 pinned memory。
+    checkpoint_dir: Path = Path("checkpoints")  # checkpoint 输出目录。
+    log_interval: int = 50  # 每隔多少个训练 batch 打一次日志。
+    save_every: int = 5  # 每隔多少个 epoch 额外保存一次常规 checkpoint。
 
     def __post_init__(self) -> None:
         for field_name in _PATH_FIELDS:

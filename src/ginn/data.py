@@ -347,6 +347,11 @@ def _build_residual_taper(mask_flat: np.ndarray, halo_samples: int) -> np.ndarra
     return taper
 
 
+# ═══════════════════════════════════════════════════════════════
+#  训练集/验证集切分
+# ═══════════════════════════════════════════════════════════════
+
+
 def _get_valid_trace_indices(mask_flat: np.ndarray) -> np.ndarray:
     """返回至少有一个有效采样点的道的展平索引。"""
     return np.flatnonzero(mask_flat.any(axis=1))
@@ -662,7 +667,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     elif cfg.lmf_source == "filtered_inversion_lmf":
         logger.info("Loading inversion volume...")
         inversion = import_seismic(
-            cfg.inversion_file,
+            cfg.lmf_reference_impedance_file,
             seismic_type="segy",
         )
         if inversion.shape != seismic.shape:

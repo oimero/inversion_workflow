@@ -1,4 +1,31 @@
-"""时间域层位约束低频模型构建。"""
+"""cup.seismic.lfm_time: 时间域层位约束低频模型构建。
+
+本模块提供基于层位解释、井曲线与时深关系的时间域低频模型构建能力，
+包括井曲线预处理、按层段比例切片采样、二维切片插值以及结果体封装。
+
+边界说明
+--------
+- 本模块不负责层位解释文件读取、测井提取或地震体加载。
+- 本模块仅支持 ``TargetLayer.geometry['sample_domain'] == 'time'`` 的场景。
+- 井曲线若为 MD 域，可借助时深表与井轨迹转换到 TWT 域；TVDSS 域曲线当前不支持直接输入。
+
+核心公开对象
+------------
+1. LfmTimeWell: 单井低频模型输入描述。
+2. LfmTimeModelResult: 低频模型体、方差体与覆盖统计的结果封装。
+3. lowpass_twt_log: 对 TWT 域单条曲线执行低通滤波。
+4. build_lfm_time_model: 基于层位约束与井点控制构建时间域低频模型。
+
+Examples
+--------
+>>> import numpy as np
+>>> from cup.seismic.lfm_time import LfmTimeWell, lowpass_twt_log
+>>> from wtie.processing import grid
+>>> twt_log = grid.Log(np.array([10., 20., 30.]), np.array([1.0, 1.5, 2.0]), "twt", name="AI")
+>>> filtered = lowpass_twt_log(twt_log, cutoff_hz=0.4, order=3)
+>>> filtered.is_twt
+True
+"""
 
 from __future__ import annotations
 
@@ -18,7 +45,28 @@ POST_SLICE_SMOOTHING_KERNEL = np.asarray([0.1, 0.2, 0.4, 0.2, 0.1], dtype=float)
 
 @dataclass
 class LfmTimeWell:
-    """单井时间域低频模型输入。"""
+    """单井时间域低频模型输入。
+
+    Parameters
+    ----------
+    well_name : str
+        井名或井标识。
+    property_name : str
+        当前井参与建模的属性名称，例如 ``"AI"``、``"Vp"``。
+    property_log : grid.Log
+        属性曲线，允许为 TWT 域或 MD 域。
+    time_depth_table : grid.TimeDepthTable
+        当前井对应的时深关系表，支持 MD 域或 TVDSS 域。
+    inline, xline : float, optional
+        井位所在的 inline/xline 坐标。若提供，则优先使用。
+    x, y : float, optional
+        井口或目标点的平面坐标。当未提供 ``inline``/``xline`` 时，可结合
+        ``survey`` 上下文转换到道号坐标。
+    trajectory : grid.WellPath, optional
+        当属性曲线为 MD 域且时深表为 TVDSS 域时，用于辅助坐标域转换的井轨迹。
+    metadata : dict, optional
+        附加元信息，会在结果中原样保留一份副本。
+    """
 
     well_name: str
     property_name: str
@@ -34,7 +82,25 @@ class LfmTimeWell:
 
 @dataclass
 class LfmTimeModelResult:
-    """时间域低频模型构建结果。"""
+    """时间域低频模型构建结果。
+
+    Attributes
+    ----------
+    volume : np.ndarray
+        低频模型体，shape 为 ``(n_inline, n_xline, n_sample)``。
+    variance_volume : np.ndarray
+        与 ``volume`` 同 shape 的切片插值方差体。
+    geometry : Dict[str, Any]
+        参与建模的几何描述，通常直接来自 ``TargetLayer.geometry``。
+    ilines, xlines, samples : np.ndarray
+        模型体三个维度对应的规则坐标轴。
+    metadata : Dict[str, Any]
+        建模参数与处理流程摘要。
+    wells : list[LfmTimeWell]
+        进入建模流程后的井输入副本；其中曲线会以处理后的 TWT 域版本返回。
+    coverage_stats : Dict[str, Any]
+        井级与层段级覆盖统计，例如切片控制点数量、切片插值模式等。
+    """
 
     volume: np.ndarray
     variance_volume: np.ndarray
@@ -176,7 +242,27 @@ def lowpass_twt_log(
     cutoff_hz: float = 10.0,
     order: int = 5,
 ) -> grid.Log:
-    """对 TWT 域单条曲线做低通滤波。"""
+    """对 TWT 域单条曲线执行 Butterworth 低通滤波。
+
+    Parameters
+    ----------
+    log : grid.Log
+        输入曲线，必须位于 TWT 域且采样间隔为常数。
+    cutoff_hz : float, default=10.0
+        低通截止频率，单位 Hz。
+    order : int, default=5
+        滤波器阶数。启用零相位滤波时，内部会按当前实现调用双向滤波。
+
+    Returns
+    -------
+    grid.Log
+        与输入曲线共享 basis、名称与单位信息的滤波后新曲线。
+
+    Raises
+    ------
+    ValueError
+        当输入曲线不在 TWT 域，或 ``cutoff_hz`` 不在有效 Nyquist 范围内时抛出。
+    """
     if not log.is_twt:
         raise ValueError("lowpass_twt_log only supports TWT-domain logs.")
 
@@ -254,7 +340,7 @@ def _convert_property_log_to_twt(
         raise ValueError(f"Unsupported property log basis type: {log.basis_type}.")
 
     if table.is_md_domain:
-        return grid.convert_log_from_md_to_twt(log, table, None, dt), "md_to_twt_via_md_table"
+        return grid.convert_log_from_md_to_twt(log, table, None, dt), "md_to_twt_via_md_table"  # type: ignore
 
     if trajectory is None:
         raise ValueError(
@@ -406,7 +492,53 @@ def build_lfm_time_model(
     filter_order: int = 5,
     post_slice_smoothing: bool = True,
 ) -> LfmTimeModelResult:
-    """构建时间域层位约束低频模型。"""
+    """构建时间域层位约束低频模型。
+
+    Parameters
+    ----------
+    target_layer : TargetLayer
+        目的层对象，需提供时间域几何信息、层位顺序与层段采样索引面。
+    wells : list[LfmTimeWell]
+        参与建模的井列表，至少包含一口井，且所有井的 ``property_name`` 必须一致。
+    survey : SurveyContext, optional
+        地震工区上下文。当井输入只提供 ``x``/``y`` 坐标时，用于换算到
+        ``inline``/``xline``。
+    n_slices : int, default=32
+        每个层段沿顶底界面之间按比例离散的切片数量。
+    variogram : {"spherical", "exponential", "gaussian"}, default="spherical"
+        多井控制时二维切片插值所使用的变差模型名称。
+    exact : bool, default=True
+        是否启用严格通过控制点的普通克里金插值。
+    nugget : float, default=0.0
+        克里金模型 nugget 参数。
+    filter_cutoff_hz : float, default=10.0
+        井曲线转换到 TWT 域后的低通滤波截止频率。
+    filter_order : int, default=5
+        井曲线低通滤波阶数。
+    post_slice_smoothing : bool, default=True
+        是否对各层段的比例切片结果沿 slice 维做轻度平滑。
+
+    Returns
+    -------
+    LfmTimeModelResult
+        包含低频模型体、方差体、结果井列表与覆盖统计的结果对象。
+
+    Raises
+    ------
+    ValueError
+        当井列表为空、采样域不是时间域、几何参数非法、井位置无法解析，
+        或某个层段在所有切片上都没有可用控制值时抛出。
+
+    Notes
+    -----
+    建模流程大致为：
+
+    1. 解析井位并为每口井提取各层位在井点处的时间解释值；
+    2. 视需要扩展时深表，并将输入属性曲线统一转换到 TWT 域后低通滤波；
+    3. 对每个层段沿顶底界面做比例切片采样；
+    4. 对每张切片按井点控制值执行常数填充或二维克里金插值；
+    5. 将切片结果重新映射回三维时间采样体，并向层段外上下延拓。
+    """
     if not wells:
         raise ValueError("wells must contain at least one LfmTimeWell.")
     if n_slices < 2:

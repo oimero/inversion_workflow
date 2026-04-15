@@ -1,4 +1,32 @@
-"""地震工区信息查询与数据处理模块。"""
+"""cup.seismic.survey: 地震工区上下文、几何查询与井旁道提取。
+
+本模块提供 SEG-Y/ZGY 工区的统一访问入口，包括工区几何查询、
+XY 与 inline/xline 坐标互转，以及井位附近道的双线性插值提取。
+
+边界说明
+--------
+- 本模块聚焦于工区上下文封装，不负责地震体全量加载与解释流程。
+- SEG-Y 与 ZGY 的实现依赖各自第三方库，缺失依赖时调用方需自行处理。
+- ``domain='depth'`` 的支持依赖底层数据确实提供深度采样信息；该模块不做速度换算。
+
+核心公开对象
+------------
+1. SurveyContext: 工区上下文协议，约定统一的几何与坐标访问接口。
+2. SegySurveyContext: SEG-Y 工区上下文实现。
+3. ZgySurveyContext: ZGY 工区上下文实现。
+4. open_survey: 根据文件类型打开工区并返回可复用上下文。
+5. import_seismic_at_well / coord_to_line / line_to_coord: 便捷访问函数。
+
+Examples
+--------
+>>> from pathlib import Path
+>>> from cup.seismic.survey import open_survey
+>>> seismic_file = Path("demo.segy")
+>>> # doctest: +SKIP
+>>> ctx = open_survey(seismic_file, seismic_type="segy")
+>>> # doctest: +SKIP
+>>> geometry = ctx.query_geometry(domain="time")
+"""
 
 from __future__ import annotations
 
@@ -12,7 +40,16 @@ from wtie.processing import grid
 
 
 class SurveyContext(Protocol):
-    """统一地震工区上下文接口。"""
+    """统一地震工区上下文接口。
+
+    Notes
+    -----
+    该协议定义了 seismic 工区上下文的最小公开能力：
+
+    - 查询规则几何；
+    - 在 XY 与 inline/xline 之间转换；
+    - 在井位附近提取双线性插值后的地震道。
+    """
 
     def query_geometry(self, domain: Optional[str] = "time") -> Dict[str, Any]: ...
 
@@ -551,7 +588,31 @@ def open_survey(
 ) -> SurveyContext:
     """打开地震工区并返回可复用的上下文对象。
 
-    建议批量调用场景优先使用本函数：先打开一次，再复用上下文执行多次查询。
+    Parameters
+    ----------
+    seismic_file : Path
+        地震文件路径。
+    seismic_type : {"segy", "zgy"}, default="segy"
+        文件类型标识。
+    segy_options : dict, optional
+        SEG-Y 读取附加参数，仅当 ``seismic_type='segy'`` 时有效。
+        目前支持 ``iline``、``xline``、``istep``、``xstep``。
+
+    Returns
+    -------
+    SurveyContext
+        可复用的工区上下文对象，具体类型取决于 ``seismic_type``。
+
+    Raises
+    ------
+    ValueError
+        当 ``seismic_type`` 不受支持，或为 ZGY 传入了 ``segy_options``，
+        或 ``segy_options`` 包含未知键时抛出。
+
+    Notes
+    -----
+    批量几何查询、批量坐标转换或批量井旁道提取时，建议优先调用本函数一次，
+    然后复用返回的上下文对象，以避免重复打开文件。
     """
     seismic_type_lower = seismic_type.lower()
     if seismic_type_lower == "segy":
@@ -587,9 +648,37 @@ def import_seismic_at_well(
     istep: Optional[int] = None,
     xstep: Optional[int] = None,
 ) -> grid.Seismic:
-    """提取井位处的复合地震道（双线性插值）。
+    """提取井位处的复合地震道。
 
-    便捷函数：批量井提取建议先调用 open_survey 后复用上下文。
+    Parameters
+    ----------
+    seismic_file : Path
+        地震文件路径。
+    well_x, well_y : float
+        目标井位或目标点的平面坐标。
+    sample_start, sample_end : float, optional
+        提取窗口的起止采样坐标。若为空，则默认使用当前工区可用采样范围。
+    domain : {"time", "depth"}, default="time"
+        返回地震道的采样域。
+    seismic_type : {"segy", "zgy"}, default="segy"
+        地震文件类型。
+    iline, xline, istep, xstep : int, optional
+        仅对 SEG-Y 有效的 keyloc 与步长参数，会透传给 ``open_survey``。
+
+    Returns
+    -------
+    grid.Seismic
+        井位处通过四邻道双线性插值得到的一维地震道。
+
+    Raises
+    ------
+    ValueError
+        当工区类型不支持、井位超出范围、采样窗口为空或邻域道不完整时抛出。
+
+    Notes
+    -----
+    这是便捷函数。若需要批量提取多口井，建议先调用 ``open_survey`` 获取上下文，
+    再复用上下文对象上的 ``import_seismic_at_well`` 方法。
     """
     ctx = _resolve_context(
         seismic_file,
@@ -618,9 +707,28 @@ def coord_to_line(
     istep: Optional[int] = None,
     xstep: Optional[int] = None,
 ) -> Tuple[float, float]:
-    """将 XY 坐标转换为 (inline_no, crossline_no)。
+    """将 XY 坐标转换为 ``(inline_no, crossline_no)``。
 
-    便捷函数：批量坐标转换建议先调用 open_survey 后复用上下文。
+    Parameters
+    ----------
+    seismic_file : Path
+        地震文件路径。
+    x, y : float
+        输入平面坐标。
+    seismic_type : {"segy", "zgy"}, default="segy"
+        地震文件类型。
+    iline, xline, istep, xstep : int, optional
+        仅对 SEG-Y 有效的读取参数，会透传给 ``open_survey``。
+
+    Returns
+    -------
+    Tuple[float, float]
+        对应的 ``(inline_no, crossline_no)``，允许为浮点值。
+
+    Raises
+    ------
+    ValueError
+        当坐标位于工区范围外，或地震类型不受支持时抛出。
     """
     ctx = _resolve_context(
         seismic_file,
@@ -643,9 +751,28 @@ def line_to_coord(
     istep: Optional[int] = None,
     xstep: Optional[int] = None,
 ) -> Tuple[float, float]:
-    """将 (inline_no, crossline_no) 转换为 XY 坐标。
+    """将 ``(inline_no, crossline_no)`` 转换为 XY 坐标。
 
-    便捷函数：批量坐标转换建议先调用 open_survey 后复用上下文。
+    Parameters
+    ----------
+    seismic_file : Path
+        地震文件路径。
+    il_no, xl_no : float
+        输入的 inline/crossline 编号。
+    seismic_type : {"segy", "zgy"}, default="segy"
+        地震文件类型。
+    iline, xline, istep, xstep : int, optional
+        仅对 SEG-Y 有效的读取参数，会透传给 ``open_survey``。
+
+    Returns
+    -------
+    Tuple[float, float]
+        对应的平面坐标 ``(x, y)``。
+
+    Raises
+    ------
+    ValueError
+        当道号超出工区范围，或地震类型不受支持时抛出。
     """
     ctx = _resolve_context(
         seismic_file,

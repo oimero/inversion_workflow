@@ -1,4 +1,34 @@
-"""Petrel数据导出工具。"""
+"""cup.petrel.export: Petrel 相关文本与 LAS 导出工具。
+
+本模块提供 LAS、checkshots 文本、两列 CSV 等导出能力，
+用于将项目内部 ``wtie.processing.grid`` 数据结构转换为
+Petrel 或下游解释流程常用的交换格式。
+
+边界说明
+--------
+- 本模块仅负责文件组织、字段映射与基础格式校验。
+- 本模块不负责井曲线反演、时深关系优化或 Petrel 工程导入流程本身。
+- 导出前的数据清洗、重采样与单位统一应由上游流程保证。
+
+核心公开对象
+------------
+1. export_logsets_to_las: 按井批量导出 LAS 文件。
+2. export_vertical_tdt_to_petrel_checkshots: 导出直井 checkshots 文本。
+3. export_twt_log_to_csv: 导出 TWT 域单条曲线为两列 CSV。
+4. export_wavelet_to_csv: 导出子波为两列 CSV。
+5. export_vertical_wtie_artifacts: 打包导出自动井震标定关键成果。
+6. format_artifact_tag: 统一成果文件名中的标签格式。
+
+Examples
+--------
+>>> from pathlib import Path
+>>> import numpy as np
+>>> from cup.petrel.export import format_artifact_tag
+>>> format_artifact_tag(" 0.012 ")
+'0.012'
+>>> format_artifact_tag(3)
+'3'
+"""
 
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Union
@@ -51,6 +81,18 @@ def _extract_basis(well_data: LogsetInput) -> np.ndarray:
     return np.asarray(basis, dtype=float)
 
 
+def _ensure_md_domain(well_data: LogsetInput) -> None:
+    """校验单井数据处于 MD 域。"""
+    logs = _extract_logs_mapping(well_data)
+
+    if hasattr(well_data, "is_md") and not bool(getattr(well_data, "is_md")):
+        raise ValueError("仅支持导出 MD 域曲线到 LAS。")
+
+    non_md_curves = [curve_name for curve_name, curve in logs.items() if not bool(getattr(curve, "is_md", False))]
+    if non_md_curves:
+        raise ValueError(f"仅支持导出 MD 域曲线到 LAS，以下曲线不是 MD 域: {non_md_curves}")
+
+
 def _resolve_export_curve(well_data: LogsetInput, curve_name: str) -> grid.Log:
     """按曲线名获取可导出曲线。"""
     logs = _extract_logs_mapping(well_data)
@@ -80,6 +122,8 @@ def _build_las_from_well_data(
     null_value: float,
 ) -> lasio.LASFile:
     """将单井数据组装为 LASFile。"""
+    _ensure_md_domain(well_data)
+
     las = lasio.LASFile()
     las.well["WELL"].value = well_name
     las.well["NULL"].value = float(null_value)
@@ -102,36 +146,48 @@ def export_logsets_to_las(
     null_value: float = -999.25,
     write_fmt: str = "%.6f",
 ) -> Dict[str, Any]:
-    """按井批量导出 LogSet/类 LogSet 字典到 LAS 文件。
+    """按井批量导出 LAS 文件。
 
     Parameters
     ----------
     logsets : Dict[str, LogsetInput]
-            键为井名，值为对应 LogSet 或 ``Dict[str, grid.Log]``。
+        键为井名，值为对应 ``grid.LogSet`` 或 ``Dict[str, grid.Log]``。
     output_dir : Path
-            LAS 输出目录。
+        LAS 输出目录。
     curve_names : List[str], optional
-            指定导出曲线列表，按传入顺序导出。
-            若为 None，则导出该井全部已有曲线。
-            对 LogSet 输入额外支持派生曲线名称: ``AI``、``Vp_Vs_ratio``。
+        指定导出曲线列表，按传入顺序导出。
+        为 ``None`` 时导出该井全部已有曲线。
+        对 ``grid.LogSet`` 输入额外支持派生曲线名 ``AI`` 与
+        ``Vp_Vs_ratio``。
     null_value : float, default -999.25
-            导出 LAS 的 NULL 指示值。
+        LAS 文件中的 NULL 指示值。
     write_fmt : str, default "%.6f"
         LAS 写出数值格式。用于统一数据区与 NULL 字段的小数显示位数。
 
     Returns
     -------
     Dict[str, Any]
-            导出汇总信息，包含：
-            - exported_files: List[Path]
-            - skipped_wells: List[dict]
-            - skipped_curves: List[dict]
+        导出汇总信息字典，包含以下键：
+
+        ``exported_files``
+            成功写出的 LAS 文件路径列表。
+        ``skipped_wells``
+            被整井跳过的记录列表，每条记录至少包含 ``well`` 与 ``reason``。
+        ``skipped_curves``
+            被跳过的曲线记录列表，每条记录至少包含 ``well``、``curve``
+            与 ``reason``。
+
+    Raises
+    ------
+    ValueError
+        当 ``write_fmt`` 不是合法的 ``printf`` 风格浮点格式串时抛出。
 
     Notes
     -----
-    - 全流程静默跳过，不因单井/单曲线失败中断。
-    - 当指定曲线不存在时，记录到 skipped_curves。
-    - 若某井最终无可导出曲线，记录到 skipped_wells。
+    - 全流程采用“逐井容错”策略，不因单井或单曲线失败中断。
+    - 导出前会显式校验输入曲线是否处于 MD 域。
+    - 当指定曲线不存在时，会记录到 ``skipped_curves``。
+    - 若某井最终无可导出曲线，会记录到 ``skipped_wells``。
     - 同名文件会覆盖。
     """
     output_dir = Path(output_dir)
@@ -223,8 +279,8 @@ def export_vertical_tdt_to_petrel_checkshots(
 ) -> Path:
     """导出直井时深关系到 Petrel checkshots 文本。
 
-    该函数以 ``TimeDepthTable`` 的深度采样点为主轴，并按项目约定写出
-    Petrel checkshots 所需字段。
+    该函数以 ``grid.TimeDepthTable`` 的 TVDSS 采样点为主轴，
+    生成符合项目约定的 Petrel checkshots 纯文本文件。
 
     Parameters
     ----------
@@ -249,6 +305,11 @@ def export_vertical_tdt_to_petrel_checkshots(
     -------
     Path
         写出的文件路径。
+
+    Raises
+    ------
+    ValueError
+        当 ``tdt`` 为 MD 域、存在非有限值、TWT 为负值或列长度不一致时抛出。
 
     Notes
     -----
@@ -312,7 +373,23 @@ def export_vertical_tdt_to_petrel_checkshots(
 
 
 def format_artifact_tag(value: Union[str, float, int]) -> str:
-    """将文件名中的标签值转为稳定字符串。"""
+    """将成果文件名中的标签值转为稳定字符串。
+
+    Parameters
+    ----------
+    value : str or float or int
+        待格式化的标签值。字符串会先执行 ``strip()``。
+
+    Returns
+    -------
+    str
+        可直接拼接到文件名中的稳定字符串。
+
+    Raises
+    ------
+    ValueError
+        当 ``value`` 是空白字符串时抛出。
+    """
     if isinstance(value, str):
         text = value.strip()
         if not text:
@@ -356,7 +433,29 @@ def export_twt_log_to_csv(
     value_name: str = "value",
     fmt: str = "%.9g",
 ) -> Path:
-    """导出 TWT 域单条曲线到两列 CSV。"""
+    """导出 TWT 域单条曲线到两列 CSV。
+
+    Parameters
+    ----------
+    output_file : Path
+        输出 CSV 路径。
+    log : grid.Log
+        待导出的单条曲线，要求处于 TWT 域。
+    value_name : str, default="value"
+        第二列列名。
+    fmt : str, default="%.9g"
+        数值写出格式。
+
+    Returns
+    -------
+    Path
+        写出的 CSV 文件路径。
+
+    Raises
+    ------
+    ValueError
+        当 ``log`` 不处于 TWT 域时抛出。
+    """
     if not log.is_twt:
         raise ValueError("仅支持导出 TWT 域曲线。")
     return _write_two_column_csv(
@@ -374,7 +473,27 @@ def export_wavelet_to_csv(
     wavelet: Any,
     fmt: str = "%.9g",
 ) -> Path:
-    """导出单道子波到两列 CSV。"""
+    """导出单道子波到两列 CSV。
+
+    Parameters
+    ----------
+    output_file : Path
+        输出 CSV 路径。
+    wavelet : Any
+        子波对象。需提供 ``basis/values`` 属性，或 ``t/y`` 属性。
+    fmt : str, default="%.9g"
+        数值写出格式。
+
+    Returns
+    -------
+    Path
+        写出的 CSV 文件路径。
+
+    Raises
+    ------
+    TypeError
+        当 ``wavelet`` 不提供受支持的时间轴与振幅属性组合时抛出。
+    """
     if hasattr(wavelet, "basis") and hasattr(wavelet, "values"):
         time_values = np.asarray(getattr(wavelet, "basis"), dtype=float)
         amplitude_values = np.asarray(getattr(wavelet, "values"), dtype=float)
@@ -407,7 +526,42 @@ def export_vertical_wtie_artifacts(
 ) -> Dict[str, Path]:
     """导出直井自动井震标定的关键成果。
 
+    Parameters
+    ----------
+    output_dir : Path
+        成果输出目录。函数会自动创建 ``tdtable``、``ai``、``wavelet``
+        三个子目录。
+    outputs : Any
+        自动井震标定输出对象。需至少提供 ``table``、``logset_twt``、
+        ``wavelet`` 三个属性，其中 ``logset_twt`` 还需提供 ``AI`` 属性。
+    well_name : str
+        井名，用于文件命名与 checkshots 文本中的 ``Well name`` 列。
+    interpretation_offset : str or float or int
+        解释偏移标签，会参与输出文件名。
+    kb : float
+        Kelly Bushing 高程，单位 m。
+    x : float
+        井口 X 坐标，单位 m。
+    y : float
+        井口 Y 坐标，单位 m。
+    csv_fmt : str, default="%.9g"
+        AI 曲线与子波 CSV 的数值写出格式。
+
+    Returns
+    -------
+    Dict[str, Path]
+        成果路径字典，包含 ``tdtable_file``、``ai_file`` 与
+        ``wavelet_file``。
+
+    Raises
+    ------
+    AttributeError
+        当 ``outputs`` 缺少必需属性时抛出。
+
+    Notes
+    -----
     导出内容包括：
+
     - 优化后的 TVDSS-TWT 时深表（Petrel checkshots 文本）
     - 优化后的 TWT 域 AI 曲线（CSV）
     - 优化后的子波（CSV）

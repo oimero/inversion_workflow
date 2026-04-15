@@ -87,7 +87,7 @@ class ForwardModel(nn.Module):
         # 不对称 padding，使输出与反射率等长
         r_padded = F.pad(reflectivity, (self.pad_left, self.pad_right), mode="constant", value=0.0)
         # conv1d + padding=0 → 输出长度 = len(r_padded) - n_w + 1 = len(r)
-        d_syn = F.conv1d(r_padded, self.wavelet_kernel, padding=0)
+        d_syn = F.conv1d(r_padded, self.wavelet_kernel, padding=0)  # type: ignore
         return d_syn
 
     def forward(self, impedance: Tensor) -> Tensor:

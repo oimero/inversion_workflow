@@ -72,7 +72,7 @@ class GINNConfig:
     grad_clip: float = 1.0
     lambda_reg: float = 0.1  # 残差 L2 正则化权重（防止尺度发散）
     residual_tanh_scale: float | None = None  # 若为空，则按 LMF 上限 + offset 自动换算
-    residual_max_ai_offset: float = 2000.0  # 允许 AI 相对 LMF 上限额外抬升的绝对量
+    residual_max_ai_offset: float = 8000.0  # 允许 AI 相对 LMF 上限额外抬升的绝对量
     zero_residual_outside_mask: bool = True  # 将目的层外残差钳回 0，避免层外失控污染层内
     device: str = "cuda"
     num_workers: int = 0  # Windows 下大数组无法 pickle，设 0

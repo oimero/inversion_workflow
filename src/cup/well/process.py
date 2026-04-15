@@ -1,4 +1,27 @@
-"""井曲线对象处理工具。"""
+"""cup.well.process: 井曲线集合处理与分层裁剪工具。
+
+本模块提供面向 ``grid.Log`` / ``grid.LogSet`` 的批量处理函数，
+包括连续常值区间替换、按井分层裁剪等常见预处理操作，
+用于后续井震标定、统计分析与地质约束流程。
+
+边界说明
+--------
+- 本模块仅处理单井曲线集合的局部数值清洗与区间裁剪。
+- 本模块不负责 Petrel 文本解析、LAS 读写或可视化渲染。
+- 曲线重采样、一致性校验与复杂插值逻辑应由上游或底层 ``grid`` 模块处理。
+
+核心公开对象
+------------
+1. replace_constant_value_intervals_in_log_dicts: 批量替换连续常值区间。
+2. clip_logsets_by_well_tops: 按井分层表在 MD 域裁剪曲线集合。
+
+Examples
+--------
+>>> import numpy as np
+>>> from cup.well.process import _DEFAULT_ANOMALY_VALUE
+>>> float(_DEFAULT_ANOMALY_VALUE)
+-999.25
+"""
 
 from typing import Any, Dict, Iterable, Optional, Sequence, Union, cast
 
@@ -102,7 +125,7 @@ def replace_constant_value_intervals_in_log_dicts(
     exclude_curve_names: Optional[Sequence[str]] = None,
     anomaly_value: float = _DEFAULT_ANOMALY_VALUE,
 ) -> Dict[str, Any]:
-    """批量替换 Dict[str, grid.Log] 中连续常值区间。
+    """批量替换井曲线集合中的连续常值区间。
 
     判定规则：
     - 连续相同值采用严格相等判定；
@@ -111,34 +134,41 @@ def replace_constant_value_intervals_in_log_dicts(
 
     Parameters
     ----------
-    logsets : Dict[str, Dict[str, grid.Log]]
-            键为井名，值为该井曲线字典（曲线名 -> ``grid.Log``）。
+    logsets : Dict[str, LogsetInput]
+        键为井名，值为该井的 ``grid.LogSet`` 或 ``Dict[str, grid.Log]``。
     min_run_length : int
-            连续相同值触发替换的最小长度（大于等于该值触发）。
+        连续相同值触发替换的最小长度（大于等于该值触发）。
     curve_names : Optional[Sequence[str]], default=None
-            仅处理这些曲线名；若为 None，则处理每口井全部曲线。
+        仅处理这些曲线名；为 ``None`` 时处理每口井全部曲线。
     exclude_curve_names : Optional[Sequence[str]], default=None
-            从处理范围中排除这些曲线名。
+        从处理范围中排除这些曲线名。
     anomaly_value : float, default=-999.25
-            用于替换目标区间的异常值。
+        用于替换目标区间的异常值。
 
     Returns
     -------
     Dict[str, Any]
-            处理结果，包含：
-            - processed_logsets: Dict[str, Dict[str, grid.Log]]
-            - anomaly_value: float
-            - target_curve_count: int
-            - curves_with_replacement: int
-            - total_replaced_points: int
-            - curve_reports: List[dict]
+        处理结果字典，包含以下键：
+
+        ``processed_logsets``
+            清洗后的井曲线集合。
+        ``anomaly_value``
+            实际用于替换的异常值。
+        ``target_curve_count``
+            纳入处理范围的曲线总数。
+        ``curves_with_replacement``
+            实际发生替换的曲线数量。
+        ``total_replaced_points``
+            被替换的采样点总数。
+        ``curve_reports``
+            逐曲线统计报告列表。
 
     Raises
     ------
     ValueError
-            当参数不合法、曲线名冲突、井内曲线名不存在时抛出。
+        当参数不合法、曲线名冲突、井内曲线名不存在时抛出。
     TypeError
-            当输入结构或曲线对象类型不符合约定时抛出。
+        当输入结构或曲线对象类型不符合约定时抛出。
     """
     if isinstance(min_run_length, bool) or not isinstance(min_run_length, int) or min_run_length < 1:
         raise ValueError(f"min_run_length 必须是大于等于 1 的整数，当前为: {min_run_length}")
@@ -254,7 +284,7 @@ def _get_unique_surface_md(
 
 def clip_logsets_by_well_tops(
     well_tops_df: pd.DataFrame,
-    logsets: Dict[str, LogsetInput],
+    logsets: Dict[str, grid.LogSet],
     top_surface_name: str,
     base_surface_name: str,
     extend: int = 0,
@@ -269,30 +299,39 @@ def clip_logsets_by_well_tops(
     Parameters
     ----------
     well_tops_df : pd.DataFrame
-            井分层表，至少包含 ``Well``、``Surface``、``MD`` 三列，MD 单位为 m。
+        井分层表，至少包含 ``Well``、``Surface``、``MD`` 三列，MD 单位为 m。
     logsets : Dict[str, grid.LogSet]
-            井曲线集合字典，键为井名。
+        井曲线集合字典，键为井名，值必须为 ``grid.LogSet``。
     top_surface_name : str
-            裁剪起始层位名称。
+        裁剪起始层位名称。
     base_surface_name : str
-            裁剪终止层位名称。
+        裁剪终止层位名称。
     extend : int, default=0
         在 top_surface 上方、base_surface 下方额外扩展的采样点数。
 
-        Returns
-        -------
-        Dict[str, Any]
-            处理结果，包含：
-            - processed_logsets: Dict[str, LogsetInput]
-            - target_well_count: int
-            - wells_with_fallback: int
-            - surface_fallback_count: int
-            - surface_fallback_reports: List[dict]
+    Returns
+    -------
+    Dict[str, Any]
+        处理结果字典，包含以下键：
+
+        ``processed_logsets``
+            裁剪后的井曲线集合，类型为 ``Dict[str, grid.LogSet]``。
+        ``target_well_count``
+            输入井数。
+        ``wells_with_fallback``
+            至少有一个层位使用回退值的井数。
+        ``surface_fallback_count``
+            层位回退事件总数。
+        ``surface_fallback_reports``
+            逐井逐层位回退报告列表。
 
     Raises
     ------
     ValueError
-            当井分层缺列、层位未查询到、层位 MD 反转，或输入 LogSet 非 MD 域时抛出。
+        当井分层缺列、层位未查询到、层位 MD 反转，或输入曲线不在
+        MD 域时抛出。
+    TypeError
+        当 ``logsets`` 中任一值不是 ``grid.LogSet`` 时抛出。
     """
     missing = [col for col in _REQUIRED_TOPS_COLUMNS if col not in well_tops_df.columns]
     if missing:
@@ -301,15 +340,12 @@ def clip_logsets_by_well_tops(
     if isinstance(extend, bool) or not isinstance(extend, int) or extend < 0:
         raise ValueError(f"extend 必须是大于等于 0 的整数，当前为: {extend}")
 
-    clipped_logsets: Dict[str, LogsetInput] = {}
+    clipped_logsets: Dict[str, grid.LogSet] = {}
     surface_fallback_reports: list[Dict[str, Any]] = []
 
-    for well_name, logset_input in logsets.items():
-        logs, input_is_logset = _normalize_logset_input(logset_input, well_name, require_non_empty=True)
-        if input_is_logset:
-            logset = cast(grid.LogSet, logset_input)
-        else:
-            logset = grid.LogSet(logs)
+    for well_name, logset in logsets.items():
+        if not isinstance(logset, grid.LogSet):
+            raise TypeError(f"井 {well_name} 的输入必须是 grid.LogSet。")
 
         if not logset.is_md:
             raise ValueError(f"井 {well_name} 的 LogSet 不是 MD 域，无法按 MD 裁剪。")
@@ -382,10 +418,7 @@ def clip_logsets_by_well_tops(
                 raise TypeError(f"井 {well_name} 的曲线 {name} 裁剪后类型不是 Log。")
             clipped_logs[name] = cast(grid.Log, sliced)
 
-        if input_is_logset:
-            clipped_logsets[well_name] = grid.LogSet(clipped_logs)
-        else:
-            clipped_logsets[well_name] = clipped_logs
+        clipped_logsets[well_name] = grid.LogSet(clipped_logs)
 
     return {
         "processed_logsets": clipped_logsets,

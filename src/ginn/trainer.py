@@ -101,7 +101,7 @@ class Trainer:
         )
 
     def _resolve_residual_tanh_scale(self) -> float:
-        """解析对数扰动上界。
+        """解析对数残差上界。
 
         若配置中显式给出 ``residual_tanh_scale``，则直接使用。
         否则根据有效区 LMF 上限和 ``residual_max_ai_offset`` 自动换算：
@@ -134,11 +134,11 @@ class Trainer:
         lmf_raw: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """网络输出对数扰动并与 LMF 合成阻抗。
+        """网络输出对数残差并与 LMF 合成阻抗。
 
         Notes
         -----
-        - 使用 ``scale * tanh(raw)`` 限制对数扰动幅度，防止 ``exp`` 放大失控。
+        - 使用 ``scale * tanh(raw)`` 限制对数残差幅度，防止 ``exp`` 放大失控。
         - 若启用 ``zero_residual_outside_mask``，则将目的层外残差压回 0，
           使层外阻抗退回到 ``lmf_raw``。
         """
@@ -295,7 +295,6 @@ class Trainer:
         n_xl = int(self.geometry["n_xl"])
         n_sample = int(self.geometry["n_sample"])
 
-        # 使用全部道（包含无效道）进行推理
         full_loader = DataLoader(
             self.dataset,
             batch_size=self.cfg.batch_size * 4,  # 推理可用更大 batch

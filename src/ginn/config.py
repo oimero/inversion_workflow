@@ -52,7 +52,7 @@ class GINNConfig:
 
     # ── 低频模型 ──────────────────────────────────────────────
     lmf_source: LmfSource = "filtered_inversion_lmf"
-    precomputed_lmf_file: Path = Path("data/lfm_time_from_wtie_output/lfm_time_from_wtie.npz")
+    precomputed_lmf_file: Path = Path("data/output_lfm_time_from_wtie/lfm_time_from_wtie.npz")
     lmf_cutoff_hz: float = 10.0  # Butterworth 低通截止频率 (Hz)
     lmf_filter_order: int = 6  # 零相位滤波器阶数
 

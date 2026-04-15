@@ -42,17 +42,35 @@ class Trainer:
 
         # ── 数据 ──
         logger.info("Building dataset...")
-        self.dataset, wavelet, self.geometry = build_dataset(cfg)
+        dataset_bundle = build_dataset(cfg)
+        self.dataset = dataset_bundle.inference_dataset
+        self.train_dataset = dataset_bundle.train_dataset
+        self.val_dataset = dataset_bundle.val_dataset
+        wavelet = dataset_bundle.wavelet
+        self.geometry = dataset_bundle.geometry
+        self.split_metadata = dataset_bundle.split_metadata
 
-        self.dataloader = DataLoader(
-            self.dataset,
+        self.train_dataloader = DataLoader(
+            self.train_dataset,
             batch_size=cfg.batch_size,
             shuffle=True,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
             drop_last=True,
         )
-        logger.info("DataLoader: %d batches/epoch", len(self.dataloader))
+        logger.info("Train DataLoader: %d batches/epoch", len(self.train_dataloader))
+        self.val_dataloader = None
+        if self.val_dataset is not None:
+            self.val_dataloader = DataLoader(
+                self.val_dataset,
+                batch_size=cfg.batch_size,
+                shuffle=False,
+                num_workers=cfg.num_workers,
+                pin_memory=cfg.pin_memory,
+                drop_last=False,
+            )
+            logger.info("Validation DataLoader: %d batches/epoch", len(self.val_dataloader))
+        logger.info("Split metadata: %s", self.split_metadata)
 
         # ── 模型 ──
         self.model = DilatedResNet1D(
@@ -92,12 +110,22 @@ class Trainer:
         self.epoch = 0
         self.global_step = 0
         self.best_loss = float("inf")
+        self.best_epoch = 0
         logger.info(
             "AI bounding: ai_min=%.2f, ai_max=%.2f, zero_outside_mask=%s",
             self.cfg.ai_min,
             self.cfg.ai_max,
             self.cfg.zero_residual_outside_mask,
         )
+        if self.val_dataloader is not None:
+            logger.info(
+                "Early stopping enabled: patience=%d, min_delta=%.2e, warmup=%d",
+                self.cfg.early_stopping_patience,
+                self.cfg.early_stopping_min_delta,
+                self.cfg.early_stopping_warmup,
+            )
+        else:
+            logger.info("Early stopping disabled because no validation dataset is configured.")
 
     def _compose_impedance(
         self,
@@ -130,59 +158,82 @@ class Trainer:
         ai = lmf_raw * torch.exp(residual)
         return ai, residual
 
-    def train_one_epoch(self) -> float:
-        """训练一个 epoch，返回 epoch 平均损失。"""
-        self.model.train()
-        epoch_loss = 0.0
+    def _run_epoch(self, dataloader: DataLoader, *, training: bool) -> dict[str, float]:
+        """执行一个 train/validation epoch，并返回聚合指标。"""
+        self.model.train(training)
+        total_loss = 0.0
+        total_waveform_mae = 0.0
+        total_reg_term = 0.0
+        total_residual_mean = 0.0
         n_batches = 0
 
-        for batch_idx, batch in enumerate(self.dataloader):
-            x = batch["input"].to(self.device)  # (B, 2, T)
-            d_obs = batch["obs"].to(self.device)  # (B, 1, T)
-            core_mask = batch["mask"].to(self.device)  # (B, 1, T)
-            loss_mask = batch["loss_mask"].to(self.device)  # (B, 1, T)
-            taper_weight = batch["taper_weight"].to(self.device)  # (B, 1, T)
-            lmf_raw = batch["lmf_raw"].to(self.device)  # (B, 1, T)
+        context = torch.enable_grad if training else torch.no_grad
+        with context():
+            for batch_idx, batch in enumerate(dataloader):
+                x = batch["input"].to(self.device)  # (B, 2, T)
+                d_obs = batch["obs"].to(self.device)  # (B, 1, T)
+                core_mask = batch["mask"].to(self.device)  # (B, 1, T)
+                loss_mask = batch["loss_mask"].to(self.device)  # (B, 1, T)
+                taper_weight = batch["taper_weight"].to(self.device)  # (B, 1, T)
+                lmf_raw = batch["lmf_raw"].to(self.device)  # (B, 1, T)
 
-            # 1. 网络前向 + 阻抗合成
-            ai, residual = self._compose_impedance(x, lmf_raw, taper_weight)
+                # 1. 网络前向 + 阻抗合成
+                ai, residual = self._compose_impedance(x, lmf_raw, taper_weight)
 
-            # 2. 物理正演
-            d_syn = self.forward_model(ai)  # (B, 1, T)
+                # 2. 物理正演
+                d_syn = self.forward_model(ai)  # (B, 1, T)
 
-            # 3. 损失
-            loss, loss_dict = self.criterion(d_syn, d_obs, loss_mask, core_mask, residual)
+                # 3. 损失
+                loss, loss_dict = self.criterion(d_syn, d_obs, loss_mask, core_mask, residual)
 
-            # 4. 反向传播
-            self.optimizer.zero_grad()
-            loss.backward()
+                if training:
+                    # 4. 反向传播
+                    self.optimizer.zero_grad()
+                    loss.backward()
 
-            # 梯度裁剪
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+                    # 梯度裁剪
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+                    self.optimizer.step()
+                    self.global_step += 1
 
-            self.optimizer.step()
-
-            epoch_loss += loss.item()
-            n_batches += 1
-            self.global_step += 1
-
-            if (batch_idx + 1) % self.cfg.log_interval == 0:
-                lr = self.optimizer.param_groups[0]["lr"]
                 residual_mean = residual.abs().mean().item()
-                logger.info(
-                    "  [Epoch %d | Batch %d/%d] loss=%.6f (mae=%.6f reg=%.3e res=%.3e) lr=%.2e",
-                    self.epoch + 1,
-                    batch_idx + 1,
-                    len(self.dataloader),
-                    loss_dict["total"],
-                    loss_dict["waveform_mae"],
-                    loss_dict["reg_term"],
-                    residual_mean,
-                    lr,
-                )
+                total_loss += loss_dict["total"]
+                total_waveform_mae += loss_dict["waveform_mae"]
+                total_reg_term += loss_dict["reg_term"]
+                total_residual_mean += residual_mean
+                n_batches += 1
 
-        avg_loss = epoch_loss / max(n_batches, 1)
-        return avg_loss
+                if training and (batch_idx + 1) % self.cfg.log_interval == 0:
+                    lr = self.optimizer.param_groups[0]["lr"]
+                    logger.info(
+                        "  [Epoch %d | Batch %d/%d] loss=%.6f (mae=%.6f reg=%.3e res=%.3e) lr=%.2e",
+                        self.epoch + 1,
+                        batch_idx + 1,
+                        len(dataloader),
+                        loss_dict["total"],
+                        loss_dict["waveform_mae"],
+                        loss_dict["reg_term"],
+                        residual_mean,
+                        lr,
+                    )
+
+        n_batches = max(n_batches, 1)
+        return {
+            "loss": total_loss / n_batches,
+            "waveform_mae": total_waveform_mae / n_batches,
+            "reg_term": total_reg_term / n_batches,
+            "residual_mean": total_residual_mean / n_batches,
+        }
+
+    def train_one_epoch(self) -> dict[str, float]:
+        """训练一个 epoch，返回 epoch 平均指标。"""
+        return self._run_epoch(self.train_dataloader, training=True)
+
+    def validate(self) -> dict[str, float]:
+        """评估一个 validation epoch，返回平均指标。"""
+        if self.val_dataloader is None:
+            raise RuntimeError("validate() called without a validation dataloader.")
+        return self._run_epoch(self.val_dataloader, training=False)
 
     def save_checkpoint(self, filename: Optional[str] = None) -> Path:
         """保存模型 checkpoint。"""
@@ -198,11 +249,13 @@ class Trainer:
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "best_loss": self.best_loss,
+                "best_epoch": self.best_epoch,
                 "config": config_payload,
                 "normalization": {
                     "seis_rms": self.dataset.seis_rms,
                     "lmf_scale": self.dataset.lmf_scale,
                 },
+                "split_metadata": self.split_metadata,
             },
             path,
         )
@@ -221,30 +274,76 @@ class Trainer:
         logger.info("=" * 60)
 
         total_start = time.time()
+        epochs_without_improvement = 0
 
         for epoch in range(self.cfg.epochs):
             self.epoch = epoch
             epoch_start = time.time()
 
-            avg_loss = self.train_one_epoch()
+            train_metrics = self.train_one_epoch()
             self.scheduler.step()
+            val_metrics = self.validate() if self.val_dataloader is not None else None
 
             elapsed = time.time() - epoch_start
             lr = self.optimizer.param_groups[0]["lr"]
 
-            logger.info(
-                "Epoch %d/%d  loss=%.6f  lr=%.2e  time=%.1fs",
-                epoch + 1,
-                self.cfg.epochs,
-                avg_loss,
-                lr,
-                elapsed,
-            )
+            if val_metrics is None:
+                logger.info(
+                    "Epoch %d/%d  train_loss=%.6f (mae=%.6f reg=%.3e res=%.3e)  lr=%.2e  time=%.1fs",
+                    epoch + 1,
+                    self.cfg.epochs,
+                    train_metrics["loss"],
+                    train_metrics["waveform_mae"],
+                    train_metrics["reg_term"],
+                    train_metrics["residual_mean"],
+                    lr,
+                    elapsed,
+                )
+                monitor_value = train_metrics["loss"]
+                monitor_name = "train_loss"
+            else:
+                logger.info(
+                    "Epoch %d/%d  train_loss=%.6f  val_loss=%.6f  val_mae=%.6f  val_reg=%.3e  "
+                    "val_res=%.3e  lr=%.2e  time=%.1fs",
+                    epoch + 1,
+                    self.cfg.epochs,
+                    train_metrics["loss"],
+                    val_metrics["loss"],
+                    val_metrics["waveform_mae"],
+                    val_metrics["reg_term"],
+                    val_metrics["residual_mean"],
+                    lr,
+                    elapsed,
+                )
+                monitor_value = val_metrics["loss"]
+                monitor_name = "val_loss"
 
             # 保存最优模型
-            if avg_loss < self.best_loss:
-                self.best_loss = avg_loss
+            if monitor_value < (self.best_loss - self.cfg.early_stopping_min_delta):
+                self.best_loss = monitor_value
+                self.best_epoch = epoch + 1
+                epochs_without_improvement = 0
                 self.save_checkpoint("best.pt")
+                logger.info("New best model at epoch %d: %s=%.6f", epoch + 1, monitor_name, monitor_value)
+            elif self.val_dataloader is not None and (epoch + 1) >= self.cfg.early_stopping_warmup:
+                epochs_without_improvement += 1
+                logger.info(
+                    "No validation improvement for %d epoch(s) (best %s=%.6f at epoch %d).",
+                    epochs_without_improvement,
+                    monitor_name,
+                    self.best_loss,
+                    self.best_epoch,
+                )
+                if (
+                    self.cfg.early_stopping_patience > 0
+                    and epochs_without_improvement >= self.cfg.early_stopping_patience
+                ):
+                    logger.info(
+                        "Early stopping triggered at epoch %d after %d stale validation epochs.",
+                        epoch + 1,
+                        epochs_without_improvement,
+                    )
+                    break
 
             # 定期保存
             if (epoch + 1) % self.cfg.save_every == 0:
@@ -256,7 +355,7 @@ class Trainer:
         total_time = time.time() - total_start
         logger.info("=" * 60)
         logger.info("Training complete. Total time: %.1f s (%.1f min)", total_time, total_time / 60.0)
-        logger.info("Best loss: %.6f", self.best_loss)
+        logger.info("Best monitored loss: %.6f (epoch %d)", self.best_loss, self.best_epoch)
         logger.info("=" * 60)
 
     @torch.no_grad()
@@ -297,7 +396,7 @@ class Trainer:
 
         # 放回原始 3D 位置
         volume = np.zeros((n_il * n_xl, n_sample), dtype=np.float32)
-        valid_indices = self.dataset._valid_indices
+        valid_indices = self.dataset.valid_indices
         volume[valid_indices] = predictions
 
         return volume.reshape(n_il, n_xl, n_sample)

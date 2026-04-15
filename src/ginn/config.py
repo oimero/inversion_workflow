@@ -9,6 +9,8 @@ from typing import Any, Dict, Literal, Tuple
 import yaml
 
 LmfSource = Literal["wtie_time_lfm", "filtered_inversion_lmf"]
+ValidationSplitMode = Literal["none", "spatial_block"]
+ValidationBlockAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"]
 
 _PATH_FIELDS = {
     "seismic_file",
@@ -77,6 +79,13 @@ class GINNConfig:
     device: str = "cuda"
     num_workers: int = 0  # Windows 下大数组无法 pickle，设 0
     pin_memory: bool = True
+    validation_split_mode: ValidationSplitMode = "spatial_block"
+    validation_fraction: float = 0.10
+    validation_gap_traces: int = 8
+    validation_block_anchor: ValidationBlockAnchor = "maxmax"
+    early_stopping_patience: int = 8
+    early_stopping_min_delta: float = 1e-4
+    early_stopping_warmup: int = 5
 
     # ── 掩码 ──────────────────────────────────────────────────
     mask_erosion_samples: int = 30  # 同时用于 loss mask 收缩与 residual halo/taper 宽度
@@ -102,6 +111,18 @@ class GINNConfig:
         valid_lmf_sources = {"wtie_time_lfm", "filtered_inversion_lmf"}
         if self.lmf_source not in valid_lmf_sources:
             raise ValueError(f"Unsupported lmf_source={self.lmf_source!r}, expected one of {sorted(valid_lmf_sources)}")
+        valid_validation_modes = {"none", "spatial_block"}
+        if self.validation_split_mode not in valid_validation_modes:
+            raise ValueError(
+                "Unsupported validation_split_mode="
+                f"{self.validation_split_mode!r}, expected one of {sorted(valid_validation_modes)}"
+            )
+        valid_validation_anchors = {"maxmax", "maxmin", "minmax", "minmin", "center"}
+        if self.validation_block_anchor not in valid_validation_anchors:
+            raise ValueError(
+                "Unsupported validation_block_anchor="
+                f"{self.validation_block_anchor!r}, expected one of {sorted(valid_validation_anchors)}"
+            )
 
         if self.wavelet_gain is not None and self.wavelet_gain <= 0.0:
             raise ValueError(f"wavelet_gain must be positive when provided, got {self.wavelet_gain}.")
@@ -113,6 +134,20 @@ class GINNConfig:
             raise ValueError(f"ai_max must be greater than ai_min, got ai_min={self.ai_min}, ai_max={self.ai_max}.")
         if self.mask_erosion_samples < 0:
             raise ValueError(f"mask_erosion_samples must be non-negative, got {self.mask_erosion_samples}.")
+        if not 0.0 <= self.validation_fraction < 1.0:
+            raise ValueError(
+                f"validation_fraction must be within [0, 1), got {self.validation_fraction}."
+            )
+        if self.validation_gap_traces < 0:
+            raise ValueError(f"validation_gap_traces must be non-negative, got {self.validation_gap_traces}.")
+        if self.early_stopping_patience < 0:
+            raise ValueError(f"early_stopping_patience must be non-negative, got {self.early_stopping_patience}.")
+        if self.early_stopping_min_delta < 0.0:
+            raise ValueError(
+                f"early_stopping_min_delta must be non-negative, got {self.early_stopping_min_delta}."
+            )
+        if self.early_stopping_warmup < 0:
+            raise ValueError(f"early_stopping_warmup must be non-negative, got {self.early_stopping_warmup}.")
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "GINNConfig":

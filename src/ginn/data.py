@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -27,6 +28,18 @@ from cup.seismic.survey import open_survey
 from ginn.config import GINNConfig
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DatasetBundle:
+    """GINN 训练/验证/推理所需数据集集合。"""
+
+    train_dataset: "SeismicTraceDataset"
+    inference_dataset: "SeismicTraceDataset"
+    val_dataset: "SeismicTraceDataset | None"
+    wavelet: np.ndarray
+    geometry: Dict[str, Any]
+    split_metadata: Dict[str, Any]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -173,6 +186,7 @@ def estimate_wavelet_gain(
     *,
     seis_rms: float,
     max_traces: int,
+    candidate_trace_indices: np.ndarray | None = None,
     batch_size: int = 64,
 ) -> float:
     """基于样本道估计使合成地震与归一化观测同量级的子波增益。
@@ -191,6 +205,9 @@ def estimate_wavelet_gain(
     mask_flat = mask.reshape(-1, n_sample).astype(bool, copy=False)
 
     valid_trace_indices = np.flatnonzero(mask_flat.any(axis=1))
+    if candidate_trace_indices is not None:
+        candidate_trace_indices = np.asarray(candidate_trace_indices, dtype=np.int64)
+        valid_trace_indices = np.intersect1d(valid_trace_indices, candidate_trace_indices, assume_unique=False)
     if valid_trace_indices.size == 0:
         raise ValueError("Cannot auto-estimate wavelet gain because no valid traces were found in the mask.")
 
@@ -330,6 +347,112 @@ def _build_residual_taper(mask_flat: np.ndarray, halo_samples: int) -> np.ndarra
     return taper
 
 
+def _select_spatial_validation_split(
+    valid_indices: np.ndarray,
+    *,
+    n_il: int,
+    n_xl: int,
+    validation_fraction: float,
+    gap_traces: int,
+    anchor: str,
+) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """按 inline/xline 连续块切出验证集，并在周围留出缓冲带。"""
+    valid_indices = np.asarray(valid_indices, dtype=np.int64)
+    if valid_indices.size == 0:
+        raise ValueError("Cannot build a validation split because no valid traces were found.")
+    if validation_fraction <= 0.0:
+        metadata = {
+            "mode": "none",
+            "train_trace_count": int(valid_indices.size),
+            "val_trace_count": 0,
+            "gap_trace_count": 0,
+        }
+        return valid_indices.copy(), np.empty(0, dtype=np.int64), metadata
+
+    il_coords = valid_indices // n_xl
+    xl_coords = valid_indices % n_xl
+    il_min = int(il_coords.min())
+    il_max = int(il_coords.max())
+    xl_min = int(xl_coords.min())
+    xl_max = int(xl_coords.max())
+    il_extent = il_max - il_min + 1
+    xl_extent = xl_max - xl_min + 1
+
+    side_fraction = math.sqrt(validation_fraction)
+    block_il = max(1, min(il_extent, int(math.ceil(il_extent * side_fraction))))
+    block_xl = max(1, min(xl_extent, int(math.ceil(xl_extent * side_fraction))))
+
+    if anchor == "maxmax":
+        il_start = il_max - block_il + 1
+        xl_start = xl_max - block_xl + 1
+    elif anchor == "maxmin":
+        il_start = il_max - block_il + 1
+        xl_start = xl_min
+    elif anchor == "minmax":
+        il_start = il_min
+        xl_start = xl_max - block_xl + 1
+    elif anchor == "minmin":
+        il_start = il_min
+        xl_start = xl_min
+    elif anchor == "center":
+        il_start = il_min + max((il_extent - block_il) // 2, 0)
+        xl_start = xl_min + max((xl_extent - block_xl) // 2, 0)
+    else:
+        raise ValueError(f"Unsupported validation block anchor: {anchor!r}")
+
+    il_end = il_start + block_il
+    xl_end = xl_start + block_xl
+
+    val_mask = (
+        (il_coords >= il_start)
+        & (il_coords < il_end)
+        & (xl_coords >= xl_start)
+        & (xl_coords < xl_end)
+    )
+    val_indices = valid_indices[val_mask]
+    if val_indices.size == 0:
+        raise ValueError(
+            "Validation block did not capture any valid traces. "
+            f"Try a different validation_block_anchor or a larger validation_fraction (current={validation_fraction})."
+        )
+
+    gap = int(gap_traces)
+    gap_il_start = max(il_start - gap, 0)
+    gap_il_end = min(il_end + gap, n_il)
+    gap_xl_start = max(xl_start - gap, 0)
+    gap_xl_end = min(xl_end + gap, n_xl)
+
+    exclusion_mask = (
+        (il_coords >= gap_il_start)
+        & (il_coords < gap_il_end)
+        & (xl_coords >= gap_xl_start)
+        & (xl_coords < gap_xl_end)
+    )
+    train_indices = valid_indices[~exclusion_mask]
+    gap_only_mask = exclusion_mask & ~val_mask
+    if train_indices.size == 0:
+        raise ValueError(
+            "Validation block plus gap removed all training traces. "
+            f"Try a smaller validation_fraction or validation_gap_traces (current gap={gap})."
+        )
+
+    metadata = {
+        "mode": "spatial_block",
+        "anchor": anchor,
+        "requested_validation_fraction": float(validation_fraction),
+        "actual_validation_fraction": float(val_indices.size / valid_indices.size),
+        "gap_traces": gap,
+        "train_trace_count": int(train_indices.size),
+        "val_trace_count": int(val_indices.size),
+        "gap_trace_count": int(gap_only_mask.sum()),
+        "block_il_start": int(il_start),
+        "block_il_end": int(il_end),
+        "block_xl_start": int(xl_start),
+        "block_xl_end": int(xl_end),
+    }
+    return train_indices, val_indices, metadata
+
+
 # ═══════════════════════════════════════════════════════════════
 #  PyTorch Dataset
 # ═══════════════════════════════════════════════════════════════
@@ -363,6 +486,8 @@ class SeismicTraceDataset(Dataset):
         mask: np.ndarray,
         *,
         mask_erosion_samples: int = 0,
+        selected_flat_indices: np.ndarray | None = None,
+        normalization_stats: tuple[float, float] | None = None,
     ) -> None:
         n_il, n_xl, n_sample = seismic.shape
         assert lmf.shape == seismic.shape
@@ -375,25 +500,43 @@ class SeismicTraceDataset(Dataset):
         # 找出掩码中至少有 1 个 True 的道
         has_valid = mask_flat.any(axis=1)
         valid_indices = np.flatnonzero(has_valid)
+        if selected_flat_indices is None:
+            selected_indices = valid_indices
+        else:
+            selected_indices = np.asarray(selected_flat_indices, dtype=np.int64).reshape(-1)
+            if selected_indices.size == 0:
+                raise ValueError("selected_flat_indices must contain at least one trace.")
+            if selected_indices.min() < 0 or selected_indices.max() >= n_il * n_xl:
+                raise ValueError("selected_flat_indices contains out-of-range trace indices.")
+            if not np.all(has_valid[selected_indices]):
+                raise ValueError("selected_flat_indices must refer only to traces with at least one valid mask sample.")
 
         self._seismic_flat = seismic.reshape(n_il * n_xl, n_sample)
         self._lmf_flat = lmf.reshape(n_il * n_xl, n_sample)
         self._mask_flat = mask_flat
         self._loss_mask_flat = loss_mask_flat
         self._taper_flat = taper_flat
-        self._valid_indices = valid_indices
+        self._valid_indices = selected_indices
 
-        # 全局归一化统计量（仅在有效掩码区域内计算）
-        valid_seis = seismic[mask]
-        self._seis_rms = float(np.sqrt(np.mean(valid_seis**2))) + 1e-10
+        if normalization_stats is None:
+            selected_mask = self._mask_flat[self._valid_indices]
+            selected_seismic = self._seismic_flat[self._valid_indices]
+            selected_lmf = self._lmf_flat[self._valid_indices]
 
-        # LMF 归一化：除以全局绝对最大值（保持正值，避免负数导致反射率除零）
-        valid_lmf = lmf[mask]
-        self._lmf_scale = float(np.abs(valid_lmf).max()) + 1e-10
+            # 归一化统计量仅从当前样本集合中估计，避免 train/val 之间的信息泄漏。
+            valid_seis = selected_seismic[selected_mask]
+            self._seis_rms = float(np.sqrt(np.mean(valid_seis**2))) + 1e-10
+
+            # LMF 归一化：除以全局绝对最大值（保持正值，避免负数导致反射率除零）
+            valid_lmf = selected_lmf[selected_mask]
+            self._lmf_scale = float(np.abs(valid_lmf).max()) + 1e-10
+        else:
+            self._seis_rms = float(normalization_stats[0])
+            self._lmf_scale = float(normalization_stats[1])
 
         logger.info(
             "Dataset: %d valid traces / %d total, seis_rms=%.4f, lmf_scale=%.2f, mask_erosion_samples=%d",
-            len(valid_indices),
+            len(self._valid_indices),
             n_il * n_xl,
             self._seis_rms,
             self._lmf_scale,
@@ -412,6 +555,11 @@ class SeismicTraceDataset(Dataset):
     def lmf_scale(self) -> float:
         """LMF 全局缩放因子（绝对最大值）。"""
         return self._lmf_scale
+
+    @property
+    def valid_indices(self) -> np.ndarray:
+        """当前数据集对应的展平 trace 索引。"""
+        return self._valid_indices
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         flat_idx = self._valid_indices[idx]
@@ -442,15 +590,13 @@ class SeismicTraceDataset(Dataset):
         }
 
 
-def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dict[str, Any]]:
-    """根据配置构建完整 Dataset。
+def build_dataset(cfg: GINNConfig) -> DatasetBundle:
+    """根据配置构建训练/验证/推理数据集。
 
     Returns
     -------
-    dataset : SeismicTraceDataset
-    wavelet : np.ndarray
-    geometry : dict
-        地震体几何元信息。
+    DatasetBundle
+        包含训练、验证、推理数据集，以及子波与几何信息。
     """
     logger.info("Loading seismic volume...")
     seismic = import_seismic(
@@ -539,11 +685,59 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
     if lmf.shape != seismic.shape:
         raise ValueError(f"LMF shape {lmf.shape} does not match seismic shape {seismic.shape}.")
 
-    dataset = SeismicTraceDataset(
+    base_dataset = SeismicTraceDataset(
         seismic,
         lmf,
         mask,
         mask_erosion_samples=cfg.mask_erosion_samples,
+    )
+
+    train_indices = base_dataset.valid_indices
+    val_indices: np.ndarray | None = None
+    split_metadata: Dict[str, Any] = {
+        "mode": "none",
+        "train_trace_count": int(train_indices.size),
+        "val_trace_count": 0,
+        "gap_trace_count": 0,
+    }
+    if cfg.validation_split_mode == "spatial_block" and cfg.validation_fraction > 0.0:
+        train_indices, val_indices, split_metadata = _select_spatial_validation_split(
+            base_dataset.valid_indices,
+            n_il=n_il,
+            n_xl=n_xl,
+            validation_fraction=cfg.validation_fraction,
+            gap_traces=cfg.validation_gap_traces,
+            anchor=cfg.validation_block_anchor,
+        )
+        logger.info("Validation split: %s", split_metadata)
+    else:
+        logger.info("Validation split disabled.")
+
+    train_dataset = SeismicTraceDataset(
+        seismic,
+        lmf,
+        mask,
+        mask_erosion_samples=cfg.mask_erosion_samples,
+        selected_flat_indices=train_indices,
+    )
+    train_norm_stats = (train_dataset.seis_rms, train_dataset.lmf_scale)
+    val_dataset = None
+    if val_indices is not None and val_indices.size > 0:
+        val_dataset = SeismicTraceDataset(
+            seismic,
+            lmf,
+            mask,
+            mask_erosion_samples=cfg.mask_erosion_samples,
+            selected_flat_indices=val_indices,
+            normalization_stats=train_norm_stats,
+        )
+    inference_dataset = SeismicTraceDataset(
+        seismic,
+        lmf,
+        mask,
+        mask_erosion_samples=cfg.mask_erosion_samples,
+        selected_flat_indices=base_dataset.valid_indices,
+        normalization_stats=train_norm_stats,
     )
 
     logger.info("Generating wavelet...")
@@ -561,8 +755,9 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
             lmf,
             mask,
             unit_wavelet,
-            seis_rms=dataset.seis_rms,
+            seis_rms=train_dataset.seis_rms,
             max_traces=cfg.wavelet_gain_num_traces,
+            candidate_trace_indices=train_dataset.valid_indices,
         )
         cfg.wavelet_gain = resolved_wavelet_gain
 
@@ -573,4 +768,11 @@ def build_dataset(cfg: GINNConfig) -> Tuple[SeismicTraceDataset, np.ndarray, Dic
         length=cfg.wavelet_length,
         gain=float(resolved_wavelet_gain),
     )
-    return dataset, wavelet, geometry
+    return DatasetBundle(
+        train_dataset=train_dataset,
+        inference_dataset=inference_dataset,
+        val_dataset=val_dataset,
+        wavelet=wavelet,
+        geometry=geometry,
+        split_metadata=split_metadata,
+    )

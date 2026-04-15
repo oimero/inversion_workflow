@@ -35,6 +35,10 @@ nav:
       - wtie.processing: api/wtie/processing.md
       - wtie.optimize: api/wtie/optimize.md
       - wtie.utils: api/wtie/utils.md
+    - cup:
+      - 命名空间总览: api/cup/index.md
+      - cup.petrel: api/cup/petrel.md
+      - cup.seismic: api/cup/seismic.md
+      - cup.well: api/cup/well.md
   - 指南:
-      - 导入路径: guide/import-paths.md
       - 常见问题: guide/troubleshooting.md

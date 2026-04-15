@@ -17,7 +17,7 @@ pip install -r requirements-docs.txt
 2. 启动本地预览
 
 ```bash
-pyrhon -m mkdocs serve
+python -m mkdocs serve
 ```
 
 3. 打开浏览器访问

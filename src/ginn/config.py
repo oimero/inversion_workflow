@@ -53,8 +53,8 @@ class GINNConfig:
 
     # ── 低频模型 ──────────────────────────────────────────────
     lfm_source: LfmSource = "filtered_inversion_lfm"  # 低频模型来源：预计算结果或对阻抗体低通。
-    precomputed_lfm_file: Path = Path("your_precomputed_lfm_file.npz")  # wtie_time_lfm
-    lfm_reference_impedance_file: Path = Path("your_reference_impedance_file.sgy")  # filtered_inversion_lfm
+    precomputed_lfm_file: Path | None = None  # wtie_time_lfm
+    lfm_reference_impedance_file: Path | None = None  # filtered_inversion_lfm
     lfm_cutoff_hz: float = 10.0  # 生成 LFM 时的 Butterworth 低通截止频率（Hz）。
     lfm_filter_order: int = 6  # 生成 LFM 时的零相位滤波器阶数。
 
@@ -101,6 +101,8 @@ class GINNConfig:
     def __post_init__(self) -> None:
         for field_name in _PATH_FIELDS:
             value = getattr(self, field_name)
+            if value is None:
+                continue
             if not isinstance(value, Path):
                 setattr(self, field_name, Path(value))
 
@@ -114,6 +116,13 @@ class GINNConfig:
         valid_lfm_sources = {"wtie_time_lfm", "filtered_inversion_lfm"}
         if self.lfm_source not in valid_lfm_sources:
             raise ValueError(f"Unsupported lfm_source={self.lfm_source!r}, expected one of {sorted(valid_lfm_sources)}")
+        if self.lfm_source == "wtie_time_lfm" and self.precomputed_lfm_file is None:
+            raise ValueError("precomputed_lfm_file is required when lfm_source='wtie_time_lfm'.")
+        if self.lfm_source == "filtered_inversion_lfm" and self.lfm_reference_impedance_file is None:
+            raise ValueError(
+                "lfm_reference_impedance_file is required when "
+                "lfm_source='filtered_inversion_lfm'."
+            )
         valid_validation_modes = {"none", "spatial_block"}
         if self.validation_split_mode not in valid_validation_modes:
             raise ValueError(
@@ -153,12 +162,21 @@ class GINNConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "GINNConfig":
         normalized = dict(data)
+        optional_path_fields = {"precomputed_lfm_file", "lfm_reference_impedance_file"}
 
         for field_name in _PATH_FIELDS:
-            if field_name not in normalized or normalized[field_name] is None:
+            if field_name not in normalized:
                 continue
 
-            path = Path(normalized[field_name])
+            raw_value = normalized[field_name]
+            if raw_value is None:
+                continue
+
+            if field_name in optional_path_fields and isinstance(raw_value, str) and not raw_value.strip():
+                normalized[field_name] = None
+                continue
+
+            path = Path(raw_value)
             if base_dir is not None and not path.is_absolute():
                 path = (base_dir / path).resolve()
             normalized[field_name] = path

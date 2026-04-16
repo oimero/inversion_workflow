@@ -30,15 +30,15 @@ class GINNConfig:
     """
 
     # ── 数据路径 ──────────────────────────────────────────────
-    seismic_file: Path = Path("data/raw/mero se 0116_1ms_new_84_coord.Sgy")  # 输入地震体路径。
-    top_horizon_file: Path = Path("data/interpre_time/bve_top_t")  # 目标层顶界解释面路径。
-    bot_horizon_file: Path = Path("data/interpre_time/itp_bot_t")  # 目标层底界解释面路径。
+    seismic_file: Path = Path("your_seismic_file.sgy")  # 输入地震体路径。
+    top_horizon_file: Path = Path("your_top_horizon_file")  # 目标层顶界解释面路径。
+    bot_horizon_file: Path = Path("your_bot_horizon_file")  # 目标层底界解释面路径。
 
     # ── 地震几何（SEG-Y 头字节位置与步长，与 notebook 一致） ──
-    segy_iline: int = 5  # inline 头字节位置。
-    segy_xline: int = 21  # xline 头字节位置。
+    segy_iline: int = 189  # inline 头字节位置。
+    segy_xline: int = 193  # xline 头字节位置。
     segy_istep: int = 1  # inline 抽样步长。
-    segy_xstep: int = 4  # xline 抽样步长。
+    segy_xstep: int = 1  # xline 抽样步长。
 
     # ── 采样参数 ──────────────────────────────────────────────
     dt: float = 0.001  # 体数据采样间隔（秒）。
@@ -47,16 +47,14 @@ class GINNConfig:
     wavelet_type: str = "ricker"  # 正演使用的子波类型。
     wavelet_freq: float = 25.0  # 子波主频（Hz）。
     wavelet_dt: float = 0.001  # 子波采样间隔（秒）。
-    wavelet_length: int = 101  # 子波长度（采样点数，建议奇数）。
+    wavelet_length: int = 301  # 子波长度（采样点数，建议奇数）。
     wavelet_gain: float | None = None  # 子波增益；为空时根据样本道自动估计。
     wavelet_gain_num_traces: int = 256  # 自动估计子波增益时采样的有效道数。
 
     # ── 低频模型 ──────────────────────────────────────────────
     lfm_source: LfmSource = "filtered_inversion_lfm"  # 低频模型来源：预计算结果或对阻抗体低通。
-    precomputed_lfm_file: Path = Path("data/output_lfm_time_from_wtie/lfm_time_from_wtie.npz")  # 预计算 LFM 文件。
-    lfm_reference_impedance_file: Path = Path(
-        "data/raw/inverted_Zp.sgy"
-    )  # 生成 filtered_inversion_lfm 时使用的阻抗体。
+    precomputed_lfm_file: Path = Path("your_precomputed_lfm_file.npz")  # wtie_time_lfm
+    lfm_reference_impedance_file: Path = Path("your_reference_impedance_file.sgy")  # filtered_inversion_lfm
     lfm_cutoff_hz: float = 10.0  # 生成 LFM 时的 Butterworth 低通截止频率（Hz）。
     lfm_filter_order: int = 6  # 生成 LFM 时的零相位滤波器阶数。
 
@@ -77,11 +75,11 @@ class GINNConfig:
 
     # ── 损失与物理约束 ────────────────────────────────────────
     lambda_reg: float = 0.1  # 残差 L2 正则化权重，约束阻抗尺度不要漂移。
-    lambda_tv: float = 0.0  # 残差 TV 正则化权重，抑制目标层边界附近的高频 ringing。
-    ai_min: float = 4000.0  # 目标层内允许的波阻抗下界。
+    lambda_tv: float = 0.0  # 残差 TV 正则化权重，抑制高频 ringing。
+    ai_min: float = 5000.0  # 目标层内允许的波阻抗下界。
     ai_max: float = 20000.0  # 目标层内允许的波阻抗上界。
     zero_residual_outside_mask: bool = True  # 是否将层外残差通过 taper 平滑压回 0。
-    mask_erosion_samples: int = 30  # 同时用于 waveform loss 内缩和 residual halo 宽度。
+    boundary_effect_samples: int = 30  # 同时用于 waveform loss 内缩和 residual halo 宽度。
 
     # ── 验证与早停 ────────────────────────────────────────────
     validation_split_mode: ValidationSplitMode = "spatial_block"  # 验证集切分方式。
@@ -139,8 +137,8 @@ class GINNConfig:
             raise ValueError(f"ai_min must be positive, got {self.ai_min}.")
         if self.ai_max <= self.ai_min:
             raise ValueError(f"ai_max must be greater than ai_min, got ai_min={self.ai_min}, ai_max={self.ai_max}.")
-        if self.mask_erosion_samples < 0:
-            raise ValueError(f"mask_erosion_samples must be non-negative, got {self.mask_erosion_samples}.")
+        if self.boundary_effect_samples < 0:
+            raise ValueError(f"boundary_effect_samples must be non-negative, got {self.boundary_effect_samples}.")
         if not 0.0 <= self.validation_fraction < 1.0:
             raise ValueError(f"validation_fraction must be within [0, 1), got {self.validation_fraction}.")
         if self.validation_gap_traces < 0:

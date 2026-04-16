@@ -685,13 +685,13 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     seismic_flat = seismic.reshape(n_il * n_xl, n_sample)
     lfm_flat = lfm.reshape(n_il * n_xl, n_sample)
     mask_flat = mask.reshape(n_il * n_xl, n_sample)
-    loss_mask_flat = _build_eroded_loss_mask(mask_flat, erosion_samples=cfg.mask_erosion_samples)
-    taper_flat = _build_residual_taper(mask_flat, halo_samples=cfg.mask_erosion_samples)
+    loss_mask_flat = _build_eroded_loss_mask(mask_flat, erosion_samples=cfg.boundary_effect_samples)
+    taper_flat = _build_residual_taper(mask_flat, halo_samples=cfg.boundary_effect_samples)
     all_valid_indices = _get_valid_trace_indices(mask_flat)
     logger.info(
-        "Preprocessed masks: %d valid traces, mask_erosion_samples=%d",
+        "Preprocessed masks: %d valid traces, boundary_effect_samples=%d",
         all_valid_indices.size,
-        cfg.mask_erosion_samples,
+        cfg.boundary_effect_samples,
     )
 
     # ── 验证集切分 ──

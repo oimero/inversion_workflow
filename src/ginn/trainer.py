@@ -90,8 +90,7 @@ class Trainer:
         # ── 损失 ──
         self.criterion = GINNLoss(lambda_reg=cfg.lambda_reg, lambda_tv=cfg.lambda_tv)
         logger.info(
-            "Loss domain: normalized seismic amplitude (obs pre-divided by RMS), "
-            "lambda_reg=%.3e, lambda_tv=%.3e",
+            "Loss domain: normalized seismic amplitude (obs pre-divided by RMS), lambda_reg=%.3e, lambda_tv=%.3e",
             self.cfg.lambda_reg,
             self.cfg.lambda_tv,
         )
@@ -136,23 +135,23 @@ class Trainer:
     def _compose_impedance(
         self,
         x: torch.Tensor,
-        lmf_raw: torch.Tensor,
+        lfm_raw: torch.Tensor,
         taper_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """网络输出区间有界的对数残差并与 LMF 合成阻抗。
+        """网络输出区间有界的对数残差并与 LFM 合成阻抗。
 
         Notes
         -----
         - 使用 ``sigmoid(raw)`` 将目标层内 AI 严格限制到 ``[ai_min, ai_max]``。
-        - 先由 ``log(ai / lmf_raw)`` 反算有界残差，再在 halo 区通过 taper 平滑收口，
-          使层外阻抗退回到 ``lmf_raw``。
+        - 先由 ``log(ai / lfm_raw)`` 反算有界残差，再在 halo 区通过 taper 平滑收口，
+          使层外阻抗退回到 ``lfm_raw``。
         - 若启用 ``zero_residual_outside_mask``，则用 core+halo taper 将层外残差
           平滑压回 0，避免在目的层边界处形成新的硬切。
         """
         raw_residual = self.model(x)
-        safe_lmf = torch.clamp(lmf_raw, min=1e-6)
-        residual_lo = torch.log(torch.full_like(safe_lmf, float(self.cfg.ai_min)) / safe_lmf)
-        residual_hi = torch.log(torch.full_like(safe_lmf, float(self.cfg.ai_max)) / safe_lmf)
+        safe_lfm = torch.clamp(lfm_raw, min=1e-6)
+        residual_lo = torch.log(torch.full_like(safe_lfm, float(self.cfg.ai_min)) / safe_lfm)
+        residual_hi = torch.log(torch.full_like(safe_lfm, float(self.cfg.ai_max)) / safe_lfm)
         alpha = torch.sigmoid(raw_residual)
         residual = residual_lo + (residual_hi - residual_lo) * alpha
 
@@ -161,7 +160,7 @@ class Trainer:
                 raise ValueError("taper_weight is required when zero_residual_outside_mask is enabled.")
             residual = residual * taper_weight.to(dtype=residual.dtype)
 
-        ai = lmf_raw * torch.exp(residual)
+        ai = lfm_raw * torch.exp(residual)
         return ai, residual
 
     def _run_epoch(self, dataloader: DataLoader, *, training: bool) -> dict[str, float]:
@@ -183,10 +182,10 @@ class Trainer:
                 core_mask = batch["mask"].to(self.device)  # (B, 1, T)
                 loss_mask = batch["loss_mask"].to(self.device)  # (B, 1, T)
                 taper_weight = batch["taper_weight"].to(self.device)  # (B, 1, T)
-                lmf_raw = batch["lmf_raw"].to(self.device)  # (B, 1, T)
+                lfm_raw = batch["lfm_raw"].to(self.device)  # (B, 1, T)
 
                 # 1. 网络前向 + 阻抗合成
-                ai, residual = self._compose_impedance(x, lmf_raw, taper_weight)
+                ai, residual = self._compose_impedance(x, lfm_raw, taper_weight)
 
                 # 2. 物理正演
                 d_syn = self.forward_model(ai)  # (B, 1, T)
@@ -267,7 +266,7 @@ class Trainer:
                 "config": config_payload,
                 "normalization": {
                     "seis_rms": self.dataset.seis_rms,
-                    "lmf_scale": self.dataset.lmf_scale,
+                    "lfm_scale": self.dataset.lfm_scale,
                 },
                 "split_metadata": self.split_metadata,
             },
@@ -410,10 +409,10 @@ class Trainer:
 
         for batch in full_loader:
             x = batch["input"].to(self.device)
-            lmf_raw = batch["lmf_raw"].to(self.device)
+            lfm_raw = batch["lfm_raw"].to(self.device)
             taper_weight = batch["taper_weight"].to(self.device)
 
-            ai, _ = self._compose_impedance(x, lmf_raw, taper_weight)
+            ai, _ = self._compose_impedance(x, lfm_raw, taper_weight)
 
             predictions.append(ai.squeeze(1).cpu().numpy())
 

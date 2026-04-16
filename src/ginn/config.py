@@ -8,7 +8,7 @@ from typing import Any, Dict, Literal, Tuple
 
 import yaml
 
-LmfSource = Literal["wtie_time_lfm", "filtered_inversion_lmf"]
+LfmSource = Literal["wtie_time_lfm", "filtered_inversion_lfm"]
 ValidationSplitMode = Literal["none", "spatial_block"]
 ValidationBlockAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"]
 
@@ -16,8 +16,8 @@ _PATH_FIELDS = {
     "seismic_file",
     "top_horizon_file",
     "bot_horizon_file",
-    "precomputed_lmf_file",
-    "lmf_reference_impedance_file",
+    "precomputed_lfm_file",
+    "lfm_reference_impedance_file",
     "checkpoint_dir",
 }
 
@@ -52,14 +52,16 @@ class GINNConfig:
     wavelet_gain_num_traces: int = 256  # 自动估计子波增益时采样的有效道数。
 
     # ── 低频模型 ──────────────────────────────────────────────
-    lmf_source: LmfSource = "filtered_inversion_lmf"  # 低频模型来源：预计算结果或对阻抗体低通。
-    precomputed_lmf_file: Path = Path("data/output_lfm_time_from_wtie/lfm_time_from_wtie.npz")  # 预计算 LMF 文件。
-    lmf_reference_impedance_file: Path = Path("data/raw/inverted_Zp.sgy")  # 生成 filtered_inversion_lmf 时使用的阻抗体。
-    lmf_cutoff_hz: float = 10.0  # 生成 LMF 时的 Butterworth 低通截止频率（Hz）。
-    lmf_filter_order: int = 6  # 生成 LMF 时的零相位滤波器阶数。
+    lfm_source: LfmSource = "filtered_inversion_lfm"  # 低频模型来源：预计算结果或对阻抗体低通。
+    precomputed_lfm_file: Path = Path("data/output_lfm_time_from_wtie/lfm_time_from_wtie.npz")  # 预计算 LFM 文件。
+    lfm_reference_impedance_file: Path = Path(
+        "data/raw/inverted_Zp.sgy"
+    )  # 生成 filtered_inversion_lfm 时使用的阻抗体。
+    lfm_cutoff_hz: float = 10.0  # 生成 LFM 时的 Butterworth 低通截止频率（Hz）。
+    lfm_filter_order: int = 6  # 生成 LFM 时的零相位滤波器阶数。
 
     # ── 网络结构 ──────────────────────────────────────────────
-    in_channels: int = 2  # 网络输入通道数，默认是地震 + LMF。
+    in_channels: int = 2  # 网络输入通道数，默认是地震 + LFM。
     hidden_channels: int = 64  # 残差块内部的隐藏通道数。
     out_channels: int = 1  # 网络输出通道数，对应阻抗残差。
     num_res_blocks: int = 8  # 残差块数量。
@@ -111,9 +113,9 @@ class GINNConfig:
         if len(self.dilations) != self.num_res_blocks:
             raise ValueError(f"len(dilations)={len(self.dilations)} != num_res_blocks={self.num_res_blocks}")
 
-        valid_lmf_sources = {"wtie_time_lfm", "filtered_inversion_lmf"}
-        if self.lmf_source not in valid_lmf_sources:
-            raise ValueError(f"Unsupported lmf_source={self.lmf_source!r}, expected one of {sorted(valid_lmf_sources)}")
+        valid_lfm_sources = {"wtie_time_lfm", "filtered_inversion_lfm"}
+        if self.lfm_source not in valid_lfm_sources:
+            raise ValueError(f"Unsupported lfm_source={self.lfm_source!r}, expected one of {sorted(valid_lfm_sources)}")
         valid_validation_modes = {"none", "spatial_block"}
         if self.validation_split_mode not in valid_validation_modes:
             raise ValueError(
@@ -140,17 +142,13 @@ class GINNConfig:
         if self.mask_erosion_samples < 0:
             raise ValueError(f"mask_erosion_samples must be non-negative, got {self.mask_erosion_samples}.")
         if not 0.0 <= self.validation_fraction < 1.0:
-            raise ValueError(
-                f"validation_fraction must be within [0, 1), got {self.validation_fraction}."
-            )
+            raise ValueError(f"validation_fraction must be within [0, 1), got {self.validation_fraction}.")
         if self.validation_gap_traces < 0:
             raise ValueError(f"validation_gap_traces must be non-negative, got {self.validation_gap_traces}.")
         if self.early_stopping_patience < 0:
             raise ValueError(f"early_stopping_patience must be non-negative, got {self.early_stopping_patience}.")
         if self.early_stopping_min_delta < 0.0:
-            raise ValueError(
-                f"early_stopping_min_delta must be non-negative, got {self.early_stopping_min_delta}."
-            )
+            raise ValueError(f"early_stopping_min_delta must be non-negative, got {self.early_stopping_min_delta}.")
         if self.early_stopping_warmup < 0:
             raise ValueError(f"early_stopping_warmup must be non-negative, got {self.early_stopping_warmup}.")
 

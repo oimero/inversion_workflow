@@ -92,15 +92,15 @@ def make_lowfreq_model(
     filtered = traces.copy()
     if np.any(active_mask):
         filtered[active_mask] = sosfiltfilt(sos, traces[active_mask], axis=-1)
-    lmf = filtered.reshape(n_il, n_xl, n_sample)
+    lfm = filtered.reshape(n_il, n_xl, n_sample)
 
     logger.info(
-        "Generated LMF: cutoff=%.1f Hz, order=%d, shape=%s",
+        "Generated LFM: cutoff=%.1f Hz, order=%d, shape=%s",
         cutoff_hz,
         order,
-        lmf.shape,
+        lfm.shape,
     )
-    return lmf.astype(np.float32)
+    return lfm.astype(np.float32)
 
 
 def load_lowfreq_model(lowfreq_file: Path) -> np.ndarray:
@@ -120,12 +120,12 @@ def load_lowfreq_model(lowfreq_file: Path) -> np.ndarray:
                 volume = archive[archive.files[0]]
             else:
                 raise ValueError(
-                    f"Expected key 'volume' in precomputed LMF archive or exactly one array, got {archive.files}."
+                    f"Expected key 'volume' in precomputed LFM archive or exactly one array, got {archive.files}."
                 )
 
             if "metadata_json" in archive.files:
                 metadata = json.loads(np.asarray(archive["metadata_json"]).item())
-                logger.info("Loaded precomputed LMF metadata: %s", metadata)
+                logger.info("Loaded precomputed LFM metadata: %s", metadata)
     else:
         raise ValueError(f"Unsupported low-frequency model file type: {lowfreq_path.suffix}")
 
@@ -180,7 +180,7 @@ def make_wavelet(
 
 def estimate_wavelet_gain(
     seismic: np.ndarray,
-    lmf: np.ndarray,
+    lfm: np.ndarray,
     mask: np.ndarray,
     unit_wavelet: np.ndarray,
     *,
@@ -192,7 +192,7 @@ def estimate_wavelet_gain(
     """基于样本道估计使合成地震与归一化观测同量级的子波增益。
 
     思路：
-    1. 用单位增益子波对 LMF 做正演，得到 ``d_syn_unit``；
+    1. 用单位增益子波对 LFM 做正演，得到 ``d_syn_unit``；
     2. 在同一批掩码样本上计算 ``d_syn_unit`` 的 RMS；
     3. 计算该批观测地震归一化后的 RMS；
     4. 令 ``gain = obs_norm_rms / syn_unit_rms``。
@@ -201,7 +201,7 @@ def estimate_wavelet_gain(
 
     n_sample = seismic.shape[-1]
     seismic_flat = seismic.reshape(-1, n_sample)
-    lmf_flat = lmf.reshape(-1, n_sample)
+    lfm_flat = lfm.reshape(-1, n_sample)
     mask_flat = mask.reshape(-1, n_sample).astype(bool, copy=False)
 
     valid_trace_indices = np.flatnonzero(mask_flat.any(axis=1))
@@ -227,9 +227,9 @@ def estimate_wavelet_gain(
         for start in range(0, selected.size, batch_size):
             batch_indices = selected[start : start + batch_size]
 
-            lmf_batch = torch.from_numpy(lmf_flat[batch_indices][:, np.newaxis, :]).float()
+            lfm_batch = torch.from_numpy(lfm_flat[batch_indices][:, np.newaxis, :]).float()
             mask_batch = mask_flat[batch_indices][:, np.newaxis, :]
-            d_syn_unit = forward_model(lmf_batch).cpu().numpy()
+            d_syn_unit = forward_model(lfm_batch).cpu().numpy()
 
             seismic_batch = seismic_flat[batch_indices][:, np.newaxis, :] / float(seis_rms)
             valid_values = mask_batch
@@ -413,12 +413,7 @@ def _select_spatial_validation_split(
     il_end = il_start + block_il
     xl_end = xl_start + block_xl
 
-    val_mask = (
-        (il_coords >= il_start)
-        & (il_coords < il_end)
-        & (xl_coords >= xl_start)
-        & (xl_coords < xl_end)
-    )
+    val_mask = (il_coords >= il_start) & (il_coords < il_end) & (xl_coords >= xl_start) & (xl_coords < xl_end)
     val_indices = valid_indices[val_mask]
     if val_indices.size == 0:
         raise ValueError(
@@ -433,10 +428,7 @@ def _select_spatial_validation_split(
     gap_xl_end = min(xl_end + gap, n_xl)
 
     exclusion_mask = (
-        (il_coords >= gap_il_start)
-        & (il_coords < gap_il_end)
-        & (xl_coords >= gap_xl_start)
-        & (xl_coords < gap_xl_end)
+        (il_coords >= gap_il_start) & (il_coords < gap_il_end) & (xl_coords >= gap_xl_start) & (xl_coords < gap_xl_end)
     )
     train_indices = valid_indices[~exclusion_mask]
     gap_only_mask = exclusion_mask & ~val_mask
@@ -472,18 +464,18 @@ class SeismicTraceDataset(Dataset):
     """逐道 1D 地震数据 Dataset。
 
     每个 item 包含：
-    - ``input``：(2, n_sample) — 归一化地震道 + 归一化 LMF
+    - ``input``：(2, n_sample) — 归一化地震道 + 归一化 LFM
     - ``obs``：(1, n_sample) — 归一化观测地震道（用于损失计算）
     - ``mask``：(1, n_sample) — core 布尔掩码（与旧接口兼容）
     - ``loss_mask``：(1, n_sample) — eroded core 掩码，仅用于 waveform loss
     - ``taper_weight``：(1, n_sample) — core+halo 平滑权重，用于 residual 收口
-    - ``lmf_raw``：(1, n_sample) — 原始 LMF（用于正演时恢复阻抗）
+    - ``lfm_raw``：(1, n_sample) — 原始 LFM（用于正演时恢复阻抗）
 
     Parameters
     ----------
     seismic_flat : np.ndarray
         展平地震数据，shape ``(n_traces, n_sample)``。
-    lmf_flat : np.ndarray
+    lfm_flat : np.ndarray
         展平低频模型，shape ``(n_traces, n_sample)``。
     mask_flat : np.ndarray
         展平布尔掩码，shape ``(n_traces, n_sample)``。
@@ -494,13 +486,13 @@ class SeismicTraceDataset(Dataset):
     selected_indices : np.ndarray
         要使用的展平道索引。
     normalization_stats : tuple[float, float] | None
-        如果提供，使用指定的 ``(seis_rms, lmf_scale)`` 而不是自行估计。
+        如果提供，使用指定的 ``(seis_rms, lfm_scale)`` 而不是自行估计。
     """
 
     def __init__(
         self,
         seismic_flat: np.ndarray,
-        lmf_flat: np.ndarray,
+        lfm_flat: np.ndarray,
         mask_flat: np.ndarray,
         loss_mask_flat: np.ndarray,
         taper_flat: np.ndarray,
@@ -509,7 +501,7 @@ class SeismicTraceDataset(Dataset):
         normalization_stats: tuple[float, float] | None = None,
     ) -> None:
         n_traces, n_sample = seismic_flat.shape
-        assert lmf_flat.shape == seismic_flat.shape
+        assert lfm_flat.shape == seismic_flat.shape
         assert mask_flat.shape == seismic_flat.shape
         assert loss_mask_flat.shape == seismic_flat.shape
         assert taper_flat.shape == seismic_flat.shape
@@ -519,7 +511,7 @@ class SeismicTraceDataset(Dataset):
             raise ValueError("selected_indices must contain at least one trace.")
 
         self._seismic_flat = seismic_flat
-        self._lmf_flat = lmf_flat
+        self._lfm_flat = lfm_flat
         self._mask_flat = mask_flat
         self._loss_mask_flat = loss_mask_flat
         self._taper_flat = taper_flat
@@ -528,23 +520,23 @@ class SeismicTraceDataset(Dataset):
         if normalization_stats is None:
             selected_mask = self._mask_flat[self._valid_indices]
             selected_seismic = self._seismic_flat[self._valid_indices]
-            selected_lmf = self._lmf_flat[self._valid_indices]
+            selected_lfm = self._lfm_flat[self._valid_indices]
 
             valid_seis = selected_seismic[selected_mask]
             self._seis_rms = float(np.sqrt(np.mean(valid_seis**2))) + 1e-10
 
-            valid_lmf = selected_lmf[selected_mask]
-            self._lmf_scale = float(np.abs(valid_lmf).max()) + 1e-10
+            valid_lfm = selected_lfm[selected_mask]
+            self._lfm_scale = float(np.abs(valid_lfm).max()) + 1e-10
         else:
             self._seis_rms = float(normalization_stats[0])
-            self._lmf_scale = float(normalization_stats[1])
+            self._lfm_scale = float(normalization_stats[1])
 
         logger.info(
-            "Dataset: %d selected traces / %d total, seis_rms=%.4f, lmf_scale=%.2f",
+            "Dataset: %d selected traces / %d total, seis_rms=%.4f, lfm_scale=%.2f",
             len(self._valid_indices),
             n_traces,
             self._seis_rms,
-            self._lmf_scale,
+            self._lfm_scale,
         )
 
     def __len__(self) -> int:
@@ -556,9 +548,9 @@ class SeismicTraceDataset(Dataset):
         return self._seis_rms
 
     @property
-    def lmf_scale(self) -> float:
-        """LMF 全局缩放因子（绝对最大值）。"""
-        return self._lmf_scale
+    def lfm_scale(self) -> float:
+        """LFM 全局缩放因子（绝对最大值）。"""
+        return self._lfm_scale
 
     @property
     def valid_indices(self) -> np.ndarray:
@@ -569,20 +561,20 @@ class SeismicTraceDataset(Dataset):
         flat_idx = self._valid_indices[idx]
 
         seis = self._seismic_flat[flat_idx].copy()  # (n_sample,)
-        lmf = self._lmf_flat[flat_idx].copy()  # (n_sample,)
+        lfm = self._lfm_flat[flat_idx].copy()  # (n_sample,)
         core_mask = self._mask_flat[flat_idx].copy()  # (n_sample,)
         loss_mask = self._loss_mask_flat[flat_idx].copy()  # (n_sample,)
         taper_weight = self._taper_flat[flat_idx].copy()  # (n_sample,)
 
-        # 保留 LMF 原始量纲用于物理正演
-        lmf_raw = lmf.copy()
+        # 保留 LFM 原始量纲用于物理正演
+        lfm_raw = lfm.copy()
 
-        # 归一化：地震道除以 RMS，LMF 除以全局最大值（保持正值）
+        # 归一化：地震道除以 RMS，LFM 除以全局最大值（保持正值）
         seis_norm = seis / self._seis_rms
-        lmf_norm = lmf / self._lmf_scale
+        lfm_norm = lfm / self._lfm_scale
 
         # 构造 2 通道输入
-        x = np.stack([seis_norm, lmf_norm], axis=0)  # (2, n_sample)
+        x = np.stack([seis_norm, lfm_norm], axis=0)  # (2, n_sample)
 
         return {
             "input": torch.from_numpy(x).float(),  # (2, n_sample)
@@ -590,7 +582,7 @@ class SeismicTraceDataset(Dataset):
             "mask": torch.from_numpy(core_mask[np.newaxis]).bool(),  # (1, n_sample)
             "loss_mask": torch.from_numpy(loss_mask[np.newaxis]).bool(),  # (1, n_sample)
             "taper_weight": torch.from_numpy(taper_weight[np.newaxis]).float(),  # (1, n_sample)
-            "lmf_raw": torch.from_numpy(lmf_raw[np.newaxis]).float(),  # (1, n_sample)
+            "lfm_raw": torch.from_numpy(lfm_raw[np.newaxis]).float(),  # (1, n_sample)
         }
 
 
@@ -661,37 +653,37 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     )
     mask = target_layer.to_mask()
 
-    if cfg.lmf_source == "wtie_time_lfm":
-        logger.info("Loading precomputed low-frequency model from %s...", cfg.precomputed_lmf_file)
-        lmf = load_lowfreq_model(cfg.precomputed_lmf_file)
-    elif cfg.lmf_source == "filtered_inversion_lmf":
+    if cfg.lfm_source == "wtie_time_lfm":
+        logger.info("Loading precomputed low-frequency model from %s...", cfg.precomputed_lfm_file)
+        lfm = load_lowfreq_model(cfg.precomputed_lfm_file)
+    elif cfg.lfm_source == "filtered_inversion_lfm":
         logger.info("Loading inversion volume...")
         inversion = import_seismic(
-            cfg.lmf_reference_impedance_file,
+            cfg.lfm_reference_impedance_file,
             seismic_type="segy",
         )
         if inversion.shape != seismic.shape:
             raise ValueError(f"Inversion shape {inversion.shape} does not match seismic shape {seismic.shape}.")
 
         logger.info("Generating low-frequency model from inversion volume...")
-        lmf = make_lowfreq_model(
+        lfm = make_lowfreq_model(
             inversion,
             dt_s=cfg.dt,
-            cutoff_hz=cfg.lmf_cutoff_hz,
-            order=cfg.lmf_filter_order,
+            cutoff_hz=cfg.lfm_cutoff_hz,
+            order=cfg.lfm_filter_order,
         )
     else:
-        raise ValueError(f"Unsupported lmf_source: {cfg.lmf_source}")
+        raise ValueError(f"Unsupported lfm_source: {cfg.lfm_source}")
 
     logger.info("Building horizon mask from TargetLayer (erosion disabled for now)...")
     if mask.shape != seismic.shape:
         raise ValueError(f"Mask shape {mask.shape} does not match seismic shape {seismic.shape}.")
-    if lmf.shape != seismic.shape:
-        raise ValueError(f"LMF shape {lmf.shape} does not match seismic shape {seismic.shape}.")
+    if lfm.shape != seismic.shape:
+        raise ValueError(f"LFM shape {lfm.shape} does not match seismic shape {seismic.shape}.")
 
     # ── 展平并预计算掩码 / taper（只算一次） ──
     seismic_flat = seismic.reshape(n_il * n_xl, n_sample)
-    lmf_flat = lmf.reshape(n_il * n_xl, n_sample)
+    lfm_flat = lfm.reshape(n_il * n_xl, n_sample)
     mask_flat = mask.reshape(n_il * n_xl, n_sample)
     loss_mask_flat = _build_eroded_loss_mask(mask_flat, erosion_samples=cfg.mask_erosion_samples)
     taper_flat = _build_residual_taper(mask_flat, halo_samples=cfg.mask_erosion_samples)
@@ -725,17 +717,19 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         logger.info("Validation split disabled.")
 
     # ── 构建数据集（共享预计算的掩码 / taper，不重复计算） ──
-    shared = (seismic_flat, lmf_flat, mask_flat, loss_mask_flat, taper_flat)
+    shared = (seismic_flat, lfm_flat, mask_flat, loss_mask_flat, taper_flat)
     train_dataset = SeismicTraceDataset(*shared, train_indices)
-    train_norm_stats = (train_dataset.seis_rms, train_dataset.lmf_scale)
+    train_norm_stats = (train_dataset.seis_rms, train_dataset.lfm_scale)
     val_dataset = None
     if val_indices is not None and val_indices.size > 0:
         val_dataset = SeismicTraceDataset(
-            *shared, val_indices,
+            *shared,
+            val_indices,
             normalization_stats=train_norm_stats,
         )
     inference_dataset = SeismicTraceDataset(
-        *shared, all_valid_indices,
+        *shared,
+        all_valid_indices,
         normalization_stats=train_norm_stats,
     )
 
@@ -751,7 +745,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         )
         resolved_wavelet_gain = estimate_wavelet_gain(
             seismic,
-            lmf,
+            lfm,
             mask,
             unit_wavelet,
             seis_rms=train_dataset.seis_rms,

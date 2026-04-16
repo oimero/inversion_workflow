@@ -1873,27 +1873,36 @@ def convert_log_from_md_to_twt(
     # Interpolate table to log sampling rate (MD domain)
     table_at_dz = table.depth_interpolation(dz)
 
-    # Find start index using MD (table.depth returns MD when is_md_domain is True)
-    idx_start = np.argmin(np.abs(table_at_dz.depth - log.basis[0])).item()
+    log_md = np.asarray(log.basis, dtype=float)
+    table_md = np.asarray(table_at_dz.depth, dtype=float)
+    overlap_min = max(float(log_md[0]), float(table_md[0]))
+    overlap_max = min(float(log_md[-1]), float(table_md[-1]))
+    if overlap_max < overlap_min:
+        raise ValueError("Log MD range and time-depth table MD range do not overlap.")
 
-    # Truncate log if longer than table relationship
-    if idx_start + len(log) >= len(table_at_dz):
+    overlap_mask = (table_md >= overlap_min) & (table_md <= overlap_max)
+    if np.count_nonzero(overlap_mask) < 2:
+        raise ValueError("Insufficient overlapping MD samples to convert log from MD to TWT.")
+
+    if overlap_min > float(log_md[0]):
+        warnings.warn("Clipping log start to match the time-depth table (MD) minimum depth.")
+    if overlap_max < float(log_md[-1]):
         warnings.warn("Truncating log as the time-depth table (MD) does not reach the maximum depth.")
-        max_idx = len(table_at_dz) - idx_start
-        log = Log(
-            log.values[:max_idx],
-            log.basis[:max_idx],
-            _inverted_name(log.basis_type),
-            name=log.name,
-        )
 
-    # Get corresponding TWT (non-linear relative to MD)
-    log_twt = table_at_dz.twt[idx_start : idx_start + len(log)]
+    overlap_md = table_md[overlap_mask]
+    overlap_twt = np.asarray(table_at_dz.twt, dtype=float)[overlap_mask]
+    overlap_values = np.interp(overlap_md, log_md, np.asarray(log.values, dtype=float))
 
     # Interpolate to regular TWT sampling (dt)
-    linear_twt = np.arange(log_twt[0], log_twt[-1] + dt, dt)
+    linear_twt = np.arange(overlap_twt[0], overlap_twt[-1] + dt, dt)
 
-    interp = _interp1d(log_twt, log.values, bounds_error=False, fill_value=log.values[-1], kind=interpolation)
+    interp = _interp1d(
+        overlap_twt,
+        overlap_values,
+        bounds_error=False,
+        fill_value=(overlap_values[0], overlap_values[-1]),
+        kind=interpolation,
+    )
     values_at_dt = interp(linear_twt)
 
     return Log(values_at_dt, linear_twt, "twt", name=log.name, allow_nan=log.allow_nan)

@@ -655,11 +655,11 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
 
     if cfg.lfm_source == "wtie_time_lfm":
         logger.info("Loading precomputed low-frequency model from %s...", cfg.precomputed_lfm_file)
-        lfm = load_lowfreq_model(cfg.precomputed_lfm_file)
+        lfm = load_lowfreq_model(cfg.precomputed_lfm_file)  # type: ignore
     elif cfg.lfm_source == "filtered_inversion_lfm":
         logger.info("Loading inversion volume...")
         inversion = import_seismic(
-            cfg.lfm_reference_impedance_file,
+            cfg.lfm_reference_impedance_file,  # type: ignore
             seismic_type="segy",
         )
         if inversion.shape != seismic.shape:
@@ -675,7 +675,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     else:
         raise ValueError(f"Unsupported lfm_source: {cfg.lfm_source}")
 
-    logger.info("Building horizon mask from TargetLayer (erosion disabled for now)...")
+    logger.info("Building horizon mask from TargetLayer...")
     if mask.shape != seismic.shape:
         raise ValueError(f"Mask shape {mask.shape} does not match seismic shape {seismic.shape}.")
     if lfm.shape != seismic.shape:

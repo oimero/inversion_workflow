@@ -53,8 +53,8 @@ class GINNConfig:
 
     # ── 低频模型 ──────────────────────────────────────────────
     lfm_source: LfmSource = "filtered_inversion_lfm"  # 低频模型来源：预计算结果或对阻抗体低通。
-    precomputed_lfm_file: Path | None = None  # wtie_time_lfm
-    lfm_reference_impedance_file: Path | None = None  # filtered_inversion_lfm
+    precomputed_lfm_file: Path | None = Path("your_precomputed_lfm_file")  # wtie_time_lfm
+    lfm_reference_impedance_file: Path | None = Path("your_lfm_reference_impedance_file")  # filtered_inversion_lfm
     lfm_cutoff_hz: float = 10.0  # 生成 LFM 时的 Butterworth 低通截止频率（Hz）。
     lfm_filter_order: int = 6  # 生成 LFM 时的零相位滤波器阶数。
 
@@ -74,7 +74,7 @@ class GINNConfig:
     grad_clip: float = 1.0  # 梯度裁剪阈值。
 
     # ── 损失与物理约束 ────────────────────────────────────────
-    lambda_reg: float = 0.1  # 残差 L2 正则化权重，约束阻抗尺度不要漂移。
+    lambda_l2: float = 0.1  # 残差 L2 正则化权重，约束阻抗尺度不要漂移。
     lambda_tv: float = 0.0  # 残差 TV 正则化权重，抑制高频 ringing。
     ai_min: float = 5000.0  # 目标层内允许的波阻抗下界。
     ai_max: float = 20000.0  # 目标层内允许的波阻抗上界。
@@ -119,10 +119,7 @@ class GINNConfig:
         if self.lfm_source == "wtie_time_lfm" and self.precomputed_lfm_file is None:
             raise ValueError("precomputed_lfm_file is required when lfm_source='wtie_time_lfm'.")
         if self.lfm_source == "filtered_inversion_lfm" and self.lfm_reference_impedance_file is None:
-            raise ValueError(
-                "lfm_reference_impedance_file is required when "
-                "lfm_source='filtered_inversion_lfm'."
-            )
+            raise ValueError("lfm_reference_impedance_file is required when lfm_source='filtered_inversion_lfm'.")
         valid_validation_modes = {"none", "spatial_block"}
         if self.validation_split_mode not in valid_validation_modes:
             raise ValueError(

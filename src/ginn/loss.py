@@ -18,12 +18,12 @@ class GINNLoss(nn.Module):
 
     .. math::
         \\mathcal{L} = \\underbrace{\\frac{\\sum |d_{syn} - d_{obs}| \\cdot m}{\\sum m}}_{\\text{waveform MAE}}
-        + \\lambda_{reg} \\cdot \\underbrace{\\frac{\\sum \\Delta^2 \\cdot m}{\\sum m}}_{\\text{residual L2 reg}}
+        + \\lambda_{l2} \\cdot \\underbrace{\\frac{\\sum \\Delta^2 \\cdot m}{\\sum m}}_{\\text{residual L2 reg}}
         + \\lambda_{tv} \\cdot \\underbrace{\\frac{\\sum |\\Delta[t+1] - \\Delta[t]| \\cdot w}{\\sum w}}_{\\text{residual TV reg}}
 
     Parameters
     ----------
-    lambda_reg : float
+    lambda_l2 : float
         残差 L2 正则化权重。默认 0.1。
         物理意义：强制阻抗不偏离低频模型太远，解决反射率比值不变性
         导致的绝对尺度不确定性。
@@ -39,9 +39,9 @@ class GINNLoss(nn.Module):
     物理量级与低频模型一致。
     """
 
-    def __init__(self, lambda_reg: float = 0.1, lambda_tv: float = 0.0) -> None:
+    def __init__(self, lambda_l2: float = 0.1, lambda_tv: float = 0.0) -> None:
         super().__init__()
-        self.lambda_reg = lambda_reg
+        self.lambda_l2 = lambda_l2
         self.lambda_tv = lambda_tv
 
     def forward(
@@ -96,9 +96,9 @@ class GINNLoss(nn.Module):
         residual_tv = (diff.abs() * pair_weight).sum() / pair_weight_sum
 
         # 总损失
-        total_loss = waveform_mae + self.lambda_reg * residual_l2 + self.lambda_tv * residual_tv
+        total_loss = waveform_mae + self.lambda_l2 * residual_l2 + self.lambda_tv * residual_tv
 
-        reg_term = self.lambda_reg * residual_l2
+        l2_term = self.lambda_l2 * residual_l2
         tv_term = self.lambda_tv * residual_tv
 
         loss_dict = {
@@ -106,9 +106,9 @@ class GINNLoss(nn.Module):
             "waveform_mae": waveform_mae.item(),
             "residual_l2": residual_l2.item(),
             "residual_tv": residual_tv.item(),
-            "reg_term": reg_term.item(),
+            "l2_term": l2_term.item(),
             "tv_term": tv_term.item(),
-            "lambda_reg": float(self.lambda_reg),
+            "lambda_l2": float(self.lambda_l2),
             "lambda_tv": float(self.lambda_tv),
         }
 

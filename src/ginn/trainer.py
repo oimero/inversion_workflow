@@ -88,10 +88,10 @@ class Trainer:
         self.forward_model = ForwardModel(wavelet).to(self.device)
 
         # ── 损失 ──
-        self.criterion = GINNLoss(lambda_reg=cfg.lambda_reg, lambda_tv=cfg.lambda_tv)
+        self.criterion = GINNLoss(lambda_l2=cfg.lambda_l2, lambda_tv=cfg.lambda_tv)
         logger.info(
-            "Loss domain: normalized seismic amplitude (obs pre-divided by RMS), lambda_reg=%.3e, lambda_tv=%.3e",
-            self.cfg.lambda_reg,
+            "Loss domain: normalized seismic amplitude (obs pre-divided by RMS), lambda_l2=%.3e, lambda_tv=%.3e",
+            self.cfg.lambda_l2,
             self.cfg.lambda_tv,
         )
 
@@ -168,7 +168,8 @@ class Trainer:
         self.model.train(training)
         total_loss = 0.0
         total_waveform_mae = 0.0
-        total_reg_term = 0.0
+        total_residual_l2 = 0.0
+        total_l2_term = 0.0
         total_tv_term = 0.0
         total_residual_tv = 0.0
         total_residual_mean = 0.0
@@ -206,7 +207,8 @@ class Trainer:
                 residual_mean = residual.abs().mean().item()
                 total_loss += loss_dict["total"]
                 total_waveform_mae += loss_dict["waveform_mae"]
-                total_reg_term += loss_dict["reg_term"]
+                total_residual_l2 += loss_dict["residual_l2"]
+                total_l2_term += loss_dict["l2_term"]
                 total_tv_term += loss_dict["tv_term"]
                 total_residual_tv += loss_dict["residual_tv"]
                 total_residual_mean += residual_mean
@@ -215,13 +217,14 @@ class Trainer:
                 if training and (batch_idx + 1) % self.cfg.log_interval == 0:
                     lr = self.optimizer.param_groups[0]["lr"]
                     logger.info(
-                        "  [Epoch %d | Batch %d/%d] loss=%.6f (mae=%.6f reg=%.3e tv=%.3e tv_raw=%.3e res=%.3e) lr=%.2e",
+                        "  [Epoch %d | Batch %d/%d] loss=%.6f (mae=%.6f l2_raw=%.3e l2=%.3e tv=%.3e tv_raw=%.3e res=%.3e) lr=%.2e",
                         self.epoch + 1,
                         batch_idx + 1,
                         len(dataloader),
                         loss_dict["total"],
                         loss_dict["waveform_mae"],
-                        loss_dict["reg_term"],
+                        loss_dict["residual_l2"],
+                        loss_dict["l2_term"],
                         loss_dict["tv_term"],
                         loss_dict["residual_tv"],
                         residual_mean,
@@ -232,7 +235,8 @@ class Trainer:
         return {
             "loss": total_loss / n_batches,
             "waveform_mae": total_waveform_mae / n_batches,
-            "reg_term": total_reg_term / n_batches,
+            "residual_l2": total_residual_l2 / n_batches,
+            "l2_term": total_l2_term / n_batches,
             "tv_term": total_tv_term / n_batches,
             "residual_tv": total_residual_tv / n_batches,
             "residual_mean": total_residual_mean / n_batches,
@@ -302,12 +306,13 @@ class Trainer:
 
             if val_metrics is None:
                 logger.info(
-                    "Epoch %d/%d  train_loss=%.6f (mae=%.6f reg=%.3e tv=%.3e tv_raw=%.3e res=%.3e)  lr=%.2e  time=%.1fs",
+                    "Epoch %d/%d  train_loss=%.6f (mae=%.6f l2_raw=%.3e l2=%.3e tv=%.3e tv_raw=%.3e res=%.3e)  lr=%.2e  time=%.1fs",
                     epoch + 1,
                     self.cfg.epochs,
                     train_metrics["loss"],
                     train_metrics["waveform_mae"],
-                    train_metrics["reg_term"],
+                    train_metrics["residual_l2"],
+                    train_metrics["l2_term"],
                     train_metrics["tv_term"],
                     train_metrics["residual_tv"],
                     train_metrics["residual_mean"],
@@ -318,14 +323,15 @@ class Trainer:
                 monitor_name = "train_loss"
             else:
                 logger.info(
-                    "Epoch %d/%d  train_loss=%.6f  val_loss=%.6f  val_mae=%.6f  val_reg=%.3e  "
+                    "Epoch %d/%d  train_loss=%.6f  val_loss=%.6f  val_mae=%.6f  val_l2_raw=%.3e  val_l2=%.3e  "
                     "val_tv=%.3e  val_tv_raw=%.3e  val_res=%.3e  lr=%.2e  time=%.1fs",
                     epoch + 1,
                     self.cfg.epochs,
                     train_metrics["loss"],
                     val_metrics["loss"],
                     val_metrics["waveform_mae"],
-                    val_metrics["reg_term"],
+                    val_metrics["residual_l2"],
+                    val_metrics["l2_term"],
                     val_metrics["tv_term"],
                     val_metrics["residual_tv"],
                     val_metrics["residual_mean"],

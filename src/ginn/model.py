@@ -1,7 +1,7 @@
 """ginn.model — 1D 膨胀卷积残差网络（Dilated ResNet）。
 
 网络接收 2 通道输入（地震 + LFM），输出 1 通道阻抗残差。
-阻抗残差加上 LFM 即得到完整声阻抗。
+阻抗残差结合 LFM 即得到完整声阻抗。
 """
 
 from __future__ import annotations

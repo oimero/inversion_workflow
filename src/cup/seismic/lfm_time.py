@@ -173,6 +173,12 @@ def _build_sample_axis(geometry: Dict[str, Any]) -> np.ndarray:
     return np.arange(sample_min, sample_max + sample_step, sample_step, dtype=float)
 
 
+def _normalize_line_coordinates(coords: np.ndarray, line_min: float, line_step: float) -> np.ndarray:
+    if line_step <= 0:
+        raise ValueError(f"line_step must be positive, got {line_step}.")
+    return (np.asarray(coords, dtype=float) - float(line_min)) / float(line_step)
+
+
 def _nearest_neighbor_range(inlines: np.ndarray, xlines: np.ndarray) -> float:
     if inlines.size <= 1:
         return 1.0
@@ -506,8 +512,14 @@ def _build_zone_slice_model(
     prepared_wells: list[_PreparedLfmTimeWell],
     ilines: np.ndarray,
     xlines: np.ndarray,
+    kriging_ilines: np.ndarray,
+    kriging_xlines: np.ndarray,
     slice_u: np.ndarray,
     *,
+    inline_min: float,
+    inline_step: float,
+    xline_min: float,
+    xline_step: float,
     top_label: str,
     bottom_label: str,
     top_grid: np.ndarray,
@@ -561,13 +573,23 @@ def _build_zone_slice_model(
             slice_variance[slice_idx] = np.zeros((n_il, n_xl), dtype=float)
             slice_modes[slice_idx] = "single_well_constant"
         else:
-            range_hint = _nearest_neighbor_range(control_inlines_arr, control_xlines_arr)
-            field, variance = _krige_slice_on_line_domain(
+            control_inlines_kriging = _normalize_line_coordinates(
                 control_inlines_arr,
+                line_min=inline_min,
+                line_step=inline_step,
+            )
+            control_xlines_kriging = _normalize_line_coordinates(
                 control_xlines_arr,
+                line_min=xline_min,
+                line_step=xline_step,
+            )
+            range_hint = _nearest_neighbor_range(control_inlines_kriging, control_xlines_kriging)
+            field, variance = _krige_slice_on_line_domain(
+                control_inlines_kriging,
+                control_xlines_kriging,
                 control_values_arr,
-                ilines,
-                xlines,
+                kriging_ilines,
+                kriging_xlines,
                 range_hint=range_hint,
                 variogram=variogram,
                 exact=exact,
@@ -609,8 +631,14 @@ def _build_extension_zone(
     prepared_wells: list[_PreparedLfmTimeWell],
     ilines: np.ndarray,
     xlines: np.ndarray,
+    kriging_ilines: np.ndarray,
+    kriging_xlines: np.ndarray,
     slice_u: np.ndarray,
     *,
+    inline_min: float,
+    inline_step: float,
+    xline_min: float,
+    xline_step: float,
     reference_zone: _ZoneSliceModel,
     direction: str,
     extension_samples: int,
@@ -632,7 +660,13 @@ def _build_extension_zone(
             prepared_wells,
             ilines,
             xlines,
+            kriging_ilines,
+            kriging_xlines,
             slice_u,
+            inline_min=inline_min,
+            inline_step=inline_step,
+            xline_min=xline_min,
+            xline_step=xline_step,
             top_label="top_extension",
             bottom_label=reference_zone.top_label,
             top_grid=np.clip(reference_zone.top_grid - extension_samples, 0.0, float(n_sample - 1)),
@@ -658,7 +692,13 @@ def _build_extension_zone(
             prepared_wells,
             ilines,
             xlines,
+            kriging_ilines,
+            kriging_xlines,
             slice_u,
+            inline_min=inline_min,
+            inline_step=inline_step,
+            xline_min=xline_min,
+            xline_step=xline_step,
             top_label=reference_zone.bottom_label,
             bottom_label="bottom_extension",
             top_grid=reference_zone.bottom_grid.copy(),
@@ -870,7 +910,7 @@ def build_lfm_time_model(
         滤波前在井曲线上下两端附加的缓冲时长，单位 s。默认按截止频率自动估算。
     filter_buffer_mode : {"reflect", "edge"}, default="reflect"
         曲线两端缓冲样本的生成方式。
-    post_slice_smoothing : bool, default=True
+    post_slice_smoothing : bool, default=False
         是否对各层段的比例切片结果沿 slice 维做轻度平滑。
 
     Returns
@@ -939,6 +979,12 @@ def build_lfm_time_model(
         float(target_layer.geometry["xline_max"]),
         float(target_layer.geometry["xline_step"]),
     )
+    inline_min = float(target_layer.geometry["inline_min"])
+    inline_step = float(target_layer.geometry["inline_step"])
+    xline_min = float(target_layer.geometry["xline_min"])
+    xline_step = float(target_layer.geometry["xline_step"])
+    kriging_ilines = _normalize_line_coordinates(ilines, line_min=inline_min, line_step=inline_step)
+    kriging_xlines = _normalize_line_coordinates(xlines, line_min=xline_min, line_step=xline_step)
     samples = _build_sample_axis(target_layer.geometry)
     n_il, n_xl, n_sample = ilines.size, xlines.size, samples.size
     sample_min = float(target_layer.geometry["sample_min"])
@@ -980,7 +1026,13 @@ def build_lfm_time_model(
             prepared_wells,
             ilines,
             xlines,
+            kriging_ilines,
+            kriging_xlines,
             slice_u,
+            inline_min=inline_min,
+            inline_step=inline_step,
+            xline_min=xline_min,
+            xline_step=xline_step,
             top_label=top_name,
             bottom_label=bottom_name,
             top_grid=top_grid,
@@ -1015,7 +1067,13 @@ def build_lfm_time_model(
                 prepared_wells,
                 ilines,
                 xlines,
+                kriging_ilines,
+                kriging_xlines,
                 slice_u,
+                inline_min=inline_min,
+                inline_step=inline_step,
+                xline_min=xline_min,
+                xline_step=xline_step,
                 reference_zone=base_zone_models[0],
                 direction="top",
                 extension_samples=extension_samples,
@@ -1038,7 +1096,13 @@ def build_lfm_time_model(
                 prepared_wells,
                 ilines,
                 xlines,
+                kriging_ilines,
+                kriging_xlines,
                 slice_u,
+                inline_min=inline_min,
+                inline_step=inline_step,
+                xline_min=xline_min,
+                xline_step=xline_step,
                 reference_zone=base_zone_models[-1],
                 direction="bottom",
                 extension_samples=extension_samples,
@@ -1086,6 +1150,9 @@ def build_lfm_time_model(
         "filter_buffer_seconds": None if filter_buffer_seconds is None else float(filter_buffer_seconds),
         "filter_buffer_mode": str(filter_buffer_mode),
         "coord_system": "inline_xline",
+        "kriging_coord_system": "inline_xline_normalized_by_step",
+        "kriging_inline_step": inline_step,
+        "kriging_xline_step": xline_step,
         "horizon_names": list(target_layer.horizon_names),
         "zone_names": [[zone.top_label, zone.bottom_label] for zone in modeled_zones],
         "well_names": [well.well_name for well in prepared_wells],

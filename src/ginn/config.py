@@ -74,7 +74,7 @@ class GINNConfig:
     grad_clip: float = 1.0  # 梯度裁剪阈值。
 
     # ── 损失与物理约束 ────────────────────────────────────────
-    lambda_l2: float = 0.1  # 残差 L2 正则化权重，约束阻抗尺度不要漂移。
+    lambda_l2: float = 0.03  # 残差 L2 正则化权重，约束阻抗尺度不要漂移。
     lambda_tv: float = 0.0  # 残差 TV 正则化权重，抑制高频 ringing。
     ai_min: float = 5000.0  # 目标层内允许的波阻抗下界。
     ai_max: float = 20000.0  # 目标层内允许的波阻抗上界。

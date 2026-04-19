@@ -142,22 +142,27 @@ class Trainer:
 
         Notes
         -----
-        - 使用 ``tanh(raw)`` 得到 ``[-1, 1]`` 的有符号系数，表示从 LFM 朝
-          ``ai_min`` 或 ``ai_max`` 移动多少。
-        - 当网络输出为 0 时，层内阻抗回到 ``lfm_raw``；当输出趋近 ±1 时，
-          阻抗分别趋近 ``ai_min`` / ``ai_max``。
-        - 该 hard bound 假设目标层内 ``lfm_raw`` 本身大致位于
-          ``[ai_min, ai_max]`` 内；若 LFM 已经超界，则无法同时严格保留 LFM
-          锚点并满足全局 hard bound。
+        - 先把 ``lfm_raw`` 映射为 ``[ai_min, ai_max]`` 对数区间内的默认
+          logit 位置，再由网络输出对该位置做平滑修正。
+        - 当网络输出为 0 且 LFM 位于边界内时，层内阻抗回到 ``lfm_raw``；
+          LFM 若超出边界，会先被投影到边界内。
+        - 最终 AI 通过对数区间插值合成，始终满足 hard bound。
         - 若启用 ``zero_residual_outside_mask``，则用 core+halo taper 将层外残差
           平滑压回 0，避免在目的层边界处形成新的硬切。
         """
         raw_residual = self.model(x)
         safe_lfm = torch.clamp(lfm_raw, min=1e-6)
-        z = torch.tanh(raw_residual)
-        to_min = torch.log(torch.full_like(safe_lfm, float(self.cfg.ai_min)) / safe_lfm)
-        to_max = torch.log(torch.full_like(safe_lfm, float(self.cfg.ai_max)) / safe_lfm)
-        residual = torch.where(z >= 0, z * to_max, (-z) * to_min)
+        log_min = torch.log(torch.full_like(safe_lfm, float(self.cfg.ai_min)))
+        log_max = torch.log(torch.full_like(safe_lfm, float(self.cfg.ai_max)))
+        log_lfm = torch.log(safe_lfm)
+
+        alpha_eps = 1e-4
+        alpha0 = (log_lfm - log_min) / (log_max - log_min)
+        alpha0 = torch.clamp(alpha0, alpha_eps, 1.0 - alpha_eps)
+        alpha = torch.sigmoid(torch.logit(alpha0) + raw_residual)
+
+        log_ai = log_min + alpha * (log_max - log_min)
+        residual = log_ai - log_lfm
 
         if self.cfg.zero_residual_outside_mask:
             if taper_weight is None:

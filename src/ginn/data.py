@@ -1,8 +1,8 @@
 """ginn.data — 数据加载、预处理与 Dataset 定义。
 
 工作流：
-1. 读取 SEG-Y 地震体和反演体
-2. 读取预计算低频模型或从反演体生成低频模型
+1. 读取 SEG-Y 地震体
+2. 读取预计算低频模型，或从参考阻抗体生成低频模型
 3. 生成理论子波（Ricker）
 4. 从层位文件生成 3D 布尔掩码
 5. 封装为 PyTorch Dataset
@@ -43,12 +43,6 @@ class DatasetBundle:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  SEG-Y I/O
-# ═══════════════════════════════════════════════════════════════
-
-# TODO：待提取为单独函数
-
-# ═══════════════════════════════════════════════════════════════
 #  低频模型
 # ═══════════════════════════════════════════════════════════════
 
@@ -83,7 +77,7 @@ def make_lowfreq_model(
     if cutoff_hz <= 0.0 or cutoff_hz >= nyquist:
         raise ValueError(f"cutoff_hz must be within (0, {nyquist}), got {cutoff_hz}.")
 
-    # 与旧实现保持一致：零相位前后各做一次滤波，因此单程滤波器阶数取 order // 2。
+    # sosfiltfilt 会前后各滤波一次，单程阶数取一半以匹配配置中的总阶数。
     single_pass_order = max(1, order // 2)
     sos = butter(single_pass_order, cutoff_hz, btype="low", fs=fs, output="sos")
 
@@ -466,7 +460,7 @@ class SeismicTraceDataset(Dataset):
     每个 item 包含：
     - ``input``：(2, n_sample) — 归一化地震道 + 归一化 LFM
     - ``obs``：(1, n_sample) — 归一化观测地震道（用于损失计算）
-    - ``mask``：(1, n_sample) — core 布尔掩码（与旧接口兼容）
+    - ``mask``：(1, n_sample) — core 布尔掩码
     - ``loss_mask``：(1, n_sample) — eroded core 掩码，仅用于 waveform loss
     - ``taper_weight``：(1, n_sample) — core+halo 平滑权重，用于 residual 收口
     - ``lfm_raw``：(1, n_sample) — 原始 LFM（用于正演时恢复阻抗）

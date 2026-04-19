@@ -61,7 +61,7 @@ class GINNConfig:
     # ── 网络结构 ──────────────────────────────────────────────
     in_channels: int = 2  # 网络输入通道数，默认是地震 + LFM。
     hidden_channels: int = 64  # 残差块内部的隐藏通道数。
-    out_channels: int = 1  # 网络输出通道数，对应阻抗残差。
+    out_channels: int = 1  # 网络输出通道数，对应对数残差控制量。
     num_res_blocks: int = 8  # 残差块数量。
     dilations: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)  # 各残差块的 dilation 序列。
     kernel_size: int = 3  # 一维卷积核大小。

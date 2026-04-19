@@ -1,7 +1,7 @@
 """ginn.model — 1D 膨胀卷积残差网络（Dilated ResNet）。
 
-网络接收 2 通道输入（地震 + LFM），输出 1 通道阻抗残差。
-阻抗残差结合 LFM 即得到完整声阻抗。
+网络接收 2 通道输入（地震 + LFM），输出 1 通道残差控制量。
+训练器会将该控制量转换为有界对数残差，再与 LFM 合成完整声阻抗。
 """
 
 from __future__ import annotations
@@ -81,14 +81,14 @@ class DilatedResBlock(nn.Module):
 
 
 class DilatedResNet1D(nn.Module):
-    """1D 膨胀卷积 ResNet — GINN 阻抗残差预测骨干网络。
+    """1D 膨胀卷积 ResNet — GINN 残差控制量预测骨干网络。
 
     Architecture
     ------------
     ::
 
         Conv1d(in→hidden) → BN → ReLU
-        → ResBlock(d=1) → ResBlock(d=2) → ... → ResBlock(d=128)
+        → ResBlock(d=dilations[0]) → ... → ResBlock(d=dilations[-1])
         → Conv1d(hidden→out, k=1)
 
     Parameters
@@ -98,7 +98,7 @@ class DilatedResNet1D(nn.Module):
     hidden_channels : int
         残差块内部通道数，默认 64。
     out_channels : int
-        输出通道数，默认 1（阻抗残差）。
+        输出通道数，默认 1（残差控制量）。
     dilations : sequence of int
         各残差块的膨胀倍率。
     kernel_size : int
@@ -155,7 +155,7 @@ class DilatedResNet1D(nn.Module):
         Returns
         -------
         Tensor
-            阻抗残差，shape ``(B, out_channels, T)``。
+            残差控制量，shape ``(B, out_channels, T)``。
         """
         x = self.head(x)
         x = self.res_blocks(x)

@@ -1,6 +1,6 @@
 """ginn.trainer — 主训练循环。
 
-串联 DilatedResNet1D + ForwardModel + MaskedMAELoss，执行标准的
+串联 DilatedResNet1D + ForwardModel + GINNLoss，执行标准的
 前向传播 → 物理正演 → 损失计算 → 反向传播训练流程。
 """
 
@@ -138,7 +138,7 @@ class Trainer:
         lfm_raw: torch.Tensor,
         taper_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """网络输出区间有界的对数残差并与 LFM 合成阻抗。
+        """将网络输出转换为有界对数残差，并与 LFM 合成阻抗。
 
         Notes
         -----

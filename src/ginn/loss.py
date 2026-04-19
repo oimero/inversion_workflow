@@ -2,8 +2,8 @@
 
 组合三项损失：
 1. 掩码 MAE：仅在层位顶底之间计算合成地震与观测地震的平均绝对误差
-2. 残差 L2 正则：防止网络输出的阻抗残差尺度发散（因反射率的比值不变性）
-3. 残差 TV 正则：抑制沿时间轴的一阶高频振荡
+2. 对数残差 L2 正则：防止阻抗偏离 LFM 过远
+3. 对数残差 TV 正则：抑制沿时间轴的一阶高频振荡
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ class GINNLoss(nn.Module):
 
     .. math::
         \\mathcal{L} = \\underbrace{\\frac{\\sum |d_{syn} - d_{obs}| \\cdot m}{\\sum m}}_{\\text{waveform MAE}}
-        + \\lambda_{l2} \\cdot \\underbrace{\\frac{\\sum \\Delta^2 \\cdot m}{\\sum m}}_{\\text{residual L2 reg}}
-        + \\lambda_{tv} \\cdot \\underbrace{\\frac{\\sum |\\Delta[t+1] - \\Delta[t]| \\cdot w}{\\sum w}}_{\\text{residual TV reg}}
+        + \\lambda_{l2} \\cdot \\underbrace{\\frac{\\sum \\phi^2 \\cdot m}{\\sum m}}_{\\text{residual L2}}
+        + \\lambda_{tv} \\cdot \\underbrace{\\frac{\\sum |\\phi[t+1] - \\phi[t]| \\cdot w}{\\sum w}}_{\\text{residual TV}}
 
     Parameters
     ----------
@@ -34,9 +34,8 @@ class GINNLoss(nn.Module):
     Notes
     -----
     反射率公式 ``r = (AI[t+1] - AI[t]) / (AI[t+1] + AI[t])`` 对 AI 的全局
-    缩放是不变的。如果不加约束，网络可以输出任意大的残差 Δ，只要相对
-    变化产生正确的反射率即可。L2 正则化将 Δ 锚定在零附近，确保阻抗
-    物理量级与低频模型一致。
+    缩放是不变的。L2 正则化将对数残差 ``phi`` 锚定在零附近，避免阻抗
+    在满足波形拟合时偏离低频模型过远。
     """
 
     def __init__(self, lambda_l2: float = 0.1, lambda_tv: float = 0.0) -> None:
@@ -66,7 +65,7 @@ class GINNLoss(nn.Module):
         residual_mask : Tensor
             残差正则掩码，shape ``(B, 1, T)``，True 表示参与 residual L2 的区域。
         residual : Tensor
-            网络输出的阻抗残差 Δ，shape ``(B, 1, T)``。
+            与 LFM 合成阻抗的对数残差 ``phi``，shape ``(B, 1, T)``。
         taper_weight : Tensor
             residual 的 core+halo taper 权重，shape ``(B, 1, T)``。
             TV 项使用相邻点对的最小权重作为 pair-wise 支撑。
@@ -86,10 +85,10 @@ class GINNLoss(nn.Module):
         # 波形 MAE
         waveform_mae = ((d_syn - d_obs).abs() * waveform_mask_f).sum() / n_waveform_valid
 
-        # 残差 L2 正则化（仅在掩码区域内）
+        # 对数残差 L2 正则化（仅在掩码区域内）
         residual_l2 = (residual.pow(2) * residual_mask_f).sum() / n_residual_valid
 
-        # 残差 TV 正则化（沿时间轴一阶差分，作用于 core+halo taper 支撑区）
+        # 对数残差 TV 正则化（沿时间轴一阶差分，作用于 core+halo taper 支撑区）
         diff = residual[..., 1:] - residual[..., :-1]
         pair_weight = torch.minimum(taper_weight[..., 1:], taper_weight[..., :-1])
         pair_weight_sum = pair_weight.sum().clamp(min=1.0)

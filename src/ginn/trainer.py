@@ -142,25 +142,29 @@ class Trainer:
 
         Notes
         -----
-        - 使用 ``sigmoid(raw)`` 将目标层内 AI 严格限制到 ``[ai_min, ai_max]``。
-        - 先由 ``log(ai / lfm_raw)`` 反算有界残差，再在 halo 区通过 taper 平滑收口，
-          使层外阻抗退回到 ``lfm_raw``。
+        - 使用 ``tanh(raw)`` 得到 ``[-1, 1]`` 的有符号系数，表示从 LFM 朝
+          ``ai_min`` 或 ``ai_max`` 移动多少。
+        - 当网络输出为 0 时，层内阻抗回到 ``lfm_raw``；当输出趋近 ±1 时，
+          阻抗分别趋近 ``ai_min`` / ``ai_max``。
+        - 该 hard bound 假设目标层内 ``lfm_raw`` 本身大致位于
+          ``[ai_min, ai_max]`` 内；若 LFM 已经超界，则无法同时严格保留 LFM
+          锚点并满足全局 hard bound。
         - 若启用 ``zero_residual_outside_mask``，则用 core+halo taper 将层外残差
           平滑压回 0，避免在目的层边界处形成新的硬切。
         """
         raw_residual = self.model(x)
         safe_lfm = torch.clamp(lfm_raw, min=1e-6)
-        residual_lo = torch.log(torch.full_like(safe_lfm, float(self.cfg.ai_min)) / safe_lfm)
-        residual_hi = torch.log(torch.full_like(safe_lfm, float(self.cfg.ai_max)) / safe_lfm)
-        alpha = torch.sigmoid(raw_residual)
-        residual = residual_lo + (residual_hi - residual_lo) * alpha
+        z = torch.tanh(raw_residual)
+        to_min = torch.log(torch.full_like(safe_lfm, float(self.cfg.ai_min)) / safe_lfm)
+        to_max = torch.log(torch.full_like(safe_lfm, float(self.cfg.ai_max)) / safe_lfm)
+        residual = torch.where(z >= 0, z * to_max, (-z) * to_min)
 
         if self.cfg.zero_residual_outside_mask:
             if taper_weight is None:
                 raise ValueError("taper_weight is required when zero_residual_outside_mask is enabled.")
             residual = residual * taper_weight.to(dtype=residual.dtype)
 
-        ai = lfm_raw * torch.exp(residual)
+        ai = safe_lfm * torch.exp(residual)
         return ai, residual
 
     def _run_epoch(self, dataloader: DataLoader, *, training: bool) -> dict[str, float]:

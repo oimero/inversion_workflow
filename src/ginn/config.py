@@ -61,7 +61,7 @@ class GINNConfig:
     # ── 网络结构 ──────────────────────────────────────────────
     in_channels: int = 2  # 网络输入通道数，默认是地震 + LFM。
     hidden_channels: int = 64  # 残差块内部的隐藏通道数。
-    out_channels: int = 1  # 网络输出通道数，对应对数残差控制量。
+    out_channels: int = 1  # 网络输出通道数，对应高频扰动。
     num_res_blocks: int = 8  # 残差块数量。
     dilations: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)  # 各残差块的 dilation 序列。
     kernel_size: int = 3  # 一维卷积核大小。
@@ -74,12 +74,12 @@ class GINNConfig:
     grad_clip: float = 1.0  # 梯度裁剪阈值。
 
     # ── 损失与物理约束 ────────────────────────────────────────
-    lambda_l2: float = 0.03  # 残差 L2 正则化权重，约束阻抗尺度不要漂移。
-    lambda_tv: float = 0.0  # 残差 TV 正则化权重，抑制高频 ringing。
+    lambda_l2: float = 0.03  # 高频扰动 L2 正则化权重，约束阻抗尺度不要漂移。
+    lambda_tv: float = 0.0  # 高频扰动 TV 正则化权重，抑制高频 ringing。
     ai_min: float = 5000.0  # 目标层内允许的波阻抗下界。
     ai_max: float = 20000.0  # 目标层内允许的波阻抗上界。
-    zero_residual_outside_mask: bool = True  # 是否将层外残差通过 taper 平滑压回 0。
-    boundary_effect_samples: int = 30  # 同时用于 waveform loss 内缩和 residual halo 宽度。
+    zero_residual_outside_mask: bool = True  # 是否将层外高频扰动通过 taper 平滑压回 0。
+    boundary_effect_samples: int = 30  # 同时用于 waveform loss 内缩和高频扰动 halo 宽度。
 
     # ── 验证与早停 ────────────────────────────────────────────
     validation_split_mode: ValidationSplitMode = "spatial_block"  # 验证集切分方式。

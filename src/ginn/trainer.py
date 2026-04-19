@@ -138,13 +138,13 @@ class Trainer:
         lfm_raw: torch.Tensor,
         taper_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """将网络输出转换为有界对数残差，并与 LFM 合成阻抗。
+        """将网络输出的高频扰动与 LFM 合成阻抗。
 
         Notes
         -----
-        - 当前不对 AI 做 hard bound，网络输出直接作为相对 LFM 的对数残差。
+        - 当前不对 AI 做 hard bound，网络输出直接作为相对 LFM 的高频扰动。
         - 当网络输出为 0 时，阻抗回到 ``lfm_raw``。
-        - 若启用 ``zero_residual_outside_mask``，则用 core+halo taper 将层外残差
+        - 若启用 ``zero_residual_outside_mask``，则用 core+halo taper 将层外高频扰动
           平滑压回 0，避免在目的层边界处形成新的硬切。
         """
         raw_residual = self.model(x)

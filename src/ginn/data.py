@@ -304,7 +304,7 @@ def _build_eroded_loss_mask(mask_flat: np.ndarray, erosion_samples: int) -> np.n
 
 
 def _build_residual_taper(mask_flat: np.ndarray, halo_samples: int) -> np.ndarray:
-    """为 residual 构造 core+halo 支撑区的平滑 taper 权重。"""
+    """为高频扰动构造 core+halo 支撑区的平滑 taper 权重。"""
     start, end, has_valid = _resolve_mask_bounds(mask_flat)
     n_sample = mask_flat.shape[1]
     sample_index = np.arange(n_sample, dtype=np.int64)[np.newaxis, :]
@@ -462,7 +462,7 @@ class SeismicTraceDataset(Dataset):
     - ``obs``：(1, n_sample) — 归一化观测地震道（用于损失计算）
     - ``mask``：(1, n_sample) — core 布尔掩码
     - ``loss_mask``：(1, n_sample) — eroded core 掩码，仅用于 waveform loss
-    - ``taper_weight``：(1, n_sample) — core+halo 平滑权重，用于 residual 收口
+    - ``taper_weight``：(1, n_sample) — core+halo 平滑权重，用于高频扰动收口
     - ``lfm_raw``：(1, n_sample) — 原始 LFM（用于正演时恢复阻抗）
 
     Parameters

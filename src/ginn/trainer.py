@@ -319,15 +319,15 @@ class Trainer:
                 monitor_name = "train_loss"
             else:
                 logger.info(
-                    "Epoch %d/%d  train_loss=%.6f  val_loss=%.6f  val_mae=%.6f  val_l2_raw=%.3e  val_l2=%.3e  "
+                    "Epoch %d/%d  train_loss=%.6f  val_loss=%.6f  val_mae=%.6f  val_l2=%.3e  val_l2_raw=%.3e  "
                     "val_tv=%.3e  val_tv_raw=%.3e  val_res=%.3e  lr=%.2e  time=%.1fs",
                     epoch + 1,
                     self.cfg.epochs,
                     train_metrics["loss"],
                     val_metrics["loss"],
                     val_metrics["waveform_mae"],
-                    val_metrics["residual_l2"],
                     val_metrics["l2_term"],
+                    val_metrics["residual_l2"],
                     val_metrics["tv_term"],
                     val_metrics["residual_tv"],
                     val_metrics["residual_mean"],

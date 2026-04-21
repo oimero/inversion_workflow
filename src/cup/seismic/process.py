@@ -453,7 +453,10 @@ class TargetLayer:
                 f"cannot assert order for '{top_name}' < '{bottom_name}'."
             )
 
-        violated = aligned[aligned["interpretation_top"] >= aligned["interpretation_bottom"]].copy()
+        if self._horizon_pair_allows_equal_boundary(top_name, bottom_name):
+            violated = aligned[aligned["interpretation_top"] > aligned["interpretation_bottom"]].copy()
+        else:
+            violated = aligned[aligned["interpretation_top"] >= aligned["interpretation_bottom"]].copy()
         if violated.empty:
             return
 
@@ -465,6 +468,12 @@ class TargetLayer:
         if debug_path is not None:
             error_message += f" Debug log saved to '{debug_path.as_posix()}'."
         raise AssertionError(error_message)
+
+    def _horizon_pair_allows_equal_boundary(self, top_name: str, bottom_name: str) -> bool:
+        """合成扩展层位裁剪到采样边界时允许与相邻原始层位重合。"""
+        top_attrs = self.interpolated_horizon_dfs[top_name].attrs
+        bottom_attrs = self.interpolated_horizon_dfs[bottom_name].attrs
+        return bool(top_attrs.get("boundary_extension") or bottom_attrs.get("boundary_extension"))
 
     def _build_horizon_pair_alignment(self, top_name: str, bottom_name: str) -> pd.DataFrame:
         """返回相邻层位在共址样点上的对齐结果。"""
@@ -599,6 +608,112 @@ class TargetLayer:
             horizon_name: self.get_horizon_interpretation_at_location(horizon_name, il_float, xl_float)
             for horizon_name in self.horizon_names
         }
+
+    def _build_boundary_extension_horizon_df(
+        self,
+        source_horizon_name: str,
+        *,
+        offset: float,
+        sample_min: float,
+        sample_max: float,
+        extension_name: str,
+    ) -> pd.DataFrame:
+        """基于已有层位构建一个按采样轴裁剪的边界扩展层位。"""
+        source_df = self._normalized_horizon_dfs[source_horizon_name]
+        out_df = source_df[["inline", "xline", "interpretation"]].copy()
+        interpretation = out_df["interpretation"].to_numpy(dtype=float, copy=True)
+        finite_mask = np.isfinite(interpretation)
+        interpretation[finite_mask] = np.clip(interpretation[finite_mask] + offset, sample_min, sample_max)
+        out_df["interpretation"] = interpretation
+        out_df.attrs["boundary_extension"] = {
+            "name": extension_name,
+            "source_horizon": source_horizon_name,
+            "offset": float(offset),
+            "sample_min": float(sample_min),
+            "sample_max": float(sample_max),
+        }
+        return out_df
+
+    def with_boundary_extension(
+        self,
+        extension_samples: int,
+        *,
+        top_extension_name: str = "top_extension",
+        bottom_extension_name: str = "bottom_extension",
+    ) -> "TargetLayer":
+        """返回在顶部上方、底部下方各新增一个合成层位的目的层副本。
+
+        Parameters
+        ----------
+        extension_samples : int
+            扩展的采样点数。顶部层位会向上移动
+            ``extension_samples * sample_step``，底部层位会向下移动同样距离。
+            结果会裁剪到 ``[sample_min, sample_max]``。
+        top_extension_name, bottom_extension_name : str
+            新增顶部/底部扩展层位名称。
+
+        Returns
+        -------
+        TargetLayer
+            一个新的 ``TargetLayer``，其层位顺序为
+            ``top_extension_name``、原始层位序列、``bottom_extension_name``。
+        """
+        if extension_samples < 0:
+            raise ValueError(f"extension_samples must be >= 0, got {extension_samples}.")
+        if extension_samples == 0:
+            return TargetLayer(
+                interpolated_horizon_dfs=self._normalized_horizon_dfs,
+                geometry=self.geometry,
+                horizon_names=self.horizon_names,
+                debug_dir=self.debug_dir,
+            )
+
+        if top_extension_name == bottom_extension_name:
+            raise ValueError("top_extension_name and bottom_extension_name must be different.")
+        duplicate_extension_names = {
+            name for name in (top_extension_name, bottom_extension_name) if name in self.interpolated_horizon_dfs
+        }
+        if duplicate_extension_names:
+            raise ValueError(f"extension horizon names already exist: {sorted(duplicate_extension_names)}")
+
+        required_geometry_keys = {"sample_min", "sample_max", "sample_step"}
+        missing_geometry_keys = required_geometry_keys - set(self.geometry)
+        if missing_geometry_keys:
+            raise ValueError(
+                f"geometry is missing required keys for boundary extension: {sorted(missing_geometry_keys)}"
+            )
+
+        sample_min = float(self.geometry["sample_min"])
+        sample_max = float(self.geometry["sample_max"])
+        sample_step = float(self.geometry["sample_step"])
+        if sample_step <= 0.0:
+            raise ValueError(f"sample_step must be positive, got {sample_step}.")
+
+        offset = float(extension_samples) * sample_step
+        top_source_name = self.horizon_names[0]
+        bottom_source_name = self.horizon_names[-1]
+        extended_horizon_dfs = {name: df.copy() for name, df in self._normalized_horizon_dfs.items()}
+        extended_horizon_dfs[top_extension_name] = self._build_boundary_extension_horizon_df(
+            top_source_name,
+            offset=-offset,
+            sample_min=sample_min,
+            sample_max=sample_max,
+            extension_name=top_extension_name,
+        )
+        extended_horizon_dfs[bottom_extension_name] = self._build_boundary_extension_horizon_df(
+            bottom_source_name,
+            offset=offset,
+            sample_min=sample_min,
+            sample_max=sample_max,
+            extension_name=bottom_extension_name,
+        )
+
+        return TargetLayer(
+            interpolated_horizon_dfs=extended_horizon_dfs,
+            geometry=self.geometry,
+            horizon_names=[top_extension_name, *self.horizon_names, bottom_extension_name],
+            debug_dir=self.debug_dir,
+        )
 
     def _resolve_zone(self, zone: Optional[tuple[str, str]]) -> tuple[str, str]:
         if zone is None:

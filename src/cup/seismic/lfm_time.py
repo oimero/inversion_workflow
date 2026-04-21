@@ -627,125 +627,6 @@ def _fill_zone_with_adjacent_boundary(
     zone_model.fallback_source_slice_index = int(source_slice_index)
 
 
-def _build_extension_zone(
-    prepared_wells: list[_PreparedLfmTimeWell],
-    ilines: np.ndarray,
-    xlines: np.ndarray,
-    kriging_ilines: np.ndarray,
-    kriging_xlines: np.ndarray,
-    slice_u: np.ndarray,
-    *,
-    inline_min: float,
-    inline_step: float,
-    xline_min: float,
-    xline_step: float,
-    reference_zone: _ZoneSliceModel,
-    direction: str,
-    extension_samples: int,
-    n_sample: int,
-    dt: float,
-    sample_min: float,
-    sample_max: float,
-    variogram: str,
-    exact: bool,
-    nugget: float,
-    post_slice_smoothing: bool,
-) -> _ZoneSliceModel:
-    """基于相邻原始层段构建顶/底扩展区。"""
-    if direction not in {"top", "bottom"}:
-        raise ValueError(f"direction must be 'top' or 'bottom', got {direction!r}.")
-
-    if direction == "top":
-        zone_model = _build_zone_slice_model(
-            prepared_wells,
-            ilines,
-            xlines,
-            kriging_ilines,
-            kriging_xlines,
-            slice_u,
-            inline_min=inline_min,
-            inline_step=inline_step,
-            xline_min=xline_min,
-            xline_step=xline_step,
-            top_label="top_extension",
-            bottom_label=reference_zone.top_label,
-            top_grid=np.clip(reference_zone.top_grid - extension_samples, 0.0, float(n_sample - 1)),
-            bottom_grid=reference_zone.top_grid.copy(),
-            well_top_times=np.asarray(
-                [max(sample_min, well.horizon_times[reference_zone.top_label] - extension_samples * dt) for well in prepared_wells],
-                dtype=float,
-            ),
-            well_bottom_times=np.asarray(
-                [well.horizon_times[reference_zone.top_label] for well in prepared_wells],
-                dtype=float,
-            ),
-            variogram=variogram,
-            exact=exact,
-            nugget=nugget,
-        )
-        fallback_source_zone = f"{reference_zone.top_label}->{reference_zone.bottom_label}"
-        fallback_source_slice_index = 0
-        fallback_source_values = reference_zone.slice_values[0]
-        fallback_source_variance = reference_zone.slice_variance[0]
-    else:
-        zone_model = _build_zone_slice_model(
-            prepared_wells,
-            ilines,
-            xlines,
-            kriging_ilines,
-            kriging_xlines,
-            slice_u,
-            inline_min=inline_min,
-            inline_step=inline_step,
-            xline_min=xline_min,
-            xline_step=xline_step,
-            top_label=reference_zone.bottom_label,
-            bottom_label="bottom_extension",
-            top_grid=reference_zone.bottom_grid.copy(),
-            bottom_grid=np.clip(reference_zone.bottom_grid + extension_samples, 0.0, float(n_sample - 1)),
-            well_top_times=np.asarray(
-                [well.horizon_times[reference_zone.bottom_label] for well in prepared_wells],
-                dtype=float,
-            ),
-            well_bottom_times=np.asarray(
-                [min(sample_max, well.horizon_times[reference_zone.bottom_label] + extension_samples * dt) for well in prepared_wells],
-                dtype=float,
-            ),
-            variogram=variogram,
-            exact=exact,
-            nugget=nugget,
-        )
-        fallback_source_zone = f"{reference_zone.top_label}->{reference_zone.bottom_label}"
-        fallback_source_slice_index = slice_u.size - 1
-        fallback_source_values = reference_zone.slice_values[-1]
-        fallback_source_variance = reference_zone.slice_variance[-1]
-
-    if np.any(zone_model.valid_slice_mask):
-        _fill_missing_slices_with_neighbors(
-            slice_u=slice_u,
-            slice_values=zone_model.slice_values,
-            slice_variance=zone_model.slice_variance,
-            slice_modes=zone_model.slice_modes,
-            valid_slice_mask=zone_model.valid_slice_mask,
-        )
-    else:
-        _fill_zone_with_adjacent_boundary(
-            zone_model,
-            source_zone_key=fallback_source_zone,
-            source_slice_index=fallback_source_slice_index,
-            source_values=fallback_source_values,
-            source_variance=fallback_source_variance,
-        )
-
-    if post_slice_smoothing:
-        zone_model.slice_values, zone_model.slice_variance = _apply_post_slice_smoothing(
-            slice_values=zone_model.slice_values,
-            slice_variance=zone_model.slice_variance,
-        )
-
-    return zone_model
-
-
 def _write_zone_model_to_volume(
     zone_model: _ZoneSliceModel,
     slice_u: np.ndarray,
@@ -922,7 +803,7 @@ def build_lfm_time_model(
     ------
     ValueError
         当井列表为空、采样域不是时间域、几何参数非法、井位置无法解析，
-        或某个层段在所有切片上都没有可用控制值时抛出。
+        或某个原始目的层段在所有切片上都没有可用控制值时抛出。
 
     Notes
     -----
@@ -932,7 +813,7 @@ def build_lfm_time_model(
     2. 视需要扩展时深表，并将输入属性曲线统一转换到 TWT 域后低通滤波；
     3. 对每个层段沿顶底界面做比例切片采样；
     4. 对每张切片按井点控制值执行常数填充或二维克里金插值；
-    5. 将切片结果重新映射回三维时间采样体，并向层段外上下延拓。
+    5. 将切片结果重新映射回三维时间采样体，并对建模层段之外做首尾常值延拓。
     """
     if not wells:
         raise ValueError("wells must contain at least one LfmTimeWell.")
@@ -950,13 +831,17 @@ def build_lfm_time_model(
     if dt <= 0.0:
         raise ValueError(f"target_layer.geometry['sample_step'] must be positive, got {dt}.")
 
+    modeling_target_layer = (
+        target_layer.with_boundary_extension(extension_samples) if extension_samples > 0 else target_layer
+    )
+
     prepared_wells = [
         _prepare_well(
             well,
-            target_layer,
+            modeling_target_layer,
             survey,
             dt,
-            boundary_extension_samples=extension_samples,
+            boundary_extension_samples=0,
             filter_cutoff_hz=float(filter_cutoff_hz),
             filter_order=int(filter_order),
             filter_buffer_seconds=filter_buffer_seconds,
@@ -1008,20 +893,14 @@ def build_lfm_time_model(
             "td_table_extended": bool(well.td_table_extended),
             "input_log_filtered": bool(well.input_log_filtered),
             "horizon_times": dict(well.horizon_times),
-            "modeled_twt_min": max(
-                sample_min,
-                float(well.horizon_times[target_layer.horizon_names[0]]) - extension_samples * dt,
-            ),
-            "modeled_twt_max": min(
-                sample_max,
-                float(well.horizon_times[target_layer.horizon_names[-1]]) + extension_samples * dt,
-            ),
+            "modeled_twt_min": float(well.horizon_times[modeling_target_layer.horizon_names[0]]),
+            "modeled_twt_max": float(well.horizon_times[modeling_target_layer.horizon_names[-1]]),
         }
 
     base_zone_models: list[_ZoneSliceModel] = []
     base_zones = target_layer.iter_zones()
     for top_name, bottom_name in base_zones:
-        top_grid, bottom_grid = target_layer.get_zone_sample_index_grids((top_name, bottom_name))
+        top_grid, bottom_grid = modeling_target_layer.get_zone_sample_index_grids((top_name, bottom_name))
         zone_model = _build_zone_slice_model(
             prepared_wells,
             ilines,
@@ -1062,60 +941,102 @@ def build_lfm_time_model(
 
     modeled_zones: list[_ZoneSliceModel] = []
     if extension_samples > 0:
-        modeled_zones.append(
-            _build_extension_zone(
-                prepared_wells,
-                ilines,
-                xlines,
-                kriging_ilines,
-                kriging_xlines,
-                slice_u,
-                inline_min=inline_min,
-                inline_step=inline_step,
-                xline_min=xline_min,
-                xline_step=xline_step,
-                reference_zone=base_zone_models[0],
-                direction="top",
-                extension_samples=extension_samples,
-                n_sample=n_sample,
-                dt=dt,
-                sample_min=sample_min,
-                sample_max=sample_max,
-                variogram=variogram,
-                exact=exact,
-                nugget=nugget,
-                post_slice_smoothing=post_slice_smoothing,
-            )
+        top_extension_zone = (modeling_target_layer.horizon_names[0], target_layer.horizon_names[0])
+        top_grid, bottom_grid = modeling_target_layer.get_zone_sample_index_grids(top_extension_zone)
+        top_extension_model = _build_zone_slice_model(
+            prepared_wells,
+            ilines,
+            xlines,
+            kriging_ilines,
+            kriging_xlines,
+            slice_u,
+            inline_min=inline_min,
+            inline_step=inline_step,
+            xline_min=xline_min,
+            xline_step=xline_step,
+            top_label=top_extension_zone[0],
+            bottom_label=top_extension_zone[1],
+            top_grid=top_grid,
+            bottom_grid=bottom_grid,
+            well_top_times=np.asarray([well.horizon_times[top_extension_zone[0]] for well in prepared_wells], dtype=float),
+            well_bottom_times=np.asarray([well.horizon_times[top_extension_zone[1]] for well in prepared_wells], dtype=float),
+            variogram=variogram,
+            exact=exact,
+            nugget=nugget,
         )
+        if np.any(top_extension_model.valid_slice_mask):
+            _fill_missing_slices_with_neighbors(
+                slice_u=slice_u,
+                slice_values=top_extension_model.slice_values,
+                slice_variance=top_extension_model.slice_variance,
+                slice_modes=top_extension_model.slice_modes,
+                valid_slice_mask=top_extension_model.valid_slice_mask,
+            )
+        else:
+            reference_zone = base_zone_models[0]
+            _fill_zone_with_adjacent_boundary(
+                top_extension_model,
+                source_zone_key=f"{reference_zone.top_label}->{reference_zone.bottom_label}",
+                source_slice_index=0,
+                source_values=reference_zone.slice_values[0],
+                source_variance=reference_zone.slice_variance[0],
+            )
+        if post_slice_smoothing:
+            top_extension_model.slice_values, top_extension_model.slice_variance = _apply_post_slice_smoothing(
+                slice_values=top_extension_model.slice_values,
+                slice_variance=top_extension_model.slice_variance,
+            )
+        modeled_zones.append(top_extension_model)
 
     modeled_zones.extend(base_zone_models)
 
     if extension_samples > 0:
-        modeled_zones.append(
-            _build_extension_zone(
-                prepared_wells,
-                ilines,
-                xlines,
-                kriging_ilines,
-                kriging_xlines,
-                slice_u,
-                inline_min=inline_min,
-                inline_step=inline_step,
-                xline_min=xline_min,
-                xline_step=xline_step,
-                reference_zone=base_zone_models[-1],
-                direction="bottom",
-                extension_samples=extension_samples,
-                n_sample=n_sample,
-                dt=dt,
-                sample_min=sample_min,
-                sample_max=sample_max,
-                variogram=variogram,
-                exact=exact,
-                nugget=nugget,
-                post_slice_smoothing=post_slice_smoothing,
-            )
+        bottom_extension_zone = (target_layer.horizon_names[-1], modeling_target_layer.horizon_names[-1])
+        top_grid, bottom_grid = modeling_target_layer.get_zone_sample_index_grids(bottom_extension_zone)
+        bottom_extension_model = _build_zone_slice_model(
+            prepared_wells,
+            ilines,
+            xlines,
+            kriging_ilines,
+            kriging_xlines,
+            slice_u,
+            inline_min=inline_min,
+            inline_step=inline_step,
+            xline_min=xline_min,
+            xline_step=xline_step,
+            top_label=bottom_extension_zone[0],
+            bottom_label=bottom_extension_zone[1],
+            top_grid=top_grid,
+            bottom_grid=bottom_grid,
+            well_top_times=np.asarray([well.horizon_times[bottom_extension_zone[0]] for well in prepared_wells], dtype=float),
+            well_bottom_times=np.asarray([well.horizon_times[bottom_extension_zone[1]] for well in prepared_wells], dtype=float),
+            variogram=variogram,
+            exact=exact,
+            nugget=nugget,
         )
+        if np.any(bottom_extension_model.valid_slice_mask):
+            _fill_missing_slices_with_neighbors(
+                slice_u=slice_u,
+                slice_values=bottom_extension_model.slice_values,
+                slice_variance=bottom_extension_model.slice_variance,
+                slice_modes=bottom_extension_model.slice_modes,
+                valid_slice_mask=bottom_extension_model.valid_slice_mask,
+            )
+        else:
+            reference_zone = base_zone_models[-1]
+            _fill_zone_with_adjacent_boundary(
+                bottom_extension_model,
+                source_zone_key=f"{reference_zone.top_label}->{reference_zone.bottom_label}",
+                source_slice_index=slice_u.size - 1,
+                source_values=reference_zone.slice_values[-1],
+                source_variance=reference_zone.slice_variance[-1],
+            )
+        if post_slice_smoothing:
+            bottom_extension_model.slice_values, bottom_extension_model.slice_variance = _apply_post_slice_smoothing(
+                slice_values=bottom_extension_model.slice_values,
+                slice_variance=bottom_extension_model.slice_variance,
+            )
+        modeled_zones.append(bottom_extension_model)
 
     for zone_model in modeled_zones:
         zone_key = f"{zone_model.top_label}->{zone_model.bottom_label}"

@@ -459,9 +459,6 @@ def build_lfm_time_model(
                 "twt_conversion_mode": well.twt_conversion_mode,
                 "td_table_extended": bool(well.td_table_extended),
                 "input_log_filtered": bool(well.input_log_filtered),
-                "horizon_times": dict(control.horizon_values),
-                "modeled_twt_min": float(control.horizon_values[modeling_target_layer.horizon_names[0]]),
-                "modeled_twt_max": float(control.horizon_values[modeling_target_layer.horizon_names[-1]]),
             }
         )
 

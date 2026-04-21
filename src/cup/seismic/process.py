@@ -62,11 +62,11 @@ def _sanitize_debug_token(value: str) -> str:
     return token or "unnamed"
 
 
-def _build_line_axis(line_min: int, line_max: int, line_step: int) -> np.ndarray:
+def _build_axis(axis_min: float, axis_max: float, axis_step: float, axis_name: str) -> np.ndarray:
     """根据最小值、最大值和步长构建完整轴。"""
-    if line_step <= 0:
-        raise ValueError(f"line_step must be positive, got {line_step}.")
-    return np.arange(line_min, line_max + line_step, line_step, dtype=int)
+    if axis_step <= 0:
+        raise ValueError(f"{axis_name}_step must be positive, got {axis_step}.")
+    return np.arange(axis_min, axis_max + axis_step, axis_step, dtype=float)
 
 
 def _nanmedian(values: np.ndarray) -> float:
@@ -242,7 +242,7 @@ def _interpolate_whole_mesh_linear_then_nearest(surface: np.ndarray) -> np.ndarr
 
 
 def _validate_geometry_keys(geometry: Dict[str, Any]) -> None:
-    """校验几何信息是否包含插值必需键。"""
+    """校验几何信息是否包含 inline/xline 插值必需键。"""
     geometry_keys = {
         "inline_min",
         "inline_max",
@@ -386,7 +386,7 @@ class TargetLayer:
     -----
     构造时会：
 
-    - 根据 geometry 构建规则 inline/xline 轴；
+    - 根据 geometry 构建规则 inline/xline/sample 轴；
     - 在秒域场景下按经验规则归一化层位单位；
     - 校验相邻层位在共址样点上的解释值顺序；
     - 若配置 ``debug_dir``，在校验失败时导出违例样点日志；
@@ -417,7 +417,7 @@ class TargetLayer:
         self.interpolated_horizon_dfs = {name: df.copy() for name, df in interpolated_horizon_dfs.items()}
         self.horizon_names = list(horizon_names)
         self.debug_dir = Path(debug_dir) if debug_dir is not None else None
-        self._il_axis, self._xl_axis = self._build_axes()
+        self._il_axis, self._xl_axis, self._sample_axis = self._build_axes()
         self._normalized_horizon_dfs = {
             name: _normalize_interpretation_unit_for_geometry(df, self.geometry)
             for name, df in self.interpolated_horizon_dfs.items()
@@ -529,18 +529,41 @@ class TargetLayer:
         for top_name, bottom_name in self.iter_zones():
             self._assert_horizon_pair_is_strictly_increasing(top_name, bottom_name)
 
-    def _build_axes(self) -> tuple[np.ndarray, np.ndarray]:
-        il_axis = _build_line_axis(
-            int(self.geometry["inline_min"]),
-            int(self.geometry["inline_max"]),
-            int(self.geometry["inline_step"]),
+    def _build_axes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        il_axis = _build_axis(
+            float(self.geometry["inline_min"]),
+            float(self.geometry["inline_max"]),
+            float(self.geometry["inline_step"]),
+            "inline",
         )
-        xl_axis = _build_line_axis(
-            int(self.geometry["xline_min"]),
-            int(self.geometry["xline_max"]),
-            int(self.geometry["xline_step"]),
+        xl_axis = _build_axis(
+            float(self.geometry["xline_min"]),
+            float(self.geometry["xline_max"]),
+            float(self.geometry["xline_step"]),
+            "xline",
         )
-        return il_axis, xl_axis
+        sample_axis = _build_axis(
+            float(self.geometry["sample_min"]),
+            float(self.geometry["sample_max"]),
+            float(self.geometry["sample_step"]),
+            "sample",
+        )
+        return il_axis, xl_axis, sample_axis
+
+    @property
+    def ilines(self) -> np.ndarray:
+        """返回规则 inline 轴副本。"""
+        return self._il_axis.copy()
+
+    @property
+    def xlines(self) -> np.ndarray:
+        """返回规则 xline 轴副本。"""
+        return self._xl_axis.copy()
+
+    @property
+    def samples(self) -> np.ndarray:
+        """返回规则采样轴副本。"""
+        return self._sample_axis.copy()
 
     def get_horizon_interpretation_at_location(
         self,
@@ -676,18 +699,9 @@ class TargetLayer:
         if duplicate_extension_names:
             raise ValueError(f"extension horizon names already exist: {sorted(duplicate_extension_names)}")
 
-        required_geometry_keys = {"sample_min", "sample_max", "sample_step"}
-        missing_geometry_keys = required_geometry_keys - set(self.geometry)
-        if missing_geometry_keys:
-            raise ValueError(
-                f"geometry is missing required keys for boundary extension: {sorted(missing_geometry_keys)}"
-            )
-
-        sample_min = float(self.geometry["sample_min"])
-        sample_max = float(self.geometry["sample_max"])
+        sample_min = float(self._sample_axis[0])
+        sample_max = float(self._sample_axis[-1])
         sample_step = float(self.geometry["sample_step"])
-        if sample_step <= 0.0:
-            raise ValueError(f"sample_step must be positive, got {sample_step}.")
 
         offset = float(extension_samples) * sample_step
         top_source_name = self.horizon_names[0]
@@ -748,22 +762,14 @@ class TargetLayer:
         Raises
         ------
         ValueError
-            当 geometry 缺少采样轴信息、``sample_step`` 非正、层位缺列，
-            或层位值超出采样范围时抛出。
+            当层位缺列或层位值超出采样范围时抛出。
         """
         if horizon_name not in self.interpolated_horizon_dfs:
             raise ValueError(f"horizon_name '{horizon_name}' is not in interpolated_horizon_dfs.")
 
-        required_geometry_keys = {"sample_min", "sample_max", "sample_step"}
-        missing_geometry_keys = required_geometry_keys - set(self.geometry)
-        if missing_geometry_keys:
-            raise ValueError(f"geometry is missing required keys for sample indexing: {sorted(missing_geometry_keys)}")
-
-        sample_min = float(self.geometry["sample_min"])
-        sample_max = float(self.geometry["sample_max"])
+        sample_min = float(self._sample_axis[0])
+        sample_max = float(self._sample_axis[-1])
         sample_step = float(self.geometry["sample_step"])
-        if sample_step <= 0:
-            raise ValueError(f"sample_step must be positive, got {sample_step}.")
 
         horizon_df = self.interpolated_horizon_dfs[horizon_name].copy()
         required_cols = {"inline", "xline", "interpretation"}
@@ -828,8 +834,7 @@ class TargetLayer:
         Raises
         ------
         ValueError
-            当 geometry 中的 inline/xline 维度与规则轴不一致，或缺少生成掩码所需的
-            采样轴信息时抛出。
+            当 geometry 中的 inline/xline/sample 维度与规则轴不一致时抛出。
 
         Notes
         -----
@@ -838,24 +843,16 @@ class TargetLayer:
         """
         il_axis, xl_axis = self._il_axis, self._xl_axis
 
-        n_il = int(self.geometry.get("n_il", il_axis.size))
-        n_xl = int(self.geometry.get("n_xl", xl_axis.size))
+        n_il = int(self.geometry["n_il"])
+        n_xl = int(self.geometry["n_xl"])
         if n_il != il_axis.size:
             raise ValueError(f"geometry n_il={n_il} does not match axis size {il_axis.size}.")
         if n_xl != xl_axis.size:
             raise ValueError(f"geometry n_xl={n_xl} does not match axis size {xl_axis.size}.")
 
-        if "n_sample" in self.geometry:
-            n_sample = int(self.geometry["n_sample"])
-        else:
-            required_keys = {"sample_min", "sample_max", "sample_step"}
-            missing = required_keys - set(self.geometry)
-            if missing:
-                raise ValueError(f"geometry is missing required keys for n_sample: {sorted(missing)}")
-            sample_max = float(self.geometry["sample_max"])
-            sample_min = float(self.geometry["sample_min"])
-            sample_step = float(self.geometry["sample_step"])
-            n_sample = int(round((sample_max - sample_min) / sample_step)) + 1
+        n_sample = int(self.geometry["n_sample"])
+        if n_sample != self._sample_axis.size:
+            raise ValueError(f"geometry n_sample={n_sample} does not match axis size {self._sample_axis.size}.")
 
         mask = np.zeros((n_il, n_xl, n_sample), dtype=bool)
 
@@ -938,15 +935,17 @@ def interpolate_interpretation_surface(
     """
     _validate_geometry_keys(geometry)
 
-    il_axis = _build_line_axis(
-        int(geometry["inline_min"]),
-        int(geometry["inline_max"]),
-        int(geometry["inline_step"]),
+    il_axis = _build_axis(
+        float(geometry["inline_min"]),
+        float(geometry["inline_max"]),
+        float(geometry["inline_step"]),
+        "inline",
     )
-    xl_axis = _build_line_axis(
-        int(geometry["xline_min"]),
-        int(geometry["xline_max"]),
-        int(geometry["xline_step"]),
+    xl_axis = _build_axis(
+        float(geometry["xline_min"]),
+        float(geometry["xline_max"]),
+        float(geometry["xline_step"]),
+        "xline",
     )
 
     normalized_interpretation_df = _normalize_interpretation_unit_for_geometry(interpretation_df, geometry)

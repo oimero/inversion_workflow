@@ -64,26 +64,6 @@ class LayerConstrainedModelResult:
     coverage_stats: Dict[str, Any]
 
 
-def _build_line_axis(line_min: float, line_max: float, line_step: float) -> np.ndarray:
-    if line_step <= 0:
-        raise ValueError(f"line_step must be positive, got {line_step}.")
-    return np.arange(line_min, line_max + line_step, line_step, dtype=float)
-
-
-def _build_sample_axis(geometry: Dict[str, Any]) -> np.ndarray:
-    required_keys = {"sample_min", "sample_max", "sample_step"}
-    missing_keys = required_keys - set(geometry)
-    if missing_keys:
-        raise ValueError(f"geometry is missing required sample keys: {sorted(missing_keys)}")
-
-    sample_min = float(geometry["sample_min"])
-    sample_max = float(geometry["sample_max"])
-    sample_step = float(geometry["sample_step"])
-    if sample_step <= 0:
-        raise ValueError(f"sample_step must be positive, got {sample_step}.")
-    return np.arange(sample_min, sample_max + sample_step, sample_step, dtype=float)
-
-
 def _normalize_line_coordinates(coords: np.ndarray, line_min: float, line_step: float) -> np.ndarray:
     if line_step <= 0:
         raise ValueError(f"line_step must be positive, got {line_step}.")
@@ -173,14 +153,8 @@ def _interpolate_log_at_sample(log: grid.Log, sample_value: float) -> float:
     return float(np.interp(sample_value, basis, values))
 
 
-def _with_complete_horizon_values(well: WellControl, target_layer: TargetLayer) -> WellControl:
+def _normalize_well_control(well: WellControl) -> WellControl:
     horizon_values = {name: float(value) for name, value in well.horizon_values.items()}
-    missing_horizon_names = [name for name in target_layer.horizon_names if name not in horizon_values]
-    if missing_horizon_names:
-        resolved_values = target_layer.get_interpretation_values_at_location(float(well.inline), float(well.xline))
-        for name in missing_horizon_names:
-            horizon_values[name] = float(resolved_values[name])
-
     return WellControl(
         well_name=well.well_name,
         property_name=str(well.property_name),
@@ -192,11 +166,60 @@ def _with_complete_horizon_values(well: WellControl, target_layer: TargetLayer) 
     )
 
 
-def _validate_well_controls(well_controls: list[WellControl], target_layer: TargetLayer) -> list[WellControl]:
+def _validate_required_horizon_values(well_controls: list[WellControl], target_layer: TargetLayer) -> None:
+    for well in well_controls:
+        missing_horizon_names = [name for name in target_layer.horizon_names if name not in well.horizon_values]
+        if missing_horizon_names:
+            raise ValueError(
+                f"well '{well.well_name}' is missing horizon_values for: {missing_horizon_names}."
+            )
+
+        for horizon_name in target_layer.horizon_names:
+            horizon_value = float(well.horizon_values[horizon_name])
+            if not np.isfinite(horizon_value):
+                raise ValueError(f"well '{well.well_name}' has non-finite horizon value for '{horizon_name}'.")
+
+
+def _add_boundary_extension_horizon_values(
+    well_controls: list[WellControl],
+    modeling_target_layer: TargetLayer,
+) -> list[WellControl]:
+    completed_controls = []
+    for well in well_controls:
+        horizon_values = dict(well.horizon_values)
+        missing_horizon_names = [name for name in modeling_target_layer.horizon_names if name not in horizon_values]
+        if missing_horizon_names:
+            resolved_values = modeling_target_layer.get_interpretation_values_at_location(
+                float(well.inline),
+                float(well.xline),
+            )
+            for name in missing_horizon_names:
+                horizon_values[name] = float(resolved_values[name])
+
+        completed_controls.append(
+            WellControl(
+                well_name=well.well_name,
+                property_name=well.property_name,
+                property_log=well.property_log,
+                inline=well.inline,
+                xline=well.xline,
+                horizon_values=horizon_values,
+                metadata={} if well.metadata is None else dict(well.metadata),
+            )
+        )
+
+    return completed_controls
+
+
+def _validate_well_controls(
+    well_controls: list[WellControl],
+    target_layer: TargetLayer,
+    modeling_target_layer: TargetLayer,
+) -> list[WellControl]:
     if not well_controls:
         raise ValueError("well_controls must contain at least one WellControl.")
 
-    prepared_controls = [_with_complete_horizon_values(well, target_layer) for well in well_controls]
+    prepared_controls = [_normalize_well_control(well) for well in well_controls]
     property_names = {well.property_name for well in prepared_controls}
     if len(property_names) != 1:
         raise ValueError(f"All well controls must share the same property_name, got {sorted(property_names)}.")
@@ -204,11 +227,10 @@ def _validate_well_controls(well_controls: list[WellControl], target_layer: Targ
     for well in prepared_controls:
         if not np.isfinite(well.inline) or not np.isfinite(well.xline):
             raise ValueError(f"well '{well.well_name}' must provide finite inline/xline coordinates.")
-        for horizon_name in target_layer.horizon_names:
-            horizon_value = float(well.horizon_values[horizon_name])
-            if not np.isfinite(horizon_value):
-                raise ValueError(f"well '{well.well_name}' has non-finite horizon value for '{horizon_name}'.")
 
+    _validate_required_horizon_values(prepared_controls, target_layer)
+    prepared_controls = _add_boundary_extension_horizon_values(prepared_controls, modeling_target_layer)
+    _validate_required_horizon_values(prepared_controls, modeling_target_layer)
     return prepared_controls
 
 
@@ -508,26 +530,22 @@ def build_layer_constrained_model(
     modeling_target_layer = (
         target_layer.with_boundary_extension(extension_samples) if extension_samples > 0 else target_layer
     )
-    prepared_controls = _validate_well_controls(list(well_controls), modeling_target_layer)
+    prepared_controls = _validate_well_controls(
+        list(well_controls),
+        target_layer=target_layer,
+        modeling_target_layer=modeling_target_layer,
+    )
     property_name = prepared_controls[0].property_name
 
-    ilines = _build_line_axis(
-        float(target_layer.geometry["inline_min"]),
-        float(target_layer.geometry["inline_max"]),
-        float(target_layer.geometry["inline_step"]),
-    )
-    xlines = _build_line_axis(
-        float(target_layer.geometry["xline_min"]),
-        float(target_layer.geometry["xline_max"]),
-        float(target_layer.geometry["xline_step"]),
-    )
+    ilines = target_layer.ilines.astype(float, copy=False)
+    xlines = target_layer.xlines.astype(float, copy=False)
     inline_min = float(target_layer.geometry["inline_min"])
     inline_step = float(target_layer.geometry["inline_step"])
     xline_min = float(target_layer.geometry["xline_min"])
     xline_step = float(target_layer.geometry["xline_step"])
     kriging_ilines = _normalize_line_coordinates(ilines, line_min=inline_min, line_step=inline_step)
     kriging_xlines = _normalize_line_coordinates(xlines, line_min=xline_min, line_step=xline_step)
-    samples = _build_sample_axis(target_layer.geometry)
+    samples = target_layer.samples
     n_il, n_xl, n_sample = ilines.size, xlines.size, samples.size
 
     volume = np.full((n_il, n_xl, n_sample), np.nan, dtype=np.float32)

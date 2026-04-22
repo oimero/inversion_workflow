@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 import gstools as gs
 import numpy as np
 
-from cup.seismic.process import TargetLayer
+from cup.seismic.target_layer import TargetLayer
 from wtie.processing import grid
 
 POST_SLICE_SMOOTHING_KERNEL = np.asarray([0.1, 0.2, 0.4, 0.2, 0.1], dtype=float)

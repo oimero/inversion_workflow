@@ -1,9 +1,8 @@
 """Fault-tolerant target-layer preparation from raw interpretation picks.
 
-This module intentionally defines a new ``TargetLayer`` that starts from raw,
-uninterpolated horizon interpretations.  It builds interpolation support masks,
-trace-level QC masks, and final horizon grids that can either keep unreliable
-traces as NaN or reconstruct the layer stack from interpolated positive
+This module defines a ``TargetLayer`` that starts from raw, uninterpolated
+horizon interpretations.  It builds interpolation support masks, trace-level QC
+masks, and full-coverage horizon grids reconstructed from interpolated positive
 thicknesses.
 """
 
@@ -19,7 +18,6 @@ from scipy.interpolate import griddata
 from scipy.ndimage import generic_filter
 from scipy.spatial import QhullError, cKDTree  # type: ignore
 
-_VALID_MODES = {"mask", "thickness_interpolation", "thickness"}
 OUTLIER_REMOVAL_WARNING_RATIO = 0.05
 
 
@@ -343,10 +341,6 @@ class TargetLayer:
         Survey geometry.  Inline/xline and sample axis keys are required.
     horizon_names
         Horizon order from shallow/top to deep/bottom.
-    mode
-        ``"thickness_interpolation"`` reconstructs the layer stack from a
-        filled top horizon plus filled positive thicknesses.  ``"mask"`` keeps
-        unreliable traces as NaN.
     output_dir
         QC CSV output directory.  Defaults to ``./output``.
     min_thickness
@@ -368,7 +362,6 @@ class TargetLayer:
         geometry: Dict[str, Any],
         horizon_names: list[str],
         *,
-        mode: str = "thickness_interpolation",
         output_dir: Optional[str | Path] = None,
         min_thickness: Optional[float] = None,
         nearest_distance_limit: Optional[float] = None,
@@ -384,16 +377,10 @@ class TargetLayer:
         missing = [name for name in horizon_names if name not in raw_horizon_dfs]
         if missing:
             raise ValueError(f"horizon_names not found in raw_horizon_dfs: {missing}")
-        mode_norm = str(mode).lower()
-        if mode_norm not in _VALID_MODES:
-            raise ValueError(f"mode must be one of {sorted(_VALID_MODES)}, got {mode!r}.")
-        if mode_norm == "thickness":
-            mode_norm = "thickness_interpolation"
 
         _validate_geometry_keys(geometry)
         self.geometry = dict(geometry)
         self.horizon_names = list(horizon_names)
-        self.mode = mode_norm
         self.output_dir = Path("output") if output_dir is None else Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.min_thickness = float(self.geometry["sample_step"]) if min_thickness is None else float(min_thickness)
@@ -527,13 +514,6 @@ class TargetLayer:
         self._summary_pair_records = pair_records
 
     def _build_final_horizon_grids(self) -> dict[str, np.ndarray]:
-        if self.mode == "mask":
-            final_grids = {name: grid.copy() for name, grid in self.initial_horizon_grids.items()}
-            for grid in final_grids.values():
-                grid[self.masked_trace_mask] = np.nan
-            self.filled_model_mask = self.valid_control_mask.copy()
-            return final_grids
-
         final_grids = {}
         top_name = self.horizon_names[0]
         top_grid = self.independent_filled_horizon_grids[top_name].copy()
@@ -602,9 +582,7 @@ class TargetLayer:
                         "filled_model": bool(self.filled_model_mask[i, j]),
                         "masked_trace": bool(self.masked_trace_mask[i, j]),
                         "filled_by_thickness_interpolation": bool(
-                            self.mode == "thickness_interpolation"
-                            and self.filled_model_mask[i, j]
-                            and not self.valid_control_mask[i, j]
+                            self.filled_model_mask[i, j] and not self.valid_control_mask[i, j]
                         ),
                         "no_support": bool(self.no_support_mask[i, j]),
                         "crossing": bool(self.crossing_mask[i, j]),
@@ -700,10 +678,7 @@ class TargetLayer:
                 "filled_model_count": int(np.count_nonzero(self.filled_model_mask)),
                 "filled_by_thickness_interpolation_count": int(
                     np.count_nonzero(self.filled_model_mask & ~self.valid_control_mask)
-                    if self.mode == "thickness_interpolation"
-                    else 0
                 ),
-                "mode": self.mode,
                 "nearest_distance_limit": self.nearest_distance_limit,
                 "outlier_threshold": self.outlier_threshold,
                 "outlier_min_neighbor_count": self.outlier_min_neighbor_count,
@@ -746,10 +721,13 @@ class TargetLayer:
         """Return where final horizon grids contain finite values."""
         return self.filled_model_mask.copy()
 
-    def get_zone_valid_mask(self, zone: tuple[str, str]) -> np.ndarray:
+    def get_zone_valid_mask(self, zone: tuple[str, str], *, use_valid_control_mask: bool = True) -> np.ndarray:
         top_name, bottom_name = self._resolve_zone(zone)
         top_grid, bottom_grid = self.get_zone_sample_index_grids((top_name, bottom_name))
-        return self.valid_control_mask & np.isfinite(top_grid) & np.isfinite(bottom_grid) & (bottom_grid > top_grid)
+        valid = np.isfinite(top_grid) & np.isfinite(bottom_grid) & (bottom_grid > top_grid)
+        if use_valid_control_mask:
+            valid &= self.valid_control_mask
+        return valid
 
     def _resolve_zone(self, zone: tuple[str, str]) -> tuple[str, str]:
         top_name, bottom_name = zone
@@ -869,7 +847,6 @@ class TargetLayer:
         out = object.__new__(TargetLayer)
         out.geometry = dict(self.geometry)
         out.horizon_names = [top_extension_name, *self.horizon_names, bottom_extension_name]
-        out.mode = self.mode
         out.output_dir = self.output_dir
         out.min_thickness = self.min_thickness
         out.nearest_distance_limit = self.nearest_distance_limit
@@ -914,7 +891,18 @@ class TargetLayer:
         out.qc_summary_path = self.qc_summary_path
         return out
 
-    def to_mask(self, zone: Optional[tuple[str, str]] = None) -> np.ndarray:
+    def to_mask(
+        self,
+        zone: Optional[tuple[str, str]] = None,
+        *,
+        use_valid_control_mask: bool = True,
+    ) -> np.ndarray:
+        """Build a 3D sample mask.
+
+        By default, only reliable-control traces participate.  Pass
+        ``use_valid_control_mask=False`` to build a full-coverage mask from the
+        filled horizon grids.
+        """
         n_il = int(self.geometry.get("n_il", self._il_axis.size))
         n_xl = int(self.geometry.get("n_xl", self._xl_axis.size))
         n_sample = int(self.geometry.get("n_sample", self._sample_axis.size))
@@ -929,7 +917,7 @@ class TargetLayer:
         zones = [self._resolve_zone(zone)] if zone is not None else self.iter_zones()
         for top_name, bottom_name in zones:
             top_grid, bottom_grid = self.get_zone_sample_index_grids((top_name, bottom_name))
-            valid = self.get_zone_valid_mask((top_name, bottom_name))
+            valid = self.get_zone_valid_mask((top_name, bottom_name), use_valid_control_mask=use_valid_control_mask)
             for i in range(n_il):
                 for j in range(n_xl):
                     if not valid[i, j]:

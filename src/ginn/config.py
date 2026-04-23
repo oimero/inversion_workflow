@@ -47,7 +47,7 @@ class GINNConfig:
     target_layer_outlier_min_neighbor_count: int = 2  # 孤立点判断所需最小十字邻域有效点数。
 
     # ── 低频模型 ──────────────────────────────────────────────
-    lfm_source: LfmSource = "filtered_inversion_lfm"  # 低频模型来源：预计算结果或对阻抗体低通。
+    lfm_source: LfmSource = "precomputed_lfm"  # 低频模型来源：预计算结果或对阻抗体低通。
     lfm_precomputed_file: Path | None = Path("your_precomputed_lfm")  # precomputed_lfm
     lfm_initial_inversion_file: Path | None = Path("your_filtered_inversion_lfm")  # filtered_inversion_lfm
     lfm_filter_dt: float = 0.001  # 从初始反演体低通生成 LFM 时的采样间隔（秒）。

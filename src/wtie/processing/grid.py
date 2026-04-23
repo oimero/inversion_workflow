@@ -1550,7 +1550,7 @@ def get_matching_traces(
     return trace1_match, trace2_match  # type: ignore
 
 
-def _lowpass_filter_trace(trace: BaseTrace, highcut: float, order: int = 5) -> BaseTrace:
+def _lowpass_filter_trace(trace: BaseTrace, highcut: float, order: int = 6) -> BaseTrace:
     """对单条轨迹执行零相位巴特沃斯低通滤波。"""
     fs = 1 / trace.sampling_rate
     fN = fs / 2.0
@@ -1563,7 +1563,7 @@ def _lowpass_filter_trace(trace: BaseTrace, highcut: float, order: int = 5) -> B
 
 
 def lowpass_filter_trace(
-    trace: Union[BaseTrace, BasePrestackTrace], highcut: float, order: int = 5
+    trace: Union[BaseTrace, BasePrestackTrace], highcut: float, order: int = 6
 ) -> Union[BaseTrace, BasePrestackTrace]:
     """对单道或叠前道集执行低通滤波。
 
@@ -1610,7 +1610,7 @@ def _apply_trace_process_to_logset(process: FunctionType, logset: LogSet, *args,
     return LogSet(new_logs)
 
 
-def lowpass_filter_logset(logset: LogSet, highcut: float, order: int = 5) -> LogSet:
+def lowpass_filter_logset(logset: LogSet, highcut: float, order: int = 6) -> LogSet:
     """对 LogSet 中每条曲线执行低通滤波。"""
     return _apply_trace_process_to_logset(lowpass_filter_trace, logset, highcut, order=order)
 

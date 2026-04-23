@@ -5,7 +5,6 @@ import numpy as np
 from wtie.utils.types_ import _size_2_t
 
 
-
 class _Taper:
     """Base class, all implementations should inherit from. Do not instanciate."""
     def __init__(self, size: _size_2_t):

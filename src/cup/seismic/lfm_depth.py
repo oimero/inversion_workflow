@@ -33,7 +33,7 @@ from wtie.processing import grid
 from wtie.processing.spectral import apply_butter_lowpass_filter
 
 DEFAULT_FILTER_BUFFER_WAVELENGTHS = 2.0
-VALID_FILTER_BUFFER_MODES = {"reflect", "edge"}
+VALID_FILTER_BUFFER_MODES = {"reflect", "edge", "none"}
 
 
 @dataclass
@@ -107,7 +107,7 @@ class _PreparedLfmDepthWell:
 def lowpass_depth_log(
     log: grid.Log,
     cutoff_wavelength_m: float = 150.0,
-    order: int = 5,
+    order: int = 6,
     buffer_meters: Optional[float] = None,
     buffer_mode: str = "reflect",
 ) -> grid.Log:
@@ -119,13 +119,13 @@ def lowpass_depth_log(
         输入曲线，必须位于 TVDSS 域且采样间隔为常数。
     cutoff_wavelength_m : float, default=150.0
         截止波长，单位 m。内部会转换为 ``1 / cutoff_wavelength_m`` cycles/m。
-    order : int, default=5
+    order : int, default=6
         滤波器阶数。
     buffer_meters : float, optional
         滤波前在曲线两端附加的缓冲长度，单位 m。若未提供，则按
         ``2 * cutoff_wavelength_m`` 与 ``3 * order * dz`` 的较大值估算。
-    buffer_mode : {"reflect", "edge"}, default="reflect"
-        生成缓冲样本的方式。
+    buffer_mode : {"reflect", "edge", "none"}, default="reflect"
+        生成缓冲样本的方式。``none`` 表示不做外部边界延拓。
     """
     if not log.is_tvdss:
         raise ValueError("lowpass_depth_log only supports TVDSS-domain logs.")
@@ -150,17 +150,21 @@ def lowpass_depth_log(
         )
 
     values = log.values.astype(np.float64)
-    resolved_buffer_meters = (
-        max(DEFAULT_FILTER_BUFFER_WAVELENGTHS * cutoff_wavelength, 3.0 * int(order) * dz)
-        if buffer_meters is None
-        else float(buffer_meters)
-    )
-    if resolved_buffer_meters < 0.0:
-        raise ValueError(f"buffer_meters must be non-negative when provided, got {buffer_meters}.")
+    pad_samples = 0
+    values_to_filter = values
+    if buffer_mode != "none":
+        resolved_buffer_meters = (
+            max(DEFAULT_FILTER_BUFFER_WAVELENGTHS * cutoff_wavelength, 3.0 * int(order) * dz)
+            if buffer_meters is None
+            else float(buffer_meters)
+        )
+        if resolved_buffer_meters < 0.0:
+            raise ValueError(f"buffer_meters must be non-negative when provided, got {buffer_meters}.")
 
-    pad_samples = int(np.ceil(resolved_buffer_meters / dz))
-    pad_samples = min(max(pad_samples, 0), values.size - 1)
-    values_to_filter = np.pad(values, (pad_samples, pad_samples), mode=buffer_mode) if pad_samples > 0 else values  # type: ignore
+        pad_samples = int(np.ceil(resolved_buffer_meters / dz))
+        pad_samples = min(max(pad_samples, 0), values.size - 1)
+        if pad_samples > 0:
+            values_to_filter = np.pad(values, (pad_samples, pad_samples), mode=buffer_mode)  # type: ignore
 
     filtered = apply_butter_lowpass_filter(
         values_to_filter,
@@ -377,7 +381,7 @@ def build_lfm_depth_model(
     exact: bool = True,
     nugget: float = 0.0,
     filter_cutoff_wavelength_m: float = 150.0,
-    filter_order: int = 5,
+    filter_order: int = 6,
     filter_buffer_meters: Optional[float] = None,
     filter_buffer_mode: str = "reflect",
     post_slice_smoothing: bool = False,

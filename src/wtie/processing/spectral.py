@@ -1,17 +1,15 @@
 """FFT stuff."""
 
 import cmath
+
 import numpy as np
 import scipy.fftpack
-
-from scipy.signal import butter, lfilter, iirfilter
-
 import torch
 import torch.nn.functional as F
+from scipy.signal import butter, iirfilter, lfilter, sosfilt, sosfiltfilt
 
-
-from wtie.utils.types_ import List, Tensor
 from wtie.modeling.noise import open_simplex_noise
+from wtie.utils.types_ import List, Tensor
 
 
 def compute_spectrum(signal: np.ndarray, dt: float,
@@ -127,7 +125,7 @@ def apply_butter_bandpass_filter(data: np.ndarray,
                                  lowcut: float,
                                  highcut: float,
                                  fs: float,
-                                 order: int=5,
+                                 order: int=6,
                                  zero_phase: bool=True
                                  ) -> np.ndarray:
     """Filters input data with Butterworth filter."""
@@ -144,24 +142,25 @@ def apply_butter_bandpass_filter(data: np.ndarray,
 def apply_butter_lowpass_filter(data: np.ndarray,
                                 highcut: float,
                                 fs: float,
-                                order: int=5,
+                                order: int=6,
                                 zero_phase: bool=True
                                 ) -> np.ndarray:
     """Filters input data with Butterworth filter."""
     if zero_phase:
-        b, a = butter_bandpass(0, highcut, fs, order=order//2)
-        data_tmp = lfilter(b, a, data[::-1])
-        y = lfilter(b, a, data_tmp[::-1])
+        if order % 2 != 0:
+            raise ValueError("order must be even when zero_phase=True.")
+        sos = butter(order // 2, highcut, btype='low', fs=fs, output='sos')  # type: ignore
+        y = sosfiltfilt(sos, data)
     else:
-        b, a = butter_bandpass(0, highcut, fs, order=order)
-        y = lfilter(b, a, data)
+        sos = butter(order, highcut, btype='low', fs=fs, output='sos')  # type: ignore
+        y = sosfilt(sos, data)
     return y # type: ignore
 
 
 
 
 def apply_notch_filter(data: np.ndarray, dt: float, freq: float, band: float,
-                       order: int=7) -> np.ndarray:
+                       order: int=6) -> np.ndarray:
     """Apply notch filter at frequency `freq` with bandwidth `band` """
     fs   = 1/dt
     nyq  = fs/2.0

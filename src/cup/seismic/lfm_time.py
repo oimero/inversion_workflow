@@ -22,7 +22,7 @@ Examples
 >>> from cup.seismic.lfm_time import LfmTimeWell, lowpass_twt_log
 >>> from wtie.processing import grid
 >>> twt_log = grid.Log(np.array([10., 20., 30.]), np.array([1.0, 1.5, 2.0]), "twt", name="AI")
->>> filtered = lowpass_twt_log(twt_log, cutoff_hz=0.4, order=3)
+>>> filtered = lowpass_twt_log(twt_log, cutoff_hz=0.4, order=6)
 >>> filtered.is_twt
 True
 """
@@ -41,7 +41,7 @@ from wtie.processing import grid
 from wtie.processing.spectral import apply_butter_lowpass_filter
 
 DEFAULT_FILTER_BUFFER_CYCLES = 2.0
-VALID_FILTER_BUFFER_MODES = {"reflect", "edge"}
+VALID_FILTER_BUFFER_MODES = {"reflect", "edge", "none"}
 
 
 @dataclass
@@ -132,7 +132,7 @@ class _PreparedLfmTimeWell:
 def lowpass_twt_log(
     log: grid.Log,
     cutoff_hz: float = 10.0,
-    order: int = 5,
+    order: int = 6,
     buffer_seconds: Optional[float] = None,
     buffer_mode: str = "reflect",
 ) -> grid.Log:
@@ -144,15 +144,15 @@ def lowpass_twt_log(
         输入曲线，必须位于 TWT 域且采样间隔为常数。
     cutoff_hz : float, default=10.0
         低通截止频率，单位 Hz。
-    order : int, default=5
+    order : int, default=6
         滤波器阶数。启用零相位滤波时，内部会按当前实现调用双向滤波。
     buffer_seconds : float, optional
         滤波前在曲线两端附加的缓冲时长，单位 s。若未提供，则按
         ``DEFAULT_FILTER_BUFFER_CYCLES / cutoff_hz`` 自动估算，并限制在
         曲线长度允许的范围内。
-    buffer_mode : {"reflect", "edge"}, default="reflect"
+    buffer_mode : {"reflect", "edge", "none"}, default="reflect"
         生成缓冲样本的方式。``reflect`` 适合减弱端点突变带来的边界效应，
-        ``edge`` 则使用端点常值外延。
+        ``edge`` 则使用端点常值外延。``none`` 表示不做外部边界延拓。
 
     Returns
     -------
@@ -184,18 +184,22 @@ def lowpass_twt_log(
             unit=getattr(log, "unit", None),
         )
 
-    dt = float(log.sampling_rate)
-    resolved_buffer_seconds = (
-        max(DEFAULT_FILTER_BUFFER_CYCLES / cutoff_hz, 3.0 * order * dt)
-        if buffer_seconds is None
-        else float(buffer_seconds)
-    )
-    if resolved_buffer_seconds < 0.0:
-        raise ValueError(f"buffer_seconds must be non-negative when provided, got {buffer_seconds}.")
+    pad_samples = 0
+    values_to_filter = values
+    if buffer_mode != "none":
+        dt = float(log.sampling_rate)
+        resolved_buffer_seconds = (
+            max(DEFAULT_FILTER_BUFFER_CYCLES / cutoff_hz, 3.0 * order * dt)
+            if buffer_seconds is None
+            else float(buffer_seconds)
+        )
+        if resolved_buffer_seconds < 0.0:
+            raise ValueError(f"buffer_seconds must be non-negative when provided, got {buffer_seconds}.")
 
-    pad_samples = int(np.ceil(resolved_buffer_seconds / dt))
-    pad_samples = min(max(pad_samples, 0), values.size - 1)
-    values_to_filter = np.pad(values, (pad_samples, pad_samples), mode=buffer_mode) if pad_samples > 0 else values  # type: ignore
+        pad_samples = int(np.ceil(resolved_buffer_seconds / dt))
+        pad_samples = min(max(pad_samples, 0), values.size - 1)
+        if pad_samples > 0:
+            values_to_filter = np.pad(values, (pad_samples, pad_samples), mode=buffer_mode)  # type: ignore
 
     filtered = apply_butter_lowpass_filter(
         values_to_filter,
@@ -348,7 +352,7 @@ def build_lfm_time_model(
     exact: bool = True,
     nugget: float = 0.0,
     filter_cutoff_hz: float = 10.0,
-    filter_order: int = 5,
+    filter_order: int = 6,
     filter_buffer_seconds: Optional[float] = None,
     filter_buffer_mode: str = "reflect",
     post_slice_smoothing: bool = False,
@@ -381,8 +385,8 @@ def build_lfm_time_model(
         井曲线低通滤波阶数。
     filter_buffer_seconds : float, optional
         滤波前在井曲线上下两端附加的缓冲时长，单位 s。默认按截止频率自动估算。
-    filter_buffer_mode : {"reflect", "edge"}, default="reflect"
-        曲线两端缓冲样本的生成方式。
+    filter_buffer_mode : {"reflect", "edge", "none"}, default="reflect"
+        曲线两端缓冲样本的生成方式。``none`` 表示不做外部边界延拓。
     post_slice_smoothing : bool, default=False
         是否对各层段的比例切片结果沿 slice 维做轻度平滑。
 

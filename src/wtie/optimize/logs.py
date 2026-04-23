@@ -300,7 +300,7 @@ def _perturbe_poly(p, delta_abs):
 
 
 def OLDget_perturbed_time_depth_tables(
-    tdt: grid.TimeDepthTable, n: int = 100, delta_abs: float = 0.03, order: int = 5
+    tdt: grid.TimeDepthTable, n: int = 100, delta_abs: float = 0.03, order: int = 6
 ) -> List[grid.TimeDepthTable]:
     """基于多项式拟合生成扰动时深表样本（旧实现，保留兼容）。
 

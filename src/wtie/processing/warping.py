@@ -2,14 +2,13 @@
 
 import numpy as np
 
-#from dtaidistance import dtw as _dtw
-
-from wtie.processing.logs import despike, interpolate_nans, smooth
-from wtie.optimize.similarity import normalized_xcorr
 #from wtie.utils.types_ import List, Tuple
-
 from scipy.interpolate import interp1d
 
+from wtie.optimize.similarity import normalized_xcorr
+
+#from dtaidistance import dtw as _dtw
+from wtie.processing.logs import despike, interpolate_nans, smooth
 
 ########################
 # dtaidistance

@@ -36,7 +36,7 @@ class DepthLfmVolume:
 
     @property
     def shape(self) -> tuple[int, int, int]:
-        return tuple(int(v) for v in self.volume.shape)
+        return tuple(int(v) for v in self.volume.shape) # type: ignore
 
     @property
     def dz(self) -> float:
@@ -275,7 +275,7 @@ def _resolve_mask_bounds(mask_flat: np.ndarray) -> tuple[np.ndarray, np.ndarray,
         valid_mask = mask_flat[has_valid]
         start[has_valid] = np.argmax(valid_mask, axis=1)
         end[has_valid] = n_sample - np.argmax(valid_mask[:, ::-1], axis=1)
-    return start, end, has_valid
+    return start, end, has_valid # type: ignore
 
 
 def _build_eroded_loss_mask(mask_flat: np.ndarray, erosion_samples: int) -> np.ndarray:

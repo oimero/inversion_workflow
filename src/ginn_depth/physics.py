@@ -109,15 +109,17 @@ class DepthWaveletMatrixBuilder(nn.Module):
         if torch.any(depth_axis_m[1:] <= depth_axis_m[:-1]):
             raise ValueError("depth_axis_m must be strictly increasing.")
 
-    def _resolve_depth_axis(self, depth_axis_m: np.ndarray | Tensor | None, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+    def _resolve_depth_axis(
+        self, depth_axis_m: np.ndarray | Tensor | None, *, device: torch.device, dtype: torch.dtype
+    ) -> Tensor:
         if depth_axis_m is None:
-            if self.depth_axis_m.numel() == 0:
+            if self.depth_axis_m.numel() == 0:  # type: ignore
                 raise ValueError("depth_axis_m was not provided at init time or call time.")
             depth_axis = self.depth_axis_m
         else:
             depth_axis = torch.as_tensor(depth_axis_m, dtype=torch.float32)
             self._validate_depth_axis(depth_axis.flatten())
-        return depth_axis.to(device=device, dtype=dtype).flatten()
+        return depth_axis.to(device=device, dtype=dtype).flatten()  # type: ignore
 
     @staticmethod
     def compute_twt_axes(depth_axis_m: Tensor, velocity_mps: Tensor) -> tuple[Tensor, Tensor]:
@@ -132,8 +134,7 @@ class DepthWaveletMatrixBuilder(nn.Module):
             raise ValueError("depth_axis_m must be 1D.")
         if velocity_mps.shape[-1] != depth_axis_m.numel():
             raise ValueError(
-                "velocity/depth length mismatch: "
-                f"velocity N={velocity_mps.shape[-1]}, depth N={depth_axis_m.numel()}"
+                f"velocity/depth length mismatch: velocity N={velocity_mps.shape[-1]}, depth N={depth_axis_m.numel()}"
             )
         if torch.any(~torch.isfinite(velocity_mps)) or torch.any(velocity_mps <= 0.0):
             raise ValueError("velocity_mps must be finite and positive everywhere.")
@@ -142,7 +143,10 @@ class DepthWaveletMatrixBuilder(nn.Module):
         inv_v_mid = 0.5 * (velocity_mps[:, :-1].reciprocal() + velocity_mps[:, 1:].reciprocal())
         dtwt = 2.0 * dz.unsqueeze(0) * inv_v_mid
         twt_sample = torch.cat(
-            [torch.zeros((velocity_mps.shape[0], 1), device=velocity_mps.device, dtype=velocity_mps.dtype), dtwt.cumsum(dim=1)],
+            [
+                torch.zeros((velocity_mps.shape[0], 1), device=velocity_mps.device, dtype=velocity_mps.dtype),
+                dtwt.cumsum(dim=1),
+            ],
             dim=1,
         )
         twt_interface = 0.5 * (twt_sample[:, :-1] + twt_sample[:, 1:])
@@ -152,15 +156,15 @@ class DepthWaveletMatrixBuilder(nn.Module):
         wavelet_time = self.wavelet_time_s.to(device=tau_s.device, dtype=tau_s.dtype)
         wavelet_amp = self.wavelet_amp.to(device=tau_s.device, dtype=tau_s.dtype)
 
-        outside = (tau_s < wavelet_time[0]) | (tau_s > wavelet_time[-1])
-        idx_right = torch.searchsorted(wavelet_time, tau_s.contiguous(), right=False)
-        idx_right = idx_right.clamp(min=1, max=wavelet_time.numel() - 1)
+        outside = (tau_s < wavelet_time[0]) | (tau_s > wavelet_time[-1])  # type: ignore
+        idx_right = torch.searchsorted(wavelet_time, tau_s.contiguous(), right=False)  # type: ignore
+        idx_right = idx_right.clamp(min=1, max=wavelet_time.numel() - 1)  # type: ignore
         idx_left = idx_right - 1
 
-        t0 = wavelet_time[idx_left]
-        t1 = wavelet_time[idx_right]
-        a0 = wavelet_amp[idx_left]
-        a1 = wavelet_amp[idx_right]
+        t0 = wavelet_time[idx_left]  # type: ignore
+        t1 = wavelet_time[idx_right]  # type: ignore
+        a0 = wavelet_amp[idx_left]  # type: ignore
+        a1 = wavelet_amp[idx_right]  # type: ignore
         alpha = (tau_s - t0) / (t1 - t0).clamp_min(torch.finfo(tau_s.dtype).eps)
         values = a0 + alpha * (a1 - a0)
         values = torch.where(outside, torch.zeros_like(values), values)

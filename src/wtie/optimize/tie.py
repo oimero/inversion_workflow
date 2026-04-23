@@ -27,6 +27,8 @@ Examples
 
 from time import sleep
 
+import numpy as np
+
 from wtie import grid
 from wtie.learning.model import BaseEvaluator
 from wtie.modeling.modeling import ModelingCallable
@@ -177,6 +179,45 @@ def compute_reflectivity(logset: grid.LogSet, angle_range: tuple = None) -> grid
     return r
 
 
+def _matching_seismic_mask(seismic_basis: np.ndarray, reflectivity_basis: np.ndarray) -> np.ndarray:
+    """Return seismic samples that are inside the reflectivity time support."""
+    if reflectivity_basis.size < 2:
+        raise ValueError("Reflectivity must contain at least two samples for interpolation.")
+
+    eps = max(
+        float(abs(seismic_basis[1] - seismic_basis[0])), float(abs(reflectivity_basis[1] - reflectivity_basis[0]))
+    )
+    eps *= 1e-6
+    mask = (seismic_basis >= reflectivity_basis[0] - eps) & (seismic_basis <= reflectivity_basis[-1] + eps)
+    if np.count_nonzero(mask) < 2:
+        raise ValueError("Seismic and reflectivity do not share enough TWT samples.")
+    return mask
+
+
+def _crop_seismic_to_mask(seismic: grid.Seismic, mask: np.ndarray) -> grid.Seismic:
+    return grid.Seismic(
+        seismic.values[mask],
+        seismic.basis[mask],
+        "twt",
+        theta=seismic.theta,
+        name=seismic.name,
+    )
+
+
+def _interpolate_reflectivity_to_basis(
+    reflectivity: grid.Reflectivity,
+    target_basis: np.ndarray,
+) -> grid.Reflectivity:
+    interp_basis = np.clip(target_basis, reflectivity.basis[0], reflectivity.basis[-1])
+    values = np.interp(interp_basis, reflectivity.basis, reflectivity.values)
+    return grid.Reflectivity(
+        values,
+        target_basis,
+        theta=reflectivity.theta,
+        name=reflectivity.name,
+    )
+
+
 def match_seismic_and_reflectivity(seismic: grid.seismic_t, reflectivity: grid.ref_t):
     """裁剪并对齐地震与反射系数的共同 TWT 区间。
 
@@ -197,7 +238,33 @@ def match_seismic_and_reflectivity(seismic: grid.seismic_t, reflectivity: grid.r
     --------
     >>> seis_m, ref_m = match_seismic_and_reflectivity(seismic, reflectivity)
     """
-    return grid.get_matching_traces(seismic, reflectivity)
+    assert seismic.basis_type == reflectivity.basis_type
+    assert seismic.is_twt and reflectivity.is_twt
+    assert np.allclose(seismic.sampling_rate, reflectivity.sampling_rate, rtol=1e-4)
+
+    if seismic.is_prestack:
+        assert reflectivity.is_prestack
+        assert (seismic.angles == reflectivity.angles).all()  # type: ignore
+
+        mask = _matching_seismic_mask(seismic.basis, reflectivity.basis)
+        target_basis = seismic.basis[mask]
+
+        seismics = []
+        reflectivities = []
+        for theta in seismic.angles:  # type: ignore
+            seismics.append(_crop_seismic_to_mask(seismic[theta], mask))  # type: ignore
+            reflectivities.append(_interpolate_reflectivity_to_basis(reflectivity[theta], target_basis))  # type: ignore
+
+        return grid.PreStackSeismic(seismics, name=seismic.name), grid.PreStackReflectivity(  # type: ignore
+            reflectivities,
+            name=reflectivity.name,  # type: ignore
+        )
+
+    assert not reflectivity.is_prestack
+    mask = _matching_seismic_mask(seismic.basis, reflectivity.basis)
+    seismic_match = _crop_seismic_to_mask(seismic, mask)  # type: ignore
+    reflectivity_match = _interpolate_reflectivity_to_basis(reflectivity, seismic_match.basis)  # type: ignore
+    return seismic_match, reflectivity_match
 
 
 def compute_wavelet(

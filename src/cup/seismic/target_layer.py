@@ -341,8 +341,9 @@ class TargetLayer:
         Survey geometry.  Inline/xline and sample axis keys are required.
     horizon_names
         Horizon order from shallow/top to deep/bottom.
-    output_dir
-        QC CSV output directory.  Defaults to ``./output``.
+    qc_output_dir
+        Optional QC CSV output directory.  When omitted, QC DataFrames are kept
+        in memory and no files or directories are created.
     min_thickness
         Minimum allowed adjacent-layer thickness.  Defaults to sample step.
     nearest_distance_limit
@@ -362,7 +363,7 @@ class TargetLayer:
         geometry: Dict[str, Any],
         horizon_names: list[str],
         *,
-        output_dir: Optional[str | Path] = None,
+        qc_output_dir: Optional[str | Path] = None,
         min_thickness: Optional[float] = None,
         nearest_distance_limit: Optional[float] = None,
         outlier_threshold: Optional[float] = None,
@@ -381,8 +382,7 @@ class TargetLayer:
         _validate_geometry_keys(geometry)
         self.geometry = dict(geometry)
         self.horizon_names = list(horizon_names)
-        self.output_dir = Path("output") if output_dir is None else Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.qc_output_dir = None if qc_output_dir is None else Path(qc_output_dir)
         self.min_thickness = float(self.geometry["sample_step"]) if min_thickness is None else float(min_thickness)
         if self.min_thickness <= 0.0:
             raise ValueError(f"min_thickness must be positive, got {self.min_thickness}.")
@@ -437,7 +437,9 @@ class TargetLayer:
         self.interpolated_horizon_dfs = {
             name: self._grid_to_horizon_df(grid) for name, grid in self._horizon_grids.items()
         }
-        self._write_qc_csvs()
+        self._build_qc_dataframes()
+        if self.qc_output_dir is not None:
+            self.write_qc(self.qc_output_dir)
 
     def _build_axes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         il_axis = _build_axis(
@@ -686,17 +688,29 @@ class TargetLayer:
         )
         return pd.DataFrame.from_records(records)
 
-    def _write_qc_csvs(self) -> None:
+    def _build_qc_dataframes(self) -> None:
         self.trace_qc_df = self._trace_qc_dataframe()
         self.pair_qc_df = self._pair_qc_dataframe()
         self.qc_summary_df = self._summary_dataframe()
+        self.trace_qc_path: Optional[Path] = None
+        self.pair_qc_path: Optional[Path] = None
+        self.qc_summary_path: Optional[Path] = None
 
-        self.trace_qc_path = self.output_dir / "target_layer_trace_qc.csv"
-        self.pair_qc_path = self.output_dir / "target_layer_pair_qc.csv"
-        self.qc_summary_path = self.output_dir / "target_layer_qc_summary.csv"
+    def write_qc(self, qc_output_dir: str | Path) -> dict[str, Path]:
+        qc_output_path = Path(qc_output_dir)
+        qc_output_path.mkdir(parents=True, exist_ok=True)
+        self.qc_output_dir = qc_output_path
+        self.trace_qc_path = qc_output_path / "target_layer_trace_qc.csv"
+        self.pair_qc_path = qc_output_path / "target_layer_pair_qc.csv"
+        self.qc_summary_path = qc_output_path / "target_layer_qc_summary.csv"
         self.trace_qc_df.to_csv(self.trace_qc_path, index=False, encoding="utf-8-sig")
         self.pair_qc_df.to_csv(self.pair_qc_path, index=False, encoding="utf-8-sig")
         self.qc_summary_df.to_csv(self.qc_summary_path, index=False, encoding="utf-8-sig")
+        return {
+            "trace_qc": self.trace_qc_path,
+            "pair_qc": self.pair_qc_path,
+            "qc_summary": self.qc_summary_path,
+        }
 
     @property
     def ilines(self) -> np.ndarray:
@@ -847,7 +861,7 @@ class TargetLayer:
         out = object.__new__(TargetLayer)
         out.geometry = dict(self.geometry)
         out.horizon_names = [top_extension_name, *self.horizon_names, bottom_extension_name]
-        out.output_dir = self.output_dir
+        out.qc_output_dir = None
         out.min_thickness = self.min_thickness
         out.nearest_distance_limit = self.nearest_distance_limit
         out.outlier_threshold = self.outlier_threshold
@@ -886,9 +900,9 @@ class TargetLayer:
         out.trace_qc_df = self.trace_qc_df.copy()
         out.pair_qc_df = self.pair_qc_df.copy()
         out.qc_summary_df = self.qc_summary_df.copy()
-        out.trace_qc_path = self.trace_qc_path
-        out.pair_qc_path = self.pair_qc_path
-        out.qc_summary_path = self.qc_summary_path
+        out.trace_qc_path = None
+        out.pair_qc_path = None
+        out.qc_summary_path = None
         return out
 
     def to_mask(

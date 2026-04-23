@@ -27,8 +27,8 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from cup.seismic.modeling import WellControl, build_layer_constrained_model
-from cup.seismic.target_layer import TargetLayer
 from cup.seismic.survey import SurveyContext
+from cup.seismic.target_layer import TargetLayer
 from wtie.processing import grid
 from wtie.processing.spectral import apply_butter_lowpass_filter
 

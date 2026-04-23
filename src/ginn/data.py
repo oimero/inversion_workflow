@@ -23,8 +23,8 @@ from scipy.signal import butter, sosfiltfilt
 from torch.utils.data import Dataset
 
 from cup.petrel.load import import_interpretation_petrel, import_seismic
-from cup.seismic.process import TargetLayer, interpolate_interpretation_surface
 from cup.seismic.survey import open_survey
+from cup.seismic.target_layer import TargetLayer
 from ginn.config import GINNConfig
 
 logger = logging.getLogger(__name__)
@@ -458,7 +458,7 @@ class SeismicTraceDataset(Dataset):
     """逐道 1D 地震数据 Dataset。
 
     每个 item 包含：
-    - ``input``：(2, n_sample) — 归一化地震道 + 归一化 LFM
+    - ``input``：(3, n_sample) — 归一化地震道 + 归一化 LFM + 目的层 mask
     - ``obs``：(1, n_sample) — 归一化观测地震道（用于损失计算）
     - ``mask``：(1, n_sample) — core 布尔掩码
     - ``loss_mask``：(1, n_sample) — eroded core 掩码，仅用于 waveform loss
@@ -551,6 +551,11 @@ class SeismicTraceDataset(Dataset):
         """当前数据集对应的展平 trace 索引。"""
         return self._valid_indices
 
+    @property
+    def lfm_flat(self) -> np.ndarray:
+        """返回完整展平 LFM，用作未进入推理域 trace 的物理背景值。"""
+        return self._lfm_flat
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         flat_idx = self._valid_indices[idx]
 
@@ -567,11 +572,11 @@ class SeismicTraceDataset(Dataset):
         seis_norm = seis / self._seis_rms
         lfm_norm = lfm / self._lfm_scale
 
-        # 构造 2 通道输入
-        x = np.stack([seis_norm, lfm_norm], axis=0)  # (2, n_sample)
+        # 构造 3 通道输入：地震、LFM、目的层位置先验。
+        x = np.stack([seis_norm, lfm_norm, core_mask.astype(np.float32)], axis=0)  # (3, n_sample)
 
         return {
-            "input": torch.from_numpy(x).float(),  # (2, n_sample)
+            "input": torch.from_numpy(x).float(),  # (3, n_sample)
             "obs": torch.from_numpy(seis_norm[np.newaxis]).float(),  # (1, n_sample)
             "mask": torch.from_numpy(core_mask[np.newaxis]).bool(),  # (1, n_sample)
             "loss_mask": torch.from_numpy(loss_mask[np.newaxis]).bool(),  # (1, n_sample)
@@ -620,40 +625,30 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
             f"volume={(n_il, n_xl, n_sample)}, geometry={(geometry_n_il, geometry_n_xl, geometry_n_sample)}"
         )
 
-    logger.info("Loading and interpolating top/bottom interpretation horizons...")
+    logger.info("Loading raw top/bottom interpretation horizons...")
     top_df_raw = import_interpretation_petrel(cfg.top_horizon_file)
     bot_df_raw = import_interpretation_petrel(cfg.bot_horizon_file)
 
-    top_df_interp = interpolate_interpretation_surface(
-        interpretation_df=top_df_raw,
-        geometry=geometry,
-        outlier_threshold=0.02,
-        min_neighbor_count=2,
-        keep_nan=True,
-    )
-    bot_df_interp = interpolate_interpretation_surface(
-        interpretation_df=bot_df_raw,
-        geometry=geometry,
-        outlier_threshold=0.02,
-        min_neighbor_count=2,
-        keep_nan=True,
-    )
-
-    logger.info("Building horizon mask from TargetLayer...")
+    logger.info("Building target layer from raw interpretations...")
     target_layer = TargetLayer(
-        interpolated_horizon_dfs={"top": top_df_interp, "bottom": bot_df_interp},
+        raw_horizon_dfs={"top": top_df_raw, "bottom": bot_df_raw},
         geometry=geometry,
         horizon_names=["top", "bottom"],
+        min_thickness=cfg.target_layer_min_thickness,
+        nearest_distance_limit=cfg.target_layer_nearest_distance_limit,
+        outlier_threshold=cfg.target_layer_outlier_threshold,
+        outlier_min_neighbor_count=cfg.target_layer_outlier_min_neighbor_count,
     )
-    mask = target_layer.to_mask()
+    train_mask = target_layer.to_mask(use_valid_control_mask=True)
+    inference_mask = target_layer.to_mask(use_valid_control_mask=False)
 
-    if cfg.lfm_source == "wtie_time_lfm":
-        logger.info("Loading precomputed low-frequency model from %s...", cfg.precomputed_lfm_file)
-        lfm = load_lowfreq_model(cfg.precomputed_lfm_file)  # type: ignore
+    if cfg.lfm_source == "precomputed_lfm":
+        logger.info("Loading precomputed low-frequency model from %s...", cfg.lfm_precomputed_file)
+        lfm = load_lowfreq_model(cfg.lfm_precomputed_file)  # type: ignore
     elif cfg.lfm_source == "filtered_inversion_lfm":
         logger.info("Loading inversion volume...")
         inversion = import_seismic(
-            cfg.lfm_reference_impedance_file,  # type: ignore
+            cfg.lfm_initial_inversion_file,  # type: ignore
             seismic_type="segy",
         )
         if inversion.shape != seismic.shape:
@@ -662,68 +657,86 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         logger.info("Generating low-frequency model from inversion volume...")
         lfm = make_lowfreq_model(
             inversion,
-            dt_s=cfg.dt,
+            dt_s=cfg.lfm_filter_dt,
             cutoff_hz=cfg.lfm_cutoff_hz,
             order=cfg.lfm_filter_order,
         )
     else:
         raise ValueError(f"Unsupported lfm_source: {cfg.lfm_source}")
 
-    logger.info("Building horizon mask from TargetLayer...")
-    if mask.shape != seismic.shape:
-        raise ValueError(f"Mask shape {mask.shape} does not match seismic shape {seismic.shape}.")
+    if train_mask.shape != seismic.shape:
+        raise ValueError(f"Training mask shape {train_mask.shape} does not match seismic shape {seismic.shape}.")
+    if inference_mask.shape != seismic.shape:
+        raise ValueError(f"Inference mask shape {inference_mask.shape} does not match seismic shape {seismic.shape}.")
     if lfm.shape != seismic.shape:
         raise ValueError(f"LFM shape {lfm.shape} does not match seismic shape {seismic.shape}.")
 
     # ── 展平并预计算掩码 / taper（只算一次） ──
     seismic_flat = seismic.reshape(n_il * n_xl, n_sample)
     lfm_flat = lfm.reshape(n_il * n_xl, n_sample)
-    mask_flat = mask.reshape(n_il * n_xl, n_sample)
-    loss_mask_flat = _build_eroded_loss_mask(mask_flat, erosion_samples=cfg.boundary_effect_samples)
-    taper_flat = _build_residual_taper(mask_flat, halo_samples=cfg.boundary_effect_samples)
-    all_valid_indices = _get_valid_trace_indices(mask_flat)
+    train_mask_flat = train_mask.reshape(n_il * n_xl, n_sample)
+    inference_mask_flat = inference_mask.reshape(n_il * n_xl, n_sample)
+    train_loss_mask_flat = _build_eroded_loss_mask(train_mask_flat, erosion_samples=cfg.boundary_effect_samples)
+    inference_loss_mask_flat = _build_eroded_loss_mask(
+        inference_mask_flat,
+        erosion_samples=cfg.boundary_effect_samples,
+    )
+    train_taper_flat = _build_residual_taper(train_mask_flat, halo_samples=cfg.boundary_effect_samples)
+    inference_taper_flat = _build_residual_taper(inference_mask_flat, halo_samples=cfg.boundary_effect_samples)
+    train_valid_indices = _get_valid_trace_indices(train_mask_flat)
+    inference_valid_indices = _get_valid_trace_indices(inference_mask_flat)
     logger.info(
-        "Preprocessed masks: %d valid traces, boundary_effect_samples=%d",
-        all_valid_indices.size,
+        "Preprocessed masks: train=%d traces, inference=%d traces, boundary_effect_samples=%d",
+        train_valid_indices.size,
+        inference_valid_indices.size,
         cfg.boundary_effect_samples,
     )
 
     # ── 验证集切分 ──
-    train_indices = all_valid_indices
+    train_indices = train_valid_indices
     val_indices: np.ndarray | None = None
     split_metadata: Dict[str, Any] = {
         "mode": "none",
         "train_trace_count": int(train_indices.size),
         "val_trace_count": 0,
         "gap_trace_count": 0,
+        "inference_trace_count": int(inference_valid_indices.size),
     }
     if cfg.validation_split_mode == "spatial_block" and cfg.validation_fraction > 0.0:
         train_indices, val_indices, split_metadata = _select_spatial_validation_split(
-            all_valid_indices,
+            train_valid_indices,
             n_il=n_il,
             n_xl=n_xl,
             validation_fraction=cfg.validation_fraction,
             gap_traces=cfg.validation_gap_traces,
             anchor=cfg.validation_block_anchor,
         )
+        split_metadata["inference_trace_count"] = int(inference_valid_indices.size)
         logger.info("Validation split: %s", split_metadata)
     else:
         logger.info("Validation split disabled.")
 
     # ── 构建数据集（共享预计算的掩码 / taper，不重复计算） ──
-    shared = (seismic_flat, lfm_flat, mask_flat, loss_mask_flat, taper_flat)
-    train_dataset = SeismicTraceDataset(*shared, train_indices)
+    train_shared = (seismic_flat, lfm_flat, train_mask_flat, train_loss_mask_flat, train_taper_flat)
+    inference_shared = (
+        seismic_flat,
+        lfm_flat,
+        inference_mask_flat,
+        inference_loss_mask_flat,
+        inference_taper_flat,
+    )
+    train_dataset = SeismicTraceDataset(*train_shared, train_indices)
     train_norm_stats = (train_dataset.seis_rms, train_dataset.lfm_scale)
     val_dataset = None
     if val_indices is not None and val_indices.size > 0:
         val_dataset = SeismicTraceDataset(
-            *shared,
+            *train_shared,
             val_indices,
             normalization_stats=train_norm_stats,
         )
     inference_dataset = SeismicTraceDataset(
-        *shared,
-        all_valid_indices,
+        *inference_shared,
+        inference_valid_indices,
         normalization_stats=train_norm_stats,
     )
 
@@ -740,7 +753,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         resolved_wavelet_gain = estimate_wavelet_gain(
             seismic,
             lfm,
-            mask,
+            train_mask,
             unit_wavelet,
             seis_rms=train_dataset.seis_rms,
             max_traces=cfg.wavelet_gain_num_traces,

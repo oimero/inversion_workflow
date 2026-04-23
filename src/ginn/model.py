@@ -1,6 +1,6 @@
 """ginn.model — 1D 膨胀卷积残差网络（Dilated ResNet）。
 
-网络接收 2 通道输入（地震 + LFM），输出 1 通道高频扰动。
+网络接收 3 通道输入（地震 + LFM + 目的层 mask），输出 1 通道高频扰动。
 训练器会将该高频扰动与 LFM 合成完整声阻抗。
 """
 
@@ -94,7 +94,7 @@ class DilatedResNet1D(nn.Module):
     Parameters
     ----------
     in_channels : int
-        输入通道数，默认 2（地震 + LFM）。
+        输入通道数，默认 3（地震 + LFM + 目的层 mask）。
     hidden_channels : int
         残差块内部通道数，默认 64。
     out_channels : int
@@ -107,7 +107,7 @@ class DilatedResNet1D(nn.Module):
 
     def __init__(
         self,
-        in_channels: int = 2,
+        in_channels: int = 3,
         hidden_channels: int = 64,
         out_channels: int = 1,
         dilations: Sequence[int] = (1, 2, 4, 8, 16, 32, 64, 128),

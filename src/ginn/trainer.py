@@ -174,7 +174,7 @@ class Trainer:
         context = torch.enable_grad if training else torch.no_grad
         with context():
             for batch_idx, batch in enumerate(dataloader):
-                x = batch["input"].to(self.device)  # (B, 2, T)
+                x = batch["input"].to(self.device)  # (B, 3, T)
                 d_obs = batch["obs"].to(self.device)  # (B, 1, T)
                 core_mask = batch["mask"].to(self.device)  # (B, 1, T)
                 loss_mask = batch["loss_mask"].to(self.device)  # (B, 1, T)
@@ -420,8 +420,8 @@ class Trainer:
 
         predictions = np.concatenate(predictions, axis=0)  # (N_valid, T)
 
-        # 放回原始 3D 位置
-        volume = np.zeros((n_il * n_xl, n_sample), dtype=np.float32)
+        # 放回原始 3D 位置；未进入 full target-layer 推理域的 trace 保持 LFM，而不是静默留 0。
+        volume = self.dataset.lfm_flat.astype(np.float32, copy=True)
         valid_indices = self.dataset.valid_indices
         volume[valid_indices] = predictions
 

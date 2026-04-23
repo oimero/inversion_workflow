@@ -8,7 +8,7 @@ from typing import Any, Dict, Literal, Tuple
 
 import yaml
 
-LfmSource = Literal["wtie_time_lfm", "filtered_inversion_lfm"]
+LfmSource = Literal["precomputed_lfm", "filtered_inversion_lfm"]
 ValidationSplitMode = Literal["none", "spatial_block"]
 ValidationBlockAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"]
 
@@ -16,8 +16,8 @@ _PATH_FIELDS = {
     "seismic_file",
     "top_horizon_file",
     "bot_horizon_file",
-    "precomputed_lfm_file",
-    "lfm_reference_impedance_file",
+    "lfm_precomputed_file",
+    "lfm_initial_inversion_file",
     "checkpoint_dir",
 }
 
@@ -40,8 +40,19 @@ class GINNConfig:
     segy_istep: int = 1  # inline 抽样步长。
     segy_xstep: int = 1  # xline 抽样步长。
 
-    # ── 采样参数 ──────────────────────────────────────────────
-    dt: float = 0.001  # 体数据采样间隔（秒）。
+    # ── 目的层 ────────────────────────────────────────────────
+    target_layer_min_thickness: float | None = None  # 相邻层位最小厚度；为空时使用 sample_step。
+    target_layer_nearest_distance_limit: float | None = None  # nearest 兜底最大距离；为空时不限制。
+    target_layer_outlier_threshold: float | None = 0.02  # 孤立层位点剔除阈值；为空时禁用。
+    target_layer_outlier_min_neighbor_count: int = 2  # 孤立点判断所需最小十字邻域有效点数。
+
+    # ── 低频模型 ──────────────────────────────────────────────
+    lfm_source: LfmSource = "filtered_inversion_lfm"  # 低频模型来源：预计算结果或对阻抗体低通。
+    lfm_precomputed_file: Path | None = Path("your_precomputed_lfm")  # precomputed_lfm
+    lfm_initial_inversion_file: Path | None = Path("your_filtered_inversion_lfm")  # filtered_inversion_lfm
+    lfm_filter_dt: float = 0.001  # 从初始反演体低通生成 LFM 时的采样间隔（秒）。
+    lfm_cutoff_hz: float = 10.0  # 生成 LFM 时的 Butterworth 低通截止频率（Hz）。
+    lfm_filter_order: int = 6  # 生成 LFM 时的零相位滤波器阶数。
 
     # ── 子波 ──────────────────────────────────────────────────
     wavelet_type: str = "ricker"  # 正演使用的子波类型。
@@ -51,15 +62,8 @@ class GINNConfig:
     wavelet_gain: float | None = None  # 子波增益；为空时根据样本道自动估计。
     wavelet_gain_num_traces: int = 256  # 自动估计子波增益时采样的有效道数。
 
-    # ── 低频模型 ──────────────────────────────────────────────
-    lfm_source: LfmSource = "filtered_inversion_lfm"  # 低频模型来源：预计算结果或对阻抗体低通。
-    precomputed_lfm_file: Path | None = Path("your_precomputed_lfm_file")  # wtie_time_lfm
-    lfm_reference_impedance_file: Path | None = Path("your_lfm_reference_impedance_file")  # filtered_inversion_lfm
-    lfm_cutoff_hz: float = 10.0  # 生成 LFM 时的 Butterworth 低通截止频率（Hz）。
-    lfm_filter_order: int = 6  # 生成 LFM 时的零相位滤波器阶数。
-
     # ── 网络结构 ──────────────────────────────────────────────
-    in_channels: int = 2  # 网络输入通道数，默认是地震 + LFM。
+    in_channels: int = 3  # 网络输入通道数：地震 + LFM + 目的层 mask。
     hidden_channels: int = 64  # 残差块内部的隐藏通道数。
     out_channels: int = 1  # 网络输出通道数，对应高频扰动。
     num_res_blocks: int = 8  # 残差块数量。
@@ -112,14 +116,18 @@ class GINNConfig:
         # 确保 dilations 长度与 num_res_blocks 一致
         if len(self.dilations) != self.num_res_blocks:
             raise ValueError(f"len(dilations)={len(self.dilations)} != num_res_blocks={self.num_res_blocks}")
+        if self.in_channels != 3:
+            raise ValueError(
+                "GINN now expects in_channels=3 because the target-layer mask is part of the network input."
+            )
 
-        valid_lfm_sources = {"wtie_time_lfm", "filtered_inversion_lfm"}
+        valid_lfm_sources = {"precomputed_lfm", "filtered_inversion_lfm"}
         if self.lfm_source not in valid_lfm_sources:
             raise ValueError(f"Unsupported lfm_source={self.lfm_source!r}, expected one of {sorted(valid_lfm_sources)}")
-        if self.lfm_source == "wtie_time_lfm" and self.precomputed_lfm_file is None:
-            raise ValueError("precomputed_lfm_file is required when lfm_source='wtie_time_lfm'.")
-        if self.lfm_source == "filtered_inversion_lfm" and self.lfm_reference_impedance_file is None:
-            raise ValueError("lfm_reference_impedance_file is required when lfm_source='filtered_inversion_lfm'.")
+        if self.lfm_source == "precomputed_lfm" and self.lfm_precomputed_file is None:
+            raise ValueError("lfm_precomputed_file is required when lfm_source='precomputed_lfm'.")
+        if self.lfm_source == "filtered_inversion_lfm" and self.lfm_initial_inversion_file is None:
+            raise ValueError("lfm_initial_inversion_file is required when lfm_source='filtered_inversion_lfm'.")
         valid_validation_modes = {"none", "spatial_block"}
         if self.validation_split_mode not in valid_validation_modes:
             raise ValueError(
@@ -137,8 +145,29 @@ class GINNConfig:
             raise ValueError(f"wavelet_gain must be positive when provided, got {self.wavelet_gain}.")
         if self.wavelet_gain_num_traces <= 0:
             raise ValueError(f"wavelet_gain_num_traces must be positive, got {self.wavelet_gain_num_traces}.")
+        if self.lfm_filter_dt <= 0.0:
+            raise ValueError(f"lfm_filter_dt must be positive, got {self.lfm_filter_dt}.")
         if self.lambda_tv < 0.0:
             raise ValueError(f"lambda_tv must be non-negative, got {self.lambda_tv}.")
+        if self.target_layer_min_thickness is not None and self.target_layer_min_thickness <= 0.0:
+            raise ValueError(
+                f"target_layer_min_thickness must be positive when provided, got {self.target_layer_min_thickness}."
+            )
+        if self.target_layer_nearest_distance_limit is not None and self.target_layer_nearest_distance_limit <= 0.0:
+            raise ValueError(
+                "target_layer_nearest_distance_limit must be positive when provided, "
+                f"got {self.target_layer_nearest_distance_limit}."
+            )
+        if self.target_layer_outlier_threshold is not None and self.target_layer_outlier_threshold <= 0.0:
+            raise ValueError(
+                "target_layer_outlier_threshold must be positive when provided, "
+                f"got {self.target_layer_outlier_threshold}."
+            )
+        if self.target_layer_outlier_min_neighbor_count < 1:
+            raise ValueError(
+                "target_layer_outlier_min_neighbor_count must be >= 1, "
+                f"got {self.target_layer_outlier_min_neighbor_count}."
+            )
         if self.ai_min <= 0.0:
             raise ValueError(f"ai_min must be positive, got {self.ai_min}.")
         if self.ai_max <= self.ai_min:
@@ -159,7 +188,7 @@ class GINNConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "GINNConfig":
         normalized = dict(data)
-        optional_path_fields = {"precomputed_lfm_file", "lfm_reference_impedance_file"}
+        optional_path_fields = {"lfm_precomputed_file", "lfm_initial_inversion_file"}
 
         for field_name in _PATH_FIELDS:
             if field_name not in normalized:

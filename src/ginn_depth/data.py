@@ -25,6 +25,7 @@ from ginn_depth.physics import DepthForwardModel
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class DatasetBundle:
     """Depth-domain train/validation/inference datasets and physics inputs."""
@@ -37,7 +38,6 @@ class DatasetBundle:
     depth_axis_m: np.ndarray
     geometry: Dict[str, Any]
     split_metadata: Dict[str, Any]
-
 
 
 @dataclass(frozen=True)
@@ -129,8 +129,6 @@ def load_lfm_depth_npz(path: str | Path, *, volume_key: str = "volume") -> Depth
         metadata=metadata,
         variance_volume=variance_volume,
     )
-
-
 
 
 def _axis_step(axis: np.ndarray, axis_name: str) -> float:

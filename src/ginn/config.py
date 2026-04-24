@@ -82,8 +82,8 @@ class GINNConfig:
     # ── 损失与物理约束 ────────────────────────────────────────
     lambda_l2: float = 0.03  # 高频扰动 L2 正则化权重，约束阻抗尺度不要漂移。
     lambda_tv: float = 0.0  # 高频扰动 TV 正则化权重，抑制高频 ringing。
-    ai_min: float = 5000.0  # 目标层内允许的波阻抗下界。
-    ai_max: float = 20000.0  # 目标层内允许的波阻抗上界。
+    ai_min: float = 3000.0  # 目标层内允许的波阻抗下界。
+    ai_max: float = 30000.0  # 目标层内允许的波阻抗上界。
     zero_residual_outside_mask: bool = True  # 是否将层外高频扰动通过 taper 平滑压回 0。
     boundary_effect_samples: int = 30  # 同时用于 waveform loss 内缩和高频扰动 halo 宽度。
 

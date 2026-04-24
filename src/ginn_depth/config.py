@@ -66,7 +66,7 @@ class DepthGINNConfig:
     kernel_size: int = 3
 
     # ── 优化与训练循环 ────────────────────────────────────────
-    batch_size: int = 8
+    batch_size: int = 16
     epochs: int = 50
     lr: float = 1e-3
     weight_decay: float = 1e-4
@@ -178,7 +178,11 @@ class DepthGINNConfig:
         for field_name in _PATH_FIELDS:
             if field_name not in normalized or normalized[field_name] is None:
                 continue
-            if field_name in optional_path_fields and isinstance(normalized[field_name], str) and not normalized[field_name].strip():
+            if (
+                field_name in optional_path_fields
+                and isinstance(normalized[field_name], str)
+                and not normalized[field_name].strip()
+            ):
                 normalized[field_name] = None
                 continue
             path = Path(normalized[field_name])

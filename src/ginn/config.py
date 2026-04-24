@@ -9,6 +9,7 @@ from typing import Any, Dict, Literal, Tuple
 import yaml
 
 LfmSource = Literal["precomputed_lfm", "filtered_inversion_lfm"]
+WaveletSource = Literal["precomputed_wavelet", "ricker_wavelet"]
 ValidationSplitMode = Literal["none", "spatial_block"]
 ValidationBlockAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"]
 
@@ -18,6 +19,7 @@ _PATH_FIELDS = {
     "bot_horizon_file",
     "lfm_precomputed_file",
     "lfm_initial_inversion_file",
+    "wavelet_file",
     "checkpoint_dir",
 }
 
@@ -29,18 +31,16 @@ class GINNConfig:
     所有路径在实际使用前由入口脚本填充；此处默认值仅供参考。
     """
 
-    # ── 数据路径 ──────────────────────────────────────────────
+    # ── 地震信息 ──────────────────────────────────────────────
     seismic_file: Path = Path("your_seismic_file.sgy")  # 输入地震体路径。
-    top_horizon_file: Path = Path("your_top_horizon_file")  # 目标层顶界解释面路径。
-    bot_horizon_file: Path = Path("your_bot_horizon_file")  # 目标层底界解释面路径。
-
-    # ── 地震几何（SEG-Y 头字节位置与步长，与 notebook 一致） ──
     segy_iline: int = 189  # inline 头字节位置。
     segy_xline: int = 193  # xline 头字节位置。
     segy_istep: int = 1  # inline 抽样步长。
     segy_xstep: int = 1  # xline 抽样步长。
 
     # ── 目的层 ────────────────────────────────────────────────
+    top_horizon_file: Path = Path("your_top_horizon_file")  # 目标层顶界解释面路径。
+    bot_horizon_file: Path = Path("your_bot_horizon_file")  # 目标层底界解释面路径。
     target_layer_min_thickness: float | None = None  # 相邻层位最小厚度；为空时使用 sample_step。
     target_layer_nearest_distance_limit: float | None = None  # nearest 兜底最大距离；为空时不限制。
     target_layer_outlier_threshold: float | None = 0.02  # 孤立层位点剔除阈值；为空时禁用。
@@ -55,6 +55,8 @@ class GINNConfig:
     lfm_filter_order: int = 6  # 生成 LFM 时的零相位滤波器阶数。
 
     # ── 子波 ──────────────────────────────────────────────────
+    wavelet_source: WaveletSource = "ricker_wavelet"  # 子波来源：文件子波或 Ricker 理论子波。
+    wavelet_file: Path | None = None  # precomputed_wavelet：包含 time_s/amplitude 列的 CSV。
     wavelet_type: str = "ricker"  # 正演使用的子波类型。
     wavelet_freq: float = 25.0  # 子波主频（Hz）。
     wavelet_dt: float = 0.001  # 子波采样间隔（秒）。
@@ -128,6 +130,13 @@ class GINNConfig:
             raise ValueError("lfm_precomputed_file is required when lfm_source='precomputed_lfm'.")
         if self.lfm_source == "filtered_inversion_lfm" and self.lfm_initial_inversion_file is None:
             raise ValueError("lfm_initial_inversion_file is required when lfm_source='filtered_inversion_lfm'.")
+        valid_wavelet_sources = {"precomputed_wavelet", "ricker_wavelet"}
+        if self.wavelet_source not in valid_wavelet_sources:
+            raise ValueError(
+                f"Unsupported wavelet_source={self.wavelet_source!r}, expected one of {sorted(valid_wavelet_sources)}"
+            )
+        if self.wavelet_source == "precomputed_wavelet" and self.wavelet_file is None:
+            raise ValueError("wavelet_file is required when wavelet_source='precomputed_wavelet'.")
         valid_validation_modes = {"none", "spatial_block"}
         if self.validation_split_mode not in valid_validation_modes:
             raise ValueError(
@@ -145,6 +154,12 @@ class GINNConfig:
             raise ValueError(f"wavelet_gain must be positive when provided, got {self.wavelet_gain}.")
         if self.wavelet_gain_num_traces <= 0:
             raise ValueError(f"wavelet_gain_num_traces must be positive, got {self.wavelet_gain_num_traces}.")
+        if self.wavelet_freq <= 0.0:
+            raise ValueError(f"wavelet_freq must be positive, got {self.wavelet_freq}.")
+        if self.wavelet_dt <= 0.0:
+            raise ValueError(f"wavelet_dt must be positive, got {self.wavelet_dt}.")
+        if self.wavelet_length < 2:
+            raise ValueError(f"wavelet_length must be at least 2, got {self.wavelet_length}.")
         if self.lfm_filter_dt <= 0.0:
             raise ValueError(f"lfm_filter_dt must be positive, got {self.lfm_filter_dt}.")
         if self.lambda_tv < 0.0:
@@ -188,7 +203,7 @@ class GINNConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "GINNConfig":
         normalized = dict(data)
-        optional_path_fields = {"lfm_precomputed_file", "lfm_initial_inversion_file"}
+        optional_path_fields = {"lfm_precomputed_file", "lfm_initial_inversion_file", "wavelet_file"}
 
         for field_name in _PATH_FIELDS:
             if field_name not in normalized:

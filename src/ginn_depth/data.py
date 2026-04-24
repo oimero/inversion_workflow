@@ -10,12 +10,12 @@ from pathlib import Path
 from typing import Any, Dict
 
 import numpy as np
-import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
 from cup.petrel.load import import_interpretation_petrel, import_seismic
 from cup.seismic.target_layer import TargetLayer
+from cup.well.wavelet import load_wavelet_csv, make_wavelet
 from ginn_depth.config import DepthGINNConfig
 from ginn_depth.physics import DepthForwardModel
 
@@ -74,31 +74,6 @@ def _json_scalar_to_dict(value: object) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         return {}
     return parsed
-
-
-def load_wavelet_csv(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load a time-domain wavelet CSV with columns ``time_s`` and ``amplitude``."""
-    path = Path(path)
-    df = pd.read_csv(path)
-    required = {"time_s", "amplitude"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"wavelet CSV is missing columns: {sorted(missing)}")
-
-    time_s = df["time_s"].to_numpy(dtype=np.float64)
-    amplitude = df["amplitude"].to_numpy(dtype=np.float64)
-    finite = np.isfinite(time_s) & np.isfinite(amplitude)
-    if np.count_nonzero(finite) < 2:
-        raise ValueError(f"wavelet CSV does not contain enough finite samples: {path}")
-
-    time_s = time_s[finite]
-    amplitude = amplitude[finite]
-    order = np.argsort(time_s)
-    time_s = time_s[order]
-    amplitude = amplitude[order]
-    if np.any(np.diff(time_s) <= 0.0):
-        raise ValueError("wavelet time_s samples must be strictly increasing after sorting.")
-    return time_s, amplitude
 
 
 def load_lfm_depth_npz(path: str | Path, *, volume_key: str = "volume") -> DepthLfmVolume:
@@ -618,8 +593,20 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         val_dataset = DepthSeismicTraceDataset(*train_shared, val_indices, normalization_stats=train_norm_stats)
     inference_dataset = DepthSeismicTraceDataset(*inference_shared, inference_valid_indices, normalization_stats=train_norm_stats)
 
-    logger.info("Loading depth-domain wavelet CSV...")
-    wavelet_time_s, wavelet_amp = load_wavelet_csv(cfg.wavelet_file)
+    logger.info("Resolving depth-domain wavelet from source=%s...", cfg.wavelet_source)
+    if cfg.wavelet_source == "precomputed_wavelet":
+        wavelet_time_s, wavelet_amp = load_wavelet_csv(cfg.wavelet_file)  # type: ignore[arg-type]
+    elif cfg.wavelet_source == "ricker_wavelet":
+        wavelet_time_s, wavelet_amp = make_wavelet(
+            wavelet_type=cfg.wavelet_type,
+            freq=cfg.wavelet_freq,
+            dt=cfg.wavelet_dt,
+            length=cfg.wavelet_length,
+            gain=1.0,
+        )
+    else:
+        raise ValueError(f"Unsupported wavelet_source: {cfg.wavelet_source}")
+
     resolved_wavelet_gain = cfg.wavelet_gain
     if resolved_wavelet_gain is None:
         resolved_wavelet_gain = estimate_wavelet_gain_depth(

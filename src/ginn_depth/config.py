@@ -8,6 +8,7 @@ from typing import Any, Dict, Literal, Tuple
 
 import yaml
 
+WaveletSource = Literal["precomputed_wavelet", "ricker_wavelet"]
 ValidationSplitMode = Literal["none", "spatial_block"]
 ValidationBlockAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"]
 
@@ -26,27 +27,37 @@ _PATH_FIELDS = {
 class DepthGINNConfig:
     """Depth-domain GINN training configuration."""
 
+    # ── 地震信息 ──────────────────────────────────────────────
     seismic_file: Path = Path("your_depth_seismic.segy")
-    top_horizon_file: Path = Path("your_top_horizon")
-    bot_horizon_file: Path = Path("your_bottom_horizon")
-    ai_lfm_file: Path = Path("your_ai_lfm_depth.npz")
-    vp_lfm_file: Path = Path("your_vp_lfm_depth.npz")
-    wavelet_file: Path = Path("your_wavelet.csv")
-
     segy_iline: int = 189
     segy_xline: int = 193
     segy_istep: int = 1
     segy_xstep: int = 1
 
+    # ── 目的层 ────────────────────────────────────────────────
+    top_horizon_file: Path = Path("your_top_horizon")
+    bot_horizon_file: Path = Path("your_bottom_horizon")
     target_layer_min_thickness: float | None = None
     target_layer_nearest_distance_limit: float | None = None
     target_layer_outlier_threshold: float | None = None
     target_layer_outlier_min_neighbor_count: int = 2
 
+    # ── 低频模型 ──────────────────────────────────────────────
+    ai_lfm_file: Path = Path("your_ai_lfm_depth.npz")
+
+    # ── 深度域子波 ────────────────────────────────────────────
+    vp_lfm_file: Path = Path("your_vp_lfm_depth.npz")
+    wavelet_source: WaveletSource = "precomputed_wavelet"
+    wavelet_file: Path | None = Path("your_wavelet.csv")
     wavelet_gain: float | None = None
     wavelet_gain_num_traces: int = 256
+    wavelet_type: str = "ricker"
+    wavelet_freq: float = 25.0
+    wavelet_dt: float = 0.001
+    wavelet_length: int = 301
     wavelet_amplitude_threshold: float = 1e-7
 
+    # ── 网络结构 ──────────────────────────────────────────────
     in_channels: int = 3
     hidden_channels: int = 64
     out_channels: int = 1
@@ -54,12 +65,14 @@ class DepthGINNConfig:
     dilations: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
     kernel_size: int = 3
 
+    # ── 优化与训练循环 ────────────────────────────────────────
     batch_size: int = 8
     epochs: int = 50
     lr: float = 1e-3
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
 
+    # ── 损失与物理约束 ────────────────────────────────────────
     lambda_l2: float = 0.03
     lambda_tv: float = 0.0
     ai_min: float = 3000.0
@@ -67,6 +80,7 @@ class DepthGINNConfig:
     zero_residual_outside_mask: bool = True
     boundary_effect_samples: int = 30
 
+    # ── 验证与早停 ────────────────────────────────────────────
     validation_split_mode: ValidationSplitMode = "spatial_block"
     validation_fraction: float = 0.10
     validation_gap_traces: int = 8
@@ -75,6 +89,7 @@ class DepthGINNConfig:
     early_stopping_min_delta: float = 1e-4
     early_stopping_warmup: int = 5
 
+    # ── 运行时与输出 ──────────────────────────────────────────
     device: str = "cuda"
     num_workers: int = 0
     pin_memory: bool = True
@@ -85,6 +100,8 @@ class DepthGINNConfig:
     def __post_init__(self) -> None:
         for field_name in _PATH_FIELDS:
             value = getattr(self, field_name)
+            if value is None:
+                continue
             if not isinstance(value, Path):
                 setattr(self, field_name, Path(value))
 
@@ -95,10 +112,23 @@ class DepthGINNConfig:
             raise ValueError(f"len(dilations)={len(self.dilations)} != num_res_blocks={self.num_res_blocks}")
         if self.in_channels != 3:
             raise ValueError("Depth GINN expects in_channels=3: seismic + AI LFM + target-layer mask.")
+        valid_wavelet_sources = {"precomputed_wavelet", "ricker_wavelet"}
+        if self.wavelet_source not in valid_wavelet_sources:
+            raise ValueError(
+                f"Unsupported wavelet_source={self.wavelet_source!r}, expected one of {sorted(valid_wavelet_sources)}"
+            )
+        if self.wavelet_source == "precomputed_wavelet" and self.wavelet_file is None:
+            raise ValueError("wavelet_file is required when wavelet_source='precomputed_wavelet'.")
         if self.wavelet_gain is not None and self.wavelet_gain <= 0.0:
             raise ValueError(f"wavelet_gain must be positive when provided, got {self.wavelet_gain}.")
         if self.wavelet_gain_num_traces <= 0:
             raise ValueError(f"wavelet_gain_num_traces must be positive, got {self.wavelet_gain_num_traces}.")
+        if self.wavelet_freq <= 0.0:
+            raise ValueError(f"wavelet_freq must be positive, got {self.wavelet_freq}.")
+        if self.wavelet_dt <= 0.0:
+            raise ValueError(f"wavelet_dt must be positive, got {self.wavelet_dt}.")
+        if self.wavelet_length < 2:
+            raise ValueError(f"wavelet_length must be at least 2, got {self.wavelet_length}.")
         if self.wavelet_amplitude_threshold < 0.0:
             raise ValueError(
                 f"wavelet_amplitude_threshold must be non-negative, got {self.wavelet_amplitude_threshold}."
@@ -144,8 +174,12 @@ class DepthGINNConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "DepthGINNConfig":
         normalized = dict(data)
+        optional_path_fields = {"wavelet_file"}
         for field_name in _PATH_FIELDS:
             if field_name not in normalized or normalized[field_name] is None:
+                continue
+            if field_name in optional_path_fields and isinstance(normalized[field_name], str) and not normalized[field_name].strip():
+                normalized[field_name] = None
                 continue
             path = Path(normalized[field_name])
             if base_dir is not None and not path.is_absolute():

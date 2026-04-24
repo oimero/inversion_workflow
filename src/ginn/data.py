@@ -25,6 +25,11 @@ from torch.utils.data import Dataset
 from cup.petrel.load import import_interpretation_petrel, import_seismic
 from cup.seismic.survey import open_survey
 from cup.seismic.target_layer import TargetLayer
+from cup.well.wavelet import (
+    load_wavelet_csv,
+    make_wavelet as make_wavelet_with_time,
+    validate_wavelet_dt,
+)
 from ginn.config import GINNConfig
 
 logger = logging.getLogger(__name__)
@@ -158,13 +163,7 @@ def make_wavelet(
     np.ndarray
         子波振幅，shape ``(length,)``。
     """
-    if wavelet_type == "ricker":
-        from wtie.modeling.wavelet import ricker
-
-        _, y = ricker(freq, dt, length)
-    else:
-        raise ValueError(f"Unsupported wavelet_type: {wavelet_type}")
-    y = y * float(gain)
+    _, y = make_wavelet_with_time(wavelet_type, freq, dt, length, gain=gain)
 
     logger.info(
         "Generated %s wavelet: freq=%.1f Hz, dt=%.4f s, length=%d, gain=%.2f", wavelet_type, freq, dt, length, gain
@@ -740,34 +739,35 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         normalization_stats=train_norm_stats,
     )
 
-    logger.info("Generating wavelet...")
+    logger.info("Resolving wavelet from source=%s...", cfg.wavelet_source)
     resolved_wavelet_gain = cfg.wavelet_gain
-    if resolved_wavelet_gain is None:
-        unit_wavelet = make_wavelet(
+    if cfg.wavelet_source == "precomputed_wavelet":
+        wavelet_time_s, base_wavelet = load_wavelet_csv(cfg.wavelet_file)  # type: ignore[arg-type]
+        validate_wavelet_dt(wavelet_time_s, float(geometry["sample_step"]))
+    elif cfg.wavelet_source == "ricker_wavelet":
+        _, base_wavelet = make_wavelet_with_time(
             wavelet_type=cfg.wavelet_type,
             freq=cfg.wavelet_freq,
             dt=cfg.wavelet_dt,
             length=cfg.wavelet_length,
             gain=1.0,
         )
+    else:
+        raise ValueError(f"Unsupported wavelet_source: {cfg.wavelet_source}")
+
+    if resolved_wavelet_gain is None:
         resolved_wavelet_gain = estimate_wavelet_gain(
             seismic,
             lfm,
             train_mask,
-            unit_wavelet,
+            base_wavelet.astype(np.float32),
             seis_rms=train_dataset.seis_rms,
             max_traces=cfg.wavelet_gain_num_traces,
             candidate_trace_indices=train_dataset.valid_indices,
         )
         cfg.wavelet_gain = resolved_wavelet_gain
 
-    wavelet = make_wavelet(
-        wavelet_type=cfg.wavelet_type,
-        freq=cfg.wavelet_freq,
-        dt=cfg.wavelet_dt,
-        length=cfg.wavelet_length,
-        gain=float(resolved_wavelet_gain),
-    )
+    wavelet = (base_wavelet * float(resolved_wavelet_gain)).astype(np.float32)
     return DatasetBundle(
         train_dataset=train_dataset,
         inference_dataset=inference_dataset,

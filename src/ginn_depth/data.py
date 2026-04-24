@@ -25,6 +25,9 @@ from ginn_depth.physics import DepthForwardModel
 
 logger = logging.getLogger(__name__)
 
+BOUNDARY_EFFECT_WAVELET_THRESHOLD = 0.05
+BOUNDARY_EFFECT_VELOCITY_PERCENTILE = 25.0
+
 
 @dataclass
 class DatasetBundle:
@@ -38,6 +41,84 @@ class DatasetBundle:
     depth_axis_m: np.ndarray
     geometry: Dict[str, Any]
     split_metadata: Dict[str, Any]
+
+
+def resolve_wavelet_from_config(cfg: DepthGINNConfig) -> tuple[np.ndarray, np.ndarray]:
+    """Load or generate the unit-gain wavelet configured for depth-domain GINN."""
+    logger.info("Resolving depth-domain wavelet from source=%s...", cfg.wavelet_source)
+    if cfg.wavelet_source == "precomputed_wavelet":
+        wavelet_time_s, wavelet_amp = load_wavelet_csv(cfg.wavelet_file)  # type: ignore[arg-type]
+    elif cfg.wavelet_source == "ricker_wavelet":
+        wavelet_time_s, wavelet_amp = make_wavelet(
+            wavelet_type=cfg.wavelet_type,
+            freq=cfg.wavelet_freq,
+            dt=cfg.wavelet_dt,
+            length=cfg.wavelet_length,
+            gain=1.0,
+        )
+    else:
+        raise ValueError(f"Unsupported wavelet_source: {cfg.wavelet_source}")
+
+    return np.asarray(wavelet_time_s, dtype=np.float64), np.asarray(wavelet_amp, dtype=np.float32)
+
+
+def _compute_wavelet_active_half_support_s(
+    wavelet_time_s: np.ndarray,
+    wavelet_amp: np.ndarray,
+    *,
+    active_threshold: float = BOUNDARY_EFFECT_WAVELET_THRESHOLD,
+) -> float:
+    if not 0.0 < active_threshold <= 1.0:
+        raise ValueError(f"active_threshold must be within (0, 1], got {active_threshold}.")
+
+    wavelet_time_s = np.asarray(wavelet_time_s, dtype=np.float64).ravel()
+    wavelet_amp = np.asarray(wavelet_amp, dtype=np.float32).ravel()
+    if wavelet_time_s.shape != wavelet_amp.shape:
+        raise ValueError(
+            f"wavelet_time_s shape {wavelet_time_s.shape} does not match wavelet_amp shape {wavelet_amp.shape}."
+        )
+    if wavelet_amp.size == 0:
+        raise ValueError("Cannot compute boundary_effect_samples from an empty wavelet.")
+
+    abs_wavelet = np.abs(wavelet_amp)
+    peak = float(abs_wavelet.max())
+    if peak <= 0.0:
+        raise ValueError("Cannot compute boundary_effect_samples because wavelet peak amplitude is zero.")
+
+    peak_index = int(abs_wavelet.argmax())
+    active = abs_wavelet >= peak * active_threshold
+    return float(np.abs(wavelet_time_s[active] - wavelet_time_s[peak_index]).max())
+
+
+def compute_boundary_effect_samples_from_depth_wavelet(
+    wavelet_time_s: np.ndarray,
+    wavelet_amp: np.ndarray,
+    vp_lfm: np.ndarray,
+    train_mask: np.ndarray,
+    depth_axis_m: np.ndarray,
+    *,
+    active_threshold: float = BOUNDARY_EFFECT_WAVELET_THRESHOLD,
+    velocity_percentile: float = BOUNDARY_EFFECT_VELOCITY_PERCENTILE,
+) -> int:
+    """Estimate boundary-effect width from wavelet support and target-layer P25 velocity."""
+    if not 0.0 <= velocity_percentile <= 100.0:
+        raise ValueError(f"velocity_percentile must be within [0, 100], got {velocity_percentile}.")
+    if vp_lfm.shape != train_mask.shape:
+        raise ValueError(f"vp_lfm shape {vp_lfm.shape} does not match train_mask shape {train_mask.shape}.")
+
+    half_support_s = _compute_wavelet_active_half_support_s(
+        wavelet_time_s,
+        wavelet_amp,
+        active_threshold=active_threshold,
+    )
+    dz_m = _axis_step(np.asarray(depth_axis_m, dtype=np.float64), "depth_axis_m")
+    masked_velocity = np.asarray(vp_lfm, dtype=np.float64)[np.asarray(train_mask, dtype=bool)]
+    valid_velocity = masked_velocity[np.isfinite(masked_velocity) & (masked_velocity > 0.0)]
+    if valid_velocity.size == 0:
+        raise ValueError("Cannot auto-compute boundary_effect_samples because train_mask contains no valid Vp values.")
+
+    velocity_mps = float(np.percentile(valid_velocity, velocity_percentile))
+    return int(math.ceil(half_support_s * velocity_mps / (2.0 * dz_m)))
 
 
 @dataclass(frozen=True)
@@ -393,23 +474,45 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
     if inference_mask.shape != seismic.shape:
         raise ValueError(f"Inference mask shape {inference_mask.shape} does not match seismic shape {seismic.shape}.")
 
+    wavelet_time_s, wavelet_amp = resolve_wavelet_from_config(cfg)
+    boundary_effect_samples = cfg.boundary_effect_samples
+    if boundary_effect_samples is None:
+        boundary_effect_samples = compute_boundary_effect_samples_from_depth_wavelet(
+            wavelet_time_s,
+            wavelet_amp,
+            vp_lfm.volume,
+            train_mask,
+            ai_lfm.samples,
+        )
+        cfg.boundary_effect_samples = boundary_effect_samples
+        logger.info(
+            "Auto depth boundary_effect_samples=%d from wavelet active half-support "
+            "(threshold=%.2f) and train-mask Vp P%.0f",
+            boundary_effect_samples,
+            BOUNDARY_EFFECT_WAVELET_THRESHOLD,
+            BOUNDARY_EFFECT_VELOCITY_PERCENTILE,
+        )
+    else:
+        boundary_effect_samples = int(boundary_effect_samples)
+        cfg.boundary_effect_samples = boundary_effect_samples
+
     n_il, n_xl, n_sample = seismic.shape
     seismic_flat = seismic.reshape(n_il * n_xl, n_sample)
     ai_lfm_flat = ai_lfm.volume.reshape(n_il * n_xl, n_sample)
     vp_flat = vp_lfm.volume.reshape(n_il * n_xl, n_sample)
     train_mask_flat = train_mask.reshape(n_il * n_xl, n_sample)
     inference_mask_flat = inference_mask.reshape(n_il * n_xl, n_sample)
-    train_loss_mask_flat = _build_eroded_loss_mask(train_mask_flat, erosion_samples=cfg.boundary_effect_samples)
-    inference_loss_mask_flat = _build_eroded_loss_mask(inference_mask_flat, erosion_samples=cfg.boundary_effect_samples)
-    train_taper_flat = _build_residual_taper(train_mask_flat, halo_samples=cfg.boundary_effect_samples)
-    inference_taper_flat = _build_residual_taper(inference_mask_flat, halo_samples=cfg.boundary_effect_samples)
+    train_loss_mask_flat = _build_eroded_loss_mask(train_mask_flat, erosion_samples=boundary_effect_samples)
+    inference_loss_mask_flat = _build_eroded_loss_mask(inference_mask_flat, erosion_samples=boundary_effect_samples)
+    train_taper_flat = _build_residual_taper(train_mask_flat, halo_samples=boundary_effect_samples)
+    inference_taper_flat = _build_residual_taper(inference_mask_flat, halo_samples=boundary_effect_samples)
     train_valid_indices = _get_valid_trace_indices(train_mask_flat)
     inference_valid_indices = _get_valid_trace_indices(inference_mask_flat)
     logger.info(
         "Preprocessed depth masks: train=%d traces, inference=%d traces, boundary_effect_samples=%d",
         train_valid_indices.size,
         inference_valid_indices.size,
-        cfg.boundary_effect_samples,
+        boundary_effect_samples,
     )
 
     train_indices = train_valid_indices
@@ -452,20 +555,6 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
     inference_dataset = DepthSeismicTraceDataset(
         *inference_shared, inference_valid_indices, normalization_stats=train_norm_stats
     )
-
-    logger.info("Resolving depth-domain wavelet from source=%s...", cfg.wavelet_source)
-    if cfg.wavelet_source == "precomputed_wavelet":
-        wavelet_time_s, wavelet_amp = load_wavelet_csv(cfg.wavelet_file)  # type: ignore[arg-type]
-    elif cfg.wavelet_source == "ricker_wavelet":
-        wavelet_time_s, wavelet_amp = make_wavelet(
-            wavelet_type=cfg.wavelet_type,
-            freq=cfg.wavelet_freq,
-            dt=cfg.wavelet_dt,
-            length=cfg.wavelet_length,
-            gain=1.0,
-        )
-    else:
-        raise ValueError(f"Unsupported wavelet_source: {cfg.wavelet_source}")
 
     resolved_wavelet_gain = cfg.wavelet_gain
     if resolved_wavelet_gain is None:

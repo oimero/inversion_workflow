@@ -3,7 +3,7 @@
 工作流：
 1. 读取 SEG-Y 地震体
 2. 读取预计算低频模型，或从参考阻抗体生成低频模型
-3. 生成理论子波（Ricker）
+3. 解析子波并按需自动估计边界影响宽度
 4. 从层位文件生成 3D 布尔掩码
 5. 封装为 PyTorch Dataset
 """
@@ -38,6 +38,8 @@ from ginn.masking import select_spatial_validation_split as _select_spatial_vali
 
 logger = logging.getLogger(__name__)
 
+BOUNDARY_EFFECT_WAVELET_THRESHOLD = 0.05
+
 
 @dataclass
 class DatasetBundle:
@@ -49,6 +51,64 @@ class DatasetBundle:
     wavelet: np.ndarray
     geometry: Dict[str, Any]
     split_metadata: Dict[str, Any]
+
+
+def resolve_wavelet_from_config(cfg: GINNConfig, geometry: Dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """Load or generate the unit-gain wavelet configured for time-domain GINN."""
+    logger.info("Resolving wavelet from source=%s...", cfg.wavelet_source)
+    if cfg.wavelet_source == "precomputed_wavelet":
+        wavelet_time_s, base_wavelet = load_wavelet_csv(cfg.wavelet_file)  # type: ignore[arg-type]
+        validate_wavelet_dt(wavelet_time_s, float(geometry["sample_step"]))
+    elif cfg.wavelet_source == "ricker_wavelet":
+        wavelet_time_s, base_wavelet = make_wavelet(
+            wavelet_type=cfg.wavelet_type,
+            freq=cfg.wavelet_freq,
+            dt=cfg.wavelet_dt,
+            length=cfg.wavelet_length,
+            gain=1.0,
+        )
+    else:
+        raise ValueError(f"Unsupported wavelet_source: {cfg.wavelet_source}")
+
+    return np.asarray(wavelet_time_s, dtype=np.float64), np.asarray(base_wavelet, dtype=np.float32)
+
+
+def compute_boundary_effect_samples_from_wavelet(
+    wavelet_time_s: np.ndarray,
+    wavelet: np.ndarray,
+    seismic_sample_step_s: float,
+    *,
+    active_threshold: float = BOUNDARY_EFFECT_WAVELET_THRESHOLD,
+) -> int:
+    """Estimate boundary-effect width from the wavelet active half-support.
+
+    The active support is where ``abs(wavelet)`` is at least ``active_threshold``
+    times the wavelet peak amplitude. The returned value is the largest active
+    time offset from the peak, converted to seismic sample count with ``ceil``.
+    """
+    if seismic_sample_step_s <= 0.0:
+        raise ValueError(f"seismic_sample_step_s must be positive, got {seismic_sample_step_s}.")
+    if not 0.0 < active_threshold <= 1.0:
+        raise ValueError(f"active_threshold must be within (0, 1], got {active_threshold}.")
+
+    wavelet_time_s = np.asarray(wavelet_time_s, dtype=np.float64).ravel()
+    wavelet = np.asarray(wavelet, dtype=np.float32).ravel()
+    if wavelet_time_s.shape != wavelet.shape:
+        raise ValueError(
+            f"wavelet_time_s shape {wavelet_time_s.shape} does not match wavelet shape {wavelet.shape}."
+        )
+    if wavelet.size == 0:
+        raise ValueError("Cannot compute boundary_effect_samples from an empty wavelet.")
+
+    abs_wavelet = np.abs(wavelet)
+    peak = float(abs_wavelet.max())
+    if peak <= 0.0:
+        raise ValueError("Cannot compute boundary_effect_samples because wavelet peak amplitude is zero.")
+
+    peak_index = int(abs_wavelet.argmax())
+    active = abs_wavelet >= peak * active_threshold
+    half_support_s = float(np.abs(wavelet_time_s[active] - wavelet_time_s[peak_index]).max())
+    return int(math.ceil(half_support_s / float(seismic_sample_step_s)))
 
 
 def make_lowfreq_model(
@@ -430,25 +490,44 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     if lfm.shape != seismic.shape:
         raise ValueError(f"LFM shape {lfm.shape} does not match seismic shape {seismic.shape}.")
 
+    wavelet_time_s, base_wavelet = resolve_wavelet_from_config(cfg, geometry)
+    boundary_effect_samples = cfg.boundary_effect_samples
+    if boundary_effect_samples is None:
+        boundary_effect_samples = compute_boundary_effect_samples_from_wavelet(
+            wavelet_time_s,
+            base_wavelet,
+            float(geometry["sample_step"]),
+        )
+        cfg.boundary_effect_samples = boundary_effect_samples
+        logger.info(
+            "Auto boundary_effect_samples=%d from wavelet active half-support (threshold=%.2f, sample_step=%.6f s)",
+            boundary_effect_samples,
+            BOUNDARY_EFFECT_WAVELET_THRESHOLD,
+            float(geometry["sample_step"]),
+        )
+    else:
+        boundary_effect_samples = int(boundary_effect_samples)
+        cfg.boundary_effect_samples = boundary_effect_samples
+
     # ── 展平并预计算掩码 / taper（只算一次） ──
     seismic_flat = seismic.reshape(n_il * n_xl, n_sample)
     lfm_flat = lfm.reshape(n_il * n_xl, n_sample)
     train_mask_flat = train_mask.reshape(n_il * n_xl, n_sample)
     inference_mask_flat = inference_mask.reshape(n_il * n_xl, n_sample)
-    train_loss_mask_flat = _build_eroded_loss_mask(train_mask_flat, erosion_samples=cfg.boundary_effect_samples)
+    train_loss_mask_flat = _build_eroded_loss_mask(train_mask_flat, erosion_samples=boundary_effect_samples)
     inference_loss_mask_flat = _build_eroded_loss_mask(
         inference_mask_flat,
-        erosion_samples=cfg.boundary_effect_samples,
+        erosion_samples=boundary_effect_samples,
     )
-    train_taper_flat = _build_residual_taper(train_mask_flat, halo_samples=cfg.boundary_effect_samples)
-    inference_taper_flat = _build_residual_taper(inference_mask_flat, halo_samples=cfg.boundary_effect_samples)
+    train_taper_flat = _build_residual_taper(train_mask_flat, halo_samples=boundary_effect_samples)
+    inference_taper_flat = _build_residual_taper(inference_mask_flat, halo_samples=boundary_effect_samples)
     train_valid_indices = _get_valid_trace_indices(train_mask_flat)
     inference_valid_indices = _get_valid_trace_indices(inference_mask_flat)
     logger.info(
         "Preprocessed masks: train=%d traces, inference=%d traces, boundary_effect_samples=%d",
         train_valid_indices.size,
         inference_valid_indices.size,
-        cfg.boundary_effect_samples,
+        boundary_effect_samples,
     )
 
     # ── 验证集切分 ──
@@ -499,22 +578,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         normalization_stats=train_norm_stats,
     )
 
-    logger.info("Resolving wavelet from source=%s...", cfg.wavelet_source)
     resolved_wavelet_gain = cfg.wavelet_gain
-    if cfg.wavelet_source == "precomputed_wavelet":
-        wavelet_time_s, base_wavelet = load_wavelet_csv(cfg.wavelet_file)  # type: ignore[arg-type]
-        validate_wavelet_dt(wavelet_time_s, float(geometry["sample_step"]))
-    elif cfg.wavelet_source == "ricker_wavelet":
-        _, base_wavelet = make_wavelet(
-            wavelet_type=cfg.wavelet_type,
-            freq=cfg.wavelet_freq,
-            dt=cfg.wavelet_dt,
-            length=cfg.wavelet_length,
-            gain=1.0,
-        )
-    else:
-        raise ValueError(f"Unsupported wavelet_source: {cfg.wavelet_source}")
-
     if resolved_wavelet_gain is None:
         resolved_wavelet_gain = estimate_wavelet_gain(
             seismic,

@@ -78,7 +78,7 @@ class DepthGINNConfig:
     ai_min: float = 3000.0
     ai_max: float = 30000.0
     zero_residual_outside_mask: bool = True
-    boundary_effect_samples: int = 30
+    boundary_effect_samples: int | None = None
 
     # ── 验证与早停 ────────────────────────────────────────────
     validation_split_mode: ValidationSplitMode = "spatial_block"
@@ -158,7 +158,7 @@ class DepthGINNConfig:
             raise ValueError(f"ai_min must be positive, got {self.ai_min}.")
         if self.ai_max <= self.ai_min:
             raise ValueError(f"ai_max must be greater than ai_min, got ai_min={self.ai_min}, ai_max={self.ai_max}.")
-        if self.boundary_effect_samples < 0:
+        if self.boundary_effect_samples is not None and self.boundary_effect_samples < 0:
             raise ValueError(f"boundary_effect_samples must be non-negative, got {self.boundary_effect_samples}.")
         if not 0.0 <= self.validation_fraction < 1.0:
             raise ValueError(f"validation_fraction must be within [0, 1), got {self.validation_fraction}.")

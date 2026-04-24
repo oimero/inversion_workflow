@@ -85,7 +85,7 @@ class GINNConfig:
     ai_min: float = 3000.0  # 目标层内允许的波阻抗下界。
     ai_max: float = 30000.0  # 目标层内允许的波阻抗上界。
     zero_residual_outside_mask: bool = True  # 是否将层外高频扰动通过 taper 平滑压回 0。
-    boundary_effect_samples: int = 30  # 同时用于 waveform loss 内缩和高频扰动 halo 宽度。
+    boundary_effect_samples: int | None = None  # 为空时按子波 5% 有效半支撑自动计算。
 
     # ── 验证与早停 ────────────────────────────────────────────
     validation_split_mode: ValidationSplitMode = "spatial_block"  # 验证集切分方式。
@@ -187,7 +187,7 @@ class GINNConfig:
             raise ValueError(f"ai_min must be positive, got {self.ai_min}.")
         if self.ai_max <= self.ai_min:
             raise ValueError(f"ai_max must be greater than ai_min, got ai_min={self.ai_min}, ai_max={self.ai_max}.")
-        if self.boundary_effect_samples < 0:
+        if self.boundary_effect_samples is not None and self.boundary_effect_samples < 0:
             raise ValueError(f"boundary_effect_samples must be non-negative, got {self.boundary_effect_samples}.")
         if not 0.0 <= self.validation_fraction < 1.0:
             raise ValueError(f"validation_fraction must be within [0, 1), got {self.validation_fraction}.")

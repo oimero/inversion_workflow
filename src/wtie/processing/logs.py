@@ -11,7 +11,7 @@
 核心公开对象
 ------------
 1. despike: 基于中值滤波残差阈值的去尖峰入口函数。
-2. interpolate_nans: 双向 NaN 插值函数，尽量填补边界缺失。
+2. interpolate_nans: 双向缺失值插值函数，尽量填补边界缺失。
 3. smoothly_interpolate_nans: 去尖峰 + 平滑 + 插值的一体化缺失值回填函数。
 4. smooth: 自动区分含 NaN/不含 NaN 场景的高斯平滑函数。
 5. blocking: 基于相邻变化阈值与最大段长的分段均值化函数。
@@ -86,10 +86,10 @@ def despike(
 
 
 def interpolate_nans(x: np.ndarray, method: str = "linear", **kwargs) -> np.ndarray:
-    """对 NaN 执行双向插值，尽量填补序列两端空值。
+    """对 NaN/inf 执行双向插值，尽量填补序列两端空值。
 
     先按原方向插值，再对反转后的序列插值并反转回来，以减少单向插值
-    对边界 NaN 的残留。
+    对边界缺失值的残留。输入中的 ``inf`` / ``-inf`` 会先被视为 NaN。
 
     Parameters
     ----------
@@ -104,9 +104,18 @@ def interpolate_nans(x: np.ndarray, method: str = "linear", **kwargs) -> np.ndar
     -------
     np.ndarray
         插值后的数组，shape 为 (n_samples,)。
-    """
 
-    interp_r = np.array(pd.Series(x).interpolate(method=method, **kwargs))  # type: ignore
+    Raises
+    ------
+    ValueError
+        当输入没有任何有限样点时抛出。
+    """
+    values = np.asarray(x, dtype=float).copy()
+    values[~np.isfinite(values)] = np.nan
+    if np.isnan(values).all():
+        raise ValueError("Cannot interpolate an all-NaN array.")
+
+    interp_r = np.array(pd.Series(values).interpolate(method=method, **kwargs))  # type: ignore
     interp_l = np.array(pd.Series(interp_r[::-1]).interpolate(method=method, **kwargs))  # type: ignore
     return interp_l[::-1]
     # return np.array(pd.Series(x).interpolate(method=method,**kwargs))
@@ -115,10 +124,11 @@ def interpolate_nans(x: np.ndarray, method: str = "linear", **kwargs) -> np.ndar
 def smoothly_interpolate_nans(
     x: np.ndarray, despike_params: dict, smooth_params: dict, method: str = "slinear"
 ) -> np.ndarray:
-    """先去尖峰和平滑，再仅回填原始 NaN 位置。
+    """先去尖峰和平滑，再仅回填原始 NaN/inf 位置。
 
     处理流程为：despike -> smooth -> interpolate_nans。
-    最终结果只会替换输入中原本为 NaN 的样点，非 NaN 样点保持原值。
+    输入中的 ``inf`` / ``-inf`` 会先被视为 NaN。最终结果只会替换输入中
+    原本为非有限值的样点，有限样点保持原值。
 
     Parameters
     ----------
@@ -135,16 +145,27 @@ def smoothly_interpolate_nans(
     -------
     np.ndarray
         与输入同 shape 的数组 (n_samples,)。
-        仅输入中的 NaN 位置会被填充，其他位置保持与输入一致。
+        仅输入中的 NaN/inf 位置会被填充，其他位置保持与输入一致。
+
+    Raises
+    ------
+    ValueError
+        当输入没有任何有限样点时抛出。
     """
+    values = np.asarray(x, dtype=float).copy()
+    missing_mask = ~np.isfinite(values)
+    values[missing_mask] = np.nan
+    if missing_mask.all():
+        raise ValueError("Cannot interpolate an all-NaN array.")
+
     # interpolate on despiked
-    x2 = despike(x, **despike_params)
+    x2 = despike(values, **despike_params)
     x2 = smooth(x2, **smooth_params)
     x2 = interpolate_nans(x2, method=method)
 
     # fill on original
-    x3 = x.copy()
-    x3[np.isnan(x)] = x2[np.isnan(x)]
+    x3 = values.copy()
+    x3[missing_mask] = x2[missing_mask]
     return x3
 
 

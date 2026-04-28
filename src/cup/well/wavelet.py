@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+DEFAULT_ACTIVE_SUPPORT_THRESHOLD = 0.05
+
 
 def make_wavelet(
     wavelet_type: str,
@@ -69,6 +71,40 @@ def infer_wavelet_dt(time_s: np.ndarray) -> float:
     if not np.allclose(deltas, dt, rtol=1e-5, atol=1e-9):
         raise ValueError("wavelet time_s samples must be regularly sampled.")
     return dt
+
+
+def compute_wavelet_active_half_support_s(
+    wavelet_time_s: np.ndarray,
+    wavelet: np.ndarray,
+    *,
+    active_threshold: float = DEFAULT_ACTIVE_SUPPORT_THRESHOLD,
+) -> float:
+    """Estimate wavelet active half-support in seconds.
+
+    The active support is where ``abs(wavelet)`` is at least
+    ``active_threshold`` times the wavelet peak amplitude. The returned value
+    is the largest active time offset from the wavelet peak.
+    """
+    if not 0.0 < active_threshold <= 1.0:
+        raise ValueError(f"active_threshold must be within (0, 1], got {active_threshold}.")
+
+    wavelet_time_s = np.asarray(wavelet_time_s, dtype=np.float64).reshape(-1)
+    wavelet = np.asarray(wavelet, dtype=np.float64).reshape(-1)
+    if wavelet_time_s.shape != wavelet.shape:
+        raise ValueError(
+            f"wavelet_time_s shape {wavelet_time_s.shape} does not match wavelet shape {wavelet.shape}."
+        )
+    if wavelet.size == 0:
+        raise ValueError("Cannot compute active half-support from an empty wavelet.")
+
+    abs_wavelet = np.abs(wavelet)
+    peak = float(abs_wavelet.max())
+    if peak <= 0.0:
+        raise ValueError("Cannot compute active half-support because wavelet peak amplitude is zero.")
+
+    peak_index = int(abs_wavelet.argmax())
+    active = abs_wavelet >= peak * float(active_threshold)
+    return float(np.abs(wavelet_time_s[active] - wavelet_time_s[peak_index]).max())
 
 
 def validate_wavelet_dt(time_s: np.ndarray, expected_dt_s: float) -> float:

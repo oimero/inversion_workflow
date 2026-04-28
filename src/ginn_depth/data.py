@@ -15,7 +15,12 @@ from torch.utils.data import Dataset
 
 from cup.petrel.load import import_interpretation_petrel, import_seismic
 from cup.seismic.target_layer import TargetLayer
-from cup.well.wavelet import load_wavelet_csv, make_wavelet
+from cup.well.wavelet import (
+    DEFAULT_ACTIVE_SUPPORT_THRESHOLD,
+    compute_wavelet_active_half_support_s,
+    load_wavelet_csv,
+    make_wavelet,
+)
 from ginn.masking import build_eroded_loss_mask as _build_eroded_loss_mask
 from ginn.masking import build_residual_taper as _build_residual_taper
 from ginn.masking import get_valid_trace_indices as _get_valid_trace_indices
@@ -25,7 +30,7 @@ from ginn_depth.physics import DepthForwardModel
 
 logger = logging.getLogger(__name__)
 
-BOUNDARY_EFFECT_WAVELET_THRESHOLD = 0.05
+BOUNDARY_EFFECT_WAVELET_THRESHOLD = DEFAULT_ACTIVE_SUPPORT_THRESHOLD
 BOUNDARY_EFFECT_VELOCITY_PERCENTILE = 25.0
 
 
@@ -62,34 +67,6 @@ def resolve_wavelet_from_config(cfg: DepthGINNConfig) -> tuple[np.ndarray, np.nd
     return np.asarray(wavelet_time_s, dtype=np.float64), np.asarray(wavelet_amp, dtype=np.float32)
 
 
-def _compute_wavelet_active_half_support_s(
-    wavelet_time_s: np.ndarray,
-    wavelet_amp: np.ndarray,
-    *,
-    active_threshold: float = BOUNDARY_EFFECT_WAVELET_THRESHOLD,
-) -> float:
-    if not 0.0 < active_threshold <= 1.0:
-        raise ValueError(f"active_threshold must be within (0, 1], got {active_threshold}.")
-
-    wavelet_time_s = np.asarray(wavelet_time_s, dtype=np.float64).ravel()
-    wavelet_amp = np.asarray(wavelet_amp, dtype=np.float32).ravel()
-    if wavelet_time_s.shape != wavelet_amp.shape:
-        raise ValueError(
-            f"wavelet_time_s shape {wavelet_time_s.shape} does not match wavelet_amp shape {wavelet_amp.shape}."
-        )
-    if wavelet_amp.size == 0:
-        raise ValueError("Cannot compute boundary_effect_samples from an empty wavelet.")
-
-    abs_wavelet = np.abs(wavelet_amp)
-    peak = float(abs_wavelet.max())
-    if peak <= 0.0:
-        raise ValueError("Cannot compute boundary_effect_samples because wavelet peak amplitude is zero.")
-
-    peak_index = int(abs_wavelet.argmax())
-    active = abs_wavelet >= peak * active_threshold
-    return float(np.abs(wavelet_time_s[active] - wavelet_time_s[peak_index]).max())
-
-
 def compute_boundary_effect_samples_from_depth_wavelet(
     wavelet_time_s: np.ndarray,
     wavelet_amp: np.ndarray,
@@ -106,7 +83,7 @@ def compute_boundary_effect_samples_from_depth_wavelet(
     if vp_lfm.shape != train_mask.shape:
         raise ValueError(f"vp_lfm shape {vp_lfm.shape} does not match train_mask shape {train_mask.shape}.")
 
-    half_support_s = _compute_wavelet_active_half_support_s(
+    half_support_s = compute_wavelet_active_half_support_s(
         wavelet_time_s,
         wavelet_amp,
         active_threshold=active_threshold,

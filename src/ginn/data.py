@@ -26,6 +26,8 @@ from cup.petrel.load import import_interpretation_petrel, import_seismic
 from cup.seismic.survey import open_survey
 from cup.seismic.target_layer import TargetLayer
 from cup.well.wavelet import (
+    DEFAULT_ACTIVE_SUPPORT_THRESHOLD,
+    compute_wavelet_active_half_support_s,
     load_wavelet_csv,
     make_wavelet,
     validate_wavelet_dt,
@@ -38,7 +40,7 @@ from ginn.masking import select_spatial_validation_split as _select_spatial_vali
 
 logger = logging.getLogger(__name__)
 
-BOUNDARY_EFFECT_WAVELET_THRESHOLD = 0.05
+BOUNDARY_EFFECT_WAVELET_THRESHOLD = DEFAULT_ACTIVE_SUPPORT_THRESHOLD
 
 
 @dataclass
@@ -91,23 +93,11 @@ def compute_boundary_effect_samples_from_wavelet(
     if not 0.0 < active_threshold <= 1.0:
         raise ValueError(f"active_threshold must be within (0, 1], got {active_threshold}.")
 
-    wavelet_time_s = np.asarray(wavelet_time_s, dtype=np.float64).ravel()
-    wavelet = np.asarray(wavelet, dtype=np.float32).ravel()
-    if wavelet_time_s.shape != wavelet.shape:
-        raise ValueError(
-            f"wavelet_time_s shape {wavelet_time_s.shape} does not match wavelet shape {wavelet.shape}."
-        )
-    if wavelet.size == 0:
-        raise ValueError("Cannot compute boundary_effect_samples from an empty wavelet.")
-
-    abs_wavelet = np.abs(wavelet)
-    peak = float(abs_wavelet.max())
-    if peak <= 0.0:
-        raise ValueError("Cannot compute boundary_effect_samples because wavelet peak amplitude is zero.")
-
-    peak_index = int(abs_wavelet.argmax())
-    active = abs_wavelet >= peak * active_threshold
-    half_support_s = float(np.abs(wavelet_time_s[active] - wavelet_time_s[peak_index]).max())
+    half_support_s = compute_wavelet_active_half_support_s(
+        wavelet_time_s,
+        wavelet,
+        active_threshold=active_threshold,
+    )
     return int(math.ceil(half_support_s / float(seismic_sample_step_s)))
 
 

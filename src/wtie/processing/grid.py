@@ -14,7 +14,8 @@
 2. LogSet: 同井同采样基准测井集合。
 3. TimeDepthTable: TWT-深度关系（支持 TVDSS 或 MD 域）。
 4. WellPath: 井斜轨迹（MD 与 TVDSS 对应）。
-5. convert_log_from_md_to_twt: MD 测井转换到 TWT 的入口函数。
+5. integrate_twt_from_depth_velocity / build_local_tdt_from_vp: 从 Vp 构建局部时深关系。
+6. convert_log_from_md_to_twt: MD 测井转换到 TWT 的入口函数。
 
 Examples
 --------
@@ -63,6 +64,116 @@ EXISTING_BASIS_TYPES = _NAMES_DICT
 
 def _inverted_name(name):
     return list(_NAMES_DICT.keys())[list(_NAMES_DICT.values()).index(name)]
+
+
+def integrate_twt_from_depth_velocity(
+    depth_m: _sequence_t,
+    vp_mps: _sequence_t,
+    *,
+    origin_twt_s: float = 0.0,
+    method: str = "slowness_trapezoid",
+) -> np.ndarray:
+    """Integrate two-way time from depth samples and interval velocity.
+
+    Parameters
+    ----------
+    depth_m : _sequence_t
+        Strictly increasing depth samples in metres.
+    vp_mps : _sequence_t
+        P-wave velocity samples in m/s, aligned with ``depth_m``.
+    origin_twt_s : float, default=0.0
+        TWT assigned to the first depth sample.
+    method : {"slowness_trapezoid", "mean_velocity", "right"}, default="slowness_trapezoid"
+        Numerical integration method. ``slowness_trapezoid`` integrates
+        slowness (1/Vp), ``mean_velocity`` uses the interval average velocity,
+        and ``right`` uses the right endpoint velocity.
+
+    Returns
+    -------
+    np.ndarray
+        TWT samples in seconds, same shape as ``depth_m``.
+    """
+    depth = np.asarray(depth_m, dtype=float)
+    vp = np.asarray(vp_mps, dtype=float)
+    origin = float(origin_twt_s)
+
+    if depth.ndim != 1 or vp.ndim != 1:
+        raise ValueError("depth_m and vp_mps must be one-dimensional arrays.")
+    if depth.size != vp.size:
+        raise ValueError(f"depth_m and vp_mps must have the same length, got {depth.size} and {vp.size}.")
+    if depth.size < 2:
+        raise ValueError("Need at least two depth samples to integrate a time-depth table.")
+    if not np.isfinite(depth).all():
+        raise ValueError("depth_m must contain only finite values.")
+    if not np.isfinite(vp).all():
+        raise ValueError("vp_mps must contain only finite values.")
+    if not np.isfinite(origin):
+        raise ValueError("origin_twt_s must be finite.")
+    if np.any(vp <= 0.0):
+        raise ValueError("vp_mps must be strictly positive.")
+
+    dz = np.diff(depth)
+    if np.any(dz <= 0.0):
+        raise ValueError("depth_m samples must be strictly increasing.")
+
+    if method == "slowness_trapezoid":
+        interval_slowness = 0.5 * (1.0 / vp[:-1] + 1.0 / vp[1:])
+        dtwt = 2.0 * dz * interval_slowness
+    elif method == "mean_velocity":
+        interval_vp = 0.5 * (vp[:-1] + vp[1:])
+        dtwt = 2.0 * dz / interval_vp
+    elif method == "right":
+        dtwt = 2.0 * dz / vp[1:]
+    else:
+        raise ValueError(
+            "method must be one of 'slowness_trapezoid', 'mean_velocity', or 'right', "
+            f"got {method!r}."
+        )
+
+    return origin + np.concatenate(([0.0], np.cumsum(dtwt)))
+
+
+def build_local_tdt_from_vp(
+    tvdss_m: _sequence_t,
+    vp_mps: _sequence_t,
+    *,
+    md_m: _sequence_t = None,  # type: ignore
+    origin_twt_s: float = 0.0,
+    method: str = "slowness_trapezoid",
+) -> pd.DataFrame:
+    """Build a local time-depth table DataFrame from TVDSS and Vp samples."""
+    tvdss = np.asarray(tvdss_m, dtype=float)
+    vp = np.asarray(vp_mps, dtype=float)
+
+    if tvdss.ndim != 1 or vp.ndim != 1:
+        raise ValueError("tvdss_m and vp_mps must be one-dimensional arrays.")
+    if tvdss.size != vp.size:
+        raise ValueError(f"tvdss_m and vp_mps must have the same length, got {tvdss.size} and {vp.size}.")
+
+    if md_m is None:
+        md = None
+    else:
+        md = np.asarray(md_m, dtype=float)
+        if md.ndim != 1:
+            raise ValueError("md_m must be a one-dimensional array.")
+        if md.size != tvdss.size:
+            raise ValueError(f"md_m and tvdss_m must have the same length, got {md.size} and {tvdss.size}.")
+        if not np.isfinite(md).all():
+            raise ValueError("md_m must contain only finite values.")
+
+    order = np.argsort(tvdss)
+    tvdss = tvdss[order]
+    vp = vp[order]
+    if md is not None:
+        md = md[order]
+
+    twt = integrate_twt_from_depth_velocity(tvdss, vp, origin_twt_s=origin_twt_s, method=method)
+
+    data = {"tvdss_m": tvdss, "twt_s": twt, "vp_mps": vp}
+    if md is not None:
+        data["md_m"] = md
+        return pd.DataFrame(data, columns=["md_m", "tvdss_m", "twt_s", "vp_mps"])
+    return pd.DataFrame(data, columns=["tvdss_m", "twt_s", "vp_mps"])
 
 
 ##############################
@@ -877,6 +988,39 @@ class TimeDepthTable:
         assert ((depth[1:] - depth[:-1]) >= 0).all()
         assert ((twt[1:] - twt[:-1]) > 0).all()
 
+    @classmethod
+    def from_vp(
+        cls,
+        vp: Log,
+        *,
+        wellpath: "WellPath" = None,  # type: ignore
+        origin_twt_s: float = 0.0,
+        method: str = "slowness_trapezoid",
+    ) -> "TimeDepthTable":
+        """Construct a TVDSS-domain time-depth table from a Vp log.
+
+        ``vp`` must be sampled in TVDSS or MD. MD logs require ``wellpath`` so
+        the velocity samples can be converted to TVDSS before integration.
+        """
+        if vp.is_tvdss:
+            vp_tvdss = vp
+        elif vp.is_md:
+            if wellpath is None:
+                raise ValueError("wellpath is required when vp is in MD domain.")
+            vp_tvdss = _convert_log_from_md_to_tvdss(vp, wellpath)
+        elif vp.is_twt:
+            raise ValueError("TimeDepthTable.from_vp only supports TVDSS or MD Vp logs.")
+        else:
+            raise NotImplementedError("%s basis type not implemented." % vp.basis_type)
+
+        twt = integrate_twt_from_depth_velocity(
+            vp_tvdss.basis,
+            vp_tvdss.values,
+            origin_twt_s=origin_twt_s,
+            method=method,
+        )
+        return cls(twt=twt, tvdss=vp_tvdss.basis)
+
     @property
     def twt(self) -> np.ndarray:
         """两程时数组，单位 s，shape 为 (n_samples,)。"""
@@ -1131,47 +1275,6 @@ class TimeDepthTable:
     def __str__(self):
         table = self.table
         return "Time-Depth table (%s vs %s) with %d entries." % (table.columns[0], table.columns[1], table.shape[0])
-
-    @staticmethod
-    def get_tvdss_twt_relation_from_vp(
-        Vp: Log,
-        wp: "WellPath" = None,  # type: ignore
-        origin: float = None,  # type: ignore
-    ) -> "TimeDepthTable":
-        # Vp should be preprocessed prior to input
-        # (despiking, long range smoothing...)
-
-        if Vp.is_md or Vp.is_tvdss:
-            # md to tvdss
-            if Vp.is_md:
-                Vp = _convert_log_from_md_to_tvdss(Vp, wp)
-
-            # integrate
-            dz = Vp.basis[1:] - Vp.basis[:-1]
-            twt = 2.0 * np.cumsum(dz / Vp.values[1:])
-
-            # shift
-            if origin is not None:
-                twt += origin
-
-            tvdss = Vp.basis[1:]
-
-        elif Vp.is_twt:
-            # integrate
-            dt = Vp.basis[1:] - Vp.basis[:-1]
-            # 0.5 to account for two-way-time
-            tvdss = 0.5 * np.cumsum(dt * Vp.values[1:])
-
-            # shift
-            if origin:
-                tvdss += origin
-
-            twt = Vp.basis[1:]
-
-        else:
-            raise NotImplementedError("%s basis type not implemented." % Vp.basis_type)
-
-        return TimeDepthTable(twt, tvdss)
 
     @staticmethod
     def get_twt_start_from_checkshots(Vp: Log, wp: "WellPath", checkshots: "TimeDepthTable", return_error: bool = True):

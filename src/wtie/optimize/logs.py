@@ -12,9 +12,8 @@
 ------------
 1. filter_log / filter_logs: 单条或批量测井去尖峰、补空与平滑。
 2. block_logs: 基于 Vp、AI 或自身分段规则的测井块化。
-3. get_tdt_from_vp: 由 Vp 与参考检查点关系构建时深表。
-4. compute_prestack_reflectivity / compute_acoustic_relfectiviy: 叠前/零偏移反射系数计算。
-5. compute_synthetic_seismic / compute_synthetic_prestack_seismic: 叠后与叠前合成地震生成。
+3. compute_prestack_reflectivity / compute_acoustic_relfectiviy: 叠前/零偏移反射系数计算。
+4. compute_synthetic_seismic / compute_synthetic_prestack_seismic: 叠后与叠前合成地震生成。
 
 Examples
 --------
@@ -349,118 +348,6 @@ def OLDget_perturbed_time_depth_tables(
         except:
             # unrealsitic perurbations
             if _i > 4 * n:
-                raise ValueError
-            continue
-
-    return tables
-
-
-def get_tdt_from_vp(Vp: grid.Log, tdt: grid.TimeDepthTable, wp: grid.WellPath = None) -> grid.TimeDepthTable:  # type: ignore
-    """根据 Vp 曲线与检查点关系构建 TVDSS-TWT 时深表。
-
-    Parameters
-    ----------
-    Vp : wtie.processing.grid.Log
-        纵波速度曲线，单位通常为 m/s。支持 MD 或 TWT 作为 ``basis``。
-    tdt : wtie.processing.grid.TimeDepthTable
-        参考时深表（通常来自 checkshot）。
-    wp : wtie.processing.grid.WellPath or None, default=None
-        井斜轨迹。当 ``Vp`` 以 MD 为坐标时参与深度转换。
-
-    Returns
-    -------
-    wtie.processing.grid.TimeDepthTable
-        由 ``Vp`` 推导的时深关系表。
-
-    Raises
-    ------
-    NotImplementedError
-        当 ``Vp`` 既不是 MD 也不是 TWT 坐标时触发。
-
-    Notes
-    -----
-    代码中会计算 ``z_error`` 与 ``t_error``，但当前实现未使用这些误差量。
-    """
-
-    if Vp.is_md:
-        t_start, z_error = grid.TimeDepthTable.get_twt_start_from_checkshots(Vp, wp, tdt)
-        sonic_tdt_pert = grid.TimeDepthTable.get_tvdss_twt_relation_from_vp(Vp, wp=wp, origin=t_start)
-    elif Vp.is_twt:
-        z_start, t_error = grid.TimeDepthTable.get_tvdss_start_from_checkshots(Vp, tdt)
-        sonic_tdt_pert = grid.TimeDepthTable.get_tvdss_twt_relation_from_vp(Vp, origin=z_start)
-
-    else:
-        raise NotImplementedError()
-
-    return sonic_tdt_pert
-
-
-def OLD_get_pertubed_tdt_from_vp(
-    Vp: grid.Log,
-    wp: grid.WellPath,
-    tdt: grid.TimeDepthTable,
-    p_pert_ratio: float = 0.02,
-    t_pert_ratio: float = 0.01,
-    max_degree: int = 5,
-    N: int = 50,
-) -> List[grid.TimeDepthTable]:
-    """通过扰动 Vp 多项式与起始时间生成多组时深表（旧实现）。
-
-    Parameters
-    ----------
-    Vp : wtie.processing.grid.Log
-        MD 坐标下的纵波速度曲线，``values`` shape 为 ``(n_samples,)``。
-    wp : wtie.processing.grid.WellPath
-        井斜轨迹。
-    tdt : wtie.processing.grid.TimeDepthTable
-        参考时深表。
-    p_pert_ratio : float, default=0.02
-        速度多项式系数扰动比例。
-    t_pert_ratio : float, default=0.01
-        起始时间扰动比例。
-    max_degree : int, default=5
-        多项式最高阶数，实际阶数在 ``[1, max_degree]`` 内随机采样。
-    N : int, default=50
-        目标生成样本数。
-
-    Returns
-    -------
-    list of wtie.processing.grid.TimeDepthTable
-        扰动得到的时深表列表。
-
-    Raises
-    ------
-    AssertionError
-        当 ``Vp`` 不是 MD 坐标时触发。
-    ValueError
-        当连续尝试超过 ``4 * N`` 次仍无法生成足够有效样本时触发。
-    """
-    assert Vp.is_md
-
-    tables = []
-
-    i = 0
-    i_ = 0
-    while i < N:
-        i_ += 1
-        deg = np.random.randint(1, max_degree + 1)
-        poly = np.polyfit(Vp.basis, Vp.values, deg)
-        poly_pert = _perturbe_poly(poly, p_pert_ratio**deg)
-
-        vl = _apply_poly(Vp.basis, poly)
-        vl_p = _apply_poly(Vp.basis, poly_pert)
-        Vp_p = grid.Log(Vp.values - vl + vl_p, Vp.basis, "md")
-
-        t_start, z_error = grid.TimeDepthTable.get_tvdss_start_from_checkshots(Vp_p, wp, tdt)  # type: ignore
-        t_start += random.uniform(-t_pert_ratio, t_pert_ratio) * t_start
-
-        try:
-            sonic_tdt_pert = grid.TimeDepthTable.get_tvdss_twt_relation_from_vp(Vp_p, wp, t_start=t_start)
-            tables.append(sonic_tdt_pert)
-            i += 1
-        except:
-            # unrealsitic perurbations
-            if i_ > 4 * N:
                 raise ValueError
             continue
 

@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from wtie.processing import grid
+from wtie.processing.logs import interpolate_nans
 
 _REQUIRED_TOPS_COLUMNS = ("Well", "Surface", "MD")
 _SENTINEL_VALUES = (-999.0, -999.25, -99999.0)
@@ -43,13 +44,10 @@ def compute_reflectivity_from_ai(ai: np.ndarray) -> np.ndarray:
     输出数组与输入等长，首样点反射率置为 0。输入中的 NaN 会先沿采样点
     线性插值补齐；若声阻抗全为 NaN，抛出 ``ValueError``。
     """
-    ai_values = np.asarray(ai, dtype=float).copy()
-    idx = np.arange(ai_values.size)
-    finite_mask = np.isfinite(ai_values)
-    if finite_mask.sum() == 0:
-        raise ValueError("Cannot compute reflectivity from an all-NaN AI array.")
-    if finite_mask.sum() != ai_values.size:
-        ai_values = np.interp(idx, idx[finite_mask], ai_values[finite_mask])
+    try:
+        ai_values = interpolate_nans(ai, method="linear")
+    except ValueError as exc:
+        raise ValueError("Cannot compute reflectivity from an all-NaN AI array.") from exc
 
     upper = ai_values[:-1]
     lower = ai_values[1:]

@@ -3,7 +3,6 @@
 import numpy as np
 from scipy.interpolate import interp1d
 
-from wtie.optimize import logs as _logs
 from wtie.processing import grid
 from wtie.processing import warping as _warping
 from wtie.processing.logs import interpolate_nans as _interpolate_nans
@@ -144,28 +143,19 @@ def apply_lags_to_table(
             "Need to find a postprocessing that \
                                   does not lead to wrong stretch & squeeze."
         )
-        ss_table = _filter_table(ss_table, post_process)
+        # Disabled design sketch: clip/smooth the slope-velocity curve after
+        # stretch/squeeze, then integrate it back into a time-depth table.
+        # This path was never reachable because of the NotImplementedError above.
+        # ss_table = _filter_table(ss_table, post_process)
 
     return ss_table
 
 
-def _filter_table(
-    table: grid.TimeDepthTable,
-    filter_params: dict,
-) -> grid.TimeDepthTable:
-    # ASSUMES Vp in m/s
-    slope_twt = np.copy(table.slope_velocity_twt().values)
-
-    # despike and smooth
-
-    # clip
-    slope_twt[slope_twt > filter_params["max_velocity"]] = filter_params["max_velocity"]
-    slope_twt[slope_twt < filter_params["min_velocity"]] = filter_params["min_velocity"]
-
-    # np to trace
-    slope_twt = grid.update_trace_values(slope_twt, table.slope_velocity_twt())
-
-    return _logs.get_tdt_from_vp(slope_twt, table)  # type: ignore
+# _filter_table was an unreachable post-processing sketch. The original idea
+# was to derive interval velocity from the stretched/squeezed table, clip
+# unrealistic velocities, and rebuild a monotonic time-depth table from that
+# filtered velocity. It stayed behind a NotImplementedError because smoothing or
+# clipping velocity after warping can change the intended stretch/squeeze.
 
 
 def compute_dynamic_lag(

@@ -487,10 +487,10 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     train_mask = target_layer.to_mask(use_valid_control_mask=True)
     inference_mask = target_layer.to_mask(use_valid_control_mask=False)
 
-    if cfg.lfm_source == "precomputed_lfm":
+    if cfg.lfm_source == "lfm_precomputed_file":
         logger.info("Loading precomputed low-frequency model from %s...", cfg.lfm_precomputed_file)
         lfm = load_lowfreq_model(cfg.lfm_precomputed_file)  # type: ignore
-    elif cfg.lfm_source == "filtered_inversion_lfm":
+    elif cfg.lfm_source == "lfm_initial_inversion_file":
         logger.info("Loading inversion volume...")
         inversion = import_seismic(
             cfg.lfm_initial_inversion_file,  # type: ignore
@@ -517,9 +517,9 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         raise ValueError(f"LFM shape {lfm.shape} does not match seismic shape {seismic.shape}.")
 
     dynamic_gain = None
-    if cfg.dynamic_gain_model_file is not None:
-        logger.info("Loading dynamic gain model from %s...", cfg.dynamic_gain_model_file)
-        dynamic_gain = load_dynamic_gain_model(cfg.dynamic_gain_model_file)
+    if cfg.gain_source == "dynamic_gain_model":
+        logger.info("Loading dynamic gain model from %s...", cfg.dynamic_gain_model)
+        dynamic_gain = load_dynamic_gain_model(cfg.dynamic_gain_model)  # type: ignore
         if dynamic_gain.shape != seismic.shape:
             raise ValueError(
                 f"Dynamic gain shape {dynamic_gain.shape} does not match seismic shape {seismic.shape}."
@@ -616,7 +616,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         normalization_stats=train_norm_stats,
     )
 
-    if cfg.dynamic_gain_model_file is None:
+    if cfg.gain_source == "fixed_gain":
         resolved_fixed_gain = cfg.fixed_gain
         if resolved_fixed_gain is None:
             resolved_fixed_gain = estimate_fixed_gain(
@@ -629,9 +629,11 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
                 candidate_trace_indices=train_dataset.valid_indices,
             )
             cfg.fixed_gain = resolved_fixed_gain
-    else:
+    elif cfg.gain_source == "dynamic_gain_model":
         resolved_fixed_gain = 1.0
         logger.info("Using dynamic gain model; fixed gain is disabled.")
+    else:
+        raise ValueError(f"Unsupported gain_source: {cfg.gain_source}")
 
     if cfg.wavelet_source == "ricker_wavelet":
         logger.info(

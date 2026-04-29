@@ -8,8 +8,9 @@ from typing import Any, Dict, Literal, Tuple
 
 import yaml
 
-LfmSource = Literal["precomputed_lfm", "filtered_inversion_lfm"]
+LfmSource = Literal["lfm_precomputed_file", "lfm_initial_inversion_file"]
 WaveletSource = Literal["precomputed_wavelet", "ricker_wavelet"]
+GainSource = Literal["fixed_gain", "dynamic_gain_model"]
 ValidationSplitMode = Literal["none", "spatial_block"]
 ValidationBlockAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"]
 
@@ -20,7 +21,7 @@ _PATH_FIELDS = {
     "lfm_precomputed_file",
     "lfm_initial_inversion_file",
     "wavelet_file",
-    "dynamic_gain_model_file",
+    "dynamic_gain_model",
     "checkpoint_dir",
 }
 
@@ -48,9 +49,9 @@ class GINNConfig:
     target_layer_outlier_min_neighbor_count: int = 2  # 孤立点判断所需最小十字邻域有效点数。
 
     # ── 低频模型 ──────────────────────────────────────────────
-    lfm_source: LfmSource = "precomputed_lfm"  # 低频模型来源：预计算结果或对阻抗体低通。
-    lfm_precomputed_file: Path | None = Path("your_precomputed_lfm")  # precomputed_lfm
-    lfm_initial_inversion_file: Path | None = Path("your_filtered_inversion_lfm")  # filtered_inversion_lfm
+    lfm_source: LfmSource = "lfm_precomputed_file"  # 低频模型来源：预计算结果或对阻抗体低通。
+    lfm_precomputed_file: Path | None = Path("your_lfm_precomputed_file")  # lfm_precomputed_file
+    lfm_initial_inversion_file: Path | None = Path("your_initial_inversion")  # lfm_initial_inversion_file
     lfm_filter_dt: float = 0.001  # 从初始反演体低通生成 LFM 时的采样间隔（秒）。
     lfm_cutoff_hz: float = 10.0  # 生成 LFM 时的 Butterworth 低通截止频率（Hz）。
     lfm_filter_order: int = 6  # 生成 LFM 时的零相位滤波器阶数。
@@ -64,9 +65,10 @@ class GINNConfig:
     wavelet_length: int = 301  # 子波长度（采样点数，建议奇数）。
 
     # ── 振幅补偿 ──────────────────────────────────────────────
-    fixed_gain: float | None = None  # 固定标量增益；为空且无 dynamic_gain_model_file 时自动估计。
+    gain_source: GainSource = "fixed_gain"  # 振幅补偿来源：固定标量增益或动态增益模型。
+    fixed_gain: float | None = None  # 固定标量增益；gain_source=fixed_gain 且为空时自动估计。
     fixed_gain_num_traces: int = 256  # 自动估计固定增益时采样的有效道数。
-    dynamic_gain_model_file: Path | None = None  # 预计算 dynamic gain model；与 fixed_gain 互斥。
+    dynamic_gain_model: Path | None = None  # gain_source=dynamic_gain_model 时使用的预计算动态增益模型。
 
     # ── 网络结构 ──────────────────────────────────────────────
     in_channels: int = 3  # 网络输入通道数：地震 + LFM + 目的层 mask。
@@ -127,13 +129,15 @@ class GINNConfig:
                 "GINN now expects in_channels=3 because the target-layer mask is part of the network input."
             )
 
-        valid_lfm_sources = {"precomputed_lfm", "filtered_inversion_lfm"}
+        valid_lfm_sources = {"lfm_precomputed_file", "lfm_initial_inversion_file"}
         if self.lfm_source not in valid_lfm_sources:
             raise ValueError(f"Unsupported lfm_source={self.lfm_source!r}, expected one of {sorted(valid_lfm_sources)}")
-        if self.lfm_source == "precomputed_lfm" and self.lfm_precomputed_file is None:
-            raise ValueError("lfm_precomputed_file is required when lfm_source='precomputed_lfm'.")
-        if self.lfm_source == "filtered_inversion_lfm" and self.lfm_initial_inversion_file is None:
-            raise ValueError("lfm_initial_inversion_file is required when lfm_source='filtered_inversion_lfm'.")
+        if self.lfm_source == "lfm_precomputed_file" and self.lfm_precomputed_file is None:
+            raise ValueError("lfm_precomputed_file is required when lfm_source='lfm_precomputed_file'.")
+        if self.lfm_source == "lfm_initial_inversion_file" and self.lfm_initial_inversion_file is None:
+            raise ValueError(
+                "lfm_initial_inversion_file is required when lfm_source='lfm_initial_inversion_file'."
+            )
         valid_wavelet_sources = {"precomputed_wavelet", "ricker_wavelet"}
         if self.wavelet_source not in valid_wavelet_sources:
             raise ValueError(
@@ -154,10 +158,15 @@ class GINNConfig:
                 f"{self.validation_block_anchor!r}, expected one of {sorted(valid_validation_anchors)}"
             )
 
+        valid_gain_sources = {"fixed_gain", "dynamic_gain_model"}
+        if self.gain_source not in valid_gain_sources:
+            raise ValueError(
+                f"Unsupported gain_source={self.gain_source!r}, expected one of {sorted(valid_gain_sources)}"
+            )
+        if self.gain_source == "dynamic_gain_model" and self.dynamic_gain_model is None:
+            raise ValueError("dynamic_gain_model is required when gain_source='dynamic_gain_model'.")
         if self.fixed_gain is not None and self.fixed_gain <= 0.0:
             raise ValueError(f"fixed_gain must be positive when provided, got {self.fixed_gain}.")
-        if self.dynamic_gain_model_file is not None and self.fixed_gain is not None:
-            raise ValueError("fixed_gain and dynamic_gain_model_file are mutually exclusive.")
         if self.fixed_gain_num_traces <= 0:
             raise ValueError(f"fixed_gain_num_traces must be positive, got {self.fixed_gain_num_traces}.")
         if self.wavelet_freq <= 0.0:
@@ -213,7 +222,7 @@ class GINNConfig:
             "lfm_precomputed_file",
             "lfm_initial_inversion_file",
             "wavelet_file",
-            "dynamic_gain_model_file",
+            "dynamic_gain_model",
         }
 
         for field_name in _PATH_FIELDS:

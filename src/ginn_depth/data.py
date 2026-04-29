@@ -453,9 +453,9 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         raise ValueError("AI/Vp LFM axes do not match.")
 
     dynamic_gain = None
-    if cfg.dynamic_gain_model_file is not None:
-        logger.info("Loading depth dynamic gain model from %s...", cfg.dynamic_gain_model_file)
-        dynamic_gain = load_dynamic_gain_depth_model(cfg.dynamic_gain_model_file)
+    if cfg.gain_source == "dynamic_gain_model":
+        logger.info("Loading depth dynamic gain model from %s...", cfg.dynamic_gain_model)
+        dynamic_gain = load_dynamic_gain_depth_model(cfg.dynamic_gain_model)  # type: ignore
         if dynamic_gain.shape != ai_lfm.shape:
             raise ValueError(
                 f"Dynamic gain shape {dynamic_gain.shape} does not match LFM shape {ai_lfm.shape}."
@@ -584,7 +584,7 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         normalization_stats=train_norm_stats,
     )
 
-    if cfg.dynamic_gain_model_file is None:
+    if cfg.gain_source == "fixed_gain":
         resolved_fixed_gain = cfg.fixed_gain
         if resolved_fixed_gain is None:
             resolved_fixed_gain = estimate_fixed_gain_depth(
@@ -601,9 +601,11 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
                 amplitude_threshold=cfg.wavelet_amplitude_threshold,
             )
             cfg.fixed_gain = resolved_fixed_gain
-    else:
+    elif cfg.gain_source == "dynamic_gain_model":
         resolved_fixed_gain = 1.0
         logger.info("Using depth dynamic gain model; fixed gain is disabled.")
+    else:
+        raise ValueError(f"Unsupported gain_source: {cfg.gain_source}")
     if cfg.wavelet_source == "ricker_wavelet":
         logger.info(
             "Generated %s wavelet: freq=%.1f Hz, dt=%.4f s, length=%d, fixed_gain=%.2f",

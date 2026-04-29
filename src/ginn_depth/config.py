@@ -9,6 +9,7 @@ from typing import Any, Dict, Literal, Tuple
 import yaml
 
 WaveletSource = Literal["precomputed_wavelet", "ricker_wavelet"]
+GainSource = Literal["fixed_gain", "dynamic_gain_model"]
 ValidationSplitMode = Literal["none", "spatial_block"]
 ValidationBlockAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"]
 
@@ -19,7 +20,7 @@ _PATH_FIELDS = {
     "ai_lfm_file",
     "vp_lfm_file",
     "wavelet_file",
-    "dynamic_gain_model_file",
+    "dynamic_gain_model",
     "checkpoint_dir",
 }
 
@@ -57,9 +58,10 @@ class DepthGINNConfig:
     wavelet_amplitude_threshold: float = 1e-7
 
     # ── 振幅补偿 ──────────────────────────────────────────────
+    gain_source: GainSource = "fixed_gain"
     fixed_gain: float | None = None
     fixed_gain_num_traces: int = 256
-    dynamic_gain_model_file: Path | None = None
+    dynamic_gain_model: Path | None = None
 
     # ── 网络结构 ──────────────────────────────────────────────
     in_channels: int = 3
@@ -123,10 +125,15 @@ class DepthGINNConfig:
             )
         if self.wavelet_source == "precomputed_wavelet" and self.wavelet_file is None:
             raise ValueError("wavelet_file is required when wavelet_source='precomputed_wavelet'.")
+        valid_gain_sources = {"fixed_gain", "dynamic_gain_model"}
+        if self.gain_source not in valid_gain_sources:
+            raise ValueError(
+                f"Unsupported gain_source={self.gain_source!r}, expected one of {sorted(valid_gain_sources)}"
+            )
+        if self.gain_source == "dynamic_gain_model" and self.dynamic_gain_model is None:
+            raise ValueError("dynamic_gain_model is required when gain_source='dynamic_gain_model'.")
         if self.fixed_gain is not None and self.fixed_gain <= 0.0:
             raise ValueError(f"fixed_gain must be positive when provided, got {self.fixed_gain}.")
-        if self.dynamic_gain_model_file is not None and self.fixed_gain is not None:
-            raise ValueError("fixed_gain and dynamic_gain_model_file are mutually exclusive.")
         if self.fixed_gain_num_traces <= 0:
             raise ValueError(f"fixed_gain_num_traces must be positive, got {self.fixed_gain_num_traces}.")
         if self.wavelet_freq <= 0.0:
@@ -180,7 +187,7 @@ class DepthGINNConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "DepthGINNConfig":
         normalized = dict(data)
-        optional_path_fields = {"wavelet_file", "dynamic_gain_model_file"}
+        optional_path_fields = {"wavelet_file", "dynamic_gain_model"}
         for field_name in _PATH_FIELDS:
             if field_name not in normalized or normalized[field_name] is None:
                 continue

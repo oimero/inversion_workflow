@@ -21,6 +21,7 @@ from cup.well.wavelet import (
     load_wavelet_csv,
     make_wavelet,
 )
+from ginn.data import compute_dynamic_gain_median, normalize_dynamic_gain_input
 from ginn.masking import build_eroded_loss_mask as _build_eroded_loss_mask
 from ginn.masking import build_residual_taper as _build_residual_taper
 from ginn.masking import get_valid_trace_indices as _get_valid_trace_indices
@@ -331,7 +332,11 @@ class DepthSeismicTraceDataset(Dataset):
         selected_indices: np.ndarray,
         *,
         dynamic_gain_flat: np.ndarray | None = None,
+        include_lfm_input: bool = True,
+        include_mask_input: bool = True,
+        include_dynamic_gain_input: bool = False,
         normalization_stats: tuple[float, float] | None = None,
+        dynamic_gain_median: float | None = None,
     ) -> None:
         n_traces, n_sample = seismic_flat.shape
         assert ai_lfm_flat.shape == seismic_flat.shape
@@ -356,6 +361,11 @@ class DepthSeismicTraceDataset(Dataset):
         self._taper_flat = taper_flat
         self._dynamic_gain_flat = dynamic_gain_flat
         self._valid_indices = selected_indices
+        self._include_lfm_input = bool(include_lfm_input)
+        self._include_mask_input = bool(include_mask_input)
+        self._include_dynamic_gain_input = bool(include_dynamic_gain_input)
+        if self._include_dynamic_gain_input and self._dynamic_gain_flat is None:
+            logger.warning("include_dynamic_gain_input=True but no dynamic gain model is loaded; using a zero channel.")
 
         if normalization_stats is None:
             selected_mask = self._mask_flat[self._valid_indices]
@@ -369,12 +379,24 @@ class DepthSeismicTraceDataset(Dataset):
             self._seis_rms = float(normalization_stats[0])
             self._lfm_scale = float(normalization_stats[1])
 
+        if self._include_dynamic_gain_input and self._dynamic_gain_flat is not None:
+            self._dynamic_gain_median = (
+                float(dynamic_gain_median)
+                if dynamic_gain_median is not None
+                else compute_dynamic_gain_median(self._dynamic_gain_flat, self._mask_flat, self._valid_indices)
+            )
+        elif self._include_dynamic_gain_input:
+            self._dynamic_gain_median = 1.0
+        else:
+            self._dynamic_gain_median = None
+
         logger.info(
-            "Depth dataset: %d selected traces / %d total, seis_rms=%.4f, ai_lfm_scale=%.2f",
+            "Depth dataset: %d selected traces / %d total, seis_rms=%.4f, ai_lfm_scale=%.2f, input_channels=%s",
             len(self._valid_indices),
             n_traces,
             self._seis_rms,
             self._lfm_scale,
+            self.input_channel_names,
         )
 
     def __len__(self) -> int:
@@ -396,6 +418,21 @@ class DepthSeismicTraceDataset(Dataset):
     def ai_lfm_flat(self) -> np.ndarray:
         return self._ai_lfm_flat
 
+    @property
+    def dynamic_gain_median(self) -> float | None:
+        return self._dynamic_gain_median
+
+    @property
+    def input_channel_names(self) -> tuple[str, ...]:
+        channels = ["seismic"]
+        if self._include_lfm_input:
+            channels.append("ai_lfm")
+        if self._include_mask_input:
+            channels.append("mask")
+        if self._include_dynamic_gain_input:
+            channels.append("dynamic_gain_log_ratio")
+        return tuple(channels)
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         flat_idx = self._valid_indices[idx]
         seis = self._seismic_flat[flat_idx].copy()
@@ -410,7 +447,17 @@ class DepthSeismicTraceDataset(Dataset):
         velocity_raw = vp.copy()
         seis_norm = seis / self._seis_rms
         ai_lfm_norm = ai_lfm / self._lfm_scale
-        x = np.stack([seis_norm, ai_lfm_norm, core_mask.astype(np.float32)], axis=0)
+        channels = [seis_norm.astype(np.float32)]
+        if self._include_lfm_input:
+            channels.append(ai_lfm_norm.astype(np.float32))
+        if self._include_mask_input:
+            channels.append(core_mask.astype(np.float32))
+        if self._include_dynamic_gain_input:
+            if dynamic_gain is None:
+                channels.append(np.zeros_like(seis_norm, dtype=np.float32))
+            else:
+                channels.append(normalize_dynamic_gain_input(dynamic_gain, self._dynamic_gain_median))  # type: ignore[arg-type]
+        x = np.stack(channels, axis=0)
 
         item = {
             "input": torch.from_numpy(x).float(),
@@ -567,7 +614,14 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         inference_loss_mask_flat,
         inference_taper_flat,
     )
-    train_dataset = DepthSeismicTraceDataset(*train_shared, train_indices, dynamic_gain_flat=dynamic_gain_flat)
+    train_dataset = DepthSeismicTraceDataset(
+        *train_shared,
+        train_indices,
+        dynamic_gain_flat=dynamic_gain_flat,
+        include_lfm_input=cfg.include_lfm_input,
+        include_mask_input=cfg.include_mask_input,
+        include_dynamic_gain_input=cfg.include_dynamic_gain_input,
+    )
     train_norm_stats = (train_dataset.seis_rms, train_dataset.lfm_scale)
     val_dataset = None
     if val_indices is not None and val_indices.size > 0:
@@ -575,13 +629,21 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
             *train_shared,
             val_indices,
             dynamic_gain_flat=dynamic_gain_flat,
+            include_lfm_input=cfg.include_lfm_input,
+            include_mask_input=cfg.include_mask_input,
+            include_dynamic_gain_input=cfg.include_dynamic_gain_input,
             normalization_stats=train_norm_stats,
+            dynamic_gain_median=train_dataset.dynamic_gain_median,
         )
     inference_dataset = DepthSeismicTraceDataset(
         *inference_shared,
         inference_valid_indices,
         dynamic_gain_flat=dynamic_gain_flat,
+        include_lfm_input=cfg.include_lfm_input,
+        include_mask_input=cfg.include_mask_input,
+        include_dynamic_gain_input=cfg.include_dynamic_gain_input,
         normalization_stats=train_norm_stats,
+        dynamic_gain_median=train_dataset.dynamic_gain_median,
     )
 
     if cfg.gain_source == "fixed_gain":

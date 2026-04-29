@@ -41,6 +41,31 @@ from ginn.masking import select_spatial_validation_split as _select_spatial_vali
 logger = logging.getLogger(__name__)
 
 BOUNDARY_EFFECT_WAVELET_THRESHOLD = DEFAULT_ACTIVE_SUPPORT_THRESHOLD
+DYNAMIC_GAIN_LOG_CLIP = 3.0
+
+
+def compute_dynamic_gain_median(
+    dynamic_gain_flat: np.ndarray,
+    mask_flat: np.ndarray,
+    selected_indices: np.ndarray,
+) -> float:
+    """Estimate a robust positive reference gain from selected masked samples."""
+    selected_gain = dynamic_gain_flat[selected_indices]
+    selected_mask = mask_flat[selected_indices]
+    valid_gain = selected_gain[selected_mask]
+    valid_gain = valid_gain[np.isfinite(valid_gain) & (valid_gain > 0.0)]
+    if valid_gain.size == 0:
+        raise ValueError("Cannot enable dynamic gain input: no positive finite gain values in selected mask.")
+    return float(np.median(valid_gain))
+
+
+def normalize_dynamic_gain_input(dynamic_gain: np.ndarray, gain_median: float) -> np.ndarray:
+    """Convert multiplicative gain to a compact additive input channel."""
+    if gain_median <= 0.0:
+        raise ValueError(f"dynamic gain median must be positive, got {gain_median}.")
+    safe_gain = np.maximum(dynamic_gain.astype(np.float32, copy=False), 1e-6)
+    gain_norm = np.log(safe_gain / float(gain_median))
+    return np.clip(gain_norm, -DYNAMIC_GAIN_LOG_CLIP, DYNAMIC_GAIN_LOG_CLIP).astype(np.float32)
 
 
 @dataclass
@@ -328,7 +353,11 @@ class SeismicTraceDataset(Dataset):
         selected_indices: np.ndarray,
         *,
         dynamic_gain_flat: np.ndarray | None = None,
+        include_lfm_input: bool = True,
+        include_mask_input: bool = True,
+        include_dynamic_gain_input: bool = False,
         normalization_stats: tuple[float, float] | None = None,
+        dynamic_gain_median: float | None = None,
     ) -> None:
         n_traces, n_sample = seismic_flat.shape
         assert lfm_flat.shape == seismic_flat.shape
@@ -351,6 +380,11 @@ class SeismicTraceDataset(Dataset):
         self._taper_flat = taper_flat
         self._dynamic_gain_flat = dynamic_gain_flat
         self._valid_indices = selected_indices
+        self._include_lfm_input = bool(include_lfm_input)
+        self._include_mask_input = bool(include_mask_input)
+        self._include_dynamic_gain_input = bool(include_dynamic_gain_input)
+        if self._include_dynamic_gain_input and self._dynamic_gain_flat is None:
+            logger.warning("include_dynamic_gain_input=True but no dynamic gain model is loaded; using a zero channel.")
 
         if normalization_stats is None:
             selected_mask = self._mask_flat[self._valid_indices]
@@ -366,12 +400,24 @@ class SeismicTraceDataset(Dataset):
             self._seis_rms = float(normalization_stats[0])
             self._lfm_scale = float(normalization_stats[1])
 
+        if self._include_dynamic_gain_input and self._dynamic_gain_flat is not None:
+            self._dynamic_gain_median = (
+                float(dynamic_gain_median)
+                if dynamic_gain_median is not None
+                else compute_dynamic_gain_median(self._dynamic_gain_flat, self._mask_flat, self._valid_indices)
+            )
+        elif self._include_dynamic_gain_input:
+            self._dynamic_gain_median = 1.0
+        else:
+            self._dynamic_gain_median = None
+
         logger.info(
-            "Dataset: %d selected traces / %d total, seis_rms=%.4f, lfm_scale=%.2f",
+            "Dataset: %d selected traces / %d total, seis_rms=%.4f, lfm_scale=%.2f, input_channels=%s",
             len(self._valid_indices),
             n_traces,
             self._seis_rms,
             self._lfm_scale,
+            self.input_channel_names,
         )
 
     def __len__(self) -> int:
@@ -397,6 +443,21 @@ class SeismicTraceDataset(Dataset):
         """返回完整展平 LFM，用作未进入推理域 trace 的物理背景值。"""
         return self._lfm_flat
 
+    @property
+    def dynamic_gain_median(self) -> float | None:
+        return self._dynamic_gain_median
+
+    @property
+    def input_channel_names(self) -> tuple[str, ...]:
+        channels = ["seismic"]
+        if self._include_lfm_input:
+            channels.append("lfm")
+        if self._include_mask_input:
+            channels.append("mask")
+        if self._include_dynamic_gain_input:
+            channels.append("dynamic_gain_log_ratio")
+        return tuple(channels)
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         flat_idx = self._valid_indices[idx]
 
@@ -414,8 +475,17 @@ class SeismicTraceDataset(Dataset):
         seis_norm = seis / self._seis_rms
         lfm_norm = lfm / self._lfm_scale
 
-        # 构造 3 通道输入：地震、LFM、目的层位置先验。
-        x = np.stack([seis_norm, lfm_norm, core_mask.astype(np.float32)], axis=0)  # (3, n_sample)
+        channels = [seis_norm.astype(np.float32)]
+        if self._include_lfm_input:
+            channels.append(lfm_norm.astype(np.float32))
+        if self._include_mask_input:
+            channels.append(core_mask.astype(np.float32))
+        if self._include_dynamic_gain_input:
+            if dynamic_gain is None:
+                channels.append(np.zeros_like(seis_norm, dtype=np.float32))
+            else:
+                channels.append(normalize_dynamic_gain_input(dynamic_gain, self._dynamic_gain_median))  # type: ignore[arg-type]
+        x = np.stack(channels, axis=0)
 
         item = {
             "input": torch.from_numpy(x).float(),  # (3, n_sample)
@@ -599,7 +669,14 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         inference_loss_mask_flat,
         inference_taper_flat,
     )
-    train_dataset = SeismicTraceDataset(*train_shared, train_indices, dynamic_gain_flat=dynamic_gain_flat)
+    train_dataset = SeismicTraceDataset(
+        *train_shared,
+        train_indices,
+        dynamic_gain_flat=dynamic_gain_flat,
+        include_lfm_input=cfg.include_lfm_input,
+        include_mask_input=cfg.include_mask_input,
+        include_dynamic_gain_input=cfg.include_dynamic_gain_input,
+    )
     train_norm_stats = (train_dataset.seis_rms, train_dataset.lfm_scale)
     val_dataset = None
     if val_indices is not None and val_indices.size > 0:
@@ -607,13 +684,21 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
             *train_shared,
             val_indices,
             dynamic_gain_flat=dynamic_gain_flat,
+            include_lfm_input=cfg.include_lfm_input,
+            include_mask_input=cfg.include_mask_input,
+            include_dynamic_gain_input=cfg.include_dynamic_gain_input,
             normalization_stats=train_norm_stats,
+            dynamic_gain_median=train_dataset.dynamic_gain_median,
         )
     inference_dataset = SeismicTraceDataset(
         *inference_shared,
         inference_valid_indices,
         dynamic_gain_flat=dynamic_gain_flat,
+        include_lfm_input=cfg.include_lfm_input,
+        include_mask_input=cfg.include_mask_input,
+        include_dynamic_gain_input=cfg.include_dynamic_gain_input,
         normalization_stats=train_norm_stats,
+        dynamic_gain_median=train_dataset.dynamic_gain_median,
     )
 
     if cfg.gain_source == "fixed_gain":

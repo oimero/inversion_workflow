@@ -157,13 +157,18 @@ def build_common_run_summary(
             "normalization": {
                 "seis_rms": float(inference_dataset.seis_rms),
                 "lfm_scale": float(inference_dataset.lfm_scale),
+                "dynamic_gain_median": getattr(inference_dataset, "dynamic_gain_median", None),
             },
+            "input_channel_names": list(getattr(inference_dataset, "input_channel_names", ())),
             "split_metadata": split_metadata,
         },
         "model": {
             "class": type(model).__name__,
             "trainable_parameters": int(model.count_parameters()),
             "in_channels": int(cfg.in_channels),
+            "include_lfm_input": bool(cfg.include_lfm_input),
+            "include_mask_input": bool(cfg.include_mask_input),
+            "include_dynamic_gain_input": bool(cfg.include_dynamic_gain_input),
             "hidden_channels": int(cfg.hidden_channels),
             "out_channels": int(cfg.out_channels),
             "num_res_blocks": int(cfg.num_res_blocks),

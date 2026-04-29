@@ -49,29 +49,32 @@ class GINNConfig:
     target_layer_outlier_min_neighbor_count: int = 2  # 孤立点判断所需最小十字邻域有效点数。
 
     # ── 低频模型 ──────────────────────────────────────────────
-    lfm_source: LfmSource = "lfm_precomputed_file"  # 低频模型来源：预计算结果或对阻抗体低通。
-    lfm_precomputed_file: Path | None = Path("your_lfm_precomputed_file")  # lfm_precomputed_file
-    lfm_initial_inversion_file: Path | None = Path("your_initial_inversion")  # lfm_initial_inversion_file
+    lfm_source: LfmSource = "lfm_precomputed_file"
+    lfm_precomputed_file: Path | None = Path("your_lfm_precomputed_file")
+    lfm_initial_inversion_file: Path | None = Path("your_lfm_initial_inversion_file")
     lfm_filter_dt: float = 0.001  # 从初始反演体低通生成 LFM 时的采样间隔（秒）。
     lfm_cutoff_hz: float = 10.0  # 生成 LFM 时的 Butterworth 低通截止频率（Hz）。
     lfm_filter_order: int = 6  # 生成 LFM 时的零相位滤波器阶数。
 
     # ── 子波 ──────────────────────────────────────────────────
-    wavelet_source: WaveletSource = "ricker_wavelet"  # 子波来源：文件子波或 Ricker 理论子波。
-    wavelet_file: Path | None = None  # precomputed_wavelet：包含 time_s/amplitude 列的 CSV。
+    wavelet_source: WaveletSource = "ricker_wavelet"
+    wavelet_file: Path | None = Path("your_precomputed_wavelet.csv")
     wavelet_type: str = "ricker"  # 正演使用的子波类型。
     wavelet_freq: float = 25.0  # 子波主频（Hz）。
     wavelet_dt: float = 0.001  # 子波采样间隔（秒）。
     wavelet_length: int = 301  # 子波长度（采样点数，建议奇数）。
 
     # ── 振幅补偿 ──────────────────────────────────────────────
-    gain_source: GainSource = "fixed_gain"  # 振幅补偿来源：固定标量增益或动态增益模型。
+    gain_source: GainSource = "fixed_gain"
     fixed_gain: float | None = None  # 固定标量增益；gain_source=fixed_gain 且为空时自动估计。
     fixed_gain_num_traces: int = 256  # 自动估计固定增益时采样的有效道数。
     dynamic_gain_model: Path | None = None  # gain_source=dynamic_gain_model 时使用的预计算动态增益模型。
 
     # ── 网络结构 ──────────────────────────────────────────────
-    in_channels: int = 3  # 网络输入通道数：地震 + LFM + 目的层 mask。
+    include_lfm_input: bool = True  # 是否将 LFM 作为网络输入通道；地震通道始终启用。
+    include_mask_input: bool = True  # 是否将目的层 mask 作为网络输入通道。
+    include_dynamic_gain_input: bool = False  # 是否将 log-normalized dynamic gain 作为网络输入通道。
+    in_channels: int = 3  # 网络输入通道数：地震 + 可选 LFM/mask/dynamic gain。
     hidden_channels: int = 64  # 残差块内部的隐藏通道数。
     out_channels: int = 1  # 网络输出通道数，对应高频扰动。
     num_res_blocks: int = 8  # 残差块数量。
@@ -124,9 +127,13 @@ class GINNConfig:
         # 确保 dilations 长度与 num_res_blocks 一致
         if len(self.dilations) != self.num_res_blocks:
             raise ValueError(f"len(dilations)={len(self.dilations)} != num_res_blocks={self.num_res_blocks}")
-        if self.in_channels != 3:
+        expected_in_channels = 1 + int(self.include_lfm_input) + int(self.include_mask_input) + int(
+            self.include_dynamic_gain_input
+        )
+        if self.in_channels != expected_in_channels:
             raise ValueError(
-                "GINN now expects in_channels=3 because the target-layer mask is part of the network input."
+                f"in_channels={self.in_channels} does not match enabled input channels "
+                f"(expected {expected_in_channels}: seismic + enabled lfm/mask/dynamic gain)."
             )
 
         valid_lfm_sources = {"lfm_precomputed_file", "lfm_initial_inversion_file"}

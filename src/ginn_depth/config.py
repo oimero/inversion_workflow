@@ -64,6 +64,9 @@ class DepthGINNConfig:
     dynamic_gain_model: Path | None = None
 
     # ── 网络结构 ──────────────────────────────────────────────
+    include_lfm_input: bool = True
+    include_mask_input: bool = True
+    include_dynamic_gain_input: bool = False
     in_channels: int = 3
     hidden_channels: int = 64
     out_channels: int = 1
@@ -116,8 +119,14 @@ class DepthGINNConfig:
 
         if len(self.dilations) != self.num_res_blocks:
             raise ValueError(f"len(dilations)={len(self.dilations)} != num_res_blocks={self.num_res_blocks}")
-        if self.in_channels != 3:
-            raise ValueError("Depth GINN expects in_channels=3: seismic + AI LFM + target-layer mask.")
+        expected_in_channels = 1 + int(self.include_lfm_input) + int(self.include_mask_input) + int(
+            self.include_dynamic_gain_input
+        )
+        if self.in_channels != expected_in_channels:
+            raise ValueError(
+                f"in_channels={self.in_channels} does not match enabled input channels "
+                f"(expected {expected_in_channels}: seismic + enabled AI LFM/mask/dynamic gain)."
+            )
         valid_wavelet_sources = {"precomputed_wavelet", "ricker_wavelet"}
         if self.wavelet_source not in valid_wavelet_sources:
             raise ValueError(

@@ -14,7 +14,6 @@
 ------------
 1. replace_constant_value_intervals_in_log_dicts: 批量替换连续常值区间。
 2. clip_logsets_by_well_tops: 按井分层表在 MD 域裁剪曲线集合。
-3. compute_reflectivity_from_ai: 由声阻抗曲线计算法向入射反射率。
 
 Examples
 --------
@@ -36,26 +35,6 @@ _REQUIRED_TOPS_COLUMNS = ("Well", "Surface", "MD")
 _SENTINEL_VALUES = (-999.0, -999.25, -99999.0)
 _DEFAULT_ANOMALY_VALUE = -999.25
 LogsetInput = Union[grid.LogSet, Dict[str, grid.Log]]
-
-
-def compute_reflectivity_from_ai(ai: np.ndarray) -> np.ndarray:
-    """由声阻抗曲线计算法向入射反射率。
-
-    输出数组与输入等长，首样点反射率置为 0。输入中的 NaN 会先沿采样点
-    线性插值补齐；若声阻抗全为 NaN，抛出 ``ValueError``。
-    """
-    try:
-        ai_values = interpolate_nans(ai, method="linear")
-    except ValueError as exc:
-        raise ValueError("Cannot compute reflectivity from an all-NaN AI array.") from exc
-
-    upper = ai_values[:-1]
-    lower = ai_values[1:]
-    denom = lower + upper
-    reflectivity = np.zeros_like(ai_values)
-    valid = np.isfinite(denom) & (np.abs(denom) > 0)
-    reflectivity[1:][valid] = (lower[valid] - upper[valid]) / denom[valid]
-    return reflectivity
 
 
 def _normalize_curve_name_set(

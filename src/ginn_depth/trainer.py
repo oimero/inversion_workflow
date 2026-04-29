@@ -13,6 +13,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from ginn.trainer import (
+    append_metrics_csv,
+    build_common_run_summary,
+    initialize_metrics_csv,
+    prefix_metrics,
+    summarize_array,
+    write_json,
+)
 from ginn_depth.config import DepthGINNConfig
 from ginn_depth.data import build_dataset
 from ginn_depth.loss import GINNLoss
@@ -94,6 +102,10 @@ class Trainer:
         )
 
         cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_path = cfg.checkpoint_dir / "metrics.csv"
+        self.run_summary_path = cfg.checkpoint_dir / "run_summary.json"
+        initialize_metrics_csv(self.metrics_path)
+        logger.info("Metrics CSV initialized: %s", self.metrics_path)
 
         self.epoch = 0
         self.global_step = 0
@@ -115,6 +127,46 @@ class Trainer:
             )
         else:
             logger.info("Early stopping disabled because no validation dataset is configured.")
+
+        self._write_run_summary()
+
+    def _write_run_summary(self) -> None:
+        summary = build_common_run_summary(
+            domain="depth",
+            cfg=self.cfg,
+            device=self.device,
+            geometry=self.geometry,
+            split_metadata=self.split_metadata,
+            train_dataset=self.train_dataset,
+            val_dataset=self.val_dataset,
+            inference_dataset=self.dataset,
+            train_dataloader=self.train_dataloader,
+            val_dataloader=self.val_dataloader,
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            extra={
+                "wavelet": {
+                    "source": self.cfg.wavelet_source,
+                    "type": self.cfg.wavelet_type,
+                    "time_s": summarize_array(self.wavelet_time_s),
+                    "amplitude": summarize_array(self.wavelet_amp),
+                    "amplitude_threshold": self.cfg.wavelet_amplitude_threshold,
+                },
+                "depth_axis_m": summarize_array(self.depth_axis_m),
+                "gain": {
+                    "source": self.cfg.gain_source,
+                    "fixed_gain": self.cfg.fixed_gain,
+                    "dynamic_gain_model": self.cfg.dynamic_gain_model,
+                },
+                "lfm": {
+                    "ai_lfm_file": self.cfg.ai_lfm_file,
+                    "vp_lfm_file": self.cfg.vp_lfm_file,
+                },
+            },
+        )
+        write_json(self.run_summary_path, summary)
+        logger.info("Run summary saved: %s", self.run_summary_path)
 
     def _compose_impedance(
         self,
@@ -301,9 +353,13 @@ class Trainer:
             if monitor_value < self.best_loss:
                 self.best_loss = monitor_value
                 self.best_epoch = epoch + 1
+                is_best = True
                 self.save_checkpoint("best.pt")
                 logger.info("New best model at epoch %d: %s=%.6f", epoch + 1, monitor_name, monitor_value)
+            else:
+                is_best = False
 
+            early_stop_triggered = False
             if self.val_dataloader is not None and (epoch + 1) >= self.cfg.early_stopping_warmup:
                 if monitor_value < (self._es_best - self.cfg.early_stopping_min_delta):
                     self._es_best = monitor_value
@@ -320,12 +376,34 @@ class Trainer:
                         self._es_best,
                     )
                     if self.cfg.early_stopping_patience > 0 and epochs_without_improvement >= self.cfg.early_stopping_patience:
+                        early_stop_triggered = True
                         logger.info(
                             "Early stopping triggered at epoch %d after %d stale validation epochs.",
                             epoch + 1,
                             epochs_without_improvement,
                         )
-                        break
+
+            append_metrics_csv(
+                self.metrics_path,
+                {
+                    "epoch": epoch + 1,
+                    "global_step": self.global_step,
+                    "lr": lr,
+                    "epoch_time_s": elapsed,
+                    **prefix_metrics("train", train_metrics),
+                    **prefix_metrics("val", val_metrics),
+                    "monitor_name": monitor_name,
+                    "monitor_value": monitor_value,
+                    "best_loss": self.best_loss,
+                    "best_epoch": self.best_epoch,
+                    "is_best": is_best,
+                    "epochs_without_improvement": epochs_without_improvement,
+                    "early_stop_triggered": early_stop_triggered,
+                },
+            )
+
+            if early_stop_triggered:
+                break
 
             if (epoch + 1) % self.cfg.save_every == 0:
                 self.save_checkpoint()

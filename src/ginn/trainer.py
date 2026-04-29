@@ -6,11 +6,12 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -24,6 +25,180 @@ from ginn.model import DilatedResNet1D
 from ginn.physics import ForwardModel
 
 logger = logging.getLogger(__name__)
+
+METRICS_FIELDNAMES = [
+    "epoch",
+    "global_step",
+    "lr",
+    "epoch_time_s",
+    "train_loss",
+    "train_waveform_mae",
+    "train_residual_l2",
+    "train_l2_term",
+    "train_tv_term",
+    "train_residual_tv",
+    "train_residual_mean",
+    "val_loss",
+    "val_waveform_mae",
+    "val_residual_l2",
+    "val_l2_term",
+    "val_tv_term",
+    "val_residual_tv",
+    "val_residual_mean",
+    "monitor_name",
+    "monitor_value",
+    "best_loss",
+    "best_epoch",
+    "is_best",
+    "epochs_without_improvement",
+    "early_stop_triggered",
+]
+
+
+def _json_compatible(value: Any) -> Any:
+    if isinstance(value, Path):
+        return value.as_posix()
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return _json_compatible(value.item())
+        return [_json_compatible(item) for item in value.tolist()]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, torch.device):
+        return str(value)
+    if isinstance(value, tuple):
+        return [_json_compatible(item) for item in value]
+    if isinstance(value, list):
+        return [_json_compatible(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+    return value
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8") as fp:
+        json.dump(_json_compatible(payload), fp, ensure_ascii=False, indent=2)
+
+
+def initialize_metrics_csv(path: Path) -> None:
+    with path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=METRICS_FIELDNAMES)
+        writer.writeheader()
+
+
+def append_metrics_csv(path: Path, row: dict[str, Any]) -> None:
+    normalized = {field: _json_compatible(row.get(field, "")) for field in METRICS_FIELDNAMES}
+    with path.open("a", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=METRICS_FIELDNAMES)
+        writer.writerow(normalized)
+
+
+def prefix_metrics(prefix: str, metrics: dict[str, float] | None) -> dict[str, float | str]:
+    keys = ("loss", "waveform_mae", "residual_l2", "l2_term", "tv_term", "residual_tv", "residual_mean")
+    if metrics is None:
+        return {f"{prefix}_{key}": "" for key in keys}
+    return {f"{prefix}_{key}": float(metrics[key]) for key in keys}
+
+
+def summarize_array(values: np.ndarray) -> dict[str, Any]:
+    array = np.asarray(values)
+    if array.size == 0:
+        return {"shape": list(array.shape), "size": 0}
+    finite = array[np.isfinite(array)]
+    summary: dict[str, Any] = {"shape": list(array.shape), "size": int(array.size)}
+    if finite.size == 0:
+        summary["finite_count"] = 0
+        return summary
+    summary.update(
+        {
+            "finite_count": int(finite.size),
+            "min": float(np.min(finite)),
+            "max": float(np.max(finite)),
+            "mean": float(np.mean(finite)),
+            "rms": float(np.sqrt(np.mean(finite.astype(np.float64) ** 2))),
+        }
+    )
+    return summary
+
+
+def build_common_run_summary(
+    *,
+    domain: str,
+    cfg: Any,
+    device: torch.device,
+    geometry: dict[str, Any],
+    split_metadata: dict[str, Any],
+    train_dataset: Any,
+    val_dataset: Any,
+    inference_dataset: Any,
+    train_dataloader: DataLoader,
+    val_dataloader: DataLoader | None,
+    model: Any,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    summary = {
+        "domain": domain,
+        "created_at_unix": time.time(),
+        "config": cfg.to_json_dict(),
+        "device": {
+            "requested": cfg.device,
+            "resolved": str(device),
+            "cuda_available": bool(torch.cuda.is_available()),
+        },
+        "geometry": geometry,
+        "data": {
+            "train_trace_count": len(train_dataset),
+            "validation_trace_count": len(val_dataset) if val_dataset is not None else 0,
+            "inference_trace_count": len(inference_dataset),
+            "train_batches_per_epoch": len(train_dataloader),
+            "validation_batches_per_epoch": len(val_dataloader) if val_dataloader is not None else 0,
+            "normalization": {
+                "seis_rms": float(inference_dataset.seis_rms),
+                "lfm_scale": float(inference_dataset.lfm_scale),
+            },
+            "split_metadata": split_metadata,
+        },
+        "model": {
+            "class": type(model).__name__,
+            "trainable_parameters": int(model.count_parameters()),
+            "in_channels": int(cfg.in_channels),
+            "hidden_channels": int(cfg.hidden_channels),
+            "out_channels": int(cfg.out_channels),
+            "num_res_blocks": int(cfg.num_res_blocks),
+            "dilations": list(cfg.dilations),
+            "kernel_size": int(cfg.kernel_size),
+        },
+        "optimizer": {
+            "class": type(optimizer).__name__,
+            "lr": float(cfg.lr),
+            "weight_decay": float(cfg.weight_decay),
+            "grad_clip": float(cfg.grad_clip),
+        },
+        "scheduler": {
+            "class": type(scheduler).__name__,
+            "t_max": int(cfg.epochs),
+            "eta_min": float(cfg.lr * 0.01),
+        },
+        "loss": {
+            "lambda_l2": float(cfg.lambda_l2),
+            "lambda_tv": float(cfg.lambda_tv),
+            "ai_min": float(cfg.ai_min),
+            "ai_max": float(cfg.ai_max),
+            "zero_residual_outside_mask": bool(cfg.zero_residual_outside_mask),
+            "boundary_effect_samples": cfg.boundary_effect_samples,
+        },
+        "early_stopping": {
+            "enabled": val_dataloader is not None,
+            "patience": int(cfg.early_stopping_patience),
+            "min_delta": float(cfg.early_stopping_min_delta),
+            "warmup": int(cfg.early_stopping_warmup),
+        },
+    }
+    if extra:
+        summary.update(extra)
+    return summary
 
 
 class Trainer:
@@ -109,6 +284,10 @@ class Trainer:
 
         # ── 输出目录 ──
         cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_path = cfg.checkpoint_dir / "metrics.csv"
+        self.run_summary_path = cfg.checkpoint_dir / "run_summary.json"
+        initialize_metrics_csv(self.metrics_path)
+        logger.info("Metrics CSV initialized: %s", self.metrics_path)
 
         # ── 日志 ──
         self.epoch = 0
@@ -131,6 +310,46 @@ class Trainer:
             )
         else:
             logger.info("Early stopping disabled because no validation dataset is configured.")
+
+        self._write_run_summary(wavelet)
+
+    def _write_run_summary(self, wavelet: np.ndarray) -> None:
+        summary = build_common_run_summary(
+            domain="time",
+            cfg=self.cfg,
+            device=self.device,
+            geometry=self.geometry,
+            split_metadata=self.split_metadata,
+            train_dataset=self.train_dataset,
+            val_dataset=self.val_dataset,
+            inference_dataset=self.dataset,
+            train_dataloader=self.train_dataloader,
+            val_dataloader=self.val_dataloader,
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            extra={
+                "wavelet": {
+                    "source": self.cfg.wavelet_source,
+                    "type": self.cfg.wavelet_type,
+                    "summary": summarize_array(wavelet),
+                },
+                "gain": {
+                    "source": self.cfg.gain_source,
+                    "fixed_gain": self.cfg.fixed_gain,
+                    "dynamic_gain_model": self.cfg.dynamic_gain_model,
+                },
+                "lfm": {
+                    "source": self.cfg.lfm_source,
+                    "lfm_precomputed_file": self.cfg.lfm_precomputed_file,
+                    "lfm_initial_inversion_file": self.cfg.lfm_initial_inversion_file,
+                    "lfm_cutoff_hz": self.cfg.lfm_cutoff_hz,
+                    "lfm_filter_order": self.cfg.lfm_filter_order,
+                },
+            },
+        )
+        write_json(self.run_summary_path, summary)
+        logger.info("Run summary saved: %s", self.run_summary_path)
 
     def _compose_impedance(
         self,
@@ -344,10 +563,14 @@ class Trainer:
             if monitor_value < self.best_loss:
                 self.best_loss = monitor_value
                 self.best_epoch = epoch + 1
+                is_best = True
                 self.save_checkpoint("best.pt")
                 logger.info("New best model at epoch %d: %s=%.6f", epoch + 1, monitor_name, monitor_value)
+            else:
+                is_best = False
 
             # Early stopping（独立跟踪，用 min_delta 判定“有效改善”）
+            early_stop_triggered = False
             if self.val_dataloader is not None and (epoch + 1) >= self.cfg.early_stopping_warmup:
                 if monitor_value < (self._es_best - self.cfg.early_stopping_min_delta):
                     self._es_best = monitor_value
@@ -367,12 +590,34 @@ class Trainer:
                         self.cfg.early_stopping_patience > 0
                         and epochs_without_improvement >= self.cfg.early_stopping_patience
                     ):
+                        early_stop_triggered = True
                         logger.info(
                             "Early stopping triggered at epoch %d after %d stale validation epochs.",
                             epoch + 1,
                             epochs_without_improvement,
                         )
-                        break
+
+            append_metrics_csv(
+                self.metrics_path,
+                {
+                    "epoch": epoch + 1,
+                    "global_step": self.global_step,
+                    "lr": lr,
+                    "epoch_time_s": elapsed,
+                    **prefix_metrics("train", train_metrics),
+                    **prefix_metrics("val", val_metrics),
+                    "monitor_name": monitor_name,
+                    "monitor_value": monitor_value,
+                    "best_loss": self.best_loss,
+                    "best_epoch": self.best_epoch,
+                    "is_best": is_best,
+                    "epochs_without_improvement": epochs_without_improvement,
+                    "early_stop_triggered": early_stop_triggered,
+                },
+            )
+
+            if early_stop_triggered:
+                break
 
             # 定期保存
             if (epoch + 1) % self.cfg.save_every == 0:

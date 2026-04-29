@@ -179,17 +179,19 @@ def _replace_sentinel_values(values: object) -> np.ndarray:
     return out
 
 
-def _convert_sonic_to_velocity_mps(sonic_values: object, unit: str, property_name: str) -> np.ndarray:
-    sonic = _replace_sentinel_values(sonic_values)
-    sonic[sonic <= 0] = np.nan
+def _convert_velocity_input_to_mps(values: object, unit: str, property_name: str) -> np.ndarray:
+    curve_values = _replace_sentinel_values(values)
+    curve_values[curve_values <= 0] = np.nan
 
     unit_norm = str(unit).strip().lower().replace(" ", "")
     if unit_norm in {"us/ft", "μs/ft", "µs/ft"}:
-        velocity = 0.3048 * 1e6 / sonic
+        velocity = 0.3048 * 1e6 / curve_values
     elif unit_norm in {"us/m", "μs/m", "µs/m"}:
-        velocity = 1e6 / sonic
+        velocity = 1e6 / curve_values
+    elif unit_norm in {"m/s", "mps", "m/sec", "meter/s", "meters/s"}:
+        velocity = curve_values
     else:
-        raise ValueError(f"{property_name} 曲线单位不受支持: '{unit}'. 当前仅支持 us/ft 或 us/m。")
+        raise ValueError(f"{property_name} 曲线单位不受支持: '{unit}'. 当前仅支持 us/ft、us/m 或 m/s。")
 
     if np.all(np.isnan(velocity)):
         raise ValueError(f"{property_name} 曲线在异常值处理与单位转换后全部为 NaN。")
@@ -226,7 +228,7 @@ def extract_vp_log_from_las(
     las_file : lasio.LASFile
         已加载的 LAS 文件对象。
     unit : str
-        输入曲线单位（必选）。仅支持 ``us/ft`` 或 ``us/m``。
+        输入曲线单位（必选）。支持 ``us/ft``、``us/m`` 或 ``m/s``。
     curve_mnemonic : str, optional
         指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
 
@@ -242,7 +244,7 @@ def extract_vp_log_from_las(
     """
     las_df = las_file.df()
     selected = _select_curve_mnemonic(las_df, _VP_MNEMONICS, "Vp", curve_mnemonic)
-    vp = _convert_sonic_to_velocity_mps(las_df.loc[:, selected].to_numpy(), unit, "Vp")
+    vp = _convert_velocity_input_to_mps(las_df.loc[:, selected].to_numpy(), unit, "Vp")
     vp = interpolate_nans(vp, method="linear")
     return grid.Log(vp, las_df.index.values, "md", name="Vp", unit="m/s", allow_nan=False)
 
@@ -259,7 +261,7 @@ def extract_vs_log_from_las(
     las_file : lasio.LASFile
         已加载的 LAS 文件对象。
     unit : str
-        输入曲线单位（必选）。仅支持 ``us/ft`` 或 ``us/m``。
+        输入曲线单位（必选）。支持 ``us/ft``、``us/m`` 或 ``m/s``。
     curve_mnemonic : str, optional
         指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
 
@@ -275,7 +277,7 @@ def extract_vs_log_from_las(
     """
     las_df = las_file.df()
     selected = _select_curve_mnemonic(las_df, _VS_MNEMONICS, "Vs", curve_mnemonic)
-    vs = _convert_sonic_to_velocity_mps(las_df.loc[:, selected].to_numpy(), unit, "Vs")
+    vs = _convert_velocity_input_to_mps(las_df.loc[:, selected].to_numpy(), unit, "Vs")
     vs = interpolate_nans(vs, method="linear")
     return grid.Log(vs, las_df.index.values, "md", name="Vs", unit="m/s", allow_nan=False)
 

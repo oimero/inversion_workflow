@@ -81,6 +81,9 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def initialize_metrics_csv(path: Path) -> None:
+    if path.exists():
+        logger.info("Metrics CSV already exists, preserving: %s", path)
+        return
     with path.open("w", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=METRICS_FIELDNAMES)
         writer.writeheader()
@@ -316,7 +319,10 @@ class Trainer:
         else:
             logger.info("Early stopping disabled because no validation dataset is configured.")
 
-        self._write_run_summary(wavelet)
+        if self.run_summary_path.exists():
+            logger.info("Run summary already exists, preserving: %s", self.run_summary_path)
+        else:
+            self._write_run_summary(wavelet)
 
     def _write_run_summary(self, wavelet: np.ndarray) -> None:
         summary = build_common_run_summary(

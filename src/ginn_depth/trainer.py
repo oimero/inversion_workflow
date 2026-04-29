@@ -128,7 +128,10 @@ class Trainer:
         else:
             logger.info("Early stopping disabled because no validation dataset is configured.")
 
-        self._write_run_summary()
+        if self.run_summary_path.exists():
+            logger.info("Run summary already exists, preserving: %s", self.run_summary_path)
+        else:
+            self._write_run_summary()
 
     def _write_run_summary(self) -> None:
         summary = build_common_run_summary(

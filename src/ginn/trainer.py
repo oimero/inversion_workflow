@@ -180,12 +180,15 @@ class Trainer:
                 loss_mask = batch["loss_mask"].to(self.device)  # (B, 1, T)
                 taper_weight = batch["taper_weight"].to(self.device)  # (B, 1, T)
                 lfm_raw = batch["lfm_raw"].to(self.device)  # (B, 1, T)
+                dynamic_gain = batch.get("dynamic_gain")
+                if dynamic_gain is not None:
+                    dynamic_gain = dynamic_gain.to(self.device)  # (B, 1, T)
 
                 # 1. 网络前向 + 阻抗合成
                 ai, residual = self._compose_impedance(x, lfm_raw, taper_weight)
 
                 # 2. 物理正演
-                d_syn = self.forward_model(ai)  # (B, 1, T)
+                d_syn = self.forward_model(ai, gain=dynamic_gain)  # (B, 1, T)
 
                 # 3. 损失
                 loss, loss_dict = self.criterion(d_syn, d_obs, loss_mask, core_mask, residual, taper_weight)

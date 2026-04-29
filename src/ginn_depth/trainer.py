@@ -153,9 +153,12 @@ class Trainer:
                 taper_weight = batch["taper_weight"].to(self.device)
                 lfm_raw = batch["lfm_raw"].to(self.device)
                 velocity_raw = batch["velocity_raw"].to(self.device)
+                dynamic_gain = batch.get("dynamic_gain")
+                if dynamic_gain is not None:
+                    dynamic_gain = dynamic_gain.to(self.device)
 
                 ai, residual = self._compose_impedance(x, lfm_raw, taper_weight)
-                d_syn = self.forward_model(ai, velocity_raw)
+                d_syn = self.forward_model(ai, velocity_raw, gain=dynamic_gain)
                 loss, loss_dict = self.criterion(d_syn, d_obs, loss_mask, core_mask, residual, taper_weight)
 
                 if training:

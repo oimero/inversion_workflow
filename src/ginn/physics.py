@@ -15,6 +15,24 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+def _normalize_gain_shape(gain: Tensor, reference: Tensor) -> Tensor:
+    """Normalize gain to a broadcastable ``(B, 1, T)`` tensor."""
+    if gain.ndim == 1:
+        gain = gain.view(1, 1, -1)
+    elif gain.ndim == 2:
+        gain = gain.unsqueeze(1)
+    elif gain.ndim == 3 and gain.shape[1] == 1:
+        pass
+    else:
+        raise ValueError(f"gain must have shape (T,), (B, T), or (B, 1, T), got {tuple(gain.shape)}.")
+
+    if gain.shape[-1] != reference.shape[-1]:
+        raise ValueError(f"gain/sample length mismatch: gain={tuple(gain.shape)}, reference={tuple(reference.shape)}")
+    if gain.shape[0] not in (1, reference.shape[0]):
+        raise ValueError(f"gain batch mismatch: gain={tuple(gain.shape)}, reference={tuple(reference.shape)}")
+    return gain.to(device=reference.device, dtype=reference.dtype)
+
+
 class ForwardModel(nn.Module):
     """物理正演：阻抗 → 反射率 → 合成地震记录。
 
@@ -90,7 +108,7 @@ class ForwardModel(nn.Module):
         d_syn = F.conv1d(r_padded, self.wavelet_kernel, padding=0)  # type: ignore
         return d_syn
 
-    def forward(self, impedance: Tensor) -> Tensor:
+    def forward(self, impedance: Tensor, gain: Tensor | None = None) -> Tensor:
         """完整正演：阻抗 → 合成地震记录。
 
         Parameters
@@ -110,4 +128,6 @@ class ForwardModel(nn.Module):
         r = F.pad(r, (0, 1), mode="constant", value=0.0)  # (B, 1, T)
 
         d_syn = self.convolve(r)  # (B, 1, T)
+        if gain is not None:
+            d_syn = d_syn * _normalize_gain_shape(gain, d_syn)
         return d_syn

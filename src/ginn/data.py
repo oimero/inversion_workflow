@@ -180,7 +180,33 @@ def load_lowfreq_model(lowfreq_file: Path) -> np.ndarray:
     return np.asarray(volume, dtype=np.float32)
 
 
-def estimate_wavelet_gain(
+def load_dynamic_gain_model(gain_model_file: Path) -> np.ndarray:
+    """Load a precomputed dynamic gain volume from ``.npz`` or ``.npy``."""
+    gain_path = Path(gain_model_file)
+    if not gain_path.exists():
+        raise FileNotFoundError(gain_path)
+
+    suffix = gain_path.suffix.lower()
+    if suffix == ".npy":
+        volume = np.load(gain_path, allow_pickle=False)
+    elif suffix == ".npz":
+        with np.load(gain_path, allow_pickle=False) as archive:
+            if "volume" not in archive.files:
+                raise ValueError(f"Expected key 'volume' in dynamic gain model archive, got {archive.files}.")
+            volume = archive["volume"]
+            if "metadata_json" in archive.files:
+                metadata = json.loads(np.asarray(archive["metadata_json"]).item())
+                logger.info("Loaded dynamic gain metadata: %s", metadata)
+    else:
+        raise ValueError(f"Unsupported dynamic gain model file type: {gain_path.suffix}")
+
+    volume = np.asarray(volume, dtype=np.float32)
+    if np.any(~np.isfinite(volume)) or np.any(volume <= 0.0):
+        raise ValueError("Dynamic gain model must be finite and positive everywhere.")
+    return volume
+
+
+def estimate_fixed_gain(
     seismic: np.ndarray,
     lfm: np.ndarray,
     mask: np.ndarray,
@@ -191,7 +217,7 @@ def estimate_wavelet_gain(
     candidate_trace_indices: np.ndarray | None = None,
     batch_size: int = 64,
 ) -> float:
-    """基于样本道估计使合成地震与归一化观测同量级的子波增益。
+    """基于样本道估计使合成地震与归一化观测同量级的固定增益。
 
     思路：
     1. 用单位增益子波对 LFM 做正演，得到 ``d_syn_unit``；
@@ -211,7 +237,7 @@ def estimate_wavelet_gain(
         candidate_trace_indices = np.asarray(candidate_trace_indices, dtype=np.int64)
         valid_trace_indices = np.intersect1d(valid_trace_indices, candidate_trace_indices, assume_unique=False)
     if valid_trace_indices.size == 0:
-        raise ValueError("Cannot auto-estimate wavelet gain because no valid traces were found in the mask.")
+        raise ValueError("Cannot auto-estimate fixed gain because no valid traces were found in the mask.")
 
     n_selected = min(max_traces, valid_trace_indices.size)
     if n_selected < valid_trace_indices.size:
@@ -244,16 +270,16 @@ def estimate_wavelet_gain(
             n_valid += int(valid_values.sum())
 
     if n_valid <= 0:
-        raise ValueError("Cannot auto-estimate wavelet gain because sampled valid point count is zero.")
+        raise ValueError("Cannot auto-estimate fixed gain because sampled valid point count is zero.")
 
     syn_rms = math.sqrt(syn_sq_sum / n_valid)
     obs_norm_rms = math.sqrt(obs_norm_sq_sum / n_valid)
     if syn_rms <= 0.0:
-        raise ValueError(f"Cannot auto-estimate wavelet gain because synthetic RMS is non-positive: {syn_rms}.")
+        raise ValueError(f"Cannot auto-estimate fixed gain because synthetic RMS is non-positive: {syn_rms}.")
 
     gain = obs_norm_rms / syn_rms
     logger.info(
-        "Auto wavelet gain from sampled traces: traces=%d, valid_points=%d, obs_norm_rms=%.4f, syn_unit_rms=%.4f, gain=%.4f",
+        "Auto fixed gain from sampled traces: traces=%d, valid_points=%d, obs_norm_rms=%.4f, syn_unit_rms=%.4f, gain=%.4f",
         selected.size,
         n_valid,
         obs_norm_rms,
@@ -301,6 +327,7 @@ class SeismicTraceDataset(Dataset):
         taper_flat: np.ndarray,
         selected_indices: np.ndarray,
         *,
+        dynamic_gain_flat: np.ndarray | None = None,
         normalization_stats: tuple[float, float] | None = None,
     ) -> None:
         n_traces, n_sample = seismic_flat.shape
@@ -308,6 +335,10 @@ class SeismicTraceDataset(Dataset):
         assert mask_flat.shape == seismic_flat.shape
         assert loss_mask_flat.shape == seismic_flat.shape
         assert taper_flat.shape == seismic_flat.shape
+        if dynamic_gain_flat is not None and dynamic_gain_flat.shape != seismic_flat.shape:
+            raise ValueError(
+                f"dynamic_gain_flat shape {dynamic_gain_flat.shape} does not match seismic shape {seismic_flat.shape}."
+            )
 
         selected_indices = np.asarray(selected_indices, dtype=np.int64).reshape(-1)
         if selected_indices.size == 0:
@@ -318,6 +349,7 @@ class SeismicTraceDataset(Dataset):
         self._mask_flat = mask_flat
         self._loss_mask_flat = loss_mask_flat
         self._taper_flat = taper_flat
+        self._dynamic_gain_flat = dynamic_gain_flat
         self._valid_indices = selected_indices
 
         if normalization_stats is None:
@@ -373,6 +405,7 @@ class SeismicTraceDataset(Dataset):
         core_mask = self._mask_flat[flat_idx].copy()  # (n_sample,)
         loss_mask = self._loss_mask_flat[flat_idx].copy()  # (n_sample,)
         taper_weight = self._taper_flat[flat_idx].copy()  # (n_sample,)
+        dynamic_gain = self._dynamic_gain_flat[flat_idx].copy() if self._dynamic_gain_flat is not None else None
 
         # 保留 LFM 原始量纲用于物理正演
         lfm_raw = lfm.copy()
@@ -384,7 +417,7 @@ class SeismicTraceDataset(Dataset):
         # 构造 3 通道输入：地震、LFM、目的层位置先验。
         x = np.stack([seis_norm, lfm_norm, core_mask.astype(np.float32)], axis=0)  # (3, n_sample)
 
-        return {
+        item = {
             "input": torch.from_numpy(x).float(),  # (3, n_sample)
             "obs": torch.from_numpy(seis_norm[np.newaxis]).float(),  # (1, n_sample)
             "mask": torch.from_numpy(core_mask[np.newaxis]).bool(),  # (1, n_sample)
@@ -392,6 +425,9 @@ class SeismicTraceDataset(Dataset):
             "taper_weight": torch.from_numpy(taper_weight[np.newaxis]).float(),  # (1, n_sample)
             "lfm_raw": torch.from_numpy(lfm_raw[np.newaxis]).float(),  # (1, n_sample)
         }
+        if dynamic_gain is not None:
+            item["dynamic_gain"] = torch.from_numpy(dynamic_gain[np.newaxis]).float()
+        return item
 
 
 def build_dataset(cfg: GINNConfig) -> DatasetBundle:
@@ -480,6 +516,15 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     if lfm.shape != seismic.shape:
         raise ValueError(f"LFM shape {lfm.shape} does not match seismic shape {seismic.shape}.")
 
+    dynamic_gain = None
+    if cfg.dynamic_gain_model_file is not None:
+        logger.info("Loading dynamic gain model from %s...", cfg.dynamic_gain_model_file)
+        dynamic_gain = load_dynamic_gain_model(cfg.dynamic_gain_model_file)
+        if dynamic_gain.shape != seismic.shape:
+            raise ValueError(
+                f"Dynamic gain shape {dynamic_gain.shape} does not match seismic shape {seismic.shape}."
+            )
+
     wavelet_time_s, base_wavelet = resolve_wavelet_from_config(cfg, geometry)
     boundary_effect_samples = cfg.boundary_effect_samples
     if boundary_effect_samples is None:
@@ -502,6 +547,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     # ── 展平并预计算掩码 / taper（只算一次） ──
     seismic_flat = seismic.reshape(n_il * n_xl, n_sample)
     lfm_flat = lfm.reshape(n_il * n_xl, n_sample)
+    dynamic_gain_flat = dynamic_gain.reshape(n_il * n_xl, n_sample) if dynamic_gain is not None else None
     train_mask_flat = train_mask.reshape(n_il * n_xl, n_sample)
     inference_mask_flat = inference_mask.reshape(n_il * n_xl, n_sample)
     train_loss_mask_flat = _build_eroded_loss_mask(train_mask_flat, erosion_samples=boundary_effect_samples)
@@ -553,44 +599,50 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         inference_loss_mask_flat,
         inference_taper_flat,
     )
-    train_dataset = SeismicTraceDataset(*train_shared, train_indices)
+    train_dataset = SeismicTraceDataset(*train_shared, train_indices, dynamic_gain_flat=dynamic_gain_flat)
     train_norm_stats = (train_dataset.seis_rms, train_dataset.lfm_scale)
     val_dataset = None
     if val_indices is not None and val_indices.size > 0:
         val_dataset = SeismicTraceDataset(
             *train_shared,
             val_indices,
+            dynamic_gain_flat=dynamic_gain_flat,
             normalization_stats=train_norm_stats,
         )
     inference_dataset = SeismicTraceDataset(
         *inference_shared,
         inference_valid_indices,
+        dynamic_gain_flat=dynamic_gain_flat,
         normalization_stats=train_norm_stats,
     )
 
-    resolved_wavelet_gain = cfg.wavelet_gain
-    if resolved_wavelet_gain is None:
-        resolved_wavelet_gain = estimate_wavelet_gain(
-            seismic,
-            lfm,
-            train_mask,
-            base_wavelet.astype(np.float32),
-            seis_rms=train_dataset.seis_rms,
-            max_traces=cfg.wavelet_gain_num_traces,
-            candidate_trace_indices=train_dataset.valid_indices,
-        )
-        cfg.wavelet_gain = resolved_wavelet_gain
+    if cfg.dynamic_gain_model_file is None:
+        resolved_fixed_gain = cfg.fixed_gain
+        if resolved_fixed_gain is None:
+            resolved_fixed_gain = estimate_fixed_gain(
+                seismic,
+                lfm,
+                train_mask,
+                base_wavelet.astype(np.float32),
+                seis_rms=train_dataset.seis_rms,
+                max_traces=cfg.fixed_gain_num_traces,
+                candidate_trace_indices=train_dataset.valid_indices,
+            )
+            cfg.fixed_gain = resolved_fixed_gain
+    else:
+        resolved_fixed_gain = 1.0
+        logger.info("Using dynamic gain model; fixed gain is disabled.")
 
     if cfg.wavelet_source == "ricker_wavelet":
         logger.info(
-            "Generated %s wavelet: freq=%.1f Hz, dt=%.4f s, length=%d, gain=%.2f",
+            "Generated %s wavelet: freq=%.1f Hz, dt=%.4f s, length=%d, fixed_gain=%.2f",
             cfg.wavelet_type,
             cfg.wavelet_freq,
             cfg.wavelet_dt,
             cfg.wavelet_length,
-            float(resolved_wavelet_gain),
+            float(resolved_fixed_gain),
         )
-    wavelet = (base_wavelet * float(resolved_wavelet_gain)).astype(np.float32)
+    wavelet = (base_wavelet * float(resolved_fixed_gain)).astype(np.float32)
     return DatasetBundle(
         train_dataset=train_dataset,
         inference_dataset=inference_dataset,

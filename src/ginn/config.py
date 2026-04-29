@@ -20,6 +20,7 @@ _PATH_FIELDS = {
     "lfm_precomputed_file",
     "lfm_initial_inversion_file",
     "wavelet_file",
+    "dynamic_gain_model_file",
     "checkpoint_dir",
 }
 
@@ -61,8 +62,11 @@ class GINNConfig:
     wavelet_freq: float = 25.0  # 子波主频（Hz）。
     wavelet_dt: float = 0.001  # 子波采样间隔（秒）。
     wavelet_length: int = 301  # 子波长度（采样点数，建议奇数）。
-    wavelet_gain: float | None = None  # 子波增益；为空时根据样本道自动估计。
-    wavelet_gain_num_traces: int = 256  # 自动估计子波增益时采样的有效道数。
+
+    # ── 振幅补偿 ──────────────────────────────────────────────
+    fixed_gain: float | None = None  # 固定标量增益；为空且无 dynamic_gain_model_file 时自动估计。
+    fixed_gain_num_traces: int = 256  # 自动估计固定增益时采样的有效道数。
+    dynamic_gain_model_file: Path | None = None  # 预计算 dynamic gain model；与 fixed_gain 互斥。
 
     # ── 网络结构 ──────────────────────────────────────────────
     in_channels: int = 3  # 网络输入通道数：地震 + LFM + 目的层 mask。
@@ -150,10 +154,12 @@ class GINNConfig:
                 f"{self.validation_block_anchor!r}, expected one of {sorted(valid_validation_anchors)}"
             )
 
-        if self.wavelet_gain is not None and self.wavelet_gain <= 0.0:
-            raise ValueError(f"wavelet_gain must be positive when provided, got {self.wavelet_gain}.")
-        if self.wavelet_gain_num_traces <= 0:
-            raise ValueError(f"wavelet_gain_num_traces must be positive, got {self.wavelet_gain_num_traces}.")
+        if self.fixed_gain is not None and self.fixed_gain <= 0.0:
+            raise ValueError(f"fixed_gain must be positive when provided, got {self.fixed_gain}.")
+        if self.dynamic_gain_model_file is not None and self.fixed_gain is not None:
+            raise ValueError("fixed_gain and dynamic_gain_model_file are mutually exclusive.")
+        if self.fixed_gain_num_traces <= 0:
+            raise ValueError(f"fixed_gain_num_traces must be positive, got {self.fixed_gain_num_traces}.")
         if self.wavelet_freq <= 0.0:
             raise ValueError(f"wavelet_freq must be positive, got {self.wavelet_freq}.")
         if self.wavelet_dt <= 0.0:
@@ -203,7 +209,12 @@ class GINNConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "GINNConfig":
         normalized = dict(data)
-        optional_path_fields = {"lfm_precomputed_file", "lfm_initial_inversion_file", "wavelet_file"}
+        optional_path_fields = {
+            "lfm_precomputed_file",
+            "lfm_initial_inversion_file",
+            "wavelet_file",
+            "dynamic_gain_model_file",
+        }
 
         for field_name in _PATH_FIELDS:
             if field_name not in normalized:

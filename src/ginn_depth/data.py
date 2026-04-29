@@ -189,6 +189,23 @@ def load_lfm_depth_npz(path: str | Path, *, volume_key: str = "volume") -> Depth
     )
 
 
+def load_dynamic_gain_depth_model(path: str | Path) -> DepthLfmVolume:
+    """Load a precomputed positive depth-domain dynamic gain model."""
+    gain_model = load_lfm_depth_npz(path, volume_key="volume")
+    volume = np.asarray(gain_model.volume, dtype=np.float32)
+    if np.any(~np.isfinite(volume)) or np.any(volume <= 0.0):
+        raise ValueError("Dynamic gain model must be finite and positive everywhere.")
+    return DepthLfmVolume(
+        volume=volume,
+        ilines=gain_model.ilines,
+        xlines=gain_model.xlines,
+        samples=gain_model.samples,
+        geometry=gain_model.geometry,
+        metadata=gain_model.metadata,
+        variance_volume=gain_model.variance_volume,
+    )
+
+
 def _axis_step(axis: np.ndarray, axis_name: str) -> float:
     if axis.size < 2:
         raise ValueError(f"{axis_name} must contain at least two samples.")
@@ -218,7 +235,7 @@ def geometry_from_axes(ilines: np.ndarray, xlines: np.ndarray, samples: np.ndarr
     }
 
 
-def estimate_wavelet_gain_depth(
+def estimate_fixed_gain_depth(
     seismic: np.ndarray,
     ai_lfm: np.ndarray,
     vp_lfm: np.ndarray,
@@ -245,7 +262,7 @@ def estimate_wavelet_gain_depth(
         candidate_trace_indices = np.asarray(candidate_trace_indices, dtype=np.int64)
         valid_trace_indices = np.intersect1d(valid_trace_indices, candidate_trace_indices, assume_unique=False)
     if valid_trace_indices.size == 0:
-        raise ValueError("Cannot auto-estimate wavelet gain because no valid depth traces were found in the mask.")
+        raise ValueError("Cannot auto-estimate fixed gain because no valid depth traces were found in the mask.")
 
     n_selected = min(max_traces, valid_trace_indices.size)
     if n_selected < valid_trace_indices.size:
@@ -281,16 +298,16 @@ def estimate_wavelet_gain_depth(
             n_valid += int(valid_values.sum())
 
     if n_valid <= 0:
-        raise ValueError("Cannot auto-estimate wavelet gain because sampled valid point count is zero.")
+        raise ValueError("Cannot auto-estimate fixed gain because sampled valid point count is zero.")
 
     syn_rms = math.sqrt(syn_sq_sum / n_valid)
     obs_norm_rms = math.sqrt(obs_norm_sq_sum / n_valid)
     if syn_rms <= 0.0:
-        raise ValueError(f"Cannot auto-estimate wavelet gain because synthetic RMS is non-positive: {syn_rms}.")
+        raise ValueError(f"Cannot auto-estimate fixed gain because synthetic RMS is non-positive: {syn_rms}.")
 
     gain = obs_norm_rms / syn_rms
     logger.info(
-        "Auto depth-wavelet gain: traces=%d, valid_points=%d, obs_norm_rms=%.4f, syn_unit_rms=%.4f, gain=%.4f",
+        "Auto depth fixed gain: traces=%d, valid_points=%d, obs_norm_rms=%.4f, syn_unit_rms=%.4f, gain=%.4f",
         selected.size,
         n_valid,
         obs_norm_rms,
@@ -313,6 +330,7 @@ class DepthSeismicTraceDataset(Dataset):
         taper_flat: np.ndarray,
         selected_indices: np.ndarray,
         *,
+        dynamic_gain_flat: np.ndarray | None = None,
         normalization_stats: tuple[float, float] | None = None,
     ) -> None:
         n_traces, n_sample = seismic_flat.shape
@@ -321,6 +339,10 @@ class DepthSeismicTraceDataset(Dataset):
         assert mask_flat.shape == seismic_flat.shape
         assert loss_mask_flat.shape == seismic_flat.shape
         assert taper_flat.shape == seismic_flat.shape
+        if dynamic_gain_flat is not None and dynamic_gain_flat.shape != seismic_flat.shape:
+            raise ValueError(
+                f"dynamic_gain_flat shape {dynamic_gain_flat.shape} does not match seismic shape {seismic_flat.shape}."
+            )
 
         selected_indices = np.asarray(selected_indices, dtype=np.int64).reshape(-1)
         if selected_indices.size == 0:
@@ -332,6 +354,7 @@ class DepthSeismicTraceDataset(Dataset):
         self._mask_flat = mask_flat
         self._loss_mask_flat = loss_mask_flat
         self._taper_flat = taper_flat
+        self._dynamic_gain_flat = dynamic_gain_flat
         self._valid_indices = selected_indices
 
         if normalization_stats is None:
@@ -381,6 +404,7 @@ class DepthSeismicTraceDataset(Dataset):
         core_mask = self._mask_flat[flat_idx].copy()
         loss_mask = self._loss_mask_flat[flat_idx].copy()
         taper_weight = self._taper_flat[flat_idx].copy()
+        dynamic_gain = self._dynamic_gain_flat[flat_idx].copy() if self._dynamic_gain_flat is not None else None
 
         ai_lfm_raw = ai_lfm.copy()
         velocity_raw = vp.copy()
@@ -388,7 +412,7 @@ class DepthSeismicTraceDataset(Dataset):
         ai_lfm_norm = ai_lfm / self._lfm_scale
         x = np.stack([seis_norm, ai_lfm_norm, core_mask.astype(np.float32)], axis=0)
 
-        return {
+        item = {
             "input": torch.from_numpy(x).float(),
             "obs": torch.from_numpy(seis_norm[np.newaxis]).float(),
             "mask": torch.from_numpy(core_mask[np.newaxis]).bool(),
@@ -397,6 +421,9 @@ class DepthSeismicTraceDataset(Dataset):
             "lfm_raw": torch.from_numpy(ai_lfm_raw[np.newaxis]).float(),
             "velocity_raw": torch.from_numpy(velocity_raw[np.newaxis]).float(),
         }
+        if dynamic_gain is not None:
+            item["dynamic_gain"] = torch.from_numpy(dynamic_gain[np.newaxis]).float()
+        return item
 
 
 def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
@@ -424,6 +451,21 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         or not np.allclose(ai_lfm.samples, vp_lfm.samples)
     ):
         raise ValueError("AI/Vp LFM axes do not match.")
+
+    dynamic_gain = None
+    if cfg.dynamic_gain_model_file is not None:
+        logger.info("Loading depth dynamic gain model from %s...", cfg.dynamic_gain_model_file)
+        dynamic_gain = load_dynamic_gain_depth_model(cfg.dynamic_gain_model_file)
+        if dynamic_gain.shape != ai_lfm.shape:
+            raise ValueError(
+                f"Dynamic gain shape {dynamic_gain.shape} does not match LFM shape {ai_lfm.shape}."
+            )
+        if (
+            not np.allclose(ai_lfm.ilines, dynamic_gain.ilines)
+            or not np.allclose(ai_lfm.xlines, dynamic_gain.xlines)
+            or not np.allclose(ai_lfm.samples, dynamic_gain.samples)
+        ):
+            raise ValueError("Dynamic gain axes do not match AI/Vp LFM axes.")
 
     geometry = (
         dict(ai_lfm.geometry) if ai_lfm.geometry else geometry_from_axes(ai_lfm.ilines, ai_lfm.xlines, ai_lfm.samples)
@@ -477,6 +519,7 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
     seismic_flat = seismic.reshape(n_il * n_xl, n_sample)
     ai_lfm_flat = ai_lfm.volume.reshape(n_il * n_xl, n_sample)
     vp_flat = vp_lfm.volume.reshape(n_il * n_xl, n_sample)
+    dynamic_gain_flat = dynamic_gain.volume.reshape(n_il * n_xl, n_sample) if dynamic_gain is not None else None
     train_mask_flat = train_mask.reshape(n_il * n_xl, n_sample)
     inference_mask_flat = inference_mask.reshape(n_il * n_xl, n_sample)
     train_loss_mask_flat = _build_eroded_loss_mask(train_mask_flat, erosion_samples=boundary_effect_samples)
@@ -524,41 +567,53 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         inference_loss_mask_flat,
         inference_taper_flat,
     )
-    train_dataset = DepthSeismicTraceDataset(*train_shared, train_indices)
+    train_dataset = DepthSeismicTraceDataset(*train_shared, train_indices, dynamic_gain_flat=dynamic_gain_flat)
     train_norm_stats = (train_dataset.seis_rms, train_dataset.lfm_scale)
     val_dataset = None
     if val_indices is not None and val_indices.size > 0:
-        val_dataset = DepthSeismicTraceDataset(*train_shared, val_indices, normalization_stats=train_norm_stats)
+        val_dataset = DepthSeismicTraceDataset(
+            *train_shared,
+            val_indices,
+            dynamic_gain_flat=dynamic_gain_flat,
+            normalization_stats=train_norm_stats,
+        )
     inference_dataset = DepthSeismicTraceDataset(
-        *inference_shared, inference_valid_indices, normalization_stats=train_norm_stats
+        *inference_shared,
+        inference_valid_indices,
+        dynamic_gain_flat=dynamic_gain_flat,
+        normalization_stats=train_norm_stats,
     )
 
-    resolved_wavelet_gain = cfg.wavelet_gain
-    if resolved_wavelet_gain is None:
-        resolved_wavelet_gain = estimate_wavelet_gain_depth(
-            seismic,
-            ai_lfm.volume,
-            vp_lfm.volume,
-            train_mask,
-            wavelet_time_s,
-            wavelet_amp,
-            depth_axis_m=ai_lfm.samples,
-            seis_rms=train_dataset.seis_rms,
-            max_traces=cfg.wavelet_gain_num_traces,
-            candidate_trace_indices=train_dataset.valid_indices,
-            amplitude_threshold=cfg.wavelet_amplitude_threshold,
-        )
-        cfg.wavelet_gain = resolved_wavelet_gain
+    if cfg.dynamic_gain_model_file is None:
+        resolved_fixed_gain = cfg.fixed_gain
+        if resolved_fixed_gain is None:
+            resolved_fixed_gain = estimate_fixed_gain_depth(
+                seismic,
+                ai_lfm.volume,
+                vp_lfm.volume,
+                train_mask,
+                wavelet_time_s,
+                wavelet_amp,
+                depth_axis_m=ai_lfm.samples,
+                seis_rms=train_dataset.seis_rms,
+                max_traces=cfg.fixed_gain_num_traces,
+                candidate_trace_indices=train_dataset.valid_indices,
+                amplitude_threshold=cfg.wavelet_amplitude_threshold,
+            )
+            cfg.fixed_gain = resolved_fixed_gain
+    else:
+        resolved_fixed_gain = 1.0
+        logger.info("Using depth dynamic gain model; fixed gain is disabled.")
     if cfg.wavelet_source == "ricker_wavelet":
         logger.info(
-            "Generated %s wavelet: freq=%.1f Hz, dt=%.4f s, length=%d, gain=%.2f",
+            "Generated %s wavelet: freq=%.1f Hz, dt=%.4f s, length=%d, fixed_gain=%.2f",
             cfg.wavelet_type,
             cfg.wavelet_freq,
             cfg.wavelet_dt,
             cfg.wavelet_length,
-            float(resolved_wavelet_gain),
+            float(resolved_fixed_gain),
         )
-    wavelet_amp = (wavelet_amp * float(resolved_wavelet_gain)).astype(np.float32)
+    wavelet_amp = (wavelet_amp * float(resolved_fixed_gain)).astype(np.float32)
     wavelet_time_s = wavelet_time_s.astype(np.float32)
 
     return DatasetBundle(

@@ -26,6 +26,11 @@ from ginn.masking import build_eroded_loss_mask as _build_eroded_loss_mask
 from ginn.masking import build_residual_taper as _build_residual_taper
 from ginn.masking import get_valid_trace_indices as _get_valid_trace_indices
 from ginn.masking import select_spatial_validation_split as _select_spatial_validation_split
+from ginn.well_constraints import (
+    WellConstraintBundle,
+    load_well_constraints_npz,
+    validate_well_constraints,
+)
 from ginn_depth.config import DepthGINNConfig
 from ginn_depth.physics import DepthForwardModel
 
@@ -337,6 +342,7 @@ class DepthSeismicTraceDataset(Dataset):
         include_dynamic_gain_input: bool = False,
         normalization_stats: tuple[float, float] | None = None,
         dynamic_gain_median: float | None = None,
+        well_constraints: WellConstraintBundle | None = None,
     ) -> None:
         n_traces, n_sample = seismic_flat.shape
         assert ai_lfm_flat.shape == seismic_flat.shape
@@ -361,6 +367,18 @@ class DepthSeismicTraceDataset(Dataset):
         self._taper_flat = taper_flat
         self._dynamic_gain_flat = dynamic_gain_flat
         self._valid_indices = selected_indices
+        self._well_constraints = well_constraints
+        self._well_row_by_flat_index: dict[int, int] = {}
+        if self._well_constraints is not None:
+            validate_well_constraints(
+                self._well_constraints,
+                sample_domain="depth",
+                n_sample=n_sample,
+                n_traces=n_traces,
+            )
+            self._well_row_by_flat_index = {
+                int(flat_idx): row_idx for row_idx, flat_idx in enumerate(self._well_constraints.flat_indices)
+            }
         self._include_lfm_input = bool(include_lfm_input)
         self._include_mask_input = bool(include_mask_input)
         self._include_dynamic_gain_input = bool(include_dynamic_gain_input)
@@ -470,6 +488,21 @@ class DepthSeismicTraceDataset(Dataset):
         }
         if dynamic_gain is not None:
             item["dynamic_gain"] = torch.from_numpy(dynamic_gain[np.newaxis]).float()
+        well_row = self._well_row_by_flat_index.get(int(flat_idx))
+        if well_row is None or self._well_constraints is None:
+            item["well_log_ai_target"] = torch.zeros((1, seis.shape[0]), dtype=torch.float32)
+            item["well_ai_target"] = torch.zeros((1, seis.shape[0]), dtype=torch.float32)
+            item["well_mask"] = torch.zeros((1, seis.shape[0]), dtype=torch.bool)
+            item["well_weight"] = torch.zeros((1, seis.shape[0]), dtype=torch.float32)
+        else:
+            item["well_log_ai_target"] = torch.from_numpy(
+                self._well_constraints.well_log_ai_target[well_row][np.newaxis]
+            ).float()
+            item["well_ai_target"] = torch.from_numpy(
+                self._well_constraints.well_ai_target[well_row][np.newaxis]
+            ).float()
+            item["well_mask"] = torch.from_numpy(self._well_constraints.well_mask[well_row][np.newaxis]).bool()
+            item["well_weight"] = torch.from_numpy(self._well_constraints.well_weight[well_row][np.newaxis]).float()
         return item
 
 
@@ -575,6 +608,21 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
     inference_taper_flat = _build_residual_taper(inference_mask_flat, halo_samples=boundary_effect_samples)
     train_valid_indices = _get_valid_trace_indices(train_mask_flat)
     inference_valid_indices = _get_valid_trace_indices(inference_mask_flat)
+    well_constraints = None
+    if cfg.well_constraint_file is not None:
+        logger.info("Loading depth well constraints from %s...", cfg.well_constraint_file)
+        well_constraints = load_well_constraints_npz(cfg.well_constraint_file)
+        validate_well_constraints(
+            well_constraints,
+            sample_domain="depth",
+            n_sample=n_sample,
+            n_traces=n_il * n_xl,
+        )
+        logger.info(
+            "Loaded depth well constraints: wells=%d, valid_samples=%d",
+            well_constraints.n_wells,
+            int(well_constraints.well_mask.sum()),
+        )
     logger.info(
         "Preprocessed depth masks: train=%d traces, inference=%d traces, boundary_effect_samples=%d",
         train_valid_indices.size,
@@ -621,6 +669,7 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         include_lfm_input=cfg.include_lfm_input,
         include_mask_input=cfg.include_mask_input,
         include_dynamic_gain_input=cfg.include_dynamic_gain_input,
+        well_constraints=well_constraints,
     )
     train_norm_stats = (train_dataset.seis_rms, train_dataset.lfm_scale)
     val_dataset = None
@@ -634,6 +683,7 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
             include_dynamic_gain_input=cfg.include_dynamic_gain_input,
             normalization_stats=train_norm_stats,
             dynamic_gain_median=train_dataset.dynamic_gain_median,
+            well_constraints=well_constraints,
         )
     inference_dataset = DepthSeismicTraceDataset(
         *inference_shared,
@@ -644,6 +694,7 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         include_dynamic_gain_input=cfg.include_dynamic_gain_input,
         normalization_stats=train_norm_stats,
         dynamic_gain_median=train_dataset.dynamic_gain_median,
+        well_constraints=well_constraints,
     )
 
     if cfg.gain_source == "fixed_gain":

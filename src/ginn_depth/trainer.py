@@ -109,6 +109,7 @@ class Trainer:
                 self.train_dataset,
                 num_examples=cfg.synthetic_traces_per_epoch,
                 residual_max_abs=cfg.synthetic_residual_max_abs,
+                log_ai_highpass_samples=cfg.synthetic_log_ai_highpass_samples,
                 thin_bed_min_samples=cfg.synthetic_thin_bed_min_samples,
                 thin_bed_max_samples=cfg.synthetic_thin_bed_max_samples,
                 ai_min=cfg.ai_min,
@@ -125,7 +126,7 @@ class Trainer:
                 shuffle=True,
                 num_workers=cfg.num_workers,
                 pin_memory=cfg.pin_memory,
-                drop_last=True,
+                drop_last=False,
             )
             logger.info(
                 "Synthetic pretrain enabled: epochs=%d, traces/epoch=%d, batches/epoch=%d, velocity_mode=%s",

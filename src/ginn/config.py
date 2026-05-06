@@ -49,23 +49,23 @@ class GINNConfig:
     target_layer_outlier_min_neighbor_count: int = 2  # 孤立点判断所需最小十字邻域有效点数。
 
     # ── 低频模型 ──────────────────────────────────────────────
-    lfm_source: LfmSource = "lfm_precomputed_file"
-    lfm_precomputed_file: Path | None = Path("your_lfm_precomputed_file")
-    lfm_initial_inversion_file: Path | None = Path("your_lfm_initial_inversion_file")
+    lfm_source: LfmSource = "lfm_precomputed_file"  # 低频模型来源。
+    lfm_precomputed_file: Path | None = Path("your_lfm_precomputed_file")  # lfm_source=lfm_precomputed_file 时使用的预计算低频模型文件。
+    lfm_initial_inversion_file: Path | None = Path("your_lfm_initial_inversion_file")  # lfm_source=lfm_initial_inversion_file 时使用的初始反演结果文件。
     lfm_filter_dt: float = 0.001  # 从初始反演体低通生成 LFM 时的采样间隔（秒）。
     lfm_cutoff_hz: float = 10.0  # 生成 LFM 时的 Butterworth 低通截止频率（Hz）。
     lfm_filter_order: int = 6  # 生成 LFM 时的零相位滤波器阶数。
 
     # ── 子波 ──────────────────────────────────────────────────
-    wavelet_source: WaveletSource = "ricker_wavelet"
-    wavelet_file: Path | None = Path("your_precomputed_wavelet.csv")
+    wavelet_source: WaveletSource = "ricker_wavelet" # 子波来源。
+    wavelet_file: Path | None = Path("your_precomputed_wavelet.csv") # wavelet_source=precomputed_wavelet 时使用的预计算子波文件。
     wavelet_type: str = "ricker"  # 正演使用的子波类型。
     wavelet_freq: float = 25.0  # 子波主频（Hz）。
     wavelet_dt: float = 0.001  # 子波采样间隔（秒）。
     wavelet_length: int = 301  # 子波长度（采样点数，建议奇数）。
 
     # ── 振幅补偿 ──────────────────────────────────────────────
-    gain_source: GainSource = "fixed_gain"
+    gain_source: GainSource = "fixed_gain" # 振幅补偿增益来源。
     fixed_gain: float | None = None  # 固定标量增益；gain_source=fixed_gain 且为空时自动估计。
     fixed_gain_num_traces: int = 256  # 自动估计固定增益时采样的有效道数。
     dynamic_gain_model: Path | None = None  # gain_source=dynamic_gain_model 时使用的预计算动态增益模型。

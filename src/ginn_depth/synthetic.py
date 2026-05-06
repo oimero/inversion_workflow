@@ -97,8 +97,9 @@ class SyntheticDepthTraceDataset(Dataset):
         taper = item["taper_weight"].squeeze(0).numpy().astype(np.float32, copy=False)
 
         safe_lfm = np.maximum(lfm, 1e-6)
-        reflectivity = random_reflectivity(
+        reflectivity = random_reflectivity_in_taper(
             max(lfm.size - 1, 1),
+            taper=taper,
             max_abs=min(0.35, float(np.tanh(0.5 * self.residual_max_abs))),
             thin_bed_min_samples=self.thin_bed_min_samples,
             thin_bed_max_samples=self.thin_bed_max_samples,
@@ -123,7 +124,7 @@ class SyntheticDepthTraceDataset(Dataset):
 
         item["target_residual"] = torch.from_numpy(residual[np.newaxis]).float()
         item["target_ai"] = torch.from_numpy(target_ai[np.newaxis]).float()
-        item["target_reflectivity"] = torch.from_numpy(reflectivity[np.newaxis]).float()
+        item["raw_reflectivity"] = torch.from_numpy(reflectivity[np.newaxis]).float()
         item["velocity_raw"] = torch.from_numpy(target_vp[np.newaxis]).float()
         return item
 
@@ -188,6 +189,49 @@ def random_reflectivity(
     if not np.any(reflectivity):
         reflectivity[int(np.random.randint(0, n_interface))] = float(np.random.uniform(-max_abs, max_abs))
     return np.clip(reflectivity, -max_abs, max_abs).astype(np.float32, copy=False)
+
+
+def random_reflectivity_in_taper(
+    n_interface: int,
+    *,
+    taper: np.ndarray,
+    max_abs: float,
+    thin_bed_min_samples: int,
+    thin_bed_max_samples: int,
+) -> np.ndarray:
+    """Create reflectivity only at interfaces inside positive taper support."""
+    if n_interface <= 0:
+        raise ValueError(f"n_interface must be positive, got {n_interface}.")
+
+    taper_1d = np.asarray(taper, dtype=np.float32).reshape(-1)
+    if taper_1d.size == n_interface + 1:
+        active = (taper_1d[:-1] > 0.0) & (taper_1d[1:] > 0.0)
+    elif taper_1d.size == n_interface:
+        active = taper_1d > 0.0
+    else:
+        raise ValueError(
+            "taper sample count must match n_interface or n_interface + 1, "
+            f"got taper.size={taper_1d.size}, n_interface={n_interface}."
+        )
+
+    reflectivity = np.zeros((n_interface,), dtype=np.float32)
+    for start, stop in _true_runs(active):
+        reflectivity[start:stop] = random_reflectivity(
+            stop - start,
+            max_abs=max_abs,
+            thin_bed_min_samples=thin_bed_min_samples,
+            thin_bed_max_samples=thin_bed_max_samples,
+        )
+    return reflectivity
+
+
+def _true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    mask_1d = np.asarray(mask, dtype=bool).reshape(-1)
+    if mask_1d.size == 0 or not np.any(mask_1d):
+        return []
+    padded = np.concatenate(([False], mask_1d, [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return [(int(edges[i]), int(edges[i + 1])) for i in range(0, edges.size, 2)]
 
 
 def reflectivity_to_log_ai(reflectivity: np.ndarray, *, initial_log_ai: float = 0.0) -> np.ndarray:

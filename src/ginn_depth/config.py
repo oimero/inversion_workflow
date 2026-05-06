@@ -161,6 +161,8 @@ class DepthGINNConfig:
             )
         if self.gain_source == "dynamic_gain_model" and self.dynamic_gain_model is None:
             raise ValueError("dynamic_gain_model is required when gain_source='dynamic_gain_model'.")
+        if self.fixed_gain is not None and self.dynamic_gain_model is not None:
+            raise ValueError("fixed_gain and dynamic_gain_model are mutually exclusive.")
         if self.fixed_gain is not None and self.fixed_gain <= 0.0:
             raise ValueError(f"fixed_gain must be positive when provided, got {self.fixed_gain}.")
         if self.fixed_gain_num_traces <= 0:

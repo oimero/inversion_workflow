@@ -12,6 +12,7 @@ WaveletSource = Literal["precomputed_wavelet", "ricker_wavelet"]
 GainSource = Literal["fixed_gain", "dynamic_gain_model"]
 ValidationSplitMode = Literal["none", "spatial_block"]
 ValidationBlockAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"]
+SyntheticVelocityMode = Literal["lfm_vp", "from_ai_linear", "blend"]
 
 _PATH_FIELDS = {
     "seismic_file",
@@ -81,6 +82,21 @@ class DepthGINNConfig:
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
 
+    # ── 合成数据预训练 ────────────────────────────────────────
+    synthetic_pretrain_enabled: bool = False
+    synthetic_pretrain_epochs: int = 0
+    synthetic_traces_per_epoch: int = 8192
+    synthetic_residual_max_abs: float = 0.30
+    synthetic_thin_bed_min_samples: int = 1
+    synthetic_thin_bed_max_samples: int = 8
+    synthetic_velocity_mode: SyntheticVelocityMode = "lfm_vp"
+    synthetic_vp_ai_slope: float | None = None
+    synthetic_vp_ai_intercept: float | None = None
+    synthetic_vp_blend_alpha: float = 0.5
+    synthetic_vp_smooth_samples: int = 3
+    synthetic_lambda_residual: float = 1.0
+    synthetic_lambda_waveform: float = 0.2
+
     # ── 损失与物理约束 ────────────────────────────────────────
     lambda_l2: float = 0.03
     lambda_tv: float = 0.0
@@ -145,6 +161,58 @@ class DepthGINNConfig:
             raise ValueError(f"fixed_gain must be positive when provided, got {self.fixed_gain}.")
         if self.fixed_gain_num_traces <= 0:
             raise ValueError(f"fixed_gain_num_traces must be positive, got {self.fixed_gain_num_traces}.")
+        if self.synthetic_pretrain_epochs < 0:
+            raise ValueError(f"synthetic_pretrain_epochs must be non-negative, got {self.synthetic_pretrain_epochs}.")
+        if self.synthetic_traces_per_epoch <= 0:
+            raise ValueError(
+                f"synthetic_traces_per_epoch must be positive, got {self.synthetic_traces_per_epoch}."
+            )
+        if self.synthetic_residual_max_abs <= 0.0:
+            raise ValueError(
+                f"synthetic_residual_max_abs must be positive, got {self.synthetic_residual_max_abs}."
+            )
+        if self.synthetic_thin_bed_min_samples <= 0:
+            raise ValueError(
+                f"synthetic_thin_bed_min_samples must be positive, got {self.synthetic_thin_bed_min_samples}."
+            )
+        if self.synthetic_thin_bed_max_samples < self.synthetic_thin_bed_min_samples:
+            raise ValueError(
+                "synthetic_thin_bed_max_samples must be >= synthetic_thin_bed_min_samples, "
+                f"got {self.synthetic_thin_bed_max_samples} < {self.synthetic_thin_bed_min_samples}."
+            )
+        valid_synthetic_velocity_modes = {"lfm_vp", "from_ai_linear", "blend"}
+        if self.synthetic_velocity_mode not in valid_synthetic_velocity_modes:
+            raise ValueError(
+                f"Unsupported synthetic_velocity_mode={self.synthetic_velocity_mode!r}, "
+                f"expected one of {sorted(valid_synthetic_velocity_modes)}"
+            )
+        if self.synthetic_velocity_mode in {"from_ai_linear", "blend"}:
+            if self.synthetic_vp_ai_slope is None or self.synthetic_vp_ai_slope <= 0.0:
+                raise ValueError(
+                    "synthetic_vp_ai_slope must be positive when synthetic_velocity_mode "
+                    f"is {self.synthetic_velocity_mode!r}."
+                )
+            if self.synthetic_vp_ai_intercept is None:
+                raise ValueError(
+                    "synthetic_vp_ai_intercept is required when synthetic_velocity_mode "
+                    f"is {self.synthetic_velocity_mode!r}."
+                )
+        if not 0.0 <= self.synthetic_vp_blend_alpha <= 1.0:
+            raise ValueError(
+                f"synthetic_vp_blend_alpha must be within [0, 1], got {self.synthetic_vp_blend_alpha}."
+            )
+        if self.synthetic_vp_smooth_samples < 1:
+            raise ValueError(
+                f"synthetic_vp_smooth_samples must be >= 1, got {self.synthetic_vp_smooth_samples}."
+            )
+        if self.synthetic_lambda_residual < 0.0:
+            raise ValueError(
+                f"synthetic_lambda_residual must be non-negative, got {self.synthetic_lambda_residual}."
+            )
+        if self.synthetic_lambda_waveform < 0.0:
+            raise ValueError(
+                f"synthetic_lambda_waveform must be non-negative, got {self.synthetic_lambda_waveform}."
+            )
         if self.wavelet_freq <= 0.0:
             raise ValueError(f"wavelet_freq must be positive, got {self.wavelet_freq}.")
         if self.wavelet_dt <= 0.0:

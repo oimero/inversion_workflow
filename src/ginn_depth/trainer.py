@@ -11,8 +11,10 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from ginn.data import DYNAMIC_GAIN_LOG_CLIP
 from ginn.trainer import (
     append_metrics_csv,
     build_common_run_summary,
@@ -26,6 +28,7 @@ from ginn_depth.data import build_dataset
 from ginn_depth.loss import GINNLoss
 from ginn_depth.model import DilatedResNet1D
 from ginn_depth.physics import DepthForwardModel
+from ginn_depth.synthetic import SyntheticDepthTraceDataset
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,37 @@ class Trainer:
             T_max=cfg.epochs,
             eta_min=cfg.lr * 0.01,
         )
+        self.synthetic_dataloader = None
+        if cfg.synthetic_pretrain_enabled and cfg.synthetic_pretrain_epochs > 0:
+            synthetic_dataset = SyntheticDepthTraceDataset(
+                self.train_dataset,
+                num_examples=cfg.synthetic_traces_per_epoch,
+                residual_max_abs=cfg.synthetic_residual_max_abs,
+                thin_bed_min_samples=cfg.synthetic_thin_bed_min_samples,
+                thin_bed_max_samples=cfg.synthetic_thin_bed_max_samples,
+                ai_min=cfg.ai_min,
+                ai_max=cfg.ai_max,
+                velocity_mode=cfg.synthetic_velocity_mode,
+                vp_ai_slope=cfg.synthetic_vp_ai_slope,
+                vp_ai_intercept=cfg.synthetic_vp_ai_intercept,
+                vp_blend_alpha=cfg.synthetic_vp_blend_alpha,
+                vp_smooth_samples=cfg.synthetic_vp_smooth_samples,
+            )
+            self.synthetic_dataloader = DataLoader(
+                synthetic_dataset,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                num_workers=cfg.num_workers,
+                pin_memory=cfg.pin_memory,
+                drop_last=True,
+            )
+            logger.info(
+                "Synthetic pretrain enabled: epochs=%d, traces/epoch=%d, batches/epoch=%d, velocity_mode=%s",
+                cfg.synthetic_pretrain_epochs,
+                cfg.synthetic_traces_per_epoch,
+                len(self.synthetic_dataloader),
+                cfg.synthetic_velocity_mode,
+            )
 
         cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_path = cfg.checkpoint_dir / "metrics.csv"
@@ -166,6 +200,14 @@ class Trainer:
                     "ai_lfm_file": self.cfg.ai_lfm_file,
                     "vp_lfm_file": self.cfg.vp_lfm_file,
                 },
+                "synthetic_pretrain": {
+                    "enabled": self.cfg.synthetic_pretrain_enabled,
+                    "epochs": self.cfg.synthetic_pretrain_epochs,
+                    "traces_per_epoch": self.cfg.synthetic_traces_per_epoch,
+                    "velocity_mode": self.cfg.synthetic_velocity_mode,
+                    "lambda_residual": self.cfg.synthetic_lambda_residual,
+                    "lambda_waveform": self.cfg.synthetic_lambda_waveform,
+                },
             },
         )
         write_json(self.run_summary_path, summary)
@@ -186,6 +228,125 @@ class Trainer:
             residual = residual * taper_weight.to(dtype=residual.dtype)
         ai = safe_lfm * torch.exp(residual)
         return ai, residual
+
+    def _compose_synthetic_input(
+        self,
+        seismic_norm: torch.Tensor,
+        lfm_raw: torch.Tensor,
+        core_mask: torch.Tensor,
+        dynamic_gain: torch.Tensor | None,
+    ) -> torch.Tensor:
+        channels = [seismic_norm.squeeze(1)]
+        if self.cfg.include_lfm_input:
+            channels.append((lfm_raw / float(self.train_dataset.lfm_scale)).squeeze(1))
+        if self.cfg.include_mask_input:
+            channels.append(core_mask.float().squeeze(1))
+        if self.cfg.include_dynamic_gain_input:
+            if dynamic_gain is None:
+                channels.append(torch.zeros_like(seismic_norm.squeeze(1)))
+            else:
+                median = self.train_dataset.dynamic_gain_median
+                if median is None or median <= 0.0:
+                    median = 1.0
+                gain_input = torch.log(torch.clamp(dynamic_gain, min=1e-6) / float(median)).clamp(
+                    -DYNAMIC_GAIN_LOG_CLIP,
+                    DYNAMIC_GAIN_LOG_CLIP,
+                )
+                channels.append(gain_input.squeeze(1))
+        return torch.stack(channels, dim=1).float()
+
+    def _run_synthetic_pretrain_epoch(self, dataloader: DataLoader) -> dict[str, float]:
+        self.model.train(True)
+        total_loss = 0.0
+        total_residual = 0.0
+        total_waveform = 0.0
+        total_pred_residual = 0.0
+        n_batches = 0
+
+        for batch_idx, batch in enumerate(dataloader):
+            core_mask = batch["mask"].to(self.device)
+            loss_mask = batch["loss_mask"].to(self.device)
+            taper_weight = batch["taper_weight"].to(self.device)
+            lfm_raw = batch["lfm_raw"].to(self.device)
+            velocity_raw = batch["velocity_raw"].to(self.device)
+            target_ai = batch["target_ai"].to(self.device)
+            target_residual = batch["target_residual"].to(self.device)
+            dynamic_gain = batch.get("dynamic_gain")
+            if dynamic_gain is not None:
+                dynamic_gain = dynamic_gain.to(self.device)
+
+            with torch.no_grad():
+                target_seismic = self.forward_model(target_ai, velocity_raw, gain=dynamic_gain)
+                x = self._compose_synthetic_input(target_seismic, lfm_raw, core_mask, dynamic_gain)
+
+            ai, residual = self._compose_impedance(x, lfm_raw, taper_weight)
+            pred_seismic = self.forward_model(ai, velocity_raw, gain=dynamic_gain)
+
+            residual_mask_f = core_mask.float()
+            waveform_mask_f = loss_mask.float()
+            n_residual = residual_mask_f.sum().clamp(min=1.0)
+            n_waveform = waveform_mask_f.sum().clamp(min=1.0)
+            residual_loss = (
+                F.smooth_l1_loss(residual, target_residual, reduction="none") * residual_mask_f
+            ).sum() / n_residual
+            waveform_loss = ((pred_seismic - target_seismic).abs() * waveform_mask_f).sum() / n_waveform
+            loss = self.cfg.synthetic_lambda_residual * residual_loss + self.cfg.synthetic_lambda_waveform * waveform_loss
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+            self.optimizer.step()
+            self.global_step += 1
+
+            total_loss += float(loss.item())
+            total_residual += float(residual_loss.item())
+            total_waveform += float(waveform_loss.item())
+            total_pred_residual += float(residual.abs().mean().item())
+            n_batches += 1
+
+            if (batch_idx + 1) % self.cfg.log_interval == 0:
+                logger.info(
+                    "  [Synthetic | Batch %d/%d] loss=%.6f residual=%.6f waveform=%.6f pred_res=%.3e",
+                    batch_idx + 1,
+                    len(dataloader),
+                    float(loss.item()),
+                    float(residual_loss.item()),
+                    float(waveform_loss.item()),
+                    float(residual.abs().mean().item()),
+                )
+
+        n_batches = max(n_batches, 1)
+        return {
+            "loss": total_loss / n_batches,
+            "residual": total_residual / n_batches,
+            "waveform": total_waveform / n_batches,
+            "pred_residual_mean": total_pred_residual / n_batches,
+        }
+
+    def _pretrain_synthetic(self) -> None:
+        if self.synthetic_dataloader is None:
+            return
+        logger.info("=" * 60)
+        logger.info(
+            "Start synthetic depth pretrain: %d epochs, batch_size=%d",
+            self.cfg.synthetic_pretrain_epochs,
+            self.cfg.batch_size,
+        )
+        logger.info("=" * 60)
+        for epoch in range(self.cfg.synthetic_pretrain_epochs):
+            start = time.time()
+            metrics = self._run_synthetic_pretrain_epoch(self.synthetic_dataloader)
+            logger.info(
+                "Synthetic epoch %d/%d  loss=%.6f residual=%.6f waveform=%.6f pred_res=%.3e  time=%.1fs",
+                epoch + 1,
+                self.cfg.synthetic_pretrain_epochs,
+                metrics["loss"],
+                metrics["residual"],
+                metrics["waveform"],
+                metrics["pred_residual_mean"],
+                time.time() - start,
+            )
+        self.save_checkpoint("synthetic_pretrained.pt")
 
     def _run_epoch(self, dataloader: DataLoader, *, training: bool) -> dict[str, float]:
         self.model.train(training)
@@ -300,6 +461,8 @@ class Trainer:
         return path
 
     def train(self) -> None:
+        self._pretrain_synthetic()
+
         logger.info("=" * 60)
         logger.info("Start depth GINN training: %d epochs, batch_size=%d", self.cfg.epochs, self.cfg.batch_size)
         logger.info("=" * 60)

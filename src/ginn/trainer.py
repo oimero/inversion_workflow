@@ -27,10 +27,21 @@ from ginn.physics import ForwardModel
 logger = logging.getLogger(__name__)
 
 METRICS_FIELDNAMES = [
+    "phase",
     "epoch",
     "global_step",
     "lr",
     "epoch_time_s",
+    "synthetic_loss",
+    "synthetic_waveform_mae",
+    "synthetic_residual_lowpass",
+    "synthetic_spectrum",
+    "synthetic_rms",
+    "synthetic_waveform_term",
+    "synthetic_residual_lowpass_term",
+    "synthetic_spectrum_term",
+    "synthetic_rms_term",
+    "synthetic_residual_mean",
     "train_loss",
     "train_waveform_mae",
     "train_residual_l2",

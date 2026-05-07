@@ -1,5 +1,5 @@
-"""ginn_depth.loss — reuse the existing masked waveform/regularization loss."""
+"""ginn_depth.loss — reuse common GINN loss implementations."""
 
-from ginn.loss import GINNLoss
+from ginn.loss import GINNLoss, ResolutionPretrainLoss
 
-__all__ = ["GINNLoss"]
+__all__ = ["GINNLoss", "ResolutionPretrainLoss"]

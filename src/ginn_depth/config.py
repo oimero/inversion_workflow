@@ -91,6 +91,25 @@ class DepthGINNConfig:
     zero_residual_outside_mask: bool = True
     boundary_effect_samples: int | None = None
 
+    # ── 井先验 synthetic 预训练 ────────────────────────────────
+    synthetic_pretrain_enabled: bool = False
+    synthetic_pretrain_epochs: int = 0
+    synthetic_traces_per_epoch: int = 0
+    synthetic_batch_size: int | None = None
+    synthetic_patch_fraction: float = 0.7
+    synthetic_unresolved_fraction: float = 0.3
+    synthetic_cluster_min_events: int = 2
+    synthetic_cluster_max_events: int = 5
+    synthetic_cluster_main_lobe_samples: int | None = None
+    synthetic_residual_highpass_samples: int = 31
+    synthetic_seismic_rms_match: bool = True
+    synthetic_seismic_rms_target: float = 1.0
+    synthetic_lambda_waveform: float = 1.0
+    synthetic_lambda_residual_lowpass: float = 0.2
+    synthetic_lambda_spectrum: float = 0.05
+    synthetic_lambda_rms: float = 0.05
+    synthetic_residual_lowpass_samples: int = 17
+
     # ── 验证与早停 ────────────────────────────────────────────
     validation_split_mode: ValidationSplitMode = "spatial_block"
     validation_fraction: float = 0.10
@@ -184,6 +203,43 @@ class DepthGINNConfig:
             raise ValueError(f"ai_max must be greater than ai_min, got ai_min={self.ai_min}, ai_max={self.ai_max}.")
         if self.boundary_effect_samples is not None and self.boundary_effect_samples < 0:
             raise ValueError(f"boundary_effect_samples must be non-negative, got {self.boundary_effect_samples}.")
+        if self.synthetic_pretrain_enabled:
+            if self.resolution_prior_file is None:
+                raise ValueError("resolution_prior_file is required when synthetic_pretrain_enabled=True.")
+            if self.synthetic_pretrain_epochs <= 0:
+                raise ValueError("synthetic_pretrain_epochs must be positive when synthetic pretrain is enabled.")
+            if self.synthetic_traces_per_epoch <= 0:
+                raise ValueError("synthetic_traces_per_epoch must be positive when synthetic pretrain is enabled.")
+        elif self.synthetic_pretrain_epochs < 0:
+            raise ValueError(f"synthetic_pretrain_epochs must be non-negative, got {self.synthetic_pretrain_epochs}.")
+        elif self.synthetic_traces_per_epoch < 0:
+            raise ValueError(f"synthetic_traces_per_epoch must be non-negative, got {self.synthetic_traces_per_epoch}.")
+        if self.synthetic_batch_size is not None and self.synthetic_batch_size <= 0:
+            raise ValueError(f"synthetic_batch_size must be positive when provided, got {self.synthetic_batch_size}.")
+        if self.synthetic_patch_fraction < 0.0 or self.synthetic_unresolved_fraction < 0.0:
+            raise ValueError("synthetic_patch_fraction and synthetic_unresolved_fraction must be non-negative.")
+        if self.synthetic_patch_fraction + self.synthetic_unresolved_fraction <= 0.0:
+            raise ValueError("synthetic patch/unresolved fractions must have a positive sum.")
+        if self.synthetic_cluster_min_events < 1:
+            raise ValueError("synthetic_cluster_min_events must be >= 1.")
+        if self.synthetic_cluster_max_events < self.synthetic_cluster_min_events:
+            raise ValueError("synthetic_cluster_max_events must be >= synthetic_cluster_min_events.")
+        if self.synthetic_cluster_main_lobe_samples is not None and self.synthetic_cluster_main_lobe_samples < 1:
+            raise ValueError("synthetic_cluster_main_lobe_samples must be positive when provided.")
+        if self.synthetic_residual_highpass_samples < 3:
+            raise ValueError("synthetic_residual_highpass_samples must be >= 3.")
+        if self.synthetic_seismic_rms_target <= 0.0:
+            raise ValueError("synthetic_seismic_rms_target must be positive.")
+        for field_name in (
+            "synthetic_lambda_waveform",
+            "synthetic_lambda_residual_lowpass",
+            "synthetic_lambda_spectrum",
+            "synthetic_lambda_rms",
+        ):
+            if getattr(self, field_name) < 0.0:
+                raise ValueError(f"{field_name} must be non-negative, got {getattr(self, field_name)}.")
+        if self.synthetic_residual_lowpass_samples < 1:
+            raise ValueError("synthetic_residual_lowpass_samples must be >= 1.")
         if not 0.0 <= self.validation_fraction < 1.0:
             raise ValueError(f"validation_fraction must be within [0, 1), got {self.validation_fraction}.")
         if self.validation_gap_traces < 0:

@@ -95,6 +95,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override synthetic_cluster_amp_abs_p99_max for this QC run.",
     )
+    parser.add_argument(
+        "--unresolved-oversample-factor",
+        type=int,
+        default=None,
+        help="Override synthetic_unresolved_oversample_factor for this QC run.",
+    )
     return parser.parse_args()
 
 
@@ -191,6 +197,7 @@ def local_window(center: int, n_sample: int, half_width: int) -> slice:
 
 
 def sample_metrics(sample: dict[str, torch.Tensor], *, main_lobe_samples: int, residual_clip_abs: float) -> dict[str, Any]:
+    mode = "well_patch" if int(sample["synthetic_mode"].item()) == 0 else "unresolved_cluster"
     loss_mask = to_numpy_1d(sample["loss_mask"]).astype(bool)
     taper = to_numpy_1d(sample["taper_weight"]).astype(np.float64)
     real = finite_values(to_numpy_1d(sample["obs"]), loss_mask)
@@ -221,17 +228,31 @@ def sample_metrics(sample: dict[str, torch.Tensor], *, main_lobe_samples: int, r
     refl_win = reflectivity_full[win.start : refl_stop]
     seismic_full = to_numpy_1d(sample["target_seismic"]).astype(np.float64)
 
-    residual_peak_count = count_abs_peaks(residual_full[win], 0.30)
-    reflectivity_peak_count = count_abs_peaks(refl_win, 0.30)
+    residual_detail = residual_full[win]
+    reflectivity_detail = refl_win
+    detail_width_scale = 1.0
+    if mode == "unresolved_cluster" and "target_residual_highres" in sample and "raw_reflectivity_highres" in sample:
+        highres_residual = to_numpy_1d(sample["target_residual_highres"]).astype(np.float64)
+        highres_reflectivity = to_numpy_1d(sample["raw_reflectivity_highres"]).astype(np.float64)
+        factor = max(1, int(round((highres_residual.size - 1) / max(residual_full.size - 1, 1))))
+        highres_center = min(highres_residual.size - 1, max(0, center * factor))
+        highres_win = local_window(highres_center, highres_residual.size, half * factor)
+        highres_refl_stop = min(highres_win.stop, highres_reflectivity.size)
+        residual_detail = highres_residual[highres_win]
+        reflectivity_detail = highres_reflectivity[highres_win.start : highres_refl_stop]
+        detail_width_scale = float(factor)
+
+    residual_peak_count = count_abs_peaks(residual_detail, 0.30)
+    reflectivity_peak_count = count_abs_peaks(reflectivity_detail, 0.30)
     seismic_peak_count = count_abs_peaks(seismic_full[win], 0.50)
-    residual_width = width_above_fraction(residual_full[win], 0.50)
+    residual_width = int(round(width_above_fraction(residual_detail, 0.50) / detail_width_scale))
     seismic_width = width_above_fraction(seismic_full[win], 0.50)
 
     ai_min = float(np.nanmin(ai)) if ai.size else float("nan")
     ai_max = float(np.nanmax(ai)) if ai.size else float("nan")
 
     return {
-        "mode": "well_patch" if int(sample["synthetic_mode"].item()) == 0 else "unresolved_cluster",
+        "mode": mode,
         "real_rms": real_rms,
         "synthetic_rms": synthetic_rms,
         "synthetic_raw_rms": synthetic_raw_rms,
@@ -339,18 +360,20 @@ def add_quality_flags(summary: dict[str, Any], *, requested_patch_fraction: floa
     if cluster:
         detail_ratio = cluster["dominant_window_detail_to_seismic_peak_ratio"]["p50"]
         residual_peaks = cluster["dominant_window_residual_peak_count"]["p50"]
-        if detail_ratio is not None and residual_peaks is not None and residual_peaks >= 2.0 and detail_ratio >= 1.5:
+        reflectivity_peaks = cluster["dominant_window_reflectivity_peak_count"]["p50"]
+        detail_peaks = max(float(residual_peaks or 0.0), float(reflectivity_peaks or 0.0))
+        if detail_ratio is not None and detail_peaks >= 2.0 and detail_ratio >= 1.5:
             flag(
                 "OK",
                 "unresolved_cluster",
-                f"cluster median residual peaks={residual_peaks:.1f}, detail/seismic peak ratio={detail_ratio:.2f}.",
+                f"cluster median detail peaks={detail_peaks:.1f}, detail/seismic peak ratio={detail_ratio:.2f}.",
             )
         else:
             flag(
                 "WARN",
                 "unresolved_cluster",
                 "cluster samples may not clearly show many details per seismic peak "
-                f"(median residual peaks={residual_peaks}, detail/seismic peak ratio={detail_ratio}).",
+                f"(median residual peaks={residual_peaks}, reflectivity peaks={reflectivity_peaks}, detail/seismic peak ratio={detail_ratio}).",
             )
 
     attempts_p95 = all_stats["resample_attempts"]["p95"]
@@ -491,6 +514,8 @@ def main() -> None:
         cfg.synthetic_cluster_amp_abs_p95_min = float(args.cluster_amp_abs_p95_min)
     if args.cluster_amp_abs_p99_max is not None:
         cfg.synthetic_cluster_amp_abs_p99_max = float(args.cluster_amp_abs_p99_max)
+    if args.unresolved_oversample_factor is not None:
+        cfg.synthetic_unresolved_oversample_factor = int(args.unresolved_oversample_factor)
     if cfg.resolution_prior_file is None:
         raise ValueError("resolution_prior_file is required for synthetic QC.")
 
@@ -540,6 +565,7 @@ def main() -> None:
         cluster_amp_abs_p95_min=cfg.synthetic_cluster_amp_abs_p95_min,
         cluster_amp_abs_p99_max=cfg.synthetic_cluster_amp_abs_p99_max,
         cluster_main_lobe_samples=cfg.synthetic_cluster_main_lobe_samples,
+        unresolved_oversample_factor=cfg.synthetic_unresolved_oversample_factor,
         residual_highpass_samples=cfg.synthetic_residual_highpass_samples,
         seismic_rms_match=cfg.synthetic_seismic_rms_match,
         seismic_rms_target=cfg.synthetic_seismic_rms_target,
@@ -576,6 +602,7 @@ def main() -> None:
         "synthetic_cluster_amp_abs_p95_min": cfg.synthetic_cluster_amp_abs_p95_min,
         "synthetic_cluster_amp_abs_p99_max": cfg.synthetic_cluster_amp_abs_p99_max,
         "synthetic_cluster_main_lobe_samples": cfg.synthetic_cluster_main_lobe_samples,
+        "synthetic_unresolved_oversample_factor": cfg.synthetic_unresolved_oversample_factor,
         "synthetic_residual_highpass_samples": cfg.synthetic_residual_highpass_samples,
         "synthetic_seismic_rms_match": cfg.synthetic_seismic_rms_match,
         "synthetic_seismic_rms_target": cfg.synthetic_seismic_rms_target,

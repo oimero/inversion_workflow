@@ -150,6 +150,7 @@ class DepthGINNConfig:
     synthetic_cluster_amp_abs_p95_min: float = 0.45  # cluster 事件幅度下界系数：乘井 prior abs_p95。
     synthetic_cluster_amp_abs_p99_max: float = 1.00  # cluster 事件幅度上界系数：乘井 prior abs_p99。
     synthetic_cluster_main_lobe_samples: int | None = None  # cluster 窗口宽度；建议接近子波主瓣采样点数。
+    synthetic_unresolved_oversample_factor: int = 6  # unresolved 内部薄互层正演采样倍率；越大越能表达一波多层。
     synthetic_residual_highpass_samples: int = 31  # synthetic residual 高通窗口；越大保留越宽的 residual 结构。
     synthetic_seismic_rms_match: bool = True  # 是否用 synthetic dynamic gain 扰动匹配目标 RMS。
     synthetic_seismic_rms_target: float = 1.0  # RMS matching 的目标 normalized seismic RMS。
@@ -292,6 +293,8 @@ class DepthGINNConfig:
             raise ValueError("synthetic_cluster_amp_abs_p99_max must be >= synthetic_cluster_amp_abs_p95_min.")
         if self.synthetic_cluster_main_lobe_samples is not None and self.synthetic_cluster_main_lobe_samples < 1:
             raise ValueError("synthetic_cluster_main_lobe_samples must be positive when provided.")
+        if self.synthetic_unresolved_oversample_factor < 1:
+            raise ValueError("synthetic_unresolved_oversample_factor must be >= 1.")
         if self.synthetic_residual_highpass_samples < 3:
             raise ValueError("synthetic_residual_highpass_samples must be >= 3.")
         if self.synthetic_seismic_rms_target <= 0.0:

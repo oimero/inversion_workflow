@@ -162,8 +162,12 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         ai_max: float,
         patch_fraction: float = 0.70,
         unresolved_fraction: float = 0.30,
+        well_patch_scale_min: float = 0.35,
+        well_patch_scale_max: float = 0.80,
         cluster_min_events: int = 2,
         cluster_max_events: int = 5,
+        cluster_amp_abs_p95_min: float = 0.45,
+        cluster_amp_abs_p99_max: float = 1.00,
         cluster_main_lobe_samples: int | None = None,
         default_main_lobe_samples: int = 12,
         residual_max_abs: float | None = None,
@@ -172,6 +176,11 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         seismic_rms_target: float = 1.0,
         seismic_rms_scale_min: float = 0.5,
         seismic_rms_scale_max: float = 2.0,
+        quality_gate_enabled: bool = True,
+        max_residual_near_clip_fraction: float | None = 0.02,
+        max_seismic_rms_ratio: float | None = 2.0,
+        max_seismic_abs_p99_ratio: float | None = 2.5,
+        max_resample_attempts: int = 8,
         velocity_mode: SyntheticVelocityMode = "lfm_vp",
         vp_ai_slope: float | None = None,
         vp_ai_intercept: float | None = None,
@@ -183,8 +192,12 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         validate_ai_bounds(ai_min, ai_max)
         if patch_fraction < 0.0 or unresolved_fraction < 0.0 or patch_fraction + unresolved_fraction <= 0.0:
             raise ValueError("patch_fraction and unresolved_fraction must be non-negative with positive sum.")
+        if well_patch_scale_min < 0.0 or well_patch_scale_max < well_patch_scale_min:
+            raise ValueError("well patch scale bounds are invalid.")
         if cluster_min_events < 1 or cluster_max_events < cluster_min_events:
             raise ValueError("cluster event bounds are invalid.")
+        if cluster_amp_abs_p95_min < 0.0 or cluster_amp_abs_p99_max < cluster_amp_abs_p95_min:
+            raise ValueError("cluster amplitude factors are invalid.")
         if default_main_lobe_samples < 1:
             raise ValueError("default_main_lobe_samples must be positive.")
         if residual_highpass_samples < 3:
@@ -193,6 +206,15 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             raise ValueError("seismic_rms_target must be positive.")
         if seismic_rms_scale_min <= 0.0 or seismic_rms_scale_max < seismic_rms_scale_min:
             raise ValueError("seismic RMS scale bounds are invalid.")
+        if max_resample_attempts < 1:
+            raise ValueError("max_resample_attempts must be >= 1.")
+        for name, value in {
+            "max_residual_near_clip_fraction": max_residual_near_clip_fraction,
+            "max_seismic_rms_ratio": max_seismic_rms_ratio,
+            "max_seismic_abs_p99_ratio": max_seismic_abs_p99_ratio,
+        }.items():
+            if value is not None and value <= 0.0:
+                raise ValueError(f"{name} must be positive when provided.")
         _validate_velocity_mode(velocity_mode, vp_ai_slope, vp_ai_intercept, vp_blend_alpha, vp_smooth_samples)
 
         self.base_dataset = base_dataset
@@ -203,8 +225,12 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         self.ai_max = float(ai_max)
         self.patch_fraction = float(patch_fraction)
         self.unresolved_fraction = float(unresolved_fraction)
+        self.well_patch_scale_min = float(well_patch_scale_min)
+        self.well_patch_scale_max = float(well_patch_scale_max)
         self.cluster_min_events = int(cluster_min_events)
         self.cluster_max_events = int(cluster_max_events)
+        self.cluster_amp_abs_p95_min = float(cluster_amp_abs_p95_min)
+        self.cluster_amp_abs_p99_max = float(cluster_amp_abs_p99_max)
         self.cluster_main_lobe_samples = int(
             cluster_main_lobe_samples if cluster_main_lobe_samples is not None else default_main_lobe_samples
         )
@@ -213,6 +239,11 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         self.seismic_rms_target = float(seismic_rms_target)
         self.seismic_rms_scale_min = float(seismic_rms_scale_min)
         self.seismic_rms_scale_max = float(seismic_rms_scale_max)
+        self.quality_gate_enabled = bool(quality_gate_enabled)
+        self.max_residual_near_clip_fraction = max_residual_near_clip_fraction
+        self.max_seismic_rms_ratio = max_seismic_rms_ratio
+        self.max_seismic_abs_p99_ratio = max_seismic_abs_p99_ratio
+        self.max_resample_attempts = int(max_resample_attempts)
         self.velocity_mode = velocity_mode
         self.vp_ai_slope = vp_ai_slope
         self.vp_ai_intercept = vp_ai_intercept
@@ -238,6 +269,15 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         return self.num_examples
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        for attempt in range(self.max_resample_attempts):
+            item = self._sample_item(idx)
+            if not self.quality_gate_enabled or self._passes_quality_gate(item):
+                item["synthetic_resample_attempts"] = torch.tensor(attempt + 1, dtype=torch.int64)
+                return item
+        item["synthetic_resample_attempts"] = torch.tensor(self.max_resample_attempts, dtype=torch.int64)
+        return item
+
+    def _sample_item(self, idx: int) -> dict[str, torch.Tensor]:
         del idx
         base_idx = int(np.random.randint(0, len(self.base_dataset)))
         item = dict(self.base_dataset[base_idx])
@@ -289,6 +329,8 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             item.get("dynamic_gain"),
             loss_mask,
         )
+        if "dynamic_gain" in item and float(rms_scale) != 1.0:
+            item["dynamic_gain"] = item["dynamic_gain"] * float(rms_scale)
         reflectivity = ai_to_reflectivity(target_ai)
 
         item["target_residual"] = torch.from_numpy(residual[np.newaxis]).float()
@@ -302,6 +344,37 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         item["mask"] = torch.from_numpy(core_mask[np.newaxis]).bool()
         item["loss_mask"] = torch.from_numpy(loss_mask[np.newaxis]).bool()
         return item
+
+    def _passes_quality_gate(self, item: dict[str, torch.Tensor]) -> bool:
+        loss_mask = item["loss_mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
+        residual = item["target_residual"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+        target_seismic = item["target_seismic"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+        source_seismic = item["obs"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+
+        valid = loss_mask & np.isfinite(residual) & np.isfinite(target_seismic) & np.isfinite(source_seismic)
+        if not np.any(valid):
+            return False
+
+        if self.max_residual_near_clip_fraction is not None:
+            near_clip = float(np.mean(np.abs(residual[valid]) >= 0.98 * self.residual_max_abs))
+            if near_clip > float(self.max_residual_near_clip_fraction):
+                return False
+
+        if self.max_seismic_rms_ratio is not None:
+            source_rms = _rms(source_seismic[valid])
+            target_rms = _rms(target_seismic[valid])
+            if source_rms > 0.0 and np.isfinite(source_rms):
+                if target_rms / source_rms > float(self.max_seismic_rms_ratio):
+                    return False
+
+        if self.max_seismic_abs_p99_ratio is not None:
+            source_p99 = _abs_percentile(source_seismic[valid], 99.0)
+            target_p99 = _abs_percentile(target_seismic[valid], 99.0)
+            if source_p99 > 0.0 and np.isfinite(source_p99):
+                if target_p99 / source_p99 > float(self.max_seismic_abs_p99_ratio):
+                    return False
+
+        return True
 
     def _sample_mode(self) -> WellGuidedMode:
         p_patch = self.patch_fraction / (self.patch_fraction + self.unresolved_fraction)
@@ -331,7 +404,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         dst0 = int(np.random.randint(dst_start, dst_stop - length + 1))
         patch = well_residual[src0 : src0 + length].astype(np.float32, copy=True)
         patch -= float(np.mean(patch))
-        patch *= float(np.random.uniform(0.8, 1.2))
+        patch *= float(np.random.uniform(self.well_patch_scale_min, self.well_patch_scale_max))
         patch = np.clip(patch, -self.residual_max_abs, self.residual_max_abs)
         residual[dst0 : dst0 + length] = patch * edge_taper(length)
         return residual
@@ -349,7 +422,9 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             width = max(1, min(self.cluster_main_lobe_samples, n_sample))
             n_events = int(np.random.randint(self.cluster_min_events, self.cluster_max_events + 1))
             offsets = np.random.randint(-(width // 2), width // 2 + 1, size=n_events)
-            amp_scale = float(np.random.uniform(0.45 * self.residual_abs_p95, self.residual_abs_p99))
+            amp_min = self.cluster_amp_abs_p95_min * self.residual_abs_p95
+            amp_max = self.cluster_amp_abs_p99_max * self.residual_abs_p99
+            amp_scale = float(np.random.uniform(amp_min, max(amp_min, amp_max)))
             signs = np.random.choice([-1.0, 1.0], size=n_events)
             for offset, sign in zip(offsets, signs):
                 pos = center + int(offset)
@@ -373,7 +448,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             seismic = self.forward_model(ai_tensor, vp_tensor, gain=gain_tensor)
         raw = seismic.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32)
         scale = 1.0
-        if self.seismic_rms_match:
+        if self.seismic_rms_match and dynamic_gain is not None:
             valid = np.asarray(loss_mask, dtype=bool) & np.isfinite(raw)
             rms = float(np.sqrt(np.mean(raw[valid] ** 2))) if np.any(valid) else 0.0
             if rms > 0.0 and np.isfinite(rms):
@@ -425,6 +500,22 @@ def _estimate_velocity_clip(base_dataset: _BaseDepthDataset) -> tuple[float, flo
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
         return 500.0, 8000.0
     return float(max(lo, 1.0)), float(hi)
+
+
+def _rms(values: np.ndarray) -> float:
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(values * values)))
+
+
+def _abs_percentile(values: np.ndarray, percentile: float) -> float:
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return 0.0
+    return float(np.percentile(np.abs(values), percentile))
 
 
 def _valid_prior_rows(prior: WellResolutionPriorBundle) -> list[int]:

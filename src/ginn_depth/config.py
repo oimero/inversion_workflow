@@ -198,8 +198,6 @@ class DepthGINNConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "DepthGINNConfig":
         normalized = dict(data)
-        if "well_constraint_file" in normalized:
-            normalized.setdefault("resolution_prior_file", normalized.pop("well_constraint_file"))
         optional_path_fields = {"wavelet_file", "dynamic_gain_model", "resolution_prior_file"}
         for field_name in _PATH_FIELDS:
             if field_name not in normalized or normalized[field_name] is None:

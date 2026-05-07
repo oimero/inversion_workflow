@@ -1,4 +1,4 @@
-"""Well-guided resolution-prior schema and loader utilities."""
+"""Enhancement-prior schema and reusable synthetic trace utilities."""
 
 from __future__ import annotations
 
@@ -216,6 +216,183 @@ def summarize_well_resolution_prior(
     return summary
 
 
+def random_reflectivity(
+    n_interface: int,
+    *,
+    max_abs: float,
+    thin_bed_min_samples: int,
+    thin_bed_max_samples: int,
+) -> np.ndarray:
+    """Create bounded sparse reflectivity interfaces for synthetic AI construction."""
+    if n_interface <= 0:
+        raise ValueError(f"n_interface must be positive, got {n_interface}.")
+    if not 0.0 < max_abs < 1.0:
+        raise ValueError(f"max_abs must be in (0, 1), got {max_abs}.")
+
+    reflectivity = np.zeros((n_interface,), dtype=np.float32)
+    generators = [_add_sparse_interfaces, _add_bed_boundaries, _add_thin_bed_pairs, _add_reflectivity_spike]
+    n_components = int(np.random.randint(1, 3))
+    for _ in range(n_components):
+        generator = generators[int(np.random.randint(0, len(generators)))]
+        generator(
+            reflectivity,
+            max_abs=max_abs,
+            thin_bed_min_samples=thin_bed_min_samples,
+            thin_bed_max_samples=thin_bed_max_samples,
+        )
+
+    if not np.any(reflectivity):
+        reflectivity[int(np.random.randint(0, n_interface))] = float(np.random.uniform(-max_abs, max_abs))
+    return np.clip(reflectivity, -max_abs, max_abs).astype(np.float32, copy=False)
+
+
+def random_reflectivity_in_taper(
+    n_interface: int,
+    *,
+    taper: np.ndarray,
+    max_abs: float,
+    thin_bed_min_samples: int,
+    thin_bed_max_samples: int,
+) -> np.ndarray:
+    """Create reflectivity only at interfaces inside positive taper support."""
+    if n_interface <= 0:
+        raise ValueError(f"n_interface must be positive, got {n_interface}.")
+
+    taper_1d = np.asarray(taper, dtype=np.float32).reshape(-1)
+    if taper_1d.size == n_interface + 1:
+        active = (taper_1d[:-1] > 0.0) & (taper_1d[1:] > 0.0)
+    elif taper_1d.size == n_interface:
+        active = taper_1d > 0.0
+    else:
+        raise ValueError(
+            "taper sample count must match n_interface or n_interface + 1, "
+            f"got taper.size={taper_1d.size}, n_interface={n_interface}."
+        )
+
+    reflectivity = np.zeros((n_interface,), dtype=np.float32)
+    for start, stop in true_runs(active):
+        reflectivity[start:stop] = random_reflectivity(
+            stop - start,
+            max_abs=max_abs,
+            thin_bed_min_samples=thin_bed_min_samples,
+            thin_bed_max_samples=thin_bed_max_samples,
+        )
+    return reflectivity
+
+
+def reflectivity_to_log_ai(reflectivity: np.ndarray, *, initial_log_ai: float = 0.0) -> np.ndarray:
+    """Integrate normal-incidence reflectivity into a log-AI trace."""
+    r = np.asarray(reflectivity, dtype=np.float32).reshape(-1)
+    if r.size <= 0:
+        raise ValueError("reflectivity must contain at least one interface.")
+    if np.any(~np.isfinite(r)):
+        raise ValueError("reflectivity contains non-finite values.")
+    r = np.clip(r, -0.95, 0.95).astype(np.float64)
+    increments = np.log1p(r) - np.log1p(-r)
+    log_ai = np.empty((r.size + 1,), dtype=np.float64)
+    log_ai[0] = float(initial_log_ai)
+    log_ai[1:] = float(initial_log_ai) + np.cumsum(increments)
+    return log_ai.astype(np.float32)
+
+
+def highpass_log_ai_residual(log_ai_raw: np.ndarray, *, window: int, max_abs: float) -> np.ndarray:
+    """Keep only the high-frequency part of a raw log-AI or residual trace."""
+    if max_abs <= 0.0:
+        raise ValueError(f"max_abs must be positive, got {max_abs}.")
+    values = np.asarray(log_ai_raw, dtype=np.float32).reshape(-1)
+    if values.size <= 0:
+        raise ValueError("log_ai_raw must contain at least one sample.")
+    if np.any(~np.isfinite(values)):
+        raise ValueError("log_ai_raw contains non-finite values.")
+
+    low = moving_average(values, int(window))
+    residual = values - low
+    scale_ref = float(np.percentile(np.abs(residual), 99.0)) if residual.size else 0.0
+    if scale_ref > max_abs:
+        residual = residual * (float(max_abs) / scale_ref)
+    return np.clip(residual, -max_abs, max_abs).astype(np.float32, copy=False)
+
+
+def ai_to_reflectivity(ai: np.ndarray, eps: float = 1e-10) -> np.ndarray:
+    """Compute normal-incidence reflectivity from a 1D AI trace."""
+    ai = np.asarray(ai, dtype=np.float32).reshape(-1)
+    if ai.size < 2:
+        return np.asarray([], dtype=np.float32)
+    upper = ai[:-1]
+    lower = ai[1:]
+    return ((lower - upper) / (lower + upper + float(eps))).astype(np.float32)
+
+
+def fit_residual_to_lfm_bounds(
+    residual: np.ndarray,
+    *,
+    safe_lfm: np.ndarray,
+    ai_min: float,
+    ai_max: float,
+    max_abs: float,
+) -> np.ndarray:
+    """Clip log-AI residuals so ``lfm * exp(residual)`` stays inside AI bounds."""
+    residual = np.asarray(residual, dtype=np.float32)
+    lower = np.log(float(ai_min) / safe_lfm)
+    upper = np.log(float(ai_max) / safe_lfm)
+    lower = np.maximum(lower, -float(max_abs))
+    upper = np.minimum(upper, float(max_abs))
+    clipped = np.clip(residual, lower, upper)
+    impossible = lower > upper
+    if np.any(impossible):
+        clipped[impossible] = np.clip(
+            residual[impossible],
+            np.log(float(ai_min) / safe_lfm[impossible]),
+            np.log(float(ai_max) / safe_lfm[impossible]),
+        )
+    return clipped.astype(np.float32, copy=False)
+
+
+def edge_taper(length: int) -> np.ndarray:
+    """Return a short symmetric taper for stitching sampled residual patches."""
+    if length <= 2:
+        return np.ones((length,), dtype=np.float32)
+    edge = max(1, min(length // 4, 8))
+    taper = np.ones((length,), dtype=np.float32)
+    ramp = np.linspace(0.0, 1.0, edge + 2, dtype=np.float32)[1:-1]
+    taper[:edge] = ramp
+    taper[-edge:] = ramp[::-1]
+    return taper
+
+
+def true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Return half-open ``[start, stop)`` runs where a 1D boolean mask is true."""
+    mask_1d = np.asarray(mask, dtype=bool).reshape(-1)
+    if mask_1d.size == 0 or not np.any(mask_1d):
+        return []
+    padded = np.concatenate(([False], mask_1d, [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return [(int(edges[i]), int(edges[i + 1])) for i in range(0, edges.size, 2)]
+
+
+def validate_ai_bounds(ai_min: float, ai_max: float) -> None:
+    """Validate positive increasing AI bounds."""
+    if ai_min <= 0.0 or ai_max <= ai_min:
+        raise ValueError(f"Invalid AI bounds: ai_min={ai_min}, ai_max={ai_max}.")
+
+
+def moving_average(values: np.ndarray, window: int) -> np.ndarray:
+    """Centered moving average that preserves sample count."""
+    if window <= 1:
+        return values.astype(np.float32, copy=False)
+    if window % 2 == 0:
+        window += 1
+    pad = window // 2
+    padded = np.pad(values.astype(np.float32), (pad, pad), mode="edge")
+    kernel = np.full((window,), 1.0 / float(window), dtype=np.float32)
+    smoothed = np.convolve(padded, kernel, mode="valid")
+    if smoothed.size != values.size:
+        raise RuntimeError(f"Moving average changed sample count: {values.size} -> {smoothed.size}.")
+    if not np.all(np.isfinite(smoothed)):
+        raise ValueError("Moving average produced non-finite values.")
+    return smoothed.astype(np.float32, copy=False)
+
+
 def _event_density_by_well(
     residual: np.ndarray,
     mask: np.ndarray,
@@ -323,6 +500,69 @@ def _robust_stats(values: np.ndarray) -> dict[str, Any]:
         "abs_p99": float(np.percentile(abs_arr, 99)),
         "max_abs": float(np.max(abs_arr)),
     }
+
+
+def _add_sparse_interfaces(
+    reflectivity: np.ndarray,
+    *,
+    max_abs: float,
+    thin_bed_min_samples: int,
+    thin_bed_max_samples: int,
+) -> None:
+    del thin_bed_min_samples
+    n = reflectivity.size
+    n_events = int(np.random.randint(1, max(2, n // max(thin_bed_max_samples * 3, 1))))
+    for _ in range(n_events):
+        idx = int(np.random.randint(0, n))
+        reflectivity[idx] += float(np.random.uniform(-0.7 * max_abs, 0.7 * max_abs))
+
+
+def _add_bed_boundaries(
+    reflectivity: np.ndarray,
+    *,
+    max_abs: float,
+    thin_bed_min_samples: int,
+    thin_bed_max_samples: int,
+) -> None:
+    n = reflectivity.size
+    pos = int(np.random.randint(0, max(1, thin_bed_max_samples)))
+    segment_max = max(thin_bed_max_samples * 5, thin_bed_min_samples + 1)
+    while pos < n:
+        reflectivity[pos] += float(np.random.uniform(-max_abs, max_abs))
+        width = int(np.random.randint(thin_bed_min_samples, segment_max + 1))
+        pos += width
+
+
+def _add_thin_bed_pairs(
+    reflectivity: np.ndarray,
+    *,
+    max_abs: float,
+    thin_bed_min_samples: int,
+    thin_bed_max_samples: int,
+) -> None:
+    n = reflectivity.size
+    n_beds = int(np.random.randint(1, max(2, n // max(thin_bed_max_samples * 8, 1))))
+    for _ in range(n_beds):
+        start = int(np.random.randint(0, n))
+        width = int(np.random.randint(thin_bed_min_samples, thin_bed_max_samples + 1))
+        stop = start + width
+        if stop >= n:
+            continue
+        amp = float(np.random.uniform(-max_abs, max_abs))
+        reflectivity[start] += amp
+        reflectivity[stop] -= amp * float(np.random.uniform(0.5, 1.0))
+
+
+def _add_reflectivity_spike(
+    reflectivity: np.ndarray,
+    *,
+    max_abs: float,
+    thin_bed_min_samples: int,
+    thin_bed_max_samples: int,
+) -> None:
+    del thin_bed_min_samples, thin_bed_max_samples
+    idx = int(np.random.randint(0, reflectivity.size))
+    reflectivity[idx] += float(np.random.uniform(-max_abs, max_abs))
 
 
 def _as_str(value: object) -> str:

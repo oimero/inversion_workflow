@@ -21,7 +21,7 @@ _PATH_FIELDS = {
     "vp_lfm_file",
     "wavelet_file",
     "dynamic_gain_model",
-    "well_constraint_file",
+    "resolution_prior_file",
     "checkpoint_dir",
 }
 
@@ -47,7 +47,7 @@ class DepthGINNConfig:
 
     # ── 低频模型 ──────────────────────────────────────────────
     ai_lfm_file: Path = Path("your_ai_lfm_depth.npz")
-    well_constraint_file: Path | None = None
+    resolution_prior_file: Path | None = None
 
     # ── 深度域子波 ────────────────────────────────────────────
     vp_lfm_file: Path = Path("your_vp_lfm_depth.npz")
@@ -198,7 +198,9 @@ class DepthGINNConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "DepthGINNConfig":
         normalized = dict(data)
-        optional_path_fields = {"wavelet_file", "dynamic_gain_model", "well_constraint_file"}
+        if "well_constraint_file" in normalized:
+            normalized.setdefault("resolution_prior_file", normalized.pop("well_constraint_file"))
+        optional_path_fields = {"wavelet_file", "dynamic_gain_model", "resolution_prior_file"}
         for field_name in _PATH_FIELDS:
             if field_name not in normalized or normalized[field_name] is None:
                 continue

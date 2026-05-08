@@ -1,7 +1,6 @@
 """Batch QC for well-guided depth synthetic samples.
 
-The script samples the same ``WellGuidedSyntheticDepthTraceDataset`` used by the
-depth trainer and writes a compact QC bundle:
+The script samples the depth enhancement synthetic adapter and writes a compact QC bundle:
 
 - ``qc.log``: human-readable verdicts and metric summaries.
 - ``summary.json``: machine-readable aggregate statistics and flags.
@@ -32,8 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("experiments/ginn_depth/train.yaml"),
-        help="Depth GINN YAML config.",
+        default=Path("experiments/enhance_depth/train.yaml"),
+        help="Stage-2 enhancement YAML config.",
     )
     parser.add_argument(
         "--num-samples",
@@ -224,12 +223,12 @@ def local_window(center: int, n_sample: int, half_width: int) -> slice:
 
 
 def zero_residual_seismic(sample: dict[str, torch.Tensor], forward_model: Any) -> np.ndarray:
-    lfm = sample["lfm_raw"].float().unsqueeze(0)
+    base_ai = sample["base_ai_raw"].float().unsqueeze(0)
     vp = sample["velocity_raw"].float().unsqueeze(0)
     dynamic_gain = sample.get("dynamic_gain")
     gain = dynamic_gain.float().unsqueeze(0) if dynamic_gain is not None else None
     with torch.no_grad():
-        seismic = forward_model(torch.clamp(lfm, min=1e-6), vp, gain=gain)
+        seismic = forward_model(torch.clamp(base_ai, min=1e-6), vp, gain=gain)
     return to_numpy_1d(seismic)
 
 
@@ -546,11 +545,9 @@ def main() -> None:
 
     torch = torch_module
 
-    from ginn.enhance import load_well_resolution_prior_npz
-    from ginn_depth.config import DepthGINNConfig
-    from ginn_depth.data import build_dataset
-    from ginn_depth.physics import DepthForwardModel
-    from ginn_depth.synthetic import WellGuidedSyntheticDepthTraceDataset
+    from enhance import load_well_resolution_prior_npz
+    from enhance.config import EnhancementConfig
+    from ginn_depth.enhance import build_depth_enhancement_bundle
 
     if args.num_samples <= 0:
         raise ValueError("--num-samples must be positive.")
@@ -572,7 +569,7 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    cfg = DepthGINNConfig.from_yaml(config_path, base_dir=project_root)
+    cfg = EnhancementConfig.from_yaml(config_path, base_dir=project_root)
     cfg.device = "cpu"
     cfg.num_workers = 0
     cfg.pin_memory = False
@@ -593,9 +590,6 @@ def main() -> None:
         cfg.synthetic_cluster_amp_abs_p99_max = float(args.cluster_amp_abs_p99_max)
     if args.unresolved_oversample_factor is not None:
         cfg.synthetic_unresolved_oversample_factor = int(args.unresolved_oversample_factor)
-    if cfg.resolution_prior_file is None:
-        raise ValueError("resolution_prior_file is required for synthetic QC.")
-
     LOGGER.info("Resolution prior: %s", cfg.resolution_prior_file)
     LOGGER.info(
         "Synthetic mix: patch_fraction=%.3f unresolved_fraction=%.3f well_patch_scale=[%.3f, %.3f] "
@@ -618,40 +612,10 @@ def main() -> None:
         _fmt(prior.summary.get("residual", {}).get("abs_p99")),
     )
 
-    LOGGER.info("Building real depth dataset...")
-    dataset_bundle = build_dataset(cfg)
-    forward_model = DepthForwardModel(
-        dataset_bundle.wavelet_time_s,
-        dataset_bundle.wavelet_amp,
-        depth_axis_m=dataset_bundle.depth_axis_m,
-        amplitude_threshold=cfg.wavelet_amplitude_threshold,
-    ).cpu()
-    synthetic_dataset = WellGuidedSyntheticDepthTraceDataset(
-        dataset_bundle.train_dataset,
-        prior,
-        forward_model,
-        num_examples=cfg.synthetic_traces_per_epoch,
-        ai_min=cfg.ai_min,
-        ai_max=cfg.ai_max,
-        patch_fraction=cfg.synthetic_patch_fraction,
-        unresolved_fraction=cfg.synthetic_unresolved_fraction,
-        well_patch_scale_min=cfg.synthetic_well_patch_scale_min,
-        well_patch_scale_max=cfg.synthetic_well_patch_scale_max,
-        cluster_min_events=cfg.synthetic_cluster_min_events,
-        cluster_max_events=cfg.synthetic_cluster_max_events,
-        cluster_amp_abs_p95_min=cfg.synthetic_cluster_amp_abs_p95_min,
-        cluster_amp_abs_p99_max=cfg.synthetic_cluster_amp_abs_p99_max,
-        cluster_main_lobe_samples=cfg.synthetic_cluster_main_lobe_samples,
-        unresolved_oversample_factor=cfg.synthetic_unresolved_oversample_factor,
-        residual_highpass_samples=cfg.synthetic_residual_highpass_samples,
-        seismic_rms_match=cfg.synthetic_seismic_rms_match,
-        seismic_rms_target=cfg.synthetic_seismic_rms_target,
-        quality_gate_enabled=cfg.synthetic_quality_gate_enabled,
-        max_residual_near_clip_fraction=cfg.synthetic_max_residual_near_clip_fraction,
-        max_seismic_rms_ratio=cfg.synthetic_max_seismic_rms_ratio,
-        max_seismic_abs_p99_ratio=cfg.synthetic_max_seismic_abs_p99_ratio,
-        max_resample_attempts=cfg.synthetic_max_resample_attempts,
-    )
+    LOGGER.info("Building depth enhancement synthetic dataset...")
+    enhancement_bundle = build_depth_enhancement_bundle(cfg)
+    synthetic_dataset = enhancement_bundle.synthetic_dataset
+    forward_model = synthetic_dataset.forward_model.cpu()
     main_lobe_samples = int(cfg.synthetic_cluster_main_lobe_samples or 12)
 
     LOGGER.info("Sampling %d synthetic traces...", args.num_samples)

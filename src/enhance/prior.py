@@ -1,4 +1,4 @@
-"""Enhancement-prior schema and reusable synthetic trace utilities."""
+"""Enhancement-prior schema and reusable log-AI utilities."""
 
 from __future__ import annotations
 
@@ -323,6 +323,31 @@ def ai_to_reflectivity(ai: np.ndarray, eps: float = 1e-10) -> np.ndarray:
     return ((lower - upper) / (lower + upper + float(eps))).astype(np.float32)
 
 
+def fit_delta_to_base_ai_bounds(
+    delta_log_ai: np.ndarray,
+    *,
+    safe_base_ai: np.ndarray,
+    ai_min: float,
+    ai_max: float,
+    max_abs: float,
+) -> np.ndarray:
+    """Clip delta log-AI so ``base_ai * exp(delta)`` stays inside AI bounds."""
+    delta_log_ai = np.asarray(delta_log_ai, dtype=np.float32)
+    lower = np.log(float(ai_min) / safe_base_ai)
+    upper = np.log(float(ai_max) / safe_base_ai)
+    lower = np.maximum(lower, -float(max_abs))
+    upper = np.minimum(upper, float(max_abs))
+    clipped = np.clip(delta_log_ai, lower, upper)
+    impossible = lower > upper
+    if np.any(impossible):
+        clipped[impossible] = np.clip(
+            delta_log_ai[impossible],
+            np.log(float(ai_min) / safe_base_ai[impossible]),
+            np.log(float(ai_max) / safe_base_ai[impossible]),
+        )
+    return clipped.astype(np.float32, copy=False)
+
+
 def fit_residual_to_lfm_bounds(
     residual: np.ndarray,
     *,
@@ -331,21 +356,14 @@ def fit_residual_to_lfm_bounds(
     ai_max: float,
     max_abs: float,
 ) -> np.ndarray:
-    """Clip log-AI residuals so ``lfm * exp(residual)`` stays inside AI bounds."""
-    residual = np.asarray(residual, dtype=np.float32)
-    lower = np.log(float(ai_min) / safe_lfm)
-    upper = np.log(float(ai_max) / safe_lfm)
-    lower = np.maximum(lower, -float(max_abs))
-    upper = np.minimum(upper, float(max_abs))
-    clipped = np.clip(residual, lower, upper)
-    impossible = lower > upper
-    if np.any(impossible):
-        clipped[impossible] = np.clip(
-            residual[impossible],
-            np.log(float(ai_min) / safe_lfm[impossible]),
-            np.log(float(ai_max) / safe_lfm[impossible]),
-        )
-    return clipped.astype(np.float32, copy=False)
+    """Compatibility alias for prior NPZ code that still uses LFM terminology."""
+    return fit_delta_to_base_ai_bounds(
+        residual,
+        safe_base_ai=safe_lfm,
+        ai_min=ai_min,
+        ai_max=ai_max,
+        max_abs=max_abs,
+    )
 
 
 def edge_taper(length: int) -> np.ndarray:

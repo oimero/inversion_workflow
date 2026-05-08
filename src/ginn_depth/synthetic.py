@@ -14,18 +14,27 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from ginn.enhance import (
+from enhance.prior import (
     WellResolutionPriorBundle,
     ai_to_reflectivity,
+    load_well_resolution_prior_npz,
+    validate_ai_bounds,
+)
+from enhance.synthetic import (
+    downsample_highres_to_samples,
     edge_taper,
+    fit_delta_to_base_ai_bounds,
     fit_residual_to_lfm_bounds,
     highpass_log_ai_residual,
-    load_well_resolution_prior_npz,
+    make_highres_axis,
+    markov_thin_bed_packet,
     moving_average,
     random_reflectivity_in_taper,
     reflectivity_to_log_ai,
+    sample_well_patch_window,
+    summary_or_percentile,
     true_runs,
-    validate_ai_bounds,
+    valid_prior_rows,
 )
 from ginn_depth.physics import DepthForwardModel
 
@@ -37,6 +46,7 @@ class _BaseDepthDataset(Protocol):
     seis_rms: float
     lfm_scale: float
     dynamic_gain_median: float | None
+    input_channel_names: tuple[str, ...]
 
     def __len__(self) -> int: ...
 
@@ -265,13 +275,13 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         self._prior_values = self._prior_values[np.isfinite(self._prior_values)]
         if self._prior_values.size == 0:
             raise ValueError("Well resolution prior contains no finite residual values.")
-        self.residual_abs_p95 = _summary_or_percentile(self.prior, "abs_p95", 95.0)
-        self.residual_abs_p99 = _summary_or_percentile(self.prior, "abs_p99", 99.0)
+        self.residual_abs_p95 = summary_or_percentile(self.prior, "abs_p95", 95.0)
+        self.residual_abs_p99 = summary_or_percentile(self.prior, "abs_p99", 99.0)
         self.residual_max_abs = float(residual_max_abs or max(self.residual_abs_p99, self.residual_abs_p95, 1e-3))
         if self.residual_max_abs <= 0.0:
             raise ValueError("residual_max_abs must be positive.")
 
-        self._well_rows = _valid_prior_rows(self.prior)
+        self._well_rows = valid_prior_rows(self.prior)
         if not self._well_rows:
             raise ValueError("Well resolution prior contains no valid well rows.")
 
@@ -292,53 +302,53 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         base_idx = int(np.random.randint(0, len(self.base_dataset)))
         item = dict(self.base_dataset[base_idx])
 
-        lfm = item["lfm_raw"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+        base_ai = item["lfm_raw"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         base_vp = item["velocity_raw"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         taper = item["taper_weight"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         core_mask = item["mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
         loss_mask = item.get("loss_mask", item["mask"]).squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
 
-        safe_lfm = np.maximum(lfm, 1e-6)
+        safe_base_ai = np.maximum(base_ai, 1e-6)
         mode = self._sample_mode()
         if mode == "well_patch":
-            residual = self._sample_well_patch_residual(lfm.size, taper, loss_mask)
+            delta_log_ai = self._sample_well_patch_residual(base_ai.size, taper, loss_mask)
             mode_code = 0
             highres_residual = None
             highres_ai = None
             highres_reflectivity = None
             highres_depth = None
         else:
-            residual, highres_residual, highres_depth = self._sample_unresolved_cluster_residual(
-                lfm.size,
+            delta_log_ai, highres_residual, highres_depth = self._sample_unresolved_cluster_residual(
+                base_ai.size,
                 taper,
                 loss_mask,
-                safe_lfm,
+                safe_base_ai,
             )
             mode_code = 1
 
         if mode == "well_patch":
-            residual = highpass_log_ai_residual(
-                residual,
+            delta_log_ai = highpass_log_ai_residual(
+                delta_log_ai,
                 window=self.residual_highpass_samples,
                 max_abs=self.residual_max_abs,
             )
-            residual = fit_residual_to_lfm_bounds(
-                residual * taper,
-                safe_lfm=safe_lfm,
+            delta_log_ai = fit_delta_to_base_ai_bounds(
+                delta_log_ai * taper,
+                safe_base_ai=safe_base_ai,
                 ai_min=self.ai_min,
                 ai_max=self.ai_max,
                 max_abs=self.residual_max_abs,
             )
         else:
-            residual = fit_residual_to_lfm_bounds(
-                residual * taper,
-                safe_lfm=safe_lfm,
+            delta_log_ai = fit_delta_to_base_ai_bounds(
+                delta_log_ai * taper,
+                safe_base_ai=safe_base_ai,
                 ai_min=self.ai_min,
                 ai_max=self.ai_max,
                 max_abs=self.residual_max_abs,
             )
-        target_ai = np.clip(safe_lfm * np.exp(residual), self.ai_min, self.ai_max).astype(np.float32)
-        residual = np.log(np.maximum(target_ai, 1e-6) / safe_lfm).astype(np.float32, copy=False)
+        target_ai = np.clip(safe_base_ai * np.exp(delta_log_ai), self.ai_min, self.ai_max).astype(np.float32)
+        delta_log_ai = np.log(np.maximum(target_ai, 1e-6) / safe_base_ai).astype(np.float32, copy=False)
         target_vp = _derive_velocity(
             target_ai,
             base_vp,
@@ -352,16 +362,16 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         )
 
         if mode == "unresolved_cluster" and highres_residual is not None and highres_depth is not None:
-            highres_lfm = np.interp(highres_depth, self._sample_depth_axis(lfm.size), safe_lfm).astype(np.float32)
-            highres_residual = fit_residual_to_lfm_bounds(
+            highres_base_ai = np.interp(highres_depth, self._sample_depth_axis(base_ai.size), safe_base_ai).astype(np.float32)
+            highres_residual = fit_delta_to_base_ai_bounds(
                 highres_residual,
-                safe_lfm=np.maximum(highres_lfm, 1e-6),
+                safe_base_ai=np.maximum(highres_base_ai, 1e-6),
                 ai_min=self.ai_min,
                 ai_max=self.ai_max,
                 max_abs=self.residual_max_abs,
             )
-            highres_ai = np.clip(highres_lfm * np.exp(highres_residual), self.ai_min, self.ai_max).astype(np.float32)
-            highres_vp = np.interp(highres_depth, self._sample_depth_axis(lfm.size), target_vp).astype(np.float32)
+            highres_ai = np.clip(highres_base_ai * np.exp(highres_residual), self.ai_min, self.ai_max).astype(np.float32)
+            highres_vp = np.interp(highres_depth, self._sample_depth_axis(base_ai.size), target_vp).astype(np.float32)
             highres_reflectivity = ai_to_reflectivity(highres_ai).astype(np.float32)
             target_seismic, target_seismic_raw, rms_scale = self._forward_highres_target_seismic(
                 highres_ai,
@@ -369,7 +379,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
                 highres_depth,
                 item.get("dynamic_gain"),
                 loss_mask,
-                lfm.size,
+                base_ai.size,
             )
         else:
             target_seismic, target_seismic_raw, rms_scale = self._forward_target_seismic(
@@ -382,13 +392,15 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             item["dynamic_gain"] = item["dynamic_gain"] * float(rms_scale)
         reflectivity = ai_to_reflectivity(target_ai)
         if highres_residual is None or highres_ai is None or highres_reflectivity is None or highres_depth is None:
-            depth = self._sample_depth_axis(lfm.size)
-            highres_depth = _make_highres_depth_axis(depth, self.unresolved_oversample_factor)
-            highres_residual = np.interp(highres_depth, depth, residual).astype(np.float32)
+            depth = self._sample_depth_axis(base_ai.size)
+            highres_depth = make_highres_axis(depth, self.unresolved_oversample_factor)
+            highres_residual = np.interp(highres_depth, depth, delta_log_ai).astype(np.float32)
             highres_ai = np.interp(highres_depth, depth, target_ai).astype(np.float32)
             highres_reflectivity = ai_to_reflectivity(highres_ai).astype(np.float32)
 
-        item["target_residual"] = torch.from_numpy(residual[np.newaxis]).float()
+        item["base_ai_raw"] = torch.from_numpy(base_ai[np.newaxis]).float()
+        item["target_delta_log_ai"] = torch.from_numpy(delta_log_ai[np.newaxis]).float()
+        item["target_residual"] = item["target_delta_log_ai"]
         item["target_ai"] = torch.from_numpy(target_ai[np.newaxis]).float()
         item["target_seismic"] = torch.from_numpy(target_seismic[np.newaxis]).float()
         item["target_seismic_raw"] = torch.from_numpy(target_seismic_raw[np.newaxis]).float()
@@ -398,15 +410,35 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         item["synthetic_mode"] = torch.tensor(mode_code, dtype=torch.int64)
         item["mask"] = torch.from_numpy(core_mask[np.newaxis]).bool()
         item["loss_mask"] = torch.from_numpy(loss_mask[np.newaxis]).bool()
+        item["input"] = self._compose_enhancement_input(item)
         item["target_residual_highres"] = torch.from_numpy(highres_residual[np.newaxis]).float()
         item["target_ai_highres"] = torch.from_numpy(highres_ai[np.newaxis]).float()
         item["raw_reflectivity_highres"] = torch.from_numpy(highres_reflectivity[np.newaxis]).float()
         item["depth_highres"] = torch.from_numpy(highres_depth[np.newaxis]).float()
         return item
 
+    def _compose_enhancement_input(self, item: dict[str, torch.Tensor]) -> torch.Tensor:
+        channels = [item["target_seismic"].squeeze(0).detach().cpu().numpy().astype(np.float32)]
+        channel_names = getattr(self.base_dataset, "input_channel_names", ())
+        base_ai = item["base_ai_raw"].squeeze(0).detach().cpu().numpy().astype(np.float32)
+        if "ai_lfm" in channel_names or "base_ai" in channel_names:
+            channels.append((base_ai / float(self.base_dataset.lfm_scale)).astype(np.float32))
+        if "mask" in channel_names:
+            channels.append(item["mask"].squeeze(0).detach().cpu().numpy().astype(np.float32))
+        if "dynamic_gain_log_ratio" in channel_names:
+            dynamic_gain = item.get("dynamic_gain")
+            if dynamic_gain is None:
+                channels.append(np.zeros_like(channels[0], dtype=np.float32))
+            else:
+                gain = dynamic_gain.squeeze(0).detach().cpu().numpy().astype(np.float32)
+                median = float(self.base_dataset.dynamic_gain_median or 1.0)
+                gain_channel = np.log(np.maximum(gain, 1e-6) / median)
+                channels.append(np.clip(gain_channel, -3.0, 3.0).astype(np.float32))
+        return torch.from_numpy(np.stack(channels, axis=0)).float()
+
     def _passes_quality_gate(self, item: dict[str, torch.Tensor]) -> bool:
         loss_mask = item["loss_mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
-        residual = item["target_residual"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+        residual = item["target_delta_log_ai"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         target_seismic = item["target_seismic"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         source_seismic = item["obs"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
 
@@ -446,7 +478,9 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         support_mask: np.ndarray,
     ) -> np.ndarray:
         residual = np.zeros((n_sample,), dtype=np.float32)
-        patch_window = self._sample_well_patch_window(
+        patch_window = sample_well_patch_window(
+            self.prior,
+            self._well_rows,
             n_sample,
             taper,
             support_mask,
@@ -464,48 +498,12 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         residual[dst0 : dst0 + length] = patch * edge_taper(length)
         return residual
 
-    def _sample_well_patch_window(
-        self,
-        n_sample: int,
-        taper: np.ndarray,
-        support_mask: np.ndarray | None = None,
-        *,
-        min_len_samples: int,
-    ) -> tuple[np.ndarray, int] | None:
-        active = np.asarray(taper) > 0.0
-        if support_mask is not None:
-            support = np.asarray(support_mask, dtype=bool).reshape(-1)
-            if support.shape == active.shape and np.any(active & support):
-                active = active & support
-        active_runs = true_runs(active)
-        if not active_runs:
-            return None
-
-        row_idx = int(np.random.choice(self._well_rows))
-        well_mask = np.asarray(self.prior.well_mask[row_idx], dtype=bool)
-        well_residual = np.asarray(self.prior.residual_log_ai[row_idx], dtype=np.float32)
-        well_runs = true_runs(well_mask)
-        if not well_runs:
-            return None
-
-        src_start, src_stop = well_runs[int(np.random.randint(0, len(well_runs)))]
-        dst_start, dst_stop = active_runs[int(np.random.randint(0, len(active_runs)))]
-        max_len = min(src_stop - src_start, dst_stop - dst_start, n_sample)
-        if max_len <= 0:
-            return None
-        min_len = min(max_len, max(4, int(min_len_samples)))
-        length = int(np.random.randint(min_len, max_len + 1)) if max_len > min_len else int(max_len)
-        src0 = int(np.random.randint(src_start, src_stop - length + 1))
-        dst0 = int(np.random.randint(dst_start, dst_stop - length + 1))
-        patch = well_residual[src0 : src0 + length].astype(np.float32, copy=True)
-        return patch, dst0
-
     def _sample_unresolved_cluster_residual(
         self,
         n_sample: int,
         taper: np.ndarray,
         support_mask: np.ndarray,
-        safe_lfm: np.ndarray,
+        safe_base_ai: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
         coarse = np.zeros((n_sample,), dtype=np.float32)
         taper_1d = np.asarray(taper, dtype=np.float32).reshape(-1)
@@ -518,7 +516,9 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             return coarse, None, None
 
         main_lobe = max(4, min(self.cluster_main_lobe_samples, n_sample))
-        patch_window = self._sample_well_patch_window(
+        patch_window = sample_well_patch_window(
+            self.prior,
+            self._well_rows,
             n_sample,
             taper_1d,
             support,
@@ -539,7 +539,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
 
         depth = self._sample_depth_axis(n_sample)
         factor = max(1, self.unresolved_oversample_factor)
-        highres_depth = _make_highres_depth_axis(depth, factor)
+        highres_depth = make_highres_axis(depth, factor)
         highres = np.zeros((highres_depth.size,), dtype=np.float32)
 
         patch_depth = depth[dst0 : dst0 + length]
@@ -555,7 +555,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         local = np.zeros((local_depth.size,), dtype=np.float32)
         source_hi = np.interp(local_depth, patch_depth, source_patch).astype(np.float32)
         taper_hi = np.interp(highres_depth, depth, taper_1d).astype(np.float32)
-        safe_lfm_hi = np.interp(highres_depth, depth, safe_lfm).astype(np.float32)
+        safe_base_ai_hi = np.interp(highres_depth, depth, safe_base_ai).astype(np.float32)
 
         background_scale = float(np.random.uniform(0.20, 0.45))
         local += background_scale * source_hi
@@ -601,7 +601,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             if np.isfinite(source_amp) and source_amp > 0.0:
                 amp_scale = 0.5 * amp_scale + 0.5 * source_amp
 
-            packet = _markov_thin_bed_packet(
+            packet = markov_thin_bed_packet(
                 packet_width,
                 n_events=n_events,
                 amp_scale=amp_scale,
@@ -614,15 +614,15 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         local *= edge_taper(local_len)
         highres[hi_start:hi_stop] = local
         highres *= taper_hi
-        highres = fit_residual_to_lfm_bounds(
+        highres = fit_delta_to_base_ai_bounds(
             highres,
-            safe_lfm=np.maximum(safe_lfm_hi, 1e-6),
+            safe_base_ai=np.maximum(safe_base_ai_hi, 1e-6),
             ai_min=self.ai_min,
             ai_max=self.ai_max,
             max_abs=self.residual_max_abs,
         )
 
-        coarse = _downsample_highres_to_samples(highres, factor, n_sample)
+        coarse = downsample_highres_to_samples(highres, factor, n_sample)
         coarse = np.clip(coarse, -self.residual_max_abs, self.residual_max_abs).astype(np.float32, copy=False)
         return coarse, highres.astype(np.float32, copy=False), highres_depth.astype(np.float32, copy=False)
 
@@ -700,63 +700,6 @@ def _extract_forward_depth_axis(forward_model: DepthForwardModel) -> np.ndarray 
     return values
 
 
-def _make_highres_depth_axis(depth_axis: np.ndarray, factor: int) -> np.ndarray:
-    depth = np.asarray(depth_axis, dtype=np.float32).reshape(-1)
-    if factor <= 1 or depth.size < 2:
-        return depth.copy()
-    segments = [np.linspace(float(depth[i]), float(depth[i + 1]), factor + 1, dtype=np.float32)[:-1] for i in range(depth.size - 1)]
-    return np.concatenate([*segments, depth[-1:].astype(np.float32)])
-
-
-def _downsample_highres_to_samples(values: np.ndarray, factor: int, n_sample: int) -> np.ndarray:
-    highres = np.asarray(values, dtype=np.float32).reshape(-1)
-    if factor <= 1:
-        return highres[:n_sample].astype(np.float32, copy=True)
-    coarse = np.zeros((n_sample,), dtype=np.float32)
-    for idx in range(n_sample):
-        center = idx * factor
-        start = max(0, center - factor // 2)
-        stop = min(highres.size, center + (factor + 1) // 2 + 1)
-        if stop <= start:
-            coarse[idx] = highres[min(center, highres.size - 1)]
-        else:
-            coarse[idx] = float(np.mean(highres[start:stop]))
-    return coarse
-
-
-def _markov_thin_bed_packet(width: int, *, n_events: int, amp_scale: float, sign0: float) -> np.ndarray:
-    width = int(max(1, width))
-    target_transitions = max(1, int(n_events))
-    sand_fraction = float(np.random.uniform(0.35, 0.65))
-    avg_run = max(1.0, width / float(target_transitions + 1))
-    beta = float(np.clip(1.0 / avg_run, 0.05, 0.95))
-    alpha = float(np.clip(sand_fraction / (avg_run * max(1e-3, 1.0 - sand_fraction)), 0.05, 0.95))
-    transition = np.array([[1.0 - alpha, alpha], [beta, 1.0 - beta]], dtype=np.float64)
-
-    best_states = None
-    best_score = float("inf")
-    for _ in range(16):
-        states = np.empty((width,), dtype=np.int8)
-        states[0] = int(np.random.random() < sand_fraction)
-        for idx in range(1, width):
-            states[idx] = int(np.random.choice([0, 1], p=transition[int(states[idx - 1])]))
-        transitions = int(np.count_nonzero(states[1:] != states[:-1]))
-        score = abs(transitions - target_transitions)
-        if score < best_score:
-            best_score = score
-            best_states = states
-        if score == 0:
-            break
-
-    assert best_states is not None
-    levels = np.where(best_states > 0, 1.0, -1.0).astype(np.float32)
-    levels -= float(np.mean(levels))
-    peak = float(np.max(np.abs(levels)))
-    if peak > 0.0:
-        levels /= peak
-    return (float(sign0) * float(amp_scale) * levels).astype(np.float32)
-
-
 def _derive_velocity(
     ai: np.ndarray,
     base_vp: np.ndarray,
@@ -815,21 +758,6 @@ def _abs_percentile(values: np.ndarray, percentile: float) -> float:
     values = values[np.isfinite(values)]
     if values.size == 0:
         return 0.0
-    return float(np.percentile(np.abs(values), percentile))
-
-
-def _valid_prior_rows(prior: WellResolutionPriorBundle) -> list[int]:
-    return [int(row) for row in range(prior.n_wells) if int(np.asarray(prior.well_mask[row]).sum()) >= 2]
-
-
-def _summary_or_percentile(prior: WellResolutionPriorBundle, key: str, percentile: float) -> float:
-    summary_value = prior.summary.get("residual", {}).get(key)
-    if summary_value is not None and np.isfinite(float(summary_value)):
-        return float(summary_value)
-    values = prior.residual_log_ai[prior.well_mask]
-    values = values[np.isfinite(values)]
-    if values.size == 0:
-        return 1e-3
     return float(np.percentile(np.abs(values), percentile))
 
 

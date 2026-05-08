@@ -1,0 +1,120 @@
+"""Depth-domain adapter for stage-2 resolution enhancement."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+
+from enhance.config import EnhancementConfig
+from ginn_depth.config import DepthGINNConfig
+from ginn_depth.data import DatasetBundle, build_dataset
+from ginn_depth.physics import DepthForwardModel
+from ginn_depth.synthetic import WellGuidedSyntheticDepthTraceDataset
+
+
+@dataclass
+class DepthEnhancementBundle:
+    """Depth adapter outputs for enhancement training and inference."""
+
+    depth_cfg: DepthGINNConfig
+    dataset_bundle: DatasetBundle
+    synthetic_dataset: WellGuidedSyntheticDepthTraceDataset
+    metadata: dict[str, Any]
+
+
+@dataclass
+class DepthEnhancementDataBundle:
+    """Depth datasets using stage-1 base AI as the enhancement base."""
+
+    depth_cfg: DepthGINNConfig
+    dataset_bundle: DatasetBundle
+    metadata: dict[str, Any]
+
+
+def build_depth_enhancement_data_bundle(cfg: EnhancementConfig) -> DepthEnhancementDataBundle:
+    """Build depth datasets with ``base_ai_file`` wired through the existing AI-base slot."""
+    depth_cfg = DepthGINNConfig.from_yaml(cfg.depth_config_file)
+    depth_cfg.ai_lfm_file = cfg.base_ai_file
+    depth_cfg.include_lfm_input = cfg.include_base_ai_input
+    depth_cfg.include_mask_input = cfg.include_mask_input
+    depth_cfg.include_dynamic_gain_input = cfg.include_dynamic_gain_input
+    depth_cfg.in_channels = cfg.in_channels
+    depth_cfg.ai_min = cfg.ai_min
+    depth_cfg.ai_max = cfg.ai_max
+
+    dataset_bundle = build_dataset(depth_cfg)
+    metadata = {
+        "domain": "depth",
+        "depth_config_file": cfg.depth_config_file,
+        "base_ai_file": cfg.base_ai_file,
+        "geometry": dataset_bundle.geometry,
+        "split_metadata": dataset_bundle.split_metadata,
+        "input_channel_names": dataset_bundle.train_dataset.input_channel_names,
+    }
+    return DepthEnhancementDataBundle(depth_cfg=depth_cfg, dataset_bundle=dataset_bundle, metadata=metadata)
+
+
+def build_depth_enhancement_bundle(cfg: EnhancementConfig) -> DepthEnhancementBundle:
+    """Build a depth synthetic dataset for stage-2 enhancement training."""
+    data_bundle = build_depth_enhancement_data_bundle(cfg)
+    depth_cfg = data_bundle.depth_cfg
+    dataset_bundle = data_bundle.dataset_bundle
+    forward_model = DepthForwardModel(
+        dataset_bundle.wavelet_time_s,
+        dataset_bundle.wavelet_amp,
+        depth_axis_m=dataset_bundle.depth_axis_m,
+        amplitude_threshold=depth_cfg.wavelet_amplitude_threshold,
+    )
+    synthetic_dataset = WellGuidedSyntheticDepthTraceDataset(
+        dataset_bundle.train_dataset,
+        cfg.resolution_prior_file,
+        forward_model,
+        num_examples=cfg.synthetic_traces_per_epoch,
+        ai_min=cfg.ai_min,
+        ai_max=cfg.ai_max,
+        patch_fraction=cfg.synthetic_patch_fraction,
+        unresolved_fraction=cfg.synthetic_unresolved_fraction,
+        well_patch_scale_min=cfg.synthetic_well_patch_scale_min,
+        well_patch_scale_max=cfg.synthetic_well_patch_scale_max,
+        cluster_min_events=cfg.synthetic_cluster_min_events,
+        cluster_max_events=cfg.synthetic_cluster_max_events,
+        cluster_amp_abs_p95_min=cfg.synthetic_cluster_amp_abs_p95_min,
+        cluster_amp_abs_p99_max=cfg.synthetic_cluster_amp_abs_p99_max,
+        cluster_main_lobe_samples=cfg.synthetic_cluster_main_lobe_samples,
+        unresolved_oversample_factor=cfg.synthetic_unresolved_oversample_factor,
+        residual_highpass_samples=cfg.synthetic_residual_highpass_samples,
+        seismic_rms_match=cfg.synthetic_seismic_rms_match,
+        seismic_rms_target=cfg.synthetic_seismic_rms_target,
+        quality_gate_enabled=cfg.synthetic_quality_gate_enabled,
+        max_residual_near_clip_fraction=cfg.synthetic_max_residual_near_clip_fraction,
+        max_seismic_rms_ratio=cfg.synthetic_max_seismic_rms_ratio,
+        max_seismic_abs_p99_ratio=cfg.synthetic_max_seismic_abs_p99_ratio,
+        max_resample_attempts=cfg.synthetic_max_resample_attempts,
+    )
+    metadata = dict(data_bundle.metadata)
+    metadata["resolution_prior_file"] = cfg.resolution_prior_file
+    return DepthEnhancementBundle(
+        depth_cfg=depth_cfg,
+        dataset_bundle=dataset_bundle,
+        synthetic_dataset=synthetic_dataset,
+        metadata=metadata,
+    )
+
+
+def load_enhancement_model(checkpoint_path: str, cfg: EnhancementConfig) -> torch.nn.Module:
+    """Load an enhancement model from a checkpoint."""
+    from enhance.model import DilatedResNet1D
+
+    model = DilatedResNet1D(
+        in_channels=cfg.in_channels,
+        hidden_channels=cfg.hidden_channels,
+        out_channels=cfg.out_channels,
+        dilations=cfg.dilations,
+        kernel_size=cfg.kernel_size,
+    )
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    model.load_state_dict(payload["model_state_dict"])
+    model.eval()
+    return model

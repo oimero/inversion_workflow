@@ -1,7 +1,7 @@
 """Render a gallery of well-guided depth synthetic samples.
 
-The script uses the same ``WellGuidedSyntheticDepthTraceDataset`` as depth GINN
-synthetic pretraining, then writes figures for visually checking whether the
+The script uses the depth enhancement synthetic adapter, then writes figures for
+visually checking whether the
 generated AI, log-AI residual, reflectivity, and synthetic seismic waveforms are
 reasonable.
 
@@ -47,8 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("experiments/ginn_depth/train.yaml"),
-        help="Depth GINN YAML config.",
+        default=Path("experiments/enhance_depth/train.yaml"),
+        help="Stage-2 enhancement YAML config.",
     )
     parser.add_argument(
         "--num-samples",
@@ -206,7 +206,7 @@ def sample_record(sample: dict[str, Any], index: int, image_path: Path | None) -
     synthetic_raw = finite_core(as_1d(sample["target_seismic_raw"]), mask)
     residual = finite_core(as_1d(sample["target_residual"]), mask)
     ai = finite_core(as_1d(sample["target_ai"]), mask)
-    lfm = finite_core(as_1d(sample["lfm_raw"]), mask)
+    base_ai = finite_core(as_1d(sample["base_ai_raw"]), mask)
     real_rms = rms(real)
     synthetic_rms = rms(synthetic)
     real_abs_p99 = abs_percentile(real, 99.0)
@@ -228,8 +228,8 @@ def sample_record(sample: dict[str, Any], index: int, image_path: Path | None) -
         "residual_abs_max": abs_percentile(residual, 100.0),
         "ai_min": float(np.nanmin(ai)) if ai.size else float("nan"),
         "ai_max": float(np.nanmax(ai)) if ai.size else float("nan"),
-        "lfm_min": float(np.nanmin(lfm)) if lfm.size else float("nan"),
-        "lfm_max": float(np.nanmax(lfm)) if lfm.size else float("nan"),
+        "base_ai_min": float(np.nanmin(base_ai)) if base_ai.size else float("nan"),
+        "base_ai_max": float(np.nanmax(base_ai)) if base_ai.size else float("nan"),
         "rms_scale": float(sample["synthetic_rms_scale"].item()),
         "resample_attempts": int(sample.get("synthetic_resample_attempts").item())
         if "synthetic_resample_attempts" in sample
@@ -250,7 +250,7 @@ def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Pat
     target_seismic = as_1d(sample["target_seismic"])
     target_seismic_raw = as_1d(sample["target_seismic_raw"])
     real_obs = as_1d(sample["obs"])
-    lfm = as_1d(sample["lfm_raw"])
+    base_ai = as_1d(sample["base_ai_raw"])
     ai = as_1d(sample["target_ai"])
     residual = as_1d(sample["target_residual"])
     reflectivity = as_1d(sample["raw_reflectivity"])
@@ -269,7 +269,7 @@ def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Pat
     axes[0].legend(loc="upper right", fontsize=8)
     axes[0].set_ylabel("seismic")
 
-    axes[1].plot(depth, lfm, color="0.40", lw=1.0, label="AI LFM")
+    axes[1].plot(depth, base_ai, color="0.40", lw=1.0, label="base AI")
     if highres_depth is not None and highres_ai is not None:
         axes[1].plot(highres_depth, highres_ai, color="tab:orange", lw=0.45, alpha=0.55, label="internal high-res AI")
     axes[1].plot(depth, ai, color="tab:red", lw=1.0, label="target AI")
@@ -330,13 +330,13 @@ def plot_overview_page(
         seismic = as_1d(sample["target_seismic"])
         real_obs = as_1d(sample["obs"])
         ai = as_1d(sample["target_ai"])
-        lfm = as_1d(sample["lfm_raw"])
+        base_ai = as_1d(sample["base_ai_raw"])
         residual = as_1d(sample["target_residual"])
         mask = as_1d(sample["loss_mask"]).astype(bool)
 
         axes[row, 0].plot(depth, real_obs, color="0.65", lw=0.8)
         axes[row, 0].plot(depth, seismic, color="tab:blue", lw=1.0)
-        axes[row, 1].plot(depth, lfm, color="0.45", lw=0.8)
+        axes[row, 1].plot(depth, base_ai, color="0.45", lw=0.8)
         axes[row, 1].plot(depth, ai, color="tab:red", lw=0.9)
         axes[row, 2].plot(depth, residual, color="tab:purple", lw=0.9)
         axes[row, 2].axhline(0.0, color="0.2", lw=0.5)
@@ -356,7 +356,7 @@ def plot_overview_page(
             axes[row, col].grid(True, alpha=0.20)
             axes[row, col].tick_params(labelsize=7)
 
-    titles = ("seismic: real gray, synthetic blue", "AI: LFM gray, target red", "logAI residual", "RMS")
+    titles = ("seismic: real gray, synthetic blue", "AI: base gray, target red", "logAI delta", "RMS")
     for ax, title in zip(axes[0], titles):
         ax.set_title(title, fontsize=10)
     for ax in axes[-1, :3]:
@@ -504,11 +504,9 @@ def main() -> None:
 
     import torch
 
-    from ginn.enhance import load_well_resolution_prior_npz
-    from ginn_depth.config import DepthGINNConfig
-    from ginn_depth.data import build_dataset
-    from ginn_depth.physics import DepthForwardModel
-    from ginn_depth.synthetic import WellGuidedSyntheticDepthTraceDataset
+    from enhance import load_well_resolution_prior_npz
+    from enhance.config import EnhancementConfig
+    from ginn_depth.enhance import build_depth_enhancement_bundle
 
     config_path = args.config if args.config.is_absolute() else project_root / args.config
     if args.output_dir is None:
@@ -531,50 +529,18 @@ def main() -> None:
     plt.rcParams["axes.grid"] = True
     plt.rcParams["grid.alpha"] = 0.25
 
-    cfg = DepthGINNConfig.from_yaml(config_path, base_dir=project_root)
+    cfg = EnhancementConfig.from_yaml(config_path, base_dir=project_root)
     apply_overrides(cfg, args)
     cfg.device = "cpu"
     cfg.num_workers = 0
     cfg.pin_memory = False
     cfg.synthetic_traces_per_epoch = int(args.num_samples)
-    if cfg.resolution_prior_file is None:
-        raise ValueError("resolution_prior_file is required to render synthetic samples.")
 
-    LOGGER.info("Building depth dataset...")
+    LOGGER.info("Building depth enhancement dataset...")
     prior = load_well_resolution_prior_npz(cfg.resolution_prior_file)
-    dataset_bundle = build_dataset(cfg)
-    forward_model = DepthForwardModel(
-        dataset_bundle.wavelet_time_s,
-        dataset_bundle.wavelet_amp,
-        depth_axis_m=dataset_bundle.depth_axis_m,
-        amplitude_threshold=cfg.wavelet_amplitude_threshold,
-    ).cpu()
-    synthetic_dataset = WellGuidedSyntheticDepthTraceDataset(
-        dataset_bundle.train_dataset,
-        prior,
-        forward_model,
-        num_examples=cfg.synthetic_traces_per_epoch,
-        ai_min=cfg.ai_min,
-        ai_max=cfg.ai_max,
-        patch_fraction=cfg.synthetic_patch_fraction,
-        unresolved_fraction=cfg.synthetic_unresolved_fraction,
-        well_patch_scale_min=cfg.synthetic_well_patch_scale_min,
-        well_patch_scale_max=cfg.synthetic_well_patch_scale_max,
-        cluster_min_events=cfg.synthetic_cluster_min_events,
-        cluster_max_events=cfg.synthetic_cluster_max_events,
-        cluster_amp_abs_p95_min=cfg.synthetic_cluster_amp_abs_p95_min,
-        cluster_amp_abs_p99_max=cfg.synthetic_cluster_amp_abs_p99_max,
-        cluster_main_lobe_samples=cfg.synthetic_cluster_main_lobe_samples,
-        unresolved_oversample_factor=cfg.synthetic_unresolved_oversample_factor,
-        residual_highpass_samples=cfg.synthetic_residual_highpass_samples,
-        seismic_rms_match=cfg.synthetic_seismic_rms_match,
-        seismic_rms_target=cfg.synthetic_seismic_rms_target,
-        quality_gate_enabled=cfg.synthetic_quality_gate_enabled,
-        max_residual_near_clip_fraction=cfg.synthetic_max_residual_near_clip_fraction,
-        max_seismic_rms_ratio=cfg.synthetic_max_seismic_rms_ratio,
-        max_seismic_abs_p99_ratio=cfg.synthetic_max_seismic_abs_p99_ratio,
-        max_resample_attempts=cfg.synthetic_max_resample_attempts,
-    )
+    enhancement_bundle = build_depth_enhancement_bundle(cfg)
+    dataset_bundle = enhancement_bundle.dataset_bundle
+    synthetic_dataset = enhancement_bundle.synthetic_dataset
 
     LOGGER.info(
         "Synthetic config: samples=%d patch_fraction=%.3f unresolved_fraction=%.3f "

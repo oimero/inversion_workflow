@@ -1,4 +1,4 @@
-"""Render a gallery of well-guided depth synthetic samples.
+"""Render a gallery of depth stage-2 enhancement synthetic samples.
 
 The script uses the depth enhancement synthetic adapter, then writes figures for
 visually checking whether the
@@ -39,7 +39,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - import-time environment
     ) from exc
 
 
-LOGGER = logging.getLogger("ginn_depth_well_guided_synthetic_gallery")
+LOGGER = logging.getLogger("enhance_gallery_depth")
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="Output directory. Defaults to data/output_ginn_depth_well_guided_synthetic_gallery_<timestamp>.",
+        help="Output directory. Defaults to data/output_enhance_gallery_depth_<timestamp>.",
     )
     parser.add_argument("--dpi", type=int, default=130, help="Figure DPI.")
     parser.add_argument(
@@ -363,7 +363,7 @@ def plot_overview_page(
         ax.set_xlabel("depth / m")
     axes[-1, 3].set_xlabel("real RMS")
     axes[-1, 3].set_ylabel("synthetic RMS")
-    fig.suptitle(f"Well-guided synthetic samples overview page {page_index}")
+    fig.suptitle(f"Depth enhancement synthetic samples overview page {page_index}")
     fig.tight_layout()
     fig.savefig(path, dpi=dpi)
     plt.close(fig)
@@ -441,7 +441,7 @@ def write_index_html(path: Path, records: list[dict[str, Any]], overview_paths: 
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Well-Guided Synthetic Gallery</title>
+  <title>Depth Enhancement Synthetic Gallery</title>
   <style>
     body {{ font-family: Arial, sans-serif; margin: 24px; color: #222; }}
     table {{ border-collapse: collapse; font-size: 13px; }}
@@ -452,7 +452,7 @@ def write_index_html(path: Path, records: list[dict[str, Any]], overview_paths: 
   </style>
 </head>
 <body>
-  <h1>Well-Guided Synthetic Gallery</h1>
+  <h1>Depth Enhancement Synthetic Gallery</h1>
   <h2>Overview Pages</h2>
   <ul>
     {overview_links}
@@ -511,7 +511,7 @@ def main() -> None:
     config_path = args.config if args.config.is_absolute() else project_root / args.config
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = project_root / "data" / f"output_ginn_depth_well_guided_synthetic_gallery_{timestamp}"
+        output_dir = project_root / "data" / f"output_enhance_gallery_depth_{timestamp}"
     else:
         output_dir = args.output_dir if args.output_dir.is_absolute() else project_root / args.output_dir
     samples_dir = output_dir / "samples"

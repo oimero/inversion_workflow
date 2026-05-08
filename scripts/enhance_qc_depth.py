@@ -1,4 +1,4 @@
-"""Batch QC for well-guided depth synthetic samples.
+"""Batch QC for depth stage-2 enhancement synthetic samples.
 
 The script samples the depth enhancement synthetic adapter and writes a compact QC bundle:
 
@@ -22,7 +22,7 @@ from typing import Any
 import numpy as np
 
 
-LOGGER = logging.getLogger("ginn_depth_well_guided_synthetic_qc")
+LOGGER = logging.getLogger("enhance_qc_depth")
 torch = None
 
 
@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="QC output directory. Defaults to data/output_ginn_depth_well_guided_synthetic_qc_<timestamp>.",
+        help="QC output directory. Defaults to data/output_enhance_qc_depth_<timestamp>.",
     )
     parser.add_argument(
         "--main-lobe-samples",
@@ -556,7 +556,7 @@ def main() -> None:
         config_path = project_root / config_path
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = project_root / "data" / f"output_ginn_depth_well_guided_synthetic_qc_{timestamp}"
+        output_dir = project_root / "data" / f"output_enhance_qc_depth_{timestamp}"
     else:
         output_dir = args.output_dir if args.output_dir.is_absolute() else project_root / args.output_dir
 

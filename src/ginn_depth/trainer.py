@@ -32,6 +32,11 @@ from ginn_depth.synthetic import WellGuidedSyntheticDepthTraceDataset
 logger = logging.getLogger(__name__)
 
 
+def _masked_mae(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    weight = mask.to(dtype=pred.dtype)
+    return ((pred - target).abs() * weight).sum() / weight.sum().clamp(min=1.0)
+
+
 class Trainer:
     """Depth-domain GINN trainer with log-AI residual output."""
 
@@ -93,9 +98,13 @@ class Trainer:
         self.synthetic_criterion = ResolutionPretrainLoss(
             lambda_waveform=cfg.synthetic_lambda_waveform,
             lambda_residual_lowpass=cfg.synthetic_lambda_residual_lowpass,
+            lambda_residual_highpass=cfg.synthetic_lambda_residual_highpass,
             lambda_spectrum=cfg.synthetic_lambda_spectrum,
             lambda_rms=cfg.synthetic_lambda_rms,
+            lambda_rms_underfit=cfg.synthetic_lambda_rms_underfit,
+            residual_rms_floor=cfg.synthetic_residual_rms_floor,
             lowpass_samples=cfg.synthetic_residual_lowpass_samples,
+            highpass_samples=cfg.synthetic_residual_highpass_samples_loss,
         )
         logger.info(
             "Loss domain: normalized depth seismic amplitude, lambda_l2=%.3e, lambda_tv=%.3e",
@@ -205,9 +214,13 @@ class Trainer:
                     "loss": {
                         "lambda_waveform": self.cfg.synthetic_lambda_waveform,
                         "lambda_residual_lowpass": self.cfg.synthetic_lambda_residual_lowpass,
+                        "lambda_residual_highpass": self.cfg.synthetic_lambda_residual_highpass,
                         "lambda_spectrum": self.cfg.synthetic_lambda_spectrum,
                         "lambda_rms": self.cfg.synthetic_lambda_rms,
+                        "lambda_rms_underfit": self.cfg.synthetic_lambda_rms_underfit,
+                        "residual_rms_floor": self.cfg.synthetic_residual_rms_floor,
                         "residual_lowpass_samples": self.cfg.synthetic_residual_lowpass_samples,
+                        "residual_highpass_samples_loss": self.cfg.synthetic_residual_highpass_samples_loss,
                     },
                 },
             },
@@ -379,13 +392,25 @@ class Trainer:
             "loss": 0.0,
             "waveform_mae": 0.0,
             "residual_lowpass": 0.0,
+            "residual_highpass": 0.0,
             "spectrum": 0.0,
             "rms": 0.0,
+            "rms_underfit": 0.0,
             "waveform_term": 0.0,
             "residual_lowpass_term": 0.0,
+            "residual_highpass_term": 0.0,
             "spectrum_term": 0.0,
             "rms_term": 0.0,
+            "rms_underfit_term": 0.0,
             "residual_mean": 0.0,
+            "pred_residual_rms": 0.0,
+            "target_residual_rms": 0.0,
+            "residual_rms_ratio": 0.0,
+            "pred_highpass_rms": 0.0,
+            "target_highpass_rms": 0.0,
+            "highpass_rms_ratio": 0.0,
+            "zero_waveform_mae": 0.0,
+            "model_vs_zero_waveform_gain": 0.0,
         }
         n_batches = 0
 
@@ -403,6 +428,9 @@ class Trainer:
 
             ai, residual = self._compose_impedance(x, lfm_raw, taper_weight)
             d_syn = self.forward_model(ai, velocity_raw, gain=dynamic_gain)
+            with torch.no_grad():
+                d_zero = self.forward_model(torch.clamp(lfm_raw, min=1e-6), velocity_raw, gain=dynamic_gain)
+                zero_waveform_mae = _masked_mae(d_zero, d_target, loss_mask)
             loss, loss_dict = self.synthetic_criterion(
                 d_syn,
                 d_target,
@@ -423,27 +451,42 @@ class Trainer:
             for key in (
                 "waveform_mae",
                 "residual_lowpass",
+                "residual_highpass",
                 "spectrum",
                 "rms",
+                "rms_underfit",
                 "waveform_term",
                 "residual_lowpass_term",
+                "residual_highpass_term",
                 "spectrum_term",
                 "rms_term",
+                "rms_underfit_term",
+                "pred_residual_rms",
+                "target_residual_rms",
+                "residual_rms_ratio",
+                "pred_highpass_rms",
+                "target_highpass_rms",
+                "highpass_rms_ratio",
             ):
                 totals[key] += loss_dict[key]
             totals["residual_mean"] += residual.abs().mean().item()
+            totals["zero_waveform_mae"] += zero_waveform_mae.item()
+            totals["model_vs_zero_waveform_gain"] += zero_waveform_mae.item() - loss_dict["waveform_mae"]
             n_batches += 1
 
             if (batch_idx + 1) % self.cfg.log_interval == 0:
                 logger.info(
-                    "  [Synthetic %d/%d] loss=%.6f (mae=%.6f low=%.3e spec=%.3e rms=%.3e res=%.3e)",
+                    "  [Synthetic %d/%d] loss=%.6f (mae=%.6f zero=%.6f low=%.3e high=%.3e "
+                    "rms_ratio=%.3f high_ratio=%.3f res=%.3e)",
                     batch_idx + 1,
                     len(self.synthetic_dataloader),
                     loss_dict["total"],
                     loss_dict["waveform_mae"],
+                    zero_waveform_mae.item(),
                     loss_dict["residual_lowpass"],
-                    loss_dict["spectrum"],
-                    loss_dict["rms"],
+                    loss_dict["residual_highpass"],
+                    loss_dict["residual_rms_ratio"],
+                    loss_dict["highpass_rms_ratio"],
                     residual.abs().mean().item(),
                 )
 
@@ -467,14 +510,18 @@ class Trainer:
             elapsed = time.time() - start
             lr = self.optimizer.param_groups[0]["lr"]
             logger.info(
-                "Synthetic epoch %d/%d loss=%.6f mae=%.6f low=%.3e spec=%.3e rms=%.3e res=%.3e lr=%.2e time=%.1fs",
+                "Synthetic epoch %d/%d loss=%.6f mae=%.6f zero=%.6f gain=%.6f low=%.3e high=%.3e "
+                "rms_ratio=%.3f high_ratio=%.3f res=%.3e lr=%.2e time=%.1fs",
                 synthetic_epoch + 1,
                 self.cfg.synthetic_pretrain_epochs,
                 metrics["loss"],
                 metrics["waveform_mae"],
+                metrics["zero_waveform_mae"],
+                metrics["model_vs_zero_waveform_gain"],
                 metrics["residual_lowpass"],
-                metrics["spectrum"],
-                metrics["rms"],
+                metrics["residual_highpass"],
+                metrics["residual_rms_ratio"],
+                metrics["highpass_rms_ratio"],
                 metrics["residual_mean"],
                 lr,
                 elapsed,
@@ -490,13 +537,25 @@ class Trainer:
                     "synthetic_loss": metrics["loss"],
                     "synthetic_waveform_mae": metrics["waveform_mae"],
                     "synthetic_residual_lowpass": metrics["residual_lowpass"],
+                    "synthetic_residual_highpass": metrics["residual_highpass"],
                     "synthetic_spectrum": metrics["spectrum"],
                     "synthetic_rms": metrics["rms"],
+                    "synthetic_rms_underfit": metrics["rms_underfit"],
                     "synthetic_waveform_term": metrics["waveform_term"],
                     "synthetic_residual_lowpass_term": metrics["residual_lowpass_term"],
+                    "synthetic_residual_highpass_term": metrics["residual_highpass_term"],
                     "synthetic_spectrum_term": metrics["spectrum_term"],
                     "synthetic_rms_term": metrics["rms_term"],
+                    "synthetic_rms_underfit_term": metrics["rms_underfit_term"],
                     "synthetic_residual_mean": metrics["residual_mean"],
+                    "synthetic_pred_residual_rms": metrics["pred_residual_rms"],
+                    "synthetic_target_residual_rms": metrics["target_residual_rms"],
+                    "synthetic_residual_rms_ratio": metrics["residual_rms_ratio"],
+                    "synthetic_pred_highpass_rms": metrics["pred_highpass_rms"],
+                    "synthetic_target_highpass_rms": metrics["target_highpass_rms"],
+                    "synthetic_highpass_rms_ratio": metrics["highpass_rms_ratio"],
+                    "synthetic_zero_waveform_mae": metrics["zero_waveform_mae"],
+                    "synthetic_model_vs_zero_waveform_gain": metrics["model_vs_zero_waveform_gain"],
                 },
             )
 

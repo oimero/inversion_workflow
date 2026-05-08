@@ -159,11 +159,15 @@ class DepthGINNConfig:
     synthetic_max_seismic_rms_ratio: float | None = 2.0  # 单条样本 synthetic/real RMS 最大允许比例。
     synthetic_max_seismic_abs_p99_ratio: float | None = 2.5  # 单条样本 synthetic/real abs-p99 最大允许比例。
     synthetic_max_resample_attempts: int = 8  # 单条 synthetic 样本最多重采次数；过高说明分布或门控不匹配。
-    synthetic_lambda_waveform: float = 1.0  # synthetic 预训练 waveform MAE 权重。
-    synthetic_lambda_residual_lowpass: float = 0.2  # synthetic 低通 residual 逐点监督权重。
-    synthetic_lambda_spectrum: float = 0.05  # synthetic residual 频谱统计约束权重。
-    synthetic_lambda_rms: float = 0.05  # synthetic residual RMS 统计约束权重。
+    synthetic_lambda_waveform: float = 0.2  # synthetic 预训练 waveform MAE 权重；只作地震一致性弱约束。
+    synthetic_lambda_residual_lowpass: float = 0.5  # synthetic 低通 residual 逐点监督权重。
+    synthetic_lambda_residual_highpass: float = 1.0  # synthetic 高频 residual 逐点监督权重，防止低频化取巧。
+    synthetic_lambda_spectrum: float = 0.2  # synthetic residual 频谱统计约束权重。
+    synthetic_lambda_rms: float = 0.2  # synthetic residual RMS 统计约束权重。
+    synthetic_lambda_rms_underfit: float = 0.5  # 只惩罚 pred RMS 低于目标 RMS floor 的欠拟合项。
+    synthetic_residual_rms_floor: float = 0.7  # pred residual RMS 至少应达到该比例的 target RMS。
     synthetic_residual_lowpass_samples: int = 17  # residual lowpass loss 使用的平滑窗口采样点数。
+    synthetic_residual_highpass_samples_loss: int = 7  # residual highpass loss 使用的平滑窗口采样点数。
 
     # ── 验证与早停 ────────────────────────────────────────────
     # 地震道空间相关性很强，因此默认使用空间块验证，而不是随机道验证。
@@ -312,13 +316,19 @@ class DepthGINNConfig:
         for field_name in (
             "synthetic_lambda_waveform",
             "synthetic_lambda_residual_lowpass",
+            "synthetic_lambda_residual_highpass",
             "synthetic_lambda_spectrum",
             "synthetic_lambda_rms",
+            "synthetic_lambda_rms_underfit",
         ):
             if getattr(self, field_name) < 0.0:
                 raise ValueError(f"{field_name} must be non-negative, got {getattr(self, field_name)}.")
+        if self.synthetic_residual_rms_floor < 0.0:
+            raise ValueError("synthetic_residual_rms_floor must be non-negative.")
         if self.synthetic_residual_lowpass_samples < 1:
             raise ValueError("synthetic_residual_lowpass_samples must be >= 1.")
+        if self.synthetic_residual_highpass_samples_loss < 1:
+            raise ValueError("synthetic_residual_highpass_samples_loss must be >= 1.")
         if not 0.0 <= self.validation_fraction < 1.0:
             raise ValueError(f"validation_fraction must be within [0, 1), got {self.validation_fraction}.")
         if self.validation_gap_traces < 0:

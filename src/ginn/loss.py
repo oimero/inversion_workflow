@@ -118,9 +118,10 @@ class GINNLoss(nn.Module):
 class ResolutionPretrainLoss(nn.Module):
     """Synthetic resolution-pretrain loss for deterministic well-guided sharpening.
 
-    The target residual is not treated as a full-band pointwise label. Only the
-    low-passed residual is aligned pointwise; high-frequency behavior is matched
-    through amplitude spectrum and RMS terms.
+    The target residual is not treated as a pure waveform side effect. Low-pass
+    and high-pass residual components are both supervised, while spectrum/RMS
+    terms keep the residual amplitude from collapsing to the zero-residual
+    shortcut.
     """
 
     def __init__(
@@ -128,28 +129,42 @@ class ResolutionPretrainLoss(nn.Module):
         *,
         lambda_waveform: float = 1.0,
         lambda_residual_lowpass: float = 0.2,
+        lambda_residual_highpass: float = 1.0,
         lambda_spectrum: float = 0.05,
         lambda_rms: float = 0.05,
+        lambda_rms_underfit: float = 0.0,
+        residual_rms_floor: float = 0.7,
         lowpass_samples: int = 17,
+        highpass_samples: int = 7,
         eps: float = 1e-8,
     ) -> None:
         super().__init__()
         for name, value in {
             "lambda_waveform": lambda_waveform,
             "lambda_residual_lowpass": lambda_residual_lowpass,
+            "lambda_residual_highpass": lambda_residual_highpass,
             "lambda_spectrum": lambda_spectrum,
             "lambda_rms": lambda_rms,
+            "lambda_rms_underfit": lambda_rms_underfit,
         }.items():
             if value < 0.0:
                 raise ValueError(f"{name} must be non-negative, got {value}.")
         if lowpass_samples < 1:
             raise ValueError(f"lowpass_samples must be >= 1, got {lowpass_samples}.")
+        if highpass_samples < 1:
+            raise ValueError(f"highpass_samples must be >= 1, got {highpass_samples}.")
+        if residual_rms_floor < 0.0:
+            raise ValueError(f"residual_rms_floor must be non-negative, got {residual_rms_floor}.")
 
         self.lambda_waveform = float(lambda_waveform)
         self.lambda_residual_lowpass = float(lambda_residual_lowpass)
+        self.lambda_residual_highpass = float(lambda_residual_highpass)
         self.lambda_spectrum = float(lambda_spectrum)
         self.lambda_rms = float(lambda_rms)
+        self.lambda_rms_underfit = float(lambda_rms_underfit)
+        self.residual_rms_floor = float(residual_rms_floor)
         self.lowpass_samples = int(lowpass_samples)
+        self.highpass_samples = int(highpass_samples)
         self.eps = float(eps)
 
     def forward(
@@ -168,29 +183,70 @@ class ResolutionPretrainLoss(nn.Module):
         low_target = _moving_average_1d(target_residual, self.lowpass_samples)
         residual_lowpass = _masked_mean(F.smooth_l1_loss(low_pred, low_target, reduction="none"), residual_mask, eps=self.eps)
 
+        high_pred = _highpass_1d(pred_residual, self.highpass_samples)
+        high_target = _highpass_1d(target_residual, self.highpass_samples)
+        residual_highpass = _masked_mean(
+            F.smooth_l1_loss(high_pred, high_target, reduction="none"),
+            residual_mask,
+            eps=self.eps,
+        )
+
         spectrum = _masked_spectrum_loss(pred_residual, target_residual, taper_weight, eps=self.eps)
-        rms = _masked_rms_loss(pred_residual, target_residual, residual_mask, eps=self.eps)
+        pred_rms, target_rms = _masked_rms_values(pred_residual, target_residual, residual_mask, eps=self.eps)
+        pred_highpass_rms, target_highpass_rms = _masked_rms_values(high_pred, high_target, residual_mask, eps=self.eps)
+        rms = F.smooth_l1_loss(pred_rms, target_rms)
+        rms_underfit = F.smooth_l1_loss(
+            torch.relu(self.residual_rms_floor * target_rms - pred_rms),
+            torch.zeros_like(pred_rms),
+        )
 
         waveform_term = self.lambda_waveform * waveform_mae
         residual_lowpass_term = self.lambda_residual_lowpass * residual_lowpass
+        residual_highpass_term = self.lambda_residual_highpass * residual_highpass
         spectrum_term = self.lambda_spectrum * spectrum
         rms_term = self.lambda_rms * rms
-        total = waveform_term + residual_lowpass_term + spectrum_term + rms_term
+        rms_underfit_term = self.lambda_rms_underfit * rms_underfit
+        total = (
+            waveform_term
+            + residual_lowpass_term
+            + residual_highpass_term
+            + spectrum_term
+            + rms_term
+            + rms_underfit_term
+        )
+
+        pred_rms_mean = pred_rms.mean()
+        target_rms_mean = target_rms.mean()
+        pred_highpass_rms_mean = pred_highpass_rms.mean()
+        target_highpass_rms_mean = target_highpass_rms.mean()
 
         loss_dict = {
             "total": total.item(),
             "waveform_mae": waveform_mae.item(),
             "residual_lowpass": residual_lowpass.item(),
+            "residual_highpass": residual_highpass.item(),
             "spectrum": spectrum.item(),
             "rms": rms.item(),
+            "rms_underfit": rms_underfit.item(),
             "waveform_term": waveform_term.item(),
             "residual_lowpass_term": residual_lowpass_term.item(),
+            "residual_highpass_term": residual_highpass_term.item(),
             "spectrum_term": spectrum_term.item(),
             "rms_term": rms_term.item(),
+            "rms_underfit_term": rms_underfit_term.item(),
+            "pred_residual_rms": pred_rms_mean.item(),
+            "target_residual_rms": target_rms_mean.item(),
+            "residual_rms_ratio": (pred_rms_mean / target_rms_mean.clamp(min=self.eps)).item(),
+            "pred_highpass_rms": pred_highpass_rms_mean.item(),
+            "target_highpass_rms": target_highpass_rms_mean.item(),
+            "highpass_rms_ratio": (pred_highpass_rms_mean / target_highpass_rms_mean.clamp(min=self.eps)).item(),
             "lambda_waveform": self.lambda_waveform,
             "lambda_residual_lowpass": self.lambda_residual_lowpass,
+            "lambda_residual_highpass": self.lambda_residual_highpass,
             "lambda_spectrum": self.lambda_spectrum,
             "lambda_rms": self.lambda_rms,
+            "lambda_rms_underfit": self.lambda_rms_underfit,
+            "residual_rms_floor": self.residual_rms_floor,
         }
         return total, loss_dict
 
@@ -210,6 +266,10 @@ def _moving_average_1d(values: Tensor, window: int) -> Tensor:
     return F.avg_pool1d(padded, kernel_size=window, stride=1)
 
 
+def _highpass_1d(values: Tensor, window: int) -> Tensor:
+    return values - _moving_average_1d(values, window)
+
+
 def _masked_center(values: Tensor, mask: Tensor, *, eps: float) -> Tensor:
     weight = mask.to(dtype=values.dtype)
     denom = weight.sum(dim=-1, keepdim=True).clamp(min=eps)
@@ -227,8 +287,13 @@ def _masked_spectrum_loss(pred: Tensor, target: Tensor, mask: Tensor, *, eps: fl
 
 
 def _masked_rms_loss(pred: Tensor, target: Tensor, mask: Tensor, *, eps: float) -> Tensor:
+    pred_rms, target_rms = _masked_rms_values(pred, target, mask, eps=eps)
+    return F.smooth_l1_loss(pred_rms, target_rms)
+
+
+def _masked_rms_values(pred: Tensor, target: Tensor, mask: Tensor, *, eps: float) -> tuple[Tensor, Tensor]:
     weight = mask.to(dtype=pred.dtype)
     denom = weight.sum(dim=-1).clamp(min=eps)
     pred_rms = torch.sqrt((pred.pow(2) * weight).sum(dim=-1) / denom + eps)
     target_rms = torch.sqrt((target.pow(2) * weight).sum(dim=-1) / denom + eps)
-    return F.smooth_l1_loss(pred_rms, target_rms)
+    return pred_rms, target_rms

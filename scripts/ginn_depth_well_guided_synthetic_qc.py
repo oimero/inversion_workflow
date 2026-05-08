@@ -148,6 +148,33 @@ def rms(values: np.ndarray) -> float:
     return float(np.sqrt(np.mean(values * values)))
 
 
+def moving_average(values: np.ndarray, window: int) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if window <= 1:
+        return values.copy()
+    if window % 2 == 0:
+        window += 1
+    pad = window // 2
+    padded = np.pad(values, (pad, pad), mode="edge")
+    kernel = np.full((window,), 1.0 / float(window), dtype=np.float64)
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def highpass(values: np.ndarray, window: int) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    return values - moving_average(values, window)
+
+
+def masked_mae(pred: np.ndarray, target: np.ndarray, mask: np.ndarray) -> float:
+    pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+    target = np.asarray(target, dtype=np.float64).reshape(-1)
+    mask = np.asarray(mask, dtype=bool).reshape(-1)
+    valid = mask & np.isfinite(pred) & np.isfinite(target)
+    if not np.any(valid):
+        return float("nan")
+    return float(np.mean(np.abs(pred[valid] - target[valid])))
+
+
 def percentile_abs(values: np.ndarray, percentile: float) -> float:
     values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)]
@@ -196,7 +223,24 @@ def local_window(center: int, n_sample: int, half_width: int) -> slice:
     return slice(start, stop)
 
 
-def sample_metrics(sample: dict[str, torch.Tensor], *, main_lobe_samples: int, residual_clip_abs: float) -> dict[str, Any]:
+def zero_residual_seismic(sample: dict[str, torch.Tensor], forward_model: Any) -> np.ndarray:
+    lfm = sample["lfm_raw"].float().unsqueeze(0)
+    vp = sample["velocity_raw"].float().unsqueeze(0)
+    dynamic_gain = sample.get("dynamic_gain")
+    gain = dynamic_gain.float().unsqueeze(0) if dynamic_gain is not None else None
+    with torch.no_grad():
+        seismic = forward_model(torch.clamp(lfm, min=1e-6), vp, gain=gain)
+    return to_numpy_1d(seismic)
+
+
+def sample_metrics(
+    sample: dict[str, torch.Tensor],
+    *,
+    main_lobe_samples: int,
+    residual_clip_abs: float,
+    highpass_samples: int,
+    forward_model: Any,
+) -> dict[str, Any]:
     mode = "well_patch" if int(sample["synthetic_mode"].item()) == 0 else "unresolved_cluster"
     loss_mask = to_numpy_1d(sample["loss_mask"]).astype(bool)
     taper = to_numpy_1d(sample["taper_weight"]).astype(np.float64)
@@ -205,8 +249,12 @@ def sample_metrics(sample: dict[str, torch.Tensor], *, main_lobe_samples: int, r
     synthetic_raw = finite_values(to_numpy_1d(sample["target_seismic_raw"]), loss_mask)
     residual_full = to_numpy_1d(sample["target_residual"]).astype(np.float64)
     residual = finite_values(residual_full, loss_mask)
+    residual_highpass_full = highpass(residual_full, highpass_samples)
+    residual_highpass = finite_values(residual_highpass_full, loss_mask)
     ai = finite_values(to_numpy_1d(sample["target_ai"]), loss_mask)
     reflectivity_full = to_numpy_1d(sample["raw_reflectivity"]).astype(np.float64)
+    zero_seismic = zero_residual_seismic(sample, forward_model)
+    target_seismic_full = to_numpy_1d(sample["target_seismic"]).astype(np.float64)
 
     real_rms = rms(real)
     synthetic_rms = rms(synthetic)
@@ -216,6 +264,9 @@ def sample_metrics(sample: dict[str, torch.Tensor], *, main_lobe_samples: int, r
     residual_abs_max = percentile_abs(residual, 100.0)
     residual_outside = residual_full[np.asarray(taper <= 0.0)]
     residual_inside = residual_full[np.asarray(taper > 0.0)]
+    residual_energy = float(np.nansum(residual_full * residual_full))
+    residual_loss_mask_energy = float(np.nansum(residual_full[loss_mask] * residual_full[loss_mask]))
+    residual_loss_mask_energy_fraction = safe_ratio(residual_loss_mask_energy, residual_energy)
 
     active = np.flatnonzero(loss_mask & np.isfinite(residual_full))
     if active.size:
@@ -226,7 +277,7 @@ def sample_metrics(sample: dict[str, torch.Tensor], *, main_lobe_samples: int, r
     win = local_window(center, residual_full.size, half)
     refl_stop = min(win.stop, reflectivity_full.size)
     refl_win = reflectivity_full[win.start : refl_stop]
-    seismic_full = to_numpy_1d(sample["target_seismic"]).astype(np.float64)
+    seismic_full = target_seismic_full
 
     residual_detail = residual_full[win]
     reflectivity_detail = refl_win
@@ -261,13 +312,17 @@ def sample_metrics(sample: dict[str, torch.Tensor], *, main_lobe_samples: int, r
         "synthetic_abs_p99": synthetic_abs_p99,
         "synthetic_to_real_abs_p99": safe_ratio(synthetic_abs_p99, real_abs_p99),
         "residual_rms": rms(residual),
+        "target_residual_highpass_rms": rms(residual_highpass),
         "residual_abs_p95": percentile_abs(residual, 95.0),
         "residual_abs_p99": percentile_abs(residual, 99.0),
         "residual_abs_max": residual_abs_max,
+        "residual_loss_mask_energy_fraction": residual_loss_mask_energy_fraction,
         "residual_near_clip_fraction": float(np.mean(np.abs(residual) >= 0.98 * residual_clip_abs)) if residual.size else float("nan"),
         "residual_outside_taper_abs_mean": float(np.mean(np.abs(residual_outside))) if residual_outside.size else 0.0,
         "residual_inside_taper_abs_mean": float(np.mean(np.abs(residual_inside))) if residual_inside.size else 0.0,
         "residual_outside_taper_nonzero_fraction": float(np.mean(np.abs(residual_outside) > 1e-6)) if residual_outside.size else 0.0,
+        "zero_waveform_mae": masked_mae(zero_seismic, target_seismic_full, loss_mask),
+        "zero_waveform_mae_to_synthetic_rms": safe_ratio(masked_mae(zero_seismic, target_seismic_full, loss_mask), synthetic_rms),
         "ai_min": ai_min,
         "ai_max": ai_max,
         "rms_scale": float(sample["synthetic_rms_scale"].item()),
@@ -356,6 +411,24 @@ def add_quality_flags(summary: dict[str, Any], *, requested_patch_fraction: floa
     else:
         flag("WARN", "residual_clip", f"p95 residual near-clip fraction is {near_clip}; synthetic residuals may be clip-dominated.")
 
+    highpass_rms = all_stats["target_residual_highpass_rms"]["p50"]
+    if highpass_rms is not None and highpass_rms >= 0.01:
+        flag("OK", "target_highpass", f"median target residual highpass RMS is {highpass_rms:.3e}.")
+    else:
+        flag("WARN", "target_highpass", f"median target residual highpass RMS is {highpass_rms}; target may be too smooth.")
+
+    support_fraction = all_stats["residual_loss_mask_energy_fraction"]["p50"]
+    if support_fraction is not None and support_fraction >= 0.70:
+        flag("OK", "loss_mask_support", f"median residual energy inside loss_mask is {support_fraction:.3f}.")
+    else:
+        flag("WARN", "loss_mask_support", f"median residual energy inside loss_mask is {support_fraction}; high-frequency target may sit outside supervised support.")
+
+    zero_mae_ratio = all_stats["zero_waveform_mae_to_synthetic_rms"]["p50"]
+    if zero_mae_ratio is not None and zero_mae_ratio >= 0.05:
+        flag("OK", "zero_baseline", f"median zero-residual MAE/synthetic RMS is {zero_mae_ratio:.3f}.")
+    else:
+        flag("WARN", "zero_baseline", f"median zero-residual MAE/synthetic RMS is {zero_mae_ratio}; zero residual may be too competitive.")
+
     cluster = summary["by_mode"].get("unresolved_cluster")
     if cluster:
         detail_ratio = cluster["dominant_window_detail_to_seismic_peak_ratio"]["p50"]
@@ -413,9 +486,13 @@ def log_summary(summary: dict[str, Any], flags: list[dict[str, str]]) -> None:
         "synthetic_to_real_rms",
         "synthetic_to_real_abs_p99",
         "residual_rms",
+        "target_residual_highpass_rms",
+        "residual_loss_mask_energy_fraction",
         "residual_abs_p99",
         "residual_near_clip_fraction",
         "residual_outside_taper_nonzero_fraction",
+        "zero_waveform_mae",
+        "zero_waveform_mae_to_synthetic_rms",
         "rms_scale",
         "resample_attempts",
     ):
@@ -581,7 +658,13 @@ def main() -> None:
     rows = []
     for idx in range(args.num_samples):
         sample = synthetic_dataset[idx]
-        row = sample_metrics(sample, main_lobe_samples=main_lobe_samples, residual_clip_abs=synthetic_dataset.residual_max_abs)
+        row = sample_metrics(
+            sample,
+            main_lobe_samples=main_lobe_samples,
+            residual_clip_abs=synthetic_dataset.residual_max_abs,
+            highpass_samples=cfg.synthetic_residual_highpass_samples_loss,
+            forward_model=forward_model,
+        )
         row["sample_index"] = idx
         rows.append(row)
         if (idx + 1) % max(1, args.num_samples // 10) == 0:
@@ -604,6 +687,7 @@ def main() -> None:
         "synthetic_cluster_main_lobe_samples": cfg.synthetic_cluster_main_lobe_samples,
         "synthetic_unresolved_oversample_factor": cfg.synthetic_unresolved_oversample_factor,
         "synthetic_residual_highpass_samples": cfg.synthetic_residual_highpass_samples,
+        "synthetic_residual_highpass_samples_loss": cfg.synthetic_residual_highpass_samples_loss,
         "synthetic_seismic_rms_match": cfg.synthetic_seismic_rms_match,
         "synthetic_seismic_rms_target": cfg.synthetic_seismic_rms_target,
         "synthetic_quality_gate_enabled": cfg.synthetic_quality_gate_enabled,

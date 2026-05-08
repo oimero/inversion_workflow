@@ -296,14 +296,19 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         safe_lfm = np.maximum(lfm, 1e-6)
         mode = self._sample_mode()
         if mode == "well_patch":
-            residual = self._sample_well_patch_residual(lfm.size, taper)
+            residual = self._sample_well_patch_residual(lfm.size, taper, loss_mask)
             mode_code = 0
             highres_residual = None
             highres_ai = None
             highres_reflectivity = None
             highres_depth = None
         else:
-            residual, highres_residual, highres_depth = self._sample_unresolved_cluster_residual(lfm.size, taper, safe_lfm)
+            residual, highres_residual, highres_depth = self._sample_unresolved_cluster_residual(
+                lfm.size,
+                taper,
+                loss_mask,
+                safe_lfm,
+            )
             mode_code = 1
 
         if mode == "well_patch":
@@ -429,11 +434,17 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         p_patch = self.patch_fraction / (self.patch_fraction + self.unresolved_fraction)
         return "well_patch" if float(np.random.random()) < p_patch else "unresolved_cluster"
 
-    def _sample_well_patch_residual(self, n_sample: int, taper: np.ndarray) -> np.ndarray:
+    def _sample_well_patch_residual(
+        self,
+        n_sample: int,
+        taper: np.ndarray,
+        support_mask: np.ndarray,
+    ) -> np.ndarray:
         residual = np.zeros((n_sample,), dtype=np.float32)
         patch_window = self._sample_well_patch_window(
             n_sample,
             taper,
+            support_mask,
             min_len_samples=max(8, self.cluster_main_lobe_samples),
         )
         if patch_window is None:
@@ -452,10 +463,16 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         self,
         n_sample: int,
         taper: np.ndarray,
+        support_mask: np.ndarray | None = None,
         *,
         min_len_samples: int,
     ) -> tuple[np.ndarray, int] | None:
-        active_runs = true_runs(np.asarray(taper) > 0.0)
+        active = np.asarray(taper) > 0.0
+        if support_mask is not None:
+            support = np.asarray(support_mask, dtype=bool).reshape(-1)
+            if support.shape == active.shape and np.any(active & support):
+                active = active & support
+        active_runs = true_runs(active)
         if not active_runs:
             return None
 
@@ -482,11 +499,15 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         self,
         n_sample: int,
         taper: np.ndarray,
+        support_mask: np.ndarray,
         safe_lfm: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
         coarse = np.zeros((n_sample,), dtype=np.float32)
         taper_1d = np.asarray(taper, dtype=np.float32).reshape(-1)
+        support = np.asarray(support_mask, dtype=bool).reshape(-1)
         active = taper_1d > 0.0
+        if support.shape == active.shape and np.any(active & support):
+            active = active & support
         active_runs = true_runs(active)
         if not active_runs:
             return coarse, None, None
@@ -495,6 +516,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         patch_window = self._sample_well_patch_window(
             n_sample,
             taper_1d,
+            support,
             min_len_samples=max(main_lobe * 2, 16),
         )
         if patch_window is None:

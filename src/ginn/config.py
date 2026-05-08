@@ -34,8 +34,7 @@ class GINNConfig:
     """
 
     # ── 地震信息 ──────────────────────────────────────────────
-    # 输入地震体及 SEG-Y 几何读取方式。这里的头字节和步长必须与数据导入/QC
-    # 阶段保持一致；一旦改错，后面的层位、LFM、动态增益都会错位。
+    # 输入地震体及 SEG-Y 几何读取方式。这里的头字节位置和步长要十分小心。
     seismic_file: Path = Path("your_seismic_file.sgy")  # 输入地震体路径。
     segy_iline: int = 189  # inline 头字节位置。
     segy_xline: int = 193  # xline 头字节位置。
@@ -46,10 +45,10 @@ class GINNConfig:
     # 目的层顶/底界决定 waveform loss 和 residual 自由度的有效区域。下面几个
     # 可选 QC 参数用于防御层位异常；除非层位诊断显示薄层、跳点或孤立异常，
     # 否则建议保持默认。
-    top_horizon_file: Path = Path("your_top_horizon_file")  # 目标层顶界解释面路径。
-    bot_horizon_file: Path = Path("your_bot_horizon_file")  # 目标层底界解释面路径。
-    target_layer_min_thickness: float | None = None  # 相邻层位最小厚度；为空时使用 sample_step。
-    target_layer_nearest_distance_limit: float | None = None  # nearest 兜底最大距离；为空时不限制。
+    top_horizon_file: Path = Path("your_top_horizon_file")  # 目的层顶界解释面路径。
+    bot_horizon_file: Path = Path("your_bot_horizon_file")  # 目的层底界解释面路径。
+    target_layer_min_thickness: float | None = None  # 相邻层位最小厚度；为空时使用地震样本间距。
+    target_layer_nearest_distance_limit: float | None = None  # 层位解释 nearest 插值的最远距离；为空时不限制。
     target_layer_outlier_threshold: float | None = 0.02  # 孤立层位点剔除阈值；为空时禁用。
     target_layer_outlier_min_neighbor_count: int = 2  # 孤立点判断所需最小十字邻域有效点数。
 
@@ -69,19 +68,19 @@ class GINNConfig:
     # Ricker 子波主要用于快速实验或缺少标定子波时的兜底。
     wavelet_source: WaveletSource = "ricker_wavelet"  # 子波来源：预计算子波或 Ricker 子波。
     wavelet_file: Path | None = Path("your_precomputed_wavelet.csv")  # 预计算子波 CSV。
-    wavelet_type: str = "ricker"  # 正演使用的子波类型。
-    wavelet_freq: float = 25.0  # 子波主频（Hz）。
+    wavelet_type: str = "ricker"  # 生成 Ricker 子波时使用的子波类型名。
+    wavelet_freq: float = 25.0  # Ricker 子波主频（Hz）。
     wavelet_dt: float = 0.001  # 子波采样间隔（秒）。
     wavelet_length: int = 301  # 子波长度（采样点数，建议奇数）。
 
     # ── 振幅补偿 ──────────────────────────────────────────────
     # 振幅补偿让正演地震和归一化观测地震处于同一量级。fixed_gain 是全局
-    # 标量；dynamic_gain_model 是随样点变化的增益模型，通常应配合
+    # 标量；dynamic_gain_model 是随样点变化的增益体，通常应配合
     # include_dynamic_gain_input=True，让网络看到增益上下文。
-    gain_source: GainSource = "fixed_gain"  # 振幅补偿来源：固定标量增益或动态增益模型。
+    gain_source: GainSource = "fixed_gain"  # 振幅补偿来源：固定标量增益或动态增益体。
     fixed_gain: float | None = None  # 固定标量增益；gain_source=fixed_gain 且为空时自动估计。
     fixed_gain_num_traces: int = 256  # 自动估计固定增益时采样的有效道数。
-    dynamic_gain_model: Path | None = None  # gain_source=dynamic_gain_model 时使用的预计算动态增益模型。
+    dynamic_gain_model: Path | None = None  # gain_source=dynamic_gain_model 时使用的预计算动态增益体。
 
     # ── 网络结构 ──────────────────────────────────────────────
     # 网络输入通道顺序为：地震、可选 LFM、可选 mask、可选 dynamic gain log-ratio。
@@ -101,7 +100,7 @@ class GINNConfig:
     # 常规 Adam 训练参数。未来如需加入新的训练阶段，应优先在专用 config 中
     # 显式配置，避免把关键训练常数藏在 trainer 里。
     batch_size: int = 16  # 每个 batch 的道数。
-    epochs: int = 50  # 最大训练轮数。
+    epochs: int = 30  # 最大训练轮数。
     lr: float = 1e-3  # Adam 初始学习率。
     weight_decay: float = 1e-4  # Adam 权重衰减系数。
     grad_clip: float = 1.0  # 梯度裁剪阈值。
@@ -111,9 +110,9 @@ class GINNConfig:
     # L2/TV 越强，越能抑制不稳定高频，但也越容易洗掉分辨率；做高分辨率实验
     # 时应和 baseline 对照，不要只看 waveform loss。
     lambda_l2: float = 0.03  # 高频扰动 L2 正则化权重，约束阻抗尺度不要漂移。
-    lambda_tv: float = 0.0  # 高频扰动 TV 正则化权重，抑制高频 ringing。
-    ai_min: float = 3000.0  # 目标层内允许的波阻抗下界。
-    ai_max: float = 30000.0  # 目标层内允许的波阻抗上界。
+    lambda_tv: float = 0.0  # 高频扰动 TV 正则化权重，抑制层内高频 ringing。
+    # ai_min: float = 3000.0  # 目的层内允许的波阻抗下界。
+    # ai_max: float = 30000.0  # 目的层内允许的波阻抗上界。
     zero_residual_outside_mask: bool = True  # 是否将层外高频扰动通过 taper 平滑压回 0。
     boundary_effect_samples: int | None = None  # 为空时按子波 5% 有效半支撑自动计算。
 

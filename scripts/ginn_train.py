@@ -4,8 +4,8 @@
 --------
 在仓库根目录下运行：
 
-    python experiments/ginn/run_training.py
-    python experiments/ginn/run_training.py --config experiments/ginn/train.yaml
+    python scripts/ginn_train.py
+    python scripts/ginn_train.py --config experiments/ginn/train.yaml
 
 需要将 ``src`` 加入 PYTHONPATH，或通过 ``train_network.ps1`` 类似脚本启动。
 """
@@ -17,7 +17,7 @@ from pathlib import Path
 
 # ── 确保 src/ 在搜索路径中 ──
 _script_dir = Path(__file__).resolve().parent
-_repo_root = _script_dir.parent.parent
+_repo_root = _script_dir.parent
 _src_dir = _repo_root / "src"
 if str(_src_dir) not in sys.path:
     sys.path.insert(0, str(_src_dir))
@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=_script_dir / "train.yaml",
+        default=_repo_root / "experiments" / "ginn" / "train.yaml",
         help="Path to the YAML config file.",
     )
     return parser.parse_args()

@@ -1,4 +1,9 @@
-"""Synthetic depth-domain samples for GINN resolution-prior experiments."""
+"""Standalone synthetic depth-domain samples for resolution enhancement experiments.
+
+This module is intentionally not wired into ``ginn_depth.trainer``.  It keeps the
+well-prior and thin-bed sample generation utilities that may be reused by a
+future second-stage enhancement workflow built on top of a stage-1 GINN base AI.
+"""
 
 from __future__ import annotations
 

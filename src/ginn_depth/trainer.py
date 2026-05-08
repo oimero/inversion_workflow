@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from ginn.data import DYNAMIC_GAIN_LOG_CLIP
 from ginn.trainer import (
     append_metrics_csv,
     build_common_run_summary,
@@ -24,17 +23,11 @@ from ginn.trainer import (
 )
 from ginn_depth.config import DepthGINNConfig
 from ginn_depth.data import build_dataset
-from ginn_depth.loss import GINNLoss, ResolutionPretrainLoss
+from ginn_depth.loss import GINNLoss
 from ginn_depth.model import DilatedResNet1D
 from ginn_depth.physics import DepthForwardModel
-from ginn_depth.synthetic import WellGuidedSyntheticDepthTraceDataset
 
 logger = logging.getLogger(__name__)
-
-
-def _masked_mae(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    weight = mask.to(dtype=pred.dtype)
-    return ((pred - target).abs() * weight).sum() / weight.sum().clamp(min=1.0)
 
 
 class Trainer:
@@ -95,17 +88,6 @@ class Trainer:
         ).to(self.device)
 
         self.criterion = GINNLoss(lambda_l2=cfg.lambda_l2, lambda_tv=cfg.lambda_tv)
-        self.synthetic_criterion = ResolutionPretrainLoss(
-            lambda_waveform=cfg.synthetic_lambda_waveform,
-            lambda_residual_lowpass=cfg.synthetic_lambda_residual_lowpass,
-            lambda_residual_highpass=cfg.synthetic_lambda_residual_highpass,
-            lambda_spectrum=cfg.synthetic_lambda_spectrum,
-            lambda_rms=cfg.synthetic_lambda_rms,
-            lambda_rms_underfit=cfg.synthetic_lambda_rms_underfit,
-            residual_rms_floor=cfg.synthetic_residual_rms_floor,
-            lowpass_samples=cfg.synthetic_residual_lowpass_samples,
-            highpass_samples=cfg.synthetic_residual_highpass_samples_loss,
-        )
         logger.info(
             "Loss domain: normalized depth seismic amplitude, lambda_l2=%.3e, lambda_tv=%.3e",
             self.cfg.lambda_l2,
@@ -118,7 +100,6 @@ class Trainer:
             T_max=cfg.epochs,
             eta_min=cfg.lr * 0.01,
         )
-        self.synthetic_dataloader = self._build_synthetic_dataloader() if cfg.synthetic_pretrain_enabled else None
 
         cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_path = cfg.checkpoint_dir / "metrics.csv"
@@ -185,94 +166,10 @@ class Trainer:
                     "ai_lfm_file": self.cfg.ai_lfm_file,
                     "vp_lfm_file": self.cfg.vp_lfm_file,
                 },
-                "synthetic_pretrain": {
-                    "enabled": self.cfg.synthetic_pretrain_enabled,
-                    "resolution_prior_file": self.cfg.resolution_prior_file,
-                    "epochs": self.cfg.synthetic_pretrain_epochs,
-                    "traces_per_epoch": self.cfg.synthetic_traces_per_epoch,
-                    "batch_size": self.cfg.synthetic_batch_size or self.cfg.batch_size,
-                    "dataset": {
-                        "patch_fraction": self.cfg.synthetic_patch_fraction,
-                        "unresolved_fraction": self.cfg.synthetic_unresolved_fraction,
-                        "well_patch_scale_min": self.cfg.synthetic_well_patch_scale_min,
-                        "well_patch_scale_max": self.cfg.synthetic_well_patch_scale_max,
-                        "cluster_min_events": self.cfg.synthetic_cluster_min_events,
-                        "cluster_max_events": self.cfg.synthetic_cluster_max_events,
-                        "cluster_amp_abs_p95_min": self.cfg.synthetic_cluster_amp_abs_p95_min,
-                        "cluster_amp_abs_p99_max": self.cfg.synthetic_cluster_amp_abs_p99_max,
-                        "cluster_main_lobe_samples": self.cfg.synthetic_cluster_main_lobe_samples,
-                        "unresolved_oversample_factor": self.cfg.synthetic_unresolved_oversample_factor,
-                        "residual_highpass_samples": self.cfg.synthetic_residual_highpass_samples,
-                        "seismic_rms_match": self.cfg.synthetic_seismic_rms_match,
-                        "seismic_rms_target": self.cfg.synthetic_seismic_rms_target,
-                        "quality_gate_enabled": self.cfg.synthetic_quality_gate_enabled,
-                        "max_residual_near_clip_fraction": self.cfg.synthetic_max_residual_near_clip_fraction,
-                        "max_seismic_rms_ratio": self.cfg.synthetic_max_seismic_rms_ratio,
-                        "max_seismic_abs_p99_ratio": self.cfg.synthetic_max_seismic_abs_p99_ratio,
-                        "max_resample_attempts": self.cfg.synthetic_max_resample_attempts,
-                    },
-                    "loss": {
-                        "lambda_waveform": self.cfg.synthetic_lambda_waveform,
-                        "lambda_residual_lowpass": self.cfg.synthetic_lambda_residual_lowpass,
-                        "lambda_residual_highpass": self.cfg.synthetic_lambda_residual_highpass,
-                        "lambda_spectrum": self.cfg.synthetic_lambda_spectrum,
-                        "lambda_rms": self.cfg.synthetic_lambda_rms,
-                        "lambda_rms_underfit": self.cfg.synthetic_lambda_rms_underfit,
-                        "residual_rms_floor": self.cfg.synthetic_residual_rms_floor,
-                        "residual_lowpass_samples": self.cfg.synthetic_residual_lowpass_samples,
-                        "residual_highpass_samples_loss": self.cfg.synthetic_residual_highpass_samples_loss,
-                    },
-                },
             },
         )
         write_json(self.run_summary_path, summary)
         logger.info("Run summary saved: %s", self.run_summary_path)
-
-    def _build_synthetic_dataloader(self) -> DataLoader:
-        if self.cfg.resolution_prior_file is None:
-            raise ValueError("resolution_prior_file is required when synthetic pretrain is enabled.")
-        synthetic_dataset = WellGuidedSyntheticDepthTraceDataset(
-            self.train_dataset,
-            self.cfg.resolution_prior_file,
-            self.forward_model,
-            num_examples=self.cfg.synthetic_traces_per_epoch,
-            ai_min=self.cfg.ai_min,
-            ai_max=self.cfg.ai_max,
-            patch_fraction=self.cfg.synthetic_patch_fraction,
-            unresolved_fraction=self.cfg.synthetic_unresolved_fraction,
-            well_patch_scale_min=self.cfg.synthetic_well_patch_scale_min,
-            well_patch_scale_max=self.cfg.synthetic_well_patch_scale_max,
-            cluster_min_events=self.cfg.synthetic_cluster_min_events,
-            cluster_max_events=self.cfg.synthetic_cluster_max_events,
-            cluster_amp_abs_p95_min=self.cfg.synthetic_cluster_amp_abs_p95_min,
-            cluster_amp_abs_p99_max=self.cfg.synthetic_cluster_amp_abs_p99_max,
-            cluster_main_lobe_samples=self.cfg.synthetic_cluster_main_lobe_samples,
-            unresolved_oversample_factor=self.cfg.synthetic_unresolved_oversample_factor,
-            residual_highpass_samples=self.cfg.synthetic_residual_highpass_samples,
-            seismic_rms_match=self.cfg.synthetic_seismic_rms_match,
-            seismic_rms_target=self.cfg.synthetic_seismic_rms_target,
-            quality_gate_enabled=self.cfg.synthetic_quality_gate_enabled,
-            max_residual_near_clip_fraction=self.cfg.synthetic_max_residual_near_clip_fraction,
-            max_seismic_rms_ratio=self.cfg.synthetic_max_seismic_rms_ratio,
-            max_seismic_abs_p99_ratio=self.cfg.synthetic_max_seismic_abs_p99_ratio,
-            max_resample_attempts=self.cfg.synthetic_max_resample_attempts,
-        )
-        batch_size = self.cfg.synthetic_batch_size or self.cfg.batch_size
-        dataloader = DataLoader(
-            synthetic_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=0,
-            pin_memory=self.cfg.pin_memory,
-            drop_last=False,
-        )
-        logger.info(
-            "Synthetic pretrain DataLoader: %d traces, %d batches/epoch, batch_size=%d",
-            len(synthetic_dataset),
-            len(dataloader),
-            batch_size,
-        )
-        return dataloader
 
     def _compose_impedance(
         self,
@@ -289,26 +186,6 @@ class Trainer:
             residual = residual * taper_weight.to(dtype=residual.dtype)
         ai = safe_lfm * torch.exp(residual)
         return ai, residual
-
-    def _compose_synthetic_input(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        target_seismic = batch["target_seismic"].to(self.device)
-        lfm_raw = batch["lfm_raw"].to(self.device)
-        mask = batch["mask"].to(self.device)
-        channels = [target_seismic]
-        if self.cfg.include_lfm_input:
-            channels.append(lfm_raw / float(self.train_dataset.lfm_scale))
-        if self.cfg.include_mask_input:
-            channels.append(mask.to(dtype=target_seismic.dtype))
-        if self.cfg.include_dynamic_gain_input:
-            dynamic_gain = batch.get("dynamic_gain")
-            if dynamic_gain is None:
-                channels.append(torch.zeros_like(target_seismic))
-            else:
-                gain = dynamic_gain.to(self.device)
-                median = self.train_dataset.dynamic_gain_median or 1.0
-                gain_channel = torch.log(torch.clamp(gain, min=1e-6) / float(median))
-                channels.append(torch.clamp(gain_channel, -DYNAMIC_GAIN_LOG_CLIP, DYNAMIC_GAIN_LOG_CLIP))
-        return torch.cat(channels, dim=1)
 
     def _run_epoch(self, dataloader: DataLoader, *, training: bool) -> dict[str, float]:
         self.model.train(training)
@@ -384,183 +261,6 @@ class Trainer:
             "residual_mean": total_residual_mean / n_batches,
         }
 
-    def _run_synthetic_pretrain_epoch(self) -> dict[str, float]:
-        if self.synthetic_dataloader is None:
-            raise RuntimeError("Synthetic pretrain requested without a synthetic dataloader.")
-        self.model.train(True)
-        totals = {
-            "loss": 0.0,
-            "waveform_mae": 0.0,
-            "residual_lowpass": 0.0,
-            "residual_highpass": 0.0,
-            "spectrum": 0.0,
-            "rms": 0.0,
-            "rms_underfit": 0.0,
-            "waveform_term": 0.0,
-            "residual_lowpass_term": 0.0,
-            "residual_highpass_term": 0.0,
-            "spectrum_term": 0.0,
-            "rms_term": 0.0,
-            "rms_underfit_term": 0.0,
-            "residual_mean": 0.0,
-            "pred_residual_rms": 0.0,
-            "target_residual_rms": 0.0,
-            "residual_rms_ratio": 0.0,
-            "pred_highpass_rms": 0.0,
-            "target_highpass_rms": 0.0,
-            "highpass_rms_ratio": 0.0,
-            "zero_waveform_mae": 0.0,
-            "model_vs_zero_waveform_gain": 0.0,
-        }
-        n_batches = 0
-
-        for batch_idx, batch in enumerate(self.synthetic_dataloader):
-            x = self._compose_synthetic_input(batch)
-            d_target = batch["target_seismic"].to(self.device)
-            target_residual = batch["target_residual"].to(self.device)
-            loss_mask = batch["loss_mask"].to(self.device)
-            taper_weight = batch["taper_weight"].to(self.device)
-            lfm_raw = batch["lfm_raw"].to(self.device)
-            velocity_raw = batch["velocity_raw"].to(self.device)
-            dynamic_gain = batch.get("dynamic_gain")
-            if dynamic_gain is not None:
-                dynamic_gain = dynamic_gain.to(self.device)
-
-            ai, residual = self._compose_impedance(x, lfm_raw, taper_weight)
-            d_syn = self.forward_model(ai, velocity_raw, gain=dynamic_gain)
-            with torch.no_grad():
-                d_zero = self.forward_model(torch.clamp(lfm_raw, min=1e-6), velocity_raw, gain=dynamic_gain)
-                zero_waveform_mae = _masked_mae(d_zero, d_target, loss_mask)
-            loss, loss_dict = self.synthetic_criterion(
-                d_syn,
-                d_target,
-                loss_mask,
-                residual,
-                target_residual,
-                loss_mask,
-                taper_weight,
-            )
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
-            self.optimizer.step()
-            self.global_step += 1
-
-            totals["loss"] += loss_dict["total"]
-            for key in (
-                "waveform_mae",
-                "residual_lowpass",
-                "residual_highpass",
-                "spectrum",
-                "rms",
-                "rms_underfit",
-                "waveform_term",
-                "residual_lowpass_term",
-                "residual_highpass_term",
-                "spectrum_term",
-                "rms_term",
-                "rms_underfit_term",
-                "pred_residual_rms",
-                "target_residual_rms",
-                "residual_rms_ratio",
-                "pred_highpass_rms",
-                "target_highpass_rms",
-                "highpass_rms_ratio",
-            ):
-                totals[key] += loss_dict[key]
-            totals["residual_mean"] += residual.abs().mean().item()
-            totals["zero_waveform_mae"] += zero_waveform_mae.item()
-            totals["model_vs_zero_waveform_gain"] += zero_waveform_mae.item() - loss_dict["waveform_mae"]
-            n_batches += 1
-
-            if (batch_idx + 1) % self.cfg.log_interval == 0:
-                logger.info(
-                    "  [Synthetic %d/%d] loss=%.6f (mae=%.6f zero=%.6f low=%.3e high=%.3e "
-                    "rms_ratio=%.3f high_ratio=%.3f res=%.3e)",
-                    batch_idx + 1,
-                    len(self.synthetic_dataloader),
-                    loss_dict["total"],
-                    loss_dict["waveform_mae"],
-                    zero_waveform_mae.item(),
-                    loss_dict["residual_lowpass"],
-                    loss_dict["residual_highpass"],
-                    loss_dict["residual_rms_ratio"],
-                    loss_dict["highpass_rms_ratio"],
-                    residual.abs().mean().item(),
-                )
-
-        n_batches = max(n_batches, 1)
-        return {key: value / n_batches for key, value in totals.items()}
-
-    def _pretrain_synthetic(self) -> None:
-        if not self.cfg.synthetic_pretrain_enabled:
-            return
-        logger.info("=" * 60)
-        logger.info(
-            "Start well-guided synthetic pretrain: %d epochs, traces_per_epoch=%d",
-            self.cfg.synthetic_pretrain_epochs,
-            self.cfg.synthetic_traces_per_epoch,
-        )
-        logger.info("=" * 60)
-
-        for synthetic_epoch in range(self.cfg.synthetic_pretrain_epochs):
-            start = time.time()
-            metrics = self._run_synthetic_pretrain_epoch()
-            elapsed = time.time() - start
-            lr = self.optimizer.param_groups[0]["lr"]
-            logger.info(
-                "Synthetic epoch %d/%d loss=%.6f mae=%.6f zero=%.6f gain=%.6f low=%.3e high=%.3e "
-                "rms_ratio=%.3f high_ratio=%.3f res=%.3e lr=%.2e time=%.1fs",
-                synthetic_epoch + 1,
-                self.cfg.synthetic_pretrain_epochs,
-                metrics["loss"],
-                metrics["waveform_mae"],
-                metrics["zero_waveform_mae"],
-                metrics["model_vs_zero_waveform_gain"],
-                metrics["residual_lowpass"],
-                metrics["residual_highpass"],
-                metrics["residual_rms_ratio"],
-                metrics["highpass_rms_ratio"],
-                metrics["residual_mean"],
-                lr,
-                elapsed,
-            )
-            append_metrics_csv(
-                self.metrics_path,
-                {
-                    "phase": "synthetic_pretrain",
-                    "epoch": synthetic_epoch + 1,
-                    "global_step": self.global_step,
-                    "lr": lr,
-                    "epoch_time_s": elapsed,
-                    "synthetic_loss": metrics["loss"],
-                    "synthetic_waveform_mae": metrics["waveform_mae"],
-                    "synthetic_residual_lowpass": metrics["residual_lowpass"],
-                    "synthetic_residual_highpass": metrics["residual_highpass"],
-                    "synthetic_spectrum": metrics["spectrum"],
-                    "synthetic_rms": metrics["rms"],
-                    "synthetic_rms_underfit": metrics["rms_underfit"],
-                    "synthetic_waveform_term": metrics["waveform_term"],
-                    "synthetic_residual_lowpass_term": metrics["residual_lowpass_term"],
-                    "synthetic_residual_highpass_term": metrics["residual_highpass_term"],
-                    "synthetic_spectrum_term": metrics["spectrum_term"],
-                    "synthetic_rms_term": metrics["rms_term"],
-                    "synthetic_rms_underfit_term": metrics["rms_underfit_term"],
-                    "synthetic_residual_mean": metrics["residual_mean"],
-                    "synthetic_pred_residual_rms": metrics["pred_residual_rms"],
-                    "synthetic_target_residual_rms": metrics["target_residual_rms"],
-                    "synthetic_residual_rms_ratio": metrics["residual_rms_ratio"],
-                    "synthetic_pred_highpass_rms": metrics["pred_highpass_rms"],
-                    "synthetic_target_highpass_rms": metrics["target_highpass_rms"],
-                    "synthetic_highpass_rms_ratio": metrics["highpass_rms_ratio"],
-                    "synthetic_zero_waveform_mae": metrics["zero_waveform_mae"],
-                    "synthetic_model_vs_zero_waveform_gain": metrics["model_vs_zero_waveform_gain"],
-                },
-            )
-
-        self.save_checkpoint("synthetic_pretrained.pt")
-
     def train_one_epoch(self) -> dict[str, float]:
         return self._run_epoch(self.train_dataloader, training=True)
 
@@ -605,7 +305,6 @@ class Trainer:
         logger.info("=" * 60)
 
         total_start = time.time()
-        self._pretrain_synthetic()
         epochs_without_improvement = 0
         for epoch in range(self.cfg.epochs):
             self.epoch = epoch
@@ -691,7 +390,6 @@ class Trainer:
                 self.metrics_path,
                 {
                     "epoch": epoch + 1,
-                    "phase": "real_train",
                     "global_step": self.global_step,
                     "lr": lr,
                     "epoch_time_s": elapsed,

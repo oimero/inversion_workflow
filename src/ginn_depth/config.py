@@ -1,4 +1,4 @@
-"""Configuration schema for depth-domain GINN training."""
+"""ginn_depth.config — 深度域 GINN 配置 schema、校验与加载。"""
 
 from __future__ import annotations
 
@@ -27,84 +27,108 @@ _PATH_FIELDS = {
 
 @dataclass
 class DepthGINNConfig:
-    """Depth-domain GINN training configuration."""
+    """深度域 GINN 训练与推理的完整配置。"""
 
     # ── 地震信息 ──────────────────────────────────────────────
-    seismic_file: Path = Path("your_depth_seismic.segy")
-    segy_iline: int = 189
-    segy_xline: int = 193
-    segy_istep: int = 1
-    segy_xstep: int = 1
+    # 输入深度域地震体及 SEG-Y 几何读取方式。这里的头字节和步长必须与数据导入/QC
+    # 阶段保持一致；一旦改错，层位、LFM、Vp、动态增益都会错位。
+    seismic_file: Path = Path("your_depth_seismic.segy")  # 输入深度域地震体路径。
+    segy_iline: int = 189  # inline 头字节位置。
+    segy_xline: int = 193  # xline 头字节位置。
+    segy_istep: int = 1  # inline 抽样步长。
+    segy_xstep: int = 1  # xline 抽样步长。
 
     # ── 目的层 ────────────────────────────────────────────────
-    top_horizon_file: Path = Path("your_top_horizon")
-    bot_horizon_file: Path = Path("your_bottom_horizon")
-    target_layer_min_thickness: float | None = None
-    target_layer_nearest_distance_limit: float | None = None
-    target_layer_outlier_threshold: float | None = None
-    target_layer_outlier_min_neighbor_count: int = 2
+    # 目的层顶/底界决定 waveform loss 和 residual 自由度的有效区域。下面几个
+    # 可选 QC 参数用于防御层位异常；除非层位诊断显示薄层、跳点或孤立异常，
+    # 否则建议保持默认。
+    top_horizon_file: Path = Path("your_top_horizon")  # 目标层顶界解释面路径。
+    bot_horizon_file: Path = Path("your_bottom_horizon")  # 目标层底界解释面路径。
+    target_layer_min_thickness: float | None = None  # 目的层最小厚度；为空时不按厚度过滤。
+    target_layer_nearest_distance_limit: float | None = None  # 层位 nearest 兜底最大距离；为空时不限制。
+    target_layer_outlier_threshold: float | None = None  # 孤立层位点剔除阈值；为空时禁用。
+    target_layer_outlier_min_neighbor_count: int = 2  # 孤立点判断所需最小十字邻域有效点数。
 
     # ── 低频模型 ──────────────────────────────────────────────
-    ai_lfm_file: Path = Path("your_ai_lfm_depth.npz")
+    # AI LFM 是低频锚点，网络输出 logAI residual，并组装为
+    # AI = ai_lfm_file * exp(residual)。
+    ai_lfm_file: Path = Path("your_ai_lfm_depth.npz")  # 深度域 AI 低频模型 NPZ。
 
     # ── 深度域子波 ────────────────────────────────────────────
-    vp_lfm_file: Path = Path("your_vp_lfm_depth.npz")
-    wavelet_source: WaveletSource = "precomputed_wavelet"
-    wavelet_file: Path | None = Path("your_wavelet.csv")
-    wavelet_type: str = "ricker"
-    wavelet_freq: float = 25.0
-    wavelet_dt: float = 0.001
-    wavelet_length: int = 301
-    wavelet_amplitude_threshold: float = 1e-7
+    # Vp LFM 和子波共同进入 DepthForwardModel。真实实验优先使用井震标定得到
+    # 的预计算子波；Ricker 子波主要用于快速实验或缺少标定子波时的兜底。
+    vp_lfm_file: Path = Path("your_vp_lfm_depth.npz")  # 深度域 Vp 低频模型 NPZ。
+    wavelet_source: WaveletSource = "precomputed_wavelet"  # 子波来源：预计算子波或 Ricker 子波。
+    wavelet_file: Path | None = Path("your_wavelet.csv")  # 预计算子波 CSV。
+    wavelet_type: str = "ricker"  # 生成 Ricker 子波时使用的子波类型名。
+    wavelet_freq: float = 25.0  # Ricker 子波主频（Hz）。
+    wavelet_dt: float = 0.001  # 子波采样间隔（秒）。
+    wavelet_length: int = 301  # 子波长度（采样点数，建议奇数）。
+    wavelet_amplitude_threshold: float = 1e-7  # 深度域卷积矩阵中裁剪微小子波尾巴的阈值。
 
     # ── 振幅补偿 ──────────────────────────────────────────────
-    gain_source: GainSource = "fixed_gain"
-    fixed_gain: float | None = None
-    fixed_gain_num_traces: int = 256
-    dynamic_gain_model: Path | None = None
+    # 振幅补偿让正演地震和归一化观测地震处于同一量级。fixed_gain 是全局
+    # 标量；dynamic_gain_model 是随样点变化的增益体，通常应配合
+    # include_dynamic_gain_input=True，让网络看到增益上下文。
+    gain_source: GainSource = "fixed_gain"  # 振幅补偿来源：固定标量增益或动态增益模型。
+    fixed_gain: float | None = None  # 固定标量增益；gain_source=fixed_gain 且为空时自动估计。
+    fixed_gain_num_traces: int = 256  # 自动估计固定增益时采样的有效道数。
+    dynamic_gain_model: Path | None = None  # gain_source=dynamic_gain_model 时使用的动态增益 NPZ。
 
     # ── 网络结构 ──────────────────────────────────────────────
-    include_lfm_input: bool = True
-    include_mask_input: bool = True
-    include_dynamic_gain_input: bool = False
-    in_channels: int = 3
-    hidden_channels: int = 64
-    out_channels: int = 1
-    num_res_blocks: int = 8
-    dilations: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
-    kernel_size: int = 3
+    # 网络输入通道顺序为：地震、可选 AI LFM、可选 mask、可选 dynamic gain
+    # log-ratio。in_channels 必须等于启用通道数。dilation 序列决定纵向
+    # 感受野，改动会影响网络能利用的深度上下文尺度。
+    include_lfm_input: bool = True  # 是否将 AI LFM 作为网络输入通道；地震通道始终启用。
+    include_mask_input: bool = True  # 是否将目的层 mask 作为网络输入通道。
+    include_dynamic_gain_input: bool = False  # 是否将 log-normalized dynamic gain 作为网络输入通道。
+    in_channels: int = 3  # 网络输入通道数：地震 + 可选 LFM/mask/dynamic gain。
+    hidden_channels: int = 64  # 残差块内部的隐藏通道数。
+    out_channels: int = 1  # 网络输出通道数，对应 logAI residual。
+    num_res_blocks: int = 8  # 残差块数量。
+    dilations: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)  # 各残差块的 dilation 序列。
+    kernel_size: int = 3  # 一维卷积核大小。
 
     # ── 优化与训练循环 ────────────────────────────────────────
-    batch_size: int = 16
-    epochs: int = 50
-    lr: float = 1e-3
-    weight_decay: float = 1e-4
-    grad_clip: float = 1.0
+    # 常规 Adam 训练参数。未来如需加入新的训练阶段，应优先在专用 config 中
+    # 显式配置，避免把关键训练常数藏在 trainer 里。
+    batch_size: int = 16  # 每个 batch 的道数。
+    epochs: int = 50  # 真实地震训练最大 epoch 数。
+    lr: float = 1e-3  # Adam 初始学习率。
+    weight_decay: float = 1e-4  # Adam 权重衰减系数。
+    grad_clip: float = 1.0  # 梯度裁剪阈值。
 
     # ── 损失与物理约束 ────────────────────────────────────────
-    lambda_l2: float = 0.03
-    lambda_tv: float = 0.0
-    ai_min: float = 3000.0
-    ai_max: float = 30000.0
-    zero_residual_outside_mask: bool = True
-    boundary_effect_samples: int | None = None
+    # 真实数据训练损失由 waveform MAE、residual L2 和 residual TV 组成。
+    # L2/TV 越强，越能抑制不稳定高频，但也越容易洗掉分辨率；做高分辨率实验
+    # 时应和 baseline 对照，不要只看 waveform loss。
+    lambda_l2: float = 0.03  # logAI residual L2 正则化权重，约束 AI 不要远离 LFM。
+    lambda_tv: float = 0.0  # logAI residual TV 正则化权重，抑制层内高频 ringing。
+    ai_min: float = 3000.0  # 目标层内允许的 AI 下界；频繁撞边界时先调弱 residual。
+    ai_max: float = 30000.0  # 目标层内允许的 AI 上界；频繁撞边界时先调弱 residual。
+    zero_residual_outside_mask: bool = True  # 是否将层外 residual 通过 taper 平滑压回 0。
+    boundary_effect_samples: int | None = None  # 为空时按子波有效支撑自动计算边界侵蚀/halo。
 
     # ── 验证与早停 ────────────────────────────────────────────
-    validation_split_mode: ValidationSplitMode = "spatial_block"
-    validation_fraction: float = 0.10
-    validation_gap_traces: int = 8
-    validation_block_anchor: ValidationBlockAnchor = "maxmin"
-    early_stopping_patience: int = 8
-    early_stopping_min_delta: float = 1e-4
-    early_stopping_warmup: int = 5
+    # 地震道空间相关性很强，因此默认使用空间块验证，而不是随机道验证。
+    # gap_traces 是训练块和验证块之间的缓冲带，用来降低空间泄漏。
+    validation_split_mode: ValidationSplitMode = "spatial_block"  # 验证集切分方式。
+    validation_fraction: float = 0.10  # 验证集目标占比。
+    validation_gap_traces: int = 8  # 训练区与验证区之间保留的空间缓冲带宽度（道数）。
+    validation_block_anchor: ValidationBlockAnchor = "maxmin"  # 验证块落在工区哪个角/位置。
+    early_stopping_patience: int = 8  # 连续多少个 epoch 无显著改善后停止训练。
+    early_stopping_min_delta: float = 1e-4  # 视为“显著改善”的最小 val_loss 降幅。
+    early_stopping_warmup: int = 5  # 早停开始生效前至少先训练的 epoch 数。
 
     # ── 运行时与输出 ──────────────────────────────────────────
-    device: str = "cuda"
-    num_workers: int = 0
-    pin_memory: bool = True
-    checkpoint_dir: Path = Path("checkpoints")
-    log_interval: int = 50
-    save_every: int = 5
+    # 运行设备、DataLoader 和 checkpoint 输出设置。Windows 下 num_workers=0
+    # 最稳；checkpoint_dir 会保存 metrics.csv、run_summary.json 和模型权重。
+    device: str = "cuda"  # 首选训练设备；若 CUDA 不可用会自动回退到 CPU。
+    num_workers: int = 0  # DataLoader worker 数；Windows 下默认 0 更稳妥。
+    pin_memory: bool = True  # CUDA 训练时是否启用 pinned memory。
+    checkpoint_dir: Path = Path("checkpoints")  # checkpoint 输出目录。
+    log_interval: int = 50  # 每隔多少个训练 batch 打一次日志。
+    save_every: int = 5  # 每隔多少个 epoch 额外保存一次常规 checkpoint。
 
     def __post_init__(self) -> None:
         for field_name in _PATH_FIELDS:

@@ -34,6 +34,8 @@ class GINNConfig:
     """
 
     # ── 地震信息 ──────────────────────────────────────────────
+    # 输入地震体及 SEG-Y 几何读取方式。这里的头字节和步长必须与数据导入/QC
+    # 阶段保持一致；一旦改错，后面的层位、LFM、动态增益都会错位。
     seismic_file: Path = Path("your_seismic_file.sgy")  # 输入地震体路径。
     segy_iline: int = 189  # inline 头字节位置。
     segy_xline: int = 193  # xline 头字节位置。
@@ -41,6 +43,9 @@ class GINNConfig:
     segy_xstep: int = 1  # xline 抽样步长。
 
     # ── 目的层 ────────────────────────────────────────────────
+    # 目的层顶/底界决定 waveform loss 和 residual 自由度的有效区域。下面几个
+    # 可选 QC 参数用于防御层位异常；除非层位诊断显示薄层、跳点或孤立异常，
+    # 否则建议保持默认。
     top_horizon_file: Path = Path("your_top_horizon_file")  # 目标层顶界解释面路径。
     bot_horizon_file: Path = Path("your_bot_horizon_file")  # 目标层底界解释面路径。
     target_layer_min_thickness: float | None = None  # 相邻层位最小厚度；为空时使用 sample_step。
@@ -49,28 +54,39 @@ class GINNConfig:
     target_layer_outlier_min_neighbor_count: int = 2  # 孤立点判断所需最小十字邻域有效点数。
 
     # ── 低频模型 ──────────────────────────────────────────────
-    lfm_source: LfmSource = "lfm_precomputed_file"
-    lfm_precomputed_file: Path | None = Path("your_lfm_precomputed_file")
-    lfm_initial_inversion_file: Path | None = Path("your_lfm_initial_inversion_file")
+    # LFM 是 AI 的低频锚点，网络只预测相对 LFM 的高频扰动。优先使用已经
+    # 预处理好的 LFM；只有在需要从初始反演体临时低通生成 LFM 时，才切换到
+    # lfm_initial_inversion_file。
+    lfm_source: LfmSource = "lfm_precomputed_file"  # LFM 来源：预计算 LFM 或初始反演体低通。
+    lfm_precomputed_file: Path | None = Path("your_lfm_precomputed_file")  # 预计算 LFM 文件。
+    lfm_initial_inversion_file: Path | None = Path("your_lfm_initial_inversion_file")  # 初始反演体文件。
     lfm_filter_dt: float = 0.001  # 从初始反演体低通生成 LFM 时的采样间隔（秒）。
     lfm_cutoff_hz: float = 10.0  # 生成 LFM 时的 Butterworth 低通截止频率（Hz）。
     lfm_filter_order: int = 6  # 生成 LFM 时的零相位滤波器阶数。
 
     # ── 子波 ──────────────────────────────────────────────────
-    wavelet_source: WaveletSource = "ricker_wavelet"
-    wavelet_file: Path | None = Path("your_precomputed_wavelet.csv")
+    # 子波用于物理正演。真实实验优先使用井震标定得到的预计算子波；
+    # Ricker 子波主要用于快速实验或缺少标定子波时的兜底。
+    wavelet_source: WaveletSource = "ricker_wavelet"  # 子波来源：预计算子波或 Ricker 子波。
+    wavelet_file: Path | None = Path("your_precomputed_wavelet.csv")  # 预计算子波 CSV。
     wavelet_type: str = "ricker"  # 正演使用的子波类型。
     wavelet_freq: float = 25.0  # 子波主频（Hz）。
     wavelet_dt: float = 0.001  # 子波采样间隔（秒）。
     wavelet_length: int = 301  # 子波长度（采样点数，建议奇数）。
 
     # ── 振幅补偿 ──────────────────────────────────────────────
-    gain_source: GainSource = "fixed_gain"
+    # 振幅补偿让正演地震和归一化观测地震处于同一量级。fixed_gain 是全局
+    # 标量；dynamic_gain_model 是随样点变化的增益模型，通常应配合
+    # include_dynamic_gain_input=True，让网络看到增益上下文。
+    gain_source: GainSource = "fixed_gain"  # 振幅补偿来源：固定标量增益或动态增益模型。
     fixed_gain: float | None = None  # 固定标量增益；gain_source=fixed_gain 且为空时自动估计。
     fixed_gain_num_traces: int = 256  # 自动估计固定增益时采样的有效道数。
     dynamic_gain_model: Path | None = None  # gain_source=dynamic_gain_model 时使用的预计算动态增益模型。
 
     # ── 网络结构 ──────────────────────────────────────────────
+    # 网络输入通道顺序为：地震、可选 LFM、可选 mask、可选 dynamic gain log-ratio。
+    # in_channels 必须等于启用通道数。dilation 序列决定纵向感受野，改动会影响
+    # 网络能利用的地震上下文尺度。
     include_lfm_input: bool = True  # 是否将 LFM 作为网络输入通道；地震通道始终启用。
     include_mask_input: bool = True  # 是否将目的层 mask 作为网络输入通道。
     include_dynamic_gain_input: bool = False  # 是否将 log-normalized dynamic gain 作为网络输入通道。
@@ -82,6 +98,8 @@ class GINNConfig:
     kernel_size: int = 3  # 一维卷积核大小。
 
     # ── 优化与训练循环 ────────────────────────────────────────
+    # 常规 Adam 训练参数。未来如需加入新的训练阶段，应优先在专用 config 中
+    # 显式配置，避免把关键训练常数藏在 trainer 里。
     batch_size: int = 16  # 每个 batch 的道数。
     epochs: int = 50  # 最大训练轮数。
     lr: float = 1e-3  # Adam 初始学习率。
@@ -89,6 +107,9 @@ class GINNConfig:
     grad_clip: float = 1.0  # 梯度裁剪阈值。
 
     # ── 损失与物理约束 ────────────────────────────────────────
+    # 真实数据训练损失由 waveform MAE、residual L2 和 residual TV 组成。
+    # L2/TV 越强，越能抑制不稳定高频，但也越容易洗掉分辨率；做高分辨率实验
+    # 时应和 baseline 对照，不要只看 waveform loss。
     lambda_l2: float = 0.03  # 高频扰动 L2 正则化权重，约束阻抗尺度不要漂移。
     lambda_tv: float = 0.0  # 高频扰动 TV 正则化权重，抑制高频 ringing。
     ai_min: float = 3000.0  # 目标层内允许的波阻抗下界。
@@ -97,6 +118,8 @@ class GINNConfig:
     boundary_effect_samples: int | None = None  # 为空时按子波 5% 有效半支撑自动计算。
 
     # ── 验证与早停 ────────────────────────────────────────────
+    # 地震道空间相关性很强，因此默认使用空间块验证，而不是随机道验证。
+    # gap_traces 是训练块和验证块之间的缓冲带，用来降低空间泄漏。
     validation_split_mode: ValidationSplitMode = "spatial_block"  # 验证集切分方式。
     validation_fraction: float = 0.10  # 验证集目标占比。
     validation_gap_traces: int = 8  # 训练区与验证区之间保留的空间缓冲带宽度（道数）。
@@ -106,6 +129,8 @@ class GINNConfig:
     early_stopping_warmup: int = 5  # 早停开始生效前至少先训练的 epoch 数。
 
     # ── 运行时与输出 ──────────────────────────────────────────
+    # 运行设备、DataLoader 和 checkpoint 输出设置。Windows 下 num_workers=0
+    # 最稳；checkpoint_dir 会保存 metrics.csv、run_summary.json 和模型权重。
     device: str = "cuda"  # 首选训练设备；若 CUDA 不可用会自动回退到 CPU。
     num_workers: int = 0  # DataLoader worker 数；Windows 下默认 0 更稳妥。
     pin_memory: bool = True  # CUDA 训练时是否启用 pinned memory。

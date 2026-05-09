@@ -75,6 +75,30 @@ def ols_fit(x: np.ndarray, y: np.ndarray) -> dict[str, Any]:
     }
 
 
+def rms(values: np.ndarray) -> float:
+    """Root mean square of finite values; returns NaN for an empty array."""
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float("nan")
+    return float(np.sqrt(np.mean(values * values)))
+
+
+def normalized_cross_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    """Zero-mean normalised cross-correlation between two 1-D arrays."""
+    a = np.asarray(a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    valid = np.isfinite(a) & np.isfinite(b)
+    if not np.any(valid):
+        return float("nan")
+    a = a[valid] - float(np.mean(a[valid]))
+    b = b[valid] - float(np.mean(b[valid]))
+    denom = float(np.sqrt(np.sum(a * a) * np.sum(b * b)))
+    if denom <= 0.0 or not np.isfinite(denom):
+        return float("nan")
+    return float(np.sum(a * b) / denom)
+
+
 def normalized_mae(
     reference: np.ndarray, estimate: np.ndarray, *, mask: np.ndarray | None = None,
 ) -> float:

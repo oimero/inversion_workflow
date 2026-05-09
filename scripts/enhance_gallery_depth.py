@@ -43,6 +43,8 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cup.utils.statistics import normalized_cross_correlation, rms  # noqa: E402
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -165,14 +167,6 @@ def finite_core(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return values[valid]
 
 
-def rms(values: np.ndarray) -> float:
-    values = np.asarray(values, dtype=np.float64)
-    values = values[np.isfinite(values)]
-    if values.size == 0:
-        return float("nan")
-    return float(np.sqrt(np.mean(values * values)))
-
-
 def abs_percentile(values: np.ndarray, percentile: float) -> float:
     values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)]
@@ -185,20 +179,6 @@ def safe_ratio(num: float, denom: float) -> float:
     if not np.isfinite(num) or not np.isfinite(denom) or abs(denom) < 1e-12:
         return float("nan")
     return float(num / denom)
-
-
-def normalized_cross_correlation(a: np.ndarray, b: np.ndarray) -> float:
-    a = np.asarray(a, dtype=np.float64).reshape(-1)
-    b = np.asarray(b, dtype=np.float64).reshape(-1)
-    valid = np.isfinite(a) & np.isfinite(b)
-    if not np.any(valid):
-        return float("nan")
-    a = a[valid] - float(np.mean(a[valid]))
-    b = b[valid] - float(np.mean(b[valid]))
-    denom = float(np.sqrt(np.sum(a * a) * np.sum(b * b)))
-    if denom <= 0.0 or not np.isfinite(denom):
-        return float("nan")
-    return float(np.sum(a * b) / denom)
 
 
 def mode_name(sample: dict[str, Any]) -> str:

@@ -40,7 +40,7 @@ def _ensure_import_path(src_root: Path) -> None:
 
 _ensure_import_path(_find_repo_root() / "src")
 
-from cup.utils.io import load_yaml_config, resolve_relative_path, sanitize_filename, save_mpl_figure  # noqa: E402
+from cup.utils.io import load_yaml_config, resolve_relative_path, sanitize_filename  # noqa: E402
 
 if TYPE_CHECKING:
     from wtie.modeling.modeling import ConvModeler
@@ -50,6 +50,17 @@ matplotlib.use("Agg")
 
 plt.rcParams["figure.dpi"] = 120
 pd.set_option("display.max_columns", 30)
+
+
+def _save_fig(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        plt.tight_layout()
+    except RuntimeError:
+        pass
+    plt.savefig(str(path), dpi=180, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {path}")
 
 
 # =============================================================================
@@ -488,16 +499,16 @@ def run_auto_tie(
     axes[2].set_xlabel("Relative TWT (ms)")
     axes[2].set_title("Local time-depth table")
     axes[2].grid(True, alpha=0.25)
-    save_mpl_figure(output["fig_01_depth_time_match"])
+    _save_fig(output["fig_01_depth_time_match"])
 
     # Fig 02: optimization objective
     fig, ax = outputs.plot_optimization_objective(figsize=(6, 3))
-    save_mpl_figure(output["fig_02_optimization_objective"])
+    _save_fig(output["fig_02_optimization_objective"])
 
     # Fig 03a: tie window raw
     _scale = 120000
     fig, axes = outputs.plot_tie_window(wiggle_scale=_scale, figsize=(12.0, 7.5))
-    save_mpl_figure(output["fig_03a_tie_window_raw"])
+    _save_fig(output["fig_03a_tie_window_raw"])
 
     # Fig 03b: cropped synthetic overlay
     fig, axes = plt.subplots(1, 3, figsize=(13, 5), sharey=True)
@@ -521,13 +532,13 @@ def run_auto_tie(
     axes[2].set_xlabel("Residual")
     axes[2].set_title("Residual")
     axes[2].grid(True, alpha=0.25)
-    save_mpl_figure(output["fig_03b_cropped_synthetic_vs_seismic"])
+    _save_fig(output["fig_03b_cropped_synthetic_vs_seismic"])
 
     # Fig 04: TD table comparison
     fig, ax = viz.plot_td_table(inputs.table, plot_params={"label": "initial"})
     viz.plot_td_table(outputs.table, plot_params={"label": "optimized"}, fig_axes=(fig, ax))
     ax.legend(loc="best")
-    save_mpl_figure(output["fig_04_td_table"])
+    _save_fig(output["fig_04_td_table"])
 
     # Fig 05: wavelet raw vs cropped
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))
@@ -560,7 +571,7 @@ def run_auto_tie(
     axes[1].set_title("Normalized amplitude spectrum")
     axes[1].legend(loc="best")
     axes[1].grid(True, alpha=0.25)
-    save_mpl_figure(output["fig_05_wavelet_raw_vs_cropped"])
+    _save_fig(output["fig_05_wavelet_raw_vs_cropped"])
 
     # Print best parameters
     print("\nAuto-tie best parameters:")

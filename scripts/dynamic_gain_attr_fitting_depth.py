@@ -40,7 +40,7 @@ def _ensure_import_path(src_root: Path) -> None:
 
 _ensure_import_path(_find_repo_root() / "src")
 
-from cup.utils.io import load_yaml_config, sanitize_filename, save_mpl_figure  # noqa: E402
+from cup.utils.io import load_yaml_config, sanitize_filename  # noqa: E402
 from cup.utils.raw_trace import centered_moving_rms, meters_to_odd_samples  # noqa: E402
 from cup.utils.statistics import normalized_mae, ols_fit, pearson_r, spearman_rho  # noqa: E402
 
@@ -49,6 +49,17 @@ plt.rcParams["figure.dpi"] = 120
 pd.set_option("display.max_columns", 120)
 
 CANDIDATE_ATTRIBUTES = ["seismic_rms", "seismic_abs_mean", "seismic_abs_p90"]
+
+
+def _save_fig(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        plt.tight_layout()
+    except RuntimeError:
+        pass
+    plt.savefig(str(path), dpi=180, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {path}")
 
 
 # =============================================================================
@@ -269,7 +280,7 @@ def main() -> None:
 
     seg_file = output_dir / "gain_attr_segment_samples.csv"
     rel_file = output_dir / "gain_attr_relationship_metrics.csv"
-    best_file = output_dir / "gain_attr_best_relationship.csv"
+    best_file = output_dir / "gain_attr_comparison_winner.csv"
     fit_file = output_dir / "gain_attr_fit_metrics.csv"
 
     print("=== Dynamic Gain Attribute Fitting (Depth) ===")
@@ -429,7 +440,7 @@ def main() -> None:
     axes[1].set_ylabel("Spearman rho")
     axes[1].set_title("Rank relationship")
     axes[1].grid(True, axis="y", alpha=0.25)
-    save_mpl_figure(figure_dir / "qc_01_gain_attribute_relationship_bars.png")
+    _save_fig(figure_dir / "qc_01_gain_attribute_relationship_bars.png")
 
     well_names = seg_df["well_name"].drop_duplicates().tolist()
     color_map = {w: plt.cm.tab10(i % 10) for i, w in enumerate(well_names)}
@@ -442,7 +453,7 @@ def main() -> None:
     ax.set_title(f"Fit attribute: {fit_attr} (pearson={all_rel.loc[fit_attr]['pearson']:.3f})")
     ax.legend(loc="best", fontsize=7)
     ax.grid(True, alpha=0.25)
-    save_mpl_figure(figure_dir / "qc_02_best_gain_attribute_scatter.png")
+    _save_fig(figure_dir / "qc_02_best_gain_attribute_scatter.png")
 
     # ── Per-well gain QC ──
 
@@ -563,7 +574,7 @@ def main() -> None:
         axes[2].set_xlabel("Normalized attribute"); axes[2].set_title("Predicted gain curve")
         axes[2].grid(True, alpha=0.25); axes[2].legend(loc="best", fontsize=7)
         fig.suptitle(well_name)
-        save_mpl_figure(figure_dir / f"qc_{name}_wellside_gain_synthetic.png")
+        _save_fig(figure_dir / f"qc_{name}_wellside_gain_synthetic.png")
 
     # ── Summary figure ──
 
@@ -593,7 +604,7 @@ def main() -> None:
         axes[2].set_xticks(x); axes[2].set_xticklabels(labels, rotation=45, ha="right")
         axes[2].set_ylabel("Gain"); axes[2].set_title("Fixed scale vs predicted gain")
         axes[2].grid(True, axis="y", alpha=0.25); axes[2].legend(loc="best", fontsize=8)
-        save_mpl_figure(figure_dir / "qc_00_wellside_gain_synthetic_summary.png")
+        _save_fig(figure_dir / "qc_00_wellside_gain_synthetic_summary.png")
 
     # ── Manifest ──
 

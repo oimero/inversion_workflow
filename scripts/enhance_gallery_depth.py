@@ -195,6 +195,20 @@ def safe_ratio(num: float, denom: float) -> float:
     return float(num / denom)
 
 
+def normalized_cross_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    valid = np.isfinite(a) & np.isfinite(b)
+    if not np.any(valid):
+        return float("nan")
+    a = a[valid] - float(np.mean(a[valid]))
+    b = b[valid] - float(np.mean(b[valid]))
+    denom = float(np.sqrt(np.sum(a * a) * np.sum(b * b)))
+    if denom <= 0.0 or not np.isfinite(denom):
+        return float("nan")
+    return float(np.sum(a * b) / denom)
+
+
 def mode_name(sample: dict[str, Any]) -> str:
     return "well_patch" if int(sample["synthetic_mode"].item()) == 0 else "unresolved_cluster"
 
@@ -206,6 +220,9 @@ def sample_record(sample: dict[str, Any], index: int, image_path: Path | None) -
     real = finite_core(as_1d(sample["obs"]), waveform_mask)
     synthetic = finite_core(as_1d(sample["target_seismic"]), waveform_mask)
     synthetic_raw = finite_core(as_1d(sample["target_seismic_raw"]), waveform_mask)
+    base_seismic_full = as_1d(sample["base_seismic"]) if "base_seismic" in sample else np.zeros_like(as_1d(sample["target_seismic"]))
+    base_seismic = finite_core(base_seismic_full, waveform_mask)
+    base_target_delta_rms = rms(finite_core(as_1d(sample["target_seismic"]) - base_seismic_full, waveform_mask))
     residual = finite_core(as_1d(sample["target_residual"]), delta_mask)
     ai = finite_core(as_1d(sample["target_ai"]), delta_mask)
     base_ai = finite_core(as_1d(sample["base_ai_raw"]), delta_mask)
@@ -224,6 +241,8 @@ def sample_record(sample: dict[str, Any], index: int, image_path: Path | None) -
         "real_abs_p99": real_abs_p99,
         "synthetic_abs_p99": synthetic_abs_p99,
         "synthetic_to_real_abs_p99": safe_ratio(synthetic_abs_p99, real_abs_p99),
+        "base_target_waveform_corr": normalized_cross_correlation(base_seismic, synthetic),
+        "base_target_waveform_delta_rms_to_target_rms": safe_ratio(base_target_delta_rms, synthetic_rms),
         "residual_rms": residual_rms,
         "residual_abs_p95": abs_percentile(residual, 95.0),
         "residual_abs_p99": abs_percentile(residual, 99.0),
@@ -254,6 +273,7 @@ def shade_mask(ax: plt.Axes, x: np.ndarray, mask: np.ndarray) -> None:
 def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Path, dpi: int) -> None:
     target_seismic = as_1d(sample["target_seismic"])
     target_seismic_raw = as_1d(sample["target_seismic_raw"])
+    base_seismic = as_1d(sample["base_seismic"]) if "base_seismic" in sample else None
     real_obs = as_1d(sample["obs"])
     base_ai = as_1d(sample["base_ai_raw"])
     ai = as_1d(sample["target_ai"])
@@ -271,6 +291,8 @@ def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Pat
     fig, axes = plt.subplots(5, 1, figsize=(11, 9), sharex=True)
 
     axes[0].plot(depth, real_obs, color="0.62", lw=1.0, label="real normalized seismic")
+    if base_seismic is not None:
+        axes[0].plot(depth, base_seismic, color="0.15", lw=0.9, alpha=0.75, label="base forward")
     axes[0].plot(depth, target_seismic_raw, color="tab:orange", lw=0.9, alpha=0.75, label="synthetic raw")
     axes[0].plot(depth, target_seismic, color="tab:blue", lw=1.2, label="synthetic RMS-matched")
     axes[0].legend(loc="upper right", fontsize=8)
@@ -420,6 +442,8 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "mode_counts": {mode: sum(1 for record in records if record["mode"] == mode) for mode in modes},
         "synthetic_to_real_rms": stats("synthetic_to_real_rms"),
         "synthetic_to_real_abs_p99": stats("synthetic_to_real_abs_p99"),
+        "base_target_waveform_corr": stats("base_target_waveform_corr"),
+        "base_target_waveform_delta_rms_to_target_rms": stats("base_target_waveform_delta_rms_to_target_rms"),
         "residual_rms": stats("residual_rms"),
         "residual_abs_p99": stats("residual_abs_p99"),
         "core_mask_fraction": stats("core_mask_fraction"),
@@ -441,6 +465,7 @@ def write_index_html(path: Path, records: list[dict[str, Any]], overview_paths: 
             f"<td>{html.escape(str(record['mode']))}</td>"
             f"<td>{float(record['synthetic_to_real_rms']):.3f}</td>"
             f"<td>{float(record['synthetic_to_real_abs_p99']):.3f}</td>"
+            f"<td>{float(record['base_target_waveform_corr']):.3f}</td>"
             f"<td>{float(record['residual_abs_p99']):.4f}</td>"
             f"<td>{float(record['rms_scale']):.3f}</td>"
             f"<td>{int(record['resample_attempts'])}</td>"
@@ -475,7 +500,7 @@ def write_index_html(path: Path, records: list[dict[str, Any]], overview_paths: 
     <thead>
       <tr>
         <th>sample</th><th>mode</th><th>synth/real RMS</th><th>synth/real abs-p99</th>
-        <th>residual abs-p99</th><th>rms scale</th><th>attempts</th>
+        <th>base/target corr</th><th>residual abs-p99</th><th>rms scale</th><th>attempts</th>
       </tr>
     </thead>
     <tbody>
@@ -613,6 +638,7 @@ def main() -> None:
             "delta_supervision_mask": cfg.delta_supervision_mask,
             "synthetic_quality_gate_enabled": cfg.synthetic_quality_gate_enabled,
             "synthetic_seismic_rms_match": cfg.synthetic_seismic_rms_match,
+            "synthetic_min_base_target_waveform_corr": cfg.synthetic_min_base_target_waveform_corr,
         },
         "summary": summarize_records(records),
     }

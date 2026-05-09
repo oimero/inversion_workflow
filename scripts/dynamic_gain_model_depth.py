@@ -41,9 +41,7 @@ def _ensure_import_path(src_root: Path) -> None:
 
 _ensure_import_path(_find_repo_root() / "src")
 
-from cup.utils.io import (  # noqa: E402
-    build_segy_textual_header, load_yaml_config, save_mpl_figure,
-)
+from cup.utils.io import build_segy_textual_header, load_yaml_config  # noqa: E402
 from cup.utils.raw_trace import (  # noqa: E402
     centered_moving_rms_axis, centered_moving_sum_axis,
     meters_to_odd_samples, zscore_traces_axis,
@@ -51,6 +49,17 @@ from cup.utils.raw_trace import (  # noqa: E402
 
 matplotlib.use("Agg")
 plt.rcParams["figure.dpi"] = 120
+
+
+def _save_fig(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        plt.tight_layout()
+    except RuntimeError:
+        pass
+    plt.savefig(str(path), dpi=180, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {path}")
 
 
 # =============================================================================
@@ -214,7 +223,7 @@ def main() -> None:
             ax.set_title("Dynamic gain training segments")
             ax.grid(True, alpha=0.25)
             ax.legend(loc="best", fontsize=7)
-            save_mpl_figure(figure_dir / "qc_01_dynamic_gain_fit.png")
+            _save_fig(figure_dir / "qc_01_dynamic_gain_fit.png")
         else:
             print("Segment samples missing fit columns, skipping qc_01.")
     else:
@@ -249,7 +258,7 @@ def main() -> None:
     axes[2].set_xlabel("Inline index")
     axes[2].set_ylabel("Depth sample")
     fig.colorbar(im2, ax=axes[2], shrink=0.82)
-    save_mpl_figure(figure_dir / "qc_02_dynamic_gain_volume.png")
+    _save_fig(figure_dir / "qc_02_dynamic_gain_volume.png")
 
     # ── Export NPZ ──
 

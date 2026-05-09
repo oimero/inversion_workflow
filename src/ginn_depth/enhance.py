@@ -89,6 +89,7 @@ def build_depth_enhancement_bundle(cfg: EnhancementConfig) -> DepthEnhancementBu
         max_residual_near_clip_fraction=cfg.synthetic_max_residual_near_clip_fraction,
         max_seismic_rms_ratio=cfg.synthetic_max_seismic_rms_ratio,
         max_seismic_abs_p99_ratio=cfg.synthetic_max_seismic_abs_p99_ratio,
+        min_base_target_waveform_corr=cfg.synthetic_min_base_target_waveform_corr,
         max_resample_attempts=cfg.synthetic_max_resample_attempts,
         delta_supervision_mask=cfg.delta_supervision_mask,
     )

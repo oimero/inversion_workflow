@@ -188,6 +188,20 @@ def safe_ratio(num: float, denom: float) -> float:
     return float(num / denom)
 
 
+def normalized_cross_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    valid = np.isfinite(a) & np.isfinite(b)
+    if not np.any(valid):
+        return float("nan")
+    a = a[valid] - float(np.mean(a[valid]))
+    b = b[valid] - float(np.mean(b[valid]))
+    denom = float(np.sqrt(np.sum(a * a) * np.sum(b * b)))
+    if denom <= 0.0 or not np.isfinite(denom):
+        return float("nan")
+    return float(np.sum(a * b) / denom)
+
+
 def count_abs_peaks(values: np.ndarray, threshold_fraction: float) -> int:
     values = np.asarray(values, dtype=np.float64)
     if values.size < 3 or not np.any(np.isfinite(values)):
@@ -223,6 +237,8 @@ def local_window(center: int, n_sample: int, half_width: int) -> slice:
 
 
 def zero_residual_seismic(sample: dict[str, torch.Tensor], forward_model: Any) -> np.ndarray:
+    if "base_seismic" in sample:
+        return to_numpy_1d(sample["base_seismic"])
     base_ai = sample["base_ai_raw"].float().unsqueeze(0)
     vp = sample["velocity_raw"].float().unsqueeze(0)
     dynamic_gain = sample.get("dynamic_gain")
@@ -248,13 +264,13 @@ def sample_metrics(
     real = finite_values(to_numpy_1d(sample["obs"]), waveform_mask)
     synthetic = finite_values(to_numpy_1d(sample["target_seismic"]), waveform_mask)
     synthetic_raw = finite_values(to_numpy_1d(sample["target_seismic_raw"]), waveform_mask)
+    base_seismic_full = zero_residual_seismic(sample, forward_model).astype(np.float64)
     residual_full = to_numpy_1d(sample["target_residual"]).astype(np.float64)
     residual = finite_values(residual_full, delta_mask)
     residual_highpass_full = highpass(residual_full, highpass_samples)
     residual_highpass = finite_values(residual_highpass_full, delta_mask)
     ai = finite_values(to_numpy_1d(sample["target_ai"]), delta_mask)
     reflectivity_full = to_numpy_1d(sample["raw_reflectivity"]).astype(np.float64)
-    zero_seismic = zero_residual_seismic(sample, forward_model)
     target_seismic_full = to_numpy_1d(sample["target_seismic"]).astype(np.float64)
 
     real_rms = rms(real)
@@ -262,6 +278,9 @@ def sample_metrics(
     synthetic_raw_rms = rms(synthetic_raw)
     real_abs_p99 = percentile_abs(real, 99.0)
     synthetic_abs_p99 = percentile_abs(synthetic, 99.0)
+    base_target_delta = finite_values(target_seismic_full - base_seismic_full, waveform_mask)
+    base_target_delta_rms = rms(base_target_delta)
+    base_target_corr = normalized_cross_correlation(base_seismic_full[waveform_mask], target_seismic_full[waveform_mask])
     residual_abs_max = percentile_abs(residual, 100.0)
     residual_outside = residual_full[np.asarray(taper <= 0.0)]
     residual_inside = residual_full[np.asarray(taper > 0.0)]
@@ -312,6 +331,10 @@ def sample_metrics(
         "real_abs_p99": real_abs_p99,
         "synthetic_abs_p99": synthetic_abs_p99,
         "synthetic_to_real_abs_p99": safe_ratio(synthetic_abs_p99, real_abs_p99),
+        "base_target_waveform_corr": base_target_corr,
+        "base_target_waveform_delta_rms": base_target_delta_rms,
+        "base_target_waveform_delta_rms_to_target_rms": safe_ratio(base_target_delta_rms, synthetic_rms),
+        "base_target_waveform_delta_rms_to_real_rms": safe_ratio(base_target_delta_rms, real_rms),
         "residual_rms": rms(residual),
         "target_residual_highpass_rms": rms(residual_highpass),
         "residual_abs_p95": percentile_abs(residual, 95.0),
@@ -322,8 +345,8 @@ def sample_metrics(
         "residual_outside_taper_abs_mean": float(np.mean(np.abs(residual_outside))) if residual_outside.size else 0.0,
         "residual_inside_taper_abs_mean": float(np.mean(np.abs(residual_inside))) if residual_inside.size else 0.0,
         "residual_outside_taper_nonzero_fraction": float(np.mean(np.abs(residual_outside) > 1e-6)) if residual_outside.size else 0.0,
-        "zero_waveform_mae": masked_mae(zero_seismic, target_seismic_full, waveform_mask),
-        "zero_waveform_mae_to_synthetic_rms": safe_ratio(masked_mae(zero_seismic, target_seismic_full, waveform_mask), synthetic_rms),
+        "zero_waveform_mae": masked_mae(base_seismic_full, target_seismic_full, waveform_mask),
+        "zero_waveform_mae_to_synthetic_rms": safe_ratio(masked_mae(base_seismic_full, target_seismic_full, waveform_mask), synthetic_rms),
         "core_mask_fraction": float(np.mean(core_mask)),
         "waveform_mask_fraction": float(np.mean(waveform_mask)),
         "delta_mask_fraction": float(np.mean(delta_mask)),
@@ -374,11 +397,50 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
-def add_quality_flags(summary: dict[str, Any], *, requested_patch_fraction: float, requested_unresolved_fraction: float) -> list[dict[str, str]]:
-    flags: list[dict[str, str]] = []
+QUALITY_THRESHOLDS = {
+    "mode_mix_abs_tolerance_min": 0.10,
+    "seismic_rms_ratio_p50_min": 0.70,
+    "seismic_rms_ratio_p50_max": 1.30,
+    "seismic_abs_p99_ratio_p50_min": 0.60,
+    "seismic_abs_p99_ratio_p50_max": 1.60,
+    "base_target_waveform_corr_p05_min": 0.50,
+    "outside_taper_nonzero_fraction_p95_max": 0.005,
+    "residual_near_clip_fraction_p95_max": 0.02,
+    "target_residual_highpass_rms_p50_min": 0.01,
+    "residual_delta_mask_energy_fraction_p50_min": 0.70,
+    "zero_waveform_mae_to_synthetic_rms_p50_min": 0.05,
+    "unresolved_detail_peaks_p50_min": 2.0,
+    "unresolved_detail_to_seismic_peak_ratio_p50_min": 1.5,
+    "resample_attempts_p95_max": 2.0,
+}
 
-    def flag(level: str, name: str, message: str) -> None:
-        flags.append({"level": level, "name": name, "message": message})
+
+def add_quality_flags(summary: dict[str, Any], *, requested_patch_fraction: float, requested_unresolved_fraction: float) -> list[dict[str, Any]]:
+    flags: list[dict[str, Any]] = []
+
+    def flag(
+        level: str,
+        name: str,
+        message: str,
+        *,
+        metric: str,
+        actual: Any,
+        threshold: str,
+        related_config_keys: list[str] | None = None,
+        suggested_action: str = "",
+    ) -> None:
+        flags.append(
+            {
+                "level": level,
+                "name": name,
+                "metric": metric,
+                "actual": actual,
+                "threshold": threshold,
+                "message": message,
+                "related_config_keys": related_config_keys or [],
+                "suggested_action": suggested_action,
+            }
+        )
 
     all_stats = summary["all"]
     n_samples = max(int(summary["n_samples"]), 1)
@@ -386,56 +448,161 @@ def add_quality_flags(summary: dict[str, Any], *, requested_patch_fraction: floa
     total_fraction = requested_patch_fraction + requested_unresolved_fraction
     expected_cluster = requested_unresolved_fraction / total_fraction if total_fraction > 0 else 0.0
     observed_cluster = mode_counts.get("unresolved_cluster", 0) / n_samples
-    if abs(observed_cluster - expected_cluster) > max(0.10, 3.0 / math.sqrt(n_samples)):
-        flag("WARN", "mode_mix", f"unresolved_cluster fraction {observed_cluster:.3f} differs from configured {expected_cluster:.3f}.")
+    mode_tolerance = max(QUALITY_THRESHOLDS["mode_mix_abs_tolerance_min"], 3.0 / math.sqrt(n_samples))
+    if abs(observed_cluster - expected_cluster) > mode_tolerance:
+        flag(
+            "WARN",
+            "mode_mix",
+            f"unresolved_cluster fraction {observed_cluster:.3f} differs from configured {expected_cluster:.3f}.",
+            metric="unresolved_cluster_fraction",
+            actual=observed_cluster,
+            threshold=f"within {mode_tolerance:.3f} of {expected_cluster:.3f}",
+            related_config_keys=["synthetic_patch_fraction", "synthetic_unresolved_fraction"],
+            suggested_action="Increase QC sample count if this is sampling noise; otherwise check the synthetic mode fractions.",
+        )
     else:
-        flag("OK", "mode_mix", f"unresolved_cluster fraction {observed_cluster:.3f} is close to configured {expected_cluster:.3f}.")
+        flag(
+            "OK",
+            "mode_mix",
+            f"unresolved_cluster fraction {observed_cluster:.3f} is close to configured {expected_cluster:.3f}.",
+            metric="unresolved_cluster_fraction",
+            actual=observed_cluster,
+            threshold=f"within {mode_tolerance:.3f} of {expected_cluster:.3f}",
+            related_config_keys=["synthetic_patch_fraction", "synthetic_unresolved_fraction"],
+        )
 
     rms_ratio = all_stats["synthetic_to_real_rms"]["p50"]
     if rms_ratio is not None and 0.70 <= rms_ratio <= 1.30:
-        flag("OK", "seismic_rms", f"median synthetic/real RMS ratio is {rms_ratio:.3f}.")
+        flag("OK", "seismic_rms", f"median synthetic/real RMS ratio is {rms_ratio:.3f}.", metric="synthetic_to_real_rms.p50", actual=rms_ratio, threshold="0.70..1.30")
     else:
-        flag("WARN", "seismic_rms", f"median synthetic/real RMS ratio is {rms_ratio}; expected roughly 0.70-1.30.")
+        flag(
+            "WARN",
+            "seismic_rms",
+            f"median synthetic/real RMS ratio is {rms_ratio}; expected roughly 0.70-1.30.",
+            metric="synthetic_to_real_rms.p50",
+            actual=rms_ratio,
+            threshold="0.70..1.30",
+            related_config_keys=["synthetic_seismic_rms_match", "synthetic_seismic_rms_target", "synthetic_max_seismic_rms_ratio"],
+            suggested_action="Check whether RMS matching is enabled and whether synthetic target amplitudes are too strong or too weak.",
+        )
 
     p99_ratio = all_stats["synthetic_to_real_abs_p99"]["p50"]
     if p99_ratio is not None and 0.60 <= p99_ratio <= 1.60:
-        flag("OK", "seismic_abs_p99", f"median synthetic/real abs-p99 ratio is {p99_ratio:.3f}.")
+        flag("OK", "seismic_abs_p99", f"median synthetic/real abs-p99 ratio is {p99_ratio:.3f}.", metric="synthetic_to_real_abs_p99.p50", actual=p99_ratio, threshold="0.60..1.60")
     else:
-        flag("WARN", "seismic_abs_p99", f"median synthetic/real abs-p99 ratio is {p99_ratio}; expected roughly 0.60-1.60.")
+        flag(
+            "WARN",
+            "seismic_abs_p99",
+            f"median synthetic/real abs-p99 ratio is {p99_ratio}; expected roughly 0.60-1.60.",
+            metric="synthetic_to_real_abs_p99.p50",
+            actual=p99_ratio,
+            threshold="0.60..1.60",
+            related_config_keys=["synthetic_cluster_amp_abs_p95_min", "synthetic_cluster_amp_abs_p99_max", "synthetic_max_seismic_abs_p99_ratio"],
+            suggested_action="Inspect cluster and well patch amplitudes; high p99 usually means local synthetic spikes are too strong.",
+        )
+
+    base_target_corr_p05 = all_stats["base_target_waveform_corr"]["p05"]
+    if base_target_corr_p05 is not None and base_target_corr_p05 >= QUALITY_THRESHOLDS["base_target_waveform_corr_p05_min"]:
+        flag(
+            "OK",
+            "base_target_waveform_corr",
+            f"p05 base/target waveform correlation is {base_target_corr_p05:.3f}.",
+            metric="base_target_waveform_corr.p05",
+            actual=base_target_corr_p05,
+            threshold=">= 0.50",
+        )
+    else:
+        flag(
+            "WARN",
+            "base_target_waveform_corr",
+            f"p05 base/target waveform correlation is {base_target_corr_p05}; some synthetic targets may drift far from base forward seismic.",
+            metric="base_target_waveform_corr.p05",
+            actual=base_target_corr_p05,
+            threshold=">= 0.50",
+            related_config_keys=[
+                "synthetic_min_base_target_waveform_corr",
+                "synthetic_well_patch_scale_min",
+                "synthetic_well_patch_scale_max",
+                "synthetic_cluster_amp_abs_p95_min",
+                "synthetic_cluster_amp_abs_p99_max",
+            ],
+            suggested_action="Inspect low-correlation samples before enabling a hard gate; if they are implausible, set synthetic_min_base_target_waveform_corr to a loose value such as 0.0.",
+        )
 
     outside_fraction = all_stats["residual_outside_taper_nonzero_fraction"]["p95"]
     if outside_fraction is not None and outside_fraction <= 0.005:
-        flag("OK", "taper_support", f"p95 outside-taper nonzero fraction is {outside_fraction:.3e}.")
+        flag("OK", "taper_support", f"p95 outside-taper nonzero fraction is {outside_fraction:.3e}.", metric="residual_outside_taper_nonzero_fraction.p95", actual=outside_fraction, threshold="<= 0.005")
     else:
-        flag("WARN", "taper_support", f"p95 outside-taper nonzero fraction is {outside_fraction}; residual may leak outside support.")
+        flag(
+            "WARN",
+            "taper_support",
+            f"p95 outside-taper nonzero fraction is {outside_fraction}; residual may leak outside support.",
+            metric="residual_outside_taper_nonzero_fraction.p95",
+            actual=outside_fraction,
+            threshold="<= 0.005",
+            related_config_keys=["zero_delta_outside_mask"],
+            suggested_action="Check taper application and synthetic residual support; residual should be essentially zero outside taper.",
+        )
 
     near_clip = all_stats["residual_near_clip_fraction"]["p95"]
     if near_clip is not None and near_clip <= 0.02:
-        flag("OK", "residual_clip", f"p95 residual near-clip fraction is {near_clip:.3e}.")
+        flag("OK", "residual_clip", f"p95 residual near-clip fraction is {near_clip:.3e}.", metric="residual_near_clip_fraction.p95", actual=near_clip, threshold="<= 0.02")
     else:
-        flag("WARN", "residual_clip", f"p95 residual near-clip fraction is {near_clip}; synthetic residuals may be clip-dominated.")
+        flag(
+            "WARN",
+            "residual_clip",
+            f"p95 residual near-clip fraction is {near_clip}; synthetic residuals may be clip-dominated.",
+            metric="residual_near_clip_fraction.p95",
+            actual=near_clip,
+            threshold="<= 0.02",
+            related_config_keys=["ai_min", "ai_max", "synthetic_max_residual_near_clip_fraction"],
+            suggested_action="Reduce synthetic residual amplitude or revisit AI bounds if many targets are clipped.",
+        )
 
     highpass_rms = all_stats["target_residual_highpass_rms"]["p50"]
     if highpass_rms is not None and highpass_rms >= 0.01:
-        flag("OK", "target_highpass", f"median target residual highpass RMS is {highpass_rms:.3e}.")
+        flag("OK", "target_highpass", f"median target residual highpass RMS is {highpass_rms:.3e}.", metric="target_residual_highpass_rms.p50", actual=highpass_rms, threshold=">= 0.01")
     else:
-        flag("WARN", "target_highpass", f"median target residual highpass RMS is {highpass_rms}; target may be too smooth.")
+        flag(
+            "WARN",
+            "target_highpass",
+            f"median target residual highpass RMS is {highpass_rms}; target may be too smooth.",
+            metric="target_residual_highpass_rms.p50",
+            actual=highpass_rms,
+            threshold=">= 0.01",
+            related_config_keys=["synthetic_residual_highpass_samples", "synthetic_cluster_amp_abs_p95_min", "synthetic_cluster_amp_abs_p99_max"],
+            suggested_action="Synthetic deltas may be too smooth; inspect residual highpass window and cluster amplitudes.",
+        )
 
     support_fraction = all_stats["residual_delta_mask_energy_fraction"]["p50"]
     if support_fraction is not None and support_fraction >= 0.70:
-        flag("OK", "delta_mask_support", f"median residual energy inside delta supervision mask is {support_fraction:.3f}.")
+        flag("OK", "delta_mask_support", f"median residual energy inside delta supervision mask is {support_fraction:.3f}.", metric="residual_delta_mask_energy_fraction.p50", actual=support_fraction, threshold=">= 0.70")
     else:
         flag(
             "WARN",
             "delta_mask_support",
             f"median residual energy inside delta supervision mask is {support_fraction}; target delta may sit outside supervised support.",
+            metric="residual_delta_mask_energy_fraction.p50",
+            actual=support_fraction,
+            threshold=">= 0.70",
+            related_config_keys=["delta_supervision_mask"],
+            suggested_action="Check whether synthetic delta placement matches the intended supervision mask.",
         )
 
     zero_mae_ratio = all_stats["zero_waveform_mae_to_synthetic_rms"]["p50"]
     if zero_mae_ratio is not None and zero_mae_ratio >= 0.05:
-        flag("OK", "zero_baseline", f"median zero-residual MAE/synthetic RMS is {zero_mae_ratio:.3f}.")
+        flag("OK", "zero_baseline", f"median zero-residual MAE/synthetic RMS is {zero_mae_ratio:.3f}.", metric="zero_waveform_mae_to_synthetic_rms.p50", actual=zero_mae_ratio, threshold=">= 0.05")
     else:
-        flag("WARN", "zero_baseline", f"median zero-residual MAE/synthetic RMS is {zero_mae_ratio}; zero residual may be too competitive.")
+        flag(
+            "WARN",
+            "zero_baseline",
+            f"median zero-residual MAE/synthetic RMS is {zero_mae_ratio}; zero residual may be too competitive.",
+            metric="zero_waveform_mae_to_synthetic_rms.p50",
+            actual=zero_mae_ratio,
+            threshold=">= 0.05",
+            related_config_keys=["synthetic_well_patch_scale_min", "synthetic_well_patch_scale_max", "synthetic_cluster_amp_abs_p95_min", "synthetic_cluster_amp_abs_p99_max"],
+            suggested_action="The task may be too easy for a zero-delta baseline; increase synthetic delta contrast or inspect waveform sensitivity.",
+        )
 
     cluster = summary["by_mode"].get("unresolved_cluster")
     if cluster:
@@ -448,6 +615,9 @@ def add_quality_flags(summary: dict[str, Any], *, requested_patch_fraction: floa
                 "OK",
                 "unresolved_cluster",
                 f"cluster median detail peaks={detail_peaks:.1f}, detail/seismic peak ratio={detail_ratio:.2f}.",
+                metric="unresolved_cluster.detail_to_seismic_peak_ratio.p50",
+                actual=detail_ratio,
+                threshold="detail_peaks >= 2 and detail/seismic >= 1.5",
             )
         else:
             flag(
@@ -455,15 +625,58 @@ def add_quality_flags(summary: dict[str, Any], *, requested_patch_fraction: floa
                 "unresolved_cluster",
                 "cluster samples may not clearly show many details per seismic peak "
                 f"(median residual peaks={residual_peaks}, reflectivity peaks={reflectivity_peaks}, detail/seismic peak ratio={detail_ratio}).",
+                metric="unresolved_cluster.detail_to_seismic_peak_ratio.p50",
+                actual=detail_ratio,
+                threshold="detail_peaks >= 2 and detail/seismic >= 1.5",
+                related_config_keys=[
+                    "synthetic_unresolved_fraction",
+                    "synthetic_cluster_min_events",
+                    "synthetic_cluster_max_events",
+                    "synthetic_unresolved_oversample_factor",
+                ],
+                suggested_action="Inspect unresolved cluster parameters; samples may not contain enough subsurface detail per seismic event.",
             )
 
     attempts_p95 = all_stats["resample_attempts"]["p95"]
     if attempts_p95 is not None and attempts_p95 <= 2.0:
-        flag("OK", "resample_attempts", f"p95 resample attempts is {attempts_p95:.1f}.")
+        flag("OK", "resample_attempts", f"p95 resample attempts is {attempts_p95:.1f}.", metric="resample_attempts.p95", actual=attempts_p95, threshold="<= 2.0")
     else:
-        flag("WARN", "resample_attempts", f"p95 resample attempts is {attempts_p95}; quality gates may be rejecting many samples.")
+        flag(
+            "WARN",
+            "resample_attempts",
+            f"p95 resample attempts is {attempts_p95}; quality gates may be rejecting many samples.",
+            metric="resample_attempts.p95",
+            actual=attempts_p95,
+            threshold="<= 2.0",
+            related_config_keys=[
+                "synthetic_max_residual_near_clip_fraction",
+                "synthetic_max_seismic_rms_ratio",
+                "synthetic_max_seismic_abs_p99_ratio",
+                "synthetic_max_resample_attempts",
+            ],
+            suggested_action="Quality gates reject many candidates; inspect gate thresholds together with synthetic amplitude settings.",
+        )
 
     return flags
+
+
+def quality_flag_summary(flags: list[dict[str, Any]]) -> dict[str, Any]:
+    levels = sorted({str(item["level"]) for item in flags})
+    flag_counts = {level: sum(1 for item in flags if item["level"] == level) for level in levels}
+    warn_flags = [item for item in flags if item["level"] == "WARN"]
+    return {
+        "overall_status": "WARN" if warn_flags else "OK",
+        "flag_counts": flag_counts,
+        "recommended_actions": [
+            {
+                "name": item["name"],
+                "suggestion": item.get("suggested_action", ""),
+                "related_config_keys": item.get("related_config_keys", []),
+            }
+            for item in warn_flags
+            if item.get("suggested_action")
+        ],
+    }
 
 
 def write_rows_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -487,12 +700,15 @@ def json_default(value: Any) -> Any:
     return str(value)
 
 
-def log_summary(summary: dict[str, Any], flags: list[dict[str, str]]) -> None:
+def log_summary(summary: dict[str, Any], flags: list[dict[str, Any]]) -> None:
     LOGGER.info("Synthetic QC samples: %d", summary["n_samples"])
     LOGGER.info("Mode counts: %s", summary["mode_counts"])
     for key in (
         "synthetic_to_real_rms",
         "synthetic_to_real_abs_p99",
+        "base_target_waveform_corr",
+        "base_target_waveform_delta_rms_to_target_rms",
+        "base_target_waveform_delta_rms_to_real_rms",
         "residual_rms",
         "target_residual_highpass_rms",
         "residual_delta_mask_energy_fraction",
@@ -671,6 +887,7 @@ def main() -> None:
         "synthetic_max_residual_near_clip_fraction": cfg.synthetic_max_residual_near_clip_fraction,
         "synthetic_max_seismic_rms_ratio": cfg.synthetic_max_seismic_rms_ratio,
         "synthetic_max_seismic_abs_p99_ratio": cfg.synthetic_max_seismic_abs_p99_ratio,
+        "synthetic_min_base_target_waveform_corr": cfg.synthetic_min_base_target_waveform_corr,
         "synthetic_max_resample_attempts": cfg.synthetic_max_resample_attempts,
         "ai_min": cfg.ai_min,
         "ai_max": cfg.ai_max,
@@ -680,6 +897,11 @@ def main() -> None:
         requested_patch_fraction=cfg.synthetic_patch_fraction,
         requested_unresolved_fraction=cfg.synthetic_unresolved_fraction,
     )
+    flag_summary = quality_flag_summary(flags)
+    summary["overall_status"] = flag_summary["overall_status"]
+    summary["flag_counts"] = flag_summary["flag_counts"]
+    summary["recommended_actions"] = flag_summary["recommended_actions"]
+    summary["quality_thresholds"] = QUALITY_THRESHOLDS
     summary["quality_flags"] = flags
 
     write_rows_csv(output_dir / "samples.csv", rows)

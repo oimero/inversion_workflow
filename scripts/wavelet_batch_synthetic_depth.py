@@ -43,13 +43,24 @@ def _ensure_import_path(src_root: Path) -> None:
 _ensure_import_path(_find_repo_root() / "src")
 
 from cup.utils.io import (  # noqa: E402
-    load_yaml_config, resolve_relative_path, sanitize_filename, save_mpl_figure,
+    load_yaml_config, resolve_relative_path, sanitize_filename,
 )
 
 matplotlib.use("Agg")
 
 plt.rcParams["figure.dpi"] = 120
 pd.set_option("display.max_columns", 80)
+
+
+def _save_fig(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        plt.tight_layout()
+    except RuntimeError:
+        pass
+    plt.savefig(str(path), dpi=180, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {path}")
 
 
 # =============================================================================
@@ -485,7 +496,7 @@ def process_well(
     axes[2].set_xlabel("Residual")
     axes[2].set_title("Residual")
     axes[2].grid(True, alpha=0.25)
-    save_mpl_figure(output_dirs["figures"] / f"qc_{name}_synthetic_vs_seismic.png")
+    _save_fig(output_dirs["figures"] / f"qc_{name}_synthetic_vs_seismic.png")
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(7, 3.5))
@@ -496,7 +507,7 @@ def process_well(
     ax.set_title(f"{well_name} shift scan")
     ax.legend(loc="best")
     ax.grid(True, alpha=0.25)
-    save_mpl_figure(output_dirs["figures"] / f"qc_{name}_shift_scan.png")
+    _save_fig(output_dirs["figures"] / f"qc_{name}_shift_scan.png")
     plt.close(fig)
 
     # Depth shift statistics
@@ -810,7 +821,7 @@ def main() -> None:
         axes[2].set_ylabel("Best shift (ms)")
         axes[2].set_title("Bulk time shift")
         axes[2].grid(True, axis="y", alpha=0.25)
-        save_mpl_figure(output_dirs["figures"] / "qc_01_batch_metric_summary.png")
+        _save_fig(output_dirs["figures"] / "qc_01_batch_metric_summary.png")
 
         # Fig 02: depth shift summary
         fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
@@ -849,7 +860,7 @@ def main() -> None:
         axes[1].set_ylabel("Depth shift (m)")
         axes[1].set_title("P10-P90 exact depth shift")
         axes[1].grid(True, axis="y", alpha=0.25)
-        save_mpl_figure(output_dirs["figures"] / "qc_02_batch_depth_shift_summary.png")
+        _save_fig(output_dirs["figures"] / "qc_02_batch_depth_shift_summary.png")
 
     # ── Source well sanity check ──
 

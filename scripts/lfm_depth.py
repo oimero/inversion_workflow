@@ -40,11 +40,22 @@ def _ensure_import_path(src_root: Path) -> None:
 _ensure_import_path(_find_repo_root() / "src")
 
 from cup.utils.io import (  # noqa: E402
-    build_segy_textual_header, load_yaml_config, resolve_relative_path, save_mpl_figure,
+    build_segy_textual_header, load_yaml_config, resolve_relative_path,
 )
 
 matplotlib.use("Agg")
 plt.rcParams["figure.dpi"] = 120
+
+
+def _save_fig(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        plt.tight_layout()
+    except RuntimeError:
+        pass
+    plt.savefig(str(path), dpi=180, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {path}")
 
 
 # =============================================================================
@@ -345,7 +356,7 @@ def plot_lfm_result(result: Any, title: str, output_path: Path, cmap: str = "vir
     axes[2].set_xlabel("Inline")
     axes[2].set_ylabel("Xline")
     fig.colorbar(im2, ax=axes[2], shrink=0.85)
-    save_mpl_figure(output_path)
+    _save_fig(output_path)
 
 
 def summarize_coverage(result: Any) -> pd.DataFrame:
@@ -440,7 +451,7 @@ def plot_target_layer_mask_qc(qc_dir: Path, output_path: Path) -> None:
     ]
     ax.legend(handles=handles, loc="upper right", frameon=True, fontsize=9)
     ax.grid(False)
-    save_mpl_figure(output_path)
+    _save_fig(output_path)
     print(f"masked_trace count: {int(masked.sum())}")
 
 

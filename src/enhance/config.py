@@ -60,6 +60,7 @@ class EnhancementConfig:
     synthetic_max_residual_near_clip_fraction: float | None = 0.02  # near-clipping 最大比例。
     synthetic_max_seismic_rms_ratio: float | None = 2.0  # synthetic/real RMS 最大比值。
     synthetic_max_seismic_abs_p99_ratio: float | None = 2.5  # synthetic/real abs-p99 最大比值。
+    synthetic_min_base_target_waveform_corr: float | None = None  # base/target 地震互相关硬门控；默认只做 QC。
     synthetic_max_resample_attempts: int = 8  # 单样本最多重采样次数。
 
     # ── AI 合成边界 ──────────────────────────────────────────
@@ -102,6 +103,8 @@ class EnhancementConfig:
     lr: float = 5e-4  # Adam 初始学习率。
     weight_decay: float = 1e-4  # Adam 权重衰减。
     grad_clip: float = 1.0  # 梯度裁剪阈值。
+    monitor_samples: int = 64  # 固定 monitor synthetic 样本数；设为 0 可关闭。
+    monitor_seed: int = 20260507  # 固定 monitor synthetic 抽样随机种子。
     device: str = "cuda"  # 首选训练设备；CUDA 不可用时回退 CPU。
     num_workers: int = 0  # DataLoader worker 数。
     pin_memory: bool = True  # CUDA 训练时是否启用 pinned memory。
@@ -132,6 +135,12 @@ class EnhancementConfig:
             raise ValueError("synthetic_traces_per_epoch must be positive.")
         if self.synthetic_batch_size is not None and self.synthetic_batch_size <= 0:
             raise ValueError("synthetic_batch_size must be positive when provided.")
+        if self.synthetic_min_base_target_waveform_corr is not None and not (
+            -1.0 <= self.synthetic_min_base_target_waveform_corr <= 1.0
+        ):
+            raise ValueError("synthetic_min_base_target_waveform_corr must be within [-1, 1] when provided.")
+        if self.monitor_samples < 0:
+            raise ValueError("monitor_samples must be non-negative.")
         if self.ai_min <= 0.0 or self.ai_max <= self.ai_min:
             raise ValueError(f"Invalid AI bounds: ai_min={self.ai_min}, ai_max={self.ai_max}.")
         for name in (

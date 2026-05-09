@@ -1,7 +1,7 @@
 """Shared infrastructure and I/O helpers.
 
 Functions in this module are project-agnostic and do not depend on any
-geophysical libraries beyond standard Python + matplotlib.
+geophysical libraries beyond standard Python.
 """
 
 from __future__ import annotations
@@ -9,7 +9,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import matplotlib.pyplot as plt
 import yaml
 
 
@@ -46,29 +45,14 @@ def sanitize_filename(name: str) -> str:
     return "".join("_" if c in bad else c for c in name)
 
 
-# ── Matplotlib ──
-
-
-def save_mpl_figure(path: Path, *, dpi: int = 180) -> None:
-    """Save the current matplotlib figure to *path*, closing it afterwards."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        plt.tight_layout()
-    except RuntimeError:
-        pass
-    plt.savefig(str(path), dpi=dpi, bbox_inches="tight")
-    plt.close()
-    print(f"Saved {path}")
-
-
 # ── SEG-Y ──
 
 
 def build_segy_textual_header(title: str, lines: list[str] | None = None) -> str:
     """Build a 3200-byte SEG-Y textual header from a title and extra lines."""
     all_lines = [title] + (lines or [])
-    rows = [f"C{i:>2d} {text}"[:80].ljust(80) for i, text in enumerate(all_lines, start=1)]
-    rows.extend([f"C{i:>2d}".ljust(80) for i in range(len(rows) + 1, 41)])
+    rows = [f"C{i:02d} {text}"[:80].ljust(80) for i, text in enumerate(all_lines, start=1)]
+    rows.extend([f"C{i:02d}".ljust(80) for i in range(len(rows) + 1, 41)])
     textual = "".join(rows)
     if len(textual) != 3200:
         raise ValueError(f"Expected 3200-char textual header, got {len(textual)}")

@@ -197,6 +197,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         max_residual_near_clip_fraction: float | None = 0.02,
         max_seismic_rms_ratio: float | None = 2.0,
         max_seismic_abs_p99_ratio: float | None = 2.5,
+        min_base_target_waveform_corr: float | None = None,
         max_resample_attempts: int = 8,
         delta_supervision_mask: DeltaSupervisionMask = "core",
         velocity_mode: SyntheticVelocityMode = "lfm_vp",
@@ -235,6 +236,8 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         }.items():
             if value is not None and value <= 0.0:
                 raise ValueError(f"{name} must be positive when provided.")
+        if min_base_target_waveform_corr is not None and not (-1.0 <= min_base_target_waveform_corr <= 1.0):
+            raise ValueError("min_base_target_waveform_corr must be within [-1, 1] when provided.")
         if delta_supervision_mask not in ("core", "loss"):
             raise ValueError("delta_supervision_mask must be one of ['core', 'loss'].")
         _validate_velocity_mode(velocity_mode, vp_ai_slope, vp_ai_intercept, vp_blend_alpha, vp_smooth_samples)
@@ -266,6 +269,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         self.max_residual_near_clip_fraction = max_residual_near_clip_fraction
         self.max_seismic_rms_ratio = max_seismic_rms_ratio
         self.max_seismic_abs_p99_ratio = max_seismic_abs_p99_ratio
+        self.min_base_target_waveform_corr = min_base_target_waveform_corr
         self.max_resample_attempts = int(max_resample_attempts)
         self.delta_supervision_mask = delta_supervision_mask
         self.velocity_mode = velocity_mode
@@ -394,6 +398,12 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
                 item.get("dynamic_gain"),
                 loss_mask,
             )
+        base_seismic_raw = self._forward_raw_seismic(
+            safe_base_ai,
+            base_vp,
+            item.get("dynamic_gain"),
+        )
+        base_seismic = (base_seismic_raw * float(rms_scale)).astype(np.float32)
         if "dynamic_gain" in item and float(rms_scale) != 1.0:
             item["dynamic_gain"] = item["dynamic_gain"] * float(rms_scale)
         reflectivity = ai_to_reflectivity(target_ai)
@@ -410,6 +420,8 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         item["target_ai"] = torch.from_numpy(target_ai[np.newaxis]).float()
         item["target_seismic"] = torch.from_numpy(target_seismic[np.newaxis]).float()
         item["target_seismic_raw"] = torch.from_numpy(target_seismic_raw[np.newaxis]).float()
+        item["base_seismic"] = torch.from_numpy(base_seismic[np.newaxis]).float()
+        item["base_seismic_raw"] = torch.from_numpy(base_seismic_raw[np.newaxis]).float()
         item["synthetic_rms_scale"] = torch.tensor(float(rms_scale), dtype=torch.float32)
         item["raw_reflectivity"] = torch.from_numpy(reflectivity[np.newaxis]).float()
         item["velocity_raw"] = torch.from_numpy(target_vp[np.newaxis]).float()
@@ -448,10 +460,11 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         delta_mask = item["delta_loss_mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
         residual = item["target_delta_log_ai"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         target_seismic = item["target_seismic"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+        base_seismic = item["base_seismic"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         source_seismic = item["obs"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
 
         valid_delta = delta_mask & np.isfinite(residual)
-        valid_waveform = waveform_mask & np.isfinite(target_seismic) & np.isfinite(source_seismic)
+        valid_waveform = waveform_mask & np.isfinite(target_seismic) & np.isfinite(source_seismic) & np.isfinite(base_seismic)
         if not np.any(valid_delta) or not np.any(valid_waveform):
             return False
 
@@ -473,6 +486,11 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             if source_p99 > 0.0 and np.isfinite(source_p99):
                 if target_p99 / source_p99 > float(self.max_seismic_abs_p99_ratio):
                     return False
+
+        if self.min_base_target_waveform_corr is not None:
+            corr = _normalized_cross_correlation(base_seismic[valid_waveform], target_seismic[valid_waveform])
+            if np.isfinite(corr) and corr < float(self.min_base_target_waveform_corr):
+                return False
 
         return True
 
@@ -635,6 +653,19 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         coarse = np.clip(coarse, -self.residual_max_abs, self.residual_max_abs).astype(np.float32, copy=False)
         return coarse, highres.astype(np.float32, copy=False), highres_depth.astype(np.float32, copy=False)
 
+    def _forward_raw_seismic(
+        self,
+        ai: np.ndarray,
+        vp: np.ndarray,
+        dynamic_gain: torch.Tensor | None,
+    ) -> np.ndarray:
+        ai_tensor = torch.from_numpy(ai[np.newaxis, np.newaxis]).float()
+        vp_tensor = torch.from_numpy(vp[np.newaxis, np.newaxis]).float()
+        gain_tensor = dynamic_gain.float().unsqueeze(0) if dynamic_gain is not None and dynamic_gain.ndim == 2 else dynamic_gain
+        with torch.no_grad():
+            seismic = self.forward_model(ai_tensor, vp_tensor, gain=gain_tensor)
+        return seismic.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32)
+
     def _forward_target_seismic(
         self,
         target_ai: np.ndarray,
@@ -642,12 +673,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         dynamic_gain: torch.Tensor | None,
         loss_mask: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, float]:
-        ai_tensor = torch.from_numpy(target_ai[np.newaxis, np.newaxis]).float()
-        vp_tensor = torch.from_numpy(target_vp[np.newaxis, np.newaxis]).float()
-        gain_tensor = dynamic_gain.float().unsqueeze(0) if dynamic_gain is not None and dynamic_gain.ndim == 2 else dynamic_gain
-        with torch.no_grad():
-            seismic = self.forward_model(ai_tensor, vp_tensor, gain=gain_tensor)
-        raw = seismic.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32)
+        raw = self._forward_raw_seismic(target_ai, target_vp, dynamic_gain)
         scale = 1.0
         if self.seismic_rms_match and dynamic_gain is not None:
             valid = np.asarray(loss_mask, dtype=bool) & np.isfinite(raw)
@@ -768,6 +794,20 @@ def _abs_percentile(values: np.ndarray, percentile: float) -> float:
     if values.size == 0:
         return 0.0
     return float(np.percentile(np.abs(values), percentile))
+
+
+def _normalized_cross_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    valid = np.isfinite(a) & np.isfinite(b)
+    if not np.any(valid):
+        return float("nan")
+    a = a[valid] - float(np.mean(a[valid]))
+    b = b[valid] - float(np.mean(b[valid]))
+    denom = float(np.sqrt(np.sum(a * a) * np.sum(b * b)))
+    if denom <= 0.0 or not np.isfinite(denom):
+        return float("nan")
+    return float(np.sum(a * b) / denom)
 
 
 def _validate_velocity_mode(

@@ -168,6 +168,6 @@ ginn_inversion_depth.py
 | 外部输入 | 说明 |
 |---|---|
 | 训练好的 checkpoint `.pt` | 脚本优先使用 checkpoint 内保存的训练配置来恢复推理环境 |
-| `well_qc_las_dir` 中的原始 LAS | 井旁 QC 用（可选） |
+| script 2 的 `shifted_las/*.las` | `source_batch_dir` 指向 script 2 的输出，井旁 QC 用（可选） |
 
 输出：`base_ai_depth.npz` + `.segy`。

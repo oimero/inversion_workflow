@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import lasio
 import matplotlib
 import numpy as np
 import pandas as pd
@@ -164,44 +165,25 @@ def _bilinear_trace_from_volume(volume: np.ndarray, survey_ctx: Any, x: float, y
     return (1.0 - wi) * (1.0 - wj) * t00 + (1.0 - wi) * wj * t01 + wi * (1.0 - wj) * t10 + wi * wj * t11
 
 
-def _collect_las_references(las_dir: Path) -> dict[str, Path]:
-    refs: dict[str, Path] = {}
-    for las_path in sorted(las_dir.glob("*.las")):
-        refs[las_path.stem.upper()] = las_path
-    return refs
-
-
-def _extract_ai_reference_from_las(
-    las_path: Path,
-    *,
-    vp_unit: str,
-    rho_unit: str,
-    kb_m: float,
-    depth_domain: str,
-    log_filter_params: dict[str, Any],
-) -> tuple[np.ndarray, np.ndarray]:
-    from cup.petrel.load import load_vp_rho_logset_from_las
-    from wtie.optimize import tie as tie_utils
-    from wtie.processing.logs import interpolate_nans
-
-    logset_md = load_vp_rho_logset_from_las(las_path, vp_unit=vp_unit, rho_unit=rho_unit)
-    filtered_logset_md = tie_utils.filter_md_logs(
-        logset_md,
-        median_size=int(log_filter_params["logs_median_size"]),
-        threshold=float(log_filter_params["logs_median_threshold"]),
-        std=float(log_filter_params["logs_std"]),
-        std2=0.8 * float(log_filter_params["logs_std"]),
-    )
-    depth = np.asarray(filtered_logset_md.basis, dtype=np.float64)
-    vp = interpolate_nans(np.asarray(filtered_logset_md.Vp.values, dtype=np.float64), method="linear")
-    rho = interpolate_nans(np.asarray(filtered_logset_md.Rho.values, dtype=np.float64), method="linear")
-    if depth_domain == "tvdss":
-        depth = depth - float(kb_m)
-    elif depth_domain != "md":
-        raise ValueError(f"well_qc_depth_domain must be 'tvdss' or 'md', got {depth_domain!r}")
-    ai = vp * rho
-    finite = np.isfinite(depth) & np.isfinite(ai) & (ai > 0.0)
-    return depth[finite], ai[finite]
+def _read_ai_from_shifted_las(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read (md_m, ai) from a shifted LAS. Uses AI curve directly if present, else VP*RHO."""
+    las = lasio.read(path)
+    df = las.df()
+    md = df.index.to_numpy(dtype=float)
+    for col in df.columns:
+        if str(col).strip().upper() == "AI":
+            return md, df[col].to_numpy(dtype=float)
+    vp_col = rho_col = None
+    for col in df.columns:
+        name = str(col).strip().upper()
+        if name in ("VP_MPS", "VP"):
+            vp_col = col
+        elif name in ("RHO_GCC", "RHO"):
+            rho_col = col
+    if vp_col is None or rho_col is None:
+        raise ValueError(f"Shifted LAS {path.name} must contain AI or VP+RHO curves.")
+    ai = df[vp_col].to_numpy(dtype=float) * df[rho_col].to_numpy(dtype=float)
+    return md, ai
 
 
 def _save_prediction_npz(
@@ -321,11 +303,7 @@ def main() -> None:
     lfm_section = _extract_section(lfm_volume, slice_mode, resolved_slice_index)
     mask_section = _extract_mask_section(mask_volume, slice_mode, resolved_slice_index)
     diff_section = pred_section - lfm_section
-    auto_vmin, auto_vmax = _robust_limits(pred_section, lfm_section, percentiles=clip_values)  # type: ignore[arg-type]
-    ai_display_min = script_cfg.get("ai_display_min", None)
-    ai_display_max = script_cfg.get("ai_display_max", None)
-    shared_vmin = auto_vmin if ai_display_min is None else float(ai_display_min)
-    shared_vmax = auto_vmax if ai_display_max is None else float(ai_display_max)
+    shared_vmin, shared_vmax = _robust_limits(pred_section, lfm_section, percentiles=clip_values)  # type: ignore[arg-type]
     diff_abs = float(np.percentile(np.abs(diff_section[np.isfinite(diff_section)]), clip_values[1]))
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 7), constrained_layout=True)
@@ -389,13 +367,14 @@ def main() -> None:
     n_wells_qc = 0
     well_qc_summary: dict[str, float | None] = {"mean_rmse": None, "mean_mae": None, "mean_corr": None}
     if not args.skip_well_qc and bool(script_cfg.get("well_qc_enabled", True)):
-        data_root = resolve_relative_path(str(cfg.get("data_root", "data")), root=REPO_ROOT)
-        las_dir = resolve_relative_path(
-            str(script_cfg.get("well_qc_las_dir", "vertical_well_las_target_qyz")), root=data_root
+        source_batch_dir = resolve_relative_path(str(script_cfg["source_batch_dir"]), root=REPO_ROOT)
+        shifted_las_dir = resolve_relative_path(
+            str(script_cfg.get("shifted_las_dir", "shifted_las")), root=source_batch_dir
         )
+        data_root = resolve_relative_path(str(cfg.get("data_root", "data")), root=REPO_ROOT)
         well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
-        if not las_dir.exists():
-            raise FileNotFoundError(f"Well QC LAS dir not found: {las_dir}")
+        if not shifted_las_dir.exists():
+            raise FileNotFoundError(f"Shifted LAS dir not found: {shifted_las_dir}")
         if not well_heads_file.exists():
             raise FileNotFoundError(f"Well heads file not found: {well_heads_file}")
 
@@ -412,18 +391,10 @@ def main() -> None:
         sample_axis_m = _sample_axis_depth_m(trainer.geometry)
         well_heads = import_well_heads_petrel(well_heads_file)
         well_heads = well_heads.assign(Name_norm=well_heads["Name"].astype(str).str.upper())
-        reference_files = _collect_las_references(las_dir)
-        vp_unit = str(script_cfg.get("well_qc_las_vp_unit", "us/m"))
-        rho_unit = str(script_cfg.get("well_qc_las_rho_unit", "g/cm3"))
-        depth_domain = str(script_cfg.get("well_qc_depth_domain", "tvdss"))
-        log_filter_params = script_cfg.get("well_qc_log_filter", {})
-        required_filter_keys = ("logs_median_size", "logs_median_threshold", "logs_std")
-        missing_filter_keys = [key for key in required_filter_keys if key not in log_filter_params]
-        if missing_filter_keys:
-            raise ValueError(f"Missing well_qc_log_filter keys: {missing_filter_keys}")
 
         metrics: list[dict[str, Any]] = []
-        for well_name_norm, las_path in reference_files.items():
+        for las_path in sorted(shifted_las_dir.glob("*.las")):
+            well_name_norm = las_path.stem.upper()
             head_match = well_heads.loc[well_heads["Name_norm"] == well_name_norm]
             if head_match.empty:
                 metrics.append({"well_name": well_name_norm, "status": "failed", "error": "well head not matched"})
@@ -432,14 +403,20 @@ def main() -> None:
             try:
                 head = head_match.iloc[0]
                 kb_m = float(head["Well datum value"])
-                ref_depth, ref_ai = _extract_ai_reference_from_las(
-                    las_path,
-                    vp_unit=vp_unit,
-                    rho_unit=rho_unit,
-                    kb_m=kb_m,
-                    depth_domain=depth_domain,
-                    log_filter_params=log_filter_params,
-                )
+                md, ai = _read_ai_from_shifted_las(las_path)
+                tvdss = np.asarray(md, dtype=float) - kb_m
+                valid_md = np.isfinite(tvdss) & np.isfinite(ai) & (ai > 0.0)
+                if int(valid_md.sum()) < 2:
+                    raise ValueError("too few finite positive AI samples after MD→TVDSS")
+                ref_depth = tvdss[valid_md]
+                ref_ai = ai[valid_md]
+                order = np.argsort(ref_depth)
+                ref_depth = ref_depth[order]
+                ref_ai = ref_ai[order]
+                unique_depth, unique_idx = np.unique(ref_depth, return_index=True)
+                ref_depth = ref_depth[unique_idx]
+                ref_ai = ref_ai[unique_idx]
+
                 pred_trace = _bilinear_trace_from_volume(
                     pred_volume,
                     survey_ctx,
@@ -458,7 +435,7 @@ def main() -> None:
                 pd.DataFrame(
                     {
                         "depth_m": ref_depth[valid],
-                        "filtered_las_ai": ref_ai[valid],
+                        "shifted_las_ai": ref_ai[valid],
                         "predicted_ai": pred_ai[valid],
                         "diff_ai": diff,
                     }
@@ -466,7 +443,7 @@ def main() -> None:
 
                 qc_plot_path = output_dirs["well_qc_figures"] / f"well_qc_{safe_name}.png"
                 fig, ax = plt.subplots(figsize=(5, 10), constrained_layout=True)
-                ax.plot(ref_ai[valid], ref_depth[valid], label="Filtered LAS AI", lw=2)
+                ax.plot(ref_ai[valid], ref_depth[valid], label="Shifted LAS AI", lw=2)
                 ax.plot(pred_ai[valid], ref_depth[valid], label="GINN-Depth predicted AI", lw=2)
                 ax.invert_yaxis()
                 ax.set_xlabel("AI")
@@ -487,10 +464,6 @@ def main() -> None:
                         "bias": float(np.mean(diff)),
                         "corr": corr,
                         "reference_file": las_path.name,
-                        "depth_domain": depth_domain,
-                        "log_filter_median_size": int(log_filter_params["logs_median_size"]),
-                        "log_filter_threshold": float(log_filter_params["logs_median_threshold"]),
-                        "log_filter_std": float(log_filter_params["logs_std"]),
                         "trace_qc_path": str(trace_qc_path),
                         "figure_path": str(qc_plot_path),
                     }

@@ -29,7 +29,7 @@ def zscore_traces_axis(values: np.ndarray) -> np.ndarray:
         raise ValueError("At least one trace has no finite samples.")
     means = np.where(finite, values, 0.0).sum(axis=1, keepdims=True) / counts
     centered = np.where(finite, values - means, 0.0)
-    stds = np.sqrt((centered ** 2).sum(axis=1, keepdims=True) / counts)
+    stds = np.sqrt((centered**2).sum(axis=1, keepdims=True) / counts)
     if np.any(~np.isfinite(stds) | (stds <= 0.0)):
         raise ValueError("At least one trace has non-positive standard deviation.")
     return centered / stds
@@ -63,7 +63,8 @@ def centered_moving_sum_axis(values: np.ndarray, window: int) -> np.ndarray:
     padded = np.pad(values, ((0, 0), (left, right)), mode="constant", constant_values=0.0)
     cumsum = np.cumsum(
         np.concatenate([np.zeros((values.shape[0], 1), dtype=np.float64), padded], axis=1),
-        axis=1, dtype=np.float64,
+        axis=1,
+        dtype=np.float64,
     )
     return cumsum[:, window:] - cumsum[:, :-window]
 
@@ -72,7 +73,7 @@ def centered_moving_rms(values: np.ndarray, window: int) -> np.ndarray:
     """1-D centered moving RMS, treating NaN as missing data."""
     values = np.asarray(values, dtype=float)
     valid = np.isfinite(values)
-    numerator = centered_moving_sum(np.where(valid, values ** 2, 0.0), window)
+    numerator = centered_moving_sum(np.where(valid, values**2, 0.0), window)
     denominator = centered_moving_sum(valid.astype(float), window)
     out = np.full(values.shape, np.nan, dtype=float)
     positive = denominator > 0.0
@@ -84,7 +85,7 @@ def centered_moving_rms_axis(values: np.ndarray, window: int) -> np.ndarray:
     """2-D centered moving RMS along axis=1, treating NaN as missing data."""
     values = np.asarray(values, dtype=np.float32)
     valid = np.isfinite(values)
-    numerator = centered_moving_sum_axis(np.where(valid, values ** 2, 0.0), window)
+    numerator = centered_moving_sum_axis(np.where(valid, values**2, 0.0), window)
     denominator = centered_moving_sum_axis(valid.astype(np.float32), window)
     out = np.full(values.shape, np.nan, dtype=np.float32)
     positive = denominator > 0.0
@@ -96,7 +97,10 @@ def centered_moving_rms_axis(values: np.ndarray, window: int) -> np.ndarray:
 
 
 def meters_to_odd_samples(
-    window_m: float, sample_step_m: float, *, min_samples: int = 3,
+    window_m: float,
+    sample_step_m: float,
+    *,
+    min_samples: int = 3,
 ) -> int:
     """Convert a physical window length (m) to the nearest odd sample count."""
     n = int(round(float(window_m) / float(sample_step_m)))

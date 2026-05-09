@@ -11,7 +11,6 @@ from typing import Any
 
 import yaml
 
-
 # ── Path resolution ──
 
 
@@ -41,7 +40,7 @@ def load_yaml_config(config_path: str | Path, *, base_dir: Path | None = None) -
 
 def sanitize_filename(name: str) -> str:
     """Replace characters that are unsafe in file names with underscores."""
-    bad = {"/", "\\", " ", ":", "*", "?", "\"", "<", ">", "|"}
+    bad = {"/", "\\", " ", ":", "*", "?", '"', "<", ">", "|"}
     return "".join("_" if c in bad else c for c in name)
 
 

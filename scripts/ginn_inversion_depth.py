@@ -27,24 +27,15 @@ import torch
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
+# =============================================================================
 # Bootstrap
+# =============================================================================
 
-
-def _find_repo_root() -> Path:
-    root = Path(__file__).resolve().parent.parent
-    if not (root / "src").exists():
-        root = Path.cwd().resolve()
-    if not (root / "src").exists():
-        raise RuntimeError("Could not locate repo root containing 'src'.")
-    return root
-
-
-def _ensure_import_path(src_root: Path) -> None:
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
-
-
-_ensure_import_path(_find_repo_root() / "src")
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from cup.petrel.load import import_well_heads_petrel  # noqa: E402
 from cup.seismic.survey import open_survey  # noqa: E402
@@ -57,7 +48,9 @@ from cup.utils.io import (  # noqa: E402
 from ginn_depth.config import DepthGINNConfig  # noqa: E402
 from ginn_depth.trainer import Trainer  # noqa: E402
 
+# =============================================================================
 # CLI
+# =============================================================================
 
 
 def parse_args() -> argparse.Namespace:
@@ -234,20 +227,21 @@ def _save_prediction_npz(
     )
 
 
+# =============================================================================
 # Main
+# =============================================================================
 
 
 def main() -> None:
     args = parse_args()
-    repo_root = _find_repo_root()
-    cfg = load_yaml_config(args.config, base_dir=repo_root)
+    cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
     script_cfg = cfg.get("ginn_inversion_depth", {})
     if not script_cfg:
         raise ValueError("Missing 'ginn_inversion_depth' section in config.")
 
-    output_root = resolve_relative_path(str(cfg.get("output_root", "scripts/output")), root=repo_root)
+    output_root = resolve_relative_path(str(cfg.get("output_root", "scripts/output")), root=REPO_ROOT)
     checkpoint_path = args.checkpoint or Path(script_cfg["checkpoint_path"])
-    checkpoint_path = checkpoint_path if checkpoint_path.is_absolute() else (repo_root / checkpoint_path).resolve()
+    checkpoint_path = checkpoint_path if checkpoint_path.is_absolute() else (REPO_ROOT / checkpoint_path).resolve()
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
@@ -255,7 +249,7 @@ def main() -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = output_root / f"ginn_inversion_depth_{timestamp}"
     else:
-        output_dir = args.output_dir if args.output_dir.is_absolute() else repo_root / args.output_dir
+        output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
     output_dirs = {
         "root": output_dir,
         "metadata": output_dir / "metadata",
@@ -274,7 +268,7 @@ def main() -> None:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cfg_payload = checkpoint["config"]
     depth_cfg = (
-        DepthGINNConfig.from_dict(cfg_payload, base_dir=repo_root) if isinstance(cfg_payload, dict) else cfg_payload
+        DepthGINNConfig.from_dict(cfg_payload, base_dir=REPO_ROOT) if isinstance(cfg_payload, dict) else cfg_payload
     )
     depth_cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -395,7 +389,7 @@ def main() -> None:
     n_wells_qc = 0
     well_qc_summary: dict[str, float | None] = {"mean_rmse": None, "mean_mae": None, "mean_corr": None}
     if not args.skip_well_qc and bool(script_cfg.get("well_qc_enabled", True)):
-        data_root = resolve_relative_path(str(cfg.get("data_root", "data")), root=repo_root)
+        data_root = resolve_relative_path(str(cfg.get("data_root", "data")), root=REPO_ROOT)
         las_dir = resolve_relative_path(
             str(script_cfg.get("well_qc_las_dir", "vertical_well_las_target_qyz")), root=data_root
         )

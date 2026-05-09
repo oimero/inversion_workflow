@@ -7,6 +7,10 @@ import logging
 import sys
 from pathlib import Path
 
+# =============================================================================
+# Bootstrap
+# =============================================================================
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -15,6 +19,10 @@ if str(SRC_DIR) not in sys.path:
 
 from ginn_depth.config import DepthGINNConfig
 from ginn_depth.trainer import Trainer
+
+# =============================================================================
+# CLI
+# =============================================================================
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,6 +34,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to the YAML config file.",
     )
     return parser.parse_args()
+
+
+# =============================================================================
+# Main
+# =============================================================================
 
 
 def main() -> None:

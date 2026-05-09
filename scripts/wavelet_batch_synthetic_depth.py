@@ -27,23 +27,15 @@ import numpy as np
 import pandas as pd
 import yaml
 
+# =============================================================================
+# Bootstrap
+# =============================================================================
 
-# ── Bootstrap ──
-def _find_repo_root() -> Path:
-    root = Path(__file__).resolve().parent.parent
-    if not (root / "src").exists():
-        root = Path.cwd().resolve()
-    if not (root / "src").exists():
-        raise RuntimeError("Could not locate repo root containing 'src'.")
-    return root
-
-
-def _ensure_import_path(src_root: Path) -> None:
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
-
-
-_ensure_import_path(_find_repo_root() / "src")
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.io import (  # noqa: E402
     load_yaml_config,
@@ -575,10 +567,9 @@ def process_well(
 
 def main() -> None:
     args = parse_args()
-    repo_root = _find_repo_root()
 
-    cfg = load_yaml_config(args.config, base_dir=repo_root)
-    data_root = resolve_relative_path(cfg.get("data_root", "data"), root=repo_root)
+    cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
+    data_root = resolve_relative_path(cfg.get("data_root", "data"), root=REPO_ROOT)
 
     script_cfg = cfg.get("wavelet_batch_synthetic_depth", {})
     if not script_cfg:
@@ -593,7 +584,7 @@ def main() -> None:
     las_dir = resolve_relative_path(las_dir_str, root=data_root)
     well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
     seismic_file = resolve_relative_path(str(cfg["seismic_depth"]["file"]), root=data_root)
-    source_auto_tie_dir = repo_root / str(script_cfg["source_auto_tie_dir"])
+    source_auto_tie_dir = REPO_ROOT / str(script_cfg["source_auto_tie_dir"])
     source_well_name = str(script_cfg["source_well_name"])
     wavelet_path = source_auto_tie_dir / f"wavelet_201ms_{source_well_name}.csv"
     # Try both naming conventions (run_summary_NW11.json from new script,
@@ -612,10 +603,10 @@ def main() -> None:
 
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_root = repo_root / cfg.get("output_root", "scripts/output")
+        output_root = REPO_ROOT / cfg.get("output_root", "scripts/output")
         output_dir = output_root / f"wavelet_batch_synthetic_depth_{timestamp}"
     else:
-        output_dir = args.output_dir if args.output_dir.is_absolute() else repo_root / args.output_dir
+        output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
 
     output_dirs = {
         "root": output_dir,

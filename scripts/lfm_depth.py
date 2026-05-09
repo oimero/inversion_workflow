@@ -24,23 +24,15 @@ import numpy as np
 import pandas as pd
 import yaml
 
+# =============================================================================
+# Bootstrap
+# =============================================================================
 
-# ── Bootstrap ──
-def _find_repo_root() -> Path:
-    root = Path(__file__).resolve().parent.parent
-    if not (root / "src").exists():
-        root = Path.cwd().resolve()
-    if not (root / "src").exists():
-        raise RuntimeError("Could not locate repo root containing 'src'.")
-    return root
-
-
-def _ensure_import_path(src_root: Path) -> None:
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
-
-
-_ensure_import_path(_find_repo_root() / "src")
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.io import (  # noqa: E402
     build_segy_textual_header,
@@ -50,17 +42,6 @@ from cup.utils.io import (  # noqa: E402
 
 matplotlib.use("Agg")
 plt.rcParams["figure.dpi"] = 120
-
-
-def _save_fig(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        plt.tight_layout()
-    except RuntimeError:
-        pass
-    plt.savefig(str(path), dpi=180, bbox_inches="tight")
-    plt.close()
-    print(f"Saved {path}")
 
 
 # =============================================================================
@@ -83,6 +64,22 @@ def parse_args() -> argparse.Namespace:
         help="Output directory. Defaults to scripts/output/lfm_depth_<timestamp>.",
     )
     return parser.parse_args()
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+
+def _save_fig(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        plt.tight_layout()
+    except RuntimeError:
+        pass
+    plt.savefig(str(path), dpi=180, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {path}")
 
 
 # =============================================================================
@@ -467,9 +464,8 @@ def plot_target_layer_mask_qc(qc_dir: Path, output_path: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    repo_root = _find_repo_root()
 
-    cfg = load_yaml_config(args.config, base_dir=repo_root)
+    cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
     data_root_str = cfg.get("data_root", "data")
 
     script_cfg = cfg.get("lfm_depth", {})
@@ -478,11 +474,11 @@ def main() -> None:
 
     # ── Resolve inputs ──
 
-    data_root = repo_root / data_root_str
+    data_root = REPO_ROOT / data_root_str
     seismic_file = resolve_relative_path(str(cfg["seismic_depth"]["file"]), root=data_root)
     well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
-    train_config_file = resolve_relative_path(str(script_cfg["train_config"]), root=repo_root)
-    las_dir = resolve_relative_path(str(script_cfg["las_dir"]), root=repo_root)
+    train_config_file = resolve_relative_path(str(script_cfg["train_config"]), root=REPO_ROOT)
+    las_dir = resolve_relative_path(str(script_cfg["las_dir"]), root=REPO_ROOT)
 
     horizon_files = {
         name: resolve_relative_path(str(cfg["horizons"][name]), root=data_root) for name in cfg["horizons"]
@@ -502,10 +498,10 @@ def main() -> None:
 
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_root = repo_root / cfg.get("output_root", "scripts/output")
+        output_root = REPO_ROOT / cfg.get("output_root", "scripts/output")
         output_dir = output_root / f"lfm_depth_{timestamp}"
     else:
-        output_dir = args.output_dir if args.output_dir.is_absolute() else repo_root / args.output_dir
+        output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
 
     qc_dir = output_dir / "target_layer_qc"
     figures_dir = output_dir / "figures"

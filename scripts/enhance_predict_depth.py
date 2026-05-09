@@ -12,6 +12,20 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+# =============================================================================
+# Bootstrap
+# =============================================================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+# =============================================================================
+# CLI
+# =============================================================================
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -23,16 +37,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def ensure_import_path(project_root: Path) -> None:
-    src_root = project_root / "src"
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
+# =============================================================================
+# Main
+# =============================================================================
 
 
 def main() -> None:
     args = parse_args()
-    project_root = Path.cwd().resolve()
-    ensure_import_path(project_root)
 
     from enhance.config import EnhancementConfig
     from enhance.loss import compose_enhanced_ai
@@ -40,13 +51,13 @@ def main() -> None:
     from ginn_depth.enhance import build_depth_enhancement_data_bundle
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-    checkpoint_path = args.checkpoint if args.checkpoint.is_absolute() else project_root / args.checkpoint
+    checkpoint_path = args.checkpoint if args.checkpoint.is_absolute() else REPO_ROOT / args.checkpoint
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if args.config is None:
-        cfg = EnhancementConfig.from_dict(payload["config"], base_dir=project_root)
+        cfg = EnhancementConfig.from_dict(payload["config"], base_dir=REPO_ROOT)
     else:
-        config_path = args.config if args.config.is_absolute() else project_root / args.config
-        cfg = EnhancementConfig.from_yaml(config_path, base_dir=project_root)
+        config_path = args.config if args.config.is_absolute() else REPO_ROOT / args.config
+        cfg = EnhancementConfig.from_yaml(config_path, base_dir=REPO_ROOT)
 
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     bundle = build_depth_enhancement_data_bundle(cfg)
@@ -92,7 +103,7 @@ def main() -> None:
     enhanced_volume = enhanced_flat.reshape(n_il, n_xl, n_sample)
     delta_volume = delta_flat.reshape(n_il, n_xl, n_sample)
 
-    output_path = args.output if args.output.is_absolute() else project_root / args.output
+    output_path = args.output if args.output.is_absolute() else REPO_ROOT / args.output
     output_path.parent.mkdir(parents=True, exist_ok=True)
     geometry = bundle.dataset_bundle.geometry
     ilines = float(geometry["inline_min"]) + np.arange(n_il, dtype=np.float32) * float(geometry["inline_step"])

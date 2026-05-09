@@ -24,6 +24,20 @@ import numpy as np
 LOGGER = logging.getLogger("enhance_qc_depth")
 torch = None
 
+# =============================================================================
+# Bootstrap
+# =============================================================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+# =============================================================================
+# CLI
+# =============================================================================
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -117,12 +131,6 @@ def setup_logging(output_dir: Path) -> None:
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
     LOGGER.addHandler(stream_handler)
-
-
-def ensure_import_path(project_root: Path) -> None:
-    src_root = project_root / "src"
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
 
 
 def to_numpy_1d(value: Any) -> np.ndarray:
@@ -856,11 +864,13 @@ def _fmt(value: Any) -> str:
     return f"{value_f:.4g}"
 
 
+# =============================================================================
+# Main
+# =============================================================================
+
+
 def main() -> None:
     args = parse_args()
-    project_root = Path.cwd().resolve()
-    ensure_import_path(project_root)
-
     global torch
     import torch as torch_module
 
@@ -874,15 +884,15 @@ def main() -> None:
         raise ValueError("--num-samples must be positive.")
     config_path = args.config
     if not config_path.is_absolute():
-        config_path = project_root / config_path
+        config_path = REPO_ROOT / config_path
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = project_root / "data" / f"output_enhance_qc_depth_{timestamp}"
+        output_dir = REPO_ROOT / "data" / f"output_enhance_qc_depth_{timestamp}"
     else:
-        output_dir = args.output_dir if args.output_dir.is_absolute() else project_root / args.output_dir
+        output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
 
     setup_logging(output_dir)
-    LOGGER.info("Project root: %s", project_root)
+    LOGGER.info("Project root: %s", REPO_ROOT)
     LOGGER.info("Config: %s", config_path)
     LOGGER.info("Output: %s", output_dir)
     LOGGER.info("Seed: %d", args.seed)
@@ -890,7 +900,7 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    cfg = EnhancementConfig.from_yaml(config_path, base_dir=project_root)
+    cfg = EnhancementConfig.from_yaml(config_path, base_dir=REPO_ROOT)
     cfg.device = "cpu"
     cfg.num_workers = 0
     cfg.pin_memory = False

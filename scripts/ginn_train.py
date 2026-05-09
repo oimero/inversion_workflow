@@ -15,15 +15,22 @@ import logging
 import sys
 from pathlib import Path
 
-# ── 确保 src/ 在搜索路径中 ──
-_script_dir = Path(__file__).resolve().parent
-_repo_root = _script_dir.parent
-_src_dir = _repo_root / "src"
-if str(_src_dir) not in sys.path:
-    sys.path.insert(0, str(_src_dir))
+# =============================================================================
+# Bootstrap
+# =============================================================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from ginn.config import GINNConfig
 from ginn.trainer import Trainer
+
+# =============================================================================
+# CLI
+# =============================================================================
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,10 +38,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=_repo_root / "experiments" / "ginn" / "train.yaml",
+        default=REPO_ROOT / "experiments" / "ginn" / "train.yaml",
         help="Path to the YAML config file.",
     )
     return parser.parse_args()
+
+
+# =============================================================================
+# Main
+# =============================================================================
 
 
 def main() -> None:
@@ -46,7 +58,7 @@ def main() -> None:
     )
 
     args = parse_args()
-    cfg = GINNConfig.from_yaml(args.config, base_dir=_repo_root)
+    cfg = GINNConfig.from_yaml(args.config, base_dir=REPO_ROOT)
     logging.info("Loaded config from %s", args.config.resolve())
 
     trainer = Trainer(cfg)

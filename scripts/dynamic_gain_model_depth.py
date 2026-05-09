@@ -26,23 +26,15 @@ import numpy as np
 import pandas as pd
 import yaml
 
+# =============================================================================
+# Bootstrap
+# =============================================================================
 
-# ── Bootstrap ──
-def _find_repo_root() -> Path:
-    root = Path(__file__).resolve().parent.parent
-    if not (root / "src").exists():
-        root = Path.cwd().resolve()
-    if not (root / "src").exists():
-        raise RuntimeError("Could not locate repo root containing 'src'.")
-    return root
-
-
-def _ensure_import_path(src_root: Path) -> None:
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
-
-
-_ensure_import_path(_find_repo_root() / "src")
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.io import build_segy_textual_header, load_yaml_config  # noqa: E402
 from cup.utils.raw_trace import (  # noqa: E402
@@ -96,22 +88,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    repo_root = _find_repo_root()
 
-    cfg = load_yaml_config(args.config, base_dir=repo_root)
+    cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
     script_cfg = cfg.get("dynamic_gain_model_depth", {})
     if not script_cfg:
         raise ValueError("Missing 'dynamic_gain_model_depth' section in config.")
 
     # ── Inputs ──
 
-    source_fit_dir = repo_root / str(script_cfg["source_fit_dir"])
+    source_fit_dir = REPO_ROOT / str(script_cfg["source_fit_dir"])
     fit_file = source_fit_dir / "gain_attr_fit_metrics.csv"
     if not fit_file.exists():
         raise FileNotFoundError(f"Fit metrics not found: {fit_file}")
 
     seg_file = source_fit_dir / "gain_attr_segment_samples.csv"
-    seismic_file = repo_root / str(cfg["data_root"]) / str(cfg["seismic_depth"]["file"])
+    seismic_file = REPO_ROOT / str(cfg["data_root"]) / str(cfg["seismic_depth"]["file"])
     if not seismic_file.exists():
         raise FileNotFoundError(f"Seismic not found: {seismic_file}")
 
@@ -121,10 +112,10 @@ def main() -> None:
 
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_root = repo_root / str(cfg.get("output_root", "scripts/output"))
+        out_root = REPO_ROOT / str(cfg.get("output_root", "scripts/output"))
         output_dir = out_root / f"dynamic_gain_model_depth_{timestamp}"
     else:
-        output_dir = args.output_dir if args.output_dir.is_absolute() else repo_root / args.output_dir
+        output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
 
     figure_dir = output_dir / "figures"
     output_dir.mkdir(parents=True, exist_ok=True)

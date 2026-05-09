@@ -7,6 +7,20 @@ import logging
 import sys
 from pathlib import Path
 
+# =============================================================================
+# Bootstrap
+# =============================================================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+# =============================================================================
+# CLI
+# =============================================================================
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -14,24 +28,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def ensure_import_path(project_root: Path) -> None:
-    src_root = project_root / "src"
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
+# =============================================================================
+# Main
+# =============================================================================
 
 
 def main() -> None:
     args = parse_args()
-    project_root = Path.cwd().resolve()
-    ensure_import_path(project_root)
 
     from enhance.config import EnhancementConfig
     from enhance.trainer import EnhancementTrainer
     from ginn_depth.enhance import build_depth_enhancement_bundle
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-    config_path = args.config if args.config.is_absolute() else project_root / args.config
-    cfg = EnhancementConfig.from_yaml(config_path, base_dir=project_root)
+    config_path = args.config if args.config.is_absolute() else REPO_ROOT / args.config
+    cfg = EnhancementConfig.from_yaml(config_path, base_dir=REPO_ROOT)
     bundle = build_depth_enhancement_bundle(cfg)
     trainer = EnhancementTrainer(
         cfg,

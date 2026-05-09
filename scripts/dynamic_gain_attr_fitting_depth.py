@@ -25,23 +25,15 @@ import numpy as np
 import pandas as pd
 import yaml
 
+# =============================================================================
+# Bootstrap
+# =============================================================================
 
-# ── Bootstrap: add src/ to sys.path before importing cup ──
-def _find_repo_root() -> Path:
-    root = Path(__file__).resolve().parent.parent
-    if not (root / "src").exists():
-        root = Path.cwd().resolve()
-    if not (root / "src").exists():
-        raise RuntimeError("Could not locate repo root containing 'src'.")
-    return root
-
-
-def _ensure_import_path(src_root: Path) -> None:
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
-
-
-_ensure_import_path(_find_repo_root() / "src")
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.io import load_yaml_config, sanitize_filename  # noqa: E402
 from cup.utils.raw_trace import centered_moving_rms, meters_to_odd_samples  # noqa: E402
@@ -277,14 +269,13 @@ def compare_attributes(
 
 def main() -> None:
     args = parse_args()
-    repo_root = _find_repo_root()
 
-    cfg = load_yaml_config(args.config, base_dir=repo_root)
+    cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
     script_cfg = cfg.get("dynamic_gain_attr_fitting_depth", {})
     if not script_cfg:
         raise ValueError("Missing 'dynamic_gain_attr_fitting_depth' section in config.")
 
-    source_batch_dir = repo_root / str(script_cfg["source_batch_dir"])
+    source_batch_dir = REPO_ROOT / str(script_cfg["source_batch_dir"])
     batch_metrics_file = source_batch_dir / "wavelet_batch_metrics.csv"
     if not batch_metrics_file.exists():
         raise FileNotFoundError(f"Batch metrics not found: {batch_metrics_file}")
@@ -305,10 +296,10 @@ def main() -> None:
 
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_root = repo_root / str(cfg.get("output_root", "scripts/output"))
+        out_root = REPO_ROOT / str(cfg.get("output_root", "scripts/output"))
         output_dir = out_root / f"dynamic_gain_attr_fitting_depth_{timestamp}"
     else:
-        output_dir = args.output_dir if args.output_dir.is_absolute() else repo_root / args.output_dir
+        output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
 
     well_qc_dir = output_dir / "well_qc"
     figure_dir = output_dir / "figures"
@@ -349,9 +340,9 @@ def main() -> None:
         qc_path = Path(row["synthetic_qc_path"])
         ds_path = Path(row["depth_shift_curve_path"])
         if not qc_path.is_absolute():
-            qc_path = repo_root / qc_path
+            qc_path = REPO_ROOT / qc_path
         if not ds_path.is_absolute():
-            ds_path = repo_root / ds_path
+            ds_path = REPO_ROOT / ds_path
         if not qc_path.exists() or not ds_path.exists():
             continue
 
@@ -521,9 +512,9 @@ def main() -> None:
         qc_path = Path(row["synthetic_qc_path"])
         ds_path = Path(row["depth_shift_curve_path"])
         if not qc_path.is_absolute():
-            qc_path = repo_root / qc_path
+            qc_path = REPO_ROOT / qc_path
         if not ds_path.is_absolute():
-            ds_path = repo_root / ds_path
+            ds_path = REPO_ROOT / ds_path
         if not qc_path.exists() or not ds_path.exists():
             continue
 

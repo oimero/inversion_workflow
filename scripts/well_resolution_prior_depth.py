@@ -23,24 +23,15 @@ import lasio
 import numpy as np
 import pandas as pd
 
+# =============================================================================
 # Bootstrap
+# =============================================================================
 
-
-def _find_repo_root() -> Path:
-    root = Path(__file__).resolve().parent.parent
-    if not (root / "src").exists():
-        root = Path.cwd().resolve()
-    if not (root / "src").exists():
-        raise RuntimeError("Could not locate repo root containing 'src'.")
-    return root
-
-
-def _ensure_import_path(src_root: Path) -> None:
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
-
-
-_ensure_import_path(_find_repo_root() / "src")
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from cup.petrel.load import import_well_heads_petrel  # noqa: E402
 from cup.seismic.survey import open_survey  # noqa: E402
@@ -52,7 +43,9 @@ from enhance.prior import (  # noqa: E402
 )
 from ginn_depth.data import load_lfm_depth_npz  # noqa: E402
 
+# =============================================================================
 # CLI
+# =============================================================================
 
 
 def parse_args() -> argparse.Namespace:
@@ -158,21 +151,22 @@ def _nearest_flat_index(ai_lfm: Any, iline: float, xline: float) -> tuple[int, i
     return flat_idx, il_idx, xl_idx, float(ai_lfm.ilines[il_idx]), float(ai_lfm.xlines[xl_idx])
 
 
+# =============================================================================
 # Main
+# =============================================================================
 
 
 def main() -> None:
     args = parse_args()
-    repo_root = _find_repo_root()
-    cfg = load_yaml_config(args.config, base_dir=repo_root)
+    cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
     script_cfg = cfg.get("well_resolution_prior_depth", {})
     if not script_cfg:
         raise ValueError("Missing 'well_resolution_prior_depth' section in config.")
 
-    data_root = resolve_relative_path(str(cfg.get("data_root", "data")), root=repo_root)
-    output_root = resolve_relative_path(str(cfg.get("output_root", "scripts/output")), root=repo_root)
+    data_root = resolve_relative_path(str(cfg.get("data_root", "data")), root=REPO_ROOT)
+    output_root = resolve_relative_path(str(cfg.get("output_root", "scripts/output")), root=REPO_ROOT)
 
-    source_batch_dir = resolve_relative_path(str(script_cfg["source_batch_dir"]), root=repo_root)
+    source_batch_dir = resolve_relative_path(str(script_cfg["source_batch_dir"]), root=REPO_ROOT)
     shifted_las_dir = resolve_relative_path(
         str(script_cfg.get("shifted_las_dir", source_batch_dir / "shifted_las")),
         root=source_batch_dir,
@@ -181,7 +175,7 @@ def main() -> None:
         str(script_cfg.get("metrics_file", source_batch_dir / "wavelet_batch_metrics.csv")),
         root=source_batch_dir,
     )
-    ai_lfm_file = resolve_relative_path(str(script_cfg["ai_lfm_file"]), root=repo_root)
+    ai_lfm_file = resolve_relative_path(str(script_cfg["ai_lfm_file"]), root=REPO_ROOT)
     seismic_file = resolve_relative_path(str(cfg["seismic_depth"]["file"]), root=data_root)
     well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
 
@@ -193,7 +187,7 @@ def main() -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = output_root / f"well_resolution_prior_depth_{timestamp}"
     else:
-        output_dir = args.output_dir if args.output_dir.is_absolute() else repo_root / args.output_dir
+        output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     prior_path = output_dir / "well_resolution_prior_depth.npz"

@@ -25,21 +25,27 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import matplotlib
 import numpy as np
 
-try:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-except ModuleNotFoundError as exc:  # pragma: no cover - import-time environment guard
-    raise SystemExit(
-        "matplotlib is required for synthetic gallery rendering. "
-        "Run this script from the training environment, for example after activating pinn_inversion."
-    ) from exc
-
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 LOGGER = logging.getLogger("enhance_gallery_depth")
+
+# =============================================================================
+# Bootstrap
+# =============================================================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+# =============================================================================
+# CLI
+# =============================================================================
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,20 +135,6 @@ def parse_args() -> argparse.Namespace:
         help="Override synthetic_unresolved_oversample_factor for this run.",
     )
     return parser.parse_args()
-
-
-def resolve_project_root(start: Path) -> Path:
-    current = start.resolve()
-    for path in (current, *current.parents):
-        if (path / "src" / "ginn_depth").exists() and (path / "experiments" / "ginn_depth").exists():
-            return path
-    return current
-
-
-def ensure_import_path(project_root: Path) -> None:
-    src_root = project_root / "src"
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
 
 
 def setup_logging(output_dir: Path) -> None:
@@ -549,13 +541,15 @@ def apply_overrides(cfg: Any, args: argparse.Namespace) -> None:
         cfg.synthetic_unresolved_oversample_factor = int(args.unresolved_oversample_factor)
 
 
+# =============================================================================
+# Main
+# =============================================================================
+
+
 def main() -> None:
     args = parse_args()
     if args.num_samples <= 0:
         raise ValueError("--num-samples must be positive.")
-
-    project_root = resolve_project_root(Path.cwd())
-    ensure_import_path(project_root)
 
     import torch
 
@@ -563,18 +557,18 @@ def main() -> None:
     from enhance.config import EnhancementConfig
     from ginn_depth.enhance import build_depth_enhancement_bundle
 
-    config_path = args.config if args.config.is_absolute() else project_root / args.config
+    config_path = args.config if args.config.is_absolute() else REPO_ROOT / args.config
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = project_root / "data" / f"output_enhance_gallery_depth_{timestamp}"
+        output_dir = REPO_ROOT / "data" / f"output_enhance_gallery_depth_{timestamp}"
     else:
-        output_dir = args.output_dir if args.output_dir.is_absolute() else project_root / args.output_dir
+        output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
     samples_dir = output_dir / "samples"
 
     setup_logging(output_dir)
     samples_dir.mkdir(parents=True, exist_ok=True)
 
-    LOGGER.info("Project root: %s", project_root)
+    LOGGER.info("Project root: %s", REPO_ROOT)
     LOGGER.info("Config: %s", config_path)
     LOGGER.info("Output: %s", output_dir)
     LOGGER.info("Seed: %d", args.seed)
@@ -584,7 +578,7 @@ def main() -> None:
     plt.rcParams["axes.grid"] = True
     plt.rcParams["grid.alpha"] = 0.25
 
-    cfg = EnhancementConfig.from_yaml(config_path, base_dir=project_root)
+    cfg = EnhancementConfig.from_yaml(config_path, base_dir=REPO_ROOT)
     apply_overrides(cfg, args)
     cfg.device = "cpu"
     cfg.num_workers = 0

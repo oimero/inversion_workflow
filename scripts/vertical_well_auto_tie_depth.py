@@ -25,23 +25,15 @@ import numpy as np
 import pandas as pd
 import yaml
 
+# =============================================================================
+# Bootstrap
+# =============================================================================
 
-# ── Bootstrap ──
-def _find_repo_root() -> Path:
-    root = Path(__file__).resolve().parent.parent
-    if not (root / "src").exists():
-        root = Path.cwd().resolve()
-    if not (root / "src").exists():
-        raise RuntimeError("Could not locate repo root containing 'src'.")
-    return root
-
-
-def _ensure_import_path(src_root: Path) -> None:
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
-
-
-_ensure_import_path(_find_repo_root() / "src")
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.io import load_yaml_config, resolve_relative_path, sanitize_filename  # noqa: E402
 
@@ -594,10 +586,9 @@ def run_auto_tie(
 
 def main() -> None:
     args = parse_args()
-    repo_root = _find_repo_root()
 
-    cfg = load_yaml_config(args.config, base_dir=repo_root)
-    data_root = resolve_relative_path(cfg.get("data_root", "data"), root=repo_root)
+    cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
+    data_root = resolve_relative_path(cfg.get("data_root", "data"), root=REPO_ROOT)
 
     script_cfg = cfg.get("vertical_well_auto_tie_depth", {})
     if not script_cfg:
@@ -629,10 +620,10 @@ def main() -> None:
     # Output dir
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_root = repo_root / cfg.get("output_root", "scripts/output")
+        output_root = REPO_ROOT / cfg.get("output_root", "scripts/output")
         output_dir = output_root / f"vertical_well_auto_tie_depth_{timestamp}"
     else:
-        output_dir = args.output_dir if args.output_dir.is_absolute() else repo_root / args.output_dir
+        output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
 
     output = build_output_tree(output_dir, well_name)
 

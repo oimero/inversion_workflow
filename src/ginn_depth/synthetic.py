@@ -444,30 +444,32 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         return torch.from_numpy(np.stack(channels, axis=0)).float()
 
     def _passes_quality_gate(self, item: dict[str, torch.Tensor]) -> bool:
-        loss_mask = item["loss_mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
+        waveform_mask = item["loss_mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
+        delta_mask = item["delta_loss_mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
         residual = item["target_delta_log_ai"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         target_seismic = item["target_seismic"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         source_seismic = item["obs"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
 
-        valid = loss_mask & np.isfinite(residual) & np.isfinite(target_seismic) & np.isfinite(source_seismic)
-        if not np.any(valid):
+        valid_delta = delta_mask & np.isfinite(residual)
+        valid_waveform = waveform_mask & np.isfinite(target_seismic) & np.isfinite(source_seismic)
+        if not np.any(valid_delta) or not np.any(valid_waveform):
             return False
 
         if self.max_residual_near_clip_fraction is not None:
-            near_clip = float(np.mean(np.abs(residual[valid]) >= 0.98 * self.residual_max_abs))
+            near_clip = float(np.mean(np.abs(residual[valid_delta]) >= 0.98 * self.residual_max_abs))
             if near_clip > float(self.max_residual_near_clip_fraction):
                 return False
 
         if self.max_seismic_rms_ratio is not None:
-            source_rms = _rms(source_seismic[valid])
-            target_rms = _rms(target_seismic[valid])
+            source_rms = _rms(source_seismic[valid_waveform])
+            target_rms = _rms(target_seismic[valid_waveform])
             if source_rms > 0.0 and np.isfinite(source_rms):
                 if target_rms / source_rms > float(self.max_seismic_rms_ratio):
                     return False
 
         if self.max_seismic_abs_p99_ratio is not None:
-            source_p99 = _abs_percentile(source_seismic[valid], 99.0)
-            target_p99 = _abs_percentile(target_seismic[valid], 99.0)
+            source_p99 = _abs_percentile(source_seismic[valid_waveform], 99.0)
+            target_p99 = _abs_percentile(target_seismic[valid_waveform], 99.0)
             if source_p99 > 0.0 and np.isfinite(source_p99):
                 if target_p99 / source_p99 > float(self.max_seismic_abs_p99_ratio):
                     return False

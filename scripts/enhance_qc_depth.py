@@ -241,16 +241,18 @@ def sample_metrics(
     forward_model: Any,
 ) -> dict[str, Any]:
     mode = "well_patch" if int(sample["synthetic_mode"].item()) == 0 else "unresolved_cluster"
-    loss_mask = to_numpy_1d(sample["loss_mask"]).astype(bool)
+    core_mask = to_numpy_1d(sample["mask"]).astype(bool)
+    waveform_mask = to_numpy_1d(sample["loss_mask"]).astype(bool)
+    delta_mask = to_numpy_1d(sample["delta_loss_mask"]).astype(bool)
     taper = to_numpy_1d(sample["taper_weight"]).astype(np.float64)
-    real = finite_values(to_numpy_1d(sample["obs"]), loss_mask)
-    synthetic = finite_values(to_numpy_1d(sample["target_seismic"]), loss_mask)
-    synthetic_raw = finite_values(to_numpy_1d(sample["target_seismic_raw"]), loss_mask)
+    real = finite_values(to_numpy_1d(sample["obs"]), waveform_mask)
+    synthetic = finite_values(to_numpy_1d(sample["target_seismic"]), waveform_mask)
+    synthetic_raw = finite_values(to_numpy_1d(sample["target_seismic_raw"]), waveform_mask)
     residual_full = to_numpy_1d(sample["target_residual"]).astype(np.float64)
-    residual = finite_values(residual_full, loss_mask)
+    residual = finite_values(residual_full, delta_mask)
     residual_highpass_full = highpass(residual_full, highpass_samples)
-    residual_highpass = finite_values(residual_highpass_full, loss_mask)
-    ai = finite_values(to_numpy_1d(sample["target_ai"]), loss_mask)
+    residual_highpass = finite_values(residual_highpass_full, delta_mask)
+    ai = finite_values(to_numpy_1d(sample["target_ai"]), delta_mask)
     reflectivity_full = to_numpy_1d(sample["raw_reflectivity"]).astype(np.float64)
     zero_seismic = zero_residual_seismic(sample, forward_model)
     target_seismic_full = to_numpy_1d(sample["target_seismic"]).astype(np.float64)
@@ -264,10 +266,10 @@ def sample_metrics(
     residual_outside = residual_full[np.asarray(taper <= 0.0)]
     residual_inside = residual_full[np.asarray(taper > 0.0)]
     residual_energy = float(np.nansum(residual_full * residual_full))
-    residual_loss_mask_energy = float(np.nansum(residual_full[loss_mask] * residual_full[loss_mask]))
-    residual_loss_mask_energy_fraction = safe_ratio(residual_loss_mask_energy, residual_energy)
+    residual_delta_mask_energy = float(np.nansum(residual_full[delta_mask] * residual_full[delta_mask]))
+    residual_delta_mask_energy_fraction = safe_ratio(residual_delta_mask_energy, residual_energy)
 
-    active = np.flatnonzero(loss_mask & np.isfinite(residual_full))
+    active = np.flatnonzero(delta_mask & np.isfinite(residual_full))
     if active.size:
         center = int(active[np.argmax(np.abs(residual_full[active]))])
     else:
@@ -315,13 +317,16 @@ def sample_metrics(
         "residual_abs_p95": percentile_abs(residual, 95.0),
         "residual_abs_p99": percentile_abs(residual, 99.0),
         "residual_abs_max": residual_abs_max,
-        "residual_loss_mask_energy_fraction": residual_loss_mask_energy_fraction,
+        "residual_delta_mask_energy_fraction": residual_delta_mask_energy_fraction,
         "residual_near_clip_fraction": float(np.mean(np.abs(residual) >= 0.98 * residual_clip_abs)) if residual.size else float("nan"),
         "residual_outside_taper_abs_mean": float(np.mean(np.abs(residual_outside))) if residual_outside.size else 0.0,
         "residual_inside_taper_abs_mean": float(np.mean(np.abs(residual_inside))) if residual_inside.size else 0.0,
         "residual_outside_taper_nonzero_fraction": float(np.mean(np.abs(residual_outside) > 1e-6)) if residual_outside.size else 0.0,
-        "zero_waveform_mae": masked_mae(zero_seismic, target_seismic_full, loss_mask),
-        "zero_waveform_mae_to_synthetic_rms": safe_ratio(masked_mae(zero_seismic, target_seismic_full, loss_mask), synthetic_rms),
+        "zero_waveform_mae": masked_mae(zero_seismic, target_seismic_full, waveform_mask),
+        "zero_waveform_mae_to_synthetic_rms": safe_ratio(masked_mae(zero_seismic, target_seismic_full, waveform_mask), synthetic_rms),
+        "core_mask_fraction": float(np.mean(core_mask)),
+        "waveform_mask_fraction": float(np.mean(waveform_mask)),
+        "delta_mask_fraction": float(np.mean(delta_mask)),
         "ai_min": ai_min,
         "ai_max": ai_max,
         "rms_scale": float(sample["synthetic_rms_scale"].item()),
@@ -416,11 +421,15 @@ def add_quality_flags(summary: dict[str, Any], *, requested_patch_fraction: floa
     else:
         flag("WARN", "target_highpass", f"median target residual highpass RMS is {highpass_rms}; target may be too smooth.")
 
-    support_fraction = all_stats["residual_loss_mask_energy_fraction"]["p50"]
+    support_fraction = all_stats["residual_delta_mask_energy_fraction"]["p50"]
     if support_fraction is not None and support_fraction >= 0.70:
-        flag("OK", "loss_mask_support", f"median residual energy inside loss_mask is {support_fraction:.3f}.")
+        flag("OK", "delta_mask_support", f"median residual energy inside delta supervision mask is {support_fraction:.3f}.")
     else:
-        flag("WARN", "loss_mask_support", f"median residual energy inside loss_mask is {support_fraction}; high-frequency target may sit outside supervised support.")
+        flag(
+            "WARN",
+            "delta_mask_support",
+            f"median residual energy inside delta supervision mask is {support_fraction}; target delta may sit outside supervised support.",
+        )
 
     zero_mae_ratio = all_stats["zero_waveform_mae_to_synthetic_rms"]["p50"]
     if zero_mae_ratio is not None and zero_mae_ratio >= 0.05:
@@ -486,12 +495,15 @@ def log_summary(summary: dict[str, Any], flags: list[dict[str, str]]) -> None:
         "synthetic_to_real_abs_p99",
         "residual_rms",
         "target_residual_highpass_rms",
-        "residual_loss_mask_energy_fraction",
+        "residual_delta_mask_energy_fraction",
         "residual_abs_p99",
         "residual_near_clip_fraction",
         "residual_outside_taper_nonzero_fraction",
         "zero_waveform_mae",
         "zero_waveform_mae_to_synthetic_rms",
+        "core_mask_fraction",
+        "waveform_mask_fraction",
+        "delta_mask_fraction",
         "rms_scale",
         "resample_attempts",
     ):

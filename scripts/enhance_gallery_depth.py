@@ -200,13 +200,15 @@ def mode_name(sample: dict[str, Any]) -> str:
 
 
 def sample_record(sample: dict[str, Any], index: int, image_path: Path | None) -> dict[str, Any]:
-    mask = as_1d(sample["loss_mask"]).astype(bool)
-    real = finite_core(as_1d(sample["obs"]), mask)
-    synthetic = finite_core(as_1d(sample["target_seismic"]), mask)
-    synthetic_raw = finite_core(as_1d(sample["target_seismic_raw"]), mask)
-    residual = finite_core(as_1d(sample["target_residual"]), mask)
-    ai = finite_core(as_1d(sample["target_ai"]), mask)
-    base_ai = finite_core(as_1d(sample["base_ai_raw"]), mask)
+    core_mask = as_1d(sample["mask"]).astype(bool)
+    waveform_mask = as_1d(sample["loss_mask"]).astype(bool)
+    delta_mask = as_1d(sample["delta_loss_mask"]).astype(bool)
+    real = finite_core(as_1d(sample["obs"]), waveform_mask)
+    synthetic = finite_core(as_1d(sample["target_seismic"]), waveform_mask)
+    synthetic_raw = finite_core(as_1d(sample["target_seismic_raw"]), waveform_mask)
+    residual = finite_core(as_1d(sample["target_residual"]), delta_mask)
+    ai = finite_core(as_1d(sample["target_ai"]), delta_mask)
+    base_ai = finite_core(as_1d(sample["base_ai_raw"]), delta_mask)
     real_rms = rms(real)
     synthetic_rms = rms(synthetic)
     real_abs_p99 = abs_percentile(real, 99.0)
@@ -230,6 +232,9 @@ def sample_record(sample: dict[str, Any], index: int, image_path: Path | None) -
         "ai_max": float(np.nanmax(ai)) if ai.size else float("nan"),
         "base_ai_min": float(np.nanmin(base_ai)) if base_ai.size else float("nan"),
         "base_ai_max": float(np.nanmax(base_ai)) if base_ai.size else float("nan"),
+        "core_mask_fraction": float(np.mean(core_mask)),
+        "waveform_mask_fraction": float(np.mean(waveform_mask)),
+        "delta_mask_fraction": float(np.mean(delta_mask)),
         "rms_scale": float(sample["synthetic_rms_scale"].item()),
         "resample_attempts": int(sample.get("synthetic_resample_attempts").item())
         if "synthetic_resample_attempts" in sample
@@ -255,7 +260,9 @@ def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Pat
     residual = as_1d(sample["target_residual"])
     reflectivity = as_1d(sample["raw_reflectivity"])
     taper = as_1d(sample["taper_weight"])
-    mask = as_1d(sample["loss_mask"]).astype(bool)
+    core_mask = as_1d(sample["mask"]).astype(bool)
+    waveform_mask = as_1d(sample["loss_mask"]).astype(bool)
+    delta_mask = as_1d(sample["delta_loss_mask"]).astype(bool)
     sample_mode = mode_name(sample)
     highres_depth = as_1d(sample["depth_highres"]) if "depth_highres" in sample else None
     highres_ai = as_1d(sample["target_ai_highres"]) if "target_ai_highres" in sample else None
@@ -290,22 +297,24 @@ def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Pat
     axes[3].set_ylabel("reflectivity")
 
     axes[4].plot(depth, taper, color="tab:brown", lw=1.2, label="taper")
-    axes[4].fill_between(depth, 0.0, mask.astype(float), color="tab:cyan", alpha=0.25, label="loss mask")
+    axes[4].fill_between(depth, 0.0, core_mask.astype(float), color="0.75", alpha=0.35, label="core mask")
+    axes[4].fill_between(depth, 0.0, waveform_mask.astype(float), color="tab:cyan", alpha=0.25, label="waveform QC mask")
+    axes[4].fill_between(depth, 0.0, delta_mask.astype(float), color="tab:purple", alpha=0.22, label="delta supervision mask")
     axes[4].set_ylim(-0.05, 1.05)
     axes[4].set_ylabel("support")
     axes[4].set_xlabel("depth / m")
     axes[4].legend(loc="upper right", fontsize=8)
 
     for ax in axes[:4]:
-        shade_mask(ax, depth, mask)
+        shade_mask(ax, depth, delta_mask)
         ax.grid(True, alpha=0.25)
     axes[4].grid(True, alpha=0.25)
 
-    core_synthetic = finite_core(target_seismic, mask)
-    core_residual = finite_core(residual, mask)
+    waveform_synthetic = finite_core(target_seismic, waveform_mask)
+    delta_residual = finite_core(residual, delta_mask)
     title = (
         f"sample {index:03d} | mode={sample_mode} | "
-        f"synthetic RMS={rms(core_synthetic):.3f} | residual abs p99={abs_percentile(core_residual, 99.0):.3f}"
+        f"synthetic RMS={rms(waveform_synthetic):.3f} | residual abs p99={abs_percentile(delta_residual, 99.0):.3f}"
     )
     fig.suptitle(title)
     fig.tight_layout()
@@ -332,7 +341,8 @@ def plot_overview_page(
         ai = as_1d(sample["target_ai"])
         base_ai = as_1d(sample["base_ai_raw"])
         residual = as_1d(sample["target_residual"])
-        mask = as_1d(sample["loss_mask"]).astype(bool)
+        waveform_mask = as_1d(sample["loss_mask"]).astype(bool)
+        delta_mask = as_1d(sample["delta_loss_mask"]).astype(bool)
 
         axes[row, 0].plot(depth, real_obs, color="0.65", lw=0.8)
         axes[row, 0].plot(depth, seismic, color="tab:blue", lw=1.0)
@@ -341,8 +351,8 @@ def plot_overview_page(
         axes[row, 2].plot(depth, residual, color="tab:purple", lw=0.9)
         axes[row, 2].axhline(0.0, color="0.2", lw=0.5)
 
-        synth = finite_core(seismic, mask)
-        real = finite_core(real_obs, mask)
+        synth = finite_core(seismic, waveform_mask)
+        real = finite_core(real_obs, waveform_mask)
         axes[row, 3].scatter([rms(real)], [rms(synth)], s=18, color="tab:blue")
         lim = max(rms(real), rms(synth), 1e-6) * 1.25
         axes[row, 3].plot([0, lim], [0, lim], color="0.35", lw=0.7)
@@ -350,7 +360,7 @@ def plot_overview_page(
         axes[row, 3].set_ylim(0, lim)
 
         for col in range(3):
-            shade_mask(axes[row, col], depth, mask)
+            shade_mask(axes[row, col], depth, delta_mask)
         axes[row, 0].set_ylabel(f"#{record['sample_index']:03d}\n{record['mode']}", fontsize=7)
         for col in range(4):
             axes[row, col].grid(True, alpha=0.20)
@@ -412,6 +422,9 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "synthetic_to_real_abs_p99": stats("synthetic_to_real_abs_p99"),
         "residual_rms": stats("residual_rms"),
         "residual_abs_p99": stats("residual_abs_p99"),
+        "core_mask_fraction": stats("core_mask_fraction"),
+        "waveform_mask_fraction": stats("waveform_mask_fraction"),
+        "delta_mask_fraction": stats("delta_mask_fraction"),
         "rms_scale": stats("rms_scale"),
         "resample_attempts": stats("resample_attempts"),
     }

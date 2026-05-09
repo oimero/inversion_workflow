@@ -111,8 +111,6 @@ class GINNConfig:
     # 时应和 baseline 对照，不要只看 waveform loss。
     lambda_l2: float = 0.03  # 高频扰动 L2 正则化权重，约束阻抗尺度不要漂移。
     lambda_tv: float = 0.0  # 高频扰动 TV 正则化权重，抑制层内高频 ringing。
-    ai_min: float = 3000.0  # 目的层内允许的波阻抗下界。
-    ai_max: float = 30000.0  # 目的层内允许的波阻抗上界。
     zero_residual_outside_mask: bool = True  # 是否将层外高频扰动通过 taper 平滑压回 0。
     boundary_effect_samples: int | None = None  # 为空时按子波 5% 有效半支撑自动计算。
 
@@ -229,10 +227,6 @@ class GINNConfig:
                 "target_layer_outlier_min_neighbor_count must be >= 1, "
                 f"got {self.target_layer_outlier_min_neighbor_count}."
             )
-        if self.ai_min <= 0.0:
-            raise ValueError(f"ai_min must be positive, got {self.ai_min}.")
-        if self.ai_max <= self.ai_min:
-            raise ValueError(f"ai_max must be greater than ai_min, got ai_min={self.ai_min}, ai_max={self.ai_max}.")
         if self.boundary_effect_samples is not None and self.boundary_effect_samples < 0:
             raise ValueError(f"boundary_effect_samples must be non-negative, got {self.boundary_effect_samples}.")
         if not 0.0 <= self.validation_fraction < 1.0:

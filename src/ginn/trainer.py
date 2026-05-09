@@ -192,8 +192,6 @@ def build_common_run_summary(
         "loss": {
             "lambda_l2": float(cfg.lambda_l2),
             "lambda_tv": float(cfg.lambda_tv),
-            "ai_min": float(cfg.ai_min),
-            "ai_max": float(cfg.ai_max),
             "zero_residual_outside_mask": bool(cfg.zero_residual_outside_mask),
             "boundary_effect_samples": cfg.boundary_effect_samples,
         },
@@ -303,12 +301,7 @@ class Trainer:
         self.best_loss = float("inf")
         self.best_epoch = 0
         self._es_best = float("inf")
-        logger.info(
-            "AI bounding: ai_min=%.2f, ai_max=%.2f, zero_outside_mask=%s",
-            self.cfg.ai_min,
-            self.cfg.ai_max,
-            self.cfg.zero_residual_outside_mask,
-        )
+        logger.info("Residual taper zero_outside_mask=%s", self.cfg.zero_residual_outside_mask)
         if self.val_dataloader is not None:
             logger.info(
                 "Early stopping enabled: patience=%d, min_delta=%.2e, warmup=%d",

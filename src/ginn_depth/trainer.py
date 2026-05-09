@@ -112,12 +112,7 @@ class Trainer:
         self.best_loss = float("inf")
         self.best_epoch = 0
         self._es_best = float("inf")
-        logger.info(
-            "AI bounding: ai_min=%.2f, ai_max=%.2f, zero_outside_mask=%s",
-            self.cfg.ai_min,
-            self.cfg.ai_max,
-            self.cfg.zero_residual_outside_mask,
-        )
+        logger.info("Residual taper zero_outside_mask=%s", self.cfg.zero_residual_outside_mask)
         if self.val_dataloader is not None:
             logger.info(
                 "Early stopping enabled: patience=%d, min_delta=%.2e, warmup=%d",

@@ -41,8 +41,6 @@ def build_depth_enhancement_data_bundle(cfg: EnhancementConfig) -> DepthEnhancem
     depth_cfg.include_mask_input = cfg.include_mask_input
     depth_cfg.include_dynamic_gain_input = cfg.include_dynamic_gain_input
     depth_cfg.in_channels = cfg.in_channels
-    depth_cfg.ai_min = cfg.ai_min
-    depth_cfg.ai_max = cfg.ai_max
 
     dataset_bundle = build_dataset(depth_cfg)
     metadata = {

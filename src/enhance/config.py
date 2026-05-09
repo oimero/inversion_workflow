@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Literal, Tuple
 
 import yaml
 
@@ -14,6 +14,8 @@ _PATH_FIELDS = {
     "resolution_prior_file",
     "checkpoint_dir",
 }
+
+DeltaSupervisionMask = Literal["core", "loss"]
 
 
 @dataclass
@@ -27,13 +29,13 @@ class EnhancementConfig:
 
     # ── Network inputs ────────────────────────────────────────
     include_base_ai_input: bool = True
-    include_mask_input: bool = True
+    include_mask_input: bool = False
     include_dynamic_gain_input: bool = False
-    in_channels: int = 3
+    in_channels: int = 2
     hidden_channels: int = 64
     out_channels: int = 1
-    num_res_blocks: int = 8
-    dilations: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+    num_res_blocks: int = 5
+    dilations: Tuple[int, ...] = (1, 2, 4, 8, 16)
     kernel_size: int = 3
 
     # ── Optimization ──────────────────────────────────────────
@@ -74,6 +76,7 @@ class EnhancementConfig:
     synthetic_max_seismic_rms_ratio: float | None = 2.0
     synthetic_max_seismic_abs_p99_ratio: float | None = 2.5
     synthetic_max_resample_attempts: int = 8
+    delta_supervision_mask: DeltaSupervisionMask = "core"
 
     # ── AI bounds and runtime ─────────────────────────────────
     ai_min: float = 3000.0
@@ -121,6 +124,10 @@ class EnhancementConfig:
                 raise ValueError(f"{name} must be non-negative.")
         if self.delta_lowpass_samples < 1 or self.delta_highpass_samples < 1:
             raise ValueError("delta low/high-pass windows must be positive.")
+        if self.delta_supervision_mask not in ("core", "loss"):
+            raise ValueError(
+                f"delta_supervision_mask={self.delta_supervision_mask!r} must be one of ['core', 'loss']."
+            )
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "EnhancementConfig":

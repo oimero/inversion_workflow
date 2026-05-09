@@ -119,7 +119,7 @@ class EnhancementTrainer:
         for batch_idx, batch in enumerate(self.train_dataloader):
             x = batch["input"].to(self.device)
             target_delta = batch["target_delta_log_ai"].to(self.device)
-            loss_mask = batch["loss_mask"].to(self.device)
+            loss_mask = batch["delta_loss_mask"].to(self.device)
 
             pred_delta = self.model(x)
             if self.cfg.zero_delta_outside_mask:

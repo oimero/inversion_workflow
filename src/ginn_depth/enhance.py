@@ -92,6 +92,7 @@ def build_depth_enhancement_bundle(cfg: EnhancementConfig) -> DepthEnhancementBu
         max_seismic_rms_ratio=cfg.synthetic_max_seismic_rms_ratio,
         max_seismic_abs_p99_ratio=cfg.synthetic_max_seismic_abs_p99_ratio,
         max_resample_attempts=cfg.synthetic_max_resample_attempts,
+        delta_supervision_mask=cfg.delta_supervision_mask,
     )
     metadata = dict(data_bundle.metadata)
     metadata["resolution_prior_file"] = cfg.resolution_prior_file

@@ -652,6 +652,7 @@ def main() -> None:
         "synthetic_unresolved_oversample_factor": cfg.synthetic_unresolved_oversample_factor,
         "synthetic_residual_highpass_samples": cfg.synthetic_residual_highpass_samples,
         "synthetic_residual_highpass_samples_loss": cfg.synthetic_residual_highpass_samples_loss,
+        "delta_supervision_mask": cfg.delta_supervision_mask,
         "synthetic_seismic_rms_match": cfg.synthetic_seismic_rms_match,
         "synthetic_seismic_rms_target": cfg.synthetic_seismic_rms_target,
         "synthetic_quality_gate_enabled": cfg.synthetic_quality_gate_enabled,

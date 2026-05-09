@@ -40,6 +40,7 @@ from ginn_depth.physics import DepthForwardModel
 
 SyntheticVelocityMode = Literal["lfm_vp", "from_ai_linear", "blend"]
 WellGuidedMode = Literal["well_patch", "unresolved_cluster"]
+DeltaSupervisionMask = Literal["core", "loss"]
 
 
 class _BaseDepthDataset(Protocol):
@@ -197,6 +198,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         max_seismic_rms_ratio: float | None = 2.0,
         max_seismic_abs_p99_ratio: float | None = 2.5,
         max_resample_attempts: int = 8,
+        delta_supervision_mask: DeltaSupervisionMask = "core",
         velocity_mode: SyntheticVelocityMode = "lfm_vp",
         vp_ai_slope: float | None = None,
         vp_ai_intercept: float | None = None,
@@ -233,6 +235,8 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         }.items():
             if value is not None and value <= 0.0:
                 raise ValueError(f"{name} must be positive when provided.")
+        if delta_supervision_mask not in ("core", "loss"):
+            raise ValueError("delta_supervision_mask must be one of ['core', 'loss'].")
         _validate_velocity_mode(velocity_mode, vp_ai_slope, vp_ai_intercept, vp_blend_alpha, vp_smooth_samples)
 
         self.base_dataset = base_dataset
@@ -263,6 +267,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         self.max_seismic_rms_ratio = max_seismic_rms_ratio
         self.max_seismic_abs_p99_ratio = max_seismic_abs_p99_ratio
         self.max_resample_attempts = int(max_resample_attempts)
+        self.delta_supervision_mask = delta_supervision_mask
         self.velocity_mode = velocity_mode
         self.vp_ai_slope = vp_ai_slope
         self.vp_ai_intercept = vp_ai_intercept
@@ -307,11 +312,12 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         taper = item["taper_weight"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         core_mask = item["mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
         loss_mask = item.get("loss_mask", item["mask"]).squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
+        delta_loss_mask = core_mask if self.delta_supervision_mask == "core" else loss_mask
 
         safe_base_ai = np.maximum(base_ai, 1e-6)
         mode = self._sample_mode()
         if mode == "well_patch":
-            delta_log_ai = self._sample_well_patch_residual(base_ai.size, taper, loss_mask)
+            delta_log_ai = self._sample_well_patch_residual(base_ai.size, taper, delta_loss_mask)
             mode_code = 0
             highres_residual = None
             highres_ai = None
@@ -321,7 +327,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             delta_log_ai, highres_residual, highres_depth = self._sample_unresolved_cluster_residual(
                 base_ai.size,
                 taper,
-                loss_mask,
+                delta_loss_mask,
                 safe_base_ai,
             )
             mode_code = 1
@@ -410,6 +416,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         item["synthetic_mode"] = torch.tensor(mode_code, dtype=torch.int64)
         item["mask"] = torch.from_numpy(core_mask[np.newaxis]).bool()
         item["loss_mask"] = torch.from_numpy(loss_mask[np.newaxis]).bool()
+        item["delta_loss_mask"] = torch.from_numpy(delta_loss_mask[np.newaxis]).bool()
         item["input"] = self._compose_enhancement_input(item)
         item["target_residual_highres"] = torch.from_numpy(highres_residual[np.newaxis]).float()
         item["target_ai_highres"] = torch.from_numpy(highres_ai[np.newaxis]).float()

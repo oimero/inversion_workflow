@@ -50,10 +50,10 @@ class DilatedResNet1D(nn.Module):
     def __init__(
         self,
         *,
-        in_channels: int = 3,
+        in_channels: int = 2,
         hidden_channels: int = 64,
         out_channels: int = 1,
-        dilations: Sequence[int] = (1, 2, 4, 8, 16, 32, 64, 128),
+        dilations: Sequence[int] = (1, 2, 4, 8, 16),
         kernel_size: int = 3,
     ) -> None:
         super().__init__()

@@ -597,6 +597,7 @@ def main() -> None:
             "synthetic_cluster_main_lobe_samples": cfg.synthetic_cluster_main_lobe_samples,
             "synthetic_unresolved_oversample_factor": cfg.synthetic_unresolved_oversample_factor,
             "synthetic_residual_highpass_samples": cfg.synthetic_residual_highpass_samples,
+            "delta_supervision_mask": cfg.delta_supervision_mask,
             "synthetic_quality_gate_enabled": cfg.synthetic_quality_gate_enabled,
             "synthetic_seismic_rms_match": cfg.synthetic_seismic_rms_match,
         },

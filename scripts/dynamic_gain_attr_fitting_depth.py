@@ -193,13 +193,12 @@ def compare_attributes(
         for well_name, well_df in segment_df.groupby("well_name"):
             xw = well_df[x_col].to_numpy(dtype=float)
             yw = well_df["log_gain"].to_numpy(dtype=float)
+            mask_w = np.isfinite(xw) & np.isfinite(yw)
             metric_rows.append({
                 "scope": "per_well", "well_name": well_name, "attribute": attr,
-                "n_samples": int(np.isfinite(xw) & np.isfinite(yw)).sum() if False else 0,
+                "n_samples": int(mask_w.sum()),
                 "pearson": pearson_r(xw, yw), "spearman": spearman_rho(xw, yw),
             })
-            # Recompute n_samples correctly
-            metric_rows[-1]["n_samples"] = int(np.isfinite(xw).sum() & np.isfinite(yw).sum())
 
     metrics_df = pd.DataFrame(metric_rows)
 
@@ -356,31 +355,37 @@ def main() -> None:
     seg_df.to_csv(seg_file, index=False)
     print(f"Segments: {len(seg_df)} from {seg_df['well_name'].nunique()} wells")
 
-    # ── Compare attributes and select best ──
+    # ── Compare attributes (QC only) ──
+    # The prediction function predict_gain_from_trace_rms() always uses
+    # sample-by-sample moving RMS, so the actual fit must use seismic_rms
+    # regardless of which attribute wins the segment-level comparison.
 
     best_attr, rel_df, best_df = compare_attributes(seg_df, attr_tie_threshold)
     rel_df.to_csv(rel_file, index=False)
     best_df.to_csv(best_file, index=False)
-    print(f"\nAttribute comparison (all wells):")
+    print(f"\nAttribute comparison (all wells, segment-level QC):")
     all_rel = rel_df.loc[rel_df["scope"] == "all_wells"].set_index("attribute")
     for attr in CANDIDATE_ATTRIBUTES:
-        mark = " <-- SELECTED" if attr == best_attr else ""
         r = all_rel.loc[attr]
-        print(f"  {attr}: pearson={r['pearson']:.3f}, spearman={r['spearman']:.3f}, n={int(r['n_samples'])}{mark}")
-    print(f"  tie_threshold={attr_tie_threshold}")
+        print(f"  {attr}: pearson={r['pearson']:.3f}, spearman={r['spearman']:.3f}, n={int(r['n_samples'])}")
+    print(f"  QC winner: {best_attr}  (tie_threshold={attr_tie_threshold})")
+    if best_attr != "seismic_rms":
+        print(f"  Note: fit uses seismic_rms because prediction uses moving-RMS input;"
+              f" segment-level {best_attr} win is informational.")
 
-    # ── Fit using selected attribute ──
+    # ── Fit always against seismic_rms (matches predict_gain_from_trace_rms) ──
 
-    fit_col = f"log_{best_attr}"
+    fit_attr = "seismic_rms"
+    fit_col = f"log_{fit_attr}"
     fit_df = seg_df.loc[np.isfinite(seg_df["log_gain"]) & np.isfinite(seg_df[fit_col])].copy()
     if fit_df.empty:
-        raise ValueError(f"No finite ln(gain) / ln({best_attr}) samples.")
+        raise ValueError(f"No finite ln(gain) / ln({fit_attr}) samples.")
 
     fit = ols_fit(fit_df[fit_col].to_numpy(dtype=float), fit_df["log_gain"].to_numpy(dtype=float))
     log_gain_clip = tuple(
         float(v) for v in np.nanpercentile(fit_df["log_gain"].to_numpy(dtype=float), pred_clip_pct)
     )
-    attr_floor = float(np.nanpercentile(fit_df[best_attr].to_numpy(dtype=float), 1.0) * attr_floor_frac)
+    attr_floor = float(np.nanpercentile(fit_df[fit_attr].to_numpy(dtype=float), 1.0) * attr_floor_frac)
     attr_floor = max(attr_floor, np.finfo(float).tiny)
 
     thick = fit_df["segment_thickness_m"].to_numpy(dtype=float)
@@ -388,7 +393,7 @@ def main() -> None:
     app_win = float(np.nanmedian(thick)) if app_window_m is None else float(app_window_m)
 
     fit_row = {
-        **fit, "target": "log_gain", "attribute": fit_col, "attribute_name": best_attr,
+        **fit, "target": "log_gain", "attribute": fit_col, "attribute_name": fit_attr,
         "n_training_segments": int(fit_df.shape[0]),
         "n_training_wells": int(fit_df["well_name"].nunique()),
         "log_gain_clip_p05": float(log_gain_clip[0]), "log_gain_clip_p95": float(log_gain_clip[1]),
@@ -397,7 +402,7 @@ def main() -> None:
     }
     pd.DataFrame([fit_row]).to_csv(fit_file, index=False)
 
-    print(f"\nFit: ln(gain) = {fit['intercept']:.3f} + {fit['slope']:.3f} * ln({best_attr})")
+    print(f"\nFit: ln(gain) = {fit['intercept']:.3f} + {fit['slope']:.3f} * ln({fit_attr})")
     print(f"  R2={fit['r2']:.3f}, pearson={fit['pearson_r']:.3f}, n={fit['n_samples']}")
     print(f"  gain clip: [{fit_row['gain_clip_p05']:.3f}, {fit_row['gain_clip_p95']:.3f}]")
     print(f"  application window: {app_win:.1f} m")
@@ -430,11 +435,11 @@ def main() -> None:
     color_map = {w: plt.cm.tab10(i % 10) for i, w in enumerate(well_names)}
     fig, ax = plt.subplots(figsize=(6.8, 5.2), constrained_layout=True)
     for w, wdf in seg_df.groupby("well_name"):
-        ax.scatter(wdf[f"log_{best_attr}"], wdf["log_gain"], s=28, alpha=0.75,
+        ax.scatter(wdf[f"log_{fit_attr}"], wdf["log_gain"], s=28, alpha=0.75,
                    color=color_map[w], label=w)
-    ax.set_xlabel(f"log({best_attr})")
+    ax.set_xlabel(f"log({fit_attr})")
     ax.set_ylabel("log(gain)")
-    ax.set_title(f"Best attribute: {best_attr} (pearson={all_rel.loc[best_attr]['pearson']:.3f})")
+    ax.set_title(f"Fit attribute: {fit_attr} (pearson={all_rel.loc[fit_attr]['pearson']:.3f})")
     ax.legend(loc="best", fontsize=7)
     ax.grid(True, alpha=0.25)
     save_mpl_figure(figure_dir / "qc_02_best_gain_attribute_scatter.png")

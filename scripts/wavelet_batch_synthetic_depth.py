@@ -560,7 +560,6 @@ def process_well(
 def main() -> None:
     args = parse_args()
     repo_root = _find_repo_root()
-    ensure_import_path(repo_root / "src")
 
     cfg = load_yaml_config(args.config, base_dir=repo_root)
     data_root = resolve_relative_path(cfg.get("data_root", "data"), root=repo_root)

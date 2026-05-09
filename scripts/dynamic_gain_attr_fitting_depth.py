@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+
 # ── Bootstrap: add src/ to sys.path before importing cup ──
 def _find_repo_root() -> Path:
     root = Path(__file__).resolve().parent.parent
@@ -34,9 +35,11 @@ def _find_repo_root() -> Path:
         raise RuntimeError("Could not locate repo root containing 'src'.")
     return root
 
+
 def _ensure_import_path(src_root: Path) -> None:
     if str(src_root) not in sys.path:
         sys.path.insert(0, str(src_root))
+
 
 _ensure_import_path(_find_repo_root() / "src")
 
@@ -70,11 +73,15 @@ def _save_fig(path: Path) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--config", type=Path, default=Path("experiments/common_depth.yaml"),
+        "--config",
+        type=Path,
+        default=Path("experiments/common_depth.yaml"),
         help="Depth-domain common config YAML.",
     )
     parser.add_argument(
-        "--output-dir", type=Path, default=None,
+        "--output-dir",
+        type=Path,
+        default=None,
         help="Output directory. Defaults to <output_root>/dynamic_gain_attr_fitting_depth_<timestamp>.",
     )
     return parser.parse_args()
@@ -92,7 +99,9 @@ def _infer_depth_step(depth_values: np.ndarray) -> float:
 
 
 def candidate_metrics(
-    seismic_norm: np.ndarray, synthetic: np.ndarray, mask: np.ndarray,
+    seismic_norm: np.ndarray,
+    synthetic: np.ndarray,
+    mask: np.ndarray,
 ) -> dict[str, Any]:
     valid = np.asarray(mask, dtype=bool) & np.isfinite(seismic_norm) & np.isfinite(synthetic)
     return {
@@ -108,7 +117,11 @@ def candidate_metrics(
 
 
 def split_valid_indices(
-    valid_indices: np.ndarray, *, min_valid_samples: int, max_segments: int, min_segments: int,
+    valid_indices: np.ndarray,
+    *,
+    min_valid_samples: int,
+    max_segments: int,
+    min_segments: int,
 ) -> list[np.ndarray]:
     valid_indices = np.asarray(valid_indices, dtype=np.int64)
     if valid_indices.size < int(min_valid_samples):
@@ -119,8 +132,11 @@ def split_valid_indices(
 
 
 def positive_ls_gain(
-    seismic_values: np.ndarray, synthetic_raw_values: np.ndarray,
-    *, eps: float, min_valid_samples: int,
+    seismic_values: np.ndarray,
+    synthetic_raw_values: np.ndarray,
+    *,
+    eps: float,
+    min_valid_samples: int,
 ) -> float:
     seismic_values = np.asarray(seismic_values, dtype=float)
     synthetic_raw_values = np.asarray(synthetic_raw_values, dtype=float)
@@ -141,7 +157,7 @@ def segment_attribute_values(seismic_values: np.ndarray) -> dict[str, float]:
     values = seismic_values[finite]
     abs_values = np.abs(values)
     return {
-        "seismic_rms": float(np.sqrt(np.nanmean(values ** 2))),
+        "seismic_rms": float(np.sqrt(np.nanmean(values**2))),
         "seismic_abs_mean": float(np.nanmean(abs_values)),
         "seismic_abs_p90": float(np.nanpercentile(abs_values, 90.0)),
     }
@@ -161,8 +177,13 @@ def eval_mask_to_bool(series: pd.Series) -> np.ndarray:
 
 
 def predict_gain_from_trace_rms(
-    seismic_norm: np.ndarray, *, window_samples: int, intercept: float, slope: float,
-    attribute_floor: float, log_gain_clip: tuple[float, float],
+    seismic_norm: np.ndarray,
+    *,
+    window_samples: int,
+    intercept: float,
+    slope: float,
+    attribute_floor: float,
+    log_gain_clip: tuple[float, float],
 ) -> pd.DataFrame:
     seismic_norm = np.asarray(seismic_norm, dtype=float)
     seismic_rms = centered_moving_rms(seismic_norm, window_samples)
@@ -170,11 +191,16 @@ def predict_gain_from_trace_rms(
     log_seismic_rms = np.where(np.isfinite(rms_safe) & (rms_safe > 0.0), np.log(rms_safe), np.nan)
     log_gain_pred = float(intercept) + float(slope) * log_seismic_rms
     log_gain_pred_clipped = np.clip(log_gain_pred, float(log_gain_clip[0]), float(log_gain_clip[1]))
-    return pd.DataFrame({
-        "seismic_rms": seismic_rms, "log_seismic_rms": log_seismic_rms,
-        "log_gain_pred": log_gain_pred, "log_gain_pred_clipped": log_gain_pred_clipped,
-        "gain_pred": np.exp(log_gain_pred), "gain_pred_clipped": np.exp(log_gain_pred_clipped),
-    })
+    return pd.DataFrame(
+        {
+            "seismic_rms": seismic_rms,
+            "log_seismic_rms": log_seismic_rms,
+            "log_gain_pred": log_gain_pred,
+            "log_gain_pred_clipped": log_gain_pred_clipped,
+            "gain_pred": np.exp(log_gain_pred),
+            "gain_pred_clipped": np.exp(log_gain_pred_clipped),
+        }
+    )
 
 
 # =============================================================================
@@ -183,7 +209,8 @@ def predict_gain_from_trace_rms(
 
 
 def compare_attributes(
-    segment_df: pd.DataFrame, attr_tie_threshold: float,
+    segment_df: pd.DataFrame,
+    attr_tie_threshold: float,
 ) -> tuple[str, pd.DataFrame, pd.DataFrame]:
     """Compare log(attribute) vs log(gain) correlations and select best attribute.
 
@@ -196,20 +223,30 @@ def compare_attributes(
         x = segment_df[x_col].to_numpy(dtype=float)
         y = segment_df["log_gain"].to_numpy(dtype=float)
         mask = np.isfinite(x) & np.isfinite(y)
-        metric_rows.append({
-            "scope": "all_wells", "well_name": "__all__", "attribute": attr,
-            "n_samples": int(mask.sum()),
-            "pearson": pearson_r(x, y), "spearman": spearman_rho(x, y),
-        })
+        metric_rows.append(
+            {
+                "scope": "all_wells",
+                "well_name": "__all__",
+                "attribute": attr,
+                "n_samples": int(mask.sum()),
+                "pearson": pearson_r(x, y),
+                "spearman": spearman_rho(x, y),
+            }
+        )
         for well_name, well_df in segment_df.groupby("well_name"):
             xw = well_df[x_col].to_numpy(dtype=float)
             yw = well_df["log_gain"].to_numpy(dtype=float)
             mask_w = np.isfinite(xw) & np.isfinite(yw)
-            metric_rows.append({
-                "scope": "per_well", "well_name": well_name, "attribute": attr,
-                "n_samples": int(mask_w.sum()),
-                "pearson": pearson_r(xw, yw), "spearman": spearman_rho(xw, yw),
-            })
+            metric_rows.append(
+                {
+                    "scope": "per_well",
+                    "well_name": well_name,
+                    "attribute": attr,
+                    "n_samples": int(mask_w.sum()),
+                    "pearson": pearson_r(xw, yw),
+                    "spearman": spearman_rho(xw, yw),
+                }
+            )
 
     metrics_df = pd.DataFrame(metric_rows)
 
@@ -335,28 +372,39 @@ def main() -> None:
 
         finite = eval_mask & np.isfinite(twt_s) & np.isfinite(seismic_norm) & np.isfinite(synthetic_raw)
         segments = split_valid_indices(
-            np.flatnonzero(finite), min_valid_samples=min_seg_samples,
-            max_segments=max_segments, min_segments=min_segments,
+            np.flatnonzero(finite),
+            min_valid_samples=min_seg_samples,
+            max_segments=max_segments,
+            min_segments=min_segments,
         )
         for seg_id, seg_idx in enumerate(segments):
             seg_twt = twt_s[seg_idx]
             gain = positive_ls_gain(
-                seismic_norm[seg_idx], synthetic_raw[seg_idx],
-                eps=gain_eps, min_valid_samples=min_seg_samples,
+                seismic_norm[seg_idx],
+                synthetic_raw[seg_idx],
+                eps=gain_eps,
+                min_valid_samples=min_seg_samples,
             )
             if not np.isfinite(gain):
                 continue
             attrs = segment_attribute_values(seismic_norm[seg_idx])
             tvdss = np.interp(seg_twt, ds_twt, ds_z)
-            segment_rows.append({
-                "well_name": well_name, "segment_id": int(seg_id),
-                "n_valid_samples": int(seg_idx.size),
-                "twt_min_s": float(np.nanmin(seg_twt)), "twt_max_s": float(np.nanmax(seg_twt)),
-                "tvdss_min_m": float(np.nanmin(tvdss)), "tvdss_max_m": float(np.nanmax(tvdss)),
-                "segment_thickness_m": float(np.nanmax(tvdss) - np.nanmin(tvdss)),
-                "gain": gain, "batch_scale": scale, "batch_corr": float(row["corr"]),
-                **attrs,
-            })
+            segment_rows.append(
+                {
+                    "well_name": well_name,
+                    "segment_id": int(seg_id),
+                    "n_valid_samples": int(seg_idx.size),
+                    "twt_min_s": float(np.nanmin(seg_twt)),
+                    "twt_max_s": float(np.nanmax(seg_twt)),
+                    "tvdss_min_m": float(np.nanmin(tvdss)),
+                    "tvdss_max_m": float(np.nanmax(tvdss)),
+                    "segment_thickness_m": float(np.nanmax(tvdss) - np.nanmin(tvdss)),
+                    "gain": gain,
+                    "batch_scale": scale,
+                    "batch_corr": float(row["corr"]),
+                    **attrs,
+                }
+            )
 
     seg_df = pd.DataFrame(segment_rows)
     if seg_df.empty:
@@ -381,8 +429,10 @@ def main() -> None:
         print(f"  {attr}: pearson={r['pearson']:.3f}, spearman={r['spearman']:.3f}, n={int(r['n_samples'])}")
     print(f"  QC winner: {best_attr}  (tie_threshold={attr_tie_threshold})")
     if best_attr != "seismic_rms":
-        print(f"  Note: fit uses seismic_rms because prediction uses moving-RMS input;"
-              f" segment-level {best_attr} win is informational.")
+        print(
+            f"  Note: fit uses seismic_rms because prediction uses moving-RMS input;"
+            f" segment-level {best_attr} win is informational."
+        )
 
     # ── Fit always against seismic_rms (matches predict_gain_from_trace_rms) ──
 
@@ -393,9 +443,7 @@ def main() -> None:
         raise ValueError(f"No finite ln(gain) / ln({fit_attr}) samples.")
 
     fit = ols_fit(fit_df[fit_col].to_numpy(dtype=float), fit_df["log_gain"].to_numpy(dtype=float))
-    log_gain_clip = tuple(
-        float(v) for v in np.nanpercentile(fit_df["log_gain"].to_numpy(dtype=float), pred_clip_pct)
-    )
+    log_gain_clip = tuple(float(v) for v in np.nanpercentile(fit_df["log_gain"].to_numpy(dtype=float), pred_clip_pct))
     attr_floor = float(np.nanpercentile(fit_df[fit_attr].to_numpy(dtype=float), 1.0) * attr_floor_frac)
     attr_floor = max(attr_floor, np.finfo(float).tiny)
 
@@ -404,12 +452,18 @@ def main() -> None:
     app_win = float(np.nanmedian(thick)) if app_window_m is None else float(app_window_m)
 
     fit_row = {
-        **fit, "target": "log_gain", "attribute": fit_col, "attribute_name": fit_attr,
+        **fit,
+        "target": "log_gain",
+        "attribute": fit_col,
+        "attribute_name": fit_attr,
         "n_training_segments": int(fit_df.shape[0]),
         "n_training_wells": int(fit_df["well_name"].nunique()),
-        "log_gain_clip_p05": float(log_gain_clip[0]), "log_gain_clip_p95": float(log_gain_clip[1]),
-        "gain_clip_p05": float(np.exp(log_gain_clip[0])), "gain_clip_p95": float(np.exp(log_gain_clip[1])),
-        "attribute_floor": attr_floor, "application_window_m": app_win,
+        "log_gain_clip_p05": float(log_gain_clip[0]),
+        "log_gain_clip_p95": float(log_gain_clip[1]),
+        "gain_clip_p05": float(np.exp(log_gain_clip[0])),
+        "gain_clip_p95": float(np.exp(log_gain_clip[1])),
+        "attribute_floor": attr_floor,
+        "application_window_m": app_win,
     }
     pd.DataFrame([fit_row]).to_csv(fit_file, index=False)
 
@@ -446,8 +500,7 @@ def main() -> None:
     color_map = {w: plt.cm.tab10(i % 10) for i, w in enumerate(well_names)}
     fig, ax = plt.subplots(figsize=(6.8, 5.2), constrained_layout=True)
     for w, wdf in seg_df.groupby("well_name"):
-        ax.scatter(wdf[f"log_{fit_attr}"], wdf["log_gain"], s=28, alpha=0.75,
-                   color=color_map[w], label=w)
+        ax.scatter(wdf[f"log_{fit_attr}"], wdf["log_gain"], s=28, alpha=0.75, color=color_map[w], label=w)
     ax.set_xlabel(f"log({fit_attr})")
     ax.set_ylabel("log(gain)")
     ax.set_title(f"Fit attribute: {fit_attr} (pearson={all_rel.loc[fit_attr]['pearson']:.3f})")
@@ -494,8 +547,12 @@ def main() -> None:
         dz_m = _infer_depth_step(tvdss_m)
         win_smp = meters_to_odd_samples(app_win, dz_m)
         pred_df = predict_gain_from_trace_rms(
-            seismic_norm, window_samples=win_smp, intercept=fit["intercept"],
-            slope=fit["slope"], attribute_floor=attr_floor, log_gain_clip=log_gain_clip,
+            seismic_norm,
+            window_samples=win_smp,
+            intercept=fit["intercept"],
+            slope=fit["slope"],
+            attribute_floor=attr_floor,
+            log_gain_clip=log_gain_clip,
         )
         gain_curve = pred_df["gain_pred_clipped"].to_numpy(dtype=float)
         synthetic_gain = gain_curve * synthetic_raw
@@ -503,37 +560,52 @@ def main() -> None:
         fm = candidate_metrics(seismic_norm, synthetic_fixed, eval_mask)
         gm = candidate_metrics(seismic_norm, synthetic_gain, eval_mask)
 
-        out_df = pd.DataFrame({
-            "well_name": well_name, "twt_s": twt_s, "tvdss_m": tvdss_m,
-            "seismic_norm": seismic_norm,
-            "reflectivity_shifted": qc_df.get("reflectivity_shifted",
-                pd.Series(np.full_like(twt_s, np.nan))).to_numpy(dtype=float),
-            "synthetic_raw": synthetic_raw,
-            "synthetic_fixed_scale": synthetic_fixed,
-            "synthetic_gain_pred": synthetic_gain,
-            "residual_fixed_scale": seismic_norm - synthetic_fixed,
-            "residual_gain_pred": seismic_norm - synthetic_gain,
-            "eval_mask": eval_mask, "batch_scale": scale,
-            "rms_window_samples": win_smp, "rms_window_m": win_smp * dz_m,
-        })
+        out_df = pd.DataFrame(
+            {
+                "well_name": well_name,
+                "twt_s": twt_s,
+                "tvdss_m": tvdss_m,
+                "seismic_norm": seismic_norm,
+                "reflectivity_shifted": qc_df.get(
+                    "reflectivity_shifted", pd.Series(np.full_like(twt_s, np.nan))
+                ).to_numpy(dtype=float),
+                "synthetic_raw": synthetic_raw,
+                "synthetic_fixed_scale": synthetic_fixed,
+                "synthetic_gain_pred": synthetic_gain,
+                "residual_fixed_scale": seismic_norm - synthetic_fixed,
+                "residual_gain_pred": seismic_norm - synthetic_gain,
+                "eval_mask": eval_mask,
+                "batch_scale": scale,
+                "rms_window_samples": win_smp,
+                "rms_window_m": win_smp * dz_m,
+            }
+        )
         out_df = pd.concat([out_df, pred_df], axis=1)
         out_path = well_qc_dir / f"wellside_gain_synthetic_qc_{name}.csv"
         out_df.to_csv(out_path, index=False)
 
         fg = gain_curve[np.isfinite(gain_curve)]
-        summary_rows.append({
-            "well_name": well_name, "n_samples": int(twt_s.size),
-            "n_eval_samples": int(eval_mask.sum()),
-            "batch_corr": float(row["corr"]), "batch_nmae": float(row["nmae"]),
-            "fixed_corr_recomputed": fm["corr"], "fixed_nmae_recomputed": fm["nmae"],
-            "gain_corr": gm["corr"], "gain_nmae": gm["nmae"],
-            "batch_scale": scale,
-            "gain_median": float(np.nanmedian(fg)) if fg.size else np.nan,
-            "gain_p10": float(np.nanpercentile(fg, 10.0)) if fg.size else np.nan,
-            "gain_p90": float(np.nanpercentile(fg, 90.0)) if fg.size else np.nan,
-            "rms_window_samples": int(win_smp), "inferred_depth_step_m": dz_m,
-            "rms_window_m": float(win_smp * dz_m), "well_qc_path": str(out_path),
-        })
+        summary_rows.append(
+            {
+                "well_name": well_name,
+                "n_samples": int(twt_s.size),
+                "n_eval_samples": int(eval_mask.sum()),
+                "batch_corr": float(row["corr"]),
+                "batch_nmae": float(row["nmae"]),
+                "fixed_corr_recomputed": fm["corr"],
+                "fixed_nmae_recomputed": fm["nmae"],
+                "gain_corr": gm["corr"],
+                "gain_nmae": gm["nmae"],
+                "batch_scale": scale,
+                "gain_median": float(np.nanmedian(fg)) if fg.size else np.nan,
+                "gain_p10": float(np.nanpercentile(fg, 10.0)) if fg.size else np.nan,
+                "gain_p90": float(np.nanpercentile(fg, 90.0)) if fg.size else np.nan,
+                "rms_window_samples": int(win_smp),
+                "inferred_depth_step_m": dz_m,
+                "rms_window_m": float(win_smp * dz_m),
+                "well_qc_path": str(out_path),
+            }
+        )
 
     summary_df = pd.DataFrame(summary_rows)
     summary_path = output_dir / "wellside_gain_synthetic_qc_summary.csv"
@@ -556,23 +628,28 @@ def main() -> None:
         axes[0].plot(s, d, lw=0.9, color="black", label="Seismic")
         axes[0].plot(fsyn, d, lw=0.9, color="tab:red", alpha=0.85, label="Fixed-scale synthetic")
         axes[0].invert_yaxis()
-        axes[0].set_xlabel("Normalized amplitude"); axes[0].set_ylabel("TVDSS (m)")
+        axes[0].set_xlabel("Normalized amplitude")
+        axes[0].set_ylabel("TVDSS (m)")
         axes[0].set_title(f"Fixed: corr={srow['fixed_corr_recomputed']:.3f}, nmae={srow['fixed_nmae_recomputed']:.3f}")
-        axes[0].grid(True, alpha=0.25); axes[0].legend(loc="best", fontsize=7)
+        axes[0].grid(True, alpha=0.25)
+        axes[0].legend(loc="best", fontsize=7)
 
         axes[1].plot(s, d, lw=0.9, color="black", label="Seismic")
         axes[1].plot(gsyn, d, lw=0.9, color="tab:blue", alpha=0.9, label="RMS-gain synthetic")
         axes[1].set_xlabel("Normalized amplitude")
         axes[1].set_title(f"Gain: corr={srow['gain_corr']:.3f}, nmae={srow['gain_nmae']:.3f}")
-        axes[1].grid(True, alpha=0.25); axes[1].legend(loc="best", fontsize=7)
+        axes[1].grid(True, alpha=0.25)
+        axes[1].legend(loc="best", fontsize=7)
 
         fg = np.isfinite(g)
         gn = g / np.nanmedian(g[fg]) if np.any(fg) else g
         rn = r / np.nanmedian(r[np.isfinite(r)]) if np.any(np.isfinite(r)) else r
         axes[2].plot(gn, d, lw=1.0, color="tab:blue", label="gain / median")
         axes[2].plot(rn, d, lw=1.0, color="tab:green", label="RMS / median")
-        axes[2].set_xlabel("Normalized attribute"); axes[2].set_title("Predicted gain curve")
-        axes[2].grid(True, alpha=0.25); axes[2].legend(loc="best", fontsize=7)
+        axes[2].set_xlabel("Normalized attribute")
+        axes[2].set_title("Predicted gain curve")
+        axes[2].grid(True, alpha=0.25)
+        axes[2].legend(loc="best", fontsize=7)
         fig.suptitle(well_name)
         _save_fig(figure_dir / f"qc_{name}_wellside_gain_synthetic.png")
 
@@ -585,25 +662,39 @@ def main() -> None:
         fig, axes = plt.subplots(1, 3, figsize=(15, 4.3), constrained_layout=True)
         axes[0].bar(x - w / 2, summary_df["fixed_corr_recomputed"], w, color="tab:red", alpha=0.8, label="fixed")
         axes[0].bar(x + w / 2, summary_df["gain_corr"], w, color="tab:blue", alpha=0.8, label="gain")
-        axes[0].set_xticks(x); axes[0].set_xticklabels(labels, rotation=45, ha="right")
-        axes[0].set_ylabel("Correlation"); axes[0].set_ylim(-1, 1)
-        axes[0].set_title("Synthetic correlation"); axes[0].grid(True, axis="y", alpha=0.25)
+        axes[0].set_xticks(x)
+        axes[0].set_xticklabels(labels, rotation=45, ha="right")
+        axes[0].set_ylabel("Correlation")
+        axes[0].set_ylim(-1, 1)
+        axes[0].set_title("Synthetic correlation")
+        axes[0].grid(True, axis="y", alpha=0.25)
         axes[0].legend(loc="best", fontsize=8)
 
         axes[1].bar(x - w / 2, summary_df["fixed_nmae_recomputed"], w, color="tab:red", alpha=0.8, label="fixed")
         axes[1].bar(x + w / 2, summary_df["gain_nmae"], w, color="tab:blue", alpha=0.8, label="gain")
-        axes[1].set_xticks(x); axes[1].set_xticklabels(labels, rotation=45, ha="right")
-        axes[1].set_ylabel("NMAE"); axes[1].set_title("Synthetic NMAE")
-        axes[1].grid(True, axis="y", alpha=0.25); axes[1].legend(loc="best", fontsize=8)
+        axes[1].set_xticks(x)
+        axes[1].set_xticklabels(labels, rotation=45, ha="right")
+        axes[1].set_ylabel("NMAE")
+        axes[1].set_title("Synthetic NMAE")
+        axes[1].grid(True, axis="y", alpha=0.25)
+        axes[1].legend(loc="best", fontsize=8)
 
         axes[2].plot(x, summary_df["batch_scale"], marker="o", lw=1.1, color="tab:red", label="batch fixed scale")
         axes[2].plot(x, summary_df["gain_median"], marker="o", lw=1.1, color="tab:blue", label="median predicted gain")
-        axes[2].fill_between(x, summary_df["gain_p10"].to_numpy(dtype=float),
-                             summary_df["gain_p90"].to_numpy(dtype=float),
-                             color="tab:blue", alpha=0.15, label="gain P10-P90")
-        axes[2].set_xticks(x); axes[2].set_xticklabels(labels, rotation=45, ha="right")
-        axes[2].set_ylabel("Gain"); axes[2].set_title("Fixed scale vs predicted gain")
-        axes[2].grid(True, axis="y", alpha=0.25); axes[2].legend(loc="best", fontsize=8)
+        axes[2].fill_between(
+            x,
+            summary_df["gain_p10"].to_numpy(dtype=float),
+            summary_df["gain_p90"].to_numpy(dtype=float),
+            color="tab:blue",
+            alpha=0.15,
+            label="gain P10-P90",
+        )
+        axes[2].set_xticks(x)
+        axes[2].set_xticklabels(labels, rotation=45, ha="right")
+        axes[2].set_ylabel("Gain")
+        axes[2].set_title("Fixed scale vs predicted gain")
+        axes[2].grid(True, axis="y", alpha=0.25)
+        axes[2].legend(loc="best", fontsize=8)
         _save_fig(figure_dir / "qc_00_wellside_gain_synthetic_summary.png")
 
     # ── Manifest ──

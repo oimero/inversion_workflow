@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+
 # ── Bootstrap ──
 def _find_repo_root() -> Path:
     root = Path(__file__).resolve().parent.parent
@@ -35,16 +36,20 @@ def _find_repo_root() -> Path:
         raise RuntimeError("Could not locate repo root containing 'src'.")
     return root
 
+
 def _ensure_import_path(src_root: Path) -> None:
     if str(src_root) not in sys.path:
         sys.path.insert(0, str(src_root))
+
 
 _ensure_import_path(_find_repo_root() / "src")
 
 from cup.utils.io import build_segy_textual_header, load_yaml_config  # noqa: E402
 from cup.utils.raw_trace import (  # noqa: E402
-    centered_moving_rms_axis, centered_moving_sum_axis,
-    meters_to_odd_samples, zscore_traces_axis,
+    centered_moving_rms_axis,
+    centered_moving_sum_axis,
+    meters_to_odd_samples,
+    zscore_traces_axis,
 )
 
 matplotlib.use("Agg")
@@ -70,11 +75,15 @@ def _save_fig(path: Path) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--config", type=Path, default=Path("experiments/common_depth.yaml"),
+        "--config",
+        type=Path,
+        default=Path("experiments/common_depth.yaml"),
         help="Depth-domain common config YAML.",
     )
     parser.add_argument(
-        "--output-dir", type=Path, default=None,
+        "--output-dir",
+        type=Path,
+        default=None,
         help="Output directory. Defaults to <output_root>/dynamic_gain_model_depth_<timestamp>.",
     )
     return parser.parse_args()
@@ -150,8 +159,10 @@ def main() -> None:
 
     segy_cfg = cfg["segy"]
     segy_options = {
-        "iline": segy_cfg["iline_byte"], "xline": segy_cfg["xline_byte"],
-        "istep": segy_cfg["istep"], "xstep": segy_cfg["xstep"],
+        "iline": segy_cfg["iline_byte"],
+        "xline": segy_cfg["xline_byte"],
+        "istep": segy_cfg["istep"],
+        "xstep": segy_cfg["xstep"],
     }
     survey = open_survey(seismic_file, seismic_type="segy", segy_options=segy_options)
     geometry = survey.query_geometry(domain="depth")
@@ -169,17 +180,20 @@ def main() -> None:
 
     print("Loading seismic volume...")
     seismic_volume = import_seismic(
-        seismic_file, seismic_type="segy",
-        iline=segy_options["iline"], xline=segy_options["xline"],
-        istep=segy_options["istep"], xstep=segy_options["xstep"],
+        seismic_file,
+        seismic_type="segy",
+        iline=segy_options["iline"],
+        xline=segy_options["xline"],
+        istep=segy_options["istep"],
+        xstep=segy_options["xstep"],
     )
     expected_shape = (
-        int(geometry["n_il"]), int(geometry["n_xl"]), int(geometry["n_sample"]),
+        int(geometry["n_il"]),
+        int(geometry["n_xl"]),
+        int(geometry["n_sample"]),
     )
     if tuple(seismic_volume.shape) != expected_shape:
-        raise ValueError(
-            f"Seismic volume shape {seismic_volume.shape} != geometry {expected_shape}"
-        )
+        raise ValueError(f"Seismic volume shape {seismic_volume.shape} != geometry {expected_shape}")
 
     # ── Compute gain volume ──
 
@@ -191,7 +205,9 @@ def main() -> None:
         seismic_rms = centered_moving_rms_axis(seismic_zscore, window_samples)
         rms_safe = np.maximum(seismic_rms, float(attr_floor))
         log_seismic_rms = np.where(
-            np.isfinite(rms_safe) & (rms_safe > 0.0), np.log(rms_safe), np.nan,
+            np.isfinite(rms_safe) & (rms_safe > 0.0),
+            np.log(rms_safe),
+            np.nan,
         )
         log_gain = float(intercept) + float(slope) * log_seismic_rms
         log_gain = np.clip(log_gain, np.log(gain_clip_p05), np.log(gain_clip_p95))
@@ -201,8 +217,10 @@ def main() -> None:
 
     gain_volume = gain_flat.reshape(seismic_volume.shape)
     print(f"Gain volume shape: {gain_volume.shape}")
-    print(f"Gain min/median/max: {float(np.nanmin(gain_volume)):.3f} / "
-          f"{float(np.nanmedian(gain_volume)):.3f} / {float(np.nanmax(gain_volume)):.3f}")
+    print(
+        f"Gain min/median/max: {float(np.nanmin(gain_volume)):.3f} / "
+        f"{float(np.nanmedian(gain_volume)):.3f} / {float(np.nanmax(gain_volume)):.3f}"
+    )
 
     # ── QC figures ──
 
@@ -235,8 +253,10 @@ def main() -> None:
     fig, axes = plt.subplots(1, 3, figsize=(14, 4.2), constrained_layout=True)
 
     axes[0].hist(
-        gain_volume[np.isfinite(gain_volume)].ravel(), bins=80,
-        color="tab:blue", alpha=0.85,
+        gain_volume[np.isfinite(gain_volume)].ravel(),
+        bins=80,
+        color="tab:blue",
+        alpha=0.85,
     )
     axes[0].set_xlabel("Gain")
     axes[0].set_ylabel("Count")
@@ -244,7 +264,10 @@ def main() -> None:
     axes[0].grid(True, alpha=0.25)
 
     im1 = axes[1].imshow(
-        gain_volume[mid_il].T, aspect="auto", origin="upper", cmap="viridis",
+        gain_volume[mid_il].T,
+        aspect="auto",
+        origin="upper",
+        cmap="viridis",
     )
     axes[1].set_title(f"Inline index {mid_il}")
     axes[1].set_xlabel("Xline index")
@@ -252,7 +275,10 @@ def main() -> None:
     fig.colorbar(im1, ax=axes[1], shrink=0.82)
 
     im2 = axes[2].imshow(
-        gain_volume[:, mid_xl, :].T, aspect="auto", origin="upper", cmap="viridis",
+        gain_volume[:, mid_xl, :].T,
+        aspect="auto",
+        origin="upper",
+        cmap="viridis",
     )
     axes[2].set_title(f"Xline index {mid_xl}")
     axes[2].set_xlabel("Inline index")
@@ -263,15 +289,18 @@ def main() -> None:
     # ── Export NPZ ──
 
     ilines = np.arange(
-        float(geometry["inline_min"]), float(geometry["inline_max"]) + 0.5 * float(geometry["inline_step"]),
+        float(geometry["inline_min"]),
+        float(geometry["inline_max"]) + 0.5 * float(geometry["inline_step"]),
         float(geometry["inline_step"]),
     ).astype(np.float32)
     xlines = np.arange(
-        float(geometry["xline_min"]), float(geometry["xline_max"]) + 0.5 * float(geometry["xline_step"]),
+        float(geometry["xline_min"]),
+        float(geometry["xline_max"]) + 0.5 * float(geometry["xline_step"]),
         float(geometry["xline_step"]),
     ).astype(np.float32)
     samples = np.arange(
-        float(geometry["sample_min"]), float(geometry["sample_max"]) + 0.5 * float(geometry["sample_step"]),
+        float(geometry["sample_min"]),
+        float(geometry["sample_max"]) + 0.5 * float(geometry["sample_step"]),
         float(geometry["sample_step"]),
     ).astype(np.float32)
 
@@ -281,7 +310,8 @@ def main() -> None:
         "gain_model_is_relative_to_fixed_gain": False,
         "intended_usage": "Set fixed_gain=None and dynamic_gain_model_file to this NPZ/SEG-Y model.",
         "selected_attribute": attribute_name,
-        "intercept": intercept, "slope": slope,
+        "intercept": intercept,
+        "slope": slope,
         "log_gain_clip": [np.log(gain_clip_p05), np.log(gain_clip_p95)],
         "gain_clip": [gain_clip_p05, gain_clip_p95],
         "attribute_floor": attr_floor,
@@ -294,7 +324,9 @@ def main() -> None:
     np.savez_compressed(
         gain_npz,
         volume=gain_volume.astype(np.float32),
-        ilines=ilines, xlines=xlines, samples=samples,
+        ilines=ilines,
+        xlines=xlines,
+        samples=samples,
         geometry_json=json.dumps(geometry, ensure_ascii=False),
         metadata_json=json.dumps(metadata, ensure_ascii=False),
     )
@@ -305,8 +337,10 @@ def main() -> None:
     import cigsegy
 
     keylocs = [
-        segy_options["iline"], segy_options["xline"],
-        segy_options["istep"], segy_options["xstep"],
+        segy_options["iline"],
+        segy_options["xline"],
+        segy_options["istep"],
+        segy_options["xstep"],
     ]
     textual = build_segy_textual_header(
         "Depth-domain dynamic gain model from RMS attribute",
@@ -319,9 +353,11 @@ def main() -> None:
         ],
     )
     cigsegy.create_by_sharing_header(
-        str(gain_segy), str(seismic_file),
+        str(gain_segy),
+        str(seismic_file),
         np.ascontiguousarray(gain_volume.astype(np.float32)),
-        keylocs=keylocs, textual=textual,
+        keylocs=keylocs,
+        textual=textual,
     )
     print(f"Saved SEG-Y: {gain_segy}")
 

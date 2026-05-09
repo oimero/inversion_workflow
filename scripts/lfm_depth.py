@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+
 # ── Bootstrap ──
 def _find_repo_root() -> Path:
     root = Path(__file__).resolve().parent.parent
@@ -33,14 +34,18 @@ def _find_repo_root() -> Path:
         raise RuntimeError("Could not locate repo root containing 'src'.")
     return root
 
+
 def _ensure_import_path(src_root: Path) -> None:
     if str(src_root) not in sys.path:
         sys.path.insert(0, str(src_root))
 
+
 _ensure_import_path(_find_repo_root() / "src")
 
 from cup.utils.io import (  # noqa: E402
-    build_segy_textual_header, load_yaml_config, resolve_relative_path,
+    build_segy_textual_header,
+    load_yaml_config,
+    resolve_relative_path,
 )
 
 matplotlib.use("Agg")
@@ -480,8 +485,7 @@ def main() -> None:
     las_dir = resolve_relative_path(str(script_cfg["las_dir"]), root=repo_root)
 
     horizon_files = {
-        name: resolve_relative_path(str(cfg["horizons"][name]), root=data_root)
-        for name in cfg["horizons"]
+        name: resolve_relative_path(str(cfg["horizons"][name]), root=data_root) for name in cfg["horizons"]
     }
 
     for p in [seismic_file, well_heads_file, train_config_file, las_dir, *horizon_files.values()]:

@@ -20,15 +20,12 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib
-import lasio
 import numpy as np
 import pandas as pd
 import torch
 
-
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
-
 
 # Bootstrap
 
@@ -49,16 +46,16 @@ def _ensure_import_path(src_root: Path) -> None:
 
 _ensure_import_path(_find_repo_root() / "src")
 
-from cup.petrel.load import (  # noqa: E402
-    extract_rho_log_from_las,
-    extract_vp_log_from_las,
-    import_well_heads_petrel,
-)
+from cup.petrel.load import import_well_heads_petrel  # noqa: E402
 from cup.seismic.survey import open_survey  # noqa: E402
-from cup.utils.io import build_segy_textual_header, load_yaml_config, resolve_relative_path, sanitize_filename  # noqa: E402
+from cup.utils.io import (  # noqa: E402
+    build_segy_textual_header,
+    load_yaml_config,
+    resolve_relative_path,
+    sanitize_filename,
+)
 from ginn_depth.config import DepthGINNConfig  # noqa: E402
 from ginn_depth.trainer import Trainer  # noqa: E402
-
 
 # CLI
 
@@ -188,16 +185,23 @@ def _extract_ai_reference_from_las(
     rho_unit: str,
     kb_m: float,
     depth_domain: str,
+    log_filter_params: dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray]:
-    las_file = lasio.read(las_path)
-    vp_log = extract_vp_log_from_las(las_file, unit=vp_unit)
-    rho_log = extract_rho_log_from_las(las_file, unit=rho_unit)
-    depth = np.asarray(vp_log.basis, dtype=np.float64)
-    vp = np.asarray(vp_log.values, dtype=np.float64)
-    rho_depth = np.asarray(rho_log.basis, dtype=np.float64)
-    rho = np.asarray(rho_log.values, dtype=np.float64)
-    if rho_depth.shape != depth.shape or not np.allclose(rho_depth, depth):
-        rho = np.interp(depth, rho_depth, rho)
+    from cup.petrel.load import load_vp_rho_logset_from_las
+    from wtie.optimize import tie as tie_utils
+    from wtie.processing.logs import interpolate_nans
+
+    logset_md = load_vp_rho_logset_from_las(las_path, vp_unit=vp_unit, rho_unit=rho_unit)
+    filtered_logset_md = tie_utils.filter_md_logs(
+        logset_md,
+        median_size=int(log_filter_params["logs_median_size"]),
+        threshold=float(log_filter_params["logs_median_threshold"]),
+        std=float(log_filter_params["logs_std"]),
+        std2=0.8 * float(log_filter_params["logs_std"]),
+    )
+    depth = np.asarray(filtered_logset_md.basis, dtype=np.float64)
+    vp = interpolate_nans(np.asarray(filtered_logset_md.Vp.values, dtype=np.float64), method="linear")
+    rho = interpolate_nans(np.asarray(filtered_logset_md.Rho.values, dtype=np.float64), method="linear")
     if depth_domain == "tvdss":
         depth = depth - float(kb_m)
     elif depth_domain != "md":
@@ -252,9 +256,16 @@ def main() -> None:
         output_dir = output_root / f"ginn_inversion_depth_{timestamp}"
     else:
         output_dir = args.output_dir if args.output_dir.is_absolute() else repo_root / args.output_dir
-    figure_dir = output_dir / "figures"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    figure_dir.mkdir(parents=True, exist_ok=True)
+    output_dirs = {
+        "root": output_dir,
+        "metadata": output_dir / "metadata",
+        "qc_figures": output_dir / "qc_figures",
+        "well_qc": output_dir / "well_qc",
+        "well_qc_figures": output_dir / "well_qc" / "figures",
+        "well_qc_traces": output_dir / "well_qc" / "traces",
+    }
+    for path in output_dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
 
     print("=== GINN Inversion (Depth) ===")
     print(f"Checkpoint: {checkpoint_path}")
@@ -263,9 +274,7 @@ def main() -> None:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cfg_payload = checkpoint["config"]
     depth_cfg = (
-        DepthGINNConfig.from_dict(cfg_payload, base_dir=repo_root)
-        if isinstance(cfg_payload, dict)
-        else cfg_payload
+        DepthGINNConfig.from_dict(cfg_payload, base_dir=repo_root) if isinstance(cfg_payload, dict) else cfg_payload
     )
     depth_cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -281,8 +290,6 @@ def main() -> None:
     mask_volume = trainer.dataset._mask_flat.reshape(n_il, n_xl, n_sample)
 
     base_ai_npz = output_dir / "stage1_ginn_base_ai_depth.npz"
-    legacy_npy = output_dir / "pred_volume_best.npy"
-    np.save(legacy_npy, pred_volume.astype(np.float32))
 
     prediction_stats = {
         "prediction_ai": _stats(_sampled_values(pred_volume)),
@@ -328,7 +335,9 @@ def main() -> None:
     diff_abs = float(np.percentile(np.abs(diff_section[np.isfinite(diff_section)]), clip_values[1]))
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 7), constrained_layout=True)
-    im0 = axes[0].imshow(pred_section, cmap="viridis", aspect="auto", origin="upper", vmin=shared_vmin, vmax=shared_vmax)
+    im0 = axes[0].imshow(
+        pred_section, cmap="viridis", aspect="auto", origin="upper", vmin=shared_vmin, vmax=shared_vmax
+    )
     axes[0].set_title(f"Predicted AI | {slice_mode}={resolved_slice_index}")
     axes[0].set_xlabel("Trace index")
     axes[0].set_ylabel("Sample index")
@@ -343,7 +352,7 @@ def main() -> None:
     axes[2].set_xlabel("Trace index")
     axes[2].set_ylabel("Sample index")
     fig.colorbar(im2, ax=axes[2], shrink=0.85)
-    slice_figure_path = figure_dir / f"{slice_mode}_{resolved_slice_index:04d}_prediction_vs_lfm.png"
+    slice_figure_path = output_dirs["qc_figures"] / f"{slice_mode}_{resolved_slice_index:04d}_prediction_vs_lfm.png"
     fig.savefig(slice_figure_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -353,7 +362,7 @@ def main() -> None:
     ax.set_xlabel("Trace index")
     ax.set_ylabel("Sample index")
     fig.colorbar(im, ax=ax, shrink=0.85)
-    mask_figure_path = figure_dir / f"{slice_mode}_{resolved_slice_index:04d}_mask.png"
+    mask_figure_path = output_dirs["qc_figures"] / f"{slice_mode}_{resolved_slice_index:04d}_mask.png"
     fig.savefig(mask_figure_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -387,7 +396,9 @@ def main() -> None:
     well_qc_summary: dict[str, float | None] = {"mean_rmse": None, "mean_mae": None, "mean_corr": None}
     if not args.skip_well_qc and bool(script_cfg.get("well_qc_enabled", True)):
         data_root = resolve_relative_path(str(cfg.get("data_root", "data")), root=repo_root)
-        las_dir = resolve_relative_path(str(script_cfg.get("well_qc_las_dir", "vertical_well_las_target_qyz")), root=data_root)
+        las_dir = resolve_relative_path(
+            str(script_cfg.get("well_qc_las_dir", "vertical_well_las_target_qyz")), root=data_root
+        )
         well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
         if not las_dir.exists():
             raise FileNotFoundError(f"Well QC LAS dir not found: {las_dir}")
@@ -411,10 +422,13 @@ def main() -> None:
         vp_unit = str(script_cfg.get("well_qc_las_vp_unit", "us/m"))
         rho_unit = str(script_cfg.get("well_qc_las_rho_unit", "g/cm3"))
         depth_domain = str(script_cfg.get("well_qc_depth_domain", "tvdss"))
-        max_well_plots = int(script_cfg.get("well_qc_max_plots", 1))
+        log_filter_params = script_cfg.get("well_qc_log_filter", {})
+        required_filter_keys = ("logs_median_size", "logs_median_threshold", "logs_std")
+        missing_filter_keys = [key for key in required_filter_keys if key not in log_filter_params]
+        if missing_filter_keys:
+            raise ValueError(f"Missing well_qc_log_filter keys: {missing_filter_keys}")
 
         metrics: list[dict[str, Any]] = []
-        plotted = 0
         for well_name_norm, las_path in reference_files.items():
             head_match = well_heads.loc[well_heads["Name_norm"] == well_name_norm]
             if head_match.empty:
@@ -430,6 +444,7 @@ def main() -> None:
                     rho_unit=rho_unit,
                     kb_m=kb_m,
                     depth_domain=depth_domain,
+                    log_filter_params=log_filter_params,
                 )
                 pred_trace = _bilinear_trace_from_volume(
                     pred_volume,
@@ -444,6 +459,30 @@ def main() -> None:
 
                 diff = pred_ai[valid] - ref_ai[valid]
                 corr = float(np.corrcoef(pred_ai[valid], ref_ai[valid])[0, 1]) if int(valid.sum()) > 1 else np.nan
+                safe_name = sanitize_filename(str(head["Name"]))
+                trace_qc_path = output_dirs["well_qc_traces"] / f"well_qc_{safe_name}.csv"
+                pd.DataFrame(
+                    {
+                        "depth_m": ref_depth[valid],
+                        "filtered_las_ai": ref_ai[valid],
+                        "predicted_ai": pred_ai[valid],
+                        "diff_ai": diff,
+                    }
+                ).to_csv(trace_qc_path, index=False)
+
+                qc_plot_path = output_dirs["well_qc_figures"] / f"well_qc_{safe_name}.png"
+                fig, ax = plt.subplots(figsize=(5, 10), constrained_layout=True)
+                ax.plot(ref_ai[valid], ref_depth[valid], label="Filtered LAS AI", lw=2)
+                ax.plot(pred_ai[valid], ref_depth[valid], label="GINN-Depth predicted AI", lw=2)
+                ax.invert_yaxis()
+                ax.set_xlabel("AI")
+                ax.set_ylabel("Depth (m)")
+                ax.set_title(f"Well QC | {head['Name']}")
+                ax.legend(loc="best")
+                ax.grid(True, alpha=0.3, linestyle=":")
+                fig.savefig(qc_plot_path, dpi=180, bbox_inches="tight")
+                plt.close(fig)
+
                 metrics.append(
                     {
                         "well_name": head["Name"],
@@ -455,23 +494,13 @@ def main() -> None:
                         "corr": corr,
                         "reference_file": las_path.name,
                         "depth_domain": depth_domain,
+                        "log_filter_median_size": int(log_filter_params["logs_median_size"]),
+                        "log_filter_threshold": float(log_filter_params["logs_median_threshold"]),
+                        "log_filter_std": float(log_filter_params["logs_std"]),
+                        "trace_qc_path": str(trace_qc_path),
+                        "figure_path": str(qc_plot_path),
                     }
                 )
-
-                if plotted < max_well_plots:
-                    fig, ax = plt.subplots(figsize=(5, 10), constrained_layout=True)
-                    ax.plot(ref_ai[valid], ref_depth[valid], label="LAS AI", lw=2)
-                    ax.plot(pred_ai[valid], ref_depth[valid], label="GINN-Depth predicted AI", lw=2)
-                    ax.invert_yaxis()
-                    ax.set_xlabel("AI")
-                    ax.set_ylabel("Depth (m)")
-                    ax.set_title(f"Well QC | {head['Name']}")
-                    ax.legend(loc="best")
-                    ax.grid(True, alpha=0.3, linestyle=":")
-                    qc_plot_path = figure_dir / f"well_qc_{sanitize_filename(str(head['Name']))}.png"
-                    fig.savefig(qc_plot_path, dpi=180, bbox_inches="tight")
-                    plt.close(fig)
-                    plotted += 1
             except Exception as exc:
                 metrics.append({"well_name": well_name_norm, "status": "failed", "error": str(exc)})
 
@@ -482,7 +511,7 @@ def main() -> None:
                 [metrics_df.loc[ok].sort_values("rmse"), metrics_df.loc[~ok]],
                 ignore_index=True,
             )
-        well_qc_metrics_path = output_dir / "well_qc_metrics.csv"
+        well_qc_metrics_path = output_dirs["well_qc"] / "well_qc_metrics.csv"
         metrics_df.to_csv(well_qc_metrics_path, index=False)
         ok_metrics = metrics_df.loc[metrics_df["status"] == "ok"] if "status" in metrics_df else pd.DataFrame()
         n_wells_qc = int(len(ok_metrics))
@@ -500,7 +529,6 @@ def main() -> None:
         "best_loss": metadata["checkpoint_best_loss"],
         "device": str(trainer.device),
         "base_ai_npz": str(base_ai_npz),
-        "legacy_prediction_npy": str(legacy_npy),
         "pred_segy_path": None if pred_segy_path is None else str(pred_segy_path),
         "slice_mode": slice_mode,
         "slice_index": int(resolved_slice_index),
@@ -517,15 +545,15 @@ def main() -> None:
         "well_qc": well_qc_summary,
         "prediction_stats": prediction_stats,
     }
-    run_summary_path = output_dir / "run_summary.json"
+    run_summary_path = output_dirs["metadata"] / "run_summary.json"
     with run_summary_path.open("w", encoding="utf-8") as fp:
         json.dump(run_summary, fp, ensure_ascii=False, indent=2)
 
     print(f"Saved base AI NPZ: {base_ai_npz}")
-    print(f"Saved legacy NPY: {legacy_npy}")
     if pred_segy_path is not None:
         print(f"Saved SEG-Y: {pred_segy_path}")
-    print(f"Saved figures: {figure_dir}")
+    print(f"Saved QC figures: {output_dirs['qc_figures']}")
+    print(f"Saved well QC: {output_dirs['well_qc']}")
     print(f"Saved run summary: {run_summary_path}")
 
 

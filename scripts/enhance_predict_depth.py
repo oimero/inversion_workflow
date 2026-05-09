@@ -17,7 +17,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--config", type=Path, default=None, help="Override config path; defaults to checkpoint config.")
+    parser.add_argument(
+        "--config", type=Path, default=None, help="Override config path; defaults to checkpoint config."
+    )
     return parser.parse_args()
 
 
@@ -103,7 +105,9 @@ def main() -> None:
         xlines=xlines,
         samples=bundle.dataset_bundle.depth_axis_m.astype(np.float32),
         geometry_json=np.asarray(json.dumps(geometry, ensure_ascii=False)),
-        metadata_json=np.asarray(json.dumps({"checkpoint": str(checkpoint_path), "config": cfg.to_json_dict()}, ensure_ascii=False)),
+        metadata_json=np.asarray(
+            json.dumps({"checkpoint": str(checkpoint_path), "config": cfg.to_json_dict()}, ensure_ascii=False)
+        ),
     )
     logging.info("Enhanced depth AI saved: %s", output_path)
 

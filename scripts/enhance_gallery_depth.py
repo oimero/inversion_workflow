@@ -220,7 +220,9 @@ def sample_record(sample: dict[str, Any], index: int, image_path: Path | None) -
     real = finite_core(as_1d(sample["obs"]), waveform_mask)
     synthetic = finite_core(as_1d(sample["target_seismic"]), waveform_mask)
     synthetic_raw = finite_core(as_1d(sample["target_seismic_raw"]), waveform_mask)
-    base_seismic_full = as_1d(sample["base_seismic"]) if "base_seismic" in sample else np.zeros_like(as_1d(sample["target_seismic"]))
+    base_seismic_full = (
+        as_1d(sample["base_seismic"]) if "base_seismic" in sample else np.zeros_like(as_1d(sample["target_seismic"]))
+    )
     base_seismic = finite_core(base_seismic_full, waveform_mask)
     base_target_delta_rms = rms(finite_core(as_1d(sample["target_seismic"]) - base_seismic_full, waveform_mask))
     residual = finite_core(as_1d(sample["target_residual"]), delta_mask)
@@ -310,8 +312,14 @@ def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Pat
     axes[2].set_ylabel("logAI residual")
 
     refl_depth = depth[:-1] if depth.size == reflectivity.size + 1 else np.arange(reflectivity.size)
-    if highres_depth is not None and highres_reflectivity is not None and highres_depth.size == highres_reflectivity.size + 1:
-        axes[3].plot(highres_depth[:-1], highres_reflectivity, color="0.55", lw=0.35, alpha=0.65, label="internal high-res")
+    if (
+        highres_depth is not None
+        and highres_reflectivity is not None
+        and highres_depth.size == highres_reflectivity.size + 1
+    ):
+        axes[3].plot(
+            highres_depth[:-1], highres_reflectivity, color="0.55", lw=0.35, alpha=0.65, label="internal high-res"
+        )
     axes[3].plot(refl_depth, reflectivity, color="tab:green", lw=0.8)
     if highres_reflectivity is not None:
         axes[3].legend(loc="upper right", fontsize=8)
@@ -320,8 +328,12 @@ def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Pat
 
     axes[4].plot(depth, taper, color="tab:brown", lw=1.2, label="taper")
     axes[4].fill_between(depth, 0.0, core_mask.astype(float), color="0.75", alpha=0.35, label="core mask")
-    axes[4].fill_between(depth, 0.0, waveform_mask.astype(float), color="tab:cyan", alpha=0.25, label="waveform QC mask")
-    axes[4].fill_between(depth, 0.0, delta_mask.astype(float), color="tab:purple", alpha=0.22, label="delta supervision mask")
+    axes[4].fill_between(
+        depth, 0.0, waveform_mask.astype(float), color="tab:cyan", alpha=0.25, label="waveform QC mask"
+    )
+    axes[4].fill_between(
+        depth, 0.0, delta_mask.astype(float), color="tab:purple", alpha=0.22, label="delta supervision mask"
+    )
     axes[4].set_ylim(-0.05, 1.05)
     axes[4].set_ylabel("support")
     axes[4].set_xlabel("depth / m")
@@ -458,7 +470,11 @@ def write_index_html(path: Path, records: list[dict[str, Any]], overview_paths: 
     rows = []
     for record in records:
         image = html.escape(record["image"])
-        link = f'<a href="{image}">sample {int(record["sample_index"]):03d}</a>' if image else f"sample {int(record['sample_index']):03d}"
+        link = (
+            f'<a href="{image}">sample {int(record["sample_index"]):03d}</a>'
+            if image
+            else f"sample {int(record['sample_index']):03d}"
+        )
         rows.append(
             "<tr>"
             f"<td>{link}</td>"
@@ -473,7 +489,8 @@ def write_index_html(path: Path, records: list[dict[str, Any]], overview_paths: 
         )
 
     overview_links = "\n".join(
-        f'<li><a href="{html.escape(path_item.as_posix())}">{html.escape(path_item.name)}</a></li>' for path_item in overview_paths
+        f'<li><a href="{html.escape(path_item.as_posix())}">{html.escape(path_item.name)}</a></li>'
+        for path_item in overview_paths
     )
     body = f"""<!doctype html>
 <html lang="en">
@@ -504,7 +521,7 @@ def write_index_html(path: Path, records: list[dict[str, Any]], overview_paths: 
       </tr>
     </thead>
     <tbody>
-      {''.join(rows)}
+      {"".join(rows)}
     </tbody>
   </table>
 </body>

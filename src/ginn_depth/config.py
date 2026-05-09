@@ -139,8 +139,8 @@ class DepthGINNConfig:
 
         if len(self.dilations) != self.num_res_blocks:
             raise ValueError(f"len(dilations)={len(self.dilations)} != num_res_blocks={self.num_res_blocks}")
-        expected_in_channels = 1 + int(self.include_lfm_input) + int(self.include_mask_input) + int(
-            self.include_dynamic_gain_input
+        expected_in_channels = (
+            1 + int(self.include_lfm_input) + int(self.include_mask_input) + int(self.include_dynamic_gain_input)
         )
         if self.in_channels != expected_in_channels:
             raise ValueError(

@@ -149,8 +149,8 @@ class GINNConfig:
         # 确保 dilations 长度与 num_res_blocks 一致
         if len(self.dilations) != self.num_res_blocks:
             raise ValueError(f"len(dilations)={len(self.dilations)} != num_res_blocks={self.num_res_blocks}")
-        expected_in_channels = 1 + int(self.include_lfm_input) + int(self.include_mask_input) + int(
-            self.include_dynamic_gain_input
+        expected_in_channels = (
+            1 + int(self.include_lfm_input) + int(self.include_mask_input) + int(self.include_dynamic_gain_input)
         )
         if self.in_channels != expected_in_channels:
             raise ValueError(
@@ -164,9 +164,7 @@ class GINNConfig:
         if self.lfm_source == "lfm_precomputed_file" and self.lfm_precomputed_file is None:
             raise ValueError("lfm_precomputed_file is required when lfm_source='lfm_precomputed_file'.")
         if self.lfm_source == "lfm_initial_inversion_file" and self.lfm_initial_inversion_file is None:
-            raise ValueError(
-                "lfm_initial_inversion_file is required when lfm_source='lfm_initial_inversion_file'."
-            )
+            raise ValueError("lfm_initial_inversion_file is required when lfm_source='lfm_initial_inversion_file'.")
         valid_wavelet_sources = {"precomputed_wavelet", "ricker_wavelet"}
         if self.wavelet_source not in valid_wavelet_sources:
             raise ValueError(

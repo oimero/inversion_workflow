@@ -23,7 +23,6 @@ import lasio
 import numpy as np
 import pandas as pd
 
-
 # Bootstrap
 
 
@@ -52,7 +51,6 @@ from enhance.prior import (  # noqa: E402
     summarize_well_resolution_prior,
 )
 from ginn_depth.data import load_lfm_depth_npz  # noqa: E402
-
 
 # CLI
 

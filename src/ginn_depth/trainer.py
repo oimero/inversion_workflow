@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -21,6 +21,7 @@ from ginn.trainer import (
     summarize_array,
     write_json,
 )
+from ginn.well_anchor import WellLogAIAnchor, disabled_well_anchor_summary, zero_well_anchor_metrics
 from ginn_depth.config import DepthGINNConfig
 from ginn_depth.data import build_dataset
 from ginn_depth.loss import GINNLoss
@@ -88,10 +89,12 @@ class Trainer:
         ).to(self.device)
 
         self.criterion = GINNLoss(lambda_l2=cfg.lambda_l2, lambda_tv=cfg.lambda_tv)
+        self.well_anchor = self._build_well_anchor()
         logger.info(
-            "Loss domain: normalized depth seismic amplitude, lambda_l2=%.3e, lambda_tv=%.3e",
+            "Loss domain: normalized depth seismic amplitude, lambda_l2=%.3e, lambda_tv=%.3e, lambda_well_log_ai=%.3e",
             self.cfg.lambda_l2,
             self.cfg.lambda_tv,
+            self.cfg.lambda_well_log_ai,
         )
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -161,10 +164,32 @@ class Trainer:
                     "ai_lfm_file": self.cfg.ai_lfm_file,
                     "vp_lfm_file": self.cfg.vp_lfm_file,
                 },
+                "well_anchor": self._well_anchor_summary(),
             },
         )
         write_json(self.run_summary_path, summary)
         logger.info("Run summary saved: %s", self.run_summary_path)
+
+    def _build_well_anchor(self) -> WellLogAIAnchor | None:
+        n_traces = int(self.geometry["n_il"]) * int(self.geometry["n_xl"])
+        return WellLogAIAnchor.build(
+            prior_file=self.cfg.well_anchor_prior_file,
+            lambda_weight=self.cfg.lambda_well_log_ai,
+            batch_size=self.cfg.well_anchor_batch_size,
+            use_prior_weight=self.cfg.well_anchor_use_prior_weight,
+            sample_domain="depth",
+            n_sample=self.depth_axis_m.size,
+            n_traces=n_traces,
+            valid_indices=self.dataset.valid_indices,
+        )
+
+    def _well_anchor_summary(self) -> dict[str, Any]:
+        if self.well_anchor is None:
+            return disabled_well_anchor_summary(
+                prior_file=self.cfg.well_anchor_prior_file,
+                lambda_weight=self.cfg.lambda_well_log_ai,
+            )
+        return self.well_anchor.summary()
 
     def _compose_impedance(
         self,
@@ -182,6 +207,16 @@ class Trainer:
         ai = safe_lfm * torch.exp(residual)
         return ai, residual
 
+    def _compute_well_anchor_loss(self, *, training: bool) -> tuple[torch.Tensor, dict[str, float]]:
+        if self.well_anchor is None:
+            return zero_well_anchor_metrics(self.device)
+        return self.well_anchor.compute_loss(
+            dataset=self.dataset,
+            device=self.device,
+            compose_impedance=self._compose_impedance,
+            training=training,
+        )
+
     def _run_epoch(self, dataloader: DataLoader, *, training: bool) -> dict[str, float]:
         self.model.train(training)
         total_loss = 0.0
@@ -191,6 +226,9 @@ class Trainer:
         total_tv_term = 0.0
         total_residual_tv = 0.0
         total_residual_mean = 0.0
+        total_well_log_ai = 0.0
+        total_well_log_ai_term = 0.0
+        total_well_anchor_traces = 0.0
         n_batches = 0
 
         context = torch.enable_grad if training else torch.no_grad
@@ -210,6 +248,9 @@ class Trainer:
                 ai, residual = self._compose_impedance(x, lfm_raw, taper_weight)
                 d_syn = self.forward_model(ai, velocity_raw, gain=dynamic_gain)
                 loss, loss_dict = self.criterion(d_syn, d_obs, loss_mask, core_mask, residual, taper_weight)
+                well_term, well_dict = self._compute_well_anchor_loss(training=training)
+                loss = loss + well_term
+                loss_dict["total"] = float(loss.detach().cpu().item())
 
                 if training:
                     self.optimizer.zero_grad()
@@ -226,12 +267,15 @@ class Trainer:
                 total_tv_term += loss_dict["tv_term"]
                 total_residual_tv += loss_dict["residual_tv"]
                 total_residual_mean += residual_mean
+                total_well_log_ai += well_dict["well_log_ai"]
+                total_well_log_ai_term += well_dict["well_log_ai_term"]
+                total_well_anchor_traces += well_dict["well_anchor_traces"]
                 n_batches += 1
 
                 if training and (batch_idx + 1) % self.cfg.log_interval == 0:
                     lr = self.optimizer.param_groups[0]["lr"]
                     logger.info(
-                        "  [Epoch %d | Batch %d/%d] loss=%.6f (mae=%.6f l2_raw=%.3e l2=%.3e tv=%.3e tv_raw=%.3e res=%.3e) lr=%.2e",
+                        "  [Epoch %d | Batch %d/%d] loss=%.6f (mae=%.6f l2_raw=%.3e l2=%.3e tv=%.3e tv_raw=%.3e res=%.3e well=%.3e) lr=%.2e",
                         self.epoch + 1,
                         batch_idx + 1,
                         len(dataloader),
@@ -242,6 +286,7 @@ class Trainer:
                         loss_dict["tv_term"],
                         loss_dict["residual_tv"],
                         residual_mean,
+                        well_dict["well_log_ai_term"],
                         lr,
                     )
 
@@ -254,6 +299,9 @@ class Trainer:
             "tv_term": total_tv_term / n_batches,
             "residual_tv": total_residual_tv / n_batches,
             "residual_mean": total_residual_mean / n_batches,
+            "well_log_ai": total_well_log_ai / n_batches,
+            "well_log_ai_term": total_well_log_ai_term / n_batches,
+            "well_anchor_traces": total_well_anchor_traces / n_batches,
         }
 
     def train_one_epoch(self) -> dict[str, float]:
@@ -313,7 +361,7 @@ class Trainer:
 
             if val_metrics is None:
                 logger.info(
-                    "Epoch %d/%d  train_loss=%.6f (mae=%.6f l2_raw=%.3e l2=%.3e tv=%.3e tv_raw=%.3e res=%.3e)  lr=%.2e  time=%.1fs",
+                    "Epoch %d/%d  train_loss=%.6f (mae=%.6f l2_raw=%.3e l2=%.3e tv=%.3e tv_raw=%.3e res=%.3e well=%.3e)  lr=%.2e  time=%.1fs",
                     epoch + 1,
                     self.cfg.epochs,
                     train_metrics["loss"],
@@ -323,6 +371,7 @@ class Trainer:
                     train_metrics["tv_term"],
                     train_metrics["residual_tv"],
                     train_metrics["residual_mean"],
+                    train_metrics["well_log_ai_term"],
                     lr,
                     elapsed,
                 )
@@ -331,7 +380,7 @@ class Trainer:
             else:
                 logger.info(
                     "Epoch %d/%d  train_loss=%.6f  val_loss=%.6f  val_mae=%.6f  val_l2=%.3e  val_l2_raw=%.3e  "
-                    "val_tv=%.3e  val_tv_raw=%.3e  val_res=%.3e  lr=%.2e  time=%.1fs",
+                    "val_tv=%.3e  val_tv_raw=%.3e  val_res=%.3e  val_well=%.3e  lr=%.2e  time=%.1fs",
                     epoch + 1,
                     self.cfg.epochs,
                     train_metrics["loss"],
@@ -342,6 +391,7 @@ class Trainer:
                     val_metrics["tv_term"],
                     val_metrics["residual_tv"],
                     val_metrics["residual_mean"],
+                    val_metrics["well_log_ai_term"],
                     lr,
                     elapsed,
                 )

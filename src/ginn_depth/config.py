@@ -21,6 +21,7 @@ _PATH_FIELDS = {
     "vp_lfm_file",
     "wavelet_file",
     "dynamic_gain_model",
+    "well_anchor_prior_file",
     "checkpoint_dir",
 }
 
@@ -102,6 +103,10 @@ class DepthGINNConfig:
     # 时应和 baseline 对照，不要只看 waveform loss。
     lambda_l2: float = 0.03  # 高频扰动 L2 正则化权重，约束阻抗尺度不要漂移。
     lambda_tv: float = 0.0  # 高频扰动 TV 正则化权重，抑制层内高频 ringing。
+    well_anchor_prior_file: Path | None = None  # 可选井分辨率先验 NPZ；启用井点 AI 强约束。
+    lambda_well_log_ai: float = 0.0  # 井旁道 log(AI) 监督权重；0 表示关闭。
+    well_anchor_batch_size: int = 0  # 每个训练 batch 额外抽取的井数；<=0 表示使用全部井。
+    well_anchor_use_prior_weight: bool = True  # 是否使用 prior 中的 well_weight 加权井约束。
     zero_residual_outside_mask: bool = True  # 是否将层外高频扰动通过 taper 平滑压回 0。
     boundary_effect_samples: int | None = None  # 为空时按子波 5% 有效半支撑自动计算。
 
@@ -177,6 +182,10 @@ class DepthGINNConfig:
             )
         if self.lambda_tv < 0.0:
             raise ValueError(f"lambda_tv must be non-negative, got {self.lambda_tv}.")
+        if self.lambda_well_log_ai < 0.0:
+            raise ValueError(f"lambda_well_log_ai must be non-negative, got {self.lambda_well_log_ai}.")
+        if self.well_anchor_batch_size < 0:
+            raise ValueError(f"well_anchor_batch_size must be non-negative, got {self.well_anchor_batch_size}.")
         if self.target_layer_min_thickness is not None and self.target_layer_min_thickness <= 0.0:
             raise ValueError(
                 f"target_layer_min_thickness must be positive when provided, got {self.target_layer_min_thickness}."
@@ -212,7 +221,7 @@ class DepthGINNConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "DepthGINNConfig":
         normalized = dict(data)
-        optional_path_fields = {"wavelet_file", "dynamic_gain_model"}
+        optional_path_fields = {"wavelet_file", "dynamic_gain_model", "well_anchor_prior_file"}
         for field_name in _PATH_FIELDS:
             if field_name not in normalized or normalized[field_name] is None:
                 continue

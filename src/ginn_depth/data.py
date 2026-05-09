@@ -467,6 +467,7 @@ class DepthSeismicTraceDataset(Dataset):
             "taper_weight": torch.from_numpy(taper_weight[np.newaxis]).float(),
             "lfm_raw": torch.from_numpy(ai_lfm_raw[np.newaxis]).float(),
             "velocity_raw": torch.from_numpy(velocity_raw[np.newaxis]).float(),
+            "flat_index": torch.tensor(int(flat_idx), dtype=torch.long),
         }
         if dynamic_gain is not None:
             item["dynamic_gain"] = torch.from_numpy(dynamic_gain[np.newaxis]).float()

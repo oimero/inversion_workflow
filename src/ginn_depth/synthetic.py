@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from enhance.prior import (
+from ginn.well_prior import (
     WellResolutionPriorBundle,
     ai_to_reflectivity,
     load_well_resolution_prior_npz,

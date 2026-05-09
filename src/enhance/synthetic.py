@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from enhance.prior import (
+from ginn.well_prior import (
     WellResolutionPriorBundle,
     edge_taper,
     fit_delta_to_base_ai_bounds,

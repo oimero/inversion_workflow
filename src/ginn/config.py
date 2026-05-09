@@ -8,6 +8,8 @@ from typing import Any, Dict, Literal, Tuple
 
 import yaml
 
+from cup.utils.io import to_json_compatible
+
 LfmSource = Literal["lfm_precomputed_file", "lfm_initial_inversion_file"]
 WaveletSource = Literal["precomputed_wavelet", "ricker_wavelet"]
 GainSource = Literal["fixed_gain", "dynamic_gain_model"]
@@ -293,16 +295,4 @@ class GINNConfig:
         return cls.from_dict(raw_data, base_dir=resolved_base_dir)
 
     def to_json_dict(self) -> Dict[str, Any]:
-        return _to_json_compatible(asdict(self))
-
-
-def _to_json_compatible(value: Any) -> Any:
-    if isinstance(value, Path):
-        return value.as_posix()
-    if isinstance(value, tuple):
-        return [_to_json_compatible(item) for item in value]
-    if isinstance(value, list):
-        return [_to_json_compatible(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _to_json_compatible(item) for key, item in value.items()}
-    return value
+        return to_json_compatible(asdict(self))

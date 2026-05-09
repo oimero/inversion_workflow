@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
+from cup.utils.io import to_json_compatible, write_json
 from enhance.config import EnhancementConfig
 from enhance.loss import EnhancementLoss, compose_enhanced_ai
 from enhance.model import DilatedResNet1D
@@ -158,7 +159,7 @@ class EnhancementTrainer:
                 "run_summary_json": self.run_summary_path,
             },
         }
-        _write_json(self.run_summary_path, payload)
+        write_json(self.run_summary_path, payload)
 
     def _run_epoch(self) -> dict[str, float]:
         self.model.train(True)
@@ -333,7 +334,7 @@ class EnhancementTrainer:
                 "training_diagnostics_json": self.training_diagnostics_path,
             },
         }
-        _write_json(self.training_diagnostics_path, payload)
+        write_json(self.training_diagnostics_path, payload)
 
     def save_checkpoint(self, filename: str | None = None) -> Path:
         if filename is None:
@@ -347,12 +348,12 @@ class EnhancementTrainer:
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "config": self.cfg.to_json_dict(),
-                "normalization": _json_compatible(self.normalization),
-                "metadata": _json_compatible(self.metadata),
+                "normalization": to_json_compatible(self.normalization),
+                "metadata": to_json_compatible(self.metadata),
             },
             path,
         )
-        _write_json(path.with_suffix(".config.json"), self.cfg.to_json_dict())
+        write_json(path.with_suffix(".config.json"), self.cfg.to_json_dict())
         logger.info("Enhancement checkpoint saved: %s", path)
         return path
 
@@ -369,27 +370,6 @@ class EnhancementTrainer:
         return enhanced_ai.cpu(), delta.cpu()
 
 
-def _json_compatible(value: Any) -> Any:
-    if isinstance(value, Path):
-        return value.as_posix()
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, torch.device):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(key): _json_compatible(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_compatible(item) for item in value]
-    return value
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    with path.open("w", encoding="utf-8") as fp:
-        json.dump(_json_compatible(payload), fp, ensure_ascii=False, indent=2)
-
-
 def _initialize_metrics_csv(path: Path) -> None:
     _initialize_csv(path, METRICS_FIELDNAMES)
 
@@ -404,7 +384,7 @@ def _initialize_csv(path: Path, fieldnames: list[str]) -> None:
 
 
 def _append_csv(path: Path, row: dict[str, Any], fieldnames: list[str]) -> None:
-    normalized = {field: _json_compatible(row.get(field, "")) for field in fieldnames}
+    normalized = {field: to_json_compatible(row.get(field, "")) for field in fieldnames}
     with path.open("a", encoding="utf-8", newline="") as fp:
         csv.DictWriter(fp, fieldnames=fieldnames).writerow(normalized)
 

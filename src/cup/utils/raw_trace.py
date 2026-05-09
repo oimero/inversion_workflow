@@ -93,6 +93,23 @@ def centered_moving_rms_axis(values: np.ndarray, window: int) -> np.ndarray:
     return out
 
 
+def centered_moving_average(values: np.ndarray, window: int) -> np.ndarray:
+    """1-D centered moving average with edge-padding, preserving sample count."""
+    if window <= 1:
+        return values.astype(np.float32, copy=False)
+    if window % 2 == 0:
+        window += 1
+    pad = window // 2
+    padded = np.pad(values.astype(np.float32), (pad, pad), mode="edge")
+    kernel = np.full((window,), 1.0 / float(window), dtype=np.float32)
+    smoothed = np.convolve(padded, kernel, mode="valid")
+    if smoothed.size != values.size:
+        raise RuntimeError(f"Moving average changed sample count: {values.size} -> {smoothed.size}.")
+    if not np.all(np.isfinite(smoothed)):
+        raise ValueError("Moving average produced non-finite values.")
+    return smoothed.astype(np.float32, copy=False)
+
+
 # ── Unit conversion ──
 
 

@@ -23,6 +23,7 @@ from ginn.data import build_dataset
 from ginn.loss import GINNLoss
 from ginn.model import DilatedResNet1D
 from ginn.physics import ForwardModel
+from cup.utils.io import to_json_compatible, write_json
 from ginn.well_anchor import WellLogAIAnchor, disabled_well_anchor_summary, zero_well_anchor_metrics
 
 logger = logging.getLogger(__name__)
@@ -62,31 +63,6 @@ METRICS_FIELDNAMES = [
 ]
 
 
-def _json_compatible(value: Any) -> Any:
-    if isinstance(value, Path):
-        return value.as_posix()
-    if isinstance(value, np.ndarray):
-        if value.ndim == 0:
-            return _json_compatible(value.item())
-        return [_json_compatible(item) for item in value.tolist()]
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, torch.device):
-        return str(value)
-    if isinstance(value, tuple):
-        return [_json_compatible(item) for item in value]
-    if isinstance(value, list):
-        return [_json_compatible(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): _json_compatible(item) for key, item in value.items()}
-    return value
-
-
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    with path.open("w", encoding="utf-8") as fp:
-        json.dump(_json_compatible(payload), fp, ensure_ascii=False, indent=2)
-
-
 def initialize_metrics_csv(path: Path) -> None:
     if path.exists():
         logger.info("Metrics CSV already exists, preserving: %s", path)
@@ -97,7 +73,7 @@ def initialize_metrics_csv(path: Path) -> None:
 
 
 def append_metrics_csv(path: Path, row: dict[str, Any]) -> None:
-    normalized = {field: _json_compatible(row.get(field, "")) for field in METRICS_FIELDNAMES}
+    normalized = {field: to_json_compatible(row.get(field, "")) for field in METRICS_FIELDNAMES}
     with path.open("a", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=METRICS_FIELDNAMES)
         writer.writerow(normalized)

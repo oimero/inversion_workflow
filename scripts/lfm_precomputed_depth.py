@@ -6,7 +6,7 @@ low-pass filtering. Outputs NPZ and SEG-Y volumes.
 
 Usage::
 
-    python scripts/lfm_depth.py
+    python scripts/lfm_precomputed_depth.py
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="Output directory. Defaults to scripts/output/lfm_depth_<timestamp>.",
+        help="Output directory. Defaults to scripts/output/lfm_precomputed_depth_<timestamp>.",
     )
     return parser.parse_args()
 
@@ -468,9 +468,9 @@ def main() -> None:
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
     data_root_str = cfg.get("data_root", "data")
 
-    script_cfg = cfg.get("lfm_depth", {})
+    script_cfg = cfg.get("lfm_precomputed_depth", {})
     if not script_cfg:
-        raise ValueError("Missing 'lfm_depth' section in config.")
+        raise ValueError("Missing 'lfm_precomputed_depth' section in config.")
 
     # ── Resolve inputs ──
 
@@ -499,7 +499,7 @@ def main() -> None:
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_root = REPO_ROOT / cfg.get("output_root", "scripts/output")
-        output_dir = output_root / f"lfm_depth_{timestamp}"
+        output_dir = output_root / f"lfm_precomputed_depth_{timestamp}"
     else:
         output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
 
@@ -513,7 +513,7 @@ def main() -> None:
     ai_npz = output_dir / "ai_lfm_depth.npz"
     ai_segy = output_dir / "ai_lfm_depth.segy"
 
-    print("=== LFM Depth ===")
+    print("=== LFM Precomputed Depth ===")
     print(f"LAS dir: {las_dir}")
     print(f"Seismic: {seismic_file}")
     print(f"Train config: {train_config_file}")
@@ -577,7 +577,9 @@ def main() -> None:
     print(f"\nVp wells: {[w.well_name for w in vp_wells]}")
     print(f"AI wells: {[w.well_name for w in ai_wells]}")
 
-    build_params = script_cfg["build_params"]
+    build_params = train_config.get("lfm_precomputed")
+    if not build_params:
+        raise ValueError("Missing 'lfm_precomputed' section in train config.")
 
     vp_result = build_lfm_depth_model(
         target_layer=target_layer,

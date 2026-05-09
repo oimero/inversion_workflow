@@ -154,7 +154,7 @@ def _json_scalar_to_dict(value: object) -> dict[str, Any]:
 
 
 def load_lfm_depth_npz(path: str | Path, *, volume_key: str = "volume") -> DepthLfmVolume:
-    """Load an ``lfm_depth.py`` result saved as ``.npz``."""
+    """Load an ``lfm_precomputed_depth.py`` result saved as ``.npz``."""
     path = Path(path)
     with np.load(path, allow_pickle=False) as data:
         required = {volume_key, "ilines", "xlines", "samples"}

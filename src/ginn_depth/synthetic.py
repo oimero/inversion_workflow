@@ -20,6 +20,7 @@ from ginn.well_prior import (
     load_well_resolution_prior_npz,
     validate_ai_bounds,
 )
+from cup.utils.raw_trace import centered_moving_average
 from enhance.synthetic import (
     downsample_highres_to_samples,
     edge_taper,
@@ -28,7 +29,6 @@ from enhance.synthetic import (
     highpass_log_ai_residual,
     make_highres_axis,
     markov_thin_bed_packet,
-    moving_average,
     random_reflectivity_in_taper,
     reflectivity_to_log_ai,
     sample_well_patch_window,
@@ -592,7 +592,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         amp_hi = max(amp_min, amp_max)
         abs_patch = np.abs(source_hi)
         if np.any(np.isfinite(abs_patch)) and float(np.max(abs_patch)) > 0.0:
-            envelope = moving_average(abs_patch, max(3, (main_lobe * factor) // 2))
+            envelope = centered_moving_average(abs_patch, max(3, (main_lobe * factor) // 2))
             env_max = float(np.max(envelope))
             if env_max > 0.0 and np.isfinite(env_max):
                 envelope = envelope / env_max
@@ -757,7 +757,7 @@ def _derive_velocity(
             vp = vp_blend_alpha * vp_from_ai + (1.0 - vp_blend_alpha) * base_vp.astype(np.float64)
         else:
             vp = vp_from_ai
-        vp = moving_average(vp.astype(np.float32), vp_smooth_samples)
+        vp = centered_moving_average(vp.astype(np.float32), vp_smooth_samples)
 
     vp = np.clip(vp, vp_clip_min, vp_clip_max)
     return np.maximum(vp, 1.0).astype(np.float32, copy=False)

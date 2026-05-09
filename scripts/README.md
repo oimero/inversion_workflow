@@ -7,7 +7,7 @@ vertical_well_auto_tie_depth.py
         ↓  子波 CSV
 wavelet_batch_synthetic_depth.py
         ↓  shifted LAS + 批量标定指标 CSV
-lfm_depth.py  ───────────────────────────────┐
+lfm_precomputed_depth.py  ──────────────────┐
         ↓  AI LFM + Vp LFM                  │
 dynamic_gain_attr_fitting_depth.py  ←───────┤  共用 shifted LAS 的井旁地震道
         ↓  增益拟合参数 CSV                 │
@@ -62,19 +62,19 @@ ginn_inversion_depth.py
 
 ---
 
-### 3. lfm_depth.py
+### 3. lfm_precomputed_depth.py
 
-**构建深度域低频模型。**
+**构建预计算深度域低频模型。**
 
 | 配置来源 | 说明 |
 |---|---|
-| `common_depth.yaml` → `lfm_depth` | LAS 参数、LFM 构建参数（变差函数、滤波等） |
+| `common_depth.yaml` → `lfm_precomputed_depth` | LAS 参数、GINN 训练配置路径 |
 | `common_depth.yaml` 共享节 | `data_root`、`output_root`、`seismic_depth.file`、`horizons` |
 
 | 外部输入 | 说明 |
 |---|---|
 | 上一步的 `shifted_las/*.las` | 深度偏移后的 LAS（Vp 单位已变为 m/s） |
-| `train_config` | `experiments/ginn_depth/train.yaml`，仅读取其中的目的层 QC 参数 |
+| `train_config` | `experiments/ginn_depth/train.yaml`，读取目的层 QC 参数和 `lfm_precomputed` 构建参数 |
 
 输出：`ai_lfm_depth.npz` + `vp_lfm_depth.npz`。
 

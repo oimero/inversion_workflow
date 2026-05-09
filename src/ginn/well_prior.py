@@ -9,6 +9,9 @@ from typing import Any
 
 import numpy as np
 
+from cup.utils.io import to_json_compatible
+from cup.utils.raw_trace import centered_moving_average
+
 SCHEMA_VERSION = "ginn_well_resolution_prior_v1"
 VALID_SAMPLE_DOMAINS = {"time", "depth"}
 VALID_SAMPLE_UNITS = {"s", "m"}
@@ -118,8 +121,8 @@ def save_well_resolution_prior_npz(path: str | Path, bundle: WellResolutionPrior
         well_names=np.asarray(bundle.well_names).astype(str),
         inline=np.asarray(bundle.inline, dtype=np.float32),
         xline=np.asarray(bundle.xline, dtype=np.float32),
-        summary_json=np.asarray(json.dumps(_json_compatible(bundle.summary), ensure_ascii=False)),
-        metadata_json=np.asarray(json.dumps(_json_compatible(bundle.metadata), ensure_ascii=False)),
+        summary_json=np.asarray(json.dumps(to_json_compatible(bundle.summary), ensure_ascii=False)),
+        metadata_json=np.asarray(json.dumps(to_json_compatible(bundle.metadata), ensure_ascii=False)),
     )
     return path
 
@@ -305,7 +308,7 @@ def highpass_log_ai_residual(log_ai_raw: np.ndarray, *, window: int, max_abs: fl
     if np.any(~np.isfinite(values)):
         raise ValueError("log_ai_raw contains non-finite values.")
 
-    low = moving_average(values, int(window))
+    low = centered_moving_average(values, int(window))
     residual = values - low
     scale_ref = float(np.percentile(np.abs(residual), 99.0)) if residual.size else 0.0
     if scale_ref > max_abs:
@@ -392,23 +395,6 @@ def validate_ai_bounds(ai_min: float, ai_max: float) -> None:
     """Validate positive increasing AI bounds."""
     if ai_min <= 0.0 or ai_max <= ai_min:
         raise ValueError(f"Invalid AI bounds: ai_min={ai_min}, ai_max={ai_max}.")
-
-
-def moving_average(values: np.ndarray, window: int) -> np.ndarray:
-    """Centered moving average that preserves sample count."""
-    if window <= 1:
-        return values.astype(np.float32, copy=False)
-    if window % 2 == 0:
-        window += 1
-    pad = window // 2
-    padded = np.pad(values.astype(np.float32), (pad, pad), mode="edge")
-    kernel = np.full((window,), 1.0 / float(window), dtype=np.float32)
-    smoothed = np.convolve(padded, kernel, mode="valid")
-    if smoothed.size != values.size:
-        raise RuntimeError(f"Moving average changed sample count: {values.size} -> {smoothed.size}.")
-    if not np.all(np.isfinite(smoothed)):
-        raise ValueError("Moving average produced non-finite values.")
-    return smoothed.astype(np.float32, copy=False)
 
 
 def _event_density_by_well(
@@ -600,18 +586,3 @@ def _json_to_dict(value: object) -> dict[str, Any]:
     return parsed
 
 
-def _json_compatible(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(k): _json_compatible(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_compatible(v) for v in value]
-    if isinstance(value, np.ndarray):
-        return _json_compatible(value.tolist())
-    if isinstance(value, (np.floating, float)):
-        value = float(value)
-        return value if np.isfinite(value) else None
-    if isinstance(value, (np.integer, int)):
-        return int(value)
-    if isinstance(value, (np.bool_, bool)):
-        return bool(value)
-    return value

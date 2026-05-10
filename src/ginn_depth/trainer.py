@@ -182,6 +182,7 @@ class Trainer:
             n_sample=self.depth_axis_m.size,
             n_traces=n_traces,
             valid_indices=self.dataset.valid_indices,
+            dataset=self.dataset,
             neighborhood_radius=self.cfg.well_anchor_neighborhood_radius,
             geometry=self.geometry,
             lowpass_cutoff_wavelength_m=self.dataset_bundle.lfm_metadata.get("filter_cutoff_wavelength_m"),

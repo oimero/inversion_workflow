@@ -364,6 +364,7 @@ class Trainer:
             n_sample=int(self.geometry["n_sample"]),
             n_traces=n_traces,
             valid_indices=self.dataset.valid_indices,
+            dataset=self.dataset,
             neighborhood_radius=self.cfg.well_anchor_neighborhood_radius,
             geometry=self.geometry,
             lowpass_cutoff_hz=self.dataset_bundle.lfm_metadata.get("filter_cutoff_hz"),

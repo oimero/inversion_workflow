@@ -78,6 +78,7 @@ class DatasetBundle:
     wavelet: np.ndarray
     geometry: Dict[str, Any]
     split_metadata: Dict[str, Any]
+    lfm_metadata: Dict[str, Any]
 
 
 def resolve_wavelet_from_config(cfg: GINNConfig, geometry: Dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
@@ -461,12 +462,12 @@ class SeismicTraceDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         flat_idx = self._valid_indices[idx]
 
-        seis = self._seismic_flat[flat_idx].copy()  # (n_sample,)
-        lfm = self._lfm_flat[flat_idx].copy()  # (n_sample,)
-        core_mask = self._mask_flat[flat_idx].copy()  # (n_sample,)
-        loss_mask = self._loss_mask_flat[flat_idx].copy()  # (n_sample,)
-        taper_weight = self._taper_flat[flat_idx].copy()  # (n_sample,)
-        dynamic_gain = self._dynamic_gain_flat[flat_idx].copy() if self._dynamic_gain_flat is not None else None
+        seis = self._seismic_flat[flat_idx]  # (n_sample,)
+        lfm = self._lfm_flat[flat_idx]  # (n_sample,)
+        core_mask = self._mask_flat[flat_idx]  # (n_sample,)
+        loss_mask = self._loss_mask_flat[flat_idx]  # (n_sample,)
+        taper_weight = self._taper_flat[flat_idx]  # (n_sample,)
+        dynamic_gain = self._dynamic_gain_flat[flat_idx] if self._dynamic_gain_flat is not None else None
 
         # 保留 LFM 原始量纲用于物理正演
         lfm_raw = lfm.copy()
@@ -550,6 +551,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     tl_outlier_min_neighbor = 2
     top_horizon_file = None
     bot_horizon_file = None
+    lfm_meta: Dict[str, Any] = {}
     lfm_path = Path(str(cfg.ai_lfm_file))
     if lfm_path.suffix == ".npz":
         with np.load(lfm_path, allow_pickle=False) as lfm_data:
@@ -743,4 +745,5 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         wavelet=wavelet,
         geometry=geometry,
         split_metadata=split_metadata,
+        lfm_metadata=lfm_meta,
     )

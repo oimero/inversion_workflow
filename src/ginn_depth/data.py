@@ -143,8 +143,6 @@ def _json_scalar_to_dict(value: object) -> dict[str, Any]:
             value = value.item()
         else:
             return {}
-    if value is None:
-        return {}
     text = str(value)
     if not text:
         return {}
@@ -436,13 +434,13 @@ class DepthSeismicTraceDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         flat_idx = self._valid_indices[idx]
-        seis = self._seismic_flat[flat_idx].copy()
-        ai_lfm = self._ai_lfm_flat[flat_idx].copy()
-        vp = self._vp_flat[flat_idx].copy()
-        core_mask = self._mask_flat[flat_idx].copy()
-        loss_mask = self._loss_mask_flat[flat_idx].copy()
-        taper_weight = self._taper_flat[flat_idx].copy()
-        dynamic_gain = self._dynamic_gain_flat[flat_idx].copy() if self._dynamic_gain_flat is not None else None
+        seis = self._seismic_flat[flat_idx]
+        ai_lfm = self._ai_lfm_flat[flat_idx]
+        vp = self._vp_flat[flat_idx]
+        core_mask = self._mask_flat[flat_idx]
+        loss_mask = self._loss_mask_flat[flat_idx]
+        taper_weight = self._taper_flat[flat_idx]
+        dynamic_gain = self._dynamic_gain_flat[flat_idx] if self._dynamic_gain_flat is not None else None
 
         ai_lfm_raw = ai_lfm.copy()
         velocity_raw = vp.copy()

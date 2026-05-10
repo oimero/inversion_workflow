@@ -222,6 +222,7 @@ class Trainer:
         # ── 数据 ──
         logger.info("Building dataset...")
         dataset_bundle = build_dataset(cfg)
+        self.dataset_bundle = dataset_bundle
         self.dataset = dataset_bundle.inference_dataset
         self.train_dataset = dataset_bundle.train_dataset
         self.val_dataset = dataset_bundle.val_dataset
@@ -365,6 +366,8 @@ class Trainer:
             valid_indices=self.dataset.valid_indices,
             neighborhood_radius=self.cfg.well_anchor_neighborhood_radius,
             geometry=self.geometry,
+            lowpass_cutoff_hz=self.dataset_bundle.lfm_metadata.get("filter_cutoff_hz"),
+            lowpass_filter_order=self.dataset_bundle.lfm_metadata.get("filter_order", 6),
         )
 
     def _well_anchor_summary(self) -> dict[str, Any]:

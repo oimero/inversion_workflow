@@ -151,6 +151,18 @@ class DepthGINNConfig:
             )
         if self.wavelet_source == "precomputed_wavelet" and self.wavelet_file is None:
             raise ValueError("wavelet_file is required when wavelet_source='precomputed_wavelet'.")
+        valid_validation_modes = {"none", "spatial_block"}
+        if self.validation_split_mode not in valid_validation_modes:
+            raise ValueError(
+                f"Unsupported validation_split_mode={self.validation_split_mode!r}, "
+                f"expected one of {sorted(valid_validation_modes)}"
+            )
+        valid_validation_anchors = {"maxmax", "maxmin", "minmax", "minmin", "center"}
+        if self.validation_block_anchor not in valid_validation_anchors:
+            raise ValueError(
+                f"Unsupported validation_block_anchor={self.validation_block_anchor!r}, "
+                f"expected one of {sorted(valid_validation_anchors)}"
+            )
         valid_gain_sources = {"fixed_gain", "dynamic_gain_model"}
         if self.gain_source not in valid_gain_sources:
             raise ValueError(

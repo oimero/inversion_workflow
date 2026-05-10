@@ -41,6 +41,7 @@ class Trainer:
 
         logger.info("Building depth-domain dataset...")
         dataset_bundle = build_dataset(cfg)
+        self.dataset_bundle = dataset_bundle
         self.dataset = dataset_bundle.inference_dataset
         self.train_dataset = dataset_bundle.train_dataset
         self.val_dataset = dataset_bundle.val_dataset

@@ -46,6 +46,7 @@ class WellLogAIAnchor:
     neighbor_dataset_indices: np.ndarray | None = None  # (n_wells, max_nbr), -1 padded
     neighbor_weight: np.ndarray | None = None            # (n_wells, max_nbr)
     lowpass_cutoff_wavelength_m: float | None = None     # set when lowpass is active
+    lowpass_cutoff_hz: float | None = None               # time-domain variant
 
     @classmethod
     def build(
@@ -62,6 +63,7 @@ class WellLogAIAnchor:
         neighborhood_radius: int = 0,
         geometry: dict | None = None,
         lowpass_cutoff_wavelength_m: float | None = None,
+        lowpass_cutoff_hz: float | None = None,
         lowpass_filter_order: int = 6,
     ) -> "WellLogAIAnchor | None":
         if lambda_weight <= 0.0:
@@ -99,12 +101,19 @@ class WellLogAIAnchor:
 
         # ── lowpass filter target AI (before log) ──
         actual_cutoff: float | None = None
+        cutoff_is_wavelength: bool = True
         if lowpass_cutoff_wavelength_m is not None and lowpass_cutoff_wavelength_m > 0.0:
             actual_cutoff = float(lowpass_cutoff_wavelength_m)
+            cutoff_is_wavelength = True
+        elif lowpass_cutoff_hz is not None and lowpass_cutoff_hz > 0.0:
+            actual_cutoff = float(lowpass_cutoff_hz)
+            cutoff_is_wavelength = False
+
+        if actual_cutoff is not None:
             dz = float(np.median(np.diff(prior.samples)))
             if dz > 0.0:
                 fs = 1.0 / dz
-                highcut = 1.0 / actual_cutoff
+                highcut = (1.0 / actual_cutoff) if cutoff_is_wavelength else actual_cutoff
                 order = int(lowpass_filter_order)
                 pad = max(1, int(np.ceil(3.0 * order * dz)))
                 for row in range(target_ai.shape[0]):
@@ -118,9 +127,10 @@ class WellLogAIAnchor:
                         padded, highcut, fs, order=order, zero_phase=True,
                     )
                     target_ai[row] = filtered[pad:pad + values.size].astype(np.float32)
+                cutoff_label = f"{actual_cutoff:.0f} m" if cutoff_is_wavelength else f"{actual_cutoff:.1f} Hz"
                 logger.info(
-                    "Well anchor lowpass: cutoff=%.0f m (%.4f cycles/m), order=%d, pad=%d samples",
-                    actual_cutoff, highcut, order, pad,
+                    "Well anchor lowpass: cutoff=%s (%.4f cycles/unit), order=%d, pad=%d samples",
+                    cutoff_label, highcut, order, pad,
                 )
 
         # ── build log-AI target ──
@@ -196,7 +206,8 @@ class WellLogAIAnchor:
             neighborhood_radius=int(neighborhood_radius),
             neighbor_dataset_indices=nbr_dataset_indices,
             neighbor_weight=nbr_weight,
-            lowpass_cutoff_wavelength_m=actual_cutoff,
+            lowpass_cutoff_wavelength_m=actual_cutoff if cutoff_is_wavelength else None,
+            lowpass_cutoff_hz=actual_cutoff if not cutoff_is_wavelength else None,
         )
         logger.info(
             "Well log-AI anchor enabled: wells=%d, lambda=%.3e, prior=%s",
@@ -218,6 +229,7 @@ class WellLogAIAnchor:
             "flat_indices": self.flat_indices.tolist(),
             "neighborhood_radius": self.neighborhood_radius,
             "lowpass_cutoff_wavelength_m": self.lowpass_cutoff_wavelength_m,
+            "lowpass_cutoff_hz": self.lowpass_cutoff_hz,
         }
         if self.neighbor_weight is not None:
             result["max_neighbors"] = int(self.neighbor_weight.shape[1])

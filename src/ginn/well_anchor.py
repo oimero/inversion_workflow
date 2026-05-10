@@ -152,10 +152,13 @@ class WellLogAIAnchor:
                 raise ValueError("geometry dict is required when neighborhood_radius > 0.")
             n_il = int(geometry["n_il"])
             n_xl = int(geometry["n_xl"])
+            il_step = float(geometry.get("inline_step", 1.0))
+            xl_step = float(geometry.get("xline_step", 1.0))
+            phys_radius = float(neighborhood_radius) * max(il_step, xl_step)
+            sigma = max(phys_radius / 2.0, 0.5 * max(il_step, xl_step))
             max_nbr = (2 * neighborhood_radius + 1) ** 2
             all_nbr_idx = np.full((n_wells, max_nbr), -1, dtype=np.int64)
             all_nbr_w = np.zeros((n_wells, max_nbr), dtype=np.float32)
-            sigma = max(float(neighborhood_radius) / 2.0, 0.5)
 
             for w in range(n_wells):
                 flat_ref = int(prior.flat_indices[rows[w]])
@@ -164,8 +167,8 @@ class WellLogAIAnchor:
                 candidates: list[tuple[float, int, float]] = []
                 for dil in range(-neighborhood_radius, neighborhood_radius + 1):
                     for dxl in range(-neighborhood_radius, neighborhood_radius + 1):
-                        dist = math.hypot(dil, dxl)
-                        if dist > neighborhood_radius + 1e-8:
+                        dist = math.hypot(dil * il_step, dxl * xl_step)
+                        if dist > phys_radius + 1e-8:
                             continue
                         il = il_ref + dil
                         xl = xl_ref + dxl
@@ -186,8 +189,8 @@ class WellLogAIAnchor:
             nbr_dataset_indices = all_nbr_idx[:, :actual_max]
             nbr_weight = all_nbr_w[:, :actual_max]
             logger.info(
-                "Well anchor neighbourhood: radius=%d, sigma=%.1f, max_neighbors=%d",
-                neighborhood_radius, sigma, actual_max,
+                "Well anchor neighbourhood: radius=%d grid (%.0f×%.0f m physical), sigma=%.1f m, max_neighbors=%d",
+                neighborhood_radius, phys_radius, phys_radius, sigma, actual_max,
             )
         else:
             nbr_dataset_indices = dataset_indices_arr.reshape(-1, 1)

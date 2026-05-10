@@ -48,6 +48,7 @@ from cup.utils.io import (  # noqa: E402
 )
 from ginn_depth.config import DepthGINNConfig  # noqa: E402
 from ginn_depth.trainer import Trainer  # noqa: E402
+from wtie.processing.spectral import apply_butter_lowpass_filter  # noqa: E402
 
 # =============================================================================
 # CLI
@@ -417,6 +418,26 @@ def main() -> None:
                 ref_depth = ref_depth[unique_idx]
                 ref_ai = ref_ai[unique_idx]
 
+                # 低通滤波参考 AI（与训练井约束一致，只比较低频基线）
+                lfm_meta = trainer.dataset_bundle.lfm_metadata
+                lp_cutoff = float(lfm_meta.get("filter_cutoff_wavelength_m", 250.0))
+                lp_order = int(lfm_meta.get("filter_order", 6))
+                ref_ai_lp = ref_ai.copy()
+                if lp_cutoff > 0.0:
+                    dz_las = float(np.median(np.diff(ref_depth)))
+                    if dz_las > 0.0:
+                        fs_las = 1.0 / dz_las
+                        highcut = 1.0 / lp_cutoff
+                        pad_las = max(1, int(np.ceil(3.0 * lp_order * dz_las)))
+                        valid_lp = np.isfinite(ref_ai) & (ref_ai > 0.0)
+                        if int(valid_lp.sum()) >= 2:
+                            values = ref_ai.astype(np.float64)
+                            padded = np.pad(values, (pad_las, pad_las), mode="reflect")
+                            filtered = apply_butter_lowpass_filter(
+                                padded, highcut, fs_las, order=lp_order, zero_phase=True,
+                            )
+                            ref_ai_lp = filtered[pad_las:pad_las + values.size].astype(np.float32)
+
                 pred_trace = _bilinear_trace_from_volume(
                     pred_volume,
                     survey_ctx,
@@ -424,18 +445,19 @@ def main() -> None:
                     float(head["Surface Y"]),
                 )
                 pred_ai = np.interp(ref_depth, sample_axis_m, pred_trace, left=np.nan, right=np.nan)
-                valid = np.isfinite(pred_ai) & np.isfinite(ref_ai)
+                valid = np.isfinite(pred_ai) & np.isfinite(ref_ai_lp)
                 if not np.any(valid):
                     raise ValueError("no overlapping finite samples")
 
-                diff = pred_ai[valid] - ref_ai[valid]
-                corr = float(np.corrcoef(pred_ai[valid], ref_ai[valid])[0, 1]) if int(valid.sum()) > 1 else np.nan
+                diff = pred_ai[valid] - ref_ai_lp[valid]
+                corr = float(np.corrcoef(pred_ai[valid], ref_ai_lp[valid])[0, 1]) if int(valid.sum()) > 1 else np.nan
                 safe_name = sanitize_filename(str(head["Name"]))
                 trace_qc_path = output_dirs["well_qc_traces"] / f"well_qc_{safe_name}.csv"
                 pd.DataFrame(
                     {
                         "depth_m": ref_depth[valid],
                         "shifted_las_ai": ref_ai[valid],
+                        "shifted_las_ai_lowpass": ref_ai_lp[valid],
                         "predicted_ai": pred_ai[valid],
                         "diff_ai": diff,
                     }
@@ -443,8 +465,9 @@ def main() -> None:
 
                 qc_plot_path = output_dirs["well_qc_figures"] / f"well_qc_{safe_name}.png"
                 fig, ax = plt.subplots(figsize=(5, 10), constrained_layout=True)
-                ax.plot(ref_ai[valid], ref_depth[valid], label="Shifted LAS AI", lw=2)
-                ax.plot(pred_ai[valid], ref_depth[valid], label="GINN-Depth predicted AI", lw=2)
+                ax.plot(ref_ai[valid], ref_depth[valid], label="Shifted LAS AI (raw)", lw=1, alpha=0.4, color="gray")
+                ax.plot(ref_ai_lp[valid], ref_depth[valid], label=f"Shifted LAS AI (LP {lp_cutoff:.0f}m)", lw=2, color="blue")
+                ax.plot(pred_ai[valid], ref_depth[valid], label="GINN-Depth predicted AI", lw=2, color="red")
                 ax.invert_yaxis()
                 ax.set_xlabel("AI")
                 ax.set_ylabel("Depth (m)")

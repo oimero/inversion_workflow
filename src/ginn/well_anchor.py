@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 ComposeImpedanceFn = Callable[[Tensor, Tensor, Tensor | None], tuple[Tensor, Tensor]]
 
 
+def _as_tensor(value: np.ndarray | Tensor) -> Tensor:
+    if isinstance(value, Tensor):
+        return value
+    return torch.from_numpy(value)
+
+
 @dataclass
 class WellLogAIAnchor:
     """Well log-AI supervision sampled on a GINN trace axis.
@@ -200,9 +206,9 @@ class WellLogAIAnchor:
                 weights_w = []
                 for _, ds_idx, dw in candidates:
                     item = dataset[int(ds_idx)]  # type: ignore[index]
-                    inputs_w.append(torch.from_numpy(item["input"]))
-                    lfm_w.append(torch.from_numpy(item["lfm_raw"]))
-                    taper_w.append(torch.from_numpy(item["taper_weight"]))
+                    inputs_w.append(_as_tensor(item["input"]))
+                    lfm_w.append(_as_tensor(item["lfm_raw"]))
+                    taper_w.append(_as_tensor(item["taper_weight"]))
                     weights_w.append(dw)
 
                 if inputs_w:
@@ -233,15 +239,12 @@ class WellLogAIAnchor:
             for w in range(n_wells):
                 ds_idx = dataset_indices_arr[w]
                 item = dataset[int(ds_idx)]
-                neighbor_inputs = torch.cat(
-                    [neighbor_inputs, torch.from_numpy(item["input"]).unsqueeze(0)]
-                ) if neighbor_inputs.numel() > 0 else torch.from_numpy(item["input"]).unsqueeze(0)
-                neighbor_lfm_raw = torch.cat(
-                    [neighbor_lfm_raw, torch.from_numpy(item["lfm_raw"]).unsqueeze(0)]
-                ) if neighbor_lfm_raw.numel() > 0 else torch.from_numpy(item["lfm_raw"]).unsqueeze(0)
-                neighbor_taper = torch.cat(
-                    [neighbor_taper, torch.from_numpy(item["taper_weight"]).unsqueeze(0)]
-                ) if neighbor_taper.numel() > 0 else torch.from_numpy(item["taper_weight"]).unsqueeze(0)
+                inp = _as_tensor(item["input"]).unsqueeze(0)
+                lfm = _as_tensor(item["lfm_raw"]).unsqueeze(0)
+                tap = _as_tensor(item["taper_weight"]).unsqueeze(0)
+                neighbor_inputs = torch.cat([neighbor_inputs, inp]) if neighbor_inputs.numel() > 0 else inp
+                neighbor_lfm_raw = torch.cat([neighbor_lfm_raw, lfm]) if neighbor_lfm_raw.numel() > 0 else lfm
+                neighbor_taper = torch.cat([neighbor_taper, tap]) if neighbor_taper.numel() > 0 else tap
                 neighbor_ranges.append((w, w + 1))
             neighbor_weights_flat = torch.ones(n_wells, dtype=torch.float32)
 

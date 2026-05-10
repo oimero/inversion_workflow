@@ -176,7 +176,7 @@ def main() -> None:
         root=source_batch_dir,
     )
     ai_lfm_file = resolve_relative_path(str(script_cfg["ai_lfm_file"]), root=REPO_ROOT)
-    seismic_file = resolve_relative_path(str(cfg["seismic_depth"]["file"]), root=data_root)
+    seismic_file = resolve_relative_path(str(cfg["segy"]["file"]), root=data_root)
     well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
 
     for path in [seismic_file, well_heads_file, shifted_las_dir, metrics_path, ai_lfm_file]:

@@ -540,44 +540,50 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
             f"volume={(n_il, n_xl, n_sample)}, geometry={(geometry_n_il, geometry_n_xl, geometry_n_sample)}"
         )
 
+    logger.info("Loading precomputed low-frequency model from %s...", cfg.ai_lfm_file)
+    lfm = load_lowfreq_model(cfg.ai_lfm_file)  # type: ignore
+
+    # ── read horizon files + target-layer QC from LFM NPZ metadata ──
+    tl_min_thickness = None
+    tl_nearest_limit = None
+    tl_outlier_threshold = None
+    tl_outlier_min_neighbor = 2
+    top_horizon_file = None
+    bot_horizon_file = None
+    lfm_path = Path(str(cfg.ai_lfm_file))
+    if lfm_path.suffix == ".npz":
+        with np.load(lfm_path, allow_pickle=False) as lfm_data:
+            if "metadata_json" in lfm_data:
+                import json
+                lfm_meta = json.loads(str(lfm_data["metadata_json"]))
+                tl_meta = lfm_meta.get("target_layer", {})
+                tl_min_thickness = tl_meta.get("min_thickness")
+                tl_nearest_limit = tl_meta.get("nearest_distance_limit")
+                tl_outlier_threshold = tl_meta.get("outlier_threshold")
+                tl_outlier_min_neighbor = tl_meta.get("outlier_min_neighbor_count", 2)
+                hz_list = lfm_meta.get("horizons", [])
+                if len(hz_list) >= 2:
+                    top_horizon_file = hz_list[0]["file"]
+                    bot_horizon_file = hz_list[-1]["file"]
+    if top_horizon_file is None or bot_horizon_file is None:
+        raise ValueError("AI LFM NPZ metadata must contain at least two sorted horizons.")
+
     logger.info("Loading raw top/bottom interpretation horizons...")
-    top_df_raw = import_interpretation_petrel(cfg.top_horizon_file)
-    bot_df_raw = import_interpretation_petrel(cfg.bot_horizon_file)
+    top_df_raw = import_interpretation_petrel(top_horizon_file)
+    bot_df_raw = import_interpretation_petrel(bot_horizon_file)
 
     logger.info("Building target layer from raw interpretations...")
     target_layer = TargetLayer(
         raw_horizon_dfs={"top": top_df_raw, "bottom": bot_df_raw},
         geometry=geometry,
         horizon_names=["top", "bottom"],
-        min_thickness=cfg.target_layer_min_thickness,
-        nearest_distance_limit=cfg.target_layer_nearest_distance_limit,
-        outlier_threshold=cfg.target_layer_outlier_threshold,
-        outlier_min_neighbor_count=cfg.target_layer_outlier_min_neighbor_count,
+        min_thickness=tl_min_thickness,
+        nearest_distance_limit=tl_nearest_limit,
+        outlier_threshold=tl_outlier_threshold,
+        outlier_min_neighbor_count=tl_outlier_min_neighbor,
     )
     train_mask = target_layer.to_mask(use_valid_control_mask=True)
     inference_mask = target_layer.to_mask(use_valid_control_mask=False)
-
-    if cfg.lfm_source == "lfm_precomputed_file":
-        logger.info("Loading precomputed low-frequency model from %s...", cfg.lfm_precomputed_file)
-        lfm = load_lowfreq_model(cfg.lfm_precomputed_file)  # type: ignore
-    elif cfg.lfm_source == "lfm_initial_inversion_file":
-        logger.info("Loading inversion volume...")
-        inversion = import_seismic(
-            cfg.lfm_initial_inversion_file,  # type: ignore
-            seismic_type="segy",
-        )
-        if inversion.shape != seismic.shape:
-            raise ValueError(f"Inversion shape {inversion.shape} does not match seismic shape {seismic.shape}.")
-
-        logger.info("Generating low-frequency model from inversion volume...")
-        lfm = make_lowfreq_model(
-            inversion,
-            dt_s=cfg.lfm_filter_dt,
-            cutoff_hz=cfg.lfm_cutoff_hz,
-            order=cfg.lfm_filter_order,
-        )
-    else:
-        raise ValueError(f"Unsupported lfm_source: {cfg.lfm_source}")
 
     if train_mask.shape != seismic.shape:
         raise ValueError(f"Training mask shape {train_mask.shape} does not match seismic shape {seismic.shape}.")

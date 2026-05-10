@@ -17,8 +17,6 @@ ValidationBlockAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"
 
 _PATH_FIELDS = {
     "seismic_file",
-    "top_horizon_file",
-    "bot_horizon_file",
     "ai_lfm_file",
     "vp_lfm_file",
     "wavelet_file",
@@ -40,19 +38,10 @@ class DepthGINNConfig:
     segy_istep: int = 1  # inline 抽样步长。
     segy_xstep: int = 1  # xline 抽样步长。
 
-    # ── 目的层 ────────────────────────────────────────────────
-    # 目的层顶/底界决定 waveform loss 和 residual 自由度的有效区域。下面几个
-    # 可选 QC 参数用于防御层位异常；除非层位诊断显示薄层、跳点或孤立异常，
-    # 否则建议保持默认。
-    top_horizon_file: Path = Path("your_top_horizon")  # 目的层顶界解释面路径。
-    bot_horizon_file: Path = Path("your_bottom_horizon")  # 目的层底界解释面路径。
-    target_layer_min_thickness: float | None = None  # 相邻层位最小厚度；为空时使用地震样本间距。
-    target_layer_nearest_distance_limit: float | None = None  # 层位解释 nearest 插值的最远距离；为空时不限制。
-    target_layer_outlier_threshold: float | None = 30  # 孤立层位点剔除阈值；为空时禁用。
-    target_layer_outlier_min_neighbor_count: int = 2  # 孤立点判断所需最小十字邻域有效点数。
-
     # ── 低频模型 ──────────────────────────────────────────────
     # LFM 是 AI 的低频锚点，网络只预测相对 LFM 的高频扰动。
+    # 目的层 QC 参数和 LFM 构建参数由 lfm_precomputed_depth.py 写入 NPZ
+    # metadata，训练时从 NPZ 自动读取，无需在 train.yaml 中重复配置。
     ai_lfm_file: Path = Path("your_ai_lfm_depth.npz")  # 深度域 AI 低频模型 NPZ。
 
     # ── 深度域子波 ────────────────────────────────────────────
@@ -109,6 +98,7 @@ class DepthGINNConfig:
     lambda_well_log_ai: float = 0.0  # 井旁道 log(AI) 监督权重；0 表示关闭。
     well_anchor_batch_size: int = 0  # 每个训练 batch 额外抽取的井数；<=0 表示使用全部井。
     well_anchor_use_prior_weight: bool = True  # 是否使用 prior 中的 well_weight 加权井约束。
+    well_anchor_neighborhood_radius: int = 0  # 井锚邻域半径（网格单位）；0=仅井点道。
     zero_residual_outside_mask: bool = True  # 是否将层外高频扰动通过 taper 平滑压回 0。
     boundary_effect_samples: int | None = None  # 为空时按子波 5% 有效半支撑自动计算。
 
@@ -188,24 +178,9 @@ class DepthGINNConfig:
             raise ValueError(f"lambda_well_log_ai must be non-negative, got {self.lambda_well_log_ai}.")
         if self.well_anchor_batch_size < 0:
             raise ValueError(f"well_anchor_batch_size must be non-negative, got {self.well_anchor_batch_size}.")
-        if self.target_layer_min_thickness is not None and self.target_layer_min_thickness <= 0.0:
+        if self.well_anchor_neighborhood_radius < 0:
             raise ValueError(
-                f"target_layer_min_thickness must be positive when provided, got {self.target_layer_min_thickness}."
-            )
-        if self.target_layer_nearest_distance_limit is not None and self.target_layer_nearest_distance_limit <= 0.0:
-            raise ValueError(
-                "target_layer_nearest_distance_limit must be positive when provided, "
-                f"got {self.target_layer_nearest_distance_limit}."
-            )
-        if self.target_layer_outlier_threshold is not None and self.target_layer_outlier_threshold <= 0.0:
-            raise ValueError(
-                "target_layer_outlier_threshold must be positive when provided, "
-                f"got {self.target_layer_outlier_threshold}."
-            )
-        if self.target_layer_outlier_min_neighbor_count < 1:
-            raise ValueError(
-                "target_layer_outlier_min_neighbor_count must be >= 1, "
-                f"got {self.target_layer_outlier_min_neighbor_count}."
+                f"well_anchor_neighborhood_radius must be non-negative, got {self.well_anchor_neighborhood_radius}."
             )
         if self.boundary_effect_samples is not None and self.boundary_effect_samples < 0:
             raise ValueError(f"boundary_effect_samples must be non-negative, got {self.boundary_effect_samples}.")

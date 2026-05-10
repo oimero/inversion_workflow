@@ -91,7 +91,7 @@ def build_target_layer(
     horizon_files: dict[str, Path],
     geometry: dict[str, Any],
     qc_output_dir: Path,
-    train_config: dict[str, Any],
+    target_layer_params: dict[str, Any],
 ) -> Any:
     from cup.petrel.load import import_interpretation_petrel
     from cup.seismic.target_layer import TargetLayer
@@ -102,10 +102,10 @@ def build_target_layer(
         geometry=geometry,
         horizon_names=list(horizon_files.keys()),
         qc_output_dir=qc_output_dir,
-        min_thickness=train_config.get("target_layer_min_thickness"),
-        nearest_distance_limit=train_config.get("target_layer_nearest_distance_limit"),
-        outlier_threshold=train_config.get("target_layer_outlier_threshold"),
-        outlier_min_neighbor_count=train_config.get("target_layer_outlier_min_neighbor_count"),  # type: ignore
+        min_thickness=target_layer_params.get("target_layer_min_thickness"),
+        nearest_distance_limit=target_layer_params.get("target_layer_nearest_distance_limit"),
+        outlier_threshold=target_layer_params.get("target_layer_outlier_threshold"),
+        outlier_min_neighbor_count=target_layer_params.get("target_layer_outlier_min_neighbor_count"),  # type: ignore
     )
 
 
@@ -475,21 +475,42 @@ def main() -> None:
     # ── Resolve inputs ──
 
     data_root = REPO_ROOT / data_root_str
-    seismic_file = resolve_relative_path(str(cfg["seismic_depth"]["file"]), root=data_root)
+    seismic_file = resolve_relative_path(str(cfg["segy"]["file"]), root=data_root)
     well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
-    train_config_file = resolve_relative_path(str(script_cfg["train_config"]), root=REPO_ROOT)
     las_dir = resolve_relative_path(str(script_cfg["las_dir"]), root=REPO_ROOT)
 
-    horizon_files = {
-        name: resolve_relative_path(str(cfg["horizons"][name]), root=data_root) for name in cfg["horizons"]
-    }
+    horizon_dir = resolve_relative_path(str(script_cfg["horizon_dir"]), root=data_root)
 
-    for p in [seismic_file, well_heads_file, train_config_file, las_dir, *horizon_files.values()]:
+    # ── scan horizon files, sort by mean depth ──
+    from cup.petrel.load import import_interpretation_petrel
+
+    _horizon_entries: list[tuple[float, Path]] = []
+    for hf in sorted(horizon_dir.glob("*")):
+        if not hf.is_file():
+            continue
+        try:
+            df = import_interpretation_petrel(hf)
+        except Exception:
+            print(f"  Skipping non-horizon file: {hf.name}")
+            continue
+        values = df.iloc[:, 2].to_numpy(dtype=float)
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            continue
+        mean_depth = float(np.mean(finite))
+        _horizon_entries.append((mean_depth, hf))
+    if not _horizon_entries:
+        raise ValueError(f"No valid horizon files found in {horizon_dir}")
+
+    _horizon_entries.sort(key=lambda t: t[0])
+    horizon_files = {f"horizon_{i}": path for i, (_, path) in enumerate(_horizon_entries)}
+    print(f"Horizons (sorted by mean depth):")
+    for i, (depth, path) in enumerate(_horizon_entries):
+        print(f"  horizon_{i}: {path.name}  mean_depth={depth:.1f} m")
+
+    for p in [seismic_file, well_heads_file, las_dir, horizon_dir]:
         if not p.exists():
             raise FileNotFoundError(f"Missing input: {p}")
-
-    with train_config_file.open("r", encoding="utf-8") as f:
-        train_config = yaml.safe_load(f)
 
     las_vp_unit = str(script_cfg.get("las_vp_unit", "m/s"))
     las_rho_unit = str(script_cfg.get("las_rho_unit", "g/cm3"))
@@ -516,7 +537,7 @@ def main() -> None:
     print("=== LFM Precomputed Depth ===")
     print(f"LAS dir: {las_dir}")
     print(f"Seismic: {seismic_file}")
-    print(f"Train config: {train_config_file}")
+    print(f"Horizons: {list(horizon_files.keys())}")
     print(f"Output dir: {output_dir}")
 
     segy_cfg = cfg["segy"]
@@ -543,7 +564,7 @@ def main() -> None:
         horizon_files=horizon_files,
         geometry=geometry_depth,
         qc_output_dir=qc_dir,
-        train_config=train_config,
+        target_layer_params=script_cfg,
     )
     print(f"horizons: {target_layer.horizon_names}")
     print(f"zones: {target_layer.iter_zones()}")
@@ -577,9 +598,26 @@ def main() -> None:
     print(f"\nVp wells: {[w.well_name for w in vp_wells]}")
     print(f"AI wells: {[w.well_name for w in ai_wells]}")
 
-    build_params = train_config.get("lfm_precomputed")
-    if not build_params:
-        raise ValueError("Missing 'lfm_precomputed' section in train config.")
+    _lfm_keys = [
+        "boundary_extension_samples",
+        "n_slices",
+        "variogram",
+        "exact",
+        "nugget",
+        "filter_cutoff_wavelength_m",
+        "filter_order",
+        "filter_buffer_meters",
+        "filter_buffer_mode",
+        "post_slice_smoothing",
+    ]
+    _lfm_required = {"boundary_extension_samples", "n_slices", "variogram", "filter_cutoff_wavelength_m", "filter_order"}
+    build_params = {}
+    for key in _lfm_keys:
+        if key not in script_cfg:
+            if key in _lfm_required:
+                raise ValueError(f"Missing '{key}' in lfm_precomputed_depth config.")
+            continue
+        build_params[key] = script_cfg[key]
 
     vp_result = build_lfm_depth_model(
         target_layer=target_layer,
@@ -606,6 +644,19 @@ def main() -> None:
     print(f"[AI] property: {ai_result.metadata['property_name']}")
     print(f"[AI] zones: {ai_result.metadata['zone_names']}")
     print(f"[AI] wells: {ai_result.metadata['well_names']}")
+
+    # ── Inject horizon + target-layer info into NPZ metadata ──
+    for result in (vp_result, ai_result):
+        result.metadata["target_layer"] = {
+            "min_thickness": script_cfg.get("target_layer_min_thickness"),
+            "nearest_distance_limit": script_cfg.get("target_layer_nearest_distance_limit"),
+            "outlier_threshold": script_cfg.get("target_layer_outlier_threshold"),
+            "outlier_min_neighbor_count": script_cfg.get("target_layer_outlier_min_neighbor_count"),
+        }
+        result.metadata["horizons"] = [
+            {"file": str(path), "mean_depth_m": float(depth)}
+            for depth, path in _horizon_entries
+        ]
 
     # ── Coverage stats ──
 

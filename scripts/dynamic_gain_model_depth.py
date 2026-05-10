@@ -102,7 +102,7 @@ def main() -> None:
         raise FileNotFoundError(f"Fit metrics not found: {fit_file}")
 
     seg_file = source_fit_dir / "gain_attr_segment_samples.csv"
-    seismic_file = REPO_ROOT / str(cfg["data_root"]) / str(cfg["seismic_depth"]["file"])
+    seismic_file = REPO_ROOT / str(cfg["data_root"]) / str(cfg["segy"]["file"])
     if not seismic_file.exists():
         raise FileNotFoundError(f"Seismic not found: {seismic_file}")
 

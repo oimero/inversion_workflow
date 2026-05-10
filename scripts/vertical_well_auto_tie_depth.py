@@ -609,7 +609,7 @@ def main() -> None:
         raise FileNotFoundError(f"LAS file not found: {las_file}")
 
     well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
-    seismic_file = resolve_relative_path(str(cfg["seismic_depth"]["file"]), root=data_root)
+    seismic_file = resolve_relative_path(str(cfg["segy"]["file"]), root=data_root)
     tutorial_model = resolve_relative_path(str(script_cfg["tutorial_model"]), root=data_root)
     tutorial_params = resolve_relative_path(str(script_cfg["tutorial_params"]), root=data_root)
 

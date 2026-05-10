@@ -344,11 +344,7 @@ class Trainer:
                     "dynamic_gain_model": self.cfg.dynamic_gain_model,
                 },
                 "lfm": {
-                    "source": self.cfg.lfm_source,
-                    "lfm_precomputed_file": self.cfg.lfm_precomputed_file,
-                    "lfm_initial_inversion_file": self.cfg.lfm_initial_inversion_file,
-                    "lfm_cutoff_hz": self.cfg.lfm_cutoff_hz,
-                    "lfm_filter_order": self.cfg.lfm_filter_order,
+                    "ai_lfm_file": self.cfg.ai_lfm_file,
                 },
                 "well_anchor": self._well_anchor_summary(),
             },
@@ -367,6 +363,8 @@ class Trainer:
             n_sample=int(self.geometry["n_sample"]),
             n_traces=n_traces,
             valid_indices=self.dataset.valid_indices,
+            neighborhood_radius=self.cfg.well_anchor_neighborhood_radius,
+            geometry=self.geometry,
         )
 
     def _well_anchor_summary(self) -> dict[str, Any]:

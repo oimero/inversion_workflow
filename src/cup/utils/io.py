@@ -75,11 +75,11 @@ def to_json_compatible(value: Any) -> Any:
         if value.ndim == 0:
             return to_json_compatible(value.item())
         return [to_json_compatible(v) for v in value.tolist()]
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
     if isinstance(value, (np.floating, float)):
         v = float(value)
         return v if np.isfinite(v) else None
-    if isinstance(value, np.bool_):
-        return bool(value)
     if isinstance(value, (np.integer, int)):
         return int(value)
     if isinstance(value, np.generic):

@@ -10,7 +10,6 @@ import yaml
 
 from cup.utils.io import to_json_compatible
 
-LfmSource = Literal["lfm_precomputed_file", "lfm_initial_inversion_file"]
 WaveletSource = Literal["precomputed_wavelet", "ricker_wavelet"]
 GainSource = Literal["fixed_gain", "dynamic_gain_model"]
 ValidationSplitMode = Literal["none", "spatial_block"]
@@ -18,10 +17,7 @@ ValidationBlockAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"
 
 _PATH_FIELDS = {
     "seismic_file",
-    "top_horizon_file",
-    "bot_horizon_file",
-    "lfm_precomputed_file",
-    "lfm_initial_inversion_file",
+    "ai_lfm_file",
     "wavelet_file",
     "dynamic_gain_model",
     "well_anchor_prior_file",
@@ -44,27 +40,10 @@ class GINNConfig:
     segy_istep: int = 1  # inline 抽样步长。
     segy_xstep: int = 1  # xline 抽样步长。
 
-    # ── 目的层 ────────────────────────────────────────────────
-    # 目的层顶/底界决定 waveform loss 和 residual 自由度的有效区域。下面几个
-    # 可选 QC 参数用于防御层位异常；除非层位诊断显示薄层、跳点或孤立异常，
-    # 否则建议保持默认。
-    top_horizon_file: Path = Path("your_top_horizon_file")  # 目的层顶界解释面路径。
-    bot_horizon_file: Path = Path("your_bot_horizon_file")  # 目的层底界解释面路径。
-    target_layer_min_thickness: float | None = None  # 相邻层位最小厚度；为空时使用地震样本间距。
-    target_layer_nearest_distance_limit: float | None = None  # 层位解释 nearest 插值的最远距离；为空时不限制。
-    target_layer_outlier_threshold: float | None = 0.02  # 孤立层位点剔除阈值；为空时禁用。
-    target_layer_outlier_min_neighbor_count: int = 2  # 孤立点判断所需最小十字邻域有效点数。
-
     # ── 低频模型 ──────────────────────────────────────────────
-    # LFM 是 AI 的低频锚点，网络只预测相对 LFM 的高频扰动。优先使用已经
-    # 预处理好的 LFM；只有在需要从初始反演体临时低通生成 LFM 时，才切换到
-    # lfm_initial_inversion_file。
-    lfm_source: LfmSource = "lfm_precomputed_file"  # LFM 来源：预计算 LFM 或初始反演体低通。
-    lfm_precomputed_file: Path | None = Path("your_lfm_precomputed_file")  # 预计算 LFM 文件。
-    lfm_initial_inversion_file: Path | None = Path("your_lfm_initial_inversion_file")  # 初始反演体文件。
-    lfm_filter_dt: float = 0.001  # 从初始反演体低通生成 LFM 时的采样间隔（秒）。
-    lfm_cutoff_hz: float = 10.0  # 生成 LFM 时的 Butterworth 低通截止频率（Hz）。
-    lfm_filter_order: int = 6  # 生成 LFM 时的零相位滤波器阶数。
+    # LFM 是 AI 的低频锚点。目的层 QC 参数和 LFM 构建参数由时间域
+    # LFM 构建脚本写入 NPZ metadata，训练时自动读取，无需在 train.yaml 重复配置。
+    ai_lfm_file: Path = Path("your_lfm_precomputed_file")  # 预计算 LFM NPZ。
 
     # ── 子波 ──────────────────────────────────────────────────
     # 子波用于物理正演。真实实验优先使用井震标定得到的预计算子波；
@@ -118,6 +97,7 @@ class GINNConfig:
     lambda_well_log_ai: float = 0.0  # 井旁道 log(AI) 监督权重；0 表示关闭。
     well_anchor_batch_size: int = 0  # 每个训练 batch 额外抽取的井数；<=0 表示使用全部井。
     well_anchor_use_prior_weight: bool = True  # 是否使用 prior 中的 well_weight 加权井约束。
+    well_anchor_neighborhood_radius: int = 0  # 井锚邻域半径（网格单位）；0=仅井点道。
     zero_residual_outside_mask: bool = True  # 是否将层外高频扰动通过 taper 平滑压回 0。
     boundary_effect_samples: int | None = None  # 为空时按子波 5% 有效半支撑自动计算。
 
@@ -165,13 +145,6 @@ class GINNConfig:
                 f"(expected {expected_in_channels}: seismic + enabled lfm/mask/dynamic gain)."
             )
 
-        valid_lfm_sources = {"lfm_precomputed_file", "lfm_initial_inversion_file"}
-        if self.lfm_source not in valid_lfm_sources:
-            raise ValueError(f"Unsupported lfm_source={self.lfm_source!r}, expected one of {sorted(valid_lfm_sources)}")
-        if self.lfm_source == "lfm_precomputed_file" and self.lfm_precomputed_file is None:
-            raise ValueError("lfm_precomputed_file is required when lfm_source='lfm_precomputed_file'.")
-        if self.lfm_source == "lfm_initial_inversion_file" and self.lfm_initial_inversion_file is None:
-            raise ValueError("lfm_initial_inversion_file is required when lfm_source='lfm_initial_inversion_file'.")
         valid_wavelet_sources = {"precomputed_wavelet", "ricker_wavelet"}
         if self.wavelet_source not in valid_wavelet_sources:
             raise ValueError(
@@ -209,32 +182,15 @@ class GINNConfig:
             raise ValueError(f"wavelet_dt must be positive, got {self.wavelet_dt}.")
         if self.wavelet_length < 2:
             raise ValueError(f"wavelet_length must be at least 2, got {self.wavelet_length}.")
-        if self.lfm_filter_dt <= 0.0:
-            raise ValueError(f"lfm_filter_dt must be positive, got {self.lfm_filter_dt}.")
         if self.lambda_tv < 0.0:
             raise ValueError(f"lambda_tv must be non-negative, got {self.lambda_tv}.")
         if self.lambda_well_log_ai < 0.0:
             raise ValueError(f"lambda_well_log_ai must be non-negative, got {self.lambda_well_log_ai}.")
         if self.well_anchor_batch_size < 0:
             raise ValueError(f"well_anchor_batch_size must be non-negative, got {self.well_anchor_batch_size}.")
-        if self.target_layer_min_thickness is not None and self.target_layer_min_thickness <= 0.0:
+        if self.well_anchor_neighborhood_radius < 0:
             raise ValueError(
-                f"target_layer_min_thickness must be positive when provided, got {self.target_layer_min_thickness}."
-            )
-        if self.target_layer_nearest_distance_limit is not None and self.target_layer_nearest_distance_limit <= 0.0:
-            raise ValueError(
-                "target_layer_nearest_distance_limit must be positive when provided, "
-                f"got {self.target_layer_nearest_distance_limit}."
-            )
-        if self.target_layer_outlier_threshold is not None and self.target_layer_outlier_threshold <= 0.0:
-            raise ValueError(
-                "target_layer_outlier_threshold must be positive when provided, "
-                f"got {self.target_layer_outlier_threshold}."
-            )
-        if self.target_layer_outlier_min_neighbor_count < 1:
-            raise ValueError(
-                "target_layer_outlier_min_neighbor_count must be >= 1, "
-                f"got {self.target_layer_outlier_min_neighbor_count}."
+                f"well_anchor_neighborhood_radius must be non-negative, got {self.well_anchor_neighborhood_radius}."
             )
         if self.boundary_effect_samples is not None and self.boundary_effect_samples < 0:
             raise ValueError(f"boundary_effect_samples must be non-negative, got {self.boundary_effect_samples}.")
@@ -253,8 +209,6 @@ class GINNConfig:
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "GINNConfig":
         normalized = dict(data)
         optional_path_fields = {
-            "lfm_precomputed_file",
-            "lfm_initial_inversion_file",
             "wavelet_file",
             "dynamic_gain_model",
             "well_anchor_prior_file",

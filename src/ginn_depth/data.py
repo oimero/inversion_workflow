@@ -47,6 +47,7 @@ class DatasetBundle:
     depth_axis_m: np.ndarray
     geometry: Dict[str, Any]
     split_metadata: Dict[str, Any]
+    lfm_metadata: Dict[str, Any]
 
 
 def resolve_wavelet_from_config(cfg: DepthGINNConfig) -> tuple[np.ndarray, np.ndarray]:
@@ -521,18 +522,37 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
     geometry.setdefault("sample_domain", "depth")
     geometry.setdefault("sample_unit", "m")
 
+    # ── read horizon files + target-layer QC from AI LFM NPZ metadata ──
+    hz_list = ai_lfm.metadata.get("horizons", [])
+    if len(hz_list) < 2:
+        raise ValueError("AI LFM NPZ metadata must contain at least two sorted horizons.")
+    # Top = shallowest (index 0), bottom = deepest (index -1)
+    top_horizon_file = hz_list[0]["file"]
+    bot_horizon_file = hz_list[-1]["file"]
+    logger.info("Top horizon: %s", top_horizon_file)
+    logger.info("Bot horizon: %s", bot_horizon_file)
+
+    tl_meta = ai_lfm.metadata.get("target_layer", {})
+    tl_min_thickness = tl_meta.get("min_thickness")
+    tl_nearest_limit = tl_meta.get("nearest_distance_limit")
+    tl_outlier_threshold = tl_meta.get("outlier_threshold")
+    tl_outlier_min_neighbor = tl_meta.get("outlier_min_neighbor_count", 2)
+    logger.info("Target-layer params from LFM NPZ metadata: min_thickness=%s, outlier_threshold=%s",
+                tl_min_thickness, tl_outlier_threshold)
+
     logger.info("Loading raw top/bottom depth horizons...")
-    top_df_raw = import_interpretation_petrel(cfg.top_horizon_file)
-    bot_df_raw = import_interpretation_petrel(cfg.bot_horizon_file)
+    top_df_raw = import_interpretation_petrel(top_horizon_file)
+    bot_df_raw = import_interpretation_petrel(bot_horizon_file)
+
     logger.info("Building target layer from raw depth interpretations...")
     target_layer = TargetLayer(
         raw_horizon_dfs={"top": top_df_raw, "bottom": bot_df_raw},
         geometry=geometry,
         horizon_names=["top", "bottom"],
-        min_thickness=cfg.target_layer_min_thickness,
-        nearest_distance_limit=cfg.target_layer_nearest_distance_limit,
-        outlier_threshold=cfg.target_layer_outlier_threshold,
-        outlier_min_neighbor_count=cfg.target_layer_outlier_min_neighbor_count,
+        min_thickness=tl_min_thickness,
+        nearest_distance_limit=tl_nearest_limit,
+        outlier_threshold=tl_outlier_threshold,
+        outlier_min_neighbor_count=tl_outlier_min_neighbor,
     )
     train_mask = target_layer.to_mask(use_valid_control_mask=True)
     inference_mask = target_layer.to_mask(use_valid_control_mask=False)
@@ -690,4 +710,5 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         depth_axis_m=ai_lfm.samples.astype(np.float32),
         geometry=geometry,
         split_metadata=split_metadata,
+        lfm_metadata=dict(ai_lfm.metadata),
     )

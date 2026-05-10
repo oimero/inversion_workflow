@@ -583,7 +583,7 @@ def main() -> None:
     las_dir_str = str(script_cfg["las_dir"])
     las_dir = resolve_relative_path(las_dir_str, root=data_root)
     well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
-    seismic_file = resolve_relative_path(str(cfg["seismic_depth"]["file"]), root=data_root)
+    seismic_file = resolve_relative_path(str(cfg["segy"]["file"]), root=data_root)
     source_auto_tie_dir = REPO_ROOT / str(script_cfg["source_auto_tie_dir"])
     source_well_name = str(script_cfg["source_well_name"])
     wavelet_path = source_auto_tie_dir / f"wavelet_201ms_{source_well_name}.csv"

@@ -493,7 +493,7 @@ def main() -> None:
         except Exception:
             print(f"  Skipping non-horizon file: {hf.name}")
             continue
-        values = df.iloc[:, 2].to_numpy(dtype=float)
+        values = df["interpretation"].to_numpy(dtype=float)
         finite = values[np.isfinite(values)]
         if finite.size == 0:
             continue

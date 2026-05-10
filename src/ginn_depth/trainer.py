@@ -224,7 +224,7 @@ class Trainer:
         if training and step % self._WELL_ANCHOR_SKIP != 0:
             cached = getattr(self, "_cached_well_metrics", None)
             if cached is not None:
-                return cached
+                return cached[0].detach(), cached[1]
             return zero_well_anchor_metrics(self.device)
         term, metrics = self.well_anchor.compute_loss(
             dataset=self.dataset,
@@ -233,7 +233,7 @@ class Trainer:
             training=training,
         )
         if training:
-            self._cached_well_metrics = (term, metrics)
+            self._cached_well_metrics = (term.detach(), metrics)
         return term, metrics
 
     def _run_epoch(self, dataloader: DataLoader, *, training: bool) -> dict[str, float]:
@@ -265,7 +265,7 @@ class Trainer:
                 ai, residual = self._compose_impedance(x, lfm_raw, taper_weight)
                 d_syn = self.forward_model(ai, velocity_raw, gain=dynamic_gain)
                 loss, loss_dict = self.criterion(d_syn, d_obs, loss_mask, core_mask, residual, taper_weight)
-                well_term, well_dict = self._compute_well_anchor_loss(training=training, step=batch_idx)
+                well_term, well_dict = self._compute_well_anchor_loss(training=training, step=batch_idx) if training else zero_well_anchor_metrics(self.device)
                 loss = loss + well_term
                 loss_dict["total"] = float(loss.detach().cpu().item())
 
@@ -290,7 +290,7 @@ class Trainer:
                 if training and (batch_idx + 1) % self.cfg.log_interval == 0:
                     lr = self.optimizer.param_groups[0]["lr"]
                     logger.info(
-                        "  [Epoch %d | Batch %d/%d] loss=%.6f  mae=%.6f  l2=%.3e  tv=%.3e  res=%.3e  well=%.3e  lr=%.2e",
+                        "  [Epoch %d | Batch %d/%d] loss=%.6f  mae=%.6f  l2=%.3e  tv=%.3e  well=%.3e  res=%.3e  lr=%.2e",
                         self.epoch + 1,
                         batch_idx + 1,
                         len(dataloader),
@@ -373,7 +373,7 @@ class Trainer:
             if val_metrics is None:
                 logger.info(
                     "Epoch %d/%d  lr=%.2e  train_loss=%.6f  train_mae=%.6f  train_l2=%.3e  train_tv=%.3e  "
-                    "train_res=%.3e  train_well=%.3e  time=%.1fs",
+                    "train_well=%.3e  train_res=%.3e  time=%.1fs",
                     epoch + 1,
                     self.cfg.epochs,
                     lr,
@@ -381,8 +381,8 @@ class Trainer:
                     train_metrics["waveform_mae"],
                     train_metrics["l2_term"],
                     train_metrics["tv_term"],
-                    train_metrics["residual_mean"],
                     train_metrics["well_log_ai_term"],
+                    train_metrics["residual_mean"],
                     elapsed,
                 )
                 monitor_value = train_metrics["loss"]
@@ -391,8 +391,8 @@ class Trainer:
                 logger.info(
                     "Epoch %d/%d  lr=%.2e  train_loss=%.6f  val_loss=%.6f  "
                     "train_mae=%.6f  val_mae=%.6f  train_l2=%.3e  val_l2=%.3e  "
-                    "train_tv=%.3e  val_tv=%.3e  train_res=%.3e  val_res=%.3e  "
-                    "train_well=%.3e  val_well=%.3e  time=%.1fs",
+                    "train_tv=%.3e  val_tv=%.3e  train_well=%.3e  val_well=%.3e  "
+                    "train_res=%.3e  val_res=%.3e  time=%.1fs",
                     epoch + 1,
                     self.cfg.epochs,
                     lr,
@@ -404,14 +404,14 @@ class Trainer:
                     val_metrics["l2_term"],
                     train_metrics["tv_term"],
                     val_metrics["tv_term"],
-                    train_metrics["residual_mean"],
-                    val_metrics["residual_mean"],
                     train_metrics["well_log_ai_term"],
                     val_metrics["well_log_ai_term"],
+                    train_metrics["residual_mean"],
+                    val_metrics["residual_mean"],
                     elapsed,
                 )
-                monitor_value = val_metrics["loss"]
-                monitor_name = "val_loss"
+                monitor_value = val_metrics["waveform_mae"]
+                monitor_name = "val_mae"
 
             if monitor_value < self.best_loss:
                 self.best_loss = monitor_value

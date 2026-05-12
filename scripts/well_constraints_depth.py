@@ -1,12 +1,15 @@
-"""Build a depth-domain well-resolution prior for stage-2 enhancement.
+"""Build depth-domain well-derived constraints for GINN workflows.
 
-The script samples shifted LAS AI logs on the depth GINN/LFM axis and stores the
-log-AI residual against the AI LFM as a ``ginn_well_resolution_prior_v1`` NPZ.
+The script samples shifted LAS AI logs on the depth GINN/LFM axis and writes two
+related artifacts from the same well QC pass:
+
+* ``well_resolution_prior_depth.npz`` for stage-2 enhancement.
+* ``log_ai_anchor_depth.npz`` for stage-1 log-AI anchor supervision.
 
 Usage::
 
-    python scripts/well_resolution_prior_depth.py
-    python scripts/well_resolution_prior_depth.py --config experiments/common_depth.yaml
+    python scripts/well_constraints_depth.py
+    python scripts/well_constraints_depth.py --config experiments/common_depth.yaml
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ if str(SRC_DIR) not in sys.path:
 from cup.petrel.load import import_well_heads_petrel  # noqa: E402
 from cup.seismic.survey import open_survey  # noqa: E402
 from cup.utils.io import load_yaml_config, resolve_relative_path  # noqa: E402
+from ginn.log_ai_anchor import build_log_ai_anchor_bundle, save_log_ai_anchor_npz  # noqa: E402
 from enhance.prior import (  # noqa: E402
     WellResolutionPriorBundle,
     save_well_resolution_prior_npz,
@@ -60,7 +64,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="Output directory. Defaults to <output_root>/well_resolution_prior_depth_<timestamp>.",
+        help="Output directory. Defaults to <output_root>/well_constraints_depth_<timestamp>.",
     )
     return parser.parse_args()
 
@@ -159,9 +163,9 @@ def _nearest_flat_index(ai_lfm: Any, iline: float, xline: float) -> tuple[int, i
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
-    script_cfg = cfg.get("well_resolution_prior_depth", {})
+    script_cfg = cfg.get("well_constraints_depth", {})
     if not script_cfg:
-        raise ValueError("Missing 'well_resolution_prior_depth' section in config.")
+        raise ValueError("Missing 'well_constraints_depth' section in config.")
 
     data_root = resolve_relative_path(str(cfg.get("data_root", "data")), root=REPO_ROOT)
     output_root = resolve_relative_path(str(cfg.get("output_root", "scripts/output")), root=REPO_ROOT)
@@ -185,13 +189,14 @@ def main() -> None:
 
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = output_root / f"well_resolution_prior_depth_{timestamp}"
+        output_dir = output_root / f"well_constraints_depth_{timestamp}"
     else:
         output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     prior_path = output_dir / "well_resolution_prior_depth.npz"
-    qc_path = output_dir / "well_resolution_prior_depth_qc.csv"
+    anchor_path = output_dir / "log_ai_anchor_depth.npz"
+    qc_path = output_dir / "well_constraints_depth_qc.csv"
     run_summary_path = output_dir / "run_summary.json"
 
     confidence_corr_floor = float(script_cfg.get("confidence_corr_floor", 0.3))
@@ -205,7 +210,7 @@ def main() -> None:
         "xstep": segy_cfg["xstep"],
     }
 
-    print("=== Well Resolution Prior (Depth) ===")
+    print("=== Well Constraints (Depth) ===")
     print(f"Shifted LAS dir: {shifted_las_dir}")
     print(f"Batch metrics: {metrics_path}")
     print(f"AI LFM: {ai_lfm_file}")
@@ -336,6 +341,10 @@ def main() -> None:
     metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_script": Path(__file__).name,
+        "artifact_family": "well_constraints_depth",
+        "artifact_role": "well_resolution_prior",
+        "used_by_stage": "stage_2_enhancement",
+        "paired_anchor_path": str(anchor_path),
         "shifted_las_dir": str(shifted_las_dir),
         "metrics_path": str(metrics_path),
         "well_heads_file": str(well_heads_file),
@@ -366,20 +375,81 @@ def main() -> None:
         metadata=metadata,
     )
 
+    anchor_metadata = {
+        "created_at_utc": metadata["created_at_utc"],
+        "source_script": Path(__file__).name,
+        "artifact_family": "well_constraints_depth",
+        "artifact_role": "log_ai_anchor",
+        "used_by_stage": "stage_1_ginn_anchor",
+        "paired_prior_path": str(prior_path),
+        "anchor_source": "shifted_las_wells",
+        "shifted_las_dir": str(shifted_las_dir),
+        "metrics_path": str(metrics_path),
+        "well_heads_file": str(well_heads_file),
+        "ai_lfm_file": str(ai_lfm_file),
+        "confidence_formula": metadata["confidence_formula"],
+        "qc_path": str(qc_path),
+        "n_input_las": int(len(las_paths)),
+        "n_successful_anchors": int(len(records)),
+        "status_counts": qc_df["status"].value_counts(dropna=False).to_dict(),
+        "reserved_anchor_types": ["well", "facies_control"],
+    }
+    anchor_bundle = build_log_ai_anchor_bundle(
+        sample_domain="depth",
+        sample_unit="m",
+        samples=depth_axis_m.astype(np.float32),
+        flat_indices=np.array([row["flat_idx"] for row in records], dtype=np.int64),
+        target_ai=np.stack([row["ai"] for row in records]).astype(np.float32),
+        anchor_mask=well_mask,
+        anchor_weight=well_weight,
+        anchor_names=np.array([row["well_name"] for row in records]),
+        anchor_types=np.array(["well"] * len(records)),
+        inline=np.array([row["inline"] for row in records], dtype=np.float32),
+        xline=np.array([row["xline"] for row in records], dtype=np.float32),
+        metadata=anchor_metadata,
+    )
+
     save_well_resolution_prior_npz(prior_path, bundle)
+    save_log_ai_anchor_npz(anchor_path, anchor_bundle)
     with run_summary_path.open("w", encoding="utf-8") as fp:
         json.dump(
             {
-                **metadata,
-                "prior_path": str(prior_path),
-                "summary": summary,
+                "created_at_utc": metadata["created_at_utc"],
+                "source_script": Path(__file__).name,
+                "artifact_family": "well_constraints_depth",
+                "shared_source": {
+                    "shifted_las_dir": str(shifted_las_dir),
+                    "metrics_path": str(metrics_path),
+                    "well_heads_file": str(well_heads_file),
+                    "ai_lfm_file": str(ai_lfm_file),
+                    "qc_path": str(qc_path),
+                    "n_input_las": int(len(las_paths)),
+                    "n_successful_wells": int(len(records)),
+                    "status_counts": qc_df["status"].value_counts(dropna=False).to_dict(),
+                },
+                "artifacts": {
+                    "stage_2_enhancement_prior": {
+                        "path": str(prior_path),
+                        "schema": "ginn_well_resolution_prior_v1",
+                        "contains_residual_log_ai": True,
+                        "summary": summary,
+                    },
+                    "stage_1_log_ai_anchor": {
+                        "path": str(anchor_path),
+                        "schema": "ginn_log_ai_anchor_v1",
+                        "contains_residual_log_ai": False,
+                        "reserved_anchor_types": ["well", "facies_control"],
+                        "summary": anchor_bundle.summary,
+                    },
+                },
             },
             fp,
             ensure_ascii=False,
             indent=2,
         )
 
-    print(f"Saved prior: {prior_path}")
+    print(f"Saved stage-2 well-resolution prior: {prior_path}")
+    print(f"Saved stage-1 log-AI anchor: {anchor_path}")
     print(f"Saved QC: {qc_path}")
     print(f"Saved run summary: {run_summary_path}")
 

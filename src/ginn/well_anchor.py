@@ -1,4 +1,4 @@
-"""Reusable well log-AI anchor constraint for GINN trainers."""
+"""Reusable log-AI anchor constraint for GINN trainers."""
 
 from __future__ import annotations
 
@@ -14,7 +14,8 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from ginn.well_prior import load_well_resolution_prior_npz, validate_well_resolution_prior
+from ginn.log_ai_anchor import load_log_ai_anchor_npz, validate_log_ai_anchor
+from ginn.well_prior import true_runs
 from wtie.processing.spectral import apply_butter_lowpass_filter
 
 logger = logging.getLogger(__name__)
@@ -29,21 +30,22 @@ def _as_tensor(value: np.ndarray | Tensor) -> Tensor:
 
 
 @dataclass
-class WellLogAIAnchor:
-    """Well log-AI supervision sampled on a GINN trace axis.
+class LogAIAnchor:
+    """Log-AI supervision sampled on a GINN trace axis.
 
     Supports optional lowpass filtering of the target AI (to constrain only the
-    low-frequency baseline) and optional spatial neighbourhood (to spread the
-    constraint across traces near the well with distance-decay weights).
+    low-frequency baseline) and optional spatial neighbourhood (to spread an
+    anchor across nearby traces with distance-decay weights).
     """
 
-    prior_file: Path
+    anchor_file: Path
     lambda_weight: float
     batch_size: int
-    use_prior_weight: bool
+    use_anchor_weight: bool
     dataset_indices: np.ndarray
     flat_indices: np.ndarray
-    well_names: np.ndarray
+    anchor_names: np.ndarray
+    anchor_types: np.ndarray
     target_log_ai: Tensor
     mask_weight: Tensor
 
@@ -61,10 +63,10 @@ class WellLogAIAnchor:
     def build(
         cls,
         *,
-        prior_file: Path | None,
+        anchor_file: Path | None,
         lambda_weight: float,
         batch_size: int,
-        use_prior_weight: bool,
+        use_anchor_weight: bool,
         sample_domain: str,
         n_sample: int,
         n_traces: int,
@@ -75,16 +77,16 @@ class WellLogAIAnchor:
         lowpass_cutoff_wavelength_m: float | None = None,
         lowpass_cutoff_hz: float | None = None,
         lowpass_filter_order: int = 6,
-    ) -> "WellLogAIAnchor | None":
+    ) -> "LogAIAnchor | None":
         if lambda_weight <= 0.0:
             return None
-        if prior_file is None:
-            logger.warning("lambda_well_log_ai > 0 but well_anchor_prior_file is empty; well anchor disabled.")
+        if anchor_file is None:
+            logger.warning("lambda_log_ai_anchor > 0 but log_ai_anchor_file is empty; log-AI anchor disabled.")
             return None
 
-        prior = load_well_resolution_prior_npz(prior_file)
-        validate_well_resolution_prior(
-            prior,
+        anchor_bundle = load_log_ai_anchor_npz(anchor_file)
+        validate_log_ai_anchor(
+            anchor_bundle,
             sample_domain=sample_domain,
             n_sample=n_sample,
             n_traces=n_traces,
@@ -93,21 +95,21 @@ class WellLogAIAnchor:
         flat_to_dataset = {int(flat_idx): idx for idx, flat_idx in enumerate(valid_indices)}
         rows: list[int] = []
         dataset_indices: list[int] = []
-        for row, flat_idx in enumerate(prior.flat_indices):
+        for row, flat_idx in enumerate(anchor_bundle.flat_indices):
             dataset_idx = flat_to_dataset.get(int(flat_idx))
             if dataset_idx is None:
                 continue
-            mask = np.asarray(prior.well_mask[row], dtype=bool)
-            ai = np.asarray(prior.well_ai[row], dtype=np.float32)
+            mask = np.asarray(anchor_bundle.anchor_mask[row], dtype=bool)
+            ai = np.asarray(anchor_bundle.target_ai[row], dtype=np.float32)
             if np.any(mask & np.isfinite(ai) & (ai > 0.0)):
                 rows.append(row)
                 dataset_indices.append(dataset_idx)
 
         if not rows:
-            logger.warning("No usable well anchor traces from %s; well anchor disabled.", prior_file)
+            logger.warning("No usable log-AI anchor traces from %s; anchor disabled.", anchor_file)
             return None
 
-        target_ai = np.asarray(prior.well_ai[rows], dtype=np.float32)
+        target_ai = np.asarray(anchor_bundle.target_ai[rows], dtype=np.float32)
 
         # ── lowpass filter target AI (before log) ──
         actual_cutoff: float | None = None
@@ -120,42 +122,59 @@ class WellLogAIAnchor:
             cutoff_is_wavelength = False
 
         if actual_cutoff is not None:
-            dz = float(np.median(np.diff(prior.samples)))
+            dz = float(np.median(np.diff(anchor_bundle.samples)))
             if dz > 0.0:
                 fs = 1.0 / dz
                 highcut = (1.0 / actual_cutoff) if cutoff_is_wavelength else actual_cutoff
                 order = int(lowpass_filter_order)
                 pad = max(1, int(np.ceil(3.0 * order * dz)))
+                run_pad_values: list[int] = []
                 for row in range(target_ai.shape[0]):
-                    row_mask = np.asarray(prior.well_mask[rows][row], dtype=bool)
+                    row_mask = np.asarray(anchor_bundle.anchor_mask[rows][row], dtype=bool)
                     row_valid = row_mask & np.isfinite(target_ai[row]) & (target_ai[row] > 0.0)
                     if row_valid.sum() < 2:
                         continue
-                    values = target_ai[row].astype(np.float64)
-                    padded = np.pad(values, (pad, pad), mode="reflect")
-                    filtered = apply_butter_lowpass_filter(
-                        padded, highcut, fs, order=order, zero_phase=True,
-                    )
-                    target_ai[row] = filtered[pad:pad + values.size].astype(np.float32)
+                    for start, stop in true_runs(row_valid):
+                        values = target_ai[row, start:stop].astype(np.float64)
+                        if values.size < 2:
+                            continue
+                        run_pad = min(pad, values.size - 1)
+                        run_pad_values.append(run_pad)
+                        if run_pad > 0:
+                            padded = np.pad(values, (run_pad, run_pad), mode="reflect")
+                            filtered = apply_butter_lowpass_filter(
+                                padded, highcut, fs, order=order, zero_phase=True,
+                            )[run_pad : run_pad + values.size]
+                        else:
+                            filtered = apply_butter_lowpass_filter(
+                                values, highcut, fs, order=order, zero_phase=True,
+                            )
+                        target_ai[row, start:stop] = filtered.astype(np.float32)
                 cutoff_label = f"{actual_cutoff:.0f} m" if cutoff_is_wavelength else f"{actual_cutoff:.1f} Hz"
+                pad_label = "none"
+                if run_pad_values:
+                    pad_label = (
+                        f"base={pad}, actual_min={min(run_pad_values)}, "
+                        f"actual_max={max(run_pad_values)} samples"
+                    )
                 logger.info(
-                    "Well anchor lowpass: cutoff=%s (%.4f cycles/unit), order=%d, pad=%d samples",
-                    cutoff_label, highcut, order, pad,
+                    "Log-AI anchor lowpass: cutoff=%s (%.4f cycles/unit), order=%d, pad=%s",
+                    cutoff_label, highcut, order, pad_label,
                 )
 
         # ── build log-AI target ──
         target_log_ai = np.zeros_like(target_ai, dtype=np.float32)
-        valid = np.asarray(prior.well_mask[rows], dtype=bool) & np.isfinite(target_ai) & (target_ai > 0.0)
+        valid = np.asarray(anchor_bundle.anchor_mask[rows], dtype=bool) & np.isfinite(target_ai) & (target_ai > 0.0)
         target_log_ai[valid] = np.log(np.clip(target_ai[valid], 1e-6, None)).astype(np.float32)
 
         weights = np.ones_like(target_log_ai, dtype=np.float32)
-        if use_prior_weight:
-            weights = np.asarray(prior.well_weight[rows], dtype=np.float32)
+        if use_anchor_weight:
+            weights = np.asarray(anchor_bundle.anchor_weight[rows], dtype=np.float32)
             weights = np.where(np.isfinite(weights) & (weights > 0.0), weights, 0.0).astype(np.float32)
         weights = weights * valid.astype(np.float32)
 
         # ── neighbourhood precomputation ──
-        n_wells = len(rows)
+        n_anchors = len(rows)
         dataset_indices_arr = np.asarray(dataset_indices, dtype=np.int64)
         neighbor_inputs = torch.empty(0)
         neighbor_lfm_raw = torch.empty(0)
@@ -178,8 +197,8 @@ class WellLogAIAnchor:
             all_taper: list[Tensor] = []
             all_w: list[Tensor] = []
 
-            for w in range(n_wells):
-                flat_ref = int(prior.flat_indices[rows[w]])
+            for w in range(n_anchors):
+                flat_ref = int(anchor_bundle.flat_indices[rows[w]])
                 il_ref = flat_ref // n_xl
                 xl_ref = flat_ref % n_xl
                 candidates: list[tuple[float, int, float]] = []
@@ -230,13 +249,13 @@ class WellLogAIAnchor:
 
             max_nbr = max((e - s) for s, e in neighbor_ranges) if neighbor_ranges else 0
             logger.info(
-                "Well anchor neighbourhood: radius=%d grid (%.0f step-units), sigma=%.1f, max_neighbors=%d, total_nbr=%d",
+                "Log-AI anchor neighbourhood: radius=%d grid (%.0f step-units), sigma=%.1f, max_neighbors=%d, total_nbr=%d",
                 neighborhood_radius, phys_radius, sigma, max_nbr, int(neighbor_weights_flat.numel()),
             )
         else:
             if dataset is None:
-                raise ValueError("dataset is required for well anchor precomputation.")
-            for w in range(n_wells):
+                raise ValueError("dataset is required for log-AI anchor precomputation.")
+            for w in range(n_anchors):
                 ds_idx = dataset_indices_arr[w]
                 item = dataset[int(ds_idx)]
                 inp = _as_tensor(item["input"]).unsqueeze(0)
@@ -246,16 +265,17 @@ class WellLogAIAnchor:
                 neighbor_lfm_raw = torch.cat([neighbor_lfm_raw, lfm]) if neighbor_lfm_raw.numel() > 0 else lfm
                 neighbor_taper = torch.cat([neighbor_taper, tap]) if neighbor_taper.numel() > 0 else tap
                 neighbor_ranges.append((w, w + 1))
-            neighbor_weights_flat = torch.ones(n_wells, dtype=torch.float32)
+            neighbor_weights_flat = torch.ones(n_anchors, dtype=torch.float32)
 
         anchor = cls(
-            prior_file=Path(prior_file),
+            anchor_file=Path(anchor_file),
             lambda_weight=float(lambda_weight),
             batch_size=int(batch_size),
-            use_prior_weight=bool(use_prior_weight),
+            use_anchor_weight=bool(use_anchor_weight),
             dataset_indices=dataset_indices_arr,
-            flat_indices=np.asarray(prior.flat_indices[rows], dtype=np.int64),
-            well_names=np.asarray(prior.well_names[rows]).astype(str),
+            flat_indices=np.asarray(anchor_bundle.flat_indices[rows], dtype=np.int64),
+            anchor_names=np.asarray(anchor_bundle.anchor_names[rows]).astype(str),
+            anchor_types=np.asarray(anchor_bundle.anchor_types[rows]).astype(str),
             target_log_ai=torch.from_numpy(target_log_ai),
             mask_weight=torch.from_numpy(weights),
             neighborhood_radius=int(neighborhood_radius),
@@ -268,22 +288,23 @@ class WellLogAIAnchor:
             lowpass_cutoff_hz=actual_cutoff if not cutoff_is_wavelength else None,
         )
         logger.info(
-            "Well log-AI anchor enabled: wells=%d, lambda=%.3e, prior=%s",
-            n_wells,
+            "Log-AI anchor enabled: anchors=%d, lambda=%.3e, file=%s",
+            n_anchors,
             float(lambda_weight),
-            prior_file,
+            anchor_file,
         )
         return anchor
 
     def summary(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "enabled": True,
-            "prior_file": self.prior_file,
-            "lambda_well_log_ai": self.lambda_weight,
+            "anchor_file": self.anchor_file,
+            "lambda_log_ai_anchor": self.lambda_weight,
             "batch_size": self.batch_size,
-            "use_prior_weight": self.use_prior_weight,
-            "n_wells": int(self.dataset_indices.size),
-            "well_names": self.well_names.tolist(),
+            "use_anchor_weight": self.use_anchor_weight,
+            "n_anchors": int(self.dataset_indices.size),
+            "anchor_names": self.anchor_names.tolist(),
+            "anchor_types": self.anchor_types.tolist(),
             "flat_indices": self.flat_indices.tolist(),
             "neighborhood_radius": self.neighborhood_radius,
             "lowpass_cutoff_wavelength_m": self.lowpass_cutoff_wavelength_m,
@@ -294,12 +315,12 @@ class WellLogAIAnchor:
         return result
 
     def sample_rows(self, *, training: bool) -> np.ndarray:
-        n_wells = int(self.dataset_indices.size)
-        if self.batch_size <= 0 or self.batch_size >= n_wells:
-            return np.arange(n_wells, dtype=np.int64)
+        n_anchors = int(self.dataset_indices.size)
+        if self.batch_size <= 0 or self.batch_size >= n_anchors:
+            return np.arange(n_anchors, dtype=np.int64)
         if training:
-            return np.random.choice(n_wells, size=self.batch_size, replace=False).astype(np.int64)
-        return np.arange(min(self.batch_size, n_wells), dtype=np.int64)
+            return np.random.choice(n_anchors, size=self.batch_size, replace=False).astype(np.int64)
+        return np.arange(min(self.batch_size, n_anchors), dtype=np.int64)
 
     def compute_loss(
         self,
@@ -311,13 +332,13 @@ class WellLogAIAnchor:
     ) -> tuple[Tensor, dict[str, float]]:
         rows = self.sample_rows(training=training)
         if rows.size == 0:
-            return zero_well_anchor_metrics(device)
+            return zero_log_ai_anchor_metrics(device)
 
-        # ── gather neighbour slices for selected wells ──
+        # ── gather neighbour slices for selected anchors ──
         slices = [self.neighbor_ranges[r] for r in rows]
         total_nbr = sum(e - s for s, e in slices)
         if total_nbr == 0:
-            return zero_well_anchor_metrics(device)
+            return zero_log_ai_anchor_metrics(device)
 
         # ── build flat batch via index cat ──
         all_idx = torch.cat([torch.arange(s, e) for s, e in slices])
@@ -329,7 +350,7 @@ class WellLogAIAnchor:
         ai, _ = compose_impedance(x, lfm_raw, taper_weight)
         pred_log_ai = torch.log(torch.clamp(ai.squeeze(1), min=1e-6))  # (total_nbr, n_sample)
 
-        # ── per-well loss with distance weighting ──
+        # ── per-anchor loss with distance weighting ──
         total_loss = torch.zeros((), device=device)
         total_denom = torch.zeros((), device=device)
         cursor = 0
@@ -352,25 +373,30 @@ class WellLogAIAnchor:
         raw_loss = total_loss / total_denom.clamp(min=1.0)
         term = self.lambda_weight * raw_loss
         return term, {
-            "well_log_ai": float(raw_loss.detach().cpu().item()),
-            "well_log_ai_term": float(term.detach().cpu().item()),
-            "well_anchor_traces": float(rows.size),
-            "well_anchor_neighbors": float(total_nbr),
+            "log_ai_anchor": float(raw_loss.detach().cpu().item()),
+            "log_ai_anchor_term": float(term.detach().cpu().item()),
+            "log_ai_anchor_traces": float(rows.size),
+            "log_ai_anchor_neighbors": float(total_nbr),
         }
 
 
-def disabled_well_anchor_summary(
+def disabled_log_ai_anchor_summary(
     *,
-    prior_file: Path | None,
+    anchor_file: Path | None,
     lambda_weight: float,
 ) -> dict[str, Any]:
     return {
         "enabled": False,
-        "prior_file": prior_file,
-        "lambda_well_log_ai": lambda_weight,
+        "anchor_file": anchor_file,
+        "lambda_log_ai_anchor": lambda_weight,
     }
 
 
-def zero_well_anchor_metrics(device: torch.device) -> tuple[Tensor, dict[str, float]]:
+def zero_log_ai_anchor_metrics(device: torch.device) -> tuple[Tensor, dict[str, float]]:
     zero = torch.zeros((), device=device)
-    return zero, {"well_log_ai": 0.0, "well_log_ai_term": 0.0, "well_anchor_traces": 0.0, "well_anchor_neighbors": 0.0}
+    return zero, {
+        "log_ai_anchor": 0.0,
+        "log_ai_anchor_term": 0.0,
+        "log_ai_anchor_traces": 0.0,
+        "log_ai_anchor_neighbors": 0.0,
+    }

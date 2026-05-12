@@ -18,13 +18,6 @@ checkshots / well heads / well tops / interpretation 文本，
 4. load_vp_rho_logset_from_las: 从 LAS 路径构造 ``grid.LogSet``。
 5. import_checkshots_petrel / import_well_heads_petrel / import_well_tops_petrel / import_interpretation_petrel:
    读取 Petrel 文本结果。
-
-Examples
---------
->>> from pathlib import Path
->>> from cup.petrel.load import import_checkshots_petrel
->>> path = Path("demo.checkshots.txt")
->>> # table = import_checkshots_petrel(path)  # doctest: +SKIP
 """
 
 from __future__ import annotations
@@ -119,6 +112,7 @@ def import_seismic(
 
 
 def _normalize_mnemonic(name: str) -> str:
+    """规范化曲线简称的大小写与空白。"""
     return str(name).strip().upper()
 
 
@@ -135,6 +129,7 @@ def _select_curve_mnemonic(
     property_name: str,
     curve_mnemonic: Optional[str] = None,
 ) -> str:
+    """从候选简称中选择唯一可用曲线。"""
     columns = [str(c) for c in las_df.columns]
     norm_to_original = {_normalize_mnemonic(c): c for c in columns}
 
@@ -164,6 +159,7 @@ def _select_curve_mnemonic(
 
 
 def _get_curve_unit(las_file: lasio.LASFile, selected_mnemonic: str) -> str:
+    """获取 LAS 曲线的单位字符串。"""
     norm_selected = _normalize_mnemonic(selected_mnemonic)
     for curve in las_file.curves:
         if _normalize_mnemonic(curve.mnemonic) == norm_selected:
@@ -172,6 +168,7 @@ def _get_curve_unit(las_file: lasio.LASFile, selected_mnemonic: str) -> str:
 
 
 def _replace_sentinel_values(values: object) -> np.ndarray:
+    """将异常占位值替换为 NaN。"""
     out = np.asarray(values, dtype=float).copy()
     for sentinel in _SENTINEL_VALUES:
         out[np.isclose(out, sentinel, equal_nan=False)] = np.nan
@@ -180,6 +177,7 @@ def _replace_sentinel_values(values: object) -> np.ndarray:
 
 
 def _convert_velocity_input_to_mps(values: object, unit: str, property_name: str) -> np.ndarray:
+    """将速度或时差曲线转换为 m/s。"""
     curve_values = _replace_sentinel_values(values)
     curve_values[curve_values <= 0] = np.nan
 
@@ -200,6 +198,7 @@ def _convert_velocity_input_to_mps(values: object, unit: str, property_name: str
 
 
 def _convert_density_to_g_cm3(density_values: object, unit: str) -> np.ndarray:
+    """将密度曲线转换为 g/cm3。"""
     density = _replace_sentinel_values(density_values)
 
     unit_norm = str(unit).strip().lower().replace(" ", "")

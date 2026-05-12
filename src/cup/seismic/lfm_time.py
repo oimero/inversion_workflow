@@ -15,16 +15,6 @@
 2. LfmTimeModelResult: 低频模型体、方差体与覆盖统计的结果封装。
 3. lowpass_twt_log: 对 TWT 域单条曲线执行低通滤波。
 4. build_lfm_time_model: 基于层位约束与井点控制构建时间域低频模型。
-
-Examples
---------
->>> import numpy as np
->>> from cup.seismic.lfm_time import LfmTimeWell, lowpass_twt_log
->>> from wtie.processing import grid
->>> twt_log = grid.Log(np.array([10., 20., 30.]), np.array([1.0, 1.5, 2.0]), "twt", name="AI")
->>> filtered = lowpass_twt_log(twt_log, cutoff_hz=0.4, order=6)
->>> filtered.is_twt
-True
 """
 
 from __future__ import annotations
@@ -221,6 +211,7 @@ def lowpass_twt_log(
 
 
 def _resolve_well_position(well: LfmTimeWell, survey: Optional[SurveyContext]) -> tuple[float, float]:
+    """解析井位的 inline/xline 坐标。"""
     if well.inline is not None and well.xline is not None:
         inline = float(well.inline)
         xline = float(well.xline)
@@ -247,6 +238,7 @@ def _maybe_extend_time_depth_table(
     twt_max: float,
     dt: float,
 ) -> tuple[grid.TimeDepthTable, bool]:
+    """按目标时间范围扩展时深表。"""
     extended = table.extend_to_twt_range(twt_min=twt_min, twt_max=twt_max, dt=dt, fit_points=3)
     was_extended = bool(
         extended.size != table.size
@@ -262,6 +254,7 @@ def _convert_property_log_to_twt(
     trajectory: Optional[grid.WellPath],
     dt: float,
 ) -> tuple[grid.Log, str]:
+    """将属性曲线转换到 TWT 域并返回转换模式。"""
     if log.is_twt:
         return log, "already_twt"
 
@@ -294,6 +287,7 @@ def _prepare_well(
     filter_buffer_seconds: Optional[float],
     filter_buffer_mode: str,
 ) -> _PreparedLfmTimeWell:
+    """标准化井输入并生成建模控制点。"""
     inline, xline = _resolve_well_position(well, survey)
     horizon_times = target_layer.get_interpretation_values_at_location(inline, xline)
     sample_min = float(target_layer.geometry["sample_min"])

@@ -187,6 +187,7 @@ def lowpass_depth_log(
 
 
 def _resolve_well_position(well: LfmDepthWell, survey: Optional[SurveyContext]) -> tuple[float, float]:
+    """解析井位的 inline/xline 坐标。"""
     if well.inline is not None and well.xline is not None:
         inline = float(well.inline)
         xline = float(well.xline)
@@ -208,6 +209,7 @@ def _resolve_well_position(well: LfmDepthWell, survey: Optional[SurveyContext]) 
 
 
 def _normalize_depth_basis_and_values(log: grid.Log) -> tuple[np.ndarray, np.ndarray]:
+    """清理并排序深度基与曲线值。"""
     basis = np.asarray(log.basis, dtype=float)
     values = np.asarray(log.values, dtype=float)
     finite_mask = np.isfinite(basis) & np.isfinite(values)
@@ -232,6 +234,7 @@ def _convert_md_log_to_tvdss(
     trajectory: grid.WellPath,
     dz: float,
 ) -> grid.Log:
+    """将 MD 域曲线转换为 TVDSS 域曲线。"""
     log_md, log_values = _normalize_depth_basis_and_values(log)
     trajectory_md = np.asarray(trajectory.md, dtype=float)
     trajectory_tvdss = np.asarray(trajectory.tvdss, dtype=float)
@@ -287,6 +290,7 @@ def _convert_property_log_to_tvdss(
     well: LfmDepthWell,
     dz: float,
 ) -> tuple[grid.Log, str, Optional[grid.WellPath], bool]:
+    """转换井曲线到 TVDSS 域并返回转换模式。"""
     log = well.property_log
     if log.is_tvdss:
         return log, "already_tvdss", well.trajectory, False
@@ -326,6 +330,7 @@ def _prepare_well(
     filter_buffer_meters: Optional[float],
     filter_buffer_mode: str,
 ) -> _PreparedLfmDepthWell:
+    """标准化井输入并生成建模控制点。"""
     inline, xline = _resolve_well_position(well, survey)
     horizon_depths = target_layer.get_interpretation_values_at_location(inline, xline)
     required_depth_min = float(horizon_depths[target_layer.horizon_names[0]])

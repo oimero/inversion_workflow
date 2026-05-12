@@ -14,13 +14,6 @@
 ------------
 1. replace_constant_value_intervals_in_log_dicts: 批量替换连续常值区间。
 2. clip_logsets_by_well_tops: 按井分层表在 MD 域裁剪曲线集合。
-
-Examples
---------
->>> import numpy as np
->>> from cup.well.process import _DEFAULT_ANOMALY_VALUE
->>> float(_DEFAULT_ANOMALY_VALUE)
--999.25
 """
 
 from typing import Any, Dict, Iterable, Optional, Sequence, Union, cast

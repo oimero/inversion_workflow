@@ -1,4 +1,20 @@
-"""cup.seismic.modeling: 采样域无关的层位约束建模核心。"""
+"""cup.seismic.modeling: 采样域无关的层位约束建模核心。
+
+本模块基于层位约束与井点控制构建三维体，支持层段比例切片、
+Kriging 插值、边界外延与方差输出。
+
+边界说明
+--------
+- 不负责时深转换、测井预处理或井轨迹解析。
+- 不包含可视化或反演训练流程。
+
+核心公开对象
+------------
+1. WellControl: 单井控制点描述。
+2. ZoneSliceModel: 单层段比例切片建模结果。
+3. LayerConstrainedModelResult: 建模输出与覆盖统计。
+4. build_layer_constrained_model: 层位约束建模入口。
+"""
 
 from __future__ import annotations
 
@@ -65,12 +81,14 @@ class LayerConstrainedModelResult:
 
 
 def _normalize_line_coordinates(coords: np.ndarray, line_min: float, line_step: float) -> np.ndarray:
+    """归一化 inline/xline 坐标到步长尺度。"""
     if line_step <= 0:
         raise ValueError(f"line_step must be positive, got {line_step}.")
     return (np.asarray(coords, dtype=float) - float(line_min)) / float(line_step)
 
 
 def _nearest_neighbor_range(inlines: np.ndarray, xlines: np.ndarray) -> float:
+    """估计控制点最近邻距离的中位数。"""
     if inlines.size <= 1:
         return 1.0
     coords = np.column_stack([inlines, xlines]).astype(float, copy=False)
@@ -95,6 +113,7 @@ def _krige_slice_on_line_domain(
     exact: bool,
     nugget: float,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """在规范化坐标上执行单切片 Kriging。"""
     finite_mask = np.isfinite(control_inlines) & np.isfinite(control_xlines) & np.isfinite(control_values)
     control_inlines = control_inlines[finite_mask]
     control_xlines = control_xlines[finite_mask]
@@ -132,6 +151,7 @@ def _krige_slice_on_line_domain(
 
 
 def _interpolate_log_at_sample(log: grid.Log, sample_value: float) -> float:
+    """在测井曲线中插值采样位置值。"""
     basis = np.asarray(log.basis, dtype=float)
     values = np.asarray(log.values, dtype=float)
     finite_mask = np.isfinite(basis) & np.isfinite(values)
@@ -154,6 +174,7 @@ def _interpolate_log_at_sample(log: grid.Log, sample_value: float) -> float:
 
 
 def _normalize_well_control(well: WellControl) -> WellControl:
+    """规范化井控制点数值类型与元信息。"""
     horizon_values = {name: float(value) for name, value in well.horizon_values.items()}
     return WellControl(
         well_name=well.well_name,
@@ -167,12 +188,11 @@ def _normalize_well_control(well: WellControl) -> WellControl:
 
 
 def _validate_required_horizon_values(well_controls: list[WellControl], target_layer: TargetLayer) -> None:
+    """校验井控制点包含所需层位值。"""
     for well in well_controls:
         missing_horizon_names = [name for name in target_layer.horizon_names if name not in well.horizon_values]
         if missing_horizon_names:
-            raise ValueError(
-                f"well '{well.well_name}' is missing horizon_values for: {missing_horizon_names}."
-            )
+            raise ValueError(f"well '{well.well_name}' is missing horizon_values for: {missing_horizon_names}.")
 
         for horizon_name in target_layer.horizon_names:
             horizon_value = float(well.horizon_values[horizon_name])
@@ -184,6 +204,7 @@ def _add_boundary_extension_horizon_values(
     well_controls: list[WellControl],
     modeling_target_layer: TargetLayer,
 ) -> list[WellControl]:
+    """补全边界外延层位值。"""
     completed_controls = []
     for well in well_controls:
         horizon_values = dict(well.horizon_values)
@@ -216,6 +237,7 @@ def _validate_well_controls(
     target_layer: TargetLayer,
     modeling_target_layer: TargetLayer,
 ) -> list[WellControl]:
+    """校验并规范化井控制点集合。"""
     if not well_controls:
         raise ValueError("well_controls must contain at least one WellControl.")
 
@@ -241,6 +263,7 @@ def _fill_missing_slices_with_neighbors(
     slice_modes: list[str],
     valid_slice_mask: np.ndarray,
 ) -> None:
+    """用相邻切片补全缺失切片。"""
     valid_indices = np.flatnonzero(valid_slice_mask)
     if valid_indices.size == 0:
         return
@@ -294,6 +317,7 @@ def _build_zone_slice_model(
     exact: bool,
     nugget: float,
 ) -> ZoneSliceModel:
+    """构建单层段比例切片模型。"""
     n_slices = slice_u.size
     n_il = ilines.size
     n_xl = xlines.size
@@ -384,6 +408,7 @@ def _fill_zone_with_adjacent_boundary(
     source_values: np.ndarray,
     source_variance: np.ndarray,
 ) -> None:
+    """用相邻层段边界切片填充空层段。"""
     zone_model.slice_values[:] = source_values
     zone_model.slice_variance[:] = source_variance
     zone_model.slice_modes[:] = ["adjacent_zone_boundary_fill"] * zone_model.slice_values.shape[0]
@@ -520,7 +545,41 @@ def build_layer_constrained_model(
     nugget: float = 0.0,
     post_slice_smoothing: bool = False,
 ) -> LayerConstrainedModelResult:
-    """基于层位约束与井点控制构建三维采样体。"""
+    """基于层位约束与井点控制构建三维采样体。
+
+    Parameters
+    ----------
+    target_layer : TargetLayer
+        目标层位对象。
+    well_controls : list[WellControl]
+        井控制点列表，property_log 已位于目标采样域。
+    boundary_extension_samples : int, default=0
+        上下边界外延的样点数。
+    n_slices : int, default=32
+        每个层段的比例切片数量。
+    variogram : str, default="spherical"
+        变差函数模型名称："spherical"、"exponential" 或 "gaussian"。
+    exact : bool, default=True
+        Kriging 是否精确通过控制点。
+    nugget : float, default=0.0
+        块金效应参数。
+    post_slice_smoothing : bool, default=False
+        是否对切片结果进行轻度平滑。
+
+    Returns
+    -------
+    LayerConstrainedModelResult
+        建模输出与覆盖统计。
+
+    Raises
+    ------
+    ValueError
+        当输入参数或井控制点非法时。
+
+    Notes
+    -----
+    Kriging 在 inline/xline 归一化坐标上执行，输出方差体与建模元信息。
+    """
     if n_slices < 2:
         raise ValueError(f"n_slices must be >= 2, got {n_slices}.")
     if boundary_extension_samples < 0:
@@ -585,7 +644,9 @@ def build_layer_constrained_model(
             top_grid=top_grid,
             bottom_grid=bottom_grid,
             well_top_values=np.asarray([well.horizon_values[top_name] for well in prepared_controls], dtype=float),
-            well_bottom_values=np.asarray([well.horizon_values[bottom_name] for well in prepared_controls], dtype=float),
+            well_bottom_values=np.asarray(
+                [well.horizon_values[bottom_name] for well in prepared_controls], dtype=float
+            ),
             variogram=variogram,
             exact=exact,
             nugget=nugget,

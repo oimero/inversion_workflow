@@ -1,8 +1,7 @@
-"""cup.seismic.process: 地震解释层位预处理、插值与目的层对象。
+"""cup.seismic.process: 地震解释层位预处理与插值。
 
-本模块提供离散层位解释点到规则 inline/xline 网格的预处理与插值能力，
-并封装 `TargetLayer` 对象，用于按层序组织多个层位、查询浮点位置解释值、
-转换到相对采样索引以及生成层段三维布尔掩码。
+本模块提供离散层位解释点到规则 inline/xline 网格的预处理、异常剔除与插值能力，
+用于单层位面清洗、网格化与插值补全。
 
 边界说明
 --------
@@ -14,31 +13,6 @@
 核心公开对象
 ------------
 1. interpolate_interpretation_surface: 清洗并插值单个层位面。
-2. TargetLayer: 管理有序层位并提供层段相关操作。
-3. TargetLayer.get_interpretation_values_at_location: 查询浮点位置上的层位值。
-4. TargetLayer.to_mask: 将相邻层位转换为三维布尔掩码。
-
-Examples
---------
->>> import pandas as pd
->>> from cup.seismic.process import TargetLayer, interpolate_interpretation_surface
->>> geometry = {
-...     "inline_min": 0, "inline_max": 1, "inline_step": 1,
-...     "xline_min": 0, "xline_max": 1, "xline_step": 1,
-...     "sample_min": 0.0, "sample_max": 3.0, "sample_step": 1.0,
-...     "sample_domain": "time", "sample_unit": "s",
-... }
->>> h1 = pd.DataFrame(
-...     {"inline": [0, 0, 1, 1], "xline": [0, 1, 0, 1], "interpretation": [1.0, 1.1, 1.2, 1.3]}
-... )
->>> h2 = pd.DataFrame(
-...     {"inline": [0, 0, 1, 1], "xline": [0, 1, 0, 1], "interpretation": [2.0, 2.1, 2.2, 2.3]}
-... )
->>> h1_interp = interpolate_interpretation_surface(h1, geometry, outlier_threshold=0.05)
->>> h2_interp = interpolate_interpretation_surface(h2, geometry, outlier_threshold=0.05)
->>> target = TargetLayer({"h1": h1_interp, "h2": h2_interp}, geometry, ["h1", "h2"])
->>> sorted(target.get_interpretation_values_at_location(0.5, 0.5))
-['h1', 'h2']
 """
 
 import warnings

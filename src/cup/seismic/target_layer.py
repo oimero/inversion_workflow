@@ -1,9 +1,23 @@
-"""Fault-tolerant target-layer preparation from raw interpretation picks.
+"""cup.seismic.target_layer: 原始层位解释的容错化目标层位准备。
 
-This module defines a ``TargetLayer`` that starts from raw, uninterpolated
-horizon interpretations.  It builds interpolation support masks, trace-level QC
-masks, and full-coverage horizon grids reconstructed from interpolated positive
-thicknesses.
+本模块以原始层位拾取为输入，构建插值支撑掩码、trace 级 QC 掩码，
+并通过厚度插值重建全覆盖层位网格。
+
+边界说明
+--------
+- 不负责反演优化、训练流程或可视化渲染。
+- 不处理下游属性建模或测井重采样。
+
+核心公开对象
+------------
+1. TargetLayer: 目标层位构建与 QC 汇总。
+2. TargetLayer.with_boundary_extension: 生成上下外延层位副本。
+3. TargetLayer.to_mask: 生成三维样点掩码。
+
+Examples
+--------
+>>> from cup.seismic.target_layer import TargetLayer
+>>> # raw_horizon_dfs 与 geometry 需提前准备
 """
 
 from __future__ import annotations
@@ -34,12 +48,14 @@ class _SurfaceInterpolation:
 
 
 def _build_axis(axis_min: float, axis_max: float, axis_step: float, axis_name: str) -> np.ndarray:
+    """构建等步长坐标轴。"""
     if axis_step <= 0:
         raise ValueError(f"{axis_name}_step must be positive, got {axis_step}.")
     return np.arange(float(axis_min), float(axis_max) + float(axis_step), float(axis_step), dtype=float)
 
 
 def _validate_geometry_keys(geometry: Dict[str, Any]) -> None:
+    """校验几何参数必要键。"""
     required = {
         "inline_min",
         "inline_max",
@@ -60,6 +76,7 @@ def _normalize_interpretation_unit_for_geometry(
     interpretation_df: pd.DataFrame,
     geometry: Dict[str, Any],
 ) -> pd.DataFrame:
+    """按几何单位规范解释值。"""
     sample_domain = str(geometry.get("sample_domain", "")).lower()
     sample_unit = str(geometry.get("sample_unit", "")).lower()
     if sample_domain != "time" or sample_unit != "s" or "interpretation" not in interpretation_df.columns:
@@ -78,6 +95,7 @@ def _normalize_interpretation_unit_for_geometry(
 
 
 def _require_interpretation_columns(df: pd.DataFrame, name: str) -> None:
+    """检查解释表所需列。"""
     required = {"inline", "xline", "interpretation"}
     missing = required - set(df.columns)
     if missing:
@@ -89,6 +107,7 @@ def _grid_raw_interpretation(
     il_axis: np.ndarray,
     xl_axis: np.ndarray,
 ) -> np.ndarray:
+    """将原始解释点格网化。"""
     grid = np.full((il_axis.size, xl_axis.size), np.nan, dtype=float)
 
     values = interpretation_df[["inline", "xline", "interpretation"]].to_numpy(dtype=float, copy=False)
@@ -134,6 +153,7 @@ def _grid_raw_interpretation(
 
 
 def _nanmedian(values: np.ndarray) -> float:
+    """对包含 NaN 的数组求中位数。"""
     if np.all(np.isnan(values)):
         return np.nan
     return float(np.nanmedian(values))
@@ -144,6 +164,7 @@ def _remove_isolated_outliers_with_stats(
     threshold: Optional[float],
     min_neighbor_count: int,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
+    """移除孤立异常点并返回统计。"""
     if min_neighbor_count < 1:
         raise ValueError(f"outlier_min_neighbor_count must be >= 1, got {min_neighbor_count}.")
 
@@ -205,6 +226,7 @@ def _linear_then_nearest_from_grid(
     raw_grid: Optional[np.ndarray] = None,
     outlier_stats: Optional[Dict[str, Any]] = None,
 ) -> _SurfaceInterpolation:
+    """先线性插值再最近邻补全网格。"""
     despiked_grid = control_grid.astype(float, copy=True)
     original_grid = despiked_grid.copy() if raw_grid is None else raw_grid.astype(float, copy=True)
     raw_mask = np.isfinite(original_grid)
@@ -263,6 +285,7 @@ def _interpolate_surface_from_raw_df(
     outlier_threshold: Optional[float],
     outlier_min_neighbor_count: int,
 ) -> _SurfaceInterpolation:
+    """从原始拾取构建插值网格。"""
     raw_grid = _grid_raw_interpretation(interpretation_df, il_axis, xl_axis)
     despiked_grid, outlier_stats = _remove_isolated_outliers_with_stats(
         raw_grid,
@@ -282,6 +305,7 @@ def _resolve_axis_interpolation_window(
     coord_float: float,
     axis_name: str,
 ) -> tuple[int, int, float]:
+    """解析轴向插值窗口索引与权重。"""
     coord = float(coord_float)
     axis_min = float(axis[0])
     axis_max = float(axis[-1])
@@ -312,6 +336,7 @@ def _bilinear_interpolate_surface_at_location(
     il_float: float,
     xl_float: float,
 ) -> float:
+    """对单点进行双线性插值。"""
     il0, il1, wi = _resolve_axis_interpolation_window(il_axis, il_float, "inline")
     xl0, xl1, wj = _resolve_axis_interpolation_window(xl_axis, xl_float, "xline")
 
@@ -331,30 +356,30 @@ def _bilinear_interpolate_surface_at_location(
 
 
 class TargetLayer:
-    """Prepare ordered target layers from raw horizon interpretations.
+    """从原始层位解释准备目标层位与 QC。
 
     Parameters
     ----------
-    raw_horizon_dfs
-        Mapping from horizon name to raw, uninterpolated interpretation picks.
-    geometry
-        Survey geometry.  Inline/xline and sample axis keys are required.
-    horizon_names
-        Horizon order from shallow/top to deep/bottom.
-    qc_output_dir
-        Optional QC CSV output directory.  When omitted, QC DataFrames are kept
-        in memory and no files or directories are created.
-    min_thickness
-        Minimum allowed adjacent-layer thickness.  Defaults to sample step.
-    nearest_distance_limit
-        Optional maximum nearest-neighbor distance in trace-index units.  The
-        default ``None`` leaves nearest filling unrestricted.
-    outlier_threshold
-        Optional isolated-pick removal threshold in interpretation units.  When
-        omitted, isolated outlier removal is disabled.
-    outlier_min_neighbor_count
-        Minimum valid cross-neighbor count required before testing a pick as an
-        isolated outlier.
+    raw_horizon_dfs : dict[str, pandas.DataFrame]
+        层位名称到原始拾取表的映射，需包含 ``inline``、``xline``、``interpretation`` 列。
+    geometry : dict[str, Any]
+        工区几何参数，要求包含 inline/xline/sample 轴的最小、最大与步长。
+    horizon_names : list[str]
+        层位顺序，从浅到深。
+    qc_output_dir : str or Path or None, default=None
+        QC 输出目录；为 None 时仅保存在内存。
+    min_thickness : float or None, default=None
+        最小允许厚度，None 时使用 ``sample_step``。
+    nearest_distance_limit : float or None, default=None
+        最近邻补全的最大距离（trace 索引单位）。
+    outlier_threshold : float or None, default=None
+        孤立异常点阈值，None 时禁用剔除。
+    outlier_min_neighbor_count : int, default=2
+        判断孤立异常点所需的最小邻居数量。
+
+    Notes
+    -----
+    插值流程为线性插值后最近邻补全，并通过厚度插值保证层位顺序一致。
     """
 
     def __init__(
@@ -392,9 +417,7 @@ class TargetLayer:
         self.outlier_threshold = None if outlier_threshold is None else float(outlier_threshold)
         self.outlier_min_neighbor_count = int(outlier_min_neighbor_count)
         if self.outlier_min_neighbor_count < 1:
-            raise ValueError(
-                f"outlier_min_neighbor_count must be >= 1, got {self.outlier_min_neighbor_count}."
-            )
+            raise ValueError(f"outlier_min_neighbor_count must be >= 1, got {self.outlier_min_neighbor_count}.")
 
         self._il_axis, self._xl_axis, self._sample_axis = self._build_axes()
         self.raw_horizon_dfs = {
@@ -428,9 +451,7 @@ class TargetLayer:
         self.nearest_distance_grids = {
             name: interp.nearest_distance_grid.copy() for name, interp in self._surface_interpolations.items()
         }
-        self.outlier_stats = {
-            name: dict(interp.outlier_stats) for name, interp in self._surface_interpolations.items()
-        }
+        self.outlier_stats = {name: dict(interp.outlier_stats) for name, interp in self._surface_interpolations.items()}
 
         self._build_trace_qc_masks()
         self._horizon_grids = self._build_final_horizon_grids()
@@ -442,6 +463,7 @@ class TargetLayer:
             self.write_qc(self.qc_output_dir)
 
     def _build_axes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """构建 inline/xline/sample 轴。"""
         il_axis = _build_axis(
             self.geometry["inline_min"],
             self.geometry["inline_max"],
@@ -463,6 +485,7 @@ class TargetLayer:
         return il_axis, xl_axis, sample_axis
 
     def _build_trace_qc_masks(self) -> None:
+        """构建 trace 级 QC 掩码。"""
         shape = (self._il_axis.size, self._xl_axis.size)
         no_support_any = np.zeros(shape, dtype=bool)
         for support_mask in self.interpolation_support_masks.values():
@@ -516,6 +539,7 @@ class TargetLayer:
         self._summary_pair_records = pair_records
 
     def _build_final_horizon_grids(self) -> dict[str, np.ndarray]:
+        """基于厚度插值生成最终层位网格。"""
         final_grids = {}
         top_name = self.horizon_names[0]
         top_grid = self.independent_filled_horizon_grids[top_name].copy()
@@ -551,6 +575,7 @@ class TargetLayer:
         return final_grids
 
     def _grid_to_horizon_df(self, grid: np.ndarray) -> pd.DataFrame:
+        """将层位网格转为 DataFrame。"""
         il_grid, xl_grid = np.meshgrid(self._il_axis, self._xl_axis, indexing="ij")
         return pd.DataFrame(
             {
@@ -561,6 +586,7 @@ class TargetLayer:
         )
 
     def _trace_qc_dataframe(self) -> pd.DataFrame:
+        """生成 trace 级 QC DataFrame。"""
         rows = []
         for i, inline in enumerate(self._il_axis):
             for j, xline in enumerate(self._xl_axis):
@@ -597,6 +623,7 @@ class TargetLayer:
         return pd.DataFrame.from_records(rows)
 
     def _pair_qc_dataframe(self) -> pd.DataFrame:
+        """生成层对 QC DataFrame。"""
         records = []
         for top_name, bottom_name in self.iter_zones():
             pair_qc = self._pair_qc_masks[(top_name, bottom_name)]
@@ -636,6 +663,7 @@ class TargetLayer:
         return pd.DataFrame.from_records(records, columns=columns)
 
     def _summary_dataframe(self) -> pd.DataFrame:
+        """生成 QC 汇总 DataFrame。"""
         records = []
         for horizon_name in self.horizon_names:
             stats = self.outlier_stats.get(horizon_name, {})
@@ -689,6 +717,7 @@ class TargetLayer:
         return pd.DataFrame.from_records(records)
 
     def _build_qc_dataframes(self) -> None:
+        """构建全部 QC DataFrame。"""
         self.trace_qc_df = self._trace_qc_dataframe()
         self.pair_qc_df = self._pair_qc_dataframe()
         self.qc_summary_df = self._summary_dataframe()
@@ -697,6 +726,18 @@ class TargetLayer:
         self.qc_summary_path: Optional[Path] = None
 
     def write_qc(self, qc_output_dir: str | Path) -> dict[str, Path]:
+        """写出 QC CSV 文件。
+
+        Parameters
+        ----------
+        qc_output_dir : str or Path
+            输出目录。
+
+        Returns
+        -------
+        dict[str, Path]
+            写出文件路径字典。
+        """
         qc_output_path = Path(qc_output_dir)
         qc_output_path.mkdir(parents=True, exist_ok=True)
         self.qc_output_dir = qc_output_path
@@ -714,28 +755,82 @@ class TargetLayer:
 
     @property
     def ilines(self) -> np.ndarray:
+        """返回 inline 轴坐标。
+
+        Returns
+        -------
+        np.ndarray
+            inline 轴取值。
+        """
         return self._il_axis.copy()
 
     @property
     def xlines(self) -> np.ndarray:
+        """返回 xline 轴坐标。
+
+        Returns
+        -------
+        np.ndarray
+            xline 轴取值。
+        """
         return self._xl_axis.copy()
 
     @property
     def samples(self) -> np.ndarray:
+        """返回采样轴坐标。
+
+        Returns
+        -------
+        np.ndarray
+            采样轴取值。
+        """
         return self._sample_axis.copy()
 
     def iter_zones(self) -> list[tuple[str, str]]:
+        """返回相邻层位对列表。
+
+        Returns
+        -------
+        list[tuple[str, str]]
+            相邻层位对 (top, bottom)。
+        """
         return list(zip(self.horizon_names[:-1], self.horizon_names[1:]))
 
     def get_trace_valid_mask(self) -> np.ndarray:
-        """Return the reliable-control trace mask before delivery filling."""
+        """返回可靠控制的 trace 掩码。
+
+        Returns
+        -------
+        np.ndarray
+            可靠控制 trace 的布尔掩码。
+        """
         return self.valid_control_mask.copy()
 
     def get_filled_model_mask(self) -> np.ndarray:
-        """Return where final horizon grids contain finite values."""
+        """返回填充后层位网格的有效掩码。
+
+        Returns
+        -------
+        np.ndarray
+            填充后层位网格的布尔掩码。
+        """
         return self.filled_model_mask.copy()
 
     def get_zone_valid_mask(self, zone: tuple[str, str], *, use_valid_control_mask: bool = True) -> np.ndarray:
+        """返回指定层段的有效掩码。
+
+        Parameters
+        ----------
+        zone : tuple[str, str]
+            层段名称对 (top, bottom)。
+        use_valid_control_mask : bool, default=True
+            是否仅使用可靠控制 trace。
+
+        Returns
+        -------
+        np.ndarray
+            指定层段的布尔掩码。
+        """
         top_name, bottom_name = self._resolve_zone(zone)
         top_grid, bottom_grid = self.get_zone_sample_index_grids((top_name, bottom_name))
         valid = np.isfinite(top_grid) & np.isfinite(bottom_grid) & (bottom_grid > top_grid)
@@ -744,6 +839,7 @@ class TargetLayer:
         return valid
 
     def _resolve_zone(self, zone: tuple[str, str]) -> tuple[str, str]:
+        """解析并校验层段名称对。"""
         top_name, bottom_name = zone
         if top_name not in self.horizon_names or bottom_name not in self.horizon_names:
             raise ValueError(f"zone contains unknown horizons: {zone}")
@@ -754,6 +850,23 @@ class TargetLayer:
         return top_name, bottom_name
 
     def get_horizon_grid(self, horizon_name: str) -> np.ndarray:
+        """返回指定层位的插值网格。
+
+        Parameters
+        ----------
+        horizon_name : str
+            层位名称。
+
+        Returns
+        -------
+        np.ndarray
+            层位网格。
+
+        Raises
+        ------
+        ValueError
+            当层位名称不存在时。
+        """
         if horizon_name not in self._horizon_grids:
             raise ValueError(f"horizon_name '{horizon_name}' is not in raw_horizon_dfs.")
         return self._horizon_grids[horizon_name].copy()
@@ -764,6 +877,27 @@ class TargetLayer:
         il_float: float,
         xl_float: float,
     ) -> float:
+        """获取指定层位在位置处的插值值。
+
+        Parameters
+        ----------
+        horizon_name : str
+            层位名称。
+        il_float : float
+            inline 坐标（浮点）。
+        xl_float : float
+            xline 坐标（浮点）。
+
+        Returns
+        -------
+        float
+            双线性插值结果。
+
+        Raises
+        ------
+        ValueError
+            当层位名称不存在时。
+        """
         if horizon_name not in self._horizon_grids:
             raise ValueError(f"horizon_name '{horizon_name}' is not in raw_horizon_dfs.")
         return _bilinear_interpolate_surface_at_location(
@@ -775,12 +909,43 @@ class TargetLayer:
         )
 
     def get_interpretation_values_at_location(self, il_float: float, xl_float: float) -> Dict[str, float]:
+        """获取所有层位在位置处的插值值。
+
+        Parameters
+        ----------
+        il_float : float
+            inline 坐标（浮点）。
+        xl_float : float
+            xline 坐标（浮点）。
+
+        Returns
+        -------
+        dict[str, float]
+            层位名称到插值值的映射。
+        """
         return {
             horizon_name: self.get_horizon_interpretation_at_location(horizon_name, il_float, xl_float)
             for horizon_name in self.horizon_names
         }
 
     def convert_horizon_to_relative_sample_index(self, horizon_name: str) -> pd.DataFrame:
+        """将层位解释值转换为相对样点索引。
+
+        Parameters
+        ----------
+        horizon_name : str
+            层位名称。
+
+        Returns
+        -------
+        pandas.DataFrame
+            包含 ``sample_index`` 列的层位解释表。
+
+        Raises
+        ------
+        ValueError
+            当层位名称不存在或解释值越界时。
+        """
         if horizon_name not in self._horizon_grids:
             raise ValueError(f"horizon_name '{horizon_name}' is not in raw_horizon_dfs.")
 
@@ -818,10 +983,23 @@ class TargetLayer:
         return out_df
 
     def _get_horizon_sample_index_grid(self, horizon_name: str) -> np.ndarray:
+        """获取层位相对样点索引网格。"""
         df = self.convert_horizon_to_relative_sample_index(horizon_name)
         return df["sample_index"].to_numpy(dtype=float).reshape((self._il_axis.size, self._xl_axis.size))
 
     def get_zone_sample_index_grids(self, zone: tuple[str, str]) -> tuple[np.ndarray, np.ndarray]:
+        """返回层段顶/底界样点索引网格。
+
+        Parameters
+        ----------
+        zone : tuple[str, str]
+            层段名称对 (top, bottom)。
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray]
+            顶界与底界样点索引网格。
+        """
         top_name, bottom_name = self._resolve_zone(zone)
         return self._get_horizon_sample_index_grid(top_name), self._get_horizon_sample_index_grid(bottom_name)
 
@@ -832,16 +1010,34 @@ class TargetLayer:
         top_extension_name: str = "top_extension",
         bottom_extension_name: str = "bottom_extension",
     ) -> "TargetLayer":
-        """Return a lightweight copy with synthetic top/bottom extension horizons."""
+        """返回包含上下外延层位的轻量副本。
+
+        Parameters
+        ----------
+        extension_samples : int
+            外延样点数。
+        top_extension_name : str, default="top_extension"
+            顶外延层位名称。
+        bottom_extension_name : str, default="bottom_extension"
+            底外延层位名称。
+
+        Returns
+        -------
+        TargetLayer
+            带外延层位的副本。
+
+        Raises
+        ------
+        ValueError
+            当参数非法或层位名称冲突时。
+        """
         if extension_samples < 0:
             raise ValueError(f"extension_samples must be >= 0, got {extension_samples}.")
         if extension_samples == 0:
             return self
         if top_extension_name == bottom_extension_name:
             raise ValueError("top_extension_name and bottom_extension_name must be different.")
-        duplicate_names = {
-            name for name in (top_extension_name, bottom_extension_name) if name in self.horizon_names
-        }
+        duplicate_names = {name for name in (top_extension_name, bottom_extension_name) if name in self.horizon_names}
         if duplicate_names:
             raise ValueError(f"extension horizon names already exist: {sorted(duplicate_names)}")
 
@@ -875,9 +1071,7 @@ class TargetLayer:
         out.independent_filled_horizon_grids = {
             name: grid.copy() for name, grid in self.independent_filled_horizon_grids.items()
         }
-        out.interpolation_support_masks = {
-            name: mask.copy() for name, mask in self.interpolation_support_masks.items()
-        }
+        out.interpolation_support_masks = {name: mask.copy() for name, mask in self.interpolation_support_masks.items()}
         out.raw_pick_masks = {name: mask.copy() for name, mask in self.raw_pick_masks.items()}
         out.nearest_distance_grids = {name: grid.copy() for name, grid in self.nearest_distance_grids.items()}
         out.outlier_stats = {name: dict(stats) for name, stats in self.outlier_stats.items()}
@@ -911,11 +1105,19 @@ class TargetLayer:
         *,
         use_valid_control_mask: bool = True,
     ) -> np.ndarray:
-        """Build a 3D sample mask.
+        """构建三维样点掩码。
 
-        By default, only reliable-control traces participate.  Pass
-        ``use_valid_control_mask=False`` to build a full-coverage mask from the
-        filled horizon grids.
+        Parameters
+        ----------
+        zone : tuple[str, str] or None, default=None
+            指定层段 (top, bottom)。为 None 时使用全部层段。
+        use_valid_control_mask : bool, default=True
+            是否仅使用可靠控制 trace；为 False 时使用填充后的全覆盖层位。
+
+        Returns
+        -------
+        np.ndarray
+            形状为 (n_il, n_xl, n_sample) 的布尔掩码。
         """
         n_il = int(self.geometry.get("n_il", self._il_axis.size))
         n_xl = int(self.geometry.get("n_xl", self._xl_axis.size))

@@ -1,4 +1,26 @@
-"""Shared wavelet loading and generation helpers."""
+"""cup.well.wavelet: 小波加载与生成辅助工具。
+
+本模块提供 Ricker 小波生成、CSV 波形加载与采样间隔校验等功能。
+
+边界说明
+--------
+- 本模块不处理地震文件读取或可视化绘图。
+- CSV 必须包含 ``time_s`` 与 ``amplitude`` 两列。
+
+核心公开对象
+------------
+1. make_wavelet: 生成时间域 Ricker 小波。
+2. load_wavelet_csv: 从 CSV 读取小波。
+3. infer_wavelet_dt: 推断规则采样间隔。
+4. compute_wavelet_active_half_support_s: 估计有效半支撑。
+5. validate_wavelet_dt: 校验小波采样间隔。
+
+Examples
+--------
+>>> from cup.well.wavelet import make_wavelet, infer_wavelet_dt
+>>> time_s, amp = make_wavelet("ricker", freq=30.0, dt=0.001, length=128)
+>>> _ = infer_wavelet_dt(time_s)
+"""
 
 from __future__ import annotations
 
@@ -17,7 +39,31 @@ def make_wavelet(
     length: int,
     gain: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Generate a time-domain wavelet and return ``(time_s, amplitude)``."""
+    """生成时间域小波。
+
+    Parameters
+    ----------
+    wavelet_type : str
+        小波类型，仅支持 ``"ricker"``。
+    freq : float
+        主频，单位 Hz。
+    dt : float
+        采样间隔，单位 s。
+    length : int
+        采样点数。
+    gain : float, default=1.0
+        振幅增益。
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(time_s, amplitude)``，单位为秒与振幅。
+
+    Raises
+    ------
+    ValueError
+        当输入参数非法或小波类型不支持时。
+    """
     if wavelet_type != "ricker":
         raise ValueError(f"Unsupported wavelet_type: {wavelet_type}")
     if freq <= 0.0:
@@ -34,7 +80,23 @@ def make_wavelet(
 
 
 def load_wavelet_csv(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load a time-domain wavelet CSV with columns ``time_s`` and ``amplitude``."""
+    """从 CSV 读取时间域小波。
+
+    Parameters
+    ----------
+    path : str or Path
+        CSV 路径，需包含 ``time_s`` 与 ``amplitude`` 列。
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(time_s, amplitude)``，时间轴严格递增。
+
+    Raises
+    ------
+    ValueError
+        当缺失必需列或样本不足/非法时。
+    """
     path = Path(path)
     df = pd.read_csv(path)
     required = {"time_s", "amplitude"}
@@ -59,7 +121,23 @@ def load_wavelet_csv(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def infer_wavelet_dt(time_s: np.ndarray) -> float:
-    """Return the regular sampling interval of a wavelet time axis."""
+    """推断小波时间轴的规则采样间隔。
+
+    Parameters
+    ----------
+    time_s : np.ndarray
+        时间轴数组，单位 s。
+
+    Returns
+    -------
+    float
+        采样间隔，单位 s。
+
+    Raises
+    ------
+    ValueError
+        当时间轴不严格递增或非规则采样时。
+    """
     time_s = np.asarray(time_s, dtype=np.float64).reshape(-1)
     if time_s.size < 2:
         raise ValueError("wavelet time_s must contain at least two samples.")
@@ -79,11 +157,29 @@ def compute_wavelet_active_half_support_s(
     *,
     active_threshold: float = DEFAULT_ACTIVE_SUPPORT_THRESHOLD,
 ) -> float:
-    """Estimate wavelet active half-support in seconds.
+    """估计小波有效半支撑（秒）。
 
-    The active support is where ``abs(wavelet)`` is at least
-    ``active_threshold`` times the wavelet peak amplitude. The returned value
-    is the largest active time offset from the wavelet peak.
+    有效支撑定义为 ``abs(wavelet)`` 不小于峰值的
+    ``active_threshold`` 倍；返回峰值处到有效支撑边界的最大时间偏移。
+
+    Parameters
+    ----------
+    wavelet_time_s : np.ndarray
+        时间轴数组，单位 s。
+    wavelet : np.ndarray
+        小波振幅数组。
+    active_threshold : float, default=DEFAULT_ACTIVE_SUPPORT_THRESHOLD
+        有效支撑阈值，相对于峰值的比例。
+
+    Returns
+    -------
+    float
+        有效半支撑时间，单位 s。
+
+    Raises
+    ------
+    ValueError
+        当输入为空、形状不一致或阈值非法时。
     """
     if not 0.0 < active_threshold <= 1.0:
         raise ValueError(f"active_threshold must be within (0, 1], got {active_threshold}.")
@@ -91,9 +187,7 @@ def compute_wavelet_active_half_support_s(
     wavelet_time_s = np.asarray(wavelet_time_s, dtype=np.float64).reshape(-1)
     wavelet = np.asarray(wavelet, dtype=np.float64).reshape(-1)
     if wavelet_time_s.shape != wavelet.shape:
-        raise ValueError(
-            f"wavelet_time_s shape {wavelet_time_s.shape} does not match wavelet shape {wavelet.shape}."
-        )
+        raise ValueError(f"wavelet_time_s shape {wavelet_time_s.shape} does not match wavelet shape {wavelet.shape}.")
     if wavelet.size == 0:
         raise ValueError("Cannot compute active half-support from an empty wavelet.")
 
@@ -108,7 +202,25 @@ def compute_wavelet_active_half_support_s(
 
 
 def validate_wavelet_dt(time_s: np.ndarray, expected_dt_s: float) -> float:
-    """Validate a file wavelet sampling interval against an expected seismic dt."""
+    """校验小波采样间隔是否匹配预期 dt。
+
+    Parameters
+    ----------
+    time_s : np.ndarray
+        小波时间轴，单位 s。
+    expected_dt_s : float
+        预期采样间隔，单位 s。
+
+    Returns
+    -------
+    float
+        推断得到的采样间隔。
+
+    Raises
+    ------
+    ValueError
+        当预期 dt 非法或与小波 dt 不一致时。
+    """
     expected_dt = float(expected_dt_s)
     if expected_dt <= 0.0:
         raise ValueError(f"expected_dt_s must be positive, got {expected_dt_s}.")

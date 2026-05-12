@@ -14,20 +14,6 @@ Petrel 或下游解释流程常用的交换格式。
 ------------
 1. export_logsets_to_las: 按井批量导出 LAS 文件。
 2. export_vertical_tdt_to_petrel_checkshots: 导出直井 checkshots 文本。
-3. export_twt_log_to_csv: 导出 TWT 域单条曲线为两列 CSV。
-4. export_wavelet_to_csv: 导出子波为两列 CSV。
-5. export_vertical_wtie_artifacts: 打包导出自动井震标定关键成果。
-6. format_artifact_tag: 统一成果文件名中的标签格式。
-
-Examples
---------
->>> from pathlib import Path
->>> import numpy as np
->>> from cup.petrel.export import format_artifact_tag
->>> format_artifact_tag(" 0.012 ")
-'0.012'
->>> format_artifact_tag(3)
-'3'
 """
 
 from pathlib import Path
@@ -372,251 +358,251 @@ def export_vertical_tdt_to_petrel_checkshots(
     return output_file
 
 
-def format_artifact_tag(value: Union[str, float, int]) -> str:
-    """将成果文件名中的标签值转为稳定字符串。
+# def format_artifact_tag(value: Union[str, float, int]) -> str:
+#     """将成果文件名中的标签值转为稳定字符串。
 
-    Parameters
-    ----------
-    value : str or float or int
-        待格式化的标签值。字符串会先执行 ``strip()``。
+#     Parameters
+#     ----------
+#     value : str or float or int
+#         待格式化的标签值。字符串会先执行 ``strip()``。
 
-    Returns
-    -------
-    str
-        可直接拼接到文件名中的稳定字符串。
+#     Returns
+#     -------
+#     str
+#         可直接拼接到文件名中的稳定字符串。
 
-    Raises
-    ------
-    ValueError
-        当 ``value`` 是空白字符串时抛出。
-    """
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            raise ValueError("标签字符串不能为空。")
-        return text
-    return str(value)
-
-
-def _write_two_column_csv(
-    output_file: Path,
-    x_values: np.ndarray,
-    y_values: np.ndarray,
-    x_name: str,
-    y_name: str,
-    fmt: str = "%.9g",
-) -> Path:
-    """写出两列数值 CSV。"""
-    output_file = Path(output_file)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-
-    x_arr = np.asarray(x_values, dtype=float).reshape(-1)
-    y_arr = np.asarray(y_values, dtype=float).reshape(-1)
-    if x_arr.size != y_arr.size:
-        raise ValueError(f"CSV 列长度不一致: {x_name}={x_arr.size}, {y_name}={y_arr.size}")
-
-    stacked = np.column_stack([x_arr, y_arr])
-    np.savetxt(
-        output_file,
-        stacked,
-        delimiter=",",
-        header=f"{x_name},{y_name}",
-        comments="",
-        fmt=fmt,
-    )
-    return output_file
+#     Raises
+#     ------
+#     ValueError
+#         当 ``value`` 是空白字符串时抛出。
+#     """
+#     if isinstance(value, str):
+#         text = value.strip()
+#         if not text:
+#             raise ValueError("标签字符串不能为空。")
+#         return text
+#     return str(value)
 
 
-def export_twt_log_to_csv(
-    output_file: Path,
-    log: grid.Log,
-    value_name: str = "value",
-    fmt: str = "%.9g",
-) -> Path:
-    """导出 TWT 域单条曲线到两列 CSV。
+# def _write_two_column_csv(
+#     output_file: Path,
+#     x_values: np.ndarray,
+#     y_values: np.ndarray,
+#     x_name: str,
+#     y_name: str,
+#     fmt: str = "%.9g",
+# ) -> Path:
+#     """写出两列数值 CSV。"""
+#     output_file = Path(output_file)
+#     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    Parameters
-    ----------
-    output_file : Path
-        输出 CSV 路径。
-    log : grid.Log
-        待导出的单条曲线，要求处于 TWT 域。
-    value_name : str, default="value"
-        第二列列名。
-    fmt : str, default="%.9g"
-        数值写出格式。
+#     x_arr = np.asarray(x_values, dtype=float).reshape(-1)
+#     y_arr = np.asarray(y_values, dtype=float).reshape(-1)
+#     if x_arr.size != y_arr.size:
+#         raise ValueError(f"CSV 列长度不一致: {x_name}={x_arr.size}, {y_name}={y_arr.size}")
 
-    Returns
-    -------
-    Path
-        写出的 CSV 文件路径。
-
-    Raises
-    ------
-    ValueError
-        当 ``log`` 不处于 TWT 域时抛出。
-    """
-    if not log.is_twt:
-        raise ValueError("仅支持导出 TWT 域曲线。")
-    return _write_two_column_csv(
-        output_file=output_file,
-        x_values=np.asarray(log.basis, dtype=float),
-        y_values=np.asarray(log.values, dtype=float),
-        x_name="twt_s",
-        y_name=value_name,
-        fmt=fmt,
-    )
+#     stacked = np.column_stack([x_arr, y_arr])
+#     np.savetxt(
+#         output_file,
+#         stacked,
+#         delimiter=",",
+#         header=f"{x_name},{y_name}",
+#         comments="",
+#         fmt=fmt,
+#     )
+#     return output_file
 
 
-def export_wavelet_to_csv(
-    output_file: Path,
-    wavelet: Any,
-    fmt: str = "%.9g",
-) -> Path:
-    """导出单道子波到两列 CSV。
+# def export_twt_log_to_csv(
+#     output_file: Path,
+#     log: grid.Log,
+#     value_name: str = "value",
+#     fmt: str = "%.9g",
+# ) -> Path:
+#     """导出 TWT 域单条曲线到两列 CSV。
 
-    Parameters
-    ----------
-    output_file : Path
-        输出 CSV 路径。
-    wavelet : Any
-        子波对象。需提供 ``basis/values`` 属性，或 ``t/y`` 属性。
-    fmt : str, default="%.9g"
-        数值写出格式。
+#     Parameters
+#     ----------
+#     output_file : Path
+#         输出 CSV 路径。
+#     log : grid.Log
+#         待导出的单条曲线，要求处于 TWT 域。
+#     value_name : str, default="value"
+#         第二列列名。
+#     fmt : str, default="%.9g"
+#         数值写出格式。
 
-    Returns
-    -------
-    Path
-        写出的 CSV 文件路径。
+#     Returns
+#     -------
+#     Path
+#         写出的 CSV 文件路径。
 
-    Raises
-    ------
-    TypeError
-        当 ``wavelet`` 不提供受支持的时间轴与振幅属性组合时抛出。
-    """
-    if hasattr(wavelet, "basis") and hasattr(wavelet, "values"):
-        time_values = np.asarray(getattr(wavelet, "basis"), dtype=float)
-        amplitude_values = np.asarray(getattr(wavelet, "values"), dtype=float)
-    elif hasattr(wavelet, "t") and hasattr(wavelet, "y"):
-        time_values = np.asarray(getattr(wavelet, "t"), dtype=float)
-        amplitude_values = np.asarray(getattr(wavelet, "y"), dtype=float)
-    else:
-        raise TypeError("wavelet 必须提供 'basis/values' 或 't/y' 属性。")
-
-    return _write_two_column_csv(
-        output_file=output_file,
-        x_values=time_values,
-        y_values=amplitude_values,
-        x_name="time_s",
-        y_name="amplitude",
-        fmt=fmt,
-    )
+#     Raises
+#     ------
+#     ValueError
+#         当 ``log`` 不处于 TWT 域时抛出。
+#     """
+#     if not log.is_twt:
+#         raise ValueError("仅支持导出 TWT 域曲线。")
+#     return _write_two_column_csv(
+#         output_file=output_file,
+#         x_values=np.asarray(log.basis, dtype=float),
+#         y_values=np.asarray(log.values, dtype=float),
+#         x_name="twt_s",
+#         y_name=value_name,
+#         fmt=fmt,
+#     )
 
 
-def export_vertical_wtie_artifacts(
-    output_dir: Path,
-    outputs: Any,
-    *,
-    well_name: str,
-    interpretation_offset: Union[str, float, int],
-    kb: float,
-    x: float,
-    y: float,
-    csv_fmt: str = "%.9g",
-) -> Dict[str, Path]:
-    """导出直井自动井震标定的关键成果。
+# def export_wavelet_to_csv(
+#     output_file: Path,
+#     wavelet: Any,
+#     fmt: str = "%.9g",
+# ) -> Path:
+#     """导出单道子波到两列 CSV。
 
-    Parameters
-    ----------
-    output_dir : Path
-        成果输出目录。函数会自动创建 ``tdtable``、``ai``、``wavelet``
-        三个子目录。
-    outputs : Any
-        自动井震标定输出对象。需至少提供 ``table``、``logset_twt``、
-        ``wavelet`` 三个属性，其中 ``logset_twt`` 还需提供 ``AI`` 属性。
-    well_name : str
-        井名，用于文件命名与 checkshots 文本中的 ``Well name`` 列。
-    interpretation_offset : str or float or int
-        解释偏移标签，会参与输出文件名。
-    kb : float
-        Kelly Bushing 高程，单位 m。
-    x : float
-        井口 X 坐标，单位 m。
-    y : float
-        井口 Y 坐标，单位 m。
-    csv_fmt : str, default="%.9g"
-        AI 曲线与子波 CSV 的数值写出格式。
+#     Parameters
+#     ----------
+#     output_file : Path
+#         输出 CSV 路径。
+#     wavelet : Any
+#         子波对象。需提供 ``basis/values`` 属性，或 ``t/y`` 属性。
+#     fmt : str, default="%.9g"
+#         数值写出格式。
 
-    Returns
-    -------
-    Dict[str, Path]
-        成果路径字典，包含 ``tdtable_file``、``ai_file`` 与
-        ``wavelet_file``。
+#     Returns
+#     -------
+#     Path
+#         写出的 CSV 文件路径。
 
-    Raises
-    ------
-    AttributeError
-        当 ``outputs`` 缺少必需属性时抛出。
+#     Raises
+#     ------
+#     TypeError
+#         当 ``wavelet`` 不提供受支持的时间轴与振幅属性组合时抛出。
+#     """
+#     if hasattr(wavelet, "basis") and hasattr(wavelet, "values"):
+#         time_values = np.asarray(getattr(wavelet, "basis"), dtype=float)
+#         amplitude_values = np.asarray(getattr(wavelet, "values"), dtype=float)
+#     elif hasattr(wavelet, "t") and hasattr(wavelet, "y"):
+#         time_values = np.asarray(getattr(wavelet, "t"), dtype=float)
+#         amplitude_values = np.asarray(getattr(wavelet, "y"), dtype=float)
+#     else:
+#         raise TypeError("wavelet 必须提供 'basis/values' 或 't/y' 属性。")
 
-    Notes
-    -----
-    导出内容包括：
+#     return _write_two_column_csv(
+#         output_file=output_file,
+#         x_values=time_values,
+#         y_values=amplitude_values,
+#         x_name="time_s",
+#         y_name="amplitude",
+#         fmt=fmt,
+#     )
 
-    - 优化后的 TVDSS-TWT 时深表（Petrel checkshots 文本）
-    - 优化后的 TWT 域 AI 曲线（CSV）
-    - 优化后的子波（CSV）
-    """
-    if not hasattr(outputs, "table"):
-        raise AttributeError("outputs 缺少 table 属性。")
-    if not hasattr(outputs, "logset_twt"):
-        raise AttributeError("outputs 缺少 logset_twt 属性。")
-    if not hasattr(outputs, "wavelet"):
-        raise AttributeError("outputs 缺少 wavelet 属性。")
 
-    tag = format_artifact_tag(interpretation_offset)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+# def export_vertical_wtie_artifacts(
+#     output_dir: Path,
+#     outputs: Any,
+#     *,
+#     well_name: str,
+#     interpretation_offset: Union[str, float, int],
+#     kb: float,
+#     x: float,
+#     y: float,
+#     csv_fmt: str = "%.9g",
+# ) -> Dict[str, Path]:
+#     """导出直井自动井震标定的关键成果。
 
-    tdt_dir = output_dir / "tdtable"
-    ai_dir = output_dir / "ai"
-    wavelet_dir = output_dir / "wavelet"
-    tdt_dir.mkdir(parents=True, exist_ok=True)
-    ai_dir.mkdir(parents=True, exist_ok=True)
-    wavelet_dir.mkdir(parents=True, exist_ok=True)
+#     Parameters
+#     ----------
+#     output_dir : Path
+#         成果输出目录。函数会自动创建 ``tdtable``、``ai``、``wavelet``
+#         三个子目录。
+#     outputs : Any
+#         自动井震标定输出对象。需至少提供 ``table``、``logset_twt``、
+#         ``wavelet`` 三个属性，其中 ``logset_twt`` 还需提供 ``AI`` 属性。
+#     well_name : str
+#         井名，用于文件命名与 checkshots 文本中的 ``Well name`` 列。
+#     interpretation_offset : str or float or int
+#         解释偏移标签，会参与输出文件名。
+#     kb : float
+#         Kelly Bushing 高程，单位 m。
+#     x : float
+#         井口 X 坐标，单位 m。
+#     y : float
+#         井口 Y 坐标，单位 m。
+#     csv_fmt : str, default="%.9g"
+#         AI 曲线与子波 CSV 的数值写出格式。
 
-    tdt_file = tdt_dir / f"{well_name}_{tag}.txt"
-    ai_file = ai_dir / f"{well_name}_{tag}.csv"
-    wavelet_file = wavelet_dir / f"{well_name}_{tag}.csv"
+#     Returns
+#     -------
+#     Dict[str, Path]
+#         成果路径字典，包含 ``tdtable_file``、``ai_file`` 与
+#         ``wavelet_file``。
 
-    tdt = getattr(outputs, "table")
-    logset_twt = getattr(outputs, "logset_twt")
-    wavelet = getattr(outputs, "wavelet")
-    if not hasattr(logset_twt, "AI"):
-        raise AttributeError("outputs.logset_twt 缺少 AI 属性。")
-    ai_log = getattr(logset_twt, "AI")
+#     Raises
+#     ------
+#     AttributeError
+#         当 ``outputs`` 缺少必需属性时抛出。
 
-    export_vertical_tdt_to_petrel_checkshots(
-        output_file=tdt_file,
-        tdt=tdt,
-        well_name=well_name,
-        kb=kb,
-        x=x,
-        y=y,
-    )
-    export_twt_log_to_csv(
-        output_file=ai_file,
-        log=ai_log,
-        value_name="ai",
-        fmt=csv_fmt,
-    )
-    export_wavelet_to_csv(
-        output_file=wavelet_file,
-        wavelet=wavelet,
-        fmt=csv_fmt,
-    )
+#     Notes
+#     -----
+#     导出内容包括：
 
-    return {
-        "tdtable_file": tdt_file,
-        "ai_file": ai_file,
-        "wavelet_file": wavelet_file,
-    }
+#     - 优化后的 TVDSS-TWT 时深表（Petrel checkshots 文本）
+#     - 优化后的 TWT 域 AI 曲线（CSV）
+#     - 优化后的子波（CSV）
+#     """
+#     if not hasattr(outputs, "table"):
+#         raise AttributeError("outputs 缺少 table 属性。")
+#     if not hasattr(outputs, "logset_twt"):
+#         raise AttributeError("outputs 缺少 logset_twt 属性。")
+#     if not hasattr(outputs, "wavelet"):
+#         raise AttributeError("outputs 缺少 wavelet 属性。")
+
+#     tag = format_artifact_tag(interpretation_offset)
+#     output_dir = Path(output_dir)
+#     output_dir.mkdir(parents=True, exist_ok=True)
+
+#     tdt_dir = output_dir / "tdtable"
+#     ai_dir = output_dir / "ai"
+#     wavelet_dir = output_dir / "wavelet"
+#     tdt_dir.mkdir(parents=True, exist_ok=True)
+#     ai_dir.mkdir(parents=True, exist_ok=True)
+#     wavelet_dir.mkdir(parents=True, exist_ok=True)
+
+#     tdt_file = tdt_dir / f"{well_name}_{tag}.txt"
+#     ai_file = ai_dir / f"{well_name}_{tag}.csv"
+#     wavelet_file = wavelet_dir / f"{well_name}_{tag}.csv"
+
+#     tdt = getattr(outputs, "table")
+#     logset_twt = getattr(outputs, "logset_twt")
+#     wavelet = getattr(outputs, "wavelet")
+#     if not hasattr(logset_twt, "AI"):
+#         raise AttributeError("outputs.logset_twt 缺少 AI 属性。")
+#     ai_log = getattr(logset_twt, "AI")
+
+#     export_vertical_tdt_to_petrel_checkshots(
+#         output_file=tdt_file,
+#         tdt=tdt,
+#         well_name=well_name,
+#         kb=kb,
+#         x=x,
+#         y=y,
+#     )
+#     export_twt_log_to_csv(
+#         output_file=ai_file,
+#         log=ai_log,
+#         value_name="ai",
+#         fmt=csv_fmt,
+#     )
+#     export_wavelet_to_csv(
+#         output_file=wavelet_file,
+#         wavelet=wavelet,
+#         fmt=csv_fmt,
+#     )
+
+#     return {
+#         "tdtable_file": tdt_file,
+#         "ai_file": ai_file,
+#         "wavelet_file": wavelet_file,
+#     }

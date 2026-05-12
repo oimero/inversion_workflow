@@ -16,16 +16,6 @@ XY 与 inline/xline 坐标互转，以及井位附近道的双线性插值提取
 3. ZgySurveyContext: ZGY 工区上下文实现。
 4. open_survey: 根据文件类型打开工区并返回可复用上下文。
 5. import_seismic_at_well / coord_to_line / line_to_coord: 便捷访问函数。
-
-Examples
---------
->>> from pathlib import Path
->>> from cup.seismic.survey import open_survey
->>> seismic_file = Path("demo.segy")
->>> # doctest: +SKIP
->>> ctx = open_survey(seismic_file, seismic_type="segy")
->>> # doctest: +SKIP
->>> geometry = ctx.query_geometry(domain="time")
 """
 
 from __future__ import annotations
@@ -68,6 +58,7 @@ class SurveyContext(Protocol):
 
 
 def _axis_stats(axis: np.ndarray) -> Dict[str, float]:
+    """计算轴的最小值、最大值与步长。"""
     if axis.size == 0:
         raise ValueError("Axis is empty.")
     if axis.size == 1:
@@ -80,6 +71,7 @@ def _axis_stats(axis: np.ndarray) -> Dict[str, float]:
 
 
 def _normalize_domain(domain: Optional[str]) -> str:
+    """规范化采样域标识。"""
     if domain is None:
         return "time"
     domain_lower = domain.lower()
@@ -89,6 +81,7 @@ def _normalize_domain(domain: Optional[str]) -> str:
 
 
 def _domain_to_basis_type(domain: str) -> str:
+    """将采样域映射为曲线基准类型。"""
     domain_lower = _normalize_domain(domain)
     if domain_lower == "time":
         return "twt"
@@ -96,6 +89,7 @@ def _domain_to_basis_type(domain: str) -> str:
 
 
 def _resolve_sample_window(samples: np.ndarray, start: Optional[float], end: Optional[float]) -> Tuple[int, int]:
+    """将采样窗口映射为索引区间。"""
     if start is None:
         start = float(samples[0])
     if end is None:
@@ -122,6 +116,7 @@ def _interpolate_trace_from_4_neighbors(
     trace10: np.ndarray,
     trace11: np.ndarray,
 ) -> np.ndarray:
+    """对四邻道执行双线性插值。"""
     i_floor = int(np.floor(i))
     j_floor = int(np.floor(j))
     wi = i - i_floor
@@ -130,6 +125,7 @@ def _interpolate_trace_from_4_neighbors(
 
 
 def _segy_build_samples(meta: Dict[str, Any], domain: str) -> np.ndarray:
+    """根据 SEG-Y 元信息构建采样轴。"""
     domain_lower = _normalize_domain(domain)
     nt = int(meta["nt"])
     if domain_lower == "time":
@@ -145,6 +141,7 @@ def _segy_build_samples(meta: Dict[str, Any], domain: str) -> np.ndarray:
 def _segy_pick_affine_reference_points_from_geom(
     geom: np.ndarray,
 ) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
+    """在几何网格中选择仿射参考点。"""
     ni, nx = geom.shape
 
     for i0 in range(ni):
@@ -169,6 +166,7 @@ def _segy_coord_to_index_from_3points(
     i0: float,
     j0: float,
 ) -> Tuple[float, float]:
+    """基于三点仿射关系将坐标转换为索引。"""
     dx_il = p1[0] - p0[0]
     dy_il = p1[1] - p0[1]
     dx_xl = p2[0] - p0[0]
@@ -187,7 +185,7 @@ def _segy_coord_to_index_from_3points(
 
 
 def _segy_coord_scalar_to_factor(coord_scalar: float) -> float:
-    """Convert SEG-Y coordinate scalar to multiplicative factor."""
+    """将 SEG-Y 坐标缩放因子转换为乘法系数。"""
     if coord_scalar == 0:
         return 1.0
     if coord_scalar > 0:
@@ -555,6 +553,7 @@ def _resolve_context(
     istep: Optional[int] = None,
     xstep: Optional[int] = None,
 ) -> SurveyContext:
+    """根据输入参数打开工区上下文。"""
     return open_survey(
         seismic_file,
         seismic_type=seismic_type,
@@ -568,6 +567,7 @@ def _build_segy_options(
     istep: Optional[int] = None,
     xstep: Optional[int] = None,
 ) -> Dict[str, int]:
+    """构建 SEG-Y 读取参数字典。"""
     options: Dict[str, int] = {}
     if iline is not None:
         options["iline"] = int(iline)

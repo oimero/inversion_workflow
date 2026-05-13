@@ -424,6 +424,8 @@ def load_qc_context(
     from ginn_depth.config import DepthGINNConfig
     from ginn_depth.data import (
         build_dataset as build_depth_dataset,
+    )
+    from ginn_depth.data import (
         load_dynamic_gain_depth_model,
         load_lfm_depth_npz,
     )
@@ -748,8 +750,8 @@ def forward_qc_at_control_trace(
     with torch.no_grad():
         before = (
             context.forward_model(
-                torch.from_numpy(ai_before[None, None, :]).float().to(device),
-                torch.from_numpy(vp[None, :]).float().to(device),
+                torch.from_numpy(ai_before[None, None, :]).float().to(device),  # type: ignore
+                torch.from_numpy(vp[None, :]).float().to(device),  # type: ignore
                 depth_axis_m=full_depth.astype(np.float32),
             )
             .squeeze()
@@ -758,8 +760,8 @@ def forward_qc_at_control_trace(
         )
         after = (
             context.forward_model(
-                torch.from_numpy(ai_after[None, None, :]).float().to(device),
-                torch.from_numpy(vp[None, :]).float().to(device),
+                torch.from_numpy(ai_after[None, None, :]).float().to(device),  # type: ignore
+                torch.from_numpy(vp[None, :]).float().to(device),  # type: ignore
                 depth_axis_m=full_depth.astype(np.float32),
             )
             .squeeze()

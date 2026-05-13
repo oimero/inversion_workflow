@@ -57,19 +57,19 @@ class EnhancementConfig:
     delta_supervision_mask: DeltaSupervisionMask = "core"  # delta 监督区域：core 或 loss。
     synthetic_residual_highpass_samples_loss: int = 7  # QC 中统计 residual 高频能量的窗口。
     synthetic_seismic_rms_match: bool = True  # 是否把 synthetic seismic RMS 匹配到目标尺度。
-    synthetic_seismic_rms_target: float = 1.0  # synthetic seismic RMS 目标值。
+    synthetic_seismic_rms_target: float = 0.8  # synthetic seismic RMS 目标值。
     synthetic_quality_gate_enabled: bool = True  # 是否启用 synthetic 样本质量门控。
     synthetic_max_residual_near_clip_fraction: float | None = 0.02  # near-clipping 最大比例。
     synthetic_max_seismic_rms_ratio: float | None = 2.0  # synthetic/real RMS 最大比值。
     synthetic_max_seismic_abs_p99_ratio: float | None = 2.5  # synthetic/real abs-p99 最大比值。
-    synthetic_min_base_target_waveform_corr: float | None = None  # base/target 地震互相关硬门控；默认只做 QC。
+    synthetic_min_base_target_waveform_corr: float | None = 0.0  # base/target 地震互相关硬门控。
     synthetic_max_resample_attempts: int = 8  # 单样本最多重采样次数。
 
     # ── AI 合成边界 ──────────────────────────────────────────
     # enhance 会预测 delta_log_ai，并组合 enhanced_ai = base_ai * exp(delta)。
     # 下面的边界只属于 synthetic/enhance，不写回 GINN 配置。
-    ai_min: float = 3000.0  # synthetic/enhanced AI 下界。
-    ai_max: float = 30000.0  # synthetic/enhanced AI 上界。
+    ai_min: float = 7000.0  # synthetic/enhanced AI 下界。
+    ai_max: float = 20000.0  # synthetic/enhanced AI 上界。
     zero_delta_outside_mask: bool = True  # 是否用 taper 将目的层外 delta 平滑压回 0。
 
     # ── 网络输入与结构 ───────────────────────────────────────
@@ -110,7 +110,7 @@ class EnhancementConfig:
     device: str = "cuda"  # 首选训练设备；CUDA 不可用时回退 CPU。
     num_workers: int = 0  # DataLoader worker 数。
     pin_memory: bool = True  # CUDA 训练时是否启用 pinned memory。
-    checkpoint_dir: Path = Path("checkpoints_enhance")  # checkpoint 输出目录。
+    checkpoint_dir: Path = Path("data/output_enhance_depth/checkpoints")  # checkpoint 输出目录。
     log_interval: int = 50  # 每隔多少个 batch 打日志。
     save_every: int = 5  # 每隔多少个 epoch 保存常规 checkpoint。
 
@@ -125,8 +125,8 @@ class EnhancementConfig:
             self.dilations = tuple(self.dilations)
         if len(self.dilations) != self.num_res_blocks:
             raise ValueError(f"len(dilations)={len(self.dilations)} != num_res_blocks={self.num_res_blocks}")
-        expected_in_channels = 1 + int(self.include_base_ai_input) + int(self.include_mask_input) + int(
-            self.include_dynamic_gain_input
+        expected_in_channels = (
+            1 + int(self.include_base_ai_input) + int(self.include_mask_input) + int(self.include_dynamic_gain_input)
         )
         if self.in_channels != expected_in_channels:
             raise ValueError(
@@ -156,9 +156,7 @@ class EnhancementConfig:
         if self.delta_lowpass_samples < 1 or self.delta_highpass_samples < 1:
             raise ValueError("delta low/high-pass windows must be positive.")
         if self.delta_supervision_mask not in ("core", "loss"):
-            raise ValueError(
-                f"delta_supervision_mask={self.delta_supervision_mask!r} must be one of ['core', 'loss']."
-            )
+            raise ValueError(f"delta_supervision_mask={self.delta_supervision_mask!r} must be one of ['core', 'loss'].")
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], *, base_dir: Path | None = None) -> "EnhancementConfig":

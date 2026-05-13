@@ -68,6 +68,18 @@ def parse_args() -> argparse.Namespace:
         help="QC output directory. Defaults to data/output_enhance_qc_depth_<timestamp>.",
     )
     parser.add_argument(
+        "--base-ai-file",
+        type=Path,
+        default=None,
+        help="Override cfg.base_ai_file for this QC run.",
+    )
+    parser.add_argument(
+        "--resolution-prior-file",
+        type=Path,
+        default=None,
+        help="Override cfg.resolution_prior_file for this QC run.",
+    )
+    parser.add_argument(
         "--main-lobe-samples",
         type=int,
         default=None,
@@ -114,6 +126,36 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Override synthetic_unresolved_oversample_factor for this QC run.",
+    )
+    parser.add_argument(
+        "--seismic-rms-target",
+        type=float,
+        default=None,
+        help="Override synthetic_seismic_rms_target for this QC run.",
+    )
+    parser.add_argument(
+        "--max-seismic-rms-ratio",
+        type=float,
+        default=None,
+        help="Override synthetic_max_seismic_rms_ratio for this QC run.",
+    )
+    parser.add_argument(
+        "--max-seismic-abs-p99-ratio",
+        type=float,
+        default=None,
+        help="Override synthetic_max_seismic_abs_p99_ratio for this QC run.",
+    )
+    parser.add_argument(
+        "--min-base-target-waveform-corr",
+        type=float,
+        default=None,
+        help="Override synthetic_min_base_target_waveform_corr for this QC run.",
+    )
+    parser.add_argument(
+        "--max-resample-attempts",
+        type=int,
+        default=None,
+        help="Override synthetic_max_resample_attempts for this QC run.",
     )
     return parser.parse_args()
 
@@ -349,6 +391,13 @@ def sample_metrics(
         "ai_max": ai_max,
         "rms_scale": float(sample["synthetic_rms_scale"].item()),
         "resample_attempts": float(sample.get("synthetic_resample_attempts", torch.tensor(1)).item()),
+        "quality_gate_passed": float(sample.get("synthetic_quality_gate_passed", torch.tensor(True)).float().item()),
+        "quality_gate_forced_accept": float(
+            sample.get("synthetic_quality_gate_forced_accept", torch.tensor(False)).float().item()
+        ),
+        "quality_gate_max_attempt_reached": float(
+            sample.get("synthetic_quality_gate_max_attempt_reached", torch.tensor(False)).float().item()
+        ),
         "dominant_center": center,
         "dominant_window_residual_peak_count": residual_peak_count,
         "dominant_window_reflectivity_peak_count": reflectivity_peak_count,
@@ -413,6 +462,8 @@ QUALITY_THRESHOLDS = {
     "unresolved_detail_peaks_p50_min": 2.0,
     "unresolved_detail_to_seismic_peak_ratio_p50_min": 1.5,
     "resample_attempts_p95_max": 2.0,
+    "quality_gate_forced_accept_fraction_max": 0.0,
+    "quality_gate_max_attempt_fraction_p95_max": 0.25,
 }
 
 
@@ -736,6 +787,62 @@ def add_quality_flags(
             suggested_action="Quality gates reject many candidates; inspect gate thresholds together with synthetic amplitude settings.",
         )
 
+    forced_accept_fraction = all_stats["quality_gate_forced_accept"]["mean"]
+    if forced_accept_fraction is not None and forced_accept_fraction <= 0.0:
+        flag(
+            "OK",
+            "quality_gate_forced_accept",
+            "no sampled traces were force-accepted after exhausting quality-gate retries.",
+            metric="quality_gate_forced_accept.mean",
+            actual=forced_accept_fraction,
+            threshold="== 0.0",
+        )
+    else:
+        flag(
+            "WARN",
+            "quality_gate_forced_accept",
+            f"force-accepted trace fraction is {forced_accept_fraction}; some candidates failed every quality-gate retry.",
+            metric="quality_gate_forced_accept.mean",
+            actual=forced_accept_fraction,
+            threshold="== 0.0",
+            related_config_keys=[
+                "synthetic_max_residual_near_clip_fraction",
+                "synthetic_max_seismic_rms_ratio",
+                "synthetic_max_seismic_abs_p99_ratio",
+                "synthetic_min_base_target_waveform_corr",
+                "synthetic_max_resample_attempts",
+            ],
+            suggested_action="Gate thresholds or synthetic amplitudes are too strict for the current retry budget; inspect rejected-pressure metrics before training.",
+        )
+
+    max_attempt_fraction = all_stats["quality_gate_max_attempt_reached"]["mean"]
+    if max_attempt_fraction is not None and max_attempt_fraction <= 0.25:
+        flag(
+            "OK",
+            "quality_gate_retry_budget",
+            f"full retry-budget fraction is {max_attempt_fraction:.3f}.",
+            metric="quality_gate_max_attempt_reached.mean",
+            actual=max_attempt_fraction,
+            threshold="<= 0.25",
+        )
+    else:
+        flag(
+            "WARN",
+            "quality_gate_retry_budget",
+            f"full retry-budget fraction is {max_attempt_fraction}; gate pressure is high.",
+            metric="quality_gate_max_attempt_reached.mean",
+            actual=max_attempt_fraction,
+            threshold="<= 0.25",
+            related_config_keys=[
+                "synthetic_max_residual_near_clip_fraction",
+                "synthetic_max_seismic_rms_ratio",
+                "synthetic_max_seismic_abs_p99_ratio",
+                "synthetic_min_base_target_waveform_corr",
+                "synthetic_max_resample_attempts",
+            ],
+            suggested_action="Many samples need the full retry budget; relax gates, reduce synthetic amplitudes, or increase retry budget after checking sample plausibility.",
+        )
+
     return flags
 
 
@@ -801,6 +908,9 @@ def log_summary(summary: dict[str, Any], flags: list[dict[str, Any]]) -> None:
         "delta_mask_fraction",
         "rms_scale",
         "resample_attempts",
+        "quality_gate_passed",
+        "quality_gate_forced_accept",
+        "quality_gate_max_attempt_reached",
     ):
         stats = summary["all"][key]
         LOGGER.info(
@@ -881,6 +991,14 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     cfg = EnhancementConfig.from_yaml(config_path, base_dir=REPO_ROOT)
+    if args.base_ai_file is not None:
+        cfg.base_ai_file = args.base_ai_file if args.base_ai_file.is_absolute() else REPO_ROOT / args.base_ai_file
+    if args.resolution_prior_file is not None:
+        cfg.resolution_prior_file = (
+            args.resolution_prior_file
+            if args.resolution_prior_file.is_absolute()
+            else REPO_ROOT / args.resolution_prior_file
+        )
     cfg.device = "cpu"
     cfg.num_workers = 0
     cfg.pin_memory = False
@@ -901,6 +1019,16 @@ def main() -> None:
         cfg.synthetic_cluster_amp_abs_p99_max = float(args.cluster_amp_abs_p99_max)
     if args.unresolved_oversample_factor is not None:
         cfg.synthetic_unresolved_oversample_factor = int(args.unresolved_oversample_factor)
+    if args.seismic_rms_target is not None:
+        cfg.synthetic_seismic_rms_target = float(args.seismic_rms_target)
+    if args.max_seismic_rms_ratio is not None:
+        cfg.synthetic_max_seismic_rms_ratio = float(args.max_seismic_rms_ratio)
+    if args.max_seismic_abs_p99_ratio is not None:
+        cfg.synthetic_max_seismic_abs_p99_ratio = float(args.max_seismic_abs_p99_ratio)
+    if args.min_base_target_waveform_corr is not None:
+        cfg.synthetic_min_base_target_waveform_corr = float(args.min_base_target_waveform_corr)
+    if args.max_resample_attempts is not None:
+        cfg.synthetic_max_resample_attempts = int(args.max_resample_attempts)
     LOGGER.info("Resolution prior: %s", cfg.resolution_prior_file)
     LOGGER.info(
         "Synthetic mix: patch_fraction=%.3f unresolved_fraction=%.3f well_patch_scale=[%.3f, %.3f] "
@@ -948,6 +1076,7 @@ def main() -> None:
     summary = summarize_rows(rows)
     summary["config"] = {
         "config_path": config_path,
+        "base_ai_file": cfg.base_ai_file,
         "resolution_prior_file": cfg.resolution_prior_file,
         "num_samples": args.num_samples,
         "seed": args.seed,

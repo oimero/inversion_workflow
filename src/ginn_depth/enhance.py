@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from enhance.config import EnhancementConfig
 from ginn_depth.config import DepthGINNConfig
-from ginn_depth.data import DatasetBundle, build_dataset
+from ginn_depth.data import DatasetBundle, DepthSeismicTraceDataset, build_dataset, load_lfm_depth_npz
 from ginn_depth.physics import DepthForwardModel
 from ginn_depth.synthetic import WellGuidedSyntheticDepthTraceDataset
 
@@ -35,14 +37,15 @@ class DepthEnhancementDataBundle:
 
 def build_depth_enhancement_data_bundle(cfg: EnhancementConfig) -> DepthEnhancementDataBundle:
     """Build depth datasets with ``base_ai_file`` wired through the existing AI-base slot."""
-    depth_cfg = DepthGINNConfig.from_yaml(cfg.depth_config_file)
-    depth_cfg.ai_lfm_file = cfg.base_ai_file
+    repo_root = Path(__file__).resolve().parents[2]
+    depth_cfg = DepthGINNConfig.from_yaml(cfg.depth_config_file, base_dir=repo_root)
     depth_cfg.include_lfm_input = cfg.include_base_ai_input
     depth_cfg.include_mask_input = cfg.include_mask_input
     depth_cfg.include_dynamic_gain_input = cfg.include_dynamic_gain_input
     depth_cfg.in_channels = cfg.in_channels
 
     dataset_bundle = build_dataset(depth_cfg)
+    _replace_dataset_bundle_base_ai(dataset_bundle, cfg.base_ai_file)
     metadata = {
         "domain": "depth",
         "depth_config_file": cfg.depth_config_file,
@@ -52,6 +55,35 @@ def build_depth_enhancement_data_bundle(cfg: EnhancementConfig) -> DepthEnhancem
         "input_channel_names": dataset_bundle.train_dataset.input_channel_names,
     }
     return DepthEnhancementDataBundle(depth_cfg=depth_cfg, dataset_bundle=dataset_bundle, metadata=metadata)
+
+
+def _replace_dataset_bundle_base_ai(dataset_bundle: DatasetBundle, base_ai_file: str | Path) -> None:
+    """Use stage-1 base AI as the enhancement base while preserving depth mask metadata."""
+    base_ai = load_lfm_depth_npz(base_ai_file)
+    expected_shape = (
+        int(dataset_bundle.geometry["n_il"]),
+        int(dataset_bundle.geometry["n_xl"]),
+        int(dataset_bundle.geometry["n_sample"]),
+    )
+    if base_ai.shape != expected_shape:
+        raise ValueError(f"Base AI shape {base_ai.shape} does not match depth dataset shape {expected_shape}.")
+    if not np.allclose(base_ai.samples, dataset_bundle.depth_axis_m):
+        raise ValueError("Base AI depth samples do not match the depth dataset samples.")
+
+    base_flat = np.asarray(base_ai.volume, dtype=np.float32).reshape(-1, expected_shape[-1])
+    for dataset in (dataset_bundle.train_dataset, dataset_bundle.val_dataset, dataset_bundle.inference_dataset):
+        if dataset is not None:
+            _replace_dataset_base_ai(dataset, base_flat)
+
+
+def _replace_dataset_base_ai(dataset: DepthSeismicTraceDataset, base_flat: np.ndarray) -> None:
+    if base_flat.shape != dataset.ai_lfm_flat.shape:
+        raise ValueError(f"Base AI flat shape {base_flat.shape} does not match dataset AI shape {dataset.ai_lfm_flat.shape}.")
+    dataset._ai_lfm_flat = base_flat  # type: ignore[attr-defined]
+    selected_mask = dataset._mask_flat[dataset.valid_indices]  # type: ignore[attr-defined]
+    selected_base_ai = base_flat[dataset.valid_indices]
+    valid_base_ai = selected_base_ai[selected_mask]
+    dataset._lfm_scale = float(np.abs(valid_base_ai).max()) + 1e-10  # type: ignore[attr-defined]
 
 
 def build_depth_enhancement_bundle(cfg: EnhancementConfig) -> DepthEnhancementBundle:

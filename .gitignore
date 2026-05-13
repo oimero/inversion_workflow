@@ -9,3 +9,4 @@ tmp/*
 */output/*
 *.pyc
 *.prompt.md
+AGENTS.md

@@ -427,6 +427,7 @@ def load_qc_context(
         load_dynamic_gain_depth_model,
         load_lfm_depth_npz,
     )
+    from ginn_depth.physics import DepthForwardModel
 
     repo_root = find_repo_root()
     common_config_path = resolve_relative_path(common_config_path, root=repo_root)

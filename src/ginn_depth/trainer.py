@@ -224,7 +224,9 @@ class Trainer:
         if training and step % self._LOG_AI_ANCHOR_SKIP != 0:
             cached = getattr(self, "_cached_log_ai_anchor_metrics", None)
             if cached is not None:
-                return cached[0].detach(), cached[1]
+                metrics = dict(cached[1])
+                metrics["log_ai_anchor_fresh"] = 0.0
+                return cached[0].detach(), metrics
             return zero_log_ai_anchor_metrics(self.device)
         term, metrics = self.log_ai_anchor.compute_loss(
             dataset=self.dataset,
@@ -232,6 +234,7 @@ class Trainer:
             compose_impedance=self._compose_impedance,
             training=training,
         )
+        metrics["log_ai_anchor_fresh"] = 1.0
         if training:
             self._cached_log_ai_anchor_metrics = (term.detach(), metrics)
         return term, metrics
@@ -243,9 +246,12 @@ class Trainer:
         total_l2_term = 0.0
         total_tv_term = 0.0
         total_residual_mean = 0.0
+        total_grad_norm = 0.0
         total_log_ai_anchor = 0.0
         total_log_ai_anchor_term = 0.0
         total_log_ai_anchor_traces = 0.0
+        total_log_ai_anchor_neighbors = 0.0
+        total_log_ai_anchor_fresh = 0.0
         n_batches = 0
 
         context = torch.enable_grad if training else torch.no_grad
@@ -267,30 +273,66 @@ class Trainer:
                 loss, loss_dict = self.criterion(d_syn, d_obs, loss_mask, core_mask, residual, taper_weight)
                 anchor_term, anchor_dict = self._compute_log_ai_anchor_loss(training=training, step=batch_idx) if training else zero_log_ai_anchor_metrics(self.device)
                 loss = loss + anchor_term
-                loss_dict["total"] = float(loss.detach().cpu().item())
+                loss_value = float(loss.detach().cpu().item())
+                loss_dict["total"] = loss_value
+                residual_mean = float(residual.detach().abs().mean().cpu().item())
 
+                if not torch.isfinite(loss.detach()).item():
+                    raise FloatingPointError(
+                        "Non-finite GINN depth loss before backward "
+                        f"(epoch={self.epoch + 1}, batch={batch_idx + 1}/{len(dataloader)}, "
+                        f"global_step={self.global_step}, loss={loss_value}, "
+                        f"mae={loss_dict['waveform_mae']}, l2={loss_dict['l2_term']}, "
+                        f"tv={loss_dict['tv_term']}, anchor={anchor_dict['log_ai_anchor_term']}, "
+                        f"anchor_fresh={anchor_dict.get('log_ai_anchor_fresh', 0.0)}, "
+                        f"residual_mean={residual_mean})"
+                    )
+
+                grad_norm_value = 0.0
                 if training:
                     self.optimizer.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
-                    self.optimizer.step()
+                    try:
+                        loss.backward()
+                        grad_norm = nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.cfg.grad_clip,
+                            error_if_nonfinite=True,
+                            foreach=False,
+                        )
+                        grad_norm_value = float(grad_norm.detach().cpu().item())
+                        self.optimizer.step()
+                    except RuntimeError as exc:
+                        raise RuntimeError(
+                            "GINN depth optimizer step failed "
+                            f"(epoch={self.epoch + 1}, batch={batch_idx + 1}/{len(dataloader)}, "
+                            f"global_step={self.global_step}, loss={loss_value:.6g}, "
+                            f"mae={loss_dict['waveform_mae']:.6g}, l2={loss_dict['l2_term']:.6g}, "
+                            f"tv={loss_dict['tv_term']:.6g}, "
+                            f"anchor={anchor_dict['log_ai_anchor_term']:.6g}, "
+                            f"anchor_fresh={anchor_dict.get('log_ai_anchor_fresh', 0.0)}, "
+                            f"anchor_neighbors={anchor_dict.get('log_ai_anchor_neighbors', 0.0)}, "
+                            f"residual_mean={residual_mean:.6g})"
+                        ) from exc
                     self.global_step += 1
 
-                residual_mean = residual.abs().mean().item()
                 total_loss += loss_dict["total"]
                 total_waveform_mae += loss_dict["waveform_mae"]
                 total_l2_term += loss_dict["l2_term"]
                 total_tv_term += loss_dict["tv_term"]
                 total_residual_mean += residual_mean
+                total_grad_norm += grad_norm_value
                 total_log_ai_anchor += anchor_dict["log_ai_anchor"]
                 total_log_ai_anchor_term += anchor_dict["log_ai_anchor_term"]
                 total_log_ai_anchor_traces += anchor_dict["log_ai_anchor_traces"]
+                total_log_ai_anchor_neighbors += anchor_dict.get("log_ai_anchor_neighbors", 0.0)
+                total_log_ai_anchor_fresh += anchor_dict.get("log_ai_anchor_fresh", 0.0)
                 n_batches += 1
 
                 if training and (batch_idx + 1) % self.cfg.log_interval == 0:
                     lr = self.optimizer.param_groups[0]["lr"]
                     logger.info(
-                        "  [Epoch %d | Batch %d/%d] loss=%.6f  mae=%.6f  l2=%.3e  tv=%.3e  anchor=%.3e  res=%.3e  lr=%.2e",
+                        "  [Epoch %d | Batch %d/%d] loss=%.6f  mae=%.6f  l2=%.3e  tv=%.3e  "
+                        "anchor=%.3e  anchor_fresh=%.0f  grad=%.3e  res=%.3e  lr=%.2e",
                         self.epoch + 1,
                         batch_idx + 1,
                         len(dataloader),
@@ -298,8 +340,10 @@ class Trainer:
                         loss_dict["waveform_mae"],
                         loss_dict["l2_term"],
                         loss_dict["tv_term"],
-                        residual_mean,
                         anchor_dict["log_ai_anchor_term"],
+                        anchor_dict.get("log_ai_anchor_fresh", 0.0),
+                        grad_norm_value,
+                        residual_mean,
                         lr,
                     )
 
@@ -310,9 +354,12 @@ class Trainer:
             "l2_term": total_l2_term / n_batches,
             "tv_term": total_tv_term / n_batches,
             "residual_mean": total_residual_mean / n_batches,
+            "grad_norm": total_grad_norm / n_batches,
             "log_ai_anchor": total_log_ai_anchor / n_batches,
             "log_ai_anchor_term": total_log_ai_anchor_term / n_batches,
             "log_ai_anchor_traces": total_log_ai_anchor_traces / n_batches,
+            "log_ai_anchor_neighbors": total_log_ai_anchor_neighbors / n_batches,
+            "log_ai_anchor_fresh": total_log_ai_anchor_fresh / n_batches,
         }
 
     def train_one_epoch(self) -> dict[str, float]:
@@ -373,7 +420,7 @@ class Trainer:
             if val_metrics is None:
                 logger.info(
                     "Epoch %d/%d  lr=%.2e  train_loss=%.6f  train_mae=%.6f  train_l2=%.3e  train_tv=%.3e  "
-                    "train_anchor=%.3e  train_res=%.3e  time=%.1fs",
+                    "train_anchor=%.3e  train_anchor_fresh=%.1f  train_grad=%.3e  train_res=%.3e  time=%.1fs",
                     epoch + 1,
                     self.cfg.epochs,
                     lr,
@@ -382,6 +429,8 @@ class Trainer:
                     train_metrics["l2_term"],
                     train_metrics["tv_term"],
                     train_metrics["log_ai_anchor_term"],
+                    train_metrics["log_ai_anchor_fresh"],
+                    train_metrics["grad_norm"],
                     train_metrics["residual_mean"],
                     elapsed,
                 )
@@ -392,7 +441,7 @@ class Trainer:
                     "Epoch %d/%d  lr=%.2e  train_loss=%.6f  val_loss=%.6f  "
                     "train_mae=%.6f  val_mae=%.6f  train_l2=%.3e  val_l2=%.3e  "
                     "train_tv=%.3e  val_tv=%.3e  train_anchor=%.3e  val_anchor=%.3e  "
-                    "train_res=%.3e  val_res=%.3e  time=%.1fs",
+                    "train_anchor_fresh=%.1f  train_grad=%.3e  train_res=%.3e  val_res=%.3e  time=%.1fs",
                     epoch + 1,
                     self.cfg.epochs,
                     lr,
@@ -406,6 +455,8 @@ class Trainer:
                     val_metrics["tv_term"],
                     train_metrics["log_ai_anchor_term"],
                     val_metrics["log_ai_anchor_term"],
+                    train_metrics["log_ai_anchor_fresh"],
+                    train_metrics["grad_norm"],
                     train_metrics["residual_mean"],
                     val_metrics["residual_mean"],
                     elapsed,

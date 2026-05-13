@@ -38,17 +38,23 @@ METRICS_FIELDNAMES = [
     "train_l2_term",
     "train_tv_term",
     "train_residual_mean",
+    "train_grad_norm",
     "train_log_ai_anchor",
     "train_log_ai_anchor_term",
     "train_log_ai_anchor_traces",
+    "train_log_ai_anchor_neighbors",
+    "train_log_ai_anchor_fresh",
     "val_loss",
     "val_waveform_mae",
     "val_l2_term",
     "val_tv_term",
     "val_residual_mean",
+    "val_grad_norm",
     "val_log_ai_anchor",
     "val_log_ai_anchor_term",
     "val_log_ai_anchor_traces",
+    "val_log_ai_anchor_neighbors",
+    "val_log_ai_anchor_fresh",
     "monitor_name",
     "monitor_value",
     "best_loss",
@@ -68,10 +74,20 @@ def initialize_metrics_csv(path: Path) -> None:
         writer.writeheader()
 
 
+def _metrics_fieldnames_for_append(path: Path) -> list[str]:
+    if not path.exists():
+        return METRICS_FIELDNAMES
+    with path.open("r", encoding="utf-8", newline="") as fp:
+        reader = csv.reader(fp)
+        header = next(reader, None)
+    return header if header else METRICS_FIELDNAMES
+
+
 def append_metrics_csv(path: Path, row: dict[str, Any]) -> None:
-    normalized = {field: to_json_compatible(row.get(field, "")) for field in METRICS_FIELDNAMES}
+    fieldnames = _metrics_fieldnames_for_append(path)
+    normalized = {field: to_json_compatible(row.get(field, "")) for field in fieldnames}
     with path.open("a", encoding="utf-8", newline="") as fp:
-        writer = csv.DictWriter(fp, fieldnames=METRICS_FIELDNAMES)
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
         writer.writerow(normalized)
 
 
@@ -82,9 +98,12 @@ def prefix_metrics(prefix: str, metrics: dict[str, float] | None) -> dict[str, f
         "l2_term",
         "tv_term",
         "residual_mean",
+        "grad_norm",
         "log_ai_anchor",
         "log_ai_anchor_term",
         "log_ai_anchor_traces",
+        "log_ai_anchor_neighbors",
+        "log_ai_anchor_fresh",
     )
     if metrics is None:
         return {f"{prefix}_{key}": "" for key in keys}

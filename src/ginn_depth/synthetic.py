@@ -300,10 +300,20 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         for attempt in range(self.max_resample_attempts):
             item = self._sample_item(idx)
-            if not self.quality_gate_enabled or self._passes_quality_gate(item):
+            gate_passed = not self.quality_gate_enabled or self._passes_quality_gate(item)
+            if gate_passed:
                 item["synthetic_resample_attempts"] = torch.tensor(attempt + 1, dtype=torch.int64)
+                item["synthetic_quality_gate_passed"] = torch.tensor(True, dtype=torch.bool)
+                item["synthetic_quality_gate_forced_accept"] = torch.tensor(False, dtype=torch.bool)
+                item["synthetic_quality_gate_max_attempt_reached"] = torch.tensor(
+                    self.quality_gate_enabled and attempt + 1 >= self.max_resample_attempts,
+                    dtype=torch.bool,
+                )
                 return item
         item["synthetic_resample_attempts"] = torch.tensor(self.max_resample_attempts, dtype=torch.int64)
+        item["synthetic_quality_gate_passed"] = torch.tensor(False, dtype=torch.bool)
+        item["synthetic_quality_gate_forced_accept"] = torch.tensor(True, dtype=torch.bool)
+        item["synthetic_quality_gate_max_attempt_reached"] = torch.tensor(True, dtype=torch.bool)
         return item
 
     def _sample_item(self, idx: int) -> dict[str, torch.Tensor]:

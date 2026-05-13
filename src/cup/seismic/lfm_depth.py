@@ -222,7 +222,7 @@ def _normalize_depth_basis_and_values(log: grid.Log) -> tuple[np.ndarray, np.nda
     basis = basis[order]
     values = values[order]
 
-    unique_basis, unique_indices = np.unique(basis, return_index=True)
+    unique_basis, unique_indices = np.unique(basis, return_index=True) # type: ignore
     unique_values = values[unique_indices]
     if unique_basis.size < 2:
         raise ValueError(f"log '{log.name}' must contain at least two unique finite depth samples.")

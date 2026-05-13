@@ -55,6 +55,9 @@ MONITOR_METRICS_FIELDNAMES = [
     *(f"monitor_{key}" for key in LOSS_METRIC_KEYS),
     "monitor_synthetic_rms_scale_mean",
     "monitor_resample_attempts_mean",
+    "monitor_quality_gate_pass_fraction",
+    "monitor_quality_gate_forced_accept_fraction",
+    "monitor_quality_gate_max_attempt_fraction",
     "monitor_well_patch_fraction",
     "monitor_unresolved_cluster_fraction",
     "monitor_base_target_waveform_corr_mean",
@@ -118,6 +121,7 @@ class EnhancementTrainer:
         self.monitor_metrics_path = cfg.checkpoint_dir / "monitor_metrics.csv"
         self.run_summary_path = cfg.checkpoint_dir / "run_summary.json"
         self.training_diagnostics_path = cfg.checkpoint_dir / "training_diagnostics.json"
+        self.best_checkpoint_path = cfg.checkpoint_dir / "best.pt"
         _initialize_metrics_csv(self.metrics_path)
         _initialize_csv(self.monitor_metrics_path, MONITOR_METRICS_FIELDNAMES)
         self.global_step = 0
@@ -157,6 +161,7 @@ class EnhancementTrainer:
                 "monitor_metrics_csv": self.monitor_metrics_path,
                 "training_diagnostics_json": self.training_diagnostics_path,
                 "run_summary_json": self.run_summary_path,
+                "best_checkpoint": self.best_checkpoint_path,
             },
         }
         write_json(self.run_summary_path, payload)
@@ -244,6 +249,7 @@ class EnhancementTrainer:
             if monitor_loss is not None and monitor_loss < self.best_monitor_loss:
                 self.best_monitor_loss = float(monitor_loss)
                 self.best_monitor_epoch = epoch + 1
+                self.save_checkpoint("best.pt")
             logger.info(
                 "Enhance epoch %d/%d train_loss=%.6f monitor_loss=%s high=%.3e rms_ratio=%.3f high_ratio=%.3f lr=%.2e time=%.1fs",
                 epoch + 1,
@@ -325,6 +331,7 @@ class EnhancementTrainer:
             "best": {
                 "monitor_loss": None if not np.isfinite(self.best_monitor_loss) else self.best_monitor_loss,
                 "monitor_epoch": self.best_monitor_epoch,
+                "checkpoint": self.best_checkpoint_path if self.best_monitor_epoch > 0 else None,
             },
             "history_tail": self.history_tail,
             "llm_entrypoints": {
@@ -425,6 +432,18 @@ def _accumulate_optional_batch_stats(totals: dict[str, float], batch: dict[str, 
         totals["resample_attempts_mean"] = totals.get("resample_attempts_mean", 0.0) + float(
             batch["synthetic_resample_attempts"].float().mean().item()
         )
+    if "synthetic_quality_gate_passed" in batch:
+        totals["quality_gate_pass_fraction"] = totals.get("quality_gate_pass_fraction", 0.0) + float(
+            batch["synthetic_quality_gate_passed"].float().mean().item()
+        )
+    if "synthetic_quality_gate_forced_accept" in batch:
+        totals["quality_gate_forced_accept_fraction"] = totals.get(
+            "quality_gate_forced_accept_fraction", 0.0
+        ) + float(batch["synthetic_quality_gate_forced_accept"].float().mean().item())
+    if "synthetic_quality_gate_max_attempt_reached" in batch:
+        totals["quality_gate_max_attempt_fraction"] = totals.get("quality_gate_max_attempt_fraction", 0.0) + float(
+            batch["synthetic_quality_gate_max_attempt_reached"].float().mean().item()
+        )
     if "synthetic_mode" in batch:
         mode = batch["synthetic_mode"].long()
         totals["well_patch_fraction"] = totals.get("well_patch_fraction", 0.0) + float((mode == 0).float().mean().item())
@@ -498,6 +517,8 @@ def _training_flags_and_actions(
     high_ratio = _maybe_float(metrics.get("highpass_rms_ratio"))
     target_high = _maybe_float(metrics.get("target_highpass_rms"))
     resample_attempts = _maybe_float(metrics.get("resample_attempts_mean"))
+    forced_accept_fraction = _maybe_float(metrics.get("quality_gate_forced_accept_fraction"))
+    max_attempt_fraction = _maybe_float(metrics.get("quality_gate_max_attempt_fraction"))
     waveform_corr = _maybe_float(metrics.get("base_target_waveform_corr_mean"))
 
     if delta_ratio is not None and delta_ratio < 0.55:
@@ -548,6 +569,38 @@ def _training_flags_and_actions(
                 "synthetic_max_residual_near_clip_fraction",
                 "synthetic_max_seismic_rms_ratio",
                 "synthetic_max_seismic_abs_p99_ratio",
+                "synthetic_max_resample_attempts",
+            ],
+        )
+    if forced_accept_fraction is not None and forced_accept_fraction > 0.0:
+        add_flag(
+            "synthetic_forced_accept_present",
+            f"{prefix} monitor samples include traces that failed every quality-gate retry and were still accepted.",
+            metric=f"{prefix}_quality_gate_forced_accept_fraction",
+            actual=forced_accept_fraction,
+            threshold="== 0.0",
+            action="Quality gates are filtering beyond the configured retry budget; inspect gate thresholds, residual amplitudes, and waveform realism before trusting the synthetic mix.",
+            related_config_keys=[
+                "synthetic_max_residual_near_clip_fraction",
+                "synthetic_max_seismic_rms_ratio",
+                "synthetic_max_seismic_abs_p99_ratio",
+                "synthetic_min_base_target_waveform_corr",
+                "synthetic_max_resample_attempts",
+            ],
+        )
+    if max_attempt_fraction is not None and max_attempt_fraction > 0.25:
+        add_flag(
+            "synthetic_retry_budget_pressure",
+            f"{prefix} many monitor samples consume the full quality-gate retry budget.",
+            metric=f"{prefix}_quality_gate_max_attempt_fraction",
+            actual=max_attempt_fraction,
+            threshold="<= 0.25",
+            action="Retry budget pressure is high; inspect whether the gate is too strict or the synthetic generator is producing overly aggressive traces.",
+            related_config_keys=[
+                "synthetic_max_residual_near_clip_fraction",
+                "synthetic_max_seismic_rms_ratio",
+                "synthetic_max_seismic_abs_p99_ratio",
+                "synthetic_min_base_target_waveform_corr",
                 "synthetic_max_resample_attempts",
             ],
         )

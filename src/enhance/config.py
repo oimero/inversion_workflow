@@ -110,7 +110,7 @@ class EnhancementConfig:
     device: str = "cuda"  # 首选训练设备；CUDA 不可用时回退 CPU。
     num_workers: int = 0  # DataLoader worker 数。
     pin_memory: bool = True  # CUDA 训练时是否启用 pinned memory。
-    checkpoint_dir: Path = Path("data/output_enhance_depth/checkpoints")  # checkpoint 输出目录。
+    checkpoint_dir: Path = Path("scripts/output/enhance_train_depth/checkpoints")  # checkpoint 输出目录。
     log_interval: int = 50  # 每隔多少个 batch 打日志。
     save_every: int = 5  # 每隔多少个 epoch 保存常规 checkpoint。
 

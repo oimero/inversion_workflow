@@ -118,7 +118,7 @@ class GINNConfig:
     device: str = "cuda"  # 首选训练设备；若 CUDA 不可用会自动回退到 CPU。
     num_workers: int = 0  # DataLoader worker 数；Windows 下默认 0 更稳妥。
     pin_memory: bool = True  # CUDA 训练时是否启用 pinned memory。
-    checkpoint_dir: Path = Path("checkpoints")  # checkpoint 输出目录。
+    checkpoint_dir: Path = Path("scripts/output/ginn_train/checkpoints")  # checkpoint 输出目录。
     log_interval: int = 50  # 每隔多少个训练 batch 打一次日志。
     save_every: int = 5  # 每隔多少个 epoch 额外保存一次常规 checkpoint。
 

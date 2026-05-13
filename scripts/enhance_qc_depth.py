@@ -35,6 +35,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.statistics import normalized_cross_correlation, rms  # noqa: E402
+from cup.utils.io import load_yaml_config, resolve_relative_path  # noqa: E402
 
 # =============================================================================
 # CLI
@@ -48,6 +49,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("experiments/enhance_depth/train.yaml"),
         help="Stage-2 enhancement YAML config.",
+    )
+    parser.add_argument(
+        "--common-config",
+        type=Path,
+        default=Path("experiments/common_depth.yaml"),
+        help="Shared depth workflow YAML used for output_root.",
     )
     parser.add_argument(
         "--num-samples",
@@ -65,7 +72,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="QC output directory. Defaults to data/output_enhance_qc_depth_<timestamp>.",
+        help="QC output directory. Defaults to <output_root>/enhance_qc_depth_<timestamp>.",
     )
     parser.add_argument(
         "--base-ai-file",
@@ -975,15 +982,18 @@ def main() -> None:
     config_path = args.config
     if not config_path.is_absolute():
         config_path = REPO_ROOT / config_path
+    common_cfg = load_yaml_config(args.common_config, base_dir=REPO_ROOT)
+    output_root = resolve_relative_path(str(common_cfg.get("output_root", "scripts/output")), root=REPO_ROOT)
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = REPO_ROOT / "data" / f"output_enhance_qc_depth_{timestamp}"
+        output_dir = output_root / f"enhance_qc_depth_{timestamp}"
     else:
         output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
 
     setup_logging(output_dir)
     LOGGER.info("Project root: %s", REPO_ROOT)
     LOGGER.info("Config: %s", config_path)
+    LOGGER.info("Common config: %s", resolve_relative_path(args.common_config, root=REPO_ROOT))
     LOGGER.info("Output: %s", output_dir)
     LOGGER.info("Seed: %d", args.seed)
 

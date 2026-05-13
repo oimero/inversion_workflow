@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,8 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cup.utils.io import load_yaml_config, resolve_relative_path  # noqa: E402
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -30,9 +33,20 @@ if str(SRC_DIR) not in sys.path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output NPZ path. Defaults to <output_root>/enhance_predict_depth_<timestamp>/enhanced_ai_depth.npz.",
+    )
     parser.add_argument(
         "--config", type=Path, default=None, help="Override config path; defaults to checkpoint config."
+    )
+    parser.add_argument(
+        "--common-config",
+        type=Path,
+        default=Path("experiments/common_depth.yaml"),
+        help="Shared depth workflow YAML used for output_root.",
     )
     return parser.parse_args()
 
@@ -52,6 +66,8 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     checkpoint_path = args.checkpoint if args.checkpoint.is_absolute() else REPO_ROOT / args.checkpoint
+    common_cfg = load_yaml_config(args.common_config, base_dir=REPO_ROOT)
+    output_root = resolve_relative_path(str(common_cfg.get("output_root", "scripts/output")), root=REPO_ROOT)
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if args.config is None:
         cfg = EnhancementConfig.from_dict(payload["config"], base_dir=REPO_ROOT)
@@ -103,7 +119,11 @@ def main() -> None:
     enhanced_volume = enhanced_flat.reshape(n_il, n_xl, n_sample)
     delta_volume = delta_flat.reshape(n_il, n_xl, n_sample)
 
-    output_path = args.output if args.output.is_absolute() else REPO_ROOT / args.output
+    if args.output is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = output_root / f"enhance_predict_depth_{timestamp}" / "enhanced_ai_depth.npz"
+    else:
+        output_path = args.output if args.output.is_absolute() else REPO_ROOT / args.output
     output_path.parent.mkdir(parents=True, exist_ok=True)
     geometry = bundle.dataset_bundle.geometry
     ilines = float(geometry["inline_min"]) + np.arange(n_il, dtype=np.float32) * float(geometry["inline_step"])

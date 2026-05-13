@@ -43,6 +43,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
     config_path = args.config if args.config.is_absolute() else REPO_ROOT / args.config
     cfg = EnhancementConfig.from_yaml(config_path, base_dir=REPO_ROOT)
+    logging.info("Config: %s", config_path)
+    logging.info("Checkpoint dir: %s", cfg.checkpoint_dir)
     bundle = build_depth_enhancement_bundle(cfg)
     trainer = EnhancementTrainer(
         cfg,

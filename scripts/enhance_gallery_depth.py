@@ -243,11 +243,11 @@ def sample_record(sample: dict[str, Any], index: int, image_path: Path | None) -
     }
 
 
-def shade_mask(ax: plt.Axes, x: np.ndarray, mask: np.ndarray) -> None:
+def shade_mask(ax: plt.Axes, x: np.ndarray, mask: np.ndarray, *, label: str | None = None) -> None:
     if x.size != mask.size or mask.size == 0:
         return
     y0, y1 = ax.get_ylim()
-    ax.fill_between(x, y0, y1, where=mask, color="0.90", alpha=0.55, linewidth=0, zorder=0)
+    ax.fill_between(x, y0, y1, where=mask, color="0.90", alpha=0.55, linewidth=0, zorder=0, label=label)
     ax.set_ylim(y0, y1)
 
 
@@ -271,22 +271,19 @@ def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Pat
 
     fig, axes = plt.subplots(5, 1, figsize=(11, 9), sharex=True)
 
-    axes[0].plot(depth, real_obs, color="0.62", lw=1.0, label="real normalized seismic")
+    axes[0].plot(depth, real_obs, color="0.58", lw=1.0, label="real normalized seismic")
     if base_seismic is not None:
-        axes[0].plot(depth, base_seismic, color="0.15", lw=0.9, alpha=0.75, label="base forward")
+        axes[0].plot(depth, base_seismic, color="tab:blue", lw=0.95, alpha=0.90, label="base forward")
     axes[0].plot(depth, target_seismic_raw, color="tab:orange", lw=0.9, alpha=0.75, label="synthetic raw")
-    axes[0].plot(depth, target_seismic, color="tab:blue", lw=1.2, label="synthetic RMS-matched")
-    axes[0].legend(loc="upper right", fontsize=8)
     axes[0].set_ylabel("seismic")
 
     axes[1].plot(depth, base_ai, color="0.40", lw=1.0, label="base AI")
     if highres_depth is not None and highres_ai is not None:
         axes[1].plot(highres_depth, highres_ai, color="tab:orange", lw=0.45, alpha=0.55, label="internal high-res AI")
     axes[1].plot(depth, ai, color="tab:red", lw=1.0, label="target AI")
-    axes[1].legend(loc="upper right", fontsize=8)
     axes[1].set_ylabel("AI")
 
-    axes[2].plot(depth, residual, color="tab:purple", lw=1.0)
+    axes[2].plot(depth, residual, color="tab:purple", lw=1.0, label="target logAI residual")
     axes[2].axhline(0.0, color="0.2", lw=0.7)
     axes[2].set_ylabel("logAI residual")
 
@@ -299,14 +296,11 @@ def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Pat
         axes[3].plot(
             highres_depth[:-1], highres_reflectivity, color="0.55", lw=0.35, alpha=0.65, label="internal high-res"
         )
-    axes[3].plot(refl_depth, reflectivity, color="tab:green", lw=0.8)
-    if highres_reflectivity is not None:
-        axes[3].legend(loc="upper right", fontsize=8)
+    axes[3].plot(refl_depth, reflectivity, color="tab:green", lw=0.8, label="sampled reflectivity")
     axes[3].axhline(0.0, color="0.2", lw=0.7)
     axes[3].set_ylabel("reflectivity")
 
     axes[4].plot(depth, taper, color="tab:brown", lw=1.2, label="taper")
-    axes[4].fill_between(depth, 0.0, core_mask.astype(float), color="0.75", alpha=0.35, label="core mask")
     axes[4].fill_between(
         depth, 0.0, waveform_mask.astype(float), color="tab:cyan", alpha=0.25, label="waveform QC mask"
     )
@@ -319,8 +313,9 @@ def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Pat
     axes[4].legend(loc="upper right", fontsize=8)
 
     for ax in axes[:4]:
-        shade_mask(ax, depth, delta_mask)
+        shade_mask(ax, depth, core_mask, label="core mask")
         ax.grid(True, alpha=0.25)
+        ax.legend(loc="upper right", fontsize=8)
     axes[4].grid(True, alpha=0.25)
 
     waveform_synthetic = finite_core(target_seismic, waveform_mask)

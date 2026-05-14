@@ -19,7 +19,7 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.seismic.facies_control_depth import build_target_layer_from_lfm_metadata, load_depth_facies_control_points_csv  # noqa: E402
 from cup.seismic.survey import open_survey  # noqa: E402
-from cup.utils.io import load_yaml_config, resolve_relative_path, to_json_compatible, write_json  # noqa: E402
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, to_json_compatible, write_json  # noqa: E402
 from ginn.facies_anchor_depth import build_facies_control_anchor_bundle  # noqa: E402
 from ginn.log_ai_anchor import save_log_ai_anchor_npz  # noqa: E402
 from ginn_depth.data import load_lfm_depth_npz  # noqa: E402
@@ -94,12 +94,13 @@ def main() -> None:
         survey=survey,
         metadata={
             "source_script": Path(__file__).name,
-            "reference_ai_lfm_file": str(ai_lfm_file),
-            "control_points_file": str(control_points_file),
-            "seismic_file": str(seismic_file),
+            "path_style": "repo_relative",
+            "reference_ai_lfm_file": repo_relative_path(ai_lfm_file, root=REPO_ROOT),
+            "control_points_file": repo_relative_path(control_points_file, root=REPO_ROOT),
+            "seismic_file": repo_relative_path(seismic_file, root=REPO_ROOT),
             "anchor_target_mode": "fixed_target_ai",
             "anchor_weight_mode": "constant_strength_inside_mask",
-            "qc_path": str(qc_path),
+            "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
         },
     )
     save_log_ai_anchor_npz(anchor_path, result.bundle)
@@ -111,16 +112,17 @@ def main() -> None:
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "source_script": Path(__file__).name,
             "artifact": {
-                "path": str(anchor_path),
+                "path": repo_relative_path(anchor_path, root=REPO_ROOT),
                 "schema": result.bundle.schema_version,
                 "summary": result.bundle.summary,
             },
             "inputs": {
-                "reference_ai_lfm_file": str(ai_lfm_file),
-                "control_points_file": str(control_points_file),
-                "seismic_file": str(seismic_file),
+                "path_style": "repo_relative",
+                "reference_ai_lfm_file": repo_relative_path(ai_lfm_file, root=REPO_ROOT),
+                "control_points_file": repo_relative_path(control_points_file, root=REPO_ROOT),
+                "seismic_file": repo_relative_path(seismic_file, root=REPO_ROOT),
             },
-            "qc_path": str(qc_path),
+            "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
             "n_controls": int(len(control_points)),
         },
     )

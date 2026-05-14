@@ -35,7 +35,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.utils.io import load_yaml_config, sanitize_filename  # noqa: E402
+from cup.utils.io import load_yaml_config, repo_relative_path, sanitize_filename  # noqa: E402
 from cup.utils.raw_trace import centered_moving_rms, meters_to_odd_samples  # noqa: E402
 from cup.utils.statistics import normalized_mae, ols_fit, pearson_r, spearman_rho  # noqa: E402
 
@@ -594,7 +594,7 @@ def main() -> None:
                 "rms_window_samples": int(win_smp),
                 "inferred_depth_step_m": dz_m,
                 "rms_window_m": float(win_smp * dz_m),
-                "well_qc_path": str(out_path),
+                "well_qc_path": repo_relative_path(out_path, root=REPO_ROOT),
             }
         )
 
@@ -607,7 +607,10 @@ def main() -> None:
     for _, srow in summary_df.iterrows():
         well_name = str(srow["well_name"])
         name = sanitize_filename(well_name)
-        qc_df = pd.read_csv(srow["well_qc_path"])
+        well_qc_path = Path(str(srow["well_qc_path"]))
+        if not well_qc_path.is_absolute():
+            well_qc_path = REPO_ROOT / well_qc_path
+        qc_df = pd.read_csv(well_qc_path)
         d = qc_df["tvdss_m"].to_numpy(dtype=float)
         s = qc_df["seismic_norm"].to_numpy(dtype=float)
         fsyn = qc_df["synthetic_fixed_scale"].to_numpy(dtype=float)

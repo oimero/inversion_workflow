@@ -14,7 +14,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.seismic.survey import open_survey  # noqa: E402
-from cup.utils.io import load_yaml_config, resolve_relative_path, write_json  # noqa: E402
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json  # noqa: E402
 from ginn.facies_anchor_depth import merge_well_and_facies_anchor_bundles  # noqa: E402
 from ginn.log_ai_anchor import load_log_ai_anchor_npz, save_log_ai_anchor_npz  # noqa: E402
 
@@ -79,10 +79,11 @@ def main() -> None:
         min_well_facies_separation_m=min_sep,
         metadata={
             "source_script": Path(__file__).name,
-            "well_anchor_file": str(well_anchor_file),
-            "facies_anchor_file": str(facies_anchor_file),
-            "seismic_file": str(seismic_file),
-            "qc_path": str(qc_path),
+            "path_style": "repo_relative",
+            "well_anchor_file": repo_relative_path(well_anchor_file, root=REPO_ROOT),
+            "facies_anchor_file": repo_relative_path(facies_anchor_file, root=REPO_ROOT),
+            "seismic_file": repo_relative_path(seismic_file, root=REPO_ROOT),
+            "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
         },
     )
     save_log_ai_anchor_npz(combined_path, result.bundle)
@@ -93,17 +94,18 @@ def main() -> None:
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "source_script": Path(__file__).name,
             "artifact": {
-                "path": str(combined_path),
+                "path": repo_relative_path(combined_path, root=REPO_ROOT),
                 "schema": result.bundle.schema_version,
                 "summary": result.bundle.summary,
             },
             "inputs": {
-                "well_anchor_file": str(well_anchor_file),
-                "facies_anchor_file": str(facies_anchor_file),
-                "seismic_file": str(seismic_file),
+                "path_style": "repo_relative",
+                "well_anchor_file": repo_relative_path(well_anchor_file, root=REPO_ROOT),
+                "facies_anchor_file": repo_relative_path(facies_anchor_file, root=REPO_ROOT),
+                "seismic_file": repo_relative_path(seismic_file, root=REPO_ROOT),
                 "min_well_facies_separation_m": min_sep,
             },
-            "qc_path": str(qc_path),
+            "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
             "n_facies_kept": int((result.qc["status"] == "kept").sum()) if not result.qc.empty else 0,
             "n_facies_skipped": int((result.qc["status"] != "kept").sum()) if not result.qc.empty else 0,
         },

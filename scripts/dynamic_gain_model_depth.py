@@ -36,7 +36,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.utils.io import build_segy_textual_header, load_yaml_config  # noqa: E402
+from cup.utils.io import build_segy_textual_header, load_yaml_config, repo_relative_path  # noqa: E402
 from cup.utils.raw_trace import (  # noqa: E402
     centered_moving_rms_axis,
     centered_moving_sum_axis,
@@ -309,8 +309,9 @@ def main() -> None:
         "application_window_m": app_window_m,
         "application_window_samples": int(window_samples),
         "sample_step_m": sample_step_m,
-        "source_seismic_file": str(seismic_file),
-        "fit_metrics_file": str(fit_file),
+        "source_seismic_file": repo_relative_path(seismic_file, root=REPO_ROOT),
+        "fit_metrics_file": repo_relative_path(fit_file, root=REPO_ROOT),
+        "path_style": "repo_relative",
     }
     np.savez_compressed(
         gain_npz,

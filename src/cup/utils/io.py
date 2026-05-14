@@ -25,6 +25,42 @@ def resolve_relative_path(relative: str | Path, *, root: Path) -> Path:
     return (root / p).resolve()
 
 
+def repo_relative_path(path: str | Path, *, root: Path) -> str:
+    """Return a portable POSIX-style path relative to *root*.
+
+    Repo artifacts should store paths with this helper instead of embedding
+    workstation-specific absolute paths.
+    """
+    root = Path(root).resolve()
+    p = Path(path)
+    if p.is_absolute():
+        resolved = p.resolve()
+    else:
+        resolved = (root / p).resolve()
+    try:
+        return resolved.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"Path is outside repository root and cannot be stored portably: {resolved}") from exc
+
+
+def resolve_repo_metadata_path(value: str | Path, *, root: Path) -> Path:
+    """Resolve a repo-relative path stored in artifact metadata.
+
+    Absolute metadata paths are intentionally rejected so stale workstation
+    paths fail loudly instead of being guessed.
+    """
+    p = Path(value)
+    if p.is_absolute():
+        raise ValueError(
+            f"Artifact metadata contains an absolute path, which is not portable: {p}. "
+            "Regenerate the artifact with repo-relative metadata."
+        )
+    resolved = (Path(root).resolve() / p).resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"Artifact metadata path does not exist: {value} -> {resolved}")
+    return resolved
+
+
 # ── Config loading ──
 
 

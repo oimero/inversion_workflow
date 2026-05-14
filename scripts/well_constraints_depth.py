@@ -38,7 +38,7 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.petrel.load import import_well_heads_petrel  # noqa: E402
 from cup.seismic.survey import open_survey  # noqa: E402
-from cup.utils.io import load_yaml_config, resolve_relative_path  # noqa: E402
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path  # noqa: E402
 from ginn.log_ai_anchor import build_log_ai_anchor_bundle, save_log_ai_anchor_npz  # noqa: E402
 from enhance.prior import (  # noqa: E402
     WellResolutionPriorBundle,
@@ -237,7 +237,11 @@ def main() -> None:
     for las_path in las_paths:
         well_name = las_path.stem
         well_name_upper = well_name.upper()
-        qc: dict[str, Any] = {"well_name": well_name, "las_path": str(las_path), "status": "skipped"}
+        qc: dict[str, Any] = {
+            "well_name": well_name,
+            "las_path": repo_relative_path(las_path, root=REPO_ROOT),
+            "status": "skipped",
+        }
         try:
             head = heads_by_name.get(well_name)
             if head is None:
@@ -344,13 +348,14 @@ def main() -> None:
         "artifact_family": "well_constraints_depth",
         "artifact_role": "well_resolution_prior",
         "used_by_stage": "stage_2_enhancement",
-        "paired_anchor_path": str(anchor_path),
-        "shifted_las_dir": str(shifted_las_dir),
-        "metrics_path": str(metrics_path),
-        "well_heads_file": str(well_heads_file),
-        "ai_lfm_file": str(ai_lfm_file),
+        "path_style": "repo_relative",
+        "paired_anchor_path": repo_relative_path(anchor_path, root=REPO_ROOT),
+        "shifted_las_dir": repo_relative_path(shifted_las_dir, root=REPO_ROOT),
+        "metrics_path": repo_relative_path(metrics_path, root=REPO_ROOT),
+        "well_heads_file": repo_relative_path(well_heads_file, root=REPO_ROOT),
+        "ai_lfm_file": repo_relative_path(ai_lfm_file, root=REPO_ROOT),
         "confidence_formula": f"clip((corr - {confidence_corr_floor}) / {confidence_corr_span}, 0, 1)",
-        "qc_path": str(qc_path),
+        "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
         "n_input_las": int(len(las_paths)),
         "n_successful_wells": int(len(records)),
         "status_counts": qc_df["status"].value_counts(dropna=False).to_dict(),
@@ -381,14 +386,15 @@ def main() -> None:
         "artifact_family": "well_constraints_depth",
         "artifact_role": "log_ai_anchor",
         "used_by_stage": "stage_1_ginn_anchor",
-        "paired_prior_path": str(prior_path),
+        "path_style": "repo_relative",
+        "paired_prior_path": repo_relative_path(prior_path, root=REPO_ROOT),
         "anchor_source": "shifted_las_wells",
-        "shifted_las_dir": str(shifted_las_dir),
-        "metrics_path": str(metrics_path),
-        "well_heads_file": str(well_heads_file),
-        "ai_lfm_file": str(ai_lfm_file),
+        "shifted_las_dir": repo_relative_path(shifted_las_dir, root=REPO_ROOT),
+        "metrics_path": repo_relative_path(metrics_path, root=REPO_ROOT),
+        "well_heads_file": repo_relative_path(well_heads_file, root=REPO_ROOT),
+        "ai_lfm_file": repo_relative_path(ai_lfm_file, root=REPO_ROOT),
         "confidence_formula": metadata["confidence_formula"],
-        "qc_path": str(qc_path),
+        "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
         "n_input_las": int(len(las_paths)),
         "n_successful_anchors": int(len(records)),
         "status_counts": qc_df["status"].value_counts(dropna=False).to_dict(),
@@ -418,24 +424,25 @@ def main() -> None:
                 "source_script": Path(__file__).name,
                 "artifact_family": "well_constraints_depth",
                 "shared_source": {
-                    "shifted_las_dir": str(shifted_las_dir),
-                    "metrics_path": str(metrics_path),
-                    "well_heads_file": str(well_heads_file),
-                    "ai_lfm_file": str(ai_lfm_file),
-                    "qc_path": str(qc_path),
+                    "path_style": "repo_relative",
+                    "shifted_las_dir": repo_relative_path(shifted_las_dir, root=REPO_ROOT),
+                    "metrics_path": repo_relative_path(metrics_path, root=REPO_ROOT),
+                    "well_heads_file": repo_relative_path(well_heads_file, root=REPO_ROOT),
+                    "ai_lfm_file": repo_relative_path(ai_lfm_file, root=REPO_ROOT),
+                    "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
                     "n_input_las": int(len(las_paths)),
                     "n_successful_wells": int(len(records)),
                     "status_counts": qc_df["status"].value_counts(dropna=False).to_dict(),
                 },
                 "artifacts": {
                     "stage_2_enhancement_prior": {
-                        "path": str(prior_path),
+                        "path": repo_relative_path(prior_path, root=REPO_ROOT),
                         "schema": "ginn_well_resolution_prior_v1",
                         "contains_residual_log_ai": True,
                         "summary": summary,
                     },
                     "stage_1_log_ai_anchor": {
-                        "path": str(anchor_path),
+                        "path": repo_relative_path(anchor_path, root=REPO_ROOT),
                         "schema": "ginn_log_ai_anchor_v1",
                         "contains_residual_log_ai": False,
                         "reserved_anchor_types": ["well", "facies_control"],

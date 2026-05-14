@@ -39,6 +39,7 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.utils.io import (  # noqa: E402
     load_yaml_config,
+    repo_relative_path,
     resolve_relative_path,
     sanitize_filename,
 )
@@ -549,12 +550,15 @@ def process_well(
             "p10_depth_shift_m": p10_depth_shift,
             "p90_depth_shift_m": p90_depth_shift,
             "approx_depth_shift_m": approx_depth_shift_m,
-            "synthetic_qc_path": str(qc_path),
-            "shift_scan_path": str(scan_path),
-            "depth_shift_curve_path": str(depth_shift_path),
-            "shifted_las_path": str(shifted_las_path),
-            "synthetic_fig_path": str(output_dirs["figures"] / f"qc_{name}_synthetic_vs_seismic.png"),
-            "shift_fig_path": str(output_dirs["figures"] / f"qc_{name}_shift_scan.png"),
+            "synthetic_qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
+            "shift_scan_path": repo_relative_path(scan_path, root=REPO_ROOT),
+            "depth_shift_curve_path": repo_relative_path(depth_shift_path, root=REPO_ROOT),
+            "shifted_las_path": repo_relative_path(shifted_las_path, root=REPO_ROOT),
+            "synthetic_fig_path": repo_relative_path(
+                output_dirs["figures"] / f"qc_{name}_synthetic_vs_seismic.png",
+                root=REPO_ROOT,
+            ),
+            "shift_fig_path": repo_relative_path(output_dirs["figures"] / f"qc_{name}_shift_scan.png", root=REPO_ROOT),
         }
     )
     return row

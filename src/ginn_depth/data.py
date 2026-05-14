@@ -15,6 +15,7 @@ from torch.utils.data import Dataset
 
 from cup.petrel.load import import_interpretation_petrel, import_seismic
 from cup.seismic.target_layer import TargetLayer
+from cup.utils.io import resolve_repo_metadata_path
 from cup.well.wavelet import (
     DEFAULT_ACTIVE_SUPPORT_THRESHOLD,
     compute_wavelet_active_half_support_s,
@@ -33,6 +34,14 @@ logger = logging.getLogger(__name__)
 
 BOUNDARY_EFFECT_WAVELET_THRESHOLD = DEFAULT_ACTIVE_SUPPORT_THRESHOLD
 BOUNDARY_EFFECT_VELOCITY_PERCENTILE = 25.0
+
+
+def _find_repo_root(start: str | Path) -> Path:
+    path = Path(start).resolve()
+    for candidate in [path if path.is_dir() else path.parent, *(path if path.is_dir() else path.parent).parents]:
+        if (candidate / "src").is_dir() and (candidate / "scripts").is_dir():
+            return candidate
+    raise FileNotFoundError(f"Cannot find repository root from {path}.")
 
 
 @dataclass
@@ -525,8 +534,9 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
     if len(hz_list) < 2:
         raise ValueError("AI LFM NPZ metadata must contain at least two sorted horizons.")
     # Top = shallowest (index 0), bottom = deepest (index -1)
-    top_horizon_file = hz_list[0]["file"]
-    bot_horizon_file = hz_list[-1]["file"]
+    repo_root = _find_repo_root(cfg.ai_lfm_file)
+    top_horizon_file = resolve_repo_metadata_path(hz_list[0]["file"], root=repo_root)
+    bot_horizon_file = resolve_repo_metadata_path(hz_list[-1]["file"], root=repo_root)
     logger.info("Top horizon: %s", top_horizon_file)
     logger.info("Bot horizon: %s", bot_horizon_file)
 

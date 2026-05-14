@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import numpy as np
 import pandas as pd
 
-from cup.utils.io import resolve_relative_path
+from cup.utils.io import resolve_relative_path, resolve_repo_metadata_path
 from cup.utils.statistics import normalized_cross_correlation, normalized_mae, rms
 
 if TYPE_CHECKING:
@@ -197,6 +197,7 @@ def build_target_layer_from_lfm_metadata(
     from cup.petrel.load import import_interpretation_petrel
     from cup.seismic.target_layer import TargetLayer
 
+    repo_root = find_repo_root()
     horizons = metadata.get("horizons", [])
     if not isinstance(horizons, list) or len(horizons) < 2:
         raise ValueError("AI LFM metadata must contain at least two horizons.")
@@ -208,7 +209,9 @@ def build_target_layer_from_lfm_metadata(
             raise ValueError(f"Invalid horizon metadata entry at index {idx}: {item!r}")
         name = str(item.get("name") or f"horizon_{idx}")
         horizon_names.append(name)
-        raw_horizons[name] = import_interpretation_petrel(Path(str(item["file"])))
+        raw_horizons[name] = import_interpretation_petrel(
+            resolve_repo_metadata_path(str(item["file"]), root=repo_root)
+        )
 
     tl_meta = metadata.get("target_layer", {})
     if not isinstance(tl_meta, dict):

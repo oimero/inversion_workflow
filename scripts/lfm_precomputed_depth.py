@@ -37,6 +37,7 @@ if str(SRC_DIR) not in sys.path:
 from cup.utils.io import (  # noqa: E402
     build_segy_textual_header,
     load_yaml_config,
+    repo_relative_path,
     resolve_relative_path,
 )
 
@@ -654,9 +655,10 @@ def main() -> None:
             "outlier_min_neighbor_count": script_cfg.get("target_layer_outlier_min_neighbor_count"),
         }
         result.metadata["horizons"] = [
-            {"file": str(path), "mean_depth_m": float(depth)}
+            {"file": repo_relative_path(path, root=REPO_ROOT), "mean_depth_m": float(depth)}
             for depth, path in _horizon_entries
         ]
+        result.metadata["path_style"] = "repo_relative"
 
     # ── Coverage stats ──
 

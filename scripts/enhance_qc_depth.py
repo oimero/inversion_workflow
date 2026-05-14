@@ -159,6 +159,12 @@ def parse_args() -> argparse.Namespace:
         help="Override synthetic_min_base_target_waveform_corr for this QC run.",
     )
     parser.add_argument(
+        "--min-target-obs-waveform-corr",
+        type=float,
+        default=None,
+        help="Override synthetic_min_target_obs_waveform_corr for this QC run.",
+    )
+    parser.add_argument(
         "--max-resample-attempts",
         type=int,
         default=None,
@@ -300,6 +306,11 @@ def sample_metrics(
     real = finite_values(to_numpy_1d(sample["obs"]), waveform_mask)
     synthetic = finite_values(to_numpy_1d(sample["target_seismic"]), waveform_mask)
     synthetic_raw = finite_values(to_numpy_1d(sample["target_seismic_raw"]), waveform_mask)
+    input_clean_full = to_numpy_1d(sample.get("input_seismic_clean", sample["target_seismic"])).astype(np.float64)
+    input_augmented_full = to_numpy_1d(sample.get("input_seismic_augmented", sample["target_seismic"])).astype(
+        np.float64
+    )
+    input_augmented = finite_values(input_augmented_full, waveform_mask)
     base_seismic_full = zero_residual_seismic(sample, forward_model).astype(np.float64)
     residual_full = to_numpy_1d(sample["target_residual"]).astype(np.float64)
     residual = finite_values(residual_full, delta_mask)
@@ -319,6 +330,10 @@ def sample_metrics(
     base_target_corr = normalized_cross_correlation(
         base_seismic_full[waveform_mask], target_seismic_full[waveform_mask]
     )
+    target_obs_corr = normalized_cross_correlation(target_seismic_full[waveform_mask], to_numpy_1d(sample["obs"])[waveform_mask])
+    input_obs_corr = normalized_cross_correlation(input_augmented_full[waveform_mask], to_numpy_1d(sample["obs"])[waveform_mask])
+    input_delta = finite_values(input_augmented_full - input_clean_full, waveform_mask)
+    input_clean = finite_values(input_clean_full, waveform_mask)
     residual_abs_max = percentile_abs(residual, 100.0)
     residual_outside = residual_full[np.asarray(taper <= 0.0)]
     residual_inside = residual_full[np.asarray(taper > 0.0)]
@@ -369,6 +384,10 @@ def sample_metrics(
         "real_abs_p99": real_abs_p99,
         "synthetic_abs_p99": synthetic_abs_p99,
         "synthetic_to_real_abs_p99": safe_ratio(synthetic_abs_p99, real_abs_p99),
+        "target_obs_waveform_corr": target_obs_corr,
+        "input_obs_waveform_corr": input_obs_corr,
+        "input_to_clean_rms_ratio": safe_ratio(rms(input_augmented), rms(input_clean)),
+        "input_augmentation_delta_rms_fraction": safe_ratio(rms(input_delta), rms(input_clean)),
         "base_target_waveform_corr": base_target_corr,
         "base_target_waveform_delta_rms": base_target_delta_rms,
         "base_target_waveform_delta_rms_to_target_rms": safe_ratio(base_target_delta_rms, synthetic_rms),
@@ -460,6 +479,7 @@ QUALITY_THRESHOLDS = {
     "seismic_rms_ratio_p50_max": 1.30,
     "seismic_abs_p99_ratio_p50_min": 0.60,
     "seismic_abs_p99_ratio_p50_max": 1.60,
+    "target_obs_waveform_corr_p05_min": 0.0,
     "base_target_waveform_corr_p05_min": 0.50,
     "outside_taper_nonzero_fraction_p95_max": 0.005,
     "residual_near_clip_fraction_p95_max": 0.02,
@@ -584,6 +604,36 @@ def add_quality_flags(
             suggested_action="Inspect cluster and well patch amplitudes; high p99 usually means local synthetic spikes are too strong.",
         )
 
+    target_obs_corr_p05 = all_stats["target_obs_waveform_corr"]["p05"]
+    if (
+        target_obs_corr_p05 is not None
+        and target_obs_corr_p05 >= QUALITY_THRESHOLDS["target_obs_waveform_corr_p05_min"]
+    ):
+        flag(
+            "OK",
+            "target_obs_waveform_corr",
+            f"p05 target/obs waveform correlation is {target_obs_corr_p05:.3f}.",
+            metric="target_obs_waveform_corr.p05",
+            actual=target_obs_corr_p05,
+            threshold=">= 0.00",
+            related_config_keys=["synthetic_min_target_obs_waveform_corr"],
+        )
+    else:
+        flag(
+            "WARN",
+            "target_obs_waveform_corr",
+            f"p05 target/obs waveform correlation is {target_obs_corr_p05}; synthetic inputs may be far from real observations.",
+            metric="target_obs_waveform_corr.p05",
+            actual=target_obs_corr_p05,
+            threshold=">= 0.00",
+            related_config_keys=[
+                "synthetic_min_target_obs_waveform_corr",
+                "synthetic_seismic_rms_target",
+                "synthetic_input_phase_deg_max",
+            ],
+            suggested_action="Inspect target/obs overlays and keep this as the primary weak waveform gate for synthetic-real input distribution.",
+        )
+
     base_target_corr_p05 = all_stats["base_target_waveform_corr"]["p05"]
     if (
         base_target_corr_p05 is not None
@@ -592,7 +642,7 @@ def add_quality_flags(
         flag(
             "OK",
             "base_target_waveform_corr",
-            f"p05 base/target waveform correlation is {base_target_corr_p05:.3f}.",
+            f"p05 base/target waveform correlation is {base_target_corr_p05:.3f} as a perturbation diagnostic.",
             metric="base_target_waveform_corr.p05",
             actual=base_target_corr_p05,
             threshold=">= 0.50",
@@ -601,7 +651,7 @@ def add_quality_flags(
         flag(
             "WARN",
             "base_target_waveform_corr",
-            f"p05 base/target waveform correlation is {base_target_corr_p05}; some synthetic targets may drift far from base forward seismic.",
+            f"p05 base/target waveform correlation is {base_target_corr_p05}; perturbations may be strong relative to base forward seismic.",
             metric="base_target_waveform_corr.p05",
             actual=base_target_corr_p05,
             threshold=">= 0.50",
@@ -612,7 +662,7 @@ def add_quality_flags(
                 "synthetic_cluster_amp_abs_p95_min",
                 "synthetic_cluster_amp_abs_p99_max",
             ],
-            suggested_action="Inspect low-correlation samples before enabling a hard gate; if they are implausible, set synthetic_min_base_target_waveform_corr to a loose value such as 0.0.",
+            suggested_action="Treat this as a perturbation guardrail; prefer target/obs correlation for the synthetic-real hard gate.",
         )
 
     outside_fraction = all_stats["residual_outside_taper_nonzero_fraction"]["p95"]
@@ -816,6 +866,7 @@ def add_quality_flags(
                 "synthetic_max_residual_near_clip_fraction",
                 "synthetic_max_seismic_rms_ratio",
                 "synthetic_max_seismic_abs_p99_ratio",
+                "synthetic_min_target_obs_waveform_corr",
                 "synthetic_min_base_target_waveform_corr",
                 "synthetic_max_resample_attempts",
             ],
@@ -844,6 +895,7 @@ def add_quality_flags(
                 "synthetic_max_residual_near_clip_fraction",
                 "synthetic_max_seismic_rms_ratio",
                 "synthetic_max_seismic_abs_p99_ratio",
+                "synthetic_min_target_obs_waveform_corr",
                 "synthetic_min_base_target_waveform_corr",
                 "synthetic_max_resample_attempts",
             ],
@@ -899,6 +951,10 @@ def log_summary(summary: dict[str, Any], flags: list[dict[str, Any]]) -> None:
     for key in (
         "synthetic_to_real_rms",
         "synthetic_to_real_abs_p99",
+        "target_obs_waveform_corr",
+        "input_obs_waveform_corr",
+        "input_to_clean_rms_ratio",
+        "input_augmentation_delta_rms_fraction",
         "base_target_waveform_corr",
         "base_target_waveform_delta_rms_to_target_rms",
         "base_target_waveform_delta_rms_to_real_rms",
@@ -1035,6 +1091,8 @@ def main() -> None:
         cfg.synthetic_max_seismic_rms_ratio = float(args.max_seismic_rms_ratio)
     if args.max_seismic_abs_p99_ratio is not None:
         cfg.synthetic_max_seismic_abs_p99_ratio = float(args.max_seismic_abs_p99_ratio)
+    if args.min_target_obs_waveform_corr is not None:
+        cfg.synthetic_min_target_obs_waveform_corr = float(args.min_target_obs_waveform_corr)
     if args.min_base_target_waveform_corr is not None:
         cfg.synthetic_min_base_target_waveform_corr = float(args.min_base_target_waveform_corr)
     if args.max_resample_attempts is not None:
@@ -1111,7 +1169,13 @@ def main() -> None:
         "synthetic_max_residual_near_clip_fraction": cfg.synthetic_max_residual_near_clip_fraction,
         "synthetic_max_seismic_rms_ratio": cfg.synthetic_max_seismic_rms_ratio,
         "synthetic_max_seismic_abs_p99_ratio": cfg.synthetic_max_seismic_abs_p99_ratio,
+        "synthetic_min_target_obs_waveform_corr": cfg.synthetic_min_target_obs_waveform_corr,
         "synthetic_min_base_target_waveform_corr": cfg.synthetic_min_base_target_waveform_corr,
+        "synthetic_input_augmentation_enabled": cfg.synthetic_input_augmentation_enabled,
+        "synthetic_input_phase_deg_max": cfg.synthetic_input_phase_deg_max,
+        "synthetic_input_amp_jitter": cfg.synthetic_input_amp_jitter,
+        "synthetic_input_noise_rms_fraction": cfg.synthetic_input_noise_rms_fraction,
+        "synthetic_input_spectral_tilt_max": cfg.synthetic_input_spectral_tilt_max,
         "synthetic_max_resample_attempts": cfg.synthetic_max_resample_attempts,
         "ai_min": cfg.ai_min,
         "ai_max": cfg.ai_max,

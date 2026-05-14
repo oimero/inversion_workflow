@@ -197,7 +197,13 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         max_residual_near_clip_fraction: float | None = 0.02,
         max_seismic_rms_ratio: float | None = 2.0,
         max_seismic_abs_p99_ratio: float | None = 2.5,
+        min_target_obs_waveform_corr: float | None = 0.0,
         min_base_target_waveform_corr: float | None = None,
+        input_augmentation_enabled: bool = True,
+        input_phase_deg_max: float = 12.0,
+        input_amp_jitter: tuple[float, float] = (0.9, 1.1),
+        input_noise_rms_fraction: tuple[float, float] = (0.02, 0.06),
+        input_spectral_tilt_max: float = 0.12,
         max_resample_attempts: int = 8,
         delta_supervision_mask: DeltaSupervisionMask = "core",
         velocity_mode: SyntheticVelocityMode = "lfm_vp",
@@ -238,6 +244,22 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
                 raise ValueError(f"{name} must be positive when provided.")
         if min_base_target_waveform_corr is not None and not (-1.0 <= min_base_target_waveform_corr <= 1.0):
             raise ValueError("min_base_target_waveform_corr must be within [-1, 1] when provided.")
+        if min_target_obs_waveform_corr is not None and not (-1.0 <= min_target_obs_waveform_corr <= 1.0):
+            raise ValueError("min_target_obs_waveform_corr must be within [-1, 1] when provided.")
+        if input_phase_deg_max < 0.0:
+            raise ValueError("input_phase_deg_max must be non-negative.")
+        if input_spectral_tilt_max < 0.0:
+            raise ValueError("input_spectral_tilt_max must be non-negative.")
+        input_amp_jitter = tuple(float(v) for v in input_amp_jitter)
+        if len(input_amp_jitter) != 2 or input_amp_jitter[0] <= 0.0 or input_amp_jitter[1] < input_amp_jitter[0]:
+            raise ValueError("input_amp_jitter must be a positive (min, max) range.")
+        input_noise_rms_fraction = tuple(float(v) for v in input_noise_rms_fraction)
+        if (
+            len(input_noise_rms_fraction) != 2
+            or input_noise_rms_fraction[0] < 0.0
+            or input_noise_rms_fraction[1] < input_noise_rms_fraction[0]
+        ):
+            raise ValueError("input_noise_rms_fraction must be a non-negative (min, max) range.")
         if delta_supervision_mask not in ("core", "loss"):
             raise ValueError("delta_supervision_mask must be one of ['core', 'loss'].")
         _validate_velocity_mode(velocity_mode, vp_ai_slope, vp_ai_intercept, vp_blend_alpha, vp_smooth_samples)
@@ -269,7 +291,13 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         self.max_residual_near_clip_fraction = max_residual_near_clip_fraction
         self.max_seismic_rms_ratio = max_seismic_rms_ratio
         self.max_seismic_abs_p99_ratio = max_seismic_abs_p99_ratio
+        self.min_target_obs_waveform_corr = min_target_obs_waveform_corr
         self.min_base_target_waveform_corr = min_base_target_waveform_corr
+        self.input_augmentation_enabled = bool(input_augmentation_enabled)
+        self.input_phase_deg_max = float(input_phase_deg_max)
+        self.input_amp_jitter = input_amp_jitter
+        self.input_noise_rms_fraction = input_noise_rms_fraction
+        self.input_spectral_tilt_max = float(input_spectral_tilt_max)
         self.max_resample_attempts = int(max_resample_attempts)
         self.delta_supervision_mask = delta_supervision_mask
         self.velocity_mode = velocity_mode
@@ -426,6 +454,15 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         item["mask"] = torch.from_numpy(core_mask[np.newaxis]).bool()
         item["loss_mask"] = torch.from_numpy(loss_mask[np.newaxis]).bool()
         item["delta_loss_mask"] = torch.from_numpy(delta_loss_mask[np.newaxis]).bool()
+        input_seismic_clean = target_seismic.astype(np.float32, copy=True)
+        input_seismic_augmented = self._augment_input_seismic(
+            input_seismic_clean,
+            item["obs"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False),
+            core_mask,
+        )
+        item["input_seismic_clean"] = torch.from_numpy(input_seismic_clean[np.newaxis]).float()
+        item["input_seismic_augmented"] = torch.from_numpy(input_seismic_augmented[np.newaxis]).float()
+        item["input_augmentation_enabled"] = torch.tensor(self.input_augmentation_enabled, dtype=torch.bool)
         item["input"] = self._compose_enhancement_input(item)
         item["target_residual_highres"] = torch.from_numpy(highres_residual[np.newaxis]).float()
         item["target_ai_highres"] = torch.from_numpy(highres_ai[np.newaxis]).float()
@@ -434,7 +471,8 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         return item
 
     def _compose_enhancement_input(self, item: dict[str, torch.Tensor]) -> torch.Tensor:
-        channels = [item["target_seismic"].squeeze(0).detach().cpu().numpy().astype(np.float32)]
+        input_seismic = item.get("input_seismic_augmented", item["target_seismic"])
+        channels = [input_seismic.squeeze(0).detach().cpu().numpy().astype(np.float32)]
         channel_names = getattr(self.base_dataset, "input_channel_names", ())
         base_ai = item["base_ai_raw"].squeeze(0).detach().cpu().numpy().astype(np.float32)
         if "ai_lfm" in channel_names or "base_ai" in channel_names:
@@ -451,6 +489,35 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
                 gain_channel = np.log(np.maximum(gain, 1e-6) / median)
                 channels.append(np.clip(gain_channel, -3.0, 3.0).astype(np.float32))
         return torch.from_numpy(np.stack(channels, axis=0)).float()
+
+    def _augment_input_seismic(self, clean: np.ndarray, source_obs: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        augmented = np.asarray(clean, dtype=np.float32).reshape(-1).copy()
+        if not self.input_augmentation_enabled:
+            return augmented
+
+        if self.input_phase_deg_max > 0.0:
+            angle = np.deg2rad(np.random.uniform(-self.input_phase_deg_max, self.input_phase_deg_max))
+            augmented = _constant_phase_rotation(augmented, float(angle)).astype(np.float32, copy=False)
+
+        if self.input_spectral_tilt_max > 0.0:
+            tilt = float(np.random.uniform(-self.input_spectral_tilt_max, self.input_spectral_tilt_max))
+            augmented = _apply_spectral_tilt(augmented, tilt).astype(np.float32, copy=False)
+
+        amp_min, amp_max = self.input_amp_jitter
+        if amp_max > 0.0 and (amp_min != 1.0 or amp_max != 1.0):
+            augmented = (augmented * float(np.random.uniform(amp_min, amp_max))).astype(np.float32, copy=False)
+
+        noise_min, noise_max = self.input_noise_rms_fraction
+        if noise_max > 0.0:
+            obs_rms = _masked_rms(np.asarray(source_obs, dtype=np.float32).reshape(-1), mask)
+            signal_rms = _masked_rms(augmented, mask)
+            reference_rms = obs_rms if obs_rms > 0.0 and np.isfinite(obs_rms) else signal_rms
+            if reference_rms > 0.0 and np.isfinite(reference_rms):
+                noise_fraction = float(np.random.uniform(noise_min, noise_max))
+                noise = np.random.normal(0.0, reference_rms * noise_fraction, size=augmented.shape)
+                augmented = (augmented + noise.astype(np.float32)).astype(np.float32, copy=False)
+
+        return augmented
 
     def _passes_quality_gate(self, item: dict[str, torch.Tensor]) -> bool:
         waveform_mask = item["mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
@@ -487,6 +554,11 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             if source_p99 > 0.0 and np.isfinite(source_p99):
                 if target_p99 / source_p99 > float(self.max_seismic_abs_p99_ratio):
                     return False
+
+        if self.min_target_obs_waveform_corr is not None:
+            corr = _normalized_cross_correlation(target_seismic[valid_waveform], source_seismic[valid_waveform])
+            if np.isfinite(corr) and corr < float(self.min_target_obs_waveform_corr):
+                return False
 
         if self.min_base_target_waveform_corr is not None:
             corr = _normalized_cross_correlation(base_seismic[valid_waveform], target_seismic[valid_waveform])
@@ -767,6 +839,61 @@ def _rms(values: np.ndarray) -> float:
     if values.size == 0:
         return 0.0
     return float(np.sqrt(np.mean(values * values)))
+
+
+def _masked_rms(values: np.ndarray, mask: np.ndarray) -> float:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    mask = np.asarray(mask, dtype=bool).reshape(-1)
+    if values.shape != mask.shape:
+        return _rms(values)
+    valid = mask & np.isfinite(values)
+    if not np.any(valid):
+        return 0.0
+    return float(np.sqrt(np.mean(values[valid] * values[valid])))
+
+
+def _constant_phase_rotation(values: np.ndarray, angle_rad: float) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    if values.size < 2 or abs(angle_rad) <= 0.0:
+        return values.copy()
+    quadrature = _hilbert_imag(values)
+    rotated = values.astype(np.float64) * np.cos(angle_rad) - quadrature.astype(np.float64) * np.sin(angle_rad)
+    original_rms = _rms(values)
+    rotated_rms = _rms(rotated)
+    if original_rms > 0.0 and rotated_rms > 0.0:
+        rotated *= original_rms / rotated_rms
+    return rotated.astype(np.float32, copy=False)
+
+
+def _hilbert_imag(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    n = values.size
+    spectrum = np.fft.fft(values)
+    multiplier = np.zeros(n, dtype=np.float64)
+    if n % 2 == 0:
+        multiplier[0] = 1.0
+        multiplier[n // 2] = 1.0
+        multiplier[1 : n // 2] = 2.0
+    else:
+        multiplier[0] = 1.0
+        multiplier[1 : (n + 1) // 2] = 2.0
+    analytic = np.fft.ifft(spectrum * multiplier)
+    return np.imag(analytic).astype(np.float32, copy=False)
+
+
+def _apply_spectral_tilt(values: np.ndarray, tilt: float) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    if values.size < 3 or abs(tilt) <= 0.0:
+        return values.copy()
+    original_rms = _rms(values)
+    spectrum = np.fft.rfft(values.astype(np.float64))
+    weights = np.linspace(1.0 - float(tilt), 1.0 + float(tilt), spectrum.size, dtype=np.float64)
+    weights = np.clip(weights, 0.05, None)
+    tilted = np.fft.irfft(spectrum * weights, n=values.size)
+    tilted_rms = _rms(tilted)
+    if original_rms > 0.0 and tilted_rms > 0.0:
+        tilted *= original_rms / tilted_rms
+    return tilted.astype(np.float32, copy=False)
 
 
 def _abs_percentile(values: np.ndarray, percentile: float) -> float:

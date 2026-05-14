@@ -62,6 +62,10 @@ MONITOR_METRICS_FIELDNAMES = [
     "monitor_unresolved_cluster_fraction",
     "monitor_base_target_waveform_corr_mean",
     "monitor_base_target_waveform_delta_rms_to_target_rms_mean",
+    "monitor_target_obs_waveform_corr_mean",
+    "monitor_input_obs_waveform_corr_mean",
+    "monitor_input_to_clean_rms_ratio_mean",
+    "monitor_input_augmentation_delta_rms_fraction_mean",
     "monitor_core_mask_fraction",
     "monitor_delta_mask_fraction",
 ]
@@ -462,6 +466,35 @@ def _accumulate_optional_batch_stats(totals: dict[str, float], batch: dict[str, 
         totals["base_target_waveform_delta_rms_to_target_rms_mean"] = totals.get(
             "base_target_waveform_delta_rms_to_target_rms_mean", 0.0
         ) + delta_ratio
+        if "obs" in batch:
+            target_obs_corr, _ = _batch_waveform_corr_and_delta_ratio(
+                batch["target_seismic"].float(),
+                batch["obs"].float(),
+                waveform_mask.bool(),
+            )
+            totals["target_obs_waveform_corr_mean"] = totals.get("target_obs_waveform_corr_mean", 0.0) + target_obs_corr
+        if "obs" in batch and "input_seismic_augmented" in batch:
+            input_obs_corr, _ = _batch_waveform_corr_and_delta_ratio(
+                batch["input_seismic_augmented"].float(),
+                batch["obs"].float(),
+                waveform_mask.bool(),
+            )
+            totals["input_obs_waveform_corr_mean"] = totals.get("input_obs_waveform_corr_mean", 0.0) + input_obs_corr
+        if "input_seismic_clean" in batch and "input_seismic_augmented" in batch:
+            input_ratio = _batch_masked_rms_ratio(
+                batch["input_seismic_augmented"].float(),
+                batch["input_seismic_clean"].float(),
+                waveform_mask.bool(),
+            )
+            augmentation_delta_fraction = _batch_masked_rms_ratio(
+                batch["input_seismic_augmented"].float() - batch["input_seismic_clean"].float(),
+                batch["input_seismic_clean"].float(),
+                waveform_mask.bool(),
+            )
+            totals["input_to_clean_rms_ratio_mean"] = totals.get("input_to_clean_rms_ratio_mean", 0.0) + input_ratio
+            totals["input_augmentation_delta_rms_fraction_mean"] = (
+                totals.get("input_augmentation_delta_rms_fraction_mean", 0.0) + augmentation_delta_fraction
+            )
     if "mask" in batch:
         totals["core_mask_fraction"] = totals.get("core_mask_fraction", 0.0) + float(batch["mask"].float().mean().item())
     if "delta_loss_mask" in batch:
@@ -515,6 +548,7 @@ def _training_flags_and_actions(
     forced_accept_fraction = _maybe_float(metrics.get("quality_gate_forced_accept_fraction"))
     max_attempt_fraction = _maybe_float(metrics.get("quality_gate_max_attempt_fraction"))
     waveform_corr = _maybe_float(metrics.get("base_target_waveform_corr_mean"))
+    target_obs_corr = _maybe_float(metrics.get("target_obs_waveform_corr_mean"))
 
     if delta_ratio is not None and delta_ratio < 0.55:
         add_flag(
@@ -564,6 +598,7 @@ def _training_flags_and_actions(
                 "synthetic_max_residual_near_clip_fraction",
                 "synthetic_max_seismic_rms_ratio",
                 "synthetic_max_seismic_abs_p99_ratio",
+                "synthetic_min_target_obs_waveform_corr",
                 "synthetic_max_resample_attempts",
             ],
         )
@@ -579,6 +614,7 @@ def _training_flags_and_actions(
                 "synthetic_max_residual_near_clip_fraction",
                 "synthetic_max_seismic_rms_ratio",
                 "synthetic_max_seismic_abs_p99_ratio",
+                "synthetic_min_target_obs_waveform_corr",
                 "synthetic_min_base_target_waveform_corr",
                 "synthetic_max_resample_attempts",
             ],
@@ -595,18 +631,33 @@ def _training_flags_and_actions(
                 "synthetic_max_residual_near_clip_fraction",
                 "synthetic_max_seismic_rms_ratio",
                 "synthetic_max_seismic_abs_p99_ratio",
+                "synthetic_min_target_obs_waveform_corr",
                 "synthetic_min_base_target_waveform_corr",
                 "synthetic_max_resample_attempts",
+            ],
+        )
+    if target_obs_corr is not None and target_obs_corr < 0.0:
+        add_flag(
+            "target_obs_waveform_corr_low",
+            f"{prefix} target/obs waveform correlation is negative.",
+            metric=f"{prefix}_target_obs_waveform_corr_mean",
+            actual=target_obs_corr,
+            threshold=">= 0.0",
+            action="Synthetic target seismic may be off the real input distribution; inspect target/obs QC and phase/noise augmentation settings.",
+            related_config_keys=[
+                "synthetic_min_target_obs_waveform_corr",
+                "synthetic_input_augmentation_enabled",
+                "synthetic_input_phase_deg_max",
             ],
         )
     if waveform_corr is not None and waveform_corr < 0.5:
         add_flag(
             "base_target_waveform_corr_low",
-            f"{prefix} base/target waveform correlation is low.",
+            f"{prefix} base/target waveform correlation is low as a perturbation diagnostic.",
             metric=f"{prefix}_base_target_waveform_corr_mean",
             actual=waveform_corr,
             threshold=">= 0.50",
-            action="Synthetic target seismic may drift far from base forward seismic; inspect QC samples before enabling a hard gate.",
+            action="Synthetic perturbations may be strong relative to base forward seismic; treat this as a diagnostic, not the primary synthetic-real gate.",
             related_config_keys=["synthetic_min_base_target_waveform_corr"],
         )
     return flags, actions
@@ -627,6 +678,17 @@ def _batch_waveform_corr_and_delta_ratio(base: torch.Tensor, target: torch.Tenso
     target_rms = torch.sqrt((target_flat.pow(2) * mask_flat).sum(dim=1) / denom + 1e-8)
     ratio = delta_rms / target_rms.clamp(min=1e-8)
     return float(corr.mean().item()), float(ratio.mean().item())
+
+
+def _batch_masked_rms_ratio(numerator: torch.Tensor, denominator: torch.Tensor, mask: torch.Tensor) -> float:
+    numerator_flat = numerator.reshape(numerator.shape[0], -1)
+    denominator_flat = denominator.reshape(denominator.shape[0], -1)
+    mask_flat = mask.reshape(mask.shape[0], -1).to(dtype=numerator_flat.dtype)
+    denom = mask_flat.sum(dim=1).clamp(min=1.0)
+    numerator_rms = torch.sqrt((numerator_flat.pow(2) * mask_flat).sum(dim=1) / denom + 1e-8)
+    denominator_rms = torch.sqrt((denominator_flat.pow(2) * mask_flat).sum(dim=1) / denom + 1e-8)
+    ratio = numerator_rms / denominator_rms.clamp(min=1e-8)
+    return float(ratio.mean().item())
 
 
 def _maybe_float(value: Any) -> float | None:

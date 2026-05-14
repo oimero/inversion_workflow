@@ -64,8 +64,18 @@ class EnhancementConfig:
     synthetic_max_residual_near_clip_fraction: float | None = 0.02  # near-clipping 最大比例。
     synthetic_max_seismic_rms_ratio: float | None = 2.0  # synthetic/real RMS 最大比值。
     synthetic_max_seismic_abs_p99_ratio: float | None = 2.5  # synthetic/real abs-p99 最大比值。
-    synthetic_min_base_target_waveform_corr: float | None = 0.0  # base/target 地震互相关硬门控。
+    synthetic_min_target_obs_waveform_corr: float | None = 0.0  # target/obs 地震互相关弱门控。
+    synthetic_min_base_target_waveform_corr: float | None = None  # base/target 诊断门控；默认不启用。
     synthetic_max_resample_attempts: int = 8  # 单样本最多重采样次数。
+
+    # ── Synthetic 输入轻量脏化 ───────────────────────────────
+    # 只作用于网络输入的 seismic 通道；clean target_seismic 和 delta 监督
+    # 保持不变，用来缩小 synthetic 输入与真实 obs 输入的分布差异。
+    synthetic_input_augmentation_enabled: bool = True  # 是否启用 synthetic seismic 输入脏化。
+    synthetic_input_phase_deg_max: float = 12.0  # 常相位旋转最大绝对角度。
+    synthetic_input_amp_jitter: Tuple[float, float] = (0.9, 1.1)  # 输入振幅随机缩放范围。
+    synthetic_input_noise_rms_fraction: Tuple[float, float] = (0.02, 0.06)  # 噪声 RMS/obs RMS 范围。
+    synthetic_input_spectral_tilt_max: float = 0.12  # 频谱线性倾斜最大幅度。
 
     # ── AI 合成边界 ──────────────────────────────────────────
     # enhance 会预测 delta_log_ai，并组合 enhanced_ai = base_ai * exp(delta)。
@@ -143,6 +153,32 @@ class EnhancementConfig:
             -1.0 <= self.synthetic_min_base_target_waveform_corr <= 1.0
         ):
             raise ValueError("synthetic_min_base_target_waveform_corr must be within [-1, 1] when provided.")
+        if self.synthetic_min_target_obs_waveform_corr is not None and not (
+            -1.0 <= self.synthetic_min_target_obs_waveform_corr <= 1.0
+        ):
+            raise ValueError("synthetic_min_target_obs_waveform_corr must be within [-1, 1] when provided.")
+        if not isinstance(self.synthetic_input_amp_jitter, tuple):
+            self.synthetic_input_amp_jitter = tuple(self.synthetic_input_amp_jitter)
+        if not isinstance(self.synthetic_input_noise_rms_fraction, tuple):
+            self.synthetic_input_noise_rms_fraction = tuple(self.synthetic_input_noise_rms_fraction)
+        self.synthetic_input_amp_jitter = tuple(float(v) for v in self.synthetic_input_amp_jitter)
+        self.synthetic_input_noise_rms_fraction = tuple(float(v) for v in self.synthetic_input_noise_rms_fraction)
+        if (
+            len(self.synthetic_input_amp_jitter) != 2
+            or self.synthetic_input_amp_jitter[0] <= 0.0
+            or self.synthetic_input_amp_jitter[1] < self.synthetic_input_amp_jitter[0]
+        ):
+            raise ValueError("synthetic_input_amp_jitter must be a positive [min, max] range.")
+        if (
+            len(self.synthetic_input_noise_rms_fraction) != 2
+            or self.synthetic_input_noise_rms_fraction[0] < 0.0
+            or self.synthetic_input_noise_rms_fraction[1] < self.synthetic_input_noise_rms_fraction[0]
+        ):
+            raise ValueError("synthetic_input_noise_rms_fraction must be a non-negative [min, max] range.")
+        if self.synthetic_input_phase_deg_max < 0.0:
+            raise ValueError("synthetic_input_phase_deg_max must be non-negative.")
+        if self.synthetic_input_spectral_tilt_max < 0.0:
+            raise ValueError("synthetic_input_spectral_tilt_max must be non-negative.")
         if self.monitor_samples < 0:
             raise ValueError("monitor_samples must be non-negative.")
         if self.ai_min <= 0.0 or self.ai_max <= self.ai_min:
@@ -172,6 +208,13 @@ class EnhancementConfig:
             normalized[field_name] = path
         if "dilations" in normalized and normalized["dilations"] is not None:
             normalized["dilations"] = tuple(normalized["dilations"])
+        if "synthetic_input_amp_jitter" in normalized and normalized["synthetic_input_amp_jitter"] is not None:
+            normalized["synthetic_input_amp_jitter"] = tuple(normalized["synthetic_input_amp_jitter"])
+        if (
+            "synthetic_input_noise_rms_fraction" in normalized
+            and normalized["synthetic_input_noise_rms_fraction"] is not None
+        ):
+            normalized["synthetic_input_noise_rms_fraction"] = tuple(normalized["synthetic_input_noise_rms_fraction"])
         return cls(**normalized)
 
     @classmethod

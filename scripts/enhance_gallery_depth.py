@@ -199,6 +199,11 @@ def sample_record(sample: dict[str, Any], index: int, image_path: Path | None) -
     real = finite_core(as_1d(sample["obs"]), waveform_mask)
     synthetic = finite_core(as_1d(sample["target_seismic"]), waveform_mask)
     synthetic_raw = finite_core(as_1d(sample["target_seismic_raw"]), waveform_mask)
+    input_clean_full = as_1d(sample.get("input_seismic_clean", sample["target_seismic"]))
+    input_augmented_full = as_1d(sample.get("input_seismic_augmented", sample["target_seismic"]))
+    input_clean = finite_core(input_clean_full, waveform_mask)
+    input_augmented = finite_core(input_augmented_full, waveform_mask)
+    input_delta = finite_core(input_augmented_full - input_clean_full, waveform_mask)
     base_seismic_full = (
         as_1d(sample["base_seismic"]) if "base_seismic" in sample else np.zeros_like(as_1d(sample["target_seismic"]))
     )
@@ -222,6 +227,10 @@ def sample_record(sample: dict[str, Any], index: int, image_path: Path | None) -
         "real_abs_p99": real_abs_p99,
         "synthetic_abs_p99": synthetic_abs_p99,
         "synthetic_to_real_abs_p99": safe_ratio(synthetic_abs_p99, real_abs_p99),
+        "target_obs_waveform_corr": normalized_cross_correlation(synthetic, real),
+        "input_obs_waveform_corr": normalized_cross_correlation(input_augmented, real),
+        "input_to_clean_rms_ratio": safe_ratio(rms(input_augmented), rms(input_clean)),
+        "input_augmentation_delta_rms_fraction": safe_ratio(rms(input_delta), rms(input_clean)),
         "base_target_waveform_corr": normalized_cross_correlation(base_seismic, synthetic),
         "base_target_waveform_delta_rms_to_target_rms": safe_ratio(base_target_delta_rms, synthetic_rms),
         "residual_rms": residual_rms,
@@ -253,6 +262,7 @@ def shade_mask(ax: plt.Axes, x: np.ndarray, mask: np.ndarray, *, label: str | No
 
 def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Path, dpi: int) -> None:
     target_seismic = as_1d(sample["target_seismic"])
+    input_augmented = as_1d(sample.get("input_seismic_augmented", sample["target_seismic"]))
     target_seismic_raw = as_1d(sample["target_seismic_raw"])
     base_seismic = as_1d(sample["base_seismic"]) if "base_seismic" in sample else None
     real_obs = as_1d(sample["obs"])
@@ -275,6 +285,8 @@ def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Pat
     if base_seismic is not None:
         axes[0].plot(depth, base_seismic, color="tab:blue", lw=0.95, alpha=0.90, label="base forward")
     axes[0].plot(depth, target_seismic_raw, color="tab:orange", lw=0.9, alpha=0.75, label="synthetic raw")
+    axes[0].plot(depth, target_seismic, color="tab:green", lw=0.9, alpha=0.80, label="clean target")
+    axes[0].plot(depth, input_augmented, color="tab:red", lw=0.75, alpha=0.70, label="dirty input")
     axes[0].set_ylabel("seismic")
 
     axes[1].plot(depth, base_ai, color="0.40", lw=1.0, label="base AI")
@@ -345,6 +357,7 @@ def plot_overview_page(
 
     for row, (sample, record) in enumerate(zip(samples, records)):
         seismic = as_1d(sample["target_seismic"])
+        input_augmented = as_1d(sample.get("input_seismic_augmented", sample["target_seismic"]))
         real_obs = as_1d(sample["obs"])
         ai = as_1d(sample["target_ai"])
         base_ai = as_1d(sample["base_ai_raw"])
@@ -354,6 +367,7 @@ def plot_overview_page(
 
         axes[row, 0].plot(depth, real_obs, color="0.65", lw=0.8)
         axes[row, 0].plot(depth, seismic, color="tab:blue", lw=1.0)
+        axes[row, 0].plot(depth, input_augmented, color="tab:red", lw=0.7, alpha=0.75)
         axes[row, 1].plot(depth, base_ai, color="0.45", lw=0.8)
         axes[row, 1].plot(depth, ai, color="tab:red", lw=0.9)
         axes[row, 2].plot(depth, residual, color="tab:purple", lw=0.9)
@@ -374,7 +388,7 @@ def plot_overview_page(
             axes[row, col].grid(True, alpha=0.20)
             axes[row, col].tick_params(labelsize=7)
 
-    titles = ("seismic: real gray, synthetic blue", "AI: base gray, target red", "logAI delta", "RMS")
+    titles = ("seismic: real gray, clean blue, input red", "AI: base gray, target red", "logAI delta", "RMS")
     for ax, title in zip(axes[0], titles):
         ax.set_title(title, fontsize=10)
     for ax in axes[-1, :3]:
@@ -428,6 +442,10 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "mode_counts": {mode: sum(1 for record in records if record["mode"] == mode) for mode in modes},
         "synthetic_to_real_rms": stats("synthetic_to_real_rms"),
         "synthetic_to_real_abs_p99": stats("synthetic_to_real_abs_p99"),
+        "target_obs_waveform_corr": stats("target_obs_waveform_corr"),
+        "input_obs_waveform_corr": stats("input_obs_waveform_corr"),
+        "input_to_clean_rms_ratio": stats("input_to_clean_rms_ratio"),
+        "input_augmentation_delta_rms_fraction": stats("input_augmentation_delta_rms_fraction"),
         "base_target_waveform_corr": stats("base_target_waveform_corr"),
         "base_target_waveform_delta_rms_to_target_rms": stats("base_target_waveform_delta_rms_to_target_rms"),
         "residual_rms": stats("residual_rms"),
@@ -455,6 +473,8 @@ def write_index_html(path: Path, records: list[dict[str, Any]], overview_paths: 
             f"<td>{html.escape(str(record['mode']))}</td>"
             f"<td>{float(record['synthetic_to_real_rms']):.3f}</td>"
             f"<td>{float(record['synthetic_to_real_abs_p99']):.3f}</td>"
+            f"<td>{float(record['target_obs_waveform_corr']):.3f}</td>"
+            f"<td>{float(record['input_obs_waveform_corr']):.3f}</td>"
             f"<td>{float(record['base_target_waveform_corr']):.3f}</td>"
             f"<td>{float(record['residual_abs_p99']):.4f}</td>"
             f"<td>{float(record['rms_scale']):.3f}</td>"
@@ -491,7 +511,8 @@ def write_index_html(path: Path, records: list[dict[str, Any]], overview_paths: 
     <thead>
       <tr>
         <th>sample</th><th>mode</th><th>synth/real RMS</th><th>synth/real abs-p99</th>
-        <th>base/target corr</th><th>residual abs-p99</th><th>rms scale</th><th>attempts</th>
+        <th>target/obs corr</th><th>input/obs corr</th><th>base/target corr</th>
+        <th>residual abs-p99</th><th>rms scale</th><th>attempts</th>
       </tr>
     </thead>
     <tbody>
@@ -634,7 +655,13 @@ def main() -> None:
             "delta_supervision_mask": cfg.delta_supervision_mask,
             "synthetic_quality_gate_enabled": cfg.synthetic_quality_gate_enabled,
             "synthetic_seismic_rms_match": cfg.synthetic_seismic_rms_match,
+            "synthetic_min_target_obs_waveform_corr": cfg.synthetic_min_target_obs_waveform_corr,
             "synthetic_min_base_target_waveform_corr": cfg.synthetic_min_base_target_waveform_corr,
+            "synthetic_input_augmentation_enabled": cfg.synthetic_input_augmentation_enabled,
+            "synthetic_input_phase_deg_max": cfg.synthetic_input_phase_deg_max,
+            "synthetic_input_amp_jitter": cfg.synthetic_input_amp_jitter,
+            "synthetic_input_noise_rms_fraction": cfg.synthetic_input_noise_rms_fraction,
+            "synthetic_input_spectral_tilt_max": cfg.synthetic_input_spectral_tilt_max,
         },
         "summary": summarize_records(records),
     }

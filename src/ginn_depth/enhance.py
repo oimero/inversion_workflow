@@ -121,7 +121,13 @@ def build_depth_enhancement_bundle(cfg: EnhancementConfig) -> DepthEnhancementBu
         max_residual_near_clip_fraction=cfg.synthetic_max_residual_near_clip_fraction,
         max_seismic_rms_ratio=cfg.synthetic_max_seismic_rms_ratio,
         max_seismic_abs_p99_ratio=cfg.synthetic_max_seismic_abs_p99_ratio,
+        min_target_obs_waveform_corr=cfg.synthetic_min_target_obs_waveform_corr,
         min_base_target_waveform_corr=cfg.synthetic_min_base_target_waveform_corr,
+        input_augmentation_enabled=cfg.synthetic_input_augmentation_enabled,
+        input_phase_deg_max=cfg.synthetic_input_phase_deg_max,
+        input_amp_jitter=cfg.synthetic_input_amp_jitter,
+        input_noise_rms_fraction=cfg.synthetic_input_noise_rms_fraction,
+        input_spectral_tilt_max=cfg.synthetic_input_spectral_tilt_max,
         max_resample_attempts=cfg.synthetic_max_resample_attempts,
         delta_supervision_mask=cfg.delta_supervision_mask,
     )

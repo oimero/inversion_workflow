@@ -96,6 +96,16 @@ def parse_args() -> argparse.Namespace:
         help="Only write CSV/index/overview pages; skip one detailed PNG per sample.",
     )
     parser.add_argument(
+        "--show-clean-target",
+        action="store_true",
+        help="Show clean target_seismic in the seismic panel in addition to synthetic raw.",
+    )
+    parser.add_argument(
+        "--show-dirty-input",
+        action="store_true",
+        help="Show augmented input_seismic in the seismic panel and overview pages.",
+    )
+    parser.add_argument(
         "--main-lobe-samples",
         type=int,
         default=None,
@@ -260,7 +270,16 @@ def shade_mask(ax: plt.Axes, x: np.ndarray, mask: np.ndarray, *, label: str | No
     ax.set_ylim(y0, y1)
 
 
-def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Path, dpi: int) -> None:
+def plot_detail(
+    sample: dict[str, Any],
+    depth: np.ndarray,
+    index: int,
+    path: Path,
+    dpi: int,
+    *,
+    show_clean_target: bool = False,
+    show_dirty_input: bool = False,
+) -> None:
     target_seismic = as_1d(sample["target_seismic"])
     input_augmented = as_1d(sample.get("input_seismic_augmented", sample["target_seismic"]))
     target_seismic_raw = as_1d(sample["target_seismic_raw"])
@@ -285,8 +304,10 @@ def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Pat
     if base_seismic is not None:
         axes[0].plot(depth, base_seismic, color="tab:blue", lw=0.95, alpha=0.90, label="base forward")
     axes[0].plot(depth, target_seismic_raw, color="tab:orange", lw=0.9, alpha=0.75, label="synthetic raw")
-    axes[0].plot(depth, target_seismic, color="tab:green", lw=0.9, alpha=0.80, label="clean target")
-    axes[0].plot(depth, input_augmented, color="tab:red", lw=0.75, alpha=0.70, label="dirty input")
+    if show_clean_target:
+        axes[0].plot(depth, target_seismic, color="tab:green", lw=0.9, alpha=0.80, label="clean target")
+    if show_dirty_input:
+        axes[0].plot(depth, input_augmented, color="tab:red", lw=0.75, alpha=0.70, label="dirty input")
     axes[0].set_ylabel("seismic")
 
     axes[1].plot(depth, base_ai, color="0.40", lw=1.0, label="base AI")
@@ -313,19 +334,14 @@ def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Pat
     axes[3].set_ylabel("reflectivity")
 
     axes[4].plot(depth, taper, color="tab:brown", lw=1.2, label="taper")
-    axes[4].fill_between(
-        depth, 0.0, waveform_mask.astype(float), color="tab:cyan", alpha=0.25, label="waveform QC mask"
-    )
-    axes[4].fill_between(
-        depth, 0.0, delta_mask.astype(float), color="tab:purple", alpha=0.22, label="delta supervision mask"
-    )
+    axes[4].fill_between(depth, 0.0, core_mask.astype(float), color="0.75", alpha=0.35, label="core mask")
     axes[4].set_ylim(-0.05, 1.05)
     axes[4].set_ylabel("support")
     axes[4].set_xlabel("depth / m")
     axes[4].legend(loc="upper right", fontsize=8)
 
     for ax in axes[:4]:
-        shade_mask(ax, depth, core_mask, label="core mask")
+        shade_mask(ax, depth, core_mask)
         ax.grid(True, alpha=0.25)
         ax.legend(loc="upper right", fontsize=8)
     axes[4].grid(True, alpha=0.25)
@@ -349,6 +365,8 @@ def plot_overview_page(
     page_index: int,
     path: Path,
     dpi: int,
+    *,
+    show_dirty_input: bool = False,
 ) -> None:
     n_rows = len(samples)
     fig, axes = plt.subplots(n_rows, 4, figsize=(15, max(2.0 * n_rows, 3.0)), sharex="col")
@@ -367,7 +385,8 @@ def plot_overview_page(
 
         axes[row, 0].plot(depth, real_obs, color="0.65", lw=0.8)
         axes[row, 0].plot(depth, seismic, color="tab:blue", lw=1.0)
-        axes[row, 0].plot(depth, input_augmented, color="tab:red", lw=0.7, alpha=0.75)
+        if show_dirty_input:
+            axes[row, 0].plot(depth, input_augmented, color="tab:red", lw=0.7, alpha=0.75)
         axes[row, 1].plot(depth, base_ai, color="0.45", lw=0.8)
         axes[row, 1].plot(depth, ai, color="tab:red", lw=0.9)
         axes[row, 2].plot(depth, residual, color="tab:purple", lw=0.9)
@@ -388,7 +407,10 @@ def plot_overview_page(
             axes[row, col].grid(True, alpha=0.20)
             axes[row, col].tick_params(labelsize=7)
 
-    titles = ("seismic: real gray, clean blue, input red", "AI: base gray, target red", "logAI delta", "RMS")
+    seismic_title = "seismic: real gray, clean blue"
+    if show_dirty_input:
+        seismic_title += ", input red"
+    titles = (seismic_title, "AI: base gray, target red", "logAI delta", "RMS")
     for ax, title in zip(axes[0], titles):
         ax.set_title(title, fontsize=10)
     for ax in axes[-1, :3]:
@@ -618,7 +640,15 @@ def main() -> None:
         detail_rel = Path("samples") / f"sample_{idx:03d}_{mode_name(sample)}.png"
         detail_path = output_dir / detail_rel
         if not args.skip_detail_plots:
-            plot_detail(sample, depth, idx, detail_path, args.dpi)
+            plot_detail(
+                sample,
+                depth,
+                idx,
+                detail_path,
+                args.dpi,
+                show_clean_target=args.show_clean_target,
+                show_dirty_input=args.show_dirty_input,
+            )
         record = sample_record(sample, idx, None if args.skip_detail_plots else detail_rel)
         samples.append(sample)
         records.append(record)
@@ -632,7 +662,15 @@ def main() -> None:
             page_records = records[page_start : page_start + args.overview_page_size]
             page_idx = page_start // args.overview_page_size + 1
             rel_path = Path(f"overview_page_{page_idx:02d}.png")
-            plot_overview_page(page_samples, page_records, depth, page_idx, output_dir / rel_path, args.dpi)
+            plot_overview_page(
+                page_samples,
+                page_records,
+                depth,
+                page_idx,
+                output_dir / rel_path,
+                args.dpi,
+                show_dirty_input=args.show_dirty_input,
+            )
             overview_paths.append(rel_path)
 
     summary = {
@@ -662,6 +700,8 @@ def main() -> None:
             "synthetic_input_amp_jitter": cfg.synthetic_input_amp_jitter,
             "synthetic_input_noise_rms_fraction": cfg.synthetic_input_noise_rms_fraction,
             "synthetic_input_spectral_tilt_max": cfg.synthetic_input_spectral_tilt_max,
+            "gallery_show_clean_target": args.show_clean_target,
+            "gallery_show_dirty_input": args.show_dirty_input,
         },
         "summary": summarize_records(records),
     }

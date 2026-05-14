@@ -294,7 +294,7 @@ def sample_metrics(
 ) -> dict[str, Any]:
     mode = "well_patch" if int(sample["synthetic_mode"].item()) == 0 else "unresolved_cluster"
     core_mask = to_numpy_1d(sample["mask"]).astype(bool)
-    waveform_mask = to_numpy_1d(sample["loss_mask"]).astype(bool)
+    waveform_mask = core_mask
     delta_mask = to_numpy_1d(sample["delta_loss_mask"]).astype(bool)
     taper = to_numpy_1d(sample["taper_weight"]).astype(np.float64)
     real = finite_values(to_numpy_1d(sample["obs"]), waveform_mask)
@@ -340,7 +340,7 @@ def sample_metrics(
     residual_detail = residual_full[win]
     reflectivity_detail = refl_win
     detail_width_scale = 1.0
-    if mode == "unresolved_cluster" and "target_residual_highres" in sample and "raw_reflectivity_highres" in sample:
+    if "target_residual_highres" in sample and "raw_reflectivity_highres" in sample:
         highres_residual = to_numpy_1d(sample["target_residual_highres"]).astype(np.float64)
         highres_reflectivity = to_numpy_1d(sample["raw_reflectivity_highres"]).astype(np.float64)
         factor = max(1, int(round((highres_residual.size - 1) / max(residual_full.size - 1, 1))))
@@ -1054,11 +1054,13 @@ def main() -> None:
 
     prior = load_well_resolution_prior_npz(cfg.resolution_prior_file)
     LOGGER.info(
-        "Prior: wells=%d samples=%d valid_samples=%d residual_abs_p99=%s",
+        "Prior: wells=%d samples=%d highres_samples=%d valid_samples=%d highres_valid_samples=%d residual_abs_p99=%s",
         prior.n_wells,
         prior.n_sample,
+        prior.n_highres_sample,
         int(prior.well_mask.sum()),
-        _fmt(prior.summary.get("residual", {}).get("abs_p99")),
+        int(prior.highres_well_mask.sum()),
+        _fmt(prior.summary.get("highres_residual", {}).get("abs_p99")),
     )
 
     LOGGER.info("Building depth enhancement synthetic dataset...")

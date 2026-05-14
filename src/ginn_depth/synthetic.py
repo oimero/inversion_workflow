@@ -31,7 +31,7 @@ from enhance.synthetic import (
     markov_thin_bed_packet,
     random_reflectivity_in_taper,
     reflectivity_to_log_ai,
-    sample_well_patch_window,
+    sample_highres_well_patch,
     summary_or_percentile,
     true_runs,
     valid_prior_rows,
@@ -280,7 +280,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
 
         self._vp_clip_min, self._vp_clip_max = _estimate_velocity_clip(base_dataset)
         self._depth_axis_m = _extract_forward_depth_axis(forward_model)
-        self._prior_values = self.prior.residual_log_ai[self.prior.well_mask]
+        self._prior_values = self.prior.highres_residual_log_ai[self.prior.highres_well_mask]
         self._prior_values = self._prior_values[np.isfinite(self._prior_values)]
         if self._prior_values.size == 0:
             raise ValueError("Well resolution prior contains no finite residual values.")
@@ -327,46 +327,55 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         core_mask = item["mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
         loss_mask = item.get("loss_mask", item["mask"]).squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
         delta_loss_mask = core_mask if self.delta_supervision_mask == "core" else loss_mask
+        waveform_qc_mask = core_mask
 
         safe_base_ai = np.maximum(base_ai, 1e-6)
+        depth = self._sample_depth_axis(base_ai.size)
+        factor = max(1, self.unresolved_oversample_factor)
+        highres_depth = make_highres_axis(depth, factor)
+        highres_base_ai = np.interp(highres_depth, depth, safe_base_ai).astype(np.float32)
+        taper_hi = np.interp(highres_depth, depth, taper).astype(np.float32)
+        support_hi = np.interp(highres_depth, depth, delta_loss_mask.astype(np.float32)) >= 0.5
         mode = self._sample_mode()
         if mode == "well_patch":
-            delta_log_ai = self._sample_well_patch_residual(base_ai.size, taper, delta_loss_mask)
+            highres_residual = self._sample_highres_well_patch_residual(highres_depth, taper_hi, support_hi, factor)
             mode_code = 0
-            highres_residual = None
-            highres_ai = None
-            highres_reflectivity = None
-            highres_depth = None
+            if highres_residual is None:
+                highres_residual = self._sample_unresolved_cluster_residual(
+                    highres_depth,
+                    taper_hi,
+                    support_hi,
+                    factor,
+                )
+                mode_code = 1
         else:
-            delta_log_ai, highres_residual, highres_depth = self._sample_unresolved_cluster_residual(
-                base_ai.size,
-                taper,
-                delta_loss_mask,
-                safe_base_ai,
+            highres_residual = self._sample_unresolved_cluster_residual(
+                highres_depth,
+                taper_hi,
+                support_hi,
+                factor,
             )
             mode_code = 1
+            if highres_residual is None:
+                highres_residual = self._sample_highres_well_patch_residual(highres_depth, taper_hi, support_hi, factor)
+                mode_code = 0
+        synthetic_empty_residual = highres_residual is None
+        if highres_residual is None:
+            highres_residual = np.zeros_like(highres_depth, dtype=np.float32)
 
-        if mode == "well_patch":
-            delta_log_ai = highpass_log_ai_residual(
-                delta_log_ai,
-                window=self.residual_highpass_samples,
-                max_abs=self.residual_max_abs,
-            )
-            delta_log_ai = fit_delta_to_base_ai_bounds(
-                delta_log_ai * taper,
-                safe_base_ai=safe_base_ai,
-                ai_min=self.ai_min,
-                ai_max=self.ai_max,
-                max_abs=self.residual_max_abs,
-            )
-        else:
-            delta_log_ai = fit_delta_to_base_ai_bounds(
-                delta_log_ai * taper,
-                safe_base_ai=safe_base_ai,
-                ai_min=self.ai_min,
-                ai_max=self.ai_max,
-                max_abs=self.residual_max_abs,
-            )
+        highres_residual = fit_delta_to_base_ai_bounds(
+            highres_residual * taper_hi,
+            safe_base_ai=np.maximum(highres_base_ai, 1e-6),
+            ai_min=self.ai_min,
+            ai_max=self.ai_max,
+            max_abs=self.residual_max_abs,
+        )
+        highres_ai = np.clip(highres_base_ai * np.exp(highres_residual), self.ai_min, self.ai_max).astype(np.float32)
+        highres_residual = np.log(np.maximum(highres_ai, 1e-6) / np.maximum(highres_base_ai, 1e-6)).astype(
+            np.float32,
+            copy=False,
+        )
+        delta_log_ai = downsample_highres_to_samples(highres_residual, factor, base_ai.size)
         target_ai = np.clip(safe_base_ai * np.exp(delta_log_ai), self.ai_min, self.ai_max).astype(np.float32)
         delta_log_ai = np.log(np.maximum(target_ai, 1e-6) / safe_base_ai).astype(np.float32, copy=False)
         target_vp = _derive_velocity(
@@ -381,33 +390,16 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             vp_clip_max=self._vp_clip_max,
         )
 
-        if mode == "unresolved_cluster" and highres_residual is not None and highres_depth is not None:
-            highres_base_ai = np.interp(highres_depth, self._sample_depth_axis(base_ai.size), safe_base_ai).astype(np.float32)
-            highres_residual = fit_delta_to_base_ai_bounds(
-                highres_residual,
-                safe_base_ai=np.maximum(highres_base_ai, 1e-6),
-                ai_min=self.ai_min,
-                ai_max=self.ai_max,
-                max_abs=self.residual_max_abs,
-            )
-            highres_ai = np.clip(highres_base_ai * np.exp(highres_residual), self.ai_min, self.ai_max).astype(np.float32)
-            highres_vp = np.interp(highres_depth, self._sample_depth_axis(base_ai.size), target_vp).astype(np.float32)
-            highres_reflectivity = ai_to_reflectivity(highres_ai).astype(np.float32)
-            target_seismic, target_seismic_raw, rms_scale = self._forward_highres_target_seismic(
-                highres_ai,
-                highres_vp,
-                highres_depth,
-                item.get("dynamic_gain"),
-                loss_mask,
-                base_ai.size,
-            )
-        else:
-            target_seismic, target_seismic_raw, rms_scale = self._forward_target_seismic(
-                target_ai,
-                target_vp,
-                item.get("dynamic_gain"),
-                loss_mask,
-            )
+        highres_vp = np.interp(highres_depth, depth, target_vp).astype(np.float32)
+        highres_reflectivity = ai_to_reflectivity(highres_ai).astype(np.float32)
+        target_seismic, target_seismic_raw, rms_scale = self._forward_highres_target_seismic(
+            highres_ai,
+            highres_vp,
+            highres_depth,
+            item.get("dynamic_gain"),
+            waveform_qc_mask,
+            base_ai.size,
+        )
         base_seismic_raw = self._forward_raw_seismic(
             safe_base_ai,
             base_vp,
@@ -417,12 +409,6 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         if "dynamic_gain" in item and float(rms_scale) != 1.0:
             item["dynamic_gain"] = item["dynamic_gain"] * float(rms_scale)
         reflectivity = ai_to_reflectivity(target_ai)
-        if highres_residual is None or highres_ai is None or highres_reflectivity is None or highres_depth is None:
-            depth = self._sample_depth_axis(base_ai.size)
-            highres_depth = make_highres_axis(depth, self.unresolved_oversample_factor)
-            highres_residual = np.interp(highres_depth, depth, delta_log_ai).astype(np.float32)
-            highres_ai = np.interp(highres_depth, depth, target_ai).astype(np.float32)
-            highres_reflectivity = ai_to_reflectivity(highres_ai).astype(np.float32)
 
         item["base_ai_raw"] = torch.from_numpy(base_ai[np.newaxis]).float()
         item["target_delta_log_ai"] = torch.from_numpy(delta_log_ai[np.newaxis]).float()
@@ -436,6 +422,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         item["raw_reflectivity"] = torch.from_numpy(reflectivity[np.newaxis]).float()
         item["velocity_raw"] = torch.from_numpy(target_vp[np.newaxis]).float()
         item["synthetic_mode"] = torch.tensor(mode_code, dtype=torch.int64)
+        item["synthetic_empty_residual"] = torch.tensor(synthetic_empty_residual, dtype=torch.bool)
         item["mask"] = torch.from_numpy(core_mask[np.newaxis]).bool()
         item["loss_mask"] = torch.from_numpy(loss_mask[np.newaxis]).bool()
         item["delta_loss_mask"] = torch.from_numpy(delta_loss_mask[np.newaxis]).bool()
@@ -466,7 +453,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         return torch.from_numpy(np.stack(channels, axis=0)).float()
 
     def _passes_quality_gate(self, item: dict[str, torch.Tensor]) -> bool:
-        waveform_mask = item["loss_mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
+        waveform_mask = item["mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
         delta_mask = item["delta_loss_mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
         residual = item["target_delta_log_ai"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         target_seismic = item["target_seismic"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
@@ -476,6 +463,10 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         valid_delta = delta_mask & np.isfinite(residual)
         valid_waveform = waveform_mask & np.isfinite(target_seismic) & np.isfinite(source_seismic) & np.isfinite(base_seismic)
         if not np.any(valid_delta) or not np.any(valid_waveform):
+            return False
+        if bool(item.get("synthetic_empty_residual", torch.tensor(False)).item()):
+            return False
+        if not np.any(np.abs(residual[valid_delta]) > 1e-8):
             return False
 
         if self.max_residual_near_clip_fraction is not None:
@@ -508,91 +499,82 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         p_patch = self.patch_fraction / (self.patch_fraction + self.unresolved_fraction)
         return "well_patch" if float(np.random.random()) < p_patch else "unresolved_cluster"
 
-    def _sample_well_patch_residual(
+    def _sample_highres_well_patch_residual(
         self,
-        n_sample: int,
-        taper: np.ndarray,
-        support_mask: np.ndarray,
-    ) -> np.ndarray:
-        residual = np.zeros((n_sample,), dtype=np.float32)
-        patch_window = sample_well_patch_window(
+        highres_depth: np.ndarray,
+        taper_hi: np.ndarray,
+        support_hi: np.ndarray,
+        factor: int,
+    ) -> np.ndarray | None:
+        patch_window = sample_highres_well_patch(
             self.prior,
             self._well_rows,
-            n_sample,
-            taper,
-            support_mask,
-            min_len_samples=max(8, self.cluster_main_lobe_samples),
+            highres_depth,
+            taper_hi,
+            support_hi,
+            min_len_samples=8 * max(1, int(factor)),
         )
         if patch_window is None:
-            return residual
+            return None
 
-        patch, dst0 = patch_window
-        length = patch.size
-        patch = patch.astype(np.float32, copy=True)
-        patch -= float(np.mean(patch))
-        patch *= float(np.random.uniform(self.well_patch_scale_min, self.well_patch_scale_max))
-        patch = np.clip(patch, -self.residual_max_abs, self.residual_max_abs)
-        residual[dst0 : dst0 + length] = patch * edge_taper(length)
+        placed, dst0, dst1, _ = patch_window
+        length = max(0, int(dst1) - int(dst0))
+        if length <= 0:
+            return None
+        local = placed[dst0:dst1].astype(np.float32, copy=True)
+        local -= float(np.mean(local))
+        local *= float(np.random.uniform(self.well_patch_scale_min, self.well_patch_scale_max))
+        window = max(3, int(self.residual_highpass_samples) * max(1, int(factor)))
+        local = highpass_log_ai_residual(local, window=window, max_abs=self.residual_max_abs)
+        local *= edge_taper(length)
+        residual = np.zeros_like(highres_depth, dtype=np.float32)
+        residual[dst0:dst1] = local
         return residual
 
     def _sample_unresolved_cluster_residual(
         self,
-        n_sample: int,
-        taper: np.ndarray,
-        support_mask: np.ndarray,
-        safe_base_ai: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
-        coarse = np.zeros((n_sample,), dtype=np.float32)
-        taper_1d = np.asarray(taper, dtype=np.float32).reshape(-1)
-        support = np.asarray(support_mask, dtype=bool).reshape(-1)
+        highres_depth: np.ndarray,
+        taper_hi: np.ndarray,
+        support_hi: np.ndarray,
+        factor: int,
+    ) -> np.ndarray | None:
+        highres = np.zeros_like(highres_depth, dtype=np.float32)
+        n_highres = highres.size
+        taper_1d = np.asarray(taper_hi, dtype=np.float32).reshape(-1)
+        support = np.asarray(support_hi, dtype=bool).reshape(-1)
         active = taper_1d > 0.0
         if support.shape == active.shape and np.any(active & support):
             active = active & support
         active_runs = true_runs(active)
         if not active_runs:
-            return coarse, None, None
+            return None
 
-        main_lobe = max(4, min(self.cluster_main_lobe_samples, n_sample))
-        patch_window = sample_well_patch_window(
+        main_lobe = max(4, min(self.cluster_main_lobe_samples, max(1, n_highres // max(1, int(factor)))))
+        patch_window = sample_highres_well_patch(
             self.prior,
             self._well_rows,
-            n_sample,
+            highres_depth,
             taper_1d,
             support,
-            min_len_samples=max(main_lobe * 2, 16),
+            min_len_samples=max(main_lobe * 2, 16) * max(1, int(factor)),
         )
         if patch_window is None:
-            return coarse, None, None
+            return None
 
-        source_patch, dst0 = patch_window
-        length = source_patch.size
+        placed, dst0, dst1, source_patch = patch_window
+        length = int(dst1) - int(dst0)
         if length <= 0:
-            return coarse, None, None
+            return None
 
         source_patch = source_patch.astype(np.float32, copy=True)
         source_patch -= float(np.mean(source_patch))
         patch_scale = float(np.random.uniform(self.well_patch_scale_min, self.well_patch_scale_max))
         source_patch *= patch_scale
 
-        depth = self._sample_depth_axis(n_sample)
-        factor = max(1, self.unresolved_oversample_factor)
-        highres_depth = make_highres_axis(depth, factor)
-        highres = np.zeros((highres_depth.size,), dtype=np.float32)
-
-        patch_depth = depth[dst0 : dst0 + length]
-        if patch_depth.size < 2:
-            return coarse, None, None
-        hi_start = int(dst0 * factor)
-        hi_stop = int((dst0 + length - 1) * factor + 1)
-        hi_stop = min(hi_stop, highres.size)
-        if hi_stop <= hi_start:
-            return coarse, None, None
-
-        local_depth = highres_depth[hi_start:hi_stop]
-        local = np.zeros((local_depth.size,), dtype=np.float32)
-        source_hi = np.interp(local_depth, patch_depth, source_patch).astype(np.float32)
-        taper_hi = np.interp(highres_depth, depth, taper_1d).astype(np.float32)
-        safe_base_ai_hi = np.interp(highres_depth, depth, safe_base_ai).astype(np.float32)
+        hi_start = int(dst0)
+        hi_stop = int(dst1)
+        local = np.zeros((length,), dtype=np.float32)
+        source_hi = source_patch
 
         background_scale = float(np.random.uniform(0.20, 0.45))
         local += background_scale * source_hi
@@ -611,7 +593,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         else:
             envelope = np.ones_like(abs_patch)
 
-        main_lobe_hi = max(4, main_lobe * factor)
+        main_lobe_hi = max(4, main_lobe * max(1, int(factor)))
         local_len = local.size
         packet_spacing = max(main_lobe_hi * 2, 1)
         n_packets = max(1, int(np.ceil(local_len / packet_spacing)))
@@ -650,18 +632,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         local -= float(np.mean(local))
         local *= edge_taper(local_len)
         highres[hi_start:hi_stop] = local
-        highres *= taper_hi
-        highres = fit_delta_to_base_ai_bounds(
-            highres,
-            safe_base_ai=np.maximum(safe_base_ai_hi, 1e-6),
-            ai_min=self.ai_min,
-            ai_max=self.ai_max,
-            max_abs=self.residual_max_abs,
-        )
-
-        coarse = downsample_highres_to_samples(highres, factor, n_sample)
-        coarse = np.clip(coarse, -self.residual_max_abs, self.residual_max_abs).astype(np.float32, copy=False)
-        return coarse, highres.astype(np.float32, copy=False), highres_depth.astype(np.float32, copy=False)
+        return highres.astype(np.float32, copy=False)
 
     def _forward_raw_seismic(
         self,
@@ -681,12 +652,12 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         target_ai: np.ndarray,
         target_vp: np.ndarray,
         dynamic_gain: torch.Tensor | None,
-        loss_mask: np.ndarray,
+        waveform_qc_mask: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, float]:
         raw = self._forward_raw_seismic(target_ai, target_vp, dynamic_gain)
         scale = 1.0
         if self.seismic_rms_match and dynamic_gain is not None:
-            valid = np.asarray(loss_mask, dtype=bool) & np.isfinite(raw)
+            valid = np.asarray(waveform_qc_mask, dtype=bool) & np.isfinite(raw)
             rms = float(np.sqrt(np.mean(raw[valid] ** 2))) if np.any(valid) else 0.0
             if rms > 0.0 and np.isfinite(rms):
                 scale = float(np.clip(self.seismic_rms_target / rms, self.seismic_rms_scale_min, self.seismic_rms_scale_max))
@@ -699,7 +670,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         highres_vp: np.ndarray,
         highres_depth: np.ndarray,
         dynamic_gain: torch.Tensor | None,
-        loss_mask: np.ndarray,
+        waveform_qc_mask: np.ndarray,
         n_sample: int,
     ) -> tuple[np.ndarray, np.ndarray, float]:
         ai_tensor = torch.from_numpy(highres_ai[np.newaxis, np.newaxis]).float()
@@ -716,7 +687,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
 
         scale = 1.0
         if self.seismic_rms_match and dynamic_gain is not None:
-            valid = np.asarray(loss_mask, dtype=bool) & np.isfinite(raw)
+            valid = np.asarray(waveform_qc_mask, dtype=bool) & np.isfinite(raw)
             rms = float(np.sqrt(np.mean(raw[valid] ** 2))) if np.any(valid) else 0.0
             if rms > 0.0 and np.isfinite(rms):
                 scale = float(np.clip(self.seismic_rms_target / rms, self.seismic_rms_scale_min, self.seismic_rms_scale_max))

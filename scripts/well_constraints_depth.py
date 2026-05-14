@@ -148,6 +148,79 @@ def _interpolate_ai_to_depth_axis(
     return ai_on_axis.astype(np.float32), mask
 
 
+def _prepare_highres_ai(md: np.ndarray, ai: np.ndarray, kb_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """Return finite positive shifted well AI on its native TVDSS axis."""
+    tvdss = np.asarray(md, dtype=float) - float(kb_m)
+    ai = np.asarray(ai, dtype=float)
+    valid = np.isfinite(tvdss) & np.isfinite(ai) & (ai > 0.0)
+    if int(valid.sum()) < 2:
+        raise ValueError("Too few finite positive AI samples after MD->TVDSS conversion.")
+
+    tvdss = tvdss[valid]
+    ai = ai[valid]
+    order = np.argsort(tvdss)
+    tvdss = tvdss[order]
+    ai = ai[order]
+    unique_tvdss, unique_idx = np.unique(tvdss, return_index=True)
+    unique_ai = ai[unique_idx]
+    if unique_tvdss.size < 2:
+        raise ValueError("Too few unique high-resolution TVDSS samples.")
+    return unique_tvdss.astype(np.float32), unique_ai.astype(np.float32)
+
+
+def _build_highres_prior_trace(
+    highres_depth: np.ndarray,
+    highres_ai: np.ndarray,
+    depth_axis_m: np.ndarray,
+    lfm_ai: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Build high-resolution well/LFM residual arrays for one well."""
+    lfm_interp = np.interp(highres_depth, depth_axis_m, lfm_ai, left=np.nan, right=np.nan)
+    mask = np.isfinite(highres_depth) & np.isfinite(highres_ai) & (highres_ai > 0.0)
+    mask = mask & np.isfinite(lfm_interp) & (lfm_interp > 0.0)
+    if int(mask.sum()) < 2:
+        raise ValueError("Too few high-resolution AI samples overlap finite positive LFM samples.")
+
+    well_log_ai = np.zeros_like(highres_ai, dtype=np.float32)
+    lfm_log_ai = np.zeros_like(highres_ai, dtype=np.float32)
+    residual_log_ai = np.zeros_like(highres_ai, dtype=np.float32)
+    well_log_ai[mask] = np.log(np.clip(highres_ai[mask], 1e-6, None)).astype(np.float32)
+    lfm_log_ai[mask] = np.log(np.clip(lfm_interp[mask], 1e-6, None)).astype(np.float32)
+    residual_log_ai[mask] = (well_log_ai[mask] - lfm_log_ai[mask]).astype(np.float32)
+    return {
+        "highres_depth": highres_depth.astype(np.float32, copy=False),
+        "highres_well_ai": np.where(mask, highres_ai, 0.0).astype(np.float32),
+        "highres_well_log_ai": well_log_ai,
+        "highres_lfm_log_ai": lfm_log_ai,
+        "highres_residual_log_ai": residual_log_ai,
+        "highres_well_mask": mask.astype(bool),
+    }
+
+
+def _pad_highres_records(records: list[dict[str, Any]], key: str, *, dtype: np.dtype, fill_value: float | bool) -> np.ndarray:
+    """Pad variable-length high-resolution well arrays to a rectangular bundle field."""
+    max_len = max(int(np.asarray(row[key]).size) for row in records)
+    padded = np.full((len(records), max_len), fill_value, dtype=dtype)
+    for row_idx, row in enumerate(records):
+        values = np.asarray(row[key], dtype=dtype).reshape(-1)
+        padded[row_idx, : values.size] = values
+    return padded
+
+
+def _median_highres_sample_step(highres_depth: np.ndarray, highres_mask: np.ndarray) -> float | None:
+    steps: list[np.ndarray] = []
+    for depth, mask in zip(highres_depth, highres_mask):
+        valid_depth = np.asarray(depth, dtype=np.float64)[np.asarray(mask, dtype=bool)]
+        if valid_depth.size > 1:
+            diff = np.diff(valid_depth)
+            diff = diff[np.isfinite(diff) & (diff > 0.0)]
+            if diff.size:
+                steps.append(diff)
+    if not steps:
+        return None
+    return float(np.median(np.concatenate(steps)))
+
+
 def _nearest_flat_index(ai_lfm: Any, iline: float, xline: float) -> tuple[int, int, int, float, float]:
     il_idx = int(np.argmin(np.abs(ai_lfm.ilines - float(iline))))
     xl_idx = int(np.argmin(np.abs(ai_lfm.xlines - float(xline))))
@@ -259,6 +332,8 @@ def main() -> None:
             md, ai, ai_source = _read_ai_from_shifted_las(las_path)
             ai_on_axis, mask = _interpolate_ai_to_depth_axis(md, ai, kb_m, depth_axis_m)
             lfm_ai = np.asarray(ai_lfm.trace_by_index(il_idx, xl_idx), dtype=np.float32)
+            highres_depth, highres_ai = _prepare_highres_ai(md, ai, kb_m)
+            highres_trace = _build_highres_prior_trace(highres_depth, highres_ai, depth_axis_m, lfm_ai)
             lfm_valid = np.isfinite(lfm_ai) & (lfm_ai > 0.0)
             mask = mask & lfm_valid
             if int(mask.sum()) < 2:
@@ -296,6 +371,7 @@ def main() -> None:
                     "lfm_ai": np.where(lfm_valid, lfm_ai, 0.0).astype(np.float32),
                     "mask": mask.astype(bool),
                     "weight": weight,
+                    **highres_trace,
                 }
             )
             qc.update(
@@ -313,6 +389,7 @@ def main() -> None:
                     "corr": corr,
                     "confidence": confidence,
                     "valid_samples": int(mask.sum()),
+                    "highres_valid_samples": int(highres_trace["highres_well_mask"].sum()),
                 }
             )
         except Exception as exc:
@@ -329,18 +406,38 @@ def main() -> None:
     duplicates = [flat for flat, count in Counter(row["flat_idx"] for row in records).items() if count > 1]
     if duplicates:
         duplicate_wells = [row["well_name"] for row in records if row["flat_idx"] in duplicates]
-        raise ValueError(f"Duplicate nearest traces are not supported in v1: {duplicates}, wells={duplicate_wells}")
+        raise ValueError(f"Duplicate nearest traces are not supported in v2: {duplicates}, wells={duplicate_wells}")
 
     sample_step = float(np.median(np.diff(depth_axis_m))) if depth_axis_m.size > 1 else None
     well_mask = np.stack([row["mask"] for row in records]).astype(bool)
     well_weight = np.stack([row["weight"] for row in records]).astype(np.float32)
     residual_log_ai = np.stack([row["residual_log_ai"] for row in records]).astype(np.float32)
+    highres_depth = _pad_highres_records(records, "highres_depth", dtype=np.float32, fill_value=0.0)
+    highres_well_ai = _pad_highres_records(records, "highres_well_ai", dtype=np.float32, fill_value=0.0)
+    highres_well_log_ai = _pad_highres_records(records, "highres_well_log_ai", dtype=np.float32, fill_value=0.0)
+    highres_lfm_log_ai = _pad_highres_records(records, "highres_lfm_log_ai", dtype=np.float32, fill_value=0.0)
+    highres_residual_log_ai = _pad_highres_records(
+        records,
+        "highres_residual_log_ai",
+        dtype=np.float32,
+        fill_value=0.0,
+    )
+    highres_well_mask = _pad_highres_records(records, "highres_well_mask", dtype=bool, fill_value=False)
     summary = summarize_well_resolution_prior(
         residual_log_ai,
         well_mask,
         sample_step=sample_step,
         well_weight=well_weight,
     )
+    highres_summary = summarize_well_resolution_prior(
+        highres_residual_log_ai,
+        highres_well_mask,
+        sample_step=_median_highres_sample_step(highres_depth, highres_well_mask),
+    )
+    summary["highres_residual"] = highres_summary["residual"]
+    summary["highres_event_density"] = highres_summary["event_density"]
+    summary["highres_reflectivity"] = highres_summary["reflectivity"]
+    summary["highres_spectrum"] = highres_summary["spectrum"]
 
     metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -358,6 +455,7 @@ def main() -> None:
         "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
         "n_input_las": int(len(las_paths)),
         "n_successful_wells": int(len(records)),
+        "highres_max_samples": int(highres_depth.shape[1]),
         "status_counts": qc_df["status"].value_counts(dropna=False).to_dict(),
     }
 
@@ -373,6 +471,12 @@ def main() -> None:
         lfm_ai=np.stack([row["lfm_ai"] for row in records]).astype(np.float32),
         well_mask=well_mask,
         well_weight=well_weight,
+        highres_depth=highres_depth,
+        highres_well_ai=highres_well_ai,
+        highres_well_log_ai=highres_well_log_ai,
+        highres_lfm_log_ai=highres_lfm_log_ai,
+        highres_residual_log_ai=highres_residual_log_ai,
+        highres_well_mask=highres_well_mask,
         well_names=np.array([row["well_name"] for row in records]),
         inline=np.array([row["inline"] for row in records], dtype=np.float32),
         xline=np.array([row["xline"] for row in records], dtype=np.float32),
@@ -437,8 +541,9 @@ def main() -> None:
                 "artifacts": {
                     "stage_2_enhancement_prior": {
                         "path": repo_relative_path(prior_path, root=REPO_ROOT),
-                        "schema": "ginn_well_resolution_prior_v1",
+                        "schema": "ginn_well_resolution_prior_v2",
                         "contains_residual_log_ai": True,
+                        "contains_highres_residual_log_ai": True,
                         "summary": summary,
                     },
                     "stage_1_log_ai_anchor": {

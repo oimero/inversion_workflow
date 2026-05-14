@@ -194,7 +194,7 @@ def mode_name(sample: dict[str, Any]) -> str:
 
 def sample_record(sample: dict[str, Any], index: int, image_path: Path | None) -> dict[str, Any]:
     core_mask = as_1d(sample["mask"]).astype(bool)
-    waveform_mask = as_1d(sample["loss_mask"]).astype(bool)
+    waveform_mask = core_mask
     delta_mask = as_1d(sample["delta_loss_mask"]).astype(bool)
     real = finite_core(as_1d(sample["obs"]), waveform_mask)
     synthetic = finite_core(as_1d(sample["target_seismic"]), waveform_mask)
@@ -262,7 +262,7 @@ def plot_detail(sample: dict[str, Any], depth: np.ndarray, index: int, path: Pat
     reflectivity = as_1d(sample["raw_reflectivity"])
     taper = as_1d(sample["taper_weight"])
     core_mask = as_1d(sample["mask"]).astype(bool)
-    waveform_mask = as_1d(sample["loss_mask"]).astype(bool)
+    waveform_mask = core_mask
     delta_mask = as_1d(sample["delta_loss_mask"]).astype(bool)
     sample_mode = mode_name(sample)
     highres_depth = as_1d(sample["depth_highres"]) if "depth_highres" in sample else None
@@ -349,7 +349,7 @@ def plot_overview_page(
         ai = as_1d(sample["target_ai"])
         base_ai = as_1d(sample["base_ai_raw"])
         residual = as_1d(sample["target_residual"])
-        waveform_mask = as_1d(sample["loss_mask"]).astype(bool)
+        waveform_mask = as_1d(sample["mask"]).astype(bool)
         delta_mask = as_1d(sample["delta_loss_mask"]).astype(bool)
 
         axes[row, 0].plot(depth, real_obs, color="0.65", lw=0.8)

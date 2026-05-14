@@ -34,8 +34,9 @@ class EnhancementConfig:
     resolution_prior_file: Path = Path("your_well_resolution_prior.npz")  # 井分辨率残差先验。
 
     # ── 合成样本分布 ─────────────────────────────────────────
-    # 每个 epoch 在线随机生成 synthetic traces。well_patch 直接抽井残差片段；
-    # unresolved_cluster 在高采样轴上加入薄互层 packet，再降采样回训练采样。
+    # 每个 epoch 在线随机生成 synthetic traces。well_patch 从井的高分辨率
+    # residual 片段生成 target；unresolved_cluster 在高采样轴上加入薄互层
+    # packet。两者都经 highres forward 后降回训练采样。
     synthetic_traces_per_epoch: int = 1024  # 每个 epoch 生成的 synthetic 道数。
     synthetic_batch_size: int | None = None  # 为空时使用 batch_size。
     synthetic_patch_fraction: float = 0.7  # 井残差 patch 样本占比权重。
@@ -53,7 +54,8 @@ class EnhancementConfig:
     # ── 合成样本 QC 与监督区域 ───────────────────────────────
     # delta_supervision_mask 控制 synthetic delta 放置和 delta loss 的区域。
     # core 使用完整目的层 mask；loss 使用 GINN eroded loss_mask，主要用于旧
-    # 行为对照。seismic RMS/QC 仍可使用原 loss_mask 评估合成地震是否过强。
+    # 行为对照。seismic RMS/QC 默认使用完整 core mask，避免薄目的层被
+    # eroded loss_mask 压得过窄。
     delta_supervision_mask: DeltaSupervisionMask = "core"  # delta 监督区域：core 或 loss。
     synthetic_residual_highpass_samples_loss: int = 7  # QC 中统计 residual 高频能量的窗口。
     synthetic_seismic_rms_match: bool = True  # 是否把 synthetic seismic RMS 匹配到目标尺度。

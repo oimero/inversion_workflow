@@ -12,14 +12,14 @@ import numpy as np
 from cup.utils.io import to_json_compatible
 from cup.utils.raw_trace import centered_moving_average
 
-SCHEMA_VERSION = "ginn_well_resolution_prior_v1"
+SCHEMA_VERSION = "ginn_well_resolution_prior_v2"
 VALID_SAMPLE_DOMAINS = {"time", "depth"}
 VALID_SAMPLE_UNITS = {"s", "m"}
 
 
 @dataclass(frozen=True)
 class WellResolutionPriorBundle:
-    """Well residuals and summary statistics sampled on a GINN trace axis."""
+    """Well residuals sampled on GINN trace and high-resolution well axes."""
 
     sample_domain: str
     sample_unit: str
@@ -32,6 +32,12 @@ class WellResolutionPriorBundle:
     lfm_ai: np.ndarray
     well_mask: np.ndarray
     well_weight: np.ndarray
+    highres_depth: np.ndarray
+    highres_well_ai: np.ndarray
+    highres_well_log_ai: np.ndarray
+    highres_lfm_log_ai: np.ndarray
+    highres_residual_log_ai: np.ndarray
+    highres_well_mask: np.ndarray
     well_names: np.ndarray
     inline: np.ndarray
     xline: np.ndarray
@@ -47,9 +53,13 @@ class WellResolutionPriorBundle:
     def n_sample(self) -> int:
         return int(self.samples.size)
 
+    @property
+    def n_highres_sample(self) -> int:
+        return int(self.highres_depth.shape[1]) if np.asarray(self.highres_depth).ndim == 2 else 0
+
 
 def load_well_resolution_prior_npz(path: str | Path) -> WellResolutionPriorBundle:
-    """Load a ``ginn_well_resolution_prior_v1`` NPZ file."""
+    """Load a ``ginn_well_resolution_prior_v2`` NPZ file."""
     path = Path(path)
     with np.load(path, allow_pickle=False) as data:
         required = {
@@ -65,6 +75,12 @@ def load_well_resolution_prior_npz(path: str | Path) -> WellResolutionPriorBundl
             "lfm_ai",
             "well_mask",
             "well_weight",
+            "highres_depth",
+            "highres_well_ai",
+            "highres_well_log_ai",
+            "highres_lfm_log_ai",
+            "highres_residual_log_ai",
+            "highres_well_mask",
             "well_names",
             "inline",
             "xline",
@@ -88,6 +104,12 @@ def load_well_resolution_prior_npz(path: str | Path) -> WellResolutionPriorBundl
             lfm_ai=np.asarray(data["lfm_ai"], dtype=np.float32),
             well_mask=np.asarray(data["well_mask"], dtype=bool),
             well_weight=np.asarray(data["well_weight"], dtype=np.float32),
+            highres_depth=np.asarray(data["highres_depth"], dtype=np.float32),
+            highres_well_ai=np.asarray(data["highres_well_ai"], dtype=np.float32),
+            highres_well_log_ai=np.asarray(data["highres_well_log_ai"], dtype=np.float32),
+            highres_lfm_log_ai=np.asarray(data["highres_lfm_log_ai"], dtype=np.float32),
+            highres_residual_log_ai=np.asarray(data["highres_residual_log_ai"], dtype=np.float32),
+            highres_well_mask=np.asarray(data["highres_well_mask"], dtype=bool),
             well_names=np.asarray(data["well_names"]).astype(str),
             inline=np.asarray(data["inline"], dtype=np.float32),
             xline=np.asarray(data["xline"], dtype=np.float32),
@@ -118,6 +140,12 @@ def save_well_resolution_prior_npz(path: str | Path, bundle: WellResolutionPrior
         lfm_ai=np.asarray(bundle.lfm_ai, dtype=np.float32),
         well_mask=np.asarray(bundle.well_mask, dtype=bool),
         well_weight=np.asarray(bundle.well_weight, dtype=np.float32),
+        highres_depth=np.asarray(bundle.highres_depth, dtype=np.float32),
+        highres_well_ai=np.asarray(bundle.highres_well_ai, dtype=np.float32),
+        highres_well_log_ai=np.asarray(bundle.highres_well_log_ai, dtype=np.float32),
+        highres_lfm_log_ai=np.asarray(bundle.highres_lfm_log_ai, dtype=np.float32),
+        highres_residual_log_ai=np.asarray(bundle.highres_residual_log_ai, dtype=np.float32),
+        highres_well_mask=np.asarray(bundle.highres_well_mask, dtype=bool),
         well_names=np.asarray(bundle.well_names).astype(str),
         inline=np.asarray(bundle.inline, dtype=np.float32),
         xline=np.asarray(bundle.xline, dtype=np.float32),
@@ -135,7 +163,10 @@ def validate_well_resolution_prior(
 ) -> None:
     """Validate schema, shapes, finite values, and optional workflow compatibility."""
     if bundle.schema_version != SCHEMA_VERSION:
-        raise ValueError(f"Unsupported well-resolution-prior schema_version={bundle.schema_version!r}.")
+        raise ValueError(
+            f"Unsupported well-resolution-prior schema_version={bundle.schema_version!r}; "
+            f"expected {SCHEMA_VERSION!r}. Rebuild the well-resolution prior."
+        )
     if bundle.sample_domain not in VALID_SAMPLE_DOMAINS:
         raise ValueError(f"sample_domain must be one of {sorted(VALID_SAMPLE_DOMAINS)}, got {bundle.sample_domain!r}.")
     if bundle.sample_unit not in VALID_SAMPLE_UNITS:
@@ -156,7 +187,7 @@ def validate_well_resolution_prior(
         raise ValueError("flat_indices must be a 1D array.")
     n_wells = int(flat_indices.size)
     if np.unique(flat_indices).size != n_wells:
-        raise ValueError("Duplicate flat_indices are not supported in well resolution-prior v1.")
+        raise ValueError("Duplicate flat_indices are not supported in well resolution-prior v2.")
     if n_traces is not None and n_wells:
         if flat_indices.min() < 0 or flat_indices.max() >= int(n_traces):
             raise ValueError(
@@ -169,6 +200,23 @@ def validate_well_resolution_prior(
         value = np.asarray(getattr(bundle, name))
         if value.shape != expected_2d:
             raise ValueError(f"{name} shape {value.shape} does not match expected {expected_2d}.")
+
+    expected_highres = None
+    for name in (
+        "highres_depth",
+        "highres_well_ai",
+        "highres_well_log_ai",
+        "highres_lfm_log_ai",
+        "highres_residual_log_ai",
+        "highres_well_mask",
+    ):
+        value = np.asarray(getattr(bundle, name))
+        if value.ndim != 2 or value.shape[0] != n_wells:
+            raise ValueError(f"{name} must have shape (n_wells, n_highres_sample), got {value.shape}.")
+        if expected_highres is None:
+            expected_highres = value.shape
+        elif value.shape != expected_highres:
+            raise ValueError(f"{name} shape {value.shape} does not match expected {expected_highres}.")
 
     for name in ("well_names", "inline", "xline"):
         value = np.asarray(getattr(bundle, name))
@@ -186,6 +234,22 @@ def validate_well_resolution_prior(
         value = np.asarray(getattr(bundle, name), dtype=np.float64)
         if np.any(~np.isfinite(value[mask])):
             raise ValueError(f"{name} contains non-finite values inside well_mask.")
+
+    highres_mask = np.asarray(bundle.highres_well_mask, dtype=bool)
+    highres_depth = np.asarray(bundle.highres_depth, dtype=np.float64)
+    for row in range(n_wells):
+        row_mask = highres_mask[row]
+        if int(row_mask.sum()) < 2:
+            raise ValueError(f"highres_well_mask row {row} contains fewer than 2 valid samples.")
+        row_depth = highres_depth[row, row_mask]
+        if np.any(~np.isfinite(row_depth)) or np.any(np.diff(row_depth) <= 0.0):
+            raise ValueError(f"highres_depth row {row} must be finite and strictly increasing inside highres_well_mask.")
+    for name in ("highres_well_ai", "highres_well_log_ai", "highres_lfm_log_ai", "highres_residual_log_ai"):
+        value = np.asarray(getattr(bundle, name), dtype=np.float64)
+        if np.any(~np.isfinite(value[highres_mask])):
+            raise ValueError(f"{name} contains non-finite values inside highres_well_mask.")
+    if np.any(np.asarray(bundle.highres_well_ai, dtype=np.float64)[highres_mask] <= 0.0):
+        raise ValueError("highres_well_ai must be positive inside highres_well_mask.")
 
 
 def summarize_well_resolution_prior(

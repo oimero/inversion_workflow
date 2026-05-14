@@ -63,7 +63,6 @@ MONITOR_METRICS_FIELDNAMES = [
     "monitor_base_target_waveform_corr_mean",
     "monitor_base_target_waveform_delta_rms_to_target_rms_mean",
     "monitor_core_mask_fraction",
-    "monitor_waveform_mask_fraction",
     "monitor_delta_mask_fraction",
 ]
 
@@ -451,7 +450,7 @@ def _accumulate_optional_batch_stats(totals: dict[str, float], batch: dict[str, 
             (mode == 1).float().mean().item()
         )
     if "base_seismic" in batch and "target_seismic" in batch:
-        waveform_mask = batch.get("loss_mask")
+        waveform_mask = batch.get("mask")
         if waveform_mask is None:
             waveform_mask = torch.ones_like(batch["target_seismic"], dtype=torch.bool)
         corr, delta_ratio = _batch_waveform_corr_and_delta_ratio(
@@ -465,10 +464,6 @@ def _accumulate_optional_batch_stats(totals: dict[str, float], batch: dict[str, 
         ) + delta_ratio
     if "mask" in batch:
         totals["core_mask_fraction"] = totals.get("core_mask_fraction", 0.0) + float(batch["mask"].float().mean().item())
-    if "loss_mask" in batch:
-        totals["waveform_mask_fraction"] = totals.get("waveform_mask_fraction", 0.0) + float(
-            batch["loss_mask"].float().mean().item()
-        )
     if "delta_loss_mask" in batch:
         totals["delta_mask_fraction"] = totals.get("delta_mask_fraction", 0.0) + float(
             batch["delta_loss_mask"].float().mean().item()

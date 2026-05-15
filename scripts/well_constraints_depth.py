@@ -46,6 +46,9 @@ from enhance.prior import (  # noqa: E402
     summarize_well_resolution_prior,
 )
 from ginn_depth.data import load_lfm_depth_npz  # noqa: E402
+from wtie.optimize import tie as tie_utils  # noqa: E402
+from wtie.optimize.logs import filter_log  # noqa: E402
+from wtie.processing import grid  # noqa: E402
 
 # =============================================================================
 # CLI
@@ -85,21 +88,100 @@ def _find_curve(df: pd.DataFrame, names: tuple[str, ...]) -> str | None:
     return None
 
 
-def _read_ai_from_shifted_las(path: Path) -> tuple[np.ndarray, np.ndarray, str]:
+def _read_ai_curves_from_shifted_las(
+    path: Path,
+    *,
+    log_filter_params: dict[str, float | int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
     las = lasio.read(path)
     df = las.df()
     md = df.index.to_numpy(dtype=float)
     ai_col = _find_curve(df, ("AI",))
-    if ai_col is not None:
-        ai = df[ai_col].to_numpy(dtype=float)
-        return md, ai, "AI"
-
     vp_col = _find_curve(df, ("VP_MPS", "VP"))
     rho_col = _find_curve(df, ("RHO_GCC", "RHO"))
-    if vp_col is None or rho_col is None:
+
+    if ai_col is not None:
+        raw_ai = df[ai_col].to_numpy(dtype=float)
+    elif vp_col is not None and rho_col is not None:
+        raw_ai = df[vp_col].to_numpy(dtype=float) * df[rho_col].to_numpy(dtype=float)
+    else:
         raise ValueError("LAS must contain AI or both VP_MPS/VP and RHO_GCC/RHO curves.")
-    ai = df[vp_col].to_numpy(dtype=float) * df[rho_col].to_numpy(dtype=float)
-    return md, ai, f"{vp_col}*{rho_col}"
+
+    median_size = int(log_filter_params["logs_median_size"])
+    threshold = float(log_filter_params["logs_median_threshold"])
+    std = float(log_filter_params["logs_std"])
+
+    if vp_col is not None and rho_col is not None:
+        vp = df[vp_col].to_numpy(dtype=float)
+        rho = df[rho_col].to_numpy(dtype=float)
+        logset = grid.LogSet(
+            {
+                "Vp": grid.Log(vp, md, "md", name="Vp", unit="m/s"),
+                "Rho": grid.Log(rho, md, "md", name="Rho", unit="g/cm3"),
+            }
+        )
+        filtered = tie_utils.filter_md_logs(
+            logset,
+            median_size=median_size,
+            threshold=threshold,
+            std=std,
+            std2=0.8 * std,
+        )
+        filtered_ai = filtered.Vp.values * filtered.Rho.values
+        source = f"filtered({vp_col}*{rho_col})"
+    elif ai_col is not None:
+        ai_log = grid.Log(raw_ai, md, "md", name="AI", unit="m/s*g/cm3")
+        filtered_log = filter_log(
+            ai_log,
+            median_size=median_size,
+            threshold=threshold,
+            std=std,
+            std2=0.8 * std,
+        )
+        filtered_ai = filtered_log.values
+        source = f"filtered({ai_col})"
+    else:
+        raise ValueError("LAS must contain AI or both VP_MPS/VP and RHO_GCC/RHO curves.")
+
+    return md, raw_ai, np.asarray(filtered_ai, dtype=float), source
+
+
+def _load_auto_tie_log_filter_params(cfg: dict[str, Any]) -> dict[str, float | int]:
+    batch_cfg = cfg.get("wavelet_batch_synthetic_depth", {})
+    if not batch_cfg:
+        raise ValueError("Missing 'wavelet_batch_synthetic_depth' section for log filter parameters.")
+
+    source_well_name = str(batch_cfg.get("source_well_name", ""))
+    source_auto_tie_dir = batch_cfg.get("source_auto_tie_dir")
+    source_run_summary: dict[str, Any] = {}
+    if source_well_name and source_auto_tie_dir is not None:
+        source_dir = resolve_relative_path(str(source_auto_tie_dir), root=REPO_ROOT)
+        candidates = [
+            source_dir / f"run_summary_{source_well_name}.json",
+            source_dir / f"run_summary_auto_well_tie_{source_well_name}.json",
+        ]
+        summary_path = next((path for path in candidates if path.exists()), None)
+        if summary_path is not None:
+            source_run_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+    params = {
+        key: source_run_summary.get("auto_tie_best_parameters", {}).get(key)
+        for key in ("logs_median_size", "logs_median_threshold", "logs_std")
+    }
+    if any(value is None for value in params.values()):
+        fallback = batch_cfg.get("fallback_log_filter", {})
+        params = {
+            "logs_median_size": fallback.get("logs_median_size"),
+            "logs_median_threshold": fallback.get("logs_median_threshold"),
+            "logs_std": fallback.get("logs_std"),
+        }
+    if any(value is None for value in params.values()):
+        raise ValueError("Missing auto-tie log filter parameters and fallback_log_filter.")
+    return {
+        "logs_median_size": int(params["logs_median_size"]),
+        "logs_median_threshold": float(params["logs_median_threshold"]),
+        "logs_std": float(params["logs_std"]),
+    }
 
 
 def _confidence_from_corr(corr: object, *, floor: float, span: float) -> float:
@@ -274,6 +356,10 @@ def main() -> None:
 
     confidence_corr_floor = float(script_cfg.get("confidence_corr_floor", 0.3))
     confidence_corr_span = float(script_cfg.get("confidence_corr_span", 0.4))
+    las_ai_source = str(script_cfg.get("las_ai_source", "filtered_shifted_las")).strip().lower()
+    if las_ai_source not in {"filtered_shifted_las", "raw_shifted_las"}:
+        raise ValueError("well_constraints_depth.las_ai_source must be 'filtered_shifted_las' or 'raw_shifted_las'.")
+    log_filter_params = _load_auto_tie_log_filter_params(cfg)
 
     segy_cfg = cfg["segy"]
     segy_options = {
@@ -287,6 +373,7 @@ def main() -> None:
     print(f"Shifted LAS dir: {shifted_las_dir}")
     print(f"Batch metrics: {metrics_path}")
     print(f"AI LFM: {ai_lfm_file}")
+    print(f"LAS AI source: {las_ai_source} ({log_filter_params})")
     print(f"Output dir: {output_dir}")
 
     ai_lfm = load_lfm_depth_npz(ai_lfm_file)
@@ -329,10 +416,18 @@ def main() -> None:
 
             iline, xline = survey.coord_to_line(well_x, well_y)
             flat_idx, il_idx, xl_idx, nearest_inline, nearest_xline = _nearest_flat_index(ai_lfm, iline, xline)
-            md, ai, ai_source = _read_ai_from_shifted_las(las_path)
-            ai_on_axis, mask = _interpolate_ai_to_depth_axis(md, ai, kb_m, depth_axis_m)
+            md, raw_ai, filtered_ai, ai_source = _read_ai_curves_from_shifted_las(
+                las_path,
+                log_filter_params=log_filter_params,
+            )
+            constraint_ai = filtered_ai if las_ai_source == "filtered_shifted_las" else raw_ai
+            constraint_ai_source = (
+                ai_source if las_ai_source == "filtered_shifted_las" else ai_source.replace("filtered(", "raw(", 1)
+            )
+            ai_on_axis, mask = _interpolate_ai_to_depth_axis(md, constraint_ai, kb_m, depth_axis_m)
+            raw_ai_on_axis, raw_mask = _interpolate_ai_to_depth_axis(md, raw_ai, kb_m, depth_axis_m)
             lfm_ai = np.asarray(ai_lfm.trace_by_index(il_idx, xl_idx), dtype=np.float32)
-            highres_depth, highres_ai = _prepare_highres_ai(md, ai, kb_m)
+            highres_depth, highres_ai = _prepare_highres_ai(md, constraint_ai, kb_m)
             highres_trace = _build_highres_prior_trace(highres_depth, highres_ai, depth_axis_m, lfm_ai)
             lfm_valid = np.isfinite(lfm_ai) & (lfm_ai > 0.0)
             mask = mask & lfm_valid
@@ -345,6 +440,8 @@ def main() -> None:
             log_ai[mask] = np.log(np.clip(ai_on_axis[mask], 1e-6, None)).astype(np.float32)
             lfm_log_ai[mask] = np.log(np.clip(lfm_ai[mask], 1e-6, None)).astype(np.float32)
             residual_log_ai[mask] = (log_ai[mask] - lfm_log_ai[mask]).astype(np.float32)
+            raw_filtered_mask = mask & raw_mask & np.isfinite(raw_ai_on_axis) & np.isfinite(ai_on_axis)
+            raw_filtered_diff = raw_ai_on_axis[raw_filtered_mask] - ai_on_axis[raw_filtered_mask]
 
             metric = metrics_by_name.get(well_name)
             if metric is None:
@@ -377,7 +474,15 @@ def main() -> None:
             qc.update(
                 {
                     "status": "ok",
-                    "ai_source": ai_source,
+                    "ai_source": constraint_ai_source,
+                    "las_ai_source": las_ai_source,
+                    "log_filter_params_json": json.dumps(log_filter_params, ensure_ascii=False),
+                    "raw_minus_filtered_ai_mean": (
+                        float(np.mean(raw_filtered_diff)) if raw_filtered_diff.size else np.nan
+                    ),
+                    "raw_minus_filtered_ai_rmse": (
+                        float(np.sqrt(np.mean(raw_filtered_diff**2))) if raw_filtered_diff.size else np.nan
+                    ),
                     "kb_m": kb_m,
                     "well_x": well_x,
                     "well_y": well_y,
@@ -451,6 +556,8 @@ def main() -> None:
         "metrics_path": repo_relative_path(metrics_path, root=REPO_ROOT),
         "well_heads_file": repo_relative_path(well_heads_file, root=REPO_ROOT),
         "ai_lfm_file": repo_relative_path(ai_lfm_file, root=REPO_ROOT),
+        "las_ai_source": las_ai_source,
+        "log_filter_params": log_filter_params,
         "confidence_formula": f"clip((corr - {confidence_corr_floor}) / {confidence_corr_span}, 0, 1)",
         "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
         "n_input_las": int(len(las_paths)),
@@ -497,6 +604,8 @@ def main() -> None:
         "metrics_path": repo_relative_path(metrics_path, root=REPO_ROOT),
         "well_heads_file": repo_relative_path(well_heads_file, root=REPO_ROOT),
         "ai_lfm_file": repo_relative_path(ai_lfm_file, root=REPO_ROOT),
+        "las_ai_source": metadata["las_ai_source"],
+        "log_filter_params": metadata["log_filter_params"],
         "confidence_formula": metadata["confidence_formula"],
         "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
         "n_input_las": int(len(las_paths)),
@@ -533,6 +642,8 @@ def main() -> None:
                     "metrics_path": repo_relative_path(metrics_path, root=REPO_ROOT),
                     "well_heads_file": repo_relative_path(well_heads_file, root=REPO_ROOT),
                     "ai_lfm_file": repo_relative_path(ai_lfm_file, root=REPO_ROOT),
+                    "las_ai_source": metadata["las_ai_source"],
+                    "log_filter_params": metadata["log_filter_params"],
                     "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
                     "n_input_las": int(len(las_paths)),
                     "n_successful_wells": int(len(records)),

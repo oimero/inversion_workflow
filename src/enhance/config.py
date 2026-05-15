@@ -37,7 +37,7 @@ class EnhancementConfig:
     # 每个 epoch 在线随机生成 synthetic traces。well_patch 从井的高分辨率
     # residual 片段生成 target；unresolved_cluster 在高采样轴上加入薄互层
     # packet。两者都经 highres forward 后降回训练采样。
-    synthetic_traces_per_epoch: int = 1024  # 每个 epoch 生成的 synthetic 道数。
+    synthetic_traces_per_epoch: int = 2048  # 每个 epoch 生成的 synthetic 道数。
     synthetic_batch_size: int | None = None  # 为空时使用 batch_size。
     synthetic_patch_fraction: float = 0.7  # 井残差 patch 样本占比权重。
     synthetic_unresolved_fraction: float = 0.3  # 不可分辨薄互层样本占比权重。
@@ -100,11 +100,11 @@ class EnhancementConfig:
     # ── Delta 监督损失 ───────────────────────────────────────
     # 训练 loop 不做物理正演反传；loss 直接比较预测和合成目标 delta_log_ai。
     # highpass 项负责细节形状，lowpass/RMS 项负责趋势和能量尺度。
-    lambda_delta_lowpass: float = 0.2  # delta 低频分量 SmoothL1 权重。
-    lambda_delta_highpass: float = 1.0  # delta 高频分量 SmoothL1 权重。
-    lambda_delta_rms: float = 0.05  # delta RMS 尺度匹配权重。
-    lambda_delta_rms_underfit: float = 0.0  # 预测能量不足惩罚权重。
-    delta_rms_floor: float = 0.7  # underfit 惩罚触发比例。
+    lambda_delta_lowpass: float = 0.05  # delta 低频分量 SmoothL1 权重。
+    lambda_delta_highpass: float = 1.5  # delta 高频分量 SmoothL1 权重。
+    lambda_delta_rms: float = 0.25  # delta RMS 尺度匹配权重。
+    lambda_delta_rms_underfit: float = 0.5  # 预测能量不足惩罚权重。
+    delta_rms_floor: float = 0.9  # underfit 惩罚触发比例。
     delta_lowpass_samples: int = 17  # lowpass 对比窗口。
     delta_highpass_samples: int = 7  # highpass 对比窗口。
 
@@ -113,18 +113,18 @@ class EnhancementConfig:
     # num_workers=0 最稳；checkpoint_dir 保存 metrics.csv、run_summary.json
     # 和模型权重。
     batch_size: int = 16  # 推理 batch size；训练 batch 默认也用它。
-    epochs: int = 10  # 训练 epoch 数。
-    lr: float = 5e-4  # Adam 初始学习率。
-    weight_decay: float = 1e-4  # Adam 权重衰减。
+    epochs: int = 6  # 训练 epoch 数。
+    lr: float = 3e-4  # Adam 初始学习率。
+    weight_decay: float = 1e-5  # Adam 权重衰减。
     grad_clip: float = 1.0  # 梯度裁剪阈值。
-    monitor_samples: int = 64  # 固定 monitor synthetic 样本数；设为 0 可关闭。
+    monitor_samples: int = 256  # 固定 monitor synthetic 样本数；设为 0 可关闭。
     monitor_seed: int = 20260507  # 固定 monitor synthetic 抽样随机种子。
     device: str = "cuda"  # 首选训练设备；CUDA 不可用时回退 CPU。
     num_workers: int = 0  # DataLoader worker 数。
     pin_memory: bool = True  # CUDA 训练时是否启用 pinned memory。
     checkpoint_dir: Path = Path("scripts/output/enhance_train_depth/checkpoints")  # checkpoint 输出目录。
-    log_interval: int = 50  # 每隔多少个 batch 打日志。
-    save_every: int = 5  # 每隔多少个 epoch 保存常规 checkpoint。
+    log_interval: int = 16  # 每隔多少个 batch 打日志。
+    save_every: int = 1  # 每隔多少个 epoch 保存常规 checkpoint。
 
     def __post_init__(self) -> None:
         for field_name in _PATH_FIELDS:

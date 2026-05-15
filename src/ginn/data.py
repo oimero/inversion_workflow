@@ -557,6 +557,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         with np.load(lfm_path, allow_pickle=False) as lfm_data:
             if "metadata_json" in lfm_data:
                 import json
+
                 lfm_meta = json.loads(str(lfm_data["metadata_json"]))
                 tl_meta = lfm_meta.get("target_layer", {})
                 tl_min_thickness = tl_meta.get("min_thickness")
@@ -599,9 +600,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         logger.info("Loading dynamic gain model from %s...", cfg.dynamic_gain_model)
         dynamic_gain = load_dynamic_gain_model(cfg.dynamic_gain_model)  # type: ignore
         if dynamic_gain.shape != seismic.shape:
-            raise ValueError(
-                f"Dynamic gain shape {dynamic_gain.shape} does not match seismic shape {seismic.shape}."
-            )
+            raise ValueError(f"Dynamic gain shape {dynamic_gain.shape} does not match seismic shape {seismic.shape}.")
 
     wavelet_time_s, base_wavelet = resolve_wavelet_from_config(cfg, geometry)
     boundary_effect_samples = cfg.boundary_effect_samples

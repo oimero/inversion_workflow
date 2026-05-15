@@ -578,7 +578,7 @@ def main() -> None:
 
     import torch
 
-    from enhance import load_well_resolution_prior_npz
+    from enhance.prior import load_well_resolution_prior_npz
     from enhance.config import EnhancementConfig
     from ginn_depth.enhance import build_depth_enhancement_bundle
 

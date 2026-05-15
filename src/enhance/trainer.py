@@ -145,7 +145,7 @@ class EnhancementTrainer:
             seed=cfg.monitor_seed,
         )
         self.monitor_dataloader = DataLoader(
-            self.monitor_samples,
+            self.monitor_samples,  # type: ignore
             batch_size=batch_size,
             shuffle=False,
             num_workers=0,
@@ -171,7 +171,7 @@ class EnhancementTrainer:
             "device": {"requested": self.cfg.device, "resolved": str(self.device)},
             "normalization": self.normalization,
             "metadata": self.metadata,
-            "train_dataset_len": len(self.train_dataset),
+            "train_dataset_len": len(self.train_dataset),  # type: ignore
             "train_batches": len(self.train_dataloader),
             "monitor_samples": len(self.monitor_samples),
             "monitor_batches": len(self.monitor_dataloader),
@@ -263,7 +263,7 @@ class EnhancementTrainer:
         logger.info(
             "Start stage-2 enhancement training: epochs=%d, traces_per_epoch=%d",
             self.cfg.epochs,
-            len(self.train_dataset),
+            len(self.train_dataset),  # type: ignore
         )
         for epoch in range(self.cfg.epochs):
             self.epoch = epoch
@@ -544,7 +544,9 @@ class _WellHighAnchor:
         enhanced_ai = compose_enhanced_ai(base_ai, pred_delta, ai_min=ai_min, ai_max=ai_max)
         enhanced_ai_trace = _ensure_trace_channel(enhanced_ai, name="enhanced_ai")[:, 0, :]
         enhanced_log_ai = torch.log(torch.clamp(enhanced_ai_trace, min=1e-6))
-        enhanced_high = enhanced_log_ai - _moving_average_1d(enhanced_log_ai.unsqueeze(1), self.highpass_samples).squeeze(1)
+        enhanced_high = enhanced_log_ai - _moving_average_1d(
+            enhanced_log_ai.unsqueeze(1), self.highpass_samples
+        ).squeeze(1)
         raw_loss = F.smooth_l1_loss(enhanced_high, target, reduction="none")
         denom = mask_weight.sum().clamp(min=1.0)
         loss = (raw_loss * mask_weight).sum() / denom
@@ -578,6 +580,7 @@ def _zero_well_high_anchor_metrics(device: torch.device) -> tuple[torch.Tensor, 
         "well_high_anchor_traces": 0.0,
     }
 
+
 def _initialize_metrics_csv(path: Path) -> None:
     _initialize_csv(path, METRICS_FIELDNAMES)
 
@@ -606,7 +609,7 @@ def _build_fixed_monitor_samples(dataset: Dataset, *, n_samples: int, seed: int)
     try:
         np.random.seed(int(seed))
         torch.manual_seed(int(seed))
-        return [_freeze_sample(dataset[index % len(dataset)]) for index in range(int(n_samples))]
+        return [_freeze_sample(dataset[index % len(dataset)]) for index in range(int(n_samples))]  # type: ignore
     finally:
         np.random.set_state(np_state)
         torch.random.set_rng_state(torch_state)
@@ -638,16 +641,18 @@ def _accumulate_optional_batch_stats(totals: dict[str, float], batch: dict[str, 
             batch["synthetic_quality_gate_passed"].float().mean().item()
         )
     if "synthetic_quality_gate_forced_accept" in batch:
-        totals["quality_gate_forced_accept_fraction"] = totals.get(
-            "quality_gate_forced_accept_fraction", 0.0
-        ) + float(batch["synthetic_quality_gate_forced_accept"].float().mean().item())
+        totals["quality_gate_forced_accept_fraction"] = totals.get("quality_gate_forced_accept_fraction", 0.0) + float(
+            batch["synthetic_quality_gate_forced_accept"].float().mean().item()
+        )
     if "synthetic_quality_gate_max_attempt_reached" in batch:
         totals["quality_gate_max_attempt_fraction"] = totals.get("quality_gate_max_attempt_fraction", 0.0) + float(
             batch["synthetic_quality_gate_max_attempt_reached"].float().mean().item()
         )
     if "synthetic_mode" in batch:
         mode = batch["synthetic_mode"].long()
-        totals["well_patch_fraction"] = totals.get("well_patch_fraction", 0.0) + float((mode == 0).float().mean().item())
+        totals["well_patch_fraction"] = totals.get("well_patch_fraction", 0.0) + float(
+            (mode == 0).float().mean().item()
+        )
         totals["unresolved_cluster_fraction"] = totals.get("unresolved_cluster_fraction", 0.0) + float(
             (mode == 1).float().mean().item()
         )
@@ -661,9 +666,9 @@ def _accumulate_optional_batch_stats(totals: dict[str, float], batch: dict[str, 
             waveform_mask.bool(),
         )
         totals["base_target_waveform_corr_mean"] = totals.get("base_target_waveform_corr_mean", 0.0) + corr
-        totals["base_target_waveform_delta_rms_to_target_rms_mean"] = totals.get(
-            "base_target_waveform_delta_rms_to_target_rms_mean", 0.0
-        ) + delta_ratio
+        totals["base_target_waveform_delta_rms_to_target_rms_mean"] = (
+            totals.get("base_target_waveform_delta_rms_to_target_rms_mean", 0.0) + delta_ratio
+        )
         if "obs" in batch:
             target_obs_corr, _ = _batch_waveform_corr_and_delta_ratio(
                 batch["target_seismic"].float(),
@@ -694,7 +699,9 @@ def _accumulate_optional_batch_stats(totals: dict[str, float], batch: dict[str, 
                 totals.get("input_augmentation_delta_rms_fraction_mean", 0.0) + augmentation_delta_fraction
             )
     if "mask" in batch:
-        totals["core_mask_fraction"] = totals.get("core_mask_fraction", 0.0) + float(batch["mask"].float().mean().item())
+        totals["core_mask_fraction"] = totals.get("core_mask_fraction", 0.0) + float(
+            batch["mask"].float().mean().item()
+        )
     if "delta_loss_mask" in batch:
         totals["delta_mask_fraction"] = totals.get("delta_mask_fraction", 0.0) + float(
             batch["delta_loss_mask"].float().mean().item()
@@ -861,7 +868,9 @@ def _training_flags_and_actions(
     return flags, actions
 
 
-def _batch_waveform_corr_and_delta_ratio(base: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> tuple[float, float]:
+def _batch_waveform_corr_and_delta_ratio(
+    base: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
+) -> tuple[float, float]:
     base_flat = base.reshape(base.shape[0], -1)
     target_flat = target.reshape(target.shape[0], -1)
     mask_flat = mask.reshape(mask.shape[0], -1).to(dtype=base_flat.dtype)

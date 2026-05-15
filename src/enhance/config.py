@@ -166,8 +166,8 @@ class EnhancementConfig:
             self.synthetic_input_amp_jitter = tuple(self.synthetic_input_amp_jitter)
         if not isinstance(self.synthetic_input_noise_rms_fraction, tuple):
             self.synthetic_input_noise_rms_fraction = tuple(self.synthetic_input_noise_rms_fraction)
-        self.synthetic_input_amp_jitter = tuple(float(v) for v in self.synthetic_input_amp_jitter)
-        self.synthetic_input_noise_rms_fraction = tuple(float(v) for v in self.synthetic_input_noise_rms_fraction)
+        self.synthetic_input_amp_jitter = tuple(float(v) for v in self.synthetic_input_amp_jitter)  # type: ignore
+        self.synthetic_input_noise_rms_fraction = tuple(float(v) for v in self.synthetic_input_noise_rms_fraction)  # type: ignore
         if (
             len(self.synthetic_input_amp_jitter) != 2
             or self.synthetic_input_amp_jitter[0] <= 0.0

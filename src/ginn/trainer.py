@@ -19,12 +19,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from cup.utils.io import to_json_compatible, write_json
+from ginn.anchor import LogAIAnchor, disabled_log_ai_anchor_summary, zero_log_ai_anchor_metrics
 from ginn.config import GINNConfig
 from ginn.data import build_dataset
 from ginn.loss import GINNLoss
 from ginn.model import DilatedResNet1D
 from ginn.physics import ForwardModel
-from ginn.anchor import LogAIAnchor, disabled_log_ai_anchor_summary, zero_log_ai_anchor_metrics
 
 logger = logging.getLogger(__name__)
 

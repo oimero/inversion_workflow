@@ -15,11 +15,9 @@ from ginn.anchor import LogAIAnchorBundle, build_log_ai_anchor_bundle, validate_
 
 
 class _SurveyLike(Protocol):
-    def coord_to_line(self, x: float, y: float) -> tuple[float, float]:
-        ...
+    def coord_to_line(self, x: float, y: float) -> tuple[float, float]: ...
 
-    def line_to_coord(self, il_no: float, xl_no: float) -> tuple[float, float]:
-        ...
+    def line_to_coord(self, il_no: float, xl_no: float) -> tuple[float, float]: ...
 
 
 @dataclass(frozen=True)
@@ -68,12 +66,14 @@ def build_facies_control_anchor_bundle(
     qc_rows: list[dict[str, Any]] = []
 
     for order, point in enumerate(control_points):
-        flat_idx, il_idx, xl_idx, resolved_inline, resolved_xline, nearest_inline, nearest_xline = nearest_trace_from_xy(
-            ilines=ilines,
-            xlines=xlines,
-            survey=survey,
-            x=point.x,
-            y=point.y,
+        flat_idx, il_idx, xl_idx, resolved_inline, resolved_xline, nearest_inline, nearest_xline = (
+            nearest_trace_from_xy(
+                ilines=ilines,
+                xlines=xlines,
+                survey=survey,
+                x=point.x,
+                y=point.y,
+            )
         )
         zone_top, zone_bottom, horizon_values = locate_control_zone(
             target_layer,
@@ -135,7 +135,9 @@ def build_facies_control_anchor_bundle(
     duplicates = [flat for flat, count in Counter(row["flat_idx"] for row in rows).items() if count > 1]
     if duplicates:
         names = [row["name"] for row in rows if row["flat_idx"] in duplicates]
-        raise ValueError(f"Duplicate nearest traces are not supported for facies anchors v1: {duplicates}, controls={names}")
+        raise ValueError(
+            f"Duplicate nearest traces are not supported for facies anchors v1: {duplicates}, controls={names}"
+        )
 
     created_at = datetime.now(timezone.utc).isoformat()
     bundle = build_log_ai_anchor_bundle(
@@ -186,7 +188,9 @@ def merge_well_and_facies_anchor_bundles(
     keep_facies_rows: list[int] = []
     qc_rows: list[dict[str, Any]] = []
 
-    for row, (name, inline, xline) in enumerate(zip(facies_bundle.anchor_names, facies_bundle.inline, facies_bundle.xline)):
+    for row, (name, inline, xline) in enumerate(
+        zip(facies_bundle.anchor_names, facies_bundle.inline, facies_bundle.xline)
+    ):
         facies_x, facies_y = survey.line_to_coord(float(inline), float(xline))
         if well_xy.size:
             dists = np.hypot(well_xy[:, 0] - facies_x, well_xy[:, 1] - facies_y)

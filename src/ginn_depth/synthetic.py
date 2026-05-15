@@ -14,13 +14,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from ginn.well_prior import (
+from cup.utils.raw_trace import centered_moving_average
+from enhance.prior import (
     WellResolutionPriorBundle,
     ai_to_reflectivity,
     load_well_resolution_prior_npz,
     validate_ai_bounds,
 )
-from cup.utils.raw_trace import centered_moving_average
 from enhance.synthetic import (
     downsample_highres_to_samples,
     edge_taper,
@@ -143,7 +143,7 @@ class SyntheticDepthTraceDataset(Dataset):
         target_vp = _derive_velocity(
             target_ai,
             base_vp,
-            velocity_mode=self.velocity_mode,
+            velocity_mode=self.velocity_mode,  # type: ignore
             vp_ai_slope=self.vp_ai_slope,
             vp_ai_intercept=self.vp_ai_intercept,
             vp_blend_alpha=self.vp_blend_alpha,
@@ -242,10 +242,10 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             raise ValueError("input_phase_deg_max must be non-negative.")
         if input_spectral_tilt_max < 0.0:
             raise ValueError("input_spectral_tilt_max must be non-negative.")
-        input_amp_jitter = tuple(float(v) for v in input_amp_jitter)
+        input_amp_jitter = tuple(float(v) for v in input_amp_jitter)  # type: ignore
         if len(input_amp_jitter) != 2 or input_amp_jitter[0] <= 0.0 or input_amp_jitter[1] < input_amp_jitter[0]:
             raise ValueError("input_amp_jitter must be a positive (min, max) range.")
-        input_noise_rms_fraction = tuple(float(v) for v in input_noise_rms_fraction)
+        input_noise_rms_fraction = tuple(float(v) for v in input_noise_rms_fraction)  # type: ignore
         if (
             len(input_noise_rms_fraction) != 2
             or input_noise_rms_fraction[0] < 0.0
@@ -382,7 +382,7 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         target_vp = _derive_velocity(
             target_ai,
             base_vp,
-            velocity_mode=self.velocity_mode,
+            velocity_mode=self.velocity_mode,  # type: ignore
             vp_ai_slope=self.vp_ai_slope,
             vp_ai_intercept=self.vp_ai_intercept,
             vp_blend_alpha=self.vp_blend_alpha,
@@ -501,7 +501,9 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         source_seismic = item["obs"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
 
         valid_delta = delta_mask & np.isfinite(residual)
-        valid_waveform = waveform_mask & np.isfinite(target_seismic) & np.isfinite(source_seismic) & np.isfinite(base_seismic)
+        valid_waveform = (
+            waveform_mask & np.isfinite(target_seismic) & np.isfinite(source_seismic) & np.isfinite(base_seismic)
+        )
         if not np.any(valid_delta) or not np.any(valid_waveform):
             return False
         if bool(item.get("synthetic_empty_residual", torch.tensor(False)).item()):
@@ -626,7 +628,11 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
 
             local_env = float(np.clip(envelope[center_idx], 0.35, 1.0))
             amp_scale = float(np.random.uniform(amp_min, amp_hi)) * local_env
-            source_amp = float(np.percentile(abs_patch[max(0, packet_start) : packet_stop], 75)) if packet_stop > packet_start else 0.0
+            source_amp = (
+                float(np.percentile(abs_patch[max(0, packet_start) : packet_stop], 75))
+                if packet_stop > packet_start
+                else 0.0
+            )
             if np.isfinite(source_amp) and source_amp > 0.0:
                 amp_scale = 0.5 * amp_scale + 0.5 * source_amp
 
@@ -652,7 +658,9 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
     ) -> np.ndarray:
         ai_tensor = torch.from_numpy(ai[np.newaxis, np.newaxis]).float()
         vp_tensor = torch.from_numpy(vp[np.newaxis, np.newaxis]).float()
-        gain_tensor = dynamic_gain.float().unsqueeze(0) if dynamic_gain is not None and dynamic_gain.ndim == 2 else dynamic_gain
+        gain_tensor = (
+            dynamic_gain.float().unsqueeze(0) if dynamic_gain is not None and dynamic_gain.ndim == 2 else dynamic_gain
+        )
         with torch.no_grad():
             seismic = self.forward_model(ai_tensor, vp_tensor, gain=gain_tensor)
         return seismic.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32)
@@ -670,7 +678,9 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             valid = np.asarray(waveform_qc_mask, dtype=bool) & np.isfinite(raw)
             rms = float(np.sqrt(np.mean(raw[valid] ** 2))) if np.any(valid) else 0.0
             if rms > 0.0 and np.isfinite(rms):
-                scale = float(np.clip(self.seismic_rms_target / rms, self.seismic_rms_scale_min, self.seismic_rms_scale_max))
+                scale = float(
+                    np.clip(self.seismic_rms_target / rms, self.seismic_rms_scale_min, self.seismic_rms_scale_max)
+                )
         matched = (raw * scale).astype(np.float32)
         return matched, raw, scale
 
@@ -700,7 +710,9 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             valid = np.asarray(waveform_qc_mask, dtype=bool) & np.isfinite(raw)
             rms = float(np.sqrt(np.mean(raw[valid] ** 2))) if np.any(valid) else 0.0
             if rms > 0.0 and np.isfinite(rms):
-                scale = float(np.clip(self.seismic_rms_target / rms, self.seismic_rms_scale_min, self.seismic_rms_scale_max))
+                scale = float(
+                    np.clip(self.seismic_rms_target / rms, self.seismic_rms_scale_min, self.seismic_rms_scale_max)
+                )
         matched = (raw * scale).astype(np.float32)
         return matched, raw, scale
 

@@ -22,8 +22,8 @@ from cup.well.wavelet import (
     load_wavelet_csv,
     make_wavelet,
 )
-from ginn.data import compute_dynamic_gain_median, normalize_dynamic_gain_input
 from ginn.anchor import load_log_ai_anchor_npz, validate_log_ai_anchor
+from ginn.data import compute_dynamic_gain_median, normalize_dynamic_gain_input
 from ginn.masking import build_eroded_loss_mask as _build_eroded_loss_mask
 from ginn.masking import build_residual_taper as _build_residual_taper
 from ginn.masking import get_valid_trace_indices as _get_valid_trace_indices
@@ -285,12 +285,7 @@ def build_well_control_data(
 ) -> WellControlData:
     """Build a sparse map of well-controlled traces for in-batch anchor loss."""
     selected_indices = np.asarray(selected_indices, dtype=np.int64).reshape(-1)
-    if (
-        lambda_log_ai_anchor <= 0.0
-        or anchor_file is None
-        or selected_indices.size == 0
-        or neighborhood_radius < 0
-    ):
+    if lambda_log_ai_anchor <= 0.0 or anchor_file is None or selected_indices.size == 0 or neighborhood_radius < 0:
         return WellControlData.empty(
             n_sample,
             summary={
@@ -382,9 +377,7 @@ def build_well_control_data(
     else:
         mask_weight = np.ones_like(target_log_ai, dtype=np.float32)
     mask_weight = (mask_weight * valid.astype(np.float32)).astype(np.float32)
-    waveform_weight_scale = (
-        1.0 - (1.0 - float(well_waveform_min_weight)) * influences
-    ).astype(np.float32)
+    waveform_weight_scale = (1.0 - (1.0 - float(well_waveform_min_weight)) * influences).astype(np.float32)
 
     anchor_names = np.asarray(anchor_bundle.anchor_names).astype(str)
     unique_rows, counts = np.unique(rows, return_counts=True)
@@ -404,8 +397,7 @@ def build_well_control_data(
         "waveform_weight_mean": float(np.mean(waveform_weight_scale)),
         "waveform_weight_max": float(np.max(waveform_weight_scale)),
         "controlled_traces_by_anchor": {
-            str(anchor_names[int(row)]): int(count)
-            for row, count in zip(unique_rows, counts)
+            str(anchor_names[int(row)]): int(count) for row, count in zip(unique_rows, counts)
         },
     }
     logger.info(
@@ -558,11 +550,7 @@ class DepthSeismicTraceDataset(Dataset):
         self._include_dynamic_gain_input = bool(include_dynamic_gain_input)
         self._zero_anchor_target_log_ai = np.zeros((n_sample,), dtype=np.float32)
         self._zero_anchor_mask_weight = np.zeros((n_sample,), dtype=np.float32)
-        self._well_control = (
-            WellControlData.empty(n_sample)
-            if well_control_data is None
-            else well_control_data
-        )
+        self._well_control = WellControlData.empty(n_sample) if well_control_data is None else well_control_data
         self._well_control_lookup = {
             int(flat_idx): row
             for row, flat_idx in enumerate(np.asarray(self._well_control.flat_indices, dtype=np.int64))
@@ -783,7 +771,7 @@ class MixedWellBatchSampler(Sampler[list[int]]):
         for _ in range(n_batches):
             parts: list[np.ndarray] = []
             if self.n_ordinary_per_batch > 0:
-                ordinary = ordinary_draws[ordinary_cursor: ordinary_cursor + self.n_ordinary_per_batch]
+                ordinary = ordinary_draws[ordinary_cursor : ordinary_cursor + self.n_ordinary_per_batch]
                 ordinary_cursor += self.n_ordinary_per_batch
                 parts.append(ordinary)
             well = rng.choice(self.anchor_indices, size=self.n_well_per_batch, replace=True)
@@ -824,9 +812,7 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         logger.info("Loading depth dynamic gain model from %s...", cfg.dynamic_gain_model)
         dynamic_gain = load_dynamic_gain_depth_model(cfg.dynamic_gain_model)  # type: ignore
         if dynamic_gain.shape != ai_lfm.shape:
-            raise ValueError(
-                f"Dynamic gain shape {dynamic_gain.shape} does not match LFM shape {ai_lfm.shape}."
-            )
+            raise ValueError(f"Dynamic gain shape {dynamic_gain.shape} does not match LFM shape {ai_lfm.shape}.")
         if (
             not np.allclose(ai_lfm.ilines, dynamic_gain.ilines)
             or not np.allclose(ai_lfm.xlines, dynamic_gain.xlines)
@@ -856,8 +842,11 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
     tl_nearest_limit = tl_meta.get("nearest_distance_limit")
     tl_outlier_threshold = tl_meta.get("outlier_threshold")
     tl_outlier_min_neighbor = tl_meta.get("outlier_min_neighbor_count", 2)
-    logger.info("Target-layer params from LFM NPZ metadata: min_thickness=%s, outlier_threshold=%s",
-                tl_min_thickness, tl_outlier_threshold)
+    logger.info(
+        "Target-layer params from LFM NPZ metadata: min_thickness=%s, outlier_threshold=%s",
+        tl_min_thickness,
+        tl_outlier_threshold,
+    )
 
     logger.info("Loading raw top/bottom depth horizons...")
     top_df_raw = import_interpretation_petrel(top_horizon_file)

@@ -449,7 +449,7 @@ class LogAIAnchor:
                         ds_idx = flat_to_dataset.get(int(flat))
                         if ds_idx is None:
                             continue
-                        dw = 1.0 if dist < 1e-8 else math.exp(-dist ** 2 / (2.0 * sigma ** 2))
+                        dw = 1.0 if dist < 1e-8 else math.exp(-(dist**2) / (2.0 * sigma**2))
                         candidates.append((dist, ds_idx, dw))
                 candidates.sort(key=lambda t: t[0])
 
@@ -469,12 +469,18 @@ class LogAIAnchor:
                     all_lfm.append(torch.stack(lfm_w))
                     all_taper.append(torch.stack(taper_w))
                     all_w.append(torch.tensor(weights_w, dtype=torch.float32))
-                    neighbor_ranges.append((neighbor_weights_flat.numel(), neighbor_weights_flat.numel() + len(inputs_w)))
+                    neighbor_ranges.append(
+                        (neighbor_weights_flat.numel(), neighbor_weights_flat.numel() + len(inputs_w))
+                    )
                 else:
                     neighbor_ranges.append((neighbor_weights_flat.numel(), neighbor_weights_flat.numel()))
 
                 if all_w:
-                    neighbor_weights_flat = torch.cat([neighbor_weights_flat] + [all_w[-1]]) if neighbor_weights_flat.numel() > 0 else all_w[-1]
+                    neighbor_weights_flat = (
+                        torch.cat([neighbor_weights_flat] + [all_w[-1]])
+                        if neighbor_weights_flat.numel() > 0
+                        else all_w[-1]
+                    )
 
             if all_inputs:
                 neighbor_inputs = torch.cat(all_inputs, dim=0)
@@ -484,7 +490,11 @@ class LogAIAnchor:
             max_nbr = max((e - s) for s, e in neighbor_ranges) if neighbor_ranges else 0
             logger.info(
                 "Log-AI anchor neighbourhood: radius=%d grid (%.0f step-units), sigma=%.1f, max_neighbors=%d, total_nbr=%d",
-                neighborhood_radius, phys_radius, sigma, max_nbr, int(neighbor_weights_flat.numel()),
+                neighborhood_radius,
+                phys_radius,
+                sigma,
+                max_nbr,
+                int(neighbor_weights_flat.numel()),
             )
         else:
             if dataset is None:
@@ -590,10 +600,10 @@ class LogAIAnchor:
             if n_valid == 0:
                 continue
 
-            pred = pred_log_ai[cursor:cursor + n_valid]
+            pred = pred_log_ai[cursor : cursor + n_valid]
             target = self.target_log_ai[r].expand(n_valid, -1).to(device)
             mask = self.mask_weight[r].to(device)
-            w = w_flat[cursor:cursor + n_valid]
+            w = w_flat[cursor : cursor + n_valid]
 
             raw = F.smooth_l1_loss(pred, target, reduction="none")  # (n_valid, n_sample)
             weighted = raw * w.unsqueeze(-1) * mask.unsqueeze(0)

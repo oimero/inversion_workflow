@@ -90,7 +90,9 @@ class EnhancementLoss(nn.Module):
         }
 
 
-def compose_enhanced_ai(base_ai: Tensor, delta_log_ai: Tensor, *, ai_min: float | None = None, ai_max: float | None = None) -> Tensor:
+def compose_enhanced_ai(
+    base_ai: Tensor, delta_log_ai: Tensor, *, ai_min: float | None = None, ai_max: float | None = None
+) -> Tensor:
     """Compose enhanced AI from a positive base AI and predicted delta log-AI."""
     enhanced = torch.clamp(base_ai, min=1e-6) * torch.exp(delta_log_ai)
     if ai_min is not None or ai_max is not None:

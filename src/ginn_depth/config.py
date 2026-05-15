@@ -194,23 +194,17 @@ class DepthGINNConfig:
             raise ValueError(f"lambda_log_ai_anchor must be non-negative, got {self.lambda_log_ai_anchor}.")
         if self.log_ai_anchor_neighborhood_radius < 0:
             raise ValueError(
-                "log_ai_anchor_neighborhood_radius must be non-negative, "
-                f"got {self.log_ai_anchor_neighborhood_radius}."
+                f"log_ai_anchor_neighborhood_radius must be non-negative, got {self.log_ai_anchor_neighborhood_radius}."
             )
         if not 0.0 <= self.well_waveform_min_weight <= 1.0:
-            raise ValueError(
-                "well_waveform_min_weight must be within [0, 1], "
-                f"got {self.well_waveform_min_weight}."
-            )
+            raise ValueError(f"well_waveform_min_weight must be within [0, 1], got {self.well_waveform_min_weight}.")
         if not 0.0 <= self.well_anchor_batch_fraction <= 1.0:
             raise ValueError(
-                "well_anchor_batch_fraction must be within [0, 1], "
-                f"got {self.well_anchor_batch_fraction}."
+                f"well_anchor_batch_fraction must be within [0, 1], got {self.well_anchor_batch_fraction}."
             )
         if self.well_anchor_distance_decay not in {"gaussian", "linear"}:
             raise ValueError(
-                "well_anchor_distance_decay must be 'gaussian' or 'linear', "
-                f"got {self.well_anchor_distance_decay!r}."
+                f"well_anchor_distance_decay must be 'gaussian' or 'linear', got {self.well_anchor_distance_decay!r}."
             )
         if self.boundary_effect_samples is not None and self.boundary_effect_samples < 0:
             raise ValueError(f"boundary_effect_samples must be non-negative, got {self.boundary_effect_samples}.")

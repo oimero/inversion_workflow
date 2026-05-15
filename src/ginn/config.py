@@ -190,8 +190,7 @@ class GINNConfig:
             raise ValueError(f"log_ai_anchor_batch_size must be non-negative, got {self.log_ai_anchor_batch_size}.")
         if self.log_ai_anchor_neighborhood_radius < 0:
             raise ValueError(
-                "log_ai_anchor_neighborhood_radius must be non-negative, "
-                f"got {self.log_ai_anchor_neighborhood_radius}."
+                f"log_ai_anchor_neighborhood_radius must be non-negative, got {self.log_ai_anchor_neighborhood_radius}."
             )
         if self.boundary_effect_samples is not None and self.boundary_effect_samples < 0:
             raise ValueError(f"boundary_effect_samples must be non-negative, got {self.boundary_effect_samples}.")

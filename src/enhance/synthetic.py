@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ginn.well_prior import (
+from enhance.prior import (
     WellResolutionPriorBundle,
     edge_taper,
     fit_delta_to_base_ai_bounds,
@@ -103,8 +103,7 @@ def valid_prior_rows(prior: WellResolutionPriorBundle) -> list[int]:
     return [
         int(row)
         for row in range(prior.n_wells)
-        if int(np.asarray(prior.well_mask[row]).sum()) >= 2
-        and int(np.asarray(prior.highres_well_mask[row]).sum()) >= 2
+        if int(np.asarray(prior.well_mask[row]).sum()) >= 2 and int(np.asarray(prior.highres_well_mask[row]).sum()) >= 2
     ]
 
 

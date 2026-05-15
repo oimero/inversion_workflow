@@ -6,17 +6,19 @@ import csv
 import json
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from cup.utils.io import to_json_compatible, write_json
 from enhance.config import EnhancementConfig
-from enhance.loss import EnhancementLoss, compose_enhanced_ai
+from enhance.loss import EnhancementLoss, _moving_average_1d, compose_enhanced_ai
 from enhance.model import DilatedResNet1D
 
 logger = logging.getLogger(__name__)
@@ -38,6 +40,12 @@ LOSS_METRIC_KEYS = [
     "highpass_rms_ratio",
 ]
 
+WELL_HIGH_ANCHOR_METRIC_KEYS = [
+    "well_high_anchor",
+    "well_high_anchor_term",
+    "well_high_anchor_traces",
+]
+
 METRICS_FIELDNAMES = [
     "epoch",
     "global_step",
@@ -45,6 +53,7 @@ METRICS_FIELDNAMES = [
     "epoch_time_s",
     "train_loss",
     *(f"train_{key}" for key in LOSS_METRIC_KEYS),
+    *(f"train_{key}" for key in WELL_HIGH_ANCHOR_METRIC_KEYS),
 ]
 
 MONITOR_METRICS_FIELDNAMES = [
@@ -53,6 +62,7 @@ MONITOR_METRICS_FIELDNAMES = [
     "lr",
     "monitor_loss",
     *(f"monitor_{key}" for key in LOSS_METRIC_KEYS),
+    *(f"monitor_{key}" for key in WELL_HIGH_ANCHOR_METRIC_KEYS),
     "monitor_synthetic_rms_scale_mean",
     "monitor_resample_attempts_mean",
     "monitor_quality_gate_pass_fraction",
@@ -142,6 +152,13 @@ class EnhancementTrainer:
             pin_memory=False,
             drop_last=False,
         )
+        self.well_high_anchor = _WellHighAnchor.build(
+            train_dataset,
+            lambda_weight=cfg.lambda_well_high_anchor,
+            batch_size=cfg.well_high_anchor_batch_size,
+            highpass_samples=int(cfg.well_high_anchor_highpass_samples or cfg.delta_highpass_samples),
+            use_weight=cfg.well_high_anchor_use_weight,
+        )
         self.best_monitor_loss = float("inf")
         self.best_monitor_epoch = 0
         self.history_tail: list[dict[str, Any]] = []
@@ -183,7 +200,11 @@ class EnhancementTrainer:
                 taper = batch.get("taper_weight")
                 if taper is not None:
                     pred_delta = pred_delta * taper.to(self.device, dtype=pred_delta.dtype)
-            loss, metrics = self.criterion(pred_delta, target_delta, loss_mask)
+            synthetic_loss, metrics = self.criterion(pred_delta, target_delta, loss_mask)
+            anchor_term, anchor_metrics = self._compute_well_high_anchor_loss(training=True)
+            loss = synthetic_loss + anchor_term
+            metrics.update(anchor_metrics)
+            metrics["total"] = float(loss.detach().cpu().item())
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -196,13 +217,14 @@ class EnhancementTrainer:
             n_batches += 1
             if (batch_idx + 1) % self.cfg.log_interval == 0:
                 logger.info(
-                    "  [Enhance batch %d/%d] loss=%.6f high=%.3e rms_ratio=%.3f high_ratio=%.3f",
+                    "  [Enhance batch %d/%d] loss=%.6f high=%.3e rms_ratio=%.3f high_ratio=%.3f well=%.3e",
                     batch_idx + 1,
                     len(self.train_dataloader),
                     metrics["total"],
                     metrics["delta_highpass"],
                     metrics["delta_rms_ratio"],
                     metrics["highpass_rms_ratio"],
+                    metrics["well_high_anchor_term"],
                 )
 
         n_batches = max(n_batches, 1)
@@ -225,7 +247,10 @@ class EnhancementTrainer:
                 taper = batch.get("taper_weight")
                 if taper is not None:
                     pred_delta = pred_delta * taper.to(self.device, dtype=pred_delta.dtype)
-            _, metrics = self.criterion(pred_delta, target_delta, loss_mask)
+            synthetic_loss, metrics = self.criterion(pred_delta, target_delta, loss_mask)
+            anchor_term, anchor_metrics = self._compute_well_high_anchor_loss(training=False)
+            metrics.update(anchor_metrics)
+            metrics["total"] = float((synthetic_loss + anchor_term).detach().cpu().item())
 
             for key, value in metrics.items():
                 totals[key] = totals.get(key, 0.0) + float(value)
@@ -254,7 +279,7 @@ class EnhancementTrainer:
                 self.best_monitor_epoch = epoch + 1
                 self.save_checkpoint("best.pt")
             logger.info(
-                "Enhance epoch %d/%d train_loss=%.6f monitor_loss=%s high=%.3e rms_ratio=%.3f high_ratio=%.3f lr=%.2e time=%.1fs",
+                "Enhance epoch %d/%d train_loss=%.6f monitor_loss=%s high=%.3e rms_ratio=%.3f high_ratio=%.3f well=%.3e lr=%.2e time=%.1fs",
                 epoch + 1,
                 self.cfg.epochs,
                 metrics["total"],
@@ -262,6 +287,7 @@ class EnhancementTrainer:
                 metrics["delta_highpass"],
                 metrics["delta_rms_ratio"],
                 metrics["highpass_rms_ratio"],
+                metrics["well_high_anchor_term"],
                 lr,
                 elapsed,
             )
@@ -321,6 +347,8 @@ class EnhancementTrainer:
                 "monitor_delta_rms_ratio": monitor_metrics.get("delta_rms_ratio"),
                 "train_highpass_rms_ratio": train_metrics.get("highpass_rms_ratio"),
                 "monitor_highpass_rms_ratio": monitor_metrics.get("highpass_rms_ratio"),
+                "train_well_high_anchor_term": train_metrics.get("well_high_anchor_term"),
+                "monitor_well_high_anchor_term": monitor_metrics.get("well_high_anchor_term"),
             }
         )
         self.history_tail = self.history_tail[-10:]
@@ -367,6 +395,18 @@ class EnhancementTrainer:
         logger.info("Enhancement checkpoint saved: %s", path)
         return path
 
+    def _compute_well_high_anchor_loss(self, *, training: bool) -> tuple[torch.Tensor, dict[str, float]]:
+        if self.well_high_anchor is None:
+            return _zero_well_high_anchor_metrics(self.device)
+        return self.well_high_anchor.compute_loss(
+            model=self.model,
+            device=self.device,
+            training=training,
+            ai_min=self.cfg.ai_min,
+            ai_max=self.cfg.ai_max,
+            zero_delta_outside_mask=self.cfg.zero_delta_outside_mask,
+        )
+
     @torch.no_grad()
     def predict_batch(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         self.model.eval()
@@ -379,6 +419,164 @@ class EnhancementTrainer:
         enhanced_ai = compose_enhanced_ai(base_ai, delta, ai_min=self.cfg.ai_min, ai_max=self.cfg.ai_max)
         return enhanced_ai.cpu(), delta.cpu()
 
+
+@dataclass
+class _WellHighAnchor:
+    """Direct high-frequency well supervision for enhancement training."""
+
+    lambda_weight: float
+    batch_size: int
+    highpass_samples: int
+    use_weight: bool
+    inputs: torch.Tensor
+    base_ai: torch.Tensor
+    taper: torch.Tensor
+    target_high_log_ai: torch.Tensor
+    mask_weight: torch.Tensor
+    flat_indices: np.ndarray
+    well_names: np.ndarray
+
+    @classmethod
+    def build(
+        cls,
+        synthetic_dataset: Dataset,
+        *,
+        lambda_weight: float,
+        batch_size: int,
+        highpass_samples: int,
+        use_weight: bool,
+    ) -> "_WellHighAnchor | None":
+        if lambda_weight <= 0.0:
+            return None
+        prior = getattr(synthetic_dataset, "prior", None)
+        base_dataset = getattr(synthetic_dataset, "base_dataset", None)
+        if prior is None or base_dataset is None:
+            logger.warning("lambda_well_high_anchor > 0 but synthetic dataset has no prior/base_dataset; disabled.")
+            return None
+
+        valid_indices = np.asarray(getattr(base_dataset, "valid_indices"), dtype=np.int64)
+        flat_to_dataset = {int(flat): idx for idx, flat in enumerate(valid_indices)}
+        rows: list[int] = []
+        dataset_indices: list[int] = []
+        for row, flat_idx in enumerate(np.asarray(prior.flat_indices, dtype=np.int64)):
+            dataset_idx = flat_to_dataset.get(int(flat_idx))
+            if dataset_idx is None:
+                continue
+            mask = np.asarray(prior.well_mask[row], dtype=bool)
+            target = np.asarray(prior.well_high_log_ai[row], dtype=np.float32)
+            if np.any(mask & np.isfinite(target)):
+                rows.append(row)
+                dataset_indices.append(dataset_idx)
+
+        if not rows:
+            logger.warning("No usable well high-frequency anchor traces; disabled.")
+            return None
+
+        inputs: list[torch.Tensor] = []
+        base_ai: list[torch.Tensor] = []
+        taper: list[torch.Tensor] = []
+        for dataset_idx in dataset_indices:
+            item = base_dataset[int(dataset_idx)]
+            inputs.append(_as_float_tensor(item["input"]))
+            base_ai.append(_as_float_tensor(item["lfm_raw"]))
+            taper.append(_as_float_tensor(item["taper_weight"]))
+
+        target = np.asarray(prior.well_high_log_ai[rows], dtype=np.float32)
+        mask = np.asarray(prior.well_mask[rows], dtype=bool)
+        weights = np.ones_like(target, dtype=np.float32)
+        if use_weight:
+            weights = np.asarray(prior.well_weight[rows], dtype=np.float32)
+            weights = np.where(np.isfinite(weights) & (weights > 0.0), weights, 0.0).astype(np.float32)
+        weights = weights * mask.astype(np.float32) * np.isfinite(target).astype(np.float32)
+
+        anchor = cls(
+            lambda_weight=float(lambda_weight),
+            batch_size=int(batch_size),
+            highpass_samples=int(highpass_samples),
+            use_weight=bool(use_weight),
+            inputs=torch.stack(inputs),
+            base_ai=torch.stack(base_ai),
+            taper=torch.stack(taper),
+            target_high_log_ai=torch.from_numpy(target),
+            mask_weight=torch.from_numpy(weights),
+            flat_indices=np.asarray(prior.flat_indices[rows], dtype=np.int64),
+            well_names=np.asarray(prior.well_names[rows]).astype(str),
+        )
+        logger.info(
+            "Well high-frequency anchor enabled: wells=%d, lambda=%.3e, highpass_samples=%d",
+            len(rows),
+            float(lambda_weight),
+            int(highpass_samples),
+        )
+        return anchor
+
+    def sample_rows(self, *, training: bool) -> np.ndarray:
+        n_rows = int(self.inputs.shape[0])
+        if self.batch_size <= 0 or self.batch_size >= n_rows:
+            return np.arange(n_rows, dtype=np.int64)
+        if training:
+            return np.random.choice(n_rows, size=self.batch_size, replace=False).astype(np.int64)
+        return np.arange(min(self.batch_size, n_rows), dtype=np.int64)
+
+    def compute_loss(
+        self,
+        *,
+        model: torch.nn.Module,
+        device: torch.device,
+        training: bool,
+        ai_min: float,
+        ai_max: float,
+        zero_delta_outside_mask: bool,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        rows_np = self.sample_rows(training=training)
+        if rows_np.size == 0:
+            return _zero_well_high_anchor_metrics(device)
+        rows = torch.from_numpy(rows_np).long()
+        x = self.inputs[rows].to(device)
+        base_ai = _ensure_trace_channel(self.base_ai[rows].to(device), name="base_ai")
+        taper = _ensure_trace_channel(self.taper[rows].to(device), name="taper")
+        target = self.target_high_log_ai[rows].to(device)
+        mask_weight = self.mask_weight[rows].to(device)
+
+        pred_delta = _ensure_trace_channel(model(x), name="pred_delta")
+        if zero_delta_outside_mask:
+            pred_delta = pred_delta * taper.to(device, dtype=pred_delta.dtype)
+        enhanced_ai = compose_enhanced_ai(base_ai, pred_delta, ai_min=ai_min, ai_max=ai_max)
+        enhanced_ai_trace = _ensure_trace_channel(enhanced_ai, name="enhanced_ai")[:, 0, :]
+        enhanced_log_ai = torch.log(torch.clamp(enhanced_ai_trace, min=1e-6))
+        enhanced_high = enhanced_log_ai - _moving_average_1d(enhanced_log_ai.unsqueeze(1), self.highpass_samples).squeeze(1)
+        raw_loss = F.smooth_l1_loss(enhanced_high, target, reduction="none")
+        denom = mask_weight.sum().clamp(min=1.0)
+        loss = (raw_loss * mask_weight).sum() / denom
+        term = self.lambda_weight * loss
+        return term, {
+            "well_high_anchor": float(loss.detach().cpu().item()),
+            "well_high_anchor_term": float(term.detach().cpu().item()),
+            "well_high_anchor_traces": float(rows_np.size),
+        }
+
+
+def _as_float_tensor(value: Any) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().float()
+    return torch.from_numpy(np.asarray(value)).float()
+
+
+def _ensure_trace_channel(value: torch.Tensor, *, name: str) -> torch.Tensor:
+    if value.ndim == 2:
+        return value.unsqueeze(1)
+    if value.ndim == 3 and value.shape[1] == 1:
+        return value
+    raise ValueError(f"{name} must have shape (batch, samples) or (batch, 1, samples), got {tuple(value.shape)}.")
+
+
+def _zero_well_high_anchor_metrics(device: torch.device) -> tuple[torch.Tensor, dict[str, float]]:
+    zero = torch.zeros((), device=device)
+    return zero, {
+        "well_high_anchor": 0.0,
+        "well_high_anchor_term": 0.0,
+        "well_high_anchor_traces": 0.0,
+    }
 
 def _initialize_metrics_csv(path: Path) -> None:
     _initialize_csv(path, METRICS_FIELDNAMES)

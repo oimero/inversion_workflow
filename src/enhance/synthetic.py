@@ -28,7 +28,7 @@ __all__ = [
     "random_reflectivity",
     "random_reflectivity_in_taper",
     "reflectivity_to_log_ai",
-    "sample_highres_well_patch",
+    "sample_highres_prior_patch",
     "summary_or_percentile",
     "true_runs",
     "valid_prior_rows",
@@ -110,23 +110,23 @@ def valid_prior_rows(prior: WellResolutionPriorBundle) -> list[int]:
 
 def summary_or_percentile(prior: WellResolutionPriorBundle, key: str, percentile: float) -> float:
     """Read a residual summary statistic, falling back to a percentile of prior values."""
-    highres_summary_value = prior.summary.get("highres_residual", {}).get(key)
+    highres_summary_value = prior.summary.get("highres_well_high_log_ai", {}).get(key)
     if highres_summary_value is not None and np.isfinite(float(highres_summary_value)):
         return float(highres_summary_value)
-    summary_value = prior.summary.get("residual", {}).get(key)
+    summary_value = prior.summary.get("well_high_log_ai", {}).get(key)
     if summary_value is not None and np.isfinite(float(summary_value)):
         return float(summary_value)
-    values = prior.highres_residual_log_ai[prior.highres_well_mask]
+    values = prior.highres_well_high_log_ai[prior.highres_well_mask]
     values = values[np.isfinite(values)]
     if values.size == 0:
-        values = prior.residual_log_ai[prior.well_mask]
+        values = prior.well_high_log_ai[prior.well_mask]
     values = values[np.isfinite(values)]
     if values.size == 0:
         return 1e-3
     return float(np.percentile(np.abs(values), percentile))
 
 
-def sample_highres_well_patch(
+def sample_highres_prior_patch(
     prior: WellResolutionPriorBundle,
     well_rows: list[int],
     target_depth: np.ndarray,
@@ -135,8 +135,9 @@ def sample_highres_well_patch(
     *,
     min_len_samples: int,
     max_attempts: int = 32,
+    values_key: str = "highres_well_high_log_ai",
 ) -> tuple[np.ndarray, int, int, np.ndarray] | None:
-    """Sample a native high-resolution well residual patch into a target high-res axis."""
+    """Sample a native high-resolution prior patch into a target high-res axis."""
     target_depth_1d = np.asarray(target_depth, dtype=np.float32).reshape(-1)
     active = np.asarray(taper, dtype=np.float32).reshape(-1) > 0.0
     if active.shape != target_depth_1d.shape:
@@ -181,7 +182,7 @@ def sample_highres_well_patch(
         row_idx = int(np.random.choice(candidate_rows))
         row_mask = np.asarray(prior.highres_well_mask[row_idx], dtype=bool)
         row_depth = np.asarray(prior.highres_depth[row_idx], dtype=np.float32)
-        row_residual = np.asarray(prior.highres_residual_log_ai[row_idx], dtype=np.float32)
+        row_residual = np.asarray(getattr(prior, values_key)[row_idx], dtype=np.float32)
         valid = row_mask & np.isfinite(row_depth) & np.isfinite(row_residual)
         for src_start, src_stop in np.random.permutation(true_runs(valid)).tolist():
             src_depth = row_depth[src_start:src_stop]

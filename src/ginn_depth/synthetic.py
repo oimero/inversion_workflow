@@ -31,7 +31,7 @@ from enhance.synthetic import (
     markov_thin_bed_packet,
     random_reflectivity_in_taper,
     reflectivity_to_log_ai,
-    sample_highres_well_patch,
+    sample_highres_prior_patch,
     summary_or_percentile,
     true_runs,
     valid_prior_rows,
@@ -39,7 +39,6 @@ from enhance.synthetic import (
 from ginn_depth.physics import DepthForwardModel
 
 SyntheticVelocityMode = Literal["lfm_vp", "from_ai_linear", "blend"]
-WellGuidedMode = Literal["well_patch", "unresolved_cluster"]
 DeltaSupervisionMask = Literal["core", "loss"]
 
 
@@ -176,8 +175,6 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         num_examples: int,
         ai_min: float,
         ai_max: float,
-        patch_fraction: float = 0.70,
-        unresolved_fraction: float = 0.30,
         well_patch_scale_min: float = 0.35,
         well_patch_scale_max: float = 0.80,
         cluster_min_events: int = 2,
@@ -188,7 +185,6 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         unresolved_oversample_factor: int = 6,
         default_main_lobe_samples: int = 12,
         residual_max_abs: float | None = None,
-        residual_highpass_samples: int = 31,
         seismic_rms_match: bool = True,
         seismic_rms_target: float = 1.0,
         seismic_rms_scale_min: float = 0.5,
@@ -215,8 +211,6 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         if num_examples <= 0:
             raise ValueError(f"num_examples must be positive, got {num_examples}.")
         validate_ai_bounds(ai_min, ai_max)
-        if patch_fraction < 0.0 or unresolved_fraction < 0.0 or patch_fraction + unresolved_fraction <= 0.0:
-            raise ValueError("patch_fraction and unresolved_fraction must be non-negative with positive sum.")
         if well_patch_scale_min < 0.0 or well_patch_scale_max < well_patch_scale_min:
             raise ValueError("well patch scale bounds are invalid.")
         if cluster_min_events < 1 or cluster_max_events < cluster_min_events:
@@ -227,8 +221,6 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             raise ValueError("unresolved_oversample_factor must be >= 1.")
         if default_main_lobe_samples < 1:
             raise ValueError("default_main_lobe_samples must be positive.")
-        if residual_highpass_samples < 3:
-            raise ValueError("residual_highpass_samples must be >= 3.")
         if seismic_rms_target <= 0.0:
             raise ValueError("seismic_rms_target must be positive.")
         if seismic_rms_scale_min <= 0.0 or seismic_rms_scale_max < seismic_rms_scale_min:
@@ -270,8 +262,6 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         self.num_examples = int(num_examples)
         self.ai_min = float(ai_min)
         self.ai_max = float(ai_max)
-        self.patch_fraction = float(patch_fraction)
-        self.unresolved_fraction = float(unresolved_fraction)
         self.well_patch_scale_min = float(well_patch_scale_min)
         self.well_patch_scale_max = float(well_patch_scale_max)
         self.cluster_min_events = int(cluster_min_events)
@@ -282,7 +272,6 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             cluster_main_lobe_samples if cluster_main_lobe_samples is not None else default_main_lobe_samples
         )
         self.unresolved_oversample_factor = int(unresolved_oversample_factor)
-        self.residual_highpass_samples = int(residual_highpass_samples)
         self.seismic_rms_match = bool(seismic_rms_match)
         self.seismic_rms_target = float(seismic_rms_target)
         self.seismic_rms_scale_min = float(seismic_rms_scale_min)
@@ -308,10 +297,10 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
 
         self._vp_clip_min, self._vp_clip_max = _estimate_velocity_clip(base_dataset)
         self._depth_axis_m = _extract_forward_depth_axis(forward_model)
-        self._prior_values = self.prior.highres_residual_log_ai[self.prior.highres_well_mask]
+        self._prior_values = self.prior.highres_well_high_log_ai[self.prior.highres_well_mask]
         self._prior_values = self._prior_values[np.isfinite(self._prior_values)]
         if self._prior_values.size == 0:
-            raise ValueError("Well resolution prior contains no finite residual values.")
+            raise ValueError("Well resolution prior contains no finite high-frequency values.")
         self.residual_abs_p95 = summary_or_percentile(self.prior, "abs_p95", 95.0)
         self.residual_abs_p99 = summary_or_percentile(self.prior, "abs_p99", 99.0)
         self.residual_max_abs = float(residual_max_abs or max(self.residual_abs_p99, self.residual_abs_p95, 1e-3))
@@ -364,29 +353,13 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         highres_base_ai = np.interp(highres_depth, depth, safe_base_ai).astype(np.float32)
         taper_hi = np.interp(highres_depth, depth, taper).astype(np.float32)
         support_hi = np.interp(highres_depth, depth, delta_loss_mask.astype(np.float32)) >= 0.5
-        mode = self._sample_mode()
-        if mode == "well_patch":
-            highres_residual = self._sample_highres_well_patch_residual(highres_depth, taper_hi, support_hi, factor)
-            mode_code = 0
-            if highres_residual is None:
-                highres_residual = self._sample_unresolved_cluster_residual(
-                    highres_depth,
-                    taper_hi,
-                    support_hi,
-                    factor,
-                )
-                mode_code = 1
-        else:
-            highres_residual = self._sample_unresolved_cluster_residual(
-                highres_depth,
-                taper_hi,
-                support_hi,
-                factor,
-            )
-            mode_code = 1
-            if highres_residual is None:
-                highres_residual = self._sample_highres_well_patch_residual(highres_depth, taper_hi, support_hi, factor)
-                mode_code = 0
+        highres_residual = self._sample_unresolved_cluster_residual(
+            highres_depth,
+            taper_hi,
+            support_hi,
+            factor,
+        )
+        mode_code = 1
         synthetic_empty_residual = highres_residual is None
         if highres_residual is None:
             highres_residual = np.zeros_like(highres_depth, dtype=np.float32)
@@ -567,42 +540,6 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
 
         return True
 
-    def _sample_mode(self) -> WellGuidedMode:
-        p_patch = self.patch_fraction / (self.patch_fraction + self.unresolved_fraction)
-        return "well_patch" if float(np.random.random()) < p_patch else "unresolved_cluster"
-
-    def _sample_highres_well_patch_residual(
-        self,
-        highres_depth: np.ndarray,
-        taper_hi: np.ndarray,
-        support_hi: np.ndarray,
-        factor: int,
-    ) -> np.ndarray | None:
-        patch_window = sample_highres_well_patch(
-            self.prior,
-            self._well_rows,
-            highres_depth,
-            taper_hi,
-            support_hi,
-            min_len_samples=8 * max(1, int(factor)),
-        )
-        if patch_window is None:
-            return None
-
-        placed, dst0, dst1, _ = patch_window
-        length = max(0, int(dst1) - int(dst0))
-        if length <= 0:
-            return None
-        local = placed[dst0:dst1].astype(np.float32, copy=True)
-        local -= float(np.mean(local))
-        local *= float(np.random.uniform(self.well_patch_scale_min, self.well_patch_scale_max))
-        window = max(3, int(self.residual_highpass_samples) * max(1, int(factor)))
-        local = highpass_log_ai_residual(local, window=window, max_abs=self.residual_max_abs)
-        local *= edge_taper(length)
-        residual = np.zeros_like(highres_depth, dtype=np.float32)
-        residual[dst0:dst1] = local
-        return residual
-
     def _sample_unresolved_cluster_residual(
         self,
         highres_depth: np.ndarray,
@@ -622,13 +559,14 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
             return None
 
         main_lobe = max(4, min(self.cluster_main_lobe_samples, max(1, n_highres // max(1, int(factor)))))
-        patch_window = sample_highres_well_patch(
+        patch_window = sample_highres_prior_patch(
             self.prior,
             self._well_rows,
             highres_depth,
             taper_1d,
             support,
             min_len_samples=max(main_lobe * 2, 16) * max(1, int(factor)),
+            values_key="highres_well_high_log_ai",
         )
         if patch_window is None:
             return None

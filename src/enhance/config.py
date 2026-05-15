@@ -34,22 +34,21 @@ class EnhancementConfig:
     resolution_prior_file: Path = Path("your_well_resolution_prior.npz")  # 井分辨率残差先验。
 
     # ── 合成样本分布 ─────────────────────────────────────────
-    # 每个 epoch 在线随机生成 synthetic traces。well_patch 从井的高分辨率
-    # residual 片段生成 target；unresolved_cluster 在高采样轴上加入薄互层
-    # packet。两者都经 highres forward 后降回训练采样。
+    # 每个 epoch 在线随机生成 synthetic traces。stage-2 井间训练只使用
+    # unresolved_cluster；well_patch 参数保留为旧配置占位，加载后会固定为 0。
     synthetic_traces_per_epoch: int = 2048  # 每个 epoch 生成的 synthetic 道数。
     synthetic_batch_size: int | None = None  # 为空时使用 batch_size。
-    synthetic_patch_fraction: float = 0.7  # 井残差 patch 样本占比权重。
-    synthetic_unresolved_fraction: float = 0.3  # 不可分辨薄互层样本占比权重。
-    synthetic_well_patch_scale_min: float = 0.35  # 井残差 patch 随机缩放下界。
-    synthetic_well_patch_scale_max: float = 0.80  # 井残差 patch 随机缩放上界。
+    synthetic_patch_fraction: float = 0.0  # 旧 well_patch 占位；加载后固定为 0。
+    synthetic_unresolved_fraction: float = 1.0  # unresolved_cluster 样本占比权重；加载后固定为 1。
+    synthetic_well_patch_scale_min: float = 0.35  # 高频 prior patch 随机缩放下界。
+    synthetic_well_patch_scale_max: float = 0.80  # 高频 prior patch 随机缩放上界。
     synthetic_cluster_min_events: int = 2  # 单个薄互层 packet 的最少跳变数。
     synthetic_cluster_max_events: int = 5  # 单个薄互层 packet 的最多跳变数。
     synthetic_cluster_amp_abs_p95_min: float = 0.45  # 薄互层振幅下界，按井残差 abs-p95 缩放。
     synthetic_cluster_amp_abs_p99_max: float = 1.00  # 薄互层振幅上界，按井残差 abs-p99 缩放。
     synthetic_cluster_main_lobe_samples: int | None = None  # 为空时使用合成器默认主瓣宽度。
     synthetic_unresolved_oversample_factor: int = 6  # 薄互层内部高采样倍数。
-    synthetic_residual_highpass_samples: int = 31  # well_patch 残差高通窗口。
+    synthetic_residual_highpass_samples: int = 31  # deprecated: 旧 well_patch 残差高通窗口，不再参与训练。
 
     # ── 合成样本 QC 与监督区域 ───────────────────────────────
     # delta_supervision_mask 控制 synthetic delta 放置和 delta loss 的区域。
@@ -107,6 +106,10 @@ class EnhancementConfig:
     delta_rms_floor: float = 0.9  # underfit 惩罚触发比例。
     delta_lowpass_samples: int = 17  # lowpass 对比窗口。
     delta_highpass_samples: int = 7  # highpass 对比窗口。
+    lambda_well_high_anchor: float = 0.5  # 真实井高频 log-AI anchor 权重；0 表示关闭。
+    well_high_anchor_batch_size: int = 0  # 每步抽取井数；0 表示全部井。
+    well_high_anchor_highpass_samples: int | None = None  # 为空时复用 delta_highpass_samples。
+    well_high_anchor_use_weight: bool = True  # 是否使用 prior well_weight。
 
     # ── 优化与运行时 ────────────────────────────────────────
     # 常规 Adam 训练参数和 DataLoader/checkpoint 输出设置。Windows 下
@@ -147,6 +150,8 @@ class EnhancementConfig:
             )
         if self.synthetic_traces_per_epoch <= 0:
             raise ValueError("synthetic_traces_per_epoch must be positive.")
+        self.synthetic_patch_fraction = 0.0
+        self.synthetic_unresolved_fraction = 1.0
         if self.synthetic_batch_size is not None and self.synthetic_batch_size <= 0:
             raise ValueError("synthetic_batch_size must be positive when provided.")
         if self.synthetic_min_base_target_waveform_corr is not None and not (
@@ -188,11 +193,18 @@ class EnhancementConfig:
             "lambda_delta_highpass",
             "lambda_delta_rms",
             "lambda_delta_rms_underfit",
+            "lambda_well_high_anchor",
         ):
             if getattr(self, name) < 0.0:
                 raise ValueError(f"{name} must be non-negative.")
         if self.delta_lowpass_samples < 1 or self.delta_highpass_samples < 1:
             raise ValueError("delta low/high-pass windows must be positive.")
+        if self.well_high_anchor_batch_size < 0:
+            raise ValueError("well_high_anchor_batch_size must be non-negative.")
+        if self.well_high_anchor_highpass_samples is None:
+            self.well_high_anchor_highpass_samples = self.delta_highpass_samples
+        if self.well_high_anchor_highpass_samples < 1:
+            raise ValueError("well_high_anchor_highpass_samples must be positive.")
         if self.delta_supervision_mask not in ("core", "loss"):
             raise ValueError(f"delta_supervision_mask={self.delta_supervision_mask!r} must be one of ['core', 'loss'].")
 

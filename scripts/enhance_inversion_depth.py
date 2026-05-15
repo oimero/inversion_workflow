@@ -667,7 +667,7 @@ def main() -> None:
                     lw=1.6,
                     color="blue",
                 )
-                ax.plot(pred_ai[valid], sample_axis_m[valid], label="Enhance predicted AI", lw=2, color="red")
+                ax.plot(pred_ai[valid], sample_axis_m[valid], label="Enhanced predicted AI", lw=2, color="red")
                 ax.invert_yaxis()
                 ax.set_xlabel("AI")
                 ax.set_ylabel("Depth (m)")

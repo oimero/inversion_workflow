@@ -48,6 +48,9 @@ from cup.utils.io import (  # noqa: E402
 )
 from ginn_depth.config import DepthGINNConfig  # noqa: E402
 from ginn_depth.trainer import Trainer  # noqa: E402
+from wtie.optimize import tie as tie_utils  # noqa: E402
+from wtie.optimize.logs import filter_log  # noqa: E402
+from wtie.processing import grid  # noqa: E402
 from wtie.processing.spectral import apply_butter_lowpass_filter  # noqa: E402
 
 # =============================================================================
@@ -166,25 +169,206 @@ def _bilinear_trace_from_volume(volume: np.ndarray, survey_ctx: Any, x: float, y
     return (1.0 - wi) * (1.0 - wj) * t00 + (1.0 - wi) * wj * t01 + wi * (1.0 - wj) * t10 + wi * wj * t11
 
 
-def _read_ai_from_shifted_las(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Read (md_m, ai) from a shifted LAS. Uses AI curve directly if present, else VP*RHO."""
+def _find_curve_column(columns: pd.Index, candidates: tuple[str, ...]) -> Any | None:
+    normalized = {str(col).strip().upper(): col for col in columns}
+    for candidate in candidates:
+        if candidate in normalized:
+            return normalized[candidate]
+    return None
+
+
+def _read_shifted_las_ai_curves(
+    path: Path,
+    *,
+    log_filter_params: dict[str, float | int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Read shifted LAS raw AI and the same log-filtered AI used by well constraints."""
     las = lasio.read(path)
     df = las.df()
     md = df.index.to_numpy(dtype=float)
-    for col in df.columns:
-        if str(col).strip().upper() == "AI":
-            return md, df[col].to_numpy(dtype=float)
-    vp_col = rho_col = None
-    for col in df.columns:
-        name = str(col).strip().upper()
-        if name in ("VP_MPS", "VP"):
-            vp_col = col
-        elif name in ("RHO_GCC", "RHO"):
-            rho_col = col
-    if vp_col is None or rho_col is None:
+    ai_col = _find_curve_column(df.columns, ("AI",))
+    vp_col = _find_curve_column(df.columns, ("VP_MPS", "VP"))
+    rho_col = _find_curve_column(df.columns, ("RHO_GCC", "RHO"))
+
+    if ai_col is not None:
+        raw_ai = df[ai_col].to_numpy(dtype=float)
+    elif vp_col is not None and rho_col is not None:
+        raw_ai = df[vp_col].to_numpy(dtype=float) * df[rho_col].to_numpy(dtype=float)
+    else:
         raise ValueError(f"Shifted LAS {path.name} must contain AI or VP+RHO curves.")
-    ai = df[vp_col].to_numpy(dtype=float) * df[rho_col].to_numpy(dtype=float)
-    return md, ai
+
+    median_size = int(log_filter_params["logs_median_size"])
+    threshold = float(log_filter_params["logs_median_threshold"])
+    std = float(log_filter_params["logs_std"])
+
+    if vp_col is not None and rho_col is not None:
+        vp = df[vp_col].to_numpy(dtype=float)
+        rho = df[rho_col].to_numpy(dtype=float)
+        logset = grid.LogSet(
+            {
+                "Vp": grid.Log(vp, md, "md", name="Vp", unit="m/s"),
+                "Rho": grid.Log(rho, md, "md", name="Rho", unit="g/cm3"),
+            }
+        )
+        filtered = tie_utils.filter_md_logs(
+            logset,
+            median_size=median_size,
+            threshold=threshold,
+            std=std,
+            std2=0.8 * std,
+        )
+        filtered_ai = filtered.Vp.values * filtered.Rho.values
+    elif ai_col is not None:
+        ai_log = grid.Log(raw_ai, md, "md", name="AI", unit="m/s*g/cm3")
+        filtered_log = filter_log(
+            ai_log,
+            median_size=median_size,
+            threshold=threshold,
+            std=std,
+            std2=0.8 * std,
+        )
+        filtered_ai = filtered_log.values
+    else:
+        raise ValueError(f"Shifted LAS {path.name} must contain AI or VP+RHO curves.")
+
+    return md, raw_ai, np.asarray(filtered_ai, dtype=float)
+
+
+def _load_auto_tie_log_filter_params(cfg: dict[str, Any]) -> dict[str, float | int]:
+    batch_cfg = cfg.get("wavelet_batch_synthetic_depth", {})
+    if not batch_cfg:
+        raise ValueError("Missing 'wavelet_batch_synthetic_depth' section for log filter parameters.")
+
+    source_well_name = str(batch_cfg.get("source_well_name", ""))
+    source_auto_tie_dir = batch_cfg.get("source_auto_tie_dir")
+    source_run_summary: dict[str, Any] = {}
+    if source_well_name and source_auto_tie_dir is not None:
+        source_dir = resolve_relative_path(str(source_auto_tie_dir), root=REPO_ROOT)
+        candidates = [
+            source_dir / f"run_summary_{source_well_name}.json",
+            source_dir / f"run_summary_auto_well_tie_{source_well_name}.json",
+        ]
+        summary_path = next((path for path in candidates if path.exists()), None)
+        if summary_path is not None:
+            source_run_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+    params = {
+        key: source_run_summary.get("auto_tie_best_parameters", {}).get(key)
+        for key in ("logs_median_size", "logs_median_threshold", "logs_std")
+    }
+    if any(value is None for value in params.values()):
+        fallback = batch_cfg.get("fallback_log_filter", {})
+        params = {
+            "logs_median_size": fallback.get("logs_median_size"),
+            "logs_median_threshold": fallback.get("logs_median_threshold"),
+            "logs_std": fallback.get("logs_std"),
+        }
+    if any(value is None for value in params.values()):
+        raise ValueError("Missing auto-tie log filter parameters and fallback_log_filter.")
+    return {
+        "logs_median_size": int(params["logs_median_size"]),
+        "logs_median_threshold": float(params["logs_median_threshold"]),
+        "logs_std": float(params["logs_std"]),
+    }
+
+
+def _regularize_depth_curve(depth: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    depth = np.asarray(depth, dtype=float)
+    values = np.asarray(values, dtype=float)
+    valid = np.isfinite(depth) & np.isfinite(values) & (values > 0.0)
+    if int(valid.sum()) < 2:
+        raise ValueError("depth curve has too few finite positive samples")
+    depth = depth[valid]
+    values = values[valid]
+    order = np.argsort(depth)
+    depth = depth[order]
+    values = values[order]
+    unique_depth, unique_idx = np.unique(depth, return_index=True)
+    unique_values = values[unique_idx]
+    if unique_depth.size < 2:
+        raise ValueError("depth curve has too few unique samples")
+    return unique_depth, unique_values
+
+
+def _resolve_frequency_split_params(cfg: dict[str, Any], lfm_metadata: dict[str, Any]) -> dict[str, Any]:
+    script_cfg = cfg.get("well_constraints_depth", {})
+    enabled = bool(script_cfg.get("frequency_split_enabled", True))
+    buffer_mode = str(script_cfg.get("frequency_split_buffer_mode", "reflect")).strip().lower()
+    if buffer_mode not in {"reflect", "symmetric", "edge"}:
+        raise ValueError("well_constraints_depth.frequency_split_buffer_mode must be reflect, symmetric, or edge.")
+    if not enabled:
+        return {
+            "enabled": False,
+            "cutoff_wavelength_m": None,
+            "filter_order": None,
+            "buffer_mode": buffer_mode,
+            "frequency_split_parameter_source": "disabled",
+        }
+
+    cutoff_value = script_cfg.get("frequency_split_cutoff_wavelength_m")
+    order_value = script_cfg.get("frequency_split_filter_order")
+    cutoff_source = "config"
+    order_source = "config"
+    if cutoff_value is None:
+        cutoff_value = lfm_metadata.get("filter_cutoff_wavelength_m")
+        cutoff_source = "lfm_metadata"
+    if order_value is None:
+        order_value = lfm_metadata.get("filter_order")
+        order_source = "lfm_metadata"
+    if cutoff_value is None or order_value is None:
+        raise ValueError(
+            "Missing frequency split parameters: set well_constraints_depth.frequency_split_cutoff_wavelength_m "
+            "and frequency_split_filter_order, or provide filter_cutoff_wavelength_m/filter_order in AI LFM metadata."
+        )
+
+    cutoff = float(cutoff_value)
+    order = int(order_value)
+    if cutoff <= 0.0 or not np.isfinite(cutoff):
+        raise ValueError(f"frequency split cutoff wavelength must be positive, got {cutoff_value!r}.")
+    if order <= 0 or order % 2 != 0:
+        raise ValueError(f"frequency split filter_order must be a positive even integer, got {order_value!r}.")
+    parameter_source = "config" if cutoff_source == "config" or order_source == "config" else "lfm_metadata"
+    return {
+        "enabled": True,
+        "cutoff_wavelength_m": cutoff,
+        "filter_order": order,
+        "buffer_mode": buffer_mode,
+        "frequency_split_parameter_source": parameter_source,
+    }
+
+
+def _lowpass_ai_curve(depth: np.ndarray, ai: np.ndarray, split_params: dict[str, Any]) -> np.ndarray:
+    depth = np.asarray(depth, dtype=float)
+    ai = np.asarray(ai, dtype=float)
+    if depth.shape != ai.shape:
+        raise ValueError("depth and AI curve must have matching shapes.")
+    if not bool(split_params.get("enabled", True)):
+        return ai.astype(np.float32, copy=True)
+
+    dz_values = np.diff(depth)
+    dz_values = dz_values[np.isfinite(dz_values) & (dz_values > 0.0)]
+    if dz_values.size == 0:
+        raise ValueError("Cannot resolve positive sample step for frequency split.")
+    dz = float(np.median(dz_values))
+    fs = 1.0 / dz
+    highcut = 1.0 / float(split_params["cutoff_wavelength_m"])
+    if highcut >= 0.5 * fs:
+        raise ValueError(
+            f"frequency split cutoff wavelength={split_params['cutoff_wavelength_m']} m is above Nyquist for dz={dz:.6g} m."
+        )
+    order = int(split_params["filter_order"])
+    if ai.size <= max(3, order):
+        return ai.astype(np.float32, copy=True)
+    pad_samples = min(max(1, 3 * order), ai.size - 1)
+    padded = np.pad(ai.astype(np.float64), (pad_samples, pad_samples), mode=str(split_params.get("buffer_mode", "reflect")))
+    filtered = apply_butter_lowpass_filter(
+        padded,
+        highcut,
+        fs,
+        order=order,
+        zero_phase=True,
+    )[pad_samples : pad_samples + ai.size]
+    return np.clip(filtered, 1e-6, None).astype(np.float32)
 
 
 def _save_prediction_npz(
@@ -392,6 +576,12 @@ def main() -> None:
         sample_axis_m = _sample_axis_depth_m(trainer.geometry)
         well_heads = import_well_heads_petrel(well_heads_file)
         well_heads = well_heads.assign(Name_norm=well_heads["Name"].astype(str).str.upper())
+        log_filter_params = _load_auto_tie_log_filter_params(cfg)
+        split_params = _resolve_frequency_split_params(cfg, trainer.dataset_bundle.lfm_metadata)
+        well_constraints_cfg = cfg.get("well_constraints_depth", {})
+        las_ai_source = str(well_constraints_cfg.get("las_ai_source", "filtered_shifted_las")).strip().lower()
+        if las_ai_source not in {"filtered_shifted_las", "raw_shifted_las"}:
+            raise ValueError("well_constraints_depth.las_ai_source must be filtered_shifted_las or raw_shifted_las.")
 
         metrics: list[dict[str, Any]] = []
         for las_path in sorted(shifted_las_dir.glob("*.las")):
@@ -404,39 +594,16 @@ def main() -> None:
             try:
                 head = head_match.iloc[0]
                 kb_m = float(head["Well datum value"])
-                md, ai = _read_ai_from_shifted_las(las_path)
+                md, ai_raw, ai_filtered = _read_shifted_las_ai_curves(
+                    las_path,
+                    log_filter_params=log_filter_params,
+                )
                 tvdss = np.asarray(md, dtype=float) - kb_m
-                valid_md = np.isfinite(tvdss) & np.isfinite(ai) & (ai > 0.0)
-                if int(valid_md.sum()) < 2:
-                    raise ValueError("too few finite positive AI samples after MD→TVDSS")
-                ref_depth = tvdss[valid_md]
-                ref_ai = ai[valid_md]
-                order = np.argsort(ref_depth)
-                ref_depth = ref_depth[order]
-                ref_ai = ref_ai[order]
-                unique_depth, unique_idx = np.unique(ref_depth, return_index=True)
-                ref_depth = ref_depth[unique_idx]
-                ref_ai = ref_ai[unique_idx]
-
-                # 低通滤波参考 AI（与训练井约束一致，只比较低频基线）
-                lfm_meta = trainer.dataset_bundle.lfm_metadata
-                lp_cutoff = float(lfm_meta.get("filter_cutoff_wavelength_m", 250.0))
-                lp_order = int(lfm_meta.get("filter_order", 6))
-                ref_ai_lp = ref_ai.copy()
-                if lp_cutoff > 0.0:
-                    dz_las = float(np.median(np.diff(ref_depth)))
-                    if dz_las > 0.0:
-                        fs_las = 1.0 / dz_las
-                        highcut = 1.0 / lp_cutoff
-                        pad_las = max(1, int(np.ceil(3.0 * lp_order * dz_las)))
-                        valid_lp = np.isfinite(ref_ai) & (ref_ai > 0.0)
-                        if int(valid_lp.sum()) >= 2:
-                            values = ref_ai.astype(np.float64)
-                            padded = np.pad(values, (pad_las, pad_las), mode="reflect")
-                            filtered = apply_butter_lowpass_filter(
-                                padded, highcut, fs_las, order=lp_order, zero_phase=True,
-                            )
-                            ref_ai_lp = filtered[pad_las:pad_las + values.size].astype(np.float32)
+                ref_depth_raw, ref_ai_raw = _regularize_depth_curve(tvdss, ai_raw)
+                source_ai = ai_filtered if las_ai_source == "filtered_shifted_las" else ai_raw
+                ref_depth_anchor, ref_ai_anchor_source = _regularize_depth_curve(tvdss, source_ai)
+                ref_ai_anchor = _lowpass_ai_curve(ref_depth_anchor, ref_ai_anchor_source, split_params)
+                raw_on_anchor = np.interp(ref_depth_anchor, ref_depth_raw, ref_ai_raw, left=np.nan, right=np.nan)
 
                 pred_trace = _bilinear_trace_from_volume(
                     pred_volume,
@@ -444,30 +611,43 @@ def main() -> None:
                     float(head["Surface X"]),
                     float(head["Surface Y"]),
                 )
-                pred_ai = np.interp(ref_depth, sample_axis_m, pred_trace, left=np.nan, right=np.nan)
-                valid = np.isfinite(pred_ai) & np.isfinite(ref_ai_lp)
+                pred_ai = np.interp(ref_depth_anchor, sample_axis_m, pred_trace, left=np.nan, right=np.nan)
+                valid = np.isfinite(pred_ai) & np.isfinite(ref_ai_anchor)
                 if not np.any(valid):
                     raise ValueError("no overlapping finite samples")
 
-                diff = pred_ai[valid] - ref_ai_lp[valid]
-                corr = float(np.corrcoef(pred_ai[valid], ref_ai_lp[valid])[0, 1]) if int(valid.sum()) > 1 else np.nan
+                diff = pred_ai[valid] - ref_ai_anchor[valid]
+                corr = float(np.corrcoef(pred_ai[valid], ref_ai_anchor[valid])[0, 1]) if int(valid.sum()) > 1 else np.nan
                 safe_name = sanitize_filename(str(head["Name"]))
                 trace_qc_path = output_dirs["well_qc_traces"] / f"well_qc_{safe_name}.csv"
                 pd.DataFrame(
                     {
-                        "depth_m": ref_depth[valid],
-                        "shifted_las_ai": ref_ai[valid],
-                        "shifted_las_ai_lowpass": ref_ai_lp[valid],
+                        "depth_m": ref_depth_anchor[valid],
+                        "shifted_las_ai_raw": raw_on_anchor[valid],
+                        "stage1_anchor_ai": ref_ai_anchor[valid],
                         "predicted_ai": pred_ai[valid],
-                        "diff_ai": diff,
+                        "diff_ai_vs_stage1_anchor": diff,
                     }
                 ).to_csv(trace_qc_path, index=False)
 
                 qc_plot_path = output_dirs["well_qc_figures"] / f"well_qc_{safe_name}.png"
                 fig, ax = plt.subplots(figsize=(5, 10), constrained_layout=True)
-                ax.plot(ref_ai[valid], ref_depth[valid], label="Shifted LAS AI (raw)", lw=1, alpha=0.4, color="gray")
-                ax.plot(ref_ai_lp[valid], ref_depth[valid], label=f"Shifted LAS AI (LP {lp_cutoff:.0f}m)", lw=2, color="blue")
-                ax.plot(pred_ai[valid], ref_depth[valid], label="GINN-Depth predicted AI", lw=2, color="red")
+                plot_depth_min = float(ref_depth_anchor[valid][0])
+                plot_depth_max = float(ref_depth_anchor[valid][-1])
+                raw_plot_mask = (ref_depth_raw >= plot_depth_min) & (ref_depth_raw <= plot_depth_max)
+                anchor_label = "Stage-1 well anchor AI"
+                if bool(split_params.get("enabled", True)):
+                    anchor_label += f" (LP {float(split_params['cutoff_wavelength_m']):.0f}m)"
+                ax.plot(
+                    ref_ai_raw[raw_plot_mask],
+                    ref_depth_raw[raw_plot_mask],
+                    label="Shifted LAS AI (raw)",
+                    lw=0.8,
+                    alpha=0.35,
+                    color="gray",
+                )
+                ax.plot(ref_ai_anchor[valid], ref_depth_anchor[valid], label=anchor_label, lw=1.8, color="blue")
+                ax.plot(pred_ai[valid], ref_depth_anchor[valid], label="GINN-Depth predicted AI", lw=2, color="red")
                 ax.invert_yaxis()
                 ax.set_xlabel("AI")
                 ax.set_ylabel("Depth (m)")
@@ -486,6 +666,12 @@ def main() -> None:
                         "rmse": float(np.sqrt(np.mean(diff**2))),
                         "bias": float(np.mean(diff)),
                         "corr": corr,
+                        "reference_target": "stage1_anchor_ai",
+                        "las_ai_source": las_ai_source,
+                        "frequency_split_cutoff_wavelength_m": split_params.get("cutoff_wavelength_m"),
+                        "frequency_split_filter_order": split_params.get("filter_order"),
+                        "frequency_split_parameter_source": split_params.get("frequency_split_parameter_source"),
+                        "log_filter_params_json": json.dumps(log_filter_params, ensure_ascii=False),
                         "reference_file": las_path.name,
                         "trace_qc_path": str(trace_qc_path),
                         "figure_path": str(qc_plot_path),

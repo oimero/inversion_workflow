@@ -49,6 +49,7 @@ from ginn_depth.data import load_lfm_depth_npz  # noqa: E402
 from wtie.optimize import tie as tie_utils  # noqa: E402
 from wtie.optimize.logs import filter_log  # noqa: E402
 from wtie.processing import grid  # noqa: E402
+from wtie.processing.spectral import apply_butter_lowpass_filter  # noqa: E402
 
 # =============================================================================
 # CLI
@@ -184,7 +185,137 @@ def _load_auto_tie_log_filter_params(cfg: dict[str, Any]) -> dict[str, float | i
     }
 
 
-def _confidence_from_corr(corr: object, *, floor: float, span: float) -> float:
+def _resolve_frequency_split_params(script_cfg: dict[str, Any], lfm_metadata: dict[str, Any]) -> dict[str, Any]:
+    enabled = bool(script_cfg.get("frequency_split_enabled", True))
+    buffer_mode = str(script_cfg.get("frequency_split_buffer_mode", "reflect")).strip().lower()
+    if buffer_mode not in {"reflect", "symmetric", "edge"}:
+        raise ValueError("well_constraints_depth.frequency_split_buffer_mode must be reflect, symmetric, or edge.")
+    if not enabled:
+        return {
+            "enabled": False,
+            "cutoff_wavelength_m": None,
+            "filter_order": None,
+            "buffer_mode": buffer_mode,
+            "frequency_split_parameter_source": "disabled",
+            "cutoff_source": "disabled",
+            "filter_order_source": "disabled",
+        }
+
+    cutoff_value = script_cfg.get("frequency_split_cutoff_wavelength_m")
+    order_value = script_cfg.get("frequency_split_filter_order")
+    cutoff_source = "config"
+    order_source = "config"
+    if cutoff_value is None:
+        cutoff_value = lfm_metadata.get("filter_cutoff_wavelength_m")
+        cutoff_source = "lfm_metadata"
+    if order_value is None:
+        order_value = lfm_metadata.get("filter_order")
+        order_source = "lfm_metadata"
+    if cutoff_value is None or order_value is None:
+        raise ValueError(
+            "Missing frequency split parameters: set well_constraints_depth.frequency_split_cutoff_wavelength_m "
+            "and frequency_split_filter_order, or provide filter_cutoff_wavelength_m/filter_order in AI LFM metadata."
+        )
+
+    cutoff = float(cutoff_value)
+    order = int(order_value)
+    if cutoff <= 0.0 or not np.isfinite(cutoff):
+        raise ValueError(f"frequency split cutoff wavelength must be positive, got {cutoff_value!r}.")
+    if order <= 0 or order % 2 != 0:
+        raise ValueError(f"frequency split filter_order must be a positive even integer, got {order_value!r}.")
+    parameter_source = "config" if cutoff_source == "config" or order_source == "config" else "lfm_metadata"
+    return {
+        "enabled": True,
+        "cutoff_wavelength_m": cutoff,
+        "filter_order": order,
+        "buffer_mode": buffer_mode,
+        "frequency_split_parameter_source": parameter_source,
+        "cutoff_source": cutoff_source,
+        "filter_order_source": order_source,
+    }
+
+
+def _true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    values = np.asarray(mask, dtype=bool).reshape(-1)
+    if values.size == 0:
+        return []
+    padded = np.concatenate([[False], values, [False]])
+    changes = np.flatnonzero(padded[1:] != padded[:-1])
+    return [(int(changes[i]), int(changes[i + 1])) for i in range(0, changes.size, 2)]
+
+
+def _split_log_ai_frequency_bands(
+    depth: np.ndarray,
+    ai: np.ndarray,
+    mask: np.ndarray,
+    split_params: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    depth = np.asarray(depth, dtype=np.float64).reshape(-1)
+    ai = np.asarray(ai, dtype=np.float64).reshape(-1)
+    mask = np.asarray(mask, dtype=bool).reshape(-1) & np.isfinite(depth) & np.isfinite(ai) & (ai > 0.0)
+    if depth.shape != ai.shape or ai.shape != mask.shape:
+        raise ValueError("depth, ai, and mask must have matching 1D shapes for frequency split.")
+
+    well_log_ai = np.zeros_like(ai, dtype=np.float32)
+    well_low_ai = np.zeros_like(ai, dtype=np.float32)
+    well_low_log_ai = np.zeros_like(ai, dtype=np.float32)
+    well_high_log_ai = np.zeros_like(ai, dtype=np.float32)
+    well_log_ai[mask] = np.log(np.clip(ai[mask], 1e-6, None)).astype(np.float32)
+
+    if not bool(split_params.get("enabled", True)):
+        well_low_ai[mask] = ai[mask].astype(np.float32)
+    else:
+        if depth.size > 1:
+            dz_values = np.diff(depth[mask]) if np.count_nonzero(mask) > 1 else np.diff(depth)
+        else:
+            dz_values = np.asarray([], dtype=np.float64)
+        dz_values = dz_values[np.isfinite(dz_values) & (dz_values > 0.0)]
+        if dz_values.size == 0:
+            raise ValueError("Cannot resolve positive sample step for frequency split.")
+        dz = float(np.median(dz_values))
+        fs = 1.0 / dz
+        highcut = 1.0 / float(split_params["cutoff_wavelength_m"])
+        if highcut >= 0.5 * fs:
+            raise ValueError(
+                f"frequency split cutoff wavelength={split_params['cutoff_wavelength_m']} m is above Nyquist "
+                f"for dz={dz:.6g} m."
+            )
+        order = int(split_params["filter_order"])
+        pad_samples = max(1, 3 * order)
+        buffer_mode = str(split_params.get("buffer_mode", "reflect"))
+        for start, stop in _true_runs(mask):
+            values = ai[start:stop].astype(np.float64)
+            if values.size <= max(3, order):
+                filtered = values
+            else:
+                run_pad = min(pad_samples, values.size - 1)
+                padded = np.pad(values, (run_pad, run_pad), mode=buffer_mode)
+                filtered = apply_butter_lowpass_filter(
+                    padded,
+                    highcut,
+                    fs,
+                    order=order,
+                    zero_phase=True,
+                )[run_pad:run_pad + values.size]
+            well_low_ai[start:stop] = np.clip(filtered, 1e-6, None).astype(np.float32)
+
+    low_valid = mask & np.isfinite(well_low_ai) & (well_low_ai > 0.0)
+    well_low_log_ai[low_valid] = np.log(np.clip(well_low_ai[low_valid], 1e-6, None)).astype(np.float32)
+    well_high_log_ai[low_valid] = (well_log_ai[low_valid] - well_low_log_ai[low_valid]).astype(np.float32)
+    return {
+        "well_log_ai": well_log_ai,
+        "well_low_ai": well_low_ai,
+        "well_low_log_ai": well_low_log_ai,
+        "well_high_log_ai": well_high_log_ai,
+    }
+
+
+def _confidence_from_corr(corr: object, *, floor: float, span: float, mode: str = "corr") -> float:
+    mode = str(mode).strip().lower()
+    if mode == "uniform":
+        return 1.0
+    if mode != "corr":
+        raise ValueError("well_constraints_depth.confidence_weight_mode must be 'corr' or 'uniform'.")
     corr_value = _finite_float_or_nan(corr)
     if not np.isfinite(corr_value):
         return 0.0
@@ -255,6 +386,7 @@ def _build_highres_prior_trace(
     highres_ai: np.ndarray,
     depth_axis_m: np.ndarray,
     lfm_ai: np.ndarray,
+    split_params: dict[str, Any],
 ) -> dict[str, np.ndarray]:
     """Build high-resolution well/LFM residual arrays for one well."""
     lfm_interp = np.interp(highres_depth, depth_axis_m, lfm_ai, left=np.nan, right=np.nan)
@@ -263,16 +395,19 @@ def _build_highres_prior_trace(
     if int(mask.sum()) < 2:
         raise ValueError("Too few high-resolution AI samples overlap finite positive LFM samples.")
 
-    well_log_ai = np.zeros_like(highres_ai, dtype=np.float32)
+    split = _split_log_ai_frequency_bands(highres_depth, highres_ai, mask, split_params)
+    well_log_ai = split["well_log_ai"]
     lfm_log_ai = np.zeros_like(highres_ai, dtype=np.float32)
     residual_log_ai = np.zeros_like(highres_ai, dtype=np.float32)
-    well_log_ai[mask] = np.log(np.clip(highres_ai[mask], 1e-6, None)).astype(np.float32)
     lfm_log_ai[mask] = np.log(np.clip(lfm_interp[mask], 1e-6, None)).astype(np.float32)
     residual_log_ai[mask] = (well_log_ai[mask] - lfm_log_ai[mask]).astype(np.float32)
     return {
         "highres_depth": highres_depth.astype(np.float32, copy=False),
         "highres_well_ai": np.where(mask, highres_ai, 0.0).astype(np.float32),
         "highres_well_log_ai": well_log_ai,
+        "highres_well_low_ai": split["well_low_ai"],
+        "highres_well_low_log_ai": split["well_low_log_ai"],
+        "highres_well_high_log_ai": split["well_high_log_ai"],
         "highres_lfm_log_ai": lfm_log_ai,
         "highres_residual_log_ai": residual_log_ai,
         "highres_well_mask": mask.astype(bool),
@@ -356,6 +491,9 @@ def main() -> None:
 
     confidence_corr_floor = float(script_cfg.get("confidence_corr_floor", 0.3))
     confidence_corr_span = float(script_cfg.get("confidence_corr_span", 0.4))
+    confidence_weight_mode = str(script_cfg.get("confidence_weight_mode", "corr")).strip().lower()
+    if confidence_weight_mode not in {"corr", "uniform"}:
+        raise ValueError("well_constraints_depth.confidence_weight_mode must be 'corr' or 'uniform'.")
     las_ai_source = str(script_cfg.get("las_ai_source", "filtered_shifted_las")).strip().lower()
     if las_ai_source not in {"filtered_shifted_las", "raw_shifted_las"}:
         raise ValueError("well_constraints_depth.las_ai_source must be 'filtered_shifted_las' or 'raw_shifted_las'.")
@@ -369,15 +507,18 @@ def main() -> None:
         "xstep": segy_cfg["xstep"],
     }
 
+    ai_lfm = load_lfm_depth_npz(ai_lfm_file)
+    frequency_split = _resolve_frequency_split_params(script_cfg, dict(ai_lfm.metadata))
+    depth_axis_m = ai_lfm.samples.astype(np.float32)
+
     print("=== Well Constraints (Depth) ===")
     print(f"Shifted LAS dir: {shifted_las_dir}")
     print(f"Batch metrics: {metrics_path}")
     print(f"AI LFM: {ai_lfm_file}")
     print(f"LAS AI source: {las_ai_source} ({log_filter_params})")
+    print(f"Frequency split: {frequency_split}")
     print(f"Output dir: {output_dir}")
 
-    ai_lfm = load_lfm_depth_npz(ai_lfm_file)
-    depth_axis_m = ai_lfm.samples.astype(np.float32)
     well_heads_df = import_well_heads_petrel(well_heads_file)
     metrics_df = pd.read_csv(metrics_path)
     survey = open_survey(seismic_file, seismic_type="segy", segy_options=segy_options)
@@ -428,16 +569,25 @@ def main() -> None:
             raw_ai_on_axis, raw_mask = _interpolate_ai_to_depth_axis(md, raw_ai, kb_m, depth_axis_m)
             lfm_ai = np.asarray(ai_lfm.trace_by_index(il_idx, xl_idx), dtype=np.float32)
             highres_depth, highres_ai = _prepare_highres_ai(md, constraint_ai, kb_m)
-            highres_trace = _build_highres_prior_trace(highres_depth, highres_ai, depth_axis_m, lfm_ai)
+            highres_trace = _build_highres_prior_trace(
+                highres_depth,
+                highres_ai,
+                depth_axis_m,
+                lfm_ai,
+                frequency_split,
+            )
             lfm_valid = np.isfinite(lfm_ai) & (lfm_ai > 0.0)
             mask = mask & lfm_valid
             if int(mask.sum()) < 2:
                 raise ValueError("Too few AI samples overlap finite positive LFM samples.")
 
-            log_ai = np.zeros_like(ai_on_axis, dtype=np.float32)
+            split_trace = _split_log_ai_frequency_bands(depth_axis_m, ai_on_axis, mask, frequency_split)
+            log_ai = split_trace["well_log_ai"]
+            well_low_ai = split_trace["well_low_ai"]
+            well_low_log_ai = split_trace["well_low_log_ai"]
+            well_high_log_ai = split_trace["well_high_log_ai"]
             lfm_log_ai = np.zeros_like(lfm_ai, dtype=np.float32)
             residual_log_ai = np.zeros_like(ai_on_axis, dtype=np.float32)
-            log_ai[mask] = np.log(np.clip(ai_on_axis[mask], 1e-6, None)).astype(np.float32)
             lfm_log_ai[mask] = np.log(np.clip(lfm_ai[mask], 1e-6, None)).astype(np.float32)
             residual_log_ai[mask] = (log_ai[mask] - lfm_log_ai[mask]).astype(np.float32)
             raw_filtered_mask = mask & raw_mask & np.isfinite(raw_ai_on_axis) & np.isfinite(ai_on_axis)
@@ -451,6 +601,7 @@ def main() -> None:
                 corr,
                 floor=confidence_corr_floor,
                 span=confidence_corr_span,
+                mode=confidence_weight_mode,
             )
             weight = np.zeros_like(ai_on_axis, dtype=np.float32)
             weight[mask] = confidence
@@ -462,6 +613,9 @@ def main() -> None:
                     "inline": float(nearest_inline),
                     "xline": float(nearest_xline),
                     "log_ai": log_ai,
+                    "well_low_ai": well_low_ai,
+                    "well_low_log_ai": well_low_log_ai,
+                    "well_high_log_ai": well_high_log_ai,
                     "lfm_log_ai": lfm_log_ai,
                     "residual_log_ai": residual_log_ai,
                     "ai": np.nan_to_num(ai_on_axis, nan=0.0).astype(np.float32),
@@ -483,6 +637,13 @@ def main() -> None:
                     "raw_minus_filtered_ai_rmse": (
                         float(np.sqrt(np.mean(raw_filtered_diff**2))) if raw_filtered_diff.size else np.nan
                     ),
+                    "frequency_split_enabled": bool(frequency_split["enabled"]),
+                    "frequency_split_cutoff_wavelength_m": frequency_split["cutoff_wavelength_m"],
+                    "frequency_split_filter_order": frequency_split["filter_order"],
+                    "frequency_split_parameter_source": frequency_split["frequency_split_parameter_source"],
+                    "well_high_log_ai_abs_p95": (
+                        float(np.percentile(np.abs(well_high_log_ai[mask]), 95.0)) if int(mask.sum()) else np.nan
+                    ),
                     "kb_m": kb_m,
                     "well_x": well_x,
                     "well_y": well_y,
@@ -492,6 +653,7 @@ def main() -> None:
                     "nearest_xline": float(nearest_xline),
                     "flat_idx": int(flat_idx),
                     "corr": corr,
+                    "confidence_weight_mode": confidence_weight_mode,
                     "confidence": confidence,
                     "valid_samples": int(mask.sum()),
                     "highres_valid_samples": int(highres_trace["highres_well_mask"].sum()),
@@ -516,10 +678,26 @@ def main() -> None:
     sample_step = float(np.median(np.diff(depth_axis_m))) if depth_axis_m.size > 1 else None
     well_mask = np.stack([row["mask"] for row in records]).astype(bool)
     well_weight = np.stack([row["weight"] for row in records]).astype(np.float32)
+    well_low_ai = np.stack([row["well_low_ai"] for row in records]).astype(np.float32)
+    well_low_log_ai = np.stack([row["well_low_log_ai"] for row in records]).astype(np.float32)
+    well_high_log_ai = np.stack([row["well_high_log_ai"] for row in records]).astype(np.float32)
     residual_log_ai = np.stack([row["residual_log_ai"] for row in records]).astype(np.float32)
     highres_depth = _pad_highres_records(records, "highres_depth", dtype=np.float32, fill_value=0.0)
     highres_well_ai = _pad_highres_records(records, "highres_well_ai", dtype=np.float32, fill_value=0.0)
     highres_well_log_ai = _pad_highres_records(records, "highres_well_log_ai", dtype=np.float32, fill_value=0.0)
+    highres_well_low_ai = _pad_highres_records(records, "highres_well_low_ai", dtype=np.float32, fill_value=0.0)
+    highres_well_low_log_ai = _pad_highres_records(
+        records,
+        "highres_well_low_log_ai",
+        dtype=np.float32,
+        fill_value=0.0,
+    )
+    highres_well_high_log_ai = _pad_highres_records(
+        records,
+        "highres_well_high_log_ai",
+        dtype=np.float32,
+        fill_value=0.0,
+    )
     highres_lfm_log_ai = _pad_highres_records(records, "highres_lfm_log_ai", dtype=np.float32, fill_value=0.0)
     highres_residual_log_ai = _pad_highres_records(
         records,
@@ -543,6 +721,17 @@ def main() -> None:
     summary["highres_event_density"] = highres_summary["event_density"]
     summary["highres_reflectivity"] = highres_summary["reflectivity"]
     summary["highres_spectrum"] = highres_summary["spectrum"]
+    summary["well_high_log_ai"] = summarize_well_resolution_prior(
+        well_high_log_ai,
+        well_mask,
+        sample_step=sample_step,
+        well_weight=well_weight,
+    )["residual"]
+    summary["highres_well_high_log_ai"] = summarize_well_resolution_prior(
+        highres_well_high_log_ai,
+        highres_well_mask,
+        sample_step=_median_highres_sample_step(highres_depth, highres_well_mask),
+    )["residual"]
 
     metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -558,7 +747,15 @@ def main() -> None:
         "ai_lfm_file": repo_relative_path(ai_lfm_file, root=REPO_ROOT),
         "las_ai_source": las_ai_source,
         "log_filter_params": log_filter_params,
-        "confidence_formula": f"clip((corr - {confidence_corr_floor}) / {confidence_corr_span}, 0, 1)",
+        "frequency_split": frequency_split,
+        "frequency_split_enabled": bool(frequency_split["enabled"]),
+        "frequency_split_parameter_source": frequency_split["frequency_split_parameter_source"],
+        "confidence_weight_mode": confidence_weight_mode,
+        "confidence_formula": (
+            "1.0 for every successful well"
+            if confidence_weight_mode == "uniform"
+            else f"clip((corr - {confidence_corr_floor}) / {confidence_corr_span}, 0, 1)"
+        ),
         "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
         "n_input_las": int(len(las_paths)),
         "n_successful_wells": int(len(records)),
@@ -575,12 +772,18 @@ def main() -> None:
         lfm_log_ai=np.stack([row["lfm_log_ai"] for row in records]).astype(np.float32),
         residual_log_ai=residual_log_ai,
         well_ai=np.stack([row["ai"] for row in records]).astype(np.float32),
+        well_low_ai=well_low_ai,
+        well_low_log_ai=well_low_log_ai,
+        well_high_log_ai=well_high_log_ai,
         lfm_ai=np.stack([row["lfm_ai"] for row in records]).astype(np.float32),
         well_mask=well_mask,
         well_weight=well_weight,
         highres_depth=highres_depth,
         highres_well_ai=highres_well_ai,
         highres_well_log_ai=highres_well_log_ai,
+        highres_well_low_ai=highres_well_low_ai,
+        highres_well_low_log_ai=highres_well_low_log_ai,
+        highres_well_high_log_ai=highres_well_high_log_ai,
         highres_lfm_log_ai=highres_lfm_log_ai,
         highres_residual_log_ai=highres_residual_log_ai,
         highres_well_mask=highres_well_mask,
@@ -606,6 +809,11 @@ def main() -> None:
         "ai_lfm_file": repo_relative_path(ai_lfm_file, root=REPO_ROOT),
         "las_ai_source": metadata["las_ai_source"],
         "log_filter_params": metadata["log_filter_params"],
+        "frequency_split": metadata["frequency_split"],
+        "frequency_split_enabled": metadata["frequency_split_enabled"],
+        "frequency_split_parameter_source": metadata["frequency_split_parameter_source"],
+        "anchor_target_band": "lowpass_lfm_matched" if frequency_split["enabled"] else "fullband",
+        "confidence_weight_mode": metadata["confidence_weight_mode"],
         "confidence_formula": metadata["confidence_formula"],
         "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
         "n_input_las": int(len(las_paths)),
@@ -618,7 +826,7 @@ def main() -> None:
         sample_unit="m",
         samples=depth_axis_m.astype(np.float32),
         flat_indices=np.array([row["flat_idx"] for row in records], dtype=np.int64),
-        target_ai=np.stack([row["ai"] for row in records]).astype(np.float32),
+        target_ai=well_low_ai,
         anchor_mask=well_mask,
         anchor_weight=well_weight,
         anchor_names=np.array([row["well_name"] for row in records]),
@@ -644,6 +852,9 @@ def main() -> None:
                     "ai_lfm_file": repo_relative_path(ai_lfm_file, root=REPO_ROOT),
                     "las_ai_source": metadata["las_ai_source"],
                     "log_filter_params": metadata["log_filter_params"],
+                    "frequency_split": metadata["frequency_split"],
+                    "frequency_split_enabled": metadata["frequency_split_enabled"],
+                    "frequency_split_parameter_source": metadata["frequency_split_parameter_source"],
                     "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
                     "n_input_las": int(len(las_paths)),
                     "n_successful_wells": int(len(records)),
@@ -652,15 +863,17 @@ def main() -> None:
                 "artifacts": {
                     "stage_2_enhancement_prior": {
                         "path": repo_relative_path(prior_path, root=REPO_ROOT),
-                        "schema": "ginn_well_resolution_prior_v2",
+                        "schema": "ginn_well_resolution_prior_v3",
                         "contains_residual_log_ai": True,
                         "contains_highres_residual_log_ai": True,
+                        "contains_well_low_high_log_ai": True,
                         "summary": summary,
                     },
                     "stage_1_log_ai_anchor": {
                         "path": repo_relative_path(anchor_path, root=REPO_ROOT),
                         "schema": "ginn_log_ai_anchor_v1",
                         "contains_residual_log_ai": False,
+                        "anchor_target_band": anchor_metadata["anchor_target_band"],
                         "reserved_anchor_types": ["well", "facies_control"],
                         "summary": anchor_bundle.summary,
                     },

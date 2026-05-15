@@ -378,8 +378,6 @@ class Trainer:
             dataset=self.dataset,
             neighborhood_radius=self.cfg.log_ai_anchor_neighborhood_radius,
             geometry=self.geometry,
-            lowpass_cutoff_hz=self.dataset_bundle.lfm_metadata.get("filter_cutoff_hz"),
-            lowpass_filter_order=self.dataset_bundle.lfm_metadata.get("filter_order", 6),
         )
 
     def _log_ai_anchor_summary(self) -> dict[str, Any]:

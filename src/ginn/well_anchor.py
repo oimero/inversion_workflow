@@ -15,8 +15,6 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from ginn.log_ai_anchor import load_log_ai_anchor_npz, validate_log_ai_anchor
-from ginn.well_prior import true_runs
-from wtie.processing.spectral import apply_butter_lowpass_filter
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +31,9 @@ def _as_tensor(value: np.ndarray | Tensor) -> Tensor:
 class LogAIAnchor:
     """Log-AI supervision sampled on a GINN trace axis.
 
-    Supports optional lowpass filtering of the target AI (to constrain only the
-    low-frequency baseline) and optional spatial neighbourhood (to spread an
-    anchor across nearby traces with distance-decay weights).
+    Supports optional spatial neighbourhood to spread an anchor across nearby
+    traces with distance-decay weights. The anchor file is responsible for any
+    frequency split; this loss uses the stored target_log_ai as-is.
     """
 
     anchor_file: Path
@@ -56,8 +54,6 @@ class LogAIAnchor:
     neighbor_taper: Tensor = field(default_factory=lambda: torch.empty(0))
     neighbor_weights: Tensor = field(default_factory=lambda: torch.empty(0))
     neighbor_ranges: list[tuple[int, int]] = field(default_factory=list)
-    lowpass_cutoff_wavelength_m: float | None = None
-    lowpass_cutoff_hz: float | None = None
 
     @classmethod
     def build(
@@ -74,9 +70,6 @@ class LogAIAnchor:
         dataset: Dataset | None = None,
         neighborhood_radius: int = 0,
         geometry: dict | None = None,
-        lowpass_cutoff_wavelength_m: float | None = None,
-        lowpass_cutoff_hz: float | None = None,
-        lowpass_filter_order: int = 6,
     ) -> "LogAIAnchor | None":
         if lambda_weight <= 0.0:
             return None
@@ -109,63 +102,8 @@ class LogAIAnchor:
             logger.warning("No usable log-AI anchor traces from %s; anchor disabled.", anchor_file)
             return None
 
-        target_ai = np.asarray(anchor_bundle.target_ai[rows], dtype=np.float32)
-
-        # ── lowpass filter target AI (before log) ──
-        actual_cutoff: float | None = None
-        cutoff_is_wavelength: bool = True
-        if lowpass_cutoff_wavelength_m is not None and lowpass_cutoff_wavelength_m > 0.0:
-            actual_cutoff = float(lowpass_cutoff_wavelength_m)
-            cutoff_is_wavelength = True
-        elif lowpass_cutoff_hz is not None and lowpass_cutoff_hz > 0.0:
-            actual_cutoff = float(lowpass_cutoff_hz)
-            cutoff_is_wavelength = False
-
-        if actual_cutoff is not None:
-            dz = float(np.median(np.diff(anchor_bundle.samples)))
-            if dz > 0.0:
-                fs = 1.0 / dz
-                highcut = (1.0 / actual_cutoff) if cutoff_is_wavelength else actual_cutoff
-                order = int(lowpass_filter_order)
-                pad = max(1, int(np.ceil(3.0 * order * dz)))
-                run_pad_values: list[int] = []
-                for row in range(target_ai.shape[0]):
-                    row_mask = np.asarray(anchor_bundle.anchor_mask[rows][row], dtype=bool)
-                    row_valid = row_mask & np.isfinite(target_ai[row]) & (target_ai[row] > 0.0)
-                    if row_valid.sum() < 2:
-                        continue
-                    for start, stop in true_runs(row_valid):
-                        values = target_ai[row, start:stop].astype(np.float64)
-                        if values.size < 2:
-                            continue
-                        run_pad = min(pad, values.size - 1)
-                        run_pad_values.append(run_pad)
-                        if run_pad > 0:
-                            padded = np.pad(values, (run_pad, run_pad), mode="reflect")
-                            filtered = apply_butter_lowpass_filter(
-                                padded, highcut, fs, order=order, zero_phase=True,
-                            )[run_pad : run_pad + values.size]
-                        else:
-                            filtered = apply_butter_lowpass_filter(
-                                values, highcut, fs, order=order, zero_phase=True,
-                            )
-                        target_ai[row, start:stop] = filtered.astype(np.float32)
-                cutoff_label = f"{actual_cutoff:.0f} m" if cutoff_is_wavelength else f"{actual_cutoff:.1f} Hz"
-                pad_label = "none"
-                if run_pad_values:
-                    pad_label = (
-                        f"base={pad}, actual_min={min(run_pad_values)}, "
-                        f"actual_max={max(run_pad_values)} samples"
-                    )
-                logger.info(
-                    "Log-AI anchor lowpass: cutoff=%s (%.4f cycles/unit), order=%d, pad=%s",
-                    cutoff_label, highcut, order, pad_label,
-                )
-
-        # ── build log-AI target ──
-        target_log_ai = np.zeros_like(target_ai, dtype=np.float32)
-        valid = np.asarray(anchor_bundle.anchor_mask[rows], dtype=bool) & np.isfinite(target_ai) & (target_ai > 0.0)
-        target_log_ai[valid] = np.log(np.clip(target_ai[valid], 1e-6, None)).astype(np.float32)
+        target_log_ai = np.asarray(anchor_bundle.target_log_ai[rows], dtype=np.float32)
+        valid = np.asarray(anchor_bundle.anchor_mask[rows], dtype=bool) & np.isfinite(target_log_ai)
 
         weights = np.ones_like(target_log_ai, dtype=np.float32)
         if use_anchor_weight:
@@ -284,8 +222,6 @@ class LogAIAnchor:
             neighbor_taper=neighbor_taper,
             neighbor_weights=neighbor_weights_flat,
             neighbor_ranges=neighbor_ranges,
-            lowpass_cutoff_wavelength_m=actual_cutoff if cutoff_is_wavelength else None,
-            lowpass_cutoff_hz=actual_cutoff if not cutoff_is_wavelength else None,
         )
         logger.info(
             "Log-AI anchor enabled: anchors=%d, lambda=%.3e, file=%s",
@@ -307,8 +243,6 @@ class LogAIAnchor:
             "anchor_types": self.anchor_types.tolist(),
             "flat_indices": self.flat_indices.tolist(),
             "neighborhood_radius": self.neighborhood_radius,
-            "lowpass_cutoff_wavelength_m": self.lowpass_cutoff_wavelength_m,
-            "lowpass_cutoff_hz": self.lowpass_cutoff_hz,
         }
         if self.neighbor_ranges:
             result["max_neighbors"] = max(e - s for s, e in self.neighbor_ranges)

@@ -18,12 +18,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from cup.utils.io import to_json_compatible, write_json
 from ginn.config import GINNConfig
 from ginn.data import build_dataset
 from ginn.loss import GINNLoss
 from ginn.model import DilatedResNet1D
 from ginn.physics import ForwardModel
-from cup.utils.io import to_json_compatible, write_json
 from ginn.well_anchor import LogAIAnchor, disabled_log_ai_anchor_summary, zero_log_ai_anchor_metrics
 
 logger = logging.getLogger(__name__)
@@ -43,6 +43,7 @@ METRICS_FIELDNAMES = [
     "train_log_ai_anchor_term",
     "train_log_ai_anchor_traces",
     "train_log_ai_anchor_neighbors",
+    "train_anchor_sample_count",
     "val_loss",
     "val_waveform_mae",
     "val_l2_term",
@@ -53,6 +54,7 @@ METRICS_FIELDNAMES = [
     "val_log_ai_anchor_term",
     "val_log_ai_anchor_traces",
     "val_log_ai_anchor_neighbors",
+    "val_anchor_sample_count",
     "monitor_name",
     "monitor_value",
     "best_loss",
@@ -101,6 +103,7 @@ def prefix_metrics(prefix: str, metrics: dict[str, float] | None) -> dict[str, f
         "log_ai_anchor_term",
         "log_ai_anchor_traces",
         "log_ai_anchor_neighbors",
+        "anchor_sample_count",
     )
     if metrics is None:
         return {f"{prefix}_{key}": "" for key in keys}
@@ -451,7 +454,11 @@ class Trainer:
 
                 # 3. 损失
                 loss, loss_dict = self.criterion(d_syn, d_obs, loss_mask, core_mask, residual, taper_weight)
-                anchor_term, anchor_dict = self._compute_log_ai_anchor_loss(training=training, step=batch_idx) if training else zero_log_ai_anchor_metrics(self.device)
+                anchor_term, anchor_dict = (
+                    self._compute_log_ai_anchor_loss(training=training, step=batch_idx)
+                    if training
+                    else zero_log_ai_anchor_metrics(self.device)
+                )
                 loss = loss + anchor_term
                 loss_value = float(loss.detach().cpu().item())
                 loss_dict["total"] = loss_value
@@ -538,11 +545,9 @@ class Trainer:
             "log_ai_anchor_neighbors": total_log_ai_anchor_neighbors / n_batches,
         }
 
-    _LOG_AI_ANCHOR_SKIP = 5
+    _LOG_AI_ANCHOR_SKIP = 1
 
-    def _compute_log_ai_anchor_loss(
-        self, *, training: bool, step: int = 0
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    def _compute_log_ai_anchor_loss(self, *, training: bool, step: int = 0) -> tuple[torch.Tensor, dict[str, float]]:
         if self.log_ai_anchor is None:
             return zero_log_ai_anchor_metrics(self.device)
         if training and step % self._LOG_AI_ANCHOR_SKIP != 0:

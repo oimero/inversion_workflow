@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 
@@ -51,6 +52,13 @@ class GINNLoss(nn.Module):
         residual_mask: Tensor,
         residual: Tensor,
         taper_weight: Tensor,
+        *,
+        pred_ai: Tensor | None = None,
+        waveform_weight_scale: Tensor | None = None,
+        anchor_target_log_ai: Tensor | None = None,
+        anchor_mask_weight: Tensor | None = None,
+        well_influence: Tensor | None = None,
+        lambda_log_ai_anchor: float = 0.0,
     ) -> tuple[Tensor, dict[str, float]]:
         """计算组合损失。
 
@@ -78,6 +86,10 @@ class GINNLoss(nn.Module):
             包含各分项的浮点值，用于日志记录。
         """
         waveform_mask_f = waveform_mask.float()
+        if waveform_weight_scale is not None:
+            scale = waveform_weight_scale.to(device=waveform_mask_f.device, dtype=waveform_mask_f.dtype)
+            scale = scale.reshape(scale.shape[0], 1, 1)
+            waveform_mask_f = waveform_mask_f * scale
         residual_mask_f = residual_mask.float()
         n_waveform_valid = waveform_mask_f.sum().clamp(min=1.0)
         n_residual_valid = residual_mask_f.sum().clamp(min=1.0)
@@ -94,11 +106,35 @@ class GINNLoss(nn.Module):
         pair_weight_sum = pair_weight.sum().clamp(min=1.0)
         residual_tv = (diff.abs() * pair_weight).sum() / pair_weight_sum
 
-        # 总损失
-        total_loss = waveform_mae + self.lambda_l2 * residual_l2 + self.lambda_tv * residual_tv
-
         l2_term = self.lambda_l2 * residual_l2
         tv_term = self.lambda_tv * residual_tv
+        total_loss = waveform_mae + l2_term + tv_term
+
+        anchor_loss = torch.zeros((), device=residual.device)
+        anchor_term = torch.zeros((), device=residual.device)
+        anchor_sample_count = torch.zeros((), device=residual.device)
+        anchor_trace_count = torch.zeros((), device=residual.device)
+        if (
+            pred_ai is not None
+            and anchor_target_log_ai is not None
+            and anchor_mask_weight is not None
+            and lambda_log_ai_anchor > 0.0
+        ):
+            anchor_weight = anchor_mask_weight.to(device=pred_ai.device, dtype=pred_ai.dtype)
+            if well_influence is not None:
+                influence = well_influence.to(device=pred_ai.device, dtype=pred_ai.dtype)
+                influence = influence.reshape(influence.shape[0], 1, 1)
+                anchor_weight = anchor_weight * influence
+            positive_anchor = anchor_weight > 0.0
+            anchor_sample_count = positive_anchor.sum().to(dtype=pred_ai.dtype)
+            anchor_trace_count = positive_anchor.any(dim=-1).sum().to(dtype=pred_ai.dtype)
+            anchor_denom = anchor_weight.sum().clamp(min=1.0)
+            target = anchor_target_log_ai.to(device=pred_ai.device, dtype=pred_ai.dtype)
+            pred_log_ai = torch.log(torch.clamp(pred_ai, min=1e-6))
+            raw_anchor = F.smooth_l1_loss(pred_log_ai, target, reduction="none")
+            anchor_loss = (raw_anchor * anchor_weight).sum() / anchor_denom
+            anchor_term = float(lambda_log_ai_anchor) * anchor_loss
+            total_loss = total_loss + anchor_term
 
         loss_dict = {
             "total": total_loss.item(),
@@ -107,8 +143,14 @@ class GINNLoss(nn.Module):
             "residual_tv": residual_tv.item(),
             "l2_term": l2_term.item(),
             "tv_term": tv_term.item(),
+            "log_ai_anchor": anchor_loss.item(),
+            "log_ai_anchor_term": anchor_term.item(),
+            "log_ai_anchor_traces": anchor_trace_count.item(),
+            "log_ai_anchor_neighbors": 0.0,
+            "anchor_sample_count": anchor_sample_count.item(),
             "lambda_l2": float(self.lambda_l2),
             "lambda_tv": float(self.lambda_tv),
+            "lambda_log_ai_anchor": float(lambda_log_ai_anchor),
         }
 
         return total_loss, loss_dict

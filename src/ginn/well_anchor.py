@@ -333,4 +333,5 @@ def zero_log_ai_anchor_metrics(device: torch.device) -> tuple[Tensor, dict[str, 
         "log_ai_anchor_term": 0.0,
         "log_ai_anchor_traces": 0.0,
         "log_ai_anchor_neighbors": 0.0,
+        "anchor_sample_count": 0.0,
     }

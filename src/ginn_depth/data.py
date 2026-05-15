@@ -11,7 +11,7 @@ from typing import Any, Dict
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from cup.petrel.load import import_interpretation_petrel, import_seismic
 from cup.seismic.target_layer import TargetLayer
@@ -23,6 +23,7 @@ from cup.well.wavelet import (
     make_wavelet,
 )
 from ginn.data import compute_dynamic_gain_median, normalize_dynamic_gain_input
+from ginn.log_ai_anchor import load_log_ai_anchor_npz, validate_log_ai_anchor
 from ginn.masking import build_eroded_loss_mask as _build_eroded_loss_mask
 from ginn.masking import build_residual_taper as _build_residual_taper
 from ginn.masking import get_valid_trace_indices as _get_valid_trace_indices
@@ -57,6 +58,30 @@ class DatasetBundle:
     geometry: Dict[str, Any]
     split_metadata: Dict[str, Any]
     lfm_metadata: Dict[str, Any]
+    well_control_summary: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class WellControlData:
+    """Sparse per-trace well-control targets for in-batch depth GINN supervision."""
+
+    flat_indices: np.ndarray
+    target_log_ai: np.ndarray
+    mask_weight: np.ndarray
+    well_influence: np.ndarray
+    waveform_weight_scale: np.ndarray
+    summary: Dict[str, Any]
+
+    @classmethod
+    def empty(cls, n_sample: int, *, summary: Dict[str, Any] | None = None) -> "WellControlData":
+        return cls(
+            flat_indices=np.empty(0, dtype=np.int64),
+            target_log_ai=np.zeros((0, int(n_sample)), dtype=np.float32),
+            mask_weight=np.zeros((0, int(n_sample)), dtype=np.float32),
+            well_influence=np.zeros((0,), dtype=np.float32),
+            waveform_weight_scale=np.ones((0,), dtype=np.float32),
+            summary={} if summary is None else dict(summary),
+        )
 
 
 def resolve_wavelet_from_config(cfg: DepthGINNConfig) -> tuple[np.ndarray, np.ndarray]:
@@ -244,6 +269,164 @@ def geometry_from_axes(ilines: np.ndarray, xlines: np.ndarray, samples: np.ndarr
     }
 
 
+def build_well_control_data(
+    *,
+    anchor_file: Path | None,
+    selected_indices: np.ndarray,
+    sample_domain: str,
+    n_sample: int,
+    n_traces: int,
+    geometry: Dict[str, Any],
+    lambda_log_ai_anchor: float,
+    use_anchor_weight: bool,
+    neighborhood_radius: int,
+    well_waveform_min_weight: float,
+    distance_decay: str,
+) -> WellControlData:
+    """Build a sparse map of well-controlled traces for in-batch anchor loss."""
+    selected_indices = np.asarray(selected_indices, dtype=np.int64).reshape(-1)
+    if (
+        lambda_log_ai_anchor <= 0.0
+        or anchor_file is None
+        or selected_indices.size == 0
+        or neighborhood_radius < 0
+    ):
+        return WellControlData.empty(
+            n_sample,
+            summary={
+                "enabled": False,
+                "anchor_file": anchor_file,
+                "reason": "disabled_or_empty",
+            },
+        )
+
+    if distance_decay not in {"gaussian", "linear"}:
+        raise ValueError(f"Unsupported well anchor distance decay: {distance_decay!r}.")
+
+    anchor_bundle = load_log_ai_anchor_npz(anchor_file)
+    validate_log_ai_anchor(
+        anchor_bundle,
+        sample_domain=sample_domain,
+        n_sample=n_sample,
+        n_traces=n_traces,
+    )
+
+    selected_set = {int(flat_idx) for flat_idx in selected_indices}
+    n_il = int(geometry["n_il"])
+    n_xl = int(geometry["n_xl"])
+    il_step = float(geometry.get("inline_step", 1.0))
+    xl_step = float(geometry.get("xline_step", 1.0))
+    radius = int(neighborhood_radius)
+    phys_radius = float(radius) * max(il_step, xl_step)
+    sigma = max(phys_radius / 2.0, 0.5 * max(il_step, xl_step))
+    gaussian_edge = math.exp(-(phys_radius**2) / (2.0 * sigma**2)) if radius > 0 else 0.0
+
+    best_by_flat: dict[int, tuple[float, int]] = {}
+    for row, flat_idx in enumerate(np.asarray(anchor_bundle.flat_indices, dtype=np.int64)):
+        target = np.asarray(anchor_bundle.target_log_ai[row], dtype=np.float32)
+        target_mask = np.asarray(anchor_bundle.anchor_mask[row], dtype=bool) & np.isfinite(target)
+        if not np.any(target_mask):
+            continue
+
+        flat_ref = int(flat_idx)
+        il_ref = flat_ref // n_xl
+        xl_ref = flat_ref % n_xl
+        for dil in range(-radius, radius + 1):
+            for dxl in range(-radius, radius + 1):
+                il = il_ref + dil
+                xl = xl_ref + dxl
+                if il < 0 or il >= n_il or xl < 0 or xl >= n_xl:
+                    continue
+                dist = math.hypot(dil * il_step, dxl * xl_step)
+                if radius > 0 and dist > phys_radius + 1e-8:
+                    continue
+                if radius == 0 and dist > 1e-8:
+                    continue
+
+                flat = il * n_xl + xl
+                if flat not in selected_set:
+                    continue
+                if dist < 1e-8:
+                    influence = 1.0
+                elif distance_decay == "linear":
+                    influence = max(0.0, 1.0 - dist / max(phys_radius, 1e-6))
+                else:
+                    raw_influence = math.exp(-(dist**2) / (2.0 * sigma**2))
+                    influence = (raw_influence - gaussian_edge) / max(1.0 - gaussian_edge, 1e-6)
+                    influence = max(0.0, min(1.0, influence))
+                if influence <= 0.0:
+                    continue
+                current = best_by_flat.get(flat)
+                if current is None or influence > current[0]:
+                    best_by_flat[flat] = (float(influence), int(row))
+
+    if not best_by_flat:
+        return WellControlData.empty(
+            n_sample,
+            summary={
+                "enabled": False,
+                "anchor_file": anchor_file,
+                "reason": "no_anchor_trace_in_selected_indices",
+                "n_input_anchors": int(anchor_bundle.n_anchors),
+            },
+        )
+
+    flat_indices = np.array(sorted(best_by_flat), dtype=np.int64)
+    influences = np.array([best_by_flat[int(flat)][0] for flat in flat_indices], dtype=np.float32)
+    rows = np.array([best_by_flat[int(flat)][1] for flat in flat_indices], dtype=np.int64)
+    target_log_ai = np.asarray(anchor_bundle.target_log_ai[rows], dtype=np.float32)
+    valid = np.asarray(anchor_bundle.anchor_mask[rows], dtype=bool) & np.isfinite(target_log_ai)
+    if use_anchor_weight:
+        mask_weight = np.asarray(anchor_bundle.anchor_weight[rows], dtype=np.float32)
+        mask_weight = np.where(np.isfinite(mask_weight) & (mask_weight > 0.0), mask_weight, 0.0)
+    else:
+        mask_weight = np.ones_like(target_log_ai, dtype=np.float32)
+    mask_weight = (mask_weight * valid.astype(np.float32)).astype(np.float32)
+    waveform_weight_scale = (
+        1.0 - (1.0 - float(well_waveform_min_weight)) * influences
+    ).astype(np.float32)
+
+    anchor_names = np.asarray(anchor_bundle.anchor_names).astype(str)
+    unique_rows, counts = np.unique(rows, return_counts=True)
+    summary = {
+        "enabled": True,
+        "anchor_file": Path(anchor_file),
+        "n_input_anchors": int(anchor_bundle.n_anchors),
+        "n_controlled_traces": int(flat_indices.size),
+        "neighborhood_radius": radius,
+        "physical_radius": phys_radius,
+        "distance_decay": distance_decay,
+        "well_waveform_min_weight": float(well_waveform_min_weight),
+        "influence_min": float(np.min(influences)),
+        "influence_mean": float(np.mean(influences)),
+        "influence_max": float(np.max(influences)),
+        "waveform_weight_min": float(np.min(waveform_weight_scale)),
+        "waveform_weight_mean": float(np.mean(waveform_weight_scale)),
+        "waveform_weight_max": float(np.max(waveform_weight_scale)),
+        "controlled_traces_by_anchor": {
+            str(anchor_names[int(row)]): int(count)
+            for row, count in zip(unique_rows, counts)
+        },
+    }
+    logger.info(
+        "Depth well-control map: controlled_traces=%d, radius=%d, influence=[%.3f, %.3f], waveform_weight=[%.3f, %.3f]",
+        int(flat_indices.size),
+        radius,
+        float(np.min(influences)),
+        float(np.max(influences)),
+        float(np.min(waveform_weight_scale)),
+        float(np.max(waveform_weight_scale)),
+    )
+    return WellControlData(
+        flat_indices=flat_indices,
+        target_log_ai=target_log_ai,
+        mask_weight=mask_weight,
+        well_influence=influences,
+        waveform_weight_scale=waveform_weight_scale,
+        summary=summary,
+    )
+
+
 def estimate_fixed_gain_depth(
     seismic: np.ndarray,
     ai_lfm: np.ndarray,
@@ -345,6 +528,7 @@ class DepthSeismicTraceDataset(Dataset):
         include_dynamic_gain_input: bool = False,
         normalization_stats: tuple[float, float] | None = None,
         dynamic_gain_median: float | None = None,
+        well_control_data: WellControlData | None = None,
     ) -> None:
         n_traces, n_sample = seismic_flat.shape
         assert ai_lfm_flat.shape == seismic_flat.shape
@@ -372,6 +556,20 @@ class DepthSeismicTraceDataset(Dataset):
         self._include_lfm_input = bool(include_lfm_input)
         self._include_mask_input = bool(include_mask_input)
         self._include_dynamic_gain_input = bool(include_dynamic_gain_input)
+        self._zero_anchor_target_log_ai = np.zeros((n_sample,), dtype=np.float32)
+        self._zero_anchor_mask_weight = np.zeros((n_sample,), dtype=np.float32)
+        self._well_control = (
+            WellControlData.empty(n_sample)
+            if well_control_data is None
+            else well_control_data
+        )
+        self._well_control_lookup = {
+            int(flat_idx): row
+            for row, flat_idx in enumerate(np.asarray(self._well_control.flat_indices, dtype=np.int64))
+        }
+        anchor_mask = np.isin(self._valid_indices, self._well_control.flat_indices)
+        self._anchor_dataset_indices = np.flatnonzero(anchor_mask).astype(np.int64)
+        self._ordinary_dataset_indices = np.flatnonzero(~anchor_mask).astype(np.int64)
         if self._include_dynamic_gain_input and self._dynamic_gain_flat is None:
             logger.warning("include_dynamic_gain_input=True but no dynamic gain model is loaded; using a zero channel.")
 
@@ -406,6 +604,12 @@ class DepthSeismicTraceDataset(Dataset):
             self._lfm_scale,
             self.input_channel_names,
         )
+        if self._anchor_dataset_indices.size:
+            logger.info(
+                "Depth dataset well-control samples: %d anchor-influenced / %d ordinary",
+                int(self._anchor_dataset_indices.size),
+                int(self._ordinary_dataset_indices.size),
+            )
 
     def __len__(self) -> int:
         return len(self._valid_indices)
@@ -431,6 +635,18 @@ class DepthSeismicTraceDataset(Dataset):
         return self._dynamic_gain_median
 
     @property
+    def anchor_dataset_indices(self) -> np.ndarray:
+        return self._anchor_dataset_indices
+
+    @property
+    def ordinary_dataset_indices(self) -> np.ndarray:
+        return self._ordinary_dataset_indices
+
+    @property
+    def well_control_summary(self) -> Dict[str, Any]:
+        return dict(self._well_control.summary)
+
+    @property
     def input_channel_names(self) -> tuple[str, ...]:
         channels = ["seismic"]
         if self._include_lfm_input:
@@ -450,6 +666,19 @@ class DepthSeismicTraceDataset(Dataset):
         loss_mask = self._loss_mask_flat[flat_idx]
         taper_weight = self._taper_flat[flat_idx]
         dynamic_gain = self._dynamic_gain_flat[flat_idx] if self._dynamic_gain_flat is not None else None
+        control_row = self._well_control_lookup.get(int(flat_idx))
+        if control_row is None:
+            anchor_target_log_ai = self._zero_anchor_target_log_ai
+            anchor_mask_weight = self._zero_anchor_mask_weight
+            well_influence = np.float32(0.0)
+            waveform_weight_scale = np.float32(1.0)
+            has_anchor = np.float32(0.0)
+        else:
+            anchor_target_log_ai = self._well_control.target_log_ai[control_row]
+            anchor_mask_weight = self._well_control.mask_weight[control_row]
+            well_influence = np.float32(self._well_control.well_influence[control_row])
+            waveform_weight_scale = np.float32(self._well_control.waveform_weight_scale[control_row])
+            has_anchor = np.float32(1.0)
 
         ai_lfm_raw = ai_lfm.copy()
         velocity_raw = vp.copy()
@@ -476,10 +705,92 @@ class DepthSeismicTraceDataset(Dataset):
             "lfm_raw": torch.from_numpy(ai_lfm_raw[np.newaxis]).float(),
             "velocity_raw": torch.from_numpy(velocity_raw[np.newaxis]).float(),
             "flat_index": torch.tensor(int(flat_idx), dtype=torch.long),
+            "anchor_target_log_ai": torch.from_numpy(anchor_target_log_ai[np.newaxis]).float(),
+            "anchor_mask_weight": torch.from_numpy(anchor_mask_weight[np.newaxis]).float(),
+            "well_influence": torch.tensor([float(well_influence)], dtype=torch.float32),
+            "waveform_weight_scale": torch.tensor([float(waveform_weight_scale)], dtype=torch.float32),
+            "has_anchor": torch.tensor([float(has_anchor)], dtype=torch.float32),
         }
         if dynamic_gain is not None:
             item["dynamic_gain"] = torch.from_numpy(dynamic_gain[np.newaxis]).float()
         return item
+
+
+class MixedWellBatchSampler(Sampler[list[int]]):
+    """Batch sampler that replaces a fraction of each batch with well-controlled traces."""
+
+    def __init__(
+        self,
+        dataset: DepthSeismicTraceDataset,
+        *,
+        batch_size: int,
+        well_fraction: float,
+        drop_last: bool = True,
+        seed: int = 0,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}.")
+        if not 0.0 <= well_fraction <= 1.0:
+            raise ValueError(f"well_fraction must be within [0, 1], got {well_fraction}.")
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.well_fraction = float(well_fraction)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self._epoch = 0
+        self.anchor_indices = np.asarray(dataset.anchor_dataset_indices, dtype=np.int64)
+        self.ordinary_indices = np.asarray(dataset.ordinary_dataset_indices, dtype=np.int64)
+        self.all_indices = np.arange(len(dataset), dtype=np.int64)
+
+        if self.anchor_indices.size and self.well_fraction > 0.0:
+            self.n_well_per_batch = int(round(self.batch_size * self.well_fraction))
+            self.n_well_per_batch = min(max(self.n_well_per_batch, 1), self.batch_size)
+        else:
+            self.n_well_per_batch = 0
+        self.n_ordinary_per_batch = self.batch_size - self.n_well_per_batch
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return int(len(self.dataset) // self.batch_size)
+        return int(math.ceil(len(self.dataset) / self.batch_size))
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self._epoch)
+        self._epoch += 1
+        n_batches = len(self)
+        if self.n_well_per_batch <= 0 or self.anchor_indices.size == 0:
+            shuffled = rng.permutation(self.all_indices)
+            for batch_idx in range(n_batches):
+                start = batch_idx * self.batch_size
+                stop = min(start + self.batch_size, shuffled.size)
+                batch = shuffled[start:stop]
+                if batch.size == self.batch_size or not self.drop_last:
+                    yield batch.astype(np.int64).tolist()
+            return
+
+        ordinary_pool = self.ordinary_indices if self.ordinary_indices.size else self.all_indices
+        ordinary_needed = max(self.n_ordinary_per_batch, 0) * n_batches
+        if ordinary_needed:
+            repeats = int(math.ceil(ordinary_needed / max(ordinary_pool.size, 1)))
+            ordinary_draws = np.concatenate([rng.permutation(ordinary_pool) for _ in range(repeats)])
+        else:
+            ordinary_draws = np.empty(0, dtype=np.int64)
+
+        ordinary_cursor = 0
+        for _ in range(n_batches):
+            parts: list[np.ndarray] = []
+            if self.n_ordinary_per_batch > 0:
+                ordinary = ordinary_draws[ordinary_cursor: ordinary_cursor + self.n_ordinary_per_batch]
+                ordinary_cursor += self.n_ordinary_per_batch
+                parts.append(ordinary)
+            well = rng.choice(self.anchor_indices, size=self.n_well_per_batch, replace=True)
+            parts.append(np.asarray(well, dtype=np.int64))
+            batch = np.concatenate(parts)
+            rng.shuffle(batch)
+            yield batch.astype(np.int64).tolist()
 
 
 def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
@@ -634,6 +945,31 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
     else:
         logger.info("Validation split disabled.")
 
+    if cfg.well_control_enabled:
+        train_well_control = build_well_control_data(
+            anchor_file=cfg.log_ai_anchor_file,
+            selected_indices=train_indices,
+            sample_domain="depth",
+            n_sample=n_sample,
+            n_traces=n_il * n_xl,
+            geometry=geometry,
+            lambda_log_ai_anchor=cfg.lambda_log_ai_anchor,
+            use_anchor_weight=cfg.log_ai_anchor_use_weight,
+            neighborhood_radius=cfg.log_ai_anchor_neighborhood_radius,
+            well_waveform_min_weight=cfg.well_waveform_min_weight,
+            distance_decay=cfg.well_anchor_distance_decay,
+        )
+    else:
+        train_well_control = WellControlData.empty(
+            n_sample,
+            summary={
+                "enabled": False,
+                "anchor_file": cfg.log_ai_anchor_file,
+                "reason": "well_control_enabled_false",
+            },
+        )
+    split_metadata["well_control"] = train_well_control.summary
+
     train_shared = (seismic_flat, ai_lfm_flat, vp_flat, train_mask_flat, train_loss_mask_flat, train_taper_flat)
     inference_shared = (
         seismic_flat,
@@ -650,6 +986,7 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         include_lfm_input=cfg.include_lfm_input,
         include_mask_input=cfg.include_mask_input,
         include_dynamic_gain_input=cfg.include_dynamic_gain_input,
+        well_control_data=train_well_control,
     )
     train_norm_stats = (train_dataset.seis_rms, train_dataset.lfm_scale)
     val_dataset = None
@@ -663,6 +1000,7 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
             include_dynamic_gain_input=cfg.include_dynamic_gain_input,
             normalization_stats=train_norm_stats,
             dynamic_gain_median=train_dataset.dynamic_gain_median,
+            well_control_data=WellControlData.empty(n_sample),
         )
     inference_dataset = DepthSeismicTraceDataset(
         *inference_shared,
@@ -673,6 +1011,7 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         include_dynamic_gain_input=cfg.include_dynamic_gain_input,
         normalization_stats=train_norm_stats,
         dynamic_gain_median=train_dataset.dynamic_gain_median,
+        well_control_data=WellControlData.empty(n_sample),
     )
 
     if cfg.gain_source == "fixed_gain":
@@ -719,4 +1058,5 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         geometry=geometry,
         split_metadata=split_metadata,
         lfm_metadata=dict(ai_lfm.metadata),
+        well_control_summary=train_well_control.summary,
     )

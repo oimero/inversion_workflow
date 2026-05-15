@@ -14,6 +14,7 @@ WaveletSource = Literal["precomputed_wavelet", "ricker_wavelet"]
 GainSource = Literal["fixed_gain", "dynamic_gain_model"]
 ValidationSplitMode = Literal["none", "spatial_block"]
 ValidationBlockAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"]
+WellAnchorDistanceDecay = Literal["gaussian", "linear"]
 
 _PATH_FIELDS = {
     "seismic_file",
@@ -83,7 +84,7 @@ class DepthGINNConfig:
     # 常规 Adam 训练参数。未来如需加入新的训练阶段，应优先在专用 config 中
     # 显式配置，避免把关键训练常数藏在 trainer 里。
     batch_size: int = 16  # 每个 batch 的道数。
-    epochs: int = 30  # 最大训练轮数。
+    epochs: int = 50  # 最大训练轮数。
     lr: float = 1e-3  # Adam 初始学习率。
     weight_decay: float = 1e-4  # Adam 权重衰减系数。
     grad_clip: float = 1.0  # 梯度裁剪阈值。
@@ -92,13 +93,16 @@ class DepthGINNConfig:
     # 真实数据训练损失由 waveform MAE、residual L2 和 residual TV 组成。
     # L2/TV 越强，越能抑制不稳定高频，但也越容易洗掉分辨率；做高分辨率实验
     # 时应和 baseline 对照，不要只看 waveform loss。
-    lambda_l2: float = 0.03  # 高频扰动 L2 正则化权重，约束阻抗尺度不要漂移。
-    lambda_tv: float = 0.0  # 高频扰动 TV 正则化权重，抑制层内高频 ringing。
+    lambda_l2: float = 0.1  # 高频扰动 L2 正则化权重，约束阻抗尺度不要漂移。
+    lambda_tv: float = 0.1  # 高频扰动 TV 正则化权重，抑制层内高频 ringing。
     log_ai_anchor_file: Path | None = None  # 可选 log-AI anchor NPZ；支持井点与相控点约束。
-    lambda_log_ai_anchor: float = 0.0  # log(AI) anchor 监督权重；0 表示关闭。
-    log_ai_anchor_batch_size: int = 0  # 每个训练 batch 额外抽取的 anchor 数；<=0 表示使用全部。
+    lambda_log_ai_anchor: float = 1.0  # log(AI) anchor 监督权重；0 表示关闭。
     log_ai_anchor_use_weight: bool = True  # 是否使用 anchor_weight 加权约束。
-    log_ai_anchor_neighborhood_radius: int = 0  # anchor 邻域半径（网格单位）；0=仅中心道。
+    log_ai_anchor_neighborhood_radius: int = 5  # anchor 邻域半径（网格单位）；0=仅中心道。
+    well_control_enabled: bool = True  # 是否启用井-地震分治：井邻域内井 anchor 进入常规 batch。
+    well_waveform_min_weight: float = 0.2  # 井中心保留的最小 waveform loss 权重。
+    well_anchor_batch_fraction: float = 0.25  # 训练 batch 中井影响区样本的目标占比。
+    well_anchor_distance_decay: WellAnchorDistanceDecay = "gaussian"  # 井影响随距离衰减方式。
     zero_residual_outside_mask: bool = True  # 是否将层外高频扰动通过 taper 平滑压回 0。
     boundary_effect_samples: int | None = None  # 为空时按子波 5% 有效半支撑自动计算。
 
@@ -188,12 +192,25 @@ class DepthGINNConfig:
             raise ValueError(f"lambda_tv must be non-negative, got {self.lambda_tv}.")
         if self.lambda_log_ai_anchor < 0.0:
             raise ValueError(f"lambda_log_ai_anchor must be non-negative, got {self.lambda_log_ai_anchor}.")
-        if self.log_ai_anchor_batch_size < 0:
-            raise ValueError(f"log_ai_anchor_batch_size must be non-negative, got {self.log_ai_anchor_batch_size}.")
         if self.log_ai_anchor_neighborhood_radius < 0:
             raise ValueError(
                 "log_ai_anchor_neighborhood_radius must be non-negative, "
                 f"got {self.log_ai_anchor_neighborhood_radius}."
+            )
+        if not 0.0 <= self.well_waveform_min_weight <= 1.0:
+            raise ValueError(
+                "well_waveform_min_weight must be within [0, 1], "
+                f"got {self.well_waveform_min_weight}."
+            )
+        if not 0.0 <= self.well_anchor_batch_fraction <= 1.0:
+            raise ValueError(
+                "well_anchor_batch_fraction must be within [0, 1], "
+                f"got {self.well_anchor_batch_fraction}."
+            )
+        if self.well_anchor_distance_decay not in {"gaussian", "linear"}:
+            raise ValueError(
+                "well_anchor_distance_decay must be 'gaussian' or 'linear', "
+                f"got {self.well_anchor_distance_decay!r}."
             )
         if self.boundary_effect_samples is not None and self.boundary_effect_samples < 0:
             raise ValueError(f"boundary_effect_samples must be non-negative, got {self.boundary_effect_samples}.")

@@ -21,9 +21,8 @@ from ginn.trainer import (
     summarize_array,
     write_json,
 )
-from ginn.well_anchor import LogAIAnchor, disabled_log_ai_anchor_summary, zero_log_ai_anchor_metrics
 from ginn_depth.config import DepthGINNConfig
-from ginn_depth.data import build_dataset
+from ginn_depth.data import MixedWellBatchSampler, build_dataset
 from ginn_depth.loss import GINNLoss
 from ginn_depth.model import DilatedResNet1D
 from ginn_depth.physics import DepthForwardModel
@@ -51,14 +50,39 @@ class Trainer:
         self.geometry = dataset_bundle.geometry
         self.split_metadata = dataset_bundle.split_metadata
 
-        self.train_dataloader = DataLoader(
-            self.train_dataset,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=cfg.num_workers,
-            pin_memory=cfg.pin_memory,
-            drop_last=True,
-        )
+        self.train_batch_sampler = None
+        if (
+            cfg.well_control_enabled
+            and cfg.lambda_log_ai_anchor > 0.0
+            and self.train_dataset.anchor_dataset_indices.size > 0
+            and cfg.well_anchor_batch_fraction > 0.0
+        ):
+            self.train_batch_sampler = MixedWellBatchSampler(
+                self.train_dataset,
+                batch_size=cfg.batch_size,
+                well_fraction=cfg.well_anchor_batch_fraction,
+                drop_last=True,
+            )
+            self.train_dataloader = DataLoader(
+                self.train_dataset,
+                batch_sampler=self.train_batch_sampler,
+                num_workers=cfg.num_workers,
+                pin_memory=cfg.pin_memory,
+            )
+            logger.info(
+                "Train DataLoader uses mixed well sampler: fraction=%.2f, well_samples=%d",
+                cfg.well_anchor_batch_fraction,
+                int(self.train_dataset.anchor_dataset_indices.size),
+            )
+        else:
+            self.train_dataloader = DataLoader(
+                self.train_dataset,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                num_workers=cfg.num_workers,
+                pin_memory=cfg.pin_memory,
+                drop_last=True,
+            )
         logger.info("Train DataLoader: %d batches/epoch", len(self.train_dataloader))
         self.val_dataloader = None
         if self.val_dataset is not None:
@@ -90,7 +114,6 @@ class Trainer:
         ).to(self.device)
 
         self.criterion = GINNLoss(lambda_l2=cfg.lambda_l2, lambda_tv=cfg.lambda_tv)
-        self.log_ai_anchor = self._build_log_ai_anchor()
         logger.info(
             "Loss domain: normalized depth seismic amplitude, lambda_l2=%.3e, lambda_tv=%.3e, lambda_log_ai_anchor=%.3e",
             self.cfg.lambda_l2,
@@ -166,35 +189,20 @@ class Trainer:
                     "vp_lfm_file": self.cfg.vp_lfm_file,
                 },
                 "log_ai_anchor": self._log_ai_anchor_summary(),
-                "log_ai_anchor_skip_interval": self._LOG_AI_ANCHOR_SKIP,
+                "well_control": self.dataset_bundle.well_control_summary,
+                "well_anchor_batch_fraction": self.cfg.well_anchor_batch_fraction,
             },
         )
         write_json(self.run_summary_path, summary)
         logger.info("Run summary saved: %s", self.run_summary_path)
 
-    def _build_log_ai_anchor(self) -> LogAIAnchor | None:
-        n_traces = int(self.geometry["n_il"]) * int(self.geometry["n_xl"])
-        return LogAIAnchor.build(
-            anchor_file=self.cfg.log_ai_anchor_file,
-            lambda_weight=self.cfg.lambda_log_ai_anchor,
-            batch_size=self.cfg.log_ai_anchor_batch_size,
-            use_anchor_weight=self.cfg.log_ai_anchor_use_weight,
-            sample_domain="depth",
-            n_sample=self.depth_axis_m.size,
-            n_traces=n_traces,
-            valid_indices=self.dataset.valid_indices,
-            dataset=self.dataset,
-            neighborhood_radius=self.cfg.log_ai_anchor_neighborhood_radius,
-            geometry=self.geometry,
-        )
-
     def _log_ai_anchor_summary(self) -> dict[str, Any]:
-        if self.log_ai_anchor is None:
-            return disabled_log_ai_anchor_summary(
-                anchor_file=self.cfg.log_ai_anchor_file,
-                lambda_weight=self.cfg.lambda_log_ai_anchor,
-            )
-        return self.log_ai_anchor.summary()
+        summary = dict(self.dataset_bundle.well_control_summary)
+        summary.setdefault("anchor_file", self.cfg.log_ai_anchor_file)
+        summary["lambda_log_ai_anchor"] = self.cfg.lambda_log_ai_anchor
+        summary["batch_fraction"] = self.cfg.well_anchor_batch_fraction
+        summary["batch_mode"] = "in_batch_well_control"
+        return summary
 
     def _compose_impedance(
         self,
@@ -212,28 +220,6 @@ class Trainer:
         ai = safe_lfm * torch.exp(residual)
         return ai, residual
 
-    _LOG_AI_ANCHOR_SKIP = 5
-
-    def _compute_log_ai_anchor_loss(
-        self, *, training: bool, step: int = 0
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        if self.log_ai_anchor is None:
-            return zero_log_ai_anchor_metrics(self.device)
-        if training and step % self._LOG_AI_ANCHOR_SKIP != 0:
-            cached = getattr(self, "_cached_log_ai_anchor_metrics", None)
-            if cached is not None:
-                return cached[0].detach(), cached[1]
-            return zero_log_ai_anchor_metrics(self.device)
-        term, metrics = self.log_ai_anchor.compute_loss(
-            dataset=self.dataset,
-            device=self.device,
-            compose_impedance=self._compose_impedance,
-            training=training,
-        )
-        if training:
-            self._cached_log_ai_anchor_metrics = (term.detach(), metrics)
-        return term, metrics
-
     def _run_epoch(self, dataloader: DataLoader, *, training: bool) -> dict[str, float]:
         self.model.train(training)
         total_loss = 0.0
@@ -246,6 +232,7 @@ class Trainer:
         total_log_ai_anchor_term = 0.0
         total_log_ai_anchor_traces = 0.0
         total_log_ai_anchor_neighbors = 0.0
+        total_anchor_sample_count = 0.0
         n_batches = 0
 
         context = torch.enable_grad if training else torch.no_grad
@@ -258,15 +245,30 @@ class Trainer:
                 taper_weight = batch["taper_weight"].to(self.device)
                 lfm_raw = batch["lfm_raw"].to(self.device)
                 velocity_raw = batch["velocity_raw"].to(self.device)
+                anchor_target_log_ai = batch["anchor_target_log_ai"].to(self.device)
+                anchor_mask_weight = batch["anchor_mask_weight"].to(self.device)
+                well_influence = batch["well_influence"].to(self.device)
+                waveform_weight_scale = batch["waveform_weight_scale"].to(self.device)
                 dynamic_gain = batch.get("dynamic_gain")
                 if dynamic_gain is not None:
                     dynamic_gain = dynamic_gain.to(self.device)
 
                 ai, residual = self._compose_impedance(x, lfm_raw, taper_weight)
                 d_syn = self.forward_model(ai, velocity_raw, gain=dynamic_gain)
-                loss, loss_dict = self.criterion(d_syn, d_obs, loss_mask, core_mask, residual, taper_weight)
-                anchor_term, anchor_dict = self._compute_log_ai_anchor_loss(training=training, step=batch_idx) if training else zero_log_ai_anchor_metrics(self.device)
-                loss = loss + anchor_term
+                loss, loss_dict = self.criterion(
+                    d_syn,
+                    d_obs,
+                    loss_mask,
+                    core_mask,
+                    residual,
+                    taper_weight,
+                    pred_ai=ai,
+                    waveform_weight_scale=waveform_weight_scale if training else None,
+                    anchor_target_log_ai=anchor_target_log_ai if training else None,
+                    anchor_mask_weight=anchor_mask_weight if training else None,
+                    well_influence=well_influence if training else None,
+                    lambda_log_ai_anchor=self.cfg.lambda_log_ai_anchor if training else 0.0,
+                )
                 loss_value = float(loss.detach().cpu().item())
                 loss_dict["total"] = loss_value
                 residual_mean = float(residual.detach().abs().mean().cpu().item())
@@ -277,7 +279,7 @@ class Trainer:
                         f"(epoch={self.epoch + 1}, batch={batch_idx + 1}/{len(dataloader)}, "
                         f"global_step={self.global_step}, loss={loss_value}, "
                         f"mae={loss_dict['waveform_mae']}, l2={loss_dict['l2_term']}, "
-                        f"tv={loss_dict['tv_term']}, anchor={anchor_dict['log_ai_anchor_term']}, "
+                        f"tv={loss_dict['tv_term']}, anchor={loss_dict['log_ai_anchor_term']}, "
                         f"residual_mean={residual_mean})"
                     )
 
@@ -301,8 +303,8 @@ class Trainer:
                             f"global_step={self.global_step}, loss={loss_value:.6g}, "
                             f"mae={loss_dict['waveform_mae']:.6g}, l2={loss_dict['l2_term']:.6g}, "
                             f"tv={loss_dict['tv_term']:.6g}, "
-                            f"anchor={anchor_dict['log_ai_anchor_term']:.6g}, "
-                            f"anchor_neighbors={anchor_dict.get('log_ai_anchor_neighbors', 0.0)}, "
+                            f"anchor={loss_dict['log_ai_anchor_term']:.6g}, "
+                            f"anchor_samples={loss_dict.get('anchor_sample_count', 0.0)}, "
                             f"residual_mean={residual_mean:.6g})"
                         ) from exc
                     self.global_step += 1
@@ -313,10 +315,11 @@ class Trainer:
                 total_tv_term += loss_dict["tv_term"]
                 total_residual_mean += residual_mean
                 total_grad_norm += grad_norm_value
-                total_log_ai_anchor += anchor_dict["log_ai_anchor"]
-                total_log_ai_anchor_term += anchor_dict["log_ai_anchor_term"]
-                total_log_ai_anchor_traces += anchor_dict["log_ai_anchor_traces"]
-                total_log_ai_anchor_neighbors += anchor_dict.get("log_ai_anchor_neighbors", 0.0)
+                total_log_ai_anchor += loss_dict["log_ai_anchor"]
+                total_log_ai_anchor_term += loss_dict["log_ai_anchor_term"]
+                total_log_ai_anchor_traces += loss_dict["log_ai_anchor_traces"]
+                total_log_ai_anchor_neighbors += loss_dict.get("log_ai_anchor_neighbors", 0.0)
+                total_anchor_sample_count += loss_dict.get("anchor_sample_count", 0.0)
                 n_batches += 1
 
                 if training and (batch_idx + 1) % self.cfg.log_interval == 0:
@@ -331,7 +334,7 @@ class Trainer:
                         loss_dict["waveform_mae"],
                         loss_dict["l2_term"],
                         loss_dict["tv_term"],
-                        anchor_dict["log_ai_anchor_term"],
+                        loss_dict["log_ai_anchor_term"],
                         residual_mean,
                         grad_norm_value,
                         lr,
@@ -349,6 +352,7 @@ class Trainer:
             "log_ai_anchor_term": total_log_ai_anchor_term / n_batches,
             "log_ai_anchor_traces": total_log_ai_anchor_traces / n_batches,
             "log_ai_anchor_neighbors": total_log_ai_anchor_neighbors / n_batches,
+            "anchor_sample_count": total_anchor_sample_count / n_batches,
         }
 
     def train_one_epoch(self) -> dict[str, float]:
@@ -400,6 +404,8 @@ class Trainer:
             self.epoch = epoch
             epoch_start = time.time()
 
+            if self.train_batch_sampler is not None:
+                self.train_batch_sampler.set_epoch(epoch)
             train_metrics = self.train_one_epoch()
             self.scheduler.step()
             val_metrics = self.validate() if self.val_dataloader is not None else None
@@ -476,7 +482,10 @@ class Trainer:
                         self.best_epoch,
                         self._es_best,
                     )
-                    if self.cfg.early_stopping_patience > 0 and epochs_without_improvement >= self.cfg.early_stopping_patience:
+                    if (
+                        self.cfg.early_stopping_patience > 0
+                        and epochs_without_improvement >= self.cfg.early_stopping_patience
+                    ):
                         early_stop_triggered = True
                         logger.info(
                             "Early stopping triggered at epoch %d after %d stale validation epochs.",

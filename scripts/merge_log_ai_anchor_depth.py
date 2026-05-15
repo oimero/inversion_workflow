@@ -15,8 +15,8 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.seismic.survey import open_survey  # noqa: E402
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json  # noqa: E402
-from ginn.facies_anchor_depth import merge_well_and_facies_anchor_bundles  # noqa: E402
-from ginn.log_ai_anchor import load_log_ai_anchor_npz, save_log_ai_anchor_npz  # noqa: E402
+from ginn_depth.facies import merge_well_and_facies_anchor_bundles  # noqa: E402
+from ginn.anchor import load_log_ai_anchor_npz, save_log_ai_anchor_npz  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

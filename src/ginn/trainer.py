@@ -24,7 +24,7 @@ from ginn.data import build_dataset
 from ginn.loss import GINNLoss
 from ginn.model import DilatedResNet1D
 from ginn.physics import ForwardModel
-from ginn.well_anchor import LogAIAnchor, disabled_log_ai_anchor_summary, zero_log_ai_anchor_metrics
+from ginn.anchor import LogAIAnchor, disabled_log_ai_anchor_summary, zero_log_ai_anchor_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -431,6 +431,7 @@ class Trainer:
         total_log_ai_anchor_term = 0.0
         total_log_ai_anchor_traces = 0.0
         total_log_ai_anchor_neighbors = 0.0
+        total_anchor_sample_count = 0.0
         n_batches = 0
 
         context = torch.enable_grad if training else torch.no_grad
@@ -511,6 +512,7 @@ class Trainer:
                 total_log_ai_anchor_term += anchor_dict["log_ai_anchor_term"]
                 total_log_ai_anchor_traces += anchor_dict["log_ai_anchor_traces"]
                 total_log_ai_anchor_neighbors += anchor_dict.get("log_ai_anchor_neighbors", 0.0)
+                total_anchor_sample_count += anchor_dict.get("anchor_sample_count", 0.0)
                 n_batches += 1
 
                 if training and (batch_idx + 1) % self.cfg.log_interval == 0:
@@ -543,6 +545,7 @@ class Trainer:
             "log_ai_anchor_term": total_log_ai_anchor_term / n_batches,
             "log_ai_anchor_traces": total_log_ai_anchor_traces / n_batches,
             "log_ai_anchor_neighbors": total_log_ai_anchor_neighbors / n_batches,
+            "anchor_sample_count": total_anchor_sample_count / n_batches,
         }
 
     _LOG_AI_ANCHOR_SKIP = 1

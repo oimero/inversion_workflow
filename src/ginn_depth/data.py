@@ -23,7 +23,7 @@ from cup.well.wavelet import (
     make_wavelet,
 )
 from ginn.data import compute_dynamic_gain_median, normalize_dynamic_gain_input
-from ginn.log_ai_anchor import load_log_ai_anchor_npz, validate_log_ai_anchor
+from ginn.anchor import load_log_ai_anchor_npz, validate_log_ai_anchor
 from ginn.masking import build_eroded_loss_mask as _build_eroded_loss_mask
 from ginn.masking import build_residual_taper as _build_residual_taper
 from ginn.masking import get_valid_trace_indices as _get_valid_trace_indices

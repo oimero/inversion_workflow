@@ -20,8 +20,8 @@ if str(SRC_DIR) not in sys.path:
 from cup.seismic.facies_control_depth import build_target_layer_from_lfm_metadata, load_depth_facies_control_points_csv  # noqa: E402
 from cup.seismic.survey import open_survey  # noqa: E402
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, to_json_compatible, write_json  # noqa: E402
-from ginn.facies_anchor_depth import build_facies_control_anchor_bundle  # noqa: E402
-from ginn.log_ai_anchor import save_log_ai_anchor_npz  # noqa: E402
+from ginn_depth.facies import build_facies_control_anchor_bundle  # noqa: E402
+from ginn.anchor import save_log_ai_anchor_npz  # noqa: E402
 from ginn_depth.data import load_lfm_depth_npz  # noqa: E402
 
 

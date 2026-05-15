@@ -39,7 +39,7 @@ if str(SRC_DIR) not in sys.path:
 from cup.petrel.load import import_well_heads_petrel  # noqa: E402
 from cup.seismic.survey import open_survey  # noqa: E402
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path  # noqa: E402
-from ginn.log_ai_anchor import build_log_ai_anchor_bundle, save_log_ai_anchor_npz  # noqa: E402
+from ginn.anchor import build_log_ai_anchor_bundle, save_log_ai_anchor_npz  # noqa: E402
 from enhance.prior import (  # noqa: E402
     WellResolutionPriorBundle,
     save_well_resolution_prior_npz,

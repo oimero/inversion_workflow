@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from cup.seismic.facies_control_depth import FaciesControlPoint, locate_control_zone
-from ginn.log_ai_anchor import LogAIAnchorBundle, build_log_ai_anchor_bundle, validate_log_ai_anchor
+from ginn.anchor import LogAIAnchorBundle, build_log_ai_anchor_bundle, validate_log_ai_anchor
 
 
 class _SurveyLike(Protocol):

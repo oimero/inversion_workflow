@@ -240,13 +240,12 @@ class Trainer:
             for batch_idx, batch in enumerate(dataloader):
                 x = batch["input"].to(self.device)
                 d_obs = batch["obs"].to(self.device)
-                core_mask = batch["mask"].to(self.device)
                 loss_mask = batch["loss_mask"].to(self.device)
                 taper_weight = batch["taper_weight"].to(self.device)
                 lfm_raw = batch["lfm_raw"].to(self.device)
                 velocity_raw = batch["velocity_raw"].to(self.device)
                 anchor_target_log_ai = batch["anchor_target_log_ai"].to(self.device)
-                anchor_mask_weight = batch["anchor_mask_weight"].to(self.device)
+                anchor_weight = batch["anchor_weight"].to(self.device)
                 well_influence = batch["well_influence"].to(self.device)
                 waveform_weight_scale = batch["waveform_weight_scale"].to(self.device)
                 dynamic_gain = batch.get("dynamic_gain")
@@ -259,13 +258,12 @@ class Trainer:
                     d_syn,
                     d_obs,
                     loss_mask,
-                    core_mask,
                     residual,
                     taper_weight,
                     pred_ai=ai,
                     waveform_weight_scale=waveform_weight_scale if training else None,
                     anchor_target_log_ai=anchor_target_log_ai if training else None,
-                    anchor_mask_weight=anchor_mask_weight if training else None,
+                    anchor_weight=anchor_weight if training else None,
                     well_influence=well_influence if training else None,
                     lambda_log_ai_anchor=self.cfg.lambda_log_ai_anchor if training else 0.0,
                 )

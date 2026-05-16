@@ -77,15 +77,7 @@ def _replace_dataset_bundle_base_ai(dataset_bundle: DatasetBundle, base_ai_file:
 
 
 def _replace_dataset_base_ai(dataset: DepthSeismicTraceDataset, base_flat: np.ndarray) -> None:
-    if base_flat.shape != dataset.ai_lfm_flat.shape:
-        raise ValueError(
-            f"Base AI flat shape {base_flat.shape} does not match dataset AI shape {dataset.ai_lfm_flat.shape}."
-        )
-    dataset._ai_lfm_flat = base_flat  # type: ignore[attr-defined]
-    selected_mask = dataset._mask_flat[dataset.valid_indices]  # type: ignore[attr-defined]
-    selected_base_ai = base_flat[dataset.valid_indices]
-    valid_base_ai = selected_base_ai[selected_mask]
-    dataset._lfm_scale = float(np.abs(valid_base_ai).max()) + 1e-10  # type: ignore[attr-defined]
+    dataset.replace_base_ai(base_flat)
 
 
 def build_depth_enhancement_bundle(cfg: EnhancementConfig) -> DepthEnhancementBundle:

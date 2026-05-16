@@ -340,7 +340,7 @@ class LogAIAnchor:
     anchor_names: np.ndarray
     anchor_types: np.ndarray
     target_log_ai: Tensor
-    mask_weight: Tensor
+    anchor_weight: Tensor
 
     # Neighbourhood.
     neighborhood_radius: int = 0
@@ -516,7 +516,7 @@ class LogAIAnchor:
             anchor_names=np.asarray(anchor_bundle.anchor_names[rows]).astype(str),
             anchor_types=np.asarray(anchor_bundle.anchor_types[rows]).astype(str),
             target_log_ai=torch.from_numpy(target_log_ai),
-            mask_weight=torch.from_numpy(weights),
+            anchor_weight=torch.from_numpy(weights),
             neighborhood_radius=int(neighborhood_radius),
             neighbor_inputs=neighbor_inputs,
             neighbor_lfm_raw=neighbor_lfm_raw,
@@ -596,13 +596,13 @@ class LogAIAnchor:
 
             pred = pred_log_ai[cursor : cursor + n_valid]
             target = self.target_log_ai[r].expand(n_valid, -1).to(device)
-            mask = self.mask_weight[r].to(device)
+            anchor_weight = self.anchor_weight[r].to(device)
             w = w_flat[cursor : cursor + n_valid]
 
             raw = F.smooth_l1_loss(pred, target, reduction="none")  # (n_valid, n_sample)
-            weighted = raw * w.unsqueeze(-1) * mask.unsqueeze(0)
+            weighted = raw * w.unsqueeze(-1) * anchor_weight.unsqueeze(0)
             total_loss = total_loss + weighted.sum()
-            sample_weight = w.unsqueeze(-1) * mask.unsqueeze(0)
+            sample_weight = w.unsqueeze(-1) * anchor_weight.unsqueeze(0)
             total_denom = total_denom + sample_weight.sum()
             total_sample_count = total_sample_count + (sample_weight > 0.0).sum()
             cursor += n_valid

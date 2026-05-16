@@ -67,7 +67,7 @@ class WellControlData:
 
     flat_indices: np.ndarray
     target_log_ai: np.ndarray
-    mask_weight: np.ndarray
+    anchor_weight: np.ndarray
     well_influence: np.ndarray
     waveform_weight_scale: np.ndarray
     summary: Dict[str, Any]
@@ -77,7 +77,7 @@ class WellControlData:
         return cls(
             flat_indices=np.empty(0, dtype=np.int64),
             target_log_ai=np.zeros((0, int(n_sample)), dtype=np.float32),
-            mask_weight=np.zeros((0, int(n_sample)), dtype=np.float32),
+            anchor_weight=np.zeros((0, int(n_sample)), dtype=np.float32),
             well_influence=np.zeros((0,), dtype=np.float32),
             waveform_weight_scale=np.ones((0,), dtype=np.float32),
             summary={} if summary is None else dict(summary),
@@ -370,9 +370,9 @@ def build_well_control_data(
     rows = np.array([best_by_flat[int(flat)][1] for flat in flat_indices], dtype=np.int64)
     target_log_ai = np.asarray(anchor_bundle.target_log_ai[rows], dtype=np.float32)
     valid = np.asarray(anchor_bundle.anchor_mask[rows], dtype=bool) & np.isfinite(target_log_ai)
-    mask_weight = np.asarray(anchor_bundle.anchor_weight[rows], dtype=np.float32)
-    mask_weight = np.where(np.isfinite(mask_weight) & (mask_weight > 0.0), mask_weight, 0.0)
-    mask_weight = (mask_weight * valid.astype(np.float32)).astype(np.float32)
+    anchor_weight = np.asarray(anchor_bundle.anchor_weight[rows], dtype=np.float32)
+    anchor_weight = np.where(np.isfinite(anchor_weight) & (anchor_weight > 0.0), anchor_weight, 0.0)
+    anchor_weight = (anchor_weight * valid.astype(np.float32)).astype(np.float32)
     waveform_weight_scale = (1.0 - (1.0 - float(well_waveform_min_weight)) * influences).astype(np.float32)
 
     anchor_names = np.asarray(anchor_bundle.anchor_names).astype(str)
@@ -408,7 +408,7 @@ def build_well_control_data(
     return WellControlData(
         flat_indices=flat_indices,
         target_log_ai=target_log_ai,
-        mask_weight=mask_weight,
+        anchor_weight=anchor_weight,
         well_influence=influences,
         waveform_weight_scale=waveform_weight_scale,
         summary=summary,
@@ -545,7 +545,7 @@ class DepthSeismicTraceDataset(Dataset):
         self._include_mask_input = bool(include_mask_input)
         self._include_dynamic_gain_input = bool(include_dynamic_gain_input)
         self._zero_anchor_target_log_ai = np.zeros((n_sample,), dtype=np.float32)
-        self._zero_anchor_mask_weight = np.zeros((n_sample,), dtype=np.float32)
+        self._zero_anchor_weight = np.zeros((n_sample,), dtype=np.float32)
         self._well_control = WellControlData.empty(n_sample) if well_control_data is None else well_control_data
         self._well_control_lookup = {
             int(flat_idx): row
@@ -653,13 +653,13 @@ class DepthSeismicTraceDataset(Dataset):
         control_row = self._well_control_lookup.get(int(flat_idx))
         if control_row is None:
             anchor_target_log_ai = self._zero_anchor_target_log_ai
-            anchor_mask_weight = self._zero_anchor_mask_weight
+            anchor_weight = self._zero_anchor_weight
             well_influence = np.float32(0.0)
             waveform_weight_scale = np.float32(1.0)
             has_anchor = np.float32(0.0)
         else:
             anchor_target_log_ai = self._well_control.target_log_ai[control_row]
-            anchor_mask_weight = self._well_control.mask_weight[control_row]
+            anchor_weight = self._well_control.anchor_weight[control_row]
             well_influence = np.float32(self._well_control.well_influence[control_row])
             waveform_weight_scale = np.float32(self._well_control.waveform_weight_scale[control_row])
             has_anchor = np.float32(1.0)
@@ -690,7 +690,7 @@ class DepthSeismicTraceDataset(Dataset):
             "velocity_raw": torch.from_numpy(velocity_raw[np.newaxis]).float(),
             "flat_index": torch.tensor(int(flat_idx), dtype=torch.long),
             "anchor_target_log_ai": torch.from_numpy(anchor_target_log_ai[np.newaxis]).float(),
-            "anchor_mask_weight": torch.from_numpy(anchor_mask_weight[np.newaxis]).float(),
+            "anchor_weight": torch.from_numpy(anchor_weight[np.newaxis]).float(),
             "well_influence": torch.tensor([float(well_influence)], dtype=torch.float32),
             "waveform_weight_scale": torch.tensor([float(waveform_weight_scale)], dtype=torch.float32),
             "has_anchor": torch.tensor([float(has_anchor)], dtype=torch.float32),
@@ -698,6 +698,31 @@ class DepthSeismicTraceDataset(Dataset):
         if dynamic_gain is not None:
             item["dynamic_gain"] = torch.from_numpy(dynamic_gain[np.newaxis]).float()
         return item
+
+    def replace_base_ai(self, ai_lfm_flat: np.ndarray) -> None:
+        """Replace the base AI volume while keeping mask/taper/well-control metadata.
+
+        Parameters
+        ----------
+        ai_lfm_flat : np.ndarray
+            New base AI flat array, shape ``(n_traces, n_sample)``.
+        """
+        base_flat = np.asarray(ai_lfm_flat, dtype=np.float32)
+        if base_flat.shape != self._ai_lfm_flat.shape:
+            raise ValueError(
+                f"Base AI flat shape {base_flat.shape} does not match dataset AI shape {self._ai_lfm_flat.shape}."
+            )
+        self._ai_lfm_flat = base_flat
+        selected_mask = self._mask_flat[self._valid_indices]
+        selected_base_ai = base_flat[self._valid_indices]
+        valid_base_ai = selected_base_ai[selected_mask]
+        valid_base_ai = valid_base_ai[np.isfinite(valid_base_ai)]
+        if valid_base_ai.size == 0:
+            raise ValueError("No finite base AI samples inside the dataset mask.")
+        max_abs = float(np.abs(valid_base_ai).max())
+        if max_abs <= 0.0:
+            raise ValueError("Base AI maximum absolute value must be positive.")
+        self._lfm_scale = max_abs + 1e-10
 
 
 class MixedWellBatchSampler(Sampler[list[int]]):

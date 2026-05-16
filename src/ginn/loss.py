@@ -1,9 +1,11 @@
-"""ginn.loss — 掩码 MAE 损失函数 + 高频扰动正则化。
+"""ginn.loss — masked MAE + perturbation regularisation for GINN.
 
-组合三项损失：
-1. 掩码 MAE：仅在层位顶底之间计算合成地震与观测地震的平均绝对误差
-2. 高频扰动 L2 正则：防止阻抗偏离 LFM 过远
-3. 高频扰动 TV 正则：抑制沿时间轴的一阶高频振荡
+Composes three loss terms:
+1. loss-mask MAE: mean absolute error between synthetic and observed seismic
+   inside the eroded loss mask.
+2. perturbation L2: discourages the predicted AI from drifting too far from
+   the low-frequency model.
+3. perturbation TV: penalises first-order oscillation along the trace axis.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from torch import Tensor
 
 
 class GINNLoss(nn.Module):
-    """GINN 组合损失：掩码 MAE + 高频扰动 L2/TV 正则化。
+    """GINN composite loss: masked MAE + L2/TV perturbation regularisation.
 
     .. math::
         \\mathcal{L} = \\underbrace{\\frac{\\sum |d_{syn} - d_{obs}| \\cdot m}{\\sum m}}_{\\text{waveform MAE}}
@@ -25,18 +27,11 @@ class GINNLoss(nn.Module):
     Parameters
     ----------
     lambda_l2 : float
-        高频扰动 L2 正则化权重。默认 0.1。
-        物理意义：强制阻抗不偏离低频模型太远，解决反射率比值不变性
-        导致的绝对尺度不确定性。
+        Perturbation L2 weight (default 0.1).  Anchors ``phi`` near zero
+        to resolve the absolute-scale ambiguity of the reflectivity formula.
     lambda_tv : float
-        高频扰动 TV 正则化权重。默认 0.0。
-        物理意义：惩罚沿时间轴的一阶差分，抑制会被子波滤掉的高频 null-space ringing。
-
-    Notes
-    -----
-    反射率公式 ``r = (AI[t+1] - AI[t]) / (AI[t+1] + AI[t])`` 对 AI 的全局
-    缩放是不变的。L2 正则化将高频扰动 ``phi`` 锚定在零附近，避免阻抗
-    在满足波形拟合时偏离低频模型过远。
+        Perturbation TV weight (default 0.0).  Penalises first-order trace
+        differences to suppress high-frequency null-space ringing.
     """
 
     def __init__(self, lambda_l2: float = 0.1, lambda_tv: float = 0.0) -> None:
@@ -48,61 +43,71 @@ class GINNLoss(nn.Module):
         self,
         d_syn: Tensor,
         d_obs: Tensor,
-        waveform_mask: Tensor,
-        residual_mask: Tensor,
+        loss_mask: Tensor,
         residual: Tensor,
         taper_weight: Tensor,
         *,
         pred_ai: Tensor | None = None,
         waveform_weight_scale: Tensor | None = None,
         anchor_target_log_ai: Tensor | None = None,
-        anchor_mask_weight: Tensor | None = None,
+        anchor_weight: Tensor | None = None,
         well_influence: Tensor | None = None,
         lambda_log_ai_anchor: float = 0.0,
     ) -> tuple[Tensor, dict[str, float]]:
-        """计算组合损失。
+        """Compute the composite loss.
 
         Parameters
         ----------
         d_syn : Tensor
-            合成地震记录，shape ``(B, 1, T)``。
+            Synthetic seismic, shape ``(B, 1, T)``.
         d_obs : Tensor
-            观测地震记录，shape ``(B, 1, T)``。
-        waveform_mask : Tensor
-            波形误差掩码，shape ``(B, 1, T)``，True 表示参与 waveform loss 的区域。
-        residual_mask : Tensor
-            高频扰动正则掩码，shape ``(B, 1, T)``。保留该参数用于调用兼容；
-            当前 perturbation L2 使用 ``taper_weight`` 的 core+halo 支撑区。
+            Observed seismic, shape ``(B, 1, T)``.
+        loss_mask : Tensor
+            Eroded waveform loss mask, shape ``(B, 1, T)``, True where
+            waveform MAE is computed.
         residual : Tensor
-            与 LFM 合成阻抗的高频扰动 ``phi``，shape ``(B, 1, T)``。
+            High-frequency perturbation ``phi``, shape ``(B, 1, T)``.
         taper_weight : Tensor
-            高频扰动的 core+halo taper 权重，shape ``(B, 1, T)``。
-            TV 项使用相邻点对的最小权重作为 pair-wise 支撑。
+            Core+halo taper weights for perturbation L2/TV support,
+            shape ``(B, 1, T)``.  The TV term uses the element-wise
+            minimum of adjacent sample weights.
+        pred_ai : Tensor or None
+            Predicted AI, shape ``(B, 1, T)``.  Required when anchor
+            supervision is active.
+        waveform_weight_scale : Tensor or None
+            Per-trace scale applied to the loss mask (well-control taper).
+        anchor_target_log_ai : Tensor or None
+            Anchor target log-AI, shape ``(B, 1, T)``.
+        anchor_weight : Tensor or None
+            Per-sample anchor confidence weights, shape ``(B, 1, T)``.
+        well_influence : Tensor or None
+            Per-trace well influence factor, shape ``(B, 1)``.
+        lambda_log_ai_anchor : float
+            Anchor loss weight. 0.0 disables anchor supervision.
 
         Returns
         -------
         total_loss : Tensor
-            标量总损失。
+            Scalar total loss.
         loss_dict : dict
-            包含各分项的浮点值，用于日志记录。
+            Per-term float values for logging.
         """
-        waveform_mask_f = waveform_mask.float()
+        loss_mask_f = loss_mask.to(device=d_syn.device, dtype=d_syn.dtype)
         if waveform_weight_scale is not None:
-            scale = waveform_weight_scale.to(device=waveform_mask_f.device, dtype=waveform_mask_f.dtype)
+            scale = waveform_weight_scale.to(device=loss_mask_f.device, dtype=loss_mask_f.dtype)
             scale = scale.reshape(scale.shape[0], 1, 1)
-            waveform_mask_f = waveform_mask_f * scale
-        del residual_mask
+            loss_mask_f = loss_mask_f * scale
         taper_weight_f = taper_weight.to(device=residual.device, dtype=residual.dtype)
-        n_waveform_valid = waveform_mask_f.sum().clamp(min=1.0)
+        n_waveform_valid = loss_mask_f.sum().clamp(min=1.0)
         n_residual_valid = taper_weight_f.sum().clamp(min=1.0)
 
-        # 波形 MAE
-        waveform_mae = ((d_syn - d_obs).abs() * waveform_mask_f).sum() / n_waveform_valid
+        # Waveform MAE (inside eroded loss mask).
+        waveform_mae = ((d_syn - d_obs).abs() * loss_mask_f).sum() / n_waveform_valid
 
-        # 高频扰动 L2 正则化（作用于 core+halo taper 支撑区）
+        # Perturbation L2 (core+halo taper support).
         residual_l2 = (residual.pow(2) * taper_weight_f).sum() / n_residual_valid
 
-        # 高频扰动 TV 正则化（沿时间轴一阶差分，作用于 core+halo taper 支撑区）
+        # Perturbation TV (first-order trace difference over taper support).
         diff = residual[..., 1:] - residual[..., :-1]
         pair_weight = torch.minimum(taper_weight_f[..., 1:], taper_weight_f[..., :-1])
         pair_weight_sum = pair_weight.sum().clamp(min=1.0)
@@ -119,22 +124,22 @@ class GINNLoss(nn.Module):
         if (
             pred_ai is not None
             and anchor_target_log_ai is not None
-            and anchor_mask_weight is not None
+            and anchor_weight is not None
             and lambda_log_ai_anchor > 0.0
         ):
-            anchor_weight = anchor_mask_weight.to(device=pred_ai.device, dtype=pred_ai.dtype)
+            aw = anchor_weight.to(device=pred_ai.device, dtype=pred_ai.dtype)
             if well_influence is not None:
                 influence = well_influence.to(device=pred_ai.device, dtype=pred_ai.dtype)
                 influence = influence.reshape(influence.shape[0], 1, 1)
-                anchor_weight = anchor_weight * influence
-            positive_anchor = anchor_weight > 0.0
+                aw = aw * influence
+            positive_anchor = aw > 0.0
             anchor_sample_count = positive_anchor.sum().to(dtype=pred_ai.dtype)
             anchor_trace_count = positive_anchor.any(dim=-1).sum().to(dtype=pred_ai.dtype)
-            anchor_denom = anchor_weight.sum().clamp(min=1.0)
+            anchor_denom = aw.sum().clamp(min=1.0)
             target = anchor_target_log_ai.to(device=pred_ai.device, dtype=pred_ai.dtype)
             pred_log_ai = torch.log(torch.clamp(pred_ai, min=1e-6))
             raw_anchor = F.smooth_l1_loss(pred_log_ai, target, reduction="none")
-            anchor_loss = (raw_anchor * anchor_weight).sum() / anchor_denom
+            anchor_loss = (raw_anchor * aw).sum() / anchor_denom
             anchor_term = float(lambda_log_ai_anchor) * anchor_loss
             total_loss = total_loss + anchor_term
 

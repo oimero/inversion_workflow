@@ -435,10 +435,9 @@ class Trainer:
         context = torch.enable_grad if training else torch.no_grad
         with context():
             for batch_idx, batch in enumerate(dataloader):
-                x = batch["input"].to(self.device)  # (B, 3, T)
-                d_obs = batch["obs"].to(self.device)  # (B, 1, T)
-                core_mask = batch["mask"].to(self.device)  # (B, 1, T)
-                loss_mask = batch["loss_mask"].to(self.device)  # (B, 1, T)
+                x = batch["input"].to(self.device)
+                d_obs = batch["obs"].to(self.device)
+                loss_mask = batch["loss_mask"].to(self.device)
                 taper_weight = batch["taper_weight"].to(self.device)  # (B, 1, T)
                 lfm_raw = batch["lfm_raw"].to(self.device)  # (B, 1, T)
                 dynamic_gain = batch.get("dynamic_gain")
@@ -452,7 +451,7 @@ class Trainer:
                 d_syn = self.forward_model(ai, gain=dynamic_gain)  # (B, 1, T)
 
                 # 3. 损失
-                loss, loss_dict = self.criterion(d_syn, d_obs, loss_mask, core_mask, residual, taper_weight)
+                loss, loss_dict = self.criterion(d_syn, d_obs, loss_mask, residual, taper_weight)
                 anchor_term, anchor_dict = (
                     self._compute_log_ai_anchor_loss(training=training, step=batch_idx)
                     if training

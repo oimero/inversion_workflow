@@ -342,8 +342,22 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         base_vp = item["velocity_raw"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         taper = item["taper_weight"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         core_mask = item["mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
-        loss_mask = item.get("loss_mask", item["mask"]).squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
-        delta_loss_mask = core_mask if self.delta_supervision_mask == "core" else loss_mask
+        has_base_loss_mask = "loss_mask" in item
+        if self.delta_supervision_mask == "loss":
+            if not has_base_loss_mask:
+                raise KeyError(
+                    "Base depth dataset item must contain 'loss_mask' "
+                    "when delta_supervision_mask='loss'."
+                )
+            loss_mask = item["loss_mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
+            delta_loss_mask = loss_mask
+        else:
+            loss_mask = (
+                item["loss_mask"].squeeze(0).detach().cpu().numpy().astype(bool, copy=False)
+                if has_base_loss_mask
+                else core_mask
+            )
+            delta_loss_mask = core_mask
         waveform_qc_mask = core_mask
 
         safe_base_ai = np.maximum(base_ai, 1e-6)
@@ -425,7 +439,8 @@ class WellGuidedSyntheticDepthTraceDataset(Dataset):
         item["synthetic_mode"] = torch.tensor(mode_code, dtype=torch.int64)
         item["synthetic_empty_residual"] = torch.tensor(synthetic_empty_residual, dtype=torch.bool)
         item["mask"] = torch.from_numpy(core_mask[np.newaxis]).bool()
-        item["loss_mask"] = torch.from_numpy(loss_mask[np.newaxis]).bool()
+        if has_base_loss_mask:
+            item["loss_mask"] = torch.from_numpy(loss_mask[np.newaxis]).bool()
         item["delta_loss_mask"] = torch.from_numpy(delta_loss_mask[np.newaxis]).bool()
         input_seismic_clean = target_seismic.astype(np.float32, copy=True)
         input_seismic_augmented = self._augment_input_seismic(

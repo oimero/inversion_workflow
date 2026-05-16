@@ -36,20 +36,20 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.petrel.load import import_well_heads_petrel  # noqa: E402
-from cup.seismic.survey import open_survey  # noqa: E402
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path  # noqa: E402
-from ginn.anchor import build_log_ai_anchor_bundle, save_log_ai_anchor_npz  # noqa: E402
-from enhance.prior import (  # noqa: E402
+from cup.petrel.load import import_well_heads_petrel
+from cup.seismic.survey import open_survey
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path
+from enhance.prior import (
     WellResolutionPriorBundle,
     save_well_resolution_prior_npz,
     summarize_well_resolution_prior,
 )
-from ginn_depth.data import load_lfm_depth_npz  # noqa: E402
-from wtie.optimize import tie as tie_utils  # noqa: E402
-from wtie.optimize.logs import filter_log  # noqa: E402
-from wtie.processing import grid  # noqa: E402
-from wtie.processing.spectral import apply_butter_lowpass_filter  # noqa: E402
+from ginn.anchor import build_log_ai_anchor_bundle, save_log_ai_anchor_npz
+from ginn_depth.data import load_lfm_depth_npz
+from wtie.optimize import tie as tie_utils
+from wtie.optimize.logs import filter_log
+from wtie.processing import grid
+from wtie.processing.spectral import apply_butter_lowpass_filter
 
 # =============================================================================
 # CLI
@@ -289,14 +289,14 @@ def _split_log_ai_frequency_bands(
                 filtered = values
             else:
                 run_pad = min(pad_samples, values.size - 1)
-                padded = np.pad(values, (run_pad, run_pad), mode=buffer_mode)
+                padded = np.pad(values, (run_pad, run_pad), mode=buffer_mode)  # type: ignore
                 filtered = apply_butter_lowpass_filter(
                     padded,
                     highcut,
                     fs,
                     order=order,
                     zero_phase=True,
-                )[run_pad:run_pad + values.size]
+                )[run_pad : run_pad + values.size]
             well_low_ai[start:stop] = np.clip(filtered, 1e-6, None).astype(np.float32)
 
     low_valid = mask & np.isfinite(well_low_ai) & (well_low_ai > 0.0)
@@ -414,7 +414,9 @@ def _build_highres_prior_trace(
     }
 
 
-def _pad_highres_records(records: list[dict[str, Any]], key: str, *, dtype: np.dtype, fill_value: float | bool) -> np.ndarray:
+def _pad_highres_records(
+    records: list[dict[str, Any]], key: str, *, dtype: np.dtype, fill_value: float | bool
+) -> np.ndarray:
     """Pad variable-length high-resolution well arrays to a rectangular bundle field."""
     max_len = max(int(np.asarray(row[key]).size) for row in records)
     padded = np.full((len(records), max_len), fill_value, dtype=dtype)
@@ -682,30 +684,30 @@ def main() -> None:
     well_low_log_ai = np.stack([row["well_low_log_ai"] for row in records]).astype(np.float32)
     well_high_log_ai = np.stack([row["well_high_log_ai"] for row in records]).astype(np.float32)
     residual_log_ai = np.stack([row["residual_log_ai"] for row in records]).astype(np.float32)
-    highres_depth = _pad_highres_records(records, "highres_depth", dtype=np.float32, fill_value=0.0)
-    highres_well_ai = _pad_highres_records(records, "highres_well_ai", dtype=np.float32, fill_value=0.0)
-    highres_well_log_ai = _pad_highres_records(records, "highres_well_log_ai", dtype=np.float32, fill_value=0.0)
-    highres_well_low_ai = _pad_highres_records(records, "highres_well_low_ai", dtype=np.float32, fill_value=0.0)
+    highres_depth = _pad_highres_records(records, "highres_depth", dtype=np.float32, fill_value=0.0)  # type: ignore
+    highres_well_ai = _pad_highres_records(records, "highres_well_ai", dtype=np.float32, fill_value=0.0)  # type: ignore
+    highres_well_log_ai = _pad_highres_records(records, "highres_well_log_ai", dtype=np.float32, fill_value=0.0)  # type: ignore
+    highres_well_low_ai = _pad_highres_records(records, "highres_well_low_ai", dtype=np.float32, fill_value=0.0)  # type: ignore
     highres_well_low_log_ai = _pad_highres_records(
         records,
         "highres_well_low_log_ai",
-        dtype=np.float32,
+        dtype=np.float32,  # type: ignore
         fill_value=0.0,
     )
     highres_well_high_log_ai = _pad_highres_records(
         records,
         "highres_well_high_log_ai",
-        dtype=np.float32,
+        dtype=np.float32,  # type: ignore
         fill_value=0.0,
     )
-    highres_lfm_log_ai = _pad_highres_records(records, "highres_lfm_log_ai", dtype=np.float32, fill_value=0.0)
+    highres_lfm_log_ai = _pad_highres_records(records, "highres_lfm_log_ai", dtype=np.float32, fill_value=0.0)  # type: ignore
     highres_residual_log_ai = _pad_highres_records(
         records,
         "highres_residual_log_ai",
-        dtype=np.float32,
+        dtype=np.float32,  # type: ignore
         fill_value=0.0,
     )
-    highres_well_mask = _pad_highres_records(records, "highres_well_mask", dtype=bool, fill_value=False)
+    highres_well_mask = _pad_highres_records(records, "highres_well_mask", dtype=bool, fill_value=False)  # type: ignore
     summary = summarize_well_resolution_prior(
         residual_log_ai,
         well_mask,

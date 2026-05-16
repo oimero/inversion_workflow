@@ -99,7 +99,7 @@ class DepthGINNConfig:
     lambda_log_ai_anchor: float = 1.0  # log(AI) anchor 监督权重；0 表示关闭。
     log_ai_anchor_neighborhood_radius: int = 5  # anchor 邻域半径（网格单位）；0=仅中心道。
     well_control_enabled: bool = True  # 是否启用井-地震分治：井邻域内井 anchor 进入常规 batch。
-    well_waveform_min_weight: float = 0.2  # 井中心保留的最小 waveform loss 权重。
+    well_waveform_min_weight: float = 0.4  # 井中心保留的最小 waveform loss 权重。
     well_anchor_batch_fraction: float = 0.25  # 训练 batch 中井影响区样本的目标占比。
     well_anchor_distance_decay: WellAnchorDistanceDecay = "gaussian"  # 井影响随距离衰减方式。
     zero_residual_outside_mask: bool = True  # 是否将层外高频扰动通过 taper 平滑压回 0。

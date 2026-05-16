@@ -26,7 +26,7 @@ import pandas as pd
 import torch
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 
 # =============================================================================
 # Bootstrap
@@ -38,20 +38,20 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.petrel.load import import_well_heads_petrel  # noqa: E402
-from cup.seismic.survey import open_survey  # noqa: E402
-from cup.utils.io import (  # noqa: E402
+from cup.petrel.load import import_well_heads_petrel
+from cup.seismic.survey import open_survey
+from cup.utils.io import (
     build_segy_textual_header,
     load_yaml_config,
     resolve_relative_path,
     sanitize_filename,
 )
-from ginn_depth.config import DepthGINNConfig  # noqa: E402
-from ginn_depth.trainer import Trainer  # noqa: E402
-from wtie.optimize import tie as tie_utils  # noqa: E402
-from wtie.optimize.logs import filter_log  # noqa: E402
-from wtie.processing import grid  # noqa: E402
-from wtie.processing.spectral import apply_butter_lowpass_filter  # noqa: E402
+from ginn_depth.config import DepthGINNConfig
+from ginn_depth.trainer import Trainer
+from wtie.optimize import tie as tie_utils
+from wtie.optimize.logs import filter_log
+from wtie.processing import grid
+from wtie.processing.spectral import apply_butter_lowpass_filter
 
 # =============================================================================
 # CLI
@@ -360,7 +360,11 @@ def _lowpass_ai_curve(depth: np.ndarray, ai: np.ndarray, split_params: dict[str,
     if ai.size <= max(3, order):
         return ai.astype(np.float32, copy=True)
     pad_samples = min(max(1, 3 * order), ai.size - 1)
-    padded = np.pad(ai.astype(np.float64), (pad_samples, pad_samples), mode=str(split_params.get("buffer_mode", "reflect")))
+    padded = np.pad(
+        ai.astype(np.float64),
+        (pad_samples, pad_samples),
+        mode=str(split_params.get("buffer_mode", "reflect")),  # type: ignore
+    )  # type: ignore
     filtered = apply_butter_lowpass_filter(
         padded,
         highcut,
@@ -617,7 +621,9 @@ def main() -> None:
                     raise ValueError("no overlapping finite samples")
 
                 diff = pred_ai[valid] - ref_ai_anchor[valid]
-                corr = float(np.corrcoef(pred_ai[valid], ref_ai_anchor[valid])[0, 1]) if int(valid.sum()) > 1 else np.nan
+                corr = (
+                    float(np.corrcoef(pred_ai[valid], ref_ai_anchor[valid])[0, 1]) if int(valid.sum()) > 1 else np.nan
+                )
                 safe_name = sanitize_filename(str(head["Name"]))
                 trace_qc_path = output_dirs["well_qc_traces"] / f"well_qc_{safe_name}.csv"
                 pd.DataFrame(

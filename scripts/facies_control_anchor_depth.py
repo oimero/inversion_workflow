@@ -17,12 +17,21 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.seismic.facies_control_depth import build_target_layer_from_lfm_metadata, load_depth_facies_control_points_csv  # noqa: E402
-from cup.seismic.survey import open_survey  # noqa: E402
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, to_json_compatible, write_json  # noqa: E402
-from ginn_depth.facies import build_facies_control_anchor_bundle  # noqa: E402
-from ginn.anchor import save_log_ai_anchor_npz  # noqa: E402
-from ginn_depth.data import load_lfm_depth_npz  # noqa: E402
+from cup.seismic.facies_control_depth import (
+    build_target_layer_from_lfm_metadata,
+    load_depth_facies_control_points_csv,
+)
+from cup.seismic.survey import open_survey
+from cup.utils.io import (
+    load_yaml_config,
+    repo_relative_path,
+    resolve_relative_path,
+    to_json_compatible,
+    write_json,
+)
+from ginn.anchor import save_log_ai_anchor_npz
+from ginn_depth.data import load_lfm_depth_npz
+from ginn_depth.facies import build_facies_control_anchor_bundle
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,7 +44,9 @@ def parse_args() -> argparse.Namespace:
 def _jsonify_horizons(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if "horizon_values" in out.columns:
-        out["horizon_values"] = out["horizon_values"].map(lambda value: json.dumps(to_json_compatible(value), ensure_ascii=False))
+        out["horizon_values"] = out["horizon_values"].map(
+            lambda value: json.dumps(to_json_compatible(value), ensure_ascii=False)
+        )
     return out
 
 
@@ -83,7 +94,9 @@ def main() -> None:
     print(f"Output dir: {output_dir}")
 
     ai_lfm = load_lfm_depth_npz(ai_lfm_file)
-    target_layer = build_target_layer_from_lfm_metadata(ai_lfm.metadata, ai_lfm.geometry, qc_output_dir=output_dir / "target_layer_qc")
+    target_layer = build_target_layer_from_lfm_metadata(
+        ai_lfm.metadata, ai_lfm.geometry, qc_output_dir=output_dir / "target_layer_qc"
+    )
     control_points = load_depth_facies_control_points_csv(control_points_file)
     result = build_facies_control_anchor_bundle(
         control_points=control_points,

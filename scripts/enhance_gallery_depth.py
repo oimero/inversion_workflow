@@ -43,8 +43,8 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.utils.statistics import normalized_cross_correlation, rms  # noqa: E402
-from cup.utils.io import load_yaml_config, resolve_relative_path  # noqa: E402
+from cup.utils.io import load_yaml_config, resolve_relative_path
+from cup.utils.statistics import normalized_cross_correlation, rms
 
 # =============================================================================
 # CLI
@@ -266,7 +266,7 @@ def shade_mask(ax: plt.Axes, x: np.ndarray, mask: np.ndarray, *, label: str | No
     if x.size != mask.size or mask.size == 0:
         return
     y0, y1 = ax.get_ylim()
-    ax.fill_between(x, y0, y1, where=mask, color="0.90", alpha=0.55, linewidth=0, zorder=0, label=label)
+    ax.fill_between(x, y0, y1, where=mask, color="0.90", alpha=0.55, linewidth=0, zorder=0, label=label)  # type: ignore
     ax.set_ylim(y0, y1)
 
 
@@ -578,8 +578,8 @@ def main() -> None:
 
     import torch
 
-    from enhance.prior import load_well_resolution_prior_npz
     from enhance.config import EnhancementConfig
+    from enhance.prior import load_well_resolution_prior_npz
     from ginn_depth.enhance import build_depth_enhancement_bundle
 
     config_path = args.config if args.config.is_absolute() else REPO_ROOT / args.config

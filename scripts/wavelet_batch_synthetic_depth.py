@@ -37,7 +37,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.utils.io import (  # noqa: E402
+from cup.utils.io import (
     load_yaml_config,
     repo_relative_path,
     resolve_relative_path,

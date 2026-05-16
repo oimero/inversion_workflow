@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 
 # =============================================================================
 # Bootstrap
@@ -37,15 +37,15 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.seismic.facies_control_depth import (  # noqa: E402
+from cup.seismic.facies_control_depth import (
     SCHEMA_VERSION,
     apply_depth_facies_controls,
     build_target_layer_from_lfm_metadata,
     build_trace_xy_grids,
     load_depth_facies_control_points_csv,
 )
-from cup.seismic.survey import open_survey  # noqa: E402
-from cup.utils.io import (  # noqa: E402
+from cup.seismic.survey import open_survey
+from cup.utils.io import (
     build_segy_textual_header,
     load_yaml_config,
     repo_relative_path,
@@ -53,7 +53,7 @@ from cup.utils.io import (  # noqa: E402
     to_json_compatible,
     write_json,
 )
-from ginn_depth.data import load_lfm_depth_npz  # noqa: E402
+from ginn_depth.data import load_lfm_depth_npz
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,13 +191,17 @@ def _plot_qc(
     vmin = float(np.nanpercentile(source[i_il], 1.0))
     vmax = float(np.nanpercentile(source[i_il], 99.0))
 
-    im0 = axes[0, 0].imshow(source[i_il].T, aspect="auto", origin="upper", extent=extent_inline, cmap="viridis", vmin=vmin, vmax=vmax)
+    im0 = axes[0, 0].imshow(
+        source[i_il].T, aspect="auto", origin="upper", extent=extent_inline, cmap="viridis", vmin=vmin, vmax=vmax
+    )
     axes[0, 0].set_title(f"Before | inline={ilines[i_il]:.0f}")
     axes[0, 0].set_xlabel("Xline")
     axes[0, 0].set_ylabel("Depth (m)")
     fig.colorbar(im0, ax=axes[0, 0], shrink=0.85)
 
-    im1 = axes[0, 1].imshow(controlled[i_il].T, aspect="auto", origin="upper", extent=extent_inline, cmap="viridis", vmin=vmin, vmax=vmax)
+    im1 = axes[0, 1].imshow(
+        controlled[i_il].T, aspect="auto", origin="upper", extent=extent_inline, cmap="viridis", vmin=vmin, vmax=vmax
+    )
     axes[0, 1].set_title("After")
     axes[0, 1].set_xlabel("Xline")
     axes[0, 1].set_ylabel("Depth (m)")
@@ -205,7 +209,15 @@ def _plot_qc(
 
     diff_clip = float(np.nanpercentile(np.abs(diff[i_il]), 99.0))
     diff_clip = max(diff_clip, 1.0)
-    im2 = axes[1, 0].imshow(diff[i_il].T, aspect="auto", origin="upper", extent=extent_inline, cmap="coolwarm", vmin=-diff_clip, vmax=diff_clip)
+    im2 = axes[1, 0].imshow(
+        diff[i_il].T,
+        aspect="auto",
+        origin="upper",
+        extent=extent_inline,
+        cmap="coolwarm",
+        vmin=-diff_clip,
+        vmax=diff_clip,
+    )
     axes[1, 0].set_title("After - Before")
     axes[1, 0].set_xlabel("Xline")
     axes[1, 0].set_ylabel("Depth (m)")

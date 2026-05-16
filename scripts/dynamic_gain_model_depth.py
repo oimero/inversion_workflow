@@ -36,8 +36,8 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.utils.io import build_segy_textual_header, load_yaml_config, repo_relative_path  # noqa: E402
-from cup.utils.raw_trace import (  # noqa: E402
+from cup.utils.io import build_segy_textual_header, load_yaml_config, repo_relative_path
+from cup.utils.raw_trace import (
     centered_moving_rms_axis,
     centered_moving_sum_axis,
     meters_to_odd_samples,

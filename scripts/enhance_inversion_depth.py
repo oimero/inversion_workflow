@@ -22,7 +22,7 @@ import pandas as pd
 import torch
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 
 # =============================================================================
 # Bootstrap
@@ -34,21 +34,21 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.petrel.load import import_well_heads_petrel  # noqa: E402
-from cup.seismic.survey import open_survey  # noqa: E402
-from cup.utils.io import (  # noqa: E402
+from cup.petrel.load import import_well_heads_petrel
+from cup.seismic.survey import open_survey
+from cup.utils.io import (
     build_segy_textual_header,
     load_yaml_config,
     resolve_relative_path,
     sanitize_filename,
 )
-from enhance.config import EnhancementConfig  # noqa: E402
-from enhance.loss import compose_enhanced_ai  # noqa: E402
-from enhance.model import DilatedResNet1D  # noqa: E402
-from ginn_depth.enhance import build_depth_enhancement_data_bundle  # noqa: E402
-from wtie.optimize import tie as tie_utils  # noqa: E402
-from wtie.optimize.logs import filter_log  # noqa: E402
-from wtie.processing import grid  # noqa: E402
+from enhance.config import EnhancementConfig
+from enhance.loss import compose_enhanced_ai
+from enhance.model import DilatedResNet1D
+from ginn_depth.enhance import build_depth_enhancement_data_bundle
+from wtie.optimize import tie as tie_utils
+from wtie.optimize.logs import filter_log
+from wtie.processing import grid
 
 # =============================================================================
 # CLI
@@ -390,9 +390,7 @@ def main() -> None:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cfg_payload = checkpoint["config"]
     enhance_cfg = (
-        EnhancementConfig.from_dict(cfg_payload, base_dir=REPO_ROOT)
-        if isinstance(cfg_payload, dict)
-        else cfg_payload
+        EnhancementConfig.from_dict(cfg_payload, base_dir=REPO_ROOT) if isinstance(cfg_payload, dict) else cfg_payload
     )
     device = torch.device(enhance_cfg.device if torch.cuda.is_available() else "cpu")
     model = DilatedResNet1D(
@@ -467,7 +465,9 @@ def main() -> None:
         "base_ai_file": str(enhance_cfg.base_ai_file),
         "prediction_stats": prediction_stats,
     }
-    _save_prediction_npz(enhanced_npz, volume=enhanced_volume, geometry=geometry, samples=sample_axis_m, metadata=metadata)
+    _save_prediction_npz(
+        enhanced_npz, volume=enhanced_volume, geometry=geometry, samples=sample_axis_m, metadata=metadata
+    )
 
     # ── QC figures ──────────────────────────────────────────────
     slice_mode = str(script_cfg.get("slice_mode", "inline"))
@@ -494,7 +494,9 @@ def main() -> None:
     axes[0].set_xlabel("Trace index")
     axes[0].set_ylabel("Sample index")
     fig.colorbar(im0, ax=axes[0], shrink=0.85)
-    im1 = axes[1].imshow(base_section, cmap="viridis", aspect="auto", origin="upper", vmin=shared_vmin, vmax=shared_vmax)
+    im1 = axes[1].imshow(
+        base_section, cmap="viridis", aspect="auto", origin="upper", vmin=shared_vmin, vmax=shared_vmax
+    )
     axes[1].set_title(f"Base AI (Stage-1) | {slice_mode}={resolved_slice_index}")
     axes[1].set_xlabel("Trace index")
     axes[1].set_ylabel("Sample index")
@@ -545,7 +547,6 @@ def main() -> None:
             keylocs=[depth_cfg.segy_iline, depth_cfg.segy_xline, depth_cfg.segy_istep, depth_cfg.segy_xstep],
             textual=textual,
         )
-
 
     # ── Well QC ─────────────────────────────────────────────────
     well_qc_metrics_path = None

@@ -34,7 +34,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.utils.io import (  # noqa: E402
+from cup.utils.io import (
     build_segy_textual_header,
     load_yaml_config,
     repo_relative_path,
@@ -611,7 +611,13 @@ def main() -> None:
         "filter_buffer_mode",
         "post_slice_smoothing",
     ]
-    _lfm_required = {"boundary_extension_samples", "n_slices", "variogram", "filter_cutoff_wavelength_m", "filter_order"}
+    _lfm_required = {
+        "boundary_extension_samples",
+        "n_slices",
+        "variogram",
+        "filter_cutoff_wavelength_m",
+        "filter_order",
+    }
     build_params = {}
     for key in _lfm_keys:
         if key not in script_cfg:

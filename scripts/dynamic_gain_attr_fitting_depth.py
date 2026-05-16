@@ -35,9 +35,9 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.utils.io import load_yaml_config, repo_relative_path, sanitize_filename  # noqa: E402
-from cup.utils.raw_trace import centered_moving_rms, meters_to_odd_samples  # noqa: E402
-from cup.utils.statistics import normalized_mae, ols_fit, pearson_r, spearman_rho  # noqa: E402
+from cup.utils.io import load_yaml_config, repo_relative_path, sanitize_filename
+from cup.utils.raw_trace import centered_moving_rms, meters_to_odd_samples
+from cup.utils.statistics import normalized_mae, ols_fit, pearson_r, spearman_rho
 
 matplotlib.use("Agg")
 plt.rcParams["figure.dpi"] = 120
@@ -543,7 +543,7 @@ def main() -> None:
             intercept=fit["intercept"],
             slope=fit["slope"],
             attribute_floor=attr_floor,
-            log_gain_clip=log_gain_clip,
+            log_gain_clip=log_gain_clip,  # type: ignore
         )
         gain_curve = pred_df["gain_pred_clipped"].to_numpy(dtype=float)
         synthetic_gain = gain_curve * synthetic_raw

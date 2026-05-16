@@ -34,8 +34,8 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.utils.statistics import normalized_cross_correlation, rms  # noqa: E402
-from cup.utils.io import load_yaml_config, resolve_relative_path  # noqa: E402
+from cup.utils.io import load_yaml_config, resolve_relative_path
+from cup.utils.statistics import normalized_cross_correlation, rms
 
 # =============================================================================
 # CLI
@@ -330,8 +330,12 @@ def sample_metrics(
     base_target_corr = normalized_cross_correlation(
         base_seismic_full[waveform_mask], target_seismic_full[waveform_mask]
     )
-    target_obs_corr = normalized_cross_correlation(target_seismic_full[waveform_mask], to_numpy_1d(sample["obs"])[waveform_mask])
-    input_obs_corr = normalized_cross_correlation(input_augmented_full[waveform_mask], to_numpy_1d(sample["obs"])[waveform_mask])
+    target_obs_corr = normalized_cross_correlation(
+        target_seismic_full[waveform_mask], to_numpy_1d(sample["obs"])[waveform_mask]
+    )
+    input_obs_corr = normalized_cross_correlation(
+        input_augmented_full[waveform_mask], to_numpy_1d(sample["obs"])[waveform_mask]
+    )
     input_delta = finite_values(input_augmented_full - input_clean_full, waveform_mask)
     input_clean = finite_values(input_clean_full, waveform_mask)
     residual_abs_max = percentile_abs(residual, 100.0)
@@ -1029,8 +1033,8 @@ def main() -> None:
 
     torch = torch_module
 
-    from enhance.prior import load_well_resolution_prior_npz
     from enhance.config import EnhancementConfig
+    from enhance.prior import load_well_resolution_prior_npz
     from ginn_depth.enhance import build_depth_enhancement_bundle
 
     if args.num_samples <= 0:

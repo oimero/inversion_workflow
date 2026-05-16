@@ -35,7 +35,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.utils.io import load_yaml_config, resolve_relative_path, sanitize_filename  # noqa: E402
+from cup.utils.io import load_yaml_config, resolve_relative_path, sanitize_filename
 
 if TYPE_CHECKING:
     from wtie.modeling.modeling import ConvModeler

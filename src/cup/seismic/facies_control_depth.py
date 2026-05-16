@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import numpy as np
 import pandas as pd
 
+from cup.seismic.spatial import build_trace_xy_grids
 from cup.utils.io import resolve_relative_path, resolve_repo_metadata_path
 from cup.utils.statistics import normalized_cross_correlation, normalized_mae, rms
 
@@ -153,38 +154,6 @@ def raised_cosine_weight(normalized_distance: np.ndarray | float) -> np.ndarray:
     inside = (d >= 0.0) & (d <= 1.0)
     weight[inside] = 0.5 * (1.0 + np.cos(np.pi * d[inside]))
     return weight
-
-
-def build_trace_xy_grids(
-    survey: _SurveyLike,
-    ilines: np.ndarray,
-    xlines: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build trace-center XY grids from survey line coordinates."""
-    ilines = np.asarray(ilines, dtype=np.float64)
-    xlines = np.asarray(xlines, dtype=np.float64)
-    if ilines.ndim != 1 or xlines.ndim != 1 or ilines.size == 0 or xlines.size == 0:
-        raise ValueError("ilines and xlines must be non-empty 1D arrays.")
-
-    x0, y0 = survey.line_to_coord(float(ilines[0]), float(xlines[0]))
-    if ilines.size > 1:
-        x1, y1 = survey.line_to_coord(float(ilines[-1]), float(xlines[0]))
-        dx_i = (x1 - x0) / float(ilines.size - 1)
-        dy_i = (y1 - y0) / float(ilines.size - 1)
-    else:
-        dx_i = dy_i = 0.0
-    if xlines.size > 1:
-        x2, y2 = survey.line_to_coord(float(ilines[0]), float(xlines[-1]))
-        dx_j = (x2 - x0) / float(xlines.size - 1)
-        dy_j = (y2 - y0) / float(xlines.size - 1)
-    else:
-        dx_j = dy_j = 0.0
-
-    i_idx = np.arange(ilines.size, dtype=np.float64)[:, None]
-    j_idx = np.arange(xlines.size, dtype=np.float64)[None, :]
-    x_grid = x0 + i_idx * dx_i + j_idx * dx_j
-    y_grid = y0 + i_idx * dy_i + j_idx * dy_j
-    return x_grid.astype(np.float64), y_grid.astype(np.float64)
 
 
 def build_target_layer_from_lfm_metadata(

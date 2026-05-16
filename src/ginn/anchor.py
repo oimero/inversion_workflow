@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import Dataset
 
+from cup.seismic.spatial import nominal_bin_spacing_m, xy_circle_mask
 from cup.utils.io import to_json_compatible
 
 logger = logging.getLogger(__name__)
@@ -343,7 +344,7 @@ class LogAIAnchor:
     anchor_weight: Tensor
 
     # Neighbourhood.
-    neighborhood_radius: int = 0
+    radius_xy_m: float = 0.0
     neighbor_inputs: Tensor = field(default_factory=lambda: torch.empty(0))
     neighbor_lfm_raw: Tensor = field(default_factory=lambda: torch.empty(0))
     neighbor_taper: Tensor = field(default_factory=lambda: torch.empty(0))
@@ -362,7 +363,9 @@ class LogAIAnchor:
         n_traces: int,
         valid_indices: np.ndarray,
         dataset: Dataset | None = None,
-        neighborhood_radius: int = 0,
+        radius_xy_m: float = 0.0,
+        x_grid: np.ndarray | None = None,
+        y_grid: np.ndarray | None = None,
         geometry: dict | None = None,
     ) -> "LogAIAnchor | None":
         if lambda_weight <= 0.0:
@@ -412,15 +415,27 @@ class LogAIAnchor:
         neighbor_weights_flat = torch.empty(0)
         neighbor_ranges: list[tuple[int, int]] = []
 
-        if neighborhood_radius > 0:
+        radius_xy_m = float(radius_xy_m)
+        if radius_xy_m < 0.0:
+            raise ValueError(f"radius_xy_m must be non-negative, got {radius_xy_m}.")
+
+        if radius_xy_m > 0.0:
+            if dataset is None:
+                raise ValueError("dataset is required for log-AI anchor neighbourhood precomputation.")
             if geometry is None:
-                raise ValueError("geometry dict is required when neighborhood_radius > 0.")
+                raise ValueError("geometry dict is required when radius_xy_m > 0.")
+            if x_grid is None or y_grid is None:
+                raise ValueError("x_grid and y_grid are required when radius_xy_m > 0.")
             n_il = int(geometry["n_il"])
             n_xl = int(geometry["n_xl"])
-            il_step = float(geometry.get("inline_step", 1.0))
-            xl_step = float(geometry.get("xline_step", 1.0))
-            phys_radius = float(neighborhood_radius) * max(il_step, xl_step)
-            sigma = max(phys_radius / 2.0, 0.5 * max(il_step, xl_step))
+            x_grid_arr = np.asarray(x_grid, dtype=np.float64)
+            y_grid_arr = np.asarray(y_grid, dtype=np.float64)
+            if x_grid_arr.shape != (n_il, n_xl) or y_grid_arr.shape != (n_il, n_xl):
+                raise ValueError(
+                    f"x_grid/y_grid shape must be {(n_il, n_xl)}, got {x_grid_arr.shape} and {y_grid_arr.shape}."
+                )
+            bin_spacing_m = nominal_bin_spacing_m(x_grid_arr, y_grid_arr)
+            sigma = max(radius_xy_m / 2.0, 0.5 * bin_spacing_m)
 
             all_inputs: list[Tensor] = []
             all_lfm: list[Tensor] = []
@@ -431,22 +446,27 @@ class LogAIAnchor:
                 flat_ref = int(anchor_bundle.flat_indices[rows[w]])
                 il_ref = flat_ref // n_xl
                 xl_ref = flat_ref % n_xl
+                if not (0 <= il_ref < n_il and 0 <= xl_ref < n_xl):
+                    neighbor_ranges.append((neighbor_weights_flat.numel(), neighbor_weights_flat.numel()))
+                    continue
                 candidates: list[tuple[float, int, float]] = []
-                for dil in range(-neighborhood_radius, neighborhood_radius + 1):
-                    for dxl in range(-neighborhood_radius, neighborhood_radius + 1):
-                        dist = math.hypot(dil * il_step, dxl * xl_step)
-                        if dist > phys_radius + 1e-8:
-                            continue
-                        il = il_ref + dil
-                        xl = xl_ref + dxl
-                        if il < 0 or il >= n_il or xl < 0 or xl >= n_xl:
-                            continue
-                        flat = il * n_xl + xl
-                        ds_idx = flat_to_dataset.get(int(flat))
-                        if ds_idx is None:
-                            continue
-                        dw = 1.0 if dist < 1e-8 else math.exp(-(dist**2) / (2.0 * sigma**2))
-                        candidates.append((dist, ds_idx, dw))
+                circle_mask, distance_m = xy_circle_mask(
+                    x_grid_arr,
+                    y_grid_arr,
+                    center_x=float(x_grid_arr[il_ref, xl_ref]),
+                    center_y=float(y_grid_arr[il_ref, xl_ref]),
+                    radius_xy_m=radius_xy_m,
+                )
+                for il, xl in np.argwhere(circle_mask):
+                    il_int = int(il)
+                    xl_int = int(xl)
+                    flat = il_int * n_xl + xl_int
+                    ds_idx = flat_to_dataset.get(int(flat))
+                    if ds_idx is None:
+                        continue
+                    dist = float(distance_m[il_int, xl_int])
+                    dw = 1.0 if dist < 1e-8 else math.exp(-(dist**2) / (2.0 * sigma**2))
+                    candidates.append((dist, ds_idx, dw))
                 candidates.sort(key=lambda t: t[0])
 
                 inputs_w = []
@@ -485,9 +505,8 @@ class LogAIAnchor:
 
             max_nbr = max((e - s) for s, e in neighbor_ranges) if neighbor_ranges else 0
             logger.info(
-                "Log-AI anchor neighbourhood: radius=%d grid (%.0f step-units), sigma=%.1f, max_neighbors=%d, total_nbr=%d",
-                neighborhood_radius,
-                phys_radius,
+                "Log-AI anchor neighbourhood: radius_xy_m=%.3f, sigma=%.3f, max_neighbors=%d, total_nbr=%d",
+                radius_xy_m,
                 sigma,
                 max_nbr,
                 int(neighbor_weights_flat.numel()),
@@ -517,7 +536,7 @@ class LogAIAnchor:
             anchor_types=np.asarray(anchor_bundle.anchor_types[rows]).astype(str),
             target_log_ai=torch.from_numpy(target_log_ai),
             anchor_weight=torch.from_numpy(weights),
-            neighborhood_radius=int(neighborhood_radius),
+            radius_xy_m=radius_xy_m,
             neighbor_inputs=neighbor_inputs,
             neighbor_lfm_raw=neighbor_lfm_raw,
             neighbor_taper=neighbor_taper,
@@ -542,7 +561,8 @@ class LogAIAnchor:
             "anchor_names": self.anchor_names.tolist(),
             "anchor_types": self.anchor_types.tolist(),
             "flat_indices": self.flat_indices.tolist(),
-            "neighborhood_radius": self.neighborhood_radius,
+            "radius_xy_m": self.radius_xy_m,
+            "distance_domain": "xy_m",
         }
         if self.neighbor_ranges:
             result["max_neighbors"] = max(e - s for s, e in self.neighbor_ranges)

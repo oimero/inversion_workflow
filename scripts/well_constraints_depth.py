@@ -23,8 +23,12 @@ from pathlib import Path
 from typing import Any
 
 import lasio
+import matplotlib
 import numpy as np
 import pandas as pd
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # =============================================================================
 # Bootstrap
@@ -38,7 +42,8 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.petrel.load import import_well_heads_petrel
 from cup.seismic.survey import open_survey
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename
+from cup.utils.raw_trace import centered_moving_average
 from enhance.prior import (
     WellResolutionPriorBundle,
     save_well_resolution_prior_npz,
@@ -310,18 +315,28 @@ def _split_log_ai_frequency_bands(
     }
 
 
-def _confidence_from_corr(corr: object, *, floor: float, span: float, mode: str = "corr") -> float:
+def _confidence_from_corr(
+    corr: object,
+    *,
+    floor: float,
+    span: float,
+    min_weight: float,
+    mode: str = "corr",
+) -> float:
     mode = str(mode).strip().lower()
     if mode == "uniform":
         return 1.0
     if mode != "corr":
         raise ValueError("well_constraints_depth.confidence_weight_mode must be 'corr' or 'uniform'.")
+    if not 0.0 <= min_weight <= 1.0:
+        raise ValueError(f"confidence_corr_min_weight must be within [0, 1], got {min_weight}.")
     corr_value = _finite_float_or_nan(corr)
     if not np.isfinite(corr_value):
         return 0.0
     if span <= 0.0:
         raise ValueError(f"confidence_corr_span must be positive, got {span}.")
-    return float(np.clip((corr_value - floor) / span, 0.0, 1.0))
+    scaled = float(np.clip((corr_value - floor) / span, 0.0, 1.0))
+    return float(min_weight + (1.0 - min_weight) * scaled)
 
 
 def _finite_float_or_nan(value: object) -> float:
@@ -447,6 +462,139 @@ def _nearest_flat_index(ai_lfm: Any, iline: float, xline: float) -> tuple[int, i
     return flat_idx, il_idx, xl_idx, float(ai_lfm.ilines[il_idx]), float(ai_lfm.xlines[xl_idx])
 
 
+def _high_frequency_envelope(high_log_ai: np.ndarray, mask: np.ndarray, window_samples: int) -> np.ndarray:
+    """Return the local absolute-amplitude envelope used to inspect enhance patch sampling."""
+    values = np.asarray(high_log_ai, dtype=np.float32).reshape(-1)
+    valid = np.asarray(mask, dtype=bool).reshape(-1) & np.isfinite(values)
+    if values.shape != valid.shape:
+        raise ValueError("high_log_ai and mask must have matching 1D shapes for envelope QC.")
+
+    envelope = np.full_like(values, np.nan, dtype=np.float32)
+    for start, stop in _true_runs(valid):
+        run = values[start:stop].astype(np.float32, copy=True)
+        run -= float(np.mean(run))
+        envelope[start:stop] = centered_moving_average(np.abs(run), int(window_samples))
+    return envelope
+
+
+def _save_frequency_split_qc(
+    *,
+    figure_path: Path,
+    trace_path: Path,
+    well_name: str,
+    raw_depth: np.ndarray,
+    raw_ai: np.ndarray,
+    highres_trace: dict[str, np.ndarray],
+    envelope_window_samples: int,
+    split_params: dict[str, Any],
+) -> dict[str, Any]:
+    """Save one well's low/high frequency-split QC figure and trace CSV."""
+    highres_depth = np.asarray(highres_trace["highres_depth"], dtype=np.float32)
+    highres_ai = np.asarray(highres_trace["highres_well_ai"], dtype=np.float32)
+    highres_low_ai = np.asarray(highres_trace["highres_well_low_ai"], dtype=np.float32)
+    highres_high_log_ai = np.asarray(highres_trace["highres_well_high_log_ai"], dtype=np.float32)
+    highres_mask = np.asarray(highres_trace["highres_well_mask"], dtype=bool)
+    valid = (
+        highres_mask
+        & np.isfinite(highres_depth)
+        & np.isfinite(highres_ai)
+        & np.isfinite(highres_low_ai)
+        & np.isfinite(highres_high_log_ai)
+    )
+    if int(valid.sum()) < 2:
+        raise ValueError("Too few valid high-resolution samples for frequency-split QC.")
+
+    envelope = _high_frequency_envelope(highres_high_log_ai, valid, envelope_window_samples)
+    raw_on_highres = np.interp(highres_depth, raw_depth, raw_ai, left=np.nan, right=np.nan)
+
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "depth_m": highres_depth[valid],
+            "shifted_las_ai_raw": raw_on_highres[valid],
+            "split_source_ai": highres_ai[valid],
+            "well_low_ai": highres_low_ai[valid],
+            "well_high_log_ai": highres_high_log_ai[valid],
+            "well_high_log_ai_envelope": envelope[valid],
+            "envelope_window_samples": np.full(int(valid.sum()), int(envelope_window_samples), dtype=np.int32),
+        }
+    ).to_csv(trace_path, index=False)
+
+    cutoff = split_params.get("cutoff_wavelength_m")
+    cutoff_label = "disabled" if cutoff is None else f"{float(cutoff):.0f} m"
+    depth_min = float(highres_depth[valid][0])
+    depth_max = float(highres_depth[valid][-1])
+    raw_plot = np.isfinite(raw_depth) & np.isfinite(raw_ai) & (raw_depth >= depth_min) & (raw_depth <= depth_max)
+
+    figure_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 10), sharey=True, constrained_layout=True)
+    axes[0].plot(
+        raw_ai[raw_plot],
+        raw_depth[raw_plot],
+        label="Shifted LAS AI (raw)",
+        lw=0.8,
+        alpha=0.35,
+        color="gray",
+    )
+    axes[0].plot(
+        highres_low_ai[valid],
+        highres_depth[valid],
+        label=f"well_low_ai (LP {cutoff_label})",
+        lw=1.8,
+        color="blue",
+    )
+    axes[0].set_title("Low-frequency split")
+    axes[0].set_xlabel("AI")
+    axes[0].set_ylabel("Depth (m)")
+    axes[0].legend(loc="best")
+    axes[0].grid(True, alpha=0.3, linestyle=":")
+
+    axes[1].plot(
+        highres_high_log_ai[valid],
+        highres_depth[valid],
+        label="well_high_log_ai",
+        lw=1.0,
+        color="tab:orange",
+    )
+    # axes[1].plot(
+    #     envelope[valid],
+    #     highres_depth[valid],
+    #     label=f"envelope (MA {int(envelope_window_samples)})",
+    #     lw=1.1,
+    #     ls="--",
+    #     color="red",
+    # )
+    # axes[1].plot(
+    #     -envelope[valid],
+    #     highres_depth[valid],
+    #     lw=1.1,
+    #     ls="--",
+    #     color="red",
+    # )
+    axes[1].axvline(0.0, color="black", lw=0.7, alpha=0.35)
+    axes[1].set_title("High-frequency residual")
+    axes[1].set_xlabel("delta log-AI")
+    axes[1].legend(loc="best")
+    axes[1].grid(True, alpha=0.3, linestyle=":")
+
+    axes[0].invert_yaxis()
+    fig.suptitle(f"Frequency Split QC | {well_name}", fontsize=13)
+    fig.savefig(figure_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+    high_values = highres_high_log_ai[valid]
+    envelope_values = envelope[valid]
+    return {
+        "frequency_split_qc_figure_path": repo_relative_path(figure_path, root=REPO_ROOT),
+        "frequency_split_qc_trace_path": repo_relative_path(trace_path, root=REPO_ROOT),
+        "frequency_split_qc_envelope_window_samples": int(envelope_window_samples),
+        "highres_well_high_log_ai_rms": float(np.sqrt(np.mean(high_values**2))),
+        "highres_well_high_log_ai_abs_p95": float(np.percentile(np.abs(high_values), 95.0)),
+        "highres_well_high_log_ai_abs_p99": float(np.percentile(np.abs(high_values), 99.0)),
+        "highres_well_high_log_ai_envelope_p95": float(np.percentile(envelope_values, 95.0)),
+    }
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -490,16 +638,29 @@ def main() -> None:
     anchor_path = output_dir / "log_ai_anchor_depth.npz"
     qc_path = output_dir / "well_constraints_depth_qc.csv"
     run_summary_path = output_dir / "run_summary.json"
+    frequency_split_qc_dir = output_dir / "frequency_split_qc"
+    frequency_split_qc_figure_dir = frequency_split_qc_dir / "figures"
+    frequency_split_qc_trace_dir = frequency_split_qc_dir / "traces"
 
     confidence_corr_floor = float(script_cfg.get("confidence_corr_floor", 0.3))
     confidence_corr_span = float(script_cfg.get("confidence_corr_span", 0.4))
+    confidence_corr_min_weight = float(script_cfg.get("confidence_corr_min_weight", 0.0))
     confidence_weight_mode = str(script_cfg.get("confidence_weight_mode", "corr")).strip().lower()
     if confidence_weight_mode not in {"corr", "uniform"}:
         raise ValueError("well_constraints_depth.confidence_weight_mode must be 'corr' or 'uniform'.")
+    if not 0.0 <= confidence_corr_min_weight <= 1.0:
+        raise ValueError("well_constraints_depth.confidence_corr_min_weight must be within [0, 1].")
     las_ai_source = str(script_cfg.get("las_ai_source", "filtered_shifted_las")).strip().lower()
     if las_ai_source not in {"filtered_shifted_las", "raw_shifted_las"}:
         raise ValueError("well_constraints_depth.las_ai_source must be 'filtered_shifted_las' or 'raw_shifted_las'.")
     log_filter_params = _load_auto_tie_log_filter_params(cfg)
+    frequency_split_qc_enabled = bool(script_cfg.get("frequency_split_qc_enabled", True))
+    frequency_split_qc_envelope_window_samples = int(script_cfg.get("frequency_split_qc_envelope_window_samples", 31))
+    if frequency_split_qc_envelope_window_samples < 1:
+        raise ValueError("well_constraints_depth.frequency_split_qc_envelope_window_samples must be >= 1.")
+    if frequency_split_qc_enabled:
+        frequency_split_qc_figure_dir.mkdir(parents=True, exist_ok=True)
+        frequency_split_qc_trace_dir.mkdir(parents=True, exist_ok=True)
 
     segy_cfg = cfg["segy"]
     segy_options = {
@@ -519,6 +680,8 @@ def main() -> None:
     print(f"AI LFM: {ai_lfm_file}")
     print(f"LAS AI source: {las_ai_source} ({log_filter_params})")
     print(f"Frequency split: {frequency_split}")
+    if frequency_split_qc_enabled:
+        print(f"Frequency split QC: {frequency_split_qc_dir}")
     print(f"Output dir: {output_dir}")
 
     well_heads_df = import_well_heads_petrel(well_heads_file)
@@ -570,6 +733,7 @@ def main() -> None:
             ai_on_axis, mask = _interpolate_ai_to_depth_axis(md, constraint_ai, kb_m, depth_axis_m)
             raw_ai_on_axis, raw_mask = _interpolate_ai_to_depth_axis(md, raw_ai, kb_m, depth_axis_m)
             lfm_ai = np.asarray(ai_lfm.trace_by_index(il_idx, xl_idx), dtype=np.float32)
+            raw_highres_depth, raw_highres_ai = _prepare_highres_ai(md, raw_ai, kb_m)
             highres_depth, highres_ai = _prepare_highres_ai(md, constraint_ai, kb_m)
             highres_trace = _build_highres_prior_trace(
                 highres_depth,
@@ -594,6 +758,19 @@ def main() -> None:
             residual_log_ai[mask] = (log_ai[mask] - lfm_log_ai[mask]).astype(np.float32)
             raw_filtered_mask = mask & raw_mask & np.isfinite(raw_ai_on_axis) & np.isfinite(ai_on_axis)
             raw_filtered_diff = raw_ai_on_axis[raw_filtered_mask] - ai_on_axis[raw_filtered_mask]
+            frequency_split_qc: dict[str, Any] = {}
+            if frequency_split_qc_enabled:
+                safe_name = sanitize_filename(well_name)
+                frequency_split_qc = _save_frequency_split_qc(
+                    figure_path=frequency_split_qc_figure_dir / f"frequency_split_{safe_name}.png",
+                    trace_path=frequency_split_qc_trace_dir / f"frequency_split_{safe_name}.csv",
+                    well_name=well_name,
+                    raw_depth=raw_highres_depth,
+                    raw_ai=raw_highres_ai,
+                    highres_trace=highres_trace,
+                    envelope_window_samples=frequency_split_qc_envelope_window_samples,
+                    split_params=frequency_split,
+                )
 
             metric = metrics_by_name.get(well_name)
             if metric is None:
@@ -603,6 +780,7 @@ def main() -> None:
                 corr,
                 floor=confidence_corr_floor,
                 span=confidence_corr_span,
+                min_weight=confidence_corr_min_weight,
                 mode=confidence_weight_mode,
             )
             weight = np.zeros_like(ai_on_axis, dtype=np.float32)
@@ -646,6 +824,7 @@ def main() -> None:
                     "well_high_log_ai_abs_p95": (
                         float(np.percentile(np.abs(well_high_log_ai[mask]), 95.0)) if int(mask.sum()) else np.nan
                     ),
+                    **frequency_split_qc,
                     "kb_m": kb_m,
                     "well_x": well_x,
                     "well_y": well_y,
@@ -756,7 +935,20 @@ def main() -> None:
         "confidence_formula": (
             "1.0 for every successful well"
             if confidence_weight_mode == "uniform"
-            else f"clip((corr - {confidence_corr_floor}) / {confidence_corr_span}, 0, 1)"
+            else (
+                f"0.0 when corr is missing/non-finite; otherwise {confidence_corr_min_weight} + "
+                f"(1 - {confidence_corr_min_weight}) * "
+                f"clip((corr - {confidence_corr_floor}) / {confidence_corr_span}, 0, 1)"
+            )
+        ),
+        "frequency_split_qc_enabled": frequency_split_qc_enabled,
+        "frequency_split_qc_dir": (
+            repo_relative_path(frequency_split_qc_dir, root=REPO_ROOT) if frequency_split_qc_enabled else None
+        ),
+        "frequency_split_qc_envelope_window_samples": frequency_split_qc_envelope_window_samples,
+        "frequency_split_qc_envelope": (
+            "centered_moving_average(abs(highres_well_high_log_ai - mean), window_samples); "
+            "plotted as +/- envelope for amplitude-reference QC"
         ),
         "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
         "n_input_las": int(len(las_paths)),
@@ -857,6 +1049,11 @@ def main() -> None:
                     "frequency_split": metadata["frequency_split"],
                     "frequency_split_enabled": metadata["frequency_split_enabled"],
                     "frequency_split_parameter_source": metadata["frequency_split_parameter_source"],
+                    "frequency_split_qc_enabled": metadata["frequency_split_qc_enabled"],
+                    "frequency_split_qc_dir": metadata["frequency_split_qc_dir"],
+                    "frequency_split_qc_envelope_window_samples": metadata[
+                        "frequency_split_qc_envelope_window_samples"
+                    ],
                     "qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
                     "n_input_las": int(len(las_paths)),
                     "n_successful_wells": int(len(records)),

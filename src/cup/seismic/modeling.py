@@ -578,7 +578,8 @@ def build_layer_constrained_model(
 
     Notes
     -----
-    Kriging 在 inline/xline 归一化坐标上执行，输出方差体与建模元信息。
+    Kriging 在 grid-index normalized 坐标上执行，输出方差体与建模元信息；
+    这里的变差距离不是 XY 米制距离。
     """
     if n_slices < 2:
         raise ValueError(f"n_slices must be >= 2, got {n_slices}.")
@@ -804,7 +805,7 @@ def build_layer_constrained_model(
         "n_slices": int(n_slices),
         "boundary_extension_samples": extension_samples,
         "coord_system": "inline_xline",
-        "kriging_coord_system": "inline_xline_normalized_by_step",
+        "kriging_coord_system": "grid_index_normalized",
         "kriging_inline_step": inline_step,
         "kriging_xline_step": xline_step,
         "horizon_names": list(target_layer.horizon_names),

@@ -14,6 +14,8 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 from cup.petrel.load import import_interpretation_petrel, import_seismic
+from cup.seismic.spatial import build_trace_xy_grids, nominal_bin_spacing_m, xy_circle_mask
+from cup.seismic.survey import open_survey
 from cup.seismic.target_layer import TargetLayer
 from cup.utils.io import resolve_repo_metadata_path
 from cup.well.wavelet import (
@@ -59,6 +61,8 @@ class DatasetBundle:
     split_metadata: Dict[str, Any]
     lfm_metadata: Dict[str, Any]
     well_control_summary: Dict[str, Any]
+    x_grid: np.ndarray
+    y_grid: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -278,13 +282,16 @@ def build_well_control_data(
     n_traces: int,
     geometry: Dict[str, Any],
     lambda_log_ai_anchor: float,
-    neighborhood_radius: int,
+    radius_xy_m: float,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
     well_waveform_min_weight: float,
     distance_decay: str,
 ) -> WellControlData:
     """Build a sparse map of well-controlled traces for in-batch anchor loss."""
     selected_indices = np.asarray(selected_indices, dtype=np.int64).reshape(-1)
-    if lambda_log_ai_anchor <= 0.0 or anchor_file is None or selected_indices.size == 0 or neighborhood_radius < 0:
+    radius_xy_m = float(radius_xy_m)
+    if lambda_log_ai_anchor <= 0.0 or anchor_file is None or selected_indices.size == 0 or radius_xy_m < 0.0:
         return WellControlData.empty(
             n_sample,
             summary={
@@ -305,15 +312,18 @@ def build_well_control_data(
         n_traces=n_traces,
     )
 
+    x_grid = np.asarray(x_grid, dtype=np.float64)
+    y_grid = np.asarray(y_grid, dtype=np.float64)
     selected_set = {int(flat_idx) for flat_idx in selected_indices}
     n_il = int(geometry["n_il"])
     n_xl = int(geometry["n_xl"])
-    il_step = float(geometry.get("inline_step", 1.0))
-    xl_step = float(geometry.get("xline_step", 1.0))
-    radius = int(neighborhood_radius)
-    phys_radius = float(radius) * max(il_step, xl_step)
-    sigma = max(phys_radius / 2.0, 0.5 * max(il_step, xl_step))
-    gaussian_edge = math.exp(-(phys_radius**2) / (2.0 * sigma**2)) if radius > 0 else 0.0
+    if x_grid.shape != (n_il, n_xl) or y_grid.shape != (n_il, n_xl):
+        raise ValueError(
+            f"x_grid/y_grid shape must be {(n_il, n_xl)}, got {x_grid.shape} and {y_grid.shape}."
+        )
+    bin_spacing_m = nominal_bin_spacing_m(x_grid, y_grid)
+    sigma = max(radius_xy_m / 2.0, 0.5 * bin_spacing_m)
+    gaussian_edge = math.exp(-(radius_xy_m**2) / (2.0 * sigma**2)) if radius_xy_m > 0.0 else 0.0
 
     best_by_flat: dict[int, tuple[float, int]] = {}
     for row, flat_idx in enumerate(np.asarray(anchor_bundle.flat_indices, dtype=np.int64)):
@@ -325,34 +335,35 @@ def build_well_control_data(
         flat_ref = int(flat_idx)
         il_ref = flat_ref // n_xl
         xl_ref = flat_ref % n_xl
-        for dil in range(-radius, radius + 1):
-            for dxl in range(-radius, radius + 1):
-                il = il_ref + dil
-                xl = xl_ref + dxl
-                if il < 0 or il >= n_il or xl < 0 or xl >= n_xl:
-                    continue
-                dist = math.hypot(dil * il_step, dxl * xl_step)
-                if radius > 0 and dist > phys_radius + 1e-8:
-                    continue
-                if radius == 0 and dist > 1e-8:
-                    continue
-
-                flat = il * n_xl + xl
-                if flat not in selected_set:
-                    continue
-                if dist < 1e-8:
-                    influence = 1.0
-                elif distance_decay == "linear":
-                    influence = max(0.0, 1.0 - dist / max(phys_radius, 1e-6))
-                else:
-                    raw_influence = math.exp(-(dist**2) / (2.0 * sigma**2))
-                    influence = (raw_influence - gaussian_edge) / max(1.0 - gaussian_edge, 1e-6)
-                    influence = max(0.0, min(1.0, influence))
-                if influence <= 0.0:
-                    continue
-                current = best_by_flat.get(flat)
-                if current is None or influence > current[0]:
-                    best_by_flat[flat] = (float(influence), int(row))
+        if not (0 <= il_ref < n_il and 0 <= xl_ref < n_xl):
+            continue
+        circle_mask, distance_m = xy_circle_mask(
+            x_grid,
+            y_grid,
+            center_x=float(x_grid[il_ref, xl_ref]),
+            center_y=float(y_grid[il_ref, xl_ref]),
+            radius_xy_m=radius_xy_m,
+        )
+        for il, xl in np.argwhere(circle_mask):
+            il_int = int(il)
+            xl_int = int(xl)
+            flat = il_int * n_xl + xl_int
+            if flat not in selected_set:
+                continue
+            dist = float(distance_m[il_int, xl_int])
+            if dist < 1e-8:
+                influence = 1.0
+            elif distance_decay == "linear":
+                influence = max(0.0, 1.0 - dist / max(radius_xy_m, 1e-6))
+            else:
+                raw_influence = math.exp(-(dist**2) / (2.0 * sigma**2))
+                influence = (raw_influence - gaussian_edge) / max(1.0 - gaussian_edge, 1e-6)
+                influence = max(0.0, min(1.0, influence))
+            if influence <= 0.0:
+                continue
+            current = best_by_flat.get(flat)
+            if current is None or influence > current[0]:
+                best_by_flat[flat] = (float(influence), int(row))
 
     if not best_by_flat:
         return WellControlData.empty(
@@ -382,8 +393,9 @@ def build_well_control_data(
         "anchor_file": Path(anchor_file),
         "n_input_anchors": int(anchor_bundle.n_anchors),
         "n_controlled_traces": int(flat_indices.size),
-        "neighborhood_radius": radius,
-        "physical_radius": phys_radius,
+        "radius_xy_m": radius_xy_m,
+        "nominal_bin_spacing_m": float(bin_spacing_m),
+        "distance_domain": "xy_m",
         "distance_decay": distance_decay,
         "well_waveform_min_weight": float(well_waveform_min_weight),
         "influence_min": float(np.min(influences)),
@@ -397,9 +409,9 @@ def build_well_control_data(
         },
     }
     logger.info(
-        "Depth well-control map: controlled_traces=%d, radius=%d, influence=[%.3f, %.3f], waveform_weight=[%.3f, %.3f]",
+        "Depth well-control map: controlled_traces=%d, radius_xy_m=%.3f, influence=[%.3f, %.3f], waveform_weight=[%.3f, %.3f]",
         int(flat_indices.size),
-        radius,
+        radius_xy_m,
         float(np.min(influences)),
         float(np.max(influences)),
         float(np.min(waveform_weight_scale)),
@@ -813,6 +825,16 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         istep=cfg.segy_istep,
         xstep=cfg.segy_xstep,
     )
+    seismic_ctx = open_survey(
+        cfg.seismic_file,
+        seismic_type="segy",
+        segy_options={
+            "iline": cfg.segy_iline,
+            "xline": cfg.segy_xline,
+            "istep": cfg.segy_istep,
+            "xstep": cfg.segy_xstep,
+        },
+    )
     logger.info("Loading AI/Vp depth LFMs...")
     ai_lfm = load_lfm_depth_npz(cfg.ai_lfm_file)
     vp_lfm = load_lfm_depth_npz(cfg.vp_lfm_file)
@@ -846,6 +868,7 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
     )
     geometry.setdefault("sample_domain", "depth")
     geometry.setdefault("sample_unit", "m")
+    x_grid, y_grid = build_trace_xy_grids(seismic_ctx, ai_lfm.ilines, ai_lfm.xlines)
 
     # ── read horizon files + target-layer QC from AI LFM NPZ metadata ──
     hz_list = ai_lfm.metadata.get("horizons", [])
@@ -964,7 +987,9 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
             n_traces=n_il * n_xl,
             geometry=geometry,
             lambda_log_ai_anchor=cfg.lambda_log_ai_anchor,
-            neighborhood_radius=cfg.log_ai_anchor_neighborhood_radius,
+            radius_xy_m=cfg.log_ai_anchor_radius_xy_m,
+            x_grid=x_grid,
+            y_grid=y_grid,
             well_waveform_min_weight=cfg.well_waveform_min_weight,
             distance_decay=cfg.well_anchor_distance_decay,
         )
@@ -1068,4 +1093,6 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
         split_metadata=split_metadata,
         lfm_metadata=dict(ai_lfm.metadata),
         well_control_summary=train_well_control.summary,
+        x_grid=x_grid,
+        y_grid=y_grid,
     )

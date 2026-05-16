@@ -96,7 +96,7 @@ class GINNConfig:
     log_ai_anchor_file: Path | None = None  # 可选 log-AI anchor NPZ；支持井点与相控点约束。
     lambda_log_ai_anchor: float = 0.0  # log(AI) anchor 监督权重；0 表示关闭。
     log_ai_anchor_batch_size: int = 0  # 每个训练 batch 额外抽取的 anchor 数；<=0 表示使用全部。
-    log_ai_anchor_neighborhood_radius: int = 0  # anchor 邻域半径（网格单位）；0=仅中心道。
+    log_ai_anchor_radius_xy_m: float = 0.0  # anchor 影响半径（XY 米制）；0=仅中心道。
     zero_residual_outside_mask: bool = True  # 是否将层外高频扰动通过 taper 平滑压回 0。
     boundary_effect_samples: int | None = None  # 为空时按子波 5% 有效半支撑自动计算。
 
@@ -187,10 +187,8 @@ class GINNConfig:
             raise ValueError(f"lambda_log_ai_anchor must be non-negative, got {self.lambda_log_ai_anchor}.")
         if self.log_ai_anchor_batch_size < 0:
             raise ValueError(f"log_ai_anchor_batch_size must be non-negative, got {self.log_ai_anchor_batch_size}.")
-        if self.log_ai_anchor_neighborhood_radius < 0:
-            raise ValueError(
-                f"log_ai_anchor_neighborhood_radius must be non-negative, got {self.log_ai_anchor_neighborhood_radius}."
-            )
+        if self.log_ai_anchor_radius_xy_m < 0.0:
+            raise ValueError(f"log_ai_anchor_radius_xy_m must be non-negative, got {self.log_ai_anchor_radius_xy_m}.")
         if self.boundary_effect_samples is not None and self.boundary_effect_samples < 0:
             raise ValueError(f"boundary_effect_samples must be non-negative, got {self.boundary_effect_samples}.")
         if not 0.0 <= self.validation_fraction < 1.0:

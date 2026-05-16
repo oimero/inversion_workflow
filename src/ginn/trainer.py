@@ -241,6 +241,8 @@ class Trainer:
         wavelet = dataset_bundle.wavelet
         self.geometry = dataset_bundle.geometry
         self.split_metadata = dataset_bundle.split_metadata
+        self.x_grid = dataset_bundle.x_grid
+        self.y_grid = dataset_bundle.y_grid
 
         self.train_dataloader = DataLoader(
             self.train_dataset,
@@ -377,7 +379,9 @@ class Trainer:
             n_traces=n_traces,
             valid_indices=self.dataset.valid_indices,
             dataset=self.dataset,
-            neighborhood_radius=self.cfg.log_ai_anchor_neighborhood_radius,
+            radius_xy_m=self.cfg.log_ai_anchor_radius_xy_m,
+            x_grid=self.x_grid,
+            y_grid=self.y_grid,
             geometry=self.geometry,
         )
 

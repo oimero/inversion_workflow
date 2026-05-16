@@ -115,6 +115,7 @@ def build_facies_control_anchor_bundle(
                 "y": float(point.y),
                 "depth_m": float(point.depth_m),
                 "radius_xy_m": float(point.radius_xy_m),
+                "radius_xy_m_usage": "nearest_trace_qc_only_no_horizontal_anchor_spread",
                 "radius_z_m": float(point.radius_z_m),
                 "target_ai": float(point.target_ai),
                 "strength": float(point.strength),
@@ -155,6 +156,7 @@ def build_facies_control_anchor_bundle(
         metadata={
             "created_at_utc": created_at,
             "artifact_role": "facies_control_log_ai_anchor",
+            "horizontal_anchor_behavior": "nearest_trace_only; radius_xy_m is not used for horizontal anchor spread",
             **({} if metadata is None else metadata),
         },
     )

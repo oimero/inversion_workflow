@@ -96,7 +96,6 @@ class GINNConfig:
     log_ai_anchor_file: Path | None = None  # 可选 log-AI anchor NPZ；支持井点与相控点约束。
     lambda_log_ai_anchor: float = 0.0  # log(AI) anchor 监督权重；0 表示关闭。
     log_ai_anchor_batch_size: int = 0  # 每个训练 batch 额外抽取的 anchor 数；<=0 表示使用全部。
-    log_ai_anchor_use_weight: bool = True  # 是否使用 anchor_weight 加权约束。
     log_ai_anchor_neighborhood_radius: int = 0  # anchor 邻域半径（网格单位）；0=仅中心道。
     zero_residual_outside_mask: bool = True  # 是否将层外高频扰动通过 taper 平滑压回 0。
     boundary_effect_samples: int | None = None  # 为空时按子波 5% 有效半支撑自动计算。

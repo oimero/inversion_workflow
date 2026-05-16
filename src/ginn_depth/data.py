@@ -278,7 +278,6 @@ def build_well_control_data(
     n_traces: int,
     geometry: Dict[str, Any],
     lambda_log_ai_anchor: float,
-    use_anchor_weight: bool,
     neighborhood_radius: int,
     well_waveform_min_weight: float,
     distance_decay: str,
@@ -371,11 +370,8 @@ def build_well_control_data(
     rows = np.array([best_by_flat[int(flat)][1] for flat in flat_indices], dtype=np.int64)
     target_log_ai = np.asarray(anchor_bundle.target_log_ai[rows], dtype=np.float32)
     valid = np.asarray(anchor_bundle.anchor_mask[rows], dtype=bool) & np.isfinite(target_log_ai)
-    if use_anchor_weight:
-        mask_weight = np.asarray(anchor_bundle.anchor_weight[rows], dtype=np.float32)
-        mask_weight = np.where(np.isfinite(mask_weight) & (mask_weight > 0.0), mask_weight, 0.0)
-    else:
-        mask_weight = np.ones_like(target_log_ai, dtype=np.float32)
+    mask_weight = np.asarray(anchor_bundle.anchor_weight[rows], dtype=np.float32)
+    mask_weight = np.where(np.isfinite(mask_weight) & (mask_weight > 0.0), mask_weight, 0.0)
     mask_weight = (mask_weight * valid.astype(np.float32)).astype(np.float32)
     waveform_weight_scale = (1.0 - (1.0 - float(well_waveform_min_weight)) * influences).astype(np.float32)
 
@@ -943,7 +939,6 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
             n_traces=n_il * n_xl,
             geometry=geometry,
             lambda_log_ai_anchor=cfg.lambda_log_ai_anchor,
-            use_anchor_weight=cfg.log_ai_anchor_use_weight,
             neighborhood_radius=cfg.log_ai_anchor_neighborhood_radius,
             well_waveform_min_weight=cfg.well_waveform_min_weight,
             distance_decay=cfg.well_anchor_distance_decay,

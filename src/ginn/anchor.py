@@ -335,7 +335,6 @@ class LogAIAnchor:
     anchor_file: Path
     lambda_weight: float
     batch_size: int
-    use_anchor_weight: bool
     dataset_indices: np.ndarray
     flat_indices: np.ndarray
     anchor_names: np.ndarray
@@ -358,7 +357,6 @@ class LogAIAnchor:
         anchor_file: Path | None,
         lambda_weight: float,
         batch_size: int,
-        use_anchor_weight: bool,
         sample_domain: str,
         n_sample: int,
         n_traces: int,
@@ -401,10 +399,8 @@ class LogAIAnchor:
         target_log_ai = np.asarray(anchor_bundle.target_log_ai[rows], dtype=np.float32)
         valid = np.asarray(anchor_bundle.anchor_mask[rows], dtype=bool) & np.isfinite(target_log_ai)
 
-        weights = np.ones_like(target_log_ai, dtype=np.float32)
-        if use_anchor_weight:
-            weights = np.asarray(anchor_bundle.anchor_weight[rows], dtype=np.float32)
-            weights = np.where(np.isfinite(weights) & (weights > 0.0), weights, 0.0).astype(np.float32)
+        weights = np.asarray(anchor_bundle.anchor_weight[rows], dtype=np.float32)
+        weights = np.where(np.isfinite(weights) & (weights > 0.0), weights, 0.0).astype(np.float32)
         weights = weights * valid.astype(np.float32)
 
         # Neighbourhood precomputation.
@@ -515,7 +511,6 @@ class LogAIAnchor:
             anchor_file=Path(anchor_file),
             lambda_weight=float(lambda_weight),
             batch_size=int(batch_size),
-            use_anchor_weight=bool(use_anchor_weight),
             dataset_indices=dataset_indices_arr,
             flat_indices=np.asarray(anchor_bundle.flat_indices[rows], dtype=np.int64),
             anchor_names=np.asarray(anchor_bundle.anchor_names[rows]).astype(str),
@@ -543,7 +538,6 @@ class LogAIAnchor:
             "anchor_file": self.anchor_file,
             "lambda_log_ai_anchor": self.lambda_weight,
             "batch_size": self.batch_size,
-            "use_anchor_weight": self.use_anchor_weight,
             "n_anchors": int(self.dataset_indices.size),
             "anchor_names": self.anchor_names.tolist(),
             "anchor_types": self.anchor_types.tolist(),

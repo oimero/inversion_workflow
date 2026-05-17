@@ -93,28 +93,16 @@ def parse_args() -> argparse.Namespace:
         help="Override synthetic_cluster_main_lobe_samples for this QC run.",
     )
     parser.add_argument(
-        "--patch-fraction",
+        "--background-prior-scale-min",
         type=float,
         default=None,
-        help="Override synthetic_patch_fraction for this QC run.",
+        help="Override the high-frequency background prior scale minimum for this QC run.",
     )
     parser.add_argument(
-        "--unresolved-fraction",
+        "--background-prior-scale-max",
         type=float,
         default=None,
-        help="Override synthetic_unresolved_fraction for this QC run.",
-    )
-    parser.add_argument(
-        "--well-patch-scale-min",
-        type=float,
-        default=None,
-        help="Override synthetic_well_patch_scale_min for this QC run.",
-    )
-    parser.add_argument(
-        "--well-patch-scale-max",
-        type=float,
-        default=None,
-        help="Override synthetic_well_patch_scale_max for this QC run.",
+        help="Override the high-frequency background prior scale maximum for this QC run.",
     )
     parser.add_argument(
         "--cluster-amp-abs-p95-min",
@@ -298,7 +286,8 @@ def sample_metrics(
     highpass_samples: int,
     forward_model: Any,
 ) -> dict[str, Any]:
-    mode = "well_patch" if int(sample["synthetic_mode"].item()) == 0 else "unresolved_cluster"
+    mode_code = int(sample["synthetic_mode"].item())
+    mode = "unresolved_cluster" if mode_code == 1 else f"legacy_mode_{mode_code}"
     core_mask = to_numpy_1d(sample["mask"]).astype(bool)
     waveform_mask = core_mask
     delta_mask = to_numpy_1d(sample["delta_loss_mask"]).astype(bool)
@@ -498,9 +487,7 @@ QUALITY_THRESHOLDS = {
 }
 
 
-def add_quality_flags(
-    summary: dict[str, Any], *, requested_patch_fraction: float, requested_unresolved_fraction: float
-) -> list[dict[str, Any]]:
+def add_quality_flags(summary: dict[str, Any]) -> list[dict[str, Any]]:
     flags: list[dict[str, Any]] = []
 
     def flag(
@@ -530,8 +517,7 @@ def add_quality_flags(
     all_stats = summary["all"]
     n_samples = max(int(summary["n_samples"]), 1)
     mode_counts = summary["mode_counts"]
-    total_fraction = requested_patch_fraction + requested_unresolved_fraction
-    expected_cluster = requested_unresolved_fraction / total_fraction if total_fraction > 0 else 0.0
+    expected_cluster = 1.0
     observed_cluster = mode_counts.get("unresolved_cluster", 0) / n_samples
     mode_tolerance = max(QUALITY_THRESHOLDS["mode_mix_abs_tolerance_min"], 3.0 / math.sqrt(n_samples))
     if abs(observed_cluster - expected_cluster) > mode_tolerance:
@@ -542,8 +528,8 @@ def add_quality_flags(
             metric="unresolved_cluster_fraction",
             actual=observed_cluster,
             threshold=f"within {mode_tolerance:.3f} of {expected_cluster:.3f}",
-            related_config_keys=["synthetic_patch_fraction", "synthetic_unresolved_fraction"],
-            suggested_action="Increase QC sample count if this is sampling noise; otherwise check the synthetic mode fractions.",
+            related_config_keys=["synthetic_unresolved_fraction"],
+            suggested_action="Check the synthetic adapter mode selection; depth enhancement QC expects unresolved-cluster samples.",
         )
     else:
         flag(
@@ -553,7 +539,7 @@ def add_quality_flags(
             metric="unresolved_cluster_fraction",
             actual=observed_cluster,
             threshold=f"within {mode_tolerance:.3f} of {expected_cluster:.3f}",
-            related_config_keys=["synthetic_patch_fraction", "synthetic_unresolved_fraction"],
+            related_config_keys=["synthetic_unresolved_fraction"],
         )
 
     rms_ratio = all_stats["synthetic_to_real_rms"]["p50"]
@@ -1075,14 +1061,10 @@ def main() -> None:
     cfg.synthetic_traces_per_epoch = int(args.num_samples)
     if args.main_lobe_samples is not None:
         cfg.synthetic_cluster_main_lobe_samples = int(args.main_lobe_samples)
-    if args.patch_fraction is not None:
-        cfg.synthetic_patch_fraction = float(args.patch_fraction)
-    if args.unresolved_fraction is not None:
-        cfg.synthetic_unresolved_fraction = float(args.unresolved_fraction)
-    if args.well_patch_scale_min is not None:
-        cfg.synthetic_well_patch_scale_min = float(args.well_patch_scale_min)
-    if args.well_patch_scale_max is not None:
-        cfg.synthetic_well_patch_scale_max = float(args.well_patch_scale_max)
+    if args.background_prior_scale_min is not None:
+        cfg.synthetic_well_patch_scale_min = float(args.background_prior_scale_min)
+    if args.background_prior_scale_max is not None:
+        cfg.synthetic_well_patch_scale_max = float(args.background_prior_scale_max)
     if args.cluster_amp_abs_p95_min is not None:
         cfg.synthetic_cluster_amp_abs_p95_min = float(args.cluster_amp_abs_p95_min)
     if args.cluster_amp_abs_p99_max is not None:
@@ -1103,10 +1085,8 @@ def main() -> None:
         cfg.synthetic_max_resample_attempts = int(args.max_resample_attempts)
     LOGGER.info("Resolution prior: %s", cfg.resolution_prior_file)
     LOGGER.info(
-        "Synthetic mix: patch_fraction=%.3f unresolved_fraction=%.3f well_patch_scale=[%.3f, %.3f] "
+        "Synthetic mix: family=unresolved_cluster background_prior_scale=[%.3f, %.3f] "
         "cluster_amp=[%.3f*p95, %.3f*p99] main_lobe_samples=%s",
-        cfg.synthetic_patch_fraction,
-        cfg.synthetic_unresolved_fraction,
         cfg.synthetic_well_patch_scale_min,
         cfg.synthetic_well_patch_scale_max,
         cfg.synthetic_cluster_amp_abs_p95_min,
@@ -1154,10 +1134,9 @@ def main() -> None:
         "resolution_prior_file": cfg.resolution_prior_file,
         "num_samples": args.num_samples,
         "seed": args.seed,
-        "synthetic_patch_fraction": cfg.synthetic_patch_fraction,
-        "synthetic_unresolved_fraction": cfg.synthetic_unresolved_fraction,
-        "synthetic_well_patch_scale_min": cfg.synthetic_well_patch_scale_min,
-        "synthetic_well_patch_scale_max": cfg.synthetic_well_patch_scale_max,
+        "synthetic_family": "unresolved_cluster",
+        "background_prior_scale_min": cfg.synthetic_well_patch_scale_min,
+        "background_prior_scale_max": cfg.synthetic_well_patch_scale_max,
         "synthetic_cluster_min_events": cfg.synthetic_cluster_min_events,
         "synthetic_cluster_max_events": cfg.synthetic_cluster_max_events,
         "synthetic_cluster_amp_abs_p95_min": cfg.synthetic_cluster_amp_abs_p95_min,
@@ -1184,11 +1163,7 @@ def main() -> None:
         "ai_min": cfg.ai_min,
         "ai_max": cfg.ai_max,
     }
-    flags = add_quality_flags(
-        summary,
-        requested_patch_fraction=cfg.synthetic_patch_fraction,
-        requested_unresolved_fraction=cfg.synthetic_unresolved_fraction,
-    )
+    flags = add_quality_flags(summary)
     flag_summary = quality_flag_summary(flags)
     summary["overall_status"] = flag_summary["overall_status"]
     summary["flag_counts"] = flag_summary["flag_counts"]

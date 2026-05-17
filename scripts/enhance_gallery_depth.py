@@ -112,28 +112,16 @@ def parse_args() -> argparse.Namespace:
         help="Override synthetic_cluster_main_lobe_samples for this run.",
     )
     parser.add_argument(
-        "--patch-fraction",
+        "--background-prior-scale-min",
         type=float,
         default=None,
-        help="Override synthetic_patch_fraction for this run.",
+        help="Override the high-frequency background prior scale minimum for this run.",
     )
     parser.add_argument(
-        "--unresolved-fraction",
+        "--background-prior-scale-max",
         type=float,
         default=None,
-        help="Override synthetic_unresolved_fraction for this run.",
-    )
-    parser.add_argument(
-        "--well-patch-scale-min",
-        type=float,
-        default=None,
-        help="Override synthetic_well_patch_scale_min for this run.",
-    )
-    parser.add_argument(
-        "--well-patch-scale-max",
-        type=float,
-        default=None,
-        help="Override synthetic_well_patch_scale_max for this run.",
+        help="Override the high-frequency background prior scale maximum for this run.",
     )
     parser.add_argument(
         "--cluster-amp-abs-p95-min",
@@ -198,10 +186,6 @@ def safe_ratio(num: float, denom: float) -> float:
     return float(num / denom)
 
 
-def mode_name(sample: dict[str, Any]) -> str:
-    return "well_patch" if int(sample["synthetic_mode"].item()) == 0 else "unresolved_cluster"
-
-
 def sample_record(sample: dict[str, Any], index: int, image_path: Path | None) -> dict[str, Any]:
     core_mask = as_1d(sample["mask"]).astype(bool)
     waveform_mask = core_mask
@@ -229,7 +213,6 @@ def sample_record(sample: dict[str, Any], index: int, image_path: Path | None) -
     residual_rms = rms(residual)
     return {
         "sample_index": index,
-        "mode": mode_name(sample),
         "real_rms": real_rms,
         "synthetic_rms": synthetic_rms,
         "synthetic_raw_rms": rms(synthetic_raw),
@@ -293,7 +276,6 @@ def plot_detail(
     core_mask = as_1d(sample["mask"]).astype(bool)
     waveform_mask = core_mask
     delta_mask = as_1d(sample["delta_loss_mask"]).astype(bool)
-    sample_mode = mode_name(sample)
     highres_depth = as_1d(sample["depth_highres"]) if "depth_highres" in sample else None
     highres_ai = as_1d(sample["target_ai_highres"]) if "target_ai_highres" in sample else None
     highres_reflectivity = as_1d(sample["raw_reflectivity_highres"]) if "raw_reflectivity_highres" in sample else None
@@ -349,8 +331,8 @@ def plot_detail(
     waveform_synthetic = finite_core(target_seismic, waveform_mask)
     delta_residual = finite_core(residual, delta_mask)
     title = (
-        f"sample {index:03d} | mode={sample_mode} | "
-        f"synthetic RMS={rms(waveform_synthetic):.3f} | residual abs p99={abs_percentile(delta_residual, 99.0):.3f}"
+        f"sample {index:03d} | synthetic RMS={rms(waveform_synthetic):.3f} | "
+        f"residual abs p99={abs_percentile(delta_residual, 99.0):.3f}"
     )
     fig.suptitle(title)
     fig.tight_layout()
@@ -402,7 +384,7 @@ def plot_overview_page(
 
         for col in range(3):
             shade_mask(axes[row, col], depth, delta_mask)
-        axes[row, 0].set_ylabel(f"#{record['sample_index']:03d}\n{record['mode']}", fontsize=7)
+        axes[row, 0].set_ylabel(f"#{record['sample_index']:03d}", fontsize=7)
         for col in range(4):
             axes[row, col].grid(True, alpha=0.20)
             axes[row, col].tick_params(labelsize=7)
@@ -458,10 +440,9 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             "max": float(np.max(values)),
         }
 
-    modes = sorted({record["mode"] for record in records})
     return {
         "n_samples": len(records),
-        "mode_counts": {mode: sum(1 for record in records if record["mode"] == mode) for mode in modes},
+        "synthetic_family": "unresolved_cluster",
         "synthetic_to_real_rms": stats("synthetic_to_real_rms"),
         "synthetic_to_real_abs_p99": stats("synthetic_to_real_abs_p99"),
         "target_obs_waveform_corr": stats("target_obs_waveform_corr"),
@@ -492,7 +473,6 @@ def write_index_html(path: Path, records: list[dict[str, Any]], overview_paths: 
         rows.append(
             "<tr>"
             f"<td>{link}</td>"
-            f"<td>{html.escape(str(record['mode']))}</td>"
             f"<td>{float(record['synthetic_to_real_rms']):.3f}</td>"
             f"<td>{float(record['synthetic_to_real_abs_p99']):.3f}</td>"
             f"<td>{float(record['target_obs_waveform_corr']):.3f}</td>"
@@ -517,7 +497,7 @@ def write_index_html(path: Path, records: list[dict[str, Any]], overview_paths: 
     body {{ font-family: Arial, sans-serif; margin: 24px; color: #222; }}
     table {{ border-collapse: collapse; font-size: 13px; }}
     th, td {{ border: 1px solid #ddd; padding: 5px 8px; text-align: right; }}
-    th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) {{ text-align: left; }}
+    th:first-child, td:first-child {{ text-align: left; }}
     th {{ background: #f2f2f2; }}
     a {{ color: #1f5fbf; }}
   </style>
@@ -532,7 +512,7 @@ def write_index_html(path: Path, records: list[dict[str, Any]], overview_paths: 
   <table>
     <thead>
       <tr>
-        <th>sample</th><th>mode</th><th>synth/real RMS</th><th>synth/real abs-p99</th>
+        <th>sample</th><th>synth/real RMS</th><th>synth/real abs-p99</th>
         <th>target/obs corr</th><th>input/obs corr</th><th>base/target corr</th>
         <th>residual abs-p99</th><th>rms scale</th><th>attempts</th>
       </tr>
@@ -550,14 +530,10 @@ def write_index_html(path: Path, records: list[dict[str, Any]], overview_paths: 
 def apply_overrides(cfg: Any, args: argparse.Namespace) -> None:
     if args.main_lobe_samples is not None:
         cfg.synthetic_cluster_main_lobe_samples = int(args.main_lobe_samples)
-    if args.patch_fraction is not None:
-        cfg.synthetic_patch_fraction = float(args.patch_fraction)
-    if args.unresolved_fraction is not None:
-        cfg.synthetic_unresolved_fraction = float(args.unresolved_fraction)
-    if args.well_patch_scale_min is not None:
-        cfg.synthetic_well_patch_scale_min = float(args.well_patch_scale_min)
-    if args.well_patch_scale_max is not None:
-        cfg.synthetic_well_patch_scale_max = float(args.well_patch_scale_max)
+    if args.background_prior_scale_min is not None:
+        cfg.synthetic_well_patch_scale_min = float(args.background_prior_scale_min)
+    if args.background_prior_scale_max is not None:
+        cfg.synthetic_well_patch_scale_max = float(args.background_prior_scale_max)
     if args.cluster_amp_abs_p95_min is not None:
         cfg.synthetic_cluster_amp_abs_p95_min = float(args.cluster_amp_abs_p95_min)
     if args.cluster_amp_abs_p99_max is not None:
@@ -620,11 +596,9 @@ def main() -> None:
     synthetic_dataset = enhancement_bundle.synthetic_dataset
 
     LOGGER.info(
-        "Synthetic config: samples=%d patch_fraction=%.3f unresolved_fraction=%.3f "
-        "well_patch_scale=[%.3f, %.3f] cluster_amp=[%.3f*p95, %.3f*p99]",
+        "Synthetic config: samples=%d family=unresolved_cluster background_prior_scale=[%.3f, %.3f] "
+        "cluster_amp=[%.3f*p95, %.3f*p99]",
         args.num_samples,
-        cfg.synthetic_patch_fraction,
-        cfg.synthetic_unresolved_fraction,
         cfg.synthetic_well_patch_scale_min,
         cfg.synthetic_well_patch_scale_max,
         cfg.synthetic_cluster_amp_abs_p95_min,
@@ -637,7 +611,7 @@ def main() -> None:
     LOGGER.info("Sampling and rendering %d traces...", args.num_samples)
     for idx in range(args.num_samples):
         sample = synthetic_dataset[idx]
-        detail_rel = Path("samples") / f"sample_{idx:03d}_{mode_name(sample)}.png"
+        detail_rel = Path("samples") / f"sample_{idx:03d}.png"
         detail_path = output_dir / detail_rel
         if not args.skip_detail_plots:
             plot_detail(
@@ -679,10 +653,9 @@ def main() -> None:
             "resolution_prior_file": cfg.resolution_prior_file,
             "seed": args.seed,
             "num_samples": args.num_samples,
-            "synthetic_patch_fraction": cfg.synthetic_patch_fraction,
-            "synthetic_unresolved_fraction": cfg.synthetic_unresolved_fraction,
-            "synthetic_well_patch_scale_min": cfg.synthetic_well_patch_scale_min,
-            "synthetic_well_patch_scale_max": cfg.synthetic_well_patch_scale_max,
+            "synthetic_family": "unresolved_cluster",
+            "background_prior_scale_min": cfg.synthetic_well_patch_scale_min,
+            "background_prior_scale_max": cfg.synthetic_well_patch_scale_max,
             "synthetic_cluster_min_events": cfg.synthetic_cluster_min_events,
             "synthetic_cluster_max_events": cfg.synthetic_cluster_max_events,
             "synthetic_cluster_amp_abs_p95_min": cfg.synthetic_cluster_amp_abs_p95_min,
@@ -710,7 +683,7 @@ def main() -> None:
         json.dump(summary, fp, ensure_ascii=False, indent=2, default=json_default)
     write_index_html(output_dir / "index.html", records, overview_paths)
 
-    LOGGER.info("Mode counts: %s", summary["summary"]["mode_counts"])
+    LOGGER.info("Synthetic family: %s", summary["summary"]["synthetic_family"])
     LOGGER.info("synthetic_to_real_rms: %s", summary["summary"]["synthetic_to_real_rms"])
     LOGGER.info("residual_abs_p99: %s", summary["summary"]["residual_abs_p99"])
     LOGGER.info("Wrote: %s", output_dir / "index.html")

@@ -63,7 +63,7 @@ class EnhancementConfig:
     synthetic_max_residual_near_clip_fraction: float | None = 0.02  # near-clipping 最大比例。
     synthetic_max_seismic_rms_ratio: float | None = 2.0  # synthetic/real RMS 最大比值。
     synthetic_max_seismic_abs_p99_ratio: float | None = 2.5  # synthetic/real abs-p99 最大比值。
-    synthetic_min_target_obs_waveform_corr: float | None = 0.0  # target/obs 地震互相关弱门控。
+    synthetic_min_target_obs_waveform_corr: float | None = 0.3  # target/obs 地震互相关弱门控。
     synthetic_min_base_target_waveform_corr: float | None = None  # base/target 诊断门控；默认不启用。
     synthetic_max_resample_attempts: int = 8  # 单样本最多重采样次数。
 

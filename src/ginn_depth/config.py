@@ -97,7 +97,7 @@ class DepthGINNConfig:
     lambda_tv: float = 0.1  # 高频扰动 TV 正则化权重，抑制层内高频 ringing。
     log_ai_anchor_file: Path | None = None  # 可选 log-AI anchor NPZ；支持井点与相控点约束。
     lambda_log_ai_anchor: float = 1.0  # log(AI) anchor 监督权重；0 表示关闭。
-    log_ai_anchor_radius_xy_m: float = 125.0  # anchor 影响半径（XY 米制）；0=仅中心道。
+    log_ai_anchor_radius_xy_m: float = 256.0  # anchor 影响半径（XY 米制）；0=仅中心道。
     well_control_enabled: bool = True  # 是否启用井-地震分治：井邻域内井 anchor 进入常规 batch。
     well_waveform_min_weight: float = 0.3  # 井中心保留的最小 waveform loss 权重。
     well_anchor_batch_fraction: float = 0.25  # 训练 batch 中井影响区样本的目标占比。

@@ -472,7 +472,7 @@ QUALITY_THRESHOLDS = {
     "seismic_rms_ratio_p50_max": 1.30,
     "seismic_abs_p99_ratio_p50_min": 0.60,
     "seismic_abs_p99_ratio_p50_max": 1.60,
-    "target_obs_waveform_corr_p05_min": 0.0,
+    "target_obs_waveform_corr_p05_min": 0.30,
     "base_target_waveform_corr_p05_min": 0.50,
     "outside_taper_nonzero_fraction_p95_max": 0.005,
     "residual_near_clip_fraction_p95_max": 0.02,

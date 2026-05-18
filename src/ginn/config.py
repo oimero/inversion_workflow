@@ -14,6 +14,7 @@ WaveletSource = Literal["precomputed_wavelet", "ricker_wavelet"]
 GainSource = Literal["fixed_gain", "dynamic_gain_model"]
 ValidationSplitMode = Literal["none", "spatial_block"]
 ValidationBlockAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"]
+WellAnchorDistanceDecay = Literal["gaussian", "linear"]
 
 _PATH_FIELDS = {
     "seismic_file",
@@ -95,8 +96,11 @@ class GINNConfig:
     lambda_tv: float = 0.0  # 高频扰动 TV 正则化权重，抑制层内高频 ringing。
     log_ai_anchor_file: Path | None = None  # 可选 log-AI anchor NPZ；支持井点与相控点约束。
     lambda_log_ai_anchor: float = 0.0  # log(AI) anchor 监督权重；0 表示关闭。
-    log_ai_anchor_batch_size: int = 0  # 每个训练 batch 额外抽取的 anchor 数；<=0 表示使用全部。
     log_ai_anchor_radius_xy_m: float = 0.0  # anchor 影响半径（XY 米制）；0=仅中心道。
+    well_control_enabled: bool = True  # 是否启用井-地震分治：井邻域内井 anchor 进入常规 batch。
+    well_waveform_min_weight: float = 0.3  # 井中心保留的最小 waveform loss 权重。
+    well_anchor_batch_fraction: float = 0.25  # 训练 batch 中井影响区样本的目标占比。
+    well_anchor_distance_decay: WellAnchorDistanceDecay = "gaussian"  # 井影响随距离衰减方式。
     zero_residual_outside_mask: bool = True  # 是否将层外高频扰动通过 taper 平滑压回 0。
     boundary_effect_samples: int | None = None  # 为空时按子波 5% 有效半支撑自动计算。
 
@@ -185,10 +189,18 @@ class GINNConfig:
             raise ValueError(f"lambda_tv must be non-negative, got {self.lambda_tv}.")
         if self.lambda_log_ai_anchor < 0.0:
             raise ValueError(f"lambda_log_ai_anchor must be non-negative, got {self.lambda_log_ai_anchor}.")
-        if self.log_ai_anchor_batch_size < 0:
-            raise ValueError(f"log_ai_anchor_batch_size must be non-negative, got {self.log_ai_anchor_batch_size}.")
         if self.log_ai_anchor_radius_xy_m < 0.0:
             raise ValueError(f"log_ai_anchor_radius_xy_m must be non-negative, got {self.log_ai_anchor_radius_xy_m}.")
+        if not 0.0 <= self.well_waveform_min_weight <= 1.0:
+            raise ValueError(f"well_waveform_min_weight must be within [0, 1], got {self.well_waveform_min_weight}.")
+        if not 0.0 <= self.well_anchor_batch_fraction <= 1.0:
+            raise ValueError(
+                f"well_anchor_batch_fraction must be within [0, 1], got {self.well_anchor_batch_fraction}."
+            )
+        if self.well_anchor_distance_decay not in {"gaussian", "linear"}:
+            raise ValueError(
+                f"well_anchor_distance_decay must be 'gaussian' or 'linear', got {self.well_anchor_distance_decay!r}."
+            )
         if self.boundary_effect_samples is not None and self.boundary_effect_samples < 0:
             raise ValueError(f"boundary_effect_samples must be non-negative, got {self.boundary_effect_samples}.")
         if not 0.0 <= self.validation_fraction < 1.0:

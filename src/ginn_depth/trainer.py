@@ -22,7 +22,8 @@ from ginn.trainer import (
     write_json,
 )
 from ginn_depth.config import DepthGINNConfig
-from ginn_depth.data import MixedWellBatchSampler, build_dataset
+from ginn.anchor import MixedWellBatchSampler
+from ginn_depth.data import build_dataset
 from ginn_depth.loss import GINNLoss
 from ginn_depth.model import DilatedResNet1D
 from ginn_depth.physics import DepthForwardModel

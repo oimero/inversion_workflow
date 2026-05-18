@@ -1,8 +1,6 @@
-"""Log-AI anchor schema and runtime constraint for GINN trainers.
+"""Log-AI anchor schema, well-control data, and batch sampler for GINN trainers.
 
-This module merges the former ``log_ai_anchor`` (NPZ schema layer) and
-``well_anchor`` (runtime loss layer) into a single public entrypoint:
-``from ginn.anchor import ...``.
+Public entrypoint: ``from ginn.anchor import ...``.
 """
 
 from __future__ import annotations
@@ -10,15 +8,12 @@ from __future__ import annotations
 import json
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
-import torch
-import torch.nn.functional as F
-from torch import Tensor
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from cup.seismic.spatial import nominal_bin_spacing_m, xy_circle_mask
 from cup.utils.io import to_json_compatible
@@ -313,349 +308,269 @@ def _json_to_dict(value: object) -> dict[str, Any]:
     return parsed
 
 
-# Runtime constraint.
-
-ComposeImpedanceFn = Callable[[Tensor, Tensor, Tensor | None], tuple[Tensor, Tensor]]
+# Well-control data.
 
 
-def _as_tensor(value: np.ndarray | Tensor) -> Tensor:
-    if isinstance(value, Tensor):
-        return value
-    return torch.from_numpy(value)
+@dataclass(frozen=True)
+class WellControlData:
+    """Sparse per-trace well-control targets for in-batch GINN supervision."""
 
-
-@dataclass
-class LogAIAnchor:
-    """Log-AI supervision sampled on a GINN trace axis.
-
-    Supports optional spatial neighbourhood to spread an anchor across nearby
-    traces with distance-decay weights. The anchor file is responsible for any
-    frequency split; this loss uses the stored target_log_ai as-is.
-    """
-
-    anchor_file: Path
-    lambda_weight: float
-    batch_size: int
-    dataset_indices: np.ndarray
     flat_indices: np.ndarray
-    anchor_names: np.ndarray
-    anchor_types: np.ndarray
-    target_log_ai: Tensor
-    anchor_weight: Tensor
-
-    # Neighbourhood.
-    radius_xy_m: float = 0.0
-    neighbor_inputs: Tensor = field(default_factory=lambda: torch.empty(0))
-    neighbor_lfm_raw: Tensor = field(default_factory=lambda: torch.empty(0))
-    neighbor_taper: Tensor = field(default_factory=lambda: torch.empty(0))
-    neighbor_weights: Tensor = field(default_factory=lambda: torch.empty(0))
-    neighbor_ranges: list[tuple[int, int]] = field(default_factory=list)
+    target_log_ai: np.ndarray
+    anchor_weight: np.ndarray
+    well_influence: np.ndarray
+    waveform_weight_scale: np.ndarray
+    summary: dict[str, Any]
 
     @classmethod
-    def build(
-        cls,
-        *,
-        anchor_file: Path | None,
-        lambda_weight: float,
-        batch_size: int,
-        sample_domain: str,
-        n_sample: int,
-        n_traces: int,
-        valid_indices: np.ndarray,
-        dataset: Dataset | None = None,
-        radius_xy_m: float = 0.0,
-        x_grid: np.ndarray | None = None,
-        y_grid: np.ndarray | None = None,
-        geometry: dict | None = None,
-    ) -> "LogAIAnchor | None":
-        if lambda_weight <= 0.0:
-            return None
-        if anchor_file is None:
-            logger.warning("lambda_log_ai_anchor > 0 but log_ai_anchor_file is empty; log-AI anchor disabled.")
-            return None
-
-        anchor_bundle = load_log_ai_anchor_npz(anchor_file)
-        validate_log_ai_anchor(
-            anchor_bundle,
-            sample_domain=sample_domain,
-            n_sample=n_sample,
-            n_traces=n_traces,
+    def empty(cls, n_sample: int, *, summary: dict[str, Any] | None = None) -> "WellControlData":
+        return cls(
+            flat_indices=np.empty(0, dtype=np.int64),
+            target_log_ai=np.zeros((0, int(n_sample)), dtype=np.float32),
+            anchor_weight=np.zeros((0, int(n_sample)), dtype=np.float32),
+            well_influence=np.zeros((0,), dtype=np.float32),
+            waveform_weight_scale=np.ones((0,), dtype=np.float32),
+            summary={} if summary is None else dict(summary),
         )
 
-        flat_to_dataset = {int(flat_idx): idx for idx, flat_idx in enumerate(valid_indices)}
-        rows: list[int] = []
-        dataset_indices: list[int] = []
-        for row, flat_idx in enumerate(anchor_bundle.flat_indices):
-            dataset_idx = flat_to_dataset.get(int(flat_idx))
-            if dataset_idx is None:
-                continue
-            mask = np.asarray(anchor_bundle.anchor_mask[row], dtype=bool)
-            ai = np.asarray(anchor_bundle.target_ai[row], dtype=np.float32)
-            if np.any(mask & np.isfinite(ai) & (ai > 0.0)):
-                rows.append(row)
-                dataset_indices.append(dataset_idx)
 
-        if not rows:
-            logger.warning("No usable log-AI anchor traces from %s; anchor disabled.", anchor_file)
-            return None
-
-        target_log_ai = np.asarray(anchor_bundle.target_log_ai[rows], dtype=np.float32)
-        valid = np.asarray(anchor_bundle.anchor_mask[rows], dtype=bool) & np.isfinite(target_log_ai)
-
-        weights = np.asarray(anchor_bundle.anchor_weight[rows], dtype=np.float32)
-        weights = np.where(np.isfinite(weights) & (weights > 0.0), weights, 0.0).astype(np.float32)
-        weights = weights * valid.astype(np.float32)
-
-        # Neighbourhood precomputation.
-        n_anchors = len(rows)
-        dataset_indices_arr = np.asarray(dataset_indices, dtype=np.int64)
-        neighbor_inputs = torch.empty(0)
-        neighbor_lfm_raw = torch.empty(0)
-        neighbor_taper = torch.empty(0)
-        neighbor_weights_flat = torch.empty(0)
-        neighbor_ranges: list[tuple[int, int]] = []
-
-        radius_xy_m = float(radius_xy_m)
-        if radius_xy_m < 0.0:
-            raise ValueError(f"radius_xy_m must be non-negative, got {radius_xy_m}.")
-
-        if radius_xy_m > 0.0:
-            if dataset is None:
-                raise ValueError("dataset is required for log-AI anchor neighbourhood precomputation.")
-            if geometry is None:
-                raise ValueError("geometry dict is required when radius_xy_m > 0.")
-            if x_grid is None or y_grid is None:
-                raise ValueError("x_grid and y_grid are required when radius_xy_m > 0.")
-            n_il = int(geometry["n_il"])
-            n_xl = int(geometry["n_xl"])
-            x_grid_arr = np.asarray(x_grid, dtype=np.float64)
-            y_grid_arr = np.asarray(y_grid, dtype=np.float64)
-            if x_grid_arr.shape != (n_il, n_xl) or y_grid_arr.shape != (n_il, n_xl):
-                raise ValueError(
-                    f"x_grid/y_grid shape must be {(n_il, n_xl)}, got {x_grid_arr.shape} and {y_grid_arr.shape}."
-                )
-            bin_spacing_m = nominal_bin_spacing_m(x_grid_arr, y_grid_arr)
-            sigma = max(radius_xy_m / 2.0, 0.5 * bin_spacing_m)
-
-            all_inputs: list[Tensor] = []
-            all_lfm: list[Tensor] = []
-            all_taper: list[Tensor] = []
-            all_w: list[Tensor] = []
-
-            for w in range(n_anchors):
-                flat_ref = int(anchor_bundle.flat_indices[rows[w]])
-                il_ref = flat_ref // n_xl
-                xl_ref = flat_ref % n_xl
-                if not (0 <= il_ref < n_il and 0 <= xl_ref < n_xl):
-                    neighbor_ranges.append((neighbor_weights_flat.numel(), neighbor_weights_flat.numel()))
-                    continue
-                candidates: list[tuple[float, int, float]] = []
-                circle_mask, distance_m = xy_circle_mask(
-                    x_grid_arr,
-                    y_grid_arr,
-                    center_x=float(x_grid_arr[il_ref, xl_ref]),
-                    center_y=float(y_grid_arr[il_ref, xl_ref]),
-                    radius_xy_m=radius_xy_m,
-                )
-                for il, xl in np.argwhere(circle_mask):
-                    il_int = int(il)
-                    xl_int = int(xl)
-                    flat = il_int * n_xl + xl_int
-                    ds_idx = flat_to_dataset.get(int(flat))
-                    if ds_idx is None:
-                        continue
-                    dist = float(distance_m[il_int, xl_int])
-                    dw = 1.0 if dist < 1e-8 else math.exp(-(dist**2) / (2.0 * sigma**2))
-                    candidates.append((dist, ds_idx, dw))
-                candidates.sort(key=lambda t: t[0])
-
-                inputs_w = []
-                lfm_w = []
-                taper_w = []
-                weights_w = []
-                for _, ds_idx, dw in candidates:
-                    item = dataset[int(ds_idx)]  # type: ignore[index]
-                    inputs_w.append(_as_tensor(item["input"]))
-                    lfm_w.append(_as_tensor(item["lfm_raw"]))
-                    taper_w.append(_as_tensor(item["taper_weight"]))
-                    weights_w.append(dw)
-
-                if inputs_w:
-                    all_inputs.append(torch.stack(inputs_w))
-                    all_lfm.append(torch.stack(lfm_w))
-                    all_taper.append(torch.stack(taper_w))
-                    all_w.append(torch.tensor(weights_w, dtype=torch.float32))
-                    neighbor_ranges.append(
-                        (neighbor_weights_flat.numel(), neighbor_weights_flat.numel() + len(inputs_w))
-                    )
-                else:
-                    neighbor_ranges.append((neighbor_weights_flat.numel(), neighbor_weights_flat.numel()))
-
-                if all_w:
-                    neighbor_weights_flat = (
-                        torch.cat([neighbor_weights_flat] + [all_w[-1]])
-                        if neighbor_weights_flat.numel() > 0
-                        else all_w[-1]
-                    )
-
-            if all_inputs:
-                neighbor_inputs = torch.cat(all_inputs, dim=0)
-                neighbor_lfm_raw = torch.cat(all_lfm, dim=0)
-                neighbor_taper = torch.cat(all_taper, dim=0)
-
-            max_nbr = max((e - s) for s, e in neighbor_ranges) if neighbor_ranges else 0
-            logger.info(
-                "Log-AI anchor neighbourhood: radius_xy_m=%.3f, sigma=%.3f, max_neighbors=%d, total_nbr=%d",
-                radius_xy_m,
-                sigma,
-                max_nbr,
-                int(neighbor_weights_flat.numel()),
-            )
-        else:
-            if dataset is None:
-                raise ValueError("dataset is required for log-AI anchor precomputation.")
-            for w in range(n_anchors):
-                ds_idx = dataset_indices_arr[w]
-                item = dataset[int(ds_idx)]
-                inp = _as_tensor(item["input"]).unsqueeze(0)
-                lfm = _as_tensor(item["lfm_raw"]).unsqueeze(0)
-                tap = _as_tensor(item["taper_weight"]).unsqueeze(0)
-                neighbor_inputs = torch.cat([neighbor_inputs, inp]) if neighbor_inputs.numel() > 0 else inp
-                neighbor_lfm_raw = torch.cat([neighbor_lfm_raw, lfm]) if neighbor_lfm_raw.numel() > 0 else lfm
-                neighbor_taper = torch.cat([neighbor_taper, tap]) if neighbor_taper.numel() > 0 else tap
-                neighbor_ranges.append((w, w + 1))
-            neighbor_weights_flat = torch.ones(n_anchors, dtype=torch.float32)
-
-        anchor = cls(
-            anchor_file=Path(anchor_file),
-            lambda_weight=float(lambda_weight),
-            batch_size=int(batch_size),
-            dataset_indices=dataset_indices_arr,
-            flat_indices=np.asarray(anchor_bundle.flat_indices[rows], dtype=np.int64),
-            anchor_names=np.asarray(anchor_bundle.anchor_names[rows]).astype(str),
-            anchor_types=np.asarray(anchor_bundle.anchor_types[rows]).astype(str),
-            target_log_ai=torch.from_numpy(target_log_ai),
-            anchor_weight=torch.from_numpy(weights),
-            radius_xy_m=radius_xy_m,
-            neighbor_inputs=neighbor_inputs,
-            neighbor_lfm_raw=neighbor_lfm_raw,
-            neighbor_taper=neighbor_taper,
-            neighbor_weights=neighbor_weights_flat,
-            neighbor_ranges=neighbor_ranges,
-        )
-        logger.info(
-            "Log-AI anchor enabled: anchors=%d, lambda=%.3e, file=%s",
-            n_anchors,
-            float(lambda_weight),
-            anchor_file,
-        )
-        return anchor
-
-    def summary(self) -> dict[str, Any]:
-        result: dict[str, Any] = {
-            "enabled": True,
-            "anchor_file": self.anchor_file,
-            "lambda_log_ai_anchor": self.lambda_weight,
-            "batch_size": self.batch_size,
-            "n_anchors": int(self.dataset_indices.size),
-            "anchor_names": self.anchor_names.tolist(),
-            "anchor_types": self.anchor_types.tolist(),
-            "flat_indices": self.flat_indices.tolist(),
-            "radius_xy_m": self.radius_xy_m,
-            "distance_domain": "xy_m",
-        }
-        if self.neighbor_ranges:
-            result["max_neighbors"] = max(e - s for s, e in self.neighbor_ranges)
-        return result
-
-    def sample_rows(self, *, training: bool) -> np.ndarray:
-        n_anchors = int(self.dataset_indices.size)
-        if self.batch_size <= 0 or self.batch_size >= n_anchors:
-            return np.arange(n_anchors, dtype=np.int64)
-        if training:
-            return np.random.choice(n_anchors, size=self.batch_size, replace=False).astype(np.int64)
-        return np.arange(min(self.batch_size, n_anchors), dtype=np.int64)
-
-    def compute_loss(
-        self,
-        *,
-        dataset: Dataset,
-        device: torch.device,
-        compose_impedance: ComposeImpedanceFn,
-        training: bool,
-    ) -> tuple[Tensor, dict[str, float]]:
-        rows = self.sample_rows(training=training)
-        if rows.size == 0:
-            return zero_log_ai_anchor_metrics(device)
-
-        # Gather neighbour slices for selected anchors.
-        slices = [self.neighbor_ranges[r] for r in rows]
-        total_nbr = sum(e - s for s, e in slices)
-        if total_nbr == 0:
-            return zero_log_ai_anchor_metrics(device)
-
-        # Build flat batch via index cat.
-        all_idx = torch.cat([torch.arange(s, e) for s, e in slices])
-        x = self.neighbor_inputs[all_idx].to(device)
-        lfm_raw = self.neighbor_lfm_raw[all_idx].to(device)
-        taper_weight = self.neighbor_taper[all_idx].to(device)
-        w_flat = self.neighbor_weights[all_idx].to(device)
-
-        ai, _ = compose_impedance(x, lfm_raw, taper_weight)
-        pred_log_ai = torch.log(torch.clamp(ai.squeeze(1), min=1e-6))  # (total_nbr, n_sample)
-
-        # Per-anchor loss with distance weighting.
-        total_loss = torch.zeros((), device=device)
-        total_denom = torch.zeros((), device=device)
-        total_sample_count = torch.zeros((), device=device)
-        cursor = 0
-        for b, r in enumerate(rows):
-            n_valid = slices[b][1] - slices[b][0]
-            if n_valid == 0:
-                continue
-
-            pred = pred_log_ai[cursor : cursor + n_valid]
-            target = self.target_log_ai[r].expand(n_valid, -1).to(device)
-            anchor_weight = self.anchor_weight[r].to(device)
-            w = w_flat[cursor : cursor + n_valid]
-
-            raw = F.smooth_l1_loss(pred, target, reduction="none")  # (n_valid, n_sample)
-            weighted = raw * w.unsqueeze(-1) * anchor_weight.unsqueeze(0)
-            total_loss = total_loss + weighted.sum()
-            sample_weight = w.unsqueeze(-1) * anchor_weight.unsqueeze(0)
-            total_denom = total_denom + sample_weight.sum()
-            total_sample_count = total_sample_count + (sample_weight > 0.0).sum()
-            cursor += n_valid
-
-        raw_loss = total_loss / total_denom.clamp(min=1.0)
-        term = self.lambda_weight * raw_loss
-        return term, {
-            "log_ai_anchor": float(raw_loss.detach().cpu().item()),
-            "log_ai_anchor_term": float(term.detach().cpu().item()),
-            "log_ai_anchor_traces": float(rows.size),
-            "log_ai_anchor_neighbors": float(total_nbr),
-            "anchor_sample_count": float(total_sample_count.detach().cpu().item()),
-        }
+def compute_anchor_influence(
+    distance_m: float,
+    radius_xy_m: float,
+    decay: str,
+    bin_spacing_m: float,
+) -> float:
+    """Compute well influence factor from XY distance using the configured decay."""
+    if distance_m < 1e-8:
+        return 1.0
+    if decay == "linear":
+        return max(0.0, 1.0 - distance_m / max(radius_xy_m, 1e-6))
+    sigma = max(radius_xy_m / 2.0, 0.5 * bin_spacing_m)
+    gaussian_edge = math.exp(-(radius_xy_m**2) / (2.0 * sigma**2)) if radius_xy_m > 0.0 else 0.0
+    raw = math.exp(-(distance_m**2) / (2.0 * sigma**2))
+    influence = (raw - gaussian_edge) / max(1.0 - gaussian_edge, 1e-6)
+    return max(0.0, min(1.0, influence))
 
 
-def disabled_log_ai_anchor_summary(
+def build_well_control_data(
     *,
     anchor_file: Path | None,
-    lambda_weight: float,
-) -> dict[str, Any]:
-    return {
-        "enabled": False,
-        "anchor_file": anchor_file,
-        "lambda_log_ai_anchor": lambda_weight,
+    selected_indices: np.ndarray,
+    sample_domain: str,
+    n_sample: int,
+    n_traces: int,
+    geometry: dict[str, Any],
+    lambda_log_ai_anchor: float,
+    radius_xy_m: float,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    well_waveform_min_weight: float,
+    distance_decay: str,
+    log_prefix: str = "Well-control",
+) -> WellControlData:
+    """Build a sparse map of well-controlled traces for in-batch anchor loss."""
+    selected_indices = np.asarray(selected_indices, dtype=np.int64).reshape(-1)
+    radius_xy_m = float(radius_xy_m)
+    if lambda_log_ai_anchor <= 0.0 or anchor_file is None or selected_indices.size == 0 or radius_xy_m < 0.0:
+        return WellControlData.empty(
+            n_sample,
+            summary={
+                "enabled": False,
+                "anchor_file": anchor_file,
+                "reason": "disabled_or_empty",
+            },
+        )
+
+    if distance_decay not in {"gaussian", "linear"}:
+        raise ValueError(f"Unsupported anchor distance decay: {distance_decay!r}.")
+
+    anchor_bundle = load_log_ai_anchor_npz(anchor_file)
+    validate_log_ai_anchor(
+        anchor_bundle,
+        sample_domain=sample_domain,
+        n_sample=n_sample,
+        n_traces=n_traces,
+    )
+
+    x_grid = np.asarray(x_grid, dtype=np.float64)
+    y_grid = np.asarray(y_grid, dtype=np.float64)
+    selected_set = {int(flat_idx) for flat_idx in selected_indices}
+    n_il = int(geometry["n_il"])
+    n_xl = int(geometry["n_xl"])
+    if x_grid.shape != (n_il, n_xl) or y_grid.shape != (n_il, n_xl):
+        raise ValueError(
+            f"x_grid/y_grid shape must be {(n_il, n_xl)}, got {x_grid.shape} and {y_grid.shape}."
+        )
+    bin_spacing_m = nominal_bin_spacing_m(x_grid, y_grid)
+
+    best_by_flat: dict[int, tuple[float, int]] = {}
+    for row, flat_idx in enumerate(np.asarray(anchor_bundle.flat_indices, dtype=np.int64)):
+        target = np.asarray(anchor_bundle.target_log_ai[row], dtype=np.float32)
+        target_mask = np.asarray(anchor_bundle.anchor_mask[row], dtype=bool) & np.isfinite(target)
+        if not np.any(target_mask):
+            continue
+
+        flat_ref = int(flat_idx)
+        il_ref = flat_ref // n_xl
+        xl_ref = flat_ref % n_xl
+        if not (0 <= il_ref < n_il and 0 <= xl_ref < n_xl):
+            continue
+        circle_mask, distance_m = xy_circle_mask(
+            x_grid,
+            y_grid,
+            center_x=float(x_grid[il_ref, xl_ref]),
+            center_y=float(y_grid[il_ref, xl_ref]),
+            radius_xy_m=radius_xy_m,
+        )
+        for il, xl in np.argwhere(circle_mask):
+            il_int = int(il)
+            xl_int = int(xl)
+            flat = il_int * n_xl + xl_int
+            if flat not in selected_set:
+                continue
+            dist = float(distance_m[il_int, xl_int])
+            influence = compute_anchor_influence(dist, radius_xy_m, distance_decay, bin_spacing_m)
+            if influence <= 0.0:
+                continue
+            current = best_by_flat.get(flat)
+            if current is None or influence > current[0]:
+                best_by_flat[flat] = (float(influence), int(row))
+
+    if not best_by_flat:
+        return WellControlData.empty(
+            n_sample,
+            summary={
+                "enabled": False,
+                "anchor_file": anchor_file,
+                "reason": "no_anchor_trace_in_selected_indices",
+                "n_input_anchors": int(anchor_bundle.n_anchors),
+            },
+        )
+
+    flat_indices = np.array(sorted(best_by_flat), dtype=np.int64)
+    influences = np.array([best_by_flat[int(flat)][0] for flat in flat_indices], dtype=np.float32)
+    rows = np.array([best_by_flat[int(flat)][1] for flat in flat_indices], dtype=np.int64)
+    target_log_ai = np.asarray(anchor_bundle.target_log_ai[rows], dtype=np.float32)
+    valid = np.asarray(anchor_bundle.anchor_mask[rows], dtype=bool) & np.isfinite(target_log_ai)
+    anchor_weight = np.asarray(anchor_bundle.anchor_weight[rows], dtype=np.float32)
+    anchor_weight = np.where(np.isfinite(anchor_weight) & (anchor_weight > 0.0), anchor_weight, 0.0)
+    anchor_weight = (anchor_weight * valid.astype(np.float32)).astype(np.float32)
+    waveform_weight_scale = (1.0 - (1.0 - float(well_waveform_min_weight)) * influences).astype(np.float32)
+
+    anchor_names = np.asarray(anchor_bundle.anchor_names).astype(str)
+    unique_rows, counts = np.unique(rows, return_counts=True)
+    summary = {
+        "enabled": True,
+        "anchor_file": Path(anchor_file),
+        "n_input_anchors": int(anchor_bundle.n_anchors),
+        "n_controlled_traces": int(flat_indices.size),
+        "radius_xy_m": radius_xy_m,
+        "nominal_bin_spacing_m": float(bin_spacing_m),
+        "distance_domain": "xy_m",
+        "distance_decay": distance_decay,
+        "well_waveform_min_weight": float(well_waveform_min_weight),
+        "influence_min": float(np.min(influences)),
+        "influence_mean": float(np.mean(influences)),
+        "influence_max": float(np.max(influences)),
+        "waveform_weight_min": float(np.min(waveform_weight_scale)),
+        "waveform_weight_mean": float(np.mean(waveform_weight_scale)),
+        "waveform_weight_max": float(np.max(waveform_weight_scale)),
+        "controlled_traces_by_anchor": {
+            str(anchor_names[int(row)]): int(count) for row, count in zip(unique_rows, counts)
+        },
     }
+    logger.info(
+        "%s map: controlled_traces=%d, radius_xy_m=%.3f, influence=[%.3f, %.3f], waveform_weight=[%.3f, %.3f]",
+        log_prefix,
+        int(flat_indices.size),
+        radius_xy_m,
+        float(np.min(influences)),
+        float(np.max(influences)),
+        float(np.min(waveform_weight_scale)),
+        float(np.max(waveform_weight_scale)),
+    )
+    return WellControlData(
+        flat_indices=flat_indices,
+        target_log_ai=target_log_ai,
+        anchor_weight=anchor_weight,
+        well_influence=influences,
+        waveform_weight_scale=waveform_weight_scale,
+        summary=summary,
+    )
 
 
-def zero_log_ai_anchor_metrics(device: torch.device) -> tuple[Tensor, dict[str, float]]:
-    zero = torch.zeros((), device=device)
-    return zero, {
-        "log_ai_anchor": 0.0,
-        "log_ai_anchor_term": 0.0,
-        "log_ai_anchor_traces": 0.0,
-        "log_ai_anchor_neighbors": 0.0,
-        "anchor_sample_count": 0.0,
-    }
+class MixedWellBatchSampler(Sampler[list[int]]):
+    """Batch sampler that replaces a fraction of each batch with well-controlled traces."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        *,
+        batch_size: int,
+        well_fraction: float,
+        drop_last: bool = True,
+        seed: int = 0,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}.")
+        if not 0.0 <= well_fraction <= 1.0:
+            raise ValueError(f"well_fraction must be within [0, 1], got {well_fraction}.")
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.well_fraction = float(well_fraction)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self._epoch = 0
+        self.anchor_indices = np.asarray(dataset.anchor_dataset_indices, dtype=np.int64)
+        self.ordinary_indices = np.asarray(dataset.ordinary_dataset_indices, dtype=np.int64)
+        self.all_indices = np.arange(len(dataset), dtype=np.int64)
+
+        if self.anchor_indices.size and self.well_fraction > 0.0:
+            self.n_well_per_batch = int(round(self.batch_size * self.well_fraction))
+            self.n_well_per_batch = min(max(self.n_well_per_batch, 1), self.batch_size)
+        else:
+            self.n_well_per_batch = 0
+        self.n_ordinary_per_batch = self.batch_size - self.n_well_per_batch
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return int(len(self.dataset) // self.batch_size)
+        return int(math.ceil(len(self.dataset) / self.batch_size))
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self._epoch)
+        self._epoch += 1
+        n_batches = len(self)
+        if self.n_well_per_batch <= 0 or self.anchor_indices.size == 0:
+            shuffled = rng.permutation(self.all_indices)
+            for batch_idx in range(n_batches):
+                start = batch_idx * self.batch_size
+                stop = min(start + self.batch_size, shuffled.size)
+                batch = shuffled[start:stop]
+                if batch.size == self.batch_size or not self.drop_last:
+                    yield batch.astype(np.int64).tolist()
+            return
+
+        ordinary_pool = self.ordinary_indices if self.ordinary_indices.size else self.all_indices
+        ordinary_needed = max(self.n_ordinary_per_batch, 0) * n_batches
+        if ordinary_needed:
+            repeats = int(math.ceil(ordinary_needed / max(ordinary_pool.size, 1)))
+            ordinary_draws = np.concatenate([rng.permutation(ordinary_pool) for _ in range(repeats)])
+        else:
+            ordinary_draws = np.empty(0, dtype=np.int64)
+
+        ordinary_cursor = 0
+        for _ in range(n_batches):
+            parts: list[np.ndarray] = []
+            if self.n_ordinary_per_batch > 0:
+                ordinary = ordinary_draws[ordinary_cursor : ordinary_cursor + self.n_ordinary_per_batch]
+                ordinary_cursor += self.n_ordinary_per_batch
+                parts.append(ordinary)
+            well = rng.choice(self.anchor_indices, size=self.n_well_per_batch, replace=True)
+            parts.append(np.asarray(well, dtype=np.int64))
+            batch = np.concatenate(parts)
+            rng.shuffle(batch)
+            yield batch.astype(np.int64).tolist()

@@ -33,6 +33,7 @@ from cup.well.wavelet import (
     make_wavelet,
     validate_wavelet_dt,
 )
+from ginn.anchor import WellControlData, build_well_control_data
 from ginn.config import GINNConfig
 from ginn.masking import build_eroded_loss_mask as _build_eroded_loss_mask
 from ginn.masking import build_residual_taper as _build_residual_taper
@@ -80,6 +81,7 @@ class DatasetBundle:
     geometry: Dict[str, Any]
     split_metadata: Dict[str, Any]
     lfm_metadata: Dict[str, Any]
+    well_control_summary: Dict[str, Any]
     x_grid: np.ndarray
     y_grid: np.ndarray
 
@@ -362,6 +364,7 @@ class SeismicTraceDataset(Dataset):
         include_dynamic_gain_input: bool = False,
         normalization_stats: tuple[float, float] | None = None,
         dynamic_gain_median: float | None = None,
+        well_control_data: WellControlData | None = None,
     ) -> None:
         n_traces, n_sample = seismic_flat.shape
         assert lfm_flat.shape == seismic_flat.shape
@@ -387,6 +390,16 @@ class SeismicTraceDataset(Dataset):
         self._include_lfm_input = bool(include_lfm_input)
         self._include_mask_input = bool(include_mask_input)
         self._include_dynamic_gain_input = bool(include_dynamic_gain_input)
+        self._zero_anchor_target_log_ai = np.zeros((n_sample,), dtype=np.float32)
+        self._zero_anchor_weight = np.zeros((n_sample,), dtype=np.float32)
+        self._well_control = WellControlData.empty(n_sample) if well_control_data is None else well_control_data
+        self._well_control_lookup = {
+            int(flat_idx): row
+            for row, flat_idx in enumerate(np.asarray(self._well_control.flat_indices, dtype=np.int64))
+        }
+        anchor_mask = np.isin(self._valid_indices, self._well_control.flat_indices)
+        self._anchor_dataset_indices = np.flatnonzero(anchor_mask).astype(np.int64)
+        self._ordinary_dataset_indices = np.flatnonzero(~anchor_mask).astype(np.int64)
         if self._include_dynamic_gain_input and self._dynamic_gain_flat is None:
             logger.warning("include_dynamic_gain_input=True but no dynamic gain model is loaded; using a zero channel.")
 
@@ -423,6 +436,12 @@ class SeismicTraceDataset(Dataset):
             self._lfm_scale,
             self.input_channel_names,
         )
+        if self._anchor_dataset_indices.size:
+            logger.info(
+                "Dataset well-control samples: %d anchor-influenced / %d ordinary",
+                int(self._anchor_dataset_indices.size),
+                int(self._ordinary_dataset_indices.size),
+            )
 
     def __len__(self) -> int:
         return len(self._valid_indices)
@@ -452,6 +471,18 @@ class SeismicTraceDataset(Dataset):
         return self._dynamic_gain_median
 
     @property
+    def anchor_dataset_indices(self) -> np.ndarray:
+        return self._anchor_dataset_indices
+
+    @property
+    def ordinary_dataset_indices(self) -> np.ndarray:
+        return self._ordinary_dataset_indices
+
+    @property
+    def well_control_summary(self) -> Dict[str, Any]:
+        return dict(self._well_control.summary)
+
+    @property
     def input_channel_names(self) -> tuple[str, ...]:
         channels = ["seismic"]
         if self._include_lfm_input:
@@ -471,6 +502,20 @@ class SeismicTraceDataset(Dataset):
         loss_mask = self._loss_mask_flat[flat_idx]  # (n_sample,)
         taper_weight = self._taper_flat[flat_idx]  # (n_sample,)
         dynamic_gain = self._dynamic_gain_flat[flat_idx] if self._dynamic_gain_flat is not None else None
+
+        control_row = self._well_control_lookup.get(int(flat_idx))
+        if control_row is None:
+            anchor_target_log_ai = self._zero_anchor_target_log_ai
+            anchor_weight = self._zero_anchor_weight
+            well_influence = np.float32(0.0)
+            waveform_weight_scale = np.float32(1.0)
+            has_anchor = np.float32(0.0)
+        else:
+            anchor_target_log_ai = self._well_control.target_log_ai[control_row]
+            anchor_weight = self._well_control.anchor_weight[control_row]
+            well_influence = np.float32(self._well_control.well_influence[control_row])
+            waveform_weight_scale = np.float32(self._well_control.waveform_weight_scale[control_row])
+            has_anchor = np.float32(1.0)
 
         # 保留 LFM 原始量纲用于物理正演
         lfm_raw = lfm.copy()
@@ -498,6 +543,11 @@ class SeismicTraceDataset(Dataset):
             "loss_mask": torch.from_numpy(loss_mask[np.newaxis]).bool(),  # (1, n_sample)
             "taper_weight": torch.from_numpy(taper_weight[np.newaxis]).float(),  # (1, n_sample)
             "lfm_raw": torch.from_numpy(lfm_raw[np.newaxis]).float(),  # (1, n_sample)
+            "anchor_target_log_ai": torch.from_numpy(anchor_target_log_ai[np.newaxis]).float(),
+            "anchor_weight": torch.from_numpy(anchor_weight[np.newaxis]).float(),
+            "well_influence": torch.tensor([float(well_influence)], dtype=torch.float32),
+            "waveform_weight_scale": torch.tensor([float(waveform_weight_scale)], dtype=torch.float32),
+            "has_anchor": torch.tensor([float(has_anchor)], dtype=torch.float32),
         }
         if dynamic_gain is not None:
             item["dynamic_gain"] = torch.from_numpy(dynamic_gain[np.newaxis]).float()
@@ -679,6 +729,35 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     else:
         logger.info("Validation split disabled.")
 
+    # ── 构建 well-control map ──
+    if cfg.well_control_enabled:
+        train_well_control = build_well_control_data(
+            anchor_file=cfg.log_ai_anchor_file,
+            selected_indices=train_indices,
+            sample_domain="time",
+            n_sample=n_sample,
+            n_traces=n_il * n_xl,
+            geometry=geometry,
+            lambda_log_ai_anchor=cfg.lambda_log_ai_anchor,
+            radius_xy_m=cfg.log_ai_anchor_radius_xy_m,
+            x_grid=x_grid,
+            y_grid=y_grid,
+            well_waveform_min_weight=cfg.well_waveform_min_weight,
+            distance_decay=cfg.well_anchor_distance_decay,
+            log_prefix="Time well-control",
+        )
+    else:
+        train_well_control = WellControlData.empty(
+            n_sample,
+            summary={
+                "enabled": False,
+                "anchor_file": cfg.log_ai_anchor_file,
+                "reason": "well_control_enabled_false",
+            },
+        )
+    empty_well_control = WellControlData.empty(n_sample)
+    split_metadata["well_control"] = train_well_control.summary
+
     # ── 构建数据集（共享预计算的掩码 / taper，不重复计算） ──
     train_shared = (seismic_flat, lfm_flat, train_mask_flat, train_loss_mask_flat, train_taper_flat)
     inference_shared = (
@@ -695,6 +774,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         include_lfm_input=cfg.include_lfm_input,
         include_mask_input=cfg.include_mask_input,
         include_dynamic_gain_input=cfg.include_dynamic_gain_input,
+        well_control_data=train_well_control,
     )
     train_norm_stats = (train_dataset.seis_rms, train_dataset.lfm_scale)
     val_dataset = None
@@ -708,6 +788,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
             include_dynamic_gain_input=cfg.include_dynamic_gain_input,
             normalization_stats=train_norm_stats,
             dynamic_gain_median=train_dataset.dynamic_gain_median,
+            well_control_data=empty_well_control,
         )
     inference_dataset = SeismicTraceDataset(
         *inference_shared,
@@ -718,6 +799,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         include_dynamic_gain_input=cfg.include_dynamic_gain_input,
         normalization_stats=train_norm_stats,
         dynamic_gain_median=train_dataset.dynamic_gain_median,
+        well_control_data=empty_well_control,
     )
 
     if cfg.gain_source == "fixed_gain":
@@ -757,6 +839,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         geometry=geometry,
         split_metadata=split_metadata,
         lfm_metadata=lfm_meta,
+        well_control_summary=train_well_control.summary,
         x_grid=x_grid,
         y_grid=y_grid,
     )

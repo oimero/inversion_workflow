@@ -41,4 +41,8 @@ nav:
       - cup.seismic: api/cup/seismic.md
       - cup.well: api/cup/well.md
   - 指南:
+      - 01 井资产盘点: guide/1-well-inventory.md
+      - 02 LAS 曲线筛选与导出: guide/2-las-curve-screen.md
+      - 03 测井预处理: guide/3-log-preprocess.md
+      - 04 井震自动标定: guide/4-well-auto-tie.md
       - 常见问题: guide/troubleshooting.md

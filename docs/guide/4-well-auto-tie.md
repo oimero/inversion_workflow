@@ -1,0 +1,361 @@
+# 04 井震自动标定
+
+本文讨论第四个规划脚本：`well_auto_tie.py`。
+
+它接在 `log_preprocess.py` 后面，负责把井曲线、时深关系、地震道和子波提取流程组织起来，产出每口井的井震标定结果。虽然历史深度域脚本叫 `vertical_well_auto_tie_depth.py`，但时间域第一版建议不要继续叫 `vertical_well_auto_tie.py`，因为本脚本需要同时路由直井和斜井。
+
+第一版先实现三条路径：
+
+1. 有时深、直井。
+2. 没有时深、有井分层、直井。
+3. 有时深、有井轨迹、斜井。
+
+没有时深、有井轨迹、有井分层的斜井路径先只识别并拒绝，不实现。
+
+## 目标
+
+`well_auto_tie.py` 回答五件事：
+
+1. 每口井满足哪条井震标定路径，或为什么被拒绝。
+2. 如何为该井构造初始时深关系。
+3. 如何读取与井匹配的地震道：直井取井口处道，斜井沿井轨迹取道。
+4. 如何调用 `wtie` auto-tie 流程微调时深关系并提取子波。
+5. 如何输出可审计的标定指标、优化后时深表、合成记录和 QC 图。
+
+第四步不再自己扫描原始 LAS 或猜测曲线是否可用。它读取前三步产出的 manifest 后做路由。
+
+## 输入
+
+- 第一阶段清单：`well_inventory.csv`。
+- 第二阶段曲线筛选：`well_curve_screen.csv`、`las_curve_inventory.csv`。
+- 第三阶段预处理状态：`well_preprocess_status.csv`。
+- 第三阶段预处理 LAS：`preprocessed_las/*.las`。
+- 时深表目录：`data/time_depth_table`。
+- 井轨迹目录：`data/all_well_trace`。
+- 井分层文件：`data/raw/well_tops`。
+- 地震解释层位：例如 `data/interpre/H3-1`、`data/interpre/H7-3`。
+- 地震体：`data/raw/obn-clipped-240-912-872-1544.zgy`。
+- 子波提取网络：沿用深度域 auto-tie 的 `tutorial_model` 和 `tutorial_params`。
+- 可选锚点配置：没有时深时，指定井分层和地震解释层位的对应关系。
+
+建议配置片段：
+
+```yaml
+well_auto_tie:
+  source_runs:
+    mode: latest
+    well_inventory_dir: null
+    las_curve_screen_dir: null
+    log_preprocess_dir: null
+
+  inventory_file: null
+  curve_screen_file: null
+  preprocess_status_file: null
+  preprocessed_las_dir: null
+
+  time_depth_dir: time_depth_table
+  well_trace_dir: all_well_trace
+  well_tops_file: raw/well_tops
+  interpretation:
+    top_horizon: interpre/H3-1
+    bottom_horizon: interpre/H7-3
+  seismic:
+    file: raw/obn-clipped-240-912-872-1544.zgy
+    type: zgy
+
+  enabled_routes:
+    - vertical_with_tdt
+    - vertical_anchor_from_tops
+    - deviated_with_tdt
+
+  anchor_config_file: experiments/well_auto_tie_anchors.yaml
+
+  tutorial_model: tutorial/trained_net_state_dict.pt
+  tutorial_params: tutorial/network_parameters.yaml
+  target_crop_ms: 201.0
+
+  search_space:
+    logs_median_size_values: [51, 71, 91, 111]
+    logs_median_threshold_bounds: [0.5, 3.0]
+    logs_std_bounds: [20, 50]
+    table_t_shift_bounds: [-0.030, 0.030]
+
+  search_params:
+    num_iters: 60
+    similarity_std: 0.02
+
+  wavelet_scaling:
+    min_scale: 50000
+    max_scale: 500000
+    num_iters: 60
+
+  reject:
+    allow_near_outside: false
+    min_valid_log_fraction: 0.7
+    min_tie_samples: 64
+```
+
+`source_runs.mode: latest` 表示脚本自动从 `scripts/output` 下寻找最新的前置产物。若需要复现实验，可以显式填写 `inventory_file`、`curve_screen_file`、`preprocess_status_file` 和 `preprocessed_las_dir`。不要把 `YYYYMMDD_HHMMSS` 占位符长期写死在配置里。
+
+## 输出
+
+默认输出目录建议为：
+
+```text
+scripts/output/well_auto_tie_<timestamp>/
+```
+
+核心文件：
+
+- `well_tie_plan.csv`：一井一行的路由结果。
+- `well_tie_metrics.csv`：一井一行的标定指标。
+- `rejected_wells.csv`：被拒绝的井及原因。
+- `wavelets/wavelet_201ms_<well>.csv`：每口成功井的裁剪归一化子波。
+- `time_depth/initial_tdt_<well>.csv`：初始时深表。
+- `time_depth/optimized_tdt_<well>.csv`：`wtie` 优化后的时深表。
+- `synthetic_qc/tie_qc_<well>.csv`：地震、反射系数、合成记录和残差。
+- `seismic_trace/seismic_trace_<well>.csv`：用于标定的井旁或轨迹地震道。
+- `figures/<well>/*.png`：优化目标、时深关系、井震匹配、子波等 QC 图。
+- `run_summary.json`：输入、配置、路由统计、失败统计。
+
+`well_tie_plan.csv` 建议字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `well_name` | 井名 |
+| `route` | `vertical_with_tdt`、`vertical_anchor_from_tops`、`deviated_with_tdt`、`deviated_anchor_from_tops`、`rejected` |
+| `route_status` | `planned`、`skipped_disabled`、`rejected` |
+| `wellbore_class_initial` | 第一阶段基于井头底孔坐标的初分井型 |
+| `wellbore_class_qc` | 第四步读取井轨迹后复核的井型；无轨迹时可为空 |
+| `has_time_depth` | 第一阶段时深存在性 |
+| `has_well_trace` | 第一阶段井轨迹存在性 |
+| `has_well_tops` | 第一阶段井分层存在性 |
+| `usable_p_sonic` | 第三阶段纵波时差可用性 |
+| `usable_density` | 第三阶段密度可用性 |
+| `input_las` | 预处理 LAS 路径 |
+| `time_depth_file` | 时深表路径；没有则为空 |
+| `well_trace_file` | 井轨迹路径；直井路径可为空 |
+| `reasons` | 路由说明或拒绝原因 |
+
+`well_tie_metrics.csv` 建议字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `well_name` | 井名 |
+| `route` | 实际执行路径 |
+| `tie_status` | `success`、`failed` |
+| `initial_corr` | 初始合成记录与地震相关系数 |
+| `optimized_corr` | 优化后相关系数 |
+| `optimized_nmae` | 优化后归一化 MAE |
+| `best_table_shift_ms` | 最优整体时移 |
+| `wavelet_file` | 输出子波 |
+| `optimized_tdt_file` | 优化后时深表 |
+| `qc_figure_dir` | QC 图目录 |
+| `reasons` | 警告或失败原因 |
+
+## 路由规则
+
+第四步先 join 三份 manifest：
+
+- `well_inventory.csv`
+- `well_curve_screen.csv`
+- `well_preprocess_status.csv`
+
+然后按下表路由：
+
+| route | 条件 | 第一版动作 |
+| --- | --- | --- |
+| `vertical_with_tdt` | 工区内或允许边缘井；直井；有时深；`usable_p_sonic` 和 `usable_density` | 实现 |
+| `vertical_anchor_from_tops` | 工区内或允许边缘井；直井；无时深；有井分层；`usable_p_sonic` 和 `usable_density`；有人工锚点配置 | 实现 |
+| `deviated_with_tdt` | 工区内或允许边缘井；斜井；有时深；有井轨迹；`usable_p_sonic` 和 `usable_density` | 实现 |
+| `deviated_anchor_from_tops` | 斜井；无时深；有井轨迹；有井分层；有曲线 | 暂时拒绝 |
+| `rejected` | 其他情况 | 拒绝 |
+
+说明：
+
+- 这里的“有井轨迹”指 `data/all_well_trace` 中的井轨迹/井斜文件，不是 LAS 井径曲线 `caliper`。
+- LAS 井径曲线可以作为井眼质量 QC 的辅助信息，但不是斜井路径的必要条件。
+- 第一阶段的 `wellbore_class` 是初分。斜井路径执行前必须正式读取井轨迹并复核。
+- `near_outside` 井默认拒绝，除非配置 `allow_near_outside: true`。
+
+`well_tie_plan.csv` 应同时保留 `wellbore_class_initial` 和 `wellbore_class_qc`。路由可以先用初分井型生成候选 plan，但执行前必须用轨迹 QC 更新最终路径；如果复核结果和初分冲突，写入 `reasons`。
+
+## 路径一：有时深、直井
+
+`vertical_with_tdt` 是最接近现有深度域 `vertical_well_auto_tie_depth.py` 的路径。
+
+处理逻辑：
+
+1. 读取预处理 LAS，取 `DT_USM` 和 `RHO_GCC`。
+2. 将慢度 `DT_USM` 转成速度 `Vp`，和密度构造 `grid.LogSet`。
+3. 读取该井已有时深表，构造 `grid.TimeDepthTable`。
+4. 在井口 XY 处读取时间域地震道。
+5. 用已有时深表作为初始 table，调用 `autotie.tie_v1` 做微调。
+6. 裁剪并能量归一化子波，输出优化后时深表和 QC。
+
+这条路径不再像深度域脚本那样从 Vp 从零构造本地时深表，而是以已有时深表为初始约束。Vp 主要用于生成反射系数和合成记录。
+
+## 路径二：无时深、有井分层、直井
+
+`vertical_anchor_from_tops` 用人工选定的层位锚点构造初始时深表。
+
+前置条件：
+
+- 井分层文件中有该井的目标层位 MD。
+- 地震解释层位能在井口 XY 处取到 TWT。
+- 人工配置明确哪个井分层对应哪个地震强轴或解释层位。
+
+锚点配置示例：
+
+```yaml
+anchors:
+  default:
+    well_top: H3-1
+    horizon: interpre/H3-1
+    event: peak
+    twt_unit: s
+  wells:
+    A1:
+      well_top: H3-1
+      horizon: interpre/H3-1
+      event: peak
+```
+
+处理逻辑：
+
+1. 从井分层得到锚点 MD。
+2. 从地震解释层位得到井口处锚点 TWT。
+3. 从锚点开始，沿井曲线向上、向下积分纵波慢度，生成初始 TWT-MD 表。
+4. 直井第一版近似 `MD ~= TVD`；如果后续发现直井也有明显偏斜，转入斜井路径。
+5. 用该初始 table 调用 `autotie.tie_v1` 微调。
+
+积分关系按双程时间处理：
+
+```text
+dTWT_s = 2 * DT_USM * dZ_m * 1e-6
+```
+
+其中 `DT_USM` 是微秒每米，`dZ_m` 第一版对直井取 MD 增量。
+
+这条路径只适用于经过复核仍可近似为直井的井。只要轨迹显示 MD 与 TVD 差异不可忽略，就不能使用这个积分近似，应转入斜井路径或拒绝。
+
+## 路径三：有时深、有井轨迹、斜井
+
+`deviated_with_tdt` 是第一版新增的关键路径。
+
+处理逻辑：
+
+1. 读取预处理 LAS，构造 `grid.LogSet`。
+2. 读取已有时深表，构造 `grid.TimeDepthTable`。
+3. 读取井轨迹文件，得到 MD、X、Y、TVD/TVDSS 的关系。
+4. 将时深表和井轨迹对齐：用 TWT 反查 MD，再由 MD 插值得到对应 XY。
+5. 沿时间采样轴，从地震体中按 `XY(TWT)` 抽取轨迹地震道。
+6. 用轨迹地震道、井曲线和已有时深表调用 `autotie.tie_v1` 微调。
+7. 输出轨迹地震道、优化后时深表、子波和 QC。
+
+关键点：
+
+- 斜井不能只取井口所在地震道。
+- 只要涉及轨迹附近的真实物理距离、邻近道或插值，就必须使用 `open_survey()`、`line_to_coord()`、`coord_to_line()` 和真实 XY 计算，不能把 inline/xline 步长当米。
+- 第一版可以先用最近道采样，但必须输出 `trace_sample_plan_<well>.csv`，记录每个 TWT 样点使用的 inline/xline 和 XY。若同一条轨迹跨越大量地震道，不能逐样点重复打开 ZGY；应先把轨迹映射到唯一道集合，批量读取后再按时间轴拼接。
+- 最近道采样会引入阶梯状空间跳变。文档第一版接受这个近似，但 QC 图必须显示轨迹 inline/xline 随 TWT 的变化，便于判断是否需要升级到双线性或多道加权。
+
+## 暂时拒绝路径
+
+`deviated_anchor_from_tops` 暂时只识别，不实现。
+
+原因是它同时缺少已有时深表，又需要沿斜井轨迹把 MD、TVD、XY、TWT 和层位锚点串起来。这里的误差来源比直井锚点路径多很多：
+
+- 井轨迹采样和测井采样需要对齐。
+- 井分层 MD 需要投影到轨迹 XY。
+- 地震层位 TWT 需要在轨迹点而不是井口点读取。
+- 纵波积分应沿 TVD 或实际路径讨论，不能简单套直井公式。
+
+第一版把这类井写入 `rejected_wells.csv`，原因设为 `deviated_anchor_route_not_implemented`。
+
+## 模块边界
+
+第四步会推动 `cup` 新增少量井震标定相关能力。为了避免模块碎片化，第一版先合并到 `cup.well.tie`；等时深表或轨迹逻辑变多后，再拆出独立模块。
+
+### 建议新增
+
+`cup.well.tie`
+
+- `read_time_depth_table(path) -> grid.TimeDepthTable`
+- `validate_time_depth_table(table, log_basis_md)`
+- `build_tdt_from_anchor(log, anchor_md, anchor_twt_s)`
+- `merge_tdt_with_log_basis(table, log_basis_md)`
+- `read_well_trace(path) -> WellTrajectory`
+- `validate_trajectory_for_well(trajectory, log_basis_md)`
+- `trajectory_xy_at_md(trajectory, md)`
+- `trajectory_xy_at_twt(trajectory, table, twt)`
+- `TieRoute`：路由枚举。
+- `WellTiePlan`：单井路由和输入资产。
+- `WellTieResult`：单井标定结果和指标。
+- `build_tie_plan(...) -> list[WellTiePlan]`
+- `run_vertical_with_tdt(plan, context) -> WellTieResult`
+- `run_vertical_anchor_from_tops(plan, context) -> WellTieResult`
+- `run_deviated_with_tdt(plan, context) -> WellTieResult`
+
+`cup.seismic.survey`
+
+- `import_time_trace_at_xy(x, y) -> grid.Seismic`
+- `import_time_trace_along_xy(twt, x, y, method="nearest") -> grid.Seismic`
+
+这些函数应放在 survey context 或 seismic 模块里，不要在脚本中散写 ZGY 索引和坐标转换。
+
+### 继续复用
+
+- `cup.well.las`：读取第三步预处理 LAS。
+- `cup.well.preprocess`：第三步已经决定曲线可用性，第四步不重复清洗。
+- `cup.well.wavelet`：子波裁剪、采样间隔检查和 CSV 读取。
+- `cup.petrel.load.import_well_heads_petrel()`、`import_well_tops_petrel()`、`import_interpretation_petrel()`：Petrel 文本读取。
+- `cup.seismic.survey.open_survey()`：地震工区入口。
+
+### API 验证
+
+本仓库里的 `wtie` 已有 `grid.LogSet`、`grid.TimeDepthTable`、`grid.WellPath` 和 `autotie.tie_v1`。但第四步不是照搬深度域脚本，而是把已有时深表、时间域地震道和斜井轨迹组合起来。因此落地代码前需要用一口直井和一口斜井做最小验证：
+
+- `InputSet(logset_md, seismic, table, wellpath)` 是否接受 MD 域 table 或需要 TVDSS table。
+- 直井是否需要显式构造 `grid.WellPath(md, kb)`，而不是传 `None`。
+- 已有时深表的 TWT 单位、起点和地震 TWT 轴是否一致。
+- `wavelet_scaling` 配置键是否需要转成 `wavelet_min_scale`、`wavelet_max_scale`。
+- `autotie.tie_v1` 输出中的 table、wavelet、synthetic 字段是否满足当前输出 schema。
+
+## 脚本层负责
+
+`well_auto_tie.py` 负责：
+
+- 读取配置和前三步 manifest。
+- 构建 `well_tie_plan.csv`。
+- 按 route 调用对应 handler。
+- 组织输出目录和文件命名。
+- 逐井容错执行，失败井写入 `rejected_wells.csv` 或 `well_tie_metrics.csv`。
+- 汇总 `run_summary.json`。
+
+它不应该自己实现：
+
+- LAS 解析。
+- 时深表列名兼容。
+- 井轨迹插值。
+- 地震体坐标转换。
+- 沿轨迹取道。
+- `wtie` 输入对象构造细节。
+
+## 已定策略
+
+- 第四步使用一个脚本 `well_auto_tie.py`，内部按 route 分发，不拆成三个脚本。
+- 第一版实现 `vertical_with_tdt`、`vertical_anchor_from_tops`、`deviated_with_tdt`。
+- `deviated_anchor_from_tops` 第一版拒绝。
+- 斜井路径依赖井轨迹/井斜文件，不依赖 LAS 井径曲线。
+- 有时深的路径以已有时深表为初始 table，再用 `wtie` 微调。
+- 无时深直井路径需要人工锚点配置，不能全自动猜强轴。
+- 第一版先把时深、轨迹和 tie handler 合并在 `cup.well.tie`，避免过早拆出薄模块。
+
+## 留到第二轮
+
+- 沿斜井轨迹取道使用最近道、双线性还是多道加权。
+- 斜井路径里 `wtie` 的 stretch/squeeze 搜索空间是否需要比直井更窄。
+- 锚点层位是否允许多锚点，而不是单锚点向上向下积分。
+- 没有时深的斜井路径如何处理。
+- 井网很密时，多口井共用或竞争同一地震道的冲突如何进入 auto-tie 权重。

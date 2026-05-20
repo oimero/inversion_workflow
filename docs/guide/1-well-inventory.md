@@ -41,6 +41,7 @@ well_inventory:
   near_survey_threshold_m: 500.0
   vertical_bottom_offset_threshold_m: 30.0
   dense_well_neighbor_threshold_m: 150.0
+  platform_cluster_threshold_m: 10.0
 ```
 
 前三个阈值先按上面默认值走：
@@ -48,6 +49,7 @@ well_inventory:
 - `near_survey_threshold_m = 500.0`
 - `vertical_bottom_offset_threshold_m = 30.0`
 - `dense_well_neighbor_threshold_m = 150.0`
+- `platform_cluster_threshold_m = 10.0`
 
 `dense_well_neighbor_threshold_m` 是早期 QC 阈值，不应长期脱离地震 bin 尺寸硬编码。落地时应同时报告 nominal bin spacing，并建议把默认值理解为 `max(3 * nominal_bin_spacing_m, 150 m)` 或按工区配置覆盖；否则密井网中会产生过多近邻对，降低报告可读性。
 
@@ -64,7 +66,8 @@ scripts/output/well_inventory_<timestamp>/
 核心文件：
 
 - `well_inventory.csv`：一井一行的主清单。
-- `well_neighbor_pairs.csv`：近邻井对 QC。
+- `well_neighbor_pairs.csv`：井口落在同一最近地震道、但不是同平台的高风险井对。
+- `well_clusters.csv`：井口距离小于平台阈值的同平台井分组。
 - `run_summary.json`：输入、阈值、统计摘要和失败原因汇总。
 
 `well_inventory.csv` 建议字段：
@@ -94,11 +97,24 @@ scripts/output/well_inventory_<timestamp>/
 | --- | --- |
 | `well_a`, `well_b` | 近邻井名 |
 | `distance_m` | 井口 XY 距离 |
-| `same_nearest_trace` | 是否落在同一最近地震道 |
+| `same_surface_nearest_trace` | 两口井的井口是否落在同一最近地震道 |
+| `same_surface_platform` | 两口井井口是否属于同平台距离范围 |
 | `class_pair` | 例如 `vertical/deviated` |
-| `risk` | `same_bin`、`close_wells`、`overlap_likely` |
+| `risk` | 例如 `same_trace_conflict` |
 
-近邻风险只标注，不自动删除井。怎么合并、降权或选择代表井，留到井约束文档里讨论。
+`well_clusters.csv` 建议字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `cluster_id` | 平台分组编号 |
+| `well_name` | 井名 |
+| `surface_x`, `surface_y` | 井口坐标 |
+| `wellbore_class` | 初分井型 |
+| `survey_position` | 井口工区位置 |
+| `nearest_inline`, `nearest_xline` | 井口吸附到的最近线号 |
+| `cluster_size` | 分组井数 |
+
+密井网近邻全量 pair 数可能非常大，不建议把所有 `distance_m <= dense_well_neighbor_threshold_m` 的井对都写进 CSV。第一步只把全量计数写入 `run_summary.json`，CSV 只输出后续有实际硬冲突意义的井口同道井对；同平台井用 cluster 表达，而不是展开成大量 pairwise 警告。怎么合并、降权或选择代表井，留到井约束文档里讨论。
 
 ## 处理逻辑
 
@@ -180,9 +196,11 @@ bottom_offset_m = hypot(Bottom hole X - Surface X, Bottom hole Y - Surface Y)
 
 只在有有效井口坐标的井之间计算近邻：
 
-- 距离小于等于 `dense_well_neighbor_threshold_m` 的井对写入 `well_neighbor_pairs.csv`。
-- 如果两口井 round 到同一最近 inline/xline，`same_nearest_trace = true`。
-- `same_nearest_trace` 的风险等级高于普通近邻，因为后续井震标定、井约束和训练采样可能读到同一地震道。
+- 距离小于等于 `dense_well_neighbor_threshold_m` 的井对只进入 summary 计数，不默认全量导出。
+- 如果两口井井口吸附到同一最近 inline/xline，`same_surface_nearest_trace = true`。吸附时必须使用 `inline_min + round((inline_float - inline_min) / inline_step) * inline_step` 这类轴逻辑，不能假设线号步长为 1。
+- `same_surface_nearest_trace` 只表示井口位置冲突，不表示目标层或斜井轨迹冲突。对于同平台多口斜井，井口很可能相近，但目标层段可能分散到不同地震道。
+- 井口距离小于 `platform_cluster_threshold_m` 的井视为同平台井，写入 `well_clusters.csv`。同平台井不是自动冲突，不展开成大量 pairwise 警告。
+- 真正的目标层冲突应留到第四步以后，基于 `WellSpatialSampleSet` 输出 `same_target_trace`、`trajectory_trace_conflict` 或类似样点级 QC。
 
 这里仍然只做标注，不做自动筛井。
 

@@ -298,10 +298,6 @@ dTWT_s = 2 * DT_USM * dZ_m * 1e-6
 
 `cup.well.tie`
 
-- `read_time_depth_table(path) -> grid.TimeDepthTable`
-- `validate_time_depth_table(table, log_basis_md)`
-- `build_tdt_from_anchor(log, anchor_md, anchor_twt_s)`
-- `merge_tdt_with_log_basis(table, log_basis_md)`
 - `TieRoute`：路由枚举。
 - `WellTiePlan`：单井路由和输入资产。
 - `WellTieResult`：单井标定结果和指标。
@@ -309,6 +305,17 @@ dTWT_s = 2 * DT_USM * dZ_m * 1e-6
 - `run_vertical_with_tdt(plan, context) -> WellTieResult`
 - `run_vertical_anchor_from_tops(plan, context) -> WellTieResult`
 - `run_deviated_with_tdt(plan, context) -> WellTieResult`
+
+`cup.well.depth_time`
+
+- `read_time_depth_table(path) -> grid.TimeDepthTable`
+- `validate_time_depth_table(table, log_basis_md, trajectory=None)`
+- `build_tdt_from_anchor(log, anchor_md, anchor_twt_s)`
+- `merge_tdt_with_log_basis(table, log_basis_md)`
+- `convert_dt_usm_to_vp_log(dt_log) -> grid.Log`
+- `build_vp_rho_logset(curve_set) -> grid.LogSet`
+
+`cup.well.depth_time` 负责时深表、MD/TWT、慢度到速度和 `grid.LogSet` 构造。`cup.well.tie` 只负责编排 route、调用 wtie Adapter 和整理 tie artifact，不直接承载时深/曲线转换细节。
 
 `cup.well.trajectory`
 
@@ -321,12 +328,16 @@ dTWT_s = 2 * DT_USM * dZ_m * 1e-6
 - `trajectory_position_at_md(trajectory, md)`
 - `trajectory_position_at_twt(trajectory, table, twt)`
 
+`cup.well.spatial_samples` 只负责把已经明确了 MD/TWT 的井样点落到 `x/y`、`inline/xline` 和 trace/sample 上；它不负责解析时深表，也不负责把慢度曲线转成速度。
+
 `cup.seismic.trace_sampling`
 
 - `import_time_trace_at_xy(x, y) -> grid.Seismic`
 - `import_time_trace_along_xy(twt, x, y, method="nearest") -> grid.Seismic`
 
 这些函数应放在专门的地震取样 Module 里，不要在脚本中散写 ZGY 索引和坐标转换。
+
+`trace_sampling` 落地时还需要深化 `SurveyContext` 的 Interface：当前 `cup.seismic.survey` 公开协议主要是 `coord_to_line()`、`line_to_coord()` 和 `import_seismic_at_well()`，但斜井批量取道需要批量 `coord_to_index`、邻道/flat index 计划、sample window 解析和重复 trace 去重。不要在脚本里直接访问 ZGY/SEG-Y 私有细节，应由 `SurveyContext` 或专门 Adapter 暴露这些能力。
 
 ### 继续复用
 
@@ -374,7 +385,7 @@ dTWT_s = 2 * DT_USM * dZ_m * 1e-6
 - 斜井路径依赖井轨迹/井斜文件，不依赖 LAS 井径曲线。
 - 有时深的路径以已有时深表为初始 table，再用 `wtie` 微调。
 - 无时深直井路径需要人工锚点配置，不能全自动猜强轴。
-- 模块边界以 `deviated-well-src-cup-refactor.md` 为准：`cup.well.tie` 只放 auto-tie 编排和 wtie Adapter；轨迹、时深/空间转换、地震取样分别进入 `cup.well.trajectory`、`cup.well.spatial_samples` 和 `cup.seismic.trace_sampling`。
+- 模块边界以 `deviated-well-src-cup-refactor.md` 为准：`cup.well.tie` 只放 auto-tie 编排和 wtie Adapter；时深/曲线转换、轨迹、空间样点、地震取样分别进入 `cup.well.depth_time`、`cup.well.trajectory`、`cup.well.spatial_samples` 和 `cup.seismic.trace_sampling`。
 
 ## 留到第二轮
 

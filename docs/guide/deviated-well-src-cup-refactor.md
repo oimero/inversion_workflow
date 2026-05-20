@@ -109,6 +109,26 @@ anchor_weight[n_anchor_trace, n_sample]
 - `Z` 与 `TVD` 的关系应做一致性检查：通常 `Z ~= KB - TVD`。
 - 文件夹真实名称是 `data/all_well_trace`，不是 `data/all_well_traces`。
 
+### TVDSS 口径
+
+这是斜井重构里最容易错一个 KB 的地方，必须作为 Module Interface 的一部分固定下来。
+
+现有 `cup.petrel.load.import_checkshots_petrel(depth_domain="tvdss")` 会把 Petrel checkshots 的 `Z` 取绝对值后放进 `grid.TimeDepthTable(tvdss=...)`；`export_vertical_tdt_to_petrel_checkshots()` 又把 `tdt.tvdss` 写成负的 Petrel `Z`，并用 `MD = |Z| + KB` 导出。这说明当前代码里的 `TimeDepthTable.tvdss` 实际是“向下为正的 TVDSS/depth below MSL”口径，而不是严格数学符号的海拔坐标。
+
+因此新 `WellTrajectory` 不应让脚本散写 `tvdss = tvd_kb - kb` 或 `tvdss = kb - z`。建议在 `cup.well.trajectory` 中集中实现：
+
+```text
+tvdss_m = tvd_kb_m - kb_m
+```
+
+并在读取 Petrel trace 时同时校验：
+
+```text
+z_m ~= kb_m - tvd_kb_m
+```
+
+如果未来决定改成带符号海拔口径，也必须只改 Adapter 和 `depth_time`，不要让不同脚本混用两种 TVDSS 语义。所有 `WellTimeDepth`、`WellTrajectory.to_wtie_wellpath()`、Petrel checkshots 导入导出都要共享同一个约定。
+
 ## 建议新增核心 Module
 
 ### `cup.well.trajectory`
@@ -128,7 +148,7 @@ WellTrajectory
 | `well_name` | 井名 |
 | `md_m` | 测深 MD，单位 m |
 | `tvd_kb_m` | 从 KB 起算的 TVD，向下为正，单位 m |
-| `tvdss_m` | TVDSS，单位 m，由 `tvd_kb_m - kb_m` 或约定口径换算 |
+| `tvdss_m` | 项目内部 TVDSS 口径，单位 m；必须由 Adapter 明确换算，不能在调用处临时猜 |
 | `z_m` | 原始 Petrel `Z` 列，保留用于 QC |
 | `x_m` | 轨迹点 X |
 | `y_m` | 轨迹点 Y |
@@ -161,9 +181,12 @@ WellTrajectory
 | 名称 | 功能 |
 | --- | --- |
 | `WellTimeDepth` | 包装 `grid.TimeDepthTable`，保留来源、domain、单位、QC |
+| `read_time_depth_table(path)` | 读取已有时深表，并统一 TWT 单位和 TVDSS/MD 口径 |
+| `validate_time_depth_table(table, log_basis_md, trajectory=None)` | 检查时深表与测井 MD、轨迹 TVDSS 的覆盖关系 |
 | `convert_log_md_to_twt(log, table, trajectory, dt_s)` | 统一 MD 曲线到 TWT |
 | `sample_log_on_twt(log_md, table, trajectory, twt_axis)` | 在指定 TWT 轴上采样曲线 |
 | `sample_trajectory_on_twt(trajectory, table, twt_axis)` | 在 TWT 轴上采样轨迹点 |
+| `convert_dt_usm_to_vp_log(dt_log)` | 在进入 wtie 或 AI 计算前，把标准慢度显式转换为 `Vp(m/s)` |
 
 这里可以保持对象轻量，但要保证脚本不直接操作裸数组做长期传递。
 
@@ -249,6 +272,16 @@ weight
 | `well_controls_to_layer_points()` | 直井旧控制转成点云控制 |
 | `spatial_samples_to_layer_points()` | 斜井样点转成层段比例控制 |
 
+`spatial_samples_to_layer_points()` 不能只是字段改名。它需要把每个空间样点和 `TargetLayer` 关联起来：
+
+1. 在样点的浮点 `inline/xline` 处读取所有层位解释值。
+2. 判断样点 `twt_s` 落在哪个相邻层段 `[top_horizon, bottom_horizon]`。
+3. 计算 `u_in_zone = (twt_s - top_twt) / (bottom_twt - top_twt)`。
+4. 对超出目标层、层位缺失、层位反转或厚度过薄的样点写入 QC，不静默参与建模。
+5. 结合 `TargetLayer.valid_control_mask`、轨迹样点覆盖率和密井冲突策略生成最终 `weight`。
+
+这部分应成为 `cup.seismic.modeling` 或 `cup.well.spatial_samples` 的深 Interface，而不是写在 `lfm_precomputed.py` 里。否则第六步和第十步会各自实现一套层位映射逻辑，后续很难保证一致。
+
 当点云路径稳定后，再考虑让 `WellControl` 退居兼容 Adapter。
 
 既然本项目不急于快速跑出结果，`lfm_precomputed.py` 不应先落一个代表点近似版本。代表点策略可以保留为 QC 对照或降级 Adapter，但不作为默认路径。
@@ -310,6 +343,8 @@ preprocessed LAS + optimized TDT + trajectory
 
 这里要继续遵守 AGENTS.md 的易错点：物理距离必须通过 `open_survey()`、`line_to_coord()` 和 `cup.seismic.spatial` 计算，不能把 `inline_step/xline_step` 当米制距离。
 
+落地时还需要深化 `SurveyContext` 的 Interface。当前公开协议主要支持单点 `coord_to_line()`、`line_to_coord()` 和 `import_seismic_at_well()`；斜井批量取道需要批量坐标转索引、邻道/flat index 计划、sample window 解析、重复 trace 去重。这个复杂度应封装在 `cup.seismic.trace_sampling` 与 SEG-Y/ZGY Adapter 后面，而不是散落到 `well_auto_tie.py`、`lfm_precomputed.py` 或 `well_constraints.py`。
+
 ## 建议模块归并
 
 为了避免文件膨胀，可以控制在这些 Module：
@@ -317,8 +352,8 @@ preprocessed LAS + optimized TDT + trajectory
 | Module | 负责内容 |
 | --- | --- |
 | `cup.well.trajectory` | 完整井轨迹、轨迹文件解析、轨迹到 wtie Adapter |
-| `cup.well.depth_time` | 井曲线、时深表、轨迹之间的域转换 |
-| `cup.well.spatial_samples` | 把井曲线样点落到 XY、inline/xline、trace/sample |
+| `cup.well.depth_time` | 井曲线、时深表、慢度/速度和 MD/TWT/TVDSS 之间的域转换 |
+| `cup.well.spatial_samples` | 把已经明确 MD/TWT 的井曲线样点落到 XY、inline/xline、trace/sample |
 | `cup.seismic.modeling` | 层位约束建模；逐步从井级控制扩展到点级控制 |
 | `cup.seismic.trace_sampling` | 批量地震道/地震样点采样计划 |
 

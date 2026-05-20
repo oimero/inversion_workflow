@@ -264,8 +264,10 @@ scripts/output/well_auto_tie_<timestamp>/wavelet_inventory.csv
 - `cup.well.wavelet.compute_wavelet_active_half_support_s()`
 - 第四步 `cup.well.tie` 中的 tie artifact 索引与 wtie 输入构造能力。
 - `cup.well.depth_time` 中的 `TimeDepthTable` 读取和曲线域转换能力。
-- `cup.well.spatial_samples` 中的斜井空间样点能力；第五步只读取第四步保存的地震道，不重新决定斜井取道。
+- `cup.well.spatial_samples` 中的斜井空间样点能力；第五步通常只读取第四步保存的地震道，不重新决定斜井取道。
 - 深度域 `metrics_for_synthetic()`、`make_eval_mask()` 的思想，但应迁移到 `cup.well.tie` 或公共评测工具中，不要从脚本互相 import。
+
+这里的模块分工与第四步保持一致：`depth_time` 负责 TDT、MD/TWT 和 `DT_USM -> Vp` 这类域/单位转换；`spatial_samples` 只负责样点落到空间和 trace/sample。第五步若只消费第四步保存的 `seismic_trace`，通常不需要重新调用 `trace_sampling`。
 
 ## 脚本层负责
 

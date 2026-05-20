@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Protocol, Tuple
+from typing import Any, Dict, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 
@@ -47,6 +47,14 @@ class SurveyContext(Protocol):
 
     def line_to_coord(self, il_no: float, xl_no: float) -> Tuple[float, float]: ...
 
+    def footprint_xy(self, domain: Optional[str] = "time") -> np.ndarray: ...
+
+    def distance_to_footprint(self, x: float, y: float, domain: Optional[str] = "time") -> float: ...
+
+    def bin_spacing_m(self, domain: Optional[str] = "time") -> Dict[str, float]: ...
+
+    def nominal_bin_spacing_m(self, domain: Optional[str] = "time") -> float: ...
+
     def import_seismic_at_well(
         self,
         well_x: float,
@@ -67,6 +75,76 @@ def _axis_stats(axis: np.ndarray) -> Dict[str, float]:
         "min": float(axis[0]),
         "max": float(axis[-1]),
         "step": float(axis[1] - axis[0]),
+    }
+
+
+def _point_segment_distance_m(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+    segment = end - start
+    denom = float(np.dot(segment, segment))
+    if denom == 0.0:
+        return float(np.linalg.norm(point - start))
+    t = float(np.dot(point - start, segment) / denom)
+    t = min(1.0, max(0.0, t))
+    projection = start + t * segment
+    return float(np.linalg.norm(point - projection))
+
+
+def _distance_to_footprint_boundary_m(point_xy: Sequence[float], footprint_xy: np.ndarray) -> float:
+    footprint = np.asarray(footprint_xy, dtype=np.float64)
+    if footprint.shape != (4, 2):
+        raise ValueError(f"Expected footprint shape (4, 2), got {footprint.shape}.")
+    point = np.asarray(point_xy, dtype=np.float64)
+    if point.shape != (2,) or not np.all(np.isfinite(point)):
+        raise ValueError(f"Invalid XY point: {point_xy}")
+    return min(
+        _point_segment_distance_m(point, footprint[index], footprint[(index + 1) % footprint.shape[0]])
+        for index in range(footprint.shape[0])
+    )
+
+
+def _survey_footprint_xy(survey: "SurveyContext", domain: Optional[str] = "time") -> np.ndarray:
+    geometry = survey.query_geometry(domain)
+    il_min = float(geometry["inline_min"])
+    il_max = float(geometry["inline_max"])
+    xl_min = float(geometry["xline_min"])
+    xl_max = float(geometry["xline_max"])
+    return np.asarray(
+        [
+            survey.line_to_coord(il_min, xl_min),
+            survey.line_to_coord(il_max, xl_min),
+            survey.line_to_coord(il_max, xl_max),
+            survey.line_to_coord(il_min, xl_max),
+        ],
+        dtype=np.float64,
+    )
+
+
+def _survey_bin_spacing_m(survey: "SurveyContext", domain: Optional[str] = "time") -> Dict[str, float]:
+    geometry = survey.query_geometry(domain)
+    il_min = float(geometry["inline_min"])
+    xl_min = float(geometry["xline_min"])
+
+    spacings: list[float] = []
+    inline_spacing_m = 0.0
+    xline_spacing_m = 0.0
+    if int(geometry["n_il"]) > 1:
+        p0 = survey.line_to_coord(il_min, xl_min)
+        p1 = survey.line_to_coord(il_min + float(geometry["inline_step"]), xl_min)
+        inline_spacing_m = float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
+        if np.isfinite(inline_spacing_m) and inline_spacing_m > 0.0:
+            spacings.append(inline_spacing_m)
+    if int(geometry["n_xl"]) > 1:
+        p0 = survey.line_to_coord(il_min, xl_min)
+        p1 = survey.line_to_coord(il_min, xl_min + float(geometry["xline_step"]))
+        xline_spacing_m = float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
+        if np.isfinite(xline_spacing_m) and xline_spacing_m > 0.0:
+            spacings.append(xline_spacing_m)
+
+    nominal = float(np.median(np.asarray(spacings, dtype=np.float64))) if spacings else 0.0
+    return {
+        "inline_spacing_m": inline_spacing_m,
+        "xline_spacing_m": xline_spacing_m,
+        "nominal_bin_spacing_m": nominal,
     }
 
 
@@ -347,6 +425,18 @@ class SegySurveyContext:
         y = self.p0[1] + di * dy_il + dj * dy_xl
         return x, y
 
+    def footprint_xy(self, domain: Optional[str] = "time") -> np.ndarray:
+        return _survey_footprint_xy(self, domain)
+
+    def distance_to_footprint(self, x: float, y: float, domain: Optional[str] = "time") -> float:
+        return _distance_to_footprint_boundary_m((x, y), self.footprint_xy(domain))
+
+    def bin_spacing_m(self, domain: Optional[str] = "time") -> Dict[str, float]:
+        return _survey_bin_spacing_m(self, domain)
+
+    def nominal_bin_spacing_m(self, domain: Optional[str] = "time") -> float:
+        return self.bin_spacing_m(domain)["nominal_bin_spacing_m"]
+
     def import_seismic_at_well(
         self,
         well_x: float,
@@ -503,6 +593,18 @@ class ZgySurveyContext:
         x = self.x0 + i * self.dx_il + j * self.dx_xl
         y = self.y0 + i * self.dy_il + j * self.dy_xl
         return x, y
+
+    def footprint_xy(self, domain: Optional[str] = "time") -> np.ndarray:
+        return _survey_footprint_xy(self, domain)
+
+    def distance_to_footprint(self, x: float, y: float, domain: Optional[str] = "time") -> float:
+        return _distance_to_footprint_boundary_m((x, y), self.footprint_xy(domain))
+
+    def bin_spacing_m(self, domain: Optional[str] = "time") -> Dict[str, float]:
+        return _survey_bin_spacing_m(self, domain)
+
+    def nominal_bin_spacing_m(self, domain: Optional[str] = "time") -> float:
+        return self.bin_spacing_m(domain)["nominal_bin_spacing_m"]
 
     def import_seismic_at_well(
         self,

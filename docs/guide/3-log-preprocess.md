@@ -55,6 +55,16 @@ log_preprocess:
   constant_runs:
     enabled: true
     min_run_length: 8
+    min_run_length_by_category:
+      p_sonic: 16
+      s_sonic: 16
+      density: 16
+      gamma_ray: 16
+      resistivity: 16
+      sp: 16
+      porosity: 16
+      permeability: 16
+      water_saturation: 16
     replacement: null
     exclude_categories: [caliper]
 
@@ -67,7 +77,7 @@ log_preprocess:
     range_override_file: experiments/log_preprocess_ranges.yaml
 ```
 
-这里的 `replacement: null` 表示替换为缺失值。导出 LAS 时再统一写成 `-999.25`。
+这里的 `replacement: null` 表示替换为缺失值。导出 LAS 时再统一写成 `-999.25`。`min_run_length` 是兜底默认值；如果存在 `min_run_length_by_category`，优先使用按类别配置。这样可以避免用同一个样点数同时处理声波、电阻率、孔渗饱等响应尺度不同的曲线。
 
 ## 输出
 
@@ -256,7 +266,7 @@ well_curve:
 
 `process.py` 现在混乱的根源是对象层级没分清。
 
-`wtie.processing.grid.LogSet` 要求至少包含 `Vp` 和 `Rho`，本质是“标准物性曲线集合”。但第三个脚本处理的是第二步导出的任意曲线集合，里面可能有 `GR`、`CALI`、`SP`、`PERM`，也可能暂时没有标准命名的 `Vp/Rho`。所以这个阶段不应该强行用 `LogSet`。
+已核实 `wtie.processing.grid.LogSet` 的源码中 `mandatory_keys = ["Vp", "Rho"]`，初始化时会断言至少包含这两条曲线。它本质是“标准物性曲线集合”。但第三个脚本处理的是第二步导出的任意曲线集合，里面可能有 `GR`、`CALI`、`SP`、`PERM`，也可能暂时没有标准命名的 `Vp/Rho`。所以这个阶段不应该强行用 `LogSet`。
 
 建议引入项目内对象：
 

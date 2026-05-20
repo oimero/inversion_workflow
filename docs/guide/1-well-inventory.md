@@ -49,6 +49,8 @@ well_inventory:
 - `vertical_bottom_offset_threshold_m = 30.0`
 - `dense_well_neighbor_threshold_m = 150.0`
 
+`dense_well_neighbor_threshold_m` 是早期 QC 阈值，不应长期脱离地震 bin 尺寸硬编码。落地时应同时报告 nominal bin spacing，并建议把默认值理解为 `max(3 * nominal_bin_spacing_m, 150 m)` 或按工区配置覆盖；否则密井网中会产生过多近邻对，降低报告可读性。
+
 如果后续发现井头坐标精度较差，再把直井阈值放宽到 50 m。
 
 ## 输出

@@ -97,6 +97,8 @@ well_auto_tie:
 
 `source_runs.mode: latest` 表示脚本自动从 `scripts/output` 下寻找最新的前置产物。若需要复现实验，可以显式填写 `inventory_file`、`curve_screen_file`、`preprocess_status_file` 和 `preprocessed_las_dir`。不要把 `YYYYMMDD_HHMMSS` 占位符长期写死在配置里。
 
+`target_crop_ms` 是井震标定时围绕目的层裁剪地震和合成记录的时间窗，示例值 `201.0` 只对应当前工区的初始经验值。正式落地时应从目标层厚度、地震主频、子波有效长度和采样间隔共同推导，至少允许按工区配置覆盖。
+
 ## 输出
 
 默认输出目录建议为：
@@ -110,6 +112,7 @@ scripts/output/well_auto_tie_<timestamp>/
 - `well_tie_plan.csv`：一井一行的路由结果。
 - `well_tie_metrics.csv`：一井一行的标定指标。
 - `rejected_wells.csv`：被拒绝的井及原因。
+- `wavelet_inventory.csv`：一条成功子波一行，供第五步作为候选子波清单。
 - `wavelets/wavelet_201ms_<well>.csv`：每口成功井的裁剪归一化子波。
 - `time_depth/initial_tdt_<well>.csv`：初始时深表。
 - `time_depth/optimized_tdt_<well>.csv`：`wtie` 优化后的时深表。
@@ -152,6 +155,20 @@ scripts/output/well_auto_tie_<timestamp>/
 | `optimized_tdt_file` | 优化后时深表 |
 | `qc_figure_dir` | QC 图目录 |
 | `reasons` | 警告或失败原因 |
+
+`wavelet_inventory.csv` 建议字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `source_well` | 子波来源井 |
+| `route` | 来源井 auto-tie 路径 |
+| `wavelet_file` | 子波 CSV 路径 |
+| `dt_s` | 子波采样间隔 |
+| `n_samples` | 子波采样点数 |
+| `tie_corr` | 来源井第四步优化后相关系数 |
+| `tie_nmae` | 来源井第四步优化后 NMAE |
+| `usable_as_candidate` | 是否进入第五步候选池 |
+| `reasons` | 跳过原因 |
 
 ## 路由规则
 
@@ -275,7 +292,7 @@ dTWT_s = 2 * DT_USM * dZ_m * 1e-6
 
 ## 模块边界
 
-第四步会推动 `cup` 新增少量井震标定相关能力。为了避免模块碎片化，第一版先合并到 `cup.well.tie`；等时深表或轨迹逻辑变多后，再拆出独立模块。
+第四步会推动 `cup` 新增井震标定相关能力。模块归属以 `斜井支持的 src/cup 重构规划` 为准：井轨迹、时深转换、空间样点和地震取样是跨步骤能力，不放进脚本，也不继续塞进 `cup.seismic.survey`。
 
 ### 建议新增
 
@@ -285,10 +302,6 @@ dTWT_s = 2 * DT_USM * dZ_m * 1e-6
 - `validate_time_depth_table(table, log_basis_md)`
 - `build_tdt_from_anchor(log, anchor_md, anchor_twt_s)`
 - `merge_tdt_with_log_basis(table, log_basis_md)`
-- `read_well_trace(path) -> WellTrajectory`
-- `validate_trajectory_for_well(trajectory, log_basis_md)`
-- `trajectory_xy_at_md(trajectory, md)`
-- `trajectory_xy_at_twt(trajectory, table, twt)`
 - `TieRoute`：路由枚举。
 - `WellTiePlan`：单井路由和输入资产。
 - `WellTieResult`：单井标定结果和指标。
@@ -297,12 +310,23 @@ dTWT_s = 2 * DT_USM * dZ_m * 1e-6
 - `run_vertical_anchor_from_tops(plan, context) -> WellTieResult`
 - `run_deviated_with_tdt(plan, context) -> WellTieResult`
 
-`cup.seismic.survey`
+`cup.well.trajectory`
+
+- `WellTrajectory.from_petrel_trace(path)`
+- `validate_trajectory_for_well(trajectory, log_basis_md)`
+- `trajectory.to_wtie_wellpath()`
+
+`cup.well.spatial_samples`
+
+- `trajectory_position_at_md(trajectory, md)`
+- `trajectory_position_at_twt(trajectory, table, twt)`
+
+`cup.seismic.trace_sampling`
 
 - `import_time_trace_at_xy(x, y) -> grid.Seismic`
 - `import_time_trace_along_xy(twt, x, y, method="nearest") -> grid.Seismic`
 
-这些函数应放在 survey context 或 seismic 模块里，不要在脚本中散写 ZGY 索引和坐标转换。
+这些函数应放在专门的地震取样 Module 里，不要在脚本中散写 ZGY 索引和坐标转换。
 
 ### 继续复用
 
@@ -314,9 +338,9 @@ dTWT_s = 2 * DT_USM * dZ_m * 1e-6
 
 ### API 验证
 
-本仓库里的 `wtie` 已有 `grid.LogSet`、`grid.TimeDepthTable`、`grid.WellPath` 和 `autotie.tie_v1`。但第四步不是照搬深度域脚本，而是把已有时深表、时间域地震道和斜井轨迹组合起来。因此落地代码前需要用一口直井和一口斜井做最小验证：
+本仓库里的 `wtie` 已有 `grid.LogSet`、`grid.TimeDepthTable`、`grid.WellPath`、`InputSet` 和 `autotie.tie_v1`。当前源码中 `InputSet` 的字段顺序为 `logset_md, seismic, table, wellpath=None`，`tie_v1(inputs, wavelet_extractor, modeler, wavelet_scaling_params, ...)` 以 `InputSet` 作为第一个参数。但第四步不是照搬深度域脚本，而是把已有时深表、时间域地震道和斜井轨迹组合起来。因此落地代码前仍需要用一口直井和一口斜井做最小验证：
 
-- `InputSet(logset_md, seismic, table, wellpath)` 是否接受 MD 域 table 或需要 TVDSS table。
+- `InputSet(logset_md, seismic, table, wellpath)` 在本项目数据中应使用 MD 域 table 还是 TVDSS table。
 - 直井是否需要显式构造 `grid.WellPath(md, kb)`，而不是传 `None`。
 - 已有时深表的 TWT 单位、起点和地震 TWT 轴是否一致。
 - `wavelet_scaling` 配置键是否需要转成 `wavelet_min_scale`、`wavelet_max_scale`。
@@ -350,7 +374,7 @@ dTWT_s = 2 * DT_USM * dZ_m * 1e-6
 - 斜井路径依赖井轨迹/井斜文件，不依赖 LAS 井径曲线。
 - 有时深的路径以已有时深表为初始 table，再用 `wtie` 微调。
 - 无时深直井路径需要人工锚点配置，不能全自动猜强轴。
-- 第一版先把时深、轨迹和 tie handler 合并在 `cup.well.tie`，避免过早拆出薄模块。
+- 模块边界以 `deviated-well-src-cup-refactor.md` 为准：`cup.well.tie` 只放 auto-tie 编排和 wtie Adapter；轨迹、时深/空间转换、地震取样分别进入 `cup.well.trajectory`、`cup.well.spatial_samples` 和 `cup.seismic.trace_sampling`。
 
 ## 留到第二轮
 

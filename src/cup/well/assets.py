@@ -24,12 +24,17 @@ def _display_well_name(name: object) -> str:
     return str(name).strip()
 
 
+def _is_missing_well_name(name: str) -> bool:
+    normalized = name.strip().casefold()
+    return normalized == "" or normalized in {"nan", "none", "null", "<na>"}
+
+
 def build_name_lookup(names: Iterable[object], *, asset_label: str) -> dict[str, str]:
     """Build a case-insensitive lookup and fail on case-only collisions."""
     lookup: dict[str, str] = {}
     for raw_name in names:
         display = _display_well_name(raw_name)
-        if not display:
+        if _is_missing_well_name(display):
             continue
         key = normalize_well_name(display)
         previous = lookup.get(key)
@@ -50,7 +55,7 @@ def build_file_lookup(files: Iterable[Path], *, asset_label: str) -> dict[str, P
         if not file_path.is_file():
             continue
         display = _display_well_name(file_path.stem)
-        if not display:
+        if _is_missing_well_name(display):
             continue
         key = normalize_well_name(display)
         previous_display = display_by_key.get(key)
@@ -272,7 +277,7 @@ def build_platform_clusters(
         for j in range(i + 1, len(valid)):
             right = valid[j]
             distance = float(np.hypot(float(right.surface_x) - float(left.surface_x), float(right.surface_y) - float(left.surface_y)))
-            if distance < threshold:
+            if distance <= threshold:
                 union(i, j)
 
     groups: dict[int, list[WellInventoryRecord]] = {}
@@ -338,7 +343,7 @@ def build_neighbor_pairs(
         for j in range(i + 1, len(valid)):
             right = valid[j]
             distance = float(np.hypot(float(right.surface_x) - float(left.surface_x), float(right.surface_y) - float(left.surface_y)))
-            same_platform = distance < platform_threshold
+            same_platform = distance <= platform_threshold
             same_trace = (
                 left.nearest_inline is not None
                 and left.nearest_xline is not None

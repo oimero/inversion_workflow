@@ -1,6 +1,6 @@
 # 01 井资产盘点
 
-`well_inventory.py` 是工作流的第一步，只做一件事：**盘点你手头有哪些井，各自具备哪些进入后续流程的资产条件。** 它不读 LAS 曲线数据、不改任何文件、不做井震标定。
+`well_inventory.py` 是工作流的第一步，只做一件事：**盘点你手头有哪些井，各自具备哪些进入后续流程的资产条件。**
 
 ---
 
@@ -37,8 +37,8 @@ well_inventory:
     xstep: <step>
   near_survey_threshold_m: 500.0
   vertical_bottom_offset_threshold_m: 30.0
+  platform_cluster_threshold_m: 12.5
   dense_well_neighbor_threshold_m: 150.0
-  platform_cluster_threshold_m: 10.0
 ```
 
 **数据资产的预期格式：**
@@ -47,11 +47,11 @@ well_inventory:
 |------|----------|
 | 井头文件 | Petrel `BEGIN HEADER ... END HEADER` 文本，必须包含 `Name`、`Surface X`、`Surface Y`、`Bottom hole X`、`Bottom hole Y`、`Well datum value` 列 |
 | LAS 目录 | 文件名 stem 即为井名，扩展名 `.las` |
-| 井轨迹目录 | 文件名 stem 即为井名，扩展名 `.txt`；本脚本仅检查文件是否存在 |
+| 井轨迹目录 | 文件名 stem 即为井名，不检查扩展名；本脚本仅检查文件是否存在 |
 | 井分层文件 | Petrel 格式，必须包含 `Well`、`Surface`、`MD` 列 |
 | 时深表目录 | 文件名 stem 即为井名；本脚本仅检查文件是否存在 |
 
-**井名匹配规则：** 所有资产通过文件名 stem 或记录中的 `Name`/`Well` 字段做大小写不敏感匹配。`A1`、`a1`、`A1.las`、`A1.txt` 被视为同一口井。大小写冲突会直接报错。名为 `nan`、`none`、`null` 或空白的记录会被跳过。
+**井名匹配规则：** 所有资产通过文件名 stem 或记录中的 `Name`/`Well` 字段做大小写不敏感匹配。`A1`、`a1`、`A1.las`、`A1.petrel_dev` 被视为同一口井；井轨迹文件也可以没有扩展名。大小写冲突会直接报错。名为 `nan`、`none`、`null` 或空白的记录会被跳过。
 
 ---
 
@@ -69,17 +69,19 @@ well_inventory:
 
 **注意：这是初分，仅依据 Petrel 井头导出中的 `Bottom hole X/Y` 字段。** Petrel 导出的底孔坐标精度有限（可能四舍五入到整米）。如果后续发现大量假阳性直井或假阴性斜井，调整此值；最终应以第四步轨迹文件复核后的井型为准。
 
-### `dense_well_neighbor_threshold_m`（默认 150.0）
-
-密井网近邻的半径。仅用于统计计数（写入 `run_summary.json`），不会全量导出为 CSV。
-
-建议将默认值理解为 `max(3 × nominal_bin_spacing_m, 150)`。实际 bin spacing 会由脚本写入 `run_summary.json`，方便交叉验证。如果此阈值过大，`dense_neighbor_pair_count` 会膨胀到几百甚至上千，失去可读性。
-
 ### `platform_cluster_threshold_m`（默认 10.0）
 
 同平台井的判定半径。井口距离 ≤ 此值的井会通过连通分量算法聚合成 `well_clusters.csv`。同一平台的多口斜井通常是有意设计的钻井方案，不属于"冲突"。
 
-同时，同平台井对 **不会** 作为 pairwise 近邻警告导出到 `well_neighbor_pairs.csv`——这避免了每次看到上百对虚假冲突时，还要手动分辨哪些来自同一个平台。
+同时，同平台井对 **不会** 作为两两近邻警告导出到 `well_neighbor_pairs.csv`，这避免了每次看到上百对虚假冲突时，还要手动分辨哪些来自同一个平台。
+
+### `dense_well_neighbor_threshold_m`（默认 150.0）
+
+密井网近邻的统计半径。仅用于统计计数（写入 `run_summary.json`），不会全量导出为 CSV。
+
+`nominal_bin_spacing_m` 是脚本根据真实 XY 道中心坐标估算出的名义道间距，写在 `run_summary.json` 的 `bin_spacing_m.nominal_bin_spacing_m` 中。它不是配置里的线号步长，而是从相邻 inline、xline 道中心距离中取出的稳健代表值，单位为米。
+
+建议将默认值理解为 `max(3 × nominal_bin_spacing_m, 150)`。实际道间距会由脚本写入 `run_summary.json`，方便交叉验证。如果此阈值过大，`dense_neighbor_pair_count` 会膨胀到几百甚至上千，失去可读性。
 
 ---
 
@@ -138,7 +140,7 @@ well_inventory:
 
 ### 4. `run_summary.json` — 输入、阈值、统计摘要
 
-包含：脚本名、config 路径、所有输入文件路径（repo-relative）、四项阈值、工区 geometry、bin spacing（inline/xline/nominal、单位米）、工区 footprint 四角 XY，以及全部统计计数和名单。
+包含：脚本名、配置路径、所有输入文件路径（相对于仓库根目录）、四项阈值、工区几何信息、道间距（inline/xline/nominal，单位米）、工区 footprint 四角 XY，以及全部统计计数和名单。
 
 关键的 `neighbor_summary` 段：
 
@@ -188,55 +190,3 @@ wellbore_class_counts: {deviated: 85, vertical: 18}
 - 关注 `wellbore_class == deviated` 且 `has_well_trace == false` 的井——斜井但没有轨迹文件，第四步无法走斜井路径。
 - 关注 `wellbore_class == unknown` 的井——井头坐标缺失或无效。
 - `reasons` 列汇总了每口井的所有警告标签（`no_time_depth`、`outside_survey`、`invalid_surface_xy` 等），方便快速筛出有问题的井。
-
----
-
-## 下游契约
-
-后续脚本不再自己扫描文件系统决定井列表，而是读取 `well_inventory.csv`：
-
-**第二步筛选候选井：**
-```
-inventory_status == "usable_for_las_screen"
-AND has_well_head == true
-AND has_las == true
-AND survey_position IN ("inside", "near_outside")
-```
-
-**第四步路由参考：**
-- `wellbore_class` — 仅作初分提示；执行斜井路径前必须正式读取井轨迹复核。
-- `has_time_depth` — 路由到 `vertical_with_tdt` 或 `deviated_with_tdt` 的前置条件。
-- `has_well_trace` — 路由到 `deviated_with_tdt` 的前置条件。
-- `has_well_tops` — 路由到 `vertical_anchor_from_tops` 的前置条件。
-
-以上字段只做**路由提示**。第四步必须自行读取时深表内容、解析井轨迹文件、检查第三步产出的曲线可用性，再做最终路由决策。
-
----
-
-## 脚本依赖的核心模块
-
-脚本调用以下 `cup` 能力（无需在脚本中重复实现）：
-
-| 能力 | 来源 |
-|------|------|
-| Petrel 井头解析 | `cup.petrel.load.import_well_heads_petrel()` |
-| Petrel 井分层解析 | `cup.petrel.load.import_well_tops_petrel()` |
-| SEG-Y / ZGY 工区打开 | `cup.seismic.survey.open_survey()` |
-| XY ↔ 线号互转 | `survey.coord_to_line()` / `survey.line_to_coord()` |
-| 工区 footprint 与距离 | `survey.footprint_xy()` / `survey.distance_to_footprint()` |
-| 名义 bin spacing | `survey.bin_spacing_m()` / `survey.nominal_bin_spacing_m()` |
-| 井名规范化与查找 | `cup.well.assets.build_name_lookup()` / `build_file_lookup()` |
-| 井型初分 | `cup.well.assets.classify_wellbore()` |
-| 同平台聚类 | `cup.well.assets.build_platform_clusters()` |
-| 近邻冲突筛选 | `cup.well.assets.build_neighbor_pairs()` |
-| 配置加载 | `cup.utils.io.load_yaml_config()` |
-| JSON 输出 | `cup.utils.io.write_json()` |
-
----
-
-## 注意事项
-
-- **`coord_to_line()` 对工区外点会抛出 `ValueError`，不会返回越界线号。** 脚本通过 try/except 捕获此异常来判断 inside/outside，而非检查线号范围。
-- **所有涉及物理距离（`_m` 后缀）的计算，必须使用 `line_to_coord()` 得出的真实 XY 坐标。** 不能用 `hypot(dil × inline_step, dxl × xline_step)` 估算——`inline_step` 和 `xline_step` 是线号步长，不是米制间距。
-- **`wellbore_class` 基于井头底孔坐标，不代表最终井型。** Petrel 导出的底孔坐标可能存在四舍五入或缺失。存在井轨迹文件时，第四步应以轨迹复核后的井型为准。
-- **井口同道只表示井口位置重合，不代表目标层地震道重合。** 对于从同一平台钻进的多口斜井，井口可能相近甚至相同，但目标层轨迹可能分布到不同地震道上。真正的轨迹冲突应在第四步后基于样点级空间分析判断。

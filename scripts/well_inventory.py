@@ -104,8 +104,8 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     )
     script_cfg.setdefault("near_survey_threshold_m", 500.0)
     script_cfg.setdefault("vertical_bottom_offset_threshold_m", 30.0)
-    script_cfg.setdefault("dense_well_neighbor_threshold_m", 150.0)
     script_cfg.setdefault("platform_cluster_threshold_m", 10.0)
+    script_cfg.setdefault("dense_well_neighbor_threshold_m", 150.0)
     return script_cfg
 
 
@@ -147,6 +147,7 @@ def _load_asset_lookups(
         raise ValueError("Unexpected duplicate well-head keys after case-insensitive normalization.")
 
     las_lookup = build_file_lookup(las_dir.glob("*.las"), asset_label=str(las_dir))
+    # Petrel trajectory export suffixes are user-defined; match trajectory assets by stem only.
     trace_lookup = build_file_lookup(well_trace_dir.iterdir() if well_trace_dir.exists() else [], asset_label=str(well_trace_dir))
     time_depth_lookup = build_file_lookup(
         time_depth_dir.iterdir() if time_depth_dir.exists() else [],
@@ -424,8 +425,8 @@ def main() -> None:
         "thresholds": {
             "near_survey_threshold_m": float(script_cfg["near_survey_threshold_m"]),
             "vertical_bottom_offset_threshold_m": float(script_cfg["vertical_bottom_offset_threshold_m"]),
-            "dense_well_neighbor_threshold_m": float(script_cfg["dense_well_neighbor_threshold_m"]),
             "platform_cluster_threshold_m": float(script_cfg["platform_cluster_threshold_m"]),
+            "dense_well_neighbor_threshold_m": float(script_cfg["dense_well_neighbor_threshold_m"]),
         },
         "geometry": geometry,
         "bin_spacing_m": bin_spacing,

@@ -1,55 +1,93 @@
 # 03 测井预处理
 
-本文讨论第三个规划脚本：`log_preprocess.py`。
+`log_preprocess.py` 接在曲线筛选之后，对选出的曲线做规范化、清洗和复核，产出可直接交给井震标定的预处理 LAS。
 
-它接在 `las_curve_screen.py` 后面，处理第二步导出的有用曲线。当前阶段做三件事：
+读完这篇你会知道：数据怎么流转、每一步在做什么校验、出问题时怎么从报告里定位。
 
-1. 缩写规范化。
-2. 单位规范化。
-3. 异常值处理：连续截断值/常值段、极值。
+---
 
-暂时不做标准化，也不做扩径段处理。
+## 快速开始
 
-参考 notebook：
+```bash
+python scripts/log_preprocess.py
+python scripts/log_preprocess.py --config experiments/my_project.yaml
+python scripts/log_preprocess.py --output-dir /tmp/preprocess_test
+```
 
-- `notebooks/well_replace_constant_value@20260403.ipynb`
+不带参数时，脚本自动从输出目录发现最新的曲线筛选产物，在 `<output_root>/log_preprocess_<timestamp>/` 下写出结果。
 
-## 目标
+---
 
-`log_preprocess.py` 的目标不是把曲线“修漂亮”，而是生成一套可追溯的预处理版本：
+## 脚本在做什么
 
-- 原始 mnemonic 被映射到了哪个标准 mnemonic。
-- 原始单位被转换到了哪个标准单位。
-- 哪些值被识别为截断值、常值段或极值。
-- 每口井、每条曲线替换了多少点。
-- 是否发现“单位字段和实际数值分布明显不匹配”的可疑曲线。
+预处理分两趟完成。
 
-所有操作都必须输出报告，方便第二轮迭代时回看。
+### 第一趟：逐井逐曲线规范化
 
-## 输入
+对每口通过第二步筛选的井，从原始 LAS 中加载第二步识别出的全部曲线（不只是 primary，还包括同类 secondary），依次做：
 
-- 第二阶段筛选结果：`well_curve_screen.csv`。
-- 第二阶段导出的瘦身 LAS：`selected_las/*.las`。
-- 第二阶段曲线清单：`las_curve_inventory.csv`。
-- 可选人工范围配置：例如 `experiments/log_preprocess_ranges.yaml`。
-- 可选缩写映射配置：例如 `experiments/log_mnemonic_map.yaml`。
+1. **缺失哨兵替换** — 把 `-999.0`、`-999.25`、`-9999.0`、`-99999.0`、LAS header 声明的 NULL 值等已知占位符统一转为 NaN。
+2. **缩写规范化**（可关闭）— 把原始 mnemonic 映射到标准名，比如原始 `DT`、`DTC`、`AC` 都映射为 `DT_USM`。
+3. **单位规范化**（可关闭）— 声波统一为 `us/m` 慢度，密度统一为 `g/cm3`。同时做两层单位 QC：
+   - **硬失败**：声波慢度单位中位数 > 1000、声波速度单位中位数 < 1000、密度 g/cm3 中位数 > 100、密度 kg/m3 中位数 < 10 — 直接判该曲线失效。
+   - **软提示**：us/ft 中位数像 us/m、us/m 中位数像 us/ft、密度 g/cm3 中位数偏高 — 只记入 QC 报告。
+4. **连续常值段替换** — 把长度 ≥ 阈值的严格连续相同值段置为 NaN。井径默认跳过（防止误伤）。
+5. **收集全局阈值样本** — 把每条通过单位硬校验的 step2-primary 曲线的清洗后数据按标准曲线名汇集。
 
-建议配置片段：
+### 第二阶段：全局阈值 + 逐井复核
+
+1. **计算全局分位数** — 按标准曲线名（`DT_USM`、`RHO_GCC` 等）分别统计 q01/q99。样本量不足时跳过并标记。
+2. **阈值优先级** — 对每条曲线，按「该井该曲线的手动配置 → 该曲线的全局手动配置 → 自动分位数」顺序解析最终使用的上下限。
+3. **极值替换** — 超出上下限的有限值置为 NaN。
+4. **可用性判定** — 检查最终有效点是否满足最低数量和相对初始有效点的最低比例。
+5. **Primary 接管** — 如果某 category 的 primary 曲线不可用，按顺序尝试同类 secondary。接管只在同一 category 内发生。
+
+---
+
+## 为什么要回读原始 LAS
+
+第二步导出的瘦身 LAS 只包含每类 primary 曲线。但第三步需要对 primary 做接管：如果 `DT` 失灵，要尝试 `DTC`。
+
+`DTC` 不在瘦身 LAS 里。所以脚本读取第二步的 `curve_classification/*.json`（其中记录了每口井所有曲线的分类结果、mnemonic、原始 LAS 路径），回到原始 LAS 中加载所有入选 category 的曲线。瘦身 LAS 只用于校验第二步导出是否成功，不用于数据加载。
+
+这意味着：如果 primary 完好，secondary 不会被用到。但如果 primary 在预处理中失效，同类 secondary 已经就绪，无需重新扫描。
+
+---
+
+## 配置参考
 
 ```yaml
 log_preprocess:
-  screen_file: scripts/output/las_curve_screen_YYYYMMDD_HHMMSS/well_curve_screen.csv
-  input_las_dir: scripts/output/las_curve_screen_YYYYMMDD_HHMMSS/selected_las
-  curve_inventory_file: scripts/output/las_curve_screen_YYYYMMDD_HHMMSS/las_curve_inventory.csv
+  # 来源 — null 表示自动发现最新第二步产物
+  screen_file: null
+  input_las_dir: null
+  curve_inventory_file: null
+  classification_dir: null
+
+  # 输出子目录
   output_las_dir: preprocessed_las
+
+  # 必须同时具备的类别（缺任一个则整井 failed）
+  required_categories: [p_sonic, density]
+
+  # 需要处理的类别集合
+  selected_categories:
+    - caliper
+    - gamma_ray
+    - s_sonic
+    - p_sonic
+    - density
+    - resistivity
+    - spontaneous_potential
+    - porosity
+    - permeability
+    - water_saturation
 
   mnemonic_standardization:
     enabled: true
 
   unit_standardization:
     enabled: true
-    p_sonic_target: slowness_us_per_m
-    density_target: g_cm3
     unit_mismatch_qc: true
 
   constant_runs:
@@ -61,7 +99,7 @@ log_preprocess:
       density: 16
       gamma_ray: 16
       resistivity: 16
-      sp: 16
+      spontaneous_potential: 16
       porosity: 16
       permeability: 16
       water_saturation: 16
@@ -75,176 +113,50 @@ log_preprocess:
     upper_quantile: 0.99
     replacement: null
     range_override_file: experiments/log_preprocess_ranges.yaml
+    min_samples_for_auto_threshold: 1000
+
+  usable_thresholds:
+    min_valid_samples: 100
+    min_valid_fraction_of_initial: 0.70
+
+  export:
+    null_value: -999.25
+    write_fmt: "%.6f"
 ```
 
-这里的 `replacement: null` 表示替换为缺失值。导出 LAS 时再统一写成 `-999.25`。`min_run_length` 是兜底默认值；如果存在 `min_run_length_by_category`，优先使用按类别配置。这样可以避免用同一个样点数同时处理声波、电阻率、孔渗饱等响应尺度不同的曲线。
+### `required_categories`
 
-## 输出
+井必须同时拥有这些类别（经过预处理并有可用曲线）才能 `passed`。默认 `[p_sonic, density]`。如果某口井缺少任一 required，状态降为 `failed`。
 
-默认输出目录建议为：
+### `selected_categories`
 
-```text
-scripts/output/log_preprocess_<timestamp>/
-```
+脚本只处理这些类别。不在列表中的即使第二步识别了也不加载。类别名是工作流语义类别（`p_sonic`、`density`），不是 LAS 原始 mnemonic。
 
-核心文件：
+### `mnemonic_standardization.enabled`
 
-- `preprocessed_las/*.las`：预处理后的 LAS。
-- `preprocess_summary.csv`：一井一曲线一行的汇总。
-- `well_preprocess_status.csv`：一井一行的最终可用性清单。
-- `mnemonic_mapping.csv`：原始 mnemonic 到标准 mnemonic 的映射。
-- `unit_conversion_report.csv`：单位转换报告。
-- `unit_mismatch_qc.csv`：单位字段和数值分布疑似不匹配的曲线。
-- `primary_reselection_report.csv`：primary 曲线在预处理后失效时的同类曲线接管记录。
-- `constant_run_report.csv`：连续常值段报告。
-- `outlier_report.csv`：极值处理报告。
-- `range_thresholds.csv`：每类曲线最终使用的全局上下限。
-- `skipped_wells.csv`：无法读取或无法导出的井。
-- `skipped_curves.csv`：无法处理的曲线。
-- `run_summary.json`：输入、配置和统计摘要。
+`true`（默认）时，导出的预处理 LAS 使用标准 mnemonic（`DT_USM`、`RHO_GCC` 等）。`false` 时保留原始 mnemonic。无论哪种模式，`mnemonic_mapping.csv` 始终记录原始名到最终名的映射。
 
-`well_preprocess_status.csv` 建议字段：
+### `unit_standardization.enabled`
 
-| 字段 | 含义 |
-| --- | --- |
-| `well_name` | 井名 |
-| `preprocess_status` | `passed`、`failed`、`partial` |
-| `usable_p_sonic` | 纵波时差是否在预处理后可用 |
-| `usable_density` | 密度是否在预处理后可用 |
-| `usable_caliper` | 井径是否在预处理后可用 |
-| `final_p_sonic` | 最终使用的标准纵波曲线名 |
-| `final_density` | 最终使用的标准密度曲线名 |
-| `final_caliper` | 最终使用的标准井径曲线名；没有则为空 |
-| `preprocessed_las` | 输出 LAS 路径 |
-| `reasons` | 失败或警告原因 |
+`true`（默认）时执行单位转换和硬先验检查。`false` 时跳过，但缺失哨兵替换和后续清洗仍按正常流程进行。
 
-## 缩写规范化
+### `constant_runs.min_run_length` 与 `min_run_length_by_category`
 
-第二步负责“识别和选择曲线”，第三步负责“形成标准输出名”。
+连续相同值段长度 ≥ 阈值时替换为 null。`min_run_length` 是兜底默认值，`min_run_length_by_category` 中的配置优先。不同类别应使用不同阈值：声波和密度默认 16 点，GR 默认 16 点，而 `min_run_length: 8` 只对未在 by_category 中列出的类别生效。
 
-建议保留两套信息：
+### `constant_runs.exclude_categories`
 
-- `original_mnemonic`：原始 LAS 里的曲线名。
-- `standard_mnemonic`：工作流内部使用的标准曲线名。
+这些类别跳过连续常值段替换。默认只排除 `caliper`，因为井径曲线长时间保持同一值是正常现象。排除的类别仍然记录在报告中（`action: skip_caliper`），只是不做替换。
 
-第一版标准名可以先保持少量：
+### `outliers.range_override_file`
 
-| category | standard_mnemonic | 说明 |
-| --- | --- | --- |
-| `p_sonic` | `DT_USM` | 纵波时差，统一为 `us/m` |
-| `s_sonic` | `DTS_USM` | 横波时差，统一为 `us/m` |
-| `density` | `RHO_GCC` | 密度，统一为 `g/cm3` |
-| `gamma_ray` | `GR` | 自然伽马 |
-| `caliper` | `CALI` | 井径 |
-| `resistivity` | `RT` | 电阻率 |
-| `sp` | `SP` | 自然电位 |
-| `porosity` | `POR` | 孔隙度 |
-| `permeability` | `PERM` | 渗透率 |
-| `water_saturation` | `SW` | 含水饱和度 |
-
-导出的预处理 LAS 可以使用标准 mnemonic，但 `mnemonic_mapping.csv` 必须能追溯到原始曲线。
-
-## 单位规范化
-
-声波类建议只保留慢度，不再同时保留速度和慢度两种口径。
-
-理由：
-
-- 当前工区绝大多数原始测井是声波时差曲线。
-- 统一到慢度后，极值阈值可以按全局 `DT_USM`、`DTS_USM` 分布统计。
-- 后续如果需要速度，可以在井震标定或物性资产阶段由慢度确定性转换得到。
-
-代价是：下游凡是进入 `wtie` 或其他外部库的地方，通常仍需要 `Vp` 速度 `m/s`。因此第三步的标准 LAS 保留 `DT_USM`，但第四步构造 `grid.LogSet` 时必须显式转换出 `Vp`，不能把慢度曲线直接命名为 `Vp`。
-
-建议规则：
-
-| 输入物理量 | 输入单位 | 输出 |
-| --- | --- | --- |
-| 声波时差 | `us/ft`、`μs/ft`、`µs/ft` | 乘 `3.280839895` 得到 `us/m` |
-| 声波时差 | `us/m`、`μs/m`、`µs/m` | 保留数值，单位规范为 `us/m` |
-| 声波速度 | `m/s` | `1e6 / velocity_mps` 得到 `us/m` |
-| 密度 | `kg/m3` | 除以 `1000` 得到 `g/cm3` |
-| 密度 | `g/cm3`、`g/cc`、`g/cm^3` | 保留数值，单位规范为 `g/cm3` |
-
-### 单位错配 QC
-
-单位字段不一定可信，所以第三步应顺便做数值分布 QC。
-
-第一版可以用简单统计规则标注疑似问题，不自动修：
-
-- 标准化前后记录均值、中位数、P1、P99。
-- 如果曲线标注为 `us/m`，但中位数更像 `us/ft`，写入 `unit_mismatch_qc.csv`。
-- 如果曲线标注为 `m/s`，但中位数落在典型慢度范围，也写入 QC。
-- 如果密度单位标注为 `g/cm3`，但中位数在 `1600-3000`，疑似实际是 `kg/m3`。
-
-这些规则只做提示，阈值应放进配置，不要硬编码进函数。岩性差异会让“典型范围”失效，例如高密度矿物或特殊岩性会触发误报。是否自动纠正，留到第二轮迭代。
-
-## Primary 曲线复核
-
-第二步选出的 primary 曲线只是基于 header、mnemonic、单位字段和人工 override 的选择。第三步完成单位规范化和异常值处理后，还需要复核 primary 是否仍然可用。
-
-建议第一版使用简单规则：
-
-- 如果 primary 曲线无法完成单位规范化，标记为失效。
-- 如果 primary 曲线在常值段和极值处理后有效点比例过低，标记为失效。
-- 如果同一类别存在 secondary 候选曲线，并且 secondary 能通过预处理，则允许自动接管。
-- 如果没有可接管曲线，则整井或该关键类别失败。
-
-接管只在同一类别内发生，例如 `DT` 失效后可以尝试 `DTC`，但不能用速度或密度曲线跨类别补位。所有接管行为写入 `primary_reselection_report.csv`，并同步更新 `preprocess_summary.csv` 中的最终曲线名。
-
-## 连续截断值/常值段
-
-当前 notebook 的逻辑是：
-
-- 将 LAS 读成每井 `dict[str, grid.Log]`。
-- 对每条曲线做严格相等判断。
-- 连续相同值长度 `>= min_run_length` 时，整段替换为 `anomaly_value`。
-- `-999.0`、`-999.25`、`-99999`、`NaN` 不参与连续段判断。
-
-第一版保留这个思路，但按你的判断调整为：
-
-- 除 `caliper` 井径以外，所有类别默认启用连续常值段替换。
-- 替换目标为 null，导出 LAS 时写成 `-999.25`。
-- 报告里记录常值段的起止 MD、原始值和长度。
-
-井径排除的原因是：井径曲线本来就可能长时间保持同一数值，直接替换会误伤。
-
-井径虽然排除连续常值段替换，但仍然要参与单位规范化、基础有限值检查和可用性统计。这里的 `usable_caliper` 指 LAS 井径曲线是否可用，只服务井眼质量和可选扩径段 QC；斜井路径需要的是 `data/all_well_trace` 里的井轨迹/井斜数据。
-
-连续段报告字段建议：
-
-| 字段 | 含义 |
-| --- | --- |
-| `well_name` | 井名 |
-| `original_mnemonic` | 原始曲线名 |
-| `standard_mnemonic` | 标准曲线名 |
-| `category` | 曲线类别 |
-| `start_md` | 起始 MD |
-| `end_md` | 结束 MD |
-| `run_length` | 连续点数 |
-| `constant_value` | 被替换的原始常值 |
-| `action` | `set_null`、`skip_caliper` |
-
-## 极值处理
-
-第一版采用全局自动阈值：
-
-- 对所有通过第二步筛选并完成单位规范化的井做全局统计。
-- 按标准曲线名统计阈值，例如 `DT_USM`、`DTS_USM`、`RHO_GCC`。
-- 默认使用全局 `q01/q99`。
-- 如果人工配置给了某个标准曲线或某井某曲线的上下限，人工配置优先。
-- 超出上下限的点置 null。
-
-示例人工范围配置：
+手动指定阈值上下限的 YAML 文件。格式：
 
 ```yaml
 global:
   DT_USM:
     min: 120.0
     max: 520.0
-  DTS_USM:
-    min: 200.0
-    max: 900.0
   RHO_GCC:
     min: 1.6
     max: 3.0
@@ -256,136 +168,174 @@ well_curve:
       max: 480.0
 ```
 
-如果某一类有效点太少，不硬算分位数：
+优先级：`well_curve.<well>.<standard>` → `global.<standard>` → 自动分位数。每一级都可以只填 `min` 或 `max`，未填的边回退到下一级。
 
-- 有效点数少于阈值时，只使用人工范围。
-- 没有人工范围时只报告，不处理。
-- 每个阈值记录来源：`manual`、`global_quantile`、`skipped_insufficient_samples`。
+### `usable_thresholds`
 
-## 对 `process.py` 的看法
+判定一条曲线是否可用的双条件：最终有效点数 ≥ `min_valid_samples`，且最终有效点数相对初始有效点数的比例 ≥ `min_valid_fraction_of_initial`。
 
-`process.py` 现在混乱的根源是对象层级没分清。
+### `export`
 
-已核实 `wtie.processing.grid.LogSet` 的源码中 `mandatory_keys = ["Vp", "Rho"]`，初始化时会断言至少包含这两条曲线。它本质是“标准物性曲线集合”。但第三个脚本处理的是第二步导出的任意曲线集合，里面可能有 `GR`、`CALI`、`SP`、`PERM`，也可能暂时没有标准命名的 `Vp/Rho`。所以这个阶段不应该强行用 `LogSet`。
+`null_value` 是导出 LAS 时写入的缺失值（`-999.25`），与数据清洗无关（清洗阶段全部用 NaN 标记缺失）。
 
-建议引入项目内对象：
+---
+
+## 单位处理规则
+
+### 声波类（`p_sonic` / `s_sonic`）
+
+| 输入单位 | 处理 | 硬失败条件 |
+|----------|------|-----------|
+| `us/ft`、`μs/ft` 等 | × 3.28084 → `us/m` | 中位数 > 1000 |
+| `us/m`、`μs/m` 等 | 保留 | 中位数 > 1000 |
+| `m/s` | 1e6 / value → `us/m` | 中位数 < 1000 |
+| 其他 | 不转换，标记硬失败 | — |
+
+非正数的物理量为 NaN（慢度、速度不可能 ≤ 0）。`us/ft` 中位数在 40-160 范围内时追加 QC 提示（看起来更像 `us/m`），`us/m` 中位数在 40-160 时追加反向提示（看起来更像 `us/ft`）。这些都是软提示，不阻止处理。
+
+### 密度类（`density`）
+
+| 输入单位 | 处理 | 硬失败条件 |
+|----------|------|-----------|
+| `g/cm3`、`g/cc` 等 | 保留 | 中位数 > 100 |
+| `kg/m3`、`kg/m^3` | ÷ 1000 → `g/cm3` | 中位数 < 10 |
+| 其他 | 不转换，标记硬失败 | — |
+
+`g/cm3` 中位数 > 10 时追加 QC 提示（疑似实际为 kg/m3 但数值异常）。
+
+### 其他类别
+
+不做单位转换，原始数值保留，原始单位作为标准单位原样带出。
+
+### 后续需要速度怎么办
+
+预处理 LAS 里的声波始终是慢度 `DT_USM`（`us/m`）。进入井震标定或构造 `LogSet` 时需要显式转换：
 
 ```text
-WellCurveSet
+Vp (m/s) = 1e6 / DT_USM (us/m)
 ```
 
-它表示“同一口井、同一采样轴上的任意 LAS 曲线集合”，不要求必须有 Vp/Rho。
+不要把慢度曲线直接命名为 `Vp`。
 
-如果以后某个步骤确认已经有标准 `Vp/Rho`，再从 `WellCurveSet` 显式构造 `grid.LogSet`。
+---
 
-## 模块边界
+## 输出文件
 
-为了避免 `cup.well` 被拆得太碎，第三步先合并为两个主要模块：一个放井曲线集合对象，一个放预处理策略和算法。等 `preprocess.py` 变得太大时，再拆出 `standardize.py`、`cleaning.py` 或 `thresholds.py`。
+所有文件在 `<output_root>/log_preprocess_<timestamp>/` 下：
 
-### 建议新增
+### `preprocessed_las/*.las`
 
-`cup.well.curves`
+通过预处理的井的标准 LAS。曲线使用标准 mnemonic，单位已统一，缺失值填 `-999.25`。只有 `preprocess_status == passed` 的井才会导出。
 
-- `WellCurveSet`：任意曲线集合，不要求 Vp/Rho。
-- `validate_shared_basis(curves)`：检查曲线是否共享 MD 轴。
-- `select_curves_by_category(curve_set, categories)`：按第二步分类选择曲线。
+### `well_preprocess_status.csv` — 每井一行
 
-这些对象可以和第二步的 `CurveInfo`、`CurveSelection` 放在同一个 `curves.py` 里，避免 `curve_set.py` 只有少量薄包装。
+| 字段 | 含义 |
+|------|------|
+| `well_name` | 井名 |
+| `preprocess_status` | `passed` / `failed` |
+| `usable_p_sonic` | 纵波时差是否最终可用 |
+| `usable_density` | 密度是否最终可用 |
+| `usable_caliper` | 井径是否最终可用 |
+| `final_p_sonic` | 最终使用的标准纵波曲线名 |
+| `final_density` | 最终使用的标准密度曲线名 |
+| `final_caliper` | 最终使用的标准井径曲线名 |
+| `preprocessed_las` | 导出 LAS 路径 |
+| `reasons` | 失败原因 |
 
-`cup.well.preprocess`
+后续步骤从这里判断每口井的可用性，不再回查第二步。
 
-- `MnemonicStandardizationPolicy`
-- `UnitStandardizationPolicy`
-- `ConstantRunPolicy`
-- `OutlierPolicy`
-- `PreprocessPolicy`
-- `CleaningReport`
-- `standardize_mnemonic(curve_info, policy)`
-- `standardize_log_unit(log, category, target_unit)`
-- `detect_unit_mismatch(log, category, unit_info)`
-- `replace_constant_runs(log, policy) -> tuple[grid.Log, CleaningReport]`
-- `remove_outliers(log, policy) -> tuple[grid.Log, CleaningReport]`
-- `compute_global_quantile_thresholds(curve_sets, curve_inventory, q_low, q_high)`
-- `merge_threshold_overrides(auto_thresholds, manual_thresholds)`
-- `reselect_primary_curve(curve_set, category, failed_primary, policy)`
-- `preprocess_curve_set(curve_set, policies) -> PreprocessedCurveSet`
+### `preprocess_summary.csv` — 每井每条曲线一行
 
-### 建议移动或拆分
+最全的明细。包含原始名、标准名、单位转换动作、硬失败原因、QC 标记、每步替换点数、最终有效点数和占比、使用的阈值上下限及来源、最终是否被选为该类别的可用曲线。
 
-`src/cup/well/process.py` 不建议继续变成大杂烩，但也不必为了第一版强行拆出多个很薄的文件。迁移策略可以是：
+### `mnemonic_mapping.csv`
 
-- 先新增 `cup.well.preprocess`，承接缩写规范化、单位规范化、单位错配 QC、异常值、常值段、极值阈值。
-- `clip_logsets_by_well_tops()` 可以暂时留在 `process.py`，等井分层相关函数超过一两个后再拆 `cup.well.tops`。
-- 任意曲线集合对象先放 `cup.well.curves`，与第二步的 `CurveInfo`、`CurveSelection` 同处一处。
+原始 mnemonic → 标准 mnemonic 的映射，附带类别、是否第二步 primary、原始 LAS 路径。
 
-旧的 `replace_constant_value_intervals_in_log_dicts()` 可以在第一轮重构中保留 wrapper，但新脚本应调用更清楚的新函数。`LogsetInput = Union[grid.LogSet, Dict[str, grid.Log]]` 这种签名建议逐步淘汰，因为它把“标准物性集合”和“任意曲线集合”混在一起了。
+### `unit_conversion_report.csv`
 
-明确迁移路径：
+每条曲线的单位转换详情：转换动作、转换前后统计量（中位数、P01、P99）。
 
-1. 第二、三步内部统一使用 `WellCurveSet` 表达任意 LAS 曲线集合。
-2. 只有当第四步确认 `DT_USM` 和 `RHO_GCC` 都可用，并把 `DT_USM` 转成 `Vp(m/s)` 后，才构造 `grid.LogSet({"Vp": ..., "Rho": ...})`。
-3. 旧函数若仍接受 `LogsetInput`，只作为兼容 wrapper，内部立即转换到新对象或明确拒绝不合适的输入。
+### `unit_mismatch_qc.csv`
 
-### 脚本层负责
+触发单位错配软提示的曲线清单，含 QC 标记和当时的中位数/P01/P99。
 
-`log_preprocess.py` 负责：
+### `primary_reselection_report.csv`
 
-- 读取第二步 manifest。
-- 组织输入输出路径。
-- 调用规范化、清洗和阈值模块。
-- 写 CSV/JSON 报告。
-- 导出预处理后 LAS。
+primary 接管记录。每行记录：哪个 category 的哪条 primary 失效、由哪条 secondary 接管、失效原因。
 
-它不应该自己实现连续段扫描、分位数阈值计算、单位转换、primary 接管或单位错配判断。
+### `constant_run_report.csv`
 
-## 前三步后的建议文件布局
+每个被替换的连续常值段一行：起止 MD、段长、常值、操作（`set_null` 或 `skip_caliper`）。
 
-第一轮重构先保持文件数量克制。`cup` 的边界可以暂定为：
+### `outlier_report.csv`
 
-### `src.cup.petrel`
+每条曲线的极值替换明细：上下限、阈值来源、替换点数。
 
-`cup.petrel` 只负责 Petrel 交换格式，不再承载 LAS 曲线业务逻辑。
+### `range_thresholds.csv`
 
-| 文件 | 职责 |
-| --- | --- |
-| `petrel/load.py` | 读取 Petrel 文本：井头、井分层、解释层位、checkshots。 |
-| `petrel/export.py` | 导出 Petrel 文本：例如 checkshots、解释或后续 Petrel 专用表。 |
+每个标准曲线名一行：最终使用的全局上下限、来源（`global_quantile` / `manual_global` / `skipped_insufficient_samples`）、参与统计的样本数。
 
-需要迁出的内容：
+### `skipped_wells.csv` / `skipped_curves.csv`
 
-- 地震体读取应归到 `cup.seismic`。
-- LAS header 扫描、LAS 曲线提取、LAS 导出应归到 `cup.well.las`。
-- 单位转换、异常值处理和曲线选择不属于 Petrel。
+无法处理的井和曲线，附原因标签。
 
-### `src.cup.well`
+### `run_summary.json`
 
-`cup.well` 负责井资产、井曲线和井相关处理。
+输入路径、配置摘要、各项计数。
 
-| 文件 | 职责 |
-| --- | --- |
-| `well/assets.py` | 井头对象、井资产清单、工区内外状态、近邻井对 QC。 |
-| `well/curves.py` | 曲线类别 schema、mnemonic 候选、曲线分类结果、primary 选择、`WellCurveSet`。 |
-| `well/las.py` | LAS header 扫描、曲线提取、瘦身 LAS 和预处理 LAS 导出。 |
-| `well/preprocess.py` | 缩写规范化、单位规范化、单位错配 QC、常值段、极值、primary 接管；第一版也可以暂存少量井分层裁剪函数。 |
-| `well/tops.py` | 可选拆分点；等井分层相关函数变多后再创建。 |
-| `well/trajectory.py` | 井轨迹读取和直井/斜井复核；第四步前再细化。 |
-| `well/wavelet.py` | 保留现状，小波生成、读取和采样间隔校验。 |
-| `well/viz.py` | 井曲线、直方图和 QC 图。 |
+---
 
-如果后续 `well/preprocess.py` 或 `well/curves.py` 变得过大，再拆出 `standardize.py`、`cleaning.py`、`thresholds.py` 或 `curve_screen.py`。当前阶段先不拆。
+## 如何阅读结果
 
-## 已定策略
+### 第一步：看终端输出
 
-- 声波统一成慢度 `us/m`。
-- 极值超限点置 null。
-- 自动阈值按全局分位数统计。
-- 除井径以外的所有类别都启用连续常值段替换。
-- 单位规范化、缩写规范化和异常值处理放在同一个预处理脚本里。
-- 第四步使用 `well_preprocess_status.csv` 判断 `usable_p_sonic`、`usable_density` 和可选的 `usable_caliper`，不直接使用第二步的原始曲线存在性。斜井路径是否可走由第一步的 `has_well_trace` 和第四步轨迹 QC 决定。
+```
+Log preprocess summary: 38 step2-passed wells, 35 passed, 3 failed, 35 LAS exported.
+```
+
+如果 `failed` 井数多，打开 `well_preprocess_status.csv` 看 `reasons` 列。
+
+### 第二步：定位 individual curve failures
+
+`skipped_curves.csv` 按原因标签分类——`no_finite_samples`、`unsupported_sonic_unit`、`density_g_cm3_unit_impossible_median_gt_100` 等。数量集中的原因说明系统性数据问题。
+
+### 第三步：检查 primary reselection
+
+`primary_reselection_report.csv` 非空时，说明有井的 primary 曲线在预处理中失效并被 secondary 接替。关注接管后是否影响全局阈值统计（primary 失效意味着该曲线的值未进入阈值计算）。
+
+### 第四步：检查单位 QC
+
+`unit_mismatch_qc.csv` 列出所有疑似单位与数值不匹配的曲线。是软提示——脚本不自动纠正，但第二轮迭代前应该人工确认这些曲线的单位字段。
+
+### 第五步：抽查极端阈值
+
+`range_thresholds.csv` 中 `source == skipped_insufficient_samples` 的条目——有效样本太少，没有自动阈值。这些标准曲线名下所有井的极值处理都不会生效，后续可能需要手动指定。
+
+### 第六步：抽查一口井的完整轨迹
+
+打开 `preprocess_summary.csv` 筛选某口井，检查每条曲线的 `conversion_action` → `constant_replaced_points` → `outlier_replaced_points` → `final_valid_fraction` 链条是否符合预期。
+
+---
+
+## 与前后步骤的约定
+
+**上游（第二步）：**
+- 必须提供 `well_curve_screen.csv`（含 `las_file` 列指向原始 LAS）。
+- 必须提供 `curve_classification/*.json`（来自第二步的逐井分类详情）。
+- 瘦身 LAS 用于校验存在性，原始 LAS 用于实际数据加载。
+
+**下游（第四步）：**
+- 读取 `well_preprocess_status.csv` 判断 `usable_p_sonic` 和 `usable_density`。
+- 读取 `preprocessed_las/*.las` 获取标准曲线。
+- 构造 `LogSet` 时必须将 `DT_USM` 显式转为 `Vp(m/s)`。
+- 斜井路径由井轨迹文件和第四步轨迹 QC 决定，LAS 井径曲线（`CALI`）只服务井眼质量评估。
+
+---
 
 ## 留到第二轮
 
-- 单位错配 QC 是否自动纠正，还是只报告。
-- 全局阈值是否需要按层段、井型或工区分区细化。
+- 单位错配软提示是否自动纠正还是只报告。
+- 全局阈值是否按层段、井型或工区分区细化。
 - 是否为极值处理生成直方图 QC 图。
-- 连续常值段是否需要按类别设置不同 `min_run_length`。
+- 连续常值段阈值是否需要继续细化。

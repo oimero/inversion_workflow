@@ -10,18 +10,224 @@
 
 核心公开对象
 ------------
-1. `_VP_MNEMONICS`: 纵波速度或声波时差候选简称。
-2. `_VS_MNEMONICS`: 横波速度或横波时差候选简称。
-3. `_RHO_MNEMONICS`: 密度曲线候选简称。
-4. `_GR_MNEMONICS` / `_POR_MNEMONICS` / `_PERM_MNEMONICS` / `_SW_MNEMONICS`:
-   其他常见储层参数候选简称。
+1. `CURVE_CATEGORY_MNEMONICS`: 第二步 LAS header 本地分类的公开候选集。
+2. `CURVE_CATEGORY_PRIORITY`: 每个类别内选择 primary 的默认优先级。
+3. `_VP_MNEMONICS` / `_RHO_MNEMONICS` 等旧常量：兼容现有加载函数。
 """
 
-_CALI_MNEMONICS = ("BS", "CALI", "HDAR", "HCAL")
+CURVE_CATEGORY_MNEMONICS = {
+    "caliper": (
+        "CAL",
+        "CALI",
+        "BS",
+        "HCAL",
+        "HDAR",
+    ),
+    "gamma_ray": (
+        "GR",
+        "GR1",
+        "GR-NORM",
+        "GR_CAL",
+        "GAMMARAY",
+        "GAMMARAY1",
+        "GAMMARAY2",
+        "GAMMARAY3",
+        "GAMMARAY4",
+        "GAMMARAY5",
+        "GAMMARAY6",
+        "GAMMARAY7",
+        "GAMMARAY8",
+        "GAMMARAY9",
+        "GAMMARAY10",
+        "GAMMARAY11",
+    ),
+    "p_sonic": (
+        "DT",
+        "DTC",
+        "DTCO",
+        "AC",
+        "CALIBRATEDSONICLOG",
+        "CALIBRATEDSONICLOG:1",
+        "CALIBRATEDSONICLOG:2",
+        "CALIBRATEDSONICLOG:3",
+        "CALIBRATEDSONICLOG:4",
+        "VP",
+        "VP_MPS",
+        "VPMS",
+        "INPUTINTERVALVELOCITY",
+        "OUTPUTINTERVALVELOCITY",
+    ),
+    "s_sonic": (
+        "DTS",
+        "DTSM",
+        "DTSH",
+        "DTSM_FAST",
+        "DTSM_SLOW",
+        "VS",
+        "VS_MPS",
+        "VSMS",
+    ),
+    "density": (
+        "DEN",
+        "RHOB",
+        "RHOZ",
+        "HDRA",
+        "RHO",
+        "RHO_GCC",
+    ),
+    "resistivity": (
+        "RT",
+        "LLD",
+        "LLD1",
+        "LLS",
+        "MSFL",
+        "ILD",
+        "AT90",
+        "RD",
+        "RS",
+        "RXO",
+        "RLA1",
+        "RLA2",
+        "RLA3",
+        "RLA4",
+        "RLA5",
+        "A40H",
+        "P16H",
+        "P28H",
+        "P34H",
+        "P40H",
+    ),
+    "sp": (
+        "SP",
+    ),
+    "porosity": (
+        "POR",
+        "PHIE",
+        "PHIT",
+        "PHIE_HILT",
+        "BFV",
+        "CN",
+    ),
+    "permeability": (
+        "PERM",
+        "PERM_COATES_FFI",
+    ),
+    "water_saturation": (
+        "SW",
+        "SWE",
+        "SWT",
+        "SW_HILT",
+    ),
+}
+
+
+CURVE_CATEGORY_PRIORITY = {
+    "caliper": (
+        "CAL",
+        "CALI",
+        "BS",
+        "HCAL",
+        "HDAR",
+    ),
+    "gamma_ray": (
+        "GR",
+        "GR1",
+        "GR-NORM",
+        "GR_CAL",
+        "GAMMARAY",
+    ),
+    "p_sonic": (
+        "DT",
+        "DTC",
+        "DTCO",
+        "AC",
+        "VP",
+        "VP_MPS",
+        "VPMS",
+    ),
+    "s_sonic": (
+        "DTS",
+        "DTSM",
+        "DTSH",
+        "VS",
+        "VS_MPS",
+        "VSMS",
+    ),
+    "density": (
+        "DEN",
+        "RHOB",
+        "RHOZ",
+        "HDRA",
+        "RHO",
+        "RHO_GCC",
+    ),
+    "resistivity": (
+        "RT",
+        "LLD",
+        "LLD1",
+        "LLS",
+        "MSFL",
+        "ILD",
+        "AT90",
+        "RD",
+        "RS",
+        "RXO",
+    ),
+    "sp": (
+        "SP",
+    ),
+    "porosity": (
+        "POR",
+        "PHIE",
+        "PHIT",
+        "PHIE_HILT",
+        "CN",
+        "BFV",
+    ),
+    "permeability": (
+        "PERM",
+        "PERM_COATES_FFI",
+    ),
+    "water_saturation": (
+        "SW",
+        "SWE",
+        "SWT",
+        "SW_HILT",
+    ),
+}
+
+
+DERIVED_OR_AUXILIARY_MNEMONICS = (
+    "AI",
+    "RC",
+    "DRIFT",
+    "RESAMPLEDAI",
+    "RESIDUALDRIFTLOG",
+    "TWTPICKED",
+    "TWTPICKED2",
+    "ONE-WAYTIME",
+    "SESMIC",
+    "SESMIC2",
+    "INPEFA",
+    "PEFA",
+    "D-INPEFA_GR",
+    "GRINPEFA",
+    "FACIES",
+    "FLUIDS",
+    "LITH",
+    "LITH_SHOW",
+    "BOOL_POR",
+    "VSH",
+    "SAND??SHADIBI",
+    "AMP",
+)
+
+
+_CALI_MNEMONICS = CURVE_CATEGORY_MNEMONICS["caliper"]
 _VP_MNEMONICS = ("DT", "AC", "DTC", "DTCO", "VP", "VP_MPS", "VPMS")
 _VS_MNEMONICS = ("DTS", "DTSM", "DTSH")
-_RHO_MNEMONICS = ("DEN", "RHOB", "RHOZ", "HDRA", "RHO", "RHO_GCC")
-_GR_MNEMONICS = ("GR", "GR_CAL")
-_POR_MNEMONICS = ("POR", "PHIE", "PHIT", "PHIE_HILT")
-_PERM_MNEMONICS = ("PERM", "PERM_COATES_FFI")
-_SW_MNEMONICS = ("SW", "SWE", "SWT", "SW_HILT")
+_RHO_MNEMONICS = CURVE_CATEGORY_MNEMONICS["density"]
+_GR_MNEMONICS = CURVE_CATEGORY_MNEMONICS["gamma_ray"]
+_POR_MNEMONICS = CURVE_CATEGORY_MNEMONICS["porosity"]
+_PERM_MNEMONICS = CURVE_CATEGORY_MNEMONICS["permeability"]
+_SW_MNEMONICS = CURVE_CATEGORY_MNEMONICS["water_saturation"]

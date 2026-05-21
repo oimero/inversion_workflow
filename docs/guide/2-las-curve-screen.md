@@ -1,51 +1,34 @@
 # 02 LAS 曲线筛选与导出
 
-本文讨论第二个规划脚本：`las_curve_screen.py`。
+`las_curve_screen.py` 是工作流的第二步。它读取第一步的 `well_inventory.csv`，对工区内且有 LAS 的每口井扫描曲线头，用本地 mnemonic 规则把每条曲线归类，选出每类的 primary 曲线，最后把通过筛选的井导出瘦身 LAS。
 
-它接在 `well_inventory.py` 后面，只处理已经通过第一步空间筛选的井：在工区内或工区边缘，并且同时有井头数据和 LAS 文件。
+它**不**做单位规范化、异常值处理、缩写改名——这些留给第三步。
 
-参考 notebook：
+---
 
-- `notebooks/well_select_and_io@20260404.ipynb`
-- `notebooks/well_import_and_export@20260404.ipynb`
+## 快速开始
 
-这两个 notebook 的核心流程是：读取 LAS 文件头，用 LLM 对曲线归类；再按归类结果提取有用曲线，导出新的 LAS。单位和缩写的最终规范化放到第三步预处理里完成。
-
-## 目标
-
-`las_curve_screen.py` 回答四件事：
-
-1. 每口候选井有哪些曲线、单位、描述和 LAS 采样轴信息。
-2. 哪些曲线对应井径、GR、横波时差、纵波时差、密度、电阻率、SP、孔隙度、渗透率、含水饱和度等类别。
-3. 哪些井同时包含“纵波声波/时差”和“密度”，可以进入后续合成记录和井震标定。
-4. 哪些井正式包含 LAS 井径曲线，可作为井眼质量 QC 的候选。
-5. 将筛选出的有用曲线导出为瘦身 LAS，并保留完整的分类、选择和跳过原因。
-
-这个脚本可以调用 LLM，但 LLM 不应是唯一判断来源。推荐优先级：
-
-```text
-人工 override > 已缓存 LLM 分类 > 本地 mnemonic 规则 > 本次 LLM 分类
+```bash
+python scripts/las_curve_screen.py
+python scripts/las_curve_screen.py --config experiments/my_project.yaml
+python scripts/las_curve_screen.py --output-dir /tmp/screen_test
 ```
 
-如果没有配置 LLM，本脚本也应该能用本地 mnemonic 规则跑出一个可审计的初版结果。
+不带参数运行时，脚本读取 `experiments/common.yaml`，自动发现最新的 `well_inventory_*/well_inventory.csv`，在 `scripts/output/las_curve_screen_<timestamp>/` 下写出结果。
 
-## 输入
+当前版本 LLM 分类默认**不启用**。仅凭本地 mnemonic 规则即可产出可审计的初版结果。如果配置里打开了 LLM，脚本会直接抛出 `NotImplementedError`——LLM 路径预留给后续迭代。
 
-- 第一阶段清单：`well_inventory.csv`。
-- 原始 LAS 目录：`data/all_well_las`。
-- 曲线分类 schema：建议项目内维护一个 YAML，而不是继续依赖临时 `import_template.csv`。
-- 可选人工 override：例如 `experiments/curve_alias_overrides.yaml`。
-- 可选 LLM 配置：模型名、API key 路径、是否启用、失败重试次数。
+---
 
-建议配置片段：
+## 配置参考
 
 ```yaml
 las_curve_screen:
-  inventory_file: scripts/output/well_inventory_YYYYMMDD_HHMMSS/well_inventory.csv
-  las_dir: all_well_las
+  inventory_file: null                       # null = 自动发现最新 step1 输出
+  las_dir: all_well_las                      # 原始 LAS 目录，相对于 data_root
   include_survey_positions: [inside, near_outside]
-  required_categories: [p_sonic, density]
-  selected_categories:
+  required_categories: [p_sonic, density]    # 必须同时具备才能 passed
+  selected_categories:                       # 需要从 LAS 中提取的类别
     - caliper
     - gamma_ray
     - s_sonic
@@ -56,7 +39,7 @@ las_curve_screen:
     - porosity
     - permeability
     - water_saturation
-  curve_schema_file: experiments/curve_schema.yaml
+  curve_schema_file: null                    # null = 使用内置 CURVE_CATEGORY_MNEMONICS
   curve_override_file: experiments/curve_alias_overrides.yaml
   llm:
     enabled: false
@@ -68,252 +51,216 @@ las_curve_screen:
     write_fmt: "%.6f"
 ```
 
-`write_fmt` 第一版可以用统一默认值，保证实现简单和可重复。后续如果 QC 发现文件过大或不同曲线需要不同精度，再扩展为按类别配置，例如密度、孔隙度、电阻率分别指定格式。
+### `inventory_file`
 
-## 输出
+`null` 时脚本自动扫描 `<output_root>/well_inventory_*/well_inventory.csv`，取最新一份。如果要复现固定实验，显式填写第一步产出的路径。
 
-默认输出目录建议为：
+### `required_categories`
 
-```text
-scripts/output/las_curve_screen_<timestamp>/
-```
+必须同时具备的类别。当前默认 `[p_sonic, density]`——缺任一个则 `screen_status = failed` 或 `partial`（有其他曲线时为 partial，完全没有则 failed）。
 
-核心文件：
+### `selected_categories`
 
-- `las_curve_inventory.csv`：每条 LAS 曲线一行，记录 mnemonic、unit、descr、category、分类来源。
-- `well_curve_screen.csv`：每口井一行，记录是否通过筛选、各类主曲线、失败原因。
-- `selected_las/*.las`：只导出 `screen_status == passed` 的井，即同时具备 `p_sonic` 和 `density` 的井。
-- `curve_classification/*.json`：逐井分类缓存，便于断点续跑和人工复查。
-- `skipped_wells.csv`：未通过筛选的井及原因。
-- `skipped_curves.csv`：分类命中但提取失败、歧义未解或被 override 禁用的曲线。
-- `run_summary.json`：输入路径、配置、统计摘要和失败原因汇总。
+脚本会从 LAS 中提取这些类别的曲线，并各选一条 primary。不在这个列表里的曲线即使能被识别也不会被选中导出，但仍会出现在 `las_curve_inventory.csv` 的分类记录中。
 
-`well_curve_screen.csv` 建议字段：
+### `curve_schema_file`
 
-| 字段 | 含义 |
-| --- | --- |
-| `well_name` | 井名 |
-| `las_file` | 原始 LAS 路径 |
-| `screen_status` | `passed`、`failed`、`partial` |
-| `has_p_sonic` | 是否有纵波声波/时差 |
-| `has_density` | 是否有密度 |
-| `has_caliper` | 是否有正式归类的井径曲线 |
-| `primary_p_sonic` | 选定的纵波曲线 mnemonic |
-| `primary_density` | 选定的密度曲线 mnemonic |
-| `primary_caliper` | 选定的井径曲线 mnemonic；没有则为空 |
-| `selected_curve_count` | 成功提取并导出的曲线数 |
-| `exported_las` | 瘦身 LAS 路径 |
-| `reasons` | 失败或警告原因 |
-
-`las_curve_inventory.csv` 建议字段：
-
-| 字段 | 含义 |
-| --- | --- |
-| `well_name` | 井名 |
-| `mnemonic` | LAS 曲线名 |
-| `unit` | 原始单位 |
-| `description` | LAS 描述 |
-| `category` | 标准类别 |
-| `is_primary` | 是否为该类别主曲线 |
-| `classification_source` | `override`、`llm_cache`、`mnemonic_rule`、`llm`、`unclassified` |
-| `confidence` | 可选置信度；规则分类可给 1.0 |
-| `notes` | 歧义或人工备注 |
-
-## 分类类别
-
-建议使用英文稳定 key，中文只作为展示名：
-
-| key | 中文 | 示例 mnemonic |
-| --- | --- | --- |
-| `caliper` | 井径/井眼质量 | `CAL`、`CALI`、`BS` |
-| `gamma_ray` | GR/泥质 | `GR`、`GR1`、`VSH` |
-| `p_sonic` | 纵波声波/时差 | `DT`、`AC`、`DTC`、`DTCO`、`VP` |
-| `s_sonic` | 横波声波/时差 | `DTS`、`DTSM`、`DTSH` |
-| `density` | 密度 | `DEN`、`RHOB`、`RHOZ`、`RHO` |
-| `resistivity` | 电阻率 | `RT`、`LLD`、`LLS`、`MSFL`、`ILD`、`AT90` |
-| `sp` | 自然电位 | `SP` |
-| `porosity` | 孔隙度 | `POR`、`PHIE`、`PHIT` |
-| `permeability` | 渗透率 | `PERM` |
-| `water_saturation` | 含水饱和度 | `SW`、`SWE`、`SWT` |
-
-当前 `src/cup/well/mnemonics.py` 已有部分候选集，但缺少电阻率、SP，并且常量以下划线开头。第二个脚本落地前，应该把它整理成公开的类别配置。
-
-## 处理逻辑
-
-### 候选井
-
-只读取第一步清单中满足以下条件的井：
-
-- `has_well_head == true`
-- `has_las == true`
-- `survey_position in [inside, near_outside]`
-- `inventory_status == usable_for_las_screen`
-
-这样第二个脚本不再重新决定空间范围，也不扫描工区外井。
-
-### LAS header 扫描
-
-优先只读取 LAS header 和 `~Curve` 段，拿到：
-
-- 井名、STRT/STOP/STEP/NULL。
-- 每条曲线的 mnemonic、unit、descr。
-- 曲线数量、采样点数、采样轴是否单调。
-
-不建议像 notebook 里那样把整个 LAS 数据区都喂给 LLM。对 LLM 来说，曲线表和必要的 well/header 信息已经足够；数据区又大又容易泄露无关内容。
-
-### 曲线分类
-
-分类合并顺序：
-
-1. 人工 override：最高优先级，用于修正 LLM 或规则误判。
-2. LLM cache：如果已有逐井 JSON，则直接复用。
-3. 本地 mnemonic 规则：对常见标准名直接分类。
-4. 本次 LLM：只处理仍未分类或存在歧义的井/曲线。
-
-LLM 输出必须校验：
-
-- 只能使用 schema 中定义的类别。
-- 返回的 mnemonic 必须真实存在于该 LAS。
-- 一个 mnemonic 可以出现在多个类别时，需要进入 `ambiguous` 或要求 override。
-- 每个类别如果有多个候选，需要按选择策略确定 primary。
-
-### 人工 override
-
-人工 override 是第二步最重要的人工干预入口。它不是“手工改结果文件”，而是一份可追溯配置，用来覆盖规则或 LLM 的判断。
-
-落地顺序可以分两层：第一版至少实现全局类别优先级和单井单类别 primary；单井禁用、单井强制归类可以先按 schema 预留，等真实井暴露出需要时再实现。
-
-建议至少支持四类 override：
-
-| override | 作用 |
-| --- | --- |
-| 全局类别优先级 | 例如 `p_sonic: [DT, DTC, DTCO, AC, VP]` |
-| 单井单类别 primary | 例如 A1 井的 `p_sonic` 强制使用 `DTC` |
-| 单井单曲线禁用 | 例如某井的 `DEN_BAD` 不参与密度候选 |
-| 单井单曲线强制归类 | 例如某井的 `RHOZ2` 强制归为 `density` |
-
-这样可以处理“有一口井想用这个缩写，另一口井想用另一个缩写”的情况。全局优先级只提供默认选择，单井 override 永远优先。
-
-示例：
+自定义分类规则的 YAML 文件。不填则使用 `cup.well.mnemonics.CURVE_CATEGORY_MNEMONICS` 内置规则。格式：
 
 ```yaml
-global_priority:
-  p_sonic: [DT, DTC, DTCO, AC, VP]
-  density: [DEN, RHOB, RHOZ, RHO]
+categories:
+  p_sonic:
+    display: "纵波声波/时差"
+    mnemonics: [DT, DTC, DTCO, AC, VP]
+  my_custom_category:
+    mnemonics: [ABC, XYZ]
+```
+
+### `curve_override_file`
+
+人工干预配置，优先级高于规则和 LLM。支持四类操作：
+
+```yaml
+global_priority:                  # 覆盖全局 primary 选择优先级
+  p_sonic: [DT, DTC, AC, VP]
+  density: [RHOB, DEN, RHOZ]
 
 wells:
-  A1:
-    primary:
+  A1:                             # 单井配置（井名大小写不敏感）
+    primary:                      # 单井单类别指定 primary
       p_sonic: DTC
-    disabled_curves: [DT_BAD]
-  B2:
-    force_category:
+    disabled_curves: [DT_BAD]    # 跳过该井的某些曲线
+    force_category:               # 强制将某曲线归入某类别
       RHOZ2: density
-    primary:
-      density: RHOZ2
 ```
 
-### 主曲线选择
+- `global_priority`：定义每类中选 primary 的优先顺序。内置优先级（`CURVE_CATEGORY_PRIORITY`）仅含可信原始测井曲线，不含派生产品。
+- `primary`：直接指定某口井某类用哪条曲线。它的值使用**精确 mnemonic**（含 LASIO 后缀如 `:1`），不会做规范化裁剪。
+- `disabled_curves`：跳过某些曲线，不参与分类和选择。支持含后缀的精确名和基础名（填 `DT` 会禁用 `DT`、`DT:1`、`DT:2` 等所有变体）。
+- `force_category`：覆盖规则判断，将一条曲线强制归入指定类别。
 
-后续合成记录最低要求是：
+所有 override 均可追溯：分类结果中的 `classification_source` 字段会标记 `override`，`notes` 会记录具体原因。
 
-- `p_sonic`
-- `density`
+---
 
-如果一类里有多个候选，建议先按配置中的优先级选择 primary；例如：
+## 曲线分类原理
 
-```text
-p_sonic: DT > DTC > DTCO > AC > VP
-density: DEN > RHOB > RHOZ > RHO
+### 本地 mnemonic 规则
+
+内置规则在 `cup.well.mnemonics.CURVE_CATEGORY_MNEMONICS` 中维护。每条曲线按 mnemonic 规范化后（大写、去前后空格、裁剪 LASIO 的 `:1`/`:2` 后缀）与规则表匹配：
+
+- 匹配到**唯一**类别 → 直接归类，`classification_source = mnemonic_rule`
+- 匹配到**多个**类别 → 标记为 `ambiguous`，`confidence = 0`，不进入 primary 选择
+- 没匹配到任何类别 → 标记为 `unclassified`
+
+### LASIO 后缀处理
+
+lasio 读取 LAS 时，同名曲线可能被自动添加 `:1`、`:2` 等后缀。脚本区分两种 mnemonic 概念：
+
+| 概念 | 函数 | 示例 |
+|------|------|------|
+| **精确名** | `exact_mnemonic()` | `CALIBRATEDSONICLOG:1` → `CALIBRATEDSONICLOG:1`（保留后缀） |
+| **规范化名** | `normalize_mnemonic()` | `CALIBRATEDSONICLOG:1` → `CALIBRATEDSONICLOG`（裁剪后缀） |
+
+分类匹配用的是规范化名（`CALIBRATEDSONICLOG:1` 和 `:2` 都归入 `p_sonic`）。Primary 选择优先用精确名匹配，规范化名作为兜底——这样你可以 override primary 到具体的 `CALIBRATEDSONICLOG:1` 而不会误选 `:2`。
+
+### Primary 选择
+
+对每个 `selected_categories` 中的类别，按以下顺序选出 primary：
+
+1. 单井 `primary` override（精确匹配）→ 精确命中
+2. 单井 `primary` override（规范化匹配）→ 多候选时取 index 最小者
+3. `global_priority` 或 `CURVE_CATEGORY_PRIORITY` 的优先级顺序 → 第一个匹配者
+4. 兜底：取 index 最小的候选曲线
+
+选出的 primary mnemonic 是**精确名**（LAS 里实际出现的 mnemonic），可直接用于后续提取。
+
+---
+
+## 输出文件
+
+脚本在 `<output_root>/las_curve_screen_<timestamp>/` 下生成：
+
+### 1. `las_curve_inventory.csv` — 每条 LAS 曲线一行
+
+| 字段 | 含义 |
+|------|------|
+| `well_name` | 井名 |
+| `mnemonic` | 原始 LAS 曲线名（精确名） |
+| `unit` | 原始单位 |
+| `description` | LAS 描述文本 |
+| `category` | 标准类别 key，或 `unclassified`/`ambiguous`/`disabled` |
+| `is_primary` | 是否为该类别的 primary |
+| `classification_source` | `override`、`mnemonic_rule`、`unclassified` |
+| `confidence` | 规则分类为 1.0，ambiguous 为 0.0 |
+| `notes` | 歧义说明或 override 原因 |
+
+### 2. `well_curve_screen.csv` — 每口井一行
+
+| 字段 | 含义 |
+|------|------|
+| `well_name` | 井名 |
+| `las_file` | 原始 LAS 路径（repo-relative） |
+| `screen_status` | `passed`、`partial`、`failed` |
+| `has_p_sonic` | 是否有 p_sonic 的 primary |
+| `has_density` | 是否有 density 的 primary |
+| `has_caliper` | 是否有 caliper 的 primary |
+| `primary_p_sonic` | 选定的 p_sonic 精确 mnemonic |
+| `primary_density` | 选定的 density 精确 mnemonic |
+| `primary_caliper` | 选定的 caliper 精确 mnemonic |
+| `selected_curve_count` | 成功选出 primary 的曲线数 |
+| `exported_las` | 导出 LAS 路径（repo-relative）；failed/partial 时为空 |
+| `reasons` | 分号分隔的失败或警告原因 |
+
+### 3. `selected_las/*.las` — 瘦身 LAS
+
+只导出 `screen_status == passed` 的井，且必须经过 `_exported_contains_required` 校验——若导出后发现 required primary（如 DT、DEN）并未写入 LAS，该井会被降级为 `failed`，不产出 LAS。
+
+导出内容：LAS 索引道 + 所有选出的 primary 曲线。保留原始 mnemonic（不做标准命名），NULL 值统一为 `-999.25`。
+
+### 4. `curve_classification/*.json` — 逐井分类详情
+
+每口候选井一份 JSON，包含 header 摘要、分类结果、primary 选择、reasons。用于断点复查和人工审计。
+
+### 5. `skipped_wells.csv`、`skipped_curves.csv`、`run_summary.json`
+
+| 文件 | 内容 |
+|------|------|
+| `skipped_wells.csv` | 未通过筛选的井及原因 |
+| `skipped_curves.csv` | 分类为 ambiguous/disabled、或导出时缺失的曲线 |
+| `run_summary.json` | 输入路径、候选井数、各状态计数、LAS 导出数、分类来源分布 |
+
+---
+
+## 如何阅读结果
+
+### 第一步：看终端输出
+
+```
+LAS curve screen summary: 61 candidates, 38 passed, 22 partial, 1 failed, 38 LAS exported.
 ```
 
-没有 `p_sonic` 或没有 `density` 的井，`screen_status = failed`，不导入后续井震标定流程。
+四数之和应等于 candidates。如果 `partial` 比例很高（>30%），说明工区内许多井缺 density 或 p_sonic——需要检查是 LAS 数据本身缺失，还是 mnemonic 规则没覆盖。
 
-`screen_status = partial` 只用于报告：表示井里有一些有用曲线，但不满足最低要求。partial 井不写入 `selected_las`，避免第三步误处理注定不能进入合成记录的井。
+### 第二步：看 `well_curve_screen.csv`
 
-### 单位与缩写
+按 `screen_status` 分组查看：
+- `passed` — 具备 p_sonic + density，已导出瘦身 LAS，进入第三步
+- `partial` — 有一些有用曲线但不满足 required，不导出 LAS，不进入第三步
+- `failed` — 完全缺少关键曲线，或 LAS 读取/导出失败
 
-第二个脚本只记录原始 mnemonic、原始 unit 和曲线类别，不做最终单位规范化和标准缩写改名。
+关注 `reasons` 列：`missing_p_sonic`、`missing_density`、`export_missing_required_p_sonic` 等标签能快速定位失败原因。
 
-原因是单位规范化需要和数值分布 QC 结合起来看。例如同一条声波曲线既可能是慢度，也可能是速度，单位字段还可能写错。这个判断更适合放到第三步 `log_preprocess.py`，和异常值处理、单位错配 QC 一起完成。
+`has_caliper` 在第三步用于决定是否跳过井径曲线的连续常值段替换。
 
-第二个脚本也不计算 AI。它只负责筛选和导出输入曲线；AI 生成可以放到标准井资产准备或井震标定阶段。
+### 第三步：看 `las_curve_inventory.csv`
 
-### 井径状态
+查询具体某口井的曲线分类详情。关注 `category == ambiguous` 的行——这些曲线命中多个类别，需要人工指定或补充分类规则。
 
-第二步完成曲线分类后，`has_caliper` 是 LAS 井径曲线的正式存在性标记：
+### 第四步：抽查 `curve_classification/*.json`
 
-- 如果井径曲线被规则、LLM cache、LLM 或人工 override 归为 `caliper`，则 `has_caliper = true`。
-- 如果只有疑似井径名但分类歧义未解，则 `has_caliper = false`，原因写入 `reasons` 或 `skipped_curves.csv`。
-- 如果有多条井径曲线，按 override 和全局优先级选 `primary_caliper`。
+对任何 `failed` 或 `partial` 的井，打开对应 JSON 查看完整的曲线头和分类判断，确认是数据本身缺失还是规则需要调整。
 
-这里的 `caliper` 指 LAS 井径曲线，不等同于 `data/all_well_trace` 里的井轨迹/井斜文件。后续斜井路径应以第一步的 `has_well_trace` 和第四步的轨迹 QC 为准；`has_caliper` 只服务井眼质量和可选扩径段 QC。
+---
 
-### LAS 导出
+## 下游契约
 
-导出瘦身 LAS 时建议：
+第三步 `log_preprocess.py` 读取 `well_curve_screen.csv` 和 `selected_las/*.las`：
 
-- 保留原始 mnemonic，避免过早改名导致人工追踪困难。
-- 在 `well_curve_screen.csv` 中记录每个类别的 primary mnemonic。
-- 导出所有选中类别的曲线，而不是只导出 p_sonic/density。
-- 同时写 `selected_curve_count` 和 `skipped_curves.csv`，避免“导出了文件但关键曲线失败”的假阳性。
+```
+screen_status == "passed" → 进入预处理
+```
 
-是否另导出一份标准命名 LAS，可以留到后续资产准备脚本讨论。这里先保持职责简单。
+第二步**不**做以下事情（留给第三步）：
+- 缩写规范化（DT → DT_USM）
+- 单位规范化（us/ft → us/m）
+- 异常值/常值段/极值处理
+- AI 曲线计算
+- 标准命名 LAS 导出（瘦身 LAS 保留原始 mnemonic）
 
-## 模块边界
+第二步产出的 `primary_p_sonic`、`primary_density` 等字段供第三步做 primary 曲线复核与接管。
 
-第二个脚本应该推动 `cup` 做一次井曲线相关重构。为了避免文件过碎，先按“对象/IO/流程”三类合并，等模块真正变大后再拆。
+---
 
-### 建议新增
+## 脚本依赖的核心模块
 
-`cup.well.curves`
+| 能力 | 来源 |
+|------|------|
+| 第一步清单过滤 | `cup.well.assets.build_file_lookup()` / `normalize_well_name()` |
+| LAS header 扫描 | `cup.well.las.scan_las_header()` / `scan_las_curves()` |
+| 曲线归类 | `cup.well.curves.classify_curves_by_rules()` |
+| Primary 选择 | `cup.well.curves.select_primary_curves()` |
+| 瘦身 LAS 导出 | `cup.well.las.export_selected_curves_to_las()` |
+| 分类规则 | `cup.well.mnemonics.CURVE_CATEGORY_MNEMONICS` |
+| 优先级规则 | `cup.well.mnemonics.CURVE_CATEGORY_PRIORITY` |
+| 配置加载 | `cup.utils.io.load_yaml_config()` |
 
-- `CurveCategory`：稳定类别 key、展示名、候选 mnemonic、单位类型。
-- `CurveInfo`：单条 LAS 曲线的 mnemonic、unit、descr、index。
-- `CurveClassification`：曲线到类别的归类结果和来源。
-- `CurveSelection`：每口井最终选中的曲线、primary 曲线、失败原因。
-- `classify_curves_by_rules(curves, schema)`
-- `merge_curve_classifications(rule_result, llm_result, overrides)`
-- `select_primary_curves(classification, policy)`
-- `screen_well_curves(...) -> CurveSelection`
+---
 
-`cup.well.las`
+## 注意事项
 
-- `scan_las_header(path) -> LasHeader`
-- `scan_las_curves(path) -> list[CurveInfo]`
-- `extract_las_curve(las_file, mnemonic) -> grid.Log`
-- `extract_selected_curves(path, selection) -> dict[str, grid.Log]`
-- `export_curve_sets_to_las(curve_sets, output_dir, ...)`
-
-`cup.well.las` 只做 LAS 读写和轻量结构扫描，不做曲线分类、单位转换或异常值处理。
-
-### 建议调整
-
-`src/cup/well/mnemonics.py`
-
-- 去掉只给内部用的下划线命名，改成公开的 `CURVE_CATEGORY_MNEMONICS`。
-- 补齐 `resistivity`、`sp`。
-- 把“曲线类别”和“单位归一规则”分开，避免 mnemonics 模块承担业务逻辑。
-
-`src/cup/petrel/load.py`
-
-- `extract_any_log_from_las()` 更像通用 LAS 功能，不属于 Petrel 文本读取。建议移动到 `cup.well.las.extract_las_curve()`，原位置只保留兼容 wrapper 或直接在本轮重构中删除旧入口。
-- `load_vp_rho_logset_from_las()` 也不适合继续放在 Petrel 模块，但不能只是机械移动。它现在混合了曲线选择、单位转换、插值和 `grid.LogSet` 构造。重构时应拆成：LAS 提取放 `cup.well.las`，单位转换放第三步 `cup.well.preprocess`，确认 `Vp/Rho` 后再显式构造 `grid.LogSet`。
-
-`src/cup/petrel/export.py`
-
-- `export_logsets_to_las()` 也是通用 LAS 导出能力，不属于 Petrel。建议移动到 `cup.well.las.export_curve_sets_to_las()`，Petrel 模块只保留 Petrel 专有文本导出。
-
-### 脚本层保留
-
-LLM 请求、API key、模型名、重试和缓存属于工作流脚本层，不建议放进 `cup` 核心模块。核心模块只接收“分类结果”，不依赖外部服务。
-
-## 决策点
-
-这些是第二个脚本真正需要拍板的点：
-
-- LLM 是否首轮启用：建议默认 `false`，先跑规则分类和人工 override。
-- 瘦身 LAS 是否保留原始 mnemonic：建议保留。
-- 是否导出未通过 p_sonic/density 的部分井：不进入 `selected_las`，只在 `well_curve_screen.csv` 和 `skipped_wells.csv` 中完整记录。
-- 多条同类曲线如何选 primary：建议配置化优先级，先不要让 LLM 决定 primary。
-- 是否在本脚本计算 AI：建议不计算。
+- **LLM 分类第一版不启用。** 如果 `llm.enabled: true`，脚本会直接抛出 `NotImplementedError`。LLM 路径的接口已预留（classifications 可合并 LLM 结果），但请求逻辑和缓存未实现。
+- **`curve_override_file` 不存在时静默跳过。** 脚本不会因为缺 override 文件而报错——此时仅使用内置规则和优先级。
+- **`CURVE_CATEGORY_PRIORITY` 故意不含派生产品。** `CALIBRATEDSONICLOG`、`INPUTINTERVALVELOCITY`、`OUTPUTINTERVALVELOCITY` 等曲线仍在 `CURVE_CATEGORY_MNEMONICS` 中可被发现（归类为 p_sonic），但不在默认 primary 选择链中。如果确实需要用它们，通过 `curve_override_file` 的 `global_priority` 或单井 `primary` 显式指定。
+- **Primary 选择用精确 mnemonic。** 单井 `primary` override 的值必须是 LAS 中实际出现的 mnemonic（如 `CALIBRATEDSONICLOG:1` 而非 `CALIBRATEDSONICLOG`）。如果填了不带后缀的名字且井内存在多个变体，会选 index 最小的那个。
+- **`_exported_contains_required` 是最后防线。** 如果分类通过但导出时 required primary 未能写入 LAS（例如 mnemonic 在 LAS 数据区缺失），脚本会将该井从 `passed` 降级为 `failed`，`exported_las` 字段置空。

@@ -2,8 +2,6 @@
 
 `las_curve_screen.py` 是工作流的第二步。它读取第一步的 `well_inventory.csv`，对工区内且有 LAS 的每口井扫描曲线头，用本地 mnemonic 规则把每条曲线归类，选出每类的 primary 曲线，最后把通过筛选的井导出瘦身 LAS。
 
-它**不**做单位规范化、异常值处理、缩写改名——这些留给第三步。
-
 ---
 
 ## 快速开始
@@ -35,7 +33,7 @@ las_curve_screen:
     - p_sonic
     - density
     - resistivity
-    - sp
+    - spontaneous_potential
     - porosity
     - permeability
     - water_saturation
@@ -62,6 +60,8 @@ las_curve_screen:
 ### `selected_categories`
 
 脚本会从 LAS 中提取这些类别的曲线，并各选一条 primary。不在这个列表里的曲线即使能被识别也不会被选中导出，但仍会出现在 `las_curve_inventory.csv` 的分类记录中。
+
+这里的类别名是工作流内部的语义类别，不是 LAS 原始 mnemonic。比如 `spontaneous_potential` 是自然电位类别，匹配的常见 LAS mnemonic 是 `SP`。
 
 ### `curve_schema_file`
 
@@ -95,9 +95,9 @@ wells:
 ```
 
 - `global_priority`：定义每类中选 primary 的优先顺序。内置优先级（`CURVE_CATEGORY_PRIORITY`）仅含可信原始测井曲线，不含派生产品。
-- `primary`：直接指定某口井某类用哪条曲线。它的值使用**精确 mnemonic**（含 LASIO 后缀如 `:1`），不会做规范化裁剪。
-- `disabled_curves`：跳过某些曲线，不参与分类和选择。支持含后缀的精确名和基础名（填 `DT` 会禁用 `DT`、`DT:1`、`DT:2` 等所有变体）。
-- `force_category`：覆盖规则判断，将一条曲线强制归入指定类别。
+- `primary`：直接指定某口井某类用哪条曲线。它的值使用**精确 mnemonic**（含 LASIO 重复曲线后缀如 `:1`），不会做规范化裁剪。
+- `disabled_curves`：跳过某些曲线，不参与分类和选择。支持含 LASIO 重复曲线后缀的精确名和基础名。填 `DT:1` 只禁用 `DT:1`；填 `DT` 会禁用 `DT`、`DT:1`、`DT:2` 等所有同名变体。下划线不是这里说的后缀，`DT_BAD` 是另一条独立 mnemonic，不会被 `DT` 禁用。
+- `force_category`：覆盖规则判断，将一条曲线强制归入指定类别。曲线名的精确名/基础名规则与 `disabled_curves` 一致。
 
 所有 override 均可追溯：分类结果中的 `classification_source` 字段会标记 `override`，`notes` 会记录具体原因。
 
@@ -107,15 +107,15 @@ wells:
 
 ### 本地 mnemonic 规则
 
-内置规则在 `cup.well.mnemonics.CURVE_CATEGORY_MNEMONICS` 中维护。每条曲线按 mnemonic 规范化后（大写、去前后空格、裁剪 LASIO 的 `:1`/`:2` 后缀）与规则表匹配：
+内置规则在 `cup.well.mnemonics.CURVE_CATEGORY_MNEMONICS` 中维护。每条曲线按 mnemonic 规范化后（大写、去前后空格、裁剪 LASIO 的 `:1`/`:2` 这类重复曲线后缀）与规则表匹配：
 
 - 匹配到**唯一**类别 → 直接归类，`classification_source = mnemonic_rule`
-- 匹配到**多个**类别 → 标记为 `ambiguous`，`confidence = 0`，不进入 primary 选择
+- 匹配到**多个**类别 → 标记为 `ambiguous`，`confidence = 0`，不进入 primary 选择。触发条件是同一个规范化 mnemonic 同时出现在多个类别规则中；内置规则会避免这种情况，通常只会在自定义 `curve_schema_file` 把同一个简称放进多个类别时出现，例如把 `GR` 同时放进 `gamma_ray` 和 `resistivity`
 - 没匹配到任何类别 → 标记为 `unclassified`
 
 ### LASIO 后缀处理
 
-lasio 读取 LAS 时，同名曲线可能被自动添加 `:1`、`:2` 等后缀。脚本区分两种 mnemonic 概念：
+lasio 读取 LAS 时，同名曲线可能被自动添加 `:1`、`:2` 等后缀。这里的“后缀”只指 mnemonic 尾部的冒号加数字，正则形式是 `:\d+$`；它不是下划线，也不是 `GR_NORM`、`DT_BAD` 这类名字的一部分。脚本区分两种 mnemonic 概念：
 
 | 概念 | 函数 | 示例 |
 |------|------|------|
@@ -223,44 +223,6 @@ LAS curve screen summary: 61 candidates, 38 passed, 22 partial, 1 failed, 38 LAS
 
 ---
 
-## 下游契约
-
-第三步 `log_preprocess.py` 读取 `well_curve_screen.csv` 和 `selected_las/*.las`：
-
-```
-screen_status == "passed" → 进入预处理
-```
-
-第二步**不**做以下事情（留给第三步）：
-- 缩写规范化（DT → DT_USM）
-- 单位规范化（us/ft → us/m）
-- 异常值/常值段/极值处理
-- AI 曲线计算
-- 标准命名 LAS 导出（瘦身 LAS 保留原始 mnemonic）
-
-第二步产出的 `primary_p_sonic`、`primary_density` 等字段供第三步做 primary 曲线复核与接管。
-
----
-
-## 脚本依赖的核心模块
-
-| 能力 | 来源 |
-|------|------|
-| 第一步清单过滤 | `cup.well.assets.build_file_lookup()` / `normalize_well_name()` |
-| LAS header 扫描 | `cup.well.las.scan_las_header()` / `scan_las_curves()` |
-| 曲线归类 | `cup.well.curves.classify_curves_by_rules()` |
-| Primary 选择 | `cup.well.curves.select_primary_curves()` |
-| 瘦身 LAS 导出 | `cup.well.las.export_selected_curves_to_las()` |
-| 分类规则 | `cup.well.mnemonics.CURVE_CATEGORY_MNEMONICS` |
-| 优先级规则 | `cup.well.mnemonics.CURVE_CATEGORY_PRIORITY` |
-| 配置加载 | `cup.utils.io.load_yaml_config()` |
-
----
-
 ## 注意事项
 
 - **LLM 分类第一版不启用。** 如果 `llm.enabled: true`，脚本会直接抛出 `NotImplementedError`。LLM 路径的接口已预留（classifications 可合并 LLM 结果），但请求逻辑和缓存未实现。
-- **`curve_override_file` 不存在时静默跳过。** 脚本不会因为缺 override 文件而报错——此时仅使用内置规则和优先级。
-- **`CURVE_CATEGORY_PRIORITY` 故意不含派生产品。** `CALIBRATEDSONICLOG`、`INPUTINTERVALVELOCITY`、`OUTPUTINTERVALVELOCITY` 等曲线仍在 `CURVE_CATEGORY_MNEMONICS` 中可被发现（归类为 p_sonic），但不在默认 primary 选择链中。如果确实需要用它们，通过 `curve_override_file` 的 `global_priority` 或单井 `primary` 显式指定。
-- **Primary 选择用精确 mnemonic。** 单井 `primary` override 的值必须是 LAS 中实际出现的 mnemonic（如 `CALIBRATEDSONICLOG:1` 而非 `CALIBRATEDSONICLOG`）。如果填了不带后缀的名字且井内存在多个变体，会选 index 最小的那个。
-- **`_exported_contains_required` 是最后防线。** 如果分类通过但导出时 required primary 未能写入 LAS（例如 mnemonic 在 LAS 数据区缺失），脚本会将该井从 `passed` 降级为 `failed`，`exported_las` 字段置空。

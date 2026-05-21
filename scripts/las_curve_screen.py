@@ -85,7 +85,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "p_sonic",
             "density",
             "resistivity",
-            "sp",
+            "spontaneous_potential",
             "porosity",
             "permeability",
             "water_saturation",

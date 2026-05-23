@@ -223,6 +223,6 @@ LAS curve screen summary: 61 candidates, 38 passed, 22 partial, 1 failed, 38 LAS
 
 ---
 
-## 注意事项
+## 留到第二轮
 
-- **LLM 分类第一版不启用。** 如果 `llm.enabled: true`，脚本会直接抛出 `NotImplementedError`。LLM 路径的接口已预留（classifications 可合并 LLM 结果），但请求逻辑和缓存未实现。
+- **LLM 分类当前未启用。** 如果 `llm.enabled: true`，脚本会直接抛出 `NotImplementedError`。LLM 路径的接口已预留（classifications 可合并 LLM 结果），但请求逻辑和缓存未实现。

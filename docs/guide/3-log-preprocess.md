@@ -44,16 +44,6 @@ python scripts/log_preprocess.py --output-dir /tmp/preprocess_test
 
 ---
 
-## 为什么要回读原始 LAS
-
-第二步导出的瘦身 LAS 只包含每类 primary 曲线。但第三步需要对 primary 做接管：如果 `DT` 失灵，要尝试 `DTC`。
-
-`DTC` 不在瘦身 LAS 里。所以脚本读取第二步的 `curve_classification/*.json`（其中记录了每口井所有曲线的分类结果、mnemonic、原始 LAS 路径），回到原始 LAS 中加载所有入选 category 的曲线。瘦身 LAS 只用于校验第二步导出是否成功，不用于数据加载。
-
-这意味着：如果 primary 完好，secondary 不会被用到。但如果 primary 在预处理中失效，同类 secondary 已经就绪，无需重新扫描。
-
----
-
 ## 配置参考
 
 ```yaml

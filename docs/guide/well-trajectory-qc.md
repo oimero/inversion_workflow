@@ -1,42 +1,77 @@
 # 井轨迹 QC
 
-`well_trajectory_qc.py` 是一个不带序号的旁路前置脚本。它不属于 LAS 曲线筛选和预处理主链，也不强制所有工区运行；它的任务是读取井轨迹文件，生成可信的井几何事实，供 `well_auto_tie.py`、后续 LFM 和井约束流程使用。
+`well_trajectory_qc.py` 读取井轨迹文件，生成可信的井几何事实，供井震标定、低频建模和井约束流程使用。
 
-推荐依赖关系是：
+---
 
-```text
-well_inventory
-  ├── las_curve_screen ── log_preprocess ──┐
-  └── well_trajectory_qc ──────────────────┤
-                                            ↓
-                                      well_auto_tie
+## 快速开始
+
+```bash
+python scripts/well_trajectory_qc.py
+python scripts/well_trajectory_qc.py --config experiments/my_project.yaml
+python scripts/well_trajectory_qc.py --output-dir /tmp/traj_test
 ```
 
-也就是说，轨迹 QC 可以在第一步之后任意时间运行，只要在需要斜井路由、轨迹采样或井型复核之前完成即可。对于明确全直井、且不需要轨迹复核的工区，这一步可以跳过。
+不带参数时，脚本自动发现最新的井资产盘点产物，在 `<output_root>/well_trajectory_qc_<timestamp>/` 下写出结果。
+
+### 什么时候需要跑这一步
+
+轨迹 QC 是第四步井震标定的前置条件——只有知道井的真实几何，才能决定它走直井路径还是斜井路径。但它不依赖第二步和第三步的 LAS 处理，所以可以在第一步之后任意时间运行。
+
+如果工区全部是直井、且不打算复核轨迹，这一步可以跳过。但建议至少跑一次，因为井头文件里的底孔坐标可能不准。
 
 ---
 
-## 目标
+## 脚本在做什么
 
-`well_trajectory_qc.py` 回答四件事：
+对每口井，依次做三件事：
 
-1. 哪些井的轨迹文件可以被正确解析。
-2. Petrel 轨迹文件中的 `MD`、`TVD`、`Z`、`KB` 口径是否自洽。
-3. 真实轨迹复核后的井型是什么：`vertical`、`deviated` 或 `unknown`。
-4. 每口井是否具备进入第四步斜井路径、后续 LFM 或井约束的几何条件。
+### 1. 解析轨迹文件
 
-第一步 `well_inventory.py` 已经基于井头文件里的井口/底孔坐标给出 `wellbore_class`，但那只是初分。`well_trajectory_qc.py` 读取真实轨迹后产出的 `wellbore_class_qc` 才应该作为后续路由优先依据。
+读取 Petrel 导出的井轨迹文本，提取 `MD`、`X`、`Y`、`Z`、`TVD` 五列必要数据，以及可选的 `DX`、`DY`、`AZIM`、`INCL`、`DLS`。
+
+解析失败的硬条件：
+- 文件缺少 `MD/X/Y/Z/TVD` 任一列
+- 有效轨迹点少于 2 个
+- MD 不单调递增
+- XY 全为空或非有限值
+- 文件头缺少 KB 基准面
+
+以上任一触发，该井 `trajectory_status = failed`，不进入后续检查。
+
+### 2. 口径一致性 QC
+
+用轨迹文件头数据和第一步井头数据互相校验：
+
+| 检查项 | 不合格时 |
+|--------|---------|
+| 文件头井名与文件名 stem 不一致 | 硬失败 |
+| 文件头缺少井名 | 警告 |
+| 井口 XY 与第一步井头偏差超过阈值 | 警告 |
+| KB 与第一步井头偏差超过阈值 | 警告 |
+| `Z` 与 `KB - TVD` 偏差超过阈值 | 警告 |
+| MD 或 TVD 出现负值 | 警告 |
+| 必要列中存在非有限值的行被丢弃 | 警告 |
+
+警告不阻塞流程，但会写入 `qc_flags` 列供第四步路由时判断。
+
+### 3. 井型复核 + 工区落点
+
+第一步用井头底孔坐标初分直井/斜井，这里用真实轨迹复核：
+
+- **用最大水平偏移判断，不用井口-底孔偏移。** 有些井中段偏斜明显但底孔又回到井口附近，井口-底孔偏移会漏判。
+- 最大水平偏移 ≤ `vertical_max_offset_m` → `vertical`
+- 最大水平偏移 > `min_deviated_max_offset_m` → `deviated`
+- 两个阈值之间的灰色地带 → `unknown`
+
+如果配置了地震工区，还会把每个轨迹点投影到 inline/xline，统计：
+- 井口和井底在工区内还是工区外
+- 全部轨迹点中有多大比例在工区内
+- 部分轨迹出界的井，按 `allow_partial_outside` 决定是警告还是硬失败
 
 ---
 
-## 输入
-
-- 第一阶段清单：`well_inventory.csv`。
-- 井轨迹目录：`data/all_well_trace`。
-- 地震体或工区：用于把轨迹点投影到 inline/xline，并检查轨迹点是否落在工区内。
-- 可选：井头文件或第一步输出中的 `kb_m`、井口坐标，用于和轨迹文件头互相校验。
-
-建议配置片段：
+## 配置参考
 
 ```yaml
 well_trajectory_qc:
@@ -48,7 +83,7 @@ well_trajectory_qc:
   well_trace_dir: all_well_trace
 
   seismic:
-    file: raw/obn-clipped-240-912-872-1544.zgy
+    file: raw/your-seismic.zgy
     type: zgy
 
   classification:
@@ -67,302 +102,148 @@ well_trajectory_qc:
     sampled_trajectory_dir: trajectory_points
 ```
 
-`source_runs.mode: latest` 表示默认自动寻找最新的 `well_inventory_<timestamp>` 输出。复现实验时可以显式填写 `inventory_file`。
+### `source_runs`
+
+`mode: latest` 时自动发现最新的 `well_inventory_<timestamp>/well_inventory.csv`。复现实验时直接填 `inventory_file` 路径。
+
+### `well_trace_dir`
+
+井轨迹文件目录。文件按 stem 匹配井名（不要求特定扩展名）。
+
+### `classification`
+
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `vertical_max_offset_m` | 30.0 | 最大水平偏移在此以内为直井 |
+| `min_deviated_max_offset_m` | 30.0 | 最大水平偏移大于此值为斜井 |
+| `surface_xy_tolerance_m` | 2.0 | 井口 XY 最大允许偏差 |
+| `kb_tolerance_m` | 0.5 | KB 基准面最大允许偏差 |
+| `z_tvd_tolerance_m` | 0.1 | Z 与 KB-TVD 残差最大允许值 |
+
+`vertical_max_offset_m` 和 `min_deviated_max_offset_m` 可以设为不同值，产生一个"不确定"灰色区间。两个值相等时所有有效轨迹都会被判断为直井或斜井。
+
+### `survey_qc`
+
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `enabled` | true | 是否计算轨迹点的 inline/xline 和工区内外 |
+| `allow_partial_outside` | true | 轨迹部分在工区外时，true=警告，false=硬失败 |
+
+### `output`
+
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `write_trajectory_points` | true | 是否写出逐点 CSV |
+| `sampled_trajectory_dir` | trajectory_points | 逐点 CSV 的子目录名 |
 
 ---
 
-## Petrel 井轨迹格式
+## 井轨迹文件格式
 
-当前数据目录是 `data/all_well_trace`。典型 Petrel 导出文件类似：
-
-```text
-# WELL TRACE FROM PETREL
-# WELL NAME:              A1
-# DEFINITIVE SURVEY:      MD Incl Azim survey 1
-# WELL HEAD X-COORDINATE: 686352.08000000 (m)
-# WELL HEAD Y-COORDINATE: 3217437.84000000 (m)
-# WELL DATUM (KB, Kelly bushing, from MSL): 23.00000000 (m)
-# MD AND TVD ARE REFERENCED (=0) AT WELL DATUM AND INCREASE DOWNWARDS
-# DEPTH (Z, tvd_z) GIVEN IN m-UNITS
-#================================================================================================================================
-      MD            X            Y            Z           TVD           DX          DY          AZIM         INCL         DLS
-#================================================================================================================================
- 0.0000000000 686352.08000 3217437.8400 23.000000000 0.0000000000 ...
-```
-
-有效数据列为空白分隔：
+脚本期望 Petrel 导出的空白分隔文本，文件头包含 `#` 注释行，数据部分首列为 `MD`。必需列：
 
 | 列 | 含义 |
-| --- | --- |
-| `MD` | 测深，从 KB 起算，向下为正，单位 m |
+|---|------|
+| `MD` | 测深，从 KB 起算，向下为正 |
 | `X`, `Y` | 轨迹点平面坐标 |
-| `Z` | Petrel 导出的高程/深度坐标；通常 `Z ~= KB - TVD` |
-| `TVD` | 从 KB 起算的真垂深，向下为正，单位 m |
-| `DX`, `DY` | 相对井口偏移，单位 m |
-| `AZIM` | 方位角，单位度 |
-| `INCL` | 井斜角，单位度 |
-| `DLS` | 狗腿严重度 |
+| `Z` | 高程/深度坐标 |
+| `TVD` | 真垂深，从 KB 起算，向下为正 |
 
-第一版不需要根据 `INCL/AZIM` 重新积分轨迹，应优先使用文件中已经给出的 `MD/X/Y/TVD`。`INCL/AZIM/DLS` 只作为 QC 字段保留。
+可选列（缺失时填 NaN，不影响解析）：`DX`、`DY`、`AZIM`、`INCL`、`DLS`。
 
----
-
-## 核心数据模型
-
-建议在 `src/cup/well/trajectory.py` 中新增项目内主模型：
-
-```text
-WellTrajectory
-```
-
-建议字段：
-
-| 字段 | 含义 |
-| --- | --- |
-| `well_name` | 井名 |
-| `md_m` | 测深 MD，单位 m |
-| `tvd_kb_m` | 从 KB 起算的 TVD，向下为正，单位 m |
-| `tvdss_m` | 项目内部 TVDSS 口径，单位 m |
-| `z_m` | 原始 Petrel `Z` 列 |
-| `x_m`, `y_m` | 轨迹点 XY 坐标 |
-| `dx_m`, `dy_m` | 相对井口偏移 |
-| `azim_deg`, `incl_deg`, `dls` | 轨迹 QC 字段 |
-| `kb_m` | KB 高程 |
-| `metadata` | 来源文件、文件头、QC 信息 |
-
-建议方法：
-
-| 方法 | 功能 |
-| --- | --- |
-| `from_petrel_trace(path)` | 读取 Petrel well trace txt |
-| `to_wtie_wellpath()` | 转成 `wtie.processing.grid.WellPath`，仅作为 wtie Adapter |
-| `with_inline_xline(survey)` | 用 `SurveyContext` 补充轨迹点浮点线号和最近道 |
-| `position_at_md(md)` | 按 MD 插值得到 `x/y/tvdss` 等位置 |
-| `representative_position(policy)` | 返回井口、井底、最大偏移点或目标层代表点 |
-
-`WellTrajectory` 是项目内完整井轨迹模型；`wtie.grid.WellPath` 只表达 `MD/TVDSS/KB`，不能反过来主导项目设计。
+轨迹里的 `Z` 和 `TVD` 应满足 `Z ≈ KB - TVD`。脚本计算残差 `Z - (KB - TVD)`，超过 `z_tvd_tolerance_m` 时发出警告。
 
 ### TVDSS 口径
 
-项目内第一版沿用现有 checkshot/tdt 处理习惯：
-
-```text
-tvdss_m = tvd_kb_m - kb_m
-```
-
-读取 Petrel 轨迹时同时检查：
-
-```text
-z_m ~= kb_m - tvd_kb_m
-```
-
-这个换算必须集中在 `cup.well.trajectory` 或后续 `cup.well.depth_time` Adapter 中实现，脚本层不要临时散写 `tvdss = tvd - kb` 或 `tvdss = kb - z`。
-
-注意：现有 Petrel 时深表导入/导出 Adapter 里仍有历史口径，第四步把已有时深表和 `WellTrajectory.to_wtie_wellpath()` 拼接前，必须在 `cup.well.depth_time` 中显式统一 TDT 的 TVDSS 口径。本脚本只产出轨迹侧的 `tvd_kb_m/tvdss_m/z_m` 事实和一致性 QC，不在这里静默修正旧 TDT。
+脚本内部按 `tvdss_m = tvd_kb_m - kb_m` 计算。这个换算只在本模块和后续时深转换模块中实现，后续脚本不要自己散写这份逻辑。
 
 ---
 
-## QC 规则
+## 输出文件
 
-### 文件级 QC
+所有文件在 `<output_root>/well_trajectory_qc_<timestamp>/` 下：
 
-| 检查 | 处理 |
-| --- | --- |
-| 文件无法解析 | `trajectory_status = failed` |
-| 缺少 `MD/X/Y/TVD` 必要列 | `trajectory_status = failed` |
-| 有效轨迹点少于 2 个 | `trajectory_status = failed` |
-| `MD` 非单调递增 | `trajectory_status = failed` 或排序后写警告，第一版建议失败 |
-| `X/Y` 全为空或非有限值 | `trajectory_status = failed` |
-
-### 口径一致性 QC
-
-| 检查 | 处理 |
-| --- | --- |
-| 文件头井名与文件名 stem 不一致 | `qc_flags += name_mismatch` |
-| 文件头井口 XY 与第一步井头 XY 超过阈值 | `qc_flags += surface_xy_mismatch` |
-| 文件头 KB 与第一步 `kb_m` 超过阈值 | `qc_flags += kb_mismatch` |
-| `Z` 与 `KB - TVD` 偏差超过阈值 | `qc_flags += z_tvd_inconsistent` |
-| `TVD` 或 `MD` 出现明显负值 | `qc_flags += invalid_depth_values` |
-
-这些 QC flag 不一定导致失败，但第四步路由时应能读取并按配置决定是否拒绝。
-
-### 井型复核
-
-建议计算：
-
-```text
-surface_to_bottom_offset_m = hypot(x_last - x_first, y_last - y_first)
-max_horizontal_offset_m = max(hypot(x_i - x_first, y_i - y_first))
-```
-
-井型判定第一版可以简单使用：
-
-| 条件 | `wellbore_class_qc` |
-| --- | --- |
-| 轨迹解析失败 | `unknown` |
-| `max_horizontal_offset_m <= vertical_max_offset_m` | `vertical` |
-| `max_horizontal_offset_m > min_deviated_max_offset_m` | `deviated` |
-| 其他 | `unknown` |
-
-注意这里使用 `max_horizontal_offset_m`，不是只看井口到底孔偏移。某些轨迹可能中段偏移明显、底孔又回到井口附近，只看底孔会误判。
-
-### 工区内外 QC
-
-如果配置了 `survey_qc.enabled`，脚本应使用 `SurveyContext.coord_to_line()` 或后续 trace/index Adapter 计算每个轨迹点的：
-
-- `inline_float`
-- `xline_float`
-- `nearest_inline`
-- `nearest_xline`
-- `survey_position`
-
-这里必须遵守 `AGENTS.md` 的线号步长约定：`geometry["inline_step"]` / `xline_step` 是线号步长，不是 XY 米制距离；最近线号必须按轴吸附，不能直接 `round(inline_float)`。
-
-对于斜井，井口可能在工区外，但目标层轨迹段进入工区；也可能井口在工区内，但深部轨迹出界。因此 `well_trajectory_qc.py` 不应该只输出一个简单的井口 `survey_position`，还应该统计：
+### `well_trajectory_qc.csv` — 每井一行
 
 | 字段 | 含义 |
-| --- | --- |
-| `trajectory_inside_fraction` | 全轨迹点中位于工区内的比例 |
-| `trajectory_inside_sample_count` | 位于工区内的轨迹点数 |
-| `trajectory_outside_sample_count` | 位于工区外的轨迹点数 |
-| `surface_survey_position` | 井口位置相对工区 |
-| `bottom_survey_position` | 井底位置相对工区 |
-
-当 `allow_partial_outside: true` 时，部分轨迹在工区外的井会保留为非致命 warning，并在 `qc_flags` 中写入 `partial_outside_survey`。当该开关为 false 时，这类井会被本脚本标记为 failed。第四步仍应读取 inside/outside 统计，并按 route 决定是否接受。
-
----
-
-## 输出
-
-默认输出目录建议为：
-
-```text
-scripts/output/well_trajectory_qc_<timestamp>/
-```
-
-核心文件：
-
-- `well_trajectory_qc.csv`：一井一行的轨迹 QC 和井型复核结果。
-- `trajectory_points/*.csv`：可选，一口井一个轨迹点表，供人工抽查或后续复用。
-- `failed_trajectories.csv`：解析失败或关键 QC 失败的井。
-- `run_summary.json`：输入、配置、井型统计、失败统计。
-
-### `well_trajectory_qc.csv`
-
-建议字段：
-
-| 字段 | 含义 |
-| --- | --- |
-| `well_name` | 统一井名 |
+|------|------|
+| `well_name` | 井名 |
 | `trajectory_file` | 轨迹文件路径 |
-| `trajectory_status` | `passed`、`warning`、`failed`、`missing` |
-| `wellbore_class_initial` | 第一阶段井头底孔坐标初分 |
-| `wellbore_class_qc` | 轨迹复核井型 |
+| `trajectory_status` | `passed` / `warning` / `failed` / `missing` |
+| `wellbore_class_initial` | 第一步井头底孔坐标初分 |
+| `wellbore_class_qc` | 轨迹复核后的井型 |
 | `class_changed` | 初分和复核是否不同 |
 | `point_count` | 轨迹点数量 |
-| `md_min_m`, `md_max_m` | MD 范围 |
-| `tvd_kb_min_m`, `tvd_kb_max_m` | TVD 范围 |
-| `tvdss_min_m`, `tvdss_max_m` | TVDSS 范围 |
-| `surface_x_m`, `surface_y_m` | 轨迹井口 XY |
-| `bottom_x_m`, `bottom_y_m` | 轨迹末点 XY |
-| `surface_to_bottom_offset_m` | 井口到轨迹末点水平偏移 |
+| `md_min_m` / `md_max_m` | MD 范围 |
+| `tvd_kb_min_m` / `tvd_kb_max_m` | TVD 范围 |
+| `tvdss_min_m` / `tvdss_max_m` | TVDSS 范围 |
+| `surface_x_m` / `surface_y_m` | 轨迹井口 XY |
+| `bottom_x_m` / `bottom_y_m` | 轨迹末点 XY |
+| `surface_to_bottom_offset_m` | 井口到末点水平偏移 |
 | `max_horizontal_offset_m` | 相对井口最大水平偏移 |
 | `max_incl_deg` | 最大井斜角 |
 | `max_dls` | 最大狗腿严重度 |
 | `surface_survey_position` | 井口相对工区位置 |
 | `bottom_survey_position` | 井底相对工区位置 |
-| `trajectory_inside_fraction` | 轨迹点在工区内比例 |
-| `qc_flags` | 分号分隔的警告 |
+| `trajectory_inside_fraction` | 轨迹点在工区内的比例 |
+| `trajectory_inside_sample_count` | 工区内轨迹点数 |
+| `trajectory_outside_sample_count` | 工区外轨迹点数 |
+| `qc_flags` | 分号分隔的警告标签 |
 | `reasons` | 失败或拒绝原因 |
 
-### `trajectory_points/<well>.csv`
+### `trajectory_points/<well>.csv` — 每口井逐轨迹点
 
-建议字段：
+仅当 `output.write_trajectory_points: true` 时写出。每行包含该轨迹点的 MD、TVD、TVDSS、Z、XY、DX/DY、井斜角、方位角、DLS、浮点线号、最近线号、工区内外。
 
-| 字段 | 含义 |
-| --- | --- |
-| `well_name` | 井名 |
-| `sample_index` | 轨迹点序号 |
-| `md_m` | MD |
-| `tvd_kb_m` | TVD from KB |
-| `tvdss_m` | 项目内部 TVDSS |
-| `z_m` | 原始 Petrel Z |
-| `x_m`, `y_m` | XY 坐标 |
-| `dx_m`, `dy_m` | 相对井口偏移 |
-| `azim_deg`, `incl_deg`, `dls` | 原始井斜字段 |
-| `inline_float`, `xline_float` | 浮点线号 |
-| `nearest_inline`, `nearest_xline` | 最近线号 |
-| `survey_position` | 该轨迹点相对工区位置 |
+### `failed_trajectories.csv`
 
-点表可能较大，因此建议配置为可选输出；但第一轮开发时建议开启，方便人工抽查。
+`trajectory_status` 为 `failed` 或 `missing` 的井子集，方便快速排查。
+
+### `run_summary.json`
+
+输入路径、配置阈值、各状态计数、井型分布、初分与复核不一致的井数。
 
 ---
 
-## 与其他步骤的关系
+## 如何阅读结果
 
-### 与 `well_inventory.py`
+### 第一步：看终端输出
 
-第一步只检查轨迹文件是否存在，并基于井头文件给出井型初分。它不解析轨迹文件。
-
-`well_trajectory_qc.py` 读取第一步的主清单，主要复用：
-
-- `well_name`
-- `has_well_trace`
-- `surface_x/surface_y`
-- `bottom_x/bottom_y`
-- `kb_m`
-- `wellbore_class`
-- `survey_position`
-
-输出中的 `wellbore_class_initial` 应来自第一步，`wellbore_class_qc` 来自真实轨迹。
-
-### 与 `las_curve_screen.py` / `log_preprocess.py`
-
-LAS 筛选和曲线预处理不消费轨迹 QC 产物。它们可以和轨迹 QC 并行运行。
-
-因此不要因为新增轨迹 QC 就重排已有脚本编号。`well_trajectory_qc.py` 是第四步之前的条件依赖，而不是第二、第三步的前置条件。
-
-### 与 `well_auto_tie.py`
-
-第四步路由应优先读取 `well_trajectory_qc.csv`：
-
-- 对 `vertical_with_tdt`，如果没有轨迹 QC，可退回第一步 `wellbore_class_initial`。
-- 对 `deviated_with_tdt`，必须要求 `trajectory_status in {passed, warning}` 且 `wellbore_class_qc = deviated`。
-- 对轨迹 QC 失败的斜井，应拒绝进入斜井路径。
-- 对 `class_changed = true` 的井，应写入 `well_tie_plan.csv`，方便人工复核。
-
-第四步不应该重新实现 Petrel 轨迹解析；如果需要轨迹点，直接读取本步骤产物或调用 `cup.well.trajectory`。
-
-### 与 `deviated-well-src-cup-refactor.md`
-
-`deviated-well-src-cup-refactor.md` 保持跨步骤架构文档定位，不作为脚本操作指南。本文只落地其中的第一块能力：
-
-```text
-Petrel trace -> WellTrajectory -> trajectory QC
+```
+Wrote trajectory QC for 103 wells to ... ({'passed': 80, 'warning': 18, 'failed': 3, 'missing': 2}).
 ```
 
-后续的 `WellSpatialSampleSet`、LFM 斜井控制点、GINN anchor 点聚合仍放在重构规划文档和对应步骤文档里展开。
+`failed` + `missing` 越少越好。`warning` 井需要检查 `qc_flags` 判断是否影响后续路由。
 
----
+### 第二步：看 class_changed
 
-## 第一版实现范围
+在 `well_trajectory_qc.csv` 中筛选 `class_changed == True`：
 
-第一版建议只做这些：
+- 初分 `vertical`、复核 `deviated` → 这口井的井头底孔坐标不准，必须走斜井路径
+- 初分 `deviated`、复核 `vertical` → 可能是井头数据有误，或以直井对待即可
 
-1. 解析 `data/all_well_trace` 下的 Petrel 轨迹文件。
-2. 新增 `WellTrajectory` 数据模型。
-3. 输出 `well_trajectory_qc.csv`。
-4. 可选输出 `trajectory_points/*.csv`。
-5. 用真实轨迹复核直井/斜井。
-6. 做 `Z ~= KB - TVD`、井口 XY、KB、MD 单调等基础 QC。
-7. 如果给定地震工区，计算轨迹点 inline/xline 和工区内外统计。
+这些变更直接影响第四步的路由决策。
 
-第一版暂不做：
+### 第三步：看 qc_flags
 
-- 根据 `INCL/AZIM` 重新积分轨迹。
-- 把轨迹采样到 TWT 轴。
-- 沿斜井轨迹读取地震道。
-- 生成 LFM 或 GINN 约束点。
-- 自动修正错误轨迹。
+警告标签的含义：
 
-这些能力属于第四步、后续斜井重构或 `cup.seismic.trace_sampling` 的范围。
+| flag | 含义 |
+|------|------|
+| `surface_xy_mismatch` | 轨迹文件头井口 XY 与井头不一致 |
+| `kb_mismatch` | 轨迹文件头 KB 与井头不一致 |
+| `z_tvd_inconsistent` | Z 与 KB-TVD 残差超限 |
+| `invalid_depth_values` | MD 或 TVD 出现负值 |
+| `invalid_required_rows_dropped` | 部分行因必要列为空被丢弃 |
+| `missing_header_well_name` | 文件头没有井名 |
+| `partial_outside_survey` | 轨迹部分在工区外 |
+
+大多数警告不影响使用，但 `z_tvd_inconsistent` 值得优先排查——它意味着 Z 和 TVD 至少有一列不可信。
+
+### 第四步：看部分出界的井
+
+筛选 `trajectory_inside_fraction` 在 0.3-0.7 之间的井。井口可能在工区外但目标层段进入了工区，或反之。第四步是否接受这类井，取决于 auto-tie 配置。
+
+### 第五步：抽查一口井的轨迹点
+
+打开 `trajectory_points/<well>.csv`，看 `incl_deg` 列的最大值、`x_m`/`y_m` 随 MD 的变化趋势，对斜井形成直观印象。

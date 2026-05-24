@@ -72,7 +72,7 @@ def build_file_lookup(files: Iterable[Path], *, asset_label: str) -> dict[str, P
 
 def is_finite_number(value: object) -> bool:
     try:
-        return bool(np.isfinite(float(value)))
+        return bool(np.isfinite(float(value)))  # type: ignore
     except (TypeError, ValueError):
         return False
 
@@ -80,7 +80,7 @@ def is_finite_number(value: object) -> bool:
 def optional_float(value: object) -> float | None:
     if not is_finite_number(value):
         return None
-    return float(value)
+    return float(value)  # type: ignore
 
 
 def classify_wellbore(
@@ -96,7 +96,7 @@ def classify_wellbore(
     if any(v is None for v in coords):
         return "unknown", None
 
-    sx, sy, bx, by = (float(v) for v in coords)
+    sx, sy, bx, by = (float(v) for v in coords)  # type: ignore
     offset = float(np.hypot(bx - sx, by - sy))
     if offset <= float(vertical_bottom_offset_threshold_m):
         return "vertical", offset
@@ -276,7 +276,9 @@ def build_platform_clusters(
     for i, left in enumerate(valid):
         for j in range(i + 1, len(valid)):
             right = valid[j]
-            distance = float(np.hypot(float(right.surface_x) - float(left.surface_x), float(right.surface_y) - float(left.surface_y)))
+            distance = float(
+                np.hypot(float(right.surface_x) - float(left.surface_x), float(right.surface_y) - float(left.surface_y))  # type: ignore
+            )
             if distance <= threshold:
                 union(i, j)
 
@@ -303,8 +305,8 @@ def build_cluster_rows(
                 WellClusterRow(
                     cluster_id=cluster_id,
                     well_name=record.well_name,
-                    surface_x=float(record.surface_x),
-                    surface_y=float(record.surface_y),
+                    surface_x=float(record.surface_x),  # type: ignore
+                    surface_y=float(record.surface_y),  # type: ignore
                     wellbore_class=record.wellbore_class,
                     survey_position=record.survey_position,
                     nearest_inline=record.nearest_inline,
@@ -342,7 +344,9 @@ def build_neighbor_pairs(
     for i, left in enumerate(valid):
         for j in range(i + 1, len(valid)):
             right = valid[j]
-            distance = float(np.hypot(float(right.surface_x) - float(left.surface_x), float(right.surface_y) - float(left.surface_y)))
+            distance = float(
+                np.hypot(float(right.surface_x) - float(left.surface_x), float(right.surface_y) - float(left.surface_y))  # type: ignore
+            )
             same_platform = distance <= platform_threshold
             same_trace = (
                 left.nearest_inline is not None
@@ -388,4 +392,4 @@ def build_neighbor_pairs(
 
 def value_counts(records: Sequence[WellInventoryRecord], field_name: str) -> dict[str, int]:
     values = [str(getattr(record, field_name)) for record in records]
-    return dict(sorted(pd.Series(values, dtype="object").value_counts(dropna=False).astype(int).to_dict().items()))
+    return dict(sorted(pd.Series(values, dtype="object").value_counts(dropna=False).astype(int).to_dict().items()))  # type: ignore

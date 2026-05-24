@@ -7,15 +7,14 @@ scripts so later deviated-well steps can reuse the same geometry facts.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-import re
 from typing import Any, Mapping
 
 import numpy as np
 
 from wtie.processing import grid
-
 
 _HEADER_PATTERNS = {
     "well_name": re.compile(r"^#\s*WELL NAME:\s*(?P<value>.+?)\s*$", re.IGNORECASE),
@@ -27,7 +26,7 @@ _HEADER_PATTERNS = {
 
 def _optional_float(value: object) -> float | None:
     try:
-        number = float(value)
+        number = float(value)  # type: ignore
     except (TypeError, ValueError):
         return None
     if not np.isfinite(number):
@@ -130,11 +129,7 @@ class WellTrajectory:
         z_m = col("z")
         tvd_kb_m = col("tvd")
         valid_required = (
-            np.isfinite(md_m)
-            & np.isfinite(x_m)
-            & np.isfinite(y_m)
-            & np.isfinite(z_m)
-            & np.isfinite(tvd_kb_m)
+            np.isfinite(md_m) & np.isfinite(x_m) & np.isfinite(y_m) & np.isfinite(z_m) & np.isfinite(tvd_kb_m)
         )
         valid_count = int(np.count_nonzero(valid_required))
         if valid_count < 2:
@@ -278,7 +273,9 @@ def trajectory_summary(trajectory: WellTrajectory) -> Mapping[str, float | int |
         "surface_y_m": float(trajectory.y_m[0]),
         "bottom_x_m": float(trajectory.x_m[-1]),
         "bottom_y_m": float(trajectory.y_m[-1]),
-        "surface_to_bottom_offset_m": float(np.hypot(trajectory.x_m[-1] - trajectory.x_m[0], trajectory.y_m[-1] - trajectory.y_m[0])),
+        "surface_to_bottom_offset_m": float(
+            np.hypot(trajectory.x_m[-1] - trajectory.x_m[0], trajectory.y_m[-1] - trajectory.y_m[0])
+        ),
         "max_horizontal_offset_m": float(np.nanmax(offsets)),
         "max_incl_deg": finite_max(trajectory.incl_deg),
         "max_dls": finite_max(trajectory.dls),

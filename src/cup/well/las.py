@@ -102,7 +102,9 @@ def scan_las_curves(path: Path) -> tuple[LasHeader, list[CurveInfo]]:
     return header, curves
 
 
-def _resolve_curve_index(curve_index: dict[str, int], normalized_index: dict[str, list[int]], mnemonic: str) -> int | None:
+def _resolve_curve_index(
+    curve_index: dict[str, int], normalized_index: dict[str, list[int]], mnemonic: str
+) -> int | None:
     exact = exact_mnemonic(mnemonic)
     if exact in curve_index:
         return curve_index[exact]

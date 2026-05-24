@@ -4,13 +4,15 @@
 
 它接在 `log_preprocess.py` 后面，负责把井曲线、时深关系、地震道和子波提取流程组织起来，产出每口井的井震标定结果。虽然历史深度域脚本叫 `vertical_well_auto_tie_depth.py`，但时间域第一版建议不要继续叫 `vertical_well_auto_tie.py`，因为本脚本需要同时路由直井和斜井。
 
-第一版先实现三条路径：
+第一版按复杂度递增实现三条路径：
 
 1. 有时深、直井。
 2. 没有时深、有井分层、直井。
 3. 有时深、有井轨迹、斜井。
 
 没有时深、有井轨迹、有井分层的斜井路径先只识别并拒绝，不实现。
+
+按当前已跑通的前三步产物估算，前三条可实现路径分别对应 `6 + 2 + 4 = 12` 口井。实现时不要三条路径并行铺开，建议先完成路径 1 的端到端闭环，再接路径 2 的锚点建表，最后处理路径 3 的斜井轨迹取道。
 
 ## 目标
 
@@ -33,10 +35,10 @@
 - 时深表目录：`data/time_depth_table`。
 - 井轨迹目录：`data/all_well_trace`。
 - 井分层文件：`data/raw/well_tops`。
-- 地震解释层位：例如 `data/interpre/H3-1`、`data/interpre/H7-3`。
+- 地震解释层位：例如 `data/interpre/H3-1`、`data/interpre/H7-1`。
 - 地震体：`data/raw/obn-clipped-240-912-872-1544.zgy`。
 - 子波提取网络：沿用深度域 auto-tie 的 `tutorial_model` 和 `tutorial_params`。
-- 可选锚点配置：没有时深时，指定井分层和地震解释层位的对应关系。
+- 可选锚点配置：没有时深时，指定一组井分层和地震解释层位的对应关系。
 
 建议配置片段：
 
@@ -58,7 +60,7 @@ well_auto_tie:
   well_tops_file: raw/well_tops
   interpretation:
     top_horizon: interpre/H3-1
-    bottom_horizon: interpre/H7-3
+    bottom_horizon: interpre/H7-1
   seismic:
     file: raw/obn-clipped-240-912-872-1544.zgy
     type: zgy
@@ -68,7 +70,16 @@ well_auto_tie:
     - vertical_anchor_from_tops
     - deviated_with_tdt
 
-  anchor_config_file: experiments/well_auto_tie_anchors.yaml
+  implementation_order:
+    - vertical_with_tdt
+    - vertical_anchor_from_tops
+    - deviated_with_tdt
+
+  coarse_anchor:
+    enabled: true
+    apply_to_routes:
+      - vertical_anchor_from_tops
+    config_file: experiments/well_auto_tie_anchors.yaml
 
   tutorial_model: tutorial/trained_net_state_dict.pt
   tutorial_params: tutorial/network_parameters.yaml
@@ -98,6 +109,13 @@ well_auto_tie:
 `source_runs.mode: latest` 表示脚本自动从 `scripts/output` 下寻找最新的前置产物。若需要复现实验，可以显式填写 `inventory_file`、`curve_screen_file`、`preprocess_status_file` 和 `preprocessed_las_dir`。不要把 `YYYYMMDD_HHMMSS` 占位符长期写死在配置里。
 
 `target_crop_ms` 是井震标定时围绕目的层裁剪地震和合成记录的时间窗，示例值 `201.0` 只对应当前工区的初始经验值。正式落地时应从目标层厚度、地震主频、子波有效长度和采样间隔共同推导，至少允许按工区配置覆盖。
+
+`coarse_anchor` 是进入 `wtie` 细标定前的粗标定配置。它不是手填整体偏移，而是用人工指定的一组 `well_top -> horizon` 锚点自动建立初始时间基准：
+
+- 对无时深直井路线，锚点用于给声波积分提供绝对 TWT 基准，第一版默认启用。
+- 对有时深路线，锚点可以用于计算原始时深表的整体 TWT shift，但默认关闭；只有显式把 `vertical_with_tdt` 或 `deviated_with_tdt` 加入 `apply_to_routes` 时才执行。
+
+当前工区第一版统一使用 `H3-1` 作为锚点。`H7-1` 作为解释层位资产保留，但不参与第一版锚定建表。
 
 ## 输出
 
@@ -197,30 +215,55 @@ scripts/output/well_auto_tie_<timestamp>/
 
 `well_tie_plan.csv` 应同时保留 `wellbore_class_initial` 和 `wellbore_class_qc`。路由可以先用初分井型生成候选 plan，但执行前必须用轨迹 QC 更新最终路径；如果复核结果和初分冲突，写入 `reasons`。
 
+当前数据按前三步结果路由后，第一版优先实现的路径数量为：
+
+| route | 数量 | 当前井 |
+| --- | ---: | --- |
+| `vertical_with_tdt` | 6 | `PH1`、`PH13`、`PH2`、`PH3`、`PH4`、`PH5` |
+| `vertical_anchor_from_tops` | 2 | `B3`、`BG2` |
+| `deviated_with_tdt` | 4 | `BA6S`、`PH6`、`PH7`、`PH8` |
+
+这也是推荐实现顺序。`deviated_anchor_from_tops` 当前有较多候选井，但同时缺少时深表且需要斜井锚点积分，第一版只写入拒绝结果。
+
 ## 路径一：有时深、直井
 
-`vertical_with_tdt` 是最接近现有深度域 `vertical_well_auto_tie_depth.py` 的路径。
+`vertical_with_tdt` 是最接近现有深度域 `vertical_well_auto_tie_depth.py` 的路径，也是第四步第一版应最先落地的端到端闭环。
 
 处理逻辑：
 
 1. 读取预处理 LAS，取 `DT_USM` 和 `RHO_GCC`。
 2. 将慢度 `DT_USM` 转成速度 `Vp`，和密度构造 `grid.LogSet`。
 3. 读取该井已有时深表，构造 `grid.TimeDepthTable`。
-4. 在井口 XY 处读取时间域地震道。
-5. 用已有时深表作为初始 table，调用 `autotie.tie_v1` 做微调。
-6. 裁剪并能量归一化子波，输出优化后时深表和 QC。
+4. 默认直接使用原始时深表；如果显式对 `vertical_with_tdt` 启用 `coarse_anchor`，才用锚点计算整体 TWT shift，并生成 `shifted_initial_tdt`。
+5. 在井口 XY 处读取时间域地震道。
+6. 用粗标定后的时深表作为初始 table，调用 `autotie.tie_v1` 做微调。
+7. 裁剪并能量归一化子波，输出优化后时深表和 QC。
 
 这条路径不再像深度域脚本那样从 Vp 从零构造本地时深表，而是以已有时深表为初始约束。Vp 主要用于生成反射系数和合成记录。
 
+可选锚点粗标定计算方式：
+
+```text
+anchor_md = well_top(H3-1).MD
+anchor_twt = horizon(H3-1).TWT at well XY
+tdt_twt_at_anchor = interp(original_tdt, anchor_md)
+coarse_shift_s = anchor_twt - tdt_twt_at_anchor
+shifted_tdt.twt = original_tdt.twt + coarse_shift_s
+```
+
+这样既保留原始时深表的形状，又用井分层和解释层位把整体时间基准拉到合理位置。`wtie` 后续只负责细标定。但这条路径默认不执行该步骤，避免在已有时深表质量未知前自动改动全部有时深井。
+
 ## 路径二：无时深、有井分层、直井
 
-`vertical_anchor_from_tops` 用人工选定的层位锚点构造初始时深表。
+`vertical_anchor_from_tops` 用人工选定的层位锚点构造初始时深表。它是第二个实现路径：先只面向直井，先把锚点建表和 wtie 细标定跑通，再考虑更复杂的斜井无时深路径。
 
 前置条件：
 
 - 井分层文件中有该井的目标层位 MD。
 - 地震解释层位能在井口 XY 处取到 TWT。
-- 人工配置明确哪个井分层对应哪个地震强轴或解释层位。
+- 人工配置明确哪一个井分层对应哪一个地震强轴或解释层位。
+
+当前工区路径 2 的锚点统一使用 `H3-1`。`H7-1` 可以继续作为解释层位资产保留，但第一版不参与锚定建表。
 
 锚点配置示例：
 
@@ -232,7 +275,7 @@ anchors:
     event: peak
     twt_unit: s
   wells:
-    A1:
+    BG2:
       well_top: H3-1
       horizon: interpre/H3-1
       event: peak
@@ -241,8 +284,8 @@ anchors:
 处理逻辑：
 
 1. 从井分层得到锚点 MD。
-2. 从地震解释层位得到井口处锚点 TWT。
-3. 从锚点开始，沿井曲线向上、向下积分纵波慢度，生成初始 TWT-MD 表。
+2. 从地震解释层位得到井口处对应锚点 TWT。
+3. 从该锚点开始，沿井曲线向上、向下积分纵波慢度。
 4. 直井第一版近似 `MD ~= TVD`；如果后续发现直井也有明显偏斜，转入斜井路径。
 5. 用该初始 table 调用 `autotie.tie_v1` 微调。
 
@@ -256,19 +299,24 @@ dTWT_s = 2 * DT_USM * dZ_m * 1e-6
 
 这条路径只适用于经过复核仍可近似为直井的井。只要轨迹显示 MD 与 TVD 差异不可忽略，就不能使用这个积分近似，应转入斜井路径或拒绝。
 
+第一版只允许一组锚点，避免多层位约束和声波积分之间的误差分配问题。后续如果确实需要顶底双锚点，再单独扩展建表逻辑。
+
+注意：路径 1 和路径 2 可以使用同一份锚点配置，但默认只有路径 2 使用。路径 1 只有显式开启时，才用锚点修正已有时深表的整体时间偏移；路径 2 没有已有时深表，锚点本身就是声波积分的绝对时间基准。
+
 ## 路径三：有时深、有井轨迹、斜井
 
-`deviated_with_tdt` 是第一版新增的关键路径。
+`deviated_with_tdt` 是第一版新增的关键路径，但实现顺序排在路径 1 和路径 2 之后。原因是它不再只取井口地震道，而要把已有时深表、井轨迹和地震取样串起来。
 
 处理逻辑：
 
 1. 读取预处理 LAS，构造 `grid.LogSet`。
 2. 读取已有时深表，构造 `grid.TimeDepthTable`。
 3. 读取井轨迹文件，得到 MD、X、Y、TVD/TVDSS 的关系。
-4. 将时深表和井轨迹对齐：用 TWT 反查 MD，再由 MD 插值得到对应 XY。
-5. 沿时间采样轴，从地震体中按 `XY(TWT)` 抽取轨迹地震道。
-6. 用轨迹地震道、井曲线和已有时深表调用 `autotie.tie_v1` 微调。
-7. 输出轨迹地震道、优化后时深表、子波和 QC。
+4. 默认直接使用原始时深表；如果显式对 `deviated_with_tdt` 启用 `coarse_anchor`，才用锚点计算整体 TWT shift。斜井锚点的 horizon TWT 应在锚点 MD 对应的轨迹 XY 处读取，而不是默认井口 XY。
+5. 将粗标定后的时深表和井轨迹对齐：用 TWT 反查 MD，再由 MD 插值得到对应 XY。
+6. 沿时间采样轴，从地震体中按 `XY(TWT)` 抽取轨迹地震道。
+7. 用轨迹地震道、井曲线和已有时深表调用 `autotie.tie_v1` 微调。
+8. 输出轨迹地震道、优化后时深表、子波和 QC。
 
 关键点：
 
@@ -380,11 +428,11 @@ dTWT_s = 2 * DT_USM * dZ_m * 1e-6
 ## 已定策略
 
 - 第四步使用一个脚本 `well_auto_tie.py`，内部按 route 分发，不拆成三个脚本。
-- 第一版实现 `vertical_with_tdt`、`vertical_anchor_from_tops`、`deviated_with_tdt`。
+- 第一版实现 `vertical_with_tdt`、`vertical_anchor_from_tops`、`deviated_with_tdt`，实现顺序固定为路径 1 -> 路径 2 -> 路径 3。
 - `deviated_anchor_from_tops` 第一版拒绝。
 - 斜井路径依赖井轨迹/井斜文件，不依赖 LAS 井径曲线。
 - 有时深的路径以已有时深表为初始 table，再用 `wtie` 微调。
-- 无时深直井路径需要人工锚点配置，不能全自动猜强轴。
+- 无时深直井路径需要人工锚点配置，当前锚点统一使用 `H3-1`，不能全自动猜强轴。
 - 模块边界以 `deviated-well-src-cup-refactor.md` 为准：`cup.well.tie` 只放 auto-tie 编排和 wtie Adapter；时深/曲线转换、轨迹、空间样点、地震取样分别进入 `cup.well.depth_time`、`cup.well.trajectory`、`cup.well.spatial_samples` 和 `cup.seismic.trace_sampling`。
 
 ## 留到第二轮

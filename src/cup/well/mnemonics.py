@@ -97,9 +97,7 @@ CURVE_CATEGORY_MNEMONICS = {
         "P34H",
         "P40H",
     ),
-    "spontaneous_potential": (
-        "SP",
-    ),
+    "spontaneous_potential": ("SP",),
     "porosity": (
         "POR",
         "PHIE",
@@ -173,9 +171,7 @@ CURVE_CATEGORY_PRIORITY = {
         "RS",
         "RXO",
     ),
-    "spontaneous_potential": (
-        "SP",
-    ),
+    "spontaneous_potential": ("SP",),
     "porosity": (
         "POR",
         "PHIE",

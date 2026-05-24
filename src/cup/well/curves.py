@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import re
+from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
 from cup.well.mnemonics import CURVE_CATEGORY_MNEMONICS, CURVE_CATEGORY_PRIORITY

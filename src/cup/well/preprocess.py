@@ -169,7 +169,9 @@ def normalize_unit(unit: object) -> str:
     return text
 
 
-def values_to_nan(values: object, *, null_value: float | None = None, sentinels: Sequence[float] = DEFAULT_MISSING_SENTINELS) -> np.ndarray:
+def values_to_nan(
+    values: object, *, null_value: float | None = None, sentinels: Sequence[float] = DEFAULT_MISSING_SENTINELS
+) -> np.ndarray:
     """Convert numeric values to float and replace known missing sentinels with NaN."""
     out = np.asarray(values, dtype=float).copy()
     missing = ~np.isfinite(out)
@@ -474,7 +476,11 @@ def threshold_from_overrides(
         for candidate_well, curves in well_curve.items():
             if str(candidate_well).strip().casefold() != str(well_name).strip().casefold():
                 continue
-            if isinstance(curves, Mapping) and standard_mnemonic in curves and isinstance(curves[standard_mnemonic], Mapping):
+            if (
+                isinstance(curves, Mapping)
+                and standard_mnemonic in curves
+                and isinstance(curves[standard_mnemonic], Mapping)
+            ):
                 spec = curves[standard_mnemonic]
                 return CurveThreshold(
                     standard_mnemonic=standard_mnemonic,
@@ -484,7 +490,11 @@ def threshold_from_overrides(
                     sample_count=0,
                 )
     global_spec = overrides.get("global", {})
-    if isinstance(global_spec, Mapping) and standard_mnemonic in global_spec and isinstance(global_spec[standard_mnemonic], Mapping):
+    if (
+        isinstance(global_spec, Mapping)
+        and standard_mnemonic in global_spec
+        and isinstance(global_spec[standard_mnemonic], Mapping)
+    ):
         spec = global_spec[standard_mnemonic]
         return CurveThreshold(
             standard_mnemonic=standard_mnemonic,
@@ -495,7 +505,9 @@ def threshold_from_overrides(
         )
     return auto_thresholds.get(
         standard_mnemonic,
-        CurveThreshold(standard_mnemonic=standard_mnemonic, lower=None, upper=None, source="missing_threshold", sample_count=0),
+        CurveThreshold(
+            standard_mnemonic=standard_mnemonic, lower=None, upper=None, source="missing_threshold", sample_count=0
+        ),
     )
 
 
@@ -511,7 +523,9 @@ def remove_outliers(values: np.ndarray, threshold: CurveThreshold) -> OutlierRem
     """Set values outside a resolved threshold to NaN."""
     cleaned = np.asarray(values, dtype=float).copy()
     if threshold.lower is None and threshold.upper is None:
-        return OutlierRemoval(values=cleaned, replaced_points=0, lower=None, upper=None, threshold_source=threshold.source)
+        return OutlierRemoval(
+            values=cleaned, replaced_points=0, lower=None, upper=None, threshold_source=threshold.source
+        )
     mask = np.zeros(cleaned.shape, dtype=bool)
     finite = np.isfinite(cleaned)
     if threshold.lower is not None:

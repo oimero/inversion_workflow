@@ -332,7 +332,7 @@ def process_well(
     output_dirs: dict[str, Path],
 ) -> dict[str, Any]:
     from cup.petrel.export import export_logsets_to_las
-    from cup.petrel.load import load_vp_rho_logset_from_las
+    from cup.petrel.load import old_load_vp_rho_logset_from_las
     from cup.utils.raw_trace import zscore_trace
     from wtie.optimize import tie as tie_utils
     from wtie.processing import grid
@@ -347,7 +347,7 @@ def process_well(
     if not (geometry_depth["xline_min"] <= xl_float <= geometry_depth["xline_max"]):
         raise ValueError(f"Crossline outside survey range: {xl_float}")
 
-    logset_md = load_vp_rho_logset_from_las(las_file, vp_unit=las_vp_unit, rho_unit=las_rho_unit)
+    logset_md = old_load_vp_rho_logset_from_las(las_file, vp_unit=las_vp_unit, rho_unit=las_rho_unit)
     md_m = logset_md.basis.astype(float)
     tvdss_m = md_m - kb_m
     vp_mps = interpolate_nans(logset_md.Vp.values, method="linear")

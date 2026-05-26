@@ -120,7 +120,7 @@ def collect_well_records(
     vp_unit: str,
     rho_unit: str,
 ) -> tuple[list[dict[str, Any]], pd.DataFrame]:
-    from cup.petrel.load import load_vp_rho_logset_from_las
+    from cup.petrel.load import old_load_vp_rho_logset_from_las
 
     head_lookup = well_heads_df.copy()
     head_lookup["_name_norm"] = head_lookup["Name"].astype(str).str.strip()
@@ -140,7 +140,7 @@ def collect_well_records(
         inline, xline = survey.coord_to_line(well_x, well_y)
         horizon_depths = target_layer.get_interpretation_values_at_location(inline, xline)
 
-        logset_md = load_vp_rho_logset_from_las(
+        logset_md = old_load_vp_rho_logset_from_las(
             las_file,
             vp_mnemonic=vp_mnemonic,
             rho_mnemonic=rho_mnemonic,

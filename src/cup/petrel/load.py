@@ -13,9 +13,9 @@ checkshots / well heads / well tops / interpretation 文本，
 核心公开对象
 ------------
 1. import_seismic: 读取 3D SEG-Y 或 ZGY 地震体。
-2. extract_vp_log_from_las / extract_vs_log_from_las / extract_rho_log_from_las: 从 LAS 提取标准物性曲线。
+2. old_extract_vp_log_from_las / extract_vs_log_from_las / old_extract_rho_log_from_las: 从 LAS 提取标准物性曲线。
 3. extract_any_log_from_las: 提取任意单条 LAS 曲线。
-4. load_vp_rho_logset_from_las: 从 LAS 路径构造 ``grid.LogSet``。
+4. old_load_vp_rho_logset_from_las: 从 LAS 路径构造旧深度域 ``grid.LogSet``。
 5. import_checkshots_petrel / import_well_heads_petrel / import_well_tops_petrel / import_interpretation_petrel:
    读取 Petrel 文本结果。
 """
@@ -215,12 +215,12 @@ def _convert_density_to_g_cm3(density_values: object, unit: str) -> np.ndarray:
     return density_g_cm3
 
 
-def extract_vp_log_from_las(
+def old_extract_vp_log_from_las(
     las_file: lasio.LASFile,
     unit: str,
     curve_mnemonic: Optional[str] = None,
 ) -> grid.Log:
-    """从 LAS 文件中提取纵波速度曲线（Vp）。
+    """旧深度域兼容入口：从原始 LAS 文件中提取纵波速度曲线（Vp）。
 
     Parameters
     ----------
@@ -281,12 +281,12 @@ def extract_vs_log_from_las(
     return grid.Log(vs, las_df.index.values, "md", name="Vs", unit="m/s", allow_nan=False)
 
 
-def extract_rho_log_from_las(
+def old_extract_rho_log_from_las(
     las_file: lasio.LASFile,
     unit: str,
     curve_mnemonic: Optional[str] = None,
 ) -> grid.Log:
-    """从 LAS 文件中提取密度曲线（Rho）。
+    """旧深度域兼容入口：从原始 LAS 文件中提取密度曲线（Rho）。
 
     Parameters
     ----------
@@ -356,14 +356,17 @@ def extract_any_log_from_las(las_file: lasio.LASFile, curve_mnemonic: str) -> gr
     return grid.Log(values, las_df.index.values, "md", name=curve_mnemonic, unit=unit_from_las, allow_nan=True)
 
 
-def load_vp_rho_logset_from_las(
+def old_load_vp_rho_logset_from_las(
     las_file_path: Path,
     vp_mnemonic: Optional[str] = None,
     rho_mnemonic: Optional[str] = None,
     vp_unit: Optional[str] = "us/m",
     rho_unit: Optional[str] = "g/cm3",
 ) -> grid.LogSet:
-    """从 LAS 文件路径读取 Vp 与 Rho 曲线并组装为 ``grid.LogSet``。
+    """旧深度域兼容入口：从原始 LAS 文件路径读取 Vp/Rho 并组装为 ``grid.LogSet``。
+
+    新时间域工作流不应使用该函数；应先经过 LAS 曲线筛选和预处理，
+    再读取含 ``DT_USM`` 与 ``RHO_GCC`` 的标准 LAS。
 
     Parameters
     ----------
@@ -395,10 +398,10 @@ def load_vp_rho_logset_from_las(
         raise FileNotFoundError(f"LAS 文件不存在: {las_file_path}")
 
     las_file = lasio.read(las_file_path)
-    vp_log = extract_vp_log_from_las(
+    vp_log = old_extract_vp_log_from_las(
         las_file, curve_mnemonic=vp_mnemonic, unit=vp_unit if vp_unit is not None else "us/m"
     )
-    rho_log = extract_rho_log_from_las(
+    rho_log = old_extract_rho_log_from_las(
         las_file, curve_mnemonic=rho_mnemonic, unit=rho_unit if rho_unit is not None else "g/cm3"
     )
 

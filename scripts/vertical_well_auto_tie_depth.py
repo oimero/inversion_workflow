@@ -36,6 +36,12 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.io import load_yaml_config, resolve_relative_path, sanitize_filename
+from cup.well.depth_time import crop_logset_md
+from well_auto_tie import (
+    _build_auto_tie_search_space,
+    _crop_wavelet_center_energy_normalize,
+    _scaled_synthetic_metrics,
+)
 
 if TYPE_CHECKING:
     from wtie.modeling.modeling import ConvModeler
@@ -136,42 +142,6 @@ def to_jsonable(value: Any) -> Any:
 
 
 # =============================================================================
-# Auto-tie utilities
-# =============================================================================
-
-
-def build_auto_tie_search_space(config: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        {
-            "name": "logs_median_size",
-            "type": "choice",
-            "values": config["logs_median_size_values"],
-            "value_type": "int",
-            "is_ordered": True,
-            "sort_values": True,
-        },
-        {
-            "name": "logs_median_threshold",
-            "type": "range",
-            "bounds": config["logs_median_threshold_bounds"],
-            "value_type": "float",
-        },
-        {
-            "name": "logs_std",
-            "type": "range",
-            "bounds": config["logs_std_bounds"],
-            "value_type": "float",
-        },
-        {
-            "name": "table_t_shift",
-            "type": "range",
-            "bounds": config["table_t_shift_bounds"],
-            "value_type": "float",
-        },
-    ]
-
-
-# =============================================================================
 # Depth / TWT conversion
 # =============================================================================
 
@@ -202,95 +172,6 @@ def depth_trace_to_twt(
     return Seismic(amp_t, twt_regular, "twt", name="Depth-derived seismic")
 
 
-def clip_logset_by_md(
-    logset: "LogSet",
-    md_min: float,
-    md_max: float,
-) -> "LogSet":
-    from wtie.processing.grid import Log, LogSet
-
-    mask = (logset.basis >= md_min) & (logset.basis <= md_max)
-    if np.count_nonzero(mask) < 10:
-        raise ValueError("Too few log samples in requested MD window.")
-    logs = {}
-    for key, log in logset.Logs.items():
-        logs[key] = Log(
-            log.values[mask],
-            log.basis[mask],
-            "md",
-            name=log.name,
-            unit=log.unit,
-            allow_nan=log.allow_nan,
-        )
-    return LogSet(logs)
-
-
-# =============================================================================
-# Wavelet post-processing
-# =============================================================================
-
-
-def crop_wavelet_center_energy_normalize(
-    wavelet: "Wavelet",
-    target_ms: float,
-) -> tuple["Wavelet", dict[str, Any]]:
-    from wtie.processing.grid import Wavelet
-
-    dt = float(wavelet.sampling_rate)
-    target_s = target_ms / 1000.0
-    n_target = int(round(target_s / dt))
-    if n_target % 2 == 0:
-        n_target += 1
-    n_target = min(n_target, wavelet.size)
-    if n_target % 2 == 0:
-        n_target -= 1
-    center_idx = int(np.argmin(np.abs(wavelet.basis)))
-    half = n_target // 2
-    start = max(0, center_idx - half)
-    end = start + n_target
-    if end > wavelet.size:
-        end = wavelet.size
-        start = end - n_target
-    values = np.asarray(wavelet.values[start:end], dtype=float).copy()
-    basis = np.asarray(wavelet.basis[start:end], dtype=float).copy()
-    energy = float(np.sqrt(np.sum(values**2)))
-    if not np.isfinite(energy) or energy <= 0:
-        raise ValueError("Cannot energy-normalize a zero-energy wavelet.")
-    values_norm = values / energy
-    cropped = Wavelet(values_norm, basis, name="Auto well tie wavelet cropped 201ms energy-normalized")
-    info = {
-        "target_ms": target_ms,
-        "dt_s": dt,
-        "original_samples": int(wavelet.size),
-        "cropped_samples": int(cropped.size),
-        "cropped_span_ms": float((basis[-1] - basis[0]) * 1000.0),
-        "cropped_nominal_ms": float(cropped.size * dt * 1000.0),
-        "pre_normalization_l2_energy": energy,
-        "post_normalization_l2_energy": float(np.sqrt(np.sum(values_norm**2))),
-    }
-    return cropped, info
-
-
-def scaled_synthetic_for_qc(
-    modeler: "ConvModeler",
-    wavelet: "Wavelet",
-    reflectivity: "Reflectivity",
-    seismic: "Seismic",
-) -> tuple[np.ndarray, float, float, float]:
-    synthetic_raw = modeler(wavelet.values, reflectivity.values)
-    seis = np.asarray(seismic.values, dtype=float)
-    seis = seis - np.mean(seis)
-    seis_std = np.std(seis)
-    if seis_std <= 0:
-        raise ValueError("Seismic trace has zero standard deviation.")
-    seis_norm = seis / seis_std
-    scale = float(np.dot(seis_norm, synthetic_raw) / max(np.dot(synthetic_raw, synthetic_raw), 1e-12))
-    synthetic = scale * synthetic_raw
-    corr = float(np.corrcoef(seis_norm, synthetic)[0, 1]) if np.std(synthetic) > 0 else np.nan
-    nmae = float(np.sum(np.abs(seis_norm - synthetic)) / np.sum(np.abs(seis_norm)))
-    return synthetic, scale, corr, nmae
-
-
 # =============================================================================
 # Core logic
 # =============================================================================
@@ -314,7 +195,7 @@ def run_auto_tie(
     target_crop_ms: float,
     output: dict[str, Path],
 ) -> None:
-    from cup.petrel.load import load_vp_rho_logset_from_las
+    from cup.petrel.load import old_load_vp_rho_logset_from_las
     from wtie.modeling.modeling import ConvModeler
     from wtie.optimize import autotie
     from wtie.processing import grid
@@ -326,7 +207,7 @@ def run_auto_tie(
 
     # ── 1) Load well data and well-location seismic trace ──
 
-    logset_md_full = load_vp_rho_logset_from_las(las_file, vp_unit=las_vp_unit, rho_unit=las_rho_unit)
+    logset_md_full = old_load_vp_rho_logset_from_las(las_file, vp_unit=las_vp_unit, rho_unit=las_rho_unit)
     seismic_depth_trace = survey.import_seismic_at_well(well_x=well_x, well_y=well_y, domain="depth")
     seis_depth = seismic_depth_trace.basis.astype(float)
     seis_amp = interpolate_nans(seismic_depth_trace.values, method="linear")
@@ -347,7 +228,7 @@ def run_auto_tie(
     overlap_md_min = overlap_z_min + kb_m
     overlap_md_max = overlap_z_max + kb_m
 
-    logset_md = clip_logset_by_md(logset_md_full, overlap_md_min, overlap_md_max)
+    logset_md = crop_logset_md(logset_md_full, overlap_md_min, overlap_md_max, min_samples=10)
     md_win = logset_md.basis.astype(float)
     tvdss_win = md_win - kb_m
     tdt_df = grid.build_local_tdt_from_vp(
@@ -380,7 +261,7 @@ def run_auto_tie(
 
     # ── 3) Run autotie.tie_v1 ──
 
-    search_space = build_auto_tie_search_space(search_space_config)
+    search_space = _build_auto_tie_search_space(search_space_config)
     search_params_full = {
         "num_iters": search_params["num_iters"],
         "similarity_std": search_params["similarity_std"],
@@ -420,19 +301,23 @@ def run_auto_tie(
 
     # ── 4) Crop to target length and energy-normalize ──
 
-    cropped_wavelet, crop_info = crop_wavelet_center_energy_normalize(raw_wavelet, target_crop_ms)  # type: ignore
+    cropped_wavelet, crop_info = _crop_wavelet_center_energy_normalize(raw_wavelet, target_crop_ms)  # type: ignore
+    crop_info.update(
+        {
+            "cropped_span_ms": float((cropped_wavelet.basis[-1] - cropped_wavelet.basis[0]) * 1000.0),
+            "cropped_nominal_ms": float(cropped_wavelet.size * cropped_wavelet.sampling_rate * 1000.0),
+            "post_normalization_l2_energy": float(np.sqrt(np.sum(np.asarray(cropped_wavelet.values, dtype=float) ** 2))),
+        }
+    )
     cropped_wavelet_df = pd.DataFrame({"time_s": cropped_wavelet.basis, "amplitude": cropped_wavelet.values})
     cropped_wavelet_df.to_csv(output["wavelet_final_csv"], index=False)
 
-    cropped_synthetic, cropped_scale, cropped_corr, cropped_nmae = scaled_synthetic_for_qc(
+    seis_norm, cropped_synthetic, cropped_corr, cropped_nmae, cropped_scale = _scaled_synthetic_metrics(
         modeler=modeler,
         wavelet=cropped_wavelet,
         reflectivity=outputs.r,  # type: ignore
         seismic=outputs.seismic,  # type: ignore
     )
-
-    seis_norm = outputs.seismic.values - np.mean(outputs.seismic.values)
-    seis_norm = seis_norm / np.std(seis_norm)
     cropped_qc_df = pd.DataFrame(
         {
             "twt_s": outputs.seismic.basis,

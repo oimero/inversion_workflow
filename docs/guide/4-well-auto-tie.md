@@ -61,6 +61,12 @@ well_auto_tie:
   interpretation:
     top_horizon: interpre/H3-1
     bottom_horizon: interpre/H7-1
+  target_interval:
+    top: H3-1
+    bottom: H7-1
+    margin_top_ms: 100.0
+    margin_bottom_ms: 100.0
+    twt_unit: auto
   seismic:
     file: raw/obn-clipped-240-912-872-1544.zgy
     type: zgy
@@ -108,7 +114,9 @@ well_auto_tie:
 
 `source_runs.mode: latest` 表示脚本自动从 `scripts/output` 下寻找最新的前置产物。若需要复现实验，可以显式填写 `inventory_file`、`curve_screen_file`、`preprocess_status_file` 和 `preprocessed_las_dir`。不要把 `YYYYMMDD_HHMMSS` 占位符长期写死在配置里。
 
-`target_crop_ms` 是井震标定时围绕目的层裁剪地震和合成记录的时间窗，示例值 `201.0` 只对应当前工区的初始经验值。正式落地时应从目标层厚度、地震主频、子波有效长度和采样间隔共同推导，至少允许按工区配置覆盖。
+`target_interval` 是实际井震标定窗口。脚本在井口 XY 处读取 `H3-1` 和 `H7-1` 解释层位的 TWT，再在时间域向上、向下各拓展默认 `100 ms`。路径一和路径二都会使用这个窗口裁剪井曲线、初始时深表和地震道。
+
+`target_crop_ms` 是成功标定后导出候选子波时使用的中心裁剪长度，不再表示井震标定输入窗口。
 
 `coarse_anchor` 是进入 `wtie` 细标定前的粗标定配置。它不是手填整体偏移，而是用人工指定的一组 `well_top -> horizon` 锚点自动建立初始时间基准：
 
@@ -131,8 +139,9 @@ scripts/output/well_auto_tie_<timestamp>/
 - `well_tie_metrics.csv`：一井一行的标定指标。
 - `rejected_wells.csv`：被拒绝的井及原因。
 - `wavelet_inventory.csv`：一条成功子波一行，供第五步作为候选子波清单。
+- `tie_window_report.csv`：一井一行的目标窗口、实际窗口、TDT 支持类型和裁剪原因。
 - `wavelets/wavelet_201ms_<well>.csv`：每口成功井的裁剪归一化子波。
-- `time_depth/initial_tdt_<well>.csv`：初始时深表。
+- `time_depth/initial_tdt_<well>.csv`：窗口内初始时深表，包含 `source` 列。
 - `time_depth/optimized_tdt_<well>.csv`：`wtie` 优化后的时深表。
 - `synthetic_qc/tie_qc_<well>.csv`：地震、反射系数、合成记录和残差。
 - `seismic_trace/seismic_trace_<well>.csv`：用于标定的井旁或轨迹地震道。
@@ -169,6 +178,10 @@ scripts/output/well_auto_tie_<timestamp>/
 | `optimized_corr` | 优化后相关系数 |
 | `optimized_nmae` | 优化后归一化 MAE |
 | `best_table_shift_ms` | 最优整体时移 |
+| `tie_window_start_s` | 实际标定窗口起点 |
+| `tie_window_end_s` | 实际标定窗口终点 |
+| `tdt_support_class` | 初始时深支持类型，如 `original_full_window`、`original_with_sonic_extension`、`anchor_integrated` |
+| `original_tdt_window_fraction` | 原始时深表覆盖目标窗口的比例 |
 | `wavelet_file` | 输出子波 |
 | `optimized_tdt_file` | 优化后时深表 |
 | `qc_figure_dir` | QC 图目录 |
@@ -234,12 +247,14 @@ scripts/output/well_auto_tie_<timestamp>/
 1. 读取预处理 LAS，取 `DT_USM` 和 `RHO_GCC`。
 2. 将慢度 `DT_USM` 转成速度 `Vp`，和密度构造 `grid.LogSet`。
 3. 读取该井已有时深表，构造 `grid.TimeDepthTable`。
-4. 默认直接使用原始时深表；如果显式对 `vertical_with_tdt` 启用 `coarse_anchor`，才用锚点计算整体 TWT shift，并生成 `shifted_initial_tdt`。
-5. 在井口 XY 处读取时间域地震道。
-6. 用粗标定后的时深表作为初始 table，调用 `autotie.tie_v1` 做微调。
-7. 裁剪并能量归一化子波，输出优化后时深表和 QC。
+4. 在井口 XY 处读取 `H3-1 -> H7-1` 目的层时间窗，并应用配置的上下拓展。
+5. 若原始时深表完全不接触目的层窗口，则改走 `vertical_anchor_from_tops`，原因记录为 `tdt_no_target_window_overlap_reroute_anchor`。
+6. 若原始时深表只覆盖部分窗口，则从原始 TDT 端点开始用 `DT_USM` 积分向上或向下拓延。
+7. 按实际可用窗口裁剪井曲线、初始时深表和时间域地震道。
+8. 用窗口内初始 table 调用 `autotie.tie_v1` 做微调。
+9. 裁剪并能量归一化子波，输出优化后时深表和 QC。
 
-这条路径不再像深度域脚本那样从 Vp 从零构造本地时深表，而是以已有时深表为初始约束。Vp 主要用于生成反射系数和合成记录。
+这条路径不再像深度域脚本那样默认从 Vp 从零构造本地时深表，而是以已有时深表为初始约束。Vp 主要用于生成反射系数、合成记录，以及在原始时深表端点附近补齐目的层窗口。
 
 可选锚点粗标定计算方式：
 
@@ -286,8 +301,9 @@ anchors:
 1. 从井分层得到锚点 MD。
 2. 从地震解释层位得到井口处对应锚点 TWT。
 3. 从该锚点开始，沿井曲线向上、向下积分纵波慢度。
-4. 直井第一版近似 `MD ~= TVD`；如果后续发现直井也有明显偏斜，转入斜井路径。
-5. 用该初始 table 调用 `autotie.tie_v1` 微调。
+4. 按 `H3-1 -> H7-1` 目的层时间窗裁剪锚点积分得到的初始 table、井曲线和地震道。
+5. 直井第一版近似 `MD ~= TVD`；如果后续发现直井也有明显偏斜，转入斜井路径。
+6. 用窗口内初始 table 调用 `autotie.tie_v1` 微调。
 
 积分关系按双程时间处理：
 

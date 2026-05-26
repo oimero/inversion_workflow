@@ -13,6 +13,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 import re
@@ -40,10 +41,20 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.seismic.survey import open_survey
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
+from cup.petrel.load import import_interpretation_petrel, import_well_tops_petrel
 from cup.well.assets import build_file_lookup
 from cup.well.depth_time import (
+    HorizonGrid,
+    PreparedTieWindow,
+    TargetTieWindow,
+    build_tdt_from_anchor,
     build_vp_rho_logset_from_preprocessed_las,
+    find_well_top_md,
+    normalize_twt_seconds,
+    prepare_anchor_tdt_for_window,
+    prepare_tdt_with_sonic_extension,
     read_time_depth_table,
+    tdt_overlaps_window,
     validate_time_depth_table,
     write_time_depth_table_csv,
 )
@@ -95,12 +106,23 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg.setdefault("trajectory_qc_file", None)
     script_cfg.setdefault("time_depth_dir", "time_depth_table")
     script_cfg.setdefault("well_trace_dir", "all_well_trace")
+    script_cfg.setdefault("well_tops_file", "raw/well_tops")
+    _merge_dict_defaults(
+        script_cfg,
+        "interpretation",
+        {"top_horizon": "interpre/H3-1", "bottom_horizon": "interpre/H7-1"},
+    )
+    _merge_dict_defaults(
+        script_cfg,
+        "target_interval",
+        {"top": "H3-1", "bottom": "H7-1", "margin_top_ms": 100.0, "margin_bottom_ms": 100.0, "twt_unit": "auto"},
+    )
     _merge_dict_defaults(
         script_cfg,
         "seismic",
         {"file": "raw/obn-clipped-240-912-872-1544.zgy", "type": "zgy"},
     )
-    script_cfg.setdefault("enabled_routes", ["vertical_with_tdt"])
+    script_cfg.setdefault("enabled_routes", ["vertical_with_tdt", "vertical_anchor_from_tops"])
     script_cfg.setdefault("tutorial_model", "tutorial/trained_net_state_dict.pt")
     script_cfg.setdefault("tutorial_params", "tutorial/network_parameters.yaml")
     script_cfg.setdefault("target_crop_ms", 201.0)
@@ -125,7 +147,17 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "reject",
         {"allow_near_outside": False, "min_tie_samples": 64, "min_valid_log_fraction": 0.7},
     )
-    _merge_dict_defaults(script_cfg, "coarse_anchor", {"enabled": True, "apply_to_routes": []})
+    _merge_dict_defaults(
+        script_cfg,
+        "coarse_anchor",
+        {
+            "enabled": True,
+            "apply_to_routes": ["vertical_anchor_from_tops"],
+            "config_file": "experiments/well_auto_tie_anchors.yaml",
+            "default": {"well_top": "H3-1", "horizon": "interpre/H3-1", "event": "peak", "twt_unit": "auto"},
+            "wells": {},
+        },
+    )
     return script_cfg
 
 
@@ -244,6 +276,112 @@ def _series_value_counts(series: pd.Series) -> dict[str, int]:
     if series.empty:
         return {}
     return {str(key): int(value) for key, value in series.value_counts(dropna=False).sort_index().items()}
+
+
+def _load_anchor_config(coarse_anchor_cfg: dict[str, Any]) -> dict[str, Any]:
+    config = {
+        "default": dict(coarse_anchor_cfg.get("default") or {}),
+        "wells": dict(coarse_anchor_cfg.get("wells") or {}),
+    }
+    config_file = coarse_anchor_cfg.get("config_file")
+    if config_file:
+        path = _resolve_repo_path(config_file)
+        if path.exists():
+            with path.open("r", encoding="utf-8") as fp:
+                file_config = yaml.safe_load(fp) or {}
+            anchors = dict(file_config.get("anchors") or file_config)
+            config["default"].update(dict(anchors.get("default") or {}))
+            config["wells"].update(dict(anchors.get("wells") or {}))
+    if not config["default"].get("well_top") or not config["default"].get("horizon"):
+        raise ValueError("coarse_anchor requires default.well_top and default.horizon.")
+    return config
+
+
+def _anchor_spec_for_well(anchor_config: dict[str, Any], well_name: str) -> dict[str, Any]:
+    spec = dict(anchor_config.get("default") or {})
+    wells = dict(anchor_config.get("wells") or {})
+    for key, value in wells.items():
+        if str(key).strip().casefold() == well_name.strip().casefold():
+            spec.update(dict(value or {}))
+            break
+    spec.setdefault("event", "peak")
+    spec.setdefault("twt_unit", "auto")
+    return spec
+
+
+def _load_horizon_grid(path: Path, cache: dict[str, HorizonGrid]) -> HorizonGrid:
+    key = str(path.resolve())
+    if key not in cache:
+        cache[key] = HorizonGrid.from_petrel_dataframe(import_interpretation_petrel(path), name=path.name)
+    return cache[key]
+
+
+class RerouteToAnchor(Exception):
+    """Signal that a TDT route should be executed with the anchor route."""
+
+    def __init__(self, reason: str, target_window: TargetTieWindow):
+        super().__init__(reason)
+        self.reason = reason
+        self.target_window = target_window
+
+
+def _target_horizon_path(value: str, *, data_root: Path) -> Path:
+    text = str(value).strip()
+    if not text:
+        raise ValueError("target_interval top/bottom horizon cannot be empty.")
+    if "/" not in text and "\\" not in text:
+        text = f"interpre/{text}"
+    return _resolve_data_path(text, data_root=data_root)
+
+
+def _target_horizon_name(value: str) -> str:
+    text = str(value).strip()
+    return Path(text).name if ("/" in text or "\\" in text) else text
+
+
+def _target_tie_window_for_plan(
+    *,
+    plan: WellTiePlan,
+    survey: Any,
+    config: dict[str, Any],
+    horizon_cache: dict[str, HorizonGrid],
+    data_root: Path,
+) -> TargetTieWindow:
+    if plan.surface_x is None or plan.surface_y is None:
+        raise ValueError("Plan has no valid surface XY.")
+    target_cfg = dict(config["target_interval"])
+    top_value = str(target_cfg.get("top") or config["interpretation"]["top_horizon"])
+    bottom_value = str(target_cfg.get("bottom") or config["interpretation"]["bottom_horizon"])
+    top_path = _target_horizon_path(top_value, data_root=data_root)
+    bottom_path = _target_horizon_path(bottom_value, data_root=data_root)
+    inline_float, xline_float = survey.coord_to_line(float(plan.surface_x), float(plan.surface_y))
+    top_sample = _load_horizon_grid(top_path, horizon_cache).sample_at_line(inline_float, xline_float)
+    bottom_sample = _load_horizon_grid(bottom_path, horizon_cache).sample_at_line(inline_float, xline_float)
+    unit = str(target_cfg.get("twt_unit", "auto"))
+    top_twt = normalize_twt_seconds(float(top_sample["value"]), unit=unit)
+    bottom_twt = normalize_twt_seconds(float(bottom_sample["value"]), unit=unit)
+    if bottom_twt < top_twt:
+        top_twt, bottom_twt = bottom_twt, top_twt
+    margin_top_s = float(target_cfg.get("margin_top_ms", 100.0)) / 1000.0
+    margin_bottom_s = float(target_cfg.get("margin_bottom_ms", 100.0)) / 1000.0
+    start_s = max(0.0, top_twt - margin_top_s)
+    end_s = bottom_twt + margin_bottom_s
+    if end_s <= start_s:
+        raise ValueError(f"Invalid target tie window [{start_s}, {end_s}] for well {plan.well_name}.")
+    return TargetTieWindow(
+        top_name=_target_horizon_name(top_value),
+        bottom_name=_target_horizon_name(bottom_value),
+        top_twt_s=top_twt,
+        bottom_twt_s=bottom_twt,
+        start_s=start_s,
+        end_s=end_s,
+        margin_top_s=margin_top_s,
+        margin_bottom_s=margin_bottom_s,
+        top_sample_method=str(top_sample["method"]),
+        bottom_sample_method=str(bottom_sample["method"]),
+        top_nearest_line_distance=float(top_sample["nearest_line_distance"]),
+        bottom_nearest_line_distance=float(bottom_sample["nearest_line_distance"]),
+    )
 
 
 # =============================================================================
@@ -368,17 +506,60 @@ def _compute_table_synthetic_metrics(logset_md: Any, seismic: Any, table: Any, w
     return corr, nmae
 
 
-def _write_qc_figures(paths: dict[str, Path], inputs_table: Any, outputs: Any, cropped_wavelet: Any, seismic_norm: np.ndarray, synthetic: np.ndarray) -> None:
-    from wtie.utils import viz
+def _snap_seismic_sampling_if_close(seismic: Any, expected_dt_s: float, *, rtol: float = 1e-5) -> Any:
+    """Rebuild a seismic trace with an exact dt when floating-point drift is negligible."""
+    actual_dt = float(seismic.sampling_rate)
+    expected = float(expected_dt_s)
+    if not np.isfinite(actual_dt) or not np.isfinite(expected) or expected <= 0.0:
+        return seismic
+    if not np.isclose(actual_dt, expected, rtol=rtol, atol=1e-9):
+        return seismic
+    snapped_basis = float(seismic.basis[0]) + np.arange(int(seismic.size), dtype=np.float64) * expected
+    return type(seismic)(
+        np.asarray(seismic.values, dtype=np.float64),
+        snapped_basis,
+        "twt",
+        name=seismic.name,
+        theta=getattr(seismic, "theta", 0),
+    )
 
+
+def _write_qc_figures(
+    paths: dict[str, Path],
+    inputs_table: Any,
+    outputs: Any,
+    cropped_wavelet: Any,
+    seismic_norm: np.ndarray,
+    synthetic: np.ndarray,
+    *,
+    initial_table_rows: pd.DataFrame | None = None,
+    target_window: TargetTieWindow | None = None,
+) -> None:
     try:
         fig, _ = outputs.plot_optimization_objective(figsize=(6, 3))
         _save_current_figure(paths["fig_objective"])
     except Exception:
         plt.close("all")
 
-    fig, ax = viz.plot_td_table(inputs_table, plot_params={"label": "initial"})
-    viz.plot_td_table(outputs.table, plot_params={"label": "optimized"}, fig_axes=(fig, ax))
+    fig, ax = plt.subplots(figsize=(5.5, 5.5))
+    if initial_table_rows is not None and not initial_table_rows.empty:
+        rows = initial_table_rows.sort_values("twt_s").reset_index(drop=True)
+        run_id = rows["source"].ne(rows["source"].shift()).cumsum()
+        for _, part in rows.groupby(run_id, sort=False):
+            source = str(part["source"].iloc[0])
+            linestyle = "-" if source == "original_tdt" else "--"
+            color = "black" if source == "original_tdt" else "tab:blue"
+            ax.plot(part["md_m"], part["twt_s"] * 1000.0, linestyle=linestyle, lw=1.0, color=color, label=source)
+    else:
+        ax.plot(inputs_table.md, inputs_table.twt * 1000.0, lw=1.0, color="black", label="initial")
+    ax.plot(outputs.table.md, outputs.table.twt * 1000.0, lw=1.0, color="tab:orange", label="optimized")
+    if target_window is not None:
+        ax.axhline(target_window.top_twt_s * 1000.0, color="tab:green", lw=0.8, alpha=0.7, label=target_window.top_name)
+        ax.axhline(target_window.bottom_twt_s * 1000.0, color="tab:red", lw=0.8, alpha=0.7, label=target_window.bottom_name)
+    ax.invert_yaxis()
+    ax.set_xlabel("MD (m)")
+    ax.set_ylabel("TWT (ms)")
+    ax.grid(True, alpha=0.25)
     ax.legend(loc="best")
     _save_current_figure(paths["fig_tdt"])
 
@@ -433,6 +614,134 @@ def _run_vertical_with_tdt(
     modeler: Any,
     config: dict[str, Any],
     output_dir: Path,
+    horizon_cache: dict[str, HorizonGrid],
+    data_root: Path,
+) -> tuple[WellTieResult, dict[str, Any]]:
+    if plan.surface_x is None or plan.surface_y is None:
+        raise ValueError("Plan has no valid surface XY.")
+    input_las = _resolve_repo_path(plan.input_las)
+    time_depth_file = _resolve_repo_path(plan.time_depth_file)
+
+    logset_md = build_vp_rho_logset_from_preprocessed_las(input_las)
+    table = read_time_depth_table(time_depth_file, domain="md")
+    target_window = _target_tie_window_for_plan(
+        plan=plan,
+        survey=survey,
+        config=config,
+        horizon_cache=horizon_cache,
+        data_root=data_root,
+    )
+    if not tdt_overlaps_window(table, target_window):
+        raise RerouteToAnchor("tdt_no_target_window_overlap_reroute_anchor", target_window)
+    prepared = prepare_tdt_with_sonic_extension(
+        raw_table=table,
+        logset_md=logset_md,
+        window=target_window,
+        min_tie_samples=int(config["reject"]["min_tie_samples"]),
+    )
+    return _run_tie_with_initial_table(
+        plan=plan,
+        survey=survey,
+        wavelet_extractor=wavelet_extractor,
+        modeler=modeler,
+        config=config,
+        output_dir=output_dir,
+        prepared=prepared,
+        extra_seed={
+            "initial_table_source": "time_depth_file",
+            "time_depth_file": repo_relative_path(time_depth_file, root=REPO_ROOT),
+        },
+    )
+
+
+def _run_vertical_anchor_from_tops(
+    *,
+    plan: WellTiePlan,
+    survey: Any,
+    wavelet_extractor: Any,
+    modeler: Any,
+    config: dict[str, Any],
+    output_dir: Path,
+    well_tops_df: pd.DataFrame,
+    anchor_config: dict[str, Any],
+    horizon_cache: dict[str, HorizonGrid],
+    data_root: Path,
+    rerouted_from: str | None = None,
+    reroute_reason: str | None = None,
+) -> tuple[WellTieResult, dict[str, Any]]:
+    if plan.surface_x is None or plan.surface_y is None:
+        raise ValueError("Plan has no valid surface XY.")
+    if not _as_bool(config["coarse_anchor"]["enabled"]):
+        raise ValueError("coarse_anchor.enabled is false; vertical_anchor_from_tops cannot build an initial TDT.")
+    if plan.route not in set(config["coarse_anchor"].get("apply_to_routes") or []):
+        raise ValueError(f"coarse_anchor.apply_to_routes does not include {plan.route}.")
+
+    input_las = _resolve_repo_path(plan.input_las)
+    logset_md = build_vp_rho_logset_from_preprocessed_las(input_las)
+    spec = _anchor_spec_for_well(anchor_config, plan.well_name)
+    anchor_md_m = find_well_top_md(well_tops_df, well_name=plan.well_name, surface=str(spec["well_top"]))
+    inline_float, xline_float = survey.coord_to_line(float(plan.surface_x), float(plan.surface_y))
+    horizon_path = _resolve_data_path(spec["horizon"], data_root=data_root)
+    horizon_grid = _load_horizon_grid(horizon_path, horizon_cache)
+    horizon_sample = horizon_grid.sample_at_line(inline_float, xline_float)
+    raw_horizon_twt = float(horizon_sample["value"])
+    anchor_twt_s = normalize_twt_seconds(raw_horizon_twt, unit=str(spec.get("twt_unit", "auto")))
+    table = build_tdt_from_anchor(logset_md, anchor_md_m=anchor_md_m, anchor_twt_s=anchor_twt_s)
+    target_window = _target_tie_window_for_plan(
+        plan=plan,
+        survey=survey,
+        config=config,
+        horizon_cache=horizon_cache,
+        data_root=data_root,
+    )
+    prepared = prepare_anchor_tdt_for_window(
+        table=table,
+        logset_md=logset_md,
+        window=target_window,
+        min_tie_samples=int(config["reject"]["min_tie_samples"]),
+        support_class="rerouted_to_anchor" if rerouted_from else "anchor_integrated",
+    )
+    return _run_tie_with_initial_table(
+        plan=plan,
+        survey=survey,
+        wavelet_extractor=wavelet_extractor,
+        modeler=modeler,
+        config=config,
+        output_dir=output_dir,
+        prepared=prepared,
+        extra_seed={
+            "initial_table_source": "well_top_anchor",
+            "rerouted_from": rerouted_from or "",
+            "reroute_reason": reroute_reason or "",
+            "anchor": {
+                "well_top": str(spec["well_top"]),
+                "horizon": repo_relative_path(horizon_path, root=REPO_ROOT),
+                "event": str(spec.get("event", "")),
+                "twt_unit": str(spec.get("twt_unit", "auto")),
+                "anchor_md_m": float(anchor_md_m),
+                "horizon_twt_raw": float(raw_horizon_twt),
+                "anchor_twt_s": float(anchor_twt_s),
+                "inline_float": float(inline_float),
+                "xline_float": float(xline_float),
+                "horizon_sample_method": str(horizon_sample["method"]),
+                "horizon_nearest_line_distance": float(horizon_sample["nearest_line_distance"]),
+                "horizon_nearest_inline": float(horizon_sample["nearest_inline"]),
+                "horizon_nearest_xline": float(horizon_sample["nearest_xline"]),
+            },
+        },
+    )
+
+
+def _run_tie_with_initial_table(
+    *,
+    plan: WellTiePlan,
+    survey: Any,
+    wavelet_extractor: Any,
+    modeler: Any,
+    config: dict[str, Any],
+    output_dir: Path,
+    prepared: PreparedTieWindow,
+    extra_seed: dict[str, Any] | None = None,
 ) -> tuple[WellTieResult, dict[str, Any]]:
     from wtie.optimize import autotie
     from wtie.utils.datasets.utils import InputSet
@@ -442,15 +751,15 @@ def _run_vertical_with_tdt(
 
     paths = _build_output_paths(output_dir, plan.well_name)
     paths["figure_dir"].mkdir(parents=True, exist_ok=True)
-    input_las = _resolve_repo_path(plan.input_las)
-    time_depth_file = _resolve_repo_path(plan.time_depth_file)
-
-    logset_md = build_vp_rho_logset_from_preprocessed_las(input_las)
-    table = read_time_depth_table(time_depth_file, domain="md")
+    logset_md = prepared.logset_md
+    table = prepared.table
     overlap = validate_time_depth_table(table, logset_md.basis, min_overlap_samples=int(config["reject"]["min_tie_samples"]))
-    seismic = survey.import_seismic_at_well(plan.surface_x, plan.surface_y, domain="time")
+    sample_start = float(prepared.report["tie_window_start_s"])
+    sample_end = float(prepared.report["tie_window_end_s"])
+    seismic = survey.import_seismic_at_well(plan.surface_x, plan.surface_y, sample_start=sample_start, sample_end=sample_end, domain="time")
+    seismic = _snap_seismic_sampling_if_close(seismic, float(wavelet_extractor.expected_sampling))
     pd.DataFrame({"twt_s": seismic.basis, "seismic": seismic.values}).to_csv(paths["seismic_trace"], index=False)
-    write_time_depth_table_csv(table, paths["initial_tdt"])
+    write_time_depth_table_csv(table, paths["initial_tdt"], sources=prepared.table_rows["source"].astype(str).tolist())
 
     wavelet_scaling_params = {
         "wavelet_min_scale": config["wavelet_scaling"]["min_scale"],
@@ -494,7 +803,25 @@ def _run_vertical_with_tdt(
         }
     )
     qc_df.to_csv(paths["synthetic_qc"], index=False)
-    _write_qc_figures(paths, table, outputs, cropped_wavelet, seismic_norm, synthetic)
+    _write_qc_figures(
+        paths,
+        table,
+        outputs,
+        cropped_wavelet,
+        seismic_norm,
+        synthetic,
+        initial_table_rows=prepared.table_rows,
+        target_window=TargetTieWindow(
+            top_name=str(prepared.report["target_top_name"]),
+            bottom_name=str(prepared.report["target_bottom_name"]),
+            top_twt_s=float(prepared.report["target_top_twt_s"]),
+            bottom_twt_s=float(prepared.report["target_bottom_twt_s"]),
+            start_s=float(prepared.report["target_window_start_s"]),
+            end_s=float(prepared.report["target_window_end_s"]),
+            margin_top_s=0.0,
+            margin_bottom_s=0.0,
+        ),
+    )
 
     best_params, _ = outputs.ax_client.get_best_parameters()
     best_shift_ms = float(best_params.get("table_t_shift", 0.0)) * 1000.0
@@ -511,16 +838,20 @@ def _run_vertical_with_tdt(
         qc_figure_dir=repo_relative_path(paths["figure_dir"], root=REPO_ROOT),
         reasons="",
     )
-    extra = {
+    extra = dict(extra_seed or {})
+    extra.update(
+        {
         "initial_nmae": initial_nmae,
         "synthetic_scale": synthetic_scale,
         "crop_info": crop_info,
         "overlap": overlap,
+        "tie_window": dict(prepared.report),
         "best_parameters": best_params,
         "synthetic_qc_file": repo_relative_path(paths["synthetic_qc"], root=REPO_ROOT),
         "seismic_trace_file": repo_relative_path(paths["seismic_trace"], root=REPO_ROOT),
         "initial_tdt_file": repo_relative_path(paths["initial_tdt"], root=REPO_ROOT),
-    }
+        }
+    )
     return result, extra
 
 
@@ -595,6 +926,7 @@ def main() -> None:
 
     time_depth_dir = _resolve_data_path(script_cfg["time_depth_dir"], data_root=data_root)
     well_trace_dir = _resolve_data_path(script_cfg["well_trace_dir"], data_root=data_root)
+    well_tops_file = _resolve_data_path(script_cfg["well_tops_file"], data_root=data_root)
     time_depth_lookup = build_file_lookup(time_depth_dir.iterdir() if time_depth_dir.exists() else [], asset_label=str(time_depth_dir))
     trace_lookup = build_file_lookup(well_trace_dir.iterdir() if well_trace_dir.exists() else [], asset_label=str(well_trace_dir))
 
@@ -630,41 +962,134 @@ def main() -> None:
 
     results: list[WellTieResult] = []
     result_extras: dict[str, Any] = {}
-    planned_to_run = [plan for plan in plans if plan.route_status == "planned" and plan.route == TieRoute.VERTICAL_WITH_TDT.value]
+    implemented_routes = {TieRoute.VERTICAL_WITH_TDT.value, TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value}
+    planned_to_run = [plan for plan in plans if plan.route_status == "planned" and plan.route in implemented_routes]
     if planned_to_run:
         from wtie.modeling.modeling import ConvModeler
 
+        needs_anchor = any(
+            plan.route in {TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value, TieRoute.VERTICAL_WITH_TDT.value}
+            for plan in planned_to_run
+        )
+        well_tops_df = import_well_tops_petrel(well_tops_file) if needs_anchor else pd.DataFrame()
+        anchor_config = _load_anchor_config(dict(script_cfg["coarse_anchor"])) if needs_anchor else {}
+        horizon_cache: dict[str, HorizonGrid] = {}
         wavelet_extractor = _load_wavelet_extractor(model_path, params_path)
         modeler = ConvModeler()
         for plan in planned_to_run:
             try:
-                result, extra = _run_vertical_with_tdt(
-                    plan=plan,
-                    survey=survey,
-                    wavelet_extractor=wavelet_extractor,
-                    modeler=modeler,
-                    config=script_cfg,
-                    output_dir=output_dir,
-                )
+                if plan.route == TieRoute.VERTICAL_WITH_TDT.value:
+                    result, extra = _run_vertical_with_tdt(
+                        plan=plan,
+                        survey=survey,
+                        wavelet_extractor=wavelet_extractor,
+                        modeler=modeler,
+                        config=script_cfg,
+                        output_dir=output_dir,
+                        horizon_cache=horizon_cache,
+                        data_root=data_root,
+                    )
+                elif plan.route == TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value:
+                    result, extra = _run_vertical_anchor_from_tops(
+                        plan=plan,
+                        survey=survey,
+                        wavelet_extractor=wavelet_extractor,
+                        modeler=modeler,
+                        config=script_cfg,
+                        output_dir=output_dir,
+                        well_tops_df=well_tops_df,
+                        anchor_config=anchor_config,
+                        horizon_cache=horizon_cache,
+                        data_root=data_root,
+                    )
+                else:
+                    raise NotImplementedError(f"Route is not implemented: {plan.route}")
+                results.append(result)
+                result_extras[plan.well_name] = extra
+            except RerouteToAnchor as reroute:
+                try:
+                    rerouted_plan = replace(plan, route=TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value)
+                    result, extra = _run_vertical_anchor_from_tops(
+                        plan=rerouted_plan,
+                        survey=survey,
+                        wavelet_extractor=wavelet_extractor,
+                        modeler=modeler,
+                        config=script_cfg,
+                        output_dir=output_dir,
+                        well_tops_df=well_tops_df,
+                        anchor_config=anchor_config,
+                        horizon_cache=horizon_cache,
+                        data_root=data_root,
+                        rerouted_from=plan.route,
+                        reroute_reason=reroute.reason,
+                    )
+                except Exception as exc:
+                    reason = str(exc) or type(exc).__name__
+                    result = WellTieResult(
+                        well_name=plan.well_name,
+                        route=TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value,
+                        tie_status="failed",
+                        reasons=f"{reroute.reason}; anchor reroute failed: {reason}",
+                    )
+                    extra = {
+                        "rerouted_from": plan.route,
+                        "reroute_reason": reroute.reason,
+                        "tie_window": {
+                            "target_top_name": reroute.target_window.top_name,
+                            "target_bottom_name": reroute.target_window.bottom_name,
+                            "target_window_start_s": reroute.target_window.start_s,
+                            "target_window_end_s": reroute.target_window.end_s,
+                            "tdt_support_class": "rerouted_to_anchor",
+                            "window_clip_reason": "anchor_reroute_failed",
+                        },
+                    }
                 results.append(result)
                 result_extras[plan.well_name] = extra
             except Exception as exc:
+                reason = str(exc) or type(exc).__name__
                 results.append(
                     WellTieResult(
                         well_name=plan.well_name,
                         route=plan.route,
                         tie_status="failed",
-                        reasons=str(exc),
+                        reasons=reason,
                     )
                 )
 
     metrics_df = results_dataframe(results)
+    tie_window_rows = []
+    metric_extra_rows = []
+    for result in results:
+        extra = dict(result_extras.get(result.well_name) or {})
+        tie_window = dict(extra.get("tie_window") or {})
+        if tie_window:
+            tie_window_rows.append({"well_name": result.well_name, "route": result.route, "tie_status": result.tie_status, **tie_window})
+            metric_extra_rows.append(
+                {
+                    "well_name": result.well_name,
+                    "tie_window_start_s": tie_window.get("tie_window_start_s"),
+                    "tie_window_end_s": tie_window.get("tie_window_end_s"),
+                    "tdt_support_class": tie_window.get("tdt_support_class"),
+                    "original_tdt_window_fraction": tie_window.get("original_tdt_window_fraction"),
+                }
+            )
+    if metric_extra_rows and not metrics_df.empty:
+        metrics_df = metrics_df.merge(pd.DataFrame.from_records(metric_extra_rows), on="well_name", how="left")
     metrics_path = output_dir / "well_tie_metrics.csv"
     metrics_df.to_csv(metrics_path, index=False)
+    tie_window_path = output_dir / "tie_window_report.csv"
+    pd.DataFrame.from_records(tie_window_rows).to_csv(tie_window_path, index=False)
     rejected_df = plan_df.loc[plan_df["route_status"] == "rejected"].copy()
     rejected_path = output_dir / "rejected_wells.csv"
     rejected_df.to_csv(rejected_path, index=False)
     wavelet_df = _write_wavelet_inventory(results, output_dir)
+    anchor_rows = []
+    for well_name, extra in result_extras.items():
+        anchor = extra.get("anchor")
+        if anchor:
+            anchor_rows.append({"well_name": well_name, **anchor, "initial_tdt_file": extra.get("initial_tdt_file", "")})
+    anchor_report_path = output_dir / "anchor_report.csv"
+    pd.DataFrame.from_records(anchor_rows).to_csv(anchor_report_path, index=False)
 
     run_summary = {
         "script": "well_auto_tie.py",
@@ -677,6 +1102,7 @@ def main() -> None:
             if paths["trajectory_qc_file"] is not None
             else None,
             "time_depth_dir": repo_relative_path(time_depth_dir, root=REPO_ROOT),
+            "well_tops_file": repo_relative_path(well_tops_file, root=REPO_ROOT),
             "seismic_file": repo_relative_path(seismic_file, root=REPO_ROOT),
             "tutorial_model": repo_relative_path(model_path, root=REPO_ROOT),
             "tutorial_params": repo_relative_path(params_path, root=REPO_ROOT),
@@ -694,18 +1120,21 @@ def main() -> None:
         "planned_run_count": int(len(planned_to_run)),
         "successful_tie_count": int((metrics_df["tie_status"] == "success").sum()) if not metrics_df.empty else 0,
         "wavelet_count": int(len(wavelet_df)),
+        "anchor_report_count": int(len(anchor_rows)),
         "result_extras": result_extras,
         "paths": {
             "well_tie_plan": repo_relative_path(plan_path, root=REPO_ROOT),
             "well_tie_metrics": repo_relative_path(metrics_path, root=REPO_ROOT),
             "rejected_wells": repo_relative_path(rejected_path, root=REPO_ROOT),
             "wavelet_inventory": repo_relative_path(output_dir / "wavelet_inventory.csv", root=REPO_ROOT),
+            "anchor_report": repo_relative_path(anchor_report_path, root=REPO_ROOT),
+            "tie_window_report": repo_relative_path(tie_window_path, root=REPO_ROOT),
         },
     }
     write_json(output_dir / "run_summary.json", run_summary)
     print(
         f"Wrote auto-tie plan for {len(plan_df)} wells to {repo_relative_path(output_dir, root=REPO_ROOT)}; "
-        f"executed {len(planned_to_run)} vertical_with_tdt wells."
+        f"executed {len(planned_to_run)} implemented-route wells."
     )
 
 

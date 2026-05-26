@@ -1773,6 +1773,8 @@ def resample_trace(
 def _resample_trace(trace: BaseTrace, new_sampling: float) -> BaseTrace:
     sr = trace.sampling_rate
 
+    if np.isclose(new_sampling, sr, rtol=1e-5, atol=1e-9):
+        return trace
     if new_sampling < sr:
         return upsample_trace(trace, new_sampling)
     elif new_sampling > sr:

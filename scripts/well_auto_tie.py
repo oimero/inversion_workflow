@@ -39,9 +39,11 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.seismic.survey import open_survey
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.petrel.load import import_interpretation_petrel, import_well_tops_petrel
+from cup.seismic.survey import open_survey, segy_options_from_config
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
+from cup.utils.coerce import as_bool
+from cup.utils.config import merge_dict_defaults
 from cup.well.assets import build_file_lookup
 from cup.well.depth_time import (
     HorizonGrid,
@@ -58,7 +60,8 @@ from cup.well.depth_time import (
     validate_time_depth_table,
     write_time_depth_table_csv,
 )
-from cup.well.tie import TieRoute, WellTiePlan, WellTieResult, build_tie_plan, plans_dataframe, results_dataframe
+from cup.well.tie import TieRoute, WellTiePlan, WellTieResult, build_auto_tie_search_space, build_tie_plan, plans_dataframe, results_dataframe, scaled_synthetic_metrics
+from cup.well.wavelet import crop_wavelet_center_energy_normalize
 
 
 # =============================================================================
@@ -74,21 +77,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _merge_dict_defaults(config: dict[str, Any], key: str, defaults: dict[str, Any]) -> None:
-    value = config.get(key)
-    if value is None:
-        config[key] = dict(defaults)
-        return
-    if not isinstance(value, dict):
-        raise ValueError(f"well_auto_tie.{key} must be a mapping.")
-    merged = dict(defaults)
-    merged.update(value)
-    config[key] = merged
-
-
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_auto_tie") or {})
-    _merge_dict_defaults(
+    merge_dict_defaults(
         script_cfg,
         "source_runs",
         {
@@ -107,17 +98,17 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg.setdefault("time_depth_dir", "time_depth_table")
     script_cfg.setdefault("well_trace_dir", "all_well_trace")
     script_cfg.setdefault("well_tops_file", "raw/well_tops")
-    _merge_dict_defaults(
+    merge_dict_defaults(
         script_cfg,
         "interpretation",
         {"top_horizon": "interpre/H3-1", "bottom_horizon": "interpre/H7-1"},
     )
-    _merge_dict_defaults(
+    merge_dict_defaults(
         script_cfg,
         "target_interval",
         {"top": "H3-1", "bottom": "H7-1", "margin_top_ms": 100.0, "margin_bottom_ms": 100.0, "twt_unit": "auto"},
     )
-    _merge_dict_defaults(
+    merge_dict_defaults(
         script_cfg,
         "seismic",
         {"file": "raw/obn-clipped-240-912-872-1544.zgy", "type": "zgy"},
@@ -126,7 +117,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg.setdefault("tutorial_model", "tutorial/trained_net_state_dict.pt")
     script_cfg.setdefault("tutorial_params", "tutorial/network_parameters.yaml")
     script_cfg.setdefault("target_crop_ms", 201.0)
-    _merge_dict_defaults(
+    merge_dict_defaults(
         script_cfg,
         "search_space",
         {
@@ -136,18 +127,18 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "table_t_shift_bounds": [-0.030, 0.030],
         },
     )
-    _merge_dict_defaults(script_cfg, "search_params", {"num_iters": 60, "similarity_std": 0.02})
-    _merge_dict_defaults(
+    merge_dict_defaults(script_cfg, "search_params", {"num_iters": 60, "similarity_std": 0.02})
+    merge_dict_defaults(
         script_cfg,
         "wavelet_scaling",
         {"min_scale": 50000, "max_scale": 500000, "num_iters": 60},
     )
-    _merge_dict_defaults(
+    merge_dict_defaults(
         script_cfg,
         "reject",
         {"allow_near_outside": False, "min_tie_samples": 64, "min_valid_log_fraction": 0.7},
     )
-    _merge_dict_defaults(
+    merge_dict_defaults(
         script_cfg,
         "coarse_anchor",
         {
@@ -159,12 +150,6 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
         },
     )
     return script_cfg
-
-
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().casefold() in {"true", "1", "yes", "y"}
 
 
 def _resolve_repo_path(value: str | Path) -> Path:
@@ -253,23 +238,6 @@ def _resolve_inputs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str
         ),
         "trajectory_qc_file": trajectory_qc_file if trajectory_qc_file is not None and trajectory_qc_file.exists() else None,
     }
-
-
-def _segy_options(seismic_cfg: dict[str, Any]) -> dict[str, int]:
-    mapping = {
-        "iline": "iline",
-        "xline": "xline",
-        "istep": "istep",
-        "xstep": "xstep",
-        "iline_byte": "iline",
-        "xline_byte": "xline",
-    }
-    options: dict[str, int] = {}
-    for key, target in mapping.items():
-        value = seismic_cfg.get(key)
-        if value is not None:
-            options[target] = int(value)
-    return options
 
 
 def _series_value_counts(series: pd.Series) -> dict[str, int]:
@@ -421,88 +389,13 @@ def _save_current_figure(path: Path) -> None:
     plt.close()
 
 
-def _build_auto_tie_search_space(config: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        {
-            "name": "logs_median_size",
-            "type": "choice",
-            "values": list(config["logs_median_size_values"]),
-            "value_type": "int",
-            "is_ordered": True,
-            "sort_values": True,
-        },
-        {
-            "name": "logs_median_threshold",
-            "type": "range",
-            "bounds": list(config["logs_median_threshold_bounds"]),
-            "value_type": "float",
-        },
-        {"name": "logs_std", "type": "range", "bounds": list(config["logs_std_bounds"]), "value_type": "float"},
-        {
-            "name": "table_t_shift",
-            "type": "range",
-            "bounds": list(config["table_t_shift_bounds"]),
-            "value_type": "float",
-        },
-    ]
-
-
-def _crop_wavelet_center_energy_normalize(wavelet: Any, target_ms: float) -> tuple[Any, dict[str, Any]]:
-    from wtie.processing.grid import Wavelet
-
-    dt = float(wavelet.sampling_rate)
-    target_s = float(target_ms) / 1000.0
-    n_target = int(round(target_s / dt))
-    if n_target % 2 == 0:
-        n_target += 1
-    n_target = min(n_target, int(wavelet.size))
-    if n_target % 2 == 0:
-        n_target -= 1
-    center_idx = int(np.argmin(np.abs(wavelet.basis)))
-    half = n_target // 2
-    start = max(0, center_idx - half)
-    end = start + n_target
-    if end > int(wavelet.size):
-        end = int(wavelet.size)
-        start = end - n_target
-    values = np.asarray(wavelet.values[start:end], dtype=np.float64).copy()
-    basis = np.asarray(wavelet.basis[start:end], dtype=np.float64).copy()
-    energy = float(np.sqrt(np.sum(values**2)))
-    if not np.isfinite(energy) or energy <= 0.0:
-        raise ValueError("Cannot normalize a zero-energy wavelet.")
-    cropped = Wavelet(values / energy, basis, name="Auto well tie wavelet cropped energy-normalized")
-    return cropped, {
-        "target_ms": float(target_ms),
-        "dt_s": dt,
-        "original_samples": int(wavelet.size),
-        "cropped_samples": int(cropped.size),
-        "pre_normalization_l2_energy": energy,
-    }
-
-
-def _scaled_synthetic_metrics(modeler: Any, wavelet: Any, reflectivity: Any, seismic: Any) -> tuple[np.ndarray, np.ndarray, float, float, float]:
-    synthetic_raw = np.asarray(modeler(wavelet.values, reflectivity.values), dtype=np.float64)
-    seismic_values = np.asarray(seismic.values, dtype=np.float64)
-    seismic_norm = seismic_values - float(np.nanmean(seismic_values))
-    std = float(np.nanstd(seismic_norm))
-    if not np.isfinite(std) or std <= 0.0:
-        raise ValueError("Seismic trace has zero standard deviation.")
-    seismic_norm = seismic_norm / std
-    denom = max(float(np.dot(synthetic_raw, synthetic_raw)), 1e-12)
-    scale = float(np.dot(seismic_norm, synthetic_raw) / denom)
-    synthetic = scale * synthetic_raw
-    corr = float(np.corrcoef(seismic_norm, synthetic)[0, 1]) if np.std(synthetic) > 0 else np.nan
-    nmae = float(np.sum(np.abs(seismic_norm - synthetic)) / max(np.sum(np.abs(seismic_norm)), 1e-12))
-    return seismic_norm, synthetic, corr, nmae, scale
-
-
 def _compute_table_synthetic_metrics(logset_md: Any, seismic: Any, table: Any, wavelet: Any, modeler: Any, dt_s: float) -> tuple[float, float]:
     from wtie.optimize import tie as tie_ops
 
     logset_twt = tie_ops.convert_logs_from_md_to_twt(logset_md, None, table, dt_s)
     reflectivity = tie_ops.compute_reflectivity(logset_twt, angle_range=seismic.angle_range)
     seismic_match, reflectivity_match = tie_ops.match_seismic_and_reflectivity(seismic, reflectivity)
-    _, _, corr, nmae, _ = _scaled_synthetic_metrics(modeler, wavelet, reflectivity_match, seismic_match)
+    _, _, corr, nmae, _ = scaled_synthetic_metrics(modeler, wavelet, reflectivity_match, seismic_match)
     return corr, nmae
 
 
@@ -671,7 +564,7 @@ def _run_vertical_anchor_from_tops(
 ) -> tuple[WellTieResult, dict[str, Any]]:
     if plan.surface_x is None or plan.surface_y is None:
         raise ValueError("Plan has no valid surface XY.")
-    if not _as_bool(config["coarse_anchor"]["enabled"]):
+    if not as_bool(config["coarse_anchor"]["enabled"]):
         raise ValueError("coarse_anchor.enabled is false; vertical_anchor_from_tops cannot build an initial TDT.")
     if plan.route not in set(config["coarse_anchor"].get("apply_to_routes") or []):
         raise ValueError(f"coarse_anchor.apply_to_routes does not include {plan.route}.")
@@ -778,15 +671,15 @@ def _run_tie_with_initial_table(
         modeler,
         wavelet_scaling_params,
         search_params=search_params,
-        search_space=_build_auto_tie_search_space(config["search_space"]),
+        search_space=build_auto_tie_search_space(config["search_space"]),
         stretch_and_squeeze_params=None,
     )
 
-    cropped_wavelet, crop_info = _crop_wavelet_center_energy_normalize(outputs.wavelet, float(config["target_crop_ms"]))
+    cropped_wavelet, crop_info = crop_wavelet_center_energy_normalize(outputs.wavelet, float(config["target_crop_ms"]))
     pd.DataFrame({"time_s": cropped_wavelet.basis, "amplitude": cropped_wavelet.values}).to_csv(paths["wavelet"], index=False)
     write_time_depth_table_csv(outputs.table, paths["optimized_tdt"])
 
-    seismic_norm, synthetic, optimized_corr, optimized_nmae, synthetic_scale = _scaled_synthetic_metrics(
+    seismic_norm, synthetic, optimized_corr, optimized_nmae, synthetic_scale = scaled_synthetic_metrics(
         modeler, cropped_wavelet, outputs.r, outputs.seismic
     )
     initial_corr, initial_nmae = _compute_table_synthetic_metrics(
@@ -937,7 +830,7 @@ def main() -> None:
         time_depth_lookup=time_depth_lookup,
         trace_lookup=trace_lookup,
         enabled_routes=script_cfg["enabled_routes"],
-        allow_near_outside=_as_bool(script_cfg["reject"]["allow_near_outside"]),
+        allow_near_outside=as_bool(script_cfg["reject"]["allow_near_outside"]),
     )
     if args.well:
         wanted = args.well.strip().casefold()
@@ -954,7 +847,7 @@ def main() -> None:
     survey = open_survey(
         seismic_file,
         seismic_type=str(seismic_cfg.get("type", "segy")),
-        segy_options=_segy_options(seismic_cfg) or None,
+        segy_options=segy_options_from_config(seismic_cfg) or None,
     )
 
     model_path = _resolve_data_path(script_cfg["tutorial_model"], data_root=data_root)

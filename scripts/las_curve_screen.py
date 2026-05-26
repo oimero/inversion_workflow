@@ -30,6 +30,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cup.utils.coerce import as_bool
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.well.assets import build_file_lookup, normalize_well_name
 from cup.well.curves import (
@@ -161,13 +162,6 @@ def _load_overrides(override_file: str | Path | None) -> dict[str, Any]:
 # =============================================================================
 
 
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().casefold()
-    return text in {"true", "1", "yes", "y"}
-
-
 def _candidate_inventory_rows(
     inventory_df: pd.DataFrame,
     *,
@@ -180,8 +174,8 @@ def _candidate_inventory_rows(
 
     include_positions = {str(item) for item in include_survey_positions}
     mask = (
-        inventory_df["has_well_head"].map(_as_bool)
-        & inventory_df["has_las"].map(_as_bool)
+        inventory_df["has_well_head"].map(as_bool)
+        & inventory_df["has_las"].map(as_bool)
         & inventory_df["survey_position"].astype(str).isin(include_positions)
         & (inventory_df["inventory_status"].astype(str) == "usable_for_las_screen")
     )

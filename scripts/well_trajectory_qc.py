@@ -33,7 +33,9 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.seismic.survey import open_survey
+from cup.seismic.survey import open_survey, segy_options_from_config, snap_line_number
+from cup.utils.coerce import as_bool, optional_float
+from cup.utils.config import merge_dict_defaults
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.well.assets import build_file_lookup, normalize_well_name
 from cup.well.trajectory import WellTrajectory, trajectory_summary, z_tvd_residual_m
@@ -63,10 +65,10 @@ def parse_args() -> argparse.Namespace:
 
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_trajectory_qc") or {})
-    _merge_dict_defaults(script_cfg, "source_runs", {"mode": "latest", "well_inventory_dir": None})
+    merge_dict_defaults(script_cfg, "source_runs", {"mode": "latest", "well_inventory_dir": None})
     script_cfg.setdefault("inventory_file", None)
     script_cfg.setdefault("well_trace_dir", "all_well_trace")
-    _merge_dict_defaults(
+    merge_dict_defaults(
         script_cfg,
         "seismic",
         {
@@ -74,7 +76,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "type": "zgy",
         },
     )
-    _merge_dict_defaults(
+    merge_dict_defaults(
         script_cfg,
         "classification",
         {
@@ -85,21 +87,9 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "z_tvd_tolerance_m": 0.1,
         },
     )
-    _merge_dict_defaults(script_cfg, "survey_qc", {"enabled": True, "allow_partial_outside": True})
-    _merge_dict_defaults(script_cfg, "output", {"write_trajectory_points": True, "sampled_trajectory_dir": "trajectory_points"})
+    merge_dict_defaults(script_cfg, "survey_qc", {"enabled": True, "allow_partial_outside": True})
+    merge_dict_defaults(script_cfg, "output", {"write_trajectory_points": True, "sampled_trajectory_dir": "trajectory_points"})
     return script_cfg
-
-
-def _merge_dict_defaults(config: dict[str, Any], key: str, defaults: dict[str, Any]) -> None:
-    value = config.get(key)
-    if value is None:
-        config[key] = dict(defaults)
-        return
-    if not isinstance(value, dict):
-        raise ValueError(f"well_trajectory_qc.{key} must be a mapping.")
-    merged = dict(defaults)
-    merged.update(value)
-    config[key] = merged
 
 
 def _resolve_repo_path(value: str | Path) -> Path:
@@ -144,51 +134,9 @@ def _discover_latest_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, A
     return candidates[-1]
 
 
-def _segy_options(seismic_cfg: dict[str, Any]) -> dict[str, int]:
-    mapping = {
-        "iline": "iline",
-        "xline": "xline",
-        "istep": "istep",
-        "xstep": "xstep",
-        "iline_byte": "iline",
-        "xline_byte": "xline",
-    }
-    options: dict[str, int] = {}
-    for key, target in mapping.items():
-        value = seismic_cfg.get(key)
-        if value is not None:
-            options[target] = int(value)
-    return options
-
-
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().casefold()
-    return text in {"true", "1", "yes", "y"}
-
-
-def _optional_float(value: Any) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(number):
-        return None
-    return number
-
-
 # =============================================================================
 # Survey helpers
 # =============================================================================
-
-
-def _nearest_line_number(line_float: float, *, line_min: float, line_step: float) -> float:
-    step = float(line_step)
-    if step <= 0.0:
-        return float(round(float(line_float)))
-    line_index = round((float(line_float) - float(line_min)) / step)
-    return float(line_min) + float(line_index) * step
 
 
 @dataclass(frozen=True)
@@ -209,12 +157,12 @@ def _classify_point_survey_position(x: float, y: float, *, survey: Any, geometry
     return SurveyPointQc(
         inline_float=float(inline_float),
         xline_float=float(xline_float),
-        nearest_inline=_nearest_line_number(
+        nearest_inline=snap_line_number(
             float(inline_float),
             line_min=float(geometry["inline_min"]),
             line_step=float(geometry["inline_step"]),
         ),
-        nearest_xline=_nearest_line_number(
+        nearest_xline=snap_line_number(
             float(xline_float),
             line_min=float(geometry["xline_min"]),
             line_step=float(geometry["xline_step"]),
@@ -372,14 +320,14 @@ def _qc_inventory_consistency(
     classification_cfg: dict[str, Any],
 ) -> list[str]:
     flags: list[str] = []
-    inv_x = _optional_float(inventory_row.get("surface_x"))
-    inv_y = _optional_float(inventory_row.get("surface_y"))
+    inv_x = optional_float(inventory_row.get("surface_x"))
+    inv_y = optional_float(inventory_row.get("surface_y"))
     if inv_x is not None and inv_y is not None:
         surface_distance = float(np.hypot(trajectory.x_m[0] - inv_x, trajectory.y_m[0] - inv_y))
         if surface_distance > float(classification_cfg["surface_xy_tolerance_m"]):
             flags.append("surface_xy_mismatch")
 
-    inv_kb = _optional_float(inventory_row.get("kb_m"))
+    inv_kb = optional_float(inventory_row.get("kb_m"))
     if inv_kb is not None and abs(float(trajectory.kb_m) - inv_kb) > float(classification_cfg["kb_tolerance_m"]):
         flags.append("kb_mismatch")
 
@@ -420,7 +368,7 @@ def _build_success_row(
     bottom_position = str(point_df.iloc[-1]["survey_position"]) if not point_df.empty else None
     is_partial_outside = inside_count > 0 and outside_count > 0
     if is_partial_outside:
-        if _as_bool(survey_cfg.get("allow_partial_outside", True)):
+        if as_bool(survey_cfg.get("allow_partial_outside", True)):
             qc_flags.append("partial_outside_survey")
         else:
             hard_reasons.append("partial_outside_survey")
@@ -498,7 +446,7 @@ def run_trajectory_qc(
     classification_cfg = dict(config["classification"])
     survey_cfg = dict(config.get("survey_qc") or {})
     output_cfg = dict(config.get("output") or {})
-    write_points = _as_bool(output_cfg.get("write_trajectory_points", True))
+    write_points = as_bool(output_cfg.get("write_trajectory_points", True))
     point_dir = output_dir / str(output_cfg.get("sampled_trajectory_dir", "trajectory_points"))
     if write_points:
         point_dir.mkdir(parents=True, exist_ok=True)
@@ -603,12 +551,12 @@ def main() -> None:
     geometry = None
     seismic_file = None
     seismic_cfg = dict(script_cfg.get("seismic") or {})
-    if _as_bool(survey_cfg.get("enabled", True)):
+    if as_bool(survey_cfg.get("enabled", True)):
         seismic_file = _resolve_data_path(seismic_cfg["file"], data_root=data_root)
         survey = open_survey(
             seismic_file,
             seismic_type=str(seismic_cfg.get("type", "segy")),
-            segy_options=_segy_options(seismic_cfg) or None,
+            segy_options=segy_options_from_config(seismic_cfg) or None,
         )
         geometry = survey.query_geometry(domain="time")
 

@@ -35,6 +35,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cup.utils.coerce import optional_float as _optional_float
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.well.assets import normalize_well_name
 from cup.well.curves import exact_mnemonic, normalize_mnemonic
@@ -250,14 +251,6 @@ class CandidateCurve:
     unusable_reason: str = ""
     final_valid_count: int = 0
     final_valid_fraction: float = 0.0
-
-
-def _optional_float(value: Any) -> float | None:
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return None
-    return out if np.isfinite(out) else None
 
 
 def _curve_index(las: lasio.LASFile) -> tuple[dict[str, int], dict[str, list[int]]]:

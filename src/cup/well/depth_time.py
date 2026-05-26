@@ -10,6 +10,7 @@ import lasio
 import numpy as np
 import pandas as pd
 
+from cup.petrel.load import read_petrel_checkshots_dataframe
 from cup.well.assets import normalize_well_name
 from wtie.processing import grid
 from wtie.processing.logs import interpolate_nans
@@ -57,39 +58,8 @@ def _finite_positive(values: np.ndarray, *, label: str) -> np.ndarray:
 
 
 def _read_petrel_checkshot_dataframe(path: Path) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    in_data = False
-    with Path(path).open("r", encoding="utf-8", errors="ignore") as fp:
-        for raw_line in fp:
-            line = raw_line.strip()
-            if not line:
-                continue
-            if line == "END HEADER":
-                in_data = True
-                continue
-            if not in_data or line.startswith("#"):
-                continue
-
-            parts = line.split()
-            if len(parts) < 6:
-                continue
-            try:
-                rows.append(
-                    {
-                        "x_m": float(parts[0]),
-                        "y_m": float(parts[1]),
-                        "z_m": float(parts[2]),
-                        "twt_ms": float(parts[3]),
-                        "md_m": float(parts[4]),
-                        "well_name": parts[5].strip('"'),
-                    }
-                )
-            except ValueError:
-                continue
-
-    if not rows:
-        raise ValueError(f"No numeric Petrel checkshot rows found in {path}.")
-    return pd.DataFrame.from_records(rows)
+    """Delegate to the unified Petrel checkshot parser in ``cup.petrel.load``."""
+    return read_petrel_checkshots_dataframe(path)
 
 
 def read_time_depth_table(path: str | Path, *, domain: Literal["md", "tvdss"] = "md") -> grid.TimeDepthTable:

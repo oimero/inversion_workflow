@@ -663,6 +663,40 @@ def _resolve_context(
     )
 
 
+def segy_options_from_config(seismic_cfg: dict[str, Any]) -> dict[str, int]:
+    """Build SEG-Y options dict from a config section.
+
+    Maps config keys ``iline``, ``xline``, ``istep``, ``xstep``,
+    ``iline_byte``, ``xline_byte`` to their integer target names.
+    """
+    mapping = {
+        "iline": "iline",
+        "xline": "xline",
+        "istep": "istep",
+        "xstep": "xstep",
+        "iline_byte": "iline",
+        "xline_byte": "xline",
+    }
+    options: dict[str, int] = {}
+    for key, target in mapping.items():
+        value = seismic_cfg.get(key)
+        if value is not None:
+            options[target] = int(value)
+    return options
+
+
+def snap_line_number(line_float: float, *, line_min: float, line_step: float) -> float:
+    """Snap a floating-point line number to the nearest valid line on a regular grid.
+
+    Uses the axis-snap formula: ``line_min + round((line_float - line_min) / line_step) * line_step``.
+    """
+    step = float(line_step)
+    if step <= 0.0:
+        return float(round(float(line_float)))
+    line_index = round((float(line_float) - float(line_min)) / step)
+    return float(line_min) + float(line_index) * step
+
+
 def _build_segy_options(
     iline: Optional[int] = None,
     xline: Optional[int] = None,

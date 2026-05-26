@@ -301,6 +301,19 @@ class BaseTrace(BaseObject):
         self.shape = self.values.shape
         self.duration = self.basis[-1] - self.basis[0]
 
+    def _slice_constructor_kwargs(self) -> dict:
+        """Return kwargs needed to reconstruct this subclass from a slice.
+
+        Subclasses that carry extra metadata (e.g. ``theta``,
+        ``uncertainties``) must override this and merge with
+        ``super()._slice_constructor_kwargs()``.
+        """
+        return {
+            "name": self.name,
+            "unit": self.unit,
+            "allow_nan": self.allow_nan,
+        }
+
     def time_slice(self, tmin: float, tmax: float) -> "BaseTrace":
         """按坐标区间截取轨迹。
 
@@ -331,9 +344,7 @@ class BaseTrace(BaseObject):
             new_values,
             new_basis,
             _inverted_name(self.basis_type),
-            name=self.name,
-            unit=self.unit,
-            allow_nan=self.allow_nan,
+            **self._slice_constructor_kwargs(),
         )
 
     @property
@@ -406,11 +417,21 @@ class Reflectivity(BaseTrace):
     """
 
     def __init__(self, values, basis, basis_type=None, theta: int = 0, **kwargs):
-        # basis_type not used as always assumed twt, there for api compat
+        if basis_type is not None:
+            supplied_name = _NAMES_DICT.get(basis_type, basis_type)
+            if supplied_name != TWT_NAME:
+                raise ValueError(
+                    f"Reflectivity only supports TWT domain, got {supplied_name}."
+                )
         super().__init__(values, basis, "twt", **kwargs)
 
         # incidence angle in degrees
         self.theta = theta
+
+    def _slice_constructor_kwargs(self) -> dict:
+        kwargs = super()._slice_constructor_kwargs()
+        kwargs["theta"] = self.theta
+        return kwargs
 
 
 class Seismic(BaseTrace):
@@ -424,6 +445,11 @@ class Seismic(BaseTrace):
 
         # for compat with PreStackSeismic
         self.angle_range = None
+
+    def _slice_constructor_kwargs(self) -> dict:
+        kwargs = super()._slice_constructor_kwargs()
+        kwargs["theta"] = self.theta
+        return kwargs
 
 
 WaveletUncertainties = namedtuple("WaveletUncertainties", ("ff", "ampl_mean", "ampl_std", "phase_mean", "phase_std"))
@@ -441,13 +467,24 @@ class Wavelet(BaseTrace):
         uncertainties: WaveletUncertainties = None,  # type: ignore
         **kwargs,  # type: ignore
     ):
-        # basis_type not used as always assumed twt, there for api compat
+        if basis_type is not None:
+            supplied_name = _NAMES_DICT.get(basis_type, basis_type)
+            if supplied_name != TWT_NAME:
+                raise ValueError(
+                    f"Wavelet only supports TWT domain, got {supplied_name}."
+                )
         super().__init__(values, basis, "twt", **kwargs)
 
         # incidence angle in degrees
         self.theta = theta
 
         self.uncertainties_ = uncertainties
+
+    def _slice_constructor_kwargs(self) -> dict:
+        kwargs = super()._slice_constructor_kwargs()
+        kwargs["theta"] = self.theta
+        kwargs["uncertainties"] = self.uncertainties_
+        return kwargs
 
     @property
     def uncertainties(self):
@@ -698,7 +735,7 @@ class BasePrestackTrace:
         for i in range(num_angles):
             count = 0
             new_value = np.zeros_like(ps_trace.traces[0].values)
-            for j in range(max(0, i - n), min(num_angles - 1, i + n + 1)):
+            for j in range(max(0, i - n), min(num_angles, i + n + 1)):
                 new_value += ps_trace.values[j, :]
                 count += 1
             new_values[i, :] = new_value / count

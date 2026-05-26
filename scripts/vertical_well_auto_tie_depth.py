@@ -37,11 +37,8 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.utils.io import load_yaml_config, resolve_relative_path, sanitize_filename
 from cup.well.depth_time import crop_logset_md
-from well_auto_tie import (
-    _build_auto_tie_search_space,
-    _crop_wavelet_center_energy_normalize,
-    _scaled_synthetic_metrics,
-)
+from cup.well.tie import build_auto_tie_search_space, scaled_synthetic_metrics
+from cup.well.wavelet import crop_wavelet_center_energy_normalize
 
 if TYPE_CHECKING:
     from wtie.modeling.modeling import ConvModeler
@@ -261,7 +258,7 @@ def run_auto_tie(
 
     # ── 3) Run autotie.tie_v1 ──
 
-    search_space = _build_auto_tie_search_space(search_space_config)
+    search_space = build_auto_tie_search_space(search_space_config)
     search_params_full = {
         "num_iters": search_params["num_iters"],
         "similarity_std": search_params["similarity_std"],
@@ -301,7 +298,7 @@ def run_auto_tie(
 
     # ── 4) Crop to target length and energy-normalize ──
 
-    cropped_wavelet, crop_info = _crop_wavelet_center_energy_normalize(raw_wavelet, target_crop_ms)  # type: ignore
+    cropped_wavelet, crop_info = crop_wavelet_center_energy_normalize(raw_wavelet, target_crop_ms)  # type: ignore
     crop_info.update(
         {
             "cropped_span_ms": float((cropped_wavelet.basis[-1] - cropped_wavelet.basis[0]) * 1000.0),
@@ -312,7 +309,7 @@ def run_auto_tie(
     cropped_wavelet_df = pd.DataFrame({"time_s": cropped_wavelet.basis, "amplitude": cropped_wavelet.values})
     cropped_wavelet_df.to_csv(output["wavelet_final_csv"], index=False)
 
-    seis_norm, cropped_synthetic, cropped_corr, cropped_nmae, cropped_scale = _scaled_synthetic_metrics(
+    seis_norm, cropped_synthetic, cropped_corr, cropped_nmae, cropped_scale = scaled_synthetic_metrics(
         modeler=modeler,
         wavelet=cropped_wavelet,
         reflectivity=outputs.r,  # type: ignore

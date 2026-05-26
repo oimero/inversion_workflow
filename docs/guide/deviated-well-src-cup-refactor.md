@@ -430,7 +430,7 @@ preprocessed LAS + optimized TDT + trajectory
 
 | 现有位置 | 建议 |
 | --- | --- |
-| `cup.petrel.load.load_vp_rho_logset_from_las` | 拆出 LAS 读取、单位转换、`LogSet` 构造；不要继续放在 Petrel I/O |
+| `cup.petrel.load.old_load_vp_rho_logset_from_las` (legacy raw LAS reader) | 拆出 LAS 读取、单位转换、`LogSet` 构造；不要继续放在 Petrel I/O |
 | `cup.seismic.lfm_time.LfmTimeWell.trajectory` | 改为接受项目 `WellTrajectory`，内部再转 wtie `WellPath` |
 | `cup.seismic.modeling.WellControl` | 不再作为时间域主 Interface；保留为直井井级控制 Adapter |
 | 脚本内 `coord_to_line` / 最近道逻辑 | 下沉到 `cup.seismic.trace_sampling` |

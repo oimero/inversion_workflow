@@ -13,7 +13,8 @@
 2. load_wavelet_csv: 从 CSV 读取小波。
 3. infer_wavelet_dt: 推断规则采样间隔。
 4. compute_wavelet_active_half_support_s: 估计有效半支撑。
-5. validate_wavelet_dt: 校验小波采样间隔。
+5. crop_wavelet_center_energy_normalize: 居中裁剪并做 L2 能量归一化。
+6. validate_wavelet_dt: 校验小波采样间隔。
 
 Examples
 --------
@@ -25,6 +26,7 @@ Examples
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -199,6 +201,47 @@ def compute_wavelet_active_half_support_s(
     peak_index = int(abs_wavelet.argmax())
     active = abs_wavelet >= peak * float(active_threshold)
     return float(np.abs(wavelet_time_s[active] - wavelet_time_s[peak_index]).max())
+
+
+def crop_wavelet_center_energy_normalize(
+    wavelet: Any,
+    target_ms: float,
+) -> tuple[Any, dict[str, Any]]:
+    """Crop a wavelet to a centred window and L2 energy-normalize.
+
+    Returns ``(cropped_wavelet, crop_info)`` where ``cropped_wavelet`` is a
+    ``wtie.processing.grid.Wavelet`` and ``crop_info`` is a metadata dict.
+    """
+    from wtie.processing.grid import Wavelet
+
+    dt = float(wavelet.sampling_rate)
+    target_s = float(target_ms) / 1000.0
+    n_target = int(round(target_s / dt))
+    if n_target % 2 == 0:
+        n_target += 1
+    n_target = min(n_target, int(wavelet.size))
+    if n_target % 2 == 0:
+        n_target -= 1
+    center_idx = int(np.argmin(np.abs(wavelet.basis)))
+    half = n_target // 2
+    start = max(0, center_idx - half)
+    end = start + n_target
+    if end > int(wavelet.size):
+        end = int(wavelet.size)
+        start = end - n_target
+    values = np.asarray(wavelet.values[start:end], dtype=np.float64).copy()
+    basis = np.asarray(wavelet.basis[start:end], dtype=np.float64).copy()
+    energy = float(np.sqrt(np.sum(values**2)))
+    if not np.isfinite(energy) or energy <= 0.0:
+        raise ValueError("Cannot normalize a zero-energy wavelet.")
+    cropped = Wavelet(values / energy, basis, name="Auto well tie wavelet cropped energy-normalized")
+    return cropped, {
+        "target_ms": float(target_ms),
+        "dt_s": dt,
+        "original_samples": int(wavelet.size),
+        "cropped_samples": int(cropped.size),
+        "pre_normalization_l2_energy": energy,
+    }
 
 
 def validate_wavelet_dt(time_s: np.ndarray, expected_dt_s: float) -> float:

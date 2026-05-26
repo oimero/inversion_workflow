@@ -31,7 +31,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.petrel.load import import_well_heads_petrel, import_well_tops_petrel
-from cup.seismic.survey import open_survey
+from cup.seismic.survey import open_survey, segy_options_from_config, snap_line_number
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.well.assets import (
     WellHead,
@@ -109,23 +109,6 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return script_cfg
 
 
-def _segy_options(seismic_cfg: dict[str, Any]) -> dict[str, int]:
-    mapping = {
-        "iline": "iline",
-        "xline": "xline",
-        "istep": "istep",
-        "xstep": "xstep",
-        "iline_byte": "iline",
-        "xline_byte": "xline",
-    }
-    options: dict[str, int] = {}
-    for key, target in mapping.items():
-        value = seismic_cfg.get(key)
-        if value is not None:
-            options[target] = int(value)
-    return options
-
-
 # =============================================================================
 # Inventory
 # =============================================================================
@@ -186,14 +169,6 @@ def _record_reasons_for_assets(
         record.reasons.append("no_well_tops")
 
 
-def _nearest_line_number(line_float: float, *, line_min: float, line_step: float) -> float:
-    step = float(line_step)
-    if step <= 0.0:
-        return float(round(float(line_float)))
-    line_index = round((float(line_float) - float(line_min)) / step)
-    return float(line_min) + float(line_index) * step
-
-
 def _classify_survey_position(
     record: WellInventoryRecord,
     *,
@@ -221,12 +196,12 @@ def _classify_survey_position(
         geometry = survey.query_geometry(domain="time")
         record.inline_float = float(inline_float)
         record.xline_float = float(xline_float)
-        record.nearest_inline = _nearest_line_number(
+        record.nearest_inline = snap_line_number(
             float(inline_float),
             line_min=float(geometry["inline_min"]),
             line_step=float(geometry["inline_step"]),
         )
-        record.nearest_xline = _nearest_line_number(
+        record.nearest_xline = snap_line_number(
             float(xline_float),
             line_min=float(geometry["xline_min"]),
             line_step=float(geometry["xline_step"]),
@@ -393,7 +368,7 @@ def main() -> None:
     survey = open_survey(
         seismic_file,
         seismic_type=seismic_type,
-        segy_options=_segy_options(seismic_cfg) if seismic_type == "segy" else None,
+        segy_options=segy_options_from_config(seismic_cfg) if seismic_type == "segy" else None,
     )
     geometry = survey.query_geometry(domain="time")
     bin_spacing = survey.bin_spacing_m(domain="time")

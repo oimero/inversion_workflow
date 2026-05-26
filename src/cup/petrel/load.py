@@ -481,27 +481,55 @@ def _warn_if_petrel_rows_skipped(
     )
 
 
-def _parse_checkshots_petrel_dataframe(checkshots_file: Path) -> pd.DataFrame:
-    """
-    导入 Petrel checkshots/时深表文本，并统一为项目内部单位约定。
+def read_petrel_checkshots_dataframe(path: Path) -> pd.DataFrame:
+    """Read a Petrel checkshot / time-depth table into a normalised DataFrame.
+
+    This is the single public parser for Petrel checkshot text exports.
+    It handles ``BEGIN HEADER`` / ``END HEADER`` blocks, properly quoted
+    fields, and recognises column aliases used across different Petrel
+    versions (e.g. ``TWT picked`` / ``Well``).
 
     Parameters
     ----------
-    checkshots_file : Path
-        Petrel 导出的 checkshots 文本路径。
+    path : Path
+        Path to the Petrel checkshot text file.
 
     Returns
     -------
     pd.DataFrame
-        归一化后的原始表格数据。
+        Columns: ``x_m, y_m, z_m, md_m, twt_ms, well_name`` and
+        optionally ``average_velocity, interval_velocity``.
+        Values are raw Petrel numbers (``twt_ms`` may be negative).
+
+    Raises
+    ------
+    ValueError
+        When required columns are missing or the header block is malformed.
     """
-    required_columns = ["X", "Y", "Z", "MD", "TWT", "Well name"]
-    optional_columns = ["Average velocity", "Interval velocity"]
+    path = Path(path)
 
-    lines = _read_text_lines_with_fallback(checkshots_file)
+    _COLUMN_ALIASES: dict[str, str] = {
+        "X": "x_m",
+        "Y": "y_m",
+        "Z": "z_m",
+        "MD": "md_m",
+        "TWT": "twt_ms",
+        "TWT picked": "twt_ms",
+        "TWT_PICKED": "twt_ms",
+        "Well name": "well_name",
+        "Well": "well_name",
+        "Average velocity": "average_velocity",
+        "Interval velocity": "interval_velocity",
+    }
+    _REQUIRED_PETREL_NAMES = ["X", "Y", "Z", "MD"]
+    _TWT_NAMES = {"TWT", "TWT picked", "TWT_PICKED"}
+    _WELL_NAMES = {"Well name", "Well"}
+    _OPTIONAL_PETREL_NAMES = ["Average velocity", "Interval velocity"]
 
-    begin_idx = None
-    end_idx = None
+    lines = _read_text_lines_with_fallback(path)
+
+    begin_idx: int | None = None
+    end_idx: int | None = None
     for i, line in enumerate(lines):
         token = line.strip()
         if token == "BEGIN HEADER":
@@ -511,19 +539,31 @@ def _parse_checkshots_petrel_dataframe(checkshots_file: Path) -> pd.DataFrame:
             break
 
     if begin_idx is None or end_idx is None or end_idx <= begin_idx:
-        raise ValueError(f"Invalid Petrel checkshots header block: {checkshots_file}")
+        raise ValueError(f"Invalid Petrel checkshots header block: {path}")
 
     header_columns = [line.strip() for line in lines[begin_idx + 1 : end_idx] if line.strip()]
     col_to_index = {name: idx for idx, name in enumerate(header_columns)}
 
-    missing = [c for c in required_columns if c not in col_to_index]
-    if missing:
-        raise ValueError(f"Required columns missing in Petrel header: {missing}")
+    missing_req = sorted(c for c in _REQUIRED_PETREL_NAMES if c not in col_to_index)
+    if missing_req:
+        raise ValueError(f"Required columns missing in Petrel header of {path}: {missing_req}")
+    if not (_TWT_NAMES & set(header_columns)):
+        raise ValueError(f"No TWT column found in Petrel header of {path}. Expected one of: {sorted(_TWT_NAMES)}")
+    if not (_WELL_NAMES & set(header_columns)):
+        raise ValueError(f"No well name column found in Petrel header of {path}. Expected one of: {sorted(_WELL_NAMES)}")
 
-    selected_columns = required_columns + [c for c in optional_columns if c in col_to_index]
+    selected_petrel_names = list(_REQUIRED_PETREL_NAMES)
+    for names in (_TWT_NAMES, _WELL_NAMES):
+        for name in sorted(names):
+            if name in col_to_index:
+                selected_petrel_names.append(name)
+                break
+    for name in _OPTIONAL_PETREL_NAMES:
+        if name in col_to_index:
+            selected_petrel_names.append(name)
 
-    records = []
-    skipped_rows: List[Tuple[int, int, str]] = []
+    records: list[dict[str, object]] = []
+    skipped_rows: list[tuple[int, int, str]] = []
     for line_no, raw_line in enumerate(lines[end_idx + 1 :], start=end_idx + 2):
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -534,26 +574,81 @@ def _parse_checkshots_petrel_dataframe(checkshots_file: Path) -> pd.DataFrame:
             skipped_rows.append((line_no, len(tokens), line))
             continue
 
-        record = {col: tokens[col_to_index[col]] for col in selected_columns}
+        record: dict[str, object] = {}
+        for petrel_name in selected_petrel_names:
+            record[petrel_name] = tokens[col_to_index[petrel_name]]
         records.append(record)
 
     _warn_if_petrel_rows_skipped(
         skipped_rows,
-        file_path=checkshots_file,
+        file_path=path,
         record_type="checkshots",
         expected_column_count=len(header_columns),
     )
 
-    df = pd.DataFrame.from_records(records, columns=selected_columns)
+    df = pd.DataFrame.from_records(records, columns=selected_petrel_names)
 
-    numeric_cols = [col for col in ["X", "Y", "Z", "MD", "TWT", *optional_columns] if col in df.columns]
+    numeric_cols = [c for c in ["X", "Y", "Z", "MD", *selected_petrel_names] if c in df.columns and c not in _WELL_NAMES]
     for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["Z"] = np.abs(df["Z"])
-    df["TWT"] = df["TWT"] / 1000.0
+    df = df.rename(columns=_COLUMN_ALIASES)
+    return df[[c for c in ["x_m", "y_m", "z_m", "md_m", "twt_ms", "well_name", "average_velocity", "interval_velocity"] if c in df.columns]]
 
+
+def _parse_checkshots_petrel_dataframe(checkshots_file: Path) -> pd.DataFrame:
+    """Legacy wrapper: reads Petrel checkshot text and applies legacy unit conventions.
+
+    Kept for backward compatibility with ``import_checkshots_petrel``.
+    New callers should use ``read_petrel_checkshots_dataframe`` directly.
+    """
+    df = read_petrel_checkshots_dataframe(checkshots_file)
+    df["z_m"] = np.abs(df["z_m"].to_numpy(dtype=np.float64))
+    df["twt_s"] = np.abs(df["twt_ms"].to_numpy(dtype=np.float64)) / 1000.0
     return df
+
+
+def _monotonic_checkshot_arrays(
+    df: pd.DataFrame,
+    *,
+    depth_domain: str,
+    source: Path,
+) -> tuple[np.ndarray, np.ndarray]:
+    depth_col = "md_m" if depth_domain == "md" else "z_m"
+    depth = df[depth_col].to_numpy(dtype=float, copy=False)
+    twt = df["twt_s"].to_numpy(dtype=float, copy=False)
+
+    finite = np.isfinite(depth) & np.isfinite(twt)
+    depth = depth[finite]
+    twt = twt[finite]
+    if depth.size < 2:
+        raise ValueError(f"Petrel checkshots has fewer than 2 valid samples: {source}")
+
+    order = np.argsort(depth)
+    depth = depth[order]
+    twt = twt[order]
+
+    unique_depth, unique_indices = np.unique(depth, return_index=True)
+    depth = unique_depth
+    twt = twt[unique_indices]
+    if depth.size < 2:
+        raise ValueError(f"Petrel checkshots has fewer than 2 unique depth samples: {source}")
+
+    start = int(np.nanargmin(twt))
+    depth = depth[start:]
+    twt = twt[start:]
+    keep = np.zeros(twt.shape, dtype=bool)
+    last_twt = -np.inf
+    for index, value in enumerate(twt):
+        if value > last_twt + 1e-9:
+            keep[index] = True
+            last_twt = float(value)
+    depth = depth[keep]
+    twt = twt[keep]
+    if depth.size < 2:
+        raise ValueError(f"Petrel checkshots has fewer than 2 strictly increasing TWT samples: {source}")
+    return depth, twt
 
 
 def import_checkshots_petrel(checkshots_file: Path, depth_domain: str = "md") -> grid.TimeDepthTable:
@@ -586,13 +681,12 @@ def import_checkshots_petrel(checkshots_file: Path, depth_domain: str = "md") ->
     if depth_domain not in {"md", "tvdss"}:
         raise ValueError(f"Unsupported depth_domain: {depth_domain}. Expect 'md' or 'tvdss'.")
 
+    checkshots_file = Path(checkshots_file)
     df = _parse_checkshots_petrel_dataframe(checkshots_file)
-    twt = df["TWT"].to_numpy(dtype=float, copy=False)
+    depth, twt = _monotonic_checkshot_arrays(df, depth_domain=depth_domain, source=checkshots_file)
     if depth_domain == "md":
-        depth = df["MD"].to_numpy(dtype=float, copy=False)
         return grid.TimeDepthTable(twt=twt, md=depth)
 
-    depth = df["Z"].to_numpy(dtype=float, copy=False)
     return grid.TimeDepthTable(twt=twt, tvdss=depth)
 
 

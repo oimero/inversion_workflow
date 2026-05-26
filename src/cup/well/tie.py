@@ -218,3 +218,55 @@ def plans_dataframe(plans: Sequence[WellTiePlan]) -> pd.DataFrame:
 def results_dataframe(results: Sequence[WellTieResult]) -> pd.DataFrame:
     columns = list(WellTieResult.__dataclass_fields__.keys())
     return pd.DataFrame.from_records([result.to_row() for result in results], columns=columns)
+
+
+def build_auto_tie_search_space(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Build the auto-tie hyperparameter search space from a config mapping."""
+    return [
+        {
+            "name": "logs_median_size",
+            "type": "choice",
+            "values": list(config["logs_median_size_values"]),
+            "value_type": "int",
+            "is_ordered": True,
+            "sort_values": True,
+        },
+        {
+            "name": "logs_median_threshold",
+            "type": "range",
+            "bounds": list(config["logs_median_threshold_bounds"]),
+            "value_type": "float",
+        },
+        {"name": "logs_std", "type": "range", "bounds": list(config["logs_std_bounds"]), "value_type": "float"},
+        {
+            "name": "table_t_shift",
+            "type": "range",
+            "bounds": list(config["table_t_shift_bounds"]),
+            "value_type": "float",
+        },
+    ]
+
+
+def scaled_synthetic_metrics(
+    modeler: Any,
+    wavelet: Any,
+    reflectivity: Any,
+    seismic: Any,
+) -> tuple[np.ndarray, np.ndarray, float, float, float]:
+    """Compute normalized synthetic-to-seismic match metrics.
+
+    Returns (seismic_norm, synthetic, corr, nmae, scale).
+    """
+    synthetic_raw = np.asarray(modeler(wavelet.values, reflectivity.values), dtype=np.float64)
+    seismic_values = np.asarray(seismic.values, dtype=np.float64)
+    seismic_norm = seismic_values - float(np.nanmean(seismic_values))
+    std = float(np.nanstd(seismic_norm))
+    if not np.isfinite(std) or std <= 0.0:
+        raise ValueError("Seismic trace has zero standard deviation.")
+    seismic_norm = seismic_norm / std
+    denom = max(float(np.dot(synthetic_raw, synthetic_raw)), 1e-12)
+    scale = float(np.dot(seismic_norm, synthetic_raw) / denom)
+    synthetic = scale * synthetic_raw
+    corr = float(np.corrcoef(seismic_norm, synthetic)[0, 1]) if np.std(synthetic) > 0 else np.nan
+    nmae = float(np.sum(np.abs(seismic_norm - synthetic)) / max(np.sum(np.abs(seismic_norm)), 1e-12))
+    return seismic_norm, synthetic, corr, nmae, scale

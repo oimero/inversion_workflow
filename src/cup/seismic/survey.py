@@ -664,10 +664,10 @@ def _resolve_context(
 
 
 def segy_options_from_config(seismic_cfg: dict[str, Any]) -> dict[str, int]:
-    """Build SEG-Y options dict from a config section.
+    """从配置段构建 SEG-Y 读取参数字典。
 
-    Maps config keys ``iline``, ``xline``, ``istep``, ``xstep``,
-    ``iline_byte``, ``xline_byte`` to their integer target names.
+    将 ``iline``、``xline``、``istep``、``xstep``、``iline_byte``、
+    ``xline_byte`` 映射为底层读取器需要的整数参数名。
     """
     mapping = {
         "iline": "iline",
@@ -686,9 +686,10 @@ def segy_options_from_config(seismic_cfg: dict[str, Any]) -> dict[str, int]:
 
 
 def snap_line_number(line_float: float, *, line_min: float, line_step: float) -> float:
-    """Snap a floating-point line number to the nearest valid line on a regular grid.
+    """将浮点线号吸附到规则线号轴上的最近有效线号。
 
-    Uses the axis-snap formula: ``line_min + round((line_float - line_min) / line_step) * line_step``.
+    使用轴吸附公式：
+    ``line_min + round((line_float - line_min) / line_step) * line_step``。
     """
     step = float(line_step)
     if step <= 0.0:

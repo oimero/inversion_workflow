@@ -1,4 +1,4 @@
-"""Depth-domain facies-control utilities for AI low-frequency models."""
+"""深度域 AI 低频模型的岩相控制工具。"""
 
 from __future__ import annotations
 
@@ -93,7 +93,7 @@ class LocalControlResult:
 
 
 def load_depth_facies_control_points_csv(path: str | Path) -> list[FaciesControlPoint]:
-    """Load and validate depth-domain facies control points from CSV."""
+    """从 CSV 读取并校验深度域岩相控制点。"""
     path = Path(path)
     df = pd.read_csv(path)
     missing = REQUIRED_COLUMNS - set(df.columns)
@@ -124,7 +124,7 @@ def load_depth_facies_control_points_csv(path: str | Path) -> list[FaciesControl
 
 
 def validate_control_point(point: FaciesControlPoint) -> None:
-    """Validate numeric constraints for one control point."""
+    """校验单个控制点的数值约束。"""
     values = {
         "x": point.x,
         "y": point.y,
@@ -148,7 +148,7 @@ def validate_control_point(point: FaciesControlPoint) -> None:
 
 
 def raised_cosine_weight(normalized_distance: np.ndarray | float) -> np.ndarray:
-    """Return a compact raised-cosine weight for normalized distance in [0, 1]."""
+    """根据 [0, 1] 归一化距离返回紧支撑 raised-cosine 权重。"""
     d = np.asarray(normalized_distance, dtype=np.float64)
     weight = np.zeros_like(d, dtype=np.float64)
     inside = (d >= 0.0) & (d <= 1.0)
@@ -162,7 +162,7 @@ def build_target_layer_from_lfm_metadata(
     *,
     qc_output_dir: str | Path | None = None,
 ) -> Any:
-    """Rebuild a TargetLayer from horizon metadata stored in an AI LFM NPZ."""
+    """根据 AI 低频模型 NPZ 中保存的层位元数据重建 TargetLayer。"""
     from cup.petrel.load import import_interpretation_petrel
     from cup.seismic.target_layer import TargetLayer
 
@@ -362,7 +362,7 @@ def apply_depth_facies_controls(
 
 
 def find_repo_root(start: str | Path | None = None) -> Path:
-    """Find the repository root by walking upward to ``src`` and ``scripts``."""
+    """向上查找同时包含 ``src`` 和 ``scripts`` 的仓库根目录。"""
     path = Path.cwd() if start is None else Path(start)
     path = path.resolve()
     for candidate in [path, *path.parents]:
@@ -388,7 +388,7 @@ def load_qc_context(
     seismic_file: str | Path | None = None,
     device: str = "cpu",
 ) -> FaciesControlQCContext:
-    """Load all heavy objects used by the interactive facies-control QC flow."""
+    """加载交互式岩相控制 QC 流程所需的全部重对象。"""
     import torch
 
     from cup.seismic.survey import open_survey
@@ -675,7 +675,7 @@ def compute_weight_window(
     zone_top: str,
     zone_bottom: str,
 ) -> np.ndarray:
-    """Compute the facies-control weight volume for a local window."""
+    """计算局部窗口中的岩相控制权重体。"""
     samples = np.asarray(samples, dtype=np.float64)
     zone_top_grid, zone_bottom_grid = get_zone_depth_grids(
         target_layer,
@@ -693,7 +693,7 @@ def compute_weight_window(
 
 
 def get_zone_depth_grids(target_layer: Any, *, zone_top: str, zone_bottom: str) -> tuple[np.ndarray, np.ndarray]:
-    """Return ordered top/bottom horizon grids for one target-layer zone."""
+    """返回目标层段有序的顶/底层位深度网格。"""
     top = target_layer.get_horizon_grid(zone_top)
     bottom = target_layer.get_horizon_grid(zone_bottom)
     return np.minimum(top, bottom), np.maximum(top, bottom)
@@ -709,7 +709,7 @@ def forward_qc_at_control_trace(
     *,
     influence_weight_threshold: float = DEFAULT_INFLUENCE_WEIGHT_THRESHOLD,
 ) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
-    """Forward model before/after AI at the control trace and compare to real seismic."""
+    """在控制点道上正演控制前后 AI，并与真实地震道对比。"""
     import torch
 
     li, lj = _nearest_local_indices(result)

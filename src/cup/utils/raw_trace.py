@@ -1,4 +1,17 @@
-"""Basic preprocessing helpers for raw 1D and 2D traces."""
+"""cup.utils.raw_trace: 原始一维/二维道集预处理。
+
+本模块提供道集级别的 z-score 标准化等基础处理。
+
+边界说明
+--------
+- 本模块仅处理数值数组，不涉及 ``grid.BaseTrace`` 等高级对象。
+- NaN 插值委托给 ``wtie.processing.logs.interpolate_nans``。
+
+核心公开对象
+------------
+1. zscore_trace: 单道 z-score 标准化。
+2. zscore_traces_axis: 按行独立 z-score 标准化。
+"""
 
 from __future__ import annotations
 
@@ -6,7 +19,7 @@ import numpy as np
 
 
 def zscore_trace(values: np.ndarray, *, nan_method: str = "linear") -> np.ndarray:
-    """Interpolate missing samples and z-score a full 1D trace."""
+    """插值缺失样点，并对完整一维道做 z-score 标准化。"""
     from wtie.processing.logs import interpolate_nans
 
     x = interpolate_nans(values, method=nan_method)
@@ -18,9 +31,9 @@ def zscore_trace(values: np.ndarray, *, nan_method: str = "linear") -> np.ndarra
 
 
 def zscore_traces_axis(values: np.ndarray) -> np.ndarray:
-    """Z-score every trace (row) of a 2-D array independently (axis=1).
+    """对二维数组的每一行独立执行 z-score 标准化。
 
-    NaN positions are excluded from mean/std computation.
+    NaN 位置不会参与均值和标准差计算。
     """
     values = np.asarray(values, dtype=np.float32)
     finite = np.isfinite(values)
@@ -48,7 +61,7 @@ def _window_radius(window: int) -> tuple[int, int]:
 
 
 def centered_moving_sum(values: np.ndarray, window: int) -> np.ndarray:
-    """1-D centered moving sum with zero-padding at edges."""
+    """一维居中滑动求和，边界使用零填充。"""
     values = np.asarray(values, dtype=float)
     left, right = _window_radius(window)
     padded = np.pad(values, (left, right), mode="constant", constant_values=0.0)
@@ -57,7 +70,7 @@ def centered_moving_sum(values: np.ndarray, window: int) -> np.ndarray:
 
 
 def centered_moving_sum_axis(values: np.ndarray, window: int) -> np.ndarray:
-    """2-D centered moving sum along axis=1 (batch of 1-D traces)."""
+    """沿 axis=1 的二维居中滑动求和，适用于批量一维道。"""
     values = np.asarray(values, dtype=np.float32)
     left, right = _window_radius(window)
     padded = np.pad(values, ((0, 0), (left, right)), mode="constant", constant_values=0.0)
@@ -70,7 +83,7 @@ def centered_moving_sum_axis(values: np.ndarray, window: int) -> np.ndarray:
 
 
 def centered_moving_rms(values: np.ndarray, window: int) -> np.ndarray:
-    """1-D centered moving RMS, treating NaN as missing data."""
+    """一维居中滑动 RMS，将 NaN 视为缺失值。"""
     values = np.asarray(values, dtype=float)
     valid = np.isfinite(values)
     numerator = centered_moving_sum(np.where(valid, values**2, 0.0), window)
@@ -82,7 +95,7 @@ def centered_moving_rms(values: np.ndarray, window: int) -> np.ndarray:
 
 
 def centered_moving_rms_axis(values: np.ndarray, window: int) -> np.ndarray:
-    """2-D centered moving RMS along axis=1, treating NaN as missing data."""
+    """沿 axis=1 的二维居中滑动 RMS，将 NaN 视为缺失值。"""
     values = np.asarray(values, dtype=np.float32)
     valid = np.isfinite(values)
     numerator = centered_moving_sum_axis(np.where(valid, values**2, 0.0), window)
@@ -94,7 +107,7 @@ def centered_moving_rms_axis(values: np.ndarray, window: int) -> np.ndarray:
 
 
 def centered_moving_average(values: np.ndarray, window: int) -> np.ndarray:
-    """1-D centered moving average with edge-padding, preserving sample count."""
+    """一维居中滑动平均，边界延拓并保持样点数不变。"""
     if window <= 1:
         return values.astype(np.float32, copy=False)
     if window % 2 == 0:
@@ -119,7 +132,7 @@ def meters_to_odd_samples(
     *,
     min_samples: int = 3,
 ) -> int:
-    """Convert a physical window length (m) to the nearest odd sample count."""
+    """将米制窗口长度换算为最接近的奇数样点数。"""
     n = int(round(float(window_m) / float(sample_step_m)))
     n = max(n, int(min_samples))
     if n % 2 == 0:

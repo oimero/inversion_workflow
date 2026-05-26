@@ -1,1 +1,1 @@
-"""cup: non-deep-learning modules for geophysical workflows."""
+"""cup: 地球物理工作流中的非深度学习模块。"""

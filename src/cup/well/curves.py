@@ -1,4 +1,20 @@
-"""Curve classification and selection helpers for LAS screening."""
+"""cup.well.curves: LAS 曲线分类与主曲线选择。
+
+本模块提供第二步 LAS 曲线筛选的核心逻辑：曲线简称规范化、按 mnemonic
+规则进行类别归属、以及每个类别中选择主曲线的优先级算法。
+
+边界说明
+--------
+- 本模块不读取 LAS 文件，不进行曲线数值处理。
+- LLM 分类为预留接入点，当前实现基于纯规则匹配。
+
+核心公开对象
+------------
+1. CurveInfo / CurveClassification / CurveSelection: 曲线分类数据结构。
+2. classify_curves_by_rules: 按 mnemonic 规则对曲线进行类别归属。
+3. select_primary_curves: 从分类结果中选择每类的主曲线。
+4. normalize_mnemonic / exact_mnemonic: 曲线简称规范化。
+"""
 
 from __future__ import annotations
 
@@ -10,19 +26,19 @@ from cup.well.mnemonics import CURVE_CATEGORY_MNEMONICS, CURVE_CATEGORY_PRIORITY
 
 
 def normalize_mnemonic(mnemonic: object) -> str:
-    """Normalize a LAS mnemonic for exact-rule matching."""
+    """为规则匹配规范化 LAS 曲线简称。"""
     text = str(mnemonic).strip().upper()
     return re.sub(r":\d+$", "", text)
 
 
 def exact_mnemonic(mnemonic: object) -> str:
-    """Normalize casing/spacing while preserving LASIO duplicate suffixes."""
+    """规范化大小写与空白，同时保留 LASIO 重复曲线后缀。"""
     return str(mnemonic).strip().upper()
 
 
 @dataclass(frozen=True)
 class CurveInfo:
-    """Lightweight LAS curve header record."""
+    """轻量 LAS 曲线头记录。"""
 
     mnemonic: str
     unit: str
@@ -35,7 +51,7 @@ class CurveInfo:
 
 @dataclass(frozen=True)
 class CurveClassification:
-    """Curve category assignment."""
+    """单条曲线的类别归属结果。"""
 
     mnemonic: str
     unit: str
@@ -64,7 +80,7 @@ class CurveClassification:
 
 @dataclass
 class CurveSelection:
-    """Per-well curve screening result."""
+    """单井曲线筛选结果。"""
 
     well_name: str
     las_file: str
@@ -157,7 +173,7 @@ def classify_curves_by_rules(
     well_name: str = "",
     overrides: Mapping[str, Any] | None = None,
 ) -> list[CurveClassification]:
-    """Classify curves by exact local mnemonic rules plus per-well overrides."""
+    """按本地 mnemonic 规则和单井覆盖配置分类曲线。"""
     schema = schema or CURVE_CATEGORY_MNEMONICS
     schema_categories = set(schema)
     lookup = _schema_lookup(schema)
@@ -306,7 +322,7 @@ def select_primary_curves(
     overrides: Mapping[str, Any] | None = None,
     category_priority: Mapping[str, Sequence[str]] | None = None,
 ) -> CurveSelection:
-    """Select one primary curve per selected category and screen the well."""
+    """为每个选中类别选择一条主曲线，并生成单井筛选状态。"""
     well_override = _well_override(overrides, well_name)
     by_category: dict[str, list[CurveClassification]] = {}
     for item in classifications:

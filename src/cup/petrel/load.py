@@ -482,29 +482,28 @@ def _warn_if_petrel_rows_skipped(
 
 
 def read_petrel_checkshots_dataframe(path: Path) -> pd.DataFrame:
-    """Read a Petrel checkshot / time-depth table into a normalised DataFrame.
+    """读取 Petrel checkshot / 时深表文本并返回标准列名 DataFrame。
 
-    This is the single public parser for Petrel checkshot text exports.
-    It handles ``BEGIN HEADER`` / ``END HEADER`` blocks, properly quoted
-    fields, and recognises column aliases used across different Petrel
-    versions (e.g. ``TWT picked`` / ``Well``).
+    这是项目内 Petrel checkshot 文本的统一公共解析器。它处理
+    ``BEGIN HEADER`` / ``END HEADER`` 块、带引号字段，以及不同 Petrel
+    版本中的列名别名，例如 ``TWT picked`` / ``Well``。
 
     Parameters
     ----------
     path : Path
-        Path to the Petrel checkshot text file.
+        Petrel checkshot 文本路径。
 
     Returns
     -------
     pd.DataFrame
-        Columns: ``x_m, y_m, z_m, md_m, twt_ms, well_name`` and
-        optionally ``average_velocity, interval_velocity``.
-        Values are raw Petrel numbers (``twt_ms`` may be negative).
+        包含 ``x_m, y_m, z_m, md_m, twt_ms, well_name``，可选包含
+        ``average_velocity, interval_velocity``。数值保留 Petrel 原始口径，
+        因此 ``twt_ms`` 可能为负值。
 
     Raises
     ------
     ValueError
-        When required columns are missing or the header block is malformed.
+        缺少必需列或头块格式错误时抛出。
     """
     path = Path(path)
 
@@ -598,10 +597,10 @@ def read_petrel_checkshots_dataframe(path: Path) -> pd.DataFrame:
 
 
 def _parse_checkshots_petrel_dataframe(checkshots_file: Path) -> pd.DataFrame:
-    """Legacy wrapper: reads Petrel checkshot text and applies legacy unit conventions.
+    """旧兼容包装：读取 Petrel checkshot 文本并应用旧单位约定。
 
-    Kept for backward compatibility with ``import_checkshots_petrel``.
-    New callers should use ``read_petrel_checkshots_dataframe`` directly.
+    本函数仅为 ``import_checkshots_petrel`` 保留。新调用方应直接使用
+    ``read_petrel_checkshots_dataframe``。
     """
     df = read_petrel_checkshots_dataframe(checkshots_file)
     df["z_m"] = np.abs(df["z_m"].to_numpy(dtype=np.float64))

@@ -1,7 +1,18 @@
-"""Shared infrastructure and I/O helpers.
+"""cup.utils.io: 项目共享基础设施与 I/O 辅助工具。
 
-Functions in this module are project-agnostic and do not depend on any
-geophysical libraries beyond standard Python.
+本模块的函数与地球物理库无关，仅依赖 Python 标准库与基础三方库。
+
+边界说明
+--------
+- 本模块不依赖 ``wtie``、``cup.seismic`` 或 ``cup.well`` 中的任何模块。
+- 路径工具统一以 ``root`` 参数为基准，不在模块内保存全局状态。
+
+核心公开对象
+------------
+1. resolve_relative_path / repo_relative_path: 路径解析与可移植路径表示。
+2. load_yaml_config / write_json: 配置文件加载与 JSON 写出。
+3. sanitize_filename: 文件名安全化。
+4. build_segy_textual_header: SEG-Y 文本头构造。
 """
 
 from __future__ import annotations
@@ -17,8 +28,7 @@ import yaml
 
 
 def resolve_relative_path(relative: str | Path, *, root: Path) -> Path:
-    """Return an absolute path.  If *relative* is already absolute it is
-    returned unchanged; otherwise it is resolved under *root*."""
+    """返回绝对路径；相对路径会在 ``root`` 下解析。"""
     p = Path(relative)
     if p.is_absolute():
         return p
@@ -26,10 +36,9 @@ def resolve_relative_path(relative: str | Path, *, root: Path) -> Path:
 
 
 def repo_relative_path(path: str | Path, *, root: Path) -> str:
-    """Return a portable POSIX-style path relative to *root*.
+    """返回相对 ``root`` 的可移植 POSIX 风格路径。
 
-    Repo artifacts should store paths with this helper instead of embedding
-    workstation-specific absolute paths.
+    仓库产物应使用本函数保存路径，避免写入本机专属绝对路径。
     """
     root = Path(root).resolve()
     p = Path(path)
@@ -44,10 +53,9 @@ def repo_relative_path(path: str | Path, *, root: Path) -> str:
 
 
 def resolve_repo_metadata_path(value: str | Path, *, root: Path) -> Path:
-    """Resolve a repo-relative path stored in artifact metadata.
+    """解析产物元数据中保存的仓库相对路径。
 
-    Absolute metadata paths are intentionally rejected so stale workstation
-    paths fail loudly instead of being guessed.
+    本函数会拒绝绝对路径，让过期的本机路径明确失败。
     """
     p = Path(value)
     if p.is_absolute():
@@ -65,7 +73,7 @@ def resolve_repo_metadata_path(value: str | Path, *, root: Path) -> Path:
 
 
 def load_yaml_config(config_path: str | Path, *, base_dir: Path | None = None) -> dict[str, Any]:
-    """Load a YAML config file, resolving relative paths against *base_dir*."""
+    """读取 YAML 配置文件，并可按 ``base_dir`` 解析相对路径。"""
     path = Path(config_path)
     if not path.is_absolute() and base_dir is not None:
         path = (base_dir / path).resolve()
@@ -77,7 +85,7 @@ def load_yaml_config(config_path: str | Path, *, base_dir: Path | None = None) -
 
 
 def sanitize_filename(name: str) -> str:
-    """Replace characters that are unsafe in file names with underscores."""
+    """将文件名中的不安全字符替换为下划线。"""
     bad = {"/", "\\", " ", ":", "*", "?", '"', "<", ">", "|"}
     return "".join("_" if c in bad else c for c in name)
 
@@ -86,7 +94,7 @@ def sanitize_filename(name: str) -> str:
 
 
 def build_segy_textual_header(title: str, lines: list[str] | None = None) -> str:
-    """Build a 3200-byte SEG-Y textual header from a title and extra lines."""
+    """根据标题和附加行构造 3200 字节 SEG-Y 文本头。"""
     all_lines = [title] + (lines or [])
     rows = [f"C{i:>2d} {text}"[:80].ljust(80) for i, text in enumerate(all_lines, start=1)]
     rows.extend([f"C{i:>2d}".ljust(80) for i in range(len(rows) + 1, 41)])
@@ -100,10 +108,10 @@ def build_segy_textual_header(title: str, lines: list[str] | None = None) -> str
 
 
 def to_json_compatible(value: Any) -> Any:
-    """Recursively convert *value* to JSON-serialisable types.
+    """递归地将输入转换为可 JSON 序列化的类型。
 
-    Handles ``Path``, ``numpy`` scalars and arrays, and containers.
-    Non-finite floats are converted to ``null``.
+    支持 ``Path``、``numpy`` 标量/数组以及常见容器；非有限浮点数会转为
+    ``null``。
     """
     if isinstance(value, Path):
         return value.as_posix()
@@ -128,7 +136,7 @@ def to_json_compatible(value: Any) -> Any:
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    """Write *payload* to *path* as JSON with UTF-8 encoding and 2-space indent."""
+    """用 UTF-8 和 2 空格缩进将 ``payload`` 写为 JSON。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fp:
         json.dump(to_json_compatible(payload), fp, ensure_ascii=False, indent=2)

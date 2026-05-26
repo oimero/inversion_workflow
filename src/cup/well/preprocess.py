@@ -1,4 +1,21 @@
-"""Reusable LAS curve preprocessing helpers for the time-domain workflow."""
+"""cup.well.preprocess: 时间域测井曲线预处理工具。
+
+本模块提供第三步测井预处理的全部可复用逻辑：单位标准化、常值段替换、
+离群值移除、全局分位数阈值计算与曲线可用性判定。
+
+边界说明
+--------
+- 本模块处理的是单条曲线的数值清洗，不涉及井间逻辑或 LAS 文件 IO。
+- 阈值计算基于全局统计数据，不依赖外部模型。
+
+核心公开对象
+------------
+1. UnitStandardization / CurveThreshold: 单位转换与阈值数据结构。
+2. standardize_curve_unit: 按类别和输入单位统一到标准单位。
+3. replace_constant_runs / remove_outliers: 常值段与离群值处理。
+4. compute_global_quantile_thresholds: 基于全局分位数计算阈值。
+5. is_curve_usable / finite_stats: 曲线可用性判定与统计。
+"""
 
 from __future__ import annotations
 
@@ -86,11 +103,11 @@ class CurveThreshold:
 
 @dataclass(frozen=True)
 class WellCurveSet:
-    """Arbitrary MD-domain curves for one well.
+    """单井同一 MD 轴上的任意曲线集合。
 
-    Unlike ``wtie.processing.grid.LogSet``, this object does not require Vp/Rho.
-    It is intended for preprocessing stages that carry auxiliary LAS curves such
-    as GR, caliper, porosity, and saturation before a rock-physics LogSet exists.
+    与 ``wtie.processing.grid.LogSet`` 不同，本对象不要求必须包含 Vp/Rho。
+    它用于预处理阶段承载 GR、井径、孔隙度、含水饱和度等辅助 LAS 曲线，
+    直到后续真正构造岩石物理 LogSet。
     """
 
     well_name: str
@@ -120,7 +137,7 @@ class WellCurveSet:
 
 
 def validate_shared_basis(logs: Mapping[str, grid.Log]) -> None:
-    """Validate that all logs share one MD sampling axis."""
+    """校验所有曲线共享同一条 MD 采样轴。"""
     if not logs:
         raise ValueError("WellCurveSet requires at least one curve.")
     first_name, first_log = next(iter(logs.items()))
@@ -141,7 +158,7 @@ def select_curves_by_category(
     category_to_mnemonic: Mapping[str, str],
     categories: Sequence[str],
 ) -> dict[str, grid.Log]:
-    """Select logs from a curve set according to a category->mnemonic mapping."""
+    """按类别到 mnemonic 的映射从曲线集合中选择曲线。"""
     selected: dict[str, grid.Log] = {}
     for category in categories:
         mnemonic = category_to_mnemonic.get(category)
@@ -154,7 +171,7 @@ def select_curves_by_category(
 
 
 def standard_mnemonic_for_category(category: str) -> str:
-    """Return the workflow standard mnemonic for a curve category."""
+    """返回指定曲线类别在工作流中的标准 mnemonic。"""
     try:
         return STANDARD_MNEMONICS[str(category)]
     except KeyError as exc:
@@ -162,7 +179,7 @@ def standard_mnemonic_for_category(category: str) -> str:
 
 
 def normalize_unit(unit: object) -> str:
-    """Normalize unit spelling for rule matching."""
+    """规范化单位写法以便规则匹配。"""
     text = str(unit or "").strip().lower()
     text = text.replace(" ", "")
     text = text.replace("μ", "u").replace("µ", "u")
@@ -172,7 +189,7 @@ def normalize_unit(unit: object) -> str:
 def values_to_nan(
     values: object, *, null_value: float | None = None, sentinels: Sequence[float] = DEFAULT_MISSING_SENTINELS
 ) -> np.ndarray:
-    """Convert numeric values to float and replace known missing sentinels with NaN."""
+    """将数值转换为 float，并把已知缺失哨兵值替换为 NaN。"""
     out = np.asarray(values, dtype=float).copy()
     missing = ~np.isfinite(out)
     for sentinel in sentinels:
@@ -184,7 +201,7 @@ def values_to_nan(
 
 
 def finite_stats(values: np.ndarray) -> dict[str, Any]:
-    """Return robust finite-value stats for reports and QC rules."""
+    """返回用于报告和 QC 规则的有限值稳健统计。"""
     finite = np.asarray(values, dtype=float)
     finite = finite[np.isfinite(finite)]
     if finite.size == 0:
@@ -230,7 +247,7 @@ def _with_stats(
 
 
 def standardize_curve_unit(values: np.ndarray, *, category: str, unit: str) -> UnitStandardization:
-    """Standardize supported curve units and detect impossible unit mismatches."""
+    """标准化受支持的曲线单位，并识别明显不可能的单位错配。"""
     original_unit = str(unit or "")
     unit_norm = normalize_unit(unit)
     clean = np.asarray(values, dtype=float)
@@ -434,7 +451,7 @@ def compute_global_quantile_thresholds(
     upper_quantile: float,
     min_samples: int,
 ) -> dict[str, CurveThreshold]:
-    """Compute per-standard-curve global quantile thresholds."""
+    """按标准曲线计算全局分位数阈值。"""
     thresholds: dict[str, CurveThreshold] = {}
     for standard, arrays in curves_by_standard.items():
         finite_parts = [np.asarray(values, dtype=float)[np.isfinite(values)] for values in arrays]
@@ -469,7 +486,7 @@ def threshold_from_overrides(
     overrides: Mapping[str, Any] | None,
     auto_thresholds: Mapping[str, CurveThreshold],
 ) -> CurveThreshold:
-    """Resolve well-curve, global, then automatic threshold."""
+    """按井级、全局、自动阈值的优先级解析最终阈值。"""
     overrides = overrides or {}
     well_curve = overrides.get("well_curve", {})
     if isinstance(well_curve, Mapping):
@@ -520,7 +537,7 @@ def _optional_float(value: Any) -> float | None:
 
 
 def remove_outliers(values: np.ndarray, threshold: CurveThreshold) -> OutlierRemoval:
-    """Set values outside a resolved threshold to NaN."""
+    """将解析阈值之外的样点置为 NaN。"""
     cleaned = np.asarray(values, dtype=float).copy()
     if threshold.lower is None and threshold.upper is None:
         return OutlierRemoval(
@@ -550,7 +567,7 @@ def is_curve_usable(
     min_valid_samples: int,
     min_valid_fraction_of_initial: float,
 ) -> tuple[bool, str, int, float]:
-    """Evaluate whether a cleaned curve remains usable."""
+    """判断清洗后的曲线是否仍满足可用性要求。"""
     final_count = int(np.isfinite(np.asarray(values, dtype=float)).sum())
     if initial_valid_count <= 0:
         return False, "no_initial_valid_samples", final_count, 0.0

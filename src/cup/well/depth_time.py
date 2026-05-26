@@ -1,4 +1,23 @@
-"""Depth/time helpers for time-domain well tying."""
+"""cup.well.depth_time: 深度/时间转换与时深关系构建。
+
+本模块提供时间域井震标定所需的时深关系加载、构建、裁剪与校验工具，
+以及目标层段窗口定义、层位网格采样与锚点 TDT 构建。
+
+边界说明
+--------
+- 本模块不负责 auto-tie 优化策略本身，仅提供数据准备层。
+- Petrel checkshot 解析委托给 ``cup.petrel.load.read_petrel_checkshots_dataframe``。
+- TVDSS/MD 口径差异由调用方在进入本模块前统一。
+
+核心公开对象
+------------
+1. TargetTieWindow / PreparedTieWindow: 标定窗口定义与裁剪结果。
+2. HorizonGrid: 层位解释网格，支持双线性采样与最近有效回退。
+3. read_time_depth_table: 读取 Petrel 时深表并归一化到正秒。
+4. build_vp_rho_logset_from_preprocessed_las: 从预处理 LAS 构建 Vp/Rho LogSet。
+5. build_tdt_from_anchor: 基于单一锚点构建时深关系。
+6. prepare_tdt_with_sonic_extension: 原始 TDT 裁剪 + 声波外推。
+"""
 
 from __future__ import annotations
 
@@ -63,11 +82,10 @@ def _read_petrel_checkshot_dataframe(path: Path) -> pd.DataFrame:
 
 
 def read_time_depth_table(path: str | Path, *, domain: Literal["md", "tvdss"] = "md") -> grid.TimeDepthTable:
-    """Read a Petrel checkshot/time-depth table into a wtie table.
+    """读取 Petrel checkshot/时深表并转换为 wtie 时深表。
 
-    Petrel exports in this project store picked TWT as negative milliseconds.
-    The time-domain workflow uses positive seconds, so this reader applies
-    ``abs(twt_ms) / 1000`` and sorts by the requested depth domain.
+    本项目中的 Petrel 导出通常以负毫秒保存解释 TWT。时间域工作流使用正秒，
+    因此本读取器会应用 ``abs(twt_ms) / 1000``，并按指定深度域排序。
     """
     path = Path(path)
     df = _read_petrel_checkshot_dataframe(path)
@@ -127,7 +145,7 @@ def read_time_depth_table(path: str | Path, *, domain: Literal["md", "tvdss"] = 
 
 
 def build_vp_rho_logset_from_preprocessed_las(path: str | Path) -> grid.LogSet:
-    """Build MD-domain Vp/Rho LogSet from third-step standard LAS."""
+    """从第三步标准 LAS 构建 MD 域 Vp/Rho LogSet。"""
     las = lasio.read(str(path))
     df = las.df()
     missing = [name for name in ("DT_USM", "RHO_GCC") if name not in df.columns]
@@ -158,7 +176,7 @@ def validate_time_depth_table(
     *,
     min_overlap_samples: int = 64,
 ) -> dict[str, float | int]:
-    """Validate MD overlap between a table and log basis."""
+    """校验时深表与测井采样轴之间的 MD 重叠范围。"""
     if not table.is_md_domain:
         raise ValueError("vertical_with_tdt expects an MD-domain TimeDepthTable.")
     log_md = np.asarray(log_basis_md, dtype=np.float64)
@@ -180,14 +198,14 @@ def validate_time_depth_table(
 
 
 def tdt_overlaps_window(table: grid.TimeDepthTable, window: TargetTieWindow) -> bool:
-    """Return whether an MD-domain TDT touches the target TWT window."""
+    """判断 MD 域 TDT 是否接触目标 TWT 窗口。"""
     if not table.is_md_domain:
         raise ValueError("TDT/window overlap expects an MD-domain TimeDepthTable.")
     return min(float(table.twt[-1]), float(window.end_s)) > max(float(table.twt[0]), float(window.start_s))
 
 
 def crop_logset_md(logset_md: grid.LogSet, md_min_m: float, md_max_m: float, *, min_samples: int = 2) -> grid.LogSet:
-    """Crop an MD-domain LogSet by MD while preserving existing log names."""
+    """按 MD 裁剪 MD 域 LogSet，并保留原曲线名。"""
     if not logset_md.is_md:
         raise ValueError("LogSet crop expects MD-domain logs.")
     md = np.asarray(logset_md.basis, dtype=np.float64)
@@ -452,7 +470,7 @@ def build_tdt_from_anchor(
     anchor_md_m: float,
     anchor_twt_s: float,
 ) -> grid.TimeDepthTable:
-    """Build an MD-domain TDT by integrating Vp around one absolute anchor."""
+    """围绕一个绝对锚点积分 Vp，构建 MD 域 TDT。"""
     if not logset_md.is_md:
         raise ValueError("Anchor-based TDT construction expects MD-domain logs.")
     md = np.asarray(logset_md.basis, dtype=np.float64)
@@ -496,7 +514,7 @@ def build_tdt_from_anchor(
 
 
 def normalize_twt_seconds(value: float, *, unit: str = "auto") -> float:
-    """Normalize Petrel horizon/checkshot time values to positive seconds."""
+    """将 Petrel 层位或 checkshot 时间值归一化为正秒。"""
     raw = abs(float(value))
     if not np.isfinite(raw):
         raise ValueError(f"TWT value is not finite: {value}")
@@ -511,7 +529,7 @@ def normalize_twt_seconds(value: float, *, unit: str = "auto") -> float:
 
 
 def find_well_top_md(well_tops_df: pd.DataFrame, *, well_name: str, surface: str) -> float:
-    """Find one finite well-top MD using case-insensitive well/surface matching."""
+    """按大小写不敏感的井名和层名匹配，查找唯一有限分层 MD。"""
     required = {"Well", "Surface", "MD"}
     missing = required.difference(well_tops_df.columns)
     if missing:
@@ -531,7 +549,7 @@ def find_well_top_md(well_tops_df: pd.DataFrame, *, well_name: str, surface: str
 
 
 class HorizonGrid:
-    """Small regular-grid interpolator for Petrel interpretation horizons."""
+    """用于 Petrel 层位解释的轻量规则网格插值器。"""
 
     def __init__(self, inline_axis: np.ndarray, xline_axis: np.ndarray, values: np.ndarray, *, name: str = ""):
         self.inline_axis = np.asarray(inline_axis, dtype=np.float64)
@@ -569,7 +587,7 @@ class HorizonGrid:
         *,
         nearest_fallback_max_line_distance: float = 5.0,
     ) -> dict[str, float | str]:
-        """Sample the horizon at floating line coordinates with audit metadata."""
+        """在浮点线号坐标处采样层位，并返回审计元数据。"""
         il = float(inline_float)
         xl = float(xline_float)
         if not (self.inline_axis[0] <= il <= self.inline_axis[-1]):
@@ -628,7 +646,7 @@ class HorizonGrid:
         *,
         nearest_fallback_max_line_distance: float = 5.0,
     ) -> float:
-        """Return the sampled horizon value at floating line coordinates."""
+        """返回浮点线号坐标处的层位采样值。"""
         sample = self.sample_at_line(
             inline_float,
             xline_float,
@@ -643,7 +661,7 @@ def write_time_depth_table_csv(
     *,
     sources: Sequence[str] | None = None,
 ) -> None:
-    """Write a wtie TimeDepthTable to CSV."""
+    """将 wtie TimeDepthTable 写出为 CSV。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     depth_name = "md_m" if table.is_md_domain else "tvdss_m"

@@ -1,8 +1,19 @@
-"""Well trajectory models and Petrel trajectory parsing.
+"""cup.well.trajectory: 井轨迹模型与 Petrel 轨迹解析。
 
-This module owns the project-level trajectory representation.  It deliberately
-keeps Petrel parsing, TVDSS convention and wtie adaptation out of workflow
-scripts so later deviated-well steps can reuse the same geometry facts.
+本模块持有项目级的井轨迹表示，将 Petrel 轨迹解析、TVDSS 口径换算
+与 wtie 适配逻辑集中于此，供斜井路径各步复用同一几何事实。
+
+边界说明
+--------
+- 本模块不负责井型判定（直/斜），判定逻辑在 ``cup.well.assets`` 与
+  ``well_trajectory_qc.py`` 中。
+- TVDSS 换算约定在本模块内唯一实现，其他模块不应独立散写。
+
+核心公开对象
+------------
+1. WellTrajectory: 井轨迹完整表示（MD、TVD、XY、Z、井斜、方位）。
+2. trajectory_summary: 轨迹几何摘要。
+3. z_tvd_residual_m: Z 与 TVD 一致性残差。
 """
 
 from __future__ import annotations
@@ -68,7 +79,7 @@ def _column_lookup(columns: list[str]) -> dict[str, int]:
 
 @dataclass(frozen=True)
 class WellTrajectory:
-    """Project-level well trajectory with MD, TVDSS and XY geometry."""
+    """项目级井轨迹对象，包含 MD、TVDSS 与 XY 几何信息。"""
 
     well_name: str
     header_well_name: str | None
@@ -89,11 +100,10 @@ class WellTrajectory:
 
     @classmethod
     def from_petrel_trace(cls, path: str | Path) -> "WellTrajectory":
-        """Read a Petrel well trace text export.
+        """读取 Petrel 导出的井轨迹文本。
 
-        The current project convention is ``tvdss_m = tvd_kb_m - kb_m``.
-        Required Petrel columns are ``MD``, ``X``, ``Y``, ``Z`` and ``TVD``.
-        Optional columns are filled with NaN when absent.
+        当前项目约定为 ``tvdss_m = tvd_kb_m - kb_m``。必需列为
+        ``MD``、``X``、``Y``、``Z`` 与 ``TVD``；可选列缺失时填 NaN。
         """
         source_file = Path(path).resolve()
         metadata, columns, column_line_index = _read_petrel_header(source_file)
@@ -191,15 +201,15 @@ class WellTrajectory:
         return int(self.md_m.size)
 
     def to_wtie_wellpath(self) -> grid.WellPath:
-        """Return the wtie adapter for MD/TVDSS conversions."""
+        """返回用于 wtie MD/TVDSS 转换的 WellPath 适配对象。"""
         return grid.WellPath(md=self.md_m, tvdss=self.tvdss_m, kb=self.kb_m)
 
     def with_well_name(self, well_name: str) -> "WellTrajectory":
-        """Return a copy with a workflow-normalized display well name."""
+        """返回替换显示井名后的副本。"""
         return replace(self, well_name=str(well_name).strip())
 
     def position_at_md(self, md_m: float) -> dict[str, float]:
-        """Interpolate trajectory position at measured depth in metres."""
+        """按米制 MD 插值得到轨迹位置。"""
         md = float(md_m)
         if md < float(self.md_m[0]) or md > float(self.md_m[-1]):
             raise ValueError(f"MD {md} is outside trajectory range [{self.md_m[0]}, {self.md_m[-1]}].")
@@ -213,9 +223,9 @@ class WellTrajectory:
         }
 
     def representative_position(self, policy: str = "surface") -> dict[str, float]:
-        """Return a representative trajectory position.
+        """返回一组代表性轨迹位置。
 
-        Supported policies are ``surface``, ``bottom`` and ``max_offset``.
+        支持策略为 ``surface``、``bottom`` 与 ``max_offset``。
         """
         policy_key = policy.strip().casefold()
         if policy_key == "surface":
@@ -241,12 +251,12 @@ class WellTrajectory:
 
 
 def z_tvd_residual_m(trajectory: WellTrajectory) -> np.ndarray:
-    """Return ``Z - (KB - TVD)`` residuals in metres."""
+    """返回米制 ``Z - (KB - TVD)`` 残差。"""
     return trajectory.z_m - (trajectory.kb_m - trajectory.tvd_kb_m)
 
 
 def horizontal_offsets_m(trajectory: WellTrajectory) -> np.ndarray:
-    """Return horizontal offsets from the first trajectory point."""
+    """返回相对第一个轨迹点的水平偏移。"""
     return np.hypot(trajectory.x_m - trajectory.x_m[0], trajectory.y_m - trajectory.y_m[0])
 
 
@@ -259,7 +269,7 @@ def finite_max(values: np.ndarray) -> float | None:
 
 
 def trajectory_summary(trajectory: WellTrajectory) -> Mapping[str, float | int | None]:
-    """Return core numerical summary values for one trajectory."""
+    """返回单条轨迹的核心数值摘要。"""
     offsets = horizontal_offsets_m(trajectory)
     return {
         "point_count": trajectory.point_count,

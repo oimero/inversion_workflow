@@ -1,4 +1,21 @@
-"""Route planning and execution helpers for well auto-tie workflows."""
+"""cup.well.tie: 井震自动标定路由规划与执行辅助。
+
+本模块定义自动标定的路由枚举、井级标定计划与结果数据结构，
+并提供路由构建、搜索空间生成以及合成记录-地震匹配指标计算。
+
+边界说明
+--------
+- 本模块只定义数据结构和路由策略，不包含 auto-tie 优化求解器。
+- 优化器入口在 ``wtie.optimize.autotie``。
+
+核心公开对象
+------------
+1. TieRoute: 标定路由枚举（直井 TDT、直井锚点、斜井路径等）。
+2. WellTiePlan / WellTieResult: 井级标定计划与结果。
+3. build_tie_plan: 根据上游 QC 数据构建标定路由计划。
+4. build_auto_tie_search_space: 从配置构建超参数搜索空间。
+5. scaled_synthetic_metrics: 计算归一化合成记录-地震匹配指标。
+"""
 
 from __future__ import annotations
 
@@ -108,7 +125,7 @@ def build_tie_plan(
     enabled_routes: Sequence[str],
     allow_near_outside: bool = False,
 ) -> list[WellTiePlan]:
-    """Build one route-plan row per inventory well."""
+    """为清单中的每口井构建一行标定路由计划。"""
     preprocess_by_key = _build_lookup(preprocess_df)
     trajectory_by_key = _build_lookup(trajectory_df if trajectory_df is not None else pd.DataFrame())
     enabled = {str(route) for route in enabled_routes}
@@ -221,7 +238,7 @@ def results_dataframe(results: Sequence[WellTieResult]) -> pd.DataFrame:
 
 
 def build_auto_tie_search_space(config: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Build the auto-tie hyperparameter search space from a config mapping."""
+    """根据配置构建 auto-tie 超参数搜索空间。"""
     return [
         {
             "name": "logs_median_size",
@@ -253,9 +270,9 @@ def scaled_synthetic_metrics(
     reflectivity: Any,
     seismic: Any,
 ) -> tuple[np.ndarray, np.ndarray, float, float, float]:
-    """Compute normalized synthetic-to-seismic match metrics.
+    """计算归一化合成记录与地震道的匹配指标。
 
-    Returns (seismic_norm, synthetic, corr, nmae, scale).
+    返回 ``(seismic_norm, synthetic, corr, nmae, scale)``。
     """
     synthetic_raw = np.asarray(modeler(wavelet.values, reflectivity.values), dtype=np.float64)
     seismic_values = np.asarray(seismic.values, dtype=np.float64)

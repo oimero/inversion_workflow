@@ -1,4 +1,15 @@
-"""Generic statistics and fitting helpers."""
+"""cup.utils.statistics: 通用统计与拟合辅助工具。
+
+本模块提供 Pearson 相关系数等基础统计函数。
+
+边界说明
+--------
+- 本模块不依赖地球物理库，仅使用 numpy/pandas。
+
+核心公开对象
+------------
+1. pearson_r: Pearson 相关系数，自动忽略非有限值。
+"""
 
 from __future__ import annotations
 

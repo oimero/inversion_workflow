@@ -1,4 +1,16 @@
-"""cup.utils.config: Config merging helpers shared across workflow scripts."""
+"""cup.utils.config: 配置合并辅助工具。
+
+本模块提供脚本配置段的默认值合并逻辑。
+
+边界说明
+--------
+- 不依赖任何地球物理库。
+- 合并是就地修改，调用方如需保留原始配置应自行深拷贝。
+
+核心公开对象
+------------
+1. merge_dict_defaults: 将默认值字典合并到配置 key 下。
+"""
 
 from __future__ import annotations
 

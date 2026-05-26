@@ -1,4 +1,4 @@
-"""XY spatial helpers for regular seismic trace grids."""
+"""规则地震道网格的 XY 空间计算辅助工具。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import numpy as np
 
 
 class SurveyLineToCoord(Protocol):
-    """Minimum survey interface needed to resolve inline/xline to XY."""
+    """将 inline/xline 转换为 XY 所需的最小工区接口。"""
 
     def line_to_coord(self, il_no: float, xl_no: float) -> tuple[float, float]: ...
 
@@ -18,7 +18,7 @@ def build_trace_xy_grids(
     ilines: np.ndarray,
     xlines: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build trace-center XY grids from survey line coordinates."""
+    """根据工区线号坐标构建道中心 XY 网格。"""
     ilines = np.asarray(ilines, dtype=np.float64)
     xlines = np.asarray(xlines, dtype=np.float64)
     if ilines.ndim != 1 or xlines.ndim != 1 or ilines.size == 0 or xlines.size == 0:
@@ -46,7 +46,7 @@ def build_trace_xy_grids(
 
 
 def nominal_bin_spacing_m(x_grid: np.ndarray, y_grid: np.ndarray) -> float:
-    """Return a robust nominal trace-center spacing in XY meters."""
+    """返回稳健的名义道中心米制间距。"""
     x = np.asarray(x_grid, dtype=np.float64)
     y = np.asarray(y_grid, dtype=np.float64)
     if x.shape != y.shape or x.ndim != 2:
@@ -72,7 +72,7 @@ def xy_distance_grid(
     center_x: float,
     center_y: float,
 ) -> np.ndarray:
-    """Compute XY Euclidean distance from every trace center to one center point."""
+    """计算每个道中心到指定中心点的 XY 欧氏距离。"""
     x = np.asarray(x_grid, dtype=np.float64)
     y = np.asarray(y_grid, dtype=np.float64)
     if x.shape != y.shape or x.ndim != 2:
@@ -88,7 +88,7 @@ def xy_circle_mask(
     center_y: float,
     radius_xy_m: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return ``(mask, distance_m)`` for a true XY circular radius."""
+    """基于真实 XY 圆形半径返回 ``(mask, distance_m)``。"""
     radius = float(radius_xy_m)
     if radius < 0.0:
         raise ValueError(f"radius_xy_m must be non-negative, got {radius}.")

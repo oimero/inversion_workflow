@@ -1,8 +1,20 @@
-"""Well asset inventory helpers.
+"""cup.well.assets: 井资产盘点辅助工具。
 
-This module keeps first-pass well asset bookkeeping out of workflow scripts.
-It intentionally works with light metadata only: well heads, file presence,
-surface/bottom coordinates, and coarse spatial QC labels.
+本模块将第一步井资产盘点逻辑从工作流脚本中抽离为可复用的数据结构与函数。
+仅处理轻量元数据：井头、文件存在性、井口/底孔坐标与粗粒度空间 QC 标签。
+
+边界说明
+--------
+- 本模块不读取 LAS 曲线内容，也不解析斜井轨迹文件。
+- 井名匹配、文件查找、井型初分与平台聚类均在本模块完成。
+
+核心公开对象
+------------
+1. WellHead / WellInventoryRecord / WellInventory: 井资产盘点数据结构。
+2. NeighborPair / WellClusterRow: 井间关系与平台聚类输出。
+3. build_file_lookup / build_name_lookup: 井名与文件查找。
+4. classify_wellbore / determine_inventory_status: 井型初分与状态判定。
+5. normalize_well_name: 项目统一的井名规范化键。
 """
 
 from __future__ import annotations
@@ -16,7 +28,7 @@ import pandas as pd
 
 
 def normalize_well_name(name: object) -> str:
-    """Return the project-wide matching key for a well name."""
+    """返回项目统一的井名匹配键。"""
     return str(name).strip().casefold()
 
 
@@ -30,7 +42,7 @@ def _is_missing_well_name(name: str) -> bool:
 
 
 def build_name_lookup(names: Iterable[object], *, asset_label: str) -> dict[str, str]:
-    """Build a case-insensitive lookup and fail on case-only collisions."""
+    """构建大小写不敏感查找表，并在大小写冲突时失败。"""
     lookup: dict[str, str] = {}
     for raw_name in names:
         display = _display_well_name(raw_name)
@@ -48,7 +60,7 @@ def build_name_lookup(names: Iterable[object], *, asset_label: str) -> dict[str,
 
 
 def build_file_lookup(files: Iterable[Path], *, asset_label: str) -> dict[str, Path]:
-    """Build a case-insensitive stem lookup for asset files."""
+    """按文件 stem 构建大小写不敏感的资产文件查找表。"""
     lookup: dict[str, Path] = {}
     display_by_key: dict[str, str] = {}
     for file_path in files:
@@ -91,7 +103,7 @@ def classify_wellbore(
     *,
     vertical_bottom_offset_threshold_m: float,
 ) -> tuple[str, float | None]:
-    """Classify a well from surface-to-bottom horizontal offset."""
+    """根据井口到底孔的水平偏移初分井型。"""
     coords = [optional_float(v) for v in (surface_x, surface_y, bottom_x, bottom_y)]
     if any(v is None for v in coords):
         return "unknown", None
@@ -105,7 +117,7 @@ def classify_wellbore(
 
 @dataclass(frozen=True)
 class WellHead:
-    """Structured Petrel well-head record."""
+    """结构化的 Petrel 井头记录。"""
 
     well_name: str
     surface_x: float | None
@@ -128,7 +140,7 @@ class WellHead:
 
 @dataclass
 class WellInventoryRecord:
-    """One row in ``well_inventory.csv``."""
+    """``well_inventory.csv`` 中的一井一行记录。"""
 
     well_name: str
     has_well_head: bool
@@ -226,7 +238,7 @@ class WellInventory:
 
 
 def determine_inventory_status(*, has_las: bool, has_well_head: bool) -> tuple[str, list[str]]:
-    """Return LAS-screening status plus reasons."""
+    """返回 LAS 筛选资产状态及原因。"""
     reasons: list[str] = []
     if has_las and has_well_head:
         return "usable_for_las_screen", reasons
@@ -246,7 +258,7 @@ def build_platform_clusters(
     *,
     platform_cluster_threshold_m: float,
 ) -> list[list[WellInventoryRecord]]:
-    """Group valid-surface wells into platform clusters by connected components."""
+    """用连通分量将有效井口聚合为平台井簇。"""
     valid = [
         record
         for record in records
@@ -323,7 +335,7 @@ def build_neighbor_pairs(
     dense_well_neighbor_threshold_m: float,
     platform_cluster_threshold_m: float,
 ) -> tuple[list[NeighborPair], dict[str, Any]]:
-    """Build non-platform same-trace conflicts and complete summary counts."""
+    """构建非同平台同最近道冲突井对，并返回完整近邻统计。"""
     valid = [
         record
         for record in records

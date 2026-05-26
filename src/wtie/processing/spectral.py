@@ -388,9 +388,6 @@ def pt_convolution(wavelets: Tensor,
         shape is (batch_size, 1, length_wavelet)
     reflectivities : Tensor
         shape is (batch_size, 1, length_reflectivity)
-    mode : str, optional
-        boundary conditions can be set to `valid` or `same` (see scipy).
-        Default is `valid`. DISABLED.
 
     Returns
     ----------

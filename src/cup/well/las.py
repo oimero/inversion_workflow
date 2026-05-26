@@ -1,4 +1,18 @@
-"""LAS header scanning and selected-curve export helpers."""
+"""cup.well.las: LAS 文件头扫描与筛选曲线导出。
+
+本模块提供 LAS 文件头的轻量扫描、曲线存在性检查，以及将筛选后的曲线
+导出为标准 LAS 文件的工具。
+
+边界说明
+--------
+- 本模块不负责曲线分类与主曲线选择，这些由 ``cup.well.curves`` 处理。
+- 导出时不修改曲线数值，输入清洗应在上游完成。
+
+核心公开对象
+------------
+1. scan_las_curves: 扫描 LAS 文件头与曲线列表。
+2. export_selected_curves_to_las: 将筛选后的曲线集合导出为 LAS。
+"""
 
 from __future__ import annotations
 
@@ -81,13 +95,13 @@ def _build_las_header(las: lasio.LASFile, *, fallback_well_name: str) -> LasHead
 
 
 def scan_las_header(path: Path) -> LasHeader:
-    """Read LAS metadata without loading data samples."""
+    """不加载数据样点，仅读取 LAS 元数据。"""
     las = lasio.read(str(path), ignore_data=True)
     return _build_las_header(las, fallback_well_name=Path(path).stem)
 
 
 def scan_las_curves(path: Path) -> tuple[LasHeader, list[CurveInfo]]:
-    """Read LAS curve headers without loading data samples."""
+    """不加载数据样点，仅读取 LAS 曲线头信息。"""
     las = lasio.read(str(path), ignore_data=True)
     header = _build_las_header(las, fallback_well_name=Path(path).stem)
     curves = [
@@ -133,7 +147,7 @@ def export_selected_curves_to_las(
     null_value: float = -999.25,
     write_fmt: str = "%.6f",
 ) -> tuple[Path, list[dict[str, str]], list[str]]:
-    """Export the LAS index curve plus selected original curves."""
+    """导出 LAS 索引曲线和选中的原始曲线。"""
     _validate_write_format(write_fmt)
     output_las = Path(output_las)
     output_las.parent.mkdir(parents=True, exist_ok=True)

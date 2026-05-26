@@ -1,1 +1,1 @@
-"""cup.seismic: survey context, spatial helpers, and seismic processing."""
+"""cup.seismic: 地震工区上下文、空间计算与地震处理工具。"""

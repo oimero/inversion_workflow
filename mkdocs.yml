@@ -1,10 +1,15 @@
-site_name: API 文档
-site_description: API 参考文档
+site_name: xihu workflow standardize
+site_description: 时间域井震工作流、井资产盘点、LAS 曲线筛选、测井预处理、井轨迹 QC、井震自动标定
 repo_name: inversion_workflow
 
 theme:
   name: material
   language: zh
+  features:
+    - navigation.sections
+    - navigation.top
+    - toc.follow
+    - content.code.copy
 
 plugins:
   - search
@@ -24,27 +29,45 @@ plugins:
             inherited_members: false
             load_external_modules: false
 
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - tables
+
 nav:
   - 首页: index.md
-  - API 总览: api/index.md
-  - API:
-    - wtie:
-      - 命名空间总览: api/wtie/index.md
-      - wtie.modeling: api/wtie/modeling.md
-      - wtie.learning: api/wtie/learning.md
-      - wtie.processing: api/wtie/processing.md
-      - wtie.optimize: api/wtie/optimize.md
-      - wtie.utils: api/wtie/utils.md
-    - cup:
-      - 命名空间总览: api/cup/index.md
-      - cup.petrel: api/cup/petrel.md
-      - cup.seismic: api/cup/seismic.md
-      - cup.well: api/cup/well.md
-  - 指南:
+  - 快速开始:
+      - 时间域工作流总览: concepts/time-domain-workflow.md
+      - 数据与坐标约定: concepts/data-and-coordinate-conventions.md
+  - 教程:
       - 01 井资产盘点: guide/1-well-inventory.md
       - 02 LAS 曲线筛选与导出: guide/2-las-curve-screen.md
       - 03 测井预处理: guide/3-log-preprocess.md
+      - 旁路 井轨迹 QC: guide/well-trajectory-qc.md
       - 04 井震自动标定: guide/4-well-auto-tie.md
       - 05 子波批量合成与全局选择: guide/5-wavelet-batch-synthetic.md
-      - 斜井支持的 src/cup 重构规划: guide/deviated-well-src-cup-refactor.md
       - 常见问题: guide/troubleshooting.md
+  - 架构与路线图:
+      - 斜井支持的 src/cup 重构规划: guide/deviated-well-src-cup-refactor.md
+  - API:
+      - API 总览: api/index.md
+      - cup:
+          - 命名空间总览: api/cup/index.md
+          - cup.petrel: api/cup/petrel.md
+          - cup.seismic: api/cup/seismic.md
+          - cup.well: api/cup/well.md
+          - cup.utils: api/cup/utils.md
+      - wtie:
+          - 命名空间总览: api/wtie/index.md
+          - wtie.modeling: api/wtie/modeling.md
+          - wtie.learning: api/wtie/learning.md
+          - wtie.processing: api/wtie/processing.md
+          - wtie.optimize: api/wtie/optimize.md
+          - wtie.utils: api/wtie/utils.md

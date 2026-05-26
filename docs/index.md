@@ -1,27 +1,18 @@
-# API 文档
+# xihu workflow standardize
 
-此处是本项目的参考文档，用于快速定位模块、类和函数。
+本项目整理时间域井震工作流、井资产盘点、LAS 曲线筛选、测井预处理、
+井轨迹 QC、井震自动标定，以及深度域 legacy 工作流。
 
-## 文档范围
+## 推荐阅读路径
 
-- 第一版聚焦 API 检索，不包含完整教程
+1. 先看[时间域工作流总览](concepts/time-domain-workflow.md)。
+2. 按教程 01 → 02 → 03 → 04 跑主链。
+3. 在 01 之后可运行[井轨迹 QC](guide/well-trajectory-qc.md) 旁路，
+   为斜井路径和第四步 preflight 服务。
+4. 需要查函数/类时再看 [API Reference](api/index.md)。
 
-## 快速开始
+## 本地预览
 
-1. 安装文档依赖
-
-```bash
-pip install -r requirements-docs.txt
-```
-
-2. 启动本地预览
-
-```bash
-python -m mkdocs serve
-```
-
-3. 打开浏览器访问
-
-```text
-http://127.0.0.1:8000
+```powershell
+C:\Users\WangQinZhuo\miniconda3\envs\pinn_inversion\python.exe -m mkdocs serve
 ```

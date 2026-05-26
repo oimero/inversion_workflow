@@ -1,1 +1,1 @@
-"""cup.well: well asset, curve, trajectory, and auto-tie helpers."""
+"""cup.well: 井资产、曲线、轨迹与井震标定辅助工具。"""

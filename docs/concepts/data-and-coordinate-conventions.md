@@ -4,7 +4,7 @@
 
 - 时间域主链内部统一使用**正秒**。
 - Petrel 导出可能是负毫秒，读取时通过 `abs(twt_ms) / 1000.0` 归一化。
-- `cup.well.depth_time.read_time_depth_table()` 是统一的 TWT 读取入口。
+- `cup.well.td.load_petrel_time_depth_table()` 是 Petrel 时深表进入项目内 TDT 的统一入口。
 
 ## TVDSS 与 Petrel `Z`
 

@@ -1,6 +1,6 @@
 """cup.petrel.export: Petrel 相关文本与 LAS 导出工具。
 
-本模块提供 LAS、checkshots 文本、两列 CSV 等导出能力，
+本模块提供 LAS、checkshots 文本等导出能力，
 用于将项目内部 ``wtie.processing.grid`` 数据结构转换为
 Petrel 或下游解释流程常用的交换格式。
 

@@ -45,17 +45,17 @@ from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_
 from cup.utils.coerce import as_bool
 from cup.utils.config import merge_dict_defaults
 from cup.well.assets import build_file_lookup
-from cup.well.depth_time import (
+from cup.well.las import load_vp_rho_logset_from_standard_las
+from cup.well.td import (
     HorizonGrid,
     PreparedTieWindow,
     TargetTieWindow,
     build_tdt_from_anchor,
-    build_vp_rho_logset_from_preprocessed_las,
     find_well_top_md,
+    load_petrel_time_depth_table,
     normalize_twt_seconds,
     prepare_anchor_tdt_for_window,
     prepare_tdt_with_sonic_extension,
-    read_time_depth_table,
     tdt_overlaps_window,
     validate_time_depth_table,
     write_time_depth_table_csv,
@@ -515,8 +515,8 @@ def _run_vertical_with_tdt(
     input_las = _resolve_repo_path(plan.input_las)
     time_depth_file = _resolve_repo_path(plan.time_depth_file)
 
-    logset_md = build_vp_rho_logset_from_preprocessed_las(input_las)
-    table = read_time_depth_table(time_depth_file, domain="md")
+    logset_md = load_vp_rho_logset_from_standard_las(input_las)
+    table = load_petrel_time_depth_table(time_depth_file, domain="md")
     target_window = _target_tie_window_for_plan(
         plan=plan,
         survey=survey,
@@ -570,7 +570,7 @@ def _run_vertical_anchor_from_tops(
         raise ValueError(f"coarse_anchor.apply_to_routes does not include {plan.route}.")
 
     input_las = _resolve_repo_path(plan.input_las)
-    logset_md = build_vp_rho_logset_from_preprocessed_las(input_las)
+    logset_md = load_vp_rho_logset_from_standard_las(input_las)
     spec = _anchor_spec_for_well(anchor_config, plan.well_name)
     anchor_md_m = find_well_top_md(well_tops_df, well_name=plan.well_name, surface=str(spec["well_top"]))
     inline_float, xline_float = survey.coord_to_line(float(plan.surface_x), float(plan.surface_y))

@@ -1,6 +1,6 @@
-"""cup.petrel.load: Petrel 相关文本、LAS 与地震数据加载工具。
+"""cup.petrel.load: Petrel 相关文本与地震数据加载工具。
 
-本模块负责读取 SEG-Y/ZGY 地震体、LAS 曲线、Petrel 导出的
+本模块负责读取 SEG-Y/ZGY 地震体，以及 Petrel 导出的
 checkshots / well heads / well tops / interpretation 文本，
 并转换为项目内部 ``wtie.processing.grid`` 对象或 ``pandas.DataFrame``。
 
@@ -13,10 +13,8 @@ checkshots / well heads / well tops / interpretation 文本，
 核心公开对象
 ------------
 1. import_seismic: 读取 3D SEG-Y 或 ZGY 地震体。
-2. old_extract_vp_log_from_las / extract_vs_log_from_las / old_extract_rho_log_from_las: 从 LAS 提取标准物性曲线。
-3. extract_any_log_from_las: 提取任意单条 LAS 曲线。
-4. old_load_vp_rho_logset_from_las: 从 LAS 路径构造旧深度域 ``grid.LogSet``。
-5. import_checkshots_petrel / import_well_heads_petrel / import_well_tops_petrel / import_interpretation_petrel:
+2. read_petrel_checkshots_dataframe: 将 Petrel checkshot 文本解析为表格。
+3. import_checkshots_petrel / import_well_heads_petrel / import_well_tops_petrel / import_interpretation_petrel:
    读取 Petrel 文本结果。
 """
 
@@ -25,17 +23,13 @@ from __future__ import annotations
 import re
 import warnings
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
-import lasio
 import numpy as np
 import pandas as pd
 
-from cup.well.mnemonics import _RHO_MNEMONICS, _VP_MNEMONICS, _VS_MNEMONICS
 from wtie.processing import grid
-from wtie.processing.logs import interpolate_nans
 
-_SENTINEL_VALUES = (-999.0, -999.25, -99999)
 _INTERPRETATION_LINE_PATTERN = re.compile(
     r"^\s*INLINE\s*:\s*([+-]?\d+)\s+XLINE\s*:\s*([+-]?\d+)\s+"
     r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+"
@@ -109,303 +103,6 @@ def import_seismic(
         return volume
 
     raise ValueError(f"Unsupported seismic_type: {seismic_type}. Expect 'segy' or 'zgy'.")
-
-
-def _normalize_mnemonic(name: str) -> str:
-    """规范化曲线简称的大小写与空白。"""
-    return str(name).strip().upper()
-
-
-def _matches_mnemonic_with_optional_suffix(column_name: str, base_mnemonic: str) -> bool:
-    """判断列名是否匹配“基础缩写 + 可选下划线后缀”规则。"""
-    col_norm = _normalize_mnemonic(column_name)
-    base_norm = _normalize_mnemonic(base_mnemonic)
-    return col_norm == base_norm or col_norm.startswith(f"{base_norm}_")
-
-
-def _select_curve_mnemonic(
-    las_df: pd.DataFrame,
-    candidate_mnemonics: Tuple[str, ...],
-    property_name: str,
-    curve_mnemonic: Optional[str] = None,
-) -> str:
-    """从候选简称中选择唯一可用曲线。"""
-    columns = [str(c) for c in las_df.columns]
-    norm_to_original = {_normalize_mnemonic(c): c for c in columns}
-
-    if curve_mnemonic is not None:
-        norm_user = _normalize_mnemonic(curve_mnemonic)
-        if norm_user not in norm_to_original:
-            raise ValueError(f"指定的 {property_name} 曲线简称不存在: {curve_mnemonic}. 可用曲线: {columns}")
-        return norm_to_original[norm_user]
-
-    matched = [
-        col
-        for col in columns
-        if any(_matches_mnemonic_with_optional_suffix(col, candidate) for candidate in candidate_mnemonics)
-    ]
-
-    if len(matched) == 0:
-        raise ValueError(
-            f"未找到 {property_name} 曲线。候选简称: {list(candidate_mnemonics)}. 请检查是否存在其他可用简称？"
-        )
-
-    if len(matched) > 1:
-        raise ValueError(
-            f"检测到多个 {property_name} 候选曲线: {matched}. 请通过 curve_mnemonic 显式指定要使用的简称。"
-        )
-
-    return matched[0]
-
-
-def _get_curve_unit(las_file: lasio.LASFile, selected_mnemonic: str) -> str:
-    """获取 LAS 曲线的单位字符串。"""
-    norm_selected = _normalize_mnemonic(selected_mnemonic)
-    for curve in las_file.curves:
-        if _normalize_mnemonic(curve.mnemonic) == norm_selected:
-            return str(curve.unit or "")
-    return ""
-
-
-def _replace_sentinel_values(values: object) -> np.ndarray:
-    """将异常占位值替换为 NaN。"""
-    out = np.asarray(values, dtype=float).copy()
-    for sentinel in _SENTINEL_VALUES:
-        out[np.isclose(out, sentinel, equal_nan=False)] = np.nan
-    out[~np.isfinite(out)] = np.nan
-    return out
-
-
-def _convert_velocity_input_to_mps(values: object, unit: str, property_name: str) -> np.ndarray:
-    """将速度或时差曲线转换为 m/s。"""
-    curve_values = _replace_sentinel_values(values)
-    curve_values[curve_values <= 0] = np.nan
-
-    unit_norm = str(unit).strip().lower().replace(" ", "")
-    if unit_norm in {"us/ft", "μs/ft", "µs/ft"}:
-        velocity = 0.3048 * 1e6 / curve_values
-    elif unit_norm in {"us/m", "μs/m", "µs/m"}:
-        velocity = 1e6 / curve_values
-    elif unit_norm in {"m/s", "mps", "m/sec", "meter/s", "meters/s"}:
-        velocity = curve_values
-    else:
-        raise ValueError(f"{property_name} 曲线单位不受支持: '{unit}'. 当前仅支持 us/ft、us/m 或 m/s。")
-
-    if np.all(np.isnan(velocity)):
-        raise ValueError(f"{property_name} 曲线在异常值处理与单位转换后全部为 NaN。")
-
-    return velocity
-
-
-def _convert_density_to_g_cm3(density_values: object, unit: str) -> np.ndarray:
-    """将密度曲线转换为 g/cm3。"""
-    density = _replace_sentinel_values(density_values)
-
-    unit_norm = str(unit).strip().lower().replace(" ", "")
-    if unit_norm in {"g/cm3", "g/cc", "g/cm^3"}:
-        density_g_cm3 = density
-    elif unit_norm in {"kg/m3", "kg/m^3"}:
-        density_g_cm3 = density / 1000.0
-    else:
-        raise ValueError(f"Rho 曲线单位不受支持: '{unit}'. 当前仅支持 g/cm3、g/cc 或 kg/m3。")
-
-    if np.all(np.isnan(density_g_cm3)):
-        raise ValueError("Rho 曲线在异常值处理与单位转换后全部为 NaN。")
-
-    return density_g_cm3
-
-
-def old_extract_vp_log_from_las(
-    las_file: lasio.LASFile,
-    unit: str,
-    curve_mnemonic: Optional[str] = None,
-) -> grid.Log:
-    """旧深度域兼容入口：从原始 LAS 文件中提取纵波速度曲线（Vp）。
-
-    Parameters
-    ----------
-    las_file : lasio.LASFile
-        已加载的 LAS 文件对象。
-    unit : str
-        输入曲线单位（必选）。支持 ``us/ft``、``us/m`` 或 ``m/s``。
-    curve_mnemonic : str, optional
-        指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
-
-    Returns
-    -------
-    grid.Log
-        纵波速度曲线，坐标域为 MD，输出单位统一为 m/s。
-
-    Raises
-    ------
-    ValueError
-        曲线缺失、候选歧义或单位不受支持时抛出。
-    """
-    las_df = las_file.df()
-    selected = _select_curve_mnemonic(las_df, _VP_MNEMONICS, "Vp", curve_mnemonic)
-    vp = _convert_velocity_input_to_mps(las_df.loc[:, selected].to_numpy(), unit, "Vp")
-    vp = interpolate_nans(vp, method="linear")
-    return grid.Log(vp, las_df.index.values, "md", name="Vp", unit="m/s", allow_nan=False)
-
-
-def extract_vs_log_from_las(
-    las_file: lasio.LASFile,
-    unit: str,
-    curve_mnemonic: Optional[str] = None,
-) -> grid.Log:
-    """从 LAS 文件中提取横波速度曲线（Vs）。
-
-    Parameters
-    ----------
-    las_file : lasio.LASFile
-        已加载的 LAS 文件对象。
-    unit : str
-        输入曲线单位（必选）。支持 ``us/ft``、``us/m`` 或 ``m/s``。
-    curve_mnemonic : str, optional
-        指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
-
-    Returns
-    -------
-    grid.Log
-        横波速度曲线，坐标域为 MD，输出单位统一为 m/s。
-
-    Raises
-    ------
-    ValueError
-        曲线缺失、候选歧义或单位不受支持时抛出。
-    """
-    las_df = las_file.df()
-    selected = _select_curve_mnemonic(las_df, _VS_MNEMONICS, "Vs", curve_mnemonic)
-    vs = _convert_velocity_input_to_mps(las_df.loc[:, selected].to_numpy(), unit, "Vs")
-    vs = interpolate_nans(vs, method="linear")
-    return grid.Log(vs, las_df.index.values, "md", name="Vs", unit="m/s", allow_nan=False)
-
-
-def old_extract_rho_log_from_las(
-    las_file: lasio.LASFile,
-    unit: str,
-    curve_mnemonic: Optional[str] = None,
-) -> grid.Log:
-    """旧深度域兼容入口：从原始 LAS 文件中提取密度曲线（Rho）。
-
-    Parameters
-    ----------
-    las_file : lasio.LASFile
-        已加载的 LAS 文件对象。
-    unit : str
-        输入曲线单位（必选）。仅支持 ``g/cm3`` 或 ``kg/m3``。
-    curve_mnemonic : str, optional
-        指定要使用的曲线简称。若未指定且匹配到多个候选，会报错。
-
-    Returns
-    -------
-    grid.Log
-        密度曲线，坐标域为 MD，输出单位统一为 g/cm3。
-
-    Raises
-    ------
-    ValueError
-        曲线缺失、候选歧义或单位不受支持时抛出。
-    """
-    las_df = las_file.df()
-    selected = _select_curve_mnemonic(las_df, _RHO_MNEMONICS, "Rho", curve_mnemonic)
-    rho = _convert_density_to_g_cm3(las_df.loc[:, selected].to_numpy(), unit)
-    rho = interpolate_nans(rho, method="linear")
-    return grid.Log(rho, las_df.index.values, "md", name="Rho", unit="g/cm3", allow_nan=False)
-
-
-def extract_any_log_from_las(las_file: lasio.LASFile, curve_mnemonic: str) -> grid.Log:
-    """从 LAS 文件中提取任意单条曲线。
-
-    Parameters
-    ----------
-    las_file : lasio.LASFile
-        已加载的 LAS 文件对象。
-    curve_mnemonic : str
-        目标曲线简称，大小写不敏感。
-
-    Returns
-    -------
-    grid.Log
-        提取后的曲线。仅做异常值替换，不做插值；允许包含 NaN。
-
-    Raises
-    ------
-    ValueError
-        当 curve_mnemonic 为空、曲线不存在或异常值处理后全部为 NaN 时抛出。
-    """
-    curve_mnemonic = str(curve_mnemonic).strip()
-    if not curve_mnemonic:
-        raise ValueError("curve_mnemonic 不能为空。")
-
-    las_df = las_file.df()
-    columns = [str(c) for c in las_df.columns]
-    norm_to_original = {_normalize_mnemonic(c): c for c in columns}
-
-    norm_user = _normalize_mnemonic(curve_mnemonic)
-    if norm_user not in norm_to_original:
-        raise ValueError(f"指定曲线简称不存在: {curve_mnemonic}. 可用曲线: {columns}")
-
-    selected = norm_to_original[norm_user]
-    values = _replace_sentinel_values(las_df.loc[:, selected].to_numpy())
-    if np.all(np.isnan(values)):
-        raise ValueError(f"{selected} 曲线在异常值处理后全部为 NaN。")
-
-    unit_from_las = _get_curve_unit(las_file, selected)
-
-    return grid.Log(values, las_df.index.values, "md", name=curve_mnemonic, unit=unit_from_las, allow_nan=True)
-
-
-def old_load_vp_rho_logset_from_las(
-    las_file_path: Path,
-    vp_mnemonic: Optional[str] = None,
-    rho_mnemonic: Optional[str] = None,
-    vp_unit: Optional[str] = "us/m",
-    rho_unit: Optional[str] = "g/cm3",
-) -> grid.LogSet:
-    """旧深度域兼容入口：从原始 LAS 文件路径读取 Vp/Rho 并组装为 ``grid.LogSet``。
-
-    新时间域工作流不应使用该函数；应先经过 LAS 曲线筛选和预处理，
-    再读取含 ``DT_USM`` 与 ``RHO_GCC`` 的标准 LAS。
-
-    Parameters
-    ----------
-    las_file_path : Path
-        LAS 文件路径。
-    vp_mnemonic : str, optional
-        指定 Vp 使用的曲线简称。未指定时按候选简称自动匹配，若匹配到多个则报错。
-    rho_mnemonic : str, optional
-        指定 Rho 使用的曲线简称。未指定时按候选简称自动匹配，若匹配到多个则报错。
-    vp_unit : str, optional
-        Vp 输入单位。默认值为 us/m。
-    rho_unit : str, optional
-        Rho 输入单位。默认值为 g/cm3。
-
-    Returns
-    -------
-    grid.LogSet
-        至少包含 Vp 与 Rho 两条曲线的 LogSet。
-
-    Raises
-    ------
-    ValueError
-        曲线不存在、候选歧义或单位不受支持时抛出。
-    FileNotFoundError
-        输入 LAS 文件路径不存在时抛出。
-    """
-    las_file_path = Path(las_file_path)
-    if not las_file_path.exists():
-        raise FileNotFoundError(f"LAS 文件不存在: {las_file_path}")
-
-    las_file = lasio.read(las_file_path)
-    vp_log = old_extract_vp_log_from_las(
-        las_file, curve_mnemonic=vp_mnemonic, unit=vp_unit if vp_unit is not None else "us/m"
-    )
-    rho_log = old_extract_rho_log_from_las(
-        las_file, curve_mnemonic=rho_mnemonic, unit=rho_unit if rho_unit is not None else "g/cm3"
-    )
-
-    return grid.LogSet({"Vp": vp_log, "Rho": rho_log})
 
 
 def _read_text_lines_with_fallback(file_path: Path, encodings: Optional[List[str]] = None) -> List[str]:

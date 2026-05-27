@@ -4,8 +4,6 @@
 
 ::: cup.well.curves
 
-::: cup.well.depth_time
-
 ::: cup.well.las
 
 ::: cup.well.mnemonics
@@ -15,6 +13,8 @@
 ::: cup.well.process
 
 ::: cup.well.tie
+
+::: cup.well.td
 
 ::: cup.well.trajectory
 

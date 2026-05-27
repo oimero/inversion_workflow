@@ -36,7 +36,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.io import load_yaml_config, resolve_relative_path, sanitize_filename
-from cup.well.depth_time import crop_logset_md
+from cup.well.td import crop_logset_md
 from cup.well.tie import build_auto_tie_search_space, scaled_synthetic_metrics
 from cup.well.wavelet import crop_wavelet_center_energy_normalize
 
@@ -192,7 +192,7 @@ def run_auto_tie(
     target_crop_ms: float,
     output: dict[str, Path],
 ) -> None:
-    from cup.petrel.load import old_load_vp_rho_logset_from_las
+    from cup.well.las import old_load_vp_rho_logset_from_las
     from wtie.modeling.modeling import ConvModeler
     from wtie.optimize import autotie
     from wtie.processing import grid

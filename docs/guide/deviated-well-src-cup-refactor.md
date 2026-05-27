@@ -127,7 +127,7 @@ tvdss_m = tvd_kb_m - kb_m
 z_m ~= kb_m - tvd_kb_m
 ```
 
-如果未来决定改成带符号海拔口径，也必须只改 Adapter 和 `depth_time`，不要让不同脚本混用两种 TVDSS 语义。所有 `WellTimeDepth`、`WellTrajectory.to_wtie_wellpath()`、Petrel checkshots 导入导出都要共享同一个约定。
+如果未来决定改成带符号海拔口径，也必须只改 Adapter 和 `cup.well.td`，不要让不同脚本混用两种 TVDSS 语义。所有 `WellTimeDepth`、`WellTrajectory.to_wtie_wellpath()`、Petrel checkshots 导入导出都要共享同一个约定。
 
 ## 建议新增核心 Module
 
@@ -172,21 +172,26 @@ WellTrajectory
 
 需要注意：`WellTrajectory` 是项目内主模型；`wtie.grid.WellPath` 只是一个 Adapter，不反过来主导项目设计。
 
-### `cup.well.depth_time`
+### `cup.well.td`
 
-这个 Module 负责井曲线、时深表和轨迹之间的域转换。
+这个 Module 负责时深表、目标时间窗和轨迹之间的域转换；标准 LAS 到 `LogSet` 的读取放在 `cup.well.las`。
 
 建议对象或函数：
 
 | 名称 | 功能 |
 | --- | --- |
 | `WellTimeDepth` | 包装 `grid.TimeDepthTable`，保留来源、domain、单位、QC |
-| `read_time_depth_table(path)` | 读取已有时深表，并统一 TWT 单位和 TVDSS/MD 口径 |
+| `load_petrel_time_depth_table(path)` | 读取 Petrel 时深表，并统一 TWT 单位和 TVDSS/MD 口径 |
 | `validate_time_depth_table(table, log_basis_md, trajectory=None)` | 检查时深表与测井 MD、轨迹 TVDSS 的覆盖关系 |
 | `convert_log_md_to_twt(log, table, trajectory, dt_s)` | 统一 MD 曲线到 TWT |
 | `sample_log_on_twt(log_md, table, trajectory, twt_axis)` | 在指定 TWT 轴上采样曲线 |
 | `sample_trajectory_on_twt(trajectory, table, twt_axis)` | 在 TWT 轴上采样轨迹点 |
-| `convert_dt_usm_to_vp_log(dt_log)` | 在进入 wtie 或 AI 计算前，把标准慢度显式转换为 `Vp(m/s)` |
+
+标准 LAS 读取入口：
+
+| 名称 | 功能 |
+| --- | --- |
+| `cup.well.las.load_vp_rho_logset_from_standard_las(path)` | 从含 `DT_USM` 与 `RHO_GCC` 的标准 LAS 构建 `grid.LogSet` |
 
 这里可以保持对象轻量，但要保证脚本不直接操作裸数组做长期传递。
 
@@ -352,7 +357,7 @@ preprocessed LAS + optimized TDT + trajectory
 | Module | 负责内容 |
 | --- | --- |
 | `cup.well.trajectory` | 完整井轨迹、轨迹文件解析、轨迹到 wtie Adapter |
-| `cup.well.depth_time` | 井曲线、时深表、慢度/速度和 MD/TWT/TVDSS 之间的域转换 |
+| `cup.well.td` | 时深表、目标时间窗和 MD/TWT/TVDSS 之间的域转换 |
 | `cup.well.spatial_samples` | 把已经明确 MD/TWT 的井曲线样点落到 XY、inline/xline、trace/sample |
 | `cup.seismic.modeling` | 层位约束建模；逐步从井级控制扩展到点级控制 |
 | `cup.seismic.trace_sampling` | 批量地震道/地震样点采样计划 |
@@ -430,7 +435,7 @@ preprocessed LAS + optimized TDT + trajectory
 
 | 现有位置 | 建议 |
 | --- | --- |
-| `cup.petrel.load.old_load_vp_rho_logset_from_las` (legacy raw LAS reader) | 拆出 LAS 读取、单位转换、`LogSet` 构造；不要继续放在 Petrel I/O |
+| `cup.well.las.old_load_vp_rho_logset_from_las` (legacy raw LAS reader) | 旧深度域原始 LAS 直读入口；不要放在 Petrel I/O |
 | `cup.seismic.lfm_time.LfmTimeWell.trajectory` | 改为接受项目 `WellTrajectory`，内部再转 wtie `WellPath` |
 | `cup.seismic.modeling.WellControl` | 不再作为时间域主 Interface；保留为直井井级控制 Adapter |
 | 脚本内 `coord_to_line` / 最近道逻辑 | 下沉到 `cup.seismic.trace_sampling` |

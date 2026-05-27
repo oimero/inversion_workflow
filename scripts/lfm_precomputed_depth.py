@@ -120,7 +120,7 @@ def collect_well_records(
     vp_unit: str,
     rho_unit: str,
 ) -> tuple[list[dict[str, Any]], pd.DataFrame]:
-    from cup.petrel.load import old_load_vp_rho_logset_from_las
+    from cup.well.las import old_load_vp_rho_logset_from_las
 
     head_lookup = well_heads_df.copy()
     head_lookup["_name_norm"] = head_lookup["Name"].astype(str).str.strip()

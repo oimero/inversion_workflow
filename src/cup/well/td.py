@@ -1,4 +1,4 @@
-"""cup.well.depth_time: 深度/时间转换与时深关系构建。
+"""cup.well.td: 时深关系（Time-Depth, TD）构建与窗口裁剪。
 
 本模块提供时间域井震标定所需的时深关系加载、构建、裁剪与校验工具，
 以及目标层段窗口定义、层位网格采样与锚点 TDT 构建。
@@ -6,17 +6,17 @@
 边界说明
 --------
 - 本模块不负责 auto-tie 优化策略本身，仅提供数据准备层。
-- Petrel checkshot 解析委托给 ``cup.petrel.load.read_petrel_checkshots_dataframe``。
+- Petrel checkshot 文本解析由 ``cup.petrel.load.read_petrel_checkshots_dataframe`` 完成；
+  本模块只负责把解析表转换为项目内 ``TimeDepthTable``。
 - TVDSS/MD 口径差异由调用方在进入本模块前统一。
 
 核心公开对象
 ------------
 1. TargetTieWindow / PreparedTieWindow: 标定窗口定义与裁剪结果。
 2. HorizonGrid: 层位解释网格，支持双线性采样与最近有效回退。
-3. read_time_depth_table: 读取 Petrel 时深表并归一化到正秒。
-4. build_vp_rho_logset_from_preprocessed_las: 从预处理 LAS 构建 Vp/Rho LogSet。
-5. build_tdt_from_anchor: 基于单一锚点构建时深关系。
-6. prepare_tdt_with_sonic_extension: 原始 TDT 裁剪 + 声波外推。
+3. load_petrel_time_depth_table: 读取 Petrel 时深表并归一化到正秒。
+4. build_tdt_from_anchor: 基于单一锚点构建时深关系。
+5. prepare_tdt_with_sonic_extension: 原始 TDT 裁剪 + 声波外推。
 """
 
 from __future__ import annotations
@@ -25,14 +25,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
-import lasio
 import numpy as np
 import pandas as pd
 
 from cup.petrel.load import read_petrel_checkshots_dataframe
 from cup.well.assets import normalize_well_name
 from wtie.processing import grid
-from wtie.processing.logs import interpolate_nans
 
 
 @dataclass(frozen=True)
@@ -67,21 +65,12 @@ class PreparedTieWindow:
     report: dict[str, Any]
 
 
-def _finite_positive(values: np.ndarray, *, label: str) -> np.ndarray:
-    arr = np.asarray(values, dtype=np.float64).reshape(-1)
-    arr[~np.isfinite(arr)] = np.nan
-    arr[arr <= 0.0] = np.nan
-    if np.all(np.isnan(arr)):
-        raise ValueError(f"{label} contains no positive finite samples.")
-    return arr
-
-
 def _read_petrel_checkshot_dataframe(path: Path) -> pd.DataFrame:
-    """Delegate to the unified Petrel checkshot parser in ``cup.petrel.load``."""
+    """委托 Petrel 格式 Adapter 解析 checkshot 文本。"""
     return read_petrel_checkshots_dataframe(path)
 
 
-def read_time_depth_table(path: str | Path, *, domain: Literal["md", "tvdss"] = "md") -> grid.TimeDepthTable:
+def load_petrel_time_depth_table(path: str | Path, *, domain: Literal["md", "tvdss"] = "md") -> grid.TimeDepthTable:
     """读取 Petrel checkshot/时深表并转换为 wtie 时深表。
 
     本项目中的 Petrel 导出通常以负毫秒保存解释 TWT。时间域工作流使用正秒，
@@ -142,32 +131,6 @@ def read_time_depth_table(path: str | Path, *, domain: Literal["md", "tvdss"] = 
     if domain == "md":
         return grid.TimeDepthTable(twt=twt, md=depth)
     return grid.TimeDepthTable(twt=twt, tvdss=depth)
-
-
-def build_vp_rho_logset_from_preprocessed_las(path: str | Path) -> grid.LogSet:
-    """从第三步标准 LAS 构建 MD 域 Vp/Rho LogSet。"""
-    las = lasio.read(str(path))
-    df = las.df()
-    missing = [name for name in ("DT_USM", "RHO_GCC") if name not in df.columns]
-    if missing:
-        raise ValueError(f"Preprocessed LAS is missing required curves {missing}: {path}")
-
-    md = np.asarray(df.index.to_numpy(dtype=np.float64), dtype=np.float64)
-    dt_usm = _finite_positive(df["DT_USM"].to_numpy(dtype=np.float64), label="DT_USM")
-    rho = _finite_positive(df["RHO_GCC"].to_numpy(dtype=np.float64), label="RHO_GCC")
-    vp = 1_000_000.0 / dt_usm
-
-    vp = interpolate_nans(vp, method="linear")
-    rho = interpolate_nans(rho, method="linear")
-    if np.any(~np.isfinite(vp)) or np.any(~np.isfinite(rho)):
-        raise ValueError(f"Vp/Rho still contain non-finite samples after interpolation: {path}")
-
-    return grid.LogSet(
-        {
-            "Vp": grid.Log(vp, md, "md", name="Vp", unit="m/s", allow_nan=False),
-            "Rho": grid.Log(rho, md, "md", name="Rho", unit="g/cm3", allow_nan=False),
-        }
-    )
 
 
 def validate_time_depth_table(

@@ -83,6 +83,7 @@ def build_file_lookup(files: Iterable[Path], *, asset_label: str) -> dict[str, P
 
 
 def is_finite_number(value: object) -> bool:
+    """判断输入是否为有限数值。"""
     try:
         return bool(np.isfinite(float(value)))  # type: ignore
     except (TypeError, ValueError):
@@ -90,6 +91,7 @@ def is_finite_number(value: object) -> bool:
 
 
 def optional_float(value: object) -> float | None:
+    """将输入转为 float，非有限时返回 None。"""
     if not is_finite_number(value):
         return None
     return float(value)  # type: ignore
@@ -403,5 +405,19 @@ def build_neighbor_pairs(
 
 
 def value_counts(records: Sequence[WellInventoryRecord], field_name: str) -> dict[str, int]:
+    """按字段统计各取值的出现次数。
+
+    Parameters
+    ----------
+    records : Sequence[WellInventoryRecord]
+        井资产记录列表。
+    field_name : str
+        目标字段名。
+
+    Returns
+    -------
+    dict[str, int]
+        取值到计数的映射，按键排序。
+    """
     values = [str(getattr(record, field_name)) for record in records]
     return dict(sorted(pd.Series(values, dtype="object").value_counts(dropna=False).astype(int).to_dict().items()))  # type: ignore

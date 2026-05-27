@@ -261,6 +261,7 @@ def horizontal_offsets_m(trajectory: WellTrajectory) -> np.ndarray:
 
 
 def finite_max(values: np.ndarray) -> float | None:
+    """返回数组中的最大有限值；若没有有限值则返回 ``None``。"""
     finite = np.asarray(values, dtype=np.float64)
     finite = finite[np.isfinite(finite)]
     if finite.size == 0:

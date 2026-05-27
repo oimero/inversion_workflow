@@ -173,7 +173,24 @@ def classify_curves_by_rules(
     well_name: str = "",
     overrides: Mapping[str, Any] | None = None,
 ) -> list[CurveClassification]:
-    """按本地 mnemonic 规则和单井覆盖配置分类曲线。"""
+    """按本地 mnemonic 规则和单井覆盖配置分类曲线。
+
+    Parameters
+    ----------
+    curves : Sequence[CurveInfo]
+        待分类的 LAS 曲线头列表。
+    schema : Mapping[str, Sequence[str]] | None, optional
+        分类规则表，默认使用 ``CURVE_CATEGORY_MNEMONICS``。
+    well_name : str, default=""
+        井名，用于匹配单井 override。
+    overrides : Mapping[str, Any] | None, optional
+        人工干预配置。
+
+    Returns
+    -------
+    list[CurveClassification]
+        逐条曲线的分类结果。
+    """
     schema = schema or CURVE_CATEGORY_MNEMONICS
     schema_categories = set(schema)
     lookup = _schema_lookup(schema)
@@ -322,7 +339,30 @@ def select_primary_curves(
     overrides: Mapping[str, Any] | None = None,
     category_priority: Mapping[str, Sequence[str]] | None = None,
 ) -> CurveSelection:
-    """为每个选中类别选择一条主曲线，并生成单井筛选状态。"""
+    """为每个选中类别选择一条主曲线，并生成单井筛选状态。
+
+    Parameters
+    ----------
+    classifications : Sequence[CurveClassification]
+        逐条曲线分类结果。
+    well_name : str
+        井名。
+    las_file : str
+        LAS 文件路径。
+    selected_categories : Sequence[str]
+        需要选 primary 的类别。
+    required_categories : Sequence[str]
+        必须同时具备的类别。
+    overrides : Mapping[str, Any] | None, optional
+        人工干预配置。
+    category_priority : Mapping[str, Sequence[str]] | None, optional
+        每类主曲线选择优先级。
+
+    Returns
+    -------
+    CurveSelection
+        单井曲线筛选结果。
+    """
     well_override = _well_override(overrides, well_name)
     by_category: dict[str, list[CurveClassification]] = {}
     for item in classifications:

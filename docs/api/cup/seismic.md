@@ -10,8 +10,6 @@
 
 ::: cup.seismic.modeling
 
-::: cup.seismic.process
-
 ::: cup.seismic.lfm_time
 
 ::: cup.seismic.lfm_depth

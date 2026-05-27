@@ -34,7 +34,7 @@ from wtie.processing import grid
 
 @dataclass(frozen=True)
 class TargetTieWindow:
-    """Target interval tie window in TWT seconds."""
+    """目标层段标定窗口，以 TWT 秒定义。"""
 
     top_name: str
     bottom_name: str
@@ -56,7 +56,7 @@ class TargetTieWindow:
 
 @dataclass(frozen=True)
 class PreparedTieWindow:
-    """A local TDT/logset package clipped to the actual tie window."""
+    """裁剪到标定窗口的本地 TDT 与 LogSet 组合。"""
 
     table: grid.TimeDepthTable
     logset_md: grid.LogSet
@@ -295,7 +295,24 @@ def prepare_tdt_with_sonic_extension(
     window: TargetTieWindow,
     min_tie_samples: int = 64,
 ) -> PreparedTieWindow:
-    """Clip an original TDT to a target window, extending from endpoints with sonic where needed."""
+    """将原始 TDT 裁剪到目标窗口，不足部分用声波积分外推补齐。
+
+    Parameters
+    ----------
+    raw_table : grid.TimeDepthTable
+        原始 MD 域时深表。
+    logset_md : grid.LogSet
+        MD 域 Vp/Rho LogSet，用于声波外推。
+    window : TargetTieWindow
+        目标标定窗口。
+    min_tie_samples : int, default=64
+        最少标定采样点数。
+
+    Returns
+    -------
+    PreparedTieWindow
+        裁剪并外推后的标定窗口数据。
+    """
     if not raw_table.is_md_domain:
         raise ValueError("Sonic TDT extension expects an MD-domain TimeDepthTable.")
     if not logset_md.is_md:
@@ -397,7 +414,26 @@ def prepare_anchor_tdt_for_window(
     min_tie_samples: int = 64,
     support_class: str = "anchor_integrated",
 ) -> PreparedTieWindow:
-    """Clip an anchor-integrated TDT to the target tie window."""
+    """将基于锚点积分的 TDT 裁剪到目标标定窗口。
+
+    Parameters
+    ----------
+    table : grid.TimeDepthTable
+        锚点积分得到的 MD 域时深表。
+    logset_md : grid.LogSet
+        MD 域 Vp/Rho LogSet，用于裁剪窗口深度。
+    window : TargetTieWindow
+        目标标定窗口。
+    min_tie_samples : int, default=64
+        最少标定采样点数。
+    support_class : str, default="anchor_integrated"
+        TDT 支撑类型标签。
+
+    Returns
+    -------
+    PreparedTieWindow
+        裁剪后的标定窗口数据。
+    """
     rows = _rows_for_window(
         twt=np.asarray(table.twt, dtype=np.float64),
         md=np.asarray(table.md, dtype=np.float64),

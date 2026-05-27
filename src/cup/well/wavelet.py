@@ -207,10 +207,19 @@ def crop_wavelet_center_energy_normalize(
     wavelet: Any,
     target_ms: float,
 ) -> tuple[Any, dict[str, Any]]:
-    """Crop a wavelet to a centred window and L2 energy-normalize.
+    """将小波居中裁剪到目标长度并做 L2 能量归一化。
 
-    Returns ``(cropped_wavelet, crop_info)`` where ``cropped_wavelet`` is a
-    ``wtie.processing.grid.Wavelet`` and ``crop_info`` is a metadata dict.
+    Parameters
+    ----------
+    wavelet : Any
+        输入小波对象（``wtie.processing.grid.Wavelet``）。
+    target_ms : float
+        目标裁剪长度，单位 ms。
+
+    Returns
+    -------
+    tuple[Any, dict[str, Any]]
+        ``(cropped_wavelet, crop_info)``，``cropped_wavelet`` 为裁剪并归一化后的小波。
     """
     from wtie.processing.grid import Wavelet
 

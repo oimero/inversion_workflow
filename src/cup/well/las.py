@@ -41,7 +41,7 @@ NULL_POLICIES = {"las_only", "common_sentinels", "las_and_common_sentinels", "no
 
 @dataclass(frozen=True)
 class LasHeader:
-    """Lightweight LAS header summary."""
+    """轻量 LAS 文件头摘要。"""
 
     well_name: str
     index_mnemonic: str
@@ -93,8 +93,24 @@ def _replace_sentinel_values(values: object, *, null_value: float | None = None,
     return out
 
 
+def _normalize_unit(unit: object) -> str:
+    """规范化单位写法，以便兼容 ``μ`` / ``µ`` / ``u`` 等常见变体。"""
+    return str(unit or "").strip().lower().replace(" ", "").replace("μ", "u").replace("µ", "u")
+
+
 def build_las_curve_lookup(las: lasio.LASFile) -> LasCurveLookup:
-    """构建 LAS 曲线 exact/normalized mnemonic 查找表。"""
+    """构建 LAS 曲线 exact/normalized mnemonic 查找表。
+
+    Parameters
+    ----------
+    las : lasio.LASFile
+        已打开的 LAS 文件对象。
+
+    Returns
+    -------
+    LasCurveLookup
+        含 ``exact_index`` 与 ``normalized_index`` 的查找表。
+    """
     exact_index: dict[str, int] = {}
     normalized_index: dict[str, list[int]] = {}
     for index, curve in enumerate(las.curves):
@@ -114,7 +130,31 @@ def resolve_las_curve_index(
     lookup: LasCurveLookup | None = None,
     source: str | Path | None = None,
 ) -> int | None:
-    """按 exact/normalized mnemonic 规则解析 LAS 曲线 index。"""
+    """按 exact/normalized mnemonic 规则解析 LAS 曲线 index。
+
+    Parameters
+    ----------
+    las : lasio.LASFile
+        已打开的 LAS 文件对象。
+    mnemonic : str
+        目标曲线简称。
+    match_policy : str, default="exact_then_normalized"
+        匹配策略：``"exact"``、``"normalized"`` 或 ``"exact_then_normalized"``。
+    lookup : LasCurveLookup | None, optional
+        预构建的查找表，为 None 时从 ``las`` 重新构建。
+    source : str | Path | None, optional
+        数据来源标识，仅用于错误信息。
+
+    Returns
+    -------
+    int | None
+        匹配到的曲线 index，未找到时返回 None。
+
+    Raises
+    ------
+    ValueError
+        当 normalized 匹配到多条曲线（歧义）时。
+    """
     policy = str(match_policy).strip()
     if policy not in MATCH_POLICIES:
         raise ValueError(f"Unsupported match_policy: {match_policy}. Expected one of {sorted(MATCH_POLICIES)}.")
@@ -223,7 +263,26 @@ def read_las_curve(
     null_policy: str = "las_and_common_sentinels",
     allow_all_nan: bool = False,
 ) -> grid.Log:
-    """从 LAS 文件按指定 mnemonic 读取单条曲线为 ``grid.Log``。"""
+    """从 LAS 文件按指定 mnemonic 读取单条曲线为 ``grid.Log``。
+
+    Parameters
+    ----------
+    path : str | Path
+        LAS 文件路径。
+    mnemonic : str
+        目标曲线简称。
+    match_policy : str, default="exact_then_normalized"
+        匹配策略。
+    null_policy : str, default="las_and_common_sentinels"
+        空值处理策略。
+    allow_all_nan : bool, default=False
+        是否允许全 NaN 曲线。
+
+    Returns
+    -------
+    grid.Log
+        MD 域曲线对象。
+    """
     path = Path(path)
     las = lasio.read(str(path))
     return _read_las_curve_from_lasio(
@@ -244,7 +303,26 @@ def read_las_curves(
     null_policy: str = "las_and_common_sentinels",
     allow_all_nan: bool = False,
 ) -> dict[str, grid.Log]:
-    """从 LAS 文件批量读取曲线，返回 ``{请求 mnemonic: grid.Log}``。"""
+    """从 LAS 文件批量读取曲线，返回 ``{请求 mnemonic: grid.Log}``。
+
+    Parameters
+    ----------
+    path : str | Path
+        LAS 文件路径。
+    mnemonics : Sequence[str]
+        目标曲线简称列表。
+    match_policy : str, default="exact_then_normalized"
+        匹配策略。
+    null_policy : str, default="las_and_common_sentinels"
+        空值处理策略。
+    allow_all_nan : bool, default=False
+        是否允许全 NaN 曲线。
+
+    Returns
+    -------
+    dict[str, grid.Log]
+        键为请求的 mnemonic、值为 MD 域曲线。
+    """
     path = Path(path)
     las = lasio.read(str(path))
     lookup = build_las_curve_lookup(las)
@@ -267,10 +345,10 @@ def _convert_velocity_input_to_mps(values: object, unit: str, property_name: str
     curve_values = _replace_sentinel_values(values)
     curve_values[curve_values <= 0] = np.nan
 
-    unit_norm = str(unit).strip().lower().replace(" ", "")
-    if unit_norm in {"us/ft", "μs/ft", "µs/ft"}:
+    unit_norm = _normalize_unit(unit)
+    if unit_norm == "us/ft":
         velocity = 0.3048 * 1e6 / curve_values
-    elif unit_norm in {"us/m", "μs/m", "µs/m"}:
+    elif unit_norm == "us/m":
         velocity = 1e6 / curve_values
     elif unit_norm in {"m/s", "mps", "m/sec", "meter/s", "meters/s"}:
         velocity = curve_values
@@ -285,7 +363,7 @@ def _convert_velocity_input_to_mps(values: object, unit: str, property_name: str
 def _convert_density_to_g_cm3(density_values: object, unit: str) -> np.ndarray:
     """将密度曲线转换为 g/cm3。"""
     density = _replace_sentinel_values(density_values)
-    unit_norm = str(unit).strip().lower().replace(" ", "")
+    unit_norm = _normalize_unit(unit)
     if unit_norm in {"g/cm3", "g/cc", "g/cm^3"}:
         density_g_cm3 = density
     elif unit_norm in {"kg/m3", "kg/m^3"}:
@@ -319,16 +397,13 @@ def _read_legacy_candidate_log(
     lookup = build_las_curve_lookup(las_file)
     matched: dict[int, grid.Log] = {}
     for candidate in candidate_mnemonics:
-        try:
-            resolved = resolve_las_curve_index(
-                las_file,
-                candidate,
-                match_policy="exact_then_normalized",
-                lookup=lookup,
-                source=f"legacy {property_name} reader",
-            )
-        except ValueError:
-            raise
+        resolved = resolve_las_curve_index(
+            las_file,
+            candidate,
+            match_policy="exact_then_normalized",
+            lookup=lookup,
+            source=f"legacy {property_name} reader",
+        )
         if resolved is not None and resolved != 0:
             matched[resolved] = _read_las_curve_from_lasio(
                 las_file,
@@ -413,6 +488,21 @@ def load_vp_rho_logset_from_standard_las(path: str | Path) -> grid.LogSet:
 
     标准 LAS 指包含第三步标准曲线 ``DT_USM`` 与 ``RHO_GCC`` 的 LAS，
     不要求文件一定由 ``scripts/log_preprocess.py`` 生成。
+
+    Parameters
+    ----------
+    path : str | Path
+        标准 LAS 文件路径，必须包含 ``DT_USM`` 与 ``RHO_GCC`` 曲线。
+
+    Returns
+    -------
+    grid.LogSet
+        含 ``Vp`` (m/s) 与 ``Rho`` (g/cm3) 的 MD 域 LogSet。
+
+    Raises
+    ------
+    ValueError
+        缺少必需曲线、采样轴不一致或插值后仍含非有限值时。
     """
     try:
         curves = read_las_curves(path, ["DT_USM", "RHO_GCC"])
@@ -492,13 +582,35 @@ def _build_las_header(las: lasio.LASFile, *, fallback_well_name: str) -> LasHead
 
 
 def scan_las_header(path: Path) -> LasHeader:
-    """不加载数据样点，仅读取 LAS 元数据。"""
+    """不加载数据样点，仅读取 LAS 元数据。
+
+    Parameters
+    ----------
+    path : Path
+        LAS 文件路径。
+
+    Returns
+    -------
+    LasHeader
+        LAS 文件头摘要。
+    """
     las = lasio.read(str(path), ignore_data=True)
     return _build_las_header(las, fallback_well_name=Path(path).stem)
 
 
 def scan_las_curves(path: Path) -> tuple[LasHeader, list[CurveInfo]]:
-    """不加载数据样点，仅读取 LAS 曲线头信息。"""
+    """不加载数据样点，仅读取 LAS 曲线头信息。
+
+    Parameters
+    ----------
+    path : Path
+        LAS 文件路径。
+
+    Returns
+    -------
+    tuple[LasHeader, list[CurveInfo]]
+        LAS 文件头摘要与曲线头信息列表。
+    """
     las = lasio.read(str(path), ignore_data=True)
     header = _build_las_header(las, fallback_well_name=Path(path).stem)
     curves = [
@@ -627,7 +739,26 @@ def export_logsets_to_las(
     null_value: float = -999.25,
     write_fmt: str = "%.6f",
 ) -> dict[str, Any]:
-    """按井批量导出 MD 域 LogSet/Log 映射到 LAS 文件。"""
+    """按井批量导出 MD 域 LogSet/Log 映射到 LAS 文件。
+
+    Parameters
+    ----------
+    logsets : dict[str, LogsetInput]
+        键为井名，值为 ``grid.LogSet`` 或 ``dict[str, grid.Log]``。
+    output_dir : Path
+        输出目录。
+    curve_names : list[str] | None, optional
+        要导出的曲线名列表，为 None 时导出全部。
+    null_value : float, default=-999.25
+        LAS 文件缺失值。
+    write_fmt : str, default="%.6f"
+        数值写入格式。
+
+    Returns
+    -------
+    dict[str, Any]
+        含 ``exported_files``、``skipped_wells``、``skipped_curves`` 的结果字典。
+    """
     _validate_write_format(write_fmt)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -659,8 +790,6 @@ def export_logsets_to_las(
                 selected_curve_names=available_curve_names,
                 null_value=null_value,
             )
-            las.well["NULL"].value = write_fmt % float(null_value)
-
             output_file = output_dir / f"{well_name}.las"
             las.write(str(output_file), version=2.0, wrap=False, fmt=write_fmt)
             exported_files.append(output_file)
@@ -683,7 +812,26 @@ def export_selected_curves_to_las(
     null_value: float = -999.25,
     write_fmt: str = "%.6f",
 ) -> tuple[Path, list[dict[str, str]], list[str]]:
-    """导出 LAS 索引曲线和选中的原始曲线。"""
+    """导出 LAS 索引曲线和选中的原始曲线。
+
+    Parameters
+    ----------
+    source_las : Path
+        源 LAS 文件路径。
+    output_las : Path
+        目标 LAS 文件路径。
+    selected_mnemonics : Sequence[str]
+        要导出的曲线 mnemonic 列表。
+    null_value : float, default=-999.25
+        LAS 文件缺失值。
+    write_fmt : str, default="%.6f"
+        数值写入格式。
+
+    Returns
+    -------
+    tuple[Path, list[dict[str, str]], list[str]]
+        ``(输出路径, 跳过曲线列表, 实际导出 mnemonic 列表)``。
+    """
     _validate_write_format(write_fmt)
     output_las = Path(output_las)
     output_las.parent.mkdir(parents=True, exist_ok=True)

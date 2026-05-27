@@ -409,7 +409,24 @@ def replace_constant_runs(
     min_run_length: int,
     exclude: bool = False,
 ) -> tuple[np.ndarray, list[ConstantRun], int]:
-    """Replace strict constant-value runs with NaN, optionally reporting skips."""
+    """将严格连续相同值段替换为 NaN，可选跳过特定类别仅做记录。
+
+    Parameters
+    ----------
+    md : np.ndarray
+        MD 深度轴，单位 m。
+    values : np.ndarray
+        曲线数值数组。
+    min_run_length : int
+        触发替换的最小连续长度。
+    exclude : bool, default=False
+        True 时仅记录不做替换，报告 action 标记为 ``skip_caliper``。
+
+    Returns
+    -------
+    tuple[np.ndarray, list[ConstantRun], int]
+        清洗后的值、连续段报告列表、被替换的数据点数。
+    """
     if min_run_length < 1:
         raise ValueError("min_run_length must be >= 1.")
     basis = np.asarray(md, dtype=float)

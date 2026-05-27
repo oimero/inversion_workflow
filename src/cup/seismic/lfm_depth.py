@@ -26,8 +26,8 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
+from cup.seismic.geometry import resolve_well_line_position
 from cup.seismic.modeling import WellControl, build_layer_constrained_model
-from cup.seismic.spatial import resolve_well_line_position
 from cup.seismic.survey import SurveyContext
 from cup.seismic.target_zone import TargetZone
 from wtie.processing import grid
@@ -310,7 +310,7 @@ def _prepare_well(
     filter_buffer_mode: str,
 ) -> _PreparedLfmDepthWell:
     """标准化井输入并生成建模控制点。"""
-    inline, xline = resolve_well_line_position(well, survey)
+    inline, xline = resolve_well_line_position(well, survey.line_geometry if survey is not None else None)
     horizon_depths = target_layer.get_interpretation_values_at_location(inline, xline)
     required_depth_min = float(horizon_depths[target_layer.horizon_names[0]])
     required_depth_max = float(horizon_depths[target_layer.horizon_names[-1]])
@@ -370,7 +370,60 @@ def build_lfm_depth_model(
     filter_buffer_mode: str = "reflect",
     post_slice_smoothing: bool = False,
 ) -> LfmDepthModelResult:
-    """构建 TVDSS 深度域层位约束低频模型。"""
+    """构建 TVDSS 深度域层位约束低频模型。
+
+    Parameters
+    ----------
+    target_layer : TargetZone
+        目的层对象，需提供深度域几何信息、层位顺序与层段采样索引面。
+    wells : list[LfmDepthWell]
+        参与建模的井列表，至少包含一口井，且所有井的 ``property_name`` 必须一致。
+    survey : SurveyContext, optional
+        地震工区上下文。当井输入只提供 ``x``/``y`` 坐标时，用于换算到
+        ``inline``/``xline``。
+    n_slices : int, default=32
+        每个层段沿顶底界面之间按比例离散的切片数量。
+    boundary_extension_samples : int, default=50
+        在目标层最顶、最底边界外额外扩展的采样点数。扩展区会纳入正式建模；
+        若扩展区整体没有直接控制值，则退化为相邻原始层段边界 slice 的兜底填充。
+    variogram : {"spherical", "exponential", "gaussian"}, default="spherical"
+        多井控制时二维切片插值所使用的变差模型名称。
+    exact : bool, default=True
+        是否启用严格通过控制点的普通克里金插值。
+    nugget : float, default=0.0
+        克里金模型 nugget 参数。
+    filter_cutoff_wavelength_m : float, default=150.0
+        井曲线转换到 TVDSS 域后的空间低通滤波截止波长，单位 m。
+    filter_order : int, default=6
+        井曲线低通滤波阶数。
+    filter_buffer_meters : float, optional
+        滤波前在井曲线两端附加的缓冲长度，单位 m。默认按截止波长自动估算。
+    filter_buffer_mode : {"reflect", "edge", "none"}, default="reflect"
+        曲线两端缓冲样本的生成方式。
+    post_slice_smoothing : bool, default=False
+        是否对各层段的比例切片结果沿 slice 维做轻度平滑。
+
+    Returns
+    -------
+    LfmDepthModelResult
+        包含低频模型体、方差体、结果井列表与覆盖统计的结果对象。
+
+    Raises
+    ------
+    ValueError
+        当井列表为空、采样域非深度、sample_unit 非米、几何参数非法、井位置无法解析，
+        或某个原始目的层段在所有切片上都没有可用控制值时抛出。
+
+    Notes
+    -----
+    建模流程大致为：
+
+    1. 解析井位并为每口井提取各层位在井点处的深度解释值；
+    2. 将输入属性曲线统一转换到 TVDSS 域后做空间低通滤波；
+    3. 对每个层段沿顶底界面做比例切片采样；
+    4. 对每张切片按井点控制值执行常数填充或二维克里金插值；
+    5. 将切片结果重新映射回三维深度采样体，并对建模层段之外做首尾常值延拓。
+    """
     if not wells:
         raise ValueError("wells must contain at least one LfmDepthWell.")
     if n_slices < 2:

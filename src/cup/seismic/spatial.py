@@ -1,86 +1,23 @@
-"""规则地震道网格的 XY 空间计算辅助工具。"""
+"""cup.seismic.spatial: 纯 XY 空间距离计算。
+
+本模块只处理已经给定的 XY 数组，不读取地震体文件，也不执行
+inline/xline 与 XY 的坐标转换。工区几何转换请使用 ``cup.seismic.geometry``。
+
+边界说明
+--------
+- 输入的 ``x_grid`` / ``y_grid`` 必须已经是真实 XY 道中心坐标。
+- 不能直接用 ``inline_step`` / ``xline_step`` 当米制距离。
+
+核心公开对象
+------------
+1. nominal_bin_spacing_m: 从 XY 道中心网格估计名义米制道间距。
+2. xy_distance_grid: 计算 XY 欧氏距离网格。
+3. xy_circle_mask: 基于真实 XY 半径生成圆形掩码。
+"""
 
 from __future__ import annotations
 
-from typing import Protocol
-
 import numpy as np
-
-
-class SurveyLineToCoord(Protocol):
-    """将 inline/xline 转换为 XY 所需的最小工区接口。"""
-
-    def line_to_coord(self, il_no: float, xl_no: float) -> tuple[float, float]: ...
-
-
-class SurveyCoordToLine(Protocol):
-    """将 XY 转换为 inline/xline 所需的最小工区接口。"""
-
-    def coord_to_line(self, x: float, y: float) -> tuple[float, float]: ...
-
-
-class WellPositionLike(Protocol):
-    """解析井位线号所需的最小井对象接口。"""
-
-    well_name: str
-    inline: float | None
-    xline: float | None
-    x: float | None
-    y: float | None
-
-
-def resolve_well_line_position(well: WellPositionLike, survey: SurveyCoordToLine | None) -> tuple[float, float]:
-    """解析井位 inline/xline，优先使用已有线号，其次用 XY 通过工区转换。"""
-    if well.inline is not None and well.xline is not None:
-        inline = float(well.inline)
-        xline = float(well.xline)
-        if not np.isfinite(inline) or not np.isfinite(xline):
-            raise ValueError(f"well '{well.well_name}' must provide finite inline/xline coordinates.")
-        return inline, xline
-
-    if well.x is not None and well.y is not None:
-        if survey is None:
-            raise ValueError(
-                f"well '{well.well_name}' provides x/y but no survey context was supplied for coord_to_line."
-            )
-        inline, xline = survey.coord_to_line(float(well.x), float(well.y))
-        return float(inline), float(xline)
-
-    raise ValueError(
-        f"well '{well.well_name}' must provide either inline/xline or x/y coordinates for location resolution."
-    )
-
-
-def build_trace_xy_grids(
-    survey: SurveyLineToCoord,
-    ilines: np.ndarray,
-    xlines: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """根据工区线号坐标构建道中心 XY 网格。"""
-    ilines = np.asarray(ilines, dtype=np.float64)
-    xlines = np.asarray(xlines, dtype=np.float64)
-    if ilines.ndim != 1 or xlines.ndim != 1 or ilines.size == 0 or xlines.size == 0:
-        raise ValueError("ilines and xlines must be non-empty 1D arrays.")
-
-    x0, y0 = survey.line_to_coord(float(ilines[0]), float(xlines[0]))
-    if ilines.size > 1:
-        x1, y1 = survey.line_to_coord(float(ilines[-1]), float(xlines[0]))
-        dx_i = (x1 - x0) / float(ilines.size - 1)
-        dy_i = (y1 - y0) / float(ilines.size - 1)
-    else:
-        dx_i = dy_i = 0.0
-    if xlines.size > 1:
-        x2, y2 = survey.line_to_coord(float(ilines[0]), float(xlines[-1]))
-        dx_j = (x2 - x0) / float(xlines.size - 1)
-        dy_j = (y2 - y0) / float(xlines.size - 1)
-    else:
-        dx_j = dy_j = 0.0
-
-    i_idx = np.arange(ilines.size, dtype=np.float64)[:, None]
-    j_idx = np.arange(xlines.size, dtype=np.float64)[None, :]
-    x_grid = x0 + i_idx * dx_i + j_idx * dx_j
-    y_grid = y0 + i_idx * dy_i + j_idx * dy_j
-    return x_grid.astype(np.float64), y_grid.astype(np.float64)
 
 
 def nominal_bin_spacing_m(x_grid: np.ndarray, y_grid: np.ndarray) -> float:

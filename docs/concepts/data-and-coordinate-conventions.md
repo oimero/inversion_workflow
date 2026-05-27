@@ -17,7 +17,7 @@
 
 - `geometry["inline_step"]` / `geometry["xline_step"]` 是线号步长，**不是 XY 米制间距**，也不保证为 1。
 - 最近道吸附使用轴吸附公式：`line_min + round((line_float - line_min) / line_step) * line_step`。
-- 物理距离必须通过 `SurveyContext.line_to_coord()` 或 `cup.seismic.spatial` 的 XY 网格计算。
+- 物理距离必须通过 `SurveyLineGeometry.line_to_coord()` 或已经构建好的 XY 网格计算。
 
 ## 井名规范化
 

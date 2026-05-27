@@ -15,9 +15,7 @@ from ginn.anchor import LogAIAnchorBundle, build_log_ai_anchor_bundle, validate_
 
 
 class _SurveyLike(Protocol):
-    def coord_to_line(self, x: float, y: float) -> tuple[float, float]: ...
-
-    def line_to_coord(self, il_no: float, xl_no: float) -> tuple[float, float]: ...
+    line_geometry: Any
 
 
 @dataclass(frozen=True)
@@ -41,7 +39,7 @@ def nearest_trace_from_xy(
     y: float,
 ) -> tuple[int, int, int, float, float, float, float]:
     """Resolve XY coordinates to the nearest LFM trace."""
-    inline, xline = survey.coord_to_line(float(x), float(y))
+    inline, xline = survey.line_geometry.coord_to_line(float(x), float(y))
     il_idx = int(np.argmin(np.abs(np.asarray(ilines, dtype=np.float64) - float(inline))))
     xl_idx = int(np.argmin(np.abs(np.asarray(xlines, dtype=np.float64) - float(xline))))
     flat_idx = il_idx * int(np.asarray(xlines).size) + xl_idx
@@ -184,7 +182,7 @@ def merge_well_and_facies_anchor_bundles(
         raise ValueError("min_well_facies_separation_m must be non-negative.")
 
     well_xy = np.array(
-        [survey.line_to_coord(float(il), float(xl)) for il, xl in zip(well_bundle.inline, well_bundle.xline)],
+        [survey.line_geometry.line_to_coord(float(il), float(xl)) for il, xl in zip(well_bundle.inline, well_bundle.xline)],
         dtype=np.float64,
     )
     keep_facies_rows: list[int] = []
@@ -193,7 +191,7 @@ def merge_well_and_facies_anchor_bundles(
     for row, (name, inline, xline) in enumerate(
         zip(facies_bundle.anchor_names, facies_bundle.inline, facies_bundle.xline)
     ):
-        facies_x, facies_y = survey.line_to_coord(float(inline), float(xline))
+        facies_x, facies_y = survey.line_geometry.line_to_coord(float(inline), float(xline))
         if well_xy.size:
             dists = np.hypot(well_xy[:, 0] - facies_x, well_xy[:, 1] - facies_y)
             nearest_idx = int(np.argmin(dists))

@@ -41,7 +41,6 @@ from cup.seismic.facies_control_depth import (
     SCHEMA_VERSION,
     apply_depth_facies_controls,
     build_target_layer_from_lfm_metadata,
-    build_trace_xy_grids,
     load_depth_facies_control_points_csv,
 )
 from cup.seismic.survey import open_survey
@@ -298,7 +297,7 @@ def main() -> None:
     control_points = load_depth_facies_control_points_csv(control_points_file)
     survey = open_survey(seismic_file, seismic_type="segy", segy_options=segy_options)
     target_layer = build_target_layer_from_lfm_metadata(ai_lfm.metadata, ai_lfm.geometry, qc_output_dir=qc_dir)
-    x_grid, y_grid = build_trace_xy_grids(survey, ai_lfm.ilines, ai_lfm.xlines)
+    x_grid, y_grid = survey.line_geometry.trace_xy_grids(ai_lfm.ilines, ai_lfm.xlines)
 
     controlled, qc_df = apply_depth_facies_controls(
         ai_lfm.volume,

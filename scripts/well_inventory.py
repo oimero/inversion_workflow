@@ -31,7 +31,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.petrel.load import import_well_heads_petrel, import_well_tops_petrel
-from cup.seismic.survey import open_survey, segy_options_from_config, snap_line_number
+from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.well.assets import (
     WellHead,
@@ -187,25 +187,16 @@ def _classify_survey_position(
     x = float(record.surface_x)
     y = float(record.surface_y)
     try:
-        record.distance_to_survey_m = float(survey.distance_to_footprint(x, y))
+        record.distance_to_survey_m = float(survey.line_geometry.distance_to_footprint_m(x, y))
     except ValueError:
         record.distance_to_survey_m = None
 
     try:
-        inline_float, xline_float = survey.coord_to_line(x, y)
-        geometry = survey.query_geometry(domain="time")
+        inline_float, xline_float = survey.line_geometry.coord_to_line(x, y)
         record.inline_float = float(inline_float)
         record.xline_float = float(xline_float)
-        record.nearest_inline = snap_line_number(
-            float(inline_float),
-            line_min=float(geometry["inline_min"]),
-            line_step=float(geometry["inline_step"]),
-        )
-        record.nearest_xline = snap_line_number(
-            float(xline_float),
-            line_min=float(geometry["xline_min"]),
-            line_step=float(geometry["xline_step"]),
-        )
+        record.nearest_inline = survey.line_geometry.snap_inline(float(inline_float))
+        record.nearest_xline = survey.line_geometry.snap_xline(float(xline_float))
         record.survey_position = "inside"
     except ValueError:
         if record.distance_to_survey_m is not None and record.distance_to_survey_m <= float(near_survey_threshold_m):
@@ -370,9 +361,9 @@ def main() -> None:
         seismic_type=seismic_type,
         segy_options=segy_options_from_config(seismic_cfg) if seismic_type == "segy" else None,
     )
-    geometry = survey.query_geometry(domain="time")
-    bin_spacing = survey.bin_spacing_m(domain="time")
-    footprint = survey.footprint_xy(domain="time")
+    geometry = survey.describe_geometry(domain="time")
+    bin_spacing = survey.line_geometry.bin_spacing_m()
+    footprint = survey.line_geometry.footprint_xy()
 
     inventory = build_inventory(
         well_heads_df=well_heads_df,

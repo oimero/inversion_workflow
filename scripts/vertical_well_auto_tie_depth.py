@@ -205,7 +205,7 @@ def run_auto_tie(
     # ── 1) Load well data and well-location seismic trace ──
 
     logset_md_full = old_load_vp_rho_logset_from_las(las_file, vp_unit=las_vp_unit, rho_unit=las_rho_unit)
-    seismic_depth_trace = survey.import_seismic_at_well(well_x=well_x, well_y=well_y, domain="depth")
+    seismic_depth_trace = survey.read_trace_at_xy(well_x=well_x, well_y=well_y, domain="depth")
     seis_depth = seismic_depth_trace.basis.astype(float)
     seis_amp = interpolate_nans(seismic_depth_trace.values, method="linear")
 
@@ -555,8 +555,8 @@ def main() -> None:
     # ── Survey ──
 
     survey = open_survey(seismic_file, seismic_type="segy", segy_options=segy_options)
-    geometry_depth = survey.query_geometry(domain="depth")
-    il_float, xl_float = survey.coord_to_line(well_x, well_y)
+    geometry_depth = survey.describe_geometry(domain="depth")
+    il_float, xl_float = survey.line_geometry.coord_to_line(well_x, well_y)
     if not (geometry_depth["inline_min"] <= il_float <= geometry_depth["inline_max"]):
         raise ValueError(f"Inline {il_float} outside survey range.")
     if not (geometry_depth["xline_min"] <= xl_float <= geometry_depth["xline_max"]):

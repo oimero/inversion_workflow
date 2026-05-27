@@ -156,7 +156,7 @@ def main() -> None:
         "xstep": segy_cfg["xstep"],
     }
     survey = open_survey(seismic_file, seismic_type="segy", segy_options=segy_options)
-    geometry = survey.query_geometry(domain="depth")
+    geometry = survey.describe_geometry(domain="depth")
     print(json.dumps(geometry, indent=2, ensure_ascii=False))
     assert geometry["sample_domain"] == "depth"
     assert geometry["sample_unit"] == "m"

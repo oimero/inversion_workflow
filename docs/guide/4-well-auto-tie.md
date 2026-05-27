@@ -337,7 +337,7 @@ dTWT_s = 2 * DT_USM * dZ_m * 1e-6
 关键点：
 
 - 斜井不能只取井口所在地震道。
-- 只要涉及轨迹附近的真实物理距离、邻近道或插值，就必须使用 `open_survey()`、`line_to_coord()`、`coord_to_line()` 和真实 XY 计算，不能把 inline/xline 步长当米。
+- 只要涉及轨迹附近的真实物理距离、邻近道或插值，就必须使用 `open_survey()`、`SurveyLineGeometry` 和真实 XY 计算，不能把 inline/xline 步长当米。
 - 第一版可以先用最近道采样，但必须输出 `trace_sample_plan_<well>.csv`，记录每个 TWT 样点使用的 inline/xline 和 XY。若同一条轨迹跨越大量地震道，不能逐样点重复打开 ZGY；应先把轨迹映射到唯一道集合，批量读取后再按时间轴拼接。
 - 最近道采样会引入阶梯状空间跳变。文档第一版接受这个近似，但 QC 图必须显示轨迹 inline/xline 随 TWT 的变化，便于判断是否需要升级到双线性或多道加权。
 
@@ -399,7 +399,7 @@ dTWT_s = 2 * DT_USM * dZ_m * 1e-6
 
 这些函数应放在专门的地震取样 Module 里，不要在脚本中散写 ZGY 索引和坐标转换。
 
-`trace_sampling` 落地时还需要深化 `SurveyContext` 的 Interface：当前 `cup.seismic.survey` 公开协议主要是 `coord_to_line()`、`line_to_coord()` 和 `import_seismic_at_well()`，但斜井批量取道需要批量 `coord_to_index`、邻道/flat index 计划、sample window 解析和重复 trace 去重。不要在脚本里直接访问 ZGY/SEG-Y 私有细节，应由 `SurveyContext` 或专门 Adapter 暴露这些能力。
+`trace_sampling` 落地时还需要深化地震采样 Interface：当前 `SurveyLineGeometry` 负责 `coord_to_index()`、`coord_to_line()`、`line_to_coord()`，地震体 Adapter 提供 `read_trace_at_xy()`；斜井批量取道还需要批量 `coord_to_index`、邻道/flat index 计划、sample window 解析和重复 trace 去重。不要在脚本里直接访问 ZGY/SEG-Y 私有细节，应由专门 Adapter 暴露这些能力。
 
 ### 继续复用
 

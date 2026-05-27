@@ -14,7 +14,6 @@ import torch
 from torch.utils.data import Dataset
 
 from cup.petrel.load import import_interpretation_petrel, import_seismic
-from cup.seismic.spatial import build_trace_xy_grids
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.utils.io import resolve_repo_metadata_path
@@ -618,7 +617,7 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
     )
     geometry.setdefault("sample_domain", "depth")
     geometry.setdefault("sample_unit", "m")
-    x_grid, y_grid = build_trace_xy_grids(seismic_ctx, ai_lfm.ilines, ai_lfm.xlines)
+    x_grid, y_grid = seismic_ctx.line_geometry.trace_xy_grids(ai_lfm.ilines, ai_lfm.xlines)
 
     # ── read horizon files + target-layer QC from AI LFM NPZ metadata ──
     hz_list = ai_lfm.metadata.get("horizons", [])

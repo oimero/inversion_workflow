@@ -33,7 +33,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.seismic.survey import open_survey, segy_options_from_config, snap_line_number
+from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.utils.coerce import as_bool, optional_float
 from cup.utils.config import merge_dict_defaults
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
@@ -150,23 +150,15 @@ class SurveyPointQc:
 
 def _classify_point_survey_position(x: float, y: float, *, survey: Any, geometry: dict[str, Any]) -> SurveyPointQc:
     try:
-        inline_float, xline_float = survey.coord_to_line(float(x), float(y))
+        inline_float, xline_float = survey.line_geometry.coord_to_line(float(x), float(y))
     except ValueError:
         return SurveyPointQc(None, None, None, None, "outside")
 
     return SurveyPointQc(
         inline_float=float(inline_float),
         xline_float=float(xline_float),
-        nearest_inline=snap_line_number(
-            float(inline_float),
-            line_min=float(geometry["inline_min"]),
-            line_step=float(geometry["inline_step"]),
-        ),
-        nearest_xline=snap_line_number(
-            float(xline_float),
-            line_min=float(geometry["xline_min"]),
-            line_step=float(geometry["xline_step"]),
-        ),
+        nearest_inline=survey.line_geometry.snap_inline(float(inline_float)),
+        nearest_xline=survey.line_geometry.snap_xline(float(xline_float)),
         survey_position="inside",
     )
 
@@ -558,7 +550,7 @@ def main() -> None:
             seismic_type=str(seismic_cfg.get("type", "segy")),
             segy_options=segy_options_from_config(seismic_cfg) or None,
         )
-        geometry = survey.query_geometry(domain="time")
+        geometry = survey.describe_geometry(domain="time")
 
     main_df, failed_df, summary = run_trajectory_qc(
         inventory_df=inventory_df,

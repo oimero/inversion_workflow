@@ -1,61 +1,46 @@
-"""cup.seismic.survey: 地震工区上下文、几何查询与井旁道提取。
+"""cup.seismic.survey: SEG-Y/ZGY 地震体 Adapter。
 
-本模块提供 SEG-Y/ZGY 工区的统一访问入口，包括工区几何查询、
-XY 与 inline/xline 坐标互转，以及井位附近道的双线性插值提取。
+本模块提供地震体文件的统一打开入口，负责 SEG-Y/ZGY 元数据读取、
+采样轴构造和井旁道双线性插值提取。inline/xline 与 XY 的几何计算由
+``cup.seismic.geometry`` 承担。
 
 边界说明
 --------
-- 本模块聚焦于工区上下文封装，不负责地震体全量加载与解释流程。
-- SEG-Y 与 ZGY 的实现依赖各自第三方库，缺失依赖时调用方需自行处理。
-- ``domain='depth'`` 的支持依赖底层数据确实提供深度采样信息；该模块不做速度换算。
+- 本模块负责文件 Adapter，不承载通用几何数学。
+- ``open_survey`` 是唯一公开工厂入口。
+- ``domain='depth'`` 的支持依赖底层数据提供深度采样信息；该模块不做速度换算。
 
 核心公开对象
 ------------
-1. SurveyContext: 工区上下文协议，约定统一的几何与坐标访问接口。
-2. SegySurveyContext: SEG-Y 工区上下文实现。
-3. ZgySurveyContext: ZGY 工区上下文实现。
-4. open_survey: 根据文件类型打开工区并返回可复用上下文。
-5. import_seismic_at_well / coord_to_line / line_to_coord: 便捷访问函数。
+1. SurveyContext: 地震体 Adapter 协议。
+2. SegySurveyContext: SEG-Y Adapter。
+3. ZgySurveyContext: ZGY Adapter。
+4. open_survey: 根据文件类型打开地震体。
+5. segy_options_from_config: 从配置段构建 SEG-Y 读取参数。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Protocol, Sequence, Tuple
+from typing import Any, Dict, Optional, Protocol, Tuple
 
 import numpy as np
 
+from cup.seismic.geometry import LineAxis, SampleAxis, SurveyLineGeometry
 from wtie.processing import grid
 
 
 class SurveyContext(Protocol):
-    """统一地震工区上下文接口。
+    """统一地震体 Adapter 接口。"""
 
-    Notes
-    -----
-    该协议定义了 seismic 工区上下文的最小公开能力：
+    line_geometry: SurveyLineGeometry
 
-    - 查询规则几何；
-    - 在 XY 与 inline/xline 之间转换；
-    - 在井位附近提取双线性插值后的地震道。
-    """
+    def sample_axis(self, domain: Optional[str] = "time") -> SampleAxis: ...
 
-    def query_geometry(self, domain: Optional[str] = "time") -> Dict[str, Any]: ...
+    def describe_geometry(self, domain: Optional[str] = "time") -> Dict[str, Any]: ...
 
-    def coord_to_line(self, x: float, y: float) -> Tuple[float, float]: ...
-
-    def line_to_coord(self, il_no: float, xl_no: float) -> Tuple[float, float]: ...
-
-    def footprint_xy(self, domain: Optional[str] = "time") -> np.ndarray: ...
-
-    def distance_to_footprint(self, x: float, y: float, domain: Optional[str] = "time") -> float: ...
-
-    def bin_spacing_m(self, domain: Optional[str] = "time") -> Dict[str, float]: ...
-
-    def nominal_bin_spacing_m(self, domain: Optional[str] = "time") -> float: ...
-
-    def import_seismic_at_well(
+    def read_trace_at_xy(
         self,
         well_x: float,
         well_y: float,
@@ -63,89 +48,6 @@ class SurveyContext(Protocol):
         sample_end: Optional[float] = None,
         domain: str = "time",
     ) -> grid.Seismic: ...
-
-
-def _axis_stats(axis: np.ndarray) -> Dict[str, float]:
-    """计算轴的最小值、最大值与步长。"""
-    if axis.size == 0:
-        raise ValueError("Axis is empty.")
-    if axis.size == 1:
-        return {"min": float(axis[0]), "max": float(axis[0]), "step": 0.0}
-    return {
-        "min": float(axis[0]),
-        "max": float(axis[-1]),
-        "step": float(axis[1] - axis[0]),
-    }
-
-
-def _point_segment_distance_m(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
-    segment = end - start
-    denom = float(np.dot(segment, segment))
-    if denom == 0.0:
-        return float(np.linalg.norm(point - start))
-    t = float(np.dot(point - start, segment) / denom)
-    t = min(1.0, max(0.0, t))
-    projection = start + t * segment
-    return float(np.linalg.norm(point - projection))
-
-
-def _distance_to_footprint_boundary_m(point_xy: Sequence[float], footprint_xy: np.ndarray) -> float:
-    footprint = np.asarray(footprint_xy, dtype=np.float64)
-    if footprint.shape != (4, 2):
-        raise ValueError(f"Expected footprint shape (4, 2), got {footprint.shape}.")
-    point = np.asarray(point_xy, dtype=np.float64)
-    if point.shape != (2,) or not np.all(np.isfinite(point)):
-        raise ValueError(f"Invalid XY point: {point_xy}")
-    return min(
-        _point_segment_distance_m(point, footprint[index], footprint[(index + 1) % footprint.shape[0]])
-        for index in range(footprint.shape[0])
-    )
-
-
-def _survey_footprint_xy(survey: "SurveyContext", domain: Optional[str] = "time") -> np.ndarray:
-    geometry = survey.query_geometry(domain)
-    il_min = float(geometry["inline_min"])
-    il_max = float(geometry["inline_max"])
-    xl_min = float(geometry["xline_min"])
-    xl_max = float(geometry["xline_max"])
-    return np.asarray(
-        [
-            survey.line_to_coord(il_min, xl_min),
-            survey.line_to_coord(il_max, xl_min),
-            survey.line_to_coord(il_max, xl_max),
-            survey.line_to_coord(il_min, xl_max),
-        ],
-        dtype=np.float64,
-    )
-
-
-def _survey_bin_spacing_m(survey: "SurveyContext", domain: Optional[str] = "time") -> Dict[str, float]:
-    geometry = survey.query_geometry(domain)
-    il_min = float(geometry["inline_min"])
-    xl_min = float(geometry["xline_min"])
-
-    spacings: list[float] = []
-    inline_spacing_m = 0.0
-    xline_spacing_m = 0.0
-    if int(geometry["n_il"]) > 1:
-        p0 = survey.line_to_coord(il_min, xl_min)
-        p1 = survey.line_to_coord(il_min + float(geometry["inline_step"]), xl_min)
-        inline_spacing_m = float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
-        if np.isfinite(inline_spacing_m) and inline_spacing_m > 0.0:
-            spacings.append(inline_spacing_m)
-    if int(geometry["n_xl"]) > 1:
-        p0 = survey.line_to_coord(il_min, xl_min)
-        p1 = survey.line_to_coord(il_min, xl_min + float(geometry["xline_step"]))
-        xline_spacing_m = float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
-        if np.isfinite(xline_spacing_m) and xline_spacing_m > 0.0:
-            spacings.append(xline_spacing_m)
-
-    nominal = float(np.median(np.asarray(spacings, dtype=np.float64))) if spacings else 0.0
-    return {
-        "inline_spacing_m": inline_spacing_m,
-        "xline_spacing_m": xline_spacing_m,
-        "nominal_bin_spacing_m": nominal,
-    }
 
 
 def _normalize_domain(domain: Optional[str]) -> str:
@@ -166,26 +68,6 @@ def _domain_to_basis_type(domain: str) -> str:
     return "md"
 
 
-def _resolve_sample_window(samples: np.ndarray, start: Optional[float], end: Optional[float]) -> Tuple[int, int]:
-    """将采样窗口映射为索引区间。"""
-    if start is None:
-        start = float(samples[0])
-    if end is None:
-        end = float(samples[-1])
-    if start >= end:
-        raise ValueError(f"Invalid window: start={start}, end={end}")
-
-    sample_idx_start = int(np.searchsorted(samples, start, side="left"))
-    sample_idx_end = int(np.searchsorted(samples, end, side="right"))
-    sample_idx_start = max(0, sample_idx_start)
-    sample_idx_end = min(samples.size, sample_idx_end)
-
-    if sample_idx_start >= sample_idx_end:
-        raise ValueError("Selected sample window is empty.")
-
-    return sample_idx_start, sample_idx_end
-
-
 def _interpolate_trace_from_4_neighbors(
     i: float,
     j: float,
@@ -202,18 +84,20 @@ def _interpolate_trace_from_4_neighbors(
     return (1 - wi) * (1 - wj) * trace00 + (1 - wi) * wj * trace01 + wi * (1 - wj) * trace10 + wi * wj * trace11
 
 
-def _segy_build_samples(meta: Dict[str, Any], domain: str) -> np.ndarray:
+def _segy_build_sample_axis(meta: Dict[str, Any], domain: str) -> SampleAxis:
     """根据 SEG-Y 元信息构建采样轴。"""
     domain_lower = _normalize_domain(domain)
     nt = int(meta["nt"])
     if domain_lower == "time":
         start_time_s = float(meta.get("start_time", 0.0)) / 1000.0
         dt_s = float(meta["dt"]) / 1_000_000.0
-        return start_time_s + np.arange(nt, dtype=np.float64) * dt_s
+        values = start_time_s + np.arange(nt, dtype=np.float64) * dt_s
+        return SampleAxis(values=values, domain=domain_lower, unit="s")
 
     start_depth = float(meta.get("start_depth", meta.get("start_time", 0.0)))
     dz = float(meta.get("dz", meta["dt"])) / 1000.0
-    return start_depth + np.arange(nt, dtype=np.float64) * dz
+    values = start_depth + np.arange(nt, dtype=np.float64) * dz
+    return SampleAxis(values=values, domain=domain_lower, unit="m")
 
 
 def _segy_pick_affine_reference_points_from_geom(
@@ -235,33 +119,6 @@ def _segy_pick_affine_reference_points_from_geom(
     raise ValueError("Cannot find valid neighboring traces to build SEG-Y coordinate transform.")
 
 
-def _segy_coord_to_index_from_3points(
-    x: float,
-    y: float,
-    p0: Tuple[float, float],
-    p1: Tuple[float, float],
-    p2: Tuple[float, float],
-    i0: float,
-    j0: float,
-) -> Tuple[float, float]:
-    """基于三点仿射关系将坐标转换为索引。"""
-    dx_il = p1[0] - p0[0]
-    dy_il = p1[1] - p0[1]
-    dx_xl = p2[0] - p0[0]
-    dy_xl = p2[1] - p0[1]
-
-    det = dx_il * dy_xl - dy_il * dx_xl
-    if abs(det) < 1e-10:
-        raise ValueError("Coordinate transform is degenerate for current SEG-Y geometry.")
-
-    dx = x - p0[0]
-    dy = y - p0[1]
-
-    di = (dx * dy_xl - dy * dx_xl) / det
-    dj = (dy * dx_il - dx * dy_il) / det
-    return i0 + di, j0 + dj
-
-
 def _segy_coord_scalar_to_factor(coord_scalar: float) -> float:
     """将 SEG-Y 坐标缩放因子转换为乘法系数。"""
     if coord_scalar == 0:
@@ -273,20 +130,12 @@ def _segy_coord_scalar_to_factor(coord_scalar: float) -> float:
 
 @dataclass(frozen=True)
 class SegySurveyContext:
-    """SEG-Y 工区上下文，封装坐标映射与井旁道提取。"""
+    """SEG-Y 地震体 Adapter。"""
 
     seismic_file: Path
     meta: Dict[str, Any]
     geom: np.ndarray
-    i0: float
-    j0: float
-    p0: Tuple[float, float]
-    p1: Tuple[float, float]
-    p2: Tuple[float, float]
-    min_iline: float
-    min_xline: float
-    istep: float
-    xstep: float
+    line_geometry: SurveyLineGeometry
 
     @classmethod
     def from_file(
@@ -333,111 +182,56 @@ class SegySurveyContext:
             idx2 = int(geom[i2, j2])
 
             coord_factor = _segy_coord_scalar_to_factor(float(meta.get("scalar", 1.0)))
-
             p0 = (float(segy.coordx(idx0)) * coord_factor, float(segy.coordy(idx0)) * coord_factor)
             p1 = (float(segy.coordx(idx1)) * coord_factor, float(segy.coordy(idx1)) * coord_factor)
             p2 = (float(segy.coordx(idx2)) * coord_factor, float(segy.coordy(idx2)) * coord_factor)
+
+            dx_inline = p1[0] - p0[0]
+            dy_inline = p1[1] - p0[1]
+            dx_xline = p2[0] - p0[0]
+            dy_xline = p2[1] - p0[1]
+            x_origin = p0[0] - i0 * dx_inline - j0 * dx_xline
+            y_origin = p0[1] - i0 * dy_inline - j0 * dy_xline
+
+            line_geometry = SurveyLineGeometry(
+                inline_axis=LineAxis(
+                    minimum=float(geominfo["iline"]["min_iline"]),
+                    step=float(geominfo["iline"]["istep"]),
+                    count=int(geom.shape[0]),
+                    name="inline",
+                ),
+                xline_axis=LineAxis(
+                    minimum=float(geominfo["xline"]["min_xline"]),
+                    step=float(geominfo["xline"]["xstep"]),
+                    count=int(geom.shape[1]),
+                    name="xline",
+                ),
+                x0=float(x_origin),
+                y0=float(y_origin),
+                dx_inline=float(dx_inline),
+                dy_inline=float(dy_inline),
+                dx_xline=float(dx_xline),
+                dy_xline=float(dy_xline),
+            )
 
             return cls(
                 seismic_file=Path(seismic_file),
                 meta=meta,
                 geom=geom,
-                i0=float(i0),
-                j0=float(j0),
-                p0=p0,
-                p1=p1,
-                p2=p2,
-                min_iline=float(geominfo["iline"]["min_iline"]),
-                min_xline=float(geominfo["xline"]["min_xline"]),
-                istep=float(geominfo["iline"]["istep"]),
-                xstep=float(geominfo["xline"]["xstep"]),
+                line_geometry=line_geometry,
             )
         finally:
             segy.close()
 
-    def query_geometry(self, domain: Optional[str] = "time") -> Dict[str, Any]:
-        domain_value = _normalize_domain(domain)
+    def sample_axis(self, domain: Optional[str] = "time") -> SampleAxis:
+        """返回指定采样域的采样轴。"""
+        return _segy_build_sample_axis(self.meta, _normalize_domain(domain))
 
-        ilines = self.min_iline + np.arange(self.geom.shape[0], dtype=np.float64) * self.istep
-        xlines = self.min_xline + np.arange(self.geom.shape[1], dtype=np.float64) * self.xstep
-        samples = _segy_build_samples(self.meta, domain_value)
+    def describe_geometry(self, domain: Optional[str] = "time") -> Dict[str, Any]:
+        """返回历史几何字典格式。"""
+        return self.line_geometry.describe(sample_axis=self.sample_axis(domain))
 
-        inline_stats = _axis_stats(ilines)
-        xline_stats = _axis_stats(xlines)
-        sample_stats = _axis_stats(samples)
-
-        sample_unit = "s" if domain_value == "time" else "m"
-        return {
-            "n_il": int(self.geom.shape[0]),
-            "inline_min": inline_stats["min"],
-            "inline_max": inline_stats["max"],
-            "inline_step": inline_stats["step"],
-            "n_xl": int(self.geom.shape[1]),
-            "xline_min": xline_stats["min"],
-            "xline_max": xline_stats["max"],
-            "xline_step": xline_stats["step"],
-            "n_sample": int(self.meta["nt"]),
-            "sample_min": sample_stats["min"],
-            "sample_max": sample_stats["max"],
-            "sample_step": sample_stats["step"],
-            "sample_domain": domain_value,
-            "sample_unit": sample_unit,
-        }
-
-    def coord_to_index(self, x: float, y: float) -> Tuple[float, float]:
-        i, j = _segy_coord_to_index_from_3points(x, y, self.p0, self.p1, self.p2, self.i0, self.j0)
-
-        ni, nx = self.geom.shape
-        if not (0 <= i <= ni - 1):
-            raise ValueError(f"Point is outside SEG-Y inline range: {i}")
-        if not (0 <= j <= nx - 1):
-            raise ValueError(f"Point is outside SEG-Y crossline range: {j}")
-        return i, j
-
-    def coord_to_line(self, x: float, y: float) -> Tuple[float, float]:
-        i, j = self.coord_to_index(x, y)
-        il_no = self.min_iline + i * self.istep
-        xl_no = self.min_xline + j * self.xstep
-        return il_no, xl_no
-
-    def line_to_index(self, il_no: float, xl_no: float) -> Tuple[float, float]:
-        i = (il_no - self.min_iline) / self.istep
-        j = (xl_no - self.min_xline) / self.xstep
-
-        ni, nx = self.geom.shape
-        if not (0 <= i <= ni - 1):
-            raise ValueError(f"Inline is outside SEG-Y range: {il_no}")
-        if not (0 <= j <= nx - 1):
-            raise ValueError(f"Crossline is outside SEG-Y range: {xl_no}")
-        return i, j
-
-    def line_to_coord(self, il_no: float, xl_no: float) -> Tuple[float, float]:
-        i, j = self.line_to_index(il_no, xl_no)
-
-        dx_il = self.p1[0] - self.p0[0]
-        dy_il = self.p1[1] - self.p0[1]
-        dx_xl = self.p2[0] - self.p0[0]
-        dy_xl = self.p2[1] - self.p0[1]
-        di = i - self.i0
-        dj = j - self.j0
-
-        x = self.p0[0] + di * dx_il + dj * dx_xl
-        y = self.p0[1] + di * dy_il + dj * dy_xl
-        return x, y
-
-    def footprint_xy(self, domain: Optional[str] = "time") -> np.ndarray:
-        return _survey_footprint_xy(self, domain)
-
-    def distance_to_footprint(self, x: float, y: float, domain: Optional[str] = "time") -> float:
-        return _distance_to_footprint_boundary_m((x, y), self.footprint_xy(domain))
-
-    def bin_spacing_m(self, domain: Optional[str] = "time") -> Dict[str, float]:
-        return _survey_bin_spacing_m(self, domain)
-
-    def nominal_bin_spacing_m(self, domain: Optional[str] = "time") -> float:
-        return self.bin_spacing_m(domain)["nominal_bin_spacing_m"]
-
-    def import_seismic_at_well(
+    def read_trace_at_xy(
         self,
         well_x: float,
         well_y: float,
@@ -445,9 +239,10 @@ class SegySurveyContext:
         sample_end: Optional[float] = None,
         domain: str = "time",
     ) -> grid.Seismic:
+        """读取井位处四邻道双线性插值后的地震道。"""
         domain_value = _normalize_domain(domain)
 
-        i, j = self.coord_to_index(well_x, well_y)
+        i, j = self.line_geometry.coord_to_index(well_x, well_y)
         i_floor = int(np.floor(i))
         i_ceil = int(np.ceil(i))
         j_floor = int(np.floor(j))
@@ -457,7 +252,7 @@ class SegySurveyContext:
         if not (0 <= i_floor < ni and 0 <= i_ceil < ni):
             raise ValueError(f"Well is outside seismic inline range: {i_floor}, {i_ceil}")
         if not (0 <= j_floor < nx and 0 <= j_ceil < nx):
-            raise ValueError(f"Well is outside seismic crossline range: {j_floor}, {j_ceil}")
+            raise ValueError(f"Well is outside seismic xline range: {j_floor}, {j_ceil}")
 
         neighbor_indices = [
             int(self.geom[i_floor, j_floor]),
@@ -468,8 +263,8 @@ class SegySurveyContext:
         if any(idx < 0 for idx in neighbor_indices):
             raise ValueError("Well neighborhood contains missing traces, cannot apply bilinear interpolation.")
 
-        raw_samples = _segy_build_samples(self.meta, domain=domain_value)
-        sample_idx_start, sample_idx_end = _resolve_sample_window(raw_samples, sample_start, sample_end)
+        sample_axis = self.sample_axis(domain_value)
+        sample_idx_start, sample_idx_end = sample_axis.window_indices(sample_start, sample_end)
 
         import cigsegy
 
@@ -483,7 +278,7 @@ class SegySurveyContext:
             segy.close()
 
         trace_data = _interpolate_trace_from_4_neighbors(i, j, t00, t01, t10, t11)
-        trace_axis = raw_samples[sample_idx_start:sample_idx_end]
+        trace_axis = sample_axis.values[sample_idx_start:sample_idx_end]
 
         basis_type = _domain_to_basis_type(domain_value)
         trace_name = "Seismic Trace" if basis_type == "twt" else "Seismic Trace (Depth)"
@@ -492,121 +287,59 @@ class SegySurveyContext:
 
 @dataclass(frozen=True)
 class ZgySurveyContext:
-    """ZGY 工区上下文，封装几何查询与井旁道提取。"""
+    """ZGY 地震体 Adapter。"""
 
     seismic_file: Path
-    ilines: np.ndarray
-    xlines: np.ndarray
     samples: np.ndarray
     n_ilines: int
     n_xlines: int
-    annotstart_il: float
-    annotstart_xl: float
-    annotinc_il: float
-    annotinc_xl: float
-    x0: float
-    y0: float
-    dx_il: float
-    dy_il: float
-    dx_xl: float
-    dy_xl: float
+    line_geometry: SurveyLineGeometry
 
     @classmethod
     def from_file(cls, seismic_file: Path) -> "ZgySurveyContext":
         import pyzgy
 
         with pyzgy.open(str(seismic_file), mode="r") as reader:
+            line_geometry = SurveyLineGeometry(
+                inline_axis=LineAxis(
+                    minimum=float(reader.annotstart[0]),
+                    step=float(reader.annotinc[0]),
+                    count=int(reader.n_ilines),
+                    name="inline",
+                ),
+                xline_axis=LineAxis(
+                    minimum=float(reader.annotstart[1]),
+                    step=float(reader.annotinc[1]),
+                    count=int(reader.n_xlines),
+                    name="xline",
+                ),
+                x0=float(reader.corners[0][0]),
+                y0=float(reader.corners[0][1]),
+                dx_inline=float(reader.easting_inc_il),
+                dy_inline=float(reader.northing_inc_il),
+                dx_xline=float(reader.easting_inc_xl),
+                dy_xline=float(reader.northing_inc_xl),
+            )
             return cls(
                 seismic_file=Path(seismic_file),
-                ilines=np.asarray(reader.ilines, dtype=np.float64),
-                xlines=np.asarray(reader.xlines, dtype=np.float64),
                 samples=np.asarray(reader.samples, dtype=np.float64),
                 n_ilines=int(reader.n_ilines),
                 n_xlines=int(reader.n_xlines),
-                annotstart_il=float(reader.annotstart[0]),
-                annotstart_xl=float(reader.annotstart[1]),
-                annotinc_il=float(reader.annotinc[0]),
-                annotinc_xl=float(reader.annotinc[1]),
-                x0=float(reader.corners[0][0]),
-                y0=float(reader.corners[0][1]),
-                dx_il=float(reader.easting_inc_il),
-                dy_il=float(reader.northing_inc_il),
-                dx_xl=float(reader.easting_inc_xl),
-                dy_xl=float(reader.northing_inc_xl),
+                line_geometry=line_geometry,
             )
 
-    def query_geometry(self, domain: Optional[str] = "time") -> Dict[str, Any]:
+    def sample_axis(self, domain: Optional[str] = "time") -> SampleAxis:
+        """返回指定采样域的采样轴。"""
         domain_value = _normalize_domain(domain)
-        inline_stats = _axis_stats(self.ilines)
-        xline_stats = _axis_stats(self.xlines)
-        sample_values = self.samples / 1000.0 if domain_value == "time" else self.samples
-        sample_stats = _axis_stats(sample_values)
+        if domain_value == "time":
+            return SampleAxis(values=self.samples / 1000.0, domain=domain_value, unit="s")
+        return SampleAxis(values=self.samples, domain=domain_value, unit="m")
 
-        sample_unit = "s" if domain_value == "time" else "m"
-        return {
-            "n_il": int(self.n_ilines),
-            "inline_min": inline_stats["min"],
-            "inline_max": inline_stats["max"],
-            "inline_step": inline_stats["step"],
-            "n_xl": int(self.n_xlines),
-            "xline_min": xline_stats["min"],
-            "xline_max": xline_stats["max"],
-            "xline_step": xline_stats["step"],
-            "n_sample": int(sample_values.size),
-            "sample_min": sample_stats["min"],
-            "sample_max": sample_stats["max"],
-            "sample_step": sample_stats["step"],
-            "sample_domain": domain_value,
-            "sample_unit": sample_unit,
-        }
+    def describe_geometry(self, domain: Optional[str] = "time") -> Dict[str, Any]:
+        """返回历史几何字典格式。"""
+        return self.line_geometry.describe(sample_axis=self.sample_axis(domain))
 
-    def coord_to_index(self, x: float, y: float) -> Tuple[float, float]:
-        det = self.dx_il * self.dy_xl - self.dy_il * self.dx_xl
-        if abs(det) < 1e-10:
-            raise ValueError("Coordinate system is degenerate (determinant is zero)")
-
-        dx = x - self.x0
-        dy = y - self.y0
-        i = (dx * self.dy_xl - dy * self.dx_xl) / det
-        j = (dy * self.dx_il - dx * self.dy_il) / det
-
-        if not (0 <= i <= self.n_ilines - 1):
-            raise ValueError(f"Point is outside ZGY inline range: {i}")
-        if not (0 <= j <= self.n_xlines - 1):
-            raise ValueError(f"Point is outside ZGY crossline range: {j}")
-        return i, j
-
-    def coord_to_line(self, x: float, y: float) -> Tuple[float, float]:
-        i, j = self.coord_to_index(x, y)
-        il_no = self.annotstart_il + i * self.annotinc_il
-        xl_no = self.annotstart_xl + j * self.annotinc_xl
-        return il_no, xl_no
-
-    def line_to_coord(self, il_no: float, xl_no: float) -> Tuple[float, float]:
-        i = (il_no - self.annotstart_il) / self.annotinc_il
-        j = (xl_no - self.annotstart_xl) / self.annotinc_xl
-        if not (0 <= i <= self.n_ilines - 1):
-            raise ValueError(f"Inline is outside ZGY range: {il_no}")
-        if not (0 <= j <= self.n_xlines - 1):
-            raise ValueError(f"Crossline is outside ZGY range: {xl_no}")
-
-        x = self.x0 + i * self.dx_il + j * self.dx_xl
-        y = self.y0 + i * self.dy_il + j * self.dy_xl
-        return x, y
-
-    def footprint_xy(self, domain: Optional[str] = "time") -> np.ndarray:
-        return _survey_footprint_xy(self, domain)
-
-    def distance_to_footprint(self, x: float, y: float, domain: Optional[str] = "time") -> float:
-        return _distance_to_footprint_boundary_m((x, y), self.footprint_xy(domain))
-
-    def bin_spacing_m(self, domain: Optional[str] = "time") -> Dict[str, float]:
-        return _survey_bin_spacing_m(self, domain)
-
-    def nominal_bin_spacing_m(self, domain: Optional[str] = "time") -> float:
-        return self.bin_spacing_m(domain)["nominal_bin_spacing_m"]
-
-    def import_seismic_at_well(
+    def read_trace_at_xy(
         self,
         well_x: float,
         well_y: float,
@@ -614,11 +347,11 @@ class ZgySurveyContext:
         sample_end: Optional[float] = None,
         domain: str = "time",
     ) -> grid.Seismic:
+        """读取井位处四邻道双线性插值后的地震道。"""
         import pyzgy
 
         domain_value = _normalize_domain(domain)
-
-        i, j = self.coord_to_index(well_x, well_y)
+        i, j = self.line_geometry.coord_to_index(well_x, well_y)
         i_floor = int(np.floor(i))
         i_ceil = int(np.ceil(i))
         j_floor = int(np.floor(j))
@@ -627,10 +360,10 @@ class ZgySurveyContext:
         if not (0 <= i_floor < self.n_ilines and 0 <= i_ceil < self.n_ilines):
             raise ValueError(f"Well is outside seismic inline range: {i_floor}, {i_ceil}")
         if not (0 <= j_floor < self.n_xlines and 0 <= j_ceil < self.n_xlines):
-            raise ValueError(f"Well is outside seismic crossline range: {j_floor}, {j_ceil}")
+            raise ValueError(f"Well is outside seismic xline range: {j_floor}, {j_ceil}")
 
-        raw_samples = self.samples / 1000.0 if domain_value == "time" else self.samples
-        sample_idx_start, sample_idx_end = _resolve_sample_window(raw_samples, sample_start, sample_end)
+        sample_axis = self.sample_axis(domain_value)
+        sample_idx_start, sample_idx_end = sample_axis.window_indices(sample_start, sample_end)
 
         with pyzgy.open(str(self.seismic_file), mode="r") as reader:
             t00 = reader.get_trace(i_floor * self.n_xlines + j_floor)[sample_idx_start:sample_idx_end]
@@ -639,28 +372,11 @@ class ZgySurveyContext:
             t11 = reader.get_trace(i_ceil * self.n_xlines + j_ceil)[sample_idx_start:sample_idx_end]
 
         trace_data = _interpolate_trace_from_4_neighbors(i, j, t00, t01, t10, t11)
-
-        trace_axis = raw_samples[sample_idx_start:sample_idx_end]
+        trace_axis = sample_axis.values[sample_idx_start:sample_idx_end]
 
         basis_type = _domain_to_basis_type(domain_value)
         trace_name = "Seismic Trace" if basis_type == "twt" else "Seismic Trace (Depth)"
         return grid.Seismic(values=trace_data, basis=trace_axis, basis_type=basis_type, name=trace_name)
-
-
-def _resolve_context(
-    seismic_file: Path,
-    seismic_type: str,
-    iline: Optional[int] = None,
-    xline: Optional[int] = None,
-    istep: Optional[int] = None,
-    xstep: Optional[int] = None,
-) -> SurveyContext:
-    """根据输入参数打开工区上下文。"""
-    return open_survey(
-        seismic_file,
-        seismic_type=seismic_type,
-        segy_options=_build_segy_options(iline=iline, xline=xline, istep=istep, xstep=xstep),
-    )
 
 
 def segy_options_from_config(seismic_cfg: dict[str, Any]) -> dict[str, int]:
@@ -685,72 +401,13 @@ def segy_options_from_config(seismic_cfg: dict[str, Any]) -> dict[str, int]:
     return options
 
 
-def snap_line_number(line_float: float, *, line_min: float, line_step: float) -> float:
-    """将浮点线号吸附到规则线号轴上的最近有效线号。
-
-    使用轴吸附公式：
-    ``line_min + round((line_float - line_min) / line_step) * line_step``。
-    """
-    step = float(line_step)
-    if step <= 0.0:
-        return float(round(float(line_float)))
-    line_index = round((float(line_float) - float(line_min)) / step)
-    return float(line_min) + float(line_index) * step
-
-
-def _build_segy_options(
-    iline: Optional[int] = None,
-    xline: Optional[int] = None,
-    istep: Optional[int] = None,
-    xstep: Optional[int] = None,
-) -> Dict[str, int]:
-    """构建 SEG-Y 读取参数字典。"""
-    options: Dict[str, int] = {}
-    if iline is not None:
-        options["iline"] = int(iline)
-    if xline is not None:
-        options["xline"] = int(xline)
-    if istep is not None:
-        options["istep"] = int(istep)
-    if xstep is not None:
-        options["xstep"] = int(xstep)
-    return options
-
-
 def open_survey(
     seismic_file: Path,
     seismic_type: str = "segy",
     *,
     segy_options: Optional[Dict[str, int]] = None,
 ) -> SurveyContext:
-    """打开地震工区并返回可复用的上下文对象。
-
-    Parameters
-    ----------
-    seismic_file : Path
-        地震文件路径。
-    seismic_type : {"segy", "zgy"}, default="segy"
-        文件类型标识。
-    segy_options : dict, optional
-        SEG-Y 读取附加参数，仅当 ``seismic_type='segy'`` 时有效。
-        目前支持 ``iline``、``xline``、``istep``、``xstep``。
-
-    Returns
-    -------
-    SurveyContext
-        可复用的工区上下文对象，具体类型取决于 ``seismic_type``。
-
-    Raises
-    ------
-    ValueError
-        当 ``seismic_type`` 不受支持，或为 ZGY 传入了 ``segy_options``，
-        或 ``segy_options`` 包含未知键时抛出。
-
-    Notes
-    -----
-    批量几何查询、批量坐标转换或批量井旁道提取时，建议优先调用本函数一次，
-    然后复用返回的上下文对象，以避免重复打开文件。
-    """
+    """打开地震体文件并返回可复用 Adapter。"""
     seismic_type_lower = seismic_type.lower()
     if seismic_type_lower == "segy":
         options = dict(segy_options or {})
@@ -770,153 +427,3 @@ def open_survey(
             raise ValueError("segy_options is only valid when seismic_type='segy'.")
         return ZgySurveyContext.from_file(seismic_file)
     raise ValueError(f"Unsupported seismic_type: {seismic_type}. Expect 'segy' or 'zgy'.")
-
-
-def import_seismic_at_well(
-    seismic_file: Path,
-    well_x: float,
-    well_y: float,
-    sample_start: Optional[float] = None,
-    sample_end: Optional[float] = None,
-    domain: str = "time",
-    seismic_type: str = "segy",
-    iline: Optional[int] = None,
-    xline: Optional[int] = None,
-    istep: Optional[int] = None,
-    xstep: Optional[int] = None,
-) -> grid.Seismic:
-    """提取井位处的复合地震道。
-
-    Parameters
-    ----------
-    seismic_file : Path
-        地震文件路径。
-    well_x, well_y : float
-        目标井位或目标点的平面坐标。
-    sample_start, sample_end : float, optional
-        提取窗口的起止采样坐标。若为空，则默认使用当前工区可用采样范围。
-    domain : {"time", "depth"}, default="time"
-        返回地震道的采样域。
-    seismic_type : {"segy", "zgy"}, default="segy"
-        地震文件类型。
-    iline, xline, istep, xstep : int, optional
-        仅对 SEG-Y 有效的 keyloc 与步长参数，会透传给 ``open_survey``。
-
-    Returns
-    -------
-    grid.Seismic
-        井位处通过四邻道双线性插值得到的一维地震道。
-
-    Raises
-    ------
-    ValueError
-        当工区类型不支持、井位超出范围、采样窗口为空或邻域道不完整时抛出。
-
-    Notes
-    -----
-    这是便捷函数。若需要批量提取多口井，建议先调用 ``open_survey`` 获取上下文，
-    再复用上下文对象上的 ``import_seismic_at_well`` 方法。
-    """
-    ctx = _resolve_context(
-        seismic_file,
-        seismic_type,
-        iline=iline,
-        xline=xline,
-        istep=istep,
-        xstep=xstep,
-    )
-    return ctx.import_seismic_at_well(
-        well_x=well_x,
-        well_y=well_y,
-        sample_start=sample_start,
-        sample_end=sample_end,
-        domain=domain,
-    )
-
-
-def coord_to_line(
-    seismic_file: Path,
-    x: float,
-    y: float,
-    seismic_type: str = "segy",
-    iline: Optional[int] = None,
-    xline: Optional[int] = None,
-    istep: Optional[int] = None,
-    xstep: Optional[int] = None,
-) -> Tuple[float, float]:
-    """将 XY 坐标转换为 ``(inline_no, crossline_no)``。
-
-    Parameters
-    ----------
-    seismic_file : Path
-        地震文件路径。
-    x, y : float
-        输入平面坐标。
-    seismic_type : {"segy", "zgy"}, default="segy"
-        地震文件类型。
-    iline, xline, istep, xstep : int, optional
-        仅对 SEG-Y 有效的读取参数，会透传给 ``open_survey``。
-
-    Returns
-    -------
-    Tuple[float, float]
-        对应的 ``(inline_no, crossline_no)``，允许为浮点值。
-
-    Raises
-    ------
-    ValueError
-        当坐标位于工区范围外，或地震类型不受支持时抛出。
-    """
-    ctx = _resolve_context(
-        seismic_file,
-        seismic_type,
-        iline=iline,
-        xline=xline,
-        istep=istep,
-        xstep=xstep,
-    )
-    return ctx.coord_to_line(x, y)
-
-
-def line_to_coord(
-    seismic_file: Path,
-    il_no: float,
-    xl_no: float,
-    seismic_type: str = "segy",
-    iline: Optional[int] = None,
-    xline: Optional[int] = None,
-    istep: Optional[int] = None,
-    xstep: Optional[int] = None,
-) -> Tuple[float, float]:
-    """将 ``(inline_no, crossline_no)`` 转换为 XY 坐标。
-
-    Parameters
-    ----------
-    seismic_file : Path
-        地震文件路径。
-    il_no, xl_no : float
-        输入的 inline/crossline 编号。
-    seismic_type : {"segy", "zgy"}, default="segy"
-        地震文件类型。
-    iline, xline, istep, xstep : int, optional
-        仅对 SEG-Y 有效的读取参数，会透传给 ``open_survey``。
-
-    Returns
-    -------
-    Tuple[float, float]
-        对应的平面坐标 ``(x, y)``。
-
-    Raises
-    ------
-    ValueError
-        当道号超出工区范围，或地震类型不受支持时抛出。
-    """
-    ctx = _resolve_context(
-        seismic_file,
-        seismic_type,
-        iline=iline,
-        xline=xline,
-        istep=istep,
-        xstep=xstep,
-    )
-    return ctx.line_to_coord(il_no, xl_no)

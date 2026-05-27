@@ -24,8 +24,8 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
+from cup.seismic.geometry import resolve_well_line_position
 from cup.seismic.modeling import WellControl, build_layer_constrained_model
-from cup.seismic.spatial import resolve_well_line_position
 from cup.seismic.survey import SurveyContext
 from cup.seismic.target_zone import TargetZone
 from wtie.processing import grid
@@ -267,7 +267,7 @@ def _prepare_well(
     filter_buffer_mode: str,
 ) -> _PreparedLfmTimeWell:
     """标准化井输入并生成建模控制点。"""
-    inline, xline = resolve_well_line_position(well, survey)
+    inline, xline = resolve_well_line_position(well, survey.line_geometry if survey is not None else None)
     horizon_times = target_layer.get_interpretation_values_at_location(inline, xline)
     sample_min = float(target_layer.geometry["sample_min"])
     sample_max = float(target_layer.geometry["sample_max"])

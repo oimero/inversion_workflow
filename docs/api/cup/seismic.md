@@ -2,6 +2,8 @@
 
 ::: cup.seismic.survey
 
+::: cup.seismic.geometry
+
 ::: cup.seismic.spatial
 
 ::: cup.seismic.horizon

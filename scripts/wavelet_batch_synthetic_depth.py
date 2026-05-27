@@ -341,7 +341,7 @@ def process_well(
     name = sanitize_filename(well_name)
     row: dict[str, Any] = {"well_name": well_name, "status": "failed", "error": ""}
 
-    il_float, xl_float = survey.coord_to_line(well_x, well_y)
+    il_float, xl_float = survey.line_geometry.coord_to_line(well_x, well_y)
     if not (geometry_depth["inline_min"] <= il_float <= geometry_depth["inline_max"]):
         raise ValueError(f"Inline outside survey range: {il_float}")
     if not (geometry_depth["xline_min"] <= xl_float <= geometry_depth["xline_max"]):
@@ -352,7 +352,7 @@ def process_well(
     tvdss_m = md_m - kb_m
     vp_mps = interpolate_nans(logset_md.Vp.values, method="linear")
 
-    seismic_depth_trace = survey.import_seismic_at_well(well_x=well_x, well_y=well_y, domain="depth")
+    seismic_depth_trace = survey.read_trace_at_xy(well_x=well_x, well_y=well_y, domain="depth")
     seis_depth = seismic_depth_trace.basis.astype(float)
     seis_amp = interpolate_nans(seismic_depth_trace.values, method="linear")
 
@@ -716,7 +716,7 @@ def main() -> None:
         "xstep": segy_cfg["xstep"],
     }
     survey = open_survey(seismic_file, seismic_type="segy", segy_options=segy_options)
-    geometry_depth = survey.query_geometry(domain="depth")
+    geometry_depth = survey.describe_geometry(domain="depth")
     modeler = ConvModeler()
 
     # ── Process wells ──

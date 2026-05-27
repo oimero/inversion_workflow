@@ -163,7 +163,7 @@ WellTrajectory
 | --- | --- |
 | `from_petrel_trace(path)` | 读取当前 Petrel well trace txt |
 | `to_wtie_wellpath()` | 转成 `wtie.processing.grid.WellPath`，供 wtie 轴转换使用 |
-| `with_inline_xline(survey)` | 用 `SurveyContext` 补充每个轨迹点的 `inline/xline` |
+| `with_inline_xline(geometry)` | 用 `SurveyLineGeometry` 补充每个轨迹点的 `inline/xline` |
 | `position_at_md(md)` | 按 MD 插值得到 `x/y/tvdss/inline/xline` |
 | `position_at_tvdss(tvdss)` | 按 TVDSS 插值得到轨迹位置 |
 | `position_at_twt(twt, time_depth_table)` | 先由 TWT 找 MD 或 TVDSS，再找空间位置 |
@@ -346,9 +346,9 @@ preprocessed LAS + optimized TDT + trajectory
 | `sample_volume_at_points(volume_or_survey, points, mode)` | 对一组点批量取地震样值或地震道 |
 | `deduplicate_trace_reads(points)` | 斜井跨多道时合并重复 trace 读取 |
 
-这里要继续遵守 AGENTS.md 的易错点：物理距离必须通过 `open_survey()`、`line_to_coord()` 和 `cup.seismic.spatial` 计算，不能把 `inline_step/xline_step` 当米制距离。
+这里要继续遵守 AGENTS.md 的易错点：物理距离必须通过 `open_survey()` 得到的 `SurveyLineGeometry` 或真实 XY 网格计算，不能把 `inline_step/xline_step` 当米制距离。
 
-落地时还需要深化 `SurveyContext` 的 Interface。当前公开协议主要支持单点 `coord_to_line()`、`line_to_coord()` 和 `import_seismic_at_well()`；斜井批量取道需要批量坐标转索引、邻道/flat index 计划、sample window 解析、重复 trace 去重。这个复杂度应封装在 `cup.seismic.trace_sampling` 与 SEG-Y/ZGY Adapter 后面，而不是散落到 `well_auto_tie.py`、`lfm_precomputed.py` 或 `well_constraints.py`。
+落地时还需要继续深化地震采样 Interface。当前几何能力已经收敛到 `SurveyLineGeometry`，地震体 Adapter 负责 `read_trace_at_xy()`；斜井批量取道还需要批量坐标转索引、邻道/flat index 计划、sample window 解析、重复 trace 去重。这个复杂度应封装在 `cup.seismic.trace_sampling` 与 SEG-Y/ZGY Adapter 后面，而不是散落到 `well_auto_tie.py`、`lfm_precomputed.py` 或 `well_constraints.py`。
 
 ## 建议模块归并
 
@@ -391,7 +391,7 @@ preprocessed LAS + optimized TDT + trajectory
 
 ### 2. 统一井曲线到空间样点
 
-新增 `WellSpatialSampleSet`，把 `LogSet + TimeDepthTable + WellTrajectory + SurveyContext` 统一成点云。
+新增 `WellSpatialSampleSet`，把 `LogSet + TimeDepthTable + WellTrajectory + SurveyLineGeometry` 统一成点云。
 
 验收标准：
 

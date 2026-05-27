@@ -463,7 +463,7 @@ def main() -> None:
             depth_ai, ai_values = _regularize_depth_curve(tvdss, ai)
             depth_vp, vp_values = _regularize_depth_curve(tvdss, vp)
 
-            seismic_depth_trace = survey.import_seismic_at_well(
+            seismic_depth_trace = survey.read_trace_at_xy(
                 well_x=float(head["Surface X"]),
                 well_y=float(head["Surface Y"]),
                 domain="depth",

@@ -720,7 +720,7 @@ def main() -> None:
             if not np.isfinite(kb_m) or not np.isfinite(well_x) or not np.isfinite(well_y):
                 raise ValueError("Non-finite KB or surface coordinates.")
 
-            iline, xline = survey.coord_to_line(well_x, well_y)
+            iline, xline = survey.line_geometry.coord_to_line(well_x, well_y)
             flat_idx, il_idx, xl_idx, nearest_inline, nearest_xline = _nearest_flat_index(ai_lfm, iline, xline)
             md, raw_ai, filtered_ai, ai_source = _read_ai_curves_from_shifted_las(
                 las_path,

@@ -137,7 +137,7 @@ def collect_well_records(
         well_x = float(head["Surface X"])
         well_y = float(head["Surface Y"])
         kb_m = float(head["Well datum value"])
-        inline, xline = survey.coord_to_line(well_x, well_y)
+        inline, xline = survey.line_geometry.coord_to_line(well_x, well_y)
         horizon_depths = target_layer.get_interpretation_values_at_location(inline, xline)
 
         logset_md = old_load_vp_rho_logset_from_las(
@@ -556,7 +556,7 @@ def main() -> None:
     from cup.seismic.survey import open_survey
 
     survey = open_survey(seismic_file, seismic_type="segy", segy_options=segy_options)
-    geometry_depth = survey.query_geometry(domain="depth")
+    geometry_depth = survey.describe_geometry(domain="depth")
     print(json.dumps(geometry_depth, indent=2, ensure_ascii=False))
     assert geometry_depth["sample_domain"] == "depth"
     assert geometry_depth["sample_unit"] == "m"

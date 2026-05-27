@@ -1,4 +1,24 @@
-"""深度域 AI 低频模型的岩相控制工具。"""
+"""cup.seismic.facies_control_depth: 深度域岩相控制点建模与交互式 QC。
+
+本模块提供深度域 AI 低频模型的岩相控制能力，包括控制点加载与校验、
+局部窗口提取、log-AI 空间混入以及正演 QC 波形指标比对。
+
+边界说明
+--------
+- 本模块依赖 ``ginn_depth`` 的 ``DepthLfmVolume``、``DepthForwardModel`` 等重对象；
+  轻量逻辑不在此模块。
+- 不负责训练流程、反演优化或地震体全量读写。
+
+核心公开对象
+------------
+1. FaciesControlPoint: 单个岩相控制点参数。
+2. LocalControlResult: 单点施加后的局部窗口完整结果。
+3. FaciesControlQCContext: 交互式 QC 流程所需的重对象集合。
+4. load_depth_facies_control_points_csv: 从 CSV 读取控制点。
+5. apply_depth_facies_controls: 对 AI 体施加岩相控制。
+6. apply_single_control_to_window: 单点施加并返回局部 QC 窗口。
+7. forward_qc_at_control_trace: 正演控制前后道集并与真实地震对比。
+"""
 
 from __future__ import annotations
 
@@ -9,7 +29,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 import numpy as np
 import pandas as pd
 
-from cup.seismic.spatial import build_trace_xy_grids
 from cup.utils.io import resolve_relative_path, resolve_repo_metadata_path
 from cup.utils.statistics import normalized_cross_correlation, normalized_mae, rms
 
@@ -24,9 +43,9 @@ DEFAULT_INFLUENCE_WEIGHT_THRESHOLD = 0.01
 
 
 class _SurveyLike(Protocol):
-    def coord_to_line(self, x: float, y: float) -> tuple[float, float]: ...
+    line_geometry: Any
 
-    def line_to_coord(self, il_no: float, xl_no: float) -> tuple[float, float]: ...
+    def read_trace_at_xy(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 @dataclass(frozen=True)
@@ -204,7 +223,31 @@ def locate_control_zone(
     xline: float,
     depth_m: float,
 ) -> tuple[str, str, dict[str, float]]:
-    """Locate the adjacent horizon pair containing a control point depth."""
+    """定位包含控制点深度的相邻层位对。
+
+    Parameters
+    ----------
+    target_layer : TargetZone
+        目标层段对象。
+    inline, xline : float
+        控制点所在的线号坐标。
+    depth_m : float
+        控制点深度，单位 m。
+
+    Returns
+    -------
+    top_name : str
+        所在层段上层位名称。
+    bottom_name : str
+        所在层段下层位名称。
+    horizon_values : dict[str, float]
+        所有层位在该位置的解释值。
+
+    Raises
+    ------
+    ValueError
+        当控制点深度不在任何目标层段内时抛出。
+    """
     horizon_values = target_layer.get_interpretation_values_at_location(inline, xline)
     names = list(target_layer.horizon_names)
     for top_name, bottom_name in zip(names[:-1], names[1:]):
@@ -234,7 +277,37 @@ def apply_depth_facies_controls(
     y_grid: np.ndarray | None = None,
     error_on_empty: bool = True,
 ) -> tuple[np.ndarray, pd.DataFrame]:
-    """Apply facies controls to an AI volume using layer-clipped log-AI blending."""
+    """对 AI 体施加岩相控制，在层段内使用 log-AI 空间混入。
+
+    Parameters
+    ----------
+    volume : np.ndarray
+        输入 AI 体，shape 为 ``(n_il, n_xl, n_sample)``，值必须正有限。
+    ilines, xlines, samples : np.ndarray
+        volume 三个维度的坐标轴。
+    target_layer : TargetZone
+        目标层段对象，用于确定控制点的层段边界。
+    survey : _SurveyLike
+        地震体 Adapter，提供 ``line_geometry``。
+    control_points : list[FaciesControlPoint]
+        待施加的控制点列表。
+    x_grid, y_grid : np.ndarray, optional
+        道中心 XY 网格。为 None 时自动构建。
+    error_on_empty : bool, default=True
+        True 时若控制点未影响任何样点则抛错。
+
+    Returns
+    -------
+    controlled : np.ndarray
+        施加控制后的 AI 体，dtype=float32。
+    qc_df : pd.DataFrame
+        每个控制点的施加统计信息。
+
+    Raises
+    ------
+    ValueError
+        当 volume shape 不匹配轴、含非正有限值，或控制点未生效时抛出。
+    """
     ai = np.asarray(volume, dtype=np.float32)
     if ai.ndim != 3:
         raise ValueError(f"Expected volume ndim=3, got {ai.ndim}.")
@@ -248,7 +321,7 @@ def apply_depth_facies_controls(
         raise ValueError("AI volume must contain only finite positive values.")
 
     if x_grid is None or y_grid is None:
-        x_grid, y_grid = build_trace_xy_grids(survey, ilines, xlines)
+        x_grid, y_grid = survey.line_geometry.trace_xy_grids(ilines, xlines)
     x_grid = np.asarray(x_grid, dtype=np.float64)
     y_grid = np.asarray(y_grid, dtype=np.float64)
     if x_grid.shape != ai.shape[:2] or y_grid.shape != ai.shape[:2]:
@@ -261,7 +334,7 @@ def apply_depth_facies_controls(
     n_sample = samples.size
 
     for order, point in enumerate(control_points):
-        inline, xline = survey.coord_to_line(point.x, point.y)
+        inline, xline = survey.line_geometry.coord_to_line(point.x, point.y)
         top_name, bottom_name, horizon_values = locate_control_zone(
             target_layer,
             inline=float(inline),
@@ -476,7 +549,7 @@ def load_qc_context(
         },
     )
     target_layer = build_target_layer_from_lfm_metadata(ai_lfm.metadata, ai_lfm.geometry)
-    x_grid, y_grid = build_trace_xy_grids(survey, ai_lfm.ilines, ai_lfm.xlines)
+    x_grid, y_grid = survey.line_geometry.trace_xy_grids(ai_lfm.ilines, ai_lfm.xlines)
     forward_model = (
         DepthForwardModel(
             np.asarray(wavelet_time_s, dtype=np.float32),
@@ -518,6 +591,29 @@ def make_control_point(
     target_ai: float,
     strength: float = 1.0,
 ) -> FaciesControlPoint:
+    """便捷构造一个 ``FaciesControlPoint``。
+
+    Parameters
+    ----------
+    name : str
+        控制点名称。
+    x, y : float
+        控制点平面坐标。
+    depth_m : float
+        控制点 TVDSS 深度，单位 m。
+    radius_xy_m : float
+        XY 方向影响半径，单位 m。
+    radius_z_m : float
+        Z 方向影响半径，单位 m。
+    target_ai : float
+        目标声阻抗值。
+    strength : float, default=1.0
+        控制强度，范围 [0, 1]。
+
+    Returns
+    -------
+    FaciesControlPoint
+    """
     return FaciesControlPoint(
         name=name,
         x=float(x),
@@ -536,8 +632,29 @@ def extract_local_window_by_xy_radius(
     *,
     section_scale: float = 1.2,
 ) -> tuple[float, float, int, int, slice, slice, slice, str | None]:
-    """Extract local indices around a control point using true XY distance."""
-    inline, xline = context.survey.coord_to_line(point.x, point.y)
+    """使用真实 XY 距离提取控制点周边的局部窗口索引。
+
+    Parameters
+    ----------
+    context : FaciesControlQCContext
+        QC 上下文，包含 AI LFM 体、XY 网格等。
+    point : FaciesControlPoint
+        目标控制点。
+    section_scale : float, default=1.2
+        显示窗口放大系数，实际窗口半径 = ``section_scale * 2 * radius_xy_m``。
+
+    Returns
+    -------
+    inline, xline : float
+        控制点在工区中的线号坐标。
+    il_idx, xl_idx : int
+        最近道索引。
+    il_slice, xl_slice, z_slice : slice
+        inline、xline 与深度维的窗口切片。
+    warning : str or None
+        窗口触及边界的警告信息，正常时为 None。
+    """
+    inline, xline = context.survey.line_geometry.coord_to_line(point.x, point.y)
     il_idx, xl_idx = context.ai_lfm.nearest_indices(inline, xline)
     display_radius_xy = max(float(section_scale) * 2.0 * point.radius_xy_m, point.radius_xy_m)
     d_xy_center = np.hypot(context.x_grid - point.x, context.y_grid - point.y)
@@ -568,6 +685,7 @@ def extract_local_window_by_xy_radius(
 
 
 def _window_target_layer(target_layer: Any, il_slice: slice, xl_slice: slice, samples: np.ndarray) -> Any:
+    """从完整 TargetZone 裁剪出局部窗口副本。"""
     from cup.seismic.horizon import HorizonSurface
     from cup.seismic.target_zone import TargetZone
 
@@ -609,7 +727,22 @@ def apply_single_control_to_window(
     *,
     section_scale: float = 1.2,
 ) -> LocalControlResult:
-    """Apply one control point to a local AI LFM window for interactive QC."""
+    """对局部 AI LFM 窗口施加单个控制点，用于交互式 QC。
+
+    Parameters
+    ----------
+    context : FaciesControlQCContext
+        QC 上下文。
+    point : FaciesControlPoint
+        目标控制点。
+    section_scale : float, default=1.2
+        窗口放大系数。
+
+    Returns
+    -------
+    LocalControlResult
+        包含控制前后 AI 窗口、权重场、层段网格等完整信息。
+    """
     inline, xline, il_idx, xl_idx, il_slice, xl_slice, z_slice, warning = extract_local_window_by_xy_radius(
         context,
         point,
@@ -714,6 +847,7 @@ def get_zone_depth_grids(target_layer: Any, *, zone_top: str, zone_bottom: str) 
 
 
 def _nearest_local_indices(result: LocalControlResult) -> tuple[int, int]:
+    """返回控制点在局部窗口中的行列索引。"""
     return result.il_idx - int(result.il_slice.start), result.xl_idx - int(result.xl_slice.start)
 
 
@@ -767,7 +901,7 @@ def forward_qc_at_control_trace(
     # the metric focused on visibly influenced samples while retaining the lens edge.
     influence_mask = result.weight_window[li, lj, :] > float(influence_weight_threshold)
 
-    real_trace = context.survey.import_seismic_at_well(
+    real_trace = context.survey.read_trace_at_xy(
         result.point.x,
         result.point.y,
         sample_start=float(display_depth[0]),
@@ -838,6 +972,15 @@ def forward_qc_at_control_trace(
 
 
 def rms_match(values: np.ndarray, reference: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, float]:
+    """按 RMS 比例缩放 values 使其与 reference 在 mask 内 RMS 一致。
+
+    Returns
+    -------
+    matched : np.ndarray
+        缩放后的 values 副本。
+    scale : float
+        RMS 缩放因子，无法计算时返回 NaN。
+    """
     ref_rms = rms(np.asarray(reference)[mask])
     val_rms = rms(np.asarray(values)[mask])
     if not np.isfinite(ref_rms) or not np.isfinite(val_rms) or val_rms <= 0.0:
@@ -855,6 +998,14 @@ def _waveform_metrics(
     *,
     scale: float = 1.0,
 ) -> dict[str, float | str]:
+    """计算波形比对指标（相关系数、NMAE、RMSE 等）。
+
+    Returns
+    -------
+    dict
+        包含 ``metric_set``、``window``、``n``、``corr``、``nmae``、
+        ``rmse``、``rms_ratio``、``peak_amp_ratio``、``scale`` 的字典。
+    """
     ref = np.asarray(reference, dtype=np.float64)
     est = np.asarray(estimate, dtype=np.float64)
     valid = np.asarray(mask, dtype=bool) & np.isfinite(ref) & np.isfinite(est)

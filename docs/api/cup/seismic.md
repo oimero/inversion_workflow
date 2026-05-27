@@ -4,7 +4,9 @@
 
 ::: cup.seismic.spatial
 
-::: cup.seismic.target_layer
+::: cup.seismic.horizon
+
+::: cup.seismic.target_zone
 
 ::: cup.seismic.modeling
 

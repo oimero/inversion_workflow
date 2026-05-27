@@ -162,9 +162,9 @@ def build_target_layer_from_lfm_metadata(
     *,
     qc_output_dir: str | Path | None = None,
 ) -> Any:
-    """根据 AI 低频模型 NPZ 中保存的层位元数据重建 TargetLayer。"""
+    """根据 AI 低频模型 NPZ 中保存的层位元数据重建 TargetZone。"""
     from cup.petrel.load import import_interpretation_petrel
-    from cup.seismic.target_layer import TargetLayer
+    from cup.seismic.target_zone import TargetZone
 
     repo_root = find_repo_root()
     horizons = metadata.get("horizons", [])
@@ -185,7 +185,7 @@ def build_target_layer_from_lfm_metadata(
     tl_meta = metadata.get("target_layer", {})
     if not isinstance(tl_meta, dict):
         tl_meta = {}
-    return TargetLayer(
+    return TargetZone(
         raw_horizon_dfs=raw_horizons,
         geometry=geometry,
         horizon_names=horizon_names,
@@ -568,9 +568,10 @@ def extract_local_window_by_xy_radius(
 
 
 def _window_target_layer(target_layer: Any, il_slice: slice, xl_slice: slice, samples: np.ndarray) -> Any:
-    from cup.seismic.target_layer import TargetLayer
+    from cup.seismic.horizon import HorizonSurface
+    from cup.seismic.target_zone import TargetZone
 
-    out = object.__new__(TargetLayer)
+    out = object.__new__(TargetZone)
     out.geometry = dict(target_layer.geometry)
     out.geometry["n_il"] = int(il_slice.stop - il_slice.start)
     out.geometry["inline_min"] = float(target_layer.ilines[il_slice][0])
@@ -586,6 +587,19 @@ def _window_target_layer(target_layer: Any, il_slice: slice, xl_slice: slice, sa
     out._xl_axis = np.asarray(target_layer.xlines[xl_slice], dtype=np.float64)
     out._sample_axis = np.asarray(samples, dtype=np.float64)
     out._horizon_grids = {name: target_layer.get_horizon_grid(name)[il_slice, xl_slice] for name in out.horizon_names}
+    value_domain = str(out.geometry.get("sample_domain", ""))
+    value_unit = str(out.geometry.get("sample_unit", ""))
+    out.horizon_surfaces = {
+        name: HorizonSurface.from_grid(
+            name=name,
+            inline_axis=out._il_axis,
+            xline_axis=out._xl_axis,
+            values=grid,
+            value_domain=value_domain,
+            value_unit=value_unit,
+        )
+        for name, grid in out._horizon_grids.items()
+    }
     return out
 
 

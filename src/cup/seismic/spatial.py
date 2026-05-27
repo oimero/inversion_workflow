@@ -13,6 +13,44 @@ class SurveyLineToCoord(Protocol):
     def line_to_coord(self, il_no: float, xl_no: float) -> tuple[float, float]: ...
 
 
+class SurveyCoordToLine(Protocol):
+    """将 XY 转换为 inline/xline 所需的最小工区接口。"""
+
+    def coord_to_line(self, x: float, y: float) -> tuple[float, float]: ...
+
+
+class WellPositionLike(Protocol):
+    """解析井位线号所需的最小井对象接口。"""
+
+    well_name: str
+    inline: float | None
+    xline: float | None
+    x: float | None
+    y: float | None
+
+
+def resolve_well_line_position(well: WellPositionLike, survey: SurveyCoordToLine | None) -> tuple[float, float]:
+    """解析井位 inline/xline，优先使用已有线号，其次用 XY 通过工区转换。"""
+    if well.inline is not None and well.xline is not None:
+        inline = float(well.inline)
+        xline = float(well.xline)
+        if not np.isfinite(inline) or not np.isfinite(xline):
+            raise ValueError(f"well '{well.well_name}' must provide finite inline/xline coordinates.")
+        return inline, xline
+
+    if well.x is not None and well.y is not None:
+        if survey is None:
+            raise ValueError(
+                f"well '{well.well_name}' provides x/y but no survey context was supplied for coord_to_line."
+            )
+        inline, xline = survey.coord_to_line(float(well.x), float(well.y))
+        return float(inline), float(xline)
+
+    raise ValueError(
+        f"well '{well.well_name}' must provide either inline/xline or x/y coordinates for location resolution."
+    )
+
+
 def build_trace_xy_grids(
     survey: SurveyLineToCoord,
     ilines: np.ndarray,

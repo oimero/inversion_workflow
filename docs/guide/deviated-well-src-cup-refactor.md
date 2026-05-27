@@ -277,13 +277,13 @@ weight
 | `well_controls_to_layer_points()` | 直井旧控制转成点云控制 |
 | `spatial_samples_to_layer_points()` | 斜井样点转成层段比例控制 |
 
-`spatial_samples_to_layer_points()` 不能只是字段改名。它需要把每个空间样点和 `TargetLayer` 关联起来：
+`spatial_samples_to_layer_points()` 不能只是字段改名。它需要把每个空间样点和 `TargetZone` 关联起来：
 
 1. 在样点的浮点 `inline/xline` 处读取所有层位解释值。
 2. 判断样点 `twt_s` 落在哪个相邻层段 `[top_horizon, bottom_horizon]`。
 3. 计算 `u_in_zone = (twt_s - top_twt) / (bottom_twt - top_twt)`。
 4. 对超出目标层、层位缺失、层位反转或厚度过薄的样点写入 QC，不静默参与建模。
-5. 结合 `TargetLayer.valid_control_mask`、轨迹样点覆盖率和密井冲突策略生成最终 `weight`。
+5. 结合 `TargetZone.valid_control_mask`、轨迹样点覆盖率和密井冲突策略生成最终 `weight`。
 
 这部分应成为 `cup.seismic.modeling` 或 `cup.well.spatial_samples` 的深 Interface，而不是写在 `lfm_precomputed.py` 里。否则第六步和第十步会各自实现一套层位映射逻辑，后续很难保证一致。
 

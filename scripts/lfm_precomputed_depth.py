@@ -95,10 +95,10 @@ def build_target_layer(
     target_layer_params: dict[str, Any],
 ) -> Any:
     from cup.petrel.load import import_interpretation_petrel
-    from cup.seismic.target_layer import TargetLayer
+    from cup.seismic.target_zone import TargetZone
 
     raw_horizons = {name: import_interpretation_petrel(hf) for name, hf in horizon_files.items()}
-    return TargetLayer(
+    return TargetZone(
         raw_horizon_dfs=raw_horizons,
         geometry=geometry,
         horizon_names=list(horizon_files.keys()),
@@ -445,7 +445,7 @@ def plot_target_layer_mask_qc(qc_dir: Path, output_path: Path) -> None:
         cmap=cmap,
         norm=norm,
     )
-    ax.set_title("TargetLayer trace mask QC")
+    ax.set_title("TargetZone trace mask QC")
     ax.set_xlabel("Xline")
     ax.set_ylabel("Inline")
     handles = [

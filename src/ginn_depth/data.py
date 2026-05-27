@@ -16,7 +16,7 @@ from torch.utils.data import Dataset
 from cup.petrel.load import import_interpretation_petrel, import_seismic
 from cup.seismic.spatial import build_trace_xy_grids
 from cup.seismic.survey import open_survey
-from cup.seismic.target_layer import TargetLayer
+from cup.seismic.target_zone import TargetZone
 from cup.utils.io import resolve_repo_metadata_path
 from cup.well.wavelet import (
     DEFAULT_ACTIVE_SUPPORT_THRESHOLD,
@@ -235,7 +235,7 @@ def _axis_step(axis: np.ndarray, axis_name: str) -> float:
 
 
 def geometry_from_axes(ilines: np.ndarray, xlines: np.ndarray, samples: np.ndarray) -> Dict[str, Any]:
-    """Construct a TargetLayer-compatible geometry dict from explicit axes."""
+    """Construct a TargetZone-compatible geometry dict from explicit axes."""
     return {
         "n_il": int(ilines.size),
         "inline_min": float(ilines[0]),
@@ -647,7 +647,7 @@ def build_dataset(cfg: DepthGINNConfig) -> DatasetBundle:
     bot_df_raw = import_interpretation_petrel(bot_horizon_file)
 
     logger.info("Building target layer from raw depth interpretations...")
-    target_layer = TargetLayer(
+    target_layer = TargetZone(
         raw_horizon_dfs={"top": top_df_raw, "bottom": bot_df_raw},
         geometry=geometry,
         horizon_names=["top", "bottom"],

@@ -6,7 +6,7 @@
 边界说明
 --------
 - 本模块不负责层位解释文件读取、测井提取或地震体加载。
-- 本模块仅支持 ``TargetLayer.geometry['sample_domain'] == 'time'`` 的场景。
+- 本模块仅支持 ``TargetZone.geometry['sample_domain'] == 'time'`` 的场景。
 - 井曲线若为 MD 域，可借助时深表与井轨迹转换到 TWT 域；TVDSS 域曲线当前不支持直接输入。
 
 核心公开对象
@@ -25,8 +25,9 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from cup.seismic.modeling import WellControl, build_layer_constrained_model
+from cup.seismic.spatial import resolve_well_line_position
 from cup.seismic.survey import SurveyContext
-from cup.seismic.target_layer import TargetLayer
+from cup.seismic.target_zone import TargetZone
 from wtie.processing import grid
 from wtie.processing.spectral import apply_butter_lowpass_filter
 
@@ -82,7 +83,7 @@ class LfmTimeModelResult:
     variance_volume : np.ndarray
         与 ``volume`` 同 shape 的切片插值方差体。
     geometry : Dict[str, Any]
-        参与建模的几何描述，通常直接来自 ``TargetLayer.geometry``。
+        参与建模的几何描述，通常直接来自 ``TargetZone.geometry``。
     ilines, xlines, samples : np.ndarray
         模型体三个维度对应的规则坐标轴。
     metadata : Dict[str, Any]
@@ -210,28 +211,6 @@ def lowpass_twt_log(
     )
 
 
-def _resolve_well_position(well: LfmTimeWell, survey: Optional[SurveyContext]) -> tuple[float, float]:
-    """解析井位的 inline/xline 坐标。"""
-    if well.inline is not None and well.xline is not None:
-        inline = float(well.inline)
-        xline = float(well.xline)
-        if not np.isfinite(inline) or not np.isfinite(xline):
-            raise ValueError(f"well '{well.well_name}' must provide finite inline/xline coordinates.")
-        return inline, xline
-
-    if well.x is not None and well.y is not None:
-        if survey is None:
-            raise ValueError(
-                f"well '{well.well_name}' provides x/y but no survey context was supplied for coord_to_line."
-            )
-        inline, xline = survey.coord_to_line(float(well.x), float(well.y))
-        return float(inline), float(xline)
-
-    raise ValueError(
-        f"well '{well.well_name}' must provide either inline/xline or x/y coordinates for location resolution."
-    )
-
-
 def _maybe_extend_time_depth_table(
     table: grid.TimeDepthTable,
     twt_min: float,
@@ -279,7 +258,7 @@ def _convert_property_log_to_twt(
 
 def _prepare_well(
     well: LfmTimeWell,
-    target_layer: TargetLayer,
+    target_layer: TargetZone,
     survey: Optional[SurveyContext],
     dt: float,
     filter_cutoff_hz: float,
@@ -288,7 +267,7 @@ def _prepare_well(
     filter_buffer_mode: str,
 ) -> _PreparedLfmTimeWell:
     """标准化井输入并生成建模控制点。"""
-    inline, xline = _resolve_well_position(well, survey)
+    inline, xline = resolve_well_line_position(well, survey)
     horizon_times = target_layer.get_interpretation_values_at_location(inline, xline)
     sample_min = float(target_layer.geometry["sample_min"])
     sample_max = float(target_layer.geometry["sample_max"])
@@ -336,7 +315,7 @@ def _prepare_well(
 
 
 def build_lfm_time_model(
-    target_layer: TargetLayer,
+    target_layer: TargetZone,
     wells: list[LfmTimeWell],
     *,
     survey: Optional[SurveyContext] = None,
@@ -355,7 +334,7 @@ def build_lfm_time_model(
 
     Parameters
     ----------
-    target_layer : TargetLayer
+    target_layer : TargetZone
         目的层对象，需提供时间域几何信息、层位顺序与层段采样索引面。
     wells : list[LfmTimeWell]
         参与建模的井列表，至少包含一口井，且所有井的 ``property_name`` 必须一致。
@@ -415,7 +394,7 @@ def build_lfm_time_model(
 
     sample_domain = str(target_layer.geometry.get("sample_domain", "")).lower()
     if sample_domain != "time":
-        raise ValueError("lfm_time.py only supports TargetLayer geometry in time domain.")
+        raise ValueError("lfm_time.py only supports TargetZone geometry in time domain.")
 
     dt = float(target_layer.geometry["sample_step"])
     if dt <= 0.0:

@@ -1,4 +1,4 @@
-"""cup.seismic.target_layer: 原始层位解释的容错化目标层位准备。
+"""cup.seismic.target_zone: 多层位目标层段构建与 QC。
 
 本模块以原始层位拾取为输入，构建插值支撑掩码、trace 级 QC 掩码，
 并通过厚度插值重建全覆盖层位网格。
@@ -10,48 +10,26 @@
 
 核心公开对象
 ------------
-1. TargetLayer: 目标层位构建与 QC 汇总。
-2. TargetLayer.with_boundary_extension: 生成上下外延层位副本。
-3. TargetLayer.to_mask: 生成三维样点掩码。
+1. TargetZone: 目标层段构建与 QC 汇总。
+2. TargetZone.with_boundary_extension: 生成上下外延层位副本。
+3. TargetZone.to_mask: 生成三维样点掩码。
 
 Examples
 --------
->>> from cup.seismic.target_layer import TargetLayer
+>>> from cup.seismic.target_zone import TargetZone
 >>> # raw_horizon_dfs 与 geometry 需提前准备
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
-from scipy.interpolate import griddata
-from scipy.ndimage import generic_filter
-from scipy.spatial import QhullError, cKDTree  # type: ignore
 
-OUTLIER_REMOVAL_WARNING_RATIO = 0.05
-
-
-@dataclass
-class _SurfaceInterpolation:
-    raw_grid: np.ndarray
-    despiked_grid: np.ndarray
-    linear_grid: np.ndarray
-    nearest_grid: np.ndarray
-    linear_support_mask: np.ndarray
-    raw_mask: np.ndarray
-    nearest_distance_grid: np.ndarray
-    outlier_stats: Dict[str, Any]
-
-
-def _build_axis(axis_min: float, axis_max: float, axis_step: float, axis_name: str) -> np.ndarray:
-    """构建等步长坐标轴。"""
-    if axis_step <= 0:
-        raise ValueError(f"{axis_name}_step must be positive, got {axis_step}.")
-    return np.arange(float(axis_min), float(axis_max) + float(axis_step), float(axis_step), dtype=float)
+from cup.seismic import horizon as horizon_tools
+from cup.seismic.horizon import HorizonSurface
 
 
 def _validate_geometry_keys(geometry: Dict[str, Any]) -> None:
@@ -72,291 +50,8 @@ def _validate_geometry_keys(geometry: Dict[str, Any]) -> None:
         raise ValueError(f"geometry is missing required keys: {sorted(missing)}")
 
 
-def _normalize_interpretation_unit_for_geometry(
-    interpretation_df: pd.DataFrame,
-    geometry: Dict[str, Any],
-) -> pd.DataFrame:
-    """按几何单位规范解释值。"""
-    sample_domain = str(geometry.get("sample_domain", "")).lower()
-    sample_unit = str(geometry.get("sample_unit", "")).lower()
-    if sample_domain != "time" or sample_unit != "s" or "interpretation" not in interpretation_df.columns:
-        return interpretation_df.copy()
-
-    z = interpretation_df["interpretation"].to_numpy(dtype=float, copy=False)
-    finite = np.isfinite(z)
-    if not np.any(finite) or float(np.nanmax(np.abs(z[finite]))) <= 10.0:
-        return interpretation_df.copy()
-
-    out_df = interpretation_df.copy()
-    converted = out_df["interpretation"].to_numpy(dtype=float, copy=True)
-    converted[finite] = converted[finite] / 1000.0
-    out_df["interpretation"] = converted
-    return out_df
-
-
-def _require_interpretation_columns(df: pd.DataFrame, name: str) -> None:
-    """检查解释表所需列。"""
-    required = {"inline", "xline", "interpretation"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"horizon '{name}' is missing required columns: {sorted(missing)}")
-
-
-def _grid_raw_interpretation(
-    interpretation_df: pd.DataFrame,
-    il_axis: np.ndarray,
-    xl_axis: np.ndarray,
-) -> np.ndarray:
-    """将原始解释点格网化。"""
-    grid = np.full((il_axis.size, xl_axis.size), np.nan, dtype=float)
-
-    values = interpretation_df[["inline", "xline", "interpretation"]].to_numpy(dtype=float, copy=False)
-    finite = np.isfinite(values).all(axis=1)
-    if not np.any(finite):
-        return grid
-
-    values = values[finite]
-    il_min = float(il_axis[0])
-    xl_min = float(xl_axis[0])
-    il_step = float(il_axis[1] - il_axis[0]) if il_axis.size > 1 else 1.0
-    xl_step = float(xl_axis[1] - xl_axis[0]) if xl_axis.size > 1 else 1.0
-
-    il_float = (values[:, 0] - il_min) / il_step
-    xl_float = (values[:, 1] - xl_min) / xl_step
-    il_idx = np.rint(il_float).astype(np.int64)
-    xl_idx = np.rint(xl_float).astype(np.int64)
-    tol = 1e-8
-    on_grid = (
-        np.isclose(il_float, il_idx, atol=tol)
-        & np.isclose(xl_float, xl_idx, atol=tol)
-        & (il_idx >= 0)
-        & (il_idx < il_axis.size)
-        & (xl_idx >= 0)
-        & (xl_idx < xl_axis.size)
-    )
-    if not np.any(on_grid):
-        return grid
-
-    gridded = pd.DataFrame(
-        {
-            "il_idx": il_idx[on_grid],
-            "xl_idx": xl_idx[on_grid],
-            "interpretation": values[on_grid, 2],
-        }
-    )
-    averaged = gridded.groupby(["il_idx", "xl_idx"], as_index=False)["interpretation"].mean()
-    grid[
-        averaged["il_idx"].to_numpy(dtype=np.int64),
-        averaged["xl_idx"].to_numpy(dtype=np.int64),
-    ] = averaged["interpretation"].to_numpy(dtype=float)
-    return grid
-
-
-def _nanmedian(values: np.ndarray) -> float:
-    """对包含 NaN 的数组求中位数。"""
-    if np.all(np.isnan(values)):
-        return np.nan
-    return float(np.nanmedian(values))
-
-
-def _remove_isolated_outliers_with_stats(
-    surface: np.ndarray,
-    threshold: Optional[float],
-    min_neighbor_count: int,
-) -> tuple[np.ndarray, Dict[str, Any]]:
-    """移除孤立异常点并返回统计。"""
-    if min_neighbor_count < 1:
-        raise ValueError(f"outlier_min_neighbor_count must be >= 1, got {min_neighbor_count}.")
-
-    valid_mask = np.isfinite(surface)
-    total_count = int(np.count_nonzero(valid_mask))
-    stats: Dict[str, Any] = {
-        "total_points": total_count,
-        "removed_points": 0,
-        "removed_ratio": 0.0,
-        "warning_ratio": OUTLIER_REMOVAL_WARNING_RATIO,
-        "threshold": None if threshold is None else float(threshold),
-        "min_neighbor_count": int(min_neighbor_count),
-        "enabled": threshold is not None,
-    }
-    if threshold is None or total_count == 0:
-        return surface.copy(), stats
-
-    out = surface.copy()
-    footprint = np.array(
-        [
-            [0, 1, 0],
-            [1, 0, 1],
-            [0, 1, 0],
-        ],
-        dtype=np.uint8,
-    )
-    local_median = generic_filter(
-        out,
-        function=_nanmedian,
-        footprint=footprint,
-        mode="constant",
-        cval=np.nan,
-    )
-    local_valid_count = generic_filter(
-        valid_mask.astype(float),
-        function=np.nansum,
-        footprint=footprint,
-        mode="constant",
-        cval=0.0,
-    )
-    isolated_mask = (
-        valid_mask
-        & np.isfinite(local_median)
-        & (local_valid_count >= float(min_neighbor_count))
-        & (np.abs(out - local_median) > float(threshold))
-    )
-    out[isolated_mask] = np.nan
-
-    removed_count = int(np.count_nonzero(isolated_mask))
-    stats["removed_points"] = removed_count
-    stats["removed_ratio"] = float(removed_count / total_count) if total_count else 0.0
-    return out, stats
-
-
-def _linear_then_nearest_from_grid(
-    control_grid: np.ndarray,
-    *,
-    nearest_distance_limit: Optional[float],
-    raw_grid: Optional[np.ndarray] = None,
-    outlier_stats: Optional[Dict[str, Any]] = None,
-) -> _SurfaceInterpolation:
-    """先线性插值再最近邻补全网格。"""
-    despiked_grid = control_grid.astype(float, copy=True)
-    original_grid = despiked_grid.copy() if raw_grid is None else raw_grid.astype(float, copy=True)
-    raw_mask = np.isfinite(original_grid)
-    control_mask = np.isfinite(despiked_grid)
-    if not np.any(control_mask):
-        raise ValueError("Cannot interpolate a horizon with no finite control points.")
-
-    ii, jj = np.indices(despiked_grid.shape)
-    known_points = np.column_stack((ii[control_mask], jj[control_mask]))
-    known_values = despiked_grid[control_mask]
-    all_points = np.column_stack((ii.ravel(), jj.ravel()))
-
-    linear_grid = despiked_grid.copy()
-    linear_values = np.full(all_points.shape[0], np.nan, dtype=float)
-    if known_points.shape[0] >= 3:
-        try:
-            linear_values = griddata(known_points, known_values, all_points, method="linear")
-        except (QhullError, ValueError):
-            linear_values = np.full(all_points.shape[0], np.nan, dtype=float)
-
-    linear_values_grid = linear_values.reshape(despiked_grid.shape)
-    linear_fill_mask = ~control_mask & np.isfinite(linear_values_grid)
-    linear_grid[linear_fill_mask] = linear_values_grid[linear_fill_mask]
-    linear_support_mask = np.isfinite(linear_grid)
-
-    nearest_grid = linear_grid.copy()
-    nearest_distance_grid = np.full(despiked_grid.shape, np.nan, dtype=float)
-    tree = cKDTree(known_points.astype(float, copy=False))
-    distances, indices = tree.query(all_points.astype(float, copy=False), k=1)
-    nearest_distance_grid = distances.reshape(despiked_grid.shape)
-
-    nearest_fill_mask = ~np.isfinite(nearest_grid)
-    if nearest_distance_limit is not None:
-        nearest_fill_mask &= nearest_distance_grid <= float(nearest_distance_limit)
-    if np.any(nearest_fill_mask):
-        nearest_grid[nearest_fill_mask] = known_values[indices.reshape(despiked_grid.shape)[nearest_fill_mask]]
-
-    return _SurfaceInterpolation(
-        raw_grid=original_grid,
-        despiked_grid=despiked_grid,
-        linear_grid=linear_grid,
-        nearest_grid=nearest_grid,
-        linear_support_mask=linear_support_mask,
-        raw_mask=raw_mask,
-        nearest_distance_grid=nearest_distance_grid,
-        outlier_stats={} if outlier_stats is None else dict(outlier_stats),
-    )
-
-
-def _interpolate_surface_from_raw_df(
-    interpretation_df: pd.DataFrame,
-    il_axis: np.ndarray,
-    xl_axis: np.ndarray,
-    *,
-    nearest_distance_limit: Optional[float],
-    outlier_threshold: Optional[float],
-    outlier_min_neighbor_count: int,
-) -> _SurfaceInterpolation:
-    """从原始拾取构建插值网格。"""
-    raw_grid = _grid_raw_interpretation(interpretation_df, il_axis, xl_axis)
-    despiked_grid, outlier_stats = _remove_isolated_outliers_with_stats(
-        raw_grid,
-        threshold=outlier_threshold,
-        min_neighbor_count=outlier_min_neighbor_count,
-    )
-    return _linear_then_nearest_from_grid(
-        despiked_grid,
-        nearest_distance_limit=nearest_distance_limit,
-        raw_grid=raw_grid,
-        outlier_stats=outlier_stats,
-    )
-
-
-def _resolve_axis_interpolation_window(
-    axis: np.ndarray,
-    coord_float: float,
-    axis_name: str,
-) -> tuple[int, int, float]:
-    """解析轴向插值窗口索引与权重。"""
-    coord = float(coord_float)
-    axis_min = float(axis[0])
-    axis_max = float(axis[-1])
-    if axis.size == 1:
-        if not np.isclose(coord, axis_min, atol=1e-8):
-            raise ValueError(f"{axis_name}_float={coord} is out of bounds [{axis_min}, {axis_max}].")
-        return 0, 0, 0.0
-
-    axis_step = float(axis[1] - axis[0])
-    tol = max(abs(axis_step), 1.0) * 1e-8
-    if coord < axis_min - tol or coord > axis_max + tol:
-        raise ValueError(f"{axis_name}_float={coord} is out of bounds [{axis_min}, {axis_max}].")
-
-    k = (coord - axis_min) / axis_step
-    rounded = round(k)
-    if np.isclose(k, rounded, atol=1e-8):
-        k = float(rounded)
-    k0 = max(0, min(axis.size - 1, int(np.floor(k))))
-    k1 = max(0, min(axis.size - 1, int(np.ceil(k))))
-    weight = 0.0 if k0 == k1 else float(k - k0)
-    return k0, k1, weight
-
-
-def _bilinear_interpolate_surface_at_location(
-    surface: np.ndarray,
-    il_axis: np.ndarray,
-    xl_axis: np.ndarray,
-    il_float: float,
-    xl_float: float,
-) -> float:
-    """对单点进行双线性插值。"""
-    il0, il1, wi = _resolve_axis_interpolation_window(il_axis, il_float, "inline")
-    xl0, xl1, wj = _resolve_axis_interpolation_window(xl_axis, xl_float, "xline")
-
-    node_indices = {(il0, xl0), (il0, xl1), (il1, xl0), (il1, xl1)}
-    for il_idx, xl_idx in node_indices:
-        value = float(surface[il_idx, xl_idx])
-        if not np.isfinite(value):
-            raise ValueError(
-                f"missing interpretation node: inline={int(il_axis[il_idx])}, xline={int(xl_axis[xl_idx])}"
-            )
-
-    t00 = float(surface[il0, xl0])
-    t01 = float(surface[il0, xl1])
-    t10 = float(surface[il1, xl0])
-    t11 = float(surface[il1, xl1])
-    return float((1.0 - wi) * (1.0 - wj) * t00 + (1.0 - wi) * wj * t01 + wi * (1.0 - wj) * t10 + wi * wj * t11)
-
-
-class TargetLayer:
-    """从原始层位解释准备目标层位与 QC。
+class TargetZone:
+    """从有序层位解释准备目标层段与 QC。
 
     Parameters
     ----------
@@ -379,7 +74,8 @@ class TargetLayer:
 
     Notes
     -----
-    插值流程为线性插值后最近邻补全，并通过厚度插值保证层位顺序一致。
+    单层位建面由 ``cup.seismic.horizon`` 负责；本类只处理多层位顺序、
+    厚度约束、目标层段掩码和 QC 汇总。
     """
 
     def __init__(
@@ -421,23 +117,30 @@ class TargetLayer:
 
         self._il_axis, self._xl_axis, self._sample_axis = self._build_axes()
         self.raw_horizon_dfs = {
-            name: _normalize_interpretation_unit_for_geometry(raw_horizon_dfs[name], self.geometry)
+            name: horizon_tools.normalize_interpretation_unit_for_geometry(raw_horizon_dfs[name], self.geometry)
             for name in self.horizon_names
         }
         for name, df in self.raw_horizon_dfs.items():
-            _require_interpretation_columns(df, name)
+            horizon_tools.require_interpretation_columns(df, name)
 
-        self._surface_interpolations = {
-            name: _interpolate_surface_from_raw_df(
+        self._surface_interpolations = {}
+        self.horizon_surfaces: dict[str, HorizonSurface] = {}
+        value_domain = str(self.geometry.get("sample_domain", ""))
+        value_unit = str(self.geometry.get("sample_unit", ""))
+        for name in self.horizon_names:
+            surface, interpolation = horizon_tools.build_horizon_surface(
                 self.raw_horizon_dfs[name],
                 self._il_axis,
                 self._xl_axis,
+                name=name,
                 nearest_distance_limit=self.nearest_distance_limit,
                 outlier_threshold=self.outlier_threshold,
                 outlier_min_neighbor_count=self.outlier_min_neighbor_count,
+                value_domain=value_domain,
+                value_unit=value_unit,
             )
-            for name in self.horizon_names
-        }
+            self._surface_interpolations[name] = interpolation
+            self.horizon_surfaces[name] = surface
         self.initial_horizon_grids = {
             name: interp.linear_grid.copy() for name, interp in self._surface_interpolations.items()
         }
@@ -455,6 +158,21 @@ class TargetLayer:
 
         self._build_trace_qc_masks()
         self._horizon_grids = self._build_final_horizon_grids()
+        self.horizon_surfaces = {
+            name: HorizonSurface.from_grid(
+                name=name,
+                inline_axis=self._il_axis,
+                xline_axis=self._xl_axis,
+                values=grid,
+                value_domain=value_domain,
+                value_unit=value_unit,
+                support_mask=self.interpolation_support_masks.get(name),
+                source_mask=self.raw_pick_masks.get(name),
+                nearest_distance_grid=self.nearest_distance_grids.get(name),
+                metadata={"outlier_stats": dict(self.outlier_stats.get(name, {}))},
+            )
+            for name, grid in self._horizon_grids.items()
+        }
         self.interpolated_horizon_dfs = {
             name: self._grid_to_horizon_df(grid) for name, grid in self._horizon_grids.items()
         }
@@ -464,19 +182,19 @@ class TargetLayer:
 
     def _build_axes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """构建 inline/xline/sample 轴。"""
-        il_axis = _build_axis(
+        il_axis = horizon_tools.build_axis(
             self.geometry["inline_min"],
             self.geometry["inline_max"],
             self.geometry["inline_step"],
             "inline",
         )
-        xl_axis = _build_axis(
+        xl_axis = horizon_tools.build_axis(
             self.geometry["xline_min"],
             self.geometry["xline_max"],
             self.geometry["xline_step"],
             "xline",
         )
-        sample_axis = _build_axis(
+        sample_axis = horizon_tools.build_axis(
             self.geometry["sample_min"],
             self.geometry["sample_max"],
             self.geometry["sample_step"],
@@ -558,7 +276,7 @@ class TargetLayer:
 
             thickness_control_grid = np.full(thickness.shape, np.nan, dtype=float)
             thickness_control_grid[control_mask] = thickness[control_mask]
-            thickness_interp = _linear_then_nearest_from_grid(
+            thickness_interp = horizon_tools.linear_then_nearest_from_grid(
                 thickness_control_grid,
                 nearest_distance_limit=self.nearest_distance_limit,
             ).nearest_grid
@@ -871,6 +589,12 @@ class TargetLayer:
             raise ValueError(f"horizon_name '{horizon_name}' is not in raw_horizon_dfs.")
         return self._horizon_grids[horizon_name].copy()
 
+    def get_horizon_surface(self, horizon_name: str) -> HorizonSurface:
+        """返回指定层位的 ``HorizonSurface``。"""
+        if horizon_name not in self.horizon_surfaces:
+            raise ValueError(f"horizon_name '{horizon_name}' is not in raw_horizon_dfs.")
+        return self.horizon_surfaces[horizon_name]
+
     def get_horizon_interpretation_at_location(
         self,
         horizon_name: str,
@@ -900,13 +624,7 @@ class TargetLayer:
         """
         if horizon_name not in self._horizon_grids:
             raise ValueError(f"horizon_name '{horizon_name}' is not in raw_horizon_dfs.")
-        return _bilinear_interpolate_surface_at_location(
-            self._horizon_grids[horizon_name],
-            self._il_axis,
-            self._xl_axis,
-            il_float,
-            xl_float,
-        )
+        return float(self.horizon_surfaces[horizon_name].sample_at_line(il_float, xl_float).value)
 
     def get_interpretation_values_at_location(self, il_float: float, xl_float: float) -> Dict[str, float]:
         """获取所有层位在位置处的插值值。
@@ -1003,13 +721,77 @@ class TargetLayer:
         top_name, bottom_name = self._resolve_zone(zone)
         return self._get_horizon_sample_index_grid(top_name), self._get_horizon_sample_index_grid(bottom_name)
 
+    def _clone_with_horizon_grids(
+        self,
+        *,
+        horizon_names: list[str],
+        horizon_grids: dict[str, np.ndarray],
+    ) -> "TargetZone":
+        """基于已有 QC 状态和新的层位网格创建派生副本。"""
+        out = object.__new__(TargetZone)
+        out.geometry = dict(self.geometry)
+        out.horizon_names = list(horizon_names)
+        out.qc_output_dir = None
+        out.min_thickness = self.min_thickness
+        out.nearest_distance_limit = self.nearest_distance_limit
+        out.outlier_threshold = self.outlier_threshold
+        out.outlier_min_neighbor_count = self.outlier_min_neighbor_count
+        out._il_axis = self._il_axis.copy()
+        out._xl_axis = self._xl_axis.copy()
+        out._sample_axis = self._sample_axis.copy()
+        out.raw_horizon_dfs = {name: df.copy() for name, df in self.raw_horizon_dfs.items()}
+        out._surface_interpolations = dict(self._surface_interpolations)
+        out.initial_horizon_grids = {name: grid.copy() for name, grid in self.initial_horizon_grids.items()}
+        out.independent_filled_horizon_grids = {
+            name: grid.copy() for name, grid in self.independent_filled_horizon_grids.items()
+        }
+        out.interpolation_support_masks = {
+            name: mask.copy() for name, mask in self.interpolation_support_masks.items()
+        }
+        out.raw_pick_masks = {name: mask.copy() for name, mask in self.raw_pick_masks.items()}
+        out.nearest_distance_grids = {name: grid.copy() for name, grid in self.nearest_distance_grids.items()}
+        out.outlier_stats = {name: dict(stats) for name, stats in self.outlier_stats.items()}
+        out.no_support_mask = self.no_support_mask.copy()
+        out.crossing_mask = self.crossing_mask.copy()
+        out.thin_mask = self.thin_mask.copy()
+        out.valid_control_mask = self.valid_control_mask.copy()
+        out.masked_trace_mask = self.masked_trace_mask.copy()
+        out.filled_model_mask = self.filled_model_mask.copy()
+        out._pair_qc_masks = dict(self._pair_qc_masks)
+        out._summary_pair_records = list(self._summary_pair_records)
+        out._horizon_grids = {name: grid.copy() for name, grid in horizon_grids.items()}
+
+        value_domain = str(out.geometry.get("sample_domain", ""))
+        value_unit = str(out.geometry.get("sample_unit", ""))
+        out.horizon_surfaces = {
+            name: HorizonSurface.from_grid(
+                name=name,
+                inline_axis=out._il_axis,
+                xline_axis=out._xl_axis,
+                values=grid,
+                value_domain=value_domain,
+                value_unit=value_unit,
+            )
+            for name, grid in out._horizon_grids.items()
+        }
+        out.interpolated_horizon_dfs = {
+            name: out._grid_to_horizon_df(grid) for name, grid in out._horizon_grids.items()
+        }
+        out.trace_qc_df = self.trace_qc_df.copy()
+        out.pair_qc_df = self.pair_qc_df.copy()
+        out.qc_summary_df = self.qc_summary_df.copy()
+        out.trace_qc_path = None
+        out.pair_qc_path = None
+        out.qc_summary_path = None
+        return out
+
     def with_boundary_extension(
         self,
         extension_samples: int,
         *,
         top_extension_name: str = "top_extension",
         bottom_extension_name: str = "bottom_extension",
-    ) -> "TargetLayer":
+    ) -> "TargetZone":
         """返回包含上下外延层位的轻量副本。
 
         Parameters
@@ -1023,7 +805,7 @@ class TargetLayer:
 
         Returns
         -------
-        TargetLayer
+        TargetZone
             带外延层位的副本。
 
         Raises
@@ -1054,50 +836,14 @@ class TargetLayer:
             np.nan,
         )
 
-        out = object.__new__(TargetLayer)
-        out.geometry = dict(self.geometry)
-        out.horizon_names = [top_extension_name, *self.horizon_names, bottom_extension_name]
-        out.qc_output_dir = None
-        out.min_thickness = self.min_thickness
-        out.nearest_distance_limit = self.nearest_distance_limit
-        out.outlier_threshold = self.outlier_threshold
-        out.outlier_min_neighbor_count = self.outlier_min_neighbor_count
-        out._il_axis = self._il_axis.copy()
-        out._xl_axis = self._xl_axis.copy()
-        out._sample_axis = self._sample_axis.copy()
-        out.raw_horizon_dfs = {name: df.copy() for name, df in self.raw_horizon_dfs.items()}
-        out._surface_interpolations = dict(self._surface_interpolations)
-        out.initial_horizon_grids = {name: grid.copy() for name, grid in self.initial_horizon_grids.items()}
-        out.independent_filled_horizon_grids = {
-            name: grid.copy() for name, grid in self.independent_filled_horizon_grids.items()
-        }
-        out.interpolation_support_masks = {name: mask.copy() for name, mask in self.interpolation_support_masks.items()}
-        out.raw_pick_masks = {name: mask.copy() for name, mask in self.raw_pick_masks.items()}
-        out.nearest_distance_grids = {name: grid.copy() for name, grid in self.nearest_distance_grids.items()}
-        out.outlier_stats = {name: dict(stats) for name, stats in self.outlier_stats.items()}
-        out.no_support_mask = self.no_support_mask.copy()
-        out.crossing_mask = self.crossing_mask.copy()
-        out.thin_mask = self.thin_mask.copy()
-        out.valid_control_mask = self.valid_control_mask.copy()
-        out.masked_trace_mask = self.masked_trace_mask.copy()
-        out.filled_model_mask = self.filled_model_mask.copy()
-        out._pair_qc_masks = dict(self._pair_qc_masks)
-        out._summary_pair_records = list(self._summary_pair_records)
-        out._horizon_grids = {
-            top_extension_name: top_extension,
-            **{name: grid.copy() for name, grid in self._horizon_grids.items()},
-            bottom_extension_name: bottom_extension,
-        }
-        out.interpolated_horizon_dfs = {
-            name: out._grid_to_horizon_df(grid) for name, grid in out._horizon_grids.items()
-        }
-        out.trace_qc_df = self.trace_qc_df.copy()
-        out.pair_qc_df = self.pair_qc_df.copy()
-        out.qc_summary_df = self.qc_summary_df.copy()
-        out.trace_qc_path = None
-        out.pair_qc_path = None
-        out.qc_summary_path = None
-        return out
+        return self._clone_with_horizon_grids(
+            horizon_names=[top_extension_name, *self.horizon_names, bottom_extension_name],
+            horizon_grids={
+                top_extension_name: top_extension,
+                **{name: grid.copy() for name, grid in self._horizon_grids.items()},
+                bottom_extension_name: bottom_extension,
+            },
+        )
 
     def to_mask(
         self,

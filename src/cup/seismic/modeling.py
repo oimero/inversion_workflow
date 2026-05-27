@@ -24,7 +24,7 @@ from typing import Any, Dict, Optional
 import gstools as gs
 import numpy as np
 
-from cup.seismic.target_layer import TargetLayer
+from cup.seismic.target_zone import TargetZone
 from wtie.processing import grid
 
 POST_SLICE_SMOOTHING_KERNEL = np.asarray([0.1, 0.2, 0.4, 0.2, 0.1], dtype=float)
@@ -187,7 +187,7 @@ def _normalize_well_control(well: WellControl) -> WellControl:
     )
 
 
-def _validate_required_horizon_values(well_controls: list[WellControl], target_layer: TargetLayer) -> None:
+def _validate_required_horizon_values(well_controls: list[WellControl], target_layer: TargetZone) -> None:
     """校验井控制点包含所需层位值。"""
     for well in well_controls:
         missing_horizon_names = [name for name in target_layer.horizon_names if name not in well.horizon_values]
@@ -202,7 +202,7 @@ def _validate_required_horizon_values(well_controls: list[WellControl], target_l
 
 def _add_boundary_extension_horizon_values(
     well_controls: list[WellControl],
-    modeling_target_layer: TargetLayer,
+    modeling_target_layer: TargetZone,
 ) -> list[WellControl]:
     """补全边界外延层位值。"""
     completed_controls = []
@@ -234,8 +234,8 @@ def _add_boundary_extension_horizon_values(
 
 def _validate_well_controls(
     well_controls: list[WellControl],
-    target_layer: TargetLayer,
-    modeling_target_layer: TargetLayer,
+    target_layer: TargetZone,
+    modeling_target_layer: TargetZone,
 ) -> list[WellControl]:
     """校验并规范化井控制点集合。"""
     if not well_controls:
@@ -535,7 +535,7 @@ def _apply_post_slice_smoothing(
 
 
 def build_layer_constrained_model(
-    target_layer: TargetLayer,
+    target_layer: TargetZone,
     well_controls: list[WellControl],
     *,
     boundary_extension_samples: int = 0,
@@ -549,7 +549,7 @@ def build_layer_constrained_model(
 
     Parameters
     ----------
-    target_layer : TargetLayer
+    target_layer : TargetZone
         目标层位对象。
     well_controls : list[WellControl]
         井控制点列表，property_log 已位于目标采样域。

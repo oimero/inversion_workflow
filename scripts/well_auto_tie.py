@@ -40,6 +40,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.petrel.load import import_interpretation_petrel, import_well_tops_petrel
+from cup.seismic.horizon import HorizonSurface
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.coerce import as_bool
@@ -47,7 +48,6 @@ from cup.utils.config import merge_dict_defaults
 from cup.well.assets import build_file_lookup
 from cup.well.las import load_vp_rho_logset_from_standard_las
 from cup.well.td import (
-    HorizonGrid,
     PreparedTieWindow,
     TargetTieWindow,
     build_tdt_from_anchor,
@@ -277,10 +277,10 @@ def _anchor_spec_for_well(anchor_config: dict[str, Any], well_name: str) -> dict
     return spec
 
 
-def _load_horizon_grid(path: Path, cache: dict[str, HorizonGrid]) -> HorizonGrid:
+def _load_horizon_surface(path: Path, cache: dict[str, HorizonSurface]) -> HorizonSurface:
     key = str(path.resolve())
     if key not in cache:
-        cache[key] = HorizonGrid.from_petrel_dataframe(import_interpretation_petrel(path), name=path.name)
+        cache[key] = HorizonSurface.from_petrel_dataframe(import_interpretation_petrel(path), name=path.name)
     return cache[key]
 
 
@@ -312,7 +312,7 @@ def _target_tie_window_for_plan(
     plan: WellTiePlan,
     survey: Any,
     config: dict[str, Any],
-    horizon_cache: dict[str, HorizonGrid],
+    horizon_cache: dict[str, HorizonSurface],
     data_root: Path,
 ) -> TargetTieWindow:
     if plan.surface_x is None or plan.surface_y is None:
@@ -323,8 +323,8 @@ def _target_tie_window_for_plan(
     top_path = _target_horizon_path(top_value, data_root=data_root)
     bottom_path = _target_horizon_path(bottom_value, data_root=data_root)
     inline_float, xline_float = survey.coord_to_line(float(plan.surface_x), float(plan.surface_y))
-    top_sample = _load_horizon_grid(top_path, horizon_cache).sample_at_line(inline_float, xline_float)
-    bottom_sample = _load_horizon_grid(bottom_path, horizon_cache).sample_at_line(inline_float, xline_float)
+    top_sample = _load_horizon_surface(top_path, horizon_cache).sample_at_line(inline_float, xline_float)
+    bottom_sample = _load_horizon_surface(bottom_path, horizon_cache).sample_at_line(inline_float, xline_float)
     unit = str(target_cfg.get("twt_unit", "auto"))
     top_twt = normalize_twt_seconds(float(top_sample["value"]), unit=unit)
     bottom_twt = normalize_twt_seconds(float(bottom_sample["value"]), unit=unit)
@@ -507,7 +507,7 @@ def _run_vertical_with_tdt(
     modeler: Any,
     config: dict[str, Any],
     output_dir: Path,
-    horizon_cache: dict[str, HorizonGrid],
+    horizon_cache: dict[str, HorizonSurface],
     data_root: Path,
 ) -> tuple[WellTieResult, dict[str, Any]]:
     if plan.surface_x is None or plan.surface_y is None:
@@ -557,7 +557,7 @@ def _run_vertical_anchor_from_tops(
     output_dir: Path,
     well_tops_df: pd.DataFrame,
     anchor_config: dict[str, Any],
-    horizon_cache: dict[str, HorizonGrid],
+    horizon_cache: dict[str, HorizonSurface],
     data_root: Path,
     rerouted_from: str | None = None,
     reroute_reason: str | None = None,
@@ -575,8 +575,8 @@ def _run_vertical_anchor_from_tops(
     anchor_md_m = find_well_top_md(well_tops_df, well_name=plan.well_name, surface=str(spec["well_top"]))
     inline_float, xline_float = survey.coord_to_line(float(plan.surface_x), float(plan.surface_y))
     horizon_path = _resolve_data_path(spec["horizon"], data_root=data_root)
-    horizon_grid = _load_horizon_grid(horizon_path, horizon_cache)
-    horizon_sample = horizon_grid.sample_at_line(inline_float, xline_float)
+    horizon_surface = _load_horizon_surface(horizon_path, horizon_cache)
+    horizon_sample = horizon_surface.sample_at_line(inline_float, xline_float)
     raw_horizon_twt = float(horizon_sample["value"])
     anchor_twt_s = normalize_twt_seconds(raw_horizon_twt, unit=str(spec.get("twt_unit", "auto")))
     table = build_tdt_from_anchor(logset_md, anchor_md_m=anchor_md_m, anchor_twt_s=anchor_twt_s)
@@ -866,7 +866,7 @@ def main() -> None:
         )
         well_tops_df = import_well_tops_petrel(well_tops_file) if needs_anchor else pd.DataFrame()
         anchor_config = _load_anchor_config(dict(script_cfg["coarse_anchor"])) if needs_anchor else {}
-        horizon_cache: dict[str, HorizonGrid] = {}
+        horizon_cache: dict[str, HorizonSurface] = {}
         wavelet_extractor = _load_wavelet_extractor(model_path, params_path)
         modeler = ConvModeler()
         for plan in planned_to_run:

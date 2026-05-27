@@ -6,7 +6,7 @@
 边界说明
 --------
 - 本模块不负责层位解释文件读取、测井提取或地震体加载。
-- 本模块仅支持 ``TargetLayer.geometry['sample_domain'] == 'depth'`` 且
+- 本模块仅支持 ``TargetZone.geometry['sample_domain'] == 'depth'`` 且
   ``sample_unit == 'm'`` 的场景。
 - 深度域建模以 TVDSS 为目标深度口径。MD 域井曲线必须提供井轨迹，
   或提供 ``kb`` 以按直井近似生成井轨迹。
@@ -27,8 +27,9 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from cup.seismic.modeling import WellControl, build_layer_constrained_model
+from cup.seismic.spatial import resolve_well_line_position
 from cup.seismic.survey import SurveyContext
-from cup.seismic.target_layer import TargetLayer
+from cup.seismic.target_zone import TargetZone
 from wtie.processing import grid
 from wtie.processing.spectral import apply_butter_lowpass_filter
 
@@ -186,28 +187,6 @@ def lowpass_depth_log(
     )
 
 
-def _resolve_well_position(well: LfmDepthWell, survey: Optional[SurveyContext]) -> tuple[float, float]:
-    """解析井位的 inline/xline 坐标。"""
-    if well.inline is not None and well.xline is not None:
-        inline = float(well.inline)
-        xline = float(well.xline)
-        if not np.isfinite(inline) or not np.isfinite(xline):
-            raise ValueError(f"well '{well.well_name}' must provide finite inline/xline coordinates.")
-        return inline, xline
-
-    if well.x is not None and well.y is not None:
-        if survey is None:
-            raise ValueError(
-                f"well '{well.well_name}' provides x/y but no survey context was supplied for coord_to_line."
-            )
-        inline, xline = survey.coord_to_line(float(well.x), float(well.y))
-        return float(inline), float(xline)
-
-    raise ValueError(
-        f"well '{well.well_name}' must provide either inline/xline or x/y coordinates for location resolution."
-    )
-
-
 def _normalize_depth_basis_and_values(log: grid.Log) -> tuple[np.ndarray, np.ndarray]:
     """清理并排序深度基与曲线值。"""
     basis = np.asarray(log.basis, dtype=float)
@@ -322,7 +301,7 @@ def _convert_property_log_to_tvdss(
 
 def _prepare_well(
     well: LfmDepthWell,
-    target_layer: TargetLayer,
+    target_layer: TargetZone,
     survey: Optional[SurveyContext],
     dz: float,
     filter_cutoff_wavelength_m: float,
@@ -331,7 +310,7 @@ def _prepare_well(
     filter_buffer_mode: str,
 ) -> _PreparedLfmDepthWell:
     """标准化井输入并生成建模控制点。"""
-    inline, xline = _resolve_well_position(well, survey)
+    inline, xline = resolve_well_line_position(well, survey)
     horizon_depths = target_layer.get_interpretation_values_at_location(inline, xline)
     required_depth_min = float(horizon_depths[target_layer.horizon_names[0]])
     required_depth_max = float(horizon_depths[target_layer.horizon_names[-1]])
@@ -376,7 +355,7 @@ def _prepare_well(
 
 
 def build_lfm_depth_model(
-    target_layer: TargetLayer,
+    target_layer: TargetZone,
     wells: list[LfmDepthWell],
     *,
     survey: Optional[SurveyContext] = None,
@@ -403,9 +382,9 @@ def build_lfm_depth_model(
     sample_domain = str(target_layer.geometry.get("sample_domain", "")).lower()
     sample_unit = str(target_layer.geometry.get("sample_unit", "")).lower()
     if sample_domain != "depth":
-        raise ValueError("lfm_depth.py only supports TargetLayer geometry in depth domain.")
+        raise ValueError("lfm_depth.py only supports TargetZone geometry in depth domain.")
     if sample_unit != "m":
-        raise ValueError("lfm_depth.py only supports depth TargetLayer geometry with sample_unit='m'.")
+        raise ValueError("lfm_depth.py only supports depth TargetZone geometry with sample_unit='m'.")
 
     dz = float(target_layer.geometry["sample_step"])
     if dz <= 0.0:

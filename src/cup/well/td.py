@@ -1,7 +1,7 @@
 """cup.well.td: 时深关系（Time-Depth, TD）构建与窗口裁剪。
 
 本模块提供时间域井震标定所需的时深关系加载、构建、裁剪与校验工具，
-以及目标层段窗口定义、层位网格采样与锚点 TDT 构建。
+以及目标层段窗口定义与锚点 TDT 构建。
 
 边界说明
 --------
@@ -13,10 +13,9 @@
 核心公开对象
 ------------
 1. TargetTieWindow / PreparedTieWindow: 标定窗口定义与裁剪结果。
-2. HorizonGrid: 层位解释网格，支持双线性采样与最近有效回退。
-3. load_petrel_time_depth_table: 读取 Petrel 时深表并归一化到正秒。
-4. build_tdt_from_anchor: 基于单一锚点构建时深关系。
-5. prepare_tdt_with_sonic_extension: 原始 TDT 裁剪 + 声波外推。
+2. load_petrel_time_depth_table: 读取 Petrel 时深表并归一化到正秒。
+3. build_tdt_from_anchor: 基于单一锚点构建时深关系。
+4. prepare_tdt_with_sonic_extension: 原始 TDT 裁剪 + 声波外推。
 """
 
 from __future__ import annotations
@@ -509,113 +508,6 @@ def find_well_top_md(well_tops_df: pd.DataFrame, *, well_name: str, surface: str
     if np.nanmax(md_values) - np.nanmin(md_values) > 0.01:
         raise ValueError(f"Multiple conflicting MD values found for well top {surface!r} in well {well_name!r}.")
     return float(md_values[0])
-
-
-class HorizonGrid:
-    """用于 Petrel 层位解释的轻量规则网格插值器。"""
-
-    def __init__(self, inline_axis: np.ndarray, xline_axis: np.ndarray, values: np.ndarray, *, name: str = ""):
-        self.inline_axis = np.asarray(inline_axis, dtype=np.float64)
-        self.xline_axis = np.asarray(xline_axis, dtype=np.float64)
-        self.values = np.asarray(values, dtype=np.float64)
-        self.name = name
-        if self.values.shape != (self.inline_axis.size, self.xline_axis.size):
-            raise ValueError("Horizon grid shape does not match inline/xline axes.")
-        if self.inline_axis.size < 2 or self.xline_axis.size < 2:
-            raise ValueError("Horizon grid requires at least 2 inline and 2 xline samples.")
-        il_grid, xl_grid = np.meshgrid(self.inline_axis, self.xline_axis, indexing="ij")
-        finite = np.isfinite(self.values)
-        self._finite_inline = il_grid[finite]
-        self._finite_xline = xl_grid[finite]
-        self._finite_values = self.values[finite]
-        if self._finite_values.size == 0:
-            raise ValueError("Horizon grid contains no finite interpretation values.")
-
-    @classmethod
-    def from_petrel_dataframe(cls, df: pd.DataFrame, *, name: str = "") -> "HorizonGrid":
-        required = {"inline", "xline", "interpretation"}
-        missing = required.difference(df.columns)
-        if missing:
-            raise ValueError(f"interpretation DataFrame is missing required columns: {sorted(missing)}")
-        inline_axis = np.sort(pd.to_numeric(df["inline"], errors="coerce").dropna().unique().astype(np.float64))
-        xline_axis = np.sort(pd.to_numeric(df["xline"], errors="coerce").dropna().unique().astype(np.float64))
-        pivot = df.pivot_table(index="inline", columns="xline", values="interpretation", aggfunc="first")
-        pivot = pivot.reindex(index=inline_axis, columns=xline_axis)
-        return cls(inline_axis, xline_axis, pivot.to_numpy(dtype=np.float64), name=name)
-
-    def sample_at_line(
-        self,
-        inline_float: float,
-        xline_float: float,
-        *,
-        nearest_fallback_max_line_distance: float = 5.0,
-    ) -> dict[str, float | str]:
-        """在浮点线号坐标处采样层位，并返回审计元数据。"""
-        il = float(inline_float)
-        xl = float(xline_float)
-        if not (self.inline_axis[0] <= il <= self.inline_axis[-1]):
-            raise ValueError(f"Inline {il} is outside horizon {self.name!r} range.")
-        if not (self.xline_axis[0] <= xl <= self.xline_axis[-1]):
-            raise ValueError(f"Xline {xl} is outside horizon {self.name!r} range.")
-
-        i1 = int(np.searchsorted(self.inline_axis, il, side="right"))
-        j1 = int(np.searchsorted(self.xline_axis, xl, side="right"))
-        i0 = max(0, min(i1 - 1, self.inline_axis.size - 2))
-        j0 = max(0, min(j1 - 1, self.xline_axis.size - 2))
-        i1 = i0 + 1
-        j1 = j0 + 1
-        il0, il1 = self.inline_axis[i0], self.inline_axis[i1]
-        xl0, xl1 = self.xline_axis[j0], self.xline_axis[j1]
-        values = np.array(
-            [
-                [self.values[i0, j0], self.values[i0, j1]],
-                [self.values[i1, j0], self.values[i1, j1]],
-            ],
-            dtype=np.float64,
-        )
-        if np.any(~np.isfinite(values)):
-            distances = np.hypot(self._finite_inline - il, self._finite_xline - xl)
-            nearest_index = int(np.nanargmin(distances))
-            nearest_distance = float(distances[nearest_index])
-            if nearest_distance <= float(nearest_fallback_max_line_distance):
-                return {
-                    "value": float(self._finite_values[nearest_index]),
-                    "method": "nearest_valid_fallback",
-                    "nearest_line_distance": nearest_distance,
-                    "nearest_inline": float(self._finite_inline[nearest_index]),
-                    "nearest_xline": float(self._finite_xline[nearest_index]),
-                }
-            raise ValueError(f"Horizon {self.name!r} has missing support around inline/xline {il}, {xl}.")
-        wi = 0.0 if il1 == il0 else (il - il0) / (il1 - il0)
-        wj = 0.0 if xl1 == xl0 else (xl - xl0) / (xl1 - xl0)
-        value = float(
-            values[0, 0] * (1.0 - wi) * (1.0 - wj)
-            + values[1, 0] * wi * (1.0 - wj)
-            + values[0, 1] * (1.0 - wi) * wj
-            + values[1, 1] * wi * wj
-        )
-        return {
-            "value": value,
-            "method": "bilinear",
-            "nearest_line_distance": 0.0,
-            "nearest_inline": il,
-            "nearest_xline": xl,
-        }
-
-    def value_at_line(
-        self,
-        inline_float: float,
-        xline_float: float,
-        *,
-        nearest_fallback_max_line_distance: float = 5.0,
-    ) -> float:
-        """返回浮点线号坐标处的层位采样值。"""
-        sample = self.sample_at_line(
-            inline_float,
-            xline_float,
-            nearest_fallback_max_line_distance=nearest_fallback_max_line_distance,
-        )
-        return float(sample["value"])
 
 
 def write_time_depth_table_csv(

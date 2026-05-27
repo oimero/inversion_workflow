@@ -25,7 +25,7 @@ from torch.utils.data import Dataset
 from cup.petrel.load import import_interpretation_petrel, import_seismic
 from cup.seismic.spatial import build_trace_xy_grids
 from cup.seismic.survey import open_survey
-from cup.seismic.target_layer import TargetLayer
+from cup.seismic.target_zone import TargetZone
 from cup.well.wavelet import (
     DEFAULT_ACTIVE_SUPPORT_THRESHOLD,
     compute_wavelet_active_half_support_s,
@@ -638,7 +638,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     bot_df_raw = import_interpretation_petrel(bot_horizon_file)
 
     logger.info("Building target layer from raw interpretations...")
-    target_layer = TargetLayer(
+    target_layer = TargetZone(
         raw_horizon_dfs={"top": top_df_raw, "bottom": bot_df_raw},
         geometry=geometry,
         horizon_names=["top", "bottom"],

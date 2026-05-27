@@ -4,8 +4,6 @@
 
 ::: cup.seismic.geometry
 
-::: cup.seismic.spatial
-
 ::: cup.seismic.horizon
 
 ::: cup.seismic.target_zone

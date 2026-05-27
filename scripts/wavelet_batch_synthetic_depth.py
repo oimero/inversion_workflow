@@ -331,8 +331,8 @@ def process_well(
     modeler: Any,
     output_dirs: dict[str, Path],
 ) -> dict[str, Any]:
-    from cup.petrel.export import export_logsets_to_las
     from cup.well.las import old_load_vp_rho_logset_from_las
+    from cup.well.las import export_logsets_to_las
     from cup.utils.raw_trace import zscore_trace
     from wtie.optimize import tie as tie_utils
     from wtie.processing import grid

@@ -14,8 +14,9 @@ checkshots / well heads / well tops / interpretation 文本，
 ------------
 1. import_seismic: 读取 3D SEG-Y 或 ZGY 地震体。
 2. read_petrel_checkshots_dataframe: 将 Petrel checkshot 文本解析为表格。
-3. import_checkshots_petrel / import_well_heads_petrel / import_well_tops_petrel / import_interpretation_petrel:
+3. import_well_heads_petrel / import_well_tops_petrel / import_interpretation_petrel:
    读取 Petrel 文本结果。
+4. old_import_checkshots_petrel: 旧式 checkshot 到 TimeDepthTable 入口。
 """
 
 from __future__ import annotations
@@ -296,7 +297,7 @@ def read_petrel_checkshots_dataframe(path: Path) -> pd.DataFrame:
 def _parse_checkshots_petrel_dataframe(checkshots_file: Path) -> pd.DataFrame:
     """旧兼容包装：读取 Petrel checkshot 文本并应用旧单位约定。
 
-    本函数仅为 ``import_checkshots_petrel`` 保留。新调用方应直接使用
+    本函数仅为 ``old_import_checkshots_petrel`` 保留。新调用方应直接使用
     ``read_petrel_checkshots_dataframe``。
     """
     df = read_petrel_checkshots_dataframe(checkshots_file)
@@ -347,8 +348,10 @@ def _monotonic_checkshot_arrays(
     return depth, twt
 
 
-def import_checkshots_petrel(checkshots_file: Path, depth_domain: str = "md") -> grid.TimeDepthTable:
-    """导入 Petrel checkshots/时深表文本。
+def old_import_checkshots_petrel(checkshots_file: Path, depth_domain: str = "md") -> grid.TimeDepthTable:
+    """旧式入口：导入 Petrel checkshots/时深表文本并转换为 TimeDepthTable。
+
+    新工作流应优先使用 ``cup.well.td.load_petrel_time_depth_table``。
 
     Parameters
     ----------

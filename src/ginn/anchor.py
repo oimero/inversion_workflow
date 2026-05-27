@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 from torch.utils.data import Dataset, Sampler
 
-from cup.seismic.spatial import nominal_bin_spacing_m, xy_circle_mask
+from cup.seismic.geometry import nominal_bin_spacing_m, xy_circle_mask
 from cup.utils.io import to_json_compatible
 
 logger = logging.getLogger(__name__)

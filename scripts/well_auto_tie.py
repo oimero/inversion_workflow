@@ -42,15 +42,18 @@ if str(SRC_DIR) not in sys.path:
 from cup.petrel.load import import_interpretation_petrel, import_well_tops_petrel
 from cup.seismic.horizon import HorizonSurface
 from cup.seismic.survey import open_survey, segy_options_from_config
+from cup.seismic.trace_sampling import assemble_nearest_trace_from_plan, build_nearest_trace_sample_plan
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.coerce import as_bool
 from cup.utils.config import merge_dict_defaults
 from cup.well.assets import build_file_lookup
 from cup.well.las import load_vp_rho_logset_from_standard_las
+from cup.well.spatial_samples import sample_trajectory_on_twt
 from cup.well.td import (
     PreparedTieWindow,
     TargetTieWindow,
     build_tdt_from_anchor,
+    crop_logset_md,
     find_well_top_md,
     load_petrel_time_depth_table,
     normalize_twt_seconds,
@@ -61,7 +64,9 @@ from cup.well.td import (
     write_time_depth_table_csv,
 )
 from cup.well.tie import TieRoute, WellTiePlan, WellTieResult, build_auto_tie_search_space, build_tie_plan, plans_dataframe, results_dataframe, scaled_synthetic_metrics
+from cup.well.trajectory import WellTrajectory
 from cup.well.wavelet import crop_wavelet_center_energy_normalize
+from wtie.processing import grid
 
 
 # =============================================================================
@@ -136,7 +141,12 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     merge_dict_defaults(
         script_cfg,
         "reject",
-        {"allow_near_outside": False, "min_tie_samples": 64, "min_valid_log_fraction": 0.7},
+        {
+            "allow_near_outside": False,
+            "min_tie_samples": 64,
+            "min_valid_log_fraction": 0.7,
+            "max_trajectory_outside_fraction": 0.05,
+        },
     )
     merge_dict_defaults(
         script_cfg,
@@ -366,6 +376,7 @@ def _build_output_paths(output_dir: Path, well_name: str) -> dict[str, Path]:
         "optimized_tdt": output_dir / "time_depth" / f"optimized_tdt_{safe}.csv",
         "synthetic_qc": output_dir / "synthetic_qc" / f"tie_qc_{safe}.csv",
         "seismic_trace": output_dir / "seismic_trace" / f"seismic_trace_{safe}.csv",
+        "trace_sample_plan": output_dir / "trace_sample_plan" / f"trace_sample_plan_{safe}.csv",
         "figure_dir": figure_dir,
         "fig_objective": figure_dir / "optimization_objective.png",
         "fig_tdt": figure_dir / "time_depth_table.png",
@@ -375,7 +386,7 @@ def _build_output_paths(output_dir: Path, well_name: str) -> dict[str, Path]:
 
 
 def _ensure_output_dirs(output_dir: Path) -> None:
-    for name in ["wavelets", "time_depth", "synthetic_qc", "seismic_trace", "figures"]:
+    for name in ["wavelets", "time_depth", "synthetic_qc", "seismic_trace", "trace_sample_plan", "figures"]:
         (output_dir / name).mkdir(parents=True, exist_ok=True)
 
 
@@ -415,6 +426,72 @@ def _snap_seismic_sampling_if_close(seismic: Any, expected_dt_s: float, *, rtol:
         name=seismic.name,
         theta=getattr(seismic, "theta", 0),
     )
+
+
+def _source_at_twt(rows: pd.DataFrame, twt_s: float) -> str:
+    values = rows["twt_s"].to_numpy(dtype=np.float64)
+    sources = rows["source"].astype(str).to_numpy(dtype=object)
+    index = int(np.searchsorted(values, float(twt_s), side="left"))
+    index = max(0, min(index, len(sources) - 1))
+    return str(sources[index])
+
+
+def _clip_prepared_tie_window(
+    prepared: PreparedTieWindow,
+    *,
+    start_s: float,
+    end_s: float,
+    min_tie_samples: int,
+    clip_reason: str,
+) -> PreparedTieWindow:
+    """Clip a prepared tie window to a smaller TWT interval."""
+    if float(end_s) <= float(start_s):
+        raise ValueError(f"Invalid clipped tie window [{start_s}, {end_s}].")
+
+    table = prepared.table
+    if not table.is_md_domain:
+        raise ValueError("well_auto_tie expects prepared tables in MD domain.")
+    twt = np.asarray(table.twt, dtype=np.float64)
+    md = np.asarray(table.md, dtype=np.float64)
+    if float(start_s) < float(twt[0]) - 1e-9 or float(end_s) > float(twt[-1]) + 1e-9:
+        raise ValueError(f"Clipped tie window [{start_s}, {end_s}] is outside prepared table range [{twt[0]}, {twt[-1]}].")
+
+    keep = (twt >= float(start_s)) & (twt <= float(end_s))
+    rows = pd.DataFrame({"twt_s": twt[keep], "md_m": md[keep]})
+    boundary_rows: list[dict[str, Any]] = []
+    for boundary in (float(start_s), float(end_s)):
+        if rows.empty or not np.any(np.isclose(rows["twt_s"].to_numpy(dtype=np.float64), boundary, rtol=0.0, atol=1e-9)):
+            boundary_rows.append(
+                {
+                    "twt_s": boundary,
+                    "md_m": float(np.interp(boundary, twt, md)),
+                }
+            )
+    if boundary_rows:
+        rows = pd.concat([rows, pd.DataFrame.from_records(boundary_rows)], ignore_index=True)
+    rows = rows.sort_values("twt_s").drop_duplicates(subset=["twt_s"], keep="first").reset_index(drop=True)
+    rows["source"] = [_source_at_twt(prepared.table_rows, float(value)) for value in rows["twt_s"]]
+    if len(rows) < 2:
+        raise ValueError("Clipped prepared TDT has fewer than 2 rows.")
+
+    clipped_table = grid.TimeDepthTable(
+        twt=rows["twt_s"].to_numpy(dtype=np.float64),
+        md=rows["md_m"].to_numpy(dtype=np.float64),
+    )
+    md_min = float(np.interp(float(rows["twt_s"].iloc[0]), clipped_table.twt, clipped_table.md))
+    md_max = float(np.interp(float(rows["twt_s"].iloc[-1]), clipped_table.twt, clipped_table.md))
+    clipped_logset = crop_logset_md(prepared.logset_md, md_min, md_max, min_samples=min_tie_samples)
+
+    report = dict(prepared.report)
+    report["tie_window_start_s"] = float(rows["twt_s"].iloc[0])
+    report["tie_window_end_s"] = float(rows["twt_s"].iloc[-1])
+    report["tie_window_duration_s"] = float(rows["twt_s"].iloc[-1] - rows["twt_s"].iloc[0])
+    report["tie_window_md_min_m"] = float(clipped_logset.basis[0])
+    report["tie_window_md_max_m"] = float(clipped_logset.basis[-1])
+    report["tie_window_log_sample_count"] = int(clipped_logset.basis.size)
+    existing_reason = str(report.get("window_clip_reason") or "")
+    report["window_clip_reason"] = ";".join([value for value in [existing_reason, clip_reason] if value])
+    return PreparedTieWindow(table=clipped_table, logset_md=clipped_logset, table_rows=rows, report=report)
 
 
 def _write_qc_figures(
@@ -625,6 +702,121 @@ def _run_vertical_anchor_from_tops(
     )
 
 
+def _run_deviated_with_tdt(
+    *,
+    plan: WellTiePlan,
+    survey: Any,
+    wavelet_extractor: Any,
+    modeler: Any,
+    config: dict[str, Any],
+    output_dir: Path,
+    horizon_cache: dict[str, HorizonSurface],
+    data_root: Path,
+) -> tuple[WellTieResult, dict[str, Any]]:
+    if plan.surface_x is None or plan.surface_y is None:
+        raise ValueError("Plan has no valid surface XY.")
+    if not plan.well_trace_file:
+        raise ValueError("Plan has no well trajectory file.")
+
+    input_las = _resolve_repo_path(plan.input_las)
+    time_depth_file = _resolve_repo_path(plan.time_depth_file)
+    trace_file = _resolve_repo_path(plan.well_trace_file)
+
+    logset_md = load_vp_rho_logset_from_standard_las(input_las)
+    table = load_petrel_time_depth_table(time_depth_file, domain="md")
+    target_window = _target_tie_window_for_plan(
+        plan=plan,
+        survey=survey,
+        config=config,
+        horizon_cache=horizon_cache,
+        data_root=data_root,
+    )
+    if not tdt_overlaps_window(table, target_window):
+        raise ValueError("tdt_no_target_window_overlap")
+
+    prepared = prepare_tdt_with_sonic_extension(
+        raw_table=table,
+        logset_md=logset_md,
+        window=target_window,
+        min_tie_samples=int(config["reject"]["min_tie_samples"]),
+    )
+    sample_start = float(prepared.report["tie_window_start_s"])
+    sample_end = float(prepared.report["tie_window_end_s"])
+    sample_axis = survey.sample_axis("time")
+    sample_idx_start, sample_idx_end = sample_axis.window_indices(sample_start, sample_end)
+    twt_axis = sample_axis.values[sample_idx_start:sample_idx_end]
+
+    trajectory = WellTrajectory.from_petrel_trace(trace_file).with_well_name(plan.well_name)
+    samples = sample_trajectory_on_twt(trajectory, prepared.table, twt_axis)
+    trace_plan = build_nearest_trace_sample_plan(samples, survey)
+    paths = _build_output_paths(output_dir, plan.well_name)
+    plan_df = trace_plan.to_dataframe()
+    plan_df["used_for_tie"] = False
+    plan_df.to_csv(paths["trace_sample_plan"], index=False)
+    outside_fraction = trace_plan.outside_fraction()
+    max_outside = float(config["reject"].get("max_trajectory_outside_fraction", 0.05))
+    if outside_fraction is None:
+        raise ValueError("trajectory_survey_position_not_checked")
+    if outside_fraction > max_outside:
+        raise ValueError(
+            f"trajectory_outside_fraction_exceeded: {outside_fraction:.6f} > {max_outside:.6f}"
+        )
+
+    inside_slice = trace_plan.longest_inside_slice()
+    inside_count = int(inside_slice.stop - inside_slice.start)
+    min_tie_samples = int(config["reject"]["min_tie_samples"])
+    if inside_count < min_tie_samples:
+        raise ValueError(f"trajectory_inside_tie_samples_too_few: {inside_count} < {min_tie_samples}")
+
+    cropped_plan = trace_plan.subset(inside_slice)
+    cropped_start = float(cropped_plan.rows["twt_s"].iloc[0])
+    cropped_end = float(cropped_plan.rows["twt_s"].iloc[-1])
+    prepared = _clip_prepared_tie_window(
+        prepared,
+        start_s=cropped_start,
+        end_s=cropped_end,
+        min_tie_samples=min_tie_samples,
+        clip_reason="trajectory_inside_crop",
+    )
+    seismic = assemble_nearest_trace_from_plan(
+        cropped_plan,
+        survey,
+        sample_start=float(prepared.report["tie_window_start_s"]),
+        sample_end=float(prepared.report["tie_window_end_s"]),
+        domain="time",
+    )
+
+    plan_df["used_for_tie"] = False
+    plan_df.loc[range(inside_slice.start, inside_slice.stop), "used_for_tie"] = True
+    plan_df.to_csv(paths["trace_sample_plan"], index=False)
+
+    result, extra = _run_tie_with_initial_table(
+        plan=plan,
+        survey=survey,
+        wavelet_extractor=wavelet_extractor,
+        modeler=modeler,
+        config=config,
+        output_dir=output_dir,
+        prepared=prepared,
+        extra_seed={
+            "initial_table_source": "time_depth_file",
+            "time_depth_file": repo_relative_path(time_depth_file, root=REPO_ROOT),
+            "well_trace_file": repo_relative_path(trace_file, root=REPO_ROOT),
+            "trace_sampling": {
+                "method": "nearest",
+                "trajectory_outside_fraction": float(outside_fraction),
+                "trajectory_inside_sample_count": int((trace_plan.rows["survey_position"] == "inside").sum()),
+                "trajectory_outside_sample_count": int((trace_plan.rows["survey_position"] == "outside").sum()),
+                "used_sample_count": int(len(cropped_plan.rows)),
+                "unique_trace_count": int(cropped_plan.rows[["inline_index", "xline_index"]].drop_duplicates().shape[0]),
+                "trace_sample_plan_file": repo_relative_path(paths["trace_sample_plan"], root=REPO_ROOT),
+            },
+        },
+        seismic_override=seismic,
+    )
+    return result, extra
+
+
 def _run_tie_with_initial_table(
     *,
     plan: WellTiePlan,
@@ -635,6 +827,7 @@ def _run_tie_with_initial_table(
     output_dir: Path,
     prepared: PreparedTieWindow,
     extra_seed: dict[str, Any] | None = None,
+    seismic_override: Any | None = None,
 ) -> tuple[WellTieResult, dict[str, Any]]:
     from wtie.optimize import autotie
     from wtie.utils.datasets.utils import InputSet
@@ -649,7 +842,11 @@ def _run_tie_with_initial_table(
     overlap = validate_time_depth_table(table, logset_md.basis, min_overlap_samples=int(config["reject"]["min_tie_samples"]))
     sample_start = float(prepared.report["tie_window_start_s"])
     sample_end = float(prepared.report["tie_window_end_s"])
-    seismic = survey.read_trace_at_xy(plan.surface_x, plan.surface_y, sample_start=sample_start, sample_end=sample_end, domain="time")
+    seismic = (
+        seismic_override
+        if seismic_override is not None
+        else survey.read_trace_at_xy(plan.surface_x, plan.surface_y, sample_start=sample_start, sample_end=sample_end, domain="time")
+    )
     seismic = _snap_seismic_sampling_if_close(seismic, float(wavelet_extractor.expected_sampling))
     pd.DataFrame({"twt_s": seismic.basis, "seismic": seismic.values}).to_csv(paths["seismic_trace"], index=False)
     write_time_depth_table_csv(table, paths["initial_tdt"], sources=prepared.table_rows["source"].astype(str).tolist())
@@ -855,7 +1052,11 @@ def main() -> None:
 
     results: list[WellTieResult] = []
     result_extras: dict[str, Any] = {}
-    implemented_routes = {TieRoute.VERTICAL_WITH_TDT.value, TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value}
+    implemented_routes = {
+        TieRoute.VERTICAL_WITH_TDT.value,
+        TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value,
+        TieRoute.DEVIATED_WITH_TDT.value,
+    }
     planned_to_run = [plan for plan in plans if plan.route_status == "planned" and plan.route in implemented_routes]
     if planned_to_run:
         from wtie.modeling.modeling import ConvModeler
@@ -892,6 +1093,17 @@ def main() -> None:
                         output_dir=output_dir,
                         well_tops_df=well_tops_df,
                         anchor_config=anchor_config,
+                        horizon_cache=horizon_cache,
+                        data_root=data_root,
+                    )
+                elif plan.route == TieRoute.DEVIATED_WITH_TDT.value:
+                    result, extra = _run_deviated_with_tdt(
+                        plan=plan,
+                        survey=survey,
+                        wavelet_extractor=wavelet_extractor,
+                        modeler=modeler,
+                        config=script_cfg,
+                        output_dir=output_dir,
                         horizon_cache=horizon_cache,
                         data_root=data_root,
                     )

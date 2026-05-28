@@ -1,45 +1,154 @@
-# 斜井支持的 src/cup 重构规划
+# 斜井支持的 src/cup 后续重构规划
 
-本文不是某一个脚本的设计文档，而是第六步 `lfm_precomputed.py` 和第十步 `well_constraints.py` 共享的重构规划。
+本文只跟踪还没有落地的斜井主线能力。已经进入代码的内容不再作为规划项重复展开：`cup.well.trajectory.WellTrajectory`、`cup.well.spatial_samples.sample_trajectory_on_twt()`、`cup.seismic.trace_sampling` 的最近道采样计划、`SurveyContext.read_traces_at_indices()`，以及 `well_auto_tie.py` 的 `deviated_with_tdt` 路径。
 
-前五步已经把斜井支持推到了工作流前台：第四步需要沿井轨迹取地震道，第六步低频模型需要决定斜井曲线在空间上的控制位置，第十步井约束需要把斜井阻抗约束落到多个地震道和多个时间样点上。单独在每个脚本里补特殊判断，会让斜井逻辑散落在脚本层，后续很难验证。
-
-因此，斜井支持应先在 `src/cup` 内形成稳定 Module，再由脚本调用。
-
-## 当前阻力
-
-### `wtie.grid.WellPath` 不够表达斜井
-
-`wtie.processing.grid.WellPath` 当前只表达：
-
-- `md`
-- `tvdss`
-- `kb`
-
-它能支持 `MD -> TVDSS` 或 `MD -> TWT` 的轴转换，但不能表达：
-
-- 轨迹点的 `x/y`
-- 轨迹点的 `inline/xline`
-- 某个 TWT 样点对应哪一个地震道
-- 一口斜井是否穿过多个地震道
-
-所以 `grid.WellPath` 可以继续作为 wtie Adapter 使用，但不能作为项目内完整井轨迹模型。
-
-### `cup.seismic.modeling.WellControl` 假设一口井一个平面点
-
-当前 `WellControl` 的 Interface 是：
+后续主线仍然围绕同一个事实链条：
 
 ```text
-well_name, property_log, inline, xline, horizon_values
+WellTrajectory + TimeDepthTable + LogSet
+  -> WellSpatialSampleSet
+  -> trace/time sample points
+  -> LFM 控制点或 GINN 井约束锚点
 ```
 
-`build_layer_constrained_model()` 在每个层段比例切片上，从每口井取一个值，然后用这口井固定的 `inline/xline` 做二维插值。
+---
 
-这对直井是自然的，但对斜井不成立。斜井在目标层内可能穿过多个 trace；同一口井的上部、下部甚至同一层段内的不同采样点，都可能对应不同的 `inline/xline`。
+## 1. 路径四：`deviated_anchor_from_tops`
 
-### `ginn.anchor.LogAIAnchorBundle` 是 trace 级约束
+这是第四步 `well_auto_tie.py` 还没有落地的路线：**斜井、无 Petrel 时深表、有井轨迹、有井分层、有可用 `DT_USM/RHO_GCC` 曲线**。
 
-当前 GINN 的井约束数据最终落成：
+它和已经实现的 `deviated_with_tdt` 最大区别是：没有现成的 `TWT -> MD` 表，所以必须先用井分层和解释层位建立一个初始 MD 域 TDT，然后才能复用已落地的斜井轨迹取道能力。
+
+### 路由条件
+
+`build_tie_plan()` 已能识别这条 route：
+
+| 条件 | 要求 |
+|------|------|
+| 井型 | `wellbore_class_qc == deviated` |
+| 曲线 | 第三步 `usable_p_sonic == true` 且 `usable_density == true` |
+| 资产 | 无时深表；有井轨迹；有井分层 |
+| 工区 | 井口在允许的 `survey_position` 内 |
+| 配置 | route 被加入 `enabled_routes` 后才执行 |
+
+当前执行层还没有 handler，因此即使 route 被识别，也不应在主配置中启用。
+
+### 设计原则
+
+- 锚点 TWT 必须在**锚点 MD 对应的轨迹 XY** 处读取，不能默认用井口 XY。
+- 初始 TDT 仍应是 MD 域表：`grid.TimeDepthTable(twt=..., md=...)`。
+- 轨迹只负责 `MD -> XY` 和后续 `TWT -> MD -> XY -> trace`；不要把轨迹里的 Petrel `Z` 当成 checkshot TDT。
+- 第一版只支持单锚点，沿声波曲线向上、向下积分；多锚点误差分配留到后续。
+
+### 建议处理流程
+
+1. 读取预处理 LAS，构造 `grid.LogSet`。
+2. 读取 Petrel 井轨迹，得到 `MD -> TVD_KB/TVDSS/XY`。
+3. 从井分层表中找到配置的锚点层位 MD，例如 `H3-1`。
+4. 用 `WellTrajectory.position_at_md(anchor_md)` 得到锚点处的 `x_m/y_m`。
+5. 把锚点 XY 投影到工区 inline/xline，在解释层位上读取锚点 TWT。
+6. 用 `DT_USM` 从锚点向上、向下积分，生成初始 MD 域 TDT。
+7. 按 `H3-1 -> H7-1` 目标时间窗裁剪或拓展 TDT 和曲线。
+8. 复用 `deviated_with_tdt` 的轨迹采样、最近道批读、出界比例检查和最长 inside 窗口裁剪。
+9. 调用 `wtie.autotie.tie_v1`，输出同一套 wavelet、TDT、QC 和 metrics。
+
+### 积分口径
+
+直井锚点路径目前使用：
+
+```text
+dTWT_s = 2 * DT_USM * dMD_m * 1e-6
+```
+
+斜井不能直接套这个近似。建议第一版显式改成沿轨迹 TVD 增量积分：
+
+```text
+dTWT_s = 2 * DT_USM(MD) * dTVD_KB_m * 1e-6
+```
+
+这样初始 TDT 仍以 MD 为自变量，但时间增量使用轨迹给出的垂向深度变化。验收时必须把 `integration_axis = tvd_kb_from_trajectory` 写入 `tie_window_report.csv` 或 `run_summary.json`，避免后续误以为它是沿井眼 MD 积分。
+
+如果轨迹 TVD 非单调、锚点 MD 超出轨迹、锚点层位在解释层位外、或生成的 TDT 非单调，应直接失败并写清原因。
+
+### 需要新增或扩展的能力
+
+| 位置 | 能力 |
+|------|------|
+| `cup.well.td` | 新增斜井锚点建表函数，例如 `build_deviated_tdt_from_anchor(logset_md, trajectory, anchor_md_m, anchor_twt_s)` |
+| `scripts/well_auto_tie.py` | 新增 `_run_deviated_anchor_from_tops()` handler |
+| `anchor_report.csv` | 增加锚点轨迹 XY、浮点 inline/xline、最近线号和层位采样状态 |
+| `tie_window_report.csv` | 增加积分口径、锚点来源和轨迹裁剪原因 |
+
+### 验收标准
+
+- 一口候选斜井能从 `well_tie_plan.csv` 进入 `deviated_anchor_from_tops` 并完成 auto-tie。
+- `anchor_report.csv` 证明锚点 TWT 取自锚点轨迹 XY，而不是井口 XY。
+- `initial_tdt_<well>.csv` 为 MD 域，TWT 严格递增，`source` 能区分 anchor 和 sonic integration。
+- `trace_sample_plan_<well>.csv` 与 `seismic_trace_<well>.csv` 的 TWT 轴一致。
+- 失败井能区分 `anchor_md_outside_trajectory`、`anchor_horizon_outside_survey`、`deviated_anchor_tdt_not_monotonic`、`trajectory_outside_fraction_exceeded` 等原因。
+
+---
+
+## 2. LFM：点级控制而不是井级代表点
+
+`lfm_precomputed.py` 后续不应再假设“一口井只有一个固定 inline/xline”。斜井在目标层内可能跨多个 trace，同一口井的不同 TWT 样点应作为不同控制点参与低频模型。
+
+### 建议新增 `LayerControlPoint`
+
+字段建议：
+
+| 字段 | 含义 |
+|------|------|
+| `well_name` | 来源井 |
+| `property_name` | 例如 `AI`、`Vp`、`Rho` |
+| `twt_s` / `md_m` | 控制点所在时间和 MD |
+| `x_m` / `y_m` | 控制点 XY |
+| `inline_float` / `xline_float` | 浮点线号 |
+| `flat_idx` | 最近 trace |
+| `zone_name` | 所属层段 |
+| `u_in_zone` | 在层段内的比例位置 |
+| `value` | 控制值 |
+| `weight` | 控制权重 |
+| `source` | `vertical_trace`、`deviated_trajectory` 等 |
+
+### 需要解决的问题
+
+1. 在控制点所在 XY 处读取上下层位 TWT。
+2. 判断样点属于哪个 `TargetZone`。
+3. 计算 `u_in_zone = (twt_s - top_twt) / (bottom_twt - top_twt)`。
+4. 对层位缺失、层位反转、厚度过薄、超出目标层的样点写 QC，不静默参与建模。
+5. 密集井网中多个控制点落到同一 slice/trace 附近时，按显式策略聚合。
+
+### 建议落地方式
+
+保留现有 `cup.seismic.modeling.WellControl` 作为直井兼容 Adapter，但时间域主线新增点级路径：
+
+```text
+optimized TDT + preprocessed LAS + trajectory
+  -> WellSpatialSampleSet
+  -> LayerControlPoint
+  -> slice-level interpolation
+```
+
+输出新增：
+
+| 文件 | 内容 |
+|------|------|
+| `lfm_layer_control_points.csv` | 每个点的井名、TWT、MD、XY、inline/xline、zone、u、属性值、权重 |
+| `lfm_control_qc.csv` | 每口井控制点数量、跨 trace 数、无效点比例 |
+| `lfm_control_conflicts.csv` | 密集井网或同 trace/slice 冲突 |
+
+验收标准：
+
+- 直井旧控制能通过 Adapter 转成点级控制。
+- 斜井目标层内多个空间控制点能参与 slice 插值。
+- 不再把斜井压成目标层中点或井口代表点作为默认路径。
+
+---
+
+## 3. well constraints：点级锚点聚合
+
+`well_constraints.py` 后续应直接从空间样点生成约束点，再聚合成现有 GINN 训练需要的 `LogAIAnchorBundle`。GINN 主训练流程可以继续消费：
 
 ```text
 flat_indices
@@ -47,420 +156,83 @@ target_log_ai[n_anchor_trace, n_sample]
 anchor_weight[n_anchor_trace, n_sample]
 ```
 
-这个结构本身可以容纳斜井，因为它允许一条 trace 上只有部分时间样点有约束。但现在的生成逻辑更接近“井头最近道整条曲线约束”。斜井需要先生成 `trajectory point -> trace/time sample` 的稀疏点云，再聚合成现有 `LogAIAnchorBundle`。
+变化发生在 bundle 生成之前。
 
-## 重构目标
+### 建议新增 `AnchorPoint`
 
-这次重构不按“先近似、后完整”的节奏推进。时间域脚本还没有形成历史包袱，深度域工作流后续大概率也不会继续作为主线，因此斜井应作为主路径一次性进入 `src/cup` 的数据模型。
-
-目标是让脚本层只表达业务决策：
-
-- 哪些井进入 LFM；
-- 哪些井进入 well constraints；
-- 斜井使用完整轨迹时，控制点如何抽稀、加权和冲突处理；
-- 冲突点如何取舍。
-
-脚本层不应该自己反复实现：
-
-- 轨迹文件解析；
-- `MD/TWT/TVDSS/XY/inline/xline` 互转；
-- 斜井采样点落到地震道；
-- 多井、多轨迹点冲突聚合；
-- 直井与斜井的两套分支数据结构。
-
-## 实际井轨迹文件格式
-
-当前 `data/all_well_trace` 下共有 Petrel 导出的 `.txt` 文件。典型文件头如下：
-
-```text
-# WELL TRACE FROM PETREL
-# WELL NAME:              A1
-# DEFINITIVE SURVEY:      MD Incl Azim survey 1
-# WELL HEAD X-COORDINATE: 686352.08000000 (m)
-# WELL HEAD Y-COORDINATE: 3217437.84000000 (m)
-# WELL DATUM (KB, Kelly bushing, from MSL): 23.00000000 (m)
-# MD AND TVD ARE REFERENCED (=0) AT WELL DATUM AND INCREASE DOWNWARDS
-# DEPTH (Z, tvd_z) GIVEN IN m-UNITS
-#================================================================================================================================
-      MD            X            Y            Z           TVD           DX          DY          AZIM         INCL         DLS
-#================================================================================================================================
- 0.0000000000 686352.08000 3217437.8400 23.000000000 0.0000000000 ...
-```
-
-有效数据列为空白分隔：
-
-| 列 | 含义 |
-| --- | --- |
-| `MD` | 测深，从 KB 起算，向下为正，单位 m |
-| `X`, `Y` | 轨迹点平面坐标 |
-| `Z` | Petrel 导出的绝对高程/深度坐标；从样例看通常等于 `KB - TVD` |
-| `TVD` | 从 KB 起算的真垂深，向下为正，单位 m |
-| `DX`, `DY` | 相对井口偏移，单位 m |
-| `AZIM` | 方位角，单位度 |
-| `INCL` | 井斜角，单位度 |
-| `DLS` | 狗腿严重度 |
-
-这意味着我们不需要从 `INCL/AZIM` 重新积分轨迹，第一优先级应使用文件中已经给出的 `X/Y/TVD/MD`。`INCL/AZIM/DLS` 只作为 QC 辅助字段。
-
-需要特别处理的情况：
-
-- 有些文件只有两行，例如直井从井口到井底；这依然是合法轨迹。
-- 有些斜井文件采样很密，例如 0.5 m 或 0.125 m。
-- `Z` 与 `TVD` 的关系应做一致性检查：通常 `Z ~= KB - TVD`。
-- 文件夹真实名称是 `data/all_well_trace`，不是 `data/all_well_traces`。
-
-### TVDSS 口径
-
-这是斜井重构里最容易错一个 KB 的地方，必须作为 Module Interface 的一部分固定下来。
-
-`cup.well.td.load_petrel_time_depth_table(domain="tvdss")` 会把 Petrel checkshots 的 `Z` 取绝对值后放进 `grid.TimeDepthTable(tvdss=...)`；`export_vertical_tdt_to_petrel_checkshots()` 又把 `tdt.tvdss` 写成负的 Petrel `Z`，并用 `MD = |Z| + KB` 导出。这说明当前代码里的 `TimeDepthTable.tvdss` 实际是“向下为正的 TVDSS/depth below MSL”口径，而不是严格数学符号的海拔坐标。
-
-因此新 `WellTrajectory` 不应让脚本散写 `tvdss = tvd_kb - kb` 或 `tvdss = kb - z`。建议在 `cup.well.trajectory` 中集中实现：
-
-```text
-tvdss_m = tvd_kb_m - kb_m
-```
-
-并在读取 Petrel trace 时同时校验：
-
-```text
-z_m ~= kb_m - tvd_kb_m
-```
-
-如果未来决定改成带符号海拔口径，也必须只改 Adapter 和 `cup.well.td`，不要让不同脚本混用两种 TVDSS 语义。所有 `WellTimeDepth`、`WellTrajectory.to_wtie_wellpath()`、Petrel checkshots 导入导出都要共享同一个约定。
-
-## 建议新增核心 Module
-
-### `cup.well.trajectory`
-
-这是斜井支持最关键的 Module。它的 Interface 应该比 `wtie.grid.WellPath` 更深，负责项目内完整井轨迹表达。
-
-建议对象：
-
-```text
-WellTrajectory
-```
-
-建议字段：
+字段建议：
 
 | 字段 | 含义 |
-| --- | --- |
-| `well_name` | 井名 |
-| `md_m` | 测深 MD，单位 m |
-| `tvd_kb_m` | 从 KB 起算的 TVD，向下为正，单位 m |
-| `tvdss_m` | 项目内部 TVDSS 口径，单位 m；必须由 Adapter 明确换算，不能在调用处临时猜 |
-| `z_m` | 原始 Petrel `Z` 列，保留用于 QC |
-| `x_m` | 轨迹点 X |
-| `y_m` | 轨迹点 Y |
-| `dx_m`, `dy_m` | 相对井口偏移 |
-| `azim_deg`, `incl_deg`, `dls` | 轨迹 QC 字段 |
-| `kb_m` | KB 高程 |
-| `metadata` | 来源文件、单位、QC 信息 |
-
-建议方法：
-
-| 方法 | 功能 |
-| --- | --- |
-| `from_petrel_trace(path)` | 读取当前 Petrel well trace txt |
-| `to_wtie_wellpath()` | 转成 `wtie.processing.grid.WellPath`，供 wtie 轴转换使用 |
-| `with_inline_xline(geometry)` | 用 `SurveyLineGeometry` 补充每个轨迹点的 `inline/xline` |
-| `position_at_md(md)` | 按 MD 插值得到 `x/y/tvdss/inline/xline` |
-| `position_at_tvdss(tvdss)` | 按 TVDSS 插值得到轨迹位置 |
-| `position_at_twt(twt, time_depth_table)` | 先由 TWT 找 MD 或 TVDSS，再找空间位置 |
-| `target_interval(top_twt, bottom_twt, table)` | 提取目标层时间窗内的轨迹片段 |
-| `representative_position(policy)` | 返回井口、目标层中点、目标层加权中心等代表点 |
-
-需要注意：`WellTrajectory` 是项目内主模型；`wtie.grid.WellPath` 只是一个 Adapter，不反过来主导项目设计。
-
-### `cup.well.td`
-
-这个 Module 负责时深表、目标时间窗和轨迹之间的域转换；标准 LAS 到 `LogSet` 的读取放在 `cup.well.las`。
-
-建议对象或函数：
-
-| 名称 | 功能 |
-| --- | --- |
-| `WellTimeDepth` | 包装 `grid.TimeDepthTable`，保留来源、domain、单位、QC |
-| `load_petrel_time_depth_table(path)` | 读取 Petrel 时深表，并统一 TWT 单位和 TVDSS/MD 口径 |
-| `validate_time_depth_table(table, log_basis_md, trajectory=None)` | 检查时深表与测井 MD、轨迹 TVDSS 的覆盖关系 |
-| `convert_log_md_to_twt(log, table, trajectory, dt_s)` | 统一 MD 曲线到 TWT |
-| `sample_log_on_twt(log_md, table, trajectory, twt_axis)` | 在指定 TWT 轴上采样曲线 |
-| `sample_trajectory_on_twt(trajectory, table, twt_axis)` | 在 TWT 轴上采样轨迹点 |
-
-标准 LAS 读取入口：
-
-| 名称 | 功能 |
-| --- | --- |
-| `cup.well.las.load_vp_rho_logset_from_standard_las(path)` | 从含 `DT_USM` 与 `RHO_GCC` 的标准 LAS 构建 `grid.LogSet` |
-
-这里可以保持对象轻量，但要保证脚本不直接操作裸数组做长期传递。
-
-### `cup.well.spatial_samples`
-
-这个 Module 表达“井曲线采样点已经落到了地震空间中”。
-
-建议对象：
-
-```text
-WellSpatialSampleSet
-```
-
-一行样点建议包含：
-
-| 字段 | 含义 |
-| --- | --- |
-| `well_name` | 井名 |
-| `md_m` | MD |
-| `twt_s` | TWT |
-| `tvdss_m` | TVDSS |
-| `x_m`, `y_m` | 空间坐标 |
-| `inline`, `xline` | 浮点线号 |
-| `nearest_il_idx`, `nearest_xl_idx` | 最近地震道索引 |
-| `flat_idx` | 展平 trace 索引 |
-| `property_name` | `AI`、`Vp` 等 |
-| `property_value` | 属性值 |
-| `weight` | 样点置信权重 |
-| `source` | `vertical_fixed_xy`、`deviated_trajectory`、`representative_xy` |
-
-这个对象会同时服务：
-
-- 第六步 LFM 的控制点生成；
-- 第十步 well constraints 的锚点生成；
-- 密集井网冲突诊断。
-
-调用顺序需要明确：`WellTrajectory` 本身不依赖时深表；只有 `position_at_twt()` 或 `WellSpatialSampleSet.from_twt_axis()` 这类 TWT 采样方法需要 `TimeDepthTable`。因此第四步可以先读取轨迹并完成空间 QC，再用已有时深表或 auto-tie 输出 table 把 TWT 样点映射回 MD/XY，避免形成“轨迹依赖时深、时深又依赖轨迹”的隐性循环。
-
-第一步的 `survey_position` 只是井口级早期标记。对于 `near_outside` 甚至少量 `outside` 井，轨迹目标段可能进入工区；最终是否可用于第四步、第六步或第十步，应以 `WellSpatialSampleSet` 的样点级覆盖统计为准，而不是只看井口 XY。
-
-## 对 LFM 的改造
-
-### 点云式 LFM 控制
-
-时间域 LFM 不再把“井级固定 XY”作为核心假设。斜井 LFM 应把控制点从“井级”改成“样点级”。
-
-需要给 `cup.seismic.modeling` 增加一个更通用的 Interface：
-
-```text
-LayerControlPoint
-```
-
-建议字段：
-
-```text
-well_name
-property_name
-inline
-xline
-sample_value
-zone_name
-u_in_zone
-value
-weight
-```
-
-`build_layer_constrained_model()` 的内部逻辑从：
-
-```text
-每个 slice -> 每口井插值一个属性值 -> kriging
-```
-
-逐步改成：
-
-```text
-每个 slice -> 收集落在该 slice 附近的控制点 -> 按权重/冲突策略聚合 -> kriging
-```
-
-为了不一次性打碎现有代码，可以先保留旧 `WellControl`，新增 Adapter：
-
-| Adapter | 功能 |
-| --- | --- |
-| `well_controls_to_layer_points()` | 直井旧控制转成点云控制 |
-| `spatial_samples_to_layer_points()` | 斜井样点转成层段比例控制 |
-
-`spatial_samples_to_layer_points()` 不能只是字段改名。它需要把每个空间样点和 `TargetZone` 关联起来：
-
-1. 在样点的浮点 `inline/xline` 处读取所有层位解释值。
-2. 判断样点 `twt_s` 落在哪个相邻层段 `[top_horizon, bottom_horizon]`。
-3. 计算 `u_in_zone = (twt_s - top_twt) / (bottom_twt - top_twt)`。
-4. 对超出目标层、层位缺失、层位反转或厚度过薄的样点写入 QC，不静默参与建模。
-5. 结合 `TargetZone.valid_control_mask`、轨迹样点覆盖率和密井冲突策略生成最终 `weight`。
-
-这部分应成为 `cup.seismic.modeling` 或 `cup.well.spatial_samples` 的深 Interface，而不是写在 `lfm_precomputed.py` 里。否则第六步和第十步会各自实现一套层位映射逻辑，后续很难保证一致。
-
-当点云路径稳定后，再考虑让 `WellControl` 退居兼容 Adapter。
-
-既然本项目不急于快速跑出结果，`lfm_precomputed.py` 不应先落一个代表点近似版本。代表点策略可以保留为 QC 对照或降级 Adapter，但不作为默认路径。
-
-## 对 well_constraints 的改造
-
-well constraints 比 LFM 更应该直接使用点云。
-
-建议流程：
-
-```text
-preprocessed LAS + optimized TDT + trajectory
-  -> WellSpatialSampleSet
-  -> AnchorPoint table
-  -> LogAIAnchorBundle
-```
-
-`AnchorPoint` 建议字段：
-
-| 字段 | 含义 |
-| --- | --- |
-| `well_name` | 井名 |
-| `md_m` | MD |
-| `twt_s` | TWT |
+|------|------|
+| `well_name` | 来源井 |
+| `md_m` / `twt_s` | 样点位置 |
 | `sample_idx` | 时间采样索引 |
-| `x_m`, `y_m` | 空间坐标 |
-| `inline`, `xline` | 浮点线号 |
+| `x_m` / `y_m` | 样点 XY |
+| `inline_float` / `xline_float` | 浮点线号 |
 | `flat_idx` | 约束落到的 trace |
-| `ai` | 阻抗 |
-| `log_ai` | `log(ai)` |
+| `ai` / `log_ai` | 阻抗及其对数 |
 | `weight` | 约束权重 |
-| `route` | 直井/斜井路径 |
+| `route` | 来源 auto-tie 路径 |
+| `source` | `vertical_trace`、`deviated_trajectory` 等 |
 
-聚合到 `LogAIAnchorBundle` 时，以 `(flat_idx, sample_idx)` 为基本单元。
+### 聚合规则
 
-冲突策略必须显式配置：
+聚合基本单元应为：
+
+```text
+(flat_idx, sample_idx)
+```
+
+同一个单元出现多个约束点时，必须显式配置冲突策略：
 
 | 策略 | 含义 |
-| --- | --- |
-| `weighted_average` | 同一格点多个约束按权重平均 |
+|------|------|
+| `weighted_average` | 按权重平均，推荐默认 |
 | `highest_confidence` | 保留权重最高者 |
-| `drop_conflict` | 冲突点全部丢弃 |
-| `fail_on_conflict` | 出现冲突直接报错 |
+| `drop_conflict` | 冲突单元全部丢弃 |
+| `fail_on_conflict` | 有冲突就报错 |
 
-默认推荐 `weighted_average`，同时输出 `anchor_conflicts.csv`，不要静默覆盖。
+默认建议 `weighted_average + report`，不要静默覆盖。
 
-## 对地震取样的改造
+### 输出新增
 
-第四步和第十步都需要“沿轨迹落道”，所以这个能力不应放在脚本中。
-
-建议在 `cup.seismic.trace_sampling` 中新增：
-
-| 名称 | 功能 |
-| --- | --- |
-| `TraceSamplePoint` | 一个空间点对应的地震道采样计划 |
-| `build_trace_sample_plan(x, y, survey)` | `x/y -> inline/xline -> nearest/bilinear trace` |
-| `sample_volume_at_points(volume_or_survey, points, mode)` | 对一组点批量取地震样值或地震道 |
-| `deduplicate_trace_reads(points)` | 斜井跨多道时合并重复 trace 读取 |
-
-这里要继续遵守 AGENTS.md 的易错点：物理距离必须通过 `open_survey()` 得到的 `SurveyLineGeometry` 或真实 XY 网格计算，不能把 `inline_step/xline_step` 当米制距离。
-
-落地时还需要继续深化地震采样 Interface。当前几何能力已经收敛到 `SurveyLineGeometry`，地震体 Adapter 负责 `read_trace_at_xy()`；斜井批量取道还需要批量坐标转索引、邻道/flat index 计划、sample window 解析、重复 trace 去重。这个复杂度应封装在 `cup.seismic.trace_sampling` 与 SEG-Y/ZGY Adapter 后面，而不是散落到 `well_auto_tie.py`、`lfm_precomputed.py` 或 `well_constraints.py`。
-
-## 建议模块归并
-
-为了避免文件膨胀，可以控制在这些 Module：
-
-| Module | 负责内容 |
-| --- | --- |
-| `cup.well.trajectory` | 完整井轨迹、轨迹文件解析、轨迹到 wtie Adapter |
-| `cup.well.td` | 时深表、目标时间窗和 MD/TWT/TVDSS 之间的域转换 |
-| `cup.well.spatial_samples` | 把已经明确 MD/TWT 的井曲线样点落到 XY、inline/xline、trace/sample |
-| `cup.seismic.modeling` | 层位约束建模；逐步从井级控制扩展到点级控制 |
-| `cup.seismic.trace_sampling` | 批量地震道/地震样点采样计划 |
-
-暂时不建议拆出很多小文件。比如 `time_depth`、`trajectory`、`wellpath_adapter` 如果太早拆开，Interface 会变浅，调用者反而需要知道更多实现细节。
-
-## 一次性改造范围
-
-“一次性”指数据模型和默认路径一次性按斜井点云设计，不先落代表点近似主路径。实际编码仍建议拆成可验证的 PR 切片，每个切片都保持主线设计不回退。
-
-### 1. 建立斜井主模型
-
-新增 `WellTrajectory`，能从 `data/all_well_trace` 读出：
-
-- `md`
-- `tvd_kb`
-- `tvdss` 或可换算出的 TVDSS
-- `x/y`
-- `z`
-- `dx/dy`
-- `incl/azim/dls`
-- `kb`
-
-同时提供 `to_wtie_wellpath()`，让 wtie 相关转换继续可用。
+| 文件 | 内容 |
+|------|------|
+| `anchor_points.csv` | 聚合前的点级井约束 |
+| `anchor_conflicts.csv` | 同一 `(flat_idx, sample_idx)` 的冲突明细 |
+| `anchor_trace_summary.csv` | 每条 trace 的锚点数量、时间覆盖、来源井列表 |
 
 验收标准：
 
-- 直井也能表示为 `WellTrajectory`；
-- `position_at_md()`、`position_at_twt()` 可测；
-- 轨迹越界、非单调、缺坐标能给出清晰错误。
+- 一口斜井跨多个 trace 时，约束分布到多个 `flat_idx`。
+- 同一 trace 不同时间窗的约束不会被整条 trace 的单一权重覆盖。
+- 不需要改 `ginn_train.py` 主训练循环即可使用新的 bundle。
 
-### 2. 统一井曲线到空间样点
+---
 
-新增 `WellSpatialSampleSet`，把 `LogSet + TimeDepthTable + WellTrajectory + SurveyLineGeometry` 统一成点云。
+## 4. 地震取样的后续升级
 
-验收标准：
+当前已落地的是最近道批读：样点落到最近 inline/xline，唯一 trace 去重读取，再拼成一条沿轨迹地震道。
 
-- 直井输出的所有样点落在同一个或近似同一个 trace；
-- 斜井输出的样点可以跨 trace；
-- 输出 `spatial_sample_qc.csv`，统计每口井跨过多少 trace、最大横向位移、越界样点比例。
+后续可升级但不阻塞主线：
 
-### 3. 改造 LFM 为点级控制
+| 能力 | 用途 |
+|------|------|
+| 双线性采样 | 减少最近道阶梯跳变 |
+| 多道加权 | 对斜井附近多个 trace 做稳定采样 |
+| ZGY 批量块读取 | 减少多井、多轨迹点时的 IO |
+| 轨迹 inline/xline QC 图 | 快速发现轨迹几何或工区转换异常 |
 
-新增 `LayerControlPoint`，让 `lfm_precomputed.py` 直接从 `WellSpatialSampleSet` 生成层段比例控制点。
+这些能力仍应放在 `cup.seismic.trace_sampling` 和 `SurveyContext` Adapter 后面，不应散写到脚本里。
 
-验收标准：
+---
 
-- 直井旧 `WellControl` 可通过 Adapter 转为 `LayerControlPoint`；
-- 斜井目标层内的多个空间控制点能参与 slice kriging；
-- 输出 `lfm_layer_control_points.csv`，说明每个控制点的井名、TWT、XY、inline/xline、zone、u 和属性值；
-- 密集井网冲突有显式权重或冲突报告。
+## 推荐落地顺序
 
-### 4. 改造 well constraints 为点级锚点
+1. `deviated_anchor_from_tops`：补齐第四步最后一条 route。
+2. 扩展空间样点到属性点：让 `WellSpatialSampleSet` 能携带 AI/Vp/Rho、权重和来源。
+3. `LayerControlPoint`：让 `lfm_precomputed.py` 从井级控制转为点级控制。
+4. `AnchorPoint`：让 `well_constraints.py` 从点级锚点聚合为 `LogAIAnchorBundle`。
+5. 冲突诊断：统一输出密集井网下的 trace/time 冲突报告。
 
-`well_constraints.py` 使用 `WellSpatialSampleSet` 生成 `AnchorPoint`，再聚合为现有 `LogAIAnchorBundle`。
-
-验收标准：
-
-- 不需要改 GINN 训练主流程即可使用斜井约束；
-- 输出 `anchor_points.csv`、`anchor_conflicts.csv`、`anchor_trace_summary.csv`；
-- 同一 trace 不同时间窗的斜井约束不会被整条 trace 的单一权重覆盖。
-
-建议实现切片：
-
-| 切片 | 解锁能力 |
-| --- | --- |
-| A | `WellTrajectory` + Petrel trace 读取 + 轨迹 QC |
-| B | `WellSpatialSampleSet` + survey 落道 + TWT/MD 空间采样 |
-| C | `LayerControlPoint` + LFM 点级控制 |
-| D | `AnchorPoint` + `LogAIAnchorBundle` 聚合 |
-
-这些切片不是“先近似后完整”的业务阶段，而是同一设计下的工程验收边界。
-
-## 旧函数处理建议
-
-| 现有位置 | 建议 |
-| --- | --- |
-| `cup.well.las.old_load_vp_rho_logset_from_las` (legacy raw LAS reader) | 旧深度域原始 LAS 直读入口；不要放在 Petrel I/O |
-| `cup.seismic.lfm_time.LfmTimeWell.trajectory` | 改为接受项目 `WellTrajectory`，内部再转 wtie `WellPath` |
-| `cup.seismic.modeling.WellControl` | 不再作为时间域主 Interface；保留为直井井级控制 Adapter |
-| 脚本内 `coord_to_line` / 最近道逻辑 | 下沉到 `cup.seismic.trace_sampling` |
-| `LogsetInput = Union[grid.LogSet, Dict[str, grid.Log]]` | 新时间域脚本不再使用；旧深度域脚本可保留 wrapper 到退出维护，避免为了新主线反向重写旧流程 |
-
-## 决策点
-
-这些决策会影响第六步和第十步文档：
-
-1. `WellTrajectory` 是否必须包含 `x/y`。建议必须包含；只有 `MD/TVDSS` 的轨迹不算可用于斜井空间建模。
-2. LFM 是否直接使用点云控制。建议直接使用，不先落代表点默认路径。
-3. well constraints 是否直接使用点云锚点。建议直接使用。
-4. `WellControl` 是否继续作为主 Interface。建议否；它可以作为直井兼容 Adapter。
-5. 密集井冲突默认策略。建议默认 `weighted_average + report`，不要静默覆盖。
-
-## 推荐结论
-
-真正需要先改的不是 `lfm_precomputed.py` 或 `well_constraints.py` 的局部分支，而是 `src/cup` 里缺少一个“井轨迹空间样点”的深 Module。
-
-推荐一次性路线：
-
-1. 新增 `cup.well.trajectory.WellTrajectory`。
-2. 新增 `cup.well.spatial_samples.WellSpatialSampleSet`。
-3. 新增 `cup.seismic.modeling.LayerControlPoint`，让 LFM 直接消费点级控制。
-4. 第十步 well constraints 使用同一套空间样点生成 trace/time 锚点。
-5. `WellControl` 和代表点策略只作为 Adapter 或 QC 对照，不作为时间域主路径。
-
-这样第六步和第十步共享同一个斜井事实来源：`WellTrajectory -> WellSpatialSampleSet`。复杂度集中在一个深 Module 后面，而不是分散在多个脚本里反复补丁。
+核心原则不变：斜井的空间事实只从 `WellTrajectory -> WellSpatialSampleSet` 出来；LFM 和 well constraints 不各自重写一套轨迹、TWT、inline/xline 转换逻辑。

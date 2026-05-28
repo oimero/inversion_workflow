@@ -34,13 +34,13 @@
     - `TimeDepthTable.md`：正米，向下为正，仅在 `domain="md"` 时存在。
     - `TimeDepthTable.tvdss`：正米，向下为正，仅在 `domain="tvdss"` 时存在。
 
-## 井轨迹 TVDSS
+## 井轨迹
 
 - 轨迹读取入口：`cup.well.trajectory.WellTrajectory.from_petrel_trace(path)`。
-- 轨迹里的 `tvdss_m` 不是从 Petrel checkshots 的 `Z` 字段读取来的，而是由轨迹点计算：
+- 轨迹里的 `tvdss_m` 不是直接读 `Z` 字段，而是逐轨迹点计算：
     - `tvdss_m = tvd_kb_m - kb_m`
-- 含义：轨迹点相对海平面的垂向位置，海平面以下为正，海平面以上为负。
-- 因此井口或浅部轨迹点的 `tvdss_m` 可以为负。
+    - 含义：轨迹点相对海平面的垂向位置，海平面以下为正，海平面以上为负。
+    - 因此，浅部轨迹点的 `tvdss_m` 可以为负。
 - 易错点：
     - `TimeDepthTable.tvdss` 是时深表深度轴，当前通过 `abs(Z)` 进入项目，通常只服务地下目标层。
     - `WellTrajectory.tvdss_m` 是轨迹几何事实，保留海平面上下的符号。

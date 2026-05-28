@@ -49,6 +49,16 @@ class SurveyContext(Protocol):
         domain: str = "time",
     ) -> grid.Seismic: ...
 
+    def trace_flat_index(self, inline_index: int, xline_index: int) -> int: ...
+
+    def read_traces_at_indices(
+        self,
+        indices: list[tuple[int, int]],
+        sample_start: Optional[float] = None,
+        sample_end: Optional[float] = None,
+        domain: str = "time",
+    ) -> dict[tuple[int, int], grid.Seismic]: ...
+
 
 def _normalize_domain(domain: Optional[str]) -> str:
     """规范化采样域标识。"""
@@ -284,6 +294,55 @@ class SegySurveyContext:
         trace_name = "Seismic Trace" if basis_type == "twt" else "Seismic Trace (Depth)"
         return grid.Seismic(values=trace_data, basis=trace_axis, basis_type=basis_type, name=trace_name)
 
+    def trace_flat_index(self, inline_index: int, xline_index: int) -> int:
+        """Return the underlying SEG-Y trace index for integer grid indices."""
+        i = int(inline_index)
+        j = int(xline_index)
+        ni, nx = self.geom.shape
+        if not (0 <= i < ni and 0 <= j < nx):
+            raise ValueError(f"Trace indices are outside survey range: {(i, j)}")
+        flat_idx = int(self.geom[i, j])
+        if flat_idx < 0:
+            raise ValueError(f"Trace indices reference a missing SEG-Y trace: {(i, j)}")
+        return flat_idx
+
+    def read_traces_at_indices(
+        self,
+        indices: list[tuple[int, int]],
+        sample_start: Optional[float] = None,
+        sample_end: Optional[float] = None,
+        domain: str = "time",
+    ) -> dict[tuple[int, int], grid.Seismic]:
+        """Read multiple traces by integer inline/xline indices."""
+        domain_value = _normalize_domain(domain)
+        unique_indices = sorted({(int(i), int(j)) for i, j in indices})
+        if not unique_indices:
+            return {}
+
+        sample_axis = self.sample_axis(domain_value)
+        sample_idx_start, sample_idx_end = sample_axis.window_indices(sample_start, sample_end)
+        trace_axis = sample_axis.values[sample_idx_start:sample_idx_end]
+        basis_type = _domain_to_basis_type(domain_value)
+        trace_name = "Seismic Trace" if basis_type == "twt" else "Seismic Trace (Depth)"
+
+        import cigsegy
+
+        out: dict[tuple[int, int], grid.Seismic] = {}
+        segy = cigsegy.Pysegy(str(self.seismic_file))
+        try:
+            for key in unique_indices:
+                flat_idx = self.trace_flat_index(*key)
+                values = segy.collect(flat_idx, flat_idx + 1, sample_idx_start, sample_idx_end).squeeze()
+                out[key] = grid.Seismic(
+                    np.atleast_1d(np.asarray(values, dtype=np.float64)),
+                    trace_axis,
+                    basis_type,
+                    name=trace_name,
+                )
+        finally:
+            segy.close()
+        return out
+
 
 @dataclass(frozen=True)
 class ZgySurveyContext:
@@ -377,6 +436,48 @@ class ZgySurveyContext:
         basis_type = _domain_to_basis_type(domain_value)
         trace_name = "Seismic Trace" if basis_type == "twt" else "Seismic Trace (Depth)"
         return grid.Seismic(values=trace_data, basis=trace_axis, basis_type=basis_type, name=trace_name)
+
+    def trace_flat_index(self, inline_index: int, xline_index: int) -> int:
+        """Return the underlying ZGY trace index for integer grid indices."""
+        i = int(inline_index)
+        j = int(xline_index)
+        if not (0 <= i < self.n_ilines and 0 <= j < self.n_xlines):
+            raise ValueError(f"Trace indices are outside survey range: {(i, j)}")
+        return i * self.n_xlines + j
+
+    def read_traces_at_indices(
+        self,
+        indices: list[tuple[int, int]],
+        sample_start: Optional[float] = None,
+        sample_end: Optional[float] = None,
+        domain: str = "time",
+    ) -> dict[tuple[int, int], grid.Seismic]:
+        """Read multiple traces by integer inline/xline indices."""
+        import pyzgy
+
+        domain_value = _normalize_domain(domain)
+        unique_indices = sorted({(int(i), int(j)) for i, j in indices})
+        if not unique_indices:
+            return {}
+
+        sample_axis = self.sample_axis(domain_value)
+        sample_idx_start, sample_idx_end = sample_axis.window_indices(sample_start, sample_end)
+        trace_axis = sample_axis.values[sample_idx_start:sample_idx_end]
+        basis_type = _domain_to_basis_type(domain_value)
+        trace_name = "Seismic Trace" if basis_type == "twt" else "Seismic Trace (Depth)"
+
+        out: dict[tuple[int, int], grid.Seismic] = {}
+        with pyzgy.open(str(self.seismic_file), mode="r") as reader:
+            for key in unique_indices:
+                flat_idx = self.trace_flat_index(*key)
+                values = reader.get_trace(flat_idx)[sample_idx_start:sample_idx_end]
+                out[key] = grid.Seismic(
+                    np.asarray(values, dtype=np.float64),
+                    trace_axis,
+                    basis_type,
+                    name=trace_name,
+                )
+        return out
 
 
 def segy_options_from_config(seismic_cfg: dict[str, Any]) -> dict[str, int]:

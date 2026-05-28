@@ -153,13 +153,18 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     )
     merge_dict_defaults(
         script_cfg,
-        "coarse_anchor",
+        "coarse_correction",
         {
-            "enabled": True,
-            "apply_to_routes": ["vertical_anchor_from_tops"],
-            "config_file": "experiments/well_auto_tie_anchors.yaml",
-            "default": {"well_top": "H3-1", "horizon": "interpre/H3-1", "event": "peak", "twt_unit": "auto"},
-            "wells": {},
+            "anchor": {
+                "enabled": True,
+                "apply_to_routes": ["vertical_anchor_from_tops"],
+                "config_file": "experiments/well_auto_tie_anchors.yaml",
+            },
+            "manual_shift": {
+                "default_ms": 0.0,
+                "by_route_ms": {},
+                "config_file": "experiments/well_auto_tie_manual_shifts.yaml",
+            },
         },
     )
     return script_cfg
@@ -259,12 +264,9 @@ def _series_value_counts(series: pd.Series) -> dict[str, int]:
     return {str(key): int(value) for key, value in series.value_counts(dropna=False).sort_index().items()}
 
 
-def _load_anchor_config(coarse_anchor_cfg: dict[str, Any]) -> dict[str, Any]:
-    config = {
-        "default": dict(coarse_anchor_cfg.get("default") or {}),
-        "wells": dict(coarse_anchor_cfg.get("wells") or {}),
-    }
-    config_file = coarse_anchor_cfg.get("config_file")
+def _load_anchor_config(anchor_cfg: dict[str, Any]) -> dict[str, Any]:
+    config = {"default": {}, "wells": {}}
+    config_file = anchor_cfg.get("config_file")
     if config_file:
         path = _resolve_repo_path(config_file)
         if path.exists():
@@ -274,7 +276,7 @@ def _load_anchor_config(coarse_anchor_cfg: dict[str, Any]) -> dict[str, Any]:
             config["default"].update(dict(anchors.get("default") or {}))
             config["wells"].update(dict(anchors.get("wells") or {}))
     if not config["default"].get("well_top") or not config["default"].get("horizon"):
-        raise ValueError("coarse_anchor requires default.well_top and default.horizon.")
+        raise ValueError("coarse_correction.anchor config_file requires default.well_top and default.horizon.")
     return config
 
 
@@ -288,6 +290,172 @@ def _anchor_spec_for_well(anchor_config: dict[str, Any], well_name: str) -> dict
     spec.setdefault("event", "peak")
     spec.setdefault("twt_unit", "auto")
     return spec
+
+
+def _anchor_enabled_for_route(config: dict[str, Any], route: str) -> bool:
+    anchor_cfg = dict(config["coarse_correction"].get("anchor") or {})
+    if not as_bool(anchor_cfg.get("enabled", False)):
+        return False
+    return str(route) in {str(value) for value in anchor_cfg.get("apply_to_routes") or []}
+
+
+def _load_manual_shift_config(manual_cfg: dict[str, Any]) -> dict[str, Any]:
+    config = {
+        "default_ms": float(manual_cfg.get("default_ms", 0.0) or 0.0),
+        "by_route_ms": dict(manual_cfg.get("by_route_ms") or {}),
+        "wells_ms": {},
+    }
+    config_file = manual_cfg.get("config_file")
+    if config_file:
+        path = _resolve_repo_path(config_file)
+        if path.exists():
+            with path.open("r", encoding="utf-8") as fp:
+                file_config = yaml.safe_load(fp) or {}
+            shifts = dict(file_config.get("manual_shift") or file_config)
+            if "default_ms" in shifts:
+                config["default_ms"] = float(shifts.get("default_ms") or 0.0)
+            config["by_route_ms"].update(dict(shifts.get("by_route_ms") or {}))
+            config["wells_ms"].update(dict(shifts.get("wells_ms") or {}))
+    return config
+
+
+def _manual_shift_seconds(manual_shift_config: dict[str, Any], *, route: str, well_name: str) -> float:
+    shift_ms = float(manual_shift_config.get("default_ms", 0.0) or 0.0)
+    by_route = dict(manual_shift_config.get("by_route_ms") or {})
+    wells = dict(manual_shift_config.get("wells_ms") or {})
+    if route in by_route:
+        shift_ms = float(by_route[route] or 0.0)
+    for key, value in wells.items():
+        if str(key).strip().casefold() == well_name.strip().casefold():
+            shift_ms = float(value or 0.0)
+            break
+    return shift_ms / 1000.0
+
+
+def _shift_time_depth_table(table: grid.TimeDepthTable, shift_s: float) -> grid.TimeDepthTable:
+    shift = float(shift_s)
+    if abs(shift) <= 1e-12:
+        return table
+    if table.is_md_domain:
+        return grid.TimeDepthTable(twt=np.asarray(table.twt, dtype=np.float64) + shift, md=np.asarray(table.md, dtype=np.float64))
+    return grid.TimeDepthTable(twt=np.asarray(table.twt, dtype=np.float64) + shift, tvdss=np.asarray(table.tvdss, dtype=np.float64))
+
+
+def _anchor_position_for_plan(
+    *,
+    plan: WellTiePlan,
+    anchor_md_m: float,
+    trajectory: WellTrajectory | None,
+) -> tuple[float, float, str]:
+    if trajectory is not None:
+        position = trajectory.position_at_md(float(anchor_md_m))
+        return float(position["x_m"]), float(position["y_m"]), "trajectory_at_anchor_md"
+    if plan.surface_x is None or plan.surface_y is None:
+        raise ValueError("Plan has no valid surface XY for anchor sampling.")
+    return float(plan.surface_x), float(plan.surface_y), "surface_xy"
+
+
+def _sample_anchor_for_plan(
+    *,
+    plan: WellTiePlan,
+    survey: Any,
+    well_tops_df: pd.DataFrame,
+    anchor_config: dict[str, Any],
+    horizon_cache: dict[str, HorizonSurface],
+    data_root: Path,
+    trajectory: WellTrajectory | None = None,
+) -> dict[str, Any]:
+    spec = _anchor_spec_for_well(anchor_config, plan.well_name)
+    anchor_md_m = find_well_top_md(well_tops_df, well_name=plan.well_name, surface=str(spec["well_top"]))
+    anchor_x_m, anchor_y_m, anchor_position_source = _anchor_position_for_plan(
+        plan=plan,
+        anchor_md_m=float(anchor_md_m),
+        trajectory=trajectory,
+    )
+    inline_float, xline_float = survey.line_geometry.coord_to_line(float(anchor_x_m), float(anchor_y_m))
+    horizon_path = _resolve_data_path(spec["horizon"], data_root=data_root)
+    horizon_surface = _load_horizon_surface(horizon_path, horizon_cache)
+    horizon_sample = horizon_surface.sample_at_line(inline_float, xline_float)
+    raw_horizon_twt = float(horizon_sample["value"])
+    anchor_twt_s = normalize_twt_seconds(raw_horizon_twt, unit=str(spec.get("twt_unit", "auto")))
+    return {
+        "well_top": str(spec["well_top"]),
+        "horizon": repo_relative_path(horizon_path, root=REPO_ROOT),
+        "event": str(spec.get("event", "")),
+        "twt_unit": str(spec.get("twt_unit", "auto")),
+        "anchor_md_m": float(anchor_md_m),
+        "anchor_x_m": float(anchor_x_m),
+        "anchor_y_m": float(anchor_y_m),
+        "anchor_position_source": anchor_position_source,
+        "horizon_twt_raw": float(raw_horizon_twt),
+        "anchor_twt_s": float(anchor_twt_s),
+        "inline_float": float(inline_float),
+        "xline_float": float(xline_float),
+        "horizon_sample_method": str(horizon_sample["method"]),
+        "horizon_nearest_line_distance": float(horizon_sample["nearest_line_distance"]),
+        "horizon_nearest_inline": float(horizon_sample["nearest_inline"]),
+        "horizon_nearest_xline": float(horizon_sample["nearest_xline"]),
+    }
+
+
+def _coarse_report(*, anchor_shift_s: float, manual_shift_s: float, anchor_info: dict[str, Any] | None) -> dict[str, Any]:
+    total_shift_s = float(anchor_shift_s) + float(manual_shift_s)
+    return {
+        "coarse_anchor_shift_ms": float(anchor_shift_s) * 1000.0,
+        "coarse_manual_shift_ms": float(manual_shift_s) * 1000.0,
+        "coarse_total_shift_ms": float(total_shift_s) * 1000.0,
+        "coarse_anchor_applied": bool(anchor_info),
+        "coarse_manual_applied": bool(abs(float(manual_shift_s)) > 1e-12),
+    }
+
+
+def _with_report(prepared: PreparedTieWindow, values: dict[str, Any]) -> PreparedTieWindow:
+    report = dict(prepared.report)
+    report.update(values)
+    return replace(prepared, report=report)
+
+
+def _apply_coarse_correction_to_existing_tdt(
+    *,
+    plan: WellTiePlan,
+    table: grid.TimeDepthTable,
+    config: dict[str, Any],
+    survey: Any,
+    well_tops_df: pd.DataFrame,
+    anchor_config: dict[str, Any],
+    manual_shift_config: dict[str, Any],
+    horizon_cache: dict[str, HorizonSurface],
+    data_root: Path,
+    trajectory: WellTrajectory | None = None,
+) -> tuple[grid.TimeDepthTable, dict[str, Any], dict[str, Any] | None]:
+    anchor_shift_s = 0.0
+    anchor_info: dict[str, Any] | None = None
+    if _anchor_enabled_for_route(config, plan.route):
+        anchor_info = _sample_anchor_for_plan(
+            plan=plan,
+            survey=survey,
+            well_tops_df=well_tops_df,
+            anchor_config=anchor_config,
+            horizon_cache=horizon_cache,
+            data_root=data_root,
+            trajectory=trajectory,
+        )
+        anchor_tdt_twt_s = float(np.interp(float(anchor_info["anchor_md_m"]), table.md, table.twt))
+        anchor_shift_s = float(anchor_info["anchor_twt_s"]) - anchor_tdt_twt_s
+        anchor_info = {
+            **anchor_info,
+            "anchor_role": "shift_existing_tdt",
+            "tdt_twt_at_anchor_s": anchor_tdt_twt_s,
+            "anchor_shift_ms": anchor_shift_s * 1000.0,
+        }
+
+    manual_shift_s = _manual_shift_seconds(manual_shift_config, route=plan.route, well_name=plan.well_name)
+    total_shift_s = anchor_shift_s + manual_shift_s
+    return _shift_time_depth_table(table, total_shift_s), _coarse_report(
+        anchor_shift_s=anchor_shift_s,
+        manual_shift_s=manual_shift_s,
+        anchor_info=anchor_info,
+    ), anchor_info
 
 
 def _load_horizon_surface(path: Path, cache: dict[str, HorizonSurface]) -> HorizonSurface:
@@ -614,6 +782,9 @@ def _run_vertical_with_tdt(
     output_dir: Path,
     horizon_cache: dict[str, HorizonSurface],
     data_root: Path,
+    well_tops_df: pd.DataFrame,
+    anchor_config: dict[str, Any],
+    manual_shift_config: dict[str, Any],
 ) -> tuple[WellTieResult, dict[str, Any]]:
     if plan.surface_x is None or plan.surface_y is None:
         raise ValueError("Plan has no valid surface XY.")
@@ -629,6 +800,17 @@ def _run_vertical_with_tdt(
         horizon_cache=horizon_cache,
         data_root=data_root,
     )
+    table, coarse_report, anchor_info = _apply_coarse_correction_to_existing_tdt(
+        plan=plan,
+        table=table,
+        config=config,
+        survey=survey,
+        well_tops_df=well_tops_df,
+        anchor_config=anchor_config,
+        manual_shift_config=manual_shift_config,
+        horizon_cache=horizon_cache,
+        data_root=data_root,
+    )
     if not tdt_overlaps_window(table, target_window):
         raise RerouteToAnchor("tdt_no_target_window_overlap_reroute_anchor", target_window)
     prepared = prepare_tdt_with_sonic_extension(
@@ -637,6 +819,7 @@ def _run_vertical_with_tdt(
         window=target_window,
         min_tie_samples=int(config["reject"]["min_tie_samples"]),
     )
+    prepared = _with_report(prepared, coarse_report)
     return _run_tie_with_initial_table(
         plan=plan,
         survey=survey,
@@ -648,6 +831,8 @@ def _run_vertical_with_tdt(
         extra_seed={
             "initial_table_source": "time_depth_file",
             "time_depth_file": repo_relative_path(time_depth_file, root=REPO_ROOT),
+            "coarse_correction": coarse_report,
+            "anchor": anchor_info,
         },
     )
 
@@ -662,6 +847,7 @@ def _run_vertical_anchor_from_tops(
     output_dir: Path,
     well_tops_df: pd.DataFrame,
     anchor_config: dict[str, Any],
+    manual_shift_config: dict[str, Any],
     horizon_cache: dict[str, HorizonSurface],
     data_root: Path,
     rerouted_from: str | None = None,
@@ -669,22 +855,28 @@ def _run_vertical_anchor_from_tops(
 ) -> tuple[WellTieResult, dict[str, Any]]:
     if plan.surface_x is None or plan.surface_y is None:
         raise ValueError("Plan has no valid surface XY.")
-    if not as_bool(config["coarse_anchor"]["enabled"]):
-        raise ValueError("coarse_anchor.enabled is false; vertical_anchor_from_tops cannot build an initial TDT.")
-    if plan.route not in set(config["coarse_anchor"].get("apply_to_routes") or []):
-        raise ValueError(f"coarse_anchor.apply_to_routes does not include {plan.route}.")
+    if not _anchor_enabled_for_route(config, plan.route):
+        raise ValueError("coarse_correction.anchor must include vertical_anchor_from_tops to build an initial TDT.")
 
     input_las = _resolve_repo_path(plan.input_las)
     logset_md = load_vp_rho_logset_from_standard_las(input_las)
-    spec = _anchor_spec_for_well(anchor_config, plan.well_name)
-    anchor_md_m = find_well_top_md(well_tops_df, well_name=plan.well_name, surface=str(spec["well_top"]))
-    inline_float, xline_float = survey.line_geometry.coord_to_line(float(plan.surface_x), float(plan.surface_y))
-    horizon_path = _resolve_data_path(spec["horizon"], data_root=data_root)
-    horizon_surface = _load_horizon_surface(horizon_path, horizon_cache)
-    horizon_sample = horizon_surface.sample_at_line(inline_float, xline_float)
-    raw_horizon_twt = float(horizon_sample["value"])
-    anchor_twt_s = normalize_twt_seconds(raw_horizon_twt, unit=str(spec.get("twt_unit", "auto")))
-    table = build_tdt_from_anchor(logset_md, anchor_md_m=anchor_md_m, anchor_twt_s=anchor_twt_s)
+    anchor_info = _sample_anchor_for_plan(
+        plan=plan,
+        survey=survey,
+        well_tops_df=well_tops_df,
+        anchor_config=anchor_config,
+        horizon_cache=horizon_cache,
+        data_root=data_root,
+    )
+    table = build_tdt_from_anchor(
+        logset_md,
+        anchor_md_m=float(anchor_info["anchor_md_m"]),
+        anchor_twt_s=float(anchor_info["anchor_twt_s"]),
+    )
+    manual_shift_s = _manual_shift_seconds(manual_shift_config, route=plan.route, well_name=plan.well_name)
+    table = _shift_time_depth_table(table, manual_shift_s)
+    anchor_info = {**anchor_info, "anchor_role": "build_initial_tdt", "anchor_shift_ms": 0.0}
+    coarse_report = _coarse_report(anchor_shift_s=0.0, manual_shift_s=manual_shift_s, anchor_info=anchor_info)
     target_window = _target_tie_window_for_plan(
         plan=plan,
         survey=survey,
@@ -699,6 +891,7 @@ def _run_vertical_anchor_from_tops(
         min_tie_samples=int(config["reject"]["min_tie_samples"]),
         support_class="rerouted_to_anchor" if rerouted_from else "anchor_integrated",
     )
+    prepared = _with_report(prepared, coarse_report)
     return _run_tie_with_initial_table(
         plan=plan,
         survey=survey,
@@ -712,20 +905,9 @@ def _run_vertical_anchor_from_tops(
             "rerouted_from": rerouted_from or "",
             "reroute_reason": reroute_reason or "",
             "anchor": {
-                "well_top": str(spec["well_top"]),
-                "horizon": repo_relative_path(horizon_path, root=REPO_ROOT),
-                "event": str(spec.get("event", "")),
-                "twt_unit": str(spec.get("twt_unit", "auto")),
-                "anchor_md_m": float(anchor_md_m),
-                "horizon_twt_raw": float(raw_horizon_twt),
-                "anchor_twt_s": float(anchor_twt_s),
-                "inline_float": float(inline_float),
-                "xline_float": float(xline_float),
-                "horizon_sample_method": str(horizon_sample["method"]),
-                "horizon_nearest_line_distance": float(horizon_sample["nearest_line_distance"]),
-                "horizon_nearest_inline": float(horizon_sample["nearest_inline"]),
-                "horizon_nearest_xline": float(horizon_sample["nearest_xline"]),
+                **anchor_info,
             },
+            "coarse_correction": coarse_report,
         },
     )
 
@@ -740,6 +922,9 @@ def _run_deviated_with_tdt(
     output_dir: Path,
     horizon_cache: dict[str, HorizonSurface],
     data_root: Path,
+    well_tops_df: pd.DataFrame,
+    anchor_config: dict[str, Any],
+    manual_shift_config: dict[str, Any],
 ) -> tuple[WellTieResult, dict[str, Any]]:
     if plan.surface_x is None or plan.surface_y is None:
         raise ValueError("Plan has no valid surface XY.")
@@ -752,12 +937,25 @@ def _run_deviated_with_tdt(
 
     logset_md = load_vp_rho_logset_from_standard_las(input_las)
     table = load_petrel_time_depth_table(time_depth_file, domain="md")
+    trajectory = WellTrajectory.from_petrel_trace(trace_file).with_well_name(plan.well_name)
     target_window = _target_tie_window_for_plan(
         plan=plan,
         survey=survey,
         config=config,
         horizon_cache=horizon_cache,
         data_root=data_root,
+    )
+    table, coarse_report, anchor_info = _apply_coarse_correction_to_existing_tdt(
+        plan=plan,
+        table=table,
+        config=config,
+        survey=survey,
+        well_tops_df=well_tops_df,
+        anchor_config=anchor_config,
+        manual_shift_config=manual_shift_config,
+        horizon_cache=horizon_cache,
+        data_root=data_root,
+        trajectory=trajectory,
     )
     if not tdt_overlaps_window(table, target_window):
         raise ValueError("tdt_no_target_window_overlap")
@@ -768,13 +966,13 @@ def _run_deviated_with_tdt(
         window=target_window,
         min_tie_samples=int(config["reject"]["min_tie_samples"]),
     )
+    prepared = _with_report(prepared, coarse_report)
     sample_start = float(prepared.report["tie_window_start_s"])
     sample_end = float(prepared.report["tie_window_end_s"])
     sample_axis = survey.sample_axis("time")
     sample_idx_start, sample_idx_end = sample_axis.window_indices(sample_start, sample_end)
     twt_axis = sample_axis.values[sample_idx_start:sample_idx_end]
 
-    trajectory = WellTrajectory.from_petrel_trace(trace_file).with_well_name(plan.well_name)
     samples = sample_trajectory_on_twt(trajectory, prepared.table, twt_axis)
     trace_plan = build_nearest_trace_sample_plan(samples, survey)
     paths = _build_output_paths(output_dir, plan.well_name)
@@ -830,6 +1028,8 @@ def _run_deviated_with_tdt(
             "initial_table_source": "time_depth_file",
             "time_depth_file": repo_relative_path(time_depth_file, root=REPO_ROOT),
             "well_trace_file": repo_relative_path(trace_file, root=REPO_ROOT),
+            "coarse_correction": coarse_report,
+            "anchor": anchor_info,
             "trace_sampling": {
                 "method": "nearest",
                 "trajectory_outside_fraction": float(outside_fraction),
@@ -1089,12 +1289,15 @@ def main() -> None:
     if planned_to_run:
         from wtie.modeling.modeling import ConvModeler
 
+        anchor_cfg = dict(script_cfg["coarse_correction"].get("anchor") or {})
+        anchor_routes = set(anchor_cfg.get("apply_to_routes") or []) if as_bool(anchor_cfg.get("enabled", False)) else set()
         needs_anchor = any(
-            plan.route in {TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value, TieRoute.VERTICAL_WITH_TDT.value}
+            plan.route in ({TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value, TieRoute.VERTICAL_WITH_TDT.value} | anchor_routes)
             for plan in planned_to_run
         )
         well_tops_df = import_well_tops_petrel(well_tops_file) if needs_anchor else pd.DataFrame()
-        anchor_config = _load_anchor_config(dict(script_cfg["coarse_anchor"])) if needs_anchor else {}
+        anchor_config = _load_anchor_config(anchor_cfg) if needs_anchor else {}
+        manual_shift_config = _load_manual_shift_config(dict(script_cfg["coarse_correction"].get("manual_shift") or {}))
         horizon_cache: dict[str, HorizonSurface] = {}
         wavelet_extractor = _load_wavelet_extractor(model_path, params_path)
         modeler = ConvModeler()
@@ -1110,6 +1313,9 @@ def main() -> None:
                         output_dir=output_dir,
                         horizon_cache=horizon_cache,
                         data_root=data_root,
+                        well_tops_df=well_tops_df,
+                        anchor_config=anchor_config,
+                        manual_shift_config=manual_shift_config,
                     )
                 elif plan.route == TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value:
                     result, extra = _run_vertical_anchor_from_tops(
@@ -1121,6 +1327,7 @@ def main() -> None:
                         output_dir=output_dir,
                         well_tops_df=well_tops_df,
                         anchor_config=anchor_config,
+                        manual_shift_config=manual_shift_config,
                         horizon_cache=horizon_cache,
                         data_root=data_root,
                     )
@@ -1134,6 +1341,9 @@ def main() -> None:
                         output_dir=output_dir,
                         horizon_cache=horizon_cache,
                         data_root=data_root,
+                        well_tops_df=well_tops_df,
+                        anchor_config=anchor_config,
+                        manual_shift_config=manual_shift_config,
                     )
                 else:
                     raise NotImplementedError(f"Route is not implemented: {plan.route}")
@@ -1155,6 +1365,7 @@ def main() -> None:
                         data_root=data_root,
                         rerouted_from=plan.route,
                         reroute_reason=reroute.reason,
+                        manual_shift_config=manual_shift_config,
                     )
                 except Exception as exc:
                     reason = str(exc) or type(exc).__name__
@@ -1222,7 +1433,30 @@ def main() -> None:
         if anchor:
             anchor_rows.append({"well_name": well_name, **anchor, "initial_tdt_file": extra.get("initial_tdt_file", "")})
     anchor_report_path = output_dir / "anchor_report.csv"
-    pd.DataFrame.from_records(anchor_rows).to_csv(anchor_report_path, index=False)
+    anchor_report_columns = [
+        "well_name",
+        "well_top",
+        "horizon",
+        "event",
+        "twt_unit",
+        "anchor_md_m",
+        "anchor_x_m",
+        "anchor_y_m",
+        "anchor_position_source",
+        "horizon_twt_raw",
+        "anchor_twt_s",
+        "inline_float",
+        "xline_float",
+        "horizon_sample_method",
+        "horizon_nearest_line_distance",
+        "horizon_nearest_inline",
+        "horizon_nearest_xline",
+        "anchor_role",
+        "tdt_twt_at_anchor_s",
+        "anchor_shift_ms",
+        "initial_tdt_file",
+    ]
+    pd.DataFrame.from_records(anchor_rows, columns=anchor_report_columns).to_csv(anchor_report_path, index=False)
 
     run_summary = {
         "script": "well_auto_tie.py",

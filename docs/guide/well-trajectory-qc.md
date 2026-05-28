@@ -31,6 +31,7 @@ python scripts/well_trajectory_qc.py --output-dir /tmp/traj_test
 读取 Petrel 导出的井轨迹文本，提取 `MD`、`X`、`Y`、`Z`、`TVD` 五列必要数据，以及可选的 `DX`、`DY`、`AZIM`、`INCL`、`DLS`。
 
 解析失败的硬条件：
+
 - 文件缺少 `MD/X/Y/Z/TVD` 任一列
 - 有效轨迹点少于 2 个
 - MD 不单调递增
@@ -65,6 +66,7 @@ python scripts/well_trajectory_qc.py --output-dir /tmp/traj_test
 - 两个阈值之间的灰色地带 → `unknown`
 
 如果配置了地震工区，还会把每个轨迹点投影到 inline/xline，统计：
+
 - 井口和井底在工区内还是工区外
 - 全部轨迹点中有多大比例在工区内
 - 部分轨迹出界的井，按 `allow_partial_outside` 决定是警告还是硬失败

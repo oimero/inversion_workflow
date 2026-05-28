@@ -96,7 +96,7 @@ wells:
 
 - `global_priority`：定义每类中选 primary 的优先顺序。内置优先级（`CURVE_CATEGORY_PRIORITY`）仅含可信原始测井曲线，不含派生产品。
 - `primary`：直接指定某口井某类用哪条曲线。它的值使用**精确 mnemonic**（含 LASIO 重复曲线后缀如 `:1`），不会做规范化裁剪。
-- `disabled_curves`：跳过某些曲线，不参与分类和选择。支持含 LASIO 重复曲线后缀的精确名和基础名。填 `DT:1` 只禁用 `DT:1`；填 `DT` 会禁用 `DT`、`DT:1`、`DT:2` 等所有同名变体。下划线不是这里说的后缀，`DT_BAD` 是另一条独立 mnemonic，不会被 `DT` 禁用。
+- `disabled_curves`：跳过某些曲线，不参与分类和选择。支持含 LASIO 重复曲线后缀的精确名和基础名。填 `DT:1` 只禁用 `DT:1`；填 `DT` 会禁用 `DT`、`DT:1`、`DT:2` 等所有同名变体。
 - `force_category`：覆盖规则判断，将一条曲线强制归入指定类别。曲线名的精确名/基础名规则与 `disabled_curves` 一致。
 
 所有 override 均可追溯：分类结果中的 `classification_source` 字段会标记 `override`，`notes` 会记录具体原因。
@@ -110,7 +110,7 @@ wells:
 内置规则在 `cup.well.mnemonics.CURVE_CATEGORY_MNEMONICS` 中维护。每条曲线按 mnemonic 规范化后（大写、去前后空格、裁剪 LASIO 的 `:1`/`:2` 这类重复曲线后缀）与规则表匹配：
 
 - 匹配到**唯一**类别 → 直接归类，`classification_source = mnemonic_rule`
-- 匹配到**多个**类别 → 标记为 `ambiguous`，`confidence = 0`，不进入 primary 选择。触发条件是同一个规范化 mnemonic 同时出现在多个类别规则中；内置规则会避免这种情况，通常只会在自定义 `curve_schema_file` 把同一个简称放进多个类别时出现，例如把 `GR` 同时放进 `gamma_ray` 和 `resistivity`
+- 匹配到**多个**类别 → 标记为 `ambiguous`，`confidence = 0`，不进入 primary 选择。触发条件是同一个规范化 mnemonic 同时出现在多个类别规则中；内置规则会避免这种情况
 - 没匹配到任何类别 → 标记为 `unclassified`
 
 ### LASIO 后缀处理
@@ -205,6 +205,7 @@ LAS curve screen summary: 61 candidates, 38 passed, 22 partial, 1 failed, 38 LAS
 ### 第二步：看 `well_curve_screen.csv`
 
 按 `screen_status` 分组查看：
+
 - `passed` — 具备 p_sonic + density，已导出瘦身 LAS，进入第三步
 - `partial` — 有一些有用曲线但不满足 required，不导出 LAS，不进入第三步
 - `failed` — 完全缺少关键曲线，或 LAS 读取/导出失败

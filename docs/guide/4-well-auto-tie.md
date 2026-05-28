@@ -61,13 +61,11 @@ well_auto_tie:
   well_trace_dir: <well-trajectory-dir>
   well_tops_file: <well-tops-file>
 
-  interpretation:
+  target_interval:
     top_horizon: <top-horizon-file>
     bottom_horizon: <bottom-horizon-file>
-
-  target_interval:
-    top: <top-marker-name>
-    bottom: <bottom-marker-name>
+    top_name: <top-marker-name>       # 可选；不填则从 top_horizon 文件名推断
+    bottom_name: <bottom-marker-name> # 可选；不填则从 bottom_horizon 文件名推断
     margin_top_ms: 100.0
     margin_bottom_ms: 100.0
     twt_unit: auto
@@ -110,7 +108,9 @@ well_auto_tie:
 
 ### `target_interval`
 
-脚本用顶底解释层位构造标定目标窗。当前三条已落地路径都在井口 XY 处读取 `top_horizon` 和 `bottom_horizon` 的 TWT，再按 `margin_top_ms`、`margin_bottom_ms` 向上下拓展。
+脚本用顶底解释层位构造标定目标窗。推荐把解释层位文件直接写在 `target_interval.top_horizon` 和 `target_interval.bottom_horizon`，脚本会在井口 XY 处读取两个层位的 TWT，再按 `margin_top_ms`、`margin_bottom_ms` 向上下拓展。
+
+`top_name` 和 `bottom_name` 只是图件与报告里的显示名；不填时从 horizon 文件名推断。脚本只从 `target_interval.top_horizon` 和 `target_interval.bottom_horizon` 读取目标层位文件，不再维护另一套 `interpretation.top_horizon/bottom_horizon` 或 `target_interval.top/bottom` 字段。
 
 `target_crop_ms` 只控制成功标定后导出的候选子波长度，不是 auto-tie 输入窗口长度。
 
@@ -280,6 +280,8 @@ successful_tie_count
 - `synthetic_qc/tie_qc_<well>.csv`
 
 重点看优化后的 TDT 是否出现不合理扭曲，合成记录是否只在局部强行对齐，以及子波是否过窄、偏相或振铃异常。
+
+`time_depth_table.png` 只对比 initial/optimized TDT，不叠加目标层位线。`synthetic_match.png` 使用 auto-tie 综合窗口风格，并叠加目标层位线，方便直接检查井震匹配和层位位置的关系。
 
 ---
 

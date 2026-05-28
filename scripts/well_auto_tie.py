@@ -105,13 +105,16 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg.setdefault("well_tops_file", "raw/well_tops")
     merge_dict_defaults(
         script_cfg,
-        "interpretation",
-        {"top_horizon": "interpre/H3-1", "bottom_horizon": "interpre/H7-1"},
-    )
-    merge_dict_defaults(
-        script_cfg,
         "target_interval",
-        {"top": "H3-1", "bottom": "H7-1", "margin_top_ms": 100.0, "margin_bottom_ms": 100.0, "twt_unit": "auto"},
+        {
+            "top_horizon": "interpre/H3-1",
+            "bottom_horizon": "interpre/H7-1",
+            "top_name": None,
+            "bottom_name": None,
+            "margin_top_ms": 100.0,
+            "margin_bottom_ms": 100.0,
+            "twt_unit": "auto",
+        },
     )
     merge_dict_defaults(
         script_cfg,
@@ -317,6 +320,19 @@ def _target_horizon_name(value: str) -> str:
     return Path(text).name if ("/" in text or "\\" in text) else text
 
 
+def _target_horizon_spec(config: dict[str, Any], side: str) -> tuple[str, str]:
+    """Return horizon path-like value and display name for the target window."""
+    target_cfg = dict(config["target_interval"])
+    horizon_key = f"{side}_horizon"
+    name_key = f"{side}_name"
+    value = target_cfg.get(horizon_key)
+    if value is None:
+        raise ValueError(f"target_interval.{horizon_key} is required.")
+
+    name = target_cfg.get(name_key)
+    return str(value), str(name) if name is not None else _target_horizon_name(str(value))
+
+
 def _target_tie_window_for_plan(
     *,
     plan: WellTiePlan,
@@ -328,8 +344,8 @@ def _target_tie_window_for_plan(
     if plan.surface_x is None or plan.surface_y is None:
         raise ValueError("Plan has no valid surface XY.")
     target_cfg = dict(config["target_interval"])
-    top_value = str(target_cfg.get("top") or config["interpretation"]["top_horizon"])
-    bottom_value = str(target_cfg.get("bottom") or config["interpretation"]["bottom_horizon"])
+    top_value, top_name = _target_horizon_spec(config, "top")
+    bottom_value, bottom_name = _target_horizon_spec(config, "bottom")
     top_path = _target_horizon_path(top_value, data_root=data_root)
     bottom_path = _target_horizon_path(bottom_value, data_root=data_root)
     inline_float, xline_float = survey.line_geometry.coord_to_line(float(plan.surface_x), float(plan.surface_y))
@@ -347,8 +363,8 @@ def _target_tie_window_for_plan(
     if end_s <= start_s:
         raise ValueError(f"Invalid target tie window [{start_s}, {end_s}] for well {plan.well_name}.")
     return TargetTieWindow(
-        top_name=_target_horizon_name(top_value),
-        bottom_name=_target_horizon_name(bottom_value),
+        top_name=top_name,
+        bottom_name=bottom_name,
         top_twt_s=top_twt,
         bottom_twt_s=bottom_twt,
         start_s=start_s,
@@ -426,6 +442,35 @@ def _snap_seismic_sampling_if_close(seismic: Any, expected_dt_s: float, *, rtol:
         name=seismic.name,
         theta=getattr(seismic, "theta", 0),
     )
+
+
+def _draw_target_horizons(axes: Any, target_window: TargetTieWindow | None, *, y_scale: float = 1.0) -> None:
+    """Draw target horizon markers on TWT-domain QC axes."""
+    if target_window is None:
+        return
+    specs = [
+        (target_window.top_twt_s * y_scale, target_window.top_name, "tab:green"),
+        (target_window.bottom_twt_s * y_scale, target_window.bottom_name, "tab:blue"),
+    ]
+    flat_axes = np.ravel(axes).tolist()
+    for ax in flat_axes:
+        if not hasattr(ax, "get_xlim"):
+            continue
+        xmin, xmax = ax.get_xlim()
+        span = xmax - xmin
+        label_x = xmin + 0.03 * span if np.isfinite(span) and span != 0.0 else xmin
+        for y_ms, label, color in specs:
+            ax.axhline(y_ms, color=color, lw=0.9, alpha=0.75, linestyle="--")
+            ax.text(
+                label_x,
+                y_ms,
+                f" {label}",
+                va="center",
+                ha="left",
+                fontsize=8,
+                color=color,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.7, "pad": 1.0},
+            )
 
 
 def _source_at_twt(rows: pd.DataFrame, twt_s: float) -> str:
@@ -518,14 +563,11 @@ def _write_qc_figures(
         for _, part in rows.groupby(run_id, sort=False):
             source = str(part["source"].iloc[0])
             linestyle = "-" if source == "original_tdt" else "--"
-            color = "black" if source == "original_tdt" else "tab:blue"
+            color = "tab:blue"
             ax.plot(part["md_m"], part["twt_s"] * 1000.0, linestyle=linestyle, lw=1.0, color=color, label=source)
     else:
-        ax.plot(inputs_table.md, inputs_table.twt * 1000.0, lw=1.0, color="black", label="initial")
+        ax.plot(inputs_table.md, inputs_table.twt * 1000.0, lw=1.0, color="tab:blue", label="initial")
     ax.plot(outputs.table.md, outputs.table.twt * 1000.0, lw=1.0, color="tab:orange", label="optimized")
-    if target_window is not None:
-        ax.axhline(target_window.top_twt_s * 1000.0, color="tab:green", lw=0.8, alpha=0.7, label=target_window.top_name)
-        ax.axhline(target_window.bottom_twt_s * 1000.0, color="tab:red", lw=0.8, alpha=0.7, label=target_window.bottom_name)
     ax.invert_yaxis()
     ax.set_xlabel("MD (m)")
     ax.set_ylabel("TWT (ms)")
@@ -533,22 +575,8 @@ def _write_qc_figures(
     ax.legend(loc="best")
     _save_current_figure(paths["fig_tdt"])
 
-    t_ms = np.asarray(outputs.seismic.basis, dtype=np.float64) * 1000.0
-    fig, axes = plt.subplots(1, 3, figsize=(13, 5), sharey=True)
-    axes[0].plot(outputs.r.values, t_ms, lw=0.8, color="tab:purple")
-    axes[0].invert_yaxis()
-    axes[0].set_xlabel("Reflectivity")
-    axes[0].set_ylabel("TWT (ms)")
-    axes[0].grid(True, alpha=0.25)
-    axes[1].plot(seismic_norm, t_ms, lw=0.9, label="Seismic", color="black")
-    axes[1].plot(synthetic, t_ms, lw=0.9, label="Synthetic", color="tab:red")
-    axes[1].set_xlabel("Normalized amplitude")
-    axes[1].legend(loc="best")
-    axes[1].grid(True, alpha=0.25)
-    axes[2].plot(seismic_norm - synthetic, t_ms, lw=0.9, color="tab:gray")
-    axes[2].axvline(0.0, color="black", lw=0.8, alpha=0.5)
-    axes[2].set_xlabel("Residual")
-    axes[2].grid(True, alpha=0.25)
+    fig, axes = outputs.plot_tie_window(wiggle_scale=120000, figsize=(12.0, 7.5))
+    _draw_target_horizons(axes, target_window, y_scale=1.0)
     _save_current_figure(paths["fig_tie"])
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))

@@ -85,13 +85,13 @@ def export_vertical_tdt_to_petrel_checkshots(
     Raises
     ------
     ValueError
-        当 ``tdt`` 为 MD 域、存在非有限值、TWT 为负值或列长度不一致时抛出。
+        当 ``tdt`` 为 MD 域、存在非有限值、内部 TWT 为负值或列长度不一致时抛出。
 
     Notes
     -----
     - ``Z`` 为负值，单位 m。
     - ``MD`` 为正值，单位 m，并按约定计算: ``MD = |Z| + kb``。
-    - ``TWT`` 为非负值，单位 ms（由 ``tdt.twt`` 的秒值转换得到）。
+    - ``TWT`` 为负值，单位 ms（由内部正秒 ``tdt.twt`` 转换得到）。
     """
     output_file = Path(output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -101,12 +101,13 @@ def export_vertical_tdt_to_petrel_checkshots(
 
     z = -np.abs(np.asarray(tdt.tvdss, dtype=float))
     md = np.abs(z) + float(kb)
-    twt_ms = np.asarray(tdt.twt, dtype=float) * 1000.0
+    twt_s = np.asarray(tdt.twt, dtype=float)
+    twt_ms = -np.abs(twt_s) * 1000.0
 
-    if not np.isfinite(z).all() or not np.isfinite(md).all() or not np.isfinite(twt_ms).all():
+    if not np.isfinite(z).all() or not np.isfinite(md).all() or not np.isfinite(twt_s).all():
         raise ValueError("Z/MD/TWT 存在非有限值，无法导出。")
-    if (twt_ms < 0.0).any():
-        raise ValueError("TWT 必须为非负值（ms）。")
+    if (twt_s < 0.0).any():
+        raise ValueError("内部 TWT 必须为非负值（s）。")
 
     n = z.size
     if md.size != n or twt_ms.size != n:

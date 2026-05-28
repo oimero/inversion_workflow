@@ -6,7 +6,7 @@
 边界说明
 --------
 - 本模块不负责 auto-tie 优化策略本身，仅提供数据准备层。
-- Petrel checkshot 文本解析由 ``cup.petrel.load.read_petrel_checkshots_dataframe`` 完成；
+- Petrel checkshot 文本解析由 ``cup.petrel.load.import_petrel_checkshots_dataframe`` 完成；
   本模块只负责把解析表转换为项目内 ``TimeDepthTable``。
 - TVDSS/MD 口径差异由调用方在进入本模块前统一。
 
@@ -27,7 +27,7 @@ from typing import Any, Literal, Sequence
 import numpy as np
 import pandas as pd
 
-from cup.petrel.load import read_petrel_checkshots_dataframe
+from cup.petrel.load import import_petrel_checkshots_dataframe
 from cup.well.assets import normalize_well_name
 from wtie.processing import grid
 
@@ -66,7 +66,7 @@ class PreparedTieWindow:
 
 def _read_petrel_checkshot_dataframe(path: Path) -> pd.DataFrame:
     """委托 Petrel 格式 Adapter 解析 checkshot 文本。"""
-    return read_petrel_checkshots_dataframe(path)
+    return import_petrel_checkshots_dataframe(path)
 
 
 def load_petrel_time_depth_table(path: str | Path, *, domain: Literal["md", "tvdss"] = "md") -> grid.TimeDepthTable:

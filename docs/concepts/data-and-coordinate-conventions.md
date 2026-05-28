@@ -1,91 +1,80 @@
 # 数据与坐标约定
 
-## TWT（两程时）
+这份文件描述数据、入口函数、坐标、单位等内容的约定。脚本之间的 CSV 字段契约见[核心 CSV 契约](csv-contracts.md)。
 
-- 时间域主链内部统一使用**正秒**。
-- Petrel 导出可能是负毫秒，读取时通过 `abs(twt_ms) / 1000.0` 归一化。
-- `cup.well.td.load_petrel_time_depth_table()` 是 Petrel 时深表进入项目内 TDT 的统一入口。
+## 井头、井分层、地震解释层位
 
-## TVDSS 与 Petrel `Z`
+- Petrel 井头、井分层、地震解释层位读取入口：`cup.petrel.load.import_well_heads_petrel()`、`import_well_tops_petrel()`、`import_interpretation_petrel()`。
 
-- Petrel checkshot adapter 使用 `abs(Z)` 表示向下为正的 TVDSS/depth below MSL。
-- `WellTrajectory.tvdss_m = tvd_kb_m - kb_m`，更接近 signed TVDSS（井口附近可能为负）。
-- `export_vertical_tdt_to_petrel_checkshots` 写 `-abs(tdt.tvdss)`。
-- **斜井路径混用前必须显式统一口径**，不要在第四步隐式混用两种约定。
+## 井名
+
+- 井名匹配键入口：`cup.well.assets.normalize_well_name(name)`。
+    - 处理等价于 `str(name).strip().casefold()`：转字符串、去首尾空白、做大小写折叠。
+    - 简单理解：`" A1 "`、`"A1"`、`"a1"` 会被当成同一口井。
+- 文件查找、DataFrame join、lookup dict 都用规范化键；输出 CSV 保留原始显示井名。
+- 同一资产目录或表格内若出现 `A1/a1` 这类冲突，应在导入阶段报错，不能静默覆盖。
+
+## 井曲线
+
+- LAS 单曲线读取入口：`cup.well.las.read_las_curve(path, mnemonic)`。
+    - 只按用户指定 mnemonic 读曲线，不做单位转换、不做语义分类。
+    - 匹配顺序是精确 mnemonic 优先，再用 LASIO 的 `:1` / `:2` 后缀规范化兜底；兜底命中多条时必须显式指定精确名。
+- 标准预处理 LAS 读取入口：`cup.well.las.load_vp_rho_logset_from_standard_las(path)`。
+    - 只读取含 `DT_USM` 和 `RHO_GCC` 的标准 LAS，并转换成 `Vp/Rho` 的 `grid.LogSet`。
+
+## 时深表
+
+- 读取入口：`cup.well.td.load_petrel_time_depth_table(path, domain="md" | "tvdss")`。
+- Petrel 导出的时深表常见口径：
+    - `TWT`：文件中为负毫秒。
+    - `MD`：文件中为正米，向下为正。
+    - `Z`：文件中为负米，表示地下深度。
+- 工作流内部统一转换为：
+    - `TimeDepthTable.twt`：正秒。
+    - `TimeDepthTable.md`：正米，向下为正，仅在 `domain="md"` 时存在。
+    - `TimeDepthTable.tvdss`：正米，向下为正，仅在 `domain="tvdss"` 时存在。
+
+## 井轨迹 TVDSS
+
+- 轨迹读取入口：`cup.well.trajectory.WellTrajectory.from_petrel_trace(path)`。
+- 轨迹里的 `tvdss_m` 不是从 Petrel checkshots 的 `Z` 字段读取来的，而是由轨迹点计算：
+    - `tvdss_m = tvd_kb_m - kb_m`
+- 含义：轨迹点相对海平面的垂向位置，海平面以下为正，海平面以上为负。
+- 因此井口或浅部轨迹点的 `tvdss_m` 可以为负。
+- 易错点：
+    - `TimeDepthTable.tvdss` 是时深表深度轴，当前通过 `abs(Z)` 进入项目，通常只服务地下目标层。
+    - `WellTrajectory.tvdss_m` 是轨迹几何事实，保留海平面上下的符号。
+    - 深部目标层通常二者同为正值；浅部不能直接混用。
 
 ## 地震工区几何
 
-- `geometry["inline_step"]` / `geometry["xline_step"]` 是线号步长，**不是 XY 米制间距**，也不保证为 1。
-- 最近道吸附使用轴吸附公式：`line_min + round((line_float - line_min) / line_step) * line_step`。
-- 物理距离必须通过 `SurveyLineGeometry.line_to_coord()` 或已经构建好的 XY 网格计算。
+- 井旁道读取入口：`cup.seismic.survey.open_survey()`。
+    - 返回 `SurveyContext`，用 `survey.read_trace_at_xy(x, y, domain="time" | "depth")` 读取井旁道。
+    - 旧的 `cup.petrel.load.import_seismic()` 只读取整块 3D 体为数组，主要服务深度学习数据准备；井震标定和井位采样不要用它取井旁道。
+- 工区几何入口：`survey.line_geometry`，类型为 `cup.seismic.geometry.SurveyLineGeometry`。
+- `geometry["inline_step"]` / `geometry["xline_step"]` 是线号步长，不是 XY 米制间距。物理距离必须通过 `SurveyLineGeometry.line_to_coord()` 或已构建的 XY 网格计算。
+- 最近道吸附公式：`line_min + round((line_float - line_min) / line_step) * line_step`。
+    - 它用于 `nearest_inline`、`nearest_xline`、同道冲突检查、轨迹点落道报告。
+- 井旁道双线性插值公式：先由 `SurveyLineGeometry.coord_to_index(x, y)` 得到浮点 index `(i, j)`，令 `wi = i - floor(i)`、`wj = j - floor(j)`，则：
 
-## 井名规范化
-
-- 项目内统一使用 `normalize_well_name(name)` 作为匹配键：`str(name).strip().casefold()`。
-- 所有文件查找、DataFrame join、lookup dict 均使用规范化键。
-
-## 核心 CSV 契约
-
-以下 CSV 文件是脚本之间的数据契约接口：
-
-### `well_inventory.csv`
-
-| 关键字段 | 含义 |
-|----------|------|
-| `well_name` | 井名 |
-| `has_well_head` / `has_las` / `has_well_trace` / `has_time_depth` / `has_well_tops` | 资产存在性 |
-| `surface_x` / `surface_y` | 井口坐标 |
-| `bottom_x` / `bottom_y` | 底孔坐标 |
-| `survey_position` | 工区位置（inside / near_outside / outside） |
-| `wellbore_class` | 井型初分（vertical / deviated / unknown） |
-| `inventory_status` | 可用状态 |
-
-### `well_curve_screen.csv`
-
-| 关键字段 | 含义 |
-|----------|------|
-| `well_name` | 井名 |
-| `screen_status` | passed / partial / failed |
-| `has_p_sonic` / `has_density` / `has_caliper` | 可用性 |
-| `primary_p_sonic` / `primary_density` | 主曲线 mnemonic |
-| `exported_las` | 筛选后 LAS 路径 |
-
-### `well_preprocess_status.csv`
-
-| 关键字段 | 含义 |
-|----------|------|
-| `well_name` | 井名 |
-| `preprocess_status` | passed / failed |
-| `usable_p_sonic` / `usable_density` / `usable_caliper` | 预处理后可用性 |
-| `preprocessed_las` | 预处理后 LAS 路径 |
-
-### `well_trajectory_qc.csv`
-
-| 关键字段 | 含义 |
-|----------|------|
-| `trajectory_status` | passed / warning / failed / missing |
-| `wellbore_class_initial` | 井头初分 |
-| `wellbore_class_qc` | 轨迹复核后井型 |
-| `class_changed` | 初分与复核是否不一致 |
-
-### `well_tie_plan.csv`
-
-| 关键字段 | 含义 |
-|----------|------|
-| `route` | 分配的路由类型 |
-| `route_status` | planned / skipped_disabled / rejected |
-| `wellbore_class_qc` | 供路由决策的井型 |
+```text
+trace =
+  (1 - wi) * (1 - wj) * trace00
+  + (1 - wi) * wj       * trace01
+  + wi       * (1 - wj) * trace10
+  + wi       * wj       * trace11
+```
 
 ## 单位约定
 
 | 物理量 | 单位 | 说明 |
 |--------|------|------|
-| TWT | s | 正秒，内部统一 |
-| 深度 MD / TVDKB | m | 向下为正 |
-| Petrel TDT 的 TVDSS / `Z` 适配值 | m | 当前使用 `abs(Z)`，向下为正 |
-| `WellTrajectory.tvdss_m` | m | `tvd_kb_m - kb_m`，可为负；斜井路径混用前必须显式转换 |
-| 速度 (Vp / Vs) | m/s | 内部统一 |
-| 密度 (Rho) | g/cm³ | 内部统一 |
-| KB 高程 | m | 正值 |
-| 频率 | Hz | |
-| 采样间隔 (dt / dz) | s / m | |
+| TWT | s | 内部正秒 |
+| MD / TVDKB | m | 向下为正 |
+| 内部 TDT 的 TVDSS | m | 向下为正 |
+| 时间采样间隔 `dt_s` | s | 地震、子波、TWT 域曲线采样间隔 |
+| 深度采样间隔 `dz_m` | m | 深度域地震或深度轴曲线采样间隔 |
+| 声波时差 `DT_USM` | us/m | 第三步预处理后的纵波慢度曲线 |
+| 密度 `RHO_GCC` | g/cm3 | 第三步预处理后的密度曲线 |
+| 速度 `Vp/Vs` | m/s | 工作流内部属性 |
+| 密度 `Rho` | g/cm3 | 工作流内部属性 |

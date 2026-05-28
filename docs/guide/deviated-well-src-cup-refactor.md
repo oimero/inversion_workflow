@@ -113,7 +113,7 @@ anchor_weight[n_anchor_trace, n_sample]
 
 这是斜井重构里最容易错一个 KB 的地方，必须作为 Module Interface 的一部分固定下来。
 
-旧入口 `cup.petrel.load.old_import_checkshots_petrel(depth_domain="tvdss")` 会把 Petrel checkshots 的 `Z` 取绝对值后放进 `grid.TimeDepthTable(tvdss=...)`；`export_vertical_tdt_to_petrel_checkshots()` 又把 `tdt.tvdss` 写成负的 Petrel `Z`，并用 `MD = |Z| + KB` 导出。这说明当前代码里的 `TimeDepthTable.tvdss` 实际是“向下为正的 TVDSS/depth below MSL”口径，而不是严格数学符号的海拔坐标。
+`cup.well.td.load_petrel_time_depth_table(domain="tvdss")` 会把 Petrel checkshots 的 `Z` 取绝对值后放进 `grid.TimeDepthTable(tvdss=...)`；`export_vertical_tdt_to_petrel_checkshots()` 又把 `tdt.tvdss` 写成负的 Petrel `Z`，并用 `MD = |Z| + KB` 导出。这说明当前代码里的 `TimeDepthTable.tvdss` 实际是“向下为正的 TVDSS/depth below MSL”口径，而不是严格数学符号的海拔坐标。
 
 因此新 `WellTrajectory` 不应让脚本散写 `tvdss = tvd_kb - kb` 或 `tvdss = kb - z`。建议在 `cup.well.trajectory` 中集中实现：
 

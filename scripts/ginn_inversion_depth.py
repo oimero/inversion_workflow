@@ -153,7 +153,7 @@ def _sample_axis_depth_m(geometry: dict[str, Any]) -> np.ndarray:
 
 
 def _bilinear_trace_from_volume(volume: np.ndarray, survey_ctx: Any, x: float, y: float) -> np.ndarray:
-    i_float, j_float = survey_ctx.coord_to_index(x, y)
+    i_float, j_float = survey_ctx.line_geometry.coord_to_index(x, y)
     i_float = float(np.clip(i_float, 0.0, volume.shape[0] - 1.0))
     j_float = float(np.clip(j_float, 0.0, volume.shape[1] - 1.0))
     i0 = int(np.floor(i_float))

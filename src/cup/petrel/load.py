@@ -2,7 +2,7 @@
 
 本模块负责读取 SEG-Y/ZGY 地震体，以及 Petrel 导出的
 checkshots / well heads / well tops / interpretation 文本，
-并转换为项目内部 ``wtie.processing.grid`` 对象或 ``pandas.DataFrame``。
+并转换为项目内部数组或 ``pandas.DataFrame``。
 
 边界说明
 --------
@@ -13,10 +13,9 @@ checkshots / well heads / well tops / interpretation 文本，
 核心公开对象
 ------------
 1. import_seismic: 读取 3D SEG-Y 或 ZGY 地震体。
-2. read_petrel_checkshots_dataframe: 将 Petrel checkshot 文本解析为表格。
+2. import_petrel_checkshots_dataframe: 将 Petrel checkshot 文本解析为表格。
 3. import_well_heads_petrel / import_well_tops_petrel / import_interpretation_petrel:
    读取 Petrel 文本结果。
-4. old_import_checkshots_petrel: 旧式 checkshot 到 TimeDepthTable 入口。
 """
 
 from __future__ import annotations
@@ -28,8 +27,6 @@ from typing import List, Optional
 
 import numpy as np
 import pandas as pd
-
-from wtie.processing import grid
 
 _INTERPRETATION_LINE_PATTERN = re.compile(
     r"^\s*INLINE\s*:\s*([+-]?\d+)\s+XLINE\s*:\s*([+-]?\d+)\s+"
@@ -179,7 +176,7 @@ def _warn_if_petrel_rows_skipped(
     )
 
 
-def read_petrel_checkshots_dataframe(path: Path) -> pd.DataFrame:
+def import_petrel_checkshots_dataframe(path: Path) -> pd.DataFrame:
     """读取 Petrel checkshot / 时深表文本并返回标准列名 DataFrame。
 
     这是项目内 Petrel checkshot 文本的统一公共解析器。它处理
@@ -292,101 +289,6 @@ def read_petrel_checkshots_dataframe(path: Path) -> pd.DataFrame:
 
     df = df.rename(columns=_COLUMN_ALIASES)
     return df[[c for c in ["x_m", "y_m", "z_m", "md_m", "twt_ms", "well_name", "average_velocity", "interval_velocity"] if c in df.columns]]
-
-
-def _parse_checkshots_petrel_dataframe(checkshots_file: Path) -> pd.DataFrame:
-    """旧兼容包装：读取 Petrel checkshot 文本并应用旧单位约定。
-
-    本函数仅为 ``old_import_checkshots_petrel`` 保留。新调用方应直接使用
-    ``read_petrel_checkshots_dataframe``。
-    """
-    df = read_petrel_checkshots_dataframe(checkshots_file)
-    df["z_m"] = np.abs(df["z_m"].to_numpy(dtype=np.float64))
-    df["twt_s"] = np.abs(df["twt_ms"].to_numpy(dtype=np.float64)) / 1000.0
-    return df
-
-
-def _monotonic_checkshot_arrays(
-    df: pd.DataFrame,
-    *,
-    depth_domain: str,
-    source: Path,
-) -> tuple[np.ndarray, np.ndarray]:
-    depth_col = "md_m" if depth_domain == "md" else "z_m"
-    depth = df[depth_col].to_numpy(dtype=float, copy=False)
-    twt = df["twt_s"].to_numpy(dtype=float, copy=False)
-
-    finite = np.isfinite(depth) & np.isfinite(twt)
-    depth = depth[finite]
-    twt = twt[finite]
-    if depth.size < 2:
-        raise ValueError(f"Petrel checkshots has fewer than 2 valid samples: {source}")
-
-    order = np.argsort(depth)
-    depth = depth[order]
-    twt = twt[order]
-
-    unique_depth, unique_indices = np.unique(depth, return_index=True)
-    depth = unique_depth
-    twt = twt[unique_indices]
-    if depth.size < 2:
-        raise ValueError(f"Petrel checkshots has fewer than 2 unique depth samples: {source}")
-
-    start = int(np.nanargmin(twt))
-    depth = depth[start:]
-    twt = twt[start:]
-    keep = np.zeros(twt.shape, dtype=bool)
-    last_twt = -np.inf
-    for index, value in enumerate(twt):
-        if value > last_twt + 1e-9:
-            keep[index] = True
-            last_twt = float(value)
-    depth = depth[keep]
-    twt = twt[keep]
-    if depth.size < 2:
-        raise ValueError(f"Petrel checkshots has fewer than 2 strictly increasing TWT samples: {source}")
-    return depth, twt
-
-
-def old_import_checkshots_petrel(checkshots_file: Path, depth_domain: str = "md") -> grid.TimeDepthTable:
-    """旧式入口：导入 Petrel checkshots/时深表文本并转换为 TimeDepthTable。
-
-    新工作流应优先使用 ``cup.well.td.load_petrel_time_depth_table``。
-
-    Parameters
-    ----------
-    checkshots_file : Path
-        Petrel 导出的 checkshots 文本路径。
-    depth_domain : str, default="md"
-        深度域类型，支持 ``"md"`` 与 ``"tvdss"``。
-
-    Returns
-    -------
-    grid.TimeDepthTable
-        统一单位后的时深关系对象。``TWT`` 单位固定为 s，深度单位固定为 m。
-
-    Raises
-    ------
-    ValueError
-        当 ``depth_domain`` 非法时抛出。
-
-    Warns
-    -----
-    UserWarning
-        当存在列数不足而被跳过的数据行时发出警告，警告中会附带行号、
-        token 数与原始行文本。
-    """
-    depth_domain = str(depth_domain).strip().lower()
-    if depth_domain not in {"md", "tvdss"}:
-        raise ValueError(f"Unsupported depth_domain: {depth_domain}. Expect 'md' or 'tvdss'.")
-
-    checkshots_file = Path(checkshots_file)
-    df = _parse_checkshots_petrel_dataframe(checkshots_file)
-    depth, twt = _monotonic_checkshot_arrays(df, depth_domain=depth_domain, source=checkshots_file)
-    if depth_domain == "md":
-        return grid.TimeDepthTable(twt=twt, md=depth)
-
-    return grid.TimeDepthTable(twt=twt, tvdss=depth)
 
 
 def import_well_heads_petrel(well_heads_file: Path) -> pd.DataFrame:

@@ -1,5 +1,5 @@
-site_name: xihu workflow standardize
-site_description: 时间域井震工作流、井资产盘点、LAS 曲线筛选、测井预处理、井轨迹 QC、井震自动标定
+site_name: inversion workflow
+site_description: 反演工作流
 repo_name: inversion_workflow
 
 theme:

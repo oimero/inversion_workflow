@@ -308,21 +308,6 @@ Log preprocess summary: 38 step2-passed wells, 35 passed, 3 failed, 35 LAS expor
 
 ---
 
-## 与前后步骤的约定
-
-**上游（第二步）：**
-- 必须提供 `well_curve_screen.csv`（含 `las_file` 列指向原始 LAS）。
-- 必须提供 `curve_classification/*.json`（来自第二步的逐井分类详情）。
-- 瘦身 LAS 用于校验存在性，原始 LAS 用于实际数据加载。
-
-**下游（第四步）：**
-- 读取 `well_preprocess_status.csv` 判断 `usable_p_sonic` 和 `usable_density`。
-- 读取 `preprocessed_las/*.las` 获取标准曲线。
-- 构造 `LogSet` 时必须将 `DT_USM` 显式转为 `Vp(m/s)`。
-- 斜井路径由井轨迹文件和第四步轨迹 QC 决定，LAS 井径曲线（`CALI`）只服务井眼质量评估。
-
----
-
 ## 留到第二轮
 
 - 单位错配软提示是否自动纠正还是只报告。

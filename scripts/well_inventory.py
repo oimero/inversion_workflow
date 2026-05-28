@@ -104,7 +104,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     )
     script_cfg.setdefault("near_survey_threshold_m", 500.0)
     script_cfg.setdefault("vertical_bottom_offset_threshold_m", 30.0)
-    script_cfg.setdefault("platform_cluster_threshold_m", 10.0)
+    script_cfg.setdefault("platform_cluster_threshold_m", 12.5)
     script_cfg.setdefault("dense_well_neighbor_threshold_m", 150.0)
     return script_cfg
 

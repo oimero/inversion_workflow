@@ -69,7 +69,7 @@ well_inventory:
 
 **注意：这是初分，仅依据 Petrel 井头导出中的 `Bottom hole X/Y` 字段。** Petrel 导出的底孔坐标精度有限（可能四舍五入到整米）。如果后续发现大量假阳性直井或假阴性斜井，调整此值；最终应以第四步轨迹文件复核后的井型为准。
 
-### `platform_cluster_threshold_m`（默认 10.0）
+### `platform_cluster_threshold_m`（默认 12.5）
 
 同平台井的判定半径。井口距离 ≤ 此值的井会通过连通分量算法聚合成 `well_clusters.csv`。同一平台的多口斜井通常是有意设计的钻井方案，不属于"冲突"。
 

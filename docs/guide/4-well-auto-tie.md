@@ -11,7 +11,7 @@
 ```bash
 python scripts/well_auto_tie.py
 python scripts/well_auto_tie.py --config experiments/common.yaml
-python scripts/well_auto_tie.py --well BA6S
+python scripts/well_auto_tie.py --well <well-name>
 python scripts/well_auto_tie.py --output-dir scripts/output/well_auto_tie_test
 ```
 
@@ -31,7 +31,7 @@ python scripts/well_auto_tie.py --output-dir scripts/output/well_auto_tie_test
 | 第二步 | `well_curve_screen.csv` | 保留曲线筛选审计信息 |
 | 第三步 | `well_preprocess_status.csv`、`preprocessed_las/*.las` | 判断曲线是否可用，并读取标准 `DT_USM`、`RHO_GCC` |
 | 轨迹 QC | `well_trajectory_qc.csv` | 优先使用轨迹复核后的井型 |
-| 数据目录 | `time_depth_table`、`all_well_trace`、`raw/well_tops` | 时深表、Petrel 井轨迹、井分层 |
+| 数据目录 | 时深表目录、井轨迹目录、井分层文件 | 时深表、Petrel 井轨迹、井分层 |
 | 地震数据 | ZGY 或 SEG-Y 体、解释层位 | 读取井旁/轨迹地震道和目标时间窗 |
 
 如果没有找到最新的 `well_trajectory_qc_*` 输出，脚本仍可运行，但斜井/直井判定会更多依赖第一步的井头底孔初分。
@@ -57,23 +57,23 @@ well_auto_tie:
   preprocessed_las_dir: null
   trajectory_qc_file: null
 
-  time_depth_dir: time_depth_table
-  well_trace_dir: all_well_trace
-  well_tops_file: raw/well_tops
+  time_depth_dir: <time-depth-dir>
+  well_trace_dir: <well-trajectory-dir>
+  well_tops_file: <well-tops-file>
 
   interpretation:
-    top_horizon: interpre/H3-1
-    bottom_horizon: interpre/H7-1
+    top_horizon: <top-horizon-file>
+    bottom_horizon: <bottom-horizon-file>
 
   target_interval:
-    top: H3-1
-    bottom: H7-1
+    top: <top-marker-name>
+    bottom: <bottom-marker-name>
     margin_top_ms: 100.0
     margin_bottom_ms: 100.0
     twt_unit: auto
 
   seismic:
-    file: raw/obn-clipped-240-912-872-1544.zgy
+    file: <seismic-volume-file>
     type: zgy
 
   enabled_routes:
@@ -116,7 +116,7 @@ well_auto_tie:
 
 ### `coarse_anchor`
 
-`vertical_anchor_from_tops` 必须使用锚点配置。当前默认用 `H3-1` 井分层 MD 对齐 `H3-1` 地震解释层位 TWT，作为声波积分的绝对时间基准。
+`vertical_anchor_from_tops` 必须使用锚点配置。通常做法是选择一个目标层位或可靠标志层，用该井分层 MD 对齐对应地震解释层位 TWT，作为声波积分的绝对时间基准。
 
 有时深表路径默认不使用锚点粗校正。若要对 `vertical_with_tdt` 或 `deviated_with_tdt` 做整体 TWT shift，必须显式把对应 route 加入 `coarse_anchor.apply_to_routes`，并在跑批前单独验证。
 

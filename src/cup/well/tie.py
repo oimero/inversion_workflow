@@ -107,7 +107,21 @@ def _string_value(value: Any) -> str:
 def _build_lookup(df: pd.DataFrame) -> dict[str, pd.Series]:
     if df.empty or "well_name" not in df.columns:
         return {}
-    return {normalize_well_name(row["well_name"]): row for _, row in df.iterrows()}
+    lookup: dict[str, pd.Series] = {}
+    display_by_key: dict[str, str] = {}
+    for _, row in df.iterrows():
+        display = _string_value(row["well_name"])
+        if not display:
+            continue
+        key = normalize_well_name(display)
+        previous = display_by_key.get(key)
+        if previous is not None:
+            raise ValueError(
+                f"Duplicate well_name after normalization in workflow CSV: {previous!r} and {display!r}."
+            )
+        lookup[key] = row
+        display_by_key[key] = display
+    return lookup
 
 
 def _path_for_lookup(lookup: Mapping[str, Path], well_name: str) -> str:

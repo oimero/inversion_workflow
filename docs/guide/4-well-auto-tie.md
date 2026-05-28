@@ -102,7 +102,7 @@ well_auto_tie:
 
 ### `target_interval`
 
-脚本在井口 XY 处读取顶底解释层位的 TWT，加上 `margin_top_ms` 和 `margin_bottom_ms` 的冗余，构成标定目标窗。层位名从文件名自动推断。
+脚本在井口 XY 处读取顶底解释层位的 TWT，加上 `margin_top_ms` 和 `margin_bottom_ms` 的冗余，构成标定目标窗。报告里的层位名从文件名自动推断，便于追溯输入；图件里的目标层位线只标注 `top` / `bottom`。
 
 ### `coarse_correction`
 
@@ -120,6 +120,8 @@ anchor_shift_s = horizon_twt_at_this_well_anchor_xy - interp(petrel_tdt, anchor_
 shifted_tdt.twt = petrel_tdt.twt + anchor_shift_s + manual_shift_s
 ```
 
+这里要求 `anchor_md` 落在 Petrel TDT 的 MD 范围内；否则脚本会失败，不会把锚点夹到 TDT 端点去估算 shift。
+
 对 `vertical_anchor_from_tops`，锚点不是“平移已有 TDT”，而是用于从声波曲线积分建立初始 TDT；随后仍会叠加 `manual_shift_s`。
 
 锚点选择规则：
@@ -128,6 +130,7 @@ shifted_tdt.twt = petrel_tdt.twt + anchor_shift_s + manual_shift_s
 - 锚点文件里的 `anchors.wells.<well-name>` 可以为单井覆盖 `well_top`、`horizon`、`event`、`twt_unit`。
 - 直井锚点的解释层位 TWT 在井口 XY 处读取。
 - 斜井 `deviated_with_tdt` 如果启用锚点粗标定，解释层位 TWT 在锚点 MD 对应的轨迹 XY 处读取。
+- `event` 目前只写入 `anchor_report.csv` 作为审计信息，不参与层位采样或 TWT 修正。
 
 锚点文件形如：
 

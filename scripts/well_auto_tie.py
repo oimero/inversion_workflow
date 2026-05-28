@@ -109,8 +109,6 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
         {
             "top_horizon": "interpre/H3-1",
             "bottom_horizon": "interpre/H7-1",
-            "top_name": None,
-            "bottom_name": None,
             "margin_top_ms": 100.0,
             "margin_bottom_ms": 100.0,
             "twt_unit": "auto",
@@ -440,7 +438,15 @@ def _apply_coarse_correction_to_existing_tdt(
             data_root=data_root,
             trajectory=trajectory,
         )
-        anchor_tdt_twt_s = float(np.interp(float(anchor_info["anchor_md_m"]), table.md, table.twt))
+        table_md = np.asarray(table.md, dtype=np.float64)
+        table_twt = np.asarray(table.twt, dtype=np.float64)
+        anchor_md = float(anchor_info["anchor_md_m"])
+        if anchor_md < float(table_md[0]) or anchor_md > float(table_md[-1]):
+            raise ValueError(
+                f"Anchor MD {anchor_md} is outside TDT MD range [{table_md[0]}, {table_md[-1]}] "
+                f"for well {plan.well_name}; cannot apply anchor shift to existing TDT."
+            )
+        anchor_tdt_twt_s = float(np.interp(anchor_md, table_md, table_twt))
         anchor_shift_s = float(anchor_info["anchor_twt_s"]) - anchor_tdt_twt_s
         anchor_info = {
             **anchor_info,
@@ -492,13 +498,11 @@ def _target_horizon_spec(config: dict[str, Any], side: str) -> tuple[str, str]:
     """Return horizon path-like value and display name for the target window."""
     target_cfg = dict(config["target_interval"])
     horizon_key = f"{side}_horizon"
-    name_key = f"{side}_name"
     value = target_cfg.get(horizon_key)
     if value is None:
         raise ValueError(f"target_interval.{horizon_key} is required.")
 
-    name = target_cfg.get(name_key)
-    return str(value), str(name) if name is not None else _target_horizon_name(str(value))
+    return str(value), _target_horizon_name(str(value))
 
 
 def _target_tie_window_for_plan(
@@ -617,8 +621,8 @@ def _draw_target_horizons(axes: Any, target_window: TargetTieWindow | None, *, y
     if target_window is None:
         return
     specs = [
-        (target_window.top_twt_s * y_scale, target_window.top_name, "tab:green"),
-        (target_window.bottom_twt_s * y_scale, target_window.bottom_name, "tab:blue"),
+        (target_window.top_twt_s * y_scale, "top", "tab:green"),
+        (target_window.bottom_twt_s * y_scale, "bottom", "tab:blue"),
     ]
     flat_axes = np.ravel(axes).tolist()
     for ax in flat_axes:
@@ -1292,7 +1296,7 @@ def main() -> None:
         anchor_cfg = dict(script_cfg["coarse_correction"].get("anchor") or {})
         anchor_routes = set(anchor_cfg.get("apply_to_routes") or []) if as_bool(anchor_cfg.get("enabled", False)) else set()
         needs_anchor = any(
-            plan.route in ({TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value, TieRoute.VERTICAL_WITH_TDT.value} | anchor_routes)
+            plan.route == TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value or plan.route in anchor_routes
             for plan in planned_to_run
         )
         well_tops_df = import_well_tops_petrel(well_tops_file) if needs_anchor else pd.DataFrame()
@@ -1351,6 +1355,9 @@ def main() -> None:
                 result_extras[plan.well_name] = extra
             except RerouteToAnchor as reroute:
                 try:
+                    if not anchor_config:
+                        well_tops_df = import_well_tops_petrel(well_tops_file)
+                        anchor_config = _load_anchor_config(anchor_cfg)
                     rerouted_plan = replace(plan, route=TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value)
                     result, extra = _run_vertical_anchor_from_tops(
                         plan=rerouted_plan,

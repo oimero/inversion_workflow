@@ -60,6 +60,8 @@
 | `usable_p_sonic` / `usable_density` | 路由所需曲线是否可用 |
 | `input_las` | 第三步预处理 LAS 路径 |
 | `time_depth_file` / `well_trace_file` | 时深表与井轨迹输入路径 |
+| `surface_x` / `surface_y` | 井口平面坐标；第六步直井控制点使用这两个字段定位井口 trace |
+| `kb_m` | 井口补心高程，单位 m；供需要井口高程的后续步骤复用 |
 
 ## `well_tie_metrics.csv`
 

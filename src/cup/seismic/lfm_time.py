@@ -25,7 +25,19 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from cup.seismic.geometry import resolve_well_line_position
-from cup.seismic.modeling import WellControl, build_layer_constrained_model
+from cup.seismic.modeling import (
+    WellControl,
+    ZoneSliceModel,
+    _apply_post_slice_smoothing,
+    _extend_volume_constant_outside_modeled_range,
+    _fill_missing_slices_with_neighbors,
+    _fill_zone_with_adjacent_boundary,
+    _krige_slice_on_line_domain,
+    _nearest_neighbor_range,
+    _normalize_line_coordinates,
+    _write_zone_model_to_volume,
+    build_layer_constrained_model,
+)
 from cup.seismic.survey import SurveyContext
 from cup.seismic.target_zone import TargetZone
 from wtie.processing import grid
@@ -105,6 +117,48 @@ class LfmTimeModelResult:
     coverage_stats: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class LfmTimeControlPoint:
+    """时间域点级低频模型控制样本。
+
+    Unlike :class:`LfmTimeWell`, this object represents one physical sample in
+    the target interval.  It is the natural input for deviated wells whose
+    inline/xline position changes with TWT.
+    """
+
+    well_name: str
+    route: str
+    twt_s: float
+    md_m: float
+    x_m: float
+    y_m: float
+    inline_float: float
+    xline_float: float
+    zone_name: str
+    u_in_zone: float
+    ai: float
+    weight: float = 1.0
+    source: str = ""
+    flat_idx: Optional[int] = None
+    sample_index: Optional[int] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class LfmTimePointModelResult:
+    """时间域点级控制 LFM 构建结果。"""
+
+    volume: np.ndarray
+    variance_volume: np.ndarray
+    geometry: Dict[str, Any]
+    ilines: np.ndarray
+    xlines: np.ndarray
+    samples: np.ndarray
+    metadata: Dict[str, Any]
+    control_points: list[LfmTimeControlPoint]
+    coverage_stats: Dict[str, Any]
+
+
 @dataclass
 class _PreparedLfmTimeWell:
     """内部标准化后的单井输入。"""
@@ -118,6 +172,184 @@ class _PreparedLfmTimeWell:
     twt_conversion_mode: str
     td_table_extended: bool
     input_log_filtered: bool
+
+
+def _zone_key(top_name: str, bottom_name: str) -> str:
+    return f"{top_name}->{bottom_name}"
+
+
+def _point_zone_matches(point: LfmTimeControlPoint, top_name: str, bottom_name: str) -> bool:
+    zone = str(point.zone_name)
+    return zone == _zone_key(top_name, bottom_name) or zone == f"{top_name}_{bottom_name}"
+
+
+def _finite_point(point: LfmTimeControlPoint) -> bool:
+    values = [
+        point.twt_s,
+        point.inline_float,
+        point.xline_float,
+        point.u_in_zone,
+        point.ai,
+        point.weight,
+    ]
+    return bool(np.all(np.isfinite(np.asarray(values, dtype=float))) and point.weight > 0.0)
+
+
+def _aggregate_duplicate_slice_points(
+    inlines: np.ndarray,
+    xlines: np.ndarray,
+    values: np.ndarray,
+    weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Collapse exact duplicate inline/xline controls within one slice.
+
+    Dense well grids can put multiple controls on the same floating trace
+    coordinate.  Kriging backends generally require unique condition
+    coordinates, so this only aggregates exact coordinate duplicates inside a
+    single slice.  Broader conflict-resolution policies stay outside this first
+    point-control builder.
+    """
+    if values.size <= 1:
+        return inlines, xlines, values, 0
+
+    frame = np.column_stack([inlines, xlines, values, weights]).astype(float, copy=False)
+    keys: dict[tuple[float, float], list[int]] = {}
+    for index, row in enumerate(frame):
+        keys.setdefault((float(row[0]), float(row[1])), []).append(index)
+    duplicate_count = sum(max(0, len(indices) - 1) for indices in keys.values())
+    if duplicate_count == 0:
+        return inlines, xlines, values, 0
+
+    out_inline = []
+    out_xline = []
+    out_value = []
+    for (inline, xline), indices in keys.items():
+        idx = np.asarray(indices, dtype=np.int64)
+        local_weights = np.asarray(weights[idx], dtype=float)
+        local_values = np.asarray(values[idx], dtype=float)
+        if np.sum(local_weights) <= 0.0:
+            averaged = float(np.mean(local_values))
+        else:
+            averaged = float(np.average(local_values, weights=local_weights))
+        out_inline.append(inline)
+        out_xline.append(xline)
+        out_value.append(averaged)
+    return (
+        np.asarray(out_inline, dtype=float),
+        np.asarray(out_xline, dtype=float),
+        np.asarray(out_value, dtype=float),
+        int(duplicate_count),
+    )
+
+
+def _build_zone_slice_model_from_points(
+    control_points: list[LfmTimeControlPoint],
+    ilines: np.ndarray,
+    xlines: np.ndarray,
+    kriging_ilines: np.ndarray,
+    kriging_xlines: np.ndarray,
+    slice_u: np.ndarray,
+    *,
+    inline_min: float,
+    inline_step: float,
+    xline_min: float,
+    xline_step: float,
+    top_label: str,
+    bottom_label: str,
+    top_grid: np.ndarray,
+    bottom_grid: np.ndarray,
+    variogram: str,
+    exact: bool,
+    nugget: float,
+) -> tuple[ZoneSliceModel, dict[str, Any]]:
+    """Build one proportional zone model from point-level controls."""
+    n_slices = slice_u.size
+    n_il = ilines.size
+    n_xl = xlines.size
+    slice_values = np.full((n_slices, n_il, n_xl), np.nan, dtype=float)
+    slice_variance = np.full((n_slices, n_il, n_xl), np.nan, dtype=float)
+    slice_control_counts = np.zeros(n_slices, dtype=int)
+    slice_modes = [""] * n_slices
+    valid_slice_mask = np.zeros(n_slices, dtype=bool)
+    duplicate_controls_aggregated = 0
+
+    finite_points = [point for point in control_points if _finite_point(point)]
+    for slice_idx, _u in enumerate(slice_u):
+        if slice_idx == 0:
+            lower = -np.inf
+        else:
+            lower = 0.5 * (float(slice_u[slice_idx - 1]) + float(slice_u[slice_idx]))
+        if slice_idx == n_slices - 1:
+            upper = np.inf
+        else:
+            upper = 0.5 * (float(slice_u[slice_idx]) + float(slice_u[slice_idx + 1]))
+
+        points = [point for point in finite_points if lower <= float(point.u_in_zone) < upper]
+        slice_control_counts[slice_idx] = len(points)
+        if not points:
+            continue
+
+        control_inlines = np.asarray([point.inline_float for point in points], dtype=float)
+        control_xlines = np.asarray([point.xline_float for point in points], dtype=float)
+        control_values = np.asarray([point.ai for point in points], dtype=float)
+        control_weights = np.asarray([point.weight for point in points], dtype=float)
+        control_inlines, control_xlines, control_values, duplicates = _aggregate_duplicate_slice_points(
+            control_inlines,
+            control_xlines,
+            control_values,
+            control_weights,
+        )
+        duplicate_controls_aggregated += duplicates
+
+        valid_slice_mask[slice_idx] = True
+        if control_values.size == 1:
+            slice_values[slice_idx] = np.full((n_il, n_xl), float(control_values[0]), dtype=float)
+            slice_variance[slice_idx] = np.zeros((n_il, n_xl), dtype=float)
+            slice_modes[slice_idx] = "single_point_constant"
+            continue
+
+        control_inlines_kriging = _normalize_line_coordinates(
+            control_inlines,
+            line_min=inline_min,
+            line_step=inline_step,
+        )
+        control_xlines_kriging = _normalize_line_coordinates(
+            control_xlines,
+            line_min=xline_min,
+            line_step=xline_step,
+        )
+        range_hint = _nearest_neighbor_range(control_inlines_kriging, control_xlines_kriging)
+        field, variance = _krige_slice_on_line_domain(
+            control_inlines_kriging,
+            control_xlines_kriging,
+            control_values,
+            kriging_ilines,
+            kriging_xlines,
+            range_hint=range_hint,
+            variogram=variogram,
+            exact=exact,
+            nugget=nugget,
+        )
+        slice_values[slice_idx] = field
+        slice_variance[slice_idx] = variance
+        slice_modes[slice_idx] = "kriging"
+
+    zone_model = ZoneSliceModel(
+        top_label=top_label,
+        bottom_label=bottom_label,
+        top_grid=top_grid,
+        bottom_grid=bottom_grid,
+        slice_values=slice_values,
+        slice_variance=slice_variance,
+        slice_control_counts=slice_control_counts,
+        slice_modes=slice_modes,
+        valid_slice_mask=valid_slice_mask,
+    )
+    stats = {
+        "point_count": int(len(finite_points)),
+        "duplicate_controls_aggregated": int(duplicate_controls_aggregated),
+    }
+    return zone_model, stats
 
 
 def lowpass_twt_log(
@@ -208,6 +440,230 @@ def lowpass_twt_log(
         name=log.name,
         unit=log.unit,
         allow_nan=log.allow_nan,
+    )
+
+
+def build_lfm_time_model_from_points(
+    target_layer: TargetZone,
+    control_points: list[LfmTimeControlPoint],
+    *,
+    boundary_extension_samples: int = 50,
+    n_slices: int = 32,
+    variogram: str = "spherical",
+    exact: bool = True,
+    nugget: float = 0.0,
+    post_slice_smoothing: bool = False,
+) -> LfmTimePointModelResult:
+    """Build a time-domain AI LFM from point-level layer controls.
+
+    This is the point-control counterpart to :func:`build_lfm_time_model`.
+    Every input point carries its own inline/xline/TWT and normalized
+    ``u_in_zone`` coordinate, which allows deviated well samples to influence
+    different traces along the well path.
+    """
+    if not control_points:
+        raise ValueError("control_points must contain at least one LfmTimeControlPoint.")
+    if n_slices < 2:
+        raise ValueError(f"n_slices must be >= 2, got {n_slices}.")
+    if boundary_extension_samples < 0:
+        raise ValueError(f"boundary_extension_samples must be >= 0, got {boundary_extension_samples}.")
+
+    sample_domain = str(target_layer.geometry.get("sample_domain", "")).lower()
+    sample_unit = str(target_layer.geometry.get("sample_unit", "")).lower()
+    if sample_domain != "time":
+        raise ValueError("Point-control time LFM only supports TargetZone geometry in time domain.")
+    if sample_unit not in {"s", "sec", "second", "seconds"}:
+        raise ValueError("Point-control time LFM expects TargetZone sample_unit in seconds.")
+
+    finite_points = [point for point in control_points if _finite_point(point)]
+    if not finite_points:
+        raise ValueError("control_points contain no finite positive-weight samples.")
+
+    extension_samples = int(boundary_extension_samples)
+    modeling_target_layer = (
+        target_layer.with_boundary_extension(extension_samples) if extension_samples > 0 else target_layer
+    )
+
+    ilines = target_layer.ilines.astype(float, copy=False)
+    xlines = target_layer.xlines.astype(float, copy=False)
+    samples = target_layer.samples.astype(float, copy=False)
+    inline_min = float(target_layer.geometry["inline_min"])
+    inline_step = float(target_layer.geometry["inline_step"])
+    xline_min = float(target_layer.geometry["xline_min"])
+    xline_step = float(target_layer.geometry["xline_step"])
+    kriging_ilines = _normalize_line_coordinates(ilines, line_min=inline_min, line_step=inline_step)
+    kriging_xlines = _normalize_line_coordinates(xlines, line_min=xline_min, line_step=xline_step)
+
+    volume = np.full((ilines.size, xlines.size, samples.size), np.nan, dtype=np.float32)
+    variance_volume = np.full_like(volume, np.nan, dtype=np.float32)
+    slice_u = np.linspace(0.0, 1.0, int(n_slices), dtype=float)
+    coverage_stats: Dict[str, Any] = {
+        "property_name": "AI",
+        "control_point_count": int(len(finite_points)),
+        "well_count": int(len({point.well_name for point in finite_points})),
+        "wells": {},
+        "zones": {},
+    }
+    for well_name in sorted({point.well_name for point in finite_points}):
+        well_points = [point for point in finite_points if point.well_name == well_name]
+        flat_values = [point.flat_idx for point in well_points if point.flat_idx is not None]
+        coverage_stats["wells"][well_name] = {
+            "control_point_count": int(len(well_points)),
+            "unique_trace_count": int(len(set(flat_values))) if flat_values else None,
+            "source_modes": sorted({str(point.source) for point in well_points}),
+        }
+
+    base_zone_models: list[ZoneSliceModel] = []
+    for top_name, bottom_name in target_layer.iter_zones():
+        zone_points = [
+            point
+            for point in finite_points
+            if _point_zone_matches(point, top_name, bottom_name)
+        ]
+        top_grid, bottom_grid = modeling_target_layer.get_zone_sample_index_grids((top_name, bottom_name))
+        zone_model, point_stats = _build_zone_slice_model_from_points(
+            zone_points,
+            ilines,
+            xlines,
+            kriging_ilines,
+            kriging_xlines,
+            slice_u,
+            inline_min=inline_min,
+            inline_step=inline_step,
+            xline_min=xline_min,
+            xline_step=xline_step,
+            top_label=top_name,
+            bottom_label=bottom_name,
+            top_grid=top_grid,
+            bottom_grid=bottom_grid,
+            variogram=variogram,
+            exact=exact,
+            nugget=nugget,
+        )
+        if not np.any(zone_model.valid_slice_mask):
+            raise ValueError(f"Zone '{top_name}' -> '{bottom_name}' has no point controls on any slice.")
+        _fill_missing_slices_with_neighbors(
+            slice_u=slice_u,
+            slice_values=zone_model.slice_values,
+            slice_variance=zone_model.slice_variance,
+            slice_modes=zone_model.slice_modes,
+            valid_slice_mask=zone_model.valid_slice_mask,
+        )
+        if post_slice_smoothing:
+            zone_model.slice_values, zone_model.slice_variance = _apply_post_slice_smoothing(
+                slice_values=zone_model.slice_values,
+                slice_variance=zone_model.slice_variance,
+            )
+        zone_key = _zone_key(top_name, bottom_name)
+        coverage_stats["zones"][zone_key] = {
+            **point_stats,
+            "slice_control_counts": zone_model.slice_control_counts.tolist(),
+            "slice_modes": zone_model.slice_modes,
+        }
+        base_zone_models.append(zone_model)
+
+    modeled_zones: list[ZoneSliceModel] = []
+    if extension_samples > 0:
+        top_extension_zone = (modeling_target_layer.horizon_names[0], target_layer.horizon_names[0])
+        top_grid, bottom_grid = modeling_target_layer.get_zone_sample_index_grids(top_extension_zone)
+        top_extension_model = ZoneSliceModel(
+            top_label=top_extension_zone[0],
+            bottom_label=top_extension_zone[1],
+            top_grid=top_grid,
+            bottom_grid=bottom_grid,
+            slice_values=np.full((slice_u.size, ilines.size, xlines.size), np.nan, dtype=float),
+            slice_variance=np.full((slice_u.size, ilines.size, xlines.size), np.nan, dtype=float),
+            slice_control_counts=np.zeros(slice_u.size, dtype=int),
+            slice_modes=[""] * slice_u.size,
+            valid_slice_mask=np.zeros(slice_u.size, dtype=bool),
+        )
+        reference_zone = base_zone_models[0]
+        _fill_zone_with_adjacent_boundary(
+            top_extension_model,
+            source_zone_key=_zone_key(reference_zone.top_label, reference_zone.bottom_label),
+            source_slice_index=0,
+            source_values=reference_zone.slice_values[0],
+            source_variance=reference_zone.slice_variance[0],
+        )
+        modeled_zones.append(top_extension_model)
+
+    modeled_zones.extend(base_zone_models)
+
+    if extension_samples > 0:
+        bottom_extension_zone = (target_layer.horizon_names[-1], modeling_target_layer.horizon_names[-1])
+        top_grid, bottom_grid = modeling_target_layer.get_zone_sample_index_grids(bottom_extension_zone)
+        bottom_extension_model = ZoneSliceModel(
+            top_label=bottom_extension_zone[0],
+            bottom_label=bottom_extension_zone[1],
+            top_grid=top_grid,
+            bottom_grid=bottom_grid,
+            slice_values=np.full((slice_u.size, ilines.size, xlines.size), np.nan, dtype=float),
+            slice_variance=np.full((slice_u.size, ilines.size, xlines.size), np.nan, dtype=float),
+            slice_control_counts=np.zeros(slice_u.size, dtype=int),
+            slice_modes=[""] * slice_u.size,
+            valid_slice_mask=np.zeros(slice_u.size, dtype=bool),
+        )
+        reference_zone = base_zone_models[-1]
+        _fill_zone_with_adjacent_boundary(
+            bottom_extension_model,
+            source_zone_key=_zone_key(reference_zone.top_label, reference_zone.bottom_label),
+            source_slice_index=slice_u.size - 1,
+            source_values=reference_zone.slice_values[-1],
+            source_variance=reference_zone.slice_variance[-1],
+        )
+        modeled_zones.append(bottom_extension_model)
+
+    for zone_model in modeled_zones:
+        zone_key = _zone_key(zone_model.top_label, zone_model.bottom_label)
+        coverage_stats["zones"].setdefault(zone_key, {})
+        coverage_stats["zones"][zone_key].update(
+            {
+                "slice_control_counts": zone_model.slice_control_counts.tolist(),
+                "slice_modes": zone_model.slice_modes,
+            }
+        )
+        if zone_model.fallback_source_zone is not None:
+            coverage_stats["zones"][zone_key]["fallback_source_zone"] = zone_model.fallback_source_zone
+            coverage_stats["zones"][zone_key]["fallback_source_slice_index"] = zone_model.fallback_source_slice_index
+        _write_zone_model_to_volume(
+            zone_model=zone_model,
+            slice_u=slice_u,
+            volume=volume,
+            variance_volume=variance_volume,
+        )
+
+    _extend_volume_constant_outside_modeled_range(volume=volume, variance_volume=variance_volume)
+    metadata = {
+        "backend": "gstools",
+        "slice_mode": "point_control_proportional",
+        "property_name": "AI",
+        "sample_domain": "time",
+        "sample_unit": "s",
+        "variogram": variogram,
+        "exact": bool(exact),
+        "nugget": float(nugget),
+        "n_slices": int(n_slices),
+        "boundary_extension_samples": extension_samples,
+        "coord_system": "inline_xline",
+        "kriging_coord_system": "grid_index_normalized",
+        "kriging_inline_step": inline_step,
+        "kriging_xline_step": xline_step,
+        "horizon_names": list(target_layer.horizon_names),
+        "zone_names": [[zone.top_label, zone.bottom_label] for zone in modeled_zones],
+        "well_names": sorted({point.well_name for point in finite_points}),
+        "post_slice_smoothing": bool(post_slice_smoothing),
+        "variance_volume_included": True,
+    }
+    return LfmTimePointModelResult(
+        volume=volume,
+        variance_volume=variance_volume,
+        geometry=dict(target_layer.geometry),
+        ilines=ilines,
+        xlines=xlines,
+        samples=samples,
+        metadata=metadata,
+        control_points=list(finite_points),
+        coverage_stats=coverage_stats,
     )
 
 

@@ -306,6 +306,14 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 
 ---
 
+## 下游消费
+
+第六步 `lfm_precomputed.py` 使用本步的 `batch_synthetic_metrics.csv` 过滤 LFM 控制井。默认策略是：只有全局子波批量合成质量达标的井，才会把第四步的 `filtered_las`、`optimized_tdt` 和斜井 `trace_sample_plan` 转成 LFM 点级控制。
+
+因此第五步的 `batch_synthetic_metrics.csv` 不只是 QC 报告，也是第六步的控制井筛选依据。不要在第六步重新做 residual shift scan，也不要跳过第五步直接把所有第四步成功井放进 LFM。
+
+---
+
 ## 留到第二轮
 
 - 是否允许按区块、层段或井型生成多个全局子波。

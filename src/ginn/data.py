@@ -210,6 +210,67 @@ def load_lowfreq_model(lowfreq_file: Path) -> np.ndarray:
     return np.asarray(volume, dtype=np.float32)
 
 
+def _json_scalar_to_dict(value: np.ndarray) -> dict[str, Any]:
+    payload = np.asarray(value).item()
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8")
+    return json.loads(str(payload))
+
+
+def _load_lowfreq_npz_contract(lowfreq_file: Path) -> tuple[dict[str, Any], dict[str, Any], np.ndarray | None]:
+    """Load metadata needed to verify a time-domain LFM NPZ against seismic geometry."""
+    lowfreq_path = Path(lowfreq_file)
+    if lowfreq_path.suffix.lower() != ".npz":
+        return {}, {}, None
+
+    with np.load(lowfreq_path, allow_pickle=False) as archive:
+        metadata = _json_scalar_to_dict(archive["metadata_json"]) if "metadata_json" in archive.files else {}
+        geometry = _json_scalar_to_dict(archive["geometry_json"]) if "geometry_json" in archive.files else {}
+        samples = np.asarray(archive["samples"], dtype=np.float64) if "samples" in archive.files else None
+    return metadata, geometry, samples
+
+
+def _validate_time_lfm_contract(
+    *,
+    lfm_path: Path,
+    lfm_geometry: dict[str, Any],
+    lfm_samples: np.ndarray | None,
+    seismic_geometry: dict[str, Any],
+) -> None:
+    """Ensure a precomputed LFM uses the same time axis as the training seismic."""
+    if not lfm_geometry:
+        raise ValueError("AI LFM NPZ must contain geometry_json for time-domain training.")
+
+    sample_domain = str(lfm_geometry.get("sample_domain", "")).strip().lower()
+    if sample_domain != "time":
+        raise ValueError(f"AI LFM geometry_json.sample_domain must be 'time', got {sample_domain!r}.")
+
+    sample_unit = str(lfm_geometry.get("sample_unit", "")).strip().lower()
+    if sample_unit not in {"s", "sec", "second", "seconds"}:
+        raise ValueError(f"AI LFM geometry_json.sample_unit must be seconds ('s'), got {sample_unit!r}.")
+
+    n_sample = int(seismic_geometry["n_sample"])
+    sample_min = float(seismic_geometry["sample_min"])
+    sample_step = float(seismic_geometry["sample_step"])
+    expected_samples = sample_min + np.arange(n_sample, dtype=np.float64) * sample_step
+
+    if lfm_samples is None:
+        raise ValueError("AI LFM NPZ must contain a 'samples' axis for time-domain training.")
+    samples = np.asarray(lfm_samples, dtype=np.float64)
+    if samples.shape != (n_sample,):
+        raise ValueError(
+            f"AI LFM samples axis length {samples.size} does not match seismic n_sample={n_sample}."
+        )
+    if np.any(~np.isfinite(samples)) or np.any(np.diff(samples) <= 0.0):
+        raise ValueError("AI LFM samples axis must be finite and strictly increasing.")
+    if not np.allclose(samples, expected_samples, rtol=0.0, atol=1e-6):
+        max_diff = float(np.max(np.abs(samples - expected_samples)))
+        raise ValueError(
+            "AI LFM samples axis does not match the seismic time axis "
+            f"(max_abs_diff={max_diff:.6g}s, lfm={lfm_path})."
+        )
+
+
 def load_dynamic_gain_model(gain_model_file: Path) -> np.ndarray:
     """Load a precomputed dynamic gain volume from ``.npz`` or ``.npy``."""
     gain_path = Path(gain_model_file)
@@ -612,23 +673,23 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     tl_outlier_min_neighbor = 2
     top_horizon_file = None
     bot_horizon_file = None
-    lfm_meta: Dict[str, Any] = {}
     lfm_path = Path(str(cfg.ai_lfm_file))
-    if lfm_path.suffix == ".npz":
-        with np.load(lfm_path, allow_pickle=False) as lfm_data:
-            if "metadata_json" in lfm_data:
-                import json
-
-                lfm_meta = json.loads(str(lfm_data["metadata_json"]))
-                tl_meta = lfm_meta.get("target_layer", {})
-                tl_min_thickness = tl_meta.get("min_thickness")
-                tl_nearest_limit = tl_meta.get("nearest_distance_limit")
-                tl_outlier_threshold = tl_meta.get("outlier_threshold")
-                tl_outlier_min_neighbor = tl_meta.get("outlier_min_neighbor_count", 2)
-                hz_list = lfm_meta.get("horizons", [])
-                if len(hz_list) >= 2:
-                    top_horizon_file = hz_list[0]["file"]
-                    bot_horizon_file = hz_list[-1]["file"]
+    lfm_meta, lfm_geometry, lfm_samples = _load_lowfreq_npz_contract(lfm_path)
+    _validate_time_lfm_contract(
+        lfm_path=lfm_path,
+        lfm_geometry=lfm_geometry,
+        lfm_samples=lfm_samples,
+        seismic_geometry=geometry,
+    )
+    tl_meta = lfm_meta.get("target_layer", {})
+    tl_min_thickness = tl_meta.get("min_thickness")
+    tl_nearest_limit = tl_meta.get("nearest_distance_limit")
+    tl_outlier_threshold = tl_meta.get("outlier_threshold")
+    tl_outlier_min_neighbor = tl_meta.get("outlier_min_neighbor_count", 2)
+    hz_list = lfm_meta.get("horizons", [])
+    if len(hz_list) >= 2:
+        top_horizon_file = hz_list[0]["file"]
+        bot_horizon_file = hz_list[-1]["file"]
     if top_horizon_file is None or bot_horizon_file is None:
         raise ValueError("AI LFM NPZ metadata must contain at least two sorted horizons.")
 

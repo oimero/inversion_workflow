@@ -71,3 +71,32 @@
 | `optimized_tdt_file` | 第四步细标定后的内部 TDT CSV |
 | `filtered_las_file` | 第四步用最优滤波参数导出的 LAS；第五步从这里读取 `DT_USM`/`RHO_GCC` |
 | `seismic_trace_file` | 第四步保存的井旁或轨迹地震道 |
+
+## `lfm_layer_control_points.csv`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `well_name` | 控制点来源井 |
+| `route` | 第四步标定路径 |
+| `source` | 控制点空间来源：vertical_trace / deviated_trajectory |
+| `twt_s` / `md_m` | 控制点所在 TWT 和 MD |
+| `x_m` / `y_m` | 控制点平面坐标 |
+| `inline_float` / `xline_float` | 控制点投影到工区后的浮点线号 |
+| `zone_name` / `u_in_zone` | 所属层段和层内比例位置 |
+| `ai` | 控制点 AI 值，由第四步 filtered LAS 的 `DT_USM`/`RHO_GCC` 构造 |
+| `weight` | 控制点权重 |
+
+`inline_float`、`xline_float`、`twt_s` 是规范坐标。`flat_idx` / `sample_index` 可以作为派生字段写出，便于 QC 和调试，但它们依赖当前地震几何与采样轴，不能作为跨步骤主键。
+
+## `lfm_control_qc.csv`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `well_name` | 井名 |
+| `status` | selected / rejected / failed |
+| `route` | 第四步标定路径 |
+| `batch_corr` / `batch_nmae` | 第五步全局子波批量合成指标 |
+| `control_point_count` | 进入 LFM 的有效控制点数量 |
+| `invalid_point_count` / `invalid_point_fraction` | 因目标层、轨迹、TDT 或曲线问题被丢弃的点 |
+| `unique_trace_count` | 控制点覆盖的唯一 trace 数；斜井通常大于 1 |
+| `reasons` | 拒绝或失败原因 |

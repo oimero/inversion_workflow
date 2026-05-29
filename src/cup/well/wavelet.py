@@ -15,6 +15,8 @@
 4. compute_wavelet_active_half_support_s: 估计有效半支撑。
 5. crop_wavelet_center_energy_normalize: 居中裁剪并做 L2 能量归一化。
 6. validate_wavelet_dt: 校验小波采样间隔。
+7. validate_wavelet_normalization: 校验子波中心、有限性和 L2 能量。
+8. wavelet_l2_normalize / wavelet_roughness / wavelet_spectrum_features: 子波属性计算。
 
 Examples
 --------
@@ -25,6 +27,7 @@ Examples
 
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +35,37 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_ACTIVE_SUPPORT_THRESHOLD = 0.05
+
+
+@dataclass(frozen=True)
+class WaveletNormalizationQC:
+    """QC result for a workflow wavelet."""
+
+    status: str
+    l2_energy: float
+    center_time_s: float
+    center_index: int
+    n_samples: int
+    renormalized: bool = False
+    reasons: str = ""
+
+    def to_row(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class WaveletSpectrumFeatures:
+    """Basic spectrum features for one regularly sampled wavelet."""
+
+    dominant_frequency_hz: float
+    spectral_centroid_hz: float
+    bandwidth_hz: float
+    low_frequency_hz: float
+    high_frequency_hz: float
+    side_lobe_ratio: float
+
+    def to_row(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def make_wavelet(
@@ -203,6 +237,139 @@ def compute_wavelet_active_half_support_s(
     return float(np.abs(wavelet_time_s[active] - wavelet_time_s[peak_index]).max())
 
 
+def wavelet_l2_normalize(values: np.ndarray) -> tuple[np.ndarray, float]:
+    """Return a L2-normalized wavelet and its pre-normalization energy."""
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        raise ValueError("Cannot normalize an empty wavelet.")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Cannot normalize a wavelet with non-finite samples.")
+    energy = float(np.sqrt(np.sum(values * values)))
+    if not np.isfinite(energy) or energy <= 0.0:
+        raise ValueError("Cannot normalize a zero-energy wavelet.")
+    return values / energy, energy
+
+
+def validate_wavelet_normalization(
+    time_s: np.ndarray,
+    amplitude: np.ndarray,
+    *,
+    expected_l2_energy: float = 1.0,
+    l2_energy_tolerance: float = 1e-5,
+    max_center_abs_time_s: float = 1e-9,
+    allow_small_renormalization: bool = False,
+) -> tuple[np.ndarray, WaveletNormalizationQC]:
+    """Validate workflow wavelet centering, finite values, and L2 energy."""
+    time_s = np.asarray(time_s, dtype=np.float64).reshape(-1)
+    amplitude = np.asarray(amplitude, dtype=np.float64).reshape(-1)
+    if time_s.shape != amplitude.shape:
+        raise ValueError(f"time_s shape {time_s.shape} does not match amplitude shape {amplitude.shape}.")
+    if time_s.size == 0:
+        raise ValueError("wavelet must contain at least one sample.")
+
+    reasons: list[str] = []
+    if not np.all(np.isfinite(time_s)) or not np.all(np.isfinite(amplitude)):
+        reasons.append("non_finite_samples")
+    if time_s.size > 1 and np.any(np.diff(time_s) <= 0.0):
+        reasons.append("time_not_strictly_increasing")
+
+    center_index = int(np.argmin(np.abs(time_s)))
+    center_time = float(time_s[center_index])
+    if abs(center_time) > float(max_center_abs_time_s):
+        reasons.append("center_not_zero")
+
+    l2_energy = float(np.sqrt(np.sum(amplitude * amplitude))) if np.all(np.isfinite(amplitude)) else float("nan")
+    expected = float(expected_l2_energy)
+    tolerance = float(l2_energy_tolerance)
+    output = amplitude.copy()
+    renormalized = False
+    if not np.isfinite(l2_energy) or l2_energy <= 0.0:
+        reasons.append("zero_or_invalid_l2_energy")
+    else:
+        energy_delta = abs(l2_energy - expected)
+        if energy_delta > tolerance:
+            reasons.append("l2_energy_out_of_tolerance")
+        elif energy_delta > 0.0 and allow_small_renormalization:
+            output, l2_energy = wavelet_l2_normalize(output)
+            renormalized = True
+
+    return output, WaveletNormalizationQC(
+        status="ok" if not reasons else "failed",
+        l2_energy=l2_energy,
+        center_time_s=center_time,
+        center_index=center_index,
+        n_samples=int(time_s.size),
+        renormalized=renormalized,
+        reasons=";".join(dict.fromkeys(reasons)),
+    )
+
+
+def wavelet_roughness(values: np.ndarray) -> float:
+    """Second-difference roughness normalized by wavelet energy."""
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if values.size < 3:
+        return 0.0
+    if not np.all(np.isfinite(values)):
+        return float("nan")
+    denom = float(np.sum(values * values))
+    if denom <= 0.0 or not np.isfinite(denom):
+        return float("nan")
+    second = np.diff(values, n=2)
+    return float(np.sum(second * second) / denom)
+
+
+def wavelet_spectrum_features(
+    time_s: np.ndarray,
+    amplitude: np.ndarray,
+    *,
+    energy_percentile: float = 0.95,
+) -> WaveletSpectrumFeatures:
+    """Compute simple amplitude-spectrum features for a regularly sampled wavelet."""
+    if not 0.0 < float(energy_percentile) <= 1.0:
+        raise ValueError(f"energy_percentile must be within (0, 1], got {energy_percentile}.")
+    time_s = np.asarray(time_s, dtype=np.float64).reshape(-1)
+    amplitude = np.asarray(amplitude, dtype=np.float64).reshape(-1)
+    if time_s.shape != amplitude.shape:
+        raise ValueError(f"time_s shape {time_s.shape} does not match amplitude shape {amplitude.shape}.")
+    if amplitude.size < 2:
+        raise ValueError("wavelet must contain at least two samples for spectrum features.")
+    if not np.all(np.isfinite(amplitude)):
+        raise ValueError("wavelet amplitude contains non-finite samples.")
+
+    dt = infer_wavelet_dt(time_s)
+    frequencies = np.fft.rfftfreq(amplitude.size, d=dt)
+    spectrum = np.abs(np.fft.rfft(amplitude))
+    power = spectrum * spectrum
+    total_power = float(np.sum(power))
+    if total_power <= 0.0 or not np.isfinite(total_power):
+        raise ValueError("Cannot compute spectrum features for a zero-energy wavelet.")
+
+    dominant_index = int(np.argmax(spectrum))
+    centroid = float(np.sum(frequencies * power) / total_power)
+    bandwidth = float(np.sqrt(np.sum(((frequencies - centroid) ** 2) * power) / total_power))
+    cumulative = np.cumsum(power) / total_power
+    tail = (1.0 - float(energy_percentile)) / 2.0
+    low = float(frequencies[int(np.searchsorted(cumulative, tail, side="left"))])
+    high_index = int(np.searchsorted(cumulative, 1.0 - tail, side="left"))
+    high_index = min(high_index, frequencies.size - 1)
+
+    abs_amp = np.abs(amplitude)
+    peak_index = int(np.argmax(abs_amp))
+    peak = float(abs_amp[peak_index])
+    left_lobe = float(np.max(abs_amp[:peak_index])) if peak_index > 0 else 0.0
+    right_lobe = float(np.max(abs_amp[peak_index + 1 :])) if peak_index + 1 < abs_amp.size else 0.0
+    side_lobe_ratio = float(max(left_lobe, right_lobe) / peak) if peak > 0.0 else float("nan")
+
+    return WaveletSpectrumFeatures(
+        dominant_frequency_hz=float(frequencies[dominant_index]),
+        spectral_centroid_hz=centroid,
+        bandwidth_hz=bandwidth,
+        low_frequency_hz=low,
+        high_frequency_hz=float(frequencies[high_index]),
+        side_lobe_ratio=side_lobe_ratio,
+    )
+
+
 def crop_wavelet_center_energy_normalize(
     wavelet: Any,
     target_ms: float,
@@ -240,10 +407,8 @@ def crop_wavelet_center_energy_normalize(
         start = end - n_target
     values = np.asarray(wavelet.values[start:end], dtype=np.float64).copy()
     basis = np.asarray(wavelet.basis[start:end], dtype=np.float64).copy()
-    energy = float(np.sqrt(np.sum(values**2)))
-    if not np.isfinite(energy) or energy <= 0.0:
-        raise ValueError("Cannot normalize a zero-energy wavelet.")
-    cropped = Wavelet(values / energy, basis, name="Auto well tie wavelet cropped energy-normalized")
+    normalized, energy = wavelet_l2_normalize(values)
+    cropped = Wavelet(normalized, basis, name="Auto well tie wavelet cropped energy-normalized")
     return cropped, {
         "target_ms": float(target_ms),
         "dt_s": dt,

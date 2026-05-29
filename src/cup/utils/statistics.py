@@ -9,6 +9,8 @@
 核心公开对象
 ------------
 1. pearson_r: Pearson 相关系数，自动忽略非有限值。
+2. radius_connected_components: 半径连边的连通分量。
+3. aggregate_cluster_then_global: 先簇内聚合、再簇间聚合。
 """
 
 from __future__ import annotations
@@ -125,3 +127,94 @@ def normalized_mae(
     if denom <= 0.0:
         return np.nan
     return float(np.sum(np.abs(ref[valid] - est[valid])) / denom)
+
+
+def radius_connected_components(points_xy: np.ndarray, radius: float) -> np.ndarray:
+    """Label connected components formed by point pairs within ``radius``.
+
+    Non-finite points are kept as singleton clusters so dense valid wells do not
+    accidentally inherit missing-coordinate rows.
+    """
+    points = np.asarray(points_xy, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError(f"points_xy must have shape [n, 2], got {points.shape}.")
+    radius = float(radius)
+    if radius < 0.0 or not np.isfinite(radius):
+        raise ValueError(f"radius must be a finite non-negative number, got {radius}.")
+
+    n_points = int(points.shape[0])
+    labels = np.full(n_points, -1, dtype=np.int64)
+    finite = np.isfinite(points).all(axis=1)
+    finite_indices = np.flatnonzero(finite)
+    radius_sq = radius * radius
+    next_label = 0
+
+    for start in range(n_points):
+        if labels[start] >= 0:
+            continue
+        labels[start] = next_label
+        if not finite[start]:
+            next_label += 1
+            continue
+        stack = [start]
+        while stack:
+            current = stack.pop()
+            candidate_indices = finite_indices[labels[finite_indices] < 0]
+            if candidate_indices.size == 0:
+                continue
+            deltas = points[candidate_indices] - points[current]
+            distances_sq = np.sum(deltas * deltas, axis=1)
+            neighbors = candidate_indices[distances_sq <= radius_sq]
+            for neighbor in neighbors:
+                labels[neighbor] = next_label
+                stack.append(int(neighbor))
+        next_label += 1
+
+    return labels
+
+
+def aggregate_cluster_then_global(
+    df: pd.DataFrame,
+    *,
+    value_columns: list[str],
+    cluster_column: str,
+    group_columns: list[str] | None = None,
+    quantiles: list[float] | None = None,
+) -> pd.DataFrame:
+    """Aggregate metrics as cluster median first, then global median/quantiles."""
+    group_columns = list(group_columns or [])
+    quantiles = list(quantiles or [0.1])
+    required = set(group_columns + [cluster_column] + list(value_columns))
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"aggregate input is missing columns: {sorted(missing)}")
+    for quantile in quantiles:
+        if not 0.0 <= float(quantile) <= 1.0:
+            raise ValueError(f"quantiles must be within [0, 1], got {quantile}.")
+
+    rows: list[dict[str, Any]] = []
+    grouped = [((), df)] if not group_columns else df.groupby(group_columns, dropna=False)
+    for group_key, group_df in grouped:
+        if group_columns:
+            key_values = group_key if isinstance(group_key, tuple) else (group_key,)
+            base = dict(zip(group_columns, key_values))
+        else:
+            base = {}
+        cluster_values = group_df.groupby(cluster_column, dropna=False)[value_columns].median(numeric_only=True)
+        row: dict[str, Any] = {
+            **base,
+            "n_samples": int(len(group_df)),
+            "n_clusters": int(len(cluster_values)),
+        }
+        for column in value_columns:
+            values = cluster_values[column].to_numpy(dtype=np.float64)
+            values = values[np.isfinite(values)]
+            row[f"spatial_debiased_median_{column}"] = float(np.median(values)) if values.size else np.nan
+            for quantile in quantiles:
+                q_name = f"p{int(round(float(quantile) * 100)):02d}"
+                row[f"spatial_debiased_{q_name}_{column}"] = (
+                    float(np.quantile(values, float(quantile))) if values.size else np.nan
+                )
+        rows.append(row)
+
+    return pd.DataFrame.from_records(rows)

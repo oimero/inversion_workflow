@@ -8,7 +8,7 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
-from cup.well.spatial_samples import WellSpatialSampleSet
+from cup.well.trajectory import WellSpatialSampleSet
 from wtie.processing import grid
 
 

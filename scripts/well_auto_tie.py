@@ -48,7 +48,6 @@ from cup.utils.coerce import as_bool
 from cup.utils.config import merge_dict_defaults
 from cup.well.assets import build_file_lookup
 from cup.well.las import load_vp_rho_logset_from_standard_las
-from cup.well.spatial_samples import sample_trajectory_on_twt
 from cup.well.td import (
     PreparedTieWindow,
     TargetTieWindow,
@@ -64,7 +63,7 @@ from cup.well.td import (
     write_time_depth_table_csv,
 )
 from cup.well.tie import TieRoute, WellTiePlan, WellTieResult, build_auto_tie_search_space, build_tie_plan, plans_dataframe, results_dataframe, scaled_synthetic_metrics
-from cup.well.trajectory import WellTrajectory
+from cup.well.trajectory import WellTrajectory, sample_trajectory_on_twt
 from cup.well.wavelet import crop_wavelet_center_energy_normalize
 from wtie.processing import grid
 

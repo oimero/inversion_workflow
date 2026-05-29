@@ -15,6 +15,7 @@
 3. build_tie_plan: 根据上游 QC 数据构建标定路由计划。
 4. build_auto_tie_search_space: 从配置构建超参数搜索空间。
 5. scaled_synthetic_metrics: 计算归一化合成记录-地震匹配指标。
+6. TieArtifactIndex / WaveletCandidate / TieEvaluationWell: 第五步复用第四步产物的索引对象。
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from cup.utils.io import sanitize_filename
+from cup.utils.statistics import radius_connected_components
 from cup.well.assets import normalize_well_name
 
 
@@ -80,6 +83,98 @@ class WellTieResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class WaveletCandidate:
+    source_well: str
+    route: str
+    wavelet_file: Path
+    dt_s: float | None
+    n_samples: int | None
+    tie_corr: float | None
+    tie_nmae: float | None
+    usable_as_candidate: bool = True
+    reasons: str = ""
+
+    def to_row(self) -> dict[str, Any]:
+        row = asdict(self)
+        row["wavelet_file"] = self.wavelet_file.as_posix()
+        return row
+
+
+@dataclass(frozen=True)
+class TieEvaluationWell:
+    well_name: str
+    route: str
+    input_las: Path
+    optimized_tdt_file: Path
+    seismic_trace_file: Path
+    surface_x: float | None = None
+    surface_y: float | None = None
+    tie_window_start_s: float | None = None
+    tie_window_end_s: float | None = None
+
+    def to_row(self) -> dict[str, Any]:
+        row = asdict(self)
+        row["input_las"] = self.input_las.as_posix()
+        row["optimized_tdt_file"] = self.optimized_tdt_file.as_posix()
+        row["seismic_trace_file"] = self.seismic_trace_file.as_posix()
+        return row
+
+
+@dataclass(frozen=True)
+class WaveletWellMetric:
+    """Metric for one candidate wavelet on one evaluation well.
+
+    ``spatial_cluster_id`` is filled by the fifth-step script after joining the
+    metrics with ``build_well_spatial_clusters()`` output.
+    """
+
+    candidate_wavelet: str
+    source_well: str
+    eval_well: str
+    route: str
+    corr: float | None
+    nmae: float | None
+    best_shift_ms: float | None = None
+    scale: float | None = None
+    n_eval_samples: int | None = None
+    spatial_cluster_id: int | None = None
+    is_source_well: bool = False
+    status: str = "ok"
+    reasons: str = ""
+
+    def to_row(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TieArtifactIndex:
+    auto_tie_dir: Path
+    plan_df: pd.DataFrame
+    metrics_df: pd.DataFrame
+    wavelet_inventory_df: pd.DataFrame
+    repo_root: Path | None = None
+
+    def candidate_wavelets(
+        self,
+        *,
+        min_source_tie_corr: float | None = None,
+        max_source_tie_nmae: float | None = None,
+        include_source_wells: set[str] | None = None,
+        exclude_source_wells: set[str] | None = None,
+    ) -> list[WaveletCandidate]:
+        return load_candidate_wavelets(
+            self,
+            min_source_tie_corr=min_source_tie_corr,
+            max_source_tie_nmae=max_source_tie_nmae,
+            include_source_wells=include_source_wells,
+            exclude_source_wells=exclude_source_wells,
+        )
+
+    def evaluation_wells(self, *, status: str = "success") -> list[TieEvaluationWell]:
+        return load_evaluation_wells(self, status=status)
+
+
 def _as_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -97,11 +192,39 @@ def _optional_float(value: Any) -> float | None:
     return number
 
 
+def _optional_int(value: Any) -> int | None:
+    number = _optional_float(value)
+    return None if number is None else int(round(number))
+
+
 def _string_value(value: Any) -> str:
     if value is None:
         return ""
     text = str(value)
     return "" if text.strip().casefold() in {"", "nan", "none", "null"} else text
+
+
+def _resolve_artifact_path(value: Any, index: TieArtifactIndex) -> Path | None:
+    text = _string_value(value)
+    if not text:
+        return None
+    path = Path(text)
+    if path.is_absolute():
+        return path
+    candidates: list[Path] = []
+    if index.repo_root is not None:
+        candidates.append(index.repo_root / path)
+    candidates.extend([Path.cwd() / path, index.auto_tie_dir / path])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0] if candidates else path
+
+
+def _prefer_existing_or_fallback(path: Path | None, fallback: Path) -> Path:
+    if path is not None and path.exists():
+        return path
+    return fallback
 
 
 def _build_lookup(df: pd.DataFrame) -> dict[str, pd.Series]:
@@ -249,6 +372,151 @@ def plans_dataframe(plans: Sequence[WellTiePlan]) -> pd.DataFrame:
 def results_dataframe(results: Sequence[WellTieResult]) -> pd.DataFrame:
     columns = list(WellTieResult.__dataclass_fields__.keys())
     return pd.DataFrame.from_records([result.to_row() for result in results], columns=columns)
+
+
+def load_tie_artifacts(auto_tie_dir: str | Path, *, repo_root: str | Path | None = None) -> TieArtifactIndex:
+    """Load the fourth-step auto-tie CSV artifacts for later wavelet evaluation."""
+    auto_tie_path = Path(auto_tie_dir)
+    root = Path(repo_root) if repo_root is not None else None
+    plan_path = auto_tie_path / "well_tie_plan.csv"
+    metrics_path = auto_tie_path / "well_tie_metrics.csv"
+    wavelet_inventory_path = auto_tie_path / "wavelet_inventory.csv"
+    missing = [path for path in [plan_path, metrics_path, wavelet_inventory_path] if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"auto-tie artifact directory is missing files: {[str(path) for path in missing]}")
+    return TieArtifactIndex(
+        auto_tie_dir=auto_tie_path,
+        plan_df=pd.read_csv(plan_path),
+        metrics_df=pd.read_csv(metrics_path),
+        wavelet_inventory_df=pd.read_csv(wavelet_inventory_path),
+        repo_root=root,
+    )
+
+
+def load_candidate_wavelets(
+    index: TieArtifactIndex,
+    *,
+    min_source_tie_corr: float | None = None,
+    max_source_tie_nmae: float | None = None,
+    include_source_wells: set[str] | None = None,
+    exclude_source_wells: set[str] | None = None,
+) -> list[WaveletCandidate]:
+    """Build candidate-wavelet objects from ``wavelet_inventory.csv``."""
+    df = index.wavelet_inventory_df
+    required = {"source_well", "route", "wavelet_file", "usable_as_candidate"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"wavelet_inventory.csv is missing columns: {sorted(missing)}")
+    include_keys = {normalize_well_name(name) for name in include_source_wells} if include_source_wells else None
+    exclude_keys = {normalize_well_name(name) for name in exclude_source_wells} if exclude_source_wells else set()
+    candidates: list[WaveletCandidate] = []
+    for _, row in df.iterrows():
+        source_well = _string_value(row.get("source_well"))
+        source_key = normalize_well_name(source_well)
+        reasons: list[str] = []
+        usable = _as_bool(row.get("usable_as_candidate"))
+        if not usable:
+            reasons.append("inventory_not_usable")
+        if include_keys is not None and source_key not in include_keys:
+            reasons.append("not_in_include_source_wells")
+        if source_key in exclude_keys:
+            reasons.append("excluded_source_well")
+        tie_corr = _optional_float(row.get("tie_corr"))
+        tie_nmae = _optional_float(row.get("tie_nmae"))
+        if min_source_tie_corr is not None and (tie_corr is None or tie_corr < float(min_source_tie_corr)):
+            reasons.append("source_tie_corr_below_threshold")
+        if max_source_tie_nmae is not None and (tie_nmae is None or tie_nmae > float(max_source_tie_nmae)):
+            reasons.append("source_tie_nmae_above_threshold")
+        wavelet_file = _resolve_artifact_path(row.get("wavelet_file"), index)
+        if wavelet_file is None or not wavelet_file.exists():
+            reasons.append("missing_wavelet_file")
+            wavelet_file = Path(_string_value(row.get("wavelet_file")))
+        if reasons:
+            continue
+        candidates.append(
+            WaveletCandidate(
+                source_well=source_well,
+                route=_string_value(row.get("route")),
+                wavelet_file=wavelet_file,
+                dt_s=_optional_float(row.get("dt_s")),
+                n_samples=_optional_int(row.get("n_samples")),
+                tie_corr=tie_corr,
+                tie_nmae=tie_nmae,
+                usable_as_candidate=True,
+                reasons=_string_value(row.get("reasons")),
+            )
+        )
+    return candidates
+
+
+def load_evaluation_wells(index: TieArtifactIndex, *, status: str = "success") -> list[TieEvaluationWell]:
+    """Build evaluation-well objects from fourth-step plan and metrics artifacts."""
+    plan_by_key = _build_lookup(index.plan_df)
+    metrics = index.metrics_df
+    if metrics.empty or "well_name" not in metrics.columns:
+        return []
+    wells: list[TieEvaluationWell] = []
+    for _, row in metrics.iterrows():
+        if _string_value(row.get("tie_status")) != status:
+            continue
+        well_name = _string_value(row.get("well_name"))
+        if not well_name:
+            continue
+        key = normalize_well_name(well_name)
+        plan = plan_by_key.get(key)
+        input_las = _resolve_artifact_path(plan.get("input_las") if plan is not None else "", index)
+        optimized_tdt = _resolve_artifact_path(row.get("optimized_tdt_file"), index)
+        seismic_trace = _resolve_artifact_path(row.get("seismic_trace_file"), index)
+        optimized_tdt = _prefer_existing_or_fallback(
+            optimized_tdt,
+            index.auto_tie_dir / "time_depth" / f"optimized_tdt_{sanitize_filename(well_name)}.csv",
+        )
+        seismic_trace = _prefer_existing_or_fallback(
+            seismic_trace,
+            index.auto_tie_dir / "seismic_trace" / f"seismic_trace_{sanitize_filename(well_name)}.csv",
+        )
+        if input_las is None or not optimized_tdt.exists() or not seismic_trace.exists():
+            continue
+        wells.append(
+            TieEvaluationWell(
+                well_name=well_name,
+                route=_string_value(row.get("route")),
+                input_las=input_las,
+                optimized_tdt_file=optimized_tdt,
+                seismic_trace_file=seismic_trace,
+                surface_x=_optional_float(plan.get("surface_x")) if plan is not None else None,
+                surface_y=_optional_float(plan.get("surface_y")) if plan is not None else None,
+                tie_window_start_s=_optional_float(row.get("tie_window_start_s")),
+                tie_window_end_s=_optional_float(row.get("tie_window_end_s")),
+            )
+        )
+    return wells
+
+
+def build_well_spatial_clusters(
+    evaluation_wells: Sequence[TieEvaluationWell],
+    *,
+    radius_m: float,
+) -> pd.DataFrame:
+    """Assign evaluation wells to radius-connected XY clusters."""
+    rows = [
+        {
+            "well_name": well.well_name,
+            "x_m": well.surface_x,
+            "y_m": well.surface_y,
+        }
+        for well in evaluation_wells
+    ]
+    df = pd.DataFrame.from_records(rows, columns=["well_name", "x_m", "y_m"])
+    if df.empty:
+        df["spatial_cluster_id"] = pd.Series(dtype=np.int64)
+        df["spatial_cluster_size"] = pd.Series(dtype=np.int64)
+        return df
+    labels = radius_connected_components(df[["x_m", "y_m"]].to_numpy(dtype=np.float64), radius_m)
+    df["spatial_cluster_id"] = labels
+    sizes = df.groupby("spatial_cluster_id")["well_name"].transform("count")
+    df["spatial_cluster_size"] = sizes.astype(np.int64)
+    return df
 
 
 def build_auto_tie_search_space(config: Mapping[str, Any]) -> list[dict[str, Any]]:

@@ -10,7 +10,7 @@
 | 02 | `las_curve_screen.py` | `well_inventory.csv`、LAS 目录 | `well_curve_screen.csv`、`selected_las/` |
 | 03 | `log_preprocess.py` | `well_curve_screen.csv`、`selected_las/` | `well_preprocess_status.csv`、`preprocessed_las/` |
 | 04 | `well_auto_tie.py` | 03 产物 + 时深表 + 井分层 + 轨迹 QC | `well_tie_metrics.csv`、优化后 TDT、子波 |
-| 05 | `wavelet_batch_synthetic.py`（规划中） | 04 子波 + 预处理 LAS | 全局子波选择与批量合成记录 |
+| 05 | `global_wavelet_generation.py`（规划中） | 04 子波 + 预处理 LAS | 全局子波生成与批量合成记录 |
 
 ## 旁路
 
@@ -34,7 +34,7 @@ flowchart LR
 
 ## 第五步当前状态
 
-时间域第五步目前还是规划文档，尚未落地为 `scripts/wavelet_batch_synthetic.py`。
+时间域第五步目前还是规划文档，尚未落地为 `scripts/global_wavelet_generation.py`。设计见 `docs/guide/5-global-wavelet-generation.md`。
 现有 `scripts/wavelet_batch_synthetic_depth.py` 是深度域 legacy 脚本，
 只能作为思路参考，不能视为时间域主链第五步的实现。
 

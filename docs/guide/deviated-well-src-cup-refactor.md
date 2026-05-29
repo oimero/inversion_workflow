@@ -1,6 +1,6 @@
 # 斜井支持的 src/cup 后续重构规划
 
-本文只跟踪还没有落地的斜井主线能力。已经进入代码的内容不再作为规划项重复展开：`cup.well.trajectory.WellTrajectory`、`cup.well.spatial_samples.sample_trajectory_on_twt()`、`cup.seismic.trace_sampling` 的最近道采样计划、`SurveyContext.read_traces_at_indices()`，以及 `well_auto_tie.py` 的 `deviated_with_tdt` 路径。
+本文只跟踪还没有落地的斜井主线能力。已经进入代码的内容不再作为规划项重复展开：`cup.well.trajectory.WellTrajectory`、`cup.well.trajectory.sample_trajectory_on_twt()`、`cup.seismic.trace_sampling` 的最近道采样计划、`SurveyContext.read_traces_at_indices()`，以及 `well_auto_tie.py` 的 `deviated_with_tdt` 路径。
 
 后续主线仍然围绕同一个事实链条：
 

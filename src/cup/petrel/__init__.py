@@ -1,1 +1,1 @@
-"""cup.petrel: Petrel 文本、LAS 与解释成果的导入导出适配器。"""
+"""cup.petrel: Petrel 文本与解释成果的导入适配器。"""

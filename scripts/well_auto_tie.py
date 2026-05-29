@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 import re
 import sys
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import matplotlib
 
@@ -47,12 +47,13 @@ from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_
 from cup.utils.coerce import as_bool
 from cup.utils.config import merge_dict_defaults
 from cup.well.assets import build_file_lookup
-from cup.well.las import load_vp_rho_logset_from_standard_las
+from cup.well.las import export_logset_to_las, load_vp_rho_logset_from_standard_las
 from cup.well.td import (
     PreparedTieWindow,
     TargetTieWindow,
     build_tdt_from_anchor,
     crop_logset_md,
+    export_vertical_tdt_to_petrel_checkshots,
     find_well_top_md,
     load_petrel_time_depth_table,
     normalize_twt_seconds,
@@ -561,6 +562,8 @@ def _build_output_paths(output_dir: Path, well_name: str) -> dict[str, Path]:
         "wavelet": output_dir / "wavelets" / f"wavelet_201ms_{safe}.csv",
         "initial_tdt": output_dir / "time_depth" / f"initial_tdt_{safe}.csv",
         "optimized_tdt": output_dir / "time_depth" / f"optimized_tdt_{safe}.csv",
+        "petrel_checkshot": output_dir / "petrel_checkshots" / f"optimized_tdt_{safe}.txt",
+        "filtered_las": output_dir / "filtered_las" / f"filtered_logs_{safe}.las",
         "synthetic_qc": output_dir / "synthetic_qc" / f"tie_qc_{safe}.csv",
         "seismic_trace": output_dir / "seismic_trace" / f"seismic_trace_{safe}.csv",
         "trace_sample_plan": output_dir / "trace_sample_plan" / f"trace_sample_plan_{safe}.csv",
@@ -573,7 +576,16 @@ def _build_output_paths(output_dir: Path, well_name: str) -> dict[str, Path]:
 
 
 def _ensure_output_dirs(output_dir: Path) -> None:
-    for name in ["wavelets", "time_depth", "synthetic_qc", "seismic_trace", "trace_sample_plan", "figures"]:
+    for name in [
+        "wavelets",
+        "time_depth",
+        "petrel_checkshots",
+        "filtered_las",
+        "synthetic_qc",
+        "seismic_trace",
+        "trace_sample_plan",
+        "figures",
+    ]:
         (output_dir / name).mkdir(parents=True, exist_ok=True)
 
 
@@ -612,6 +624,75 @@ def _snap_seismic_sampling_if_close(seismic: Any, expected_dt_s: float, *, rtol:
         "twt",
         name=seismic.name,
         theta=getattr(seismic, "theta", 0),
+    )
+
+
+def _finite_float(value: Any, *, label: str) -> float:
+    number = float(value)
+    if not np.isfinite(number):
+        raise ValueError(f"{label} must be finite.")
+    return number
+
+
+def _md_tdt_to_vertical_petrel_tvdss_table(table: Any, *, kb_m: float) -> grid.TimeDepthTable:
+    """Convert an MD-domain workflow TDT to the TVDSS-domain table expected by the Petrel exporter."""
+    if not getattr(table, "is_md_domain", False):
+        raise ValueError("Petrel checkshot export expects an MD-domain optimized TDT.")
+    md = np.asarray(table.md, dtype=np.float64)
+    tvdss = md - float(kb_m)
+    if np.any(~np.isfinite(tvdss)):
+        raise ValueError("Petrel checkshot export got non-finite TVDSS values.")
+    if np.any(tvdss < 0.0):
+        raise ValueError("Petrel vertical checkshot export does not support samples above the KB datum.")
+    return grid.TimeDepthTable(twt=np.asarray(table.twt, dtype=np.float64), tvdss=tvdss)
+
+
+def _export_petrel_checkshot_tdt(paths: dict[str, Path], plan: WellTiePlan, table: Any) -> Path:
+    if plan.surface_x is None or plan.surface_y is None or plan.kb_m is None:
+        raise ValueError("Petrel checkshot export requires surface_x, surface_y and kb_m.")
+    kb_m = _finite_float(plan.kb_m, label="kb_m")
+    petrel_table = _md_tdt_to_vertical_petrel_tvdss_table(table, kb_m=kb_m)
+    return export_vertical_tdt_to_petrel_checkshots(
+        paths["petrel_checkshot"],
+        petrel_table,
+        well_name=plan.well_name,
+        kb=kb_m,
+        x=_finite_float(plan.surface_x, label="surface_x"),
+        y=_finite_float(plan.surface_y, label="surface_y"),
+    )
+
+
+def _filtered_standard_las_logset(logset_md: Any, best_params: Mapping[str, Any]) -> dict[str, grid.Log]:
+    """Apply the selected auto-tie MD log filters and convert back to standard LAS mnemonics."""
+    from wtie.optimize import tie as tie_ops
+
+    filtered = tie_ops.filter_md_logs(
+        logset_md,
+        median_size=best_params["logs_median_size"],
+        threshold=best_params["logs_median_threshold"],
+        std=best_params["logs_std"],
+        std2=0.8 * best_params["logs_std"],
+    )
+    vp = np.asarray(filtered.Logs["Vp"].values, dtype=np.float64)
+    rho = np.asarray(filtered.Logs["Rho"].values, dtype=np.float64)
+    md = np.asarray(filtered.basis, dtype=np.float64)
+    if np.any(~np.isfinite(vp)) or np.any(vp <= 0.0):
+        raise ValueError("Filtered Vp contains non-finite or non-positive values.")
+    if np.any(~np.isfinite(rho)) or np.any(rho <= 0.0):
+        raise ValueError("Filtered Rho contains non-finite or non-positive values.")
+    return {
+        "DT_USM": grid.Log(1_000_000.0 / vp, md, "md", name="DT_USM", unit="us/m", allow_nan=False),
+        "RHO_GCC": grid.Log(rho, md, "md", name="RHO_GCC", unit="g/cm3", allow_nan=False),
+    }
+
+
+def _export_filtered_las(paths: dict[str, Path], plan: WellTiePlan, logset_md: Any, best_params: Mapping[str, Any]) -> Path:
+    filtered_logs = _filtered_standard_las_logset(logset_md, best_params)
+    return export_logset_to_las(
+        plan.well_name,
+        filtered_logs,
+        paths["filtered_las"],
+        curve_names=["DT_USM", "RHO_GCC"],
     )
 
 
@@ -1146,6 +1227,8 @@ def _run_tie_with_initial_table(
 
     best_params, _ = outputs.ax_client.get_best_parameters()
     best_shift_ms = float(best_params.get("table_t_shift", 0.0)) * 1000.0
+    petrel_checkshot_file = _export_petrel_checkshot_tdt(paths, plan, outputs.table)
+    filtered_las_file = _export_filtered_las(paths, plan, logset_md, best_params)
     result = WellTieResult(
         well_name=plan.well_name,
         route=plan.route,
@@ -1171,6 +1254,8 @@ def _run_tie_with_initial_table(
         "synthetic_qc_file": repo_relative_path(paths["synthetic_qc"], root=REPO_ROOT),
         "seismic_trace_file": repo_relative_path(paths["seismic_trace"], root=REPO_ROOT),
         "initial_tdt_file": repo_relative_path(paths["initial_tdt"], root=REPO_ROOT),
+        "petrel_checkshot_file": repo_relative_path(petrel_checkshot_file, root=REPO_ROOT),
+        "filtered_las_file": repo_relative_path(filtered_las_file, root=REPO_ROOT),
         }
     )
     return result, extra
@@ -1421,6 +1506,8 @@ def main() -> None:
                     "tie_window_end_s": tie_window.get("tie_window_end_s"),
                     "tdt_support_class": tie_window.get("tdt_support_class"),
                     "original_tdt_window_fraction": tie_window.get("original_tdt_window_fraction"),
+                    "petrel_checkshot_file": extra.get("petrel_checkshot_file"),
+                    "filtered_las_file": extra.get("filtered_las_file"),
                 }
             )
     if metric_extra_rows and not metrics_df.empty:

@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -31,6 +32,8 @@ import pandas as pd
 from cup.utils.io import sanitize_filename
 from cup.utils.statistics import radius_connected_components
 from cup.well.assets import normalize_well_name
+from cup.well.las import load_vp_rho_logset_from_standard_las
+from cup.well.td import load_workflow_time_depth_table_csv
 
 
 class TieRoute(str, Enum):
@@ -519,6 +522,138 @@ def build_well_spatial_clusters(
     return df
 
 
+def build_reflectivity_for_tie_eval(logset: Any, table: Any, dt_s: float) -> Any:
+    """Build TWT reflectivity on a fixed workflow time-depth table."""
+    from wtie.optimize import tie as tie_ops
+
+    if not getattr(logset, "is_md", False):
+        raise ValueError("tie evaluation expects an MD-domain LogSet.")
+    if not getattr(table, "is_md_domain", False):
+        raise ValueError("tie evaluation expects an MD-domain TimeDepthTable.")
+    logset_twt = tie_ops.convert_logs_from_md_to_twt(logset, None, table, float(dt_s))
+    return tie_ops.compute_reflectivity(logset_twt)
+
+
+def load_saved_seismic_trace_csv(path: str | Path) -> Any:
+    """Load a fourth-step saved seismic trace CSV as a ``grid.Seismic``."""
+    from wtie.processing import grid
+
+    path = Path(path)
+    df = pd.read_csv(path)
+    required = {"twt_s", "seismic"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"seismic trace CSV is missing columns {sorted(missing)}: {path}")
+    twt = df["twt_s"].to_numpy(dtype=np.float64)
+    values = df["seismic"].to_numpy(dtype=np.float64)
+    finite = np.isfinite(twt) & np.isfinite(values)
+    twt = twt[finite]
+    values = values[finite]
+    if twt.size < 2:
+        raise ValueError(f"seismic trace CSV has fewer than 2 finite samples: {path}")
+    order = np.argsort(twt)
+    twt = twt[order]
+    values = values[order]
+    if np.any(np.diff(twt) <= 0.0):
+        raise ValueError(f"seismic trace TWT must be strictly increasing: {path}")
+    return grid.Seismic(values, twt, "twt", name=path.stem)
+
+
+def _regular_dt_from_basis(basis: np.ndarray, *, label: str) -> float:
+    values = np.asarray(basis, dtype=np.float64).reshape(-1)
+    if values.size < 2:
+        raise ValueError(f"{label} basis has fewer than 2 samples.")
+    diffs = np.diff(values)
+    if not np.all(np.isfinite(diffs)) or np.any(diffs <= 0.0):
+        raise ValueError(f"{label} basis must be strictly increasing.")
+    dt_s = float(np.median(diffs))
+    if not np.allclose(diffs, dt_s, rtol=1e-4, atol=1e-9):
+        raise ValueError(f"{label} basis is not regularly sampled.")
+    return dt_s
+
+
+def prepare_well_for_evaluation(well_artifact: TieEvaluationWell) -> tuple[Any, Any]:
+    """Load well artifacts once and return ``(seismic_match, reflectivity_match)``.
+
+    The returned pair can be reused across wavelet evaluations for the same well,
+    avoiding repeated LAS / TDT / seismic I/O and MD→TWT conversion.
+    """
+    from wtie.optimize import tie as tie_ops
+
+    logset = load_vp_rho_logset_from_standard_las(well_artifact.input_las)
+    table = load_workflow_time_depth_table_csv(well_artifact.optimized_tdt_file)
+    seismic = load_saved_seismic_trace_csv(well_artifact.seismic_trace_file)
+    seismic_dt_s = _regular_dt_from_basis(seismic.basis, label="seismic trace")
+    reflectivity = build_reflectivity_for_tie_eval(logset, table, seismic_dt_s)
+    return tie_ops.match_seismic_and_reflectivity(seismic, reflectivity)
+
+
+def evaluate_wavelet_on_well(
+    *,
+    wavelet_time_s: np.ndarray,
+    wavelet_amplitude: np.ndarray,
+    well_artifact: TieEvaluationWell,
+    candidate_wavelet: str,
+    source_well: str,
+    modeler: Any,
+    seismic_match: Any | None = None,
+    reflectivity_match: Any | None = None,
+) -> tuple[WaveletWellMetric, pd.DataFrame]:
+    """Evaluate one wavelet on one fourth-step optimized tie artifact.
+
+    Pass *seismic_match* and *reflectivity_match* (from
+    ``prepare_well_for_evaluation``) to skip repeated I/O during batch
+    or consensus evaluation.
+    """
+    from wtie.processing import grid
+
+    wavelet_time = np.asarray(wavelet_time_s, dtype=np.float64).reshape(-1)
+    wavelet_values = np.asarray(wavelet_amplitude, dtype=np.float64).reshape(-1)
+    if wavelet_time.shape != wavelet_values.shape:
+        raise ValueError("wavelet_time_s and wavelet_amplitude must have matching shapes.")
+    if wavelet_time.size < 3:
+        raise ValueError("wavelet must contain at least three samples.")
+    wavelet_dt_s = _regular_dt_from_basis(wavelet_time, label="wavelet")
+
+    if seismic_match is None or reflectivity_match is None:
+        seismic_match, reflectivity_match = prepare_well_for_evaluation(well_artifact)
+    seismic_dt_s = _regular_dt_from_basis(seismic_match.basis, label="seismic trace")
+    if not np.isclose(wavelet_dt_s, seismic_dt_s, rtol=1e-5, atol=1e-9):
+        raise ValueError(f"wavelet dt {wavelet_dt_s:g}s does not match seismic trace dt {seismic_dt_s:g}s.")
+    wavelet = grid.Wavelet(wavelet_values, wavelet_time, name=str(candidate_wavelet))
+    seismic_norm, synthetic, corr, nmae, scale = scaled_synthetic_metrics(
+        modeler,
+        wavelet,
+        reflectivity_match,
+        seismic_match,
+    )
+    finite = np.isfinite(seismic_norm) & np.isfinite(synthetic)
+    metric = WaveletWellMetric(
+        candidate_wavelet=str(candidate_wavelet),
+        source_well=str(source_well),
+        eval_well=well_artifact.well_name,
+        route=well_artifact.route,
+        corr=corr,
+        nmae=nmae,
+        best_shift_ms=0.0,
+        scale=scale,
+        n_eval_samples=int(np.count_nonzero(finite)),
+        is_source_well=normalize_well_name(source_well) == normalize_well_name(well_artifact.well_name),
+        status="ok",
+        reasons="",
+    )
+    qc = pd.DataFrame(
+        {
+            "twt_s": seismic_match.basis,
+            "seismic_norm": seismic_norm,
+            "reflectivity": reflectivity_match.values,
+            "synthetic_scaled": synthetic,
+            "residual": seismic_norm - synthetic,
+        }
+    )
+    return metric, qc
+
+
 def build_auto_tie_search_space(config: Mapping[str, Any]) -> list[dict[str, Any]]:
     """根据配置构建 auto-tie 超参数搜索空间。"""
     return [
@@ -556,7 +691,9 @@ def scaled_synthetic_metrics(
 
     返回 ``(seismic_norm, synthetic, corr, nmae, scale)``。
     """
-    synthetic_raw = np.asarray(modeler(wavelet.values, reflectivity.values), dtype=np.float64)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Wavelet has odd number of samples\\.")
+        synthetic_raw = np.asarray(modeler(wavelet.values, reflectivity.values), dtype=np.float64)
     seismic_values = np.asarray(seismic.values, dtype=np.float64)
     seismic_norm = seismic_values - float(np.nanmean(seismic_values))
     std = float(np.nanstd(seismic_norm))

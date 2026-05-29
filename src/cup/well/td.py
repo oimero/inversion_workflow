@@ -7,22 +7,24 @@
 --------
 - 本模块不负责 auto-tie 优化策略本身，仅提供数据准备层。
 - Petrel checkshot 文本解析由 ``cup.petrel.load.import_petrel_checkshots_dataframe`` 完成；
-  本模块只负责把解析表转换为项目内 ``TimeDepthTable``。
+  Petrel checkshot 文本导出也放在本模块，和工作流时深表读写保持同一边界。
 - TVDSS/MD 口径差异由调用方在进入本模块前统一。
 
 核心公开对象
 ------------
 1. TargetTieWindow / PreparedTieWindow: 标定窗口定义与裁剪结果。
 2. load_petrel_time_depth_table: 读取 Petrel 时深表并归一化到正秒。
-3. build_tdt_from_anchor: 基于单一锚点构建时深关系。
-4. prepare_tdt_with_sonic_extension: 原始 TDT 裁剪 + 声波外推。
+3. load_workflow_time_depth_table_csv: 读取工作流内部 TDT CSV。
+4. export_vertical_tdt_to_petrel_checkshots: 导出 Petrel checkshots 文本。
+5. build_tdt_from_anchor: 基于单一锚点构建时深关系。
+6. prepare_tdt_with_sonic_extension: 原始 TDT 裁剪 + 声波外推。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -128,6 +130,44 @@ def load_petrel_time_depth_table(path: str | Path, *, domain: Literal["md", "tvd
         raise ValueError(f"Time-depth table TWT is not strictly increasing after monotonic filtering: {path}")
 
     if domain == "md":
+        return grid.TimeDepthTable(twt=twt, md=depth)
+    return grid.TimeDepthTable(twt=twt, tvdss=depth)
+
+
+def load_workflow_time_depth_table_csv(path: str | Path) -> grid.TimeDepthTable:
+    """读取工作流内部写出的 TDT CSV。
+
+    该函数读取 ``write_time_depth_table_csv()`` 产物，要求包含 ``twt_s``，
+    并且恰好包含 ``md_m`` 或 ``tvdss_m`` 之一。它不解析 Petrel 负毫秒/
+    负 Z 口径，也不做单位猜测。
+    """
+    path = Path(path)
+    df = pd.read_csv(path)
+    if "twt_s" not in df.columns:
+        raise ValueError(f"workflow TDT CSV is missing required column 'twt_s': {path}")
+    has_md = "md_m" in df.columns
+    has_tvdss = "tvdss_m" in df.columns
+    if has_md == has_tvdss:
+        raise ValueError(f"workflow TDT CSV must contain exactly one of 'md_m' or 'tvdss_m': {path}")
+
+    depth_col = "md_m" if has_md else "tvdss_m"
+    twt = df["twt_s"].to_numpy(dtype=np.float64)
+    depth = df[depth_col].to_numpy(dtype=np.float64)
+    finite = np.isfinite(twt) & np.isfinite(depth)
+    twt = twt[finite]
+    depth = depth[finite]
+    if twt.size < 2:
+        raise ValueError(f"workflow TDT CSV has fewer than 2 finite rows: {path}")
+    order = np.argsort(twt)
+    twt = twt[order]
+    depth = depth[order]
+    if np.any(np.diff(twt) == 0.0):
+        raise ValueError(f"workflow TDT CSV contains duplicate TWT samples: {path}")
+    if np.any(np.diff(twt) <= 0.0):
+        raise ValueError(f"workflow TDT CSV TWT is not strictly increasing: {path}")
+    if np.any(np.diff(depth) <= 0.0):
+        raise ValueError(f"workflow TDT CSV depth is not strictly increasing with TWT: {path}")
+    if has_md:
         return grid.TimeDepthTable(twt=twt, md=depth)
     return grid.TimeDepthTable(twt=twt, tvdss=depth)
 
@@ -562,3 +602,95 @@ def write_time_depth_table_csv(
             raise ValueError("sources length must match the time-depth table length.")
         rows["source"] = list(sources)
     rows.to_csv(path, index=False)
+
+
+def _normalize_optional_column(
+    value: Optional[Union[float, np.ndarray]],
+    size: int,
+    name: str,
+) -> Optional[np.ndarray]:
+    """将可选标量/数组列标准化为长度一致的一维数组。"""
+    if value is None:
+        return None
+
+    arr = np.asarray(value, dtype=float)
+    if arr.ndim == 0:
+        return np.full(size, float(arr), dtype=float)
+
+    arr = arr.reshape(-1)
+    if arr.size != size:
+        raise ValueError(f"{name} 长度不匹配: expect {size}, got {arr.size}")
+
+    return arr
+
+
+def export_vertical_tdt_to_petrel_checkshots(
+    output_file: Path,
+    tdt: grid.TimeDepthTable,
+    well_name: str,
+    kb: float,
+    x: float,
+    y: float,
+    average_velocity: Optional[Union[float, np.ndarray]] = None,
+    interval_velocity: Optional[Union[float, np.ndarray]] = None,
+) -> Path:
+    """导出直井时深关系到 Petrel checkshots 文本。
+
+    该函数沿用项目既有 Petrel 交换格式，以 TVDSS 域 ``TimeDepthTable``
+    为输入，写出 ``X/Y/Z/MD/TWT/Well name``。内部 TWT 为正秒，导出到
+    Petrel 时转换为负毫秒。
+    """
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if tdt.is_md_domain:
+        raise ValueError("仅支持 TVDSS 域 TimeDepthTable；当前输入为 MD 域。")
+
+    z = -np.abs(np.asarray(tdt.tvdss, dtype=float))
+    md = np.abs(z) + float(kb)
+    twt_s = np.asarray(tdt.twt, dtype=float)
+    twt_ms = -np.abs(twt_s) * 1000.0
+
+    if not np.isfinite(z).all() or not np.isfinite(md).all() or not np.isfinite(twt_s).all():
+        raise ValueError("Z/MD/TWT 存在非有限值，无法导出。")
+    if (twt_s < 0.0).any():
+        raise ValueError("内部 TWT 必须为非负值（s）。")
+
+    n = z.size
+    if md.size != n or twt_ms.size != n:
+        raise ValueError("Z/MD/TWT 采样长度不一致。")
+
+    avg_v = _normalize_optional_column(average_velocity, n, "average_velocity")
+    int_v = _normalize_optional_column(interval_velocity, n, "interval_velocity")
+
+    header = ["X", "Y", "Z", "MD", "TWT"]
+    if avg_v is not None:
+        header.append("Average velocity")
+    if int_v is not None:
+        header.append("Interval velocity")
+    header.append("Well name")
+
+    lines = [
+        "VERSION 1",
+        "BEGIN HEADER",
+        *header,
+        "END HEADER",
+    ]
+
+    for i in range(n):
+        row = [
+            f"{float(x):.2f}",
+            f"{float(y):.2f}",
+            f"{z[i]:.2f}",
+            f"{md[i]:.2f}",
+            f"{twt_ms[i]:.2f}",
+        ]
+        if avg_v is not None:
+            row.append(f"{avg_v[i]:.6g}")
+        if int_v is not None:
+            row.append(f"{int_v[i]:.6g}")
+        row.append(f'"{well_name}"')
+        lines.append(" ".join(row))
+
+    output_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output_file

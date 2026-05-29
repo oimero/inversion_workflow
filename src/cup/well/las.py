@@ -15,7 +15,7 @@
 1. scan_las_curves / scan_las_header: 扫描 LAS 元数据。
 2. read_las_curve / read_las_curves: 按用户指定 mnemonic 读取通用曲线。
 3. load_vp_rho_logset_from_standard_las: 从标准 LAS 构建 Vp/Rho LogSet。
-4. export_selected_curves_to_las / export_logsets_to_las: LAS 导出。
+4. export_selected_curves_to_las / export_logset_to_las / export_logsets_to_las: LAS 导出。
 5. old_load_vp_rho_logset_from_las: 旧深度域 Vp/Rho 兼容 Adapter。
 """
 
@@ -802,6 +802,37 @@ def export_logsets_to_las(
         "skipped_wells": skipped_wells,
         "skipped_curves": skipped_curves,
     }
+
+
+def export_logset_to_las(
+    well_name: str,
+    well_data: LogsetInput,
+    output_las: Path,
+    curve_names: list[str] | None = None,
+    null_value: float = -999.25,
+    write_fmt: str = "%.6f",
+) -> Path:
+    """导出单井 MD 域 LogSet/Log 映射到指定 LAS 文件。"""
+    _validate_write_format(write_fmt)
+    logs_mapping = _extract_logs_mapping(well_data)
+    requested_curve_names = list(logs_mapping.keys()) if curve_names is None else list(curve_names)
+    available_curve_names: list[str] = []
+    for curve_name in requested_curve_names:
+        _resolve_export_curve(well_data, curve_name)
+        available_curve_names.append(curve_name)
+    if not available_curve_names:
+        raise ValueError(f"No exportable curves for well {well_name!r}.")
+
+    las = _build_las_from_well_data(
+        well_name=well_name,
+        well_data=well_data,
+        selected_curve_names=available_curve_names,
+        null_value=null_value,
+    )
+    output_las = Path(output_las)
+    output_las.parent.mkdir(parents=True, exist_ok=True)
+    las.write(str(output_las), version=2.0, wrap=False, fmt=write_fmt)
+    return output_las
 
 
 def export_selected_curves_to_las(

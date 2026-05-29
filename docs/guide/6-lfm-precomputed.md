@@ -1,10 +1,8 @@
-# 06 时间域点云低频模型
+# 06 低频模型
 
-`lfm_precomputed.py` 是时间域工作流的第六步。它把第四步标定成功的井在目标层内的曲线样点转成空间控制点，再通过层位约束插值生成 AI 低频模型，供第七步 GINN 训练直接读取。
+`lfm_precomputed.py` 是工作流的第六步。它把第四步标定成功的井在目标层内的曲线样点转成空间控制点，再通过层位约束插值生成 AI 低频模型，供第七步 GINN 训练直接读取。
 
 本步的核心不再是"一口井一个控制点"，而是"目标层内的样点控制"——每口井在目的层内贡献数十到上百个带空间坐标的 AI 样点，斜井样点随轨迹分布在不同的 inline/xline 上。
-
-第一版只输出 **AI LFM**。Vp、Rho、well constraints、dynamic gain 和 enhance 都不属于本步主线。
 
 ---
 
@@ -29,7 +27,7 @@ python scripts/lfm_precomputed.py --output-dir scripts/output/lfm_precomputed_te
 | 第四步 | 标定成功/失败、路由、优化后时深表、滤波 LAS | 筛选候选井、读取 AI 曲线、获取井位坐标 |
 | 第四步 | 斜井样点 TWT/MD/XY/inline/xline 映射 | 斜井控制点的空间事实来源 |
 | 第五步 | 全局子波批量合成指标 | 逐井合成质量，用于筛选控制井 |
-| 地震数据 | 时间域地震体 + 顶底解释层位 | 提供时间轴、工区几何和目标层 mask |
+| 地震数据 | 地震体 + 顶底解释层位 | 提供时间轴、工区几何和目标层 mask |
 
 直井用井口坐标配合优化后时深表将 MD 域曲线映射到 TWT 域后生成控制点；斜井优先复用第四步写出的样点级空间映射，不重新写一套轨迹反查逻辑。斜井缺少空间映射时脚本会跳过该井并记录原因，不会将它降级成井口直井控制。
 
@@ -62,8 +60,6 @@ lfm_precomputed:
   controls:
     sample_step_s: null
     min_control_samples_per_well: 16
-    vertical_source: well_head_trace
-    deviated_source: trace_sample_plan
 
   modeling:
     boundary_extension_samples: 50
@@ -78,8 +74,7 @@ lfm_precomputed:
     post_slice_smoothing: false
 
   export:
-    write_segy: true
-    write_zgy: true
+    export_volume: true
 ```
 
 ### `source_runs`
@@ -101,9 +96,9 @@ lfm_precomputed:
 
 `sample_step_s: null` 表示使用地震体的时间采样间隔，不另行重采样。设为正值时按给定间隔沿 TWT 轴抽取控制点。
 
-本步产出的控制点以 `inline_float`、`xline_float` 和 `twt_s` 为规范坐标。`flat_idx` 和 `sample_index` 是派生字段，只在当前地震几何和采样轴下有效，不应被下游脚本当作规范坐标依赖。
+每个控制点记录了一个空间位置和一个 AI 值。空间位置由工区线号（`inline_float`、`xline_float`）和时间（`twt_s`）确定，这三个字段是控制点的核心坐标。CSV 中同时输出的 `flat_idx` 和 `sample_index` 是它们的整数近似，仅供排查时对照地震道编号使用——不保证在更换地震体或裁剪工区后仍然有效。
 
-直井的 `source` 标记为 `vertical_trace`，所有控制点共用井口 XY。斜井的 `source` 标记为 `deviated_trajectory`，每个控制点的 XY 来自第四步的空间映射。
+直井所有控制点落在井口对应的同一个 trace 上；斜井每个控制点落在各自轨迹样点对应的 trace 上，因此一口斜井的控制点会分布在多个不同的 `inline_float`、`xline_float` 处。
 
 ### `target_interval`
 
@@ -169,7 +164,7 @@ lfm_precomputed:
 ### 第四阶段：导出
 
 1. 将建模结果保存为 `ai_lfm_time.npz`，内含体积、方差体、三个规则轴、几何元数据、建模元数据和覆盖统计。
-2. 可选导出 SEG-Y 或 ZGY 格式，方便在地质软件中检查。
+2. 可选导出地震体格式（SEG-Y 进则 SEG-Y 出，ZGY 进则 ZGY 出），方便在地质软件中检查。
 3. 输出 QC 图：控制点平面分布图和 LFM 剖面图。
 
 ---
@@ -181,8 +176,7 @@ lfm_precomputed:
 | 文件 | 内容 |
 |------|------|
 | `ai_lfm_time.npz` | GINN 训练可直接读取的 AI 低频模型 |
-| `ai_lfm_time.segy` | 可选 SEG-Y 导出 |
-| `ai_lfm_time.zgy` | 可选 ZGY 导出 |
+| `ai_lfm_time.segy` 或 `.zgy` | 可选地震体导出，格式跟随源地震 |
 | `lfm_layer_control_points.csv` | 点级控制样本，每行一个目标层内控制点 |
 | `lfm_control_qc.csv` | 逐井筛选结果、控制点数量和无效比例 |
 | `target_layer_qc/*` | 目标层 mask、层厚、层位有效性 QC |
@@ -251,8 +245,7 @@ lfm_precomputed:
 | `target_layer geometry domain is not time` | 地震数据不在时间域 | 确认地震体路径和类型正确 |
 | 某口斜井 `missing_trace_sample_plan` | 第四步未为该斜井写出空间映射 | 回到第四步检查斜井路径是否执行成功 |
 | `too_few_control_samples` | 落入目标层的有效样点不足 | 检查时深表范围是否覆盖目标层；LAS 曲线在目标层深度内是否有值 |
-| ZGY 导出失败 (zgy export skipped/failed) | 源地震非 ZGY 格式 | ZGY 导出只对 ZGY 源地震开启；对 SEG-Y 源使用 SEG-Y 导出 |
-| SEG-Y 导出失败 | 缺少 SEG-Y 头字节配置或 `cigsegy` 不可用 | 检查配置中的 `iline_byte`/`xline_byte`；确认 `cigsegy` 已安装 |
+| 地震体导出失败 | 缺少 SEG-Y 头字节配置或 ZGY 写入库不可用 | 检查配置中的 `iline_byte`/`xline_byte`，或确认 `pyzgy` 已安装；也可 `export_volume: false` 跳过导出 |
 
 ---
 

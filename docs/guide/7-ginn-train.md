@@ -1,6 +1,6 @@
-# 07 时间域 GINN 训练
+# 07 GINN 训练
 
-`ginn_train.py` 是时间域工作流的第七步。它读取时间域地震体、第六步产出的 AI 低频模型和第五步选出的全局子波，训练一个物理信息神经网络（GINN），在目标层内预测 AI 的高频扰动分量。
+`ginn_train.py` 是工作流的第七步。它读取地震体、第六步产出的 AI 低频模型和第五步选出的全局子波，训练一个物理信息神经网络（GINN），在目标层内预测 AI 的高频扰动分量。
 
 网络不直接输出 AI，而是输出一个乘性扰动——最终 AI 由 `LFM × exp(residual)` 合成。物理正演（阻抗→反射率→子波褶积→合成地震记录）全程可微分，损失函数同时在观测地震匹配和扰动正则化两个维度上约束网络。
 
@@ -49,7 +49,7 @@ wavelet_file: null
 wavelet_type: ricker
 wavelet_freq: 25.0
 wavelet_dt: 0.001
-wavelet_length: 301
+wavelet_length: 201
 
 gain_source: fixed_gain
 fixed_gain: null

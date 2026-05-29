@@ -58,8 +58,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "controls": {
         "sample_step_s": None,
         "min_control_samples_per_well": 16,
-        "vertical_source": "well_head_trace",
-        "deviated_source": "trace_sample_plan",
     },
     "modeling": {
         "boundary_extension_samples": 50,
@@ -73,7 +71,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "filter_buffer_mode": "reflect",
         "post_slice_smoothing": False,
     },
-    "export": {"write_segy": True, "write_zgy": True, "zgy_inline_chunk_size": 16},
+    "export": {"export_volume": True, "zgy_inline_chunk_size": 16},
 }
 
 
@@ -953,18 +951,21 @@ def main() -> None:
     npz_file = output_dir / "ai_lfm_time.npz"
     _save_npz(result, npz_file, metadata_extra=metadata_extra)
 
-    segy_status = None
-    zgy_status = None
-    if bool(script_cfg["export"].get("write_segy", True)):
-        segy_status = _try_write_segy(result, output_dir / "ai_lfm_time.segy", seismic_file, seismic_type, cfg)
-    if bool(script_cfg["export"].get("write_zgy", True)):
-        zgy_status = _try_write_zgy(
-            result,
-            output_dir / "ai_lfm_time.zgy",
-            survey,
-            seismic_type,
-            inline_chunk_size=int(script_cfg["export"].get("zgy_inline_chunk_size", 16)),
-        )
+    export_status = None
+    export_ext = None
+    if bool(script_cfg["export"].get("export_volume", True)):
+        if seismic_type.lower() == "segy":
+            export_ext = ".segy"
+            export_status = _try_write_segy(result, output_dir / "ai_lfm_time.segy", seismic_file, seismic_type, cfg)
+        elif seismic_type.lower() == "zgy":
+            export_ext = ".zgy"
+            export_status = _try_write_zgy(
+                result,
+                output_dir / "ai_lfm_time.zgy",
+                survey,
+                seismic_type,
+                inline_chunk_size=int(script_cfg["export"].get("zgy_inline_chunk_size", 16)),
+            )
 
     _plot_controls(control_df, figures_dir / "qc_control_points.png")
     _plot_lfm_result(result, figures_dir / "qc_ai_lfm_time.png")
@@ -980,21 +981,18 @@ def main() -> None:
             "control_points": repo_relative_path(control_path, root=REPO_ROOT),
             "control_qc": repo_relative_path(qc_path, root=REPO_ROOT),
         },
-        "segy_export_status": "written" if segy_status is None else segy_status,
-        "zgy_export_status": "written" if zgy_status is None else zgy_status,
+        "export_status": "written" if export_status is None else export_status,
         "coverage_stats": result.coverage_stats,
     }
     write_json(output_dir / "run_summary.json", summary)
 
-    print("=== LFM Precomputed Time ===")
+    print("=== LFM Precomputed ===")
     print(f"Output: {output_dir}")
     print(f"Selected wells: {summary['selected_well_count']}")
     print(f"Control points: {summary['control_point_count']}")
     print(f"NPZ: {npz_file}")
-    if segy_status:
-        print(f"SEG-Y export skipped/failed: {segy_status}")
-    if zgy_status:
-        print(f"ZGY export skipped/failed: {zgy_status}")
+    if export_status:
+        print(f"Volume export skipped/failed: {export_status}")
 
 
 if __name__ == "__main__":

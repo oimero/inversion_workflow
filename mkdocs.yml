@@ -54,8 +54,8 @@ nav:
       - 旁路 井轨迹 QC: guide/well-trajectory-qc.md
       - 04 井震自动标定: guide/4-well-auto-tie.md
       - 05 全局子波生成与批量合成: guide/5-global-wavelet-generation.md
-      - 06 时间域点云低频模型: guide/6-lfm-precomputed.md
-      - 07 时间域 GINN 训练: guide/7-ginn-train.md
+      - 06 低频模型: guide/6-lfm-precomputed.md
+      - 07 GINN 训练: guide/7-ginn-train.md
       - 常见问题: guide/troubleshooting.md
   - 架构与路线图:
       - 斜井支持的 src/cup 重构规划: guide/deviated-well-src-cup-refactor.md

@@ -54,7 +54,7 @@ class GINNConfig:
     wavelet_type: str = "ricker"  # 生成 Ricker 子波时使用的子波类型名。
     wavelet_freq: float = 25.0  # Ricker 子波主频（Hz）。
     wavelet_dt: float = 0.001  # 子波采样间隔（秒）。
-    wavelet_length: int = 301  # 子波长度（采样点数，建议奇数）。
+    wavelet_length: int = 201  # 子波长度（采样点数，建议奇数）。
 
     # ── 振幅补偿 ──────────────────────────────────────────────
     # 振幅补偿让正演地震和归一化观测地震处于同一量级。fixed_gain 是全局

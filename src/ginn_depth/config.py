@@ -54,7 +54,7 @@ class DepthGINNConfig:
     wavelet_type: str = "ricker"  # 生成 Ricker 子波时使用的子波类型名。
     wavelet_freq: float = 25.0  # Ricker 子波主频（Hz）。
     wavelet_dt: float = 0.001  # 子波采样间隔（秒）。
-    wavelet_length: int = 301  # 子波长度（采样点数，建议奇数）。
+    wavelet_length: int = 201  # 子波长度（采样点数，建议奇数）。
     wavelet_amplitude_threshold: float = 1e-7  # 深度域卷积矩阵中裁剪微小子波尾巴的阈值。
 
     # ── 振幅补偿 ──────────────────────────────────────────────

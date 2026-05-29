@@ -453,7 +453,11 @@ def load_candidate_wavelets(
 
 
 def load_evaluation_wells(index: TieArtifactIndex, *, status: str = "success") -> list[TieEvaluationWell]:
-    """Build evaluation-well objects from fourth-step plan and metrics artifacts."""
+    """Build evaluation-well objects from fourth-step plan and metrics artifacts.
+
+    The fifth step evaluates against the filtered LAS exported by the fourth
+    step, not the third-step preprocessed LAS listed in ``well_tie_plan``.
+    """
     plan_by_key = _build_lookup(index.plan_df)
     metrics = index.metrics_df
     if metrics.empty or "well_name" not in metrics.columns:
@@ -467,7 +471,11 @@ def load_evaluation_wells(index: TieArtifactIndex, *, status: str = "success") -
             continue
         key = normalize_well_name(well_name)
         plan = plan_by_key.get(key)
-        input_las = _resolve_artifact_path(plan.get("input_las") if plan is not None else "", index)
+        input_las = _resolve_artifact_path(row.get("filtered_las_file"), index)
+        input_las = _prefer_existing_or_fallback(
+            input_las,
+            index.auto_tie_dir / "filtered_las" / f"filtered_logs_{sanitize_filename(well_name)}.las",
+        )
         optimized_tdt = _resolve_artifact_path(row.get("optimized_tdt_file"), index)
         seismic_trace = _resolve_artifact_path(row.get("seismic_trace_file"), index)
         optimized_tdt = _prefer_existing_or_fallback(
@@ -478,7 +486,7 @@ def load_evaluation_wells(index: TieArtifactIndex, *, status: str = "success") -
             seismic_trace,
             index.auto_tie_dir / "seismic_trace" / f"seismic_trace_{sanitize_filename(well_name)}.csv",
         )
-        if input_las is None or not optimized_tdt.exists() or not seismic_trace.exists():
+        if input_las is None or not input_las.exists() or not optimized_tdt.exists() or not seismic_trace.exists():
             continue
         wells.append(
             TieEvaluationWell(

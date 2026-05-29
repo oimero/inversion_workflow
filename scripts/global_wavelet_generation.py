@@ -70,7 +70,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     merge_dict_defaults(
         script_cfg,
         "source_runs",
-        {"mode": "latest", "well_auto_tie_dir": None, "log_preprocess_dir": None},
+        {"mode": "latest", "well_auto_tie_dir": None},
     )
     merge_dict_defaults(
         script_cfg,
@@ -171,12 +171,7 @@ def _resolve_source_dirs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dic
         if source_runs.get("well_auto_tie_dir") is not None
         else _discover_latest_dir(cfg, "well_auto_tie")
     )
-    log_preprocess_dir = (
-        _resolve_repo_path(source_runs["log_preprocess_dir"])
-        if source_runs.get("log_preprocess_dir") is not None
-        else _discover_latest_dir(cfg, "log_preprocess")
-    )
-    return {"auto_tie_dir": auto_tie_dir, "log_preprocess_dir": log_preprocess_dir}
+    return {"auto_tie_dir": auto_tie_dir}
 
 
 def _ensure_output_dirs(output_dir: Path) -> dict[str, Path]:
@@ -689,7 +684,6 @@ def main() -> None:
         "evaluation_well_count": len(wells),
         "selected_wavelet_file": repo_relative_path(selected_wavelet_path, root=REPO_ROOT),
         "source_auto_tie_dir": repo_relative_path(source_dirs["auto_tie_dir"], root=REPO_ROOT),
-        "source_log_preprocess_dir": repo_relative_path(source_dirs["log_preprocess_dir"], root=REPO_ROOT),
     }
     write_json(output_dir / "selected_wavelet_summary.json", summary)
     write_json(output_dir / "run_summary.json", {"config": script_cfg, **summary})

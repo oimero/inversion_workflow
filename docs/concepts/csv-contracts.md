@@ -60,3 +60,14 @@
 | `usable_p_sonic` / `usable_density` | 路由所需曲线是否可用 |
 | `input_las` | 第三步预处理 LAS 路径 |
 | `time_depth_file` / `well_trace_file` | 时深表与井轨迹输入路径 |
+
+## `well_tie_metrics.csv`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `well_name` | 井名 |
+| `route` | 实际执行的第四步标定路由 |
+| `tie_status` | success / failed |
+| `optimized_tdt_file` | 第四步细标定后的内部 TDT CSV |
+| `filtered_las_file` | 第四步用最优滤波参数导出的 LAS；第五步从这里读取 `DT_USM`/`RHO_GCC` |
+| `seismic_trace_file` | 第四步保存的井旁或轨迹地震道 |

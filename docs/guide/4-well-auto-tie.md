@@ -73,16 +73,17 @@ well_auto_tie:
       config_file: experiments/well_auto_tie_anchors.yaml
     manual_shift:
       default_ms: 0.0
-      by_route_ms:
-        vertical_with_tdt: 0.0
       config_file: experiments/well_auto_tie_manual_shifts.yaml
 
   reject:
     allow_near_outside: false
-    min_valid_log_fraction: 0.7
     min_tie_samples: 64
     max_trajectory_outside_fraction: 0.05
 ```
+
+### `target_interval`
+
+脚本在井口 XY 处读取顶底解释层位的 TWT，加上 `margin_top_ms` 和 `margin_bottom_ms` 的冗余，构成标定目标窗。报告里的层位名从文件名自动推断，便于追溯输入；图件里的目标层位线只标注 `top` / `bottom`。
 
 ### `enabled_routes`
 
@@ -97,10 +98,6 @@ well_auto_tie:
 脚本自身的保守默认只启用前两条。主配置 `experiments/common.yaml` 额外启用了 `deviated_with_tdt`。如果你暂时不想跑斜井，从配置里删掉它即可——对应井会在 `well_tie_plan.csv` 里显示为 `skipped_disabled`，不会报错。
 
 `deviated_anchor_from_tops`（斜井、无时深、有轨迹和分层）还没有落地，设计文档在 `docs/guide/deviated-well-src-cup-refactor.md`。
-
-### `target_interval`
-
-脚本在井口 XY 处读取顶底解释层位的 TWT，加上 `margin_top_ms` 和 `margin_bottom_ms` 的冗余，构成标定目标窗。报告里的层位名从文件名自动推断，便于追溯输入；图件里的目标层位线只标注 `top` / `bottom`。
 
 ### `coarse_correction`
 
@@ -148,7 +145,6 @@ anchors:
 手动偏移规则：
 
 - `manual_shift.default_ms` 是全局默认值。
-- `manual_shift.by_route_ms.<route>` 覆盖某条路径的默认值。
 - `manual_shift.config_file` 指向单井手动偏移文件；文件里的 `manual_shift.wells_ms.<well-name>` 覆盖单井，优先级最高。
 
 单井手动偏移文件形如：
@@ -161,12 +157,20 @@ manual_shift:
 
 默认配置下，只有 `vertical_anchor_from_tops` 启用锚点；`vertical_with_tdt` 和 `deviated_with_tdt` 的锚点粗标定关闭。所有路径的手动偏移默认都是 0。
 
-### `max_trajectory_outside_fraction`
+### `reject`
 
-只对 `deviated_with_tdt` 生效。斜井轨迹在目标窗口内采样时，部分 TWT 样点对应的轨迹 XY 可能落到工区之外。脚本的处理逻辑是：
+`reject` 控制第四步自己的拒绝条件。曲线有效比例不在这里重复判定：第三步已经写出 `usable_p_sonic` 和 `usable_density`，第四步只消费这两个结果。
 
-- 出界比例 ≤ 5%：裁剪到最长连续工区内 TWT 段，在裁后的窗口内做标定。
-- 出界比例 > 5%：整井失败，原因记 `trajectory_outside_fraction_exceeded`。
+| 参数 | 含义 |
+|------|------|
+| `allow_near_outside` | 路由阶段是否允许 `survey_position == near_outside` 的井进入标定。默认 `false`，只接受工区内井。 |
+| `min_tie_samples` | 时深表、曲线窗口或斜井裁剪后的最少样点数；低于该值则失败。 |
+| `max_trajectory_outside_fraction` | 目标窗口内允许落到工区外的最大轨迹样点比例，仅对 `deviated_with_tdt` 生效。 |
+
+斜井轨迹在目标窗口内采样时，部分 TWT 样点对应的轨迹 XY 可能落到工区之外。脚本的处理逻辑是：
+
+- 出界比例 ≤ `max_trajectory_outside_fraction`：裁剪到最长连续工区内 TWT 段，在裁后的窗口内做标定。
+- 出界比例 > `max_trajectory_outside_fraction`：整井失败，原因记 `trajectory_outside_fraction_exceeded`。
 - 裁剪后样点数 < `min_tie_samples`：整井失败，原因记 `trajectory_inside_tie_samples_too_few`。
 
 ---
@@ -234,6 +238,8 @@ join 前三步的井清单、曲线可用性和轨迹 QC 结果，生成 `well_t
 | `wavelets/wavelet_201ms_<well>.csv` | 裁剪并能量归一化后的子波 |
 | `time_depth/initial_tdt_<well>.csv` | 进入 `wtie` 前的初始 TDT，含 `source` 列 |
 | `time_depth/optimized_tdt_<well>.csv` | `wtie` 优化后的 TDT |
+| `petrel_checkshots/optimized_tdt_<well>.txt` | Petrel checkshots 格式的细标定后时深表，便于导入地质软件 |
+| `filtered_las/filtered_logs_<well>.las` | 用本井 auto-tie 选中的日志滤波参数重建的 MD 域 LAS，供第五步和地质软件使用 |
 | `synthetic_qc/tie_qc_<well>.csv` | 地震、反射系数、合成记录和残差 |
 | `seismic_trace/seismic_trace_<well>.csv` | 实际用于标定的地震道（直井是井旁道，斜井是沿轨迹拼接道） |
 | `trace_sample_plan/trace_sample_plan_<well>.csv` | 斜井样点级落道明细；直井通常没有 |
@@ -241,6 +247,10 @@ join 前三步的井清单、曲线可用性和轨迹 QC 结果，生成 `well_t
 | `run_summary.json` | 输入路径、路由统计、失败统计、逐井补充信息 |
 
 `tie_window_report.csv` 会记录 `coarse_anchor_shift_ms`、`coarse_manual_shift_ms` 和 `coarse_total_shift_ms`。如果某口井没有启用锚点且手动偏移为 0，这三个值就是 0。
+
+`time_depth/optimized_tdt_<well>.csv` 是工作流内部格式，保留正秒 `twt_s` 和正米 `md_m`；`petrel_checkshots/optimized_tdt_<well>.txt` 是地质软件导入格式，沿用 `export_vertical_tdt_to_petrel_checkshots()` 的口径导出。`filtered_las/filtered_logs_<well>.las` 只包含第五步需要的标准曲线：`DT_USM`（`us/m`）和 `RHO_GCC`（`g/cm3`）。
+
+这里的“本井 auto-tie 选中的日志滤波参数”指 `wtie` 自动标定优化结束后返回的 `best_parameters` 中与日志滤波有关的三项：`logs_median_size`、`logs_median_threshold`、`logs_std`。脚本用它们在 MD 域重新滤波本井输入曲线，再把滤波后的 `Vp` 转回 `DT_USM`、`Rho` 写成 `RHO_GCC`。同一组 `best_parameters` 里的 `table_t_shift` 只用于时深表优化，不用于改写 `filtered_las` 曲线。
 
 ### `trace_sample_plan_<well>.csv`
 
@@ -302,6 +312,8 @@ planned_run_count / successful_tie_count
 - `best_table_shift_ms`：`wtie` 找到的整体时移量
 - `tie_window_start_s` / `tie_window_end_s`：实际标定窗口
 - `tdt_support_class`：TDT 来源（原始表、声波拓延、锚点积分）
+- `petrel_checkshot_file`：细标定后时深表的 Petrel checkshots 导入文件
+- `filtered_las_file`：第五步默认读取的滤波后 LAS 文件
 
 相关系数提高不等于结果可靠——必须结合 TDT 图、合成匹配图和子波形态一起看。
 

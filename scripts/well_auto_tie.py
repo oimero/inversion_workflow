@@ -145,7 +145,6 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
         {
             "allow_near_outside": False,
             "min_tie_samples": 64,
-            "min_valid_log_fraction": 0.7,
             "max_trajectory_outside_fraction": 0.05,
         },
     )

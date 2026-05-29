@@ -13,7 +13,7 @@ python scripts/global_wavelet_generation.py --well <well-name>
 python scripts/global_wavelet_generation.py --output-dir scripts/output/global_wavelet_test
 ```
 
-不带参数时，脚本自动发现最新的第四步和第三步产物，在 `scripts/output/global_wavelet_generation_<timestamp>/` 下写出结果。
+不带参数时，脚本自动发现最新的第四步产物，在 `scripts/output/global_wavelet_generation_<timestamp>/` 下写出结果。
 
 用 `--well` 可以只在一口井上评测，方便调试——此时脚本跳过共识优化，直接选第四步来源井指标最好的候选子波。
 
@@ -21,18 +21,16 @@ python scripts/global_wavelet_generation.py --output-dir scripts/output/global_w
 
 ## 运行前需要什么
 
-第五步依赖第四步和第三步的产物：
+第五步只依赖第四步产物：
 
 | 来源 | 文件 | 用途 |
 |------|------|------|
-| 第三步 | `preprocessed_las/*.las` | 读取 `DT_USM` 和 `RHO_GCC`，构造波阻抗和反射系数 |
 | 第四步 | `well_tie_plan.csv` | 每口井的路由、井口坐标 |
 | 第四步 | `well_tie_metrics.csv` | 标定成功/失败、优化后相关系数和 NMAE、实际标定窗口 |
 | 第四步 | `wavelet_inventory.csv` | 哪些子波可以作为候选、采样间隔、来源井指标 |
+| 第四步 | `filtered_las/filtered_logs_<well>.las` | 读取第四步最优参数滤波后的 `DT_USM` 和 `RHO_GCC`，构造波阻抗和反射系数 |
 | 第四步 | `time_depth/optimized_tdt_<well>.csv` | 优化后的时深表——第五步的固定评测基准 |
 | 第四步 | `seismic_trace/seismic_trace_<well>.csv` | 井旁或沿轨迹地震道——第五步不重新取道 |
-
-第五步不重新跑 auto-tie，不重新优化时深表，不重新决定斜井怎么取地震道。所有评测都在第四步已经固定好的 TDT 和地震道上进行。
 
 ---
 
@@ -43,7 +41,6 @@ global_wavelet_generation:
   source_runs:
     mode: latest                  # 自动发现最新前置产物
     well_auto_tie_dir: null
-    log_preprocess_dir: null
 
   candidate_filter:
     min_source_tie_corr: 0.35     # 来源井 auto-tie 相关系数低于此值的子波不进入候选池
@@ -113,12 +110,6 @@ global_wavelet_generation:
 
 第五步不做相位校正和极性翻转——这些会改变第四步 auto-tie 的物理含义。
 
-### `spatial_debias`
-
-密井网中，一个平台上十几口井的同形态子波如果各自算一票，会主导全局目标。空间去偏的思路是：先把评测井按平面距离聚成空间簇（距离小于 `cluster_radius_m` 的井连通），评分时先算簇内中位数、再算簇间中位数。这样一簇近井只贡献一票。
-
-如果不想用空间去偏，把 `enabled` 关掉即可——此时每口井等权投票。
-
 ### `generation.objective`
 
 优化目标由六项组成：
@@ -133,6 +124,12 @@ global_wavelet_generation:
 | `bandwidth_drift_weight` × 带宽漂移 | 防止主频偏离候选子波族太远 |
 
 权重都是正数，corr 项加分，NMAE/偏离/粗糙度/漂移项减分。
+
+### `spatial_debias`
+
+密井网中，一个平台上十几口井的同形态子波如果各自算一票，会主导全局目标。空间去偏的思路是：先把评测井按平面距离聚成空间簇（距离小于 `cluster_radius_m` 的井连通），评分时先算簇内中位数、再算簇间中位数。这样一簇近井只贡献一票。
+
+如果不想用空间去偏，把 `enabled` 关掉即可——此时每口井等权投票。
 
 ### `scoring`
 
@@ -182,7 +179,7 @@ global_wavelet_generation:
 
 ### 第五阶段：批量合成
 
-用最终选定的全局子波，对所有评测井生成统一的合成记录和 QC 数据。这一步才对应深度域批量合成脚本的角色——但它不调整时深表、不输出新的 TDT。
+用最终选定的全局子波，对所有评测井生成统一的合成记录和 QC 数据。
 
 ---
 
@@ -306,14 +303,6 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 | `No finite candidate wavelet metrics were produced` | 所有候选在所有井上的评测都失败了 | 检查子波采样间隔是否与地震道一致 |
 | `wavelet dt does not match seismic trace dt` | 某条子波的采样间隔和地震道不一致 | 检查第四步子波是否是用正确的地震采样间隔导出的 |
 | `insufficient_eval_fallback`（降级） | 评测井少于 `min_eval_well_count`，脚本降级为选最佳候选 | 检查第四步成功率；如果井确实少，这是预期行为 |
-
----
-
-## 和第四步的关系
-
-第四步产出的是"每口井各自最优的子波"，第五步产出的是"所有井共享的全局子波"。两者通过 `wavelet_inventory.csv` 衔接——第五步不直接扫描文件目录，而是读取这个索引来获知子波的来源井、路由、可用性和第四步指标。
-
-第五步的公平性来自一个关键约束：所有候选子波和生成子波，都在**同一条地震道、同一张优化时深表**上比较。评测过程不调整时深关系、不做 residual shift、不重新 auto-tie。这使得评测反映的是"子波本身的泛化能力"，而不是"子波+时深表联合过拟合"。
 
 ---
 

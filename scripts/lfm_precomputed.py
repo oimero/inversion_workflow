@@ -48,7 +48,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "global_wavelet_generation_dir": None,
     },
     "seismic": {"file": "raw/obn-clipped-240-912-872-1544.zgy", "type": "zgy"},
-    "target_interval": {"top_horizon": "interpre/H3-1", "bottom_horizon": "interpre/H7-1", "twt_unit": "auto"},
+    "target_interval": {
+        "horizons": ["interpre/H3-1", "interpre/H7-1"],
+        "twt_unit": "auto",
+    },
     "control_wells": {
         "min_batch_corr": 0.35,
         "max_batch_nmae": None,
@@ -233,13 +236,21 @@ def _build_target_layer(script_cfg: dict[str, Any], geometry: dict[str, Any], qc
     from cup.seismic.target_zone import TargetZone
 
     target_cfg = dict(script_cfg["target_interval"])
-    top_file = resolve_relative_path(target_cfg["top_horizon"], root=data_root)
-    bottom_file = resolve_relative_path(target_cfg["bottom_horizon"], root=data_root)
+    horizon_values = target_cfg.get("horizons")
+    if not isinstance(horizon_values, list) or len(horizon_values) < 2:
+        raise ValueError("lfm_precomputed.target_interval.horizons must contain at least two horizon files.")
+    horizon_files = [resolve_relative_path(value, root=data_root) for value in horizon_values]
     twt_unit = str(target_cfg.get("twt_unit", "auto"))
-    raw_horizons = {
-        top_file.stem: _normalize_horizon_twt_df(import_interpretation_petrel(top_file), unit=twt_unit),
-        bottom_file.stem: _normalize_horizon_twt_df(import_interpretation_petrel(bottom_file), unit=twt_unit),
-    }
+    raw_entries: list[tuple[float, str, Path, pd.DataFrame]] = []
+    for index, horizon_file in enumerate(horizon_files):
+        horizon_df = _normalize_horizon_twt_df(import_interpretation_petrel(horizon_file), unit=twt_unit)
+        values = horizon_df["interpretation"].to_numpy(dtype=float)
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            raise ValueError(f"Horizon contains no finite TWT values: {horizon_file}")
+        raw_entries.append((float(np.mean(finite)), f"horizon_{index}", horizon_file, horizon_df))
+    raw_entries.sort(key=lambda item: item[0])
+    raw_horizons = {name: horizon_df for _, name, _, horizon_df in raw_entries}
     target_layer = TargetZone(
         raw_horizon_dfs=raw_horizons,
         geometry=geometry,
@@ -251,12 +262,13 @@ def _build_target_layer(script_cfg: dict[str, Any], geometry: dict[str, Any], qc
         outlier_min_neighbor_count=target_cfg.get("outlier_min_neighbor_count", 2),
     )
     horizons = []
-    for path, name in [(top_file, top_file.stem), (bottom_file, bottom_file.stem)]:
+    for mean_twt, name, path, _horizon_df in raw_entries:
         grid = target_layer.get_horizon_grid(name)
         horizons.append(
             {
                 "file": repo_relative_path(path, root=REPO_ROOT),
                 "mean_twt_s": float(np.nanmean(grid)),
+                "input_mean_twt_s": float(mean_twt),
             }
         )
     return target_layer, horizons
@@ -354,6 +366,66 @@ def _nearest_trace_fields(survey: Any, inline_float: float, xline_float: float) 
     }
 
 
+def _slice_index_from_u(u_in_zone: float, n_slices: int) -> int:
+    if n_slices < 2:
+        raise ValueError(f"n_slices must be >= 2, got {n_slices}.")
+    slice_u = np.linspace(0.0, 1.0, int(n_slices), dtype=np.float64)
+    boundaries = 0.5 * (slice_u[:-1] + slice_u[1:])
+    return int(np.searchsorted(boundaries, float(u_in_zone), side="right"))
+
+
+def _aggregate_deviated_points_by_slice(
+    rows: list[dict[str, Any]],
+    *,
+    survey: Any,
+    n_slices: int,
+) -> tuple[list[dict[str, Any]], int]:
+    if len(rows) <= 1:
+        return rows, 0
+
+    frame = pd.DataFrame(rows)
+    frame["_slice_index"] = [
+        _slice_index_from_u(float(u_in_zone), int(n_slices)) for u_in_zone in frame["u_in_zone"].to_numpy(dtype=float)
+    ]
+
+    aggregated_rows: list[dict[str, Any]] = []
+    removed_count = 0
+    for (_well_name, _route, zone_name, _slice_index), group in frame.groupby(
+        ["well_name", "route", "zone_name", "_slice_index"],
+        sort=False,
+    ):
+        if len(group) == 1:
+            row = group.iloc[0].drop(labels=["_slice_index"]).to_dict()
+            aggregated_rows.append(_control_point_row(**row))
+            continue
+
+        removed_count += int(len(group) - 1)
+        inline_float = float(group["inline_float"].mean())
+        xline_float = float(group["xline_float"].mean())
+        trace_fields = _nearest_trace_fields(survey, inline_float, xline_float)
+        aggregated_rows.append(
+            _control_point_row(
+                well_name=str(group["well_name"].iloc[0]),
+                route=str(group["route"].iloc[0]),
+                source="deviated_trajectory",
+                twt_s=float(group["twt_s"].mean()),
+                md_m=float(group["md_m"].mean()),
+                x_m=float(group["x_m"].mean()),
+                y_m=float(group["y_m"].mean()),
+                inline_float=inline_float,
+                xline_float=xline_float,
+                zone_name=str(zone_name),
+                u_in_zone=float(group["u_in_zone"].mean()),
+                ai=float(group["ai"].mean()),
+                weight=1.0,
+                sample_index=int(round(float(group["sample_index"].mean()))),
+                **trace_fields,
+            )
+        )
+
+    return aggregated_rows, removed_count
+
+
 def _control_point_row(**kwargs: Any) -> dict[str, Any]:
     columns = [
         "well_name",
@@ -387,7 +459,7 @@ def _build_vertical_points(
     survey: Any,
     samples: np.ndarray,
     modeling_cfg: dict[str, Any],
-) -> tuple[list[dict[str, Any]], int, list[str]]:
+) -> tuple[list[dict[str, Any]], int, int, list[str]]:
     from cup.well.las import load_vp_rho_logset_from_standard_las
     from cup.well.td import load_workflow_time_depth_table_csv
     from wtie.processing import grid
@@ -444,7 +516,7 @@ def _build_vertical_points(
                 **trace_fields,
             )
         )
-    return rows, attempted, diagnostics
+    return rows, attempted, max(0, attempted - len(rows)), diagnostics
 
 
 def _build_deviated_points(
@@ -457,7 +529,7 @@ def _build_deviated_points(
     survey: Any,
     sample_step_s: float | None,
     modeling_cfg: dict[str, Any],
-) -> tuple[list[dict[str, Any]], int, list[str]]:
+) -> tuple[list[dict[str, Any]], int, int, list[str]]:
     from cup.well.las import load_vp_rho_logset_from_standard_las
 
     logset = load_vp_rho_logset_from_standard_las(las_file)
@@ -483,7 +555,7 @@ def _build_deviated_points(
 
     attempted = int(len(plan_df))
     if plan_df.empty:
-        return [], attempted, []
+        return [], attempted, attempted, []
     plan_md = plan_df["md_m"].to_numpy(dtype=float)
     finite_md = plan_md[np.isfinite(plan_md)]
     if finite_md.size >= 2 and np.any(np.diff(finite_md) < 0.0):
@@ -555,7 +627,15 @@ def _build_deviated_points(
                 **trace_fields,
             )
         )
-    return rows, attempted, diagnostics
+    raw_control_count = len(rows)
+    rows, aggregated_count = _aggregate_deviated_points_by_slice(
+        rows,
+        survey=survey,
+        n_slices=int(modeling_cfg["n_slices"]),
+    )
+    if aggregated_count:
+        diagnostics.append(f"deviated_slice_aggregation:{raw_control_count}->{len(rows)}")
+    return rows, attempted, max(0, attempted - raw_control_count), diagnostics
 
 
 def _to_control_points(rows: pd.DataFrame) -> list[Any]:
@@ -841,6 +921,7 @@ def main() -> None:
         plan = plan_by_key.get(key)
         well_rows: list[dict[str, Any]] = []
         attempted = 0
+        invalid_count = 0
         diagnostics: list[str] = []
         if reasons:
             status = "rejected"
@@ -850,7 +931,7 @@ def main() -> None:
                     trace_file = auto_dir / "trace_sample_plan" / f"trace_sample_plan_{sanitize_filename(well_name)}.csv"
                     if not trace_file.exists():
                         raise FileNotFoundError("missing_trace_sample_plan")
-                    well_rows, attempted, diagnostics = _build_deviated_points(
+                    well_rows, attempted, invalid_count, diagnostics = _build_deviated_points(
                         well_name=well_name,
                         route=route,
                         las_file=las_file,
@@ -867,7 +948,7 @@ def main() -> None:
                     surface_y = _as_optional_float(plan.get("surface_y"))
                     if surface_x is None or surface_y is None:
                         raise ValueError("missing_surface_xy")
-                    well_rows, attempted, diagnostics = _build_vertical_points(
+                    well_rows, attempted, invalid_count, diagnostics = _build_vertical_points(
                         well_name=well_name,
                         route=route,
                         las_file=las_file,
@@ -892,7 +973,6 @@ def main() -> None:
         unique_trace_count = 0
         if well_rows:
             unique_trace_count = int(pd.DataFrame(well_rows)["flat_idx"].dropna().nunique())
-        invalid_count = max(0, int(attempted) - int(len(well_rows)))
         qc_rows.append(
             {
                 "well_name": well_name,

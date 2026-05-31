@@ -20,8 +20,6 @@ python scripts/lfm_precomputed.py --output-dir scripts/output/lfm_precomputed_te
 
 ## 运行前需要什么
 
-第六步消费第四步的井震标定事实和第五步的全局子波批量合成 QC，不重新做曲线滤波、时深转换或子波扫描。
-
 | 来源 | 内容 | 用途 |
 |------|------|------|
 | 第四步 | 标定成功/失败、路由、优化后时深表、滤波 LAS | 筛选候选井、读取 AI 曲线、获取井位坐标 |
@@ -47,8 +45,10 @@ lfm_precomputed:
     type: segy
 
   target_interval:
-    top_horizon: null
-    bottom_horizon: null
+    horizons:
+      - interpre/H1
+      - interpre/H2
+      - interpre/H3
     twt_unit: auto
 
   control_wells:
@@ -100,7 +100,11 @@ lfm_precomputed:
 
 直井所有控制点落在井口对应的同一个 trace 上；斜井每个控制点落在各自轨迹样点对应的 trace 上，因此一口斜井的控制点会分布在多个不同的 `inline_float`、`xline_float` 处。
 
+斜井控制点在进入克里金前会先按 `well + zone + slice` 聚合：同一口斜井落入同一比例切片的轨迹样点只保留一个代表控制点，`inline_float`、`xline_float`、`x_m`、`y_m`、`twt_s`、`md_m`、`u_in_zone` 和 AI 都取算术平均。这样一小段斜井轨迹不会在同一张切片里被克里金误当成多口独立井。
+
 ### `target_interval`
+
+`horizons` 是目标层位列表，至少包含两个文件。脚本会读取所有层位并按平均 TWT 从浅到深排序，相邻层位组成建模层段。例如 `H1, H2, H3` 会形成 `H1 -> H2` 和 `H2 -> H3` 两个 zone。
 
 `twt_unit: auto` 表示按解释层位值的量级自动判断单位：值量级像毫秒则转为正秒，否则按正秒使用。解析结果必须与地震时间轴同单位。也可显式指定为 `s` 或 `ms`。
 
@@ -138,6 +142,7 @@ lfm_precomputed:
 3. 按 TWT 排序后可选重采样。
 4. 在空间映射给出的每个轨迹样点处，插值 AI 值并做低通滤波。
 5. 判断每个样点是否落入目标层内，记录其空间坐标、TWT、AI、zone 和 `u_in_zone`。
+6. 按 `well + zone + slice` 将同一口斜井在同一张比例切片内的样点聚合为一个代表控制点。
 
 两路共用同一条 AI 低通滤波管线：先检查数据量是否足够（至少 4 个以上有效样点），然后规整化到均匀网格、应用 Butterworth 零相位低通滤波、再插值回原始 TWT 位置。
 
@@ -147,7 +152,7 @@ lfm_precomputed:
 
 建模核心是将三维目标层分解为沿顶底界面按比例离散的二维切片，在每张切片上做空间插值，再将切片序列重构成三维体。
 
-1. **比例切片离散。** 将目标层沿顶底界面之间的方向均匀划分为若干层段，每个层段再沿层内比例方向（`u_in_zone` = 0 到 1）等间隔划分为切片。切片数量由 `n_slices` 控制，越多则垂向分辨率越高。
+1. **比例切片离散。** `target_interval.horizons` 中的相邻层位会组成一个或多个 zone。每个 zone 独立沿层内比例方向（`u_in_zone` = 0 到 1）等间隔划分为切片。切片数量由 `n_slices` 控制；例如一个 zone 且 `n_slices = 20` 时生成 20 张切片，两个 zone 时每个 zone 各 20 张。
 
 2. **控制点分配。** 每个控制点按其 `u_in_zone` 值分配到最近的切片。切片之间的分界取相邻两个切片中心的中点。
 

@@ -73,6 +73,7 @@
 | `optimized_tdt_file` | 第四步细标定后的内部 TDT CSV |
 | `filtered_las_file` | 第四步用最优滤波参数导出的 LAS；第五步从这里读取 `DT_USM`/`RHO_GCC` |
 | `seismic_trace_file` | 第四步保存的井旁或轨迹地震道 |
+| `optimized_trace_sample_plan_file` | 斜井细标定后按 optimized TDT 重新生成的样点级落道计划；直井为空 |
 
 ## `lfm_layer_control_points.csv`
 

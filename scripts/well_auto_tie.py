@@ -566,6 +566,7 @@ def _build_output_paths(output_dir: Path, well_name: str) -> dict[str, Path]:
         "synthetic_qc": output_dir / "synthetic_qc" / f"tie_qc_{safe}.csv",
         "seismic_trace": output_dir / "seismic_trace" / f"seismic_trace_{safe}.csv",
         "trace_sample_plan": output_dir / "trace_sample_plan" / f"trace_sample_plan_{safe}.csv",
+        "optimized_trace_sample_plan": output_dir / "trace_sample_plan" / f"optimized_trace_sample_plan_{safe}.csv",
         "figure_dir": figure_dir,
         "fig_objective": figure_dir / "optimization_objective.png",
         "fig_tdt": figure_dir / "time_depth_table.png",
@@ -659,6 +660,33 @@ def _export_petrel_checkshot_tdt(paths: dict[str, Path], plan: WellTiePlan, tabl
         x=_finite_float(plan.surface_x, label="surface_x"),
         y=_finite_float(plan.surface_y, label="surface_y"),
     )
+
+
+def _write_optimized_trace_sample_plan(
+    *,
+    paths: dict[str, Path],
+    plan: WellTiePlan,
+    survey: Any,
+    trajectory: WellTrajectory,
+    table: grid.TimeDepthTable,
+) -> Path:
+    """Write deviated-well spatial samples regenerated from the optimized TDT."""
+    if not getattr(table, "is_md_domain", False):
+        raise ValueError("Optimized trace sample plan expects an MD-domain TDT.")
+    table_twt = np.asarray(table.twt, dtype=np.float64)
+    if table_twt.size < 2:
+        raise ValueError("Optimized TDT must contain at least two TWT samples.")
+
+    sample_axis = survey.sample_axis("time")
+    sample_idx_start, sample_idx_end = sample_axis.window_indices(float(table_twt[0]), float(table_twt[-1]))
+    twt_axis = sample_axis.values[sample_idx_start:sample_idx_end]
+    if twt_axis.size == 0:
+        raise ValueError("Optimized trace sample plan has no seismic samples inside optimized TDT range.")
+
+    samples = sample_trajectory_on_twt(trajectory.with_well_name(plan.well_name), table, twt_axis)
+    trace_plan = build_nearest_trace_sample_plan(samples, survey)
+    trace_plan.to_dataframe().to_csv(paths["optimized_trace_sample_plan"], index=False)
+    return paths["optimized_trace_sample_plan"]
 
 
 def _filtered_standard_las_logset(logset_md: Any, best_params: Mapping[str, Any]) -> dict[str, grid.Log]:
@@ -1124,6 +1152,7 @@ def _run_deviated_with_tdt(
             },
         },
         seismic_override=seismic,
+        optimized_trace_trajectory=trajectory,
     )
     return result, extra
 
@@ -1139,6 +1168,7 @@ def _run_tie_with_initial_table(
     prepared: PreparedTieWindow,
     extra_seed: dict[str, Any] | None = None,
     seismic_override: Any | None = None,
+    optimized_trace_trajectory: WellTrajectory | None = None,
 ) -> tuple[WellTieResult, dict[str, Any]]:
     from wtie.optimize import autotie
     from wtie.utils.datasets.utils import InputSet
@@ -1228,6 +1258,15 @@ def _run_tie_with_initial_table(
     best_shift_ms = float(best_params.get("table_t_shift", 0.0)) * 1000.0
     petrel_checkshot_file = _export_petrel_checkshot_tdt(paths, plan, outputs.table)
     filtered_las_file = _export_filtered_las(paths, plan, logset_md, best_params)
+    optimized_trace_sample_plan_file = None
+    if optimized_trace_trajectory is not None:
+        optimized_trace_sample_plan_file = _write_optimized_trace_sample_plan(
+            paths=paths,
+            plan=plan,
+            survey=survey,
+            trajectory=optimized_trace_trajectory,
+            table=outputs.table,
+        )
     result = WellTieResult(
         well_name=plan.well_name,
         route=plan.route,
@@ -1255,6 +1294,11 @@ def _run_tie_with_initial_table(
         "initial_tdt_file": repo_relative_path(paths["initial_tdt"], root=REPO_ROOT),
         "petrel_checkshot_file": repo_relative_path(petrel_checkshot_file, root=REPO_ROOT),
         "filtered_las_file": repo_relative_path(filtered_las_file, root=REPO_ROOT),
+        "optimized_trace_sample_plan_file": (
+            None
+            if optimized_trace_sample_plan_file is None
+            else repo_relative_path(optimized_trace_sample_plan_file, root=REPO_ROOT)
+        ),
         }
     )
     return result, extra
@@ -1507,6 +1551,7 @@ def main() -> None:
                     "original_tdt_window_fraction": tie_window.get("original_tdt_window_fraction"),
                     "petrel_checkshot_file": extra.get("petrel_checkshot_file"),
                     "filtered_las_file": extra.get("filtered_las_file"),
+                    "optimized_trace_sample_plan_file": extra.get("optimized_trace_sample_plan_file"),
                 }
             )
     if metric_extra_rows and not metrics_df.empty:

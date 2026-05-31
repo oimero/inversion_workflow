@@ -928,9 +928,11 @@ def main() -> None:
         else:
             try:
                 if route.startswith("deviated"):
-                    trace_file = auto_dir / "trace_sample_plan" / f"trace_sample_plan_{sanitize_filename(well_name)}.csv"
+                    trace_file = _resolve_artifact_path(metric.get("optimized_trace_sample_plan_file"), run_dir=auto_dir)
+                    if trace_file is None:
+                        trace_file = auto_dir / "trace_sample_plan" / f"optimized_trace_sample_plan_{sanitize_filename(well_name)}.csv"
                     if not trace_file.exists():
-                        raise FileNotFoundError("missing_trace_sample_plan")
+                        raise FileNotFoundError("missing_optimized_trace_sample_plan")
                     well_rows, attempted, invalid_count, diagnostics = _build_deviated_points(
                         well_name=well_name,
                         route=route,
@@ -967,7 +969,7 @@ def main() -> None:
                 else:
                     control_rows.extend(well_rows)
             except Exception as exc:
-                status = "rejected" if str(exc) == "missing_trace_sample_plan" else "failed"
+                status = "rejected" if str(exc) == "missing_optimized_trace_sample_plan" else "failed"
                 reasons.append(str(exc) or type(exc).__name__)
 
         unique_trace_count = 0

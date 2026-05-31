@@ -23,11 +23,11 @@ python scripts/lfm_precomputed.py --output-dir scripts/output/lfm_precomputed_te
 | 来源 | 内容 | 用途 |
 |------|------|------|
 | 第四步 | 标定成功/失败、路由、优化后时深表、滤波 LAS | 筛选候选井、读取 AI 曲线、获取井位坐标 |
-| 第四步 | 斜井样点 TWT/MD/XY/inline/xline 映射 | 斜井控制点的空间事实来源 |
+| 第四步 | 斜井细标定后样点 TWT/MD/XY/inline/xline 映射 | 斜井控制点的空间事实来源 |
 | 第五步 | 全局子波批量合成指标 | 逐井合成质量，用于筛选控制井 |
 | 地震数据 | 地震体 + 顶底解释层位 | 提供时间轴、工区几何和目标层 mask |
 
-直井用井口坐标配合优化后时深表将 MD 域曲线映射到 TWT 域后生成控制点；斜井优先复用第四步写出的样点级空间映射，不重新写一套轨迹反查逻辑。斜井缺少空间映射时脚本会跳过该井并记录原因，不会将它降级成井口直井控制。
+直井用井口坐标配合优化后时深表将 MD 域曲线映射到 TWT 域后生成控制点；斜井复用第四步基于 optimized TDT 写出的 `optimized_trace_sample_plan_<well>.csv`，确保控制点空间事实和细标定后的时深关系一致。斜井缺少 optimized 空间映射时脚本会跳过该井并记录原因，不会将它降级成井口直井控制。
 
 ---
 
@@ -90,7 +90,7 @@ lfm_precomputed:
 - `include_wells`：白名单模式，只使用指定井。
 - `exclude_wells`：人工排除可疑井。
 
-此外，井还必须同时具备第四步产出的滤波 LAS 和优化后时深表；斜井还需要对应的空间映射文件。
+此外，井还必须同时具备第四步产出的滤波 LAS 和优化后时深表；斜井还需要对应的 optimized 空间映射文件。
 
 ### `controls`
 
@@ -138,7 +138,7 @@ lfm_precomputed:
 **斜井路径**
 
 1. 从滤波 LAS 读取 AI 曲线。
-2. 读取第四步的空间映射文件，只保留工区内样点。
+2. 读取第四步的 optimized 空间映射文件，只保留工区内样点。
 3. 按 TWT 排序后可选重采样。
 4. 在空间映射给出的每个轨迹样点处，插值 AI 值并做低通滤波。
 5. 判断每个样点是否落入目标层内，记录其空间坐标、TWT、AI、zone 和 `u_in_zone`。
@@ -226,7 +226,7 @@ lfm_precomputed:
 
 ### 第一步：看 `lfm_control_qc.csv`
 
-优先确认入选井的 `status` 分布。`rejected` 井的数量和原因（`batch_corr_below_threshold`、`too_few_control_samples`、`missing_trace_sample_plan` 等）直接反映第四步和第五步的衔接质量。
+优先确认入选井的 `status` 分布。`rejected` 井的数量和原因（`batch_corr_below_threshold`、`too_few_control_samples`、`missing_optimized_trace_sample_plan` 等）直接反映第四步和第五步的衔接质量。
 
 对入选井，看 `control_point_count` 和 `invalid_point_fraction`。无效比例过高通常说明时深表、井轨迹或目标层解释没有充分重叠。
 
@@ -248,7 +248,7 @@ lfm_precomputed:
 |------|------|---------|
 | `No LFM control points selected` | 所有井都被过滤或控制点生成失败 | 检查 `lfm_control_qc.csv` 的拒绝原因；多数情况是第四步成功井太少或第五步门槛过高 |
 | `target_layer geometry domain is not time` | 地震数据不在时间域 | 确认地震体路径和类型正确 |
-| 某口斜井 `missing_trace_sample_plan` | 第四步未为该斜井写出空间映射 | 回到第四步检查斜井路径是否执行成功 |
+| 某口斜井 `missing_optimized_trace_sample_plan` | 第四步未为该斜井写出细标定后的空间映射 | 回到第四步检查斜井路径是否执行成功，以及 `well_tie_metrics.csv` 是否有 `optimized_trace_sample_plan_file` |
 | `too_few_control_samples` | 落入目标层的有效样点不足 | 检查时深表范围是否覆盖目标层；LAS 曲线在目标层深度内是否有值 |
 | 地震体导出失败 | 缺少 SEG-Y 头字节配置或 ZGY 写入库不可用 | 检查配置中的 `iline_byte`/`xline_byte`，或确认 `pyzgy` 已安装；也可 `export_volume: false` 跳过导出 |
 

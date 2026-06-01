@@ -20,6 +20,16 @@ python scripts/ginn_inversion.py --skip-segy
 
 ---
 
+## 运行前需要什么
+
+| 输入 | 用途 |
+|------|------|
+| 第七步 checkpoint | 重建训练配置、加载模型权重和事实链 |
+| checkpoint 内记录的地震/LFM/子波路径 | 复用训练时的数据口径 |
+| 可选输出配置 | 控制剖面方向、抽样剖面和 SEG-Y 导出 |
+
+---
+
 ## 配置参考
 
 ```yaml
@@ -52,7 +62,7 @@ checkpoint 内已经包含第七步训练配置，因此第八步不应该重复
 
 ---
 
-## 输出文件
+## 核心输出文件
 
 所有文件在 `<output_root>/ginn_inversion_<timestamp>/` 下：
 
@@ -78,11 +88,11 @@ NPZ 应与第六步 LFM 的轴和 geometry 对齐：
 
 metadata 中应至少记录 `checkpoint_path`、`checkpoint_epoch`、`checkpoint_best_epoch`、`checkpoint_best_loss`、`ai_lfm_file`、`wavelet_file` 和 `prediction_stats`。
 
-`lfm_volume` 和 `mask` 适合写入可选 QC 包，而不是默认塞进主预测 NPZ。大工区下这两个数组会显著增加文件体积；主 NPZ 保持为下游消费所需的 stage-1 AI 体和轴信息即可。
+`lfm_volume` 和 `mask` 适合写入可选 QC 包，而不是默认塞进主预测 NPZ。大工区下这两个数组会显著增加文件体积；主 NPZ 保持为 stage-1 AI 体和轴信息即可。
 
 ---
 
-## QC 重点
+## 如何阅读结果
 
 ### 预测体统计
 
@@ -106,7 +116,7 @@ metadata 中应至少记录 `checkpoint_path`、`checkpoint_epoch`、`checkpoint
 
 ---
 
-## 常见失败原因
+### 常见失败原因
 
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
@@ -123,3 +133,6 @@ metadata 中应至少记录 `checkpoint_path`、`checkpoint_epoch`、`checkpoint
 - 输出给 enhance 的 stage-2 输入契约。
 - 多 checkpoint 集成或模型不确定性。
 - dynamic gain 版本的反演入口。
+
+
+

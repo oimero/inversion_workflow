@@ -1,51 +1,37 @@
 # 03 测井预处理
 
-`log_preprocess.py` 接在曲线筛选之后，对选出的曲线做规范化、清洗和复核，产出可直接交给井震标定的预处理 LAS。
+`well_preprocess.py` 接在曲线筛选之后，对选出的曲线做规范化、清洗和复核，产出可直接交给井震标定的预处理 LAS。
 
 ---
 
 ## 快速开始
 
 ```bash
-python scripts/log_preprocess.py
-python scripts/log_preprocess.py --config experiments/my_project.yaml
-python scripts/log_preprocess.py --output-dir /tmp/preprocess_test
+python scripts/well_preprocess.py
+python scripts/well_preprocess.py --config experiments/my_project.yaml
+python scripts/well_preprocess.py --output-dir /tmp/preprocess_test
 ```
 
-不带参数时，脚本自动从输出目录发现最新的曲线筛选产物，在 `<output_root>/log_preprocess_<timestamp>/` 下写出结果。
+不带参数时，脚本自动从输出目录发现最新的曲线筛选产物，在 `<output_root>/well_preprocess_<timestamp>/` 下写出结果。
 
 ---
 
-## 脚本在做什么
+## 运行前需要什么
 
-预处理分两趟完成。
-
-### 第一趟：逐井逐曲线规范化
-
-对每口通过第二步筛选的井，从原始 LAS 中加载第二步识别出的全部曲线（不只是 primary，还包括同类 secondary），依次做：
-
-1. **缺失哨兵替换** — 把 `-999.0`、`-999.25`、`-9999.0`、`-99999.0`、LAS header 声明的 NULL 值等已知占位符统一转为 NaN。
-2. **缩写规范化**（可关闭）— 把原始 mnemonic 映射到标准名，比如原始 `DT`、`DTC`、`AC` 都映射为 `DT_USM`。
-3. **单位规范化**（可关闭）— 声波统一为 `us/m` 慢度，密度统一为 `g/cm3`。同时做两层单位 QC：
-   - **硬失败**：声波慢度单位中位数 > 1000、声波速度单位中位数 < 1000、密度 g/cm3 中位数 > 100、密度 kg/m3 中位数 < 10 — 直接判该曲线失效。
-   - **软提示**：us/ft 中位数像 us/m、us/m 中位数像 us/ft、密度 g/cm3 中位数偏高 — 只记入 QC 报告。
-4. **连续常值段替换** — 把长度 ≥ 阈值的严格连续相同值段置为 NaN。井径默认跳过（防止误伤）。
-5. **收集全局阈值样本** — 把每条通过单位硬校验的 step2-primary 曲线的清洗后数据按标准曲线名汇集。
-
-### 第二阶段：全局阈值 + 逐井复核
-
-1. **计算全局分位数** — 按标准曲线名（`DT_USM`、`RHO_GCC` 等）分别统计 q01/q99。样本量不足时跳过并标记。
-2. **阈值优先级** — 对每条曲线，按「该井该曲线的手动配置 → 该曲线的全局手动配置 → 自动分位数」顺序解析最终使用的上下限。
-3. **极值替换** — 超出上下限的有限值置为 NaN。
-4. **可用性判定** — 检查最终有效点是否满足最低数量和相对初始有效点的最低比例。
-5. **Primary 接管** — 如果某 category 的 primary 曲线不可用，按顺序尝试同类 secondary。接管只在同一 category 内发生。
+| 输入 | 用途 |
+|------|------|
+| `well_screen.csv` | 确定第二步 passed 井、原始 LAS 路径和 primary 曲线 |
+| `las_curve_inventory.csv` | 读取每条曲线的类别、单位、primary 标记 |
+| `curve_classification/*.json` | 复原逐井分类细节，支持 primary 接管 |
+| `selected_las/*.las` | 读取第二步导出的瘦身 LAS 并做清洗 |
+| 可选阈值 override YAML | 人工指定曲线值域上下限 |
 
 ---
 
 ## 配置参考
 
 ```yaml
-log_preprocess:
+well_preprocess:
   # 来源 — null 表示自动发现最新第二步产物
   screen_file: null
   input_las_dir: null
@@ -100,7 +86,7 @@ log_preprocess:
     lower_quantile: 0.01
     upper_quantile: 0.99
     replacement: null
-    range_override_file: experiments/log_preprocess_ranges.yaml
+    range_override_file: experiments/well_preprocess_ranges.yaml
     min_samples_for_auto_threshold: 1000
 
   usable_thresholds:
@@ -168,6 +154,32 @@ well_curve:
 
 ---
 
+## 脚本在做什么
+
+预处理分两趟完成。
+
+### 第一趟：逐井逐曲线规范化
+
+对每口通过第二步筛选的井，从原始 LAS 中加载第二步识别出的全部曲线（不只是 primary，还包括同类 secondary），依次做：
+
+1. **缺失哨兵替换** — 把 `-999.0`、`-999.25`、`-9999.0`、`-99999.0`、LAS header 声明的 NULL 值等已知占位符统一转为 NaN。
+2. **缩写规范化**（可关闭）— 把原始 mnemonic 映射到标准名，比如原始 `DT`、`DTC`、`AC` 都映射为 `DT_USM`。
+3. **单位规范化**（可关闭）— 声波统一为 `us/m` 慢度，密度统一为 `g/cm3`。同时做两层单位 QC：
+   - **硬失败**：声波慢度单位中位数 > 1000、声波速度单位中位数 < 1000、密度 g/cm3 中位数 > 100、密度 kg/m3 中位数 < 10 — 直接判该曲线失效。
+   - **软提示**：us/ft 中位数像 us/m、us/m 中位数像 us/ft、密度 g/cm3 中位数偏高 — 只记入 QC 报告。
+4. **连续常值段替换** — 把长度 ≥ 阈值的严格连续相同值段置为 NaN。井径默认跳过（防止误伤）。
+5. **收集全局阈值样本** — 把每条通过单位硬校验的 step2-primary 曲线的清洗后数据按标准曲线名汇集。
+
+### 第二阶段：全局阈值 + 逐井复核
+
+1. **计算全局分位数** — 按标准曲线名（`DT_USM`、`RHO_GCC` 等）分别统计 q01/q99。样本量不足时跳过并标记。
+2. **阈值优先级** — 对每条曲线，按「该井该曲线的手动配置 → 该曲线的全局手动配置 → 自动分位数」顺序解析最终使用的上下限。
+3. **极值替换** — 超出上下限的有限值置为 NaN。
+4. **可用性判定** — 检查最终有效点是否满足最低数量和相对初始有效点的最低比例。
+5. **Primary 接管** — 如果某 category 的 primary 曲线不可用，按顺序尝试同类 secondary。接管只在同一 category 内发生。
+
+---
+
 ## 单位处理规则
 
 ### 声波类（`p_sonic` / `s_sonic`）
@@ -207,9 +219,9 @@ Vp (m/s) = 1e6 / DT_USM (us/m)
 
 ---
 
-## 输出文件
+## 核心输出文件
 
-所有文件在 `<output_root>/log_preprocess_<timestamp>/` 下：
+所有文件在 `<output_root>/well_preprocess_<timestamp>/` 下：
 
 ### `preprocessed_las/*.las`
 
@@ -312,3 +324,6 @@ Log preprocess summary: 38 step2-passed wells, 35 passed, 3 failed, 35 LAS expor
 - 全局阈值是否按层段、井型或工区分区细化。
 - 是否为极值处理生成直方图 QC 图。
 - 连续常值段阈值是否需要继续细化。
+
+
+

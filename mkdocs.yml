@@ -49,11 +49,11 @@ nav:
       - 核心 CSV 契约: concepts/csv-contracts.md
   - 教程:
       - 01 井资产盘点: guide/1-well-inventory.md
-      - 02 LAS 曲线筛选与导出: guide/2-las-curve-screen.md
-      - 03 测井预处理: guide/3-log-preprocess.md
-      - 旁路 井轨迹 QC: guide/well-trajectory-qc.md
+      - 02 LAS 曲线筛选与导出: guide/2-well-screen.md
+      - 03 测井预处理: guide/3-well-preprocess.md
+      - 旁路 井轨迹 QC: guide/well-trajectory.md
       - 04 井震自动标定: guide/4-well-auto-tie.md
-      - 05 全局子波生成与批量合成: guide/5-global-wavelet-generation.md
+      - 05 全局子波生成与批量合成: guide/5-wavelet-generation.md
       - 06 低频模型: guide/6-lfm-precomputed.md
       - 07 GINN 训练: guide/7-ginn-train.md
       - 常见问题: guide/troubleshooting.md
@@ -74,3 +74,4 @@ nav:
           - wtie.processing: api/wtie/processing.md
           - wtie.optimize: api/wtie/optimize.md
           - wtie.utils: api/wtie/utils.md
+

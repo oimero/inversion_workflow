@@ -6,8 +6,8 @@ then exports traceable preprocessed LAS files.
 
 Usage::
 
-    python scripts/log_preprocess.py
-    python scripts/log_preprocess.py --config experiments/common.yaml
+    python scripts/well_preprocess.py
+    python scripts/well_preprocess.py --config experiments/common.yaml
 """
 
 from __future__ import annotations
@@ -73,13 +73,13 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="Output directory. Defaults to <output_root>/log_preprocess_<timestamp>.",
+        help="Output directory. Defaults to <output_root>/well_preprocess_<timestamp>.",
     )
     return parser.parse_args()
 
 
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    script_cfg = dict(cfg.get("log_preprocess") or {})
+    script_cfg = dict(cfg.get("well_preprocess") or {})
     script_cfg.setdefault("screen_file", None)
     script_cfg.setdefault("input_las_dir", None)
     script_cfg.setdefault("curve_inventory_file", None)
@@ -131,7 +131,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "lower_quantile": 0.01,
             "upper_quantile": 0.99,
             "replacement": None,
-            "range_override_file": "experiments/log_preprocess_ranges.yaml",
+            "range_override_file": "experiments/well_preprocess_ranges.yaml",
             "min_samples_for_auto_threshold": 1000,
         },
     )
@@ -153,27 +153,27 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
         return _resolve_repo_path(args.output_dir)
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return output_root / f"log_preprocess_{timestamp}"
+    return output_root / f"well_preprocess_{timestamp}"
 
 
 def _discover_latest_screen_dir(cfg: dict[str, Any]) -> Path:
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
-    all_candidates = [path for path in output_root.glob("las_curve_screen_*") if path.is_dir()]
+    all_candidates = [path for path in output_root.glob("well_screen_*") if path.is_dir()]
     timestamped = [
         path
         for path in all_candidates
-        if re.fullmatch(r"las_curve_screen_\d{8}_\d{6}", path.name)
+        if re.fullmatch(r"well_screen_\d{8}_\d{6}", path.name)
     ]
     candidates = sorted(timestamped or all_candidates, key=lambda path: path.name)
     if not candidates:
-        raise FileNotFoundError("No las_curve_screen_* output directory found under output_root.")
+        raise FileNotFoundError("No well_screen_* output directory found under output_root.")
     return candidates[-1]
 
 
 def _resolve_inputs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str, Path]:
     latest_dir = _discover_latest_screen_dir(cfg)
     screen_file = (
-        latest_dir / "well_curve_screen.csv"
+        latest_dir / "well_screen.csv"
         if script_cfg.get("screen_file") is None
         else _resolve_repo_path(script_cfg["screen_file"])
     )
@@ -782,13 +782,13 @@ def run_preprocess(
         else {}
     )
     summary = {
-        "script": "log_preprocess.py",
+        "script": "well_preprocess.py",
         "inputs": {
             "screen_file": repo_relative_path(screen_file, root=REPO_ROOT),
             "selected_las_dir": repo_relative_path(input_las_dir, root=REPO_ROOT),
             "curve_inventory_file": repo_relative_path(curve_inventory_file, root=REPO_ROOT),
             "classification_dir": repo_relative_path(classification_dir, root=REPO_ROOT),
-            "raw_las_source": "well_curve_screen.las_file",
+            "raw_las_source": "well_screen.las_file",
         },
         "input_contract": {
             "selected_las_dir": "checked for upstream exported LAS presence",
@@ -848,3 +848,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

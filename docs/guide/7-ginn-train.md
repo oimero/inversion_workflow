@@ -158,7 +158,7 @@ well_control_enabled: false
 
 ---
 
-## 训练流程
+## 脚本在做什么
 
 训练流程由 `src.ginn.data.build_dataset()` 和 `src.ginn.trainer.Trainer` 串联：
 
@@ -194,7 +194,7 @@ well_control_enabled: false
 
 ---
 
-## 输出文件
+## 核心输出文件
 
 训练输出在 `checkpoint_dir` 下：
 
@@ -236,7 +236,7 @@ well_control_enabled: false
 
 ---
 
-## 常见失败原因
+### 常见失败原因
 
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
@@ -252,15 +252,13 @@ well_control_enabled: false
 
 ---
 
-## 下游消费
-
-第八步 `ginn_inversion.py` 读取 `best.pt`，从中取出训练配置来重建数据加载、mask、LFM、子波和 fixed gain 的口径。因此 checkpoint 不只是模型权重，还是第七步事实链的完整记录——更换地震体、LFM 或子波时，必须重新训练，不能只改第八步配置。
-
----
-
 ## 留到第二轮
 
 - 接入点级 `log_ai_anchor_file`，启用在训练 batch 中混入井控道的 in-batch well control 机制。
 - `gain_source: dynamic_gain_model`，将随样点变化的增益体作为输入通道和正演增益。
 - 按井或平台做专用验证集切分，替代单纯的空间块切分。
 - enhance stage-2 训练的契约对接。
+
+
+
+

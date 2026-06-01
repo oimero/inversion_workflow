@@ -6,8 +6,8 @@ left disabled by default and is not required for a reproducible first pass.
 
 Usage::
 
-    python scripts/las_curve_screen.py
-    python scripts/las_curve_screen.py --config experiments/common.yaml
+    python scripts/well_screen.py
+    python scripts/well_screen.py --config experiments/common.yaml
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="Output directory. Defaults to <output_root>/las_curve_screen_<timestamp>.",
+        help="Output directory. Defaults to <output_root>/well_screen_<timestamp>.",
     )
     return parser.parse_args()
 
@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    script_cfg = dict(cfg.get("las_curve_screen") or {})
+    script_cfg = dict(cfg.get("well_screen") or {})
     script_cfg.setdefault("inventory_file", None)
     script_cfg.setdefault("las_dir", "all_well_las")
     script_cfg.setdefault("include_survey_positions", ["inside", "near_outside"])
@@ -94,7 +94,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     )
     script_cfg.setdefault("curve_schema_file", None)
     script_cfg.setdefault("curve_override_file", "experiments/curve_alias_overrides.yaml")
-    script_cfg.setdefault("llm", {"enabled": False, "cache_dir": "scripts/output/las_curve_screen_cache", "max_retry": 1})
+    script_cfg.setdefault("llm", {"enabled": False, "cache_dir": "scripts/output/well_screen_cache", "max_retry": 1})
     script_cfg.setdefault("export", {"selected_las_dir": "selected_las", "null_value": -999.25, "write_fmt": "%.6f"})
     return script_cfg
 
@@ -112,7 +112,7 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
         return _resolve_repo_path(args.output_dir)
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return output_root / f"las_curve_screen_{timestamp}"
+    return output_root / f"well_screen_{timestamp}"
 
 
 def _discover_latest_inventory_file(cfg: dict[str, Any]) -> Path:
@@ -120,7 +120,7 @@ def _discover_latest_inventory_file(cfg: dict[str, Any]) -> Path:
     candidates = sorted(output_root.glob("well_inventory_*/well_inventory.csv"))
     if not candidates:
         raise FileNotFoundError(
-            "las_curve_screen.inventory_file is not configured and no "
+            "well_screen.inventory_file is not configured and no "
             "well_inventory_*/well_inventory.csv file was found under output_root."
         )
     return candidates[-1]
@@ -402,13 +402,13 @@ def run_screening(
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = {
         "las_curve_inventory_csv": output_dir / "las_curve_inventory.csv",
-        "well_curve_screen_csv": output_dir / "well_curve_screen.csv",
+        "well_screen_csv": output_dir / "well_screen.csv",
         "skipped_wells_csv": output_dir / "skipped_wells.csv",
         "skipped_curves_csv": output_dir / "skipped_curves.csv",
         "run_summary_json": output_dir / "run_summary.json",
     }
     pd.DataFrame.from_records(curve_inventory_rows).to_csv(paths["las_curve_inventory_csv"], index=False, encoding="utf-8")
-    pd.DataFrame.from_records(well_rows).to_csv(paths["well_curve_screen_csv"], index=False, encoding="utf-8")
+    pd.DataFrame.from_records(well_rows).to_csv(paths["well_screen_csv"], index=False, encoding="utf-8")
     pd.DataFrame.from_records(skipped_well_rows, columns=["well_name", "reason"]).to_csv(
         paths["skipped_wells_csv"],
         index=False,
@@ -427,7 +427,7 @@ def run_screening(
         else {}
     )
     summary = {
-        "script": "las_curve_screen.py",
+        "script": "well_screen.py",
         "inputs": {
             "inventory_file": repo_relative_path(inventory_file, root=REPO_ROOT),
             "las_dir": repo_relative_path(las_dir, root=REPO_ROOT),
@@ -481,7 +481,7 @@ def main() -> None:
     )
     summary = result["summary"]
     print(f"Saved LAS curve inventory: {result['paths']['las_curve_inventory_csv']}")
-    print(f"Saved well curve screen: {result['paths']['well_curve_screen_csv']}")
+    print(f"Saved well screen: {result['paths']['well_screen_csv']}")
     print(f"Saved skipped wells: {result['paths']['skipped_wells_csv']}")
     print(f"Saved skipped curves: {result['paths']['skipped_curves_csv']}")
     print(f"Saved run summary: {result['paths']['run_summary_json']}")
@@ -497,3 +497,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

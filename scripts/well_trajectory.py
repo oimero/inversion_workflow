@@ -6,8 +6,8 @@ deviated-well routing without changing the LAS screening/preprocess chain.
 
 Usage::
 
-    python scripts/well_trajectory_qc.py
-    python scripts/well_trajectory_qc.py --config experiments/common.yaml
+    python scripts/well_trajectory.py
+    python scripts/well_trajectory.py --config experiments/common.yaml
 """
 
 from __future__ import annotations
@@ -58,13 +58,13 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="Output directory. Defaults to <output_root>/well_trajectory_qc_<timestamp>.",
+        help="Output directory. Defaults to <output_root>/well_trajectory_<timestamp>.",
     )
     return parser.parse_args()
 
 
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    script_cfg = dict(cfg.get("well_trajectory_qc") or {})
+    script_cfg = dict(cfg.get("well_trajectory") or {})
     merge_dict_defaults(script_cfg, "source_runs", {"mode": "latest", "well_inventory_dir": None})
     script_cfg.setdefault("inventory_file", None)
     script_cfg.setdefault("well_trace_dir", "all_well_trace")
@@ -105,7 +105,7 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
         return _resolve_repo_path(args.output_dir)
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return output_root / f"well_trajectory_qc_{timestamp}"
+    return output_root / f"well_trajectory_{timestamp}"
 
 
 def _discover_latest_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
@@ -119,7 +119,7 @@ def _discover_latest_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, A
 
     mode = str(source_runs.get("mode", "latest")).strip().casefold()
     if mode != "latest":
-        raise ValueError("well_trajectory_qc.inventory_file must be configured when source_runs.mode is not 'latest'.")
+        raise ValueError("well_trajectory.inventory_file must be configured when source_runs.mode is not 'latest'.")
 
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
     all_candidates = [path for path in output_root.glob("well_inventory_*/well_inventory.csv") if path.is_file()]
@@ -426,7 +426,7 @@ def _value_counts(rows: Sequence[dict[str, Any]], key: str) -> dict[str, int]:
 # =============================================================================
 
 
-def run_trajectory_qc(
+def run_trajectory(
     *,
     inventory_df: pd.DataFrame,
     trace_lookup: dict[str, Path],
@@ -552,7 +552,7 @@ def main() -> None:
         )
         geometry = survey.describe_geometry(domain="time")
 
-    main_df, failed_df, summary = run_trajectory_qc(
+    main_df, failed_df, summary = run_trajectory(
         inventory_df=inventory_df,
         trace_lookup=trace_lookup,
         survey=survey,
@@ -562,15 +562,15 @@ def main() -> None:
     )
 
     paths = {
-        "well_trajectory_qc": output_dir / "well_trajectory_qc.csv",
+        "well_trajectory": output_dir / "well_trajectory.csv",
         "failed_trajectories": output_dir / "failed_trajectories.csv",
         "run_summary": output_dir / "run_summary.json",
     }
-    main_df.to_csv(paths["well_trajectory_qc"], index=False)
+    main_df.to_csv(paths["well_trajectory"], index=False)
     failed_df.to_csv(paths["failed_trajectories"], index=False)
 
     run_summary = {
-        "script": "well_trajectory_qc.py",
+        "script": "well_trajectory.py",
         "config_file": repo_relative_path(args.config, root=REPO_ROOT),
         "inputs": {
             "data_root": repo_relative_path(data_root, root=REPO_ROOT),
@@ -595,3 +595,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

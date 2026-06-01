@@ -6,7 +6,7 @@
 边界说明
 --------
 - 本模块不负责井型判定（直/斜），判定逻辑在 ``cup.well.assets`` 与
-  ``well_trajectory_qc.py`` 中。
+  ``well_trajectory.py`` 中。
 - TVDSS 换算约定在本模块内唯一实现，其他模块不应独立散写。
 
 核心公开对象
@@ -385,3 +385,4 @@ def trajectory_summary(trajectory: WellTrajectory) -> Mapping[str, float | int |
         "max_incl_deg": finite_max(trajectory.incl_deg),
         "max_dls": finite_max(trajectory.dls),
     }
+

@@ -45,7 +45,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "source_runs": {
         "mode": "latest",
         "well_auto_tie_dir": None,
-        "global_wavelet_generation_dir": None,
+        "wavelet_generation_dir": None,
     },
     "seismic": {"file": "raw/obn-clipped-240-912-872-1544.zgy", "type": "zgy"},
     "target_interval": {
@@ -117,7 +117,7 @@ def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[
     source_cfg = dict(script_cfg.get("source_runs") or {})
     mode = str(source_cfg.get("mode", "latest")).strip().lower()
     auto_dir_value = source_cfg.get("well_auto_tie_dir")
-    wavelet_dir_value = source_cfg.get("global_wavelet_generation_dir")
+    wavelet_dir_value = source_cfg.get("wavelet_generation_dir")
     if mode != "latest" and (auto_dir_value is None or wavelet_dir_value is None):
         raise ValueError("source_runs.mode other than 'latest' requires explicit source directories.")
     auto_dir = (
@@ -126,11 +126,11 @@ def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[
         else resolve_relative_path(auto_dir_value, root=REPO_ROOT)
     )
     wavelet_dir = (
-        _latest_run(output_root, "global_wavelet_generation", "batch_synthetic_metrics.csv")
+        _latest_run(output_root, "wavelet_generation", "batch_synthetic_metrics.csv")
         if wavelet_dir_value in {None, ""}
         else resolve_relative_path(wavelet_dir_value, root=REPO_ROOT)
     )
-    return {"well_auto_tie_dir": auto_dir, "global_wavelet_generation_dir": wavelet_dir}
+    return {"well_auto_tie_dir": auto_dir, "wavelet_generation_dir": wavelet_dir}
 
 
 def _resolve_artifact_path(value: Any, *, run_dir: Path) -> Path | None:
@@ -870,7 +870,7 @@ def main() -> None:
         sample_axis = np.arange(float(sample_axis[0]), float(sample_axis[-1]) + 0.5 * sample_step_s, sample_step_s)
 
     auto_dir = source_dirs["well_auto_tie_dir"]
-    wavelet_dir = source_dirs["global_wavelet_generation_dir"]
+    wavelet_dir = source_dirs["wavelet_generation_dir"]
     metrics_df = pd.read_csv(auto_dir / "well_tie_metrics.csv")
     plan_df = pd.read_csv(auto_dir / "well_tie_plan.csv") if (auto_dir / "well_tie_plan.csv").exists() else pd.DataFrame()
     batch_df = pd.read_csv(wavelet_dir / "batch_synthetic_metrics.csv")
@@ -1079,3 +1079,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

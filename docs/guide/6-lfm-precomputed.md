@@ -38,7 +38,7 @@ lfm_precomputed:
   source_runs:
     mode: latest
     well_auto_tie_dir: null
-    global_wavelet_generation_dir: null
+    wavelet_generation_dir: null
 
   seismic:
     file: null
@@ -174,7 +174,7 @@ lfm_precomputed:
 
 ---
 
-## 输出文件
+## 核心输出文件
 
 所有文件在 `<output_root>/lfm_precomputed_<timestamp>/` 下：
 
@@ -242,7 +242,7 @@ lfm_precomputed:
 
 ---
 
-## 常见失败原因
+### 常见失败原因
 
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
@@ -254,14 +254,6 @@ lfm_precomputed:
 
 ---
 
-## 下游消费
-
-第七步 `ginn_train.py` 读取 `ai_lfm_time.npz` 的 `volume` 作为低频模型输入通道，读取 `metadata_json.horizons` 重建训练 mask，读取 `metadata_json.target_layer` 复用目标层 QC 参数。
-
-因此第六步产出的 NPZ 不只是数据体，还承载了目标层的层位选择和 QC 口径。第七步的 train config 不再单独配置顶底层位——这一事实从第六步继承。
-
----
-
 ## 留到第二轮
 
 - 输出 Vp 和 Rho LFM。
@@ -269,3 +261,7 @@ lfm_precomputed:
 - 从点级控制直接生成 GINN 井约束锚点文件。
 - dynamic gain 或 frequency split 诊断与 LFM 的联动。
 - 斜井 AI 低通滤波的采样率自适应（当前使用中位步长，对极不均匀采样的适应性有限）。
+
+
+
+

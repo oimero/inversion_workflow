@@ -14,7 +14,7 @@
 | `wellbore_class` | 井型初分：vertical / deviated / unknown |
 | `inventory_status` | 资产状态，不等同于最终筛选候选状态 |
 
-## `well_curve_screen.csv`
+## `well_screen.csv`
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -36,7 +36,7 @@
 | `final_p_sonic` / `final_density` / `final_caliper` | 最终标准 mnemonic |
 | `preprocessed_las` | 第三步预处理 LAS；仅 passed 井应有值 |
 
-## `well_trajectory_qc.csv`
+## `well_trajectory.csv`
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -103,3 +103,4 @@
 | `invalid_point_count` / `invalid_point_fraction` | 因目标层、轨迹、TDT 或曲线问题被丢弃的点 |
 | `unique_trace_count` | 控制点覆盖的唯一 trace 数；斜井通常大于 1 |
 | `reasons` | 拒绝或失败原因 |
+

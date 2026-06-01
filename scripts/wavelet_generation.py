@@ -6,8 +6,8 @@ optimizes a PCA consensus wavelet, and exports one selected global wavelet.
 
 Usage::
 
-    python scripts/global_wavelet_generation.py
-    python scripts/global_wavelet_generation.py --config experiments/common.yaml
+    python scripts/wavelet_generation.py
+    python scripts/wavelet_generation.py --config experiments/common.yaml
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    script_cfg = dict(cfg.get("global_wavelet_generation") or {})
+    script_cfg = dict(cfg.get("wavelet_generation") or {})
     merge_dict_defaults(
         script_cfg,
         "source_runs",
@@ -153,7 +153,7 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
         return _resolve_repo_path(args.output_dir)
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return output_root / f"global_wavelet_generation_{timestamp}"
+    return output_root / f"wavelet_generation_{timestamp}"
 
 
 def _discover_latest_dir(cfg: dict[str, Any], prefix: str) -> Path:
@@ -695,3 +695,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

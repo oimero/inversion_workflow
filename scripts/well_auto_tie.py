@@ -90,16 +90,16 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
         {
             "mode": "latest",
             "well_inventory_dir": None,
-            "las_curve_screen_dir": None,
-            "log_preprocess_dir": None,
-            "well_trajectory_qc_dir": None,
+            "well_screen_dir": None,
+            "well_preprocess_dir": None,
+            "well_trajectory_dir": None,
         },
     )
     script_cfg.setdefault("inventory_file", None)
-    script_cfg.setdefault("curve_screen_file", None)
+    script_cfg.setdefault("well_screen_file", None)
     script_cfg.setdefault("preprocess_status_file", None)
     script_cfg.setdefault("preprocessed_las_dir", None)
-    script_cfg.setdefault("trajectory_qc_file", None)
+    script_cfg.setdefault("well_trajectory_file", None)
     script_cfg.setdefault("time_depth_dir", "time_depth_table")
     script_cfg.setdefault("well_trace_dir", "all_well_trace")
     script_cfg.setdefault("well_tops_file", "raw/well_tops")
@@ -202,56 +202,58 @@ def _resolve_inputs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str
         else _discover_latest_dir(cfg, "well_inventory")
     )
     screen_dir = (
-        _resolve_repo_path(source_runs["las_curve_screen_dir"])
-        if source_runs.get("las_curve_screen_dir") is not None
-        else _discover_latest_dir(cfg, "las_curve_screen")
+        _resolve_repo_path(source_runs["well_screen_dir"])
+        if source_runs.get("well_screen_dir") is not None
+        else _discover_latest_dir(cfg, "well_screen")
     )
     preprocess_dir = (
-        _resolve_repo_path(source_runs["log_preprocess_dir"])
-        if source_runs.get("log_preprocess_dir") is not None
-        else _discover_latest_dir(cfg, "log_preprocess")
+        _resolve_repo_path(source_runs["well_preprocess_dir"])
+        if source_runs.get("well_preprocess_dir") is not None
+        else _discover_latest_dir(cfg, "well_preprocess")
     )
 
-    trajectory_qc_dir = None
-    if source_runs.get("well_trajectory_qc_dir") is not None:
-        trajectory_qc_dir = _resolve_repo_path(source_runs["well_trajectory_qc_dir"])
+    trajectory_dir = None
+    if source_runs.get("well_trajectory_dir") is not None:
+        trajectory_dir = _resolve_repo_path(source_runs["well_trajectory_dir"])
     else:
         try:
-            trajectory_qc_dir = _discover_latest_dir(cfg, "well_trajectory_qc")
+            trajectory_dir = _discover_latest_dir(cfg, "well_trajectory")
         except FileNotFoundError:
-            trajectory_qc_dir = None
+            trajectory_dir = None
 
     inventory_file = (
         _resolve_repo_path(script_cfg["inventory_file"])
         if script_cfg.get("inventory_file") is not None
         else inventory_dir / "well_inventory.csv"
     )
-    curve_screen_file = (
-        _resolve_repo_path(script_cfg["curve_screen_file"])
-        if script_cfg.get("curve_screen_file") is not None
-        else screen_dir / "well_curve_screen.csv"
+    well_screen_file = (
+        _resolve_repo_path(script_cfg["well_screen_file"])
+        if script_cfg.get("well_screen_file") is not None
+        else screen_dir / "well_screen.csv"
     )
     preprocess_status_file = (
         _resolve_repo_path(script_cfg["preprocess_status_file"])
         if script_cfg.get("preprocess_status_file") is not None
         else preprocess_dir / "well_preprocess_status.csv"
     )
-    trajectory_qc_file = (
-        _resolve_repo_path(script_cfg["trajectory_qc_file"])
-        if script_cfg.get("trajectory_qc_file") is not None
-        else (trajectory_qc_dir / "well_trajectory_qc.csv" if trajectory_qc_dir is not None else None)
+    well_trajectory_file = (
+        _resolve_repo_path(script_cfg["well_trajectory_file"])
+        if script_cfg.get("well_trajectory_file") is not None
+        else (trajectory_dir / "well_trajectory.csv" if trajectory_dir is not None else None)
     )
 
     return {
         "inventory_file": inventory_file,
-        "curve_screen_file": curve_screen_file,
+        "well_screen_file": well_screen_file,
         "preprocess_status_file": preprocess_status_file,
         "preprocessed_las_dir": (
             _resolve_repo_path(script_cfg["preprocessed_las_dir"])
             if script_cfg.get("preprocessed_las_dir") is not None
             else preprocess_dir / "preprocessed_las"
         ),
-        "trajectory_qc_file": trajectory_qc_file if trajectory_qc_file is not None and trajectory_qc_file.exists() else None,
+        "well_trajectory_file": (
+            well_trajectory_file if well_trajectory_file is not None and well_trajectory_file.exists() else None
+        ),
     }
 
 
@@ -1369,9 +1371,9 @@ def main() -> None:
 
     paths = _resolve_inputs(cfg, script_cfg)
     inventory_df = pd.read_csv(paths["inventory_file"])
-    curve_screen_df = pd.read_csv(paths["curve_screen_file"])
+    well_screen_df = pd.read_csv(paths["well_screen_file"])
     preprocess_df = pd.read_csv(paths["preprocess_status_file"])
-    trajectory_df = pd.read_csv(paths["trajectory_qc_file"]) if paths["trajectory_qc_file"] is not None else None
+    trajectory_df = pd.read_csv(paths["well_trajectory_file"]) if paths["well_trajectory_file"] is not None else None
 
     time_depth_dir = _resolve_data_path(script_cfg["time_depth_dir"], data_root=data_root)
     well_trace_dir = _resolve_data_path(script_cfg["well_trace_dir"], data_root=data_root)
@@ -1600,10 +1602,10 @@ def main() -> None:
         "config_file": repo_relative_path(args.config, root=REPO_ROOT),
         "inputs": {
             "inventory_file": repo_relative_path(paths["inventory_file"], root=REPO_ROOT),
-            "curve_screen_file": repo_relative_path(paths["curve_screen_file"], root=REPO_ROOT),
+            "well_screen_file": repo_relative_path(paths["well_screen_file"], root=REPO_ROOT),
             "preprocess_status_file": repo_relative_path(paths["preprocess_status_file"], root=REPO_ROOT),
-            "trajectory_qc_file": repo_relative_path(paths["trajectory_qc_file"], root=REPO_ROOT)
-            if paths["trajectory_qc_file"] is not None
+            "well_trajectory_file": repo_relative_path(paths["well_trajectory_file"], root=REPO_ROOT)
+            if paths["well_trajectory_file"] is not None
             else None,
             "time_depth_dir": repo_relative_path(time_depth_dir, root=REPO_ROOT),
             "well_tops_file": repo_relative_path(well_tops_file, root=REPO_ROOT),
@@ -1614,9 +1616,9 @@ def main() -> None:
         "enabled_routes": list(script_cfg["enabled_routes"]),
         "input_row_counts": {
             "inventory": int(len(inventory_df)),
-            "curve_screen": int(len(curve_screen_df)),
+            "well_screen": int(len(well_screen_df)),
             "preprocess_status": int(len(preprocess_df)),
-            "trajectory_qc": int(len(trajectory_df)) if trajectory_df is not None else 0,
+            "well_trajectory": int(len(trajectory_df)) if trajectory_df is not None else 0,
         },
         "route_counts": _series_value_counts(plan_df["route"]),
         "route_status_counts": _series_value_counts(plan_df["route_status"]),
@@ -1644,3 +1646,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

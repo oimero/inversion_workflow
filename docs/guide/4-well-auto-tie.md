@@ -24,13 +24,13 @@ python scripts/well_auto_tie.py --output-dir scripts/output/well_auto_tie_test
 | 来源 | 文件 | 用途 |
 |------|------|------|
 | 第一步 | `well_inventory.csv` | 井口坐标、资产清单、井型初分、工区位置 |
-| 第二步 | `well_curve_screen.csv` | 曲线筛选审计、每口井有哪些可用曲线 |
+| 第二步 | `well_screen.csv` | 曲线筛选审计、每口井有哪些可用曲线 |
 | 第三步 | `well_preprocess_status.csv`、`preprocessed_las/*.las` | 判断 `DT_USM` 和 `RHO_GCC` 是否可用，加载标准 LAS |
-| 轨迹 QC | `well_trajectory_qc.csv` | 优先用复核后的井型替代第一步的初分 |
+| 轨迹 QC | `well_trajectory.csv` | 优先用复核后的井型替代第一步的初分 |
 | 数据目录 | 时深表目录、井轨迹目录、井分层文件 | 时深表、Petrel 井轨迹、井分层 |
 | 地震数据 | ZGY 或 SEG-Y 体、解释层位 | 读取井旁地震道或沿轨迹道集，确定目标时间窗 |
 
-如果找不到最新的 `well_trajectory_qc_*` 目录，脚本退回到第一步的井口/底孔初分来判定直井斜井——对直井没影响，但斜井判定可能不准。
+如果找不到最新的 `well_trajectory_*` 目录，脚本退回到第一步的井口/底孔初分来判定直井斜井——对直井没影响，但斜井判定可能不准。
 
 ---
 
@@ -41,9 +41,15 @@ well_auto_tie:
   source_runs:
     mode: latest                  # 自动发现最新前置产物
     well_inventory_dir: null
-    las_curve_screen_dir: null
-    log_preprocess_dir: null
-    well_trajectory_qc_dir: null
+    well_screen_dir: null
+    well_preprocess_dir: null
+    well_trajectory_dir: null
+
+  inventory_file: null
+  well_screen_file: null
+  preprocess_status_file: null
+  preprocessed_las_dir: null
+  well_trajectory_file: null
 
   time_depth_dir: <time-depth-dir>
   well_trace_dir: <well-trajectory-dir>
@@ -223,7 +229,7 @@ join 前三步的井清单、曲线可用性和轨迹 QC 结果，生成 `well_t
 
 ---
 
-## 输出文件
+## 核心输出文件
 
 所有文件在 `<output_root>/well_auto_tie_<timestamp>/` 下：
 
@@ -271,18 +277,6 @@ join 前三步的井清单、曲线可用性和轨迹 QC 结果，生成 `well_t
 `used_for_tie` 只用于初始 `trace_sample_plan_<well>.csv` 审计 auto-tie 裁剪窗口；optimized 版本已经是细标定后的下游空间映射，不再使用这个字段表达 tie 窗口裁剪。
 
 即使整井失败，这份文件通常也已经写出。对照它可以看出失败是轨迹出界、工区转换失败，还是最长 inside 窗口太短。
-
----
-
-## 常见失败原因
-
-| 原因 | 含义 | 怎么处理 |
-|------|------|---------|
-| `tdt_no_target_window_overlap` | 时深表和目标窗口完全不重叠 | 检查 Petrel TDT 的时间范围、解释层位单位和目标窗配置 |
-| `trajectory_outside_fraction_exceeded` | 斜井轨迹在目标窗内超过 5% 的样点出工区 | 看 `trace_sample_plan`，确认轨迹或工区几何是否有问题 |
-| `trajectory_inside_tie_samples_too_few` | 裁剪后连续 inside 样点太少 | 放宽窗口 margin、检查轨迹，或暂时跳过这口井 |
-| `TWT axis outside table range` | 地震采样轴超出了 TDT 范围 | 检查声波拓延是否有足够曲线覆盖 |
-| `Seismic trace has zero standard deviation` | 读到的那段地震道完全没有振幅变化 | 检查地震体、窗口范围和道索引 |
 
 ---
 
@@ -336,9 +330,24 @@ planned_run_count / successful_tie_count
 
 ---
 
+### 常见失败原因
+
+| 原因 | 含义 | 怎么处理 |
+|------|------|---------|
+| `tdt_no_target_window_overlap` | 时深表和目标窗口完全不重叠 | 检查 Petrel TDT 的时间范围、解释层位单位和目标窗配置 |
+| `trajectory_outside_fraction_exceeded` | 斜井轨迹在目标窗内超过 5% 的样点出工区 | 看 `trace_sample_plan`，确认轨迹或工区几何是否有问题 |
+| `trajectory_inside_tie_samples_too_few` | 裁剪后连续 inside 样点太少 | 放宽窗口 margin、检查轨迹，或暂时跳过这口井 |
+| `TWT axis outside table range` | 地震采样轴超出了 TDT 范围 | 检查声波拓延是否有足够曲线覆盖 |
+| `Seismic trace has zero standard deviation` | 读到的那段地震道完全没有振幅变化 | 检查地震体、窗口范围和道索引 |
+
+---
+
 ## 留到第二轮
 
 - `deviated_anchor_from_tops`：斜井无时深、有轨迹和分层的第四条路径。
 - 斜井地震采样从最近道升级到双线性或多道加权。
 - 斜井轨迹 inline/xline 随 TWT 变化的专用 QC 图。
 - 密井网下多井落到同一 trace/time 样点时的冲突诊断。
+
+
+

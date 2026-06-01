@@ -1,19 +1,19 @@
 # 05 全局子波生成与批量合成
 
-`global_wavelet_generation.py` 是时间域工作流的第五步。它读取第四步每口成功井产出的子波，在所有井上做交叉评测，再在候选子波张成的低维形态空间中优化出一条全局共识子波，最后用这条子波生成统一的批量合成记录。
+`wavelet_generation.py` 是时间域工作流的第五步。它读取第四步每口成功井产出的子波，在所有井上做交叉评测，再在候选子波张成的低维形态空间中优化出一条全局共识子波，最后用这条子波生成统一的批量合成记录。
 
 ---
 
 ## 快速开始
 
 ```bash
-python scripts/global_wavelet_generation.py
-python scripts/global_wavelet_generation.py --config experiments/common.yaml
-python scripts/global_wavelet_generation.py --well <well-name>
-python scripts/global_wavelet_generation.py --output-dir scripts/output/global_wavelet_test
+python scripts/wavelet_generation.py
+python scripts/wavelet_generation.py --config experiments/common.yaml
+python scripts/wavelet_generation.py --well <well-name>
+python scripts/wavelet_generation.py --output-dir scripts/output/wavelet_generation_test
 ```
 
-不带参数时，脚本自动发现最新的第四步产物，在 `scripts/output/global_wavelet_generation_<timestamp>/` 下写出结果。
+不带参数时，脚本自动发现最新的第四步产物，在 `scripts/output/wavelet_generation_<timestamp>/` 下写出结果。
 
 用 `--well` 可以只在一口井上评测，方便调试——此时脚本跳过共识优化，直接选第四步来源井指标最好的候选子波。
 
@@ -37,7 +37,7 @@ python scripts/global_wavelet_generation.py --output-dir scripts/output/global_w
 ## 配置参考
 
 ```yaml
-global_wavelet_generation:
+wavelet_generation:
   source_runs:
     mode: latest                  # 自动发现最新前置产物
     well_auto_tie_dir: null
@@ -183,9 +183,9 @@ global_wavelet_generation:
 
 ---
 
-## 输出文件
+## 核心输出文件
 
-所有文件在 `<output_root>/global_wavelet_generation_<timestamp>/` 下：
+所有文件在 `<output_root>/wavelet_generation_<timestamp>/` 下：
 
 | 文件 | 内容 |
 |------|------|
@@ -247,7 +247,7 @@ global_wavelet_generation:
 
 ```
 === Global Wavelet Generation ===
-Output: scripts/output/global_wavelet_generation_<timestamp>
+Output: scripts/output/wavelet_generation_<timestamp>
 Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 ```
 
@@ -294,7 +294,7 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 
 ---
 
-## 常见失败原因
+### 常见失败原因
 
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
@@ -306,14 +306,6 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 
 ---
 
-## 下游消费
-
-第六步 `lfm_precomputed.py` 使用本步的 `batch_synthetic_metrics.csv` 过滤 LFM 控制井。默认策略是：只有全局子波批量合成质量达标的井，才会把第四步的 `filtered_las`、`optimized_tdt` 和斜井 `trace_sample_plan` 转成 LFM 点级控制。
-
-因此第五步的 `batch_synthetic_metrics.csv` 不只是 QC 报告，也是第六步的控制井筛选依据。不要在第六步重新做 residual shift scan，也不要跳过第五步直接把所有第四步成功井放进 LFM。
-
----
-
 ## 留到第二轮
 
 - 是否允许按区块、层段或井型生成多个全局子波。
@@ -321,3 +313,7 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 - 是否在 PCA 前先做子波形态聚类；第一版先靠 PCA 系数范围和正则化控制。
 - 是否增加只诊断、不反写的 residual shift scan。
 - 是否让 dynamic gain 评估结果反向参与全局子波评分；第一版不要耦合，避免形成闭环。
+
+
+
+

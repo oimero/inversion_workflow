@@ -487,7 +487,7 @@ def load_vp_rho_logset_from_standard_las(path: str | Path) -> grid.LogSet:
     """从标准 LAS 构建 MD 域 Vp/Rho LogSet。
 
     标准 LAS 指包含第三步标准曲线 ``DT_USM`` 与 ``RHO_GCC`` 的 LAS，
-    不要求文件一定由 ``scripts/log_preprocess.py`` 生成。
+    不要求文件一定由 ``scripts/well_preprocess.py`` 生成。
 
     Parameters
     ----------
@@ -927,3 +927,4 @@ def export_selected_curves_to_las(
 
     out.write(str(output_las), version=2.0, wrap=False, fmt=write_fmt)
     return output_las, skipped, exported_mnemonics
+

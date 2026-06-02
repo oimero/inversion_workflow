@@ -111,12 +111,12 @@ global_priority:                  # 覆盖全局 primary 选择优先级
   density: [RHOB, DEN, RHOZ]
 
 wells:
-  A1:                             # 单井配置（井名大小写不敏感）
+  <well-name>:                    # 单井配置（井名大小写不敏感）
     primary:                      # 单井单类别指定 primary
       p_sonic: DTC
     disabled_curves: [DT_BAD]    # 跳过该井的某些曲线
     force_category:               # 强制将某曲线归入某类别
-      RHOZ2: density
+      <curve-name>: density
 ```
 
 - `global_priority`：调整每类曲线的优先顺序，例如优先选原始测井曲线，少选派生产品。

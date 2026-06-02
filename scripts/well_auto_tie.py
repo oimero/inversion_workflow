@@ -264,7 +264,6 @@ def _anchor_spec_for_well(anchor_config: dict[str, Any], well_name: str) -> dict
         if str(key).strip().casefold() == well_name.strip().casefold():
             spec.update(dict(value or {}))
             break
-    spec.setdefault("event", "peak")
     spec.setdefault("twt_unit", "auto")
     return spec
 
@@ -358,7 +357,6 @@ def _sample_anchor_for_plan(
     return {
         "well_top": str(spec["well_top"]),
         "horizon": repo_relative_path(horizon_path, root=REPO_ROOT),
-        "event": str(spec.get("event", "")),
         "twt_unit": str(spec.get("twt_unit", "auto")),
         "anchor_md_m": float(anchor_md_m),
         "anchor_x_m": float(anchor_x_m),
@@ -1554,7 +1552,6 @@ def main() -> None:
         "well_name",
         "well_top",
         "horizon",
-        "event",
         "twt_unit",
         "anchor_md_m",
         "anchor_x_m",

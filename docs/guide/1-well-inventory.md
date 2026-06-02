@@ -37,7 +37,7 @@ python scripts/well_inventory.py --output-dir /tmp/inventory_test
 | 井分层文件 | Petrel 格式，必须包含 `Well`、`Surface`、`MD` 列 |
 | 时深表目录 | 文件名 stem 即为井名；本脚本仅检查文件是否存在 |
 
-**井名匹配规则：** 所有资产通过文件名 stem 或记录中的 `Name`/`Well` 字段做大小写不敏感匹配。`A1`、`a1`、`A1.las`、`A1.petrel_dev` 被视为同一口井；井轨迹文件也可以没有扩展名。大小写冲突会直接报错。名为 `nan`、`none`、`null` 或空白的记录会被跳过。
+**井名匹配规则：** 所有资产通过文件名 stem 或记录中的 `Name`/`Well` 字段做大小写不敏感匹配。`WellA`、`wella`、`WellA.las`、`WellA.petrel_dev` 被视为同一口井；井轨迹文件也可以没有扩展名。大小写冲突会直接报错。名为 `nan`、`none`、`null` 或空白的记录会被跳过。
 
 ---
 

@@ -69,7 +69,7 @@ wavelet_generation:
       strategy: random_then_powell
       random_trials: 512
       max_refine_iters: 120
-      seed: 20260529
+      seed: 12345
     objective:
       corr_weight: 1.0
       p10_corr_weight: 0.5
@@ -171,7 +171,7 @@ wavelet_generation:
 3. **两阶段搜索。** 先大量随机尝试，找到高分区域；再对高分结果做局部细化。
 4. **每次评测都做完整交叉评测。** 每条生成子波和候选子波一样，在所有评测井上做合成记录、算空间去偏聚合指标、加上正则化项得到最终分数。
 
-整个过程的所有 trial（随机 + 细化）都写入 `consensus_search_trials.csv`，可以追溯每一步的系数、各项指标和分数。
+整个过程的所有试验（随机 + 细化）都写入 `consensus_search_trials.csv`，可以追溯每一步的系数、各项指标和分数。
 
 ### 第四阶段：选择
 
@@ -233,7 +233,7 @@ wavelet_generation:
 | 字段 | 含义 |
 |------|------|
 | `trial_id` | 搜索编号 |
-| `coef_0 ... coef_k` | 该 trial 的 PCA 系数 |
+| `coef_0 ... coef_k` | 该试验的 PCA 系数 |
 | `spatial_debiased_median_corr` | 空间去偏中位相关系数 |
 | `spatial_debiased_p10_corr` | 空间去偏 P10 相关系数 |
 | `spatial_debiased_median_nmae` | 空间去偏中位 NMAE |
@@ -271,7 +271,7 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 }
 ```
 
-如果 `selected_score` 只比 `best_candidate_score` 高一点点（< 0.02），说明共识子波的优势很微弱，建议把图和 trial 明细一起看，不要只凭分数接受。
+如果 `selected_score` 只比 `best_candidate_score` 高一点点（< 0.02），说明共识子波的优势很微弱，建议把图和试验明细一起看，不要只凭分数接受。
 
 ### 第三步：看 `wavelet_candidate_aggregate.csv`
 
@@ -285,8 +285,8 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 
 在优化搜索记录中关注：
 
-- 随机采样阶段分数最高的几个 trial 和细化后最终选中的 trial 之间的分数差——如果细化提升很小（< 0.01），说明随机采样已经找到了足够好的区域。
-- 最终选中 trial 的各项指标是否都在候选子波族的合理范围内（`deviation_from_mean`、`roughness`、`bandwidth_drift` 不应显著高于候选的典型值）。
+- 随机采样阶段分数最高的几个试验和细化后最终选中的试验之间的分数差——如果细化提升很小（< 0.01），说明随机采样已经找到了足够好的区域。
+- 最终选中试验的各项指标是否都在候选子波族的合理范围内（`deviation_from_mean`、`roughness`、`bandwidth_drift` 不应显著高于候选的典型值）。
 
 ### 第五步：看图
 
@@ -315,7 +315,3 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 - 是否允许按区块、层段或井型生成多个全局子波。
 - 是否允许显式相位或极性搜索；默认不做。
 - 是否在 PCA 前先做子波形态聚类；第一版先靠 PCA 系数范围和正则化控制。
-- 是否增加只诊断、不反写的 residual shift scan。
-- 是否让 dynamic gain 评估结果反向参与全局子波评分；第一版不要耦合，避免形成闭环。
-
-

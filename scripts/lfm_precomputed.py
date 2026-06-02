@@ -374,7 +374,7 @@ def _slice_index_from_u(u_in_zone: float, n_slices: int) -> int:
     return int(np.searchsorted(boundaries, float(u_in_zone), side="right"))
 
 
-def _aggregate_deviated_points_by_slice(
+def _aggregate_points_by_well_zone_slice(
     rows: list[dict[str, Any]],
     *,
     survey: Any,
@@ -390,8 +390,8 @@ def _aggregate_deviated_points_by_slice(
 
     aggregated_rows: list[dict[str, Any]] = []
     removed_count = 0
-    for (_well_name, _route, zone_name, _slice_index), group in frame.groupby(
-        ["well_name", "route", "zone_name", "_slice_index"],
+    for (_well_name, _route, source, zone_name, _slice_index), group in frame.groupby(
+        ["well_name", "route", "source", "zone_name", "_slice_index"],
         sort=False,
     ):
         if len(group) == 1:
@@ -407,7 +407,7 @@ def _aggregate_deviated_points_by_slice(
             _control_point_row(
                 well_name=str(group["well_name"].iloc[0]),
                 route=str(group["route"].iloc[0]),
-                source="deviated_trajectory",
+                source=str(source),
                 twt_s=float(group["twt_s"].mean()),
                 md_m=float(group["md_m"].mean()),
                 x_m=float(group["x_m"].mean()),
@@ -417,7 +417,7 @@ def _aggregate_deviated_points_by_slice(
                 zone_name=str(zone_name),
                 u_in_zone=float(group["u_in_zone"].mean()),
                 ai=float(group["ai"].mean()),
-                weight=1.0,
+                weight=float(group["weight"].mean()) if "weight" in group else 1.0,
                 sample_index=int(round(float(group["sample_index"].mean()))),
                 **trace_fields,
             )
@@ -628,13 +628,6 @@ def _build_deviated_points(
             )
         )
     raw_control_count = len(rows)
-    rows, aggregated_count = _aggregate_deviated_points_by_slice(
-        rows,
-        survey=survey,
-        n_slices=int(modeling_cfg["n_slices"]),
-    )
-    if aggregated_count:
-        diagnostics.append(f"deviated_slice_aggregation:{raw_control_count}->{len(rows)}")
     return rows, attempted, max(0, attempted - raw_control_count), diagnostics
 
 
@@ -962,6 +955,14 @@ def main() -> None:
                         samples=sample_axis,
                         modeling_cfg=script_cfg["modeling"],
                     )
+                raw_control_count = len(well_rows)
+                well_rows, aggregated_count = _aggregate_points_by_well_zone_slice(
+                    well_rows,
+                    survey=survey,
+                    n_slices=int(script_cfg["modeling"]["n_slices"]),
+                )
+                if aggregated_count:
+                    diagnostics.append(f"slice_aggregation:{raw_control_count}->{len(well_rows)}")
                 reasons.extend(diagnostics)
                 if len(well_rows) < min_points:
                     status = "rejected"

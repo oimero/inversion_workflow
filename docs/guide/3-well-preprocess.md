@@ -138,7 +138,7 @@ global:
     max: 3.0
 
 well_curve:
-  A1:
+  <well-name>:
     DT_USM:
       min: 130.0
       max: 480.0

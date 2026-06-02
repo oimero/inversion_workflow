@@ -121,15 +121,14 @@ shifted_tdt.twt = petrel_tdt.twt + anchor_shift_s + manual_shift_s
 
 锚点深度必须落在该井时深表覆盖范围内。超出范围时脚本会直接失败，避免用端点外推制造看似合理但不可追溯的时移。
 
-对没有 Petrel TDT 的直井，锚点不是平移已有时深表，而是帮助脚本从声波曲线积分建立一条初始时深关系；之后仍可叠加人工整体时移。
+对没有 Petrel TDT 的直井，脚本会用锚点给声波积分定时，再沿声波曲线向上、向下建立初始 TDT；人工整体时移会叠加在这条新建 TDT 上。
 
 锚点选择规则：
 
 - 锚点文件里的 `anchors.default` 是全局默认锚点。
-- 锚点文件里的 `anchors.wells.<well-name>` 可以为单井覆盖 `well_top`、`horizon`、`event`、`twt_unit`。
+- 锚点文件里的 `anchors.wells.<well-name>` 可以为单井覆盖 `well_top`、`horizon`、`twt_unit`。
 - 直井锚点的解释层位 TWT 在井口 XY 处读取。
 - 斜井 `deviated_with_tdt` 如果启用锚点粗标定，解释层位 TWT 在锚点 MD 对应的轨迹 XY 处读取。
-- `event` 目前只写入 `anchor_report.csv` 作为审计信息，不参与层位采样或 TWT 修正。
 
 锚点文件形如：
 
@@ -138,7 +137,6 @@ anchors:
   default:
     well_top: <marker-name>
     horizon: <horizon-file>
-    event: peak
     twt_unit: auto
   wells:
     <well-name>:
@@ -208,7 +206,9 @@ manual_shift:
 
 ### 第三步：取地震道
 
-**直井**很简单：在井口 XY 处读一条地震道。
+**直井**只需要一个固定井位，但不是简单吸附到最近道。脚本会把井口 XY 转成工区里的浮点 inline/xline index，读取周围四条相邻地震道，并按井口落在四邻道网格中的位置做双线性插值。这样可以避免井口刚好落在两条道之间时，被最近道选择带来阶跃误差。
+
+如果井口周围四邻道有缺失，或井口落到工区范围外，直井取道会失败；这类问题通常应回到第一步的 `survey_position` 和井口坐标检查。
 
 **斜井**不同——井眼不是垂直的，不同深度的轨迹点对应不同的地面 XY。如果还在井口读一条道，深部的标定就对不上。所以斜井需要沿轨迹逐点取道：
 
@@ -217,7 +217,7 @@ manual_shift:
 3. 如果只有少量样点落到工区外面，裁剪到最长连续工区内段。
 4. 对其中用到的每条唯一地震道各读一次，再按 TWT 样点逐点取出对应时刻的振幅值，拼成一条"沿轨迹地震道"。
 
-第一步版本用的是最近道采样，不做空间插值。每个样点落在哪条道上、是否在工区内，全部写进 `trace_sample_plan_<well>.csv`。
+斜井第一版用的是最近道采样，不做空间插值。每个样点落在哪条道上、是否在工区内，全部写进 `trace_sample_plan_<well>.csv`。
 
 ### 第四步：细标定
 
@@ -251,9 +251,9 @@ manual_shift:
 
 `tie_window_report.csv` 会记录 `coarse_anchor_shift_ms`、`coarse_manual_shift_ms` 和 `coarse_total_shift_ms`。如果某口井没有启用锚点且手动偏移为 0，这三个值就是 0。
 
-`time_depth/optimized_tdt_<well>.csv` 是工作流内部格式，保留正秒 `twt_s` 和正米 `md_m`；`petrel_checkshots/optimized_tdt_<well>.txt` 是地质软件导入格式，沿用 `export_vertical_tdt_to_petrel_checkshots()` 的口径导出。`filtered_las/filtered_logs_<well>.las` 只包含第五步需要的标准曲线：`DT_USM`（`us/m`）和 `RHO_GCC`（`g/cm3`）。
+`time_depth/optimized_tdt_<well>.csv` 是工作流内部格式，保留正秒 `twt_s` 和正米 `md_m`；`petrel_checkshots/optimized_tdt_<well>.txt` 是地质软件导入格式，沿用 `export_vertical_tdt_to_petrel_checkshots()` 的口径导出。
 
-`filtered_las/filtered_logs_<well>.las` 是第四步为第五步准备的“标定后口径”LAS：它保留本井自动标定选中的日志滤波效果，但不会把时深表的整体时移写回测井曲线。也就是说，它修的是曲线滤波口径，不是把 LAS 深度轴改掉。
+`filtered_las/filtered_logs_<well>.las` 只包含第五步需要的标准曲线：`DT_USM`（`us/m`）和 `RHO_GCC`（`g/cm3`）。它保留本井自动标定选中的滤波效果，但不会把时深表的整体时移写回测井曲线。也就是说，它修的是曲线滤波口径，不是把 LAS 深度轴改掉。
 
 ### `trace_sample_plan_<well>.csv`
 

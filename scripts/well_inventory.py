@@ -90,11 +90,13 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
 
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_inventory") or {})
-    script_cfg.setdefault("well_heads_file", "raw/well_heads")
-    script_cfg.setdefault("las_dir", "all_well_las")
-    script_cfg.setdefault("well_trace_dir", "all_well_trace")
-    script_cfg.setdefault("well_tops_file", "raw/well_tops")
-    script_cfg.setdefault("time_depth_dir", "time_depth_table")
+    source_data = dict(script_cfg.get("source_data") or {})
+    source_data.setdefault("well_heads_file", "raw/well_heads")
+    source_data.setdefault("las_dir", "all_well_las")
+    source_data.setdefault("well_trace_dir", "all_well_trace")
+    source_data.setdefault("well_tops_file", "raw/well_tops")
+    source_data.setdefault("time_depth_dir", "time_depth_table")
+    script_cfg["source_data"] = source_data
     script_cfg.setdefault(
         "seismic",
         {
@@ -102,10 +104,16 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "type": "zgy",
         },
     )
-    script_cfg.setdefault("near_survey_threshold_m", 500.0)
-    script_cfg.setdefault("vertical_bottom_offset_threshold_m", 30.0)
-    script_cfg.setdefault("platform_cluster_threshold_m", 12.5)
-    script_cfg.setdefault("dense_well_neighbor_threshold_m", 150.0)
+    survey_position = dict(script_cfg.get("survey_position") or {})
+    survey_position.setdefault("near_survey_threshold_m", 500.0)
+    script_cfg["survey_position"] = survey_position
+    wellbore_classification = dict(script_cfg.get("wellbore_classification") or {})
+    wellbore_classification.setdefault("vertical_bottom_offset_threshold_m", 30.0)
+    script_cfg["wellbore_classification"] = wellbore_classification
+    dense_well_qc = dict(script_cfg.get("dense_well_qc") or {})
+    dense_well_qc.setdefault("platform_cluster_threshold_m", 12.5)
+    dense_well_qc.setdefault("dense_well_neighbor_threshold_m", 150.0)
+    script_cfg["dense_well_qc"] = dense_well_qc
     return script_cfg
 
 
@@ -253,14 +261,16 @@ def build_inventory(
                 record.surface_y,
                 record.bottom_x,
                 record.bottom_y,
-                vertical_bottom_offset_threshold_m=float(config["vertical_bottom_offset_threshold_m"]),
+                vertical_bottom_offset_threshold_m=float(
+                    config["wellbore_classification"]["vertical_bottom_offset_threshold_m"]
+                ),
             )
             if record.wellbore_class == "unknown":
                 record.reasons.append("invalid_bottom_xy")
             _classify_survey_position(
                 record,
                 survey=survey,
-                near_survey_threshold_m=float(config["near_survey_threshold_m"]),
+                near_survey_threshold_m=float(config["survey_position"]["near_survey_threshold_m"]),
             )
         else:
             record.survey_position = "invalid_xy"
@@ -276,12 +286,12 @@ def build_inventory(
 
     neighbor_pairs, neighbor_summary = build_neighbor_pairs(
         records,
-        dense_well_neighbor_threshold_m=float(config["dense_well_neighbor_threshold_m"]),
-        platform_cluster_threshold_m=float(config["platform_cluster_threshold_m"]),
+        dense_well_neighbor_threshold_m=float(config["dense_well_qc"]["dense_well_neighbor_threshold_m"]),
+        platform_cluster_threshold_m=float(config["dense_well_qc"]["platform_cluster_threshold_m"]),
     )
     cluster_rows = build_cluster_rows(
         records,
-        platform_cluster_threshold_m=float(config["platform_cluster_threshold_m"]),
+        platform_cluster_threshold_m=float(config["dense_well_qc"]["platform_cluster_threshold_m"]),
     )
     cluster_ids = {row.cluster_id for row in cluster_rows}
 
@@ -339,11 +349,12 @@ def main() -> None:
     data_root = resolve_relative_path(str(cfg.get("data_root", "data")), root=REPO_ROOT)
     output_dir = _resolve_output_dir(args, cfg)
 
-    well_heads_file = _resolve_data_path(script_cfg["well_heads_file"], data_root=data_root)
-    las_dir = _resolve_data_path(script_cfg["las_dir"], data_root=data_root)
-    well_trace_dir = _resolve_data_path(script_cfg["well_trace_dir"], data_root=data_root)
-    well_tops_file = _resolve_data_path(script_cfg["well_tops_file"], data_root=data_root)
-    time_depth_dir = _resolve_data_path(script_cfg["time_depth_dir"], data_root=data_root)
+    source_data = dict(script_cfg["source_data"])
+    well_heads_file = _resolve_data_path(source_data["well_heads_file"], data_root=data_root)
+    las_dir = _resolve_data_path(source_data["las_dir"], data_root=data_root)
+    well_trace_dir = _resolve_data_path(source_data["well_trace_dir"], data_root=data_root)
+    well_tops_file = _resolve_data_path(source_data["well_tops_file"], data_root=data_root)
+    time_depth_dir = _resolve_data_path(source_data["time_depth_dir"], data_root=data_root)
     seismic_cfg = dict(script_cfg["seismic"])
     seismic_file = _resolve_data_path(seismic_cfg["file"], data_root=data_root)
     seismic_type = str(seismic_cfg.get("type", "zgy")).lower()
@@ -389,10 +400,12 @@ def main() -> None:
             "seismic_type": seismic_type,
         },
         "thresholds": {
-            "near_survey_threshold_m": float(script_cfg["near_survey_threshold_m"]),
-            "vertical_bottom_offset_threshold_m": float(script_cfg["vertical_bottom_offset_threshold_m"]),
-            "platform_cluster_threshold_m": float(script_cfg["platform_cluster_threshold_m"]),
-            "dense_well_neighbor_threshold_m": float(script_cfg["dense_well_neighbor_threshold_m"]),
+            "near_survey_threshold_m": float(script_cfg["survey_position"]["near_survey_threshold_m"]),
+            "vertical_bottom_offset_threshold_m": float(
+                script_cfg["wellbore_classification"]["vertical_bottom_offset_threshold_m"]
+            ),
+            "platform_cluster_threshold_m": float(script_cfg["dense_well_qc"]["platform_cluster_threshold_m"]),
+            "dense_well_neighbor_threshold_m": float(script_cfg["dense_well_qc"]["dense_well_neighbor_threshold_m"]),
         },
         "geometry": geometry,
         "bin_spacing_m": bin_spacing,

@@ -73,11 +73,20 @@ def parse_args() -> argparse.Namespace:
 
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_screen") or {})
+    source_runs = dict(script_cfg.get("source_runs") or {})
+    source_runs.setdefault("mode", "latest")
+    source_runs.setdefault("well_inventory_dir", None)
+    script_cfg["source_runs"] = source_runs
     script_cfg.setdefault("inventory_file", None)
-    script_cfg.setdefault("las_dir", "all_well_las")
-    script_cfg.setdefault("include_survey_positions", ["inside", "near_outside"])
-    script_cfg.setdefault("required_categories", ["p_sonic", "density"])
-    script_cfg.setdefault(
+    source_data = dict(script_cfg.get("source_data") or {})
+    source_data.setdefault("las_dir", "all_well_las")
+    script_cfg["source_data"] = source_data
+    candidate_filter = dict(script_cfg.get("candidate_filter") or {})
+    candidate_filter.setdefault("include_survey_positions", ["inside", "near_outside"])
+    script_cfg["candidate_filter"] = candidate_filter
+    curve_selection = dict(script_cfg.get("curve_selection") or {})
+    curve_selection.setdefault("required_categories", ["p_sonic", "density"])
+    curve_selection.setdefault(
         "selected_categories",
         [
             "caliper",
@@ -92,8 +101,11 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "water_saturation",
         ],
     )
-    script_cfg.setdefault("curve_schema_file", None)
-    script_cfg.setdefault("curve_override_file", "experiments/curve_alias_overrides.yaml")
+    script_cfg["curve_selection"] = curve_selection
+    classification = dict(script_cfg.get("classification") or {})
+    classification.setdefault("curve_schema_file", None)
+    classification.setdefault("curve_override_file", "experiments/curve_alias_overrides.yaml")
+    script_cfg["classification"] = classification
     script_cfg.setdefault("llm", {"enabled": False, "cache_dir": "scripts/output/well_screen_cache", "max_retry": 1})
     script_cfg.setdefault("export", {"selected_las_dir": "selected_las", "null_value": -999.25, "write_fmt": "%.6f"})
     return script_cfg
@@ -115,12 +127,24 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     return output_root / f"well_screen_{timestamp}"
 
 
-def _discover_latest_inventory_file(cfg: dict[str, Any]) -> Path:
+def _validate_latest_mode(source_runs: Mapping[str, Any], *, section: str) -> None:
+    mode = str(source_runs.get("mode", "latest")).strip().casefold()
+    if mode != "latest":
+        raise ValueError(f"{section}.source_runs.mode only supports 'latest' for now, got {mode!r}.")
+
+
+def _discover_latest_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
+    source_runs = dict(script_cfg.get("source_runs") or {})
+    _validate_latest_mode(source_runs, section="well_screen")
+    if script_cfg.get("inventory_file") is not None:
+        return _resolve_repo_path(script_cfg["inventory_file"])
+    if source_runs.get("well_inventory_dir") is not None:
+        return _resolve_repo_path(source_runs["well_inventory_dir"]) / "well_inventory.csv"
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
     candidates = sorted(output_root.glob("well_inventory_*/well_inventory.csv"))
     if not candidates:
         raise FileNotFoundError(
-            "well_screen.inventory_file is not configured and no "
+            "well_screen source run is not configured and no "
             "well_inventory_*/well_inventory.csv file was found under output_root."
         )
     return candidates[-1]
@@ -264,7 +288,7 @@ def run_screening(
     inventory_df = pd.read_csv(inventory_file)
     candidates = _candidate_inventory_rows(
         inventory_df,
-        include_survey_positions=config["include_survey_positions"],
+        include_survey_positions=config["candidate_filter"]["include_survey_positions"],
     )
     las_lookup = build_file_lookup(las_dir.glob("*.las"), asset_label=str(las_dir))
 
@@ -315,8 +339,8 @@ def run_screening(
                 classifications,
                 well_name=well_name,
                 las_file=repo_relative_path(las_file, root=REPO_ROOT),
-                selected_categories=config["selected_categories"],
-                required_categories=config["required_categories"],
+                selected_categories=config["curve_selection"]["selected_categories"],
+                required_categories=config["curve_selection"]["required_categories"],
                 overrides=overrides,
                 category_priority=CURVE_CATEGORY_PRIORITY,
             )
@@ -342,7 +366,7 @@ def run_screening(
                 required_exported, missing_exported_categories = _exported_contains_required(
                     selection=selection,
                     exported_mnemonics=exported_mnemonics,
-                    required_categories=config["required_categories"],
+                    required_categories=config["curve_selection"]["required_categories"],
                 )
                 if required_exported:
                     selection.exported_las = repo_relative_path(output_las, root=REPO_ROOT)
@@ -435,11 +459,11 @@ def run_screening(
         "candidate_filter": {
             "has_well_head": True,
             "has_las": True,
-            "survey_position": list(config["include_survey_positions"]),
+            "survey_position": list(config["candidate_filter"]["include_survey_positions"]),
             "inventory_status": "usable_for_las_screen",
         },
-        "required_categories": list(config["required_categories"]),
-        "selected_categories": list(config["selected_categories"]),
+        "required_categories": list(config["curve_selection"]["required_categories"]),
+        "selected_categories": list(config["curve_selection"]["selected_categories"]),
         "llm_enabled": bool(config.get("llm", {}).get("enabled", False)),
         "candidate_well_count": int(len(candidates)),
         "screen_status_counts": {str(key): int(value) for key, value in status_counts.items()},
@@ -461,15 +485,11 @@ def main() -> None:
         raise NotImplementedError("LLM classification is intentionally not implemented in the first local pass.")
 
     data_root = _resolve_repo_path(str(cfg.get("data_root", "data")))
-    inventory_file = (
-        _discover_latest_inventory_file(cfg)
-        if script_cfg.get("inventory_file") is None
-        else _resolve_repo_path(script_cfg["inventory_file"])
-    )
-    las_dir = _resolve_data_path(script_cfg["las_dir"], data_root=data_root)
+    inventory_file = _discover_latest_inventory_file(cfg, script_cfg)
+    las_dir = _resolve_data_path(script_cfg["source_data"]["las_dir"], data_root=data_root)
     output_dir = _resolve_output_dir(args, cfg)
-    schema = _load_curve_schema(script_cfg.get("curve_schema_file"))
-    overrides = _load_overrides(script_cfg.get("curve_override_file"))
+    schema = _load_curve_schema(script_cfg["classification"].get("curve_schema_file"))
+    overrides = _load_overrides(script_cfg["classification"].get("curve_override_file"))
 
     result = run_screening(
         inventory_file=inventory_file,
@@ -497,4 +517,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

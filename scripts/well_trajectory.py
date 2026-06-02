@@ -113,13 +113,12 @@ def _discover_latest_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, A
         return _resolve_repo_path(script_cfg["inventory_file"])
 
     source_runs = dict(script_cfg.get("source_runs") or {})
+    mode = str(source_runs.get("mode", "latest")).strip().casefold()
+    if mode != "latest":
+        raise ValueError(f"well_trajectory.source_runs.mode only supports 'latest' for now, got {mode!r}.")
     inventory_dir = source_runs.get("well_inventory_dir")
     if inventory_dir is not None:
         return _resolve_repo_path(inventory_dir) / "well_inventory.csv"
-
-    mode = str(source_runs.get("mode", "latest")).strip().casefold()
-    if mode != "latest":
-        raise ValueError("well_trajectory.inventory_file must be configured when source_runs.mode is not 'latest'.")
 
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
     all_candidates = [path for path in output_root.glob("well_inventory_*/well_inventory.csv") if path.is_file()]
@@ -595,4 +594,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

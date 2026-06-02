@@ -87,9 +87,13 @@ well_auto_tie:
     max_trajectory_outside_fraction: 0.05
 ```
 
+### `source_runs`
+
+默认接上最新的前置步骤结果。复现实验时，可以在这个块里填写某次第一步、第二步、第三步或轨迹 QC 的输出目录，固定对应输入。`mode` 目前只支持 `latest`。
+
 ### `target_interval`
 
-脚本在井口 XY 处读取顶底解释层位的 TWT，加上 `margin_top_ms` 和 `margin_bottom_ms` 的冗余，构成标定目标窗。报告里的层位名从文件名自动推断，便于追溯输入；图件里的目标层位线只标注 `top` / `bottom`。
+定义每口井要标定的时间范围。脚本先读取顶底解释层位的 TWT，再在上下各留一段冗余时间，形成实际标定窗口。冗余不要太小，否则目标层边界附近的波形容易被截断；也不要太大，否则标定会被目标层外的强反射带偏。
 
 ### `enabled_routes`
 
@@ -107,23 +111,23 @@ well_auto_tie:
 
 ### `coarse_correction`
 
-粗标定发生在 `wtie` 细标定之前，当前支持两种来源：
+粗标定发生在自动细标定之前，用来先把井的初始时深关系移到一个合理位置。当前支持两种来源：
 
 | 来源 | 作用 |
 |------|------|
-| `anchor` | 用井分层 MD 和解释层位 TWT 计算逐井锚点。路径 2 用它建初始 TDT；路径 1/3 如果显式加入 `apply_to_routes`，则用它对已有 Petrel TDT 做逐井整体 TWT shift。 |
-| `manual_shift` | 用户手动给 TDT 加一个常数 TWT 偏移，单位 ms。三条已实现路径都支持，默认 0。 |
+| `anchor` | 用“井上的某个分层深度”对齐“地震上的某个解释层位时间”，给单井提供一个粗略锚点。 |
+| `manual_shift` | 人工给某口井加一个整体时间平移，适合已有经验判断或临时排查。 |
 
-对有 Petrel TDT 的路径，锚点 shift 的计算方式是逐井的：
+对有 Petrel TDT 的井，锚点会转化为一个逐井整体时移：
 
 ```text
 anchor_shift_s = horizon_twt_at_this_well_anchor_xy - interp(petrel_tdt, anchor_md)
 shifted_tdt.twt = petrel_tdt.twt + anchor_shift_s + manual_shift_s
 ```
 
-这里要求 `anchor_md` 落在 Petrel TDT 的 MD 范围内；否则脚本会失败，不会把锚点夹到 TDT 端点去估算 shift。
+锚点深度必须落在该井时深表覆盖范围内。超出范围时脚本会直接失败，避免用端点外推制造看似合理但不可追溯的时移。
 
-对 `vertical_anchor_from_tops`，锚点不是“平移已有 TDT”，而是用于从声波曲线积分建立初始 TDT；随后仍会叠加 `manual_shift_s`。
+对没有 Petrel TDT 的直井，锚点不是平移已有时深表，而是帮助脚本从声波曲线积分建立一条初始时深关系；之后仍可叠加人工整体时移。
 
 锚点选择规则：
 
@@ -165,18 +169,18 @@ manual_shift:
 
 ### `reject`
 
-`reject` 控制第四步自己的拒绝条件。曲线有效比例不在这里重复判定：第三步已经写出 `usable_p_sonic` 和 `usable_density`，第四步只消费这两个结果。
+`reject` 控制第四步自己的准入边界。曲线是否可用已经在第三步判断过；这里主要关心井是否在工区内、目标窗口是否有足够样点、斜井轨迹是否大面积出界。
 
 | 参数 | 含义 |
 |------|------|
-| `allow_near_outside` | 路由阶段是否允许 `survey_position == near_outside` 的井进入标定。默认 `false`，只接受工区内井。 |
-| `min_tie_samples` | 时深表、曲线窗口或斜井裁剪后的最少样点数；低于该值则失败。 |
-| `max_trajectory_outside_fraction` | 目标窗口内允许落到工区外的最大轨迹样点比例，仅对 `deviated_with_tdt` 生效。 |
+| `allow_near_outside` | 是否允许工区边缘外的井参与标定。默认只接受工区内井。 |
+| `min_tie_samples` | 实际标定窗口里至少要保留多少时间样点。 |
+| `max_trajectory_outside_fraction` | 斜井目标窗口内最多允许多少比例的轨迹样点落到工区外。 |
 
 斜井轨迹在目标窗口内采样时，部分 TWT 样点对应的轨迹 XY 可能落到工区之外。脚本的处理逻辑是：
 
-- 出界比例 ≤ `max_trajectory_outside_fraction`：裁剪到最长连续工区内 TWT 段，在裁后的窗口内做标定。
-- 出界比例 > `max_trajectory_outside_fraction`：整井失败，原因记 `trajectory_outside_fraction_exceeded`。
+- 出界比例在允许范围内：裁剪到最长连续工区内 TWT 段，在裁后的窗口内做标定。
+- 出界比例超过允许范围：整井失败，原因记 `trajectory_outside_fraction_exceeded`。
 - 裁剪后样点数 < `min_tie_samples`：整井失败，原因记 `trajectory_inside_tie_samples_too_few`。
 
 ---
@@ -187,7 +191,7 @@ manual_shift:
 
 ### 第一步：路由
 
-join 前三步的井清单、曲线可用性和轨迹 QC 结果，生成 `well_tie_plan.csv`，为每口井匹配一条路径：
+把井资产、曲线可用性和轨迹 QC 合在一起，为每口井决定“能不能标、按哪条路径标”。结果写入 `well_tie_plan.csv`：
 
 | 条件 | 路径 | 状态 |
 |------|------|------|
@@ -197,11 +201,11 @@ join 前三步的井清单、曲线可用性和轨迹 QC 结果，生成 `well_t
 | 斜井，无时深，有轨迹+分层，曲线可用 | `deviated_anchor_from_tops` | 仅识别，未实现 |
 | 不满足以上任一 | `rejected` | — |
 
-`route_status` 有三种：`planned`（会执行）、`skipped_disabled`（路径未启用）、`rejected`（不满足条件）。
+`route_status` 可以先粗看：`planned` 会执行，`skipped_disabled` 是路径条件满足但配置没启用，`rejected` 是资产或 QC 条件不满足。
 
 ### 第二步：准备初始时深表、粗校正和测井窗口
 
-三条路径都使用 MD 域时深表（横轴是测量深度 MD，纵轴是双程旅行时 TWT）：
+三条路径最终都会准备出一条“测深 MD 到双程旅行时 TWT”的初始关系：
 
 - **有时深表的路径**（`vertical_with_tdt`、`deviated_with_tdt`）：读取 Petrel 时深表；如果启用了锚点粗校正或手动偏移，先整体平移 TWT；如果它只覆盖了目标窗的一部分，再用声波曲线从时深表端点向上或向下补齐。
 - **锚点路径**（`vertical_anchor_from_tops`）：取一口井的某个分层 MD 和对应解释层位的 TWT 作为锚点，沿声波曲线向上向下积分，建出初始 TDT；如果配置了手动偏移，再整体平移这个初始 TDT。
@@ -216,16 +220,14 @@ join 前三步的井清单、曲线可用性和轨迹 QC 结果，生成 `well_t
 
 1. 把目标窗口的 TWT 轴上的每个样点，通过时深表转成 MD，再查轨迹得到该 MD 处的 XY 坐标。
 2. 把每个 XY 吸附到最近的 inline/xline 地震道上。
-3. 如果有少量样点落到了工区外面（≤ 5%），裁剪到最长连续工区内段。
+3. 如果只有少量样点落到工区外面，裁剪到最长连续工区内段。
 4. 对其中用到的每条唯一地震道各读一次，再按 TWT 样点逐点取出对应时刻的振幅值，拼成一条"沿轨迹地震道"。
 
 第一步版本用的是最近道采样，不做空间插值。每个样点落在哪条道上、是否在工区内，全部写进 `trace_sample_plan_<well>.csv`。
 
 ### 第四步：细标定
 
-把准备好的 MD 域曲线、地震道和时深表交给 `wtie` 做优化：调整时深关系让合成记录与地震匹配得更好。输出优化后的 TDT、子波、合成记录和 QC 指标。
-
-这里传给 `wtie` 的 `wellpath` 参数是 `None`，因为斜井的地震道已经在第三步沿轨迹拼好了，`wtie` 不需要再操心空间定位。
+把准备好的曲线、地震道和初始时深关系交给自动标定模块。它会微调时深关系，让曲线正演出的合成记录尽量贴近实际地震道，并输出优化后的时深表、候选子波、合成记录和 QC 指标。
 
 ---
 
@@ -257,7 +259,7 @@ join 前三步的井清单、曲线可用性和轨迹 QC 结果，生成 `well_t
 
 `time_depth/optimized_tdt_<well>.csv` 是工作流内部格式，保留正秒 `twt_s` 和正米 `md_m`；`petrel_checkshots/optimized_tdt_<well>.txt` 是地质软件导入格式，沿用 `export_vertical_tdt_to_petrel_checkshots()` 的口径导出。`filtered_las/filtered_logs_<well>.las` 只包含第五步需要的标准曲线：`DT_USM`（`us/m`）和 `RHO_GCC`（`g/cm3`）。
 
-这里的“本井 auto-tie 选中的日志滤波参数”指 `wtie` 自动标定优化结束后返回的 `best_parameters` 中与日志滤波有关的三项：`logs_median_size`、`logs_median_threshold`、`logs_std`。脚本用它们在 MD 域重新滤波本井输入曲线，再把滤波后的 `Vp` 转回 `DT_USM`、`Rho` 写成 `RHO_GCC`。同一组 `best_parameters` 里的 `table_t_shift` 只用于时深表优化，不用于改写 `filtered_las` 曲线。
+`filtered_las/filtered_logs_<well>.las` 是第四步为第五步准备的“标定后口径”LAS：它保留本井自动标定选中的日志滤波效果，但不会把时深表的整体时移写回测井曲线。也就是说，它修的是曲线滤波口径，不是把 LAS 深度轴改掉。
 
 ### `trace_sample_plan_<well>.csv`
 
@@ -284,14 +286,14 @@ join 前三步的井清单、曲线可用性和轨迹 QC 结果，生成 `well_t
 
 ### 第一步：看 `run_summary.json`
 
-直接看顶层计数：
+先看顶层计数，判断这次批量标定是“多数井成功”还是“某类井系统性失败”：
 
 ```
 route_counts / route_status_counts / tie_status_counts
 planned_run_count / successful_tie_count
 ```
 
-`skipped_disabled` 多 → 配置没启用对应路径。`failed` 集中在斜井 → 优先看 `result_extras.<well>.trace_sampling` 和该井的 `trace_sample_plan`。
+`skipped_disabled` 多，通常是配置没启用对应路径；`failed` 集中在斜井，优先看该井的 `trace_sample_plan`，确认是不是轨迹取道或工区出界问题。
 
 ### 第二步：看 `well_tie_plan.csv`
 
@@ -348,6 +350,3 @@ planned_run_count / successful_tie_count
 - 斜井地震采样从最近道升级到双线性或多道加权。
 - 斜井轨迹 inline/xline 随 TWT 变化的专用 QC 图。
 - 密井网下多井落到同一 trace/time 样点时的冲突诊断。
-
-
-

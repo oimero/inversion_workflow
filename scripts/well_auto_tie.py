@@ -195,6 +195,9 @@ def _discover_latest_dir(cfg: dict[str, Any], prefix: str) -> Path:
 
 def _resolve_inputs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str, Path | None]:
     source_runs = dict(script_cfg.get("source_runs") or {})
+    mode = str(source_runs.get("mode", "latest")).strip().casefold()
+    if mode != "latest":
+        raise ValueError(f"well_auto_tie.source_runs.mode only supports 'latest' for now, got {mode!r}.")
 
     inventory_dir = (
         _resolve_repo_path(source_runs["well_inventory_dir"])
@@ -1646,4 +1649,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

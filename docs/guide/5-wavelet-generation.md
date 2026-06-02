@@ -92,6 +92,10 @@ wavelet_generation:
     write_unified_synthetics: true
 ```
 
+### `source_runs`
+
+默认接上最新一次井震标定结果。复现实验时，在 `well_auto_tie_dir` 填入某次第四步输出目录即可固定输入。`mode` 目前只支持 `latest`。
+
 ### `candidate_filter`
 
 第四步的 `wavelet_inventory.csv` 已经标记了每条子波是否 `usable_as_candidate`。第五步在这个基础上再做一层过滤：
@@ -102,9 +106,9 @@ wavelet_generation:
 
 ### `wavelet_qc`
 
-第四步输出的子波应该是居中、奇数长度、L2 能量为 1 的。第五步加载每条子波后做校验：
+第五步会先确认候选子波的基本形态是否可比较：长度一致、中心明确、采样间隔一致、能量已经归一化。
 
-- 如果 L2 能量在容差内偏离 1.0，且 `allow_small_renormalization` 为 true，做一次数值重归一化并记录在 `wavelet_qc.csv`。
+- 如果能量只有很小的数值偏差，脚本可以重新归一化并记录在 `wavelet_qc.csv`。
 - 如果中心不在 0 附近、采样间隔不一致、长度不统一、或能量异常，直接拒绝该候选。
 - 子波长度必须为奇数，确保中心样点明确落在零时刻。
 
@@ -112,7 +116,7 @@ wavelet_generation:
 
 ### `generation.objective`
 
-优化目标由六项组成：
+全局子波不是只追求最高相关系数。评分同时考虑整体匹配、少数差井、振幅误差和子波形态是否合理：
 
 | 项 | 作用 |
 |------|------|
@@ -123,11 +127,11 @@ wavelet_generation:
 | `roughness_weight` × 粗糙度 | 防止振铃 |
 | `bandwidth_drift_weight` × 带宽漂移 | 防止主频偏离候选子波族太远 |
 
-权重都是正数，corr 项加分，NMAE/偏离/粗糙度/漂移项减分。
+这些权重控制评分偏好：相关性负责奖励，误差和形态惩罚负责防止子波为了局部匹配而变得不可信。
 
 ### `spatial_debias`
 
-密井网中，一个平台上十几口井的同形态子波如果各自算一票，会主导全局目标。空间去偏的思路是：先把评测井按平面距离聚成空间簇（距离小于 `cluster_radius_m` 的井连通），评分时先算簇内中位数、再算簇间中位数。这样一簇近井只贡献一票。
+密井网中，一个平台上十几口井如果各自算一票，会让该平台主导全局子波。空间去偏会先把近井归成空间簇，再按“簇”聚合评分，让一簇近井只贡献一票。
 
 如果不想用空间去偏，把 `enabled` 关掉即可——此时每口井等权投票。
 
@@ -160,11 +164,11 @@ wavelet_generation:
 
 ### 第三阶段：共识子波生成
 
-默认不从候选里选一条，而是在候选子波张成的低维形态空间中搜索一条新的子波：
+默认不只是从候选里挑一条，而是在这些候选子波共同定义的“合理形态范围”内搜索一条新的共识子波：
 
-1. **构造 PCA 基底。** 把候选子波矩阵（每行一条子波）做 PCA，得到均值子波和若干主成分。实际维度不超过候选数减一，也不超过配置的 `n_components`。
-2. **约束搜索范围。** 把每条候选子波投影到 PCA 空间，取系数分布的分位数作为搜索上下界。生成子波只能在已知可信子波的形态邻域内移动。
-3. **两阶段搜索。** 先在系数范围内做大量随机采样（`random_trials` 次），每轮评测一条生成子波并记录分数；然后对分数最高的几个做局部细化，用无梯度优化器在系数空间内精调。
+1. **提取候选形态。** 从候选子波中提取主要变化方向，得到均值子波和若干形态分量。
+2. **限制搜索范围。** 新子波只能在候选子波附近移动，避免生成一条数学上高分、地质上陌生的波形。
+3. **两阶段搜索。** 先大量随机尝试，找到高分区域；再对高分结果做局部细化。
 4. **每次评测都做完整交叉评测。** 每条生成子波和候选子波一样，在所有评测井上做合成记录、算空间去偏聚合指标、加上正则化项得到最终分数。
 
 整个过程的所有 trial（随机 + 细化）都写入 `consensus_search_trials.csv`，可以追溯每一步的系数、各项指标和分数。
@@ -255,7 +259,7 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 
 ### 第二步：看 `selected_wavelet_summary.json`
 
-直接看 `selection_mode` 和分数对比：
+直接看最终为什么选了这条子波：
 
 ```json
 {
@@ -267,7 +271,7 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 }
 ```
 
-如果 `selected_score` 只比 `best_candidate_score` 高一点点（< 0.02），说明共识子波的优势很微弱，建议检查对应 trial 的详细指标。
+如果 `selected_score` 只比 `best_candidate_score` 高一点点（< 0.02），说明共识子波的优势很微弱，建议把图和 trial 明细一起看，不要只凭分数接受。
 
 ### 第三步：看 `wavelet_candidate_aggregate.csv`
 
@@ -313,7 +317,5 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 - 是否在 PCA 前先做子波形态聚类；第一版先靠 PCA 系数范围和正则化控制。
 - 是否增加只诊断、不反写的 residual shift scan。
 - 是否让 dynamic gain 评估结果反向参与全局子波评分；第一版不要耦合，避免形成闭环。
-
-
 
 

@@ -80,10 +80,16 @@ def parse_args() -> argparse.Namespace:
 
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_preprocess") or {})
-    script_cfg.setdefault("screen_file", None)
-    script_cfg.setdefault("input_las_dir", None)
-    script_cfg.setdefault("curve_inventory_file", None)
-    script_cfg.setdefault("classification_dir", None)
+    source_runs = dict(script_cfg.get("source_runs") or {})
+    source_runs.setdefault("mode", "latest")
+    source_runs.setdefault("well_screen_dir", None)
+    script_cfg["source_runs"] = source_runs
+    source_files = dict(script_cfg.get("source_files") or {})
+    source_files.setdefault("screen_file", None)
+    source_files.setdefault("input_las_dir", None)
+    source_files.setdefault("curve_inventory_file", None)
+    source_files.setdefault("classification_dir", None)
+    script_cfg["source_files"] = source_files
     script_cfg.setdefault("output_las_dir", "preprocessed_las")
     script_cfg.setdefault("required_categories", ["p_sonic", "density"])
     script_cfg.setdefault(
@@ -156,7 +162,17 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     return output_root / f"well_preprocess_{timestamp}"
 
 
-def _discover_latest_screen_dir(cfg: dict[str, Any]) -> Path:
+def _validate_latest_mode(source_runs: dict[str, Any], *, section: str) -> None:
+    mode = str(source_runs.get("mode", "latest")).strip().casefold()
+    if mode != "latest":
+        raise ValueError(f"{section}.source_runs.mode only supports 'latest' for now, got {mode!r}.")
+
+
+def _discover_latest_screen_dir(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
+    source_runs = dict(script_cfg.get("source_runs") or {})
+    _validate_latest_mode(source_runs, section="well_preprocess")
+    if source_runs.get("well_screen_dir") is not None:
+        return _resolve_repo_path(source_runs["well_screen_dir"])
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
     all_candidates = [path for path in output_root.glob("well_screen_*") if path.is_dir()]
     timestamped = [
@@ -171,26 +187,27 @@ def _discover_latest_screen_dir(cfg: dict[str, Any]) -> Path:
 
 
 def _resolve_inputs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str, Path]:
-    latest_dir = _discover_latest_screen_dir(cfg)
+    latest_dir = _discover_latest_screen_dir(cfg, script_cfg)
+    source_files = dict(script_cfg.get("source_files") or {})
     screen_file = (
         latest_dir / "well_screen.csv"
-        if script_cfg.get("screen_file") is None
-        else _resolve_repo_path(script_cfg["screen_file"])
+        if source_files.get("screen_file") is None
+        else _resolve_repo_path(source_files["screen_file"])
     )
     input_las_dir = (
         latest_dir / "selected_las"
-        if script_cfg.get("input_las_dir") is None
-        else _resolve_repo_path(script_cfg["input_las_dir"])
+        if source_files.get("input_las_dir") is None
+        else _resolve_repo_path(source_files["input_las_dir"])
     )
     curve_inventory_file = (
         latest_dir / "las_curve_inventory.csv"
-        if script_cfg.get("curve_inventory_file") is None
-        else _resolve_repo_path(script_cfg["curve_inventory_file"])
+        if source_files.get("curve_inventory_file") is None
+        else _resolve_repo_path(source_files["curve_inventory_file"])
     )
     classification_dir = (
         latest_dir / "curve_classification"
-        if script_cfg.get("classification_dir") is None
-        else _resolve_repo_path(script_cfg["classification_dir"])
+        if source_files.get("classification_dir") is None
+        else _resolve_repo_path(source_files["classification_dir"])
     )
     return {
         "screen_file": screen_file,
@@ -848,4 +865,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

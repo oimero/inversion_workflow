@@ -61,7 +61,7 @@ well_trajectory:
 
 ### `source_runs`
 
-`mode: latest` 时自动发现最新的 `well_inventory_<timestamp>/well_inventory.csv`。复现实验时直接填 `inventory_file` 路径。
+默认接上最新一次井资产盘点结果。复现实验时，可以在 `well_inventory_dir` 填入某次第一步输出目录；如果只想替换清单文件本身，再用 `inventory_file` 指定具体的 `well_inventory.csv`。`mode` 目前只支持 `latest`。
 
 ### `well_trace_dir`
 
@@ -71,13 +71,13 @@ well_trajectory:
 
 | 参数 | 默认值 | 含义 |
 |------|--------|------|
-| `vertical_max_offset_m` | 30.0 | 最大水平偏移在此以内为直井 |
-| `min_deviated_max_offset_m` | 30.0 | 最大水平偏移大于此值为斜井 |
+| `vertical_max_offset_m` | 30.0 | 轨迹整体偏移很小时，复核为直井 |
+| `min_deviated_max_offset_m` | 30.0 | 轨迹整体偏移明显时，复核为斜井 |
 | `surface_xy_tolerance_m` | 2.0 | 井口 XY 最大允许偏差 |
 | `kb_tolerance_m` | 0.5 | KB 基准面最大允许偏差 |
 | `z_tvd_tolerance_m` | 0.1 | Z 与 KB-TVD 残差最大允许值 |
 
-`vertical_max_offset_m` 和 `min_deviated_max_offset_m` 可以设为不同值，产生一个"不确定"灰色区间。两个值相等时所有有效轨迹都会被判断为直井或斜井。
+`vertical_max_offset_m` 和 `min_deviated_max_offset_m` 可以设成不同值，中间留出“不确定”灰色区间。两个值相等时，所有有效轨迹都会被明确分成直井或斜井。
 
 ### `survey_qc`
 
@@ -134,9 +134,9 @@ well_trajectory:
 第一步用井头底孔坐标初分直井/斜井，这里用真实轨迹复核：
 
 - **用最大水平偏移判断，不用井口-底孔偏移。** 有些井中段偏斜明显但底孔又回到井口附近，井口-底孔偏移会漏判。
-- 最大水平偏移 ≤ `vertical_max_offset_m` → `vertical`
-- 最大水平偏移 > `min_deviated_max_offset_m` → `deviated`
-- 两个阈值之间的灰色地带 → `unknown`
+- 轨迹整体偏移很小 → 复核为直井
+- 轨迹整体偏移明显 → 复核为斜井
+- 落在两个阈值之间 → 暂时标记为不确定
 
 如果配置了地震工区，还会把每个轨迹点投影到 inline/xline，统计：
 
@@ -227,8 +227,8 @@ Wrote trajectory QC for 103 wells to ... ({'passed': 80, 'warning': 18, 'failed'
 
 在 `well_trajectory.csv` 中筛选 `class_changed == True`：
 
-- 初分 `vertical`、复核 `deviated` → 这口井的井头底孔坐标不准，必须走斜井路径
-- 初分 `deviated`、复核 `vertical` → 可能是井头数据有误，或以直井对待即可
+- 初分为直井、复核为斜井 → 井头底孔坐标低估了实际偏移，第四步应走斜井路径。
+- 初分为斜井、复核为直井 → 可能是井头底孔坐标有误，也可能该井可以按直井处理。
 
 这些变更直接影响第四步的路由决策。
 
@@ -263,6 +263,4 @@ Wrote trajectory QC for 103 wells to ... ({'passed': 80, 'warning': 18, 'failed'
 - 轨迹点落道从最近道升级为双线性或多道加权。
 - 与第四步斜井标定共享同一套轨迹采样对象，减少脚本间裸数组传递。
 - 对同平台密井生成轨迹交叉/近距离诊断。
-
-
 

@@ -32,11 +32,15 @@ python scripts/well_preprocess.py --output-dir /tmp/preprocess_test
 
 ```yaml
 well_preprocess:
-  # 来源 — null 表示自动发现最新第二步产物
-  screen_file: null
-  input_las_dir: null
-  curve_inventory_file: null
-  classification_dir: null
+  source_runs:
+    mode: latest
+    well_screen_dir: null
+
+  source_files:
+    screen_file: null
+    input_las_dir: null
+    curve_inventory_file: null
+    classification_dir: null
 
   # 输出子目录
   output_las_dir: preprocessed_las
@@ -98,9 +102,17 @@ well_preprocess:
     write_fmt: "%.6f"
 ```
 
+### `source_runs`
+
+默认接上最新一次曲线筛选结果。复现实验时，在 `well_screen_dir` 填入某次第二步输出目录即可固定整套输入；`mode` 目前只支持 `latest`。
+
+### `source_files`
+
+更细粒度的输入覆盖入口。日常运行保持全空；只有临时替换某一个第二步产物时，才单独填写这里的文件或目录。
+
 ### `required_categories`
 
-井必须同时拥有这些类别（经过预处理并有可用曲线）才能 `passed`。默认 `[p_sonic, density]`。如果某口井缺少任一 required，状态降为 `failed`。
+决定一口井预处理后是否还能进入井震标定。默认要求纵波声波和密度都可用；只要其中一类在清洗后不可用，这口井就会被挡在第三步之外。
 
 ### `selected_categories`
 
@@ -116,7 +128,7 @@ well_preprocess:
 
 ### `constant_runs.min_run_length` 与 `min_run_length_by_category`
 
-连续相同值段长度 ≥ 阈值时替换为 null。`min_run_length` 是兜底默认值，`min_run_length_by_category` 中的配置优先。不同类别应使用不同阈值：声波和密度默认 16 点，GR 默认 16 点，而 `min_run_length: 8` 只对未在 by_category 中列出的类别生效。
+用于识别“长时间完全不变”的可疑曲线段。这类段落常见于仪器、导出或填充值问题，会被置为空值。不同曲线对常值段的容忍度不同，因此声波、密度、GR 等类别可以单独设阈值；没有单独配置的类别才使用 `min_run_length`。
 
 ### `constant_runs.exclude_categories`
 
@@ -146,7 +158,7 @@ well_curve:
 
 ### `usable_thresholds`
 
-判定一条曲线是否可用的双条件：最终有效点数 ≥ `min_valid_samples`，且最终有效点数相对初始有效点数的比例 ≥ `min_valid_fraction_of_initial`。
+用于避免“清洗后只剩一点点数据”的曲线继续被当成可靠曲线。脚本同时检查最终有效点数量和保留下来的有效比例，两项都过关才认为曲线可用。
 
 ### `export`
 
@@ -162,18 +174,16 @@ well_curve:
 
 对每口通过第二步筛选的井，从原始 LAS 中加载第二步识别出的全部曲线（不只是 primary，还包括同类 secondary），依次做：
 
-1. **缺失哨兵替换** — 把 `-999.0`、`-999.25`、`-9999.0`、`-99999.0`、LAS header 声明的 NULL 值等已知占位符统一转为 NaN。
+1. **缺失值识别** — 把 LAS 中常见的缺失占位符统一转为空值。
 2. **缩写规范化**（可关闭）— 把原始 mnemonic 映射到标准名，比如原始 `DT`、`DTC`、`AC` 都映射为 `DT_USM`。
-3. **单位规范化**（可关闭）— 声波统一为 `us/m` 慢度，密度统一为 `g/cm3`。同时做两层单位 QC：
-   - **硬失败**：声波慢度单位中位数 > 1000、声波速度单位中位数 < 1000、密度 g/cm3 中位数 > 100、密度 kg/m3 中位数 < 10 — 直接判该曲线失效。
-   - **软提示**：us/ft 中位数像 us/m、us/m 中位数像 us/ft、密度 g/cm3 中位数偏高 — 只记入 QC 报告。
-4. **连续常值段替换** — 把长度 ≥ 阈值的严格连续相同值段置为 NaN。井径默认跳过（防止误伤）。
+3. **单位规范化**（可关闭）— 声波统一为 `us/m` 慢度，密度统一为 `g/cm3`。数值明显不符合单位常识的曲线会被判为不可用；疑似单位写错但还能处理的曲线会进入 QC 报告。
+4. **连续常值段替换** — 把长时间完全不变的可疑段落置为空值。井径默认跳过，避免误伤真实井径响应。
 5. **收集全局阈值样本** — 把每条通过单位硬校验的 step2-primary 曲线的清洗后数据按标准曲线名汇集。
 
 ### 第二阶段：全局阈值 + 逐井复核
 
 1. **计算全局分位数** — 按标准曲线名（`DT_USM`、`RHO_GCC` 等）分别统计 q01/q99。样本量不足时跳过并标记。
-2. **阈值优先级** — 对每条曲线，按「该井该曲线的手动配置 → 该曲线的全局手动配置 → 自动分位数」顺序解析最终使用的上下限。
+2. **阈值优先级** — 优先使用单井手动阈值，其次使用全局手动阈值，最后才使用自动分位数。
 3. **极值替换** — 超出上下限的有限值置为 NaN。
 4. **可用性判定** — 检查最终有效点是否满足最低数量和相对初始有效点的最低比例。
 5. **Primary 接管** — 如果某 category 的 primary 曲线不可用，按顺序尝试同类 secondary。接管只在同一 category 内发生。
@@ -191,7 +201,7 @@ well_curve:
 | `m/s` | 1e6 / value → `us/m` | 中位数 < 1000 |
 | 其他 | 不转换，标记硬失败 | — |
 
-非正数的物理量为 NaN（慢度、速度不可能 ≤ 0）。`us/ft` 中位数明显高于常见 `us/ft` 声波时差范围（当前阈值为 > 160）时追加 QC 提示（可能实际为 `us/m`）；`us/m` 中位数落在 40-160 时追加反向提示（可能实际为 `us/ft`）。这些都是软提示，不阻止处理。
+非正数的慢度或速度会被视为空值。脚本还会检查“单位写法”和“数值范围”是否相互匹配：例如单位写成 `us/ft` 但数值更像 `us/m`，或反过来。这类情况只进入 QC 报告，不会自动改单位，也不会阻止处理。
 
 ### 密度类（`density`）
 
@@ -296,9 +306,9 @@ Log preprocess summary: 38 step2-passed wells, 35 passed, 3 failed, 35 LAS expor
 
 如果 `failed` 井数多，打开 `well_preprocess_status.csv` 看 `reasons` 列。
 
-### 第二步：定位 individual curve failures
+### 第二步：定位单条曲线为什么失效
 
-`skipped_curves.csv` 按原因标签分类——`no_finite_samples`、`unsupported_sonic_unit`、`density_g_cm3_unit_impossible_median_gt_100` 等。数量集中的原因说明系统性数据问题。
+`skipped_curves.csv` 会列出每条失效曲线的原因。如果某一类原因大量出现，通常不是单井问题，而是数据命名、单位或导出规则存在系统性偏差。
 
 ### 第三步：检查 primary reselection
 
@@ -324,6 +334,3 @@ Log preprocess summary: 38 step2-passed wells, 35 passed, 3 failed, 35 LAS expor
 - 全局阈值是否按层段、井型或工区分区细化。
 - 是否为极值处理生成直方图 QC 图。
 - 连续常值段阈值是否需要继续细化。
-
-
-

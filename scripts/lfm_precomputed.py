@@ -118,8 +118,8 @@ def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[
     mode = str(source_cfg.get("mode", "latest")).strip().lower()
     auto_dir_value = source_cfg.get("well_auto_tie_dir")
     wavelet_dir_value = source_cfg.get("wavelet_generation_dir")
-    if mode != "latest" and (auto_dir_value is None or wavelet_dir_value is None):
-        raise ValueError("source_runs.mode other than 'latest' requires explicit source directories.")
+    if mode != "latest":
+        raise ValueError(f"lfm_precomputed.source_runs.mode only supports 'latest' for now, got {mode!r}.")
     auto_dir = (
         _latest_run(output_root, "well_auto_tie", "well_tie_metrics.csv")
         if auto_dir_value in {None, ""}
@@ -1079,4 +1079,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

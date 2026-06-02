@@ -27,33 +27,6 @@ python scripts/well_inventory.py --output-dir /tmp/inventory_test
 | 时深表目录 | 判断每口井是否有 Petrel TDT |
 | 时间域地震体 | 解析工区几何，判断井口是否在工区内 |
 
----
-
-## 配置参考
-
-脚本从共享配置的 `well_inventory` 段读取参数。所有路径均相对于 `data_root`（顶层配置，默认 `data`）。
-
-```yaml
-well_inventory:
-  well_heads_file: raw/well_heads          # Petrel 井头导出文件
-  las_dir: all_well_las                     # LAS 文件目录
-  well_trace_dir: all_well_trace            # 井轨迹文件目录（只查存在，不解析）
-  well_tops_file: raw/well_tops             # Petrel 井分层导出文件
-  time_depth_dir: time_depth_table          # 时深表目录（只查存在，不解析列名）
-  seismic:
-    file: <path-to-seismic>                 # SEG-Y 或 ZGY 文件
-    type: zgy                               # "segy" 或 "zgy"
-    # 以下仅 SEG-Y 需要
-    iline: <byte-location>
-    xline: <byte-location>
-    istep: <step>
-    xstep: <step>
-  near_survey_threshold_m: 500.0
-  vertical_bottom_offset_threshold_m: 30.0
-  platform_cluster_threshold_m: 12.5
-  dense_well_neighbor_threshold_m: 150.0
-```
-
 **数据资产的预期格式：**
 
 | 输入 | 格式要求 |
@@ -68,29 +41,60 @@ well_inventory:
 
 ---
 
-### 阈值设置指南
+## 配置参考
 
-### `near_survey_threshold_m`（默认 500.0）
+脚本从共享配置的 `well_inventory` 段读取参数。所有路径均相对于 `data_root`（顶层配置，默认 `data`）。
 
-工区外的井，如果井口到工区边界的最近距离 ≤ 此值，标记为 `near_outside`；否则为 `outside`。
+```yaml
+well_inventory:
+  source_data:
+    well_heads_file: raw/well_heads        # Petrel 井头导出文件
+    las_dir: all_well_las                  # LAS 文件目录
+    well_trace_dir: all_well_trace         # 井轨迹文件目录（只查存在，不解析）
+    well_tops_file: raw/well_tops          # Petrel 井分层导出文件
+    time_depth_dir: time_depth_table       # 时深表目录（只查存在，不解析列名）
+
+  seismic:
+    file: <path-to-seismic>                # SEG-Y 或 ZGY 文件
+    type: zgy                              # "segy" 或 "zgy"
+    # 以下仅 SEG-Y 需要
+    iline: <byte-location>
+    xline: <byte-location>
+    istep: <step>
+    xstep: <step>
+
+  survey_position:
+    near_survey_threshold_m: 500.0
+
+  wellbore_classification:
+    vertical_bottom_offset_threshold_m: 30.0
+
+  dense_well_qc:
+    platform_cluster_threshold_m: 12.5
+    dense_well_neighbor_threshold_m: 150.0
+```
+
+### `survey_position.near_survey_threshold_m`
+
+用于区分“刚好在工区边缘外”和“离工区很远”的井。脚本会计算井口到地震工区边界的最近距离；距离在这个范围内的井记为 `near_outside`，更远的井记为 `outside`。
 
 这个阈值取决于你的工区边缘地质情况。如果工区边界附近有可靠的地震数据覆盖，可以放宽；如果边界处地震质量差，保持默认即可。
 
-### `vertical_bottom_offset_threshold_m`（默认 30.0）
+### `wellbore_classification.vertical_bottom_offset_threshold_m`
 
-用井头底孔坐标做直井/斜井初分的阈值。井口到底孔水平距离 ≤ 此值为 `vertical`，否则为 `deviated`。
+用于在还没有解析完整轨迹之前，先给每口井一个粗略井型。脚本会用 Petrel 井头导出中的 `Surface X/Y` 和 `Bottom hole X/Y` 计算井口到底孔的水平偏移；偏移很小的井先视为直井，偏移明显的井先视为斜井。
 
-**注意：这是初分，仅依据 Petrel 井头导出中的 `Bottom hole X/Y` 字段。** Petrel 导出的底孔坐标精度有限（可能四舍五入到整米）。如果后续发现大量假阳性直井或假阴性斜井，调整此值；最终应以第四步轨迹文件复核后的井型为准。
+**注意：这是初分，不是最终轨迹解释。** Petrel 井头里的底孔坐标可能被四舍五入，也看不到井眼中段是否偏斜。后面的井轨迹 QC 会用完整轨迹重新复核井型；如果初分和复核经常不一致，再回头调整这个阈值。
 
-### `platform_cluster_threshold_m`（默认 12.5）
+### `dense_well_qc.platform_cluster_threshold_m`
 
-同平台井的判定半径。井口距离 ≤ 此值的井会通过连通分量算法聚合成 `well_clusters.csv`。同一平台的多口斜井通常是有意设计的钻井方案，不属于"冲突"。
+用于识别同一个平台或井场上的近距离井。井口彼此非常接近的井会被归到同一个平台分组，写入 `well_clusters.csv`。同平台上的多口斜井通常是有意设计的钻井方案，不应被当成普通近井冲突。
 
-同时，同平台井对 **不会** 作为两两近邻警告导出到 `well_neighbor_pairs.csv`，这避免了每次看到上百对虚假冲突时，还要手动分辨哪些来自同一个平台。
+因此，同平台井对不会进入 `well_neighbor_pairs.csv` 的高风险冲突清单，避免后续排查时被大量正常平台井淹没。
 
-### `dense_well_neighbor_threshold_m`（默认 150.0）
+### `dense_well_qc.dense_well_neighbor_threshold_m`
 
-密井网近邻的统计半径。仅用于统计计数（写入 `run_summary.json`），不会全量导出为 CSV。
+用于给密井网一个整体密集程度的统计口径。它只影响 `run_summary.json` 里的近邻数量，不会把所有近井对都导出成 CSV。
 
 `nominal_bin_spacing_m` 是脚本根据真实 XY 道中心坐标估算出的名义道间距，写在 `run_summary.json` 的 `bin_spacing_m.nominal_bin_spacing_m` 中。它不是配置里的线号步长，而是从相邻 inline、xline 道中心距离中取出的稳健代表值，单位为米。
 
@@ -153,7 +157,7 @@ well_inventory:
 
 ### 3. `well_clusters.csv` — 同平台井分组
 
-井口距离 ≤ `platform_cluster_threshold_m` 的井通过连通分量算法聚合。
+把井口距离很近、很可能属于同一平台的井放在一起。这个文件适合用来检查平台井规模，以及后续是否需要按平台加权或选代表井。
 
 | 字段 | 含义 |
 |------|------|
@@ -207,8 +211,8 @@ wellbore_class_counts: {deviated: 85, vertical: 18}
 
 ### 第四步：看 `neighbor_summary`
 
-- `dense_neighbor_pair_count` 很大（>300）→ 说明井网很密，但这不直接意味着有问题。
-- `exported_neighbor_pair_count` > 0 → 存在井口落在同一地震道但不在同一平台的井对。查看 `well_neighbor_pairs.csv` 了解详情。这一对井在后续 auto-tie 和 well constraints 中可能需要特殊处理。
+- `dense_neighbor_pair_count` 很大（>300）→ 说明井网很密，但不等于数据有问题。
+- `exported_neighbor_pair_count` > 0 → 存在井口落在同一地震道、但不属于同一平台的井对。查看 `well_neighbor_pairs.csv` 了解详情；这类井在后续 auto-tie 和井约束中可能需要特殊处理。
 - `platform_cluster_count` 告诉你工区内有多少个集中钻井平台。每个 cluster 的 `cluster_size` 可以帮助判断后续是否需要对同平台井做代表井选择或加权处理。
 
 ### 第五步：看 `well_inventory.csv` 的具体列
@@ -222,8 +226,5 @@ wellbore_class_counts: {deviated: 85, vertical: 18}
 
 ## 留到第二轮
 
-- 同平台/同道井在后续井控、标定和反演里的冲突策略。
 - 斜井初分从井头底孔坐标升级为轨迹驱动的统一入口。
 - 对密井网按平台或井组生成更高层级的统计摘要。
-
-

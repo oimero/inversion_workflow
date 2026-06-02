@@ -166,6 +166,9 @@ def _discover_latest_dir(cfg: dict[str, Any], prefix: str) -> Path:
 
 def _resolve_source_dirs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str, Path]:
     source_runs = dict(script_cfg.get("source_runs") or {})
+    mode = str(source_runs.get("mode", "latest")).strip().casefold()
+    if mode != "latest":
+        raise ValueError(f"wavelet_generation.source_runs.mode only supports 'latest' for now, got {mode!r}.")
     auto_tie_dir = (
         _resolve_repo_path(source_runs["well_auto_tie_dir"])
         if source_runs.get("well_auto_tie_dir") is not None
@@ -695,4 +698,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

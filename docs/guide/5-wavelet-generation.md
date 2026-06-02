@@ -90,6 +90,7 @@ wavelet_generation:
   export:
     selected_wavelet_name: global_wavelet_201ms.csv
     write_unified_synthetics: true
+    write_debug_artifacts: false
 ```
 
 ### `source_runs`
@@ -140,6 +141,12 @@ wavelet_generation:
 - 如果评测井总数不足 `min_eval_well_count`，脚本不尝试共识优化，降级为选择第四步来源井指标最好的候选子波。
 - 共识优化产出的生成子波必须**严格优于**最佳候选子波的分数才会被选中；如果打平或更差，脚本选择最佳候选，并在 summary 中标记 `existing_candidate_wins`。
 
+### `export`
+
+`write_unified_synthetics` 控制是否写出每井合成记录 CSV。每井 QC 图默认仍会生成，方便直接看波形是否对齐。
+
+`write_debug_artifacts` 默认关闭。关闭时只写主线结果；打开后会额外写出候选子波清单、候选 QC、候选逐井评测、PCA 基底和共识搜索明细，用于复盘共识子波的搜索过程。
+
 ---
 
 ## 脚本在做什么
@@ -185,6 +192,8 @@ wavelet_generation:
 
 用最终选定的全局子波，对所有评测井生成统一的合成记录和 QC 数据。
 
+批量合成结束后，脚本会给每口评测井输出一张三联 QC 图：反射系数、观测地震与合成记录叠合、残差。
+
 ---
 
 ## 核心输出文件
@@ -193,22 +202,19 @@ wavelet_generation:
 
 | 文件 | 内容 |
 |------|------|
-| `candidate_wavelets.csv` | 进入候选池的子波清单和来源井信息 |
-| `wavelet_qc.csv` | 每条候选子波的 QC 结果：中心、长度、L2 能量、是否重归一化 |
 | `evaluation_well_spatial_clusters.csv` | 每口评测井的空间簇编号和簇大小 |
-| `wavelet_candidate_metrics.csv` | 候选子波 × 评测井的逐项指标（相关系数、NMAE、振幅缩放等） |
 | `wavelet_candidate_aggregate.csv` | 候选子波的空间去偏聚合指标和综合分数 |
-| `wavelet_basis.csv` | 均值子波和 PCA 主成分 |
-| `consensus_search_trials.csv` | 共识搜索的每次 trial：系数、各项指标、分数、是否选中 |
-| `consensus_wavelet_metrics.csv` | 共识子波 × 评测井的逐项指标 |
 | `selected_wavelet.csv` | 最终输出的全局子波 |
 | `selected_wavelet_summary.json` | 选择模式、分数对比、来源井、配置摘要 |
 | `batch_synthetic_metrics.csv` | 使用全局子波后每口井的合成记录指标 |
 | `synthetic_qc/*.csv` | 每口井的地震道、反射系数、合成记录和残差 |
+| `figures/batch_synthetic_qc/*.png` | 每口井的批量合成三联 QC 图 |
 | `figures/selected_wavelet.png` | 全局子波、最佳候选和共识子波的形态对比 |
 | `run_summary.json` | 输入路径、候选数、评测井数、选择模式 |
 
-### `wavelet_candidate_metrics.csv`
+`candidate_wavelets.csv`、`wavelet_qc.csv`、`wavelet_candidate_metrics.csv`、`wavelet_basis.csv`、`consensus_search_trials.csv` 和 `consensus_wavelet_metrics.csv` 默认不写。需要追溯候选过滤、PCA 或共识搜索过程时，把 `export.write_debug_artifacts` 打开。
+
+### `wavelet_candidate_metrics.csv`（debug 输出）
 
 每条候选子波在每口评测井上各一行：
 
@@ -226,7 +232,7 @@ wavelet_generation:
 | `status` | `ok` 或 `failed` |
 | `reasons` | 失败原因 |
 
-### `consensus_search_trials.csv`
+### `consensus_search_trials.csv`（debug 输出）
 
 共识搜索的每次评测一行：
 
@@ -281,9 +287,9 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 - 某个候选的 `p10_corr` 特别低——说明它在少数井上表现很差，即使中位数不错也不该选。
 - 空间去偏聚合和普通全井中位数的差异——如果某候选在去偏后分数大幅下降，说明它的高分主要靠一簇密井拉动。
 
-### 第四步：看 `consensus_search_trials.csv`
+### 第四步：必要时打开 debug 明细
 
-在优化搜索记录中关注：
+如果对共识子波为什么赢有疑问，打开 `export.write_debug_artifacts` 重跑，再看 `consensus_search_trials.csv`：
 
 - 随机采样阶段分数最高的几个试验和细化后最终选中的试验之间的分数差——如果细化提升很小（< 0.01），说明随机采样已经找到了足够好的区域。
 - 最终选中试验的各项指标是否都在候选子波族的合理范围内（`deviation_from_mean`、`roughness`、`bandwidth_drift` 不应显著高于候选的典型值）。
@@ -294,7 +300,9 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 
 ### 第六步：抽查合成记录
 
-打开 `batch_synthetic_metrics.csv`，按 `corr` 排序，检查最低分的几口井对应的 `synthetic_qc/*.csv`——地震和合成记录是否在关键层位附近明显错位。如果少数井拖累了全局指标，考虑把它们加入 `evaluation_wells.exclude_wells` 后重跑。
+打开 `batch_synthetic_metrics.csv`，按 `corr` 排序，检查最低分的几口井对应的 `figures/batch_synthetic_qc/*.png`——地震和合成记录是否在关键层位附近明显错位。如果少数井拖累了全局指标，考虑把它们加入 `evaluation_wells.exclude_wells` 后重跑。
+
+每井 QC 图第二个子图的红线是该井单独最小二乘缩放后的合成记录，标题里的 `scale` 就是这口井使用的缩放倍数。因此这张图适合看波形、相位和残差，不用于判断全局固定振幅尺度。
 
 ---
 
@@ -302,7 +310,7 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
-| `No candidate wavelets passed QC` | 所有子波都没通过校验 | 检查 `wavelet_qc.csv` 的具体失败原因：中心偏移、能量异常、长度不一致 |
+| `No candidate wavelets passed QC` | 所有子波都没通过校验 | 打开 `export.write_debug_artifacts` 重跑，检查 `wavelet_qc.csv` 的具体失败原因：中心偏移、能量异常、长度不一致 |
 | `No evaluation wells are available` | 第四步没有标定成功的井 | 检查第四步 `well_tie_metrics.csv` 的 `tie_status` |
 | `No finite candidate wavelet metrics were produced` | 所有候选在所有井上的评测都失败了 | 检查子波采样间隔是否与地震道一致 |
 | `wavelet dt does not match seismic trace dt` | 某条子波的采样间隔和地震道不一致 | 检查第四步子波是否是用正确的地震采样间隔导出的 |

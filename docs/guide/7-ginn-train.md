@@ -19,8 +19,6 @@ python scripts/ginn_train.py --config experiments/ginn/train.yaml
 
 ## 运行前需要什么
 
-第七步不重新选择子波，不重建 LFM，不扫描 residual shift。事实链全部来自前置步骤。
-
 | 来源 | 内容 | 用途 |
 |------|------|------|
 | 地震数据 | 时间域地震体 | 观测地震道和 inline/xline/time 几何 |

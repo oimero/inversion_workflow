@@ -139,7 +139,11 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     merge_dict_defaults(
         script_cfg,
         "export",
-        {"selected_wavelet_name": "global_wavelet_201ms.csv", "write_unified_synthetics": True},
+        {
+            "selected_wavelet_name": "global_wavelet_201ms.csv",
+            "write_unified_synthetics": True,
+            "write_debug_artifacts": False,
+        },
     )
     return script_cfg
 
@@ -182,6 +186,7 @@ def _ensure_output_dirs(output_dir: Path) -> dict[str, Path]:
         "root": output_dir,
         "synthetic_qc": output_dir / "synthetic_qc",
         "figures": output_dir / "figures",
+        "batch_synthetic_qc_figures": output_dir / "figures" / "batch_synthetic_qc",
     }
     for path in dirs.values():
         path.mkdir(parents=True, exist_ok=True)
@@ -467,6 +472,67 @@ def _plot_wavelets(time_s: np.ndarray, wavelets: dict[str, np.ndarray], path: Pa
     plt.close(fig)
 
 
+def _plot_batch_synthetic_qc(qc: pd.DataFrame, metrics_row: pd.Series | None, path: Path) -> None:
+    if qc.empty:
+        return
+    twt_ms = qc["twt_s"].to_numpy(dtype=np.float64) * 1000.0
+    reflectivity = qc["reflectivity"].to_numpy(dtype=np.float64)
+    seismic_norm = qc["seismic_norm"].to_numpy(dtype=np.float64)
+    synthetic = qc["synthetic_scaled"].to_numpy(dtype=np.float64)
+    residual = qc["residual"].to_numpy(dtype=np.float64)
+    corr = float(metrics_row["corr"]) if metrics_row is not None and pd.notna(metrics_row.get("corr")) else np.nan
+    nmae = float(metrics_row["nmae"]) if metrics_row is not None and pd.notna(metrics_row.get("nmae")) else np.nan
+    scale = float(metrics_row["scale"]) if metrics_row is not None and pd.notna(metrics_row.get("scale")) else np.nan
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 5), sharey=True)
+    axes[0].plot(reflectivity, twt_ms, lw=0.8, color="tab:purple")
+    axes[0].invert_yaxis()
+    axes[0].set_xlabel("Reflectivity")
+    axes[0].set_ylabel("TWT (ms)")
+    axes[0].set_title("Reflectivity")
+    axes[0].grid(True, alpha=0.25)
+
+    axes[1].plot(seismic_norm, twt_ms, lw=0.9, label="Seismic", color="black")
+    axes[1].plot(synthetic, twt_ms, lw=0.9, label="Synthetic", color="tab:red", alpha=0.85)
+    axes[1].set_xlabel("Normalized amplitude")
+    axes[1].set_title(f"Batch synthetic: corr={corr:.3f}, nmae={nmae:.3f}, scale={scale:.3g}")
+    axes[1].legend(loc="best")
+    axes[1].grid(True, alpha=0.25)
+
+    axes[2].plot(residual, twt_ms, lw=0.9, color="tab:gray")
+    axes[2].axvline(0.0, color="black", lw=0.8, alpha=0.5)
+    axes[2].set_xlabel("Residual")
+    axes[2].set_title("Residual")
+    axes[2].grid(True, alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_batch_synthetic_qc_figures(
+    qcs: Sequence[pd.DataFrame],
+    metrics_df: pd.DataFrame,
+    output_dir: Path,
+) -> list[str]:
+    metric_by_well = {
+        normalize_well_name(str(row["eval_well"])): row
+        for _, row in metrics_df.iterrows()
+        if "eval_well" in row and pd.notna(row["eval_well"])
+    }
+    figure_paths: list[str] = []
+    for qc in qcs:
+        if qc.empty or "well_name" not in qc.columns:
+            continue
+        well_name = str(qc["well_name"].iloc[0])
+        candidate = str(qc["candidate_wavelet"].iloc[0]) if "candidate_wavelet" in qc.columns else "selected"
+        safe = sanitize_filename(f"{candidate}_{well_name}")
+        path = output_dir / f"batch_synthetic_qc_{safe}.png"
+        _plot_batch_synthetic_qc(qc, metric_by_well.get(normalize_well_name(well_name)), path)
+        figure_paths.append(repo_relative_path(path, root=REPO_ROOT))
+    return figure_paths
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
@@ -477,6 +543,7 @@ def main() -> None:
     source_dirs = _resolve_source_dirs(cfg, script_cfg)
     output_dir = _resolve_output_dir(args, cfg)
     output_dirs = _ensure_output_dirs(output_dir)
+    write_debug_artifacts = bool(script_cfg["export"].get("write_debug_artifacts", False))
 
     index = load_tie_artifacts(source_dirs["auto_tie_dir"], repo_root=REPO_ROOT)
     candidate_filter = dict(script_cfg["candidate_filter"])
@@ -503,11 +570,14 @@ def main() -> None:
         clusters_df["spatial_cluster_id"] = np.arange(len(clusters_df), dtype=np.int64)
         clusters_df["spatial_cluster_size"] = 1
 
-    pd.DataFrame.from_records([item["candidate"].to_row() | {"candidate_wavelet": item["name"]} for item in pool]).to_csv(
-        output_dir / "candidate_wavelets.csv",
-        index=False,
-    )
-    pd.DataFrame.from_records(qc_rows).to_csv(output_dir / "wavelet_qc.csv", index=False)
+    if write_debug_artifacts:
+        pd.DataFrame.from_records(
+            [item["candidate"].to_row() | {"candidate_wavelet": item["name"]} for item in pool]
+        ).to_csv(
+            output_dir / "candidate_wavelets.csv",
+            index=False,
+        )
+        pd.DataFrame.from_records(qc_rows).to_csv(output_dir / "wavelet_qc.csv", index=False)
     clusters_df.to_csv(output_dir / "evaluation_well_spatial_clusters.csv", index=False)
 
     modeler = ConvModeler()
@@ -529,7 +599,8 @@ def main() -> None:
         )
         candidate_metric_frames.append(metrics_df)
     candidate_metrics_df = pd.concat(candidate_metric_frames, ignore_index=True) if candidate_metric_frames else pd.DataFrame()
-    candidate_metrics_df.to_csv(output_dir / "wavelet_candidate_metrics.csv", index=False)
+    if write_debug_artifacts:
+        candidate_metrics_df.to_csv(output_dir / "wavelet_candidate_metrics.csv", index=False)
     candidate_aggregate = _aggregate_metrics(candidate_metrics_df)
     if candidate_aggregate.empty:
         raise ValueError("No finite candidate wavelet metrics were produced.")
@@ -541,7 +612,8 @@ def main() -> None:
         coefficient_bounds=str(pca_cfg["coefficient_bounds"]),
         coefficient_quantiles=tuple(float(v) for v in pca_cfg["coefficient_quantiles"]),
     )
-    _basis_dataframe(wavelet_time_s, basis).to_csv(output_dir / "wavelet_basis.csv", index=False)
+    if write_debug_artifacts:
+        _basis_dataframe(wavelet_time_s, basis).to_csv(output_dir / "wavelet_basis.csv", index=False)
     mean_features = wavelet_spectrum_features(wavelet_time_s, basis.mean_wavelet).to_row()
     candidate_aggregate = _add_candidate_regularization_and_score(
         candidate_aggregate,
@@ -576,11 +648,12 @@ def main() -> None:
     consensus_wavelet = basis.mean_wavelet
     consensus_score = float("nan")
     if insufficient_eval_wells:
-        pd.DataFrame(columns=["trial_id", "score", "status", "reason", "selected"]).to_csv(
-            output_dir / "consensus_search_trials.csv",
-            index=False,
-        )
-        pd.DataFrame().to_csv(output_dir / "consensus_wavelet_metrics.csv", index=False)
+        if write_debug_artifacts:
+            pd.DataFrame(columns=["trial_id", "score", "status", "reason", "selected"]).to_csv(
+                output_dir / "consensus_search_trials.csv",
+                index=False,
+            )
+            pd.DataFrame().to_csv(output_dir / "consensus_wavelet_metrics.csv", index=False)
         selected_name = best_candidate_name
         selected_source = best_candidate_item["candidate"].source_well
         selected_wavelet = best_candidate_item["amplitude"]
@@ -625,10 +698,11 @@ def main() -> None:
                 score_key="score",
             ),
         )
-        pd.DataFrame.from_records([trial.to_row() for trial in consensus_result.trials]).to_csv(
-            output_dir / "consensus_search_trials.csv",
-            index=False,
-        )
+        if write_debug_artifacts:
+            pd.DataFrame.from_records([trial.to_row() for trial in consensus_result.trials]).to_csv(
+                output_dir / "consensus_search_trials.csv",
+                index=False,
+            )
 
         consensus_metrics_df, _ = _evaluate_wavelet_on_all_wells(
             wavelet_name="optimized_consensus",
@@ -640,7 +714,8 @@ def main() -> None:
             modeler=modeler,
             well_cache=well_cache,
         )
-        consensus_metrics_df.to_csv(output_dir / "consensus_wavelet_metrics.csv", index=False)
+        if write_debug_artifacts:
+            consensus_metrics_df.to_csv(output_dir / "consensus_wavelet_metrics.csv", index=False)
         consensus_score = float(consensus_result.score)
         consensus_wavelet = consensus_result.wavelet
 
@@ -659,7 +734,7 @@ def main() -> None:
 
     selected_wavelet_path = output_dir / str(script_cfg["export"]["selected_wavelet_name"])
     pd.DataFrame({"time_s": wavelet_time_s, "amplitude": selected_wavelet}).to_csv(selected_wavelet_path, index=False)
-    batch_metrics_df, _ = _evaluate_wavelet_on_all_wells(
+    batch_metrics_df, batch_qcs = _evaluate_wavelet_on_all_wells(
         wavelet_name=selected_name,
         source_well=selected_source,
         wavelet_time_s=wavelet_time_s,
@@ -671,7 +746,11 @@ def main() -> None:
         well_cache=well_cache,
     )
     batch_metrics_df.to_csv(output_dir / "batch_synthetic_metrics.csv", index=False)
-
+    batch_qc_figure_paths = _write_batch_synthetic_qc_figures(
+        batch_qcs,
+        batch_metrics_df,
+        output_dirs["batch_synthetic_qc_figures"],
+    )
     plot_wavelets = {"selected": selected_wavelet, "best_candidate": best_candidate_item["amplitude"]}
     plot_wavelets["mean_of_candidates" if selection_mode == "insufficient_eval_fallback" else "consensus"] = consensus_wavelet
     _plot_wavelets(wavelet_time_s, plot_wavelets, output_dirs["figures"] / "selected_wavelet.png")
@@ -687,6 +766,7 @@ def main() -> None:
         "evaluation_well_count": len(wells),
         "selected_wavelet_file": repo_relative_path(selected_wavelet_path, root=REPO_ROOT),
         "source_auto_tie_dir": repo_relative_path(source_dirs["auto_tie_dir"], root=REPO_ROOT),
+        "batch_synthetic_qc_figure_count": len(batch_qc_figure_paths),
     }
     write_json(output_dir / "selected_wavelet_summary.json", summary)
     write_json(output_dir / "run_summary.json", {"config": script_cfg, **summary})

@@ -388,7 +388,7 @@ class SeismicTraceDataset(Dataset):
     - ``obs``：(1, n_sample) — 归一化观测地震道（用于损失计算）
     - ``mask``：(1, n_sample) — core 布尔掩码
     - ``loss_mask``：(1, n_sample) — eroded core 掩码，仅用于 waveform loss
-    - ``taper_weight``：(1, n_sample) — core+halo 平滑权重，用于高频扰动收口
+    - ``taper_weight``：(1, n_sample) — core+halo 平滑权重，用于残差收口
     - ``lfm_raw``：(1, n_sample) — 原始 LFM（用于正演时恢复阻抗）
 
     Parameters

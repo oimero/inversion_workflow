@@ -74,7 +74,7 @@ class GINNConfig:
     include_dynamic_gain_input: bool = False  # 是否将 log-normalized dynamic gain 作为网络输入通道。
     in_channels: int = 3  # 网络输入通道数：地震 + 可选 LFM/mask/dynamic gain。
     hidden_channels: int = 64  # 残差块内部的隐藏通道数。
-    out_channels: int = 1  # 网络输出通道数，对应高频扰动。
+    out_channels: int = 1  # 网络输出通道数，对应残差。
     num_res_blocks: int = 8  # 残差块数量。
     dilations: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)  # 各残差块的 dilation 序列。
     kernel_size: int = 3  # 一维卷积核大小。
@@ -92,8 +92,8 @@ class GINNConfig:
     # 真实数据训练损失由 waveform MAE、residual L2 和 residual TV 组成。
     # L2/TV 越强，越能抑制不稳定高频，但也越容易洗掉分辨率；做高分辨率实验
     # 时应和 baseline 对照，不要只看 waveform loss。
-    lambda_l2: float = 0.03  # 高频扰动 L2 正则化权重，约束阻抗尺度不要漂移。
-    lambda_tv: float = 0.0  # 高频扰动 TV 正则化权重，抑制层内高频 ringing。
+    lambda_l2: float = 0.05  # 残差 L2 正则化权重，约束阻抗尺度不要漂移。
+    lambda_tv: float = 0.05  # 残差 TV 正则化权重，抑制层内高频 ringing。
     log_ai_anchor_file: Path | None = None  # 可选 log-AI anchor NPZ；支持井点与相控点约束。
     lambda_log_ai_anchor: float = 0.0  # log(AI) anchor 监督权重；0 表示关闭。
     log_ai_anchor_radius_xy_m: float = 0.0  # anchor 影响半径（XY 米制）；0=仅中心道。
@@ -101,7 +101,7 @@ class GINNConfig:
     well_waveform_min_weight: float = 0.3  # 井中心保留的最小 waveform loss 权重。
     well_anchor_batch_fraction: float = 0.25  # 训练 batch 中井影响区样本的目标占比。
     well_anchor_distance_decay: WellAnchorDistanceDecay = "gaussian"  # 井影响随距离衰减方式。
-    zero_residual_outside_mask: bool = True  # 是否将层外高频扰动通过 taper 平滑压回 0。
+    zero_residual_outside_mask: bool = True  # 是否将层外残差通过 taper 平滑压回 0。
     boundary_effect_samples: int | None = None  # 为空时按子波 5% 有效半支撑自动计算。
 
     # ── 验证与早停 ────────────────────────────────────────────

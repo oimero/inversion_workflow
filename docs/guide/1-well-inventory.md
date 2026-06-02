@@ -161,6 +161,19 @@ well_inventory:
 
 包含：脚本名、配置路径、所有输入文件路径（相对于仓库根目录）、四项阈值、工区几何信息、道间距（inline/xline/nominal，单位米）、工区 footprint 四角 XY，以及全部统计计数和名单。
 
+其中，地震体几何：
+
+| JSON 路径 | 含义 |
+|-----------|------|
+| `geometry.sample_domain` / `geometry.sample_unit` | 采样轴类型和单位；时间域应为 `time` / `s` |
+| `geometry.sample_min` / `geometry.sample_max` / `geometry.sample_step` | 采样轴起止值和采样间隔；查时间采样间隔就看 `geometry.sample_step` |
+| `geometry.n_sample` | 时间或深度采样点数 |
+| `geometry.inline_min` / `geometry.inline_max` / `geometry.inline_step` | inline 线号范围和线号步长 |
+| `geometry.xline_min` / `geometry.xline_max` / `geometry.xline_step` | xline 线号范围和线号步长 |
+| `geometry.n_il` / `geometry.n_xl` | inline / xline 数量 |
+| `bin_spacing_m.nominal` | 近似道间距，单位米 |
+| `footprint_xy` | 工区 footprint 四角 XY |
+
 关键的 `neighbor_summary` 段：
 
 | 字段 | 含义 |
@@ -188,6 +201,8 @@ wellbore_class_counts: {deviated: 85, vertical: 18}
 ```
 
 这几行直接回答：有多少井？缺哪些资产？多少在工区内？多少看起来是斜井？
+
+如果要查地震几何，也从同一个 `run_summary.json` 开始。最常用的是 `geometry.sample_step`，它就是地震时间采样间隔，单位由 `geometry.sample_unit` 给出；时间域工作流里应为秒。线号范围看 `geometry.inline_*` 和 `geometry.xline_*`，近似物理道间距看 `bin_spacing_m.nominal`。
 
 ### 第二步：如果有 `las_only` 井 → 补井头
 

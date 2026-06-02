@@ -1,6 +1,6 @@
 # 08 时间域 GINN 反演
 
-`ginn_inversion.py` 是时间域工作流的第八步。它读取第七步训练好的 checkpoint，复用 checkpoint 内保存的训练配置，在全目标层范围内推理并输出 stage-1 AI 体。
+`ginn_inversion.py` 是时间域工作流的第八步。它读取第七步训练好的 checkpoint，复用 checkpoint 内保存的训练配置，在全目标层范围内推理并输出 stage-1 波阻抗体。
 
 第一版只做时间域 stage-1 反演：不接 enhance，不接 dynamic gain，不重新选择子波，也不重建 LFM。
 
@@ -54,7 +54,7 @@ checkpoint 内已经包含第七步训练配置，因此第八步不应该重复
 1. 读取 checkpoint，取出保存的 `config`、`model_state_dict`、epoch 和 best loss。
 2. 用 checkpoint 内配置重新构建 `GINNConfig`，并把设备解析为当前机器可用设备。
 3. 初始化 `src.ginn.trainer.Trainer`，复用第七步的数据加载、mask、LFM、子波和 fixed gain 口径。
-4. 加载模型权重，调用 `predict_volume()` 得到全目标层 stage-1 AI。
+4. 加载模型权重，调用 `predict_volume()` 得到全目标层 stage-1 波阻抗。
 5. 未进入 inference mask 的样点保持 LFM，不静默留 0。
 6. 输出 NPZ、可选 SEG-Y、QC 图和统计摘要。
 
@@ -68,11 +68,11 @@ checkpoint 内已经包含第七步训练配置，因此第八步不应该重复
 
 | 文件 | 内容 |
 |------|------|
-| `stage1_ginn_base_ai_time.npz` | 时间域 stage-1 AI 预测体 |
+| `stage1_ginn_base_ai_time.npz` | 时间域 stage-1 波阻抗预测体 |
 | `stage1_ginn_base_ai_time.segy` | 可选 SEG-Y 导出 |
 | `qc/prediction_context_time.npz` | 可选 QC 包，保存 LFM 和 mask 等调试上下文 |
-| `figures/<slice>_prediction_vs_lfm.png` | 预测 AI、LFM 和差异剖面对比 |
-| `figures/prediction_vs_lfm_crossplot.png` | 预测 AI 与 LFM 抽样交会图 |
+| `figures/<slice>_prediction_vs_lfm.png` | 预测波阻抗、LFM 和差异剖面对比 |
+| `figures/prediction_vs_lfm_crossplot.png` | 预测波阻抗与 LFM 抽样交会图 |
 | `metadata/run_summary.json` | checkpoint、输出、几何和预测统计 |
 
 ### `stage1_ginn_base_ai_time.npz`
@@ -81,14 +81,14 @@ NPZ 应与第六步 LFM 的轴和 geometry 对齐：
 
 | 键 | 含义 |
 |----|------|
-| `volume` | stage-1 AI 体，shape 为 `(n_inline, n_xline, n_sample)` |
+| `volume` | stage-1 波阻抗体，shape 为 `(n_inline, n_xline, n_sample)` |
 | `ilines` / `xlines` / `samples` | inline、xline、TWT 秒轴 |
 | `geometry_json` | 时间域地震几何 |
 | `metadata_json` | checkpoint、训练配置摘要、统计信息和上游路径 |
 
 metadata 中应至少记录 `checkpoint_path`、`checkpoint_epoch`、`checkpoint_best_epoch`、`checkpoint_best_loss`、`ai_lfm_file`、`wavelet_file` 和 `prediction_stats`。
 
-`lfm_volume` 和 `mask` 适合写入可选 QC 包，而不是默认塞进主预测 NPZ。大工区下这两个数组会显著增加文件体积；主 NPZ 保持为 stage-1 AI 体和轴信息即可。
+`lfm_volume` 和 `mask` 适合写入可选 QC 包，而不是默认塞进主预测 NPZ。大工区下这两个数组会显著增加文件体积；主 NPZ 保持为 stage-1 波阻抗体和轴信息即可。
 
 ---
 
@@ -112,7 +112,7 @@ metadata 中应至少记录 `checkpoint_path`、`checkpoint_epoch`、`checkpoint
 - 井密集区域剖面。
 - 目标层边界变化剧烈区域剖面。
 
-预测 AI 应在目标层内相对 LFM 增加合理高频细节；目标层外 residual 应被 taper 压回 0。
+预测波阻抗应在目标层内相对 LFM 增加合理高频细节；目标层外 residual 应被 taper 压回 0。
 
 ---
 

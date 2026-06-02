@@ -63,42 +63,30 @@ well_inventory:
     istep: <step>
     xstep: <step>
 
-  survey_position:
+  spatial_qc:
     near_survey_threshold_m: 500.0
-
-  wellbore_classification:
     vertical_bottom_offset_threshold_m: 30.0
-
-  dense_well_qc:
     platform_cluster_threshold_m: 12.5
     dense_well_neighbor_threshold_m: 150.0
 ```
 
-### `survey_position.near_survey_threshold_m`
+### `near_survey_threshold_m`
 
-用于区分“刚好在工区边缘外”和“离工区很远”的井。脚本会计算井口到地震工区边界的最近距离；距离在这个范围内的井记为 `near_outside`，更远的井记为 `outside`。
+用于区分“刚好在工区边缘外”和“离工区很远”的井。脚本会计算井口到地震工区边界的最近距离；距离在这个范围内的井记为 `near_outside`，更远的井记为 `outside`。这个阈值取决于你的工区边缘地质情况。如果工区边界附近有可靠的地震数据覆盖，可以放宽；如果边界处地震质量差，保持默认即可。
 
-这个阈值取决于你的工区边缘地质情况。如果工区边界附近有可靠的地震数据覆盖，可以放宽；如果边界处地震质量差，保持默认即可。
+### `vertical_bottom_offset_threshold_m`
 
-### `wellbore_classification.vertical_bottom_offset_threshold_m`
+用于在还没有解析完整轨迹之前，先给每口井一个粗略井型。脚本会用 Petrel 井头导出中的 `Surface X/Y` 和 `Bottom hole X/Y` 计算井口到底孔的水平偏移；偏移很小的井先视为直井，偏移明显的井先视为斜井。注意：**这是初分，不是最终轨迹解释，后面的井轨迹 QC 会用完整轨迹重新复核井型**。如果初分和复核经常不一致，再回头调整这个阈值。
 
-用于在还没有解析完整轨迹之前，先给每口井一个粗略井型。脚本会用 Petrel 井头导出中的 `Surface X/Y` 和 `Bottom hole X/Y` 计算井口到底孔的水平偏移；偏移很小的井先视为直井，偏移明显的井先视为斜井。
+### `dense_well_neighbor_threshold_m`
 
-**注意：这是初分，不是最终轨迹解释。** Petrel 井头里的底孔坐标可能被四舍五入，也看不到井眼中段是否偏斜。后面的井轨迹 QC 会用完整轨迹重新复核井型；如果初分和复核经常不一致，再回头调整这个阈值。
+描述“值得警惕的近”。两口独立井相距不远时，可能在地震上落到同一条道或很近的道，后续 auto-tie、井约束、插值和反演都可能重复消费相似地震信息，所以需要统计和审计。
 
-### `dense_well_qc.platform_cluster_threshold_m`
+### `platform_cluster_threshold_m`
 
-用于识别同一个平台或井场上的近距离井。井口彼此非常接近的井会被归到同一个平台分组，写入 `well_clusters.csv`。同平台上的多口斜井通常是有意设计的钻井方案，不应被当成普通近井冲突。
+描述“近到像同一个平台”。这类井往往是同一平台上的多个井槽或丛式井，井口极近是钻井设计造成的，不应直接当成异常冲突。脚本会先把它们聚成平台，再把同平台井对从高风险同道冲突清单里排除。
 
-因此，同平台井对不会进入 `well_neighbor_pairs.csv` 的高风险冲突清单，避免后续排查时被大量正常平台井淹没。
-
-### `dense_well_qc.dense_well_neighbor_threshold_m`
-
-用于给密井网一个整体密集程度的统计口径。它只影响 `run_summary.json` 里的近邻数量，不会把所有近井对都导出成 CSV。
-
-`nominal_bin_spacing_m` 是脚本根据真实 XY 道中心坐标估算出的名义道间距，写在 `run_summary.json` 的 `bin_spacing_m.nominal_bin_spacing_m` 中。它不是配置里的线号步长，而是从相邻 inline、xline 道中心距离中取出的稳健代表值，单位为米。
-
-建议将默认值理解为 `max(3 × nominal_bin_spacing_m, 150)`。实际道间距会由脚本写入 `run_summary.json`，方便交叉验证。如果此阈值过大，`dense_neighbor_pair_count` 会膨胀到几百甚至上千，失去可读性。
+`dense_well_neighbor_threshold_m` 和 `platform_cluster_threshold_m` 这两个阈值的大小关系也因此应该不同：平台阈值通常很小，只识别井口几乎贴在一起的井；近邻阈值更大，用来观察密井网中可能互相影响的井对。此外，`dense_well_neighbor_threshold_m` 只影响 `run_summary.json` 里的近邻数量，不会把所有近井对都导出成 CSV。真正导出的 `well_neighbor_pairs.csv` 更克制：只保留“落到同一最近地震道、且不属于同平台”的井对。
 
 ---
 
@@ -109,7 +97,7 @@ well_inventory:
 核心动作是：
 
 1. 按规范化井名合并各类资产，检查大小写冲突。
-2. 根据井口 XY 判断工区位置，写出浮点线号和最近道线号。
+2. 根据每口井的 XY 判断它在工区的具体位置，计算它的线号（带小数点）和最近道线号。
 3. 用井口到底孔的水平偏移做直井/斜井初分。
 4. 识别同平台井和非同平台同道冲突，给密井网后续处理留出审计入口。
 5. 写出主清单、同道冲突、平台分组和运行摘要。
@@ -178,9 +166,9 @@ well_inventory:
 | 字段 | 含义 |
 |------|------|
 | `valid_surface_well_count` | 有效井口坐标井数（参与近邻计算） |
-| `dense_neighbor_pair_count` | ≤ `dense_well_neighbor_threshold_m` 的井对总数 |
+| `dense_neighbor_pair_count` | 落入 `spatial_qc.dense_well_neighbor_threshold_m` 统计半径内的井对总数 |
 | `same_surface_nearest_trace_pair_count` | 井口吸附到同一最近道的井对数 |
-| `same_platform_pair_count` | 井口 ≤ `platform_cluster_threshold_m` 的井对数 |
+| `same_platform_pair_count` | 被 `spatial_qc.platform_cluster_threshold_m` 识别为同平台的井对数 |
 | `same_trace_platform_pair_count` | 同时满足同道和同平台的井对数 |
 | `exported_neighbor_pair_count` | 写入 `well_neighbor_pairs.csv` 的硬冲突数 |
 | `platform_cluster_count` | 平台分组数 |

@@ -36,7 +36,6 @@ well_trajectory:
     mode: latest
     well_inventory_dir: null
 
-  inventory_file: null
   well_trace_dir: all_well_trace
 
   seismic:
@@ -61,7 +60,7 @@ well_trajectory:
 
 ### `source_runs`
 
-默认接上最新一次井资产盘点结果。复现实验时，可以在 `well_inventory_dir` 填入某次第一步输出目录；如果只想替换清单文件本身，再用 `inventory_file` 指定具体的 `well_inventory.csv`。`mode` 目前只支持 `latest`。
+默认接上最新一次井资产盘点结果。复现实验时，在 `well_inventory_dir` 填入某次第一步输出目录即可固定输入；`mode` 目前只支持 `latest`。
 
 ### `well_trace_dir`
 
@@ -263,4 +262,3 @@ Wrote trajectory QC for 103 wells to ... ({'passed': 80, 'warning': 18, 'failed'
 - 轨迹点落道从最近道升级为双线性或多道加权。
 - 与第四步斜井标定共享同一套轨迹采样对象，减少脚本间裸数组传递。
 - 对同平台密井生成轨迹交叉/近距离诊断。
-

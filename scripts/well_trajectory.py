@@ -66,7 +66,6 @@ def parse_args() -> argparse.Namespace:
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_trajectory") or {})
     merge_dict_defaults(script_cfg, "source_runs", {"mode": "latest", "well_inventory_dir": None})
-    script_cfg.setdefault("inventory_file", None)
     script_cfg.setdefault("well_trace_dir", "all_well_trace")
     merge_dict_defaults(
         script_cfg,
@@ -109,9 +108,6 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
 
 
 def _discover_latest_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
-    if script_cfg.get("inventory_file") is not None:
-        return _resolve_repo_path(script_cfg["inventory_file"])
-
     source_runs = dict(script_cfg.get("source_runs") or {})
     mode = str(source_runs.get("mode", "latest")).strip().casefold()
     if mode != "latest":

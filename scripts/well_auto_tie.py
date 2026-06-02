@@ -95,11 +95,6 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "well_trajectory_dir": None,
         },
     )
-    script_cfg.setdefault("inventory_file", None)
-    script_cfg.setdefault("well_screen_file", None)
-    script_cfg.setdefault("preprocess_status_file", None)
-    script_cfg.setdefault("preprocessed_las_dir", None)
-    script_cfg.setdefault("well_trajectory_file", None)
     script_cfg.setdefault("time_depth_dir", "time_depth_table")
     script_cfg.setdefault("well_trace_dir", "all_well_trace")
     script_cfg.setdefault("well_tops_file", "raw/well_tops")
@@ -224,36 +219,16 @@ def _resolve_inputs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str
         except FileNotFoundError:
             trajectory_dir = None
 
-    inventory_file = (
-        _resolve_repo_path(script_cfg["inventory_file"])
-        if script_cfg.get("inventory_file") is not None
-        else inventory_dir / "well_inventory.csv"
-    )
-    well_screen_file = (
-        _resolve_repo_path(script_cfg["well_screen_file"])
-        if script_cfg.get("well_screen_file") is not None
-        else screen_dir / "well_screen.csv"
-    )
-    preprocess_status_file = (
-        _resolve_repo_path(script_cfg["preprocess_status_file"])
-        if script_cfg.get("preprocess_status_file") is not None
-        else preprocess_dir / "well_preprocess_status.csv"
-    )
-    well_trajectory_file = (
-        _resolve_repo_path(script_cfg["well_trajectory_file"])
-        if script_cfg.get("well_trajectory_file") is not None
-        else (trajectory_dir / "well_trajectory.csv" if trajectory_dir is not None else None)
-    )
+    inventory_file = inventory_dir / "well_inventory.csv"
+    well_screen_file = screen_dir / "well_screen.csv"
+    preprocess_status_file = preprocess_dir / "well_preprocess_status.csv"
+    well_trajectory_file = trajectory_dir / "well_trajectory.csv" if trajectory_dir is not None else None
 
     return {
         "inventory_file": inventory_file,
         "well_screen_file": well_screen_file,
         "preprocess_status_file": preprocess_status_file,
-        "preprocessed_las_dir": (
-            _resolve_repo_path(script_cfg["preprocessed_las_dir"])
-            if script_cfg.get("preprocessed_las_dir") is not None
-            else preprocess_dir / "preprocessed_las"
-        ),
+        "preprocessed_las_dir": preprocess_dir / "preprocessed_las",
         "well_trajectory_file": (
             well_trajectory_file if well_trajectory_file is not None and well_trajectory_file.exists() else None
         ),

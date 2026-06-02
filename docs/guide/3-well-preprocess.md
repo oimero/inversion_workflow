@@ -36,12 +36,6 @@ well_preprocess:
     mode: latest
     well_screen_dir: null
 
-  source_files:
-    screen_file: null
-    input_las_dir: null
-    curve_inventory_file: null
-    classification_dir: null
-
   # 输出子目录
   output_las_dir: preprocessed_las
 
@@ -105,10 +99,6 @@ well_preprocess:
 ### `source_runs`
 
 默认接上最新一次曲线筛选结果。复现实验时，在 `well_screen_dir` 填入某次第二步输出目录即可固定整套输入；`mode` 目前只支持 `latest`。
-
-### `source_files`
-
-更细粒度的输入覆盖入口。日常运行保持全空；只有临时替换某一个第二步产物时，才单独填写这里的文件或目录。
 
 ### `required_categories`
 

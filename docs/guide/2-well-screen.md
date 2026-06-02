@@ -38,11 +38,13 @@ well_screen:
   source_runs:
     mode: latest
     well_inventory_dir: null                 # null = 自动发现最新 step1 输出
-  inventory_file: null                       # 可选：直接指定 well_inventory.csv
+
   source_data:
     las_dir: all_well_las                    # 原始 LAS 目录，相对于 data_root
+
   candidate_filter:
     include_survey_positions: [inside, near_outside]
+
   curve_selection:
     required_categories: [p_sonic, density]  # 必须同时具备才能 passed
     selected_categories:                     # 需要从 LAS 中提取的类别
@@ -56,13 +58,16 @@ well_screen:
       - porosity
       - permeability
       - water_saturation
+
   classification:
     curve_schema_file: null                  # null = 使用内置 CURVE_CATEGORY_MNEMONICS
     curve_override_file: experiments/curve_alias_overrides.yaml
+
   llm:
     enabled: false
     cache_dir: scripts/output/well_screen_cache
     max_retry: 1
+
   export:
     selected_las_dir: selected_las
     null_value: -999.25
@@ -71,7 +76,7 @@ well_screen:
 
 ### `source_runs`
 
-默认接上最新一次井资产盘点结果。复现实验时，可以在 `well_inventory_dir` 填入某次第一步输出目录；如果只想替换清单文件本身，再使用 `inventory_file` 指定具体的 `well_inventory.csv`。`mode` 目前只支持 `latest`。
+默认接上最新一次井资产盘点结果。复现实验时，在 `well_inventory_dir` 填入某次第一步输出目录即可固定输入；`mode` 目前只支持 `latest`。
 
 ### `curve_selection.required_categories`
 

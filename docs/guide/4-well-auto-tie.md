@@ -45,12 +45,6 @@ well_auto_tie:
     well_preprocess_dir: null
     well_trajectory_dir: null
 
-  inventory_file: null
-  well_screen_file: null
-  preprocess_status_file: null
-  preprocessed_las_dir: null
-  well_trajectory_file: null
-
   time_depth_dir: <time-depth-dir>
   well_trace_dir: <well-trajectory-dir>
   well_tops_file: <well-tops-file>

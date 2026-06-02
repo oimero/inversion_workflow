@@ -77,7 +77,6 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     source_runs.setdefault("mode", "latest")
     source_runs.setdefault("well_inventory_dir", None)
     script_cfg["source_runs"] = source_runs
-    script_cfg.setdefault("inventory_file", None)
     source_data = dict(script_cfg.get("source_data") or {})
     source_data.setdefault("las_dir", "all_well_las")
     script_cfg["source_data"] = source_data
@@ -136,8 +135,6 @@ def _validate_latest_mode(source_runs: Mapping[str, Any], *, section: str) -> No
 def _discover_latest_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
     source_runs = dict(script_cfg.get("source_runs") or {})
     _validate_latest_mode(source_runs, section="well_screen")
-    if script_cfg.get("inventory_file") is not None:
-        return _resolve_repo_path(script_cfg["inventory_file"])
     if source_runs.get("well_inventory_dir") is not None:
         return _resolve_repo_path(source_runs["well_inventory_dir"]) / "well_inventory.csv"
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))

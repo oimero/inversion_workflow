@@ -104,16 +104,12 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "type": "zgy",
         },
     )
-    survey_position = dict(script_cfg.get("survey_position") or {})
-    survey_position.setdefault("near_survey_threshold_m", 500.0)
-    script_cfg["survey_position"] = survey_position
-    wellbore_classification = dict(script_cfg.get("wellbore_classification") or {})
-    wellbore_classification.setdefault("vertical_bottom_offset_threshold_m", 30.0)
-    script_cfg["wellbore_classification"] = wellbore_classification
-    dense_well_qc = dict(script_cfg.get("dense_well_qc") or {})
-    dense_well_qc.setdefault("platform_cluster_threshold_m", 12.5)
-    dense_well_qc.setdefault("dense_well_neighbor_threshold_m", 150.0)
-    script_cfg["dense_well_qc"] = dense_well_qc
+    spatial_qc = dict(script_cfg.get("spatial_qc") or {})
+    spatial_qc.setdefault("near_survey_threshold_m", 500.0)
+    spatial_qc.setdefault("vertical_bottom_offset_threshold_m", 30.0)
+    spatial_qc.setdefault("platform_cluster_threshold_m", 12.5)
+    spatial_qc.setdefault("dense_well_neighbor_threshold_m", 150.0)
+    script_cfg["spatial_qc"] = spatial_qc
     return script_cfg
 
 
@@ -261,16 +257,14 @@ def build_inventory(
                 record.surface_y,
                 record.bottom_x,
                 record.bottom_y,
-                vertical_bottom_offset_threshold_m=float(
-                    config["wellbore_classification"]["vertical_bottom_offset_threshold_m"]
-                ),
+                vertical_bottom_offset_threshold_m=float(config["spatial_qc"]["vertical_bottom_offset_threshold_m"]),
             )
             if record.wellbore_class == "unknown":
                 record.reasons.append("invalid_bottom_xy")
             _classify_survey_position(
                 record,
                 survey=survey,
-                near_survey_threshold_m=float(config["survey_position"]["near_survey_threshold_m"]),
+                near_survey_threshold_m=float(config["spatial_qc"]["near_survey_threshold_m"]),
             )
         else:
             record.survey_position = "invalid_xy"
@@ -286,12 +280,12 @@ def build_inventory(
 
     neighbor_pairs, neighbor_summary = build_neighbor_pairs(
         records,
-        dense_well_neighbor_threshold_m=float(config["dense_well_qc"]["dense_well_neighbor_threshold_m"]),
-        platform_cluster_threshold_m=float(config["dense_well_qc"]["platform_cluster_threshold_m"]),
+        dense_well_neighbor_threshold_m=float(config["spatial_qc"]["dense_well_neighbor_threshold_m"]),
+        platform_cluster_threshold_m=float(config["spatial_qc"]["platform_cluster_threshold_m"]),
     )
     cluster_rows = build_cluster_rows(
         records,
-        platform_cluster_threshold_m=float(config["dense_well_qc"]["platform_cluster_threshold_m"]),
+        platform_cluster_threshold_m=float(config["spatial_qc"]["platform_cluster_threshold_m"]),
     )
     cluster_ids = {row.cluster_id for row in cluster_rows}
 
@@ -400,12 +394,10 @@ def main() -> None:
             "seismic_type": seismic_type,
         },
         "thresholds": {
-            "near_survey_threshold_m": float(script_cfg["survey_position"]["near_survey_threshold_m"]),
-            "vertical_bottom_offset_threshold_m": float(
-                script_cfg["wellbore_classification"]["vertical_bottom_offset_threshold_m"]
-            ),
-            "platform_cluster_threshold_m": float(script_cfg["dense_well_qc"]["platform_cluster_threshold_m"]),
-            "dense_well_neighbor_threshold_m": float(script_cfg["dense_well_qc"]["dense_well_neighbor_threshold_m"]),
+            "near_survey_threshold_m": float(script_cfg["spatial_qc"]["near_survey_threshold_m"]),
+            "vertical_bottom_offset_threshold_m": float(script_cfg["spatial_qc"]["vertical_bottom_offset_threshold_m"]),
+            "platform_cluster_threshold_m": float(script_cfg["spatial_qc"]["platform_cluster_threshold_m"]),
+            "dense_well_neighbor_threshold_m": float(script_cfg["spatial_qc"]["dense_well_neighbor_threshold_m"]),
         },
         "geometry": geometry,
         "bin_spacing_m": bin_spacing,

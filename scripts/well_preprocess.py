@@ -84,12 +84,6 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     source_runs.setdefault("mode", "latest")
     source_runs.setdefault("well_screen_dir", None)
     script_cfg["source_runs"] = source_runs
-    source_files = dict(script_cfg.get("source_files") or {})
-    source_files.setdefault("screen_file", None)
-    source_files.setdefault("input_las_dir", None)
-    source_files.setdefault("curve_inventory_file", None)
-    source_files.setdefault("classification_dir", None)
-    script_cfg["source_files"] = source_files
     script_cfg.setdefault("output_las_dir", "preprocessed_las")
     script_cfg.setdefault("required_categories", ["p_sonic", "density"])
     script_cfg.setdefault(
@@ -188,32 +182,11 @@ def _discover_latest_screen_dir(cfg: dict[str, Any], script_cfg: dict[str, Any])
 
 def _resolve_inputs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str, Path]:
     latest_dir = _discover_latest_screen_dir(cfg, script_cfg)
-    source_files = dict(script_cfg.get("source_files") or {})
-    screen_file = (
-        latest_dir / "well_screen.csv"
-        if source_files.get("screen_file") is None
-        else _resolve_repo_path(source_files["screen_file"])
-    )
-    input_las_dir = (
-        latest_dir / "selected_las"
-        if source_files.get("input_las_dir") is None
-        else _resolve_repo_path(source_files["input_las_dir"])
-    )
-    curve_inventory_file = (
-        latest_dir / "las_curve_inventory.csv"
-        if source_files.get("curve_inventory_file") is None
-        else _resolve_repo_path(source_files["curve_inventory_file"])
-    )
-    classification_dir = (
-        latest_dir / "curve_classification"
-        if source_files.get("classification_dir") is None
-        else _resolve_repo_path(source_files["classification_dir"])
-    )
     return {
-        "screen_file": screen_file,
-        "input_las_dir": input_las_dir,
-        "curve_inventory_file": curve_inventory_file,
-        "classification_dir": classification_dir,
+        "screen_file": latest_dir / "well_screen.csv",
+        "input_las_dir": latest_dir / "selected_las",
+        "curve_inventory_file": latest_dir / "las_curve_inventory.csv",
+        "classification_dir": latest_dir / "curve_classification",
     }
 
 

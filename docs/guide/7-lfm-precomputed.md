@@ -1,10 +1,10 @@
 # 07 低频模型
 
-`lfm_precomputed.py` 是工作流的第七步。它把第四步标定成功的井在目标层内的曲线样点转成空间控制点，再通过层位约束插值生成波阻抗低频模型，供第八步 GINN 训练直接读取。
+`lfm_precomputed.py` 是工作流的第七步。它读取第六步 `well_constraints.py` 已经统一生成的低频控制点，再通过层位约束插值生成波阻抗低频模型，供第八步 GINN 训练直接读取。
 
 本步的核心不再是"一口井一个控制点"，而是"目标层内的样点控制"——每口井在目的层内贡献数十到上百个带空间坐标的波阻抗样点，斜井样点随轨迹分布在不同的 inline/xline 上。
 
-第二轮重构后，第六步 `well_constraints.py` 会前置生成共享井空间事实和分频事实；本步应消费这些事实并专注于顺层插值建模。当前脚本仍保留自己的控制点生成逻辑，属于过渡实现。
+第二轮重构后，第六步 `well_constraints.py` 已经前置生成共享井空间事实和分频事实；本步消费 `lfm_layer_control_points.csv` 并专注于顺层插值建模，不再从 LAS、TDT 或井轨迹临时拼井约束。
 
 ---
 
@@ -16,7 +16,7 @@ python scripts/lfm_precomputed.py --config experiments/common.yaml
 python scripts/lfm_precomputed.py --output-dir scripts/output/lfm_precomputed_test
 ```
 
-不带参数时，脚本自动发现最新的第四步和第五步产物，按时间戳创建输出目录。
+不带参数时，脚本自动发现最新的第六步 `well_constraints_*` 产物，按时间戳创建输出目录。
 
 ---
 
@@ -24,12 +24,11 @@ python scripts/lfm_precomputed.py --output-dir scripts/output/lfm_precomputed_te
 
 | 来源 | 内容 | 用途 |
 |------|------|------|
-| 第四步 | 标定成功/失败、路由、优化后时深表、滤波 LAS | 筛选候选井、读取波阻抗曲线、获取井位坐标 |
-| 第四步 | 斜井细标定后样点 TWT/MD/XY/inline/xline 映射 | 斜井控制点的空间事实来源 |
-| 第五步 | 全局子波批量合成指标 | 逐井合成质量，用于筛选控制井 |
+| 第六步 | `lfm_layer_control_points.csv` | 低频控制点事实 |
+| 第六步 | `lfm_control_qc.csv` / `run_summary.json` | 控制井 QC、分频和切片配置审计 |
 | 地震数据 | 地震体 + 顶底解释层位 | 提供时间轴、工区几何和目标层 mask |
 
-直井用井口坐标配合优化后时深表将 MD 域曲线映射到 TWT 域后生成控制点；斜井复用第四步基于 optimized TDT 写出的 `optimized_trace_sample_plan_<well>.csv`，确保控制点空间事实和细标定后的时深关系一致。斜井缺少 optimized 空间映射时脚本会跳过该井并记录原因，不会将它降级成井口直井控制。
+直井和斜井控制点的空间来源、曲线分频和密井冲突处理都在第六步完成。第七步只校验控制点 CSV 契约、目标层位和 `n_slices` 是否一致，然后建模。
 
 ---
 
@@ -39,8 +38,7 @@ python scripts/lfm_precomputed.py --output-dir scripts/output/lfm_precomputed_te
 lfm_precomputed:
   source_runs:
     mode: latest
-    well_auto_tie_dir: null
-    wavelet_generation_dir: null
+    well_constraints_dir: null
 
   seismic:
     file: null
@@ -53,56 +51,28 @@ lfm_precomputed:
       - <bottom-horizon-file>
     twt_unit: auto
 
-  control_wells:
-    min_batch_corr: 0.35
-    max_batch_nmae: null
-    include_wells: null
-    exclude_wells: []
-
-  controls:
-    sample_step_s: null
-    min_control_samples_per_well: 16
-
   modeling:
     boundary_extension_samples: 50
     n_slices: 20
     variogram: spherical
     exact: true
     nugget: 0.0
-    filter_cutoff_hz: 10.0
-    filter_order: 6
-    filter_buffer_seconds: null
-    filter_buffer_mode: reflect
     post_slice_smoothing: false
 
   export:
-    export_volume: true
+    write_segy: true
+    write_zgy: true
 ```
 
 ### `source_runs`
 
-默认接上最新一次井震标定和全局子波结果。复现实验时，填写 `well_auto_tie_dir` 或 `wavelet_generation_dir` 固定输入。`mode` 目前只支持 `latest`。
-
-### `control_wells`
-
-控制井不是所有标定成功井。它必须先通过第五步的统一子波批量合成 QC，说明这口井在统一子波口径下仍然可信：
-
-- `min_batch_corr`：批量合成相关系数低于此值的井被排除。
-- `max_batch_nmae`：可选 NMAE 上限，为空时不按 NMAE 过滤。
-- `include_wells`：白名单模式，只使用指定井。
-- `exclude_wells`：人工排除可疑井。
-
-此外，井还必须同时具备第四步产出的滤波 LAS 和优化后时深表；斜井还需要对应的 optimized 空间映射文件。
-
-### `controls`
-
-`sample_step_s` 控制沿时间轴抽控制点的密度。默认跟随地震采样间隔；只有想主动降采样或统一采样步长时才需要填写。
+默认接上最新一次井约束结果。复现实验时，填写 `well_constraints_dir` 固定输入。`mode` 目前只支持 `latest`。
 
 每个控制点本质上是”一口井在某个层段切片中的代表波阻抗值”。脚本会先生成目标层内的时间样点，再按单井、层段和切片聚合成代表控制点。规范坐标是浮点 inline、浮点 xline 和 TWT；那些整数道号、数组索引只用于排查，不能当作跨工区稳定坐标。
 
 直井的代表控制点落在井口对应的同一个 trace 上；斜井的代表控制点来自轨迹样点聚合，因此一口斜井的控制点会分布在多个不同的 `inline_float`、`xline_float` 处。
 
-聚合按 `well + route + source + zone + slice` 执行：同一口井落入同一比例切片的多个样点只保留一个代表控制点，`inline_float`、`xline_float`、`x_m`、`y_m`、`twt_s`、`md_m`、`u_in_zone` 和波阻抗都取算术平均。这样直井和斜井口径一致，也避免一小段斜井轨迹在同一张切片里被克里金误当成多口独立井。
+聚合按 `well + route + source + zone + slice` 执行：同一口井落入同一比例切片的多个样点只保留一个代表控制点，`inline_float`、`xline_float`、`x_m`、`y_m`、`twt_s`、`md_m`、`u_in_zone` 和波阻抗都按第六步权重做加权平均。这样直井和斜井口径一致，也避免一小段斜井轨迹在同一张切片里被克里金误当成多口独立井。
 
 ### `target_interval`
 
@@ -112,11 +82,7 @@ lfm_precomputed:
 
 ### `modeling`
 
-这一块同时控制两件事：**先把井上的波阻抗控制点降到低频口径，再把这些控制点顺层插值成三维 LFM**。前者决定控制点有多”低频”，后者决定层内空间变化如何铺开。
-
-`filter_cutoff_hz` 和 `filter_order` 用在井曲线低通阶段。第四步输出的滤波 LAS 仍然保留了不少井上细节，第七步不希望把这些高频细节直接灌进 LFM；LFM 应该只承载大尺度背景趋势，把高频变化留给第八步 GINN。当前默认 `10 Hz` 可以理解为时间域低频背景，`filter_order: 6` 是 Butterworth 滤波器阶数，阶数越高，截止附近越陡，但也更容易放大边界处理的重要性。
-
-`filter_buffer_seconds` 和 `filter_buffer_mode` 用来保护一维低通滤波的首尾边界。第七步会先尽量对该井可用的整段 TWT 曲线低通，再去目标层内取控制点；所以如果目标层上方或下方本来就有曲线样点，这些真实样点会自然参与滤波，不需要在目标层边界做镜像延拓。当滤波走到输入曲线本身的最顶端或最底端时，脚本才需要临时补一段“虚拟上下文”。`filter_buffer_mode: reflect` 表示这段虚拟上下文由曲线首尾镜像得到，通常比直接复制端点常值更平滑。
+这一块只控制顺层插值和三维 LFM 重建。井曲线低通、cutoff 诊断和高低频拆分都在第六步完成；第七步消费的 `ai` 已经是第六步确定的低频控制值。
 
 `n_slices` 控制顺层切片数量。相邻层位组成一个 zone，每个 zone 会按层内比例切成 `n_slices` 张薄片；如果目标窗由多个层位分成多个 zone，每个 zone 都会独立切片。切片数越多，层内垂向变化表达越细，但每张切片能分到的控制点也更少；如果井少或控制点稀疏，过大的 `n_slices` 反而会让很多切片靠补值支撑。
 
@@ -130,36 +96,17 @@ lfm_precomputed:
 
 ## 脚本在做什么
 
-脚本分四个阶段：**前置发现 → 控制点生成 → 层位约束建模 → 导出**。
+脚本分四个阶段：**前置发现 → 控制点读取 → 层位约束建模 → 导出**。
 
 ### 第一阶段：前置发现
 
-1. 从配置或自动发现中定位第四步和第五步的产出目录。
+1. 从配置或自动发现中定位第六步井约束产出目录。
 2. 打开地震体，校验采样域为时间域且单位为秒。
 3. 读取顶底解释层位，构建目标层并输出层位 QC（mask 有效性、层厚、交叉、薄层）。
 
-### 第二阶段：控制点生成
+### 第二阶段：控制点读取
 
-对第四步标定成功的每口井，先过第五步 QC 门槛，再过资产完整性检查，然后按井型分两路生成控制点：
-
-**直井路径**
-
-1. 从滤波 LAS 读取波阻抗曲线。
-2. 用优化后时深表将 MD 域波阻抗转成 TWT 域。
-3. 对 TWT 域曲线做低通滤波。
-4. 在时间轴的每个样点处，判断是否落入目标层内；若是，记录该样点的 TWT、波阻抗、MD、zone 和层内比例位置 `u_in_zone`。
-
-**斜井路径**
-
-1. 从滤波 LAS 读取波阻抗曲线。
-2. 读取第四步的 optimized 空间映射文件，只保留工区内样点。
-3. 按 TWT 排序后可选重采样。
-4. 在空间映射给出的每个轨迹样点处，插值波阻抗值并做低通滤波。
-5. 判断每个样点是否落入目标层内，记录其空间坐标、TWT、波阻抗、zone 和 `u_in_zone`。
-
-两路共用同一条波阻抗低通滤波管线：先检查数据量是否足够（至少 4 个以上有效样点），然后规整化到均匀网格、应用 Butterworth 零相位低通滤波、再插值回原始 TWT 位置。
-
-两路生成的目标层样点都会按单井、层段和切片聚合。聚合后的代表控制点写入 `lfm_layer_control_points.csv`；每口井的过滤结果和统计写入 `lfm_control_qc.csv`。
+第七步读取第六步写出的 `lfm_layer_control_points.csv`，校验字段、正值 AI、有限坐标和 `u_in_zone` 范围，然后把控制点和 `lfm_control_qc.csv` 复制到本次第七步输出目录。第六步 `run_summary.json` 中的 `lfm_controls.n_slices` 必须与第七步 `modeling.n_slices` 一致，否则脚本直接失败。
 
 ### 第三阶段：层位约束建模
 
@@ -228,7 +175,7 @@ lfm_precomputed:
 | `x_m` / `y_m` | 控制点平面坐标 |
 | `inline_float` / `xline_float` | 投影到工区后的浮点线号 |
 | `zone_name` / `u_in_zone` | 所属层段和层内比例位置（0 到 1） |
-| `ai` / `weight` | 控制点波阻抗值及权重；当前自动生成的权重均为 `1.0` |
+| `ai` / `weight` | 第六步分频后的低频 AI 控制值及权重 |
 | `flat_idx` / `sample_index` | 派生字段，仅供调试；依赖地震几何 |
 
 ---
@@ -249,7 +196,7 @@ lfm_precomputed:
 
 ### 第三步：看图
 
-`figures/` 中的控制点分布图用于判断是否存在空间偏差：某个平台并群的密度是否远超其他区域。同一张切片里如果多口井落到重复 `(inline, xline)` 坐标，当前版本会先做算术平均再进入插值，并在覆盖统计中记录聚合数量。更复杂的冲突策略留到第二轮。
+`figures/` 中的控制点分布图用于判断是否存在空间偏差：某个平台井群的密度是否远超其他区域。同一张切片里如果多口井落到重复 `(inline, xline)` 坐标，第六步会先写冲突报告并按权重聚合，再交给第七步插值。
 
 ---
 
@@ -257,17 +204,16 @@ lfm_precomputed:
 
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
-| `No LFM control points selected` | 所有井都被过滤或控制点生成失败 | 检查 `lfm_control_qc.csv` 的拒绝原因；多数情况是第四步成功井太少或第五步门槛过高 |
+| `No LFM control points selected` | 第六步没有生成可用低频控制点 | 检查第六步 `lfm_control_qc.csv`、`well_high_supervision_qc.csv` 和 `run_summary.json`；上游第四步标定、第五步批量合成门槛或第六步目标层覆盖都可能是原因 |
 | `target_layer geometry domain is not time` | 地震数据不在时间域 | 确认地震体路径和类型正确 |
 | 某口斜井 `missing_optimized_trace_sample_plan` | 第四步未为该斜井写出细标定后的空间映射 | 回到第四步检查斜井路径是否执行成功，以及 `well_tie_metrics.csv` 是否有 `optimized_trace_sample_plan_file` |
 | `too_few_control_samples` | 落入目标层的有效样点不足 | 检查时深表范围是否覆盖目标层；LAS 曲线在目标层深度内是否有值 |
-| 地震体导出失败 | 缺少 SEG-Y 头字节配置或 ZGY 写入库不可用 | 检查配置中的 `iline_byte`/`xline_byte`，或确认 `pyzgy` 已安装；也可 `export_volume: false` 跳过导出 |
+| 地震体导出失败 | 缺少 SEG-Y 头字节配置或 ZGY 写入库不可用 | 检查配置中的 `iline_byte`/`xline_byte`，或确认 `pyzgy` 已安装；也可设置 `write_segy: false` / `write_zgy: false` 跳过导出 |
 
 ---
 
 ## 留到第二轮
 
-- 控制点冲突的置信度权重 / highest confidence / fail-on-conflict 策略，取代当前的简单平均。
-- 从点级控制直接生成 GINN 井约束锚点文件。
-- frequency split 诊断与 LFM 的联动。
+- highest confidence / fail-on-conflict 等更激进的控制点冲突策略。
+- 按平台或空间簇做 LFM 控制点去偏，避免密井平台在克里金里权重过高。
 - 斜井波阻抗低通滤波的采样率自适应（当前使用中位步长，对极不均匀采样的适应性有限）。

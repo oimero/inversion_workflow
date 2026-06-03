@@ -75,6 +75,40 @@
 | `seismic_trace_file` | 第四步保存的井旁或轨迹地震道 |
 | `optimized_trace_sample_plan_file` | 斜井细标定后按 optimized TDT 重新生成的样点级落道计划；直井为空 |
 
+## `well_constraint_points.csv`
+
+第六步写出的点级井约束事实表。它是低频 anchor、高频井监督、高频统计和 LFM 控制点的共同来源。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `well_name` / `route` | 来源井和第四步标定路径 |
+| `source` | 空间来源：vertical_trace / deviated_trajectory |
+| `anchor_eligible` | 是否允许进入 GINN 低频 anchor |
+| `twt_s` / `md_m` | 点级样本所在 TWT 和 MD |
+| `x_m` / `y_m` | 点级样本平面坐标 |
+| `inline_float` / `xline_float` | 投影到工区后的浮点线号 |
+| `flat_idx` / `sample_index` | 依赖当前地震几何的派生索引，仅用于 bundle 构建和 QC |
+| `zone_name` / `u_in_zone` | 所属层段和层内比例位置 |
+| `ai_full` / `log_ai_full` | 井上全频 AI 与 log-AI |
+| `well_low_ai` / `well_low_log_ai` | 第六步分频后的低频井曲线 |
+| `well_high_log_ai` | 全频 log-AI 减低频 log-AI 后的高频 residual |
+| `weight` | 由第五步批量合成质量等因素得到的约束权重 |
+
+`inline_float`、`xline_float`、`twt_s` 是空间事实的规范坐标；`flat_idx` / `sample_index` 只能在同一地震几何和采样轴内解释。
+
+## `well_anchor_points.csv` / `well_high_supervision_conflicts.csv`
+
+`well_anchor_points.csv` 是 `well_constraint_points.csv` 中允许进入 GINN 低频 anchor 的子集。`well_anchor_conflicts.csv` 和 `well_high_supervision_conflicts.csv` 记录同一 `(flat_idx, sample_index)` 上有多条井约束被聚合前的差异。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `flat_idx` / `sample_index` | 发生冲突的地震道和采样点 |
+| `n_points` | 冲突点数量 |
+| `well_names` / `sources` | 参与冲突的井和空间来源 |
+| `min_value` / `max_value` / `range_value` | 被审计目标值的范围 |
+| `strategy` | 当前聚合策略 |
+| `point_rows_json` | 冲突点的原始井名、位置、目标值和权重 |
+
 ## `lfm_layer_control_points.csv`
 
 | 关键字段 | 含义 |
@@ -86,10 +120,10 @@
 | `x_m` / `y_m` | 控制点平面坐标 |
 | `inline_float` / `xline_float` | 控制点投影到工区后的浮点线号 |
 | `zone_name` / `u_in_zone` | 所属层段和层内比例位置 |
-| `ai` | 控制点 AI 值，由第四步 filtered LAS 的 `DT_USM`/`RHO_GCC` 构造 |
-| `weight` | 控制点权重；当前第七步 LFM 自动生成的权重均为 `1.0` |
+| `ai` | 第六步分频后的低频 AI 控制值 |
+| `weight` | 第六步按井震匹配质量等因素计算的控制点权重 |
 
-`inline_float`、`xline_float`、`twt_s` 是规范坐标。当前第七步 LFM 输出的是按单井、层段和切片聚合后的代表控制点。`flat_idx` / `sample_index` 可以作为派生字段写出，便于 QC 和调试，但它们依赖当前地震几何与采样轴，不能作为跨步骤主键。
+`inline_float`、`xline_float`、`twt_s` 是规范坐标。当前第六步输出的是按单井、层段和切片聚合后的代表控制点，第七步只消费它做 LFM 建模。`flat_idx` / `sample_index` 可以作为派生字段写出，便于 QC 和调试，但它们依赖当前地震几何与采样轴，不能作为跨步骤主键。
 
 ## `lfm_control_qc.csv`
 

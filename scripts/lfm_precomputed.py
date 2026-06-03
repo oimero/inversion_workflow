@@ -44,23 +44,12 @@ plt.rcParams["figure.dpi"] = 120
 DEFAULT_CONFIG: dict[str, Any] = {
     "source_runs": {
         "mode": "latest",
-        "well_auto_tie_dir": None,
-        "wavelet_generation_dir": None,
+        "well_constraints_dir": None,
     },
     "seismic": {"file": "raw/obn-clipped-240-912-872-1544.zgy", "type": "zgy"},
     "target_interval": {
         "horizons": ["interpre/H3-1", "interpre/H7-1"],
         "twt_unit": "auto",
-    },
-    "control_wells": {
-        "min_batch_corr": 0.35,
-        "max_batch_nmae": None,
-        "include_wells": None,
-        "exclude_wells": [],
-    },
-    "controls": {
-        "sample_step_s": None,
-        "min_control_samples_per_well": 16,
     },
     "modeling": {
         "boundary_extension_samples": 50,
@@ -68,10 +57,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "variogram": "spherical",
         "exact": True,
         "nugget": 0.0,
-        "filter_cutoff_hz": 10.0,
-        "filter_order": 6,
-        "filter_buffer_seconds": None,
-        "filter_buffer_mode": "reflect",
         "post_slice_smoothing": False,
     },
     "export": {"export_volume": True, "zgy_inline_chunk_size": 16},
@@ -116,21 +101,15 @@ def _latest_run(output_root: Path, prefix: str, required_file: str) -> Path:
 def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[str, Path]:
     source_cfg = dict(script_cfg.get("source_runs") or {})
     mode = str(source_cfg.get("mode", "latest")).strip().lower()
-    auto_dir_value = source_cfg.get("well_auto_tie_dir")
-    wavelet_dir_value = source_cfg.get("wavelet_generation_dir")
+    constraints_dir_value = source_cfg.get("well_constraints_dir")
     if mode != "latest":
         raise ValueError(f"lfm_precomputed.source_runs.mode only supports 'latest' for now, got {mode!r}.")
-    auto_dir = (
-        _latest_run(output_root, "well_auto_tie", "well_tie_metrics.csv")
-        if auto_dir_value in {None, ""}
-        else resolve_relative_path(auto_dir_value, root=REPO_ROOT)
+    constraints_dir = (
+        _latest_run(output_root, "well_constraints", "lfm_layer_control_points.csv")
+        if constraints_dir_value in {None, ""}
+        else resolve_relative_path(constraints_dir_value, root=REPO_ROOT)
     )
-    wavelet_dir = (
-        _latest_run(output_root, "wavelet_generation", "batch_synthetic_metrics.csv")
-        if wavelet_dir_value in {None, ""}
-        else resolve_relative_path(wavelet_dir_value, root=REPO_ROOT)
-    )
-    return {"well_auto_tie_dir": auto_dir, "wavelet_generation_dir": wavelet_dir}
+    return {"well_constraints_dir": constraints_dir}
 
 
 def _resolve_artifact_path(value: Any, *, run_dir: Path) -> Path | None:
@@ -833,6 +812,76 @@ def _try_write_zgy(
         return str(exc)
 
 
+def _should_export_volume(export_cfg: dict[str, Any], seismic_type: str) -> bool:
+    legacy_enabled = export_cfg.get("export_volume")
+    default_enabled = True if legacy_enabled is None else bool(legacy_enabled)
+    kind = str(seismic_type).strip().lower()
+    if kind == "segy":
+        return bool(export_cfg.get("write_segy", default_enabled))
+    if kind == "zgy":
+        return bool(export_cfg.get("write_zgy", default_enabled))
+    return default_enabled
+
+
+def _load_constraints_control_points(
+    constraints_dir: Path,
+    *,
+    expected_n_slices: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    control_path = constraints_dir / "lfm_layer_control_points.csv"
+    qc_path = constraints_dir / "lfm_control_qc.csv"
+    summary_path = constraints_dir / "run_summary.json"
+    if not control_path.exists():
+        raise FileNotFoundError(f"Missing sixth-step LFM control points: {control_path}")
+    control_df = pd.read_csv(control_path)
+    required = {
+        "well_name",
+        "route",
+        "source",
+        "twt_s",
+        "md_m",
+        "x_m",
+        "y_m",
+        "inline_float",
+        "xline_float",
+        "zone_name",
+        "u_in_zone",
+        "ai",
+        "weight",
+        "flat_idx",
+        "sample_index",
+    }
+    missing = required - set(control_df.columns)
+    if missing:
+        raise ValueError(f"lfm_layer_control_points.csv is missing required columns: {sorted(missing)}")
+    if control_df.empty:
+        raise ValueError(f"Sixth-step LFM control table is empty: {control_path}")
+    for col in ["twt_s", "inline_float", "xline_float", "u_in_zone", "ai", "weight"]:
+        values = control_df[col].to_numpy(dtype=float)
+        if np.any(~np.isfinite(values)):
+            raise ValueError(f"lfm_layer_control_points.csv column {col!r} contains non-finite values.")
+    if np.any(control_df["ai"].to_numpy(dtype=float) <= 0.0):
+        raise ValueError("lfm_layer_control_points.csv column 'ai' must be positive.")
+    if np.any((control_df["u_in_zone"].to_numpy(dtype=float) < 0.0) | (control_df["u_in_zone"].to_numpy(dtype=float) > 1.0)):
+        raise ValueError("lfm_layer_control_points.csv column 'u_in_zone' must be within [0, 1].")
+
+    summary: dict[str, Any] = {}
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        source_n_slices = (
+            summary.get("config", {})
+            .get("lfm_controls", {})
+            .get("n_slices")
+        )
+        if source_n_slices is not None and int(source_n_slices) != int(expected_n_slices):
+            raise ValueError(
+                "lfm_precomputed.modeling.n_slices must match well_constraints.lfm_controls.n_slices "
+                f"({expected_n_slices} != {source_n_slices})."
+            )
+    qc_df = pd.read_csv(qc_path) if qc_path.exists() else pd.DataFrame()
+    return control_df, qc_df, summary
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
@@ -857,142 +906,11 @@ def main() -> None:
         raise ValueError(f"Expected time-domain seismic geometry in seconds, got {geometry}")
     target_layer, horizon_metadata = _build_target_layer(script_cfg, geometry, qc_dir, data_root)
     sample_axis = survey.sample_axis("time").values.astype(np.float64)
-    sample_step_s = script_cfg["controls"].get("sample_step_s")
-    if sample_step_s is not None:
-        sample_step_s = float(sample_step_s)
-        sample_axis = np.arange(float(sample_axis[0]), float(sample_axis[-1]) + 0.5 * sample_step_s, sample_step_s)
-
-    auto_dir = source_dirs["well_auto_tie_dir"]
-    wavelet_dir = source_dirs["wavelet_generation_dir"]
-    metrics_df = pd.read_csv(auto_dir / "well_tie_metrics.csv")
-    plan_df = pd.read_csv(auto_dir / "well_tie_plan.csv") if (auto_dir / "well_tie_plan.csv").exists() else pd.DataFrame()
-    batch_df = pd.read_csv(wavelet_dir / "batch_synthetic_metrics.csv")
-    batch_lookup = _batch_metric_lookup(batch_df)
-    plan_by_key = _plan_lookup(plan_df)
-
-    include_wells = script_cfg["control_wells"].get("include_wells")
-    include_keys = {normalize_well_name(w) for w in include_wells} if include_wells else None
-    exclude_keys = {normalize_well_name(w) for w in script_cfg["control_wells"].get("exclude_wells", [])}
-    min_corr = script_cfg["control_wells"].get("min_batch_corr")
-    max_nmae = script_cfg["control_wells"].get("max_batch_nmae")
-    min_points = int(script_cfg["controls"].get("min_control_samples_per_well", 16))
-
-    control_rows: list[dict[str, Any]] = []
-    qc_rows: list[dict[str, Any]] = []
-    for _, metric in metrics_df.iterrows():
-        well_name = str(metric.get("well_name", "")).strip()
-        if not well_name:
-            continue
-        key = normalize_well_name(well_name)
-        route = str(metric.get("route", ""))
-        tie_status = str(metric.get("tie_status", ""))
-        batch_row = batch_lookup.get(key)
-        batch_corr = _batch_corr(batch_row)
-        batch_nmae = _batch_nmae(batch_row)
-        reasons: list[str] = []
-        status = "selected"
-        if tie_status != "success":
-            reasons.append(f"tie_status_{tie_status or 'unknown'}")
-        if include_keys is not None and key not in include_keys:
-            reasons.append("not_in_include_wells")
-        if key in exclude_keys:
-            reasons.append("excluded_well")
-        if batch_corr is None:
-            reasons.append("missing_batch_corr")
-        elif min_corr is not None and batch_corr < float(min_corr):
-            reasons.append("batch_corr_below_threshold")
-        if max_nmae is not None and (batch_nmae is None or batch_nmae > float(max_nmae)):
-            reasons.append("batch_nmae_above_threshold")
-
-        las_file = _resolve_artifact_path(metric.get("filtered_las_file"), run_dir=auto_dir)
-        tdt_file = _resolve_artifact_path(metric.get("optimized_tdt_file"), run_dir=auto_dir)
-        if las_file is None or not las_file.exists():
-            reasons.append("missing_filtered_las_file")
-        if tdt_file is None or not tdt_file.exists():
-            reasons.append("missing_optimized_tdt_file")
-
-        plan = plan_by_key.get(key)
-        well_rows: list[dict[str, Any]] = []
-        attempted = 0
-        invalid_count = 0
-        diagnostics: list[str] = []
-        if reasons:
-            status = "rejected"
-        else:
-            try:
-                if route.startswith("deviated"):
-                    trace_file = _resolve_artifact_path(metric.get("optimized_trace_sample_plan_file"), run_dir=auto_dir)
-                    if trace_file is None:
-                        trace_file = auto_dir / "trace_sample_plan" / f"optimized_trace_sample_plan_{sanitize_filename(well_name)}.csv"
-                    if not trace_file.exists():
-                        raise FileNotFoundError("missing_optimized_trace_sample_plan")
-                    well_rows, attempted, invalid_count, diagnostics = _build_deviated_points(
-                        well_name=well_name,
-                        route=route,
-                        las_file=las_file,
-                        trace_plan_file=trace_file,
-                        target_layer=target_layer,
-                        survey=survey,
-                        sample_step_s=sample_step_s,
-                        modeling_cfg=script_cfg["modeling"],
-                    )
-                else:
-                    if plan is None:
-                        raise ValueError("missing_well_tie_plan_row")
-                    surface_x = _as_optional_float(plan.get("surface_x"))
-                    surface_y = _as_optional_float(plan.get("surface_y"))
-                    if surface_x is None or surface_y is None:
-                        raise ValueError("missing_surface_xy")
-                    well_rows, attempted, invalid_count, diagnostics = _build_vertical_points(
-                        well_name=well_name,
-                        route=route,
-                        las_file=las_file,
-                        tdt_file=tdt_file,
-                        surface_x=surface_x,
-                        surface_y=surface_y,
-                        target_layer=target_layer,
-                        survey=survey,
-                        samples=sample_axis,
-                        modeling_cfg=script_cfg["modeling"],
-                    )
-                raw_control_count = len(well_rows)
-                well_rows, aggregated_count = _aggregate_points_by_well_zone_slice(
-                    well_rows,
-                    survey=survey,
-                    n_slices=int(script_cfg["modeling"]["n_slices"]),
-                )
-                if aggregated_count:
-                    diagnostics.append(f"slice_aggregation:{raw_control_count}->{len(well_rows)}")
-                reasons.extend(diagnostics)
-                if len(well_rows) < min_points:
-                    status = "rejected"
-                    reasons.append("too_few_control_samples")
-                else:
-                    control_rows.extend(well_rows)
-            except Exception as exc:
-                status = "rejected" if str(exc) == "missing_optimized_trace_sample_plan" else "failed"
-                reasons.append(str(exc) or type(exc).__name__)
-
-        unique_trace_count = 0
-        if well_rows:
-            unique_trace_count = int(pd.DataFrame(well_rows)["flat_idx"].dropna().nunique())
-        qc_rows.append(
-            {
-                "well_name": well_name,
-                "status": status,
-                "route": route,
-                "batch_corr": batch_corr,
-                "batch_nmae": batch_nmae,
-                "control_point_count": int(len(well_rows)) if status == "selected" else 0,
-                "invalid_point_count": invalid_count,
-                "invalid_point_fraction": float(invalid_count / attempted) if attempted else None,
-                "unique_trace_count": unique_trace_count,
-                "reasons": ";".join(dict.fromkeys(reasons)),
-            }
-        )
-
-    control_df = pd.DataFrame.from_records(control_rows)
-    qc_df = pd.DataFrame.from_records(qc_rows)
+    constraints_dir = source_dirs["well_constraints_dir"]
+    control_df, qc_df, constraints_summary = _load_constraints_control_points(
+        constraints_dir,
+        expected_n_slices=int(script_cfg["modeling"]["n_slices"]),
+    )
     control_path = output_dir / "lfm_layer_control_points.csv"
     qc_path = output_dir / "lfm_control_qc.csv"
     control_df.to_csv(control_path, index=False, encoding="utf-8-sig")
@@ -1014,10 +932,9 @@ def main() -> None:
     )
     result.metadata.update(
         {
-            "filter_cutoff_hz": float(script_cfg["modeling"]["filter_cutoff_hz"]),
-            "filter_order": int(script_cfg["modeling"]["filter_order"]),
-            "filter_buffer_seconds": script_cfg["modeling"].get("filter_buffer_seconds"),
-            "filter_buffer_mode": str(script_cfg["modeling"].get("filter_buffer_mode", "reflect")),
+            "control_source": "well_constraints",
+            "well_constraints_dir": repo_relative_path(constraints_dir, root=REPO_ROOT),
+            "frequency_split": constraints_summary.get("frequency_split"),
         }
     )
     metadata_extra = {
@@ -1034,14 +951,12 @@ def main() -> None:
     npz_file = output_dir / "ai_lfm_time.npz"
     _save_npz(result, npz_file, metadata_extra=metadata_extra)
 
-    export_status = None
-    export_ext = None
-    if bool(script_cfg["export"].get("export_volume", True)):
+    export_status = "disabled"
+    if _should_export_volume(script_cfg["export"], seismic_type):
         if seismic_type.lower() == "segy":
-            export_ext = ".segy"
             export_status = _try_write_segy(result, output_dir / "ai_lfm_time.segy", seismic_file, seismic_type, cfg)
+            export_status = "written" if export_status is None else export_status
         elif seismic_type.lower() == "zgy":
-            export_ext = ".zgy"
             export_status = _try_write_zgy(
                 result,
                 output_dir / "ai_lfm_time.zgy",
@@ -1049,6 +964,9 @@ def main() -> None:
                 seismic_type,
                 inline_chunk_size=int(script_cfg["export"].get("zgy_inline_chunk_size", 16)),
             )
+            export_status = "written" if export_status is None else export_status
+        else:
+            export_status = f"unsupported_seismic_type:{seismic_type}"
 
     _plot_controls(control_df, figures_dir / "qc_control_points.png")
     _plot_lfm_result(result, figures_dir / "qc_ai_lfm_time.png")
@@ -1056,15 +974,18 @@ def main() -> None:
         "source_dirs": {key: repo_relative_path(value, root=REPO_ROOT) for key, value in source_dirs.items()},
         "seismic_file": repo_relative_path(seismic_file, root=REPO_ROOT),
         "seismic_type": seismic_type,
+        "well_constraints_summary": constraints_summary,
         "config": script_cfg,
-        "selected_well_count": int((qc_df["status"] == "selected").sum()),
+        "selected_well_count": (
+            int((qc_df["status"] == "selected").sum()) if "status" in qc_df.columns else int(control_df["well_name"].nunique())
+        ),
         "control_point_count": int(len(control_df)),
         "outputs": {
             "ai_lfm_time": repo_relative_path(npz_file, root=REPO_ROOT),
             "control_points": repo_relative_path(control_path, root=REPO_ROOT),
             "control_qc": repo_relative_path(qc_path, root=REPO_ROOT),
         },
-        "export_status": "written" if export_status is None else export_status,
+        "export_status": export_status,
         "coverage_stats": result.coverage_stats,
     }
     write_json(output_dir / "run_summary.json", summary)
@@ -1074,7 +995,7 @@ def main() -> None:
     print(f"Selected wells: {summary['selected_well_count']}")
     print(f"Control points: {summary['control_point_count']}")
     print(f"NPZ: {npz_file}")
-    if export_status:
+    if export_status not in {"written", "disabled"}:
         print(f"Volume export skipped/failed: {export_status}")
 
 

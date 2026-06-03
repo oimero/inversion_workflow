@@ -83,11 +83,24 @@
 1. 按 trace 的目标层 mask 找到每个层段的有效样点。
 2. 对每个层段读取收缩后的 layer stats。
 3. 采样该层的事件密度、正负 run length、振幅分位数和转移矩阵。
-4. 用 semi-Markov 过程生成正负状态序列；状态持续长度来自 run-length 分布，而不是逐点独立转移。
-5. 给每个状态或事件采样振幅，并按层内包络、taper 和 AI 物理边界约束调整。
-6. 可选混入 motif bank：只让 motif 影响局部包络、极性或振幅，不让它完全替代统计生成主体。
-7. 将各层生成的 `delta_log_ai` 拼接到全目标窗，并在层间边界做平滑过渡。
-8. 用 `target_ai = base_ai * exp(delta_log_ai)` 得到目标 AI，再用当前全局子波正演生成 `target_seismic`。
+4. 先生成一条隐藏结构状态序列，再把状态映射成 `delta_log_ai`，不要直接把 Markov 状态等同于正负 residual。
+5. 用 semi-Markov 过程控制状态持续长度；状态持续长度来自 run-length 分布，而不是逐点独立转移。
+6. 给每个状态或事件采样振幅，并按层内包络、taper 和 AI 物理边界约束调整。
+7. 可选混入 motif bank：只让 motif 影响局部包络、极性或振幅，不让它完全替代统计生成主体。
+8. 将各层生成的 `delta_log_ai` 拼接到全目标窗，并在层间边界做平滑过渡。
+9. 用 `target_ai = base_ai * exp(delta_log_ai)` 得到目标 AI，再用当前全局子波正演生成 `target_seismic`。
+
+隐藏结构状态建议从简单版本开始，而不是一上来做复杂地质相：
+
+| 状态 | 含义 |
+|------|------|
+| `quiet_background` | 高频变化弱，主要保持低振幅扰动 |
+| `positive_packet` | 局部 AI 偏高的薄层组合 |
+| `negative_packet` | 局部 AI 偏低的薄层组合 |
+| `alternating_packet` | 正负交替的薄互层组合 |
+| `boundary_packet` | 较强界面附近的短窗扰动 |
+
+这是一种“两阶段生成”：先生成高频结构语法，再生成数值 residual。它比直接生成 `+1/-1` residual 更容易扩展，也更方便把井统计、motif bank 和人工 QC 语言对齐。
 
 关键配置建议：
 
@@ -99,10 +112,21 @@ enhance_synthetic:
   min_layer_reliability_for_patch: 0.5
   shrinkage_enabled: true
   semi_markov_enabled: true
+  spatial_modulation_enabled: true
   layer_boundary_blend_samples: null
 ```
 
 `patch_guided_fraction` 不应成为主要多样性来源。小样本层或低可靠度层应降低 patch 使用比例，更多借用全窗统计。
+
+同一层内的生成参数也不应每条 trace 完全独立抽样。建议为每层生成低分辨率空间调制场，并在每条 synthetic trace 的位置读取局部 modifier：
+
+```text
+layer_amp_modifier(inline, xline)
+layer_event_density_modifier(inline, xline)
+layer_spectral_modifier(inline, xline)
+```
+
+这些 modifier 只调制统计参数，不改变目标层 mask 和井约束事实。这样 synthetic 样本在空间上更连续，也能避免相邻道高频风格完全无关。
 
 ---
 
@@ -143,11 +167,15 @@ QC 指标建议覆盖：
 | synthetic-to-real RMS / p95 / p99 | 检查振幅是否过强或过弱 |
 | event density by layer | 检查层内节律是否符合井统计 |
 | run-length distribution | 检查 Markov 生成是否过碎或过平 |
+| hidden-state occupancy | 检查结构状态是否被某一类 packet 垄断 |
+| spatial modifier range | 检查层内空间调制是否过强或失效 |
 | base-target waveform corr | 检查目标地震是否离 base 过远 |
 | target-observed waveform corr | 防止 synthetic 与真实地震统计完全脱节 |
 | quality gate pass fraction | 评估样本拒绝率和重采样压力 |
 
 训练端仍应同时保留 synthetic loss 和井高频监督项。synthetic loss 提供大量可控样本，井高频监督项把模型拉回真实井位置。
+
+每次生成训练样本或 gallery 样本，都应写入 `synthetic_generation_summary.json`，至少记录：井约束输入路径、seed、每层 raw stats、shrinkage stats、实际生成后统计、quality gate 通过率、motif 使用比例、隐藏状态占比和主要拒绝原因。这样后续模型表现异常时，可以判断问题来自井统计、生成器还是训练本身。
 
 ---
 
@@ -157,5 +185,7 @@ QC 指标建议覆盖：
 2. 让合成器只从第六步井约束输出读取高频统计，不再直接读取井文件。
 3. 先实现全窗统计生成，确认 synthetic QC 与现有原型相当。
 4. 加入分层统计和 shrinkage，支持按层生成不同高频风格。
-5. 将真实 patch 改成可选 motif bank，并限制其使用比例。
-6. 接入分层 fine-tune 和层间融合所需的 mask/QC 输出。
+5. 将 Markov residual 生成改成“隐藏结构状态 -> 数值 residual”的两阶段生成。
+6. 加入层内空间调制场，保证同层相邻 trace 的高频风格具有连续性。
+7. 将真实 patch 改成可选 motif bank，并限制其使用比例。
+8. 接入分层 fine-tune 和层间融合所需的 mask/QC 输出。

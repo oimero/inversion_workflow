@@ -78,17 +78,21 @@ well_screen:
 
 默认接上最新一次井资产盘点结果。复现实验时，在 `well_inventory_dir` 填入某次第一步输出目录即可固定输入；`mode` 目前只支持 `latest`。
 
-### `curve_selection.required_categories`
+### `curve_selection`
+
+#### `required_categories`
 
 决定一口井能不能进入后续井震流程。当前要求同时找到纵波声波和密度；缺少任意一个，就不会导出给第三步使用的瘦身 LAS。
 
-### `curve_selection.selected_categories`
+#### `selected_categories`
 
 决定第二步重点关心哪些曲线类别。脚本会为列表中的每个类别尽量选出一条代表曲线；不在列表中的曲线即使能识别，也只留在分类明细里，不进入导出的瘦身 LAS。
 
 这里的类别名是工作流内部的语义类别，不是 LAS 原始 mnemonic。比如 `spontaneous_potential` 是自然电位类别，匹配的常见 LAS mnemonic 是 `SP`。
 
-### `classification.curve_schema_file`
+### `classification`
+
+#### `curve_schema_file`
 
 自定义分类规则的 YAML 文件。不填则使用 `cup.well.mnemonics.CURVE_CATEGORY_MNEMONICS` 内置规则。格式：
 
@@ -101,7 +105,7 @@ categories:
     mnemonics: [ABC, XYZ]
 ```
 
-### `classification.curve_override_file`
+#### `curve_override_file`
 
 人工干预入口，用来处理规则无法可靠判断的井或曲线。它的优先级高于内置规则，适合固定某口井的 primary、跳过坏曲线，或把项目里特殊命名的曲线强制归类。
 

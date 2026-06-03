@@ -105,12 +105,11 @@ well_auto_tie:
 
 ### `coarse_correction`
 
-粗标定发生在自动细标定之前，用来先把井的初始时深关系移到一个合理位置。当前支持两种来源：
+粗标定发生在自动细标定之前，用来先把井的初始时深关系移到一个合理位置。当前支持两种来源：`anchor` 和 `manual_shift`。
 
-| 来源 | 作用 |
-|------|------|
-| `anchor` | 用“井上的某个分层深度”对齐“地震上的某个解释层位时间”，给单井提供一个粗略锚点。 |
-| `manual_shift` | 人工给某口井加一个整体时间平移，适合已有经验判断或临时排查。 |
+#### `anchor`
+
+用”井上的某个分层深度”对齐”地震上的某个解释层位时间”，给单井提供一个粗略锚点。
 
 对有 Petrel TDT 的井，锚点会转化为一个逐井整体时移：
 
@@ -144,6 +143,12 @@ anchors:
       horizon: <horizon-file>
 ```
 
+默认配置下，只有 `vertical_anchor_from_tops` 启用锚点；`vertical_with_tdt` 和 `deviated_with_tdt` 的锚点粗标定关闭。
+
+#### `manual_shift`
+
+人工给某口井加一个整体时间平移，适合已有经验判断或临时排查。
+
 手动偏移规则：
 
 - `manual_shift.default_ms` 是全局默认值。
@@ -157,7 +162,7 @@ manual_shift:
     <well-name>: 0.0
 ```
 
-默认配置下，只有 `vertical_anchor_from_tops` 启用锚点；`vertical_with_tdt` 和 `deviated_with_tdt` 的锚点粗标定关闭。所有路径的手动偏移默认都是 0。
+所有路径的手动偏移默认都是 0。
 
 ### `reject`
 

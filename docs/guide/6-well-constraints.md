@@ -1,8 +1,6 @@
-# 06 井约束与分频诊断
+# 06 分频诊断与井约束
 
-`well_constraints.py` 是时间域工作流的第六步。它不建低频模型，也不训练网络；它负责把第四步、第五步之后可信的井曲线转换成一套统一的井约束数据，分别交给 GINN、低频模型和后续 enhance 使用。
-
-这一步的核心目标是：井的空间位置、曲线值、所属层段和频率拆分只在一个地方确定。后续第七步 LFM、第八步 GINN 和 enhance 不再各自从测井文件、时深表或井轨迹里临时拼一套井约束。
+`well_constraints.py` 是时间域工作流的第六步。它负责把第四步、第五步之后可信的井曲线转换成一套统一的井约束数据，分别交给 GINN、低频模型和后续 enhance 使用。
 
 ---
 
@@ -62,7 +60,9 @@ well_constraints:
     mode: diagnose
     manual_cutoff_hz: null
     filter_order: 6
-    candidate_cutoff_hz: [6.0, 8.0, 10.0, 12.0, 15.0]
+    candidate_cutoff_hz: [6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0]
+    selection_corr_tolerance: 0.02
+    selection_nmae_tolerance: 0.03
     buffer_seconds: null
     buffer_mode: reflect
     qc_enabled: true
@@ -110,7 +110,7 @@ well_constraints:
 
 决定井曲线中哪部分交给低频约束、哪部分交给 enhance 高频材料。支持两种模式：
 
-- **`diagnose`**：在候选截止频率上比较低频曲线的平滑度、高频残余的能量比例和边界稳定性，选出全目标窗统一的截止频率。第五步批量合成质量用于井筛选和权重，不直接进入分频选择。
+- **`diagnose`**：对每个候选截止频率低通井上 log-AI，用第五步最终全局子波正演合成记录，再与第四步保存的井旁地震道计算 `corr`、`nmae` 和 `scale`。脚本先找多井波形拟合的近最佳平台，再在平台内选择较低 Hz，让低频分支保持保守。
 - **`manual`**：跳过诊断，直接使用 `manual_cutoff_hz` 指定的截止频率。
 
 无论哪种模式，最终选定的截止频率、滤波阶数、缓冲策略和诊断证据都会写入 `run_summary.json`。
@@ -192,7 +192,9 @@ well_constraints:
 
 ### 第三阶段：分频诊断与拆分
 
-如果配置为 `diagnose` 模式，对每个候选截止频率做一次完整的分频，评估低频曲线的平滑度、高频残余的能量比例和边界稳定性，选出一个全窗统一的截止频率。
+如果配置为 `diagnose` 模式，对每个候选截止频率做一次完整的低通，然后用第五步最终全局子波做正演，和第四步保存的井旁地震道比较。诊断输出不是只看井曲线是否平滑，而是回答一个更直接的问题：这个 cutoff 下的低频 AI 正演出来，是否仍能解释真实地震波形。
+
+多井聚合后，脚本先找 `median_corr` 最高的 cutoff，再按 `selection_corr_tolerance` 和 `selection_nmae_tolerance` 找近最佳平台；如果有平台，则选平台内较低的 Hz。时间域 Hz 越低，低通越强、低频分支越保守。
 
 如果配置为 `manual` 模式，直接使用用户指定的截止频率。
 
@@ -249,7 +251,10 @@ well_constraints:
 | `lfm_layer_control_points.csv` | 第七步 LFM 读取的控制点文件 |
 | `lfm_control_qc.csv` | 逐井筛选结果和控制点数量 |
 | `target_layer_qc/*` | 目标层 mask、层厚、层位有效性 QC |
-| `frequency_split_diagnostics.csv` | 分频诊断的诊断记录 |
+| `frequency_split_diagnostics.csv` | 逐井逐候选 cutoff 的正演匹配指标 |
+| `frequency_split_aggregate.csv` | 多井聚合后的候选 cutoff 指标 |
+| `figures/frequency_split_cutoff_sweep.png` | 候选 cutoff 的全局 corr/nmae sweep 图 |
+| `figures/frequency_split_wells/*.png` | 每口井的候选 cutoff corr/nmae sweep 图 |
 | `frequency_split_qc/traces/*.csv` | 每口井分频前后的曲线数值 |
 | `frequency_split_qc/figures/*.png` | 每口井的分频 QC 图 |
 | `run_summary.json` | 输入路径、筛选统计、分频参数和所有输出路径 |
@@ -331,7 +336,11 @@ enhance 训练读取的高频井监督数据包，包含每个受控样点上的
 
 ### 第五步：看图
 
-抽查几口井的分频 QC 图（`frequency_split_qc/figures/`）：
+先看 `figures/frequency_split_cutoff_sweep.png`。这张图展示候选 cutoff 的多井 `median corr` 和 `median nmae`；虚线会标出波形相关性最佳 cutoff 和最终选中的 cutoff。如果两者不同，说明脚本在近最佳平台内选择了更保守的低 Hz。
+
+再看 `figures/frequency_split_wells/` 中的逐井 sweep 图，确认最终选择不是由少数井单独拉动。
+
+最后抽查几口井的分频 QC 图（`frequency_split_qc/figures/`）：
 
 - 上方子图：完整的和低频的 log-AI。低频曲线应该平滑、跟随大趋势，而不是贴着原始曲线走。
 - 下方子图：高频残余和包络。高频残余应在零值附近正负振荡，包络不应在某一段突然膨胀（说明那里的原始曲线有异常尖峰）。
@@ -356,6 +365,6 @@ enhance 训练读取的高频井监督数据包，包含每个受控样点上的
 
 - 冲突策略从仅支持加权平均扩展到保留最高置信度、丢弃冲突点和遇冲突直接失败。
 - motif patch 的提取、质量标签和数据包生成。
-- 分频诊断的评分函数加入第五步批量合成正演匹配度作为联合判断。
+- 正演分频诊断进一步加入空间去偏聚合，避免密井平台主导 cutoff 选择。
 - 斜井 anchor 支持（当前 `include_deviated` 默认为关）。
 - 分频 QC 增加分层叠加图：在同一张图上按层段着色显示高频残余，方便对比不同层的分频效果。

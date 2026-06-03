@@ -39,14 +39,20 @@ from cup.well.constraints import (
     build_point_conflict_report,
     build_vertical_point_facts,
     confidence_from_corr,
-    diagnose_frequency_split,
     high_frequency_stats,
     layer_shrinkage_stats,
+    lowpass_values_on_twt,
 )
+from cup.well.las import load_vp_rho_logset_from_standard_las
+from cup.well.td import load_workflow_time_depth_table_csv
+from cup.well.tie import load_saved_seismic_trace_csv
+from cup.well.wavelet import load_wavelet_csv
 # Step 06 depends on downstream bundle schemas only. Keep GINN/enhance training
 # logic out of this script; move schemas to a neutral package when they stabilize.
 from enhance.prior import WellResolutionPriorBundle, save_well_resolution_prior_npz, validate_well_resolution_prior
 from ginn.anchor import build_log_ai_anchor_bundle, save_log_ai_anchor_npz, validate_log_ai_anchor
+from wtie.modeling.modeling import ConvModeler
+from wtie.processing import grid
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -67,7 +73,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mode": "diagnose",
         "manual_cutoff_hz": None,
         "filter_order": 6,
-        "candidate_cutoff_hz": [6.0, 8.0, 10.0, 12.0, 15.0],
+        "candidate_cutoff_hz": [6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0],
+        "selection_corr_tolerance": 0.02,
+        "selection_nmae_tolerance": 0.03,
         "buffer_seconds": None,
         "buffer_mode": "reflect",
         "qc_enabled": True,
@@ -137,6 +145,14 @@ def _resolve_artifact_path(value: Any, *, run_dir: Path) -> Path | None:
         if candidate.exists():
             return candidate.resolve()
     return candidates[0].resolve()
+
+
+def _resolve_seismic_trace_file(metric: pd.Series, *, run_dir: Path, well_name: str) -> Path | None:
+    direct = _resolve_artifact_path(metric.get("seismic_trace_file"), run_dir=run_dir)
+    if direct is not None and direct.exists():
+        return direct
+    fallback = run_dir / "seismic_trace" / f"seismic_trace_{sanitize_filename(well_name)}.csv"
+    return fallback if fallback.exists() else direct
 
 
 def _as_optional_float(value: Any) -> float | None:
@@ -257,7 +273,14 @@ def _build_target_layer(script_cfg: dict[str, Any], geometry: dict[str, Any], qc
     return target_layer, horizons
 
 
-def _resolve_frequency_split(point_df: pd.DataFrame, script_cfg: dict[str, Any]) -> tuple[FrequencySplitConfig, pd.DataFrame, str]:
+def _resolve_frequency_split(
+    point_df: pd.DataFrame,
+    *,
+    metrics_df: pd.DataFrame,
+    auto_dir: Path,
+    wavelet_dir: Path,
+    script_cfg: dict[str, Any],
+) -> tuple[FrequencySplitConfig, pd.DataFrame, pd.DataFrame, dict[str, Any], str]:
     split_cfg = dict(script_cfg.get("frequency_split") or {})
     mode = str(split_cfg.get("mode", "diagnose")).strip().lower()
     order = int(split_cfg.get("filter_order", 6))
@@ -269,11 +292,250 @@ def _resolve_frequency_split(point_df: pd.DataFrame, script_cfg: dict[str, Any])
         if cutoff is None:
             raise ValueError("well_constraints.frequency_split.manual_cutoff_hz is required for mode=manual.")
         cfg = FrequencySplitConfig(float(cutoff), filter_order=order, buffer_seconds=buffer_seconds, buffer_mode=buffer_mode)
-        return cfg, pd.DataFrame([{"cutoff_hz": float(cutoff), "mode": "manual", "score": 0.0}]), "manual"
+        diag = pd.DataFrame([{"cutoff_hz": float(cutoff), "mode": "manual", "status": "manual"}])
+        aggregate = pd.DataFrame([{"cutoff_hz": float(cutoff), "mode": "manual"}])
+        selection = {"selected_cutoff_hz": float(cutoff), "reason": "manual"}
+        return cfg, diag, aggregate, selection, "manual"
     if mode != "diagnose":
         raise ValueError(f"Unsupported frequency split mode: {mode!r}")
-    candidates = [float(v) for v in split_cfg.get("candidate_cutoff_hz", [6.0, 8.0, 10.0, 12.0, 15.0])]
-    return (*diagnose_frequency_split(point_df, candidates, filter_order=order, buffer_seconds=buffer_seconds, buffer_mode=buffer_mode), "diagnose")
+    candidates = [float(v) for v in split_cfg.get("candidate_cutoff_hz", [6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0])]
+    return (
+        *_diagnose_frequency_split_by_forward_modeling(
+            point_df,
+            metrics_df=metrics_df,
+            auto_dir=auto_dir,
+            wavelet_dir=wavelet_dir,
+            candidate_cutoff_hz=candidates,
+            filter_order=order,
+            buffer_seconds=buffer_seconds,
+            buffer_mode=buffer_mode,
+            corr_tolerance=float(split_cfg.get("selection_corr_tolerance", 0.02)),
+            nmae_tolerance=float(split_cfg.get("selection_nmae_tolerance", 0.03)),
+        ),
+        "diagnose",
+    )
+
+
+def _load_selected_wavelet(wavelet_dir: Path) -> tuple[np.ndarray, np.ndarray, Path]:
+    summary_path = wavelet_dir / "selected_wavelet_summary.json"
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        value = summary.get("selected_wavelet_file")
+        if value:
+            path = resolve_relative_path(value, root=REPO_ROOT)
+            if path.exists():
+                time_s, amplitude = load_wavelet_csv(path)
+                return time_s, amplitude, path
+    fallback = wavelet_dir / "global_wavelet_201ms.csv"
+    time_s, amplitude = load_wavelet_csv(fallback)
+    return time_s, amplitude, fallback
+
+
+def _reflectivity_from_ai(ai: np.ndarray) -> np.ndarray:
+    values = np.asarray(ai, dtype=np.float64)
+    out = np.zeros(values.shape, dtype=np.float32)
+    valid = np.isfinite(values) & (values > 0.0)
+    pair_valid = valid[:-1] & valid[1:]
+    upper = values[:-1][pair_valid]
+    lower = values[1:][pair_valid]
+    out[np.flatnonzero(pair_valid) + 1] = ((lower - upper) / np.maximum(lower + upper, 1e-12)).astype(np.float32)
+    return out
+
+
+def _masked_scaled_synthetic_metrics(
+    *,
+    modeler: Any,
+    wavelet: Any,
+    reflectivity: Any,
+    seismic: Any,
+    eval_mask: np.ndarray,
+) -> tuple[float, float, float, int]:
+    synthetic_raw = np.asarray(modeler(wavelet.values, reflectivity.values), dtype=np.float64)
+    seismic_values = np.asarray(seismic.values, dtype=np.float64)
+    mask = np.asarray(eval_mask, dtype=bool) & np.isfinite(synthetic_raw) & np.isfinite(seismic_values)
+    n_eval = int(np.count_nonzero(mask))
+    if n_eval < 8:
+        raise ValueError(f"too_few_eval_samples:{n_eval}")
+    seismic_eval = seismic_values[mask]
+    seismic_norm = seismic_eval - float(np.mean(seismic_eval))
+    std = float(np.std(seismic_norm))
+    if not np.isfinite(std) or std <= 0.0:
+        raise ValueError("Seismic eval window has zero standard deviation.")
+    seismic_norm = seismic_norm / std
+    synthetic_eval = synthetic_raw[mask]
+    denom = max(float(np.dot(synthetic_eval, synthetic_eval)), 1e-12)
+    scale = float(np.dot(seismic_norm, synthetic_eval) / denom)
+    synthetic_scaled = scale * synthetic_eval
+    corr = float(np.corrcoef(seismic_norm, synthetic_scaled)[0, 1]) if np.std(synthetic_scaled) > 0.0 else np.nan
+    nmae = float(np.sum(np.abs(seismic_norm - synthetic_scaled)) / max(np.sum(np.abs(seismic_norm)), 1e-12))
+    return corr, nmae, scale, n_eval
+
+
+def _diagnose_frequency_split_by_forward_modeling(
+    point_df: pd.DataFrame,
+    *,
+    metrics_df: pd.DataFrame,
+    auto_dir: Path,
+    wavelet_dir: Path,
+    candidate_cutoff_hz: list[float],
+    filter_order: int,
+    buffer_seconds: float | None,
+    buffer_mode: str,
+    corr_tolerance: float,
+    nmae_tolerance: float,
+) -> tuple[FrequencySplitConfig, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    if point_df.empty:
+        raise ValueError("Cannot diagnose frequency split from an empty point table.")
+    wavelet_time_s, wavelet_amplitude, wavelet_path = _load_selected_wavelet(wavelet_dir)
+    wavelet_dt = float(np.median(np.diff(wavelet_time_s)))
+    wavelet = grid.Wavelet(wavelet_amplitude, wavelet_time_s, name=wavelet_path.stem)
+    modeler = ConvModeler()
+    selected_keys = {normalize_well_name(name) for name in point_df["well_name"].astype(str).unique()}
+    point_by_key = {normalize_well_name(str(name)): group.copy() for name, group in point_df.groupby("well_name", sort=False)}
+    rows: list[dict[str, Any]] = []
+
+    for _, metric in metrics_df.iterrows():
+        well_name = str(metric.get("well_name", "")).strip()
+        key = normalize_well_name(well_name)
+        if key not in selected_keys:
+            continue
+        route = str(metric.get("route", ""))
+        las_file = _resolve_artifact_path(metric.get("filtered_las_file"), run_dir=auto_dir)
+        tdt_file = _resolve_artifact_path(metric.get("optimized_tdt_file"), run_dir=auto_dir)
+        seismic_file = _resolve_seismic_trace_file(metric, run_dir=auto_dir, well_name=well_name)
+        if las_file is None or tdt_file is None or seismic_file is None:
+            for cutoff in candidate_cutoff_hz:
+                rows.append({"well_name": well_name, "route": route, "cutoff_hz": cutoff, "status": "failed", "reason": "missing_las_tdt_or_seismic"})
+            continue
+        try:
+            logset = load_vp_rho_logset_from_standard_las(las_file)
+            table = load_workflow_time_depth_table_csv(tdt_file)
+            seismic = load_saved_seismic_trace_csv(seismic_file)
+            seismic_basis = np.asarray(seismic.basis, dtype=np.float64)
+            seismic_dt = float(np.median(np.diff(seismic_basis)))
+            if not np.isclose(wavelet_dt, seismic_dt, rtol=1e-5, atol=1e-9):
+                raise ValueError(f"wavelet_dt_mismatch:{wavelet_dt:g}!={seismic_dt:g}")
+            ai_twt = grid.convert_log_from_md_to_twt(logset.AI, table, None, seismic_dt)
+            ai_twt_basis = np.asarray(ai_twt.basis, dtype=np.float64)
+            ai_values = np.asarray(ai_twt.values, dtype=np.float64)
+            valid_ai = np.isfinite(ai_values) & (ai_values > 0.0)
+            if int(np.count_nonzero(valid_ai)) < 8:
+                raise ValueError("too_few_finite_ai_samples")
+            log_ai_values = np.full(ai_values.shape, np.nan, dtype=np.float64)
+            log_ai_values[valid_ai] = np.log(ai_values[valid_ai])
+            eval_group = point_by_key[key]
+            eval_twt = eval_group["twt_s"].to_numpy(dtype=np.float64)
+            eval_mask = np.isin(np.round(seismic_basis, 9), np.round(eval_twt, 9))
+            if int(np.count_nonzero(eval_mask)) < 8:
+                eval_mask = (seismic_basis >= float(np.nanmin(eval_twt)) - 0.5 * seismic_dt) & (
+                    seismic_basis <= float(np.nanmax(eval_twt)) + 0.5 * seismic_dt
+                )
+            for cutoff in candidate_cutoff_hz:
+                low_log_ai = lowpass_values_on_twt(
+                    ai_twt_basis,
+                    log_ai_values,
+                    dt_s=seismic_dt,
+                    cutoff_hz=float(cutoff),
+                    order=int(filter_order),
+                    buffer_seconds=buffer_seconds,
+                    buffer_mode=buffer_mode,
+                )
+                low_ai_on_seis = np.exp(np.interp(seismic_basis, ai_twt_basis, low_log_ai, left=np.nan, right=np.nan))
+                reflectivity = grid.Reflectivity(_reflectivity_from_ai(low_ai_on_seis), seismic_basis)
+                corr, nmae, scale, n_eval = _masked_scaled_synthetic_metrics(
+                    modeler=modeler,
+                    wavelet=wavelet,
+                    reflectivity=reflectivity,
+                    seismic=seismic,
+                    eval_mask=eval_mask,
+                )
+                rows.append(
+                    {
+                        "well_name": well_name,
+                        "route": route,
+                        "cutoff_hz": float(cutoff),
+                        "status": "ok",
+                        "corr": corr,
+                        "nmae": nmae,
+                        "scale": scale,
+                        "n_eval_samples": n_eval,
+                        "wavelet_file": repo_relative_path(wavelet_path, root=REPO_ROOT),
+                    }
+                )
+        except Exception as exc:
+            for cutoff in candidate_cutoff_hz:
+                rows.append(
+                    {
+                        "well_name": well_name,
+                        "route": route,
+                        "cutoff_hz": float(cutoff),
+                        "status": "failed",
+                        "reason": f"{type(exc).__name__}:{exc}",
+                    }
+                )
+
+    diag_df = pd.DataFrame(rows)
+    ok = diag_df.loc[diag_df["status"].eq("ok")].copy()
+    if ok.empty:
+        raise ValueError("No successful forward-modeled frequency split diagnostics.")
+    aggregate = (
+        ok.groupby("cutoff_hz")
+        .agg(
+            n_wells=("well_name", "nunique"),
+            median_corr=("corr", "median"),
+            mean_corr=("corr", "mean"),
+            p25_corr=("corr", lambda x: float(np.nanpercentile(x, 25))),
+            p75_corr=("corr", lambda x: float(np.nanpercentile(x, 75))),
+            median_nmae=("nmae", "median"),
+            mean_nmae=("nmae", "mean"),
+            p25_nmae=("nmae", lambda x: float(np.nanpercentile(x, 25))),
+            p75_nmae=("nmae", lambda x: float(np.nanpercentile(x, 75))),
+            median_scale=("scale", "median"),
+            median_n_eval_samples=("n_eval_samples", "median"),
+        )
+        .reset_index()
+        .sort_values("cutoff_hz")
+    )
+    finite = aggregate[np.isfinite(aggregate["median_corr"]) & np.isfinite(aggregate["median_nmae"])].copy()
+    if finite.empty:
+        raise ValueError("No finite aggregate forward-modeled frequency split metrics.")
+    best = finite.loc[finite["median_corr"].idxmax()]
+    best_corr = float(best["median_corr"])
+    best_nmae = float(best["median_nmae"])
+    plateau = finite[
+        (finite["median_corr"] >= best_corr - float(corr_tolerance))
+        & (finite["median_nmae"] <= best_nmae + float(nmae_tolerance))
+    ]
+    if plateau.empty:
+        chosen = best
+        reason = "No cutoff passed plateau tolerances; selected max median_corr."
+    else:
+        chosen = plateau.loc[plateau["cutoff_hz"].idxmin()]
+        reason = "Selected the lowest Hz on the near-best waveform-fit plateau to keep the low-frequency branch conservative."
+    selected = float(chosen["cutoff_hz"])
+    selection = {
+        "selected_cutoff_hz": selected,
+        "selected_median_corr": float(chosen["median_corr"]),
+        "selected_median_nmae": float(chosen["median_nmae"]),
+        "best_median_corr": best_corr,
+        "best_corr_cutoff_hz": float(best["cutoff_hz"]),
+        "best_corr_median_nmae": best_nmae,
+        "corr_tolerance": float(corr_tolerance),
+        "nmae_tolerance": float(nmae_tolerance),
+        "reason": reason,
+        "wavelet_file": repo_relative_path(wavelet_path, root=REPO_ROOT),
+    }
+    return (
+        FrequencySplitConfig(
+            cutoff_hz=selected,
+            filter_order=int(filter_order),
+            buffer_seconds=buffer_seconds,
+            buffer_mode=buffer_mode,
+        ),
+        diag_df,
+        aggregate,
+        selection,
+    )
 
 
 def _save_frequency_qc(point_df: pd.DataFrame, qc_dir: Path, *, envelope_window: int) -> list[dict[str, Any]]:
@@ -326,6 +588,72 @@ def _save_frequency_qc(point_df: pd.DataFrame, qc_dir: Path, *, envelope_window:
             }
         )
     return rows
+
+
+def _plot_frequency_split_aggregate(
+    aggregate_df: pd.DataFrame,
+    *,
+    figure_path: Path,
+    selected_cutoff_hz: float | None,
+    best_cutoff_hz: float | None,
+) -> None:
+    if aggregate_df.empty or "cutoff_hz" not in aggregate_df.columns:
+        return
+    if not {"median_corr", "median_nmae"}.issubset(aggregate_df.columns):
+        return
+    figure_path.parent.mkdir(parents=True, exist_ok=True)
+    plot_df = aggregate_df.sort_values("cutoff_hz").copy()
+    x = plot_df["cutoff_hz"].to_numpy(dtype=float)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), constrained_layout=True)
+    axes[0].plot(x, plot_df["median_corr"], marker="o", color="tab:blue", label="median corr")
+    if {"p25_corr", "p75_corr"}.issubset(plot_df.columns):
+        axes[0].fill_between(x, plot_df["p25_corr"], plot_df["p75_corr"], color="tab:blue", alpha=0.15, label="p25-p75")
+    axes[0].set_ylabel("Correlation")
+    axes[0].set_title("Forward synthetic correlation")
+    axes[0].legend(loc="best")
+
+    axes[1].plot(x, plot_df["median_nmae"], marker="o", color="tab:orange", label="median nmae")
+    if {"p25_nmae", "p75_nmae"}.issubset(plot_df.columns):
+        axes[1].fill_between(x, plot_df["p25_nmae"], plot_df["p75_nmae"], color="tab:orange", alpha=0.15, label="p25-p75")
+    axes[1].set_ylabel("NMAE")
+    axes[1].set_title("Forward synthetic error")
+    axes[1].legend(loc="best")
+
+    for ax in axes:
+        if best_cutoff_hz is not None and np.isfinite(best_cutoff_hz):
+            ax.axvline(float(best_cutoff_hz), color="black", linestyle=":", linewidth=1.0, alpha=0.75, label="best corr")
+        if selected_cutoff_hz is not None and np.isfinite(selected_cutoff_hz):
+            ax.axvline(float(selected_cutoff_hz), color="tab:red", linestyle="--", linewidth=1.2, alpha=0.85, label="selected")
+        ax.set_xlabel("Cutoff (Hz)")
+        ax.grid(True, alpha=0.25)
+
+    fig.suptitle("Frequency split forward-model cutoff sweep")
+    fig.savefig(figure_path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_frequency_split_well_sweeps(diag_df: pd.DataFrame, figure_dir: Path) -> dict[str, str]:
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    out: dict[str, str] = {}
+    ok = diag_df.loc[diag_df.get("status", "").eq("ok")].copy() if not diag_df.empty else pd.DataFrame()
+    for well_name, group in ok.groupby("well_name", sort=False):
+        plot_df = group.sort_values("cutoff_hz")
+        path = figure_dir / f"frequency_split_sweep_{sanitize_filename(str(well_name))}.png"
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+        axes[0].plot(plot_df["cutoff_hz"], plot_df["corr"], marker="o", color="tab:blue")
+        axes[0].set_title(str(well_name))
+        axes[0].set_ylabel("Correlation")
+        axes[1].plot(plot_df["cutoff_hz"], plot_df["nmae"], marker="o", color="tab:orange")
+        axes[1].set_title("Forward synthetic error")
+        axes[1].set_ylabel("NMAE")
+        for ax in axes:
+            ax.set_xlabel("Cutoff (Hz)")
+            ax.grid(True, alpha=0.25)
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        out[str(well_name)] = repo_relative_path(path, root=REPO_ROOT)
+    return out
 
 
 def _make_high_supervision_bundle(
@@ -555,7 +883,13 @@ def main() -> None:
         raise ValueError(f"No selected well constraint points. Inspect {qc_path}.")
 
     raw_points = pd.concat(point_frames, ignore_index=True)
-    split_cfg, split_diag_df, split_source = _resolve_frequency_split(raw_points, script_cfg)
+    split_cfg, split_diag_df, split_aggregate_df, split_selection, split_source = _resolve_frequency_split(
+        raw_points,
+        metrics_df=metrics_df,
+        auto_dir=auto_dir,
+        wavelet_dir=wavelet_dir,
+        script_cfg=script_cfg,
+    )
     point_df = apply_frequency_split(raw_points, split_cfg)
 
     qc_split_rows: list[dict[str, Any]] = []
@@ -680,6 +1014,19 @@ def main() -> None:
 
     split_diag_path = output_dir / "frequency_split_diagnostics.csv"
     split_diag_df.to_csv(split_diag_path, index=False, encoding="utf-8-sig")
+    split_aggregate_path = output_dir / "frequency_split_aggregate.csv"
+    split_aggregate_df.to_csv(split_aggregate_path, index=False, encoding="utf-8-sig")
+    split_diag_figure_path = output_dir / "figures" / "frequency_split_cutoff_sweep.png"
+    _plot_frequency_split_aggregate(
+        split_aggregate_df,
+        figure_path=split_diag_figure_path,
+        selected_cutoff_hz=split_selection.get("selected_cutoff_hz"),
+        best_cutoff_hz=split_selection.get("best_corr_cutoff_hz"),
+    )
+    split_well_figure_paths = _plot_frequency_split_well_sweeps(
+        split_diag_df,
+        output_dir / "figures" / "frequency_split_wells",
+    )
     run_summary = {
         "created_at_utc": anchor_metadata["created_at_utc"],
         "source_script": Path(__file__).name,
@@ -696,6 +1043,9 @@ def main() -> None:
             "buffer_seconds": split_cfg.buffer_seconds,
             "buffer_mode": split_cfg.buffer_mode,
             "diagnostics": repo_relative_path(split_diag_path, root=REPO_ROOT),
+            "aggregate": repo_relative_path(split_aggregate_path, root=REPO_ROOT),
+            "diagnostic_figure": repo_relative_path(split_diag_figure_path, root=REPO_ROOT),
+            "selection": split_selection,
         },
         "conflicts": {
             "strategy": "weighted_average",
@@ -726,6 +1076,10 @@ def main() -> None:
             "well_high_motif_manifest": repo_relative_path(motif_path, root=REPO_ROOT),
             "lfm_layer_control_points": repo_relative_path(lfm_control_path, root=REPO_ROOT),
             "lfm_control_qc": repo_relative_path(lfm_qc_path, root=REPO_ROOT),
+            "frequency_split_diagnostics": repo_relative_path(split_diag_path, root=REPO_ROOT),
+            "frequency_split_aggregate": repo_relative_path(split_aggregate_path, root=REPO_ROOT),
+            "frequency_split_cutoff_sweep_figure": repo_relative_path(split_diag_figure_path, root=REPO_ROOT),
+            "frequency_split_well_sweep_figures": split_well_figure_paths,
         },
     }
     write_json(output_dir / "run_summary.json", run_summary)

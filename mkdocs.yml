@@ -53,11 +53,10 @@ nav:
       - 03 测井预处理: guide/3-well-preprocess.md
       - 旁路 井轨迹 QC: guide/well-trajectory.md
       - 04 井震自动标定: guide/4-well-auto-tie.md
-      - 05 全局子波生成与批量合成: guide/5-wavelet-generation.md
-      - 06 井约束与分频诊断: guide/6-well-constraints.md
-      - 07 低频模型: guide/7-lfm-precomputed.md
+      - 05 全局子波生成: guide/5-wavelet-generation.md
+      - 06 分频诊断与井约束: guide/6-well-constraints.md
+      - 07 构建低频模型: guide/7-lfm-precomputed.md
       - 08 GINN 训练: guide/8-ginn-train.md
-      - 09 时间域 GINN 反演: guide/9-ginn-inversion.md
       - 常见问题: guide/troubleshooting.md
   - 架构与路线图:
       - 斜井支持的 src/cup 重构规划: guide/deviated-well-src-cup-refactor.md

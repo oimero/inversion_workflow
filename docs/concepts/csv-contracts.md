@@ -156,18 +156,34 @@
 
 ## `frequency_split_diagnostics.csv`
 
-分频诊断时每个候选截止频率一行。
+分频诊断时每口井、每个候选截止频率一行。脚本用该 cutoff 下的低通井 AI 正演合成记录，并与第四步保存的井旁地震道比较。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `well_name` / `route` | 参与诊断的井和第四步标定路径 |
+| `cutoff_hz` | 候选截止频率 |
+| `status` | ok / failed / manual |
+| `corr` | 低通 AI 正演合成记录与井旁地震道的相关系数 |
+| `nmae` | 低通 AI 正演合成记录与井旁地震道的归一化绝对误差 |
+| `scale` | 最小二乘缩放系数 |
+| `n_eval_samples` | 参与正演匹配评价的样点数 |
+| `wavelet_file` | 第五步最终全局子波路径 |
+| `reason` | 失败原因，仅 failed 行有值 |
+
+## `frequency_split_aggregate.csv`
+
+分频诊断的多井聚合表，每个候选截止频率一行。
 
 | 关键字段 | 含义 |
 |----------|------|
 | `cutoff_hz` | 候选截止频率 |
-| `score` | 综合评分，越低越好 |
-| `high_rms` | 该 cutoff 下高频残余的 RMS |
-| `full_std` | 全频 log-AI 的标准差 |
-| `high_to_full_std_ratio` | 高频 RMS 与全频标准差的比值 |
-| `low_log_ai_mean_abs_diff` | 低频曲线的一阶差分绝对值均值（平滑度） |
-| `edge_high_abs_mean` | 高频残余首尾边缘的绝对均值（边界稳定性） |
-| `valid_samples` | 参与评分的有效样点数 |
+| `n_wells` | 该 cutoff 下成功参与评价的井数 |
+| `median_corr` / `mean_corr` | 多井相关系数聚合 |
+| `p25_corr` / `p75_corr` | 相关系数四分位范围 |
+| `median_nmae` / `mean_nmae` | 多井误差聚合 |
+| `p25_nmae` / `p75_nmae` | 误差四分位范围 |
+| `median_scale` | 最小二乘缩放系数中位数 |
+| `median_n_eval_samples` | 参与评价样点数中位数 |
 
 ## `well_high_motif_manifest.csv`
 

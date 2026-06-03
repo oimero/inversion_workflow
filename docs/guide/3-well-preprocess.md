@@ -108,23 +108,31 @@ well_preprocess:
 
 脚本只处理这些类别。不在列表中的即使第二步识别了也不加载。类别名是工作流语义类别（`p_sonic`、`density`），不是 LAS 原始 mnemonic。
 
-### `mnemonic_standardization.enabled`
+### `mnemonic_standardization`
+
+#### `enabled`
 
 `true`（默认）时，导出的预处理 LAS 使用标准 mnemonic（`DT_USM`、`RHO_GCC` 等）。`false` 时保留原始 mnemonic。无论哪种模式，`mnemonic_mapping.csv` 始终记录原始名到最终名的映射。
 
-### `unit_standardization.enabled`
+### `unit_standardization`
+
+#### `enabled`
 
 `true`（默认）时执行单位转换和硬先验检查。`false` 时跳过，但缺失哨兵替换和后续清洗仍按正常流程进行。
 
-### `constant_runs.min_run_length` 与 `min_run_length_by_category`
+### `constant_runs`
 
-用于识别“长时间完全不变”的可疑曲线段。这类段落常见于仪器、导出或填充值问题，会被置为空值。不同曲线对常值段的容忍度不同，因此声波、密度、GR 等类别可以单独设阈值；没有单独配置的类别才使用 `min_run_length`。
+#### `min_run_length`
 
-### `constant_runs.exclude_categories`
+用于识别”长时间完全不变”的可疑曲线段。这类段落常见于仪器、导出或填充值问题，会被置为空值。不同曲线对常值段的容忍度不同，可通过 `min_run_length_by_category` 让声波、密度、GR 等类别单独设阈值；没有单独配置的类别才使用 `min_run_length`。
+
+#### `exclude_categories`
 
 这些类别跳过连续常值段替换。默认只排除 `caliper`，因为井径曲线长时间保持同一值是正常现象。排除的类别仍然记录在报告中（`action: skip_caliper`），只是不做替换。
 
-### `outliers.range_override_file`
+### `outliers`
+
+#### `range_override_file`
 
 手动指定阈值上下限的 YAML 文件。格式：
 

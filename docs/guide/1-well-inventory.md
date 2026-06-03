@@ -70,23 +70,25 @@ well_inventory:
     dense_well_neighbor_threshold_m: 150.0
 ```
 
-### `near_survey_threshold_m`
+### `spatial_qc`
 
-用于区分“刚好在工区边缘外”和“离工区很远”的井。脚本会计算井口到地震工区边界的最近距离；距离在这个范围内的井记为 `near_outside`，更远的井记为 `outside`。这个阈值取决于你的工区边缘地质情况。如果工区边界附近有可靠的地震数据覆盖，可以放宽；如果边界处地震质量差，保持默认即可。
+#### `near_survey_threshold_m`
 
-### `vertical_bottom_offset_threshold_m`
+用于区分”刚好在工区边缘外”和”离工区很远”的井。脚本会计算井口到地震工区边界的最近距离；距离在这个范围内的井记为 `near_outside`，更远的井记为 `outside`。这个阈值取决于你的工区边缘地质情况。如果工区边界附近有可靠的地震数据覆盖，可以放宽；如果边界处地震质量差，保持默认即可。
+
+#### `vertical_bottom_offset_threshold_m`
 
 用于在还没有解析完整轨迹之前，先给每口井一个粗略井型。脚本会用 Petrel 井头导出中的 `Surface X/Y` 和 `Bottom hole X/Y` 计算井口到底孔的水平偏移；偏移很小的井先视为直井，偏移明显的井先视为斜井。注意：**这是初分，不是最终轨迹解释，后面的井轨迹 QC 会用完整轨迹重新复核井型**。如果初分和复核经常不一致，再回头调整这个阈值。
 
-### `dense_well_neighbor_threshold_m`
+#### `dense_well_neighbor_threshold_m`
 
-描述“值得警惕的近”。两口独立井相距不远时，可能在地震上落到同一条道或很近的道，后续 auto-tie、井约束、插值和反演都可能重复消费相似地震信息，所以需要统计和审计。
+描述”值得警惕的近”。两口独立井相距不远时，可能在地震上落到同一条道或很近的道，后续 auto-tie、井约束、插值和反演都可能重复消费相似地震信息，所以需要统计和审计。
 
-### `platform_cluster_threshold_m`
+#### `platform_cluster_threshold_m`
 
-描述“近到像同一个平台”。这类井往往是同一平台上的多个井槽或丛式井，井口极近是钻井设计造成的，不应直接当成异常冲突。脚本会先把它们聚成平台，再把同平台井对从高风险同道冲突清单里排除。
+描述”近到像同一个平台”。这类井往往是同一平台上的多个井槽或丛式井，井口极近是钻井设计造成的，不应直接当成异常冲突。脚本会先把它们聚成平台，再把同平台井对从高风险同道冲突清单里排除。
 
-`dense_well_neighbor_threshold_m` 和 `platform_cluster_threshold_m` 这两个阈值的大小关系也因此应该不同：平台阈值通常很小，只识别井口几乎贴在一起的井；近邻阈值更大，用来观察密井网中可能互相影响的井对。此外，`dense_well_neighbor_threshold_m` 只影响 `run_summary.json` 里的近邻数量，不会把所有近井对都导出成 CSV。真正导出的 `well_neighbor_pairs.csv` 更克制：只保留“落到同一最近地震道、且不属于同平台”的井对。
+`dense_well_neighbor_threshold_m` 和 `platform_cluster_threshold_m` 这两个阈值的大小关系也因此应该不同：平台阈值通常很小，只识别井口几乎贴在一起的井；近邻阈值更大，用来观察密井网中可能互相影响的井对。此外，`dense_well_neighbor_threshold_m` 只影响 `run_summary.json` 里的近邻数量，不会把所有近井对都导出成 CSV。真正导出的 `well_neighbor_pairs.csv` 更克制：只保留”落到同一最近地震道、且不属于同平台”的井对。
 
 ---
 

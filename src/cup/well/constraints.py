@@ -57,7 +57,21 @@ POINT_COLUMNS = [
     "batch_nmae",
 ]
 
+CONFLICT_COLUMNS = [
+    "flat_idx",
+    "sample_index",
+    "n_points",
+    "well_names",
+    "sources",
+    "min_value",
+    "max_value",
+    "range_value",
+    "strategy",
+    "point_rows_json",
+]
+
 __all__ = [
+    "CONFLICT_COLUMNS",
     "FrequencySplitConfig",
     "POINT_COLUMNS",
     "aggregate_lfm_control_points",
@@ -600,7 +614,7 @@ def build_point_conflict_report(point_df: pd.DataFrame, *, value_col: str = "wel
     """Report duplicate nearest trace/sample constraints before aggregation."""
     rows: list[dict[str, Any]] = []
     if point_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=CONFLICT_COLUMNS)
     for (flat_idx, sample_index), group in point_df.groupby(["flat_idx", "sample_index"], sort=False):
         if len(group) <= 1:
             continue
@@ -634,7 +648,7 @@ def build_point_conflict_report(point_df: pd.DataFrame, *, value_col: str = "wel
                 ),
             }
         )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=CONFLICT_COLUMNS)
 
 
 def aggregate_trace_arrays(

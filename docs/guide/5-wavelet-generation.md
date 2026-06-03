@@ -115,9 +115,38 @@ wavelet_generation:
 
 第五步不做相位校正和极性翻转——这些会改变第四步 auto-tie 的物理含义。
 
-### `generation.objective`
+### `generation`
 
-全局子波不是只追求最高相关系数。评分同时考虑整体匹配、少数差井、振幅误差和子波形态是否合理：
+#### `mode`
+
+`generation.mode: optimize_consensus` 表示默认不直接从候选子波里挑一条，而是在候选子波共同定义的形态范围内生成一条共识子波。可以把它理解成：先学习“这些候选子波通常怎么变化”，再在这个变化范围内找一条整体评分更好的子波。
+
+#### `pca`
+
+`generation.pca` 控制这个“形态范围”：
+
+| 参数 | 含义 |
+|------|------|
+| `n_components` | 使用多少个主要形态变化方向。值越大，可搜索的子波形态越自由，也越容易追随局部噪声；候选井不多时不宜设太大。 |
+| `coefficient_bounds` | 每个形态方向的搜索边界来源。`quantile` 用候选子波投影系数的分位数做边界，比直接用极值更稳。 |
+| `coefficient_quantiles` | `quantile` 模式下的上下分位。`[0.05, 0.95]` 表示避开最极端的 5% 和 95% 以外形态。范围放宽会给优化更多自由，范围收窄会更保守。 |
+
+#### `optimizer`
+
+`generation.optimizer` 控制怎么在这个范围内搜索：
+
+| 参数 | 含义 |
+|------|------|
+| `strategy` | 当前主线为 `random_then_powell`：先随机撒点找高分区域，再局部细化。 |
+| `random_trials` | 随机尝试次数。次数越多越不容易漏掉好区域，但运行更慢。 |
+| `max_refine_iters` | 局部细化最多迭代次数。值越大越愿意在当前高分区域继续打磨，但提升通常会递减。 |
+| `seed` | 随机搜索种子。固定后，同一批输入会得到可复现的搜索过程。 |
+
+实际调参时，通常先不要动 `n_components` 和分位范围；如果怀疑优化没有充分探索，优先增加 `random_trials`。如果共识子波形态变得不自然，优先收窄 `coefficient_quantiles` 或增加 `generation.objective` 里的形态惩罚。
+
+#### `objective`
+
+`generation.objective` 定义共识子波的评分方式。全局子波不是只追求最高相关系数，评分同时考虑整体匹配、少数差井、振幅误差和子波形态是否合理：
 
 | 项 | 作用 |
 |------|------|
@@ -167,18 +196,18 @@ wavelet_generation:
 2. 用候选子波与反射系数卷积，生成合成记录。
 3. 与地震道比较，计算相关系数和 NMAE。
 
-输出 `wavelet_candidate_metrics.csv`（候选 × 井的逐项指标）和 `wavelet_candidate_aggregate.csv`（空间去偏聚合后的综合指标）。
+默认输出 `wavelet_candidate_aggregate.csv`，用于比较候选子波的空间去偏综合指标。候选 × 井的逐项指标属于 debug 明细，只有打开 `export.write_debug_artifacts` 时才写出。
 
 ### 第三阶段：共识子波生成
 
 默认不只是从候选里挑一条，而是在这些候选子波共同定义的“合理形态范围”内搜索一条新的共识子波：
 
-1. **提取候选形态。** 从候选子波中提取主要变化方向，得到均值子波和若干形态分量。
-2. **限制搜索范围。** 新子波只能在候选子波附近移动，避免生成一条数学上高分、地质上陌生的波形。
-3. **两阶段搜索。** 先大量随机尝试，找到高分区域；再对高分结果做局部细化。
+1. **提取候选形态。** 从候选子波中提取主要变化方向，得到均值子波和若干形态分量。`n_components` 控制保留多少个形态方向。
+2. **限制搜索范围。** 新子波只能在候选子波附近移动，避免生成一条数学上高分、地质上陌生的波形。`coefficient_bounds` 和 `coefficient_quantiles` 控制这个附近到底有多宽。
+3. **两阶段搜索。** 先用 `random_trials` 大量随机尝试，找到高分区域；再用 `max_refine_iters` 对高分结果做局部细化。`seed` 固定随机搜索的可复现性。
 4. **每次评测都做完整交叉评测。** 每条生成子波和候选子波一样，在所有评测井上做合成记录、算空间去偏聚合指标、加上正则化项得到最终分数。
 
-整个过程的所有试验（随机 + 细化）都写入 `consensus_search_trials.csv`，可以追溯每一步的系数、各项指标和分数。
+打开 `export.write_debug_artifacts` 后，整个过程的试验记录会写入 `consensus_search_trials.csv`，可以追溯每一步的系数、各项指标和分数。
 
 ### 第四阶段：选择
 
@@ -200,19 +229,37 @@ wavelet_generation:
 
 所有文件在 `<output_root>/wavelet_generation_<timestamp>/` 下：
 
+### 主线决策输出
+
+| 文件 | 什么时候看 | 内容 |
+|------|------------|------|
+| `selected_wavelet.csv` | 第六、七步继续运行时 | 最终输出的全局子波 |
+| `selected_wavelet_summary.json` | 先看 | 选择模式、分数对比、来源井、配置摘要 |
+| `wavelet_candidate_aggregate.csv` | 判断候选竞争关系时 | 候选子波的空间去偏聚合指标和综合分数 |
+| `evaluation_well_spatial_clusters.csv` | 检查密井平台是否被去偏时 | 每口评测井的空间簇编号和簇大小 |
+| `run_summary.json` | 复现实验时 | 输入路径、候选数、评测井数、选择模式和配置快照 |
+
+### 批量合成 QC 输出
+
+| 文件 | 什么时候看 | 内容 |
+|------|------------|------|
+| `batch_synthetic_metrics.csv` | 先按 `corr` 排序 | 使用全局子波后每口井的合成记录指标 |
+| `figures/batch_synthetic_qc/*.png` | 排查单井波形时 | 反射系数、观测/合成叠合、残差三联图；第二图标题里的 `scale` 是该井自己的最小二乘缩放倍数 |
+| `synthetic_qc/*.csv` | 需要逐样点复核时 | 每口井的地震道、反射系数、合成记录和残差 |
+| `figures/selected_wavelet.png` | 检查最终子波形态时 | 全局子波、最佳候选和共识子波的形态对比 |
+
+### Debug 输出
+
+这些文件默认不写。需要追溯候选过滤、PCA 或共识搜索过程时，把 `export.write_debug_artifacts` 打开。
+
 | 文件 | 内容 |
 |------|------|
-| `evaluation_well_spatial_clusters.csv` | 每口评测井的空间簇编号和簇大小 |
-| `wavelet_candidate_aggregate.csv` | 候选子波的空间去偏聚合指标和综合分数 |
-| `selected_wavelet.csv` | 最终输出的全局子波 |
-| `selected_wavelet_summary.json` | 选择模式、分数对比、来源井、配置摘要 |
-| `batch_synthetic_metrics.csv` | 使用全局子波后每口井的合成记录指标 |
-| `synthetic_qc/*.csv` | 每口井的地震道、反射系数、合成记录和残差 |
-| `figures/batch_synthetic_qc/*.png` | 每口井的批量合成三联 QC 图 |
-| `figures/selected_wavelet.png` | 全局子波、最佳候选和共识子波的形态对比 |
-| `run_summary.json` | 输入路径、候选数、评测井数、选择模式 |
-
-`candidate_wavelets.csv`、`wavelet_qc.csv`、`wavelet_candidate_metrics.csv`、`wavelet_basis.csv`、`consensus_search_trials.csv` 和 `consensus_wavelet_metrics.csv` 默认不写。需要追溯候选过滤、PCA 或共识搜索过程时，把 `export.write_debug_artifacts` 打开。
+| `candidate_wavelets.csv` | 进入候选池的子波清单和来源井信息 |
+| `wavelet_qc.csv` | 每条候选子波的中心、长度、采样间隔和能量 QC |
+| `wavelet_candidate_metrics.csv` | 候选子波 × 评测井的逐项指标 |
+| `wavelet_basis.csv` | 均值子波和 PCA 主成分 |
+| `consensus_search_trials.csv` | 共识搜索的每次 trial、系数、指标和分数 |
+| `consensus_wavelet_metrics.csv` | 共识子波 × 评测井的逐项指标 |
 
 ### `wavelet_candidate_metrics.csv`（debug 输出）
 

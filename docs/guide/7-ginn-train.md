@@ -252,7 +252,6 @@ well_control_enabled: false
 
 - 接入点级 `log_ai_anchor_file`，启用在训练 batch 中混入井控道的 in-batch well control 机制。
 - `gain_source: dynamic_gain_model`，将随样点变化的增益体作为输入通道和正演增益。
-- 按井或平台做专用验证集切分，替代单纯的空间块切分。
 - enhance stage-2 训练的契约对接。
 
 

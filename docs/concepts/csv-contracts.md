@@ -96,9 +96,9 @@
 
 `inline_float`、`xline_float`、`twt_s` 是空间事实的规范坐标；`flat_idx` / `sample_index` 只能在同一地震几何和采样轴内解释。
 
-## `well_anchor_points.csv` / `well_high_supervision_conflicts.csv`
+## `well_anchor_points.csv` / `well_anchor_conflicts.csv`
 
-`well_anchor_points.csv` 是 `well_constraint_points.csv` 中允许进入 GINN 低频 anchor 的子集。`well_anchor_conflicts.csv` 和 `well_high_supervision_conflicts.csv` 记录同一 `(flat_idx, sample_index)` 上有多条井约束被聚合前的差异。
+`well_anchor_points.csv` 是 `well_constraint_points.csv` 中允许进入 GINN 低频 anchor 的子集（第一版默认只含直井）。`well_anchor_conflicts.csv` 记录同一 `(flat_idx, sample_index)` 上有多条井约束被聚合前的差异。
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -108,6 +108,78 @@
 | `min_value` / `max_value` / `range_value` | 被审计目标值的范围 |
 | `strategy` | 当前聚合策略 |
 | `point_rows_json` | 冲突点的原始井名、位置、目标值和权重 |
+
+## `well_anchor_trace_summary.csv`
+
+每条进入 GINN 低频 anchor 的受控道一行，用于审计道级覆盖。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `flat_idx` | 受控地震道编号 |
+| `well_names` | 约束该道的井名，多井用分号连接 |
+| `sources` | 空间来源类型 |
+| `sample_count` | 该道上有效锚点样点数 |
+| `weight_min` / `weight_mean` / `weight_max` | 该道锚点权重的最小、均值和最大值 |
+| `inline` / `xline` | 该道的线号 |
+
+## `well_high_supervision_qc.csv`
+
+逐井入选结果和质量控制摘要，每口候选井一行。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `well_name` | 井名 |
+| `status` | `selected` / `rejected` / `failed` |
+| `route` | 第四步标定路径 |
+| `batch_corr` / `batch_nmae` | 第五步批量合成指标 |
+| `control_point_count` | 有效样点数 |
+| `invalid_point_count` / `invalid_point_fraction` | 无效样点数及比例 |
+| `unique_trace_count` | 样点覆盖的唯一道数；斜井应大于 1 |
+| `reasons` | 分号分隔的拒绝或失败原因 |
+| `frequency_split_qc_trace_path` | 分频前后曲线数值文件路径 |
+| `frequency_split_qc_figure_path` | 分频 QC 图路径 |
+
+## `well_high_stats_by_layer.csv`
+
+每层一行，记录该层的高频统计特征和可靠度。后续 enhance 合成器用这些统计驱动分层样本生成。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `zone_name` | 层段名 |
+| `well_count` / `sample_count` / `event_count` | 该层的有效井数、样点数和事件数 |
+| `reliability` | 0–1 可靠度，由井数、样点数和事件数综合决定 |
+| `alpha_to_layer` | 收缩因子 α，越高越相信本层自身统计 |
+| `event_density_per_sample` / `event_density_per_second` | 事件密度（每样点 / 每秒） |
+| `amplitude_rms` / `amplitude_p10` / `amplitude_p50` / `amplitude_p90` / `amplitude_abs_p95` | 高频残余振幅分布 |
+| `run_length_p50` / `run_length_p90` | 正负状态持续样点数的分位数 |
+| `transition_matrix_json` | 三状态转移矩阵（正/静/负）的计数和概率 |
+
+## `frequency_split_diagnostics.csv`
+
+分频诊断时每个候选截止频率一行。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `cutoff_hz` | 候选截止频率 |
+| `score` | 综合评分，越低越好 |
+| `high_rms` | 该 cutoff 下高频残余的 RMS |
+| `full_std` | 全频 log-AI 的标准差 |
+| `high_to_full_std_ratio` | 高频 RMS 与全频标准差的比值 |
+| `low_log_ai_mean_abs_diff` | 低频曲线的一阶差分绝对值均值（平滑度） |
+| `edge_high_abs_mean` | 高频残余首尾边缘的绝对均值（边界稳定性） |
+| `valid_samples` | 参与评分的有效样点数 |
+
+## `well_high_motif_manifest.csv`
+
+可选真实高频 motif patch 的索引表。第一版只写表头（占位），不生成对应的 motif 数据包。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `motif_id` | motif 编号 |
+| `well_name` / `zone_name` | 来源井和层段 |
+| `start_twt_s` / `end_twt_s` | motif 片段的时间范围 |
+| `quality_tag` | 质量标签 |
+| `reason` | 选择原因 |
 
 ## `lfm_layer_control_points.csv`
 
@@ -123,7 +195,7 @@
 | `ai` | 第六步分频后的低频 AI 控制值 |
 | `weight` | 第六步按井震匹配质量等因素计算的控制点权重 |
 
-`inline_float`、`xline_float`、`twt_s` 是规范坐标。当前第六步输出的是按单井、层段和切片聚合后的代表控制点，第七步只消费它做 LFM 建模。`flat_idx` / `sample_index` 可以作为派生字段写出，便于 QC 和调试，但它们依赖当前地震几何与采样轴，不能作为跨步骤主键。
+`inline_float`、`xline_float`、`twt_s` 是规范坐标。第六步输出的是按单井、层段和切片聚合后的代表控制点，第七步只消费它做 LFM 建模。`flat_idx` / `sample_index` 作为派生字段写出，便于 QC 和调试，但它们依赖当前地震几何与采样轴，不能作为跨步骤主键。
 
 ## `lfm_control_qc.csv`
 

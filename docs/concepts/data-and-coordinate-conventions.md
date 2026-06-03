@@ -65,6 +65,75 @@ trace =
   + wi       * wj       * trace11
 ```
 
+## 第六步井约束：NPZ 数据包与步骤间契约
+
+第六步 `well_constraints.py` 输出的 CSV 字段契约见[核心 CSV 契约](csv-contracts.md)。这里的重点是它产出的两个 NPZ 数据包和统计文件，它们是第七、八步和 enhance 的正式输入。
+
+### `log_ai_anchor_time.npz` → 第八步 GINN
+
+| NPZ 键 | 形状 | 语义 |
+|--------|------|------|
+| `samples` | `(n_sample,)` | 正秒 TWT 采样轴 |
+| `flat_indices` | `(n_anchor,)` | 每条受控道的地震体内部编号 |
+| `target_ai` | `(n_anchor, n_sample)` | 第六步分频后的低频波阻抗 |
+| `target_log_ai` | `(n_anchor, n_sample)` | 低频波阻抗的对数，由 `target_ai` 自动推导 |
+| `anchor_mask` | `(n_anchor, n_sample)` | 布尔掩码，标记哪些样点是有效控制点 |
+| `anchor_weight` | `(n_anchor, n_sample)` | 每个控制点的训练权重 |
+| `anchor_names` | `(n_anchor,)` | 每条道的来源井名 |
+| `anchor_types` | `(n_anchor,)` | 锚点类型，当前均为 `"well"` |
+| `inline` / `xline` | `(n_anchor,)` | 每条道的线号 |
+| `summary_json` | 标量 | 锚点数、有效样点数、目标值统计、权重统计 |
+| `metadata_json` | 标量 | 分频参数、冲突策略、上游路径 |
+
+第一版默认只含直井锚点。第八步训练时，`anchor_mask` 为真的样点会参与井约束损失。
+
+### `well_high_supervision_time.npz` → enhance 训练
+
+遵循 `enhance.prior` 的 `WellResolutionPriorBundle` 格式（schema v3）。在第六步的语境下：
+
+| 可用字段 | 语义 |
+|----------|------|
+| `well_high_log_ai` | 井上高频残余，enhance 训练的真实井监督目标 |
+| `well_low_ai` / `well_low_log_ai` | 井上低频成分 |
+| `well_ai` / `well_log_ai` | 井上全频波阻抗 |
+| `well_mask` / `well_weight` | 有效样点掩码和训练权重 |
+| `well_names` / `inline` / `xline` | 每口井的标识和位置 |
+| `highres_depth` | 实际存储正秒 TWT（保留旧字段名以兼容 enhance.prior） |
+| `highres_well_*` | 各字段的"高采样"副本，第六步与原始采样一致 |
+
+不可用的占位字段（全零）：
+
+| 字段 | 原因 |
+|------|------|
+| `lfm_log_ai` / `lfm_ai` / `highres_lfm_log_ai` | LFM 是第七步的产物，第六步执行时尚不存在 |
+
+enhance 训练端若需要底阻抗输入，应从 GINN 或 LFM 主文件读取，不应从这份井监督包中读取。
+
+### 统计文件 → enhance 合成器
+
+| 文件 | 格式 | 消费者 |
+|------|------|--------|
+| `well_high_stats_global.json` | JSON，含振幅、事件密度、持续长度、转移矩阵、反射率和频谱的全局统计 | enhance 合成器，全窗预训练阶段 |
+| `well_high_stats_by_layer.csv` | CSV，每层经验统计和可靠度 | enhance 合成器，分层微调阶段 |
+| `well_high_stats_shrinkage.json` | JSON，每层向全窗收缩后的最终生成参数 | enhance 合成器的真实生成参数来源 |
+| `well_high_motif_manifest.csv` | CSV，第一版为空占位 | 后续 motif bank 功能的接口 |
+
+统计文件的核心约定：输出不写单一均值，保留分位数（p10/p50/p90），让合成器从分布中抽样而非永远取中位数。每层可靠度由井数、样点数、事件数三者综合决定。
+
+### 跨步骤接口一览
+
+```
+第六步 well_constraints.py
+  ├─ lfm_layer_control_points.csv  → 第七步 lfm_precomputed.py（顺层插值建模）
+  ├─ lfm_control_qc.csv            → 第七步（控制井审计）
+  ├─ log_ai_anchor_time.npz        → 第八步 ginn_train.py（井约束损失）
+  ├─ well_high_supervision_time.npz → enhance 训练（真实井高频监督）
+  ├─ well_high_stats_*.json/csv    → enhance 合成器（统计驱动生成）
+  └─ well_high_motif_manifest.csv  → enhance 合成器（motif bank 占位）
+```
+
+每个下游步骤只读取第六步的输出，不应再直接访问第四步的 LAS、时深表或井轨迹。
+
 ## 单位约定
 
 | 物理量 | 单位 | 说明 |

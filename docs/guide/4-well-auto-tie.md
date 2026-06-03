@@ -245,7 +245,7 @@ manual_shift:
 | `synthetic_qc/tie_qc_<well>.csv` | 地震、反射系数、合成记录和残差 |
 | `seismic_trace/seismic_trace_<well>.csv` | 实际用于标定的地震道（直井是井旁道，斜井是沿轨迹拼接道） |
 | `trace_sample_plan/trace_sample_plan_<well>.csv` | 斜井 auto-tie 前用于取轨迹地震道的样点级落道明细；直井通常没有 |
-| `trace_sample_plan/optimized_trace_sample_plan_<well>.csv` | 斜井细标定后基于 `optimized_tdt_<well>.csv` 重新生成的样点级落道明细，供第六步点级 LFM 使用 |
+| `trace_sample_plan/optimized_trace_sample_plan_<well>.csv` | 斜井细标定后基于 `optimized_tdt_<well>.csv` 重新生成的样点级落道明细，供第六步井约束和第七步点级 LFM 使用 |
 | `figures/<well>/*.png` | TDT 图、合成匹配图、子波图 |
 | `run_summary.json` | 输入路径、路由统计、失败统计、逐井补充信息 |
 

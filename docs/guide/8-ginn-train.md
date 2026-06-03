@@ -1,8 +1,8 @@
-# 07 GINN 训练
+# 08 GINN 训练
 
-`ginn_train.py` 是工作流的第七步。它读取地震体、第六步产出的波阻抗低频模型和第五步选出的全局子波，训练一个物理信息神经网络（GINN），在目标层内预测波阻抗的残差分量。
+`ginn_train.py` 是工作流的第八步。它读取地震体、第七步产出的波阻抗低频模型和第五步选出的全局子波，训练一个物理信息神经网络（GINN），在目标层内预测波阻抗的残差分量。
 
-网络不直接重画一套波阻抗体，而是在第六步低频模型的基础上学习一个相对残差。这样做的直觉是：LFM 负责大尺度趋势，神经网络只补目标层内能被地震波形约束的高频细节。
+网络不直接重画一套波阻抗体，而是在第七步低频模型的基础上学习一个相对残差。这样做的直觉是：LFM 负责大尺度趋势，神经网络只补目标层内能被地震波形约束的高频细节。
 
 ---
 
@@ -23,9 +23,9 @@ python scripts/ginn_train.py --config experiments/ginn/train.yaml
 |------|------|------|
 | 地震数据 | 时间域地震体 | 观测地震道和 inline/xline/time 几何 |
 | 第五步 | 全局子波 | 物理正演的褶积子波 |
-| 第六步 | 波阻抗低频模型 NPZ | LFM 体、目标层 metadata、层位路径 |
+| 第七步 | 波阻抗低频模型 NPZ | LFM 体、目标层 metadata、层位路径 |
 
-第六步的 NPZ 已经记录了目标层选择和 QC 口径，所以第七步不再单独配置顶底层位。训练会重新读取这些层位并重建 mask。LFM 必须是时间域、秒单位，并且 TWT 采样轴要与训练地震体完全对齐；任何一项不满足，训练都会在数据加载阶段停止。
+第七步的 NPZ 已经记录了目标层选择和 QC 口径，所以第八步不再单独配置顶底层位。训练会重新读取这些层位并重建 mask。LFM 必须是时间域、秒单位，并且 TWT 采样轴要与训练地震体完全对齐；任何一项不满足，训练都会在数据加载阶段停止。
 
 ---
 
@@ -144,7 +144,7 @@ lambda_log_ai_anchor: 0.0
 well_control_enabled: false
 ```
 
-后续若从第六步点级控制生成 anchor bundle（一个 NPZ 文件，记录每口控制井在哪些 trace、哪些 sample 上的 log-AI 目标值和权重），才打开这些配置。不要在第七步里临时从 LAS 或时深表拼约束。
+后续若从第六步井约束生成 anchor bundle（一个 NPZ 文件，记录每口控制井在哪些 trace、哪些 sample 上的 log-AI 目标值和权重），才打开这些配置。不要在第八步里临时从 LAS 或时深表拼约束。
 
 ### 验证集切分
 
@@ -161,8 +161,8 @@ well_control_enabled: false
 ### 数据准备
 
 1. 读取地震体，获取 3D 几何（n_inline, n_xline, n_sample）和 inline/xline 网格的 XY 坐标。
-2. 读取第六步的 LFM NPZ，校验三项：采样域为 `time`、采样单位为秒、`samples` 轴与地震采样轴对齐。
-3. 从 LFM metadata 中读取顶底解释层位路径，用第六步同套目标层 QC 参数重建 TargetZone，生成训练 mask 和推理 mask。
+2. 读取第七步的 LFM NPZ，校验三项：采样域为 `time`、采样单位为秒、`samples` 轴与地震采样轴对齐。
+3. 从 LFM metadata 中读取顶底解释层位路径，用第七步同套目标层 QC 参数重建 TargetZone，生成训练 mask 和推理 mask。
 4. 根据子波自动估计边界影响宽度（`boundary_effect_samples`），用它对 mask 侵蚀得到 loss mask、向外扩展得到 residual taper。
 5. 将所有 3D 数据展平为 `(n_trace, n_sample)` 的道集。
 6. 若配置了空间块验证，按比例划分训练集和验证集。
@@ -204,7 +204,7 @@ well_control_enabled: false
 
 ### checkpoint 结构
 
-每个 `.pt` 文件保存模型权重、优化器状态、学习率调度器状态和完整训练配置。第八步反演应从 checkpoint 中读取配置来重建数据加载和模型的口径——不应重新手抄一份 train config。
+每个 `.pt` 文件保存模型权重、优化器状态、学习率调度器状态和完整训练配置。第九步反演应从 checkpoint 中读取配置来重建数据加载和模型的口径——不应重新手抄一份 train config。
 
 ---
 
@@ -236,10 +236,10 @@ well_control_enabled: false
 
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
-| LFM NPZ 无 `metadata_json.horizons` | 第六步 NPZ 缺少层位信息 | 回到第六步确认 `metadata_json` 写入了 `horizons` 字段 |
-| LFM `sample_domain` 不是 `time` 或 `sample_unit` 不是秒 | LFM 不在时间域 | 确认第六步使用时间域地震几何 |
-| LFM `samples` 轴与地震采样轴不对齐 | 最大差异超过 1e-6 秒 | 确认第六步和第七步使用同一套地震体和采样轴 |
-| LFM shape 与地震 shape 不匹配 | 第六步和第七步的 inline/xline/sample 维度不一致 | 检查地震体路径和 SEG-Y 头字节配置 |
+| LFM NPZ 无 `metadata_json.horizons` | 第七步 NPZ 缺少层位信息 | 回到第七步确认 `metadata_json` 写入了 `horizons` 字段 |
+| LFM `sample_domain` 不是 `time` 或 `sample_unit` 不是秒 | LFM 不在时间域 | 确认第七步使用时间域地震几何 |
+| LFM `samples` 轴与地震采样轴不对齐 | 最大差异超过 1e-6 秒 | 确认第七步和第八步使用同一套地震体和采样轴 |
+| LFM shape 与地震 shape 不匹配 | 第七步和第八步的 inline/xline/sample 维度不一致 | 检查地震体路径和 SEG-Y 头字节配置 |
 | 子波采样间隔与地震不一致 | 第五步子波来源和训练地震的 dt 不同 | 确认子波导出时使用的是正确的采样间隔 |
 | `in_channels` 与启用通道数不匹配 | 配置冲突 | V1 使用 `include_lfm_input=true`、`include_mask_input=true`、`include_dynamic_gain_input=false`、`in_channels=3` |
 | `dilations` 长度不等于 `num_res_blocks` | 只改了其中一个 | 两者必须一起维护 |
@@ -253,6 +253,5 @@ well_control_enabled: false
 - 接入点级 `log_ai_anchor_file`，启用在训练 batch 中混入井控道的 in-batch well control 机制。
 - `gain_source: dynamic_gain_model`，将随样点变化的增益体作为输入通道和正演增益。
 - enhance stage-2 训练的契约对接。
-
 
 

@@ -60,7 +60,7 @@
 | `usable_p_sonic` / `usable_density` | 路由所需曲线是否可用 |
 | `input_las` | 第三步预处理 LAS 路径 |
 | `time_depth_file` / `well_trace_file` | 时深表与井轨迹输入路径 |
-| `surface_x` / `surface_y` | 井口平面坐标；第六步直井控制点使用这两个字段定位井口 trace |
+| `surface_x` / `surface_y` | 井口平面坐标；第六步井约束和第七步 LFM 的直井控制点使用这两个字段定位井口 trace |
 | `kb_m` | 井口补心高程，单位 m；供需要井口高程的后续步骤复用 |
 
 ## `well_tie_metrics.csv`
@@ -87,9 +87,9 @@
 | `inline_float` / `xline_float` | 控制点投影到工区后的浮点线号 |
 | `zone_name` / `u_in_zone` | 所属层段和层内比例位置 |
 | `ai` | 控制点 AI 值，由第四步 filtered LAS 的 `DT_USM`/`RHO_GCC` 构造 |
-| `weight` | 控制点权重；当前第六步自动生成的权重均为 `1.0` |
+| `weight` | 控制点权重；当前第七步 LFM 自动生成的权重均为 `1.0` |
 
-`inline_float`、`xline_float`、`twt_s` 是规范坐标。第六步输出的是按单井、层段和切片聚合后的代表控制点。`flat_idx` / `sample_index` 可以作为派生字段写出，便于 QC 和调试，但它们依赖当前地震几何与采样轴，不能作为跨步骤主键。
+`inline_float`、`xline_float`、`twt_s` 是规范坐标。当前第七步 LFM 输出的是按单井、层段和切片聚合后的代表控制点。`flat_idx` / `sample_index` 可以作为派生字段写出，便于 QC 和调试，但它们依赖当前地震几何与采样轴，不能作为跨步骤主键。
 
 ## `lfm_control_qc.csv`
 

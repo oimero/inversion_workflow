@@ -54,11 +54,13 @@ nav:
       - 旁路 井轨迹 QC: guide/well-trajectory.md
       - 04 井震自动标定: guide/4-well-auto-tie.md
       - 05 全局子波生成与批量合成: guide/5-wavelet-generation.md
-      - 06 低频模型: guide/6-lfm-precomputed.md
-      - 07 GINN 训练: guide/7-ginn-train.md
+      - 06 井约束与分频诊断: guide/6-well-constraints.md
+      - 07 低频模型: guide/7-lfm-precomputed.md
+      - 08 GINN 训练: guide/8-ginn-train.md
       - 常见问题: guide/troubleshooting.md
   - 架构与路线图:
       - 斜井支持的 src/cup 重构规划: guide/deviated-well-src-cup-refactor.md
+      - Enhance 合成器重构规划: guide/enhance-synthetic-refactor.md
   - API:
       - API 总览: api/index.md
       - cup:
@@ -74,4 +76,3 @@ nav:
           - wtie.processing: api/wtie/processing.md
           - wtie.optimize: api/wtie/optimize.md
           - wtie.utils: api/wtie/utils.md
-

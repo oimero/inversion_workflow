@@ -1,6 +1,6 @@
 # 时间域工作流总览
 
-时间域主链由七个顺序步骤 + 一个旁路脚本组成。
+时间域主链由九个顺序步骤 + 一个旁路脚本组成。
 
 ## 主链
 
@@ -11,8 +11,10 @@
 | 03 | `well_preprocess.py` | `well_screen.csv`、`selected_las/` | `well_preprocess_status.csv`、`preprocessed_las/` |
 | 04 | `well_auto_tie.py` | 03 产物 + 时深表 + 井分层 + 轨迹 QC | `well_tie_metrics.csv`、优化后 TDT、子波 |
 | 05 | `wavelet_generation.py` | 04 子波 + 预处理 LAS | 全局子波、批量合成记录 |
-| 06 | `lfm_precomputed.py` | 04 标定结果 + 05 批量合成 QC + 层位 | `ai_lfm_time.npz`、LFM 控制点 |
-| 07 | `ginn_train.py` | 时间域地震体 + 05 子波 + 06 LFM | GINN checkpoint |
+| 06 | `well_constraints.py` | 04 标定结果 + 05 批量合成 QC + 层位 | 低频井监督、高频井监督、高频统计 |
+| 07 | `lfm_precomputed.py` | 06 井空间事实 + 04/05 QC + 层位 | `ai_lfm_time.npz`、LFM 控制点 |
+| 08 | `ginn_train.py` | 时间域地震体 + 05 子波 + 07 LFM + 可选 06 anchor | GINN checkpoint |
+| 09 | `ginn_inversion.py` | 08 checkpoint | stage-1 波阻抗预测体 |
 
 ## 旁路
 
@@ -30,8 +32,10 @@ flowchart LR
   B --> C["03 well_preprocess"]
   C --> D["04 well_auto_tie"]
   D --> E["05 wavelet_generation"]
-  E --> F["06 lfm_precomputed"]
-  F --> G["07 ginn_train"]
+  E --> F["06 well_constraints"]
+  F --> G["07 lfm_precomputed"]
+  G --> H["08 ginn_train"]
+  H --> I["09 ginn_inversion"]
   A --> T["well_trajectory (旁路)"]
   T --> D
 ```
@@ -41,4 +45,3 @@ flowchart LR
 深度域脚本（`scripts/*_depth.py`）独立于上述主链，互不依赖。
 两者共享 `src/cup/` 库函数与 `src/wtie/` 核心，但脚本层面的
 输入/输出产物不交叉。
-

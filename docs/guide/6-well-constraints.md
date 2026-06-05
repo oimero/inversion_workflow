@@ -72,6 +72,9 @@ well_constraints:
     include_deviated: false
     min_points_per_trace: 2
 
+  high_supervision:
+    include_deviated: false
+
   conflicts:
     strategy: weighted_average
 
@@ -117,6 +120,16 @@ well_constraints:
 
 分频结果不是为了让每口井各用各的截止频率。默认口径是全目标窗共享一个分频；分层 enhance 在此基础上统计每层的高频特征，但同一条训练链路里不应出现多套互相不兼容的频率拆分。
 
+实际调参时，通常只先看三个地方：
+
+- `candidate_cutoff_hz` 决定可选范围。选中的 cutoff 如果总在列表边界，先扩展候选范围，而不是马上改别的参数。
+- `selection_corr_tolerance` 和 `selection_nmae_tolerance` 决定“近最佳平台”有多宽。放宽后更容易选到较低 Hz，低频分支更保守；收紧后更贴近波形拟合最优点。
+- `buffer_seconds` 主要处理滤波边界效应。如果分频 QC 图两端高频残差异常放大，或低频曲线端部翘起，可以给一个小缓冲，例如 `0.05` 到 `0.15` 秒。
+
+默认建议先用 `diagnose` 跑一遍，看 `frequency_split_cutoff_sweep.png` 和几口代表井的分频 QC 图。若低频曲线几乎贴着原始 log-AI，说明高频留得不够，可以考虑降低候选 cutoff 或放宽平台容差；若低频太平滑、正演合成明显变差，则提高候选 cutoff 或收紧平台容差。只有当诊断结果明显被异常井带偏，或者已有明确地质认识时，再切到 `manual` 固定 `manual_cutoff_hz`。
+
+`filter_order` 和 `qc_envelope_window_samples` 一般不作为第一轮调参入口。前者只在低通边缘出现不自然振荡时再动，后者只影响 QC 图上的包络显示，不改变实际分频结果。
+
 ### `anchor`
 
 控制 GINN 低频 anchor 的生成：
@@ -128,7 +141,15 @@ well_constraints:
 
 低频 anchor 的目标值来自分频后的低频 log-AI，而不是原始全频井曲线。这样它不会和第八步网络学习的高频残差互相争抢职责。
 
-第一版默认只有直井进入低频 anchor 文件；斜井进入点级事实、高频监督和高频统计，但不进入低频 anchor。
+第一版默认只有直井进入低频 anchor 文件；斜井只进入点级事实和 LFM 控制点候选，不进入 GINN 低频 anchor，也不进入 enhance 高频监督和高频统计。平台斜井很容易与直井落到同一批近邻地震道，默认排除可以避免训练监督冲突。
+
+### `high_supervision`
+
+控制 enhance 高频监督和高频统计的来源：
+
+| 参数 | 含义 |
+|------|------|
+| `include_deviated` | 是否允许斜井进入 `well_high_supervision_time.npz` 和 `well_high_stats_*`。默认关闭 |
 
 ### `conflicts`
 
@@ -213,10 +234,10 @@ well_constraints:
 
 ### 第五阶段：高频监督与统计输出
 
-从同一个点级事实表中，同时产出三套材料：
+从点级事实表中筛选训练材料，默认只使用直井点，同时产出三套材料：
 
 1. **逐点监督真值**：每口井每个样点上的高频残余值，写成 enhance 训练可读取的监督数据包。样点带有井名、空间位置、权重和层段归属标记。
-2. **全窗和分层统计**：对全部井的高频残余做全局统计；再按每个层段分别统计。统计项包括振幅分布、事件密度、正负状态持续长度、转移矩阵、反射系数量级和频谱。
+2. **全窗和分层统计**：对入选训练点的高频残余做全局统计；再按每个层段分别统计。统计项包括振幅分布、事件密度、正负状态持续长度、转移矩阵、反射系数量级和频谱。
 3. **收缩参数**：每层的经验统计按其可靠度向全窗统计收缩——可靠度高的层主要相信自己，可靠度低的层更多借用全窗先验。收缩因子一并写出。
 
 可靠度由有效井数、有效样点数、事件数和空间覆盖共同决定。小样本层如果完全相信自身的经验统计，后续 enhance 合成器生成的样本会过拟合；向全窗收缩可以在信息不足时借用先验。
@@ -243,10 +264,10 @@ well_constraints:
 | `well_anchor_conflicts.csv` | 同一道位置 / 样点位置的井间冲突明细 |
 | `well_anchor_trace_summary.csv` | 每条受控道的井数、样点数和权重统计 |
 | `log_ai_anchor_time.npz` | GINN 训练可直接读取的低频井监督数据包 |
-| `well_high_supervision_time.npz` | enhance 训练可直接读取的高频井监督数据包 |
-| `well_high_stats_global.json` | 全目标窗高频残余统计 |
-| `well_high_stats_by_layer.csv` | 每层的经验统计和可靠度 |
-| `well_high_stats_shrinkage.json` | 每层收缩后的最终生成参数 |
+| `well_high_supervision_time.npz` | enhance 训练可直接读取的高频井监督数据包，默认只含直井 |
+| `well_high_stats_global.json` | 全目标窗高频残余统计，默认只含直井 |
+| `well_high_stats_by_layer.csv` | 每层的经验统计和可靠度，默认只含直井 |
+| `well_high_stats_shrinkage.json` | 每层收缩后的最终生成参数，默认只含直井 |
 | `well_high_motif_manifest.csv` | motif patch 清单（第一版为空占位） |
 | `lfm_layer_control_points.csv` | 第七步 LFM 读取的控制点文件 |
 | `lfm_control_qc.csv` | 逐井筛选结果和控制点数量 |
@@ -289,7 +310,7 @@ well_constraints:
 
 ### `well_high_supervision_time.npz`
 
-enhance 训练读取的高频井监督数据包，包含每个受控样点上的全频 log-AI、低频成分、高频残余、掩码、权重和井名。样点保留层段归属标记，训练端可以按批抽取真实井位置，计算增强后的高频残余并与井上高频残余做对比损失。
+enhance 训练读取的高频井监督数据包，使用 `well_high_supervision_v1` schema。它只包含井上的全频 log-AI、低频 log-AI、高频 log-AI、掩码、权重、采样轴和井名 / 道位置，不包含 LFM 或 base AI 字段。默认只使用直井样点；斜井样点保留在点级事实表中，但不写入该训练包。训练端若需要底阻抗输入，应读取第七步 LFM 或 GINN 输出。
 
 ### `well_high_stats_by_layer.csv`
 
@@ -316,7 +337,7 @@ enhance 训练读取的高频井监督数据包，包含每个受控样点上的
 
 ### 第二步：看 `well_high_supervision_qc.csv`
 
-确认每口井的入选状态和拒绝原因。常见拒绝原因：
+确认每口井的入选状态和拒绝原因。`status=selected` 表示该井进入点级事实表和 LFM 候选；是否实际进入 enhance 训练材料看 `high_supervision_eligible` 和 `high_supervision_point_count`。默认配置下，斜井即使点级事实入选，这两项也会显示未进入高频监督。常见拒绝原因：
 
 - `batch_corr_below_threshold`：批量合成相关系数不够
 - `missing_filtered_las_file`：缺少滤波 LAS

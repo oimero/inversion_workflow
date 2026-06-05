@@ -1,10 +1,10 @@
-"""Reusable synthetic helpers for resolution-enhancement experiments."""
+"""Legacy depth synthetic helpers for resolution-enhancement experiments."""
 
 from __future__ import annotations
 
 import numpy as np
 
-from enhance.prior import (
+from ginn_depth.prior import (
     WellResolutionPriorBundle,
     edge_taper,
     fit_delta_to_base_ai_bounds,

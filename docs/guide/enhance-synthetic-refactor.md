@@ -8,7 +8,7 @@
 
 ## 当前原型的问题
 
-深度域原型已经具备一个可工作的 enhance synthetic dataset：它读取 stage-1 base AI、井高频 prior、子波和目标 mask，生成 `target_delta_log_ai`、`target_ai` 和 `target_seismic`，再训练模型把 base 输入增强到目标高频。
+深度域原型已经具备一个可工作的 enhance synthetic dataset：它读取 stage-1 base AI、井高频材料、子波和目标 mask，生成 `target_delta_log_ai`、`target_ai` 和 `target_seismic`，再训练模型把 base 输入增强到目标高频。
 
 当前思路的主要风险不在“不能合成”，而在分层化之后：
 
@@ -61,7 +61,7 @@
 | `well_high_stats_global.json` | 全目标窗默认生成参数 |
 | `well_high_stats_by_layer.csv` | 每层经验统计和可靠度 |
 | `well_high_stats_shrinkage.json` | 每层最终生成参数 |
-| `well_high_supervision_time.npz` | 只供训练监督项使用，不作为 synthetic 主体 |
+| `well_high_supervision_time.npz` | 井高频监督包，只供训练监督项使用，不作为 synthetic 主体 |
 
 可选读取：
 

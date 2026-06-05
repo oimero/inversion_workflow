@@ -160,12 +160,18 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     return output_root / f"wavelet_generation_{timestamp}"
 
 
-def _discover_latest_dir(cfg: dict[str, Any], prefix: str) -> Path:
+def _discover_latest_dir(cfg: dict[str, Any], prefix: str, required_files: Sequence[str]) -> Path:
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
-    candidates = sorted([path for path in output_root.glob(f"{prefix}_*") if path.is_dir()], key=lambda p: p.name)
+    candidates = [
+        path
+        for path in output_root.glob(f"{prefix}_*")
+        if path.is_dir() and all((path / required_file).exists() for required_file in required_files)
+    ]
     if not candidates:
-        raise FileNotFoundError(f"No {prefix}_* output directory found under {output_root}.")
-    return candidates[-1]
+        raise FileNotFoundError(
+            f"No {prefix}_* output directory containing {list(required_files)} found under {output_root}."
+        )
+    return sorted(candidates, key=lambda p: (p.stat().st_mtime, p.name))[-1]
 
 
 def _resolve_source_dirs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str, Path]:
@@ -176,7 +182,11 @@ def _resolve_source_dirs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dic
     auto_tie_dir = (
         _resolve_repo_path(source_runs["well_auto_tie_dir"])
         if source_runs.get("well_auto_tie_dir") is not None
-        else _discover_latest_dir(cfg, "well_auto_tie")
+        else _discover_latest_dir(
+            cfg,
+            "well_auto_tie",
+            ["well_tie_plan.csv", "well_tie_metrics.csv", "wavelet_inventory.csv"],
+        )
     )
     return {"auto_tie_dir": auto_tie_dir}
 

@@ -555,7 +555,7 @@ def main() -> None:
     import torch
 
     from enhance.config import EnhancementConfig
-    from enhance.prior import load_well_resolution_prior_npz
+    from ginn_depth.prior import load_well_resolution_prior_npz
     from ginn_depth.enhance import build_depth_enhancement_bundle
 
     config_path = args.config if args.config.is_absolute() else REPO_ROOT / args.config

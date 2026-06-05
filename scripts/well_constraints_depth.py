@@ -44,7 +44,7 @@ from cup.petrel.load import import_well_heads_petrel
 from cup.seismic.survey import open_survey
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename
 from cup.utils.raw_trace import centered_moving_average
-from enhance.prior import (
+from ginn_depth.prior import (
     WellResolutionPriorBundle,
     save_well_resolution_prior_npz,
     summarize_well_resolution_prior,

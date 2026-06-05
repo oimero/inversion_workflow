@@ -1020,7 +1020,7 @@ def main() -> None:
     torch = torch_module
 
     from enhance.config import EnhancementConfig
-    from enhance.prior import load_well_resolution_prior_npz
+    from ginn_depth.prior import load_well_resolution_prior_npz
     from ginn_depth.enhance import build_depth_enhancement_bundle
 
     if args.num_samples <= 0:

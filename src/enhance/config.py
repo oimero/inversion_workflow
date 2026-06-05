@@ -27,8 +27,8 @@ class EnhancementConfig:
     # ── 合成数据来源 ─────────────────────────────────────────
     # depth_config_file 只用于复用 depth GINN 的地震、层位、Vp、子波、gain、
     # 几何和 mask/taper 数据工程；base_ai_file 会被接到原 GINN 的 AI LFM
-    # 槽位，作为 stage-2 的低频/base 阻抗。resolution_prior_file 提供井上
-    # high-resolution log-AI residual 先验，用来构造 synthetic delta 目标。
+    # 槽位，作为 stage-2 的低频/base 阻抗。resolution_prior_file 指向
+    # ginn_depth.prior 的 legacy depth resolution prior，用来构造 synthetic delta 目标。
     depth_config_file: Path = Path("experiments/ginn_depth/train.yaml")  # depth GINN 数据配置。
     base_ai_file: Path = Path("your_stage1_base_ai_depth.npz")  # stage-1 GINN 输出的 base AI。
     resolution_prior_file: Path = Path("your_well_resolution_prior.npz")  # 井分辨率残差先验。

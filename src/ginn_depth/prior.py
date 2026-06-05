@@ -1,8 +1,9 @@
-"""High-resolution well prior schema and reusable log-AI / synthetic utilities.
+"""Legacy depth-domain resolution-prior schema and synthetic utilities.
 
-This module is the canonical home for the stage-2 resolution-enhancement
-well prior: schema definitions, NPZ I/O, validation, and the thin-bed
-random-synthetic helpers (reflectivity generation, AI bounds fitting, etc.).
+This module keeps the depth-domain stage-2 resolution prior used by the
+existing depth enhancement path.  Time-domain step 06 writes
+``enhance.supervision.WellHighSupervisionBundle`` instead; do not reuse this
+legacy schema for time-domain high-frequency well supervision.
 """
 
 from __future__ import annotations

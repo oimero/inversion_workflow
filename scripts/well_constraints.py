@@ -49,7 +49,11 @@ from cup.well.tie import load_saved_seismic_trace_csv
 from cup.well.wavelet import load_wavelet_csv
 # Step 06 depends on downstream bundle schemas only. Keep GINN/enhance training
 # logic out of this script; move schemas to a neutral package when they stabilize.
-from enhance.prior import WellResolutionPriorBundle, save_well_resolution_prior_npz, validate_well_resolution_prior
+from enhance.supervision import (
+    WellHighSupervisionBundle,
+    save_well_high_supervision_npz,
+    validate_well_high_supervision,
+)
 from ginn.anchor import build_log_ai_anchor_bundle, save_log_ai_anchor_npz, validate_log_ai_anchor
 from wtie.modeling.modeling import ConvModeler
 from wtie.processing import grid
@@ -82,6 +86,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "qc_envelope_window_samples": 31,
     },
     "anchor": {"include_deviated": False, "min_points_per_trace": 2},
+    "high_supervision": {"include_deviated": False},
     "conflicts": {"strategy": "weighted_average"},
     "weights": {"mode": "corr", "corr_floor": 0.3, "corr_span": 0.4, "corr_min_weight": 0.6},
     "lfm_controls": {"n_slices": 20, "min_control_samples_per_well": 16},
@@ -131,6 +136,27 @@ def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[
         else resolve_relative_path(wavelet_value, root=REPO_ROOT)
     )
     return {"well_auto_tie_dir": auto_dir, "wavelet_generation_dir": wavelet_dir}
+
+
+def _validate_wavelet_generation_source(*, auto_dir: Path, wavelet_dir: Path) -> None:
+    summary_candidates = [
+        wavelet_dir / "run_summary.json",
+        wavelet_dir / "selected_wavelet_summary.json",
+    ]
+    summary_path = next((path for path in summary_candidates if path.exists()), None)
+    if summary_path is None:
+        return
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    source_value = summary.get("source_auto_tie_dir")
+    if not source_value:
+        return
+    source_dir = resolve_relative_path(source_value, root=REPO_ROOT)
+    if source_dir.resolve() != auto_dir.resolve():
+        raise ValueError(
+            "wavelet_generation source_auto_tie_dir does not match well_constraints auto-tie input: "
+            f"wavelet_generation={source_dir}, well_constraints={auto_dir}. "
+            "Set well_constraints.source_runs.well_auto_tie_dir and wavelet_generation_dir to matching runs."
+        )
 
 
 def _resolve_artifact_path(value: Any, *, run_dir: Path) -> Path | None:
@@ -661,7 +687,7 @@ def _make_high_supervision_bundle(
     point_df: pd.DataFrame,
     samples: np.ndarray,
     metadata: dict[str, Any],
-) -> WellResolutionPriorBundle:
+) -> WellHighSupervisionBundle:
     arrays, _summary_df = aggregate_trace_arrays(
         point_df,
         samples,
@@ -677,44 +703,31 @@ def _make_high_supervision_bundle(
             arr = np.asarray(value)
             if arr.ndim >= 1 and arr.shape[0] == keep.size:
                 arrays[key] = arr[keep]
-    n_trace = int(arrays["flat_indices"].size)
     n_sample = int(samples.size)
-    lfm_zero = np.zeros((n_trace, n_sample), dtype=np.float32)
     mask = arrays["mask"].astype(bool)
-    well_ai = np.zeros((n_trace, n_sample), dtype=np.float32)
-    well_ai[mask] = np.exp(arrays["log_ai_full"][mask]).astype(np.float32)
-    residual = arrays["well_high_log_ai"].astype(np.float32)
-    bundle = WellResolutionPriorBundle(
+    samples_1d = np.asarray(samples, dtype=np.float32)
+    bundle = WellHighSupervisionBundle(
         sample_domain="time",
         sample_unit="s",
-        samples=np.asarray(samples, dtype=np.float32),
+        samples=samples_1d,
         flat_indices=arrays["flat_indices"],
-        well_log_ai=arrays["log_ai_full"].astype(np.float32),
-        lfm_log_ai=lfm_zero,
-        residual_log_ai=residual,
-        well_ai=well_ai,
-        well_low_ai=arrays["well_low_ai"].astype(np.float32),
-        well_low_log_ai=arrays["well_low_log_ai"].astype(np.float32),
-        well_high_log_ai=residual,
-        lfm_ai=np.zeros_like(well_ai, dtype=np.float32),
-        well_mask=mask,
-        well_weight=arrays["weight"].astype(np.float32),
-        highres_depth=np.tile(np.asarray(samples, dtype=np.float32), (n_trace, 1)),
-        highres_well_ai=well_ai.copy(),
-        highres_well_log_ai=arrays["log_ai_full"].astype(np.float32),
-        highres_well_low_ai=arrays["well_low_ai"].astype(np.float32),
-        highres_well_low_log_ai=arrays["well_low_log_ai"].astype(np.float32),
-        highres_well_high_log_ai=residual.copy(),
-        highres_lfm_log_ai=lfm_zero.copy(),
-        highres_residual_log_ai=residual.copy(),
-        highres_well_mask=mask.copy(),
         well_names=arrays["well_names"],
         inline=arrays["inline"],
         xline=arrays["xline"],
+        well_log_ai=arrays["log_ai_full"].astype(np.float32),
+        well_low_log_ai=arrays["well_low_log_ai"].astype(np.float32),
+        well_high_log_ai=arrays["well_high_log_ai"].astype(np.float32),
+        well_mask=mask,
+        well_weight=arrays["weight"].astype(np.float32),
+        native_samples=samples_1d.copy(),
+        native_well_log_ai=arrays["log_ai_full"].astype(np.float32),
+        native_well_low_log_ai=arrays["well_low_log_ai"].astype(np.float32),
+        native_well_high_log_ai=arrays["well_high_log_ai"].astype(np.float32),
+        native_well_mask=mask.copy(),
         summary=high_frequency_stats(point_df, sample_step_s=float(np.median(np.diff(samples))) if samples.size > 1 else None),
         metadata=metadata,
     )
-    validate_well_resolution_prior(bundle, sample_domain="time", n_sample=n_sample)
+    validate_well_high_supervision(bundle, sample_domain="time", n_sample=n_sample)
     return bundle
 
 
@@ -746,6 +759,7 @@ def main() -> None:
 
     auto_dir = source_dirs["well_auto_tie_dir"]
     wavelet_dir = source_dirs["wavelet_generation_dir"]
+    _validate_wavelet_generation_source(auto_dir=auto_dir, wavelet_dir=wavelet_dir)
     metrics_df = pd.read_csv(auto_dir / "well_tie_metrics.csv")
     plan_df = pd.read_csv(auto_dir / "well_tie_plan.csv") if (auto_dir / "well_tie_plan.csv").exists() else pd.DataFrame()
     batch_df = pd.read_csv(wavelet_dir / "batch_synthetic_metrics.csv")
@@ -760,6 +774,7 @@ def main() -> None:
     min_points = int(script_cfg["lfm_controls"].get("min_control_samples_per_well", 16))
     weights_cfg = dict(script_cfg.get("weights") or {})
     include_deviated_anchor = bool(script_cfg.get("anchor", {}).get("include_deviated", False))
+    include_deviated_high = bool(script_cfg.get("high_supervision", {}).get("include_deviated", False))
 
     point_frames: list[pd.DataFrame] = []
     qc_rows: list[dict[str, Any]] = []
@@ -891,6 +906,11 @@ def main() -> None:
         script_cfg=script_cfg,
     )
     point_df = apply_frequency_split(raw_points, split_cfg)
+    high_points = (
+        point_df.copy()
+        if include_deviated_high
+        else point_df.loc[~point_df["source"].astype(str).eq("deviated_trajectory")].copy()
+    )
 
     qc_split_rows: list[dict[str, Any]] = []
     freq_cfg = dict(script_cfg.get("frequency_split") or {})
@@ -902,6 +922,11 @@ def main() -> None:
         )
     qc_split_by_well = {row["well_name"]: row for row in qc_split_rows}
     qc_df = pd.DataFrame(qc_rows)
+    high_counts_by_well = high_points.groupby("well_name").size().to_dict() if not high_points.empty else {}
+    qc_df["high_supervision_point_count"] = [
+        int(high_counts_by_well.get(str(well_name), 0)) for well_name in qc_df["well_name"]
+    ]
+    qc_df["high_supervision_eligible"] = qc_df["high_supervision_point_count"].gt(0)
     for key in ["frequency_split_qc_trace_path", "frequency_split_qc_figure_path"]:
         qc_df[key] = [qc_split_by_well.get(str(w), {}).get(key) for w in qc_df["well_name"]]
 
@@ -917,7 +942,7 @@ def main() -> None:
     conflicts_path = output_dir / "well_anchor_conflicts.csv"
     conflicts.to_csv(conflicts_path, index=False, encoding="utf-8-sig")
 
-    high_conflicts = build_point_conflict_report(point_df, value_col="well_high_log_ai")
+    high_conflicts = build_point_conflict_report(high_points, value_col="well_high_log_ai")
     high_conflicts_path = output_dir / "well_high_supervision_conflicts.csv"
     high_conflicts.to_csv(high_conflicts_path, index=False, encoding="utf-8-sig")
 
@@ -966,25 +991,31 @@ def main() -> None:
     anchor_path = output_dir / "log_ai_anchor_time.npz"
     save_log_ai_anchor_npz(anchor_path, anchor_bundle)
 
-    prior_metadata = {
+    supervision_metadata = {
         "created_at_utc": anchor_metadata["created_at_utc"],
         "source_script": Path(__file__).name,
         "artifact_family": "well_constraints_time",
         "artifact_role": "well_high_supervision",
-        "schema_compatibility": "ginn_well_resolution_prior_v3",
+        "schema_compatibility": "well_high_supervision_v1",
         "sample_domain": "time",
-        "highres_depth_field_semantics": "TWT seconds, kept under legacy field name for enhance.prior compatibility",
-        "lfm_fields_available": False,
-        "lfm_fields_note": "Step 06 runs before LFM. lfm_log_ai, lfm_ai, and highres_lfm_log_ai are zero placeholders and must not be used as base AI.",
+        "include_deviated": include_deviated_high,
+        "excluded_sources": [] if include_deviated_high else ["deviated_trajectory"],
+        "native_sample_semantics": "TWT seconds; native_samples currently matches samples in time-domain step 06.",
+        "base_ai_fields_available": False,
+        "base_ai_fields_note": "This package contains well high-frequency supervision only. Read base AI from LFM or GINN outputs.",
         "frequency_split": anchor_metadata["frequency_split"],
         "point_table": repo_relative_path(point_path, root=REPO_ROOT),
         "high_conflicts": repo_relative_path(high_conflicts_path, root=REPO_ROOT),
     }
-    prior_bundle = _make_high_supervision_bundle(point_df=point_df, samples=samples, metadata=prior_metadata)
-    prior_path = output_dir / "well_high_supervision_time.npz"
-    save_well_resolution_prior_npz(prior_path, prior_bundle)
+    supervision_bundle = _make_high_supervision_bundle(
+        point_df=high_points,
+        samples=samples,
+        metadata=supervision_metadata,
+    )
+    supervision_path = output_dir / "well_high_supervision_time.npz"
+    save_well_high_supervision_npz(supervision_path, supervision_bundle)
 
-    global_stats, layer_stats_df, shrinkage = layer_shrinkage_stats(point_df, sample_step_s=sample_step_s)
+    global_stats, layer_stats_df, shrinkage = layer_shrinkage_stats(high_points, sample_step_s=sample_step_s)
     global_stats_path = output_dir / "well_high_stats_global.json"
     layer_stats_path = output_dir / "well_high_stats_by_layer.csv"
     shrinkage_path = output_dir / "well_high_stats_shrinkage.json"
@@ -1053,10 +1084,23 @@ def main() -> None:
             "report": repo_relative_path(conflicts_path, root=REPO_ROOT),
             "high_supervision_conflict_count": int(len(high_conflicts)),
             "high_supervision_report": repo_relative_path(high_conflicts_path, root=REPO_ROOT),
+            "high_supervision_include_deviated": include_deviated_high,
         },
         "counts": {
             "selected_wells": int(qc_df["control_point_count"].gt(0).sum()),
             "point_count": int(len(point_df)),
+            "deviated_point_count": int(point_df["source"].astype(str).eq("deviated_trajectory").sum()),
+            "high_supervision_point_count": int(len(high_points)),
+            "high_supervision_deviated_point_count": int(
+                high_points["source"].astype(str).eq("deviated_trajectory").sum()
+            )
+            if not high_points.empty
+            else 0,
+            "excluded_deviated_high_supervision_point_count": int(
+                point_df["source"].astype(str).eq("deviated_trajectory").sum()
+            )
+            if not include_deviated_high
+            else 0,
             "anchor_trace_count": int(anchor_bundle.n_anchors),
             "lfm_control_point_count": int(len(lfm_control_df)),
             "lfm_aggregated_point_count": int(lfm_aggregated_count),
@@ -1067,7 +1111,7 @@ def main() -> None:
             "well_anchor_points": repo_relative_path(anchor_points_path, root=REPO_ROOT),
             "well_anchor_conflicts": repo_relative_path(conflicts_path, root=REPO_ROOT),
             "well_anchor_trace_summary": repo_relative_path(anchor_trace_summary_path, root=REPO_ROOT),
-            "well_high_supervision_time": repo_relative_path(prior_path, root=REPO_ROOT),
+            "well_high_supervision_time": repo_relative_path(supervision_path, root=REPO_ROOT),
             "well_high_supervision_conflicts": repo_relative_path(high_conflicts_path, root=REPO_ROOT),
             "well_high_supervision_qc": repo_relative_path(qc_path, root=REPO_ROOT),
             "well_high_stats_global": repo_relative_path(global_stats_path, root=REPO_ROOT),

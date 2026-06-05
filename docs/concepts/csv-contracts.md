@@ -77,7 +77,7 @@
 
 ## `well_constraint_points.csv`
 
-第六步写出的点级井约束事实表。它是低频 anchor、高频井监督、高频统计和 LFM 控制点的共同来源。
+第六步写出的点级井约束事实表。它是低频 anchor、高频井监督、高频统计和 LFM 控制点的共同来源。默认训练材料只使用直井点；斜井点保留在事实表中用于审计和 LFM 控制点候选，不默认进入 GINN 或 enhance 训练。
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -124,7 +124,7 @@
 
 ## `well_high_supervision_qc.csv`
 
-逐井入选结果和质量控制摘要，每口候选井一行。
+逐井入选结果和质量控制摘要，每口候选井一行。`status=selected` 表示该井进入点级事实表和 LFM 候选；若该井为斜井，在默认配置下仍不会进入 `well_high_supervision_time.npz` 和 `well_high_stats_*`。
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -133,6 +133,8 @@
 | `route` | 第四步标定路径 |
 | `batch_corr` / `batch_nmae` | 第五步批量合成指标 |
 | `control_point_count` | 有效样点数 |
+| `high_supervision_eligible` | 是否实际进入 enhance 高频监督和高频统计；默认斜井为 false |
+| `high_supervision_point_count` | 实际进入 enhance 高频监督和高频统计的样点数 |
 | `invalid_point_count` / `invalid_point_fraction` | 无效样点数及比例 |
 | `unique_trace_count` | 样点覆盖的唯一道数；斜井应大于 1 |
 | `reasons` | 分号分隔的拒绝或失败原因 |

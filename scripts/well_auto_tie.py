@@ -527,6 +527,108 @@ def _target_tie_window_for_plan(
     )
 
 
+def _target_tie_window_for_trajectory(
+    *,
+    plan: WellTiePlan,
+    survey: Any,
+    config: dict[str, Any],
+    horizon_cache: dict[str, HorizonSurface],
+    data_root: Path,
+    trajectory: WellTrajectory,
+    table: grid.TimeDepthTable,
+) -> TargetTieWindow:
+    """Build the target window from horizon samples along a deviated trajectory."""
+    if not getattr(table, "is_md_domain", False):
+        raise ValueError("Trajectory target window expects an MD-domain TDT.")
+
+    target_cfg = dict(config["target_interval"])
+    top_value, top_name = _target_horizon_spec(config, "top")
+    bottom_value, bottom_name = _target_horizon_spec(config, "bottom")
+    top_surface = _load_horizon_surface(_target_horizon_path(top_value, data_root=data_root), horizon_cache)
+    bottom_surface = _load_horizon_surface(_target_horizon_path(bottom_value, data_root=data_root), horizon_cache)
+    unit = str(target_cfg.get("twt_unit", "auto"))
+
+    table_twt = np.asarray(table.twt, dtype=np.float64)
+    table_md = np.asarray(table.md, dtype=np.float64)
+    sample_axis = np.asarray(survey.sample_axis("time").values, dtype=np.float64)
+    in_table = (sample_axis >= float(table_twt[0])) & (sample_axis <= float(table_twt[-1]))
+    twt_axis = sample_axis[in_table]
+    if twt_axis.size == 0:
+        raise ValueError("No seismic time samples overlap the deviated-well TDT range.")
+
+    md_axis = np.interp(twt_axis, table_twt, table_md)
+    in_trajectory = (md_axis >= float(trajectory.md_m[0])) & (md_axis <= float(trajectory.md_m[-1]))
+    twt_axis = twt_axis[in_trajectory]
+    if twt_axis.size == 0:
+        raise ValueError("No TDT samples overlap the deviated-well trajectory MD range.")
+
+    samples = sample_trajectory_on_twt(trajectory.with_well_name(plan.well_name), table, twt_axis)
+    rows = samples.rows
+    top_twt_values: list[float] = []
+    bottom_twt_values: list[float] = []
+    sample_twt_values: list[float] = []
+    top_methods: list[str] = []
+    bottom_methods: list[str] = []
+    top_distances: list[float] = []
+    bottom_distances: list[float] = []
+
+    for _, row in rows.iterrows():
+        try:
+            inline_float, xline_float = survey.line_geometry.coord_to_line(float(row["x_m"]), float(row["y_m"]))
+            top_sample = top_surface.sample_at_line(inline_float, xline_float)
+            bottom_sample = bottom_surface.sample_at_line(inline_float, xline_float)
+        except ValueError:
+            continue
+
+        top_twt = normalize_twt_seconds(float(top_sample["value"]), unit=unit)
+        bottom_twt = normalize_twt_seconds(float(bottom_sample["value"]), unit=unit)
+        if bottom_twt < top_twt:
+            top_twt, bottom_twt = bottom_twt, top_twt
+        twt_s = float(row["twt_s"])
+        if top_twt <= twt_s <= bottom_twt:
+            top_twt_values.append(float(top_twt))
+            bottom_twt_values.append(float(bottom_twt))
+            sample_twt_values.append(twt_s)
+            top_methods.append(str(top_sample["method"]))
+            bottom_methods.append(str(bottom_sample["method"]))
+            top_distances.append(float(top_sample["nearest_line_distance"]))
+            bottom_distances.append(float(bottom_sample["nearest_line_distance"]))
+
+    if not sample_twt_values:
+        raise ValueError(
+            f"No deviated trajectory samples fall inside target horizons {top_name!r} and {bottom_name!r} "
+            f"for well {plan.well_name}."
+        )
+
+    top_twt = float(np.nanmin(top_twt_values))
+    bottom_twt = float(np.nanmax(bottom_twt_values))
+    if bottom_twt < top_twt:
+        top_twt, bottom_twt = bottom_twt, top_twt
+    margin_top_s = float(target_cfg.get("margin_top_ms", 100.0)) / 1000.0
+    margin_bottom_s = float(target_cfg.get("margin_bottom_ms", 100.0)) / 1000.0
+    start_s = max(0.0, top_twt - margin_top_s)
+    end_s = bottom_twt + margin_bottom_s
+    if end_s <= start_s:
+        raise ValueError(f"Invalid deviated trajectory target window [{start_s}, {end_s}] for well {plan.well_name}.")
+
+    top_method = "trajectory:" + ",".join(sorted(set(top_methods)))
+    bottom_method = "trajectory:" + ",".join(sorted(set(bottom_methods)))
+    return TargetTieWindow(
+        top_name=top_name,
+        bottom_name=bottom_name,
+        top_twt_s=top_twt,
+        bottom_twt_s=bottom_twt,
+        start_s=start_s,
+        end_s=end_s,
+        margin_top_s=margin_top_s,
+        margin_bottom_s=margin_bottom_s,
+        top_sample_method=top_method,
+        bottom_sample_method=bottom_method,
+        top_nearest_line_distance=float(np.nanmax(top_distances)) if top_distances else None,
+        bottom_nearest_line_distance=float(np.nanmax(bottom_distances)) if bottom_distances else None,
+    )
+
+
 # =============================================================================
 # Output helpers
 # =============================================================================
@@ -1027,13 +1129,6 @@ def _run_deviated_with_tdt(
     logset_md = load_vp_rho_logset_from_standard_las(input_las)
     table = load_petrel_time_depth_table(time_depth_file, domain="md")
     trajectory = WellTrajectory.from_petrel_trace(trace_file).with_well_name(plan.well_name)
-    target_window = _target_tie_window_for_plan(
-        plan=plan,
-        survey=survey,
-        config=config,
-        horizon_cache=horizon_cache,
-        data_root=data_root,
-    )
     table, coarse_report, anchor_info = _apply_coarse_correction_to_existing_tdt(
         plan=plan,
         table=table,
@@ -1045,6 +1140,15 @@ def _run_deviated_with_tdt(
         horizon_cache=horizon_cache,
         data_root=data_root,
         trajectory=trajectory,
+    )
+    target_window = _target_tie_window_for_trajectory(
+        plan=plan,
+        survey=survey,
+        config=config,
+        horizon_cache=horizon_cache,
+        data_root=data_root,
+        trajectory=trajectory,
+        table=table,
     )
     if not tdt_overlaps_window(table, target_window):
         raise ValueError("tdt_no_target_window_overlap")

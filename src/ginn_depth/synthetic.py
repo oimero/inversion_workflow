@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import Dataset
 
 from cup.utils.raw_trace import centered_moving_average
-from enhance.prior import (
+from ginn_depth.prior import (
     WellResolutionPriorBundle,
     ai_to_reflectivity,
     load_well_resolution_prior_npz,

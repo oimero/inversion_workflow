@@ -271,25 +271,125 @@ def _validate_time_lfm_contract(
         )
 
 
-def load_dynamic_gain_model(gain_model_file: Path) -> np.ndarray:
-    """Load a precomputed dynamic gain volume from ``.npz`` or ``.npy``."""
+def _validate_dynamic_gain_npz_contract(
+    *,
+    gain_path: Path,
+    archive: Any,
+    volume: np.ndarray,
+    seismic_geometry: dict[str, Any] | None,
+) -> None:
+    """Validate time-domain dynamic gain schema and axis metadata."""
+    required_keys = {"metadata_json", "geometry_json", "samples", "inline", "xline"}
+    missing = required_keys - set(archive.files)
+    if missing:
+        raise ValueError(f"Dynamic gain NPZ is missing required keys {sorted(missing)}: {gain_path}")
+
+    metadata = _json_scalar_to_dict(archive["metadata_json"])
+    expected = {
+        "schema_version": "dynamic_gain_v1",
+        "sample_domain": "time",
+        "sample_unit": "s",
+        "normalization": "seismic_raw_divided_by_train_mask_rms",
+        "gain_model_is_relative_to_fixed_gain": False,
+    }
+    for key, expected_value in expected.items():
+        actual = metadata.get(key)
+        if actual != expected_value:
+            raise ValueError(
+                f"Dynamic gain metadata field {key!r} must be {expected_value!r}, got {actual!r}: {gain_path}"
+            )
+    if metadata.get("gain_reference") != "unit_wavelet_synthetic_to_normalized_observation":
+        raise ValueError(
+            "Dynamic gain metadata gain_reference must be "
+            "'unit_wavelet_synthetic_to_normalized_observation'."
+        )
+    train_mask_rms = float(metadata.get("train_mask_rms", np.nan))
+    if not np.isfinite(train_mask_rms) or train_mask_rms <= 0.0:
+        raise ValueError(f"Dynamic gain metadata train_mask_rms must be positive finite, got {train_mask_rms}.")
+
+    if seismic_geometry is None:
+        return
+
+    expected_shape = (
+        int(seismic_geometry["n_il"]),
+        int(seismic_geometry["n_xl"]),
+        int(seismic_geometry["n_sample"]),
+    )
+    if tuple(volume.shape) != expected_shape:
+        raise ValueError(f"Dynamic gain volume shape {volume.shape} does not match seismic geometry {expected_shape}.")
+
+    gain_geometry = _json_scalar_to_dict(archive["geometry_json"])
+    for key in ("sample_domain", "sample_unit", "n_il", "n_xl", "n_sample"):
+        if str(gain_geometry.get(key)) != str(seismic_geometry.get(key)):
+            raise ValueError(
+                f"Dynamic gain geometry_json.{key}={gain_geometry.get(key)!r} "
+                f"does not match seismic geometry {seismic_geometry.get(key)!r}."
+            )
+
+    n_sample = int(seismic_geometry["n_sample"])
+    samples = np.asarray(archive["samples"], dtype=np.float64)
+    expected_samples = float(seismic_geometry["sample_min"]) + np.arange(n_sample, dtype=np.float64) * float(
+        seismic_geometry["sample_step"]
+    )
+    if samples.shape != (n_sample,):
+        raise ValueError(f"Dynamic gain samples shape {samples.shape} does not match n_sample={n_sample}.")
+    if np.any(~np.isfinite(samples)) or np.any(np.diff(samples) <= 0.0):
+        raise ValueError("Dynamic gain samples axis must be finite and strictly increasing.")
+    if not np.allclose(samples, expected_samples, rtol=0.0, atol=1e-6):
+        max_diff = float(np.max(np.abs(samples - expected_samples)))
+        raise ValueError(f"Dynamic gain samples axis does not match seismic time axis (max_abs_diff={max_diff:.6g}s).")
+
+    axis_specs = {
+        "inline": (
+            int(seismic_geometry["n_il"]),
+            float(seismic_geometry["inline_min"]),
+            float(seismic_geometry["inline_step"]),
+        ),
+        "xline": (
+            int(seismic_geometry["n_xl"]),
+            float(seismic_geometry["xline_min"]),
+            float(seismic_geometry["xline_step"]),
+        ),
+    }
+    for axis_name, (axis_size, axis_min, axis_step) in axis_specs.items():
+        axis = np.asarray(archive[axis_name], dtype=np.float64)
+        expected_axis = axis_min + np.arange(axis_size, dtype=np.float64) * axis_step
+        if axis.shape != (axis_size,):
+            raise ValueError(
+                f"Dynamic gain {axis_name} axis shape {axis.shape} does not match expected {(axis_size,)}."
+            )
+        if np.any(~np.isfinite(axis)):
+            raise ValueError(f"Dynamic gain {axis_name} axis must be finite.")
+        if not np.allclose(axis, expected_axis, rtol=0.0, atol=1e-6):
+            max_diff = float(np.max(np.abs(axis - expected_axis)))
+            raise ValueError(
+                f"Dynamic gain {axis_name} axis does not match seismic geometry (max_abs_diff={max_diff:.6g})."
+            )
+
+
+def load_dynamic_gain_model(gain_model_file: Path, seismic_geometry: dict[str, Any] | None = None) -> np.ndarray:
+    """Load a time-domain ``dynamic_gain_v1`` NPZ volume."""
     gain_path = Path(gain_model_file)
     if not gain_path.exists():
         raise FileNotFoundError(gain_path)
 
-    suffix = gain_path.suffix.lower()
-    if suffix == ".npy":
-        volume = np.load(gain_path, allow_pickle=False)
-    elif suffix == ".npz":
-        with np.load(gain_path, allow_pickle=False) as archive:
-            if "volume" not in archive.files:
-                raise ValueError(f"Expected key 'volume' in dynamic gain model archive, got {archive.files}.")
-            volume = archive["volume"]
-            if "metadata_json" in archive.files:
-                metadata = json.loads(np.asarray(archive["metadata_json"]).item())
-                logger.info("Loaded dynamic gain metadata: %s", metadata)
-    else:
-        raise ValueError(f"Unsupported dynamic gain model file type: {gain_path.suffix}")
+    if gain_path.suffix.lower() != ".npz":
+        raise ValueError(
+            f"Dynamic gain model must be a dynamic_gain_v1 .npz file, got suffix {gain_path.suffix!r}: {gain_path}"
+        )
+
+    with np.load(gain_path, allow_pickle=False) as archive:
+        if "volume" not in archive.files:
+            raise ValueError(f"Expected key 'volume' in dynamic gain model archive, got {archive.files}.")
+        volume = archive["volume"]
+        _validate_dynamic_gain_npz_contract(
+            gain_path=gain_path,
+            archive=archive,
+            volume=np.asarray(volume),
+            seismic_geometry=seismic_geometry,
+        )
+        metadata = _json_scalar_to_dict(archive["metadata_json"])
+        logger.info("Loaded dynamic gain metadata: %s", metadata)
 
     volume = np.asarray(volume, dtype=np.float32)
     if np.any(~np.isfinite(volume)) or np.any(volume <= 0.0):
@@ -720,7 +820,7 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     dynamic_gain = None
     if cfg.gain_source == "dynamic_gain_model":
         logger.info("Loading dynamic gain model from %s...", cfg.dynamic_gain_model)
-        dynamic_gain = load_dynamic_gain_model(cfg.dynamic_gain_model)  # type: ignore
+        dynamic_gain = load_dynamic_gain_model(cfg.dynamic_gain_model, seismic_geometry=geometry)  # type: ignore
         if dynamic_gain.shape != seismic.shape:
             raise ValueError(f"Dynamic gain shape {dynamic_gain.shape} does not match seismic shape {seismic.shape}.")
 

@@ -1,235 +1,231 @@
-# 时间域 Dynamic Gain 旁路设计
+# Dynamic Gain：让合成记录回到观测地震的尺度
 
-本文是时间域 `dynamic_gain.py` 的实现规格。它不是主链步骤，也不自动决定第八步一定使用 dynamic gain；它只负责在第七步 LFM、第五步全局子波和 GINN 同口径地震归一化下，生成一个可选的随样点变化 gain 体，并顺手给出一个井上推荐 fixed gain。
-
----
-
-## 位置与目标
-
-运行位置：第七步 `lfm_precomputed.py` 之后，第八步 `ginn_train.py` 之前。
-
-核心目标：
-
-```text
-单位子波正演 LFM × gain(t, inline, xline)
-  ≈ GINN 训练端看到的归一化观测地震
-```
-
-这里的“归一化观测地震”必须和第八步一致：
-
-```text
-seismic_norm = seismic_raw / train_mask_rms
-```
-
-`train_mask_rms` 只在目标层训练 mask 内计算，不做逐道 zscore，不做逐道去均值，也不使用深度域旧脚本里的 per-trace 标准化口径。
+GINN 训练端用能量归一化的子波做正演，合成记录的振幅和真实地震不在一个量级上。`dynamic_gain.py` 负责生成一个随时间和空间变化的增益体，把单位子波正演结果拉回到观测地震的尺度。它不是主链步骤，跑在第七步 LFM 之后、第八步 GINN 训练之前，由人根据产出证据决定第八步用 fixed gain 还是 dynamic gain。
 
 ---
 
-## 输入
+## 快速开始
+
+```bash
+python scripts/dynamic_gain.py
+python scripts/dynamic_gain.py --train-config experiments/ginn/train.yaml --config experiments/common.yaml
+python scripts/dynamic_gain.py --output-dir scripts/output/dynamic_gain_test
+```
+
+不带参数时，脚本自动发现最新的第六、七步产物和第五步全局子波，按第八步训练配置重建归一化口径，在 `scripts/output/dynamic_gain_<timestamp>/` 下写出结果。
+
+---
+
+## 运行前需要什么
 
 | 来源 | 文件/配置 | 用途 |
 |------|-----------|------|
-| 地震数据 | 与第八步相同的时间域地震体和 SEG-Y 几何配置 | 读取 raw seismic、inline/xline/time 轴 |
+| 地震数据 | 与第八步相同的地震体和 SEG-Y 几何配置 | 读取原始地震、确定时间轴和工区几何 |
 | 第五步 | `selected_wavelet.csv` | 单位子波正演 |
-| 第六步 | `log_ai_anchor_time.npz` | 第一版井上 fixed gain 样本来源 |
-| 第七步 | `ai_lfm_time.npz` | LFM 体、目标层 metadata、层位路径和目标层 QC 参数 |
-| 配置 | 与第八步一致的 validation / mask 口径 | 复现第八步训练 mask 和 `train_mask_rms` |
+| 第六步 | `log_ai_anchor_time.npz` | 井上 gain 样本来源 |
+| 第七步 | `ai_lfm_time.npz` | LFM 体、目标层元数据、层位路径 |
+| 训练配置 | 与第八步一致的 mask、验证划分、子波、LFM 和 anchor 配置 | 复现第八步的训练 mask 和归一化 RMS |
 
-脚本不得直接从 LAS、TDT 或井轨迹重建井约束。第一版只读取第六步已经生成的 `log_ai_anchor_time.npz`；若后续需要从 `well_constraint_points.csv` 取更细的点级事实，应作为新的输入契约显式加入。
+脚本不直接从 LAS、TDT 或井轨迹重建井约束。它只读第六步已经生成的 `log_ai_anchor_time.npz`。
 
 ---
 
-## 输出
+## 配置参考
 
-主输出：
+脚本配置放在 `dynamic_gain` 段下：
+
+```yaml
+dynamic_gain:
+  source_runs:
+    mode: latest
+    well_constraints_dir: null
+    lfm_precomputed_dir: null
+    wavelet_generation_dir: null
+
+  segments:
+    min_segment_valid_samples: 8
+    max_segment_count_per_trace: 20
+    min_segments_per_well: 1
+    gain_eps: 1e-12
+
+  spatial_debias:
+    enabled: true
+    cluster_radius_m: 600.0
+
+  attributes:
+    candidate_attributes: [seismic_rms, seismic_abs_mean, seismic_abs_p90]
+    attr_tie_threshold: 0.05
+    attribute_floor_fraction: 0.10
+    window_s: null
+
+  prediction:
+    clip_percentiles: [5.0, 95.0]
+    gain_smoothing_samples: 1
+
+  runtime:
+    forward_batch_traces: 256
+    volume_batch_traces: 512
+```
+
+### `source_runs`
+
+默认接上最新的第六步、第七步和第五步产物。复现实验时，可以在这里填写某次对应步骤的输出目录，固定输入来源。`mode` 目前只支持 `latest`。
+
+### `segments`
+
+控制从锚点道上切出 gain 估计段的粒度。`min_segment_valid_samples` 是每段最少有效样点数；`max_segment_count_per_trace` 限制单道最多切多少段。`gain_eps` 是正则化小量，防止合成记录能量为零时除零。
+
+### `spatial_debias`
+
+密井平台上的十几口井如果各算一票，gain 推荐值会被这个平台主导。空间去偏先把井口 XY 近的井聚成空间簇，再按簇聚合——每个簇贡献一票，而不是每口井一票。`cluster_radius_m` 控制多大范围内的井算作同一个簇。`enabled: false` 时每口井各自为簇。
+
+### `attributes`
+
+`candidate_attributes` 是候选地震属性列表，当前支持三种。`attr_tie_threshold` 控制属性选择的保守程度：如果另一个属性的 Pearson |r| 比 RMS 高出这个阈值以上，脚本才会选它，否则优先用 RMS。`attribute_floor_fraction` 是属性下限的安全因子——在预测 gain 体时，任何属性值低于全局 P01 的这个倍数时会被 clamp 到安全下限。`window_s` 是滑动窗口秒数，不填则用井样本段长的中位值。
+
+### `prediction`
+
+`clip_percentiles` 是 gain 预测值的 clip 上下百分位，防止极端预测值失控。`gain_smoothing_samples` 是生成 gain 体后的沿时间轴轻量平滑窗口（奇数样点，1 表示不做平滑）。
+
+### `runtime`
+
+`forward_batch_traces` 控制单位子波正演时的批大小；`volume_batch_traces` 控制生成 gain 体时的批大小。减少它们可以降低显存占用。
+
+---
+
+## 脚本在做什么
+
+脚本分五个阶段：**归一化与正演 → 井上 gain 样本 → 空间去偏与固定 gain → 属性选择与拟合 → gain 体生成与导出**。主要计算逻辑在 `src/cup/well/gain.py` 中，脚本负责 CLI、上下文组装和 QC 图绘制。
+
+### 第一阶段：归一化与正演
+
+按第八步训练配置重建目标层 mask 和 loss mask，计算 `train_mask_rms`——目标层训练 mask 内全部有限地震样点的 RMS。然后把原始地震按 `seismic_raw / train_mask_rms` 归一到单位量级。
+
+归一化之后，用第五步全局子波（不乘任何增益）对 LFM 做一次完整正演，得到单位子波合成记录。后续所有 gain 估计都在这个归一化域里进行。
+
+### 第二阶段：井上 gain 样本估计
+
+在第六步 anchor 的控制井道上，对每个有效段用最小二乘估计局部 gain——给定一段归一化观测地震和一段单位合成记录，求一个正数增益使残差平方和最小。
+
+一口井可能切出多段，每段一个 gain。段内的有效样点必须同时满足三个条件：在 anchor mask 内、在 loss mask 内、地震和合成记录都是有限值。太短的连续有效段会被跳过。
+
+### 第三阶段：空间去偏与固定增益推荐
+
+对井 gain 样本按井口 XY 做空间聚类，然后给出一个 recommended fixed gain：先取每段的中位 gain，再取每口井的中位，再取每个空间簇的中位，最后取全局中位。这个值是人做决策时的基线——如果不使用 dynamic gain，第八步填这个数。
+
+### 第四阶段：属性选择与对数拟合
+
+核心是用一条简单的对数-对数关系从地震振幅属性预测增益：`ln(gain) = a + b * ln(attribute)`。
+
+属性是地震归一化振幅的局部移动窗统计量，本质上回答"这个位置的观测地震强不强"。三种候选属性各有侧重：RMS 最常用，绝对均值更稳健，P90 对强反射更敏感。脚本在井样本上比较它们和 gain 的相关性，RMS 有轻微偏好加权。
+
+选定属性后做一次最小二乘对数拟合。同时从井样本的 gain 分布中确定上下 clip 百分位，作为后续生成 gain 体的安全边界。
+
+### 第五阶段：gain 体生成与导出
+
+对全体地震道计算同一属性、套用对数关系、clip 到安全范围、做轻量平滑，生成完整的三维增益体。输出的 gain 体必须是正值有限值；任何非正值会被替换为 clip 上下界的几何平均。
+
+同时输出 `recommended_fixed_gain.json` 和一系列 QC 图，供人判断第八步用 fixed 还是 dynamic。
+
+---
+
+## 核心输出文件
+
+所有文件在 `<output_root>/dynamic_gain_<timestamp>/` 下：
+
+### 主输出
 
 | 文件 | 内容 |
 |------|------|
 | `dynamic_gain.npz` | 正值 gain 体，供第八步 `gain_source: dynamic_gain_model` 读取 |
-| `recommended_fixed_gain.json` | 用井上样本估计的推荐 fixed gain |
-| `dynamic_gain_summary.json` | 输入路径、归一化参数、拟合参数、样本数量和输出路径 |
-| `dynamic_gain_samples.csv` | 井上或控制点上的 gain 样本、地震属性和拟合用字段 |
-| `figures/*.png` | gain 曲线、属性关系、体切片等人工 QC 图 |
+| `recommended_fixed_gain.json` | 空间去偏后的推荐固定增益 |
+| `dynamic_gain_samples.csv` | 井上 gain 样本明细，含属性和拟合用字段 |
+| `dynamic_gain_summary.json` | 完整输入、归一化参数、拟合结果和输出路径 |
 
-不输出常数 gain volume。fixed gain 只写在 `recommended_fixed_gain.json` 中，由人工决定是否填入第八步配置。
+### QC 输出
 
-脚本也不自动判定 dynamic gain 好坏。可以输出相关系数、残差、样本数、clip 比例等 QC 指标，但不应自动切换为 fixed gain，也不应在配置中替用户选择 `gain_source`。
+| 文件 | 内容 |
+|------|------|
+| `figures/qc_01_gain_distribution.png` | 井上 gain 段分布直方图 |
+| `figures/qc_02_attribute_fit.png` | 选定属性的对数散点图与拟合线 |
+| `figures/qc_03_attribute_metrics.png` | 候选属性的 Pearson 相关系数柱状图 |
+| `figures/qc_04_spatial_debias.png` | 空间簇的井增益与簇增益对比 |
+| `figures/qc_05_dynamic_gain_volume.png` | 增益体的 inline、xline 和时间切片 |
 
----
+### `dynamic_gain.npz`
 
-## Dynamic Gain NPZ Schema
-
-`dynamic_gain.npz` 建议包含：
+使用 `dynamic_gain_v1` schema，包含：
 
 | 键 | 形状 | 语义 |
 |----|------|------|
 | `volume` | `(n_inline, n_xline, n_sample)` | 正值 dynamic gain |
-| `samples` | `(n_sample,)` | 正秒 TWT 采样轴 |
-| `inline` / `xline` | `(n_inline,)` / `(n_xline,)` | 线号轴 |
+| `samples` / `inline` / `xline` | 一维轴 | TWT 采样轴和线号轴 |
 | `geometry_json` | 标量 | 与第八步地震几何一致 |
-| `metadata_json` | 标量 | 输入路径、归一化口径、拟合参数和输出说明 |
+| `metadata_json` | 标量 | 归一化口径、拟合参数、上游路径 |
 
-`metadata_json` 至少写入：
-
-| 字段 | 含义 |
-|------|------|
-| `schema_version` | 例如 `dynamic_gain_v1` |
-| `sample_domain` / `sample_unit` | 必须为 `time` / `s` |
-| `gain_reference` | `unit_wavelet_synthetic_to_normalized_observation` |
-| `normalization` | `seismic_raw_divided_by_train_mask_rms` |
-| `train_mask_rms` | 与第八步训练端一致的地震 RMS |
-| `gain_model_is_relative_to_fixed_gain` | 固定为 `false` |
-| `unit_wavelet_file` | 第五步 `selected_wavelet.csv` |
-| `ai_lfm_file` | 第七步 `ai_lfm_time.npz` |
-| `target_layer` / `horizons` | 从第七步 LFM metadata 继承 |
-
-第八步读取该 NPZ 时，应校验 shape、采样轴、时间域单位和正值约束。
-
----
-
-## 计算流程
-
-### 1. 重建 GINN 数据口径
-
-读取地震体、LFM NPZ 和 LFM metadata 中的层位信息，按第八步相同逻辑重建 target mask、loss mask 和训练 trace 集合。
-
-然后计算：
-
-```text
-train_mask_rms = RMS(seismic_raw[train_mask])
-seismic_norm = seismic_raw / train_mask_rms
-```
-
-这一步是整个旁路的尺度基准。后续所有 gain 样本和 gain 体都在 `seismic_norm` 域里解释。
-
-### 2. 单位子波正演 LFM
-
-读取第五步 `selected_wavelet.csv`，不乘 fixed gain，得到单位子波正演：
-
-```text
-syn_unit = ForwardModel(unit_wavelet)(LFM)
-```
-
-若第八步未来使用 dynamic gain，则训练端应保持 `fixed_gain = 1.0`，由 `dynamic_gain.npz` 直接缩放 `syn_unit`。
-
-### 3. 井上 fixed gain 样本
-
-在第六步入选井或 anchor 控制点上，按同一时间窗计算局部最小二乘 gain：
-
-```text
-gain_i = sum(seismic_norm_i * syn_unit_i) / sum(syn_unit_i^2)
-```
-
-只保留正值、有限值、有效样点数足够的样本。密井平台应做空间去偏聚合，避免一组近井控制 fixed gain 的全局推荐值。
-
-`recommended_fixed_gain.json` 建议包含：
+### `recommended_fixed_gain.json`
 
 | 字段 | 含义 |
 |------|------|
 | `recommended_fixed_gain` | 空间去偏后的井上 gain 中位数 |
-| `n_wells` / `n_segments` | 参与估计的井数和片段数 |
-| `normalization` | `seismic_raw_divided_by_train_mask_rms` |
-| `train_mask_rms` | 地震归一化 RMS |
-| `gain_reference` | `unit_wavelet_synthetic_to_normalized_observation` |
+| `n_wells` / `n_segments` / `n_spatial_clusters` | 参与估计的井数、段数和空间簇数 |
+| `normalization` | 固定为 `seismic_raw_divided_by_train_mask_rms` |
+| `gain_reference` | 固定为 `unit_wavelet_synthetic_to_normalized_observation` |
+| `train_mask_rms` | 与第八步训练端一致的地震 RMS |
 
-这个 fixed gain 是人工决策时的 baseline。若不使用 dynamic gain，第八步配置可填：
+---
 
-```yaml
-gain_source: fixed_gain
-fixed_gain: <recommended_fixed_gain>
-include_dynamic_gain_input: false
-```
+## 如何阅读结果
 
-### 4. 拟合 dynamic gain
+### 第一步：看图说话
 
-第一版建议使用地震属性驱动的简洁模型，不把网络引进这个旁路：
+不用看任何数字，先看三张图：
 
-```text
-ln(gain) = intercept + slope * ln(attribute)
-```
+- `qc_02_attribute_fit.png`：散点是否沿拟合线集中。如果对数散点是一团散沙、看不出线性趋势，dynamic gain 就不可信——直接用 fixed。
+- `qc_01_gain_distribution.png`：井之间的 gain 差异有多大。如果分布集中在一个窄峰附近，fixed 够用；如果明显分散甚至双峰，dynamic 值得试。
+- `qc_04_spatial_debias.png`：空间簇之间的 gain 是否有系统性差异。如果某个区域的井增益整体偏高或偏低，说明振幅空间变化大，dynamic 可能更有价值。
 
-可选属性包括：
+### 第二步：看 `recommended_fixed_gain.json`
 
-| 属性 | 说明 |
-|------|------|
-| `moving_rms(seismic_norm)` | 首选，表达局部振幅背景 |
-| `moving_abs_mean(seismic_norm)` | RMS 的稳健替代 |
-| `moving_abs_p90(seismic_norm)` | 对强反射更敏感 |
+`recommended_fixed_gain` 就是如果不用 dynamic 时该填的值。同时关注 `n_spatial_clusters`——如果只有 1-2 个簇，说明空间去偏意义不大（井分布太集中或工区太小）；如果簇数很多但各簇增益接近，说明振幅空间变化不显著。
 
-所有属性都从 `seismic_norm` 计算，不能从 raw seismic 或逐道 zscore 地震计算。拟合结果写入 `dynamic_gain_summary.json` 和 `dynamic_gain_samples.csv`。
+### 第三步：看体切片
 
-### 5. 生成 gain 体
+`qc_05_dynamic_gain_volume.png` 三张切片用于排查异常。关注：是否有明显的条带（可能是采集脚印）、边界突变（检查 clip 比例）、孤立的高增益或低增益区（检查对应位置的原始地震是否是噪声）。
 
-对全体地震道计算同一属性，套用拟合关系生成 gain：
+### 第四步：必要时看 samples 表
 
-```text
-attribute = moving_rms(seismic_norm)
-log_gain = intercept + slope * log(attribute)
-gain = exp(log_gain)
-```
-
-gain 必须为正有限值。clip、平滑和边界处理都应写入 metadata；clip 是数值保护，不是自动 QC 决策。
+`dynamic_gain_samples.csv` 是井上估计的所有 gain 段明细。可以按 well_name 分组，看同一口井不同深度的 gain 是否一致、跨井的 gain 范围和井位空间分布有没有关系。
 
 ---
 
 ## 第八步接入
 
-使用 dynamic gain 时：
+使用 dynamic gain：
 
 ```yaml
 gain_source: dynamic_gain_model
-fixed_gain: null
 dynamic_gain_model: scripts/output/dynamic_gain_<timestamp>/dynamic_gain.npz
 include_dynamic_gain_input: true
 in_channels: 4
+fixed_gain: null
 ```
 
-不使用 dynamic gain，只使用推荐 fixed gain 时：
+使用推荐固定增益：
 
 ```yaml
 gain_source: fixed_gain
 fixed_gain: <recommended_fixed_gain>
-dynamic_gain_model: null
 include_dynamic_gain_input: false
 in_channels: 3
+dynamic_gain_model: null
 ```
-
-第八步训练端已有两个不同用途：
-
-1. `dynamic_gain` 作为正演乘子，直接乘到合成地震上。
-2. `dynamic_gain_log_ratio` 作为网络输入通道，表达局部振幅补偿上下文。
-
-因此 dynamic gain 体的绝对尺度必须和 `seismic_norm` 对齐，不能再额外乘 fixed gain。
 
 ---
 
-## 人工 QC 建议
+## 留到第二轮
 
-脚本只提供证据，不自动选择 dynamic 或 fixed。建议至少输出：
-
-| QC | 目的 |
-|----|------|
-| 井上 `gain_i` 分布 | 判断 fixed baseline 是否稳定 |
-| `ln(attribute)` vs `ln(gain_i)` 散点图 | 判断 dynamic 关系是否可信 |
-| dynamic gain 体切片 | 排查异常条带、边界突变和非地质性强振幅 |
-| 井上 fixed / dynamic 合成对比 | 人工判断 dynamic 是否真的改善波形 |
-| clip 比例 | 判断拟合是否大量落在保护边界 |
-
-最终第八步用 `fixed_gain` 还是 `dynamic_gain_model`，由人工根据这些图和指标决定。
-
----
-
-## 与深度域旧旁路的区别
-
-时间域实现不要直接复刻深度域两个脚本的拆分方式。建议脚本层面合并为一个 `dynamic_gain.py`，内部拆函数即可：
-
-```text
-load_context()
-build_ginn_normalization()
-estimate_well_gain_samples()
-fit_gain_relationship()
-build_gain_volume()
-write_outputs()
-```
-
-深度域旧实现中逐道 zscore 后计算属性的做法，不适合作为时间域默认口径。时间域 dynamic gain 的尺度必须服务第八步 GINN 的 waveform loss，因此以 `seismic_raw / train_mask_rms` 为唯一归一化口径。
+- 属性候选池扩展到更多地震属性（瞬时振幅、相对波阻抗等）。
+- 增益体在井控之外区域的验证——当前没有盲井测试，完全依赖属性→gain 关系的外推可信度。
+- dynamic gain 和 fixed gain 的量化对比——目前只提供了图件证据，没有一个自动化的 A/B 对比指标。
+- 按层段分别拟合 gain 关系的可能性——有些目标层振幅空间变化由沉积相控制，一个全局关系可能不够。

@@ -28,7 +28,16 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
+from cup.utils.config import deep_merge_dict
+from cup.utils.io import (
+    latest_run,
+    load_yaml_config,
+    repo_relative_path,
+    resolve_artifact_path,
+    resolve_relative_path,
+    sanitize_filename,
+    write_json,
+)
 from cup.well.assets import normalize_well_name
 from cup.well.constraints import (
     FrequencySplitConfig,
@@ -99,23 +108,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _deep_update(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
-    out = {key: (value.copy() if isinstance(value, dict) else value) for key, value in base.items()}
-    for key, value in updates.items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = _deep_update(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
-def _latest_run(output_root: Path, prefix: str, required_file: str) -> Path:
-    candidates = [p for p in output_root.glob(f"{prefix}_*") if p.is_dir() and (p / required_file).exists()]
-    if not candidates:
-        raise FileNotFoundError(f"No run found under {output_root} for {prefix}_* containing {required_file}")
-    return sorted(candidates, key=lambda p: (p.stat().st_mtime, p.name))[-1]
-
-
 def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[str, Path]:
     source_cfg = dict(script_cfg.get("source_runs") or {})
     mode = str(source_cfg.get("mode", "latest")).strip().lower()
@@ -124,12 +116,12 @@ def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[
     auto_value = source_cfg.get("well_auto_tie_dir")
     wavelet_value = source_cfg.get("wavelet_generation_dir")
     auto_dir = (
-        _latest_run(output_root, "well_auto_tie", "well_tie_metrics.csv")
+        latest_run(output_root, "well_auto_tie", "well_tie_metrics.csv")
         if auto_value in {None, ""}
         else resolve_relative_path(auto_value, root=REPO_ROOT)
     )
     wavelet_dir = (
-        _latest_run(output_root, "wavelet_generation", "batch_synthetic_metrics.csv")
+        latest_run(output_root, "wavelet_generation", "batch_synthetic_metrics.csv")
         if wavelet_value in {None, ""}
         else resolve_relative_path(wavelet_value, root=REPO_ROOT)
     )
@@ -157,22 +149,8 @@ def _validate_wavelet_generation_source(*, auto_dir: Path, wavelet_dir: Path) ->
         )
 
 
-def _resolve_artifact_path(value: Any, *, run_dir: Path) -> Path | None:
-    text = "" if value is None else str(value).strip()
-    if not text or text.casefold() in {"nan", "none", "null"}:
-        return None
-    path = Path(text)
-    if path.is_absolute():
-        return path
-    candidates = [REPO_ROOT / path, run_dir / path]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate.resolve()
-    return candidates[0].resolve()
-
-
 def _resolve_seismic_trace_file(metric: pd.Series, *, run_dir: Path, well_name: str) -> Path | None:
-    direct = _resolve_artifact_path(metric.get("seismic_trace_file"), run_dir=run_dir)
+    direct = resolve_artifact_path(metric.get("seismic_trace_file"), root=REPO_ROOT, run_dir=run_dir)
     if direct is not None and direct.exists():
         return direct
     fallback = run_dir / "seismic_trace" / f"seismic_trace_{sanitize_filename(well_name)}.csv"
@@ -424,8 +402,8 @@ def _diagnose_frequency_split_by_forward_modeling(
         if key not in selected_keys:
             continue
         route = str(metric.get("route", ""))
-        las_file = _resolve_artifact_path(metric.get("filtered_las_file"), run_dir=auto_dir)
-        tdt_file = _resolve_artifact_path(metric.get("optimized_tdt_file"), run_dir=auto_dir)
+        las_file = resolve_artifact_path(metric.get("filtered_las_file"), root=REPO_ROOT, run_dir=auto_dir)
+        tdt_file = resolve_artifact_path(metric.get("optimized_tdt_file"), root=REPO_ROOT, run_dir=auto_dir)
         seismic_file = _resolve_seismic_trace_file(metric, run_dir=auto_dir, well_name=well_name)
         if las_file is None or tdt_file is None or seismic_file is None:
             for cutoff in candidate_cutoff_hz:
@@ -760,7 +738,7 @@ def _make_lfm_control_table(point_df: pd.DataFrame) -> pd.DataFrame:
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
-    script_cfg = _deep_update(DEFAULT_CONFIG, dict(cfg.get("well_constraints") or {}))
+    script_cfg = deep_merge_dict(DEFAULT_CONFIG, dict(cfg.get("well_constraints") or {}))
     if "n_slices" in dict(script_cfg.get("lfm_controls") or {}):
         raise ValueError(
             "well_constraints.lfm_controls.n_slices has moved to lfm_precomputed.modeling.n_slices; "
@@ -833,8 +811,8 @@ def main() -> None:
         if max_nmae is not None and (batch_nmae is None or batch_nmae > float(max_nmae)):
             reasons.append("batch_nmae_above_threshold")
 
-        las_file = _resolve_artifact_path(metric.get("filtered_las_file"), run_dir=auto_dir)
-        tdt_file = _resolve_artifact_path(metric.get("optimized_tdt_file"), run_dir=auto_dir)
+        las_file = resolve_artifact_path(metric.get("filtered_las_file"), root=REPO_ROOT, run_dir=auto_dir)
+        tdt_file = resolve_artifact_path(metric.get("optimized_tdt_file"), root=REPO_ROOT, run_dir=auto_dir)
         if las_file is None or not las_file.exists():
             reasons.append("missing_filtered_las_file")
         if not route.startswith("deviated") and (tdt_file is None or not tdt_file.exists()):
@@ -854,7 +832,7 @@ def main() -> None:
                     min_weight=float(weights_cfg.get("corr_min_weight", 0.6)),
                 )
                 if route.startswith("deviated"):
-                    trace_file = _resolve_artifact_path(metric.get("optimized_trace_sample_plan_file"), run_dir=auto_dir)
+                    trace_file = resolve_artifact_path(metric.get("optimized_trace_sample_plan_file"), root=REPO_ROOT, run_dir=auto_dir)
                     if trace_file is None:
                         trace_file = auto_dir / "trace_sample_plan" / f"optimized_trace_sample_plan_{sanitize_filename(well_name)}.csv"
                     if not trace_file.exists():

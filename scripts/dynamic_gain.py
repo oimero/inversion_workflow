@@ -36,9 +36,26 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.petrel.load import import_interpretation_petrel, import_seismic
 from cup.seismic.target_zone import TargetZone
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, to_json_compatible, write_json
-from cup.utils.raw_trace import centered_moving_average, centered_moving_rms_axis, centered_moving_sum_axis
-from cup.utils.statistics import ols_fit, pearson_r, radius_connected_components, spearman_rho
+from cup.utils.config import deep_merge_dict
+from cup.utils.io import (
+    latest_run,
+    load_yaml_config,
+    repo_relative_path,
+    resolve_optional_path,
+    write_json,
+)
+from cup.well.gain import (
+    CANDIDATE_ATTRIBUTES,
+    NORMALIZATION,
+    SCHEMA_VERSION,
+    assign_spatial_clusters,
+    build_gain_volume as build_gain_volume_from_fit,
+    fit_gain_relationship as fit_gain_relationship_from_samples,
+    positive_ls_gain,
+    recommended_fixed_gain,
+    segment_attribute_values,
+    write_gain_npz as write_dynamic_gain_npz,
+)
 from cup.well.wavelet import load_wavelet_csv, validate_wavelet_dt
 from ginn.anchor import load_log_ai_anchor_npz, validate_log_ai_anchor
 from ginn.config import GINNConfig
@@ -55,11 +72,6 @@ matplotlib.use("Agg")
 plt.rcParams["figure.dpi"] = 120
 
 logger = logging.getLogger(__name__)
-
-SCHEMA_VERSION = "dynamic_gain_v1"
-GAIN_REFERENCE = "unit_wavelet_synthetic_to_normalized_observation"
-NORMALIZATION = "seismic_raw_divided_by_train_mask_rms"
-CANDIDATE_ATTRIBUTES = ("seismic_rms", "seismic_abs_mean", "seismic_abs_p90")
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -133,35 +145,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _deep_update(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
-    out = {key: (value.copy() if isinstance(value, dict) else value) for key, value in base.items()}
-    for key, value in updates.items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = _deep_update(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
 def _json_scalar_to_dict(value: np.ndarray) -> dict[str, Any]:
     payload = np.asarray(value).item()
     if isinstance(payload, bytes):
         payload = payload.decode("utf-8")
     return json.loads(str(payload))
-
-
-def _latest_run(output_root: Path, prefix: str, required_file: str) -> Path:
-    candidates = [p for p in output_root.glob(f"{prefix}_*") if p.is_dir() and (p / required_file).exists()]
-    if not candidates:
-        raise FileNotFoundError(f"No {prefix}_* run under {output_root} contains {required_file}.")
-    return sorted(candidates, key=lambda p: (p.stat().st_mtime, p.name))[-1]
-
-
-def _resolve_optional_path(value: Any, *, root: Path) -> Path | None:
-    text = "" if value is None else str(value).strip()
-    if not text or text.casefold() in {"none", "null", "nan"}:
-        return None
-    return resolve_relative_path(text, root=root)
 
 
 def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[str, Path | None]:
@@ -172,7 +160,7 @@ def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[
 
     dirs: dict[str, Path | None] = {}
     for key in ("well_constraints_dir", "lfm_precomputed_dir", "wavelet_generation_dir"):
-        dirs[key] = _resolve_optional_path(source_cfg.get(key), root=REPO_ROOT)
+        dirs[key] = resolve_optional_path(source_cfg.get(key), root=REPO_ROOT)
     return dirs
 
 
@@ -228,7 +216,7 @@ def _resolve_lfm_file(cfg: GINNConfig, source_dirs: dict[str, Path | None], outp
             return path.resolve()
     lfm_dir = source_dirs.get("lfm_precomputed_dir")
     if lfm_dir is None:
-        lfm_dir = _latest_run(output_root, "lfm_precomputed", "ai_lfm_time.npz")
+        lfm_dir = latest_run(output_root, "lfm_precomputed", "ai_lfm_time.npz")
     if lfm_dir is not None:
         candidates.append(lfm_dir / "ai_lfm_time.npz")
     for path in candidates:
@@ -243,7 +231,7 @@ def _resolve_wavelet_file(cfg: GINNConfig, source_dirs: dict[str, Path | None], 
         candidates.append(Path(cfg.wavelet_file))
     wavelet_dir = source_dirs.get("wavelet_generation_dir")
     if wavelet_dir is None and not any(path.exists() for path in candidates):
-        wavelet_dir = _latest_run(output_root, "wavelet_generation", "selected_wavelet.csv")
+        wavelet_dir = latest_run(output_root, "wavelet_generation", "selected_wavelet.csv")
     if wavelet_dir is not None:
         candidates.append(wavelet_dir / "selected_wavelet.csv")
     for path in candidates:
@@ -261,7 +249,7 @@ def _resolve_anchor_file(cfg: GINNConfig, source_dirs: dict[str, Path | None], o
         candidates.append(Path(cfg.log_ai_anchor_file))
     constraints_dir = source_dirs.get("well_constraints_dir")
     if constraints_dir is None and not any(path.exists() for path in candidates):
-        constraints_dir = _latest_run(output_root, "well_constraints", "log_ai_anchor_time.npz")
+        constraints_dir = latest_run(output_root, "well_constraints", "log_ai_anchor_time.npz")
     if constraints_dir is not None:
         candidates.append(constraints_dir / "log_ai_anchor_time.npz")
     for path in candidates:
@@ -357,7 +345,7 @@ def _compute_train_mask_rms(seismic: np.ndarray, train_mask: np.ndarray, train_i
 
 def load_context(args: argparse.Namespace) -> DynamicGainContext:
     common_cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
-    script_cfg = _deep_update(DEFAULT_CONFIG, dict(common_cfg.get("dynamic_gain") or {}))
+    script_cfg = deep_merge_dict(DEFAULT_CONFIG, dict(common_cfg.get("dynamic_gain") or {}))
     output_root = REPO_ROOT / str(common_cfg.get("output_root", "scripts/output"))
     source_dirs = _resolve_source_dirs(script_cfg, output_root)
 
@@ -505,37 +493,6 @@ def contiguous_true_segments(mask: np.ndarray) -> list[np.ndarray]:
     return [segment for segment in np.split(indices, breaks) if segment.size > 0]
 
 
-def positive_ls_gain(
-    seismic_values: np.ndarray,
-    synthetic_values: np.ndarray,
-    *,
-    eps: float,
-    min_valid_samples: int,
-) -> float:
-    seismic_values = np.asarray(seismic_values, dtype=np.float64)
-    synthetic_values = np.asarray(synthetic_values, dtype=np.float64)
-    valid = np.isfinite(seismic_values) & np.isfinite(synthetic_values)
-    if int(valid.sum()) < int(min_valid_samples):
-        return float("nan")
-    numerator = float(np.sum(seismic_values[valid] * synthetic_values[valid]))
-    denominator = float(np.sum(synthetic_values[valid] ** 2))
-    gain = numerator / (denominator + float(eps) * max(int(valid.sum()), 1))
-    return float(gain) if np.isfinite(gain) and gain > 0.0 else float("nan")
-
-
-def segment_attribute_values(seismic_norm_values: np.ndarray) -> dict[str, float]:
-    values = np.asarray(seismic_norm_values, dtype=np.float64)
-    values = values[np.isfinite(values)]
-    if values.size == 0:
-        return {name: float("nan") for name in CANDIDATE_ATTRIBUTES}
-    abs_values = np.abs(values)
-    return {
-        "seismic_rms": float(np.sqrt(np.mean(values**2))),
-        "seismic_abs_mean": float(np.mean(abs_values)),
-        "seismic_abs_p90": float(np.percentile(abs_values, 90.0)),
-    }
-
-
 def _trace_xy_from_flat(ctx: DynamicGainContext, flat_idx: int) -> tuple[float, float, float, float]:
     n_xl = int(ctx.geometry["n_xl"])
     i_il = int(flat_idx) // n_xl
@@ -653,126 +610,21 @@ def estimate_well_gain_samples(ctx: DynamicGainContext, syn_unit: np.ndarray) ->
     return sample_df.reset_index(drop=True), summary
 
 
-def assign_spatial_clusters(sample_df: pd.DataFrame, *, radius_m: float, enabled: bool) -> pd.DataFrame:
-    wells = (
-        sample_df.groupby("well_name", as_index=False)
-        .agg(x_m=("x_m", "median"), y_m=("y_m", "median"))
-        .sort_values("well_name")
-        .reset_index(drop=True)
-    )
-    if enabled:
-        wells["spatial_cluster_id"] = radius_connected_components(wells[["x_m", "y_m"]].to_numpy(dtype=np.float64), radius_m)
-    else:
-        wells["spatial_cluster_id"] = np.arange(len(wells), dtype=np.int64)
-    wells["spatial_cluster_size"] = wells.groupby("spatial_cluster_id")["well_name"].transform("count").astype(np.int64)
-    return sample_df.merge(
-        wells[["well_name", "spatial_cluster_id", "spatial_cluster_size"]],
-        on="well_name",
-        how="left",
-        validate="many_to_one",
-    )
-
-
-def recommended_fixed_gain(sample_df: pd.DataFrame) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
-    well_gain = (
-        sample_df.groupby(["well_name", "spatial_cluster_id", "spatial_cluster_size"], as_index=False)
-        .agg(gain=("gain", "median"), n_segments=("gain", "count"))
-        .sort_values(["spatial_cluster_id", "well_name"])
-    )
-    cluster_gain = (
-        well_gain.groupby("spatial_cluster_id", as_index=False)
-        .agg(gain=("gain", "median"), n_wells=("well_name", "count"), n_segments=("n_segments", "sum"))
-        .sort_values("spatial_cluster_id")
-    )
-    values = cluster_gain["gain"].to_numpy(dtype=np.float64)
-    values = values[np.isfinite(values) & (values > 0.0)]
-    if values.size == 0:
-        raise ValueError("Cannot recommend fixed gain because no positive finite cluster gain exists.")
-    payload = {
-        "recommended_fixed_gain": float(np.median(values)),
-        "n_wells": int(well_gain["well_name"].nunique()),
-        "n_segments": int(sample_df.shape[0]),
-        "n_spatial_clusters": int(cluster_gain.shape[0]),
-        "spatial_debias_method": "segment_median_to_well_median_to_cluster_median_to_global_median",
-        "normalization": NORMALIZATION,
-        "gain_reference": GAIN_REFERENCE,
-    }
-    return payload, well_gain, cluster_gain
-
-
-def _set_log_attr_columns(sample_df: pd.DataFrame, candidate_attributes: list[str]) -> pd.DataFrame:
-    out = sample_df.copy()
-    for attr in candidate_attributes:
-        values = out[attr].to_numpy(dtype=np.float64)
-        out[f"log_{attr}"] = np.where(np.isfinite(values) & (values > 0.0), np.log(values), np.nan)
-    return out
-
-
-def choose_attribute(sample_df: pd.DataFrame, *, candidate_attributes: list[str], attr_tie_threshold: float) -> tuple[str, pd.DataFrame]:
-    rows = []
-    y = sample_df["log_gain"].to_numpy(dtype=np.float64)
-    for attr in candidate_attributes:
-        x = sample_df[f"log_{attr}"].to_numpy(dtype=np.float64)
-        valid = np.isfinite(x) & np.isfinite(y)
-        rows.append(
-            {
-                "attribute": attr,
-                "n_samples": int(valid.sum()),
-                "pearson": pearson_r(x, y),
-                "spearman": spearman_rho(x, y),
-            }
-        )
-    metrics = pd.DataFrame.from_records(rows)
-    if metrics.empty:
-        raise ValueError("No candidate attributes were configured.")
-
-    score = metrics["pearson"].abs().fillna(-np.inf)
-    best_attr = str(metrics.loc[int(score.idxmax()), "attribute"])
-    if "seismic_rms" in set(candidate_attributes):
-        rms_score = float(metrics.loc[metrics["attribute"] == "seismic_rms", "pearson"].abs().fillna(-np.inf).iloc[0])
-        best_score = float(score.max())
-        if np.isfinite(rms_score) and (best_score - rms_score) < float(attr_tie_threshold):
-            best_attr = "seismic_rms"
-    return best_attr, metrics
-
-
 def fit_gain_relationship(ctx: DynamicGainContext, sample_df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any], pd.DataFrame]:
+    """Thin wrapper — unpack config from *ctx* then delegate to ``cup.well.gain``."""
     attr_cfg = dict(ctx.script_cfg["attributes"])
-    candidate_attributes = [str(v) for v in attr_cfg.get("candidate_attributes", CANDIDATE_ATTRIBUTES)]
-    unknown = set(candidate_attributes) - set(CANDIDATE_ATTRIBUTES)
-    if unknown:
-        raise ValueError(f"Unsupported dynamic gain attributes: {sorted(unknown)}")
-    sample_df = _set_log_attr_columns(sample_df, candidate_attributes)
-    selected_attr, attr_metrics = choose_attribute(
+    candidate_attributes = [str(v) for v in attr_cfg.get("candidate_attributes", list(CANDIDATE_ATTRIBUTES))]
+    clip_percentiles_raw = ctx.script_cfg["prediction"].get("clip_percentiles", [5.0, 95.0])
+    if len(clip_percentiles_raw) != 2:
+        raise ValueError("dynamic_gain.prediction.clip_percentiles must contain two numbers.")
+    clip_percentiles = (float(clip_percentiles_raw[0]), float(clip_percentiles_raw[1]))
+    return fit_gain_relationship_from_samples(
         sample_df,
         candidate_attributes=candidate_attributes,
         attr_tie_threshold=float(attr_cfg.get("attr_tie_threshold", 0.05)),
+        clip_percentiles=clip_percentiles,
+        attribute_floor_fraction=float(attr_cfg.get("attribute_floor_fraction", 0.10)),
     )
-    fit = ols_fit(sample_df[f"log_{selected_attr}"].to_numpy(dtype=np.float64), sample_df["log_gain"].to_numpy(dtype=np.float64))
-    gain_values = sample_df["gain"].to_numpy(dtype=np.float64)
-    attr_values = sample_df[selected_attr].to_numpy(dtype=np.float64)
-    attr_positive = attr_values[np.isfinite(attr_values) & (attr_values > 0.0)]
-    if attr_positive.size == 0:
-        raise ValueError(f"Selected attribute {selected_attr!r} has no positive finite samples.")
-    clip_percentiles = list(ctx.script_cfg["prediction"].get("clip_percentiles", [5.0, 95.0]))
-    if len(clip_percentiles) != 2:
-        raise ValueError("dynamic_gain.prediction.clip_percentiles must contain two numbers.")
-    gain_clip = np.percentile(gain_values[np.isfinite(gain_values) & (gain_values > 0.0)], clip_percentiles)
-    if gain_clip[0] <= 0.0 or gain_clip[1] <= 0.0 or gain_clip[0] > gain_clip[1]:
-        raise ValueError(f"Invalid gain clip bounds from samples: {gain_clip}.")
-    attribute_floor = float(np.percentile(attr_positive, 1.0) * float(attr_cfg.get("attribute_floor_fraction", 0.10)))
-    attribute_floor = max(attribute_floor, float(np.finfo(np.float32).tiny))
-    fit_payload = {
-        **fit,
-        "attribute_name": selected_attr,
-        "gain_clip_low": float(gain_clip[0]),
-        "gain_clip_high": float(gain_clip[1]),
-        "clip_percentiles": [float(clip_percentiles[0]), float(clip_percentiles[1])],
-        "attribute_floor": float(attribute_floor),
-        "attribute_floor_fraction": float(attr_cfg.get("attribute_floor_fraction", 0.10)),
-        "candidate_attributes": candidate_attributes,
-    }
-    return sample_df, fit_payload, attr_metrics
 
 
 def seconds_to_odd_samples(window_s: float, sample_step_s: float, *, min_samples: int = 3) -> int:
@@ -795,148 +647,39 @@ def _configured_attribute_window_samples(ctx: DynamicGainContext, sample_df: pd.
     return seconds_to_odd_samples(duration, float(ctx.geometry["sample_step"]), min_samples=3)
 
 
-def moving_abs_mean_axis(values: np.ndarray, window: int) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float32)
-    valid = np.isfinite(values)
-    numerator = centered_moving_sum_axis(np.where(valid, np.abs(values), 0.0), int(window))
-    denominator = centered_moving_sum_axis(valid.astype(np.float32), int(window))
-    out = np.full(values.shape, np.nan, dtype=np.float32)
-    positive = denominator > 0.0
-    out[positive] = (numerator[positive] / denominator[positive]).astype(np.float32)
-    return out
-
-
-def moving_abs_p90_axis(values: np.ndarray, window: int) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float32)
-    left = int(window) // 2
-    right = int(window) - 1 - left
-    out = np.full(values.shape, np.nan, dtype=np.float32)
-    for row in range(values.shape[0]):
-        padded = np.pad(np.abs(values[row]).astype(np.float32), (left, right), mode="constant", constant_values=np.nan)
-        windows = np.lib.stride_tricks.sliding_window_view(padded, int(window))
-        with np.errstate(all="ignore"):
-            out[row] = np.nanpercentile(windows, 90.0, axis=1).astype(np.float32)
-    return out
-
-
-def compute_attribute_axis(values: np.ndarray, *, attribute_name: str, window_samples: int) -> np.ndarray:
-    if attribute_name == "seismic_rms":
-        return centered_moving_rms_axis(values, int(window_samples))
-    if attribute_name == "seismic_abs_mean":
-        return moving_abs_mean_axis(values, int(window_samples))
-    if attribute_name == "seismic_abs_p90":
-        return moving_abs_p90_axis(values, int(window_samples))
-    raise ValueError(f"Unsupported attribute_name={attribute_name!r}.")
-
-
-def build_gain_volume(
-    ctx: DynamicGainContext,
-    fit: dict[str, Any],
-    sample_df: pd.DataFrame,
-) -> tuple[np.ndarray, dict[str, Any]]:
+def build_gain_volume(ctx: DynamicGainContext, fit: dict[str, Any], sample_df: pd.DataFrame) -> tuple[np.ndarray, dict[str, Any]]:
+    """Thin wrapper — unpack context then delegate to ``cup.well.gain``."""
     n_sample = int(ctx.geometry["n_sample"])
     flat = (ctx.seismic.reshape(-1, n_sample) / float(ctx.train_mask_rms)).astype(np.float32)
-    batch_size = int(ctx.script_cfg["runtime"].get("volume_batch_traces", 512))
     window_samples = _configured_attribute_window_samples(ctx, sample_df)
-    attr_name = str(fit["attribute_name"])
-    attr_floor = float(fit["attribute_floor"])
-    log_clip = (float(np.log(fit["gain_clip_low"])), float(np.log(fit["gain_clip_high"])))
-    smoothing_samples = int(ctx.script_cfg["prediction"].get("gain_smoothing_samples", 1))
-    if smoothing_samples < 1:
-        smoothing_samples = 1
-    if smoothing_samples % 2 == 0:
-        smoothing_samples += 1
-
-    gain_flat = np.empty_like(flat, dtype=np.float32)
-    raw_below_clip = 0
-    raw_above_clip = 0
-    finite_total = 0
-    for start in range(0, flat.shape[0], batch_size):
-        end = min(start + batch_size, flat.shape[0])
-        attr = compute_attribute_axis(flat[start:end], attribute_name=attr_name, window_samples=window_samples)
-        attr_safe = np.maximum(attr, attr_floor)
-        log_attr = np.where(np.isfinite(attr_safe) & (attr_safe > 0.0), np.log(attr_safe), np.nan)
-        log_gain = float(fit["intercept"]) + float(fit["slope"]) * log_attr
-        finite = np.isfinite(log_gain)
-        raw_below_clip += int(np.sum(finite & (log_gain < log_clip[0])))
-        raw_above_clip += int(np.sum(finite & (log_gain > log_clip[1])))
-        finite_total += int(np.sum(finite))
-        log_gain = np.clip(log_gain, log_clip[0], log_clip[1])
-        gain = np.exp(log_gain).astype(np.float32)
-        if np.any(~np.isfinite(gain) | (gain <= 0.0)):
-            fill = float(np.sqrt(float(fit["gain_clip_low"]) * float(fit["gain_clip_high"])))
-            gain = np.where(np.isfinite(gain) & (gain > 0.0), gain, fill).astype(np.float32)
-        if smoothing_samples > 1:
-            for row in range(gain.shape[0]):
-                gain[row] = centered_moving_average(gain[row], smoothing_samples)
-        if np.any(~np.isfinite(gain) | (gain <= 0.0)):
-            fill = float(np.sqrt(float(fit["gain_clip_low"]) * float(fit["gain_clip_high"])))
-            gain = np.where(np.isfinite(gain) & (gain > 0.0), gain, fill).astype(np.float32)
-        gain_flat[start:end] = gain
-        if start == 0 or end == flat.shape[0] or (start // max(batch_size, 1)) % 20 == 0:
-            logger.info("Predicted gain for %d/%d traces", end, flat.shape[0])
-
-    volume = gain_flat.reshape(ctx.seismic.shape)
-    if np.any(~np.isfinite(volume)) or np.any(volume <= 0.0):
-        raise ValueError("Predicted dynamic gain volume contains non-finite or non-positive values.")
-    stats = summarize_array(volume)
-    stats.update(
-        {
-            "attribute_window_samples": int(window_samples),
-            "attribute_window_s": float(window_samples * float(ctx.geometry["sample_step"])),
-            "gain_smoothing_samples": int(smoothing_samples),
-            "raw_below_clip_count": int(raw_below_clip),
-            "raw_above_clip_count": int(raw_above_clip),
-            "raw_clip_fraction": float((raw_below_clip + raw_above_clip) / max(finite_total, 1)),
-        }
+    smoothing = int(ctx.script_cfg["prediction"].get("gain_smoothing_samples", 1))
+    return build_gain_volume_from_fit(
+        flat,
+        fit=fit,
+        sample_step_s=float(ctx.geometry["sample_step"]),
+        seismic_shape=ctx.seismic.shape,
+        window_samples=window_samples,
+        gain_smoothing_samples=smoothing,
+        batch_traces=int(ctx.script_cfg["runtime"].get("volume_batch_traces", 512)),
     )
-    return volume, stats
-
-
-def summarize_array(values: np.ndarray) -> dict[str, Any]:
-    arr = np.asarray(values)
-    finite = arr[np.isfinite(arr)]
-    out: dict[str, Any] = {"shape": list(arr.shape), "size": int(arr.size), "finite_count": int(finite.size)}
-    if finite.size:
-        out.update(
-            {
-                "min": float(np.min(finite)),
-                "p05": float(np.percentile(finite, 5.0)),
-                "median": float(np.median(finite)),
-                "p95": float(np.percentile(finite, 95.0)),
-                "max": float(np.max(finite)),
-                "mean": float(np.mean(finite)),
-            }
-        )
-    return out
 
 
 def write_gain_npz(ctx: DynamicGainContext, gain_volume: np.ndarray, fit: dict[str, Any], volume_stats: dict[str, Any]) -> Path:
-    metadata = {
-        "schema_version": SCHEMA_VERSION,
-        "sample_domain": "time",
-        "sample_unit": "s",
-        "gain_reference": GAIN_REFERENCE,
-        "normalization": NORMALIZATION,
-        "train_mask_rms": float(ctx.train_mask_rms),
-        "gain_model_is_relative_to_fixed_gain": False,
-        "unit_wavelet_file": repo_relative_path(ctx.wavelet_file, root=REPO_ROOT),
-        "ai_lfm_file": repo_relative_path(ctx.lfm_file, root=REPO_ROOT),
-        "target_layer": ctx.lfm_metadata.get("target_layer"),
-        "horizons": ctx.lfm_metadata.get("horizons"),
-        "fit": fit,
-        "volume_stats": volume_stats,
-        "path_style": "repo_relative",
-    }
+    """Thin wrapper — unpack context then delegate to ``cup.well.gain``."""
     path = ctx.output_dir / "dynamic_gain.npz"
-    np.savez_compressed(
+    write_dynamic_gain_npz(
         path,
-        volume=gain_volume.astype(np.float32),
-        samples=ctx.samples.astype(np.float64),
-        inline=ctx.ilines.astype(np.float64),
-        xline=ctx.xlines.astype(np.float64),
-        geometry_json=np.asarray(json.dumps(to_json_compatible(ctx.geometry), ensure_ascii=False)),
-        metadata_json=np.asarray(json.dumps(to_json_compatible(metadata), ensure_ascii=False)),
+        gain_volume,
+        samples=ctx.samples,
+        ilines=ctx.ilines,
+        xlines=ctx.xlines,
+        geometry=ctx.geometry,
+        wavelet_file=repo_relative_path(ctx.wavelet_file, root=REPO_ROOT),
+        lfm_file=repo_relative_path(ctx.lfm_file, root=REPO_ROOT),
+        train_mask_rms=ctx.train_mask_rms,
+        fit=fit,
+        volume_stats=volume_stats,
+        lfm_metadata=ctx.lfm_metadata,
     )
     return path
 

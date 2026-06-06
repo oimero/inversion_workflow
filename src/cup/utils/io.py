@@ -13,11 +13,13 @@
 2. load_yaml_config / write_json: 配置文件加载与 JSON 写出。
 3. sanitize_filename: 文件名安全化。
 4. build_segy_textual_header: SEG-Y 文本头构造。
+5. latest_run / resolve_timestamped_output_dir: 工作流 run 目录发现与构造。
 """
 
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,66 @@ import numpy as np
 import yaml
 
 # ── Path resolution ──
+
+
+def resolve_optional_path(value: str | Path | None, *, root: Path) -> Path | None:
+    """Parse a config-level optional path value.
+
+    Returns ``None`` for empty strings, ``"none"``, ``"null"``, ``"nan"``
+    (case-insensitive), or ``None``.  Otherwise resolves the value relative
+    to *root* and returns the resolved absolute path.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.casefold() in {"none", "null", "nan"}:
+        return None
+    return resolve_relative_path(text, root=root)
+
+
+def resolve_artifact_path(value: Any, *, root: Path, run_dir: Path) -> Path | None:
+    """Resolve a repo-relative artifact path from metadata, falling back to
+    *run_dir*-relative when the absolute path does not exist.
+
+    *root* is typically ``REPO_ROOT``.  Returns ``None`` for empty / sentinel
+    strings.
+    """
+    text = "" if value is None else str(value).strip()
+    if not text or text.casefold() in {"nan", "none", "null"}:
+        return None
+    path = Path(text)
+    if path.is_absolute():
+        return path
+    candidates = [root / path, run_dir / path]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
+
+
+def latest_run(output_root: str | Path, prefix: str, required_file: str) -> Path:
+    """Return the latest ``<prefix>_*`` run directory containing ``required_file``.
+
+    This helper only discovers directories. Callers must still validate that
+    the required file conforms to the expected CSV/NPZ schema.
+    """
+    root = Path(output_root)
+    pattern = f"{prefix}_*"
+    candidates = [p for p in root.glob(pattern) if p.is_dir() and (p / required_file).exists()]
+    if not candidates:
+        raise FileNotFoundError(f"No run found under {root} for {pattern} containing {required_file!r}.")
+    return sorted(candidates, key=lambda p: (p.stat().st_mtime, p.name))[-1]
+
+
+def resolve_timestamped_output_dir(
+    output_root: str | Path,
+    prefix: str,
+    *,
+    timestamp: str | None = None,
+) -> Path:
+    """Build ``<output_root>/<prefix>_<timestamp>`` without creating it."""
+    ts = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Path(output_root) / f"{prefix}_{ts}"
 
 
 def resolve_relative_path(relative: str | Path, *, root: Path) -> Path:

@@ -1,14 +1,17 @@
-"""GINN 训练入口脚本。
+"""Train a GINN model from a YAML experiment config.
 
-使用方法
---------
-在仓库根目录下运行：
+This is the eighth step of the time-domain workflow.  It reads the seismic
+volume, a precomputed AI low-frequency model (step 7), an optional well
+anchor bundle (step 6), and a global wavelet (step 5), then trains a
+physics-informed neural network to predict AI residuals.
+
+Usage::
 
     python scripts/ginn_train.py
     python scripts/ginn_train.py --config experiments/ginn/train.yaml
-
-需要将 ``src`` 加入 PYTHONPATH，或通过 ``train_network.ps1`` 类似脚本启动。
 """
+
+from __future__ import annotations
 
 import argparse
 import logging
@@ -34,7 +37,7 @@ from ginn.trainer import Trainer
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train GINN from a YAML experiment config.")
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
         type=Path,
@@ -50,7 +53,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    # ── 日志 ──
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",

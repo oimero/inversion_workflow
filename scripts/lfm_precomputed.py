@@ -26,15 +26,17 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cup.utils.config import deep_merge_dict
 from cup.utils.io import (
     build_segy_textual_header,
+    latest_run,
     load_yaml_config,
     repo_relative_path,
     resolve_relative_path,
+    sanitize_filename,
+    to_json_compatible,
     write_json,
 )
-from cup.utils.io import to_json_compatible
-from cup.utils.io import sanitize_filename
 
 matplotlib.use("Agg")
 plt.rcParams["figure.dpi"] = 120
@@ -62,16 +64,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
-def _deep_update(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
-    out = {key: (value.copy() if isinstance(value, dict) else value) for key, value in base.items()}
-    for key, value in updates.items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = _deep_update(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("experiments/common.yaml"))
@@ -90,13 +82,6 @@ def _save_fig(path: Path) -> None:
     print(f"Saved {path}")
 
 
-def _latest_run(output_root: Path, prefix: str, required_file: str) -> Path:
-    candidates = [p for p in output_root.glob(f"{prefix}_*") if p.is_dir() and (p / required_file).exists()]
-    if not candidates:
-        raise FileNotFoundError(f"No run found under {output_root} for {prefix}_* containing {required_file}")
-    return sorted(candidates, key=lambda p: (p.stat().st_mtime, p.name))[-1]
-
-
 def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[str, Path]:
     source_cfg = dict(script_cfg.get("source_runs") or {})
     mode = str(source_cfg.get("mode", "latest")).strip().lower()
@@ -104,25 +89,11 @@ def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[
     if mode != "latest":
         raise ValueError(f"lfm_precomputed.source_runs.mode only supports 'latest' for now, got {mode!r}.")
     constraints_dir = (
-        _latest_run(output_root, "well_constraints", "lfm_control_points.csv")
+        latest_run(output_root, "well_constraints", "lfm_control_points.csv")
         if constraints_dir_value in {None, ""}
         else resolve_relative_path(constraints_dir_value, root=REPO_ROOT)
     )
     return {"well_constraints_dir": constraints_dir}
-
-
-def _resolve_artifact_path(value: Any, *, run_dir: Path) -> Path | None:
-    text = "" if value is None else str(value).strip()
-    if not text or text.casefold() in {"nan", "none", "null"}:
-        return None
-    path = Path(text)
-    if path.is_absolute():
-        return path
-    candidates = [REPO_ROOT / path, run_dir / path]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate.resolve()
-    return candidates[0].resolve()
 
 
 def _resolve_segy_options(cfg: dict[str, Any]) -> dict[str, int] | None:
@@ -206,363 +177,6 @@ def _build_target_layer(script_cfg: dict[str, Any], geometry: dict[str, Any], qc
             }
         )
     return target_layer, horizons
-
-
-def _lowpass_values_on_twt(
-    twt: np.ndarray,
-    values: np.ndarray,
-    *,
-    dt_s: float,
-    cutoff_hz: float,
-    order: int,
-    buffer_seconds: float | None,
-    buffer_mode: str,
-) -> np.ndarray:
-    from cup.seismic.lfm_time import lowpass_twt_log
-    from wtie.processing import grid
-
-    original_twt = np.asarray(twt, dtype=np.float64).reshape(-1)
-    original_values = np.asarray(values, dtype=np.float64).reshape(-1)
-    if original_twt.shape != original_values.shape:
-        raise ValueError("twt and values must have matching 1D shapes.")
-    if dt_s <= 0.0 or not np.isfinite(dt_s):
-        raise ValueError(f"lowpass dt_s must be positive and finite, got {dt_s}.")
-
-    out = np.full(original_values.shape, np.nan, dtype=np.float64)
-    finite = np.isfinite(original_twt) & np.isfinite(original_values)
-    finite_indices = np.flatnonzero(finite)
-    min_filter_samples = max(4, 3 * int(order) + 2)
-    if finite_indices.size < min_filter_samples:
-        out[finite_indices] = original_values[finite_indices]
-        return out
-
-    twt = original_twt[finite_indices]
-    values = original_values[finite_indices]
-    order_idx = np.argsort(twt)
-    twt = twt[order_idx]
-    values = values[order_idx]
-    unique_twt, inverse = np.unique(twt, return_inverse=True)
-    if unique_twt.size != twt.size:
-        value_sum = np.zeros(unique_twt.size, dtype=np.float64)
-        count = np.zeros(unique_twt.size, dtype=np.float64)
-        np.add.at(value_sum, inverse, values)
-        np.add.at(count, inverse, 1.0)
-        values = value_sum / np.maximum(count, 1.0)
-        twt = unique_twt
-    if twt.size < min_filter_samples:
-        out[finite_indices] = np.interp(original_twt[finite_indices], twt, values)
-        return out
-    regular_twt = np.arange(float(twt[0]), float(twt[-1]) + 0.5 * dt_s, float(dt_s))
-    regular_values = np.interp(regular_twt, twt, values)
-    log = grid.Log(regular_values, regular_twt, "twt", name="AI", unit="m/s*g/cm3", allow_nan=False)
-    filtered = lowpass_twt_log(
-        log,
-        cutoff_hz=float(cutoff_hz),
-        order=int(order),
-        buffer_seconds=buffer_seconds,
-        buffer_mode=buffer_mode,
-    )
-    out[finite_indices] = np.interp(original_twt[finite_indices], filtered.basis, filtered.values)
-    return out
-
-
-def _sample_zone(target_layer: Any, inline_float: float, xline_float: float, twt_s: float) -> tuple[str | None, float | None]:
-    values = target_layer.get_interpretation_values_at_location(float(inline_float), float(xline_float))
-    for top_name, bottom_name in target_layer.iter_zones():
-        top = float(values[top_name])
-        bottom = float(values[bottom_name])
-        if not np.isfinite(top) or not np.isfinite(bottom) or bottom <= top:
-            continue
-        if top <= float(twt_s) <= bottom:
-            return f"{top_name}->{bottom_name}", float((float(twt_s) - top) / (bottom - top))
-    return None, None
-
-
-def _nearest_trace_fields(survey: Any, inline_float: float, xline_float: float) -> dict[str, Any]:
-    nearest_inline = survey.line_geometry.snap_inline(float(inline_float))
-    nearest_xline = survey.line_geometry.snap_xline(float(xline_float))
-    inline_index_f, xline_index_f = survey.line_geometry.line_to_index(nearest_inline, nearest_xline)
-    inline_index = min(
-        int(survey.line_geometry.inline_axis.count) - 1,
-        max(0, int(round(inline_index_f))),
-    )
-    xline_index = min(
-        int(survey.line_geometry.xline_axis.count) - 1,
-        max(0, int(round(xline_index_f))),
-    )
-    flat_idx = int(survey.trace_flat_index(inline_index, xline_index))
-    return {
-        "nearest_inline": nearest_inline,
-        "nearest_xline": nearest_xline,
-        "inline_index": inline_index,
-        "xline_index": xline_index,
-        "flat_idx": flat_idx,
-    }
-
-
-def _slice_index_from_u(u_in_zone: float, n_slices: int) -> int:
-    if n_slices < 2:
-        raise ValueError(f"n_slices must be >= 2, got {n_slices}.")
-    slice_u = np.linspace(0.0, 1.0, int(n_slices), dtype=np.float64)
-    boundaries = 0.5 * (slice_u[:-1] + slice_u[1:])
-    return int(np.searchsorted(boundaries, float(u_in_zone), side="right"))
-
-
-def _aggregate_points_by_well_zone_slice(
-    rows: list[dict[str, Any]],
-    *,
-    survey: Any,
-    n_slices: int,
-) -> tuple[list[dict[str, Any]], int]:
-    if len(rows) <= 1:
-        return rows, 0
-
-    frame = pd.DataFrame(rows)
-    frame["_slice_index"] = [
-        _slice_index_from_u(float(u_in_zone), int(n_slices)) for u_in_zone in frame["u_in_zone"].to_numpy(dtype=float)
-    ]
-
-    aggregated_rows: list[dict[str, Any]] = []
-    removed_count = 0
-    for (_well_name, _route, source, zone_name, _slice_index), group in frame.groupby(
-        ["well_name", "route", "source", "zone_name", "_slice_index"],
-        sort=False,
-    ):
-        if len(group) == 1:
-            row = group.iloc[0].drop(labels=["_slice_index"]).to_dict()
-            aggregated_rows.append(_control_point_row(**row))
-            continue
-
-        removed_count += int(len(group) - 1)
-        inline_float = float(group["inline_float"].mean())
-        xline_float = float(group["xline_float"].mean())
-        trace_fields = _nearest_trace_fields(survey, inline_float, xline_float)
-        aggregated_rows.append(
-            _control_point_row(
-                well_name=str(group["well_name"].iloc[0]),
-                route=str(group["route"].iloc[0]),
-                source=str(source),
-                twt_s=float(group["twt_s"].mean()),
-                md_m=float(group["md_m"].mean()),
-                x_m=float(group["x_m"].mean()),
-                y_m=float(group["y_m"].mean()),
-                inline_float=inline_float,
-                xline_float=xline_float,
-                zone_name=str(zone_name),
-                u_in_zone=float(group["u_in_zone"].mean()),
-                ai=float(group["ai"].mean()),
-                weight=float(group["weight"].mean()) if "weight" in group else 1.0,
-                sample_index=int(round(float(group["sample_index"].mean()))),
-                **trace_fields,
-            )
-        )
-
-    return aggregated_rows, removed_count
-
-
-def _control_point_row(**kwargs: Any) -> dict[str, Any]:
-    columns = [
-        "well_name",
-        "route",
-        "source",
-        "twt_s",
-        "md_m",
-        "x_m",
-        "y_m",
-        "inline_float",
-        "xline_float",
-        "zone_name",
-        "u_in_zone",
-        "ai",
-        "weight",
-        "flat_idx",
-        "sample_index",
-    ]
-    return {key: kwargs.get(key) for key in columns}
-
-
-def _build_vertical_points(
-    *,
-    well_name: str,
-    route: str,
-    las_file: Path,
-    tdt_file: Path,
-    surface_x: float,
-    surface_y: float,
-    target_layer: Any,
-    survey: Any,
-    samples: np.ndarray,
-    modeling_cfg: dict[str, Any],
-) -> tuple[list[dict[str, Any]], int, int, list[str]]:
-    from cup.well.las import load_vp_rho_logset_from_standard_las
-    from cup.well.td import load_workflow_time_depth_table_csv
-    from wtie.processing import grid
-
-    logset = load_vp_rho_logset_from_standard_las(las_file)
-    table = load_workflow_time_depth_table_csv(tdt_file)
-    dt_s = float(np.median(np.diff(samples)))
-    ai_twt = grid.convert_log_from_md_to_twt(logset.AI, table, None, dt_s)
-    ai_values = _lowpass_values_on_twt(
-        ai_twt.basis,
-        ai_twt.values,
-        dt_s=dt_s,
-        cutoff_hz=float(modeling_cfg["filter_cutoff_hz"]),
-        order=int(modeling_cfg["filter_order"]),
-        buffer_seconds=modeling_cfg.get("filter_buffer_seconds"),
-        buffer_mode=str(modeling_cfg.get("filter_buffer_mode", "reflect")),
-    )
-    ai_at_samples = np.interp(samples, np.asarray(ai_twt.basis, dtype=float), ai_values, left=np.nan, right=np.nan)
-    inline_float, xline_float = survey.line_geometry.coord_to_line(float(surface_x), float(surface_y))
-    trace_fields = _nearest_trace_fields(survey, inline_float, xline_float)
-    md_at_samples = np.interp(samples, table.twt, table.depth, left=np.nan, right=np.nan)
-
-    rows: list[dict[str, Any]] = []
-    diagnostics: list[str] = []
-    attempted = 0
-    for sample_index, (twt_s, ai, md_m) in enumerate(zip(samples, ai_at_samples, md_at_samples)):
-        if not np.isfinite(ai) or not np.isfinite(md_m):
-            continue
-        attempted += 1
-        try:
-            zone_name, u_in_zone = _sample_zone(target_layer, inline_float, xline_float, float(twt_s))
-        except Exception as exc:
-            if not diagnostics:
-                diagnostics.append(f"zone_sample_error:{type(exc).__name__}:{exc}")
-            zone_name, u_in_zone = None, None
-        if zone_name is None or u_in_zone is None:
-            continue
-        rows.append(
-            _control_point_row(
-                well_name=well_name,
-                route=route,
-                source="vertical_trace",
-                twt_s=float(twt_s),
-                md_m=float(md_m),
-                x_m=float(surface_x),
-                y_m=float(surface_y),
-                inline_float=float(inline_float),
-                xline_float=float(xline_float),
-                zone_name=zone_name,
-                u_in_zone=float(u_in_zone),
-                ai=float(ai),
-                weight=1.0,
-                sample_index=int(sample_index),
-                **trace_fields,
-            )
-        )
-    return rows, attempted, max(0, attempted - len(rows)), diagnostics
-
-
-def _build_deviated_points(
-    *,
-    well_name: str,
-    route: str,
-    las_file: Path,
-    trace_plan_file: Path,
-    target_layer: Any,
-    survey: Any,
-    sample_step_s: float | None,
-    modeling_cfg: dict[str, Any],
-) -> tuple[list[dict[str, Any]], int, int, list[str]]:
-    from cup.well.las import load_vp_rho_logset_from_standard_las
-
-    logset = load_vp_rho_logset_from_standard_las(las_file)
-    ai_log = logset.AI
-    ai_basis = np.asarray(ai_log.basis, dtype=float)
-    if ai_basis.size < 2 or np.any(np.diff(ai_basis) <= 0.0):
-        raise ValueError(f"AI log MD basis must be strictly increasing: {las_file}")
-    plan_df = pd.read_csv(trace_plan_file)
-    required = {"twt_s", "md_m", "x_m", "y_m", "inline_float", "xline_float", "survey_position"}
-    missing = required - set(plan_df.columns)
-    if missing:
-        raise ValueError(f"trace_sample_plan missing columns: {sorted(missing)}")
-    plan_df = plan_df.loc[plan_df["survey_position"].astype(str).eq("inside")].copy()
-    plan_df = plan_df.sort_values("twt_s").reset_index(drop=True)
-    if sample_step_s is not None and sample_step_s > 0.0 and not plan_df.empty:
-        keep = []
-        last_twt = -np.inf
-        for idx, twt in enumerate(plan_df["twt_s"].to_numpy(dtype=float)):
-            if twt >= last_twt + float(sample_step_s) - 1e-9:
-                keep.append(idx)
-                last_twt = float(twt)
-        plan_df = plan_df.iloc[keep].reset_index(drop=True)
-
-    attempted = int(len(plan_df))
-    if plan_df.empty:
-        return [], attempted, attempted, []
-    plan_md = plan_df["md_m"].to_numpy(dtype=float)
-    finite_md = plan_md[np.isfinite(plan_md)]
-    if finite_md.size >= 2 and np.any(np.diff(finite_md) < 0.0):
-        raise ValueError(f"trace_sample_plan md_m must be non-decreasing with TWT: {trace_plan_file}")
-    ai_raw = np.interp(
-        plan_md,
-        ai_basis,
-        np.asarray(ai_log.values, dtype=float),
-        left=np.nan,
-        right=np.nan,
-    )
-    plan_twt = plan_df["twt_s"].to_numpy(dtype=float)
-    dt_s = float(np.nanmedian(np.diff(plan_twt))) if len(plan_df) > 1 else float(survey.sample_axis("time").step)
-    if not np.isfinite(dt_s) or dt_s <= 0.0:
-        raise ValueError(f"trace_sample_plan twt_s must have a positive sampling interval: {trace_plan_file}")
-    if np.isfinite(dt_s) and dt_s > 0.0:
-        ai_filtered = _lowpass_values_on_twt(
-            plan_twt,
-            ai_raw,
-            dt_s=dt_s,
-            cutoff_hz=float(modeling_cfg["filter_cutoff_hz"]),
-            order=int(modeling_cfg["filter_order"]),
-            buffer_seconds=modeling_cfg.get("filter_buffer_seconds"),
-            buffer_mode=str(modeling_cfg.get("filter_buffer_mode", "reflect")),
-        )
-        ai_by_row = ai_filtered
-    else:
-        ai_by_row = ai_raw
-
-    rows: list[dict[str, Any]] = []
-    diagnostics: list[str] = []
-    for row_index, row in plan_df.iterrows():
-        ai = float(ai_by_row[row_index])
-        if not np.isfinite(ai):
-            continue
-        inline_float = float(row["inline_float"])
-        xline_float = float(row["xline_float"])
-        twt_s = float(row["twt_s"])
-        try:
-            zone_name, u_in_zone = _sample_zone(target_layer, inline_float, xline_float, twt_s)
-        except Exception as exc:
-            if not diagnostics:
-                diagnostics.append(f"zone_sample_error:{type(exc).__name__}:{exc}")
-            zone_name, u_in_zone = None, None
-        if zone_name is None or u_in_zone is None:
-            continue
-        trace_fields = {}
-        for key in ["flat_idx", "inline_index", "xline_index", "nearest_inline", "nearest_xline"]:
-            if key in row and pd.notna(row[key]):
-                trace_fields[key] = int(row[key]) if key.endswith("index") or key == "flat_idx" else float(row[key])
-        if "flat_idx" not in trace_fields:
-            trace_fields = _nearest_trace_fields(survey, inline_float, xline_float)
-        rows.append(
-            _control_point_row(
-                well_name=well_name,
-                route=route,
-                source="deviated_trajectory",
-                twt_s=twt_s,
-                md_m=float(row["md_m"]),
-                x_m=float(row["x_m"]),
-                y_m=float(row["y_m"]),
-                inline_float=inline_float,
-                xline_float=xline_float,
-                zone_name=zone_name,
-                u_in_zone=float(u_in_zone),
-                ai=ai,
-                weight=1.0,
-                sample_index=int(row["sample_index"]) if "sample_index" in row and pd.notna(row["sample_index"]) else int(row_index),
-                **trace_fields,
-            )
-        )
-    raw_control_count = len(rows)
-    return rows, attempted, max(0, attempted - raw_control_count), diagnostics
 
 
 def _to_control_points(rows: pd.DataFrame) -> list[Any]:
@@ -828,7 +442,7 @@ def _load_constraints_control_points(
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
-    script_cfg = _deep_update(DEFAULT_CONFIG, dict(cfg.get("lfm_precomputed") or {}))
+    script_cfg = deep_merge_dict(DEFAULT_CONFIG, dict(cfg.get("lfm_precomputed") or {}))
     data_root = REPO_ROOT / str(cfg.get("data_root", "data"))
     output_root = REPO_ROOT / str(cfg.get("output_root", "scripts/output"))
     source_dirs = _resolve_source_dirs(script_cfg, output_root)

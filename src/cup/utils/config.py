@@ -5,16 +5,19 @@
 边界说明
 --------
 - 不依赖任何地球物理库。
-- 合并是就地修改，调用方如需保留原始配置应自行深拷贝。
+- ``merge_dict_defaults`` 是就地修改，调用方如需保留原始配置应自行深拷贝。
+- ``deep_merge_dict`` 返回新 dict，不修改输入。
 
 核心公开对象
 ------------
-1. merge_dict_defaults: 将默认值字典合并到配置 key 下。
+1. merge_dict_defaults: 将默认值字典合并到配置 key 下（就地修改）。
+2. deep_merge_dict: 递归合并两个 dict，返回新的合并结果。
+3. require_latest_mode: 校验 ``source_runs.mode == "latest"``。
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 
 def merge_dict_defaults(config: dict[str, Any], key: str, defaults: dict[str, Any]) -> None:
@@ -33,3 +36,29 @@ def merge_dict_defaults(config: dict[str, Any], key: str, defaults: dict[str, An
     merged = dict(defaults)
     merged.update(value)
     config[key] = merged
+
+
+def deep_merge_dict(base: Mapping[str, Any], updates: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a new dict that recursively merges *updates* into *base*.
+
+    Neither input is modified.  When a key exists in both dicts and both
+    values are dicts, the merge is deep; otherwise the update value wins.
+    """
+    out = {key: (dict(value) if isinstance(value, dict) else value) for key, value in base.items()}
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge_dict(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def require_latest_mode(source_cfg: Mapping[str, Any], *, section: str) -> None:
+    """Raise ``ValueError`` if ``source_runs.mode`` is not ``"latest"``.
+
+    *section* is used in the error message to identify which config block is
+    being checked (e.g. ``"well_constraints"``).
+    """
+    mode = str(source_cfg.get("mode", "latest")).strip().casefold()
+    if mode != "latest":
+        raise ValueError(f"{section}.source_runs.mode only supports 'latest' for now, got {mode!r}.")

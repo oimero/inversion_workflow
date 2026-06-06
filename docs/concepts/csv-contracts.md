@@ -96,9 +96,9 @@
 
 `inline_float`、`xline_float`、`twt_s` 是空间事实的规范坐标；`flat_idx` / `sample_index` 只能在同一地震几何和采样轴内解释。
 
-## `well_anchor_points.csv` / `well_anchor_conflicts.csv`
+## `well_anchor_conflicts.csv`
 
-`well_anchor_points.csv` 是 `well_constraint_points.csv` 中允许进入 GINN 低频 anchor 的子集（第一版默认只含直井）。`well_anchor_conflicts.csv` 记录同一 `(flat_idx, sample_index)` 上有多条井约束被聚合前的差异。
+可选输出。只有 GINN 低频 anchor 中存在同一 `(flat_idx, sample_index)` 上多条井约束时才写出，记录被聚合前的差异。
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -109,20 +109,7 @@
 | `strategy` | 当前聚合策略 |
 | `point_rows_json` | 冲突点的原始井名、位置、目标值和权重 |
 
-## `well_anchor_trace_summary.csv`
-
-每条进入 GINN 低频 anchor 的受控道一行，用于审计道级覆盖。
-
-| 关键字段 | 含义 |
-|----------|------|
-| `flat_idx` | 受控地震道编号 |
-| `well_names` | 约束该道的井名，多井用分号连接 |
-| `sources` | 空间来源类型 |
-| `sample_count` | 该道上有效锚点样点数 |
-| `weight_min` / `weight_mean` / `weight_max` | 该道锚点权重的最小、均值和最大值 |
-| `inline` / `xline` | 该道的线号 |
-
-## `well_high_supervision_qc.csv`
+## `well_constraint_qc.csv`
 
 逐井入选结果和质量控制摘要，每口候选井一行。`status=selected` 表示该井进入点级事实表和 LFM 候选；若该井为斜井，在默认配置下仍不会进入 `well_high_supervision_time.npz` 和 `well_high_stats_*`。
 
@@ -140,6 +127,10 @@
 | `reasons` | 分号分隔的拒绝或失败原因 |
 | `frequency_split_qc_trace_path` | 分频前后曲线数值文件路径 |
 | `frequency_split_qc_figure_path` | 分频 QC 图路径 |
+
+## `well_high_supervision_conflicts.csv`
+
+可选输出。只有 enhance 高频监督点中存在同一 `(flat_idx, sample_index)` 上多条井约束时才写出。字段与 `well_anchor_conflicts.csv` 一致，但审计目标值为 `well_high_log_ai`。
 
 ## `well_high_stats_by_layer.csv`
 
@@ -187,18 +178,6 @@
 | `median_scale` | 最小二乘缩放系数中位数 |
 | `median_n_eval_samples` | 参与评价样点数中位数 |
 
-## `well_high_motif_manifest.csv`
-
-可选真实高频 motif patch 的索引表。第一版只写表头（占位），不生成对应的 motif 数据包。
-
-| 关键字段 | 含义 |
-|----------|------|
-| `motif_id` | motif 编号 |
-| `well_name` / `zone_name` | 来源井和层段 |
-| `start_twt_s` / `end_twt_s` | motif 片段的时间范围 |
-| `quality_tag` | 质量标签 |
-| `reason` | 选择原因 |
-
 ## `lfm_control_points.csv`
 
 | 关键字段 | 含义 |
@@ -214,28 +193,3 @@
 | `weight` | 第六步按井震匹配质量等因素计算的控制点权重 |
 
 `inline_float`、`xline_float`、`twt_s` 是规范坐标。第六步输出的是点级低频控制事实，不按单井、层段或顺层切片聚合；第七步 LFM 根据自己的 `modeling.n_slices` 决定如何分配切片、聚合重复控制点和插值建模。`flat_idx` / `sample_index` 作为派生字段写出，便于 QC 和调试，但它们依赖当前地震几何与采样轴，不能作为跨步骤主键。
-
-## `lfm_log_control_points.csv`
-
-字段与 `lfm_control_points.csv` 基本一致，但控制值列为：
-
-| 关键字段 | 含义 |
-|----------|------|
-| `log_ai` | 第六步分频后的低频 log-AI 控制值 |
-
-这张表用于 log 域建模、审计或后续方法扩展。当前第七步 AI-LFM 主路径读取 `lfm_control_points.csv`。
-
-## `lfm_control_qc.csv`
-
-| 关键字段 | 含义 |
-|----------|------|
-| `well_name` | 井名 |
-| `status` | selected / rejected / failed |
-| `route` | 第四步标定路径 |
-| `batch_corr` / `batch_nmae` | 第五步全局子波批量合成指标 |
-| `control_point_count` | 第六步点级事实中的有效控制样点数量 |
-| `lfm_control_point_count` | 写入 `lfm_control_points.csv` 的 AI 控制点数量 |
-| `lfm_log_control_point_count` | 写入 `lfm_log_control_points.csv` 的 log-AI 控制点数量 |
-| `invalid_point_count` / `invalid_point_fraction` | 因目标层、轨迹、TDT 或曲线问题被丢弃的点 |
-| `unique_trace_count` | 控制点覆盖的唯一 trace 数；斜井通常大于 1 |
-| `reasons` | 拒绝或失败原因 |

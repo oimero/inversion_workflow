@@ -827,7 +827,7 @@ def _load_constraints_control_points(
     constraints_dir: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     control_path = constraints_dir / "lfm_control_points.csv"
-    qc_path = constraints_dir / "lfm_control_qc.csv"
+    qc_path = constraints_dir / "well_constraint_qc.csv"
     summary_path = constraints_dir / "run_summary.json"
     if not control_path.exists():
         raise FileNotFoundError(f"Missing sixth-step LFM control points: {control_path}")
@@ -897,9 +897,7 @@ def main() -> None:
     constraints_dir = source_dirs["well_constraints_dir"]
     control_df, qc_df, constraints_summary = _load_constraints_control_points(constraints_dir)
     control_path = output_dir / "lfm_control_points.csv"
-    qc_path = output_dir / "lfm_control_qc.csv"
     control_df.to_csv(control_path, index=False, encoding="utf-8-sig")
-    qc_df.to_csv(qc_path, index=False, encoding="utf-8-sig")
     if control_df.empty:
         raise ValueError("No LFM control points selected. Check lfm_control_qc.csv for rejection reasons.")
 
@@ -955,6 +953,11 @@ def main() -> None:
 
     _plot_controls(control_df, figures_dir / "qc_control_points.png")
     _plot_lfm_result(result, figures_dir / "qc_ai_lfm_time.png")
+    outputs = {
+        "ai_lfm_time": repo_relative_path(npz_file, root=REPO_ROOT),
+        "control_points": repo_relative_path(control_path, root=REPO_ROOT),
+    }
+
     summary = {
         "source_dirs": {key: repo_relative_path(value, root=REPO_ROOT) for key, value in source_dirs.items()},
         "seismic_file": repo_relative_path(seismic_file, root=REPO_ROOT),
@@ -965,11 +968,7 @@ def main() -> None:
             int((qc_df["status"] == "selected").sum()) if "status" in qc_df.columns else int(control_df["well_name"].nunique())
         ),
         "control_point_count": int(len(control_df)),
-        "outputs": {
-            "ai_lfm_time": repo_relative_path(npz_file, root=REPO_ROOT),
-            "control_points": repo_relative_path(control_path, root=REPO_ROOT),
-            "control_qc": repo_relative_path(qc_path, root=REPO_ROOT),
-        },
+        "outputs": outputs,
         "export_status": export_status,
         "coverage_stats": result.coverage_stats,
     }

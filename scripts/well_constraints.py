@@ -89,7 +89,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "conflicts": {"strategy": "weighted_average"},
     "weights": {"mode": "corr", "corr_floor": 0.3, "corr_span": 0.4, "corr_min_weight": 0.6},
     "lfm_controls": {"min_control_samples_per_well": 16},
-    "motif": {"write_manifest": True},
 }
 
 
@@ -730,7 +729,7 @@ def _make_high_supervision_bundle(
     return bundle
 
 
-def _make_lfm_control_tables(point_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _make_lfm_control_table(point_df: pd.DataFrame) -> pd.DataFrame:
     """Export point-level LFM controls without slice aggregation."""
     base_columns = [
         "well_name",
@@ -755,10 +754,7 @@ def _make_lfm_control_tables(point_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.D
         "batch_nmae",
     ]
     ai_df = point_df.loc[:, base_columns + ["well_low_ai"]].copy()
-    ai_df = ai_df.rename(columns={"well_low_ai": "ai"})
-    log_df = point_df.loc[:, base_columns + ["well_low_log_ai"]].copy()
-    log_df = log_df.rename(columns={"well_low_log_ai": "log_ai"})
-    return ai_df, log_df
+    return ai_df.rename(columns={"well_low_ai": "ai"})
 
 
 def main() -> None:
@@ -928,7 +924,7 @@ def main() -> None:
         )
 
     if not point_frames:
-        qc_path = output_dir / "well_high_supervision_qc.csv"
+        qc_path = output_dir / "well_constraint_qc.csv"
         pd.DataFrame(qc_rows).to_csv(qc_path, index=False, encoding="utf-8-sig")
         raise ValueError(f"No selected well constraint points. Inspect {qc_path}.")
 
@@ -967,29 +963,27 @@ def main() -> None:
 
     point_path = output_dir / "well_constraint_points.csv"
     point_df.to_csv(point_path, index=False, encoding="utf-8-sig")
-    qc_path = output_dir / "well_high_supervision_qc.csv"
+    qc_path = output_dir / "well_constraint_qc.csv"
     qc_df.to_csv(qc_path, index=False, encoding="utf-8-sig")
 
     anchor_points = point_df.loc[point_df["anchor_eligible"].astype(bool)].copy()
-    anchor_points_path = output_dir / "well_anchor_points.csv"
-    anchor_points.to_csv(anchor_points_path, index=False, encoding="utf-8-sig")
     conflicts = build_point_conflict_report(anchor_points, value_col="well_low_log_ai")
-    conflicts_path = output_dir / "well_anchor_conflicts.csv"
-    conflicts.to_csv(conflicts_path, index=False, encoding="utf-8-sig")
+    conflicts_path = output_dir / "well_anchor_conflicts.csv" if not conflicts.empty else None
+    if conflicts_path is not None:
+        conflicts.to_csv(conflicts_path, index=False, encoding="utf-8-sig")
 
     high_conflicts = build_point_conflict_report(high_points, value_col="well_high_log_ai")
-    high_conflicts_path = output_dir / "well_high_supervision_conflicts.csv"
-    high_conflicts.to_csv(high_conflicts_path, index=False, encoding="utf-8-sig")
+    high_conflicts_path = output_dir / "well_high_supervision_conflicts.csv" if not high_conflicts.empty else None
+    if high_conflicts_path is not None:
+        high_conflicts.to_csv(high_conflicts_path, index=False, encoding="utf-8-sig")
 
-    anchor_arrays, anchor_trace_summary = aggregate_trace_arrays(
+    anchor_arrays, _anchor_trace_summary = aggregate_trace_arrays(
         point_df,
         samples,
         target_col="well_low_ai",
         value_cols=["well_low_log_ai"],
         include_anchor_only=True,
     )
-    anchor_trace_summary_path = output_dir / "well_anchor_trace_summary.csv"
-    anchor_trace_summary.to_csv(anchor_trace_summary_path, index=False, encoding="utf-8-sig")
     anchor_metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_script": Path(__file__).name,
@@ -1006,7 +1000,7 @@ def main() -> None:
             "buffer_mode": split_cfg.buffer_mode,
         },
         "point_table": repo_relative_path(point_path, root=REPO_ROOT),
-        "conflicts": repo_relative_path(conflicts_path, root=REPO_ROOT),
+        "conflicts": repo_relative_path(conflicts_path, root=REPO_ROOT) if conflicts_path is not None else None,
     }
     anchor_bundle = build_log_ai_anchor_bundle(
         sample_domain="time",
@@ -1040,7 +1034,9 @@ def main() -> None:
         "base_ai_fields_note": "This package contains well high-frequency supervision only. Read base AI from LFM or GINN outputs.",
         "frequency_split": anchor_metadata["frequency_split"],
         "point_table": repo_relative_path(point_path, root=REPO_ROOT),
-        "high_conflicts": repo_relative_path(high_conflicts_path, root=REPO_ROOT),
+        "high_conflicts": (
+            repo_relative_path(high_conflicts_path, root=REPO_ROOT) if high_conflicts_path is not None else None
+        ),
     }
     supervision_bundle = _make_high_supervision_bundle(
         point_df=high_points,
@@ -1058,26 +1054,9 @@ def main() -> None:
     layer_stats_df.to_csv(layer_stats_path, index=False, encoding="utf-8-sig")
     write_json(shrinkage_path, shrinkage)
 
-    motif_path = output_dir / "well_high_motif_manifest.csv"
-    pd.DataFrame(
-        columns=["motif_id", "well_name", "zone_name", "start_twt_s", "end_twt_s", "quality_tag", "reason"]
-    ).to_csv(motif_path, index=False, encoding="utf-8-sig")
-
-    lfm_control_df, lfm_log_control_df = _make_lfm_control_tables(point_df)
+    lfm_control_df = _make_lfm_control_table(point_df)
     lfm_control_path = output_dir / "lfm_control_points.csv"
-    lfm_log_control_path = output_dir / "lfm_log_control_points.csv"
     lfm_control_df.to_csv(lfm_control_path, index=False, encoding="utf-8-sig")
-    lfm_log_control_df.to_csv(lfm_log_control_path, index=False, encoding="utf-8-sig")
-    lfm_qc = qc_df.rename(columns={"status": "well_constraint_status"}).copy()
-    lfm_qc["status"] = np.where(lfm_qc["well_constraint_status"].eq("selected"), "selected", lfm_qc["well_constraint_status"])
-    lfm_qc["lfm_control_point_count"] = [
-        int(lfm_control_df.loc[lfm_control_df["well_name"].astype(str).eq(str(w))].shape[0]) for w in lfm_qc["well_name"]
-    ]
-    lfm_qc["lfm_log_control_point_count"] = [
-        int(lfm_log_control_df.loc[lfm_log_control_df["well_name"].astype(str).eq(str(w))].shape[0]) for w in lfm_qc["well_name"]
-    ]
-    lfm_qc_path = output_dir / "lfm_control_qc.csv"
-    lfm_qc.to_csv(lfm_qc_path, index=False, encoding="utf-8-sig")
 
     split_diag_path = output_dir / "frequency_split_diagnostics.csv"
     split_diag_df.to_csv(split_diag_path, index=False, encoding="utf-8-sig")
@@ -1094,6 +1073,25 @@ def main() -> None:
         split_diag_df,
         output_dir / "figures" / "frequency_split_wells",
     )
+    outputs = {
+        "well_constraint_points": repo_relative_path(point_path, root=REPO_ROOT),
+        "well_constraint_qc": repo_relative_path(qc_path, root=REPO_ROOT),
+        "lfm_control_points": repo_relative_path(lfm_control_path, root=REPO_ROOT),
+        "log_ai_anchor_time": repo_relative_path(anchor_path, root=REPO_ROOT),
+        "well_high_supervision_time": repo_relative_path(supervision_path, root=REPO_ROOT),
+        "well_high_stats_global": repo_relative_path(global_stats_path, root=REPO_ROOT),
+        "well_high_stats_by_layer": repo_relative_path(layer_stats_path, root=REPO_ROOT),
+        "well_high_stats_shrinkage": repo_relative_path(shrinkage_path, root=REPO_ROOT),
+        "frequency_split_diagnostics": repo_relative_path(split_diag_path, root=REPO_ROOT),
+        "frequency_split_aggregate": repo_relative_path(split_aggregate_path, root=REPO_ROOT),
+        "frequency_split_cutoff_sweep_figure": repo_relative_path(split_diag_figure_path, root=REPO_ROOT),
+        "frequency_split_well_sweep_figures": split_well_figure_paths,
+    }
+    if conflicts_path is not None:
+        outputs["well_anchor_conflicts"] = repo_relative_path(conflicts_path, root=REPO_ROOT)
+    if high_conflicts_path is not None:
+        outputs["well_high_supervision_conflicts"] = repo_relative_path(high_conflicts_path, root=REPO_ROOT)
+
     run_summary = {
         "created_at_utc": anchor_metadata["created_at_utc"],
         "source_script": Path(__file__).name,
@@ -1117,9 +1115,11 @@ def main() -> None:
         "conflicts": {
             "strategy": "weighted_average",
             "point_conflict_count": int(len(conflicts)),
-            "report": repo_relative_path(conflicts_path, root=REPO_ROOT),
+            "report": repo_relative_path(conflicts_path, root=REPO_ROOT) if conflicts_path is not None else None,
             "high_supervision_conflict_count": int(len(high_conflicts)),
-            "high_supervision_report": repo_relative_path(high_conflicts_path, root=REPO_ROOT),
+            "high_supervision_report": (
+                repo_relative_path(high_conflicts_path, root=REPO_ROOT) if high_conflicts_path is not None else None
+            ),
             "high_supervision_include_deviated": include_deviated_high,
         },
         "counts": {
@@ -1139,29 +1139,8 @@ def main() -> None:
             else 0,
             "anchor_trace_count": int(anchor_bundle.n_anchors),
             "lfm_control_point_count": int(len(lfm_control_df)),
-            "lfm_log_control_point_count": int(len(lfm_log_control_df)),
         },
-        "outputs": {
-            "well_constraint_points": repo_relative_path(point_path, root=REPO_ROOT),
-            "log_ai_anchor_time": repo_relative_path(anchor_path, root=REPO_ROOT),
-            "well_anchor_points": repo_relative_path(anchor_points_path, root=REPO_ROOT),
-            "well_anchor_conflicts": repo_relative_path(conflicts_path, root=REPO_ROOT),
-            "well_anchor_trace_summary": repo_relative_path(anchor_trace_summary_path, root=REPO_ROOT),
-            "well_high_supervision_time": repo_relative_path(supervision_path, root=REPO_ROOT),
-            "well_high_supervision_conflicts": repo_relative_path(high_conflicts_path, root=REPO_ROOT),
-            "well_high_supervision_qc": repo_relative_path(qc_path, root=REPO_ROOT),
-            "well_high_stats_global": repo_relative_path(global_stats_path, root=REPO_ROOT),
-            "well_high_stats_by_layer": repo_relative_path(layer_stats_path, root=REPO_ROOT),
-            "well_high_stats_shrinkage": repo_relative_path(shrinkage_path, root=REPO_ROOT),
-            "well_high_motif_manifest": repo_relative_path(motif_path, root=REPO_ROOT),
-            "lfm_control_points": repo_relative_path(lfm_control_path, root=REPO_ROOT),
-            "lfm_log_control_points": repo_relative_path(lfm_log_control_path, root=REPO_ROOT),
-            "lfm_control_qc": repo_relative_path(lfm_qc_path, root=REPO_ROOT),
-            "frequency_split_diagnostics": repo_relative_path(split_diag_path, root=REPO_ROOT),
-            "frequency_split_aggregate": repo_relative_path(split_aggregate_path, root=REPO_ROOT),
-            "frequency_split_cutoff_sweep_figure": repo_relative_path(split_diag_figure_path, root=REPO_ROOT),
-            "frequency_split_well_sweep_figures": split_well_figure_paths,
-        },
+        "outputs": outputs,
     }
     write_json(output_dir / "run_summary.json", run_summary)
 
@@ -1171,7 +1150,6 @@ def main() -> None:
     print(f"Point facts: {len(point_df)}")
     print(f"Anchor traces: {anchor_bundle.n_anchors}")
     print(f"LFM control points: {len(lfm_control_df)}")
-    print("Motif bank: not populated in this version")
 
 
 if __name__ == "__main__":

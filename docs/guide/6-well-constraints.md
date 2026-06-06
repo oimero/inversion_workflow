@@ -87,8 +87,6 @@ well_constraints:
   lfm_controls:
     min_control_samples_per_well: 16
 
-  motif:
-    write_manifest: true
 ```
 
 ### `source_runs`
@@ -174,12 +172,6 @@ well_constraints:
 
 如果旧配置里还写着 `well_constraints.lfm_controls.n_slices`，脚本会直接报错；这个参数应放到 `lfm_precomputed.modeling.n_slices`。
 
-### `motif`
-
-`write_manifest: true` 时，写出一个空的 motif 清单文件作为后续 synthetic generator 的接口占位。第一版不生成 motif 数据包。
-
----
-
 ## 脚本在做什么
 
 脚本分五个阶段：**前置发现 → 点级事实生成 → 分频诊断与拆分 → 低频 anchor 输出 → 高频监督与统计输出**。同一份点级事实表还会导出第七步低频模型需要的点级控制点文件，见下方核心输出文件。
@@ -251,19 +243,13 @@ well_constraints:
 | 文件 | 内容 |
 |------|------|
 | `well_constraint_points.csv` | 点级事实表，每行一个时间样点的完整空间和曲线信息 |
-| `well_high_supervision_qc.csv` | 逐井筛选结果、样点数和分频 QC 图路径 |
-| `well_anchor_points.csv` | 聚合前用于低频 anchor 的点级约束 |
-| `well_anchor_conflicts.csv` | 同一道位置 / 样点位置的井间冲突明细 |
-| `well_anchor_trace_summary.csv` | 每条受控道的井数、样点数和权重统计 |
+| `well_constraint_qc.csv` | 逐井筛选结果、样点数和分频 QC 图路径 |
 | `log_ai_anchor_time.npz` | GINN 训练可直接读取的低频井监督数据包 |
 | `well_high_supervision_time.npz` | enhance 训练可直接读取的高频井监督数据包，默认只含直井 |
 | `well_high_stats_global.json` | 全目标窗高频残余统计，默认只含直井 |
 | `well_high_stats_by_layer.csv` | 每层的经验统计和可靠度，默认只含直井 |
 | `well_high_stats_shrinkage.json` | 每层收缩后的最终生成参数，默认只含直井 |
-| `well_high_motif_manifest.csv` | motif patch 清单（第一版为空占位） |
 | `lfm_control_points.csv` | 第七步 LFM 读取的点级低频 AI 控制点文件；不做顺层切片聚合 |
-| `lfm_log_control_points.csv` | 点级低频 log-AI 控制点文件，供后续 log 域建模或审计使用 |
-| `lfm_control_qc.csv` | 逐井筛选结果和 LFM 控制点数量 |
 | `target_layer_qc/*` | 目标层 mask、层厚、层位有效性 QC |
 | `frequency_split_diagnostics.csv` | 逐井逐候选 cutoff 的正演匹配指标 |
 | `frequency_split_aggregate.csv` | 多井聚合后的候选 cutoff 指标 |
@@ -272,6 +258,8 @@ well_constraints:
 | `frequency_split_qc/traces/*.csv` | 每口井分频前后的曲线数值 |
 | `frequency_split_qc/figures/*.png` | 每口井的分频 QC 图 |
 | `run_summary.json` | 输入路径、筛选统计、分频参数和所有输出路径 |
+
+如果密井冲突真实发生，脚本会额外写出 `well_anchor_conflicts.csv` 或 `well_high_supervision_conflicts.csv`；没有冲突时不写空文件，只在 `run_summary.json` 里记录冲突数为 0。
 
 ### `well_constraint_points.csv`
 
@@ -303,18 +291,11 @@ well_constraints:
 
 ### `well_high_supervision_time.npz`
 
-enhance 训练读取的高频井监督数据包，使用 `well_high_supervision_v1` schema。它只包含井上的全频 log-AI、低频 log-AI、高频 log-AI、掩码、权重、采样轴和井名 / 道位置，不包含 LFM 或 base AI 字段。默认只使用直井样点；斜井样点保留在点级事实表中，但不写入该训练包。训练端若需要底阻抗输入，应读取第七步 LFM 或 GINN 输出。
+enhance 训练读取的高频井监督数据包，使用 `well_high_supervision_v1` schema，包含井上的全频 log-AI、低频 log-AI、高频 log-AI、掩码、权重、采样轴和井名 / 道位置。默认只使用直井样点；斜井样点保留在点级事实表中，但不写入该训练包。训练端若需要底阻抗输入，应读取第七步 LFM 或 GINN 输出。
 
-### `lfm_control_points.csv` / `lfm_log_control_points.csv`
+### `lfm_control_points.csv`
 
-这两个文件是第七步 LFM 的点级低频控制事实：
-
-| 文件 | 控制值 |
-|------|--------|
-| `lfm_control_points.csv` | `ai`，即第六步分频后的低频 AI |
-| `lfm_log_control_points.csv` | `log_ai`，即第六步分频后的低频 log-AI |
-
-二者都保留 `twt_s`、`inline_float`、`xline_float`、`zone_name`、`u_in_zone`、`weight` 等点级坐标和质量字段。第六步不按 `well + zone + slice` 聚合；第七步会根据自己的 `modeling.n_slices` 把这些点分配到顺层切片，再完成插值建模。
+第七步 LFM 的点级低频 AI 控制事实。控制值列 `ai` 是第六步分频后的低频 AI，同时保留 `twt_s`、`inline_float`、`xline_float`、`zone_name`、`u_in_zone`、`weight` 等点级坐标和质量字段。第六步不按 `well + zone + slice` 聚合；第七步会根据自己的 `modeling.n_slices` 把这些点分配到顺层切片，再完成插值建模。
 
 ### `well_high_stats_by_layer.csv`
 
@@ -339,7 +320,7 @@ enhance 训练读取的高频井监督数据包，使用 `well_high_supervision_
 
 这些数字应该与第四步的标定成功井数、目标层覆盖范围在量级上匹配。如果入选井数远少于第四步的成功井数，优先看质量控制文件的拒绝原因分布。
 
-### 第二步：看 `well_high_supervision_qc.csv`
+### 第二步：看 `well_constraint_qc.csv`
 
 确认每口井的入选状态和拒绝原因。`status=selected` 表示该井进入点级事实表和 LFM 候选；是否实际进入 enhance 训练材料看 `high_supervision_eligible` 和 `high_supervision_point_count`。默认配置下，斜井即使点级事实入选，这两项也会显示未进入高频监督。常见拒绝原因：
 
@@ -351,9 +332,9 @@ enhance 训练读取的高频井监督数据包，使用 `well_high_supervision_
 
 对入选井，看样点数和唯一道数。直井的唯一道数应为 1；斜井应大于 1。如果斜井所有样点落在同一道上，要回头检查第四步的空间映射。
 
-### 第三步：看 `well_anchor_conflicts.csv`
+### 第三步：看冲突报告
 
-如果存在多口井落到同一个道位置和样点位置上的记录，说明存在密井冲突。看冲突文件中的值差距——同一位置上的波阻抗值差异越大，权重平均的效果就越值得怀疑。目前第一版用加权平均处理冲突，更精细的策略（如保留最高置信度、遇冲突直接失败）留到后续版本。
+如果 `run_summary.json` 中的冲突数大于 0，再打开对应的 `well_anchor_conflicts.csv` 或 `well_high_supervision_conflicts.csv`。同一位置上的值差异越大，权重平均的效果就越值得怀疑。目前第一版用加权平均处理冲突，更精细的策略（如保留最高置信度、遇冲突直接失败）留到后续版本。
 
 ### 第四步：看 `well_high_stats_by_layer.csv`
 
@@ -382,14 +363,14 @@ enhance 训练读取的高频井监督数据包，使用 `well_high_supervision_
 | 分频诊断在候选截止频率上全部不理想 | 候选范围不覆盖当前数据的合理分频点 | 扩大候选截止频率范围，或改用手动模式指定一个已知合适的值 |
 | 某口斜井缺少样点计划文件 | 第四步未为该斜井写出细标定后的空间映射 | 回到第四步检查斜井路径是否执行成功 |
 | 落入目标层的有效样点不足 | 时深表范围未覆盖目标层，或 LAS 曲线在目标层深度内没有值 | 检查时深表覆盖范围、目标层配置和 LAS 曲线深度范围 |
-| LFM 控制点为空 | 所有井都被过滤，或目标层内没有有效低频控制样点 | 检查 `lfm_control_qc.csv`、入选井样点数、目标层覆盖和第五步批量合成门槛 |
+| LFM 控制点为空 | 所有井都被过滤，或目标层内没有有效低频控制样点 | 检查 `well_constraint_qc.csv`、入选井样点数、目标层覆盖和第五步批量合成门槛 |
 
 ---
 
 ## 留到第二轮
 
 - 冲突策略从仅支持加权平均扩展到保留最高置信度、丢弃冲突点和遇冲突直接失败。
-- motif patch 的提取、质量标签和数据包生成。
+- motif patch 的提取、质量标签和数据包生成；到那时再输出真实 manifest，不再写空占位。
 - 正演分频诊断进一步加入空间去偏聚合，避免密井平台主导 cutoff 选择。
 - 斜井 anchor 支持（当前 `include_deviated` 默认为关）。
 - 分频 QC 增加分层叠加图：在同一张图上按层段着色显示高频残余，方便对比不同层的分频效果。

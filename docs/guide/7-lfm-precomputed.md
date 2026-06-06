@@ -25,8 +25,7 @@ python scripts/lfm_precomputed.py --output-dir scripts/output/lfm_precomputed_te
 | 来源 | 内容 | 用途 |
 |------|------|------|
 | 第六步 | `lfm_control_points.csv` | 点级低频 AI 控制事实 |
-| 第六步 | `lfm_control_qc.csv` / `run_summary.json` | 控制井 QC 和分频配置审计 |
-| 第六步 | `lfm_log_control_points.csv` | 可选审计文件；当前 AI-LFM 主路径不读取 |
+| 第六步 | `well_constraint_qc.csv` / `run_summary.json` | 控制井 QC 和分频配置审计 |
 | 地震数据 | 地震体 + 顶底解释层位 | 提供时间轴、工区几何和目标层 mask |
 
 直井和斜井控制点的空间来源、曲线分频和密井冲突审计都在第六步完成。第七步校验点级控制点 CSV 契约和目标层位，然后用自己的 `modeling.n_slices` 做顺层切片建模。
@@ -115,7 +114,7 @@ lfm_precomputed:
 
 ### 第二阶段：控制点读取
 
-第七步读取第六步写出的 `lfm_control_points.csv`，校验字段、正值 AI、有限坐标和 `u_in_zone` 范围，然后把控制点和 `lfm_control_qc.csv` 复制到本次第七步输出目录。第六步不再提供 `n_slices`，切片数量只由本步骤的 `modeling.n_slices` 决定。
+第七步读取第六步写出的 `lfm_control_points.csv`，校验字段、正值 AI、有限坐标和 `u_in_zone` 范围，然后把控制点复制到本次第七步输出目录。第六步不再提供 `n_slices`，切片数量只由本步骤的 `modeling.n_slices` 决定。
 
 ### 第三阶段：层位约束建模
 
@@ -150,7 +149,6 @@ lfm_precomputed:
 | `ai_lfm_time.npz` | GINN 训练可直接读取的波阻抗低频模型 |
 | `ai_lfm_time.segy` 或 `.zgy` | 可选地震体导出，格式跟随源地震 |
 | `lfm_control_points.csv` | 点级控制样本，每行一个目标层内低频 AI 控制点 |
-| `lfm_control_qc.csv` | 逐井筛选结果、控制点数量和无效比例 |
 | `target_layer_qc/*` | 目标层 mask、层厚、层位有效性 QC |
 | `figures/*.png` | 控制点分布图和 LFM 剖面图 |
 | `run_summary.json` | 输入路径、筛选统计、建模参数和输出路径 |
@@ -191,19 +189,13 @@ lfm_precomputed:
 
 ## 如何阅读结果
 
-### 第一步：看 `lfm_control_qc.csv`
-
-优先确认入选井的 `status` 分布。`rejected` 井的数量和原因（`batch_corr_below_threshold`、`too_few_control_samples`、`missing_optimized_trace_sample_plan` 等）直接反映第四步和第五步的衔接质量。
-
-对入选井，看 `control_point_count` 和 `invalid_point_fraction`。无效比例过高通常说明时深表、井轨迹或目标层解释没有充分重叠。
-
-斜井的 `unique_trace_count` 应大于 1。如果斜井所有控制点落在同一 trace 上，要回头检查第四步空间映射。
-
-### 第二步：看 `lfm_control_points.csv`
+### 第一步：看 `lfm_control_points.csv`
 
 抽查几口斜井的 `inline_float` / `xline_float` 是否随 `twt_s` 变化。直井的这两个字段应恒定。同时检查 `u_in_zone` 覆盖是否均匀——集中在某个窄范围说明该井只有部分曲线段落落入目标层。
 
-### 第三步：看图
+若入选井或点数不符合预期，回到第六步的 `well_constraint_qc.csv` 看拒绝原因和无效样点比例。
+
+### 第二步：看图
 
 `figures/` 中的控制点分布图用于判断是否存在空间偏差：某个平台井群的密度是否远超其他区域。同一张切片里如果多口井落到重复 `(inline, xline)` 坐标，第七步会在切片建模时按权重聚合这些重复坐标，再交给克里金插值。
 
@@ -213,7 +205,7 @@ lfm_precomputed:
 
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
-| `No LFM control points selected` | 第六步没有生成可用低频控制点 | 检查第六步 `lfm_control_qc.csv`、`well_high_supervision_qc.csv` 和 `run_summary.json`；上游第四步标定、第五步批量合成门槛或第六步目标层覆盖都可能是原因 |
+| `No LFM control points selected` | 第六步没有生成可用低频控制点 | 检查第六步 `well_constraint_qc.csv` 和 `run_summary.json`；上游第四步标定、第五步批量合成门槛或第六步目标层覆盖都可能是原因 |
 | `target_layer geometry domain is not time` | 地震数据不在时间域 | 确认地震体路径和类型正确 |
 | 某口斜井 `missing_optimized_trace_sample_plan` | 第四步未为该斜井写出细标定后的空间映射 | 回到第四步检查斜井路径是否执行成功，以及 `well_tie_metrics.csv` 是否有 `optimized_trace_sample_plan_file` |
 | `too_few_control_samples` | 落入目标层的有效样点不足 | 检查时深表范围是否覆盖目标层；LAS 曲线在目标层深度内是否有值 |

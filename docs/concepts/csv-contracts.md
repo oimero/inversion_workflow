@@ -77,7 +77,7 @@
 
 ## `well_constraint_points.csv`
 
-第六步写出的点级井约束事实表。它是低频 anchor、高频井监督、高频统计和 LFM 控制点的共同来源。默认训练材料只使用直井点；斜井点保留在事实表中用于审计和 LFM 控制点候选，不默认进入 GINN 或 enhance 训练。
+第六步写出的点级井约束事实表。它是低频 anchor、高频井监督、高频统计和 LFM 点级控制点的共同来源。默认训练材料只使用直井点；斜井点保留在事实表中用于审计和 LFM 控制点候选，不默认进入 GINN 或 enhance 训练。
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -199,7 +199,7 @@
 | `quality_tag` | 质量标签 |
 | `reason` | 选择原因 |
 
-## `lfm_layer_control_points.csv`
+## `lfm_control_points.csv`
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -213,7 +213,17 @@
 | `ai` | 第六步分频后的低频 AI 控制值 |
 | `weight` | 第六步按井震匹配质量等因素计算的控制点权重 |
 
-`inline_float`、`xline_float`、`twt_s` 是规范坐标。第六步输出的是按单井、层段和切片聚合后的代表控制点，第七步只消费它做 LFM 建模。`flat_idx` / `sample_index` 作为派生字段写出，便于 QC 和调试，但它们依赖当前地震几何与采样轴，不能作为跨步骤主键。
+`inline_float`、`xline_float`、`twt_s` 是规范坐标。第六步输出的是点级低频控制事实，不按单井、层段或顺层切片聚合；第七步 LFM 根据自己的 `modeling.n_slices` 决定如何分配切片、聚合重复控制点和插值建模。`flat_idx` / `sample_index` 作为派生字段写出，便于 QC 和调试，但它们依赖当前地震几何与采样轴，不能作为跨步骤主键。
+
+## `lfm_log_control_points.csv`
+
+字段与 `lfm_control_points.csv` 基本一致，但控制值列为：
+
+| 关键字段 | 含义 |
+|----------|------|
+| `log_ai` | 第六步分频后的低频 log-AI 控制值 |
+
+这张表用于 log 域建模、审计或后续方法扩展。当前第七步 AI-LFM 主路径读取 `lfm_control_points.csv`。
 
 ## `lfm_control_qc.csv`
 
@@ -223,7 +233,9 @@
 | `status` | selected / rejected / failed |
 | `route` | 第四步标定路径 |
 | `batch_corr` / `batch_nmae` | 第五步全局子波批量合成指标 |
-| `control_point_count` | 进入 LFM 的有效控制点数量 |
+| `control_point_count` | 第六步点级事实中的有效控制样点数量 |
+| `lfm_control_point_count` | 写入 `lfm_control_points.csv` 的 AI 控制点数量 |
+| `lfm_log_control_point_count` | 写入 `lfm_log_control_points.csv` 的 log-AI 控制点数量 |
 | `invalid_point_count` / `invalid_point_fraction` | 因目标层、轨迹、TDT 或曲线问题被丢弃的点 |
 | `unique_trace_count` | 控制点覆盖的唯一 trace 数；斜井通常大于 1 |
 | `reasons` | 拒绝或失败原因 |

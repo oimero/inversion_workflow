@@ -105,7 +105,7 @@ def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[
     if mode != "latest":
         raise ValueError(f"lfm_precomputed.source_runs.mode only supports 'latest' for now, got {mode!r}.")
     constraints_dir = (
-        _latest_run(output_root, "well_constraints", "lfm_layer_control_points.csv")
+        _latest_run(output_root, "well_constraints", "lfm_control_points.csv")
         if constraints_dir_value in {None, ""}
         else resolve_relative_path(constraints_dir_value, root=REPO_ROOT)
     )
@@ -825,10 +825,8 @@ def _should_export_volume(export_cfg: dict[str, Any], seismic_type: str) -> bool
 
 def _load_constraints_control_points(
     constraints_dir: Path,
-    *,
-    expected_n_slices: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    control_path = constraints_dir / "lfm_layer_control_points.csv"
+    control_path = constraints_dir / "lfm_control_points.csv"
     qc_path = constraints_dir / "lfm_control_qc.csv"
     summary_path = constraints_dir / "run_summary.json"
     if not control_path.exists():
@@ -853,31 +851,21 @@ def _load_constraints_control_points(
     }
     missing = required - set(control_df.columns)
     if missing:
-        raise ValueError(f"lfm_layer_control_points.csv is missing required columns: {sorted(missing)}")
+        raise ValueError(f"lfm_control_points.csv is missing required columns: {sorted(missing)}")
     if control_df.empty:
         raise ValueError(f"Sixth-step LFM control table is empty: {control_path}")
     for col in ["twt_s", "inline_float", "xline_float", "u_in_zone", "ai", "weight"]:
         values = control_df[col].to_numpy(dtype=float)
         if np.any(~np.isfinite(values)):
-            raise ValueError(f"lfm_layer_control_points.csv column {col!r} contains non-finite values.")
+            raise ValueError(f"lfm_control_points.csv column {col!r} contains non-finite values.")
     if np.any(control_df["ai"].to_numpy(dtype=float) <= 0.0):
-        raise ValueError("lfm_layer_control_points.csv column 'ai' must be positive.")
+        raise ValueError("lfm_control_points.csv column 'ai' must be positive.")
     if np.any((control_df["u_in_zone"].to_numpy(dtype=float) < 0.0) | (control_df["u_in_zone"].to_numpy(dtype=float) > 1.0)):
-        raise ValueError("lfm_layer_control_points.csv column 'u_in_zone' must be within [0, 1].")
+        raise ValueError("lfm_control_points.csv column 'u_in_zone' must be within [0, 1].")
 
     summary: dict[str, Any] = {}
     if summary_path.exists():
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        source_n_slices = (
-            summary.get("config", {})
-            .get("lfm_controls", {})
-            .get("n_slices")
-        )
-        if source_n_slices is not None and int(source_n_slices) != int(expected_n_slices):
-            raise ValueError(
-                "lfm_precomputed.modeling.n_slices must match well_constraints.lfm_controls.n_slices "
-                f"({expected_n_slices} != {source_n_slices})."
-            )
     qc_df = pd.read_csv(qc_path) if qc_path.exists() else pd.DataFrame()
     return control_df, qc_df, summary
 
@@ -907,11 +895,8 @@ def main() -> None:
     target_layer, horizon_metadata = _build_target_layer(script_cfg, geometry, qc_dir, data_root)
     sample_axis = survey.sample_axis("time").values.astype(np.float64)
     constraints_dir = source_dirs["well_constraints_dir"]
-    control_df, qc_df, constraints_summary = _load_constraints_control_points(
-        constraints_dir,
-        expected_n_slices=int(script_cfg["modeling"]["n_slices"]),
-    )
-    control_path = output_dir / "lfm_layer_control_points.csv"
+    control_df, qc_df, constraints_summary = _load_constraints_control_points(constraints_dir)
+    control_path = output_dir / "lfm_control_points.csv"
     qc_path = output_dir / "lfm_control_qc.csv"
     control_df.to_csv(control_path, index=False, encoding="utf-8-sig")
     qc_df.to_csv(qc_path, index=False, encoding="utf-8-sig")

@@ -32,7 +32,6 @@ from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_
 from cup.well.assets import normalize_well_name
 from cup.well.constraints import (
     FrequencySplitConfig,
-    aggregate_lfm_control_points,
     aggregate_trace_arrays,
     apply_frequency_split,
     build_deviated_point_facts,
@@ -89,7 +88,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "high_supervision": {"include_deviated": False},
     "conflicts": {"strategy": "weighted_average"},
     "weights": {"mode": "corr", "corr_floor": 0.3, "corr_span": 0.4, "corr_min_weight": 0.6},
-    "lfm_controls": {"n_slices": 20, "min_control_samples_per_well": 16},
+    "lfm_controls": {"min_control_samples_per_well": 16},
     "motif": {"write_manifest": True},
 }
 
@@ -731,10 +730,46 @@ def _make_high_supervision_bundle(
     return bundle
 
 
+def _make_lfm_control_tables(point_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Export point-level LFM controls without slice aggregation."""
+    base_columns = [
+        "well_name",
+        "route",
+        "source",
+        "twt_s",
+        "md_m",
+        "x_m",
+        "y_m",
+        "inline_float",
+        "xline_float",
+        "nearest_inline",
+        "nearest_xline",
+        "inline_index",
+        "xline_index",
+        "flat_idx",
+        "sample_index",
+        "zone_name",
+        "u_in_zone",
+        "weight",
+        "batch_corr",
+        "batch_nmae",
+    ]
+    ai_df = point_df.loc[:, base_columns + ["well_low_ai"]].copy()
+    ai_df = ai_df.rename(columns={"well_low_ai": "ai"})
+    log_df = point_df.loc[:, base_columns + ["well_low_log_ai"]].copy()
+    log_df = log_df.rename(columns={"well_low_log_ai": "log_ai"})
+    return ai_df, log_df
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
     script_cfg = _deep_update(DEFAULT_CONFIG, dict(cfg.get("well_constraints") or {}))
+    if "n_slices" in dict(script_cfg.get("lfm_controls") or {}):
+        raise ValueError(
+            "well_constraints.lfm_controls.n_slices has moved to lfm_precomputed.modeling.n_slices; "
+            "step 06 exports point-level LFM controls only."
+        )
     data_root = REPO_ROOT / str(cfg.get("data_root", "data"))
     output_root = REPO_ROOT / str(cfg.get("output_root", "scripts/output"))
     source_dirs = _resolve_source_dirs(script_cfg, output_root)
@@ -1028,17 +1063,18 @@ def main() -> None:
         columns=["motif_id", "well_name", "zone_name", "start_twt_s", "end_twt_s", "quality_tag", "reason"]
     ).to_csv(motif_path, index=False, encoding="utf-8-sig")
 
-    lfm_control_df, lfm_aggregated_count = aggregate_lfm_control_points(
-        point_df,
-        n_slices=int(script_cfg["lfm_controls"]["n_slices"]),
-    )
-    lfm_control_path = output_dir / "lfm_layer_control_points.csv"
+    lfm_control_df, lfm_log_control_df = _make_lfm_control_tables(point_df)
+    lfm_control_path = output_dir / "lfm_control_points.csv"
+    lfm_log_control_path = output_dir / "lfm_log_control_points.csv"
     lfm_control_df.to_csv(lfm_control_path, index=False, encoding="utf-8-sig")
+    lfm_log_control_df.to_csv(lfm_log_control_path, index=False, encoding="utf-8-sig")
     lfm_qc = qc_df.rename(columns={"status": "well_constraint_status"}).copy()
     lfm_qc["status"] = np.where(lfm_qc["well_constraint_status"].eq("selected"), "selected", lfm_qc["well_constraint_status"])
-    lfm_qc["raw_point_count"] = lfm_qc["control_point_count"]
-    lfm_qc["aggregated_point_count"] = [
+    lfm_qc["lfm_control_point_count"] = [
         int(lfm_control_df.loc[lfm_control_df["well_name"].astype(str).eq(str(w))].shape[0]) for w in lfm_qc["well_name"]
+    ]
+    lfm_qc["lfm_log_control_point_count"] = [
+        int(lfm_log_control_df.loc[lfm_log_control_df["well_name"].astype(str).eq(str(w))].shape[0]) for w in lfm_qc["well_name"]
     ]
     lfm_qc_path = output_dir / "lfm_control_qc.csv"
     lfm_qc.to_csv(lfm_qc_path, index=False, encoding="utf-8-sig")
@@ -1103,7 +1139,7 @@ def main() -> None:
             else 0,
             "anchor_trace_count": int(anchor_bundle.n_anchors),
             "lfm_control_point_count": int(len(lfm_control_df)),
-            "lfm_aggregated_point_count": int(lfm_aggregated_count),
+            "lfm_log_control_point_count": int(len(lfm_log_control_df)),
         },
         "outputs": {
             "well_constraint_points": repo_relative_path(point_path, root=REPO_ROOT),
@@ -1118,7 +1154,8 @@ def main() -> None:
             "well_high_stats_by_layer": repo_relative_path(layer_stats_path, root=REPO_ROOT),
             "well_high_stats_shrinkage": repo_relative_path(shrinkage_path, root=REPO_ROOT),
             "well_high_motif_manifest": repo_relative_path(motif_path, root=REPO_ROOT),
-            "lfm_layer_control_points": repo_relative_path(lfm_control_path, root=REPO_ROOT),
+            "lfm_control_points": repo_relative_path(lfm_control_path, root=REPO_ROOT),
+            "lfm_log_control_points": repo_relative_path(lfm_log_control_path, root=REPO_ROOT),
             "lfm_control_qc": repo_relative_path(lfm_qc_path, root=REPO_ROOT),
             "frequency_split_diagnostics": repo_relative_path(split_diag_path, root=REPO_ROOT),
             "frequency_split_aggregate": repo_relative_path(split_aggregate_path, root=REPO_ROOT),

@@ -74,7 +74,6 @@ __all__ = [
     "CONFLICT_COLUMNS",
     "FrequencySplitConfig",
     "POINT_COLUMNS",
-    "aggregate_lfm_control_points",
     "aggregate_trace_arrays",
     "apply_frequency_split",
     "build_deviated_point_facts",
@@ -574,42 +573,6 @@ def build_deviated_point_facts(
     )
 
 
-def aggregate_lfm_control_points(point_df: pd.DataFrame, *, n_slices: int) -> tuple[pd.DataFrame, int]:
-    """Aggregate point facts to LFM layer control points."""
-    if point_df.empty:
-        return pd.DataFrame(), 0
-    frame = point_df.copy()
-    frame["_slice_index"] = [_slice_index_from_u(float(v), int(n_slices)) for v in frame["u_in_zone"]]
-    rows: list[dict[str, Any]] = []
-    removed = 0
-    group_cols = ["well_name", "route", "source", "zone_name", "_slice_index"]
-    for (_, _, source, zone_name, _), group in frame.groupby(group_cols, sort=False):
-        removed += max(0, int(len(group) - 1))
-        weight = np.maximum(group["weight"].to_numpy(dtype=float), 0.0)
-        if not np.any(weight > 0.0):
-            weight = np.ones_like(weight)
-        rows.append(
-            {
-                "well_name": str(group["well_name"].iloc[0]),
-                "route": str(group["route"].iloc[0]),
-                "source": str(source),
-                "twt_s": _weighted_mean(group["twt_s"], weight),
-                "md_m": _weighted_mean(group["md_m"], weight),
-                "x_m": _weighted_mean(group["x_m"], weight),
-                "y_m": _weighted_mean(group["y_m"], weight),
-                "inline_float": _weighted_mean(group["inline_float"], weight),
-                "xline_float": _weighted_mean(group["xline_float"], weight),
-                "zone_name": str(zone_name),
-                "u_in_zone": _weighted_mean(group["u_in_zone"], weight),
-                "ai": _weighted_mean(group["well_low_ai"], weight),
-                "weight": float(np.mean(weight)),
-                "flat_idx": int(round(_weighted_mean(group["flat_idx"], weight))),
-                "sample_index": int(round(_weighted_mean(group["sample_index"], weight))),
-            }
-        )
-    return pd.DataFrame(rows), int(removed)
-
-
 def build_point_conflict_report(point_df: pd.DataFrame, *, value_col: str = "well_low_log_ai") -> pd.DataFrame:
     """Report duplicate nearest trace/sample constraints before aggregation."""
     rows: list[dict[str, Any]] = []
@@ -810,14 +773,6 @@ def layer_shrinkage_stats(point_df: pd.DataFrame, *, sample_step_s: float | None
             "final": _blend_stats(empirical, global_stats, alpha),
         }
     return global_stats, pd.DataFrame(rows), shrinkage
-
-
-def _slice_index_from_u(u_in_zone: float, n_slices: int) -> int:
-    if n_slices < 2:
-        raise ValueError(f"n_slices must be >= 2, got {n_slices}.")
-    slice_u = np.linspace(0.0, 1.0, int(n_slices), dtype=np.float64)
-    boundaries = 0.5 * (slice_u[:-1] + slice_u[1:])
-    return int(np.searchsorted(boundaries, float(u_in_zone), side="right"))
 
 
 def _weighted_mean(values: Any, weight: np.ndarray) -> float:

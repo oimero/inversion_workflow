@@ -85,7 +85,6 @@ well_constraints:
     corr_min_weight: 0.6
 
   lfm_controls:
-    n_slices: 20
     min_control_samples_per_well: 16
 
   motif:
@@ -169,10 +168,11 @@ well_constraints:
 
 | 参数 | 含义 |
 |------|------|
-| `n_slices` | 顺层切片数量。必须与第七步 LFM 配置中的同名参数一致 |
 | `min_control_samples_per_well` | 单井最少有效样点数，低于此值的井被排除 |
 
-第七步 LFM 会校验 `n_slices` 是否与本步骤一致，不一致则直接报错。
+第六步只负责输出点级低频控制事实，不在这里按层段或顺层切片聚合。顺层切片数量、切片聚合和空间插值都属于第七步 LFM。
+
+如果旧配置里还写着 `well_constraints.lfm_controls.n_slices`，脚本会直接报错；这个参数应放到 `lfm_precomputed.modeling.n_slices`。
 
 ### `motif`
 
@@ -182,7 +182,7 @@ well_constraints:
 
 ## 脚本在做什么
 
-脚本分五个阶段：**前置发现 → 点级事实生成 → 分频诊断与拆分 → 低频 anchor 输出 → 高频监督与统计输出**。同一份点级事实表还会顺手整理出第七步低频模型需要的控制点文件，见下方核心输出文件。
+脚本分五个阶段：**前置发现 → 点级事实生成 → 分频诊断与拆分 → 低频 anchor 输出 → 高频监督与统计输出**。同一份点级事实表还会导出第七步低频模型需要的点级控制点文件，见下方核心输出文件。
 
 ### 第一阶段：前置发现
 
@@ -261,7 +261,8 @@ well_constraints:
 | `well_high_stats_by_layer.csv` | 每层的经验统计和可靠度，默认只含直井 |
 | `well_high_stats_shrinkage.json` | 每层收缩后的最终生成参数，默认只含直井 |
 | `well_high_motif_manifest.csv` | motif patch 清单（第一版为空占位） |
-| `lfm_layer_control_points.csv` | 第七步 LFM 读取的低频模型控制点文件；由点级事实表按单井、层段和切片聚合得到 |
+| `lfm_control_points.csv` | 第七步 LFM 读取的点级低频 AI 控制点文件；不做顺层切片聚合 |
+| `lfm_log_control_points.csv` | 点级低频 log-AI 控制点文件，供后续 log 域建模或审计使用 |
 | `lfm_control_qc.csv` | 逐井筛选结果和 LFM 控制点数量 |
 | `target_layer_qc/*` | 目标层 mask、层厚、层位有效性 QC |
 | `frequency_split_diagnostics.csv` | 逐井逐候选 cutoff 的正演匹配指标 |
@@ -304,6 +305,17 @@ well_constraints:
 
 enhance 训练读取的高频井监督数据包，使用 `well_high_supervision_v1` schema。它只包含井上的全频 log-AI、低频 log-AI、高频 log-AI、掩码、权重、采样轴和井名 / 道位置，不包含 LFM 或 base AI 字段。默认只使用直井样点；斜井样点保留在点级事实表中，但不写入该训练包。训练端若需要底阻抗输入，应读取第七步 LFM 或 GINN 输出。
 
+### `lfm_control_points.csv` / `lfm_log_control_points.csv`
+
+这两个文件是第七步 LFM 的点级低频控制事实：
+
+| 文件 | 控制值 |
+|------|--------|
+| `lfm_control_points.csv` | `ai`，即第六步分频后的低频 AI |
+| `lfm_log_control_points.csv` | `log_ai`，即第六步分频后的低频 log-AI |
+
+二者都保留 `twt_s`、`inline_float`、`xline_float`、`zone_name`、`u_in_zone`、`weight` 等点级坐标和质量字段。第六步不按 `well + zone + slice` 聚合；第七步会根据自己的 `modeling.n_slices` 把这些点分配到顺层切片，再完成插值建模。
+
 ### `well_high_stats_by_layer.csv`
 
 每层一行，记录该层的统计特征和可靠度。关键列包括：有效井数、有效样点数、事件数、可靠度（决定收缩强度）、振幅分位数、事件密度、正负状态持续长度的分位数，以及转移矩阵。
@@ -322,7 +334,7 @@ enhance 训练读取的高频井监督数据包，使用 `well_high_supervision_
 
 - 入选井数、点级事实总数
 - anchor 受控道数
-- LFM 控制点数（聚合后）
+- LFM 点级控制点数
 - 分频诊断选出的截止频率
 
 这些数字应该与第四步的标定成功井数、目标层覆盖范围在量级上匹配。如果入选井数远少于第四步的成功井数，优先看质量控制文件的拒绝原因分布。
@@ -370,7 +382,7 @@ enhance 训练读取的高频井监督数据包，使用 `well_high_supervision_
 | 分频诊断在候选截止频率上全部不理想 | 候选范围不覆盖当前数据的合理分频点 | 扩大候选截止频率范围，或改用手动模式指定一个已知合适的值 |
 | 某口斜井缺少样点计划文件 | 第四步未为该斜井写出细标定后的空间映射 | 回到第四步检查斜井路径是否执行成功 |
 | 落入目标层的有效样点不足 | 时深表范围未覆盖目标层，或 LAS 曲线在目标层深度内没有值 | 检查时深表覆盖范围、目标层配置和 LAS 曲线深度范围 |
-| LFM 控制点为空 | 所有入选井在切片整理时被过滤 | 检查 `n_slices` 是否过大导致每张切片没有足够的控制点 |
+| LFM 控制点为空 | 所有井都被过滤，或目标层内没有有效低频控制样点 | 检查 `lfm_control_qc.csv`、入选井样点数、目标层覆盖和第五步批量合成门槛 |
 
 ---
 

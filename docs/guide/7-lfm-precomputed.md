@@ -4,7 +4,7 @@
 
 本步的核心不再是"一口井一个控制点"，而是"目标层内的样点控制"——每口井在目的层内贡献数十到上百个带空间坐标的波阻抗样点，斜井样点随轨迹分布在不同的 inline/xline 上。
 
-第二轮重构后，第六步 `well_constraints.py` 已经前置生成共享井空间事实和分频事实；本步消费 `lfm_layer_control_points.csv` 并专注于顺层插值建模，不再从 LAS、TDT 或井轨迹临时拼井约束。
+第二轮重构后，第六步 `well_constraints.py` 已经前置生成共享井空间事实和分频事实；本步消费点级 `lfm_control_points.csv`，并在第七步内部完成顺层切片、必要的重复点聚合和插值建模，不再从 LAS、TDT 或井轨迹临时拼井约束。
 
 ---
 
@@ -24,11 +24,12 @@ python scripts/lfm_precomputed.py --output-dir scripts/output/lfm_precomputed_te
 
 | 来源 | 内容 | 用途 |
 |------|------|------|
-| 第六步 | `lfm_layer_control_points.csv` | 低频控制点事实 |
-| 第六步 | `lfm_control_qc.csv` / `run_summary.json` | 控制井 QC、分频和切片配置审计 |
+| 第六步 | `lfm_control_points.csv` | 点级低频 AI 控制事实 |
+| 第六步 | `lfm_control_qc.csv` / `run_summary.json` | 控制井 QC 和分频配置审计 |
+| 第六步 | `lfm_log_control_points.csv` | 可选审计文件；当前 AI-LFM 主路径不读取 |
 | 地震数据 | 地震体 + 顶底解释层位 | 提供时间轴、工区几何和目标层 mask |
 
-直井和斜井控制点的空间来源、曲线分频和密井冲突处理都在第六步完成。第七步只校验控制点 CSV 契约、目标层位和 `n_slices` 是否一致，然后建模。
+直井和斜井控制点的空间来源、曲线分频和密井冲突审计都在第六步完成。第七步校验点级控制点 CSV 契约和目标层位，然后用自己的 `modeling.n_slices` 做顺层切片建模。
 
 ---
 
@@ -68,11 +69,11 @@ lfm_precomputed:
 
 默认接上最新一次井约束结果。复现实验时，填写 `well_constraints_dir` 固定输入。`mode` 目前只支持 `latest`。
 
-每个控制点本质上是”一口井在某个层段切片中的代表波阻抗值”。脚本会先生成目标层内的时间样点，再按单井、层段和切片聚合成代表控制点。规范坐标是浮点 inline、浮点 xline 和 TWT；那些整数道号、数组索引只用于排查，不能当作跨工区稳定坐标。
+每个控制点本质上是“一口井在目标层内某个时间样点上的低频波阻抗值”。第六步只负责把这个点的 TWT、浮点 inline/xline、层段、层内比例和低频 AI 写清楚；第七步再按 `modeling.n_slices` 把这些点分配到顺层切片。那些整数道号、数组索引只用于排查，不能当作跨工区稳定坐标。
 
-直井的代表控制点落在井口对应的同一个 trace 上；斜井的代表控制点来自轨迹样点聚合，因此一口斜井的控制点会分布在多个不同的 `inline_float`、`xline_float` 处。
+直井的控制点落在井口对应的同一个 trace 上；斜井控制点来自轨迹样点，因此一口斜井的控制点会分布在多个不同的 `inline_float`、`xline_float` 处。
 
-聚合按 `well + route + source + zone + slice` 执行：同一口井落入同一比例切片的多个样点只保留一个代表控制点，`inline_float`、`xline_float`、`x_m`、`y_m`、`twt_s`、`md_m`、`u_in_zone` 和波阻抗都按第六步权重做加权平均。这样直井和斜井口径一致，也避免一小段斜井轨迹在同一张切片里被克里金误当成多口独立井。
+切片聚合不再由第六步提前完成。第七步在建模时按切片收集控制点，并只对同一切片内完全重复的 inline/xline 坐标做权重聚合，避免密井或重复轨迹点在克里金里被当成多个独立空间位置。
 
 ### `target_interval`
 
@@ -114,7 +115,7 @@ lfm_precomputed:
 
 ### 第二阶段：控制点读取
 
-第七步读取第六步写出的 `lfm_layer_control_points.csv`，校验字段、正值 AI、有限坐标和 `u_in_zone` 范围，然后把控制点和 `lfm_control_qc.csv` 复制到本次第七步输出目录。第六步 `run_summary.json` 中的 `lfm_controls.n_slices` 必须与第七步 `modeling.n_slices` 一致，否则脚本直接失败。
+第七步读取第六步写出的 `lfm_control_points.csv`，校验字段、正值 AI、有限坐标和 `u_in_zone` 范围，然后把控制点和 `lfm_control_qc.csv` 复制到本次第七步输出目录。第六步不再提供 `n_slices`，切片数量只由本步骤的 `modeling.n_slices` 决定。
 
 ### 第三阶段：层位约束建模
 
@@ -148,7 +149,7 @@ lfm_precomputed:
 |------|------|
 | `ai_lfm_time.npz` | GINN 训练可直接读取的波阻抗低频模型 |
 | `ai_lfm_time.segy` 或 `.zgy` | 可选地震体导出，格式跟随源地震 |
-| `lfm_layer_control_points.csv` | 点级控制样本，每行一个目标层内控制点 |
+| `lfm_control_points.csv` | 点级控制样本，每行一个目标层内低频 AI 控制点 |
 | `lfm_control_qc.csv` | 逐井筛选结果、控制点数量和无效比例 |
 | `target_layer_qc/*` | 目标层 mask、层厚、层位有效性 QC |
 | `figures/*.png` | 控制点分布图和 LFM 剖面图 |
@@ -171,7 +172,7 @@ lfm_precomputed:
 
 第八步会严格校验时间轴。即使体大小相同，只要 TWT 采样轴不一致，也应该回到第七步或地震配置排查；这种情况不能被当成正常训练继续下去。
 
-### `lfm_layer_control_points.csv`
+### `lfm_control_points.csv`
 
 每行一个控制点，以 `inline_float`、`xline_float` 和 `twt_s` 为规范坐标。关键字段：
 
@@ -198,13 +199,13 @@ lfm_precomputed:
 
 斜井的 `unique_trace_count` 应大于 1。如果斜井所有控制点落在同一 trace 上，要回头检查第四步空间映射。
 
-### 第二步：看 `lfm_layer_control_points.csv`
+### 第二步：看 `lfm_control_points.csv`
 
 抽查几口斜井的 `inline_float` / `xline_float` 是否随 `twt_s` 变化。直井的这两个字段应恒定。同时检查 `u_in_zone` 覆盖是否均匀——集中在某个窄范围说明该井只有部分曲线段落落入目标层。
 
 ### 第三步：看图
 
-`figures/` 中的控制点分布图用于判断是否存在空间偏差：某个平台井群的密度是否远超其他区域。同一张切片里如果多口井落到重复 `(inline, xline)` 坐标，第六步会先写冲突报告并按权重聚合，再交给第七步插值。
+`figures/` 中的控制点分布图用于判断是否存在空间偏差：某个平台井群的密度是否远超其他区域。同一张切片里如果多口井落到重复 `(inline, xline)` 坐标，第七步会在切片建模时按权重聚合这些重复坐标，再交给克里金插值。
 
 ---
 

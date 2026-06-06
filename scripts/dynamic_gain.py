@@ -363,25 +363,28 @@ def load_context(args: argparse.Namespace) -> DynamicGainContext:
     anchor_file = _resolve_anchor_file(cfg, source_dirs, output_root)
 
     logger.info("Loading seismic volume: %s", cfg.seismic_file)
+    seismic_type = str(cfg.seismic_type).strip().lower()
     seismic = import_seismic(
         cfg.seismic_file,
-        seismic_type="segy",
-        iline=cfg.segy_iline,
-        xline=cfg.segy_xline,
-        istep=cfg.segy_istep,
-        xstep=cfg.segy_xstep,
+        seismic_type=seismic_type,
+        iline=cfg.segy_iline if seismic_type == "segy" else None,
+        xline=cfg.segy_xline if seismic_type == "segy" else None,
+        istep=cfg.segy_istep if seismic_type == "segy" else None,
+        xstep=cfg.segy_xstep if seismic_type == "segy" else None,
     )
     from cup.seismic.survey import open_survey
 
     survey = open_survey(
         cfg.seismic_file,
-        seismic_type="segy",
+        seismic_type=seismic_type,
         segy_options={
             "iline": cfg.segy_iline,
             "xline": cfg.segy_xline,
             "istep": cfg.segy_istep,
             "xstep": cfg.segy_xstep,
-        },
+        }
+        if seismic_type == "segy"
+        else None,
     )
     geometry = survey.describe_geometry(domain="time")
     if str(geometry.get("sample_domain", "")).strip().lower() != "time":

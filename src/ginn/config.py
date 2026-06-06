@@ -12,6 +12,7 @@ from cup.utils.io import to_json_compatible
 
 WaveletSource = Literal["precomputed_wavelet", "ricker_wavelet"]
 GainSource = Literal["fixed_gain", "dynamic_gain_model"]
+SeismicType = Literal["segy", "zgy"]
 ValidationSplitMode = Literal["none", "spatial_block"]
 ValidationBlockAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"]
 WellAnchorDistanceDecay = Literal["gaussian", "linear"]
@@ -34,8 +35,9 @@ class GINNConfig:
     """
 
     # ── 地震信息 ──────────────────────────────────────────────
-    # 输入地震体及 SEG-Y 几何读取方式。这里的头字节位置和步长要十分小心。
+    # 输入地震体及几何读取方式。SEG-Y 的头字节位置和步长要十分小心。
     seismic_file: Path = Path("your_seismic_file.sgy")  # 输入地震体路径。
+    seismic_type: SeismicType = "segy"  # 地震体类型：segy 或 zgy。
     segy_iline: int = 189  # inline 头字节位置。
     segy_xline: int = 193  # xline 头字节位置。
     segy_istep: int = 1  # inline 抽样步长。
@@ -149,6 +151,11 @@ class GINNConfig:
             )
 
         valid_wavelet_sources = {"precomputed_wavelet", "ricker_wavelet"}
+        valid_seismic_types = {"segy", "zgy"}
+        if self.seismic_type not in valid_seismic_types:
+            raise ValueError(
+                f"Unsupported seismic_type={self.seismic_type!r}, expected one of {sorted(valid_seismic_types)}"
+            )
         if self.wavelet_source not in valid_wavelet_sources:
             raise ValueError(
                 f"Unsupported wavelet_source={self.wavelet_source!r}, expected one of {sorted(valid_wavelet_sources)}"

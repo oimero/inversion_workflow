@@ -188,9 +188,9 @@ def _as_optional_float(value: Any) -> float | None:
 
 
 def _batch_metric_lookup(batch_df: pd.DataFrame) -> dict[str, pd.Series]:
-    well_col = "eval_well" if "eval_well" in batch_df.columns else "well_name"
+    well_col = "eval_well"
     if well_col not in batch_df.columns:
-        raise ValueError("batch_synthetic_metrics.csv must contain eval_well or well_name.")
+        raise ValueError("batch_synthetic_metrics.csv must contain eval_well.")
     return {
         normalize_well_name(str(row[well_col])): row
         for _, row in batch_df.iterrows()
@@ -350,7 +350,7 @@ def _load_selected_wavelet(wavelet_dir: Path) -> tuple[np.ndarray, np.ndarray, P
             if path.exists():
                 time_s, amplitude = load_wavelet_csv(path)
                 return time_s, amplitude, path
-    fallback = wavelet_dir / "global_wavelet_201ms.csv"
+    fallback = wavelet_dir / "selected_wavelet.csv"
     time_s, amplitude = load_wavelet_csv(fallback)
     return time_s, amplitude, fallback
 

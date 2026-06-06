@@ -140,7 +140,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
         script_cfg,
         "export",
         {
-            "selected_wavelet_name": "global_wavelet_201ms.csv",
+            "selected_wavelet_name": "selected_wavelet.csv",
             "write_unified_synthetics": True,
             "write_debug_artifacts": False,
         },

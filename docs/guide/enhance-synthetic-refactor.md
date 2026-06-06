@@ -40,12 +40,12 @@
 
 这套设计借鉴的是程序化地质生成的思想：多样性主要来自统计参数空间和随机生成过程，而不是来自“能从真实井里截出多少段窗口”。
 
-真实 patch 的新定位是：
+真实井片段的新定位是：
 
 | 用途 | 说明 |
 |------|------|
 | 统计校准 | 估计振幅、事件密度、run length、转移矩阵和频谱 |
-| motif bank | 少量高质量真实片段可作为局部包络、极性和形态参考 |
+| 形态参考 | 少量高质量真实片段只作为人工 QC 和后续实验参考，不作为第六步主线输出 |
 | QC 对照 | 合成 residual 的统计分布要与真实井 residual 可比 |
 
 ---
@@ -62,13 +62,6 @@
 | `well_high_stats_by_layer.csv` | 每层经验统计和可靠度 |
 | `well_high_stats_shrinkage.json` | 每层最终生成参数 |
 | `well_high_supervision_time.npz` | 井高频监督包，schema 为 `well_high_supervision_v1`，只供训练监督项使用，不作为 synthetic 主体 |
-
-可选读取：
-
-| 材料 | 用途 |
-|------|------|
-| `well_high_motif_manifest.csv` | 选择可用 motif patch |
-| `well_high_motif_bank.npz` | 为部分样本提供真实局部形态参考 |
 
 注意：`well_high_supervision_time.npz` 和统计材料同源，但消费方式不同。监督项关心真实井位置上的逐点高频真值；合成器关心一层内应该生成什么样的高频扰动分布。底阻抗或 base AI 应来自 GINN / LFM 输出，不应从井高频监督包读取。
 

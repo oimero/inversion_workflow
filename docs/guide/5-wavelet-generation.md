@@ -88,7 +88,7 @@ wavelet_generation:
     on_insufficient_eval_wells: select_best_source_tie
 
   export:
-    selected_wavelet_name: global_wavelet_201ms.csv
+    selected_wavelet_name: selected_wavelet.csv
     write_unified_synthetics: true
     write_debug_artifacts: false
 ```
@@ -233,7 +233,7 @@ wavelet_generation:
 
 | 文件 | 什么时候看 | 内容 |
 |------|------------|------|
-| `selected_wavelet.csv` | 第六、七步继续运行时 | 最终输出的全局子波 |
+| `selected_wavelet.csv` | 第六、八步继续运行时 | 最终输出的全局子波 |
 | `selected_wavelet_summary.json` | 先看 | 选择模式、分数对比、来源井、配置摘要 |
 | `wavelet_candidate_aggregate.csv` | 判断候选竞争关系时 | 候选子波的空间去偏聚合指标和综合分数 |
 | `evaluation_well_spatial_clusters.csv` | 检查密井平台是否被去偏时 | 每口评测井的空间簇编号和簇大小 |

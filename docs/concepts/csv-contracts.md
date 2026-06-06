@@ -26,6 +26,21 @@
 | `selected_curve_count` | 选中曲线数量，partial 井也保留真实数量 |
 | `exported_las` | 第二步瘦身 LAS；仅 passed 井应有值 |
 
+## `las_curve_inventory.csv`
+
+第二步写出的逐曲线清单，第三步用它复原每口井的曲线类别、primary 选择和原始单位。它是一条 LAS 曲线一行，不是一口井一行。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `well_name` | 井名 |
+| `mnemonic` | 原始 LAS 曲线名，必须能在对应 LAS 中精确回查 |
+| `unit` | LAS 头中的原始单位 |
+| `category` | 工作流标准类别，如 `p_sonic` / `density` / `caliper`，或 `unclassified` / `ambiguous` / `disabled` |
+| `is_primary` | 是否为该类别进入下游的代表曲线 |
+| `classification_source` | 分类来源：`override` / `mnemonic_rule` / `unclassified` |
+| `confidence` | 分类置信度；规则命中通常为 1.0，歧义为 0.0 |
+| `notes` | override、歧义或禁用原因 |
+
 ## `well_preprocess_status.csv`
 
 | 关键字段 | 含义 |
@@ -74,6 +89,47 @@
 | `filtered_las_file` | 第四步用最优滤波参数导出的 LAS；第五步从这里读取 `DT_USM`/`RHO_GCC` |
 | `seismic_trace_file` | 第四步保存的井旁或轨迹地震道 |
 | `optimized_trace_sample_plan_file` | 斜井细标定后按 optimized TDT 重新生成的样点级落道计划；直井为空 |
+
+## `wavelet_inventory.csv`
+
+第四步写出的候选子波清单，第五步只从这里挑选候选子波，不再扫描第四步目录下的所有子波文件。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `source_well` | 子波来源井 |
+| `route` | 来源井第四步标定路由 |
+| `wavelet_file` | 候选子波 CSV 路径，repo-relative |
+| `dt_s` | 子波采样间隔，单位 s |
+| `n_samples` | 子波样点数 |
+| `tie_corr` / `tie_nmae` | 第四步该井 auto-tie 的最终匹配指标 |
+| `usable_as_candidate` | 第五步是否允许作为候选；第五步还会再做长度、中心、能量和采样间隔 QC |
+| `reasons` | 不可用或需要审计的原因 |
+
+## `selected_wavelet.csv`
+
+第五步选出的全局子波。第六步分频诊断和第八步 GINN 正演都应读取这条子波，而不是回退到单井候选子波。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `time_s` | 子波时间轴，单位 s，中心应在 0 附近 |
+| `amplitude` | 已归一化的子波振幅 |
+
+## `batch_synthetic_metrics.csv`
+
+第五步用全局子波在所有评测井上重新正演后的逐井指标。第六步用它筛选控制井和计算井约束权重。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `candidate_wavelet` | 评测使用的全局子波名称 |
+| `source_well` | 全局子波来源；共识子波可为 `optimized_consensus` |
+| `eval_well` | 被评测井名 |
+| `route` | 被评测井第四步标定路由 |
+| `corr` / `nmae` | 全局子波合成记录与第四步保存地震道的匹配指标 |
+| `scale` | 单井最小二乘振幅缩放系数，仅用于评价和 QC |
+| `n_eval_samples` | 参与评价的样点数 |
+| `spatial_cluster_id` / `spatial_cluster_size` | 密井平台去偏用的空间簇信息 |
+| `status` | `ok` / `failed` |
+| `reasons` | 失败原因 |
 
 ## `well_constraint_points.csv`
 

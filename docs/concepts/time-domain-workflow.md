@@ -10,10 +10,10 @@
 | 02 | `well_screen.py` | `well_inventory.csv`、LAS 目录 | `well_screen.csv`、`selected_las/` |
 | 03 | `well_preprocess.py` | `well_screen.csv`、`selected_las/` | `well_preprocess_status.csv`、`preprocessed_las/` |
 | 04 | `well_auto_tie.py` | 03 产物 + 时深表 + 井分层 + 轨迹 QC | `well_tie_metrics.csv`、优化后 TDT、子波 |
-| 05 | `wavelet_generation.py` | 04 子波 + 预处理 LAS | 全局子波、批量合成记录 |
-| 06 | `well_constraints.py` | 04 标定结果 + 05 批量合成 QC + 层位 | 低频井监督、高频井监督、高频统计 |
-| 07 | `lfm_precomputed.py` | 06 井空间事实 + 04/05 QC + 层位 | `ai_lfm_time.npz`、LFM 控制点 |
-| 08 | `ginn_train.py` | 时间域地震体 + 05 子波 + 07 LFM + 可选 06 anchor | GINN checkpoint |
+| 05 | `wavelet_generation.py` | 04 子波 + 标定产物 | `selected_wavelet.csv`、`batch_synthetic_metrics.csv` |
+| 06 | `well_constraints.py` | 04 标定结果 + 05 全局子波评测 + 层位 | `lfm_control_points.csv`、`log_ai_anchor_time.npz`、高频监督和统计 |
+| 07 | `lfm_precomputed.py` | 06 `lfm_control_points.csv` + 层位 | `ai_lfm_time.npz` |
+| 08 | `ginn_train.py` | 时间域地震体 + 05 `selected_wavelet.csv` + 07 LFM + 可选 06 anchor | GINN checkpoint |
 | 09 | `ginn_inversion.py` | 08 checkpoint | stage-1 波阻抗预测体 |
 
 ## 旁路

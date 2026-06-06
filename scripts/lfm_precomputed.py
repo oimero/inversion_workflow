@@ -35,7 +35,6 @@ from cup.utils.io import (
 )
 from cup.utils.io import to_json_compatible
 from cup.utils.io import sanitize_filename
-from cup.well.assets import normalize_well_name
 
 matplotlib.use("Agg")
 plt.rcParams["figure.dpi"] = 120
@@ -124,50 +123,6 @@ def _resolve_artifact_path(value: Any, *, run_dir: Path) -> Path | None:
         if candidate.exists():
             return candidate.resolve()
     return candidates[0].resolve()
-
-
-def _as_optional_float(value: Any) -> float | None:
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return None
-    return out if np.isfinite(out) else None
-
-
-def _batch_metric_lookup(batch_df: pd.DataFrame) -> dict[str, pd.Series]:
-    well_col = "eval_well" if "eval_well" in batch_df.columns else "well_name"
-    if well_col not in batch_df.columns:
-        raise ValueError("batch_synthetic_metrics.csv must contain eval_well or well_name.")
-    lookup: dict[str, pd.Series] = {}
-    for _, row in batch_df.iterrows():
-        well_name = str(row[well_col])
-        if well_name and well_name.casefold() != "nan":
-            lookup[normalize_well_name(well_name)] = row
-    return lookup
-
-
-def _plan_lookup(plan_df: pd.DataFrame) -> dict[str, pd.Series]:
-    if plan_df.empty or "well_name" not in plan_df.columns:
-        return {}
-    return {normalize_well_name(str(row["well_name"])): row for _, row in plan_df.iterrows()}
-
-
-def _batch_corr(row: pd.Series | None) -> float | None:
-    if row is None:
-        return None
-    for key in ("corr", "batch_corr", "selected_corr"):
-        if key in row:
-            return _as_optional_float(row.get(key))
-    return None
-
-
-def _batch_nmae(row: pd.Series | None) -> float | None:
-    if row is None:
-        return None
-    for key in ("nmae", "batch_nmae", "selected_nmae"):
-        if key in row:
-            return _as_optional_float(row.get(key))
-    return None
 
 
 def _resolve_segy_options(cfg: dict[str, Any]) -> dict[str, int] | None:
@@ -899,7 +854,7 @@ def main() -> None:
     control_path = output_dir / "lfm_control_points.csv"
     control_df.to_csv(control_path, index=False, encoding="utf-8-sig")
     if control_df.empty:
-        raise ValueError("No LFM control points selected. Check lfm_control_qc.csv for rejection reasons.")
+        raise ValueError("No LFM control points selected. Check sixth-step well_constraint_qc.csv for rejection reasons.")
 
     from cup.seismic.lfm_time import build_lfm_time_model_from_points
 

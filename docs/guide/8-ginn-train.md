@@ -26,10 +26,6 @@ python scripts/ginn_train.py --config experiments/ginn/train.yaml
 | 第六步 | `log_ai_anchor_time.npz` | 可选井上低频 log-AI anchor 监督 |
 | 第七步 | 波阻抗低频模型 NPZ | LFM 体、目标层 metadata、层位路径 |
 
-第七步的 NPZ 已经记录了目标层选择和 QC 口径，所以第八步不再单独配置顶底层位。训练会重新读取这些层位并重建 mask。LFM 必须是时间域、秒单位，并且 TWT 采样轴要与训练地震体完全对齐；任何一项不满足，训练都会在数据加载阶段停止。
-
-第六步的 `log_ai_anchor_time.npz` 是正式可选输入，不在第八步里临时从 LAS、TDT 或井轨迹拼井约束。不开井控时保持 `lambda_log_ai_anchor: 0.0`；打开井控时显式填写该 NPZ 路径并给出正的 anchor loss 权重。
-
 ---
 
 ## 配置参考

@@ -44,9 +44,13 @@ from cup.utils.io import (
     load_yaml_config,
     repo_relative_path,
     resolve_optional_path,
+    resolve_relative_path,
     sanitize_filename,
     write_json,
 )
+from cup.well.assets import normalize_well_name
+from cup.well.las import load_vp_rho_logset_from_standard_las
+from cup.well.td import load_workflow_time_depth_table_csv
 from cup.well.gain import (
     CANDIDATE_ATTRIBUTES,
     NORMALIZATION,
@@ -71,6 +75,7 @@ from ginn.data import (
 from ginn.masking import build_eroded_loss_mask, get_valid_trace_indices, select_spatial_validation_split
 from ginn.physics import ForwardModel
 from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
+from wtie.optimize import tie as tie_ops
 from wtie.processing import grid
 
 matplotlib.use("Agg")
@@ -139,6 +144,7 @@ class DynamicGainContext:
     wavelet_time_s: np.ndarray
     unit_wavelet: np.ndarray
     anchor_file: Path
+    auto_tie_dir: Path | None
     source_dirs: dict[str, Path | None]
 
 
@@ -164,8 +170,13 @@ def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[
         raise ValueError(f"dynamic_gain.source_runs.mode only supports 'latest', got {mode!r}.")
 
     dirs: dict[str, Path | None] = {}
-    for key in ("well_constraints_dir", "lfm_precomputed_dir", "wavelet_generation_dir"):
+    for key in ("well_auto_tie_dir", "well_constraints_dir", "lfm_precomputed_dir", "wavelet_generation_dir"):
         dirs[key] = resolve_optional_path(source_cfg.get(key), root=REPO_ROOT)
+    if dirs.get("well_auto_tie_dir") is None:
+        try:
+            dirs["well_auto_tie_dir"] = latest_run(output_root, "well_auto_tie", "well_tie_metrics.csv")
+        except FileNotFoundError:
+            pass
     return dirs
 
 
@@ -459,6 +470,7 @@ def load_context(args: argparse.Namespace) -> DynamicGainContext:
         wavelet_time_s=np.asarray(wavelet_time_s, dtype=np.float64),
         unit_wavelet=unit_wavelet,
         anchor_file=anchor_file,
+        auto_tie_dir=source_dirs.get("well_auto_tie_dir"),
         source_dirs=source_dirs,
     )
 
@@ -833,6 +845,53 @@ def _qc_plot_slice(mask: np.ndarray, n_sample: int, *, pad_samples: int = 25) ->
     return slice(start, end)
 
 
+def _load_well_ai_cache(
+    auto_tie_dir: Path,
+    anchor_names: np.ndarray,
+    target_samples: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Build a mapping from anchor name to filtered-LAS AI interpolated to *target_samples*."""
+    metrics_path = auto_tie_dir / "well_tie_metrics.csv"
+    if not metrics_path.exists():
+        logger.warning("well_tie_metrics.csv not found at %s, well AI track will be empty.", metrics_path)
+        return {}
+
+    metrics_df = pd.read_csv(metrics_path)
+    name_to_las: dict[str, Path] = {}
+    name_to_tdt: dict[str, Path] = {}
+    for _, row in metrics_df.iterrows():
+        norm = normalize_well_name(str(row["well_name"]))
+        las = row.get("filtered_las_file")
+        tdt = row.get("optimized_tdt_file")
+        if pd.notna(las) and pd.notna(tdt):
+            las_path = resolve_relative_path(str(las), root=REPO_ROOT)
+            tdt_path = resolve_relative_path(str(tdt), root=REPO_ROOT)
+            if las_path.exists() and tdt_path.exists():
+                name_to_las[norm] = las_path
+                name_to_tdt[norm] = tdt_path
+
+    seismic_dt_s = float(np.median(np.diff(target_samples)))
+    cache: dict[str, np.ndarray] = {}
+    for anchor_name in np.asarray(anchor_names).astype(str):
+        norm = normalize_well_name(anchor_name)
+        las_path = name_to_las.get(norm)
+        tdt_path = name_to_tdt.get(norm)
+        if las_path is None or tdt_path is None:
+            continue
+        try:
+            logset = load_vp_rho_logset_from_standard_las(las_path)
+            table = load_workflow_time_depth_table_csv(tdt_path)
+            logset_twt = tie_ops.convert_logs_from_md_to_twt(logset, None, table, seismic_dt_s)
+            ai = np.interp(
+                target_samples, logset_twt.AI.basis, logset_twt.AI.values,
+                left=np.nan, right=np.nan,
+            )
+            cache[anchor_name] = np.asarray(ai, dtype=np.float64)
+        except Exception:
+            logger.warning("Failed to load filtered LAS AI for %s", anchor_name, exc_info=True)
+    return cache
+
+
 def write_well_waveform_qc(
     ctx: DynamicGainContext,
     syn_unit: np.ndarray,
@@ -853,6 +912,12 @@ def write_well_waveform_qc(
         n_traces=int(ctx.geometry["n_il"]) * int(ctx.geometry["n_xl"]),
     )
     _validate_samples_axis(np.asarray(anchor.samples, dtype=np.float64), ctx.samples, name="log_ai_anchor_time.npz")
+
+    well_ai_cache: dict[str, np.ndarray] = {}
+    if ctx.auto_tie_dir is not None:
+        well_ai_cache = _load_well_ai_cache(ctx.auto_tie_dir, anchor.anchor_names, ctx.samples)
+    else:
+        logger.warning("auto_tie_dir not resolved; well AI track will fall back to NaN.")
 
     n_sample = int(ctx.geometry["n_sample"])
     seismic_norm_flat = (ctx.seismic.reshape(-1, n_sample) / float(ctx.train_mask_rms)).astype(np.float32)
@@ -885,7 +950,11 @@ def write_well_waveform_qc(
                 used_sample_mask[start:end] = True
 
         lfm_ai = np.asarray(lfm_flat[flat_idx], dtype=np.float64)
-        reflectivity = _reflectivity_from_ai(lfm_ai)
+        well_ai = well_ai_cache.get(str(anchor_names[anchor_row]))
+        if well_ai is None:
+            well_ai = np.full(n_sample, np.nan, dtype=np.float64)
+            logger.warning("No filtered LAS AI for anchor %s, well AI track will be empty.", anchor_names[anchor_row])
+        reflectivity = _reflectivity_from_ai(well_ai)
         trace_df = pd.DataFrame(
             {
                 "twt_s": ctx.samples,
@@ -894,6 +963,7 @@ def write_well_waveform_qc(
                 "dynamic_gain": gain_flat[flat_idx],
                 "synthetic_dynamic": synthetic_dynamic_flat[flat_idx],
                 "residual_dynamic": seismic_norm_flat[flat_idx] - synthetic_dynamic_flat[flat_idx],
+                "well_ai": well_ai,
                 "lfm_ai": lfm_ai,
                 "reflectivity": reflectivity,
                 "anchor_mask": anchor_mask,
@@ -910,7 +980,7 @@ def write_well_waveform_qc(
         plot_samples = np.asarray(ctx.samples[plot_slice], dtype=np.float64)
         synthetic_values = np.asarray(synthetic_dynamic_flat[flat_idx, plot_slice], dtype=np.float64)
         seismic_values = np.asarray(seismic_norm_flat[flat_idx, plot_slice], dtype=np.float64)
-        lfm_plot = np.asarray(lfm_ai[plot_slice], dtype=np.float64)
+        well_ai_plot = np.asarray(well_ai[plot_slice], dtype=np.float64)
         reflectivity_plot = np.asarray(reflectivity[plot_slice], dtype=np.float64)
         synthetic_trace = grid.Seismic(
             synthetic_values,
@@ -931,7 +1001,7 @@ def write_well_waveform_qc(
             xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
             dxcorr = dynamic_normalized_xcorr(seismic_trace, synthetic_trace)
         fig, _ = plot_well_waveform_qc(
-            grid.Log(lfm_plot, plot_samples, "twt", name="LFM AI"),
+            grid.Log(well_ai_plot, plot_samples, "twt", name="Well AI"),
             grid.Reflectivity(reflectivity_plot, plot_samples, "twt", name="Reflectivity"),
             synthetic_trace,
             seismic_trace,

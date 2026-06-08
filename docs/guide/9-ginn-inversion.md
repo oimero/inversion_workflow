@@ -26,9 +26,8 @@ python scripts/ginn_inversion.py --skip-zgy
 |------|------|
 | 第八步 checkpoint（`best.pt` 或 `final.pt`） | 提取训练配置、模型权重和完整数据事实链 |
 | checkpoint 内记录的子波、LFM、地震路径 | 复用训练时的数据口径，确保推理和训练一致 |
-| 可选输出配置 | 控制剖面方向、抽样比例和 ZGY 导出 |
-
-反演不需要单独配置地震路径、子波路径或 LFM 路径——这些全部从 checkpoint 中读取。这样做的好处是：即使第八步的训练目录被移动或重跑了，只要 checkpoint 是同一个文件，反演就能精准复现训练时的数据口径。
+| 第六步 `log_ai_anchor_time.npz` 和 `well_constraint_points.csv` | 井上波阻抗 QC 的井曲线和全频 AI 来源 |
+| 可选输出配置 | 控制剖面方向、抽样比例、井 QC 开关和 ZGY 导出 |
 
 ---
 
@@ -74,6 +73,10 @@ ginn_inversion:
 
 控制交会图的抽样点数。工区体素量极大时，全部画进 hexbin 会很慢且看不出更多信息。默认 20 万点足够覆盖分布。
 
+### 井上波阻抗 QC
+
+反演结束后自动生成井上波阻抗 QC。脚本从 checkpoint 配置中定位 `log_ai_anchor_time.npz`，再通过 anchor 元数据找回第六步的 `well_constraint_points.csv` 获取全频井 AI。每口 anchor 井输出一张三线对比图（灰线全频井 AI、蓝线低频参考、红线 GINN 预测 AI）和对应的 QC 指标。
+
 ---
 
 ## 脚本在做什么
@@ -115,6 +118,9 @@ ginn_inversion:
 | `figures/prediction_vs_lfm_crossplot.png` | 预测波阻抗 vs LFM 抽样交会图 |
 | `qc/prediction_context_time.npz` | 可选 QC 包，包含 LFM 体和 mask 体（默认不写） |
 | `trainer_context/` | 训练上下文目录（Trainer 初始化时自动生成，不删） |
+| `well_qc/figures/well_qc_*.png` | 每口 anchor 井的预测 AI vs 低频/全频 AI 对比图 |
+| `well_qc/traces/well_qc_*.csv` | 全频井 AI、低频井 AI、预测 AI 的逐样点明细 |
+| `well_qc/well_qc_metrics.csv` | 逐 anchor 井阻抗 QC 指标 |
 
 ### `stage1_ginn_base_ai_time.npz`
 

@@ -221,7 +221,7 @@ wavelet_generation:
 
 用最终选定的全局子波，对所有评测井生成统一的合成记录和 QC 数据。
 
-批量合成结束后，脚本会给每口评测井输出一张三联 QC 图：反射系数、观测地震与合成记录叠合、残差。
+批量合成结束后，脚本会给每口评测井输出一张统一风格的波形 QC 图，包含波阻抗、反射系数、合成地震 wiggle、观测地震 wiggle、残差 wiggle 和互相关热力图。
 
 ---
 
@@ -244,7 +244,7 @@ wavelet_generation:
 | 文件 | 什么时候看 | 内容 |
 |------|------------|------|
 | `batch_synthetic_metrics.csv` | 先按 `corr` 排序 | 使用全局子波后每口井的合成记录指标 |
-| `figures/batch_synthetic_qc/*.png` | 排查单井波形时 | 反射系数、观测/合成叠合、残差三联图；第二图标题里的 `scale` 是该井自己的最小二乘缩放倍数 |
+| `figures/batch_synthetic_qc/*.png` | 排查单井波形时 | 六 panel 波形 QC 图（波阻抗、反射系数、合成 wiggle、观测 wiggle、残差 wiggle、互相关）；标题含 `corr`、`nmae`、`scale` 指标 |
 | `synthetic_qc/*.csv` | 需要逐样点复核时 | 每口井的地震道、反射系数、合成记录和残差 |
 | `figures/selected_wavelet.png` | 检查最终子波形态时 | 全局子波、最佳候选和共识子波的形态对比 |
 

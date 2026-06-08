@@ -70,7 +70,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "zgy_inline_chunk_size": 16,
     "write_qc_context": False,
     "crossplot_max_samples": 200_000,
-    "well_qc_enabled": True,
 }
 
 
@@ -90,7 +89,6 @@ def parse_args() -> argparse.Namespace:
         help="Output directory. Defaults to <output_root>/ginn_inversion_<timestamp>.",
     )
     parser.add_argument("--skip-zgy", action="store_true", help="Skip optional ZGY export.")
-    parser.add_argument("--skip-well-qc", action="store_true", help="Skip well-side impedance QC.")
     return parser.parse_args()
 
 
@@ -626,14 +624,12 @@ def main() -> None:
     )
 
     qc_context_written = bool(script_cfg.get("write_qc_context", False))
-    well_qc_summary: dict[str, Any] | None = None
-    if bool(script_cfg.get("well_qc_enabled", True)) and not args.skip_well_qc:
-        well_qc_summary = _write_ginn_well_qc(
-            output_dir=output_dir,
-            pred_volume=pred_volume,
-            anchor_file=cfg.log_ai_anchor_file,
-            geometry=trainer.geometry,
-        )
+    well_qc_summary = _write_ginn_well_qc(
+        output_dir=output_dir,
+        pred_volume=pred_volume,
+        anchor_file=cfg.log_ai_anchor_file,
+        geometry=trainer.geometry,
+    )
 
     zgy_status = "disabled"
     if bool(script_cfg.get("export_zgy", True)) and not args.skip_zgy:
@@ -655,8 +651,8 @@ def main() -> None:
             "prediction_slice_figure": slice_figure_path,
             "prediction_crossplot": crossplot_path,
             "prediction_context_time": qc_context_path if qc_context_written else None,
-            "well_qc": well_qc_dir if well_qc_summary is not None else None,
-            "well_qc_metrics": (well_qc_dir / "well_qc_metrics.csv") if well_qc_summary is not None else None,
+            "well_qc": well_qc_dir,
+            "well_qc_metrics": well_qc_dir / "well_qc_metrics.csv",
         }
     )
     summary = {
@@ -691,8 +687,7 @@ def main() -> None:
     print(f"Output: {output_dir}")
     print(f"NPZ: {base_ai_npz}")
     print(f"ZGY export: {zgy_status}")
-    if well_qc_summary is not None:
-        print(f"Well QC: {well_qc_dir}")
+    print(f"Well QC: {well_qc_dir}")
 
 
 if __name__ == "__main__":

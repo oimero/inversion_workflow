@@ -71,7 +71,6 @@ def parse_args() -> argparse.Namespace:
         help="Output directory. Defaults to <output_root>/enhance_inversion_depth_<timestamp>.",
     )
     parser.add_argument("--skip-segy", action="store_true", help="Skip SEG-Y export.")
-    parser.add_argument("--skip-well-qc", action="store_true", help="Skip LAS-vs-prediction well QC.")
     return parser.parse_args()
 
 
@@ -552,8 +551,7 @@ def main() -> None:
     well_qc_metrics_path = None
     n_wells_qc = 0
     well_qc_summary: dict[str, float | None] = {"mean_rmse": None, "mean_mae": None, "mean_corr": None}
-    if not args.skip_well_qc and bool(script_cfg.get("well_qc_enabled", True)):
-        source_batch_dir = resolve_relative_path(str(script_cfg["source_batch_dir"]), root=REPO_ROOT)
+    source_batch_dir = resolve_relative_path(str(script_cfg["source_batch_dir"]), root=REPO_ROOT)
         shifted_las_dir = resolve_relative_path(
             str(script_cfg.get("shifted_las_dir", "shifted_las")), root=source_batch_dir
         )

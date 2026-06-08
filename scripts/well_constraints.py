@@ -294,8 +294,39 @@ def _resolve_frequency_split(
         if cutoff is None:
             raise ValueError("well_constraints.frequency_split.manual_cutoff_hz is required for mode=manual.")
         cfg = FrequencySplitConfig(float(cutoff), filter_order=order, buffer_seconds=buffer_seconds, buffer_mode=buffer_mode)
-        diag = pd.DataFrame([{"cutoff_hz": float(cutoff), "mode": "manual", "status": "manual"}])
-        aggregate = pd.DataFrame([{"cutoff_hz": float(cutoff), "mode": "manual"}])
+        well_rows = [
+            {
+                "well_name": str(w),
+                "route": "",
+                "cutoff_hz": float(cutoff),
+                "status": "manual",
+                "corr": np.nan,
+                "nmae": np.nan,
+                "scale": np.nan,
+                "n_eval_samples": 0,
+                "wavelet_file": "",
+                "reason": "",
+            }
+            for w in point_df["well_name"].unique()
+        ]
+        diag = pd.DataFrame.from_records(well_rows)
+        aggregate = pd.DataFrame(
+            {
+                "cutoff_hz": [float(cutoff)],
+                "mode": ["manual"],
+                "n_wells": [len(well_rows)],
+                "median_corr": [np.nan],
+                "mean_corr": [np.nan],
+                "p25_corr": [np.nan],
+                "p75_corr": [np.nan],
+                "median_nmae": [np.nan],
+                "mean_nmae": [np.nan],
+                "p25_nmae": [np.nan],
+                "p75_nmae": [np.nan],
+                "median_scale": [np.nan],
+                "median_n_eval_samples": [np.nan],
+            }
+        )
         selection = {"selected_cutoff_hz": float(cutoff), "reason": "manual"}
         return cfg, diag, aggregate, selection, "manual"
     if mode != "diagnose":

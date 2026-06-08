@@ -231,7 +231,11 @@ class EnhancementConfig:
 
     @classmethod
     def from_yaml(cls, config_file: str | Path, *, base_dir: Path | None = None) -> "EnhancementConfig":
-        config_path = Path(config_file).resolve()
+        config_path = Path(config_file)
+        if not config_path.is_absolute() and base_dir is not None:
+            config_path = (base_dir / config_path).resolve()
+        else:
+            config_path = config_path.resolve()
         with config_path.open("r", encoding="utf-8") as fp:
             raw_data = yaml.safe_load(fp) or {}
         if not isinstance(raw_data, dict):

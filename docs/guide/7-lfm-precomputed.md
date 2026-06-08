@@ -28,8 +28,6 @@ python scripts/lfm_precomputed.py --output-dir scripts/output/lfm_precomputed_te
 | 第六步 | `well_constraint_qc.csv` / `run_summary.json` | 控制井 QC 和分频配置审计 |
 | 地震数据 | 地震体 + 顶底解释层位 | 提供时间轴、工区几何和目标层 mask |
 
-直井和斜井控制点的空间来源、曲线分频和密井冲突审计都在第六步完成。第七步校验点级控制点 CSV 契约和目标层位，然后用自己的 `modeling.n_slices` 做顺层切片建模。
-
 ---
 
 ## 配置参考
@@ -98,7 +96,7 @@ lfm_precomputed:
 
 #### `post_slice_smoothing`
 
-切片之间的额外平滑，当前默认关闭。第一版主要依赖井曲线低通、顺层切片和边界扩展来保证 LFM 平滑；只有当相邻切片之间仍出现明显跳变时，才考虑打开它。
+切片之间的额外平滑，默认关闭。启用后对每个层段的比例切片沿 slice 维做轻度加权平均（核 `[0.1, 0.2, 0.4, 0.2, 0.1]`），减弱相邻切片面的突变和尖刺。代价是进一步偏离控制点——平滑核覆盖 5 个切片，会把邻切片的克里金值混入当前切片。如果井上抽出的 LFM 曲线有明显锯齿感，可以尝试开启。
 
 ---
 
@@ -136,7 +134,7 @@ lfm_precomputed:
 
 1. 将建模结果保存为 `ai_lfm_time.npz`，内含体积、方差体、三个规则轴、几何元数据、建模元数据和覆盖统计。
 2. 可选导出地震体格式（SEG-Y 进则 SEG-Y 出，ZGY 进则 ZGY 出），方便在地质软件中检查。
-3. 输出 QC 图：控制点平面分布图和 LFM 剖面图。
+3. 输出 QC 图：控制点平面分布图、LFM 剖面图和井上波阻抗 QC 图。
 
 ---
 
@@ -151,6 +149,9 @@ lfm_precomputed:
 | `lfm_control_points.csv` | 点级控制样本，每行一个目标层内低频 AI 控制点 |
 | `target_layer_qc/*` | 目标层 mask、层厚、层位有效性 QC |
 | `figures/*.png` | 控制点分布图和 LFM 剖面图 |
+| `well_qc/figures/well_qc_<well>.png` | 每口控制点井的低频 AI vs LFM 采样 AI 对比 |
+| `well_qc/traces/well_qc_<well>.csv` | 控制点 AI、LFM 采样 AI 和残差的逐样点明细 |
+| `well_qc/well_qc_metrics.csv` | 逐井 LFM QC 指标（相关系数、MAE、RMSE、bias、NMAE） |
 | `run_summary.json` | 输入路径、筛选统计、建模参数和输出路径 |
 
 ### `ai_lfm_time.npz`

@@ -21,12 +21,11 @@ python scripts/dynamic_gain.py --output-dir scripts/output/dynamic_gain_test
 | 来源 | 文件/配置 | 用途 |
 |------|-----------|------|
 | 地震数据 | 与第八步相同的地震体和 SEG-Y 几何配置 | 读取原始地震、确定时间轴和工区几何 |
+| 第四步 | `filtered_las/filtered_logs_<well>.las`、`time_depth/optimized_tdt_<well>.csv` | 井上波形 QC 的波阻抗曲线来源 |
 | 第五步 | `selected_wavelet.csv` | 单位子波正演 |
 | 第六步 | `log_ai_anchor_time.npz` | 井上 gain 样本来源 |
 | 第七步 | `ai_lfm_time.npz` | LFM 体、目标层元数据、层位路径 |
 | 训练配置 | 与第八步一致的 mask、验证划分、子波、LFM 和 anchor 配置 | 复现第八步的训练 mask 和归一化 RMS |
-
-脚本不直接从 LAS、TDT 或井轨迹重建井约束。它只读第六步已经生成的 `log_ai_anchor_time.npz`。
 
 ---
 
@@ -38,6 +37,7 @@ python scripts/dynamic_gain.py --output-dir scripts/output/dynamic_gain_test
 dynamic_gain:
   source_runs:
     mode: latest
+    well_auto_tie_dir: null
     well_constraints_dir: null
     lfm_precomputed_dir: null
     wavelet_generation_dir: null
@@ -69,7 +69,7 @@ dynamic_gain:
 
 ### `source_runs`
 
-默认接上最新的第六步、第七步和第五步产物。复现实验时，可以在这里填写某次对应步骤的输出目录，固定输入来源。`mode` 目前只支持 `latest`。
+默认接上最新的第四步、第五步、第六步和第七步产物。第四步只在井上波形 QC 时使用（加载滤波 LAS 提供井上波阻抗曲线）；gain 估计逻辑不依赖第四步。复现实验时，可以填写某次对应步骤的输出目录固定输入来源。`mode` 目前只支持 `latest`。
 
 ### `segments`
 
@@ -125,7 +125,7 @@ dynamic_gain:
 
 对全体地震道计算同一属性、套用对数关系、clip 到安全范围、做轻量平滑，生成完整的三维增益体。输出的 gain 体必须是正值有限值；任何非正值会被替换为 clip 上下界的几何平均。
 
-同时输出 `recommended_fixed_gain.json` 和一系列 QC 图，供人判断第八步用 fixed 还是 dynamic。
+同时输出 `recommended_fixed_gain.json`、一系列 QC 图和井上波形 QC，供人判断第八步用 fixed 还是 dynamic。
 
 ---
 
@@ -151,6 +151,9 @@ dynamic_gain:
 | `figures/qc_03_attribute_metrics.png` | 候选属性的 Pearson 相关系数柱状图 |
 | `figures/qc_04_spatial_debias.png` | 空间簇的井增益与簇增益对比 |
 | `figures/qc_05_dynamic_gain_volume.png` | 增益体的 inline、xline 和时间切片 |
+| `well_qc/figures/anchor_trace_*.png` | 每道 anchor 的井上波形 QC 图（amplitude 模式） |
+| `well_qc/traces/anchor_trace_*.csv` | 地震、合成、gain、波阻抗和反射系数的逐样点明细 |
+| `well_qc/well_qc_metrics.csv` | 逐 anchor 道波形 QC 指标（corr、MAE、RMSE、bias、RMS ratio） |
 
 ### `dynamic_gain.npz`
 

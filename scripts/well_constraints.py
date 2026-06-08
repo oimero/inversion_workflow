@@ -844,6 +844,7 @@ def main() -> None:
                         trace_plan_file=trace_file,
                         target_layer=target_layer,
                         survey=survey,
+                        samples=samples,
                         weight=weight,
                         batch_corr=batch_corr,
                         batch_nmae=batch_nmae,

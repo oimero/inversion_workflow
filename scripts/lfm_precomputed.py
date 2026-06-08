@@ -27,6 +27,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.config import deep_merge_dict
+from cup.seismic.viz import impedance_qc_metrics, plot_well_impedance_qc, sample_volume_at_points
 from cup.utils.io import (
     build_segy_textual_header,
     latest_run,
@@ -270,6 +271,82 @@ def _plot_lfm_result(result: Any, output_path: Path) -> None:
     _save_fig(output_path)
 
 
+def _write_lfm_well_qc(control_df: pd.DataFrame, result: Any, output_dir: Path) -> dict[str, Any]:
+    from wtie.processing import grid
+
+    well_qc_dir = output_dir / "well_qc"
+    trace_dir = well_qc_dir / "traces"
+    figure_dir = well_qc_dir / "figures"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+
+    qc_df = control_df.copy()
+    if "sample_index" in qc_df.columns:
+        qc_df["input_sample_index"] = qc_df["sample_index"]
+    sample_axis = np.asarray(result.samples, dtype=np.float64)
+    qc_df["sample_index_used"] = np.searchsorted(sample_axis, qc_df["twt_s"].to_numpy(dtype=np.float64), side="left")
+    qc_df["sample_index_used"] = np.clip(qc_df["sample_index_used"].to_numpy(dtype=np.int64), 0, sample_axis.size - 1)
+    left = np.maximum(qc_df["sample_index_used"].to_numpy(dtype=np.int64) - 1, 0)
+    right = qc_df["sample_index_used"].to_numpy(dtype=np.int64)
+    twt_values = qc_df["twt_s"].to_numpy(dtype=np.float64)
+    choose_left = np.abs(sample_axis[left] - twt_values) < np.abs(sample_axis[right] - twt_values)
+    qc_df.loc[choose_left, "sample_index_used"] = left[choose_left]
+    qc_df["ai_lfm_sampled"] = sample_volume_at_points(
+        result.volume,
+        result.geometry,
+        qc_df["inline_float"].to_numpy(dtype=np.float64),
+        qc_df["xline_float"].to_numpy(dtype=np.float64),
+        qc_df["sample_index_used"].to_numpy(dtype=np.int64),
+    )
+    qc_df["diff_ai_lfm_minus_control"] = qc_df["ai_lfm_sampled"].to_numpy(dtype=np.float64) - qc_df["ai"].to_numpy(dtype=np.float64)
+
+    metrics_rows: list[dict[str, Any]] = []
+    for well_name, group in qc_df.groupby("well_name", sort=True):
+        group = group.sort_values(["twt_s", "md_m", "sample_index"]).reset_index(drop=True)
+        safe = sanitize_filename(str(well_name))
+        trace_path = trace_dir / f"well_qc_{safe}.csv"
+        figure_path = figure_dir / f"well_qc_{safe}.png"
+        group.to_csv(trace_path, index=False, encoding="utf-8-sig")
+
+        samples = group["twt_s"].to_numpy(dtype=np.float64)
+        control_ai = grid.Log(group["ai"].to_numpy(dtype=np.float64), samples, "twt", name="Low-frequency control AI")
+        sampled_ai = grid.Log(group["ai_lfm_sampled"].to_numpy(dtype=np.float64), samples, "twt", name="LFM sampled AI")
+        mask = (
+            np.isfinite(group["ai"].to_numpy(dtype=np.float64))
+            & np.isfinite(group["ai_lfm_sampled"].to_numpy(dtype=np.float64))
+        )
+        fig, _axes = plot_well_impedance_qc(
+            low_ai=control_ai,
+            model_ai=sampled_ai,
+            mask=mask,
+            title=f"LFM well QC | {well_name}",
+            model_label="LFM sampled AI",
+        )
+        fig.savefig(figure_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+
+        metrics_rows.append(
+            {
+                "well_name": str(well_name),
+                "status": "ok" if np.any(mask) else "no_valid_samples",
+                "n_control_points": int(len(group)),
+                "source_values": ";".join(sorted({str(value) for value in group.get("source", pd.Series(dtype=str)).dropna().unique()})),
+                "trace_csv": repo_relative_path(trace_path, root=REPO_ROOT),
+                "figure": repo_relative_path(figure_path, root=REPO_ROOT),
+                **impedance_qc_metrics(model_ai=sampled_ai, low_ai=control_ai, mask=mask),
+            }
+        )
+
+    metrics_df = pd.DataFrame.from_records(metrics_rows)
+    metrics_path = well_qc_dir / "well_qc_metrics.csv"
+    metrics_df.to_csv(metrics_path, index=False, encoding="utf-8-sig")
+    return {
+        "well_qc_dir": repo_relative_path(well_qc_dir, root=REPO_ROOT),
+        "metrics": repo_relative_path(metrics_path, root=REPO_ROOT),
+        "n_wells_qc": int(len(metrics_rows)),
+    }
+
+
 def _save_npz(result: Any, npz_file: Path, *, metadata_extra: dict[str, Any]) -> None:
     result.metadata.update(metadata_extra)
     npz_file.parent.mkdir(parents=True, exist_ok=True)
@@ -454,7 +531,8 @@ def main() -> None:
         output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
     qc_dir = output_dir / "target_layer_qc"
     figures_dir = output_dir / "figures"
-    for directory in [output_dir, qc_dir, figures_dir]:
+    well_qc_dir = output_dir / "well_qc"
+    for directory in [output_dir, qc_dir, figures_dir, well_qc_dir]:
         directory.mkdir(parents=True, exist_ok=True)
 
     survey, seismic_file, seismic_type = _open_survey(script_cfg, cfg, data_root)
@@ -522,9 +600,12 @@ def main() -> None:
 
     _plot_controls(control_df, figures_dir / "qc_control_points.png")
     _plot_lfm_result(result, figures_dir / "qc_ai_lfm_time.png")
+    well_qc_summary = _write_lfm_well_qc(control_df, result, output_dir)
     outputs = {
         "ai_lfm_time": repo_relative_path(npz_file, root=REPO_ROOT),
         "control_points": repo_relative_path(control_path, root=REPO_ROOT),
+        "well_qc": well_qc_summary["well_qc_dir"],
+        "well_qc_metrics": well_qc_summary["metrics"],
     }
 
     summary = {
@@ -538,6 +619,7 @@ def main() -> None:
         ),
         "control_point_count": int(len(control_df)),
         "outputs": outputs,
+        "well_qc": well_qc_summary,
         "export_status": export_status,
         "coverage_stats": result.coverage_stats,
     }
@@ -548,6 +630,7 @@ def main() -> None:
     print(f"Selected wells: {summary['selected_well_count']}")
     print(f"Control points: {summary['control_point_count']}")
     print(f"NPZ: {npz_file}")
+    print(f"Well QC: {output_dir / 'well_qc'}")
     if export_status not in {"written", "disabled"}:
         print(f"Volume export skipped/failed: {export_status}")
 

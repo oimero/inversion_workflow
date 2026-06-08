@@ -476,6 +476,7 @@ def build_deviated_point_facts(
     trace_plan_file: Any,
     target_layer: Any,
     survey: Any,
+    samples: np.ndarray,
     weight: float,
     batch_corr: float | None,
     batch_nmae: float | None,
@@ -486,6 +487,9 @@ def build_deviated_point_facts(
     from cup.well.las import load_vp_rho_logset_from_standard_las
 
     logset = load_vp_rho_logset_from_standard_las(las_file)
+    sample_axis = np.asarray(samples, dtype=np.float64).reshape(-1)
+    if sample_axis.size < 2 or np.any(np.diff(sample_axis) <= 0.0):
+        raise ValueError("samples must be a strictly increasing seismic sample axis.")
     ai_log = logset.AI
     ai_basis = np.asarray(ai_log.basis, dtype=float)
     if ai_basis.size < 2 or np.any(np.diff(ai_basis) <= 0.0):
@@ -526,6 +530,7 @@ def build_deviated_point_facts(
         inline_float = float(row["inline_float"])
         xline_float = float(row["xline_float"])
         twt_s = float(row["twt_s"])
+        sample_index = int(np.argmin(np.abs(sample_axis - twt_s)))
         try:
             zone_name, u_in_zone = sample_zone(target_layer, inline_float, xline_float, twt_s)
         except Exception:
@@ -551,7 +556,7 @@ def build_deviated_point_facts(
                 "y_m": float(row["y_m"]),
                 "inline_float": inline_float,
                 "xline_float": xline_float,
-                "sample_index": int(row["sample_index"]) if "sample_index" in row and pd.notna(row["sample_index"]) else int(row_index),
+                "sample_index": sample_index,
                 "zone_name": zone_name,
                 "u_in_zone": float(u_in_zone),
                 "ai_full": ai,

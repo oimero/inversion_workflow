@@ -25,6 +25,7 @@ from typing import Any
 
 import matplotlib
 import numpy as np
+import pandas as pd
 import torch
 
 matplotlib.use("Agg")
@@ -41,16 +42,21 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.seismic.survey import open_survey
+from cup.seismic.viz import impedance_qc_metrics, plot_well_impedance_qc
 from cup.utils.config import deep_merge_dict
 from cup.utils.io import (
     load_yaml_config,
     repo_relative_path,
     resolve_relative_path,
+    sanitize_filename,
     to_json_compatible,
     write_json,
 )
+from cup.well.assets import normalize_well_name
+from ginn.anchor import load_log_ai_anchor_npz
 from ginn.config import GINNConfig
 from ginn.trainer import Trainer
+from wtie.processing import grid
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +70,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "zgy_inline_chunk_size": 16,
     "write_qc_context": False,
     "crossplot_max_samples": 200_000,
+    "well_qc_enabled": True,
 }
 
 
@@ -83,6 +90,7 @@ def parse_args() -> argparse.Namespace:
         help="Output directory. Defaults to <output_root>/ginn_inversion_<timestamp>.",
     )
     parser.add_argument("--skip-zgy", action="store_true", help="Skip optional ZGY export.")
+    parser.add_argument("--skip-well-qc", action="store_true", help="Skip well-side impedance QC.")
     return parser.parse_args()
 
 
@@ -368,6 +376,134 @@ def _plot_crossplot(path: Path, *, pred_volume: np.ndarray, lfm_volume: np.ndarr
     _save_fig(path)
 
 
+def _resolve_anchor_point_table(anchor_file: Path, metadata: dict[str, Any]) -> Path | None:
+    raw_path = metadata.get("point_table")
+    if raw_path in {None, ""}:
+        return None
+    path = Path(str(raw_path))
+    return path if path.is_absolute() else (REPO_ROOT / path).resolve()
+
+
+def _point_table_for_anchor(anchor_name: str, flat_idx: int, point_df: pd.DataFrame) -> pd.DataFrame:
+    if point_df.empty:
+        return point_df
+    out = point_df.loc[point_df["flat_idx"].astype("Int64") == int(flat_idx)].copy()
+    if "well_name" in out.columns:
+        key = normalize_well_name(anchor_name)
+        named = out.loc[out["well_name"].map(lambda value: normalize_well_name(str(value))) == key].copy()
+        if not named.empty:
+            out = named
+    return out
+
+
+def _write_ginn_well_qc(
+    *,
+    output_dir: Path,
+    pred_volume: np.ndarray,
+    anchor_file: Path | None,
+    geometry: dict[str, Any],
+) -> dict[str, Any]:
+    well_qc_dir = output_dir / "well_qc"
+    trace_dir = well_qc_dir / "traces"
+    figure_dir = well_qc_dir / "figures"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = well_qc_dir / "well_qc_metrics.csv"
+
+    if anchor_file is None:
+        metrics_df = pd.DataFrame([{"status": "failed", "error": "checkpoint_config_has_no_log_ai_anchor_file"}])
+        metrics_df.to_csv(metrics_path, index=False, encoding="utf-8-sig")
+        return {"well_qc_dir": repo_relative_path(well_qc_dir, root=REPO_ROOT), "metrics": repo_relative_path(metrics_path, root=REPO_ROOT), "n_wells_qc": 0}
+
+    anchor = load_log_ai_anchor_npz(anchor_file)
+    point_table_path = _resolve_anchor_point_table(anchor_file, anchor.metadata)
+    point_df = pd.read_csv(point_table_path) if point_table_path is not None and point_table_path.exists() else pd.DataFrame()
+    if not point_df.empty and "flat_idx" not in point_df.columns:
+        raise ValueError(f"Anchor point table is missing flat_idx: {point_table_path}")
+
+    n_sample = int(geometry["n_sample"])
+    pred_flat = np.asarray(pred_volume, dtype=np.float32).reshape(-1, n_sample)
+    samples = np.asarray(anchor.samples, dtype=np.float64)
+    metrics_rows: list[dict[str, Any]] = []
+
+    for anchor_row, flat_idx_value in enumerate(np.asarray(anchor.flat_indices, dtype=np.int64)):
+        flat_idx = int(flat_idx_value)
+        anchor_name = str(np.asarray(anchor.anchor_names).astype(str)[anchor_row])
+        safe = sanitize_filename(f"{flat_idx}_{anchor_name}")
+        trace_path = trace_dir / f"well_qc_{safe}.csv"
+        figure_path = figure_dir / f"well_qc_{safe}.png"
+
+        if flat_idx < 0 or flat_idx >= pred_flat.shape[0]:
+            metrics_rows.append({"well_name": anchor_name, "flat_idx": flat_idx, "status": "failed", "error": "flat_idx_out_of_range"})
+            continue
+
+        low_values = np.asarray(anchor.target_ai[anchor_row], dtype=np.float64)
+        pred_values = np.asarray(pred_flat[flat_idx], dtype=np.float64)
+        mask = np.asarray(anchor.anchor_mask[anchor_row], dtype=bool) & np.isfinite(low_values) & np.isfinite(pred_values)
+
+        full_values = np.full(n_sample, np.nan, dtype=np.float64)
+        point_group = _point_table_for_anchor(anchor_name, flat_idx, point_df)
+        if not point_group.empty and {"sample_index", "ai_full"}.issubset(point_group.columns):
+            for _, row in point_group.iterrows():
+                sample_idx = int(row["sample_index"])
+                if 0 <= sample_idx < n_sample and np.isfinite(float(row["ai_full"])):
+                    full_values[sample_idx] = float(row["ai_full"])
+
+        trace_df = pd.DataFrame(
+            {
+                "twt_s": samples,
+                "well_full_ai": full_values,
+                "well_low_ai": low_values,
+                "ginn_predicted_ai": pred_values,
+                "anchor_mask": np.asarray(anchor.anchor_mask[anchor_row], dtype=bool),
+                "valid_for_metrics": mask,
+            }
+        )
+        trace_df.to_csv(trace_path, index=False, encoding="utf-8-sig")
+
+        low_trace = grid.Log(low_values, samples, "twt", name="Low-frequency well AI")
+        full_trace = grid.Log(full_values, samples, "twt", name="Full-band well AI") if np.any(np.isfinite(full_values)) else None
+        pred_trace = grid.Log(pred_values, samples, "twt", name="GINN predicted AI")
+        fig, _axes = plot_well_impedance_qc(
+            full_ai=full_trace,
+            low_ai=low_trace,
+            model_ai=pred_trace,
+            mask=mask,
+            title=f"GINN well QC | {anchor_name}",
+            model_label="GINN predicted AI",
+        )
+        fig.savefig(figure_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+
+        metrics_rows.append(
+            {
+                "well_name": anchor_name,
+                "flat_idx": flat_idx,
+                "inline": float(np.asarray(anchor.inline, dtype=np.float64)[anchor_row]),
+                "xline": float(np.asarray(anchor.xline, dtype=np.float64)[anchor_row]),
+                "status": "ok" if np.any(mask) else "no_valid_samples",
+                "trace_csv": repo_relative_path(trace_path, root=REPO_ROOT),
+                "figure": repo_relative_path(figure_path, root=REPO_ROOT),
+                **impedance_qc_metrics(model_ai=pred_trace, low_ai=low_trace, full_ai=full_trace, mask=mask),
+            }
+        )
+
+    metrics_df = pd.DataFrame.from_records(metrics_rows)
+    metrics_df.to_csv(metrics_path, index=False, encoding="utf-8-sig")
+    ok = metrics_df.loc[metrics_df["status"] == "ok"] if "status" in metrics_df else pd.DataFrame()
+    summary: dict[str, Any] = {
+        "well_qc_dir": repo_relative_path(well_qc_dir, root=REPO_ROOT),
+        "metrics": repo_relative_path(metrics_path, root=REPO_ROOT),
+        "n_wells_qc": int(len(ok)),
+        "point_table": None if point_table_path is None else repo_relative_path(point_table_path, root=REPO_ROOT),
+    }
+    if not ok.empty and "vs_low_rmse" in ok:
+        summary["mean_vs_low_rmse"] = float(ok["vs_low_rmse"].mean())
+        summary["mean_vs_low_mae"] = float(ok["vs_low_mae"].mean())
+        summary["mean_vs_low_corr"] = float(ok["vs_low_corr"].mean())
+    return summary
+
+
 def _relative_outputs(paths: dict[str, Path | None]) -> dict[str, str | None]:
     out: dict[str, str | None] = {}
     for key, path in paths.items():
@@ -400,8 +536,9 @@ def main() -> None:
     figure_dir = output_dir / "figures"
     metadata_dir = output_dir / "metadata"
     qc_dir = output_dir / "qc"
+    well_qc_dir = output_dir / "well_qc"
     trainer_context_dir = output_dir / "trainer_context"
-    for path in (output_dir, figure_dir, metadata_dir, qc_dir, trainer_context_dir):
+    for path in (output_dir, figure_dir, metadata_dir, qc_dir, well_qc_dir, trainer_context_dir):
         path.mkdir(parents=True, exist_ok=True)
 
     checkpoint_path = args.checkpoint or Path(script_cfg["checkpoint_path"])
@@ -489,6 +626,14 @@ def main() -> None:
     )
 
     qc_context_written = bool(script_cfg.get("write_qc_context", False))
+    well_qc_summary: dict[str, Any] | None = None
+    if bool(script_cfg.get("well_qc_enabled", True)) and not args.skip_well_qc:
+        well_qc_summary = _write_ginn_well_qc(
+            output_dir=output_dir,
+            pred_volume=pred_volume,
+            anchor_file=cfg.log_ai_anchor_file,
+            geometry=trainer.geometry,
+        )
 
     zgy_status = "disabled"
     if bool(script_cfg.get("export_zgy", True)) and not args.skip_zgy:
@@ -510,6 +655,8 @@ def main() -> None:
             "prediction_slice_figure": slice_figure_path,
             "prediction_crossplot": crossplot_path,
             "prediction_context_time": qc_context_path if qc_context_written else None,
+            "well_qc": well_qc_dir if well_qc_summary is not None else None,
+            "well_qc_metrics": (well_qc_dir / "well_qc_metrics.csv") if well_qc_summary is not None else None,
         }
     )
     summary = {
@@ -523,6 +670,7 @@ def main() -> None:
         "geometry": trainer.geometry,
         "prediction_stats": prediction_stats,
         "outputs": outputs,
+        "well_qc": well_qc_summary,
         "zgy_export_status": zgy_status,
     }
     metadata["outputs"] = outputs
@@ -543,6 +691,8 @@ def main() -> None:
     print(f"Output: {output_dir}")
     print(f"NPZ: {base_ai_npz}")
     print(f"ZGY export: {zgy_status}")
+    if well_qc_summary is not None:
+        print(f"Well QC: {well_qc_dir}")
 
 
 if __name__ == "__main__":

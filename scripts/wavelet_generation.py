@@ -36,7 +36,10 @@ if str(SRC_DIR) not in sys.path:
 from cup.utils.config import merge_dict_defaults
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.statistics import aggregate_cluster_then_global
+from cup.seismic.viz import plot_well_waveform_qc
 from cup.well.assets import normalize_well_name
+from cup.well.las import load_vp_rho_logset_from_standard_las
+from cup.well.td import load_workflow_time_depth_table_csv
 from cup.well.tie import (
     TieEvaluationWell,
     WaveletCandidate,
@@ -44,6 +47,7 @@ from cup.well.tie import (
     build_well_spatial_clusters,
     evaluate_wavelet_on_well,
     load_tie_artifacts,
+    load_saved_seismic_trace_csv,
     prepare_well_for_evaluation,
 )
 from cup.well.wavelet import (
@@ -55,6 +59,9 @@ from cup.well.wavelet import (
 )
 from cup.well.wavelet_consensus import ConsensusSearchPolicy, build_wavelet_pca_basis, optimize_consensus_wavelet
 from wtie.modeling.modeling import ConvModeler
+from wtie.optimize import tie as tie_ops
+from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
+from wtie.processing import grid
 
 
 def parse_args() -> argparse.Namespace:
@@ -354,6 +361,18 @@ def _score_from_aggregate(row: pd.Series, cfg: dict[str, Any], *, regularization
     return float(score)
 
 
+def _prepare_well_for_evaluation_with_ai(well: TieEvaluationWell) -> tuple[Any, Any, grid.Log]:
+    logset = load_vp_rho_logset_from_standard_las(well.input_las)
+    table = load_workflow_time_depth_table_csv(well.optimized_tdt_file)
+    seismic = load_saved_seismic_trace_csv(well.seismic_trace_file)
+    seismic_dt_s = float(np.median(np.diff(seismic.basis)))
+    logset_twt = tie_ops.convert_logs_from_md_to_twt(logset, None, table, seismic_dt_s)
+    reflectivity = tie_ops.compute_reflectivity(logset_twt)
+    seismic_match, reflectivity_match = tie_ops.match_seismic_and_reflectivity(seismic, reflectivity)
+    ai_values = np.interp(seismic_match.basis, logset_twt.AI.basis, logset_twt.AI.values, left=np.nan, right=np.nan)
+    return seismic_match, reflectivity_match, grid.Log(ai_values, seismic_match.basis, "twt", name="AI")
+
+
 def _evaluate_wavelet_on_all_wells(
     *,
     wavelet_name: str,
@@ -364,7 +383,7 @@ def _evaluate_wavelet_on_all_wells(
     clusters_df: pd.DataFrame,
     modeler: Any,
     output_qc_dir: Path | None = None,
-    well_cache: dict[str, tuple[Any, Any]] | None = None,
+    well_cache: dict[str, tuple[Any, Any, grid.Log]] | None = None,
 ) -> tuple[pd.DataFrame, list[pd.DataFrame]]:
     metrics: list[WaveletWellMetric] = []
     qcs: list[pd.DataFrame] = []
@@ -386,6 +405,8 @@ def _evaluate_wavelet_on_all_wells(
             qc = qc.copy()
             qc.insert(0, "well_name", well.well_name)
             qc.insert(1, "candidate_wavelet", wavelet_name)
+            if precomputed is not None and len(precomputed) >= 3:
+                qc["ai"] = precomputed[2].values
             qcs.append(qc)
             if output_qc_dir is not None:
                 safe = sanitize_filename(f"{wavelet_name}_{well.well_name}")
@@ -485,37 +506,36 @@ def _plot_wavelets(time_s: np.ndarray, wavelets: dict[str, np.ndarray], path: Pa
 def _plot_batch_synthetic_qc(qc: pd.DataFrame, metrics_row: pd.Series | None, path: Path) -> None:
     if qc.empty:
         return
-    twt_ms = qc["twt_s"].to_numpy(dtype=np.float64) * 1000.0
+    twt_s = qc["twt_s"].to_numpy(dtype=np.float64)
     reflectivity = qc["reflectivity"].to_numpy(dtype=np.float64)
     seismic_norm = qc["seismic_norm"].to_numpy(dtype=np.float64)
     synthetic = qc["synthetic_scaled"].to_numpy(dtype=np.float64)
     residual = qc["residual"].to_numpy(dtype=np.float64)
-    corr = float(metrics_row["corr"]) if metrics_row is not None and pd.notna(metrics_row.get("corr")) else np.nan
-    nmae = float(metrics_row["nmae"]) if metrics_row is not None and pd.notna(metrics_row.get("nmae")) else np.nan
-    scale = float(metrics_row["scale"]) if metrics_row is not None and pd.notna(metrics_row.get("scale")) else np.nan
+    ai_values = qc["ai"].to_numpy(dtype=np.float64) if "ai" in qc.columns else np.full_like(twt_s, np.nan)
 
-    fig, axes = plt.subplots(1, 3, figsize=(13, 5), sharey=True)
-    axes[0].plot(reflectivity, twt_ms, lw=0.8, color="tab:purple")
-    axes[0].invert_yaxis()
-    axes[0].set_xlabel("Reflectivity")
-    axes[0].set_ylabel("TWT (ms)")
-    axes[0].set_title("Reflectivity")
-    axes[0].grid(True, alpha=0.25)
-
-    axes[1].plot(seismic_norm, twt_ms, lw=0.9, label="Seismic", color="black")
-    axes[1].plot(synthetic, twt_ms, lw=0.9, label="Synthetic", color="tab:red", alpha=0.85)
-    axes[1].set_xlabel("Normalized amplitude")
-    axes[1].set_title(f"Batch synthetic: corr={corr:.3f}, nmae={nmae:.3f}, scale={scale:.3g}")
-    axes[1].legend(loc="best")
-    axes[1].grid(True, alpha=0.25)
-
-    axes[2].plot(residual, twt_ms, lw=0.9, color="tab:gray")
-    axes[2].axvline(0.0, color="black", lw=0.8, alpha=0.5)
-    axes[2].set_xlabel("Residual")
-    axes[2].set_title("Residual")
-    axes[2].grid(True, alpha=0.25)
-
-    fig.tight_layout()
+    synthetic_trace = grid.Seismic(synthetic, twt_s, "twt", name="Synthetic")
+    seismic_trace = grid.Seismic(seismic_norm, twt_s, "twt", name="Seismic")
+    xcorr_values = normalized_xcorr(seismic_trace.values, synthetic_trace.values)
+    xcorr_basis = synthetic_trace.sampling_rate * np.arange(-(synthetic_trace.size - 1), synthetic_trace.size)
+    xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
+    dxcorr = dynamic_normalized_xcorr(seismic_trace, synthetic_trace)
+    fig, _axes = plot_well_waveform_qc(
+        grid.Log(ai_values, twt_s, "twt", name="AI"),
+        grid.Reflectivity(reflectivity, twt_s, "twt", name="Reflectivity"),
+        synthetic_trace,
+        seismic_trace,
+        xcorr,
+        dxcorr,
+        mode="shape",
+        adaptive_wiggle_scale=True,
+        compact_x_ticks=True,
+        figsize=(12.0, 7.5),
+    )
+    if metrics_row is not None:
+        corr = float(metrics_row["corr"]) if pd.notna(metrics_row.get("corr")) else np.nan
+        nmae = float(metrics_row["nmae"]) if pd.notna(metrics_row.get("nmae")) else np.nan
+        scale = float(metrics_row["scale"]) if pd.notna(metrics_row.get("scale")) else np.nan
+        fig.suptitle(f"Batch synthetic | corr={corr:.3f}, nmae={nmae:.3f}, scale={scale:.3g}")
     fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -591,8 +611,8 @@ def main() -> None:
     clusters_df.to_csv(output_dir / "evaluation_well_spatial_clusters.csv", index=False)
 
     modeler = ConvModeler()
-    well_cache: dict[str, tuple[Any, Any]] = {
-        normalize_well_name(well.well_name): prepare_well_for_evaluation(well)
+    well_cache: dict[str, tuple[Any, Any, grid.Log]] = {
+        normalize_well_name(well.well_name): _prepare_well_for_evaluation_with_ai(well)
         for well in wells
     }
     candidate_metric_frames = []

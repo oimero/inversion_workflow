@@ -43,6 +43,7 @@ from cup.petrel.load import import_interpretation_petrel, import_well_tops_petre
 from cup.seismic.horizon import HorizonSurface
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.trace_sampling import assemble_nearest_trace_from_plan, build_nearest_trace_sample_plan
+from cup.seismic.viz import plot_well_waveform_qc
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.coerce import as_bool
 from cup.utils.config import merge_dict_defaults
@@ -934,7 +935,17 @@ def _write_qc_figures(
     ax.legend(loc="best")
     _save_current_figure(paths["fig_tdt"])
 
-    fig, axes = outputs.plot_tie_window(wiggle_scale=120000, figsize=(12.0, 7.5))
+    fig, axes = plot_well_waveform_qc(
+        outputs.logset_twt,
+        outputs.r,
+        outputs.synth_seismic,
+        outputs.seismic,
+        outputs.xcorr,
+        outputs.dxcorr,
+        wiggle_scale_syn=120000,
+        wiggle_scale_real=120000,
+        figsize=(12.0, 7.5),
+    )
     _draw_target_horizons(axes, target_window, y_scale=1.0)
     _save_current_figure(paths["fig_tie"])
 

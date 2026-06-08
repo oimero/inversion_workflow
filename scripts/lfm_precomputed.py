@@ -26,6 +26,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cup.seismic.viz import impedance_qc_metrics, plot_well_impedance_qc, sample_volume_at_points
 from cup.utils.config import deep_merge_dict
 from cup.utils.io import (
     build_segy_textual_header,
@@ -268,6 +269,93 @@ def _plot_lfm_result(result: Any, output_path: Path) -> None:
     axes[2].set_ylabel("Xline")
     fig.colorbar(im2, ax=axes[2], shrink=0.85)
     _save_fig(output_path)
+
+
+def _write_lfm_well_qc(control_df: pd.DataFrame, result: Any, output_dir: Path) -> tuple[Path | None, dict[str, Any]]:
+    if control_df.empty:
+        return None, {"n_wells_qc": 0, "well_qc": None}
+    qc_dir = output_dir / "well_qc"
+    figure_dir = qc_dir / "figures"
+    trace_dir = qc_dir / "traces"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    trace_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = control_df.copy()
+    samples = np.asarray(result.samples, dtype=np.float64)
+    if "sample_index" not in rows.columns or rows["sample_index"].isna().any():
+        twt = rows["twt_s"].to_numpy(dtype=np.float64)
+        right = np.searchsorted(samples, twt, side="left")
+        right = np.clip(right, 0, samples.size - 1)
+        left = np.clip(right - 1, 0, samples.size - 1)
+        choose_left = np.abs(twt - samples[left]) <= np.abs(samples[right] - twt)
+        rows["sample_index"] = np.where(choose_left, left, right).astype(np.int64)
+    sampled = sample_volume_at_points(
+        result.volume,
+        ilines=np.asarray(result.ilines, dtype=np.float64),
+        xlines=np.asarray(result.xlines, dtype=np.float64),
+        inline_values=rows["inline_float"].to_numpy(dtype=np.float64),
+        xline_values=rows["xline_float"].to_numpy(dtype=np.float64),
+        sample_indices=rows["sample_index"].to_numpy(dtype=np.int64),
+    )
+    rows["ai_lfm_sampled"] = sampled.astype(np.float64)
+    rows["diff_ai"] = rows["ai_lfm_sampled"].to_numpy(dtype=np.float64) - rows["ai"].to_numpy(dtype=np.float64)
+
+    metrics_rows: list[dict[str, Any]] = []
+    for well_name, group in rows.groupby("well_name", sort=True):
+        group = group.sort_values(["twt_s", "inline_float", "xline_float"]).reset_index(drop=True)
+        safe = sanitize_filename(str(well_name))
+        trace_path = trace_dir / f"well_qc_{safe}.csv"
+        figure_path = figure_dir / f"well_qc_{safe}.png"
+        keep_cols = [
+            "well_name",
+            "route",
+            "source",
+            "twt_s",
+            "sample_index",
+            "inline_float",
+            "xline_float",
+            "zone_name",
+            "u_in_zone",
+            "ai",
+            "ai_lfm_sampled",
+            "diff_ai",
+            "weight",
+        ]
+        present_cols = [col for col in keep_cols if col in group.columns]
+        group[present_cols].to_csv(trace_path, index=False, encoding="utf-8-sig")
+        metrics = impedance_qc_metrics(
+            group["ai"].to_numpy(dtype=np.float64),
+            group["ai_lfm_sampled"].to_numpy(dtype=np.float64),
+            weights=group["weight"].to_numpy(dtype=np.float64) if "weight" in group.columns else None,
+        )
+        plot_well_impedance_qc(
+            figure_path,
+            samples_s=group["twt_s"].to_numpy(dtype=np.float64),
+            low_ai=group["ai"].to_numpy(dtype=np.float64),
+            model_ai=group["ai_lfm_sampled"].to_numpy(dtype=np.float64),
+            title=f"LFM well QC | {well_name}",
+            low_label="Step-6 low-frequency control AI",
+            model_label="Step-7 LFM sampled AI",
+            metrics=metrics,
+        )
+        metrics_rows.append(
+            {
+                "well_name": str(well_name),
+                "status": "ok",
+                "source": ";".join(sorted(group["source"].astype(str).unique())) if "source" in group.columns else "",
+                **metrics,
+                "trace_qc_path": repo_relative_path(trace_path, root=REPO_ROOT),
+                "figure_path": repo_relative_path(figure_path, root=REPO_ROOT),
+            }
+        )
+
+    metrics_path = qc_dir / "well_qc_metrics.csv"
+    pd.DataFrame.from_records(metrics_rows).to_csv(metrics_path, index=False, encoding="utf-8-sig")
+    return metrics_path, {
+        "n_wells_qc": int(len(metrics_rows)),
+        "well_qc": repo_relative_path(qc_dir, root=REPO_ROOT),
+        "well_qc_metrics": repo_relative_path(metrics_path, root=REPO_ROOT),
+    }
 
 
 def _save_npz(result: Any, npz_file: Path, *, metadata_extra: dict[str, Any]) -> None:
@@ -522,9 +610,12 @@ def main() -> None:
 
     _plot_controls(control_df, figures_dir / "qc_control_points.png")
     _plot_lfm_result(result, figures_dir / "qc_ai_lfm_time.png")
+    well_qc_metrics_path, well_qc_summary = _write_lfm_well_qc(control_df, result, output_dir)
     outputs = {
         "ai_lfm_time": repo_relative_path(npz_file, root=REPO_ROOT),
         "control_points": repo_relative_path(control_path, root=REPO_ROOT),
+        "well_qc": well_qc_summary["well_qc"],
+        "well_qc_metrics": None if well_qc_metrics_path is None else repo_relative_path(well_qc_metrics_path, root=REPO_ROOT),
     }
 
     summary = {
@@ -540,6 +631,7 @@ def main() -> None:
         "outputs": outputs,
         "export_status": export_status,
         "coverage_stats": result.coverage_stats,
+        "well_qc": well_qc_summary,
     }
     write_json(output_dir / "run_summary.json", summary)
 

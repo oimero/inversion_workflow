@@ -43,6 +43,7 @@ from cup.petrel.load import import_interpretation_petrel, import_well_tops_petre
 from cup.seismic.horizon import HorizonSurface
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.trace_sampling import assemble_nearest_trace_from_plan, build_nearest_trace_sample_plan
+from cup.seismic.viz import plot_well_waveform_qc, waveform_qc_metrics
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.coerce import as_bool
 from cup.utils.config import merge_dict_defaults
@@ -906,6 +907,10 @@ def _write_qc_figures(
     seismic_norm: np.ndarray,
     synthetic: np.ndarray,
     *,
+    well_name: str = "",
+    optimized_corr: float | None = None,
+    optimized_nmae: float | None = None,
+    synthetic_scale: float | None = None,
     initial_table_rows: pd.DataFrame | None = None,
     target_window: TargetTieWindow | None = None,
 ) -> None:
@@ -934,9 +939,26 @@ def _write_qc_figures(
     ax.legend(loc="best")
     _save_current_figure(paths["fig_tdt"])
 
-    fig, axes = outputs.plot_tie_window(wiggle_scale=120000, figsize=(12.0, 7.5))
-    _draw_target_horizons(axes, target_window, y_scale=1.0)
-    _save_current_figure(paths["fig_tie"])
+    metrics = waveform_qc_metrics(seismic_norm, synthetic)
+    if optimized_corr is not None:
+        metrics["corr"] = optimized_corr
+    if optimized_nmae is not None:
+        metrics["nmae"] = optimized_nmae
+    if synthetic_scale is not None:
+        metrics["scale"] = synthetic_scale
+    plot_well_waveform_qc(
+        paths["fig_tie"],
+        samples_s=np.asarray(outputs.seismic.basis, dtype=np.float64),
+        observed=seismic_norm,
+        synthetic=synthetic,
+        reflectivity=np.asarray(outputs.r.values, dtype=np.float64),
+        mode="shape",
+        title=f"Well auto-tie waveform QC | {well_name}" if well_name else "Well auto-tie waveform QC",
+        observed_label="Seismic (standardized)",
+        synthetic_label="Synthetic (LS-scaled)",
+        amplitude_label="Standardized amplitude",
+        metrics=metrics,
+    )
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))
     axes[0].plot(outputs.wavelet.basis * 1000.0, outputs.wavelet.values / np.max(np.abs(outputs.wavelet.values)), label="raw")
@@ -1323,6 +1345,10 @@ def _run_tie_with_initial_table(
         cropped_wavelet,
         seismic_norm,
         synthetic,
+        well_name=plan.well_name,
+        optimized_corr=optimized_corr,
+        optimized_nmae=optimized_nmae,
+        synthetic_scale=synthetic_scale,
         initial_table_rows=prepared.table_rows,
         target_window=TargetTieWindow(
             top_name=str(prepared.report["target_top_name"]),

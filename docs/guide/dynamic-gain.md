@@ -1,4 +1,4 @@
-# 旁路 正演增益
+# Dynamic Gain：让合成记录回到观测地震的尺度
 
 GINN 训练端用能量归一化的子波做正演，合成记录的振幅和真实地震不在一个量级上。`dynamic_gain.py` 负责生成一个随时间和空间变化的增益体，把单位子波正演结果拉回到观测地震的尺度。它不是主链步骤，跑在第七步 LFM 之后、第八步 GINN 训练之前，由人根据产出证据决定第八步用 fixed gain 还是 dynamic gain。
 
@@ -125,7 +125,7 @@ dynamic_gain:
 
 对全体地震道计算同一属性、套用对数关系、clip 到安全范围、做轻量平滑，生成完整的三维增益体。输出的 gain 体必须是正值有限值；任何非正值会被替换为 clip 上下界的几何平均。
 
-同时输出 `recommended_fixed_gain.json`、体级 QC 图和井上波形 QC，供人判断第八步用 fixed 还是 dynamic。
+同时输出 `recommended_fixed_gain.json` 和一系列 QC 图，供人判断第八步用 fixed 还是 dynamic。
 
 ---
 
@@ -151,9 +151,6 @@ dynamic_gain:
 | `figures/qc_03_attribute_metrics.png` | 候选属性的 Pearson 相关系数柱状图 |
 | `figures/qc_04_spatial_debias.png` | 空间簇的井增益与簇增益对比 |
 | `figures/qc_05_dynamic_gain_volume.png` | 增益体的 inline、xline 和时间切片 |
-| `well_qc/figures/*.png` | 每条 anchor trace 的 amplitude 模式波形 QC |
-| `well_qc/traces/*.csv` | 每条 anchor trace 的归一化地震、单位合成、动态增益、增益后合成和残差 |
-| `well_qc/well_qc_metrics.csv` | 每条 anchor trace 的波形误差、RMS 比和是否参与 gain 拟合 |
 
 ### `dynamic_gain.npz`
 
@@ -196,11 +193,7 @@ dynamic_gain:
 
 `qc_05_dynamic_gain_volume.png` 三张切片用于排查异常。关注：是否有明显的条带（可能是采集脚印）、边界突变（检查 clip 比例）、孤立的高增益或低增益区（检查对应位置的原始地震是否是噪声）。
 
-### 第四步：看井上波形 QC
-
-`well_qc/figures/` 是 amplitude 模式 QC：黑线是 `seismic_raw / train_mask_rms`，红线是 `unit_wavelet_synthetic * dynamic_gain`，两者在同一个训练归一化幅值域中叠画。这里不再做单井最小二乘缩放，因此 RMS 比、残差和偏置可以直接反映 dynamic gain 是否把单位子波正演结果拉到了观测地震量级。互相关轨道按有效样点去均值后计算，主要用于看形态和相位，不表示含直流分量的幅值相似度。
-
-### 第五步：必要时看 samples 表
+### 第四步：必要时看 samples 表
 
 `dynamic_gain_samples.csv` 是井上估计的所有 gain 段明细。可以按 well_name 分组，看同一口井不同深度的 gain 是否一致、跨井的 gain 范围和井位空间分布有没有关系。
 

@@ -36,7 +36,6 @@ if str(SRC_DIR) not in sys.path:
 from cup.utils.config import merge_dict_defaults
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.statistics import aggregate_cluster_then_global
-from cup.seismic.viz import plot_well_waveform_qc, waveform_qc_metrics
 from cup.well.assets import normalize_well_name
 from cup.well.tie import (
     TieEvaluationWell,
@@ -486,33 +485,39 @@ def _plot_wavelets(time_s: np.ndarray, wavelets: dict[str, np.ndarray], path: Pa
 def _plot_batch_synthetic_qc(qc: pd.DataFrame, metrics_row: pd.Series | None, path: Path) -> None:
     if qc.empty:
         return
+    twt_ms = qc["twt_s"].to_numpy(dtype=np.float64) * 1000.0
     reflectivity = qc["reflectivity"].to_numpy(dtype=np.float64)
     seismic_norm = qc["seismic_norm"].to_numpy(dtype=np.float64)
     synthetic = qc["synthetic_scaled"].to_numpy(dtype=np.float64)
+    residual = qc["residual"].to_numpy(dtype=np.float64)
     corr = float(metrics_row["corr"]) if metrics_row is not None and pd.notna(metrics_row.get("corr")) else np.nan
     nmae = float(metrics_row["nmae"]) if metrics_row is not None and pd.notna(metrics_row.get("nmae")) else np.nan
     scale = float(metrics_row["scale"]) if metrics_row is not None and pd.notna(metrics_row.get("scale")) else np.nan
-    metrics = waveform_qc_metrics(seismic_norm, synthetic)
-    if np.isfinite(corr):
-        metrics["corr"] = corr
-    if np.isfinite(nmae):
-        metrics["nmae"] = nmae
-    if np.isfinite(scale):
-        metrics["scale"] = scale
-    well_name = str(qc["well_name"].iloc[0]) if "well_name" in qc.columns and not qc.empty else ""
-    plot_well_waveform_qc(
-        path,
-        samples_s=qc["twt_s"].to_numpy(dtype=np.float64),
-        observed=seismic_norm,
-        synthetic=synthetic,
-        reflectivity=reflectivity,
-        mode="shape",
-        title=f"Batch synthetic waveform QC | {well_name}" if well_name else "Batch synthetic waveform QC",
-        observed_label="Seismic (standardized)",
-        synthetic_label="Synthetic (LS-scaled)",
-        amplitude_label="Standardized amplitude",
-        metrics=metrics,
-    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 5), sharey=True)
+    axes[0].plot(reflectivity, twt_ms, lw=0.8, color="tab:purple")
+    axes[0].invert_yaxis()
+    axes[0].set_xlabel("Reflectivity")
+    axes[0].set_ylabel("TWT (ms)")
+    axes[0].set_title("Reflectivity")
+    axes[0].grid(True, alpha=0.25)
+
+    axes[1].plot(seismic_norm, twt_ms, lw=0.9, label="Seismic", color="black")
+    axes[1].plot(synthetic, twt_ms, lw=0.9, label="Synthetic", color="tab:red", alpha=0.85)
+    axes[1].set_xlabel("Normalized amplitude")
+    axes[1].set_title(f"Batch synthetic: corr={corr:.3f}, nmae={nmae:.3f}, scale={scale:.3g}")
+    axes[1].legend(loc="best")
+    axes[1].grid(True, alpha=0.25)
+
+    axes[2].plot(residual, twt_ms, lw=0.9, color="tab:gray")
+    axes[2].axvline(0.0, color="black", lw=0.8, alpha=0.5)
+    axes[2].set_xlabel("Residual")
+    axes[2].set_title("Residual")
+    axes[2].grid(True, alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _write_batch_synthetic_qc_figures(

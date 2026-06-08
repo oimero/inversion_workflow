@@ -25,7 +25,6 @@ from typing import Any
 
 import matplotlib
 import numpy as np
-import pandas as pd
 import torch
 
 matplotlib.use("Agg")
@@ -42,17 +41,14 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.seismic.survey import open_survey
-from cup.seismic.viz import impedance_qc_metrics, plot_well_impedance_qc, sample_volume_at_points
 from cup.utils.config import deep_merge_dict
 from cup.utils.io import (
     load_yaml_config,
     repo_relative_path,
     resolve_relative_path,
-    sanitize_filename,
     to_json_compatible,
     write_json,
 )
-from ginn.anchor import load_log_ai_anchor_npz, validate_log_ai_anchor
 from ginn.config import GINNConfig
 from ginn.trainer import Trainer
 
@@ -68,7 +64,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "zgy_inline_chunk_size": 16,
     "write_qc_context": False,
     "crossplot_max_samples": 200_000,
-    "well_qc_enabled": True,
 }
 
 
@@ -88,7 +83,6 @@ def parse_args() -> argparse.Namespace:
         help="Output directory. Defaults to <output_root>/ginn_inversion_<timestamp>.",
     )
     parser.add_argument("--skip-zgy", action="store_true", help="Skip optional ZGY export.")
-    parser.add_argument("--skip-well-qc", action="store_true", help="Skip anchor well impedance QC.")
     return parser.parse_args()
 
 
@@ -381,186 +375,6 @@ def _relative_outputs(paths: dict[str, Path | None]) -> dict[str, str | None]:
     return out
 
 
-def _resolve_anchor_point_table(anchor_metadata: dict[str, Any]) -> Path | None:
-    value = anchor_metadata.get("point_table")
-    if value is None or str(value).strip() == "":
-        return None
-    path = Path(str(value))
-    return path if path.is_absolute() else (REPO_ROOT / path).resolve()
-
-
-def _weighted_mean(values: pd.Series, weights: pd.Series) -> float:
-    v = values.to_numpy(dtype=np.float64)
-    w = np.maximum(weights.to_numpy(dtype=np.float64), 0.0)
-    valid = np.isfinite(v) & np.isfinite(w) & (w > 0.0)
-    if not np.any(valid):
-        valid = np.isfinite(v)
-        if not np.any(valid):
-            return float("nan")
-        return float(np.mean(v[valid]))
-    return float(np.sum(v[valid] * w[valid]) / np.sum(w[valid]))
-
-
-def _write_ginn_well_qc(
-    *,
-    pred_volume: np.ndarray,
-    geometry: dict[str, Any],
-    anchor_file: Path | None,
-    output_dir: Path,
-) -> tuple[Path | None, dict[str, Any]]:
-    if anchor_file is None or not Path(anchor_file).exists():
-        return None, {
-            "status": "skipped",
-            "reason": "missing_log_ai_anchor_file",
-            "n_wells_qc": 0,
-            "n_anchor_traces_qc": 0,
-            "well_qc": None,
-        }
-    anchor = load_log_ai_anchor_npz(anchor_file)
-    validate_log_ai_anchor(
-        anchor,
-        sample_domain="time",
-        n_sample=int(geometry["n_sample"]),
-        n_traces=int(geometry["n_il"]) * int(geometry["n_xl"]),
-    )
-    point_table = _resolve_anchor_point_table(anchor.metadata)
-    if point_table is None or not point_table.exists():
-        return None, {
-            "status": "skipped",
-            "reason": "missing_anchor_point_table",
-            "n_wells_qc": 0,
-            "n_anchor_traces_qc": 0,
-            "well_qc": None,
-        }
-
-    point_df = pd.read_csv(point_table)
-    required = {"well_name", "flat_idx", "sample_index", "twt_s", "inline_float", "xline_float", "ai_full", "well_low_ai", "weight"}
-    missing = required - set(point_df.columns)
-    if missing:
-        return None, {
-            "status": "skipped",
-            "reason": f"point_table_missing_columns:{sorted(missing)}",
-            "n_wells_qc": 0,
-            "n_anchor_traces_qc": 0,
-            "well_qc": None,
-        }
-
-    qc_dir = output_dir / "well_qc"
-    figure_dir = qc_dir / "figures"
-    trace_dir = qc_dir / "traces"
-    figure_dir.mkdir(parents=True, exist_ok=True)
-    trace_dir.mkdir(parents=True, exist_ok=True)
-    ilines, xlines, samples = _axis_values(geometry)
-    n_sample = samples.size
-    point_by_flat = {int(flat_idx): group.copy() for flat_idx, group in point_df.groupby("flat_idx", sort=False)}
-    metrics_rows: list[dict[str, Any]] = []
-
-    for anchor_row, flat_idx_value in enumerate(np.asarray(anchor.flat_indices, dtype=np.int64)):
-        flat_idx = int(flat_idx_value)
-        anchor_name = str(np.asarray(anchor.anchor_names).astype(str)[anchor_row])
-        anchor_mask = np.asarray(anchor.anchor_mask[anchor_row], dtype=bool)
-        weight = np.asarray(anchor.anchor_weight[anchor_row], dtype=np.float64)
-        low_ai = np.full(n_sample, np.nan, dtype=np.float64)
-        low_ai[anchor_mask] = np.asarray(anchor.target_ai[anchor_row], dtype=np.float64)[anchor_mask]
-        full_ai = np.full(n_sample, np.nan, dtype=np.float64)
-        # Defaults are the aggregated anchor-trace coordinates. Point rows replace
-        # them where per-sample floating coordinates exist, which matters for
-        # deviated wells and dense-platform conflict audit.
-        inline_values = np.full(n_sample, float(np.asarray(anchor.inline, dtype=np.float64)[anchor_row]), dtype=np.float64)
-        xline_values = np.full(n_sample, float(np.asarray(anchor.xline, dtype=np.float64)[anchor_row]), dtype=np.float64)
-        zones = np.full(n_sample, "", dtype=object)
-        u_values = np.full(n_sample, np.nan, dtype=np.float64)
-
-        group = point_by_flat.get(flat_idx)
-        if group is not None and not group.empty:
-            for sample_index, sample_group in group.groupby("sample_index", sort=False):
-                idx = int(sample_index)
-                if not 0 <= idx < n_sample:
-                    continue
-                w = sample_group["weight"]
-                full_ai[idx] = _weighted_mean(sample_group["ai_full"], w)
-                low_ai[idx] = _weighted_mean(sample_group["well_low_ai"], w)
-                inline_values[idx] = _weighted_mean(sample_group["inline_float"], w)
-                xline_values[idx] = _weighted_mean(sample_group["xline_float"], w)
-                if "zone_name" in sample_group.columns:
-                    zones[idx] = str(sample_group["zone_name"].astype(str).iloc[0])
-                if "u_in_zone" in sample_group.columns:
-                    u_values[idx] = _weighted_mean(sample_group["u_in_zone"], w)
-
-        sample_indices = np.arange(n_sample, dtype=np.int64)
-        pred_ai = sample_volume_at_points(
-            pred_volume,
-            ilines=ilines,
-            xlines=xlines,
-            inline_values=inline_values,
-            xline_values=xline_values,
-            sample_indices=sample_indices,
-        )
-        valid = anchor_mask & np.isfinite(low_ai) & np.isfinite(pred_ai)
-        trace_df = pd.DataFrame(
-            {
-                "twt_s": samples,
-                "sample_index": sample_indices,
-                "inline_float": inline_values,
-                "xline_float": xline_values,
-                "zone_name": zones,
-                "u_in_zone": u_values,
-                "well_ai_full": full_ai,
-                "well_ai_low": low_ai,
-                "ginn_ai": pred_ai,
-                "diff_vs_low": pred_ai - low_ai,
-                "diff_vs_full": pred_ai - full_ai,
-                "weight": weight,
-                "anchor_mask": anchor_mask,
-                "valid_for_metrics": valid,
-            }
-        )
-        safe = sanitize_filename(anchor_name)
-        trace_path = trace_dir / f"anchor_trace_{flat_idx}_{safe}.csv"
-        figure_path = figure_dir / f"anchor_trace_{flat_idx}_{safe}.png"
-        trace_df.to_csv(trace_path, index=False, encoding="utf-8-sig")
-        low_metrics = impedance_qc_metrics(low_ai, pred_ai, mask=valid, weights=weight, prefix="low")
-        full_metrics = impedance_qc_metrics(full_ai, pred_ai, mask=anchor_mask, weights=weight, prefix="full")
-        metrics = {**low_metrics, **full_metrics}
-        plot_well_impedance_qc(
-            figure_path,
-            samples_s=samples,
-            full_ai=full_ai,
-            low_ai=low_ai,
-            model_ai=pred_ai,
-            title=f"GINN anchor-trace QC | flat_idx={flat_idx} | {anchor_name}",
-            full_label="Step-6 full-frequency anchor AI",
-            low_label="Step-6 low-frequency anchor AI",
-            model_label="Step-9 GINN predicted AI",
-            metrics=metrics,
-        )
-        contributing_wells = sorted({str(v) for v in anchor_name.split(";") if str(v).strip()})
-        metrics_rows.append(
-            {
-                "anchor_name": anchor_name,
-                "contributing_wells": ";".join(contributing_wells),
-                "n_contributing_wells": int(len(contributing_wells)),
-                "flat_idx": flat_idx,
-                "status": "ok" if int(low_metrics["low_n_samples"]) > 0 else "no_valid_samples",
-                **metrics,
-                "trace_qc_path": repo_relative_path(trace_path, root=REPO_ROOT),
-                "figure_path": repo_relative_path(figure_path, root=REPO_ROOT),
-            }
-        )
-
-    metrics_path = qc_dir / "well_qc_metrics.csv"
-    pd.DataFrame.from_records(metrics_rows).to_csv(metrics_path, index=False, encoding="utf-8-sig")
-    return metrics_path, {
-        "status": "ok",
-        "n_wells_qc": int(len(metrics_rows)),
-        "n_anchor_traces_qc": int(len(metrics_rows)),
-        "well_qc": repo_relative_path(qc_dir, root=REPO_ROOT),
-        "well_qc_metrics": repo_relative_path(metrics_path, root=REPO_ROOT),
-        "anchor_file": repo_relative_path(anchor_file, root=REPO_ROOT),
-        "point_table": repo_relative_path(point_table, root=REPO_ROOT),
-    }
-
-
 # =============================================================================
 # Main
 # =============================================================================
@@ -689,23 +503,6 @@ def main() -> None:
     elif args.skip_zgy:
         zgy_status = "skipped_cli"
 
-    well_qc_metrics_path: Path | None = None
-    if args.skip_well_qc or not bool(script_cfg.get("well_qc_enabled", True)):
-        well_qc_summary: dict[str, Any] = {
-            "status": "skipped",
-            "reason": "disabled",
-            "n_wells_qc": 0,
-            "n_anchor_traces_qc": 0,
-            "well_qc": None,
-        }
-    else:
-        well_qc_metrics_path, well_qc_summary = _write_ginn_well_qc(
-            pred_volume=pred_volume,
-            geometry=trainer.geometry,
-            anchor_file=cfg.log_ai_anchor_file,
-            output_dir=output_dir,
-        )
-
     outputs = _relative_outputs(
         {
             "stage1_ginn_base_ai_time": base_ai_npz,
@@ -713,10 +510,8 @@ def main() -> None:
             "prediction_slice_figure": slice_figure_path,
             "prediction_crossplot": crossplot_path,
             "prediction_context_time": qc_context_path if qc_context_written else None,
-            "well_qc_metrics": well_qc_metrics_path,
         }
     )
-    outputs["well_qc"] = well_qc_summary.get("well_qc")
     summary = {
         "config": script_cfg,
         "checkpoint": {
@@ -729,7 +524,6 @@ def main() -> None:
         "prediction_stats": prediction_stats,
         "outputs": outputs,
         "zgy_export_status": zgy_status,
-        "well_qc": well_qc_summary,
     }
     metadata["outputs"] = outputs
     metadata["zgy_export_status"] = zgy_status

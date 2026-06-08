@@ -221,7 +221,7 @@ wavelet_generation:
 
 用最终选定的全局子波，对所有评测井生成统一的合成记录和 QC 数据。
 
-批量合成结束后，脚本会给每口评测井输出一张统一风格 A 的 shape-only QC 图：反射系数、合成地震、真实地震、残差和互相关。
+批量合成结束后，脚本会给每口评测井输出一张三联 QC 图：反射系数、观测地震与合成记录叠合、残差。
 
 ---
 
@@ -244,7 +244,7 @@ wavelet_generation:
 | 文件 | 什么时候看 | 内容 |
 |------|------------|------|
 | `batch_synthetic_metrics.csv` | 先按 `corr` 排序 | 使用全局子波后每口井的合成记录指标 |
-| `figures/batch_synthetic_qc/*.png` | 排查单井波形时 | 风格 A 的 shape-only 波形 QC；图中的 `scale` 是该井自己的最小二乘缩放倍数 |
+| `figures/batch_synthetic_qc/*.png` | 排查单井波形时 | 反射系数、观测/合成叠合、残差三联图；第二图标题里的 `scale` 是该井自己的最小二乘缩放倍数 |
 | `synthetic_qc/*.csv` | 需要逐样点复核时 | 每口井的地震道、反射系数、合成记录和残差 |
 | `figures/selected_wavelet.png` | 检查最终子波形态时 | 全局子波、最佳候选和共识子波的形态对比 |
 
@@ -349,7 +349,7 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 
 打开 `batch_synthetic_metrics.csv`，按 `corr` 排序，检查最低分的几口井对应的 `figures/batch_synthetic_qc/*.png`——地震和合成记录是否在关键层位附近明显错位。如果少数井拖累了全局指标，考虑把它们加入 `evaluation_wells.exclude_wells` 后重跑。
 
-每井 QC 图中的合成记录是该井单独最小二乘缩放后的结果，标题里的 `scale` 就是这口井使用的缩放倍数。因此这张图适合看波形、相位、残差和互相关，不用于判断全局固定振幅尺度。
+每井 QC 图第二个子图的红线是该井单独最小二乘缩放后的合成记录，标题里的 `scale` 就是这口井使用的缩放倍数。因此这张图适合看波形、相位和残差，不用于判断全局固定振幅尺度。
 
 ---
 

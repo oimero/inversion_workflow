@@ -14,7 +14,6 @@ python scripts/ginn_inversion.py --config experiments/common.yaml
 python scripts/ginn_inversion.py --checkpoint experiments/ginn/results/.../checkpoints/best.pt
 python scripts/ginn_inversion.py --output-dir scripts/output/ginn_inversion_test
 python scripts/ginn_inversion.py --skip-zgy
-python scripts/ginn_inversion.py --skip-well-qc
 ```
 
 不带参数时，脚本从配置的 `ginn_inversion.checkpoint_path` 读取 checkpoint；`--checkpoint` 可以临时覆盖这个路径。输出写入 `<output_root>/ginn_inversion_<timestamp>/`。
@@ -49,7 +48,6 @@ ginn_inversion:
   zgy_inline_chunk_size: 16
   write_qc_context: false
   crossplot_max_samples: 200000
-  well_qc_enabled: true
 ```
 
 ### `checkpoint_path`
@@ -76,10 +74,6 @@ ginn_inversion:
 
 控制交会图的抽样点数。工区体素量极大时，全部画进 hexbin 会很慢且看不出更多信息。默认 20 万点足够覆盖分布。
 
-### `well_qc_enabled`
-
-控制是否输出 anchor trace 波阻抗 QC。默认开启；命令行 `--skip-well-qc` 可以临时跳过。QC 会从 checkpoint 里的 `log_ai_anchor_file` 追溯到第六步 `well_constraint_points.csv`，因此不需要额外配置点表路径。密井平台中多口井落到同一道时，第六步 anchor 会先聚合为一条受控道，因此这里检查的是聚合后的 anchor trace，而不是强行拆成单井。
-
 ---
 
 ## 脚本在做什么
@@ -104,7 +98,7 @@ ginn_inversion:
 
 将推理出的波阻抗体保存为 NPZ，写出几何轴和元数据。元数据记录 checkpoint 来源、训练配置摘要、预测统计和输出文件清单。可选地导出 ZGY 格式和 QC 上下文包。
 
-同时生成剖面四联图（预测、LFM、差异、mask）、预测 vs LFM 的二维交会图，以及可选的 anchor trace 波阻抗 QC。
+同时生成两张 QC 图：一张剖面四联图（预测、LFM、差异、mask），一张预测 vs LFM 的二维交会图。
 
 ---
 
@@ -119,9 +113,6 @@ ginn_inversion:
 | `metadata/run_summary.json` | checkpoint、输出路径、几何和预测统计 |
 | `figures/<slice>_prediction_vs_lfm.png` | 预测、LFM、差异和 mask 四联剖面对比 |
 | `figures/prediction_vs_lfm_crossplot.png` | 预测波阻抗 vs LFM 抽样交会图 |
-| `well_qc/figures/*.png` | 每条 anchor trace 的全频 anchor、低频 anchor 和 GINN 预测 AI 对比 |
-| `well_qc/traces/*.csv` | 每条 anchor trace 逐样点全频 AI、低频 AI、GINN AI、差值和权重 |
-| `well_qc/well_qc_metrics.csv` | 每条 anchor trace 相对低频 anchor 和全频 anchor 的误差指标 |
 | `qc/prediction_context_time.npz` | 可选 QC 包，包含 LFM 体和 mask 体（默认不写） |
 | `trainer_context/` | 训练上下文目录（Trainer 初始化时自动生成，不删） |
 
@@ -163,10 +154,6 @@ LFM 体和 mask 体不塞进主 NPZ——大工区下它们的体积和预测体
 - 目标层外部：预测体是否基本还原为 LFM。如果层外出现明显的异常值，说明 mask 的边界效应超过了预期。
 
 默认剖面取工区中央。正式检查时应至少多看两条：一条过井密集区，一条过目标层厚度变化剧烈区。
-
-### 第四步：看井上 QC
-
-`well_qc/figures/` 中灰线是第六步聚合后的全频 anchor AI，蓝线是第六步聚合后的低频 anchor AI，红线是第九步 GINN 预测 AI。优先看红线是否在蓝线基础上增加合理细节，而不是整体漂离低频趋势；再看它与灰线的关系，判断 stage-1 是否已经恢复了井上高频变化。
 
 ---
 

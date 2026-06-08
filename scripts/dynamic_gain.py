@@ -36,14 +36,12 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.petrel.load import import_interpretation_petrel, import_seismic
 from cup.seismic.target_zone import TargetZone
-from cup.seismic.viz import plot_well_waveform_qc, reflectivity_from_ai, waveform_qc_metrics
 from cup.utils.config import deep_merge_dict
 from cup.utils.io import (
     latest_run,
     load_yaml_config,
     repo_relative_path,
     resolve_optional_path,
-    sanitize_filename,
     write_json,
 )
 from cup.well.gain import (
@@ -783,123 +781,6 @@ def write_qc_figures(
     _save_fig(ctx.figure_dir / "qc_05_dynamic_gain_volume.png")
 
 
-def write_well_waveform_qc(
-    ctx: DynamicGainContext,
-    *,
-    syn_unit: np.ndarray,
-    gain_volume: np.ndarray,
-    sample_df: pd.DataFrame,
-) -> tuple[Path | None, dict[str, Any]]:
-    anchor = load_log_ai_anchor_npz(ctx.anchor_file)
-    validate_log_ai_anchor(
-        anchor,
-        sample_domain="time",
-        n_sample=int(ctx.geometry["n_sample"]),
-        n_traces=int(ctx.geometry["n_il"]) * int(ctx.geometry["n_xl"]),
-    )
-    if anchor.n_anchors == 0:
-        return None, {"n_wells_qc": 0, "n_anchor_traces_qc": 0, "well_qc": None}
-    qc_dir = ctx.output_dir / "well_qc"
-    figure_dir = qc_dir / "figures"
-    trace_dir = qc_dir / "traces"
-    figure_dir.mkdir(parents=True, exist_ok=True)
-    trace_dir.mkdir(parents=True, exist_ok=True)
-
-    n_sample = int(ctx.geometry["n_sample"])
-    seismic_norm_flat = (ctx.seismic.reshape(-1, n_sample) / float(ctx.train_mask_rms)).astype(np.float32)
-    syn_unit_flat = np.asarray(syn_unit, dtype=np.float32).reshape(-1, n_sample)
-    gain_flat = np.asarray(gain_volume, dtype=np.float32).reshape(-1, n_sample)
-    synthetic_dynamic_flat = syn_unit_flat * gain_flat
-    lfm_flat = np.asarray(ctx.lfm, dtype=np.float32).reshape(-1, n_sample)
-    loss_mask_flat = np.asarray(ctx.train_loss_mask, dtype=bool).reshape(-1, n_sample)
-    fit_groups = {int(flat_idx): group for flat_idx, group in sample_df.groupby("flat_idx", sort=False)}
-
-    metrics_rows: list[dict[str, Any]] = []
-    for anchor_row, flat_idx_value in enumerate(np.asarray(anchor.flat_indices, dtype=np.int64)):
-        flat_idx = int(flat_idx_value)
-        well_name = str(np.asarray(anchor.anchor_names).astype(str)[anchor_row])
-        safe = sanitize_filename(well_name)
-        anchor_mask = np.asarray(anchor.anchor_mask[anchor_row], dtype=bool)
-        loss_mask = loss_mask_flat[flat_idx]
-        finite = (
-            anchor_mask
-            & loss_mask
-            & np.isfinite(seismic_norm_flat[flat_idx])
-            & np.isfinite(synthetic_dynamic_flat[flat_idx])
-        )
-        used_sample_mask = np.zeros(n_sample, dtype=bool)
-        fit_group = fit_groups.get(flat_idx)
-        if fit_group is not None:
-            for _, row in fit_group.iterrows():
-                start = max(0, int(row["sample_start"]))
-                end = min(n_sample, int(row["sample_end"]))
-                used_sample_mask[start:end] = True
-        trace_df = pd.DataFrame(
-            {
-                "twt_s": ctx.samples,
-                "seismic_norm": seismic_norm_flat[flat_idx],
-                "synthetic_unit": syn_unit_flat[flat_idx],
-                "dynamic_gain": gain_flat[flat_idx],
-                "synthetic_dynamic": synthetic_dynamic_flat[flat_idx],
-                "residual_dynamic": seismic_norm_flat[flat_idx] - synthetic_dynamic_flat[flat_idx],
-                "lfm_ai": lfm_flat[flat_idx],
-                "reflectivity": reflectivity_from_ai(lfm_flat[flat_idx]),
-                "anchor_mask": anchor_mask,
-                "loss_mask": loss_mask,
-                "valid_for_metrics": finite,
-                "used_for_gain_fit_sample": used_sample_mask,
-            }
-        )
-        trace_path = trace_dir / f"anchor_trace_{flat_idx}_{safe}.csv"
-        figure_path = figure_dir / f"anchor_trace_{flat_idx}_{safe}.png"
-        trace_df.to_csv(trace_path, index=False, encoding="utf-8-sig")
-        metrics = waveform_qc_metrics(
-            seismic_norm_flat[flat_idx],
-            synthetic_dynamic_flat[flat_idx],
-            mask=finite,
-        )
-        used_for_gain_fit = bool(fit_group is not None and not fit_group.empty)
-        plot_well_waveform_qc(
-            figure_path,
-            samples_s=ctx.samples,
-            observed=seismic_norm_flat[flat_idx],
-            synthetic=synthetic_dynamic_flat[flat_idx],
-            impedance=lfm_flat[flat_idx],
-            reflectivity=trace_df["reflectivity"].to_numpy(dtype=np.float64),
-            mode="amplitude",
-            title=f"Dynamic gain anchor-trace QC | flat_idx={flat_idx} | {well_name}",
-            observed_label="Seismic / train_mask_rms",
-            synthetic_label="Unit synthetic * dynamic gain",
-            amplitude_label="Training-normalized amplitude",
-            mask=finite,
-            metrics=metrics,
-        )
-        metrics_rows.append(
-            {
-                "anchor_name": well_name,
-                "flat_idx": flat_idx,
-                "inline": float(np.asarray(anchor.inline, dtype=np.float64)[anchor_row]),
-                "xline": float(np.asarray(anchor.xline, dtype=np.float64)[anchor_row]),
-                "status": "ok" if int(metrics["n_samples"]) > 0 else "no_valid_samples",
-                "used_for_gain_fit": used_for_gain_fit,
-                "n_gain_segments": int(0 if fit_group is None else len(fit_group)),
-                "gain_median": float(np.nanmedian(gain_flat[flat_idx][finite])) if np.any(finite) else float("nan"),
-                **metrics,
-                "trace_qc_path": repo_relative_path(trace_path, root=REPO_ROOT),
-                "figure_path": repo_relative_path(figure_path, root=REPO_ROOT),
-            }
-        )
-
-    metrics_path = qc_dir / "well_qc_metrics.csv"
-    pd.DataFrame.from_records(metrics_rows).to_csv(metrics_path, index=False, encoding="utf-8-sig")
-    return metrics_path, {
-        "n_wells_qc": int(len(metrics_rows)),
-        "n_anchor_traces_qc": int(len(metrics_rows)),
-        "well_qc": repo_relative_path(qc_dir, root=REPO_ROOT),
-        "well_qc_metrics": repo_relative_path(metrics_path, root=REPO_ROOT),
-    }
-
-
 def write_outputs(
     ctx: DynamicGainContext,
     sample_df: pd.DataFrame,
@@ -911,7 +792,6 @@ def write_outputs(
     gain_volume: np.ndarray,
     volume_stats: dict[str, Any],
     sample_summary: dict[str, Any],
-    syn_unit: np.ndarray,
 ) -> None:
     gain_npz = write_gain_npz(ctx, gain_volume, fit, volume_stats)
     fixed_payload = {
@@ -924,12 +804,6 @@ def write_outputs(
     cluster_gain.to_csv(ctx.output_dir / "dynamic_gain_cluster_medians.csv", index=False, encoding="utf-8-sig")
     attr_metrics.to_csv(ctx.output_dir / "dynamic_gain_attribute_metrics.csv", index=False, encoding="utf-8-sig")
     write_qc_figures(ctx, sample_df, attr_metrics, well_gain, cluster_gain, fit, gain_volume)
-    well_qc_metrics_path, well_qc_summary = write_well_waveform_qc(
-        ctx,
-        syn_unit=syn_unit,
-        gain_volume=gain_volume,
-        sample_df=sample_df,
-    )
 
     summary = {
         "schema_version": SCHEMA_VERSION,
@@ -956,10 +830,7 @@ def write_outputs(
             "recommended_fixed_gain": repo_relative_path(ctx.output_dir / "recommended_fixed_gain.json", root=REPO_ROOT),
             "dynamic_gain_samples": repo_relative_path(ctx.output_dir / "dynamic_gain_samples.csv", root=REPO_ROOT),
             "figures": repo_relative_path(ctx.figure_dir, root=REPO_ROOT),
-            "well_qc": well_qc_summary["well_qc"],
-            "well_qc_metrics": None if well_qc_metrics_path is None else repo_relative_path(well_qc_metrics_path, root=REPO_ROOT),
         },
-        "well_qc": well_qc_summary,
         "config": ctx.script_cfg,
     }
     write_json(ctx.output_dir / "dynamic_gain_summary.json", summary)
@@ -1000,7 +871,6 @@ def main() -> None:
         gain_volume,
         volume_stats,
         sample_summary,
-        syn_unit,
     )
 
 

@@ -136,7 +136,7 @@ lfm_precomputed:
 
 1. 将建模结果保存为 `ai_lfm_time.npz`，内含体积、方差体、三个规则轴、几何元数据、建模元数据和覆盖统计。
 2. 可选导出地震体格式（SEG-Y 进则 SEG-Y 出，ZGY 进则 ZGY 出），方便在地质软件中检查。
-3. 输出 QC 图：控制点平面分布图、LFM 剖面图和井上低频模型对比图。
+3. 输出 QC 图：控制点平面分布图和 LFM 剖面图。
 
 ---
 
@@ -151,9 +151,6 @@ lfm_precomputed:
 | `lfm_control_points.csv` | 点级控制样本，每行一个目标层内低频 AI 控制点 |
 | `target_layer_qc/*` | 目标层 mask、层厚、层位有效性 QC |
 | `figures/*.png` | 控制点分布图和 LFM 剖面图 |
-| `well_qc/figures/*.png` | 每口井的低频控制 AI 与 LFM 抽样 AI 对比 |
-| `well_qc/traces/*.csv` | 每口井逐点低频控制、LFM 抽样、差值和坐标 |
-| `well_qc/well_qc_metrics.csv` | 每口井 LFM 抽样相对低频控制点的误差指标 |
 | `run_summary.json` | 输入路径、筛选统计、建模参数和输出路径 |
 
 ### `ai_lfm_time.npz`
@@ -201,8 +198,6 @@ lfm_precomputed:
 ### 第二步：看图
 
 `figures/` 中的控制点分布图用于判断是否存在空间偏差：某个平台井群的密度是否远超其他区域。同一张切片里如果多口井落到重复 `(inline, xline)` 坐标，第七步会在切片建模时按权重聚合这些重复坐标，再交给克里金插值。
-
-`well_qc/figures/` 用于逐井检查第七步是否尊重第六步给出的低频控制事实。蓝线是第六步低频控制 AI，红线是从 LFM 体按 `inline_float/xline_float/sample_index` 双线性抽样得到的 AI；斜井会按轨迹点的浮点线号位置抽样，而不是退回井口直井。
 
 ---
 

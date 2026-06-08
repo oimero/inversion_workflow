@@ -324,10 +324,8 @@ planned_run_count / successful_tie_count
 每口成功井抽查这几张图：
 
 - `figures/<well>/time_depth_table.png` — 初始 vs 优化 TDT 对比
-- `figures/<well>/synthetic_match.png` — 风格 A 的 shape-only 合成匹配图：反射系数、合成地震、真实地震、残差和互相关
+- `figures/<well>/synthetic_match.png` — 合成记录与地震道匹配
 - `figures/<well>/wavelet.png` — 提取的子波形态
-
-`synthetic_match.png` 是井震标定用的形态 QC。图中的地震道已标准化，合成记录已按单井最小二乘缩放，因此适合判断相位、波形和残差，不用于判断真实地震振幅量级。
 
 关注：优化后的 TDT 有没有不合理的大幅扭曲？合成记录是不是只在局部强行对齐？子波有没有过窄、偏相或振铃异常？
 

@@ -54,9 +54,9 @@ class GINNConfig:
     wavelet_source: WaveletSource = "ricker_wavelet"  # 子波来源：预计算子波或 Ricker 子波。
     wavelet_file: Path | None = Path("your_precomputed_wavelet.csv")  # 预计算子波 CSV。
     wavelet_type: str = "ricker"  # 生成 Ricker 子波时使用的子波类型名。
-    wavelet_freq: float = 25.0  # Ricker 子波主频（Hz）。
-    wavelet_dt: float = 0.001  # 子波采样间隔（秒）。
-    wavelet_length: int = 201  # 子波长度（采样点数，建议奇数）。
+    wavelet_freq: float | None = None  # Ricker 子波主频（Hz）；precomputed_wavelet 时不需要。
+    wavelet_dt: float | None = None  # 子波采样间隔（秒）；precomputed_wavelet 时不需要。
+    wavelet_length: int | None = None  # 子波长度（采样点数）；precomputed_wavelet 时不需要。
 
     # ── 振幅补偿 ──────────────────────────────────────────────
     # 振幅补偿让正演地震和归一化观测地震处于同一量级。fixed_gain 是全局
@@ -186,12 +186,13 @@ class GINNConfig:
             raise ValueError(f"fixed_gain must be positive when provided, got {self.fixed_gain}.")
         if self.fixed_gain_num_traces <= 0:
             raise ValueError(f"fixed_gain_num_traces must be positive, got {self.fixed_gain_num_traces}.")
-        if self.wavelet_freq <= 0.0:
-            raise ValueError(f"wavelet_freq must be positive, got {self.wavelet_freq}.")
-        if self.wavelet_dt <= 0.0:
-            raise ValueError(f"wavelet_dt must be positive, got {self.wavelet_dt}.")
-        if self.wavelet_length < 2:
-            raise ValueError(f"wavelet_length must be at least 2, got {self.wavelet_length}.")
+        if self.wavelet_source == "ricker_wavelet":
+            if self.wavelet_freq is None or self.wavelet_freq <= 0.0:
+                raise ValueError(f"wavelet_freq must be positive for ricker_wavelet, got {self.wavelet_freq}.")
+            if self.wavelet_dt is None or self.wavelet_dt <= 0.0:
+                raise ValueError(f"wavelet_dt must be positive for ricker_wavelet, got {self.wavelet_dt}.")
+            if self.wavelet_length is None or self.wavelet_length < 2:
+                raise ValueError(f"wavelet_length must be at least 2 for ricker_wavelet, got {self.wavelet_length}.")
         if self.lambda_tv < 0.0:
             raise ValueError(f"lambda_tv must be non-negative, got {self.lambda_tv}.")
         if self.lambda_log_ai_anchor < 0.0:

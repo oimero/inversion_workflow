@@ -25,6 +25,7 @@ from torch.utils.data import Dataset
 from cup.petrel.load import import_interpretation_petrel, import_seismic
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
+from cup.utils.io import resolve_relative_path
 from cup.well.wavelet import (
     DEFAULT_ACTIVE_SUPPORT_THRESHOLD,
     compute_wavelet_active_half_support_s,
@@ -40,6 +41,8 @@ from ginn.masking import get_valid_trace_indices as _get_valid_trace_indices
 from ginn.masking import select_spatial_validation_split as _select_spatial_validation_split
 
 logger = logging.getLogger(__name__)
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 BOUNDARY_EFFECT_WAVELET_THRESHOLD = DEFAULT_ACTIVE_SUPPORT_THRESHOLD
 DYNAMIC_GAIN_LOG_CLIP = 3.0
@@ -797,6 +800,8 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
         raise ValueError("AI LFM NPZ metadata must contain at least two sorted horizons.")
 
     logger.info("Loading raw top/bottom interpretation horizons...")
+    top_horizon_file = str(resolve_relative_path(top_horizon_file, root=_REPO_ROOT))
+    bot_horizon_file = str(resolve_relative_path(bot_horizon_file, root=_REPO_ROOT))
     top_df_raw = import_interpretation_petrel(top_horizon_file)
     bot_df_raw = import_interpretation_petrel(bot_horizon_file)
 

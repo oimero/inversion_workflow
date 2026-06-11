@@ -71,7 +71,7 @@
 | `preprocess_status` | passed / failed |
 | `usable_p_sonic` / `usable_density` / `usable_caliper` | 清洗和复核后的曲线可用性 |
 | `final_p_sonic` / `final_density` / `final_caliper` | 最终标准 mnemonic |
-| `preprocessed_las` | 第三步预处理 LAS；仅 passed 井应有值 |
+| `preprocessed_las` | 第三步预处理 LAS；仅 passed 井应有值，固定包含 `DT_USM`、`RHO_GCC` 和缺失值严格传播的全频 `AI` |
 
 ---
 
@@ -122,7 +122,7 @@
 | `route` | 实际执行的第四步标定路由 |
 | `tie_status` | success / failed |
 | `optimized_tdt_file` | 第四步细标定后的内部 TDT CSV |
-| `filtered_las_file` | 第四步用最优滤波参数导出的 LAS；第五步从这里读取 `DT_USM`/`RHO_GCC` |
+| `filtered_las_file` | 第四步用最优滤波参数导出的 LAS，固定包含重新计算的 `DT_USM`、`RHO_GCC`、`AI`；第五步仍以基础曲线构造自己的 `LogSet` |
 | `seismic_trace_file` | 第四步保存的井旁或轨迹地震道 |
 | `optimized_trace_sample_plan_file` | 斜井细标定后按 optimized TDT 重新生成的样点级落道计划；直井为空 |
 

@@ -788,9 +788,11 @@ def _filtered_standard_las_logset(logset_md: Any, best_params: Mapping[str, Any]
         raise ValueError("Filtered Vp contains non-finite or non-positive values.")
     if np.any(~np.isfinite(rho)) or np.any(rho <= 0.0):
         raise ValueError("Filtered Rho contains non-finite or non-positive values.")
+    ai = filtered.AI
     return {
         "DT_USM": grid.Log(1_000_000.0 / vp, md, "md", name="DT_USM", unit="us/m", allow_nan=False),
         "RHO_GCC": grid.Log(rho, md, "md", name="RHO_GCC", unit="g/cm3", allow_nan=False),
+        "AI": ai,
     }
 
 
@@ -800,7 +802,7 @@ def _export_filtered_las(paths: dict[str, Path], plan: WellTiePlan, logset_md: A
         plan.well_name,
         filtered_logs,
         paths["filtered_las"],
-        curve_names=["DT_USM", "RHO_GCC"],
+        curve_names=["DT_USM", "RHO_GCC", "AI"],
     )
 
 

@@ -25,7 +25,7 @@ python scripts/well_auto_tie.py --output-dir scripts/output/well_auto_tie_test
 |------|------|------|
 | 第一步 | `well_inventory.csv` | 井口坐标、资产清单、井型初分、工区位置 |
 | 第二步 | `well_screen.csv` | 曲线筛选审计、每口井有哪些可用曲线 |
-| 第三步 | `well_preprocess_status.csv`、`preprocessed_las/*.las` | 判断 `DT_USM` 和 `RHO_GCC` 是否可用，加载标准 LAS |
+| 第三步 | `well_preprocess_status.csv`、`preprocessed_las/*.las` | 判断基础曲线是否可用；从当前 `DT_USM/RHO_GCC` 加载 `LogSet`，忽略输入 LAS 中已有的 AI |
 | 轨迹 QC | `well_trajectory.csv` | 优先用复核后的井型替代第一步的初分 |
 | 数据目录 | 时深表目录、井轨迹目录、井分层文件 | 时深表、Petrel 井轨迹、井分层 |
 | 地震数据 | ZGY 或 SEG-Y 体、解释层位 | 读取井旁地震道或沿轨迹道集，确定目标时间窗 |
@@ -258,7 +258,9 @@ manual_shift:
 
 `time_depth/optimized_tdt_<well>.csv` 是工作流内部格式，保留正秒 `twt_s` 和正米 `md_m`；`petrel_checkshots/optimized_tdt_<well>.txt` 是地质软件导入格式，沿用 `export_vertical_tdt_to_petrel_checkshots()` 的口径导出。
 
-`filtered_las/filtered_logs_<well>.las` 只包含第五步需要的标准曲线：`DT_USM`（`us/m`）和 `RHO_GCC`（`g/cm3`）。它保留本井自动标定选中的滤波效果，但不会把时深表的整体时移写回测井曲线。也就是说，它修的是曲线滤波口径，不是把 LAS 深度轴改掉。
+`filtered_las/filtered_logs_<well>.las` 固定包含 `DT_USM`（`us/m`）、`RHO_GCC`（`g/cm3`）和 `AI`（`m/s*g/cm3`）。第四步只信当前输入 LAS 的基础 DT/RHO，完成最优滤波后重新计算 AI；不会校验或沿用第三步、人工处理中已有的旧 AI。
+
+它保留本井自动标定选中的滤波效果，但不会把时深表的整体时移写回测井曲线。也就是说，它修的是曲线滤波口径，不是把 LAS 深度轴改掉。
 
 ### `trace_sample_plan_<well>.csv`
 

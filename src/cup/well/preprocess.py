@@ -135,6 +135,14 @@ class WellCurveSet:
             raise KeyError(f"Curve {name!r} is not available in well {self.well_name!r}.")
         return log
 
+    def with_log(self, name: str, log: grid.Log) -> "WellCurveSet":
+        """返回追加一条共享 MD 轴曲线后的新对象。"""
+        if name in self.logs:
+            raise KeyError(f"Curve {name!r} already exists in well {self.well_name!r}.")
+        logs = dict(self.logs)
+        logs[name] = log
+        return WellCurveSet(well_name=self.well_name, logs=logs, source_las=self.source_las)
+
 
 def validate_shared_basis(logs: Mapping[str, grid.Log]) -> None:
     """校验所有曲线共享同一条 MD 采样轴。"""
@@ -151,6 +159,40 @@ def validate_shared_basis(logs: Mapping[str, grid.Log]) -> None:
             raise ValueError(f"Curve {name!r} must be in MD domain.")
         if log.basis.shape != basis.shape or not np.allclose(np.asarray(log.basis, dtype=float), basis, atol=1e-6):
             raise ValueError(f"Curve {name!r} does not share the same MD basis as {first_name!r}.")
+
+
+def derive_acoustic_impedance(
+    curve_set: WellCurveSet,
+    *,
+    dt_mnemonic: str = "DT_USM",
+    rho_mnemonic: str = "RHO_GCC",
+) -> grid.Log:
+    """从标准慢度和密度曲线派生声阻抗，严格传播无效样点。"""
+    dt_log = curve_set.require(dt_mnemonic)
+    rho_log = curve_set.require(rho_mnemonic)
+    if str(dt_log.unit or "").strip().lower() != "us/m":
+        raise ValueError(f"{dt_mnemonic} must use unit 'us/m', got {dt_log.unit!r}.")
+    if str(rho_log.unit or "").strip().lower() != "g/cm3":
+        raise ValueError(f"{rho_mnemonic} must use unit 'g/cm3', got {rho_log.unit!r}.")
+
+    dt_usm = np.asarray(dt_log.values, dtype=float)
+    rho_gcc = np.asarray(rho_log.values, dtype=float)
+    valid = np.isfinite(dt_usm) & (dt_usm > 0.0) & np.isfinite(rho_gcc) & (rho_gcc > 0.0)
+    ai = np.full(dt_usm.shape, np.nan, dtype=float)
+    ai[valid] = (1_000_000.0 / dt_usm[valid]) * rho_gcc[valid]
+    return grid.Log(
+        ai,
+        np.asarray(dt_log.basis, dtype=float),
+        "md",
+        name="AI",
+        unit="m/s*g/cm3",
+        allow_nan=True,
+    )
+
+
+def with_acoustic_impedance(curve_set: WellCurveSet) -> WellCurveSet:
+    """返回固定追加 ``AI`` 派生曲线的单井曲线集合。"""
+    return curve_set.with_log("AI", derive_acoustic_impedance(curve_set))
 
 
 def select_curves_by_category(

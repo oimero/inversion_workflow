@@ -39,11 +39,12 @@ from cup.utils.coerce import optional_float as _optional_float
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.well.assets import normalize_well_name
 from cup.well.curves import exact_mnemonic, normalize_mnemonic
-from cup.well.las import _header_value
+from cup.well.las import _header_value, export_logset_to_las
 from cup.well.preprocess import (
     DEFAULT_MISSING_SENTINELS,
     CurveThreshold,
     UnitStandardization,
+    WellCurveSet,
     compute_global_quantile_thresholds,
     finite_stats,
     is_curve_usable,
@@ -53,7 +54,9 @@ from cup.well.preprocess import (
     standardize_curve_unit,
     threshold_from_overrides,
     values_to_nan,
+    with_acoustic_impedance,
 )
+from wtie.processing import grid
 
 
 # =============================================================================
@@ -144,6 +147,19 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return script_cfg
 
 
+def _validate_standardization_contract(config: Mapping[str, Any]) -> None:
+    if not _section_enabled(config, "mnemonic_standardization", default=True):
+        raise ValueError(
+            "well_preprocess.mnemonic_standardization.enabled must be true: "
+            "successful LAS files must use DT_USM/RHO_GCC/AI."
+        )
+    if not _section_enabled(config, "unit_standardization", default=True):
+        raise ValueError(
+            "well_preprocess.unit_standardization.enabled must be true: "
+            "successful LAS files must use us/m, g/cm3, and m/s*g/cm3."
+        )
+
+
 def _resolve_repo_path(value: str | Path) -> Path:
     return resolve_relative_path(value, root=REPO_ROOT)
 
@@ -218,8 +234,6 @@ class RawCurve:
     md: np.ndarray
     values: np.ndarray
     source_las: Path
-    index_mnemonic: str
-    index_unit: str
     las_null_value: float | None
 
 
@@ -274,7 +288,6 @@ def _load_raw_curves_for_well(
     if data.ndim != 2 or data.shape[1] != len(las.curves):
         raise ValueError(f"LAS data shape does not match curve headers: {las_file}")
     by_exact, by_norm = _curve_index(las)
-    index_curve = las.curves[0]
     md = np.asarray(data[:, 0], dtype=float)
     null_value = _optional_float(_header_value(las, "well", "NULL"))
     selected = set(str(item) for item in selected_categories)
@@ -302,8 +315,6 @@ def _load_raw_curves_for_well(
                 md=md,
                 values=np.asarray(data[:, index], dtype=float),
                 source_las=las_file,
-                index_mnemonic=str(index_curve.mnemonic),
-                index_unit=str(index_curve.unit or ""),
                 las_null_value=null_value,
             )
         )
@@ -311,36 +322,29 @@ def _load_raw_curves_for_well(
     return raw
 
 
-def _write_preprocessed_las(
-    *,
-    output_las: Path,
-    template_las: Path,
-    md: np.ndarray,
-    index_mnemonic: str,
-    index_unit: str,
-    curves: Sequence[CandidateCurve],
-    null_value: float,
-    write_fmt: str,
-) -> None:
-    source = lasio.read(str(template_las), ignore_data=True)
-    output_las.parent.mkdir(parents=True, exist_ok=True)
-    out = lasio.LASFile()
-    for item in source.well:
-        out.well[item.mnemonic] = item
-    out.well["NULL"].value = float(null_value)
-    out.append_curve(index_mnemonic, np.asarray(md, dtype=float), unit=index_unit, descr="Measured depth")
+def _build_preprocessed_curve_set(well_name: str, curves: Sequence[CandidateCurve]) -> WellCurveSet:
+    if not curves:
+        raise ValueError(f"No final curves are available for well {well_name!r}.")
+    logs: dict[str, grid.Log] = {}
     for curve in curves:
         if curve.final_values is None:
-            continue
-        values = np.asarray(curve.final_values, dtype=float).copy()
-        values[~np.isfinite(values)] = float(null_value)
-        out.append_curve(
-            curve.standard_mnemonic,
-            values,
+            raise ValueError(
+                f"Final curve {curve.standard_mnemonic!r} has no values for well {well_name!r}."
+            )
+        logs[curve.standard_mnemonic] = grid.Log(
+            np.asarray(curve.final_values, dtype=float),
+            np.asarray(curve.raw.md, dtype=float),
+            "md",
+            name=curve.standard_mnemonic,
             unit=curve.standard_unit,
-            descr=f"{curve.raw.category} from {curve.raw.original_mnemonic}",
+            allow_nan=True,
         )
-    out.write(str(output_las), version=2.0, wrap=False, fmt=write_fmt)
+    curve_set = WellCurveSet(
+        well_name=well_name,
+        logs=logs,
+        source_las=str(curves[0].raw.source_las),
+    )
+    return with_acoustic_impedance(curve_set)
 
 
 # =============================================================================
@@ -513,6 +517,7 @@ def run_preprocess(
     config: dict[str, Any],
     range_overrides: Mapping[str, Any],
 ) -> dict[str, Any]:
+    _validate_standardization_contract(config)
     screen_df = pd.read_csv(screen_file)
     curve_inventory_df = pd.read_csv(curve_inventory_file)
     required_categories = [str(item) for item in config["required_categories"]]
@@ -701,15 +706,15 @@ def run_preprocess(
             first = final_curves[0].raw
             output_las = output_las_dir / f"{sanitize_filename(well_name)}.las"
             try:
-                _write_preprocessed_las(
-                    output_las=output_las,
-                    template_las=first.source_las,
-                    md=first.md,
-                    index_mnemonic=first.index_mnemonic,
-                    index_unit=first.index_unit,
-                    curves=final_curves,
+                curve_set = _build_preprocessed_curve_set(well_name, final_curves)
+                export_logset_to_las(
+                    well_name,
+                    curve_set,
+                    output_las,
+                    curve_names=curve_set.curve_names,
                     null_value=float(config.get("export", {}).get("null_value", -999.25)),
                     write_fmt=str(config.get("export", {}).get("write_fmt", "%.6f")),
+                    template_las=first.source_las,
                 )
                 preprocessed_las = repo_relative_path(output_las, root=REPO_ROOT)
             except Exception as exc:

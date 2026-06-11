@@ -936,7 +936,14 @@ class LogSet:
     def AI(self) -> Log:
         """声阻抗曲线（AI = Vp * Rho）。"""
         ai = self.vp * self.rho
-        return Log(ai, self.basis, _inverted_name(self.basis_type), name="AI")
+        return Log(
+            ai,
+            self.basis,
+            _inverted_name(self.basis_type),
+            name="AI",
+            unit="m/s*g/cm3",
+            allow_nan=self.Vp.allow_nan or self.Rho.allow_nan,
+        )
 
     @property
     def ai(self) -> np.ndarray:

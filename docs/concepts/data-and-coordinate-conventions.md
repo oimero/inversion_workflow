@@ -26,7 +26,12 @@
     - 只按用户指定 mnemonic 读曲线，不做单位转换、不做语义分类。
     - 匹配顺序是精确 mnemonic 优先，再用 LASIO 的 `:1` / `:2` 后缀规范化兜底；兜底命中多条时必须显式指定精确名。
 - 标准预处理 LAS 读取入口：`cup.well.las.load_vp_rho_logset_from_standard_las(path)`。
-    - 只读取含 `DT_USM` 和 `RHO_GCC` 的标准 LAS，并转换成 `Vp/Rho` 的 `grid.LogSet`。
+    - 标准 LAS 必须含 `DT_USM`（`us/m`）和 `RHO_GCC`（`g/cm3`），且 MD 轴有限、严格递增、规则采样。
+    - 入口只读取这两条基础曲线并转换成 `Vp/Rho` 的 `grid.LogSet`；即使 LAS 含 `AI`，也不会读取或校验旧 AI。
+- 时间域第三、四步成功导出的 LAS 固定含 `AI`：
+    - 第三步 `AI` 来自清洗后的全频 `DT_USM/RHO_GCC`；任一源曲线无效时对应 AI 样点保持缺失。
+    - 第四步 `AI` 来自 auto-tie 最优滤波后的 `Vp/Rho`，会重新计算，不沿用第三步或人工处理中遗留的 AI。
+    - 两者都保持原 MD 轴；TDT 的整体时移不写回 LAS。
 
 ## 时深表
 
@@ -85,6 +90,7 @@ trace =
 | 密度 `RHO_GCC` | g/cm³ | 第三步预处理后的密度曲线 |
 | 速度 `Vp/Vs` | m/s | 工作流内部属性 |
 | 密度 `Rho` | g/cm³ | 工作流内部属性 |
+| 声阻抗 `AI` | m/s*g/cm³ | `AI = Vp_mps * Rho_gcc`；不换算为数值相差 1000 倍的 SI 表示 |
 
 ## 坐标轴单位
 

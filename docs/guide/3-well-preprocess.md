@@ -56,10 +56,10 @@ well_preprocess:
     - water_saturation
 
   mnemonic_standardization:
-    enabled: true
+    enabled: true                # 时间域标准 LAS 契约要求，不能关闭
 
   unit_standardization:
-    enabled: true
+    enabled: true                # 时间域标准 LAS 契约要求，不能关闭
     unit_mismatch_qc: true
 
   constant_runs:
@@ -112,13 +112,13 @@ well_preprocess:
 
 #### `enabled`
 
-`true`（默认）时，导出的预处理 LAS 使用标准 mnemonic（`DT_USM`、`RHO_GCC` 等）。`false` 时保留原始 mnemonic。无论哪种模式，`mnemonic_mapping.csv` 始终记录原始名到最终名的映射。
+必须为 `true`。导出的预处理 LAS 使用标准 mnemonic（`DT_USM`、`RHO_GCC` 等），这是第四步和 AI 派生的固定输入契约。配置为 `false` 时第三步直接报错。`mnemonic_mapping.csv` 始终记录原始名到最终名的映射。
 
 ### `unit_standardization`
 
 #### `enabled`
 
-`true`（默认）时执行单位转换和硬先验检查。`false` 时跳过，但缺失哨兵替换和后续清洗仍按正常流程进行。
+必须为 `true`。第三步执行单位转换和硬先验检查，确保 `DT_USM` 为 `us/m`、`RHO_GCC` 为 `g/cm3`。配置为 `false` 时第三步直接报错。
 
 ### `constant_runs`
 
@@ -225,6 +225,16 @@ Vp (m/s) = 1e6 / DT_USM (us/m)
 
 不要把慢度曲线直接命名为 `Vp`。
 
+### 波阻抗派生
+
+通过预处理的井固定派生：
+
+```text
+AI (m/s*g/cm3) = (1e6 / DT_USM) * RHO_GCC
+```
+
+只有 `DT_USM` 和 `RHO_GCC` 同时有限且为正的样点才计算 AI；其他样点保持缺失并在 LAS 中写为 `NULL`。第三步不会为了得到连续 AI 而插值，也不会用 AI 的有效覆盖率再次否决已通过 DT/RHO 可用性检查的井。
+
 ---
 
 ## 核心输出文件
@@ -233,7 +243,7 @@ Vp (m/s) = 1e6 / DT_USM (us/m)
 
 ### `preprocessed_las/*.las`
 
-通过预处理的井的标准 LAS。曲线使用标准 mnemonic，单位已统一，缺失值填 `-999.25`。只有 `preprocess_status == passed` 的井才会导出。
+通过预处理的井的标准 LAS。曲线使用标准 mnemonic，单位已统一，固定包含 `DT_USM`、`RHO_GCC` 和全频派生 `AI`；其他入选辅助曲线照常保留。缺失值填 `-999.25`。只有 `preprocess_status == passed` 的井才会导出。
 
 ### `well_preprocess_status.csv` — 每井一行
 

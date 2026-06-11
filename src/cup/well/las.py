@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Mapping, Optional, Protocol, Sequence, Tuple
 
 import lasio
 import numpy as np
@@ -34,7 +34,16 @@ from wtie.processing import grid
 from wtie.processing.logs import interpolate_nans
 
 _SENTINEL_VALUES = (-999.0, -999.25, -9999.0, -99999.0)
-LogsetInput = grid.LogSet | dict[str, grid.Log]
+
+
+class LogMappingContainer(Protocol):
+    """具有命名 ``grid.Log`` 映射的曲线容器协议。"""
+
+    @property
+    def logs(self) -> Mapping[str, grid.Log]: ...
+
+
+LogsetInput = grid.LogSet | Mapping[str, grid.Log] | LogMappingContainer
 MATCH_POLICIES = {"exact", "normalized", "exact_then_normalized"}
 NULL_POLICIES = {"las_only", "common_sentinels", "las_and_common_sentinels", "none"}
 
@@ -505,16 +514,27 @@ def load_vp_rho_logset_from_standard_las(path: str | Path) -> grid.LogSet:
         缺少必需曲线、采样轴不一致或插值后仍含非有限值时。
     """
     try:
-        curves = read_las_curves(path, ["DT_USM", "RHO_GCC"])
-    except ValueError as exc:
-        raise ValueError(f"Standard LAS is missing required curves ['DT_USM', 'RHO_GCC']: {path}") from exc
+        curves = read_las_curves(path, ["DT_USM", "RHO_GCC"], match_policy="exact")
+    except (AssertionError, ValueError) as exc:
+        raise ValueError(
+            f"Standard LAS is missing required curves or has an invalid MD basis: {path}"
+        ) from exc
 
     dt_log = curves["DT_USM"]
     rho_log = curves["RHO_GCC"]
+    if _normalize_unit(dt_log.unit) != "us/m":
+        raise ValueError(f"Standard LAS DT_USM unit must be 'us/m', got {dt_log.unit!r}: {path}")
+    if _normalize_unit(rho_log.unit) != "g/cm3":
+        raise ValueError(f"Standard LAS RHO_GCC unit must be 'g/cm3', got {rho_log.unit!r}: {path}")
     if not np.allclose(dt_log.basis, rho_log.basis, equal_nan=False):
         raise ValueError(f"DT_USM and RHO_GCC basis do not match: {path}")
 
     md = np.asarray(dt_log.basis, dtype=np.float64)
+    if md.size < 2 or np.any(~np.isfinite(md)) or np.any(np.diff(md) <= 0.0):
+        raise ValueError(f"Standard LAS MD basis must be finite and strictly increasing: {path}")
+    md_step = float(np.median(np.diff(md)))
+    if not np.allclose(np.diff(md), md_step, rtol=1e-4, atol=1e-6):
+        raise ValueError(f"Standard LAS MD basis must be regularly sampled: {path}")
     dt_usm = _finite_positive(dt_log.values, label="DT_USM")
     rho = _finite_positive(rho_log.values, label="RHO_GCC")
     vp = 1_000_000.0 / dt_usm
@@ -638,6 +658,8 @@ def _extract_logs_mapping(well_data: LogsetInput) -> Mapping[str, grid.Log]:
     """从单井数据中提取曲线映射。"""
     if hasattr(well_data, "Logs"):
         logs = getattr(well_data, "Logs")
+    elif hasattr(well_data, "logs"):
+        logs = getattr(well_data, "logs")
     elif isinstance(well_data, Mapping):
         logs = well_data
     else:
@@ -713,20 +735,36 @@ def _build_las_from_well_data(
     well_data: LogsetInput,
     selected_curve_names: list[str],
     null_value: float,
+    *,
+    template_las: str | Path | None = None,
 ) -> lasio.LASFile:
     """将单井 LogSet/Log 映射组装为 LASFile。"""
     _ensure_md_domain(well_data)
 
     las = lasio.LASFile()
+    index_mnemonic = "DEPT"
+    index_unit = "m"
+    index_description = "Measured depth"
+    if template_las is not None:
+        source = lasio.read(str(template_las), ignore_data=True)
+        for item in source.well:
+            las.well[item.mnemonic] = item
+        if source.curves:
+            index_curve = source.curves[0]
+            index_mnemonic = str(index_curve.mnemonic)
+            index_unit = str(index_curve.unit or "m")
+            index_description = str(index_curve.descr or "Measured depth")
     las.well["WELL"].value = well_name
     las.well["NULL"].value = float(null_value)
 
     basis = _extract_basis(well_data)
-    las.append_curve("DEPT", basis, unit="m", descr="Depth")
+    las.append_curve(index_mnemonic, basis, unit=index_unit, descr=index_description)
 
     for curve_name in selected_curve_names:
         curve = _resolve_export_curve(well_data, curve_name)
         values, unit = _extract_curve_values_and_unit(curve)
+        values = values.copy()
+        values[~np.isfinite(values)] = float(null_value)
         las.append_curve(curve_name, values, unit=unit, descr=curve_name)
 
     return las
@@ -744,7 +782,7 @@ def export_logsets_to_las(
     Parameters
     ----------
     logsets : dict[str, LogsetInput]
-        键为井名，值为 ``grid.LogSet`` 或 ``dict[str, grid.Log]``。
+        键为井名，值为 ``grid.LogSet``、曲线映射或具有 ``logs`` 映射的对象。
     output_dir : Path
         输出目录。
     curve_names : list[str] | None, optional
@@ -811,8 +849,10 @@ def export_logset_to_las(
     curve_names: list[str] | None = None,
     null_value: float = -999.25,
     write_fmt: str = "%.6f",
+    *,
+    template_las: str | Path | None = None,
 ) -> Path:
-    """导出单井 MD 域 LogSet/Log 映射到指定 LAS 文件。"""
+    """导出单井 MD 域曲线到 LAS，可选保留源 LAS 的井头和索引信息。"""
     _validate_write_format(write_fmt)
     logs_mapping = _extract_logs_mapping(well_data)
     requested_curve_names = list(logs_mapping.keys()) if curve_names is None else list(curve_names)
@@ -828,6 +868,7 @@ def export_logset_to_las(
         well_data=well_data,
         selected_curve_names=available_curve_names,
         null_value=null_value,
+        template_las=template_las,
     )
     output_las = Path(output_las)
     output_las.parent.mkdir(parents=True, exist_ok=True)
@@ -927,4 +968,3 @@ def export_selected_curves_to_las(
 
     out.write(str(output_las), version=2.0, wrap=False, fmt=write_fmt)
     return output_las, skipped, exported_mnemonics
-

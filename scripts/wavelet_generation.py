@@ -526,9 +526,6 @@ def _plot_batch_synthetic_qc(qc: pd.DataFrame, metrics_row: pd.Series | None, pa
         seismic_trace,
         xcorr,
         dxcorr,
-        mode="shape",
-        adaptive_wiggle_scale=True,
-        compact_x_ticks=True,
         figsize=(12.0, 7.5),
     )
     if metrics_row is not None:

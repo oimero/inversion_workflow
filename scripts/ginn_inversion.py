@@ -42,7 +42,11 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.seismic.survey import open_survey
-from cup.seismic.viz import impedance_qc_metrics, plot_well_impedance_qc
+from cup.seismic.viz import (
+    impedance_qc_metrics,
+    plot_well_waveform_qc,
+    waveform_qc_metrics,
+)
 from cup.utils.config import deep_merge_dict
 from cup.utils.io import (
     load_yaml_config,
@@ -56,6 +60,7 @@ from cup.well.assets import normalize_well_name
 from ginn.anchor import load_log_ai_anchor_npz
 from ginn.config import GINNConfig
 from ginn.trainer import Trainer
+from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
 from wtie.processing import grid
 
 logger = logging.getLogger(__name__)
@@ -394,12 +399,59 @@ def _point_table_for_anchor(anchor_name: str, flat_idx: int, point_df: pd.DataFr
     return out
 
 
+def _reflectivity_from_ai(ai: np.ndarray) -> np.ndarray:
+    values = np.asarray(ai, dtype=np.float64)
+    out = np.zeros(values.shape, dtype=np.float64)
+    valid = np.isfinite(values) & (values > 0.0)
+    pair_valid = valid[:-1] & valid[1:]
+    upper = values[:-1][pair_valid]
+    lower = values[1:][pair_valid]
+    out[np.flatnonzero(pair_valid) + 1] = (lower - upper) / np.maximum(lower + upper, 1e-12)
+    return out
+
+
+def _expanded_mask_window(mask: np.ndarray, halo_samples: int) -> slice:
+    indices = np.flatnonzero(np.asarray(mask, dtype=bool))
+    if indices.size == 0:
+        raise ValueError("Cannot build a QC display window from an empty metric mask.")
+    start = max(0, int(indices[0]) - int(halo_samples))
+    stop = min(mask.size, int(indices[-1]) + int(halo_samples) + 1)
+    return slice(start, stop)
+
+
+def _forward_ginn_qc_trace(
+    trainer: Trainer,
+    predicted_ai: np.ndarray,
+    dynamic_gain: np.ndarray | None,
+) -> np.ndarray:
+    ai_tensor = torch.from_numpy(
+        np.asarray(predicted_ai, dtype=np.float32)
+    ).view(1, 1, -1).to(trainer.device)
+    gain_tensor = None
+    if trainer.cfg.gain_source == "dynamic_gain_model":
+        if dynamic_gain is None:
+            raise ValueError("Checkpoint requires dynamic gain but the inference dataset has no gain trace.")
+        gain_tensor = torch.from_numpy(
+            np.asarray(dynamic_gain, dtype=np.float32)
+        ).view(1, 1, -1).to(trainer.device)
+    with torch.no_grad():
+        return (
+            trainer.forward_model(ai_tensor, gain=gain_tensor)
+            .detach()
+            .cpu()
+            .numpy()
+            .reshape(-1)
+            .astype(np.float64)
+        )
+
+
 def _write_ginn_well_qc(
     *,
     output_dir: Path,
     pred_volume: np.ndarray,
     anchor_file: Path | None,
     geometry: dict[str, Any],
+    trainer: Trainer,
 ) -> dict[str, Any]:
     well_qc_dir = output_dir / "well_qc"
     trace_dir = well_qc_dir / "traces"
@@ -431,60 +483,170 @@ def _write_ginn_well_qc(
         trace_path = trace_dir / f"well_qc_{safe}.csv"
         figure_path = figure_dir / f"well_qc_{safe}.png"
 
-        if flat_idx < 0 or flat_idx >= pred_flat.shape[0]:
-            metrics_rows.append({"well_name": anchor_name, "flat_idx": flat_idx, "status": "failed", "error": "flat_idx_out_of_range"})
-            continue
+        base_row = {
+            "well_name": anchor_name,
+            "flat_idx": flat_idx,
+            "inline": float(np.asarray(anchor.inline, dtype=np.float64)[anchor_row]),
+            "xline": float(np.asarray(anchor.xline, dtype=np.float64)[anchor_row]),
+            "gain_source": str(trainer.cfg.gain_source),
+            "fixed_gain": (
+                float(trainer.cfg.fixed_gain)
+                if trainer.cfg.gain_source == "fixed_gain" and trainer.cfg.fixed_gain is not None
+                else None
+            ),
+            "dynamic_gain_model": (
+                None
+                if trainer.cfg.dynamic_gain_model is None
+                else repo_relative_path(trainer.cfg.dynamic_gain_model, root=REPO_ROOT)
+            ),
+        }
+        try:
+            if flat_idx < 0 or flat_idx >= pred_flat.shape[0]:
+                raise IndexError("flat_idx_out_of_range")
 
-        low_values = np.asarray(anchor.target_ai[anchor_row], dtype=np.float64)
-        pred_values = np.asarray(pred_flat[flat_idx], dtype=np.float64)
-        mask = np.asarray(anchor.anchor_mask[anchor_row], dtype=bool) & np.isfinite(low_values) & np.isfinite(pred_values)
+            low_values = np.asarray(anchor.target_ai[anchor_row], dtype=np.float64)
+            pred_values = np.asarray(pred_flat[flat_idx], dtype=np.float64)
+            anchor_mask = np.asarray(anchor.anchor_mask[anchor_row], dtype=bool)
+            qc_data = trainer.dataset.trace_qc_data(flat_idx)
+            observed = np.asarray(qc_data.seismic_raw, dtype=np.float64) / float(trainer.dataset.seis_rms)
+            loss_mask = np.asarray(qc_data.loss_mask, dtype=bool)
 
-        full_values = np.full(n_sample, np.nan, dtype=np.float64)
-        point_group = _point_table_for_anchor(anchor_name, flat_idx, point_df)
-        if not point_group.empty and {"sample_index", "ai_full"}.issubset(point_group.columns):
-            for _, row in point_group.iterrows():
-                sample_idx = int(row["sample_index"])
-                if 0 <= sample_idx < n_sample and np.isfinite(float(row["ai_full"])):
-                    full_values[sample_idx] = float(row["ai_full"])
+            full_values = np.full(n_sample, np.nan, dtype=np.float64)
+            point_group = _point_table_for_anchor(anchor_name, flat_idx, point_df)
+            if not point_group.empty and {"sample_index", "ai_full"}.issubset(point_group.columns):
+                for _, row in point_group.iterrows():
+                    sample_idx = int(row["sample_index"])
+                    if 0 <= sample_idx < n_sample and np.isfinite(float(row["ai_full"])):
+                        full_values[sample_idx] = float(row["ai_full"])
+            if not np.any(np.isfinite(full_values)):
+                raise ValueError("No full-band well AI samples were found in the anchor point table.")
 
-        trace_df = pd.DataFrame(
-            {
-                "twt_s": samples,
-                "well_full_ai": full_values,
-                "well_low_ai": low_values,
-                "ginn_predicted_ai": pred_values,
-                "anchor_mask": np.asarray(anchor.anchor_mask[anchor_row], dtype=bool),
-                "valid_for_metrics": mask,
-            }
-        )
-        trace_df.to_csv(trace_path, index=False, encoding="utf-8-sig")
+            synthetic = _forward_ginn_qc_trace(
+                trainer,
+                pred_values,
+                qc_data.dynamic_gain,
+            )
+            reflectivity = _reflectivity_from_ai(pred_values)
+            metric_mask = (
+                anchor_mask
+                & loss_mask
+                & np.isfinite(low_values)
+                & np.isfinite(pred_values)
+                & np.isfinite(observed)
+                & np.isfinite(synthetic)
+            )
+            if int(np.count_nonzero(metric_mask)) < 8:
+                raise ValueError(f"Too few valid GINN waveform QC samples: {int(np.count_nonzero(metric_mask))}.")
+            display_slice = _expanded_mask_window(
+                metric_mask,
+                halo_samples=int(trainer.cfg.boundary_effect_samples or 0),
+            )
+            display_twt = samples[display_slice]
+            display_observed = observed[display_slice]
+            display_synthetic = synthetic[display_slice]
+            display_pred = pred_values[display_slice]
+            display_low = low_values[display_slice]
+            display_full = full_values[display_slice]
+            display_reflectivity = reflectivity[display_slice]
 
-        low_trace = grid.Log(low_values, samples, "twt", name="Low-frequency well AI")
-        full_trace = grid.Log(full_values, samples, "twt", name="Full-band well AI") if np.any(np.isfinite(full_values)) else None
-        pred_trace = grid.Log(pred_values, samples, "twt", name="GINN predicted AI")
-        fig, _axes = plot_well_impedance_qc(
-            full_ai=full_trace,
-            low_ai=low_trace,
-            model_ai=pred_trace,
-            mask=mask,
-            title=f"GINN well QC | {anchor_name}",
-            model_label="GINN predicted AI",
-        )
-        fig.savefig(figure_path, dpi=180, bbox_inches="tight")
-        plt.close(fig)
+            observed_trace = grid.Seismic(
+                display_observed,
+                display_twt,
+                "twt",
+                name="Seismic normalized",
+            )
+            synthetic_trace = grid.Seismic(
+                display_synthetic,
+                display_twt,
+                "twt",
+                name="GINN synthetic",
+            )
+            xcorr_values = normalized_xcorr(observed_trace.values, synthetic_trace.values)
+            xcorr_basis = synthetic_trace.sampling_rate * np.arange(
+                -(synthetic_trace.size - 1),
+                synthetic_trace.size,
+            )
+            xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
+            dxcorr = dynamic_normalized_xcorr(observed_trace, synthetic_trace)
+            low_trace = grid.Log(display_low, display_twt, "twt", name="Low-frequency well AI")
+            full_trace = grid.Log(display_full, display_twt, "twt", name="Full-band well AI")
+            pred_trace = grid.Log(display_pred, display_twt, "twt", name="GINN predicted AI")
+            reflectivity_trace = grid.Reflectivity(
+                display_reflectivity,
+                display_twt,
+                "twt",
+                name="GINN reflectivity",
+            )
 
-        metrics_rows.append(
-            {
-                "well_name": anchor_name,
-                "flat_idx": flat_idx,
-                "inline": float(np.asarray(anchor.inline, dtype=np.float64)[anchor_row]),
-                "xline": float(np.asarray(anchor.xline, dtype=np.float64)[anchor_row]),
-                "status": "ok" if np.any(mask) else "no_valid_samples",
-                "trace_csv": repo_relative_path(trace_path, root=REPO_ROOT),
-                "figure": repo_relative_path(figure_path, root=REPO_ROOT),
-                **impedance_qc_metrics(model_ai=pred_trace, low_ai=low_trace, full_ai=full_trace, mask=mask),
-            }
-        )
+            trace_df = pd.DataFrame(
+                {
+                    "twt_s": samples,
+                    "well_full_ai": full_values,
+                    "well_low_ai": low_values,
+                    "ginn_predicted_ai": pred_values,
+                    "reflectivity_ginn": reflectivity,
+                    "seismic_raw": np.asarray(qc_data.seismic_raw, dtype=np.float64),
+                    "seismic_normalized": observed,
+                    "synthetic_ginn": synthetic,
+                    "residual": observed - synthetic,
+                    "dynamic_gain": (
+                        np.full(n_sample, np.nan, dtype=np.float64)
+                        if qc_data.dynamic_gain is None
+                        else np.asarray(qc_data.dynamic_gain, dtype=np.float64)
+                    ),
+                    "anchor_mask": anchor_mask,
+                    "loss_mask": loss_mask,
+                    "valid_for_metrics": metric_mask,
+                }
+            )
+            trace_df.to_csv(trace_path, index=False, encoding="utf-8-sig")
+
+            waveform_metrics = waveform_qc_metrics(observed, synthetic, metric_mask)
+            fig, _axes = plot_well_waveform_qc(
+                [full_trace, low_trace, pred_trace],
+                reflectivity_trace,
+                synthetic_trace,
+                observed_trace,
+                xcorr,
+                dxcorr,
+                synthetic_ai=pred_trace,
+                figsize=(12.0, 7.5),
+            )
+            fig.suptitle(
+                f"GINN well QC | {anchor_name} | corr={waveform_metrics['corr']:.3f}"
+            )
+            fig.savefig(figure_path, dpi=180, bbox_inches="tight")
+            plt.close(fig)
+
+            low_metric_trace = grid.Log(low_values, samples, "twt", name="Low-frequency well AI")
+            full_metric_trace = grid.Log(full_values, samples, "twt", name="Full-band well AI")
+            pred_metric_trace = grid.Log(pred_values, samples, "twt", name="GINN predicted AI")
+            metrics_rows.append(
+                {
+                    **base_row,
+                    "status": "ok",
+                    "trace_csv": repo_relative_path(trace_path, root=REPO_ROOT),
+                    "figure": repo_relative_path(figure_path, root=REPO_ROOT),
+                    "seismic_rms": float(trainer.dataset.seis_rms),
+                    "xcorr_lag_s": float(xcorr.lag),
+                    **impedance_qc_metrics(
+                        model_ai=pred_metric_trace,
+                        low_ai=low_metric_trace,
+                        full_ai=full_metric_trace,
+                        mask=metric_mask,
+                    ),
+                    **{f"waveform_{key}": value for key, value in waveform_metrics.items()},
+                }
+            )
+        except Exception as exc:
+            plt.close("all")
+            metrics_rows.append(
+                {
+                    **base_row,
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}:{exc}",
+                }
+            )
 
     metrics_df = pd.DataFrame.from_records(metrics_rows)
     metrics_df.to_csv(metrics_path, index=False, encoding="utf-8-sig")
@@ -629,6 +791,7 @@ def main() -> None:
         pred_volume=pred_volume,
         anchor_file=cfg.log_ai_anchor_file,
         geometry=trainer.geometry,
+        trainer=trainer,
     )
 
     zgy_status = "disabled"

@@ -942,8 +942,6 @@ def _write_qc_figures(
         outputs.seismic,
         outputs.xcorr,
         outputs.dxcorr,
-        wiggle_scale_syn=120000,
-        wiggle_scale_real=120000,
         figsize=(12.0, 7.5),
     )
     _draw_target_horizons(axes, target_window, y_scale=1.0)

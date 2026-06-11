@@ -1,13 +1,9 @@
-"""Seismic well-QC plotting helpers.
-
-The waveform QC style is intentionally copied from
-``wtie.utils.viz.plot_tie_window`` so workflow scripts can depend on a
-``cup.seismic`` entry point without changing the figure aesthetics.
-"""
+"""Shared seismic well-QC plotting and metric helpers."""
 
 from __future__ import annotations
 
-from typing import Literal, Tuple
+from collections.abc import Sequence
+from typing import Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
@@ -15,9 +11,6 @@ from matplotlib.ticker import FormatStrFormatter, MaxNLocator
 import numpy as np
 
 from wtie.processing import grid
-
-WaveformQcMode = Literal["shape", "amplitude"]
-
 
 def _plot_trace(
     trace: grid.BaseTrace,
@@ -89,36 +82,33 @@ def _plot_reflectivity(
 def _plot_wiggle_trace(
     trace: grid.BaseTrace,
     figsize: Tuple[int, int] = (4, 4),
-    repeat_n_times: int = 7,
-    scaling: float = 1.0,
     fig_axes: tuple | None = None,
+    xlim: tuple[float, float] | None = None,
 ) -> tuple:
     if fig_axes is None:
         fig, ax = plt.subplots(1, figsize=figsize)
     else:
         fig, ax = fig_axes
 
-    for offset in np.linspace(0.0, scaling * 1.0, num=repeat_n_times):
-        if repeat_n_times == 1:
-            # trace in the middle
-            offset = scaling / 2.0
-
-        _x = trace.values + offset
-        ax.plot(_x, trace.basis, color="k", lw=0.5)
-        ax.plot(offset * np.ones_like(_x), trace.basis, color="k", lw=0.2)
-
-        ax.fill_betweenx(trace.basis, offset, _x, where=(_x >= offset), color="b", alpha=0.6, interpolate=True)  # type: ignore
-        ax.fill_betweenx(trace.basis, offset, _x, where=(_x < offset), color="r", alpha=0.6, interpolate=True)  # type: ignore
+    values = np.asarray(trace.values, dtype=np.float64)
+    basis = np.asarray(trace.basis, dtype=np.float64)
+    zero = np.zeros_like(values)
+    ax.plot(values, basis, color="k", lw=0.7)
+    ax.plot(zero, basis, color="k", lw=0.35, alpha=0.7)
+    ax.fill_betweenx(basis, zero, values, where=(values >= 0.0), color="b", alpha=0.6, interpolate=True)  # type: ignore
+    ax.fill_betweenx(basis, zero, values, where=(values < 0.0), color="r", alpha=0.6, interpolate=True)  # type: ignore
 
     ax.set_xlabel(trace.name)
+    ax.xaxis.set_label_position("top")
+    ax.xaxis.tick_top()
     ax.set_ylim((trace.basis[0], trace.basis[-1]))
     ax.invert_yaxis()
-    ax.xaxis.set_label_position("top")
     ax.set_ylabel(trace.basis_type)
-
-    _space = 0.05 * np.abs(trace.values.max())
-    ax.set_xlim((trace.values.min() - _space, (trace.values.max() + scaling + _space)))
-    ax.set_xticks([])
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=3))
+    ax.tick_params(axis="x", labelsize=8)
+    ax.ticklabel_format(axis="x", style="sci", scilimits=(-3, 4), useMathText=True)
+    if xlim is not None:
+        ax.set_xlim(xlim)
 
     if trace.is_twt:
         ax.yaxis.set_major_formatter(FormatStrFormatter("%0.3f"))
@@ -129,6 +119,90 @@ def _plot_wiggle_trace(
         fig.tight_layout()
 
     return fig, ax
+
+
+def _normalize_ai_traces(
+    value: grid.LogSet | grid.Log | Sequence[grid.Log],
+    synthetic_ai: grid.Log | None,
+) -> tuple[list[grid.Log], grid.Log]:
+    if isinstance(value, grid.LogSet):
+        traces = [value.AI]
+    elif isinstance(value, grid.Log):
+        traces = [value]
+    else:
+        traces = list(value)
+    if not traces or not all(isinstance(trace, grid.Log) for trace in traces):
+        raise ValueError("impedance traces must contain at least one grid.Log.")
+
+    selected = traces[0] if synthetic_ai is None else synthetic_ai
+    if not isinstance(selected, grid.Log):
+        raise TypeError("synthetic_ai must be a grid.Log.")
+    selected_index = next(
+        (
+            index
+            for index, trace in enumerate(traces)
+            if trace is selected
+            or (
+                np.asarray(trace.values).shape == np.asarray(selected.values).shape
+                and np.asarray(trace.basis).shape == np.asarray(selected.basis).shape
+                and np.allclose(trace.values, selected.values, equal_nan=True)
+                and np.allclose(trace.basis, selected.basis, equal_nan=True)
+            )
+        ),
+        None,
+    )
+    if selected_index is None:
+        raise ValueError("synthetic_ai must select one of the supplied impedance traces.")
+    traces[selected_index] = selected
+    basis = np.asarray(selected.basis, dtype=np.float64)
+    for trace in [*traces, selected]:
+        trace_basis = np.asarray(trace.basis, dtype=np.float64)
+        if trace_basis.shape != basis.shape or not np.allclose(trace_basis, basis, equal_nan=True):
+            raise ValueError("All waveform QC impedance traces must share the same basis.")
+    return traces, selected
+
+
+def _plot_impedance_traces(
+    traces: Sequence[grid.Log],
+    synthetic_ai: grid.Log,
+    *,
+    fig_axes: tuple,
+) -> tuple:
+    fig, ax = fig_axes
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["tab:blue"])
+    for index, trace in enumerate(traces):
+        selected = trace is synthetic_ai
+        ax.plot(
+            trace.values,
+            trace.basis,
+            label=str(trace.name or f"AI {index + 1}"),
+            color="tab:red" if selected else colors[index % len(colors)],
+            lw=2.0 if selected else 1.0,
+            alpha=1.0 if selected else 0.75,
+            zorder=3 if selected else 2,
+        )
+    ax.set_xlabel("AI")
+    ax.xaxis.set_label_position("top")
+    ax.xaxis.tick_top()
+    ax.set_ylabel(synthetic_ai.basis_type)
+    ax.set_ylim((synthetic_ai.basis[0], synthetic_ai.basis[-1]))
+    ax.invert_yaxis()
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=3))
+    ax.tick_params(axis="x", labelsize=8)
+    if len(traces) > 1:
+        ax.legend(loc="best", fontsize=7)
+    if synthetic_ai.is_twt:
+        ax.yaxis.set_major_formatter(FormatStrFormatter("%0.3f"))
+    return fig, ax
+
+
+def _symmetric_limits(*values: np.ndarray) -> tuple[float, float]:
+    finite_parts = [np.asarray(value, dtype=np.float64).reshape(-1) for value in values]
+    finite = np.concatenate(finite_parts)
+    finite = finite[np.isfinite(finite)]
+    limit = float(np.max(np.abs(finite))) if finite.size else 1.0
+    limit = max(limit, 1e-12) * 1.08
+    return -limit, limit
 
 
 def _plot_dynamic_xcorr(
@@ -166,29 +240,16 @@ def _plot_dynamic_xcorr(
 
 
 def plot_well_waveform_qc(
-    logset: grid.LogSet | grid.Log,
+    logset: grid.LogSet | grid.Log | Sequence[grid.Log],
     reflectivity: grid.Reflectivity,
     synthetic_seismic: grid.Seismic,
     real_seismic: grid.Seismic,
     xcorr: grid.XCorr,
     dxcorr: grid.DynamicXCorr,
     figsize: Tuple[int, int] = (7, 4),
-    wiggle_scale_syn: float = 1.0,
-    wiggle_scale_real: float = 1.0,
-    mode: WaveformQcMode = "shape",
-    adaptive_wiggle_scale: bool = False,
-    compact_x_ticks: bool = False,
+    synthetic_ai: grid.Log | None = None,
 ) -> tuple:
-    """Draw the post-stack well-tie waveform QC window.
-
-    ``mode="shape"`` is a local, workflow-owned copy of
-    ``wtie.utils.viz.plot_tie_window``. ``mode="amplitude"`` keeps the same
-    six-panel style but preserves the caller's amplitude domain. The optional
-    display knobs are deliberately explicit so the fourth-step 1:1 style remains
-    unchanged unless a caller asks for compact/adaptive rendering.
-    """
-    if mode not in {"shape", "amplitude"}:
-        raise ValueError(f"Unsupported waveform QC mode={mode!r}.")
+    """Draw the shared six-panel well waveform QC with true amplitude axes."""
     fig = plt.figure(figsize=figsize)
     gs = gridspec.GridSpec(1, 8)
 
@@ -201,60 +262,25 @@ def plot_well_waveform_qc(
         fig.add_subplot(gs[7:]),
     ]
 
-    # logs
-    ai_trace = logset.AI if isinstance(logset, grid.LogSet) else logset
-    _plot_trace(ai_trace, fig_axes=(fig, axes[0]))
+    impedance_traces, selected_ai = _normalize_ai_traces(logset, synthetic_ai)
+    synthetic_basis = np.asarray(synthetic_seismic.basis, dtype=np.float64)
+    real_basis = np.asarray(real_seismic.basis, dtype=np.float64)
+    if synthetic_basis.shape != real_basis.shape or not np.allclose(
+        synthetic_basis,
+        real_basis,
+        equal_nan=True,
+    ):
+        raise ValueError("Synthetic and real seismic must share the same basis.")
+
+    _plot_impedance_traces(impedance_traces, selected_ai, fig_axes=(fig, axes[0]))
     _plot_reflectivity(reflectivity, fig_axes=(fig, axes[1]))
 
-    plot_wiggle_scale_syn = float(wiggle_scale_syn)
-    plot_wiggle_scale_real = float(wiggle_scale_real)
-    if mode == "amplitude" or adaptive_wiggle_scale:
-        finite_for_scale = np.concatenate(
-            [
-                np.asarray(synthetic_seismic.values, dtype=float).reshape(-1),
-                np.asarray(real_seismic.values, dtype=float).reshape(-1),
-                np.asarray(real_seismic.values - synthetic_seismic.values, dtype=float).reshape(-1),
-            ]
-        )
-        finite_for_scale = finite_for_scale[np.isfinite(finite_for_scale)]
-        if finite_for_scale.size:
-            value_span = float(np.max(finite_for_scale) - np.min(finite_for_scale))
-            value_absmax = float(np.max(np.abs(finite_for_scale)))
-            adaptive_scale = max(value_span, value_absmax, 1e-12)
-            plot_wiggle_scale_syn = adaptive_scale
-            plot_wiggle_scale_real = adaptive_scale
-
     # seismic
-    _plot_wiggle_trace(synthetic_seismic, scaling=plot_wiggle_scale_syn, repeat_n_times=5, fig_axes=(fig, axes[2]))
-    _plot_wiggle_trace(real_seismic, scaling=plot_wiggle_scale_real, repeat_n_times=5, fig_axes=(fig, axes[3]))
-
+    common_xlim = _symmetric_limits(synthetic_seismic.values, real_seismic.values)
+    _plot_wiggle_trace(synthetic_seismic, fig_axes=(fig, axes[2]), xlim=common_xlim)
+    _plot_wiggle_trace(real_seismic, fig_axes=(fig, axes[3]), xlim=common_xlim)
     residual = grid.Seismic(real_seismic.values - synthetic_seismic.values, real_seismic.basis, "twt", name="Residual")
-
-    _plot_wiggle_trace(residual, scaling=plot_wiggle_scale_real, repeat_n_times=1, fig_axes=(fig, axes[4]))
-
-    if mode == "amplitude" or compact_x_ticks:
-        axes[0].xaxis.set_major_locator(MaxNLocator(nbins=3))
-        axes[0].tick_params(axis="x", labelsize=8)
-        axes[1].xaxis.set_major_locator(MaxNLocator(nbins=3))
-        axes[1].tick_params(axis="x", labelsize=8)
-
-    if mode == "amplitude" or adaptive_wiggle_scale:
-        finite = np.concatenate(
-            [
-                np.asarray(synthetic_seismic.values, dtype=float).reshape(-1),
-                np.asarray(real_seismic.values, dtype=float).reshape(-1),
-                np.asarray(residual.values, dtype=float).reshape(-1),
-            ]
-        )
-        finite = finite[np.isfinite(finite)]
-        if finite.size:
-            value_min = float(np.min(finite))
-            value_max = float(np.max(finite))
-            common_scale = max(float(plot_wiggle_scale_syn), float(plot_wiggle_scale_real))
-            space = 0.05 * max(abs(value_min), abs(value_max), common_scale, 1e-12)
-            common_xlim = (value_min - space, value_max + common_scale + space)
-            for ax in axes[2:5]:
-                ax.set_xlim(common_xlim)
+    _plot_wiggle_trace(residual, fig_axes=(fig, axes[4]), xlim=_symmetric_limits(residual.values))
 
     # dxcoor
     _plot_dynamic_xcorr(dxcorr, fig_axes=(fig, axes[5]))
@@ -322,6 +348,49 @@ def _metric_pair(reference: np.ndarray, model: np.ndarray, mask: np.ndarray) -> 
         "bias": float(np.mean(diff)),
         "corr": corr,
         "nmae": float(np.mean(np.abs(diff)) / denom),
+    }
+
+
+def waveform_qc_metrics(
+    observed: np.ndarray,
+    synthetic: np.ndarray,
+    mask: np.ndarray | None = None,
+) -> dict[str, float | int]:
+    """Compute amplitude-preserving waveform metrics on a shared sample axis."""
+    observed_values = np.asarray(observed, dtype=np.float64).reshape(-1)
+    synthetic_values = np.asarray(synthetic, dtype=np.float64).reshape(-1)
+    if observed_values.shape != synthetic_values.shape:
+        raise ValueError(
+            f"observed shape {observed_values.shape} does not match synthetic shape {synthetic_values.shape}."
+        )
+    valid = _as_bool_mask(mask, observed_values.size)
+    valid &= np.isfinite(observed_values) & np.isfinite(synthetic_values)
+    if not np.any(valid):
+        return {
+            "n_samples": 0,
+            "corr": float("nan"),
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "nmae": float("nan"),
+            "observed_rms": float("nan"),
+            "synthetic_rms": float("nan"),
+            "rms_ratio": float("nan"),
+        }
+    obs = observed_values[valid]
+    syn = synthetic_values[valid]
+    diff = syn - obs
+    observed_rms = float(np.sqrt(np.mean(obs**2)))
+    synthetic_rms = float(np.sqrt(np.mean(syn**2)))
+    corr = float(np.corrcoef(obs, syn)[0, 1]) if obs.size > 1 and np.std(obs) > 0.0 and np.std(syn) > 0.0 else float("nan")
+    return {
+        "n_samples": int(obs.size),
+        "corr": corr,
+        "mae": float(np.mean(np.abs(diff))),
+        "rmse": float(np.sqrt(np.mean(diff**2))),
+        "nmae": float(np.sum(np.abs(diff)) / max(float(np.sum(np.abs(obs))), 1e-12)),
+        "observed_rms": observed_rms,
+        "synthetic_rms": synthetic_rms,
+        "rms_ratio": float(synthetic_rms / max(observed_rms, 1e-12)),
     }
 
 
@@ -485,4 +554,5 @@ __all__ = [
     "plot_well_impedance_qc",
     "plot_well_waveform_qc",
     "sample_volume_at_points",
+    "waveform_qc_metrics",
 ]

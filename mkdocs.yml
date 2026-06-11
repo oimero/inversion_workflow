@@ -45,9 +45,9 @@ nav:
   - 首页: index.md
   - 快速开始:
       - 核心 CSV 契约: concepts/csv-contracts.md
-      - 数据与坐标约定: concepts/data-and-coordinate-conventions.md
+      - 数据与单位约定: concepts/data-and-coordinate-conventions.md
       - 脚本风格指南: concepts/script-style.md
-      - 时间域工作流总览: concepts/time-domain-workflow.md
+      - 工作流总览: concepts/time-domain-workflow.md
   - 教程:
       - 01 井资产盘点: guide/1-well-inventory.md
       - 02 LAS 曲线筛选与导出: guide/2-well-screen.md
@@ -58,6 +58,7 @@ nav:
       - 06 分频诊断与井约束: guide/6-well-constraints.md
       - 07 构建低频模型: guide/7-lfm-precomputed.md
       - 旁路 正演增益: guide/dynamic-gain.md
+      - 旁路 确定性反演: guide/deterministic-inversion.md
       - 08 GINN 训练: guide/8-ginn-train.md
       - 09 GINN 反演: guide/9-ginn-inversion.md
       - 常见问题: guide/troubleshooting.md

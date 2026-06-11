@@ -1,8 +1,16 @@
 # 核心 CSV 契约
 
-这些 CSV 是脚本之间的数据契约。脚本读取上游结果时，应按这里的字段语义判断，不要凭字段名猜测。
+这些 CSV 是脚本之间的数据契约。下游脚本读取上游结果时，应按这里的字段语义判断，不要凭字段名猜测。
 
-## `well_inventory.csv`
+每个 CSV 列在其生产者脚本的章节下，`→` 后标注下游消费者。标题中标记「诊断」的 CSV 不被任何脚本自动读取，仅供人工审阅。
+
+---
+
+## 01 · well_inventory.py
+
+### `well_inventory.csv` — 核心契约
+
+→ well_screen.py、well_auto_tie.py、well_trajectory.py
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -14,7 +22,13 @@
 | `wellbore_class` | 井型初分：vertical / deviated / unknown |
 | `inventory_status` | 资产状态，不等同于最终筛选候选状态 |
 
-## `well_screen.csv`
+---
+
+## 02 · well_screen.py
+
+### `well_screen.csv` — 核心契约
+
+→ well_preprocess.py、well_auto_tie.py
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -26,9 +40,11 @@
 | `selected_curve_count` | 选中曲线数量，partial 井也保留真实数量 |
 | `exported_las` | 第二步瘦身 LAS；仅 passed 井应有值 |
 
-## `las_curve_inventory.csv`
+### `las_curve_inventory.csv` — 核心契约
 
-第二步写出的逐曲线清单，第三步用它复原每口井的曲线类别、primary 选择和原始单位。它是一条 LAS 曲线一行，不是一口井一行。
+→ well_preprocess.py
+
+一条 LAS 曲线一行，不是一口井一行。第三步用它复原每口井的曲线类别、primary 选择和原始单位。
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -41,7 +57,13 @@
 | `confidence` | 分类置信度；规则命中通常为 1.0，歧义为 0.0 |
 | `notes` | override、歧义或禁用原因 |
 
-## `well_preprocess_status.csv`
+---
+
+## 03 · well_preprocess.py
+
+### `well_preprocess_status.csv` — 核心契约
+
+→ well_auto_tie.py
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -51,7 +73,13 @@
 | `final_p_sonic` / `final_density` / `final_caliper` | 最终标准 mnemonic |
 | `preprocessed_las` | 第三步预处理 LAS；仅 passed 井应有值 |
 
-## `well_trajectory.csv`
+---
+
+## 旁路 · well_trajectory.py
+
+### `well_trajectory.csv` — 核心契约
+
+→ well_auto_tie.py
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -63,7 +91,13 @@
 | `surface_survey_position` / `bottom_survey_position` | 井口/井底相对工区位置 |
 | `trajectory_inside_fraction` | 轨迹点位于工区内的比例 |
 
-## `well_tie_plan.csv`
+---
+
+## 04 · well_auto_tie.py
+
+### `well_tie_plan.csv` — 核心契约
+
+→ wavelet_generation.py、well_constraints.py
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -78,7 +112,9 @@
 | `surface_x` / `surface_y` | 井口平面坐标；第六步井约束和第七步 LFM 的直井控制点使用这两个字段定位井口 trace |
 | `kb_m` | 井口补心高程，单位 m；供需要井口高程的后续步骤复用 |
 
-## `well_tie_metrics.csv`
+### `well_tie_metrics.csv` — 核心契约
+
+→ wavelet_generation.py、well_constraints.py、dynamic_gain.py
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -90,7 +126,9 @@
 | `seismic_trace_file` | 第四步保存的井旁或轨迹地震道 |
 | `optimized_trace_sample_plan_file` | 斜井细标定后按 optimized TDT 重新生成的样点级落道计划；直井为空 |
 
-## `wavelet_inventory.csv`
+### `wavelet_inventory.csv` — 核心契约
+
+→ wavelet_generation.py
 
 第四步写出的候选子波清单，第五步只从这里挑选候选子波，不再扫描第四步目录下的所有子波文件。
 
@@ -105,7 +143,13 @@
 | `usable_as_candidate` | 第五步是否允许作为候选；第五步还会再做长度、中心、能量和采样间隔 QC |
 | `reasons` | 不可用或需要审计的原因 |
 
-## `selected_wavelet.csv`
+---
+
+## 05 · wavelet_generation.py
+
+### `selected_wavelet.csv` — 核心契约
+
+→ well_constraints.py、deterministic_inversion.py、dynamic_gain.py、ginn_train.py
 
 第五步选出的全局子波。第六步分频诊断和第八步 GINN 正演都应读取这条子波，而不是回退到单井候选子波。
 
@@ -114,7 +158,9 @@
 | `time_s` | 子波时间轴，单位 s，中心应在 0 附近 |
 | `amplitude` | 已归一化的子波振幅 |
 
-## `batch_synthetic_metrics.csv`
+### `batch_synthetic_metrics.csv` — 核心契约
+
+→ well_constraints.py
 
 第五步用全局子波在所有评测井上重新正演后的逐井指标。第六步用它筛选控制井和计算井约束权重。
 
@@ -131,9 +177,17 @@
 | `status` | `ok` / `failed` |
 | `reasons` | 失败原因 |
 
-## `well_constraint_points.csv`
+---
 
-第六步写出的点级井约束事实表。它是低频 anchor、高频井监督、高频统计和 LFM 点级控制点的共同来源。默认训练材料只使用直井点；斜井点保留在事实表中用于审计和 LFM 控制点候选，不默认进入 GINN 或 enhance 训练。
+## 06 · well_constraints.py
+
+第六步是 CSV 输出最多的步骤。它同时产出点级事实表、分频诊断、冲突报告和高频统计。
+
+### `well_constraint_points.csv` — 核心契约
+
+→ ginn_inversion.py（井 QC）、deterministic_inversion.py（井 QC）
+
+点级井约束事实表。它是低频 anchor、高频井监督、高频统计和 LFM 点级控制点的共同来源。默认训练材料只使用直井点；斜井点保留在事实表中用于审计和 LFM 控制点候选，不默认进入 GINN 或 enhance 训练。
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -152,20 +206,9 @@
 
 `inline_float`、`xline_float`、`twt_s` 是空间事实的规范坐标；`flat_idx` / `sample_index` 只能在同一地震几何和采样轴内解释。
 
-## `well_anchor_conflicts.csv`
+### `well_constraint_qc.csv` — 核心契约
 
-可选输出。只有 GINN 低频 anchor 中存在同一 `(flat_idx, sample_index)` 上多条井约束时才写出，记录被聚合前的差异。
-
-| 关键字段 | 含义 |
-|----------|------|
-| `flat_idx` / `sample_index` | 发生冲突的地震道和采样点 |
-| `n_points` | 冲突点数量 |
-| `well_names` / `sources` | 参与冲突的井和空间来源 |
-| `min_value` / `max_value` / `range_value` | 被审计目标值的范围 |
-| `strategy` | 当前聚合策略 |
-| `point_rows_json` | 冲突点的原始井名、位置、目标值和权重 |
-
-## `well_constraint_qc.csv`
+→ lfm_precomputed.py
 
 逐井入选结果和质量控制摘要，每口候选井一行。`status=selected` 表示该井进入点级事实表和 LFM 候选；若该井为斜井，在默认配置下仍不会进入 `well_high_supervision_time.npz` 和 `well_high_stats_*`。
 
@@ -184,57 +227,9 @@
 | `frequency_split_qc_trace_path` | 分频前后曲线数值文件路径 |
 | `frequency_split_qc_figure_path` | 分频 QC 图路径 |
 
-## `well_high_supervision_conflicts.csv`
+### `lfm_control_points.csv` — 核心契约
 
-可选输出。只有 enhance 高频监督点中存在同一 `(flat_idx, sample_index)` 上多条井约束时才写出。字段与 `well_anchor_conflicts.csv` 一致，但审计目标值为 `well_high_log_ai`。
-
-## `well_high_stats_by_layer.csv`
-
-每层一行，记录该层的高频统计特征和可靠度。后续 enhance 合成器用这些统计驱动分层样本生成。
-
-| 关键字段 | 含义 |
-|----------|------|
-| `zone_name` | 层段名 |
-| `well_count` / `sample_count` / `event_count` | 该层的有效井数、样点数和事件数 |
-| `reliability` | 0–1 可靠度，由井数、样点数和事件数综合决定 |
-| `alpha_to_layer` | 收缩因子 α，越高越相信本层自身统计 |
-| `event_density_per_sample` / `event_density_per_second` | 事件密度（每样点 / 每秒） |
-| `amplitude_rms` / `amplitude_p10` / `amplitude_p50` / `amplitude_p90` / `amplitude_abs_p95` | 高频残余振幅分布 |
-| `run_length_p50` / `run_length_p90` | 正负状态持续样点数的分位数 |
-| `transition_matrix_json` | 三状态转移矩阵（正/静/负）的计数和概率 |
-
-## `frequency_split_diagnostics.csv`
-
-分频诊断时每口井、每个候选截止频率一行。脚本用该 cutoff 下的低通井 AI 正演合成记录，并与第四步保存的井旁地震道比较。
-
-| 关键字段 | 含义 |
-|----------|------|
-| `well_name` / `route` | 参与诊断的井和第四步标定路径 |
-| `cutoff_hz` | 候选截止频率 |
-| `status` | ok / failed / manual |
-| `corr` | 低通 AI 正演合成记录与井旁地震道的相关系数 |
-| `nmae` | 低通 AI 正演合成记录与井旁地震道的归一化绝对误差 |
-| `scale` | 最小二乘缩放系数 |
-| `n_eval_samples` | 参与正演匹配评价的样点数 |
-| `wavelet_file` | 第五步最终全局子波路径 |
-| `reason` | 失败原因，仅 failed 行有值 |
-
-## `frequency_split_aggregate.csv`
-
-分频诊断的多井聚合表，每个候选截止频率一行。
-
-| 关键字段 | 含义 |
-|----------|------|
-| `cutoff_hz` | 候选截止频率 |
-| `n_wells` | 该 cutoff 下成功参与评价的井数 |
-| `median_corr` / `mean_corr` | 多井相关系数聚合 |
-| `p25_corr` / `p75_corr` | 相关系数四分位范围 |
-| `median_nmae` / `mean_nmae` | 多井误差聚合 |
-| `p25_nmae` / `p75_nmae` | 误差四分位范围 |
-| `median_scale` | 最小二乘缩放系数中位数 |
-| `median_n_eval_samples` | 参与评价样点数中位数 |
-
-## `lfm_control_points.csv`
+→ lfm_precomputed.py
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -249,3 +244,114 @@
 | `weight` | 第六步按井震匹配质量等因素计算的控制点权重 |
 
 `inline_float`、`xline_float`、`twt_s` 是规范坐标。第六步输出的是点级低频控制事实，不按单井、层段或顺层切片聚合；第七步 LFM 根据自己的 `modeling.n_slices` 决定如何分配切片、聚合重复控制点和插值建模。`flat_idx` / `sample_index` 作为派生字段写出，便于 QC 和调试，但它们依赖当前地震几何与采样轴，不能作为跨步骤主键。
+
+### `frequency_split_diagnostics.csv` — 诊断
+
+分频诊断时每口井、每个候选截止频率一行。脚本用该 cutoff 下的低通井 AI 正演合成记录，并与第四步保存的井旁地震道比较。**仅供人工审阅**，不被任何下游脚本自动读取。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `well_name` / `route` | 参与诊断的井和第四步标定路径 |
+| `cutoff_hz` | 候选截止频率 |
+| `status` | ok / failed / manual |
+| `corr` | 低通 AI 正演合成记录与井旁地震道的相关系数 |
+| `nmae` | 低通 AI 正演合成记录与井旁地震道的归一化绝对误差 |
+| `scale` | 最小二乘缩放系数 |
+| `n_eval_samples` | 参与正演匹配评价的样点数 |
+| `wavelet_file` | 第五步最终全局子波路径 |
+| `reason` | 失败原因，仅 failed 行有值 |
+
+### `frequency_split_aggregate.csv` — 诊断
+
+分频诊断的多井聚合表，每个候选截止频率一行。**仅供人工审阅**，不被任何下游脚本自动读取。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `cutoff_hz` | 候选截止频率 |
+| `n_wells` | 该 cutoff 下成功参与评价的井数 |
+| `median_corr` / `mean_corr` | 多井相关系数聚合 |
+| `p25_corr` / `p75_corr` | 相关系数四分位范围 |
+| `median_nmae` / `mean_nmae` | 多井误差聚合 |
+| `p25_nmae` / `p75_nmae` | 误差四分位范围 |
+| `median_scale` | 最小二乘缩放系数中位数 |
+| `median_n_eval_samples` | 参与评价样点数中位数 |
+
+### `well_anchor_conflicts.csv` — 诊断（可选）
+
+只有 GINN 低频 anchor 中存在同一 `(flat_idx, sample_index)` 上多条井约束时才写出，记录被聚合前的差异。**仅供人工审阅**。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `flat_idx` / `sample_index` | 发生冲突的地震道和采样点 |
+| `n_points` | 冲突点数量 |
+| `well_names` / `sources` | 参与冲突的井和空间来源 |
+| `min_value` / `max_value` / `range_value` | 被审计目标值的范围 |
+| `strategy` | 当前聚合策略 |
+| `point_rows_json` | 冲突点的原始井名、位置、目标值和权重 |
+
+### `well_high_supervision_conflicts.csv` — 诊断（可选）
+
+只有 enhance 高频监督点中存在同一 `(flat_idx, sample_index)` 上多条井约束时才写出。字段与 `well_anchor_conflicts.csv` 一致，但审计目标值为 `well_high_log_ai`。**仅供人工审阅**。
+
+### `well_high_stats_by_layer.csv` — 诊断 / enhance 输入
+
+→ enhance 合成器（深度域）
+
+每层一行，记录该层的高频统计特征和可靠度。后续 enhance 合成器用这些统计驱动分层样本生成。时间域工作流当前不自动消费此文件。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `zone_name` | 层段名 |
+| `well_count` / `sample_count` / `event_count` | 该层的有效井数、样点数和事件数 |
+| `reliability` | 0–1 可靠度，由井数、样点数和事件数综合决定 |
+| `alpha_to_layer` | 收缩因子 α，越高越相信本层自身统计 |
+| `event_density_per_sample` / `event_density_per_second` | 事件密度（每样点 / 每秒） |
+| `amplitude_rms` / `amplitude_p10` / `amplitude_p50` / `amplitude_p90` / `amplitude_abs_p95` | 高频残余振幅分布 |
+| `run_length_p50` / `run_length_p90` | 正负状态持续样点数的分位数 |
+| `transition_matrix_json` | 三状态转移矩阵（正/静/负）的计数和概率 |
+
+---
+
+## 06 → 07/08/enhance：NPZ 与 JSON 数据包
+
+第六步除了 CSV 外，还产出以下 NPZ 和 JSON 文件，是第七、八步和 enhance 的正式输入。详细 schema 见[数据与单位约定](data-and-coordinate-conventions.md)。
+
+```
+第六步 well_constraints.py
+  ├─ lfm_control_points.csv         → 第七步 lfm_precomputed.py（点级 AI 控制）
+  ├─ log_ai_anchor_time.npz         → 第八步 ginn_train.py（井约束损失）
+  ├─ well_high_supervision_time.npz → enhance 训练（真实井高频监督，默认只含直井）
+  └─ well_high_stats_*.json/csv     → enhance 合成器（统计驱动生成，默认只含直井）
+```
+
+每个下游步骤只读取第六步的输出，不应再直接访问第四步的 LAS、时深表或井轨迹。
+
+---
+
+## 07 · lfm_precomputed.py
+
+第七步不产出 CSV 契约。它读取第六步的 `lfm_control_points.csv` 和 `well_constraint_qc.csv`，产出 `ai_lfm_time.npz` 供第八步 GINN 训练使用。
+
+---
+
+## 08 · ginn_train.py
+
+第八步不读写 CSV。它通过 YAML 配置读取第七步的 `ai_lfm_time.npz`、第五步的 `selected_wavelet.csv`（经 `ginn.config` 解析）和可选的第六步 anchor NPZ，产出 GINN checkpoint。
+
+---
+
+## 09 · ginn_inversion.py
+
+第九步读取第八步 checkpoint 执行反演，产出 `well_qc_metrics.csv` 和逐井 `well_qc_*.csv` 用于井 QC 评估。这些 QC CSV 是脚本内部产物，不进入其他主链步骤的输入。
+
+---
+
+## 旁路 · deterministic_inversion.py
+
+确定性反演旁路，置于第七步之后、第八步之前。读取第五步 `selected_wavelet.csv` 和第六步 `well_constraint_points.csv`（用于井 QC），产出 `well_qc_metrics.csv` 和确定性反演体。不产出新的跨步骤 CSV 契约。
+
+---
+
+## 旁路 · dynamic_gain.py
+
+Dynamic gain 旁路，置于第七步之后、第八步之前。读取第四步 `well_tie_metrics.csv` 和第五步 `selected_wavelet.csv`，产出 `dynamic_gain.npz` 和若干诊断 CSV（`dynamic_gain_samples.csv`、`dynamic_gain_well_medians.csv` 等）。诊断 CSV 仅供人工审阅，`dynamic_gain.npz` 可由第八步按配置读取。

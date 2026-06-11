@@ -27,17 +27,29 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.config import deep_merge_dict
-from cup.seismic.viz import impedance_qc_metrics, plot_well_impedance_qc, sample_volume_at_points
 from cup.utils.io import (
     build_segy_textual_header,
     latest_run,
     load_yaml_config,
     repo_relative_path,
+    resolve_artifact_path,
     resolve_relative_path,
     sanitize_filename,
     to_json_compatible,
     write_json,
 )
+from cup.seismic.viz import (
+    impedance_qc_metrics,
+    plot_well_waveform_qc,
+    sample_volume_at_points,
+    waveform_qc_metrics,
+)
+from cup.well.assets import normalize_well_name
+from cup.well.tie import load_saved_seismic_trace_csv
+from cup.well.wavelet import compute_wavelet_active_half_support_s, load_wavelet_csv, validate_wavelet_dt
+from wtie.modeling.modeling import ConvModeler
+from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
+from wtie.processing import grid
 
 matplotlib.use("Agg")
 plt.rcParams["figure.dpi"] = 120
@@ -271,9 +283,117 @@ def _plot_lfm_result(result: Any, output_path: Path) -> None:
     _save_fig(output_path)
 
 
-def _write_lfm_well_qc(control_df: pd.DataFrame, result: Any, output_dir: Path) -> dict[str, Any]:
-    from wtie.processing import grid
+def _reflectivity_from_ai(ai: np.ndarray) -> np.ndarray:
+    values = np.asarray(ai, dtype=np.float64)
+    out = np.zeros(values.shape, dtype=np.float64)
+    valid = np.isfinite(values) & (values > 0.0)
+    pair_valid = valid[:-1] & valid[1:]
+    upper = values[:-1][pair_valid]
+    lower = values[1:][pair_valid]
+    out[np.flatnonzero(pair_valid) + 1] = (lower - upper) / np.maximum(lower + upper, 1e-12)
+    return out
 
+
+def _nearest_sample_indices(sample_axis: np.ndarray, twt_s: np.ndarray) -> np.ndarray:
+    right = np.searchsorted(sample_axis, twt_s, side="left")
+    right = np.clip(right, 0, sample_axis.size - 1)
+    left = np.maximum(right - 1, 0)
+    choose_left = np.abs(sample_axis[left] - twt_s) < np.abs(sample_axis[right] - twt_s)
+    return np.where(choose_left, left, right).astype(np.int64)
+
+
+def _resolve_lfm_qc_sources(constraints_summary: dict[str, Any]) -> tuple[Path, Path, pd.DataFrame]:
+    source_dirs = dict(constraints_summary.get("source_dirs") or {})
+    auto_value = source_dirs.get("well_auto_tie_dir")
+    wavelet_value = source_dirs.get("wavelet_generation_dir")
+    if not auto_value or not wavelet_value:
+        raise ValueError("Sixth-step run_summary.json is missing well_auto_tie_dir or wavelet_generation_dir.")
+    auto_dir = resolve_relative_path(auto_value, root=REPO_ROOT)
+    wavelet_dir = resolve_relative_path(wavelet_value, root=REPO_ROOT)
+    metrics_path = auto_dir / "well_tie_metrics.csv"
+    wavelet_path = wavelet_dir / "selected_wavelet.csv"
+    if not metrics_path.exists():
+        raise FileNotFoundError(f"Missing fourth-step well_tie_metrics.csv: {metrics_path}")
+    if not wavelet_path.exists():
+        raise FileNotFoundError(f"Missing fifth-step selected_wavelet.csv: {wavelet_path}")
+    return auto_dir, wavelet_path, pd.read_csv(metrics_path)
+
+
+def _metric_row_for_well(metrics_df: pd.DataFrame, well_name: str) -> pd.Series:
+    key = normalize_well_name(well_name)
+    matches = metrics_df.loc[
+        metrics_df["well_name"].map(lambda value: normalize_well_name(str(value))) == key
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"Expected exactly one fourth-step metric row for {well_name!r}, found {len(matches)}.")
+    row = matches.iloc[0]
+    if str(row.get("tie_status", "")) != "success":
+        raise ValueError(f"Fourth-step tie_status is not success for {well_name!r}.")
+    return row
+
+
+def _trajectory_coordinates(
+    metric: pd.Series,
+    *,
+    auto_dir: Path,
+    well_name: str,
+    twt_s: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    plan_path = resolve_artifact_path(
+        metric.get("optimized_trace_sample_plan_file"),
+        root=REPO_ROOT,
+        run_dir=auto_dir,
+    )
+    if plan_path is None or not plan_path.exists():
+        raise FileNotFoundError(f"Missing optimized trajectory sample plan for deviated well {well_name!r}.")
+    plan = pd.read_csv(plan_path)
+    required = {"twt_s", "inline_float", "xline_float", "survey_position"}
+    missing = required - set(plan.columns)
+    if missing:
+        raise ValueError(f"Trajectory sample plan is missing columns {sorted(missing)}: {plan_path}")
+    plan = plan.loc[plan["survey_position"].astype(str).eq("inside")].sort_values("twt_s")
+    if len(plan) < 2:
+        raise ValueError(f"Trajectory sample plan has fewer than two inside samples: {plan_path}")
+    plan_twt = plan["twt_s"].to_numpy(dtype=np.float64)
+    if twt_s[0] < plan_twt[0] - 1e-9 or twt_s[-1] > plan_twt[-1] + 1e-9:
+        raise ValueError("Requested LFM QC window extends outside the optimized trajectory sample plan.")
+    return (
+        np.interp(twt_s, plan_twt, plan["inline_float"].to_numpy(dtype=np.float64)),
+        np.interp(twt_s, plan_twt, plan["xline_float"].to_numpy(dtype=np.float64)),
+    )
+
+
+def _lfm_qc_coordinates(
+    group: pd.DataFrame,
+    metric: pd.Series,
+    *,
+    auto_dir: Path,
+    well_name: str,
+    twt_s: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    sources = set(group["source"].astype(str))
+    if sources == {"deviated_trajectory"}:
+        return _trajectory_coordinates(
+            metric,
+            auto_dir=auto_dir,
+            well_name=well_name,
+            twt_s=twt_s,
+        )
+    if sources == {"vertical_trace"}:
+        return (
+            np.full(twt_s.size, float(group["inline_float"].median())),
+            np.full(twt_s.size, float(group["xline_float"].median())),
+        )
+    raise ValueError(f"Unsupported mixed LFM QC sources for {well_name!r}: {sorted(sources)}")
+
+
+def _write_lfm_well_qc(
+    control_df: pd.DataFrame,
+    result: Any,
+    output_dir: Path,
+    *,
+    constraints_summary: dict[str, Any],
+) -> dict[str, Any]:
     well_qc_dir = output_dir / "well_qc"
     trace_dir = well_qc_dir / "traces"
     figure_dir = well_qc_dir / "figures"
@@ -284,13 +404,10 @@ def _write_lfm_well_qc(control_df: pd.DataFrame, result: Any, output_dir: Path) 
     if "sample_index" in qc_df.columns:
         qc_df["input_sample_index"] = qc_df["sample_index"]
     sample_axis = np.asarray(result.samples, dtype=np.float64)
-    qc_df["sample_index_used"] = np.searchsorted(sample_axis, qc_df["twt_s"].to_numpy(dtype=np.float64), side="left")
-    qc_df["sample_index_used"] = np.clip(qc_df["sample_index_used"].to_numpy(dtype=np.int64), 0, sample_axis.size - 1)
-    left = np.maximum(qc_df["sample_index_used"].to_numpy(dtype=np.int64) - 1, 0)
-    right = qc_df["sample_index_used"].to_numpy(dtype=np.int64)
-    twt_values = qc_df["twt_s"].to_numpy(dtype=np.float64)
-    choose_left = np.abs(sample_axis[left] - twt_values) < np.abs(sample_axis[right] - twt_values)
-    qc_df.loc[choose_left, "sample_index_used"] = left[choose_left]
+    qc_df["sample_index_used"] = _nearest_sample_indices(
+        sample_axis,
+        qc_df["twt_s"].to_numpy(dtype=np.float64),
+    )
     qc_df["ai_lfm_sampled"] = sample_volume_at_points(
         result.volume,
         result.geometry,
@@ -301,41 +418,214 @@ def _write_lfm_well_qc(control_df: pd.DataFrame, result: Any, output_dir: Path) 
     qc_df["diff_ai_lfm_minus_control"] = qc_df["ai_lfm_sampled"].to_numpy(dtype=np.float64) - qc_df["ai"].to_numpy(dtype=np.float64)
 
     metrics_rows: list[dict[str, Any]] = []
+    try:
+        auto_dir, wavelet_path, tie_metrics = _resolve_lfm_qc_sources(constraints_summary)
+        wavelet_time_s, wavelet_values = load_wavelet_csv(wavelet_path)
+        validate_wavelet_dt(wavelet_time_s, float(np.median(np.diff(sample_axis))))
+        half_support_s = compute_wavelet_active_half_support_s(wavelet_time_s, wavelet_values)
+        wavelet = grid.Wavelet(wavelet_values, wavelet_time_s, name=wavelet_path.stem)
+        modeler = ConvModeler()
+    except Exception as exc:
+        for well_name, group in qc_df.groupby("well_name", sort=True):
+            metrics_rows.append(
+                {
+                    "well_name": str(well_name),
+                    "status": "failed",
+                    "n_control_points": int(len(group)),
+                    "source_values": ";".join(sorted(set(group["source"].astype(str)))),
+                    "error": f"{type(exc).__name__}:{exc}",
+                }
+            )
+        metrics_df = pd.DataFrame.from_records(metrics_rows)
+        metrics_path = well_qc_dir / "well_qc_metrics.csv"
+        metrics_df.to_csv(metrics_path, index=False, encoding="utf-8-sig")
+        return {
+            "well_qc_dir": repo_relative_path(well_qc_dir, root=REPO_ROOT),
+            "metrics": repo_relative_path(metrics_path, root=REPO_ROOT),
+            "n_wells_qc": 0,
+        }
+
     for well_name, group in qc_df.groupby("well_name", sort=True):
         group = group.sort_values(["twt_s", "md_m", "sample_index"]).reset_index(drop=True)
         safe = sanitize_filename(str(well_name))
         trace_path = trace_dir / f"well_qc_{safe}.csv"
         figure_path = figure_dir / f"well_qc_{safe}.png"
-        group.to_csv(trace_path, index=False, encoding="utf-8-sig")
+        base_row = {
+            "well_name": str(well_name),
+            "n_control_points": int(len(group)),
+            "source_values": ";".join(
+                sorted({str(value) for value in group.get("source", pd.Series(dtype=str)).dropna().unique()})
+            ),
+            "wavelet_file": repo_relative_path(wavelet_path, root=REPO_ROOT),
+        }
+        try:
+            metric = _metric_row_for_well(tie_metrics, str(well_name))
+            seismic_path = resolve_artifact_path(
+                metric.get("seismic_trace_file"),
+                root=REPO_ROOT,
+                run_dir=auto_dir,
+            )
+            if seismic_path is None or not seismic_path.exists():
+                raise FileNotFoundError(f"Missing fourth-step seismic trace for {well_name!r}.")
+            seismic = load_saved_seismic_trace_csv(seismic_path)
+            display_start = max(
+                float(seismic.basis[0]),
+                float(group["twt_s"].min()) - half_support_s,
+            )
+            display_end = min(
+                float(seismic.basis[-1]),
+                float(group["twt_s"].max()) + half_support_s,
+            )
+            display_mask = (seismic.basis >= display_start) & (seismic.basis <= display_end)
+            display_twt = np.asarray(seismic.basis[display_mask], dtype=np.float64)
+            seismic_raw = np.asarray(seismic.values[display_mask], dtype=np.float64)
+            if display_twt.size < 8:
+                raise ValueError(f"Too few samples in LFM QC display window: {display_twt.size}.")
 
-        samples = group["twt_s"].to_numpy(dtype=np.float64)
-        control_ai = grid.Log(group["ai"].to_numpy(dtype=np.float64), samples, "twt", name="Low-frequency control AI")
-        sampled_ai = grid.Log(group["ai_lfm_sampled"].to_numpy(dtype=np.float64), samples, "twt", name="LFM sampled AI")
-        mask = (
-            np.isfinite(group["ai"].to_numpy(dtype=np.float64))
-            & np.isfinite(group["ai_lfm_sampled"].to_numpy(dtype=np.float64))
-        )
-        fig, _axes = plot_well_impedance_qc(
-            low_ai=control_ai,
-            model_ai=sampled_ai,
-            mask=mask,
-            title=f"LFM well QC | {well_name}",
-            model_label="LFM sampled AI",
-        )
-        fig.savefig(figure_path, dpi=180, bbox_inches="tight")
-        plt.close(fig)
+            inline_values, xline_values = _lfm_qc_coordinates(
+                group,
+                metric,
+                auto_dir=auto_dir,
+                well_name=str(well_name),
+                twt_s=display_twt,
+            )
 
-        metrics_rows.append(
-            {
-                "well_name": str(well_name),
-                "status": "ok" if np.any(mask) else "no_valid_samples",
-                "n_control_points": int(len(group)),
-                "source_values": ";".join(sorted({str(value) for value in group.get("source", pd.Series(dtype=str)).dropna().unique()})),
-                "trace_csv": repo_relative_path(trace_path, root=REPO_ROOT),
-                "figure": repo_relative_path(figure_path, root=REPO_ROOT),
-                **impedance_qc_metrics(model_ai=sampled_ai, low_ai=control_ai, mask=mask),
-            }
-        )
+            display_indices = _nearest_sample_indices(sample_axis, display_twt)
+            lfm_ai_values = sample_volume_at_points(
+                result.volume,
+                result.geometry,
+                inline_values,
+                xline_values,
+                display_indices,
+            )
+            if np.any(~np.isfinite(lfm_ai_values)) or np.any(lfm_ai_values <= 0.0):
+                raise ValueError("LFM sampled AI contains non-finite or non-positive values in the QC window.")
+
+            group_twt = group["twt_s"].to_numpy(dtype=np.float64)
+            control_values = np.interp(
+                display_twt,
+                group_twt,
+                group["ai"].to_numpy(dtype=np.float64),
+                left=np.nan,
+                right=np.nan,
+            )
+            reflectivity_values = _reflectivity_from_ai(lfm_ai_values)
+            synthetic_raw = np.asarray(modeler(wavelet.values, reflectivity_values), dtype=np.float64)
+            target_mask = (
+                (display_twt >= float(group_twt.min()))
+                & (display_twt <= float(group_twt.max()))
+                & np.isfinite(seismic_raw)
+                & np.isfinite(synthetic_raw)
+            )
+            if int(np.count_nonzero(target_mask)) < 8:
+                raise ValueError("Too few valid target-window samples for LFM waveform QC.")
+            observed_mean = float(np.mean(seismic_raw[target_mask]))
+            observed_std = float(np.std(seismic_raw[target_mask]))
+            if not np.isfinite(observed_std) or observed_std <= 0.0:
+                raise ValueError("Observed seismic has zero standard deviation in the LFM QC target window.")
+            observed = (seismic_raw - observed_mean) / observed_std
+            denominator = max(float(np.dot(synthetic_raw[target_mask], synthetic_raw[target_mask])), 1e-12)
+            scale = float(np.dot(observed[target_mask], synthetic_raw[target_mask]) / denominator)
+            synthetic = scale * synthetic_raw
+
+            synthetic_trace = grid.Seismic(synthetic, display_twt, "twt", name="LFM synthetic")
+            observed_trace = grid.Seismic(observed, display_twt, "twt", name="Seismic normalized")
+            xcorr_values = normalized_xcorr(observed_trace.values, synthetic_trace.values)
+            xcorr_basis = synthetic_trace.sampling_rate * np.arange(
+                -(synthetic_trace.size - 1),
+                synthetic_trace.size,
+            )
+            xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
+            dxcorr = dynamic_normalized_xcorr(observed_trace, synthetic_trace)
+            control_trace = grid.Log(control_values, display_twt, "twt", name="Low-frequency control AI")
+            sampled_trace = grid.Log(lfm_ai_values, display_twt, "twt", name="LFM sampled AI")
+            reflectivity_trace = grid.Reflectivity(
+                reflectivity_values,
+                display_twt,
+                "twt",
+                name="LFM reflectivity",
+            )
+
+            trace_df = pd.DataFrame(
+                {
+                    "twt_s": display_twt,
+                    "well_low_ai": control_values,
+                    "ai_lfm_sampled": lfm_ai_values,
+                    "reflectivity_lfm": reflectivity_values,
+                    "seismic_raw": seismic_raw,
+                    "seismic_normalized": observed,
+                    "synthetic_unscaled": synthetic_raw,
+                    "synthetic_scaled": synthetic,
+                    "residual": observed - synthetic,
+                    "valid_for_metrics": target_mask,
+                    "inline_float": inline_values,
+                    "xline_float": xline_values,
+                }
+            )
+            trace_df.to_csv(trace_path, index=False, encoding="utf-8-sig")
+
+            fig, _axes = plot_well_waveform_qc(
+                [control_trace, sampled_trace],
+                reflectivity_trace,
+                synthetic_trace,
+                observed_trace,
+                xcorr,
+                dxcorr,
+                synthetic_ai=sampled_trace,
+                figsize=(12.0, 7.5),
+            )
+            fig.suptitle(
+                f"LFM well QC | {well_name} | corr={waveform_qc_metrics(observed, synthetic, target_mask)['corr']:.3f}"
+            )
+            fig.savefig(figure_path, dpi=180, bbox_inches="tight")
+            plt.close(fig)
+
+            ai_mask = (
+                np.isfinite(group["ai"].to_numpy(dtype=np.float64))
+                & np.isfinite(group["ai_lfm_sampled"].to_numpy(dtype=np.float64))
+            )
+            control_metric_trace = grid.Log(
+                group["ai"].to_numpy(dtype=np.float64),
+                group_twt,
+                "twt",
+                name="Low-frequency control AI",
+            )
+            sampled_metric_trace = grid.Log(
+                group["ai_lfm_sampled"].to_numpy(dtype=np.float64),
+                group_twt,
+                "twt",
+                name="LFM sampled AI",
+            )
+            metrics_rows.append(
+                {
+                    **base_row,
+                    "status": "ok",
+                    "trace_csv": repo_relative_path(trace_path, root=REPO_ROOT),
+                    "figure": repo_relative_path(figure_path, root=REPO_ROOT),
+                    "seismic_trace_file": repo_relative_path(seismic_path, root=REPO_ROOT),
+                    "route": str(metric.get("route", "")),
+                    "synthetic_scale": scale,
+                    "xcorr_lag_s": float(xcorr.lag),
+                    **impedance_qc_metrics(
+                        model_ai=sampled_metric_trace,
+                        low_ai=control_metric_trace,
+                        mask=ai_mask,
+                    ),
+                    **{
+                        f"waveform_{key}": value
+                        for key, value in waveform_qc_metrics(observed, synthetic, target_mask).items()
+                    },
+                }
+            )
+        except Exception as exc:
+            plt.close("all")
+            metrics_rows.append(
+                {
+                    **base_row,
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}:{exc}",
+                }
+            )
 
     metrics_df = pd.DataFrame.from_records(metrics_rows)
     metrics_path = well_qc_dir / "well_qc_metrics.csv"
@@ -343,7 +633,7 @@ def _write_lfm_well_qc(control_df: pd.DataFrame, result: Any, output_dir: Path) 
     return {
         "well_qc_dir": repo_relative_path(well_qc_dir, root=REPO_ROOT),
         "metrics": repo_relative_path(metrics_path, root=REPO_ROOT),
-        "n_wells_qc": int(len(metrics_rows)),
+        "n_wells_qc": int((metrics_df.get("status") == "ok").sum()) if not metrics_df.empty else 0,
     }
 
 
@@ -600,7 +890,12 @@ def main() -> None:
 
     _plot_controls(control_df, figures_dir / "qc_control_points.png")
     _plot_lfm_result(result, figures_dir / "qc_ai_lfm_time.png")
-    well_qc_summary = _write_lfm_well_qc(control_df, result, output_dir)
+    well_qc_summary = _write_lfm_well_qc(
+        control_df,
+        result,
+        output_dir,
+        constraints_summary=constraints_summary,
+    )
     outputs = {
         "ai_lfm_time": repo_relative_path(npz_file, root=REPO_ROOT),
         "control_points": repo_relative_path(control_path, root=REPO_ROOT),

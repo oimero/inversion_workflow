@@ -483,6 +483,15 @@ def estimate_fixed_gain(
     return float(gain)
 
 
+@dataclass(frozen=True)
+class TraceQCData:
+    """Read-only copies of one physical trace used by GINN QC."""
+
+    seismic_raw: np.ndarray
+    loss_mask: np.ndarray
+    dynamic_gain: np.ndarray | None
+
+
 class SeismicTraceDataset(Dataset):
     """逐道 1D 地震数据 Dataset。
 
@@ -655,6 +664,29 @@ class SeismicTraceDataset(Dataset):
         if self._include_dynamic_gain_input:
             channels.append("dynamic_gain_log_ratio")
         return tuple(channels)
+
+    def trace_qc_data(self, flat_idx: int) -> TraceQCData:
+        """Return read-only QC arrays for an absolute flattened trace index."""
+        index = int(flat_idx)
+        if index < 0 or index >= self._seismic_flat.shape[0]:
+            raise IndexError(f"flat_idx {index} is outside [0, {self._seismic_flat.shape[0]}).")
+
+        seismic_raw = np.array(self._seismic_flat[index], dtype=np.float64, copy=True)
+        loss_mask = np.array(self._loss_mask_flat[index], dtype=bool, copy=True)
+        dynamic_gain = (
+            None
+            if self._dynamic_gain_flat is None
+            else np.array(self._dynamic_gain_flat[index], dtype=np.float64, copy=True)
+        )
+        seismic_raw.setflags(write=False)
+        loss_mask.setflags(write=False)
+        if dynamic_gain is not None:
+            dynamic_gain.setflags(write=False)
+        return TraceQCData(
+            seismic_raw=seismic_raw,
+            loss_mask=loss_mask,
+            dynamic_gain=dynamic_gain,
+        )
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         flat_idx = self._valid_indices[idx]

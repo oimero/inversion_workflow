@@ -1,6 +1,12 @@
-# 数据与坐标约定
+# 数据与单位约定
 
-这份文件描述数据、入口函数、坐标、单位等内容的约定。脚本之间的 CSV 字段契约见[核心 CSV 契约](csv-contracts.md)。
+本文档分两部分：**Part A** 描述工作流用到的原始数据类型及其读取入口；**Part B** 描述所有物理量 & 坐标轴的单位约定。
+
+脚本之间的 CSV 契约和中间产物（NPZ 等）见[核心 CSV 契约](csv-contracts.md)。
+
+---
+
+# Part A：数据
 
 ## 井头、井分层、地震解释层位
 
@@ -65,80 +71,30 @@ trace =
   + wi       * wj       * trace11
 ```
 
-## 第六步井约束：NPZ 数据包与步骤间契约
+---
 
-第六步 `well_constraints.py` 输出的 CSV 字段契约见[核心 CSV 契约](csv-contracts.md)。这里的重点是它产出的两个 NPZ 数据包和统计文件，它们是第七、八步和 enhance 的正式输入。
+# Part B：物理量
 
-### `log_ai_anchor_time.npz` → 第八步 GINN
-
-| NPZ 键 | 形状 | 语义 |
-|--------|------|------|
-| `samples` | `(n_sample,)` | 正秒 TWT 采样轴 |
-| `flat_indices` | `(n_anchor,)` | 每条受控道的地震体内部编号 |
-| `target_ai` | `(n_anchor, n_sample)` | 第六步分频后的低频波阻抗 |
-| `target_log_ai` | `(n_anchor, n_sample)` | 低频波阻抗的对数，由 `target_ai` 自动推导 |
-| `anchor_mask` | `(n_anchor, n_sample)` | 布尔掩码，标记哪些样点是有效控制点 |
-| `anchor_weight` | `(n_anchor, n_sample)` | 每个控制点的训练权重 |
-| `anchor_names` | `(n_anchor,)` | 每条道的来源井名 |
-| `anchor_types` | `(n_anchor,)` | 锚点类型，当前均为 `"well"` |
-| `inline` / `xline` | `(n_anchor,)` | 每条道的线号 |
-| `summary_json` | 标量 | 锚点数、有效样点数、目标值统计、权重统计 |
-| `metadata_json` | 标量 | 分频参数、冲突策略、上游路径 |
-
-第一版默认只含直井锚点。第八步训练时，`anchor_mask` 为真的样点会参与井约束损失。
-
-### `well_high_supervision_time.npz` → enhance 训练
-
-遵循 `enhance.supervision` 的 `WellHighSupervisionBundle` 格式（schema `well_high_supervision_v1`）。它只表达井上高频监督，不包含 LFM 或 base AI 字段。
-
-| NPZ 键 | 语义 |
-|--------|------|
-| `well_high_log_ai` | 井上高频残余，enhance 训练的真实井监督目标 |
-| `well_low_log_ai` | 井上低频 log-AI 成分 |
-| `well_log_ai` | 井上全频 log-AI |
-| `well_mask` / `well_weight` | 有效样点掩码和训练权重 |
-| `well_names` / `inline` / `xline` | 每口井的标识和位置 |
-| `samples` | 正秒 TWT 采样轴 |
-| `native_samples` | 原生采样轴；第六步当前与 `samples` 一致 |
-| `native_well_*` / `native_well_mask` | 原生采样轴上的全频、低频和高频 log-AI 监督副本 |
-| `summary_json` / `metadata_json` | 高频统计摘要和上游路径、分频参数等元数据 |
-
-enhance 训练端若需要底阻抗或 base AI 输入，应从 GINN 或 LFM 主文件读取，不应从这份井监督包中读取。
-
-默认情况下，这份监督包只包含直井点。第六步仍会在 `well_constraint_points.csv` 中保留斜井点级事实，但不会把 `source=deviated_trajectory` 的点写入 enhance 训练监督和高频统计，避免平台斜井与邻近直井落在同一批地震道上造成训练冲突。若确需实验性启用，可显式设置 `well_constraints.high_supervision.include_deviated: true`。
-
-### 统计文件 → enhance 合成器
-
-| 文件 | 格式 | 消费者 |
-|------|------|--------|
-| `well_high_stats_global.json` | JSON，含振幅、事件密度、持续长度、转移矩阵、反射率和频谱的全局统计 | enhance 合成器，全窗预训练阶段 |
-| `well_high_stats_by_layer.csv` | CSV，每层经验统计和可靠度 | enhance 合成器，分层微调阶段 |
-| `well_high_stats_shrinkage.json` | JSON，每层向全窗收缩后的最终生成参数 | enhance 合成器的真实生成参数来源 |
-
-统计文件的核心约定：输出不写单一均值，保留分位数（p10/p50/p90），让合成器从分布中抽样而非永远取中位数。每层可靠度由井数、样点数、事件数三者综合决定。
-
-### 跨步骤接口一览
-
-```
-第六步 well_constraints.py
-  ├─ lfm_control_points.csv        → 第七步 lfm_precomputed.py（点级 AI 控制）
-  ├─ log_ai_anchor_time.npz        → 第八步 ginn_train.py（井约束损失）
-  ├─ well_high_supervision_time.npz → enhance 训练（真实井高频监督，默认只含直井）
-  └─ well_high_stats_*.json/csv    → enhance 合成器（统计驱动生成，默认只含直井）
-```
-
-每个下游步骤只读取第六步的输出，不应再直接访问第四步的 LAS、时深表或井轨迹。
-
-## 单位约定
+## 物理量单位
 
 | 物理量 | 单位 | 说明 |
 |--------|------|------|
-| TWT | s | 内部正秒 |
-| MD / TVDKB | m | 向下为正 |
-| 内部 TDT 的 TVDSS | m | 向下为正 |
 | 时间采样间隔 `dt_s` | s | 地震、子波、TWT 域曲线采样间隔 |
 | 深度采样间隔 `dz_m` | m | 深度域地震或深度轴曲线采样间隔 |
 | 声波时差 `DT_USM` | us/m | 第三步预处理后的纵波慢度曲线 |
-| 密度 `RHO_GCC` | g/cm3 | 第三步预处理后的密度曲线 |
+| 密度 `RHO_GCC` | g/cm³ | 第三步预处理后的密度曲线 |
 | 速度 `Vp/Vs` | m/s | 工作流内部属性 |
-| 密度 `Rho` | g/cm3 | 工作流内部属性 |
+| 密度 `Rho` | g/cm³ | 工作流内部属性 |
+
+## 坐标轴单位
+
+| 坐标轴 | 单位/参照 | 说明 |
+|------|-----------|------|
+| TWT | s，双程旅行时 | 工作流内部为正秒 |
+| MD | m，沿井轨迹向下 | 钻井测量深度 |
+| TVDKB | m，从补心向下 | 垂深（以 Kelly Bushing 为基准） |
+| TVDSS | m，从海平面向下 | 垂深（以 Mean Sea Level 为基准），海平面以下为正 |
+| inline / xline | 线号（整数或浮点） | 地震工区网格坐标，非 XY 米制 |
+| X / Y | m | 工区投影平面坐标 |
+| `flat_idx` | 整数 | 地震体内部一维道编号，依赖当前几何 |
+| `sample_index` | 整数 | 地震体内部采样点索引，依赖当前采样轴 |

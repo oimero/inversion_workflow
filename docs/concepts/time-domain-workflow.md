@@ -1,20 +1,22 @@
-# 时间域工作流总览
+# 工作流总览
 
-时间域主链由九个顺序步骤 + 若干旁路脚本组成。
+反演在时间域完成。主链由九个顺序步骤 + 若干旁路脚本组成。
 
 ## 主链
 
 | 步骤 | 脚本 | 输入 | 输出 |
 |------|------|------|------|
 | 01 | `well_inventory.py` | Petrel 井头、LAS 目录、地震体 | `well_inventory.csv` |
-| 02 | `well_screen.py` | `well_inventory.csv`、LAS 目录 | `well_screen.csv`、`selected_las/` |
-| 03 | `well_preprocess.py` | `well_screen.csv`、`selected_las/` | `well_preprocess_status.csv`、`preprocessed_las/` |
-| 04 | `well_auto_tie.py` | 03 产物 + 时深表 + 井分层 + 轨迹 QC | `well_tie_metrics.csv`、优化后 TDT、子波 |
+| 02 | `well_screen.py` | `well_inventory.csv`、LAS 目录 | `well_screen.csv`、`las_curve_inventory.csv`、`selected_las/` |
+| 03 | `well_preprocess.py` | `well_screen.csv`、`las_curve_inventory.csv`、`selected_las/` | `well_preprocess_status.csv`、`preprocessed_las/` |
+| 04 | `well_auto_tie.py` | 03 产物 + 时深表 + 井分层 + 轨迹 QC | `well_tie_plan.csv`、`well_tie_metrics.csv`、`wavelet_inventory.csv`、优化后 TDT、单井子波 |
 | 05 | `wavelet_generation.py` | 04 子波 + 标定产物 | `selected_wavelet.csv`、`batch_synthetic_metrics.csv` |
-| 06 | `well_constraints.py` | 04 标定结果 + 05 全局子波评测 + 层位 | `lfm_control_points.csv`、`log_ai_anchor_time.npz`、高频监督和统计 |
-| 07 | `lfm_precomputed.py` | 06 `lfm_control_points.csv` + 层位 | `ai_lfm_time.npz` |
+| 06 | `well_constraints.py` | 04 标定结果 + 05 全局子波评测 + 层位 | `lfm_control_points.csv`、`well_constraint_points.csv`、`well_constraint_qc.csv`、`log_ai_anchor_time.npz`、高频监督和统计 |
+| 07 | `lfm_precomputed.py` | 06 `lfm_control_points.csv` + `well_constraint_qc.csv` + 层位 | `ai_lfm_time.npz` |
 | 08 | `ginn_train.py` | 时间域地震体 + 05 `selected_wavelet.csv` + 07 LFM + 可选 06 anchor | GINN checkpoint |
 | 09 | `ginn_inversion.py` | 08 checkpoint | stage-1 波阻抗预测体 |
+
+各步骤产出的 CSV 字段约定和消费者详见[核心 CSV 契约](csv-contracts.md)。
 
 ## 旁路
 
@@ -22,6 +24,7 @@
 |------|------|----------|
 | `well_trajectory.py` | 解析轨迹文件，复核井型（直/斜），输出轨迹几何事实 | 01 之后，04 之前 |
 | `dynamic_gain.py` | 生成可选 dynamic gain 体，并顺手估计井上 fixed gain baseline | 07 之后，08 之前 |
+| `deterministic_inversion.py` | 确定性反演旁路实验，产出非神经网络物理约束 baseline 用于与 GINN 对比 | 07 之后，08 之前 |
 
 旁路不改变主链编号。04 的路由决策依赖轨迹 QC 的输出；08 可由人工选择是否读取 dynamic gain 旁路输出。
 
@@ -41,6 +44,7 @@ flowchart LR
   T --> D
   G --> DG["dynamic_gain (旁路)"]
   DG -. "可选 gain" .-> H
+  G --> DI["deterministic_inversion (旁路)"]
 ```
 
 ## 深度域 Legacy 工作流

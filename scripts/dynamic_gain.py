@@ -1007,9 +1007,6 @@ def write_well_waveform_qc(
             seismic_trace,
             xcorr,
             dxcorr,
-            mode="amplitude",
-            wiggle_scale_syn=1.0,
-            wiggle_scale_real=1.0,
             figsize=(12.0, 7.5),
         )
         fig.savefig(figure_path, dpi=180, bbox_inches="tight")

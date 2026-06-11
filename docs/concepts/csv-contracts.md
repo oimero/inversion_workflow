@@ -126,6 +126,8 @@
 | `seismic_trace_file` | 第四步保存的井旁或轨迹地震道 |
 | `optimized_trace_sample_plan_file` | 斜井细标定后按 optimized TDT 重新生成的样点级落道计划；直井为空 |
 
+`optimized_trace_sample_plan_file` 指向的 CSV 使用 `trace_plan_index` 表示当前计划内从 0 开始的局部行号。它在裁剪或重建计划后会重新编号，不能解释为地震体全局样点索引；下游必须使用同一行的 `twt_s`、`inline_float`、`xline_float`。
+
 ### `wavelet_inventory.csv` — 核心契约
 
 → wavelet_generation.py
@@ -197,14 +199,14 @@
 | `twt_s` / `md_m` | 点级样本所在 TWT 和 MD |
 | `x_m` / `y_m` | 点级样本平面坐标 |
 | `inline_float` / `xline_float` | 投影到工区后的浮点线号 |
-| `flat_idx` / `sample_index` | 依赖当前地震几何的派生索引，仅用于 bundle 构建和 QC |
+| `flat_idx` / `seismic_sample_index` | 依赖当前地震几何和全局采样轴的派生索引，仅用于 bundle 构建和 QC |
 | `zone_name` / `u_in_zone` | 所属层段和层内比例位置 |
 | `ai_full` / `log_ai_full` | 井上全频 AI 与 log-AI |
 | `well_low_ai` / `well_low_log_ai` | 第六步分频后的低频井曲线 |
 | `well_high_log_ai` | 全频 log-AI 减低频 log-AI 后的高频 residual |
 | `weight` | 由第五步批量合成质量等因素得到的约束权重 |
 
-`inline_float`、`xline_float`、`twt_s` 是空间事实的规范坐标；`flat_idx` / `sample_index` 只能在同一地震几何和采样轴内解释。
+`inline_float`、`xline_float`、`twt_s` 是空间事实的规范坐标；`flat_idx` / `seismic_sample_index` 只能在同一地震几何和全局采样轴内解释。任何体采样入口必须由 `twt_s` 在当前采样轴上重新求最近索引，并用 `seismic_sample_index` 做交叉校验，不能直接信任派生索引。
 
 ### `well_constraint_qc.csv` — 核心契约
 
@@ -243,7 +245,7 @@
 | `ai` | 第六步分频后的低频 AI 控制值 |
 | `weight` | 第六步按井震匹配质量等因素计算的控制点权重 |
 
-`inline_float`、`xline_float`、`twt_s` 是规范坐标。第六步输出的是点级低频控制事实，不按单井、层段或顺层切片聚合；第七步 LFM 根据自己的 `modeling.n_slices` 决定如何分配切片、聚合重复控制点和插值建模。`flat_idx` / `sample_index` 作为派生字段写出，便于 QC 和调试，但它们依赖当前地震几何与采样轴，不能作为跨步骤主键。
+`inline_float`、`xline_float`、`twt_s` 是规范坐标。第六步输出的是点级低频控制事实，不按单井、层段或顺层切片聚合；第七步 LFM 根据自己的 `modeling.n_slices` 决定如何分配切片、聚合重复控制点和插值建模。`flat_idx` / `seismic_sample_index` 作为派生字段写出，便于 QC 和调试，但它们依赖当前地震几何与全局采样轴，不能作为跨步骤主键。
 
 ### `frequency_split_diagnostics.csv` — 诊断
 
@@ -278,11 +280,11 @@
 
 ### `well_anchor_conflicts.csv` — 诊断（可选）
 
-只有 GINN 低频 anchor 中存在同一 `(flat_idx, sample_index)` 上多条井约束时才写出，记录被聚合前的差异。**仅供人工审阅**。
+只有 GINN 低频 anchor 中存在同一 `(flat_idx, seismic_sample_index)` 上多条井约束时才写出，记录被聚合前的差异。**仅供人工审阅**。
 
 | 关键字段 | 含义 |
 |----------|------|
-| `flat_idx` / `sample_index` | 发生冲突的地震道和采样点 |
+| `flat_idx` / `seismic_sample_index` | 发生冲突的地震道和全局采样点 |
 | `n_points` | 冲突点数量 |
 | `well_names` / `sources` | 参与冲突的井和空间来源 |
 | `min_value` / `max_value` / `range_value` | 被审计目标值的范围 |
@@ -291,7 +293,7 @@
 
 ### `well_high_supervision_conflicts.csv` — 诊断（可选）
 
-只有 enhance 高频监督点中存在同一 `(flat_idx, sample_index)` 上多条井约束时才写出。字段与 `well_anchor_conflicts.csv` 一致，但审计目标值为 `well_high_log_ai`。**仅供人工审阅**。
+只有 enhance 高频监督点中存在同一 `(flat_idx, seismic_sample_index)` 上多条井约束时才写出。字段与 `well_anchor_conflicts.csv` 一致，但审计目标值为 `well_high_log_ai`。**仅供人工审阅**。
 
 ### `well_high_stats_by_layer.csv` — 诊断 / enhance 输入
 

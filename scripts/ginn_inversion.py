@@ -41,6 +41,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cup.seismic.geometry import validate_sample_indices
 from cup.seismic.survey import open_survey
 from cup.seismic.viz import (
     impedance_qc_metrics,
@@ -399,6 +400,40 @@ def _point_table_for_anchor(anchor_name: str, flat_idx: int, point_df: pd.DataFr
     return out
 
 
+def _full_band_well_ai_on_axis(point_group: pd.DataFrame, samples: np.ndarray) -> np.ndarray:
+    """Place full-band well AI by canonical TWT, validating the derived CSV index."""
+    sample_axis = np.asarray(samples, dtype=np.float64).reshape(-1)
+    full_values = np.full(sample_axis.size, np.nan, dtype=np.float64)
+    if point_group.empty:
+        return full_values
+
+    required = {"twt_s", "seismic_sample_index", "ai_full"}
+    missing = required - set(point_group.columns)
+    if missing:
+        raise ValueError(f"Anchor point table is missing required columns: {sorted(missing)}")
+    sample_indices = validate_sample_indices(
+        sample_axis,
+        point_group["twt_s"].to_numpy(dtype=np.float64),
+        point_group["seismic_sample_index"].to_numpy(dtype=np.float64),
+        field_name="seismic_sample_index",
+    )
+    ai_values = point_group["ai_full"].to_numpy(dtype=np.float64)
+    weights = (
+        np.maximum(point_group["weight"].to_numpy(dtype=np.float64), 0.0)
+        if "weight" in point_group.columns
+        else np.ones(ai_values.size, dtype=np.float64)
+    )
+    for sample_idx in np.unique(sample_indices):
+        selected = (sample_indices == sample_idx) & np.isfinite(ai_values)
+        if not np.any(selected):
+            continue
+        selected_weights = weights[selected]
+        if not np.any(selected_weights > 0.0):
+            selected_weights = np.ones(selected_weights.size, dtype=np.float64)
+        full_values[int(sample_idx)] = float(np.average(ai_values[selected], weights=selected_weights))
+    return full_values
+
+
 def _reflectivity_from_ai(ai: np.ndarray) -> np.ndarray:
     values = np.asarray(ai, dtype=np.float64)
     out = np.zeros(values.shape, dtype=np.float64)
@@ -474,6 +509,8 @@ def _write_ginn_well_qc(
     n_sample = int(geometry["n_sample"])
     pred_flat = np.asarray(pred_volume, dtype=np.float32).reshape(-1, n_sample)
     samples = np.asarray(anchor.samples, dtype=np.float64)
+    if samples.size != n_sample:
+        raise ValueError(f"Anchor sample axis size {samples.size} does not match geometry n_sample={n_sample}.")
     metrics_rows: list[dict[str, Any]] = []
 
     for anchor_row, flat_idx_value in enumerate(np.asarray(anchor.flat_indices, dtype=np.int64)):
@@ -511,13 +548,8 @@ def _write_ginn_well_qc(
             observed = np.asarray(qc_data.seismic_raw, dtype=np.float64) / float(trainer.dataset.seis_rms)
             loss_mask = np.asarray(qc_data.loss_mask, dtype=bool)
 
-            full_values = np.full(n_sample, np.nan, dtype=np.float64)
             point_group = _point_table_for_anchor(anchor_name, flat_idx, point_df)
-            if not point_group.empty and {"sample_index", "ai_full"}.issubset(point_group.columns):
-                for _, row in point_group.iterrows():
-                    sample_idx = int(row["sample_index"])
-                    if 0 <= sample_idx < n_sample and np.isfinite(float(row["ai_full"])):
-                        full_values[sample_idx] = float(row["ai_full"])
+            full_values = _full_band_well_ai_on_axis(point_group, samples)
             if not np.any(np.isfinite(full_values)):
                 raise ValueError("No full-band well AI samples were found in the anchor point table.")
 

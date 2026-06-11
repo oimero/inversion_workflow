@@ -14,7 +14,7 @@ from wtie.processing import grid
 
 TRACE_SAMPLE_PLAN_COLUMNS = [
     "well_name",
-    "sample_index",
+    "trace_plan_index",
     "twt_s",
     "md_m",
     "tvdss_m",
@@ -80,7 +80,7 @@ class TraceSamplePlan:
 
     def subset(self, sample_slice: slice) -> "TraceSamplePlan":
         rows = self.rows.iloc[sample_slice].reset_index(drop=True).copy()
-        rows["sample_index"] = np.arange(len(rows), dtype=np.int64)
+        rows["trace_plan_index"] = np.arange(len(rows), dtype=np.int64)
         return TraceSamplePlan(well_name=self.well_name, rows=rows)
 
 
@@ -111,7 +111,7 @@ def build_nearest_trace_sample_plan(samples: WellSpatialSampleSet, survey: Any) 
     for _, sample in samples.rows.iterrows():
         base = {
             "well_name": str(sample["well_name"]),
-            "sample_index": int(sample["sample_index"]),
+            "trace_plan_index": int(sample["trajectory_sample_index"]),
             "twt_s": float(sample["twt_s"]),
             "md_m": float(sample["md_m"]),
             "tvdss_m": float(sample["tvdss_m"]),

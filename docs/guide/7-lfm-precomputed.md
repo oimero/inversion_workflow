@@ -184,7 +184,7 @@ lfm_precomputed:
 | `inline_float` / `xline_float` | 投影到工区后的浮点线号 |
 | `zone_name` / `u_in_zone` | 所属层段和层内比例位置（0 到 1） |
 | `ai` / `weight` | 第六步分频后的低频 AI 控制值及权重 |
-| `flat_idx` / `sample_index` | 派生字段，仅供调试；依赖地震几何 |
+| `flat_idx` / `seismic_sample_index` | 派生字段，仅供调试和交叉校验；依赖地震几何与全局采样轴 |
 
 ---
 

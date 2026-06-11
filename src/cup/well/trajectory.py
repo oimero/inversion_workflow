@@ -31,7 +31,7 @@ from wtie.processing import grid
 
 SPATIAL_SAMPLE_COLUMNS = [
     "well_name",
-    "sample_index",
+    "trajectory_sample_index",
     "twt_s",
     "md_m",
     "tvd_kb_m",
@@ -328,7 +328,7 @@ def sample_trajectory_on_twt(
         rows.append(
             {
                 "well_name": trajectory.well_name,
-                "sample_index": index,
+                "trajectory_sample_index": index,
                 "twt_s": float(twt_s),
                 "md_m": float(position["md_m"]),
                 "tvd_kb_m": float(position["tvd_kb_m"]),
@@ -385,4 +385,3 @@ def trajectory_summary(trajectory: WellTrajectory) -> Mapping[str, float | int |
         "max_incl_deg": finite_max(trajectory.incl_deg),
         "max_dls": finite_max(trajectory.dls),
     }
-

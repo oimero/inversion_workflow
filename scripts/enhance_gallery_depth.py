@@ -212,7 +212,7 @@ def sample_record(sample: dict[str, Any], index: int, image_path: Path | None) -
     synthetic_abs_p99 = abs_percentile(synthetic, 99.0)
     residual_rms = rms(residual)
     return {
-        "sample_index": index,
+        "gallery_example_index": index,
         "real_rms": real_rms,
         "synthetic_rms": synthetic_rms,
         "synthetic_raw_rms": rms(synthetic_raw),
@@ -384,7 +384,7 @@ def plot_overview_page(
 
         for col in range(3):
             shade_mask(axes[row, col], depth, delta_mask)
-        axes[row, 0].set_ylabel(f"#{record['sample_index']:03d}", fontsize=7)
+        axes[row, 0].set_ylabel(f"#{record['gallery_example_index']:03d}", fontsize=7)
         for col in range(4):
             axes[row, col].grid(True, alpha=0.20)
             axes[row, col].tick_params(labelsize=7)
@@ -466,9 +466,9 @@ def write_index_html(path: Path, records: list[dict[str, Any]], overview_paths: 
     for record in records:
         image = html.escape(record["image"])
         link = (
-            f'<a href="{image}">sample {int(record["sample_index"]):03d}</a>'
+            f'<a href="{image}">sample {int(record["gallery_example_index"]):03d}</a>'
             if image
-            else f"sample {int(record['sample_index']):03d}"
+            else f"sample {int(record['gallery_example_index']):03d}"
         )
         rows.append(
             "<tr>"

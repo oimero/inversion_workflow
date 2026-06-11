@@ -174,7 +174,7 @@ def _trajectory_point_qc(trajectory: WellTrajectory, *, survey: Any | None, geom
         rows.append(
             {
                 "well_name": trajectory.well_name,
-                "sample_index": index,
+                "trajectory_point_index": index,
                 "md_m": float(trajectory.md_m[index]),
                 "tvd_kb_m": float(trajectory.tvd_kb_m[index]),
                 "tvdss_m": float(trajectory.tvdss_m[index]),
@@ -236,7 +236,7 @@ FAILED_COLUMNS = ["well_name", "trajectory_file", "trajectory_status", "qc_flags
 
 TRAJECTORY_POINT_COLUMNS = [
     "well_name",
-    "sample_index",
+    "trajectory_point_index",
     "md_m",
     "tvd_kb_m",
     "tvdss_m",

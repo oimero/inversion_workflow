@@ -134,6 +134,64 @@ class SampleAxis:
         return idx_start, idx_end
 
 
+def nearest_sample_indices(sample_axis: np.ndarray, sample_values: np.ndarray) -> np.ndarray:
+    """Map physical sample coordinates to nearest indices on one explicit axis."""
+    axis = np.asarray(sample_axis, dtype=np.float64).reshape(-1)
+    values = np.asarray(sample_values, dtype=np.float64).reshape(-1)
+    if axis.size == 0 or np.any(~np.isfinite(axis)) or np.any(np.diff(axis) <= 0.0):
+        raise ValueError("sample_axis must be a finite, strictly increasing 1D array.")
+    if np.any(~np.isfinite(values)):
+        raise ValueError("sample_values must contain only finite coordinates.")
+
+    right = np.searchsorted(axis, values, side="left")
+    right = np.clip(right, 0, axis.size - 1)
+    left = np.maximum(right - 1, 0)
+    choose_left = np.abs(axis[left] - values) < np.abs(axis[right] - values)
+    return np.where(choose_left, left, right).astype(np.int64)
+
+
+def validate_sample_indices(
+    sample_axis: np.ndarray,
+    sample_values: np.ndarray,
+    sample_indices: np.ndarray,
+    *,
+    field_name: str,
+    max_index_delta: int = 1,
+) -> np.ndarray:
+    """Validate a derived index column against its physical sample coordinates."""
+    expected = nearest_sample_indices(sample_axis, sample_values)
+    actual_float = np.asarray(sample_indices, dtype=np.float64).reshape(-1)
+    if actual_float.size != expected.size:
+        raise ValueError(
+            f"{field_name} size {actual_float.size} does not match sample coordinate size {expected.size}."
+        )
+    if np.any(~np.isfinite(actual_float)) or np.any(np.abs(actual_float - np.round(actual_float)) > 1e-6):
+        raise ValueError(f"{field_name} must contain only finite integer values.")
+
+    actual = np.round(actual_float).astype(np.int64)
+    if np.any((actual < 0) | (actual >= np.asarray(sample_axis).size)):
+        raise ValueError(f"{field_name} contains indices outside the current sample axis.")
+    mismatch = np.abs(actual - expected) > int(max_index_delta)
+    if np.any(mismatch):
+        examples = [
+            {
+                "sample_value": float(value),
+                "csv_index": int(csv_index),
+                "expected_index": int(expected_index),
+            }
+            for value, csv_index, expected_index in zip(
+                np.asarray(sample_values, dtype=np.float64).reshape(-1)[mismatch][:5],
+                actual[mismatch][:5],
+                expected[mismatch][:5],
+            )
+        ]
+        raise ValueError(
+            f"{field_name} does not match the current sample axis for {int(np.count_nonzero(mismatch))} rows. "
+            f"Examples: {examples}"
+        )
+    return expected
+
+
 def _point_segment_distance_m(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
     segment = end - start
     denom = float(np.dot(segment, segment))

@@ -97,4 +97,7 @@ trace =
 | inline / xline | 线号（整数或浮点） | 地震工区网格坐标，非 XY 米制 |
 | X / Y | m | 工区投影平面坐标 |
 | `flat_idx` | 整数 | 地震体内部一维道编号，依赖当前几何 |
-| `sample_index` | 整数 | 地震体内部采样点索引，依赖当前采样轴 |
+| `seismic_sample_index` | 整数 | 地震体全局采样轴上的派生索引，依赖当前采样轴；体采样仍以 TWT/TVDSS 等规范坐标重新计算并交叉校验 |
+| `trajectory_point_index` | 整数 | 原始井轨迹点在轨迹文件内的局部序号 |
+| `trajectory_sample_index` | 整数 | 井轨迹在传入 TWT 轴上重采样后的局部序号 |
+| `trace_plan_index` | 整数 | 当前 trace plan 内的局部行号；裁剪后重新从 0 编号，绝不是地震全局样点索引 |

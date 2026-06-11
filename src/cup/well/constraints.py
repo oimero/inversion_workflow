@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from cup.seismic.geometry import nearest_sample_indices, validate_sample_indices
 from cup.utils.io import to_json_compatible
 
 
@@ -44,7 +45,7 @@ POINT_COLUMNS = [
     "inline_index",
     "xline_index",
     "flat_idx",
-    "sample_index",
+    "seismic_sample_index",
     "zone_name",
     "u_in_zone",
     "ai_full",
@@ -59,7 +60,7 @@ POINT_COLUMNS = [
 
 CONFLICT_COLUMNS = [
     "flat_idx",
-    "sample_index",
+    "seismic_sample_index",
     "n_points",
     "well_names",
     "sources",
@@ -423,7 +424,7 @@ def build_vertical_point_facts(
     rows: list[dict[str, Any]] = []
     attempted = 0
     zone_errors = 0
-    for sample_index, (twt_s, ai, md_m) in enumerate(zip(samples, ai_at_samples, md_at_samples)):
+    for seismic_sample_index, (twt_s, ai, md_m) in enumerate(zip(samples, ai_at_samples, md_at_samples)):
         if not np.isfinite(ai) or ai <= 0.0 or not np.isfinite(md_m):
             continue
         attempted += 1
@@ -446,7 +447,7 @@ def build_vertical_point_facts(
                 "y_m": float(surface_y),
                 "inline_float": float(inline_float),
                 "xline_float": float(xline_float),
-                "sample_index": int(sample_index),
+                "seismic_sample_index": int(seismic_sample_index),
                 "zone_name": zone_name,
                 "u_in_zone": float(u_in_zone),
                 "ai_full": float(ai),
@@ -530,7 +531,7 @@ def build_deviated_point_facts(
         inline_float = float(row["inline_float"])
         xline_float = float(row["xline_float"])
         twt_s = float(row["twt_s"])
-        sample_index = int(np.argmin(np.abs(sample_axis - twt_s)))
+        seismic_sample_index = int(nearest_sample_indices(sample_axis, np.asarray([twt_s]))[0])
         try:
             zone_name, u_in_zone = sample_zone(target_layer, inline_float, xline_float, twt_s)
         except Exception:
@@ -556,7 +557,7 @@ def build_deviated_point_facts(
                 "y_m": float(row["y_m"]),
                 "inline_float": inline_float,
                 "xline_float": xline_float,
-                "sample_index": sample_index,
+                "seismic_sample_index": seismic_sample_index,
                 "zone_name": zone_name,
                 "u_in_zone": float(u_in_zone),
                 "ai_full": ai,
@@ -583,14 +584,17 @@ def build_point_conflict_report(point_df: pd.DataFrame, *, value_col: str = "wel
     rows: list[dict[str, Any]] = []
     if point_df.empty:
         return pd.DataFrame(columns=CONFLICT_COLUMNS)
-    for (flat_idx, sample_index), group in point_df.groupby(["flat_idx", "sample_index"], sort=False):
+    for (flat_idx, seismic_sample_index), group in point_df.groupby(
+        ["flat_idx", "seismic_sample_index"],
+        sort=False,
+    ):
         if len(group) <= 1:
             continue
         values = group[value_col].to_numpy(dtype=float)
         rows.append(
             {
                 "flat_idx": int(flat_idx),
-                "sample_index": int(sample_index),
+                "seismic_sample_index": int(seismic_sample_index),
                 "n_points": int(len(group)),
                 "well_names": ";".join(sorted(group["well_name"].astype(str).unique())),
                 "sources": ";".join(sorted(group["source"].astype(str).unique())),
@@ -649,6 +653,12 @@ def aggregate_trace_arrays(
             empty[col] = np.zeros((0, n_sample), dtype=np.float32)
         return empty, pd.DataFrame()
 
+    frame["_seismic_sample_index_used"] = validate_sample_indices(
+        samples,
+        frame["twt_s"].to_numpy(dtype=np.float64),
+        frame["seismic_sample_index"].to_numpy(dtype=np.float64),
+        field_name="seismic_sample_index",
+    )
     flat_indices = np.array(sorted(frame["flat_idx"].dropna().astype(int).unique()), dtype=np.int64)
     flat_to_row = {int(flat): idx for idx, flat in enumerate(flat_indices)}
     arrays: dict[str, np.ndarray] = {
@@ -664,8 +674,8 @@ def aggregate_trace_arrays(
     summary_rows: list[dict[str, Any]] = []
     for flat_idx, flat_group in frame.groupby("flat_idx", sort=True):
         row_idx = flat_to_row[int(flat_idx)]
-        for sample_index, sample_group in flat_group.groupby("sample_index", sort=False):
-            sample_idx = int(sample_index)
+        for seismic_sample_index, sample_group in flat_group.groupby("_seismic_sample_index_used", sort=False):
+            sample_idx = int(seismic_sample_index)
             if not 0 <= sample_idx < n_sample:
                 continue
             weight = np.maximum(sample_group["weight"].to_numpy(dtype=float), 0.0)

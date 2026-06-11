@@ -755,7 +755,7 @@ def _make_lfm_control_table(point_df: pd.DataFrame) -> pd.DataFrame:
         "inline_index",
         "xline_index",
         "flat_idx",
-        "sample_index",
+        "seismic_sample_index",
         "zone_name",
         "u_in_zone",
         "weight",

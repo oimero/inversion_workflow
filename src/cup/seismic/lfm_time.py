@@ -140,7 +140,6 @@ class LfmTimeControlPoint:
     weight: float = 1.0
     source: str = ""
     flat_idx: Optional[int] = None
-    sample_index: Optional[int] = None
     metadata: Optional[Dict[str, Any]] = None
 
 

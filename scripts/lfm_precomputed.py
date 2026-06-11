@@ -38,6 +38,7 @@ from cup.utils.io import (
     to_json_compatible,
     write_json,
 )
+from cup.seismic.geometry import nearest_sample_indices, validate_sample_indices
 from cup.seismic.viz import (
     impedance_qc_metrics,
     plot_well_waveform_qc,
@@ -213,7 +214,6 @@ def _to_control_points(rows: pd.DataFrame) -> list[Any]:
                 weight=float(row.get("weight", 1.0)),
                 source=str(row.get("source", "")),
                 flat_idx=None if pd.isna(row.get("flat_idx")) else int(row.get("flat_idx")),
-                sample_index=None if pd.isna(row.get("sample_index")) else int(row.get("sample_index")),
             )
         )
     return points
@@ -292,14 +292,6 @@ def _reflectivity_from_ai(ai: np.ndarray) -> np.ndarray:
     lower = values[1:][pair_valid]
     out[np.flatnonzero(pair_valid) + 1] = (lower - upper) / np.maximum(lower + upper, 1e-12)
     return out
-
-
-def _nearest_sample_indices(sample_axis: np.ndarray, twt_s: np.ndarray) -> np.ndarray:
-    right = np.searchsorted(sample_axis, twt_s, side="left")
-    right = np.clip(right, 0, sample_axis.size - 1)
-    left = np.maximum(right - 1, 0)
-    choose_left = np.abs(sample_axis[left] - twt_s) < np.abs(sample_axis[right] - twt_s)
-    return np.where(choose_left, left, right).astype(np.int64)
 
 
 def _resolve_lfm_qc_sources(constraints_summary: dict[str, Any]) -> tuple[Path, Path, pd.DataFrame]:
@@ -401,19 +393,19 @@ def _write_lfm_well_qc(
     figure_dir.mkdir(parents=True, exist_ok=True)
 
     qc_df = control_df.copy()
-    if "sample_index" in qc_df.columns:
-        qc_df["input_sample_index"] = qc_df["sample_index"]
     sample_axis = np.asarray(result.samples, dtype=np.float64)
-    qc_df["sample_index_used"] = _nearest_sample_indices(
+    qc_df["seismic_sample_index_used"] = validate_sample_indices(
         sample_axis,
         qc_df["twt_s"].to_numpy(dtype=np.float64),
+        qc_df["seismic_sample_index"].to_numpy(dtype=np.float64),
+        field_name="seismic_sample_index",
     )
     qc_df["ai_lfm_sampled"] = sample_volume_at_points(
         result.volume,
         result.geometry,
         qc_df["inline_float"].to_numpy(dtype=np.float64),
         qc_df["xline_float"].to_numpy(dtype=np.float64),
-        qc_df["sample_index_used"].to_numpy(dtype=np.int64),
+        qc_df["seismic_sample_index_used"].to_numpy(dtype=np.int64),
     )
     qc_df["diff_ai_lfm_minus_control"] = qc_df["ai_lfm_sampled"].to_numpy(dtype=np.float64) - qc_df["ai"].to_numpy(dtype=np.float64)
 
@@ -446,7 +438,7 @@ def _write_lfm_well_qc(
         }
 
     for well_name, group in qc_df.groupby("well_name", sort=True):
-        group = group.sort_values(["twt_s", "md_m", "sample_index"]).reset_index(drop=True)
+        group = group.sort_values(["twt_s", "md_m", "seismic_sample_index"]).reset_index(drop=True)
         safe = sanitize_filename(str(well_name))
         trace_path = trace_dir / f"well_qc_{safe}.csv"
         figure_path = figure_dir / f"well_qc_{safe}.png"
@@ -490,7 +482,7 @@ def _write_lfm_well_qc(
                 twt_s=display_twt,
             )
 
-            display_indices = _nearest_sample_indices(sample_axis, display_twt)
+            display_indices = nearest_sample_indices(sample_axis, display_twt)
             lfm_ai_values = sample_volume_at_points(
                 result.volume,
                 result.geometry,
@@ -783,7 +775,7 @@ def _load_constraints_control_points(
         "ai",
         "weight",
         "flat_idx",
-        "sample_index",
+        "seismic_sample_index",
     }
     missing = required - set(control_df.columns)
     if missing:

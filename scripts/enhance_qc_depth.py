@@ -1122,7 +1122,7 @@ def main() -> None:
             highpass_samples=cfg.synthetic_residual_highpass_samples_loss,
             forward_model=forward_model,
         )
-        row["sample_index"] = idx
+        row["synthetic_example_index"] = idx
         rows.append(row)
         if (idx + 1) % max(1, args.num_samples // 10) == 0:
             LOGGER.info("Sampled %d/%d", idx + 1, args.num_samples)

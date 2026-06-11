@@ -304,7 +304,7 @@ def _prepare_from_rows(
     table = grid.TimeDepthTable(twt=rows["twt_s"].to_numpy(dtype=np.float64), md=rows["md_m"].to_numpy(dtype=np.float64))
     md_min = float(np.interp(float(rows["twt_s"].iloc[0]), table.twt, table.md))
     md_max = float(np.interp(float(rows["twt_s"].iloc[-1]), table.twt, table.md))
-    cropped_logset = crop_logset_md(logset_md, md_min, md_max, min_samples=min_tie_samples)
+    cropped_logset = crop_logset_md(logset_md, md_min, md_max, min_samples=2)
     report.update(
         {
             "target_top_name": window.top_name,

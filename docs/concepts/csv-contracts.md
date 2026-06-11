@@ -125,6 +125,12 @@
 | `filtered_las_file` | 第四步用最优滤波参数导出的 LAS，固定包含重新计算的 `DT_USM`、`RHO_GCC`、`AI`；第五步仍以基础曲线构造自己的 `LogSet` |
 | `seismic_trace_file` | 第四步保存的井旁或轨迹地震道 |
 | `optimized_trace_sample_plan_file` | 斜井细标定后按 optimized TDT 重新生成的样点级落道计划；直井为空 |
+| `joint_observed_fraction` | 原目标窗内 DT/RHO 原始联合观测比例 |
+| `short_gap_filled_samples` / `long_gap_count` / `longest_long_gap_s` | `10 ms` 缺口规则的 QC |
+| `continuous_tie_window_start_s` / `continuous_tie_window_end_s` | 实际用于 auto-tie 的最长连续联合有效段 |
+| `continuous_tie_sample_count` | 该连续段按地震时间采样间隔计算的样点数，用于 `min_tie_samples` 判据 |
+| `continuous_tie_log_sample_count` | 同一连续段在原始 MD 井曲线轴上的样点数，仅作 QC |
+| `tie_window_clipped_for_log_gap` | 标定窗是否因长缺口被裁剪 |
 
 `optimized_trace_sample_plan_file` 指向的 CSV 使用 `trace_plan_index` 表示当前计划内从 0 开始的局部行号。它在裁剪或重建计划后会重新编号，不能解释为地震体全局样点索引；下游必须使用同一行的 `twt_s`、`inline_float`、`xline_float`。
 
@@ -201,9 +207,14 @@
 | `inline_float` / `xline_float` | 投影到工区后的浮点线号 |
 | `flat_idx` / `seismic_sample_index` | 依赖当前地震几何和全局采样轴的派生索引，仅用于 bundle 构建和 QC |
 | `zone_name` / `u_in_zone` | 所属层段和层内比例位置 |
-| `ai_full` / `log_ai_full` | 井上全频 AI 与 log-AI |
-| `well_low_ai` / `well_low_log_ai` | 第六步分频后的低频井曲线 |
-| `well_high_log_ai` | 全频 log-AI 减低频 log-AI 后的高频 residual |
+| `reference_ai` / `reference_log_ai` | 轻量清洗并低通到 `f_reference` 的参考井曲线 |
+| `lfm_ai` / `lfm_log_ai` | 低通到 `f_lfm` 的 LFM 控制 |
+| `ginn_target_ai` / `ginn_target_log_ai` | 低通到 `f_ginn` 的 GINN 井 anchor 目标 |
+| `ginn_band_log_ai` | `ginn_target_log_ai - lfm_log_ai` |
+| `enhance_residual_log_ai` | `reference_log_ai - ginn_target_log_ai` |
+| `observed_well_sample` | 是否为可进入监督、统计和控制点的真实井样点 |
+| `short_gap_interpolated` / `hampel_conditioned` | 是否仅作为滤波支撑的插值或异常替换样点 |
+| `frequency_band_valid` | 三条低通曲线在该点是否都有效 |
 | `weight` | 由第五步批量合成质量等因素得到的约束权重 |
 
 `inline_float`、`xline_float`、`twt_s` 是空间事实的规范坐标；`flat_idx` / `seismic_sample_index` 只能在同一地震几何和全局采样轴内解释。任何体采样入口必须由 `twt_s` 在当前采样轴上重新求最近索引，并用 `seismic_sample_index` 做交叉校验，不能直接信任派生索引。
@@ -226,8 +237,8 @@
 | `invalid_point_count` / `invalid_point_fraction` | 无效样点数及比例 |
 | `unique_trace_count` | 样点覆盖的唯一道数；斜井应大于 1 |
 | `reasons` | 分号分隔的拒绝或失败原因 |
-| `frequency_split_qc_trace_path` | 分频前后曲线数值文件路径 |
-| `frequency_split_qc_figure_path` | 分频 QC 图路径 |
+| `frequency_band_qc_trace_path` | reference/LFM/GINN/enhance 三频带数值文件路径 |
+| `frequency_band_qc_figure_path` | 三频带 QC 图路径 |
 
 ### `lfm_control_points.csv` — 核心契约
 
@@ -247,14 +258,14 @@
 
 `inline_float`、`xline_float`、`twt_s` 是规范坐标。第六步输出的是点级低频控制事实，不按单井、层段或顺层切片聚合；第七步 LFM 根据自己的 `modeling.n_slices` 决定如何分配切片、聚合重复控制点和插值建模。`flat_idx` / `seismic_sample_index` 作为派生字段写出，便于 QC 和调试，但它们依赖当前地震几何与全局采样轴，不能作为跨步骤主键。
 
-### `frequency_split_diagnostics.csv` — 诊断
+### `ginn_cutoff_diagnostics.csv` — 诊断
 
 分频诊断时每口井、每个候选截止频率一行。脚本用该 cutoff 下的低通井 AI 正演合成记录，并与第四步保存的井旁地震道比较。**仅供人工审阅**，不被任何下游脚本自动读取。
 
 | 关键字段 | 含义 |
 |----------|------|
 | `well_name` / `route` | 参与诊断的井和第四步标定路径 |
-| `cutoff_hz` | 候选截止频率 |
+| `cutoff_hz` | 候选 GINN 截止频率 |
 | `status` | ok / failed / manual |
 | `corr` | 低通 AI 正演合成记录与井旁地震道的相关系数 |
 | `nmae` | 低通 AI 正演合成记录与井旁地震道的归一化绝对误差 |
@@ -263,9 +274,9 @@
 | `wavelet_file` | 第五步最终全局子波路径 |
 | `reason` | 失败原因，仅 failed 行有值 |
 
-### `frequency_split_aggregate.csv` — 诊断
+### `ginn_cutoff_cluster_aggregate.csv` / `ginn_cutoff_aggregate.csv` — 诊断
 
-分频诊断的多井聚合表，每个候选截止频率一行。**仅供人工审阅**，不被任何下游脚本自动读取。
+前者先在空间簇内取井指标中位数；后者再跨空间簇取中位数，避免密井平台按井数重复投票。**仅供人工审阅**。
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -293,7 +304,7 @@
 
 ### `well_high_supervision_conflicts.csv` — 诊断（可选）
 
-只有 enhance 高频监督点中存在同一 `(flat_idx, seismic_sample_index)` 上多条井约束时才写出。字段与 `well_anchor_conflicts.csv` 一致，但审计目标值为 `well_high_log_ai`。**仅供人工审阅**。
+只有 enhance 监督点中存在同一 `(flat_idx, seismic_sample_index)` 上多条井约束时才写出。字段与 `well_anchor_conflicts.csv` 一致，但审计目标值为 `enhance_residual_log_ai`。**仅供人工审阅**。
 
 ### `well_high_stats_by_layer.csv` — 诊断 / enhance 输入
 
@@ -321,8 +332,8 @@
 ```
 第六步 well_constraints.py
   ├─ lfm_control_points.csv         → 第七步 lfm_precomputed.py（点级 AI 控制）
-  ├─ log_ai_anchor_time.npz         → 第八步 ginn_train.py（井约束损失）
-  ├─ well_high_supervision_time.npz → enhance 训练（真实井高频监督，默认只含直井）
+  ├─ log_ai_anchor_time.npz         → 第八步 ginn_train.py（ginn_target_log_ai 井约束）
+  ├─ well_high_supervision_time.npz → enhance 训练（enhance_residual_log_ai，schema v2）
   └─ well_high_stats_*.json/csv     → enhance 合成器（统计驱动生成，默认只含直井）
 ```
 

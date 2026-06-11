@@ -400,14 +400,19 @@ def _point_table_for_anchor(anchor_name: str, flat_idx: int, point_df: pd.DataFr
     return out
 
 
-def _full_band_well_ai_on_axis(point_group: pd.DataFrame, samples: np.ndarray) -> np.ndarray:
-    """Place full-band well AI by canonical TWT, validating the derived CSV index."""
+def _well_ai_on_axis(
+    point_group: pd.DataFrame,
+    samples: np.ndarray,
+    *,
+    value_column: str,
+) -> np.ndarray:
+    """Place one well-AI field by canonical TWT, validating the derived CSV index."""
     sample_axis = np.asarray(samples, dtype=np.float64).reshape(-1)
-    full_values = np.full(sample_axis.size, np.nan, dtype=np.float64)
+    values_on_axis = np.full(sample_axis.size, np.nan, dtype=np.float64)
     if point_group.empty:
-        return full_values
+        return values_on_axis
 
-    required = {"twt_s", "seismic_sample_index", "ai_full"}
+    required = {"twt_s", "seismic_sample_index", value_column}
     missing = required - set(point_group.columns)
     if missing:
         raise ValueError(f"Anchor point table is missing required columns: {sorted(missing)}")
@@ -417,7 +422,7 @@ def _full_band_well_ai_on_axis(point_group: pd.DataFrame, samples: np.ndarray) -
         point_group["seismic_sample_index"].to_numpy(dtype=np.float64),
         field_name="seismic_sample_index",
     )
-    ai_values = point_group["ai_full"].to_numpy(dtype=np.float64)
+    ai_values = point_group[value_column].to_numpy(dtype=np.float64)
     weights = (
         np.maximum(point_group["weight"].to_numpy(dtype=np.float64), 0.0)
         if "weight" in point_group.columns
@@ -430,8 +435,8 @@ def _full_band_well_ai_on_axis(point_group: pd.DataFrame, samples: np.ndarray) -
         selected_weights = weights[selected]
         if not np.any(selected_weights > 0.0):
             selected_weights = np.ones(selected_weights.size, dtype=np.float64)
-        full_values[int(sample_idx)] = float(np.average(ai_values[selected], weights=selected_weights))
-    return full_values
+        values_on_axis[int(sample_idx)] = float(np.average(ai_values[selected], weights=selected_weights))
+    return values_on_axis
 
 
 def _reflectivity_from_ai(ai: np.ndarray) -> np.ndarray:
@@ -541,7 +546,7 @@ def _write_ginn_well_qc(
             if flat_idx < 0 or flat_idx >= pred_flat.shape[0]:
                 raise IndexError("flat_idx_out_of_range")
 
-            low_values = np.asarray(anchor.target_ai[anchor_row], dtype=np.float64)
+            target_values = np.asarray(anchor.target_ai[anchor_row], dtype=np.float64)
             pred_values = np.asarray(pred_flat[flat_idx], dtype=np.float64)
             anchor_mask = np.asarray(anchor.anchor_mask[anchor_row], dtype=bool)
             qc_data = trainer.dataset.trace_qc_data(flat_idx)
@@ -549,9 +554,9 @@ def _write_ginn_well_qc(
             loss_mask = np.asarray(qc_data.loss_mask, dtype=bool)
 
             point_group = _point_table_for_anchor(anchor_name, flat_idx, point_df)
-            full_values = _full_band_well_ai_on_axis(point_group, samples)
-            if not np.any(np.isfinite(full_values)):
-                raise ValueError("No full-band well AI samples were found in the anchor point table.")
+            lfm_values = _well_ai_on_axis(point_group, samples, value_column="lfm_ai")
+            if not np.any(np.isfinite(lfm_values)):
+                raise ValueError("No LFM well AI samples were found in the anchor point table.")
 
             synthetic = _forward_ginn_qc_trace(
                 trainer,
@@ -562,7 +567,8 @@ def _write_ginn_well_qc(
             metric_mask = (
                 anchor_mask
                 & loss_mask
-                & np.isfinite(low_values)
+                & np.isfinite(target_values)
+                & np.isfinite(lfm_values)
                 & np.isfinite(pred_values)
                 & np.isfinite(observed)
                 & np.isfinite(synthetic)
@@ -577,8 +583,8 @@ def _write_ginn_well_qc(
             display_observed = observed[display_slice]
             display_synthetic = synthetic[display_slice]
             display_pred = pred_values[display_slice]
-            display_low = low_values[display_slice]
-            display_full = full_values[display_slice]
+            display_lfm = lfm_values[display_slice]
+            display_target = target_values[display_slice]
             display_reflectivity = reflectivity[display_slice]
 
             observed_trace = grid.Seismic(
@@ -600,8 +606,8 @@ def _write_ginn_well_qc(
             )
             xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
             dxcorr = dynamic_normalized_xcorr(observed_trace, synthetic_trace)
-            low_trace = grid.Log(display_low, display_twt, "twt", name="Low-frequency well AI")
-            full_trace = grid.Log(display_full, display_twt, "twt", name="Full-band well AI")
+            lfm_trace = grid.Log(display_lfm, display_twt, "twt", name="LFM well AI")
+            target_trace = grid.Log(display_target, display_twt, "twt", name="GINN target well AI")
             pred_trace = grid.Log(display_pred, display_twt, "twt", name="GINN predicted AI")
             reflectivity_trace = grid.Reflectivity(
                 display_reflectivity,
@@ -613,8 +619,8 @@ def _write_ginn_well_qc(
             trace_df = pd.DataFrame(
                 {
                     "twt_s": samples,
-                    "well_full_ai": full_values,
-                    "well_low_ai": low_values,
+                    "well_lfm_ai": lfm_values,
+                    "well_ginn_target_ai": target_values,
                     "ginn_predicted_ai": pred_values,
                     "reflectivity_ginn": reflectivity,
                     "seismic_raw": np.asarray(qc_data.seismic_raw, dtype=np.float64),
@@ -635,7 +641,7 @@ def _write_ginn_well_qc(
 
             waveform_metrics = waveform_qc_metrics(observed, synthetic, metric_mask)
             fig, _axes = plot_well_waveform_qc(
-                [full_trace, low_trace, pred_trace],
+                [target_trace, lfm_trace, pred_trace],
                 reflectivity_trace,
                 synthetic_trace,
                 observed_trace,
@@ -650,9 +656,19 @@ def _write_ginn_well_qc(
             fig.savefig(figure_path, dpi=180, bbox_inches="tight")
             plt.close(fig)
 
-            low_metric_trace = grid.Log(low_values, samples, "twt", name="Low-frequency well AI")
-            full_metric_trace = grid.Log(full_values, samples, "twt", name="Full-band well AI")
+            lfm_metric_trace = grid.Log(lfm_values, samples, "twt", name="LFM well AI")
+            target_metric_trace = grid.Log(target_values, samples, "twt", name="GINN target well AI")
             pred_metric_trace = grid.Log(pred_values, samples, "twt", name="GINN predicted AI")
+            impedance_metrics = impedance_qc_metrics(
+                model_ai=pred_metric_trace,
+                low_ai=lfm_metric_trace,
+                full_ai=target_metric_trace,
+                mask=metric_mask,
+            )
+            impedance_metrics = {
+                key.replace("vs_low_", "vs_lfm_").replace("vs_full_", "vs_ginn_target_"): value
+                for key, value in impedance_metrics.items()
+            }
             metrics_rows.append(
                 {
                     **base_row,
@@ -661,12 +677,7 @@ def _write_ginn_well_qc(
                     "figure": repo_relative_path(figure_path, root=REPO_ROOT),
                     "seismic_rms": float(trainer.dataset.seis_rms),
                     "xcorr_lag_s": float(xcorr.lag),
-                    **impedance_qc_metrics(
-                        model_ai=pred_metric_trace,
-                        low_ai=low_metric_trace,
-                        full_ai=full_metric_trace,
-                        mask=metric_mask,
-                    ),
+                    **impedance_metrics,
                     **{f"waveform_{key}": value for key, value in waveform_metrics.items()},
                 }
             )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from cup.utils.masks import true_runs
 from ginn_depth.prior import (
     WellResolutionPriorBundle,
     edge_taper,
@@ -13,7 +14,6 @@ from ginn_depth.prior import (
     random_reflectivity,
     random_reflectivity_in_taper,
     reflectivity_to_log_ai,
-    true_runs,
 )
 
 __all__ = [
@@ -30,7 +30,6 @@ __all__ = [
     "reflectivity_to_log_ai",
     "sample_highres_prior_patch",
     "summary_or_percentile",
-    "true_runs",
     "valid_prior_rows",
 ]
 

@@ -9,7 +9,6 @@ coordinates and positive TWT seconds.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -17,16 +16,7 @@ import pandas as pd
 
 from cup.seismic.geometry import nearest_sample_indices, validate_sample_indices
 from cup.utils.io import to_json_compatible
-
-
-@dataclass(frozen=True)
-class FrequencySplitConfig:
-    """Resolved frequency split configuration for time-domain log-AI."""
-
-    cutoff_hz: float
-    filter_order: int = 6
-    buffer_seconds: float | None = None
-    buffer_mode: str = "reflect"
+from cup.well.frequency_bands import WellFrequencyBands
 
 
 POINT_COLUMNS = [
@@ -48,11 +38,18 @@ POINT_COLUMNS = [
     "seismic_sample_index",
     "zone_name",
     "u_in_zone",
-    "ai_full",
-    "log_ai_full",
-    "well_low_ai",
-    "well_low_log_ai",
-    "well_high_log_ai",
+    "reference_ai",
+    "reference_log_ai",
+    "lfm_ai",
+    "lfm_log_ai",
+    "ginn_target_ai",
+    "ginn_target_log_ai",
+    "ginn_band_log_ai",
+    "enhance_residual_log_ai",
+    "observed_well_sample",
+    "short_gap_interpolated",
+    "hampel_conditioned",
+    "frequency_band_valid",
     "weight",
     "batch_corr",
     "batch_nmae",
@@ -73,34 +70,18 @@ CONFLICT_COLUMNS = [
 
 __all__ = [
     "CONFLICT_COLUMNS",
-    "FrequencySplitConfig",
     "POINT_COLUMNS",
     "aggregate_trace_arrays",
-    "apply_frequency_split",
     "build_deviated_point_facts",
     "build_point_conflict_report",
     "build_vertical_point_facts",
     "confidence_from_corr",
-    "diagnose_frequency_split",
     "high_frequency_stats",
     "layer_shrinkage_stats",
-    "lowpass_values_on_twt",
     "nearest_trace_fields",
     "robust_stats",
     "sample_zone",
-    "split_log_ai_frequency_bands",
-    "true_runs",
 ]
-
-
-def true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
-    """Return half-open runs where a 1D boolean mask is true."""
-    values = np.asarray(mask, dtype=bool).reshape(-1)
-    if values.size == 0 or not np.any(values):
-        return []
-    padded = np.concatenate(([False], values, [False]))
-    edges = np.flatnonzero(padded[1:] != padded[:-1])
-    return [(int(edges[i]), int(edges[i + 1])) for i in range(0, edges.size, 2)]
 
 
 def robust_stats(values: np.ndarray) -> dict[str, Any]:
@@ -160,208 +141,6 @@ def confidence_from_corr(
     return float(min_weight + (1.0 - min_weight) * scaled)
 
 
-def lowpass_values_on_twt(
-    twt: np.ndarray,
-    values: np.ndarray,
-    *,
-    dt_s: float,
-    cutoff_hz: float,
-    order: int,
-    buffer_seconds: float | None = None,
-    buffer_mode: str = "reflect",
-) -> np.ndarray:
-    """Low-pass a trace on an irregular TWT basis and interpolate back."""
-    from cup.seismic.lfm_time import lowpass_twt_log
-    from wtie.processing import grid
-
-    original_twt = np.asarray(twt, dtype=np.float64).reshape(-1)
-    original_values = np.asarray(values, dtype=np.float64).reshape(-1)
-    if original_twt.shape != original_values.shape:
-        raise ValueError("twt and values must have matching 1D shapes.")
-    if dt_s <= 0.0 or not np.isfinite(dt_s):
-        raise ValueError(f"dt_s must be positive and finite, got {dt_s}.")
-
-    out = np.full(original_values.shape, np.nan, dtype=np.float64)
-    finite = np.isfinite(original_twt) & np.isfinite(original_values)
-    finite_indices = np.flatnonzero(finite)
-    min_filter_samples = max(4, 3 * int(order) + 2)
-    if finite_indices.size < min_filter_samples:
-        out[finite_indices] = original_values[finite_indices]
-        return out
-
-    twt_valid = original_twt[finite_indices]
-    values_valid = original_values[finite_indices]
-    order_idx = np.argsort(twt_valid)
-    twt_valid = twt_valid[order_idx]
-    values_valid = values_valid[order_idx]
-    unique_twt, inverse = np.unique(twt_valid, return_inverse=True)
-    if unique_twt.size != twt_valid.size:
-        value_sum = np.zeros(unique_twt.size, dtype=np.float64)
-        count = np.zeros(unique_twt.size, dtype=np.float64)
-        np.add.at(value_sum, inverse, values_valid)
-        np.add.at(count, inverse, 1.0)
-        values_valid = value_sum / np.maximum(count, 1.0)
-        twt_valid = unique_twt
-    if twt_valid.size < min_filter_samples:
-        out[finite_indices] = np.interp(original_twt[finite_indices], twt_valid, values_valid)
-        return out
-
-    regular_twt = np.arange(float(twt_valid[0]), float(twt_valid[-1]) + 0.5 * dt_s, float(dt_s))
-    regular_values = np.interp(regular_twt, twt_valid, values_valid)
-    log = grid.Log(regular_values, regular_twt, "twt", name="log_AI", unit="ln(m/s*g/cm3)", allow_nan=False)
-    filtered = lowpass_twt_log(
-        log,
-        cutoff_hz=float(cutoff_hz),
-        order=int(order),
-        buffer_seconds=buffer_seconds,
-        buffer_mode=buffer_mode,
-    )
-    out[finite_indices] = np.interp(original_twt[finite_indices], filtered.basis, filtered.values)
-    return out
-
-
-def split_log_ai_frequency_bands(
-    twt_s: np.ndarray,
-    ai: np.ndarray,
-    mask: np.ndarray,
-    cfg: FrequencySplitConfig,
-) -> dict[str, np.ndarray]:
-    """Split positive AI samples into full, low-pass, and high-pass log-AI."""
-    twt = np.asarray(twt_s, dtype=np.float64).reshape(-1)
-    ai_values = np.asarray(ai, dtype=np.float64).reshape(-1)
-    valid = np.asarray(mask, dtype=bool).reshape(-1) & np.isfinite(twt) & np.isfinite(ai_values) & (ai_values > 0.0)
-    if twt.shape != ai_values.shape or twt.shape != valid.shape:
-        raise ValueError("twt_s, ai, and mask must have matching 1D shapes.")
-
-    log_ai = np.zeros(ai_values.shape, dtype=np.float32)
-    low_log_ai = np.zeros(ai_values.shape, dtype=np.float32)
-    high_log_ai = np.zeros(ai_values.shape, dtype=np.float32)
-    low_ai = np.zeros(ai_values.shape, dtype=np.float32)
-    log_ai[valid] = np.log(np.clip(ai_values[valid], 1e-6, None)).astype(np.float32)
-
-    if int(np.count_nonzero(valid)) >= 2:
-        steps = np.diff(np.sort(twt[valid]))
-        steps = steps[np.isfinite(steps) & (steps > 0.0)]
-        dt_s = float(np.median(steps)) if steps.size else np.nan
-    else:
-        dt_s = np.nan
-    if not np.isfinite(dt_s) or dt_s <= 0.0:
-        low_log_ai[valid] = log_ai[valid]
-    else:
-        low_values = lowpass_values_on_twt(
-            twt,
-            np.where(valid, log_ai, np.nan),
-            dt_s=dt_s,
-            cutoff_hz=float(cfg.cutoff_hz),
-            order=int(cfg.filter_order),
-            buffer_seconds=cfg.buffer_seconds,
-            buffer_mode=cfg.buffer_mode,
-        )
-        low_log_ai[valid] = low_values[valid].astype(np.float32)
-    high_log_ai[valid] = (log_ai[valid] - low_log_ai[valid]).astype(np.float32)
-    low_ai[valid] = np.exp(low_log_ai[valid]).astype(np.float32)
-    return {
-        "log_ai_full": log_ai,
-        "well_low_ai": low_ai,
-        "well_low_log_ai": low_log_ai,
-        "well_high_log_ai": high_log_ai,
-    }
-
-
-def diagnose_frequency_split(
-    point_df: pd.DataFrame,
-    candidate_cutoff_hz: list[float],
-    *,
-    filter_order: int,
-    buffer_seconds: float | None,
-    buffer_mode: str,
-) -> tuple[FrequencySplitConfig, pd.DataFrame]:
-    """Choose one shared cutoff from simple well-log split diagnostics."""
-    if point_df.empty:
-        raise ValueError("Cannot diagnose frequency split from an empty point table.")
-    diagnostics: list[dict[str, Any]] = []
-    for cutoff in candidate_cutoff_hz:
-        cfg = FrequencySplitConfig(
-            cutoff_hz=float(cutoff),
-            filter_order=int(filter_order),
-            buffer_seconds=buffer_seconds,
-            buffer_mode=buffer_mode,
-        )
-        split_df = apply_frequency_split(point_df, cfg)
-        valid = split_df["well_high_log_ai"].to_numpy(dtype=float)
-        full = split_df["log_ai_full"].to_numpy(dtype=float)
-        mask = np.isfinite(valid) & np.isfinite(full) & (split_df["weight"].to_numpy(dtype=float) > 0.0)
-        high_rms = float(np.sqrt(np.mean(valid[mask] ** 2))) if np.any(mask) else np.nan
-        full_std = float(np.std(full[mask])) if np.any(mask) else np.nan
-        ratio = high_rms / max(full_std, 1e-6) if np.isfinite(high_rms) and np.isfinite(full_std) else np.nan
-        roughness_values = []
-        boundary_values = []
-        for _, group in split_df.loc[mask].groupby("well_name", sort=False):
-            low = group.sort_values("twt_s")["well_low_log_ai"].to_numpy(dtype=float)
-            high = group.sort_values("twt_s")["well_high_log_ai"].to_numpy(dtype=float)
-            if low.size > 1:
-                roughness_values.append(float(np.mean(np.abs(np.diff(low)))))
-            if high.size >= 6:
-                edge = max(1, min(5, high.size // 5))
-                boundary_values.append(float(np.mean(np.abs(np.r_[high[:edge], high[-edge:]]))))
-        roughness = float(np.mean(roughness_values)) if roughness_values else np.nan
-        boundary = float(np.mean(boundary_values)) if boundary_values else np.nan
-        normalizer = max(full_std, 1e-6) if np.isfinite(full_std) else np.nan
-        roughness_norm = roughness / normalizer if np.isfinite(roughness) and np.isfinite(normalizer) else np.nan
-        boundary_norm = boundary / normalizer if np.isfinite(boundary) and np.isfinite(normalizer) else np.nan
-        ratio_penalty = 0.0 if np.isfinite(ratio) and 0.05 <= ratio <= 0.8 else 1.0
-        score = (
-            (0.0 if np.isfinite(roughness_norm) else 1.0)
-            + (roughness_norm if np.isfinite(roughness_norm) else 0.0)
-            + 0.5 * (boundary_norm if np.isfinite(boundary_norm) else 0.0)
-            + ratio_penalty
-        )
-        diagnostics.append(
-            {
-                "cutoff_hz": float(cutoff),
-                "score": float(score),
-                "high_rms": high_rms,
-                "full_std": full_std,
-                "high_to_full_std_ratio": ratio,
-                "low_log_ai_mean_abs_diff": roughness,
-                "low_log_ai_mean_abs_diff_norm": roughness_norm,
-                "edge_high_abs_mean": boundary,
-                "edge_high_abs_mean_norm": boundary_norm,
-                "valid_samples": int(np.count_nonzero(mask)),
-            }
-        )
-    diag_df = pd.DataFrame(diagnostics).sort_values(["score", "cutoff_hz"], ascending=[True, True])
-    best = float(diag_df.iloc[0]["cutoff_hz"])
-    return (
-        FrequencySplitConfig(
-            cutoff_hz=best,
-            filter_order=int(filter_order),
-            buffer_seconds=buffer_seconds,
-            buffer_mode=buffer_mode,
-        ),
-        pd.DataFrame(diagnostics),
-    )
-
-
-def apply_frequency_split(point_df: pd.DataFrame, cfg: FrequencySplitConfig) -> pd.DataFrame:
-    """Add low/high log-AI columns to a point table."""
-    out = point_df.copy()
-    for col in ("log_ai_full", "well_low_ai", "well_low_log_ai", "well_high_log_ai"):
-        if col not in out.columns:
-            out[col] = np.nan
-    for _, index in out.groupby("well_name", sort=False).groups.items():
-        group = out.loc[index].sort_values("twt_s")
-        split = split_log_ai_frequency_bands(
-            group["twt_s"].to_numpy(dtype=float),
-            group["ai_full"].to_numpy(dtype=float),
-            np.isfinite(group["ai_full"].to_numpy(dtype=float)),
-            cfg,
-        )
-        for key, values in split.items():
-            out.loc[group.index, key] = values
-    return out
-
-
 def nearest_trace_fields(survey: Any, inline_float: float, xline_float: float) -> dict[str, Any]:
     """Resolve nearest integer trace fields from floating line coordinates."""
     nearest_inline = survey.line_geometry.snap_inline(float(inline_float))
@@ -395,8 +174,8 @@ def build_vertical_point_facts(
     *,
     well_name: str,
     route: str,
-    las_file: Any,
     tdt_file: Any,
+    bands: WellFrequencyBands,
     surface_x: float,
     surface_y: float,
     target_layer: Any,
@@ -408,15 +187,12 @@ def build_vertical_point_facts(
     anchor_eligible: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Build target-window point facts for one vertical well."""
-    from cup.well.las import load_vp_rho_logset_from_standard_las
     from cup.well.td import load_workflow_time_depth_table_csv
-    from wtie.processing import grid
 
-    logset = load_vp_rho_logset_from_standard_las(las_file)
     table = load_workflow_time_depth_table_csv(tdt_file)
-    dt_s = float(np.median(np.diff(np.asarray(samples, dtype=float))))
-    ai_twt = grid.convert_log_from_md_to_twt(logset.AI, table, None, dt_s)
-    ai_at_samples = np.interp(samples, np.asarray(ai_twt.basis, dtype=float), ai_twt.values, left=np.nan, right=np.nan)
+    band_twt = np.asarray(bands.reference_log_ai.basis, dtype=float)
+    if not np.allclose(band_twt, np.asarray(samples, dtype=float), rtol=0.0, atol=1e-9):
+        raise ValueError("Vertical well frequency bands must use the seismic sample axis.")
     md_at_samples = np.interp(samples, table.twt, table.depth, left=np.nan, right=np.nan)
     inline_float, xline_float = survey.line_geometry.coord_to_line(float(surface_x), float(surface_y))
     trace_fields = nearest_trace_fields(survey, inline_float, xline_float)
@@ -424,8 +200,11 @@ def build_vertical_point_facts(
     rows: list[dict[str, Any]] = []
     attempted = 0
     zone_errors = 0
-    for seismic_sample_index, (twt_s, ai, md_m) in enumerate(zip(samples, ai_at_samples, md_at_samples)):
-        if not np.isfinite(ai) or ai <= 0.0 or not np.isfinite(md_m):
+    reference_ai = bands.reference_ai.values
+    lfm_ai = bands.lfm_ai.values
+    ginn_target_ai = bands.ginn_target_ai.values
+    for seismic_sample_index, (twt_s, md_m) in enumerate(zip(samples, md_at_samples)):
+        if not bands.valid_band_mask[seismic_sample_index] or not np.isfinite(md_m):
             continue
         attempted += 1
         try:
@@ -450,7 +229,18 @@ def build_vertical_point_facts(
                 "seismic_sample_index": int(seismic_sample_index),
                 "zone_name": zone_name,
                 "u_in_zone": float(u_in_zone),
-                "ai_full": float(ai),
+                "reference_ai": float(reference_ai[seismic_sample_index]),
+                "reference_log_ai": float(bands.reference_log_ai.values[seismic_sample_index]),
+                "lfm_ai": float(lfm_ai[seismic_sample_index]),
+                "lfm_log_ai": float(bands.lfm_log_ai.values[seismic_sample_index]),
+                "ginn_target_ai": float(ginn_target_ai[seismic_sample_index]),
+                "ginn_target_log_ai": float(bands.ginn_target_log_ai.values[seismic_sample_index]),
+                "ginn_band_log_ai": float(bands.ginn_band_log_ai.values[seismic_sample_index]),
+                "enhance_residual_log_ai": float(bands.enhance_residual_log_ai.values[seismic_sample_index]),
+                "observed_well_sample": bool(bands.observed_mask[seismic_sample_index]),
+                "short_gap_interpolated": bool(bands.interpolation_mask[seismic_sample_index]),
+                "hampel_conditioned": bool(bands.conditioned_mask[seismic_sample_index]),
+                "frequency_band_valid": True,
                 "weight": float(weight),
                 "batch_corr": batch_corr,
                 "batch_nmae": batch_nmae,
@@ -458,7 +248,7 @@ def build_vertical_point_facts(
             }
         )
     return (
-        pd.DataFrame(rows, columns=[c for c in POINT_COLUMNS if c not in {"log_ai_full", "well_low_ai", "well_low_log_ai", "well_high_log_ai"}]),
+        pd.DataFrame(rows, columns=POINT_COLUMNS),
         {
             "attempted_samples": int(attempted),
             "valid_points": int(len(rows)),
@@ -473,8 +263,8 @@ def build_deviated_point_facts(
     *,
     well_name: str,
     route: str,
-    las_file: Any,
     trace_plan_file: Any,
+    bands: WellFrequencyBands,
     target_layer: Any,
     survey: Any,
     samples: np.ndarray,
@@ -485,16 +275,10 @@ def build_deviated_point_facts(
     anchor_eligible: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Build target-window point facts for one deviated well from a trace plan."""
-    from cup.well.las import load_vp_rho_logset_from_standard_las
-
-    logset = load_vp_rho_logset_from_standard_las(las_file)
     sample_axis = np.asarray(samples, dtype=np.float64).reshape(-1)
     if sample_axis.size < 2 or np.any(np.diff(sample_axis) <= 0.0):
         raise ValueError("samples must be a strictly increasing seismic sample axis.")
-    ai_log = logset.AI
-    ai_basis = np.asarray(ai_log.basis, dtype=float)
-    if ai_basis.size < 2 or np.any(np.diff(ai_basis) <= 0.0):
-        raise ValueError(f"AI log MD basis must be strictly increasing: {las_file}")
+    band_twt = np.asarray(bands.reference_log_ai.basis, dtype=float)
     plan_df = pd.read_csv(trace_plan_file)
     required = {"twt_s", "md_m", "x_m", "y_m", "inline_float", "xline_float", "survey_position"}
     missing = required - set(plan_df.columns)
@@ -520,18 +304,16 @@ def build_deviated_point_facts(
             "zone_sample_errors": 0,
             "unique_trace_count": 0,
         }
-    plan_md = plan_df["md_m"].to_numpy(dtype=float)
-    ai_values = np.interp(plan_md, ai_basis, np.asarray(ai_log.values, dtype=float), left=np.nan, right=np.nan)
     rows: list[dict[str, Any]] = []
     zone_errors = 0
     for row_index, row in plan_df.iterrows():
-        ai = float(ai_values[row_index])
-        if not np.isfinite(ai) or ai <= 0.0:
-            continue
         inline_float = float(row["inline_float"])
         xline_float = float(row["xline_float"])
         twt_s = float(row["twt_s"])
         seismic_sample_index = int(nearest_sample_indices(sample_axis, np.asarray([twt_s]))[0])
+        band_index = int(nearest_sample_indices(band_twt, np.asarray([twt_s]))[0])
+        if not bands.valid_band_mask[band_index]:
+            continue
         try:
             zone_name, u_in_zone = sample_zone(target_layer, inline_float, xline_float, twt_s)
         except Exception:
@@ -560,7 +342,18 @@ def build_deviated_point_facts(
                 "seismic_sample_index": seismic_sample_index,
                 "zone_name": zone_name,
                 "u_in_zone": float(u_in_zone),
-                "ai_full": ai,
+                "reference_ai": float(bands.reference_ai.values[band_index]),
+                "reference_log_ai": float(bands.reference_log_ai.values[band_index]),
+                "lfm_ai": float(bands.lfm_ai.values[band_index]),
+                "lfm_log_ai": float(bands.lfm_log_ai.values[band_index]),
+                "ginn_target_ai": float(bands.ginn_target_ai.values[band_index]),
+                "ginn_target_log_ai": float(bands.ginn_target_log_ai.values[band_index]),
+                "ginn_band_log_ai": float(bands.ginn_band_log_ai.values[band_index]),
+                "enhance_residual_log_ai": float(bands.enhance_residual_log_ai.values[band_index]),
+                "observed_well_sample": bool(bands.observed_mask[band_index]),
+                "short_gap_interpolated": bool(bands.interpolation_mask[band_index]),
+                "hampel_conditioned": bool(bands.conditioned_mask[band_index]),
+                "frequency_band_valid": True,
                 "weight": float(weight),
                 "batch_corr": batch_corr,
                 "batch_nmae": batch_nmae,
@@ -568,7 +361,7 @@ def build_deviated_point_facts(
             }
         )
     return (
-        pd.DataFrame(rows, columns=[c for c in POINT_COLUMNS if c not in {"log_ai_full", "well_low_ai", "well_low_log_ai", "well_high_log_ai"}]),
+        pd.DataFrame(rows, columns=POINT_COLUMNS),
         {
             "attempted_samples": attempted,
             "valid_points": int(len(rows)),
@@ -579,7 +372,7 @@ def build_deviated_point_facts(
     )
 
 
-def build_point_conflict_report(point_df: pd.DataFrame, *, value_col: str = "well_low_log_ai") -> pd.DataFrame:
+def build_point_conflict_report(point_df: pd.DataFrame, *, value_col: str = "lfm_log_ai") -> pd.DataFrame:
     """Report duplicate nearest trace/sample constraints before aggregation."""
     rows: list[dict[str, Any]] = []
     if point_df.empty:
@@ -710,7 +503,7 @@ def high_frequency_stats(point_df: pd.DataFrame, *, sample_step_s: float | None 
     """Compute high-frequency residual statistics for one point subset."""
     if point_df.empty:
         return _empty_high_stats()
-    values = point_df["well_high_log_ai"].to_numpy(dtype=float)
+    values = point_df["enhance_residual_log_ai"].to_numpy(dtype=float)
     valid = np.isfinite(values) & (point_df["weight"].to_numpy(dtype=float) > 0.0)
     values = values[valid]
     event_threshold = float(np.percentile(np.abs(values), 90.0)) if values.size else np.nan
@@ -721,7 +514,7 @@ def high_frequency_stats(point_df: pd.DataFrame, *, sample_step_s: float | None 
     reflectivity = []
     spectra = []
     for _, group in point_df.loc[valid].groupby("well_name", sort=False):
-        high = group.sort_values("twt_s")["well_high_log_ai"].to_numpy(dtype=float)
+        high = group.sort_values("twt_s")["enhance_residual_log_ai"].to_numpy(dtype=float)
         if high.size >= 2:
             reflectivity.append(np.tanh(0.5 * np.diff(high)))
         if high.size >= 8:
@@ -817,7 +610,7 @@ def _state_run_lengths_by_state(frame: pd.DataFrame, threshold: float) -> dict[s
     lengths: dict[str, list[int]] = {"positive": [], "negative": [], "quiet": []}
     label_by_value = {-1: "negative", 0: "quiet", 1: "positive"}
     for _, group in frame.groupby("well_name", sort=False):
-        values = group.sort_values("twt_s")["well_high_log_ai"].to_numpy(dtype=float)
+        values = group.sort_values("twt_s")["enhance_residual_log_ai"].to_numpy(dtype=float)
         state = np.where(values > threshold, 1, np.where(values < -threshold, -1, 0))
         if state.size == 0:
             continue
@@ -835,7 +628,7 @@ def _transition_matrix(frame: pd.DataFrame, threshold: float) -> dict[str, Any]:
     counts = np.zeros((3, 3), dtype=float)
     if not frame.empty and np.isfinite(threshold):
         for _, group in frame.groupby("well_name", sort=False):
-            values = group.sort_values("twt_s")["well_high_log_ai"].to_numpy(dtype=float)
+            values = group.sort_values("twt_s")["enhance_residual_log_ai"].to_numpy(dtype=float)
             state = np.where(values > threshold, 1, np.where(values < -threshold, -1, 0))
             for a, b in zip(state[:-1], state[1:]):
                 counts[labels.index(int(a)), labels.index(int(b))] += 1.0

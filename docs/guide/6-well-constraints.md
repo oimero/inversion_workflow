@@ -1,374 +1,190 @@
-# 06 分频诊断与井约束
+# 第六步：三频带井约束
 
-`well_constraints.py` 是时间域工作流的第六步。它负责把第四步、第五步之后可信的井曲线转换成一套统一的井约束数据，分别交给 GINN、低频模型和后续 enhance 使用。
+入口：
 
----
-
-## 快速开始
-
-```bash
-python scripts/well_constraints.py
-python scripts/well_constraints.py --config experiments/common.yaml
-python scripts/well_constraints.py --output-dir scripts/output/well_constraints_test
+```powershell
+& "C:\Users\WangQinZhuo\miniconda3\envs\pinn_inversion\python.exe" scripts\well_constraints.py --config experiments\common.yaml
 ```
 
-不带参数时，脚本自动发现最新的第四步和第五步产物，在 `scripts/output/well_constraints_<timestamp>/` 下写出结果。
+## 职责
 
----
+第六步把井上参考 `log(AI)` 拆成三个职责明确的频带：
 
-## 运行前需要什么
+```text
+reference_log_ai
+  = lfm_log_ai
+  + ginn_band_log_ai
+  + enhance_residual_log_ai
+```
 
-| 来源 | 文件 | 用途 |
-|------|------|------|
-| 第四步 | `well_tie_metrics.csv` | 标定状态、路由、优化后时深表路径、滤波 LAS 路径 |
-| 第四步 | `well_tie_plan.csv` | 井口坐标、井型初分 |
-| 第四步 | 斜井样点计划文件 | 斜井沿优化后时深表生成的逐样点空间映射 |
-| 第五步 | `batch_synthetic_metrics.csv` | 逐井批量合成相关系数和误差，用于筛选和定权重 |
-| 地震数据 | 时间域地震体 | 提供时间轴和工区几何 |
-| 解释层位 | 顶底解释层位文件 | 构建目标层范围和各层段划分 |
+定义为：
 
----
+```text
+reference_log_ai = LP(conditioned_log_ai, f_reference)
+lfm_log_ai = LP(conditioned_log_ai, f_lfm)
+ginn_target_log_ai = LP(conditioned_log_ai, f_ginn)
+ginn_band_log_ai = ginn_target_log_ai - lfm_log_ai
+enhance_residual_log_ai = reference_log_ai - ginn_target_log_ai
+```
 
-## 配置参考
+- LFM 消费 `lfm_ai`。
+- GINN anchor 消费 `ginn_target_log_ai`。GINN 仍是物理约束反演，不是残差学习。
+- Enhance 监督消费 `enhance_residual_log_ai`。
+- 禁止用 `reference_log_ai - actual_ginn_prediction_log_ai` 作为 enhance 真值。
+
+## 输入链
+
+曲线真值来自第三步：
+
+```text
+well_tie_plan.csv.input_las
+```
+
+第四步只提供：
+
+- `optimized_tdt_file`
+- `seismic_trace_file`
+- `optimized_trace_sample_plan_file`
+- 井位、route 和时间关系
+
+第五步提供：
+
+- `selected_wavelet.csv`
+- `batch_synthetic_metrics.csv`
+- `spatial_cluster_id`
+
+第四步 `filtered_las_file` 不参与第六步频带定义，避免 auto-tie 滤波参数反向定义 GINN 可恢复频带。
+
+## 缺口和清洗
+
+标准 LAS loader 保留原始 NaN。
+
+- `<=10 ms` 的有界内部缺口允许线性插值，仅用于滤波、重采样和正演支撑。
+- 插值样点的 `observed_well_sample=false`，不进入 LFM 控制、GINN anchor、enhance 监督、统计或冲突报告。
+- `>10 ms` 的缺口保持无效，缺口两侧按连续段独立滤波。
+- 轻量 Hampel 只替换孤立尖峰；被替换样点同样不作为观测监督。
+
+默认配置：
 
 ```yaml
 well_constraints:
-  source_runs:
-    mode: latest
-    well_auto_tie_dir: null
-    wavelet_generation_dir: null
+  reference_conditioning:
+    max_short_gap_s: 0.010
+    hampel_window_samples: 7
+    hampel_sigma: 4.0
+```
 
-  seismic:
-    file: null
-    type: segy
+## Cutoff
 
-  target_interval:
-    horizons:
-      - <top-horizon-file>
-      - <bottom-horizon-file>
-    twt_unit: auto
+### LFM cutoff
 
-  control_wells:
-    min_batch_corr: 0.35
-    max_batch_nmae: null
-    include_wells: null
-    exclude_wells: []
+默认取共识子波主峰左侧归一化振幅 `0.5` 交点：
 
-  frequency_split:
-    mode: diagnose
-    manual_cutoff_hz: null
+```yaml
+frequency_bands:
+  lfm:
+    cutoff_mode: wavelet_left_half_amplitude
+    cutoff_scale: 1.0
+```
+
+这里的振幅 `0.5` 是 `-6 dB`；Butterworth cutoff 是 `-3 dB`。工作流把前者映射为名义 cutoff，并由 Butterworth 自身提供渐变过渡。`cutoff_scale < 1` 只作为显式实验。
+
+### GINN cutoff
+
+对每个候选 cutoff：
+
+1. 将参考井 `log(AI)` 低通到候选频率。
+2. 转回 AI 并计算反射系数。
+3. 与第五步共识子波卷积。
+4. 与第四步保存的真实井旁或轨迹地震比较 corr、NMAE 和 scale。
+5. 先在空间簇内取井指标中位数，再跨空间簇取中位数。
+6. 在近最佳平台内选择最低 cutoff。
+
+默认候选围绕共识子波右侧振幅 `0.5` 交点自动生成。若最终值命中候选最低或最高边界，脚本写出诊断后失败，必须扩展候选范围。
+
+### Reference cutoff
+
+默认：
+
+```text
+f_reference = min(2 * f_ginn, 0.4 * fs)
+```
+
+三条低通统一使用同阶零相位 Butterworth，并满足：
+
+```text
+0 < f_lfm < f_ginn < f_reference < Nyquist
+```
+
+## 核心配置
+
+```yaml
+well_constraints:
+  frequency_bands:
     filter_order: 6
-    candidate_cutoff_hz: [6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0]
-    selection_corr_tolerance: 0.02
-    selection_nmae_tolerance: 0.03
     buffer_seconds: null
     buffer_mode: reflect
     qc_enabled: true
     qc_envelope_window_samples: 31
 
-  anchor:
-    include_deviated: false
-    min_points_per_trace: 2
+    lfm:
+      cutoff_mode: wavelet_left_half_amplitude
+      cutoff_scale: 1.0
+      manual_cutoff_hz: null
 
-  high_supervision:
-    include_deviated: false
+    ginn:
+      mode: diagnose
+      manual_cutoff_hz: null
+      candidate_cutoff_hz: null
+      candidate_min_right_half_ratio: 0.4
+      candidate_max_right_half_ratio: 1.3
+      candidate_step_hz: 5.0
+      selection_corr_tolerance: 0.02
+      selection_nmae_tolerance: 0.03
+      fail_on_candidate_boundary: true
 
-  conflicts:
-    strategy: weighted_average
-
-  weights:
-    mode: corr
-    corr_floor: 0.3
-    corr_span: 0.4
-    corr_min_weight: 0.6
-
-  lfm_controls:
-    min_control_samples_per_well: 16
-
+    reference:
+      cutoff_mode: ginn_octave
+      ginn_multiplier: 2.0
+      max_nyquist_fraction: 0.4
+      manual_cutoff_hz: null
 ```
 
-### `source_runs`
-
-默认接上最新一次井震标定和全局子波结果。复现实验时，填写 `well_auto_tie_dir` 或 `wavelet_generation_dir` 固定输入。`mode` 目前只支持 `latest`。
-
-### `control_wells`
-
-不是所有标定成功的井都能成为控制井。每口井必须先过第五步的统一子波批量合成门槛：
-
-| 参数 | 含义 |
-|------|------|
-| `min_batch_corr` | 批量合成相关系数低于此值的井被排除 |
-| `max_batch_nmae` | 可选 NMAE 上限，为空时不按 NMAE 过滤 |
-| `include_wells` | 白名单模式，只使用指定井 |
-| `exclude_wells` | 人工排除可疑井 |
-
-此外，井还必须同时具备第四步产出的滤波 LAS 和优化后时深表；斜井还需要对应的样点计划文件。
-
-### `frequency_split`
-
-决定井曲线中哪部分交给低频约束、哪部分交给 enhance 高频材料。支持两种模式：
-
-- **`diagnose`**：对每个候选截止频率低通井上 log-AI，用第五步最终全局子波正演合成记录，再与第四步保存的井旁地震道计算 `corr`、`nmae` 和 `scale`。脚本先找多井波形拟合的近最佳平台，再在平台内选择较低 Hz，让低频分支保持保守。
-- **`manual`**：跳过诊断，直接使用 `manual_cutoff_hz` 指定的截止频率。
-
-无论哪种模式，最终选定的截止频率、滤波阶数、缓冲策略和诊断证据都会写入 `run_summary.json`。
-
-分频结果不是为了让每口井各用各的截止频率。默认口径是全目标窗共享一个分频；分层 enhance 在此基础上统计每层的高频特征，但同一条训练链路里不应出现多套互相不兼容的频率拆分。
-
-实际调参时，通常只先看三个地方：
-
-- `candidate_cutoff_hz` 决定可选范围。选中的 cutoff 如果总在列表边界，先扩展候选范围，而不是马上改别的参数。
-- `selection_corr_tolerance` 和 `selection_nmae_tolerance` 决定“近最佳平台”有多宽。放宽后更容易选到较低 Hz，低频分支更保守；收紧后更贴近波形拟合最优点。
-- `buffer_seconds` 主要处理滤波边界效应。如果分频 QC 图两端高频残差异常放大，或低频曲线端部翘起，可以给一个小缓冲，例如 `0.05` 到 `0.15` 秒。
-
-默认建议先用 `diagnose` 跑一遍，看 `frequency_split_cutoff_sweep.png` 和几口代表井的分频 QC 图。若低频曲线几乎贴着原始 log-AI，说明高频留得不够，可以考虑降低候选 cutoff 或放宽平台容差；若低频太平滑、正演合成明显变差，则提高候选 cutoff 或收紧平台容差。只有当诊断结果明显被异常井带偏，或者已有明确地质认识时，再切到 `manual` 固定 `manual_cutoff_hz`。
-
-`filter_order` 和 `qc_envelope_window_samples` 一般不作为第一轮调参入口。前者只在低通边缘出现不自然振荡时再动，后者只影响 QC 图上的包络显示，不改变实际分频结果。
-
-### `anchor`
-
-控制 GINN 低频 anchor 的生成：
-
-| 参数 | 含义 |
-|------|------|
-| `include_deviated` | 是否允许斜井进入低频 anchor。第一版默认关闭 |
-| `min_points_per_trace` | 每条受控道上至少需要多少个有效样点 |
-
-低频 anchor 的目标值来自分频后的低频 log-AI，而不是原始全频井曲线。这样它不会和第八步网络学习的高频残差互相争抢职责。
-
-第一版默认只有直井进入低频 anchor 文件；斜井只进入点级事实和 LFM 控制点候选，不进入 GINN 低频 anchor，也不进入 enhance 高频监督和高频统计。平台斜井很容易与直井落到同一批近邻地震道，默认排除可以避免训练监督冲突。
-
-### `high_supervision`
-
-控制 enhance 高频监督和高频统计的来源：
-
-| 参数 | 含义 |
-|------|------|
-| `include_deviated` | 是否允许斜井进入 `well_high_supervision_time.npz` 和 `well_high_stats_*`。默认关闭 |
-
-### `conflicts`
-
-密井网下，多口井可能落到同一个道位置和样点位置上。当前只支持 `weighted_average` 策略：按权重加权平均，冲突明细写入审计文件。密井网下不允许静默覆盖。
-
-### `weights`
-
-控制每个样点的训练权重。`mode: corr` 时，权重由第五步的批量合成相关系数映射而来：
-
-- 相关系数低于 `corr_floor`，权重退到 `corr_min_weight`
-- 相关系数在 `corr_floor` 到 `corr_floor + corr_span` 之间线性增长
-- 相关系数达到上限后权重封顶为 1.0
-
-`mode: uniform` 时，所有权重为 1.0。
-
-### `lfm_controls`
-
-| 参数 | 含义 |
-|------|------|
-| `min_control_samples_per_well` | 单井最少有效样点数，低于此值的井被排除 |
-
-第六步只负责输出点级低频控制事实，不在这里按层段或顺层切片聚合。顺层切片数量、切片聚合和空间插值都属于第七步 LFM。
-
-如果旧配置里还写着 `well_constraints.lfm_controls.n_slices`，脚本会直接报错；这个参数应放到 `lfm_precomputed.modeling.n_slices`。
-
-## 脚本在做什么
-
-脚本分五个阶段：**前置发现 → 点级事实生成 → 分频诊断与拆分 → 低频 anchor 输出 → 高频监督与统计输出**。同一份点级事实表还会导出第七步低频模型需要的点级控制点文件，见下方核心输出文件。
-
-### 第一阶段：前置发现
-
-1. 从配置或自动发现中定位第四步和第五步的产出目录。
-2. 打开地震体，校验采样域为时间域且单位为秒。
-3. 读取顶底解释层位，按平均时间从浅到深排序，相邻层位组成层段。
-
-### 第二阶段：点级事实生成
-
-对第四步标定成功的每口井，先过第五步的批量合成 QC 门槛，再过资产完整性检查。然后按井型分两条路径生成点级事实表：
-
-**直井路径**
-
-1. 从滤波 LAS 读取波阻抗曲线。
-2. 用优化后时深表将深度域波阻抗转成时间域。
-3. 在时间轴的每个样点处，判断是否落入目标层内；若是，记录该样点的时间、波阻抗、深度、层段和层内比例位置。
-4. 空间坐标由井口 XY 和地震几何确定，直井的所有样点落在同一个道位置上。
-
-**斜井路径**
-
-1. 从滤波 LAS 读取波阻抗曲线。
-2. 读取第四步的样点计划文件（细标定后的空间映射），只保留工区内样点。
-3. 在计划文件给出的每个轨迹样点处，插值波阻抗值。
-4. 判断每个样点是否落入目标层内，记录其空间坐标、时间、波阻抗、层段和层内比例位置。
-5. 斜井的样点随轨迹分布在多个不同的空间位置上。
-
-两路生成的点级事实表格式统一，基本单元是"某口井在某个时间样点上的空间和曲线事实"。规范坐标为浮点线号和正秒时间。整数道号、数组索引等只作为派生调试字段，不能当作跨工区稳定坐标。
-
-### 第三阶段：分频诊断与拆分
-
-如果配置为 `diagnose` 模式，对每个候选截止频率做一次完整的低通，然后用第五步最终全局子波做正演，和第四步保存的井旁地震道比较。诊断输出不是只看井曲线是否平滑，而是回答一个更直接的问题：这个 cutoff 下的低频 AI 正演出来，是否仍能解释真实地震波形。
-
-多井聚合后，脚本先找 `median_corr` 最高的 cutoff，再按 `selection_corr_tolerance` 和 `selection_nmae_tolerance` 找近最佳平台；如果有平台，则选平台内较低的 Hz。时间域 Hz 越低，低通越强、低频分支越保守。
-
-如果配置为 `manual` 模式，直接使用用户指定的截止频率。
-
-确定截止频率后，对所有井的 log-AI 曲线做零相位低通滤波，拆成两部分：
-
-- **低频部分**：滤波后的平滑趋势，交给 GINN 低频 anchor
-- **高频部分**：原曲线减去低频部分后的残余，交给 enhance 统计和监督
-
-每口井的分频结果会生成 QC 图：上方是完整的和低频的 log-AI 对比，下方是高频残余及其包络。
-
-### 第四阶段：低频 anchor 输出
-
-从分频后的低频 log-AI 中提取 anchor 样点，聚合成 GINN 训练端可直接读取的 anchor 数据包。anchor 样点只来自直井（除非显式打开斜井开关）。
-
-如果多口井落到同一个道位置和样点位置上，按权重加权平均，冲突明细写入独立的冲突报告文件。每条受控道的井数、样点数、覆盖层段和权重统计写入道摘要文件。
-
-### 第五阶段：高频监督与统计输出
-
-从点级事实表中筛选训练材料，默认只使用直井点，同时产出三套材料：
-
-1. **逐点监督真值**：每口井每个样点上的高频残余值，写成 enhance 训练可读取的监督数据包。样点带有井名、空间位置、权重和层段归属标记。
-2. **全窗和分层统计**：对入选训练点的高频残余做全局统计；再按每个层段分别统计。统计项包括振幅分布、事件密度、正负状态持续长度、转移矩阵、反射系数量级和频谱。
-3. **收缩参数**：每层的经验统计按其可靠度向全窗统计收缩——可靠度高的层主要相信自己，可靠度低的层更多借用全窗先验。收缩因子一并写出。
-
-可靠度由有效井数、有效样点数、事件数和空间覆盖共同决定。小样本层如果完全相信自身的经验统计，后续 enhance 合成器生成的样本会过拟合；向全窗收缩可以在信息不足时借用先验。
-
----
-
-## 核心输出文件
-
-所有文件在 `<output_root>/well_constraints_<timestamp>/` 下：
-
-| 文件 | 内容 |
-|------|------|
-| `well_constraint_points.csv` | 点级事实表，每行一个时间样点的完整空间和曲线信息 |
-| `well_constraint_qc.csv` | 逐井筛选结果、样点数和分频 QC 图路径 |
-| `log_ai_anchor_time.npz` | GINN 训练可直接读取的低频井监督数据包 |
-| `well_high_supervision_time.npz` | enhance 训练可直接读取的高频井监督数据包，默认只含直井 |
-| `well_high_stats_global.json` | 全目标窗高频残余统计，默认只含直井 |
-| `well_high_stats_by_layer.csv` | 每层的经验统计和可靠度，默认只含直井 |
-| `well_high_stats_shrinkage.json` | 每层收缩后的最终生成参数，默认只含直井 |
-| `lfm_control_points.csv` | 第七步 LFM 读取的点级低频 AI 控制点文件；不做顺层切片聚合 |
-| `target_layer_qc/*` | 目标层 mask、层厚、层位有效性 QC |
-| `frequency_split_diagnostics.csv` | 逐井逐候选 cutoff 的正演匹配指标 |
-| `frequency_split_aggregate.csv` | 多井聚合后的候选 cutoff 指标 |
-| `figures/frequency_split_cutoff_sweep.png` | 候选 cutoff 的全局 corr/nmae sweep 图 |
-| `figures/frequency_split_wells/*.png` | 每口井的候选 cutoff corr/nmae sweep 图 |
-| `frequency_split_qc/traces/*.csv` | 每口井分频前后的曲线数值 |
-| `frequency_split_qc/figures/*.png` | 每口井的分频 QC 图 |
-| `run_summary.json` | 输入路径、筛选统计、分频参数和所有输出路径 |
-
-如果密井冲突真实发生，脚本会额外写出 `well_anchor_conflicts.csv` 或 `well_high_supervision_conflicts.csv`；没有冲突时不写空文件，只在 `run_summary.json` 里记录冲突数为 0。
-
-### `well_constraint_points.csv`
-
-每行一个目标层内的井样点，以浮点线号和正秒时间为规范坐标。关键字段：
-
-| 字段 | 含义 |
-|------|------|
-| 井名 / 路径 | 来源井和第四步标定路径 |
-| 来源类型 | `vertical_trace`（直井井口）或 `deviated_trajectory`（斜井沿轨迹） |
-| 时间 / 深度 | 样点在时间域和深度域的位置 |
-| 平面坐标 | 样点的地面投影 XY |
-| 浮点线号 | 投影到工区后的浮点线号 |
-| 层段 / 层内比例 | 所属层段和层内比例位置（0 到 1） |
-| 波阻抗 / 权重 | 样点的全频波阻抗值及训练权重 |
-| 低频 / 高频 log-AI | 分频后的低频和高频成分 |
-| 是否用于 anchor | 该样点是否进入 GINN 低频 anchor |
-
-### `log_ai_anchor_time.npz`
-
-第八步 GINN 读取的低频井监督数据包，包含：
-
-| 键 | 含义 |
-|----|------|
-| 目标值数组 | 每个受控样点的低频波阻抗 |
-| 掩码数组 | 哪些样点是有效控制点 |
-| 权重数组 | 每个控制点的训练权重 |
-| 井名 / 类型 / 坐标 | 每口控制井的标识和位置 |
-| 元数据 | 分频参数、冲突策略和上游路径 |
-
-### `well_high_supervision_time.npz`
-
-enhance 训练读取的高频井监督数据包，使用 `well_high_supervision_v1` schema，包含井上的全频 log-AI、低频 log-AI、高频 log-AI、掩码、权重、采样轴和井名 / 道位置。默认只使用直井样点；斜井样点保留在点级事实表中，但不写入该训练包。训练端若需要底阻抗输入，应读取第七步 LFM 或 GINN 输出。
-
-### `lfm_control_points.csv`
-
-第七步 LFM 的点级低频 AI 控制事实。控制值列 `ai` 是第六步分频后的低频 AI，同时保留 `twt_s`、`inline_float`、`xline_float`、`zone_name`、`u_in_zone`、`weight` 等点级坐标和质量字段。第六步不按 `well + zone + slice` 聚合；第七步会根据自己的 `modeling.n_slices` 把这些点分配到顺层切片，再完成插值建模。
-
-### `well_high_stats_by_layer.csv`
-
-每层一行，记录该层的统计特征和可靠度。关键列包括：有效井数、有效样点数、事件数、可靠度（决定收缩强度）、振幅分位数、事件密度、正负状态持续长度的分位数，以及转移矩阵。
-
-### `well_high_stats_shrinkage.json`
-
-每层一个条目，记录该层经验统计、全窗统计、收缩因子和收缩后的最终参数。最终参数就是 enhance 合成器要用到的生成参数。
-
----
-
-## 如何阅读结果
-
-### 第一步：看 `run_summary.json`
-
-先看顶层计数：
-
-- 入选井数、点级事实总数
-- anchor 受控道数
-- LFM 点级控制点数
-- 分频诊断选出的截止频率
-
-这些数字应该与第四步的标定成功井数、目标层覆盖范围在量级上匹配。如果入选井数远少于第四步的成功井数，优先看质量控制文件的拒绝原因分布。
-
-### 第二步：看 `well_constraint_qc.csv`
-
-确认每口井的入选状态和拒绝原因。`status=selected` 表示该井进入点级事实表和 LFM 候选；是否实际进入 enhance 训练材料看 `high_supervision_eligible` 和 `high_supervision_point_count`。默认配置下，斜井即使点级事实入选，这两项也会显示未进入高频监督。常见拒绝原因：
-
-- `batch_corr_below_threshold`：批量合成相关系数不够
-- `missing_filtered_las_file`：缺少滤波 LAS
-- `missing_optimized_tdt_file`：缺少优化后时深表
-- `missing_optimized_trace_sample_plan`：斜井缺少样点计划文件
-- `too_few_control_samples`：落入目标层的有效样点不足
-
-对入选井，看样点数和唯一道数。直井的唯一道数应为 1；斜井应大于 1。如果斜井所有样点落在同一道上，要回头检查第四步的空间映射。
-
-### 第三步：看冲突报告
-
-如果 `run_summary.json` 中的冲突数大于 0，再打开对应的 `well_anchor_conflicts.csv` 或 `well_high_supervision_conflicts.csv`。同一位置上的值差异越大，权重平均的效果就越值得怀疑。目前第一版用加权平均处理冲突，更精细的策略（如保留最高置信度、遇冲突直接失败）留到后续版本。
-
-### 第四步：看 `well_high_stats_by_layer.csv`
-
-关注每层的可靠度。可靠度低的层，在 enhance 合成器中生成的高频样本会更多依赖全窗先验——这不是错误，而是信息不足时的合理保守策略。但如果大多数层的可靠度都偏低，说明有效井数或样点覆盖不足以支撑分层统计，此时应回到第四步或第五步检查标定和批量合成的覆盖面。
-
-### 第五步：看图
-
-先看 `figures/frequency_split_cutoff_sweep.png`。这张图展示候选 cutoff 的多井 `median corr` 和 `median nmae`；虚线会标出波形相关性最佳 cutoff 和最终选中的 cutoff。如果两者不同，说明脚本在近最佳平台内选择了更保守的低 Hz。
-
-再看 `figures/frequency_split_wells/` 中的逐井 sweep 图，确认最终选择不是由少数井单独拉动。
-
-最后抽查几口井的分频 QC 图（`frequency_split_qc/figures/`）：
-
-- 上方子图：完整的和低频的 log-AI。低频曲线应该平滑、跟随大趋势，而不是贴着原始曲线走。
-- 下方子图：高频残余和包络。高频残余应在零值附近正负振荡，包络不应在某一段突然膨胀（说明那里的原始曲线有异常尖峰）。
-
-同时抽查几口直井和斜井的点级事实——直井的空间坐标应恒定，斜井的空间坐标应随时时间变化，层内比例覆盖应尽量均匀。
-
----
-
-### 常见失败原因
-
-| 原因 | 含义 | 怎么处理 |
-|------|------|---------|
-| `No selected well constraint points` | 所有井都被过滤或事实生成失败 | 检查质量控制文件的拒绝原因；多数情况是第四步成功井太少或第五步门槛过高 |
-| 分频诊断在候选截止频率上全部不理想 | 候选范围不覆盖当前数据的合理分频点 | 扩大候选截止频率范围，或改用手动模式指定一个已知合适的值 |
-| 某口斜井缺少样点计划文件 | 第四步未为该斜井写出细标定后的空间映射 | 回到第四步检查斜井路径是否执行成功 |
-| 落入目标层的有效样点不足 | 时深表范围未覆盖目标层，或 LAS 曲线在目标层深度内没有值 | 检查时深表覆盖范围、目标层配置和 LAS 曲线深度范围 |
-| LFM 控制点为空 | 所有井都被过滤，或目标层内没有有效低频控制样点 | 检查 `well_constraint_qc.csv`、入选井样点数、目标层覆盖和第五步批量合成门槛 |
-
----
-
-## 留到第二轮
-
-- 冲突策略从仅支持加权平均扩展到保留最高置信度、丢弃冲突点和遇冲突直接失败。
-- motif patch 的提取、质量标签和数据包生成；到那时再输出真实 manifest，不再写空占位。
-- 正演分频诊断进一步加入空间去偏聚合，避免密井平台主导 cutoff 选择。
-- 斜井 anchor 支持（当前 `include_deviated` 默认为关）。
-- 分频 QC 增加分层叠加图：在同一张图上按层段着色显示高频残余，方便对比不同层的分频效果。
+旧 `well_constraints.frequency_split` 不兼容，检测到后直接报迁移错误。
+
+## 输出
+
+正式产物：
+
+| 文件 | 语义 |
+|---|---|
+| `well_constraint_points.csv` | 点级三频带事实、mask、空间坐标和权重 |
+| `lfm_control_points.csv` | 仅真实观测样点的 `lfm_ai` |
+| `log_ai_anchor_time.npz` | GINN 的 `ginn_target_log_ai` anchor |
+| `well_high_supervision_time.npz` | Enhance 的 `enhance_residual_log_ai`，schema `enhance_residual_supervision_v2` |
+| `well_high_stats_global.json` | Enhance residual 全局统计 |
+| `well_high_stats_by_layer.csv` | 分层 Enhance residual 统计 |
+| `well_high_stats_shrinkage.json` | 分层收缩统计 |
+
+诊断产物：
+
+| 文件 | 语义 |
+|---|---|
+| `ginn_cutoff_diagnostics.csv` | 逐井逐候选正演指标 |
+| `ginn_cutoff_cluster_aggregate.csv` | 空间簇内聚合 |
+| `ginn_cutoff_aggregate.csv` | 跨空间簇聚合 |
+| `figures/ginn_cutoff_sweep.png` | 全局候选 sweep |
+| `figures/ginn_cutoff_wells/*.png` | 逐井 sweep |
+| `figures/frequency_band_response.png` | 共识子波频谱、左右半峰值和三条实际零相位 Butterworth 响应 |
+| `frequency_band_qc/traces/*.csv` | 单井三频带数值 |
+| `frequency_band_qc/figures/*.png` | 单井三频带 QC |
+
+## 验收
+
+1. `run_summary.json` 中三个 cutoff 顺序正确。
+2. 选中的 GINN cutoff 不在候选边界。
+3. 有效样点满足三频带重构恒等式。
+4. `lfm_control_points.csv` 全部来自 `observed_well_sample=true`。
+5. GINN anchor 元数据的 `anchor_target_band` 为 `lowpass_reference_to_ginn_cutoff`。
+6. Enhance 包 schema 为 `enhance_residual_supervision_v2`。
+7. 长缺口位置没有频带值，缺口两侧不存在滤波泄漏。

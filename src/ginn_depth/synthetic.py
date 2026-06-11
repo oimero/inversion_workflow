@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from cup.utils.masks import true_runs
 from cup.utils.raw_trace import centered_moving_average
 from ginn_depth.prior import (
     WellResolutionPriorBundle,
@@ -33,7 +34,6 @@ from enhance.synthetic import (
     reflectivity_to_log_ai,
     sample_highres_prior_patch,
     summary_or_percentile,
-    true_runs,
     valid_prior_rows,
 )
 from ginn_depth.physics import DepthForwardModel

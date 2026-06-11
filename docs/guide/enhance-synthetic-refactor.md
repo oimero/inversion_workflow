@@ -61,9 +61,9 @@
 | `well_high_stats_global.json` | 全目标窗默认生成参数 |
 | `well_high_stats_by_layer.csv` | 每层经验统计和可靠度 |
 | `well_high_stats_shrinkage.json` | 每层最终生成参数 |
-| `well_high_supervision_time.npz` | 井高频监督包，schema 为 `well_high_supervision_v1`，只供训练监督项使用，不作为 synthetic 主体 |
+| `well_high_supervision_time.npz` | 井上 enhance residual 监督包，schema 为 `enhance_residual_supervision_v2`，只供训练监督项使用，不作为 synthetic 主体 |
 
-注意：`well_high_supervision_time.npz` 和统计材料同源，但消费方式不同。监督项关心真实井位置上的逐点高频真值；合成器关心一层内应该生成什么样的高频扰动分布。底阻抗或 base AI 应来自 GINN / LFM 输出，不应从井高频监督包读取。
+注意：`well_high_supervision_time.npz` 和统计材料同源，但消费方式不同。监督项关心真实井位置上的 `enhance_residual_log_ai = reference_log_ai - ginn_target_log_ai`；合成器关心一层内应该生成什么样的超 GINN 频带扰动。底阻抗或 base AI 应来自 GINN 输出，不应从井监督包读取。
 
 ---
 
@@ -134,7 +134,7 @@
 
 | 版本 | 状态来源 | 说明 |
 |------|----------|------|
-| v1 | 阈值三状态：`quiet` / `positive` / `negative` | 先跑通 semi-Markov 框架，直接复用当前 `well_high_log_ai` 的阈值状态统计 |
+| v1 | 阈值三状态：`quiet` / `positive` / `negative` | 先跑通 semi-Markov 框架，使用 `enhance_residual_log_ai` 的阈值状态统计 |
 | v2 | 多尺度 residual 特征 + KMeans/GMM 伪状态 | 用局部包络、一阶差分、局部 RMS、多窗口平滑残差等特征聚类，再映射到更丰富的结构状态 |
 
 这轮参考其他工区代码仓后，最值得吸收的是“多尺度特征 -> 伪状态 -> 连续段统计”的套路：苏19、苏77 和塔里木的岩相 / 微相实践里都大量使用 INPEFA、多窗口中值滤波、滑动窗口样本、KMeans/GMM 伪标签和连续预测段合并。时间域 enhance 不需要照搬它们的分类模型，但可以把这套思路用于 v2 的 hidden-state 提取。

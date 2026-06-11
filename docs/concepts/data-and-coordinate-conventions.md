@@ -27,11 +27,30 @@
     - 匹配顺序是精确 mnemonic 优先，再用 LASIO 的 `:1` / `:2` 后缀规范化兜底；兜底命中多条时必须显式指定精确名。
 - 标准预处理 LAS 读取入口：`cup.well.las.load_vp_rho_logset_from_standard_las(path)`。
     - 标准 LAS 必须含 `DT_USM`（`us/m`）和 `RHO_GCC`（`g/cm3`），且 MD 轴有限、严格递增、规则采样。
-    - 入口只读取这两条基础曲线并转换成 `Vp/Rho` 的 `grid.LogSet`；即使 LAS 含 `AI`，也不会读取或校验旧 AI。
+    - 入口只读取这两条基础曲线并转换成允许 NaN 的 `Vp/Rho` `grid.LogSet`；不会静默插值缺失值，即使 LAS 含 `AI`，也不会读取或校验旧 AI。
+    - 需要原始联合观测 mask 时使用 `cup.well.las.load_standard_vp_rho_logs(path)`。
+    - 基于 TDT 判断短缺口时长、填补短缺口或裁取连续标定窗，统一使用 `cup.well.gaps`；频带模块不拥有第四步标定窗逻辑。
 - 时间域第三、四步成功导出的 LAS 固定含 `AI`：
     - 第三步 `AI` 来自清洗后的全频 `DT_USM/RHO_GCC`；任一源曲线无效时对应 AI 样点保持缺失。
     - 第四步 `AI` 来自 auto-tie 最优滤波后的 `Vp/Rho`，会重新计算，不沿用第三步或人工处理中遗留的 AI。
     - 两者都保持原 MD 轴；TDT 的整体时移不写回 LAS。
+
+## 第六步三频带
+
+- 第六步曲线来源固定为第三步 `preprocessed_las`，不使用第四步 `filtered_las_file` 定义频带真值。
+- 第四步提供 optimized TDT、地震道和斜井轨迹采样计划；第五步提供唯一的共识子波。
+- 所有分频在 TWT 域 `log(AI)` 上执行：
+
+```text
+reference_log_ai = LP(conditioned_log_ai, f_reference)
+lfm_log_ai = LP(conditioned_log_ai, f_lfm)
+ginn_target_log_ai = LP(conditioned_log_ai, f_ginn)
+ginn_band_log_ai = ginn_target_log_ai - lfm_log_ai
+enhance_residual_log_ai = reference_log_ai - ginn_target_log_ai
+```
+
+- `f_lfm` 默认取共识子波主峰左侧归一化振幅 `0.5` 交点；`f_ginn` 由正演近最佳平台诊断；`f_reference = min(2*f_ginn, 0.4*fs)`。
+- `<=10 ms` 的内部缺口只为滤波支撑而插值，不进入 LFM 控制、GINN anchor、enhance 监督或统计；更长缺口保持无效并按连续段独立滤波。
 
 ## 时深表
 

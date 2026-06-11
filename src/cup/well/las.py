@@ -85,6 +85,20 @@ class ResolvedLasCurve:
     description: str
 
 
+@dataclass(frozen=True)
+class StandardVpRhoLogs:
+    """Standard DT/Rho LAS content with the original joint-observation mask."""
+
+    logs: grid.LogSet
+    observed_mask: np.ndarray
+
+    def __post_init__(self) -> None:
+        mask = np.asarray(self.observed_mask, dtype=bool).reshape(-1)
+        if mask.shape != np.asarray(self.logs.basis).shape:
+            raise ValueError("observed_mask must match the standard LAS MD basis.")
+        object.__setattr__(self, "observed_mask", mask)
+
+
 def _replace_sentinel_values(values: object, *, null_value: float | None = None, null_policy: str = "common_sentinels") -> np.ndarray:
     """将 LAS 空值和常见异常占位值替换为 NaN。"""
     policy = str(null_policy).strip()
@@ -492,29 +506,15 @@ def old_load_vp_rho_logset_from_las(
     return grid.LogSet({"Vp": vp_log, "Rho": rho_log})
 
 
-def load_vp_rho_logset_from_standard_las(path: str | Path) -> grid.LogSet:
-    """从标准 LAS 构建 MD 域 Vp/Rho LogSet。
-
-    标准 LAS 指包含第三步标准曲线 ``DT_USM`` 与 ``RHO_GCC`` 的 LAS，
-    不要求文件一定由 ``scripts/well_preprocess.py`` 生成。
-
-    Parameters
-    ----------
-    path : str | Path
-        标准 LAS 文件路径，必须包含 ``DT_USM`` 与 ``RHO_GCC`` 曲线。
-
-    Returns
-    -------
-    grid.LogSet
-        含 ``Vp`` (m/s) 与 ``Rho`` (g/cm3) 的 MD 域 LogSet。
-
-    Raises
-    ------
-    ValueError
-        缺少必需曲线、采样轴不一致或插值后仍含非有限值时。
-    """
+def load_standard_vp_rho_logs(path: str | Path) -> StandardVpRhoLogs:
+    """Read standard DT/Rho curves without filling missing samples."""
     try:
-        curves = read_las_curves(path, ["DT_USM", "RHO_GCC"], match_policy="exact")
+        curves = read_las_curves(
+            path,
+            ["DT_USM", "RHO_GCC"],
+            match_policy="exact",
+            allow_all_nan=True,
+        )
     except (AssertionError, ValueError) as exc:
         raise ValueError(
             f"Standard LAS is missing required curves or has an invalid MD basis: {path}"
@@ -535,21 +535,50 @@ def load_vp_rho_logset_from_standard_las(path: str | Path) -> grid.LogSet:
     md_step = float(np.median(np.diff(md)))
     if not np.allclose(np.diff(md), md_step, rtol=1e-4, atol=1e-6):
         raise ValueError(f"Standard LAS MD basis must be regularly sampled: {path}")
-    dt_usm = _finite_positive(dt_log.values, label="DT_USM")
-    rho = _finite_positive(rho_log.values, label="RHO_GCC")
+
+    dt_usm = np.asarray(dt_log.values, dtype=np.float64).copy()
+    rho = np.asarray(rho_log.values, dtype=np.float64).copy()
+    dt_valid = np.isfinite(dt_usm) & (dt_usm > 0.0)
+    rho_valid = np.isfinite(rho) & (rho > 0.0)
+    dt_usm[~dt_valid] = np.nan
+    rho[~rho_valid] = np.nan
+    if not np.any(dt_valid):
+        raise ValueError(f"DT_USM contains no positive finite samples: {path}")
+    if not np.any(rho_valid):
+        raise ValueError(f"RHO_GCC contains no positive finite samples: {path}")
+
     vp = 1_000_000.0 / dt_usm
-
-    vp = interpolate_nans(vp, method="linear")
-    rho = interpolate_nans(rho, method="linear")
-    if np.any(~np.isfinite(vp)) or np.any(~np.isfinite(rho)):
-        raise ValueError(f"Vp/Rho still contain non-finite samples after interpolation: {path}")
-
-    return grid.LogSet(
+    logs = grid.LogSet(
         {
-            "Vp": grid.Log(vp, md, "md", name="Vp", unit="m/s", allow_nan=False),
-            "Rho": grid.Log(rho, md, "md", name="Rho", unit="g/cm3", allow_nan=False),
+            "Vp": grid.Log(vp, md, "md", name="Vp", unit="m/s", allow_nan=True),
+            "Rho": grid.Log(rho, md, "md", name="Rho", unit="g/cm3", allow_nan=True),
         }
     )
+    return StandardVpRhoLogs(logs=logs, observed_mask=dt_valid & rho_valid)
+
+
+def load_vp_rho_logset_from_standard_las(path: str | Path) -> grid.LogSet:
+    """从标准 LAS 构建 MD 域 Vp/Rho LogSet。
+
+    标准 LAS 指包含第三步标准曲线 ``DT_USM`` 与 ``RHO_GCC`` 的 LAS，
+    不要求文件一定由 ``scripts/well_preprocess.py`` 生成。
+
+    Parameters
+    ----------
+    path : str | Path
+        标准 LAS 文件路径，必须包含 ``DT_USM`` 与 ``RHO_GCC`` 曲线。
+
+    Returns
+    -------
+    grid.LogSet
+        含 ``Vp`` (m/s) 与 ``Rho`` (g/cm3) 的 MD 域 LogSet。
+
+    Raises
+    ------
+    ValueError
+        缺少必需曲线、采样轴不一致或单位错误时。
+    """
+    return load_standard_vp_rho_logs(path).logs
 
 
 def _header_value(las: lasio.LASFile, section: str, mnemonic: str) -> Any:

@@ -555,152 +555,152 @@ def main() -> None:
     n_wells_qc = 0
     well_qc_summary: dict[str, float | None] = {"mean_rmse": None, "mean_mae": None, "mean_corr": None}
     source_batch_dir = resolve_relative_path(str(script_cfg["source_batch_dir"]), root=REPO_ROOT)
-        shifted_las_dir = resolve_relative_path(
-            str(script_cfg.get("shifted_las_dir", "shifted_las")), root=source_batch_dir
-        )
-        data_root = resolve_relative_path(str(cfg.get("data_root", "data")), root=REPO_ROOT)
-        well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
-        if not shifted_las_dir.exists():
-            raise FileNotFoundError(f"Shifted LAS dir not found: {shifted_las_dir}")
-        if not well_heads_file.exists():
-            raise FileNotFoundError(f"Well heads file not found: {well_heads_file}")
+    shifted_las_dir = resolve_relative_path(
+        str(script_cfg.get("shifted_las_dir", "shifted_las")), root=source_batch_dir
+    )
+    data_root = resolve_relative_path(str(cfg.get("data_root", "data")), root=REPO_ROOT)
+    well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
+    if not shifted_las_dir.exists():
+        raise FileNotFoundError(f"Shifted LAS dir not found: {shifted_las_dir}")
+    if not well_heads_file.exists():
+        raise FileNotFoundError(f"Well heads file not found: {well_heads_file}")
 
-        survey_ctx = open_survey(
-            depth_cfg.seismic_file,
-            seismic_type="segy",
-            segy_options={
-                "iline": depth_cfg.segy_iline,
-                "xline": depth_cfg.segy_xline,
-                "istep": depth_cfg.segy_istep,
-                "xstep": depth_cfg.segy_xstep,
-            },
-        )
-        sample_axis_m = _sample_axis_depth_m(trainer.geometry)
-        well_heads = import_well_heads_petrel(well_heads_file)
-        well_heads = well_heads.assign(Name_norm=well_heads["Name"].astype(str).str.upper())
-        log_filter_params = _load_auto_tie_log_filter_params(cfg)
-        split_params = _resolve_frequency_split_params(cfg, trainer.dataset_bundle.lfm_metadata)
-        well_constraints_cfg = cfg.get("well_constraints_depth", {})
-        las_ai_source = str(well_constraints_cfg.get("las_ai_source", "filtered_shifted_las")).strip().lower()
-        if las_ai_source not in {"filtered_shifted_las", "raw_shifted_las"}:
-            raise ValueError("well_constraints_depth.las_ai_source must be filtered_shifted_las or raw_shifted_las.")
+    survey_ctx = open_survey(
+        depth_cfg.seismic_file,
+        seismic_type="segy",
+        segy_options={
+            "iline": depth_cfg.segy_iline,
+            "xline": depth_cfg.segy_xline,
+            "istep": depth_cfg.segy_istep,
+            "xstep": depth_cfg.segy_xstep,
+        },
+    )
+    sample_axis_m = _sample_axis_depth_m(trainer.geometry)
+    well_heads = import_well_heads_petrel(well_heads_file)
+    well_heads = well_heads.assign(Name_norm=well_heads["Name"].astype(str).str.upper())
+    log_filter_params = _load_auto_tie_log_filter_params(cfg)
+    split_params = _resolve_frequency_split_params(cfg, trainer.dataset_bundle.lfm_metadata)
+    well_constraints_cfg = cfg.get("well_constraints_depth", {})
+    las_ai_source = str(well_constraints_cfg.get("las_ai_source", "filtered_shifted_las")).strip().lower()
+    if las_ai_source not in {"filtered_shifted_las", "raw_shifted_las"}:
+        raise ValueError("well_constraints_depth.las_ai_source must be filtered_shifted_las or raw_shifted_las.")
 
-        metrics: list[dict[str, Any]] = []
-        for las_path in sorted(shifted_las_dir.glob("*.las")):
-            well_name_norm = las_path.stem.upper()
-            head_match = well_heads.loc[well_heads["Name_norm"] == well_name_norm]
-            if head_match.empty:
-                metrics.append({"well_name": well_name_norm, "status": "failed", "error": "well head not matched"})
-                continue
+    metrics: list[dict[str, Any]] = []
+    for las_path in sorted(shifted_las_dir.glob("*.las")):
+        well_name_norm = las_path.stem.upper()
+        head_match = well_heads.loc[well_heads["Name_norm"] == well_name_norm]
+        if head_match.empty:
+            metrics.append({"well_name": well_name_norm, "status": "failed", "error": "well head not matched"})
+            continue
 
-            try:
-                head = head_match.iloc[0]
-                kb_m = float(head["Well datum value"])
-                md, ai_raw, ai_filtered = _read_shifted_las_ai_curves(
-                    las_path,
-                    log_filter_params=log_filter_params,
-                )
-                tvdss = np.asarray(md, dtype=float) - kb_m
-                ref_depth_raw, ref_ai_raw = _regularize_depth_curve(tvdss, ai_raw)
-                source_ai = ai_filtered if las_ai_source == "filtered_shifted_las" else ai_raw
-                ref_depth_anchor, ref_ai_anchor_source = _regularize_depth_curve(tvdss, source_ai)
-                ref_ai_anchor = _lowpass_ai_curve(ref_depth_anchor, ref_ai_anchor_source, split_params)
-                raw_on_anchor = np.interp(ref_depth_anchor, ref_depth_raw, ref_ai_raw, left=np.nan, right=np.nan)
-
-                pred_trace = _bilinear_trace_from_volume(
-                    pred_volume,
-                    survey_ctx,
-                    float(head["Surface X"]),
-                    float(head["Surface Y"]),
-                )
-                pred_ai = np.interp(ref_depth_anchor, sample_axis_m, pred_trace, left=np.nan, right=np.nan)
-                valid = np.isfinite(pred_ai) & np.isfinite(ref_ai_anchor)
-                if not np.any(valid):
-                    raise ValueError("no overlapping finite samples")
-
-                diff = pred_ai[valid] - ref_ai_anchor[valid]
-                corr = (
-                    float(np.corrcoef(pred_ai[valid], ref_ai_anchor[valid])[0, 1]) if int(valid.sum()) > 1 else np.nan
-                )
-                safe_name = sanitize_filename(str(head["Name"]))
-                trace_qc_path = output_dirs["well_qc_traces"] / f"well_qc_{safe_name}.csv"
-                pd.DataFrame(
-                    {
-                        "depth_m": ref_depth_anchor[valid],
-                        "shifted_las_ai_raw": raw_on_anchor[valid],
-                        "stage1_anchor_ai": ref_ai_anchor[valid],
-                        "predicted_ai": pred_ai[valid],
-                        "diff_ai_vs_stage1_anchor": diff,
-                    }
-                ).to_csv(trace_qc_path, index=False)
-
-                qc_plot_path = output_dirs["well_qc_figures"] / f"well_qc_{safe_name}.png"
-                fig, ax = plt.subplots(figsize=(5, 10), constrained_layout=True)
-                plot_depth_min = float(ref_depth_anchor[valid][0])
-                plot_depth_max = float(ref_depth_anchor[valid][-1])
-                raw_plot_mask = (ref_depth_raw >= plot_depth_min) & (ref_depth_raw <= plot_depth_max)
-                anchor_label = "Stage-1 well anchor AI"
-                if bool(split_params.get("enabled", True)):
-                    anchor_label += f" (LP {float(split_params['cutoff_wavelength_m']):.0f}m)"
-                ax.plot(
-                    ref_ai_raw[raw_plot_mask],
-                    ref_depth_raw[raw_plot_mask],
-                    label="Shifted LAS AI (raw)",
-                    lw=0.8,
-                    alpha=0.35,
-                    color="gray",
-                )
-                ax.plot(ref_ai_anchor[valid], ref_depth_anchor[valid], label=anchor_label, lw=1.8, color="blue")
-                ax.plot(pred_ai[valid], ref_depth_anchor[valid], label="GINN-Depth predicted AI", lw=2, color="red")
-                ax.invert_yaxis()
-                ax.set_xlabel("AI")
-                ax.set_ylabel("Depth (m)")
-                ax.set_title(f"Well QC | {head['Name']}")
-                ax.legend(loc="best")
-                ax.grid(True, alpha=0.3, linestyle=":")
-                fig.savefig(qc_plot_path, dpi=180, bbox_inches="tight")
-                plt.close(fig)
-
-                metrics.append(
-                    {
-                        "well_name": head["Name"],
-                        "status": "ok",
-                        "n_samples": int(np.sum(valid)),
-                        "mae": float(np.mean(np.abs(diff))),
-                        "rmse": float(np.sqrt(np.mean(diff**2))),
-                        "bias": float(np.mean(diff)),
-                        "corr": corr,
-                        "reference_target": "stage1_anchor_ai",
-                        "las_ai_source": las_ai_source,
-                        "frequency_split_cutoff_wavelength_m": split_params.get("cutoff_wavelength_m"),
-                        "frequency_split_filter_order": split_params.get("filter_order"),
-                        "frequency_split_parameter_source": split_params.get("frequency_split_parameter_source"),
-                        "log_filter_params_json": json.dumps(log_filter_params, ensure_ascii=False),
-                        "reference_file": las_path.name,
-                        "trace_qc_path": str(trace_qc_path),
-                        "figure_path": str(qc_plot_path),
-                    }
-                )
-            except Exception as exc:
-                metrics.append({"well_name": well_name_norm, "status": "failed", "error": str(exc)})
-
-        metrics_df = pd.DataFrame(metrics)
-        if not metrics_df.empty and "rmse" in metrics_df:
-            ok = metrics_df["status"] == "ok"
-            metrics_df = pd.concat(
-                [metrics_df.loc[ok].sort_values("rmse"), metrics_df.loc[~ok]],
-                ignore_index=True,
+        try:
+            head = head_match.iloc[0]
+            kb_m = float(head["Well datum value"])
+            md, ai_raw, ai_filtered = _read_shifted_las_ai_curves(
+                las_path,
+                log_filter_params=log_filter_params,
             )
-        well_qc_metrics_path = output_dirs["well_qc"] / "well_qc_metrics.csv"
-        metrics_df.to_csv(well_qc_metrics_path, index=False)
-        ok_metrics = metrics_df.loc[metrics_df["status"] == "ok"] if "status" in metrics_df else pd.DataFrame()
-        n_wells_qc = int(len(ok_metrics))
-        if not ok_metrics.empty:
-            well_qc_summary = {
-                "mean_rmse": float(ok_metrics["rmse"].mean()),
-                "mean_mae": float(ok_metrics["mae"].mean()),
-                "mean_corr": float(ok_metrics["corr"].mean()),
-            }
+            tvdss = np.asarray(md, dtype=float) - kb_m
+            ref_depth_raw, ref_ai_raw = _regularize_depth_curve(tvdss, ai_raw)
+            source_ai = ai_filtered if las_ai_source == "filtered_shifted_las" else ai_raw
+            ref_depth_anchor, ref_ai_anchor_source = _regularize_depth_curve(tvdss, source_ai)
+            ref_ai_anchor = _lowpass_ai_curve(ref_depth_anchor, ref_ai_anchor_source, split_params)
+            raw_on_anchor = np.interp(ref_depth_anchor, ref_depth_raw, ref_ai_raw, left=np.nan, right=np.nan)
+
+            pred_trace = _bilinear_trace_from_volume(
+                pred_volume,
+                survey_ctx,
+                float(head["Surface X"]),
+                float(head["Surface Y"]),
+            )
+            pred_ai = np.interp(ref_depth_anchor, sample_axis_m, pred_trace, left=np.nan, right=np.nan)
+            valid = np.isfinite(pred_ai) & np.isfinite(ref_ai_anchor)
+            if not np.any(valid):
+                raise ValueError("no overlapping finite samples")
+
+            diff = pred_ai[valid] - ref_ai_anchor[valid]
+            corr = (
+                float(np.corrcoef(pred_ai[valid], ref_ai_anchor[valid])[0, 1]) if int(valid.sum()) > 1 else np.nan
+            )
+            safe_name = sanitize_filename(str(head["Name"]))
+            trace_qc_path = output_dirs["well_qc_traces"] / f"well_qc_{safe_name}.csv"
+            pd.DataFrame(
+                {
+                    "depth_m": ref_depth_anchor[valid],
+                    "shifted_las_ai_raw": raw_on_anchor[valid],
+                    "stage1_anchor_ai": ref_ai_anchor[valid],
+                    "predicted_ai": pred_ai[valid],
+                    "diff_ai_vs_stage1_anchor": diff,
+                }
+            ).to_csv(trace_qc_path, index=False)
+
+            qc_plot_path = output_dirs["well_qc_figures"] / f"well_qc_{safe_name}.png"
+            fig, ax = plt.subplots(figsize=(5, 10), constrained_layout=True)
+            plot_depth_min = float(ref_depth_anchor[valid][0])
+            plot_depth_max = float(ref_depth_anchor[valid][-1])
+            raw_plot_mask = (ref_depth_raw >= plot_depth_min) & (ref_depth_raw <= plot_depth_max)
+            anchor_label = "Stage-1 well anchor AI"
+            if bool(split_params.get("enabled", True)):
+                anchor_label += f" (LP {float(split_params['cutoff_wavelength_m']):.0f}m)"
+            ax.plot(
+                ref_ai_raw[raw_plot_mask],
+                ref_depth_raw[raw_plot_mask],
+                label="Shifted LAS AI (raw)",
+                lw=0.8,
+                alpha=0.35,
+                color="gray",
+            )
+            ax.plot(ref_ai_anchor[valid], ref_depth_anchor[valid], label=anchor_label, lw=1.8, color="blue")
+            ax.plot(pred_ai[valid], ref_depth_anchor[valid], label="GINN-Depth predicted AI", lw=2, color="red")
+            ax.invert_yaxis()
+            ax.set_xlabel("AI")
+            ax.set_ylabel("Depth (m)")
+            ax.set_title(f"Well QC | {head['Name']}")
+            ax.legend(loc="best")
+            ax.grid(True, alpha=0.3, linestyle=":")
+            fig.savefig(qc_plot_path, dpi=180, bbox_inches="tight")
+            plt.close(fig)
+
+            metrics.append(
+                {
+                    "well_name": head["Name"],
+                    "status": "ok",
+                    "n_samples": int(np.sum(valid)),
+                    "mae": float(np.mean(np.abs(diff))),
+                    "rmse": float(np.sqrt(np.mean(diff**2))),
+                    "bias": float(np.mean(diff)),
+                    "corr": corr,
+                    "reference_target": "stage1_anchor_ai",
+                    "las_ai_source": las_ai_source,
+                    "frequency_split_cutoff_wavelength_m": split_params.get("cutoff_wavelength_m"),
+                    "frequency_split_filter_order": split_params.get("filter_order"),
+                    "frequency_split_parameter_source": split_params.get("frequency_split_parameter_source"),
+                    "log_filter_params_json": json.dumps(log_filter_params, ensure_ascii=False),
+                    "reference_file": las_path.name,
+                    "trace_qc_path": str(trace_qc_path),
+                    "figure_path": str(qc_plot_path),
+                }
+            )
+        except Exception as exc:
+            metrics.append({"well_name": well_name_norm, "status": "failed", "error": str(exc)})
+
+    metrics_df = pd.DataFrame(metrics)
+    if not metrics_df.empty and "rmse" in metrics_df:
+        ok = metrics_df["status"] == "ok"
+        metrics_df = pd.concat(
+            [metrics_df.loc[ok].sort_values("rmse"), metrics_df.loc[~ok]],
+            ignore_index=True,
+        )
+    well_qc_metrics_path = output_dirs["well_qc"] / "well_qc_metrics.csv"
+    metrics_df.to_csv(well_qc_metrics_path, index=False)
+    ok_metrics = metrics_df.loc[metrics_df["status"] == "ok"] if "status" in metrics_df else pd.DataFrame()
+    n_wells_qc = int(len(ok_metrics))
+    if not ok_metrics.empty:
+        well_qc_summary = {
+            "mean_rmse": float(ok_metrics["rmse"].mean()),
+            "mean_mae": float(ok_metrics["mae"].mean()),
+            "mean_corr": float(ok_metrics["corr"].mean()),
+        }
 
     run_summary = {
         "checkpoint_path": str(checkpoint_path),

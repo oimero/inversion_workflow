@@ -172,6 +172,7 @@ manual_shift:
 |------|------|
 | `allow_near_outside` | 是否允许工区边缘外的井参与标定。默认只接受工区内井。 |
 | `min_tie_samples` | 实际标定窗口里至少要保留多少时间样点。 |
+| `max_short_log_gap_s` | 允许为连续滤波支撑而线性填补的内部 DT/RHO 缺口时长，默认 `0.010 s`。 |
 | `max_trajectory_outside_fraction` | 斜井目标窗口内最多允许多少比例的轨迹样点落到工区外。 |
 
 斜井轨迹在目标窗口内采样时，部分 TWT 样点对应的轨迹 XY 可能落到工区之外。脚本的处理逻辑是：
@@ -259,6 +260,10 @@ manual_shift:
 `time_depth/optimized_tdt_<well>.csv` 是工作流内部格式，保留正秒 `twt_s` 和正米 `md_m`；`petrel_checkshots/optimized_tdt_<well>.txt` 是地质软件导入格式，沿用 `export_vertical_tdt_to_petrel_checkshots()` 的口径导出。
 
 `filtered_las/filtered_logs_<well>.las` 固定包含 `DT_USM`（`us/m`）、`RHO_GCC`（`g/cm3`）和 `AI`（`m/s*g/cm3`）。第四步只信当前输入 LAS 的基础 DT/RHO，完成最优滤波后重新计算 AI；不会校验或沿用第三步、人工处理中已有的旧 AI。
+
+第四步不再无条件贯通全部缺失段。它只填补 `<=10 ms` 的内部短缺口，然后在目标窗内选择 DT/RHO 最长连续联合有效段执行 auto-tie；该段按地震时间采样间隔计数，不足 `min_tie_samples` 时整井失败。`continuous_tie_log_sample_count` 另行记录原始 MD 轴点数，不能用于替代这一门槛。导出 LAS 会回到完整第三步 MD 轴，按联合有效段独立应用最优滤波，长缺口继续写为 LAS NULL。
+
+`vertical_anchor_from_tops` 没有输入 TDT，因此允许为“初始 TDT 坐标映射”临时补齐声波缺口；该曲线不进入 auto-tie、不导出 LAS。正式标定仍回到原始观测 mask，执行同一套 `10 ms` 缺口规则和最长连续段门槛，QC 记录 `anchor_tdt_mapping_only_*` 字段。
 
 它保留本井自动标定选中的滤波效果，但不会把时深表的整体时移写回测井曲线。也就是说，它修的是曲线滤波口径，不是把 LAS 深度轴改掉。
 

@@ -33,7 +33,7 @@ from cup.utils.io import sanitize_filename
 from cup.utils.statistics import radius_connected_components
 from cup.well.assets import normalize_well_name
 from cup.well.las import load_vp_rho_logset_from_standard_las
-from cup.well.td import load_workflow_time_depth_table_csv
+from cup.well.td import crop_logset_md, load_workflow_time_depth_table_csv
 
 
 class TieRoute(str, Enum):
@@ -588,12 +588,52 @@ def prepare_well_for_evaluation(well_artifact: TieEvaluationWell) -> tuple[Any, 
     """
     from wtie.optimize import tie as tie_ops
 
-    logset = load_vp_rho_logset_from_standard_las(well_artifact.input_las)
-    table = load_workflow_time_depth_table_csv(well_artifact.optimized_tdt_file)
-    seismic = load_saved_seismic_trace_csv(well_artifact.seismic_trace_file)
+    logset, table, seismic = load_continuous_tie_evaluation_inputs(well_artifact)
     seismic_dt_s = _regular_dt_from_basis(seismic.basis, label="seismic trace")
     reflectivity = build_reflectivity_for_tie_eval(logset, table, seismic_dt_s)
     return tie_ops.match_seismic_and_reflectivity(seismic, reflectivity)
+
+
+def load_continuous_tie_evaluation_inputs(
+    well_artifact: TieEvaluationWell,
+) -> tuple[Any, Any, Any]:
+    """Load and crop fourth-step artifacts to one gap-free evaluation window."""
+    logset = load_vp_rho_logset_from_standard_las(well_artifact.input_las)
+    table = load_workflow_time_depth_table_csv(well_artifact.optimized_tdt_file)
+    seismic = load_saved_seismic_trace_csv(well_artifact.seismic_trace_file)
+
+    start_s = max(float(seismic.basis[0]), float(table.twt[0]))
+    end_s = min(float(seismic.basis[-1]), float(table.twt[-1]))
+    if well_artifact.tie_window_start_s is not None:
+        start_s = max(start_s, float(well_artifact.tie_window_start_s))
+    if well_artifact.tie_window_end_s is not None:
+        end_s = min(end_s, float(well_artifact.tie_window_end_s))
+    if end_s <= start_s:
+        raise ValueError("Fourth-step LAS, TDT, and seismic trace have no common tie window.")
+
+    keep = (seismic.basis >= start_s) & (seismic.basis <= end_s)
+    if int(np.count_nonzero(keep)) < 2:
+        raise ValueError("Common fourth-step tie window contains fewer than two seismic samples.")
+    seismic = type(seismic)(
+        seismic.values[keep],
+        seismic.basis[keep],
+        "twt",
+        name=seismic.name,
+    )
+    md_start = float(np.interp(float(seismic.basis[0]), table.twt, table.md))
+    md_end = float(np.interp(float(seismic.basis[-1]), table.twt, table.md))
+    logset = crop_logset_md(logset, md_start, md_end, min_samples=2)
+    joint_valid = (
+        np.isfinite(logset.Vp.values)
+        & (logset.Vp.values > 0.0)
+        & np.isfinite(logset.Rho.values)
+        & (logset.Rho.values > 0.0)
+    )
+    if not np.all(joint_valid):
+        raise ValueError(
+            "Fourth-step filtered LAS contains a long DT/RHO gap inside the saved continuous tie window."
+        )
+    return logset, table, seismic
 
 
 def evaluate_wavelet_on_well(

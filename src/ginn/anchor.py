@@ -250,6 +250,24 @@ def validate_log_ai_anchor(
     if np.any(~np.isfinite(target_log_ai[mask])):
         raise ValueError("target_log_ai must be finite inside anchor_mask.")
 
+    if (
+        bundle.sample_domain == "time"
+        and str(bundle.metadata.get("artifact_family", "")) == "well_constraints_time"
+    ):
+        expected_band = "lowpass_reference_to_ginn_cutoff"
+        if bundle.metadata.get("anchor_target_band") != expected_band:
+            raise ValueError(
+                "Time-domain well anchor must target ginn_target_log_ai; "
+                f"expected anchor_target_band={expected_band!r}."
+            )
+        frequency_bands = bundle.metadata.get("frequency_bands")
+        if not isinstance(frequency_bands, dict):
+            raise ValueError("Time-domain well anchor metadata must contain frequency_bands.")
+        for key in ("lfm_cutoff_hz", "ginn_cutoff_hz", "reference_cutoff_hz"):
+            value = frequency_bands.get(key)
+            if value is None or not np.isfinite(float(value)):
+                raise ValueError(f"Time-domain well anchor metadata is missing finite {key}.")
+
 
 def summarize_log_ai_anchor(
     target_log_ai: np.ndarray,

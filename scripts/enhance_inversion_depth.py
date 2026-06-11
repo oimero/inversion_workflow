@@ -552,169 +552,169 @@ def main() -> None:
     n_wells_qc = 0
     well_qc_summary: dict[str, float | None] = {"mean_rmse": None, "mean_mae": None, "mean_corr": None}
     source_batch_dir = resolve_relative_path(str(script_cfg["source_batch_dir"]), root=REPO_ROOT)
-        shifted_las_dir = resolve_relative_path(
-            str(script_cfg.get("shifted_las_dir", "shifted_las")), root=source_batch_dir
-        )
-        data_root = resolve_relative_path(str(cfg.get("data_root", "data")), root=REPO_ROOT)
-        well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
-        if not shifted_las_dir.exists():
-            raise FileNotFoundError(f"Shifted LAS dir not found: {shifted_las_dir}")
-        if not well_heads_file.exists():
-            raise FileNotFoundError(f"Well heads file not found: {well_heads_file}")
+    shifted_las_dir = resolve_relative_path(
+        str(script_cfg.get("shifted_las_dir", "shifted_las")), root=source_batch_dir
+    )
+    data_root = resolve_relative_path(str(cfg.get("data_root", "data")), root=REPO_ROOT)
+    well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
+    if not shifted_las_dir.exists():
+        raise FileNotFoundError(f"Shifted LAS dir not found: {shifted_las_dir}")
+    if not well_heads_file.exists():
+        raise FileNotFoundError(f"Well heads file not found: {well_heads_file}")
 
-        survey_ctx = open_survey(
-            depth_cfg.seismic_file,
-            seismic_type="segy",
-            segy_options={
-                "iline": depth_cfg.segy_iline,
-                "xline": depth_cfg.segy_xline,
-                "istep": depth_cfg.segy_istep,
-                "xstep": depth_cfg.segy_xstep,
-            },
-        )
-        well_heads = import_well_heads_petrel(well_heads_file)
-        well_heads = well_heads.assign(Name_norm=well_heads["Name"].astype(str).str.upper())
+    survey_ctx = open_survey(
+        depth_cfg.seismic_file,
+        seismic_type="segy",
+        segy_options={
+            "iline": depth_cfg.segy_iline,
+            "xline": depth_cfg.segy_xline,
+            "istep": depth_cfg.segy_istep,
+            "xstep": depth_cfg.segy_xstep,
+        },
+    )
+    well_heads = import_well_heads_petrel(well_heads_file)
+    well_heads = well_heads.assign(Name_norm=well_heads["Name"].astype(str).str.upper())
 
-        log_filter_params = _load_auto_tie_log_filter_params(cfg)
+    log_filter_params = _load_auto_tie_log_filter_params(cfg)
 
-        metrics: list[dict[str, Any]] = []
-        for las_path in sorted(shifted_las_dir.glob("*.las")):
-            well_name_norm = las_path.stem.upper()
-            head_match = well_heads.loc[well_heads["Name_norm"] == well_name_norm]
-            if head_match.empty:
-                metrics.append({"well_name": well_name_norm, "status": "failed", "error": "well head not matched"})
-                continue
+    metrics: list[dict[str, Any]] = []
+    for las_path in sorted(shifted_las_dir.glob("*.las")):
+        well_name_norm = las_path.stem.upper()
+        head_match = well_heads.loc[well_heads["Name_norm"] == well_name_norm]
+        if head_match.empty:
+            metrics.append({"well_name": well_name_norm, "status": "failed", "error": "well head not matched"})
+            continue
 
-            try:
-                head = head_match.iloc[0]
-                kb_m = float(head["Well datum value"])
-                md, ai_raw, ai_filtered = _read_shifted_las_ai_curves(
-                    las_path,
-                    log_filter_params=log_filter_params,
-                )
-                tvdss_raw = np.asarray(md, dtype=float) - kb_m
-                valid_md = np.isfinite(tvdss_raw) & np.isfinite(ai_raw) & (ai_raw > 0.0)
-                if int(valid_md.sum()) < 2:
-                    raise ValueError("too few finite positive AI samples after MD→TVDSS")
-                ref_depth, ref_ai_raw = _regularize_depth_curve(tvdss_raw[valid_md], ai_raw[valid_md])
-                valid_filtered = np.isfinite(tvdss_raw) & np.isfinite(ai_filtered) & (ai_filtered > 0.0)
-                ref_depth_filtered, ref_ai_filtered = _regularize_depth_curve(
-                    tvdss_raw[valid_filtered],
-                    ai_filtered[valid_filtered],
-                )
-                ref_ai_raw_sampled = _downsample_curve_to_axis(ref_depth, ref_ai_raw, sample_axis_m)
-                ref_ai_filtered_sampled = _downsample_curve_to_axis(
-                    ref_depth_filtered,
-                    ref_ai_filtered,
-                    sample_axis_m,
-                )
-
-                pred_trace = _bilinear_trace_from_volume(
-                    enhanced_volume,
-                    survey_ctx,
-                    float(head["Surface X"]),
-                    float(head["Surface Y"]),
-                )
-                pred_ai = np.asarray(pred_trace, dtype=np.float32)
-                valid = np.isfinite(pred_ai) & np.isfinite(ref_ai_filtered_sampled)
-                if not np.any(valid):
-                    raise ValueError("no overlapping finite samples")
-
-                diff = pred_ai[valid] - ref_ai_filtered_sampled[valid]
-                corr = (
-                    float(np.corrcoef(pred_ai[valid], ref_ai_filtered_sampled[valid])[0, 1])
-                    if int(valid.sum()) > 1
-                    else np.nan
-                )
-                valid_raw = np.isfinite(pred_ai) & np.isfinite(ref_ai_raw_sampled)
-                diff_raw = pred_ai[valid_raw] - ref_ai_raw_sampled[valid_raw]
-                corr_raw = (
-                    float(np.corrcoef(pred_ai[valid_raw], ref_ai_raw_sampled[valid_raw])[0, 1])
-                    if int(valid_raw.sum()) > 1
-                    else np.nan
-                )
-                safe_name = sanitize_filename(str(head["Name"]))
-                trace_qc_path = output_dirs["well_qc_traces"] / f"well_qc_{safe_name}.csv"
-                pd.DataFrame(
-                    {
-                        "depth_m": sample_axis_m[valid],
-                        "shifted_las_ai_downsampled": ref_ai_raw_sampled[valid],
-                        "shifted_las_ai_filtered_downsampled": ref_ai_filtered_sampled[valid],
-                        "enhanced_ai": pred_ai[valid],
-                        "diff_ai": diff,
-                    }
-                ).to_csv(trace_qc_path, index=False)
-
-                qc_plot_path = output_dirs["well_qc_figures"] / f"well_qc_{safe_name}.png"
-                fig, ax = plt.subplots(figsize=(5, 10), constrained_layout=True)
-                raw_plot_mask = (ref_depth >= sample_axis_m[valid][0]) & (ref_depth <= sample_axis_m[valid][-1])
-                filtered_plot_mask = (ref_depth_filtered >= sample_axis_m[valid][0]) & (
-                    ref_depth_filtered <= sample_axis_m[valid][-1]
-                )
-                ax.plot(
-                    ref_ai_raw[raw_plot_mask],
-                    ref_depth[raw_plot_mask],
-                    label="Shifted LAS AI",
-                    lw=0.8,
-                    alpha=0.35,
-                    color="gray",
-                )
-                ax.plot(
-                    ref_ai_filtered[filtered_plot_mask],
-                    ref_depth_filtered[filtered_plot_mask],
-                    label="Shifted LAS AI (filtered)",
-                    lw=1.6,
-                    color="blue",
-                )
-                ax.plot(pred_ai[valid], sample_axis_m[valid], label="Enhanced predicted AI", lw=2, color="red")
-                ax.invert_yaxis()
-                ax.set_xlabel("AI")
-                ax.set_ylabel("Depth (m)")
-                ax.set_title(f"Well QC | {head['Name']}")
-                ax.legend(loc="best")
-                ax.grid(True, alpha=0.3, linestyle=":")
-                fig.savefig(qc_plot_path, dpi=180, bbox_inches="tight")
-                plt.close(fig)
-
-                metrics.append(
-                    {
-                        "well_name": head["Name"],
-                        "status": "ok",
-                        "n_samples": int(np.sum(valid)),
-                        "mae": float(np.mean(np.abs(diff))),
-                        "rmse": float(np.sqrt(np.mean(diff**2))),
-                        "bias": float(np.mean(diff)),
-                        "corr": corr,
-                        "mae_raw_downsampled": float(np.mean(np.abs(diff_raw))) if diff_raw.size else np.nan,
-                        "rmse_raw_downsampled": float(np.sqrt(np.mean(diff_raw**2))) if diff_raw.size else np.nan,
-                        "bias_raw_downsampled": float(np.mean(diff_raw)) if diff_raw.size else np.nan,
-                        "corr_raw_downsampled": corr_raw,
-                        "log_filter_params_json": json.dumps(log_filter_params, ensure_ascii=False),
-                        "reference_file": las_path.name,
-                        "trace_qc_path": str(trace_qc_path),
-                        "figure_path": str(qc_plot_path),
-                    }
-                )
-            except Exception as exc:
-                metrics.append({"well_name": well_name_norm, "status": "failed", "error": str(exc)})
-
-        metrics_df = pd.DataFrame(metrics)
-        if not metrics_df.empty and "rmse" in metrics_df:
-            ok = metrics_df["status"] == "ok"
-            metrics_df = pd.concat(
-                [metrics_df.loc[ok].sort_values("rmse"), metrics_df.loc[~ok]],
-                ignore_index=True,
+        try:
+            head = head_match.iloc[0]
+            kb_m = float(head["Well datum value"])
+            md, ai_raw, ai_filtered = _read_shifted_las_ai_curves(
+                las_path,
+                log_filter_params=log_filter_params,
             )
-        well_qc_metrics_path = output_dirs["well_qc"] / "well_qc_metrics.csv"
-        metrics_df.to_csv(well_qc_metrics_path, index=False)
-        ok_metrics = metrics_df.loc[metrics_df["status"] == "ok"] if "status" in metrics_df else pd.DataFrame()
-        n_wells_qc = int(len(ok_metrics))
-        if not ok_metrics.empty:
-            well_qc_summary = {
-                "mean_rmse": float(ok_metrics["rmse"].mean()),
-                "mean_mae": float(ok_metrics["mae"].mean()),
-                "mean_corr": float(ok_metrics["corr"].mean()),
-            }
+            tvdss_raw = np.asarray(md, dtype=float) - kb_m
+            valid_md = np.isfinite(tvdss_raw) & np.isfinite(ai_raw) & (ai_raw > 0.0)
+            if int(valid_md.sum()) < 2:
+                raise ValueError("too few finite positive AI samples after MD→TVDSS")
+            ref_depth, ref_ai_raw = _regularize_depth_curve(tvdss_raw[valid_md], ai_raw[valid_md])
+            valid_filtered = np.isfinite(tvdss_raw) & np.isfinite(ai_filtered) & (ai_filtered > 0.0)
+            ref_depth_filtered, ref_ai_filtered = _regularize_depth_curve(
+                tvdss_raw[valid_filtered],
+                ai_filtered[valid_filtered],
+            )
+            ref_ai_raw_sampled = _downsample_curve_to_axis(ref_depth, ref_ai_raw, sample_axis_m)
+            ref_ai_filtered_sampled = _downsample_curve_to_axis(
+                ref_depth_filtered,
+                ref_ai_filtered,
+                sample_axis_m,
+            )
+
+            pred_trace = _bilinear_trace_from_volume(
+                enhanced_volume,
+                survey_ctx,
+                float(head["Surface X"]),
+                float(head["Surface Y"]),
+            )
+            pred_ai = np.asarray(pred_trace, dtype=np.float32)
+            valid = np.isfinite(pred_ai) & np.isfinite(ref_ai_filtered_sampled)
+            if not np.any(valid):
+                raise ValueError("no overlapping finite samples")
+
+            diff = pred_ai[valid] - ref_ai_filtered_sampled[valid]
+            corr = (
+                float(np.corrcoef(pred_ai[valid], ref_ai_filtered_sampled[valid])[0, 1])
+                if int(valid.sum()) > 1
+                else np.nan
+            )
+            valid_raw = np.isfinite(pred_ai) & np.isfinite(ref_ai_raw_sampled)
+            diff_raw = pred_ai[valid_raw] - ref_ai_raw_sampled[valid_raw]
+            corr_raw = (
+                float(np.corrcoef(pred_ai[valid_raw], ref_ai_raw_sampled[valid_raw])[0, 1])
+                if int(valid_raw.sum()) > 1
+                else np.nan
+            )
+            safe_name = sanitize_filename(str(head["Name"]))
+            trace_qc_path = output_dirs["well_qc_traces"] / f"well_qc_{safe_name}.csv"
+            pd.DataFrame(
+                {
+                    "depth_m": sample_axis_m[valid],
+                    "shifted_las_ai_downsampled": ref_ai_raw_sampled[valid],
+                    "shifted_las_ai_filtered_downsampled": ref_ai_filtered_sampled[valid],
+                    "enhanced_ai": pred_ai[valid],
+                    "diff_ai": diff,
+                }
+            ).to_csv(trace_qc_path, index=False)
+
+            qc_plot_path = output_dirs["well_qc_figures"] / f"well_qc_{safe_name}.png"
+            fig, ax = plt.subplots(figsize=(5, 10), constrained_layout=True)
+            raw_plot_mask = (ref_depth >= sample_axis_m[valid][0]) & (ref_depth <= sample_axis_m[valid][-1])
+            filtered_plot_mask = (ref_depth_filtered >= sample_axis_m[valid][0]) & (
+                ref_depth_filtered <= sample_axis_m[valid][-1]
+            )
+            ax.plot(
+                ref_ai_raw[raw_plot_mask],
+                ref_depth[raw_plot_mask],
+                label="Shifted LAS AI",
+                lw=0.8,
+                alpha=0.35,
+                color="gray",
+            )
+            ax.plot(
+                ref_ai_filtered[filtered_plot_mask],
+                ref_depth_filtered[filtered_plot_mask],
+                label="Shifted LAS AI (filtered)",
+                lw=1.6,
+                color="blue",
+            )
+            ax.plot(pred_ai[valid], sample_axis_m[valid], label="Enhanced predicted AI", lw=2, color="red")
+            ax.invert_yaxis()
+            ax.set_xlabel("AI")
+            ax.set_ylabel("Depth (m)")
+            ax.set_title(f"Well QC | {head['Name']}")
+            ax.legend(loc="best")
+            ax.grid(True, alpha=0.3, linestyle=":")
+            fig.savefig(qc_plot_path, dpi=180, bbox_inches="tight")
+            plt.close(fig)
+
+            metrics.append(
+                {
+                    "well_name": head["Name"],
+                    "status": "ok",
+                    "n_samples": int(np.sum(valid)),
+                    "mae": float(np.mean(np.abs(diff))),
+                    "rmse": float(np.sqrt(np.mean(diff**2))),
+                    "bias": float(np.mean(diff)),
+                    "corr": corr,
+                    "mae_raw_downsampled": float(np.mean(np.abs(diff_raw))) if diff_raw.size else np.nan,
+                    "rmse_raw_downsampled": float(np.sqrt(np.mean(diff_raw**2))) if diff_raw.size else np.nan,
+                    "bias_raw_downsampled": float(np.mean(diff_raw)) if diff_raw.size else np.nan,
+                    "corr_raw_downsampled": corr_raw,
+                    "log_filter_params_json": json.dumps(log_filter_params, ensure_ascii=False),
+                    "reference_file": las_path.name,
+                    "trace_qc_path": str(trace_qc_path),
+                    "figure_path": str(qc_plot_path),
+                }
+            )
+        except Exception as exc:
+            metrics.append({"well_name": well_name_norm, "status": "failed", "error": str(exc)})
+
+    metrics_df = pd.DataFrame(metrics)
+    if not metrics_df.empty and "rmse" in metrics_df:
+        ok = metrics_df["status"] == "ok"
+        metrics_df = pd.concat(
+            [metrics_df.loc[ok].sort_values("rmse"), metrics_df.loc[~ok]],
+            ignore_index=True,
+        )
+    well_qc_metrics_path = output_dirs["well_qc"] / "well_qc_metrics.csv"
+    metrics_df.to_csv(well_qc_metrics_path, index=False)
+    ok_metrics = metrics_df.loc[metrics_df["status"] == "ok"] if "status" in metrics_df else pd.DataFrame()
+    n_wells_qc = int(len(ok_metrics))
+    if not ok_metrics.empty:
+        well_qc_summary = {
+            "mean_rmse": float(ok_metrics["rmse"].mean()),
+            "mean_mae": float(ok_metrics["mae"].mean()),
+            "mean_corr": float(ok_metrics["corr"].mean()),
+        }
 
     # ── Run summary ─────────────────────────────────────────────
     run_summary = {

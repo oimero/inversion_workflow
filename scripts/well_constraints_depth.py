@@ -43,6 +43,7 @@ if str(SRC_DIR) not in sys.path:
 from cup.petrel.load import import_well_heads_petrel
 from cup.seismic.survey import open_survey
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename
+from cup.utils.masks import true_runs
 from cup.utils.raw_trace import centered_moving_average
 from ginn_depth.prior import (
     WellResolutionPriorBundle,
@@ -240,15 +241,6 @@ def _resolve_frequency_split_params(script_cfg: dict[str, Any], lfm_metadata: di
     }
 
 
-def _true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
-    values = np.asarray(mask, dtype=bool).reshape(-1)
-    if values.size == 0:
-        return []
-    padded = np.concatenate([[False], values, [False]])
-    changes = np.flatnonzero(padded[1:] != padded[:-1])
-    return [(int(changes[i]), int(changes[i + 1])) for i in range(0, changes.size, 2)]
-
-
 def _split_log_ai_frequency_bands(
     depth: np.ndarray,
     ai: np.ndarray,
@@ -288,7 +280,7 @@ def _split_log_ai_frequency_bands(
         order = int(split_params["filter_order"])
         pad_samples = max(1, 3 * order)
         buffer_mode = str(split_params.get("buffer_mode", "reflect"))
-        for start, stop in _true_runs(mask):
+        for start, stop in true_runs(mask):
             values = ai[start:stop].astype(np.float64)
             if values.size <= max(3, order):
                 filtered = values
@@ -470,7 +462,7 @@ def _high_frequency_envelope(high_log_ai: np.ndarray, mask: np.ndarray, window_s
         raise ValueError("high_log_ai and mask must have matching 1D shapes for envelope QC.")
 
     envelope = np.full_like(values, np.nan, dtype=np.float32)
-    for start, stop in _true_runs(valid):
+    for start, stop in true_runs(valid):
         run = values[start:stop].astype(np.float32, copy=True)
         run -= float(np.mean(run))
         envelope[start:stop] = centered_moving_average(np.abs(run), int(window_samples))

@@ -400,14 +400,17 @@ def _write_lfm_well_qc(
         qc_df["seismic_sample_index"].to_numpy(dtype=np.float64),
         field_name="seismic_sample_index",
     )
-    qc_df["ai_lfm_sampled"] = sample_volume_at_points(
+    qc_df["lfm_ai_sampled"] = sample_volume_at_points(
         result.volume,
         result.geometry,
         qc_df["inline_float"].to_numpy(dtype=np.float64),
         qc_df["xline_float"].to_numpy(dtype=np.float64),
         qc_df["seismic_sample_index_used"].to_numpy(dtype=np.int64),
     )
-    qc_df["diff_ai_lfm_minus_control"] = qc_df["ai_lfm_sampled"].to_numpy(dtype=np.float64) - qc_df["ai"].to_numpy(dtype=np.float64)
+    qc_df["diff_lfm_ai_minus_control"] = (
+        qc_df["lfm_ai_sampled"].to_numpy(dtype=np.float64)
+        - qc_df["ai"].to_numpy(dtype=np.float64)
+    )
 
     metrics_rows: list[dict[str, Any]] = []
     try:
@@ -541,8 +544,8 @@ def _write_lfm_well_qc(
             trace_df = pd.DataFrame(
                 {
                     "twt_s": display_twt,
-                    "well_low_ai": control_values,
-                    "ai_lfm_sampled": lfm_ai_values,
+                    "lfm_ai": control_values,
+                    "lfm_ai_sampled": lfm_ai_values,
                     "reflectivity_lfm": reflectivity_values,
                     "seismic_raw": seismic_raw,
                     "seismic_normalized": observed,
@@ -574,7 +577,7 @@ def _write_lfm_well_qc(
 
             ai_mask = (
                 np.isfinite(group["ai"].to_numpy(dtype=np.float64))
-                & np.isfinite(group["ai_lfm_sampled"].to_numpy(dtype=np.float64))
+                & np.isfinite(group["lfm_ai_sampled"].to_numpy(dtype=np.float64))
             )
             control_metric_trace = grid.Log(
                 group["ai"].to_numpy(dtype=np.float64),
@@ -583,7 +586,7 @@ def _write_lfm_well_qc(
                 name="Low-frequency control AI",
             )
             sampled_metric_trace = grid.Log(
-                group["ai_lfm_sampled"].to_numpy(dtype=np.float64),
+                group["lfm_ai_sampled"].to_numpy(dtype=np.float64),
                 group_twt,
                 "twt",
                 name="LFM sampled AI",
@@ -846,7 +849,7 @@ def main() -> None:
         {
             "control_source": "well_constraints",
             "well_constraints_dir": repo_relative_path(constraints_dir, root=REPO_ROOT),
-            "frequency_split": constraints_summary.get("frequency_split"),
+            "frequency_bands": constraints_summary.get("frequency_bands"),
         }
     )
     metadata_extra = {

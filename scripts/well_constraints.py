@@ -21,6 +21,7 @@ import pandas as pd
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy.signal import butter, sosfreqz
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -40,18 +41,26 @@ from cup.utils.io import (
 )
 from cup.well.assets import normalize_well_name
 from cup.well.constraints import (
-    FrequencySplitConfig,
     aggregate_trace_arrays,
-    apply_frequency_split,
     build_deviated_point_facts,
     build_point_conflict_report,
     build_vertical_point_facts,
     confidence_from_corr,
     high_frequency_stats,
     layer_shrinkage_stats,
-    lowpass_values_on_twt,
 )
-from cup.well.las import load_vp_rho_logset_from_standard_las
+from cup.well.frequency_bands import (
+    ConditionedWellLog,
+    ReferenceConditioningConfig,
+    ThreeBandSplitConfig,
+    WellFrequencyBands,
+    build_conditioned_reference_log,
+    build_frequency_bands,
+    ginn_cutoff_candidates,
+    segmented_lowpass,
+    wavelet_half_amplitude_frequencies,
+)
+from cup.well.las import load_standard_vp_rho_logs
 from cup.well.td import load_workflow_time_depth_table_csv
 from cup.well.tie import load_saved_seismic_trace_csv
 from cup.well.wavelet import load_wavelet_csv
@@ -81,17 +90,39 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "include_wells": None,
         "exclude_wells": [],
     },
-    "frequency_split": {
-        "mode": "diagnose",
-        "manual_cutoff_hz": None,
+    "reference_conditioning": {
+        "max_short_gap_s": 0.010,
+        "hampel_window_samples": 7,
+        "hampel_sigma": 4.0,
+    },
+    "frequency_bands": {
         "filter_order": 6,
-        "candidate_cutoff_hz": [6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0],
-        "selection_corr_tolerance": 0.02,
-        "selection_nmae_tolerance": 0.03,
         "buffer_seconds": None,
         "buffer_mode": "reflect",
         "qc_enabled": True,
         "qc_envelope_window_samples": 31,
+        "lfm": {
+            "cutoff_mode": "wavelet_left_half_amplitude",
+            "cutoff_scale": 1.0,
+            "manual_cutoff_hz": None,
+        },
+        "ginn": {
+            "mode": "diagnose",
+            "manual_cutoff_hz": None,
+            "candidate_cutoff_hz": None,
+            "candidate_min_right_half_ratio": 0.4,
+            "candidate_max_right_half_ratio": 1.3,
+            "candidate_step_hz": 5.0,
+            "selection_corr_tolerance": 0.02,
+            "selection_nmae_tolerance": 0.03,
+            "fail_on_candidate_boundary": True,
+        },
+        "reference": {
+            "cutoff_mode": "ginn_octave",
+            "ginn_multiplier": 2.0,
+            "max_nyquist_fraction": 0.4,
+            "manual_cutoff_hz": None,
+        },
     },
     "anchor": {"include_deviated": False, "min_points_per_trace": 2},
     "high_supervision": {"include_deviated": False},
@@ -135,11 +166,13 @@ def _validate_wavelet_generation_source(*, auto_dir: Path, wavelet_dir: Path) ->
     ]
     summary_path = next((path for path in summary_candidates if path.exists()), None)
     if summary_path is None:
-        return
+        raise FileNotFoundError(
+            f"Wavelet-generation run has no run_summary.json or selected_wavelet_summary.json: {wavelet_dir}"
+        )
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     source_value = summary.get("source_auto_tie_dir")
     if not source_value:
-        return
+        raise ValueError(f"Wavelet-generation summary does not identify source_auto_tie_dir: {summary_path}")
     source_dir = resolve_relative_path(source_value, root=REPO_ROOT)
     if source_dir.resolve() != auto_dir.resolve():
         raise ValueError(
@@ -275,28 +308,47 @@ def _build_target_layer(script_cfg: dict[str, Any], geometry: dict[str, Any], qc
     return target_layer, horizons
 
 
-def _resolve_frequency_split(
-    point_df: pd.DataFrame,
+def _resolve_frequency_bands(
+    conditioned_by_key: dict[str, ConditionedWellLog],
     *,
     metrics_df: pd.DataFrame,
     auto_dir: Path,
     wavelet_dir: Path,
+    batch_lookup: dict[str, pd.Series],
+    sample_step_s: float,
     script_cfg: dict[str, Any],
-) -> tuple[FrequencySplitConfig, pd.DataFrame, pd.DataFrame, dict[str, Any], str]:
-    split_cfg = dict(script_cfg.get("frequency_split") or {})
-    mode = str(split_cfg.get("mode", "diagnose")).strip().lower()
-    order = int(split_cfg.get("filter_order", 6))
-    buffer_seconds = split_cfg.get("buffer_seconds")
+) -> tuple[ThreeBandSplitConfig, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    bands_cfg = dict(script_cfg.get("frequency_bands") or {})
+    order = int(bands_cfg.get("filter_order", 6))
+    buffer_seconds = bands_cfg.get("buffer_seconds")
     buffer_seconds = None if buffer_seconds is None else float(buffer_seconds)
-    buffer_mode = str(split_cfg.get("buffer_mode", "reflect"))
+    buffer_mode = str(bands_cfg.get("buffer_mode", "reflect"))
+    wavelet_time, wavelet_amplitude, wavelet_path = _load_selected_wavelet(wavelet_dir)
+    peak_hz, left_half_hz, right_half_hz = wavelet_half_amplitude_frequencies(
+        wavelet_time,
+        wavelet_amplitude,
+    )
+
+    lfm_cfg = dict(bands_cfg.get("lfm") or {})
+    lfm_mode = str(lfm_cfg.get("cutoff_mode", "wavelet_left_half_amplitude")).strip().lower()
+    if lfm_mode == "manual":
+        if lfm_cfg.get("manual_cutoff_hz") is None:
+            raise ValueError("well_constraints.frequency_bands.lfm.manual_cutoff_hz is required.")
+        lfm_cutoff = float(lfm_cfg["manual_cutoff_hz"])
+    elif lfm_mode == "wavelet_left_half_amplitude":
+        lfm_cutoff = left_half_hz * float(lfm_cfg.get("cutoff_scale", 1.0))
+    else:
+        raise ValueError(f"Unsupported LFM cutoff_mode: {lfm_mode!r}.")
+
+    ginn_cfg = dict(bands_cfg.get("ginn") or {})
+    mode = str(ginn_cfg.get("mode", "diagnose")).strip().lower()
     if mode == "manual":
-        cutoff = split_cfg.get("manual_cutoff_hz")
+        cutoff = ginn_cfg.get("manual_cutoff_hz")
         if cutoff is None:
-            raise ValueError("well_constraints.frequency_split.manual_cutoff_hz is required for mode=manual.")
-        cfg = FrequencySplitConfig(float(cutoff), filter_order=order, buffer_seconds=buffer_seconds, buffer_mode=buffer_mode)
+            raise ValueError("well_constraints.frequency_bands.ginn.manual_cutoff_hz is required.")
         well_rows = [
             {
-                "well_name": str(w),
+                "well_name": str(key),
                 "route": "",
                 "cutoff_hz": float(cutoff),
                 "status": "manual",
@@ -307,14 +359,16 @@ def _resolve_frequency_split(
                 "wavelet_file": "",
                 "reason": "",
             }
-            for w in point_df["well_name"].unique()
+            for key in conditioned_by_key
         ]
         diag = pd.DataFrame.from_records(well_rows)
+        cluster_aggregate = pd.DataFrame()
         aggregate = pd.DataFrame(
             {
                 "cutoff_hz": [float(cutoff)],
                 "mode": ["manual"],
                 "n_wells": [len(well_rows)],
+                "n_clusters": [0],
                 "median_corr": [np.nan],
                 "mean_corr": [np.nan],
                 "p25_corr": [np.nan],
@@ -327,26 +381,105 @@ def _resolve_frequency_split(
                 "median_n_eval_samples": [np.nan],
             }
         )
-        selection = {"selected_cutoff_hz": float(cutoff), "reason": "manual"}
-        return cfg, diag, aggregate, selection, "manual"
-    if mode != "diagnose":
-        raise ValueError(f"Unsupported frequency split mode: {mode!r}")
-    candidates = [float(v) for v in split_cfg.get("candidate_cutoff_hz", [6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0])]
-    return (
-        *_diagnose_frequency_split_by_forward_modeling(
-            point_df,
+        selection = {"selected_cutoff_hz": float(cutoff), "reason": "manual", "candidate_boundary_hit": False}
+    elif mode == "diagnose":
+        configured_candidates = ginn_cfg.get("candidate_cutoff_hz")
+        candidates = (
+            [float(value) for value in configured_candidates]
+            if configured_candidates
+            else ginn_cutoff_candidates(
+                right_half_hz,
+                minimum_ratio=float(ginn_cfg.get("candidate_min_right_half_ratio", 0.4)),
+                maximum_ratio=float(ginn_cfg.get("candidate_max_right_half_ratio", 1.3)),
+                step_hz=float(ginn_cfg.get("candidate_step_hz", 5.0)),
+            )
+        )
+        reference_preview = dict(bands_cfg.get("reference") or {})
+        reference_preview_mode = str(
+            reference_preview.get("cutoff_mode", "ginn_octave")
+        ).strip().lower()
+        if reference_preview_mode == "manual":
+            manual_reference = reference_preview.get("manual_cutoff_hz")
+            if manual_reference is None:
+                raise ValueError("well_constraints.frequency_bands.reference.manual_cutoff_hz is required.")
+            candidate_upper_hz = float(manual_reference)
+        elif reference_preview_mode == "ginn_octave":
+            multiplier = float(reference_preview.get("ginn_multiplier", 2.0))
+            if multiplier <= 1.0:
+                raise ValueError("reference.ginn_multiplier must be greater than 1.")
+            candidate_upper_hz = (
+                float(reference_preview.get("max_nyquist_fraction", 0.4))
+                / float(sample_step_s)
+            )
+        else:
+            raise ValueError(f"Unsupported reference cutoff_mode: {reference_preview_mode!r}.")
+        candidates = sorted(
+            {
+                value
+                for value in candidates
+                if np.isfinite(value) and lfm_cutoff < value < candidate_upper_hz
+            }
+        )
+        if len(candidates) < 3:
+            raise ValueError(
+                "GINN cutoff diagnosis requires at least three candidates satisfying "
+                "lfm_cutoff < candidate < reference_limit."
+            )
+        diag, cluster_aggregate, aggregate, selection = _diagnose_ginn_cutoff_by_forward_modeling(
+            conditioned_by_key,
             metrics_df=metrics_df,
             auto_dir=auto_dir,
-            wavelet_dir=wavelet_dir,
+            wavelet_time_s=wavelet_time,
+            wavelet_amplitude=wavelet_amplitude,
+            wavelet_path=wavelet_path,
+            batch_lookup=batch_lookup,
             candidate_cutoff_hz=candidates,
             filter_order=order,
             buffer_seconds=buffer_seconds,
             buffer_mode=buffer_mode,
-            corr_tolerance=float(split_cfg.get("selection_corr_tolerance", 0.02)),
-            nmae_tolerance=float(split_cfg.get("selection_nmae_tolerance", 0.03)),
-        ),
-        "diagnose",
+            corr_tolerance=float(ginn_cfg.get("selection_corr_tolerance", 0.02)),
+            nmae_tolerance=float(ginn_cfg.get("selection_nmae_tolerance", 0.03)),
+        )
+    else:
+        raise ValueError(f"Unsupported GINN cutoff mode: {mode!r}.")
+
+    ginn_cutoff = float(selection["selected_cutoff_hz"])
+    reference_cfg = dict(bands_cfg.get("reference") or {})
+    reference_mode = str(reference_cfg.get("cutoff_mode", "ginn_octave")).strip().lower()
+    fs = 1.0 / float(sample_step_s)
+    if reference_mode == "manual":
+        if reference_cfg.get("manual_cutoff_hz") is None:
+            raise ValueError("well_constraints.frequency_bands.reference.manual_cutoff_hz is required.")
+        reference_cutoff = float(reference_cfg["manual_cutoff_hz"])
+    elif reference_mode == "ginn_octave":
+        reference_cutoff = min(
+            float(reference_cfg.get("ginn_multiplier", 2.0)) * ginn_cutoff,
+            float(reference_cfg.get("max_nyquist_fraction", 0.4)) * fs,
+        )
+    else:
+        raise ValueError(f"Unsupported reference cutoff_mode: {reference_mode!r}.")
+    resolved = ThreeBandSplitConfig(
+        lfm_cutoff_hz=lfm_cutoff,
+        ginn_cutoff_hz=ginn_cutoff,
+        reference_cutoff_hz=reference_cutoff,
+        filter_order=order,
+        buffer_seconds=buffer_seconds,
+        buffer_mode=buffer_mode,
     )
+    resolved.validate(sample_step_s)
+    selection.update(
+        {
+            "mode": mode,
+            "wavelet_file": repo_relative_path(wavelet_path, root=REPO_ROOT),
+            "wavelet_peak_hz": peak_hz,
+            "wavelet_left_half_amplitude_hz": left_half_hz,
+            "wavelet_right_half_amplitude_hz": right_half_hz,
+            "lfm_cutoff_hz": lfm_cutoff,
+            "reference_cutoff_hz": reference_cutoff,
+            "fail_on_candidate_boundary": bool(ginn_cfg.get("fail_on_candidate_boundary", True)),
+        }
+    )
+    return resolved, diag, cluster_aggregate, aggregate, selection
 
 
 def _load_selected_wavelet(wavelet_dir: Path) -> tuple[np.ndarray, np.ndarray, Path]:
@@ -401,100 +534,126 @@ def _masked_scaled_synthetic_metrics(
     synthetic_scaled = scale * synthetic_eval
     corr = float(np.corrcoef(seismic_norm, synthetic_scaled)[0, 1]) if np.std(synthetic_scaled) > 0.0 else np.nan
     nmae = float(np.sum(np.abs(seismic_norm - synthetic_scaled)) / max(np.sum(np.abs(seismic_norm)), 1e-12))
+    if not np.isfinite(corr) or not np.isfinite(nmae):
+        raise ValueError("Forward diagnostic produced non-finite corr or NMAE.")
     return corr, nmae, scale, n_eval
 
 
-def _diagnose_frequency_split_by_forward_modeling(
-    point_df: pd.DataFrame,
+def _diagnose_ginn_cutoff_by_forward_modeling(
+    conditioned_by_key: dict[str, ConditionedWellLog],
     *,
     metrics_df: pd.DataFrame,
     auto_dir: Path,
-    wavelet_dir: Path,
+    wavelet_time_s: np.ndarray,
+    wavelet_amplitude: np.ndarray,
+    wavelet_path: Path,
+    batch_lookup: dict[str, pd.Series],
     candidate_cutoff_hz: list[float],
     filter_order: int,
     buffer_seconds: float | None,
     buffer_mode: str,
     corr_tolerance: float,
     nmae_tolerance: float,
-) -> tuple[FrequencySplitConfig, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    if point_df.empty:
-        raise ValueError("Cannot diagnose frequency split from an empty point table.")
-    wavelet_time_s, wavelet_amplitude, wavelet_path = _load_selected_wavelet(wavelet_dir)
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    if not conditioned_by_key:
+        raise ValueError("Cannot diagnose GINN cutoff without conditioned well logs.")
     wavelet_dt = float(np.median(np.diff(wavelet_time_s)))
     wavelet = grid.Wavelet(wavelet_amplitude, wavelet_time_s, name=wavelet_path.stem)
     modeler = ConvModeler()
-    selected_keys = {normalize_well_name(name) for name in point_df["well_name"].astype(str).unique()}
-    point_by_key = {normalize_well_name(str(name)): group.copy() for name, group in point_df.groupby("well_name", sort=False)}
     rows: list[dict[str, Any]] = []
 
     for _, metric in metrics_df.iterrows():
         well_name = str(metric.get("well_name", "")).strip()
         key = normalize_well_name(well_name)
-        if key not in selected_keys:
+        conditioned = conditioned_by_key.get(key)
+        if conditioned is None:
             continue
         route = str(metric.get("route", ""))
-        las_file = resolve_artifact_path(metric.get("filtered_las_file"), root=REPO_ROOT, run_dir=auto_dir)
-        tdt_file = resolve_artifact_path(metric.get("optimized_tdt_file"), root=REPO_ROOT, run_dir=auto_dir)
         seismic_file = _resolve_seismic_trace_file(metric, run_dir=auto_dir, well_name=well_name)
-        if las_file is None or tdt_file is None or seismic_file is None:
+        if seismic_file is None:
             for cutoff in candidate_cutoff_hz:
-                rows.append({"well_name": well_name, "route": route, "cutoff_hz": cutoff, "status": "failed", "reason": "missing_las_tdt_or_seismic"})
+                rows.append(
+                    {
+                        "well_name": well_name,
+                        "route": route,
+                        "cutoff_hz": cutoff,
+                        "status": "failed",
+                        "reason": "missing_seismic_trace",
+                    }
+                )
             continue
         try:
-            logset = load_vp_rho_logset_from_standard_las(las_file)
-            table = load_workflow_time_depth_table_csv(tdt_file)
             seismic = load_saved_seismic_trace_csv(seismic_file)
             seismic_basis = np.asarray(seismic.basis, dtype=np.float64)
             seismic_dt = float(np.median(np.diff(seismic_basis)))
             if not np.isclose(wavelet_dt, seismic_dt, rtol=1e-5, atol=1e-9):
                 raise ValueError(f"wavelet_dt_mismatch:{wavelet_dt:g}!={seismic_dt:g}")
-            ai_twt = grid.convert_log_from_md_to_twt(logset.AI, table, None, seismic_dt)
-            ai_twt_basis = np.asarray(ai_twt.basis, dtype=np.float64)
-            ai_values = np.asarray(ai_twt.values, dtype=np.float64)
-            valid_ai = np.isfinite(ai_values) & (ai_values > 0.0)
-            if int(np.count_nonzero(valid_ai)) < 8:
-                raise ValueError("too_few_finite_ai_samples")
-            log_ai_values = np.full(ai_values.shape, np.nan, dtype=np.float64)
-            log_ai_values[valid_ai] = np.log(ai_values[valid_ai])
-            eval_group = point_by_key[key]
-            eval_twt = eval_group["twt_s"].to_numpy(dtype=np.float64)
-            eval_mask = np.isin(np.round(seismic_basis, 9), np.round(eval_twt, 9))
-            if int(np.count_nonzero(eval_mask)) < 8:
-                eval_mask = (seismic_basis >= float(np.nanmin(eval_twt)) - 0.5 * seismic_dt) & (
-                    seismic_basis <= float(np.nanmax(eval_twt)) + 0.5 * seismic_dt
-                )
+            source_basis = np.asarray(conditioned.log_ai.basis, dtype=np.float64)
+            observed_float = conditioned.observed_mask.astype(np.float64)
+            eval_mask = np.interp(seismic_basis, source_basis, observed_float, left=0.0, right=0.0) > 0.999
+            filter_cfg = ThreeBandSplitConfig(
+                lfm_cutoff_hz=1.0,
+                ginn_cutoff_hz=2.0,
+                reference_cutoff_hz=3.0,
+                filter_order=int(filter_order),
+                buffer_seconds=buffer_seconds,
+                buffer_mode=buffer_mode,
+            )
+            batch_row = batch_lookup.get(key)
+            cluster_value = None if batch_row is None else batch_row.get("spatial_cluster_id")
+            if cluster_value is None or pd.isna(cluster_value) or not str(cluster_value).strip():
+                raise ValueError("missing_spatial_cluster_id")
+            cluster_id = str(cluster_value)
             for cutoff in candidate_cutoff_hz:
-                low_log_ai = lowpass_values_on_twt(
-                    ai_twt_basis,
-                    log_ai_values,
-                    dt_s=seismic_dt,
-                    cutoff_hz=float(cutoff),
-                    order=int(filter_order),
-                    buffer_seconds=buffer_seconds,
-                    buffer_mode=buffer_mode,
-                )
-                low_ai_on_seis = np.exp(np.interp(seismic_basis, ai_twt_basis, low_log_ai, left=np.nan, right=np.nan))
-                reflectivity = grid.Reflectivity(_reflectivity_from_ai(low_ai_on_seis), seismic_basis)
-                corr, nmae, scale, n_eval = _masked_scaled_synthetic_metrics(
-                    modeler=modeler,
-                    wavelet=wavelet,
-                    reflectivity=reflectivity,
-                    seismic=seismic,
-                    eval_mask=eval_mask,
-                )
-                rows.append(
-                    {
-                        "well_name": well_name,
-                        "route": route,
-                        "cutoff_hz": float(cutoff),
-                        "status": "ok",
-                        "corr": corr,
-                        "nmae": nmae,
-                        "scale": scale,
-                        "n_eval_samples": n_eval,
-                        "wavelet_file": repo_relative_path(wavelet_path, root=REPO_ROOT),
-                    }
-                )
+                try:
+                    low_log = segmented_lowpass(conditioned.log_ai, float(cutoff), filter_cfg)
+                    low_log_on_seis = np.interp(
+                        seismic_basis,
+                        source_basis,
+                        low_log.values,
+                        left=np.nan,
+                        right=np.nan,
+                    )
+                    low_ai_on_seis = np.exp(low_log_on_seis)
+                    context_valid = np.convolve(
+                        np.isfinite(low_ai_on_seis).astype(np.int16),
+                        np.ones(wavelet_amplitude.size, dtype=np.int16),
+                        mode="same",
+                    ) == int(wavelet_amplitude.size)
+                    reflectivity = grid.Reflectivity(_reflectivity_from_ai(low_ai_on_seis), seismic_basis)
+                    corr, nmae, scale, n_eval = _masked_scaled_synthetic_metrics(
+                        modeler=modeler,
+                        wavelet=wavelet,
+                        reflectivity=reflectivity,
+                        seismic=seismic,
+                        eval_mask=eval_mask & context_valid,
+                    )
+                    rows.append(
+                        {
+                            "well_name": well_name,
+                            "route": route,
+                            "spatial_cluster_id": cluster_id,
+                            "cutoff_hz": float(cutoff),
+                            "status": "ok",
+                            "corr": corr,
+                            "nmae": nmae,
+                            "scale": scale,
+                            "n_eval_samples": n_eval,
+                            "wavelet_file": repo_relative_path(wavelet_path, root=REPO_ROOT),
+                            "reason": "",
+                        }
+                    )
+                except Exception as exc:
+                    rows.append(
+                        {
+                            "well_name": well_name,
+                            "route": route,
+                            "spatial_cluster_id": cluster_id,
+                            "cutoff_hz": float(cutoff),
+                            "status": "failed",
+                            "reason": f"{type(exc).__name__}:{exc}",
+                        }
+                    )
         except Exception as exc:
             for cutoff in candidate_cutoff_hz:
                 rows.append(
@@ -510,21 +669,33 @@ def _diagnose_frequency_split_by_forward_modeling(
     diag_df = pd.DataFrame(rows)
     ok = diag_df.loc[diag_df["status"].eq("ok")].copy()
     if ok.empty:
-        raise ValueError("No successful forward-modeled frequency split diagnostics.")
-    aggregate = (
-        ok.groupby("cutoff_hz")
+        raise ValueError("No successful forward-modeled GINN cutoff diagnostics.")
+    cluster_aggregate = (
+        ok.groupby(["cutoff_hz", "spatial_cluster_id"], dropna=False)
         .agg(
             n_wells=("well_name", "nunique"),
             median_corr=("corr", "median"),
-            mean_corr=("corr", "mean"),
-            p25_corr=("corr", lambda x: float(np.nanpercentile(x, 25))),
-            p75_corr=("corr", lambda x: float(np.nanpercentile(x, 75))),
             median_nmae=("nmae", "median"),
-            mean_nmae=("nmae", "mean"),
-            p25_nmae=("nmae", lambda x: float(np.nanpercentile(x, 25))),
-            p75_nmae=("nmae", lambda x: float(np.nanpercentile(x, 75))),
             median_scale=("scale", "median"),
             median_n_eval_samples=("n_eval_samples", "median"),
+        )
+        .reset_index()
+    )
+    aggregate = (
+        cluster_aggregate.groupby("cutoff_hz")
+        .agg(
+            n_clusters=("spatial_cluster_id", "nunique"),
+            n_wells=("n_wells", "sum"),
+            median_corr=("median_corr", "median"),
+            mean_corr=("median_corr", "mean"),
+            p25_corr=("median_corr", lambda x: float(np.nanpercentile(x, 25))),
+            p75_corr=("median_corr", lambda x: float(np.nanpercentile(x, 75))),
+            median_nmae=("median_nmae", "median"),
+            mean_nmae=("median_nmae", "mean"),
+            p25_nmae=("median_nmae", lambda x: float(np.nanpercentile(x, 25))),
+            p75_nmae=("median_nmae", lambda x: float(np.nanpercentile(x, 75))),
+            median_scale=("median_scale", "median"),
+            median_n_eval_samples=("median_n_eval_samples", "median"),
         )
         .reset_index()
         .sort_values("cutoff_hz")
@@ -544,8 +715,11 @@ def _diagnose_frequency_split_by_forward_modeling(
         reason = "No cutoff passed plateau tolerances; selected max median_corr."
     else:
         chosen = plateau.loc[plateau["cutoff_hz"].idxmin()]
-        reason = "Selected the lowest Hz on the near-best waveform-fit plateau to keep the low-frequency branch conservative."
+        reason = "Selected the lowest GINN cutoff on the cluster-debiased near-best waveform-fit plateau."
     selected = float(chosen["cutoff_hz"])
+    candidate_min = float(min(candidate_cutoff_hz))
+    candidate_max = float(max(candidate_cutoff_hz))
+    boundary_hit = bool(np.isclose(selected, candidate_min) or np.isclose(selected, candidate_max))
     selection = {
         "selected_cutoff_hz": selected,
         "selected_median_corr": float(chosen["median_corr"]),
@@ -557,67 +731,108 @@ def _diagnose_frequency_split_by_forward_modeling(
         "nmae_tolerance": float(nmae_tolerance),
         "reason": reason,
         "wavelet_file": repo_relative_path(wavelet_path, root=REPO_ROOT),
+        "candidate_min_hz": candidate_min,
+        "candidate_max_hz": candidate_max,
+        "candidate_boundary_hit": boundary_hit,
+        "aggregation": "median_within_spatial_cluster_then_median_across_clusters",
     }
-    return (
-        FrequencySplitConfig(
-            cutoff_hz=selected,
-            filter_order=int(filter_order),
-            buffer_seconds=buffer_seconds,
-            buffer_mode=buffer_mode,
-        ),
-        diag_df,
-        aggregate,
-        selection,
-    )
+    return diag_df, cluster_aggregate, aggregate, selection
 
 
-def _save_frequency_qc(point_df: pd.DataFrame, qc_dir: Path, *, envelope_window: int) -> list[dict[str, Any]]:
+def _save_frequency_band_qc(
+    bands_by_well: dict[str, WellFrequencyBands],
+    qc_dir: Path,
+    *,
+    envelope_window: int,
+) -> list[dict[str, Any]]:
     qc_dir.mkdir(parents=True, exist_ok=True)
     fig_dir = qc_dir / "figures"
     trace_dir = qc_dir / "traces"
     fig_dir.mkdir(parents=True, exist_ok=True)
     trace_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
-    for well_name, group in point_df.groupby("well_name", sort=False):
-        group = group.sort_values("twt_s")
+    for well_name, bands in bands_by_well.items():
+        group = pd.DataFrame(
+            {
+                "well_name": well_name,
+                "twt_s": bands.reference_log_ai.basis,
+                "reference_ai": bands.reference_ai.values,
+                "reference_log_ai": bands.reference_log_ai.values,
+                "lfm_ai": bands.lfm_ai.values,
+                "lfm_log_ai": bands.lfm_log_ai.values,
+                "ginn_target_ai": bands.ginn_target_ai.values,
+                "ginn_target_log_ai": bands.ginn_target_log_ai.values,
+                "ginn_band_log_ai": bands.ginn_band_log_ai.values,
+                "enhance_residual_log_ai": bands.enhance_residual_log_ai.values,
+                "observed_well_sample": bands.observed_mask,
+                "short_gap_interpolated": bands.interpolation_mask,
+                "hampel_conditioned": bands.conditioned_mask,
+                "frequency_band_valid": bands.valid_band_mask,
+            }
+        )
         safe = sanitize_filename(str(well_name))
-        trace_path = trace_dir / f"frequency_split_{safe}.csv"
+        trace_path = trace_dir / f"frequency_bands_{safe}.csv"
         group[
             [
                 "well_name",
                 "twt_s",
-                "ai_full",
-                "log_ai_full",
-                "well_low_ai",
-                "well_low_log_ai",
-                "well_high_log_ai",
-                "zone_name",
-                "weight",
+                "reference_ai",
+                "reference_log_ai",
+                "lfm_ai",
+                "lfm_log_ai",
+                "ginn_target_ai",
+                "ginn_target_log_ai",
+                "ginn_band_log_ai",
+                "enhance_residual_log_ai",
+                "observed_well_sample",
+                "short_gap_interpolated",
+                "hampel_conditioned",
+                "frequency_band_valid",
             ]
         ].to_csv(trace_path, index=False, encoding="utf-8-sig")
-        fig_path = fig_dir / f"frequency_split_{safe}.png"
-        fig, axes = plt.subplots(2, 1, figsize=(9, 6), sharex=True, constrained_layout=True)
-        axes[0].plot(group["twt_s"], group["log_ai_full"], label="full log-AI", linewidth=1.0)
-        axes[0].plot(group["twt_s"], group["well_low_log_ai"], label="low log-AI", linewidth=1.0)
+        fig_path = fig_dir / f"frequency_bands_{safe}.png"
+        fig, axes = plt.subplots(4, 1, figsize=(9, 9), sharex=True, constrained_layout=True)
+        axes[0].plot(group["twt_s"], group["reference_log_ai"], label="reference", linewidth=1.0)
+        axes[0].plot(group["twt_s"], group["ginn_target_log_ai"], label="GINN target", linewidth=1.0)
+        axes[0].plot(group["twt_s"], group["lfm_log_ai"], label="LFM", linewidth=1.0)
         axes[0].legend(loc="best")
-        high = group["well_high_log_ai"].to_numpy(dtype=float)
-        axes[1].plot(group["twt_s"], high, label="high residual", linewidth=1.0)
+        axes[1].plot(group["twt_s"], group["ginn_band_log_ai"], label="GINN band", linewidth=1.0)
+        axes[1].legend(loc="best")
+        high = group["enhance_residual_log_ai"].to_numpy(dtype=float)
+        axes[2].plot(group["twt_s"], high, label="enhance residual", linewidth=1.0)
         if high.size and int(envelope_window) > 1:
             window = min(int(envelope_window), max(1, high.size))
             kernel = np.ones(window, dtype=float) / float(window)
             envelope = np.convolve(np.abs(high), kernel, mode="same")
-            axes[1].plot(group["twt_s"], envelope, color="tab:red", alpha=0.8, label="abs envelope")
-            axes[1].plot(group["twt_s"], -envelope, color="tab:red", alpha=0.8)
-        axes[1].legend(loc="best")
-        axes[1].set_xlabel("TWT (s)")
+            axes[2].plot(group["twt_s"], envelope, color="tab:red", alpha=0.8, label="abs envelope")
+            axes[2].plot(group["twt_s"], -envelope, color="tab:red", alpha=0.8)
+        axes[2].legend(loc="best")
+        for offset, (column, label) in enumerate(
+            (
+                ("observed_well_sample", "observed"),
+                ("short_gap_interpolated", "short-gap support"),
+                ("hampel_conditioned", "Hampel support"),
+                ("frequency_band_valid", "band valid"),
+            )
+        ):
+            axes[3].step(
+                group["twt_s"],
+                group[column].astype(float) + 1.25 * offset,
+                where="mid",
+                linewidth=0.9,
+                label=label,
+            )
+        axes[3].set_yticks([])
+        axes[3].legend(loc="best", ncol=2)
+        axes[3].set_xlabel("TWT (s)")
         fig.suptitle(str(well_name))
         fig.savefig(fig_path, dpi=180)
         plt.close(fig)
         rows.append(
             {
                 "well_name": str(well_name),
-                "frequency_split_qc_trace_path": repo_relative_path(trace_path, root=REPO_ROOT),
-                "frequency_split_qc_figure_path": repo_relative_path(fig_path, root=REPO_ROOT),
+                "frequency_band_qc_trace_path": repo_relative_path(trace_path, root=REPO_ROOT),
+                "frequency_band_qc_figure_path": repo_relative_path(fig_path, root=REPO_ROOT),
             }
         )
     return rows
@@ -661,7 +876,7 @@ def _plot_frequency_split_aggregate(
         ax.set_xlabel("Cutoff (Hz)")
         ax.grid(True, alpha=0.25)
 
-    fig.suptitle("Frequency split forward-model cutoff sweep")
+    fig.suptitle("GINN cutoff forward-model sweep")
     fig.savefig(figure_path, dpi=180)
     plt.close(fig)
 
@@ -672,7 +887,7 @@ def _plot_frequency_split_well_sweeps(diag_df: pd.DataFrame, figure_dir: Path) -
     ok = diag_df.loc[diag_df.get("status", "").eq("ok")].copy() if not diag_df.empty else pd.DataFrame()
     for well_name, group in ok.groupby("well_name", sort=False):
         plot_df = group.sort_values("cutoff_hz")
-        path = figure_dir / f"frequency_split_sweep_{sanitize_filename(str(well_name))}.png"
+        path = figure_dir / f"ginn_cutoff_sweep_{sanitize_filename(str(well_name))}.png"
         fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
         axes[0].plot(plot_df["cutoff_hz"], plot_df["corr"], marker="o", color="tab:blue")
         axes[0].set_title(str(well_name))
@@ -689,6 +904,51 @@ def _plot_frequency_split_well_sweeps(diag_df: pd.DataFrame, figure_dir: Path) -
     return out
 
 
+def _plot_frequency_band_response(
+    *,
+    wavelet_time_s: np.ndarray,
+    wavelet_amplitude: np.ndarray,
+    bands: ThreeBandSplitConfig,
+    figure_path: Path,
+) -> None:
+    """Plot wavelet amplitude spectrum and the effective zero-phase filters."""
+    dt_s = float(np.median(np.diff(wavelet_time_s)))
+    fs = 1.0 / dt_s
+    n_fft = max(4096, 1 << int(np.ceil(np.log2(wavelet_amplitude.size * 16))))
+    frequency = np.fft.rfftfreq(n_fft, d=dt_s)
+    spectrum = np.abs(np.fft.rfft(wavelet_amplitude, n=n_fft))
+    spectrum /= max(float(np.max(spectrum)), 1e-12)
+    peak_hz, left_hz, right_hz = wavelet_half_amplitude_frequencies(
+        wavelet_time_s,
+        wavelet_amplitude,
+    )
+
+    figure_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(10, 5), constrained_layout=True)
+    ax.plot(frequency, spectrum, color="black", linewidth=1.4, label="consensus wavelet amplitude")
+    for cutoff, label, color in (
+        (bands.lfm_cutoff_hz, "LFM low-pass", "tab:blue"),
+        (bands.ginn_cutoff_hz, "GINN target low-pass", "tab:orange"),
+        (bands.reference_cutoff_hz, "reference low-pass", "tab:green"),
+    ):
+        sos = butter(int(bands.filter_order) // 2, float(cutoff), btype="low", fs=fs, output="sos")
+        response_frequency, response = sosfreqz(sos, worN=4096, fs=fs)
+        ax.plot(response_frequency, np.abs(response) ** 2, color=color, linewidth=1.1, label=label)
+        ax.axvline(float(cutoff), color=color, linestyle="--", linewidth=0.9, alpha=0.75)
+    ax.axvline(peak_hz, color="black", linestyle=":", linewidth=0.9, label="wavelet peak")
+    ax.axvline(left_hz, color="tab:purple", linestyle=":", linewidth=0.9, label="left/right amplitude 0.5")
+    ax.axvline(right_hz, color="tab:purple", linestyle=":", linewidth=0.9)
+    ax.axhline(0.5, color="gray", linestyle=":", linewidth=0.8)
+    ax.set_xlim(0.0, min(0.5 * fs, max(bands.reference_cutoff_hz * 1.5, right_hz * 1.5)))
+    ax.set_ylim(0.0, 1.05)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Normalized amplitude")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+    fig.savefig(figure_path, dpi=180)
+    plt.close(fig)
+
+
 def _make_high_supervision_bundle(
     *,
     point_df: pd.DataFrame,
@@ -698,8 +958,8 @@ def _make_high_supervision_bundle(
     arrays, _summary_df = aggregate_trace_arrays(
         point_df,
         samples,
-        target_col="well_low_ai",
-        value_cols=["log_ai_full", "well_low_ai", "well_low_log_ai", "well_high_log_ai"],
+        target_col="ginn_target_ai",
+        value_cols=["reference_log_ai", "ginn_target_log_ai", "enhance_residual_log_ai"],
         include_anchor_only=False,
     )
     keep = arrays["mask"].sum(axis=1) >= 2
@@ -721,15 +981,15 @@ def _make_high_supervision_bundle(
         well_names=arrays["well_names"],
         inline=arrays["inline"],
         xline=arrays["xline"],
-        well_log_ai=arrays["log_ai_full"].astype(np.float32),
-        well_low_log_ai=arrays["well_low_log_ai"].astype(np.float32),
-        well_high_log_ai=arrays["well_high_log_ai"].astype(np.float32),
+        reference_log_ai=arrays["reference_log_ai"].astype(np.float32),
+        ginn_target_log_ai=arrays["ginn_target_log_ai"].astype(np.float32),
+        enhance_residual_log_ai=arrays["enhance_residual_log_ai"].astype(np.float32),
         well_mask=mask,
         well_weight=arrays["weight"].astype(np.float32),
         native_samples=samples_1d.copy(),
-        native_well_log_ai=arrays["log_ai_full"].astype(np.float32),
-        native_well_low_log_ai=arrays["well_low_log_ai"].astype(np.float32),
-        native_well_high_log_ai=arrays["well_high_log_ai"].astype(np.float32),
+        native_reference_log_ai=arrays["reference_log_ai"].astype(np.float32),
+        native_ginn_target_log_ai=arrays["ginn_target_log_ai"].astype(np.float32),
+        native_enhance_residual_log_ai=arrays["enhance_residual_log_ai"].astype(np.float32),
         native_well_mask=mask.copy(),
         summary=high_frequency_stats(point_df, sample_step_s=float(np.median(np.diff(samples))) if samples.size > 1 else None),
         metadata=metadata,
@@ -762,14 +1022,19 @@ def _make_lfm_control_table(point_df: pd.DataFrame) -> pd.DataFrame:
         "batch_corr",
         "batch_nmae",
     ]
-    ai_df = point_df.loc[:, base_columns + ["well_low_ai"]].copy()
-    return ai_df.rename(columns={"well_low_ai": "ai"})
+    ai_df = point_df.loc[point_df["observed_well_sample"].astype(bool), base_columns + ["lfm_ai"]].copy()
+    return ai_df.rename(columns={"lfm_ai": "ai"})
 
 
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
     script_cfg = deep_merge_dict(DEFAULT_CONFIG, dict(cfg.get("well_constraints") or {}))
+    if "frequency_split" in dict(cfg.get("well_constraints") or {}):
+        raise ValueError(
+            "well_constraints.frequency_split was replaced by well_constraints.frequency_bands. "
+            "Migrate the configuration; the old two-band contract is not supported."
+        )
     if "n_slices" in dict(script_cfg.get("lfm_controls") or {}):
         raise ValueError(
             "well_constraints.lfm_controls.n_slices has moved to lfm_precomputed.modeling.n_slices; "
@@ -816,7 +1081,9 @@ def main() -> None:
     include_deviated_anchor = bool(script_cfg.get("anchor", {}).get("include_deviated", False))
     include_deviated_high = bool(script_cfg.get("high_supervision", {}).get("include_deviated", False))
 
-    point_frames: list[pd.DataFrame] = []
+    conditioning_cfg = ReferenceConditioningConfig(**dict(script_cfg.get("reference_conditioning") or {}))
+    conditioned_by_key: dict[str, ConditionedWellLog] = {}
+    candidate_context: dict[str, dict[str, Any]] = {}
     qc_rows: list[dict[str, Any]] = []
     for _, metric in metrics_df.iterrows():
         well_name = str(metric.get("well_name", "")).strip()
@@ -842,15 +1109,19 @@ def main() -> None:
         if max_nmae is not None and (batch_nmae is None or batch_nmae > float(max_nmae)):
             reasons.append("batch_nmae_above_threshold")
 
-        las_file = resolve_artifact_path(metric.get("filtered_las_file"), root=REPO_ROOT, run_dir=auto_dir)
+        plan = plan_by_key.get(key)
+        las_file = (
+            None
+            if plan is None
+            else resolve_artifact_path(plan.get("input_las"), root=REPO_ROOT, run_dir=auto_dir)
+        )
         tdt_file = resolve_artifact_path(metric.get("optimized_tdt_file"), root=REPO_ROOT, run_dir=auto_dir)
         if las_file is None or not las_file.exists():
-            reasons.append("missing_filtered_las_file")
-        if not route.startswith("deviated") and (tdt_file is None or not tdt_file.exists()):
+            reasons.append("missing_preprocessed_las")
+        if tdt_file is None or not tdt_file.exists():
             reasons.append("missing_optimized_tdt_file")
 
-        point_df = pd.DataFrame()
-        point_qc: dict[str, Any] = {}
+        conditioning_qc: dict[str, Any] = {}
         if reasons:
             status = "rejected"
         else:
@@ -862,56 +1133,38 @@ def main() -> None:
                     span=float(weights_cfg.get("corr_span", 0.4)),
                     min_weight=float(weights_cfg.get("corr_min_weight", 0.6)),
                 )
-                if route.startswith("deviated"):
-                    trace_file = resolve_artifact_path(metric.get("optimized_trace_sample_plan_file"), root=REPO_ROOT, run_dir=auto_dir)
-                    if trace_file is None:
-                        trace_file = auto_dir / "trace_sample_plan" / f"optimized_trace_sample_plan_{sanitize_filename(well_name)}.csv"
-                    if not trace_file.exists():
-                        raise FileNotFoundError("missing_optimized_trace_sample_plan")
-                    point_df, point_qc = build_deviated_point_facts(
-                        well_name=well_name,
-                        route=route,
-                        las_file=las_file,
-                        trace_plan_file=trace_file,
-                        target_layer=target_layer,
-                        survey=survey,
-                        samples=samples,
-                        weight=weight,
-                        batch_corr=batch_corr,
-                        batch_nmae=batch_nmae,
-                        sample_step_s=sample_step_s,
-                        anchor_eligible=include_deviated_anchor,
-                    )
-                else:
-                    plan = plan_by_key.get(key)
-                    if plan is None:
-                        raise ValueError("missing_well_tie_plan_row")
-                    surface_x = _as_optional_float(plan.get("surface_x"))
-                    surface_y = _as_optional_float(plan.get("surface_y"))
-                    if surface_x is None or surface_y is None:
-                        raise ValueError("missing_surface_xy")
-                    point_df, point_qc = build_vertical_point_facts(
-                        well_name=well_name,
-                        route=route,
-                        las_file=las_file,
-                        tdt_file=tdt_file,
-                        surface_x=surface_x,
-                        surface_y=surface_y,
-                        target_layer=target_layer,
-                        survey=survey,
-                        samples=samples,
-                        weight=weight,
-                        batch_corr=batch_corr,
-                        batch_nmae=batch_nmae,
-                        anchor_eligible=True,
-                    )
-                if int(point_qc.get("valid_points", 0)) < min_points:
+                standard = load_standard_vp_rho_logs(las_file)
+                table = load_workflow_time_depth_table_csv(tdt_file)
+                conditioned = build_conditioned_reference_log(
+                    standard,
+                    table,
+                    samples,
+                    conditioning_cfg,
+                )
+                observed_count = int(np.count_nonzero(conditioned.observed_mask))
+                conditioning_qc = {
+                    "observed_samples": observed_count,
+                    "short_gap_interpolated_samples": int(np.count_nonzero(conditioned.interpolation_mask)),
+                    "hampel_conditioned_samples": int(np.count_nonzero(conditioned.conditioned_mask)),
+                    "valid_conditioned_samples": int(np.count_nonzero(np.isfinite(conditioned.log_ai.values))),
+                }
+                if observed_count < min_points:
                     status = "rejected"
                     reasons.append("too_few_control_samples")
                 else:
-                    point_frames.append(point_df)
+                    conditioned_by_key[key] = conditioned
+                    candidate_context[key] = {
+                        "well_name": well_name,
+                        "route": route,
+                        "metric": metric,
+                        "plan": plan,
+                        "tdt_file": tdt_file,
+                        "weight": weight,
+                        "batch_corr": batch_corr,
+                        "batch_nmae": batch_nmae,
+                    }
             except Exception as exc:
-                status = "rejected" if str(exc) == "missing_optimized_trace_sample_plan" else "failed"
+                status = "failed"
                 reasons.append(str(exc) or type(exc).__name__)
 
         qc_rows.append(
@@ -921,54 +1174,196 @@ def main() -> None:
                 "route": route,
                 "batch_corr": batch_corr,
                 "batch_nmae": batch_nmae,
-                "control_point_count": int(len(point_df)) if status == "selected" else 0,
-                "invalid_point_count": point_qc.get("invalid_point_count"),
-                "invalid_point_fraction": (
-                    float(point_qc.get("invalid_point_count", 0) / point_qc.get("attempted_samples", 1))
-                    if point_qc.get("attempted_samples")
-                    else None
-                ),
-                "unique_trace_count": point_qc.get("unique_trace_count", 0),
+                "control_point_count": 0,
+                "invalid_point_count": None,
+                "invalid_point_fraction": None,
+                "unique_trace_count": 0,
+                **conditioning_qc,
                 "reasons": ";".join(dict.fromkeys(reasons)),
             }
         )
 
-    if not point_frames:
+    if not conditioned_by_key:
         qc_path = output_dir / "well_constraint_qc.csv"
         pd.DataFrame(qc_rows).to_csv(qc_path, index=False, encoding="utf-8-sig")
-        raise ValueError(f"No selected well constraint points. Inspect {qc_path}.")
+        raise ValueError(f"No selected conditioned well logs. Inspect {qc_path}.")
 
-    raw_points = pd.concat(point_frames, ignore_index=True)
-    split_cfg, split_diag_df, split_aggregate_df, split_selection, split_source = _resolve_frequency_split(
-        raw_points,
+    bands_cfg, split_diag_df, split_cluster_df, split_aggregate_df, split_selection = _resolve_frequency_bands(
+        conditioned_by_key,
         metrics_df=metrics_df,
         auto_dir=auto_dir,
         wavelet_dir=wavelet_dir,
+        batch_lookup=batch_lookup,
+        sample_step_s=float(sample_step_s),
         script_cfg=script_cfg,
     )
-    point_df = apply_frequency_split(raw_points, split_cfg)
+    split_diag_path = output_dir / "ginn_cutoff_diagnostics.csv"
+    split_cluster_path = output_dir / "ginn_cutoff_cluster_aggregate.csv"
+    split_aggregate_path = output_dir / "ginn_cutoff_aggregate.csv"
+    split_diag_df.to_csv(split_diag_path, index=False, encoding="utf-8-sig")
+    split_cluster_df.to_csv(split_cluster_path, index=False, encoding="utf-8-sig")
+    split_aggregate_df.to_csv(split_aggregate_path, index=False, encoding="utf-8-sig")
+    split_diag_figure_path = output_dir / "figures" / "ginn_cutoff_sweep.png"
+    _plot_frequency_split_aggregate(
+        split_aggregate_df,
+        figure_path=split_diag_figure_path,
+        selected_cutoff_hz=split_selection.get("selected_cutoff_hz"),
+        best_cutoff_hz=split_selection.get("best_corr_cutoff_hz"),
+    )
+    split_well_figure_paths = _plot_frequency_split_well_sweeps(
+        split_diag_df,
+        output_dir / "figures" / "ginn_cutoff_wells",
+    )
+    wavelet_time_s, wavelet_amplitude, _wavelet_path = _load_selected_wavelet(wavelet_dir)
+    frequency_response_path = output_dir / "figures" / "frequency_band_response.png"
+    _plot_frequency_band_response(
+        wavelet_time_s=wavelet_time_s,
+        wavelet_amplitude=wavelet_amplitude,
+        bands=bands_cfg,
+        figure_path=frequency_response_path,
+    )
+    if (
+        bool(split_selection.get("candidate_boundary_hit"))
+        and bool(split_selection.get("fail_on_candidate_boundary"))
+    ):
+        write_json(
+            output_dir / "run_summary.json",
+            {
+                "frequency_bands": split_selection,
+                "status": "failed_candidate_boundary",
+                "outputs": {
+                    "ginn_cutoff_diagnostics": repo_relative_path(split_diag_path, root=REPO_ROOT),
+                    "ginn_cutoff_cluster_aggregate": repo_relative_path(split_cluster_path, root=REPO_ROOT),
+                    "ginn_cutoff_aggregate": repo_relative_path(split_aggregate_path, root=REPO_ROOT),
+                    "ginn_cutoff_sweep_figure": repo_relative_path(split_diag_figure_path, root=REPO_ROOT),
+                    "ginn_cutoff_well_sweep_figures": split_well_figure_paths,
+                    "frequency_band_response_figure": repo_relative_path(
+                        frequency_response_path,
+                        root=REPO_ROOT,
+                    ),
+                },
+            },
+        )
+        raise ValueError(
+            "Selected GINN cutoff lies on the candidate boundary. Diagnostics were written; "
+            "expand well_constraints.frequency_bands.ginn candidates and rerun."
+        )
+
+    point_frames: list[pd.DataFrame] = []
+    bands_by_well: dict[str, WellFrequencyBands] = {}
+    qc_by_key = {normalize_well_name(str(row["well_name"])): row for row in qc_rows}
+    for key, context in candidate_context.items():
+        qc_row = qc_by_key[key]
+        try:
+            bands = build_frequency_bands(conditioned_by_key[key], bands_cfg)
+            metric = context["metric"]
+            plan = context["plan"]
+            route = context["route"]
+            well_name = context["well_name"]
+            if route.startswith("deviated"):
+                trace_file = resolve_artifact_path(
+                    metric.get("optimized_trace_sample_plan_file"),
+                    root=REPO_ROOT,
+                    run_dir=auto_dir,
+                )
+                if trace_file is None:
+                    trace_file = (
+                        auto_dir
+                        / "trace_sample_plan"
+                        / f"optimized_trace_sample_plan_{sanitize_filename(well_name)}.csv"
+                    )
+                if not trace_file.exists():
+                    raise FileNotFoundError(f"missing_optimized_trace_sample_plan:{well_name}")
+                points, point_qc = build_deviated_point_facts(
+                    well_name=well_name,
+                    route=route,
+                    trace_plan_file=trace_file,
+                    bands=bands,
+                    target_layer=target_layer,
+                    survey=survey,
+                    samples=samples,
+                    weight=context["weight"],
+                    batch_corr=context["batch_corr"],
+                    batch_nmae=context["batch_nmae"],
+                    sample_step_s=sample_step_s,
+                    anchor_eligible=include_deviated_anchor,
+                )
+            else:
+                surface_x = _as_optional_float(plan.get("surface_x"))
+                surface_y = _as_optional_float(plan.get("surface_y"))
+                if surface_x is None or surface_y is None:
+                    raise ValueError(f"missing_surface_xy:{well_name}")
+                points, point_qc = build_vertical_point_facts(
+                    well_name=well_name,
+                    route=route,
+                    tdt_file=context["tdt_file"],
+                    bands=bands,
+                    surface_x=surface_x,
+                    surface_y=surface_y,
+                    target_layer=target_layer,
+                    survey=survey,
+                    samples=samples,
+                    weight=context["weight"],
+                    batch_corr=context["batch_corr"],
+                    batch_nmae=context["batch_nmae"],
+                    anchor_eligible=True,
+                )
+            attempted = int(point_qc.get("attempted_samples", 0))
+            invalid = int(point_qc.get("invalid_point_count", 0))
+            qc_row["invalid_point_count"] = invalid
+            qc_row["invalid_point_fraction"] = float(invalid / attempted) if attempted else None
+            qc_row["zone_sample_errors"] = int(point_qc.get("zone_sample_errors", 0))
+            if int(point_qc.get("valid_points", 0)) >= min_points:
+                point_frames.append(points)
+                bands_by_well[well_name] = bands
+            else:
+                qc_row["status"] = "rejected"
+                qc_row["reasons"] = ";".join(
+                    value
+                    for value in [str(qc_row.get("reasons") or ""), "too_few_valid_frequency_band_points"]
+                    if value
+                )
+        except Exception as exc:
+            qc_row["status"] = "failed"
+            qc_row["reasons"] = ";".join(
+                value
+                for value in [
+                    str(qc_row.get("reasons") or ""),
+                    f"{type(exc).__name__}:{exc}",
+                ]
+                if value
+            )
+    if not point_frames:
+        raise ValueError("No wells retained enough valid three-band control samples.")
+    point_df = pd.concat(point_frames, ignore_index=True)
     high_points = (
         point_df.copy()
         if include_deviated_high
         else point_df.loc[~point_df["source"].astype(str).eq("deviated_trajectory")].copy()
     )
+    high_points = high_points.loc[high_points["observed_well_sample"].astype(bool)].copy()
 
     qc_split_rows: list[dict[str, Any]] = []
-    freq_cfg = dict(script_cfg.get("frequency_split") or {})
+    freq_cfg = dict(script_cfg.get("frequency_bands") or {})
     if bool(freq_cfg.get("qc_enabled", True)):
-        qc_split_rows = _save_frequency_qc(
-            point_df,
-            output_dir / "frequency_split_qc",
+        qc_split_rows = _save_frequency_band_qc(
+            bands_by_well,
+            output_dir / "frequency_band_qc",
             envelope_window=int(freq_cfg.get("qc_envelope_window_samples", 31)),
         )
     qc_split_by_well = {row["well_name"]: row for row in qc_split_rows}
     qc_df = pd.DataFrame(qc_rows)
+    point_counts = point_df.groupby("well_name").size().to_dict()
+    unique_trace_counts = point_df.groupby("well_name")["flat_idx"].nunique().to_dict()
+    qc_df["control_point_count"] = [int(point_counts.get(str(name), 0)) for name in qc_df["well_name"]]
+    qc_df["unique_trace_count"] = [int(unique_trace_counts.get(str(name), 0)) for name in qc_df["well_name"]]
+    qc_df.loc[qc_df["control_point_count"].eq(0) & qc_df["status"].eq("selected"), "status"] = "rejected"
     high_counts_by_well = high_points.groupby("well_name").size().to_dict() if not high_points.empty else {}
     qc_df["high_supervision_point_count"] = [
         int(high_counts_by_well.get(str(well_name), 0)) for well_name in qc_df["well_name"]
     ]
     qc_df["high_supervision_eligible"] = qc_df["high_supervision_point_count"].gt(0)
-    for key in ["frequency_split_qc_trace_path", "frequency_split_qc_figure_path"]:
+    for key in ["frequency_band_qc_trace_path", "frequency_band_qc_figure_path"]:
         qc_df[key] = [qc_split_by_well.get(str(w), {}).get(key) for w in qc_df["well_name"]]
 
     point_path = output_dir / "well_constraint_points.csv"
@@ -976,38 +1371,41 @@ def main() -> None:
     qc_path = output_dir / "well_constraint_qc.csv"
     qc_df.to_csv(qc_path, index=False, encoding="utf-8-sig")
 
-    anchor_points = point_df.loc[point_df["anchor_eligible"].astype(bool)].copy()
-    conflicts = build_point_conflict_report(anchor_points, value_col="well_low_log_ai")
+    anchor_points = point_df.loc[
+        point_df["anchor_eligible"].astype(bool) & point_df["observed_well_sample"].astype(bool)
+    ].copy()
+    conflicts = build_point_conflict_report(anchor_points, value_col="ginn_target_log_ai")
     conflicts_path = output_dir / "well_anchor_conflicts.csv" if not conflicts.empty else None
     if conflicts_path is not None:
         conflicts.to_csv(conflicts_path, index=False, encoding="utf-8-sig")
 
-    high_conflicts = build_point_conflict_report(high_points, value_col="well_high_log_ai")
+    high_conflicts = build_point_conflict_report(high_points, value_col="enhance_residual_log_ai")
     high_conflicts_path = output_dir / "well_high_supervision_conflicts.csv" if not high_conflicts.empty else None
     if high_conflicts_path is not None:
         high_conflicts.to_csv(high_conflicts_path, index=False, encoding="utf-8-sig")
 
     anchor_arrays, _anchor_trace_summary = aggregate_trace_arrays(
-        point_df,
+        anchor_points,
         samples,
-        target_col="well_low_ai",
-        value_cols=["well_low_log_ai"],
-        include_anchor_only=True,
+        target_col="ginn_target_ai",
+        value_cols=["ginn_target_log_ai"],
+        include_anchor_only=False,
     )
     anchor_metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_script": Path(__file__).name,
         "artifact_family": "well_constraints_time",
         "artifact_role": "log_ai_anchor",
-        "anchor_target_band": "lowpass_log_ai",
+        "anchor_target_band": "lowpass_reference_to_ginn_cutoff",
         "include_deviated": include_deviated_anchor,
         "conflict_strategy": "weighted_average",
-        "frequency_split": {
-            "mode": split_source,
-            "cutoff_hz": split_cfg.cutoff_hz,
-            "filter_order": split_cfg.filter_order,
-            "buffer_seconds": split_cfg.buffer_seconds,
-            "buffer_mode": split_cfg.buffer_mode,
+        "frequency_bands": {
+            "lfm_cutoff_hz": bands_cfg.lfm_cutoff_hz,
+            "ginn_cutoff_hz": bands_cfg.ginn_cutoff_hz,
+            "reference_cutoff_hz": bands_cfg.reference_cutoff_hz,
+            "filter_order": bands_cfg.filter_order,
+            "buffer_seconds": bands_cfg.buffer_seconds,
+            "buffer_mode": bands_cfg.buffer_mode,
         },
         "point_table": repo_relative_path(point_path, root=REPO_ROOT),
         "conflicts": repo_relative_path(conflicts_path, root=REPO_ROOT) if conflicts_path is not None else None,
@@ -1035,14 +1433,14 @@ def main() -> None:
         "source_script": Path(__file__).name,
         "artifact_family": "well_constraints_time",
         "artifact_role": "well_high_supervision",
-        "schema_compatibility": "well_high_supervision_v1",
+        "schema_compatibility": "enhance_residual_supervision_v2",
         "sample_domain": "time",
         "include_deviated": include_deviated_high,
         "excluded_sources": [] if include_deviated_high else ["deviated_trajectory"],
         "native_sample_semantics": "TWT seconds; native_samples currently matches samples in time-domain step 06.",
         "base_ai_fields_available": False,
         "base_ai_fields_note": "This package contains well high-frequency supervision only. Read base AI from LFM or GINN outputs.",
-        "frequency_split": anchor_metadata["frequency_split"],
+        "frequency_bands": anchor_metadata["frequency_bands"],
         "point_table": repo_relative_path(point_path, root=REPO_ROOT),
         "high_conflicts": (
             repo_relative_path(high_conflicts_path, root=REPO_ROOT) if high_conflicts_path is not None else None
@@ -1068,21 +1466,6 @@ def main() -> None:
     lfm_control_path = output_dir / "lfm_control_points.csv"
     lfm_control_df.to_csv(lfm_control_path, index=False, encoding="utf-8-sig")
 
-    split_diag_path = output_dir / "frequency_split_diagnostics.csv"
-    split_diag_df.to_csv(split_diag_path, index=False, encoding="utf-8-sig")
-    split_aggregate_path = output_dir / "frequency_split_aggregate.csv"
-    split_aggregate_df.to_csv(split_aggregate_path, index=False, encoding="utf-8-sig")
-    split_diag_figure_path = output_dir / "figures" / "frequency_split_cutoff_sweep.png"
-    _plot_frequency_split_aggregate(
-        split_aggregate_df,
-        figure_path=split_diag_figure_path,
-        selected_cutoff_hz=split_selection.get("selected_cutoff_hz"),
-        best_cutoff_hz=split_selection.get("best_corr_cutoff_hz"),
-    )
-    split_well_figure_paths = _plot_frequency_split_well_sweeps(
-        split_diag_df,
-        output_dir / "figures" / "frequency_split_wells",
-    )
     outputs = {
         "well_constraint_points": repo_relative_path(point_path, root=REPO_ROOT),
         "well_constraint_qc": repo_relative_path(qc_path, root=REPO_ROOT),
@@ -1092,10 +1475,12 @@ def main() -> None:
         "well_high_stats_global": repo_relative_path(global_stats_path, root=REPO_ROOT),
         "well_high_stats_by_layer": repo_relative_path(layer_stats_path, root=REPO_ROOT),
         "well_high_stats_shrinkage": repo_relative_path(shrinkage_path, root=REPO_ROOT),
-        "frequency_split_diagnostics": repo_relative_path(split_diag_path, root=REPO_ROOT),
-        "frequency_split_aggregate": repo_relative_path(split_aggregate_path, root=REPO_ROOT),
-        "frequency_split_cutoff_sweep_figure": repo_relative_path(split_diag_figure_path, root=REPO_ROOT),
-        "frequency_split_well_sweep_figures": split_well_figure_paths,
+        "ginn_cutoff_diagnostics": repo_relative_path(split_diag_path, root=REPO_ROOT),
+        "ginn_cutoff_cluster_aggregate": repo_relative_path(split_cluster_path, root=REPO_ROOT),
+        "ginn_cutoff_aggregate": repo_relative_path(split_aggregate_path, root=REPO_ROOT),
+        "ginn_cutoff_sweep_figure": repo_relative_path(split_diag_figure_path, root=REPO_ROOT),
+        "ginn_cutoff_well_sweep_figures": split_well_figure_paths,
+        "frequency_band_response_figure": repo_relative_path(frequency_response_path, root=REPO_ROOT),
     }
     if conflicts_path is not None:
         outputs["well_anchor_conflicts"] = repo_relative_path(conflicts_path, root=REPO_ROOT)
@@ -1111,13 +1496,15 @@ def main() -> None:
         "seismic_type": seismic_type,
         "horizons": horizon_metadata,
         "config": script_cfg,
-        "frequency_split": {
-            "mode": split_source,
-            "cutoff_hz": split_cfg.cutoff_hz,
-            "filter_order": split_cfg.filter_order,
-            "buffer_seconds": split_cfg.buffer_seconds,
-            "buffer_mode": split_cfg.buffer_mode,
+        "frequency_bands": {
+            "lfm_cutoff_hz": bands_cfg.lfm_cutoff_hz,
+            "ginn_cutoff_hz": bands_cfg.ginn_cutoff_hz,
+            "reference_cutoff_hz": bands_cfg.reference_cutoff_hz,
+            "filter_order": bands_cfg.filter_order,
+            "buffer_seconds": bands_cfg.buffer_seconds,
+            "buffer_mode": bands_cfg.buffer_mode,
             "diagnostics": repo_relative_path(split_diag_path, root=REPO_ROOT),
+            "cluster_aggregate": repo_relative_path(split_cluster_path, root=REPO_ROOT),
             "aggregate": repo_relative_path(split_aggregate_path, root=REPO_ROOT),
             "diagnostic_figure": repo_relative_path(split_diag_figure_path, root=REPO_ROOT),
             "selection": split_selection,

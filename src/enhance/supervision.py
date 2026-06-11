@@ -16,7 +16,7 @@ import numpy as np
 
 from cup.utils.io import to_json_compatible
 
-SCHEMA_VERSION = "well_high_supervision_v1"
+SCHEMA_VERSION = "enhance_residual_supervision_v2"
 VALID_SAMPLE_DOMAINS = {"time", "depth"}
 VALID_SAMPLE_UNITS = {"s", "m"}
 
@@ -42,15 +42,15 @@ class WellHighSupervisionBundle:
     well_names: np.ndarray
     inline: np.ndarray
     xline: np.ndarray
-    well_log_ai: np.ndarray
-    well_low_log_ai: np.ndarray
-    well_high_log_ai: np.ndarray
+    reference_log_ai: np.ndarray
+    ginn_target_log_ai: np.ndarray
+    enhance_residual_log_ai: np.ndarray
     well_mask: np.ndarray
     well_weight: np.ndarray
     native_samples: np.ndarray
-    native_well_log_ai: np.ndarray
-    native_well_low_log_ai: np.ndarray
-    native_well_high_log_ai: np.ndarray
+    native_reference_log_ai: np.ndarray
+    native_ginn_target_log_ai: np.ndarray
+    native_enhance_residual_log_ai: np.ndarray
     native_well_mask: np.ndarray
     summary: dict[str, Any]
     metadata: dict[str, Any]
@@ -75,7 +75,7 @@ class WellHighSupervisionBundle:
 
 
 def load_well_high_supervision_npz(path: str | Path) -> WellHighSupervisionBundle:
-    """Load a ``well_high_supervision_v1`` NPZ file."""
+    """Load an ``enhance_residual_supervision_v2`` NPZ file."""
     path = Path(path)
     with np.load(path, allow_pickle=False) as data:
         required = {
@@ -87,15 +87,15 @@ def load_well_high_supervision_npz(path: str | Path) -> WellHighSupervisionBundl
             "well_names",
             "inline",
             "xline",
-            "well_log_ai",
-            "well_low_log_ai",
-            "well_high_log_ai",
+            "reference_log_ai",
+            "ginn_target_log_ai",
+            "enhance_residual_log_ai",
             "well_mask",
             "well_weight",
             "native_samples",
-            "native_well_log_ai",
-            "native_well_low_log_ai",
-            "native_well_high_log_ai",
+            "native_reference_log_ai",
+            "native_ginn_target_log_ai",
+            "native_enhance_residual_log_ai",
             "native_well_mask",
             "summary_json",
             "metadata_json",
@@ -112,15 +112,15 @@ def load_well_high_supervision_npz(path: str | Path) -> WellHighSupervisionBundl
             well_names=np.asarray(data["well_names"]).astype(str),
             inline=np.asarray(data["inline"], dtype=np.float32),
             xline=np.asarray(data["xline"], dtype=np.float32),
-            well_log_ai=np.asarray(data["well_log_ai"], dtype=np.float32),
-            well_low_log_ai=np.asarray(data["well_low_log_ai"], dtype=np.float32),
-            well_high_log_ai=np.asarray(data["well_high_log_ai"], dtype=np.float32),
+            reference_log_ai=np.asarray(data["reference_log_ai"], dtype=np.float32),
+            ginn_target_log_ai=np.asarray(data["ginn_target_log_ai"], dtype=np.float32),
+            enhance_residual_log_ai=np.asarray(data["enhance_residual_log_ai"], dtype=np.float32),
             well_mask=np.asarray(data["well_mask"], dtype=bool),
             well_weight=np.asarray(data["well_weight"], dtype=np.float32),
             native_samples=np.asarray(data["native_samples"], dtype=np.float32),
-            native_well_log_ai=np.asarray(data["native_well_log_ai"], dtype=np.float32),
-            native_well_low_log_ai=np.asarray(data["native_well_low_log_ai"], dtype=np.float32),
-            native_well_high_log_ai=np.asarray(data["native_well_high_log_ai"], dtype=np.float32),
+            native_reference_log_ai=np.asarray(data["native_reference_log_ai"], dtype=np.float32),
+            native_ginn_target_log_ai=np.asarray(data["native_ginn_target_log_ai"], dtype=np.float32),
+            native_enhance_residual_log_ai=np.asarray(data["native_enhance_residual_log_ai"], dtype=np.float32),
             native_well_mask=np.asarray(data["native_well_mask"], dtype=bool),
             summary=_json_to_dict(data["summary_json"]),
             metadata=_json_to_dict(data["metadata_json"]),
@@ -144,15 +144,15 @@ def save_well_high_supervision_npz(path: str | Path, bundle: WellHighSupervision
         well_names=np.asarray(bundle.well_names).astype(str),
         inline=np.asarray(bundle.inline, dtype=np.float32),
         xline=np.asarray(bundle.xline, dtype=np.float32),
-        well_log_ai=np.asarray(bundle.well_log_ai, dtype=np.float32),
-        well_low_log_ai=np.asarray(bundle.well_low_log_ai, dtype=np.float32),
-        well_high_log_ai=np.asarray(bundle.well_high_log_ai, dtype=np.float32),
+        reference_log_ai=np.asarray(bundle.reference_log_ai, dtype=np.float32),
+        ginn_target_log_ai=np.asarray(bundle.ginn_target_log_ai, dtype=np.float32),
+        enhance_residual_log_ai=np.asarray(bundle.enhance_residual_log_ai, dtype=np.float32),
         well_mask=np.asarray(bundle.well_mask, dtype=bool),
         well_weight=np.asarray(bundle.well_weight, dtype=np.float32),
         native_samples=np.asarray(bundle.native_samples, dtype=np.float32),
-        native_well_log_ai=np.asarray(bundle.native_well_log_ai, dtype=np.float32),
-        native_well_low_log_ai=np.asarray(bundle.native_well_low_log_ai, dtype=np.float32),
-        native_well_high_log_ai=np.asarray(bundle.native_well_high_log_ai, dtype=np.float32),
+        native_reference_log_ai=np.asarray(bundle.native_reference_log_ai, dtype=np.float32),
+        native_ginn_target_log_ai=np.asarray(bundle.native_ginn_target_log_ai, dtype=np.float32),
+        native_enhance_residual_log_ai=np.asarray(bundle.native_enhance_residual_log_ai, dtype=np.float32),
         native_well_mask=np.asarray(bundle.native_well_mask, dtype=bool),
         summary_json=np.asarray(json.dumps(to_json_compatible(bundle.summary), ensure_ascii=False)),
         metadata_json=np.asarray(json.dumps(to_json_compatible(bundle.metadata), ensure_ascii=False)),
@@ -190,7 +190,7 @@ def validate_well_high_supervision(
         raise ValueError("flat_indices must be a 1D array.")
     n_rows = int(flat_indices.size)
     if np.unique(flat_indices).size != n_rows:
-        raise ValueError("Duplicate flat_indices are not supported in well_high_supervision_v1.")
+        raise ValueError(f"Duplicate flat_indices are not supported in {SCHEMA_VERSION}.")
     if n_traces is not None and n_rows:
         if flat_indices.min() < 0 or flat_indices.max() >= int(n_traces):
             raise ValueError(
@@ -204,7 +204,7 @@ def validate_well_high_supervision(
             raise ValueError(f"{name} shape {value.shape} does not match expected {(n_rows,)}.")
 
     expected_2d = (n_rows, samples.size)
-    for name in ("well_log_ai", "well_low_log_ai", "well_high_log_ai", "well_mask", "well_weight"):
+    for name in ("reference_log_ai", "ginn_target_log_ai", "enhance_residual_log_ai", "well_mask", "well_weight"):
         value = np.asarray(getattr(bundle, name))
         if value.shape != expected_2d:
             raise ValueError(f"{name} shape {value.shape} does not match expected {expected_2d}.")
@@ -215,7 +215,7 @@ def validate_well_high_supervision(
         raise ValueError("well_weight must be finite.")
     if np.any(weight < 0.0):
         raise ValueError("well_weight must be non-negative.")
-    for name in ("well_log_ai", "well_low_log_ai", "well_high_log_ai"):
+    for name in ("reference_log_ai", "ginn_target_log_ai", "enhance_residual_log_ai"):
         value = np.asarray(getattr(bundle, name), dtype=np.float64)
         if np.any(~np.isfinite(value[mask])):
             raise ValueError(f"{name} contains non-finite values inside well_mask.")
@@ -233,12 +233,17 @@ def validate_well_high_supervision(
     else:
         raise ValueError(f"native_samples must be 1D or shape (n_traces, n_native_sample), got {native_samples.shape}.")
 
-    for name in ("native_well_log_ai", "native_well_low_log_ai", "native_well_high_log_ai", "native_well_mask"):
+    for name in (
+        "native_reference_log_ai",
+        "native_ginn_target_log_ai",
+        "native_enhance_residual_log_ai",
+        "native_well_mask",
+    ):
         value = np.asarray(getattr(bundle, name))
         if value.shape != expected_native:
             raise ValueError(f"{name} shape {value.shape} does not match expected {expected_native}.")
     native_mask = np.asarray(bundle.native_well_mask, dtype=bool)
-    for name in ("native_well_log_ai", "native_well_low_log_ai", "native_well_high_log_ai"):
+    for name in ("native_reference_log_ai", "native_ginn_target_log_ai", "native_enhance_residual_log_ai"):
         value = np.asarray(getattr(bundle, name), dtype=np.float64)
         if np.any(~np.isfinite(value[native_mask])):
             raise ValueError(f"{name} contains non-finite values inside native_well_mask.")

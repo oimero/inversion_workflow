@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 
 from cup.utils.io import to_json_compatible
+from cup.utils.masks import true_runs
 from cup.utils.raw_trace import centered_moving_average
 
 SCHEMA_VERSION = "ginn_well_resolution_prior_v3"
@@ -38,7 +39,6 @@ __all__ = [
     "reflectivity_to_log_ai",
     "save_well_resolution_prior_npz",
     "summarize_well_resolution_prior",
-    "true_runs",
     "validate_ai_bounds",
     "validate_well_resolution_prior",
 ]
@@ -531,16 +531,6 @@ def edge_taper(length: int) -> np.ndarray:
     taper[:edge] = ramp
     taper[-edge:] = ramp[::-1]
     return taper
-
-
-def true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
-    """Return half-open ``[start, stop)`` runs where a 1D boolean mask is true."""
-    mask_1d = np.asarray(mask, dtype=bool).reshape(-1)
-    if mask_1d.size == 0 or not np.any(mask_1d):
-        return []
-    padded = np.concatenate(([False], mask_1d, [False]))
-    edges = np.flatnonzero(padded[1:] != padded[:-1])
-    return [(int(edges[i]), int(edges[i + 1])) for i in range(0, edges.size, 2)]
 
 
 def validate_ai_bounds(ai_min: float, ai_max: float) -> None:

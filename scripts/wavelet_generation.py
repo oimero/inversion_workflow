@@ -38,8 +38,6 @@ from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_
 from cup.utils.statistics import aggregate_cluster_then_global
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.well.assets import normalize_well_name
-from cup.well.las import load_vp_rho_logset_from_standard_las
-from cup.well.td import load_workflow_time_depth_table_csv
 from cup.well.tie import (
     TieEvaluationWell,
     WaveletCandidate,
@@ -47,7 +45,6 @@ from cup.well.tie import (
     build_well_spatial_clusters,
     evaluate_wavelet_on_well,
     load_tie_artifacts,
-    load_saved_seismic_trace_csv,
     prepare_well_for_evaluation,
 )
 from cup.well.wavelet import (
@@ -362,9 +359,9 @@ def _score_from_aggregate(row: pd.Series, cfg: dict[str, Any], *, regularization
 
 
 def _prepare_well_for_evaluation_with_ai(well: TieEvaluationWell) -> tuple[Any, Any, grid.Log]:
-    logset = load_vp_rho_logset_from_standard_las(well.input_las)
-    table = load_workflow_time_depth_table_csv(well.optimized_tdt_file)
-    seismic = load_saved_seismic_trace_csv(well.seismic_trace_file)
+    from cup.well.tie import load_continuous_tie_evaluation_inputs
+
+    logset, table, seismic = load_continuous_tie_evaluation_inputs(well)
     seismic_dt_s = float(np.median(np.diff(seismic.basis)))
     logset_twt = tie_ops.convert_logs_from_md_to_twt(logset, None, table, seismic_dt_s)
     reflectivity = tie_ops.compute_reflectivity(logset_twt)

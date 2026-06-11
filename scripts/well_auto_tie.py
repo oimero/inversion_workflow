@@ -47,8 +47,10 @@ from cup.seismic.viz import plot_well_waveform_qc
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.coerce import as_bool
 from cup.utils.config import merge_dict_defaults
+from cup.utils.masks import true_runs
 from cup.well.assets import build_file_lookup
-from cup.well.las import export_logset_to_las, load_vp_rho_logset_from_standard_las
+from cup.well.gaps import fill_short_joint_gaps, prepare_continuous_tie_logs
+from cup.well.las import export_logset_to_las, load_standard_vp_rho_logs
 from cup.well.td import (
     PreparedTieWindow,
     TargetTieWindow,
@@ -142,6 +144,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "allow_near_outside": False,
             "min_tie_samples": 64,
             "max_trajectory_outside_fraction": 0.05,
+            "max_short_log_gap_s": 0.010,
         },
     )
     merge_dict_defaults(
@@ -770,39 +773,117 @@ def _write_optimized_trace_sample_plan(
     return paths["optimized_trace_sample_plan"]
 
 
-def _filtered_standard_las_logset(logset_md: Any, best_params: Mapping[str, Any]) -> dict[str, grid.Log]:
-    """Apply the selected auto-tie MD log filters and convert back to standard LAS mnemonics."""
+def _filtered_standard_las_logset(
+    logset_md: Any,
+    best_params: Mapping[str, Any],
+) -> dict[str, grid.Log]:
+    """Apply selected filters independently to each joint-valid MD segment."""
     from wtie.optimize import tie as tie_ops
 
-    filtered = tie_ops.filter_md_logs(
-        logset_md,
-        median_size=best_params["logs_median_size"],
-        threshold=best_params["logs_median_threshold"],
-        std=best_params["logs_std"],
-        std2=0.8 * best_params["logs_std"],
-    )
-    vp = np.asarray(filtered.Logs["Vp"].values, dtype=np.float64)
-    rho = np.asarray(filtered.Logs["Rho"].values, dtype=np.float64)
-    md = np.asarray(filtered.basis, dtype=np.float64)
-    if np.any(~np.isfinite(vp)) or np.any(vp <= 0.0):
-        raise ValueError("Filtered Vp contains non-finite or non-positive values.")
-    if np.any(~np.isfinite(rho)) or np.any(rho <= 0.0):
-        raise ValueError("Filtered Rho contains non-finite or non-positive values.")
-    ai = filtered.AI
+    md = np.asarray(logset_md.basis, dtype=np.float64)
+    source_vp = np.asarray(logset_md.Vp.values, dtype=np.float64)
+    source_rho = np.asarray(logset_md.Rho.values, dtype=np.float64)
+    valid = np.isfinite(source_vp) & (source_vp > 0.0) & np.isfinite(source_rho) & (source_rho > 0.0)
+    vp = np.full(md.shape, np.nan, dtype=np.float64)
+    rho = np.full(md.shape, np.nan, dtype=np.float64)
+    min_filter_samples = max(8, int(best_params["logs_median_size"]) + 2)
+    for start, stop in true_runs(valid):
+        segment = grid.LogSet(
+            {
+                "Vp": grid.Log(
+                    source_vp[start:stop],
+                    md[start:stop],
+                    "md",
+                    name="Vp",
+                    unit="m/s",
+                    allow_nan=False,
+                ),
+                "Rho": grid.Log(
+                    source_rho[start:stop],
+                    md[start:stop],
+                    "md",
+                    name="Rho",
+                    unit="g/cm3",
+                    allow_nan=False,
+                ),
+            }
+        )
+        if stop - start >= min_filter_samples:
+            segment = tie_ops.filter_md_logs(
+                segment,
+                median_size=best_params["logs_median_size"],
+                threshold=best_params["logs_median_threshold"],
+                std=best_params["logs_std"],
+                std2=0.8 * best_params["logs_std"],
+            )
+        vp[start:stop] = segment.Vp.values
+        rho[start:stop] = segment.Rho.values
+    ai_values = vp * rho
     return {
-        "DT_USM": grid.Log(1_000_000.0 / vp, md, "md", name="DT_USM", unit="us/m", allow_nan=False),
-        "RHO_GCC": grid.Log(rho, md, "md", name="RHO_GCC", unit="g/cm3", allow_nan=False),
-        "AI": ai,
+        "DT_USM": grid.Log(1_000_000.0 / vp, md, "md", name="DT_USM", unit="us/m", allow_nan=True),
+        "RHO_GCC": grid.Log(rho, md, "md", name="RHO_GCC", unit="g/cm3", allow_nan=True),
+        "AI": grid.Log(
+            ai_values,
+            md,
+            "md",
+            name="AI",
+            unit="m/s*g/cm3",
+            allow_nan=True,
+        ),
     }
 
 
-def _export_filtered_las(paths: dict[str, Path], plan: WellTiePlan, logset_md: Any, best_params: Mapping[str, Any]) -> Path:
-    filtered_logs = _filtered_standard_las_logset(logset_md, best_params)
+def _export_filtered_las(
+    paths: dict[str, Path],
+    plan: WellTiePlan,
+    best_params: Mapping[str, Any],
+    table: grid.TimeDepthTable,
+    *,
+    max_short_gap_s: float,
+) -> Path:
+    standard = load_standard_vp_rho_logs(_resolve_repo_path(plan.input_las))
+    export_logset, _filled = fill_short_joint_gaps(
+        standard,
+        table,
+        max_short_gap_s=max_short_gap_s,
+    )
+    filtered_logs = _filtered_standard_las_logset(export_logset, best_params)
     return export_logset_to_las(
         plan.well_name,
         filtered_logs,
         paths["filtered_las"],
         curve_names=["DT_USM", "RHO_GCC", "AI"],
+        template_las=_resolve_repo_path(plan.input_las),
+    )
+
+
+def _provisional_anchor_tdt_logset(standard: Any) -> tuple[grid.LogSet, int]:
+    """Build a mapping-only continuous logset for anchor-based initial TDT construction."""
+    md = np.asarray(standard.logs.basis, dtype=np.float64)
+    vp = np.asarray(standard.logs.Vp.values, dtype=np.float64)
+    rho = np.asarray(standard.logs.Rho.values, dtype=np.float64)
+    joint_valid = np.isfinite(vp) & (vp > 0.0) & np.isfinite(rho) & (rho > 0.0)
+    if int(np.count_nonzero(joint_valid)) < 2:
+        raise ValueError("Anchor TDT construction requires at least two joint-valid Vp/Rho samples.")
+    if np.all(joint_valid):
+        return standard.logs, 0
+    mapping_vp = np.interp(md, md[joint_valid], vp[joint_valid])
+    mapping_rho = np.interp(md, md[joint_valid], rho[joint_valid])
+    return (
+        grid.LogSet(
+            {
+                "Vp": grid.Log(mapping_vp, md, "md", name="Vp", unit="m/s", allow_nan=False),
+                "Rho": grid.Log(
+                    mapping_rho,
+                    md,
+                    "md",
+                    name="Rho",
+                    unit="g/cm3",
+                    allow_nan=False,
+                ),
+            }
+        ),
+        int(np.count_nonzero(~joint_valid)),
     )
 
 
@@ -887,7 +968,7 @@ def _clip_prepared_tie_window(
     )
     md_min = float(np.interp(float(rows["twt_s"].iloc[0]), clipped_table.twt, clipped_table.md))
     md_max = float(np.interp(float(rows["twt_s"].iloc[-1]), clipped_table.twt, clipped_table.md))
-    clipped_logset = crop_logset_md(prepared.logset_md, md_min, md_max, min_samples=min_tie_samples)
+    clipped_logset = crop_logset_md(prepared.logset_md, md_min, md_max, min_samples=2)
 
     report = dict(prepared.report)
     report["tie_window_start_s"] = float(rows["twt_s"].iloc[0])
@@ -993,7 +1074,7 @@ def _run_vertical_with_tdt(
     input_las = _resolve_repo_path(plan.input_las)
     time_depth_file = _resolve_repo_path(plan.time_depth_file)
 
-    logset_md = load_vp_rho_logset_from_standard_las(input_las)
+    standard_logs = load_standard_vp_rho_logs(input_las)
     table = load_petrel_time_depth_table(time_depth_file, domain="md")
     target_window = _target_tie_window_for_plan(
         plan=plan,
@@ -1015,6 +1096,21 @@ def _run_vertical_with_tdt(
     )
     if not tdt_overlaps_window(table, target_window):
         raise RerouteToAnchor("tdt_no_target_window_overlap_reroute_anchor", target_window)
+    continuous = prepare_continuous_tie_logs(
+        standard_logs,
+        table,
+        window_start_s=target_window.start_s,
+        window_end_s=target_window.end_s,
+        max_short_gap_s=float(config["reject"]["max_short_log_gap_s"]),
+        min_tie_samples=int(config["reject"]["min_tie_samples"]),
+        seismic_sample_interval_s=float(survey.sample_axis("time").step),
+    )
+    logset_md = continuous.logs
+    target_window = replace(
+        target_window,
+        start_s=continuous.start_twt_s,
+        end_s=continuous.end_twt_s,
+    )
     prepared = prepare_tdt_with_sonic_extension(
         raw_table=table,
         logset_md=logset_md,
@@ -1022,6 +1118,7 @@ def _run_vertical_with_tdt(
         min_tie_samples=int(config["reject"]["min_tie_samples"]),
     )
     prepared = _with_report(prepared, coarse_report)
+    prepared = _with_report(prepared, continuous.qc)
     return _run_tie_with_initial_table(
         plan=plan,
         survey=survey,
@@ -1061,7 +1158,8 @@ def _run_vertical_anchor_from_tops(
         raise ValueError("coarse_correction.anchor must include vertical_anchor_from_tops to build an initial TDT.")
 
     input_las = _resolve_repo_path(plan.input_las)
-    logset_md = load_vp_rho_logset_from_standard_las(input_las)
+    standard_logs = load_standard_vp_rho_logs(input_las)
+    mapping_logset, mapping_filled_samples = _provisional_anchor_tdt_logset(standard_logs)
     anchor_info = _sample_anchor_for_plan(
         plan=plan,
         survey=survey,
@@ -1071,7 +1169,7 @@ def _run_vertical_anchor_from_tops(
         data_root=data_root,
     )
     table = build_tdt_from_anchor(
-        logset_md,
+        mapping_logset,
         anchor_md_m=float(anchor_info["anchor_md_m"]),
         anchor_twt_s=float(anchor_info["anchor_twt_s"]),
     )
@@ -1079,12 +1177,33 @@ def _run_vertical_anchor_from_tops(
     table = _shift_time_depth_table(table, manual_shift_s)
     anchor_info = {**anchor_info, "anchor_role": "build_initial_tdt", "anchor_shift_ms": 0.0}
     coarse_report = _coarse_report(anchor_shift_s=0.0, manual_shift_s=manual_shift_s, anchor_info=anchor_info)
+    coarse_report.update(
+        {
+            "anchor_tdt_mapping_only_interpolation": bool(mapping_filled_samples),
+            "anchor_tdt_mapping_only_filled_samples": int(mapping_filled_samples),
+        }
+    )
     target_window = _target_tie_window_for_plan(
         plan=plan,
         survey=survey,
         config=config,
         horizon_cache=horizon_cache,
         data_root=data_root,
+    )
+    continuous = prepare_continuous_tie_logs(
+        standard_logs,
+        table,
+        window_start_s=target_window.start_s,
+        window_end_s=target_window.end_s,
+        max_short_gap_s=float(config["reject"]["max_short_log_gap_s"]),
+        min_tie_samples=int(config["reject"]["min_tie_samples"]),
+        seismic_sample_interval_s=float(survey.sample_axis("time").step),
+    )
+    logset_md = continuous.logs
+    target_window = replace(
+        target_window,
+        start_s=continuous.start_twt_s,
+        end_s=continuous.end_twt_s,
     )
     prepared = prepare_anchor_tdt_for_window(
         table=table,
@@ -1094,6 +1213,7 @@ def _run_vertical_anchor_from_tops(
         support_class="rerouted_to_anchor" if rerouted_from else "anchor_integrated",
     )
     prepared = _with_report(prepared, coarse_report)
+    prepared = _with_report(prepared, continuous.qc)
     return _run_tie_with_initial_table(
         plan=plan,
         survey=survey,
@@ -1137,7 +1257,7 @@ def _run_deviated_with_tdt(
     time_depth_file = _resolve_repo_path(plan.time_depth_file)
     trace_file = _resolve_repo_path(plan.well_trace_file)
 
-    logset_md = load_vp_rho_logset_from_standard_las(input_las)
+    standard_logs = load_standard_vp_rho_logs(input_las)
     table = load_petrel_time_depth_table(time_depth_file, domain="md")
     trajectory = WellTrajectory.from_petrel_trace(trace_file).with_well_name(plan.well_name)
     table, coarse_report, anchor_info = _apply_coarse_correction_to_existing_tdt(
@@ -1163,6 +1283,21 @@ def _run_deviated_with_tdt(
     )
     if not tdt_overlaps_window(table, target_window):
         raise ValueError("tdt_no_target_window_overlap")
+    continuous = prepare_continuous_tie_logs(
+        standard_logs,
+        table,
+        window_start_s=target_window.start_s,
+        window_end_s=target_window.end_s,
+        max_short_gap_s=float(config["reject"]["max_short_log_gap_s"]),
+        min_tie_samples=int(config["reject"]["min_tie_samples"]),
+        seismic_sample_interval_s=float(survey.sample_axis("time").step),
+    )
+    logset_md = continuous.logs
+    target_window = replace(
+        target_window,
+        start_s=continuous.start_twt_s,
+        end_s=continuous.end_twt_s,
+    )
 
     prepared = prepare_tdt_with_sonic_extension(
         raw_table=table,
@@ -1171,6 +1306,7 @@ def _run_deviated_with_tdt(
         min_tie_samples=int(config["reject"]["min_tie_samples"]),
     )
     prepared = _with_report(prepared, coarse_report)
+    prepared = _with_report(prepared, continuous.qc)
     sample_start = float(prepared.report["tie_window_start_s"])
     sample_end = float(prepared.report["tie_window_end_s"])
     sample_axis = survey.sample_axis("time")
@@ -1350,7 +1486,13 @@ def _run_tie_with_initial_table(
     best_params, _ = outputs.ax_client.get_best_parameters()
     best_shift_ms = float(best_params.get("table_t_shift", 0.0)) * 1000.0
     petrel_checkshot_file = _export_petrel_checkshot_tdt(paths, plan, outputs.table)
-    filtered_las_file = _export_filtered_las(paths, plan, logset_md, best_params)
+    filtered_las_file = _export_filtered_las(
+        paths,
+        plan,
+        best_params,
+        outputs.table,
+        max_short_gap_s=float(config["reject"]["max_short_log_gap_s"]),
+    )
     optimized_trace_sample_plan_file = None
     if optimized_trace_trajectory is not None:
         optimized_trace_sample_plan_file = _write_optimized_trace_sample_plan(
@@ -1642,6 +1784,15 @@ def main() -> None:
                     "tie_window_end_s": tie_window.get("tie_window_end_s"),
                     "tdt_support_class": tie_window.get("tdt_support_class"),
                     "original_tdt_window_fraction": tie_window.get("original_tdt_window_fraction"),
+                    "joint_observed_fraction": tie_window.get("joint_observed_fraction"),
+                    "short_gap_filled_samples": tie_window.get("short_gap_filled_samples"),
+                    "long_gap_count": tie_window.get("long_gap_count"),
+                    "longest_long_gap_s": tie_window.get("longest_long_gap_s"),
+                    "continuous_tie_window_start_s": tie_window.get("continuous_tie_window_start_s"),
+                    "continuous_tie_window_end_s": tie_window.get("continuous_tie_window_end_s"),
+                    "continuous_tie_sample_count": tie_window.get("continuous_tie_sample_count"),
+                    "continuous_tie_log_sample_count": tie_window.get("continuous_tie_log_sample_count"),
+                    "tie_window_clipped_for_log_gap": tie_window.get("tie_window_clipped_for_log_gap"),
                     "petrel_checkshot_file": extra.get("petrel_checkshot_file"),
                     "filtered_las_file": extra.get("filtered_las_file"),
                     "optimized_trace_sample_plan_file": extra.get("optimized_trace_sample_plan_file"),

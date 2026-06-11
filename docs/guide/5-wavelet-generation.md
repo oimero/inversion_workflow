@@ -32,6 +32,8 @@ python scripts/wavelet_generation.py --output-dir scripts/output/wavelet_generat
 | 第四步 | `time_depth/optimized_tdt_<well>.csv` | 优化后的时深表——第五步的固定评测基准 |
 | 第四步 | `seismic_trace/seismic_trace_<well>.csv` | 井旁或沿轨迹地震道——第五步不重新取道 |
 
+第五步只使用保存地震道、优化 TDT 和 filtered LAS 的共同连续标定窗。若该窗内仍存在 DT/RHO 长缺口，井评测直接失败，不允许通过普通插值跨越缺口。
+
 ---
 
 ## 配置参考

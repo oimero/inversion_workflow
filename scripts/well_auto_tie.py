@@ -664,12 +664,14 @@ def _ensure_output_dirs(output_dir: Path) -> None:
 
 def _save_current_figure(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        plt.tight_layout()
-    except RuntimeError:
-        pass
-    plt.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close()
+    fig = plt.gcf()
+    if not fig.get_constrained_layout():
+        try:
+            fig.tight_layout()
+        except RuntimeError:
+            pass
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _compute_table_synthetic_metrics(logset_md: Any, seismic: Any, table: Any, wavelet: Any, modeler: Any, dt_s: float) -> tuple[float, float]:
@@ -879,35 +881,6 @@ def _provisional_anchor_tdt_logset(standard: Any) -> tuple[grid.LogSet, int]:
     )
 
 
-def _draw_target_horizons(axes: Any, target_window: TargetTieWindow | None, *, y_scale: float = 1.0) -> None:
-    """Draw target horizon markers on TWT-domain QC axes."""
-    if target_window is None:
-        return
-    specs = [
-        (target_window.top_twt_s * y_scale, "top", "tab:green"),
-        (target_window.bottom_twt_s * y_scale, "bottom", "tab:blue"),
-    ]
-    flat_axes = np.ravel(axes).tolist()
-    for ax in flat_axes:
-        if not hasattr(ax, "get_xlim"):
-            continue
-        xmin, xmax = ax.get_xlim()
-        span = xmax - xmin
-        label_x = xmin + 0.03 * span if np.isfinite(span) and span != 0.0 else xmin
-        for y_ms, label, color in specs:
-            ax.axhline(y_ms, color=color, lw=0.9, alpha=0.75, linestyle="--")
-            ax.text(
-                label_x,
-                y_ms,
-                f" {label}",
-                va="center",
-                ha="left",
-                fontsize=8,
-                color=color,
-                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.7, "pad": 1.0},
-            )
-
-
 def _source_at_twt(rows: pd.DataFrame, twt_s: float) -> str:
     values = rows["twt_s"].to_numpy(dtype=np.float64)
     sources = rows["source"].astype(str).to_numpy(dtype=object)
@@ -984,6 +957,9 @@ def _write_qc_figures(
     *,
     initial_table_rows: pd.DataFrame | None = None,
     target_window: TargetTieWindow | None = None,
+    optimized_corr: float,
+    optimized_nmae: float,
+    synthetic_scale: float,
 ) -> None:
     try:
         fig, _ = outputs.plot_optimization_objective(figsize=(6, 3))
@@ -1018,8 +994,19 @@ def _write_qc_figures(
         outputs.xcorr,
         outputs.dxcorr,
         figsize=(12.0, 7.5),
+        title=(
+            f"Auto tie | corr={optimized_corr:.3f}, "
+            f"nmae={optimized_nmae:.3f}, scale={synthetic_scale:.3g}"
+        ),
+        horizon_markers=(
+            []
+            if target_window is None
+            else [
+                (target_window.top_twt_s, target_window.top_name),
+                (target_window.bottom_twt_s, target_window.bottom_name),
+            ]
+        ),
     )
-    _draw_target_horizons(axes, target_window, y_scale=1.0)
     _save_current_figure(paths["fig_tie"])
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))
@@ -1473,6 +1460,9 @@ def _run_tie_with_initial_table(
             margin_top_s=0.0,
             margin_bottom_s=0.0,
         ),
+        optimized_corr=optimized_corr,
+        optimized_nmae=optimized_nmae,
+        synthetic_scale=synthetic_scale,
     )
 
     best_params, _ = outputs.ax_client.get_best_parameters()
@@ -1786,6 +1776,7 @@ def main() -> None:
                     "continuous_tie_sample_count": tie_window.get("continuous_tie_sample_count"),
                     "continuous_tie_log_sample_count": tie_window.get("continuous_tie_log_sample_count"),
                     "tie_window_clipped_for_log_gap": tie_window.get("tie_window_clipped_for_log_gap"),
+                    "seismic_trace_file": extra.get("seismic_trace_file"),
                     "petrel_checkshot_file": extra.get("petrel_checkshot_file"),
                     "filtered_las_file": extra.get("filtered_las_file"),
                     "optimized_trace_sample_plan_file": extra.get("optimized_trace_sample_plan_file"),

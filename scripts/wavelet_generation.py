@@ -486,7 +486,13 @@ def _plot_wavelets(time_s: np.ndarray, wavelets: dict[str, np.ndarray], path: Pa
     plt.close(fig)
 
 
-def _plot_batch_synthetic_qc(qc: pd.DataFrame, metrics_row: pd.Series | None, path: Path) -> None:
+def _plot_batch_synthetic_qc(
+    qc: pd.DataFrame,
+    metrics_row: pd.Series | None,
+    path: Path,
+    *,
+    horizon_markers: Sequence[tuple[float, str]] = (),
+) -> None:
     if qc.empty:
         return
     twt_s = qc["twt_s"].to_numpy(dtype=np.float64)
@@ -502,6 +508,12 @@ def _plot_batch_synthetic_qc(qc: pd.DataFrame, metrics_row: pd.Series | None, pa
     xcorr_basis = synthetic_trace.sampling_rate * np.arange(-(synthetic_trace.size - 1), synthetic_trace.size)
     xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
     dxcorr = dynamic_normalized_xcorr(seismic_trace, synthetic_trace)
+    title = None
+    if metrics_row is not None:
+        corr = float(metrics_row["corr"]) if pd.notna(metrics_row.get("corr")) else np.nan
+        nmae = float(metrics_row["nmae"]) if pd.notna(metrics_row.get("nmae")) else np.nan
+        scale = float(metrics_row["scale"]) if pd.notna(metrics_row.get("scale")) else np.nan
+        title = f"Batch synthetic | corr={corr:.3f}, nmae={nmae:.3f}, scale={scale:.3g}"
     fig, _axes = plot_well_waveform_qc(
         grid.Log(ai_values, twt_s, "twt", name="AI"),
         grid.Reflectivity(reflectivity, twt_s, "twt", name="Reflectivity"),
@@ -510,20 +522,43 @@ def _plot_batch_synthetic_qc(qc: pd.DataFrame, metrics_row: pd.Series | None, pa
         xcorr,
         dxcorr,
         figsize=(12.0, 7.5),
+        title=title,
+        horizon_markers=horizon_markers,
     )
-    if metrics_row is not None:
-        corr = float(metrics_row["corr"]) if pd.notna(metrics_row.get("corr")) else np.nan
-        nmae = float(metrics_row["nmae"]) if pd.notna(metrics_row.get("nmae")) else np.nan
-        scale = float(metrics_row["scale"]) if pd.notna(metrics_row.get("scale")) else np.nan
-        fig.suptitle(f"Batch synthetic | corr={corr:.3f}, nmae={nmae:.3f}, scale={scale:.3g}")
     fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
+
+
+def _tie_horizon_markers_by_well(auto_tie_dir: Path) -> dict[str, list[tuple[float, str]]]:
+    path = auto_tie_dir / "tie_window_report.csv"
+    if not path.exists():
+        return {}
+    rows = pd.read_csv(path)
+    required = {
+        "well_name",
+        "target_top_name",
+        "target_bottom_name",
+        "target_top_twt_s",
+        "target_bottom_twt_s",
+    }
+    if not required.issubset(rows.columns):
+        return {}
+    return {
+        normalize_well_name(str(row["well_name"])): [
+            (float(row["target_top_twt_s"]), str(row["target_top_name"])),
+            (float(row["target_bottom_twt_s"]), str(row["target_bottom_name"])),
+        ]
+        for _, row in rows.iterrows()
+        if pd.notna(row["target_top_twt_s"]) and pd.notna(row["target_bottom_twt_s"])
+    }
 
 
 def _write_batch_synthetic_qc_figures(
     qcs: Sequence[pd.DataFrame],
     metrics_df: pd.DataFrame,
     output_dir: Path,
+    *,
+    horizon_markers_by_well: dict[str, list[tuple[float, str]]] | None = None,
 ) -> list[str]:
     metric_by_well = {
         normalize_well_name(str(row["eval_well"])): row
@@ -538,7 +573,13 @@ def _write_batch_synthetic_qc_figures(
         candidate = str(qc["candidate_wavelet"].iloc[0]) if "candidate_wavelet" in qc.columns else "selected"
         safe = sanitize_filename(f"{candidate}_{well_name}")
         path = output_dir / f"batch_synthetic_qc_{safe}.png"
-        _plot_batch_synthetic_qc(qc, metric_by_well.get(normalize_well_name(well_name)), path)
+        key = normalize_well_name(well_name)
+        _plot_batch_synthetic_qc(
+            qc,
+            metric_by_well.get(key),
+            path,
+            horizon_markers=(horizon_markers_by_well or {}).get(key, ()),
+        )
         figure_paths.append(repo_relative_path(path, root=REPO_ROOT))
     return figure_paths
 
@@ -761,6 +802,7 @@ def main() -> None:
         batch_qcs,
         batch_metrics_df,
         output_dirs["batch_synthetic_qc_figures"],
+        horizon_markers_by_well=_tie_horizon_markers_by_well(source_dirs["auto_tie_dir"]),
     )
     plot_wavelets = {"selected": selected_wavelet, "best_candidate": best_candidate_item["amplitude"]}
     plot_wavelets["mean_of_candidates" if selection_mode == "insufficient_eval_fallback" else "consensus"] = consensus_wavelet

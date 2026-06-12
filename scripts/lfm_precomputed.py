@@ -316,6 +316,18 @@ def _metric_row_for_well(metrics_df: pd.DataFrame, well_name: str) -> pd.Series:
     return row
 
 
+def _resolve_lfm_qc_seismic_trace_file(metric: pd.Series, *, auto_dir: Path, well_name: str) -> Path | None:
+    direct = resolve_artifact_path(
+        metric.get("seismic_trace_file"),
+        root=REPO_ROOT,
+        run_dir=auto_dir,
+    )
+    if direct is not None and direct.exists():
+        return direct
+    fallback = auto_dir / "seismic_trace" / f"seismic_trace_{sanitize_filename(well_name)}.csv"
+    return fallback if fallback.exists() else direct
+
+
 def _trajectory_coordinates(
     metric: pd.Series,
     *,
@@ -371,6 +383,34 @@ def _lfm_qc_coordinates(
     raise ValueError(f"Unsupported mixed LFM QC sources for {well_name!r}: {sorted(sources)}")
 
 
+def _lfm_horizon_markers(
+    group: pd.DataFrame,
+    *,
+    horizon_names: dict[str, str],
+) -> list[tuple[float, str]]:
+    estimates: dict[str, list[float]] = {}
+    for zone_name, zone_group in group.groupby("zone_name", sort=False):
+        parts = str(zone_name).split("->", maxsplit=1)
+        if len(parts) != 2 or len(zone_group) < 2:
+            continue
+        u = zone_group["u_in_zone"].to_numpy(dtype=np.float64)
+        twt = zone_group["twt_s"].to_numpy(dtype=np.float64)
+        valid = np.isfinite(u) & np.isfinite(twt)
+        if int(np.count_nonzero(valid)) < 2 or np.ptp(u[valid]) <= 0.0:
+            continue
+        slope, intercept = np.polyfit(u[valid], twt[valid], deg=1)
+        estimates.setdefault(parts[0], []).append(float(intercept))
+        estimates.setdefault(parts[1], []).append(float(intercept + slope))
+    return sorted(
+        [
+            (float(np.mean(values)), horizon_names.get(name, name))
+            for name, values in estimates.items()
+            if values
+        ],
+        key=lambda item: item[0],
+    )
+
+
 def _write_lfm_well_qc(
     control_df: pd.DataFrame,
     result: Any,
@@ -405,6 +445,10 @@ def _write_lfm_well_qc(
     )
 
     metrics_rows: list[dict[str, Any]] = []
+    horizon_names = {
+        f"horizon_{index}": Path(str(item.get("file", f"horizon_{index}"))).name
+        for index, item in enumerate(constraints_summary.get("horizons") or [])
+    }
     try:
         auto_dir, wavelet_path, tie_metrics = _resolve_lfm_qc_sources(constraints_summary)
         wavelet_time_s, wavelet_values = load_wavelet_csv(wavelet_path)
@@ -447,10 +491,10 @@ def _write_lfm_well_qc(
         }
         try:
             metric = _metric_row_for_well(tie_metrics, str(well_name))
-            seismic_path = resolve_artifact_path(
-                metric.get("seismic_trace_file"),
-                root=REPO_ROOT,
-                run_dir=auto_dir,
+            seismic_path = _resolve_lfm_qc_seismic_trace_file(
+                metric,
+                auto_dir=auto_dir,
+                well_name=str(well_name),
             )
             if seismic_path is None or not seismic_path.exists():
                 raise FileNotFoundError(f"Missing fourth-step seismic trace for {well_name!r}.")
@@ -524,8 +568,8 @@ def _write_lfm_well_qc(
             )
             xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
             dxcorr = dynamic_normalized_xcorr(observed_trace, synthetic_trace)
-            control_trace = grid.Log(control_values, display_twt, "twt", name="Low-frequency control AI")
-            sampled_trace = grid.Log(lfm_ai_values, display_twt, "twt", name="LFM sampled AI")
+            control_trace = grid.Log(control_values, display_twt, "twt", name="Control AI")
+            sampled_trace = grid.Log(lfm_ai_values, display_twt, "twt", name="LFM model")
             reflectivity_trace = grid.Reflectivity(
                 reflectivity_values,
                 display_twt,
@@ -551,6 +595,7 @@ def _write_lfm_well_qc(
             )
             trace_df.to_csv(trace_path, index=False, encoding="utf-8-sig")
 
+            wave_metrics = waveform_qc_metrics(observed, synthetic, target_mask)
             fig, _axes = plot_well_waveform_qc(
                 [control_trace, sampled_trace],
                 reflectivity_trace,
@@ -560,9 +605,14 @@ def _write_lfm_well_qc(
                 dxcorr,
                 synthetic_ai=sampled_trace,
                 figsize=(12.0, 7.5),
-            )
-            fig.suptitle(
-                f"LFM well QC | {well_name} | corr={waveform_qc_metrics(observed, synthetic, target_mask)['corr']:.3f}"
+                title=(
+                    f"LFM synthetic | corr={wave_metrics['corr']:.3f}, "
+                    f"nmae={wave_metrics['nmae']:.3f}, scale={scale:.3g}"
+                ),
+                horizon_markers=_lfm_horizon_markers(
+                    group,
+                    horizon_names=horizon_names,
+                ),
             )
             fig.savefig(figure_path, dpi=180, bbox_inches="tight")
             plt.close(fig)
@@ -600,7 +650,7 @@ def _write_lfm_well_qc(
                     ),
                     **{
                         f"waveform_{key}": value
-                        for key, value in waveform_qc_metrics(observed, synthetic, target_mask).items()
+                        for key, value in wave_metrics.items()
                     },
                 }
             )

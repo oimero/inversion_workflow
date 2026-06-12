@@ -241,41 +241,6 @@ wavelet_generation:
 | `consensus_search_trials.csv` | 共识搜索的每次 trial、系数、指标和分数 |
 | `consensus_wavelet_metrics.csv` | 共识子波 × 评测井的逐项指标 |
 
-### `wavelet_candidate_metrics.csv`（debug 输出）
-
-每条候选子波在每口评测井上各一行：
-
-| 字段 | 含义 |
-|------|------|
-| `candidate_wavelet` | 候选子波名 |
-| `source_well` | 子波来源井 |
-| `eval_well` | 评测井 |
-| `is_source_well` | 评测井是否就是来源井（自己评自己，通常偏高） |
-| `spatial_cluster_id` | 评测井的空间簇编号 |
-| `route` | 评测井的第四步标定路径 |
-| `corr` | 零残余时移下的相关系数 |
-| `nmae` | 零残余时移下的 NMAE |
-| `scale` | 最小二乘振幅缩放因子 |
-| `status` | `ok` 或 `failed` |
-| `reasons` | 失败原因 |
-
-### `consensus_search_trials.csv`（debug 输出）
-
-共识搜索的每次评测一行：
-
-| 字段 | 含义 |
-|------|------|
-| `trial_id` | 搜索编号 |
-| `coef_0 ... coef_k` | 该试验的 PCA 系数 |
-| `spatial_debiased_median_corr` | 空间去偏中位相关系数 |
-| `spatial_debiased_p10_corr` | 空间去偏 P10 相关系数 |
-| `spatial_debiased_median_nmae` | 空间去偏中位 NMAE |
-| `deviation_from_mean` | 与均值子波的形态偏离 |
-| `roughness` | 二阶差分粗糙度 |
-| `bandwidth_drift` | 主频相对候选子波均值的漂移 |
-| `score` | 综合优化目标 |
-| `selected` | 是否最终选中 |
-
 ---
 
 ## 如何阅读结果

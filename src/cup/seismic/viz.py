@@ -7,7 +7,7 @@ from typing import Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
-from matplotlib.ticker import FormatStrFormatter, MaxNLocator
+from matplotlib.ticker import FormatStrFormatter, MaxNLocator, ScalarFormatter
 import numpy as np
 
 from wtie.processing import grid
@@ -66,11 +66,17 @@ def _plot_reflectivity(
 
     ax.set_xlabel(reflectivity.name)
     ax.xaxis.set_label_position("top")
+    ax.xaxis.tick_top()
     ax.set_ylabel(reflectivity.basis_type)
 
     ax.set_ylim((basis[0], basis[-1]))
     ax.invert_yaxis()
-
+    ax.set_xlim(_symmetric_limits(reflectivity.values))
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=3, symmetric=True, min_n_ticks=3))
+    formatter = ScalarFormatter(useMathText=True)
+    formatter.set_powerlimits((-2, 2))
+    ax.xaxis.set_major_formatter(formatter)
+    ax.tick_params(axis="x", labelsize=8)
     ax.yaxis.set_major_formatter(FormatStrFormatter("%0.3f"))
 
     if fig_axes is None:
@@ -190,7 +196,7 @@ def _plot_impedance_traces(
     ax.xaxis.set_major_locator(MaxNLocator(nbins=3))
     ax.tick_params(axis="x", labelsize=8)
     if len(traces) > 1:
-        ax.legend(loc="best", fontsize=7)
+        ax.legend(loc="lower left", fontsize=6.5, handlelength=2.2, framealpha=0.85)
     if synthetic_ai.is_twt:
         ax.yaxis.set_major_formatter(FormatStrFormatter("%0.3f"))
     return fig, ax
@@ -203,6 +209,40 @@ def _symmetric_limits(*values: np.ndarray) -> tuple[float, float]:
     limit = float(np.max(np.abs(finite))) if finite.size else 1.0
     limit = max(limit, 1e-12) * 1.08
     return -limit, limit
+
+
+def _draw_horizon_markers(
+    axes: Sequence[plt.Axes],
+    markers: Sequence[tuple[float, str]],
+) -> None:
+    finite_markers = [
+        (float(twt_s), str(label))
+        for twt_s, label in markers
+        if np.isfinite(float(twt_s))
+    ]
+    if not finite_markers:
+        return
+    colors = (
+        ["tab:green", "tab:blue"]
+        if len(finite_markers) == 2
+        else ["tab:green", "tab:orange", "tab:blue", "tab:purple"]
+    )
+    for marker_index, (twt_s, label) in enumerate(finite_markers):
+        color = colors[marker_index % len(colors)]
+        for ax in axes:
+            ax.axhline(twt_s, color=color, lw=0.9, alpha=0.75, linestyle="--")
+        first_ax = axes[0]
+        xmin, xmax = first_ax.get_xlim()
+        first_ax.text(
+            xmin + 0.03 * (xmax - xmin),
+            twt_s,
+            f" {label}",
+            va="center",
+            ha="left",
+            fontsize=8,
+            color=color,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 1.0},
+        )
 
 
 def _plot_dynamic_xcorr(
@@ -248,18 +288,25 @@ def plot_well_waveform_qc(
     dxcorr: grid.DynamicXCorr,
     figsize: Tuple[int, int] = (7, 4),
     synthetic_ai: grid.Log | None = None,
+    title: str | None = None,
+    horizon_markers: Sequence[tuple[float, str]] = (),
 ) -> tuple:
     """Draw the shared six-panel well waveform QC with true amplitude axes."""
-    fig = plt.figure(figsize=figsize)
-    gs = gridspec.GridSpec(1, 8)
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    gs = gridspec.GridSpec(
+        1,
+        6,
+        figure=fig,
+        width_ratios=[1.25, 1.4, 2.5, 2.5, 1.15, 1.0],
+    )
 
     axes = [
         fig.add_subplot(gs[0]),
         fig.add_subplot(gs[1]),
-        fig.add_subplot(gs[2:4]),
-        fig.add_subplot(gs[4:6]),
-        fig.add_subplot(gs[6:7]),
-        fig.add_subplot(gs[7:]),
+        fig.add_subplot(gs[2]),
+        fig.add_subplot(gs[3]),
+        fig.add_subplot(gs[4]),
+        fig.add_subplot(gs[5]),
     ]
 
     impedance_traces, selected_ai = _normalize_ai_traces(logset, synthetic_ai)
@@ -293,9 +340,12 @@ def plot_well_waveform_qc(
     for ax in axes:
         ax.locator_params(axis="y", nbins=28)
 
-    fig.suptitle("Max correlation of %.2f at a lag of %.3f s (Rc = %.2f)" % (xcorr.R, xcorr.lag, xcorr.Rc))
-
-    fig.tight_layout()
+    _draw_horizon_markers(axes, horizon_markers)
+    fig.suptitle(
+        title
+        if title is not None
+        else "Max correlation of %.2f at a lag of %.3f s (Rc = %.2f)" % (xcorr.R, xcorr.lag, xcorr.Rc)
+    )
     return fig, axes
 
 

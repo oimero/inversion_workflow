@@ -252,25 +252,6 @@ manual_shift:
 | `figures/<well>/*.png` | TDT 图、合成匹配图、子波图 |
 | `run_summary.json` | 输入路径、路由统计、失败统计、逐井补充信息 |
 
-### `trace_sample_plan_<well>.csv`
-
-斜井路径最重要的审计文件，每个 TWT 样点一行。`trace_sample_plan_<well>.csv` 记录 auto-tie 取轨迹地震道时使用的初始空间映射；`optimized_trace_sample_plan_<well>.csv` 在 auto-tie 完成后用细标定后的 `optimized_tdt_<well>.csv` 重新生成，作为后续 LFM 的空间事实。两者字段基本一致：
-
-| 字段 | 含义 |
-|------|------|
-| `twt_s` / `md_m` | 样点的 TWT 和对应的 MD |
-| `x_m` / `y_m` | 该 MD 在井轨迹上的 XY |
-| `inline_float` / `xline_float` | XY 投影到工区的浮点线号 |
-| `nearest_inline` / `nearest_xline` | 吸附到的最近道线号 |
-| `inline_index` / `xline_index` | 最近道的数组索引 |
-| `flat_idx` | 地震体内部 trace 编号 |
-| `survey_position` | `inside` 或 `outside` |
-| `used_for_tie` | 裁剪后是否实际进入标定 |
-
-`used_for_tie` 只用于初始 `trace_sample_plan_<well>.csv` 审计 auto-tie 裁剪窗口；optimized 版本已经是细标定后的下游空间映射，不再使用这个字段表达 tie 窗口裁剪。
-
-即使整井失败，这份文件通常也已经写出。对照它可以看出失败是轨迹出界、工区转换失败，还是最长 inside 窗口太短。
-
 ---
 
 ## 如何阅读结果

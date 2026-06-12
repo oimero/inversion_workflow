@@ -29,6 +29,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cup.time_config import TimeWorkflowConfig
 from cup.utils.config import deep_merge_dict
 from cup.utils.io import (
     latest_run,
@@ -78,11 +79,9 @@ from wtie.processing import grid
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "source_runs": {
-        "mode": "latest",
         "well_auto_tie_dir": None,
         "wavelet_generation_dir": None,
     },
-    "seismic": {"file": "raw/obn-clipped-240-912-872-1544.zgy", "type": "zgy"},
     "target_interval": {"horizons": ["interpre/H3-1", "interpre/H7-1"], "twt_unit": "auto"},
     "control_wells": {
         "min_batch_corr": 0.35,
@@ -99,7 +98,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "filter_order": 6,
         "buffer_seconds": None,
         "buffer_mode": "reflect",
-        "qc_enabled": True,
         "qc_envelope_window_samples": 31,
         "lfm": {
             "cutoff_mode": "wavelet_left_half_amplitude",
@@ -124,9 +122,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "manual_cutoff_hz": None,
         },
     },
-    "anchor": {"include_deviated": False, "min_points_per_trace": 2},
+    "anchor": {"include_deviated": False},
     "high_supervision": {"include_deviated": False},
-    "conflicts": {"strategy": "weighted_average"},
     "weights": {"mode": "corr", "corr_floor": 0.3, "corr_span": 0.4, "corr_min_weight": 0.6},
     "lfm_controls": {"min_control_samples_per_well": 16},
 }
@@ -141,9 +138,6 @@ def parse_args() -> argparse.Namespace:
 
 def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[str, Path]:
     source_cfg = dict(script_cfg.get("source_runs") or {})
-    mode = str(source_cfg.get("mode", "latest")).strip().lower()
-    if mode != "latest":
-        raise ValueError(f"well_constraints.source_runs.mode only supports 'latest', got {mode!r}.")
     auto_value = source_cfg.get("well_auto_tie_dir")
     wavelet_value = source_cfg.get("wavelet_generation_dir")
     auto_dir = (
@@ -226,21 +220,18 @@ def _metric_value(row: pd.Series | None, keys: tuple[str, ...]) -> float | None:
     return None
 
 
-def _resolve_segy_options(cfg: dict[str, Any]) -> dict[str, int] | None:
+def _resolve_segy_options(seismic_cfg: dict[str, Any]) -> dict[str, int] | None:
     from cup.seismic.survey import segy_options_from_config
 
-    if "segy" in cfg:
-        return segy_options_from_config(dict(cfg["segy"])) or None
-    return None
+    return segy_options_from_config(seismic_cfg) or None
 
 
-def _open_survey(script_cfg: dict[str, Any], cfg: dict[str, Any], data_root: Path) -> tuple[Any, Path, str]:
+def _open_survey(seismic_cfg: dict[str, Any], data_root: Path) -> tuple[Any, Path, str]:
     from cup.seismic.survey import open_survey
 
-    seismic_cfg = dict(script_cfg.get("seismic") or {})
     seismic_file = resolve_relative_path(seismic_cfg.get("file"), root=data_root)
     seismic_type = str(seismic_cfg.get("type", "segy"))
-    survey = open_survey(seismic_file, seismic_type=seismic_type, segy_options=_resolve_segy_options(cfg))
+    survey = open_survey(seismic_file, seismic_type=seismic_type, segy_options=_resolve_segy_options(seismic_cfg))
     return survey, seismic_file, seismic_type
 
 
@@ -1029,6 +1020,7 @@ def _make_lfm_control_table(point_df: pd.DataFrame) -> pd.DataFrame:
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
+    workflow = TimeWorkflowConfig.from_mapping(cfg)
     script_cfg = deep_merge_dict(DEFAULT_CONFIG, dict(cfg.get("well_constraints") or {}))
     if "frequency_split" in dict(cfg.get("well_constraints") or {}):
         raise ValueError(
@@ -1040,12 +1032,9 @@ def main() -> None:
             "well_constraints.lfm_controls.n_slices has moved to lfm_precomputed.modeling.n_slices; "
             "step 06 exports point-level LFM controls only."
         )
-    data_root = REPO_ROOT / str(cfg.get("data_root", "data"))
-    output_root = REPO_ROOT / str(cfg.get("output_root", "scripts/output"))
+    data_root = REPO_ROOT / workflow.data_root
+    output_root = REPO_ROOT / workflow.output_root
     source_dirs = _resolve_source_dirs(script_cfg, output_root)
-
-    if str(script_cfg.get("conflicts", {}).get("strategy", "weighted_average")) != "weighted_average":
-        raise ValueError("well_constraints.conflicts.strategy currently supports only 'weighted_average'.")
 
     if args.output_dir is None:
         output_dir = output_root / f"well_constraints_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -1054,7 +1043,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     target_qc_dir = output_dir / "target_layer_qc"
 
-    survey, seismic_file, seismic_type = _open_survey(script_cfg, cfg, data_root)
+    survey, seismic_file, seismic_type = _open_survey(workflow.seismic.as_dict(), data_root)
     geometry = survey.describe_geometry(domain="time")
     if str(geometry.get("sample_domain")).lower() != "time" or str(geometry.get("sample_unit")).lower() != "s":
         raise ValueError(f"Expected time-domain seismic geometry in seconds, got {geometry}")
@@ -1343,14 +1332,12 @@ def main() -> None:
     )
     high_points = high_points.loc[high_points["observed_well_sample"].astype(bool)].copy()
 
-    qc_split_rows: list[dict[str, Any]] = []
     freq_cfg = dict(script_cfg.get("frequency_bands") or {})
-    if bool(freq_cfg.get("qc_enabled", True)):
-        qc_split_rows = _save_frequency_band_qc(
-            bands_by_well,
-            output_dir / "frequency_band_qc",
-            envelope_window=int(freq_cfg.get("qc_envelope_window_samples", 31)),
-        )
+    qc_split_rows = _save_frequency_band_qc(
+        bands_by_well,
+        output_dir / "frequency_band_qc",
+        envelope_window=int(freq_cfg.get("qc_envelope_window_samples", 31)),
+    )
     qc_split_by_well = {row["well_name"]: row for row in qc_split_rows}
     qc_df = pd.DataFrame(qc_rows)
     point_counts = point_df.groupby("well_name").size().to_dict()

@@ -10,6 +10,7 @@
 python scripts/wavelet_generation.py
 python scripts/wavelet_generation.py --config experiments/common.yaml
 python scripts/wavelet_generation.py --well <well-name>
+python scripts/wavelet_generation.py --debug
 python scripts/wavelet_generation.py --output-dir scripts/output/wavelet_generation_test
 ```
 
@@ -32,18 +33,15 @@ python scripts/wavelet_generation.py --output-dir scripts/output/wavelet_generat
 | 第四步 | `time_depth/optimized_tdt_<well>.csv` | 优化后的时深表——第五步的固定评测基准 |
 | 第四步 | `seismic_trace/seismic_trace_<well>.csv` | 井旁或沿轨迹地震道——第五步不重新取道 |
 
-第五步只使用保存地震道、优化 TDT 和 filtered LAS 的共同连续标定窗。若该窗内仍存在 DT/RHO 长缺口，井评测直接失败，不允许通过普通插值跨越缺口。
-
 ---
 
 ## 配置参考
 
 ```yaml
-wavelet_generation:
-  source_runs:
-    mode: latest                  # 自动发现最新前置产物
-    well_auto_tie_dir: null
+spatial_debias:
+  cluster_radius_m: 600.0
 
+wavelet_generation:
   candidate_filter:
     min_source_tie_corr: 0.35     # 来源井 auto-tie 相关系数低于此值的子波不进入候选池
     max_source_tie_nmae: null     # 可选 NMAE 上限
@@ -51,7 +49,6 @@ wavelet_generation:
     include_source_wells: null    # 白名单模式
 
   evaluation_wells:
-    status: success               # 只评测第四步标定成功的井
     exclude_wells: []
     include_wells: null
 
@@ -62,13 +59,11 @@ wavelet_generation:
     allow_small_renormalization: true
 
   generation:
-    mode: optimize_consensus
     pca:
       n_components: 4
       coefficient_bounds: quantile
       coefficient_quantiles: [0.05, 0.95]
     optimizer:
-      strategy: random_then_powell
       random_trials: 512
       max_refine_iters: 120
       seed: 12345
@@ -83,21 +78,15 @@ wavelet_generation:
 
   spatial_debias:
     enabled: true
-    cluster_radius_m: 600.0
 
   scoring:
     min_eval_well_count: 3
     on_insufficient_eval_wells: select_best_source_tie
-
-  export:
-    selected_wavelet_name: selected_wavelet.csv
-    write_unified_synthetics: true
-    write_debug_artifacts: false
 ```
 
 ### `source_runs`
 
-默认接上最新一次井震标定结果。复现实验时，在 `well_auto_tie_dir` 填入某次第四步输出目录即可固定输入。`mode` 目前只支持 `latest`。
+默认自动接上最新一次井震标定结果。复现实验时可按需加入 `source_runs.well_auto_tie_dir` 固定输入。
 
 ### `candidate_filter`
 
@@ -115,13 +104,9 @@ wavelet_generation:
 - 如果中心不在 0 附近、采样间隔不一致、长度不统一、或能量异常，直接拒绝该候选。
 - 子波长度必须为奇数，确保中心样点明确落在零时刻。
 
-第五步不做相位校正和极性翻转——这些会改变第四步 auto-tie 的物理含义。
-
 ### `generation`
 
-#### `mode`
-
-`generation.mode: optimize_consensus` 表示默认不直接从候选子波里挑一条，而是在候选子波共同定义的形态范围内生成一条共识子波。可以把它理解成：先学习“这些候选子波通常怎么变化”，再在这个变化范围内找一条整体评分更好的子波。
+第五步固定执行共识优化：先学习候选子波的主要形态变化，再在该范围内寻找整体评分更好的子波。
 
 #### `pca`
 
@@ -139,7 +124,6 @@ wavelet_generation:
 
 | 参数 | 含义 |
 |------|------|
-| `strategy` | 当前主线为 `random_then_powell`：先随机撒点找高分区域，再局部细化。 |
 | `random_trials` | 随机尝试次数。次数越多越不容易漏掉好区域，但运行更慢。 |
 | `max_refine_iters` | 局部细化最多迭代次数。值越大越愿意在当前高分区域继续打磨，但提升通常会递减。 |
 | `seed` | 随机搜索种子。固定后，同一批输入会得到可复现的搜索过程。 |
@@ -163,7 +147,7 @@ wavelet_generation:
 
 ### `spatial_debias`
 
-密井网中，一个平台上十几口井如果各自算一票，会让该平台主导全局子波。空间去偏会先把近井归成空间簇，再按“簇”聚合评分，让一簇近井只贡献一票。
+密井网中，一个平台上十几口井如果各自算一票，会让该平台主导全局子波。空间去偏会先把近井归成空间簇，再按“簇”聚合评分，让一簇近井只贡献一票。半径来自顶层 `spatial_debias.cluster_radius_m`，与 dynamic gain 共用。
 
 如果不想用空间去偏，把 `enabled` 关掉即可——此时每口井等权投票。
 
@@ -171,12 +155,6 @@ wavelet_generation:
 
 - 如果评测井总数不足 `min_eval_well_count`，脚本不尝试共识优化，降级为选择第四步来源井指标最好的候选子波。
 - 共识优化产出的生成子波必须**严格优于**最佳候选子波的分数才会被选中；如果打平或更差，脚本选择最佳候选，并在 summary 中标记 `existing_candidate_wins`。
-
-### `export`
-
-`write_unified_synthetics` 控制是否写出每井合成记录 CSV。每井 QC 图默认仍会生成，方便直接看波形是否对齐。
-
-`write_debug_artifacts` 默认关闭。关闭时只写主线结果；打开后会额外写出候选子波清单、候选 QC、候选逐井评测、PCA 基底和共识搜索明细，用于复盘共识子波的搜索过程。
 
 ---
 
@@ -198,7 +176,7 @@ wavelet_generation:
 2. 用候选子波与反射系数卷积，生成合成记录。
 3. 与地震道比较，计算相关系数和 NMAE。
 
-默认输出 `wavelet_candidate_aggregate.csv`，用于比较候选子波的空间去偏综合指标。候选 × 井的逐项指标属于 debug 明细，只有打开 `export.write_debug_artifacts` 时才写出。
+默认输出 `wavelet_candidate_aggregate.csv`，用于比较候选子波的空间去偏综合指标。候选 × 井的逐项指标属于 debug 明细，只有使用 `--debug` 时才写出。
 
 ### 第三阶段：共识子波生成
 
@@ -209,7 +187,7 @@ wavelet_generation:
 3. **两阶段搜索。** 先用 `random_trials` 大量随机尝试，找到高分区域；再用 `max_refine_iters` 对高分结果做局部细化。`seed` 固定随机搜索的可复现性。
 4. **每次评测都做完整交叉评测。** 每条生成子波和候选子波一样，在所有评测井上做合成记录、算空间去偏聚合指标、加上正则化项得到最终分数。
 
-打开 `export.write_debug_artifacts` 后，整个过程的试验记录会写入 `consensus_search_trials.csv`，可以追溯每一步的系数、各项指标和分数。
+使用 `--debug` 后，整个过程的试验记录会写入 `consensus_search_trials.csv`，可以追溯每一步的系数、各项指标和分数。
 
 ### 第四阶段：选择
 
@@ -252,7 +230,7 @@ wavelet_generation:
 
 ### Debug 输出
 
-这些文件默认不写。需要追溯候选过滤、PCA 或共识搜索过程时，把 `export.write_debug_artifacts` 打开。
+这些文件默认不写。需要追溯候选过滤、PCA 或共识搜索过程时，使用 `--debug` 重跑。
 
 | 文件 | 内容 |
 |------|------|
@@ -338,7 +316,7 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 
 ### 第四步：必要时打开 debug 明细
 
-如果对共识子波为什么赢有疑问，打开 `export.write_debug_artifacts` 重跑，再看 `consensus_search_trials.csv`：
+如果对共识子波为什么赢有疑问，使用 `--debug` 重跑，再看 `consensus_search_trials.csv`：
 
 - 随机采样阶段分数最高的几个试验和细化后最终选中的试验之间的分数差——如果细化提升很小（< 0.01），说明随机采样已经找到了足够好的区域。
 - 最终选中试验的各项指标是否都在候选子波族的合理范围内（`deviation_from_mean`、`roughness`、`bandwidth_drift` 不应显著高于候选的典型值）。
@@ -359,7 +337,7 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
-| `No candidate wavelets passed QC` | 所有子波都没通过校验 | 打开 `export.write_debug_artifacts` 重跑，检查 `wavelet_qc.csv` 的具体失败原因：中心偏移、能量异常、长度不一致 |
+| `No candidate wavelets passed QC` | 所有子波都没通过校验 | 使用 `--debug` 重跑，检查 `wavelet_qc.csv` 的具体失败原因：中心偏移、能量异常、长度不一致 |
 | `No evaluation wells are available` | 第四步没有标定成功的井 | 检查第四步 `well_tie_metrics.csv` 的 `tie_status` |
 | `No finite candidate wavelet metrics were produced` | 所有候选在所有井上的评测都失败了 | 检查子波采样间隔是否与地震道一致 |
 | `wavelet dt does not match seismic trace dt` | 某条子波的采样间隔和地震道不一致 | 检查第四步子波是否是用正确的地震采样间隔导出的 |

@@ -12,7 +12,6 @@
 ------------
 1. merge_dict_defaults: 将默认值字典合并到配置 key 下（就地修改）。
 2. deep_merge_dict: 递归合并两个 dict，返回新的合并结果。
-3. require_latest_mode: 校验 ``source_runs.mode == "latest"``。
 """
 
 from __future__ import annotations
@@ -51,14 +50,3 @@ def deep_merge_dict(base: Mapping[str, Any], updates: Mapping[str, Any]) -> dict
         else:
             out[key] = value
     return out
-
-
-def require_latest_mode(source_cfg: Mapping[str, Any], *, section: str) -> None:
-    """Raise ``ValueError`` if ``source_runs.mode`` is not ``"latest"``.
-
-    *section* is used in the error message to identify which config block is
-    being checked (e.g. ``"well_constraints"``).
-    """
-    mode = str(source_cfg.get("mode", "latest")).strip().casefold()
-    if mode != "latest":
-        raise ValueError(f"{section}.source_runs.mode only supports 'latest' for now, got {mode!r}.")

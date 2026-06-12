@@ -43,26 +43,22 @@ python scripts/well_inventory.py --output-dir /tmp/inventory_test
 
 ## 配置参考
 
-脚本从共享配置的 `well_inventory` 段读取参数。所有路径均相对于 `data_root`（顶层配置，默认 `data`）。
+资产路径和地震体是整个工区的共享事实，放在顶层；第一步只保留自己的空间 QC 阈值。所有资产路径均相对于 `data_root`。
 
 ```yaml
+assets:
+  well_heads_file: raw/well_heads
+  las_dir: all_well_las
+  well_trace_dir: all_well_trace
+  well_tops_file: raw/well_tops
+  time_depth_dir: time_depth_table
+
+seismic:
+  file: <path-to-seismic>
+  type: zgy
+  zgy_inline_chunk_size: 16
+
 well_inventory:
-  source_data:
-    well_heads_file: raw/well_heads        # Petrel 井头导出文件
-    las_dir: all_well_las                  # LAS 文件目录
-    well_trace_dir: all_well_trace         # 井轨迹文件目录（只查存在，不解析）
-    well_tops_file: raw/well_tops          # Petrel 井分层导出文件
-    time_depth_dir: time_depth_table       # 时深表目录（只查存在，不解析列名）
-
-  seismic:
-    file: <path-to-seismic>                # SEG-Y 或 ZGY 文件
-    type: zgy                              # "segy" 或 "zgy"
-    # 以下仅 SEG-Y 需要
-    iline: <byte-location>
-    xline: <byte-location>
-    istep: <step>
-    xstep: <step>
-
   spatial_qc:
     near_survey_threshold_m: 500.0
     vertical_bottom_offset_threshold_m: 30.0

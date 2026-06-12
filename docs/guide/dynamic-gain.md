@@ -34,14 +34,10 @@ python scripts/dynamic_gain.py --output-dir scripts/output/dynamic_gain_test
 脚本配置放在 `dynamic_gain` 段下：
 
 ```yaml
-dynamic_gain:
-  source_runs:
-    mode: latest
-    well_auto_tie_dir: null
-    well_constraints_dir: null
-    lfm_precomputed_dir: null
-    wavelet_generation_dir: null
+spatial_debias:
+  cluster_radius_m: 600.0
 
+dynamic_gain:
   segments:
     min_segment_valid_samples: 8
     max_segment_count_per_trace: 20
@@ -50,7 +46,6 @@ dynamic_gain:
 
   spatial_debias:
     enabled: true
-    cluster_radius_m: 600.0
 
   attributes:
     candidate_attributes: [seismic_rms, seismic_abs_mean, seismic_abs_p90]
@@ -69,7 +64,7 @@ dynamic_gain:
 
 ### `source_runs`
 
-默认接上最新的第四步、第五步、第六步和第七步产物。第四步只在井上波形 QC 时使用（加载滤波 LAS 提供井上波阻抗曲线）；gain 估计逻辑不依赖第四步。复现实验时，可以填写某次对应步骤的输出目录固定输入来源。`mode` 目前只支持 `latest`。
+默认自动接上最新的第四步、第五步、第六步和第七步产物。第四步只在井上波形 QC 时使用；gain 估计逻辑不依赖第四步。复现实验时，可以按需加入 `source_runs` 并填写对应步骤目录。
 
 ### `segments`
 
@@ -77,7 +72,7 @@ dynamic_gain:
 
 ### `spatial_debias`
 
-密井平台上的十几口井如果各算一票，gain 推荐值会被这个平台主导。空间去偏先把井口 XY 近的井聚成空间簇，再按簇聚合——每个簇贡献一票，而不是每口井一票。`cluster_radius_m` 控制多大范围内的井算作同一个簇。`enabled: false` 时每口井各自为簇。
+密井平台上的十几口井如果各算一票，gain 推荐值会被这个平台主导。空间去偏先把井口 XY 近的井聚成空间簇，再按簇聚合。半径来自顶层 `spatial_debias.cluster_radius_m`；`enabled: false` 时每口井各自为簇。
 
 ### `attributes`
 

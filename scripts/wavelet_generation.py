@@ -34,6 +34,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.config import merge_dict_defaults
+from cup.time_config import TimeWorkflowConfig
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.statistics import aggregate_cluster_then_global
 from cup.seismic.viz import plot_well_waveform_qc
@@ -66,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path("experiments/common.yaml"))
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--well", type=str, default=None, help="Optional single evaluation well filter.")
+    parser.add_argument("--debug", action="store_true", help="Write candidate, PCA, and optimizer debug artifacts.")
     return parser.parse_args()
 
 
@@ -74,7 +76,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     merge_dict_defaults(
         script_cfg,
         "source_runs",
-        {"mode": "latest", "well_auto_tie_dir": None},
+        {"well_auto_tie_dir": None},
     )
     merge_dict_defaults(
         script_cfg,
@@ -89,7 +91,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     merge_dict_defaults(
         script_cfg,
         "evaluation_wells",
-        {"status": "success", "exclude_wells": [], "include_wells": None},
+        {"exclude_wells": [], "include_wells": None},
     )
     merge_dict_defaults(
         script_cfg,
@@ -105,21 +107,17 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
         script_cfg,
         "generation",
         {
-            "mode": "optimize_consensus",
             "pca": {
                 "n_components": 4,
                 "coefficient_bounds": "quantile",
                 "coefficient_quantiles": [0.05, 0.95],
-                "include_mean_wavelet": True,
             },
             "optimizer": {
-                "strategy": "random_then_powell",
                 "random_trials": 512,
                 "max_refine_iters": 120,
                 "seed": 20260529,
             },
             "objective": {
-                "name": "spatial_debiased_score",
                 "corr_weight": 1.0,
                 "p10_corr_weight": 0.5,
                 "nmae_weight": 0.5,
@@ -133,21 +131,12 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     merge_dict_defaults(
         script_cfg,
         "spatial_debias",
-        {"enabled": True, "cluster_radius_m": 600.0},
+        {"enabled": True},
     )
     merge_dict_defaults(
         script_cfg,
         "scoring",
         {"min_eval_well_count": 3, "on_insufficient_eval_wells": "select_best_source_tie"},
-    )
-    merge_dict_defaults(
-        script_cfg,
-        "export",
-        {
-            "selected_wavelet_name": "selected_wavelet.csv",
-            "write_unified_synthetics": True,
-            "write_debug_artifacts": False,
-        },
     )
     return script_cfg
 
@@ -180,9 +169,6 @@ def _discover_latest_dir(cfg: dict[str, Any], prefix: str, required_files: Seque
 
 def _resolve_source_dirs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str, Path]:
     source_runs = dict(script_cfg.get("source_runs") or {})
-    mode = str(source_runs.get("mode", "latest")).strip().casefold()
-    if mode != "latest":
-        raise ValueError(f"wavelet_generation.source_runs.mode only supports 'latest' for now, got {mode!r}.")
     auto_tie_dir = (
         _resolve_repo_path(source_runs["well_auto_tie_dir"])
         if source_runs.get("well_auto_tie_dir") is not None
@@ -560,6 +546,7 @@ def _write_batch_synthetic_qc_figures(
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
+    workflow = TimeWorkflowConfig.from_mapping(cfg)
     script_cfg = _script_config(cfg)
     if args.well is not None:
         script_cfg["evaluation_wells"]["include_wells"] = [args.well]
@@ -567,7 +554,7 @@ def main() -> None:
     source_dirs = _resolve_source_dirs(cfg, script_cfg)
     output_dir = _resolve_output_dir(args, cfg)
     output_dirs = _ensure_output_dirs(output_dir)
-    write_debug_artifacts = bool(script_cfg["export"].get("write_debug_artifacts", False))
+    write_debug_artifacts = bool(args.debug)
 
     index = load_tie_artifacts(source_dirs["auto_tie_dir"], repo_root=REPO_ROOT)
     candidate_filter = dict(script_cfg["candidate_filter"])
@@ -579,7 +566,7 @@ def main() -> None:
     )
     pool, qc_rows, wavelet_time_s, wavelet_matrix = _load_candidate_wavelet_pool(candidates, script_cfg)
 
-    wells = index.evaluation_wells(status=str(script_cfg["evaluation_wells"]["status"]))
+    wells = index.evaluation_wells(status="success")
     wells = _filter_by_well_names(wells, dict(script_cfg["evaluation_wells"]))
     min_eval_well_count = int(script_cfg["scoring"]["min_eval_well_count"])
     insufficient_eval_wells = len(wells) < min_eval_well_count
@@ -589,7 +576,7 @@ def main() -> None:
     if insufficient_eval_wells and insufficient_policy != "select_best_source_tie":
         raise ValueError(f"Too few evaluation wells: {len(wells)} < {min_eval_well_count}")
 
-    clusters_df = build_well_spatial_clusters(wells, radius_m=float(script_cfg["spatial_debias"]["cluster_radius_m"]))
+    clusters_df = build_well_spatial_clusters(wells, radius_m=workflow.spatial_debias.cluster_radius_m)
     if not bool(script_cfg["spatial_debias"].get("enabled", True)):
         clusters_df["spatial_cluster_id"] = np.arange(len(clusters_df), dtype=np.int64)
         clusters_df["spatial_cluster_size"] = 1
@@ -756,7 +743,7 @@ def main() -> None:
             selected_score = best_candidate_score
             selection_mode = "existing_candidate_wins"
 
-    selected_wavelet_path = output_dir / str(script_cfg["export"]["selected_wavelet_name"])
+    selected_wavelet_path = output_dir / "selected_wavelet.csv"
     pd.DataFrame({"time_s": wavelet_time_s, "amplitude": selected_wavelet}).to_csv(selected_wavelet_path, index=False)
     batch_metrics_df, batch_qcs = _evaluate_wavelet_on_all_wells(
         wavelet_name=selected_name,
@@ -766,7 +753,7 @@ def main() -> None:
         wells=wells,
         clusters_df=clusters_df,
         modeler=modeler,
-        output_qc_dir=output_dirs["synthetic_qc"] if bool(script_cfg["export"]["write_unified_synthetics"]) else None,
+        output_qc_dir=output_dirs["synthetic_qc"],
         well_cache=well_cache,
     )
     batch_metrics_df.to_csv(output_dir / "batch_synthetic_metrics.csv", index=False)
@@ -788,6 +775,8 @@ def main() -> None:
         "consensus_score": consensus_score,
         "candidate_count": len(pool),
         "evaluation_well_count": len(wells),
+        "spatial_cluster_radius_m": workflow.spatial_debias.cluster_radius_m,
+        "debug_artifacts": write_debug_artifacts,
         "selected_wavelet_file": repo_relative_path(selected_wavelet_path, root=REPO_ROOT),
         "source_auto_tie_dir": repo_relative_path(source_dirs["auto_tie_dir"], root=REPO_ROOT),
         "batch_synthetic_qc_figure_count": len(batch_qc_figure_paths),

@@ -26,6 +26,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cup.time_config import TimeWorkflowConfig
 from cup.utils.config import deep_merge_dict
 from cup.utils.io import (
     build_segy_textual_header,
@@ -58,10 +59,8 @@ plt.rcParams["figure.dpi"] = 120
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "source_runs": {
-        "mode": "latest",
         "well_constraints_dir": None,
     },
-    "seismic": {"file": "raw/obn-clipped-240-912-872-1544.zgy", "type": "zgy"},
     "target_interval": {
         "horizons": ["interpre/H3-1", "interpre/H7-1"],
         "twt_unit": "auto",
@@ -74,7 +73,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "nugget": 0.0,
         "post_slice_smoothing": False,
     },
-    "export": {"export_volume": True, "zgy_inline_chunk_size": 16},
+    "export": {"export_volume": True},
 }
 
 
@@ -98,10 +97,7 @@ def _save_fig(path: Path) -> None:
 
 def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[str, Path]:
     source_cfg = dict(script_cfg.get("source_runs") or {})
-    mode = str(source_cfg.get("mode", "latest")).strip().lower()
     constraints_dir_value = source_cfg.get("well_constraints_dir")
-    if mode != "latest":
-        raise ValueError(f"lfm_precomputed.source_runs.mode only supports 'latest' for now, got {mode!r}.")
     constraints_dir = (
         latest_run(output_root, "well_constraints", "lfm_control_points.csv")
         if constraints_dir_value in {None, ""}
@@ -110,22 +106,18 @@ def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[
     return {"well_constraints_dir": constraints_dir}
 
 
-def _resolve_segy_options(cfg: dict[str, Any]) -> dict[str, int] | None:
+def _resolve_segy_options(seismic_cfg: dict[str, Any]) -> dict[str, int] | None:
     from cup.seismic.survey import segy_options_from_config
 
-    if "segy" in cfg:
-        options = segy_options_from_config(dict(cfg["segy"]))
-        return options or None
-    return None
+    return segy_options_from_config(seismic_cfg) or None
 
 
-def _open_survey(script_cfg: dict[str, Any], cfg: dict[str, Any], data_root: Path) -> tuple[Any, Path, str]:
+def _open_survey(seismic_cfg: dict[str, Any], data_root: Path) -> tuple[Any, Path, str]:
     from cup.seismic.survey import open_survey
 
-    seismic_cfg = dict(script_cfg.get("seismic") or {})
     seismic_file = resolve_relative_path(seismic_cfg.get("file"), root=data_root)
     seismic_type = str(seismic_cfg.get("type", "segy"))
-    survey = open_survey(seismic_file, seismic_type=seismic_type, segy_options=_resolve_segy_options(cfg))
+    survey = open_survey(seismic_file, seismic_type=seismic_type, segy_options=_resolve_segy_options(seismic_cfg))
     return survey, seismic_file, seismic_type
 
 
@@ -648,18 +640,23 @@ def _save_npz(result: Any, npz_file: Path, *, metadata_extra: dict[str, Any]) ->
     )
 
 
-def _try_write_segy(result: Any, segy_file: Path, seismic_file: Path, seismic_type: str, cfg: dict[str, Any]) -> str | None:
+def _try_write_segy(
+    result: Any,
+    segy_file: Path,
+    seismic_file: Path,
+    seismic_type: str,
+    seismic_cfg: dict[str, Any],
+) -> str | None:
     if seismic_type.lower() != "segy":
         return "skipped_non_segy_source"
     try:
         import cigsegy
 
-        segy_cfg = dict(cfg.get("segy") or {})
         keylocs = [
-            int(segy_cfg["iline_byte"]),
-            int(segy_cfg["xline_byte"]),
-            int(segy_cfg["istep"]),
-            int(segy_cfg["xstep"]),
+            int(seismic_cfg["iline_byte"]),
+            int(seismic_cfg["xline_byte"]),
+            int(seismic_cfg["istep"]),
+            int(seismic_cfg["xstep"]),
         ]
         textual = build_segy_textual_header(
             "Time-domain AI low-frequency model",
@@ -743,17 +740,6 @@ def _try_write_zgy(
         return str(exc)
 
 
-def _should_export_volume(export_cfg: dict[str, Any], seismic_type: str) -> bool:
-    legacy_enabled = export_cfg.get("export_volume")
-    default_enabled = True if legacy_enabled is None else bool(legacy_enabled)
-    kind = str(seismic_type).strip().lower()
-    if kind == "segy":
-        return bool(export_cfg.get("write_segy", default_enabled))
-    if kind == "zgy":
-        return bool(export_cfg.get("write_zgy", default_enabled))
-    return default_enabled
-
-
 def _load_constraints_control_points(
     constraints_dir: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
@@ -804,9 +790,10 @@ def _load_constraints_control_points(
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
+    workflow = TimeWorkflowConfig.from_mapping(cfg)
     script_cfg = deep_merge_dict(DEFAULT_CONFIG, dict(cfg.get("lfm_precomputed") or {}))
-    data_root = REPO_ROOT / str(cfg.get("data_root", "data"))
-    output_root = REPO_ROOT / str(cfg.get("output_root", "scripts/output"))
+    data_root = REPO_ROOT / workflow.data_root
+    output_root = REPO_ROOT / workflow.output_root
     source_dirs = _resolve_source_dirs(script_cfg, output_root)
 
     if args.output_dir is None:
@@ -820,7 +807,8 @@ def main() -> None:
     for directory in [output_dir, qc_dir, figures_dir, well_qc_dir]:
         directory.mkdir(parents=True, exist_ok=True)
 
-    survey, seismic_file, seismic_type = _open_survey(script_cfg, cfg, data_root)
+    seismic_cfg = workflow.seismic.as_dict()
+    survey, seismic_file, seismic_type = _open_survey(seismic_cfg, data_root)
     geometry = survey.describe_geometry(domain="time")
     if str(geometry.get("sample_domain")).lower() != "time" or str(geometry.get("sample_unit")).lower() != "s":
         raise ValueError(f"Expected time-domain seismic geometry in seconds, got {geometry}")
@@ -867,9 +855,15 @@ def main() -> None:
     _save_npz(result, npz_file, metadata_extra=metadata_extra)
 
     export_status = "disabled"
-    if _should_export_volume(script_cfg["export"], seismic_type):
+    if bool(script_cfg["export"].get("export_volume", True)):
         if seismic_type.lower() == "segy":
-            export_status = _try_write_segy(result, output_dir / "ai_lfm_time.segy", seismic_file, seismic_type, cfg)
+            export_status = _try_write_segy(
+                result,
+                output_dir / "ai_lfm_time.segy",
+                seismic_file,
+                seismic_type,
+                seismic_cfg,
+            )
             export_status = "written" if export_status is None else export_status
         elif seismic_type.lower() == "zgy":
             export_status = _try_write_zgy(
@@ -877,7 +871,7 @@ def main() -> None:
                 output_dir / "ai_lfm_time.zgy",
                 survey,
                 seismic_type,
-                inline_chunk_size=int(script_cfg["export"].get("zgy_inline_chunk_size", 16)),
+                inline_chunk_size=workflow.seismic.zgy_inline_chunk_size,
             )
             export_status = "written" if export_status is None else export_status
         else:

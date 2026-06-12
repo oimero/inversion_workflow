@@ -44,6 +44,7 @@ from cup.seismic.horizon import HorizonSurface
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.trace_sampling import assemble_nearest_trace_from_plan, build_nearest_trace_sample_plan
 from cup.seismic.viz import plot_well_waveform_qc
+from cup.time_config import TimeWorkflowConfig
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.coerce import as_bool
 from cup.utils.config import merge_dict_defaults
@@ -91,16 +92,12 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
         script_cfg,
         "source_runs",
         {
-            "mode": "latest",
             "well_inventory_dir": None,
             "well_screen_dir": None,
             "well_preprocess_dir": None,
             "well_trajectory_dir": None,
         },
     )
-    script_cfg.setdefault("time_depth_dir", "time_depth_table")
-    script_cfg.setdefault("well_trace_dir", "all_well_trace")
-    script_cfg.setdefault("well_tops_file", "raw/well_tops")
     merge_dict_defaults(
         script_cfg,
         "target_interval",
@@ -111,11 +108,6 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "margin_bottom_ms": 100.0,
             "twt_unit": "auto",
         },
-    )
-    merge_dict_defaults(
-        script_cfg,
-        "seismic",
-        {"file": "raw/obn-clipped-240-912-872-1544.zgy", "type": "zgy"},
     )
     script_cfg.setdefault("enabled_routes", ["vertical_with_tdt", "vertical_anchor_from_tops"])
     script_cfg.setdefault("tutorial_model", "tutorial/trained_net_state_dict.pt")
@@ -194,9 +186,6 @@ def _discover_latest_dir(cfg: dict[str, Any], prefix: str) -> Path:
 
 def _resolve_inputs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str, Path | None]:
     source_runs = dict(script_cfg.get("source_runs") or {})
-    mode = str(source_runs.get("mode", "latest")).strip().casefold()
-    if mode != "latest":
-        raise ValueError(f"well_auto_tie.source_runs.mode only supports 'latest' for now, got {mode!r}.")
 
     inventory_dir = (
         _resolve_repo_path(source_runs["well_inventory_dir"])
@@ -1596,8 +1585,9 @@ def _write_wavelet_inventory(results: Sequence[WellTieResult], output_dir: Path)
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
+    workflow = TimeWorkflowConfig.from_mapping(cfg)
     script_cfg = _script_config(cfg)
-    data_root = _resolve_repo_path(str(cfg.get("data_root", "data")))
+    data_root = _resolve_repo_path(workflow.data_root)
     output_dir = _resolve_output_dir(args, cfg)
     output_dir.mkdir(parents=True, exist_ok=True)
     _ensure_output_dirs(output_dir)
@@ -1608,9 +1598,9 @@ def main() -> None:
     preprocess_df = pd.read_csv(paths["preprocess_status_file"])
     trajectory_df = pd.read_csv(paths["well_trajectory_file"]) if paths["well_trajectory_file"] is not None else None
 
-    time_depth_dir = _resolve_data_path(script_cfg["time_depth_dir"], data_root=data_root)
-    well_trace_dir = _resolve_data_path(script_cfg["well_trace_dir"], data_root=data_root)
-    well_tops_file = _resolve_data_path(script_cfg["well_tops_file"], data_root=data_root)
+    time_depth_dir = _resolve_data_path(workflow.assets.time_depth_dir, data_root=data_root)
+    well_trace_dir = _resolve_data_path(workflow.assets.well_trace_dir, data_root=data_root)
+    well_tops_file = _resolve_data_path(workflow.assets.well_tops_file, data_root=data_root)
     time_depth_lookup = build_file_lookup(time_depth_dir.iterdir() if time_depth_dir.exists() else [], asset_label=str(time_depth_dir))
     trace_lookup = build_file_lookup(well_trace_dir.iterdir() if well_trace_dir.exists() else [], asset_label=str(well_trace_dir))
 
@@ -1633,11 +1623,11 @@ def main() -> None:
     plan_path = output_dir / "well_tie_plan.csv"
     plan_df.to_csv(plan_path, index=False)
 
-    seismic_cfg = dict(script_cfg["seismic"])
-    seismic_file = _resolve_data_path(seismic_cfg["file"], data_root=data_root)
+    seismic_cfg = workflow.seismic.as_dict()
+    seismic_file = _resolve_data_path(workflow.seismic.file, data_root=data_root)
     survey = open_survey(
         seismic_file,
-        seismic_type=str(seismic_cfg.get("type", "segy")),
+        seismic_type=workflow.seismic.type,
         segy_options=segy_options_from_config(seismic_cfg) or None,
     )
 

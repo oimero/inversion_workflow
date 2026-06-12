@@ -38,6 +38,7 @@ if str(SRC_DIR) not in sys.path:
 from cup.petrel.load import import_interpretation_petrel, import_seismic
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.viz import plot_well_waveform_qc
+from cup.time_config import TimeWorkflowConfig
 from cup.utils.config import deep_merge_dict
 from cup.utils.io import (
     latest_run,
@@ -86,7 +87,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "source_runs": {
-        "mode": "latest",
         "well_constraints_dir": None,
         "lfm_precomputed_dir": None,
         "wavelet_generation_dir": None,
@@ -99,7 +99,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "spatial_debias": {
         "enabled": True,
-        "cluster_radius_m": 600.0,
     },
     "attributes": {
         "candidate_attributes": list(CANDIDATE_ATTRIBUTES),
@@ -165,9 +164,6 @@ def _json_scalar_to_dict(value: np.ndarray) -> dict[str, Any]:
 
 def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[str, Path | None]:
     source_cfg = dict(script_cfg.get("source_runs") or {})
-    mode = str(source_cfg.get("mode", "latest")).strip().lower()
-    if mode != "latest":
-        raise ValueError(f"dynamic_gain.source_runs.mode only supports 'latest', got {mode!r}.")
 
     dirs: dict[str, Path | None] = {}
     for key in ("well_auto_tie_dir", "well_constraints_dir", "lfm_precomputed_dir", "wavelet_generation_dir"):
@@ -361,8 +357,10 @@ def _compute_train_mask_rms(seismic: np.ndarray, train_mask: np.ndarray, train_i
 
 def load_context(args: argparse.Namespace) -> DynamicGainContext:
     common_cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
+    workflow = TimeWorkflowConfig.from_mapping(common_cfg)
     script_cfg = deep_merge_dict(DEFAULT_CONFIG, dict(common_cfg.get("dynamic_gain") or {}))
-    output_root = REPO_ROOT / str(common_cfg.get("output_root", "scripts/output"))
+    script_cfg["spatial_debias"]["cluster_radius_m"] = workflow.spatial_debias.cluster_radius_m
+    output_root = REPO_ROOT / workflow.output_root
     source_dirs = _resolve_source_dirs(script_cfg, output_root)
 
     cfg = GINNConfig.from_yaml(args.train_config, base_dir=REPO_ROOT)

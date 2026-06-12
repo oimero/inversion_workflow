@@ -34,6 +34,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.seismic.survey import open_survey, segy_options_from_config
+from cup.time_config import TimeWorkflowConfig
 from cup.utils.coerce import as_bool, optional_float
 from cup.utils.config import merge_dict_defaults
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
@@ -65,16 +66,7 @@ def parse_args() -> argparse.Namespace:
 
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_trajectory") or {})
-    merge_dict_defaults(script_cfg, "source_runs", {"mode": "latest", "well_inventory_dir": None})
-    script_cfg.setdefault("well_trace_dir", "all_well_trace")
-    merge_dict_defaults(
-        script_cfg,
-        "seismic",
-        {
-            "file": "raw/obn-clipped-240-912-872-1544.zgy",
-            "type": "zgy",
-        },
-    )
+    merge_dict_defaults(script_cfg, "source_runs", {"well_inventory_dir": None})
     merge_dict_defaults(
         script_cfg,
         "classification",
@@ -86,8 +78,8 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "z_tvd_tolerance_m": 0.1,
         },
     )
-    merge_dict_defaults(script_cfg, "survey_qc", {"enabled": True, "allow_partial_outside": True})
-    merge_dict_defaults(script_cfg, "output", {"write_trajectory_points": True, "sampled_trajectory_dir": "trajectory_points"})
+    merge_dict_defaults(script_cfg, "survey_qc", {"allow_partial_outside": True})
+    merge_dict_defaults(script_cfg, "output", {"write_trajectory_points": True})
     return script_cfg
 
 
@@ -109,9 +101,6 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
 
 def _discover_latest_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
     source_runs = dict(script_cfg.get("source_runs") or {})
-    mode = str(source_runs.get("mode", "latest")).strip().casefold()
-    if mode != "latest":
-        raise ValueError(f"well_trajectory.source_runs.mode only supports 'latest' for now, got {mode!r}.")
     inventory_dir = source_runs.get("well_inventory_dir")
     if inventory_dir is not None:
         return _resolve_repo_path(inventory_dir) / "well_inventory.csv"
@@ -434,7 +423,7 @@ def run_trajectory(
     survey_cfg = dict(config.get("survey_qc") or {})
     output_cfg = dict(config.get("output") or {})
     write_points = as_bool(output_cfg.get("write_trajectory_points", True))
-    point_dir = output_dir / str(output_cfg.get("sampled_trajectory_dir", "trajectory_points"))
+    point_dir = output_dir / "trajectory_points"
     if write_points:
         point_dir.mkdir(parents=True, exist_ok=True)
 
@@ -518,8 +507,9 @@ def run_trajectory(
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
+    workflow = TimeWorkflowConfig.from_mapping(cfg)
     script_cfg = _script_config(cfg)
-    data_root = _resolve_repo_path(str(cfg.get("data_root", "data")))
+    data_root = _resolve_repo_path(workflow.data_root)
     output_dir = _resolve_output_dir(args, cfg)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -530,22 +520,18 @@ def main() -> None:
     if "well_name" not in inventory_df.columns:
         raise ValueError(f"Inventory file is missing required column 'well_name': {inventory_file}")
 
-    well_trace_dir = _resolve_data_path(script_cfg["well_trace_dir"], data_root=data_root)
+    well_trace_dir = _resolve_data_path(workflow.assets.well_trace_dir, data_root=data_root)
     trace_lookup = build_file_lookup(well_trace_dir.iterdir() if well_trace_dir.exists() else [], asset_label=str(well_trace_dir))
 
     survey_cfg = dict(script_cfg.get("survey_qc") or {})
-    survey = None
-    geometry = None
-    seismic_file = None
-    seismic_cfg = dict(script_cfg.get("seismic") or {})
-    if as_bool(survey_cfg.get("enabled", True)):
-        seismic_file = _resolve_data_path(seismic_cfg["file"], data_root=data_root)
-        survey = open_survey(
-            seismic_file,
-            seismic_type=str(seismic_cfg.get("type", "segy")),
-            segy_options=segy_options_from_config(seismic_cfg) or None,
-        )
-        geometry = survey.describe_geometry(domain="time")
+    seismic_cfg = workflow.seismic.as_dict()
+    seismic_file = _resolve_data_path(workflow.seismic.file, data_root=data_root)
+    survey = open_survey(
+        seismic_file,
+        seismic_type=workflow.seismic.type,
+        segy_options=segy_options_from_config(seismic_cfg) or None,
+    )
+    geometry = survey.describe_geometry(domain="time")
 
     main_df, failed_df, summary = run_trajectory(
         inventory_df=inventory_df,
@@ -571,8 +557,8 @@ def main() -> None:
             "data_root": repo_relative_path(data_root, root=REPO_ROOT),
             "inventory_file": repo_relative_path(inventory_file, root=REPO_ROOT),
             "well_trace_dir": repo_relative_path(well_trace_dir, root=REPO_ROOT),
-            "seismic_file": repo_relative_path(seismic_file, root=REPO_ROOT) if seismic_file is not None else None,
-            "seismic_type": seismic_cfg.get("type"),
+            "seismic_file": repo_relative_path(seismic_file, root=REPO_ROOT),
+            "seismic_type": workflow.seismic.type,
         },
         "thresholds": dict(script_cfg["classification"]),
         "survey_qc": survey_cfg,

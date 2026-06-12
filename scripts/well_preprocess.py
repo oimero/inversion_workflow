@@ -35,6 +35,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cup.time_config import TimeWorkflowConfig
 from cup.utils.coerce import optional_float as _optional_float
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.well.assets import normalize_well_name
@@ -43,10 +44,8 @@ from cup.well.las import _header_value, export_logset_to_las
 from cup.well.preprocess import (
     DEFAULT_MISSING_SENTINELS,
     CurveThreshold,
-    UnitStandardization,
     WellCurveSet,
     compute_global_quantile_thresholds,
-    finite_stats,
     is_curve_usable,
     remove_outliers,
     replace_constant_runs,
@@ -84,28 +83,8 @@ def parse_args() -> argparse.Namespace:
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_preprocess") or {})
     source_runs = dict(script_cfg.get("source_runs") or {})
-    source_runs.setdefault("mode", "latest")
     source_runs.setdefault("well_screen_dir", None)
     script_cfg["source_runs"] = source_runs
-    script_cfg.setdefault("output_las_dir", "preprocessed_las")
-    script_cfg.setdefault("required_categories", ["p_sonic", "density"])
-    script_cfg.setdefault(
-        "selected_categories",
-        [
-            "caliper",
-            "gamma_ray",
-            "s_sonic",
-            "p_sonic",
-            "density",
-            "resistivity",
-            "spontaneous_potential",
-            "porosity",
-            "permeability",
-            "water_saturation",
-        ],
-    )
-    script_cfg.setdefault("mnemonic_standardization", {"enabled": True})
-    script_cfg.setdefault("unit_standardization", {"enabled": True, "unit_mismatch_qc": True})
     script_cfg.setdefault(
         "constant_runs",
         {
@@ -122,7 +101,6 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
                 "permeability": 16,
                 "water_saturation": 16,
             },
-            "replacement": None,
             "exclude_categories": ["caliper"],
         },
     )
@@ -130,10 +108,8 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "outliers",
         {
             "enabled": True,
-            "strategy": "global_quantile_with_override",
             "lower_quantile": 0.01,
             "upper_quantile": 0.99,
-            "replacement": None,
             "range_override_file": "experiments/well_preprocess_ranges.yaml",
             "min_samples_for_auto_threshold": 1000,
         },
@@ -142,22 +118,8 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "usable_thresholds",
         {"min_valid_samples": 100, "min_valid_fraction_of_initial": 0.70},
     )
-    script_cfg.setdefault("export", {"null_value": -999.25, "write_fmt": "%.6f"})
     script_cfg.setdefault("missing_sentinel_values", list(DEFAULT_MISSING_SENTINELS))
     return script_cfg
-
-
-def _validate_standardization_contract(config: Mapping[str, Any]) -> None:
-    if not _section_enabled(config, "mnemonic_standardization", default=True):
-        raise ValueError(
-            "well_preprocess.mnemonic_standardization.enabled must be true: "
-            "successful LAS files must use DT_USM/RHO_GCC/AI."
-        )
-    if not _section_enabled(config, "unit_standardization", default=True):
-        raise ValueError(
-            "well_preprocess.unit_standardization.enabled must be true: "
-            "successful LAS files must use us/m, g/cm3, and m/s*g/cm3."
-        )
 
 
 def _resolve_repo_path(value: str | Path) -> Path:
@@ -172,15 +134,8 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     return output_root / f"well_preprocess_{timestamp}"
 
 
-def _validate_latest_mode(source_runs: dict[str, Any], *, section: str) -> None:
-    mode = str(source_runs.get("mode", "latest")).strip().casefold()
-    if mode != "latest":
-        raise ValueError(f"{section}.source_runs.mode only supports 'latest' for now, got {mode!r}.")
-
-
 def _discover_latest_screen_dir(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
     source_runs = dict(script_cfg.get("source_runs") or {})
-    _validate_latest_mode(source_runs, section="well_preprocess")
     if source_runs.get("well_screen_dir") is not None:
         return _resolve_repo_path(source_runs["well_screen_dir"])
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
@@ -359,31 +314,6 @@ def _min_run_length(category: str, constant_cfg: Mapping[str, Any]) -> int:
     return int(constant_cfg.get("min_run_length", 8))
 
 
-def _section_enabled(config: Mapping[str, Any], key: str, *, default: bool = True) -> bool:
-    value = config.get(key, {})
-    if isinstance(value, Mapping):
-        return bool(value.get("enabled", default))
-    return default
-
-
-def _disabled_unit_standardization(values: np.ndarray, original_unit: str) -> UnitStandardization:
-    stats = finite_stats(values)
-    return UnitStandardization(
-        values=np.asarray(values, dtype=float).copy(),
-        original_unit=original_unit,
-        standard_unit=original_unit,
-        conversion_action="disabled",
-        input_valid_count=int(stats["valid_count"]),
-        output_valid_count=int(stats["valid_count"]),
-        input_median=stats["median"],
-        output_median=stats["median"],
-        input_p01=stats["p01"],
-        input_p99=stats["p99"],
-        output_p01=stats["p01"],
-        output_p99=stats["p99"],
-    )
-
-
 def _prepare_candidate(
     raw: RawCurve,
     *,
@@ -393,18 +323,10 @@ def _prepare_candidate(
     unit_qc_rows: list[dict[str, Any]],
     skipped_curve_rows: list[dict[str, Any]],
 ) -> CandidateCurve:
-    standard = (
-        standard_mnemonic_for_category(raw.category)
-        if _section_enabled(script_cfg, "mnemonic_standardization", default=True)
-        else raw.original_mnemonic
-    )
+    standard = standard_mnemonic_for_category(raw.category)
     sentinels = [float(item) for item in script_cfg.get("missing_sentinel_values", DEFAULT_MISSING_SENTINELS)]
     missing_clean = values_to_nan(raw.values, null_value=raw.las_null_value, sentinels=sentinels)
-    unit_result = (
-        standardize_curve_unit(missing_clean, category=raw.category, unit=raw.original_unit)
-        if _section_enabled(script_cfg, "unit_standardization", default=True)
-        else _disabled_unit_standardization(missing_clean, raw.original_unit)
-    )
+    unit_result = standardize_curve_unit(missing_clean, category=raw.category, unit=raw.original_unit)
     unit_row = {
         "well_name": raw.well_name,
         "category": raw.category,
@@ -517,13 +439,12 @@ def run_preprocess(
     config: dict[str, Any],
     range_overrides: Mapping[str, Any],
 ) -> dict[str, Any]:
-    _validate_standardization_contract(config)
     screen_df = pd.read_csv(screen_file)
     curve_inventory_df = pd.read_csv(curve_inventory_file)
     required_categories = [str(item) for item in config["required_categories"]]
     selected_categories = [str(item) for item in config["selected_categories"]]
 
-    output_las_dir = output_dir / str(config.get("output_las_dir", "preprocessed_las"))
+    output_las_dir = output_dir / "preprocessed_las"
     output_las_dir.mkdir(parents=True, exist_ok=True)
 
     constant_run_rows: list[dict[str, Any]] = []
@@ -712,8 +633,6 @@ def run_preprocess(
                     curve_set,
                     output_las,
                     curve_names=curve_set.curve_names,
-                    null_value=float(config.get("export", {}).get("null_value", -999.25)),
-                    write_fmt=str(config.get("export", {}).get("write_fmt", "%.6f")),
                     template_las=first.source_las,
                 )
                 preprocessed_las = repo_relative_path(output_las, root=REPO_ROOT)
@@ -790,8 +709,8 @@ def run_preprocess(
             "raw_las_source": "used to load primary and same-category fallback curves",
         },
         "curve_inventory_row_count": int(len(curve_inventory_df)),
-        "mnemonic_standardization_enabled": _section_enabled(config, "mnemonic_standardization", default=True),
-        "unit_standardization_enabled": _section_enabled(config, "unit_standardization", default=True),
+        "mnemonic_standardization_enabled": True,
+        "unit_standardization_enabled": True,
         "selected_categories": selected_categories,
         "required_categories": required_categories,
         "candidate_well_count": int((screen_df["screen_status"].astype(str) == "passed").sum()),
@@ -816,7 +735,10 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], columns: Sequence[
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
+    workflow = TimeWorkflowConfig.from_mapping(cfg)
     script_cfg = _script_config(cfg)
+    script_cfg["required_categories"] = list(workflow.well_curves.required_categories)
+    script_cfg["selected_categories"] = list(workflow.well_curves.selected_categories)
     inputs = _resolve_inputs(cfg, script_cfg)
     output_dir = _resolve_output_dir(args, cfg)
     range_overrides = _load_range_overrides(script_cfg)

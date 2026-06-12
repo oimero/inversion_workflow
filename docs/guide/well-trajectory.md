@@ -20,7 +20,7 @@ python scripts/well_trajectory.py --output-dir /tmp/traj_test
 |------|------|
 | `well_inventory.csv` | 提供井名、井头坐标、KB 和井型初分 |
 | Petrel 井轨迹目录 | 读取每口井的 MD/XY/Z/TVD 轨迹点 |
-| 时间域地震体 | 可选；启用 survey QC 时用于判断轨迹点是否在工区内 |
+| 时间域地震体 | 判断轨迹点是否在工区内 |
 
 如果工区全部是直井、且不打算复核轨迹，这一步可以跳过。但建议至少跑一次，因为井头文件里的底孔坐标可能不准。
 
@@ -29,17 +29,15 @@ python scripts/well_trajectory.py --output-dir /tmp/traj_test
 ## 配置参考
 
 ```yaml
-well_trajectory:
-  source_runs:
-    mode: latest
-    well_inventory_dir: null
-
+assets:
   well_trace_dir: all_well_trace
 
-  seismic:
-    file: raw/your-seismic.zgy
-    type: zgy
+seismic:
+  file: raw/your-seismic.zgy
+  type: zgy
+  zgy_inline_chunk_size: 16
 
+well_trajectory:
   classification:
     vertical_max_offset_m: 30.0
     min_deviated_max_offset_m: 30.0
@@ -48,21 +46,16 @@ well_trajectory:
     z_tvd_tolerance_m: 0.1
 
   survey_qc:
-    enabled: true
     allow_partial_outside: true
-
-  output:
-    write_trajectory_points: true
-    sampled_trajectory_dir: trajectory_points
 ```
 
 ### `source_runs`
 
-默认接上最新一次井资产盘点结果。复现实验时，在 `well_inventory_dir` 填入某次第一步输出目录即可固定输入；`mode` 目前只支持 `latest`。
+默认自动接上最新一次井资产盘点结果。复现实验时可按需加入 `source_runs.well_inventory_dir` 固定输入。
 
 ### `well_trace_dir`
 
-井轨迹文件目录。文件按 stem 匹配井名（不要求特定扩展名）。
+井轨迹文件目录来自顶层 `assets.well_trace_dir`。文件按 stem 匹配井名（不要求特定扩展名）。
 
 ### `classification`
 
@@ -80,15 +73,9 @@ well_trajectory:
 
 | 参数 | 默认值 | 含义 |
 |------|--------|------|
-| `enabled` | true | 是否计算轨迹点的 inline/xline 和工区内外 |
 | `allow_partial_outside` | true | 轨迹部分在工区外时，true=警告，false=硬失败 |
 
-### `output`
-
-| 参数 | 默认值 | 含义 |
-|------|--------|------|
-| `write_trajectory_points` | true | 是否写出逐点 CSV |
-| `sampled_trajectory_dir` | trajectory_points | 逐点 CSV 的子目录名 |
+工区几何 QC 固定启用；逐点 CSV 默认写入固定的 `trajectory_points` 子目录。代码仍保留 `output.write_trajectory_points` 作为特殊运行覆盖，但常用配置无需展示。
 
 ---
 

@@ -14,7 +14,7 @@ python scripts/well_screen.py --output-dir /tmp/screen_test
 
 不带参数运行时，脚本读取 `experiments/common.yaml`，自动发现最新的 `well_inventory_*/well_inventory.csv`，在 `scripts/output/well_screen_<timestamp>/` 下写出结果。
 
-当前版本 LLM 分类默认**不启用**。仅凭本地 mnemonic 规则即可产出可审计的初版结果。如果配置里打开了 LLM，脚本会直接抛出 `NotImplementedError`——LLM 路径预留给后续迭代。
+当前版本只使用可复现的本地 mnemonic 规则和人工 override。
 
 ---
 
@@ -34,51 +34,37 @@ python scripts/well_screen.py --output-dir /tmp/screen_test
 ## 配置参考
 
 ```yaml
+assets:
+  las_dir: all_well_las
+
+well_curves:
+  required_categories: [p_sonic, density]
+  selected_categories:
+    - caliper
+    - gamma_ray
+    - s_sonic
+    - p_sonic
+    - density
+    - resistivity
+    - spontaneous_potential
+    - porosity
+    - permeability
+    - water_saturation
+
 well_screen:
-  source_runs:
-    mode: latest
-    well_inventory_dir: null                 # null = 自动发现最新 step1 输出
-
-  source_data:
-    las_dir: all_well_las                    # 原始 LAS 目录，相对于 data_root
-
   candidate_filter:
     include_survey_positions: [inside, near_outside]
-
-  curve_selection:
-    required_categories: [p_sonic, density]  # 必须同时具备才能 passed
-    selected_categories:                     # 需要从 LAS 中提取的类别
-      - caliper
-      - gamma_ray
-      - s_sonic
-      - p_sonic
-      - density
-      - resistivity
-      - spontaneous_potential
-      - porosity
-      - permeability
-      - water_saturation
 
   classification:
     curve_schema_file: null                  # null = 使用内置 CURVE_CATEGORY_MNEMONICS
     curve_override_file: experiments/curve_alias_overrides.yaml
-
-  llm:
-    enabled: false
-    cache_dir: scripts/output/well_screen_cache
-    max_retry: 1
-
-  export:
-    selected_las_dir: selected_las
-    null_value: -999.25
-    write_fmt: "%.6f"
 ```
 
 ### `source_runs`
 
-默认接上最新一次井资产盘点结果。复现实验时，在 `well_inventory_dir` 填入某次第一步输出目录即可固定输入；`mode` 目前只支持 `latest`。
+默认自动接上最新一次井资产盘点结果，因此常用配置不显示 `source_runs`。复现实验时可按需加入 `source_runs.well_inventory_dir` 固定输入。
 
-### `curve_selection`
+### `well_curves`
 
 #### `required_categories`
 
@@ -87,8 +73,6 @@ well_screen:
 #### `selected_categories`
 
 决定第二步重点关心哪些曲线类别。脚本会为列表中的每个类别尽量选出一条代表曲线；不在列表中的曲线即使能识别，也只留在分类明细里，不进入导出的瘦身 LAS。
-
-这里的类别名是工作流内部的语义类别，不是 LAS 原始 mnemonic。比如 `spontaneous_potential` 是自然电位类别，匹配的常见 LAS mnemonic 是 `SP`。
 
 ### `classification`
 
@@ -144,7 +128,9 @@ wells:
 
 ### LASIO 后缀处理
 
-lasio 读取 LAS 时，同名曲线可能被自动添加 `:1`、`:2` 等后缀。这里的“后缀”只指 mnemonic 尾部的冒号加数字，正则形式是 `:\d+$`；它不是下划线，也不是 `GR_NORM`、`DT_BAD` 这类名字的一部分。脚本区分两种 mnemonic 概念：
+lasio 读取 LAS 时，同名曲线可能被自动添加 `:1`、`:2` 等后缀。
+
+脚本区分两种 mnemonic 概念：
 
 | 概念 | 函数 | 示例 |
 |------|------|------|
@@ -255,4 +241,4 @@ LAS curve screen summary: 61 candidates, 38 passed, 22 partial, 1 failed, 38 LAS
 
 ## 留到第二轮
 
-- **LLM 分类当前未启用。** 如果 `llm.enabled: true`，脚本会直接抛出 `NotImplementedError`。LLM 路径的接口已预留（classifications 可合并 LLM 结果），但请求逻辑和缓存未实现。
+- **LLM 分类当前未实现。**

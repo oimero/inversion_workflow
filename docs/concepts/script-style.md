@@ -23,9 +23,10 @@
 
 ### 具体约束
 
-- **CLI**：`parse_args()` 只解析 `--config`、`--output-dir` 和可选单井过滤参数（如 `--well`）。
+- **CLI**：`parse_args()` 解析 `--config`、`--output-dir` 和真正属于单次运行的覆盖项（如 `--well`、`--debug`）。
+- **共享配置**：时间域脚本先用 `cup.time_config.TimeWorkflowConfig` 解析顶层 `assets`、`seismic`、`well_curves`、`spatial_debias`，步骤段不得复制这些工区事实；步骤级覆盖和已退休键会明确报错。
 - **配置合并**：用 `cup.utils.config.deep_merge_dict(DEFAULT_CONFIG, cfg.get("<section>"))` 合并用户配置到默认值。
-- **run 发现**：用 `cup.utils.io.latest_run(output_root, prefix, required_file)` 定位上游 run 目录。
+- **run 发现**：缺省用 `cup.utils.io.latest_run(output_root, prefix, required_file)` 定位上游 run；复现实验时才显式配置 `source_runs.<step>_dir`。
 - **路径解析**：用 `cup.utils.io.resolve_relative_path` / `repo_relative_path`；可选的配置路径用 `resolve_optional_path`；从上游元数据里取出的 artifact 路径用 `resolve_artifact_path`。
 - **日志**：`import logging; logger = logging.getLogger(__name__)`，主流程用 `logger.info()`，只在脚本最后用 `print()` 输出一行简短汇总。
 - **图表保存**：简单 `_save_fig()` 留在脚本内；只有带业务语义的图件绘制逻辑才迁入 `cup.well.viz` 或 `cup.seismic.viz`。
@@ -37,8 +38,8 @@
 
 | 需求 | 模块 | 函数 |
 |------|------|------|
+| 解析时间域共享配置 | `cup.time_config` | `TimeWorkflowConfig.from_mapping` |
 | 递归合并两个 dict | `cup.utils.config` | `deep_merge_dict` |
-| 校验 source_runs.mode | `cup.utils.config` | `require_latest_mode` |
 | 定位最新上游 run | `cup.utils.io` | `latest_run` |
 | 构造时间戳输出目录 | `cup.utils.io` | `resolve_timestamped_output_dir` |
 | 解析脚本级路径 | `cup.utils.io` | `resolve_relative_path` |

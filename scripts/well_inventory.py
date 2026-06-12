@@ -32,6 +32,7 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.petrel.load import import_well_heads_petrel, import_well_tops_petrel
 from cup.seismic.survey import open_survey, segy_options_from_config
+from cup.time_config import TimeWorkflowConfig
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.well.assets import (
     WellHead,
@@ -90,20 +91,6 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
 
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_inventory") or {})
-    source_data = dict(script_cfg.get("source_data") or {})
-    source_data.setdefault("well_heads_file", "raw/well_heads")
-    source_data.setdefault("las_dir", "all_well_las")
-    source_data.setdefault("well_trace_dir", "all_well_trace")
-    source_data.setdefault("well_tops_file", "raw/well_tops")
-    source_data.setdefault("time_depth_dir", "time_depth_table")
-    script_cfg["source_data"] = source_data
-    script_cfg.setdefault(
-        "seismic",
-        {
-            "file": "raw/obn-clipped-240-912-872-1544.zgy",
-            "type": "zgy",
-        },
-    )
     spatial_qc = dict(script_cfg.get("spatial_qc") or {})
     spatial_qc.setdefault("near_survey_threshold_m", 500.0)
     spatial_qc.setdefault("vertical_bottom_offset_threshold_m", 30.0)
@@ -338,20 +325,20 @@ def _write_outputs(inventory: WellInventory, output_dir: Path, run_summary: dict
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
+    workflow = TimeWorkflowConfig.from_mapping(cfg)
     script_cfg = _script_config(cfg)
 
-    data_root = resolve_relative_path(str(cfg.get("data_root", "data")), root=REPO_ROOT)
+    data_root = resolve_relative_path(workflow.data_root, root=REPO_ROOT)
     output_dir = _resolve_output_dir(args, cfg)
 
-    source_data = dict(script_cfg["source_data"])
-    well_heads_file = _resolve_data_path(source_data["well_heads_file"], data_root=data_root)
-    las_dir = _resolve_data_path(source_data["las_dir"], data_root=data_root)
-    well_trace_dir = _resolve_data_path(source_data["well_trace_dir"], data_root=data_root)
-    well_tops_file = _resolve_data_path(source_data["well_tops_file"], data_root=data_root)
-    time_depth_dir = _resolve_data_path(source_data["time_depth_dir"], data_root=data_root)
-    seismic_cfg = dict(script_cfg["seismic"])
-    seismic_file = _resolve_data_path(seismic_cfg["file"], data_root=data_root)
-    seismic_type = str(seismic_cfg.get("type", "zgy")).lower()
+    well_heads_file = _resolve_data_path(workflow.assets.well_heads_file, data_root=data_root)
+    las_dir = _resolve_data_path(workflow.assets.las_dir, data_root=data_root)
+    well_trace_dir = _resolve_data_path(workflow.assets.well_trace_dir, data_root=data_root)
+    well_tops_file = _resolve_data_path(workflow.assets.well_tops_file, data_root=data_root)
+    time_depth_dir = _resolve_data_path(workflow.assets.time_depth_dir, data_root=data_root)
+    seismic_cfg = workflow.seismic.as_dict()
+    seismic_file = _resolve_data_path(workflow.seismic.file, data_root=data_root)
+    seismic_type = workflow.seismic.type
 
     well_heads_df, las_lookup, trace_lookup, time_depth_lookup, tops_lookup = _load_asset_lookups(
         well_heads_file=well_heads_file,

@@ -33,15 +33,12 @@ python scripts/lfm_precomputed.py --output-dir scripts/output/lfm_precomputed_te
 ## 配置参考
 
 ```yaml
+seismic:
+  file: <seismic-volume-file>
+  type: zgy
+  zgy_inline_chunk_size: 16
+
 lfm_precomputed:
-  source_runs:
-    mode: latest
-    well_constraints_dir: null
-
-  seismic:
-    file: null
-    type: segy
-
   target_interval:
     horizons:
       - <top-horizon-file>
@@ -58,13 +55,14 @@ lfm_precomputed:
     post_slice_smoothing: false
 
   export:
-    write_segy: true
-    write_zgy: true
+    export_volume: true
 ```
 
 ### `source_runs`
 
-默认接上最新一次井约束结果。复现实验时，填写 `well_constraints_dir` 固定输入。`mode` 目前只支持 `latest`。
+默认自动接上最新一次井约束结果。复现实验时可按需加入 `source_runs.well_constraints_dir` 固定输入。
+
+`export_volume: true` 时，输出格式跟随顶层 `seismic.type`：ZGY 输入写 ZGY，SEG-Y 输入写 SEG-Y。ZGY 分块大小来自顶层 `seismic.zgy_inline_chunk_size`。
 
 每个控制点本质上是“一口井在目标层内某个时间样点上的低频波阻抗值”。第六步只负责把这个点的 TWT、浮点 inline/xline、层段、层内比例和低频 AI 写清楚；第七步再按 `modeling.n_slices` 把这些点分配到顺层切片。那些整数道号、数组索引只用于排查，不能当作跨工区稳定坐标。
 
@@ -210,7 +208,7 @@ lfm_precomputed:
 | `target_layer geometry domain is not time` | 地震数据不在时间域 | 确认地震体路径和类型正确 |
 | 某口斜井 `missing_optimized_trace_sample_plan` | 第四步未为该斜井写出细标定后的空间映射 | 回到第四步检查斜井路径是否执行成功，以及 `well_tie_metrics.csv` 是否有 `optimized_trace_sample_plan_file` |
 | `too_few_control_samples` | 落入目标层的有效样点不足 | 检查时深表范围是否覆盖目标层；LAS 曲线在目标层深度内是否有值 |
-| 地震体导出失败 | 缺少 SEG-Y 头字节配置或 ZGY 写入库不可用 | 检查配置中的 `iline_byte`/`xline_byte`，或确认 `pyzgy` 已安装；也可设置 `write_segy: false` / `write_zgy: false` 跳过导出 |
+| 地震体导出失败 | 缺少 SEG-Y 头字节配置或 ZGY 写入库不可用 | 检查顶层 `seismic` 的 SEG-Y 几何配置，或确认 `pyzgy` 已安装；也可设置 `export.export_volume: false` 跳过导出 |
 
 ---
 

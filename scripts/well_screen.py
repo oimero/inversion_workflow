@@ -1,8 +1,8 @@
 """Screen LAS curves and export slim LAS files for usable wells.
 
 This script consumes ``well_inventory.csv`` from the first workflow step. It
-uses local mnemonic rules plus optional human overrides; LLM classification is
-left disabled by default and is not required for a reproducible first pass.
+uses local mnemonic rules plus optional human overrides to classify and select
+curves before exporting the fixed slim-LAS contract.
 
 Usage::
 
@@ -30,6 +30,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cup.time_config import TimeWorkflowConfig
 from cup.utils.coerce import as_bool
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.well.assets import build_file_lookup, normalize_well_name
@@ -74,39 +75,15 @@ def parse_args() -> argparse.Namespace:
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_screen") or {})
     source_runs = dict(script_cfg.get("source_runs") or {})
-    source_runs.setdefault("mode", "latest")
     source_runs.setdefault("well_inventory_dir", None)
     script_cfg["source_runs"] = source_runs
-    source_data = dict(script_cfg.get("source_data") or {})
-    source_data.setdefault("las_dir", "all_well_las")
-    script_cfg["source_data"] = source_data
     candidate_filter = dict(script_cfg.get("candidate_filter") or {})
     candidate_filter.setdefault("include_survey_positions", ["inside", "near_outside"])
     script_cfg["candidate_filter"] = candidate_filter
-    curve_selection = dict(script_cfg.get("curve_selection") or {})
-    curve_selection.setdefault("required_categories", ["p_sonic", "density"])
-    curve_selection.setdefault(
-        "selected_categories",
-        [
-            "caliper",
-            "gamma_ray",
-            "s_sonic",
-            "p_sonic",
-            "density",
-            "resistivity",
-            "spontaneous_potential",
-            "porosity",
-            "permeability",
-            "water_saturation",
-        ],
-    )
-    script_cfg["curve_selection"] = curve_selection
     classification = dict(script_cfg.get("classification") or {})
     classification.setdefault("curve_schema_file", None)
     classification.setdefault("curve_override_file", "experiments/curve_alias_overrides.yaml")
     script_cfg["classification"] = classification
-    script_cfg.setdefault("llm", {"enabled": False, "cache_dir": "scripts/output/well_screen_cache", "max_retry": 1})
-    script_cfg.setdefault("export", {"selected_las_dir": "selected_las", "null_value": -999.25, "write_fmt": "%.6f"})
     return script_cfg
 
 
@@ -126,15 +103,8 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     return output_root / f"well_screen_{timestamp}"
 
 
-def _validate_latest_mode(source_runs: Mapping[str, Any], *, section: str) -> None:
-    mode = str(source_runs.get("mode", "latest")).strip().casefold()
-    if mode != "latest":
-        raise ValueError(f"{section}.source_runs.mode only supports 'latest' for now, got {mode!r}.")
-
-
 def _discover_latest_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
     source_runs = dict(script_cfg.get("source_runs") or {})
-    _validate_latest_mode(source_runs, section="well_screen")
     if source_runs.get("well_inventory_dir") is not None:
         return _resolve_repo_path(source_runs["well_inventory_dir"]) / "well_inventory.csv"
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
@@ -289,7 +259,7 @@ def run_screening(
     )
     las_lookup = build_file_lookup(las_dir.glob("*.las"), asset_label=str(las_dir))
 
-    selected_las_dir = output_dir / str(config["export"]["selected_las_dir"])
+    selected_las_dir = output_dir / "selected_las"
     classification_dir = output_dir / "curve_classification"
     selected_las_dir.mkdir(parents=True, exist_ok=True)
     classification_dir.mkdir(parents=True, exist_ok=True)
@@ -348,8 +318,6 @@ def run_screening(
                     las_file,
                     output_las,
                     selection.selected_mnemonics,
-                    null_value=float(config["export"]["null_value"]),
-                    write_fmt=str(config["export"]["write_fmt"]),
                 )
                 for item in skipped:
                     skipped_curve_rows.append(
@@ -461,7 +429,6 @@ def run_screening(
         },
         "required_categories": list(config["curve_selection"]["required_categories"]),
         "selected_categories": list(config["curve_selection"]["selected_categories"]),
-        "llm_enabled": bool(config.get("llm", {}).get("enabled", False)),
         "candidate_well_count": int(len(candidates)),
         "screen_status_counts": {str(key): int(value) for key, value in status_counts.items()},
         "exported_las_count": int((well_screen_df["exported_las"].astype(str) != "").sum()) if not well_screen_df.empty else 0,
@@ -476,14 +443,16 @@ def run_screening(
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
+    workflow = TimeWorkflowConfig.from_mapping(cfg)
     script_cfg = _script_config(cfg)
+    script_cfg["curve_selection"] = {
+        "required_categories": list(workflow.well_curves.required_categories),
+        "selected_categories": list(workflow.well_curves.selected_categories),
+    }
 
-    if bool(script_cfg.get("llm", {}).get("enabled", False)):
-        raise NotImplementedError("LLM classification is intentionally not implemented in the first local pass.")
-
-    data_root = _resolve_repo_path(str(cfg.get("data_root", "data")))
+    data_root = _resolve_repo_path(workflow.data_root)
     inventory_file = _discover_latest_inventory_file(cfg, script_cfg)
-    las_dir = _resolve_data_path(script_cfg["source_data"]["las_dir"], data_root=data_root)
+    las_dir = _resolve_data_path(workflow.assets.las_dir, data_root=data_root)
     output_dir = _resolve_output_dir(args, cfg)
     schema = _load_curve_schema(script_cfg["classification"].get("curve_schema_file"))
     overrides = _load_overrides(script_cfg["classification"].get("curve_override_file"))

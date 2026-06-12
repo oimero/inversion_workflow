@@ -37,28 +37,23 @@ python scripts/well_auto_tie.py --output-dir scripts/output/well_auto_tie_test
 ## 配置参考
 
 ```yaml
-well_auto_tie:
-  source_runs:
-    mode: latest                  # 自动发现最新前置产物
-    well_inventory_dir: null
-    well_screen_dir: null
-    well_preprocess_dir: null
-    well_trajectory_dir: null
-
-  time_depth_dir: <time-depth-dir>
+assets:
   well_trace_dir: <well-trajectory-dir>
   well_tops_file: <well-tops-file>
+  time_depth_dir: <time-depth-dir>
 
+seismic:
+  file: <seismic-volume-file>
+  type: zgy
+  zgy_inline_chunk_size: 16
+
+well_auto_tie:
   target_interval:
     top_horizon: <top-horizon-file>
     bottom_horizon: <bottom-horizon-file>
     margin_top_ms: 100.0          # 层位之上冗余时间宽度
     margin_bottom_ms: 100.0       # 层位之下冗余时间宽度
     twt_unit: auto
-
-  seismic:
-    file: <seismic-volume-file>
-    type: zgy
 
   enabled_routes:                 # 当前启用的路径
     - vertical_with_tdt
@@ -83,7 +78,9 @@ well_auto_tie:
 
 ### `source_runs`
 
-默认接上最新的前置步骤结果。复现实验时，可以在这个块里填写某次第一步、第二步、第三步或轨迹 QC 的输出目录，固定对应输入。`mode` 目前只支持 `latest`。
+默认自动接上最新的前置步骤结果。复现实验时，可以按需加入 `source_runs`，填写某次第一步、第二步、第三步或轨迹 QC 的输出目录。
+
+时深表、轨迹、井分层和地震来自顶层 `assets` / `seismic`，第四步不允许单独覆盖，避免同一轮工作流读取不同工区。
 
 ### `target_interval`
 
@@ -212,7 +209,7 @@ manual_shift:
 
 ### 第三步：取地震道
 
-**直井**只需要一个固定井位，但不是简单吸附到最近道。脚本会把井口 XY 转成工区里的浮点 inline/xline index，读取周围四条相邻地震道，并按井口落在四邻道网格中的位置做双线性插值。这样可以避免井口刚好落在两条道之间时，被最近道选择带来阶跃误差。
+**直井**只需要一个固定井位。脚本会把井口 XY 转成工区里的浮点 inline/xline index，读取周围四条相邻地震道，并按井口落在四邻道网格中的位置做双线性插值。这样可以避免井口刚好落在两条道之间时，被最近道选择带来阶跃误差。
 
 如果井口周围四邻道有缺失，或井口落到工区范围外，直井取道会失败；这类问题通常应回到第一步的 `survey_position` 和井口坐标检查。
 
@@ -254,18 +251,6 @@ manual_shift:
 | `trace_sample_plan/optimized_trace_sample_plan_<well>.csv` | 斜井细标定后基于 `optimized_tdt_<well>.csv` 重新生成的样点级落道明细，供第六步井约束和第七步点级 LFM 使用 |
 | `figures/<well>/*.png` | TDT 图、合成匹配图、子波图 |
 | `run_summary.json` | 输入路径、路由统计、失败统计、逐井补充信息 |
-
-`tie_window_report.csv` 会记录 `coarse_anchor_shift_ms`、`coarse_manual_shift_ms` 和 `coarse_total_shift_ms`。如果某口井没有启用锚点且手动偏移为 0，这三个值就是 0。
-
-`time_depth/optimized_tdt_<well>.csv` 是工作流内部格式，保留正秒 `twt_s` 和正米 `md_m`；`petrel_checkshots/optimized_tdt_<well>.txt` 是地质软件导入格式，沿用 `export_vertical_tdt_to_petrel_checkshots()` 的口径导出。
-
-`filtered_las/filtered_logs_<well>.las` 固定包含 `DT_USM`（`us/m`）、`RHO_GCC`（`g/cm3`）和 `AI`（`m/s*g/cm3`）。第四步只信当前输入 LAS 的基础 DT/RHO，完成最优滤波后重新计算 AI；不会校验或沿用第三步、人工处理中已有的旧 AI。
-
-第四步不再无条件贯通全部缺失段。它只填补 `<=10 ms` 的内部短缺口，然后在目标窗内选择 DT/RHO 最长连续联合有效段执行 auto-tie；该段按地震时间采样间隔计数，不足 `min_tie_samples` 时整井失败。`continuous_tie_log_sample_count` 另行记录原始 MD 轴点数，不能用于替代这一门槛。导出 LAS 会回到完整第三步 MD 轴，按联合有效段独立应用最优滤波，长缺口继续写为 LAS NULL。
-
-`vertical_anchor_from_tops` 没有输入 TDT，因此允许为“初始 TDT 坐标映射”临时补齐声波缺口；该曲线不进入 auto-tie、不导出 LAS。正式标定仍回到原始观测 mask，执行同一套 `10 ms` 缺口规则和最长连续段门槛，QC 记录 `anchor_tdt_mapping_only_*` 字段。
-
-它保留本井自动标定选中的滤波效果，但不会把时深表的整体时移写回测井曲线。也就是说，它修的是曲线滤波口径，不是把 LAS 深度轴改掉。
 
 ### `trace_sample_plan_<well>.csv`
 

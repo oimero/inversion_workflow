@@ -31,37 +31,11 @@ python scripts/well_preprocess.py --output-dir /tmp/preprocess_test
 ## 配置参考
 
 ```yaml
-well_preprocess:
-  source_runs:
-    mode: latest
-    well_screen_dir: null
-
-  # 输出子目录
-  output_las_dir: preprocessed_las
-
-  # 必须同时具备的类别（缺任一个则整井 failed）
+well_curves:
   required_categories: [p_sonic, density]
+  selected_categories: [...]
 
-  # 需要处理的类别集合
-  selected_categories:
-    - caliper
-    - gamma_ray
-    - s_sonic
-    - p_sonic
-    - density
-    - resistivity
-    - spontaneous_potential
-    - porosity
-    - permeability
-    - water_saturation
-
-  mnemonic_standardization:
-    enabled: true                # 时间域标准 LAS 契约要求，不能关闭
-
-  unit_standardization:
-    enabled: true                # 时间域标准 LAS 契约要求，不能关闭
-    unit_mismatch_qc: true
-
+well_preprocess:
   constant_runs:
     enabled: true
     min_run_length: 8
@@ -75,30 +49,23 @@ well_preprocess:
       porosity: 16
       permeability: 16
       water_saturation: 16
-    replacement: null
     exclude_categories: [caliper]
 
   outliers:
     enabled: true
-    strategy: global_quantile_with_override
     lower_quantile: 0.01
     upper_quantile: 0.99
-    replacement: null
     range_override_file: experiments/well_preprocess_ranges.yaml
     min_samples_for_auto_threshold: 1000
 
   usable_thresholds:
     min_valid_samples: 100
     min_valid_fraction_of_initial: 0.70
-
-  export:
-    null_value: -999.25
-    write_fmt: "%.6f"
 ```
 
 ### `source_runs`
 
-默认接上最新一次曲线筛选结果。复现实验时，在 `well_screen_dir` 填入某次第二步输出目录即可固定整套输入；`mode` 目前只支持 `latest`。
+默认自动接上最新一次曲线筛选结果。复现实验时可按需加入 `source_runs.well_screen_dir` 固定整套输入。
 
 ### `required_categories`
 
@@ -107,18 +74,6 @@ well_preprocess:
 ### `selected_categories`
 
 脚本只处理这些类别。不在列表中的即使第二步识别了也不加载。类别名是工作流语义类别（`p_sonic`、`density`），不是 LAS 原始 mnemonic。
-
-### `mnemonic_standardization`
-
-#### `enabled`
-
-必须为 `true`。导出的预处理 LAS 使用标准 mnemonic（`DT_USM`、`RHO_GCC` 等），这是第四步和 AI 派生的固定输入契约。配置为 `false` 时第三步直接报错。`mnemonic_mapping.csv` 始终记录原始名到最终名的映射。
-
-### `unit_standardization`
-
-#### `enabled`
-
-必须为 `true`。第三步执行单位转换和硬先验检查，确保 `DT_USM` 为 `us/m`、`RHO_GCC` 为 `g/cm3`。配置为 `false` 时第三步直接报错。
 
 ### `constant_runs`
 
@@ -157,10 +112,6 @@ well_curve:
 ### `usable_thresholds`
 
 用于避免“清洗后只剩一点点数据”的曲线继续被当成可靠曲线。脚本同时检查最终有效点数量和保留下来的有效比例，两项都过关才认为曲线可用。
-
-### `export`
-
-`null_value` 是导出 LAS 时写入的缺失值（`-999.25`），与数据清洗无关（清洗阶段全部用 NaN 标记缺失）。
 
 ---
 
@@ -233,7 +184,7 @@ Vp (m/s) = 1e6 / DT_USM (us/m)
 AI (m/s*g/cm3) = (1e6 / DT_USM) * RHO_GCC
 ```
 
-只有 `DT_USM` 和 `RHO_GCC` 同时有限且为正的样点才计算 AI；其他样点保持缺失并在 LAS 中写为 `NULL`。第三步不会为了得到连续 AI 而插值，也不会用 AI 的有效覆盖率再次否决已通过 DT/RHO 可用性检查的井。
+只有 `DT_USM` 和 `RHO_GCC` 同时有限且为正的样点才计算 AI；其他样点保持缺失并在 LAS 中写为 `NULL`。
 
 ---
 

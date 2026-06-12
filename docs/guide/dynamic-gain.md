@@ -1,6 +1,8 @@
 # Dynamic Gain：让合成记录回到观测地震的尺度
 
-GINN 训练端用能量归一化的子波做正演，合成记录的振幅和真实地震不在一个量级上。`dynamic_gain.py` 负责生成一个随时间和空间变化的增益体，把单位子波正演结果拉回到观测地震的尺度。它不是主链步骤，跑在第七步 LFM 之后、第八步 GINN 训练之前，由人根据产出证据决定第八步用 fixed gain 还是 dynamic gain。
+GINN 训练端用能量归一化的子波做正演，合成记录的振幅和真实地震不在一个量级上。`dynamic_gain.py` 负责生成一个随时间和空间变化的增益体，把井位 **GINN target 阻抗** 的单位子波合成记录拉回到观测地震的尺度。它不是主链步骤，跑在第七步 LFM 之后、第八步 GINN 训练之前，由人根据产出证据决定第八步用 fixed gain 还是 dynamic gain。
+
+这里不能用 LFM 合成记录估计 gain。LFM 只含低于 `lfm_cutoff_hz` 的背景成分，而 GINN 输出目标达到 `ginn_cutoff_hz`；用 LFM 作分母会把两者之间缺失的反射能量误算成振幅增益，随后又把这个过大的 gain 乘到 GINN 输出上。
 
 ---
 
@@ -21,10 +23,9 @@ python scripts/dynamic_gain.py --output-dir scripts/output/dynamic_gain_test
 | 来源 | 文件/配置 | 用途 |
 |------|-----------|------|
 | 地震数据 | 与第八步相同的地震体和 SEG-Y 几何配置 | 读取原始地震、确定时间轴和工区几何 |
-| 第四步 | `filtered_las/filtered_logs_<well>.las`、`time_depth/optimized_tdt_<well>.csv` | 井上波形 QC 的波阻抗曲线来源 |
 | 第五步 | `selected_wavelet.csv` | 单位子波正演 |
-| 第六步 | `log_ai_anchor_time.npz` | 井上 gain 样本来源 |
-| 第七步 | `ai_lfm_time.npz` | LFM 体、目标层元数据、层位路径 |
+| 第六步 | `log_ai_anchor_time.npz` | 井位 GINN target 阻抗、有效掩膜和道索引 |
+| 第七步 | `ai_lfm_time.npz` | 训练空间几何、mask、目标层元数据和 QC 对照 |
 | 训练配置 | 与第八步一致的 mask、验证划分、子波、LFM 和 anchor 配置 | 复现第八步的训练 mask 和归一化 RMS |
 
 ---
@@ -64,7 +65,7 @@ dynamic_gain:
 
 ### `source_runs`
 
-默认自动接上最新的第四步、第五步、第六步和第七步产物。第四步只在井上波形 QC 时使用；gain 估计逻辑不依赖第四步。复现实验时，可以按需加入 `source_runs` 并填写对应步骤目录。
+默认自动接上最新的第五步、第六步和第七步产物。旁路不再回读第四步；井上 GINN target 阻抗和有效区间全部以第六步 anchor 契约为准。复现实验时，可以按需加入 `source_runs` 并填写对应步骤目录。
 
 ### `segments`
 
@@ -96,11 +97,11 @@ dynamic_gain:
 
 按第八步训练配置重建目标层 mask 和 loss mask，计算 `train_mask_rms`——目标层训练 mask 内全部有限地震样点的 RMS。然后把原始地震按 `seismic_raw / train_mask_rms` 归一到单位量级。
 
-归一化之后，用第五步全局子波（不乘任何增益）对 LFM 做一次完整正演，得到单位子波合成记录。后续所有 gain 估计都在这个归一化域里进行。
+归一化之后，用第五步全局子波（不乘任何增益）对第六步每条井位 GINN target 阻抗做正演，得到单位子波合成记录。这里只正演少量 anchor 道，不再对完整 LFM 体正演。后续所有 gain 估计都在这个归一化域里进行。
 
 ### 第二阶段：井上 gain 样本估计
 
-在第六步 anchor 的控制井道上，对每个有效段用最小二乘估计局部 gain——给定一段归一化观测地震和一段单位合成记录，求一个正数增益使残差平方和最小。
+在第六步 anchor 的控制井道上，对每个有效段用最小二乘估计局部 gain——给定一段归一化观测地震和一段 GINN target 单位合成记录，求一个正数增益使残差平方和最小。
 
 一口井可能切出多段，每段一个 gain。段内的有效样点必须同时满足三个条件：在 anchor mask 内、在 loss mask 内、地震和合成记录都是有限值。太短的连续有效段会被跳过。
 
@@ -152,14 +153,14 @@ dynamic_gain:
 
 ### `dynamic_gain.npz`
 
-使用 `dynamic_gain_v1` schema，包含：
+使用 `dynamic_gain_v2` schema，包含：
 
 | 键 | 形状 | 语义 |
 |----|------|------|
 | `volume` | `(n_inline, n_xline, n_sample)` | 正值 dynamic gain |
 | `samples` / `inline` / `xline` | 一维轴 | TWT 采样轴和线号轴 |
 | `geometry_json` | 标量 | 与第八步地震几何一致 |
-| `metadata_json` | 标量 | 归一化口径、拟合参数、上游路径 |
+| `metadata_json` | 标量 | 归一化口径、GINN target 频带、拟合参数、上游路径 |
 
 ### `recommended_fixed_gain.json`
 
@@ -168,7 +169,7 @@ dynamic_gain:
 | `recommended_fixed_gain` | 空间去偏后的井上 gain 中位数 |
 | `n_wells` / `n_segments` / `n_spatial_clusters` | 参与估计的井数、段数和空间簇数 |
 | `normalization` | 固定为 `seismic_raw_divided_by_train_mask_rms` |
-| `gain_reference` | 固定为 `unit_wavelet_synthetic_to_normalized_observation` |
+| `gain_reference` | 固定为 `unit_wavelet_ginn_target_synthetic_to_normalized_observation` |
 | `train_mask_rms` | 与第八步训练端一致的地震 RMS |
 
 ---

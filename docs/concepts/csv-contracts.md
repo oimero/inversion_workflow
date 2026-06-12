@@ -114,7 +114,7 @@
 
 ### `well_tie_metrics.csv` — 核心契约
 
-→ wavelet_generation.py、well_constraints.py、dynamic_gain.py
+→ wavelet_generation.py、well_constraints.py
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -350,7 +350,7 @@
 
 ## 旁路 · dynamic_gain.py
 
-Dynamic gain 旁路，置于第七步之后、第八步之前。读取第四步 `well_tie_metrics.csv` 和第五步 `selected_wavelet.csv`，产出 `dynamic_gain.npz` 和若干诊断 CSV（`dynamic_gain_samples.csv`、`dynamic_gain_well_medians.csv` 等）。诊断 CSV 仅供人工审阅，`dynamic_gain.npz` 可由第八步按配置读取。
+Dynamic gain 旁路，置于第七步之后、第八步之前。读取第五步 `selected_wavelet.csv`、第六步 `log_ai_anchor_time.npz` 和第七步 `ai_lfm_time.npz`。井点 gain 必须由第六步的 GINN target 阻抗合成记录估计，LFM 只提供训练空间几何、mask 和 QC 对照，不得作为 gain 分母。脚本产出 `dynamic_gain.npz` 和若干诊断 CSV（`dynamic_gain_samples.csv`、`dynamic_gain_well_medians.csv` 等）；诊断 CSV 仅供人工审阅，`dynamic_gain.npz` 可由第八步按配置读取。
 
 ---
 

@@ -289,7 +289,7 @@ def _validate_dynamic_gain_npz_contract(
 
     metadata = _json_scalar_to_dict(archive["metadata_json"])
     expected = {
-        "schema_version": "dynamic_gain_v1",
+        "schema_version": "dynamic_gain_v2",
         "sample_domain": "time",
         "sample_unit": "s",
         "normalization": "seismic_raw_divided_by_train_mask_rms",
@@ -301,10 +301,15 @@ def _validate_dynamic_gain_npz_contract(
             raise ValueError(
                 f"Dynamic gain metadata field {key!r} must be {expected_value!r}, got {actual!r}: {gain_path}"
             )
-    if metadata.get("gain_reference") != "unit_wavelet_synthetic_to_normalized_observation":
+    if metadata.get("gain_reference") != "unit_wavelet_ginn_target_synthetic_to_normalized_observation":
         raise ValueError(
             "Dynamic gain metadata gain_reference must be "
-            "'unit_wavelet_synthetic_to_normalized_observation'."
+            "'unit_wavelet_ginn_target_synthetic_to_normalized_observation'."
+        )
+    if metadata.get("anchor_target_band") != "lowpass_reference_to_ginn_cutoff":
+        raise ValueError(
+            "Dynamic gain metadata anchor_target_band must be "
+            "'lowpass_reference_to_ginn_cutoff'."
         )
     train_mask_rms = float(metadata.get("train_mask_rms", np.nan))
     if not np.isfinite(train_mask_rms) or train_mask_rms <= 0.0:
@@ -371,14 +376,14 @@ def _validate_dynamic_gain_npz_contract(
 
 
 def load_dynamic_gain_model(gain_model_file: Path, seismic_geometry: dict[str, Any] | None = None) -> np.ndarray:
-    """Load a time-domain ``dynamic_gain_v1`` NPZ volume."""
+    """Load a time-domain ``dynamic_gain_v2`` NPZ volume."""
     gain_path = Path(gain_model_file)
     if not gain_path.exists():
         raise FileNotFoundError(gain_path)
 
     if gain_path.suffix.lower() != ".npz":
         raise ValueError(
-            f"Dynamic gain model must be a dynamic_gain_v1 .npz file, got suffix {gain_path.suffix!r}: {gain_path}"
+            f"Dynamic gain model must be a dynamic_gain_v2 .npz file, got suffix {gain_path.suffix!r}: {gain_path}"
         )
 
     with np.load(gain_path, allow_pickle=False) as archive:
@@ -398,89 +403,6 @@ def load_dynamic_gain_model(gain_model_file: Path, seismic_geometry: dict[str, A
     if np.any(~np.isfinite(volume)) or np.any(volume <= 0.0):
         raise ValueError("Dynamic gain model must be finite and positive everywhere.")
     return volume
-
-
-def estimate_fixed_gain(
-    seismic: np.ndarray,
-    lfm: np.ndarray,
-    mask: np.ndarray,
-    unit_wavelet: np.ndarray,
-    *,
-    seis_rms: float,
-    max_traces: int,
-    candidate_trace_indices: np.ndarray | None = None,
-    batch_size: int = 64,
-) -> float:
-    """基于样本道估计使合成地震与归一化观测同量级的固定增益。
-
-    思路：
-    1. 用单位增益子波对 LFM 做正演，得到 ``d_syn_unit``；
-    2. 在同一批掩码样本上计算 ``d_syn_unit`` 的 RMS；
-    3. 计算该批观测地震归一化后的 RMS；
-    4. 令 ``gain = obs_norm_rms / syn_unit_rms``。
-    """
-    from ginn.physics import ForwardModel
-
-    n_sample = seismic.shape[-1]
-    seismic_flat = seismic.reshape(-1, n_sample)
-    lfm_flat = lfm.reshape(-1, n_sample)
-    mask_flat = mask.reshape(-1, n_sample).astype(bool, copy=False)
-
-    valid_trace_indices = np.flatnonzero(mask_flat.any(axis=1))
-    if candidate_trace_indices is not None:
-        candidate_trace_indices = np.asarray(candidate_trace_indices, dtype=np.int64)
-        valid_trace_indices = np.intersect1d(valid_trace_indices, candidate_trace_indices, assume_unique=False)
-    if valid_trace_indices.size == 0:
-        raise ValueError("Cannot auto-estimate fixed gain because no valid traces were found in the mask.")
-
-    n_selected = min(max_traces, valid_trace_indices.size)
-    if n_selected < valid_trace_indices.size:
-        rng = np.random.default_rng(0)
-        selected = np.sort(rng.choice(valid_trace_indices, size=n_selected, replace=False))
-    else:
-        selected = valid_trace_indices
-
-    forward_model = ForwardModel(unit_wavelet).cpu()
-    syn_sq_sum = 0.0
-    obs_norm_sq_sum = 0.0
-    n_valid = 0
-
-    with torch.no_grad():
-        for start in range(0, selected.size, batch_size):
-            batch_indices = selected[start : start + batch_size]
-
-            lfm_batch = torch.from_numpy(lfm_flat[batch_indices][:, np.newaxis, :]).float()
-            mask_batch = mask_flat[batch_indices][:, np.newaxis, :]
-            d_syn_unit = forward_model(lfm_batch).cpu().numpy()
-
-            seismic_batch = seismic_flat[batch_indices][:, np.newaxis, :] / float(seis_rms)
-            valid_values = mask_batch
-
-            syn_values = d_syn_unit[valid_values]
-            obs_norm_values = seismic_batch[valid_values]
-
-            syn_sq_sum += float(np.square(syn_values, dtype=np.float64).sum())
-            obs_norm_sq_sum += float(np.square(obs_norm_values, dtype=np.float64).sum())
-            n_valid += int(valid_values.sum())
-
-    if n_valid <= 0:
-        raise ValueError("Cannot auto-estimate fixed gain because sampled valid point count is zero.")
-
-    syn_rms = math.sqrt(syn_sq_sum / n_valid)
-    obs_norm_rms = math.sqrt(obs_norm_sq_sum / n_valid)
-    if syn_rms <= 0.0:
-        raise ValueError(f"Cannot auto-estimate fixed gain because synthetic RMS is non-positive: {syn_rms}.")
-
-    gain = obs_norm_rms / syn_rms
-    logger.info(
-        "Auto fixed gain from sampled traces: traces=%d, valid_points=%d, obs_norm_rms=%.4f, syn_unit_rms=%.4f, gain=%.4f",
-        selected.size,
-        n_valid,
-        obs_norm_rms,
-        syn_rms,
-        gain,
-    )
-    return float(gain)
 
 
 @dataclass(frozen=True)
@@ -1005,16 +927,10 @@ def build_dataset(cfg: GINNConfig) -> DatasetBundle:
     if cfg.gain_source == "fixed_gain":
         resolved_fixed_gain = cfg.fixed_gain
         if resolved_fixed_gain is None:
-            resolved_fixed_gain = estimate_fixed_gain(
-                seismic,
-                lfm,
-                train_mask,
-                base_wavelet.astype(np.float32),
-                seis_rms=train_dataset.seis_rms,
-                max_traces=cfg.fixed_gain_num_traces,
-                candidate_trace_indices=train_dataset.valid_indices,
+            raise ValueError(
+                "fixed_gain must be explicitly configured. LFM-based automatic gain estimation is invalid for "
+                "the GINN target band; use recommended_fixed_gain.json from scripts/dynamic_gain.py."
             )
-            cfg.fixed_gain = resolved_fixed_gain
     elif cfg.gain_source == "dynamic_gain_model":
         resolved_fixed_gain = 1.0
         logger.info("Using dynamic gain model; fixed gain is disabled.")

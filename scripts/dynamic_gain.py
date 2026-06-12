@@ -1,7 +1,7 @@
 """Build a time-domain dynamic gain sidecar for GINN training.
 
-The produced gain volume maps unit-wavelet LFM synthetics to the same
-normalised seismic domain used by ``scripts/ginn_train.py``:
+The produced gain volume maps unit-wavelet GINN-target synthetics at well
+anchors to the same normalised seismic domain used by ``scripts/ginn_train.py``:
 
     seismic_norm = seismic_raw / train_mask_rms
 
@@ -45,13 +45,9 @@ from cup.utils.io import (
     load_yaml_config,
     repo_relative_path,
     resolve_optional_path,
-    resolve_relative_path,
     sanitize_filename,
     write_json,
 )
-from cup.well.assets import normalize_well_name
-from cup.well.las import load_vp_rho_logset_from_standard_las
-from cup.well.td import load_workflow_time_depth_table_csv
 from cup.seismic.gain import (
     CANDIDATE_ATTRIBUTES,
     NORMALIZATION,
@@ -76,7 +72,6 @@ from ginn.data import (
 from ginn.masking import build_eroded_loss_mask, get_valid_trace_indices, select_spatial_validation_split
 from ginn.physics import ForwardModel
 from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
-from wtie.optimize import tie as tie_ops
 from wtie.processing import grid
 
 matplotlib.use("Agg")
@@ -143,7 +138,6 @@ class DynamicGainContext:
     wavelet_time_s: np.ndarray
     unit_wavelet: np.ndarray
     anchor_file: Path
-    auto_tie_dir: Path | None
     source_dirs: dict[str, Path | None]
 
 
@@ -162,17 +156,12 @@ def _json_scalar_to_dict(value: np.ndarray) -> dict[str, Any]:
     return json.loads(str(payload))
 
 
-def _resolve_source_dirs(script_cfg: dict[str, Any], output_root: Path) -> dict[str, Path | None]:
+def _resolve_source_dirs(script_cfg: dict[str, Any]) -> dict[str, Path | None]:
     source_cfg = dict(script_cfg.get("source_runs") or {})
 
     dirs: dict[str, Path | None] = {}
-    for key in ("well_auto_tie_dir", "well_constraints_dir", "lfm_precomputed_dir", "wavelet_generation_dir"):
+    for key in ("well_constraints_dir", "lfm_precomputed_dir", "wavelet_generation_dir"):
         dirs[key] = resolve_optional_path(source_cfg.get(key), root=REPO_ROOT)
-    if dirs.get("well_auto_tie_dir") is None:
-        try:
-            dirs["well_auto_tie_dir"] = latest_run(output_root, "well_auto_tie", "well_tie_metrics.csv")
-        except FileNotFoundError:
-            pass
     return dirs
 
 
@@ -361,7 +350,7 @@ def load_context(args: argparse.Namespace) -> DynamicGainContext:
     script_cfg = deep_merge_dict(DEFAULT_CONFIG, dict(common_cfg.get("dynamic_gain") or {}))
     script_cfg["spatial_debias"]["cluster_radius_m"] = workflow.spatial_debias.cluster_radius_m
     output_root = REPO_ROOT / workflow.output_root
-    source_dirs = _resolve_source_dirs(script_cfg, output_root)
+    source_dirs = _resolve_source_dirs(script_cfg)
 
     cfg = GINNConfig.from_yaml(args.train_config, base_dir=REPO_ROOT)
     if args.output_dir is None:
@@ -468,24 +457,47 @@ def load_context(args: argparse.Namespace) -> DynamicGainContext:
         wavelet_time_s=np.asarray(wavelet_time_s, dtype=np.float64),
         unit_wavelet=unit_wavelet,
         anchor_file=anchor_file,
-        auto_tie_dir=source_dirs.get("well_auto_tie_dir"),
         source_dirs=source_dirs,
     )
 
 
-def build_unit_synthetic(lfm: np.ndarray, unit_wavelet: np.ndarray, *, batch_traces: int) -> np.ndarray:
-    n_sample = int(lfm.shape[-1])
-    flat = lfm.reshape(-1, n_sample)
-    out = np.empty_like(flat, dtype=np.float32)
+def continuous_anchor_target_ai(anchor: Any) -> np.ndarray:
+    """Interpolate each masked GINN-target anchor trace for convolution support."""
+    samples = np.asarray(anchor.samples, dtype=np.float64).reshape(-1)
+    target_ai = np.asarray(anchor.target_ai, dtype=np.float64)
+    anchor_mask = np.asarray(anchor.anchor_mask, dtype=bool)
+    if target_ai.shape != anchor_mask.shape or target_ai.shape[1] != samples.size:
+        raise ValueError(
+            "Anchor target_ai, anchor_mask, and samples have incompatible shapes: "
+            f"{target_ai.shape}, {anchor_mask.shape}, {samples.shape}."
+        )
+
+    continuous = np.empty_like(target_ai, dtype=np.float32)
+    for row in range(target_ai.shape[0]):
+        valid = anchor_mask[row] & np.isfinite(target_ai[row]) & (target_ai[row] > 0.0)
+        if int(valid.sum()) < 2:
+            name = str(np.asarray(anchor.anchor_names).astype(str)[row])
+            raise ValueError(f"Anchor {name!r} has fewer than two valid positive GINN-target AI samples.")
+        continuous[row] = np.interp(samples, samples[valid], target_ai[row, valid]).astype(np.float32)
+    return continuous
+
+
+def build_anchor_target_unit_synthetic(
+    anchor: Any,
+    unit_wavelet: np.ndarray,
+    *,
+    batch_traces: int,
+) -> np.ndarray:
+    target_ai = continuous_anchor_target_ai(anchor)
+    out = np.empty_like(target_ai, dtype=np.float32)
     model = ForwardModel(unit_wavelet).cpu()
     with torch.no_grad():
-        for start in range(0, flat.shape[0], int(batch_traces)):
-            end = min(start + int(batch_traces), flat.shape[0])
-            batch = torch.from_numpy(flat[start:end, np.newaxis, :]).float()
+        for start in range(0, target_ai.shape[0], int(batch_traces)):
+            end = min(start + int(batch_traces), target_ai.shape[0])
+            batch = torch.from_numpy(target_ai[start:end, np.newaxis, :]).float()
             out[start:end] = model(batch).cpu().numpy()[:, 0, :]
-            if start == 0 or end == flat.shape[0] or (start // max(int(batch_traces), 1)) % 20 == 0:
-                logger.info("Forward modeled %d/%d traces", end, flat.shape[0])
-    return out.reshape(lfm.shape)
+            logger.info("Forward modeled %d/%d GINN-target anchor traces", end, target_ai.shape[0])
+    return out
 
 
 def split_valid_indices(
@@ -521,21 +533,20 @@ def _trace_xy_from_flat(ctx: DynamicGainContext, flat_idx: int) -> tuple[float, 
     return inline, xline, float(x_m), float(y_m)
 
 
-def estimate_well_gain_samples(ctx: DynamicGainContext, syn_unit: np.ndarray) -> tuple[pd.DataFrame, dict[str, Any]]:
-    anchor = load_log_ai_anchor_npz(ctx.anchor_file)
-    validate_log_ai_anchor(
-        anchor,
-        sample_domain="time",
-        n_sample=int(ctx.geometry["n_sample"]),
-        n_traces=int(ctx.geometry["n_il"]) * int(ctx.geometry["n_xl"]),
-    )
-    _validate_samples_axis(np.asarray(anchor.samples, dtype=np.float64), ctx.samples, name="log_ai_anchor_time.npz")
-
+def estimate_well_gain_samples(
+    ctx: DynamicGainContext,
+    anchor: Any,
+    anchor_syn_unit: np.ndarray,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     n_sample = int(ctx.geometry["n_sample"])
     seismic_norm_flat = (ctx.seismic.reshape(-1, n_sample) / float(ctx.train_mask_rms)).astype(np.float32)
-    syn_flat = syn_unit.reshape(-1, n_sample)
     loss_mask_flat = ctx.train_loss_mask.reshape(-1, n_sample)
     train_set = set(int(v) for v in np.asarray(ctx.train_indices, dtype=np.int64))
+    if anchor_syn_unit.shape != (int(np.asarray(anchor.flat_indices).size), n_sample):
+        raise ValueError(
+            "GINN-target anchor synthetic shape does not match anchor count/time axis: "
+            f"{anchor_syn_unit.shape}."
+        )
 
     seg_cfg = dict(ctx.script_cfg["segments"])
     min_samples = int(seg_cfg["min_segment_valid_samples"])
@@ -556,7 +567,7 @@ def estimate_well_gain_samples(ctx: DynamicGainContext, syn_unit: np.ndarray) ->
             anchor_mask
             & loss_mask_flat[flat_idx]
             & np.isfinite(seismic_norm_flat[flat_idx])
-            & np.isfinite(syn_flat[flat_idx])
+            & np.isfinite(anchor_syn_unit[anchor_row])
         )
         trace_segments: list[np.ndarray] = []
         for contiguous in contiguous_true_segments(valid):
@@ -577,7 +588,7 @@ def estimate_well_gain_samples(ctx: DynamicGainContext, syn_unit: np.ndarray) ->
         for segment_index, indices in enumerate(trace_segments):
             gain = positive_ls_gain(
                 seismic_norm_flat[flat_idx, indices],
-                syn_flat[flat_idx, indices],
+                anchor_syn_unit[anchor_row, indices],
                 eps=eps,
                 min_valid_samples=min_samples,
             )
@@ -600,7 +611,9 @@ def estimate_well_gain_samples(ctx: DynamicGainContext, syn_unit: np.ndarray) ->
                 "gain": float(gain),
                 "log_gain": float(np.log(gain)),
                 "seismic_norm_rms": float(attrs["seismic_rms"]),
-                "syn_unit_rms": float(np.sqrt(np.mean(syn_flat[flat_idx, indices].astype(np.float64) ** 2))),
+                "ginn_target_syn_unit_rms": float(
+                    np.sqrt(np.mean(anchor_syn_unit[anchor_row, indices].astype(np.float64) ** 2))
+                ),
                 **attrs,
             }
             rows.append(row)
@@ -619,6 +632,8 @@ def estimate_well_gain_samples(ctx: DynamicGainContext, syn_unit: np.ndarray) ->
 
     summary = {
         "anchor_file": repo_relative_path(ctx.anchor_file, root=REPO_ROOT),
+        "synthetic_reference": "ginn_target_ai",
+        "anchor_target_band": anchor.metadata.get("anchor_target_band"),
         "anchor_trace_count": int(anchor.flat_indices.size),
         "skipped_not_in_training_split": int(skipped_not_train),
         "skipped_without_valid_segments": int(skipped_no_segments),
@@ -682,7 +697,13 @@ def build_gain_volume(ctx: DynamicGainContext, fit: dict[str, Any], sample_df: p
     )
 
 
-def write_gain_npz(ctx: DynamicGainContext, gain_volume: np.ndarray, fit: dict[str, Any], volume_stats: dict[str, Any]) -> Path:
+def write_gain_npz(
+    ctx: DynamicGainContext,
+    anchor: Any,
+    gain_volume: np.ndarray,
+    fit: dict[str, Any],
+    volume_stats: dict[str, Any],
+) -> Path:
     """Thin wrapper — unpack context then delegate to ``cup.seismic.gain``."""
     path = ctx.output_dir / "dynamic_gain.npz"
     write_dynamic_gain_npz(
@@ -694,6 +715,8 @@ def write_gain_npz(ctx: DynamicGainContext, gain_volume: np.ndarray, fit: dict[s
         geometry=ctx.geometry,
         wavelet_file=repo_relative_path(ctx.wavelet_file, root=REPO_ROOT),
         lfm_file=repo_relative_path(ctx.lfm_file, root=REPO_ROOT),
+        anchor_file=repo_relative_path(ctx.anchor_file, root=REPO_ROOT),
+        anchor_target_band=str(anchor.metadata["anchor_target_band"]),
         train_mask_rms=ctx.train_mask_rms,
         fit=fit,
         volume_stats=volume_stats,
@@ -843,56 +866,10 @@ def _qc_plot_slice(mask: np.ndarray, n_sample: int, *, pad_samples: int = 25) ->
     return slice(start, end)
 
 
-def _load_well_ai_cache(
-    auto_tie_dir: Path,
-    anchor_names: np.ndarray,
-    target_samples: np.ndarray,
-) -> dict[str, np.ndarray]:
-    """Build a mapping from anchor name to filtered-LAS AI interpolated to *target_samples*."""
-    metrics_path = auto_tie_dir / "well_tie_metrics.csv"
-    if not metrics_path.exists():
-        logger.warning("well_tie_metrics.csv not found at %s, well AI track will be empty.", metrics_path)
-        return {}
-
-    metrics_df = pd.read_csv(metrics_path)
-    name_to_las: dict[str, Path] = {}
-    name_to_tdt: dict[str, Path] = {}
-    for _, row in metrics_df.iterrows():
-        norm = normalize_well_name(str(row["well_name"]))
-        las = row.get("filtered_las_file")
-        tdt = row.get("optimized_tdt_file")
-        if pd.notna(las) and pd.notna(tdt):
-            las_path = resolve_relative_path(str(las), root=REPO_ROOT)
-            tdt_path = resolve_relative_path(str(tdt), root=REPO_ROOT)
-            if las_path.exists() and tdt_path.exists():
-                name_to_las[norm] = las_path
-                name_to_tdt[norm] = tdt_path
-
-    seismic_dt_s = float(np.median(np.diff(target_samples)))
-    cache: dict[str, np.ndarray] = {}
-    for anchor_name in np.asarray(anchor_names).astype(str):
-        norm = normalize_well_name(anchor_name)
-        las_path = name_to_las.get(norm)
-        tdt_path = name_to_tdt.get(norm)
-        if las_path is None or tdt_path is None:
-            continue
-        try:
-            logset = load_vp_rho_logset_from_standard_las(las_path)
-            table = load_workflow_time_depth_table_csv(tdt_path)
-            logset_twt = tie_ops.convert_logs_from_md_to_twt(logset, None, table, seismic_dt_s)
-            ai = np.interp(
-                target_samples, logset_twt.AI.basis, logset_twt.AI.values,
-                left=np.nan, right=np.nan,
-            )
-            cache[anchor_name] = np.asarray(ai, dtype=np.float64)
-        except Exception:
-            logger.warning("Failed to load filtered LAS AI for %s", anchor_name, exc_info=True)
-    return cache
-
-
 def write_well_waveform_qc(
     ctx: DynamicGainContext,
-    syn_unit: np.ndarray,
+    anchor: Any,
+    anchor_syn_unit: np.ndarray,
     gain_volume: np.ndarray,
     sample_df: pd.DataFrame,
 ) -> dict[str, Any]:
@@ -902,28 +879,12 @@ def write_well_waveform_qc(
     trace_dir.mkdir(parents=True, exist_ok=True)
     figure_dir.mkdir(parents=True, exist_ok=True)
 
-    anchor = load_log_ai_anchor_npz(ctx.anchor_file)
-    validate_log_ai_anchor(
-        anchor,
-        sample_domain="time",
-        n_sample=int(ctx.geometry["n_sample"]),
-        n_traces=int(ctx.geometry["n_il"]) * int(ctx.geometry["n_xl"]),
-    )
-    _validate_samples_axis(np.asarray(anchor.samples, dtype=np.float64), ctx.samples, name="log_ai_anchor_time.npz")
-
-    well_ai_cache: dict[str, np.ndarray] = {}
-    if ctx.auto_tie_dir is not None:
-        well_ai_cache = _load_well_ai_cache(ctx.auto_tie_dir, anchor.anchor_names, ctx.samples)
-    else:
-        logger.warning("auto_tie_dir not resolved; well AI track will fall back to NaN.")
-
     n_sample = int(ctx.geometry["n_sample"])
     seismic_norm_flat = (ctx.seismic.reshape(-1, n_sample) / float(ctx.train_mask_rms)).astype(np.float32)
-    syn_unit_flat = syn_unit.reshape(-1, n_sample)
     gain_flat = gain_volume.reshape(-1, n_sample)
-    synthetic_dynamic_flat = syn_unit_flat * gain_flat
     lfm_flat = ctx.lfm.reshape(-1, n_sample)
     loss_mask_flat = ctx.train_loss_mask.reshape(-1, n_sample)
+    target_ai = continuous_anchor_target_ai(anchor)
 
     fit_groups = sample_df.groupby("flat_idx") if not sample_df.empty and "flat_idx" in sample_df.columns else {}
     metrics_rows: list[dict[str, Any]] = []
@@ -933,11 +894,13 @@ def write_well_waveform_qc(
         safe_name = sanitize_filename(str(anchor_names[anchor_row]))
         anchor_mask = np.asarray(anchor.anchor_mask[anchor_row], dtype=bool)
         loss_mask = np.asarray(loss_mask_flat[flat_idx], dtype=bool)
+        synthetic_unit = np.asarray(anchor_syn_unit[anchor_row], dtype=np.float64)
+        synthetic_dynamic = synthetic_unit * np.asarray(gain_flat[flat_idx], dtype=np.float64)
         finite = (
             anchor_mask
             & loss_mask
             & np.isfinite(seismic_norm_flat[flat_idx])
-            & np.isfinite(synthetic_dynamic_flat[flat_idx])
+            & np.isfinite(synthetic_dynamic)
         )
         used_sample_mask = np.zeros(n_sample, dtype=bool)
         fit_group = fit_groups.get_group(flat_idx) if hasattr(fit_groups, "groups") and flat_idx in fit_groups.groups else None
@@ -948,20 +911,17 @@ def write_well_waveform_qc(
                 used_sample_mask[start:end] = True
 
         lfm_ai = np.asarray(lfm_flat[flat_idx], dtype=np.float64)
-        well_ai = well_ai_cache.get(str(anchor_names[anchor_row]))
-        if well_ai is None:
-            well_ai = np.full(n_sample, np.nan, dtype=np.float64)
-            logger.warning("No filtered LAS AI for anchor %s, well AI track will be empty.", anchor_names[anchor_row])
-        reflectivity = _reflectivity_from_ai(well_ai)
+        ginn_target_ai = np.asarray(target_ai[anchor_row], dtype=np.float64)
+        reflectivity = _reflectivity_from_ai(ginn_target_ai)
         trace_df = pd.DataFrame(
             {
                 "twt_s": ctx.samples,
                 "seismic_norm": seismic_norm_flat[flat_idx],
-                "synthetic_unit": syn_unit_flat[flat_idx],
+                "synthetic_unit_ginn_target": synthetic_unit,
                 "dynamic_gain": gain_flat[flat_idx],
-                "synthetic_dynamic": synthetic_dynamic_flat[flat_idx],
-                "residual_dynamic": seismic_norm_flat[flat_idx] - synthetic_dynamic_flat[flat_idx],
-                "well_ai": well_ai,
+                "synthetic_dynamic": synthetic_dynamic,
+                "residual_dynamic": seismic_norm_flat[flat_idx] - synthetic_dynamic,
+                "ginn_target_ai": ginn_target_ai,
                 "lfm_ai": lfm_ai,
                 "reflectivity": reflectivity,
                 "anchor_mask": anchor_mask,
@@ -976,9 +936,10 @@ def write_well_waveform_qc(
 
         plot_slice = _qc_plot_slice(finite | used_sample_mask, n_sample)
         plot_samples = np.asarray(ctx.samples[plot_slice], dtype=np.float64)
-        synthetic_values = np.asarray(synthetic_dynamic_flat[flat_idx, plot_slice], dtype=np.float64)
+        synthetic_values = np.asarray(synthetic_dynamic[plot_slice], dtype=np.float64)
         seismic_values = np.asarray(seismic_norm_flat[flat_idx, plot_slice], dtype=np.float64)
-        well_ai_plot = np.asarray(well_ai[plot_slice], dtype=np.float64)
+        lfm_ai_plot = np.asarray(lfm_ai[plot_slice], dtype=np.float64)
+        ginn_target_ai_plot = np.asarray(ginn_target_ai[plot_slice], dtype=np.float64)
         reflectivity_plot = np.asarray(reflectivity[plot_slice], dtype=np.float64)
         synthetic_trace = grid.Seismic(
             synthetic_values,
@@ -998,19 +959,22 @@ def write_well_waveform_qc(
             xcorr_basis = synthetic_trace.sampling_rate * np.arange(-(synthetic_trace.size - 1), synthetic_trace.size)
             xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
             dxcorr = dynamic_normalized_xcorr(seismic_trace, synthetic_trace)
+        lfm_log = grid.Log(lfm_ai_plot, plot_samples, "twt", name="LFM")
+        ginn_target_log = grid.Log(ginn_target_ai_plot, plot_samples, "twt", name="GINN target")
         fig, _ = plot_well_waveform_qc(
-            grid.Log(well_ai_plot, plot_samples, "twt", name="Well AI"),
+            [lfm_log, ginn_target_log],
             grid.Reflectivity(reflectivity_plot, plot_samples, "twt", name="Reflectivity"),
             synthetic_trace,
             seismic_trace,
             xcorr,
             dxcorr,
             figsize=(12.0, 7.5),
+            synthetic_ai=ginn_target_log,
         )
         fig.savefig(figure_path, dpi=180, bbox_inches="tight")
         plt.close(fig)
 
-        metrics = _waveform_metrics(seismic_norm_flat[flat_idx], synthetic_dynamic_flat[flat_idx], finite)
+        metrics = _waveform_metrics(seismic_norm_flat[flat_idx], synthetic_dynamic, finite)
         metrics_rows.append(
             {
                 "anchor_name": str(anchor_names[anchor_row]),
@@ -1038,7 +1002,8 @@ def write_well_waveform_qc(
 
 def write_outputs(
     ctx: DynamicGainContext,
-    syn_unit: np.ndarray,
+    anchor: Any,
+    anchor_syn_unit: np.ndarray,
     sample_df: pd.DataFrame,
     fixed_payload: dict[str, Any],
     well_gain: pd.DataFrame,
@@ -1049,7 +1014,7 @@ def write_outputs(
     volume_stats: dict[str, Any],
     sample_summary: dict[str, Any],
 ) -> None:
-    gain_npz = write_gain_npz(ctx, gain_volume, fit, volume_stats)
+    gain_npz = write_gain_npz(ctx, anchor, gain_volume, fit, volume_stats)
     fixed_payload = {
         **fixed_payload,
         "train_mask_rms": float(ctx.train_mask_rms),
@@ -1060,7 +1025,7 @@ def write_outputs(
     cluster_gain.to_csv(ctx.output_dir / "dynamic_gain_cluster_medians.csv", index=False, encoding="utf-8-sig")
     attr_metrics.to_csv(ctx.output_dir / "dynamic_gain_attribute_metrics.csv", index=False, encoding="utf-8-sig")
     write_qc_figures(ctx, sample_df, attr_metrics, well_gain, cluster_gain, fit, gain_volume)
-    well_qc_summary = write_well_waveform_qc(ctx, syn_unit, gain_volume, sample_df)
+    well_qc_summary = write_well_waveform_qc(ctx, anchor, anchor_syn_unit, gain_volume, sample_df)
 
     summary = {
         "schema_version": SCHEMA_VERSION,
@@ -1076,6 +1041,11 @@ def write_outputs(
             "name": NORMALIZATION,
             "train_mask_rms": float(ctx.train_mask_rms),
             "split_metadata": ctx.split_metadata,
+        },
+        "gain_reference": {
+            "synthetic": "unit_wavelet_ginn_target_ai",
+            "anchor_target_band": anchor.metadata["anchor_target_band"],
+            "observation": "seismic_raw_divided_by_train_mask_rms",
         },
         "fit": fit,
         "attribute_metrics": attr_metrics.to_dict(orient="records"),
@@ -1104,12 +1074,27 @@ def main() -> None:
     )
     args = parse_args()
     ctx = load_context(args)
-    syn_unit = build_unit_synthetic(
-        ctx.lfm,
+    anchor = load_log_ai_anchor_npz(ctx.anchor_file)
+    validate_log_ai_anchor(
+        anchor,
+        sample_domain="time",
+        n_sample=int(ctx.geometry["n_sample"]),
+        n_traces=int(ctx.geometry["n_il"]) * int(ctx.geometry["n_xl"]),
+    )
+    expected_anchor_band = "lowpass_reference_to_ginn_cutoff"
+    if anchor.metadata.get("anchor_target_band") != expected_anchor_band:
+        raise ValueError(
+            "Dynamic gain requires GINN-target anchors; "
+            f"expected anchor_target_band={expected_anchor_band!r}, "
+            f"got {anchor.metadata.get('anchor_target_band')!r}."
+        )
+    _validate_samples_axis(np.asarray(anchor.samples, dtype=np.float64), ctx.samples, name="log_ai_anchor_time.npz")
+    anchor_syn_unit = build_anchor_target_unit_synthetic(
+        anchor,
         ctx.unit_wavelet,
         batch_traces=int(ctx.script_cfg["runtime"].get("forward_batch_traces", 256)),
     )
-    sample_df, sample_summary = estimate_well_gain_samples(ctx, syn_unit)
+    sample_df, sample_summary = estimate_well_gain_samples(ctx, anchor, anchor_syn_unit)
     spatial_cfg = dict(ctx.script_cfg["spatial_debias"])
     sample_df = assign_spatial_clusters(
         sample_df,
@@ -1121,7 +1106,8 @@ def main() -> None:
     gain_volume, volume_stats = build_gain_volume(ctx, fit, sample_df)
     write_outputs(
         ctx,
-        syn_unit,
+        anchor,
+        anchor_syn_unit,
         sample_df,
         fixed_payload,
         well_gain,

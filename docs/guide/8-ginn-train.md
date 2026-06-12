@@ -47,8 +47,7 @@ wavelet_dt: 0.001
 wavelet_length: 201
 
 gain_source: fixed_gain
-fixed_gain: null
-fixed_gain_num_traces: 256
+fixed_gain: <recommended_fixed_gain>
 dynamic_gain_model: null
 
 include_lfm_input: true
@@ -114,9 +113,9 @@ save_every: 5
 
 ### 振幅补偿
 
-V1 使用一个全局振幅增益，让正演出的合成记录和观测地震处在可比较的量级。它只处理整体振幅尺度，不解决随空间或时间变化的增益问题。
+固定增益让正演出的合成记录和观测地震处在可比较的量级。它只处理整体振幅尺度，不解决随空间或时间变化的增益问题。
 
-当 `fixed_gain: null` 时，训练端从目标层内抽样若干道，用单位子波对 LFM 做正演，计算合成记录的 RMS，再与同批观测地震归一化后的 RMS 比较，自动估计增益。抽样道数由 `fixed_gain_num_traces` 控制。
+`gain_source: fixed_gain` 时必须显式填写 `fixed_gain`，推荐使用 dynamic gain 旁路输出的 `recommended_fixed_gain.json`。训练端不再根据 LFM 自动估计 gain，因为 LFM 与 GINN target 的频带不同；用 LFM 合成记录作分母会把缺失频带的反射能量误算成振幅增益。
 
 `dynamic_gain_model` 是旁路生成的随样点变化增益体，主线不默认启用。时间域旁路的实现规格见 [dynamic-gain.md](dynamic-gain.md)；它必须使用和本训练端一致的 `seismic_raw / train_mask_rms` 归一化口径，并会同时给出一个人工可选的 recommended fixed gain。
 

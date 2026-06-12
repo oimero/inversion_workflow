@@ -63,8 +63,7 @@ class GINNConfig:
     # 标量；dynamic_gain_model 是随样点变化的增益体，通常应配合
     # include_dynamic_gain_input=True，让网络看到增益上下文。
     gain_source: GainSource = "fixed_gain"  # 振幅补偿来源：固定标量增益或动态增益体。
-    fixed_gain: float | None = None  # 固定标量增益；gain_source=fixed_gain 且为空时自动估计。
-    fixed_gain_num_traces: int = 256  # 自动估计固定增益时采样的有效道数。
+    fixed_gain: float | None = None  # 固定标量增益；使用 fixed_gain 时必须显式配置。
     dynamic_gain_model: Path | None = None  # gain_source=dynamic_gain_model 时使用的预计算动态增益体。
 
     # ── 网络结构 ──────────────────────────────────────────────
@@ -182,10 +181,13 @@ class GINNConfig:
             )
         if self.gain_source == "dynamic_gain_model" and self.dynamic_gain_model is None:
             raise ValueError("dynamic_gain_model is required when gain_source='dynamic_gain_model'.")
+        if self.gain_source == "fixed_gain" and self.fixed_gain is None:
+            raise ValueError(
+                "fixed_gain is required when gain_source='fixed_gain'; "
+                "use the GINN-target-based recommendation from scripts/dynamic_gain.py."
+            )
         if self.fixed_gain is not None and self.fixed_gain <= 0.0:
             raise ValueError(f"fixed_gain must be positive when provided, got {self.fixed_gain}.")
-        if self.fixed_gain_num_traces <= 0:
-            raise ValueError(f"fixed_gain_num_traces must be positive, got {self.fixed_gain_num_traces}.")
         if self.wavelet_source == "ricker_wavelet":
             if self.wavelet_freq is None or self.wavelet_freq <= 0.0:
                 raise ValueError(f"wavelet_freq must be positive for ricker_wavelet, got {self.wavelet_freq}.")

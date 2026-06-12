@@ -61,6 +61,7 @@ from cup.seismic.gain import (
     write_gain_npz as write_dynamic_gain_npz,
 )
 from cup.seismic.wavelet import load_wavelet_csv, validate_wavelet_dt
+from cup.well.assets import normalize_well_name
 from ginn.anchor import load_log_ai_anchor_npz, validate_log_ai_anchor
 from ginn.config import GINNConfig
 from ginn.data import (
@@ -633,7 +634,8 @@ def estimate_well_gain_samples(
     summary = {
         "anchor_file": repo_relative_path(ctx.anchor_file, root=REPO_ROOT),
         "synthetic_reference": "ginn_target_ai",
-        "anchor_target_band": anchor.metadata.get("anchor_target_band"),
+        "ginn_target_source": anchor.metadata.get("ginn_target_source"),
+        "ginn_target_semantics": anchor.metadata.get("ginn_target_semantics"),
         "anchor_trace_count": int(anchor.flat_indices.size),
         "skipped_not_in_training_split": int(skipped_not_train),
         "skipped_without_valid_segments": int(skipped_no_segments),
@@ -716,7 +718,10 @@ def write_gain_npz(
         wavelet_file=repo_relative_path(ctx.wavelet_file, root=REPO_ROOT),
         lfm_file=repo_relative_path(ctx.lfm_file, root=REPO_ROOT),
         anchor_file=repo_relative_path(ctx.anchor_file, root=REPO_ROOT),
-        anchor_target_band=str(anchor.metadata["anchor_target_band"]),
+        ginn_target_source=str(anchor.metadata["ginn_target_source"]),
+        ginn_target_semantics=str(anchor.metadata["ginn_target_semantics"]),
+        diagnostic_ginn_cutoff_hz=float(anchor.metadata["diagnostic_ginn_cutoff_hz"]),
+        filtered_las_sources=dict(anchor.metadata.get("filtered_las_sources") or {}),
         train_mask_rms=ctx.train_mask_rms,
         fit=fit,
         volume_stats=volume_stats,
@@ -845,12 +850,18 @@ def _waveform_metrics(observed: np.ndarray, synthetic: np.ndarray, mask: np.ndar
     mae = float(np.mean(np.abs(diff))) if diff.size else float("nan")
     rmse = float(np.sqrt(np.mean(diff**2))) if diff.size else float("nan")
     bias = float(np.mean(syn_v - obs_v)) if diff.size else float("nan")
+    nmae = (
+        float(np.sum(np.abs(diff)) / max(float(np.sum(np.abs(obs_v))), 1e-12))
+        if diff.size
+        else float("nan")
+    )
     return {
         "n_samples": int(valid.sum()),
         "corr": corr,
         "mae": mae,
         "rmse": rmse,
         "bias": bias,
+        "nmae": nmae,
         "observed_rms": obs_rms,
         "synthetic_rms": syn_rms,
         "rms_ratio": float(syn_rms / obs_rms) if np.isfinite(obs_rms) and obs_rms > 0.0 else float("nan"),
@@ -864,6 +875,62 @@ def _qc_plot_slice(mask: np.ndarray, n_sample: int, *, pad_samples: int = 25) ->
     start = max(0, int(indices[0]) - int(pad_samples))
     end = min(int(n_sample), int(indices[-1]) + int(pad_samples) + 1)
     return slice(start, end)
+
+
+def _constraint_horizon_markers_by_well(ctx: DynamicGainContext) -> dict[str, list[tuple[float, str]]]:
+    constraints_dir = ctx.anchor_file.parent
+    point_path = constraints_dir / "well_constraint_points.csv"
+    summary_path = constraints_dir / "run_summary.json"
+    if not point_path.exists() or not summary_path.exists():
+        return {}
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    horizon_names = {
+        f"horizon_{index}": Path(str(item.get("file", f"horizon_{index}"))).name
+        for index, item in enumerate(summary.get("horizons") or [])
+    }
+    points = pd.read_csv(
+        point_path,
+        usecols=["well_name", "zone_name", "u_in_zone", "twt_s"],
+    )
+    markers_by_well: dict[str, list[tuple[float, str]]] = {}
+    for well_name, group in points.groupby("well_name", sort=False):
+        estimates: dict[str, list[float]] = {}
+        for zone_name, zone_group in group.groupby("zone_name", sort=False):
+            parts = str(zone_name).split("->", maxsplit=1)
+            if len(parts) != 2 or len(zone_group) < 2:
+                continue
+            u = zone_group["u_in_zone"].to_numpy(dtype=np.float64)
+            twt = zone_group["twt_s"].to_numpy(dtype=np.float64)
+            valid = np.isfinite(u) & np.isfinite(twt)
+            if int(np.count_nonzero(valid)) < 2 or np.ptp(u[valid]) <= 0.0:
+                continue
+            slope, intercept = np.polyfit(u[valid], twt[valid], deg=1)
+            estimates.setdefault(parts[0], []).append(float(intercept))
+            estimates.setdefault(parts[1], []).append(float(intercept + slope))
+        markers_by_well[normalize_well_name(str(well_name))] = sorted(
+            [
+                (float(np.mean(values)), horizon_names.get(name, name))
+                for name, values in estimates.items()
+                if values
+            ],
+            key=lambda item: item[0],
+        )
+    return markers_by_well
+
+
+def _anchor_horizon_markers(
+    anchor_name: str,
+    markers_by_well: dict[str, list[tuple[float, str]]],
+) -> list[tuple[float, str]]:
+    estimates: dict[str, list[float]] = {}
+    for well_name in str(anchor_name).split(";"):
+        for twt_s, label in markers_by_well.get(normalize_well_name(well_name), ()):
+            estimates.setdefault(label, []).append(float(twt_s))
+    return sorted(
+        [(float(np.mean(values)), label) for label, values in estimates.items() if values],
+        key=lambda item: item[0],
+    )
 
 
 def write_well_waveform_qc(
@@ -889,6 +956,7 @@ def write_well_waveform_qc(
     fit_groups = sample_df.groupby("flat_idx") if not sample_df.empty and "flat_idx" in sample_df.columns else {}
     metrics_rows: list[dict[str, Any]] = []
     anchor_names = np.asarray(anchor.anchor_names).astype(str)
+    horizon_markers_by_well = _constraint_horizon_markers_by_well(ctx)
     for anchor_row, flat_idx_value in enumerate(np.asarray(anchor.flat_indices, dtype=np.int64)):
         flat_idx = int(flat_idx_value)
         safe_name = sanitize_filename(str(anchor_names[anchor_row]))
@@ -938,7 +1006,6 @@ def write_well_waveform_qc(
         plot_samples = np.asarray(ctx.samples[plot_slice], dtype=np.float64)
         synthetic_values = np.asarray(synthetic_dynamic[plot_slice], dtype=np.float64)
         seismic_values = np.asarray(seismic_norm_flat[flat_idx, plot_slice], dtype=np.float64)
-        lfm_ai_plot = np.asarray(lfm_ai[plot_slice], dtype=np.float64)
         ginn_target_ai_plot = np.asarray(ginn_target_ai[plot_slice], dtype=np.float64)
         reflectivity_plot = np.asarray(reflectivity[plot_slice], dtype=np.float64)
         synthetic_trace = grid.Seismic(
@@ -959,22 +1026,34 @@ def write_well_waveform_qc(
             xcorr_basis = synthetic_trace.sampling_rate * np.arange(-(synthetic_trace.size - 1), synthetic_trace.size)
             xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
             dxcorr = dynamic_normalized_xcorr(seismic_trace, synthetic_trace)
-        lfm_log = grid.Log(lfm_ai_plot, plot_samples, "twt", name="LFM")
         ginn_target_log = grid.Log(ginn_target_ai_plot, plot_samples, "twt", name="GINN target")
+        metrics = _waveform_metrics(seismic_norm_flat[flat_idx], synthetic_dynamic, finite)
+        finite_gain = finite & np.isfinite(gain_flat[flat_idx]) & (gain_flat[flat_idx] > 0.0)
+        median_gain = (
+            float(np.median(gain_flat[flat_idx][finite_gain]))
+            if np.any(finite_gain)
+            else float("nan")
+        )
         fig, _ = plot_well_waveform_qc(
-            [lfm_log, ginn_target_log],
+            ginn_target_log,
             grid.Reflectivity(reflectivity_plot, plot_samples, "twt", name="Reflectivity"),
             synthetic_trace,
             seismic_trace,
             xcorr,
             dxcorr,
             figsize=(12.0, 7.5),
-            synthetic_ai=ginn_target_log,
+            title=(
+                f"Dynamic gain synthetic | corr={metrics['corr']:.3f}, "
+                f"nmae={metrics['nmae']:.3f}, median gain={median_gain:.3g}"
+            ),
+            horizon_markers=_anchor_horizon_markers(
+                str(anchor_names[anchor_row]),
+                horizon_markers_by_well,
+            ),
         )
         fig.savefig(figure_path, dpi=180, bbox_inches="tight")
         plt.close(fig)
 
-        metrics = _waveform_metrics(seismic_norm_flat[flat_idx], synthetic_dynamic, finite)
         metrics_rows.append(
             {
                 "anchor_name": str(anchor_names[anchor_row]),
@@ -1044,7 +1123,9 @@ def write_outputs(
         },
         "gain_reference": {
             "synthetic": "unit_wavelet_ginn_target_ai",
-            "anchor_target_band": anchor.metadata["anchor_target_band"],
+            "ginn_target_source": anchor.metadata["ginn_target_source"],
+            "ginn_target_semantics": anchor.metadata["ginn_target_semantics"],
+            "diagnostic_ginn_cutoff_hz": anchor.metadata["diagnostic_ginn_cutoff_hz"],
             "observation": "seismic_raw_divided_by_train_mask_rms",
         },
         "fit": fit,
@@ -1081,13 +1162,6 @@ def main() -> None:
         n_sample=int(ctx.geometry["n_sample"]),
         n_traces=int(ctx.geometry["n_il"]) * int(ctx.geometry["n_xl"]),
     )
-    expected_anchor_band = "lowpass_reference_to_ginn_cutoff"
-    if anchor.metadata.get("anchor_target_band") != expected_anchor_band:
-        raise ValueError(
-            "Dynamic gain requires GINN-target anchors; "
-            f"expected anchor_target_band={expected_anchor_band!r}, "
-            f"got {anchor.metadata.get('anchor_target_band')!r}."
-        )
     _validate_samples_axis(np.asarray(anchor.samples, dtype=np.float64), ctx.samples, name="log_ai_anchor_time.npz")
     anchor_syn_unit = build_anchor_target_unit_synthetic(
         anchor,

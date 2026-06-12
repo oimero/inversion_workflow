@@ -73,7 +73,7 @@ ginn_inversion:
 
 ### 井上波阻抗 QC
 
-反演结束后自动生成井上波阻抗 QC。脚本从 checkpoint 配置中定位 `log_ai_anchor_time.npz`，再通过 anchor 元数据找回第六步的 `well_constraint_points.csv` 获取全频井 AI。每口 anchor 井输出一张三线对比图（灰线全频井 AI、蓝线低频参考、红线 GINN 预测 AI）和对应的 QC 指标。
+反演结束后自动生成井上波阻抗 QC。脚本从 checkpoint 配置中定位 `log_ai_anchor_time.npz`，再通过 anchor 元数据找回第六步的 `well_constraint_points.csv` 获取 reference AI。每口 anchor 井输出一张三线对比图（灰线 reference AI、蓝线实际 GINN target、红线 GINN 预测 AI）和对应的 QC 指标。
 
 ---
 
@@ -116,8 +116,8 @@ ginn_inversion:
 | `figures/prediction_vs_lfm_crossplot.png` | 预测波阻抗 vs LFM 抽样交会图 |
 | `qc/prediction_context_time.npz` | 可选 QC 包，包含 LFM 体和 mask 体（默认不写） |
 | `trainer_context/` | 训练上下文目录（Trainer 初始化时自动生成，不删） |
-| `well_qc/figures/well_qc_*.png` | 每口 anchor 井的预测 AI vs 低频/全频 AI 对比图 |
-| `well_qc/traces/well_qc_*.csv` | 全频井 AI、低频井 AI、预测 AI 的逐样点明细 |
+| `well_qc/figures/well_qc_*.png` | 每口 anchor 井的预测 AI vs GINN target/reference AI 对比图 |
+| `well_qc/traces/well_qc_*.csv` | reference AI、GINN target AI、预测 AI 的逐样点明细 |
 | `well_qc/well_qc_metrics.csv` | 逐 anchor 井阻抗 QC 指标 |
 
 ### `stage1_ginn_base_ai_time.npz`

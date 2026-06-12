@@ -33,7 +33,7 @@ from cup.seismic.wavelet import (
     make_wavelet,
     validate_wavelet_dt,
 )
-from ginn.anchor import WellControlData, build_well_control_data
+from ginn.anchor import TIME_TARGET_SEMANTICS, WellControlData, build_well_control_data
 from ginn.config import GINNConfig
 from ginn.masking import build_eroded_loss_mask as _build_eroded_loss_mask
 from ginn.masking import build_residual_taper as _build_residual_taper
@@ -289,7 +289,7 @@ def _validate_dynamic_gain_npz_contract(
 
     metadata = _json_scalar_to_dict(archive["metadata_json"])
     expected = {
-        "schema_version": "dynamic_gain_v2",
+        "schema_version": "dynamic_gain_v3",
         "sample_domain": "time",
         "sample_unit": "s",
         "normalization": "seismic_raw_divided_by_train_mask_rms",
@@ -306,11 +306,30 @@ def _validate_dynamic_gain_npz_contract(
             "Dynamic gain metadata gain_reference must be "
             "'unit_wavelet_ginn_target_synthetic_to_normalized_observation'."
         )
-    if metadata.get("anchor_target_band") != "lowpass_reference_to_ginn_cutoff":
+    target_source = str(metadata.get("ginn_target_source", ""))
+    if target_source not in TIME_TARGET_SEMANTICS:
         raise ValueError(
-            "Dynamic gain metadata anchor_target_band must be "
-            "'lowpass_reference_to_ginn_cutoff'."
+            "Dynamic gain metadata ginn_target_source must be one of "
+            f"{sorted(TIME_TARGET_SEMANTICS)}, got {target_source!r}."
         )
+    expected_semantics = TIME_TARGET_SEMANTICS[target_source]
+    if metadata.get("ginn_target_semantics") != expected_semantics:
+        raise ValueError(
+            "Dynamic gain metadata ginn_target_semantics must be "
+            f"{expected_semantics!r} for source {target_source!r}."
+        )
+    diagnostic_cutoff = float(metadata.get("diagnostic_ginn_cutoff_hz", np.nan))
+    if not np.isfinite(diagnostic_cutoff) or diagnostic_cutoff <= 0.0:
+        raise ValueError(
+            "Dynamic gain metadata diagnostic_ginn_cutoff_hz must be positive finite, "
+            f"got {diagnostic_cutoff}."
+        )
+    if target_source == "auto_tie_filtered_las":
+        filtered_sources = metadata.get("filtered_las_sources")
+        if not isinstance(filtered_sources, dict) or not filtered_sources:
+            raise ValueError(
+                "auto_tie_filtered_las dynamic gain metadata must contain non-empty filtered_las_sources."
+            )
     train_mask_rms = float(metadata.get("train_mask_rms", np.nan))
     if not np.isfinite(train_mask_rms) or train_mask_rms <= 0.0:
         raise ValueError(f"Dynamic gain metadata train_mask_rms must be positive finite, got {train_mask_rms}.")
@@ -376,14 +395,14 @@ def _validate_dynamic_gain_npz_contract(
 
 
 def load_dynamic_gain_model(gain_model_file: Path, seismic_geometry: dict[str, Any] | None = None) -> np.ndarray:
-    """Load a time-domain ``dynamic_gain_v2`` NPZ volume."""
+    """Load a time-domain ``dynamic_gain_v3`` NPZ volume."""
     gain_path = Path(gain_model_file)
     if not gain_path.exists():
         raise FileNotFoundError(gain_path)
 
     if gain_path.suffix.lower() != ".npz":
         raise ValueError(
-            f"Dynamic gain model must be a dynamic_gain_v2 .npz file, got suffix {gain_path.suffix!r}: {gain_path}"
+            f"Dynamic gain model must be a dynamic_gain_v3 .npz file, got suffix {gain_path.suffix!r}: {gain_path}"
         )
 
     with np.load(gain_path, allow_pickle=False) as archive:

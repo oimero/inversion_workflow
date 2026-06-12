@@ -50,6 +50,7 @@ from ginn_depth.prior import (
     save_well_resolution_prior_npz,
     summarize_well_resolution_prior,
 )
+from ginn.anchor import SCHEMA_VERSION as ANCHOR_SCHEMA_VERSION
 from ginn.anchor import build_log_ai_anchor_bundle, save_log_ai_anchor_npz
 from ginn_depth.data import load_lfm_depth_npz
 from wtie.optimize import tie as tie_utils
@@ -1062,7 +1063,7 @@ def main() -> None:
                     },
                     "stage_1_log_ai_anchor": {
                         "path": repo_relative_path(anchor_path, root=REPO_ROOT),
-                        "schema": "ginn_log_ai_anchor_v1",
+                        "schema": ANCHOR_SCHEMA_VERSION,
                         "contains_residual_log_ai": False,
                         "anchor_target_band": anchor_metadata["anchor_target_band"],
                         "reserved_anchor_types": ["well", "facies_control"],

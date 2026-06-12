@@ -11,7 +11,7 @@ Boundary
 --------
 - Functions assume a time-domain seismic volume and an LFM volume already loaded
   in memory.  I/O, CLI, and figure-rendering are kept in ``scripts/dynamic_gain.py``.
-- NPZ export uses the ``dynamic_gain_v2`` schema.
+- NPZ export uses the ``dynamic_gain_v3`` schema.
 
 Core public objects
 -------------------
@@ -23,7 +23,7 @@ Core public objects
 6. fit_gain_relationship: OLS log-gain vs log-attribute.
 7. compute_attribute_axis: compute a moving-window attribute over a flat trace array.
 8. build_gain_volume: apply the fitted relationship to the full seismic volume.
-9. write_gain_npz: write the dynamic_gain_v2 NPZ file.
+9. write_gain_npz: write the dynamic_gain_v3 NPZ file.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ from cup.utils.statistics import ols_fit, pearson_r, radius_connected_components
 # are rejected with a clear error message.
 CANDIDATE_ATTRIBUTES = ("seismic_rms", "seismic_abs_mean", "seismic_abs_p90")
 
-SCHEMA_VERSION = "dynamic_gain_v2"
+SCHEMA_VERSION = "dynamic_gain_v3"
 GAIN_REFERENCE = "unit_wavelet_ginn_target_synthetic_to_normalized_observation"
 NORMALIZATION = "seismic_raw_divided_by_train_mask_rms"
 
@@ -434,13 +434,16 @@ def write_gain_npz(
     wavelet_file: str,
     lfm_file: str,
     anchor_file: str,
-    anchor_target_band: str,
+    ginn_target_source: str,
+    ginn_target_semantics: str,
+    diagnostic_ginn_cutoff_hz: float,
+    filtered_las_sources: dict[str, str],
     train_mask_rms: float,
     fit: dict[str, Any],
     volume_stats: dict[str, Any],
     lfm_metadata: dict[str, Any],
 ) -> None:
-    """Write ``dynamic_gain.npz`` conforming to the ``dynamic_gain_v2`` schema."""
+    """Write ``dynamic_gain.npz`` conforming to the ``dynamic_gain_v3`` schema."""
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "sample_domain": "time",
@@ -452,7 +455,10 @@ def write_gain_npz(
         "unit_wavelet_file": wavelet_file,
         "ai_lfm_file": lfm_file,
         "log_ai_anchor_file": anchor_file,
-        "anchor_target_band": anchor_target_band,
+        "ginn_target_source": ginn_target_source,
+        "ginn_target_semantics": ginn_target_semantics,
+        "diagnostic_ginn_cutoff_hz": float(diagnostic_ginn_cutoff_hz),
+        "filtered_las_sources": dict(filtered_las_sources),
         "target_layer": lfm_metadata.get("target_layer"),
         "horizons": lfm_metadata.get("horizons"),
         "fit": fit,

@@ -209,12 +209,12 @@
 | `zone_name` / `u_in_zone` | 所属层段和层内比例位置 |
 | `reference_ai` / `reference_log_ai` | 轻量清洗并低通到 `f_reference` 的参考井曲线 |
 | `lfm_ai` / `lfm_log_ai` | 低通到 `f_lfm` 的 LFM 控制 |
-| `ginn_target_ai` / `ginn_target_log_ai` | 低通到 `f_ginn` 的 GINN 井 anchor 目标 |
-| `ginn_band_log_ai` | `ginn_target_log_ai - lfm_log_ai` |
+| `ginn_target_ai` / `ginn_target_log_ai` | 配置选择的 GINN 井 anchor 目标：诊断低通或第四步 filtered LAS 的直接 TWT 投影 |
+| `ginn_band_log_ai` | `ginn_target_log_ai - lfm_log_ai`；filtered 模式下是经验增量，不是严格频带 |
 | `enhance_residual_log_ai` | `reference_log_ai - ginn_target_log_ai` |
 | `observed_well_sample` | 是否为可进入监督、统计和控制点的真实井样点 |
 | `short_gap_interpolated` / `hampel_conditioned` | 是否仅作为滤波支撑的插值或异常替换样点 |
-| `frequency_band_valid` | 三条低通曲线在该点是否都有效 |
+| `frequency_band_valid` | reference、LFM 和所选 GINN target 在该点是否都有效；filtered 模式下不表示三条低通 |
 | `weight` | 由第五步批量合成质量等因素得到的约束权重 |
 
 `inline_float`、`xline_float`、`twt_s` 是空间事实的规范坐标；`flat_idx` / `seismic_sample_index` 只能在同一地震几何和全局采样轴内解释。任何体采样入口必须由 `twt_s` 在当前采样轴上重新求最近索引，并用 `seismic_sample_index` 做交叉校验，不能直接信任派生索引。
@@ -231,6 +231,9 @@
 | `status` | `selected` / `rejected` / `failed` |
 | `route` | 第四步标定路径 |
 | `batch_corr` / `batch_nmae` | 第五步批量合成指标 |
+| `ginn_target_source` | 整次运行统一的目标来源：`frequency_lowpass` / `auto_tie_filtered_las` |
+| `ginn_target_corr` / `ginn_target_nmae` / `ginn_target_scale` | 所选目标在第六步同窗正演评价中的指标 |
+| `ginn_target_diagnostic_cutoff_hz` | cutoff sweep 选中的诊断频率；filtered 模式下仅用于 reference 与对照 |
 | `control_point_count` | 有效样点数 |
 | `high_supervision_eligible` | 是否实际进入 enhance 高频监督和高频统计；默认斜井为 false |
 | `high_supervision_point_count` | 实际进入 enhance 高频监督和高频统计的样点数 |
@@ -267,10 +270,10 @@
 |----------|------|
 | `well_name` / `route` | 参与诊断的井和第四步标定路径 |
 | `cutoff_hz` | 候选 GINN 截止频率 |
-| `status` | ok / failed / manual |
+| `status` | `ok` / `failed` / `manual` / `invalid_negative_scale` |
 | `corr` | 低通 AI 正演合成记录与井旁地震道的相关系数 |
 | `nmae` | 低通 AI 正演合成记录与井旁地震道的归一化绝对误差 |
-| `scale` | 最小二乘缩放系数 |
+| `scale` | 正值最小二乘缩放系数；非正值不允许通过反极性参与聚合 |
 | `n_eval_samples` | 参与正演匹配评价的样点数 |
 | `wavelet_file` | 第五步最终全局子波路径 |
 | `reason` | 失败原因，仅 failed 行有值 |
@@ -289,6 +292,10 @@
 | `p25_nmae` / `p75_nmae` | 误差四分位范围 |
 | `median_scale` | 最小二乘缩放系数中位数 |
 | `median_n_eval_samples` | 参与评价样点数中位数 |
+
+### `ginn_target_comparison.csv` — 诊断
+
+在相同地震窗、observed mask 和共识子波下，逐井比较 selected frequency lowpass 与第四步 filtered LAS target。`scale<=0` 的记录标记为 `invalid_negative_scale`，不进入空间簇聚合。
 
 ### `well_anchor_conflicts.csv` — 诊断（可选）
 
@@ -333,7 +340,7 @@
 ```
 第六步 well_constraints.py
   ├─ lfm_control_points.csv         → 第七步 lfm_precomputed.py（点级 AI 控制）
-  ├─ log_ai_anchor_time.npz         → 第八步 ginn_train.py（ginn_target_log_ai 井约束）
+  ├─ log_ai_anchor_time.npz         → 第八步 ginn_train.py（ginn_log_ai_anchor_v2）
   ├─ well_high_supervision_time.npz → enhance 训练（enhance_residual_log_ai，schema v2）
   └─ well_high_stats_*.json/csv     → enhance 合成器（统计驱动生成，默认只含直井）
 ```
@@ -350,7 +357,7 @@
 
 ## 旁路 · dynamic_gain.py
 
-Dynamic gain 旁路，置于第七步之后、第八步之前。读取第五步 `selected_wavelet.csv`、第六步 `log_ai_anchor_time.npz` 和第七步 `ai_lfm_time.npz`。井点 gain 必须由第六步的 GINN target 阻抗合成记录估计，LFM 只提供训练空间几何、mask 和 QC 对照，不得作为 gain 分母。脚本产出 `dynamic_gain.npz` 和若干诊断 CSV（`dynamic_gain_samples.csv`、`dynamic_gain_well_medians.csv` 等）；诊断 CSV 仅供人工审阅，`dynamic_gain.npz` 可由第八步按配置读取。
+Dynamic gain 旁路，置于第七步之后、第八步之前。读取第五步 `selected_wavelet.csv`、第六步 `ginn_log_ai_anchor_v2` 和第七步 `ai_lfm_time.npz`。井点 gain 必须由第六步实际选择的 GINN target 阻抗合成记录估计，LFM 只提供训练空间几何、mask 和 QC 对照，不得作为 gain 分母。脚本产出 `dynamic_gain_v3` NPZ 和若干诊断 CSV。
 
 ---
 

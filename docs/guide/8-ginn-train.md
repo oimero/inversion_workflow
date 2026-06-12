@@ -23,7 +23,7 @@ python scripts/ginn_train.py --config experiments/ginn/train.yaml
 |------|------|------|
 | 地震数据 | 时间域地震体 | 观测地震道和 inline/xline/time 几何 |
 | 第五步 | 全局子波 | 物理正演的褶积子波 |
-| 第六步 | `log_ai_anchor_time.npz` | 可选井上低频 log-AI anchor 监督 |
+| 第六步 | `log_ai_anchor_time.npz` | 可选井上 GINN target log-AI anchor 监督 |
 | 第七步 | 波阻抗低频模型 NPZ | LFM 体、目标层 metadata、层位路径 |
 
 ---
@@ -115,7 +115,7 @@ save_every: 5
 
 固定增益让正演出的合成记录和观测地震处在可比较的量级。它只处理整体振幅尺度，不解决随空间或时间变化的增益问题。
 
-`gain_source: fixed_gain` 时必须显式填写 `fixed_gain`，推荐使用 dynamic gain 旁路输出的 `recommended_fixed_gain.json`。训练端不再根据 LFM 自动估计 gain，因为 LFM 与 GINN target 的频带不同；用 LFM 合成记录作分母会把缺失频带的反射能量误算成振幅增益。
+`gain_source: fixed_gain` 时必须显式填写 `fixed_gain`，推荐使用 dynamic gain 旁路输出的 `recommended_fixed_gain.json`。训练端不再根据 LFM 自动估计 gain，因为 LFM 与实际 GINN target 的响应不同；用 LFM 合成记录作分母会把目标差异误算成振幅增益。
 
 `dynamic_gain_model` 是旁路生成的随样点变化增益体，主线不默认启用。时间域旁路的实现规格见 [dynamic-gain.md](dynamic-gain.md)；它必须使用和本训练端一致的 `seismic_raw / train_mask_rms` 归一化口径，并会同时给出一个人工可选的 recommended fixed gain。
 
@@ -128,7 +128,7 @@ save_every: 5
 | Waveform MAE | 合成地震与观测地震在侵蚀掩码内的平均绝对误差 | 固定为 1 |
 | Residual L2 | 约束残差幅度，防止波阻抗偏离 LFM 太远 | `lambda_l2` |
 | Residual TV | 沿时间轴的一阶差分惩罚，抑制层内高频振铃 | `lambda_tv` |
-| Log-AI Anchor | 井控样点上的预测 log-AI 与第六步低频 anchor 对齐 | `lambda_log_ai_anchor` |
+| Log-AI Anchor | 井控样点上的预测 log-AI 与第六步 GINN target anchor 对齐 | `lambda_log_ai_anchor` |
 
 Waveform MAE 只在目标层内部的有效区域（core mask 向内侵蚀掉子波边界影响区后的 loss mask）计算。Residual L2 和 TV 在 core mask 加上向外的 halo 过渡带（taper mask）上计算，halo 宽度由 `boundary_effect_samples` 控制。
 
@@ -138,7 +138,7 @@ Waveform MAE 只在目标层内部的有效区域（core mask 向内侵蚀掉子
 
 ### 井约束
 
-第六步已经输出 `log_ai_anchor_time.npz`，它记录每条井控 trace 的低频 log-AI 目标、有效样点 mask 和训练权重。井约束是可选项，关闭时只需要让 anchor loss 权重为 0：
+第六步已经输出 `log_ai_anchor_time.npz`，它记录每条井控 trace 的实际 GINN target log-AI、有效样点 mask、来源语义和训练权重。目标可以是诊断 cutoff 低通，也可以是第四步 filtered LAS 的直接 TWT 投影。井约束是可选项，关闭时只需要让 anchor loss 权重为 0：
 
 ```yaml
 log_ai_anchor_file: null
@@ -148,7 +148,7 @@ well_control_enabled: true
 
 正式启用时，`log_ai_anchor_file` 指向第六步的 `log_ai_anchor_time.npz`，`lambda_log_ai_anchor` 设为正值。`log_ai_anchor_radius_xy_m: 0.0` 表示只约束井所在中心道；大于 0 时会在井附近地震道上按距离衰减扩散井控影响。`well_anchor_batch_fraction` 控制训练 batch 中井影响区样本的目标占比，避免密井监督被普通地震道完全稀释。
 
-井约束只惩罚预测 AI 的 log 值与第六步低频 anchor 的差异；它不替代 waveform loss。`well_waveform_min_weight` 保留井中心附近的最低波形损失权重，避免井点附近只顾井曲线而放弃真实地震匹配。
+井约束只惩罚预测 AI 的 log 值与第六步 GINN target anchor 的差异；它不替代 waveform loss。`well_waveform_min_weight` 保留井中心附近的最低波形损失权重，避免井点附近只顾井曲线而放弃真实地震匹配。
 
 ### 验证集切分
 

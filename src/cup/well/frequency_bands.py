@@ -253,6 +253,38 @@ def build_conditioned_reference_log(
     )
 
 
+def project_standard_log_ai_to_twt(
+    standard: StandardVpRhoLogs,
+    table: grid.TimeDepthTable,
+    target_twt_s: np.ndarray,
+    *,
+    name: str = "projected_log_AI",
+) -> grid.Log:
+    """Project standard LAS AI to TWT without conditioning or filtering."""
+    if not table.is_md_domain:
+        raise ValueError("Filtered-LAS projection requires an MD-domain TimeDepthTable.")
+    target_twt = np.asarray(target_twt_s, dtype=np.float64).reshape(-1)
+    if target_twt.size < 2 or np.any(~np.isfinite(target_twt)) or np.any(np.diff(target_twt) <= 0.0):
+        raise ValueError("target_twt_s must be a finite, strictly increasing axis.")
+
+    md = np.asarray(standard.logs.basis, dtype=np.float64)
+    ai = np.asarray(standard.logs.AI.values, dtype=np.float64)
+    log_ai_md = np.full(ai.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(ai) & (ai > 0.0)
+    log_ai_md[valid] = np.log(ai[valid])
+    target_md = np.interp(target_twt, table.twt, table.md, left=np.nan, right=np.nan)
+    values = _segmented_interp(md, log_ai_md, target_md)
+    values[~np.isfinite(target_md)] = np.nan
+    return grid.Log(
+        values,
+        target_twt,
+        "twt",
+        name=name,
+        unit="ln(m/s*g/cm3)",
+        allow_nan=True,
+    )
+
+
 def segmented_lowpass(log: grid.Log, cutoff_hz: float, cfg: ThreeBandSplitConfig) -> grid.Log:
     """Apply one Butterworth low-pass independently to each finite run."""
     values = np.asarray(log.values, dtype=np.float64)
@@ -318,6 +350,48 @@ def build_frequency_bands(conditioned: ConditionedWellLog, cfg: ThreeBandSplitCo
         observed_mask=conditioned.observed_mask,
         interpolation_mask=conditioned.interpolation_mask,
         conditioned_mask=conditioned.conditioned_mask,
+        valid_band_mask=valid,
+    )
+
+
+def replace_ginn_target(
+    bands: WellFrequencyBands,
+    ginn_target_log_ai: grid.Log,
+) -> WellFrequencyBands:
+    """Replace the GINN target while preserving reference, LFM, and provenance."""
+    basis = np.asarray(bands.reference_log_ai.basis, dtype=np.float64)
+    target_basis = np.asarray(ginn_target_log_ai.basis, dtype=np.float64)
+    if target_basis.shape != basis.shape or not np.allclose(target_basis, basis, rtol=0.0, atol=1e-9):
+        raise ValueError("Replacement GINN target must use the frequency-band TWT axis.")
+
+    reference_values = np.asarray(bands.reference_log_ai.values, dtype=np.float64)
+    lfm_values = np.asarray(bands.lfm_log_ai.values, dtype=np.float64)
+    target_values = np.asarray(ginn_target_log_ai.values, dtype=np.float64)
+    valid = np.isfinite(reference_values) & np.isfinite(lfm_values) & np.isfinite(target_values)
+    ginn_band = np.full(reference_values.shape, np.nan, dtype=np.float64)
+    enhance = np.full(reference_values.shape, np.nan, dtype=np.float64)
+    ginn_band[valid] = target_values[valid] - lfm_values[valid]
+    enhance[valid] = reference_values[valid] - target_values[valid]
+
+    def make(values: np.ndarray, name: str) -> grid.Log:
+        return grid.Log(
+            values,
+            basis,
+            "twt",
+            name=name,
+            unit="ln(m/s*g/cm3)",
+            allow_nan=True,
+        )
+
+    return WellFrequencyBands(
+        reference_log_ai=bands.reference_log_ai,
+        lfm_log_ai=bands.lfm_log_ai,
+        ginn_target_log_ai=make(target_values, "ginn_target_log_AI"),
+        ginn_band_log_ai=make(ginn_band, "ginn_band_log_AI"),
+        enhance_residual_log_ai=make(enhance, "enhance_residual_log_AI"),
+        observed_mask=bands.observed_mask,
+        interpolation_mask=bands.interpolation_mask,
+        conditioned_mask=bands.conditioned_mask,
         valid_band_mask=valid,
     )
 

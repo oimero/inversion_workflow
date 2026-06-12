@@ -59,6 +59,8 @@ from cup.well.frequency_bands import (
     build_conditioned_reference_log,
     build_frequency_bands,
     ginn_cutoff_candidates,
+    project_standard_log_ai_to_twt,
+    replace_ginn_target,
     segmented_lowpass,
 )
 from cup.well.las import load_standard_vp_rho_logs
@@ -104,6 +106,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "manual_cutoff_hz": None,
         },
         "ginn": {
+            "target_source": "frequency_lowpass",
             "mode": "diagnose",
             "manual_cutoff_hz": None,
             "candidate_cutoff_hz": None,
@@ -331,6 +334,12 @@ def _resolve_frequency_bands(
         raise ValueError(f"Unsupported LFM cutoff_mode: {lfm_mode!r}.")
 
     ginn_cfg = dict(bands_cfg.get("ginn") or {})
+    target_source = str(ginn_cfg.get("target_source", "frequency_lowpass")).strip().lower()
+    if target_source not in {"frequency_lowpass", "auto_tie_filtered_las"}:
+        raise ValueError(
+            "well_constraints.frequency_bands.ginn.target_source must be "
+            "'frequency_lowpass' or 'auto_tie_filtered_las'."
+        )
     mode = str(ginn_cfg.get("mode", "diagnose")).strip().lower()
     if mode == "manual":
         cutoff = ginn_cfg.get("manual_cutoff_hz")
@@ -460,6 +469,7 @@ def _resolve_frequency_bands(
     selection.update(
         {
             "mode": mode,
+            "target_source": target_source,
             "wavelet_file": repo_relative_path(wavelet_path, root=REPO_ROOT),
             "wavelet_peak_hz": peak_hz,
             "wavelet_left_half_amplitude_hz": left_half_hz,
@@ -521,6 +531,8 @@ def _masked_scaled_synthetic_metrics(
     synthetic_eval = synthetic_raw[mask]
     denom = max(float(np.dot(synthetic_eval, synthetic_eval)), 1e-12)
     scale = float(np.dot(seismic_norm, synthetic_eval) / denom)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"invalid_negative_scale:{scale:.6g}")
     synthetic_scaled = scale * synthetic_eval
     corr = float(np.corrcoef(seismic_norm, synthetic_scaled)[0, 1]) if np.std(synthetic_scaled) > 0.0 else np.nan
     nmae = float(np.sum(np.abs(seismic_norm - synthetic_scaled)) / max(np.sum(np.abs(seismic_norm)), 1e-12))
@@ -634,13 +646,18 @@ def _diagnose_ginn_cutoff_by_forward_modeling(
                         }
                     )
                 except Exception as exc:
+                    reason = str(exc) or type(exc).__name__
                     rows.append(
                         {
                             "well_name": well_name,
                             "route": route,
                             "spatial_cluster_id": cluster_id,
                             "cutoff_hz": float(cutoff),
-                            "status": "failed",
+                            "status": (
+                                "invalid_negative_scale"
+                                if reason.startswith("invalid_negative_scale:")
+                                else "failed"
+                            ),
                             "reason": f"{type(exc).__name__}:{exc}",
                         }
                     )
@@ -727,6 +744,236 @@ def _diagnose_ginn_cutoff_by_forward_modeling(
         "aggregation": "median_within_spatial_cluster_then_median_across_clusters",
     }
     return diag_df, cluster_aggregate, aggregate, selection
+
+
+def _evaluate_ginn_target_log(
+    target_log_ai: grid.Log,
+    *,
+    conditioned: ConditionedWellLog,
+    seismic: grid.Seismic,
+    wavelet: grid.Wavelet,
+    modeler: ConvModeler,
+) -> tuple[float, float, float, int]:
+    seismic_basis = np.asarray(seismic.basis, dtype=np.float64)
+    source_basis = np.asarray(conditioned.log_ai.basis, dtype=np.float64)
+    eval_mask = (
+        np.interp(
+            seismic_basis,
+            source_basis,
+            conditioned.observed_mask.astype(np.float64),
+            left=0.0,
+            right=0.0,
+        )
+        > 0.999
+    )
+    target_on_seismic = np.interp(
+        seismic_basis,
+        np.asarray(target_log_ai.basis, dtype=np.float64),
+        np.asarray(target_log_ai.values, dtype=np.float64),
+        left=np.nan,
+        right=np.nan,
+    )
+    target_ai = np.exp(target_on_seismic)
+    context_valid = np.convolve(
+        np.isfinite(target_ai).astype(np.int16),
+        np.ones(wavelet.size, dtype=np.int16),
+        mode="same",
+    ) == int(wavelet.size)
+    reflectivity = grid.Reflectivity(_reflectivity_from_ai(target_ai), seismic_basis)
+    return _masked_scaled_synthetic_metrics(
+        modeler=modeler,
+        wavelet=wavelet,
+        reflectivity=reflectivity,
+        seismic=seismic,
+        eval_mask=eval_mask & context_valid,
+    )
+
+
+def _aggregate_ginn_target_comparison(rows: pd.DataFrame) -> dict[str, Any]:
+    ok = rows.loc[rows["status"].astype(str).eq("ok")].copy()
+    if ok.empty:
+        return {"method": "median_within_spatial_cluster_then_median_across_clusters", "targets": []}
+    cluster = (
+        ok.groupby(["target_source", "spatial_cluster_id"], dropna=False)
+        .agg(
+            n_wells=("well_name", "nunique"),
+            median_corr=("corr", "median"),
+            median_nmae=("nmae", "median"),
+            median_scale=("scale", "median"),
+            median_n_eval_samples=("n_eval_samples", "median"),
+        )
+        .reset_index()
+    )
+    aggregate = (
+        cluster.groupby("target_source", dropna=False)
+        .agg(
+            n_clusters=("spatial_cluster_id", "nunique"),
+            n_wells=("n_wells", "sum"),
+            median_corr=("median_corr", "median"),
+            median_nmae=("median_nmae", "median"),
+            median_scale=("median_scale", "median"),
+            median_n_eval_samples=("median_n_eval_samples", "median"),
+        )
+        .reset_index()
+    )
+    return {
+        "method": "median_within_spatial_cluster_then_median_across_clusters",
+        "targets": aggregate.to_dict(orient="records"),
+    }
+
+
+def _compare_ginn_target_sources(
+    candidate_context: dict[str, dict[str, Any]],
+    conditioned_by_key: dict[str, ConditionedWellLog],
+    *,
+    auto_dir: Path,
+    wavelet_dir: Path,
+    samples: np.ndarray,
+    bands_cfg: ThreeBandSplitConfig,
+    batch_lookup: dict[str, pd.Series],
+) -> tuple[pd.DataFrame, dict[str, grid.Log], dict[str, Path], dict[str, Any]]:
+    wavelet_time_s, wavelet_amplitude, wavelet_path = _load_selected_wavelet(wavelet_dir)
+    wavelet = grid.Wavelet(wavelet_amplitude, wavelet_time_s, name=wavelet_path.stem)
+    modeler = ConvModeler()
+    rows: list[dict[str, Any]] = []
+    filtered_targets: dict[str, grid.Log] = {}
+    filtered_paths: dict[str, Path] = {}
+
+    for key, context in candidate_context.items():
+        well_name = str(context["well_name"])
+        metric = context["metric"]
+        conditioned = conditioned_by_key[key]
+        batch_row = batch_lookup.get(key)
+        cluster_value = None if batch_row is None else batch_row.get("spatial_cluster_id")
+        cluster_id = None if cluster_value is None or pd.isna(cluster_value) else str(cluster_value)
+        seismic_file = _resolve_seismic_trace_file(metric, run_dir=auto_dir, well_name=well_name)
+        if seismic_file is None:
+            for target_source in ("frequency_lowpass", "auto_tie_filtered_las"):
+                rows.append(
+                    {
+                        "well_name": well_name,
+                        "route": context["route"],
+                        "spatial_cluster_id": cluster_id,
+                        "target_source": target_source,
+                        "diagnostic_cutoff_hz": float(bands_cfg.ginn_cutoff_hz),
+                        "status": "failed",
+                        "reason": "missing_seismic_trace",
+                    }
+                )
+            continue
+
+        try:
+            seismic = load_saved_seismic_trace_csv(seismic_file)
+        except Exception as exc:
+            for target_source in ("frequency_lowpass", "auto_tie_filtered_las"):
+                rows.append(
+                    {
+                        "well_name": well_name,
+                        "route": context["route"],
+                        "spatial_cluster_id": cluster_id,
+                        "target_source": target_source,
+                        "diagnostic_cutoff_hz": float(bands_cfg.ginn_cutoff_hz),
+                        "status": "failed",
+                        "reason": f"{type(exc).__name__}:{exc}",
+                    }
+                )
+            continue
+
+        frequency_target = segmented_lowpass(conditioned.log_ai, bands_cfg.ginn_cutoff_hz, bands_cfg)
+        target_specs: list[tuple[str, grid.Log | None, str]] = [
+            ("frequency_lowpass", frequency_target, ""),
+        ]
+        filtered_path = resolve_artifact_path(
+            metric.get("filtered_las_file"),
+            root=REPO_ROOT,
+            run_dir=auto_dir,
+        )
+        try:
+            if filtered_path is None or not filtered_path.exists():
+                raise FileNotFoundError(f"missing_filtered_las:{well_name}")
+            filtered_standard = load_standard_vp_rho_logs(filtered_path)
+            filtered_target = project_standard_log_ai_to_twt(
+                filtered_standard,
+                load_workflow_time_depth_table_csv(context["tdt_file"]),
+                samples,
+                name="auto_tie_filtered_log_AI",
+            )
+            filtered_targets[key] = filtered_target
+            filtered_paths[key] = filtered_path
+            target_specs.append(("auto_tie_filtered_las", filtered_target, ""))
+        except Exception as exc:
+            target_specs.append(
+                ("auto_tie_filtered_las", None, f"{type(exc).__name__}:{exc}")
+            )
+
+        for target_source, target_log, preparation_error in target_specs:
+            row = {
+                "well_name": well_name,
+                "route": context["route"],
+                "spatial_cluster_id": cluster_id,
+                "target_source": target_source,
+                "diagnostic_cutoff_hz": float(bands_cfg.ginn_cutoff_hz),
+                "status": "failed",
+                "corr": np.nan,
+                "nmae": np.nan,
+                "scale": np.nan,
+                "n_eval_samples": 0,
+                "wavelet_file": repo_relative_path(wavelet_path, root=REPO_ROOT),
+                "filtered_las_file": (
+                    repo_relative_path(filtered_path, root=REPO_ROOT)
+                    if target_source == "auto_tie_filtered_las"
+                    and filtered_path is not None
+                    and filtered_path.exists()
+                    else ""
+                ),
+                "reason": preparation_error,
+            }
+            if target_log is not None:
+                try:
+                    corr, nmae, scale, n_eval = _evaluate_ginn_target_log(
+                        target_log,
+                        conditioned=conditioned,
+                        seismic=seismic,
+                        wavelet=wavelet,
+                        modeler=modeler,
+                    )
+                    row.update(
+                        {
+                            "status": "ok",
+                            "corr": corr,
+                            "nmae": nmae,
+                            "scale": scale,
+                            "n_eval_samples": n_eval,
+                            "reason": "",
+                        }
+                    )
+                except Exception as exc:
+                    reason = str(exc) or type(exc).__name__
+                    row["status"] = (
+                        "invalid_negative_scale"
+                        if reason.startswith("invalid_negative_scale:")
+                        else "failed"
+                    )
+                    row["reason"] = f"{type(exc).__name__}:{exc}"
+            rows.append(row)
+
+    comparison = pd.DataFrame.from_records(rows)
+    return comparison, filtered_targets, filtered_paths, _aggregate_ginn_target_comparison(comparison)
+
+
+def _select_ginn_target_bands(
+    frequency_bands: WellFrequencyBands,
+    *,
+    target_source: str,
+    filtered_target: grid.Log | None,
+) -> WellFrequencyBands:
+    if target_source == "frequency_lowpass":
+        return frequency_bands
+    if target_source == "auto_tie_filtered_las":
+        if filtered_target is None:
+            raise ValueError("missing_or_invalid_filtered_las_target")
+        return replace_ginn_target(frequency_bands, filtered_target)
+    raise ValueError(f"Unsupported GINN target source: {target_source!r}.")
 
 
 def _save_frequency_band_qc(
@@ -979,7 +1226,7 @@ def _plot_frequency_band_response(
     ax.plot(frequency, spectrum, color="black", linewidth=1.4, label="consensus wavelet amplitude")
     for cutoff, label, color in (
         (bands.lfm_cutoff_hz, "LFM low-pass", "tab:blue"),
-        (bands.ginn_cutoff_hz, "GINN target low-pass", "tab:orange"),
+        (bands.ginn_cutoff_hz, "diagnostic GINN low-pass", "tab:orange"),
         (bands.reference_cutoff_hz, "reference low-pass", "tab:green"),
     ):
         sos = butter(int(bands.filter_order) // 2, float(cutoff), btype="low", fs=fs, output="sos")
@@ -1298,6 +1545,27 @@ def main() -> None:
             "expand well_constraints.frequency_bands.ginn candidates and rerun."
         )
 
+    target_source = str(split_selection["target_source"])
+    target_comparison_df, filtered_targets, filtered_target_paths, target_comparison_summary = (
+        _compare_ginn_target_sources(
+            candidate_context,
+            conditioned_by_key,
+            auto_dir=auto_dir,
+            wavelet_dir=wavelet_dir,
+            samples=samples,
+            bands_cfg=bands_cfg,
+            batch_lookup=batch_lookup,
+        )
+    )
+    target_comparison_path = output_dir / "ginn_target_comparison.csv"
+    target_comparison_df.to_csv(target_comparison_path, index=False, encoding="utf-8-sig")
+    selected_target_metrics = {
+        normalize_well_name(str(row["well_name"])): row
+        for _, row in target_comparison_df.loc[
+            target_comparison_df["target_source"].astype(str).eq(target_source)
+        ].iterrows()
+    }
+
     point_frames: list[pd.DataFrame] = []
     bands_by_well: dict[str, WellFrequencyBands] = {}
     qc_by_key = {normalize_well_name(str(row["well_name"])): row for row in qc_rows}
@@ -1305,6 +1573,36 @@ def main() -> None:
         qc_row = qc_by_key[key]
         try:
             bands = build_frequency_bands(conditioned_by_key[key], bands_cfg)
+            try:
+                bands = _select_ginn_target_bands(
+                    bands,
+                    target_source=target_source,
+                    filtered_target=filtered_targets.get(key),
+                )
+            except ValueError as exc:
+                if str(exc) != "missing_or_invalid_filtered_las_target":
+                    raise
+                comparison_row = selected_target_metrics.get(key)
+                comparison_reason = (
+                    ""
+                    if comparison_row is None
+                    else str(comparison_row.get("reason") or "")
+                )
+                qc_row["status"] = "rejected"
+                qc_row["reasons"] = ";".join(
+                    value
+                    for value in [
+                        str(qc_row.get("reasons") or ""),
+                        "missing_or_invalid_filtered_las_target",
+                        (
+                            f"filtered_las_target_failed:{comparison_reason}"
+                            if comparison_reason
+                            else ""
+                        ),
+                    ]
+                    if value
+                )
+                continue
             metric = context["metric"]
             plan = context["plan"]
             route = context["route"]
@@ -1399,6 +1697,20 @@ def main() -> None:
     )
     qc_split_by_well = {row["well_name"]: row for row in qc_split_rows}
     qc_df = pd.DataFrame(qc_rows)
+    qc_df["ginn_target_source"] = target_source
+    qc_df["ginn_target_corr"] = [
+        selected_target_metrics.get(normalize_well_name(str(name)), {}).get("corr")
+        for name in qc_df["well_name"]
+    ]
+    qc_df["ginn_target_nmae"] = [
+        selected_target_metrics.get(normalize_well_name(str(name)), {}).get("nmae")
+        for name in qc_df["well_name"]
+    ]
+    qc_df["ginn_target_scale"] = [
+        selected_target_metrics.get(normalize_well_name(str(name)), {}).get("scale")
+        for name in qc_df["well_name"]
+    ]
+    qc_df["ginn_target_diagnostic_cutoff_hz"] = float(bands_cfg.ginn_cutoff_hz)
     point_counts = point_df.groupby("well_name").size().to_dict()
     unique_trace_counts = point_df.groupby("well_name")["flat_idx"].nunique().to_dict()
     qc_df["control_point_count"] = [int(point_counts.get(str(name), 0)) for name in qc_df["well_name"]]
@@ -1442,12 +1754,29 @@ def main() -> None:
         value_cols=["ginn_target_log_ai"],
         include_anchor_only=False,
     )
+    target_semantics = (
+        "twt_log_ai_lowpass_at_diagnostic_ginn_cutoff"
+        if target_source == "frequency_lowpass"
+        else "fourth_step_auto_tie_filtered_las_projected_with_optimized_tdt"
+    )
+    filtered_las_sources = (
+        {
+            candidate_context[key]["well_name"]: repo_relative_path(path, root=REPO_ROOT)
+            for key, path in filtered_target_paths.items()
+            if candidate_context[key]["well_name"] in bands_by_well
+        }
+        if target_source == "auto_tie_filtered_las"
+        else {}
+    )
     anchor_metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_script": Path(__file__).name,
         "artifact_family": "well_constraints_time",
         "artifact_role": "log_ai_anchor",
-        "anchor_target_band": "lowpass_reference_to_ginn_cutoff",
+        "ginn_target_source": target_source,
+        "ginn_target_semantics": target_semantics,
+        "diagnostic_ginn_cutoff_hz": bands_cfg.ginn_cutoff_hz,
+        "filtered_las_sources": filtered_las_sources,
         "include_deviated": include_deviated_anchor,
         "conflict_strategy": "weighted_average",
         "frequency_bands": {
@@ -1491,6 +1820,10 @@ def main() -> None:
         "native_sample_semantics": "TWT seconds; native_samples currently matches samples in time-domain step 06.",
         "base_ai_fields_available": False,
         "base_ai_fields_note": "This package contains well high-frequency supervision only. Read base AI from LFM or GINN outputs.",
+        "ginn_target_source": target_source,
+        "ginn_target_semantics": target_semantics,
+        "diagnostic_ginn_cutoff_hz": bands_cfg.ginn_cutoff_hz,
+        "filtered_las_sources": filtered_las_sources,
         "frequency_bands": anchor_metadata["frequency_bands"],
         "point_table": repo_relative_path(point_path, root=REPO_ROOT),
         "high_conflicts": (
@@ -1529,6 +1862,7 @@ def main() -> None:
         "ginn_cutoff_diagnostics": repo_relative_path(split_diag_path, root=REPO_ROOT),
         "ginn_cutoff_cluster_aggregate": repo_relative_path(split_cluster_path, root=REPO_ROOT),
         "ginn_cutoff_aggregate": repo_relative_path(split_aggregate_path, root=REPO_ROOT),
+        "ginn_target_comparison": repo_relative_path(target_comparison_path, root=REPO_ROOT),
         "ginn_cutoff_sweep_figure": repo_relative_path(split_diag_figure_path, root=REPO_ROOT),
         "ginn_cutoff_well_sweep_figures": split_well_figure_paths,
         "frequency_band_response_figure": repo_relative_path(frequency_response_path, root=REPO_ROOT),
@@ -1548,6 +1882,8 @@ def main() -> None:
         "horizons": horizon_metadata,
         "config": script_cfg,
         "frequency_bands": {
+            "ginn_target_source": target_source,
+            "ginn_target_semantics": target_semantics,
             "lfm_cutoff_hz": bands_cfg.lfm_cutoff_hz,
             "ginn_cutoff_hz": bands_cfg.ginn_cutoff_hz,
             "reference_cutoff_hz": bands_cfg.reference_cutoff_hz,
@@ -1559,6 +1895,10 @@ def main() -> None:
             "aggregate": repo_relative_path(split_aggregate_path, root=REPO_ROOT),
             "diagnostic_figure": repo_relative_path(split_diag_figure_path, root=REPO_ROOT),
             "selection": split_selection,
+            "target_comparison": {
+                "path": repo_relative_path(target_comparison_path, root=REPO_ROOT),
+                **target_comparison_summary,
+            },
         },
         "conflicts": {
             "strategy": "weighted_average",

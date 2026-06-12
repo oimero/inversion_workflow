@@ -35,21 +35,25 @@
     - 第四步 `AI` 来自 auto-tie 最优滤波后的 `Vp/Rho`，会重新计算，不沿用第三步或人工处理中遗留的 AI。
     - 两者都保持原 MD 轴；TDT 的整体时移不写回 LAS。
 
-## 第六步三频带
+## 第六步目标分解
 
-- 第六步曲线来源固定为第三步 `preprocessed_las`，不使用第四步 `filtered_las_file` 定义频带真值。
-- 第四步提供 optimized TDT、地震道和斜井轨迹采样计划；第五步提供唯一的共识子波。
-- 所有分频在 TWT 域 `log(AI)` 上执行：
+- Reference、LFM 和观测 provenance 固定来自第三步 `preprocessed_las`。
+- GINN target 由整次运行统一选择：
+    - `frequency_lowpass`：第三步条件化 `log(AI)` 低通到诊断 cutoff。
+    - `auto_tie_filtered_las`：第四步 `filtered_las_file` 经 optimized TDT 直接投影到 TWT，不再做 Hampel、Gaussian 或 Butterworth 处理。
+- 第四步还提供地震道和斜井轨迹采样计划；第五步提供唯一的共识子波。
+- 分解在 TWT 域 `log(AI)` 上执行：
 
 ```text
 reference_log_ai = LP(conditioned_log_ai, f_reference)
 lfm_log_ai = LP(conditioned_log_ai, f_lfm)
-ginn_target_log_ai = LP(conditioned_log_ai, f_ginn)
+ginn_target_log_ai = LP(conditioned_log_ai, f_ginn)  # frequency_lowpass
+                     or project(filtered_las, optimized_tdt)
 ginn_band_log_ai = ginn_target_log_ai - lfm_log_ai
 enhance_residual_log_ai = reference_log_ai - ginn_target_log_ai
 ```
 
-- `f_lfm` 默认取共识子波主峰左侧归一化振幅 `0.5` 交点；`f_ginn` 由正演近最佳平台诊断；`f_reference = min(2*f_ginn, 0.4*fs)`。
+- `f_lfm` 默认取共识子波主峰左侧归一化振幅 `0.5` 交点；`f_ginn` 始终由正演近最佳平台诊断，并用于 `f_reference = min(2*f_ginn, 0.4*fs)`。filtered 模式下 `f_ginn` 仅是诊断/reference 参数，不定义目标曲线。
 - `<=10 ms` 的内部缺口只为滤波支撑而插值，不进入 LFM 控制、GINN anchor、enhance 监督或统计；更长缺口保持无效并按连续段独立滤波。
 
 ## 时深表

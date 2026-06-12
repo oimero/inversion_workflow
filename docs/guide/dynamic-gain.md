@@ -147,20 +147,20 @@ dynamic_gain:
 | `figures/qc_03_attribute_metrics.png` | 候选属性的 Pearson 相关系数柱状图 |
 | `figures/qc_04_spatial_debias.png` | 空间簇的井增益与簇增益对比 |
 | `figures/qc_05_dynamic_gain_volume.png` | 增益体的 inline、xline 和时间切片 |
-| `well_qc/figures/anchor_trace_*.png` | 每道 anchor 的井上波形 QC 图（amplitude 模式） |
+| `well_qc/figures/anchor_trace_*.png` | 每道 anchor 的井上波形 QC 图；首列只画 GINN target AI，并标出第六步恢复的井分层 |
 | `well_qc/traces/anchor_trace_*.csv` | 地震、合成、gain、波阻抗和反射系数的逐样点明细 |
-| `well_qc/well_qc_metrics.csv` | 逐 anchor 道波形 QC 指标（corr、MAE、RMSE、bias、RMS ratio） |
+| `well_qc/well_qc_metrics.csv` | 逐 anchor 道波形 QC 指标（corr、MAE、RMSE、NMAE、bias、RMS ratio） |
 
 ### `dynamic_gain.npz`
 
-使用 `dynamic_gain_v2` schema，包含：
+使用 `dynamic_gain_v3` schema，包含：
 
 | 键 | 形状 | 语义 |
 |----|------|------|
 | `volume` | `(n_inline, n_xline, n_sample)` | 正值 dynamic gain |
 | `samples` / `inline` / `xline` | 一维轴 | TWT 采样轴和线号轴 |
 | `geometry_json` | 标量 | 与第八步地震几何一致 |
-| `metadata_json` | 标量 | 归一化口径、GINN target 频带、拟合参数、上游路径 |
+| `metadata_json` | 标量 | 归一化口径、GINN target source/semantics、诊断 cutoff、拟合参数和上游路径 |
 
 ### `recommended_fixed_gain.json`
 

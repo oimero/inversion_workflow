@@ -22,10 +22,14 @@ logger = logging.getLogger(__name__)
 
 # Schema constants.
 
-SCHEMA_VERSION = "ginn_log_ai_anchor_v1"
+SCHEMA_VERSION = "ginn_log_ai_anchor_v2"
 VALID_ANCHOR_TYPES = {"well", "facies_control"}
 VALID_SAMPLE_DOMAINS = {"time", "depth"}
 VALID_SAMPLE_UNITS = {"s", "m"}
+TIME_TARGET_SEMANTICS = {
+    "frequency_lowpass": "twt_log_ai_lowpass_at_diagnostic_ginn_cutoff",
+    "auto_tie_filtered_las": "fourth_step_auto_tie_filtered_las_projected_with_optimized_tdt",
+}
 
 
 # Schema dataclass.
@@ -112,7 +116,7 @@ def build_log_ai_anchor_bundle(
 
 
 def load_log_ai_anchor_npz(path: str | Path) -> LogAIAnchorBundle:
-    """Load a ``ginn_log_ai_anchor_v1`` NPZ file."""
+    """Load a ``ginn_log_ai_anchor_v2`` NPZ file."""
     path = Path(path)
     with np.load(path, allow_pickle=False) as data:
         required = {
@@ -254,12 +258,34 @@ def validate_log_ai_anchor(
         bundle.sample_domain == "time"
         and str(bundle.metadata.get("artifact_family", "")) == "well_constraints_time"
     ):
-        expected_band = "lowpass_reference_to_ginn_cutoff"
-        if bundle.metadata.get("anchor_target_band") != expected_band:
+        target_source = str(bundle.metadata.get("ginn_target_source", ""))
+        if target_source not in TIME_TARGET_SEMANTICS:
             raise ValueError(
-                "Time-domain well anchor must target ginn_target_log_ai; "
-                f"expected anchor_target_band={expected_band!r}."
+                "Time-domain well anchor metadata ginn_target_source must be one of "
+                f"{sorted(TIME_TARGET_SEMANTICS)}, got {target_source!r}."
             )
+        expected_semantics = TIME_TARGET_SEMANTICS[target_source]
+        if bundle.metadata.get("ginn_target_semantics") != expected_semantics:
+            raise ValueError(
+                "Time-domain well anchor metadata ginn_target_semantics must be "
+                f"{expected_semantics!r} for source {target_source!r}."
+            )
+        diagnostic_cutoff = bundle.metadata.get("diagnostic_ginn_cutoff_hz")
+        if (
+            diagnostic_cutoff is None
+            or not np.isfinite(float(diagnostic_cutoff))
+            or float(diagnostic_cutoff) <= 0.0
+        ):
+            raise ValueError(
+                "Time-domain well anchor metadata must contain positive finite "
+                "diagnostic_ginn_cutoff_hz."
+            )
+        if target_source == "auto_tie_filtered_las":
+            filtered_sources = bundle.metadata.get("filtered_las_sources")
+            if not isinstance(filtered_sources, dict) or not filtered_sources:
+                raise ValueError(
+                    "auto_tie_filtered_las anchor metadata must contain non-empty filtered_las_sources."
+                )
         frequency_bands = bundle.metadata.get("frequency_bands")
         if not isinstance(frequency_bands, dict):
             raise ValueError("Time-domain well anchor metadata must contain frequency_bands.")

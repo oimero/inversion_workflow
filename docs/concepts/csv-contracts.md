@@ -239,6 +239,7 @@
 | `reasons` | 分号分隔的拒绝或失败原因 |
 | `frequency_band_qc_trace_path` | reference/LFM/GINN/enhance 三频带数值文件路径 |
 | `frequency_band_qc_figure_path` | 三频带 QC 图路径 |
+| `frequency_band_qc_plot_start_s` / `frequency_band_qc_plot_end_s` | 三频带 QC 图实际显示的该井目的层 TWT 范围；完整数值 CSV 仍保留全地震时间轴 |
 
 ### `lfm_control_points.csv` — 核心契约
 

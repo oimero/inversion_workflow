@@ -39,9 +39,8 @@ def convolution_modeling(
     """
 
     if wavelet.size % 2 == 0:
+        warnings.warn("Wavelet has even number of samples; appending one zero sample.")
         wavelet = np.concatenate((wavelet, np.zeros((1,))))
-    else:
-        warnings.warn("Wavelet has odd number of samples.")
 
     trace = np.convolve(wavelet, reflectivity, mode=mode)  # type: ignore
 

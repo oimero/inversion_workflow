@@ -46,6 +46,7 @@ from cup.well.preprocess import (
     CurveThreshold,
     WellCurveSet,
     compute_global_quantile_thresholds,
+    finite_stats,
     is_curve_usable,
     remove_outliers,
     replace_constant_runs,

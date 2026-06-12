@@ -98,7 +98,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "filter_order": 6,
         "buffer_seconds": None,
         "buffer_mode": "reflect",
-        "qc_envelope_window_samples": 31,
         "lfm": {
             "cutoff_mode": "wavelet_left_half_amplitude",
             "cutoff_scale": 1.0,
@@ -734,7 +733,7 @@ def _save_frequency_band_qc(
     bands_by_well: dict[str, WellFrequencyBands],
     qc_dir: Path,
     *,
-    envelope_window: int,
+    plot_windows_by_well: dict[str, tuple[float, float]],
 ) -> list[dict[str, Any]]:
     qc_dir.mkdir(parents=True, exist_ok=True)
     fig_dir = qc_dir / "figures"
@@ -782,40 +781,68 @@ def _save_frequency_band_qc(
             ]
         ].to_csv(trace_path, index=False, encoding="utf-8-sig")
         fig_path = fig_dir / f"frequency_bands_{safe}.png"
+        if well_name not in plot_windows_by_well:
+            raise ValueError(f"Missing frequency-band QC plot window for well {well_name}.")
+        plot_start_s, plot_end_s = plot_windows_by_well[well_name]
+        plot_mask = group["twt_s"].between(plot_start_s, plot_end_s, inclusive="both")
+        plot_group = group.loc[plot_mask].copy()
+        if len(plot_group) < 2:
+            raise ValueError(
+                f"Frequency-band QC plot window for {well_name} contains fewer than 2 samples: "
+                f"[{plot_start_s}, {plot_end_s}]."
+            )
         fig, axes = plt.subplots(4, 1, figsize=(9, 9), sharex=True, constrained_layout=True)
-        axes[0].plot(group["twt_s"], group["reference_log_ai"], label="reference", linewidth=1.0)
-        axes[0].plot(group["twt_s"], group["ginn_target_log_ai"], label="GINN target", linewidth=1.0)
-        axes[0].plot(group["twt_s"], group["lfm_log_ai"], label="LFM", linewidth=1.0)
+        axes[0].plot(plot_group["twt_s"], plot_group["reference_log_ai"], label="reference", linewidth=1.0)
+        axes[0].plot(plot_group["twt_s"], plot_group["ginn_target_log_ai"], label="GINN target", linewidth=1.0)
+        axes[0].plot(plot_group["twt_s"], plot_group["lfm_log_ai"], label="LFM", linewidth=1.0)
         axes[0].legend(loc="best")
-        axes[1].plot(group["twt_s"], group["ginn_band_log_ai"], label="GINN band", linewidth=1.0)
+        axes[1].plot(plot_group["twt_s"], plot_group["ginn_band_log_ai"], label="GINN band", linewidth=1.0)
         axes[1].legend(loc="best")
-        high = group["enhance_residual_log_ai"].to_numpy(dtype=float)
-        axes[2].plot(group["twt_s"], high, label="enhance residual", linewidth=1.0)
-        if high.size and int(envelope_window) > 1:
-            window = min(int(envelope_window), max(1, high.size))
-            kernel = np.ones(window, dtype=float) / float(window)
-            envelope = np.convolve(np.abs(high), kernel, mode="same")
-            axes[2].plot(group["twt_s"], envelope, color="tab:red", alpha=0.8, label="abs envelope")
-            axes[2].plot(group["twt_s"], -envelope, color="tab:red", alpha=0.8)
+        plot_high = plot_group["enhance_residual_log_ai"].to_numpy(dtype=float)
+        axes[2].plot(plot_group["twt_s"], plot_high, label="enhance residual", linewidth=1.0)
+        axes[2].axhline(0.0, color="black", linestyle="--", linewidth=0.9, alpha=0.7)
         axes[2].legend(loc="best")
-        for offset, (column, label) in enumerate(
-            (
-                ("observed_well_sample", "observed"),
-                ("short_gap_interpolated", "short-gap support"),
-                ("hampel_conditioned", "Hampel support"),
-                ("frequency_band_valid", "band valid"),
+        status_tracks = (
+            ("observed_well_sample", "Observed sample", "tab:blue"),
+            ("short_gap_interpolated", "Short-gap interpolated", "tab:orange"),
+            ("hampel_conditioned", "Hampel replaced", "tab:purple"),
+            ("frequency_band_valid", "Band valid", "tab:green"),
+        )
+        track_x = plot_group["twt_s"].to_numpy(dtype=float)
+        track_edges = _sample_cell_edges(track_x)
+        for track_index, (column, _label, color) in enumerate(status_tracks):
+            track_values = plot_group[column].astype(bool).to_numpy()
+            axes[3].broken_barh(
+                [(float(track_edges[0]), float(track_edges[-1] - track_edges[0]))],
+                (track_index - 0.28, 0.56),
+                facecolors="0.88",
+                edgecolors="none",
+                zorder=1,
             )
-        ):
-            axes[3].step(
-                group["twt_s"],
-                group[column].astype(float) + 1.25 * offset,
-                where="mid",
-                linewidth=0.9,
-                label=label,
-            )
-        axes[3].set_yticks([])
-        axes[3].legend(loc="best", ncol=2)
+            padded = np.concatenate(([False], track_values, [False]))
+            transitions = np.flatnonzero(padded[1:] != padded[:-1]).reshape(-1, 2)
+            spans = [
+                (float(track_edges[start]), float(track_edges[stop] - track_edges[start]))
+                for start, stop in transitions
+            ]
+            if spans:
+                axes[3].broken_barh(
+                    spans,
+                    (track_index - 0.28, 0.56),
+                    facecolors=color,
+                    edgecolors="none",
+                    alpha=0.9,
+                    zorder=2,
+                )
+        axes[3].set_yticks(
+            np.arange(len(status_tracks), dtype=float),
+            labels=[label for _, label, _ in status_tracks],
+        )
+        axes[3].set_ylim(len(status_tracks) - 0.5, -0.5)
+        axes[3].set_title("Colored = true, gray = false", fontsize=9)
+        axes[3].grid(axis="x", alpha=0.2)
         axes[3].set_xlabel("TWT (s)")
+        axes[3].set_xlim(float(plot_start_s), float(plot_end_s))
         fig.suptitle(str(well_name))
         fig.savefig(fig_path, dpi=180)
         plt.close(fig)
@@ -824,9 +851,42 @@ def _save_frequency_band_qc(
                 "well_name": str(well_name),
                 "frequency_band_qc_trace_path": repo_relative_path(trace_path, root=REPO_ROOT),
                 "frequency_band_qc_figure_path": repo_relative_path(fig_path, root=REPO_ROOT),
+                "frequency_band_qc_plot_start_s": float(plot_start_s),
+                "frequency_band_qc_plot_end_s": float(plot_end_s),
             }
         )
     return rows
+
+
+def _sample_cell_edges(sample_centers: np.ndarray) -> np.ndarray:
+    """Convert strictly increasing sample centers to shared cell boundaries."""
+    centers = np.asarray(sample_centers, dtype=float).reshape(-1)
+    if centers.size < 2 or np.any(~np.isfinite(centers)) or np.any(np.diff(centers) <= 0.0):
+        raise ValueError("sample_centers must contain at least 2 finite, strictly increasing values.")
+    midpoints = 0.5 * (centers[:-1] + centers[1:])
+    return np.concatenate(
+        (
+            [centers[0] - (midpoints[0] - centers[0])],
+            midpoints,
+            [centers[-1] + (centers[-1] - midpoints[-1])],
+        )
+    )
+
+
+def _frequency_band_qc_plot_windows(point_df: pd.DataFrame) -> dict[str, tuple[float, float]]:
+    """Return each well's actual target-layer TWT extent for QC plotting."""
+    required = {"well_name", "twt_s"}
+    missing = required - set(point_df.columns)
+    if missing:
+        raise ValueError(f"Point facts are missing frequency-band QC window columns: {sorted(missing)}")
+    windows: dict[str, tuple[float, float]] = {}
+    for well_name, group in point_df.groupby("well_name", sort=False):
+        twt = pd.to_numeric(group["twt_s"], errors="coerce").to_numpy(dtype=float)
+        twt = twt[np.isfinite(twt)]
+        if twt.size < 2:
+            raise ValueError(f"Well {well_name} has fewer than 2 finite target-layer TWT samples.")
+        windows[str(well_name)] = (float(np.min(twt)), float(np.max(twt)))
+    return windows
 
 
 def _plot_frequency_split_aggregate(
@@ -1332,11 +1392,10 @@ def main() -> None:
     )
     high_points = high_points.loc[high_points["observed_well_sample"].astype(bool)].copy()
 
-    freq_cfg = dict(script_cfg.get("frequency_bands") or {})
     qc_split_rows = _save_frequency_band_qc(
         bands_by_well,
         output_dir / "frequency_band_qc",
-        envelope_window=int(freq_cfg.get("qc_envelope_window_samples", 31)),
+        plot_windows_by_well=_frequency_band_qc_plot_windows(point_df),
     )
     qc_split_by_well = {row["well_name"]: row for row in qc_split_rows}
     qc_df = pd.DataFrame(qc_rows)
@@ -1350,7 +1409,12 @@ def main() -> None:
         int(high_counts_by_well.get(str(well_name), 0)) for well_name in qc_df["well_name"]
     ]
     qc_df["high_supervision_eligible"] = qc_df["high_supervision_point_count"].gt(0)
-    for key in ["frequency_band_qc_trace_path", "frequency_band_qc_figure_path"]:
+    for key in [
+        "frequency_band_qc_trace_path",
+        "frequency_band_qc_figure_path",
+        "frequency_band_qc_plot_start_s",
+        "frequency_band_qc_plot_end_s",
+    ]:
         qc_df[key] = [qc_split_by_well.get(str(w), {}).get(key) for w in qc_df["well_name"]]
 
     point_path = output_dir / "well_constraint_points.csv"

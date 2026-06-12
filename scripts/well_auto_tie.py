@@ -777,6 +777,10 @@ def _filtered_standard_las_logset(
     rho = np.full(md.shape, np.nan, dtype=np.float64)
     min_filter_samples = max(8, int(best_params["logs_median_size"]) + 2)
     for start, stop in true_runs(valid):
+        if stop - start < min_filter_samples:
+            vp[start:stop] = source_vp[start:stop]
+            rho[start:stop] = source_rho[start:stop]
+            continue
         segment = grid.LogSet(
             {
                 "Vp": grid.Log(
@@ -797,14 +801,13 @@ def _filtered_standard_las_logset(
                 ),
             }
         )
-        if stop - start >= min_filter_samples:
-            segment = tie_ops.filter_md_logs(
-                segment,
-                median_size=best_params["logs_median_size"],
-                threshold=best_params["logs_median_threshold"],
-                std=best_params["logs_std"],
-                std2=0.8 * best_params["logs_std"],
-            )
+        segment = tie_ops.filter_md_logs(
+            segment,
+            median_size=best_params["logs_median_size"],
+            threshold=best_params["logs_median_threshold"],
+            std=best_params["logs_std"],
+            std2=0.8 * best_params["logs_std"],
+        )
         vp[start:stop] = segment.Vp.values
         rho[start:stop] = segment.Rho.values
     ai_values = vp * rho

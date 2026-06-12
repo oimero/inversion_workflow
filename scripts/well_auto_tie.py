@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import sys
 from typing import Any, Mapping, Sequence
+import warnings
 
 import matplotlib
 
@@ -1411,15 +1412,20 @@ def _run_tie_with_initial_table(
         "suppress_runtime_warnings": True,
         "show_all_warnings": False,
     }
-    outputs = autotie.tie_v1(
-        InputSet(logset_md=logset_md, seismic=seismic, table=table, wellpath=None),  # type: ignore[arg-type]
-        wavelet_extractor,
-        modeler,
-        wavelet_scaling_params,
-        search_params=search_params,
-        search_space=build_auto_tie_search_space(config["search_space"]),
-        stretch_and_squeeze_params=None,
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Wavelet has even number of samples; appending one zero sample\.",
+        )
+        outputs = autotie.tie_v1(
+            InputSet(logset_md=logset_md, seismic=seismic, table=table, wellpath=None),  # type: ignore[arg-type]
+            wavelet_extractor,
+            modeler,
+            wavelet_scaling_params,
+            search_params=search_params,
+            search_space=build_auto_tie_search_space(config["search_space"]),
+            stretch_and_squeeze_params=None,
+        )
 
     cropped_wavelet, crop_info = crop_wavelet_center_energy_normalize(outputs.wavelet, float(config["target_crop_ms"]))
     pd.DataFrame({"time_s": cropped_wavelet.basis, "amplitude": cropped_wavelet.values}).to_csv(paths["wavelet"], index=False)

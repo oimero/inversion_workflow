@@ -7,7 +7,7 @@ from typing import Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib import gridspec
-from matplotlib.ticker import FormatStrFormatter, MaxNLocator, ScalarFormatter
+from matplotlib.ticker import FormatStrFormatter, FuncFormatter, MaxNLocator
 import numpy as np
 
 from wtie.processing import grid
@@ -73,9 +73,7 @@ def _plot_reflectivity(
     ax.invert_yaxis()
     ax.set_xlim(_symmetric_limits(reflectivity.values))
     ax.xaxis.set_major_locator(MaxNLocator(nbins=3, symmetric=True, min_n_ticks=3))
-    formatter = ScalarFormatter(useMathText=True)
-    formatter.set_powerlimits((-2, 2))
-    ax.xaxis.set_major_formatter(formatter)
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.1e}" if x != 0 else "0"))
     ax.tick_params(axis="x", labelsize=8)
     ax.yaxis.set_major_formatter(FormatStrFormatter("%0.3f"))
 
@@ -111,8 +109,8 @@ def _plot_wiggle_trace(
     ax.invert_yaxis()
     ax.set_ylabel(trace.basis_type)
     ax.xaxis.set_major_locator(MaxNLocator(nbins=3))
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.1e}" if x != 0 else "0"))
     ax.tick_params(axis="x", labelsize=8)
-    ax.ticklabel_format(axis="x", style="sci", scilimits=(-3, 4), useMathText=True)
     if xlim is not None:
         ax.set_xlim(xlim)
 

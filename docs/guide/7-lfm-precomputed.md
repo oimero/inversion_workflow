@@ -68,7 +68,7 @@ lfm_precomputed:
 
 直井的控制点落在井口对应的同一个 trace 上；斜井控制点来自轨迹样点，因此一口斜井的控制点会分布在多个不同的 `inline_float`、`xline_float` 处。
 
-切片聚合不再由第六步提前完成。第七步在建模时按切片收集控制点，并只对同一切片内完全重复的 inline/xline 坐标做权重聚合，避免密井或重复轨迹点在克里金里被当成多个独立空间位置。
+切片聚合不由第六步提前完成。第七步按自己的 `modeling.n_slices`，将每口井在每个 zone、每个 slice 内的点按权重聚合为一个建模代表点。直井和斜井遵循同一规则，使每口井在一张切片内只投一票，避免斜井密集轨迹样点污染克里金变程估计。第六步原始点级事实仍完整保留，用于井 QC 和审计。
 
 ### `target_interval`
 
@@ -110,7 +110,7 @@ lfm_precomputed:
 
 ### 第二阶段：控制点读取
 
-第七步读取第六步写出的 `lfm_control_points.csv`，校验字段、正值 AI、有限坐标和 `u_in_zone` 范围，然后把控制点复制到本次第七步输出目录。第六步不再提供 `n_slices`，切片数量只由本步骤的 `modeling.n_slices` 决定。
+第七步读取第六步写出的 `lfm_control_points.csv`，校验字段、正值 AI、有限坐标和 `u_in_zone` 范围，并将原始点复制到本次输出目录。随后按本步骤的 `modeling.n_slices` 生成 `lfm_model_control_points.csv`；后者是实际进入克里金的每井每 slice 代表点。
 
 ### 第三阶段：层位约束建模
 
@@ -118,9 +118,9 @@ lfm_precomputed:
 
 1. **比例切片离散。** 相邻层位组成一个层段，每个层段再按层内比例切成若干薄片。`n_slices` 越大，层内变化表达越细，但插值也更依赖控制点覆盖。
 
-2. **控制点分配。** 每个控制点按其 `u_in_zone` 值分配到最近的切片。
+2. **控制点分配与聚合。** 每个原始控制点按 `u_in_zone` 分配到最近切片；同一井、同一层段、同一切片内的点按权重聚合成一个代表点。
 
-3. **切片插值。** 每张切片收集落入其中的控制点。有多个控制点时做平面插值；只有一个控制点时，该切片只能退化为常值片。
+3. **切片插值。** 每张切片收集各井的代表点。有多个井点时做平面插值；只有一个井点时，该切片只能退化为常值片。
 
 4. **缺失切片填充。** 某些切片可能没有任何控制点（特别是目标层顶部或底部），此时沿比例方向向上、向下搜索最近的有效切片，用其值填充。
 
@@ -144,7 +144,8 @@ lfm_precomputed:
 |------|------|
 | `ai_lfm_time.npz` | GINN 训练可直接读取的波阻抗低频模型 |
 | `ai_lfm_time.segy` 或 `.zgy` | 可选地震体导出，格式跟随源地震 |
-| `lfm_control_points.csv` | 点级控制样本，每行一个目标层内低频 AI 控制点 |
+| `lfm_control_points.csv` | 第六步原始点级控制事实的完整副本，供井 QC 和审计 |
+| `lfm_model_control_points.csv` | 每井、每 zone、每 slice 一个代表点，实际用于克里金 |
 | `target_layer_qc/*` | 目标层 mask、层厚、层位有效性 QC |
 | `figures/*.png` | 控制点分布图和 LFM 剖面图 |
 | `well_qc/figures/well_qc_<well>.png` | 每口控制点井的低频 AI vs LFM 采样 AI 对比 |
@@ -183,6 +184,17 @@ lfm_precomputed:
 | `zone_name` / `u_in_zone` | 所属层段和层内比例位置（0 到 1） |
 | `ai` / `weight` | 第六步分频后的低频 AI 控制值及权重 |
 | `flat_idx` / `seismic_sample_index` | 派生字段，仅供调试和交叉校验；依赖地震几何与全局采样轴 |
+
+### `lfm_model_control_points.csv`
+
+保留上述来源和坐标字段，并增加：
+
+| 字段 | 含义 |
+|------|------|
+| `slice_index` | 第七步 `modeling.n_slices` 口径下的层内切片编号 |
+| `source_point_count` | 聚合成当前代表点的原始点数 |
+
+`run_summary.json.control_aggregation` 同时记录原始点数、建模代表点数、删除的重复投票数，以及按来源井和井名拆分的统计。
 
 ---
 

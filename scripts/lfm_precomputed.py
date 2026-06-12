@@ -47,6 +47,7 @@ from cup.seismic.viz import (
     waveform_qc_metrics,
 )
 from cup.well.assets import normalize_well_name
+from cup.well.constraints import nearest_trace_fields
 from cup.well.tie import load_saved_seismic_trace_csv
 from cup.seismic.wavelet import compute_wavelet_active_half_support_s, load_wavelet_csv, validate_wavelet_dt
 from wtie.modeling.modeling import ConvModeler
@@ -183,6 +184,144 @@ def _build_target_layer(script_cfg: dict[str, Any], geometry: dict[str, Any], qc
             }
         )
     return target_layer, horizons
+
+
+def _slice_index_from_u(u_in_zone: float, n_slices: int) -> int:
+    """Map a proportional zone position u∈[0,1] to its slice index.
+
+    Uses the same mid-slice boundary rule as
+    :func:`cup.seismic.lfm_time._build_zone_slice_model_from_points`.
+    """
+    if n_slices < 2:
+        raise ValueError(f"n_slices must be >= 2, got {n_slices}.")
+    slice_u = np.linspace(0.0, 1.0, int(n_slices), dtype=np.float64)
+    boundaries = 0.5 * (slice_u[:-1] + slice_u[1:])
+    return int(np.searchsorted(boundaries, float(u_in_zone), side="right"))
+
+
+def _aggregate_slice_control_points(
+    control_df: pd.DataFrame,
+    *,
+    survey: Any,
+    n_slices: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Aggregate controls to one representative per well, zone, and slice.
+
+    Both vertical and deviated wells get one vote per proportional slice.
+    This prevents dense trajectory samples from contaminating the spatial
+    range estimate while keeping slice assignment owned by step seven.
+    """
+    if control_df.empty:
+        return control_df.copy(), {
+            "method": "well_zone_slice_weighted_representative",
+            "n_slices": int(n_slices),
+            "raw_control_point_count": 0,
+            "model_control_point_count": 0,
+            "removed_control_point_count": 0,
+            "by_source": {},
+            "by_well": [],
+        }
+
+    controls = control_df.copy()
+    controls["_slice_index"] = [
+        _slice_index_from_u(float(u), n_slices) for u in controls["u_in_zone"]
+    ]
+    for well_name, well_group in controls.groupby("well_name", sort=False):
+        for field in ("route", "source"):
+            values = well_group[field].astype(str).unique()
+            if values.size != 1:
+                raise ValueError(
+                    f"Well {well_name!r} has multiple {field} values in LFM controls: {values.tolist()}."
+                )
+
+    group_keys = ["well_name", "zone_name", "_slice_index"]
+    _bool_columns = [
+        "observed_well_sample",
+        "short_gap_interpolated",
+        "hampel_conditioned",
+        "frequency_band_valid",
+        "anchor_eligible",
+    ]
+    _trace_columns = ["flat_idx", "nearest_inline", "nearest_xline", "inline_index", "xline_index"]
+    weighted_columns = {
+        "twt_s",
+        "md_m",
+        "x_m",
+        "y_m",
+        "inline_float",
+        "xline_float",
+        "u_in_zone",
+        "ai",
+    }
+    sample_axis = survey.sample_axis("time").values
+
+    agg_rows: list[dict[str, Any]] = []
+    for group_values, group in controls.groupby(group_keys, sort=False):
+        weights = group["weight"].to_numpy(dtype=np.float64)
+        if np.any(~np.isfinite(weights)) or np.any(weights <= 0.0):
+            raise ValueError("LFM slice aggregation requires finite positive control weights.")
+        weight_sum = float(np.sum(weights))
+        row: dict[str, Any] = {}
+
+        for col in controls.columns:
+            if col == "_slice_index":
+                continue
+            if col in group_keys:
+                row[col] = group[col].iloc[0]
+            elif col in _bool_columns:
+                row[col] = bool(group[col].any())
+            elif col in _trace_columns:
+                pass
+            elif col in weighted_columns:
+                row[col] = float(np.sum(group[col].to_numpy(dtype=np.float64) * weights) / weight_sum)
+            elif np.issubdtype(group[col].dtype, np.number):
+                row[col] = float(group[col].mean())
+            else:
+                row[col] = group[col].iloc[0]
+
+        trace = nearest_trace_fields(survey, row["inline_float"], row["xline_float"])
+        row.update(trace)
+        row["seismic_sample_index"] = int(nearest_sample_indices(sample_axis, np.asarray([row["twt_s"]]))[0])
+        row["slice_index"] = int(group_values[-1])
+        row["source_point_count"] = int(len(group))
+
+        agg_rows.append(row)
+
+    agg_df = pd.DataFrame(agg_rows)
+    agg_df = agg_df[[*control_df.columns, "slice_index", "source_point_count"]]
+    by_source = []
+    for source, source_group in controls.groupby("source", sort=True):
+        model_count = int((agg_df["source"].astype(str) == str(source)).sum())
+        by_source.append(
+            {
+                "source": str(source),
+                "raw_control_point_count": int(len(source_group)),
+                "model_control_point_count": model_count,
+                "removed_control_point_count": int(len(source_group) - model_count),
+            }
+        )
+    by_well = []
+    for well_name, well_group in controls.groupby("well_name", sort=True):
+        model_count = int((agg_df["well_name"].astype(str) == str(well_name)).sum())
+        by_well.append(
+            {
+                "well_name": str(well_name),
+                "source": str(well_group["source"].iloc[0]),
+                "raw_control_point_count": int(len(well_group)),
+                "model_control_point_count": model_count,
+                "removed_control_point_count": int(len(well_group) - model_count),
+            }
+        )
+    stats = {
+        "method": "well_zone_slice_weighted_representative",
+        "n_slices": int(n_slices),
+        "raw_control_point_count": int(len(control_df)),
+        "model_control_point_count": int(len(agg_df)),
+        "removed_control_point_count": int(len(control_df) - len(agg_df)),
+        "by_source": by_source,
+        "by_well": by_well,
+    }
+    return agg_df.reset_index(drop=True), stats
 
 
 def _to_control_points(rows: pd.DataFrame) -> list[Any]:
@@ -865,17 +1004,26 @@ def main() -> None:
     target_layer, horizon_metadata = _build_target_layer(script_cfg, geometry, qc_dir, data_root)
     sample_axis = survey.sample_axis("time").values.astype(np.float64)
     constraints_dir = source_dirs["well_constraints_dir"]
-    control_df, qc_df, constraints_summary = _load_constraints_control_points(constraints_dir)
-    control_path = output_dir / "lfm_control_points.csv"
-    control_df.to_csv(control_path, index=False, encoding="utf-8-sig")
-    if control_df.empty:
+    raw_control_df, qc_df, constraints_summary = _load_constraints_control_points(constraints_dir)
+    if raw_control_df.empty:
         raise ValueError("No LFM control points selected. Check sixth-step well_constraint_qc.csv for rejection reasons.")
+
+    n_slices = int(script_cfg["modeling"]["n_slices"])
+    model_control_df, aggregation_summary = _aggregate_slice_control_points(
+        raw_control_df,
+        survey=survey,
+        n_slices=n_slices,
+    )
+    control_path = output_dir / "lfm_control_points.csv"
+    model_control_path = output_dir / "lfm_model_control_points.csv"
+    raw_control_df.to_csv(control_path, index=False, encoding="utf-8-sig")
+    model_control_df.to_csv(model_control_path, index=False, encoding="utf-8-sig")
 
     from cup.seismic.lfm_time import build_lfm_time_model_from_points
 
     result = build_lfm_time_model_from_points(
         target_layer=target_layer,
-        control_points=_to_control_points(control_df),
+        control_points=_to_control_points(model_control_df),
         boundary_extension_samples=int(script_cfg["modeling"]["boundary_extension_samples"]),
         n_slices=int(script_cfg["modeling"]["n_slices"]),
         variogram=str(script_cfg["modeling"]["variogram"]),
@@ -887,7 +1035,10 @@ def main() -> None:
         {
             "control_source": "well_constraints",
             "well_constraints_dir": repo_relative_path(constraints_dir, root=REPO_ROOT),
+            "raw_control_points_file": repo_relative_path(control_path, root=REPO_ROOT),
+            "model_control_points_file": repo_relative_path(model_control_path, root=REPO_ROOT),
             "frequency_bands": constraints_summary.get("frequency_bands"),
+            "control_aggregation": aggregation_summary,
         }
     )
     metadata_extra = {
@@ -927,10 +1078,10 @@ def main() -> None:
         else:
             export_status = f"unsupported_seismic_type:{seismic_type}"
 
-    _plot_controls(control_df, figures_dir / "qc_control_points.png")
+    _plot_controls(model_control_df, figures_dir / "qc_control_points.png")
     _plot_lfm_result(result, figures_dir / "qc_ai_lfm_time.png")
     well_qc_summary = _write_lfm_well_qc(
-        control_df,
+        raw_control_df,
         result,
         output_dir,
         constraints_summary=constraints_summary,
@@ -938,6 +1089,7 @@ def main() -> None:
     outputs = {
         "ai_lfm_time": repo_relative_path(npz_file, root=REPO_ROOT),
         "control_points": repo_relative_path(control_path, root=REPO_ROOT),
+        "model_control_points": repo_relative_path(model_control_path, root=REPO_ROOT),
         "well_qc": well_qc_summary["well_qc_dir"],
         "well_qc_metrics": well_qc_summary["metrics"],
     }
@@ -949,9 +1101,13 @@ def main() -> None:
         "well_constraints_summary": constraints_summary,
         "config": script_cfg,
         "selected_well_count": (
-            int((qc_df["status"] == "selected").sum()) if "status" in qc_df.columns else int(control_df["well_name"].nunique())
+            int((qc_df["status"] == "selected").sum())
+            if "status" in qc_df.columns
+            else int(raw_control_df["well_name"].nunique())
         ),
-        "control_point_count": int(len(control_df)),
+        "raw_control_point_count": int(len(raw_control_df)),
+        "model_control_point_count": int(len(model_control_df)),
+        "control_aggregation": aggregation_summary,
         "outputs": outputs,
         "well_qc": well_qc_summary,
         "export_status": export_status,
@@ -962,7 +1118,10 @@ def main() -> None:
     print("=== LFM Precomputed ===")
     print(f"Output: {output_dir}")
     print(f"Selected wells: {summary['selected_well_count']}")
-    print(f"Control points: {summary['control_point_count']}")
+    print(
+        "Control points: "
+        f"raw={summary['raw_control_point_count']}, model={summary['model_control_point_count']}"
+    )
     print(f"NPZ: {npz_file}")
     print(f"Well QC: {output_dir / 'well_qc'}")
     if export_status not in {"written", "disabled"}:

@@ -344,7 +344,7 @@
 
 ## 07 · lfm_precomputed.py
 
-第七步不产出 CSV 契约。它读取第六步的 `lfm_control_points.csv` 和 `well_constraint_qc.csv`，产出 `ai_lfm_time.npz` 供第八步 GINN 训练使用。
+第七步读取第六步的 `lfm_control_points.csv` 和 `well_constraint_qc.csv`，产出 `ai_lfm_time.npz` 供第八步 GINN 训练使用。输出目录中的 `lfm_control_points.csv` 是第六步原始点级事实的审计副本；`lfm_model_control_points.csv` 是按第七步 `n_slices` 聚合后的实际建模代表点，仅供本步建模和人工审阅，不进入后续步骤契约。
 
 ---
 

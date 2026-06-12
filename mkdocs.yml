@@ -47,7 +47,6 @@ nav:
       - 核心 CSV 契约: concepts/csv-contracts.md
       - 数据与单位约定: concepts/data-and-coordinate-conventions.md
       - 脚本风格指南: concepts/script-style.md
-      - 工作流总览: concepts/time-domain-workflow.md
   - 教程:
       - 01 井资产盘点: guide/1-well-inventory.md
       - 02 LAS 曲线筛选与导出: guide/2-well-screen.md

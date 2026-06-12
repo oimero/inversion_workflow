@@ -740,7 +740,10 @@ def scaled_synthetic_metrics(
     返回 ``(seismic_norm, synthetic, corr, nmae, scale)``。
     """
     with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="Wavelet has odd number of samples\\.")
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Wavelet has even number of samples; appending one zero sample\.",
+        )
         synthetic_raw = np.asarray(modeler(wavelet.values, reflectivity.values), dtype=np.float64)
     seismic_values = np.asarray(seismic.values, dtype=np.float64)
     seismic_norm = seismic_values - float(np.nanmean(seismic_values))

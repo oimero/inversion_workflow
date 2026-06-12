@@ -49,7 +49,7 @@ well_constraints:
     twt_unit: auto
 
   control_wells:
-    min_batch_corr: 0.35          # 第五步合成相关系数低于此值的井不参与
+    min_batch_corr: 0.3           # 第五步合成相关系数低于此值的井不参与
     max_batch_nmae: null          # 可选 NMAE 上限
     include_wells: null           # 白名单模式
     exclude_wells: []             # 人工剔除井
@@ -171,7 +171,7 @@ weight = corr_min_weight + (1 - corr_min_weight) × clamp((corr - corr_floor) / 
 
 对每口第四步标定成功、且第五步合成指标达标的井：
 
-1. 从 `well_tie_plan.input_las` 读取第三步的标准 LAS，提取 `DT_USM` 和 `RHO_GCC`。保留原始 NaN——不做无条件线性贯通。
+1. 从 `well_tie_plan.input_las` 读取第三步的标准 LAS，提取 `DT_USM` 和 `RHO_GCC`。保留原始 NaN。
 2. 用第四步输出的优化时深表，将 MD 域曲线映射到地震 TWT 采样轴上。
 3. 识别 DT 和 RHO 同时无效的段：≤ 10 ms 的短缺口用端点值线性插值；> 10 ms 的长缺口保持 NaN。
 4. 在 log-AI 域做 Hampel 去尖峰：对每段连续有效数据，用滑动窗口中位数检测孤立异常值，只替换尖峰不覆盖正常段。
@@ -235,7 +235,7 @@ enhance_residual   = reference_log_ai − ginn_target_log_ai
 ### 第五阶段：聚合与导出
 
 1. **聚合**：将同一 flat_idx + seismic_sample_index 上的多点（不同井可能落到同一道同一样点）按权重加权平均，解决同道冲突。
-2. **导出 GINN anchor**：`ginn_target_log_ai` 作为井 anchor 值。GINN 训练时以此为井监督目标——不再用 LFM 做 anchor，避免地震损失和井监督在同一频带内互相争夺。
+2. **导出 GINN anchor**：`ginn_target_log_ai` 作为井 anchor 值，GINN 训练时以此为井监督目标。
 3. **导出 Enhance 监督**：`enhance_residual_log_ai` 作为监督目标。只有 `observed_well_sample=true` 的样点才进入监督，插值和 Hampel 替换的样点不参与。
 4. **导出 LFM 控制点**：`lfm_ai` 仅来自真实观测样点，供第七步 LFM 插值使用。
 5. **写出诊断和 QC**：逐井、逐候选的正演指标；簇级和全局聚合；三频带数值 trace 和对比图。

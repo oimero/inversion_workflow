@@ -43,7 +43,7 @@ from cup.petrel.load import import_well_heads_petrel
 from cup.seismic.survey import open_survey
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename
 from cup.utils.raw_trace import zscore_trace
-from cup.well.wavelet import compute_wavelet_active_half_support_s, infer_wavelet_dt, load_wavelet_csv
+from cup.seismic.wavelet import compute_wavelet_active_half_support_s, infer_wavelet_dt, load_wavelet_csv
 from wavelet_batch_synthetic_depth import depth_curve_to_twt, make_eval_mask, metrics_for_synthetic
 from wtie.modeling.modeling import ConvModeler
 from wtie.optimize import tie as tie_utils

@@ -650,7 +650,7 @@ def main() -> None:
 
     # ── Load wavelet ──
 
-    from cup.well.wavelet import (
+    from cup.seismic.wavelet import (
         compute_wavelet_active_half_support_s,
         infer_wavelet_dt,
         load_wavelet_csv,
@@ -663,7 +663,7 @@ def main() -> None:
         raise ValueError("Expected an odd-sample centered wavelet.")
     wavelet_dt_s = infer_wavelet_dt(wavelet_time_s)
     wavelet_full_half_s = max(abs(float(wavelet_time_s[0])), abs(float(wavelet_time_s[-1])))
-    # Uses cup.well.wavelet.DEFAULT_ACTIVE_SUPPORT_THRESHOLD (=0.05).
+    # Uses cup.seismic.wavelet.DEFAULT_ACTIVE_SUPPORT_THRESHOLD (=0.05).
     wavelet_active_half_support_s = compute_wavelet_active_half_support_s(
         wavelet_time_s,
         wavelet_amp,

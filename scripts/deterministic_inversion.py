@@ -53,7 +53,7 @@ from cup.utils.io import (
     write_json,
 )
 from cup.well.assets import normalize_well_name
-from cup.well.wavelet import load_wavelet_csv, validate_wavelet_dt
+from cup.seismic.wavelet import load_wavelet_csv, validate_wavelet_dt
 from ginn.anchor import load_log_ai_anchor_npz
 from wtie.processing import grid
 

@@ -29,6 +29,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cup.seismic.wavelet import load_wavelet_csv, wavelet_half_amplitude_frequencies
 from cup.time_config import TimeWorkflowConfig
 from cup.utils.config import deep_merge_dict
 from cup.utils.io import (
@@ -59,12 +60,11 @@ from cup.well.frequency_bands import (
     build_frequency_bands,
     ginn_cutoff_candidates,
     segmented_lowpass,
-    wavelet_half_amplitude_frequencies,
 )
 from cup.well.las import load_standard_vp_rho_logs
 from cup.well.td import load_workflow_time_depth_table_csv
 from cup.well.tie import load_saved_seismic_trace_csv
-from cup.well.wavelet import load_wavelet_csv
+
 # Step 06 depends on downstream bundle schemas only. Keep GINN/enhance training
 # logic out of this script; move schemas to a neutral package when they stabilize.
 from enhance.supervision import (

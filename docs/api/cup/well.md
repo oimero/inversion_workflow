@@ -10,6 +10,8 @@
 
 ::: cup.well.preprocess
 
+::: cup.well.gaps
+
 ::: cup.well.tie
 
 ::: cup.well.td
@@ -17,5 +19,3 @@
 ::: cup.well.trajectory
 
 ::: cup.well.viz
-
-::: cup.well.wavelet

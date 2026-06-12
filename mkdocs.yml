@@ -58,9 +58,9 @@ nav:
       - 06 分频诊断与井约束: guide/6-well-constraints.md
       - 07 构建低频模型: guide/7-lfm-precomputed.md
       - 旁路 正演增益: guide/dynamic-gain.md
-      - 旁路 确定性反演: guide/deterministic-inversion.md
       - 08 GINN 训练: guide/8-ginn-train.md
       - 09 GINN 反演: guide/9-ginn-inversion.md
+      - 旁路 确定性反演: guide/deterministic-inversion.md
       - 常见问题: guide/troubleshooting.md
   - 架构与路线图:
       - 斜井支持的 src/cup 重构规划: guide/deviated-well-src-cup-refactor.md

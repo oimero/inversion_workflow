@@ -1,4 +1,4 @@
-"""cup.well.gain: time-domain dynamic gain computation.
+"""cup.seismic.gain: time-domain dynamic gain computation.
 
 This module houses the business logic for estimating, fitting, and applying a
 time-domain dynamic gain volume.  The gain maps unit-wavelet LFM synthetics

@@ -17,7 +17,7 @@ from cup.petrel.load import import_interpretation_petrel, import_seismic
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.utils.io import resolve_repo_metadata_path
-from cup.well.wavelet import (
+from cup.seismic.wavelet import (
     DEFAULT_ACTIVE_SUPPORT_THRESHOLD,
     compute_wavelet_active_half_support_s,
     load_wavelet_csv,

@@ -38,7 +38,7 @@ if str(SRC_DIR) not in sys.path:
 from cup.utils.io import load_yaml_config, resolve_relative_path, sanitize_filename
 from cup.well.td import crop_logset_md
 from cup.well.tie import build_auto_tie_search_space, scaled_synthetic_metrics
-from cup.well.wavelet import crop_wavelet_center_energy_normalize
+from cup.seismic.wavelet import crop_wavelet_center_energy_normalize
 
 if TYPE_CHECKING:
     from wtie.modeling.modeling import ConvModeler

@@ -347,6 +347,12 @@
 
 ---
 
+## 旁路 · dynamic_gain.py
+
+Dynamic gain 旁路，置于第七步之后、第八步之前。读取第四步 `well_tie_metrics.csv` 和第五步 `selected_wavelet.csv`，产出 `dynamic_gain.npz` 和若干诊断 CSV（`dynamic_gain_samples.csv`、`dynamic_gain_well_medians.csv` 等）。诊断 CSV 仅供人工审阅，`dynamic_gain.npz` 可由第八步按配置读取。
+
+---
+
 ## 08 · ginn_train.py
 
 第八步不读写 CSV。它通过 YAML 配置读取第七步的 `ai_lfm_time.npz`、第五步的 `selected_wavelet.csv`（经 `ginn.config` 解析）和可选的第六步 anchor NPZ，产出 GINN checkpoint。
@@ -362,9 +368,3 @@
 ## 旁路 · deterministic_inversion.py
 
 确定性反演旁路，置于第七步之后、第八步之前。读取第五步 `selected_wavelet.csv` 和第六步 `well_constraint_points.csv`（用于井 QC），产出 `well_qc_metrics.csv` 和确定性反演体。不产出新的跨步骤 CSV 契约。
-
----
-
-## 旁路 · dynamic_gain.py
-
-Dynamic gain 旁路，置于第七步之后、第八步之前。读取第四步 `well_tie_metrics.csv` 和第五步 `selected_wavelet.csv`，产出 `dynamic_gain.npz` 和若干诊断 CSV（`dynamic_gain_samples.csv`、`dynamic_gain_well_medians.csv` 等）。诊断 CSV 仅供人工审阅，`dynamic_gain.npz` 可由第八步按配置读取。

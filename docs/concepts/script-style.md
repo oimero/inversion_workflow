@@ -66,11 +66,12 @@
 | 曲线 mnemonic 规则 | `cup.well.mnemonics` | `CURVE_CATEGORY_MNEMONICS` |
 | 预处理清洗 | `cup.well.preprocess` | `standardize_curve_unit` / `replace_constant_runs` / `remove_outliers` 等 |
 | 时深表加载 | `cup.well.td` | `load_petrel_time_depth_table` / `load_workflow_time_depth_table_csv` |
-| 子波加载 | `cup.well.wavelet` | `load_wavelet_csv` / `crop_wavelet_center_energy_normalize` |
-| 子波共识搜索 | `cup.well.wavelet_consensus` | `build_wavelet_pca_basis` / `optimize_consensus_wavelet` |
+| 子波加载与频谱 | `cup.seismic.wavelet` | `load_wavelet_csv` / `crop_wavelet_center_energy_normalize` / `wavelet_half_amplitude_frequencies` |
+| 子波共识搜索 | `cup.seismic.wavelet_consensus` | `build_wavelet_pca_basis` / `optimize_consensus_wavelet` |
 | 井震标定路由 | `cup.well.tie` | `build_tie_plan` / `WellTiePlan` / `evaluate_wavelet_on_well` 等 |
 | 井约束点级事实 | `cup.well.constraints` | `build_vertical_point_facts` / `build_deviated_point_facts` / `lowpass_values_on_twt` 等 |
-| dynamic gain 计算 | `cup.well.gain` | `positive_ls_gain` / `fit_gain_relationship` / `build_gain_volume` / `write_gain_npz` |
+| TDT 感知测井连续化 | `cup.well.gaps` | `fill_short_joint_gaps` / `prepare_continuous_tie_logs` |
+| dynamic gain 计算 | `cup.seismic.gain` | `positive_ls_gain` / `fit_gain_relationship` / `build_gain_volume` / `write_gain_npz` |
 | LFM 时间域建模 | `cup.seismic.lfm_time` | `build_lfm_time_model_from_points` |
 | LFM 低通滤波 | `cup.seismic.lfm_time` | `lowpass_twt_log` |
 | 沿轨迹取道 | `cup.seismic.trace_sampling` | `build_nearest_trace_sample_plan` / `assemble_nearest_trace_from_plan` |

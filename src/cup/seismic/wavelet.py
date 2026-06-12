@@ -1,4 +1,4 @@
-"""cup.well.wavelet: 小波加载与生成辅助工具。
+"""cup.seismic.wavelet: 地震子波加载、生成与频谱辅助工具。
 
 本模块提供 Ricker 小波生成、CSV 波形加载与采样间隔校验等功能。
 
@@ -17,10 +17,11 @@
 6. validate_wavelet_dt: 校验小波采样间隔。
 7. validate_wavelet_normalization: 校验子波中心、有限性和 L2 能量。
 8. wavelet_l2_normalize / wavelet_roughness / wavelet_spectrum_features: 子波属性计算。
+9. wavelet_half_amplitude_frequencies: 计算振幅谱峰值及左右半峰值频率。
 
 Examples
 --------
->>> from cup.well.wavelet import make_wavelet, infer_wavelet_dt
+>>> from cup.seismic.wavelet import make_wavelet, infer_wavelet_dt
 >>> time_s, amp = make_wavelet("ricker", freq=30.0, dt=0.001, length=128)
 >>> _ = infer_wavelet_dt(time_s)
 """
@@ -368,6 +369,52 @@ def wavelet_spectrum_features(
         high_frequency_hz=float(frequencies[high_index]),
         side_lobe_ratio=side_lobe_ratio,
     )
+
+
+def wavelet_half_amplitude_frequencies(
+    time_s: np.ndarray,
+    amplitude: np.ndarray,
+) -> tuple[float, float, float]:
+    """Return peak, left, and right normalized-amplitude 0.5 frequencies."""
+    time = np.asarray(time_s, dtype=np.float64).reshape(-1)
+    values = np.asarray(amplitude, dtype=np.float64).reshape(-1)
+    if time.shape != values.shape or time.size < 4:
+        raise ValueError("Wavelet time and amplitude must have matching length >= 4.")
+    diffs = np.diff(time)
+    if np.any(~np.isfinite(time)) or np.any(~np.isfinite(values)) or np.any(diffs <= 0.0):
+        raise ValueError("Wavelet time must be finite and strictly increasing; amplitude must be finite.")
+    dt_s = float(np.median(diffs))
+    if not np.allclose(diffs, dt_s, rtol=1e-4, atol=1e-9):
+        raise ValueError("Wavelet time axis must be regularly sampled.")
+    n_fft = max(4096, 1 << int(np.ceil(np.log2(values.size * 16))))
+    frequency = np.fft.rfftfreq(n_fft, d=dt_s)
+    spectrum = np.abs(np.fft.rfft(values, n=n_fft))
+    peak_index = int(np.argmax(spectrum))
+    peak = float(spectrum[peak_index])
+    if peak <= 0.0:
+        raise ValueError("Wavelet spectrum has zero peak amplitude.")
+    normalized = spectrum / peak
+
+    def crossing(indices: range) -> float:
+        for index in indices:
+            a = float(normalized[index])
+            b = float(normalized[index + 1])
+            if (a - 0.5) * (b - 0.5) <= 0.0 and a != b:
+                fraction = (0.5 - a) / (b - a)
+                return float(frequency[index] + fraction * (frequency[index + 1] - frequency[index]))
+        raise ValueError("Wavelet spectrum has no amplitude-0.5 crossing around its peak.")
+
+    left_candidates = [
+        index
+        for index in range(0, peak_index)
+        if (float(normalized[index]) - 0.5) * (float(normalized[index + 1]) - 0.5) <= 0.0
+        and float(normalized[index]) != float(normalized[index + 1])
+    ]
+    if not left_candidates:
+        raise ValueError("Wavelet spectrum has no left amplitude-0.5 crossing.")
+    left = crossing(range(left_candidates[-1], left_candidates[-1] + 1))
+    right = crossing(range(peak_index, frequency.size - 1))
+    return float(frequency[peak_index]), left, right
 
 
 def crop_wavelet_center_energy_normalize(

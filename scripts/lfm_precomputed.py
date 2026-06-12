@@ -48,7 +48,7 @@ from cup.seismic.viz import (
 )
 from cup.well.assets import normalize_well_name
 from cup.well.tie import load_saved_seismic_trace_csv
-from cup.well.wavelet import compute_wavelet_active_half_support_s, load_wavelet_csv, validate_wavelet_dt
+from cup.seismic.wavelet import compute_wavelet_active_half_support_s, load_wavelet_csv, validate_wavelet_dt
 from wtie.modeling.modeling import ConvModeler
 from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
 from wtie.processing import grid

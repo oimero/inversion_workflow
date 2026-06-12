@@ -52,7 +52,7 @@ from cup.utils.io import (
 from cup.well.assets import normalize_well_name
 from cup.well.las import load_vp_rho_logset_from_standard_las
 from cup.well.td import load_workflow_time_depth_table_csv
-from cup.well.gain import (
+from cup.seismic.gain import (
     CANDIDATE_ATTRIBUTES,
     NORMALIZATION,
     SCHEMA_VERSION,
@@ -64,7 +64,7 @@ from cup.well.gain import (
     segment_attribute_values,
     write_gain_npz as write_dynamic_gain_npz,
 )
-from cup.well.wavelet import load_wavelet_csv, validate_wavelet_dt
+from cup.seismic.wavelet import load_wavelet_csv, validate_wavelet_dt
 from ginn.anchor import load_log_ai_anchor_npz, validate_log_ai_anchor
 from ginn.config import GINNConfig
 from ginn.data import (
@@ -629,7 +629,7 @@ def estimate_well_gain_samples(ctx: DynamicGainContext, syn_unit: np.ndarray) ->
 
 
 def fit_gain_relationship(ctx: DynamicGainContext, sample_df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any], pd.DataFrame]:
-    """Thin wrapper — unpack config from *ctx* then delegate to ``cup.well.gain``."""
+    """Thin wrapper — unpack config from *ctx* then delegate to ``cup.seismic.gain``."""
     attr_cfg = dict(ctx.script_cfg["attributes"])
     candidate_attributes = [str(v) for v in attr_cfg.get("candidate_attributes", list(CANDIDATE_ATTRIBUTES))]
     clip_percentiles_raw = ctx.script_cfg["prediction"].get("clip_percentiles", [5.0, 95.0])
@@ -666,7 +666,7 @@ def _configured_attribute_window_samples(ctx: DynamicGainContext, sample_df: pd.
 
 
 def build_gain_volume(ctx: DynamicGainContext, fit: dict[str, Any], sample_df: pd.DataFrame) -> tuple[np.ndarray, dict[str, Any]]:
-    """Thin wrapper — unpack context then delegate to ``cup.well.gain``."""
+    """Thin wrapper — unpack context then delegate to ``cup.seismic.gain``."""
     n_sample = int(ctx.geometry["n_sample"])
     flat = (ctx.seismic.reshape(-1, n_sample) / float(ctx.train_mask_rms)).astype(np.float32)
     window_samples = _configured_attribute_window_samples(ctx, sample_df)
@@ -683,7 +683,7 @@ def build_gain_volume(ctx: DynamicGainContext, fit: dict[str, Any], sample_df: p
 
 
 def write_gain_npz(ctx: DynamicGainContext, gain_volume: np.ndarray, fit: dict[str, Any], volume_stats: dict[str, Any]) -> Path:
-    """Thin wrapper — unpack context then delegate to ``cup.well.gain``."""
+    """Thin wrapper — unpack context then delegate to ``cup.seismic.gain``."""
     path = ctx.output_dir / "dynamic_gain.npz"
     write_dynamic_gain_npz(
         path,

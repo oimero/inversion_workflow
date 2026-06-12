@@ -322,49 +322,6 @@ def build_frequency_bands(conditioned: ConditionedWellLog, cfg: ThreeBandSplitCo
     )
 
 
-def wavelet_half_amplitude_frequencies(time_s: np.ndarray, amplitude: np.ndarray) -> tuple[float, float, float]:
-    """Return peak, left, and right normalized-amplitude 0.5 frequencies."""
-    time = np.asarray(time_s, dtype=np.float64).reshape(-1)
-    values = np.asarray(amplitude, dtype=np.float64).reshape(-1)
-    if time.shape != values.shape or time.size < 4:
-        raise ValueError("Wavelet time and amplitude must have matching length >= 4.")
-    diffs = np.diff(time)
-    if np.any(~np.isfinite(time)) or np.any(~np.isfinite(values)) or np.any(diffs <= 0.0):
-        raise ValueError("Wavelet time must be finite and strictly increasing; amplitude must be finite.")
-    dt_s = float(np.median(diffs))
-    if not np.allclose(diffs, dt_s, rtol=1e-4, atol=1e-9):
-        raise ValueError("Wavelet time axis must be regularly sampled.")
-    n_fft = max(4096, 1 << int(np.ceil(np.log2(values.size * 16))))
-    frequency = np.fft.rfftfreq(n_fft, d=dt_s)
-    spectrum = np.abs(np.fft.rfft(values, n=n_fft))
-    peak_index = int(np.argmax(spectrum))
-    peak = float(spectrum[peak_index])
-    if peak <= 0.0:
-        raise ValueError("Wavelet spectrum has zero peak amplitude.")
-    normalized = spectrum / peak
-
-    def crossing(indices: range) -> float:
-        for index in indices:
-            a = float(normalized[index])
-            b = float(normalized[index + 1])
-            if (a - 0.5) * (b - 0.5) <= 0.0 and a != b:
-                fraction = (0.5 - a) / (b - a)
-                return float(frequency[index] + fraction * (frequency[index + 1] - frequency[index]))
-        raise ValueError("Wavelet spectrum has no amplitude-0.5 crossing around its peak.")
-
-    left_candidates = [
-        index
-        for index in range(0, peak_index)
-        if (float(normalized[index]) - 0.5) * (float(normalized[index + 1]) - 0.5) <= 0.0
-        and float(normalized[index]) != float(normalized[index + 1])
-    ]
-    if not left_candidates:
-        raise ValueError("Wavelet spectrum has no left amplitude-0.5 crossing.")
-    left = crossing(range(left_candidates[-1], left_candidates[-1] + 1))
-    right = crossing(range(peak_index, frequency.size - 1))
-    return float(frequency[peak_index]), left, right
-
-
 def ginn_cutoff_candidates(
     right_half_amplitude_hz: float,
     *,

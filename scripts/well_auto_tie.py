@@ -69,7 +69,7 @@ from cup.well.td import (
 )
 from cup.well.tie import TieRoute, WellTiePlan, WellTieResult, build_auto_tie_search_space, build_tie_plan, plans_dataframe, results_dataframe, scaled_synthetic_metrics
 from cup.well.trajectory import WellTrajectory, sample_trajectory_on_twt
-from cup.well.wavelet import crop_wavelet_center_energy_normalize
+from cup.seismic.wavelet import crop_wavelet_center_energy_normalize
 from wtie.processing import grid
 
 

@@ -48,14 +48,14 @@ from cup.well.tie import (
     load_tie_artifacts,
     prepare_well_for_evaluation,
 )
-from cup.well.wavelet import (
+from cup.seismic.wavelet import (
     infer_wavelet_dt,
     load_wavelet_csv,
     validate_wavelet_normalization,
     wavelet_roughness,
     wavelet_spectrum_features,
 )
-from cup.well.wavelet_consensus import ConsensusSearchPolicy, build_wavelet_pca_basis, optimize_consensus_wavelet
+from cup.seismic.wavelet_consensus import ConsensusSearchPolicy, build_wavelet_pca_basis, optimize_consensus_wavelet
 from wtie.modeling.modeling import ConvModeler
 from wtie.optimize import tie as tie_ops
 from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr

@@ -1,4 +1,4 @@
-"""cup.well.wavelet_consensus: generate a global wavelet from candidates.
+"""cup.seismic.wavelet_consensus: generate a global wavelet from candidates.
 
 This module owns the low-dimensional wavelet-shape algorithm.  It does not read
 LAS, time-depth tables, seismic files, or auto-tie artifacts; callers provide
@@ -12,7 +12,7 @@ from typing import Callable, Mapping
 
 import numpy as np
 
-from cup.well.wavelet import wavelet_l2_normalize
+from cup.seismic.wavelet import wavelet_l2_normalize
 
 
 # Evaluators may return a scalar score or a metric mapping containing

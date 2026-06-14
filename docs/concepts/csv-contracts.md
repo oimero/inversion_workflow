@@ -369,10 +369,10 @@ Dynamic gain 旁路，置于第七步之后、第八步之前。读取第五步 
 
 ## 09 · ginn_inversion.py
 
-第九步读取第八步 checkpoint 执行反演，产出 `well_qc_metrics.csv` 和逐井 `well_qc_*.csv` 用于井 QC 评估。这些 QC CSV 是脚本内部产物，不进入其他主链步骤的输入。
+第九步读取第八步 checkpoint 执行反演，产出 `well_qc_metrics.csv` 和逐井 `well_qc_*.csv`。逐井明细包含 reference/GINN target/LFM/预测 AI、预测反射系数、归一化地震、GINN 正演、残差和有效 mask；指标同时覆盖阻抗误差与波形 `corr/nmae`。这些 QC CSV 是脚本内部产物，不进入其他主链步骤的输入。
 
 ---
 
 ## 旁路 · deterministic_inversion.py
 
-确定性反演旁路，置于第七步之后、第八步之前。读取第五步 `selected_wavelet.csv` 和第六步 `well_constraint_points.csv`（用于井 QC），产出 `well_qc_metrics.csv` 和确定性反演体。不产出新的跨步骤 CSV 契约。
+确定性反演旁路，置于第七步之后、第八步之前。读取第五步 `selected_wavelet.csv` 和第六步 `well_constraint_points.csv`（用于井 QC），产出 `well_qc_metrics.csv`、与第七/九步同版式的逐井六联波形 QC 和确定性反演体。不产出新的跨步骤 CSV 契约。

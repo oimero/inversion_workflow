@@ -8,6 +8,7 @@ Usage::
 
     python scripts/deterministic_inversion.py
     python scripts/deterministic_inversion.py --config experiments/common.yaml
+    python scripts/deterministic_inversion.py --slice xline=250
     python scripts/deterministic_inversion.py --output-dir scripts/output/deterministic_inversion_test
 """
 
@@ -39,11 +40,18 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.petrel.load import import_interpretation_petrel
+from cup.seismic.geometry import validate_sample_indices
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.target_zone import TargetZone
-from cup.seismic.viz import impedance_qc_metrics, plot_well_impedance_qc
+from cup.seismic.viz import (
+    impedance_qc_metrics,
+    plot_well_waveform_qc,
+    waveform_qc_metrics,
+)
+from cup.time_config import TimeWorkflowConfig
 from cup.utils.config import deep_merge_dict
 from cup.utils.io import (
+    build_segy_textual_header,
     latest_run,
     load_yaml_config,
     repo_relative_path,
@@ -53,8 +61,10 @@ from cup.utils.io import (
     write_json,
 )
 from cup.well.assets import normalize_well_name
+from cup.well.constraints import horizon_markers_from_zone_points
 from cup.seismic.wavelet import load_wavelet_csv, validate_wavelet_dt
 from ginn.anchor import load_log_ai_anchor_npz
+from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
 from wtie.processing import grid
 
 logger = logging.getLogger(__name__)
@@ -64,33 +74,14 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "source_runs": {
-        "mode": "latest",
-        "lfm_precomputed_dir": None,
-        "wavelet_generation_dir": None,
-        "well_constraints_dir": None,
-    },
-    "seismic": {
-        "file": None,
-        "type": None,
-    },
-    "ai_lfm_file": None,
-    "wavelet_file": None,
-    "log_ai_anchor_file": None,
     "boundary_extension_samples": 30,
     "epsR": 0.20,
     "damp": 0.03,
     "iter_lim": 100,
-    "show_solver": True,
     "export_volume": True,
-    "export_segy": False,
-    "export_zgy": True,
-    "zgy_inline_chunk_size": 16,
-    "qc_wells": True,
-    "slice_mode": "inline",
-    "slice_index": None,
-    "clip_percentiles": [1.0, 99.0],
 }
+
+QC_CLIP_PERCENTILES = (1.0, 99.0)
 
 
 # =============================================================================
@@ -107,6 +98,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Output directory. Defaults to <output_root>/deterministic_inversion_<timestamp>.",
     )
+    parser.add_argument(
+        "--slice",
+        default="inline",
+        metavar="inline[=INDEX]|xline[=INDEX]",
+        help="QC section direction and optional zero-based index. Defaults to the central inline.",
+    )
+    parser.add_argument("--skip-volume", action="store_true", help="Skip optional survey-format volume export.")
     return parser.parse_args()
 
 
@@ -159,6 +157,21 @@ def _resolve_slice_index(mode: str, index: int | None, geometry: dict[str, Any])
     if not (0 <= index < size):
         raise IndexError(f"slice_index={index} out of range for {mode} size={size}")
     return int(index)
+
+
+def _parse_slice_spec(value: str) -> tuple[str, int | None]:
+    mode_text, separator, index_text = str(value).strip().casefold().partition("=")
+    if mode_text not in {"inline", "xline"}:
+        raise ValueError("--slice must be inline, xline, inline=INDEX, or xline=INDEX.")
+    if not separator:
+        return mode_text, None
+    if not index_text.strip():
+        raise ValueError("--slice index must not be empty.")
+    try:
+        index = int(index_text)
+    except ValueError as exc:
+        raise ValueError(f"--slice index must be an integer, got {index_text!r}.") from exc
+    return mode_text, index
 
 
 def _extract_section(volume: np.ndarray, mode: str, index: int) -> np.ndarray:
@@ -264,6 +277,41 @@ def _try_write_zgy(
         return f"failed:{exc}"
 
 
+def _try_write_segy(
+    segy_file: Path,
+    *,
+    volume: np.ndarray,
+    seismic_file: Path,
+    seismic_type: str,
+    seismic_cfg: dict[str, Any],
+) -> str:
+    if seismic_type.lower() != "segy":
+        return "skipped_non_segy_source"
+    try:
+        import cigsegy
+
+        keylocs = [
+            int(seismic_cfg["iline_byte"]),
+            int(seismic_cfg["xline_byte"]),
+            int(seismic_cfg["istep"]),
+            int(seismic_cfg["xstep"]),
+        ]
+        textual = build_segy_textual_header(
+            "Time-domain deterministic acoustic impedance",
+            ["artifact=deterministic_ai_full.npz", "source=deterministic_inversion.py"],
+        )
+        cigsegy.create_by_sharing_header(
+            str(segy_file),
+            str(seismic_file),
+            np.ascontiguousarray(np.asarray(volume, dtype=np.float32)),
+            keylocs=keylocs,
+            textual=textual,
+        )
+        return "written"
+    except Exception as exc:
+        return f"failed:{exc}"
+
+
 def _json_scalar_to_dict(value: np.ndarray) -> dict[str, Any]:
     payload = np.asarray(value).item()
     if isinstance(payload, bytes):
@@ -276,16 +324,6 @@ def _is_missing_config_value(value: Any) -> bool:
         return True
     text = str(value).strip()
     return not text or text.casefold() in {"none", "null", "nan"}
-
-
-def _apply_seismic_fallback(script_cfg: dict[str, Any], common_cfg: dict[str, Any]) -> None:
-    seismic_cfg = dict(script_cfg.get("seismic") or {})
-    fallback = dict((common_cfg.get("lfm_precomputed") or {}).get("seismic") or {})
-    if _is_missing_config_value(seismic_cfg.get("file")) and not _is_missing_config_value(fallback.get("file")):
-        seismic_cfg["file"] = fallback["file"]
-    if _is_missing_config_value(seismic_cfg.get("type")) and not _is_missing_config_value(fallback.get("type")):
-        seismic_cfg["type"] = fallback["type"]
-    script_cfg["seismic"] = seismic_cfg
 
 
 def _resolve_run_file(
@@ -321,24 +359,23 @@ def _resolve_run_file(
 # =============================================================================
 
 
-def _load_seismic(script_cfg: dict[str, Any], data_root: Path) -> tuple[np.ndarray, Any, Path, str, dict[str, Any]]:
+def _load_seismic(seismic_cfg: dict[str, Any], data_root: Path) -> tuple[np.ndarray, Any, Path, str, dict[str, Any]]:
     """Open seismic survey and read the full volume.
 
     Returns (volume, survey, seismic_file, seismic_type, geometry).
     """
     from cup.petrel.load import import_seismic
 
-    seismic_cfg = dict(script_cfg.get("seismic") or {})
     raw_file = seismic_cfg.get("file")
     if _is_missing_config_value(raw_file):
-        raise ValueError("deterministic_inversion.seismic.file must be set in config.")
+        raise ValueError("seismic.file must be set in config.")
     seismic_file = resolve_relative_path(raw_file, root=data_root)
     seismic_type_value = seismic_cfg.get("type")
     seismic_type = "segy" if _is_missing_config_value(seismic_type_value) else str(seismic_type_value).strip().lower()
 
     segy_opts = None
     if seismic_type == "segy":
-        segy_opts = segy_options_from_config(dict(script_cfg.get("segy") or {}))
+        segy_opts = segy_options_from_config(seismic_cfg)
 
     volume = import_seismic(
         seismic_file,
@@ -743,15 +780,110 @@ def _plot_deterministic_slice(
     _save_fig(path)
 
 
+def _resolve_anchor_point_table(anchor_file: Path, metadata: dict[str, Any]) -> Path | None:
+    raw_path = metadata.get("point_table")
+    if raw_path in {None, ""}:
+        return None
+    path = Path(str(raw_path))
+    return path if path.is_absolute() else (REPO_ROOT / path).resolve()
+
+
+def _point_table_for_anchor(anchor_name: str, flat_idx: int, point_df: pd.DataFrame) -> pd.DataFrame:
+    if point_df.empty:
+        return point_df
+    out = point_df.loc[point_df["flat_idx"].astype("Int64") == int(flat_idx)].copy()
+    if "well_name" in out.columns:
+        key = normalize_well_name(anchor_name)
+        named = out.loc[
+            out["well_name"].map(lambda value: normalize_well_name(str(value))) == key
+        ].copy()
+        if not named.empty:
+            out = named
+    return out
+
+
+def _well_ai_on_axis(
+    point_group: pd.DataFrame,
+    samples: np.ndarray,
+    *,
+    value_column: str,
+) -> np.ndarray:
+    sample_axis = np.asarray(samples, dtype=np.float64).reshape(-1)
+    values_on_axis = np.full(sample_axis.size, np.nan, dtype=np.float64)
+    if point_group.empty or value_column not in point_group.columns:
+        return values_on_axis
+    required = {"twt_s", "seismic_sample_index"}
+    missing = required - set(point_group.columns)
+    if missing:
+        raise ValueError(f"Anchor point table is missing required columns: {sorted(missing)}")
+    sample_indices = validate_sample_indices(
+        sample_axis,
+        point_group["twt_s"].to_numpy(dtype=np.float64),
+        point_group["seismic_sample_index"].to_numpy(dtype=np.float64),
+        field_name="seismic_sample_index",
+    )
+    ai_values = point_group[value_column].to_numpy(dtype=np.float64)
+    weights = (
+        np.maximum(point_group["weight"].to_numpy(dtype=np.float64), 0.0)
+        if "weight" in point_group.columns
+        else np.ones(ai_values.size, dtype=np.float64)
+    )
+    for sample_idx in np.unique(sample_indices):
+        selected = (sample_indices == sample_idx) & np.isfinite(ai_values)
+        if not np.any(selected):
+            continue
+        selected_weights = weights[selected]
+        if not np.any(selected_weights > 0.0):
+            selected_weights = np.ones(selected_weights.size, dtype=np.float64)
+        values_on_axis[int(sample_idx)] = float(np.average(ai_values[selected], weights=selected_weights))
+    return values_on_axis
+
+
+def _reflectivity_from_ai(ai: np.ndarray) -> np.ndarray:
+    values = np.asarray(ai, dtype=np.float64)
+    out = np.zeros(values.shape, dtype=np.float64)
+    valid = np.isfinite(values) & (values > 0.0)
+    pair_valid = valid[:-1] & valid[1:]
+    upper = values[:-1][pair_valid]
+    lower = values[1:][pair_valid]
+    out[np.flatnonzero(pair_valid) + 1] = (lower - upper) / np.maximum(lower + upper, 1e-12)
+    return out
+
+
+def _expanded_mask_window(mask: np.ndarray, halo_samples: int) -> slice:
+    indices = np.flatnonzero(np.asarray(mask, dtype=bool))
+    if indices.size == 0:
+        raise ValueError("Cannot build a QC display window from an empty metric mask.")
+    start = max(0, int(indices[0]) - int(halo_samples))
+    stop = min(mask.size, int(indices[-1]) + int(halo_samples) + 1)
+    return slice(start, stop)
+
+
+def _horizon_names_for_point_table(point_table_path: Path | None) -> dict[str, str]:
+    if point_table_path is None:
+        return {}
+    summary_path = point_table_path.parent / "run_summary.json"
+    if not summary_path.exists():
+        return {}
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    return {
+        f"horizon_{index}": Path(str(item.get("file", f"horizon_{index}"))).name
+        for index, item in enumerate(summary.get("horizons") or [])
+    }
+
+
 def _write_well_qc(
     *,
     output_dir: Path,
     det_volume: np.ndarray,
     lfm_volume: np.ndarray,
+    observed_volume: np.ndarray,
+    synthetic_volume: np.ndarray,
     anchor_file: Path | None,
     geometry: dict[str, Any],
+    display_halo_samples: int,
 ) -> dict[str, Any]:
-    """Generate well QC comparing deterministic AI vs anchor data and LFM."""
+    """Generate six-panel well QC from the deterministic forward response."""
     well_qc_dir = output_dir / "well_qc"
     trace_dir = well_qc_dir / "traces"
     figure_dir = well_qc_dir / "figures"
@@ -779,10 +911,25 @@ def _write_well_qc(
         }
 
     anchor = load_log_ai_anchor_npz(anchor_file)
+    point_table_path = _resolve_anchor_point_table(anchor_file, anchor.metadata)
+    point_df = (
+        pd.read_csv(point_table_path)
+        if point_table_path is not None and point_table_path.exists()
+        else pd.DataFrame()
+    )
+    if not point_df.empty and "flat_idx" not in point_df.columns:
+        raise ValueError(f"Anchor point table is missing flat_idx: {point_table_path}")
+    horizon_names = _horizon_names_for_point_table(point_table_path)
     n_sample = int(geometry["n_sample"])
     det_flat = np.asarray(det_volume, dtype=np.float32).reshape(-1, n_sample)
     lfm_flat = np.asarray(lfm_volume, dtype=np.float32).reshape(-1, n_sample)
+    observed_flat = np.asarray(observed_volume, dtype=np.float32).reshape(-1, n_sample)
+    synthetic_flat = np.asarray(synthetic_volume, dtype=np.float32).reshape(-1, n_sample)
     anchor_samples = np.asarray(anchor.samples, dtype=np.float64)
+    if anchor_samples.size != n_sample:
+        raise ValueError(
+            f"Anchor sample axis size {anchor_samples.size} does not match geometry n_sample={n_sample}."
+        )
     metrics_rows: list[dict[str, Any]] = []
 
     for anchor_row, flat_idx_value in enumerate(np.asarray(anchor.flat_indices, dtype=np.int64)):
@@ -792,66 +939,169 @@ def _write_well_qc(
         trace_path = trace_dir / f"well_qc_{safe}.csv"
         figure_path = figure_dir / f"well_qc_{safe}.png"
 
-        if flat_idx < 0 or flat_idx >= det_flat.shape[0]:
-            metrics_rows.append({
-                "well_name": anchor_name, "flat_idx": flat_idx,
-                "status": "failed", "error": "flat_idx_out_of_range",
-            })
-            continue
-
-        target_ai = np.asarray(anchor.target_ai[anchor_row], dtype=np.float64)
-        det_ai = np.asarray(det_flat[flat_idx], dtype=np.float64)
-        lfm_ai = np.asarray(lfm_flat[flat_idx], dtype=np.float64)
-        mask = (
-            np.asarray(anchor.anchor_mask[anchor_row], dtype=bool)
-            & np.isfinite(target_ai)
-            & np.isfinite(det_ai)
-            & np.isfinite(lfm_ai)
-        )
-
-        trace_df = pd.DataFrame({
-            "twt_s": anchor_samples,
-            "anchor_target_ai": target_ai,
-            "deterministic_ai": det_ai,
-            "lfm_ai": lfm_ai,
-            "anchor_mask": np.asarray(anchor.anchor_mask[anchor_row], dtype=bool),
-            "valid_for_metrics": mask,
-        })
-        trace_df.to_csv(trace_path, index=False, encoding="utf-8-sig")
-
-        # Plot: full-band anchor + LFM + deterministic AI
-        # Note: well anchor data is low-frequency; full-band well AI may be absent.
-        anchor_trace = grid.Log(target_ai, anchor_samples, "twt", name="Anchor target AI")
-        det_trace = grid.Log(det_ai, anchor_samples, "twt", name="Deterministic AI")
-        lfm_trace = grid.Log(lfm_ai, anchor_samples, "twt", name="LFM")
-
-        fig, _axes = plot_well_impedance_qc(
-            full_ai=anchor_trace,
-            low_ai=lfm_trace,
-            model_ai=det_trace,
-            mask=mask,
-            title=f"Deterministic inversion well QC | {anchor_name}",
-            model_label="Deterministic AI",
-        )
-        fig.savefig(figure_path, dpi=180, bbox_inches="tight")
-        plt.close(fig)
-
-        qc_metrics = impedance_qc_metrics(model_ai=det_trace, low_ai=lfm_trace, full_ai=anchor_trace, mask=mask)
-        qc_metrics = {
-            key.replace("vs_full_", "vs_anchor_"): value
-            for key, value in qc_metrics.items()
-        }
-
-        metrics_rows.append({
+        base_row = {
             "well_name": anchor_name,
             "flat_idx": flat_idx,
             "inline": float(np.asarray(anchor.inline, dtype=np.float64)[anchor_row]),
             "xline": float(np.asarray(anchor.xline, dtype=np.float64)[anchor_row]),
-            "status": "ok" if np.any(mask) else "no_valid_samples",
-            "trace_csv": repo_relative_path(trace_path, root=REPO_ROOT),
-            "figure": repo_relative_path(figure_path, root=REPO_ROOT),
-            **qc_metrics,
-        })
+        }
+        try:
+            if flat_idx < 0 or flat_idx >= det_flat.shape[0]:
+                raise IndexError("flat_idx_out_of_range")
+
+            target_ai = np.asarray(anchor.target_ai[anchor_row], dtype=np.float64)
+            det_ai = np.asarray(det_flat[flat_idx], dtype=np.float64)
+            lfm_ai = np.asarray(lfm_flat[flat_idx], dtype=np.float64)
+            observed = np.asarray(observed_flat[flat_idx], dtype=np.float64)
+            synthetic = np.asarray(synthetic_flat[flat_idx], dtype=np.float64)
+            anchor_mask = np.asarray(anchor.anchor_mask[anchor_row], dtype=bool)
+            point_group = _point_table_for_anchor(anchor_name, flat_idx, point_df)
+            reference_ai = _well_ai_on_axis(
+                point_group,
+                anchor_samples,
+                value_column="reference_ai",
+            )
+            reflectivity = _reflectivity_from_ai(det_ai)
+            metric_mask = (
+                anchor_mask
+                & np.isfinite(target_ai)
+                & np.isfinite(det_ai)
+                & np.isfinite(lfm_ai)
+                & np.isfinite(observed)
+                & np.isfinite(synthetic)
+            )
+            if int(np.count_nonzero(metric_mask)) < 8:
+                raise ValueError(
+                    f"Too few valid deterministic waveform QC samples: "
+                    f"{int(np.count_nonzero(metric_mask))}."
+                )
+
+            display_slice = _expanded_mask_window(metric_mask, display_halo_samples)
+            display_twt = anchor_samples[display_slice]
+            observed_trace = grid.Seismic(
+                observed[display_slice],
+                display_twt,
+                "twt",
+                name="Seismic normalized",
+            )
+            synthetic_trace = grid.Seismic(
+                synthetic[display_slice],
+                display_twt,
+                "twt",
+                name="Deterministic synthetic",
+            )
+            xcorr_values = normalized_xcorr(observed_trace.values, synthetic_trace.values)
+            xcorr_basis = synthetic_trace.sampling_rate * np.arange(
+                -(synthetic_trace.size - 1),
+                synthetic_trace.size,
+            )
+            xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
+            dxcorr = dynamic_normalized_xcorr(observed_trace, synthetic_trace)
+
+            target_trace = grid.Log(
+                target_ai[display_slice],
+                display_twt,
+                "twt",
+                name="GINN target well AI",
+            )
+            lfm_trace = grid.Log(lfm_ai[display_slice], display_twt, "twt", name="LFM")
+            det_trace = grid.Log(
+                det_ai[display_slice],
+                display_twt,
+                "twt",
+                name="Deterministic AI",
+            )
+            ai_traces = [target_trace, lfm_trace, det_trace]
+            if np.any(np.isfinite(reference_ai[display_slice])):
+                ai_traces.insert(
+                    0,
+                    grid.Log(
+                        reference_ai[display_slice],
+                        display_twt,
+                        "twt",
+                        name="Reference well AI",
+                    ),
+                )
+            reflectivity_trace = grid.Reflectivity(
+                reflectivity[display_slice],
+                display_twt,
+                "twt",
+                name="Deterministic reflectivity",
+            )
+
+            trace_df = pd.DataFrame(
+                {
+                    "twt_s": anchor_samples,
+                    "well_reference_ai": reference_ai,
+                    "well_ginn_target_ai": target_ai,
+                    "lfm_ai": lfm_ai,
+                    "deterministic_ai": det_ai,
+                    "reflectivity_deterministic": reflectivity,
+                    "seismic_normalized": observed,
+                    "synthetic_deterministic": synthetic,
+                    "residual": observed - synthetic,
+                    "anchor_mask": anchor_mask,
+                    "valid_for_metrics": metric_mask,
+                }
+            )
+            trace_df.to_csv(trace_path, index=False, encoding="utf-8-sig")
+
+            waveform_metrics = waveform_qc_metrics(observed, synthetic, metric_mask)
+            anchor_metric_trace = grid.Log(target_ai, anchor_samples, "twt", name="GINN target well AI")
+            det_metric_trace = grid.Log(det_ai, anchor_samples, "twt", name="Deterministic AI")
+            lfm_metric_trace = grid.Log(lfm_ai, anchor_samples, "twt", name="LFM")
+            qc_metrics = impedance_qc_metrics(
+                model_ai=det_metric_trace,
+                low_ai=lfm_metric_trace,
+                full_ai=anchor_metric_trace,
+                mask=metric_mask,
+            )
+            qc_metrics = {
+                key.replace("vs_full_", "vs_anchor_"): value
+                for key, value in qc_metrics.items()
+            }
+            fig, _axes = plot_well_waveform_qc(
+                ai_traces,
+                reflectivity_trace,
+                synthetic_trace,
+                observed_trace,
+                xcorr,
+                dxcorr,
+                synthetic_ai=det_trace,
+                figsize=(12.0, 7.5),
+                title=(
+                    f"Deterministic synthetic | corr={waveform_metrics['corr']:.3f}, "
+                    f"nmae={waveform_metrics['nmae']:.3f}, "
+                    f"AI rmse={qc_metrics['vs_anchor_rmse']:.2e}"
+                ),
+                horizon_markers=horizon_markers_from_zone_points(
+                    point_group,
+                    horizon_names=horizon_names,
+                ),
+            )
+            fig.savefig(figure_path, dpi=180, bbox_inches="tight")
+            plt.close(fig)
+
+            metrics_rows.append(
+                {
+                    **base_row,
+                    "status": "ok",
+                    "trace_csv": repo_relative_path(trace_path, root=REPO_ROOT),
+                    "figure": repo_relative_path(figure_path, root=REPO_ROOT),
+                    "xcorr_lag_s": float(xcorr.lag),
+                    **qc_metrics,
+                    **{f"waveform_{key}": value for key, value in waveform_metrics.items()},
+                }
+            )
+        except Exception as exc:
+            plt.close("all")
+            metrics_rows.append(
+                {
+                    **base_row,
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}:{exc}",
+                }
+            )
 
     metrics_df = pd.DataFrame.from_records(metrics_rows)
     metrics_df.to_csv(metrics_path, index=False, encoding="utf-8-sig")
@@ -860,6 +1110,11 @@ def _write_well_qc(
         "well_qc_dir": repo_relative_path(well_qc_dir, root=REPO_ROOT),
         "metrics": repo_relative_path(metrics_path, root=REPO_ROOT),
         "n_wells_qc": int(len(ok)),
+        "point_table": (
+            None
+            if point_table_path is None
+            else repo_relative_path(point_table_path, root=REPO_ROOT)
+        ),
     }
     if not ok.empty and "vs_anchor_mae" in ok:
         vs_col = "vs_anchor_mae"
@@ -887,13 +1142,13 @@ def main() -> None:
     )
     args = parse_args()
     common_cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
+    workflow = TimeWorkflowConfig.from_mapping(common_cfg)
     if "deterministic_inversion" not in common_cfg:
         raise ValueError("Missing 'deterministic_inversion' section in config.")
     script_cfg = deep_merge_dict(DEFAULT_CONFIG, dict(common_cfg.get("deterministic_inversion") or {}))
-    _apply_seismic_fallback(script_cfg, common_cfg)
 
-    data_root = REPO_ROOT / str(common_cfg.get("data_root", "data"))
-    output_root = resolve_relative_path(common_cfg.get("output_root", "scripts/output"), root=REPO_ROOT)
+    data_root = resolve_relative_path(workflow.data_root, root=REPO_ROOT)
+    output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
     if args.output_dir is None:
         output_dir = output_root / f"deterministic_inversion_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     else:
@@ -907,9 +1162,6 @@ def main() -> None:
 
     # ── Resolve required input paths ──
     source_cfg = dict(script_cfg.get("source_runs") or {})
-    mode = str(source_cfg.get("mode", "latest")).strip().casefold()
-    if mode != "latest":
-        raise ValueError(f"deterministic_inversion.source_runs.mode only supports 'latest', got {mode!r}.")
 
     ai_lfm_path = _resolve_run_file(
         configured_file=script_cfg.get("ai_lfm_file"),
@@ -945,7 +1197,8 @@ def main() -> None:
 
     # ── Segment 1: Load inputs ──
     logger.info("=== Segment 1: Loading inputs ===")
-    seismic, survey, seismic_file, seismic_type, geometry = _load_seismic(script_cfg, data_root)
+    seismic_cfg = workflow.seismic.as_dict()
+    seismic, survey, seismic_file, seismic_type, geometry = _load_seismic(seismic_cfg, data_root)
     seismic_samples = (
         float(geometry["sample_min"])
         + np.arange(int(geometry["n_sample"]), dtype=np.float64) * float(geometry["sample_step"])
@@ -1001,12 +1254,14 @@ def main() -> None:
     epsR = float(script_cfg["epsR"])
     damp = float(script_cfg["damp"])
     iter_lim = int(script_cfg["iter_lim"])
-    show_solver = bool(script_cfg.get("show_solver", True))
-
     xinv_log, solver_info = _solve_inversion(
         Pop, Reg_spatial, d_obs, m0_log,
-        epsR=epsR, damp=damp, iter_lim=iter_lim, show_solver=show_solver,
+        epsR=epsR, damp=damp, iter_lim=iter_lim, show_solver=True,
     )
+    synthetic_window_time_first = np.asarray(
+        Pop @ np.asarray(xinv_log, dtype=np.float64).reshape(-1),
+        dtype=np.float64,
+    ).reshape(nt_window, n_inline, n_xline)
 
     # Transform back to AI
     ai_window_time_first = np.exp(xinv_log.reshape(nt_window, n_inline, n_xline)).astype(np.float32)
@@ -1031,12 +1286,20 @@ def main() -> None:
     # Assemble full volume: LFM outside window, inverted AI inside window
     ai_full = lfm.astype(np.float32).copy()
     ai_full[:, :, window_start:window_end] = ai_window
+    synthetic_full = np.full(seismic.shape, np.nan, dtype=np.float32)
+    synthetic_full[:, :, window_start:window_end] = np.moveaxis(
+        synthetic_window_time_first,
+        0,
+        -1,
+    ).astype(np.float32)
+    observed_normalized = (seismic / seis_rms).astype(np.float32)
 
     # ── Segment 5: Export & QC ──
     logger.info("=== Segment 5: Export & QC ===")
 
     npz_path = output_dir / "deterministic_ai_full.npz"
     zgy_path = output_dir / "deterministic_ai_full.zgy"
+    segy_path = output_dir / "deterministic_ai_full.segy"
 
     # Statistics
     det_stats = _stats(ai_full)
@@ -1055,13 +1318,7 @@ def main() -> None:
     }
 
     # Metadata
-    clip_values = tuple(float(v) for v in script_cfg.get("clip_percentiles", [1.0, 99.0]))
-    if len(clip_values) != 2:
-        raise ValueError("clip_percentiles must contain exactly two values.")
-
-    slice_mode = str(script_cfg.get("slice_mode", "inline"))
-    raw_slice_index = script_cfg.get("slice_index")
-    slice_index = None if raw_slice_index is None else int(raw_slice_index)
+    slice_mode, slice_index = _parse_slice_spec(args.slice)
     resolved_slice_index = _resolve_slice_index(slice_mode, slice_index, geometry)
 
     metadata: dict[str, Any] = {
@@ -1109,45 +1366,61 @@ def main() -> None:
         geometry=geometry,
         slice_mode=slice_mode,
         slice_index=resolved_slice_index,
-        clip_percentiles=clip_values,
+        clip_percentiles=QC_CLIP_PERCENTILES,
     )
 
     # Well QC
-    well_qc_summary: dict[str, Any] = {"well_qc_dir": None, "n_wells_qc": 0}
-    if bool(script_cfg.get("qc_wells", True)):
-        well_qc_summary = _write_well_qc(
-            output_dir=output_dir,
-            det_volume=ai_full,
-            lfm_volume=lfm,
-            anchor_file=anchor_path,
-            geometry=geometry,
-        )
+    well_qc_summary = _write_well_qc(
+        output_dir=output_dir,
+        det_volume=ai_full,
+        lfm_volume=lfm,
+        observed_volume=observed_normalized,
+        synthetic_volume=synthetic_full,
+        anchor_file=anchor_path,
+        geometry=geometry,
+        display_halo_samples=boundary_ext,
+    )
 
-    # Save NPZ
-    _save_npz(npz_path, volume=ai_full, geometry=geometry, metadata=metadata)
-
-    # ZGY export
-    zgy_status = "disabled"
-    if bool(script_cfg.get("export_zgy", True)):
-        zgy_status = _try_write_zgy(
-            zgy_path,
-            volume=ai_full,
-            geometry=geometry,
-            seismic_file=seismic_file,
-            seismic_type=seismic_type,
-            inline_chunk_size=int(script_cfg.get("zgy_inline_chunk_size", 16)),
-        )
+    export_status = "disabled"
+    exported_volume_path: Path | None = None
+    if bool(script_cfg.get("export_volume", True)) and not args.skip_volume:
+        if seismic_type == "zgy":
+            export_status = _try_write_zgy(
+                zgy_path,
+                volume=ai_full,
+                geometry=geometry,
+                seismic_file=seismic_file,
+                seismic_type=seismic_type,
+                inline_chunk_size=workflow.seismic.zgy_inline_chunk_size,
+            )
+            exported_volume_path = zgy_path if export_status == "written" else None
+        else:
+            export_status = _try_write_segy(
+                segy_path,
+                volume=ai_full,
+                seismic_file=seismic_file,
+                seismic_type=seismic_type,
+                seismic_cfg=seismic_cfg,
+            )
+            exported_volume_path = segy_path if export_status == "written" else None
+    elif args.skip_volume:
+        export_status = "skipped_cli"
 
     # Run summary
     outputs = {
         "deterministic_ai_full_npz": repo_relative_path(npz_path, root=REPO_ROOT),
-        "deterministic_ai_full_zgy": repo_relative_path(zgy_path, root=REPO_ROOT) if zgy_status == "written" else None,
+        "deterministic_ai_full_volume": (
+            None
+            if exported_volume_path is None
+            else repo_relative_path(exported_volume_path, root=REPO_ROOT)
+        ),
         "slice_figure": repo_relative_path(slice_figure_path, root=REPO_ROOT),
         "well_qc_dir": well_qc_summary.get("well_qc_dir"),
         "well_qc_metrics": well_qc_summary.get("metrics"),
     }
     metadata["outputs"] = outputs
-    metadata["zgy_export_status"] = zgy_status
+    metadata["volume_export_status"] = export_status
+    _save_npz(npz_path, volume=ai_full, geometry=geometry, metadata=metadata)
 
     summary = {
         "config": script_cfg,
@@ -1164,7 +1437,11 @@ def main() -> None:
         "prediction_stats": prediction_stats,
         "outputs": outputs,
         "well_qc": well_qc_summary,
-        "zgy_export_status": zgy_status,
+        "runtime_options": {
+            "slice": args.slice,
+            "export_volume": bool(script_cfg.get("export_volume", True)) and not args.skip_volume,
+        },
+        "volume_export_status": export_status,
     }
     write_json(metadata_dir / "run_summary.json", summary)
 
@@ -1175,7 +1452,7 @@ def main() -> None:
     print(f"epsR={epsR}, damp={damp}, iter_lim={iter_lim}")
     print(f"Solver: istop={solver_info['istop']}, niter={solver_info['niter']}")
     print(f"NPZ: {npz_path}")
-    print(f"ZGY export: {zgy_status}")
+    print(f"Volume export: {export_status}")
     print(f"Well QC: {well_qc_summary.get('n_wells_qc', 0)} wells")
 
 

@@ -9,8 +9,9 @@ Usage::
     python scripts/ginn_inversion.py
     python scripts/ginn_inversion.py --config experiments/common.yaml
     python scripts/ginn_inversion.py --checkpoint experiments/ginn/results/.../checkpoints/best.pt
+    python scripts/ginn_inversion.py --slice inline=400
     python scripts/ginn_inversion.py --output-dir scripts/output/ginn_inversion_test
-    python scripts/ginn_inversion.py --skip-zgy
+    python scripts/ginn_inversion.py --skip-volume
 """
 
 from __future__ import annotations
@@ -48,8 +49,9 @@ from cup.seismic.viz import (
     plot_well_waveform_qc,
     waveform_qc_metrics,
 )
-from cup.utils.config import deep_merge_dict
+from cup.time_config import TimeWorkflowConfig
 from cup.utils.io import (
+    build_segy_textual_header,
     load_yaml_config,
     repo_relative_path,
     resolve_relative_path,
@@ -58,6 +60,7 @@ from cup.utils.io import (
     write_json,
 )
 from cup.well.assets import normalize_well_name
+from cup.well.constraints import horizon_markers_from_zone_points
 from ginn.anchor import load_log_ai_anchor_npz
 from ginn.config import GINNConfig
 from ginn.trainer import Trainer
@@ -67,16 +70,8 @@ from wtie.processing import grid
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_CONFIG: dict[str, Any] = {
-    "checkpoint_path": "experiments/ginn/results/2026060701/checkpoints/best.pt",
-    "slice_mode": "inline",
-    "slice_index": None,
-    "clip_percentiles": [1.0, 99.0],
-    "export_zgy": True,
-    "zgy_inline_chunk_size": 16,
-    "write_qc_context": False,
-    "crossplot_max_samples": 200_000,
-}
+QC_CLIP_PERCENTILES = (1.0, 99.0)
+CROSSPLOT_MAX_SAMPLES = 200_000
 
 
 # =============================================================================
@@ -87,14 +82,30 @@ DEFAULT_CONFIG: dict[str, Any] = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("experiments/common.yaml"))
-    parser.add_argument("--checkpoint", type=Path, default=None, help="Override ginn_inversion.checkpoint_path.")
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="Checkpoint to replay. Defaults to the latest experiments/ginn/results/*/checkpoints/best.pt.",
+    )
+    parser.add_argument(
+        "--slice",
+        default="inline",
+        metavar="inline[=INDEX]|xline[=INDEX]",
+        help="QC section direction and optional zero-based index. Defaults to the central inline.",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
         help="Output directory. Defaults to <output_root>/ginn_inversion_<timestamp>.",
     )
-    parser.add_argument("--skip-zgy", action="store_true", help="Skip optional ZGY export.")
+    parser.add_argument("--skip-volume", action="store_true", help="Skip optional survey-format volume export.")
+    parser.add_argument(
+        "--write-qc-context",
+        action="store_true",
+        help="Write the large LFM and mask QC context NPZ.",
+    )
     return parser.parse_args()
 
 
@@ -154,6 +165,54 @@ def _resolve_slice_index(mode: str, index: int | None, geometry: dict[str, Any])
     if not (0 <= index < size):
         raise IndexError(f"slice_index={index} out of range for {mode} size={size}")
     return int(index)
+
+
+def _parse_slice_spec(value: str) -> tuple[str, int | None]:
+    mode_text, separator, index_text = str(value).strip().casefold().partition("=")
+    if mode_text not in {"inline", "xline"}:
+        raise ValueError("--slice must be inline, xline, inline=INDEX, or xline=INDEX.")
+    if not separator:
+        return mode_text, None
+    if not index_text.strip():
+        raise ValueError("--slice index must not be empty.")
+    try:
+        index = int(index_text)
+    except ValueError as exc:
+        raise ValueError(f"--slice index must be an integer, got {index_text!r}.") from exc
+    return mode_text, index
+
+
+def _latest_ginn_checkpoint(results_root: Path) -> Path:
+    candidates = [
+        path
+        for path in results_root.glob("*/checkpoints/best.pt")
+        if path.is_file()
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No GINN checkpoint found under {results_root} matching */checkpoints/best.pt."
+        )
+    return sorted(candidates, key=lambda path: (path.stat().st_mtime, path.parent.parent.name))[-1]
+
+
+def _validate_checkpoint_seismic_contract(
+    cfg: GINNConfig,
+    workflow: TimeWorkflowConfig,
+) -> None:
+    shared_file = resolve_relative_path(
+        workflow.seismic.file,
+        root=resolve_relative_path(workflow.data_root, root=REPO_ROOT),
+    )
+    if str(cfg.seismic_type).casefold() != workflow.seismic.type:
+        raise ValueError(
+            "Checkpoint seismic_type does not match top-level seismic.type: "
+            f"{cfg.seismic_type!r} != {workflow.seismic.type!r}."
+        )
+    if Path(cfg.seismic_file).resolve() != shared_file.resolve():
+        raise ValueError(
+            "Checkpoint seismic_file does not match top-level seismic.file: "
+            f"{cfg.seismic_file} != {shared_file}."
+        )
 
 
 def _extract_section(volume: np.ndarray, mode: str, index: int) -> np.ndarray:
@@ -299,6 +358,41 @@ def _try_write_zgy(
         return f"failed:{exc}"
 
 
+def _try_write_segy(
+    segy_file: Path,
+    *,
+    volume: np.ndarray,
+    seismic_file: Path,
+    seismic_type: str,
+    seismic_cfg: dict[str, Any],
+) -> str:
+    if seismic_type.lower() != "segy":
+        return "skipped_non_segy_source"
+    try:
+        import cigsegy
+
+        keylocs = [
+            int(seismic_cfg["iline_byte"]),
+            int(seismic_cfg["xline_byte"]),
+            int(seismic_cfg["istep"]),
+            int(seismic_cfg["xstep"]),
+        ]
+        textual = build_segy_textual_header(
+            "Time-domain GINN stage-1 acoustic impedance",
+            ["artifact=stage1_ginn_base_ai_time.npz", "source=ginn_inversion.py"],
+        )
+        cigsegy.create_by_sharing_header(
+            str(segy_file),
+            str(seismic_file),
+            np.ascontiguousarray(np.asarray(volume, dtype=np.float32)),
+            keylocs=keylocs,
+            textual=textual,
+        )
+        return "written"
+    except Exception as exc:
+        return f"failed:{exc}"
+
+
 def _plot_prediction_slice(
     path: Path,
     *,
@@ -386,6 +480,19 @@ def _resolve_anchor_point_table(anchor_file: Path, metadata: dict[str, Any]) -> 
         return None
     path = Path(str(raw_path))
     return path if path.is_absolute() else (REPO_ROOT / path).resolve()
+
+
+def _horizon_names_for_point_table(point_table_path: Path | None) -> dict[str, str]:
+    if point_table_path is None:
+        return {}
+    summary_path = point_table_path.parent / "run_summary.json"
+    if not summary_path.exists():
+        return {}
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    return {
+        f"horizon_{index}": Path(str(item.get("file", f"horizon_{index}"))).name
+        for index, item in enumerate(summary.get("horizons") or [])
+    }
 
 
 def _point_table_for_anchor(anchor_name: str, flat_idx: int, point_df: pd.DataFrame) -> pd.DataFrame:
@@ -508,6 +615,7 @@ def _write_ginn_well_qc(
     anchor = load_log_ai_anchor_npz(anchor_file)
     point_table_path = _resolve_anchor_point_table(anchor_file, anchor.metadata)
     point_df = pd.read_csv(point_table_path) if point_table_path is not None and point_table_path.exists() else pd.DataFrame()
+    horizon_names = _horizon_names_for_point_table(point_table_path)
     if not point_df.empty and "flat_idx" not in point_df.columns:
         raise ValueError(f"Anchor point table is missing flat_idx: {point_table_path}")
 
@@ -555,6 +663,7 @@ def _write_ginn_well_qc(
 
             point_group = _point_table_for_anchor(anchor_name, flat_idx, point_df)
             lfm_values = _well_ai_on_axis(point_group, samples, value_column="lfm_ai")
+            reference_values = _well_ai_on_axis(point_group, samples, value_column="reference_ai")
             if not np.any(np.isfinite(lfm_values)):
                 raise ValueError("No LFM well AI samples were found in the anchor point table.")
 
@@ -584,6 +693,7 @@ def _write_ginn_well_qc(
             display_synthetic = synthetic[display_slice]
             display_pred = pred_values[display_slice]
             display_lfm = lfm_values[display_slice]
+            display_reference = reference_values[display_slice]
             display_target = target_values[display_slice]
             display_reflectivity = reflectivity[display_slice]
 
@@ -620,6 +730,7 @@ def _write_ginn_well_qc(
                 {
                     "twt_s": samples,
                     "well_lfm_ai": lfm_values,
+                    "well_reference_ai": reference_values,
                     "well_ginn_target_ai": target_values,
                     "ginn_predicted_ai": pred_values,
                     "reflectivity_ginn": reflectivity,
@@ -640,8 +751,22 @@ def _write_ginn_well_qc(
             trace_df.to_csv(trace_path, index=False, encoding="utf-8-sig")
 
             waveform_metrics = waveform_qc_metrics(observed, synthetic, metric_mask)
+            ai_rmse = float(
+                np.sqrt(np.mean((pred_values[metric_mask] - target_values[metric_mask]) ** 2))
+            )
+            ai_traces = [target_trace, lfm_trace, pred_trace]
+            if np.any(np.isfinite(display_reference)):
+                ai_traces.insert(
+                    0,
+                    grid.Log(
+                        display_reference,
+                        display_twt,
+                        "twt",
+                        name="Reference well AI",
+                    ),
+                )
             fig, _axes = plot_well_waveform_qc(
-                [target_trace, lfm_trace, pred_trace],
+                ai_traces,
                 reflectivity_trace,
                 synthetic_trace,
                 observed_trace,
@@ -649,9 +774,14 @@ def _write_ginn_well_qc(
                 dxcorr,
                 synthetic_ai=pred_trace,
                 figsize=(12.0, 7.5),
-            )
-            fig.suptitle(
-                f"GINN well QC | {anchor_name} | corr={waveform_metrics['corr']:.3f}"
+                title=(
+                    f"GINN synthetic | corr={waveform_metrics['corr']:.3f}, "
+                    f"nmae={waveform_metrics['nmae']:.3f}, AI rmse={ai_rmse:.2e}"
+                ),
+                horizon_markers=horizon_markers_from_zone_points(
+                    point_group,
+                    horizon_names=horizon_names,
+                ),
             )
             fig.savefig(figure_path, dpi=180, bbox_inches="tight")
             plt.close(fig)
@@ -700,10 +830,10 @@ def _write_ginn_well_qc(
         "n_wells_qc": int(len(ok)),
         "point_table": None if point_table_path is None else repo_relative_path(point_table_path, root=REPO_ROOT),
     }
-    if not ok.empty and "vs_low_rmse" in ok:
-        summary["mean_vs_low_rmse"] = float(ok["vs_low_rmse"].mean())
-        summary["mean_vs_low_mae"] = float(ok["vs_low_mae"].mean())
-        summary["mean_vs_low_corr"] = float(ok["vs_low_corr"].mean())
+    if not ok.empty and "vs_lfm_rmse" in ok:
+        summary["mean_vs_lfm_rmse"] = float(ok["vs_lfm_rmse"].mean())
+        summary["mean_vs_lfm_mae"] = float(ok["vs_lfm_mae"].mean())
+        summary["mean_vs_lfm_corr"] = float(ok["vs_lfm_corr"].mean())
     return summary
 
 
@@ -727,11 +857,15 @@ def main() -> None:
     )
     args = parse_args()
     common_cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
-    if "ginn_inversion" not in common_cfg:
-        raise ValueError("Missing 'ginn_inversion' section in config.")
-    script_cfg = deep_merge_dict(DEFAULT_CONFIG, dict(common_cfg.get("ginn_inversion") or {}))
+    workflow = TimeWorkflowConfig.from_mapping(common_cfg)
+    script_cfg = dict(common_cfg.get("ginn_inversion") or {})
+    if script_cfg:
+        raise ValueError(
+            "ginn_inversion no longer accepts common-YAML parameters; "
+            "use --checkpoint, --slice, --skip-volume, or --write-qc-context."
+        )
 
-    output_root = resolve_relative_path(common_cfg.get("output_root", "scripts/output"), root=REPO_ROOT)
+    output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
     if args.output_dir is None:
         output_dir = output_root / f"ginn_inversion_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     else:
@@ -744,7 +878,7 @@ def main() -> None:
     for path in (output_dir, figure_dir, metadata_dir, qc_dir, well_qc_dir, trainer_context_dir):
         path.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = args.checkpoint or Path(script_cfg["checkpoint_path"])
+    checkpoint_path = args.checkpoint or _latest_ginn_checkpoint(REPO_ROOT / "experiments" / "ginn" / "results")
     checkpoint_path = checkpoint_path if checkpoint_path.is_absolute() else (REPO_ROOT / checkpoint_path).resolve()
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -755,6 +889,7 @@ def main() -> None:
     checkpoint_train_config = GINNConfig.from_dict(checkpoint["config"], base_dir=REPO_ROOT)
 
     cfg = GINNConfig.from_dict(checkpoint["config"], base_dir=REPO_ROOT)
+    _validate_checkpoint_seismic_contract(cfg, workflow)
     cfg.device = "cuda" if torch.cuda.is_available() and str(cfg.device).lower().startswith("cuda") else "cpu"
     cfg.checkpoint_dir = trainer_context_dir
 
@@ -780,6 +915,7 @@ def main() -> None:
 
     base_ai_npz = output_dir / "stage1_ginn_base_ai_time.npz"
     zgy_path = output_dir / "stage1_ginn_base_ai_time.zgy"
+    segy_path = output_dir / "stage1_ginn_base_ai_time.segy"
     qc_context_path = qc_dir / "prediction_context_time.npz"
 
     metadata: dict[str, Any] = {
@@ -801,13 +937,8 @@ def main() -> None:
         "prediction_stats": prediction_stats,
     }
 
-    raw_slice_index = script_cfg.get("slice_index")
-    slice_index = None if raw_slice_index is None else int(raw_slice_index)
-    slice_mode = str(script_cfg.get("slice_mode", "inline"))
+    slice_mode, slice_index = _parse_slice_spec(args.slice)
     resolved_slice_index = _resolve_slice_index(slice_mode, slice_index, trainer.geometry)
-    clip_values = tuple(float(v) for v in script_cfg.get("clip_percentiles", [1.0, 99.0]))
-    if len(clip_values) != 2:
-        raise ValueError("clip_percentiles must contain exactly two values.")
 
     slice_figure_path = figure_dir / f"{slice_mode}_{resolved_slice_index:04d}_prediction_vs_lfm.png"
     crossplot_path = figure_dir / "prediction_vs_lfm_crossplot.png"
@@ -819,16 +950,16 @@ def main() -> None:
         geometry=trainer.geometry,
         slice_mode=slice_mode,
         slice_index=resolved_slice_index,
-        clip_percentiles=clip_values,  # type: ignore[arg-type]
+        clip_percentiles=QC_CLIP_PERCENTILES,
     )
     _plot_crossplot(
         crossplot_path,
         pred_volume=pred_volume,
         lfm_volume=lfm_volume,
-        max_samples=int(script_cfg.get("crossplot_max_samples", 200_000)),
+        max_samples=CROSSPLOT_MAX_SAMPLES,
     )
 
-    qc_context_written = bool(script_cfg.get("write_qc_context", False))
+    qc_context_written = bool(args.write_qc_context)
     well_qc_summary = _write_ginn_well_qc(
         output_dir=output_dir,
         pred_volume=pred_volume,
@@ -837,23 +968,35 @@ def main() -> None:
         trainer=trainer,
     )
 
-    zgy_status = "disabled"
-    if bool(script_cfg.get("export_zgy", True)) and not args.skip_zgy:
-        zgy_status = _try_write_zgy(
-            zgy_path,
-            volume=pred_volume,
-            geometry=trainer.geometry,
-            seismic_file=cfg.seismic_file,
-            seismic_type=cfg.seismic_type,
-            inline_chunk_size=int(script_cfg.get("zgy_inline_chunk_size", 16)),
-        )
-    elif args.skip_zgy:
-        zgy_status = "skipped_cli"
+    volume_status = "disabled"
+    exported_volume_path: Path | None = None
+    if not args.skip_volume:
+        if cfg.seismic_type == "zgy":
+            volume_status = _try_write_zgy(
+                zgy_path,
+                volume=pred_volume,
+                geometry=trainer.geometry,
+                seismic_file=cfg.seismic_file,
+                seismic_type=cfg.seismic_type,
+                inline_chunk_size=workflow.seismic.zgy_inline_chunk_size,
+            )
+            exported_volume_path = zgy_path if volume_status == "written" else None
+        else:
+            volume_status = _try_write_segy(
+                segy_path,
+                volume=pred_volume,
+                seismic_file=cfg.seismic_file,
+                seismic_type=cfg.seismic_type,
+                seismic_cfg=workflow.seismic.as_dict(),
+            )
+            exported_volume_path = segy_path if volume_status == "written" else None
+    else:
+        volume_status = "skipped_cli"
 
     outputs = _relative_outputs(
         {
             "stage1_ginn_base_ai_time": base_ai_npz,
-            "stage1_ginn_base_ai_time_zgy": zgy_path if zgy_status == "written" else None,
+            "stage1_ginn_base_ai_time_volume": exported_volume_path,
             "prediction_slice_figure": slice_figure_path,
             "prediction_crossplot": crossplot_path,
             "prediction_context_time": qc_context_path if qc_context_written else None,
@@ -862,7 +1005,11 @@ def main() -> None:
         }
     )
     summary = {
-        "config": script_cfg,
+        "runtime_options": {
+            "slice": args.slice,
+            "write_qc_context": qc_context_written,
+            "export_volume": not args.skip_volume,
+        },
         "checkpoint": {
             "path": repo_relative_path(checkpoint_path, root=REPO_ROOT),
             "epoch": metadata["checkpoint_epoch"],
@@ -873,10 +1020,10 @@ def main() -> None:
         "prediction_stats": prediction_stats,
         "outputs": outputs,
         "well_qc": well_qc_summary,
-        "zgy_export_status": zgy_status,
+        "volume_export_status": volume_status,
     }
     metadata["outputs"] = outputs
-    metadata["zgy_export_status"] = zgy_status
+    metadata["volume_export_status"] = volume_status
     _save_prediction_npz(base_ai_npz, volume=pred_volume, geometry=trainer.geometry, metadata=metadata)
     if qc_context_written:
         _save_qc_context(
@@ -892,7 +1039,7 @@ def main() -> None:
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Output: {output_dir}")
     print(f"NPZ: {base_ai_npz}")
-    print(f"ZGY export: {zgy_status}")
+    print(f"Volume export: {volume_status}")
     print(f"Well QC: {well_qc_dir}")
 
 

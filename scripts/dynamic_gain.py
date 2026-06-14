@@ -70,7 +70,7 @@ from ginn.data import (
     compute_boundary_effect_samples_from_wavelet,
     load_lowfreq_model,
 )
-from ginn.masking import build_eroded_loss_mask, get_valid_trace_indices, select_spatial_validation_split
+from ginn.masking import get_valid_trace_indices, resolve_mask_bounds, select_spatial_validation_split
 from ginn.physics import ForwardModel
 from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
 from wtie.processing import grid
@@ -272,6 +272,22 @@ def _resolve_horizon_path(value: Any) -> Path:
     return candidates[0].resolve()
 
 
+def _build_extended_mask(mask_flat: np.ndarray, extension_samples: int) -> np.ndarray:
+    """Build a mask extended outward from the target-layer mask by *extension_samples*."""
+    start, end, has_valid = resolve_mask_bounds(mask_flat)
+    n_sample = mask_flat.shape[1]
+    sample_index = np.arange(n_sample, dtype=np.int64)[np.newaxis, :]
+
+    ext_start = np.maximum(start - int(extension_samples), 0)
+    ext_end = np.minimum(end + int(extension_samples), n_sample)
+
+    return (
+        has_valid[:, np.newaxis]
+        & (sample_index >= ext_start[:, np.newaxis])
+        & (sample_index < ext_end[:, np.newaxis])
+    )
+
+
 def _build_train_masks(
     *,
     cfg: GINNConfig,
@@ -307,7 +323,7 @@ def _build_train_masks(
     boundary_effect_samples = cfg.boundary_effect_samples
     if boundary_effect_samples is None:
         raise ValueError("boundary_effect_samples must be resolved before building dynamic gain masks.")
-    loss_mask_flat = build_eroded_loss_mask(mask_flat, erosion_samples=int(boundary_effect_samples))
+    loss_mask_flat = _build_extended_mask(mask_flat, extension_samples=int(boundary_effect_samples))
     valid_indices = get_valid_trace_indices(mask_flat)
     train_indices = valid_indices
     split_metadata: dict[str, Any] = {
@@ -1002,7 +1018,7 @@ def write_well_waveform_qc(
         figure_path = figure_dir / f"anchor_trace_{flat_idx}_{safe_name}.png"
         trace_df.to_csv(trace_path, index=False, encoding="utf-8-sig")
 
-        plot_slice = _qc_plot_slice(finite | used_sample_mask, n_sample)
+        plot_slice = _qc_plot_slice(loss_mask, n_sample, pad_samples=0)
         plot_samples = np.asarray(ctx.samples[plot_slice], dtype=np.float64)
         synthetic_values = np.asarray(synthetic_dynamic[plot_slice], dtype=np.float64)
         seismic_values = np.asarray(seismic_norm_flat[flat_idx, plot_slice], dtype=np.float64)

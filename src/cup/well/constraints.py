@@ -76,12 +76,48 @@ __all__ = [
     "build_point_conflict_report",
     "build_vertical_point_facts",
     "confidence_from_corr",
+    "horizon_markers_from_zone_points",
     "high_frequency_stats",
     "layer_shrinkage_stats",
     "nearest_trace_fields",
     "robust_stats",
     "sample_zone",
 ]
+
+
+def horizon_markers_from_zone_points(
+    points: pd.DataFrame,
+    *,
+    horizon_names: dict[str, str] | None = None,
+) -> list[tuple[float, str]]:
+    """Recover per-well horizon TWT markers from canonical zone coordinates."""
+    required = {"zone_name", "u_in_zone", "twt_s"}
+    if points.empty or not required.issubset(points.columns):
+        return []
+
+    labels = horizon_names or {}
+    estimates: dict[str, list[float]] = {}
+    for zone_name, zone_group in points.groupby("zone_name", sort=False):
+        parts = str(zone_name).split("->", maxsplit=1)
+        if len(parts) != 2 or len(zone_group) < 2:
+            continue
+        u = zone_group["u_in_zone"].to_numpy(dtype=np.float64)
+        twt = zone_group["twt_s"].to_numpy(dtype=np.float64)
+        valid = np.isfinite(u) & np.isfinite(twt)
+        if int(np.count_nonzero(valid)) < 2 or np.ptp(u[valid]) <= 0.0:
+            continue
+        slope, intercept = np.polyfit(u[valid], twt[valid], deg=1)
+        estimates.setdefault(parts[0], []).append(float(intercept))
+        estimates.setdefault(parts[1], []).append(float(intercept + slope))
+
+    return sorted(
+        [
+            (float(np.mean(values)), labels.get(name, name))
+            for name, values in estimates.items()
+            if values
+        ],
+        key=lambda item: item[0],
+    )
 
 
 def robust_stats(values: np.ndarray) -> dict[str, Any]:

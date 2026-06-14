@@ -10,11 +10,13 @@
 python scripts/ginn_inversion.py
 python scripts/ginn_inversion.py --config experiments/common.yaml
 python scripts/ginn_inversion.py --checkpoint experiments/ginn/results/.../checkpoints/best.pt
+python scripts/ginn_inversion.py --slice inline=400
 python scripts/ginn_inversion.py --output-dir scripts/output/ginn_inversion_test
-python scripts/ginn_inversion.py --skip-zgy
+python scripts/ginn_inversion.py --skip-volume
+python scripts/ginn_inversion.py --write-qc-context
 ```
 
-不带参数时，脚本从配置的 `ginn_inversion.checkpoint_path` 读取 checkpoint；`--checkpoint` 可以临时覆盖这个路径。输出写入 `<output_root>/ginn_inversion_<timestamp>/`。
+不带参数时，脚本自动选择 `experiments/ginn/results/*/checkpoints/best.pt` 中最新的一次；`--checkpoint` 用于固定具体实验。输出写入 `<output_root>/ginn_inversion_<timestamp>/`。
 
 ---
 
@@ -29,51 +31,20 @@ python scripts/ginn_inversion.py --skip-zgy
 
 ---
 
-## 配置参考
+## 运行参数
 
-脚本配置放在 `ginn_inversion` 段下：
+GINN 推理不再拥有常用 YAML 段。checkpoint、QC 切片和调试输出都是本次运行选择：
 
-```yaml
-ginn_inversion:
-  checkpoint_path: experiments/ginn/results/.../checkpoints/best.pt
+- `--checkpoint PATH`：固定 checkpoint；缺省自动发现最新 `best.pt`。
+- `--slice inline` / `--slice xline=250`：选择剖面方向及可选零基索引；不写索引时取中央剖面。
+- `--skip-volume`：只写 NPZ，不写工区原生格式体。
+- `--write-qc-context`：额外写出 LFM 和 mask 调试 NPZ。
 
-  slice_mode: inline
-  slice_index: null
-  clip_percentiles: [1.0, 99.0]
-
-  export_zgy: true
-  zgy_inline_chunk_size: 16
-  write_qc_context: false
-  crossplot_max_samples: 200000
-```
-
-### `checkpoint_path`
-
-指向第八步训练产出的 checkpoint 文件。脚本会自动从中读取训练配置并重建数据加载管线。同一个 checkpoint 在不同机器上跑反演，只要路径可解析，输出应一致。
-
-### `slice_mode` / `slice_index`
-
-控制 QC 剖面的方向：`inline` 表示沿 inline 方向切，`xline` 表示沿 xline 方向切。`slice_index` 为 null 时取工区中央位置。
-
-### `clip_percentiles`
-
-预测体和 LFM 体在 QC 图上的颜色范围。默认的 1% 到 99% 去掉了最极端的异常值，让多数区域的颜色对比度更好。这个参数只影响显示，不改变输出的体数据。
-
-### `export_zgy` / `zgy_inline_chunk_size`
-
-控制是否将预测体导出为 ZGY 格式。只在原始地震体是 ZGY 时尝试导出；SEG-Y 工区不会导出 ZGY。`zgy_inline_chunk_size` 是写入时的批大小，减少它可以降低内存峰值。
-
-### `write_qc_context`
-
-开启时额外写出一个 NPZ 包，包含 LFM 体和目标层 mask。这个包体积较大（和主输出同级），默认关闭。只在需要离线对比 LFM 和预测体时才打开。
-
-### `crossplot_max_samples`
-
-控制交会图的抽样点数。工区体素量极大时，全部画进 hexbin 会很慢且看不出更多信息。默认 20 万点足够覆盖分布。
+剖面裁剪固定为 1%–99%，交会图固定最多抽样 20 万点。体格式跟随 checkpoint 的地震类型，ZGY 分块大小读取顶层 `seismic.zgy_inline_chunk_size`。
 
 ### 井上波阻抗 QC
 
-反演结束后自动生成井上波阻抗 QC。脚本从 checkpoint 配置中定位 `log_ai_anchor_time.npz`，再通过 anchor 元数据找回第六步的 `well_constraint_points.csv` 获取 reference AI。每口 anchor 井输出一张三线对比图（灰线 reference AI、蓝线实际 GINN target、红线 GINN 预测 AI）和对应的 QC 指标。
+反演结束后自动生成与第七步一致的六联井 QC：reference/GINN target/LFM/预测 AI、预测反射系数、GINN 正演、归一化地震、残差和动态互相关。图中显示第六步 point facts 恢复的井分层；标题统一报告 `corr`、`nmae` 和科学计数法 AI RMSE。
 
 ---
 
@@ -110,7 +81,7 @@ ginn_inversion:
 | 文件 | 内容 |
 |------|------|
 | `stage1_ginn_base_ai_time.npz` | 时间域 stage-1 波阻抗预测体 |
-| `stage1_ginn_base_ai_time.zgy` | 可选 ZGY 导出，仅在 checkpoint 的地震类型为 ZGY 且未跳过时写出 |
+| `stage1_ginn_base_ai_time.zgy` / `.segy` | 可选工区原生格式体，格式跟随 checkpoint 地震类型 |
 | `metadata/run_summary.json` | checkpoint、输出路径、几何和预测统计 |
 | `figures/<slice>_prediction_vs_lfm.png` | 预测、LFM、差异和 mask 四联剖面对比 |
 | `figures/prediction_vs_lfm_crossplot.png` | 预测波阻抗 vs LFM 抽样交会图 |
@@ -131,7 +102,7 @@ ginn_inversion:
 
 metadata 中记录了 `checkpoint_path`、`checkpoint_epoch`、`checkpoint_best_epoch`、`checkpoint_best_loss`、`ai_lfm_file`、`wavelet_file`、`gain_source` 和 `prediction_stats`。这些信息让下游步骤（如 enhance 或人工抽查）在不需要第八步源文件的情况下也能追溯反演的完整事实链。
 
-LFM 体和 mask 体不塞进主 NPZ——大工区下它们的体积和预测体同级，会让文件翻倍。需要调试时打开 `write_qc_context` 单独导出。
+LFM 体和 mask 体不塞进主 NPZ——大工区下它们的体积和预测体同级，会让文件翻倍。需要调试时使用 `--write-qc-context` 单独导出。
 
 ---
 
@@ -165,11 +136,11 @@ LFM 体和 mask 体不塞进主 NPZ——大工区下它们的体积和预测体
 
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
-| checkpoint 不存在 | 配置或 CLI 指向的 checkpoint 路径无效 | 检查第八步输出目录和 `checkpoint_path` |
+| checkpoint 不存在 | 未发现最新 `best.pt` 或 CLI 路径无效 | 检查第八步结果目录或显式传 `--checkpoint` |
 | `model_state_dict` 缺失 | checkpoint 文件不是训练脚本保存的模型 | 确认文件来自第八步的 `best.pt` 或 `final.pt` |
 | LFM 与地震 shape 不匹配 | checkpoint 配置指向的 LFM 不在同一个工区 | 回到第七步检查 `ai_lfm_time.npz` 和地震几何 |
-| ZGY 导出失败 | ZGY 写入库不可用或几何不一致 | 先用 `--skip-zgy` 只输出 NPZ，再排查写入端 |
-| GPU OOM | 全工区推理显存不足 | 减小 `zgy_inline_chunk_size`，或在 CPU 上跑 |
+| 体导出失败 | ZGY/SEG-Y 写入库不可用或几何不一致 | 先用 `--skip-volume` 只输出 NPZ，再排查写入端 |
+| GPU OOM | 全工区推理显存不足 | 调整训练/推理批大小，或在 CPU 上跑 |
 
 ---
 

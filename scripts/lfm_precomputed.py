@@ -49,7 +49,7 @@ from cup.seismic.viz import (
 from cup.well.assets import normalize_well_name
 from cup.well.constraints import nearest_trace_fields
 from cup.well.tie import load_saved_seismic_trace_csv
-from cup.seismic.wavelet import compute_wavelet_active_half_support_s, load_wavelet_csv, validate_wavelet_dt
+from cup.seismic.wavelet import load_wavelet_csv, validate_wavelet_dt
 from wtie.modeling.modeling import ConvModeler
 from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
 from wtie.processing import grid
@@ -556,6 +556,7 @@ def _write_lfm_well_qc(
     output_dir: Path,
     *,
     constraints_summary: dict[str, Any],
+    boundary_extension_samples: int = 50,
 ) -> dict[str, Any]:
     well_qc_dir = output_dir / "well_qc"
     trace_dir = well_qc_dir / "traces"
@@ -592,7 +593,8 @@ def _write_lfm_well_qc(
         auto_dir, wavelet_path, tie_metrics = _resolve_lfm_qc_sources(constraints_summary)
         wavelet_time_s, wavelet_values = load_wavelet_csv(wavelet_path)
         validate_wavelet_dt(wavelet_time_s, float(np.median(np.diff(sample_axis))))
-        half_support_s = compute_wavelet_active_half_support_s(wavelet_time_s, wavelet_values)
+        dt = float(np.median(np.diff(sample_axis)))
+        extension_s = boundary_extension_samples * dt
         wavelet = grid.Wavelet(wavelet_values, wavelet_time_s, name=wavelet_path.stem)
         modeler = ConvModeler()
     except Exception as exc:
@@ -640,11 +642,11 @@ def _write_lfm_well_qc(
             seismic = load_saved_seismic_trace_csv(seismic_path)
             display_start = max(
                 float(seismic.basis[0]),
-                float(group["twt_s"].min()) - half_support_s,
+                float(group["twt_s"].min()) - extension_s,
             )
             display_end = min(
                 float(seismic.basis[-1]),
-                float(group["twt_s"].max()) + half_support_s,
+                float(group["twt_s"].max()) + extension_s,
             )
             display_mask = (seismic.basis >= display_start) & (seismic.basis <= display_end)
             display_twt = np.asarray(seismic.basis[display_mask], dtype=np.float64)
@@ -1085,6 +1087,7 @@ def main() -> None:
         result,
         output_dir,
         constraints_summary=constraints_summary,
+        boundary_extension_samples=int(script_cfg["modeling"]["boundary_extension_samples"]),
     )
     outputs = {
         "ai_lfm_time": repo_relative_path(npz_file, root=REPO_ROOT),

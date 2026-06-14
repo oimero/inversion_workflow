@@ -11,7 +11,9 @@
 ```bash
 python scripts/deterministic_inversion.py
 python scripts/deterministic_inversion.py --config experiments/common.yaml
+python scripts/deterministic_inversion.py --slice xline=250
 python scripts/deterministic_inversion.py --output-dir scripts/output/deterministic_inversion_test
+python scripts/deterministic_inversion.py --skip-volume
 ```
 
 不带参数时，脚本从配置的 `deterministic_inversion` 段读取参数，输出写入 `<output_root>/deterministic_inversion_<timestamp>/`。当低频模型、子波和井锚点路径在配置中留空时，脚本自动从对应步骤的最新输出中寻找。
@@ -27,7 +29,7 @@ python scripts/deterministic_inversion.py --output-dir scripts/output/determinis
 | 第七步 | `ai_lfm_time.npz` | 低频模型、采样轴、目标层元数据和层位路径 |
 | 第六步 | `log_ai_anchor_time.npz` | 可选，仅用于井验收，不进入反演目标函数 |
 
-输入自动发现：当配置中 `ai_lfm_file`、`wavelet_file` 或 `log_ai_anchor_file` 为 `null` 时，脚本按 `source_runs` 指定的目录或最新步骤输出自动定位。`seismic` 块留空时，从 `lfm_precomputed` 配置中的地震设置继承。
+输入缺省从对应步骤最新输出自动发现；复现实验时仍可填写具体上游目录或产物路径。地震始终读取顶层 `seismic`，不允许步骤级覆盖。
 
 ---
 
@@ -35,44 +37,14 @@ python scripts/deterministic_inversion.py --output-dir scripts/output/determinis
 
 ```yaml
 deterministic_inversion:
-  source_runs:
-    mode: latest
-    lfm_precomputed_dir: null
-    wavelet_generation_dir: null
-    well_constraints_dir: null
-
-  seismic:
-    file: null
-    type: null
-
-  ai_lfm_file: null
-  wavelet_file: null
-  log_ai_anchor_file: null
-
   boundary_extension_samples: 30
   epsR: 0.20
   damp: 0.03
   iter_lim: 100
-  show_solver: true
-
   export_volume: true
-  export_segy: false
-  export_zgy: true
-  zgy_inline_chunk_size: 16
-
-  qc_wells: true
-  slice_mode: inline
-  slice_index: null
-  clip_percentiles: [1.0, 99.0]
 ```
 
-### `source_runs`
-
-默认接最新一次对应步骤的输出。复现实验时，填写具体目录固定输入。`mode` 目前只支持 `latest`。
-
-### `ai_lfm_file` / `wavelet_file` / `log_ai_anchor_file`
-
-分别指向第七步低频模型、第五步子波和第六步井锚点产物。低频模型必须包含 `metadata_json` 中的 `horizons` 和目标层参数，脚本据此重建目标层掩码；如果缺失，应回到第七步修复输出，而不是在确定性反演里临时指定层位。井锚点文件为可选——缺失时井质量控制跳过，反演主体仍可运行。
+日常 YAML 只保留科学求解决策。显式上游目录和文件路径仍可用于固定实验，但空 `source_runs`、空路径和 `null` override 不写入常用配置。低频模型必须包含层位和目标层元数据；井锚点缺失时反演仍可运行，但井 QC 会记录跳过原因。
 
 ### `boundary_extension_samples`
 
@@ -86,13 +58,13 @@ deterministic_inversion:
 
 解偏离低频模型的阻尼系数，是确定性反演抑制不适定性的核心手段。值越大，结果越接近低频模型；值越小，地震拟合自由度越高，但出现极端值的风险也越大。求解后若出现非正数或极端值，优先调大本参数。
 
-### `iter_lim` / `show_solver`
+### `iter_lim`
 
-求解器的最大迭代轮数和终端残差打印开关。默认 100 轮对大多数情况足够。
+求解器的最大迭代轮数。默认 100 轮对大多数情况足够；终端求解过程固定显示，不再作为配置参数。
 
-### 输出控制
+### 输出与 QC
 
-`export_zgy` 控制是否导出三维数据体（只在源地震为 ZGY 时尝试）。`zgy_inline_chunk_size` 控制分块写入行数。`qc_wells: false` 可跳过井质量控制。`slice_mode` / `slice_index` 控制剖面图方向和位置；`slice_index` 留空时取工区中央。`clip_percentiles` 只影响剖面图配色，不改变输出数据体。
+`export_volume` 控制是否默认导出三维体；格式跟随顶层 `seismic.type`，ZGY 分块大小读取顶层配置。`--skip-volume` 可临时关闭。`--slice inline` / `--slice xline=250` 控制本次 QC 剖面，裁剪固定为 1%–99%。有井锚点时井 QC 固定生成。
 
 ---
 
@@ -138,12 +110,12 @@ deterministic_inversion:
 | 文件 | 内容 |
 |------|------|
 | `deterministic_ai_full.npz` | 完整的确定性波阻抗数据体，含三维数组、规则轴、几何和完整元数据 |
-| `deterministic_ai_full.zgy` | 可选导出，只在源地震为 ZGY 且未关闭时写出 |
+| `deterministic_ai_full.zgy` / `.segy` | 可选工区原生格式体 |
 | `metadata/run_summary.json` | 输入路径、核心参数、窗口范围、归一化因子、迭代状态和残差范数 |
 | `figures/<slice>_deterministic_vs_lfm.png` | 四栏剖面图：确定性反演、低频模型、差值、掩码，窗口边界以虚线标注 |
 | `well_qc/well_qc_metrics.csv` | 逐井质量控制指标（平均绝对误差、均方根误差、偏差、相关系数、归一化平均绝对误差） |
-| `well_qc/figures/well_qc_*.png` | 单井三线对比图（锚点数据灰线、低频模型蓝线、确定性反演红线） |
-| `well_qc/traces/well_qc_*.csv` | 每口井逐样点的锚点值、低频模型值和确定性反演值 |
+| `well_qc/figures/well_qc_*.png` | 六联图：井 AI、反射系数、确定性正演、地震、残差和动态互相关，并标注井分层 |
+| `well_qc/traces/well_qc_*.csv` | 井 AI、确定性 AI、正演、地震、残差和 QC mask 的逐样点明细 |
 
 ### `deterministic_ai_full.npz`
 
@@ -183,7 +155,7 @@ deterministic_inversion:
 
 `well_qc_metrics.csv` 每行一口井，按井检查 `vs_anchor_mae`（与锚点的平均绝对误差）、`vs_anchor_rmse`（均方根误差）和 `vs_anchor_corr`（相关系数）。锚点数据是第六步的低频井波阻抗，不是全频井 AI——指标反映的是确定性反演结果在多大程度上保持了井低频趋势。
 
-结合 `well_qc/figures/` 的曲线图：确定性反演（红线）应该比低频模型（蓝线）更贴近锚点数据（灰线），但不追求完美贴合——它只受地震和正则化驱动，没有被井资料训练过。如果确定性反演在某些井上跑偏严重，检查该井位置的掩码是否有效、子波在该位置的正演是否正常。
+结合 `well_qc/figures/`：标题中的 `corr/nmae` 衡量求解器正演记录与归一化地震，AI RMSE 用科学计数法报告确定性 AI 与 GINN target 井曲线的差异。层位横线用于确认偏差集中在哪个层段；确定性反演只受地震和正则化驱动，不追求对井曲线的完美贴合。
 
 ### 第四步：和 GINN 对比
 
@@ -207,7 +179,7 @@ deterministic_inversion:
 | 目标层掩码为空 | 层位无法覆盖有效时间范围 | 检查层位文件路径和 TWT 数值，适当增大 `boundary_extension_samples` |
 | 非正数或非有限波阻抗值 | 反演求解失稳，出现负值或无穷 | 优先增大 `damp`；若仍不可解，再尝试增大 `epsR` 或检查地震归一化 |
 | 反演结果几乎等于低频模型 | `damp` 或 `epsR` 过大 | 降低相应参数，但保持求解稳定 |
-| ZGY 导出失败 | 写入库不可用或几何不一致 | 检查 `pyzgy` 是否可用，或关闭 `export_zgy` |
+| 体导出失败 | 写入库不可用或几何不一致 | 用 `--skip-volume` 保留 NPZ，再检查对应格式写入库 |
 
 ---
 

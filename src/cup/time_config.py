@@ -198,33 +198,6 @@ _RETIRED_KEYS: dict[str, str] = {
     "wavelet_generation.generation.objective.name": "the objective is defined by its weights",
     "wavelet_generation.spatial_debias.cluster_radius_m": "use top-level spatial_debias.cluster_radius_m",
     "wavelet_generation.export": "selected output names are fixed; use --debug for debug artifacts",
-    "well_constraints.seismic": "use top-level seismic",
-    "well_constraints.frequency_bands.qc_enabled": "frequency-band QC is mandatory",
-    "well_constraints.anchor.min_points_per_trace": "the unused option was removed",
-    "well_constraints.conflicts": "conflicts are always aggregated with weighted_average",
-    "well_constraints.motif": "the unused motif placeholder was removed",
-    "lfm_precomputed.seismic": "use top-level seismic",
-    "lfm_precomputed.export.write_segy": "use export.export_volume; format follows seismic.type",
-    "lfm_precomputed.export.write_zgy": "use export.export_volume; format follows seismic.type",
-    "lfm_precomputed.export.zgy_inline_chunk_size": "use top-level seismic.zgy_inline_chunk_size",
-    "dynamic_gain.spatial_debias.cluster_radius_m": "use top-level spatial_debias.cluster_radius_m",
-    "ginn_inversion.checkpoint_path": "latest best.pt discovery is implicit; use --checkpoint to pin a run",
-    "ginn_inversion.slice_mode": "use --slice",
-    "ginn_inversion.slice_index": "use --slice",
-    "ginn_inversion.clip_percentiles": "QC clipping is fixed to the workflow display default",
-    "ginn_inversion.export_zgy": "volume export is enabled by default; use --skip-volume",
-    "ginn_inversion.zgy_inline_chunk_size": "use top-level seismic.zgy_inline_chunk_size",
-    "ginn_inversion.write_qc_context": "use --write-qc-context",
-    "ginn_inversion.crossplot_max_samples": "crossplot sampling is a fixed display default",
-    "deterministic_inversion.seismic": "use top-level seismic",
-    "deterministic_inversion.export_segy": "use export_volume; format follows top-level seismic.type",
-    "deterministic_inversion.export_zgy": "use export_volume; format follows top-level seismic.type",
-    "deterministic_inversion.zgy_inline_chunk_size": "use top-level seismic.zgy_inline_chunk_size",
-    "deterministic_inversion.qc_wells": "well QC is mandatory when anchor data are available",
-    "deterministic_inversion.slice_mode": "use --slice",
-    "deterministic_inversion.slice_index": "use --slice",
-    "deterministic_inversion.clip_percentiles": "QC clipping is fixed to the workflow display default",
-    "deterministic_inversion.show_solver": "solver progress display is always enabled",
 }
 
 _SOURCE_RUN_SECTIONS = (
@@ -233,16 +206,11 @@ _SOURCE_RUN_SECTIONS = (
     "well_trajectory",
     "well_auto_tie",
     "wavelet_generation",
-    "well_constraints",
-    "lfm_precomputed",
-    "dynamic_gain",
-    "deterministic_inversion",
 )
 
 _TIME_WORKFLOW_SECTIONS = (
     "well_inventory",
     *_SOURCE_RUN_SECTIONS,
-    "ginn_inversion",
 )
 
 

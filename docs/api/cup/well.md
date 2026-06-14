@@ -17,5 +17,3 @@
 ::: cup.well.td
 
 ::: cup.well.trajectory
-
-::: cup.well.viz

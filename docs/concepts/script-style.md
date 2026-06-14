@@ -1,91 +1,70 @@
 # 脚本风格
 
-本文是对重构后代码组织方式的极简归纳。如何在 `scripts/` 下写一个合规的新脚本、每个公共函数去哪个模块找、`src/` 下每个文件管什么——都可以在这里查到。
-
----
+本文只描述当前稳定的前五步和井轨迹旁路。研究阶段的新脚本不得沿用已经删除的
+后半程接口。
 
 ## 脚本骨架
 
-每个时间域主链脚本统一为以下结构，从上到下：
+时间域脚本统一采用以下结构：
 
 ```text
-1. 英文 docstring（消费什么、输出什么、怎么运行）
+1. 英文模块 docstring
 2. from __future__ import annotations
-3. import argparse / logging / sys / pathlib / 三方库
-4. Bootstrap block（SCRIPT_DIR → REPO_ROOT → SRC_DIR，把 src 加入 sys.path）
-5. from src import ...（库函数和 dataclass）
-6. DEFAULT_CONFIG（脚本级默认值字典）
+3. 标准库与第三方依赖
+4. SCRIPT_DIR / REPO_ROOT / SRC_DIR bootstrap
+5. cup 与 wtie 导入
+6. DEFAULT_CONFIG
 7. parse_args()
-8. _resolve_inputs() / _resolve_output_dir()（路径与上游 run 发现）
-9. main()（构建上下文 → 调 src 函数 → 写 summary → 打印一行简短日志）
+8. 输入和输出路径解析
+9. main()
 10. if __name__ == "__main__": main()
 ```
 
-### 具体约束
+## 约束
 
-- **CLI**：`parse_args()` 解析 `--config`、`--output-dir` 和真正属于单次运行的覆盖项（如 `--well`、`--debug`）。
-- **共享配置**：时间域脚本先用 `cup.time_config.TimeWorkflowConfig` 解析顶层 `assets`、`seismic`、`well_curves`、`spatial_debias`，步骤段不得复制这些工区事实；步骤级覆盖和已退休键会明确报错。
-- **配置合并**：用 `cup.utils.config.deep_merge_dict(DEFAULT_CONFIG, cfg.get("<section>"))` 合并用户配置到默认值。
-- **run 发现**：缺省用 `cup.utils.io.latest_run(output_root, prefix, required_file)` 定位上游 run；复现实验时才显式配置 `source_runs.<step>_dir`。
-- **路径解析**：用 `cup.utils.io.resolve_relative_path` / `repo_relative_path`；可选的配置路径用 `resolve_optional_path`；从上游元数据里取出的 artifact 路径用 `resolve_artifact_path`。
-- **日志**：`import logging; logger = logging.getLogger(__name__)`，主流程用 `logger.info()`，只在脚本最后用 `print()` 输出一行简短汇总。
-- **图表保存**：简单 `_save_fig()` 留在脚本内；只有带业务语义的图件绘制逻辑才迁入 `cup.well.viz` 或 `cup.seismic.viz`。
-- **ginn_train.py**：可保持 dataclass 驱动的极简风格，但必须补齐英文 docstring 和 bootstrap 分隔。
+- CLI 只暴露单次运行需要覆盖的参数。
+- 顶层工区事实通过 `cup.time_config.TimeWorkflowConfig` 解析。
+- 步骤默认配置使用 `cup.utils.config.merge_dict_defaults`。
+- 路径使用 `cup.utils.io` 中的解析和 repo-relative 工具。
+- 带采样轴、单位或 domain 的井曲线和地震道优先使用 `wtie.processing.grid`
+  对象或项目 dataclass，不在脚本中长期传递裸 `np.ndarray`。
+- 简单保存逻辑可留在脚本内；可复用的业务计算和绘图进入 `src/cup/`。
+- 跨步骤 CSV 的字段语义以[核心 CSV 契约](csv-contracts.md)为准。
+- 新研究模块应先确定独立契约，再创建包名和脚本编号。
 
----
+## 稳定能力地图
 
-## 常用函数去哪儿找
-
-| 需求 | 模块 | 函数 |
+| 需求 | 模块 | 入口 |
 |------|------|------|
-| 解析时间域共享配置 | `cup.time_config` | `TimeWorkflowConfig.from_mapping` |
-| 递归合并两个 dict | `cup.utils.config` | `deep_merge_dict` |
-| 定位最新上游 run | `cup.utils.io` | `latest_run` |
-| 构造时间戳输出目录 | `cup.utils.io` | `resolve_timestamped_output_dir` |
-| 解析脚本级路径 | `cup.utils.io` | `resolve_relative_path` |
-| 可移植 repo-relative string | `cup.utils.io` | `repo_relative_path` |
-| 可选路径（支持 none/null） | `cup.utils.io` | `resolve_optional_path` |
-| 上游元数据 artifact 路径 | `cup.utils.io` | `resolve_artifact_path` |
-| 加载 YAML 配置 | `cup.utils.io` | `load_yaml_config` |
-| 写 JSON 产物 | `cup.utils.io` | `write_json` |
-| JSON-safe 序列化 | `cup.utils.io` | `to_json_compatible` |
-| 文件名安全化 | `cup.utils.io` | `sanitize_filename` |
-| 打开地震体 | `cup.seismic.survey` | `open_survey` |
-| 构造 SEG-Y 选项 | `cup.seismic.survey` | `segy_options_from_config` |
-| 井位 → inline/xline | `cup.seismic.geometry` | `resolve_well_line_position` |
-| 目标层构建 | `cup.seismic.target_zone` | `TargetZone` |
-| 解释层位读取 | `cup.petrel.load` | `import_interpretation_petrel` |
-| 井头读取 | `cup.petrel.load` | `import_well_heads_petrel` |
-| 井分层读取 | `cup.petrel.load` | `import_well_tops_petrel` |
-| 井名规范化 | `cup.well.assets` | `normalize_well_name` |
-| 文件 lookup（stem→path） | `cup.well.assets` | `build_file_lookup` |
-| 井轨迹解析 | `cup.well.trajectory` | `WellTrajectory.from_petrel_trace` |
-| 标准 LAS 加载 | `cup.well.las` | `load_vp_rho_logset_from_standard_las` |
-| LAS 曲线扫描 | `cup.well.las` | `scan_las_curves` |
-| 曲线分类与 primary | `cup.well.curves` | `classify_curves_by_rules` / `select_primary_curves` |
-| 曲线 mnemonic 规则 | `cup.well.mnemonics` | `CURVE_CATEGORY_MNEMONICS` |
-| 预处理清洗 | `cup.well.preprocess` | `standardize_curve_unit` / `replace_constant_runs` / `remove_outliers` 等 |
-| 时深表加载 | `cup.well.td` | `load_petrel_time_depth_table` / `load_workflow_time_depth_table_csv` |
-| 子波加载与频谱 | `cup.seismic.wavelet` | `load_wavelet_csv` / `crop_wavelet_center_energy_normalize` / `wavelet_half_amplitude_frequencies` |
-| 子波共识搜索 | `cup.seismic.wavelet_consensus` | `build_wavelet_pca_basis` / `optimize_consensus_wavelet` |
-| 井震标定路由 | `cup.well.tie` | `build_tie_plan` / `WellTiePlan` / `evaluate_wavelet_on_well` 等 |
-| 井约束点级事实 | `cup.well.constraints` | `build_vertical_point_facts` / `build_deviated_point_facts` / `lowpass_values_on_twt` 等 |
-| TDT 感知测井连续化 | `cup.well.gaps` | `fill_short_joint_gaps` / `prepare_continuous_tie_logs` |
-| dynamic gain 计算 | `cup.seismic.gain` | `positive_ls_gain` / `fit_gain_relationship` / `build_gain_volume` / `write_gain_npz` |
-| LFM 时间域建模 | `cup.seismic.lfm_time` | `build_lfm_time_model_from_points` |
-| LFM 低通滤波 | `cup.seismic.lfm_time` | `lowpass_twt_log` |
-| 沿轨迹取道 | `cup.seismic.trace_sampling` | `build_nearest_trace_sample_plan` / `assemble_nearest_trace_from_plan` |
-| GINN 数据加载 | `ginn.data` | `load_lowfreq_model` / `_validate_time_lfm_contract` 等 |
-| GINN anchor 读写 | `ginn.anchor` | `build_log_ai_anchor_bundle` / `validate_log_ai_anchor` / `save_log_ai_anchor_npz` |
-| GINN 训练 | `ginn.trainer` | `Trainer` |
-| GINN 配置 | `ginn.config` | `GINNConfig` |
-| enhance 监督包 | `enhance.supervision` | `WellHighSupervisionBundle` / `save_well_high_supervision_npz` |
-| 统计工具 | `cup.utils.statistics` | `pearson_r` / `spearman_rho` / `ols_fit` / `radius_connected_components` / `aggregate_cluster_then_global` |
-| 滑动窗口 | `cup.utils.raw_trace` | `centered_moving_rms_axis` / `centered_moving_average` / `centered_moving_sum_axis` |
+| 共享配置 | `cup.time_config` | `TimeWorkflowConfig.from_mapping` |
+| 配置默认值合并 | `cup.utils.config` | `merge_dict_defaults` |
+| YAML、JSON 与路径 | `cup.utils.io` | `load_yaml_config` / `write_json` / `resolve_relative_path` / `repo_relative_path` |
 | 类型转换 | `cup.utils.coerce` | `as_bool` / `optional_float` |
+| 掩码连续区间 | `cup.utils.masks` | `true_runs` |
+| 空间簇与统计 | `cup.utils.statistics` | `radius_connected_components` / `aggregate_cluster_then_global` |
+| Petrel 资产读取 | `cup.petrel.load` | 井头、井分层、checkshot 和解释层位读取函数 |
+| 打开地震体 | `cup.seismic.survey` | `open_survey` / `segy_options_from_config` |
+| 工区几何 | `cup.seismic.geometry` | `SurveyLineGeometry` 及坐标变换工具 |
+| 单层位处理 | `cup.seismic.horizon` | `HorizonSurface` / `build_horizon_surface` |
+| 沿轨迹取道 | `cup.seismic.trace_sampling` | `build_nearest_trace_sample_plan` / `assemble_nearest_trace_from_plan` |
+| 井震与子波 QC | `cup.seismic.viz` | `plot_well_waveform_qc` |
+| 子波处理 | `cup.seismic.wavelet` | 加载、裁剪、归一化和频谱属性函数 |
+| 共识子波搜索 | `cup.seismic.wavelet_consensus` | `build_wavelet_pca_basis` / `optimize_consensus_wavelet` |
+| 井资产 | `cup.well.assets` | `normalize_well_name` / `build_file_lookup` |
+| LAS I/O | `cup.well.las` | 标准 LAS 加载、扫描和导出函数 |
+| 曲线识别 | `cup.well.curves` / `cup.well.mnemonics` | 分类、primary 选择和 mnemonic 规则 |
+| 测井预处理 | `cup.well.preprocess` | 单位标准化、常值段和异常值处理 |
+| 缺口处理 | `cup.well.gaps` | `fill_short_joint_gaps` / `prepare_continuous_tie_logs` |
+| 时深表 | `cup.well.td` | Petrel 和工作流 TDT 读取、转换与输出 |
+| 井轨迹 | `cup.well.trajectory` | `WellTrajectory` 及 TWT 轨迹采样 |
+| 井震标定 | `cup.well.tie` | 路由、搜索空间、结果对象和子波评价 |
 
-## 脚本之间的契约
+## 跨步骤契约
 
-脚本之间传的是文件，不是内存对象。下游脚本通过 `latest_run` 定位上游输出目录后，必须检查必需文件是否存在并做 schema 校验。每个步骤产出的 CSV 和 NPZ 字段约定见 `docs/concepts/csv-contracts.md`；TWT、TVDSS、inline/xline 等坐标约定见 `docs/concepts/data-and-coordinate-conventions.md`。
+脚本之间传递文件，不传递进程内对象。修改任何 CSV 列、路径含义或坐标语义前，
+必须同步更新：
 
-修改任何跨步骤的 CSV 列或 NPZ 键之前，必须先更新对应的 contracts 文档。
+- [核心 CSV 契约](csv-contracts.md)
+- [数据与单位约定](data-and-coordinate-conventions.md)
+
+当前正式契约只覆盖步骤 01 至 05 和井轨迹旁路。

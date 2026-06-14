@@ -6,7 +6,7 @@
 边界说明
 --------
 - 负责单个层位解释点到规则网格面的构建、异常点处理和采样审计。
-- 不负责目标层段之间的厚度关系；这些由 ``cup.seismic.target_zone`` 处理。
+- 不负责多层位排序、层间厚度修复或三维目标窗构建。
 - 不读取 Petrel 文件；调用方先用 ``cup.petrel.load`` 得到 DataFrame。
 
 核心公开对象
@@ -560,4 +560,3 @@ def build_horizon_surface(
         metadata={"outlier_stats": dict(interpolation.outlier_stats)},
     )
     return surface, interpolation
-

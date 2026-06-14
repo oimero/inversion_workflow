@@ -147,7 +147,7 @@ wavelet_generation:
 
 ### `spatial_debias`
 
-密井网中，一个平台上十几口井如果各自算一票，会让该平台主导全局子波。空间去偏会先把近井归成空间簇，再按“簇”聚合评分，让一簇近井只贡献一票。半径来自顶层 `spatial_debias.cluster_radius_m`，与 dynamic gain 共用。
+密井网中，一个平台上十几口井如果各自算一票，会让该平台主导全局子波。空间去偏会先把近井归成空间簇，再按“簇”聚合评分，让一簇近井只贡献一票。半径来自顶层 `spatial_debias.cluster_radius_m`。
 
 如果不想用空间去偏，把 `enabled` 关掉即可——此时每口井等权投票。
 

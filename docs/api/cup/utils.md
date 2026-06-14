@@ -6,6 +6,4 @@
 
 ::: cup.utils.config
 
-::: cup.utils.raw_trace
-
 ::: cup.utils.statistics

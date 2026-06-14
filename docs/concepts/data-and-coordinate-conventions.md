@@ -29,32 +29,11 @@
     - 标准 LAS 必须含 `DT_USM`（`us/m`）和 `RHO_GCC`（`g/cm3`），且 MD 轴有限、严格递增、规则采样。
     - 入口只读取这两条基础曲线并转换成允许 NaN 的 `Vp/Rho` `grid.LogSet`；不会静默插值缺失值，即使 LAS 含 `AI`，也不会读取或校验旧 AI。
     - 需要原始联合观测 mask 时使用 `cup.well.las.load_standard_vp_rho_logs(path)`。
-    - 基于 TDT 判断短缺口时长、填补短缺口或裁取连续标定窗，统一使用 `cup.well.gaps`；频带模块不拥有第四步标定窗逻辑。
+    - 基于 TDT 判断短缺口时长、填补短缺口或裁取连续标定窗，统一使用 `cup.well.gaps`。
 - 时间域第三、四步成功导出的 LAS 固定含 `AI`：
     - 第三步 `AI` 来自清洗后的全频 `DT_USM/RHO_GCC`；任一源曲线无效时对应 AI 样点保持缺失。
     - 第四步 `AI` 来自 auto-tie 最优滤波后的 `Vp/Rho`，会重新计算，不沿用第三步或人工处理中遗留的 AI。
     - 两者都保持原 MD 轴；TDT 的整体时移不写回 LAS。
-
-## 第六步目标分解
-
-- Reference、LFM 和观测 provenance 固定来自第三步 `preprocessed_las`。
-- GINN target 由整次运行统一选择：
-    - `frequency_lowpass`：第三步条件化 `log(AI)` 低通到诊断 cutoff。
-    - `auto_tie_filtered_las`：第四步 `filtered_las_file` 经 optimized TDT 直接投影到 TWT，不再做 Hampel、Gaussian 或 Butterworth 处理。
-- 第四步还提供地震道和斜井轨迹采样计划；第五步提供唯一的共识子波。
-- 分解在 TWT 域 `log(AI)` 上执行：
-
-```text
-reference_log_ai = LP(conditioned_log_ai, f_reference)
-lfm_log_ai = LP(conditioned_log_ai, f_lfm)
-ginn_target_log_ai = LP(conditioned_log_ai, f_ginn)  # frequency_lowpass
-                     or project(filtered_las, optimized_tdt)
-ginn_band_log_ai = ginn_target_log_ai - lfm_log_ai
-enhance_residual_log_ai = reference_log_ai - ginn_target_log_ai
-```
-
-- `f_lfm` 默认取共识子波主峰左侧归一化振幅 `0.5` 交点；`f_ginn` 始终由正演近最佳平台诊断，并用于 `f_reference = min(2*f_ginn, 0.4*fs)`。filtered 模式下 `f_ginn` 仅是诊断/reference 参数，不定义目标曲线。
-- `<=10 ms` 的内部缺口只为滤波支撑而插值，不进入 LFM 控制、GINN anchor、enhance 监督或统计；更长缺口保持无效并按连续段独立滤波。
 
 ## 时深表
 
@@ -84,7 +63,7 @@ enhance_residual_log_ai = reference_log_ai - ginn_target_log_ai
 
 - 井旁道读取入口：`cup.seismic.survey.open_survey()`。
     - 返回 `SurveyContext`，用 `survey.read_trace_at_xy(x, y, domain="time" | "depth")` 读取井旁道。
-    - 旧的 `cup.petrel.load.import_seismic()` 只读取整块 3D 体为数组，主要服务深度学习数据准备；井震标定和井位采样不要用它取井旁道。
+    - `cup.petrel.load.import_seismic()` 是整块 3D 数组读取入口，不属于当前稳定脚本链；井震标定和井位采样不要用它取井旁道。
 - 工区几何入口：`survey.line_geometry`，类型为 `cup.seismic.geometry.SurveyLineGeometry`。
 - `geometry["inline_step"]` / `geometry["xline_step"]` 是线号步长，不是 XY 米制间距。物理距离必须通过 `SurveyLineGeometry.line_to_coord()` 或已构建的 XY 网格计算。
 - 最近道吸附公式：`line_min + round((line_float - line_min) / line_step) * line_step`。

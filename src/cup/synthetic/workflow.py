@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -10,6 +11,7 @@ from typing import Any, Mapping, Sequence
 import h5py
 import numpy as np
 import pandas as pd
+import scipy
 
 from cup.petrel.load import (
     import_interpretation_petrel,
@@ -38,9 +40,29 @@ from cup.synthetic.canonical import (
 from cup.synthetic.generation import (
     GenerationRejected,
     GenerationScenario,
+    antialias_taps,
     generate_field_section,
 )
-from cup.synthetic.io import sha256_file, write_generated_section
+from cup.synthetic.forward import (
+    HighresForwardResult,
+    HighresWavelet,
+    highres_forward_to_model_grid,
+    model_grid_closure_qc,
+    resample_wavelet_to_highres,
+)
+from cup.synthetic.io import (
+    sha256_file,
+    write_generated_section,
+    write_highres_forward_result,
+    write_probe_result,
+)
+from cup.synthetic.probes import (
+    ProbeFrequency,
+    build_probe_frequency_catalog,
+    frequency_catalog_rows,
+    generate_probe,
+    probe_variants,
+)
 from cup.time_config import TimeWorkflowConfig
 from cup.utils.io import (
     repo_relative_path,
@@ -54,7 +76,12 @@ from cup.well.td import find_well_top_md, load_workflow_time_depth_table_csv
 
 
 DATA_SCHEMA = "synthoseis_lite_v1"
-IMPLEMENTATION_SCOPE = "impedance_truth_and_nominal_forward"
+IMPLEMENTATION_SCOPE = "impedance_truth_frequency_probes_and_forward_qc"
+
+
+def _array_sha256(values: np.ndarray) -> str:
+    array = np.ascontiguousarray(np.asarray(values))
+    return hashlib.sha256(array.view(np.uint8).tobytes()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -135,6 +162,28 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     qc = dict(impedance.get("qc") or {})
     robust_scale = dict(impedance.get("robust_scale") or {})
     generation = dict(root.get("generation") or {})
+    forward_qc = dict(root.get("forward_qc") or {})
+    highres_mismatch = dict(forward_qc.get("highres_mismatch") or {})
+    probe_selection = dict(root.get("probe_selection") or {})
+    raw_lateral_shapes = probe_selection.get(
+        "lateral_shapes",
+        [
+            "section_coherent",
+            {
+                "name": "localized_tukey",
+                "centered_fraction": 0.40,
+                "alpha": 0.5,
+            },
+        ],
+    )
+    lateral_shapes = []
+    for index, item in enumerate(raw_lateral_shapes):
+        if isinstance(item, str):
+            lateral_shapes.append({"name": item})
+        else:
+            lateral_shapes.append(
+                _mapping(item, path=f"synthoseis_lite.probe_selection.lateral_shapes[{index}]")
+            )
     parsed = {
         "global_seed": int(root.get("global_seed", 20260615)),
         "source_runs": source_runs,
@@ -225,8 +274,59 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 generation.get("geometry_directions", ["left_to_right", "right_to_left"])
             ),
         },
+        "forward_qc": {
+            "highres_mismatch_enabled": bool(
+                highres_mismatch.get("enabled", True)
+            ),
+            "highres_mismatch_required": bool(
+                highres_mismatch.get("required", False)
+            ),
+        },
+        "probe_selection": {
+            "enabled": bool(probe_selection.get("enabled", True)),
+            "weak_representatives_per_band": int(
+                probe_selection.get("weak_representatives_per_band", 3)
+            ),
+            "unsupported_representatives_per_band": int(
+                probe_selection.get("unsupported_representatives_per_band", 3)
+            ),
+            "minimum_noise_equivalent_clusters": int(
+                probe_selection.get("minimum_noise_equivalent_clusters", 3)
+            ),
+            "low_probe_energy_warning_fraction": float(
+                probe_selection.get("low_probe_energy_warning_fraction", 0.01)
+            ),
+            "conservative_to_nominal_warning_ratio": float(
+                probe_selection.get(
+                    "conservative_to_nominal_warning_ratio",
+                    1.5,
+                )
+            ),
+            "vertical_tukey_alpha": float(
+                probe_selection.get("vertical_tukey_alpha", 0.5)
+            ),
+            "amplitude_multipliers": [
+                float(value)
+                for value in probe_selection.get(
+                    "amplitude_multipliers",
+                    [0.0, 0.25, 0.5, 1.0, 2.0, 4.0],
+                )
+            ],
+            "phases": [
+                str(value)
+                for value in probe_selection.get("phases", ["sin", "cos"])
+            ],
+            "lateral_shapes": lateral_shapes,
+            "field_parent_geometry_family": str(
+                probe_selection.get("field_parent_geometry_family", "none")
+            ),
+            "field_parents_per_section": int(
+                probe_selection.get("field_parents_per_section", 1)
+            ),
+        },
     }
     _validate_canonical_config(parsed["canonical"])
+    _validate_probe_config(parsed["probe_selection"])
     return parsed
 
 
@@ -251,6 +351,50 @@ def _validate_canonical_config(config: Mapping[str, Any]) -> None:
         value = float(config[key])
         if not 0.0 < value < 1.0:
             raise ValueError(f"canonical {key} must be within (0, 1).")
+
+
+def _validate_probe_config(config: Mapping[str, Any]) -> None:
+    if int(config["weak_representatives_per_band"]) < 1:
+        raise ValueError("weak_representatives_per_band must be positive.")
+    if int(config["unsupported_representatives_per_band"]) < 1:
+        raise ValueError("unsupported_representatives_per_band must be positive.")
+    if int(config["minimum_noise_equivalent_clusters"]) < 1:
+        raise ValueError("minimum_noise_equivalent_clusters must be positive.")
+    if int(config["field_parents_per_section"]) < 1:
+        raise ValueError("field_parents_per_section must be positive.")
+    if str(config["field_parent_geometry_family"]) not in {
+        "none",
+        "wedge",
+        "pinchout",
+    }:
+        raise ValueError(
+            "field_parent_geometry_family must be none, wedge, or pinchout."
+        )
+    if not 0.0 <= float(config["vertical_tukey_alpha"]) <= 1.0:
+        raise ValueError("vertical_tukey_alpha must be within [0, 1].")
+    multipliers = list(config["amplitude_multipliers"])
+    if (
+        not multipliers
+        or 0.0 not in multipliers
+        or any(not np.isfinite(value) or value < 0.0 for value in multipliers)
+    ):
+        raise ValueError("probe amplitude_multipliers must be finite, nonnegative, and include 0.")
+    if set(config["phases"]) != {"sin", "cos"}:
+        raise ValueError("probe phases must contain exactly sin and cos.")
+    names = [str(item.get("name", "")) for item in config["lateral_shapes"]]
+    if set(names) != {"section_coherent", "localized_tukey"}:
+        raise ValueError(
+            "probe lateral_shapes must contain section_coherent and localized_tukey."
+        )
+    localized = next(
+        item
+        for item in config["lateral_shapes"]
+        if str(item["name"]) == "localized_tukey"
+    )
+    if not 0.0 < float(localized.get("centered_fraction", 0.0)) <= 1.0:
+        raise ValueError("localized_tukey centered_fraction must be within (0, 1].")
+    if not 0.0 <= float(localized.get("alpha", -1.0)) <= 1.0:
+        raise ValueError("localized_tukey alpha must be within [0, 1].")
 
 
 def resolve_sources(script_cfg: Mapping[str, Any], *, repo_root: Path) -> dict[str, Path]:
@@ -674,6 +818,239 @@ def generation_scenarios(script_cfg: Mapping[str, Any]) -> list[GenerationScenar
     return scenarios
 
 
+def _load_probe_frequencies(
+    *,
+    script_cfg: Mapping[str, Any],
+    sources: Mapping[str, Path],
+) -> list[ProbeFrequency]:
+    config = script_cfg["probe_selection"]
+    if not bool(config["enabled"]):
+        return []
+    evidence = pd.read_csv(
+        sources["forward_observability_dir"] / "frequency_evidence_bands.csv"
+    )
+    sensitivity = pd.read_csv(
+        sources["forward_observability_dir"] / "well_frequency_sensitivity.csv"
+    )
+    return build_probe_frequency_catalog(
+        evidence,
+        sensitivity,
+        weak_representatives_per_band=int(
+            config["weak_representatives_per_band"]
+        ),
+        unsupported_representatives_per_band=int(
+            config["unsupported_representatives_per_band"]
+        ),
+        minimum_clusters=int(config["minimum_noise_equivalent_clusters"]),
+    )
+
+
+def _section_forward_qc(
+    section: Any,
+    *,
+    wavelet: np.ndarray,
+    highres_wavelet: HighresWavelet | None,
+    required: bool,
+) -> tuple[HighresForwardResult | None, dict[str, Any]]:
+    qc = model_grid_closure_qc(
+        section.model_target_log_ai,
+        section.seismic_model_consistent,
+        wavelet,
+    )
+    if highres_wavelet is None:
+        return None, {
+            **qc,
+            "highres_forward_status": "disabled",
+            "highres_forward_reasons": "",
+        }
+    try:
+        result = highres_forward_to_model_grid(
+            section.truth_log_ai_highres,
+            section.seismic_model_consistent,
+            highres_wavelet=highres_wavelet,
+            forward_valid_mask_model=section.forward_valid_mask_model,
+        )
+        return result, {
+            **qc,
+            **result.qc,
+            "highres_forward_reasons": "",
+        }
+    except Exception as exc:
+        if required:
+            raise ValueError(f"highres_forward_qc_failed:{exc}") from exc
+        return None, {
+            **qc,
+            "highres_forward_status": "failed",
+            "highres_forward_reasons": f"{type(exc).__name__}:{exc}",
+        }
+
+
+def _probe_records_for_parent(
+    *,
+    h5: h5py.File,
+    parent_path: str,
+    section: Any,
+    suite: str,
+    section_id: str,
+    split: str,
+    frequencies: Sequence[ProbeFrequency],
+    script_cfg: Mapping[str, Any],
+    wavelet: np.ndarray,
+    highres_wavelet: HighresWavelet | None,
+    base_highres_forward: HighresForwardResult | None,
+    qc_only: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    config = script_cfg["probe_selection"]
+    taps = antialias_taps(
+        int(script_cfg["sampling"]["vertical_oversampling_factor"])
+    )
+    index_records: list[dict[str, Any]] = []
+    result_records: list[dict[str, Any]] = []
+    for frequency in frequencies:
+        variants = probe_variants(
+            frequency,
+            amplitude_multipliers=config["amplitude_multipliers"],
+            phases=config["phases"],
+            lateral_shapes=config["lateral_shapes"],
+        )
+        for variant in variants:
+            result = generate_probe(
+                section,
+                frequency,
+                variant,
+                wavelet=wavelet,
+                antialias_filter_taps=taps,
+                vertical_tukey_alpha=float(config["vertical_tukey_alpha"]),
+                lateral_shapes=config["lateral_shapes"],
+                low_probe_energy_warning_fraction=float(
+                    config["low_probe_energy_warning_fraction"]
+                ),
+            )
+            closure = model_grid_closure_qc(
+                result.model_target_log_ai,
+                result.seismic_model_consistent,
+                wavelet,
+            )
+            if variant.amplitude_multiplier == 0.0:
+                highres_result = base_highres_forward
+                highres_qc = (
+                    {}
+                    if base_highres_forward is None
+                    else base_highres_forward.qc
+                )
+            elif highres_wavelet is not None:
+                try:
+                    highres_result = highres_forward_to_model_grid(
+                        section.truth_log_ai_highres
+                        + result.probe_log_ai_highres,
+                        result.seismic_model_consistent,
+                        highres_wavelet=highres_wavelet,
+                        forward_valid_mask_model=(
+                            section.forward_valid_mask_model
+                        ),
+                    )
+                    highres_qc = highres_result.qc
+                except Exception as exc:
+                    if bool(
+                        script_cfg["forward_qc"][
+                            "highres_mismatch_required"
+                        ]
+                    ):
+                        raise ValueError(
+                            f"highres_forward_qc_failed:"
+                            f"{section.realization_id}:{variant.variant_id}:{exc}"
+                        ) from exc
+                    highres_result = None
+                    highres_qc = {
+                        "highres_forward_status": "failed",
+                        "highres_forward_reasons": (
+                            f"{type(exc).__name__}:{exc}"
+                        ),
+                    }
+            else:
+                highres_result = None
+                highres_qc = {
+                    "highres_forward_status": "disabled",
+                    "highres_forward_reasons": "",
+                }
+            hdf5_group = (
+                ""
+                if qc_only
+                else write_probe_result(
+                    h5,
+                    realization_path=parent_path,
+                    frequency=frequency,
+                    result=result,
+                    highres_forward=highres_result,
+                )
+            )
+            sample_id = (
+                f"{section.realization_id}__probe__{variant.variant_id}"
+            )
+            pair_id = (
+                f"{section.realization_id}__probe__"
+                f"{variant.paired_zero_variant_id}"
+            )
+            index_record = {
+                "sample_id": sample_id,
+                "realization_id": sample_id,
+                "parent_realization_id": section.realization_id,
+                "suite": suite,
+                "section_id": section_id,
+                "scenario_id": "frequency_probe",
+                "geometry_family": section.scenario.geometry_family,
+                "duration_mode": section.scenario.duration_mode,
+                "split": split,
+                "hdf5_group": hdf5_group,
+                "attempt_id": "",
+                "status": "ok",
+                "reasons": "",
+                "sample_kind": "frequency_probe",
+                "probe_variant_id": variant.variant_id,
+                "paired_zero_sample_id": pair_id,
+                "probe_frequency_hz": frequency.frequency_hz,
+                "probe_phase": variant.phase,
+                "probe_lateral_shape": variant.lateral_shape,
+                "probe_amplitude_multiplier": (
+                    variant.amplitude_multiplier
+                ),
+            }
+            index_records.append(index_record)
+            result_records.append(
+                {
+                    **index_record,
+                    "evidence_status": frequency.evidence_status,
+                    "operator_support": frequency.operator_support,
+                    "experiment_class": frequency.experiment_class,
+                    "selection_reason": frequency.selection_reason,
+                    "noise_equivalent_calibration_status": (
+                        frequency.calibration_status
+                    ),
+                    "wavelet_uncertainty_warning": bool(
+                        np.isfinite(
+                            frequency.conservative_to_nominal_ratio
+                        )
+                        and frequency.conservative_to_nominal_ratio
+                        > float(
+                            config[
+                                "conservative_to_nominal_warning_ratio"
+                            ]
+                        )
+                    ),
+                    "valid_nominal_cluster_count": (
+                        frequency.valid_nominal_cluster_count
+                    ),
+                    "valid_conservative_cluster_count": (
+                        frequency.valid_conservative_cluster_count
+                    ),
+                    **result.qc,
+                    **closure,
+                    **highres_qc,
+                }
+            )
+    return index_records, result_records
+
+
 def _run_canonical_generation(
     *,
     script_cfg: Mapping[str, Any],
@@ -694,6 +1071,24 @@ def _run_canonical_generation(
     index_records: list[dict[str, Any]] = []
     object_records: list[dict[str, Any]] = []
     qc_records: list[dict[str, Any]] = []
+    probe_records: list[dict[str, Any]] = []
+    probe_frequencies = _load_probe_frequencies(
+        script_cfg=script_cfg,
+        sources=sources,
+    )
+    highres_wavelet = (
+        resample_wavelet_to_highres(
+            wavelet_time,
+            wavelet,
+            factor=int(
+                script_cfg["sampling"]["vertical_oversampling_factor"]
+            ),
+        )
+        if bool(
+            script_cfg["forward_qc"]["highres_mismatch_enabled"]
+        )
+        else None
+    )
     h5_path = output_dir / "synthetic_benchmark.h5"
     with h5py.File(h5_path, "w") as h5:
         h5.attrs["schema_version"] = DATA_SCHEMA
@@ -726,7 +1121,24 @@ def _run_canonical_generation(
                     raise ValueError(
                         f"canonical_geometry_qc_failed:{scenario.scenario_id}:termination_error"
                     )
+            highres_result, forward_qc = _section_forward_qc(
+                generated,
+                wavelet=wavelet,
+                highres_wavelet=highres_wavelet,
+                required=bool(
+                    script_cfg["forward_qc"][
+                        "highres_mismatch_required"
+                    ]
+                ),
+            )
+            generated.qc.update(forward_qc)
             hdf5_group = "" if qc_only else write_generated_section(h5, generated)
+            if not qc_only and highres_result is not None:
+                write_highres_forward_result(
+                    h5,
+                    realization_path=hdf5_group,
+                    result=highres_result,
+                )
             object_records.extend(generated.object_catalog)
             record = {
                 "sample_id": scenario.scenario_id,
@@ -742,12 +1154,34 @@ def _run_canonical_generation(
                 "attempt_id": 0,
                 "status": "ok",
                 "reasons": "",
+                "sample_kind": "base",
                 "canonical_parameter_name": scenario.parameter_name,
                 "canonical_parameter_value": scenario.parameter_value,
                 "canonical_parameter_unit": scenario.parameter_unit,
             }
             index_records.append(record)
             qc_records.append({**record, **generated.qc})
+            if scenario.family == "frequency_probe" and probe_frequencies:
+                probe_index, parent_probe_records = _probe_records_for_parent(
+                    h5=h5,
+                    parent_path=(
+                        hdf5_group
+                        if hdf5_group
+                        else f"/realizations/{generated.realization_id}"
+                    ),
+                    section=generated,
+                    suite="canonical",
+                    section_id="canonical",
+                    split="benchmark",
+                    frequencies=probe_frequencies,
+                    script_cfg=script_cfg,
+                    wavelet=wavelet,
+                    highres_wavelet=highres_wavelet,
+                    base_highres_forward=highres_result,
+                    qc_only=qc_only,
+                )
+                index_records.extend(probe_index)
+                probe_records.extend(parent_probe_records)
 
     index = pd.DataFrame.from_records(index_records)
     index.to_csv(output_dir / "sample_index.csv", index=False)
@@ -779,6 +1213,28 @@ def _run_canonical_generation(
     qc_frame = pd.DataFrame.from_records(qc_records)
     qc_frame.to_csv(output_dir / "generation_qc.csv", index=False)
     qc_frame.to_csv(output_dir / "canonical_geometry_qc.csv", index=False)
+    pd.DataFrame.from_records(probe_records).to_csv(
+        output_dir / "frequency_probe_results.csv",
+        index=False,
+    )
+    probe_frequency_frame = pd.DataFrame.from_records(
+        frequency_catalog_rows(probe_frequencies)
+    )
+    if not probe_frequency_frame.empty:
+        probe_frequency_frame["wavelet_uncertainty_warning"] = (
+            probe_frequency_frame[
+                "conservative_to_nominal_ratio"
+            ]
+            > float(
+                script_cfg["probe_selection"][
+                    "conservative_to_nominal_warning_ratio"
+                ]
+            )
+        )
+    probe_frequency_frame.to_csv(
+        output_dir / "probe_frequency_catalog.csv",
+        index=False,
+    )
     rejection_columns = [
         "realization_id",
         "section_id",
@@ -805,7 +1261,7 @@ def _run_canonical_generation(
         output_dir / "generation_rejection_details.csv",
         index=False,
     )
-    catalog = index[
+    catalog = index[index["sample_kind"].eq("base")][
         [
             "section_id",
             "scenario_id",
@@ -842,12 +1298,70 @@ def _run_canonical_generation(
         "canonical_families": list(CANONICAL_FAMILIES),
         "canonical_config": dict(config),
         "canonical_reference_impedance": reference,
+        "probe_selection": dict(script_cfg["probe_selection"]),
+        "probe_frequency_count": len(probe_frequencies),
+        "probe_variant_count": len(probe_records),
+        "forward_qc": dict(script_cfg["forward_qc"]),
+        "highres_wavelet": (
+            {}
+            if highres_wavelet is None
+            else {
+                "dt_s": float(
+                    highres_wavelet.time_s[1]
+                    - highres_wavelet.time_s[0]
+                ),
+                "n_samples": int(highres_wavelet.amplitude.size),
+                "l2_energy": float(
+                    np.linalg.norm(highres_wavelet.amplitude)
+                ),
+                "sha256": _array_sha256(
+                    highres_wavelet.amplitude
+                ),
+            }
+        ),
+        "antialias_filter": {
+            "implementation": "scipy.signal.firwin/resample_poly",
+            "scipy_version": scipy.__version__,
+            "factor": int(
+                script_cfg["sampling"][
+                    "vertical_oversampling_factor"
+                ]
+            ),
+            "numtaps": int(
+                antialias_taps(
+                    int(
+                        script_cfg["sampling"][
+                            "vertical_oversampling_factor"
+                        ]
+                    )
+                ).size
+            ),
+            "cutoff_output_nyquist_fraction": 0.9,
+            "kaiser_beta": 8.6,
+            "taps_sha256": _array_sha256(
+                antialias_taps(
+                    int(
+                        script_cfg["sampling"][
+                            "vertical_oversampling_factor"
+                        ]
+                    )
+                )
+            ),
+        },
+        "probe_source_hashes": {
+            "frequency_evidence_bands.csv": sha256_file(
+                sources["forward_observability_dir"]
+                / "frequency_evidence_bands.csv"
+            ),
+            "well_frequency_sensitivity.csv": sha256_file(
+                sources["forward_observability_dir"]
+                / "well_frequency_sensitivity.csv"
+            ),
+        },
         "not_yet_implemented": [
-            "frequency_probe_matrix",
             "lfm_ideal",
             "lfm_controlled_degraded",
             "noise_gain_and_wavelet_mismatch_scenarios",
-            "highres_forward_mismatch_qc",
         ],
         "files": {
             "synthetic_benchmark.h5": sha256_file(h5_path),
@@ -856,6 +1370,12 @@ def _run_canonical_generation(
             "generation_qc.csv": sha256_file(output_dir / "generation_qc.csv"),
             "canonical_geometry_qc.csv": sha256_file(
                 output_dir / "canonical_geometry_qc.csv"
+            ),
+            "frequency_probe_results.csv": sha256_file(
+                output_dir / "frequency_probe_results.csv"
+            ),
+            "probe_frequency_catalog.csv": sha256_file(
+                output_dir / "probe_frequency_catalog.csv"
             ),
             "generation_rejection_details.csv": sha256_file(
                 output_dir / "generation_rejection_details.csv"
@@ -870,6 +1390,7 @@ def _run_canonical_generation(
         "accepted_realizations": len(scenarios),
         "rejected_realizations": 0,
         "failed_scenario_count": 0,
+        "probe_variant_count": len(probe_records),
     }
     write_json(output_dir / "run_summary.json", summary)
     return summary
@@ -951,15 +1472,38 @@ def run_generation(
     object_records: list[dict[str, Any]] = []
     qc_records: list[dict[str, Any]] = []
     rejection_records: list[dict[str, Any]] = []
+    probe_records: list[dict[str, Any]] = []
+    probe_frequencies = _load_probe_frequencies(
+        script_cfg=script_cfg,
+        sources=sources,
+    )
+    highres_wavelet = (
+        resample_wavelet_to_highres(
+            wavelet_time,
+            wavelet,
+            factor=int(
+                script_cfg["sampling"]["vertical_oversampling_factor"]
+            ),
+        )
+        if bool(
+            script_cfg["forward_qc"]["highres_mismatch_enabled"]
+        )
+        else None
+    )
+    probe_parent_counts = {section.section_id: 0 for section in sections}
     h5_path = output_dir / "synthetic_benchmark.h5"
     with h5py.File(h5_path, "w") as h5:
         h5.attrs["schema_version"] = DATA_SCHEMA
         h5.attrs["generator_family"] = calibration.generator_family
         h5.attrs["implementation_scope"] = IMPLEMENTATION_SCOPE
+        h5.attrs["suite"] = "field_conditioned"
         for section in sections:
             for scenario in scenarios:
                 for attempt_id in range(attempts):
                     realization_id = f"{section.section_id}__{scenario.scenario_id}__a{attempt_id:03d}"
+                    hdf5_group = ""
+                    probe_index_local: list[dict[str, Any]] = []
+                    probe_records_local: list[dict[str, Any]] = []
                     try:
                         minimum_truth_samples = 2 if scenario.duration_mode == "ultra_thin_stress" else 4
                         generated = generate_field_section(
@@ -992,7 +1536,69 @@ def run_generation(
                                 script_cfg["impedance"]["max_object_clipping_fraction"]
                             ),
                         )
+                        highres_result, forward_qc = _section_forward_qc(
+                            generated,
+                            wavelet=wavelet,
+                            highres_wavelet=highres_wavelet,
+                            required=bool(
+                                script_cfg["forward_qc"][
+                                    "highres_mismatch_required"
+                                ]
+                            ),
+                        )
+                        generated.qc.update(forward_qc)
                         hdf5_group = "" if qc_only else write_generated_section(h5, generated)
+                        if not qc_only and highres_result is not None:
+                            write_highres_forward_result(
+                                h5,
+                                realization_path=hdf5_group,
+                                result=highres_result,
+                            )
+                        probe_config = script_cfg["probe_selection"]
+                        is_probe_parent = (
+                            probe_frequencies
+                            and scenario.geometry_family
+                            == str(
+                                probe_config[
+                                    "field_parent_geometry_family"
+                                ]
+                            )
+                            and probe_parent_counts[section.section_id]
+                            < int(
+                                probe_config[
+                                    "field_parents_per_section"
+                                ]
+                            )
+                        )
+                        if is_probe_parent:
+                            try:
+                                (
+                                    probe_index_local,
+                                    probe_records_local,
+                                ) = _probe_records_for_parent(
+                                    h5=h5,
+                                    parent_path=(
+                                        hdf5_group
+                                        if hdf5_group
+                                        else f"/realizations/{generated.realization_id}"
+                                    ),
+                                    section=generated,
+                                    suite="field_conditioned",
+                                    section_id=section.section_id,
+                                    split="benchmark",
+                                    frequencies=probe_frequencies,
+                                    script_cfg=script_cfg,
+                                    wavelet=wavelet,
+                                    highres_wavelet=highres_wavelet,
+                                    base_highres_forward=highres_result,
+                                    qc_only=qc_only,
+                                )
+                            except Exception as exc:
+                                raise RuntimeError(
+                                    "frequency_probe_generation_failed:"
+                                    f"{generated.realization_id}:{exc}"
+                                ) from exc
+                            probe_parent_counts[section.section_id] += 1
                         object_records.extend(generated.object_catalog)
                         status = "ok"
                         reasons = ""
@@ -1014,6 +1620,16 @@ def run_generation(
                             for detail in exc.details
                         )
                     except Exception as exc:
+                        if str(exc).startswith(
+                            (
+                                "highres_forward_qc_failed",
+                                "invalid_model_grid_forward",
+                                "frequency_probe_generation_failed",
+                            )
+                        ):
+                            raise
+                        if hdf5_group and hdf5_group in h5:
+                            del h5[hdf5_group]
                         hdf5_group = ""
                         status = "rejected"
                         reasons = f"{type(exc).__name__}:{exc}"
@@ -1032,8 +1648,12 @@ def run_generation(
                         "attempt_id": attempt_id,
                         "status": status,
                         "reasons": reasons,
+                        "sample_kind": "base",
                     }
                     index_records.append(record)
+                    if status == "ok":
+                        index_records.extend(probe_index_local)
+                        probe_records.extend(probe_records_local)
                     qc_records.append({**record, **{key: value for key, value in qc_payload.items() if key != "field_qc"}})
     index = pd.DataFrame.from_records(index_records)
     index.to_csv(output_dir / "sample_index.csv", index=False)
@@ -1073,6 +1693,28 @@ def run_generation(
         index=False,
     )
     pd.DataFrame.from_records(qc_records).to_csv(output_dir / "generation_qc.csv", index=False)
+    pd.DataFrame.from_records(probe_records).to_csv(
+        output_dir / "frequency_probe_results.csv",
+        index=False,
+    )
+    probe_frequency_frame = pd.DataFrame.from_records(
+        frequency_catalog_rows(probe_frequencies)
+    )
+    if not probe_frequency_frame.empty:
+        probe_frequency_frame["wavelet_uncertainty_warning"] = (
+            probe_frequency_frame[
+                "conservative_to_nominal_ratio"
+            ]
+            > float(
+                script_cfg["probe_selection"][
+                    "conservative_to_nominal_warning_ratio"
+                ]
+            )
+        )
+    probe_frequency_frame.to_csv(
+        output_dir / "probe_frequency_catalog.csv",
+        index=False,
+    )
     rejection_columns = [
         "realization_id",
         "section_id",
@@ -1100,7 +1742,8 @@ def run_generation(
         index=False,
     )
     catalog = (
-        index.groupby(["section_id", "scenario_id"], dropna=False)["status"]
+        index[index["sample_kind"].eq("base")]
+        .groupby(["section_id", "scenario_id"], dropna=False)["status"]
         .value_counts()
         .unstack(fill_value=0)
         .reset_index()
@@ -1142,18 +1785,83 @@ def run_generation(
         "n_scenarios": len(scenarios),
         "attempts_per_scenario": attempts,
         "geometry_filters": sorted({scenario.geometry_family for scenario in scenarios}),
+        "probe_selection": dict(script_cfg["probe_selection"]),
+        "probe_frequency_count": len(probe_frequencies),
+        "probe_variant_count": len(probe_records),
+        "probe_parent_counts": probe_parent_counts,
+        "forward_qc": dict(script_cfg["forward_qc"]),
+        "highres_wavelet": (
+            {}
+            if highres_wavelet is None
+            else {
+                "dt_s": float(
+                    highres_wavelet.time_s[1]
+                    - highres_wavelet.time_s[0]
+                ),
+                "n_samples": int(highres_wavelet.amplitude.size),
+                "l2_energy": float(
+                    np.linalg.norm(highres_wavelet.amplitude)
+                ),
+                "sha256": _array_sha256(
+                    highres_wavelet.amplitude
+                ),
+            }
+        ),
+        "antialias_filter": {
+            "implementation": "scipy.signal.firwin/resample_poly",
+            "scipy_version": scipy.__version__,
+            "factor": int(
+                script_cfg["sampling"][
+                    "vertical_oversampling_factor"
+                ]
+            ),
+            "numtaps": int(
+                antialias_taps(
+                    int(
+                        script_cfg["sampling"][
+                            "vertical_oversampling_factor"
+                        ]
+                    )
+                ).size
+            ),
+            "cutoff_output_nyquist_fraction": 0.9,
+            "kaiser_beta": 8.6,
+            "taps_sha256": _array_sha256(
+                antialias_taps(
+                    int(
+                        script_cfg["sampling"][
+                            "vertical_oversampling_factor"
+                        ]
+                    )
+                )
+            ),
+        },
+        "probe_source_hashes": {
+            "frequency_evidence_bands.csv": sha256_file(
+                sources["forward_observability_dir"]
+                / "frequency_evidence_bands.csv"
+            ),
+            "well_frequency_sensitivity.csv": sha256_file(
+                sources["forward_observability_dir"]
+                / "well_frequency_sensitivity.csv"
+            ),
+        },
         "not_yet_implemented": [
-            "frequency_probe_matrix",
             "lfm_ideal",
             "lfm_controlled_degraded",
             "noise_gain_and_wavelet_mismatch_scenarios",
-            "highres_forward_mismatch_qc",
         ],
         "files": {
             "synthetic_benchmark.h5": sha256_file(h5_path),
             "sample_index.csv": sha256_file(output_dir / "sample_index.csv"),
             "object_catalog.csv": sha256_file(output_dir / "object_catalog.csv"),
             "generation_qc.csv": sha256_file(output_dir / "generation_qc.csv"),
+            "frequency_probe_results.csv": sha256_file(
+                output_dir / "frequency_probe_results.csv"
+            ),
+            "probe_frequency_catalog.csv": sha256_file(
+                output_dir / "probe_frequency_catalog.csv"
+            ),
             "generation_rejection_details.csv": sha256_file(
                 output_dir / "generation_rejection_details.csv"
             ),
@@ -1170,9 +1878,20 @@ def run_generation(
             if development_limited
             else ("failed_acceptance_qc" if bool(failed_scenarios.any()) else "ok")
         ),
-        "accepted_realizations": int(index["status"].eq("ok").sum()),
-        "rejected_realizations": int(index["status"].eq("rejected").sum()),
+        "accepted_realizations": int(
+            (
+                index["sample_kind"].eq("base")
+                & index["status"].eq("ok")
+            ).sum()
+        ),
+        "rejected_realizations": int(
+            (
+                index["sample_kind"].eq("base")
+                & index["status"].eq("rejected")
+            ).sum()
+        ),
         "failed_scenario_count": int(failed_scenarios.sum()),
+        "probe_variant_count": len(probe_records),
     }
     write_json(output_dir / "run_summary.json", summary)
     return summary

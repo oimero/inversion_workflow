@@ -10,6 +10,8 @@ import h5py
 import numpy as np
 
 from cup.synthetic.generation import GeneratedSection
+from cup.synthetic.forward import HighresForwardResult
+from cup.synthetic.probes import ProbeFrequency, ProbeResult
 
 
 def sha256_file(path: str | Path) -> str:
@@ -165,3 +167,116 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
         axis_dataset=model_forward_axis,
     )
     return f"/{path}"
+
+
+def write_highres_forward_result(
+    h5: h5py.File,
+    *,
+    realization_path: str,
+    result: HighresForwardResult,
+) -> str:
+    root = h5[realization_path]
+    seismic = root["seismic"]
+    axis = f"{realization_path}/axes/twt_forward_model_s"
+    _dataset(
+        seismic,
+        "seismic_from_highres_truth_model_grid",
+        result.seismic_model_grid.astype(np.float32),
+        unit="normalized_amplitude",
+        domain="twt",
+        axis_order=["lateral", "twt_forward"],
+        axis_dataset=axis,
+    )
+    qc = root.require_group("qc")
+    for key, value in result.qc.items():
+        qc.attrs[key] = value
+    return f"{realization_path}/seismic/seismic_from_highres_truth_model_grid"
+
+
+def write_probe_result(
+    h5: h5py.File,
+    *,
+    realization_path: str,
+    frequency: ProbeFrequency,
+    result: ProbeResult,
+    highres_forward: HighresForwardResult | None,
+) -> str:
+    root = h5[realization_path]
+    probes = root.require_group("probes")
+    group = probes.create_group(result.variant.variant_id)
+    group.attrs["frequency_hz"] = frequency.frequency_hz
+    group.attrs["phase"] = result.variant.phase
+    group.attrs["lateral_shape"] = result.variant.lateral_shape
+    group.attrs["amplitude_multiplier"] = result.variant.amplitude_multiplier
+    group.attrs["paired_zero_variant_id"] = (
+        result.variant.paired_zero_variant_id
+    )
+    group.attrs["evidence_status"] = frequency.evidence_status
+    group.attrs["operator_support"] = frequency.operator_support
+    group.attrs["experiment_class"] = frequency.experiment_class
+    group.attrs["calibration_status"] = frequency.calibration_status
+    group.attrs["target_semantics"] = "base_model_target_plus_probe_increment"
+    group.attrs["base_truth_dataset"] = (
+        f"{realization_path}/truth/truth_log_ai_highres"
+    )
+    group.attrs["base_model_target_dataset"] = (
+        f"{realization_path}/truth/model_target_log_ai"
+    )
+    truth = group.create_group("truth")
+    high_axis = f"{realization_path}/axes/twt_highres_s"
+    model_axis = f"{realization_path}/axes/twt_model_s"
+    forward_axis = f"{realization_path}/axes/twt_forward_model_s"
+    _dataset(
+        truth,
+        "probe_log_ai_highres",
+        result.probe_log_ai_highres.astype(np.float32),
+        unit="ln(m/s*g/cm3)",
+        domain="twt",
+        axis_order=["lateral", "twt"],
+        axis_dataset=high_axis,
+    )
+    _dataset(
+        truth,
+        "probe_log_ai_model_grid",
+        result.probe_log_ai_model_grid.astype(np.float32),
+        unit="ln(m/s*g/cm3)",
+        domain="twt",
+        axis_order=["lateral", "twt"],
+        axis_dataset=model_axis,
+    )
+    _dataset(
+        truth,
+        "reflectivity_model",
+        result.reflectivity_model.astype(np.float32),
+        unit="ratio",
+        domain="twt",
+        axis_order=["lateral", "twt_forward"],
+        axis_dataset=forward_axis,
+    )
+    seismic = group.create_group("seismic")
+    _dataset(
+        seismic,
+        "seismic_model_consistent",
+        result.seismic_model_consistent.astype(np.float32),
+        unit="normalized_amplitude",
+        domain="twt",
+        axis_order=["lateral", "twt_forward"],
+        axis_dataset=forward_axis,
+    )
+    if highres_forward is not None:
+        _dataset(
+            seismic,
+            "seismic_from_highres_truth_model_grid",
+            highres_forward.seismic_model_grid.astype(np.float32),
+            unit="normalized_amplitude",
+            domain="twt",
+            axis_order=["lateral", "twt_forward"],
+            axis_dataset=forward_axis,
+        )
+    qc = group.create_group("qc")
+    for key, value in {
+        **result.qc,
+        **({} if highres_forward is None else highres_forward.qc),
+    }.items():
+        qc.attrs[key] = value
+    return f"{realization_path}/probes/{result.variant.variant_id}"

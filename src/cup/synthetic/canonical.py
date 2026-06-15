@@ -25,6 +25,7 @@ CANONICAL_FAMILIES = (
     "pinchout",
     "dipping_layers",
     "lateral_impedance_change",
+    "frequency_probe",
 )
 
 
@@ -116,6 +117,15 @@ def canonical_scenarios(config: Mapping[str, Any]) -> list[CanonicalScenario]:
                 parameter_unit="ratio",
             )
         )
+    scenarios.append(
+        CanonicalScenario(
+            scenario_id="frequency_probe__smooth_background",
+            family="frequency_probe",
+            parameter_name="background_type",
+            parameter_value=0.0,
+            parameter_unit="smooth_background",
+        )
+    )
     return scenarios
 
 
@@ -152,6 +162,10 @@ def _target_geometry(
         thickness = np.full(x.shape, 0.25 * peak_period_s)
         top = np.full(x.shape, center_twt_s - 0.125 * peak_period_s)
         contrast_multiplier = np.where(x < 0.5, 1.0, scenario.parameter_value)
+    elif scenario.family == "frequency_probe":
+        thickness = np.zeros(x.shape)
+        top = np.full(x.shape, center_twt_s)
+        contrast_multiplier = np.zeros(x.shape)
     else:
         raise ValueError(f"Unsupported canonical family: {scenario.family}")
     return top, thickness, contrast_multiplier
@@ -279,10 +293,14 @@ def generate_canonical_section(
         (twt_highres - geometry_start) / max(geometry_end - geometry_start, truth_dt),
         log_ai.shape,
     ).copy()
-    state_id = np.full(log_ai.shape, 1, dtype=np.int8)
-    object_id = np.zeros(log_ai.shape, dtype=np.int32)
+    valid_geometry = np.broadcast_to(
+        (twt_highres >= geometry_start) & (twt_highres <= geometry_end),
+        log_ai.shape,
+    )
+    state_id = np.where(valid_geometry, 1, -1).astype(np.int8)
+    object_id = np.where(valid_geometry, 0, -1).astype(np.int32)
     object_xi = np.full(log_ai.shape, np.nan, dtype=np.float64)
-    zone_id = np.zeros(log_ai.shape, dtype=np.int16)
+    zone_id = np.where(valid_geometry, 0, -1).astype(np.int16)
     boundary = np.zeros(log_ai.shape, dtype=bool)
     for lateral_index in range(n_lateral):
         thickness = float(thickness_s[lateral_index])
@@ -355,8 +373,10 @@ def generate_canonical_section(
         thickness_log_sigma=0.0,
         variant_id="",
     )
-    object_catalog = [
-        {
+    object_catalog = (
+        []
+        if scenario.family == "frequency_probe"
+        else [{
             "realization_id": scenario.scenario_id,
             "scenario_id": scenario.scenario_id,
             "zone_id": "canonical",
@@ -379,8 +399,8 @@ def generate_canonical_section(
             "expected_section_drop_s": qc.get("expected_section_drop_s", float("nan")),
             "contrast_multiplier_start": float(contrast_multiplier[0]),
             "contrast_multiplier_end": float(contrast_multiplier[-1]),
-        }
-    ]
+        }]
+    )
     return GeneratedSection(
         realization_id=scenario.scenario_id,
         scenario=generation_scenario,
@@ -410,8 +430,12 @@ def generate_canonical_section(
         dominant_object_id_model=dominant,
         zone_id_model=zone_model,
         valid_mask_model=valid_model,
-        forward_valid_mask_highres=np.ones(reflectivity_highres.shape, dtype=bool),
-        forward_valid_mask_model=np.ones(reflectivity_model.shape, dtype=bool),
+        forward_valid_mask_highres=(
+            valid_geometry[:, :-1] & valid_geometry[:, 1:]
+        ),
+        forward_valid_mask_model=(
+            valid_model[:, :-1] & valid_model[:, 1:]
+        ),
         object_catalog=object_catalog,
         qc=qc,
     )

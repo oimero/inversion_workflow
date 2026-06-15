@@ -44,12 +44,13 @@ markdown_extensions:
 nav:
   - 首页: index.md
   - 快速开始:
-      - 时间域反演重置: concepts/time-domain-inversion-reset.md
-      - 前向可观测性闸门: concepts/forward-observability-gate.md
-      - Truth-First 合成基准: concepts/synthoseis-lite-benchmark.md
       - 核心 CSV 契约: concepts/csv-contracts.md
       - 数据与单位约定: concepts/data-and-coordinate-conventions.md
       - 脚本风格指南: concepts/script-style.md
+  - 概念与研究:
+      - 时间域反演重置: concepts/time-domain-inversion-reset.md
+      - 前向可观测性闸门: concepts/forward-observability-gate.md
+      - Truth-First synthoseis-lite 基准: concepts/synthoseis-lite-benchmark.md
   - 教程:
       - 01 井资产盘点: guide/1-well-inventory.md
       - 02 LAS 曲线筛选与导出: guide/2-well-screen.md

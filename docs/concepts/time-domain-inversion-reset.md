@@ -28,19 +28,31 @@
 - `src/wtie/` 完整保留。它是前五步自动井震标定的基础库，本轮不做内部裁剪。
 - 稳定工作流暂时终止于第五步。后续工作先通过研究闸门，不提前占用“第六步”编号。
 
+## 当前研究入口
+
+第一研究闸门见[前向可观测性闸门](forward-observability-gate.md)，已经定义并实现
+离散前向响应、井上扰动灵敏度和空间簇证据聚合。
+
+当前活动研究入口是
+[Truth-First `synthoseis-lite` 基准](synthoseis-lite-benchmark.md)。它定义双套二维
+几何、高分辨率真值、统一正演、第一闸门驱动的频率-振幅探针、防泄漏拆分和冻结报告卡。
+
+以下章节保留完整研究路线；若其中概述与两个闸门文档冲突，以对应闸门文档为准。
+
 ## 下一步实施顺序
 
 ### 1. 建立 observability 研究闸门
 
 把现有“井曲线低通后正演，再与井旁地震比较”的 cutoff 诊断扩展为可观测性分析：
 
-- 计算子波与反射系数算子的联合传递响应，例如
-  `H(f) ~= W(f) * j*pi*f`。
+- 计算子波与离散反射系数算子的联合传递响应。精确公式、经验失配底和证据判定见
+  [前向可观测性闸门](forward-observability-gate.md)。
 - 分析不同频率处的灵敏度、噪声放大和相位不确定性。
 - 在已知真值的合成数据上测量可恢复频带，而不把一次井旁正演相关性直接解释为网络可恢复上限。
 - 将 35 Hz、70 Hz 等数值视为具体数据和子波下的诊断结果，不固化为模型结构边界。
 
-通过该闸门后，才能确定训练目标、损失频带和模型输出分辨率。
+通过该闸门只能确定 `synthoseis-lite` 的建议实验范围；训练目标、损失频带和模型输出
+分辨率还必须由合成基准上的逆问题可恢复性实验决定。
 observability 所需的低通、传递响应和频率诊断工具在重置后按新接口重新实现，
 不从旧三频带模块复制或迁移。
 
@@ -48,6 +60,8 @@ observability 所需的低通、传递响应和频率诊断工具在重置后按
 
 先生成地质与高分辨率阻抗真值，再通过统一正演算子生成地震和学习目标：
 
+- 详细输入、场景、采样、输出和评测契约见
+  [Truth-First `synthoseis-lite` 基准](synthoseis-lite-benchmark.md)。
 - 使用真实目标层位或 RGT 框架约束二维地层几何。
 - 以层为基本对象，生成横向相关的层厚、阻抗、楔状体、尖灭和倾斜层。
 - Semi-Markov 只负责沉积或阻抗状态及其持续长度，不直接生成残差波形。
@@ -281,7 +295,11 @@ src/cup/
 src/wtie/                  完整保留的自动井震标定基础库
 ```
 
-新的 observability、合成基准和反演模块不预先占用包名，待研究接口确定后创建。
+observability 的接口已由[前向可观测性闸门](forward-observability-gate.md)确定；
+其入口为 `scripts/forward_observability.py`，核心模块为
+`src/cup/seismic/observability.py`。合成基准接口由
+[Truth-First `synthoseis-lite` 基准](synthoseis-lite-benchmark.md)确定，未来入口为
+`scripts/synthoseis_lite.py`，核心包为 `src/cup/synthetic/`。反演模块仍不预先占用包名。
 
 ## Ignored/Untracked 人工清理建议
 

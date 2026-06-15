@@ -211,6 +211,7 @@ _SOURCE_RUN_SECTIONS = (
 _TIME_WORKFLOW_SECTIONS = (
     "well_inventory",
     *_SOURCE_RUN_SECTIONS,
+    "forward_observability",
 )
 
 

@@ -149,8 +149,8 @@
 
 ## 05 · wavelet_generation.py
 
-第五步是当前稳定工作流终点。以下产物可作为后续 research gate 的输入，
-但在新接口确定前没有正式脚本消费者。
+第五步是当前稳定工作流终点。以下产物由研究入口
+`forward_observability.py` 显式消费；该入口不是编号生产步骤。
 
 ### `selected_wavelet.csv`
 
@@ -178,4 +178,71 @@
 | `status` | `ok` / `failed` |
 | `reasons` | 失败原因 |
 
-任何后续研究脚本若要消费第五步产物，必须先在本文定义新契约，再实现读取逻辑。
+### `wavelet_candidate_aggregate.csv`
+
+消费者：`forward_observability.py`
+
+闸门只用 `source_well` 与第四步 `wavelet_inventory.csv.source_well` 做规范化井名后的
+1:1 联接。`candidate_wavelet` 是场景名，不是文件路径联接键。
+
+### `evaluation_well_spatial_clusters.csv`
+
+消费者：`forward_observability.py`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `well_name` | 第五步固定的评测井 |
+| `spatial_cluster_id` | 跨井证据去偏使用的空间簇 |
+| `spatial_cluster_size` | 当前簇井数，仅作 QC |
+
+## Research Gate · forward_observability.py
+
+所有表使用 schema `forward_observability_v1`。运行必须显式指定第三、四、五步目录，
+不搜索 latest，也不自动回退。
+
+### `operator_transfer.csv`
+
+逐子波场景、逐频率记录子波、离散差分和联合算子的幅值/相位、归一化联合幅值、
+`operator_support_class` 以及 FFT、差分和卷积约定。
+
+### `well_frequency_sensitivity.csv`
+
+一口井、一个窗口、一个频率、一个子波场景一行。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `window_id` / `window_type` | 通用全目标窗或相邻层段窗 |
+| `frequency_hz` | 本行扰动频率 |
+| `wavelet_scenario` / `wavelet_scenario_kind` | nominal、候选或人工小失配场景 |
+| `baseline_scale` | standardized observed units 下的 nuisance amplitude slope，不是物理增益 |
+| `mismatch_rms` | 同窗加权现实失配底 |
+| `sensitivity_scale_marginalized` | 边缘化整体 scale 后的保守灵敏度 |
+| `noise_equivalent_log_ai` | 产生现实失配底所需的等效 `log(AI)` 幅度 |
+| `detectability_ratio` | 第三步井上窄带幅度与 noise-equivalent 幅度之比 |
+| `operator_support_class` | 解析算子支持等级，与经验状态分开 |
+| `status` / `reasons` | 本场景有效性或拒绝原因 |
+
+### `well_frequency_aggregate.csv`
+
+在同井、同窗、同频率内对有效子波场景做 lower empirical P25 聚合。记录 nominal、
+候选和人工扰动有效数量；场景不足时为 `insufficient_wavelet_scenarios`，不允许
+nominal-only 进入空间聚合。
+
+### `cluster_frequency_aggregate.csv`
+
+先在同一 `spatial_cluster_id` 内对井的 detectability ratio 取中位数。层位 TWT 因井而异，
+不属于跨井分组键；表中仅将窗口起止时间中位数作为 QC。
+
+### `frequency_evidence_bands.csv`
+
+逐通用窗口和频率记录有效井数、有效空间簇数、跨簇中位数与 lower empirical P25、
+经验状态、nominal/conservative 解析支持和 zone warnings。全目标窗至少需要 5 井、
+3 簇，否则为 `insufficient_evidence`。
+
+### 其他正式输出
+
+- `well_status.csv`：来源核验和逐井运行状态，并保留第五步 batch 指标作为 QC。
+- `well_window_status.csv`：逐井窗口的实际连续分析范围与拒绝原因。
+- `wavelet_scenario_qc.csv`：第五步汇总与第四步 inventory 的候选联接结果。
+- `recommended_experiment_ranges.json`：仅用于 `synthoseis-lite` 的实验区间。
+- `run_summary.json`：完整来源、参数、拒绝统计、warning 和建议区间。

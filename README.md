@@ -5,3 +5,11 @@
 
 重构原则、清理记录和研究顺序以
 [时间域反演重置](docs/concepts/time-domain-inversion-reset.md)为唯一权威入口。
+
+当前已经落地的下一项研究工具是
+[前向可观测性闸门](docs/concepts/forward-observability-gate.md)，运行入口为
+`scripts/forward_observability.py`；它不属于编号生产步骤。
+
+当前活动设计入口是
+[Truth-First `synthoseis-lite` 基准](docs/concepts/synthoseis-lite-benchmark.md)。
+它将建立已知真值的二维合成评测闸门，暂不定义神经网络架构。

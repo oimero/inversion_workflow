@@ -50,6 +50,7 @@
 | 井震与子波 QC | `cup.seismic.viz` | `plot_well_waveform_qc` |
 | 子波处理 | `cup.seismic.wavelet` | 加载、裁剪、归一化和频谱属性函数 |
 | 共识子波搜索 | `cup.seismic.wavelet_consensus` | `build_wavelet_pca_basis` / `optimize_consensus_wavelet` |
+| 前向可观测性 | `cup.seismic.observability` | 离散算子、扰动灵敏度、场景与空间簇证据聚合 |
 | 井资产 | `cup.well.assets` | `normalize_well_name` / `build_file_lookup` |
 | LAS I/O | `cup.well.las` | 标准 LAS 加载、扫描和导出函数 |
 | 曲线识别 | `cup.well.curves` / `cup.well.mnemonics` | 分类、primary 选择和 mnemonic 规则 |
@@ -67,4 +68,5 @@
 - [核心 CSV 契约](csv-contracts.md)
 - [数据与单位约定](data-and-coordinate-conventions.md)
 
-当前正式契约只覆盖步骤 01 至 05 和井轨迹旁路。
+当前正式契约覆盖步骤 01 至 05、井轨迹旁路和无编号的
+`forward_observability.py` 研究入口。

@@ -5,6 +5,11 @@ from cup.synthetic.calibration import (
     WellZoneCurves,
     calibrate_impedance,
 )
+from cup.synthetic.canonical import (
+    CanonicalScenario,
+    canonical_scenarios,
+    generate_canonical_section,
+)
 from cup.synthetic.generation import (
     GeneratedSection,
     GenerationScenario,
@@ -14,8 +19,11 @@ from cup.synthetic.generation import (
 __all__ = [
     "GeneratedSection",
     "GenerationScenario",
+    "CanonicalScenario",
     "ImpedanceCalibration",
     "WellZoneCurves",
     "calibrate_impedance",
+    "canonical_scenarios",
+    "generate_canonical_section",
     "generate_field_section",
 ]

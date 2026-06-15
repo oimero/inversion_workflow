@@ -52,6 +52,7 @@ class GeneratedSection:
     object_id_highres: np.ndarray
     object_xi_highres: np.ndarray
     zone_id_highres: np.ndarray
+    geometry_event_mask_highres: np.ndarray
     boundary_mask_highres: np.ndarray
     boundary_fraction_model: np.ndarray
     boundary_mask_model: np.ndarray
@@ -666,6 +667,7 @@ def generate_field_section(
     object_id = np.full((n_lateral, n_highres), -1, dtype=np.int32)
     object_xi = np.full_like(log_ai, np.nan)
     zone_id_grid = np.full((n_lateral, n_highres), -1, dtype=np.int16)
+    geometry_event_mask = np.zeros((n_lateral, n_highres), dtype=bool)
     boundary = np.zeros((n_lateral, n_highres), dtype=bool)
     object_catalog: list[dict[str, Any]] = []
     field_qc: list[dict[str, Any]] = []
@@ -848,6 +850,8 @@ def generate_field_section(
                 object_id[lateral_index, indices] = global_object_id
                 object_xi[lateral_index, indices] = xi
                 zone_id_grid[lateral_index, indices] = zone_index
+                if local_object_index == event_target:
+                    geometry_event_mask[lateral_index, indices] = True
                 boundary[lateral_index, indices[0]] = True
                 mean_value = float(np.mean(clipped))
                 mean_background = float(np.mean(background))
@@ -1117,6 +1121,7 @@ def generate_field_section(
         object_id_highres=object_id,
         object_xi_highres=object_xi,
         zone_id_highres=zone_id_grid,
+        geometry_event_mask_highres=geometry_event_mask,
         boundary_mask_highres=boundary,
         boundary_fraction_model=boundary_fraction,
         boundary_mask_model=boundary_fraction > 0.0,

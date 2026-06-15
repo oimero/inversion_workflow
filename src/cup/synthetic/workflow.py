@@ -29,6 +29,12 @@ from cup.synthetic.calibration import (
     WellZoneCurves,
     calibrate_impedance,
 )
+from cup.synthetic.canonical import (
+    CANONICAL_FAMILIES,
+    canonical_reference_impedance,
+    canonical_scenarios,
+    generate_canonical_section,
+)
 from cup.synthetic.generation import (
     GenerationRejected,
     GenerationScenario,
@@ -90,6 +96,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     sampling = _mapping(root.get("sampling"), path="synthoseis_lite.sampling")
     geometry = _mapping(root.get("geometry"), path="synthoseis_lite.geometry")
     field = _mapping(geometry.get("field_conditioned"), path="synthoseis_lite.geometry.field_conditioned")
+    canonical = _mapping(geometry.get("canonical") or {}, path="synthoseis_lite.geometry.canonical")
     horizons = field.get("horizons")
     sections = field.get("sections")
     if not isinstance(horizons, list) or len(horizons) < 2:
@@ -128,7 +135,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     qc = dict(impedance.get("qc") or {})
     robust_scale = dict(impedance.get("robust_scale") or {})
     generation = dict(root.get("generation") or {})
-    return {
+    parsed = {
         "global_seed": int(root.get("global_seed", 20260615)),
         "source_runs": source_runs,
         "sampling": {
@@ -138,6 +145,45 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "horizons": horizon_items,
         "sections": section_items,
         "lateral_sample_interval_m": float(geometry.get("lateral_sample_interval_m", 25.0)),
+        "canonical": {
+            "enabled": bool(canonical.get("enabled", True)),
+            "lateral_sample_interval_m": float(
+                canonical.get(
+                    "lateral_sample_interval_m",
+                    geometry.get("lateral_sample_interval_m", 25.0),
+                )
+            ),
+            "lateral_samples": int(canonical.get("lateral_samples", 128)),
+            "center_twt_s": float(canonical.get("center_twt_s", 1.5)),
+            "vertical_extent_periods": float(canonical.get("vertical_extent_periods", 6.0)),
+            "thin_bed_period_ratios": [
+                float(value)
+                for value in canonical.get(
+                    "thin_bed_period_ratios",
+                    [1.0 / 16.0, 1.0 / 8.0, 1.0 / 4.0, 1.0 / 2.0, 1.0],
+                )
+            ],
+            "wedge_transition_fraction": float(
+                canonical.get("wedge_transition_fraction", 0.80)
+            ),
+            "pinchout_termination_fraction": float(
+                canonical.get("pinchout_termination_fraction", 0.75)
+            ),
+            "dip_drop_period_ratios": [
+                float(value)
+                for value in canonical.get(
+                    "dip_drop_period_ratios",
+                    [0.25, 0.5, 1.0],
+                )
+            ],
+            "lateral_contrast_multipliers": [
+                float(value)
+                for value in canonical.get(
+                    "lateral_contrast_multipliers",
+                    [0.25, 0.5, 1.0, 2.0],
+                )
+            ],
+        },
         "impedance": {
             "family": str(impedance.get("family", GENERATOR_FAMILY)),
             "state_threshold_sigma": float(impedance.get("state_threshold_sigma", 1.0)),
@@ -180,6 +226,31 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             ),
         },
     }
+    _validate_canonical_config(parsed["canonical"])
+    return parsed
+
+
+def _validate_canonical_config(config: Mapping[str, Any]) -> None:
+    if int(config["lateral_samples"]) < 8:
+        raise ValueError("synthoseis_lite.geometry.canonical.lateral_samples must be >= 8.")
+    if float(config["lateral_sample_interval_m"]) <= 0.0:
+        raise ValueError("canonical lateral_sample_interval_m must be positive.")
+    if float(config["center_twt_s"]) <= 0.0:
+        raise ValueError("canonical center_twt_s must be positive.")
+    if float(config["vertical_extent_periods"]) < 2.0:
+        raise ValueError("canonical vertical_extent_periods must be >= 2.")
+    for key in (
+        "thin_bed_period_ratios",
+        "dip_drop_period_ratios",
+        "lateral_contrast_multipliers",
+    ):
+        values = list(config[key])
+        if not values or any(not np.isfinite(value) or value <= 0.0 for value in values):
+            raise ValueError(f"canonical {key} must contain positive finite values.")
+    for key in ("wedge_transition_fraction", "pinchout_termination_fraction"):
+        value = float(config[key])
+        if not 0.0 < value < 1.0:
+            raise ValueError(f"canonical {key} must be within (0, 1).")
 
 
 def resolve_sources(script_cfg: Mapping[str, Any], *, repo_root: Path) -> dict[str, Path]:
@@ -603,6 +674,207 @@ def generation_scenarios(script_cfg: Mapping[str, Any]) -> list[GenerationScenar
     return scenarios
 
 
+def _run_canonical_generation(
+    *,
+    script_cfg: Mapping[str, Any],
+    sources: Mapping[str, Path],
+    calibration: ImpedanceCalibration,
+    calibration_path: Path,
+    repo_root: Path,
+    output_dir: Path,
+    wavelet_time: np.ndarray,
+    wavelet: np.ndarray,
+    output_dt: float,
+    qc_only: bool,
+) -> dict[str, Any]:
+    config = script_cfg["canonical"]
+    if not bool(config["enabled"]):
+        raise ValueError("synthoseis_lite.geometry.canonical.enabled is false.")
+    scenarios = canonical_scenarios(config)
+    index_records: list[dict[str, Any]] = []
+    object_records: list[dict[str, Any]] = []
+    qc_records: list[dict[str, Any]] = []
+    h5_path = output_dir / "synthetic_benchmark.h5"
+    with h5py.File(h5_path, "w") as h5:
+        h5.attrs["schema_version"] = DATA_SCHEMA
+        h5.attrs["generator_family"] = calibration.generator_family
+        h5.attrs["implementation_scope"] = IMPLEMENTATION_SCOPE
+        h5.attrs["suite"] = "canonical"
+        for scenario in scenarios:
+            generated = generate_canonical_section(
+                calibration,
+                scenario=scenario,
+                config=config,
+                output_dt_s=output_dt,
+                wavelet_time_s=wavelet_time,
+                wavelet=wavelet,
+                vertical_oversampling_factor=int(
+                    script_cfg["sampling"]["vertical_oversampling_factor"]
+                ),
+            )
+            thickness_error = float(generated.qc["maximum_thickness_absolute_error_s"])
+            if thickness_error > calibration.truth_dt_s + 1e-12:
+                raise ValueError(
+                    f"canonical_geometry_qc_failed:{scenario.scenario_id}:thickness_error"
+                )
+            if scenario.family == "pinchout":
+                termination_error = float(generated.qc["termination_absolute_error_m"])
+                termination_tolerance = float(
+                    generated.qc["termination_grid_resolution_tolerance_m"]
+                )
+                if termination_error > termination_tolerance + 1e-12:
+                    raise ValueError(
+                        f"canonical_geometry_qc_failed:{scenario.scenario_id}:termination_error"
+                    )
+            hdf5_group = "" if qc_only else write_generated_section(h5, generated)
+            object_records.extend(generated.object_catalog)
+            record = {
+                "sample_id": scenario.scenario_id,
+                "realization_id": scenario.scenario_id,
+                "parent_realization_id": scenario.scenario_id,
+                "suite": "canonical",
+                "section_id": "canonical",
+                "scenario_id": scenario.scenario_id,
+                "geometry_family": scenario.family,
+                "duration_mode": "canonical",
+                "split": "benchmark",
+                "hdf5_group": hdf5_group,
+                "attempt_id": 0,
+                "status": "ok",
+                "reasons": "",
+                "canonical_parameter_name": scenario.parameter_name,
+                "canonical_parameter_value": scenario.parameter_value,
+                "canonical_parameter_unit": scenario.parameter_unit,
+            }
+            index_records.append(record)
+            qc_records.append({**record, **generated.qc})
+
+    index = pd.DataFrame.from_records(index_records)
+    index.to_csv(output_dir / "sample_index.csv", index=False)
+    object_columns = [
+        "realization_id",
+        "scenario_id",
+        "zone_id",
+        "object_id",
+        "state",
+        "state_id",
+        "event_target",
+        "minimum_duration_s",
+        "maximum_duration_s",
+        "minimum_truth_samples",
+        "maximum_truth_samples",
+        "canonical_family",
+        "canonical_parameter_name",
+        "canonical_parameter_value",
+        "canonical_parameter_unit",
+        "expected_termination_lateral_m",
+        "expected_section_drop_s",
+        "contrast_multiplier_start",
+        "contrast_multiplier_end",
+    ]
+    pd.DataFrame.from_records(object_records, columns=object_columns).to_csv(
+        output_dir / "object_catalog.csv",
+        index=False,
+    )
+    qc_frame = pd.DataFrame.from_records(qc_records)
+    qc_frame.to_csv(output_dir / "generation_qc.csv", index=False)
+    qc_frame.to_csv(output_dir / "canonical_geometry_qc.csv", index=False)
+    rejection_columns = [
+        "realization_id",
+        "section_id",
+        "scenario_id",
+        "geometry_family",
+        "attempt_id",
+        "reason",
+        "zone_id",
+        "object_id",
+        "state",
+        "event_target",
+        "count",
+        "denominator",
+        "fraction",
+        "threshold",
+        "metric",
+        "value",
+        "lower",
+        "upper",
+        "excess_ratio",
+        "lateral_index",
+    ]
+    pd.DataFrame(columns=rejection_columns).to_csv(
+        output_dir / "generation_rejection_details.csv",
+        index=False,
+    )
+    catalog = index[
+        [
+            "section_id",
+            "scenario_id",
+            "geometry_family",
+            "canonical_parameter_name",
+            "canonical_parameter_value",
+            "canonical_parameter_unit",
+            "status",
+        ]
+    ].copy()
+    catalog["attempt_count"] = 1
+    catalog["acceptance_fraction"] = 1.0
+    catalog["acceptance_status"] = "fixed_public_benchmark"
+    catalog.to_csv(output_dir / "scenario_catalog.csv", index=False)
+    reference = canonical_reference_impedance(calibration)
+    manifest = {
+        "schema_version": DATA_SCHEMA,
+        "generator_family": calibration.generator_family,
+        "implementation_scope": IMPLEMENTATION_SCOPE,
+        "suite": "canonical",
+        "development_limited": False,
+        "qc_only": bool(qc_only),
+        "source_runs": {
+            key: repo_relative_path(path, root=repo_root) for key, path in sources.items()
+        },
+        "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
+        "impedance_calibration_sha256": sha256_file(calibration_path),
+        "global_seed": int(script_cfg["global_seed"]),
+        "output_dt_s": output_dt,
+        "truth_dt_s": calibration.truth_dt_s,
+        "n_sections": 1,
+        "n_scenarios": len(scenarios),
+        "attempts_per_scenario": 1,
+        "canonical_families": list(CANONICAL_FAMILIES),
+        "canonical_config": dict(config),
+        "canonical_reference_impedance": reference,
+        "not_yet_implemented": [
+            "frequency_probe_matrix",
+            "lfm_ideal",
+            "lfm_controlled_degraded",
+            "noise_gain_and_wavelet_mismatch_scenarios",
+            "highres_forward_mismatch_qc",
+        ],
+        "files": {
+            "synthetic_benchmark.h5": sha256_file(h5_path),
+            "sample_index.csv": sha256_file(output_dir / "sample_index.csv"),
+            "object_catalog.csv": sha256_file(output_dir / "object_catalog.csv"),
+            "generation_qc.csv": sha256_file(output_dir / "generation_qc.csv"),
+            "canonical_geometry_qc.csv": sha256_file(
+                output_dir / "canonical_geometry_qc.csv"
+            ),
+            "generation_rejection_details.csv": sha256_file(
+                output_dir / "generation_rejection_details.csv"
+            ),
+            "scenario_catalog.csv": sha256_file(output_dir / "scenario_catalog.csv"),
+        },
+    }
+    write_json(output_dir / "benchmark_manifest.json", manifest)
+    summary = {
+        **manifest,
+        "status": "ok",
+        "accepted_realizations": len(scenarios),
+        "rejected_realizations": 0,
+        "failed_scenario_count": 0,
+    }
+    write_json(output_dir / "run_summary.json", summary)
+    return summary
+
+
 def run_generation(
     *,
     workflow: TimeWorkflowConfig,
@@ -614,6 +886,7 @@ def run_generation(
     debug_attempt_limit: int | None = None,
     geometry_families: Sequence[str] | None = None,
     qc_only: bool = False,
+    suite: str = "field_conditioned",
 ) -> dict[str, Any]:
     calibration = load_calibration(calibration_path)
     for key, recorded in calibration.source_runs.items():
@@ -639,6 +912,23 @@ def run_generation(
     if qc.status != "ok":
         raise ValueError(f"invalid_wavelet:{qc.reasons}")
     output_dt = infer_wavelet_dt(wavelet_time)
+    if suite == "canonical":
+        if geometry_families:
+            raise ValueError("--geometry-family is only valid for the field_conditioned suite.")
+        return _run_canonical_generation(
+            script_cfg=script_cfg,
+            sources=sources,
+            calibration=calibration,
+            calibration_path=calibration_path,
+            repo_root=repo_root,
+            output_dir=output_dir,
+            wavelet_time=wavelet_time,
+            wavelet=wavelet,
+            output_dt=output_dt,
+            qc_only=qc_only,
+        )
+    if suite != "field_conditioned":
+        raise ValueError(f"Unsupported synthoseis-lite suite: {suite}")
     sections = build_section_geometries(
         workflow=workflow,
         script_cfg=script_cfg,
@@ -839,6 +1129,7 @@ def run_generation(
         "implementation_scope": IMPLEMENTATION_SCOPE,
         "development_limited": development_limited,
         "qc_only": bool(qc_only),
+        "suite": "field_conditioned",
         "source_runs": {
             key: repo_relative_path(path, root=repo_root) for key, path in sources.items()
         },
@@ -852,7 +1143,6 @@ def run_generation(
         "attempts_per_scenario": attempts,
         "geometry_filters": sorted({scenario.geometry_family for scenario in scenarios}),
         "not_yet_implemented": [
-            "canonical_suite",
             "frequency_probe_matrix",
             "lfm_ideal",
             "lfm_controlled_degraded",

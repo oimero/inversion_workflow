@@ -48,6 +48,7 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
     root = h5.create_group(path)
     root.attrs["scenario_id"] = section.scenario.scenario_id
     root.attrs["status"] = str(section.qc.get("status", "ok"))
+    root.attrs["suite"] = str(section.qc.get("suite", "field_conditioned"))
     axes = root.create_group("axes")
     _dataset(axes, "lateral_m", section.lateral_m, unit="m", domain="distance", axis_order=["lateral"])
     _dataset(axes, "inline_float", section.inline_float, unit="line", domain="survey", axis_order=["lateral"])
@@ -86,6 +87,12 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
         ("object_id_highres", section.object_id_highres, "category", high_axis),
         ("object_xi_highres", section.object_xi_highres, "normalized_object", high_axis),
         ("zone_id_highres", section.zone_id_highres, "category", high_axis),
+        (
+            "geometry_event_mask_highres",
+            section.geometry_event_mask_highres,
+            "bool",
+            high_axis,
+        ),
         ("boundary_mask_highres", section.boundary_mask_highres, "bool", high_axis),
         ("boundary_fraction_model", section.boundary_fraction_model, "fraction", model_axis),
         ("boundary_mask_model", section.boundary_mask_model, "bool", model_axis),

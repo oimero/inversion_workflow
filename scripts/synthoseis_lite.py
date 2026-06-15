@@ -3,7 +3,8 @@
 Usage::
 
     python scripts/synthoseis_lite.py calibrate
-    python scripts/synthoseis_lite.py generate --impedance-calibration <file>
+    python scripts/synthoseis_lite.py generate --suite canonical --impedance-calibration <file>
+    python scripts/synthoseis_lite.py generate --suite field_conditioned --impedance-calibration <file>
 """
 
 from __future__ import annotations
@@ -41,8 +42,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("calibrate", help="Freeze impedance calibration from third/fourth-step LAS.")
-    generate = subparsers.add_parser("generate", help="Generate field-conditioned truth and nominal seismic.")
+    generate = subparsers.add_parser("generate", help="Generate canonical or field-conditioned truth.")
     generate.add_argument("--impedance-calibration", type=Path, required=True)
+    generate.add_argument(
+        "--suite",
+        choices=("canonical", "field_conditioned"),
+        required=True,
+        help="Generate exactly one benchmark suite per run.",
+    )
     generate.add_argument(
         "--debug-attempt-limit",
         type=int,
@@ -54,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         choices=("none", "wedge", "pinchout"),
         default=None,
-        help="Restrict generation to one or more geometry families.",
+        help="Restrict field-conditioned generation to one or more geometry families.",
     )
     generate.add_argument(
         "--qc-only",
@@ -100,6 +107,7 @@ def main() -> None:
             debug_attempt_limit=args.debug_attempt_limit,
             geometry_families=args.geometry_family,
             qc_only=args.qc_only,
+            suite=args.suite,
         )
     print("=== synthoseis-lite ===")
     print(f"Command: {args.command}")

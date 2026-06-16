@@ -21,6 +21,11 @@ from cup.synthetic.forward import (
     highres_forward_to_model_grid,
     resample_wavelet_to_highres,
 )
+from cup.synthetic.lfm import (
+    LfmResult,
+    derive_lfm_priors,
+    lowpass_model_grid,
+)
 from cup.synthetic.probes import (
     ProbeFrequency,
     ProbeResult,
@@ -28,12 +33,17 @@ from cup.synthetic.probes import (
     build_probe_frequency_catalog,
     generate_probe,
 )
+from cup.synthetic.seismic_variants import (
+    SeismicVariantResult,
+    generate_seismic_variants,
+)
 
 __all__ = [
     "GeneratedSection",
     "GenerationScenario",
     "HighresForwardResult",
     "HighresWavelet",
+    "LfmResult",
     "CanonicalScenario",
     "ImpedanceCalibration",
     "WellZoneCurves",
@@ -44,8 +54,12 @@ __all__ = [
     "ProbeFrequency",
     "ProbeResult",
     "ProbeVariant",
+    "SeismicVariantResult",
     "build_probe_frequency_catalog",
     "generate_probe",
+    "generate_seismic_variants",
     "highres_forward_to_model_grid",
+    "derive_lfm_priors",
+    "lowpass_model_grid",
     "resample_wavelet_to_highres",
 ]

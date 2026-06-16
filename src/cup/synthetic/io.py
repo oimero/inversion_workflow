@@ -11,7 +11,9 @@ import numpy as np
 
 from cup.synthetic.generation import GeneratedSection
 from cup.synthetic.forward import HighresForwardResult
+from cup.synthetic.lfm import LfmResult
 from cup.synthetic.probes import ProbeFrequency, ProbeResult
+from cup.synthetic.seismic_variants import SeismicVariantResult
 
 
 def sha256_file(path: str | Path) -> str:
@@ -193,6 +195,54 @@ def write_highres_forward_result(
     return f"{realization_path}/seismic/seismic_from_highres_truth_model_grid"
 
 
+def write_lfm_result(
+    h5: h5py.File,
+    *,
+    realization_path: str,
+    result: LfmResult,
+) -> dict[str, str]:
+    root = h5[realization_path]
+    axis = f"{realization_path}/axes/twt_model_s"
+    priors = root.require_group("priors")
+    residuals = root.require_group("residuals")
+    paths = {}
+    for name, values in (
+        ("lfm_ideal", result.lfm_ideal),
+        ("lfm_controlled_degraded", result.lfm_controlled_degraded),
+    ):
+        _dataset(
+            priors,
+            name,
+            values.astype(np.float32),
+            unit="ln(m/s*g/cm3)",
+            domain="twt",
+            axis_order=["lateral", "twt"],
+            axis_dataset=axis,
+        )
+        paths[name] = f"{realization_path}/priors/{name}"
+    for name, values in (
+        ("residual_vs_lfm_ideal", result.residual_vs_lfm_ideal),
+        (
+            "residual_vs_lfm_controlled_degraded",
+            result.residual_vs_lfm_controlled_degraded,
+        ),
+    ):
+        _dataset(
+            residuals,
+            name,
+            values.astype(np.float32),
+            unit="ln(m/s*g/cm3)",
+            domain="twt",
+            axis_order=["lateral", "twt"],
+            axis_dataset=axis,
+        )
+        paths[name] = f"{realization_path}/residuals/{name}"
+    qc = root.require_group("qc")
+    for key, value in result.qc.items():
+        qc.attrs[key] = value
+    return paths
+
+
 def write_probe_result(
     h5: h5py.File,
     *,
@@ -200,6 +250,7 @@ def write_probe_result(
     frequency: ProbeFrequency,
     result: ProbeResult,
     highres_forward: HighresForwardResult | None,
+    lfm_result: LfmResult | None = None,
 ) -> str:
     root = h5[realization_path]
     probes = root.require_group("probes")
@@ -222,6 +273,8 @@ def write_probe_result(
     group.attrs["base_model_target_dataset"] = (
         f"{realization_path}/truth/model_target_log_ai"
     )
+    if lfm_result is not None:
+        group.attrs["lfm_semantics"] = "derived_from_base_model_target_plus_probe_increment"
     truth = group.create_group("truth")
     high_axis = f"{realization_path}/axes/twt_highres_s"
     model_axis = f"{realization_path}/axes/twt_model_s"
@@ -273,10 +326,92 @@ def write_probe_result(
             axis_order=["lateral", "twt_forward"],
             axis_dataset=forward_axis,
         )
+    if lfm_result is not None:
+        priors = group.create_group("priors")
+        residuals = group.create_group("residuals")
+        for name, values in (
+            ("lfm_ideal", lfm_result.lfm_ideal),
+            ("lfm_controlled_degraded", lfm_result.lfm_controlled_degraded),
+        ):
+            _dataset(
+                priors,
+                name,
+                values.astype(np.float32),
+                unit="ln(m/s*g/cm3)",
+                domain="twt",
+                axis_order=["lateral", "twt"],
+                axis_dataset=model_axis,
+            )
+        for name, values in (
+            ("residual_vs_lfm_ideal", lfm_result.residual_vs_lfm_ideal),
+            (
+                "residual_vs_lfm_controlled_degraded",
+                lfm_result.residual_vs_lfm_controlled_degraded,
+            ),
+        ):
+            _dataset(
+                residuals,
+                name,
+                values.astype(np.float32),
+                unit="ln(m/s*g/cm3)",
+                domain="twt",
+                axis_order=["lateral", "twt"],
+                axis_dataset=model_axis,
+            )
     qc = group.create_group("qc")
     for key, value in {
         **result.qc,
         **({} if highres_forward is None else highres_forward.qc),
+        **({} if lfm_result is None else lfm_result.qc),
     }.items():
         qc.attrs[key] = value
     return f"{realization_path}/probes/{result.variant.variant_id}"
+
+
+def write_seismic_variant_result(
+    h5: h5py.File,
+    *,
+    owner_path: str,
+    result: SeismicVariantResult,
+) -> str:
+    owner = h5[owner_path]
+    variants = owner.require_group("seismic_variants")
+    group = variants.create_group(result.variant_id)
+    group.attrs["variant_id"] = result.variant_id
+    group.attrs["mismatch_family"] = result.mismatch_family
+    if "/probes/" in owner_path:
+        axis_root = owner_path.split("/probes/", maxsplit=1)[0]
+    else:
+        axis_root = owner_path
+    forward_axis = f"{axis_root}/axes/twt_forward_model_s"
+    _dataset(
+        group,
+        "seismic_observed",
+        result.seismic_observed.astype(np.float32),
+        unit="normalized_amplitude",
+        domain="twt",
+        axis_order=["lateral", "twt_forward"],
+        axis_dataset=forward_axis,
+    )
+    _dataset(
+        group,
+        "positive_gain",
+        result.positive_gain.astype(np.float32),
+        unit="ratio",
+        domain="twt",
+        axis_order=["lateral", "twt_forward"],
+        axis_dataset=forward_axis,
+    )
+    _dataset(
+        group,
+        "additive_noise",
+        result.additive_noise.astype(np.float32),
+        unit="normalized_amplitude",
+        domain="twt",
+        axis_order=["lateral", "twt_forward"],
+        axis_dataset=forward_axis,
+    )
+    qc = group.create_group("qc")
+    for key, value in result.qc.items():
+        qc.attrs[key] = value
+    return f"{owner_path}/seismic_variants/{result.variant_id}"

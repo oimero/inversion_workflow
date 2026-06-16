@@ -54,14 +54,21 @@ from cup.synthetic.io import (
     sha256_file,
     write_generated_section,
     write_highres_forward_result,
+    write_lfm_result,
     write_probe_result,
+    write_seismic_variant_result,
 )
+from cup.synthetic.lfm import LfmResult, derive_lfm_priors
 from cup.synthetic.probes import (
     ProbeFrequency,
     build_probe_frequency_catalog,
     frequency_catalog_rows,
     generate_probe,
     probe_variants,
+)
+from cup.synthetic.seismic_variants import (
+    SeismicVariantResult,
+    generate_seismic_variants,
 )
 from cup.time_config import TimeWorkflowConfig
 from cup.utils.io import (
@@ -76,7 +83,7 @@ from cup.well.td import find_well_top_md, load_workflow_time_depth_table_csv
 
 
 DATA_SCHEMA = "synthoseis_lite_v1"
-IMPLEMENTATION_SCOPE = "impedance_truth_frequency_probes_and_forward_qc"
+IMPLEMENTATION_SCOPE = "impedance_truth_frequency_probes_forward_qc_lfm_and_seismic_mismatch"
 
 
 def _array_sha256(values: np.ndarray) -> str:
@@ -165,6 +172,16 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     forward_qc = dict(root.get("forward_qc") or {})
     highres_mismatch = dict(forward_qc.get("highres_mismatch") or {})
     probe_selection = dict(root.get("probe_selection") or {})
+    lfm = dict(root.get("lfm") or {})
+    lfm_ideal = dict(lfm.get("ideal") or {})
+    lfm_degraded = dict(lfm.get("controlled_degraded") or {})
+    lfm_over_smoothing = dict(lfm_degraded.get("over_smoothing") or {})
+    lfm_missing = dict(lfm_degraded.get("local_missing_control_bias") or {})
+    mismatch = dict(root.get("seismic_mismatch") or {})
+    mismatch_noise = dict(mismatch.get("noise") or {})
+    mismatch_gain = dict(mismatch.get("gain") or {})
+    mismatch_wavelet = dict(mismatch.get("wavelet") or {})
+    mismatch_combined = dict(mismatch.get("combined") or {})
     raw_lateral_shapes = probe_selection.get(
         "lateral_shapes",
         [
@@ -282,6 +299,115 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 highres_mismatch.get("required", False)
             ),
         },
+        "lfm": {
+            "enabled": bool(lfm.get("enabled", True)),
+            "ideal": {
+                "cutoff_hz": float(lfm_ideal.get("cutoff_hz", 10.0)),
+                "numtaps": int(lfm_ideal.get("numtaps", 129)),
+                "kaiser_beta": float(lfm_ideal.get("kaiser_beta", 8.6)),
+            },
+            "controlled_degraded": {
+                "constant_bias_sigma_log_ai": float(
+                    lfm_degraded.get("constant_bias_sigma_log_ai", 0.02)
+                ),
+                "linear_twt_trend_sigma_log_ai": float(
+                    lfm_degraded.get("linear_twt_trend_sigma_log_ai", 0.02)
+                ),
+                "zonewise_bias_sigma_log_ai": float(
+                    lfm_degraded.get("zonewise_bias_sigma_log_ai", 0.03)
+                ),
+                "lateral_smooth_bias_sigma_log_ai": float(
+                    lfm_degraded.get("lateral_smooth_bias_sigma_log_ai", 0.02)
+                ),
+                "lateral_correlation_fraction": float(
+                    lfm_degraded.get("lateral_correlation_fraction", 0.30)
+                ),
+                "amplitude_scale_sigma": float(
+                    lfm_degraded.get("amplitude_scale_sigma", 0.05)
+                ),
+                "over_smoothing": {
+                    "cutoff_hz": float(lfm_over_smoothing.get("cutoff_hz", 6.0)),
+                    "numtaps": int(lfm_over_smoothing.get("numtaps", 129)),
+                    "kaiser_beta": float(
+                        lfm_over_smoothing.get("kaiser_beta", 8.6)
+                    ),
+                    "blend": float(lfm_over_smoothing.get("blend", 1.0)),
+                },
+                "local_missing_control_bias": {
+                    "enabled": bool(lfm_missing.get("enabled", True)),
+                    "max_abs_log_ai": float(
+                        lfm_missing.get("max_abs_log_ai", 0.04)
+                    ),
+                    "lateral_width_fraction": float(
+                        lfm_missing.get("lateral_width_fraction", 0.30)
+                    ),
+                    "twt_width_fraction": float(
+                        lfm_missing.get("twt_width_fraction", 0.30)
+                    ),
+                },
+            },
+        },
+        "seismic_mismatch": {
+            "enabled": bool(mismatch.get("enabled", True)),
+            "noise": {
+                "white_noise_rms_fraction": float(
+                    mismatch_noise.get("white_noise_rms_fraction", 0.05)
+                ),
+                "colored_noise_rms_fraction": float(
+                    mismatch_noise.get("colored_noise_rms_fraction", 0.05)
+                ),
+                "absolute_noise_rms_floor": float(
+                    mismatch_noise.get("absolute_noise_rms_floor", 0.01)
+                ),
+                "colored_time_correlation_samples": float(
+                    mismatch_noise.get("colored_time_correlation_samples", 5.0)
+                ),
+            },
+            "gain": {
+                "global_log_sigma": float(mismatch_gain.get("global_log_sigma", 0.15)),
+                "tracewise_log_sigma": float(
+                    mismatch_gain.get("tracewise_log_sigma", 0.15)
+                ),
+                "time_lateral_log_sigma": float(
+                    mismatch_gain.get("time_lateral_log_sigma", 0.15)
+                ),
+                "lateral_correlation_fraction": float(
+                    mismatch_gain.get("lateral_correlation_fraction", 0.30)
+                ),
+                "time_correlation_fraction": float(
+                    mismatch_gain.get("time_correlation_fraction", 0.25)
+                ),
+            },
+            "wavelet": {
+                "phase_rotation_degrees": [
+                    float(value)
+                    for value in mismatch_wavelet.get(
+                        "phase_rotation_degrees",
+                        [-10.0, 10.0],
+                    )
+                ],
+                "time_shift_samples": [
+                    float(value)
+                    for value in mismatch_wavelet.get(
+                        "time_shift_samples",
+                        [-0.5, 0.5],
+                    )
+                ],
+            },
+            "combined": {
+                "enabled": bool(mismatch_combined.get("enabled", True)),
+                "phase_rotation_degrees": float(
+                    mismatch_combined.get("phase_rotation_degrees", 10.0)
+                ),
+                "time_shift_samples": float(
+                    mismatch_combined.get("time_shift_samples", 0.5)
+                ),
+                "gain_log_sigma": float(mismatch_combined.get("gain_log_sigma", 0.10)),
+                "noise_rms_fraction": float(
+                    mismatch_combined.get("noise_rms_fraction", 0.05)
+                ),
+            },
+        },
         "probe_selection": {
             "enabled": bool(probe_selection.get("enabled", True)),
             "weak_representatives_per_band": int(
@@ -326,6 +452,8 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         },
     }
     _validate_canonical_config(parsed["canonical"])
+    _validate_lfm_config(parsed["lfm"], output_dt_s=parsed["sampling"]["expected_output_dt_s"])
+    _validate_seismic_mismatch_config(parsed["seismic_mismatch"])
     _validate_probe_config(parsed["probe_selection"])
     return parsed
 
@@ -351,6 +479,94 @@ def _validate_canonical_config(config: Mapping[str, Any]) -> None:
         value = float(config[key])
         if not 0.0 < value < 1.0:
             raise ValueError(f"canonical {key} must be within (0, 1).")
+
+
+def _validate_lfm_config(config: Mapping[str, Any], *, output_dt_s: float) -> None:
+    if not bool(config["enabled"]):
+        return
+    nyquist = 0.5 / float(output_dt_s)
+    ideal = config["ideal"]
+    degraded = config["controlled_degraded"]
+    cutoff = float(ideal["cutoff_hz"])
+    if not 0.0 < cutoff < nyquist:
+        raise ValueError("lfm.ideal.cutoff_hz must be within (0, Nyquist).")
+    if int(ideal["numtaps"]) < 3:
+        raise ValueError("lfm.ideal.numtaps must be >= 3.")
+    if float(ideal["kaiser_beta"]) < 0.0:
+        raise ValueError("lfm.ideal.kaiser_beta must be nonnegative.")
+    for key in (
+        "constant_bias_sigma_log_ai",
+        "linear_twt_trend_sigma_log_ai",
+        "zonewise_bias_sigma_log_ai",
+        "lateral_smooth_bias_sigma_log_ai",
+        "amplitude_scale_sigma",
+    ):
+        value = float(degraded[key])
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(f"lfm.controlled_degraded.{key} must be nonnegative.")
+    fraction = float(degraded["lateral_correlation_fraction"])
+    if not np.isfinite(fraction) or fraction <= 0.0:
+        raise ValueError("lfm.controlled_degraded.lateral_correlation_fraction must be positive.")
+    smoothing = degraded["over_smoothing"]
+    over_cutoff = float(smoothing["cutoff_hz"])
+    if not 0.0 < over_cutoff <= cutoff:
+        raise ValueError("lfm over_smoothing.cutoff_hz must be within (0, ideal cutoff].")
+    if int(smoothing["numtaps"]) < 3:
+        raise ValueError("lfm over_smoothing.numtaps must be >= 3.")
+    if not 0.0 <= float(smoothing["blend"]) <= 1.0:
+        raise ValueError("lfm over_smoothing.blend must be within [0, 1].")
+    missing = degraded["local_missing_control_bias"]
+    if float(missing["max_abs_log_ai"]) < 0.0:
+        raise ValueError("lfm local_missing_control_bias.max_abs_log_ai must be nonnegative.")
+    for key in ("lateral_width_fraction", "twt_width_fraction"):
+        if not 0.0 < float(missing[key]) <= 1.0:
+            raise ValueError(f"lfm local_missing_control_bias.{key} must be within (0, 1].")
+
+
+def _validate_seismic_mismatch_config(config: Mapping[str, Any]) -> None:
+    if not bool(config["enabled"]):
+        return
+    noise = config["noise"]
+    for key in (
+        "white_noise_rms_fraction",
+        "colored_noise_rms_fraction",
+        "absolute_noise_rms_floor",
+    ):
+        value = float(noise[key])
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(f"seismic_mismatch.noise.{key} must be nonnegative.")
+    if float(noise["colored_time_correlation_samples"]) <= 0.0:
+        raise ValueError("seismic_mismatch.noise.colored_time_correlation_samples must be positive.")
+    gain = config["gain"]
+    for key in (
+        "global_log_sigma",
+        "tracewise_log_sigma",
+        "time_lateral_log_sigma",
+    ):
+        value = float(gain[key])
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(f"seismic_mismatch.gain.{key} must be nonnegative.")
+    for key in ("lateral_correlation_fraction", "time_correlation_fraction"):
+        value = float(gain[key])
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"seismic_mismatch.gain.{key} must be positive.")
+    wavelet = config["wavelet"]
+    for key in ("phase_rotation_degrees", "time_shift_samples"):
+        values = list(wavelet[key])
+        if not values or any(not np.isfinite(float(value)) for value in values):
+            raise ValueError(f"seismic_mismatch.wavelet.{key} must contain finite values.")
+    combined = config["combined"]
+    for key in (
+        "phase_rotation_degrees",
+        "time_shift_samples",
+        "gain_log_sigma",
+        "noise_rms_fraction",
+    ):
+        value = float(combined[key])
+        if not np.isfinite(value):
+            raise ValueError(f"seismic_mismatch.combined.{key} must be finite.")
+    if float(combined["gain_log_sigma"]) < 0.0 or float(combined["noise_rms_fraction"]) < 0.0:
+        raise ValueError("seismic_mismatch.combined gain/noise magnitudes must be nonnegative.")
 
 
 def _validate_probe_config(config: Mapping[str, Any]) -> None:
@@ -885,6 +1101,98 @@ def _section_forward_qc(
         }
 
 
+def _lfm_records(result: LfmResult, *, base_path: str) -> dict[str, Any]:
+    return {
+        **result.qc,
+        "lfm_versions": "ideal;controlled_degraded",
+        "lfm_ideal_dataset": (
+            "" if not base_path else f"{base_path}/priors/lfm_ideal"
+        ),
+        "lfm_controlled_degraded_dataset": (
+            ""
+            if not base_path
+            else f"{base_path}/priors/lfm_controlled_degraded"
+        ),
+        "residual_vs_lfm_ideal_dataset": (
+            ""
+            if not base_path
+            else f"{base_path}/residuals/residual_vs_lfm_ideal"
+        ),
+        "residual_vs_lfm_controlled_degraded_dataset": (
+            ""
+            if not base_path
+            else f"{base_path}/residuals/residual_vs_lfm_controlled_degraded"
+        ),
+    }
+
+
+def _seismic_variant_records_for_sample(
+    *,
+    h5: h5py.File,
+    owner_path: str,
+    source_index_record: Mapping[str, Any],
+    seismic_model_consistent: np.ndarray,
+    forward_valid_mask: np.ndarray,
+    lateral_m: np.ndarray,
+    script_cfg: Mapping[str, Any],
+    qc_only: bool,
+    source_variant_id: str = "",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    results = generate_seismic_variants(
+        seismic_model_consistent=seismic_model_consistent,
+        forward_valid_mask=forward_valid_mask,
+        lateral_m=lateral_m,
+        config=script_cfg["seismic_mismatch"],
+        global_seed=int(script_cfg["global_seed"]),
+        generator_family=GENERATOR_FAMILY,
+        realization_id=str(source_index_record["parent_realization_id"]),
+        source_variant_id=source_variant_id or str(source_index_record["sample_id"]),
+    )
+    index_records: list[dict[str, Any]] = []
+    result_records: list[dict[str, Any]] = []
+    source_sample_id = str(source_index_record["sample_id"])
+    source_kind = str(source_index_record.get("sample_kind", "base"))
+    for result in results:
+        variant_group = (
+            ""
+            if qc_only
+            else write_seismic_variant_result(
+                h5,
+                owner_path=owner_path,
+                result=result,
+            )
+        )
+        sample_id = f"{source_sample_id}__seismic__{result.variant_id}"
+        sample_kind = (
+            "frequency_probe_seismic_variant"
+            if source_kind == "frequency_probe"
+            else "seismic_variant"
+        )
+        record = {
+            **dict(source_index_record),
+            "sample_id": sample_id,
+            "realization_id": sample_id,
+            "source_sample_id": source_sample_id,
+            "source_sample_kind": source_kind,
+            "sample_kind": sample_kind,
+            "hdf5_group": variant_group,
+            "seismic_variant_id": result.variant_id,
+            "seismic_mismatch_family": result.mismatch_family,
+            "seismic_observed_dataset": (
+                "" if not variant_group else f"{variant_group}/seismic_observed"
+            ),
+            "positive_gain_dataset": (
+                "" if not variant_group else f"{variant_group}/positive_gain"
+            ),
+            "additive_noise_dataset": (
+                "" if not variant_group else f"{variant_group}/additive_noise"
+            ),
+        }
+        index_records.append(record)
+        result_records.append({**record, **result.qc})
+    return index_records, result_records
+
+
 def _probe_records_for_parent(
     *,
     h5: h5py.File,
@@ -899,13 +1207,14 @@ def _probe_records_for_parent(
     highres_wavelet: HighresWavelet | None,
     base_highres_forward: HighresForwardResult | None,
     qc_only: bool,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     config = script_cfg["probe_selection"]
     taps = antialias_taps(
         int(script_cfg["sampling"]["vertical_oversampling_factor"])
     )
     index_records: list[dict[str, Any]] = []
     result_records: list[dict[str, Any]] = []
+    seismic_variant_records: list[dict[str, Any]] = []
     for frequency in frequencies:
         variants = probe_variants(
             frequency,
@@ -930,6 +1239,14 @@ def _probe_records_for_parent(
                 result.model_target_log_ai,
                 result.seismic_model_consistent,
                 wavelet,
+            )
+            lfm_result = derive_lfm_priors(
+                section,
+                config=script_cfg["lfm"],
+                global_seed=int(script_cfg["global_seed"]),
+                generator_family=GENERATOR_FAMILY,
+                model_target_log_ai=result.model_target_log_ai,
+                degradation_variant_id=section.realization_id,
             )
             if variant.amplitude_multiplier == 0.0:
                 highres_result = base_highres_forward
@@ -982,6 +1299,7 @@ def _probe_records_for_parent(
                     frequency=frequency,
                     result=result,
                     highres_forward=highres_result,
+                    lfm_result=lfm_result,
                 )
             )
             sample_id = (
@@ -1014,8 +1332,26 @@ def _probe_records_for_parent(
                 "probe_amplitude_multiplier": (
                     variant.amplitude_multiplier
                 ),
+                **_lfm_records(lfm_result, base_path=hdf5_group),
             }
             index_records.append(index_record)
+            seismic_index, seismic_results = _seismic_variant_records_for_sample(
+                h5=h5,
+                owner_path=(
+                    hdf5_group
+                    if hdf5_group
+                    else f"{parent_path}/probes/{variant.variant_id}"
+                ),
+                source_index_record=index_record,
+                seismic_model_consistent=result.seismic_model_consistent,
+                forward_valid_mask=section.forward_valid_mask_model,
+                lateral_m=section.lateral_m,
+                script_cfg=script_cfg,
+                qc_only=qc_only,
+                source_variant_id=variant.variant_id,
+            )
+            index_records.extend(seismic_index)
+            seismic_variant_records.extend(seismic_results)
             result_records.append(
                 {
                     **index_record,
@@ -1046,9 +1382,10 @@ def _probe_records_for_parent(
                     **result.qc,
                     **closure,
                     **highres_qc,
+                    **lfm_result.qc,
                 }
             )
-    return index_records, result_records
+    return index_records, result_records, seismic_variant_records
 
 
 def _run_canonical_generation(
@@ -1072,6 +1409,7 @@ def _run_canonical_generation(
     object_records: list[dict[str, Any]] = []
     qc_records: list[dict[str, Any]] = []
     probe_records: list[dict[str, Any]] = []
+    seismic_variant_records: list[dict[str, Any]] = []
     probe_frequencies = _load_probe_frequencies(
         script_cfg=script_cfg,
         sources=sources,
@@ -1132,12 +1470,26 @@ def _run_canonical_generation(
                 ),
             )
             generated.qc.update(forward_qc)
+            lfm_result = derive_lfm_priors(
+                generated,
+                config=script_cfg["lfm"],
+                global_seed=int(script_cfg["global_seed"]),
+                generator_family=GENERATOR_FAMILY,
+                degradation_variant_id=generated.realization_id,
+            )
+            generated.qc.update(lfm_result.qc)
             hdf5_group = "" if qc_only else write_generated_section(h5, generated)
             if not qc_only and highres_result is not None:
                 write_highres_forward_result(
                     h5,
                     realization_path=hdf5_group,
                     result=highres_result,
+                )
+            if not qc_only:
+                write_lfm_result(
+                    h5,
+                    realization_path=hdf5_group,
+                    result=lfm_result,
                 )
             object_records.extend(generated.object_catalog)
             record = {
@@ -1158,11 +1510,33 @@ def _run_canonical_generation(
                 "canonical_parameter_name": scenario.parameter_name,
                 "canonical_parameter_value": scenario.parameter_value,
                 "canonical_parameter_unit": scenario.parameter_unit,
+                **_lfm_records(lfm_result, base_path=hdf5_group),
             }
             index_records.append(record)
+            seismic_index, seismic_results = _seismic_variant_records_for_sample(
+                h5=h5,
+                owner_path=(
+                    hdf5_group
+                    if hdf5_group
+                    else f"/realizations/{generated.realization_id}"
+                ),
+                source_index_record=record,
+                seismic_model_consistent=generated.seismic_model_consistent,
+                forward_valid_mask=generated.forward_valid_mask_model,
+                lateral_m=generated.lateral_m,
+                script_cfg=script_cfg,
+                qc_only=qc_only,
+                source_variant_id="base",
+            )
+            index_records.extend(seismic_index)
+            seismic_variant_records.extend(seismic_results)
             qc_records.append({**record, **generated.qc})
             if scenario.family == "frequency_probe" and probe_frequencies:
-                probe_index, parent_probe_records = _probe_records_for_parent(
+                (
+                    probe_index,
+                    parent_probe_records,
+                    probe_seismic_records,
+                ) = _probe_records_for_parent(
                     h5=h5,
                     parent_path=(
                         hdf5_group
@@ -1182,6 +1556,7 @@ def _run_canonical_generation(
                 )
                 index_records.extend(probe_index)
                 probe_records.extend(parent_probe_records)
+                seismic_variant_records.extend(probe_seismic_records)
 
     index = pd.DataFrame.from_records(index_records)
     index.to_csv(output_dir / "sample_index.csv", index=False)
@@ -1215,6 +1590,10 @@ def _run_canonical_generation(
     qc_frame.to_csv(output_dir / "canonical_geometry_qc.csv", index=False)
     pd.DataFrame.from_records(probe_records).to_csv(
         output_dir / "frequency_probe_results.csv",
+        index=False,
+    )
+    pd.DataFrame.from_records(seismic_variant_records).to_csv(
+        output_dir / "seismic_variant_results.csv",
         index=False,
     )
     probe_frequency_frame = pd.DataFrame.from_records(
@@ -1301,7 +1680,10 @@ def _run_canonical_generation(
         "probe_selection": dict(script_cfg["probe_selection"]),
         "probe_frequency_count": len(probe_frequencies),
         "probe_variant_count": len(probe_records),
+        "seismic_variant_count": len(seismic_variant_records),
         "forward_qc": dict(script_cfg["forward_qc"]),
+        "lfm": dict(script_cfg["lfm"]),
+        "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
         "highres_wavelet": (
             {}
             if highres_wavelet is None
@@ -1358,11 +1740,7 @@ def _run_canonical_generation(
                 / "well_frequency_sensitivity.csv"
             ),
         },
-        "not_yet_implemented": [
-            "lfm_ideal",
-            "lfm_controlled_degraded",
-            "noise_gain_and_wavelet_mismatch_scenarios",
-        ],
+        "not_yet_implemented": [],
         "files": {
             "synthetic_benchmark.h5": sha256_file(h5_path),
             "sample_index.csv": sha256_file(output_dir / "sample_index.csv"),
@@ -1376,6 +1754,9 @@ def _run_canonical_generation(
             ),
             "probe_frequency_catalog.csv": sha256_file(
                 output_dir / "probe_frequency_catalog.csv"
+            ),
+            "seismic_variant_results.csv": sha256_file(
+                output_dir / "seismic_variant_results.csv"
             ),
             "generation_rejection_details.csv": sha256_file(
                 output_dir / "generation_rejection_details.csv"
@@ -1391,6 +1772,7 @@ def _run_canonical_generation(
         "rejected_realizations": 0,
         "failed_scenario_count": 0,
         "probe_variant_count": len(probe_records),
+        "seismic_variant_count": len(seismic_variant_records),
     }
     write_json(output_dir / "run_summary.json", summary)
     return summary
@@ -1473,6 +1855,7 @@ def run_generation(
     qc_records: list[dict[str, Any]] = []
     rejection_records: list[dict[str, Any]] = []
     probe_records: list[dict[str, Any]] = []
+    seismic_variant_records: list[dict[str, Any]] = []
     probe_frequencies = _load_probe_frequencies(
         script_cfg=script_cfg,
         sources=sources,
@@ -1504,6 +1887,8 @@ def run_generation(
                     hdf5_group = ""
                     probe_index_local: list[dict[str, Any]] = []
                     probe_records_local: list[dict[str, Any]] = []
+                    seismic_variant_records_local: list[dict[str, Any]] = []
+                    base_lfm_index: dict[str, Any] = {}
                     try:
                         minimum_truth_samples = 2 if scenario.duration_mode == "ultra_thin_stress" else 4
                         generated = generate_field_section(
@@ -1547,6 +1932,14 @@ def run_generation(
                             ),
                         )
                         generated.qc.update(forward_qc)
+                        lfm_result = derive_lfm_priors(
+                            generated,
+                            config=script_cfg["lfm"],
+                            global_seed=int(script_cfg["global_seed"]),
+                            generator_family=GENERATOR_FAMILY,
+                            degradation_variant_id=generated.realization_id,
+                        )
+                        generated.qc.update(lfm_result.qc)
                         hdf5_group = "" if qc_only else write_generated_section(h5, generated)
                         if not qc_only and highres_result is not None:
                             write_highres_forward_result(
@@ -1554,6 +1947,53 @@ def run_generation(
                                 realization_path=hdf5_group,
                                 result=highres_result,
                             )
+                        if not qc_only:
+                            write_lfm_result(
+                                h5,
+                                realization_path=hdf5_group,
+                                result=lfm_result,
+                            )
+                        base_lfm_index = _lfm_records(
+                            lfm_result,
+                            base_path=hdf5_group,
+                        )
+                        base_record_for_variants = {
+                            "sample_id": realization_id,
+                            "realization_id": realization_id,
+                            "parent_realization_id": realization_id,
+                            "suite": "field_conditioned",
+                            "section_id": section.section_id,
+                            "scenario_id": scenario.scenario_id,
+                            "geometry_family": scenario.geometry_family,
+                            "duration_mode": scenario.duration_mode,
+                            "split": "test" if scenario.geometry_family == "pinchout" else "unassigned",
+                            "hdf5_group": hdf5_group,
+                            "attempt_id": attempt_id,
+                            "status": "ok",
+                            "reasons": "",
+                            "sample_kind": "base",
+                            **base_lfm_index,
+                        }
+                        (
+                            base_seismic_index,
+                            base_seismic_results,
+                        ) = _seismic_variant_records_for_sample(
+                            h5=h5,
+                            owner_path=(
+                                hdf5_group
+                                if hdf5_group
+                                else f"/realizations/{generated.realization_id}"
+                            ),
+                            source_index_record=base_record_for_variants,
+                            seismic_model_consistent=generated.seismic_model_consistent,
+                            forward_valid_mask=generated.forward_valid_mask_model,
+                            lateral_m=generated.lateral_m,
+                            script_cfg=script_cfg,
+                            qc_only=qc_only,
+                            source_variant_id="base",
+                        )
+                        probe_index_local.extend(base_seismic_index)
+                        seismic_variant_records_local.extend(base_seismic_results)
                         probe_config = script_cfg["probe_selection"]
                         is_probe_parent = (
                             probe_frequencies
@@ -1573,8 +2013,9 @@ def run_generation(
                         if is_probe_parent:
                             try:
                                 (
-                                    probe_index_local,
-                                    probe_records_local,
+                                    probe_index_extra,
+                                    probe_records_extra,
+                                    probe_seismic_records_extra,
                                 ) = _probe_records_for_parent(
                                     h5=h5,
                                     parent_path=(
@@ -1592,6 +2033,11 @@ def run_generation(
                                     highres_wavelet=highres_wavelet,
                                     base_highres_forward=highres_result,
                                     qc_only=qc_only,
+                                )
+                                probe_index_local.extend(probe_index_extra)
+                                probe_records_local.extend(probe_records_extra)
+                                seismic_variant_records_local.extend(
+                                    probe_seismic_records_extra
                                 )
                             except Exception as exc:
                                 raise RuntimeError(
@@ -1649,11 +2095,13 @@ def run_generation(
                         "status": status,
                         "reasons": reasons,
                         "sample_kind": "base",
+                        **base_lfm_index,
                     }
                     index_records.append(record)
                     if status == "ok":
                         index_records.extend(probe_index_local)
                         probe_records.extend(probe_records_local)
+                        seismic_variant_records.extend(seismic_variant_records_local)
                     qc_records.append({**record, **{key: value for key, value in qc_payload.items() if key != "field_qc"}})
     index = pd.DataFrame.from_records(index_records)
     index.to_csv(output_dir / "sample_index.csv", index=False)
@@ -1695,6 +2143,10 @@ def run_generation(
     pd.DataFrame.from_records(qc_records).to_csv(output_dir / "generation_qc.csv", index=False)
     pd.DataFrame.from_records(probe_records).to_csv(
         output_dir / "frequency_probe_results.csv",
+        index=False,
+    )
+    pd.DataFrame.from_records(seismic_variant_records).to_csv(
+        output_dir / "seismic_variant_results.csv",
         index=False,
     )
     probe_frequency_frame = pd.DataFrame.from_records(
@@ -1789,7 +2241,10 @@ def run_generation(
         "probe_frequency_count": len(probe_frequencies),
         "probe_variant_count": len(probe_records),
         "probe_parent_counts": probe_parent_counts,
+        "seismic_variant_count": len(seismic_variant_records),
         "forward_qc": dict(script_cfg["forward_qc"]),
+        "lfm": dict(script_cfg["lfm"]),
+        "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
         "highres_wavelet": (
             {}
             if highres_wavelet is None
@@ -1846,11 +2301,7 @@ def run_generation(
                 / "well_frequency_sensitivity.csv"
             ),
         },
-        "not_yet_implemented": [
-            "lfm_ideal",
-            "lfm_controlled_degraded",
-            "noise_gain_and_wavelet_mismatch_scenarios",
-        ],
+        "not_yet_implemented": [],
         "files": {
             "synthetic_benchmark.h5": sha256_file(h5_path),
             "sample_index.csv": sha256_file(output_dir / "sample_index.csv"),
@@ -1861,6 +2312,9 @@ def run_generation(
             ),
             "probe_frequency_catalog.csv": sha256_file(
                 output_dir / "probe_frequency_catalog.csv"
+            ),
+            "seismic_variant_results.csv": sha256_file(
+                output_dir / "seismic_variant_results.csv"
             ),
             "generation_rejection_details.csv": sha256_file(
                 output_dir / "generation_rejection_details.csv"
@@ -1892,6 +2346,7 @@ def run_generation(
         ),
         "failed_scenario_count": int(failed_scenarios.sum()),
         "probe_variant_count": len(probe_records),
+        "seismic_variant_count": len(seismic_variant_records),
     }
     write_json(output_dir / "run_summary.json", summary)
     return summary

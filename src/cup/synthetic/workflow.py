@@ -50,6 +50,10 @@ from cup.synthetic.forward import (
     model_grid_closure_qc,
     resample_wavelet_to_highres,
 )
+from cup.synthetic.figures import (
+    write_calibration_figures,
+    write_generation_figures,
+)
 from cup.synthetic.io import (
     sha256_file,
     write_generated_section,
@@ -184,6 +188,8 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     forward_qc = dict(root.get("forward_qc") or {})
     highres_mismatch = dict(forward_qc.get("highres_mismatch") or {})
     probe_selection = dict(root.get("probe_selection") or {})
+    figures = dict(root.get("figures") or {})
+    report_examples = dict(figures.get("report_examples") or {})
     lfm = dict(root.get("lfm") or {})
     lfm_ideal = dict(lfm.get("ideal") or {})
     lfm_degraded = dict(lfm.get("controlled_degraded") or {})
@@ -468,6 +474,17 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "field_parents_per_section": int(
                 probe_selection.get("field_parents_per_section", 1)
             ),
+        },
+        "figures": {
+            "enabled": bool(figures.get("enabled", True)),
+            "max_example_objects_per_zone_state": int(
+                figures.get("max_example_objects_per_zone_state", 1)
+            ),
+            "report_examples": {
+                key: str(value)
+                for key, value in report_examples.items()
+                if value is not None and str(value).strip()
+            },
         },
     }
     _validate_canonical_config(parsed["canonical"])
@@ -869,7 +886,7 @@ def run_calibration(
     }.items():
         for name in names:
             source_hashes[f"{directory_key}/{name}"] = sha256_file(sources[directory_key] / name)
-    calibration, objects, qc = calibrate_impedance(
+    calibration, objects, qc, samples, backgrounds, profile_samples = calibrate_impedance(
         inputs,
         truth_dt_s=float(input_qc["truth_dt_s"]),
         ordered_horizons=[item["name"] for item in script_cfg["horizons"]],
@@ -891,15 +908,28 @@ def run_calibration(
     objects_path = output_dir / "well_object_catalog.csv"
     qc_path = output_dir / "calibration_qc.csv"
     status_path = output_dir / "well_status.csv"
+    samples_path = output_dir / "well_calibration_samples.csv"
+    backgrounds_path = output_dir / "well_background_fits.csv"
+    profile_samples_path = output_dir / "well_object_profile_samples.csv"
     objects.to_csv(objects_path, index=False)
     qc.to_csv(qc_path, index=False)
+    samples.to_csv(samples_path, index=False)
+    backgrounds.to_csv(backgrounds_path, index=False)
+    profile_samples.to_csv(profile_samples_path, index=False)
     pd.DataFrame.from_records(input_qc["well_status"]).to_csv(status_path, index=False)
     payload = calibration.to_dict()
     payload["artifact_hashes"] = {
         "well_object_catalog.csv": sha256_file(objects_path),
         "calibration_qc.csv": sha256_file(qc_path),
+        "well_calibration_samples.csv": sha256_file(samples_path),
+        "well_background_fits.csv": sha256_file(backgrounds_path),
+        "well_object_profile_samples.csv": sha256_file(profile_samples_path),
     }
     write_json(output_dir / "impedance_calibration.json", payload)
+    figure_summary = write_calibration_figures(
+        output_dir,
+        script_cfg.get("figures", {}),
+    )
     summary = {
         "schema_version": CALIBRATION_SCHEMA,
         "generator_family": GENERATOR_FAMILY,
@@ -916,6 +946,17 @@ def run_calibration(
             ),
             "well_object_catalog": repo_relative_path(objects_path, root=repo_root),
             "calibration_qc": repo_relative_path(qc_path, root=repo_root),
+            "well_calibration_samples": repo_relative_path(samples_path, root=repo_root),
+            "well_background_fits": repo_relative_path(backgrounds_path, root=repo_root),
+            "well_object_profile_samples": repo_relative_path(profile_samples_path, root=repo_root),
+        },
+        "figures": {
+            "generated_count": int(figure_summary.get("generated_count", 0)),
+            "skipped_count": int(figure_summary.get("skipped_count", 0)),
+            "figure_manifest": repo_relative_path(
+                Path(str(figure_summary.get("figure_manifest", output_dir / "figures" / "figure_manifest.json"))),
+                root=repo_root,
+            ),
         },
     }
     write_json(output_dir / "run_summary.json", summary)
@@ -1519,6 +1560,7 @@ def _run_canonical_generation(
     scenarios = canonical_scenarios(config)
     index_records: list[dict[str, Any]] = []
     object_records: list[dict[str, Any]] = []
+    object_lateral_records: list[dict[str, Any]] = []
     qc_records: list[dict[str, Any]] = []
     probe_records: list[dict[str, Any]] = []
     seismic_variant_records: list[dict[str, Any]] = []
@@ -1767,6 +1809,12 @@ def _run_canonical_generation(
     catalog["acceptance_fraction"] = 1.0
     catalog["acceptance_status"] = "fixed_public_benchmark"
     catalog.to_csv(output_dir / "scenario_catalog.csv", index=False)
+    figure_summary = write_generation_figures(
+        output_dir,
+        script_cfg.get("figures", {}),
+        suite="canonical",
+        qc_only=qc_only,
+    )
     reference = canonical_reference_impedance(calibration)
     manifest = {
         "schema_version": DATA_SCHEMA,
@@ -1853,6 +1901,14 @@ def _run_canonical_generation(
             ),
         },
         "not_yet_implemented": [],
+        "figures": {
+            "generated_count": int(figure_summary.get("generated_count", 0)),
+            "skipped_count": int(figure_summary.get("skipped_count", 0)),
+            "figure_manifest": repo_relative_path(
+                Path(str(figure_summary.get("figure_manifest", output_dir / "figures" / "figure_manifest.json"))),
+                root=repo_root,
+            ),
+        },
         "files": {
             "synthetic_benchmark.h5": sha256_file(h5_path),
             "sample_index.csv": sha256_file(output_dir / "sample_index.csv"),
@@ -1874,6 +1930,9 @@ def _run_canonical_generation(
                 output_dir / "generation_rejection_details.csv"
             ),
             "scenario_catalog.csv": sha256_file(output_dir / "scenario_catalog.csv"),
+            "figures/figure_manifest.json": sha256_file(
+                output_dir / "figures" / "figure_manifest.json"
+            ),
         },
     }
     write_json(output_dir / "benchmark_manifest.json", manifest)
@@ -1969,6 +2028,7 @@ def run_generation(
         attempts = min(attempts, int(debug_attempt_limit))
     index_records: list[dict[str, Any]] = []
     object_records: list[dict[str, Any]] = []
+    object_lateral_records: list[dict[str, Any]] = []
     qc_records: list[dict[str, Any]] = []
     rejection_records: list[dict[str, Any]] = []
     probe_records: list[dict[str, Any]] = []
@@ -2163,6 +2223,9 @@ def run_generation(
                                 ) from exc
                             probe_parent_counts[section.section_id] += 1
                         object_records.extend(generated.object_catalog)
+                        object_lateral_records.extend(
+                            generated.object_lateral_coefficients
+                        )
                         status = "ok"
                         reasons = ""
                         qc_payload = generated.qc
@@ -2257,6 +2320,31 @@ def run_generation(
         output_dir / "object_catalog.csv",
         index=False,
     )
+    object_lateral_columns = [
+        "realization_id",
+        "scenario_id",
+        "zone_id",
+        "local_object_index",
+        "calibration_object_id",
+        "object_id",
+        "state",
+        "state_id",
+        "event_target",
+        "lateral_index",
+        "lateral_m",
+        "c0",
+        "c1",
+        "c2",
+        "thickness_fraction",
+        "object_top_s",
+        "object_bottom_s",
+        "profile_projection_scale",
+        "c0_conditioning_adjustment",
+    ]
+    pd.DataFrame.from_records(
+        object_lateral_records,
+        columns=object_lateral_columns,
+    ).to_csv(output_dir / "object_lateral_coefficients.csv", index=False)
     pd.DataFrame.from_records(qc_records).to_csv(output_dir / "generation_qc.csv", index=False)
     pd.DataFrame.from_records(probe_records).to_csv(
         output_dir / "frequency_probe_results.csv",
@@ -2335,6 +2423,12 @@ def run_generation(
             ),
         )
     catalog.to_csv(output_dir / "scenario_catalog.csv", index=False)
+    figure_summary = write_generation_figures(
+        output_dir,
+        script_cfg.get("figures", {}),
+        suite="field_conditioned",
+        qc_only=qc_only,
+    )
     manifest = {
         "schema_version": DATA_SCHEMA,
         "generator_family": calibration.generator_family,
@@ -2424,10 +2518,21 @@ def run_generation(
             ),
         },
         "not_yet_implemented": [],
+        "figures": {
+            "generated_count": int(figure_summary.get("generated_count", 0)),
+            "skipped_count": int(figure_summary.get("skipped_count", 0)),
+            "figure_manifest": repo_relative_path(
+                Path(str(figure_summary.get("figure_manifest", output_dir / "figures" / "figure_manifest.json"))),
+                root=repo_root,
+            ),
+        },
         "files": {
             "synthetic_benchmark.h5": sha256_file(h5_path),
             "sample_index.csv": sha256_file(output_dir / "sample_index.csv"),
             "object_catalog.csv": sha256_file(output_dir / "object_catalog.csv"),
+            "object_lateral_coefficients.csv": sha256_file(
+                output_dir / "object_lateral_coefficients.csv"
+            ),
             "generation_qc.csv": sha256_file(output_dir / "generation_qc.csv"),
             "frequency_probe_results.csv": sha256_file(
                 output_dir / "frequency_probe_results.csv"
@@ -2443,6 +2548,9 @@ def run_generation(
             ),
             "scenario_catalog.csv": sha256_file(output_dir / "scenario_catalog.csv"),
             "section_geometry_qc.csv": sha256_file(section_geometry_qc_path),
+            "figures/figure_manifest.json": sha256_file(
+                output_dir / "figures" / "figure_manifest.json"
+            ),
         },
     }
     write_json(output_dir / "benchmark_manifest.json", manifest)

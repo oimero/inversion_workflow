@@ -63,6 +63,7 @@ class GeneratedSection:
     forward_valid_mask_highres: np.ndarray
     forward_valid_mask_model: np.ndarray
     object_catalog: list[dict[str, Any]]
+    object_lateral_coefficients: list[dict[str, Any]]
     qc: dict[str, Any]
 
 
@@ -670,6 +671,7 @@ def generate_field_section(
     geometry_event_mask = np.zeros((n_lateral, n_highres), dtype=bool)
     boundary = np.zeros((n_lateral, n_highres), dtype=bool)
     object_catalog: list[dict[str, Any]] = []
+    object_lateral_coefficients: list[dict[str, Any]] = []
     field_qc: list[dict[str, Any]] = []
     rejection_details: list[dict[str, Any]] = []
     next_global_object_id = 0
@@ -792,6 +794,31 @@ def generate_field_section(
                     ai_bounds=calibration.zone_models[zone_id]["ai_bounds"],
                 )
                 c0, c1, c2 = projected
+                object_lateral_coefficients.append(
+                    {
+                        "realization_id": realization_id,
+                        "scenario_id": scenario.scenario_id,
+                        "zone_id": zone_id,
+                        "local_object_index": int(local_object_index),
+                        "calibration_object_id": item["object_id"],
+                        "object_id": int(global_object_id),
+                        "state": item["state"],
+                        "state_id": int(item["state_id"]),
+                        "event_target": bool(local_object_index == event_target),
+                        "lateral_index": int(lateral_index),
+                        "lateral_m": float(lateral[lateral_index]),
+                        "c0": float(c0),
+                        "c1": float(c1),
+                        "c2": float(c2),
+                        "thickness_fraction": float(
+                            thickness_weights[local_object_index, lateral_index]
+                        ),
+                        "object_top_s": float(object_top),
+                        "object_bottom_s": float(object_bottom),
+                        "profile_projection_scale": float(projection),
+                        "c0_conditioning_adjustment": float(c0_adjustment),
+                    }
+                )
                 profile_projection_count += int(projection < 1.0 - 1e-12)
                 profile_projection_sum += projection
                 minimum_profile_projection = min(minimum_profile_projection, projection)
@@ -1132,6 +1159,7 @@ def generate_field_section(
         forward_valid_mask_highres=forward_valid_highres,
         forward_valid_mask_model=forward_valid_model,
         object_catalog=object_catalog,
+        object_lateral_coefficients=object_lateral_coefficients,
         qc={
             "status": "ok",
             "global_reversal_fraction": global_reversal,

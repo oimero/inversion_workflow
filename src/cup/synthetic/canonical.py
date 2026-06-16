@@ -437,5 +437,6 @@ def generate_canonical_section(
             valid_model[:, :-1] & valid_model[:, 1:]
         ),
         object_catalog=object_catalog,
+        object_lateral_coefficients=[],
         qc=qc,
     )

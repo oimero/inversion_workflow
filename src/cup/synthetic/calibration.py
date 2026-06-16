@@ -270,7 +270,7 @@ def calibrate_impedance(
     huber_delta_parent_sigma_floor: float = 0.05,
     coefficient_sigma_parent_floor: float = 0.05,
     coefficient_sigma_parent_cap: float = 3.0,
-) -> tuple[ImpedanceCalibration, pd.DataFrame, pd.DataFrame]:
+) -> tuple[ImpedanceCalibration, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Calibrate zone backgrounds, Semi-Markov objects and profile coefficients."""
     if not curves:
         raise ValueError("No well-zone curves were provided.")
@@ -301,18 +301,30 @@ def calibrate_impedance(
             }
         )
         background = a + b * (2.0 * zeta[valid] - 1.0)
-        for local_index, (time, coordinate, full, residual) in enumerate(
-            zip(item.twt_s[valid], zeta[valid], item.full_log_ai[valid], item.full_log_ai[valid] - background)
+        residual_values = item.full_log_ai[valid] - background
+        for local_index, (time, coordinate, filtered, full, bg, residual) in enumerate(
+            zip(
+                item.twt_s[valid],
+                zeta[valid],
+                item.filtered_log_ai[valid],
+                item.full_log_ai[valid],
+                background,
+                residual_values,
+            )
         ):
             sample_records.append(
                 {
                     "well_name": item.well_name,
                     "spatial_cluster_id": item.spatial_cluster_id,
                     "zone_id": item.zone_id,
+                    "top_horizon": item.top_horizon,
+                    "bottom_horizon": item.bottom_horizon,
                     "sample_id": local_index,
                     "twt_s": float(time),
                     "zeta": float(coordinate),
+                    "filtered_log_ai": float(filtered),
                     "full_log_ai": float(full),
+                    "background_log_ai": float(bg),
                     "residual": float(residual),
                     "zone_duration_s": duration,
                 }
@@ -323,6 +335,7 @@ def calibrate_impedance(
         raise ValueError("No valid calibration samples were produced.")
 
     object_records: list[dict[str, Any]] = []
+    profile_sample_records: list[dict[str, Any]] = []
     threshold_rows: list[dict[str, Any]] = []
     zone_centers: dict[str, tuple[float, float]] = {}
     for zone_id, group in samples.groupby("zone_id", sort=False):
@@ -331,8 +344,20 @@ def calibrate_impedance(
         if not np.isfinite(sigma) or sigma <= 0.0:
             raise ValueError(f"invalid_impedance_calibration:nonpositive_state_sigma:{zone_id}")
         zone_centers[str(zone_id)] = (center, sigma)
+        residual_values = group["residual"].to_numpy()
+        sample_states = np.where(
+            residual_values < center - state_threshold_sigma * sigma,
+            0,
+            np.where(residual_values > center + state_threshold_sigma * sigma, 2, 1),
+        )
+        samples.loc[group.index, "state_id_initial"] = sample_states.astype(np.int8)
+        samples.loc[group.index, "state_initial"] = [
+            STATE_NAMES[int(state)] for state in sample_states
+        ]
+        samples.loc[group.index, "state_center"] = center
+        samples.loc[group.index, "state_sigma"] = sigma
         for threshold in (0.75, state_threshold_sigma, 1.25):
-            values = group["residual"].to_numpy()
+            values = residual_values
             states = np.where(
                 values < center - threshold * sigma,
                 0,
@@ -396,6 +421,31 @@ def calibrate_impedance(
                     **profile_metrics,
                 }
             )
+            for point_index, (time, coordinate, observed, predicted) in enumerate(
+                zip(
+                    group["twt_s"].to_numpy()[start:end],
+                    xi,
+                    residual[start:end],
+                    fitted,
+                )
+            ):
+                profile_sample_records.append(
+                    {
+                        "well_name": well_name,
+                        "spatial_cluster_id": int(group["spatial_cluster_id"].iloc[0]),
+                        "zone_id": zone_id,
+                        "object_id": f"{well_name}:{zone_id}:{object_index}",
+                        "object_order": object_index,
+                        "state_id": int(states[start]),
+                        "state": STATE_NAMES[int(states[start])],
+                        "point_index": int(point_index),
+                        "twt_s": float(time),
+                        "xi": float(coordinate),
+                        "residual": float(observed),
+                        "fitted_residual": float(predicted),
+                        "fit_residual": float(observed - predicted),
+                    }
+                )
     objects = pd.DataFrame.from_records(object_records)
     if objects.empty:
         raise ValueError("No calibration objects were produced.")
@@ -594,4 +644,11 @@ def calibrate_impedance(
         source_runs=dict(source_runs),
         source_hashes=dict(source_hashes),
     )
-    return calibration, objects, pd.DataFrame.from_records(qc_records)
+    return (
+        calibration,
+        objects,
+        pd.DataFrame.from_records(qc_records),
+        samples,
+        backgrounds,
+        pd.DataFrame.from_records(profile_sample_records),
+    )

@@ -17,8 +17,8 @@ from cup.petrel.load import (
     import_interpretation_petrel,
     import_well_tops_petrel,
 )
-from cup.seismic.horizon import HorizonSurface
 from cup.seismic.survey import open_survey
+from cup.seismic.target_zone import TargetZone
 from cup.seismic.wavelet import (
     infer_wavelet_dt,
     load_wavelet_csv,
@@ -100,6 +100,7 @@ class SectionGeometry:
     x_m: np.ndarray
     y_m: np.ndarray
     horizon_twt_s: np.ndarray
+    qc_rows: tuple[dict[str, Any], ...] = ()
 
 
 def _mapping(value: Any, *, path: str) -> dict[str, Any]:
@@ -113,6 +114,16 @@ def _required_text(value: Mapping[str, Any], key: str, *, path: str) -> str:
     if not text:
         raise ValueError(f"{path}.{key} must be a non-empty string.")
     return text
+
+
+def _optional_float(value: Mapping[str, Any], key: str) -> float | None:
+    raw = value.get(key)
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text or text.casefold() in {"none", "null", "nan"}:
+        return None
+    return float(raw)
 
 
 def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -131,6 +142,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     geometry = _mapping(root.get("geometry"), path="synthoseis_lite.geometry")
     field = _mapping(geometry.get("field_conditioned"), path="synthoseis_lite.geometry.field_conditioned")
     canonical = _mapping(geometry.get("canonical") or {}, path="synthoseis_lite.geometry.canonical")
+    target_zone = _mapping(field.get("target_zone") or {}, path="synthoseis_lite.geometry.field_conditioned.target_zone")
     horizons = field.get("horizons")
     sections = field.get("sections")
     if not isinstance(horizons, list) or len(horizons) < 2:
@@ -211,6 +223,13 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "horizons": horizon_items,
         "sections": section_items,
         "lateral_sample_interval_m": float(geometry.get("lateral_sample_interval_m", 25.0)),
+        "target_zone": {
+            "mode": str(target_zone.get("mode", "filled_target_zone")),
+            "nearest_distance_limit": _optional_float(target_zone, "nearest_distance_limit"),
+            "outlier_threshold": _optional_float(target_zone, "outlier_threshold"),
+            "outlier_min_neighbor_count": int(target_zone.get("outlier_min_neighbor_count", 2)),
+            "min_thickness_s": _optional_float(target_zone, "min_thickness_s"),
+        },
         "canonical": {
             "enabled": bool(canonical.get("enabled", True)),
             "lateral_sample_interval_m": float(
@@ -933,6 +952,72 @@ def _resample_section_path(
     return lateral, lines[:, 0], lines[:, 1], x, y
 
 
+def _nearest_grid_index(value: float, *, minimum: float, step: float, size: int) -> int:
+    index = int(round((float(value) - float(minimum)) / float(step)))
+    return max(0, min(index, int(size) - 1))
+
+
+def _section_target_zone_qc_rows(
+    *,
+    section_id: str,
+    lateral_m: np.ndarray,
+    inline_float: np.ndarray,
+    xline_float: np.ndarray,
+    horizon_values: np.ndarray,
+    target_zone: TargetZone,
+    horizon_names: Sequence[str],
+    geometry_mode: str,
+) -> list[dict[str, Any]]:
+    geometry = target_zone.geometry
+    inline_min = float(geometry["inline_min"])
+    xline_min = float(geometry["xline_min"])
+    inline_step = float(geometry["inline_step"])
+    xline_step = float(geometry["xline_step"])
+    inline_size, xline_size = target_zone.valid_control_mask.shape
+    rows: list[dict[str, Any]] = []
+    for sample_index, (distance, il, xl) in enumerate(zip(lateral_m, inline_float, xline_float)):
+        i = _nearest_grid_index(il, minimum=inline_min, step=inline_step, size=inline_size)
+        j = _nearest_grid_index(xl, minimum=xline_min, step=xline_step, size=xline_size)
+        trace_valid_control = bool(target_zone.valid_control_mask[i, j])
+        trace_filled_model = bool(target_zone.filled_model_mask[i, j])
+        trace_filled_by_thickness = bool(trace_filled_model and not trace_valid_control)
+        for horizon_index, horizon_name in enumerate(horizon_names):
+            surface = target_zone.get_horizon_surface(str(horizon_name))
+            sample = surface.sample_at_line(float(il), float(xl))
+            rows.append(
+                {
+                    "section_id": section_id,
+                    "geometry_mode": geometry_mode,
+                    "sample_index": int(sample_index),
+                    "lateral_m": float(distance),
+                    "inline_float": float(il),
+                    "xline_float": float(xl),
+                    "nearest_grid_inline": float(inline_min + i * inline_step),
+                    "nearest_grid_xline": float(xline_min + j * xline_step),
+                    "nearest_grid_index_inline": int(i),
+                    "nearest_grid_index_xline": int(j),
+                    "horizon_name": str(horizon_name),
+                    "horizon_twt_s": float(horizon_values[sample_index, horizon_index]),
+                    "horizon_sample_method": str(sample.method),
+                    "horizon_support_status": str(sample.support_status),
+                    "raw_pick": bool(target_zone.raw_pick_masks[str(horizon_name)][i, j]),
+                    "linear_support": bool(
+                        target_zone.interpolation_support_masks[str(horizon_name)][i, j]
+                    ),
+                    "nearest_distance_grid": float(
+                        target_zone.nearest_distance_grids[str(horizon_name)][i, j]
+                    ),
+                    "trace_valid_control": trace_valid_control,
+                    "trace_filled_model": trace_filled_model,
+                    "trace_filled_by_thickness_interpolation": trace_filled_by_thickness,
+                    "trace_no_support": bool(target_zone.no_support_mask[i, j]),
+                    "trace_crossing": bool(target_zone.crossing_mask[i, j]),
+                    "trace_thin": bool(target_zone.thin_mask[i, j]),
+                }
+            )
+    return rows
+
+
 def build_section_geometries(
     *,
     workflow: TimeWorkflowConfig,
@@ -953,19 +1038,35 @@ def build_section_geometries(
         workflow.seismic.type,
         segy_options=segy_options or None,
     )
-    surfaces: list[HorizonSurface] = []
+    target_zone_cfg = dict(script_cfg.get("target_zone") or {})
+    mode = str(target_zone_cfg.get("mode", "filled_target_zone"))
+    if mode != "filled_target_zone":
+        raise ValueError(
+            "synthoseis_lite field-conditioned geometry only supports "
+            f"filled_target_zone, got {mode!r}."
+        )
+    survey_geometry = survey.describe_geometry(domain="time")
+    raw_horizon_dfs: dict[str, pd.DataFrame] = {}
+    ordered_horizons = [str(item["name"]) for item in script_cfg["horizons"]]
     for horizon in script_cfg["horizons"]:
         path = resolve_relative_path(
             horizon["file"],
             root=resolve_relative_path(workflow.data_root, root=repo_root),
         )
         frame = import_interpretation_petrel(path)
-        values = np.abs(frame["interpretation"].to_numpy(dtype=np.float64))
-        if np.nanmedian(values) > 20.0:
-            values = values / 1000.0
         frame = frame.copy()
-        frame["interpretation"] = values
-        surfaces.append(HorizonSurface.from_petrel_dataframe(frame, name=horizon["name"]))
+        frame["interpretation"] = np.abs(frame["interpretation"].to_numpy(dtype=np.float64))
+        raw_horizon_dfs[str(horizon["name"])] = frame
+    target_zone = TargetZone(
+        raw_horizon_dfs,
+        survey_geometry,
+        ordered_horizons,
+        nearest_distance_limit=target_zone_cfg.get("nearest_distance_limit"),
+        outlier_threshold=target_zone_cfg.get("outlier_threshold"),
+        outlier_min_neighbor_count=int(target_zone_cfg.get("outlier_min_neighbor_count", 2)),
+        min_thickness=target_zone_cfg.get("min_thickness_s"),
+    )
+    surfaces = [target_zone.get_horizon_surface(name) for name in ordered_horizons]
     sections: list[SectionGeometry] = []
     for section in script_cfg["sections"]:
         lateral, inline, xline, x, y = _resample_section_path(
@@ -984,6 +1085,16 @@ def build_section_geometries(
         )
         if np.any(np.diff(horizon_values, axis=1) <= 0.0):
             raise ValueError(f"crossing_horizons:{section['section_id']}")
+        qc_rows = _section_target_zone_qc_rows(
+            section_id=str(section["section_id"]),
+            lateral_m=lateral,
+            inline_float=inline,
+            xline_float=xline,
+            horizon_values=horizon_values,
+            target_zone=target_zone,
+            horizon_names=ordered_horizons,
+            geometry_mode=mode,
+        )
         sections.append(
             SectionGeometry(
                 section_id=section["section_id"],
@@ -993,6 +1104,7 @@ def build_section_geometries(
                 x_m=x,
                 y_m=y,
                 horizon_twt_s=horizon_values,
+                qc_rows=tuple(qc_rows),
             )
         )
     return sections
@@ -1837,6 +1949,11 @@ def run_generation(
         script_cfg=script_cfg,
         repo_root=repo_root,
     )
+    section_geometry_qc_path = output_dir / "section_geometry_qc.csv"
+    section_geometry_qc = pd.DataFrame.from_records(
+        [row for section in sections for row in section.qc_rows]
+    )
+    section_geometry_qc.to_csv(section_geometry_qc_path, index=False)
     scenarios = generation_scenarios(script_cfg)
     if geometry_families:
         selected = {str(value) for value in geometry_families}
@@ -2237,6 +2354,11 @@ def run_generation(
         "n_scenarios": len(scenarios),
         "attempts_per_scenario": attempts,
         "geometry_filters": sorted({scenario.geometry_family for scenario in scenarios}),
+        "field_geometry": {
+            "mode": str(script_cfg.get("target_zone", {}).get("mode", "filled_target_zone")),
+            "target_zone": dict(script_cfg.get("target_zone") or {}),
+            "section_geometry_qc": repo_relative_path(section_geometry_qc_path, root=repo_root),
+        },
         "probe_selection": dict(script_cfg["probe_selection"]),
         "probe_frequency_count": len(probe_frequencies),
         "probe_variant_count": len(probe_records),
@@ -2320,6 +2442,7 @@ def run_generation(
                 output_dir / "generation_rejection_details.csv"
             ),
             "scenario_catalog.csv": sha256_file(output_dir / "scenario_catalog.csv"),
+            "section_geometry_qc.csv": sha256_file(section_geometry_qc_path),
         },
     }
     write_json(output_dir / "benchmark_manifest.json", manifest)

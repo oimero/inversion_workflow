@@ -164,9 +164,6 @@ observability 所需的低通、传递响应和频率诊断工具在重置后按
 - `src/cup/seismic/facies_control_depth.py`
 - `src/cup/seismic/gain.py`
 - `src/cup/seismic/lfm_depth.py`
-- `src/cup/seismic/lfm_time.py`
-- `src/cup/seismic/modeling.py`
-- `src/cup/seismic/target_zone.py`
 - `src/cup/well/constraints.py`
 - `src/cup/well/frequency_bands.py`
 - `src/cup/utils/raw_trace.py`

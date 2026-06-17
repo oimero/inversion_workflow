@@ -11,22 +11,19 @@ import pandas as pd
 import scipy
 
 from cup.seismic.wavelet import infer_wavelet_dt, load_wavelet_csv, validate_wavelet_normalization
-from cup.synthetic.calibration import GENERATOR_FAMILY, ImpedanceCalibration
+from cup.synthetic.calibration import GENERATOR_FAMILY, ImpedanceCalibration, load_calibration
 from cup.synthetic.canonical import CANONICAL_FAMILIES, canonical_reference_impedance, canonical_scenarios, generate_canonical_section
-from cup.synthetic.constants import DATA_SCHEMA, IMPLEMENTATION_SCOPE
-from cup.synthetic.dsp import antialias_taps
-from cup.synthetic.forward import HighresForwardResult, HighresWavelet, highres_forward_to_model_grid, model_grid_closure_qc, resample_wavelet_to_highres
+from cup.synthetic.config import DATA_SCHEMA, IMPLEMENTATION_SCOPE
+from cup.synthetic.forward import HighresForwardResult, HighresWavelet, antialias_taps, highres_forward_to_model_grid, model_grid_closure_qc, resample_wavelet_to_highres
 from cup.synthetic.figures import write_generation_figures
 from cup.synthetic.generation import GenerationRejected, GenerationScenario, generate_field_section
 from cup.synthetic.geometry import build_section_geometries
-from cup.synthetic.hashing import array_sha256, sha256_file
 from cup.synthetic.io import write_generated_section, write_highres_forward_result, write_lfm_result, write_probe_result, write_seismic_variant_result
 from cup.synthetic.lfm import LfmResult, derive_lfm_priors
 from cup.synthetic.probes import ProbeFrequency, build_probe_frequency_catalog, frequency_catalog_rows, generate_probe, probe_variants
 from cup.synthetic.seismic_variants import generate_seismic_variants
-from cup.synthetic.sources import load_calibration
 from cup.time_config import TimeWorkflowConfig
-from cup.utils.io import repo_relative_path, resolve_relative_path, write_json
+from cup.utils.io import array_sha256, repo_relative_path, resolve_relative_path, sha256_file, write_json
 
 
 def generation_scenarios(script_cfg: Mapping[str, Any]) -> list[GenerationScenario]:

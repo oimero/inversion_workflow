@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -699,3 +701,8 @@ def calibrate_impedance(
         backgrounds,
         pd.DataFrame.from_records(profile_sample_records),
     )
+
+
+def load_calibration(path: Path) -> ImpedanceCalibration:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        return ImpedanceCalibration.from_dict(json.load(handle))

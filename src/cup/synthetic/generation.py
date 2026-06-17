@@ -14,8 +14,7 @@ from cup.synthetic.calibration import (
     STATE_NAMES,
     object_profile_metrics,
 )
-from cup.synthetic.dsp import antialias_taps, downsample_continuous
-from cup.synthetic.grids import categorical_model_grids
+from cup.synthetic.forward import antialias_taps, categorical_model_grids, downsample_continuous
 from cup.synthetic.random import ar1_irregular, named_rng
 
 

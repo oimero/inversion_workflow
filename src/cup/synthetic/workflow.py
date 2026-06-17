@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+from cup.synthetic.calibration import load_calibration
 from cup.synthetic.calibration_pipeline import build_calibration_inputs, run_calibration
-from cup.synthetic.config import parse_synthoseis_config
+from cup.synthetic.config import parse_synthoseis_config, resolve_sources
 from cup.synthetic.generation_pipeline import generation_scenarios, run_generation
 from cup.synthetic.geometry import SectionGeometry, build_section_geometries
-from cup.synthetic.sources import load_calibration, resolve_sources
 
 __all__ = [
     "SectionGeometry",

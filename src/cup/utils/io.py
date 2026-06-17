@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -202,3 +203,21 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fp:
         json.dump(to_json_compatible(payload), fp, ensure_ascii=False, indent=2)
+
+
+# ── Hashing ──
+
+
+def array_sha256(values: np.ndarray) -> str:
+    """SHA-256 digest of an array's contiguous byte representation."""
+    array = np.ascontiguousarray(np.asarray(values))
+    return hashlib.sha256(array.view(np.uint8).tobytes()).hexdigest()
+
+
+def sha256_file(path: str | Path) -> str:
+    """SHA-256 digest of a file, streamed in fixed-size blocks."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()

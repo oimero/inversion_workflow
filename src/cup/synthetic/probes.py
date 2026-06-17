@@ -10,9 +10,9 @@ import pandas as pd
 from scipy.signal.windows import tukey
 
 from cup.seismic.observability import forward_log_ai
-from cup.synthetic.dsp import downsample_continuous
+from cup.synthetic.forward import downsample_continuous
 from cup.synthetic.generation import GeneratedSection
-from cup.synthetic.stats import centered_rms
+from cup.utils.statistics import centered_rms
 
 
 @dataclass(frozen=True)

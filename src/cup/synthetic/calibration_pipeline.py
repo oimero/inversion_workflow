@@ -16,12 +16,10 @@ from cup.synthetic.calibration import (
     WellZoneCurves,
     calibrate_impedance,
 )
-from cup.synthetic.constants import IMPLEMENTATION_SCOPE
+from cup.synthetic.config import IMPLEMENTATION_SCOPE
 from cup.synthetic.figures import write_calibration_figures
-from cup.synthetic.hashing import sha256_file
-from cup.synthetic.sources import _artifact
 from cup.time_config import TimeWorkflowConfig
-from cup.utils.io import repo_relative_path, resolve_relative_path, write_json
+from cup.utils.io import repo_relative_path, resolve_artifact_path, resolve_relative_path, sha256_file, write_json
 from cup.well.assets import normalize_well_name
 from cup.well.las import read_las_curve
 from cup.well.td import find_well_top_md, load_workflow_time_depth_table_csv
@@ -72,6 +70,13 @@ def _piecewise_cell_average(
             ]
             result[index] = float(np.trapezoid(y, x) / dt_s)
     return result
+
+
+def _artifact(value: Any, *, run_dir: Path, repo_root: Path, label: str) -> Path:
+    path = resolve_artifact_path(value, root=repo_root, run_dir=run_dir)
+    if path is None or not path.is_file():
+        raise FileNotFoundError(f"{label} does not exist: {path}")
+    return path
 
 def build_calibration_inputs(
     *,

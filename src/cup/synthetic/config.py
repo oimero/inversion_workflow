@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 
 from cup.synthetic.calibration import GENERATOR_FAMILY
+from cup.utils.io import resolve_relative_path
+
+
+DATA_SCHEMA = "synthoseis_lite_v1"
+IMPLEMENTATION_SCOPE = "impedance_truth_frequency_probes_forward_qc_lfm_and_seismic_mismatch"
 
 
 def _mapping(value: Any, *, path: str) -> dict[str, Any]:
@@ -391,6 +398,45 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     _validate_seismic_mismatch_config(parsed["seismic_mismatch"])
     _validate_probe_config(parsed["probe_selection"])
     return parsed
+
+
+def resolve_sources(script_cfg: Mapping[str, Any], *, repo_root: Path) -> dict[str, Path]:
+    sources = {
+        key: resolve_relative_path(value, root=repo_root)
+        for key, value in script_cfg["source_runs"].items()
+    }
+    required = {
+        "forward_observability_dir": [
+            "run_summary.json",
+            "frequency_evidence_bands.csv",
+            "well_frequency_sensitivity.csv",
+        ],
+        "well_preprocess_dir": ["well_preprocess_status.csv"],
+        "well_auto_tie_dir": ["well_tie_metrics.csv"],
+        "wavelet_generation_dir": [
+            "selected_wavelet.csv",
+            "selected_wavelet_summary.json",
+            "evaluation_well_spatial_clusters.csv",
+        ],
+    }
+    for key, names in required.items():
+        directory = sources[key]
+        if not directory.is_dir():
+            raise FileNotFoundError(f"Source run does not exist: {directory}")
+        missing = [name for name in names if not (directory / name).is_file()]
+        if missing:
+            raise FileNotFoundError(f"{key} is missing {missing}: {directory}")
+    with (sources["forward_observability_dir"] / "run_summary.json").open(
+        "r", encoding="utf-8"
+    ) as handle:
+        summary = json.load(handle)
+    recorded = summary.get("source_runs") or {}
+    for key in ("well_preprocess_dir", "well_auto_tie_dir", "wavelet_generation_dir"):
+        if key not in recorded:
+            raise ValueError(f"source_run_mismatch: observability summary lacks {key}")
+        if resolve_relative_path(recorded[key], root=repo_root).resolve() != sources[key].resolve():
+            raise ValueError(f"source_run_mismatch:{key}")
+    return sources
 
 def _validate_canonical_config(config: Mapping[str, Any]) -> None:
     if int(config["lateral_samples"]) < 8:

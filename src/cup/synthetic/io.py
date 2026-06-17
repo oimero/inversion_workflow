@@ -8,11 +8,11 @@ import h5py
 import numpy as np
 
 from cup.synthetic.generation import GeneratedSection
-from cup.synthetic.hashing import array_sha256, sha256_file
 from cup.synthetic.forward import HighresForwardResult
 from cup.synthetic.lfm import LfmResult
 from cup.synthetic.probes import ProbeFrequency, ProbeResult
 from cup.synthetic.seismic_variants import SeismicVariantResult
+from cup.utils.io import array_sha256, sha256_file
 
 
 def _dataset(

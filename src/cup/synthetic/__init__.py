@@ -11,7 +11,6 @@ from cup.synthetic.canonical import (
     generate_canonical_section,
 )
 from cup.synthetic.dataset import SyntheticSample, SynthoseisBenchmark
-from cup.synthetic.dsp import antialias_taps, downsample_continuous
 from cup.synthetic.generation import (
     GeneratedSection,
     GenerationScenario,
@@ -27,6 +26,8 @@ from cup.synthetic.metrics import (
 from cup.synthetic.forward import (
     HighresForwardResult,
     HighresWavelet,
+    antialias_taps,
+    downsample_continuous,
     highres_forward_to_model_grid,
     resample_wavelet_to_highres,
 )

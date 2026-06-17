@@ -10,9 +10,8 @@ import numpy as np
 from cup.seismic.observability import acoustic_reflectivity_from_log_ai, forward_log_ai
 from cup.seismic.wavelet import wavelet_spectrum_features
 from cup.synthetic.calibration import ImpedanceCalibration
-from cup.synthetic.dsp import antialias_taps, downsample_continuous
+from cup.synthetic.forward import antialias_taps, categorical_model_grids, downsample_continuous
 from cup.synthetic.generation import GeneratedSection, GenerationScenario
-from cup.synthetic.grids import categorical_model_grids
 
 
 CANONICAL_FAMILIES = (

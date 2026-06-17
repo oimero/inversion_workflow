@@ -9,7 +9,7 @@ import numpy as np
 from scipy.signal import hilbert
 
 from cup.synthetic.random import ar1_irregular, named_rng
-from cup.synthetic.stats import centered_rms
+from cup.utils.statistics import centered_rms
 
 
 @dataclass(frozen=True)

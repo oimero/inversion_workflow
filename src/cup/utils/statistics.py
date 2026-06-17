@@ -97,6 +97,16 @@ def rms(values: np.ndarray) -> float:
     return float(np.sqrt(np.mean(values * values)))
 
 
+def centered_rms(values: np.ndarray, mask: np.ndarray, *, min_count: int = 1) -> float:
+    """Root mean square after removing the masked finite mean."""
+    finite = np.asarray(mask, dtype=bool) & np.isfinite(values)
+    if np.count_nonzero(finite) < int(min_count):
+        return float("nan")
+    selected = np.asarray(values, dtype=np.float64)[finite]
+    centered = selected - float(np.mean(selected))
+    return float(np.sqrt(np.mean(centered * centered)))
+
+
 def normalized_cross_correlation(a: np.ndarray, b: np.ndarray) -> float:
     """Zero-mean normalised cross-correlation between two 1-D arrays."""
     a = np.asarray(a, dtype=np.float64).reshape(-1)

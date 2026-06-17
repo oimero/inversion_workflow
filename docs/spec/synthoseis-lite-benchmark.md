@@ -977,7 +977,7 @@ train/validation/test 分配，并使该检查成为 hard failure。
 ## 8. 输出契约
 
 本节定义未来 schema，但本轮不把它加入稳定工作流的
-[核心 CSV 契约](csv-contracts.md)。
+[核心 CSV 契约](../concepts/csv-contracts.md)。
 
 ### 8.1 冻结阻抗校准产物
 

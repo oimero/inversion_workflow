@@ -2,7 +2,7 @@
 
 ## 文档地位
 
-本文是[时间域反演重置](time-domain-inversion-reset.md)之后的当前研究入口。
+本文是[时间域反演重置](../concepts/time-domain-inversion-reset.md)之后的当前研究入口。
 它定义第五步之后第一个研究闸门的目的、输入、算法、输出和判定规则。
 
 本闸门回答：
@@ -54,8 +54,8 @@ forward_observability:
 运行。`selected_wavelet_summary.json.source_auto_tie_dir` 必须与显式指定的
 `well_auto_tie_dir` 指向同一运行，否则整次运行失败。
 
-路径解析遵循[核心 CSV 契约](csv-contracts.md)，坐标、时间和阻抗单位遵循
-[数据与单位约定](data-and-coordinate-conventions.md)。
+路径解析遵循[核心 CSV 契约](../concepts/csv-contracts.md)，坐标、时间和阻抗单位遵循
+[数据与单位约定](../concepts/data-and-coordinate-conventions.md)。
 
 ### 1.2 主基线与对照曲线
 

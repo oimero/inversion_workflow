@@ -3,7 +3,6 @@
 ## 文档地位
 
 本文是第五步之后时间域反演重构的唯一权威入口。
-它同时是后续清理工作的执行规格，不是交给未知后继者自行补全的方向性备忘。
 
 当前稳定生产链截止第五步：
 
@@ -15,53 +14,30 @@
 
 `scripts/well_trajectory.py` 是井轨迹事实与 QC 旁路，也属于保留范围。
 
-第五步以后的旧脚本、指南、模块和 schema 不再定义未来架构。
-
-## 重置原则
-
-- 清理后的活动树不保留兼容层、自动回退、旧 schema、legacy 目录或废弃入口。
-- 不为旧调用点维持 API。新研究结论确定后，从明确的新契约重新实现。
-- Git 历史是旧实现的唯一档案，不额外建立 legacy 分支、tag 或代码副本。
-- 对完全属于旧架构的文件优先整文件或整目录删除，不逐行抢救“也许以后能用”的代码。
-- 只有被前五步直接依赖且语义仍成立的通用能力才允许迁移；重写小型工具的成本低于保留错误上下文。
-- 前五步继续提供可信的井、轨迹、井震标定、全局子波和工区坐标事实。
-- `src/wtie/` 完整保留。它是前五步自动井震标定的基础库，本轮不做内部裁剪。
-- 稳定工作流暂时终止于第五步。后续工作先通过研究闸门，不提前占用“第六步”编号。
-
-## 当前研究入口
-
-第一研究闸门见[前向可观测性闸门](forward-observability-gate.md)，已经定义并实现
-离散前向响应、井上扰动灵敏度和空间簇证据聚合。
-
-当前活动研究入口是
-[Truth-First `synthoseis-lite` 基准](synthoseis-lite-benchmark.md)。它定义双套二维
-几何、高分辨率真值、统一正演、第一闸门驱动的频率-振幅探针、防泄漏拆分和冻结报告卡。
-
-以下章节保留完整研究路线；若其中概述与两个闸门文档冲突，以对应闸门文档为准。
-
 ## 下一步实施顺序
+
+### 0. 清理遗留代码（已实现）
+
+转入 ginn-v2 分支后，对第六步及以后的代码做清理：
+
+- 详见下面的"清理实施规格"。
+- 这么做的目的是为了避免历史遗留代码影响 ginn-v2 阶段 Code Agent 的代码生成。
 
 ### 1. 建立 observability 研究闸门（已实现）
 
 把现有“井曲线低通后正演，再与井旁地震比较”的 cutoff 诊断扩展为可观测性分析：
 
-- 计算子波与离散反射系数算子的联合传递响应。精确公式、经验失配底和证据判定见
-  [前向可观测性闸门](forward-observability-gate.md)。
+- 计算子波与离散反射系数算子的联合传递响应。
 - 分析不同频率处的灵敏度、噪声放大和相位不确定性。
 - 在已知真值的合成数据上测量可恢复频带，而不把一次井旁正演相关性直接解释为网络可恢复上限。
-- 将 35 Hz、70 Hz 等数值视为具体数据和子波下的诊断结果，不固化为模型结构边界。
 
 通过该闸门只能确定 `synthoseis-lite` 的建议实验范围；训练目标、损失频带和模型输出
 分辨率还必须由合成基准上的逆问题可恢复性实验决定。
-observability 所需的低通、传递响应和频率诊断工具在重置后按新接口重新实现，
-不从旧三频带模块复制或迁移。
 
-### 2. 建立 truth-first 的 `synthoseis-lite`（当前活动设计）
+### 2. 建立 truth-first 的 `synthoseis-lite`（已实现）
 
 先生成地质与高分辨率阻抗真值，再通过统一正演算子生成地震和学习目标：
 
-- 详细输入、场景、采样、输出和评测契约见
-  [Truth-First `synthoseis-lite` 基准](synthoseis-lite-benchmark.md)。
 - 使用真实目标层位或 RGT 框架约束二维地层几何。
 - 以层为基本对象，生成横向相关的层厚、阻抗、楔状体、尖灭和倾斜层。
 - Semi-Markov 只负责沉积或阻抗状态及其持续长度，不直接生成残差波形。
@@ -72,10 +48,9 @@ observability 所需的低通、传递响应和频率诊断工具在重置后按
 高频残差不得作为独立随机曲线生成。它必须是高分辨率真值与指定基准目标之间的差，
 并与正演关系、采样率和可观测性结论一致。
 
-`.ref/synthoseis/` 只提供地质生成思路。首版不移植其完整工程，也不引入断层、盐体、
-闭合圈、AVO 或 Linux 专用运行假设。
+`.ref/synthoseis/` 只提供地质生成思路。
 
-### 3. 在统一基准上做模型消融（待第二闸门冻结）
+### 3. 在统一基准上做模型消融
 
 至少比较以下基线：
 
@@ -241,86 +216,3 @@ observability 所需的低通、传递响应和频率诊断工具在重置后按
 
   删除 06 至 09、正演增益、确定性反演和整个旧“架构与路线图”导航组。
 - 更新根 `README.md` 和 `docs/index.md`，使稳定流程明确终止于第五步。
-- `AGENTS.md` 虽然被 Git 忽略，但属于清理完成前的阻断项。项目负责人需在清理
-  提交完成后立即将模块树改为“前五步稳定，后续处于研究闸门阶段”，并删除
-  `src.ginn`、`src.ginn_depth`、`src.enhance` 和旧总体架构描述。未更新前不得
-  以新会话继续架构实现。
-
-## 明确保留
-
-- 五个编号主脚本与 `scripts/well_trajectory.py`，合计六个保留脚本。
-- 上述脚本真实依赖的 `src/cup/` 模块。
-- 完整的 `src/wtie/`。
-- `docs/guide/1-well-inventory.md` 至 `docs/guide/5-wavelet-generation.md`。
-- `docs/guide/well-trajectory.md` 和仍适用的通用 troubleshooting。
-- `.ref/`、原始工区数据和前五步运行产物。
-
-## 复位后的项目地图
-
-清理后，项目自研的稳定代码边界应收敛为：
-
-```text
-src/cup/
-  petrel/
-    load.py                 Petrel 井头、分层和 checkshot 读取
-  seismic/
-    geometry.py             工区规则网格与坐标变换
-    horizon.py              单层位读取、清洗和采样
-    survey.py               SEG-Y/ZGY 工区适配
-    trace_sampling.py       直井与斜井沿轨迹采道
-    viz.py                  前五步井震 QC 绘图
-    wavelet.py              子波处理与属性
-    wavelet_consensus.py    全局共识子波搜索
-  utils/
-    coerce.py               配置值转换
-    config.py               配置默认值合并
-    io.py                   路径、YAML、JSON 和文件 I/O
-    masks.py                连续区间与掩码工具
-    statistics.py           前五步统计和空间簇去偏
-  well/
-    assets.py               井资产与名称规范化
-    curves.py               曲线识别
-    gaps.py                 井曲线缺口处理
-    las.py                  LAS 契约与 I/O
-    mnemonics.py            曲线 mnemonic 规则
-    preprocess.py           第三步预处理对象
-    td.py                   时深表读取、转换和输出
-    tie.py                  第四步井震标定领域对象
-    trajectory.py           井轨迹与斜井空间采样
-  time_config.py            仅覆盖前五步与井轨迹旁路的共享配置
-
-src/wtie/                  完整保留的自动井震标定基础库
-```
-
-observability 的接口已由[前向可观测性闸门](forward-observability-gate.md)确定；
-其入口为 `scripts/forward_observability.py`，核心模块为
-`src/cup/seismic/observability.py`。合成基准接口由
-[Truth-First `synthoseis-lite` 基准](synthoseis-lite-benchmark.md)确定，未来入口为
-`scripts/synthoseis_lite.py`，核心包为 `src/cup/synthetic/`。反演模块仍不预先占用包名。
-
-## Ignored/Untracked 人工清理建议
-
-以下路径被 Git 忽略，不由自动清理提交修改。执行前应由项目负责人逐项确认：
-
-- 删除 `scripts/output/` 中旧 `well_constraints_*`、`lfm_precomputed_*`、
-  `dynamic_gain_*`、`ginn_*`、deterministic、depth 和 enhance 产物。
-- 清理 `note/` 中旧 GINN、深度域、enhance、动态增益和残差拆分讨论。
-- 清理 `__pycache__/`、`site/` 和 `tmp/` 等生成内容。
-- 保留 `data/` 中原始数据和前五步事实；只裁剪 `data/survey_report.md`
-  中已经失效的第五步以后结论。
-
-截至 2026-06-15，`experiments/` 和 `tests/` 已由项目负责人移走，清理任务不再搜索、
-删除或重建这两个目录。
-
-## 清理分支验证
-
-清理完成后：
-
-1. 删除前再次执行保留脚本到删除模块的静态导入扫描，要求零命中。
-2. 用项目 Python 对保留的 `scripts/` 和 `src/` 执行静态编译。
-3. 分别运行五个编号主脚本及井轨迹旁路的 `--help`。
-4. 构建 MkDocs，确认不存在失效页面、API 导入或导航链接。
-5. 搜索 `ginn`、`ginn_depth`、`enhance`、`well_constraints`、`lfm_precomputed`、
-   `dynamic_gain` 和 `deterministic_inversion`，只允许本文命中。
-6. `experiments/` 和 `tests/` 当前不存在，不恢复它们；后续测试由项目负责人
-   根据新架构重新放回。

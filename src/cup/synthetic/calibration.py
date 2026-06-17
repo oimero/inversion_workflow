@@ -222,6 +222,36 @@ def _distribution(frame: pd.DataFrame, column: str, weights: np.ndarray) -> dict
     }
 
 
+def _edge_support(objects: pd.DataFrame, left: int, right: int) -> dict[str, Any]:
+    if objects.empty:
+        return {
+            "count": 0,
+            "n_wells": 0,
+            "n_clusters": 0,
+            "source": "parent_prior_only",
+        }
+    edge = objects.merge(
+        objects,
+        on=["well_name", "zone_id"],
+        suffixes=("_a", "_b"),
+    )
+    edge = edge[
+        (edge["object_order_b"] == edge["object_order_a"] + 1)
+        & (edge["state_id_a"] == left)
+        & (edge["state_id_b"] == right)
+    ]
+    count = int(len(edge))
+    wells_count = int(edge["well_name"].nunique())
+    clusters_count = int(edge["spatial_cluster_id_a"].nunique()) if count else 0
+    supported = count >= 2 and wells_count >= 2 and clusters_count >= 2
+    return {
+        "count": count,
+        "n_wells": wells_count,
+        "n_clusters": clusters_count,
+        "source": "zone_supported" if supported else "parent_prior_only",
+    }
+
+
 def _blend(raw: float, parent: float, weight: float) -> float:
     if not np.isfinite(raw):
         return float(parent)
@@ -449,6 +479,20 @@ def calibrate_impedance(
     objects = pd.DataFrame.from_records(object_records)
     if objects.empty:
         raise ValueError("No calibration objects were produced.")
+    parent_transition_support: dict[tuple[int, int], dict[str, Any]] = {}
+    for left in range(3):
+        for right in range(3):
+            if left == right:
+                continue
+            info = _edge_support(objects, left, right)
+            parent_transition_support[(left, right)] = {
+                **info,
+                "source": (
+                    "parent_supported"
+                    if info["source"] == "zone_supported"
+                    else "parent_prior_only"
+                ),
+            }
 
     coefficient_columns = ("c0", "c1", "c2", *PROFILE_METRICS)
     parent_states: dict[str, Any] = {}
@@ -578,32 +622,35 @@ def calibrate_impedance(
             for right in range(3):
                 if left == right:
                     continue
-                edge = zone_objects.merge(
-                    zone_objects,
-                    on=["well_name", "zone_id"],
-                    suffixes=("_a", "_b"),
-                )
-                edge = edge[
-                    (edge["object_order_b"] == edge["object_order_a"] + 1)
-                    & (edge["state_id_a"] == left)
-                    & (edge["state_id_b"] == right)
-                ]
-                count = int(len(edge))
-                wells_count = int(edge["well_name"].nunique())
-                clusters_count = int(edge["spatial_cluster_id_a"].nunique()) if count else 0
+                info = _edge_support(zone_objects, left, right)
+                source = str(info["source"])
+                if {left, right} == {0, 2} and source != "zone_supported":
+                    parent_info = parent_transition_support[(left, right)]
+                    source = (
+                        "parent_prior_only"
+                        if parent_info["source"] == "parent_supported"
+                        else "forbidden"
+                    )
                 support[f"{left}->{right}"] = {
-                    "count": count,
-                    "n_wells": wells_count,
-                    "n_clusters": clusters_count,
-                    "source": (
-                        "zone_supported"
-                        if count >= 2 and wells_count >= 2 and clusters_count >= 2
-                        else "parent_prior_only"
-                    ),
+                    **info,
+                    "source": source,
+                    "parent_count": parent_transition_support[(left, right)]["count"],
+                    "parent_n_wells": parent_transition_support[(left, right)]["n_wells"],
+                    "parent_n_clusters": parent_transition_support[(left, right)]["n_clusters"],
                 }
-        transition = transition + 0.5
+        pseudocount = np.full((3, 3), 0.5, dtype=np.float64)
+        np.fill_diagonal(pseudocount, 0.0)
+        for edge, info in support.items():
+            if info["source"] == "forbidden":
+                left_text, right_text = edge.split("->", maxsplit=1)
+                pseudocount[int(left_text), int(right_text)] = 0.0
+                transition[int(left_text), int(right_text)] = 0.0
+        transition = transition + pseudocount
         np.fill_diagonal(transition, 0.0)
-        transition /= transition.sum(axis=1, keepdims=True)
+        row_sums = transition.sum(axis=1, keepdims=True)
+        if np.any(row_sums <= 0.0):
+            raise ValueError(f"invalid_impedance_calibration:empty_transition_row:{zone_id}")
+        transition /= row_sums
         initial = (initial + 0.5) / float(np.sum(initial + 0.5))
         zone_weight = min(
             1.0,

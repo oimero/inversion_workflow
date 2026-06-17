@@ -1946,6 +1946,12 @@ def _run_canonical_generation(
         "seismic_variant_count": len(seismic_variant_records),
     }
     write_json(output_dir / "run_summary.json", summary)
+    if (not development_limited) and bool(failed_scenarios.any()):
+        failed = catalog.loc[
+            failed_scenarios,
+            ["section_id", "scenario_id", "acceptance_status"],
+        ].to_dict(orient="records")
+        raise RuntimeError(f"field_conditioned_acceptance_qc_failed:{failed}")
     return summary
 
 

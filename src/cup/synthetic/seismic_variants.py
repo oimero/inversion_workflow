@@ -9,6 +9,7 @@ import numpy as np
 from scipy.signal import hilbert
 
 from cup.synthetic.random import ar1_irregular, named_rng
+from cup.synthetic.stats import centered_rms
 
 
 @dataclass(frozen=True)
@@ -40,15 +41,6 @@ def _rng(
     )
 
 
-def _centered_rms(values: np.ndarray, mask: np.ndarray) -> float:
-    valid = np.asarray(mask, dtype=bool) & np.isfinite(values)
-    if not np.any(valid):
-        return float("nan")
-    selected = np.asarray(values, dtype=np.float64)[valid]
-    centered = selected - float(np.mean(selected))
-    return float(np.sqrt(np.mean(centered * centered)))
-
-
 def _normalize_to_rms(values: np.ndarray, mask: np.ndarray, rms: float) -> np.ndarray:
     output = np.asarray(values, dtype=np.float64).copy()
     valid = np.asarray(mask, dtype=bool)
@@ -63,7 +55,7 @@ def _normalize_to_rms(values: np.ndarray, mask: np.ndarray, rms: float) -> np.nd
 
 
 def _target_noise_rms(seismic: np.ndarray, mask: np.ndarray, config: Mapping[str, Any], fraction_key: str) -> float:
-    signal = _centered_rms(seismic, mask)
+    signal = centered_rms(seismic, mask)
     floor = float(config["noise"]["absolute_noise_rms_floor"])
     fraction = float(config["noise"][fraction_key])
     if np.isfinite(signal) and signal > 0.0:
@@ -206,8 +198,8 @@ def _build_result(
         "seismic_variant_status": "ok",
         "seismic_variant_id": variant_id,
         "seismic_mismatch_family": mismatch_family,
-        "seismic_observed_rms": _centered_rms(observed, valid),
-        "seismic_convolved_rms": _centered_rms(seismic_convolved, valid),
+        "seismic_observed_rms": centered_rms(observed, valid),
+        "seismic_convolved_rms": centered_rms(seismic_convolved, valid),
         "additive_noise_rms": float(np.sqrt(np.mean(noise_valid * noise_valid))),
         "positive_gain_min": float(np.min(gain_valid)),
         "positive_gain_max": float(np.max(gain_valid)),

@@ -24,7 +24,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.synthetic.dataset import SynthoseisBenchmark
-from cup.synthetic.io import sha256_file
+from cup.synthetic.hashing import sha256_file
 from cup.synthetic.metrics import aggregate_metric_rows, metric_row, regression_metrics
 from cup.utils.io import repo_relative_path, resolve_relative_path, write_json
 

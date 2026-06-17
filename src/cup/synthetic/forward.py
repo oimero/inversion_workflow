@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 from typing import Any
 
 import numpy as np
 from scipy.signal import resample_poly
 
 from cup.seismic.observability import forward_log_ai
-from cup.synthetic.generation import antialias_taps, downsample_continuous
+from cup.synthetic.dsp import antialias_taps, downsample_continuous
+from cup.synthetic.hashing import array_sha256
 
 
 @dataclass(frozen=True)
@@ -25,11 +25,6 @@ class HighresWavelet:
 class HighresForwardResult:
     seismic_model_grid: np.ndarray
     qc: dict[str, Any]
-
-
-def _array_sha256(values: np.ndarray) -> str:
-    array = np.ascontiguousarray(np.asarray(values))
-    return hashlib.sha256(array.view(np.uint8).tobytes()).hexdigest()
 
 
 def resample_wavelet_to_highres(
@@ -181,8 +176,8 @@ def highres_forward_to_model_grid(
         "highres_wavelet_l2_energy": float(
             np.linalg.norm(highres_wavelet.amplitude)
         ),
-        "highres_wavelet_sha256": _array_sha256(highres_wavelet.amplitude),
-        "highres_forward_filter_sha256": _array_sha256(
+        "highres_wavelet_sha256": array_sha256(highres_wavelet.amplitude),
+        "highres_forward_filter_sha256": array_sha256(
             highres_wavelet.filter_taps
         ),
     }

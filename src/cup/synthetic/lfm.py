@@ -9,6 +9,7 @@ import numpy as np
 from scipy.signal import firwin
 
 from cup.synthetic.random import ar1_irregular, named_rng
+from cup.synthetic.stats import centered_rms
 
 
 @dataclass(frozen=True)
@@ -38,15 +39,6 @@ def _rng(
         coefficient_name=coefficient_name,
         variant_id=variant_id,
     )
-
-
-def _centered_rms(values: np.ndarray, mask: np.ndarray) -> float:
-    finite = np.asarray(mask, dtype=bool) & np.isfinite(values)
-    if not np.any(finite):
-        return float("nan")
-    selected = np.asarray(values, dtype=np.float64)[finite]
-    centered = selected - float(np.mean(selected))
-    return float(np.sqrt(np.mean(centered * centered)))
 
 
 def _fill_trace(trace: np.ndarray, valid: np.ndarray) -> np.ndarray:
@@ -203,7 +195,7 @@ def derive_lfm_priors(
         target.shape,
     )
     _add_valid(degraded, trend_bias, valid)
-    components["linear_twt_trend_bias_rms"] = _centered_rms(trend_bias, valid)
+    components["linear_twt_trend_bias_rms"] = centered_rms(trend_bias, valid)
 
     zone_sigma = float(degraded_config.get("zonewise_bias_sigma_log_ai", 0.03))
     zone_bias = np.zeros_like(target)
@@ -219,7 +211,7 @@ def derive_lfm_priors(
         )
         zone_bias[zone_model == zone_value] = zone_sigma * float(zone_rng.normal())
     _add_valid(degraded, zone_bias, valid)
-    components["zonewise_bias_rms"] = _centered_rms(zone_bias, valid)
+    components["zonewise_bias_rms"] = centered_rms(zone_bias, valid)
 
     lateral_sigma = float(degraded_config.get("lateral_smooth_bias_sigma_log_ai", 0.02))
     lateral = np.asarray(section.lateral_m, dtype=np.float64)
@@ -250,7 +242,7 @@ def derive_lfm_priors(
         field_qc = {}
         lateral_bias = np.zeros_like(target)
     _add_valid(degraded, lateral_bias, valid)
-    components["lateral_smooth_bias_rms"] = _centered_rms(lateral_bias, valid)
+    components["lateral_smooth_bias_rms"] = centered_rms(lateral_bias, valid)
 
     scale_sigma = float(degraded_config.get("amplitude_scale_sigma", 0.05))
     scale_rng = _rng(
@@ -312,7 +304,7 @@ def derive_lfm_priors(
         missing_bias = amplitude * lateral_window[:, None] * twt_window[None, :]
         _add_valid(degraded, missing_bias, valid)
         components["local_missing_control_bias_peak"] = amplitude
-        components["local_missing_control_bias_rms"] = _centered_rms(missing_bias, valid)
+        components["local_missing_control_bias_rms"] = centered_rms(missing_bias, valid)
 
     degraded[~valid] = np.nan
     ideal[~valid] = np.nan
@@ -335,11 +327,11 @@ def derive_lfm_priors(
             field_qc.get("empirical_correlation_length_m", float("nan"))
         ),
         "lfm_valid_sample_count": int(np.count_nonzero(valid)),
-        "lfm_ideal_rms": _centered_rms(ideal, valid),
-        "lfm_controlled_degraded_rms": _centered_rms(degraded, valid),
-        "lfm_degradation_rms": _centered_rms(degradation, valid),
-        "residual_vs_lfm_ideal_rms": _centered_rms(residual_ideal, valid),
-        "residual_vs_lfm_controlled_degraded_rms": _centered_rms(
+        "lfm_ideal_rms": centered_rms(ideal, valid),
+        "lfm_controlled_degraded_rms": centered_rms(degraded, valid),
+        "lfm_degradation_rms": centered_rms(degradation, valid),
+        "residual_vs_lfm_ideal_rms": centered_rms(residual_ideal, valid),
+        "residual_vs_lfm_controlled_degraded_rms": centered_rms(
             residual_degraded,
             valid,
         ),

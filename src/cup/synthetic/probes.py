@@ -10,7 +10,9 @@ import pandas as pd
 from scipy.signal.windows import tukey
 
 from cup.seismic.observability import forward_log_ai
-from cup.synthetic.generation import GeneratedSection, downsample_continuous
+from cup.synthetic.dsp import downsample_continuous
+from cup.synthetic.generation import GeneratedSection
+from cup.synthetic.stats import centered_rms
 
 
 @dataclass(frozen=True)
@@ -350,14 +352,6 @@ def probe_variants(
     return variants
 
 
-def _centered_rms(values: np.ndarray, mask: np.ndarray) -> float:
-    selected = np.asarray(values, dtype=np.float64)[np.asarray(mask, dtype=bool)]
-    if selected.size < 2:
-        return float("nan")
-    selected = selected - float(np.mean(selected))
-    return float(np.sqrt(np.mean(selected * selected)))
-
-
 def _probe_support(section: GeneratedSection) -> np.ndarray:
     if str(section.qc.get("suite", "")) == "canonical":
         return (section.rgt_highres >= 0.0) & (section.rgt_highres <= 1.0)
@@ -439,7 +433,7 @@ def generate_probe(
         else 0.0
     )
     if requested > 0.0:
-        raw_rms = _centered_rms(raw, active)
+        raw_rms = centered_rms(raw, active, min_count=2)
         if not np.isfinite(raw_rms) or raw_rms <= 0.0:
             raise ValueError("invalid_probe_basis_energy")
         probe_highres = raw * (requested / raw_rms)
@@ -463,8 +457,8 @@ def generate_probe(
         axis=0,
     )
     model_mask = section.valid_mask_model & np.isfinite(target_model)
-    model_probe_rms = _centered_rms(probe_model, model_mask)
-    total_rms = _centered_rms(target_model, model_mask)
+    model_probe_rms = centered_rms(probe_model, model_mask, min_count=2)
+    total_rms = centered_rms(target_model, model_mask, min_count=2)
     rms_fraction = (
         model_probe_rms / total_rms
         if np.isfinite(total_rms) and total_rms > 0.0
@@ -496,7 +490,7 @@ def generate_probe(
             frequency.conservative_to_nominal_ratio
         ),
         "probe_rms_requested_highres": float(requested),
-        "probe_rms_actual_highres": _centered_rms(probe_highres, active),
+        "probe_rms_actual_highres": centered_rms(probe_highres, active, min_count=2),
         "probe_rms_after_antialias": model_probe_rms,
         "probe_rms_actual_model_grid": model_probe_rms,
         "probe_rms_fraction_of_total_model_grid": rms_fraction,

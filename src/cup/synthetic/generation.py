@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-from scipy.signal import firwin, resample_poly
 
 from cup.seismic.observability import acoustic_reflectivity_from_log_ai, forward_log_ai
 from cup.synthetic.calibration import (
@@ -15,6 +14,8 @@ from cup.synthetic.calibration import (
     STATE_NAMES,
     object_profile_metrics,
 )
+from cup.synthetic.dsp import antialias_taps, downsample_continuous
+from cup.synthetic.grids import categorical_model_grids
 from cup.synthetic.random import ar1_irregular, named_rng
 
 
@@ -82,30 +83,6 @@ class GenerationRejected(ValueError):
         self.reasons = unique_reasons
         self.diagnostics = dict(diagnostics)
         self.details = [dict(item) for item in details]
-
-
-def antialias_taps(
-    factor: int,
-    *,
-    taps_per_factor: int = 32,
-    cutoff_output_nyquist_fraction: float = 0.9,
-    kaiser_beta: float = 8.6,
-) -> np.ndarray:
-    if factor < 1:
-        raise ValueError("factor must be positive.")
-    return firwin(
-        taps_per_factor * factor + 1,
-        cutoff_output_nyquist_fraction / factor,
-        window=("kaiser", kaiser_beta),
-        scale=True,
-    ).astype(np.float64)
-
-
-def downsample_continuous(values: np.ndarray, factor: int, taps: np.ndarray) -> np.ndarray:
-    return np.asarray(
-        resample_poly(values, up=1, down=factor, axis=-1, window=taps, padtype="line"),
-        dtype=np.float64,
-    )
 
 
 def _rng_keys(
@@ -583,42 +560,6 @@ def _enforce_minimum_thickness(
         if exempt_index is not None:
             output[exempt_index, lateral_index] = exempt_weight
     return output
-
-
-def _categorical_model_grids(
-    state_highres: np.ndarray,
-    object_highres: np.ndarray,
-    zone_highres: np.ndarray,
-    boundary_highres: np.ndarray,
-    factor: int,
-    n_model: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    n_lateral, n_highres = state_highres.shape
-    fractions = np.zeros((n_lateral, n_model, 3), dtype=np.float32)
-    dominant = np.full((n_lateral, n_model), -1, dtype=np.int32)
-    zone_model = np.full((n_lateral, n_model), -1, dtype=np.int16)
-    boundary_fraction = np.zeros((n_lateral, n_model), dtype=np.float32)
-    valid = np.zeros((n_lateral, n_model), dtype=bool)
-    for model_index in range(n_model):
-        center = model_index * factor
-        start = max(0, center - factor // 2)
-        end = min(n_highres, center + factor // 2 + 1)
-        for lateral_index in range(n_lateral):
-            states = state_highres[lateral_index, start:end]
-            objects = object_highres[lateral_index, start:end]
-            zones = zone_highres[lateral_index, start:end]
-            finite = states >= 0
-            if not np.any(finite):
-                continue
-            valid[lateral_index, model_index] = True
-            for state in range(3):
-                fractions[lateral_index, model_index, state] = np.mean(states[finite] == state)
-            object_values, object_counts = np.unique(objects[finite], return_counts=True)
-            dominant[lateral_index, model_index] = int(object_values[np.argmax(object_counts)])
-            zone_values, zone_counts = np.unique(zones[finite], return_counts=True)
-            zone_model[lateral_index, model_index] = int(zone_values[np.argmax(zone_counts)])
-            boundary_fraction[lateral_index, model_index] = float(np.mean(boundary_highres[lateral_index, start:end]))
-    return fractions, dominant, zone_model, boundary_fraction, valid
 
 
 def generate_field_section(
@@ -1113,7 +1054,7 @@ def generate_field_section(
     seismic = np.stack(
         [forward_log_ai(trace, wavelet_values) for trace in model_log_ai], axis=0
     )
-    state_fraction, dominant, zone_model, boundary_fraction, valid_model = _categorical_model_grids(
+    state_fraction, dominant, zone_model, boundary_fraction, valid_model = categorical_model_grids(
         state_id, object_id, zone_id_grid, boundary, factor, twt_model.size
     )
     forward_valid_highres = np.isfinite(log_ai[:, :-1]) & np.isfinite(log_ai[:, 1:])

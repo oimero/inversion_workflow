@@ -2,26 +2,17 @@
 
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
 from typing import Any
 
 import h5py
 import numpy as np
 
 from cup.synthetic.generation import GeneratedSection
+from cup.synthetic.hashing import array_sha256, sha256_file
 from cup.synthetic.forward import HighresForwardResult
 from cup.synthetic.lfm import LfmResult
 from cup.synthetic.probes import ProbeFrequency, ProbeResult
 from cup.synthetic.seismic_variants import SeismicVariantResult
-
-
-def sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _dataset(
@@ -36,9 +27,7 @@ def _dataset(
 ) -> h5py.Dataset:
     array = np.asarray(values)
     dataset = group.create_dataset(name, data=array, compression="gzip", shuffle=True)
-    dataset.attrs["sha256"] = hashlib.sha256(
-        np.ascontiguousarray(array).view(np.uint8).tobytes()
-    ).hexdigest()
+    dataset.attrs["sha256"] = array_sha256(array)
     dataset.attrs["unit"] = unit
     dataset.attrs["domain"] = domain
     dataset.attrs["axis_order"] = np.asarray(axis_order, dtype=h5py.string_dtype("utf-8"))

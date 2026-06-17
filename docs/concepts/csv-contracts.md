@@ -246,3 +246,138 @@ nominal-only 进入空间聚合。
 - `wavelet_scenario_qc.csv`：第五步汇总与第四步 inventory 的候选联接结果。
 - `recommended_experiment_ranges.json`：仅用于 `synthoseis-lite` 的实验区间。
 - `run_summary.json`：完整来源、参数、拒绝统计、warning 和建议区间。
+
+## Research Gate · synthoseis_lite.py (calibrate)
+
+校准阶段冻结一份可从井数据复现的阻抗统计模型。所有输出使用 schema
+`synthoseis_lite_impedance_calibration_v1`。
+
+### `impedance_calibration.json`
+
+消费者：`synthoseis_lite.py generate`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `schema_version` | 固定 `synthoseis_lite_impedance_calibration_v1` |
+| `generator_family` | 固定 `object_coefficients_v1` |
+| `truth_dt_s` | 高分辨率真值网格的时间采样间隔 |
+| `state_threshold_sigma` | 三态划分的 log(AI) 残差 σ 倍数 |
+| `ordered_horizons` | 从浅到深的层位名列表 |
+| `zones` | 每个区域的顶层位、底层位和区域级统计 |
+| `parent` | 父先验：每种态的参数均值、协方差和权重 |
+| `zone_models` | 每个区域的三态高斯模型参数 |
+| `source_runs` | 校准所用的第三、四、五步来源目录 |
+| `source_hashes` | 各来源文件的 SHA-256，锁定输入版本 |
+
+### `zone_models.csv`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `zone_id` | 区域标识 |
+| `state` | `low_impedance` / `background` / `high_impedance` |
+| `mean` / `std` | 该态 log(AI) 残差的均值与标准差 |
+| `n_samples` | 该态有效样本数 |
+| `weight` | 层级化证据权重 |
+
+### `object_catalog.csv`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `well_name` | 来源井 |
+| `zone_id` | 所在区域 |
+| `state` | 对象阻抗态 |
+| `c0` / `c1` / `c2` | 轮廓拟合系数（均值、线性趋势、曲率） |
+| `duration_s` / `thickness_m` | 对象持续时间和厚度 |
+| `profile_mean` / `endpoint_difference` / `peak_to_peak` | 轮廓诊断指标 |
+
+### `transfer_matrix.csv`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `from_state` / `to_state` | 转移方向 |
+| `probability` | 层级化估计的转移概率 |
+| `support` | `direct` / `mixed` / `forbidden` |
+
+## Research Gate · synthoseis_lite.py (generate)
+
+生成阶段冻结一个可复现的二维声阻抗合成基准。master schema 为 `synthoseis_lite_v1`。
+
+### `synthetic_benchmark.h5`
+
+消费者：`evaluate_synthoseis_lite.py` 及所有模型训练/推理
+
+HDF5 文件，每个 sample 为一个 group，包含 `model_target_log_ai`、
+`seismic_input`、`valid_mask` 及 priors。所有数组带有 `sha256`、`unit`、
+`domain` 和 `axis_order` 属性。
+
+### `sample_index.csv`
+
+消费者：`evaluate_synthoseis_lite.py`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `sample_id` | 样本唯一标识 |
+| `sample_kind` | `base` / `frequency_probe` / `seismic_variant` / `frequency_probe_seismic_variant` |
+| `suite` | `canonical` / `field_conditioned` |
+| `section_id` | 所属剖面 |
+| `geometry_family` | `none` / `wedge` / `pinchout` 等 |
+| `status` | `ok` / `rejected` |
+| `hdf5_group` | HDF5 内 group 路径 |
+
+### `benchmark_manifest.json`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `schema_version` | 固定 `synthoseis_lite_v1` |
+| `global_seed` | 全局随机种子 |
+| `config_summary` | 关键的生成配置参数快照 |
+| `file_hashes` | 所有输出文件的 SHA-256 |
+| `accepted_realizations` / `rejected_realizations` | 接受/拒绝计数 |
+
+### 其他生成输出
+
+- `frequency_probe_results.csv`：每个探针变体的频率、振幅、相位、横向形状和 RMS。
+- `probe_frequency_catalog.csv`：探针频率的选择理由和噪声等效参考。
+- `seismic_variant_results.csv`：每个地震变体（噪声、增益、相移等）的参数。
+- `scenario_catalog.csv`：所有场景的定义和场条件接受状态。
+- `generation_qc.csv`：每次生成尝试的 QC 指标和拒绝原因。
+- `section_geometry_qc.csv`：场条件截面的横向层位支撑状态。
+
+## Research Gate · evaluate_synthoseis_lite.py
+
+评估阶段产出模型无关的基线报告卡。schema 为 `synthoseis_lite_report_v1`。
+
+### `model_sample_metrics.csv`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `sample_id` | 样本标识 |
+| `baseline_id` | `lfm_ideal` / `lfm_controlled_degraded` / `oracle_target` |
+| `bias` / `mae` / `rmse` / `nrmse` / `corr` | 预测 vs 真值的回归指标 |
+| `target_rms` / `prediction_rms` | 真值和预测的 RMS |
+| `status` | `ok` / `failed` |
+
+### `model_probe_metrics.csv`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `sample_id` | 探针样本标识 |
+| `baseline_id` | 基线标识 |
+| `probe_frequency_hz` / `probe_phase` / `probe_amplitude_multiplier` | 探针参数 |
+| `paired_zero_sample_id` | 配对的零振幅探针 |
+| `probe_metric_semantics` | `absolute_zero_or_unpaired_probe_error` / `paired_probe_increment_error` |
+| `bias` / `mae` / `rmse` / `nrmse` / `corr` | 绝对或增量误差指标 |
+
+### `model_geometry_metrics.csv`
+
+按 `(baseline_id, suite, geometry_family)` 聚合 base 样本的
+`n_samples` / `mean_rmse` / `mean_nrmse` / `median_corr`。
+
+### `model_report_card.json`
+
+包含 `baseline_aggregate` 和 `probe_aggregate` 两个聚合段，以及各基线语义说明。
+`oracle_target` 的 RMSE 应为 0（pipeline 自检）。
+
+### `evaluation_summary.json`
+
+包含 benchmark 文件 SHA-256、输出文件列表及各文件 SHA-256，确保评估可复现。

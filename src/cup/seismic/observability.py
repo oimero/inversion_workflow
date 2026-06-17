@@ -1,7 +1,7 @@
 """Forward-observability analysis for time-domain acoustic impedance.
 
 The module contains the numerical core for the research gate described in
-``docs/concepts/forward-observability-gate.md``.  It deliberately has no run
+``docs/spec/forward-observability-gate.md``.  It deliberately has no run
 directory discovery or project-data I/O.
 """
 

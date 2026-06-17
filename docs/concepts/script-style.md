@@ -51,6 +51,11 @@
 | 子波处理 | `cup.seismic.wavelet` | 加载、裁剪、归一化和频谱属性函数 |
 | 共识子波搜索 | `cup.seismic.wavelet_consensus` | `build_wavelet_pca_basis` / `optimize_consensus_wavelet` |
 | 前向可观测性 | `cup.seismic.observability` | 离散算子、扰动灵敏度、场景与空间簇证据聚合 |
+| 合成基准校准 | `cup.synthetic.calibration` | 背景拟合、三态识别、对象轮廓拟合、层级化收缩 |
+| 合成基准生成 | `cup.synthetic.generation` | 随机地质真值、几何事件、探针矩阵、地震变体 |
+| 合成基准评估 | `cup.synthetic.metrics` / `cup.synthetic.dataset` | 回归指标、基准消费接口 |
+| 合成基准工具 | `cup.synthetic.forward` / `cup.synthetic.lfm` / `cup.synthetic.probes` | 抗混叠正演、LFM 推导、频率探针构建 |
+| 合成基准配置 | `cup.synthetic.config` | `parse_synthoseis_config` / `resolve_sources` |
 | 井资产 | `cup.well.assets` | `normalize_well_name` / `build_file_lookup` |
 | LAS I/O | `cup.well.las` | 标准 LAS 加载、扫描和导出函数 |
 | 曲线识别 | `cup.well.curves` / `cup.well.mnemonics` | 分类、primary 选择和 mnemonic 规则 |
@@ -68,5 +73,6 @@
 - [核心 CSV 契约](csv-contracts.md)
 - [数据与单位约定](data-and-coordinate-conventions.md)
 
-当前正式契约覆盖步骤 01 至 05、井轨迹旁路和无编号的
-`forward_observability.py` 研究入口。
+当前正式契约覆盖步骤 01 至 05、井轨迹旁路、`forward_observability.py`
+研究闸门，以及 `synthoseis_lite.py` calibrate/generate 与
+`evaluate_synthoseis_lite.py` 研究闸门。

@@ -31,6 +31,9 @@ from ginn_v2.training import predict_patches, report_predictions, train_model
 
 MODEL_IDS = (
     "trace_1d",
+    "trace_1d_dilated_tcn",
+    "trace_1d_dilated_tcn_mismatch_training",
+    "trace_1d_mismatch_training",
     "patch_2d_supervised",
     "patch_2d_with_physics_loss",
     "patch_2d_mismatch_training",
@@ -153,8 +156,14 @@ def _write_train_manifest(
         "loss": {
             "lambda_ai": 1.0,
             "lambda_physics": float(args.lambda_physics),
-            "physics_loss_applied_sample_kinds": [],
-            "physics_forward_operator_id": "",
+            "physics_loss_applied_sample_kinds": (
+                ["base"] if float(args.lambda_physics) > 0.0 else []
+            ),
+            "physics_forward_operator_id": (
+                "nominal_selected_wavelet_forward_log_ai_interior_patch"
+                if float(args.lambda_physics) > 0.0
+                else ""
+            ),
             "wavelet_scenario_id": "",
             "gain_scenario_id": "",
         },
@@ -253,8 +262,20 @@ def run_predict(args: argparse.Namespace) -> None:
     benchmark = SynthoseisBenchmark(benchmark_dir)
     if args.index_source == "train":
         patch_index = pd.read_csv(resolve_relative_path(manifest["patch_index"], root=REPO_ROOT))
+        if args.sample_kind:
+            sample_kinds = set(args.sample_kind)
+            patch_index = patch_index[
+                patch_index["sample_kind"].astype(str).isin(sample_kinds)
+            ].copy()
+            if patch_index.empty:
+                raise ValueError(
+                    f"No train-index patches match requested sample kinds: {sorted(sample_kinds)}"
+                )
         patch_index_source = repo_relative_path(resolve_relative_path(manifest["patch_index"], root=REPO_ROOT), root=REPO_ROOT)
-        patch_index_sha256 = manifest.get("patch_index_sha256", "")
+        eval_index_path = output_dir / "eval_patch_index.csv"
+        patch_index.to_csv(eval_index_path, index=False)
+        patch_index_source = repo_relative_path(eval_index_path, root=REPO_ROOT)
+        patch_index_sha256 = sha256_file(eval_index_path)
     else:
         sample_kinds = set(args.sample_kind) if args.sample_kind else default_eval_kinds()
         spec_cfg = dict(manifest["patch_spec"])
@@ -350,6 +371,8 @@ def run_summarize(args: argparse.Namespace) -> None:
             card = json.load(handle)
         aggregate = dict(card.get("aggregate") or {})
         lfm_aggregate = dict(card.get("lfm_aggregate") or {})
+        lfm_ideal_aggregate = dict(card.get("lfm_ideal_aggregate") or {})
+        oracle_aggregate = dict(card.get("oracle_aggregate") or {})
         probe_aggregate = dict(card.get("probe_aggregate") or {})
         amplitude_phase_aggregate = dict(card.get("probe_amplitude_phase_aggregate") or {})
         zero_x_aggregate = dict(card.get("zero_x_false_prediction_aggregate") or {})
@@ -358,6 +381,9 @@ def run_summarize(args: argparse.Namespace) -> None:
         )
         zero_x_energy_aggregate = dict(card.get("zero_x_false_energy_aggregate") or {})
         unsupported_energy_aggregate = dict(card.get("unsupported_false_energy_aggregate") or {})
+        geometry_aggregate = dict(card.get("geometry_aggregate") or {})
+        realization_uniform_aggregate = dict(card.get("realization_uniform_aggregate") or {})
+        realization_center_aggregate = dict(card.get("realization_center_crop_aggregate") or {})
         rows.append(
             {
                 "model": model,
@@ -369,6 +395,12 @@ def run_summarize(args: argparse.Namespace) -> None:
                 "lfm_rmse": lfm_aggregate.get("mean_rmse"),
                 "lfm_nrmse": lfm_aggregate.get("mean_nrmse"),
                 "lfm_corr": lfm_aggregate.get("median_corr"),
+                "lfm_ideal_rmse": lfm_ideal_aggregate.get("mean_rmse"),
+                "lfm_ideal_nrmse": lfm_ideal_aggregate.get("mean_nrmse"),
+                "lfm_ideal_corr": lfm_ideal_aggregate.get("median_corr"),
+                "oracle_rmse": oracle_aggregate.get("mean_rmse"),
+                "oracle_nrmse": oracle_aggregate.get("mean_nrmse"),
+                "oracle_corr": oracle_aggregate.get("median_corr"),
                 "rmse_improvement_pct_vs_lfm": card.get("rmse_improvement_pct_vs_lfm"),
                 "probe_n_ok": probe_aggregate.get("n_ok"),
                 "probe_nrmse": probe_aggregate.get("mean_nrmse"),
@@ -393,6 +425,16 @@ def run_summarize(args: argparse.Namespace) -> None:
                 "unsupported_false_frequency_rms": unsupported_energy_aggregate.get(
                     "mean_false_frequency_rms"
                 ),
+                "geometry_n_ok": geometry_aggregate.get("n_ok"),
+                "geometry_boundary_rmse": geometry_aggregate.get("mean_boundary_rmse"),
+                "geometry_event_rmse": geometry_aggregate.get("mean_event_rmse"),
+                "geometry_lateral_gradient_rmse": geometry_aggregate.get(
+                    "mean_lateral_gradient_rmse"
+                ),
+                "realization_uniform_n_ok": realization_uniform_aggregate.get("n_ok"),
+                "realization_uniform_rmse": realization_uniform_aggregate.get("mean_rmse"),
+                "realization_center_crop_n_ok": realization_center_aggregate.get("n_ok"),
+                "realization_center_crop_rmse": realization_center_aggregate.get("mean_rmse"),
                 "report_dir": repo_relative_path(report_path, root=REPO_ROOT),
                 "report_card_sha256": sha256_file(card_path),
             }
@@ -447,10 +489,39 @@ def _build_ablation_report_card(summary: pd.DataFrame, frequency_path: Path) -> 
         "base_fullband": bool((summary["scope"].astype(str) == "test_base").any()),
         "validation_base": bool((summary["scope"].astype(str) == "validation_base").any()),
         "probe_paired_increment": bool(summary["probe_n_ok"].fillna(0).astype(float).gt(0).any()),
+        "probe_mismatch_paired_increment": bool(
+            summary[summary["scope"].astype(str).eq("benchmark_probe_mismatch")]
+            .get("probe_n_ok", pd.Series(dtype=float))
+            .fillna(0)
+            .astype(float)
+            .gt(0)
+            .any()
+        ),
+        "lfm_ideal_baseline": bool(
+            summary.get("lfm_ideal_rmse", pd.Series(dtype=float))
+            .fillna(float("nan"))
+            .notna()
+            .any()
+        ),
+        "oracle_target_self_check": bool(
+            summary.get("oracle_rmse", pd.Series(dtype=float))
+            .fillna(float("nan"))
+            .astype(float)
+            .le(1e-8)
+            .any()
+        ),
         "mismatch_degradation": bool((summary["scope"].astype(str) == "validation_mismatch").any()),
         "trace_1d": bool(summary["model"].astype(str).str.contains("trace1d").any()),
         "patch_2d_supervised": bool(summary["model"].astype(str).str.contains("patch2d").any()),
-        "patch_2d_mismatch_training": bool(summary["model"].astype(str).str.contains("mismatch").any()),
+        "patch_2d_mismatch_training": bool(
+            summary["model"].astype(str).str.contains(r"patch2d.*mismatch|patch_2d_mismatch").any()
+        ),
+        "trace_1d_mismatch_training": bool(
+            summary["model"].astype(str).str.contains("trace1d_mismatch").any()
+        ),
+        "trace_1d_dilated_tcn_mismatch_training": bool(
+            summary["model"].astype(str).str.contains("trace1d_tcn_mismatch").any()
+        ),
         "zero_x_false_prediction_error": bool(
             summary.get("zero_x_false_prediction_n_ok", pd.Series(dtype=float))
             .fillna(0)
@@ -465,8 +536,15 @@ def _build_ablation_report_card(summary: pd.DataFrame, frequency_path: Path) -> 
             .gt(0)
             .any()
         ),
-        "physics_loss": False,
+        "physics_loss": bool(summary["model"].astype(str).str.contains("phys", case=False).any()),
         "geometry_metrics": False,
+        "patch_geometry_metrics": bool(
+            summary.get("geometry_n_ok", pd.Series(dtype=float))
+            .fillna(0)
+            .astype(float)
+            .gt(0)
+            .any()
+        ),
         "band_amplitude_phase_metrics": bool(
             summary.get("probe_amplitude_phase_n_ok", pd.Series(dtype=float))
             .fillna(0)
@@ -488,14 +566,31 @@ def _build_ablation_report_card(summary: pd.DataFrame, frequency_path: Path) -> 
             .gt(0)
             .any()
         ),
-        "realization_level_stitching": False,
+        "realization_level_stitching": bool(
+            summary.get("realization_uniform_n_ok", pd.Series(dtype=float))
+            .fillna(0)
+            .astype(float)
+            .gt(0)
+            .any()
+            and summary.get("realization_center_crop_n_ok", pd.Series(dtype=float))
+            .fillna(0)
+            .astype(float)
+            .gt(0)
+            .any()
+        ),
     }
+    coverage["geometry_metrics"] = bool(coverage["patch_geometry_metrics"])
     test_base = summary[summary["scope"].astype(str).eq("test_base")].copy()
     benchmark_probe = summary[summary["scope"].astype(str).eq("benchmark_probe")].copy()
     mismatch = summary[summary["scope"].astype(str).eq("validation_mismatch")].copy()
     best = {
         "test_base_by_rmse": _best_row(test_base, metric="model_rmse", ascending=True),
         "probe_by_nrmse": _best_row(benchmark_probe, metric="probe_nrmse", ascending=True),
+        "probe_mismatch_by_nrmse": _best_row(
+            summary[summary["scope"].astype(str).eq("benchmark_probe_mismatch")].copy(),
+            metric="probe_nrmse",
+            ascending=True,
+        ),
         "mismatch_by_rmse": _best_row(mismatch, metric="model_rmse", ascending=True),
     }
     stability = _seed_stability(summary)
@@ -507,12 +602,35 @@ def _build_ablation_report_card(summary: pd.DataFrame, frequency_path: Path) -> 
         and stability.get("trace1d_test_model_rmse_std") is not None
     ):
         status = "baseline_evidence_ready"
-    missing = [key for key, value in coverage.items() if not value]
+    required_for_full_gate = [
+        "base_fullband",
+        "validation_base",
+        "probe_paired_increment",
+        "probe_mismatch_paired_increment",
+        "mismatch_degradation",
+        "lfm_ideal_baseline",
+        "oracle_target_self_check",
+        "trace_1d",
+        "patch_2d_supervised",
+        "patch_2d_mismatch_training",
+        "trace_1d_mismatch_training",
+        "trace_1d_dilated_tcn_mismatch_training",
+        "physics_loss",
+        "geometry_metrics",
+        "patch_geometry_metrics",
+        "band_amplitude_phase_metrics",
+        "zero_x_false_energy",
+        "unsupported_false_energy",
+        "realization_level_stitching",
+    ]
+    missing = [key for key in required_for_full_gate if not coverage.get(key)]
     conclusion = _ablation_conclusion(best, stability)
     return {
         "schema_version": "ginn_v2_ablation_report_card_v1",
         "status": status,
         "coverage": coverage,
+        "required_for_full_gate": required_for_full_gate,
+        "metric_notes": _ablation_metric_notes(),
         "missing_for_full_gate": missing,
         "best": best,
         "stability": stability,
@@ -568,6 +686,12 @@ def _ablation_conclusion(best: dict[str, object], stability: dict[str, object]) 
             f"Best paired-probe NRMSE is {probe_best.get('model')} "
             f"({float(probe_best.get('probe_nrmse')):.6g})."
         )
+    probe_mismatch_best = best.get("probe_mismatch_by_nrmse") or {}
+    if probe_mismatch_best:
+        statements.append(
+            f"Best paired-probe+mismatch NRMSE is {probe_mismatch_best.get('model')} "
+            f"({float(probe_mismatch_best.get('probe_nrmse')):.6g})."
+        )
     if mismatch_best:
         statements.append(
             f"Best validation-mismatch RMSE is {mismatch_best.get('model')} "
@@ -588,6 +712,46 @@ def _ablation_conclusion(best: dict[str, object], stability: dict[str, object]) 
     }
 
 
+def _ablation_metric_notes() -> list[dict[str, str]]:
+    return [
+        {
+            "metric": "zero_x_false_prediction_error",
+            "role": "sanity_check",
+            "note": (
+                "Absolute prediction error on 0x frequency-probe samples. Because 0x samples "
+                "share the same no-increment target across probe frequencies, this metric is "
+                "not frequency selective and is not used as the primary unsupported-frequency "
+                "false-energy gate."
+            ),
+        },
+        {
+            "metric": "unsupported_zero_x_false_prediction_error",
+            "role": "sanity_check",
+            "note": (
+                "The unsupported subset verifies probe-frequency catalog filtering, but its "
+                "absolute RMSE can match all 0x RMSE when the same 0x target is repeated across "
+                "frequency labels. Use unsupported_false_energy for frequency-selective evidence."
+            ),
+        },
+        {
+            "metric": "zero_x_false_energy",
+            "role": "gate_metric",
+            "note": (
+                "Weighted sin/cos projection of the 0x residual at the labeled probe frequency. "
+                "This is the primary false-frequency-energy diagnostic."
+            ),
+        },
+        {
+            "metric": "unsupported_false_energy",
+            "role": "gate_metric",
+            "note": (
+                "Frequency-projection false energy restricted to operator-unsupported 0x probes. "
+                "This is the primary unsupported-frequency false-energy diagnostic."
+            ),
+        },
+    ]
+
+
 def _format_ablation_markdown(report_card: Mapping[str, object]) -> str:
     lines = [
         "# GINN-v2 Model Ablation Report",
@@ -604,6 +768,9 @@ def _format_ablation_markdown(report_card: Mapping[str, object]) -> str:
     for key, value in coverage.items():
         mark = "yes" if value else "no"
         lines.append(f"- {key}: {mark}")
+    lines.extend(["", "## Metric Notes"])
+    for note in report_card.get("metric_notes") or []:
+        lines.append(f"- {note.get('metric')}: `{note.get('role')}` - {note.get('note')}")
     missing = report_card.get("missing_for_full_gate") or []
     lines.extend(["", "## Missing For Full Gate"])
     for item in missing:

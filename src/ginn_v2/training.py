@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
+import h5py
 import numpy as np
 import pandas as pd
 import torch
@@ -13,8 +15,11 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from cup.synthetic.dataset import SynthoseisBenchmark
 from cup.synthetic.metrics import regression_metrics
 from cup.utils.io import sha256_file, write_json
-from ginn_v2.data import PatchDataset, default_train_kinds, denormalize_delta
+from ginn_v2.data import PatchDataset, _aligned_arrays, default_train_kinds, denormalize_delta
 from ginn_v2.models import build_model
+
+
+PROBE_SAMPLE_KINDS = {"frequency_probe", "frequency_probe_seismic_variant"}
 
 
 def masked_mse(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -42,16 +47,12 @@ def train_model(
     seed: int,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    if model_id == "patch_2d_with_physics_loss":
-        raise NotImplementedError(
-            "patch_2d_with_physics_loss is reserved for a future physics-loss ablation. "
-            "It is not allowed to run as a supervised-only alias."
-        )
     if lambda_physics != 0.0:
-        raise NotImplementedError(
-            "Non-zero physics loss is intentionally not implemented yet. "
-            "Use lambda_physics=0 for supervised and mismatch-training ablations."
-        )
+        if model_id != "patch_2d_with_physics_loss":
+            raise NotImplementedError(
+                "Non-zero physics loss is currently only implemented for "
+                "patch_2d_with_physics_loss."
+            )
     allowed_kinds = default_train_kinds(model_id)
     unexpected = sorted(set(patch_index["sample_kind"].astype(str)) - allowed_kinds)
     if unexpected:
@@ -94,6 +95,11 @@ def train_model(
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
     model, info = build_model(model_id, hidden_channels=hidden_channels, depth=depth)
     model.to(device)
+    wavelet = (
+        _load_nominal_wavelet(benchmark.run_dir).to(device)
+        if float(lambda_physics) > 0.0
+        else None
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(learning_rate))
     history: list[dict[str, Any]] = []
     best_val = float("inf")
@@ -107,7 +113,24 @@ def train_model(
             mask = batch["valid_mask"].to(device)
             optimizer.zero_grad(set_to_none=True)
             pred = model(x)
-            loss = masked_mse(pred, target, mask)
+            loss_ai = masked_mse(pred, target, mask)
+            loss = loss_ai
+            if wavelet is not None:
+                lfm = batch["lfm"].to(device)
+                seismic = batch["seismic"].to(device)
+                pred_log_ai = lfm + _denormalize_delta_torch(pred[:, 0], normalization)[:, None]
+                synthetic = _torch_forward_log_ai(pred_log_ai[:, 0], wavelet)
+                # The patch target is aligned to the seismic axis by dropping the
+                # preceding impedance sample.  For the auxiliary physics loss we
+                # use the interior samples where a local reflectivity is defined.
+                seismic_target = seismic[:, 0, :, 1:]
+                seismic_mask = mask[:, 0, :, 1:]
+                loss_physics = masked_mse(
+                    synthetic[:, None],
+                    seismic_target[:, None],
+                    seismic_mask[:, None],
+                )
+                loss = loss_ai + float(lambda_physics) * loss_physics
             loss.backward()
             optimizer.step()
             train_losses.append(float(loss.detach().cpu()))
@@ -158,6 +181,62 @@ def evaluate_loss(model: torch.nn.Module, loader: DataLoader, device: torch.devi
     return float(np.mean(losses)) if losses else float("nan")
 
 
+def _load_nominal_wavelet(benchmark_dir: Path) -> torch.Tensor:
+    manifest_path = Path(benchmark_dir) / "benchmark_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"benchmark_manifest.json not found: {manifest_path}")
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    source_runs = manifest.get("source_runs") or {}
+    wavelet_dir = source_runs.get("wavelet_generation_dir")
+    if not wavelet_dir:
+        raise ValueError("benchmark manifest lacks source_runs.wavelet_generation_dir")
+    wavelet_path = Path(wavelet_dir)
+    if not wavelet_path.is_absolute():
+        wavelet_path = Path.cwd() / wavelet_path
+    csv_path = wavelet_path / "selected_wavelet.csv"
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"selected_wavelet.csv not found: {csv_path}")
+    frame = pd.read_csv(csv_path)
+    if "amplitude" not in frame:
+        raise ValueError(f"selected_wavelet.csv lacks amplitude column: {csv_path}")
+    wavelet = frame["amplitude"].to_numpy(dtype=np.float32)
+    if wavelet.size < 3 or wavelet.size % 2 == 0:
+        raise ValueError("nominal wavelet must have odd length >= 3")
+    if not np.all(np.isfinite(wavelet)):
+        raise ValueError("nominal wavelet contains non-finite values")
+    return torch.as_tensor(wavelet.reshape(1, 1, -1), dtype=torch.float32)
+
+
+def _denormalize_delta_torch(values: torch.Tensor, normalization: Mapping[str, Any]) -> torch.Tensor:
+    stats = normalization["delta"]
+    return values * float(stats["std"]) + float(stats["mean"])
+
+
+def _torch_forward_log_ai(log_ai: torch.Tensor, wavelet: torch.Tensor) -> torch.Tensor:
+    """Differentiable project forward model for patch tensors.
+
+    Input shape is ``[batch, lateral, twt]`` and output shape is
+    ``[batch, lateral, twt - 1]``.  The implementation mirrors
+    ``numpy.convolve(wavelet, reflectivity, mode='same')`` for the common case
+    where the wavelet is shorter than the local reflectivity.
+    """
+
+    if log_ai.ndim != 3:
+        raise ValueError("log_ai must have shape [batch, lateral, twt]")
+    reflectivity = torch.tanh(0.5 * (log_ai[:, :, 1:] - log_ai[:, :, :-1]))
+    batch, lateral, samples = reflectivity.shape
+    traces = reflectivity.reshape(batch * lateral, 1, samples)
+    kernel = torch.flip(wavelet.to(dtype=traces.dtype, device=traces.device), dims=[-1])
+    padding = int(kernel.shape[-1] // 2)
+    convolved = torch.nn.functional.conv1d(traces, kernel, padding=padding)
+    if convolved.shape[-1] != samples:
+        difference = convolved.shape[-1] - samples
+        start = difference // 2
+        convolved = convolved[..., start : start + samples]
+    return convolved.reshape(batch, lateral, samples)
+
+
 def load_checkpoint(path: Path, *, hidden_channels: int | None = None, depth: int | None = None) -> tuple[torch.nn.Module, dict[str, Any]]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     info = dict(checkpoint["model_info"])
@@ -206,6 +285,7 @@ def predict_patches(
     targets = []
     masks = []
     lfm_values = []
+    lfm_ideal_values = []
     patch_ids = []
     sample_ids = []
     with torch.no_grad():
@@ -219,12 +299,14 @@ def predict_patches(
             targets.append(batch["target_log_ai"].numpy()[:, 0].astype(np.float32))
             masks.append(batch["valid_mask"].numpy()[:, 0].astype(bool))
             lfm_values.append(lfm.astype(np.float32))
+            lfm_ideal_values.append(batch["lfm_ideal"].numpy()[:, 0].astype(np.float32))
             patch_ids.extend([str(value) for value in batch["patch_id"]])
             sample_ids.extend([str(value) for value in batch["sample_id"]])
     pred_array = np.concatenate(predictions, axis=0)
     target_array = np.concatenate(targets, axis=0)
     mask_array = np.concatenate(masks, axis=0)
     lfm_array = np.concatenate(lfm_values, axis=0)
+    lfm_ideal_array = np.concatenate(lfm_ideal_values, axis=0)
     npz_path = output_dir / "predictions.npz"
     np.savez_compressed(
         npz_path,
@@ -232,6 +314,7 @@ def predict_patches(
         target_log_ai=target_array,
         valid_mask_model=mask_array,
         lfm_controlled_degraded=lfm_array,
+        lfm_ideal=lfm_ideal_array,
         patch_id=np.asarray(patch_ids),
         sample_id=np.asarray(sample_ids),
     )
@@ -261,14 +344,25 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     target = arrays["target_log_ai"]
     mask = arrays["valid_mask_model"].astype(bool)
     lfm = arrays["lfm_controlled_degraded"]
+    lfm_ideal = (
+        arrays["lfm_ideal"]
+        if "lfm_ideal" in arrays
+        else _load_lfm_ideal_patches(prediction_dir, index, target.shape)
+    )
     rows = []
     lfm_rows = []
+    lfm_ideal_rows = []
+    oracle_rows = []
     for _, row in index.iterrows():
         i = int(row["prediction_row"])
         metrics = regression_metrics(target[i], pred[i], valid_mask=mask[i])
         rows.append({**row.to_dict(), "model_id": row.get("model_id", ""), **metrics})
         lfm_metrics = regression_metrics(target[i], lfm[i], valid_mask=mask[i])
         lfm_rows.append({**row.to_dict(), "model_id": "lfm_controlled_degraded", **lfm_metrics})
+        lfm_ideal_metrics = regression_metrics(target[i], lfm_ideal[i], valid_mask=mask[i])
+        lfm_ideal_rows.append({**row.to_dict(), "model_id": "lfm_ideal", **lfm_ideal_metrics})
+        oracle_metrics = regression_metrics(target[i], target[i], valid_mask=mask[i])
+        oracle_rows.append({**row.to_dict(), "model_id": "oracle_target", **oracle_metrics})
     metrics_frame = pd.DataFrame.from_records(rows)
     metrics_path = output_dir / "model_patch_metrics.csv"
     metrics_frame.to_csv(metrics_path, index=False)
@@ -276,9 +370,28 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     _grouped_patch_metrics(metrics_frame, ["geometry_family"]).to_csv(geometry_path, index=False)
     mismatch_path = output_dir / "model_patch_metrics_by_mismatch_family.csv"
     _grouped_patch_metrics(metrics_frame, ["seismic_mismatch_family"]).to_csv(mismatch_path, index=False)
+    geometry_detail_frame = _geometry_patch_metrics(metrics_frame, pred, target, mask, prediction_dir)
+    geometry_detail_path = output_dir / "model_geometry_patch_metrics.csv"
+    geometry_detail_frame.to_csv(geometry_detail_path, index=False)
+    geometry_aggregate_path = output_dir / "model_geometry_metrics_by_family.csv"
+    _grouped_geometry_metrics(geometry_detail_frame, ["geometry_family"]).to_csv(
+        geometry_aggregate_path,
+        index=False,
+    )
+    stitched = _stitch_realization_metrics(index, pred, target, mask, lfm)
+    stitched_uniform_path = output_dir / "model_realization_metrics_uniform.csv"
+    stitched["uniform"].to_csv(stitched_uniform_path, index=False)
+    stitched_center_path = output_dir / "model_realization_metrics_center_crop.csv"
+    stitched["center_crop"].to_csv(stitched_center_path, index=False)
     lfm_frame = pd.DataFrame.from_records(lfm_rows)
     lfm_path = output_dir / "lfm_patch_metrics.csv"
     lfm_frame.to_csv(lfm_path, index=False)
+    lfm_ideal_frame = pd.DataFrame.from_records(lfm_ideal_rows)
+    lfm_ideal_path = output_dir / "lfm_ideal_patch_metrics.csv"
+    lfm_ideal_frame.to_csv(lfm_ideal_path, index=False)
+    oracle_frame = pd.DataFrame.from_records(oracle_rows)
+    oracle_path = output_dir / "oracle_patch_metrics.csv"
+    oracle_frame.to_csv(oracle_path, index=False)
     probe_rows = _paired_probe_rows(metrics_frame, pred, target, mask, prediction_dir)
     probe_frame = pd.DataFrame.from_records(probe_rows)
     probe_path = output_dir / "model_probe_metrics.csv"
@@ -303,6 +416,8 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     )
     model_aggregate = _aggregate(metrics_frame)
     lfm_aggregate = _aggregate(lfm_frame)
+    lfm_ideal_aggregate = _aggregate(lfm_ideal_frame)
+    oracle_aggregate = _aggregate(oracle_frame)
     report = {
         "schema_version": "ginn_v2_patch_smoke_report_v1",
         "report_scope": "patch_smoke",
@@ -311,9 +426,20 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
         "n_patches": int(len(metrics_frame)),
         "aggregate": model_aggregate,
         "lfm_aggregate": lfm_aggregate,
+        "lfm_ideal_aggregate": lfm_ideal_aggregate,
+        "oracle_aggregate": oracle_aggregate,
         "rmse_improvement_pct_vs_lfm": _rmse_improvement_pct(model_aggregate, lfm_aggregate),
         "probe_aggregate": _aggregate(probe_frame),
         "probe_amplitude_phase_aggregate": _aggregate_amplitude_phase(probe_frame),
+        "geometry_aggregate": _aggregate_geometry(geometry_detail_frame),
+        "realization_uniform_aggregate": _aggregate(
+            stitched["uniform"][stitched["uniform"]["model_id"].astype(str).ne("lfm_controlled_degraded")]
+        ),
+        "realization_center_crop_aggregate": _aggregate(
+            stitched["center_crop"][
+                stitched["center_crop"]["model_id"].astype(str).ne("lfm_controlled_degraded")
+            ]
+        ),
         "zero_x_false_prediction_aggregate": _aggregate(zero_x_frame),
         "unsupported_zero_x_false_prediction_aggregate": _aggregate(_filter_unsupported_zero_x(zero_x_frame)),
         "zero_x_false_energy_aggregate": _aggregate_false_energy(zero_x_energy_frame),
@@ -328,7 +454,13 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
         "model_patch_metrics": metrics_path,
         "model_patch_metrics_by_geometry": geometry_path,
         "model_patch_metrics_by_mismatch_family": mismatch_path,
+        "model_geometry_patch_metrics": geometry_detail_path,
+        "model_geometry_metrics_by_family": geometry_aggregate_path,
+        "model_realization_metrics_uniform": stitched_uniform_path,
+        "model_realization_metrics_center_crop": stitched_center_path,
         "lfm_patch_metrics": lfm_path,
+        "lfm_ideal_patch_metrics": lfm_ideal_path,
+        "oracle_patch_metrics": oracle_path,
         "model_probe_metrics": probe_path,
         "model_probe_metrics_by_frequency": probe_frequency_path,
         "model_probe_metrics_by_frequency_amplitude": probe_frequency_amplitude_path,
@@ -350,7 +482,7 @@ def _paired_probe_rows(
     rows = []
     dt_s = _model_dt_s(prediction_dir)
     for _, row in index.iterrows():
-        pair_id = str(row.get("paired_zero_patch_id", "") or "").strip()
+        pair_id = _clean_report_text(row.get("paired_zero_patch_id"))
         if not pair_id or pair_id not in by_patch:
             continue
         amp = row.get("probe_amplitude_multiplier", "")
@@ -378,16 +510,37 @@ def _paired_probe_rows(
                 "paired_zero_patch_id": pair_id,
                 "sample_id": row.get("sample_id", ""),
                 "paired_zero_sample_id": row.get("paired_zero_sample_id", ""),
+                "sample_kind": row.get("sample_kind", ""),
+                "source_sample_id": row.get("source_sample_id", ""),
+                "source_sample_kind": row.get("source_sample_kind", ""),
+                "seismic_variant_id": row.get("seismic_variant_id", ""),
+                "seismic_mismatch_family": row.get("seismic_mismatch_family", ""),
                 "probe_frequency_hz": row.get("probe_frequency_hz", ""),
                 "probe_phase": row.get("probe_phase", ""),
                 "probe_lateral_shape": row.get("probe_lateral_shape", ""),
                 "probe_amplitude_multiplier": amp,
-                "probe_metric_semantics": "paired_probe_increment_error",
+                "probe_metric_semantics": (
+                    "paired_probe_increment_error_under_seismic_mismatch"
+                    if str(row.get("sample_kind", "")) == "frequency_probe_seismic_variant"
+                    else "paired_probe_increment_error"
+                ),
                 **metrics,
                 **amp_phase,
             }
         )
     return rows
+
+
+def _clean_report_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if bool(pd.isna(value)):
+            return ""
+    except TypeError:
+        pass
+    text = str(value).strip()
+    return "" if text.lower() in {"", "nan", "none", "null"} else text
 
 
 def _aggregate(frame: pd.DataFrame) -> dict[str, Any]:
@@ -413,6 +566,427 @@ def _grouped_patch_metrics(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame
         row.update(_aggregate(group))
         rows.append(row)
     return pd.DataFrame.from_records(rows)
+
+
+def _load_lfm_ideal_patches(
+    prediction_dir: Path,
+    index: pd.DataFrame,
+    expected_shape: tuple[int, ...],
+) -> np.ndarray:
+    benchmark_dir = _benchmark_dir_from_prediction(prediction_dir)
+    if benchmark_dir is None:
+        raise ValueError("Cannot load lfm_ideal: prediction manifest lacks benchmark_dir.")
+    benchmark = SynthoseisBenchmark(benchmark_dir)
+    patches: list[np.ndarray] = []
+    for _, row in index.iterrows():
+        sample = benchmark.load_sample(str(row["sample_id"]))
+        target, _, _, _, _ = _aligned_arrays(sample)
+        lfm_ideal = np.asarray(sample.priors["lfm_ideal"], dtype=np.float32)
+        if lfm_ideal.shape[1] == target.shape[1] + 1:
+            lfm_ideal = lfm_ideal[:, 1:]
+        if lfm_ideal.shape != target.shape:
+            raise ValueError(
+                f"lfm_ideal/target shape mismatch for {sample.sample_id}: "
+                f"{lfm_ideal.shape} vs {target.shape}"
+            )
+        patches.append(lfm_ideal[_patch_slice(row, offset=0)].astype(np.float32))
+    result = np.stack(patches, axis=0)
+    if result.shape != expected_shape:
+        raise ValueError(f"lfm_ideal patch shape mismatch: {result.shape} vs {expected_shape}")
+    return result
+
+
+def _geometry_patch_metrics(
+    index: pd.DataFrame,
+    pred: np.ndarray,
+    target: np.ndarray,
+    mask: np.ndarray,
+    prediction_dir: Path,
+) -> pd.DataFrame:
+    """Compute geometry-focused patch metrics from frozen benchmark masks."""
+
+    benchmark_dir = _benchmark_dir_from_prediction(prediction_dir)
+    if benchmark_dir is None:
+        return pd.DataFrame()
+    h5_path = benchmark_dir / "synthetic_benchmark.h5"
+    if not h5_path.is_file():
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    geometry_cache: dict[str, dict[str, np.ndarray]] = {}
+    with h5py.File(h5_path, "r") as h5:
+        for _, row in index.iterrows():
+            prediction_row = int(row["prediction_row"])
+            root = _root_from_group_path(str(row.get("hdf5_group", "")))
+            if not root:
+                continue
+            geometry = geometry_cache.get(root)
+            if geometry is None:
+                geometry = _read_geometry_masks(h5, root)
+                geometry_cache[root] = geometry
+            sl = _patch_slice(row, offset=int(row.get("raw_twt_offset_samples", 0) or 0))
+            boundary = geometry["boundary_mask_model"][sl]
+            event = geometry["geometry_event_mask_model"][sl]
+            valid = (
+                mask[prediction_row].astype(bool)
+                & np.isfinite(pred[prediction_row])
+                & np.isfinite(target[prediction_row])
+            )
+            residual = pred[prediction_row] - target[prediction_row]
+            boundary_band = _dilate_mask(boundary, lateral_radius=1, twt_radius=2) & valid
+            non_boundary = valid & ~boundary_band
+            event_valid = event & valid
+            non_event = valid & ~event
+            lateral = _lateral_gradient_metrics(
+                prediction=pred[prediction_row],
+                target=target[prediction_row],
+                valid=valid,
+            )
+            rows.append(
+                {
+                    "patch_id": row.get("patch_id", ""),
+                    "sample_id": row.get("sample_id", ""),
+                    "sample_kind": row.get("sample_kind", ""),
+                    "split": row.get("split", ""),
+                    "geometry_family": row.get("geometry_family", ""),
+                    "scenario_id": row.get("scenario_id", ""),
+                    "duration_mode": row.get("duration_mode", ""),
+                    "geometry_metric_semantics": (
+                        "boundary uses dilated truth/boundary_mask_model; "
+                        "event uses model-grid projection of truth/geometry_event_mask_highres"
+                    ),
+                    **_region_metrics("all", residual, valid),
+                    **_region_metrics("boundary", residual, boundary_band),
+                    **_region_metrics("non_boundary", residual, non_boundary),
+                    **_region_metrics("event", residual, event_valid),
+                    **_region_metrics("non_event", residual, non_event),
+                    **lateral,
+                }
+            )
+    return pd.DataFrame.from_records(rows)
+
+
+def _benchmark_dir_from_prediction(prediction_dir: Path) -> Path | None:
+    import json
+
+    manifest_path = prediction_dir / "prediction_manifest.json"
+    if not manifest_path.is_file():
+        return None
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    benchmark_dir = manifest.get("benchmark_dir")
+    if not benchmark_dir:
+        return None
+    path = Path(benchmark_dir)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
+def _root_from_group_path(group_path: str) -> str:
+    group_path = str(group_path).strip()
+    if not group_path:
+        return ""
+    for marker in ("/probes/", "/seismic_variants/"):
+        if marker in group_path:
+            return group_path.split(marker, maxsplit=1)[0]
+    return group_path
+
+
+def _read_geometry_masks(h5: h5py.File, root: str) -> dict[str, np.ndarray]:
+    truth = h5[f"{root}/truth"]
+    boundary = np.asarray(truth["boundary_mask_model"][()], dtype=bool)
+    event_highres = np.asarray(truth["geometry_event_mask_highres"][()], dtype=bool)
+    event_model = _highres_mask_to_model(event_highres, boundary.shape)
+    return {
+        "boundary_mask_model": boundary,
+        "geometry_event_mask_model": event_model,
+    }
+
+
+def _highres_mask_to_model(mask_highres: np.ndarray, model_shape: tuple[int, int]) -> np.ndarray:
+    mask_highres = np.asarray(mask_highres, dtype=bool)
+    n_lateral, n_model = model_shape
+    if mask_highres.shape[0] != n_lateral:
+        return np.zeros(model_shape, dtype=bool)
+    if mask_highres.shape[1] == n_model:
+        return mask_highres.copy()
+    factor = mask_highres.shape[1] / float(n_model)
+    result = np.zeros(model_shape, dtype=bool)
+    for model_index in range(n_model):
+        start = int(np.floor(model_index * factor))
+        stop = int(np.floor((model_index + 1) * factor))
+        stop = max(stop, start + 1)
+        start = min(start, mask_highres.shape[1])
+        stop = min(stop, mask_highres.shape[1])
+        if start < stop:
+            result[:, model_index] = np.any(mask_highres[:, start:stop], axis=1)
+    return result
+
+
+def _patch_slice(row: Mapping[str, Any], *, offset: int = 0) -> tuple[slice, slice]:
+    return (
+        slice(int(row["lateral_start"]), int(row["lateral_stop"])),
+        slice(int(row["twt_start"]) + offset, int(row["twt_stop"]) + offset),
+    )
+
+
+def _dilate_mask(mask: np.ndarray, *, lateral_radius: int, twt_radius: int) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool)
+    result = np.zeros_like(mask, dtype=bool)
+    for dl in range(-int(lateral_radius), int(lateral_radius) + 1):
+        src_l0 = max(0, -dl)
+        src_l1 = min(mask.shape[0], mask.shape[0] - dl)
+        dst_l0 = max(0, dl)
+        dst_l1 = min(mask.shape[0], mask.shape[0] + dl)
+        for dt in range(-int(twt_radius), int(twt_radius) + 1):
+            src_t0 = max(0, -dt)
+            src_t1 = min(mask.shape[1], mask.shape[1] - dt)
+            dst_t0 = max(0, dt)
+            dst_t1 = min(mask.shape[1], mask.shape[1] + dt)
+            result[dst_l0:dst_l1, dst_t0:dst_t1] |= mask[src_l0:src_l1, src_t0:src_t1]
+    return result
+
+
+def _region_metrics(prefix: str, residual: np.ndarray, valid: np.ndarray) -> dict[str, Any]:
+    valid = np.asarray(valid, dtype=bool) & np.isfinite(residual)
+    n_valid = int(np.count_nonzero(valid))
+    if n_valid == 0:
+        return {
+            f"{prefix}_n_valid": 0,
+            f"{prefix}_rmse": float("nan"),
+            f"{prefix}_mae": float("nan"),
+            f"{prefix}_bias": float("nan"),
+        }
+    values = np.asarray(residual, dtype=np.float64)[valid]
+    return {
+        f"{prefix}_n_valid": n_valid,
+        f"{prefix}_rmse": float(np.sqrt(np.mean(values**2))),
+        f"{prefix}_mae": float(np.mean(np.abs(values))),
+        f"{prefix}_bias": float(np.mean(values)),
+    }
+
+
+def _lateral_gradient_metrics(
+    *,
+    prediction: np.ndarray,
+    target: np.ndarray,
+    valid: np.ndarray,
+) -> dict[str, Any]:
+    pair_valid = valid[1:, :] & valid[:-1, :]
+    n_valid = int(np.count_nonzero(pair_valid))
+    if n_valid == 0:
+        return {
+            "lateral_gradient_n_valid": 0,
+            "lateral_gradient_rmse": float("nan"),
+            "lateral_gradient_mae": float("nan"),
+            "lateral_gradient_corr": float("nan"),
+        }
+    pred_grad = np.asarray(prediction[1:, :] - prediction[:-1, :], dtype=np.float64)
+    target_grad = np.asarray(target[1:, :] - target[:-1, :], dtype=np.float64)
+    residual = pred_grad - target_grad
+    metrics = regression_metrics(target_grad, pred_grad, valid_mask=pair_valid)
+    return {
+        "lateral_gradient_n_valid": n_valid,
+        "lateral_gradient_rmse": float(np.sqrt(np.mean(residual[pair_valid] ** 2))),
+        "lateral_gradient_mae": float(np.mean(np.abs(residual[pair_valid]))),
+        "lateral_gradient_corr": metrics.get("corr", float("nan")),
+    }
+
+
+def _aggregate_geometry(frame: pd.DataFrame) -> dict[str, Any]:
+    if frame.empty:
+        return {"n_ok": 0}
+    ok = frame[pd.to_numeric(frame.get("all_n_valid", 0), errors="coerce").fillna(0).gt(0)]
+    return {
+        "n_ok": int(len(ok)),
+        "mean_boundary_rmse": _safe_mean(ok, "boundary_rmse"),
+        "mean_event_rmse": _safe_mean(ok, "event_rmse"),
+        "mean_lateral_gradient_rmse": _safe_mean(ok, "lateral_gradient_rmse"),
+        "median_lateral_gradient_corr": _safe_median(ok, "lateral_gradient_corr"),
+    }
+
+
+def _grouped_geometry_metrics(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+    columns = [
+        *keys,
+        "n_ok",
+        "mean_all_rmse",
+        "mean_boundary_rmse",
+        "mean_non_boundary_rmse",
+        "mean_event_rmse",
+        "mean_non_event_rmse",
+        "mean_lateral_gradient_rmse",
+        "median_lateral_gradient_corr",
+    ]
+    if frame.empty or not set(keys).issubset(frame.columns):
+        return pd.DataFrame(columns=columns)
+    rows: list[dict[str, Any]] = []
+    for key_values, group in frame.groupby(keys, dropna=False):
+        if not isinstance(key_values, tuple):
+            key_values = (key_values,)
+        ok = group[pd.to_numeric(group.get("all_n_valid", 0), errors="coerce").fillna(0).gt(0)]
+        row = {key: value for key, value in zip(keys, key_values)}
+        row.update(
+            {
+                "n_ok": int(len(ok)),
+                "mean_all_rmse": _safe_mean(ok, "all_rmse"),
+                "mean_boundary_rmse": _safe_mean(ok, "boundary_rmse"),
+                "mean_non_boundary_rmse": _safe_mean(ok, "non_boundary_rmse"),
+                "mean_event_rmse": _safe_mean(ok, "event_rmse"),
+                "mean_non_event_rmse": _safe_mean(ok, "non_event_rmse"),
+                "mean_lateral_gradient_rmse": _safe_mean(ok, "lateral_gradient_rmse"),
+                "median_lateral_gradient_corr": _safe_median(ok, "lateral_gradient_corr"),
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame.from_records(rows, columns=columns)
+
+
+def _safe_mean(frame: pd.DataFrame, column: str) -> float:
+    if frame.empty or column not in frame:
+        return float("nan")
+    values = pd.to_numeric(frame[column], errors="coerce").dropna()
+    return float(values.mean()) if not values.empty else float("nan")
+
+
+def _safe_median(frame: pd.DataFrame, column: str) -> float:
+    if frame.empty or column not in frame:
+        return float("nan")
+    values = pd.to_numeric(frame[column], errors="coerce").dropna()
+    return float(values.median()) if not values.empty else float("nan")
+
+
+def _stitch_realization_metrics(
+    index: pd.DataFrame,
+    pred: np.ndarray,
+    target: np.ndarray,
+    mask: np.ndarray,
+    lfm: np.ndarray,
+) -> dict[str, pd.DataFrame]:
+    return {
+        "uniform": _stitch_one_strategy(
+            index,
+            pred,
+            target,
+            mask,
+            lfm,
+            strategy="uniform",
+        ),
+        "center_crop": _stitch_one_strategy(
+            index,
+            pred,
+            target,
+            mask,
+            lfm,
+            strategy="center_crop",
+        ),
+    }
+
+
+def _stitch_one_strategy(
+    index: pd.DataFrame,
+    pred: np.ndarray,
+    target: np.ndarray,
+    mask: np.ndarray,
+    lfm: np.ndarray,
+    *,
+    strategy: str,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    if index.empty:
+        return pd.DataFrame()
+    for sample_id, group in index.groupby("sample_id", dropna=False):
+        n_lateral = int(pd.to_numeric(group["lateral_stop"], errors="coerce").max())
+        n_twt = int(pd.to_numeric(group["twt_stop"], errors="coerce").max())
+        if n_lateral <= 0 or n_twt <= 0:
+            continue
+        pred_sum = np.zeros((n_lateral, n_twt), dtype=np.float64)
+        target_sum = np.zeros((n_lateral, n_twt), dtype=np.float64)
+        lfm_sum = np.zeros((n_lateral, n_twt), dtype=np.float64)
+        counts = np.zeros((n_lateral, n_twt), dtype=np.float64)
+        first_row = group.iloc[0]
+        for _, row in group.iterrows():
+            patch_index = int(row["prediction_row"])
+            local, dest = _stitch_slices(row, strategy=strategy)
+            patch_valid = mask[patch_index][local]
+            if not np.any(patch_valid):
+                continue
+            weights = patch_valid.astype(np.float64)
+            pred_sum[dest] += np.where(patch_valid, pred[patch_index][local], 0.0)
+            target_sum[dest] += np.where(patch_valid, target[patch_index][local], 0.0)
+            lfm_sum[dest] += np.where(patch_valid, lfm[patch_index][local], 0.0)
+            counts[dest] += weights
+        valid = counts > 0.0
+        if not np.any(valid):
+            continue
+        pred_full = np.divide(pred_sum, counts, out=np.zeros_like(pred_sum), where=valid)
+        target_full = np.divide(target_sum, counts, out=np.zeros_like(target_sum), where=valid)
+        lfm_full = np.divide(lfm_sum, counts, out=np.zeros_like(lfm_sum), where=valid)
+        base = {
+            "sample_id": sample_id,
+            "sample_kind": first_row.get("sample_kind", ""),
+            "split": first_row.get("split", ""),
+            "geometry_family": first_row.get("geometry_family", ""),
+            "scenario_id": first_row.get("scenario_id", ""),
+            "duration_mode": first_row.get("duration_mode", ""),
+            "stitch_strategy": strategy,
+            "n_source_patches": int(len(group)),
+            "stitched_lateral_samples": n_lateral,
+            "stitched_twt_samples": n_twt,
+            "coverage_fraction": float(np.mean(valid)),
+            "mean_patch_overlap": float(np.mean(counts[valid])),
+        }
+        rows.append(
+            {
+                **base,
+                "model_id": first_row.get("model_id", ""),
+                **regression_metrics(target_full, pred_full, valid_mask=valid),
+            }
+        )
+        rows.append(
+            {
+                **base,
+                "model_id": "lfm_controlled_degraded",
+                **regression_metrics(target_full, lfm_full, valid_mask=valid),
+            }
+        )
+    return pd.DataFrame.from_records(rows)
+
+
+def _stitch_slices(row: Mapping[str, Any], *, strategy: str) -> tuple[tuple[slice, slice], tuple[slice, slice]]:
+    lateral_start = int(row["lateral_start"])
+    lateral_stop = int(row["lateral_stop"])
+    twt_start = int(row["twt_start"])
+    twt_stop = int(row["twt_stop"])
+    patch_lateral = lateral_stop - lateral_start
+    patch_twt = twt_stop - twt_start
+    if strategy == "uniform":
+        local_l0, local_l1 = 0, patch_lateral
+        local_t0, local_t1 = 0, patch_twt
+    elif strategy == "center_crop":
+        local_l0, local_l1 = _center_crop_bounds(patch_lateral)
+        local_t0, local_t1 = _center_crop_bounds(patch_twt)
+    else:
+        raise ValueError(f"Unsupported stitch strategy: {strategy}")
+    return (
+        (slice(local_l0, local_l1), slice(local_t0, local_t1)),
+        (
+            slice(lateral_start + local_l0, lateral_start + local_l1),
+            slice(twt_start + local_t0, twt_start + local_t1),
+        ),
+    )
+
+
+def _center_crop_bounds(size: int) -> tuple[int, int]:
+    if size <= 4:
+        return 0, size
+    margin = max(1, size // 4)
+    start = margin
+    stop = size - margin
+    if stop <= start:
+        return 0, size
+    return start, stop
 
 
 def _filter_unsupported_zero_x(frame: pd.DataFrame) -> pd.DataFrame:
@@ -657,7 +1231,7 @@ def _zero_x_false_prediction_error(metrics_frame: pd.DataFrame, prediction_dir: 
         return pd.DataFrame()
     probe_amp = pd.to_numeric(metrics_frame["probe_amplitude_multiplier"], errors="coerce")
     zero = metrics_frame[
-        metrics_frame["sample_kind"].astype(str).eq("frequency_probe")
+        metrics_frame["sample_kind"].astype(str).isin(PROBE_SAMPLE_KINDS)
         & probe_amp.eq(0.0)
     ].copy()
     if zero.empty:

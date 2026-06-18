@@ -27,9 +27,18 @@ class PatchSpec:
 
 
 def default_train_kinds(model_id: str) -> set[str]:
-    if model_id == "patch_2d_mismatch_training":
+    if model_id in {
+        "trace_1d_dilated_tcn_mismatch_training",
+        "trace_1d_mismatch_training",
+        "patch_2d_mismatch_training",
+    }:
         return {"base", "seismic_variant"}
-    if model_id in {"trace_1d", "patch_2d_supervised", "patch_2d_with_physics_loss"}:
+    if model_id in {
+        "trace_1d",
+        "trace_1d_dilated_tcn",
+        "patch_2d_supervised",
+        "patch_2d_with_physics_loss",
+    }:
         return {"base"}
     raise ValueError(f"Unsupported model_id: {model_id}")
 
@@ -227,29 +236,38 @@ def build_patch_index(
 def _attach_paired_zero_patch_ids(frame: pd.DataFrame) -> pd.DataFrame:
     frame = frame.copy()
     keys = {}
+    variant_keys = {}
     for _, row in frame.iterrows():
-        key = (
-            str(row.get("sample_id", "")),
+        window = (
             int(row["lateral_start"]),
             int(row["twt_start"]),
             int(row["lateral_stop"]),
             int(row["twt_stop"]),
         )
+        key = (str(row.get("sample_id", "")), *window)
         keys[key] = str(row["patch_id"])
+        source_sample = _clean_text(row.get("source_sample_id"))
+        seismic_variant = _clean_text(row.get("seismic_variant_id"))
+        if source_sample and seismic_variant:
+            variant_keys[(source_sample, seismic_variant, *window)] = str(row["patch_id"])
     paired = []
     for _, row in frame.iterrows():
         pair_sample = _clean_text(row.get("paired_zero_sample_id"))
         if not pair_sample:
             paired.append("")
             continue
-        key = (
-            pair_sample,
+        window = (
             int(row["lateral_start"]),
             int(row["twt_start"]),
             int(row["lateral_stop"]),
             int(row["twt_stop"]),
         )
-        paired.append(keys.get(key, ""))
+        direct = keys.get((pair_sample, *window), "")
+        if direct:
+            paired.append(direct)
+            continue
+        seismic_variant = _clean_text(row.get("seismic_variant_id"))
+        paired.append(variant_keys.get((pair_sample, seismic_variant, *window), ""))
     frame["paired_zero_patch_id"] = paired
     return frame
 
@@ -342,6 +360,24 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         delta_n = np.where(valid_patch & np.isfinite(delta_n), delta_n, 0.0)
         target_patch = np.where(valid_patch & np.isfinite(target_patch), target_patch, 0.0)
         lfm_patch = np.where(valid_patch & np.isfinite(lfm_patch), lfm_patch, 0.0)
+        lfm_ideal = np.asarray(sample.priors["lfm_ideal"], dtype=np.float32)
+        if lfm_ideal.shape[0] != target.shape[0]:
+            raise ValueError(
+                f"lfm_ideal lateral shape mismatch for {sample.sample_id}: "
+                f"{lfm_ideal.shape} vs {target.shape}"
+            )
+        if lfm_ideal.shape[1] == target.shape[1] + 1:
+            lfm_ideal = lfm_ideal[:, 1:]
+        if lfm_ideal.shape != target.shape:
+            raise ValueError(
+                f"lfm_ideal/target shape mismatch for {sample.sample_id}: "
+                f"{lfm_ideal.shape} vs {target.shape}"
+            )
+        lfm_ideal_patch = np.where(
+            valid_patch & np.isfinite(lfm_ideal[sl]),
+            lfm_ideal[sl],
+            0.0,
+        )
         inputs = np.stack(
             [
                 seismic_n,
@@ -354,7 +390,11 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             "input": torch.from_numpy(inputs.astype(np.float32)),
             "target_delta": torch.from_numpy(delta_n.astype(np.float32))[None, :, :],
             "target_log_ai": torch.from_numpy(target_patch.astype(np.float32))[None, :, :],
+            "seismic": torch.from_numpy(
+                np.where(valid_patch & np.isfinite(seismic_patch), seismic_patch, 0.0).astype(np.float32)
+            )[None, :, :],
             "lfm": torch.from_numpy(lfm_patch.astype(np.float32))[None, :, :],
+            "lfm_ideal": torch.from_numpy(lfm_ideal_patch.astype(np.float32))[None, :, :],
             "valid_mask": torch.from_numpy(valid_patch.astype(np.float32))[None, :, :],
             "patch_id": str(row["patch_id"]),
             "sample_id": str(row["sample_id"]),

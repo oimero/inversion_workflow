@@ -70,6 +70,41 @@ class Trace1DNet(nn.Module):
         return out.reshape(b, lateral, 1, twt).permute(0, 2, 1, 3)
 
 
+class Trace1DDilatedTCN(nn.Module):
+    def __init__(self, *, in_channels: int = 3, hidden_channels: int = 32, depth: int = 5) -> None:
+        super().__init__()
+        if depth < 2:
+            raise ValueError("Trace1DDilatedTCN depth must be >= 2.")
+        layers: list[nn.Module] = [
+            nn.Conv1d(in_channels, hidden_channels, kernel_size=1),
+            nn.GELU(),
+        ]
+        for block in range(depth - 1):
+            dilation = 2 ** block
+            padding = 2 * dilation
+            layers.extend(
+                [
+                    nn.Conv1d(
+                        hidden_channels,
+                        hidden_channels,
+                        kernel_size=5,
+                        padding=padding,
+                        dilation=dilation,
+                    ),
+                    nn.GELU(),
+                ]
+            )
+        layers.append(nn.Conv1d(hidden_channels, 1, kernel_size=1))
+        self.net = nn.Sequential(*layers)
+        self.depth = depth
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, lateral, twt = x.shape
+        traces = x.permute(0, 2, 1, 3).reshape(b * lateral, c, twt)
+        out = self.net(traces)
+        return out.reshape(b, lateral, 1, twt).permute(0, 2, 1, 3)
+
+
 def build_model(
     model_id: str,
     *,
@@ -84,10 +119,14 @@ def build_model(
         model = Patch2DNet(hidden_channels=hidden_channels, depth=depth)
         rf_lateral = 1 + 2 * depth
         rf_twt = 1 + 2 * depth
-    elif model_id == "trace_1d":
+    elif model_id in {"trace_1d", "trace_1d_mismatch_training"}:
         model = Trace1DNet(hidden_channels=hidden_channels, depth=depth)
         rf_lateral = 1
         rf_twt = 1 + 4 * depth
+    elif model_id in {"trace_1d_dilated_tcn", "trace_1d_dilated_tcn_mismatch_training"}:
+        model = Trace1DDilatedTCN(hidden_channels=hidden_channels, depth=depth)
+        rf_lateral = 1
+        rf_twt = 1 + 4 * (2 ** (depth - 1) - 1)
     else:
         raise ValueError(f"Unsupported model_id: {model_id}")
     params = sum(parameter.numel() for parameter in model.parameters())

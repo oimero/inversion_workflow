@@ -156,9 +156,12 @@ Split 必须按 parent realization 隔离：
 2. `lfm_ideal`：理想低频先验参考，不代表真实输入条件。
 3. `lfm_controlled_degraded`：真实输入先验基线，也即 `lfm_only`。
 4. `trace_1d`：逐道监督模型。
-5. `patch_2d_supervised`：GINN-v2 首个二维 patch 闭环。
-6. `patch_2d_with_physics_loss`：在二维监督模型上加入物理一致性损失。
-7. `patch_2d_mismatch_training`：加入 seismic variants 的鲁棒训练消融。
+5. `trace_1d_dilated_tcn`：逐道膨胀时间卷积模型，检验更长时间感受野是否提升恢复。
+6. `trace_1d_mismatch_training`：在逐道模型上加入 seismic variants，检验鲁棒性收益是否不依赖二维上下文。
+7. `trace_1d_dilated_tcn_mismatch_training`：逐道膨胀时间卷积加 seismic variants 的交叉消融。
+8. `patch_2d_supervised`：GINN-v2 首个二维 patch 闭环。
+9. `patch_2d_with_physics_loss`：在二维监督模型上加入物理一致性损失。
+10. `patch_2d_mismatch_training`：加入 seismic variants 的鲁棒训练消融。
 
 模型矩阵使用中性名称。GINN-v2 可以实现 `patch_2d_supervised`，但报告中必须首先按消融项
 解释结果，而不是按网络名字预设胜负。
@@ -168,6 +171,9 @@ Split 必须按 parent realization 隔离：
 | 模型 | 训练样本 | 评估样本 |
 | --- | --- | --- |
 | `trace_1d` | `base` | 全部 sample kind |
+| `trace_1d_dilated_tcn` | `base` | 全部 sample kind |
+| `trace_1d_mismatch_training` | `base` + `seismic_variant` | 全部 sample kind |
+| `trace_1d_dilated_tcn_mismatch_training` | `base` + `seismic_variant` | 全部 sample kind |
 | `patch_2d_supervised` | `base` | 全部 sample kind |
 | `patch_2d_with_physics_loss` | `base` | 全部 sample kind |
 | `patch_2d_mismatch_training` | `base` + `seismic_variant` | 全部 sample kind |

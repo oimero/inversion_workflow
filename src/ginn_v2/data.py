@@ -28,7 +28,9 @@ class PatchSpec:
 
 def default_train_kinds(model_id: str) -> set[str]:
     if model_id in {
+        "trace_1d_tcn_lateral_mixer_k1_mismatch_training",
         "trace_1d_tcn_lateral_mixer_mismatch_training",
+        "trace_1d_tcn_lateral_mixer_k5_mismatch_training",
         "trace_1d_dilated_tcn_mismatch_training",
         "trace_1d_mismatch_training",
         "patch_2d_mismatch_training",

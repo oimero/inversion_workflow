@@ -33,7 +33,9 @@ MODEL_IDS = (
     "trace_1d",
     "trace_1d_dilated_tcn",
     "trace_1d_dilated_tcn_mismatch_training",
+    "trace_1d_tcn_lateral_mixer_k1_mismatch_training",
     "trace_1d_tcn_lateral_mixer_mismatch_training",
+    "trace_1d_tcn_lateral_mixer_k5_mismatch_training",
     "trace_1d_mismatch_training",
     "patch_2d_supervised",
     "patch_2d_with_physics_loss",
@@ -58,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--validation-fraction", type=float, default=0.15)
     train.add_argument("--test-fraction", type=float, default=0.15)
     train.add_argument("--max-patches", type=int, default=None)
+    train.add_argument("--patch-index", type=Path, default=None)
+    train.add_argument("--normalization", type=Path, default=None)
     train.add_argument("--overfit-tiny", action="store_true")
     train.add_argument("--epochs", type=int, default=5)
     train.add_argument("--batch-size", type=int, default=8)
@@ -72,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     predict.add_argument("--model-run-dir", type=Path, required=True)
     predict.add_argument("--benchmark-dir", type=Path, default=None)
     predict.add_argument("--index-source", choices=("train", "eval"), default="train")
+    predict.add_argument("--eval-patch-index", type=Path, default=None)
     predict.add_argument("--sample-kind", action="append", choices=(
         "base",
         "frequency_probe",
@@ -197,15 +202,28 @@ def run_train(args: argparse.Namespace) -> None:
     )
     max_patches = 4 if args.overfit_tiny and args.max_patches is None else args.max_patches
     patch_index_truncated = max_patches is not None
-    patch_index = build_patch_index(
-        benchmark,
-        patch_spec=patch_spec,
-        sample_kinds=_sample_kinds_for_training(args.model_id),
-        split_policy=args.split_policy,
-        validation_fraction=float(args.validation_fraction),
-        test_fraction=float(args.test_fraction),
-        max_patches=max_patches,
-    )
+    if args.patch_index is not None:
+        if args.overfit_tiny or args.max_patches is not None:
+            raise ValueError("--patch-index cannot be combined with --overfit-tiny or --max-patches.")
+        patch_index_source = resolve_relative_path(args.patch_index, root=REPO_ROOT)
+        patch_index = pd.read_csv(patch_index_source)
+        allowed = _sample_kinds_for_training(args.model_id)
+        unexpected = sorted(set(patch_index["sample_kind"].astype(str)) - allowed)
+        if unexpected:
+            raise ValueError(
+                f"Provided patch index contains sample_kind values not allowed for {args.model_id}: "
+                f"{unexpected}. Allowed: {sorted(allowed)}"
+            )
+    else:
+        patch_index = build_patch_index(
+            benchmark,
+            patch_spec=patch_spec,
+            sample_kinds=_sample_kinds_for_training(args.model_id),
+            split_policy=args.split_policy,
+            validation_fraction=float(args.validation_fraction),
+            test_fraction=float(args.test_fraction),
+            max_patches=max_patches,
+        )
     if args.overfit_tiny:
         patch_index["split"] = "train"
         first = patch_index.head(min(4, len(patch_index))).copy()
@@ -215,7 +233,11 @@ def run_train(args: argparse.Namespace) -> None:
         patch_index = pd.concat([first, validation], ignore_index=True)
     patch_index_path = output_dir / "patch_index.csv"
     patch_index.to_csv(patch_index_path, index=False)
-    normalization = compute_normalization(benchmark, patch_index)
+    if args.normalization is not None:
+        with resolve_relative_path(args.normalization, root=REPO_ROOT).open("r", encoding="utf-8") as handle:
+            normalization = json.load(handle)
+    else:
+        normalization = compute_normalization(benchmark, patch_index)
     write_json(output_dir / "normalization.json", normalization)
     result = train_model(
         benchmark=benchmark,
@@ -261,7 +283,23 @@ def run_predict(args: argparse.Namespace) -> None:
     output_dir = _timestamped_output("ginn_v2_predict", args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
     benchmark = SynthoseisBenchmark(benchmark_dir)
-    if args.index_source == "train":
+    if args.eval_patch_index is not None:
+        patch_index_source_path = resolve_relative_path(args.eval_patch_index, root=REPO_ROOT)
+        patch_index = pd.read_csv(patch_index_source_path)
+        if args.sample_kind:
+            sample_kinds = set(args.sample_kind)
+            patch_index = patch_index[
+                patch_index["sample_kind"].astype(str).isin(sample_kinds)
+            ].copy()
+            if patch_index.empty:
+                raise ValueError(
+                    f"No provided eval-index patches match requested sample kinds: {sorted(sample_kinds)}"
+                )
+        eval_index_path = output_dir / "eval_patch_index.csv"
+        patch_index.to_csv(eval_index_path, index=False)
+        patch_index_source = repo_relative_path(eval_index_path, root=REPO_ROOT)
+        patch_index_sha256 = sha256_file(eval_index_path)
+    elif args.index_source == "train":
         patch_index = pd.read_csv(resolve_relative_path(manifest["patch_index"], root=REPO_ROOT))
         if args.sample_kind:
             sample_kinds = set(args.sample_kind)

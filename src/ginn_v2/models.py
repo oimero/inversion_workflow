@@ -106,10 +106,19 @@ class Trace1DDilatedTCN(nn.Module):
 
 
 class Trace1DTCNShallowLateralMixer(nn.Module):
-    def __init__(self, *, in_channels: int = 3, hidden_channels: int = 32, depth: int = 5) -> None:
+    def __init__(
+        self,
+        *,
+        in_channels: int = 3,
+        hidden_channels: int = 32,
+        depth: int = 5,
+        lateral_kernel: int = 3,
+    ) -> None:
         super().__init__()
         if depth < 2:
             raise ValueError("Trace1DTCNShallowLateralMixer depth must be >= 2.")
+        if lateral_kernel < 1 or lateral_kernel % 2 == 0:
+            raise ValueError("lateral_kernel must be an odd positive integer.")
         layers: list[nn.Module] = [
             nn.Conv1d(in_channels, hidden_channels, kernel_size=1),
             nn.GELU(),
@@ -131,12 +140,18 @@ class Trace1DTCNShallowLateralMixer(nn.Module):
             )
         self.temporal_encoder = nn.Sequential(*layers)
         self.lateral_mixer = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=(3, 1), padding=(1, 0)),
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=(lateral_kernel, 1),
+                padding=(lateral_kernel // 2, 0),
+            ),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
         )
         self.output = nn.Conv2d(hidden_channels, 1, kernel_size=1)
         self.depth = depth
+        self.lateral_kernel = lateral_kernel
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, lateral, twt = x.shape
@@ -169,9 +184,22 @@ def build_model(
         model = Trace1DDilatedTCN(hidden_channels=hidden_channels, depth=depth)
         rf_lateral = 1
         rf_twt = 1 + 4 * (2 ** (depth - 1) - 1)
-    elif model_id == "trace_1d_tcn_lateral_mixer_mismatch_training":
-        model = Trace1DTCNShallowLateralMixer(hidden_channels=hidden_channels, depth=depth)
-        rf_lateral = 3
+    elif model_id in {
+        "trace_1d_tcn_lateral_mixer_k1_mismatch_training",
+        "trace_1d_tcn_lateral_mixer_mismatch_training",
+        "trace_1d_tcn_lateral_mixer_k5_mismatch_training",
+    }:
+        lateral_kernel = {
+            "trace_1d_tcn_lateral_mixer_k1_mismatch_training": 1,
+            "trace_1d_tcn_lateral_mixer_mismatch_training": 3,
+            "trace_1d_tcn_lateral_mixer_k5_mismatch_training": 5,
+        }[model_id]
+        model = Trace1DTCNShallowLateralMixer(
+            hidden_channels=hidden_channels,
+            depth=depth,
+            lateral_kernel=lateral_kernel,
+        )
+        rf_lateral = lateral_kernel
         rf_twt = 1 + 4 * (2 ** (depth - 1) - 1)
     else:
         raise ValueError(f"Unsupported model_id: {model_id}")

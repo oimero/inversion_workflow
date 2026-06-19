@@ -20,6 +20,10 @@ from ginn_v2.models import build_model
 
 
 PROBE_SAMPLE_KINDS = {"frequency_probe", "frequency_probe_seismic_variant"}
+PHYSICS_LOSS_MODEL_IDS = {
+    "patch_2d_with_physics_loss",
+    "trace_1d_dilated_tcn_mismatch_training",
+}
 
 
 def masked_mse(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -48,10 +52,10 @@ def train_model(
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     if lambda_physics != 0.0:
-        if model_id != "patch_2d_with_physics_loss":
+        if model_id not in PHYSICS_LOSS_MODEL_IDS:
             raise NotImplementedError(
-                "Non-zero physics loss is currently only implemented for "
-                "patch_2d_with_physics_loss."
+                "Non-zero physics loss is currently only implemented for: "
+                f"{sorted(PHYSICS_LOSS_MODEL_IDS)}."
             )
     allowed_kinds = default_train_kinds(model_id)
     unexpected = sorted(set(patch_index["sample_kind"].astype(str)) - allowed_kinds)
@@ -116,15 +120,28 @@ def train_model(
             loss_ai = masked_mse(pred, target, mask)
             loss = loss_ai
             if wavelet is not None:
-                lfm = batch["lfm"].to(device)
-                seismic = batch["seismic"].to(device)
-                pred_log_ai = lfm + _denormalize_delta_torch(pred[:, 0], normalization)[:, None]
+                sample_kinds = list(batch["sample_kind"])
+                physics_rows = [
+                    idx for idx, kind in enumerate(sample_kinds)
+                    if str(kind) == "base"
+                ]
+                if not physics_rows:
+                    loss.backward()
+                    optimizer.step()
+                    train_losses.append(float(loss.detach().cpu()))
+                    continue
+                physics_index = torch.as_tensor(physics_rows, dtype=torch.long, device=device)
+                lfm = batch["lfm"].to(device).index_select(0, physics_index)
+                seismic = batch["seismic"].to(device).index_select(0, physics_index)
+                physics_mask = mask.index_select(0, physics_index)
+                physics_pred = pred.index_select(0, physics_index)
+                pred_log_ai = lfm + _denormalize_delta_torch(physics_pred[:, 0], normalization)[:, None]
                 synthetic = _torch_forward_log_ai(pred_log_ai[:, 0], wavelet)
                 # The patch target is aligned to the seismic axis by dropping the
                 # preceding impedance sample.  For the auxiliary physics loss we
                 # use the interior samples where a local reflectivity is defined.
                 seismic_target = seismic[:, 0, :, 1:]
-                seismic_mask = mask[:, 0, :, 1:]
+                seismic_mask = physics_mask[:, 0, :, 1:]
                 loss_physics = masked_mse(
                     synthetic[:, None],
                     seismic_target[:, None],

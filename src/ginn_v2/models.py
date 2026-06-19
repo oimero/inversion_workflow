@@ -105,6 +105,48 @@ class Trace1DDilatedTCN(nn.Module):
         return out.reshape(b, lateral, 1, twt).permute(0, 2, 1, 3)
 
 
+class Trace1DTCNShallowLateralMixer(nn.Module):
+    def __init__(self, *, in_channels: int = 3, hidden_channels: int = 32, depth: int = 5) -> None:
+        super().__init__()
+        if depth < 2:
+            raise ValueError("Trace1DTCNShallowLateralMixer depth must be >= 2.")
+        layers: list[nn.Module] = [
+            nn.Conv1d(in_channels, hidden_channels, kernel_size=1),
+            nn.GELU(),
+        ]
+        for block in range(depth - 1):
+            dilation = 2 ** block
+            padding = 2 * dilation
+            layers.extend(
+                [
+                    nn.Conv1d(
+                        hidden_channels,
+                        hidden_channels,
+                        kernel_size=5,
+                        padding=padding,
+                        dilation=dilation,
+                    ),
+                    nn.GELU(),
+                ]
+            )
+        self.temporal_encoder = nn.Sequential(*layers)
+        self.lateral_mixer = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=(3, 1), padding=(1, 0)),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
+        )
+        self.output = nn.Conv2d(hidden_channels, 1, kernel_size=1)
+        self.depth = depth
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, lateral, twt = x.shape
+        traces = x.permute(0, 2, 1, 3).reshape(b * lateral, c, twt)
+        encoded = self.temporal_encoder(traces)
+        encoded = encoded.reshape(b, lateral, encoded.shape[1], twt).permute(0, 2, 1, 3)
+        mixed = encoded + self.lateral_mixer(encoded)
+        return self.output(mixed)
+
+
 def build_model(
     model_id: str,
     *,
@@ -126,6 +168,10 @@ def build_model(
     elif model_id in {"trace_1d_dilated_tcn", "trace_1d_dilated_tcn_mismatch_training"}:
         model = Trace1DDilatedTCN(hidden_channels=hidden_channels, depth=depth)
         rf_lateral = 1
+        rf_twt = 1 + 4 * (2 ** (depth - 1) - 1)
+    elif model_id == "trace_1d_tcn_lateral_mixer_mismatch_training":
+        model = Trace1DTCNShallowLateralMixer(hidden_channels=hidden_channels, depth=depth)
+        rf_lateral = 3
         rf_twt = 1 + 4 * (2 ** (depth - 1) - 1)
     else:
         raise ValueError(f"Unsupported model_id: {model_id}")

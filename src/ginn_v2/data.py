@@ -28,6 +28,7 @@ class PatchSpec:
 
 def default_train_kinds(model_id: str) -> set[str]:
     if model_id in {
+        "trace_1d_tcn_lateral_mixer_mismatch_training",
         "trace_1d_dilated_tcn_mismatch_training",
         "trace_1d_mismatch_training",
         "patch_2d_mismatch_training",
@@ -398,6 +399,7 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             "valid_mask": torch.from_numpy(valid_patch.astype(np.float32))[None, :, :],
             "patch_id": str(row["patch_id"]),
             "sample_id": str(row["sample_id"]),
+            "sample_kind": str(row.get("sample_kind", "")),
         }
 
 

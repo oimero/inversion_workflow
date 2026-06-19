@@ -33,6 +33,7 @@ MODEL_IDS = (
     "trace_1d",
     "trace_1d_dilated_tcn",
     "trace_1d_dilated_tcn_mismatch_training",
+    "trace_1d_tcn_lateral_mixer_mismatch_training",
     "trace_1d_mismatch_training",
     "patch_2d_supervised",
     "patch_2d_with_physics_loss",

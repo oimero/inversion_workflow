@@ -1,0 +1,761 @@
+"""Real-field zero-shot prediction and forward diagnostics for GINN-v2."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+import pandas as pd
+import torch
+
+from cup.seismic.survey import open_survey, segy_options_from_config
+from cup.utils.io import (
+    repo_relative_path,
+    resolve_artifact_path,
+    resolve_relative_path,
+    sha256_file,
+    write_json,
+)
+from ginn_v2.data import denormalize_delta
+from ginn_v2.training import load_checkpoint, resolve_device
+
+
+@dataclass(frozen=True)
+class RealFieldSection:
+    seismic: np.ndarray
+    lfm: np.ndarray
+    valid_mask: np.ndarray
+    ilines: np.ndarray
+    xlines: np.ndarray
+    twt_s: np.ndarray
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PatchGeometry:
+    lateral_start: int
+    lateral_stop: int
+    twt_start: int
+    twt_stop: int
+    valid_fraction: float
+
+
+def load_real_field_section(
+    *,
+    config: Mapping[str, Any],
+    root: Path,
+    data_root: Path,
+) -> RealFieldSection:
+    inputs = _mapping(config.get("real_field_inputs"), "real_field_zero_shot.real_field_inputs")
+    section_cfg = _mapping(config.get("section"), "real_field_zero_shot.section")
+    lfm_path = resolve_relative_path(_required_text(inputs, "lfm_file"), root=root)
+    lfm_values, ilines, xlines, twt_s = _load_npz_grid_section(
+        lfm_path,
+        section_cfg=section_cfg,
+        value_keys=("lfm", "log_ai", "volume", "pred_log_ai"),
+    )
+    lfm_transform = str(inputs.get("lfm_value_transform") or "identity").casefold()
+    if lfm_transform == "log":
+        if np.any(lfm_values <= 0.0):
+            raise ValueError("lfm_value_transform=log requires positive LFM/AI values.")
+        lfm_values = np.log(lfm_values)
+    elif lfm_transform not in {"identity", "none"}:
+        raise ValueError(f"Unsupported lfm_value_transform: {lfm_transform}")
+    sample_start = float(twt_s[0])
+    sample_end = float(twt_s[-1])
+
+    seismic_path = resolve_relative_path(_required_text(inputs, "seismic_file"), root=data_root)
+    seismic_type = str(inputs.get("seismic_type", inputs.get("type", "zgy"))).casefold()
+    if seismic_path.suffix.casefold() == ".npz":
+        seismic, seismic_ilines, seismic_xlines, seismic_twt = _load_npz_grid_section(
+            seismic_path,
+            section_cfg=section_cfg,
+            value_keys=("seismic", "volume", "seismic_input"),
+        )
+        _assert_axes_close("seismic ilines", seismic_ilines, ilines)
+        _assert_axes_close("seismic xlines", seismic_xlines, xlines)
+        seismic, lfm_values, twt_s = _align_time_arrays(seismic, seismic_twt, lfm_values, twt_s)
+    else:
+        seismic, seismic_twt = _load_survey_section(
+            seismic_path,
+            seismic_type=seismic_type,
+            section_cfg=section_cfg,
+            ilines=ilines,
+            xlines=xlines,
+            sample_start=sample_start,
+            sample_end=sample_end,
+            seismic_options=dict(inputs.get("segy_options") or {}),
+        )
+        seismic, lfm_values, twt_s = _align_time_arrays(seismic, seismic_twt, lfm_values, twt_s)
+
+    mask_path_text = str(inputs.get("target_mask_file") or "").strip()
+    if mask_path_text:
+        mask_path = resolve_relative_path(mask_path_text, root=root)
+        mask, mask_ilines, mask_xlines, mask_twt = _load_npz_grid_section(
+            mask_path,
+            section_cfg=section_cfg,
+            value_keys=("valid_mask_model", "mask", "target_mask", "volume"),
+        )
+        _assert_axes_close("mask ilines", mask_ilines, ilines)
+        _assert_axes_close("mask xlines", mask_xlines, xlines)
+        mask, _, _ = _align_time_arrays(mask.astype(float), mask_twt, lfm_values, twt_s)
+        valid_mask = mask > 0.5
+    else:
+        valid_mask = np.isfinite(lfm_values) & np.isfinite(seismic)
+
+    valid_mask = valid_mask & np.isfinite(lfm_values) & np.isfinite(seismic)
+    if seismic.shape != lfm_values.shape or valid_mask.shape != lfm_values.shape:
+        raise ValueError(
+            f"Real-field shape mismatch: seismic={seismic.shape}, lfm={lfm_values.shape}, "
+            f"mask={valid_mask.shape}"
+        )
+    if not np.any(valid_mask):
+        raise ValueError("Real-field section has no finite valid samples.")
+    return RealFieldSection(
+        seismic=np.asarray(seismic, dtype=np.float32),
+        lfm=np.asarray(lfm_values, dtype=np.float32),
+        valid_mask=np.asarray(valid_mask, dtype=bool),
+        ilines=np.asarray(ilines, dtype=np.float64),
+        xlines=np.asarray(xlines, dtype=np.float64),
+        twt_s=np.asarray(twt_s, dtype=np.float64),
+        metadata={
+            "lfm_file": str(lfm_path),
+            "seismic_file": str(seismic_path),
+            "seismic_type": seismic_type,
+            "target_mask_file": mask_path_text,
+            "lfm_value_transform": lfm_transform,
+            "section": dict(section_cfg),
+        },
+    )
+
+
+def run_zero_shot_model(
+    *,
+    section: RealFieldSection,
+    model_cfg: Mapping[str, Any],
+    output_dir: Path,
+    root: Path,
+    device_name: str,
+    stitch_strategy: str,
+) -> dict[str, Any]:
+    model_role = _required_text(model_cfg, "model_role")
+    model_id_label = _required_text(model_cfg, "model_id")
+    synthetic_gate_summary = _required_text(model_cfg, "synthetic_gate_summary")
+    synthetic_gate_report_sha256 = _required_text(model_cfg, "synthetic_gate_report_sha256")
+    if len(synthetic_gate_report_sha256) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in synthetic_gate_report_sha256):
+        raise ValueError(f"{model_role}.synthetic_gate_report_sha256 must be a full SHA-256 digest.")
+    model_run_dir = resolve_relative_path(_required_text(model_cfg, "model_run_dir"), root=root)
+    manifest_path = model_run_dir / "model_run_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    checkpoint_path = _resolve_model_artifact(
+        model_cfg.get("checkpoint_file") or manifest.get("checkpoint"),
+        root=root,
+        model_run_dir=model_run_dir,
+        fallback_name="checkpoint.pt",
+    )
+    model, checkpoint = load_checkpoint(checkpoint_path)
+    normalization_path = None
+    if model_cfg.get("normalization_file"):
+        normalization_path = _resolve_model_artifact(
+            model_cfg.get("normalization_file"),
+            root=root,
+            model_run_dir=model_run_dir,
+            fallback_name="normalization.json",
+        )
+        with normalization_path.open("r", encoding="utf-8") as handle:
+            normalization_file_payload = json.load(handle)
+        if normalization_file_payload != dict(checkpoint["normalization"]):
+            raise ValueError(f"normalization_file does not match checkpoint normalization: {normalization_path}")
+    device, device_metadata = resolve_device(device_name)
+    model.to(device)
+    model.eval()
+    normalization = dict(checkpoint["normalization"])
+    patch_spec = _mapping(manifest.get("patch_spec"), f"{model_role}.patch_spec")
+    patches = build_real_field_patch_index(
+        section.valid_mask,
+        lateral_samples=int(patch_spec["lateral_samples"]),
+        twt_samples=int(patch_spec["twt_samples"]),
+        lateral_stride=int(patch_spec["lateral_stride"]),
+        twt_stride=int(patch_spec["twt_stride"]),
+        min_valid_fraction=float(patch_spec["min_valid_fraction"]),
+    )
+    if not patches:
+        raise ValueError(f"No valid real-field patches for model role={model_role}.")
+
+    pred_sum = np.zeros_like(section.lfm, dtype=np.float64)
+    weight = np.zeros_like(section.lfm, dtype=np.float64)
+    rows: list[dict[str, Any]] = []
+    patch_predictions: list[np.ndarray] = []
+    with torch.no_grad():
+        for patch_idx, patch in enumerate(patches):
+            sl = (slice(patch.lateral_start, patch.lateral_stop), slice(patch.twt_start, patch.twt_stop))
+            seismic_patch = section.seismic[sl]
+            lfm_patch = section.lfm[sl]
+            valid_patch = section.valid_mask[sl]
+            inputs = np.stack(
+                [
+                    _normalize_with_mask(seismic_patch, valid_patch, normalization["seismic"]),
+                    _normalize_with_mask(lfm_patch, valid_patch, normalization["lfm"]),
+                    valid_patch.astype(np.float32),
+                ],
+                axis=0,
+            )[None, ...]
+            tensor = torch.as_tensor(inputs, dtype=torch.float32, device=device)
+            pred_delta_n = model(tensor).detach().cpu().numpy()[0, 0]
+            pred_delta = denormalize_delta(pred_delta_n, normalization)
+            prediction = np.asarray(lfm_patch + pred_delta, dtype=np.float32)
+            patch_predictions.append(prediction)
+            local, dest = _stitch_slices(patch, strategy=stitch_strategy)
+            local_valid = valid_patch[local]
+            pred_sum[dest] += np.where(local_valid, prediction[local], 0.0)
+            weight[dest] += local_valid.astype(np.float64)
+            rows.append(
+                {
+                    "patch_id": f"{model_role}__p{patch_idx:05d}",
+                    "model_role": model_role,
+                    "model_id": model_id_label,
+                    "checkpoint_model_id": str(checkpoint["model_id"]),
+                    "lateral_start": patch.lateral_start,
+                    "lateral_stop": patch.lateral_stop,
+                    "twt_start": patch.twt_start,
+                    "twt_stop": patch.twt_stop,
+                    "inline_start": float(section.ilines[patch.lateral_start]),
+                    "inline_stop": float(section.ilines[patch.lateral_stop - 1]),
+                    "xline_start": float(section.xlines[patch.lateral_start]),
+                    "xline_stop": float(section.xlines[patch.lateral_stop - 1]),
+                    "twt_start_s": float(section.twt_s[patch.twt_start]),
+                    "twt_stop_s": float(section.twt_s[patch.twt_stop - 1]),
+                    "valid_fraction": patch.valid_fraction,
+                    "stitch_strategy": stitch_strategy,
+                }
+            )
+    stitched = np.divide(pred_sum, weight, out=np.full_like(pred_sum, np.nan), where=weight > 0.0)
+    pred_delta_vs_lfm = stitched - section.lfm
+    model_dir = output_dir / model_role
+    model_dir.mkdir(parents=True, exist_ok=False)
+    npz_path = model_dir / "predictions.npz"
+    np.savez_compressed(
+        npz_path,
+        stitched_pred_log_ai=stitched.astype(np.float32),
+        pred_delta_vs_lfm=pred_delta_vs_lfm.astype(np.float32),
+        stitching_weight=weight.astype(np.float32),
+        lfm_input=section.lfm.astype(np.float32),
+        seismic_input=section.seismic.astype(np.float32),
+        valid_mask_model=section.valid_mask.astype(bool),
+        ilines=section.ilines,
+        xlines=section.xlines,
+        twt_s=section.twt_s,
+        patch_pred_log_ai=np.asarray(patch_predictions, dtype=np.float32),
+    )
+    index_path = model_dir / "prediction_index.csv"
+    pd.DataFrame.from_records(rows).to_csv(index_path, index=False)
+    summary = {
+        "schema_version": "real_field_zero_shot_model_v1",
+        "status": "ok",
+        "model_role": model_role,
+        "model_id": model_id_label,
+        "checkpoint_model_id": str(checkpoint["model_id"]),
+        "model_run_dir": repo_relative_path(model_run_dir, root=root),
+        "checkpoint": repo_relative_path(checkpoint_path, root=root),
+        "checkpoint_sha256": sha256_file(checkpoint_path),
+        "normalization_file": (
+            repo_relative_path(normalization_path, root=root) if normalization_path is not None else ""
+        ),
+        "normalization_file_sha256": sha256_file(normalization_path) if normalization_path is not None else "",
+        "normalization_sha256": hashlib.sha256(
+            json.dumps(normalization, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+        "synthetic_gate_summary": synthetic_gate_summary,
+        "synthetic_gate_report_sha256": synthetic_gate_report_sha256,
+        "device": device_metadata,
+        "normalization": normalization,
+        "patch_spec": patch_spec,
+        "stitch_strategy": stitch_strategy,
+        "n_patches": int(len(patches)),
+        "outputs": {
+            "predictions": repo_relative_path(npz_path, root=root),
+            "prediction_index": repo_relative_path(index_path, root=root),
+        },
+        "output_prediction_sha256": sha256_file(npz_path),
+        "prediction_coverage_fraction": float(np.mean(weight > 0.0)),
+    }
+    write_json(model_dir / "real_field_zero_shot_model_summary.json", summary)
+    return summary
+
+
+def build_real_field_patch_index(
+    valid_mask: np.ndarray,
+    *,
+    lateral_samples: int,
+    twt_samples: int,
+    lateral_stride: int,
+    twt_stride: int,
+    min_valid_fraction: float,
+) -> list[PatchGeometry]:
+    valid = np.asarray(valid_mask, dtype=bool)
+    if valid.ndim != 2:
+        raise ValueError("valid_mask must be 2D [lateral, twt].")
+    lateral_starts = _window_starts(valid.shape[0], int(lateral_samples), int(lateral_stride))
+    twt_starts = _window_starts(valid.shape[1], int(twt_samples), int(twt_stride))
+    rows: list[PatchGeometry] = []
+    for lateral_start in lateral_starts:
+        for twt_start in twt_starts:
+            patch_mask = valid[
+                lateral_start : lateral_start + lateral_samples,
+                twt_start : twt_start + twt_samples,
+            ]
+            fraction = float(np.mean(patch_mask))
+            if fraction >= float(min_valid_fraction):
+                rows.append(
+                    PatchGeometry(
+                        lateral_start=lateral_start,
+                        lateral_stop=lateral_start + lateral_samples,
+                        twt_start=twt_start,
+                        twt_stop=twt_start + twt_samples,
+                        valid_fraction=fraction,
+                    )
+                )
+    return rows
+
+
+def input_qc_frame(section: RealFieldSection, normalization: Mapping[str, Any]) -> pd.DataFrame:
+    rows = []
+    for name, values, stats_key in [
+        ("seismic", section.seismic, "seismic"),
+        ("lfm", section.lfm, "lfm"),
+    ]:
+        valid = section.valid_mask & np.isfinite(values)
+        data = values[valid].astype(np.float64)
+        row = {"input": name, "finite_fraction": float(np.mean(valid)), **_summary_stats(data)}
+        if stats_key in normalization:
+            normalized = (data - float(normalization[stats_key]["mean"])) / float(normalization[stats_key]["std"])
+            row.update(
+                {
+                    "normalized_mean": float(np.mean(normalized)) if normalized.size else float("nan"),
+                    "normalized_std": float(np.std(normalized)) if normalized.size else float("nan"),
+                    "fraction_abs_normalized_gt_3": float(np.mean(np.abs(normalized) > 3.0)) if normalized.size else 0.0,
+                    "fraction_abs_normalized_gt_5": float(np.mean(np.abs(normalized) > 5.0)) if normalized.size else 0.0,
+                }
+            )
+        rows.append(row)
+    rows.append(
+        {
+            "input": "valid_mask_model",
+            "finite_fraction": 1.0,
+            "mean": float(np.mean(section.valid_mask)),
+            "rms": float(np.sqrt(np.mean(section.valid_mask.astype(float) ** 2))),
+            "robust_rms": float("nan"),
+            "p01": float("nan"),
+            "p50": float("nan"),
+            "p99": float("nan"),
+        }
+    )
+    return pd.DataFrame.from_records(rows)
+
+
+def forward_log_ai(log_ai: np.ndarray, wavelet: np.ndarray) -> np.ndarray:
+    values = np.asarray(log_ai, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError("log_ai must have shape [lateral, twt].")
+    reflectivity = np.tanh(0.5 * (values[:, 1:] - values[:, :-1]))
+    wavelet_values = np.asarray(wavelet, dtype=np.float64).reshape(-1)
+    if wavelet_values.size < 3 or wavelet_values.size % 2 == 0:
+        raise ValueError("wavelet must have odd length >= 3.")
+    out = np.empty_like(reflectivity, dtype=np.float64)
+    for idx in range(reflectivity.shape[0]):
+        out[idx] = np.convolve(reflectivity[idx], wavelet_values, mode="same")
+    return out
+
+
+def load_selected_wavelet(wavelet_generation_dir: Path) -> tuple[np.ndarray, dict[str, Any]]:
+    csv_path = wavelet_generation_dir / "selected_wavelet.csv"
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"selected_wavelet.csv not found: {csv_path}")
+    frame = pd.read_csv(csv_path)
+    if "amplitude" not in frame:
+        raise ValueError(f"selected_wavelet.csv lacks amplitude column: {csv_path}")
+    wavelet = frame["amplitude"].to_numpy(dtype=np.float64)
+    return wavelet, {
+        "selected_wavelet_csv": str(csv_path),
+        "wavelet_sha256": sha256_file(csv_path),
+        "n_samples": int(wavelet.size),
+    }
+
+
+def diagnostic_metrics(
+    *,
+    observed: np.ndarray,
+    synthetic: np.ndarray,
+    valid_mask: np.ndarray,
+) -> dict[str, Any]:
+    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(observed) & np.isfinite(synthetic)
+    n_valid = int(np.count_nonzero(valid))
+    if n_valid < 8:
+        return {"status": "insufficient_valid_samples", "n_valid": n_valid}
+    obs = np.asarray(observed, dtype=np.float64)[valid]
+    syn = np.asarray(synthetic, dtype=np.float64)[valid]
+    syn_energy = float(np.dot(syn, syn))
+    obs_rms = float(np.sqrt(np.mean(obs * obs)))
+    syn_rms = float(np.sqrt(np.mean(syn * syn)))
+    raw = _residual_stats(obs, syn)
+    if syn_energy <= 0.0 or not np.isfinite(syn_energy):
+        return {
+            "status": "invalid_synthetic_energy",
+            "n_valid": n_valid,
+            "observed_rms": obs_rms,
+            "synthetic_rms_before_scale": syn_rms,
+            **raw,
+        }
+    scale = float(np.dot(obs, syn) / syn_energy)
+    scale_status = "ok" if scale > 0.0 else "invalid_nonpositive_scale"
+    scaled = _residual_stats(obs, scale * syn) if scale > 0.0 else {}
+    syn_centered = syn - float(np.mean(syn))
+    obs_centered = obs - float(np.mean(obs))
+    centered_energy = float(np.dot(syn_centered, syn_centered))
+    slope = float(np.dot(obs_centered, syn_centered) / centered_energy) if centered_energy > 0.0 else float("nan")
+    intercept = float(np.mean(obs) - slope * np.mean(syn)) if np.isfinite(slope) else float("nan")
+    slope_status = "ok" if np.isfinite(slope) and slope > 0.0 else "invalid_nonpositive_scale"
+    scaled_intercept = _residual_stats(obs, slope * syn + intercept) if slope_status == "ok" else {}
+    return {
+        "status": "ok",
+        "n_valid": n_valid,
+        "observed_rms": obs_rms,
+        "synthetic_rms_before_scale": syn_rms,
+        "scale_positive": scale,
+        "scale_status": scale_status,
+        "intercept": intercept,
+        "scale_intercept_status": slope_status,
+        "residual_rms_raw": raw["rmse"],
+        "residual_corr_raw": raw["corr"],
+        "residual_rms_scaled": scaled.get("rmse", float("nan")),
+        "residual_corr_scaled": scaled.get("corr", float("nan")),
+        "residual_rms_scaled_intercept": scaled_intercept.get("rmse", float("nan")),
+        "residual_corr_scaled_intercept": scaled_intercept.get("corr", float("nan")),
+    }
+
+
+def phase_shift_scan(
+    *,
+    observed: np.ndarray,
+    synthetic: np.ndarray,
+    valid_mask: np.ndarray,
+    phase_degrees: Sequence[float],
+    fractional_shift_samples: Sequence[float],
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for phase in phase_degrees:
+        candidate = _constant_phase_rotate(synthetic, float(phase))
+        row = diagnostic_metrics(observed=observed, synthetic=candidate, valid_mask=valid_mask)
+        rows.append({"scan_type": "phase", "phase_deg": float(phase), "fractional_shift_samples": 0.0, **row})
+    for shift in fractional_shift_samples:
+        candidate = _fractional_shift(synthetic, float(shift))
+        row = diagnostic_metrics(observed=observed, synthetic=candidate, valid_mask=valid_mask)
+        rows.append({"scan_type": "fractional_shift", "phase_deg": 0.0, "fractional_shift_samples": float(shift), **row})
+    return pd.DataFrame.from_records(rows)
+
+
+def load_zero_shot_predictions(run_dir: Path) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for child in sorted(run_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        npz_path = child / "predictions.npz"
+        summary_path = child / "real_field_zero_shot_model_summary.json"
+        if not npz_path.is_file():
+            continue
+        arrays = np.load(npz_path, allow_pickle=True)
+        summary = {}
+        if summary_path.is_file():
+            with summary_path.open("r", encoding="utf-8") as handle:
+                summary = json.load(handle)
+        role = str(summary.get("model_role") or child.name)
+        out[role] = {"dir": child, "arrays": arrays, "summary": summary}
+    if not out:
+        raise FileNotFoundError(f"No R0 model predictions found under {run_dir}")
+    return out
+
+
+def _load_npz_grid_section(
+    path: Path,
+    *,
+    section_cfg: Mapping[str, Any],
+    value_keys: Sequence[str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    data = np.load(path, allow_pickle=True)
+    key = next((candidate for candidate in value_keys if candidate in data.files), None)
+    if key is None:
+        raise ValueError(f"{path} lacks any value key from {list(value_keys)}; found {data.files}")
+    values = np.asarray(data[key])
+    if "samples" in data.files:
+        twt = np.asarray(data["samples"], dtype=np.float64)
+    elif "twt_s" in data.files:
+        twt = np.asarray(data["twt_s"], dtype=np.float64)
+    else:
+        raise ValueError(f"{path} lacks samples/twt_s axis.")
+    if twt.ndim != 1:
+        raise ValueError(f"{path} sample axis must be 1D.")
+    if values.ndim == 2:
+        lateral = values.shape[0]
+        sample_slice, cropped_twt = _crop_twt_axis(twt, section_cfg)
+        return (
+            np.asarray(values[:, sample_slice], dtype=np.float32),
+            np.arange(lateral, dtype=np.float64),
+            np.arange(lateral, dtype=np.float64),
+            cropped_twt,
+        )
+    if values.ndim != 3:
+        raise ValueError(f"{path} values must be 2D or 3D, got shape {values.shape}.")
+    il_axis = np.asarray(data["ilines"], dtype=np.float64)
+    xl_axis = np.asarray(data["xlines"], dtype=np.float64)
+    ilines, xlines = _section_line_path(section_cfg)
+    il_idx = _nearest_axis_indices(il_axis, ilines, axis_name="inline")
+    xl_idx = _nearest_axis_indices(xl_axis, xlines, axis_name="xline")
+    sample_slice, cropped_twt = _crop_twt_axis(twt, section_cfg)
+    section = values[il_idx, xl_idx, :][:, sample_slice]
+    return np.asarray(section, dtype=np.float32), ilines, xlines, cropped_twt
+
+
+def _load_survey_section(
+    path: Path,
+    *,
+    seismic_type: str,
+    section_cfg: Mapping[str, Any],
+    ilines: np.ndarray,
+    xlines: np.ndarray,
+    sample_start: float,
+    sample_end: float,
+    seismic_options: Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    options = segy_options_from_config(dict(seismic_options)) if seismic_type == "segy" else None
+    survey = open_survey(path, seismic_type, segy_options=options)
+    indices = []
+    for il, xl in zip(ilines, xlines):
+        i_float, j_float = survey.line_geometry.line_to_index(float(il), float(xl))
+        indices.append((int(round(i_float)), int(round(j_float))))
+    traces = survey.read_traces_at_indices(
+        indices,
+        sample_start=float(sample_start),
+        sample_end=float(sample_end),
+        domain="time",
+    )
+    first_trace = traces[indices[0]]
+    twt_s = np.asarray(first_trace.basis, dtype=np.float64)
+    values = [np.asarray(traces[key].values, dtype=np.float32) for key in indices]
+    arr = np.asarray(values, dtype=np.float32)
+    expected = int(np.asarray(section_cfg.get("expected_twt_samples", arr.shape[1])).item())
+    if "expected_twt_samples" in section_cfg and arr.shape[1] != expected:
+        raise ValueError(f"Survey section sample count {arr.shape[1]} != expected {expected}.")
+    return arr, twt_s
+
+
+def _section_line_path(section_cfg: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    path = section_cfg.get("path")
+    if not isinstance(path, list) or len(path) < 2:
+        raise ValueError("section.path must contain at least two inline/xline points.")
+    first = _mapping(path[0], "section.path[0]")
+    last = _mapping(path[-1], "section.path[-1]")
+    n_traces = int(section_cfg.get("n_traces") or _infer_trace_count(first, last))
+    if n_traces <= 0:
+        raise ValueError("section.n_traces must be positive.")
+    ilines = np.linspace(float(first["inline"]), float(last["inline"]), n_traces)
+    xlines = np.linspace(float(first["xline"]), float(last["xline"]), n_traces)
+    return ilines, xlines
+
+
+def _infer_trace_count(first: Mapping[str, Any], last: Mapping[str, Any]) -> int:
+    return int(max(abs(float(last["inline"]) - float(first["inline"])), abs(float(last["xline"]) - float(first["xline"]))) + 1)
+
+
+def _nearest_axis_indices(axis: np.ndarray, values: np.ndarray, *, axis_name: str) -> np.ndarray:
+    axis_values = np.asarray(axis, dtype=np.float64)
+    indices = np.searchsorted(axis_values, values)
+    indices = np.clip(indices, 0, axis_values.size - 1)
+    left = np.maximum(indices - 1, 0)
+    choose_left = np.abs(axis_values[left] - values) < np.abs(axis_values[indices] - values)
+    nearest = np.where(choose_left, left, indices)
+    tolerance = float(np.median(np.abs(np.diff(axis_values)))) * 0.51 if axis_values.size > 1 else 1e-6
+    if np.any(np.abs(axis_values[nearest] - values) > tolerance):
+        raise ValueError(f"Requested {axis_name} values are not supported by the source grid.")
+    return nearest.astype(np.int64)
+
+
+def _crop_twt_axis(twt: np.ndarray, section_cfg: Mapping[str, Any]) -> tuple[slice, np.ndarray]:
+    start = section_cfg.get("sample_start_s")
+    end = section_cfg.get("sample_end_s")
+    i0 = 0 if start is None else int(np.searchsorted(twt, float(start), side="left"))
+    i1 = twt.size if end is None else int(np.searchsorted(twt, float(end), side="right"))
+    i0 = max(0, i0)
+    i1 = min(twt.size, i1)
+    if i0 >= i1:
+        raise ValueError("Selected TWT window is empty.")
+    return slice(i0, i1), np.asarray(twt[i0:i1], dtype=np.float64)
+
+
+def _align_time_arrays(
+    first: np.ndarray,
+    first_twt: np.ndarray,
+    second: np.ndarray,
+    second_twt: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if first.shape[1] == second.shape[1] and np.allclose(first_twt, second_twt, rtol=0.0, atol=1e-8):
+        return first, second, first_twt
+    dt_first = float(np.median(np.diff(first_twt)))
+    dt_second = float(np.median(np.diff(second_twt)))
+    if not np.isclose(dt_first, dt_second, rtol=0.0, atol=1e-8):
+        raise ValueError(f"Cannot align time axes with different dt: {dt_first} vs {dt_second}")
+    start = max(float(first_twt[0]), float(second_twt[0]))
+    end = min(float(first_twt[-1]), float(second_twt[-1]))
+    if start > end:
+        raise ValueError("Time axes do not overlap.")
+    dt = dt_first
+    n = int(np.floor((end - start) / dt + 0.5)) + 1
+    if n <= 0:
+        raise ValueError("Time axes have no common samples.")
+    common = start + np.arange(n, dtype=np.float64) * dt
+    first_idx = _nearest_time_indices(first_twt, common, dt=dt, name="first_twt")
+    second_idx = _nearest_time_indices(second_twt, common, dt=dt, name="second_twt")
+    return first[:, first_idx], second[:, second_idx], common
+
+
+def _nearest_time_indices(axis: np.ndarray, values: np.ndarray, *, dt: float, name: str) -> np.ndarray:
+    indices = np.searchsorted(axis, values)
+    indices = np.clip(indices, 0, axis.size - 1)
+    left = np.maximum(indices - 1, 0)
+    choose_left = np.abs(axis[left] - values) < np.abs(axis[indices] - values)
+    nearest = np.where(choose_left, left, indices)
+    delta = np.abs(axis[nearest] - values)
+    if np.any(delta > max(abs(dt) * 0.25, 1e-8)):
+        raise ValueError(f"{name} cannot be aligned to common TWT axis.")
+    return nearest.astype(np.int64)
+
+
+def _assert_axes_close(name: str, actual: np.ndarray, expected: np.ndarray) -> None:
+    if actual.shape != expected.shape or not np.allclose(actual, expected, rtol=0.0, atol=1e-6):
+        raise ValueError(f"{name} mismatch.")
+
+
+def _resolve_model_artifact(value: Any, *, root: Path, model_run_dir: Path, fallback_name: str) -> Path:
+    resolved = resolve_artifact_path(value, root=root, run_dir=model_run_dir) if value else None
+    if resolved is not None and resolved.is_file():
+        return resolved
+    fallback = model_run_dir / fallback_name
+    if fallback.is_file():
+        return fallback
+    raise FileNotFoundError(f"Cannot resolve model artifact {value!r}; fallback missing: {fallback}")
+
+
+def _normalize_with_mask(values: np.ndarray, mask: np.ndarray, stats: Mapping[str, Any]) -> np.ndarray:
+    out = (np.asarray(values, dtype=np.float32) - float(stats["mean"])) / float(stats["std"])
+    return np.where(mask & np.isfinite(out), out, 0.0).astype(np.float32)
+
+
+def _window_starts(size: int, window: int, stride: int) -> list[int]:
+    if window <= 0 or stride <= 0:
+        raise ValueError("Patch window and stride must be positive.")
+    if size < window:
+        raise ValueError(f"Section size {size} is smaller than patch window {window}.")
+    starts = list(range(0, size - window + 1, stride))
+    last = size - window
+    if starts[-1] != last:
+        starts.append(last)
+    return starts
+
+
+def _stitch_slices(patch: PatchGeometry, *, strategy: str) -> tuple[tuple[slice, slice], tuple[slice, slice]]:
+    lateral = patch.lateral_stop - patch.lateral_start
+    twt = patch.twt_stop - patch.twt_start
+    if strategy == "uniform":
+        l0, l1 = 0, lateral
+        t0, t1 = 0, twt
+    elif strategy == "center_crop":
+        l0, l1 = _center_crop_bounds(lateral)
+        t0, t1 = _center_crop_bounds(twt)
+    else:
+        raise ValueError(f"Unsupported stitch strategy: {strategy}")
+    return (
+        (slice(l0, l1), slice(t0, t1)),
+        (slice(patch.lateral_start + l0, patch.lateral_start + l1), slice(patch.twt_start + t0, patch.twt_start + t1)),
+    )
+
+
+def _center_crop_bounds(size: int) -> tuple[int, int]:
+    if size <= 4:
+        return 0, size
+    margin = max(1, size // 4)
+    return margin, size - margin
+
+
+def _summary_stats(values: np.ndarray) -> dict[str, float]:
+    data = np.asarray(values, dtype=np.float64)
+    if data.size == 0:
+        return {"mean": float("nan"), "rms": float("nan"), "robust_rms": float("nan"), "p01": float("nan"), "p50": float("nan"), "p99": float("nan")}
+    median = float(np.median(data))
+    mad = float(np.median(np.abs(data - median)))
+    return {
+        "mean": float(np.mean(data)),
+        "rms": float(np.sqrt(np.mean(data * data))),
+        "robust_rms": float(1.4826 * mad),
+        "p01": float(np.quantile(data, 0.01)),
+        "p50": median,
+        "p99": float(np.quantile(data, 0.99)),
+    }
+
+
+def _residual_stats(observed: np.ndarray, synthetic: np.ndarray) -> dict[str, float]:
+    residual = observed - synthetic
+    rmse = float(np.sqrt(np.mean(residual * residual)))
+    if observed.size < 2 or np.std(observed) <= 0.0 or np.std(synthetic) <= 0.0:
+        corr = float("nan")
+    else:
+        corr = float(np.corrcoef(observed, synthetic)[0, 1])
+    return {"rmse": rmse, "corr": corr}
+
+
+def _constant_phase_rotate(values: np.ndarray, phase_deg: float) -> np.ndarray:
+    analytic = _analytic_signal(values)
+    radians = np.deg2rad(float(phase_deg))
+    return np.real(analytic * np.exp(1j * radians))
+
+
+def _analytic_signal(values: np.ndarray) -> np.ndarray:
+    x = np.asarray(values, dtype=np.float64)
+    n = x.shape[-1]
+    spectrum = np.fft.fft(x, axis=-1)
+    h = np.zeros(n, dtype=np.float64)
+    if n % 2 == 0:
+        h[0] = h[n // 2] = 1.0
+        h[1 : n // 2] = 2.0
+    else:
+        h[0] = 1.0
+        h[1 : (n + 1) // 2] = 2.0
+    return np.fft.ifft(spectrum * h, axis=-1)
+
+
+def _fractional_shift(values: np.ndarray, shift_samples: float) -> np.ndarray:
+    x = np.asarray(values, dtype=np.float64)
+    coords = np.arange(x.shape[-1], dtype=np.float64)
+    shifted_coords = coords - float(shift_samples)
+    out = np.empty_like(x)
+    for idx in range(x.shape[0]):
+        out[idx] = np.interp(shifted_coords, coords, x[idx], left=np.nan, right=np.nan)
+    return out
+
+
+def _mapping(value: Any, path: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{path} must be a mapping.")
+    return dict(value)
+
+
+def _required_text(config: Mapping[str, Any], key: str) -> str:
+    text = "" if config.get(key) is None else str(config.get(key)).strip()
+    if not text:
+        raise ValueError(f"Missing required config value: {key}")
+    return text

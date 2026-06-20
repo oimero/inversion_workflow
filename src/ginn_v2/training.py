@@ -26,6 +26,35 @@ PHYSICS_LOSS_MODEL_IDS = {
 }
 
 
+def resolve_device(device_name: str) -> tuple[torch.device, dict[str, Any]]:
+    """Resolve a requested torch device and return auditable metadata.
+
+    ``auto`` keeps the historical behavior: use CUDA when available, otherwise
+    CPU.  Explicit values such as ``cuda`` are not softened into a fallback; if
+    the runtime cannot satisfy them, PyTorch will fail before the run produces
+    outputs.
+    """
+
+    requested = str(device_name or "auto")
+    cuda_available = bool(torch.cuda.is_available())
+    resolved = requested if requested != "auto" else ("cuda" if cuda_available else "cpu")
+    if requested.startswith("cuda") and not cuda_available:
+        raise RuntimeError("Requested CUDA device, but torch.cuda.is_available() is false.")
+    device = torch.device(resolved)
+    device_name_text = ""
+    if device.type == "cuda" and cuda_available:
+        device_name_text = torch.cuda.get_device_name(device)
+    metadata = {
+        "requested_device": requested,
+        "resolved_device": str(device),
+        "cuda_available": cuda_available,
+        "cuda_device_count": int(torch.cuda.device_count()) if cuda_available else 0,
+        "cuda_device_name": device_name_text,
+        "torch_version": str(torch.__version__),
+    }
+    return device, metadata
+
+
 def masked_mse(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     valid = mask > 0.5
     if torch.count_nonzero(valid) == 0:
@@ -69,11 +98,7 @@ def train_model(
         torch.cuda.manual_seed_all(int(seed))
     generator = torch.Generator()
     generator.manual_seed(int(seed))
-    device = torch.device(
-        device_name
-        if device_name != "auto"
-        else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device, device_metadata = resolve_device(device_name)
     train_ds = PatchDataset(
         benchmark,
         patch_index,
@@ -170,6 +195,7 @@ def train_model(
                         "hidden_channels": int(hidden_channels),
                         "depth": int(depth),
                     },
+                    "device": device_metadata,
                 },
                 best_path,
             )
@@ -179,6 +205,7 @@ def train_model(
     return {
         "status": "ok",
         "device": str(device),
+        "device_metadata": device_metadata,
         "checkpoint": best_path,
         "history": history_path,
         "best_validation_loss": best_val,
@@ -279,11 +306,7 @@ def predict_patches(
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     model, checkpoint = load_checkpoint(checkpoint_path)
-    device = torch.device(
-        device_name
-        if device_name != "auto"
-        else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device, device_metadata = resolve_device(device_name)
     model.to(device)
     model.eval()
     selected = patch_index.copy()
@@ -350,6 +373,7 @@ def predict_patches(
         "model_id": str(checkpoint["model_id"]),
         "model_info": dict(checkpoint["model_info"]),
         "normalization": dict(checkpoint["normalization"]),
+        "device_metadata": device_metadata,
     }
 
 

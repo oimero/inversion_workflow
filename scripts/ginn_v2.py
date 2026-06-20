@@ -180,6 +180,7 @@ def _write_train_manifest(
             "overfit_tiny": bool(args.overfit_tiny),
             "seed": int(args.seed),
         },
+        "device": train_result.get("device_metadata", {"resolved_device": train_result.get("device", "")}),
         "model_info": train_result["model_info"],
         "checkpoint": repo_relative_path(train_result["checkpoint"], root=REPO_ROOT),
         "training_history": repo_relative_path(train_result["history"], root=REPO_ROOT),
@@ -367,6 +368,7 @@ def run_predict(args: argparse.Namespace) -> None:
         "patch_index_sha256": patch_index_sha256,
         "checkpoint_sha256": result["checkpoint_sha256"],
         "prediction_sha256": result["prediction_sha256"],
+        "device": result.get("device_metadata", {}),
     }
     write_json(output_dir / "prediction_summary.json", summary)
     write_json(output_dir / "prediction_manifest.json", summary)

@@ -44,6 +44,100 @@ class PatchGeometry:
     valid_fraction: float
 
 
+def finite_summary_stats(values: np.ndarray) -> dict[str, float]:
+    data = np.asarray(values, dtype=np.float64)
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        return {
+            "mean": float("nan"),
+            "std": float("nan"),
+            "rms": float("nan"),
+            "robust_rms": float("nan"),
+            "p01": float("nan"),
+            "p05": float("nan"),
+            "p50": float("nan"),
+            "p95": float("nan"),
+            "p99": float("nan"),
+            "abs_p95": float("nan"),
+            "abs_p99": float("nan"),
+        }
+    median = float(np.median(data))
+    mad = float(np.median(np.abs(data - median)))
+    return {
+        "mean": float(np.mean(data)),
+        "std": float(np.std(data)),
+        "rms": float(np.sqrt(np.mean(data * data))),
+        "robust_rms": float(1.4826 * mad),
+        "p01": float(np.quantile(data, 0.01)),
+        "p05": float(np.quantile(data, 0.05)),
+        "p50": median,
+        "p95": float(np.quantile(data, 0.95)),
+        "p99": float(np.quantile(data, 0.99)),
+        "abs_p95": float(np.quantile(np.abs(data), 0.95)),
+        "abs_p99": float(np.quantile(np.abs(data), 0.99)),
+    }
+
+
+def transform_real_seismic(
+    seismic: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    transform: str,
+    reference_stats: Mapping[str, Any] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Apply an auditable real-field seismic input transform.
+
+    The transform is deterministic and diagnostic; it does not modify the model
+    checkpoint or normalization.  Matching is done against synthetic train
+    seismic summary statistics supplied by the caller.
+    """
+
+    mode = str(transform or "identity").strip()
+    values = np.asarray(seismic, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(values)
+    real = finite_summary_stats(values[valid])
+    if mode in {"identity", "raw", "none"}:
+        return np.asarray(values, dtype=np.float32), {
+            "seismic_value_transform": "identity",
+            "real_input_stats": real,
+            "reference_stats": dict(reference_stats or {}),
+            "scale": 1.0,
+            "center": 0.0,
+            "polarity": 1.0,
+        }
+    if reference_stats is None:
+        raise ValueError(f"seismic_value_transform={mode} requires synthetic reference stats.")
+    ref = dict(reference_stats)
+    center = float(real["p50"])
+    ref_mean = float(ref["mean"])
+    polarity = -1.0 if mode.endswith("_polarity_flip") else 1.0
+    base_mode = mode.removesuffix("_polarity_flip")
+    if base_mode == "robust_rms_matched":
+        numerator = float(ref["robust_rms"])
+        denominator = float(real["robust_rms"])
+    elif base_mode == "p95_abs_matched":
+        numerator = float(ref["abs_p95"])
+        denominator = float(real["abs_p95"])
+    elif base_mode == "p99_abs_matched":
+        numerator = float(ref["abs_p99"])
+        denominator = float(real["abs_p99"])
+    else:
+        raise ValueError(f"Unsupported seismic_value_transform: {mode}")
+    if denominator <= 0.0 or not np.isfinite(denominator) or not np.isfinite(numerator):
+        raise ValueError(f"Cannot apply seismic_value_transform={mode}: invalid scale denominator/reference.")
+    scale = numerator / denominator
+    transformed = polarity * (values - center) * scale + ref_mean
+    metadata = {
+        "seismic_value_transform": mode,
+        "real_input_stats": real,
+        "reference_stats": ref,
+        "scale": float(scale),
+        "center": center,
+        "polarity": polarity,
+    }
+    return np.asarray(transformed, dtype=np.float32), metadata
+
+
 def load_real_field_section(
     *,
     config: Mapping[str, Any],
@@ -115,6 +209,14 @@ def load_real_field_section(
         )
     if not np.any(valid_mask):
         raise ValueError("Real-field section has no finite valid samples.")
+    seismic_transform = inputs.get("seismic_value_transform") or inputs.get("seismic_transform") or "identity"
+    reference_stats = inputs.get("seismic_reference_stats")
+    seismic, seismic_transform_metadata = transform_real_seismic(
+        seismic,
+        valid_mask,
+        transform=str(seismic_transform),
+        reference_stats=reference_stats if isinstance(reference_stats, Mapping) else None,
+    )
     return RealFieldSection(
         seismic=np.asarray(seismic, dtype=np.float32),
         lfm=np.asarray(lfm_values, dtype=np.float32),
@@ -128,6 +230,8 @@ def load_real_field_section(
             "seismic_type": seismic_type,
             "target_mask_file": mask_path_text,
             "lfm_value_transform": lfm_transform,
+            "seismic_value_transform": str(seismic_transform),
+            "seismic_transform_metadata": seismic_transform_metadata,
             "section": dict(section_cfg),
         },
     )
@@ -693,18 +797,14 @@ def _center_crop_bounds(size: int) -> tuple[int, int]:
 
 
 def _summary_stats(values: np.ndarray) -> dict[str, float]:
-    data = np.asarray(values, dtype=np.float64)
-    if data.size == 0:
-        return {"mean": float("nan"), "rms": float("nan"), "robust_rms": float("nan"), "p01": float("nan"), "p50": float("nan"), "p99": float("nan")}
-    median = float(np.median(data))
-    mad = float(np.median(np.abs(data - median)))
+    stats = finite_summary_stats(values)
     return {
-        "mean": float(np.mean(data)),
-        "rms": float(np.sqrt(np.mean(data * data))),
-        "robust_rms": float(1.4826 * mad),
-        "p01": float(np.quantile(data, 0.01)),
-        "p50": median,
-        "p99": float(np.quantile(data, 0.99)),
+        "mean": stats["mean"],
+        "rms": stats["rms"],
+        "robust_rms": stats["robust_rms"],
+        "p01": stats["p01"],
+        "p50": stats["p50"],
+        "p99": stats["p99"],
     }
 
 

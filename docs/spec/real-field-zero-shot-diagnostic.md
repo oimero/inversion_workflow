@@ -19,6 +19,11 @@
 - R1：`scripts/real_field_forward_diagnostic.py`
 - 核心包：`src/ginn_v2/real_field.py` 或后续等价模块
 
+R0 使用的真实工区 LFM 必须来自当前分支可复现的输入准备契约，见
+[`real-field-lfm-input.md`](real-field-lfm-input.md)。历史遗留
+`scripts/output/lfm_precomputed_*/ai_lfm_time.npz` 不得作为默认 LFM；如需对照，只能显式标记为
+`legacy_lfm_negative_control`。
+
 稳定生产链仍终止于第五步。R0/R1 输出均为 research output，在完成 R2/R3/R4 前不得替代
 前五步生产链。
 
@@ -76,7 +81,9 @@ real_field_zero_shot:
   real_field_inputs:
     seismic_file: <real seismic volume>
     seismic_type: segy|zgy
-    lfm_file: <real-field LFM/logAI prior>
+    seismic_value_transform: p99_abs_matched
+    lfm_file: <real_field_lfm_v1/real_field_lfm.npz>
+    lfm_value_transform: identity
     target_mask_file: <target-window mask or horizon-derived mask source>
   models:
     - model_role: no_lateral
@@ -99,6 +106,10 @@ real_field_zero_shot:
 
 - 真实地震、LFM、mask 使用同一 inline/xline/TWT 轴或可审计的显式重采样结果。
 - LFM 是 `log(AI)` 语义，且单位、采样间隔和时间轴写入 manifest。
+- LFM 必须包含 R0 可直接消费的 `log_ai` 字段；不得把旧 AI 体通过 `lfm_value_transform: log`
+  伪装成当前分支 LFM。
+- LFM 必须提供 `valid_mask_model` 或等价目标层有效区；mask 是 R0/R1 的权威边界，时间窗只是
+  裁剪和图件配置。
 - 模型 checkpoint、model manifest、normalization manifest 和 `model_id` 一致。
 - 模型候选必须能追溯到冻结 synthetic gate summary 和 report SHA-256；不得把其他 seed、
   其他 checkpoint、k5 变体或临时平滑后处理混作同一候选。
@@ -108,7 +119,43 @@ real_field_zero_shot:
 若真实工区数据需要从 3D 体裁剪剖面或小体，裁剪范围必须进入 `prediction_index.csv`，
 不能只保存在命令行日志中。
 
-### 3.1 输入分布 QC
+R0 不强制只使用目标层时间窗。若配置使用更宽时窗，patch 采样、stitching、输入 QC、井旁图件和
+R1 正演诊断都必须严格使用 LFM 的 `valid_mask_model`。不得通过目标层外常数外推制造 finite LFM，
+也不得把 mask 外平坦 LFM 解释为模型真实输入条件。推荐使用目标窗加小上下文，只是为了改善图件
+和 patch 覆盖，不是地质边界。
+
+R0 不得将 NaN 送入模型张量。送入模型前，mask 外 LFM 和 seismic 在各自 normalization 之后填 0，
+并保留 `valid_mask_model=false` 作为输入通道和评价边界。若 `lfm_file` 指向
+`lfm_precomputed_*`，primary R0 必须失败；只有显式 `legacy_lfm_negative_control: true` 时才允许
+作为历史负对照运行。
+
+若 LFM summary 或 `zone_boundary_jump_qc.csv` 显示相邻 zone 边界跳变主导正演响应，R1 必须标记
+`lfm_boundary_jump_dominated`。该反射只能解释为 LFM 构造风险，不能解释为模型预测能力。
+
+### 3.1 固定输入值域变换
+
+R0 允许对真实地震输入做一个显式、可追溯的值域变换，使其进入合成训练集的 seismic 输入
+尺度。该变换属于输入契约，不是 gain 校准、wavelet 校准、模型后处理或 R1 正演调参。变换
+必须在 `real_field_zero_shot_summary.json` 中记录真实输入统计、synthetic train 参考统计、缩放
+系数、中心值和极性。
+
+当前工区冻结候选为：
+
+```yaml
+real_field_inputs:
+  seismic_value_transform: p99_abs_matched
+```
+
+其语义是：以真实地震窗内中位数为中心，用 synthetic train seismic 的 `abs_p99` 匹配真实地震
+窗内 `abs_p99`。R0.6 输入变换闸门中，原始地震归一化后几乎全窗越界；`p99_abs_matched`
+将 `fraction_abs_normalized_seismic_gt_5` 降为 0，并使两条 zero-shot 模型输出回到约
+`log(AI)≈9` 的合理范围。因此，后续 R0/R1 默认使用该变换；`raw` 只保留为负对照。
+
+可选候选包括 `robust_rms_matched`、`p95_abs_matched` 及极性翻转版本，但不能在同一次 R0
+主表中与 `p99_abs_matched` 混用。若未来换工区或换合成基准，必须重新运行输入变换闸门，
+不能继承当前工区的缩放系数。
+
+### 3.2 输入分布 QC
 
 真实地震和真实 LFM 是模型输入，不只是图件背景。R0 必须在模型预测前输出输入分布 QC，
 并与 synthetic train normalization manifest 对照。至少记录：

@@ -17,10 +17,13 @@ import pandas as pd
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
+from scripts.real_field_input_domain_diagnostic import _load_model_manifest, _synthetic_train_values
 from ginn_v2.real_field import input_qc_frame, load_real_field_section, run_zero_shot_model
 
 
@@ -558,9 +561,6 @@ def main() -> None:
 
     device = str(args.device or run_cfg.get("device") or "auto")
     stitch_strategy = str(args.stitch_strategy or run_cfg.get("stitch_strategy") or "uniform")
-    data_root = resolve_relative_path(cfg.get("data_root", "data"), root=REPO_ROOT)
-    section = load_real_field_section(config=run_cfg, root=REPO_ROOT, data_root=data_root)
-
     models = run_cfg.get("models")
     if not isinstance(models, list) or not models:
         raise ValueError("real_field_zero_shot.models must be a non-empty list.")
@@ -571,6 +571,25 @@ def main() -> None:
     seen = {str(item.get("model_role")): str(item.get("model_id")) for item in models if isinstance(item, dict)}
     if seen != expected:
         raise ValueError(f"R0 first batch must contain exactly {expected}, got {seen}.")
+    data_root = resolve_relative_path(cfg.get("data_root", "data"), root=REPO_ROOT)
+    run_cfg_for_load = dict(run_cfg)
+    inputs_for_load = dict(run_cfg_for_load.get("real_field_inputs") or {})
+    transform_name = str(inputs_for_load.get("seismic_value_transform") or inputs_for_load.get("seismic_transform") or "identity")
+    if transform_name not in {"identity", "raw", "none"} and "seismic_reference_stats" not in inputs_for_load:
+        diag_cfg = dict(cfg.get("real_field_input_domain_diagnostic") or {})
+        manifest = _load_model_manifest(dict(models[0]))
+        values, metadata = _synthetic_train_values(
+            manifest,
+            input_name="seismic",
+            max_patches=int(diag_cfg.get("max_synthetic_train_patches", 4096)),
+            seed=int(diag_cfg.get("synthetic_train_sampling_seed", 20260620)),
+        )
+        from ginn_v2.real_field import finite_summary_stats
+
+        inputs_for_load["seismic_reference_stats"] = finite_summary_stats(values)
+        inputs_for_load["seismic_reference_sampling"] = metadata
+        run_cfg_for_load["real_field_inputs"] = inputs_for_load
+    section = load_real_field_section(config=run_cfg_for_load, root=REPO_ROOT, data_root=data_root)
 
     model_summaries = []
     input_qc_written = False

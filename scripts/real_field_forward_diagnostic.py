@@ -59,26 +59,40 @@ def _git_commit() -> str:
     return result.stdout.strip()
 
 
-def _crop_forward_arrays(
+def _erode_forward_arrays(
     observed: np.ndarray,
     synthetic: np.ndarray,
     valid: np.ndarray,
     *,
-    crop_samples: int,
+    erosion_samples: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     obs = np.asarray(observed, dtype=np.float64)[:, 1:]
     syn = np.asarray(synthetic, dtype=np.float64)
     mask = np.asarray(valid, dtype=bool)[:, 1:]
     if obs.shape != syn.shape or mask.shape != syn.shape:
         raise ValueError(f"Forward diagnostic shape mismatch: obs={obs.shape}, syn={syn.shape}, mask={mask.shape}")
-    if crop_samples > 0:
-        if obs.shape[1] <= 2 * crop_samples:
-            raise ValueError("forward_diagnostic_crop_s removes the whole time window.")
-        sl = slice(crop_samples, obs.shape[1] - crop_samples)
-        obs = obs[:, sl]
-        syn = syn[:, sl]
-        mask = mask[:, sl]
-    return obs, syn, mask
+    eroded = _erode_valid_runs(mask, int(erosion_samples))
+    if not np.any(eroded):
+        raise ValueError("forward_diagnostic_erosion_s removes all valid forward samples.")
+    return obs, syn, eroded
+
+
+def _erode_valid_runs(mask: np.ndarray, erosion_samples: int) -> np.ndarray:
+    valid = np.asarray(mask, dtype=bool)
+    if erosion_samples <= 0:
+        return valid.copy()
+    out = np.zeros_like(valid, dtype=bool)
+    for row_idx in range(valid.shape[0]):
+        row = valid[row_idx]
+        changes = np.diff(np.r_[False, row, False].astype(np.int8))
+        starts = np.flatnonzero(changes == 1)
+        stops = np.flatnonzero(changes == -1)
+        for start, stop in zip(starts, stops):
+            inner_start = int(start + erosion_samples)
+            inner_stop = int(stop - erosion_samples)
+            if inner_stop > inner_start:
+                out[row_idx, inner_start:inner_stop] = True
+    return out
 
 
 def _spatial_rows(*, model_role: str, observed: np.ndarray, synthetic: np.ndarray, valid: np.ndarray) -> list[dict[str, object]]:
@@ -414,13 +428,16 @@ def _build_well_forward_qc(
                 syn_arrays = np.load(synthetic_path, allow_pickle=True)
                 observed = np.asarray(syn_arrays["observed_seismic_forward_axis"], dtype=np.float64)[trace_idx : trace_idx + 1]
                 synthetic = np.asarray(syn_arrays["synthetic_seismic"], dtype=np.float64)[trace_idx : trace_idx + 1]
-                valid_forward = np.asarray(syn_arrays["valid_mask_forward_axis"], dtype=bool)[trace_idx : trace_idx + 1]
+                valid_display = np.asarray(syn_arrays["valid_mask_forward_axis"], dtype=bool)[trace_idx : trace_idx + 1]
+                valid_key = "valid_mask_forward_eroded_axis" if "valid_mask_forward_eroded_axis" in syn_arrays.files else "valid_mask_forward_axis"
+                valid_forward = np.asarray(syn_arrays[valid_key], dtype=bool)[trace_idx : trace_idx + 1]
                 twt_forward = np.asarray(syn_arrays["twt_s_forward_axis"], dtype=np.float64)
                 tie_start = pd.to_numeric(tie.get("tie_window_start_s"), errors="coerce")
                 tie_end = pd.to_numeric(tie.get("tie_window_end_s"), errors="coerce")
                 if np.isfinite(tie_start) and np.isfinite(tie_end):
                     window = (twt_forward >= float(tie_start)) & (twt_forward <= float(tie_end))
                     valid_forward = valid_forward & window[None, :]
+                    valid_display = valid_display & window[None, :]
                 waveform = diagnostic_metrics(observed=observed, synthetic=synthetic, valid_mask=valid_forward)
                 waveform_metrics = {f"waveform_{key}": value for key, value in waveform.items()}
             rows.append(
@@ -482,12 +499,27 @@ def _plot_well_qc(
         twt = arrays["twt_s_forward_axis"]
         observed = arrays["observed_seismic_forward_axis"][trace_idx]
         synthetic = arrays["synthetic_seismic"][trace_idx]
+        valid_display = np.asarray(arrays["valid_mask_forward_axis"], dtype=bool)[trace_idx]
+        valid_key = "valid_mask_forward_eroded_axis" if "valid_mask_forward_eroded_axis" in arrays.files else "valid_mask_forward_axis"
+        valid_diagnostic = np.asarray(arrays[valid_key], dtype=bool)[trace_idx]
+        observed_plot = np.where(valid_display, observed, np.nan)
+        synthetic_plot = np.where(valid_display, synthetic, np.nan)
+        residual_plot = np.where(valid_display, observed - synthetic, np.nan)
         if role == next(iter(predictions)):
-            first_observed = observed
+            first_observed = observed_plot
             first_twt = twt
-            axes[1].plot(observed, twt, color="black", label="observed", linewidth=1.0)
-        axes[1].plot(synthetic, twt, label=f"syn {role}", linewidth=1.0)
-        axes[2].plot(observed - synthetic, twt, label=f"res {role}", linewidth=1.0)
+            axes[1].plot(observed_plot, twt, color="black", label="observed", linewidth=1.0)
+        axes[1].plot(synthetic_plot, twt, label=f"syn {role}", linewidth=1.0)
+        axes[2].plot(residual_plot, twt, label=f"res {role}", linewidth=1.0)
+        diagnostic_n = int(np.count_nonzero(valid_diagnostic & np.isfinite(observed) & np.isfinite(synthetic)))
+        if diagnostic_n < 8:
+            axes[2].text(
+                0.02,
+                0.92 - 0.08 * len(axes[2].lines),
+                f"{role}: diagnostic n={diagnostic_n}",
+                transform=axes[2].transAxes,
+                fontsize=8,
+            )
     axes[1].invert_yaxis()
     axes[1].set_xlabel("seismic")
     axes[1].set_title(f"{well_name} forward")
@@ -509,26 +541,31 @@ def _plot_forward_qc(
     model_role: str,
     observed: np.ndarray,
     synthetic: np.ndarray,
-    valid: np.ndarray,
+    display_valid: np.ndarray,
+    diagnostic_valid: np.ndarray,
 ) -> str:
     figures = output_dir / "figures"
     figures.mkdir(parents=True, exist_ok=True)
-    residual = np.where(valid, observed - synthetic, np.nan)
+    display_mask = np.asarray(display_valid, dtype=bool)
+    diagnostic_mask = np.asarray(diagnostic_valid, dtype=bool)
+    residual = np.where(display_mask, observed - synthetic, np.nan)
     panels = [
-        ("observed", np.where(valid, observed, np.nan), "seismic"),
-        ("synthetic", np.where(valid, synthetic, np.nan), "seismic"),
+        ("observed", np.where(display_mask, observed, np.nan), "seismic"),
+        ("synthetic", np.where(display_mask, synthetic, np.nan), "seismic"),
         ("residual", residual, "residual"),
     ]
     fig, axes = plt.subplots(1, 3, figsize=(12, 4), sharey=True)
     for ax, (_, values, title) in zip(axes, panels):
         finite = values[np.isfinite(values)]
         vmax = float(np.quantile(np.abs(finite), 0.99)) if finite.size else 1.0
-        image = ax.imshow(values.T, aspect="auto", origin="lower", cmap="seismic", vmin=-vmax, vmax=vmax)
+        image = ax.imshow(values.T, aspect="auto", origin="upper", cmap="seismic", vmin=-vmax, vmax=vmax)
+        if np.any(diagnostic_mask):
+            ax.contour(diagnostic_mask.T.astype(float), levels=[0.5], colors="black", linewidths=0.4)
         ax.set_title(title)
         ax.set_xlabel("lateral trace")
         fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
     axes[0].set_ylabel("forward TWT sample")
-    fig.suptitle(f"R1 forward QC: {model_role}")
+    fig.suptitle(f"R1 forward QC: {model_role} (black outline = eroded diagnostic mask)")
     fig.tight_layout()
     path = figures / f"{model_role}_observed_synthetic_residual.png"
     fig.savefig(path, dpi=160)
@@ -543,16 +580,26 @@ def _plot_scan_qc(output_dir: Path, decomposition: pd.DataFrame) -> str:
     if decomposition.empty:
         return ""
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    for role, group in decomposition[decomposition["scan_type"].eq("phase")].groupby("model_role"):
+    phase_frame = decomposition[
+        decomposition["scan_type"].eq("phase") & np.isfinite(decomposition["residual_rms_scaled"])
+    ]
+    for role, group in phase_frame.groupby("model_role"):
         axes[0].plot(group["phase_deg"], group["residual_rms_scaled"], marker="o", label=role)
     axes[0].set_title("Phase scan")
     axes[0].set_xlabel("phase deg")
     axes[0].set_ylabel("scaled residual RMS")
+    if phase_frame.empty:
+        axes[0].text(0.5, 0.5, "no valid positive-scale phase rows", ha="center", va="center", transform=axes[0].transAxes)
     axes[0].legend(fontsize=8)
-    for role, group in decomposition[decomposition["scan_type"].eq("fractional_shift")].groupby("model_role"):
+    shift_frame = decomposition[
+        decomposition["scan_type"].eq("fractional_shift") & np.isfinite(decomposition["residual_rms_scaled"])
+    ]
+    for role, group in shift_frame.groupby("model_role"):
         axes[1].plot(group["fractional_shift_samples"], group["residual_rms_scaled"], marker="o", label=role)
     axes[1].set_title("Fractional shift scan")
     axes[1].set_xlabel("shift samples")
+    if shift_frame.empty:
+        axes[1].text(0.5, 0.5, "no valid positive-scale shift rows", ha="center", va="center", transform=axes[1].transAxes)
     axes[1].legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=160)
@@ -567,11 +614,14 @@ def _plot_spatial_qc(output_dir: Path, spatial: pd.DataFrame) -> str:
     if spatial.empty:
         return ""
     fig, ax = plt.subplots(figsize=(8, 4))
-    for role, group in spatial.groupby("model_role"):
+    finite = spatial[np.isfinite(spatial["residual_rms_scaled"])]
+    for role, group in finite.groupby("model_role"):
         ax.plot(group["lateral_index"], group["residual_rms_scaled"], label=role)
     ax.set_xlabel("lateral trace")
     ax.set_ylabel("scaled residual RMS")
     ax.set_title("Spatial residual pattern")
+    if finite.empty:
+        ax.text(0.5, 0.5, "no valid positive-scale spatial rows", ha="center", va="center", transform=ax.transAxes)
     ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=160)
@@ -676,12 +726,22 @@ def main() -> None:
     wavelet, wavelet_meta = load_selected_wavelet(wavelet_dir)
     wavelet_scenarios = _load_wavelet_scenarios(wavelet_dir, wavelet, wavelet_meta, run_cfg)
 
-    boundary = dict(run_cfg.get("boundary") or {})
-    crop_s = float(boundary.get("forward_diagnostic_crop_s", run_cfg.get("forward_diagnostic_crop_s", 0.0)) or 0.0)
-    crop_samples = int(np.ceil(crop_s / dt_s)) if crop_s > 0.0 else 0
     scan_cfg = dict(run_cfg.get("diagnostic_scan") or {})
     phase_values = [float(v) for v in scan_cfg.get("phase_deg", [-20, -10, 0, 10, 20])]
     shift_values = [float(v) for v in scan_cfg.get("fractional_shift_samples", [-1.0, -0.5, 0.0, 0.5, 1.0])]
+    boundary = dict(run_cfg.get("boundary") or {})
+    if boundary.get("forward_diagnostic_crop_s") is not None:
+        raise ValueError(
+            "forward_diagnostic_crop_s is retired; use forward_diagnostic_erosion_s "
+            "or omit it to use the selected wavelet active half-support."
+        )
+    erosion_source = "configured"
+    if boundary.get("forward_diagnostic_erosion_s") is not None:
+        erosion_s = float(boundary.get("forward_diagnostic_erosion_s") or 0.0)
+    else:
+        erosion_s = float(wavelet_meta.get("active_half_support_s", 0.0) or 0.0)
+        erosion_source = "wavelet_active_half_support"
+    erosion_samples = int(np.ceil(erosion_s / dt_s)) if erosion_s > 0.0 else 0
 
     impedance_inputs: list[tuple[str, np.ndarray, str]] = [("lfm_only", lfm, "lfm_input")]
     for role, payload in predictions.items():
@@ -697,11 +757,11 @@ def main() -> None:
     synthetic_dir.mkdir(parents=True, exist_ok=False)
     for model_role, log_ai, source_role in impedance_inputs:
         synthetic = forward_log_ai(log_ai, wavelet)
-        obs_crop, syn_crop, valid_crop = _crop_forward_arrays(
+        obs_crop, syn_crop, valid_crop = _erode_forward_arrays(
             observed,
             synthetic,
             valid,
-            crop_samples=crop_samples,
+            erosion_samples=erosion_samples,
         )
         metrics = diagnostic_metrics(observed=obs_crop, synthetic=syn_crop, valid_mask=valid_crop)
         metric_rows.append(
@@ -710,22 +770,26 @@ def main() -> None:
                 "source_role": source_role,
                 "forward_operator_id": "real_field_log_ai_tanh_reflectivity_nominal_wavelet_v1",
                 "reflectivity_hang_point": "r[j]=tanh((x[j]-x[j-1])/2), aligned to observed[:, 1:]",
-                "crop_samples_each_side": crop_samples,
+                "erosion_samples_each_valid_run_side": erosion_samples,
+                "erosion_s_each_valid_run_side": erosion_s,
+                "erosion_source": erosion_source,
                 **metrics,
             }
         )
         figure_outputs[model_role] = _plot_forward_qc(
             output_dir=output_dir,
             model_role=model_role,
-            observed=obs_crop,
-            synthetic=syn_crop,
-            valid=valid_crop,
+            observed=observed[:, 1:],
+            synthetic=synthetic,
+            display_valid=valid[:, 1:],
+            diagnostic_valid=valid_crop,
         )
         np.savez_compressed(
             synthetic_dir / f"{model_role}.npz",
             synthetic_seismic=synthetic.astype(np.float32),
             observed_seismic_forward_axis=observed[:, 1:].astype(np.float32),
             valid_mask_forward_axis=valid[:, 1:].astype(bool),
+            valid_mask_forward_eroded_axis=valid_crop.astype(bool),
             twt_s_forward_axis=twt_s[1:],
         )
         scan = phase_shift_scan(
@@ -741,11 +805,11 @@ def main() -> None:
         for scenario in wavelet_scenarios:
             scenario_wavelet = np.asarray(scenario["wavelet"], dtype=np.float64)
             scenario_synthetic = forward_log_ai(log_ai, scenario_wavelet)
-            obs_wave, syn_wave, valid_wave = _crop_forward_arrays(
+            obs_wave, syn_wave, valid_wave = _erode_forward_arrays(
                 observed,
                 scenario_synthetic,
                 valid,
-                crop_samples=crop_samples,
+                erosion_samples=erosion_samples,
             )
             scenario_metrics = diagnostic_metrics(observed=obs_wave, synthetic=syn_wave, valid_mask=valid_wave)
             wavelet_rows.append(
@@ -757,7 +821,9 @@ def main() -> None:
                     "candidate_score": scenario["candidate_score"],
                     "wavelet_path": scenario["wavelet_path"],
                     "wavelet_sha256": scenario["wavelet_sha256"],
-                    "crop_samples_each_side": crop_samples,
+                    "erosion_samples_each_valid_run_side": erosion_samples,
+                    "erosion_s_each_valid_run_side": erosion_s,
+                    "erosion_source": erosion_source,
                     **scenario_metrics,
                 }
             )
@@ -805,11 +871,12 @@ def main() -> None:
             "observed_alignment": "observed[:, 1:]",
             "time_alignment_mode": "drop_first_observed_sample_to_match_N_minus_1_reflectivity_axis",
             "discarded_samples_for_forward_axis": 1,
-            "synthetic_twt_axis": "twt_s[1:] before forward_diagnostic_crop",
-            "observed_twt_axis_after_alignment": "twt_s[1:] before forward_diagnostic_crop",
+            "synthetic_twt_axis": "twt_s[1:] before valid-run erosion",
+            "observed_twt_axis_after_alignment": "twt_s[1:] before valid-run erosion",
             "dt_s": dt_s,
-            "forward_diagnostic_crop_s": crop_s,
-            "forward_diagnostic_crop_samples": crop_samples,
+            "forward_diagnostic_erosion_s": erosion_s,
+            "forward_diagnostic_erosion_samples": erosion_samples,
+            "forward_diagnostic_erosion_source": erosion_source,
             "phase_scan_deg": phase_values,
             "fractional_shift_scan_samples": shift_values,
             "wavelet_scenario_count": len(wavelet_scenarios),

@@ -13,6 +13,12 @@ import pandas as pd
 import torch
 
 from cup.seismic.survey import open_survey, segy_options_from_config
+from cup.seismic.wavelet import (
+    DEFAULT_ACTIVE_SUPPORT_THRESHOLD,
+    compute_wavelet_active_half_support_s,
+    infer_wavelet_dt,
+)
+from cup.synthetic.dataset import SynthoseisBenchmark
 from cup.utils.io import (
     repo_relative_path,
     resolve_artifact_path,
@@ -76,6 +82,75 @@ def finite_summary_stats(values: np.ndarray) -> dict[str, float]:
         "abs_p95": float(np.quantile(np.abs(data), 0.95)),
         "abs_p99": float(np.quantile(np.abs(data), 0.99)),
     }
+
+
+def load_model_manifest(model_cfg: Mapping[str, Any], *, root: Path) -> dict[str, Any]:
+    model_run_dir = resolve_relative_path(_required_text(model_cfg, "model_run_dir"), root=root)
+    manifest_path = model_run_dir / "model_run_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def synthetic_train_values(
+    manifest: Mapping[str, Any],
+    *,
+    root: Path,
+    input_name: str = "seismic",
+    max_patches: int = 4096,
+    seed: int = 20260620,
+) -> tuple[np.ndarray, dict[str, object]]:
+    benchmark_dir = resolve_relative_path(_required_text(manifest, "benchmark_dir"), root=root)
+    patch_index_path = resolve_relative_path(_required_text(manifest, "patch_index"), root=root)
+    benchmark = SynthoseisBenchmark(benchmark_dir)
+    patch_index = pd.read_csv(patch_index_path)
+    train = patch_index[patch_index["split"].astype(str).eq("train")]
+    total_train = int(train.shape[0])
+    if max_patches > 0 and total_train > max_patches:
+        train = train.sample(n=int(max_patches), random_state=int(seed)).sort_index()
+    chunks: list[np.ndarray] = []
+    for _, row in train.iterrows():
+        sample = benchmark.load_sample(str(row["sample_id"]))
+        target = np.asarray(sample.target_log_ai, dtype=np.float32)
+        seismic = np.asarray(sample.seismic_input, dtype=np.float32)
+        lfm = np.asarray(sample.priors["lfm_controlled_degraded"], dtype=np.float32)
+        valid = np.asarray(sample.valid_mask, dtype=bool)
+        if seismic.shape[1] == target.shape[1] - 1:
+            target = target[:, 1:]
+            lfm = lfm[:, 1:]
+            valid = valid[:, 1:]
+        elif seismic.shape[1] != target.shape[1]:
+            raise ValueError(f"Unsupported seismic/target time shape for {sample.sample_id}.")
+        effective_valid = valid & np.isfinite(target) & np.isfinite(seismic) & np.isfinite(lfm)
+        lateral = slice(int(row["lateral_start"]), int(row["lateral_stop"]))
+        twt = slice(int(row["twt_start"]), int(row["twt_stop"]))
+        patch_valid = effective_valid[lateral, twt]
+        if input_name == "seismic":
+            values = seismic[lateral, twt]
+        elif input_name == "lfm":
+            values = lfm[lateral, twt]
+        elif input_name == "target":
+            values = target[lateral, twt]
+        else:
+            raise ValueError(f"Unsupported synthetic input: {input_name}")
+        finite = np.asarray(values, dtype=np.float64)[patch_valid & np.isfinite(values)]
+        if finite.size:
+            chunks.append(finite)
+    if not chunks:
+        raise ValueError(f"No finite synthetic train values for {input_name}.")
+    metadata = {
+        "input_name": input_name,
+        "total_train_patches": total_train,
+        "sampled_train_patches": int(train.shape[0]),
+        "sampling_seed": int(seed),
+        "sampling_policy": (
+            "deterministic_random_sample_without_replacement"
+            if train.shape[0] < total_train
+            else "all_train_patches"
+        ),
+    }
+    return np.concatenate(chunks), metadata
 
 
 def transform_real_seismic(
@@ -147,12 +222,18 @@ def load_real_field_section(
     inputs = _mapping(config.get("real_field_inputs"), "real_field_zero_shot.real_field_inputs")
     section_cfg = _mapping(config.get("section"), "real_field_zero_shot.section")
     lfm_path = resolve_relative_path(_required_text(inputs, "lfm_file"), root=root)
+    lfm_transform = str(inputs.get("lfm_value_transform") or "identity").casefold()
+    legacy_lfm_negative_control = bool(inputs.get("legacy_lfm_negative_control", False))
+    _validate_lfm_npz_contract(
+        lfm_path,
+        lfm_transform=lfm_transform,
+        legacy_lfm_negative_control=legacy_lfm_negative_control,
+    )
     lfm_values, ilines, xlines, twt_s = _load_npz_grid_section(
         lfm_path,
         section_cfg=section_cfg,
-        value_keys=("lfm", "log_ai", "volume", "pred_log_ai"),
+        value_keys=("log_ai", "lfm", "volume", "pred_log_ai"),
     )
-    lfm_transform = str(inputs.get("lfm_value_transform") or "identity").casefold()
     if lfm_transform == "log":
         if np.any(lfm_values <= 0.0):
             raise ValueError("lfm_value_transform=log requires positive LFM/AI values.")
@@ -161,6 +242,7 @@ def load_real_field_section(
         raise ValueError(f"Unsupported lfm_value_transform: {lfm_transform}")
     sample_start = float(twt_s[0])
     sample_end = float(twt_s[-1])
+    _validate_section_axes_against_config(section_cfg, ilines, xlines)
 
     seismic_path = resolve_relative_path(_required_text(inputs, "seismic_file"), root=data_root)
     seismic_type = str(inputs.get("seismic_type", inputs.get("type", "zgy"))).casefold()
@@ -198,6 +280,16 @@ def load_real_field_section(
         _assert_axes_close("mask xlines", mask_xlines, xlines)
         mask, _, _ = _align_time_arrays(mask.astype(float), mask_twt, lfm_values, twt_s)
         valid_mask = mask > 0.5
+    elif _npz_has_any(lfm_path, ("valid_mask_model", "mask", "target_mask")):
+        mask, mask_ilines, mask_xlines, mask_twt = _load_npz_grid_section(
+            lfm_path,
+            section_cfg=section_cfg,
+            value_keys=("valid_mask_model", "mask", "target_mask"),
+        )
+        _assert_axes_close("lfm mask ilines", mask_ilines, ilines)
+        _assert_axes_close("lfm mask xlines", mask_xlines, xlines)
+        mask, _, _ = _align_time_arrays(mask.astype(float), mask_twt, lfm_values, twt_s)
+        valid_mask = mask > 0.5
     else:
         valid_mask = np.isfinite(lfm_values) & np.isfinite(seismic)
 
@@ -209,6 +301,7 @@ def load_real_field_section(
         )
     if not np.any(valid_mask):
         raise ValueError("Real-field section has no finite valid samples.")
+    _validate_lfm_log_domain(lfm_values, valid_mask, lfm_transform=lfm_transform, path=lfm_path)
     seismic_transform = inputs.get("seismic_value_transform") or inputs.get("seismic_transform") or "identity"
     reference_stats = inputs.get("seismic_reference_stats")
     seismic, seismic_transform_metadata = transform_real_seismic(
@@ -230,6 +323,7 @@ def load_real_field_section(
             "seismic_type": seismic_type,
             "target_mask_file": mask_path_text,
             "lfm_value_transform": lfm_transform,
+            "legacy_lfm_negative_control": legacy_lfm_negative_control,
             "seismic_value_transform": str(seismic_transform),
             "seismic_transform_metadata": seismic_transform_metadata,
             "section": dict(section_cfg),
@@ -468,6 +562,7 @@ def forward_log_ai(log_ai: np.ndarray, wavelet: np.ndarray) -> np.ndarray:
     values = np.asarray(log_ai, dtype=np.float64)
     if values.ndim != 2:
         raise ValueError("log_ai must have shape [lateral, twt].")
+    values = _fill_nonfinite_along_time(values)
     reflectivity = np.tanh(0.5 * (values[:, 1:] - values[:, :-1]))
     wavelet_values = np.asarray(wavelet, dtype=np.float64).reshape(-1)
     if wavelet_values.size < 3 or wavelet_values.size % 2 == 0:
@@ -478,6 +573,21 @@ def forward_log_ai(log_ai: np.ndarray, wavelet: np.ndarray) -> np.ndarray:
     return out
 
 
+def _fill_nonfinite_along_time(values: np.ndarray) -> np.ndarray:
+    filled = np.asarray(values, dtype=np.float64).copy()
+    coords = np.arange(filled.shape[1], dtype=np.float64)
+    for idx in range(filled.shape[0]):
+        row = filled[idx]
+        finite = np.isfinite(row)
+        if np.all(finite):
+            continue
+        if not np.any(finite):
+            filled[idx] = 0.0
+            continue
+        filled[idx] = np.interp(coords, coords[finite], row[finite])
+    return filled
+
+
 def load_selected_wavelet(wavelet_generation_dir: Path) -> tuple[np.ndarray, dict[str, Any]]:
     csv_path = wavelet_generation_dir / "selected_wavelet.csv"
     if not csv_path.is_file():
@@ -485,11 +595,24 @@ def load_selected_wavelet(wavelet_generation_dir: Path) -> tuple[np.ndarray, dic
     frame = pd.read_csv(csv_path)
     if "amplitude" not in frame:
         raise ValueError(f"selected_wavelet.csv lacks amplitude column: {csv_path}")
+    if "time_s" not in frame:
+        raise ValueError(f"selected_wavelet.csv lacks time_s column: {csv_path}")
+    time_s = frame["time_s"].to_numpy(dtype=np.float64)
     wavelet = frame["amplitude"].to_numpy(dtype=np.float64)
+    dt_s = infer_wavelet_dt(time_s)
+    active_threshold = DEFAULT_ACTIVE_SUPPORT_THRESHOLD
+    active_half_support_s = compute_wavelet_active_half_support_s(
+        time_s,
+        wavelet,
+        active_threshold=active_threshold,
+    )
     return wavelet, {
         "selected_wavelet_csv": str(csv_path),
         "wavelet_sha256": sha256_file(csv_path),
         "n_samples": int(wavelet.size),
+        "dt_s": float(dt_s),
+        "active_support_threshold": float(active_threshold),
+        "active_half_support_s": float(active_half_support_s),
     }
 
 
@@ -586,6 +709,62 @@ def load_zero_shot_predictions(run_dir: Path) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _validate_lfm_npz_contract(
+    path: Path,
+    *,
+    lfm_transform: str,
+    legacy_lfm_negative_control: bool,
+) -> None:
+    with np.load(path, allow_pickle=False) as data:
+        files = set(data.files)
+        if legacy_lfm_negative_control:
+            return
+        required = {"log_ai", "valid_mask_model", "ilines", "xlines"}
+        missing = sorted(required - files)
+        if missing:
+            raise ValueError(
+                f"R0 primary LFM must be real_field_lfm_v1 and is missing {missing}: {path}. "
+                "Set legacy_lfm_negative_control=true only for explicit historical negative controls."
+            )
+        if "samples" not in files and "twt_s" not in files:
+            raise ValueError(f"R0 primary LFM must provide samples/twt_s axis: {path}")
+        if str(lfm_transform) == "log":
+            raise ValueError(
+                "real_field_lfm_v1/log_ai is already in log(AI); use lfm_value_transform=identity."
+            )
+        if "metadata_json" not in files:
+            raise ValueError(f"R0 primary LFM lacks metadata_json: {path}")
+        metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
+    if str(metadata.get("schema_version")) != "real_field_lfm_v1":
+        raise ValueError(f"Unsupported LFM schema_version={metadata.get('schema_version')!r}: {path}")
+    if str(metadata.get("value_key")) != "log_ai":
+        raise ValueError(f"LFM metadata value_key must be log_ai, got {metadata.get('value_key')!r}: {path}")
+    if str(metadata.get("value_domain")) != "log(AI)":
+        raise ValueError(f"LFM metadata value_domain must be log(AI), got {metadata.get('value_domain')!r}: {path}")
+    if str(metadata.get("valid_mask_key")) != "valid_mask_model":
+        raise ValueError(
+            f"LFM metadata valid_mask_key must be valid_mask_model, got {metadata.get('valid_mask_key')!r}: {path}"
+        )
+
+
+def _validate_section_axes_against_config(
+    section_cfg: Mapping[str, Any],
+    ilines: np.ndarray,
+    xlines: np.ndarray,
+) -> None:
+    if "path" not in section_cfg:
+        return
+    expected_ilines, expected_xlines = _section_line_path(section_cfg)
+    if expected_ilines.shape != ilines.shape or expected_xlines.shape != xlines.shape:
+        raise ValueError(
+            "R0 section axis mismatch: LFM section axes do not match configured section.n_traces/path."
+        )
+    if not np.allclose(expected_ilines, ilines, rtol=0.0, atol=1e-6):
+        raise ValueError("R0 section axis mismatch: LFM ilines do not match configured section.path.")
+    if not np.allclose(expected_xlines, xlines, rtol=0.0, atol=1e-6):
+        raise ValueError("R0 section axis mismatch: LFM xlines do not match configured section.path.")
+
+
 def _load_npz_grid_section(
     path: Path,
     *,
@@ -608,10 +787,11 @@ def _load_npz_grid_section(
     if values.ndim == 2:
         lateral = values.shape[0]
         sample_slice, cropped_twt = _crop_twt_axis(twt, section_cfg)
+        ilines, xlines = _npz_lateral_axes(data, path=path, lateral=lateral)
         return (
             np.asarray(values[:, sample_slice], dtype=np.float32),
-            np.arange(lateral, dtype=np.float64),
-            np.arange(lateral, dtype=np.float64),
+            ilines,
+            xlines,
             cropped_twt,
         )
     if values.ndim != 3:
@@ -624,6 +804,54 @@ def _load_npz_grid_section(
     sample_slice, cropped_twt = _crop_twt_axis(twt, section_cfg)
     section = values[il_idx, xl_idx, :][:, sample_slice]
     return np.asarray(section, dtype=np.float32), ilines, xlines, cropped_twt
+
+
+def _npz_has_any(path: Path, keys: Sequence[str]) -> bool:
+    with np.load(path, allow_pickle=False) as data:
+        return any(key in data.files for key in keys)
+
+
+def _validate_lfm_log_domain(
+    lfm_values: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    lfm_transform: str,
+    path: Path,
+) -> None:
+    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(lfm_values)
+    values = np.asarray(lfm_values, dtype=np.float64)[valid]
+    if values.size == 0:
+        raise ValueError(f"LFM has no finite valid log(AI) samples after transform: {path}")
+    stats = finite_summary_stats(values)
+    p01 = float(stats["p01"])
+    p99 = float(stats["p99"])
+    median = float(stats["p50"])
+    if not (0.0 < median < 30.0 and -5.0 < p01 < 30.0 and 0.0 < p99 < 30.0):
+        raise ValueError(
+            "LFM values do not look like log(AI). "
+            f"lfm_value_transform={lfm_transform!r}, p01={p01:.6g}, "
+            f"median={median:.6g}, p99={p99:.6g}, path={path}. "
+            "Use lfm_value_transform=log only for linear positive AI inputs, "
+            "or provide real_field_lfm_v1/log_ai with identity."
+        )
+
+
+def _npz_lateral_axes(data: np.lib.npyio.NpzFile, *, path: Path, lateral: int) -> tuple[np.ndarray, np.ndarray]:
+    il_key = next((key for key in ("ilines", "inline", "section_ilines") if key in data.files), None)
+    xl_key = next((key for key in ("xlines", "xline", "section_xlines") if key in data.files), None)
+    if il_key is None and xl_key is None:
+        axis = np.arange(lateral, dtype=np.float64)
+        return axis, axis.copy()
+    if il_key is None or xl_key is None:
+        raise ValueError(f"{path} 2D section must provide both ilines and xlines axes when either is present.")
+    ilines = np.asarray(data[il_key], dtype=np.float64).reshape(-1)
+    xlines = np.asarray(data[xl_key], dtype=np.float64).reshape(-1)
+    if ilines.size != lateral or xlines.size != lateral:
+        raise ValueError(
+            f"{path} 2D section axis length mismatch: values lateral={lateral}, "
+            f"ilines={ilines.size}, xlines={xlines.size}."
+        )
+    return ilines, xlines
 
 
 def _load_survey_section(

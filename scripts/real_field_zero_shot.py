@@ -23,8 +23,13 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
-from scripts.real_field_input_domain_diagnostic import _load_model_manifest, _synthetic_train_values
-from ginn_v2.real_field import input_qc_frame, load_real_field_section, run_zero_shot_model
+from ginn_v2.real_field import (
+    input_qc_frame,
+    load_model_manifest,
+    load_real_field_section,
+    run_zero_shot_model,
+    synthetic_train_values,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -272,7 +277,7 @@ def _plot_zero_shot_qc(output_dir: Path) -> dict[str, str]:
             (axes[1], delta, "Pred - LFM"),
             (axes[2], pred, "Pred log(AI)"),
         ]:
-            image = ax.imshow(values.T, aspect="auto", origin="lower", cmap="viridis")
+            image = ax.imshow(values.T, aspect="auto", origin="upper", cmap="viridis")
             ax.set_title(title)
             ax.set_xlabel("lateral trace")
             fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
@@ -287,7 +292,7 @@ def _plot_zero_shot_qc(output_dir: Path) -> dict[str, str]:
         diff = model_arrays["lateral"]["stitched_pred_log_ai"] - model_arrays["no_lateral"]["stitched_pred_log_ai"]
         fig, ax = plt.subplots(figsize=(6, 4))
         vmax = float(np.nanquantile(np.abs(diff), 0.99)) if np.isfinite(diff).any() else 1.0
-        image = ax.imshow(diff.T, aspect="auto", origin="lower", cmap="coolwarm", vmin=-vmax, vmax=vmax)
+        image = ax.imshow(diff.T, aspect="auto", origin="upper", cmap="coolwarm", vmin=-vmax, vmax=vmax)
         ax.set_title("lateral - no_lateral log(AI)")
         ax.set_xlabel("lateral trace")
         ax.set_ylabel("TWT sample")
@@ -463,7 +468,7 @@ def _write_spectral_qc(output_dir: Path, *, run_cfg: dict, dt_s: float) -> dict[
             values = np.asarray(panel["values"], dtype=np.float64)
             finite = values[np.isfinite(values)]
             vmax = float(np.nanquantile(np.abs(finite), 0.99)) if finite.size else 1.0
-            image = ax.imshow(values.T, aspect="auto", origin="lower", cmap="coolwarm", vmin=-vmax, vmax=vmax)
+            image = ax.imshow(values.T, aspect="auto", origin="upper", cmap="coolwarm", vmin=-vmax, vmax=vmax)
             ax.set_title(str(panel["name"]))
             ax.set_xlabel("lateral trace")
             fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
@@ -577,9 +582,10 @@ def main() -> None:
     transform_name = str(inputs_for_load.get("seismic_value_transform") or inputs_for_load.get("seismic_transform") or "identity")
     if transform_name not in {"identity", "raw", "none"} and "seismic_reference_stats" not in inputs_for_load:
         diag_cfg = dict(cfg.get("real_field_input_domain_diagnostic") or {})
-        manifest = _load_model_manifest(dict(models[0]))
-        values, metadata = _synthetic_train_values(
+        manifest = load_model_manifest(dict(models[0]), root=REPO_ROOT)
+        values, metadata = synthetic_train_values(
             manifest,
+            root=REPO_ROOT,
             input_name="seismic",
             max_patches=int(diag_cfg.get("max_synthetic_train_patches", 4096)),
             seed=int(diag_cfg.get("synthetic_train_sampling_seed", 20260620)),
@@ -615,6 +621,8 @@ def main() -> None:
     source_runs = dict(run_cfg.get("source_runs") or {})
     boundary = dict(run_cfg.get("boundary") or {})
     dt_s = float(section.twt_s[1] - section.twt_s[0]) if section.twt_s.size > 1 else 0.002
+    forward_erosion_raw = boundary.get("forward_diagnostic_erosion_s")
+    forward_erosion_s = None if forward_erosion_raw is None else float(forward_erosion_raw or 0.0)
     input_qc_path = output_dir / "model_input_qc.csv"
     source_hashes = _source_file_hashes(section.metadata, source_runs)
     summary = {
@@ -639,10 +647,15 @@ def main() -> None:
         "boundary_contract": {
             "loss_or_eval_erosion_s": float(boundary.get("loss_or_eval_erosion_s", 0.0) or 0.0),
             "prediction_taper_halo_s": float(boundary.get("prediction_taper_halo_s", 0.0) or 0.0),
-            "forward_diagnostic_crop_s": float(boundary.get("forward_diagnostic_crop_s", 0.0) or 0.0),
+            "forward_diagnostic_erosion_s": forward_erosion_s,
+            "forward_diagnostic_erosion_source": (
+                "configured" if forward_erosion_s is not None else "deferred_to_r1_wavelet_active_half_support"
+            ),
             "loss_or_eval_erosion_samples": int(np.ceil(float(boundary.get("loss_or_eval_erosion_s", 0.0) or 0.0) / dt_s)),
             "prediction_taper_halo_samples": int(np.ceil(float(boundary.get("prediction_taper_halo_s", 0.0) or 0.0) / dt_s)),
-            "forward_diagnostic_crop_samples": int(np.ceil(float(boundary.get("forward_diagnostic_crop_s", 0.0) or 0.0) / dt_s)),
+            "forward_diagnostic_erosion_samples": (
+                None if forward_erosion_s is None else int(np.ceil(forward_erosion_s / dt_s))
+            ),
             "dt_s": dt_s,
         },
         "source_file_sha256": source_hashes,

@@ -20,6 +20,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cup.seismic.viz import plot_well_waveform_qc
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
 from ginn_v2.real_field import (
     diagnostic_metrics,
@@ -28,6 +29,8 @@ from ginn_v2.real_field import (
     load_zero_shot_predictions,
     phase_shift_scan,
 )
+from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
+from wtie.processing import grid
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,6 +116,54 @@ def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(a, b)[0, 1])
 
 
+def _finite_stats(values: np.ndarray, mask: np.ndarray | None = None) -> dict[str, float | int]:
+    data = np.asarray(values, dtype=np.float64)
+    valid = np.isfinite(data)
+    if mask is not None:
+        valid &= np.asarray(mask, dtype=bool)
+    finite = data[valid]
+    if finite.size == 0:
+        return {
+            "n_valid": 0,
+            "mean": float("nan"),
+            "std": float("nan"),
+            "rms": float("nan"),
+            "p01": float("nan"),
+            "p10": float("nan"),
+            "p50": float("nan"),
+            "p90": float("nan"),
+            "p99": float("nan"),
+        }
+    return {
+        "n_valid": int(finite.size),
+        "mean": float(np.mean(finite)),
+        "std": float(np.std(finite)),
+        "rms": float(np.sqrt(np.mean(finite * finite))),
+        "p01": float(np.quantile(finite, 0.01)),
+        "p10": float(np.quantile(finite, 0.10)),
+        "p50": float(np.quantile(finite, 0.50)),
+        "p90": float(np.quantile(finite, 0.90)),
+        "p99": float(np.quantile(finite, 0.99)),
+    }
+
+
+def _normalization_for_role(predictions: dict[str, dict[str, object]], role: str) -> dict[str, object]:
+    payload = predictions.get(role)
+    if payload is None:
+        return {}
+    summary = payload.get("summary")
+    if isinstance(summary, dict) and isinstance(summary.get("normalization"), dict):
+        return dict(summary["normalization"])
+    return {}
+
+
+def _normalization_stats(normalization: dict[str, object], key: str) -> tuple[float, float]:
+    item = normalization.get(key)
+    if not isinstance(item, dict):
+        return float("nan"), float("nan")
+    return float(item.get("mean", float("nan"))), float(item.get("std", float("nan")))
+
+
 def _configured_bands(run_cfg: dict) -> list[dict[str, float | str]]:
     spectral = dict(run_cfg.get("spectral_qc") or {})
     bands = spectral.get("bands") or [
@@ -148,6 +199,28 @@ def _band_rms(values: np.ndarray, valid: np.ndarray, *, dt_s: float, low_hz: flo
     filtered = np.zeros_like(spectrum)
     filtered[band] = spectrum[band]
     component = np.fft.irfft(filtered, n=data.size)
+    return float(np.sqrt(np.mean(component[mask] ** 2)))
+
+
+def _band_rms_2d(values: np.ndarray, valid: np.ndarray, *, dt_s: float, low_hz: float, high_hz: float) -> float:
+    data = np.asarray(values, dtype=np.float64)
+    mask = np.asarray(valid, dtype=bool) & np.isfinite(data)
+    if data.ndim != 2 or not np.any(mask):
+        return float("nan")
+    prepared = np.zeros_like(data, dtype=np.float64)
+    for idx in range(data.shape[0]):
+        row_mask = mask[idx]
+        if int(np.count_nonzero(row_mask)) < 8:
+            continue
+        prepared[idx] = np.where(row_mask, data[idx] - float(np.mean(data[idx, row_mask])), 0.0)
+    spectrum = np.fft.rfft(prepared, axis=1)
+    freqs = np.fft.rfftfreq(data.shape[1], d=float(dt_s))
+    band = (freqs >= float(low_hz)) & (freqs < float(high_hz))
+    if not np.any(band):
+        return 0.0
+    filtered = np.zeros_like(spectrum)
+    filtered[:, band] = spectrum[:, band]
+    component = np.fft.irfft(filtered, n=data.shape[1], axis=1)
     return float(np.sqrt(np.mean(component[mask] ** 2)))
 
 
@@ -304,6 +377,7 @@ def _build_well_forward_qc(
     output_dir: Path,
     predictions: dict[str, dict[str, object]],
     synthetic_dir: Path,
+    wavelet: np.ndarray,
 ) -> tuple[pd.DataFrame, dict[str, str]]:
     cfg = dict(run_cfg.get("well_qc") or {})
     if not bool(cfg.get("enabled", True)):
@@ -398,6 +472,55 @@ def _build_well_forward_qc(
         except Exception as exc:
             rows.append({**base, "model_role": "", "status": "skipped_well_log_projection_failed", "reason": str(exc)})
             continue
+        first_synthetic_path = next(
+            (synthetic_dir / f"zero_shot_{role}.npz" for role in predictions if (synthetic_dir / f"zero_shot_{role}.npz").is_file()),
+            None,
+        )
+        if first_synthetic_path is not None:
+            with np.load(first_synthetic_path, allow_pickle=True) as syn_arrays:
+                observed = np.asarray(syn_arrays["observed_seismic_forward_axis"], dtype=np.float64)[trace_idx : trace_idx + 1]
+                twt_forward = np.asarray(syn_arrays["twt_s_forward_axis"], dtype=np.float64)
+                valid_key = "valid_mask_forward_eroded_axis" if "valid_mask_forward_eroded_axis" in syn_arrays.files else "valid_mask_forward_axis"
+                valid_forward = np.asarray(syn_arrays[valid_key], dtype=bool)[trace_idx : trace_idx + 1]
+            filtered_synthetic = forward_log_ai(well_log_ai[None, :], wavelet)
+            tie_start = pd.to_numeric(tie.get("tie_window_start_s"), errors="coerce")
+            tie_end = pd.to_numeric(tie.get("tie_window_end_s"), errors="coerce")
+            if np.isfinite(tie_start) and np.isfinite(tie_end):
+                window = (twt_forward >= float(tie_start)) & (twt_forward <= float(tie_end))
+                valid_forward = valid_forward & window[None, :]
+            filtered_waveform = diagnostic_metrics(
+                observed=observed,
+                synthetic=filtered_synthetic,
+                valid_mask=valid_forward,
+            )
+            rows.append(
+                {
+                    **base,
+                    "model_role": "filtered_las",
+                    "status": "ok",
+                    "well_ai_status": "reference",
+                    "well_ai_n_valid": int(np.count_nonzero(np.isfinite(well_log_ai))),
+                    "well_ai_rmse": 0.0,
+                    "well_ai_bias": 0.0,
+                    "well_ai_corr": 1.0,
+                    **{f"waveform_{key}": value for key, value in filtered_waveform.items()},
+                }
+            )
+        lfm_log_ai = np.asarray(first_arrays["lfm_input"], dtype=np.float64)[trace_idx]
+        lfm_valid = (
+            np.asarray(first_arrays["valid_mask_model"], dtype=bool)[trace_idx]
+            & np.isfinite(lfm_log_ai)
+            & np.isfinite(well_log_ai)
+        )
+        lfm_ai_metrics = _well_ai_metrics(well_log_ai=well_log_ai, pred_log_ai=lfm_log_ai, valid=lfm_valid)
+        rows.append(
+            {
+                **base,
+                "model_role": "lfm_input",
+                "status": "ok" if lfm_ai_metrics.get("well_ai_status") == "ok" else lfm_ai_metrics.get("well_ai_status"),
+                **lfm_ai_metrics,
+            }
+        )
         for role, payload in predictions.items():
             arrays = payload["arrays"]
             pred = np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float64)[trace_idx]
@@ -450,89 +573,131 @@ def _build_well_forward_qc(
                     **waveform_metrics,
                 }
             )
-        figure_path = figures / f"well_forward_qc_{well_name}.png"
-        _plot_well_qc(
-            path=figure_path,
-            well_name=well_name,
-            twt_model=twt_model,
-            well_log_ai=well_log_ai,
-            trace_idx=trace_idx,
-            predictions=predictions,
-            synthetic_dir=synthetic_dir,
+        figure_outputs.update(
+            _plot_well_qc(
+                figures_dir=figures,
+                well_name=well_name,
+                twt_model=twt_model,
+                well_log_ai=well_log_ai,
+                trace_idx=trace_idx,
+                predictions=predictions,
+                synthetic_dir=synthetic_dir,
+                tie_window_start_s=_coerce_float(tie.get("tie_window_start_s")),
+                tie_window_end_s=_coerce_float(tie.get("tie_window_end_s")),
+            )
         )
-        figure_outputs[well_name] = repo_relative_path(figure_path, root=REPO_ROOT)
     return pd.DataFrame.from_records(rows), figure_outputs
 
 
 def _plot_well_qc(
     *,
-    path: Path,
+    figures_dir: Path,
     well_name: str,
     twt_model: np.ndarray,
     well_log_ai: np.ndarray,
     trace_idx: int,
     predictions: dict[str, dict[str, object]],
     synthetic_dir: Path,
-) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(14, 5), sharey=False)
-    axes[0].plot(well_log_ai, twt_model, label="well filtered log(AI)", color="black", linewidth=1.5)
+    tie_window_start_s: float,
+    tie_window_end_s: float,
+) -> dict[str, str]:
+    outputs: dict[str, str] = {}
+    twt_model = np.asarray(twt_model, dtype=np.float64)
+    well_log_ai = np.asarray(well_log_ai, dtype=np.float64)
+    if twt_model.size < 2:
+        return outputs
+    twt_forward_model = twt_model[1:]
     for role, payload in predictions.items():
         arrays = payload["arrays"]
-        axes[0].plot(
-            np.asarray(arrays["stitched_pred_log_ai"])[trace_idx],
-            twt_model,
-            label=role,
-            linewidth=1.0,
-        )
-    axes[0].invert_yaxis()
-    axes[0].set_xlabel("log(AI)")
-    axes[0].set_ylabel("TWT s")
-    axes[0].set_title(f"{well_name} impedance")
-    axes[0].legend(fontsize=8)
-    first_observed = None
-    first_twt = None
-    for role in predictions:
         synthetic_path = synthetic_dir / f"zero_shot_{role}.npz"
         if not synthetic_path.is_file():
             continue
-        arrays = np.load(synthetic_path, allow_pickle=True)
-        twt = arrays["twt_s_forward_axis"]
-        observed = arrays["observed_seismic_forward_axis"][trace_idx]
-        synthetic = arrays["synthetic_seismic"][trace_idx]
-        valid_display = np.asarray(arrays["valid_mask_forward_axis"], dtype=bool)[trace_idx]
-        valid_key = "valid_mask_forward_eroded_axis" if "valid_mask_forward_eroded_axis" in arrays.files else "valid_mask_forward_axis"
-        valid_diagnostic = np.asarray(arrays[valid_key], dtype=bool)[trace_idx]
-        observed_plot = np.where(valid_display, observed, np.nan)
-        synthetic_plot = np.where(valid_display, synthetic, np.nan)
-        residual_plot = np.where(valid_display, observed - synthetic, np.nan)
-        if role == next(iter(predictions)):
-            first_observed = observed_plot
-            first_twt = twt
-            axes[1].plot(observed_plot, twt, color="black", label="observed", linewidth=1.0)
-        axes[1].plot(synthetic_plot, twt, label=f"syn {role}", linewidth=1.0)
-        axes[2].plot(residual_plot, twt, label=f"res {role}", linewidth=1.0)
-        diagnostic_n = int(np.count_nonzero(valid_diagnostic & np.isfinite(observed) & np.isfinite(synthetic)))
-        if diagnostic_n < 8:
-            axes[2].text(
-                0.02,
-                0.92 - 0.08 * len(axes[2].lines),
-                f"{role}: diagnostic n={diagnostic_n}",
-                transform=axes[2].transAxes,
-                fontsize=8,
-            )
-    axes[1].invert_yaxis()
-    axes[1].set_xlabel("seismic")
-    axes[1].set_title(f"{well_name} forward")
-    axes[1].legend(fontsize=8)
-    if first_observed is not None and first_twt is not None:
-        axes[2].axvline(0.0, color="black", linestyle="--", linewidth=0.8)
-    axes[2].invert_yaxis()
-    axes[2].set_xlabel("observed - synthetic")
-    axes[2].set_title(f"{well_name} residual")
-    axes[2].legend(fontsize=8)
-    fig.tight_layout()
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
+        pred_log_ai = np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float64)[trace_idx]
+        pred_filled = _fill_nonfinite_1d(pred_log_ai)
+        reflectivity = np.tanh(0.5 * (pred_filled[1:] - pred_filled[:-1]))
+        with np.load(synthetic_path, allow_pickle=True) as syn_arrays:
+            twt_forward = np.asarray(syn_arrays["twt_s_forward_axis"], dtype=np.float64)
+            observed = np.asarray(syn_arrays["observed_seismic_forward_axis"], dtype=np.float64)[trace_idx]
+            synthetic = np.asarray(syn_arrays["synthetic_seismic"], dtype=np.float64)[trace_idx]
+            display_mask = np.asarray(syn_arrays["valid_mask_forward_axis"], dtype=bool)[trace_idx]
+        if twt_forward.shape != observed.shape or twt_forward.shape != synthetic.shape:
+            continue
+        if reflectivity.shape != twt_forward.shape:
+            if reflectivity.shape == twt_forward_model.shape and np.allclose(twt_forward, twt_forward_model, equal_nan=True):
+                pass
+            else:
+                continue
+        plot_mask = display_mask & np.isfinite(observed) & np.isfinite(synthetic) & np.isfinite(reflectivity)
+        if np.isfinite(tie_window_start_s) and np.isfinite(tie_window_end_s):
+            plot_mask &= (twt_forward >= float(tie_window_start_s)) & (twt_forward <= float(tie_window_end_s))
+        run = _largest_true_run(plot_mask)
+        if run is None:
+            continue
+        start, stop = run
+        if stop - start < 8:
+            continue
+        sl = slice(start, stop)
+        basis = twt_forward[sl]
+        pred_ai = np.exp(pred_filled[1:][sl])
+        filtered_ai = np.exp(well_log_ai[1:][sl])
+        synthetic_trace = grid.Seismic(synthetic[sl], basis, "twt", name="Synthetic")
+        observed_trace = grid.Seismic(observed[sl], basis, "twt", name="Seismic")
+        reflectivity_trace = grid.Reflectivity(reflectivity[sl], basis, "twt", name="Reflectivity")
+        pred_ai_trace = grid.Log(pred_ai, basis, "twt", name=f"{role} AI")
+        filtered_ai_trace = grid.Log(filtered_ai, basis, "twt", name="Filtered LAS AI")
+        xcorr_values = normalized_xcorr(observed_trace.values, synthetic_trace.values)
+        xcorr_basis = synthetic_trace.sampling_rate * np.arange(-(synthetic_trace.size - 1), synthetic_trace.size)
+        xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
+        dxcorr = dynamic_normalized_xcorr(observed_trace, synthetic_trace)
+        corr = _safe_corr(observed_trace.values, synthetic_trace.values)
+        title = f"R1 well QC | {well_name} | {role} | corr={corr:.3f}"
+        fig, _axes = plot_well_waveform_qc(
+            [pred_ai_trace, filtered_ai_trace],
+            reflectivity_trace,
+            synthetic_trace,
+            observed_trace,
+            xcorr,
+            dxcorr,
+            figsize=(12.0, 7.5),
+            synthetic_ai=pred_ai_trace,
+            title=title,
+        )
+        path = figures_dir / f"well_forward_qc_{well_name}_{role}.png"
+        fig.savefig(path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        outputs[f"{well_name}/{role}"] = repo_relative_path(path, root=REPO_ROOT)
+    return outputs
+
+
+def _fill_nonfinite_1d(values: np.ndarray) -> np.ndarray:
+    out = np.asarray(values, dtype=np.float64).copy()
+    finite = np.isfinite(out)
+    if np.all(finite):
+        return out
+    if not np.any(finite):
+        return np.zeros_like(out)
+    x = np.arange(out.size, dtype=np.float64)
+    out[~finite] = np.interp(x[~finite], x[finite], out[finite])
+    return out
+
+
+def _largest_true_run(mask: np.ndarray) -> tuple[int, int] | None:
+    values = np.asarray(mask, dtype=bool).reshape(-1)
+    best_start = -1
+    best_stop = -1
+    current_start: int | None = None
+    for index, flag in enumerate(values):
+        if flag and current_start is None:
+            current_start = index
+        elif not flag and current_start is not None:
+            if index - current_start > best_stop - best_start:
+                best_start, best_stop = current_start, index
+            current_start = None
+    if current_start is not None and values.size - current_start > best_stop - best_start:
+        best_start, best_stop = current_start, values.size
+    if best_start < 0:
+        return None
+    return best_start, best_stop
 
 
 def _plot_forward_qc(
@@ -627,6 +792,214 @@ def _plot_spatial_qc(output_dir: Path, spatial: pd.DataFrame) -> str:
     fig.savefig(path, dpi=160)
     plt.close(fig)
     return repo_relative_path(path, root=REPO_ROOT)
+
+
+def _write_forward_band_residual_qc(
+    output_dir: Path,
+    *,
+    run_cfg: dict,
+    dt_s: float,
+    observed_forward: np.ndarray,
+    synthetic_by_role: dict[str, np.ndarray],
+    valid_forward: np.ndarray,
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    bands = _configured_bands(run_cfg)
+    rows: list[dict[str, object]] = []
+    for role, synthetic in synthetic_by_role.items():
+        residual = observed_forward - synthetic
+        full_residual = _band_rms_2d(residual, valid_forward, dt_s=dt_s, low_hz=0.0, high_hz=float("inf"))
+        full_observed = _band_rms_2d(observed_forward, valid_forward, dt_s=dt_s, low_hz=0.0, high_hz=float("inf"))
+        full_synthetic = _band_rms_2d(synthetic, valid_forward, dt_s=dt_s, low_hz=0.0, high_hz=float("inf"))
+        for band in bands:
+            low = float(band["low_hz"])
+            high = float(band["high_hz"])
+            obs_rms = _band_rms_2d(observed_forward, valid_forward, dt_s=dt_s, low_hz=low, high_hz=high)
+            syn_rms = _band_rms_2d(synthetic, valid_forward, dt_s=dt_s, low_hz=low, high_hz=high)
+            res_rms = _band_rms_2d(residual, valid_forward, dt_s=dt_s, low_hz=low, high_hz=high)
+            rows.append(
+                {
+                    "model_role": role,
+                    "band": band["name"],
+                    "low_hz": low,
+                    "high_hz": high,
+                    "observed_band_rms": obs_rms,
+                    "synthetic_band_rms": syn_rms,
+                    "residual_band_rms": res_rms,
+                    "residual_to_observed_ratio": res_rms / obs_rms if np.isfinite(obs_rms) and obs_rms > 0 else float("nan"),
+                    "band_residual_energy_fraction_of_full": (
+                        res_rms / full_residual if np.isfinite(full_residual) and full_residual > 0 else float("nan")
+                    ),
+                    "fullband_observed_rms": full_observed,
+                    "fullband_synthetic_rms": full_synthetic,
+                    "fullband_residual_rms": full_residual,
+                }
+            )
+    frame = pd.DataFrame.from_records(rows)
+    path = output_dir / "forward_band_residual_qc.csv"
+    frame.to_csv(path, index=False)
+    figures: dict[str, str] = {}
+    fig_dir = output_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    fig_path = fig_dir / "forward_band_residual_qc.png"
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    for role, group in frame.groupby("model_role"):
+        ax.plot(group["band"], group["residual_to_observed_ratio"], marker="o", label=role)
+    ax.set_ylabel("residual band RMS / observed band RMS")
+    ax.set_title("Forward residual by seismic band")
+    ax.tick_params(axis="x", rotation=20)
+    ax.grid(True, alpha=0.25)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(fig_path, dpi=160)
+    plt.close(fig)
+    figures["forward_band_residual_qc"] = repo_relative_path(fig_path, root=REPO_ROOT)
+    return frame, figures
+
+
+def _write_ai_plausibility_qc(
+    output_dir: Path,
+    *,
+    run_cfg: dict,
+    dt_s: float,
+    predictions: dict[str, dict[str, object]],
+    lfm: np.ndarray,
+    valid: np.ndarray,
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    bands = _configured_bands(run_cfg)
+    rows: list[dict[str, object]] = []
+    valid = np.asarray(valid, dtype=bool)
+    lfm = np.asarray(lfm, dtype=np.float64)
+    rows.append({"model_role": "lfm_only", "signal": "lfm_log_ai", **_finite_stats(lfm, valid)})
+    for role, payload in predictions.items():
+        arrays = payload["arrays"]
+        pred = np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float64)
+        delta = np.asarray(arrays["pred_delta_vs_lfm"], dtype=np.float64)
+        role_valid = valid & np.asarray(arrays["valid_mask_model"], dtype=bool) & (np.asarray(arrays["stitching_weight"]) > 0.0)
+        normalization = _normalization_for_role(predictions, role)
+        delta_mean, delta_std = _normalization_stats(normalization, "delta")
+        lfm_mean, lfm_std = _normalization_stats(normalization, "lfm")
+        rows.append(
+            {
+                "model_role": role,
+                "signal": "pred_log_ai",
+                **_finite_stats(pred, role_valid),
+                "synthetic_train_mean": float("nan"),
+                "synthetic_train_std": float("nan"),
+            }
+        )
+        delta_row = {
+            "model_role": role,
+            "signal": "pred_delta_vs_lfm",
+            **_finite_stats(delta, role_valid),
+            "synthetic_train_mean": delta_mean,
+            "synthetic_train_std": delta_std,
+        }
+        delta_row["real_to_synthetic_std_ratio"] = (
+            delta_row["std"] / delta_std if np.isfinite(delta_std) and delta_std > 0 else float("nan")
+        )
+        rows.append(delta_row)
+        lfm_row = {
+            "model_role": role,
+            "signal": "lfm_input_for_role",
+            **_finite_stats(lfm, role_valid),
+            "synthetic_train_mean": lfm_mean,
+            "synthetic_train_std": lfm_std,
+        }
+        lfm_row["real_to_synthetic_std_ratio"] = (
+            lfm_row["std"] / lfm_std if np.isfinite(lfm_std) and lfm_std > 0 else float("nan")
+        )
+        rows.append(lfm_row)
+        full_delta = _band_rms_2d(delta, role_valid, dt_s=dt_s, low_hz=0.0, high_hz=float("inf"))
+        full_pred = _band_rms_2d(pred, role_valid, dt_s=dt_s, low_hz=0.0, high_hz=float("inf"))
+        for band in bands:
+            low = float(band["low_hz"])
+            high = float(band["high_hz"])
+            delta_band = _band_rms_2d(delta, role_valid, dt_s=dt_s, low_hz=low, high_hz=high)
+            pred_band = _band_rms_2d(pred, role_valid, dt_s=dt_s, low_hz=low, high_hz=high)
+            rows.append(
+                {
+                    "model_role": role,
+                    "signal": "pred_delta_vs_lfm_band",
+                    "band": band["name"],
+                    "low_hz": low,
+                    "high_hz": high,
+                    "band_rms": delta_band,
+                    "fullband_rms": full_delta,
+                    "energy_ratio": delta_band / full_delta if np.isfinite(full_delta) and full_delta > 0 else float("nan"),
+                    "synthetic_train_std": delta_std,
+                    "band_rms_to_synthetic_delta_std": (
+                        delta_band / delta_std if np.isfinite(delta_std) and delta_std > 0 else float("nan")
+                    ),
+                }
+            )
+            rows.append(
+                {
+                    "model_role": role,
+                    "signal": "pred_log_ai_band",
+                    "band": band["name"],
+                    "low_hz": low,
+                    "high_hz": high,
+                    "band_rms": pred_band,
+                    "fullband_rms": full_pred,
+                    "energy_ratio": pred_band / full_pred if np.isfinite(full_pred) and full_pred > 0 else float("nan"),
+                }
+            )
+    if "lateral" in predictions and "no_lateral" in predictions:
+        lat = predictions["lateral"]["arrays"]
+        no = predictions["no_lateral"]["arrays"]
+        diff = np.asarray(lat["stitched_pred_log_ai"], dtype=np.float64) - np.asarray(no["stitched_pred_log_ai"], dtype=np.float64)
+        diff_valid = (
+            valid
+            & np.asarray(lat["valid_mask_model"], dtype=bool)
+            & np.asarray(no["valid_mask_model"], dtype=bool)
+            & (np.asarray(lat["stitching_weight"]) > 0.0)
+            & (np.asarray(no["stitching_weight"]) > 0.0)
+        )
+        full = _band_rms_2d(diff, diff_valid, dt_s=dt_s, low_hz=0.0, high_hz=float("inf"))
+        rows.append({"model_role": "lateral_minus_no_lateral", "signal": "pred_log_ai_difference", **_finite_stats(diff, diff_valid)})
+        for band in bands:
+            band_rms = _band_rms_2d(
+                diff,
+                diff_valid,
+                dt_s=dt_s,
+                low_hz=float(band["low_hz"]),
+                high_hz=float(band["high_hz"]),
+            )
+            rows.append(
+                {
+                    "model_role": "lateral_minus_no_lateral",
+                    "signal": "pred_log_ai_difference_band",
+                    "band": band["name"],
+                    "low_hz": band["low_hz"],
+                    "high_hz": band["high_hz"],
+                    "band_rms": band_rms,
+                    "fullband_rms": full,
+                    "energy_ratio": band_rms / full if np.isfinite(full) and full > 0 else float("nan"),
+                }
+            )
+    frame = pd.DataFrame.from_records(rows)
+    path = output_dir / "ai_plausibility_qc.csv"
+    frame.to_csv(path, index=False)
+    figures: dict[str, str] = {}
+    fig_dir = output_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    band_frame = frame[frame["signal"].astype(str).str.endswith("_band", na=False)].copy()
+    fig_path = fig_dir / "ai_band_energy_qc.png"
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    for (role, signal), group in band_frame.groupby(["model_role", "signal"]):
+        if str(signal) != "pred_delta_vs_lfm_band":
+            continue
+        ax.plot(group["band"], group["energy_ratio"], marker="o", label=str(role))
+    ax.set_ylabel("band RMS / fullband RMS")
+    ax.set_title("AI pred_delta_vs_lfm band energy")
+    ax.tick_params(axis="x", rotation=20)
+    ax.grid(True, alpha=0.25)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(fig_path, dpi=160)
+    plt.close(fig)
+    figures["ai_band_energy_qc"] = repo_relative_path(fig_path, root=REPO_ROOT)
+    return frame, figures
 
 
 def _red_flags(
@@ -753,10 +1126,12 @@ def main() -> None:
     scan_frames = []
     spatial_rows = []
     figure_outputs: dict[str, str] = {}
+    synthetic_by_role: dict[str, np.ndarray] = {}
     synthetic_dir = output_dir / "synthetic"
     synthetic_dir.mkdir(parents=True, exist_ok=False)
     for model_role, log_ai, source_role in impedance_inputs:
         synthetic = forward_log_ai(log_ai, wavelet)
+        synthetic_by_role[model_role] = synthetic
         obs_crop, syn_crop, valid_crop = _erode_forward_arrays(
             observed,
             synthetic,
@@ -828,6 +1203,26 @@ def main() -> None:
                 }
             )
 
+    common_forward_valid = _erode_valid_runs(valid[:, 1:], erosion_samples)
+    forward_band_frame, forward_band_figures = _write_forward_band_residual_qc(
+        output_dir,
+        run_cfg=run_cfg,
+        dt_s=dt_s,
+        observed_forward=observed[:, 1:],
+        synthetic_by_role=synthetic_by_role,
+        valid_forward=common_forward_valid,
+    )
+    ai_plausibility_frame, ai_plausibility_figures = _write_ai_plausibility_qc(
+        output_dir,
+        run_cfg=run_cfg,
+        dt_s=dt_s,
+        predictions=predictions,
+        lfm=lfm,
+        valid=valid,
+    )
+    figure_outputs.update(forward_band_figures)
+    figure_outputs.update(ai_plausibility_figures)
+
     metrics_path = output_dir / "forward_diagnostic_metrics.csv"
     metrics_frame = pd.DataFrame.from_records(metric_rows)
     metrics_frame.to_csv(metrics_path, index=False)
@@ -846,6 +1241,7 @@ def main() -> None:
         output_dir=output_dir,
         predictions=predictions,
         synthetic_dir=synthetic_dir,
+        wavelet=wavelet,
     )
     well_frame.to_csv(well_path, index=False)
     figure_outputs["phase_shift_gain_scan"] = _plot_scan_qc(output_dir, decomposition_frame)
@@ -887,6 +1283,8 @@ def main() -> None:
             "residual_decomposition": repo_relative_path(decomposition_path, root=REPO_ROOT),
             "wavelet_sensitivity": repo_relative_path(wavelet_sensitivity_path, root=REPO_ROOT),
             "spatial_residual_qc": repo_relative_path(spatial_path, root=REPO_ROOT),
+            "forward_band_residual_qc": repo_relative_path(output_dir / "forward_band_residual_qc.csv", root=REPO_ROOT),
+            "ai_plausibility_qc": repo_relative_path(output_dir / "ai_plausibility_qc.csv", root=REPO_ROOT),
             "synthetic_dir": repo_relative_path(synthetic_dir, root=REPO_ROOT),
             "figures": figure_outputs,
         },

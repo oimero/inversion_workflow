@@ -450,17 +450,18 @@ def _build_well_forward_qc(
                     **waveform_metrics,
                 }
             )
-        figure_path = figures / f"well_forward_qc_{well_name}.png"
-        _plot_well_qc(
-            path=figure_path,
-            well_name=well_name,
-            twt_model=twt_model,
-            well_log_ai=well_log_ai,
-            trace_idx=trace_idx,
-            predictions=predictions,
-            synthetic_dir=synthetic_dir,
-        )
-        figure_outputs[well_name] = repo_relative_path(figure_path, root=REPO_ROOT)
+            figure_path = figures / f"well_forward_qc_{well_name}_{role}.png"
+            _plot_well_qc(
+                path=figure_path,
+                well_name=well_name,
+                model_role=role,
+                twt_model=twt_model,
+                well_log_ai=well_log_ai,
+                pred_log_ai=pred,
+                trace_idx=trace_idx,
+                synthetic_dir=synthetic_dir,
+            )
+            figure_outputs[f"{well_name}_{role}"] = repo_relative_path(figure_path, root=REPO_ROOT)
     return pd.DataFrame.from_records(rows), figure_outputs
 
 
@@ -468,33 +469,36 @@ def _plot_well_qc(
     *,
     path: Path,
     well_name: str,
+    model_role: str,
     twt_model: np.ndarray,
     well_log_ai: np.ndarray,
+    pred_log_ai: np.ndarray,
     trace_idx: int,
-    predictions: dict[str, dict[str, object]],
     synthetic_dir: Path,
 ) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(14, 5), sharey=False)
-    axes[0].plot(well_log_ai, twt_model, label="well filtered log(AI)", color="black", linewidth=1.5)
-    for role, payload in predictions.items():
-        arrays = payload["arrays"]
-        axes[0].plot(
-            np.asarray(arrays["stitched_pred_log_ai"])[trace_idx],
-            twt_model,
-            label=role,
-            linewidth=1.0,
-        )
+    fig, axes = plt.subplots(1, 4, figsize=(15, 5), sharey=True)
+    well_ai = np.exp(well_log_ai)
+    pred_ai = np.exp(pred_log_ai)
+    valid_ai = np.isfinite(well_ai)
+    if np.any(valid_ai):
+        axes[0].plot(well_ai, twt_model, label="filtered AI", color="0.55", linewidth=1.2)
+    axes[0].plot(pred_ai, twt_model, label=f"{model_role} AI", color="red", linewidth=1.4)
     axes[0].invert_yaxis()
-    axes[0].set_xlabel("log(AI)")
+    axes[0].set_xlabel("AI")
     axes[0].set_ylabel("TWT s")
-    axes[0].set_title(f"{well_name} impedance")
+    axes[0].set_title("AI")
     axes[0].legend(fontsize=8)
-    first_observed = None
-    first_twt = None
-    for role in predictions:
-        synthetic_path = synthetic_dir / f"zero_shot_{role}.npz"
-        if not synthetic_path.is_file():
-            continue
+
+    pred_filled = _fill_nonfinite_1d(pred_log_ai)
+    reflectivity = np.tanh(0.5 * (pred_filled[1:] - pred_filled[:-1]))
+    twt_forward = twt_model[1:]
+    axes[1].plot(reflectivity, twt_forward, color="red", linewidth=0.9)
+    axes[1].axvline(0.0, color="black", linewidth=0.6)
+    axes[1].set_xlabel("reflectivity")
+    axes[1].set_title("Reflectivity")
+
+    synthetic_path = synthetic_dir / f"zero_shot_{model_role}.npz"
+    if synthetic_path.is_file():
         arrays = np.load(synthetic_path, allow_pickle=True)
         twt = arrays["twt_s_forward_axis"]
         observed = arrays["observed_seismic_forward_axis"][trace_idx]
@@ -505,34 +509,40 @@ def _plot_well_qc(
         observed_plot = np.where(valid_display, observed, np.nan)
         synthetic_plot = np.where(valid_display, synthetic, np.nan)
         residual_plot = np.where(valid_display, observed - synthetic, np.nan)
-        if role == next(iter(predictions)):
-            first_observed = observed_plot
-            first_twt = twt
-            axes[1].plot(observed_plot, twt, color="black", label="observed", linewidth=1.0)
-        axes[1].plot(synthetic_plot, twt, label=f"syn {role}", linewidth=1.0)
-        axes[2].plot(residual_plot, twt, label=f"res {role}", linewidth=1.0)
+        axes[2].plot(observed_plot, twt, color="black", label="observed", linewidth=1.0)
+        axes[2].plot(synthetic_plot, twt, color="red", label="synthetic", linewidth=1.0)
+        axes[3].plot(residual_plot, twt, color="red", label="observed - synthetic", linewidth=1.0)
         diagnostic_n = int(np.count_nonzero(valid_diagnostic & np.isfinite(observed) & np.isfinite(synthetic)))
         if diagnostic_n < 8:
-            axes[2].text(
+            axes[3].text(
                 0.02,
-                0.92 - 0.08 * len(axes[2].lines),
-                f"{role}: diagnostic n={diagnostic_n}",
-                transform=axes[2].transAxes,
+                0.92,
+                f"diagnostic n={diagnostic_n}",
+                transform=axes[3].transAxes,
                 fontsize=8,
             )
-    axes[1].invert_yaxis()
-    axes[1].set_xlabel("seismic")
-    axes[1].set_title(f"{well_name} forward")
-    axes[1].legend(fontsize=8)
-    if first_observed is not None and first_twt is not None:
-        axes[2].axvline(0.0, color="black", linestyle="--", linewidth=0.8)
-    axes[2].invert_yaxis()
-    axes[2].set_xlabel("observed - synthetic")
-    axes[2].set_title(f"{well_name} residual")
+    axes[2].set_xlabel("seismic")
+    axes[2].set_title("Synthetic")
     axes[2].legend(fontsize=8)
+    axes[3].axvline(0.0, color="black", linestyle="--", linewidth=0.8)
+    axes[3].set_xlabel("residual")
+    axes[3].set_title("Residual")
+    axes[3].legend(fontsize=8)
+    fig.suptitle(f"{well_name} R1 well QC: {model_role}")
     fig.tight_layout()
     fig.savefig(path, dpi=160)
     plt.close(fig)
+
+
+def _fill_nonfinite_1d(values: np.ndarray) -> np.ndarray:
+    out = np.asarray(values, dtype=np.float64).copy()
+    finite = np.isfinite(out)
+    if np.all(finite):
+        return out
+    if not np.any(finite):
+        return np.zeros_like(out, dtype=np.float64)
+    coords = np.arange(out.size, dtype=np.float64)
+    return np.interp(coords, coords[finite], out[finite])
 
 
 def _plot_forward_qc(

@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from cup.seismic.volume_export import export_volume_like_source
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
 from ginn_v2.real_field import forward_log_ai, load_selected_wavelet
 
@@ -38,12 +39,17 @@ class CalibrationConfig:
 def parse_lowfreq_calibration_config(raw: Mapping[str, Any], *, root: Path) -> CalibrationConfig:
     cfg = _mapping(raw.get("real_field_lowfreq_calibration"), "real_field_lowfreq_calibration")
     source_items = cfg.get("sources")
+    volume_source = cfg.get("volume_source")
+    if volume_source is not None:
+        source_items = [volume_source]
     if not isinstance(source_items, Sequence) or isinstance(source_items, (str, bytes)) or not source_items:
-        raise ValueError("real_field_lowfreq_calibration.sources must be a non-empty list.")
+        raise ValueError("real_field_lowfreq_calibration.sources or volume_source must be a non-empty list/mapping.")
     sources: list[CalibrationSource] = []
     for idx, item in enumerate(source_items):
         entry = _mapping(item, f"real_field_lowfreq_calibration.sources[{idx}]")
-        section_id = _required_text(entry, "section_id", path=f"real_field_lowfreq_calibration.sources[{idx}]")
+        section_id = str(entry.get("section_id") or entry.get("source_id") or "volume").strip()
+        if not section_id:
+            raise ValueError(f"real_field_lowfreq_calibration.sources[{idx}].section_id must be explicit.")
         lfm_text = str(entry.get("lfm_dir") or "").strip()
         sources.append(
             CalibrationSource(
@@ -98,14 +104,24 @@ def run_lowfreq_calibration(
         source_rows.append(_source_status_row(source, root=root))
         r0_summary = _read_json(source.zero_shot_dir / "real_field_zero_shot_summary.json")
         r1_summary = _read_json(source.forward_diagnostic_dir / "real_field_forward_diagnostic_summary.json")
-        r1_config = _load_r1_config(r1_summary, root=root)
-        well_auto_tie_dir = _r1_well_auto_tie_dir(r1_config, root=root)
-        tie_metrics = _load_tie_metrics(well_auto_tie_dir, root=root)
-        well_table = _read_csv_required(source.forward_diagnostic_dir / "well_forward_diagnostic.csv")
         predictions = _load_prediction_arrays(source.zero_shot_dir, roles=config.model_roles)
         for role, arrays in predictions.items():
             if config.output_arrays:
                 arrays_by_source_role[(source.section_id, role)] = arrays
+        if str(r0_summary.get("mode") or "").casefold() == "volume":
+            _write_source_metadata(
+                output_dir=output_dir,
+                source=source,
+                r0_summary=r0_summary,
+                r1_summary=r1_summary,
+                root=root,
+            )
+            continue
+        r1_config = _load_r1_config(r1_summary, root=root)
+        well_auto_tie_dir = _r1_well_auto_tie_dir(r1_config, root=root)
+        tie_metrics = _load_tie_metrics(well_auto_tie_dir, root=root)
+        well_table = _read_csv_required(source.forward_diagnostic_dir / "well_forward_diagnostic.csv")
+        for role, arrays in predictions.items():
             rows = _source_role_evidence(
                 source=source,
                 role=role,
@@ -133,6 +149,8 @@ def run_lowfreq_calibration(
     well_bias.to_csv(well_bias_path, index=False)
 
     model_bias = _aggregate_model_bias(well_bias, model_roles=config.model_roles)
+    if evidence.empty and well_bias.empty:
+        model_bias = _noop_model_bias(config.model_roles, reason="no_well_evidence_for_volume_mode")
     model_bias_path = output_dir / "calibration_bias_by_model.csv"
     model_bias.to_csv(model_bias_path, index=False)
 
@@ -345,6 +363,24 @@ def _aggregate_model_bias(well_bias: pd.DataFrame, *, model_roles: Sequence[str]
     return pd.DataFrame.from_records(rows)
 
 
+def _noop_model_bias(model_roles: Sequence[str], *, reason: str) -> pd.DataFrame:
+    return pd.DataFrame.from_records(
+        [
+            {
+                "model_role": role,
+                "status": "no_op_no_well_evidence",
+                "bias_model_role": 0.0,
+                "n_wells": 0,
+                "jackknife_bias_std": np.nan,
+                "jackknife_max_abs_shift": np.nan,
+                "jackknife_biases": "",
+                "reason": reason,
+            }
+            for role in model_roles
+        ]
+    )
+
+
 def _calibrated_well_comparison(evidence: pd.DataFrame, model_bias: pd.DataFrame) -> pd.DataFrame:
     if evidence.empty:
         return pd.DataFrame()
@@ -412,7 +448,7 @@ def _forward_invariance_metrics(
             calibrated = pred + bias if np.isfinite(bias) else np.full_like(pred, np.nan)
             before_syn = forward_log_ai(pred, wavelet)
             after_syn = forward_log_ai(calibrated, wavelet) if np.isfinite(bias) else np.full_like(before_syn, np.nan)
-            valid_forward = valid[:, 1:] & np.isfinite(before_syn) & np.isfinite(after_syn) & (weight[:, 1:] > 0.0)
+            valid_forward = valid[..., 1:] & np.isfinite(before_syn) & np.isfinite(after_syn) & (weight[..., 1:] > 0.0)
             diff = np.abs(after_syn - before_syn)
             max_diff = float(np.nanmax(diff[valid_forward])) if np.any(valid_forward) else np.nan
             rms_diff = float(np.sqrt(np.nanmean(diff[valid_forward] ** 2))) if np.any(valid_forward) else np.nan
@@ -449,6 +485,30 @@ def _forward_invariance_metrics(
                     xlines=np.asarray(arrays["xlines"]),
                     twt_s=np.asarray(arrays["twt_s"]),
                 )
+                if pred.ndim == 3:
+                    r0_summary = _read_json(source.zero_shot_dir / "real_field_zero_shot_summary.json")
+                    volume_meta = _mapping(r0_summary.get("volume"), "real_field_zero_shot_summary.volume")
+                    seismic_file = Path(str(volume_meta.get("seismic_file") or ""))
+                    seismic_type = str(volume_meta.get("seismic_type") or "").strip()
+                    if seismic_file and seismic_type:
+                        export = export_volume_like_source(
+                            output_base=target.parent / f"{role}_pred_log_ai_calibrated",
+                            volume=np.asarray(calibrated, dtype=np.float32),
+                            ilines=np.asarray(arrays["ilines"], dtype=np.float64),
+                            xlines=np.asarray(arrays["xlines"], dtype=np.float64),
+                            samples=np.asarray(arrays["twt_s"], dtype=np.float64),
+                            source_seismic_file=seismic_file,
+                            source_seismic_type=seismic_type,
+                            title=f"R2 calibrated {role}",
+                            details=[
+                                f"source zero-shot: {source.zero_shot_dir}",
+                                f"bias_model_role: {bias}",
+                            ],
+                            inline_chunk_size=16,
+                            nan_fill=None,
+                        )
+                        rows[-1]["calibrated_volume_export"] = export.get("path", "")
+                        rows[-1]["calibrated_volume_export_sha256"] = export.get("sha256", "")
     return pd.DataFrame.from_records(rows)
 
 
@@ -773,4 +833,6 @@ def _summary_status(model_bias: pd.DataFrame) -> str:
     if model_bias.empty:
         return "insufficient_evidence"
     statuses = set(str(x) for x in model_bias.get("status", pd.Series(dtype=str)).dropna())
+    if statuses == {"no_op_no_well_evidence"}:
+        return "ok_noop_no_well_evidence"
     return "ok" if statuses == {"ok"} else "partial" if "ok" in statuses else "insufficient_evidence"

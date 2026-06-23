@@ -68,9 +68,9 @@ def _align_forward_arrays(
     synthetic: np.ndarray,
     valid: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    obs = np.asarray(observed, dtype=np.float64)[:, 1:]
+    obs = np.asarray(observed, dtype=np.float64)[..., 1:]
     syn = np.asarray(synthetic, dtype=np.float64)
-    mask = np.asarray(valid, dtype=bool)[:, 1:]
+    mask = np.asarray(valid, dtype=bool)[..., 1:]
     if obs.shape != syn.shape or mask.shape != syn.shape:
         raise ValueError(f"Forward diagnostic shape mismatch: obs={obs.shape}, syn={syn.shape}, mask={mask.shape}")
     return obs, syn, mask
@@ -78,13 +78,32 @@ def _align_forward_arrays(
 
 def _spatial_rows(*, model_role: str, observed: np.ndarray, synthetic: np.ndarray, valid: np.ndarray) -> list[dict[str, object]]:
     rows = []
-    for lateral_idx in range(observed.shape[0]):
-        metrics = diagnostic_metrics(
-            observed=observed[lateral_idx : lateral_idx + 1],
-            synthetic=synthetic[lateral_idx : lateral_idx + 1],
-            valid_mask=valid[lateral_idx : lateral_idx + 1],
-        )
-        rows.append({"model_role": model_role, "lateral_index": lateral_idx, **metrics})
+    if observed.ndim == 2:
+        for lateral_idx in range(observed.shape[0]):
+            metrics = diagnostic_metrics(
+                observed=observed[lateral_idx : lateral_idx + 1],
+                synthetic=synthetic[lateral_idx : lateral_idx + 1],
+                valid_mask=valid[lateral_idx : lateral_idx + 1],
+            )
+            rows.append({"model_role": model_role, "spatial_axis": "lateral", "lateral_index": lateral_idx, **metrics})
+        return rows
+    if observed.ndim == 3:
+        for inline_idx in range(observed.shape[0]):
+            metrics = diagnostic_metrics(
+                observed=observed[inline_idx : inline_idx + 1, :, :],
+                synthetic=synthetic[inline_idx : inline_idx + 1, :, :],
+                valid_mask=valid[inline_idx : inline_idx + 1, :, :],
+            )
+            rows.append({"model_role": model_role, "spatial_axis": "inline", "spatial_index": inline_idx, **metrics})
+        for xline_idx in range(observed.shape[1]):
+            metrics = diagnostic_metrics(
+                observed=observed[:, xline_idx : xline_idx + 1, :],
+                synthetic=synthetic[:, xline_idx : xline_idx + 1, :],
+                valid_mask=valid[:, xline_idx : xline_idx + 1, :],
+            )
+            rows.append({"model_role": model_role, "spatial_axis": "xline", "spatial_index": xline_idx, **metrics})
+        return rows
+    raise ValueError(f"Unsupported spatial QC dimensionality: {observed.ndim}")
     return rows
 
 
@@ -224,23 +243,25 @@ def _band_pair_metrics(
 def _band_rms_2d(values: np.ndarray, valid: np.ndarray, *, dt_s: float, low_hz: float, high_hz: float) -> float:
     data = np.asarray(values, dtype=np.float64)
     mask = np.asarray(valid, dtype=bool) & np.isfinite(data)
-    if data.ndim != 2 or not np.any(mask):
+    if data.ndim < 2 or not np.any(mask):
         return float("nan")
-    prepared = np.zeros_like(data, dtype=np.float64)
-    for idx in range(data.shape[0]):
-        row_mask = mask[idx]
+    flat = data.reshape((-1, data.shape[-1]))
+    flat_mask = mask.reshape((-1, data.shape[-1]))
+    prepared = np.zeros_like(flat, dtype=np.float64)
+    for idx in range(flat.shape[0]):
+        row_mask = flat_mask[idx]
         if int(np.count_nonzero(row_mask)) < 8:
             continue
-        prepared[idx] = np.where(row_mask, data[idx] - float(np.mean(data[idx, row_mask])), 0.0)
+        prepared[idx] = np.where(row_mask, flat[idx] - float(np.mean(flat[idx, row_mask])), 0.0)
     spectrum = np.fft.rfft(prepared, axis=1)
-    freqs = np.fft.rfftfreq(data.shape[1], d=float(dt_s))
+    freqs = np.fft.rfftfreq(flat.shape[1], d=float(dt_s))
     band = (freqs >= float(low_hz)) & (freqs < float(high_hz))
     if not np.any(band):
         return 0.0
     filtered = np.zeros_like(spectrum)
     filtered[:, band] = spectrum[:, band]
-    component = np.fft.irfft(filtered, n=data.shape[1], axis=1)
-    return float(np.sqrt(np.mean(component[mask] ** 2)))
+    component = np.fft.irfft(filtered, n=flat.shape[1], axis=1)
+    return float(np.sqrt(np.mean(component[flat_mask] ** 2)))
 
 
 def _read_wavelet_csv(path: Path) -> np.ndarray:
@@ -850,10 +871,13 @@ def _plot_forward_qc(
     figures.mkdir(parents=True, exist_ok=True)
     display_mask = np.asarray(display_valid, dtype=bool)
     residual = np.where(display_mask, observed - synthetic, np.nan)
+    observed_plot = _central_display_panel(np.where(display_mask, observed, np.nan))
+    synthetic_plot = _central_display_panel(np.where(display_mask, synthetic, np.nan))
+    residual_plot = _central_display_panel(residual)
     panels = [
-        ("observed", np.where(display_mask, observed, np.nan), "seismic"),
-        ("synthetic", np.where(display_mask, synthetic, np.nan), "seismic"),
-        ("residual", residual, "residual"),
+        ("observed", observed_plot, "seismic"),
+        ("synthetic", synthetic_plot, "seismic"),
+        ("residual", residual_plot, "residual"),
     ]
     fig, axes = plt.subplots(1, 3, figsize=(12, 4), sharey=True)
     for ax, (_, values, title) in zip(axes, panels):
@@ -870,6 +894,15 @@ def _plot_forward_qc(
     fig.savefig(path, dpi=160)
     plt.close(fig)
     return repo_relative_path(path, root=REPO_ROOT)
+
+
+def _central_display_panel(values: np.ndarray) -> np.ndarray:
+    data = np.asarray(values)
+    if data.ndim == 2:
+        return data
+    if data.ndim == 3:
+        return data[data.shape[0] // 2, :, :]
+    raise ValueError(f"Cannot display forward QC array with ndim={data.ndim}.")
 
 
 def _plot_scan_qc(output_dir: Path, decomposition: pd.DataFrame) -> str:
@@ -914,9 +947,14 @@ def _plot_spatial_qc(output_dir: Path, spatial: pd.DataFrame) -> str:
         return ""
     fig, ax = plt.subplots(figsize=(8, 4))
     finite = spatial[np.isfinite(spatial["residual_rms_scaled"])]
-    for role, group in finite.groupby("model_role"):
-        ax.plot(group["lateral_index"], group["residual_rms_scaled"], label=role)
-    ax.set_xlabel("lateral trace")
+    x_col = "lateral_index" if "lateral_index" in finite.columns and finite["lateral_index"].notna().any() else "spatial_index"
+    group_cols = ["model_role"]
+    if "spatial_axis" in finite.columns:
+        group_cols.append("spatial_axis")
+    for key, group in finite.groupby(group_cols):
+        label = " / ".join(str(part) for part in (key if isinstance(key, tuple) else (key,)))
+        ax.plot(group[x_col], group["residual_rms_scaled"], label=label)
+    ax.set_xlabel(x_col)
     ax.set_ylabel("scaled residual RMS")
     ax.set_title("Spatial residual pattern")
     if finite.empty:
@@ -1386,6 +1424,7 @@ def main() -> None:
     observed = np.asarray(first["seismic_input"], dtype=np.float64)
     lfm = np.asarray(first["lfm_input"], dtype=np.float64)
     valid = np.asarray(first["valid_mask_model"], dtype=bool)
+    output_mode = "volume" if observed.ndim == 3 else "section"
     twt_s = np.asarray(first["twt_s"], dtype=np.float64)
     dt_s = float(np.median(np.diff(twt_s))) if twt_s.size > 1 else 0.002
 
@@ -1443,16 +1482,16 @@ def main() -> None:
         figure_outputs[model_role] = _plot_forward_qc(
             output_dir=output_dir,
             model_role=model_role,
-            observed=observed[:, 1:],
+            observed=observed[..., 1:],
             synthetic=synthetic,
-            display_valid=valid[:, 1:],
+            display_valid=valid[..., 1:],
             diagnostic_valid=valid_crop,
         )
         np.savez_compressed(
             synthetic_dir / f"{model_role}.npz",
             synthetic_seismic=synthetic.astype(np.float32),
-            observed_seismic_forward_axis=observed[:, 1:].astype(np.float32),
-            valid_mask_forward_axis=valid[:, 1:].astype(bool),
+            observed_seismic_forward_axis=observed[..., 1:].astype(np.float32),
+            valid_mask_forward_axis=valid[..., 1:].astype(bool),
             twt_s_forward_axis=twt_s[1:],
         )
         scan = phase_shift_scan(
@@ -1488,12 +1527,12 @@ def main() -> None:
                 }
             )
 
-    common_forward_valid = valid[:, 1:].astype(bool)
+    common_forward_valid = valid[..., 1:].astype(bool)
     forward_band_frame, forward_band_figures = _write_forward_band_residual_qc(
         output_dir,
         run_cfg=run_cfg,
         dt_s=dt_s,
-        observed_forward=observed[:, 1:],
+        observed_forward=observed[..., 1:],
         synthetic_by_role=synthetic_by_role,
         valid_forward=common_forward_valid,
     )
@@ -1520,20 +1559,38 @@ def main() -> None:
     spatial_frame = pd.DataFrame.from_records(spatial_rows)
     spatial_frame.to_csv(spatial_path, index=False)
     well_path = output_dir / "well_forward_diagnostic.csv"
-    well_frame, well_figure_outputs = _build_well_forward_qc(
-        run_cfg=run_cfg,
-        zero_shot_dir=zero_shot_dir,
-        output_dir=output_dir,
-        predictions=predictions,
-        synthetic_dir=synthetic_dir,
-        wavelet=wavelet,
-    )
+    if output_mode == "volume":
+        well_frame = pd.DataFrame.from_records(
+            [
+                {
+                    "status": "disabled_for_volume_mode",
+                    "reason": "R1 volume diagnostic does not run section-distance well QC.",
+                }
+            ]
+        )
+        well_figure_outputs = {}
+    else:
+        well_frame, well_figure_outputs = _build_well_forward_qc(
+            run_cfg=run_cfg,
+            zero_shot_dir=zero_shot_dir,
+            output_dir=output_dir,
+            predictions=predictions,
+            synthetic_dir=synthetic_dir,
+            wavelet=wavelet,
+        )
     well_frame.to_csv(well_path, index=False)
-    well_comparison_frame, well_band_frame, well_closure_figures = _write_well_closure_tables(
-        output_dir,
-        well_frame=well_frame,
-        run_cfg=run_cfg,
-    )
+    if output_mode == "volume":
+        well_comparison_frame = pd.DataFrame()
+        well_band_frame = pd.DataFrame()
+        (output_dir / "well_ai_comparison_summary.csv").write_text("", encoding="utf-8")
+        (output_dir / "well_ai_band_comparison.csv").write_text("", encoding="utf-8")
+        well_closure_figures = {}
+    else:
+        well_comparison_frame, well_band_frame, well_closure_figures = _write_well_closure_tables(
+            output_dir,
+            well_frame=well_frame,
+            run_cfg=run_cfg,
+        )
     figure_outputs.update(well_closure_figures)
     figure_outputs["phase_shift_gain_scan"] = _plot_scan_qc(output_dir, decomposition_frame)
     figure_outputs["spatial_residual_qc"] = _plot_spatial_qc(output_dir, spatial_frame)
@@ -1549,6 +1606,7 @@ def main() -> None:
     summary = {
         "schema_version": "real_field_forward_diagnostic_summary_v1",
         "status": "ok",
+        "mode": output_mode,
         "config_file": repo_relative_path(cfg_path, root=REPO_ROOT),
         "zero_shot_dir": repo_relative_path(zero_shot_dir, root=REPO_ROOT),
         "wavelet": wavelet_meta,

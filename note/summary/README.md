@@ -1,18 +1,18 @@
-# 模型消融与真实工区 R0/R1 · 冻结报告
+# 模型消融与真实工区 R0/R1/R2 · 冻结报告
 
-本目录冻结 `synthoseis-lite` 模型消融阶段，以及真实工区 R0/R1 研究诊断阶段的可信报告。
+本目录冻结 `synthoseis-lite` 模型消融阶段，以及真实工区 R0/R1/R2 研究诊断阶段的可信报告。
 
 当前 HEAD：
 
 ```text
-1dd88ac969793a16cd94c0525e10e76675e82a18
+0c216564d9a19e076665e133be791c40b7e31b4e
 ```
 
 ## 当前结论
 
-Synthetic gate 的主候选仍是 `trace1d_tcn_lateral_mixer_mismatch`：强 1D TCN 时间主干加浅横向 mixer，在多 seed 消融中整体优于纯 1D；`k5` 仍是下一轮候选，不替代当前 full-training `k3` 主候选。Post-hoc smoothing 不能替代 learned lateral mixer，tiny physics 暂未证明有效。
+Synthetic gate 的主候选仍是 `trace1d_tcn_lateral_mixer_mismatch`：强 1D TCN 时间主干加浅横向 mixer，在多 seed 消融中整体优于纯 1D；`k5` 仍是下一轮候选，不替代当前 full-training `k3` 主候选。
 
-真实工区 R0/R1 已完成一版可复现诊断：使用 `real_field_lfm_v1`、`p99_abs_matched` seismic 输入变换和第五步子波 active half-support 的 valid-run erosion。修复 NaN 正演污染和图件纵轴后，R1 显示 zero-shot synthetic 与真实地震具备较强正演一致性；但这仍是 research output，不是生产反演结果，也不是穿井验证结论。
+真实工区已完成六剖面 R0/R1/R2 诊断：zero-shot 正演一致性稳定，但井旁阻抗可信度尚未被钉牢。R2 证明全局常数 `log(AI)` bias 不能解决井旁 AI 偏差；下一步不应扩大 R2，而应先做小体/体模式 R0/R1 QC，再判断是否进入 R3 adapter。
 
 ## 批次说明
 
@@ -22,22 +22,24 @@ Synthetic gate 的主候选仍是 `trace1d_tcn_lateral_mixer_mismatch`：强 1D 
 | `20260619_lateral_mixer_gate` | `79e270e06eb797ab9e62227aa95217c2780543fb` | 冻结 tiny physics 与 lateral mixer 追加消融 | 支撑当前 synthetic 主候选 |
 | `20260619_smoothing_width_gate` | `60aeb3a310cee090090041084344da72a218edd3` | 冻结 post-hoc smoothing、mixer width 和 k5 subset 多 seed 复核 | 当前 synthetic 推荐入口 |
 | `20260622_real_field_gate` | `1dd88ac969793a16cd94c0525e10e76675e82a18` | 冻结新 LFM、R0 zero-shot 和 R1 forward diagnostic | 当前真实工区 R0/R1 推荐入口 |
+| `20260623_six_section_r2_gate` | `0c216564d9a19e076665e133be791c40b7e31b4e` | 冻结六剖面 R0/R1 和 R2 全局常数 bias 诊断 | 当前真实工区推荐入口 |
 
 ## 真实工区冻结位置
 
 ```text
-note/summary/final_audit/20260622_real_field_gate/
+note/summary/final_audit/20260623_six_section_r2_gate/
   README.md
-  lfm/real_field_lfm_current_v4/
-  r0/real_field_zero_shot_20260622_103213/
-  r1/real_field_forward_diagnostic_20260622_103253/
-  training_runs/ginn_v2_train_trace1d_tcn_mismatch_r0_s20260619/
+  configs/real_field_six_section_configs_20260623/
+  r0/
+  r1/
+  r2/real_field_lowfreq_calibration_current/
 ```
 
 关键指标来自：
 
 ```text
-note/summary/final_audit/20260622_real_field_gate/r1/real_field_forward_diagnostic_20260622_103253/forward_diagnostic_metrics.csv
+note/summary/final_audit/20260623_six_section_r2_gate/r2/real_field_lowfreq_calibration_current/calibration_bias_by_model.csv
+note/summary/final_audit/20260623_six_section_r2_gate/r2/real_field_lowfreq_calibration_current/calibrated_forward_metrics.csv
 ```
 
 ## 当前候选排序
@@ -54,7 +56,7 @@ note/summary/final_audit/20260622_real_field_gate/r1/real_field_forward_diagnost
 
 `sample_kind` 过滤修复前的 mismatch-training base 指标全部废弃。20260618 baseline gate 只引用 `20260618_baseline_gate` 下的冻结副本；20260619 lateral mixer gate 只引用 `20260619_lateral_mixer_gate` 下的冻结副本；post-hoc smoothing 与 mixer width 复核只引用 `20260619_smoothing_width_gate` 下的冻结副本。
 
-真实工区 R0/R1 只引用 `20260622_real_field_gate` 下的冻结副本。更早的 `real_field_*` 输出，尤其是旧 LFM、NaN 正演污染或图件纵轴修复前的结果，不再用于结论。
+真实工区 R0/R1/R2 当前只引用 `20260623_six_section_r2_gate` 下的冻结副本。更早的 `real_field_*` 输出，尤其是旧 LFM、NaN 正演污染、图件纵轴修复前或单剖面阶段的结果，不再作为当前主结论。
 
 合成基准冻结位置：
 

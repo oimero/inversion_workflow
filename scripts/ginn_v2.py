@@ -22,6 +22,7 @@ from cup.utils.io import repo_relative_path, resolve_relative_path, sha256_file,
 from ginn_v2.data import (
     PatchSpec,
     build_patch_index,
+    compute_input_reference_stats,
     compute_normalization,
     default_eval_kinds,
     default_train_kinds,
@@ -119,6 +120,7 @@ def _write_train_manifest(
     benchmark_dir: Path,
     patch_index_path: Path,
     normalization: dict,
+    input_reference_stats_path: Path,
     train_result: dict,
     patch_index_truncated: bool,
     max_patches: int | None,
@@ -152,6 +154,8 @@ def _write_train_manifest(
         "validation_fraction": float(args.validation_fraction),
         "test_fraction": float(args.test_fraction),
         "normalization": normalization,
+        "input_reference_stats": repo_relative_path(input_reference_stats_path, root=REPO_ROOT),
+        "input_reference_stats_sha256": sha256_file(input_reference_stats_path),
         "input_channels": ["seismic", "lfm_controlled_degraded", "valid_mask_model"],
         "output_semantics": "pred_log_ai = lfm_controlled_degraded + pred_delta_log_ai",
         "train_sample_kinds": sorted(_sample_kinds_for_training(args.model_id)),
@@ -240,6 +244,33 @@ def run_train(args: argparse.Namespace) -> None:
     else:
         normalization = compute_normalization(benchmark, patch_index)
     write_json(output_dir / "normalization.json", normalization)
+    input_reference_stats = {
+        "schema_version": "real_field_input_reference_stats_v1",
+        "input_name": "seismic",
+        "stats": compute_input_reference_stats(benchmark, patch_index, input_name="seismic"),
+        "sampling": {
+            "input_name": "seismic",
+            "total_train_patches": int(patch_index[patch_index["split"].eq("train")].shape[0]),
+            "sampled_train_patches": int(patch_index[patch_index["split"].eq("train")].shape[0]),
+            "sampling_policy": "all_train_patches_from_this_model_run",
+        },
+        "sources": {
+            "benchmark_dir": repo_relative_path(benchmark_dir, root=REPO_ROOT),
+            "patch_index": repo_relative_path(patch_index_path, root=REPO_ROOT),
+        },
+        "source_sha256": {
+            "patch_index": sha256_file(patch_index_path),
+            "synthetic_benchmark_h5": sha256_file(benchmark_dir / "synthetic_benchmark.h5"),
+            "sample_index_csv": sha256_file(benchmark_dir / "sample_index.csv"),
+            "benchmark_manifest_json": (
+                sha256_file(benchmark_dir / "benchmark_manifest.json")
+                if (benchmark_dir / "benchmark_manifest.json").is_file()
+                else ""
+            ),
+        },
+    }
+    input_reference_stats_path = output_dir / "input_reference_stats.json"
+    write_json(input_reference_stats_path, input_reference_stats)
     result = train_model(
         benchmark=benchmark,
         patch_index=patch_index,
@@ -261,6 +292,7 @@ def run_train(args: argparse.Namespace) -> None:
         benchmark_dir=benchmark_dir,
         patch_index_path=patch_index_path,
         normalization=normalization,
+        input_reference_stats_path=input_reference_stats_path,
         train_result=result,
         patch_index_truncated=patch_index_truncated,
         max_patches=max_patches,

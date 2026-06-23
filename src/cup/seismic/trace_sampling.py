@@ -15,6 +15,7 @@ from wtie.processing import grid
 TRACE_SAMPLE_PLAN_COLUMNS = [
     "well_name",
     "trace_plan_index",
+    "sample_method",
     "twt_s",
     "md_m",
     "tvdss_m",
@@ -22,11 +23,25 @@ TRACE_SAMPLE_PLAN_COLUMNS = [
     "y_m",
     "inline_float",
     "xline_float",
+    "inline_index_float",
+    "xline_index_float",
     "nearest_inline",
     "nearest_xline",
     "inline_index",
     "xline_index",
     "flat_idx",
+    "trace00_inline_index",
+    "trace00_xline_index",
+    "trace00_weight",
+    "trace01_inline_index",
+    "trace01_xline_index",
+    "trace01_weight",
+    "trace10_inline_index",
+    "trace10_xline_index",
+    "trace10_weight",
+    "trace11_inline_index",
+    "trace11_xline_index",
+    "trace11_weight",
     "survey_position",
 ]
 
@@ -105,6 +120,52 @@ def _nearest_indices_from_line(survey: Any, inline_float: float, xline_float: fl
     return int(round(inline_index_f)), int(round(xline_index_f)), float(nearest_inline), float(nearest_xline)
 
 
+def _bilinear_indices_from_line(survey: Any, inline_float: float, xline_float: float) -> dict[str, Any]:
+    geometry = survey.line_geometry
+    i_float, j_float = geometry.line_to_index(float(inline_float), float(xline_float))
+    i0 = int(np.floor(i_float))
+    i1 = int(np.ceil(i_float))
+    j0 = int(np.floor(j_float))
+    j1 = int(np.ceil(j_float))
+    wi = float(i_float - i0)
+    wj = float(j_float - j0)
+    neighbors = {
+        "trace00": (i0, j0, (1.0 - wi) * (1.0 - wj)),
+        "trace01": (i0, j1, (1.0 - wi) * wj),
+        "trace10": (i1, j0, wi * (1.0 - wj)),
+        "trace11": (i1, j1, wi * wj),
+    }
+    # Validate every required neighbor against the underlying survey.  This keeps
+    # deviated-well sampling honest near missing traces and survey edges.
+    for i, j, weight in neighbors.values():
+        if weight > 0.0:
+            _trace_flat_index(survey, i, j)
+    nearest_inline = geometry.snap_inline(float(inline_float))
+    nearest_xline = geometry.snap_xline(float(xline_float))
+    nearest_i, nearest_j, _, _ = _nearest_indices_from_line(survey, inline_float, xline_float)
+    return {
+        "inline_index_float": float(i_float),
+        "xline_index_float": float(j_float),
+        "nearest_inline": float(nearest_inline),
+        "nearest_xline": float(nearest_xline),
+        "inline_index": int(nearest_i),
+        "xline_index": int(nearest_j),
+        "flat_idx": _trace_flat_index(survey, nearest_i, nearest_j),
+        **{
+            f"{name}_inline_index": int(i)
+            for name, (i, _j, _w) in neighbors.items()
+        },
+        **{
+            f"{name}_xline_index": int(j)
+            for name, (_i, j, _w) in neighbors.items()
+        },
+        **{
+            f"{name}_weight": float(w)
+            for name, (_i, _j, w) in neighbors.items()
+        },
+    }
+
+
 def build_nearest_trace_sample_plan(samples: WellSpatialSampleSet, survey: Any) -> TraceSamplePlan:
     """Assign each spatial sample to its nearest valid seismic trace."""
     rows: list[dict[str, Any]] = []
@@ -129,13 +190,28 @@ def build_nearest_trace_sample_plan(samples: WellSpatialSampleSet, survey: Any) 
             rows.append(
                 {
                     **base,
+                    "sample_method": "nearest",
                     "inline_float": float(inline_float),
                     "xline_float": float(xline_float),
+                    "inline_index_float": float(inline_index),
+                    "xline_index_float": float(xline_index),
                     "nearest_inline": nearest_inline,
                     "nearest_xline": nearest_xline,
                     "inline_index": inline_index,
                     "xline_index": xline_index,
                     "flat_idx": flat_idx,
+                    "trace00_inline_index": inline_index,
+                    "trace00_xline_index": xline_index,
+                    "trace00_weight": 1.0,
+                    "trace01_inline_index": inline_index,
+                    "trace01_xline_index": xline_index,
+                    "trace01_weight": 0.0,
+                    "trace10_inline_index": inline_index,
+                    "trace10_xline_index": xline_index,
+                    "trace10_weight": 0.0,
+                    "trace11_inline_index": inline_index,
+                    "trace11_xline_index": xline_index,
+                    "trace11_weight": 0.0,
                     "survey_position": "inside",
                 }
             )
@@ -143,16 +219,66 @@ def build_nearest_trace_sample_plan(samples: WellSpatialSampleSet, survey: Any) 
             rows.append(
                 {
                     **base,
+                    "sample_method": "nearest",
                     "inline_float": None,
                     "xline_float": None,
+                    "inline_index_float": None,
+                    "xline_index_float": None,
                     "nearest_inline": None,
                     "nearest_xline": None,
                     "inline_index": None,
                     "xline_index": None,
                     "flat_idx": None,
+                    "trace00_inline_index": None,
+                    "trace00_xline_index": None,
+                    "trace00_weight": None,
+                    "trace01_inline_index": None,
+                    "trace01_xline_index": None,
+                    "trace01_weight": None,
+                    "trace10_inline_index": None,
+                    "trace10_xline_index": None,
+                    "trace10_weight": None,
+                    "trace11_inline_index": None,
+                    "trace11_xline_index": None,
+                    "trace11_weight": None,
                     "survey_position": "outside",
                 }
             )
+    return TraceSamplePlan(
+        well_name=samples.well_name,
+        rows=pd.DataFrame.from_records(rows, columns=TRACE_SAMPLE_PLAN_COLUMNS),
+    )
+
+
+def build_bilinear_trace_sample_plan(samples: WellSpatialSampleSet, survey: Any) -> TraceSamplePlan:
+    """Assign each spatial sample to bilinear trace-neighborhood weights."""
+    rows: list[dict[str, Any]] = []
+    for _, sample in samples.rows.iterrows():
+        base = {
+            "well_name": str(sample["well_name"]),
+            "trace_plan_index": int(sample["trajectory_sample_index"]),
+            "sample_method": "bilinear",
+            "twt_s": float(sample["twt_s"]),
+            "md_m": float(sample["md_m"]),
+            "tvdss_m": float(sample["tvdss_m"]),
+            "x_m": float(sample["x_m"]),
+            "y_m": float(sample["y_m"]),
+        }
+        try:
+            inline_float, xline_float = survey.line_geometry.coord_to_line(float(sample["x_m"]), float(sample["y_m"]))
+            plan = _bilinear_indices_from_line(survey, inline_float, xline_float)
+            rows.append(
+                {
+                    **base,
+                    "inline_float": float(inline_float),
+                    "xline_float": float(xline_float),
+                    **plan,
+                    "survey_position": "inside",
+                }
+            )
+        except ValueError:
+            empty = {column: None for column in TRACE_SAMPLE_PLAN_COLUMNS if column not in base}
+            rows.append({**base, **empty, "survey_position": "outside"})
     return TraceSamplePlan(
         well_name=samples.well_name,
         rows=pd.DataFrame.from_records(rows, columns=TRACE_SAMPLE_PLAN_COLUMNS),
@@ -165,6 +291,19 @@ def _unique_trace_indices(rows: pd.DataFrame) -> list[tuple[int, int]]:
         if str(row["survey_position"]) != "inside":
             continue
         pairs.add((int(row["inline_index"]), int(row["xline_index"])))
+    return sorted(pairs)
+
+
+def _unique_bilinear_trace_indices(rows: pd.DataFrame) -> list[tuple[int, int]]:
+    pairs: set[tuple[int, int]] = set()
+    for _, row in rows.iterrows():
+        if str(row["survey_position"]) != "inside":
+            continue
+        for prefix in ("trace00", "trace01", "trace10", "trace11"):
+            weight = float(row.get(f"{prefix}_weight", 0.0))
+            if weight <= 0.0:
+                continue
+            pairs.add((int(row[f"{prefix}_inline_index"]), int(row[f"{prefix}_xline_index"])))
     return sorted(pairs)
 
 
@@ -204,6 +343,55 @@ def assemble_nearest_trace_from_plan(
         twt,
         "twt" if domain == "time" else "md",
         name=f"Nearest trajectory seismic ({plan.well_name})",
+    )
+
+
+def assemble_bilinear_trace_from_plan(
+    plan: TraceSamplePlan,
+    survey: Any,
+    *,
+    sample_start: float | None = None,
+    sample_end: float | None = None,
+    domain: str = "time",
+) -> grid.Seismic:
+    """Read bilinear neighbor traces and assemble one along-trajectory seismic trace."""
+    rows = plan.rows.reset_index(drop=True)
+    if rows.empty:
+        raise ValueError("Trace sample plan is empty.")
+    if not rows["survey_position"].astype(str).eq("inside").all():
+        raise ValueError("Trace sample plan contains non-inside samples; crop or reject before assembly.")
+
+    indices = _unique_bilinear_trace_indices(rows)
+    if not indices:
+        raise ValueError("Trace sample plan contains no inside traces.")
+
+    trace_by_index = survey.read_traces_at_indices(indices, sample_start=sample_start, sample_end=sample_end, domain=domain)
+    first_trace = next(iter(trace_by_index.values()))
+    basis = np.asarray(first_trace.basis, dtype=np.float64)
+    twt = rows["twt_s"].to_numpy(dtype=np.float64)
+    if float(twt[0]) < float(basis[0]) - 1e-9 or float(twt[-1]) > float(basis[-1]) + 1e-9:
+        raise ValueError(f"Plan TWT range [{twt[0]}, {twt[-1]}] is outside read trace range [{basis[0]}, {basis[-1]}].")
+
+    values: list[float] = []
+    for _, row in rows.iterrows():
+        value = 0.0
+        weight_sum = 0.0
+        for prefix in ("trace00", "trace01", "trace10", "trace11"):
+            weight = float(row.get(f"{prefix}_weight", 0.0))
+            if weight <= 0.0:
+                continue
+            key = (int(row[f"{prefix}_inline_index"]), int(row[f"{prefix}_xline_index"]))
+            trace = trace_by_index[key]
+            value += weight * float(np.interp(float(row["twt_s"]), trace.basis, trace.values))
+            weight_sum += weight
+        if weight_sum <= 0.0:
+            raise ValueError("Bilinear trace sample has zero total weight.")
+        values.append(value / weight_sum)
+    return grid.Seismic(
+        np.asarray(values, dtype=np.float64),
+        twt,
+        "twt" if domain == "time" else "md",
+        name=f"Bilinear trajectory seismic ({plan.well_name})",
     )
 
 

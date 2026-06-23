@@ -36,6 +36,7 @@ from cup.seismic.horizon import (
     normalize_interpretation_unit_for_geometry,
 )
 from cup.seismic.survey import open_survey, segy_options_from_config
+from cup.seismic.volume_export import export_volume_like_source
 from cup.utils.io import (
     repo_relative_path,
     resolve_artifact_path,
@@ -254,6 +255,14 @@ def run_real_field_lfm(
         b_field=fields["b"].astype(np.float32),
         metadata_json=json.dumps(metadata, ensure_ascii=False),
     )
+    export_payload = _export_lfm_volume(
+        output_dir=output_dir,
+        log_ai=log_ai,
+        output_geometry=output_geometry,
+        seismic_path=seismic_path,
+        seismic_type=seismic_type,
+        seismic_cfg=config.seismic,
+    )
 
     parameter_qc_path = output_dir / "parameter_field_qc.csv"
     continuity_path = output_dir / "internal_horizon_continuity_qc.csv"
@@ -288,6 +297,7 @@ def run_real_field_lfm(
         lfm_stats=lfm_stats,
         outputs={
             "real_field_lfm": npz_path,
+            **({"real_field_lfm_export": Path(export_payload["path"])} if export_payload.get("path") else {}),
             "well_trend_controls": controls_path,
             "parameter_field_qc": parameter_qc_path,
             "internal_horizon_continuity_qc": continuity_path,
@@ -295,6 +305,7 @@ def run_real_field_lfm(
             **{f"figure:{key}": Path(value) for key, value in figure_outputs.items()},
         },
     )
+    summary["volume_export"] = export_payload
     write_json(output_dir / "real_field_lfm_summary.json", summary)
     return summary
 
@@ -1117,6 +1128,43 @@ def _write_figures(
         plt.close(fig)
         outputs["well_trend_controls"] = repo_relative_path(path, root=repo_root)
     return outputs
+
+
+def _export_lfm_volume(
+    *,
+    output_dir: Path,
+    log_ai: np.ndarray,
+    output_geometry: OutputGeometry,
+    seismic_path: Path,
+    seismic_type: str,
+    seismic_cfg: Mapping[str, Any],
+) -> dict[str, Any]:
+    export_cfg = dict(seismic_cfg.get("volume_export") or {})
+    if not _as_bool(export_cfg.get("enabled", True)):
+        return {"status": "disabled", "format": "", "path": ""}
+    if output_geometry.is_section:
+        return {"status": "skipped_section_output", "format": "", "path": ""}
+    if output_geometry.samples.size == 0:
+        return {"status": "skipped_empty_sample_axis", "format": "", "path": ""}
+    payload = export_volume_like_source(
+        output_base=output_dir / "real_field_lfm_log_ai",
+        volume=log_ai,
+        ilines=output_geometry.ilines,
+        xlines=output_geometry.xlines,
+        samples=output_geometry.samples,
+        source_seismic_file=seismic_path,
+        source_seismic_type=seismic_type,
+        title="Real-field LFM log(AI)",
+        details=[
+            "schema=real_field_lfm_v1",
+            "field=log_ai",
+            "domain=log(AI)",
+        ],
+        seismic_options=seismic_cfg,
+        inline_chunk_size=int(export_cfg.get("inline_chunk_size", seismic_cfg.get("zgy_inline_chunk_size", 16))),
+        nan_fill=export_cfg.get("nan_fill"),
+    )
+    return payload
 
 
 def _summary_payload(

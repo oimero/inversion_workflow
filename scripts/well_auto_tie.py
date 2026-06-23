@@ -43,7 +43,7 @@ if str(SRC_DIR) not in sys.path:
 from cup.petrel.load import import_interpretation_petrel, import_well_tops_petrel
 from cup.seismic.horizon import HorizonSurface
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.seismic.trace_sampling import assemble_nearest_trace_from_plan, build_nearest_trace_sample_plan
+from cup.seismic.trace_sampling import assemble_bilinear_trace_from_plan, build_bilinear_trace_sample_plan
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.time_config import TimeWorkflowConfig
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
@@ -760,7 +760,7 @@ def _write_optimized_trace_sample_plan(
         raise ValueError("Optimized trace sample plan has no seismic samples inside optimized TDT range.")
 
     samples = sample_trajectory_on_twt(trajectory.with_well_name(plan.well_name), table, twt_axis)
-    trace_plan = build_nearest_trace_sample_plan(samples, survey)
+    trace_plan = build_bilinear_trace_sample_plan(samples, survey)
     trace_plan.to_dataframe().to_csv(paths["optimized_trace_sample_plan"], index=False)
     return paths["optimized_trace_sample_plan"]
 
@@ -1294,7 +1294,7 @@ def _run_deviated_with_tdt(
     twt_axis = sample_axis.values[sample_idx_start:sample_idx_end]
 
     samples = sample_trajectory_on_twt(trajectory, prepared.table, twt_axis)
-    trace_plan = build_nearest_trace_sample_plan(samples, survey)
+    trace_plan = build_bilinear_trace_sample_plan(samples, survey)
     paths = _build_output_paths(output_dir, plan.well_name)
     plan_df = trace_plan.to_dataframe()
     plan_df["used_for_tie"] = False
@@ -1324,7 +1324,7 @@ def _run_deviated_with_tdt(
         min_tie_samples=min_tie_samples,
         clip_reason="trajectory_inside_crop",
     )
-    seismic = assemble_nearest_trace_from_plan(
+    seismic = assemble_bilinear_trace_from_plan(
         cropped_plan,
         survey,
         sample_start=float(prepared.report["tie_window_start_s"]),
@@ -1351,7 +1351,7 @@ def _run_deviated_with_tdt(
             "coarse_correction": coarse_report,
             "anchor": anchor_info,
             "trace_sampling": {
-                "method": "nearest",
+                "method": "bilinear",
                 "trajectory_outside_fraction": float(outside_fraction),
                 "trajectory_inside_sample_count": int((trace_plan.rows["survey_position"] == "inside").sum()),
                 "trajectory_outside_sample_count": int((trace_plan.rows["survey_position"] == "outside").sum()),

@@ -315,6 +315,49 @@ def compute_normalization(
     return stats
 
 
+def compute_input_reference_stats(
+    benchmark: SynthoseisBenchmark,
+    patch_index: pd.DataFrame,
+    *,
+    input_name: str = "seismic",
+) -> dict[str, Any]:
+    train = patch_index[patch_index["split"].eq("train")]
+    if train.empty:
+        raise ValueError("Cannot compute input reference stats without train patches.")
+    chunks: list[np.ndarray] = []
+    for _, row in train.iterrows():
+        sample = benchmark.load_sample(str(row["sample_id"]))
+        target, seismic, lfm, valid, _ = _aligned_arrays(sample)
+        sl = _row_slice(row)
+        patch_valid = valid[sl]
+        if input_name == "seismic":
+            chunks.append(_finite_values(seismic[sl], patch_valid))
+        elif input_name == "lfm":
+            chunks.append(_finite_values(lfm[sl], patch_valid))
+        elif input_name == "target":
+            chunks.append(_finite_values(target[sl], patch_valid))
+        else:
+            raise ValueError(f"Unsupported input reference stats input_name: {input_name}")
+    values = np.concatenate([chunk for chunk in chunks if chunk.size])
+    if values.size < 2:
+        raise ValueError(f"Insufficient finite train values for input reference stats: {input_name}")
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    return {
+        "mean": float(np.mean(values)),
+        "std": float(np.std(values)),
+        "rms": float(np.sqrt(np.mean(values * values))),
+        "robust_rms": float(1.4826 * mad),
+        "p01": float(np.quantile(values, 0.01)),
+        "p05": float(np.quantile(values, 0.05)),
+        "p50": median,
+        "p95": float(np.quantile(values, 0.95)),
+        "p99": float(np.quantile(values, 0.99)),
+        "abs_p95": float(np.quantile(np.abs(values), 0.95)),
+        "abs_p99": float(np.quantile(np.abs(values), 0.99)),
+    }
+
+
 def _row_slice(row: Mapping[str, Any]) -> tuple[slice, slice]:
     return (
         slice(int(row["lateral_start"]), int(row["lateral_stop"])),

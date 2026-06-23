@@ -23,12 +23,13 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
+from cup.seismic.volume_export import export_volume_like_source
 from ginn_v2.real_field import (
     input_qc_frame,
-    load_model_manifest,
     load_real_field_section,
+    load_real_field_volume,
     run_zero_shot_model,
-    synthetic_train_values,
+    run_zero_shot_volume_model,
 )
 
 
@@ -60,6 +61,42 @@ def _git_commit() -> str:
     except Exception:
         return ""
     return result.stdout.strip()
+
+
+def _load_seismic_reference_payload(*, run_cfg: dict, models: list[dict]) -> dict[str, object]:
+    inputs = dict(run_cfg.get("real_field_inputs") or {})
+    explicit = str(inputs.get("seismic_reference_stats_file") or "").strip()
+    if explicit:
+        stats_path = resolve_relative_path(explicit, root=REPO_ROOT)
+    else:
+        first_model = dict(models[0])
+        model_run_dir = resolve_relative_path(str(first_model["model_run_dir"]), root=REPO_ROOT)
+        manifest_path = model_run_dir / "model_run_manifest.json"
+        stats_path = model_run_dir / "input_reference_stats.json"
+        if manifest_path.is_file():
+            with manifest_path.open("r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            manifest_stats = str(manifest.get("input_reference_stats") or "").strip()
+            if manifest_stats:
+                stats_path = resolve_relative_path(manifest_stats, root=REPO_ROOT)
+    if not stats_path.is_file():
+        raise FileNotFoundError(
+            "seismic_value_transform requires frozen input reference stats. "
+            f"Expected {stats_path}. Re-run the training command with the current "
+            "scripts/ginn_v2.py so input_reference_stats.json is produced next to "
+            "normalization.json and checkpoint.pt."
+        )
+    with stats_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    stats = payload.get("stats")
+    if not isinstance(stats, dict):
+        raise ValueError(f"Input reference stats file lacks 'stats' object: {stats_path}")
+    return {
+        "stats": stats,
+        "sampling": payload.get("sampling", {}),
+        "file": repo_relative_path(stats_path, root=REPO_ROOT),
+        "sha256": sha256_file(stats_path),
+    }
 
 
 def _coerce_float(value: object) -> float:
@@ -271,6 +308,34 @@ def _plot_zero_shot_qc(output_dir: Path) -> dict[str, str]:
         lfm = arrays["lfm_input"]
         pred = arrays["stitched_pred_log_ai"]
         delta = arrays["pred_delta_vs_lfm"]
+        if pred.ndim == 3:
+            il_mid = pred.shape[0] // 2
+            xl_mid = pred.shape[1] // 2
+            twt_mid = pred.shape[2] // 2
+            panel_sets = [
+                ("central_inline", [lfm[il_mid], delta[il_mid], pred[il_mid]], "xline"),
+                ("central_xline", [lfm[:, xl_mid, :], delta[:, xl_mid, :], pred[:, xl_mid, :]], "inline"),
+                ("central_time_slice", [lfm[:, :, twt_mid], delta[:, :, twt_mid], pred[:, :, twt_mid]], "xline"),
+            ]
+            for suffix, panels, xlabel in panel_sets:
+                fig, axes = plt.subplots(1, 3, figsize=(12, 4), sharey=True)
+                for ax, values, title in [
+                    (axes[0], panels[0], "LFM log(AI)"),
+                    (axes[1], panels[1], "Pred - LFM"),
+                    (axes[2], panels[2], "Pred log(AI)"),
+                ]:
+                    image = ax.imshow(np.asarray(values).T, aspect="auto", origin="upper", cmap="viridis")
+                    ax.set_title(title)
+                    ax.set_xlabel(xlabel)
+                    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+                axes[0].set_ylabel("TWT sample" if suffix != "central_time_slice" else "inline")
+                fig.suptitle(f"R0 volume QC {suffix}: {child.name}")
+                fig.tight_layout()
+                path = figures / f"{child.name}_{suffix}_lfm_delta_pred.png"
+                fig.savefig(path, dpi=160)
+                plt.close(fig)
+                outputs[f"{child.name}_{suffix}_triptych"] = repo_relative_path(path, root=REPO_ROOT)
+            continue
         fig, axes = plt.subplots(1, 3, figsize=(12, 4), sharey=True)
         for ax, values, title in [
             (axes[0], lfm, "LFM log(AI)"),
@@ -290,6 +355,30 @@ def _plot_zero_shot_qc(output_dir: Path) -> dict[str, str]:
         outputs[f"{child.name}_triptych"] = repo_relative_path(path, root=REPO_ROOT)
     if "lateral" in model_arrays and "no_lateral" in model_arrays:
         diff = model_arrays["lateral"]["stitched_pred_log_ai"] - model_arrays["no_lateral"]["stitched_pred_log_ai"]
+        if diff.ndim == 3:
+            il_mid = diff.shape[0] // 2
+            xl_mid = diff.shape[1] // 2
+            twt_mid = diff.shape[2] // 2
+            panels = [
+                ("central_inline", diff[il_mid], "xline", "TWT sample"),
+                ("central_xline", diff[:, xl_mid, :], "inline", "TWT sample"),
+                ("central_time_slice", diff[:, :, twt_mid], "xline", "inline"),
+            ]
+            for suffix, values, xlabel, ylabel in panels:
+                fig, ax = plt.subplots(figsize=(6, 4))
+                finite = values[np.isfinite(values)]
+                vmax = float(np.nanquantile(np.abs(finite), 0.99)) if finite.size else 1.0
+                image = ax.imshow(values.T, aspect="auto", origin="upper", cmap="coolwarm", vmin=-vmax, vmax=vmax)
+                ax.set_title(f"lateral - no_lateral {suffix}")
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel(ylabel)
+                fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+                fig.tight_layout()
+                path = figures / f"lateral_minus_no_lateral_{suffix}.png"
+                fig.savefig(path, dpi=160)
+                plt.close(fig)
+                outputs[f"lateral_minus_no_lateral_{suffix}"] = repo_relative_path(path, root=REPO_ROOT)
+            return outputs
         fig, ax = plt.subplots(figsize=(6, 4))
         vmax = float(np.nanquantile(np.abs(diff), 0.99)) if np.isfinite(diff).any() else 1.0
         image = ax.imshow(diff.T, aspect="auto", origin="upper", cmap="coolwarm", vmin=-vmax, vmax=vmax)
@@ -330,6 +419,9 @@ def _configured_bands(run_cfg: dict) -> list[dict[str, float | str]]:
 def _band_rms(values: np.ndarray, valid: np.ndarray, *, dt_s: float, low_hz: float, high_hz: float) -> float:
     data = np.asarray(values, dtype=np.float64)
     mask = np.asarray(valid, dtype=bool) & np.isfinite(data)
+    if data.ndim == 3:
+        data = data.reshape((-1, data.shape[-1]))
+        mask = mask.reshape((-1, mask.shape[-1]))
     if data.ndim != 2 or not np.any(mask):
         return float("nan")
     prepared = np.zeros_like(data, dtype=np.float64)
@@ -447,36 +539,37 @@ def _write_spectral_qc(output_dir: Path, *, run_cfg: dict, dt_s: float) -> dict[
                     ),
                 }
             )
-        band_fig_path = figures / "lateral_minus_no_lateral_band_split.png"
-        panel_specs = [{"name": "fullband", "values": diff}]
-        panel_specs.extend(
-            {
-                "name": str(band["name"]),
-                "values": _band_component_2d(
-                    diff,
-                    dt_s=dt_s,
-                    low_hz=float(band["low_hz"]),
-                    high_hz=float(band["high_hz"]),
-                ),
-            }
-            for band in bands
-        )
-        fig, axes = plt.subplots(1, len(panel_specs), figsize=(4 * len(panel_specs), 4), sharey=True)
-        if len(panel_specs) == 1:
-            axes = [axes]
-        for ax, panel in zip(axes, panel_specs):
-            values = np.asarray(panel["values"], dtype=np.float64)
-            finite = values[np.isfinite(values)]
-            vmax = float(np.nanquantile(np.abs(finite), 0.99)) if finite.size else 1.0
-            image = ax.imshow(values.T, aspect="auto", origin="upper", cmap="coolwarm", vmin=-vmax, vmax=vmax)
-            ax.set_title(str(panel["name"]))
-            ax.set_xlabel("lateral trace")
-            fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-        axes[0].set_ylabel("TWT sample")
-        fig.suptitle("lateral - no_lateral band split")
-        fig.tight_layout()
-        fig.savefig(band_fig_path, dpi=160)
-        plt.close(fig)
+        if diff.ndim == 2:
+            band_fig_path = figures / "lateral_minus_no_lateral_band_split.png"
+            panel_specs = [{"name": "fullband", "values": diff}]
+            panel_specs.extend(
+                {
+                    "name": str(band["name"]),
+                    "values": _band_component_2d(
+                        diff,
+                        dt_s=dt_s,
+                        low_hz=float(band["low_hz"]),
+                        high_hz=float(band["high_hz"]),
+                    ),
+                }
+                for band in bands
+            )
+            fig, axes = plt.subplots(1, len(panel_specs), figsize=(4 * len(panel_specs), 4), sharey=True)
+            if len(panel_specs) == 1:
+                axes = [axes]
+            for ax, panel in zip(axes, panel_specs):
+                values = np.asarray(panel["values"], dtype=np.float64)
+                finite = values[np.isfinite(values)]
+                vmax = float(np.nanquantile(np.abs(finite), 0.99)) if finite.size else 1.0
+                image = ax.imshow(values.T, aspect="auto", origin="upper", cmap="coolwarm", vmin=-vmax, vmax=vmax)
+                ax.set_title(str(panel["name"]))
+                ax.set_xlabel("lateral trace")
+                fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+            axes[0].set_ylabel("TWT sample")
+            fig.suptitle("lateral - no_lateral band split")
+            fig.tight_layout()
+            fig.savefig(band_fig_path, dpi=160)
+            plt.close(fig)
     diff_path = output_dir / "lateral_difference_band_qc.csv"
     pd.DataFrame.from_records(diff_rows).to_csv(diff_path, index=False)
 
@@ -502,6 +595,55 @@ def _write_spectral_qc(output_dir: Path, *, run_cfg: dict, dt_s: float) -> dict[
             repo_relative_path(figure_path, root=REPO_ROOT) if figure_path.is_file() else ""
         ),
     }
+
+
+def _export_zero_shot_volumes(output_dir: Path, *, run_cfg: dict, data_root: Path) -> dict[str, dict[str, object]]:
+    if str(run_cfg.get("mode") or "section").casefold() != "volume":
+        return {}
+    export_cfg = dict(run_cfg.get("volume_export") or {})
+    if not bool(export_cfg.get("enabled", True)):
+        return {}
+    inputs = dict(run_cfg.get("real_field_inputs") or {})
+    source_file = resolve_relative_path(str(inputs.get("seismic_file") or ""), root=data_root)
+    source_type = str(inputs.get("seismic_type", inputs.get("type", "zgy"))).casefold()
+    inline_chunk_size = int(export_cfg.get("inline_chunk_size", inputs.get("zgy_inline_chunk_size", 16)))
+    nan_fill = export_cfg.get("nan_fill")
+    outputs: dict[str, dict[str, object]] = {}
+    for child in sorted(output_dir.iterdir()):
+        npz_path = child / "predictions.npz"
+        summary_path = child / "real_field_zero_shot_model_summary.json"
+        if not child.is_dir() or not npz_path.is_file():
+            continue
+        with np.load(npz_path, allow_pickle=False) as arrays:
+            pred = np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float32)
+            if pred.ndim != 3:
+                continue
+            payload = export_volume_like_source(
+                output_base=child / f"{child.name}_pred_log_ai",
+                volume=pred,
+                ilines=np.asarray(arrays["ilines"], dtype=np.float64),
+                xlines=np.asarray(arrays["xlines"], dtype=np.float64),
+                samples=np.asarray(arrays["twt_s"], dtype=np.float64),
+                source_seismic_file=source_file,
+                source_seismic_type=source_type,
+                title=f"R0 zero-shot pred_log_ai: {child.name}",
+                details=[
+                    "schema=real_field_zero_shot_model_v1",
+                    "field=stitched_pred_log_ai",
+                    "domain=log(AI)",
+                ],
+                seismic_options=inputs,
+                inline_chunk_size=inline_chunk_size,
+                nan_fill=nan_fill,
+            )
+        payload["path"] = repo_relative_path(Path(str(payload["path"])), root=REPO_ROOT)
+        outputs[child.name] = payload
+        if summary_path.is_file():
+            with summary_path.open("r", encoding="utf-8") as handle:
+                summary = json.load(handle)
+            summary["volume_export"] = payload
+            write_json(summary_path, summary)
+    return outputs
 
 
 def _input_distribution_warnings(qc_path: Path) -> list[dict[str, object]]:
@@ -581,66 +723,96 @@ def main() -> None:
     inputs_for_load = dict(run_cfg_for_load.get("real_field_inputs") or {})
     transform_name = str(inputs_for_load.get("seismic_value_transform") or inputs_for_load.get("seismic_transform") or "identity")
     if transform_name not in {"identity", "raw", "none"} and "seismic_reference_stats" not in inputs_for_load:
-        diag_cfg = dict(cfg.get("real_field_input_domain_diagnostic") or {})
-        manifest = load_model_manifest(dict(models[0]), root=REPO_ROOT)
-        values, metadata = synthetic_train_values(
-            manifest,
-            root=REPO_ROOT,
-            input_name="seismic",
-            max_patches=int(diag_cfg.get("max_synthetic_train_patches", 4096)),
-            seed=int(diag_cfg.get("synthetic_train_sampling_seed", 20260620)),
-        )
-        from ginn_v2.real_field import finite_summary_stats
-
-        inputs_for_load["seismic_reference_stats"] = finite_summary_stats(values)
-        inputs_for_load["seismic_reference_sampling"] = metadata
+        reference_payload = _load_seismic_reference_payload(run_cfg=run_cfg_for_load, models=[dict(item) for item in models])
+        inputs_for_load["seismic_reference_stats"] = reference_payload["stats"]
+        inputs_for_load["seismic_reference_sampling"] = reference_payload["sampling"]
+        inputs_for_load["seismic_reference_stats_file"] = reference_payload["file"]
+        inputs_for_load["seismic_reference_stats_sha256"] = reference_payload["sha256"]
         run_cfg_for_load["real_field_inputs"] = inputs_for_load
-    section = load_real_field_section(config=run_cfg_for_load, root=REPO_ROOT, data_root=data_root)
+    output_mode = str(run_cfg.get("mode") or "section").casefold()
+    if output_mode == "section":
+        field = load_real_field_section(config=run_cfg_for_load, root=REPO_ROOT, data_root=data_root)
+    elif output_mode == "volume":
+        field = load_real_field_volume(config=run_cfg_for_load, root=REPO_ROOT, data_root=data_root)
+    else:
+        raise ValueError(f"Unsupported real_field_zero_shot.mode: {output_mode}")
 
     model_summaries = []
     input_qc_written = False
     for model_cfg in models:
-        summary = run_zero_shot_model(
-            section=section,
-            model_cfg=model_cfg,
-            output_dir=output_dir,
-            root=REPO_ROOT,
-            device_name=device,
-            stitch_strategy=stitch_strategy,
-        )
+        if output_mode == "volume":
+            summary = run_zero_shot_volume_model(
+                volume=field,
+                model_cfg=model_cfg,
+                output_dir=output_dir,
+                root=REPO_ROOT,
+                device_name=device,
+                stitch_strategy=stitch_strategy,
+            )
+        else:
+            summary = run_zero_shot_model(
+                section=field,
+                model_cfg=model_cfg,
+                output_dir=output_dir,
+                root=REPO_ROOT,
+                device_name=device,
+                stitch_strategy=stitch_strategy,
+            )
         model_summaries.append(summary)
         if not input_qc_written:
-            qc = input_qc_frame(section, summary.get("normalization", {}) or {})
+            qc = input_qc_frame(field, summary.get("normalization", {}) or {})
             qc.to_csv(output_dir / "model_input_qc.csv", index=False)
             input_qc_written = True
     figure_outputs = _plot_zero_shot_qc(output_dir)
-    well_outputs = _write_well_prediction_qc(output_dir, run_cfg=run_cfg)
-    dt_s = float(section.twt_s[1] - section.twt_s[0]) if section.twt_s.size > 1 else 0.002
+    well_outputs = (
+        {"csv": "", "figures": {}, "status": "disabled_for_volume_mode"}
+        if output_mode == "volume"
+        else _write_well_prediction_qc(output_dir, run_cfg=run_cfg)
+    )
+    volume_exports = _export_zero_shot_volumes(output_dir, run_cfg=run_cfg, data_root=data_root)
+    dt_s = float(field.twt_s[1] - field.twt_s[0]) if field.twt_s.size > 1 else 0.002
     spectral_outputs = _write_spectral_qc(output_dir, run_cfg=run_cfg, dt_s=dt_s)
 
     source_runs = dict(run_cfg.get("source_runs") or {})
     boundary = dict(run_cfg.get("boundary") or {})
-    dt_s = float(section.twt_s[1] - section.twt_s[0]) if section.twt_s.size > 1 else 0.002
+    dt_s = float(field.twt_s[1] - field.twt_s[0]) if field.twt_s.size > 1 else 0.002
     input_qc_path = output_dir / "model_input_qc.csv"
-    source_hashes = _source_file_hashes(section.metadata, source_runs)
+    source_hashes = _source_file_hashes(field.metadata, source_runs)
+    if output_mode == "volume":
+        axis_contract = {
+            "n_inline": int(field.lfm.shape[0]),
+            "n_xline": int(field.lfm.shape[1]),
+            "n_twt": int(field.lfm.shape[2]),
+            "inline_start": float(field.ilines[0]),
+            "inline_stop": float(field.ilines[-1]),
+            "xline_start": float(field.xlines[0]),
+            "xline_stop": float(field.xlines[-1]),
+            "twt_start_s": float(field.twt_s[0]),
+            "twt_stop_s": float(field.twt_s[-1]),
+            "dt_s": float(field.twt_s[1] - field.twt_s[0]) if field.twt_s.size > 1 else None,
+        }
+    else:
+        axis_contract = {
+            "n_lateral": int(field.lfm.shape[0]),
+            "n_twt": int(field.lfm.shape[1]),
+            "twt_start_s": float(field.twt_s[0]),
+            "twt_stop_s": float(field.twt_s[-1]),
+            "dt_s": float(field.twt_s[1] - field.twt_s[0]) if field.twt_s.size > 1 else None,
+        }
     summary = {
         "schema_version": "real_field_zero_shot_summary_v1",
         "status": "needs_forward_diagnostic",
+        "mode": output_mode,
         "config_file": repo_relative_path(cfg_path, root=REPO_ROOT),
         "device_requested": device,
         "stitch_strategy": stitch_strategy,
         "source_runs": source_runs,
-        "section": section.metadata,
-        "axis_contract": {
-            "n_lateral": int(section.lfm.shape[0]),
-            "n_twt": int(section.lfm.shape[1]),
-            "twt_start_s": float(section.twt_s[0]),
-            "twt_stop_s": float(section.twt_s[-1]),
-            "dt_s": float(section.twt_s[1] - section.twt_s[0]) if section.twt_s.size > 1 else None,
-        },
+        "section": field.metadata if output_mode == "section" else {},
+        "volume": field.metadata if output_mode == "volume" else {},
+        "axis_contract": axis_contract,
         "mask_contract": {
-            "valid_fraction": float(section.valid_mask.mean()),
-            "valid_samples": int(section.valid_mask.sum()),
+            "valid_fraction": float(field.valid_mask.mean()),
+            "valid_samples": int(field.valid_mask.sum()),
         },
         "boundary_contract": {
             "loss_or_eval_erosion_s": float(boundary.get("loss_or_eval_erosion_s", 0.0) or 0.0),
@@ -659,6 +831,7 @@ def main() -> None:
             "model_input_qc": repo_relative_path(input_qc_path, root=REPO_ROOT),
             "figures": figure_outputs,
             "well_prediction_qc": well_outputs,
+            "volume_exports": volume_exports,
             **spectral_outputs,
         },
         "models": model_summaries,

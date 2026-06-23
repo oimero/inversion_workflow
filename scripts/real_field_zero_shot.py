@@ -621,8 +621,6 @@ def main() -> None:
     source_runs = dict(run_cfg.get("source_runs") or {})
     boundary = dict(run_cfg.get("boundary") or {})
     dt_s = float(section.twt_s[1] - section.twt_s[0]) if section.twt_s.size > 1 else 0.002
-    forward_erosion_raw = boundary.get("forward_diagnostic_erosion_s")
-    forward_erosion_s = None if forward_erosion_raw is None else float(forward_erosion_raw or 0.0)
     input_qc_path = output_dir / "model_input_qc.csv"
     source_hashes = _source_file_hashes(section.metadata, source_runs)
     summary = {
@@ -647,15 +645,9 @@ def main() -> None:
         "boundary_contract": {
             "loss_or_eval_erosion_s": float(boundary.get("loss_or_eval_erosion_s", 0.0) or 0.0),
             "prediction_taper_halo_s": float(boundary.get("prediction_taper_halo_s", 0.0) or 0.0),
-            "forward_diagnostic_erosion_s": forward_erosion_s,
-            "forward_diagnostic_erosion_source": (
-                "configured" if forward_erosion_s is not None else "deferred_to_r1_wavelet_active_half_support"
-            ),
+            "forward_diagnostic_erosion": "disabled",
             "loss_or_eval_erosion_samples": int(np.ceil(float(boundary.get("loss_or_eval_erosion_s", 0.0) or 0.0) / dt_s)),
             "prediction_taper_halo_samples": int(np.ceil(float(boundary.get("prediction_taper_halo_s", 0.0) or 0.0) / dt_s)),
-            "forward_diagnostic_erosion_samples": (
-                None if forward_erosion_s is None else int(np.ceil(forward_erosion_s / dt_s))
-            ),
             "dt_s": dt_s,
         },
         "source_file_sha256": source_hashes,

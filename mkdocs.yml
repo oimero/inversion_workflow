@@ -49,15 +49,15 @@ nav:
       - 脚本风格指南: concepts/script-style.md
       - 时间域反演重置: concepts/time-domain-inversion-reset.md
   - 教程:
+      - 常见问题: guide/0-troubleshooting.md
       - 01 井资产盘点: guide/1-well-inventory.md
       - 02 LAS 曲线筛选与导出: guide/2-well-screen.md
       - 03 测井预处理: guide/3-well-preprocess.md
       - 旁路 井轨迹 QC: guide/well-trajectory.md
       - 04 井震自动标定: guide/4-well-auto-tie.md
       - 05 全局子波生成: guide/5-wavelet-generation.md
-      - 旁路 正演可观测性分析: guide/6-forward-observability-gate.md
-      - 旁路 合成基准生成与评估: guide/7-synthoseis-lite-benchmark.md
-      - 常见问题: guide/troubleshooting.md
+      - 旁路 正演可观测性分析: guide/forward-observability-gate.md
+      - 旁路 合成基准生成与评估: guide/synthoseis-lite-benchmark.md
   - API:
       - API 总览: api/index.md
       - cup:

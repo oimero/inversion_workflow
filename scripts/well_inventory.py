@@ -32,7 +32,7 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.petrel.load import import_well_heads_petrel, import_well_tops_petrel
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.time_config import TimeWorkflowConfig
+from cup.config.workflow import TimeWorkflowConfig
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.well.assets import (
     WellHead,

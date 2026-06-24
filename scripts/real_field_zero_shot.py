@@ -33,13 +33,82 @@ from ginn_v2.real_field import (
 )
 
 
+DEFAULT_COMMON_CONFIG = Path("experiments/common.yaml")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("experiments/common.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("experiments/research/real_field_r0_r1.yaml"))
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--device", default=None, help="Torch device. Use 'cuda' to fail if GPU is unavailable.")
     parser.add_argument("--stitch-strategy", choices=("uniform", "center_crop"), default=None)
     return parser.parse_args()
+
+
+def _load_config_with_common(path: Path) -> tuple[Path, dict]:
+    cfg_path = resolve_relative_path(path, root=REPO_ROOT)
+    common_path = resolve_relative_path(DEFAULT_COMMON_CONFIG, root=REPO_ROOT)
+    common = load_yaml_config(common_path) if common_path.is_file() else {}
+    specific = load_yaml_config(cfg_path)
+    merged = dict(common)
+    merged.update(specific)
+    return cfg_path, merged
+
+
+def _load_model_set(run_cfg: dict) -> list[dict]:
+    if run_cfg.get("models") is not None:
+        raise ValueError("real_field_zero_shot.models is retired; use model_set_file with model_run_dir entries.")
+    model_set_file = str(run_cfg.get("model_set_file") or "").strip()
+    if not model_set_file:
+        raise ValueError("real_field_zero_shot.model_set_file must be configured.")
+    payload = load_yaml_config(resolve_relative_path(model_set_file, root=REPO_ROOT))
+    models = payload.get("models")
+    if not isinstance(models, list) or not models:
+        raise ValueError(f"{model_set_file} must contain a non-empty models list.")
+    clean = []
+    for idx, item in enumerate(models):
+        if not isinstance(item, dict):
+            raise ValueError(f"{model_set_file}.models[{idx}] must be a mapping.")
+        extra = sorted(set(item) - {"model_run_dir"})
+        if extra:
+            raise ValueError(f"{model_set_file}.models[{idx}] only accepts model_run_dir; got {extra}.")
+        text = str(item.get("model_run_dir") or "").strip()
+        if not text:
+            raise ValueError(f"{model_set_file}.models[{idx}].model_run_dir must be non-empty.")
+        clean.append({"model_run_dir": text})
+    return clean
+
+
+def _load_sections_file(run_cfg: dict) -> list[dict]:
+    if run_cfg.get("section") is not None:
+        raise ValueError("real_field_zero_shot.section is retired; use sections_file.")
+    sections_file = str(run_cfg.get("sections_file") or "").strip()
+    if not sections_file:
+        return []
+    payload = load_yaml_config(resolve_relative_path(sections_file, root=REPO_ROOT))
+    sections = payload.get("sections")
+    if not isinstance(sections, list) or not sections:
+        raise ValueError(f"{sections_file} must contain a non-empty sections list.")
+    return [dict(item) for item in sections]
+
+
+def _prepare_run_config(run_cfg: dict, cfg: dict) -> dict:
+    prepared = dict(run_cfg)
+    inputs = dict(prepared.get("real_field_inputs") or {})
+    seismic = dict(cfg.get("seismic") or {})
+    if any(key in inputs for key in ("seismic_file", "seismic_type", "type")):
+        raise ValueError("real_field_zero_shot.real_field_inputs seismic fields are retired; use top-level seismic.")
+    inputs["seismic_file"] = str(seismic.get("file") or "")
+    inputs["seismic_type"] = str(seismic.get("type") or "")
+    if seismic.get("segy_options"):
+        inputs["segy_options"] = dict(seismic["segy_options"])
+    prepared["real_field_inputs"] = inputs
+    if str(prepared.get("mode") or "section").casefold() == "section":
+        sections = _load_sections_file(prepared)
+        if len(sections) != 1:
+            raise ValueError("R0 section mode requires sections_file with exactly one section.")
+        prepared["section"] = sections[0]
+    return prepared
 
 
 def _timestamped_output(prefix: str, explicit: Path | None, *, output_root: Path) -> Path:
@@ -207,7 +276,11 @@ def _write_well_prediction_qc(output_dir: Path, *, run_cfg: dict) -> dict[str, o
     ilines = np.asarray(first["ilines"], dtype=np.float64)
     xlines = np.asarray(first["xlines"], dtype=np.float64)
     twt_s = np.asarray(first["twt_s"], dtype=np.float64)
-    max_distance = float(cfg.get("max_line_distance", 25.0))
+    if "max_line_distance" in cfg:
+        raise ValueError("real_field_zero_shot.well_qc.max_line_distance is retired; use max_xy_distance_m.")
+    if cfg.get("max_xy_distance_m") is None:
+        raise ValueError("real_field_zero_shot.well_qc.max_xy_distance_m must be explicit.")
+    max_distance = float(cfg.get("max_xy_distance_m"))
     rows: list[dict[str, object]] = []
     figure_outputs: dict[str, str] = {}
     figure_dir = output_dir / "figures" / "wells"
@@ -239,7 +312,7 @@ def _write_well_prediction_qc(output_dir: Path, *, run_cfg: dict) -> dict[str, o
             }
         )
         if distance > max_distance:
-            rows.append({**base, "model_role": "", "status": "skipped_outside_section_support", "max_line_distance": max_distance})
+            rows.append({**base, "model_role": "", "status": "skipped_outside_section_support", "max_xy_distance_m": max_distance})
             continue
         try:
             well_log_ai = _log_ai_at_twt(
@@ -394,9 +467,23 @@ def _plot_zero_shot_qc(output_dir: Path) -> dict[str, str]:
     return outputs
 
 
-def _configured_bands(run_cfg: dict) -> list[dict[str, float | str]]:
+def _configured_bands(run_cfg: dict, *, dt_s: float) -> list[dict[str, float | str | bool]]:
     spectral = dict(run_cfg.get("spectral_qc") or {})
     bands = spectral.get("bands")
+    if bands is None:
+        nyquist = 0.5 / float(dt_s)
+        configured_max = float(run_cfg.get("diagnostic_max_hz", 80.0))
+        high = min(configured_max, 0.45 * nyquist)
+        if not high > 0.0:
+            raise ValueError("Cannot build default spectral bands with non-positive diagnostic max frequency.")
+        return [
+            {"name": "lowfreq", "low_hz": 0.0, "high_hz": 0.2 * high, "manual_spectral_band_override": False},
+            {"name": "observable_band", "low_hz": 0.2 * high, "high_hz": 0.4 * high, "manual_spectral_band_override": False},
+            {"name": "highfreq_or_nullspace", "low_hz": 0.4 * high, "high_hz": high, "manual_spectral_band_override": False},
+        ]
+    reason = str(spectral.get("manual_override_reason") or "").strip()
+    if not reason:
+        raise ValueError("Manual spectral_qc.bands requires spectral_qc.manual_override_reason.")
     if not isinstance(bands, list) or not bands:
         raise ValueError("real_field_zero_shot.spectral_qc.bands must be a non-empty list.")
     out = []
@@ -411,8 +498,64 @@ def _configured_bands(run_cfg: dict) -> list[dict[str, float | str]]:
                 "name": name,
                 "low_hz": float(item.get("low_hz", 0.0)),
                 "high_hz": float(item["high_hz"]) if item.get("high_hz") is not None else float("inf"),
+                "manual_spectral_band_override": True,
+                "manual_override_reason": reason,
             }
         )
+    return out
+
+
+def _observability_evidence(run_cfg: dict, bands: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    source_runs = dict(run_cfg.get("source_runs") or {})
+    obs_dir_text = str(run_cfg.get("observability_dir") or source_runs.get("forward_observability_dir") or "").strip()
+    missing = {
+        str(band["name"]): {
+            "observability_evidence_status": "missing",
+            "dominant_evidence_status": "",
+            "operator_support_summary": "",
+            "detectability_ratio_p25_range": "",
+            "observability_source_run": "",
+        }
+        for band in bands
+    }
+    if not obs_dir_text:
+        return missing
+    obs_dir = resolve_relative_path(obs_dir_text, root=REPO_ROOT)
+    path = obs_dir / "frequency_evidence_bands.csv"
+    if not path.is_file():
+        return missing
+    frame = pd.read_csv(path)
+    if "frequency_hz" not in frame:
+        return missing
+    out = {}
+    for band in bands:
+        name = str(band["name"])
+        low = float(band["low_hz"])
+        high = float(band["high_hz"])
+        scoped = frame[
+            pd.to_numeric(frame["frequency_hz"], errors="coerce").ge(low)
+            & pd.to_numeric(frame["frequency_hz"], errors="coerce").lt(high)
+        ].copy()
+        if scoped.empty:
+            out[name] = {
+                **missing[name],
+                "observability_evidence_status": "empty_band_overlap",
+                "observability_source_run": repo_relative_path(obs_dir, root=REPO_ROOT),
+            }
+            continue
+        status_col = "dominant_evidence_status" if "dominant_evidence_status" in scoped else "empirical_status"
+        support_col = "operator_support_summary" if "operator_support_summary" in scoped else "operator_support_class"
+        ratio_col = "detectability_ratio_p25" if "detectability_ratio_p25" in scoped else "cluster_p25_detectability_ratio"
+        ratios = pd.to_numeric(scoped.get(ratio_col, pd.Series(dtype=float)), errors="coerce").dropna()
+        out[name] = {
+            "observability_evidence_status": "present",
+            "dominant_evidence_status": str(scoped[status_col].mode().iloc[0]) if status_col in scoped and not scoped[status_col].dropna().empty else "",
+            "operator_support_summary": str(scoped[support_col].mode().iloc[0]) if support_col in scoped and not scoped[support_col].dropna().empty else "",
+            "detectability_ratio_p25_range": (
+                f"{float(ratios.min()):.6g}..{float(ratios.max()):.6g}" if not ratios.empty else ""
+            ),
+            "observability_source_run": repo_relative_path(obs_dir, root=REPO_ROOT),
+        }
     return out
 
 
@@ -454,7 +597,8 @@ def _band_component_2d(values: np.ndarray, *, dt_s: float, low_hz: float, high_h
 
 
 def _write_spectral_qc(output_dir: Path, *, run_cfg: dict, dt_s: float) -> dict[str, str]:
-    bands = _configured_bands(run_cfg)
+    bands = _configured_bands(run_cfg, dt_s=dt_s)
+    evidence = _observability_evidence(run_cfg, bands)
     rows = []
     arrays_by_role = {}
     for child in sorted(output_dir.iterdir()):
@@ -487,6 +631,9 @@ def _write_spectral_qc(output_dir: Path, *, run_cfg: dict, dt_s: float) -> dict[
                     "band": band["name"],
                     "low_hz": band["low_hz"],
                     "high_hz": band["high_hz"],
+                    "manual_spectral_band_override": bool(band.get("manual_spectral_band_override", False)),
+                    "manual_override_reason": str(band.get("manual_override_reason", "")),
+                    **evidence.get(str(band["name"]), {}),
                     "band_rms": band_rms,
                     "fullband_rms": full,
                     "energy_ratio": band_rms / full if np.isfinite(full) and full > 0 else float("nan"),
@@ -531,6 +678,9 @@ def _write_spectral_qc(output_dir: Path, *, run_cfg: dict, dt_s: float) -> dict[
                     "band": band["name"],
                     "low_hz": band["low_hz"],
                     "high_hz": band["high_hz"],
+                    "manual_spectral_band_override": bool(band.get("manual_spectral_band_override", False)),
+                    "manual_override_reason": str(band.get("manual_override_reason", "")),
+                    **evidence.get(str(band["name"]), {}),
                     "band_rms": band_rms,
                     "fullband_rms": full,
                     "energy_ratio": band_rms / full if np.isfinite(full) and full > 0 else float("nan"),
@@ -697,8 +847,7 @@ def _source_file_hashes(section_metadata: dict, source_runs: dict) -> dict[str, 
 
 def main() -> None:
     args = parse_args()
-    cfg_path = resolve_relative_path(args.config, root=REPO_ROOT)
-    cfg = load_yaml_config(cfg_path)
+    cfg_path, cfg = _load_config_with_common(args.config)
     run_cfg = dict(cfg.get("real_field_zero_shot") or {})
     if not run_cfg:
         raise ValueError("experiments/common.yaml lacks real_field_zero_shot section.")
@@ -708,18 +857,9 @@ def main() -> None:
 
     device = str(args.device or run_cfg.get("device") or "auto")
     stitch_strategy = str(args.stitch_strategy or run_cfg.get("stitch_strategy") or "uniform")
-    models = run_cfg.get("models")
-    if not isinstance(models, list) or not models:
-        raise ValueError("real_field_zero_shot.models must be a non-empty list.")
-    expected = {
-        "no_lateral": "trace1d_tcn_mismatch",
-        "lateral": "trace1d_tcn_lateral_mixer_mismatch",
-    }
-    seen = {str(item.get("model_role")): str(item.get("model_id")) for item in models if isinstance(item, dict)}
-    if seen != expected:
-        raise ValueError(f"R0 first batch must contain exactly {expected}, got {seen}.")
+    models = _load_model_set(run_cfg)
     data_root = resolve_relative_path(cfg.get("data_root", "data"), root=REPO_ROOT)
-    run_cfg_for_load = dict(run_cfg)
+    run_cfg_for_load = _prepare_run_config(run_cfg, cfg)
     inputs_for_load = dict(run_cfg_for_load.get("real_field_inputs") or {})
     transform_name = str(inputs_for_load.get("seismic_value_transform") or inputs_for_load.get("seismic_transform") or "identity")
     if transform_name not in {"identity", "raw", "none"} and "seismic_reference_stats" not in inputs_for_load:
@@ -769,7 +909,7 @@ def main() -> None:
         if output_mode == "volume"
         else _write_well_prediction_qc(output_dir, run_cfg=run_cfg)
     )
-    volume_exports = _export_zero_shot_volumes(output_dir, run_cfg=run_cfg, data_root=data_root)
+    volume_exports = _export_zero_shot_volumes(output_dir, run_cfg=run_cfg_for_load, data_root=data_root)
     dt_s = float(field.twt_s[1] - field.twt_s[0]) if field.twt_s.size > 1 else 0.002
     spectral_outputs = _write_spectral_qc(output_dir, run_cfg=run_cfg, dt_s=dt_s)
 

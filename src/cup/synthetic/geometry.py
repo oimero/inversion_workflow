@@ -12,7 +12,7 @@ import pandas as pd
 from cup.petrel.load import import_interpretation_petrel
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
-from cup.time_config import TimeWorkflowConfig
+from cup.config.workflow import TimeWorkflowConfig
 from cup.utils.io import resolve_relative_path
 
 

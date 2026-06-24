@@ -38,6 +38,7 @@ from cup.seismic.horizon import (
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.volume_export import export_volume_like_source
 from cup.utils.io import (
+    load_yaml_config,
     repo_relative_path,
     resolve_artifact_path,
     resolve_relative_path,
@@ -81,20 +82,35 @@ class OutputGeometry:
 def parse_real_field_lfm_config(raw: Mapping[str, Any]) -> RealFieldLfmConfig:
     root = _mapping(raw.get("real_field_lfm"), "real_field_lfm")
     source_runs = _mapping(root.get("source_runs"), "real_field_lfm.source_runs")
-    horizons_raw = root.get("target_interval", {}).get("horizons") if isinstance(root.get("target_interval"), Mapping) else None
+    if "seismic" in root:
+        raise ValueError("real_field_lfm.seismic is retired; use top-level seismic.")
+    if "target_interval" in root:
+        raise ValueError("real_field_lfm.target_interval is retired; use top-level target_interval.")
+    horizons_parent = _mapping(raw.get("target_interval"), "target_interval")
+    horizons_raw = horizons_parent.get("horizons")
     if not isinstance(horizons_raw, (list, tuple)) or len(horizons_raw) < 2:
-        raise ValueError("real_field_lfm.target_interval.horizons must contain at least two horizons.")
+        raise ValueError("target_interval.horizons must contain at least two horizons.")
     horizons: list[dict[str, str]] = []
     seen: set[str] = set()
     for idx, item in enumerate(horizons_raw):
-        entry = _mapping(item, f"real_field_lfm.target_interval.horizons[{idx}]")
-        name = _required_text(entry, "name", path=f"real_field_lfm.target_interval.horizons[{idx}]")
-        file = _required_text(entry, "file", path=f"real_field_lfm.target_interval.horizons[{idx}]")
+        entry = _mapping(item, f"target_interval.horizons[{idx}]")
+        name = _required_text(entry, "name", path=f"target_interval.horizons[{idx}]")
+        file = _required_text(entry, "file", path=f"target_interval.horizons[{idx}]")
         key = name.casefold()
         if key in seen:
-            raise ValueError(f"Duplicate horizon name in real_field_lfm.target_interval.horizons: {name}")
+            raise ValueError(f"Duplicate horizon name in target_interval.horizons: {name}")
         seen.add(key)
         horizons.append({"name": name, "file": file})
+    output_geometry = dict(root.get("output_geometry") or {"mode": "volume"})
+    if isinstance(output_geometry.get("section"), Mapping):
+        raise ValueError("real_field_lfm.output_geometry.section is retired; use sections_file.")
+    if str(output_geometry.get("mode") or "volume").casefold() == "section":
+        sections_file = _required_text(root, "sections_file", path="real_field_lfm")
+        sections_payload = load_yaml_config(resolve_relative_path(sections_file, root=Path.cwd()))
+        sections = sections_payload.get("sections")
+        if not isinstance(sections, list) or len(sections) != 1:
+            raise ValueError("real_field_lfm section mode requires sections_file with exactly one section.")
+        output_geometry["section"] = dict(sections[0])
     return RealFieldLfmConfig(
         source_runs={
             "well_auto_tie_dir": _required_text(
@@ -104,11 +120,11 @@ def parse_real_field_lfm_config(raw: Mapping[str, Any]) -> RealFieldLfmConfig:
             )
         },
         well_inventory_file=_required_text(root, "well_inventory_file", path="real_field_lfm"),
-        seismic=_mapping(root.get("seismic"), "real_field_lfm.seismic"),
+        seismic=_mapping(raw.get("seismic"), "seismic"),
         horizons=tuple(horizons),
         trend_fit=dict(root.get("trend_fit") or {}),
         parameter_modeling=dict(root.get("parameter_modeling") or {}),
-        output_geometry=dict(root.get("output_geometry") or {"mode": "volume"}),
+        output_geometry=output_geometry,
         lfm_qc=dict(root.get("lfm_qc") or {}),
     )
 

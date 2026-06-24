@@ -104,6 +104,45 @@ def load_model_manifest(model_cfg: Mapping[str, Any], *, root: Path) -> dict[str
         return json.load(handle)
 
 
+def _model_manifest_and_dir(model_cfg: Mapping[str, Any], *, root: Path) -> tuple[Path, dict[str, Any]]:
+    extra = sorted(set(model_cfg) - {"model_run_dir"})
+    if extra:
+        raise ValueError(f"R0 model entries only accept model_run_dir; got {extra}.")
+    model_run_dir = resolve_relative_path(_required_text(model_cfg, "model_run_dir"), root=root)
+    manifest_path = model_run_dir / "model_run_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v1":
+        raise ValueError(f"Unsupported model run manifest schema: {manifest_path}")
+    gate = manifest.get("synthetic_gate_evidence")
+    if not isinstance(gate, Mapping):
+        raise ValueError(f"Model run manifest lacks synthetic_gate_evidence: {manifest_path}")
+    required_gate = ("report_dir", "report_card", "report_card_sha256", "is_current_frozen_candidate")
+    missing_gate = [key for key in required_gate if key not in gate]
+    if missing_gate:
+        raise ValueError(f"synthetic_gate_evidence missing {missing_gate}: {manifest_path}")
+    digest = str(gate.get("report_card_sha256") or "")
+    if len(digest) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in digest):
+        raise ValueError(f"synthetic_gate_evidence.report_card_sha256 must be a full SHA-256 digest: {manifest_path}")
+    return model_run_dir, manifest
+
+
+def _manifest_model_role(manifest: Mapping[str, Any]) -> str:
+    explicit = str(manifest.get("model_role") or "").strip()
+    if explicit:
+        return explicit
+    model_id = str(manifest.get("model_id") or "").strip()
+    if "lateral_mixer" in model_id:
+        return "lateral"
+    if "trace_1d" in model_id or "trace1d" in model_id:
+        return "no_lateral"
+    if not model_id:
+        raise ValueError("Model manifest must contain model_id or model_role.")
+    return model_id.replace("-", "_")
+
+
 def synthetic_train_values(
     manifest: Mapping[str, Any],
     *,
@@ -469,29 +508,22 @@ def run_zero_shot_model(
     device_name: str,
     stitch_strategy: str,
 ) -> dict[str, Any]:
-    model_role = _required_text(model_cfg, "model_role")
-    model_id_label = _required_text(model_cfg, "model_id")
-    synthetic_gate_summary = _required_text(model_cfg, "synthetic_gate_summary")
-    synthetic_gate_report_sha256 = _required_text(model_cfg, "synthetic_gate_report_sha256")
-    if len(synthetic_gate_report_sha256) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in synthetic_gate_report_sha256):
-        raise ValueError(f"{model_role}.synthetic_gate_report_sha256 must be a full SHA-256 digest.")
-    model_run_dir = resolve_relative_path(_required_text(model_cfg, "model_run_dir"), root=root)
-    manifest_path = model_run_dir / "model_run_manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        manifest = json.load(handle)
+    model_run_dir, manifest = _model_manifest_and_dir(model_cfg, root=root)
+    model_role = _manifest_model_role(manifest)
+    model_id_label = _required_text(manifest, "model_id")
+    synthetic_gate_evidence = dict(manifest["synthetic_gate_evidence"])
     checkpoint_path = _resolve_model_artifact(
-        model_cfg.get("checkpoint_file") or manifest.get("checkpoint"),
+        manifest.get("checkpoint"),
         root=root,
         model_run_dir=model_run_dir,
         fallback_name="checkpoint.pt",
     )
     model, checkpoint = load_checkpoint(checkpoint_path)
     normalization_path = None
-    if model_cfg.get("normalization_file"):
+    normalization_ref = manifest.get("normalization_path") or manifest.get("normalization_file")
+    if normalization_ref:
         normalization_path = _resolve_model_artifact(
-            model_cfg.get("normalization_file"),
+            normalization_ref,
             root=root,
             model_run_dir=model_run_dir,
             fallback_name="normalization.json",
@@ -599,8 +631,7 @@ def run_zero_shot_model(
         "normalization_sha256": hashlib.sha256(
             json.dumps(normalization, sort_keys=True).encode("utf-8")
         ).hexdigest(),
-        "synthetic_gate_summary": synthetic_gate_summary,
-        "synthetic_gate_report_sha256": synthetic_gate_report_sha256,
+        "synthetic_gate_evidence": synthetic_gate_evidence,
         "device": device_metadata,
         "normalization": normalization,
         "patch_spec": patch_spec,
@@ -626,29 +657,22 @@ def run_zero_shot_volume_model(
     device_name: str,
     stitch_strategy: str,
 ) -> dict[str, Any]:
-    model_role = _required_text(model_cfg, "model_role")
-    model_id_label = _required_text(model_cfg, "model_id")
-    synthetic_gate_summary = _required_text(model_cfg, "synthetic_gate_summary")
-    synthetic_gate_report_sha256 = _required_text(model_cfg, "synthetic_gate_report_sha256")
-    if len(synthetic_gate_report_sha256) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in synthetic_gate_report_sha256):
-        raise ValueError(f"{model_role}.synthetic_gate_report_sha256 must be a full SHA-256 digest.")
-    model_run_dir = resolve_relative_path(_required_text(model_cfg, "model_run_dir"), root=root)
-    manifest_path = model_run_dir / "model_run_manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        manifest = json.load(handle)
+    model_run_dir, manifest = _model_manifest_and_dir(model_cfg, root=root)
+    model_role = _manifest_model_role(manifest)
+    model_id_label = _required_text(manifest, "model_id")
+    synthetic_gate_evidence = dict(manifest["synthetic_gate_evidence"])
     checkpoint_path = _resolve_model_artifact(
-        model_cfg.get("checkpoint_file") or manifest.get("checkpoint"),
+        manifest.get("checkpoint"),
         root=root,
         model_run_dir=model_run_dir,
         fallback_name="checkpoint.pt",
     )
     model, checkpoint = load_checkpoint(checkpoint_path)
     normalization_path = None
-    if model_cfg.get("normalization_file"):
+    normalization_ref = manifest.get("normalization_path") or manifest.get("normalization_file")
+    if normalization_ref:
         normalization_path = _resolve_model_artifact(
-            model_cfg.get("normalization_file"),
+            normalization_ref,
             root=root,
             model_run_dir=model_run_dir,
             fallback_name="normalization.json",
@@ -766,8 +790,7 @@ def run_zero_shot_volume_model(
         "normalization_sha256": hashlib.sha256(
             json.dumps(normalization, sort_keys=True).encode("utf-8")
         ).hexdigest(),
-        "synthetic_gate_summary": synthetic_gate_summary,
-        "synthetic_gate_report_sha256": synthetic_gate_report_sha256,
+        "synthetic_gate_evidence": synthetic_gate_evidence,
         "device": device_metadata,
         "normalization": normalization,
         "patch_spec": patch_spec,

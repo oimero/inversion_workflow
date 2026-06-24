@@ -72,6 +72,14 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--lambda-physics", type=float, default=0.0)
     train.add_argument("--device", default="auto")
     train.add_argument("--seed", type=int, default=20260617)
+    train.add_argument("--model-role", default=None)
+    train.add_argument("--synthetic-gate-report-dir", type=Path, required=True)
+    train.add_argument("--synthetic-gate-report-card", type=Path, required=True)
+    train.add_argument(
+        "--synthetic-gate-frozen-candidate",
+        action="store_true",
+        help="Mark this run as belonging to the current frozen synthetic-gate candidate set.",
+    )
 
     predict = sub.add_parser("predict")
     predict.add_argument("--model-run-dir", type=Path, required=True)
@@ -119,16 +127,26 @@ def _write_train_manifest(
     args: argparse.Namespace,
     benchmark_dir: Path,
     patch_index_path: Path,
+    normalization_path: Path,
     normalization: dict,
     input_reference_stats_path: Path,
     train_result: dict,
     patch_index_truncated: bool,
     max_patches: int | None,
 ) -> None:
+    gate_report_dir = resolve_relative_path(args.synthetic_gate_report_dir, root=REPO_ROOT)
+    gate_report_card = resolve_relative_path(args.synthetic_gate_report_card, root=REPO_ROOT)
+    if not gate_report_dir.is_dir():
+        raise FileNotFoundError(f"synthetic gate report directory not found: {gate_report_dir}")
+    if not gate_report_card.is_file():
+        raise FileNotFoundError(f"synthetic gate report card not found: {gate_report_card}")
+    checkpoint_path = Path(train_result["checkpoint"])
+    history_path = Path(train_result["history"])
     manifest = {
         "schema_version": "ginn_v2_model_run_v1",
         "status": "ok",
         "model_id": args.model_id,
+        "model_role": str(args.model_role or _infer_model_role(args.model_id)),
         "benchmark_dir": repo_relative_path(benchmark_dir, root=REPO_ROOT),
         "benchmark_hashes": {
             "synthetic_benchmark.h5": sha256_file(benchmark_dir / "synthetic_benchmark.h5"),
@@ -154,6 +172,8 @@ def _write_train_manifest(
         "validation_fraction": float(args.validation_fraction),
         "test_fraction": float(args.test_fraction),
         "normalization": normalization,
+        "normalization_path": repo_relative_path(normalization_path, root=REPO_ROOT),
+        "normalization_sha256": sha256_file(normalization_path),
         "input_reference_stats": repo_relative_path(input_reference_stats_path, root=REPO_ROOT),
         "input_reference_stats_sha256": sha256_file(input_reference_stats_path),
         "input_channels": ["seismic", "lfm_controlled_degraded", "valid_mask_model"],
@@ -186,11 +206,28 @@ def _write_train_manifest(
         },
         "device": train_result.get("device_metadata", {"resolved_device": train_result.get("device", "")}),
         "model_info": train_result["model_info"],
-        "checkpoint": repo_relative_path(train_result["checkpoint"], root=REPO_ROOT),
-        "training_history": repo_relative_path(train_result["history"], root=REPO_ROOT),
+        "checkpoint": repo_relative_path(checkpoint_path, root=REPO_ROOT),
+        "checkpoint_sha256": sha256_file(checkpoint_path),
+        "training_history": repo_relative_path(history_path, root=REPO_ROOT),
+        "training_history_sha256": sha256_file(history_path),
         "best_validation_loss": train_result["best_validation_loss"],
+        "synthetic_gate_evidence": {
+            "report_dir": repo_relative_path(gate_report_dir, root=REPO_ROOT),
+            "report_card": repo_relative_path(gate_report_card, root=REPO_ROOT),
+            "report_card_sha256": sha256_file(gate_report_card),
+            "is_current_frozen_candidate": bool(args.synthetic_gate_frozen_candidate),
+        },
     }
     write_json(output_dir / "model_run_manifest.json", manifest)
+
+
+def _infer_model_role(model_id: str) -> str:
+    text = str(model_id)
+    if "lateral_mixer" in text:
+        return "lateral"
+    if "trace_1d" in text or "trace1d" in text:
+        return "no_lateral"
+    return text.replace("-", "_")
 
 
 def run_train(args: argparse.Namespace) -> None:
@@ -243,7 +280,8 @@ def run_train(args: argparse.Namespace) -> None:
             normalization = json.load(handle)
     else:
         normalization = compute_normalization(benchmark, patch_index)
-    write_json(output_dir / "normalization.json", normalization)
+    normalization_path = output_dir / "normalization.json"
+    write_json(normalization_path, normalization)
     input_reference_stats = {
         "schema_version": "real_field_input_reference_stats_v1",
         "input_name": "seismic",
@@ -291,6 +329,7 @@ def run_train(args: argparse.Namespace) -> None:
         args=args,
         benchmark_dir=benchmark_dir,
         patch_index_path=patch_index_path,
+        normalization_path=normalization_path,
         normalization=normalization,
         input_reference_stats_path=input_reference_stats_path,
         train_result=result,

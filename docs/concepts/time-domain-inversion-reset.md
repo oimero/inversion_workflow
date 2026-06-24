@@ -171,7 +171,7 @@
 
 ### 同步收口
 
-- 重写 `src/cup/time_config.py` 的旧后半程注册：
+- 重写 `src/cup/config/workflow.py` 的旧后半程注册：
   - 从 `_RETIRED_KEYS` 删除所有 `well_constraints.*`、`lfm_precomputed.*`、
     `dynamic_gain.*`、`ginn_inversion.*` 和 `deterministic_inversion.*` 条目。
   - 从 `_SOURCE_RUN_SECTIONS` 删除 `well_constraints`、`lfm_precomputed`、

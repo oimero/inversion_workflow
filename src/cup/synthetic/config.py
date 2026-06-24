@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from cup.synthetic.calibration import GENERATOR_FAMILY
-from cup.utils.io import resolve_relative_path
+from cup.utils.io import load_yaml_config, resolve_relative_path
 
 
 DATA_SCHEMA = "synthoseis_lite_v1"
@@ -48,13 +48,20 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "wavelet_generation_dir",
         )
     }
-    sampling = _mapping(root.get("sampling"), path="synthoseis_lite.sampling")
-    geometry = _mapping(root.get("geometry"), path="synthoseis_lite.geometry")
-    field = _mapping(geometry.get("field_conditioned"), path="synthoseis_lite.geometry.field_conditioned")
+    sampling = _mapping(root.get("sampling") or {}, path="synthoseis_lite.sampling")
+    geometry = _mapping(root.get("geometry") or {}, path="synthoseis_lite.geometry")
+    field = _mapping(geometry.get("field_conditioned") or {}, path="synthoseis_lite.geometry.field_conditioned")
     canonical = _mapping(geometry.get("canonical") or {}, path="synthoseis_lite.geometry.canonical")
     target_zone = _mapping(field.get("target_zone") or {}, path="synthoseis_lite.geometry.field_conditioned.target_zone")
-    horizons = field.get("horizons")
-    sections = field.get("sections")
+    if "horizons" in field:
+        raise ValueError("synthoseis_lite.geometry.field_conditioned.horizons is retired; use top-level target_interval.horizons.")
+    if "sections" in field:
+        raise ValueError("synthoseis_lite.geometry.field_conditioned.sections is retired; use sections_file.")
+    target_interval = _mapping(config.get("target_interval"), path="target_interval")
+    horizons = target_interval.get("horizons")
+    sections_file = _required_text(root, "sections_file", path="synthoseis_lite")
+    sections_payload = load_yaml_config(resolve_relative_path(sections_file, root=Path.cwd()))
+    sections = sections_payload.get("sections")
     if not isinstance(horizons, list) or len(horizons) < 2:
         raise ValueError("synthoseis_lite.geometry.field_conditioned.horizons needs at least two entries.")
     if not isinstance(sections, list) or not sections:

@@ -27,8 +27,11 @@ from cup.synthetic.workflow import (
     run_calibration,
     run_generation,
 )
-from cup.time_config import TimeWorkflowConfig
+from cup.config.workflow import TimeWorkflowConfig
 from cup.utils.io import load_yaml_config, resolve_relative_path
+
+
+DEFAULT_COMMON_CONFIG = Path("experiments/common.yaml")
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("experiments/common.yaml"),
+        default=Path("experiments/research/synthoseis_lite.yaml"),
         help="YAML configuration containing synthoseis_lite.",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -71,6 +74,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _load_config_with_common(path: Path) -> tuple[Path, dict]:
+    config_path = resolve_relative_path(path, root=REPO_ROOT)
+    common_path = resolve_relative_path(DEFAULT_COMMON_CONFIG, root=REPO_ROOT)
+    common = load_yaml_config(common_path) if common_path.is_file() else {}
+    specific = load_yaml_config(config_path)
+    merged = dict(common)
+    merged.update(specific)
+    return config_path, merged
+
+
 def _output_dir(args: argparse.Namespace, workflow: TimeWorkflowConfig) -> Path:
     if args.output_dir is not None:
         return resolve_relative_path(args.output_dir, root=REPO_ROOT)
@@ -81,8 +94,7 @@ def _output_dir(args: argparse.Namespace, workflow: TimeWorkflowConfig) -> Path:
 
 def main() -> None:
     args = parse_args()
-    config_path = resolve_relative_path(args.config, root=REPO_ROOT)
-    raw = load_yaml_config(config_path)
+    config_path, raw = _load_config_with_common(args.config)
     workflow = TimeWorkflowConfig.from_mapping(raw)
     script_cfg = parse_synthoseis_config(raw)
     sources = resolve_sources(script_cfg, repo_root=REPO_ROOT)

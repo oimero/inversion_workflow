@@ -45,7 +45,7 @@ from cup.seismic.horizon import HorizonSurface
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.trace_sampling import assemble_bilinear_trace_from_plan, build_bilinear_trace_sample_plan
 from cup.seismic.viz import plot_well_waveform_qc
-from cup.time_config import TimeWorkflowConfig
+from cup.config.workflow import TimeWorkflowConfig
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.coerce import as_bool
 from cup.utils.config import merge_dict_defaults

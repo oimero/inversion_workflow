@@ -18,7 +18,7 @@ from cup.synthetic.calibration import (
 )
 from cup.synthetic.config import IMPLEMENTATION_SCOPE
 from cup.synthetic.figures import write_calibration_figures
-from cup.time_config import TimeWorkflowConfig
+from cup.config.workflow import TimeWorkflowConfig
 from cup.utils.io import repo_relative_path, resolve_artifact_path, resolve_relative_path, sha256_file, write_json
 from cup.well.assets import normalize_well_name
 from cup.well.las import read_las_curve

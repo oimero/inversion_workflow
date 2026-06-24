@@ -34,7 +34,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.config import merge_dict_defaults
-from cup.time_config import TimeWorkflowConfig
+from cup.config.workflow import TimeWorkflowConfig
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.statistics import aggregate_cluster_then_global
 from cup.seismic.viz import plot_well_waveform_qc

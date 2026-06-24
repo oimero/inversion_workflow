@@ -51,7 +51,7 @@ from cup.seismic.wavelet import (
     validate_wavelet_normalization,
     wavelet_half_amplitude_frequencies,
 )
-from cup.time_config import TimeWorkflowConfig
+from cup.config.workflow import TimeWorkflowConfig
 from cup.utils.io import (
     load_yaml_config,
     repo_relative_path,
@@ -68,6 +68,7 @@ from cup.well.tie import load_saved_seismic_trace_csv
 
 
 SCHEMA_VERSION = "forward_observability_v1"
+DEFAULT_COMMON_CONFIG = Path("experiments/common.yaml")
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,12 +76,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("experiments/common.yaml"),
+        default=Path("experiments/research/forward_observability.yaml"),
         help="YAML config containing an explicit forward_observability section.",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--well", type=str, default=None, help="Optional single-well debug filter.")
     return parser.parse_args()
+
+
+def _load_config_with_common(path: Path) -> tuple[Path, dict[str, Any]]:
+    config_path = _resolve_repo_path(path)
+    common_path = _resolve_repo_path(DEFAULT_COMMON_CONFIG)
+    common = load_yaml_config(common_path) if common_path.is_file() else {}
+    specific = load_yaml_config(config_path)
+    merged = dict(common)
+    merged.update(specific)
+    return config_path, merged
 
 
 def _mapping(value: Any, *, path: str) -> dict[str, Any]:
@@ -127,16 +138,21 @@ def _script_config(config: Mapping[str, Any]) -> dict[str, Any]:
         for key in ("wavelet_generation_dir", "well_auto_tie_dir", "well_preprocess_dir")
     }
 
-    horizons_cfg = _mapping(root.get("horizons"), path="forward_observability.horizons")
-    raw_names = horizons_cfg.get("ordered_names")
-    if not isinstance(raw_names, (list, tuple)):
-        raise ValueError("forward_observability.horizons.ordered_names must be a list.")
-    ordered_names = [str(name).strip() for name in raw_names]
+    if "horizons" in root:
+        raise ValueError("forward_observability.horizons is retired; use top-level target_interval.horizons.")
+    target_interval = _mapping(config.get("target_interval"), path="target_interval")
+    raw_horizons = target_interval.get("horizons")
+    if not isinstance(raw_horizons, (list, tuple)):
+        raise ValueError("target_interval.horizons must be a list.")
+    ordered_names = [
+        _required_text(_mapping(item, path=f"target_interval.horizons[{idx}]"), "name", path=f"target_interval.horizons[{idx}]")
+        for idx, item in enumerate(raw_horizons)
+    ]
     if len(ordered_names) < 2 or any(not name for name in ordered_names):
-        raise ValueError("forward_observability.horizons.ordered_names needs at least two non-empty names.")
+        raise ValueError("target_interval.horizons needs at least two non-empty names.")
     normalized_names = [name.casefold() for name in ordered_names]
     if len(set(normalized_names)) != len(normalized_names):
-        raise ValueError("forward_observability.horizons.ordered_names must not contain duplicates.")
+        raise ValueError("target_interval.horizons must not contain duplicate names.")
 
     frequency_cfg = _mapping(root.get("frequency"), path="forward_observability.frequency")
     if frequency_cfg.get("max_hz") is None:
@@ -980,8 +996,7 @@ def _write_empty_or_rows(path: Path, rows: Iterable[Mapping[str, Any]]) -> pd.Da
 
 def main() -> None:
     args = parse_args()
-    config_path = _resolve_repo_path(args.config)
-    config = load_yaml_config(config_path)
+    config_path, config = _load_config_with_common(args.config)
     workflow = TimeWorkflowConfig.from_mapping(config)
     script_cfg = _script_config(config)
     sources = _resolve_sources(script_cfg)

@@ -108,19 +108,13 @@ def run_lowfreq_calibration(
         for role, arrays in predictions.items():
             if config.output_arrays:
                 arrays_by_source_role[(source.section_id, role)] = arrays
-        if str(r0_summary.get("mode") or "").casefold() == "volume":
-            _write_source_metadata(
-                output_dir=output_dir,
-                source=source,
-                r0_summary=r0_summary,
-                r1_summary=r1_summary,
-                root=root,
-            )
-            continue
-        r1_config = _load_r1_config(r1_summary, root=root)
-        well_auto_tie_dir = _r1_well_auto_tie_dir(r1_config, root=root)
-        tie_metrics = _load_tie_metrics(well_auto_tie_dir, root=root)
         well_table = _read_csv_required(source.forward_diagnostic_dir / "well_forward_diagnostic.csv")
+        if "sampling_mode" in well_table.columns:
+            tie_metrics: dict[str, Mapping[str, Any]] = {}
+        else:
+            r1_config = _load_r1_config(r1_summary, root=root)
+            well_auto_tie_dir = _r1_well_auto_tie_dir(r1_config, root=root)
+            tie_metrics = _load_tie_metrics(well_auto_tie_dir, root=root)
         for role, arrays in predictions.items():
             rows = _source_role_evidence(
                 source=source,
@@ -215,6 +209,13 @@ def _source_role_evidence(
     min_valid_samples: int,
     root: Path,
 ) -> list[dict[str, Any]]:
+    if "sampling_mode" in well_table.columns:
+        return _volume_source_role_evidence(
+            source=source,
+            role=role,
+            well_table=well_table,
+            min_valid_samples=min_valid_samples,
+        )
     rows: list[dict[str, Any]] = []
     role_rows = well_table[
         well_table.get("model_role", pd.Series(dtype=str)).astype(str).eq(role)
@@ -287,6 +288,65 @@ def _source_role_evidence(
                 "corr_after_well_bias": after["corr"],
                 **_prefix_dict(band_before, "before_"),
                 **_prefix_dict(band_after, "after_well_bias_"),
+                "reference_quality_flag": _reference_quality_flag(row),
+            }
+        )
+    return rows
+
+
+def _volume_source_role_evidence(
+    *,
+    source: CalibrationSource,
+    role: str,
+    well_table: pd.DataFrame,
+    min_valid_samples: int,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    role_rows = well_table[well_table.get("model_role", pd.Series(dtype=str)).astype(str).eq(role)].copy()
+    for _, row in role_rows.iterrows():
+        base = _base_evidence_row(source=source, role=role, row=row)
+        if str(row.get("status", "")) != "ok":
+            rows.append({**base, "calibration_status": "skipped_r1_status", "skip_reason": str(row.get("status", ""))})
+            continue
+        if str(row.get("well_ai_status", "")) != "ok":
+            rows.append(
+                {**base, "calibration_status": "skipped_well_ai_status", "skip_reason": str(row.get("well_ai_status", ""))}
+            )
+            continue
+        n_valid = _int_value(row.get("well_ai_n_valid"), default=0)
+        if n_valid < min_valid_samples:
+            rows.append(
+                {
+                    **base,
+                    "calibration_status": "skipped_insufficient_valid_samples",
+                    "skip_reason": f"n_valid={n_valid}",
+                    "n_valid": n_valid,
+                }
+            )
+            continue
+        bias = _float_value(row.get("calibration_bias_filtered_minus_pred_median"))
+        if not np.isfinite(bias):
+            rows.append({**base, "calibration_status": "skipped_missing_bias", "skip_reason": "missing calibration bias"})
+            continue
+        rows.append(
+            {
+                **base,
+                "calibration_status": "ok",
+                "skip_reason": "",
+                "n_valid": n_valid,
+                "well_bias_filtered_minus_pred_median": bias,
+                "well_residual_mean_filtered_minus_pred": -_float_value(row.get("well_ai_bias")),
+                "well_residual_std_filtered_minus_pred": np.nan,
+                "rmse_before": _float_value(row.get("well_ai_rmse")),
+                "rmse_after_well_bias": np.nan,
+                "corr_before": _float_value(row.get("well_ai_corr")),
+                "corr_after_well_bias": _float_value(row.get("well_ai_corr")),
+                "before_lowfreq_rmse": _float_value(row.get("well_ai_lowfreq_rmse")),
+                "before_lowfreq_corr": _float_value(row.get("well_ai_lowfreq_corr")),
+                "before_observable_band_rmse": _float_value(row.get("well_ai_observable_band_rmse")),
+                "before_observable_band_corr": _float_value(row.get("well_ai_observable_band_corr")),
+                "before_highfreq_or_nullspace_rmse": _float_value(row.get("well_ai_highfreq_or_nullspace_rmse")),
+                "before_highfreq_or_nullspace_corr": _float_value(row.get("well_ai_highfreq_or_nullspace_corr")),
                 "reference_quality_flag": _reference_quality_flag(row),
             }
         )
@@ -777,6 +837,8 @@ def _base_evidence_row(*, source: CalibrationSource, role: str, row: pd.Series) 
         "wellbore_class": str(row.get("wellbore_class", "")),
         "section_xy_distance_m": _float_value(row.get("section_xy_distance_m")),
         "nearest_section_trace": _int_value(row.get("nearest_section_trace"), default=-1),
+        "sampling_mode": str(row.get("sampling_mode", "")),
+        "sample_method": str(row.get("sample_method", "")),
         "r1_status": str(row.get("status", "")),
         "r1_well_ai_status": str(row.get("well_ai_status", "")),
     }

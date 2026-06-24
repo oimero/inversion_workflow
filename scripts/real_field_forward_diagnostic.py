@@ -464,10 +464,431 @@ def _well_ai_metrics(*, well_log_ai: np.ndarray, pred_log_ai: np.ndarray, valid:
         "well_ai_n_valid": n_valid,
         "well_ai_rmse": float(np.sqrt(np.mean(residual * residual))),
         "well_ai_bias": float(np.mean(residual)),
+        "well_ai_bias_median": float(np.median(residual)),
+        "calibration_bias_filtered_minus_pred_median": float(np.median(well_log_ai[mask] - pred_log_ai[mask])),
         "well_ai_corr": _safe_corr(well_log_ai[mask], pred_log_ai[mask]),
         "well_ai_pred_mean": float(np.mean(pred_log_ai[mask])),
         "well_ai_log_mean": float(np.mean(well_log_ai[mask])),
     }
+
+
+def _axis_index_float(axis: np.ndarray, value: float) -> float:
+    values = np.asarray(axis, dtype=np.float64)
+    if values.size < 2:
+        raise ValueError("Axis must contain at least two samples.")
+    step = float(np.median(np.diff(values)))
+    if step == 0.0 or not np.isfinite(step):
+        raise ValueError("Axis step is invalid.")
+    return (float(value) - float(values[0])) / step
+
+
+def _sample_volume_bilinear(
+    volume: np.ndarray,
+    *,
+    ilines: np.ndarray,
+    xlines: np.ndarray,
+    twt_s: np.ndarray,
+    inline_values: np.ndarray,
+    xline_values: np.ndarray,
+    sample_twt_s: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    data = np.asarray(volume, dtype=np.float64)
+    if data.ndim != 3:
+        raise ValueError(f"Volume sampling expects [inline, xline, twt], got {data.shape}.")
+    inline_values = np.asarray(inline_values, dtype=np.float64).reshape(-1)
+    xline_values = np.asarray(xline_values, dtype=np.float64).reshape(-1)
+    sample_twt_s = np.asarray(sample_twt_s, dtype=np.float64).reshape(-1)
+    if not (inline_values.size == xline_values.size == sample_twt_s.size):
+        raise ValueError("Volume sampling coordinate arrays must have the same length.")
+    out = np.full(sample_twt_s.shape, np.nan, dtype=np.float64)
+    inside = np.zeros(sample_twt_s.shape, dtype=bool)
+    for idx, (inline_value, xline_value, twt_value) in enumerate(zip(inline_values, xline_values, sample_twt_s)):
+        if not (np.isfinite(inline_value) and np.isfinite(xline_value) and np.isfinite(twt_value)):
+            continue
+        i_float = _axis_index_float(ilines, float(inline_value))
+        j_float = _axis_index_float(xlines, float(xline_value))
+        i0 = int(np.floor(i_float))
+        j0 = int(np.floor(j_float))
+        i1 = i0 + 1
+        j1 = j0 + 1
+        if i0 < 0 or j0 < 0 or i1 >= data.shape[0] or j1 >= data.shape[1]:
+            continue
+        wi = float(i_float - i0)
+        wj = float(j_float - j0)
+        accum = 0.0
+        weight_sum = 0.0
+        for i, j, weight in (
+            (i0, j0, (1.0 - wi) * (1.0 - wj)),
+            (i0, j1, (1.0 - wi) * wj),
+            (i1, j0, wi * (1.0 - wj)),
+            (i1, j1, wi * wj),
+        ):
+            if weight <= 0.0:
+                continue
+            trace = data[i, j, :]
+            finite = np.isfinite(trace) & np.isfinite(twt_s)
+            if int(np.count_nonzero(finite)) < 2:
+                continue
+            value = float(np.interp(float(twt_value), twt_s[finite], trace[finite], left=np.nan, right=np.nan))
+            if not np.isfinite(value):
+                continue
+            accum += weight * value
+            weight_sum += weight
+        if weight_sum > 0.0:
+            out[idx] = accum / weight_sum
+            inside[idx] = True
+    return out, inside
+
+
+def _well_sampling_coordinates(
+    *,
+    tie: pd.Series,
+    inventory: Mapping[str, object],
+    twt_s: np.ndarray,
+    include_deviated: bool,
+) -> tuple[str, np.ndarray, np.ndarray, np.ndarray, str]:
+    well = str(tie.get("well_name", "")).strip()
+    wellbore_class = str(inventory.get("wellbore_class") or "")
+    plan_text = str(tie.get("optimized_trace_sample_plan_file") or "").strip()
+    if plan_text and plan_text.casefold() != "nan":
+        if not include_deviated and wellbore_class.casefold() == "deviated":
+            raise ValueError("deviated well disabled by config")
+        plan_path = resolve_relative_path(plan_text, root=REPO_ROOT)
+        plan = pd.read_csv(plan_path)
+        inside = plan["survey_position"].astype(str).eq("inside")
+        plan = plan[inside].copy()
+        if plan.empty:
+            raise ValueError(f"Trace sample plan has no inside samples: {plan_path}")
+        return (
+            "volume_trace_plan_bilinear",
+            pd.to_numeric(plan["inline_float"], errors="coerce").to_numpy(dtype=np.float64),
+            pd.to_numeric(plan["xline_float"], errors="coerce").to_numpy(dtype=np.float64),
+            pd.to_numeric(plan["twt_s"], errors="coerce").to_numpy(dtype=np.float64),
+            wellbore_class,
+        )
+    inline_value = _coerce_float(inventory.get("inline_float"))
+    xline_value = _coerce_float(inventory.get("xline_float"))
+    if not (np.isfinite(inline_value) and np.isfinite(xline_value)):
+        raise ValueError(f"Missing inline/xline for well {well}")
+    return (
+        "volume_vertical_bilinear",
+        np.full(twt_s.shape, inline_value, dtype=np.float64),
+        np.full(twt_s.shape, xline_value, dtype=np.float64),
+        np.asarray(twt_s, dtype=np.float64),
+        wellbore_class or "vertical",
+    )
+
+
+def _build_volume_well_forward_qc(
+    *,
+    run_cfg: dict,
+    output_dir: Path,
+    predictions: dict[str, dict[str, object]],
+    synthetic_by_role: dict[str, np.ndarray],
+    wavelet: np.ndarray,
+    observed: np.ndarray,
+    lfm: np.ndarray,
+    valid: np.ndarray,
+    ilines: np.ndarray,
+    xlines: np.ndarray,
+    twt_s: np.ndarray,
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    well_cfg = dict(run_cfg.get("well_qc") or {})
+    if not bool(well_cfg.get("enabled", False)):
+        return pd.DataFrame.from_records([{"status": "disabled_by_config"}]), {}
+    well_auto_tie_text = str(well_cfg.get("well_auto_tie_dir") or "").strip()
+    if not well_auto_tie_text:
+        raise ValueError("real_field_forward_diagnostic.well_qc.well_auto_tie_dir must be explicit when well_qc is enabled.")
+    well_auto_tie_dir = resolve_relative_path(well_auto_tie_text, root=REPO_ROOT)
+    metrics = pd.read_csv(well_auto_tie_dir / "well_tie_metrics.csv")
+    metrics = metrics[metrics["tie_status"].astype(str).eq("success")].copy()
+    inventory_info = _load_well_inventory_info(well_cfg)
+    include_deviated = bool(well_cfg.get("include_deviated_wells", True))
+    bands = _configured_bands(run_cfg)
+    rows: list[dict[str, object]] = []
+    figures: dict[str, str] = {}
+    figures_dir = output_dir / "figures" / "wells"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    dt_s = float(np.median(np.diff(twt_s))) if twt_s.size > 1 else 0.002
+    first_arrays = next(iter(predictions.values()))["arrays"]
+    for _, tie in metrics.iterrows():
+        well_name = str(tie.get("well_name", "")).strip()
+        inventory = inventory_info.get(well_name, {})
+        base_common = {"well_name": well_name, "sampling_mode": "volume"}
+        try:
+            sample_method, sample_ilines, sample_xlines, sample_twt, wellbore_class = _well_sampling_coordinates(
+                tie=tie,
+                inventory=inventory,
+                twt_s=twt_s,
+                include_deviated=include_deviated,
+            )
+            well_log_ai = _log_ai_at_twt(
+                las_path=resolve_relative_path(str(tie["filtered_las_file"]), root=REPO_ROOT),
+                tdt_path=resolve_relative_path(str(tie["optimized_tdt_file"]), root=REPO_ROOT),
+                twt_s=sample_twt,
+            )
+        except Exception as exc:
+            rows.append({**base_common, "model_role": "", "wellbore_class": str(inventory.get("wellbore_class", "")), "status": "skipped_sampling_failed", "reason": str(exc)})
+            continue
+        base = {
+            **base_common,
+            "wellbore_class": wellbore_class,
+            "sample_method": sample_method,
+            "n_well_samples": int(sample_twt.size),
+            "twt_start_s": float(np.nanmin(sample_twt)) if sample_twt.size else np.nan,
+            "twt_stop_s": float(np.nanmax(sample_twt)) if sample_twt.size else np.nan,
+            "section_xy_distance_m": 0.0,
+            "nearest_section_trace": -1,
+        }
+        lfm_trace, lfm_inside = _sample_volume_bilinear(
+            lfm,
+            ilines=ilines,
+            xlines=xlines,
+            twt_s=twt_s,
+            inline_values=sample_ilines,
+            xline_values=sample_xlines,
+            sample_twt_s=sample_twt,
+        )
+        valid_trace, valid_inside = _sample_volume_bilinear(
+            valid.astype(float),
+            ilines=ilines,
+            xlines=xlines,
+            twt_s=twt_s,
+            inline_values=sample_ilines,
+            xline_values=sample_xlines,
+            sample_twt_s=sample_twt,
+        )
+        model_valid = valid_inside & lfm_inside & (valid_trace > 0.5)
+        filtered_synthetic = forward_log_ai(well_log_ai[None, :], wavelet)[0]
+        forward_twt = sample_twt[1:]
+        forward_ilines = sample_ilines[1:]
+        forward_xlines = sample_xlines[1:]
+        observed_forward, observed_inside = _sample_volume_bilinear(
+            observed,
+            ilines=ilines,
+            xlines=xlines,
+            twt_s=twt_s,
+            inline_values=forward_ilines,
+            xline_values=forward_xlines,
+            sample_twt_s=forward_twt,
+        )
+        forward_valid_base = observed_inside & model_valid[1:]
+        filtered_waveform = diagnostic_metrics(
+            observed=observed_forward[None, :],
+            synthetic=filtered_synthetic[None, :],
+            valid_mask=(forward_valid_base & np.isfinite(filtered_synthetic))[None, :],
+        )
+        figures.update(
+            _plot_volume_well_qc_case(
+                figures_dir=figures_dir,
+                well_name=well_name,
+                role="filtered_las",
+                selected_log_ai=well_log_ai,
+                filtered_log_ai=well_log_ai,
+                sample_twt=sample_twt,
+                observed=observed_forward,
+                synthetic=filtered_synthetic,
+                valid_forward=forward_valid_base & np.isfinite(filtered_synthetic),
+                tie_window_start_s=_coerce_float(tie.get("tie_window_start_s")),
+                tie_window_end_s=_coerce_float(tie.get("tie_window_end_s")),
+            )
+        )
+        rows.append(
+            {
+                **base,
+                "model_role": "filtered_las",
+                "status": "ok",
+                "well_ai_status": "reference",
+                "well_ai_n_valid": int(np.count_nonzero(np.isfinite(well_log_ai))),
+                "well_ai_rmse": 0.0,
+                "well_ai_bias": 0.0,
+                "well_ai_bias_median": 0.0,
+                "calibration_bias_filtered_minus_pred_median": 0.0,
+                "well_ai_corr": 1.0,
+                **{f"waveform_{key}": value for key, value in filtered_waveform.items()},
+            }
+        )
+        lfm_ai_metrics = _well_ai_metrics(well_log_ai=well_log_ai, pred_log_ai=lfm_trace, valid=model_valid)
+        lfm_synthetic = forward_log_ai(lfm_trace[None, :], wavelet)[0]
+        figures.update(
+            _plot_volume_well_qc_case(
+                figures_dir=figures_dir,
+                well_name=well_name,
+                role="lfm_input",
+                selected_log_ai=lfm_trace,
+                filtered_log_ai=well_log_ai,
+                sample_twt=sample_twt,
+                observed=observed_forward,
+                synthetic=lfm_synthetic,
+                valid_forward=forward_valid_base & np.isfinite(lfm_synthetic),
+                tie_window_start_s=_coerce_float(tie.get("tie_window_start_s")),
+                tie_window_end_s=_coerce_float(tie.get("tie_window_end_s")),
+            )
+        )
+        rows.append({**base, "model_role": "lfm_input", "status": "ok" if lfm_ai_metrics.get("well_ai_status") == "ok" else lfm_ai_metrics.get("well_ai_status"), **lfm_ai_metrics})
+        for role, payload in predictions.items():
+            arrays = payload["arrays"]
+            pred_trace, pred_inside = _sample_volume_bilinear(
+                np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float64),
+                ilines=ilines,
+                xlines=xlines,
+                twt_s=twt_s,
+                inline_values=sample_ilines,
+                xline_values=sample_xlines,
+                sample_twt_s=sample_twt,
+            )
+            weight_trace, _ = _sample_volume_bilinear(
+                np.asarray(arrays["stitching_weight"], dtype=np.float64),
+                ilines=ilines,
+                xlines=xlines,
+                twt_s=twt_s,
+                inline_values=sample_ilines,
+                xline_values=sample_xlines,
+                sample_twt_s=sample_twt,
+            )
+            role_valid = model_valid & pred_inside & (weight_trace > 0.0)
+            ai_metrics = _well_ai_metrics(well_log_ai=well_log_ai, pred_log_ai=pred_trace, valid=role_valid)
+            local_spectrum: dict[str, object] = {}
+            pred_delta_trace, _ = _sample_volume_bilinear(
+                np.asarray(arrays["pred_delta_vs_lfm"], dtype=np.float64),
+                ilines=ilines,
+                xlines=xlines,
+                twt_s=twt_s,
+                inline_values=sample_ilines,
+                xline_values=sample_xlines,
+                sample_twt_s=sample_twt,
+            )
+            residual = pred_trace - well_log_ai
+            for band in bands:
+                name = str(band["name"])
+                pair = _band_pair_metrics(
+                    reference=well_log_ai,
+                    model=pred_trace,
+                    valid=role_valid,
+                    dt_s=dt_s,
+                    low_hz=float(band["low_hz"]),
+                    high_hz=float(band["high_hz"]),
+                )
+                local_spectrum[f"well_ai_{name}_n_valid"] = pair["n_valid"]
+                local_spectrum[f"well_ai_{name}_rmse"] = pair["rmse"]
+                local_spectrum[f"well_ai_{name}_corr"] = pair["corr"]
+                local_spectrum[f"well_ai_residual_{name}_rms"] = _band_rms(residual, role_valid, dt_s=dt_s, low_hz=float(band["low_hz"]), high_hz=float(band["high_hz"]))
+                local_spectrum[f"pred_delta_{name}_rms"] = _band_rms(pred_delta_trace, role_valid, dt_s=dt_s, low_hz=float(band["low_hz"]), high_hz=float(band["high_hz"]))
+            synthetic_key = f"zero_shot_{role}"
+            synthetic_trace = np.full(forward_twt.shape, np.nan, dtype=np.float64)
+            synthetic_inside = np.zeros(forward_twt.shape, dtype=bool)
+            if synthetic_key in synthetic_by_role:
+                synthetic_trace, synthetic_inside = _sample_volume_bilinear(
+                    synthetic_by_role[synthetic_key],
+                    ilines=ilines,
+                    xlines=xlines,
+                    twt_s=twt_s[1:],
+                    inline_values=forward_ilines,
+                    xline_values=forward_xlines,
+                    sample_twt_s=forward_twt,
+                )
+            waveform = diagnostic_metrics(
+                observed=observed_forward[None, :],
+                synthetic=synthetic_trace[None, :],
+                valid_mask=(forward_valid_base & synthetic_inside)[None, :],
+            )
+            figures.update(
+                _plot_volume_well_qc_case(
+                    figures_dir=figures_dir,
+                    well_name=well_name,
+                    role=role,
+                    selected_log_ai=pred_trace,
+                    filtered_log_ai=well_log_ai,
+                    sample_twt=sample_twt,
+                    observed=observed_forward,
+                    synthetic=synthetic_trace,
+                    valid_forward=forward_valid_base & synthetic_inside,
+                    tie_window_start_s=_coerce_float(tie.get("tie_window_start_s")),
+                    tie_window_end_s=_coerce_float(tie.get("tie_window_end_s")),
+                )
+            )
+            rows.append(
+                {
+                    **base,
+                    "model_role": role,
+                    "status": "ok" if ai_metrics.get("well_ai_status") == "ok" else ai_metrics.get("well_ai_status"),
+                    **ai_metrics,
+                    **local_spectrum,
+                    **{f"waveform_{key}": value for key, value in waveform.items()},
+                }
+            )
+    frame = pd.DataFrame.from_records(rows)
+    return frame, figures
+
+
+def _plot_volume_well_qc_case(
+    *,
+    figures_dir: Path,
+    well_name: str,
+    role: str,
+    selected_log_ai: np.ndarray,
+    filtered_log_ai: np.ndarray,
+    sample_twt: np.ndarray,
+    observed: np.ndarray,
+    synthetic: np.ndarray,
+    valid_forward: np.ndarray,
+    tie_window_start_s: float,
+    tie_window_end_s: float,
+) -> dict[str, str]:
+    outputs: dict[str, str] = {}
+    sample_twt = np.asarray(sample_twt, dtype=np.float64)
+    selected_log_ai = np.asarray(selected_log_ai, dtype=np.float64)
+    filtered_log_ai = np.asarray(filtered_log_ai, dtype=np.float64)
+    observed = np.asarray(observed, dtype=np.float64)
+    synthetic = np.asarray(synthetic, dtype=np.float64)
+    valid_forward = np.asarray(valid_forward, dtype=bool)
+    if sample_twt.size < 2 or observed.shape != synthetic.shape or observed.shape != sample_twt[1:].shape:
+        return outputs
+    selected_filled = _fill_nonfinite_1d(selected_log_ai)
+    reflectivity = np.tanh(0.5 * (selected_filled[1:] - selected_filled[:-1]))
+    plot_mask = valid_forward & np.isfinite(observed) & np.isfinite(synthetic) & np.isfinite(reflectivity)
+    twt_forward = sample_twt[1:]
+    if np.isfinite(tie_window_start_s) and np.isfinite(tie_window_end_s):
+        plot_mask &= (twt_forward >= float(tie_window_start_s)) & (twt_forward <= float(tie_window_end_s))
+    run = _largest_true_run(plot_mask)
+    if run is None:
+        return outputs
+    start, stop = run
+    if stop - start < 8:
+        return outputs
+    sl = slice(start, stop)
+    basis = twt_forward[sl]
+    selected_ai = np.exp(selected_filled[1:][sl])
+    filtered_ai = np.exp(_fill_nonfinite_1d(filtered_log_ai)[1:][sl])
+    synthetic_trace = grid.Seismic(synthetic[sl], basis, "twt", name="Synthetic")
+    observed_trace = grid.Seismic(observed[sl], basis, "twt", name="Seismic")
+    reflectivity_trace = grid.Reflectivity(reflectivity[sl], basis, "twt", name="Reflectivity")
+    selected_ai_trace = grid.Log(selected_ai, basis, "twt", name=f"{role} AI")
+    traces: list[grid.Log] = [selected_ai_trace]
+    if role != "filtered_las":
+        traces.append(grid.Log(filtered_ai, basis, "twt", name="Filtered LAS AI"))
+    xcorr_values = normalized_xcorr(observed_trace.values, synthetic_trace.values)
+    xcorr_basis = synthetic_trace.sampling_rate * np.arange(-(synthetic_trace.size - 1), synthetic_trace.size)
+    xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
+    dxcorr = dynamic_normalized_xcorr(observed_trace, synthetic_trace)
+    corr = _safe_corr(observed_trace.values, synthetic_trace.values)
+    title = f"R1 volume well QC | {well_name} | {role} | corr={corr:.3f}"
+    fig, _axes = plot_well_waveform_qc(
+        traces,
+        reflectivity_trace,
+        synthetic_trace,
+        observed_trace,
+        xcorr,
+        dxcorr,
+        figsize=(12.0, 7.5),
+        synthetic_ai=selected_ai_trace,
+        title=title,
+    )
+    path = figures_dir / f"well_forward_qc_{well_name}_{role}.png"
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    outputs[f"{well_name}/{role}"] = repo_relative_path(path, root=REPO_ROOT)
+    return outputs
 
 
 def _build_well_forward_qc(
@@ -1424,6 +1845,8 @@ def main() -> None:
     observed = np.asarray(first["seismic_input"], dtype=np.float64)
     lfm = np.asarray(first["lfm_input"], dtype=np.float64)
     valid = np.asarray(first["valid_mask_model"], dtype=bool)
+    ilines = np.asarray(first["ilines"], dtype=np.float64)
+    xlines = np.asarray(first["xlines"], dtype=np.float64)
     output_mode = "volume" if observed.ndim == 3 else "section"
     twt_s = np.asarray(first["twt_s"], dtype=np.float64)
     dt_s = float(np.median(np.diff(twt_s))) if twt_s.size > 1 else 0.002
@@ -1560,15 +1983,19 @@ def main() -> None:
     spatial_frame.to_csv(spatial_path, index=False)
     well_path = output_dir / "well_forward_diagnostic.csv"
     if output_mode == "volume":
-        well_frame = pd.DataFrame.from_records(
-            [
-                {
-                    "status": "disabled_for_volume_mode",
-                    "reason": "R1 volume diagnostic does not run section-distance well QC.",
-                }
-            ]
+        well_frame, well_figure_outputs = _build_volume_well_forward_qc(
+            run_cfg=run_cfg,
+            output_dir=output_dir,
+            predictions=predictions,
+            synthetic_by_role=synthetic_by_role,
+            wavelet=wavelet,
+            observed=observed,
+            lfm=lfm,
+            valid=valid,
+            ilines=ilines,
+            xlines=xlines,
+            twt_s=twt_s,
         )
-        well_figure_outputs = {}
     else:
         well_frame, well_figure_outputs = _build_well_forward_qc(
             run_cfg=run_cfg,
@@ -1579,7 +2006,7 @@ def main() -> None:
             wavelet=wavelet,
         )
     well_frame.to_csv(well_path, index=False)
-    if output_mode == "volume":
+    if output_mode == "volume" and not {"well_name", "model_role"}.issubset(well_frame.columns):
         well_comparison_frame = pd.DataFrame()
         well_band_frame = pd.DataFrame()
         (output_dir / "well_ai_comparison_summary.csv").write_text("", encoding="utf-8")

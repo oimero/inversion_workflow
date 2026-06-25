@@ -9,6 +9,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from cup.synthetic.calibration import GENERATOR_FAMILY
+from cup.config.sources import assert_recorded_source_matches, require_source_files
 from cup.utils.io import resolve_relative_path
 
 
@@ -428,21 +429,14 @@ def resolve_sources(script_cfg: Mapping[str, Any], *, repo_root: Path) -> dict[s
     }
     for key, names in required.items():
         directory = sources[key]
-        if not directory.is_dir():
-            raise FileNotFoundError(f"Source run does not exist: {directory}")
-        missing = [name for name in names if not (directory / name).is_file()]
-        if missing:
-            raise FileNotFoundError(f"{key} is missing {missing}: {directory}")
+        require_source_files(directory, names, label=key)
     with (sources["forward_observability_dir"] / "run_summary.json").open(
         "r", encoding="utf-8"
     ) as handle:
         summary = json.load(handle)
     recorded = summary.get("source_runs") or {}
     for key in ("well_preprocess_dir", "well_auto_tie_dir", "wavelet_generation_dir"):
-        if key not in recorded:
-            raise ValueError(f"source_run_mismatch: observability summary lacks {key}")
-        if resolve_relative_path(recorded[key], root=repo_root).resolve() != sources[key].resolve():
-            raise ValueError(f"source_run_mismatch:{key}")
+        assert_recorded_source_matches(recorded, key, sources[key], root=repo_root)
     return sources
 
 def _validate_canonical_config(config: Mapping[str, Any]) -> None:

@@ -6,6 +6,8 @@ from cup.config.workflow import (
     SpatialDebiasConfig,
     TimeWorkflowConfig,
     WellCurveContract,
+    deep_merge_dict,
+    merge_dict_defaults,
 )
 
 __all__ = [
@@ -14,4 +16,6 @@ __all__ = [
     "SpatialDebiasConfig",
     "TimeWorkflowConfig",
     "WellCurveContract",
+    "deep_merge_dict",
+    "merge_dict_defaults",
 ]

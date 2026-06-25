@@ -52,8 +52,8 @@ from cup.seismic.wavelet import (
     wavelet_half_amplitude_frequencies,
 )
 from cup.config.workflow import TimeWorkflowConfig
+from cup.config.sources import assert_recorded_source_matches, require_source_files, resolve_source_run
 from cup.utils.io import (
-    latest_checked_run,
     load_yaml_config,
     repo_relative_path,
     resolve_artifact_path,
@@ -259,57 +259,42 @@ def _resolve_output_dir(args: argparse.Namespace, workflow: TimeWorkflowConfig) 
     return output_root / f"forward_observability_{timestamp}"
 
 
-def _require_files(directory: Path, names: Sequence[str], *, label: str) -> None:
-    if not directory.is_dir():
-        raise FileNotFoundError(f"{label} directory does not exist: {directory}")
-    missing = [name for name in names if not (directory / name).is_file()]
-    if missing:
-        raise FileNotFoundError(f"{label} directory is missing required files {missing}: {directory}")
-
-
-def _same_path(left: Path, right: Path) -> bool:
-    return left.resolve() == right.resolve()
-
-
 def _resolve_sources(script_cfg: Mapping[str, Any]) -> dict[str, Path]:
     source_cfg = script_cfg["source_runs"]
     output_root = _resolve_repo_path(script_cfg["output_root"])
     sources = {
-        "wavelet_generation_dir": (
-            _resolve_repo_path(source_cfg["wavelet_generation_dir"])
-            if source_cfg.get("wavelet_generation_dir")
-            else latest_checked_run(
-                output_root,
-                "wavelet_generation",
-                required_files=[
-                    "selected_wavelet.csv",
-                    "selected_wavelet_summary.json",
-                    "wavelet_candidate_aggregate.csv",
-                    "evaluation_well_spatial_clusters.csv",
-                    "batch_synthetic_metrics.csv",
-                ],
-            )
+        "wavelet_generation_dir": resolve_source_run(
+            source_cfg.get("wavelet_generation_dir"),
+            output_root=output_root,
+            prefix="wavelet_generation",
+            required_files=[
+                "selected_wavelet.csv",
+                "selected_wavelet_summary.json",
+                "wavelet_candidate_aggregate.csv",
+                "evaluation_well_spatial_clusters.csv",
+                "batch_synthetic_metrics.csv",
+            ],
+            root=REPO_ROOT,
+            label="wavelet_generation",
         ),
-        "well_auto_tie_dir": (
-            _resolve_repo_path(source_cfg["well_auto_tie_dir"])
-            if source_cfg.get("well_auto_tie_dir")
-            else latest_checked_run(
-                output_root,
-                "well_auto_tie",
-                required_files=["well_tie_metrics.csv", "well_tie_plan.csv", "wavelet_inventory.csv"],
-            )
+        "well_auto_tie_dir": resolve_source_run(
+            source_cfg.get("well_auto_tie_dir"),
+            output_root=output_root,
+            prefix="well_auto_tie",
+            required_files=["well_tie_metrics.csv", "well_tie_plan.csv", "wavelet_inventory.csv"],
+            root=REPO_ROOT,
+            label="well_auto_tie",
         ),
-        "well_preprocess_dir": (
-            _resolve_repo_path(source_cfg["well_preprocess_dir"])
-            if source_cfg.get("well_preprocess_dir")
-            else latest_checked_run(
-                output_root,
-                "well_preprocess",
-                required_files=["well_preprocess_status.csv"],
-            )
+        "well_preprocess_dir": resolve_source_run(
+            source_cfg.get("well_preprocess_dir"),
+            output_root=output_root,
+            prefix="well_preprocess",
+            required_files=["well_preprocess_status.csv"],
+            root=REPO_ROOT,
+            label="well_preprocess",
         ),
     }
-    _require_files(
+    require_source_files(
         sources["wavelet_generation_dir"],
         [
             "selected_wavelet.csv",
@@ -320,12 +305,12 @@ def _resolve_sources(script_cfg: Mapping[str, Any]) -> dict[str, Path]:
         ],
         label="wavelet_generation",
     )
-    _require_files(
+    require_source_files(
         sources["well_auto_tie_dir"],
         ["well_tie_metrics.csv", "well_tie_plan.csv", "wavelet_inventory.csv"],
         label="well_auto_tie",
     )
-    _require_files(
+    require_source_files(
         sources["well_preprocess_dir"],
         ["well_preprocess_status.csv"],
         label="well_preprocess",
@@ -337,11 +322,16 @@ def _resolve_sources(script_cfg: Mapping[str, Any]) -> dict[str, Path]:
     source_auto_tie = summary.get("source_auto_tie_dir")
     if not source_auto_tie:
         raise ValueError("selected_wavelet_summary.json is missing source_auto_tie_dir.")
-    if not _same_path(_resolve_repo_path(source_auto_tie), sources["well_auto_tie_dir"]):
-        raise ValueError(
+    assert_recorded_source_matches(
+        {"source_auto_tie_dir": source_auto_tie},
+        "source_auto_tie_dir",
+        sources["well_auto_tie_dir"],
+        root=REPO_ROOT,
+        message=(
             "source_run_mismatch: selected wavelet source_auto_tie_dir does not match "
             "forward_observability.source_runs.well_auto_tie_dir."
-        )
+        ),
+    )
     return sources
 
 

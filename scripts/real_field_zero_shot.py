@@ -23,7 +23,8 @@ sys.path = [path for path in sys.path if path not in {repo_text, src_text}]
 sys.path.insert(0, repo_text)
 sys.path.insert(0, src_text)
 
-from cup.utils.io import latest_checked_run, load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
+from cup.config.sources import load_summary, resolve_source_file_from_run, resolve_source_run
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
 from cup.seismic.volume_export import export_volume_like_source
 from ginn_v2.real_field import (
     input_qc_frame,
@@ -101,35 +102,48 @@ def _prepare_real_field_inputs(run_cfg: dict, workflow_cfg: dict) -> dict:
     prepared = dict(run_cfg)
     inputs = dict(prepared.get("real_field_inputs") or {})
     output_root = resolve_relative_path(workflow_cfg.get("output_root", "scripts/output"), root=REPO_ROOT)
-    if not inputs.get("lfm_file"):
-        lfm_dir = latest_checked_run(
-            output_root,
-            "real_field_lfm",
-            required_files=["real_field_lfm.npz", "real_field_lfm_summary.json"],
-            validator=_validate_real_field_lfm_run,
+    if inputs.get("lfm_file"):
+        lfm_file = resolve_source_file_from_run(
+            inputs.get("lfm_file"),
+            output_root=output_root,
+            prefix="real_field_lfm",
+            file_name="real_field_lfm.npz",
+            root=REPO_ROOT,
+            label="real_field_lfm.npz",
         )
-        inputs["lfm_file"] = repo_relative_path(lfm_dir / "real_field_lfm.npz", root=REPO_ROOT)
+        load_summary(
+            lfm_file.parent / "real_field_lfm_summary.json",
+            schema_version="real_field_lfm_v1",
+            allowed_status={"ok", "warning"},
+            label="real_field_lfm_summary.json",
+        )
+    else:
+        lfm_file = resolve_source_file_from_run(
+            None,
+            output_root=output_root,
+            prefix="real_field_lfm",
+            file_name="real_field_lfm.npz",
+            root=REPO_ROOT,
+            label="real_field_lfm.npz",
+            run_required_files=["real_field_lfm.npz", "real_field_lfm_summary.json"],
+            summary_file="real_field_lfm_summary.json",
+            schema_version="real_field_lfm_v1",
+            allowed_status={"ok", "warning"},
+        )
+    inputs["lfm_file"] = repo_relative_path(lfm_file, root=REPO_ROOT)
     source_runs = dict(prepared.get("source_runs") or {})
-    if not source_runs.get("wavelet_generation_dir"):
-        wavelet_dir = latest_checked_run(
-            output_root,
-            "wavelet_generation",
-            required_files=["selected_wavelet.csv", "selected_wavelet_summary.json"],
-        )
-        source_runs["wavelet_generation_dir"] = repo_relative_path(wavelet_dir, root=REPO_ROOT)
+    wavelet_dir = resolve_source_run(
+        source_runs.get("wavelet_generation_dir"),
+        output_root=output_root,
+        prefix="wavelet_generation",
+        required_files=["selected_wavelet.csv", "selected_wavelet_summary.json"],
+        root=REPO_ROOT,
+        label="wavelet_generation",
+    )
+    source_runs["wavelet_generation_dir"] = repo_relative_path(wavelet_dir, root=REPO_ROOT)
     prepared["real_field_inputs"] = inputs
     prepared["source_runs"] = source_runs
     return prepared
-
-
-def _validate_real_field_lfm_run(path: Path) -> None:
-    with (path / "real_field_lfm_summary.json").open("r", encoding="utf-8") as handle:
-        summary = json.load(handle)
-    if str(summary.get("schema_version") or "") != "real_field_lfm_v1":
-        raise ValueError("real_field_lfm_summary.json schema_version is not real_field_lfm_v1")
-    if str(summary.get("status") or "") not in {"ok", "warning"}:
-        raise ValueError(f"real_field_lfm status is not consumable: {summary.get('status')}")
-
 
 def _timestamped_output(prefix: str, explicit: Path | None, *, output_root: Path) -> Path:
     if explicit is not None:

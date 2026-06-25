@@ -16,7 +16,6 @@ import argparse
 from dataclasses import dataclass
 import json
 from pathlib import Path
-import re
 import sys
 from datetime import datetime
 from typing import Any, Mapping, Sequence
@@ -36,6 +35,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.config.workflow import TimeWorkflowConfig
+from cup.config.sources import resolve_source_run
 from cup.utils.coerce import optional_float as _optional_float
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.well.assets import normalize_well_name
@@ -135,25 +135,21 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     return output_root / f"well_preprocess_{timestamp}"
 
 
-def _discover_latest_screen_dir(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
+def _resolve_screen_dir(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
     source_runs = dict(script_cfg.get("source_runs") or {})
-    if source_runs.get("well_screen_dir") is not None:
-        return _resolve_repo_path(source_runs["well_screen_dir"])
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
-    all_candidates = [path for path in output_root.glob("well_screen_*") if path.is_dir()]
-    timestamped = [
-        path
-        for path in all_candidates
-        if re.fullmatch(r"well_screen_\d{8}_\d{6}", path.name)
-    ]
-    candidates = sorted(timestamped or all_candidates, key=lambda path: path.name)
-    if not candidates:
-        raise FileNotFoundError("No well_screen_* output directory found under output_root.")
-    return candidates[-1]
+    return resolve_source_run(
+        source_runs.get("well_screen_dir"),
+        output_root=output_root,
+        prefix="well_screen",
+        required_files=["well_screen.csv", "las_curve_inventory.csv"],
+        root=REPO_ROOT,
+        label="well_screen",
+    )
 
 
 def _resolve_inputs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str, Path]:
-    latest_dir = _discover_latest_screen_dir(cfg, script_cfg)
+    latest_dir = _resolve_screen_dir(cfg, script_cfg)
     return {
         "screen_file": latest_dir / "well_screen.csv",
         "input_las_dir": latest_dir / "selected_las",

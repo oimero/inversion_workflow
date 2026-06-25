@@ -16,7 +16,6 @@ import argparse
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-import re
 import sys
 from typing import Any, Mapping, Sequence
 import warnings
@@ -45,10 +44,10 @@ from cup.seismic.horizon import HorizonSurface
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.trace_sampling import assemble_bilinear_trace_from_plan, build_bilinear_trace_sample_plan
 from cup.seismic.viz import plot_well_waveform_qc
-from cup.config.workflow import TimeWorkflowConfig
+from cup.config.workflow import TimeWorkflowConfig, merge_dict_defaults
+from cup.config.sources import resolve_source_run
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.coerce import as_bool
-from cup.utils.config import merge_dict_defaults
 from cup.utils.masks import true_runs
 from cup.well.assets import build_file_lookup
 from cup.well.gaps import fill_short_joint_gaps, prepare_continuous_tie_logs
@@ -175,41 +174,55 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     return output_root / f"well_auto_tie_{timestamp}"
 
 
-def _discover_latest_dir(cfg: dict[str, Any], prefix: str) -> Path:
-    output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
-    all_candidates = [path for path in output_root.glob(f"{prefix}_*") if path.is_dir()]
-    timestamped = [path for path in all_candidates if re.fullmatch(rf"{re.escape(prefix)}_\d{{8}}_\d{{6}}", path.name)]
-    candidates = sorted(timestamped or all_candidates, key=lambda path: path.name)
-    if not candidates:
-        raise FileNotFoundError(f"No {prefix}_* output directory found under output_root.")
-    return candidates[-1]
-
-
 def _resolve_inputs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str, Path | None]:
     source_runs = dict(script_cfg.get("source_runs") or {})
+    output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
 
-    inventory_dir = (
-        _resolve_repo_path(source_runs["well_inventory_dir"])
-        if source_runs.get("well_inventory_dir") is not None
-        else _discover_latest_dir(cfg, "well_inventory")
+    inventory_dir = resolve_source_run(
+        source_runs.get("well_inventory_dir"),
+        output_root=output_root,
+        prefix="well_inventory",
+        required_files=["well_inventory.csv"],
+        root=REPO_ROOT,
+        label="well_inventory",
     )
-    screen_dir = (
-        _resolve_repo_path(source_runs["well_screen_dir"])
-        if source_runs.get("well_screen_dir") is not None
-        else _discover_latest_dir(cfg, "well_screen")
+    screen_dir = resolve_source_run(
+        source_runs.get("well_screen_dir"),
+        output_root=output_root,
+        prefix="well_screen",
+        required_files=["well_screen.csv"],
+        root=REPO_ROOT,
+        label="well_screen",
     )
-    preprocess_dir = (
-        _resolve_repo_path(source_runs["well_preprocess_dir"])
-        if source_runs.get("well_preprocess_dir") is not None
-        else _discover_latest_dir(cfg, "well_preprocess")
+    preprocess_dir = resolve_source_run(
+        source_runs.get("well_preprocess_dir"),
+        output_root=output_root,
+        prefix="well_preprocess",
+        required_files=["well_preprocess_status.csv"],
+        root=REPO_ROOT,
+        label="well_preprocess",
     )
 
     trajectory_dir = None
     if source_runs.get("well_trajectory_dir") is not None:
-        trajectory_dir = _resolve_repo_path(source_runs["well_trajectory_dir"])
+        trajectory_dir = resolve_source_run(
+            source_runs.get("well_trajectory_dir"),
+            output_root=output_root,
+            prefix="well_trajectory",
+            required_files=["well_trajectory.csv"],
+            root=REPO_ROOT,
+            label="well_trajectory",
+        )
     else:
         try:
-            trajectory_dir = _discover_latest_dir(cfg, "well_trajectory")
+            trajectory_dir = resolve_source_run(
+                None,
+                output_root=output_root,
+                prefix="well_trajectory",
+                required_files=["well_trajectory.csv"],
+                root=REPO_ROOT,
+                label="well_trajectory",
+            )
         except FileNotFoundError:
             trajectory_dir = None
 

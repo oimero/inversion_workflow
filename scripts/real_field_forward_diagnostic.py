@@ -24,7 +24,8 @@ sys.path.insert(0, src_text)
 
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.utils.io import latest_checked_run, load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
+from cup.config.sources import assert_same_path, load_summary, resolve_source_file_from_run, resolve_source_run
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
 from ginn_v2.real_field import (
     diagnostic_metrics,
     forward_log_ai,
@@ -460,32 +461,25 @@ def _load_zero_shot_line_geometry(zero_shot_dir: Path):
 
 
 def _load_zero_shot_summary(zero_shot_dir: Path) -> dict:
-    summary_path = zero_shot_dir / "real_field_zero_shot_summary.json"
-    if not summary_path.is_file():
-        raise FileNotFoundError(f"real_field_zero_shot_summary.json not found: {summary_path}")
-    with summary_path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def _validate_zero_shot_run(path: Path) -> None:
-    with (path / "real_field_zero_shot_summary.json").open("r", encoding="utf-8") as handle:
-        summary = json.load(handle)
-    if str(summary.get("schema_version") or "") != "real_field_zero_shot_summary_v1":
-        raise ValueError("real_field_zero_shot_summary.json schema_version is not real_field_zero_shot_summary_v1")
-    if str(summary.get("status") or "") not in {"needs_forward_diagnostic", "ok"}:
-        raise ValueError(f"R0 status is not consumable: {summary.get('status')}")
+    return load_summary(
+        zero_shot_dir / "real_field_zero_shot_summary.json",
+        schema_version="real_field_zero_shot_summary_v1",
+        allowed_status={"needs_forward_diagnostic", "ok"},
+        label="real_field_zero_shot_summary.json",
+    )
 
 
 def _resolve_zero_shot_dir(run_cfg: dict, *, output_root: Path, cli_value: Path | None) -> Path:
-    if cli_value is not None:
-        return resolve_relative_path(cli_value, root=REPO_ROOT)
-    if run_cfg.get("zero_shot_dir"):
-        return resolve_relative_path(run_cfg["zero_shot_dir"], root=REPO_ROOT)
-    return latest_checked_run(
-        output_root,
-        "real_field_zero_shot",
+    return resolve_source_run(
+        cli_value if cli_value is not None else run_cfg.get("zero_shot_dir"),
+        output_root=output_root,
+        prefix="real_field_zero_shot",
         required_files=["real_field_zero_shot_summary.json"],
-        validator=_validate_zero_shot_run,
+        root=REPO_ROOT,
+        label="real_field_zero_shot",
+        summary_file="real_field_zero_shot_summary.json",
+        schema_version="real_field_zero_shot_summary_v1",
+        allowed_status={"needs_forward_diagnostic", "ok"},
     )
 
 
@@ -499,16 +493,38 @@ def _resolve_wavelet_dir(run_cfg: dict, *, zero_shot_dir: Path, output_root: Pat
             summary = json.load(handle)
         recorded = str((summary.get("source_runs") or {}).get("wavelet_generation_dir") or "").strip()
     if explicit:
-        wavelet_dir = resolve_relative_path(explicit, root=REPO_ROOT)
-        if recorded and wavelet_dir.resolve() != resolve_relative_path(recorded, root=REPO_ROOT).resolve():
-            raise ValueError("R1 wavelet_generation_dir override does not match R0 summary source_runs.")
+        wavelet_dir = resolve_source_run(
+            explicit,
+            output_root=output_root,
+            prefix="wavelet_generation",
+            required_files=["selected_wavelet.csv", "selected_wavelet_summary.json"],
+            root=REPO_ROOT,
+            label="wavelet_generation",
+        )
+        if recorded:
+            assert_same_path(
+                wavelet_dir,
+                recorded,
+                root=REPO_ROOT,
+                message="R1 wavelet_generation_dir override does not match R0 summary source_runs.",
+            )
         return wavelet_dir
     if recorded:
-        return resolve_relative_path(recorded, root=REPO_ROOT)
-    return latest_checked_run(
-        output_root,
-        "wavelet_generation",
+        return resolve_source_run(
+            recorded,
+            output_root=output_root,
+            prefix="wavelet_generation",
+            required_files=["selected_wavelet.csv", "selected_wavelet_summary.json"],
+            root=REPO_ROOT,
+            label="wavelet_generation",
+        )
+    return resolve_source_run(
+        None,
+        output_root=output_root,
+        prefix="wavelet_generation",
         required_files=["selected_wavelet.csv", "selected_wavelet_summary.json"],
+        root=REPO_ROOT,
+        label="wavelet_generation",
     )
 
 
@@ -543,16 +559,38 @@ def _resolve_well_auto_tie_dir(
         or ""
     ).strip()
     if explicit:
-        well_auto_tie_dir = resolve_relative_path(explicit, root=REPO_ROOT)
-        if recorded and well_auto_tie_dir.resolve() != resolve_relative_path(recorded, root=REPO_ROOT).resolve():
-            raise ValueError("R1 well_qc.well_auto_tie_dir override does not match R0/LFM source_runs.")
+        well_auto_tie_dir = resolve_source_run(
+            explicit,
+            output_root=output_root,
+            prefix="well_auto_tie",
+            required_files=["well_tie_metrics.csv", "well_tie_plan.csv", "wavelet_inventory.csv"],
+            root=REPO_ROOT,
+            label="well_auto_tie",
+        )
+        if recorded:
+            assert_same_path(
+                well_auto_tie_dir,
+                recorded,
+                root=REPO_ROOT,
+                message="R1 well_qc.well_auto_tie_dir override does not match R0/LFM source_runs.",
+            )
         return well_auto_tie_dir
     if recorded:
-        return resolve_relative_path(recorded, root=REPO_ROOT)
-    return latest_checked_run(
-        output_root,
-        "well_auto_tie",
+        return resolve_source_run(
+            recorded,
+            output_root=output_root,
+            prefix="well_auto_tie",
+            required_files=["well_tie_metrics.csv", "well_tie_plan.csv", "wavelet_inventory.csv"],
+            root=REPO_ROOT,
+            label="well_auto_tie",
+        )
+    return resolve_source_run(
+        None,
+        output_root=output_root,
+        prefix="well_auto_tie",
         required_files=["well_tie_metrics.csv", "well_tie_plan.csv", "wavelet_inventory.csv"],
+        root=REPO_ROOT,
+        label="well_auto_tie",
     )
 
 
@@ -567,18 +605,39 @@ def _resolve_well_inventory_file(
     lfm_summary = _recorded_lfm_summary_from_zero_shot(zero_shot_summary)
     recorded = str((lfm_summary.get("inputs") or {}).get("well_inventory_file") or "").strip()
     if explicit:
-        inventory_file = resolve_relative_path(explicit, root=REPO_ROOT)
-        if recorded and inventory_file.resolve() != resolve_relative_path(recorded, root=REPO_ROOT).resolve():
-            raise ValueError("R1 well_qc.well_inventory_file override does not match LFM summary inputs.")
+        inventory_file = resolve_source_file_from_run(
+            explicit,
+            output_root=output_root,
+            prefix="well_inventory",
+            file_name="well_inventory.csv",
+            root=REPO_ROOT,
+            label="well_inventory_file",
+        )
+        if recorded:
+            assert_same_path(
+                inventory_file,
+                recorded,
+                root=REPO_ROOT,
+                message="R1 well_qc.well_inventory_file override does not match LFM summary inputs.",
+            )
         return inventory_file
     if recorded:
-        return resolve_relative_path(recorded, root=REPO_ROOT)
-    inventory_dir = latest_checked_run(
-        output_root,
-        "well_inventory",
-        required_files=["well_inventory.csv"],
+        return resolve_source_file_from_run(
+            recorded,
+            output_root=output_root,
+            prefix="well_inventory",
+            file_name="well_inventory.csv",
+            root=REPO_ROOT,
+            label="well_inventory_file",
+        )
+    return resolve_source_file_from_run(
+        None,
+        output_root=output_root,
+        prefix="well_inventory",
+        file_name="well_inventory.csv",
+        root=REPO_ROOT,
+        label="well_inventory_file",
     )
-    return inventory_dir / "well_inventory.csv"
 
 
 def _prepare_well_qc_sources(

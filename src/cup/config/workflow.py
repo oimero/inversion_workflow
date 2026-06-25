@@ -6,6 +6,30 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
+def merge_dict_defaults(config: dict[str, Any], key: str, defaults: dict[str, Any]) -> None:
+    """Merge *defaults* into ``config[key]`` in place."""
+    value = config.get(key)
+    if value is None:
+        config[key] = dict(defaults)
+        return
+    if not isinstance(value, dict):
+        raise ValueError(f"{key} must be a mapping, got {type(value).__name__}.")
+    merged = dict(defaults)
+    merged.update(value)
+    config[key] = merged
+
+
+def deep_merge_dict(base: Mapping[str, Any], updates: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a new dict that recursively merges *updates* into *base*."""
+    out = {key: (dict(value) if isinstance(value, dict) else value) for key, value in base.items()}
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge_dict(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
 def _mapping(value: Any, *, path: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{path} must be a mapping.")

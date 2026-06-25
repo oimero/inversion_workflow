@@ -63,6 +63,7 @@ nav:
       - API 总览: api/index.md
       - cup:
           - 命名空间总览: api/cup/index.md
+          - cup.config: api/cup/config.md
           - cup.petrel: api/cup/petrel.md
           - cup.seismic: api/cup/seismic.md
           - cup.well: api/cup/well.md

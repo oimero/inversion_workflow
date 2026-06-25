@@ -26,7 +26,8 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.seismic.real_field_lfm import parse_real_field_lfm_config, run_real_field_lfm
 from cup.config.workflow import TimeWorkflowConfig
-from cup.utils.io import latest_checked_run, load_yaml_config, repo_relative_path, resolve_relative_path
+from cup.config.sources import resolve_source_file_from_run, resolve_source_run
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path
 
 
 DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")
@@ -57,20 +58,28 @@ def _prepare_real_field_lfm_config(raw: dict, workflow: TimeWorkflowConfig) -> d
     root = dict(prepared.get("real_field_lfm") or {})
     source_runs = dict(root.get("source_runs") or {})
     output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
-    if not source_runs.get("well_auto_tie_dir"):
-        source_runs["well_auto_tie_dir"] = latest_checked_run(
-            output_root,
-            "well_auto_tie",
+    source_runs["well_auto_tie_dir"] = repo_relative_path(
+        resolve_source_run(
+            source_runs.get("well_auto_tie_dir"),
+            output_root=output_root,
+            prefix="well_auto_tie",
             required_files=["well_tie_metrics.csv", "well_tie_plan.csv", "wavelet_inventory.csv"],
-        )
-        source_runs["well_auto_tie_dir"] = repo_relative_path(source_runs["well_auto_tie_dir"], root=REPO_ROOT)
-    if not root.get("well_inventory_file"):
-        inventory_dir = latest_checked_run(
-            output_root,
-            "well_inventory",
-            required_files=["well_inventory.csv"],
-        )
-        root["well_inventory_file"] = repo_relative_path(inventory_dir / "well_inventory.csv", root=REPO_ROOT)
+            root=REPO_ROOT,
+            label="well_auto_tie",
+        ),
+        root=REPO_ROOT,
+    )
+    root["well_inventory_file"] = repo_relative_path(
+        resolve_source_file_from_run(
+            root.get("well_inventory_file"),
+            output_root=output_root,
+            prefix="well_inventory",
+            file_name="well_inventory.csv",
+            root=REPO_ROOT,
+            label="well_inventory_file",
+        ),
+        root=REPO_ROOT,
+    )
     root["source_runs"] = source_runs
     prepared["real_field_lfm"] = root
     return prepared

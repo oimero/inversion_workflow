@@ -5,5 +5,6 @@
 ## 子模块
 
 - `cup.petrel`
+- `cup.config`
 - `cup.seismic`
 - `cup.well`

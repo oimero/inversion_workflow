@@ -24,7 +24,7 @@
 
 - CLI 只暴露单次运行需要覆盖的参数。
 - 顶层工区事实通过 `cup.config.workflow.TimeWorkflowConfig` 解析。
-- 步骤默认配置使用 `cup.utils.config.merge_dict_defaults`。
+- 步骤默认配置使用 `cup.config.merge_dict_defaults`。
 - 路径使用 `cup.utils.io` 中的解析和 repo-relative 工具。
 - 带采样轴、单位或 domain 的井曲线和地震道优先使用 `wtie.processing.grid`
   对象或项目 dataclass，不在脚本中长期传递裸 `np.ndarray`。
@@ -37,7 +37,8 @@
 | 需求 | 模块 | 入口 |
 |------|------|------|
 | 共享配置 | `cup.config.workflow` | `TimeWorkflowConfig.from_mapping` |
-| 配置默认值合并 | `cup.utils.config` | `merge_dict_defaults` |
+| 配置默认值合并 | `cup.config` | `merge_dict_defaults` |
+| 上游产物衔接 | `cup.config.sources` | `resolve_source_run` / `resolve_source_file_from_run` |
 | YAML、JSON 与路径 | `cup.utils.io` | `load_yaml_config` / `write_json` / `resolve_relative_path` / `repo_relative_path` |
 | 类型转换 | `cup.utils.coerce` | `as_bool` / `optional_float` |
 | 掩码连续区间 | `cup.utils.masks` | `true_runs` |

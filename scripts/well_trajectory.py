@@ -16,7 +16,6 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import re
 import sys
 from typing import Any, Sequence
 
@@ -34,9 +33,9 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.config.workflow import TimeWorkflowConfig
+from cup.config.workflow import TimeWorkflowConfig, merge_dict_defaults
+from cup.config.sources import resolve_source_run
 from cup.utils.coerce import as_bool, optional_float
-from cup.utils.config import merge_dict_defaults
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.well.assets import build_file_lookup, normalize_well_name
 from cup.well.trajectory import WellTrajectory, trajectory_summary, z_tvd_residual_m
@@ -99,23 +98,18 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     return output_root / f"well_trajectory_{timestamp}"
 
 
-def _discover_latest_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
+def _resolve_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
     source_runs = dict(script_cfg.get("source_runs") or {})
-    inventory_dir = source_runs.get("well_inventory_dir")
-    if inventory_dir is not None:
-        return _resolve_repo_path(inventory_dir) / "well_inventory.csv"
-
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
-    all_candidates = [path for path in output_root.glob("well_inventory_*/well_inventory.csv") if path.is_file()]
-    timestamped = [
-        path
-        for path in all_candidates
-        if re.fullmatch(r"well_inventory_\d{8}_\d{6}", path.parent.name)
-    ]
-    candidates = sorted(timestamped or all_candidates, key=lambda path: path.parent.name)
-    if not candidates:
-        raise FileNotFoundError("No well_inventory_*/well_inventory.csv file found under output_root.")
-    return candidates[-1]
+    inventory_dir = resolve_source_run(
+        source_runs.get("well_inventory_dir"),
+        output_root=output_root,
+        prefix="well_inventory",
+        required_files=["well_inventory.csv"],
+        root=REPO_ROOT,
+        label="well_inventory",
+    )
+    return inventory_dir / "well_inventory.csv"
 
 
 # =============================================================================
@@ -513,7 +507,7 @@ def main() -> None:
     output_dir = _resolve_output_dir(args, cfg)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    inventory_file = _discover_latest_inventory_file(cfg, script_cfg)
+    inventory_file = _resolve_inventory_file(cfg, script_cfg)
     if not inventory_file.exists():
         raise FileNotFoundError(f"well_inventory.csv does not exist: {inventory_file}")
     inventory_df = pd.read_csv(inventory_file)

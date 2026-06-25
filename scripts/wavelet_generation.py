@@ -33,8 +33,8 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.utils.config import merge_dict_defaults
-from cup.config.workflow import TimeWorkflowConfig
+from cup.config.workflow import TimeWorkflowConfig, merge_dict_defaults
+from cup.config.sources import resolve_source_run
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.statistics import aggregate_cluster_then_global
 from cup.seismic.viz import plot_well_waveform_qc
@@ -153,30 +153,16 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     return output_root / f"wavelet_generation_{timestamp}"
 
 
-def _discover_latest_dir(cfg: dict[str, Any], prefix: str, required_files: Sequence[str]) -> Path:
-    output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
-    candidates = [
-        path
-        for path in output_root.glob(f"{prefix}_*")
-        if path.is_dir() and all((path / required_file).exists() for required_file in required_files)
-    ]
-    if not candidates:
-        raise FileNotFoundError(
-            f"No {prefix}_* output directory containing {list(required_files)} found under {output_root}."
-        )
-    return sorted(candidates, key=lambda p: (p.stat().st_mtime, p.name))[-1]
-
-
 def _resolve_source_dirs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str, Path]:
     source_runs = dict(script_cfg.get("source_runs") or {})
-    auto_tie_dir = (
-        _resolve_repo_path(source_runs["well_auto_tie_dir"])
-        if source_runs.get("well_auto_tie_dir") is not None
-        else _discover_latest_dir(
-            cfg,
-            "well_auto_tie",
-            ["well_tie_plan.csv", "well_tie_metrics.csv", "wavelet_inventory.csv"],
-        )
+    output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
+    auto_tie_dir = resolve_source_run(
+        source_runs.get("well_auto_tie_dir"),
+        output_root=output_root,
+        prefix="well_auto_tie",
+        required_files=["well_tie_plan.csv", "well_tie_metrics.csv", "wavelet_inventory.csv"],
+        root=REPO_ROOT,
+        label="well_auto_tie",
     )
     return {"auto_tie_dir": auto_tie_dir}
 

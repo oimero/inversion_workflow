@@ -31,6 +31,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.config.workflow import TimeWorkflowConfig
+from cup.config.sources import resolve_source_run
 from cup.utils.coerce import as_bool
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.well.assets import build_file_lookup, normalize_well_name
@@ -103,18 +104,18 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     return output_root / f"well_screen_{timestamp}"
 
 
-def _discover_latest_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
+def _resolve_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
     source_runs = dict(script_cfg.get("source_runs") or {})
-    if source_runs.get("well_inventory_dir") is not None:
-        return _resolve_repo_path(source_runs["well_inventory_dir"]) / "well_inventory.csv"
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
-    candidates = sorted(output_root.glob("well_inventory_*/well_inventory.csv"))
-    if not candidates:
-        raise FileNotFoundError(
-            "well_screen source run is not configured and no "
-            "well_inventory_*/well_inventory.csv file was found under output_root."
-        )
-    return candidates[-1]
+    inventory_dir = resolve_source_run(
+        source_runs.get("well_inventory_dir"),
+        output_root=output_root,
+        prefix="well_inventory",
+        required_files=["well_inventory.csv"],
+        root=REPO_ROOT,
+        label="well_inventory",
+    )
+    return inventory_dir / "well_inventory.csv"
 
 
 def _load_curve_schema(schema_file: str | Path | None) -> Mapping[str, Sequence[str]]:
@@ -451,7 +452,7 @@ def main() -> None:
     }
 
     data_root = _resolve_repo_path(workflow.data_root)
-    inventory_file = _discover_latest_inventory_file(cfg, script_cfg)
+    inventory_file = _resolve_inventory_file(cfg, script_cfg)
     las_dir = _resolve_data_path(workflow.assets.las_dir, data_root=data_root)
     output_dir = _resolve_output_dir(args, cfg)
     schema = _load_curve_schema(script_cfg["classification"].get("curve_schema_file"))

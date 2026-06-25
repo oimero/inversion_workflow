@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
-import json
 from pathlib import Path
 import sys
 
@@ -29,7 +28,8 @@ from cup.synthetic.workflow import (
     run_generation,
 )
 from cup.config.workflow import TimeWorkflowConfig
-from cup.utils.io import latest_checked_run, load_yaml_config, repo_relative_path, resolve_relative_path
+from cup.config.sources import load_summary, resolve_source_run
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,14 +86,17 @@ def _prepare_synthoseis_config(raw: dict, workflow: TimeWorkflowConfig) -> dict:
     source_runs = dict(root.get("source_runs") or {})
     if not source_runs:
         output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
-        obs_dir = latest_checked_run(
-            output_root,
-            "forward_observability",
+        obs_dir = resolve_source_run(
+            None,
+            output_root=output_root,
+            prefix="forward_observability",
             required_files=["run_summary.json", "frequency_evidence_bands.csv", "well_frequency_sensitivity.csv"],
-            validator=_validate_forward_observability_run,
+            root=REPO_ROOT,
+            label="forward_observability",
+            summary_file="run_summary.json",
+            schema_version="forward_observability_v1",
         )
-        with (obs_dir / "run_summary.json").open("r", encoding="utf-8") as handle:
-            summary = json.load(handle)
+        summary = load_summary(obs_dir / "run_summary.json", schema_version="forward_observability_v1")
         recorded = dict(summary.get("source_runs") or {})
         source_runs = {
             "forward_observability_dir": repo_relative_path(obs_dir, root=REPO_ROOT),
@@ -104,15 +107,6 @@ def _prepare_synthoseis_config(raw: dict, workflow: TimeWorkflowConfig) -> dict:
     root["source_runs"] = source_runs
     prepared["synthoseis_lite"] = root
     return prepared
-
-
-def _validate_forward_observability_run(path: Path) -> None:
-    import json
-
-    with (path / "run_summary.json").open("r", encoding="utf-8") as handle:
-        summary = json.load(handle)
-    if str(summary.get("schema_version") or "") != "forward_observability_v1":
-        raise ValueError("run_summary.json schema_version is not forward_observability_v1")
 
 
 def main() -> None:

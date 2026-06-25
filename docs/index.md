@@ -1,7 +1,35 @@
 # 反演工作流
 
-当前稳定时间域工作流截止第五步。旧后半程实现已经从活动树移除，
-后续反演从研究闸门重新开始。
+```mermaid
+flowchart TB
+    subgraph prod["稳定生产链"]
+        S1["01 · well_inventory"] --> S2["02 · well_screen"] --> S3["03 · well_preprocess"] --> S4["04 · well_auto_tie"] --> S5["05 · wavelet_generation"]
+        WT["旁路 · well_trajectory"] -.-> S4
+    end
 
-开始后续工作前，请先阅读[时间域反演重置](concepts/time-domain-inversion-reset.md)。
-该文档是重构原则、研究顺序和清理边界的唯一权威入口。
+    prod --> S6["06 · forward_observability"]
+
+    S1 -.-> S7["07 · real_field_lfm"]
+    S4 -.-> S7
+
+    S6 --> SL["旁路 · synthoseis_lite"]
+    SL --> GV["旁路 · ginn_v2"]
+
+    S5 -.-> R0["08 R0 · real_field_zero_shot"]
+    S7 --> R0
+    GV --> R0
+
+    R0 --> R1["08 R1 · real_field_forward_diagnostic"]
+```
+
+## 配置文件
+
+| 步骤 | 配置文件 |
+|------|---------|
+| 01–05 · well_trajectory | `experiments/common/common.yaml` |
+| 06 · forward_observability | `experiments/common/common.yaml` |
+| 旁路 · synthoseis_lite | `experiments/synthoseis_lite/synthoseis_lite.yaml` |
+| 旁路 · ginn_v2 | `experiments/ginn_v2/train.yaml` |
+| 07 · real_field_lfm | `experiments/common/common.yaml` |
+| 08 R0 · real_field_zero_shot | `experiments/common/common.yaml` |
+| 08 R1 · real_field_forward_diagnostic | `experiments/common/common.yaml` |

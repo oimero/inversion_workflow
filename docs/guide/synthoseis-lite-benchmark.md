@@ -102,11 +102,11 @@ python scripts/evaluate_synthoseis_lite.py \
 # 以及 synthoseis_lite 段：
 
 synthoseis_lite:
-  global_seed: 20250615
+  global_seed: 0
 
   # source_runs 可留空 —— 自动发现最新第六步产物并反查第三/四/五步来源
   source_runs:
-    forward_observability_dir: scripts/output/forward_observability_20250601
+    forward_observability_dir: scripts/output/forward_observability_<timestamp>
 
   # sections 必填，定义合成剖面的几何路径
   sections:
@@ -190,9 +190,9 @@ synthoseis_lite:
 
 target_interval:
   horizons:
-    - {name: H3-1, file: interpre/H3-1}
-    - {name: H5-1, file: interpre/H5-1}
-    - {name: H7-1, file: interpre/H7-1}
+    - {name: top_a, file: interpre/top_a}
+    - {name: middle_b, file: interpre/middle_b}
+    - {name: base_c, file: interpre/base_c}
 ```
 
 ### `global_seed`

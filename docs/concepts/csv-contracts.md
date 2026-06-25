@@ -1,7 +1,6 @@
 # 核心 CSV 契约
 
-这些 CSV 是当前稳定工作流的跨脚本契约。稳定生产链截止第五步；
-第五步产物暂时没有正式下游消费者。
+这些 CSV 是当前工作流的跨脚本契约，覆盖主链第一至八步及两个旁路。
 
 下游读取上游结果时必须按本文解释字段语义，不得凭字段名猜测。
 标题中标记“诊断”的 CSV 只供人工审阅。
@@ -149,8 +148,7 @@
 
 ## 05 · wavelet_generation.py
 
-第五步是当前稳定工作流终点。以下产物由研究入口
-`forward_observability.py` 显式消费；该入口不是编号生产步骤。
+第五步产物由第六步 `forward_observability.py` 消费。以下表均由第六步读取。
 
 ### `selected_wavelet.csv`
 
@@ -195,10 +193,9 @@
 | `spatial_cluster_id` | 跨井证据去偏使用的空间簇 |
 | `spatial_cluster_size` | 当前簇井数，仅作 QC |
 
-## Research Gate · forward_observability.py
+## 06 · forward_observability.py
 
-所有表使用 schema `forward_observability_v1`。运行必须显式指定第三、四、五步目录，
-不搜索 latest，也不自动回退。
+所有表使用 schema `forward_observability_v1`。上游来源可从配置显式指定，也可自动发现最新合格产物。
 
 ### `operator_transfer.csv`
 
@@ -247,7 +244,7 @@ nominal-only 进入空间聚合。
 - `recommended_experiment_ranges.json`：仅用于 `synthoseis-lite` 的实验区间。
 - `run_summary.json`：完整来源、参数、拒绝统计、warning 和建议区间。
 
-## Research Gate · synthoseis_lite.py (calibrate)
+## 旁路 · synthoseis_lite.py (calibrate)
 
 校准阶段冻结一份可从井数据复现的阻抗统计模型。所有输出使用 schema
 `synthoseis_lite_impedance_calibration_v1`。
@@ -298,7 +295,7 @@ nominal-only 进入空间聚合。
 | `probability` | 层级化估计的转移概率 |
 | `support` | `direct` / `mixed` / `forbidden` |
 
-## Research Gate · synthoseis_lite.py (generate)
+## 旁路 · synthoseis_lite.py (generate)
 
 生成阶段冻结一个可复现的二维声阻抗合成基准。master schema 为 `synthoseis_lite_v1`。
 
@@ -343,7 +340,7 @@ HDF5 文件，每个 sample 为一个 group，包含 `model_target_log_ai`、
 - `generation_qc.csv`：每次生成尝试的 QC 指标和拒绝原因。
 - `section_geometry_qc.csv`：场条件截面的横向层位支撑状态。
 
-## Research Gate · evaluate_synthoseis_lite.py
+## 旁路 · evaluate_synthoseis_lite.py
 
 评估阶段产出模型无关的基线报告卡。schema 为 `synthoseis_lite_report_v1`。
 

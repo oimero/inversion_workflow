@@ -88,9 +88,10 @@ train:
 
   # 设备与种子
   device: auto
-  seed: 20260617
+  seed: 0
 
-  # 物理损失（仅 patch_2d_with_physics_loss 模型有效）
+  # 物理正演辅助损失。设为 >0 时仅对 base 样本生效。
+  # 支持模型：patch_2d_with_physics_loss、trace_1d_dilated_tcn_mismatch_training
   lambda_physics: 0.0
 ```
 
@@ -100,15 +101,20 @@ train:
 
 ### `model_id`
 
-可选模型架构列表：
+可选模型架构（共 10 个注册 ID，按族分组）：
 
-| 架构 | 说明 |
-|------|------|
-| `trace_1d_dilated_tcn_mismatch_training` | 单道时序卷积，不含邻道信息 |
-| `trace_1d_tcn_lateral_mixer_mismatch_training` | 单道时序卷积 + 邻道横向混合 |
-| `patch_2d_supervised` | 二维块监督学习基线 |
-| `patch_2d_with_physics_loss` | 二维块 + 物理正演损失 |
-| `patch_2d_mismatch_training` | 二维块 + 不匹配对抗训练 |
+| 族 | 架构 ID | 说明 |
+|------|------|------|
+| 一维基础 | `trace_1d` | 单道 TCN，仅用 base 样本训练 |
+| | `trace_1d_mismatch_training` | 单道 TCN，加入失配样本训练 |
+| 一维膨胀 | `trace_1d_dilated_tcn` | 膨胀时间卷积，更长感受野，仅 base |
+| | `trace_1d_dilated_tcn_mismatch_training` | 膨胀时间卷积 + 失配训练，也可开启物理损失 |
+| 横向混合 | `trace_1d_tcn_lateral_mixer_k1_mismatch_training` | 膨胀 TCN + 邻道横向混合（核宽=1） |
+| | `trace_1d_tcn_lateral_mixer_mismatch_training` | 膨胀 TCN + 邻道横向混合（核宽=3，默认） |
+| | `trace_1d_tcn_lateral_mixer_k5_mismatch_training` | 膨胀 TCN + 邻道横向混合（核宽=5） |
+| 二维 | `patch_2d_supervised` | 二维块监督学习基线，仅 base |
+| | `patch_2d_mismatch_training` | 二维块 + 失配对抗训练 |
+| | `patch_2d_with_physics_loss` | 二维块 + 物理正演辅助损失 |
 
 ### `model_role`
 

@@ -49,9 +49,9 @@ forward_observability:
 # --- 可选（source_runs 缺失时自动发现最新合格产物）---
 forward_observability:
   source_runs:
-    wavelet_generation_dir: scripts/output/wavelet_generation_20250601_120000
-    well_auto_tie_dir: scripts/output/well_auto_tie_20250601_100000
-    well_preprocess_dir: scripts/output/well_preprocess_20250601_080000
+    wavelet_generation_dir: scripts/output/wavelet_generation_<timestamp>
+    well_auto_tie_dir: scripts/output/well_auto_tie_<timestamp>
+    well_preprocess_dir: scripts/output/well_preprocess_<timestamp>
 
 # --- 可选（有默认值）---
 forward_observability:
@@ -76,9 +76,9 @@ forward_observability:
 # 层位从顶层 target_interval.horizons 读取，不在 forward_observability 下配置：
 target_interval:
   horizons:
-    - {name: H3-1, file: interpre/H3-1}
-    - {name: H5-1, file: interpre/H5-1}
-    - {name: H7-1, file: interpre/H7-1}
+    - {name: top_a, file: interpre/top_a}
+    - {name: middle_b, file: interpre/middle_b}
+    - {name: base_c, file: interpre/base_c}
 ```
 
 ### `source_runs`

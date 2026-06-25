@@ -7,7 +7,7 @@ deviated-well routing without changing the LAS screening/preprocess chain.
 Usage::
 
     python scripts/well_trajectory.py
-    python scripts/well_trajectory.py --config experiments/common.yaml
+    python scripts/well_trajectory.py --config experiments/common/common.yaml
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("experiments/common.yaml"),
+        default=Path("experiments/common/common.yaml"),
         help="Time-domain common config YAML.",
     )
     parser.add_argument(

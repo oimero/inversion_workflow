@@ -1,13 +1,13 @@
 """Build the real-field R0 log(AI) LFM input.
 
 This is a research-input preparation script, not a restored workflow step.  It
-requires explicit source paths in ``real_field_lfm`` and writes
+discovers upstream workflow outputs by default and writes
 ``real_field_lfm_v1`` artifacts for R0 zero-shot prediction.
 
 Usage::
 
     python scripts/real_field_lfm.py
-    python scripts/real_field_lfm.py --config experiments/common.yaml
+    python scripts/real_field_lfm.py --config experiments/common/common.yaml
 """
 
 from __future__ import annotations
@@ -26,10 +26,10 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.seismic.real_field_lfm import parse_real_field_lfm_config, run_real_field_lfm
 from cup.config.workflow import TimeWorkflowConfig
-from cup.utils.io import load_yaml_config, resolve_relative_path
+from cup.utils.io import latest_checked_run, load_yaml_config, repo_relative_path, resolve_relative_path
 
 
-DEFAULT_COMMON_CONFIG = Path("experiments/common.yaml")
+DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,21 +37,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("experiments/research/real_field_r0_r1.yaml"),
+        default=DEFAULT_COMMON_CONFIG,
         help="YAML config containing a real_field_lfm section.",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
     return parser.parse_args()
-
-
-def _load_config_with_common(path: Path) -> tuple[Path, dict]:
-    config_path = resolve_relative_path(path, root=REPO_ROOT)
-    common_path = resolve_relative_path(DEFAULT_COMMON_CONFIG, root=REPO_ROOT)
-    common = load_yaml_config(common_path) if common_path.is_file() else {}
-    specific = load_yaml_config(config_path)
-    merged = dict(common)
-    merged.update(specific)
-    return config_path, merged
 
 
 def _output_dir(args: argparse.Namespace, workflow: TimeWorkflowConfig) -> Path:
@@ -62,11 +52,37 @@ def _output_dir(args: argparse.Namespace, workflow: TimeWorkflowConfig) -> Path:
     return root / f"real_field_lfm_{timestamp}"
 
 
+def _prepare_real_field_lfm_config(raw: dict, workflow: TimeWorkflowConfig) -> dict:
+    prepared = dict(raw)
+    root = dict(prepared.get("real_field_lfm") or {})
+    source_runs = dict(root.get("source_runs") or {})
+    output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
+    if not source_runs.get("well_auto_tie_dir"):
+        source_runs["well_auto_tie_dir"] = latest_checked_run(
+            output_root,
+            "well_auto_tie",
+            required_files=["well_tie_metrics.csv", "well_tie_plan.csv", "wavelet_inventory.csv"],
+        )
+        source_runs["well_auto_tie_dir"] = repo_relative_path(source_runs["well_auto_tie_dir"], root=REPO_ROOT)
+    if not root.get("well_inventory_file"):
+        inventory_dir = latest_checked_run(
+            output_root,
+            "well_inventory",
+            required_files=["well_inventory.csv"],
+        )
+        root["well_inventory_file"] = repo_relative_path(inventory_dir / "well_inventory.csv", root=REPO_ROOT)
+    root["source_runs"] = source_runs
+    prepared["real_field_lfm"] = root
+    return prepared
+
+
 def main() -> None:
     args = parse_args()
-    config_path, raw = _load_config_with_common(args.config)
+    config_path = resolve_relative_path(args.config, root=REPO_ROOT)
+    raw = load_yaml_config(config_path)
     workflow = TimeWorkflowConfig.from_mapping(raw)
-    script_cfg = parse_real_field_lfm_config(raw)
+    prepared = _prepare_real_field_lfm_config(raw, workflow)
+    script_cfg = parse_real_field_lfm_config(prepared)
     output_dir = _output_dir(args, workflow)
     summary = run_real_field_lfm(
         config=script_cfg,

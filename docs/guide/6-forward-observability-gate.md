@@ -1,4 +1,4 @@
-# 正演可观测性分析
+# 06 正演可观测性分析
 
 `forward_observability.py` 是稳定生产链（第一至五步）之后的第一个研究闸门。它回答一个具体问题：**在当前全局子波、井震匹配和目标时窗下，某个频率的波阻抗扰动能否在地震上产生可辨识的响应。** 它的输出只用于设计 `synthoseis-lite` 的恢复实验和压力测试，不进入任何反演模型。
 
@@ -13,7 +13,7 @@ python scripts/forward_observability.py --output-dir /tmp/obs_test
 python scripts/forward_observability.py --well W1  # 单井调试
 ```
 
-不带参数运行时，脚本读取 `experiments/common.yaml`，在 `scripts/output/forward_observability_<timestamp>/` 下写出分析结果。
+不带参数运行时，脚本读取 `experiments/common/common.yaml`，自动发现最新合格的第三、四、五步产物，并在 `scripts/output/forward_observability_<timestamp>/` 下写出分析结果。
 
 ---
 
@@ -39,52 +39,63 @@ python scripts/forward_observability.py --well W1  # 单井调试
 ## 配置参考
 
 ```yaml
+# 以下所有字段都写在 experiments/common/common.yaml 的顶层或 forward_observability 段下。
+
+# --- 必填 ---
+forward_observability:
+  frequency:
+    max_hz: 80.0                                  # 必填
+
+# --- 可选（source_runs 缺失时自动发现最新合格产物）---
 forward_observability:
   source_runs:
-    wavelet_generation_dir: experiments/output/wavelet_generation_20250601_120000
-    well_auto_tie_dir: experiments/output/well_auto_tie_20250601_100000
-    well_preprocess_dir: experiments/output/well_preprocess_20250601_080000
+    wavelet_generation_dir: scripts/output/wavelet_generation_20250601_120000
+    well_auto_tie_dir: scripts/output/well_auto_tie_20250601_100000
+    well_preprocess_dir: scripts/output/well_preprocess_20250601_080000
 
-  horizons:
-    ordered_names: [H1, H2, H3, H4]
-
+# --- 可选（有默认值）---
+forward_observability:
   frequency:
-    start_hz: 5.0
-    step_hz: 5.0
-    max_hz: 80.0
-
+    start_hz: 5.0                                 # 默认 5.0
+    step_hz: 5.0                                  # 默认 5.0
   perturbation:
-    epsilon_log_ai: 0.001
-    tukey_alpha: 0.5
-    phase_degrees: 10.0
-    fractional_shift_samples: 0.5
-    max_basis_condition_number: 1000000.0
-
+    epsilon_log_ai: 0.001                         # 默认 0.001
+    tukey_alpha: 0.5                              # 默认 0.5
+    phase_degrees: 10.0                           # 默认 10.0
+    fractional_shift_samples: 0.5                 # 默认 0.5
+    max_basis_condition_number: 1000000.0         # 默认 1e6
   thresholds:
-    min_valid_samples: 50
-    min_cycles: 2.0
-    min_wells: 5
-    min_clusters: 3
-    min_synthetic_rms: 1.0e-06
-    required_artificial_scenarios: 3
-    max_short_log_gap_s: 0.010
+    min_valid_samples: 50                         # 默认 50
+    min_cycles: 2.0                               # 默认 2.0
+    min_wells: 5                                  # 默认 5
+    min_clusters: 3                               # 默认 3
+    min_synthetic_rms: 1.0e-06                    # 默认 1e-6
+    required_artificial_scenarios: 3              # 默认 3
+    max_short_log_gap_s: 0.010                    # 默认 0.01
+
+# 层位从顶层 target_interval.horizons 读取，不在 forward_observability 下配置：
+target_interval:
+  horizons:
+    - {name: H3-1, file: interpre/H3-1}
+    - {name: H5-1, file: interpre/H5-1}
+    - {name: H7-1, file: interpre/H7-1}
 ```
 
 ### `source_runs`
 
-三个目录必须**显式配置**，脚本不做任何自动发现或回退。每个目录要求包含特定文件——缺失任一文件直接报错。
+三个目录均可留空——脚本默认从 `output_root` 下自动发现最新合格产物。显式填写时优先使用填写的路径，用于复现特定 run。每个目录要求包含特定文件——缺失任一文件直接报错。
 
-### `horizons.ordered_names`
+### `target_interval.horizons`
 
-从浅到深排列的层位名列表，长度至少为 2。脚本用第一个和最后一个层位构建 `whole_target` 全目标窗口，用相邻层位对构建 `adjacent_zone` 相邻区域窗口。N 个层位产生 1 个全目标窗口和 N-1 个邻区窗口。层位名大小写不敏感，但不允许重复。
+从浅到深排列的层位列表，长度至少为 2。脚本用第一个和最后一个层位构建 `whole_target` 全目标窗口，用相邻层位对构建 `adjacent_zone` 相邻区域窗口。N 个层位产生 1 个全目标窗口和 N-1 个邻区窗口。层位名大小写不敏感，但不允许重复。
 
 ### `frequency`
 
-显式赫兹网格。`max_hz` 必须显式配置，脚本内部还会用 0.45 倍奈奎斯特频率（`0.45 * 0.5 / dt`）做硬上限，取两者最小值。三个值都必须是正有限浮点数。
+`max_hz` 必须显式配置，脚本内部还会用 0.45 倍奈奎斯特频率（`0.45 * 0.5 / dt`）做硬上限，取两者最小值。`start_hz` 和 `step_hz` 有默认值 5.0，可按需覆盖。
 
 ### `perturbation`
 
-控制人工子波扰动的参数，用于评估算子对子波不确定性的敏感度。
+控制人工子波扰动的参数，用于评估算子对子波不确定性的敏感度。全部有默认值，可不配置。
 
 #### `epsilon_log_ai`
 

@@ -55,7 +55,7 @@ well_preprocess:
     enabled: true
     lower_quantile: 0.01
     upper_quantile: 0.99
-    range_override_file: experiments/well_preprocess_ranges.yaml
+    range_override_file: experiments/common/well_preprocess_ranges.yaml
     min_samples_for_auto_threshold: 1000
 
   usable_thresholds:

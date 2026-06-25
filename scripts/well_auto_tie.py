@@ -7,7 +7,7 @@ default and leaves later routes as explicit skipped/rejected plan rows.
 Usage::
 
     python scripts/well_auto_tie.py
-    python scripts/well_auto_tie.py --config experiments/common.yaml
+    python scripts/well_auto_tie.py --config experiments/common/common.yaml
 """
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ from wtie.processing import grid
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("experiments/common.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("experiments/common/common.yaml"))
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--well", type=str, default=None, help="Optional single well execution filter.")
     return parser.parse_args()

@@ -1,8 +1,8 @@
 """Run the time-domain forward-observability research gate.
 
-All third-, fourth-, and fifth-step run directories must be configured
-explicitly.  The script never discovers a latest run or falls back to another
-well artifact.
+Third-, fourth-, and fifth-step run directories are discovered from
+``output_root`` by default.  Set ``forward_observability.source_runs`` in the
+common config to pin a reproducible run.
 
 Usage::
 
@@ -53,6 +53,7 @@ from cup.seismic.wavelet import (
 )
 from cup.config.workflow import TimeWorkflowConfig
 from cup.utils.io import (
+    latest_checked_run,
     load_yaml_config,
     repo_relative_path,
     resolve_artifact_path,
@@ -68,7 +69,7 @@ from cup.well.tie import load_saved_seismic_trace_csv
 
 
 SCHEMA_VERSION = "forward_observability_v1"
-DEFAULT_COMMON_CONFIG = Path("experiments/common.yaml")
+DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,22 +77,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("experiments/research/forward_observability.yaml"),
-        help="YAML config containing an explicit forward_observability section.",
+        default=DEFAULT_COMMON_CONFIG,
+        help="YAML config containing the main workflow configuration.",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--well", type=str, default=None, help="Optional single-well debug filter.")
     return parser.parse_args()
-
-
-def _load_config_with_common(path: Path) -> tuple[Path, dict[str, Any]]:
-    config_path = _resolve_repo_path(path)
-    common_path = _resolve_repo_path(DEFAULT_COMMON_CONFIG)
-    common = load_yaml_config(common_path) if common_path.is_file() else {}
-    specific = load_yaml_config(config_path)
-    merged = dict(common)
-    merged.update(specific)
-    return config_path, merged
 
 
 def _mapping(value: Any, *, path: str) -> dict[str, Any]:
@@ -132,9 +123,9 @@ def _positive_int(config: Mapping[str, Any], key: str, *, path: str, default: in
 
 def _script_config(config: Mapping[str, Any]) -> dict[str, Any]:
     root = _mapping(config.get("forward_observability"), path="forward_observability")
-    source_runs = _mapping(root.get("source_runs"), path="forward_observability.source_runs")
+    source_runs = dict(root.get("source_runs") or {})
     sources = {
-        key: _required_text(source_runs, key, path="forward_observability.source_runs")
+        key: str(source_runs.get(key) or "").strip()
         for key in ("wavelet_generation_dir", "well_auto_tie_dir", "well_preprocess_dir")
     }
 
@@ -282,7 +273,42 @@ def _same_path(left: Path, right: Path) -> bool:
 
 def _resolve_sources(script_cfg: Mapping[str, Any]) -> dict[str, Path]:
     source_cfg = script_cfg["source_runs"]
-    sources = {key: _resolve_repo_path(value) for key, value in source_cfg.items()}
+    output_root = _resolve_repo_path(script_cfg["output_root"])
+    sources = {
+        "wavelet_generation_dir": (
+            _resolve_repo_path(source_cfg["wavelet_generation_dir"])
+            if source_cfg.get("wavelet_generation_dir")
+            else latest_checked_run(
+                output_root,
+                "wavelet_generation",
+                required_files=[
+                    "selected_wavelet.csv",
+                    "selected_wavelet_summary.json",
+                    "wavelet_candidate_aggregate.csv",
+                    "evaluation_well_spatial_clusters.csv",
+                    "batch_synthetic_metrics.csv",
+                ],
+            )
+        ),
+        "well_auto_tie_dir": (
+            _resolve_repo_path(source_cfg["well_auto_tie_dir"])
+            if source_cfg.get("well_auto_tie_dir")
+            else latest_checked_run(
+                output_root,
+                "well_auto_tie",
+                required_files=["well_tie_metrics.csv", "well_tie_plan.csv", "wavelet_inventory.csv"],
+            )
+        ),
+        "well_preprocess_dir": (
+            _resolve_repo_path(source_cfg["well_preprocess_dir"])
+            if source_cfg.get("well_preprocess_dir")
+            else latest_checked_run(
+                output_root,
+                "well_preprocess",
+                required_files=["well_preprocess_status.csv"],
+            )
+        ),
+    }
     _require_files(
         sources["wavelet_generation_dir"],
         [
@@ -996,9 +1022,11 @@ def _write_empty_or_rows(path: Path, rows: Iterable[Mapping[str, Any]]) -> pd.Da
 
 def main() -> None:
     args = parse_args()
-    config_path, config = _load_config_with_common(args.config)
+    config_path = _resolve_repo_path(args.config)
+    config = load_yaml_config(config_path)
     workflow = TimeWorkflowConfig.from_mapping(config)
     script_cfg = _script_config(config)
+    script_cfg["output_root"] = workflow.output_root
     sources = _resolve_sources(script_cfg)
     output_dir = _resolve_output_dir(args, workflow)
     figures_dir = output_dir / "figures"

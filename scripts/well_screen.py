@@ -7,7 +7,7 @@ curves before exporting the fixed slim-LAS contract.
 Usage::
 
     python scripts/well_screen.py
-    python scripts/well_screen.py --config experiments/common.yaml
+    python scripts/well_screen.py --config experiments/common/common.yaml
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("experiments/common.yaml"),
+        default=Path("experiments/common/common.yaml"),
         help="Time-domain common config YAML.",
     )
     parser.add_argument(
@@ -82,7 +82,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg["candidate_filter"] = candidate_filter
     classification = dict(script_cfg.get("classification") or {})
     classification.setdefault("curve_schema_file", None)
-    classification.setdefault("curve_override_file", "experiments/curve_alias_overrides.yaml")
+    classification.setdefault("curve_override_file", "experiments/common/curve_alias_overrides.yaml")
     script_cfg["classification"] = classification
     return script_cfg
 

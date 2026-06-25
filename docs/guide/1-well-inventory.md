@@ -12,7 +12,7 @@ python scripts/well_inventory.py --config experiments/my_project.yaml
 python scripts/well_inventory.py --output-dir /tmp/inventory_test
 ```
 
-不带参数运行时，脚本读取 `experiments/common.yaml`，在 `scripts/output/well_inventory_<timestamp>/` 下写出四份文件。
+不带参数运行时，脚本读取 `experiments/common/common.yaml`，在 `scripts/output/well_inventory_<timestamp>/` 下写出四份文件。
 
 ---
 

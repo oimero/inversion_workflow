@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from typing import Mapping
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -17,12 +18,13 @@ import pandas as pd
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+src_text = str(SRC_DIR)
+sys.path = [path for path in sys.path if path != src_text]
+sys.path.insert(0, src_text)
 
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
+from cup.utils.io import latest_checked_run, load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
 from ginn_v2.real_field import (
     diagnostic_metrics,
     forward_log_ai,
@@ -34,25 +36,15 @@ from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
 from wtie.processing import grid
 
 
-DEFAULT_COMMON_CONFIG = Path("experiments/common.yaml")
+DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("experiments/research/real_field_r0_r1.yaml"))
+    parser.add_argument("--config", type=Path, default=DEFAULT_COMMON_CONFIG)
     parser.add_argument("--zero-shot-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     return parser.parse_args()
-
-
-def _load_config_with_common(path: Path) -> tuple[Path, dict]:
-    cfg_path = resolve_relative_path(path, root=REPO_ROOT)
-    common_path = resolve_relative_path(DEFAULT_COMMON_CONFIG, root=REPO_ROOT)
-    common = load_yaml_config(common_path) if common_path.is_file() else {}
-    specific = load_yaml_config(cfg_path)
-    merged = dict(common)
-    merged.update(specific)
-    return cfg_path, merged
 
 
 def _timestamped_output(prefix: str, explicit: Path | None, *, output_root: Path) -> Path:
@@ -449,16 +441,12 @@ def _trace_distance_to_section(
 
 
 def _load_zero_shot_line_geometry(zero_shot_dir: Path):
-    summary_path = zero_shot_dir / "real_field_zero_shot_summary.json"
-    if not summary_path.is_file():
-        raise FileNotFoundError(f"real_field_zero_shot_summary.json not found: {summary_path}")
-    with summary_path.open("r", encoding="utf-8") as handle:
-        summary = json.load(handle)
+    summary = _load_zero_shot_summary(zero_shot_dir)
     config_text = str(summary.get("config_file") or "").strip()
     if not config_text:
         raise ValueError("R1 XY well QC requires zero-shot summary config_file.")
     config_path = resolve_relative_path(config_text, root=REPO_ROOT)
-    _, cfg = _load_config_with_common(config_path)
+    cfg = load_yaml_config(config_path)
     data_root = resolve_relative_path(cfg.get("data_root", "data"), root=REPO_ROOT)
     seismic = dict(cfg.get("seismic") or {})
     seismic_text = str(seismic.get("file") or "").strip()
@@ -469,6 +457,155 @@ def _load_zero_shot_line_geometry(zero_shot_dir: Path):
     segy_options = segy_options_from_config(dict(seismic.get("segy_options") or {})) if seismic_type == "segy" else None
     survey = open_survey(seismic_path, seismic_type, segy_options=segy_options)
     return survey.line_geometry
+
+
+def _load_zero_shot_summary(zero_shot_dir: Path) -> dict:
+    summary_path = zero_shot_dir / "real_field_zero_shot_summary.json"
+    if not summary_path.is_file():
+        raise FileNotFoundError(f"real_field_zero_shot_summary.json not found: {summary_path}")
+    with summary_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _validate_zero_shot_run(path: Path) -> None:
+    with (path / "real_field_zero_shot_summary.json").open("r", encoding="utf-8") as handle:
+        summary = json.load(handle)
+    if str(summary.get("schema_version") or "") != "real_field_zero_shot_summary_v1":
+        raise ValueError("real_field_zero_shot_summary.json schema_version is not real_field_zero_shot_summary_v1")
+    if str(summary.get("status") or "") not in {"needs_forward_diagnostic", "ok"}:
+        raise ValueError(f"R0 status is not consumable: {summary.get('status')}")
+
+
+def _resolve_zero_shot_dir(run_cfg: dict, *, output_root: Path, cli_value: Path | None) -> Path:
+    if cli_value is not None:
+        return resolve_relative_path(cli_value, root=REPO_ROOT)
+    if run_cfg.get("zero_shot_dir"):
+        return resolve_relative_path(run_cfg["zero_shot_dir"], root=REPO_ROOT)
+    return latest_checked_run(
+        output_root,
+        "real_field_zero_shot",
+        required_files=["real_field_zero_shot_summary.json"],
+        validator=_validate_zero_shot_run,
+    )
+
+
+def _resolve_wavelet_dir(run_cfg: dict, *, zero_shot_dir: Path, output_root: Path) -> Path:
+    source_runs = dict(run_cfg.get("source_runs") or {})
+    explicit = str(source_runs.get("wavelet_generation_dir") or "").strip()
+    summary_path = zero_shot_dir / "real_field_zero_shot_summary.json"
+    recorded = ""
+    if summary_path.is_file():
+        with summary_path.open("r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+        recorded = str((summary.get("source_runs") or {}).get("wavelet_generation_dir") or "").strip()
+    if explicit:
+        wavelet_dir = resolve_relative_path(explicit, root=REPO_ROOT)
+        if recorded and wavelet_dir.resolve() != resolve_relative_path(recorded, root=REPO_ROOT).resolve():
+            raise ValueError("R1 wavelet_generation_dir override does not match R0 summary source_runs.")
+        return wavelet_dir
+    if recorded:
+        return resolve_relative_path(recorded, root=REPO_ROOT)
+    return latest_checked_run(
+        output_root,
+        "wavelet_generation",
+        required_files=["selected_wavelet.csv", "selected_wavelet_summary.json"],
+    )
+
+
+def _recorded_lfm_summary_from_zero_shot(zero_shot_summary: Mapping[str, object]) -> dict:
+    volume = dict(zero_shot_summary.get("volume") or {})
+    section = dict(zero_shot_summary.get("section") or {})
+    lfm_text = str(volume.get("lfm_file") or section.get("lfm_file") or "").strip()
+    if not lfm_text:
+        return {}
+    lfm_path = resolve_relative_path(lfm_text, root=REPO_ROOT)
+    summary_path = lfm_path.parent / "real_field_lfm_summary.json"
+    if not summary_path.is_file():
+        return {}
+    with summary_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _resolve_well_auto_tie_dir(
+    run_cfg: dict,
+    *,
+    zero_shot_summary: Mapping[str, object],
+    output_root: Path,
+) -> Path:
+    well_cfg = dict(run_cfg.get("well_qc") or {})
+    explicit = str(well_cfg.get("well_auto_tie_dir") or "").strip()
+    r0_source_runs = dict(zero_shot_summary.get("source_runs") or {})
+    lfm_summary = _recorded_lfm_summary_from_zero_shot(zero_shot_summary)
+    lfm_source_runs = dict(lfm_summary.get("source_runs") or {})
+    recorded = str(
+        r0_source_runs.get("well_auto_tie_dir")
+        or lfm_source_runs.get("well_auto_tie_dir")
+        or ""
+    ).strip()
+    if explicit:
+        well_auto_tie_dir = resolve_relative_path(explicit, root=REPO_ROOT)
+        if recorded and well_auto_tie_dir.resolve() != resolve_relative_path(recorded, root=REPO_ROOT).resolve():
+            raise ValueError("R1 well_qc.well_auto_tie_dir override does not match R0/LFM source_runs.")
+        return well_auto_tie_dir
+    if recorded:
+        return resolve_relative_path(recorded, root=REPO_ROOT)
+    return latest_checked_run(
+        output_root,
+        "well_auto_tie",
+        required_files=["well_tie_metrics.csv", "well_tie_plan.csv", "wavelet_inventory.csv"],
+    )
+
+
+def _resolve_well_inventory_file(
+    run_cfg: dict,
+    *,
+    zero_shot_summary: Mapping[str, object],
+    output_root: Path,
+) -> Path:
+    well_cfg = dict(run_cfg.get("well_qc") or {})
+    explicit = str(well_cfg.get("well_inventory_file") or "").strip()
+    lfm_summary = _recorded_lfm_summary_from_zero_shot(zero_shot_summary)
+    recorded = str((lfm_summary.get("inputs") or {}).get("well_inventory_file") or "").strip()
+    if explicit:
+        inventory_file = resolve_relative_path(explicit, root=REPO_ROOT)
+        if recorded and inventory_file.resolve() != resolve_relative_path(recorded, root=REPO_ROOT).resolve():
+            raise ValueError("R1 well_qc.well_inventory_file override does not match LFM summary inputs.")
+        return inventory_file
+    if recorded:
+        return resolve_relative_path(recorded, root=REPO_ROOT)
+    inventory_dir = latest_checked_run(
+        output_root,
+        "well_inventory",
+        required_files=["well_inventory.csv"],
+    )
+    return inventory_dir / "well_inventory.csv"
+
+
+def _prepare_well_qc_sources(
+    run_cfg: dict,
+    *,
+    zero_shot_summary: Mapping[str, object],
+    output_root: Path,
+) -> dict:
+    prepared = dict(run_cfg)
+    well_cfg = dict(prepared.get("well_qc") or {})
+    if bool(well_cfg.get("enabled", True)):
+        if not str(well_cfg.get("well_auto_tie_dir") or "").strip():
+            well_dir = _resolve_well_auto_tie_dir(
+                prepared,
+                zero_shot_summary=zero_shot_summary,
+                output_root=output_root,
+            )
+            well_cfg["well_auto_tie_dir"] = repo_relative_path(well_dir, root=REPO_ROOT)
+        if not str(well_cfg.get("well_inventory_file") or "").strip():
+            inventory_file = _resolve_well_inventory_file(
+                prepared,
+                zero_shot_summary=zero_shot_summary,
+                output_root=output_root,
+            )
+            well_cfg["well_inventory_file"] = repo_relative_path(inventory_file, root=REPO_ROOT)
+    prepared["well_qc"] = well_cfg
+    return prepared
 
 
 def _line_xy_arrays(line_geometry, ilines: np.ndarray, xlines: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1908,15 +2045,18 @@ def _red_flags(
 
 def main() -> None:
     args = parse_args()
-    cfg_path, cfg = _load_config_with_common(args.config)
+    cfg_path = resolve_relative_path(args.config, root=REPO_ROOT)
+    cfg = load_yaml_config(cfg_path)
     run_cfg = dict(cfg.get("real_field_forward_diagnostic") or {})
     if not run_cfg:
-        raise ValueError("experiments/common.yaml lacks real_field_forward_diagnostic section.")
+        raise ValueError("experiments/common/common.yaml lacks real_field_forward_diagnostic section.")
     output_root = resolve_relative_path(cfg.get("output_root", "scripts/output"), root=REPO_ROOT)
-    zero_shot_dir = (
-        resolve_relative_path(args.zero_shot_dir, root=REPO_ROOT)
-        if args.zero_shot_dir is not None
-        else resolve_relative_path(run_cfg.get("zero_shot_dir"), root=REPO_ROOT)
+    zero_shot_dir = _resolve_zero_shot_dir(run_cfg, output_root=output_root, cli_value=args.zero_shot_dir)
+    zero_shot_summary = _load_zero_shot_summary(zero_shot_dir)
+    run_cfg = _prepare_well_qc_sources(
+        run_cfg,
+        zero_shot_summary=zero_shot_summary,
+        output_root=output_root,
     )
     output_dir = _timestamped_output("real_field_forward_diagnostic", args.output_dir, output_root=output_root)
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -1932,11 +2072,7 @@ def main() -> None:
     twt_s = np.asarray(first["twt_s"], dtype=np.float64)
     dt_s = float(np.median(np.diff(twt_s))) if twt_s.size > 1 else 0.002
 
-    source_runs = dict(run_cfg.get("source_runs") or {})
-    wavelet_dir_text = source_runs.get("wavelet_generation_dir")
-    if not wavelet_dir_text:
-        raise ValueError("R1 requires explicit source_runs.wavelet_generation_dir.")
-    wavelet_dir = resolve_relative_path(wavelet_dir_text, root=REPO_ROOT)
+    wavelet_dir = _resolve_wavelet_dir(run_cfg, zero_shot_dir=zero_shot_dir, output_root=output_root)
     wavelet, wavelet_meta = load_selected_wavelet(wavelet_dir)
     wavelet_scenarios = _load_wavelet_scenarios(wavelet_dir, wavelet, wavelet_meta, run_cfg)
 

@@ -14,11 +14,12 @@ import pandas as pd
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+src_text = str(SRC_DIR)
+sys.path = [path for path in sys.path if path != src_text]
+sys.path.insert(0, src_text)
 
 from cup.synthetic.dataset import SynthoseisBenchmark
-from cup.utils.io import repo_relative_path, resolve_relative_path, sha256_file, write_json
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
 from ginn_v2.data import (
     PatchSpec,
     build_patch_index,
@@ -43,6 +44,64 @@ MODEL_IDS = (
     "patch_2d_mismatch_training",
 )
 
+TRAIN_DEFAULTS = {
+    "benchmark_dir": None,
+    "model_id": "patch_2d_supervised",
+    "patch_lateral": 32,
+    "patch_twt": 128,
+    "lateral_stride": 16,
+    "twt_stride": 64,
+    "min_valid_fraction": 0.50,
+    "split_policy": "derive",
+    "validation_fraction": 0.15,
+    "test_fraction": 0.15,
+    "max_patches": None,
+    "patch_index": None,
+    "normalization": None,
+    "overfit_tiny": False,
+    "epochs": 5,
+    "batch_size": 8,
+    "learning_rate": 1e-3,
+    "hidden_channels": 32,
+    "depth": 5,
+    "lambda_physics": 0.0,
+    "device": "auto",
+    "seed": 20260617,
+    "model_role": None,
+    "synthetic_gate_report_dir": None,
+    "synthetic_gate_report_card": None,
+    "synthetic_gate_frozen_candidate": False,
+}
+
+TRAIN_CONFIG_KEYS = {
+    "benchmark_dir": "benchmark-dir",
+    "model_id": "model-id",
+    "patch_lateral": "patch-lateral",
+    "patch_twt": "patch-twt",
+    "lateral_stride": "lateral-stride",
+    "twt_stride": "twt-stride",
+    "min_valid_fraction": "min-valid-fraction",
+    "split_policy": "split-policy",
+    "validation_fraction": "validation-fraction",
+    "test_fraction": "test-fraction",
+    "max_patches": "max-patches",
+    "patch_index": "patch-index",
+    "normalization": "normalization",
+    "overfit_tiny": "overfit-tiny",
+    "epochs": "epochs",
+    "batch_size": "batch-size",
+    "learning_rate": "learning-rate",
+    "hidden_channels": "hidden-channels",
+    "depth": "depth",
+    "lambda_physics": "lambda-physics",
+    "device": "device",
+    "seed": "seed",
+    "model_role": "model-role",
+    "synthetic_gate_report_dir": "synthetic-gate-report-dir",
+    "synthetic_gate_report_card": "synthetic-gate-report-card",
+    "synthetic_gate_frozen_candidate": "synthetic-gate-frozen-candidate",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -50,31 +109,32 @@ def parse_args() -> argparse.Namespace:
     sub = parser.add_subparsers(dest="command", required=True)
 
     train = sub.add_parser("train")
-    train.add_argument("--benchmark-dir", type=Path, required=True)
-    train.add_argument("--model-id", choices=MODEL_IDS, default="patch_2d_supervised")
-    train.add_argument("--patch-lateral", type=int, default=32)
-    train.add_argument("--patch-twt", type=int, default=128)
-    train.add_argument("--lateral-stride", type=int, default=16)
-    train.add_argument("--twt-stride", type=int, default=64)
-    train.add_argument("--min-valid-fraction", type=float, default=0.50)
-    train.add_argument("--split-policy", choices=("derive", "strict"), default="derive")
-    train.add_argument("--validation-fraction", type=float, default=0.15)
-    train.add_argument("--test-fraction", type=float, default=0.15)
-    train.add_argument("--max-patches", type=int, default=None)
-    train.add_argument("--patch-index", type=Path, default=None)
-    train.add_argument("--normalization", type=Path, default=None)
+    train.add_argument("--config", type=Path, default=None)
+    train.add_argument("--benchmark-dir", type=Path, default=TRAIN_DEFAULTS["benchmark_dir"])
+    train.add_argument("--model-id", choices=MODEL_IDS, default=TRAIN_DEFAULTS["model_id"])
+    train.add_argument("--patch-lateral", type=int, default=TRAIN_DEFAULTS["patch_lateral"])
+    train.add_argument("--patch-twt", type=int, default=TRAIN_DEFAULTS["patch_twt"])
+    train.add_argument("--lateral-stride", type=int, default=TRAIN_DEFAULTS["lateral_stride"])
+    train.add_argument("--twt-stride", type=int, default=TRAIN_DEFAULTS["twt_stride"])
+    train.add_argument("--min-valid-fraction", type=float, default=TRAIN_DEFAULTS["min_valid_fraction"])
+    train.add_argument("--split-policy", choices=("derive", "strict"), default=TRAIN_DEFAULTS["split_policy"])
+    train.add_argument("--validation-fraction", type=float, default=TRAIN_DEFAULTS["validation_fraction"])
+    train.add_argument("--test-fraction", type=float, default=TRAIN_DEFAULTS["test_fraction"])
+    train.add_argument("--max-patches", type=int, default=TRAIN_DEFAULTS["max_patches"])
+    train.add_argument("--patch-index", type=Path, default=TRAIN_DEFAULTS["patch_index"])
+    train.add_argument("--normalization", type=Path, default=TRAIN_DEFAULTS["normalization"])
     train.add_argument("--overfit-tiny", action="store_true")
-    train.add_argument("--epochs", type=int, default=5)
-    train.add_argument("--batch-size", type=int, default=8)
-    train.add_argument("--learning-rate", type=float, default=1e-3)
-    train.add_argument("--hidden-channels", type=int, default=32)
-    train.add_argument("--depth", type=int, default=5)
-    train.add_argument("--lambda-physics", type=float, default=0.0)
-    train.add_argument("--device", default="auto")
-    train.add_argument("--seed", type=int, default=20260617)
-    train.add_argument("--model-role", default=None)
-    train.add_argument("--synthetic-gate-report-dir", type=Path, required=True)
-    train.add_argument("--synthetic-gate-report-card", type=Path, required=True)
+    train.add_argument("--epochs", type=int, default=TRAIN_DEFAULTS["epochs"])
+    train.add_argument("--batch-size", type=int, default=TRAIN_DEFAULTS["batch_size"])
+    train.add_argument("--learning-rate", type=float, default=TRAIN_DEFAULTS["learning_rate"])
+    train.add_argument("--hidden-channels", type=int, default=TRAIN_DEFAULTS["hidden_channels"])
+    train.add_argument("--depth", type=int, default=TRAIN_DEFAULTS["depth"])
+    train.add_argument("--lambda-physics", type=float, default=TRAIN_DEFAULTS["lambda_physics"])
+    train.add_argument("--device", default=TRAIN_DEFAULTS["device"])
+    train.add_argument("--seed", type=int, default=TRAIN_DEFAULTS["seed"])
+    train.add_argument("--model-role", default=TRAIN_DEFAULTS["model_role"])
+    train.add_argument("--synthetic-gate-report-dir", type=Path, default=TRAIN_DEFAULTS["synthetic_gate_report_dir"])
+    train.add_argument("--synthetic-gate-report-card", type=Path, default=TRAIN_DEFAULTS["synthetic_gate_report_card"])
     train.add_argument(
         "--synthetic-gate-frozen-candidate",
         action="store_true",
@@ -107,6 +167,16 @@ def parse_args() -> argparse.Namespace:
         metavar="MODEL:SCOPE:REPORT_DIR",
         help="Report entry. Repeat for each model/scope report directory.",
     )
+
+    stamp = sub.add_parser("stamp-gate")
+    stamp.add_argument("--model-run-dir", type=Path, required=True)
+    stamp.add_argument("--synthetic-gate-report-dir", type=Path, required=True)
+    stamp.add_argument("--synthetic-gate-report-card", type=Path, required=True)
+    stamp.add_argument(
+        "--synthetic-gate-frozen-candidate",
+        action="store_true",
+        help="Mark this model run as belonging to the current frozen synthetic-gate candidate set.",
+    )
     return parser.parse_args()
 
 
@@ -115,6 +185,47 @@ def _timestamped_output(prefix: str, explicit: Path | None) -> Path:
         return resolve_relative_path(explicit, root=REPO_ROOT)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     return REPO_ROOT / "scripts" / "output" / f"{prefix}_{timestamp}"
+
+
+def _apply_train_config(args: argparse.Namespace) -> argparse.Namespace:
+    if args.config is None:
+        if args.benchmark_dir is None:
+            raise ValueError("ginn_v2.py train requires --benchmark-dir or --config with train.benchmark_dir.")
+        return args
+    config_path = resolve_relative_path(args.config, root=REPO_ROOT)
+    payload = load_yaml_config(config_path)
+    config = dict(payload.get("train") or payload)
+    provided_flags = {token[2:] for token in sys.argv if token.startswith("--")}
+    for key, flag in TRAIN_CONFIG_KEYS.items():
+        if flag in provided_flags or key not in config:
+            continue
+        value = config[key]
+        if key in {"benchmark_dir", "patch_index", "normalization", "synthetic_gate_report_dir", "synthetic_gate_report_card"}:
+            value = None if value is None or str(value).strip() == "" else Path(str(value))
+        setattr(args, key, value)
+    if args.benchmark_dir is None:
+        raise ValueError("ginn_v2.py train requires train.benchmark_dir in config or --benchmark-dir.")
+    return args
+
+
+def _resolve_benchmark_dir(value: Path | str) -> Path:
+    text = str(value).strip()
+    if text.casefold() != "auto":
+        return resolve_relative_path(value, root=REPO_ROOT)
+    root = REPO_ROOT / "experiments" / "synthoseis_lite" / "results"
+    required = [
+        "generate_field_conditioned/synthetic_benchmark.h5",
+        "generate_field_conditioned/sample_index.csv",
+        "generate_field_conditioned/benchmark_manifest.json",
+    ]
+    candidates = [
+        path
+        for path in root.glob("*")
+        if path.is_dir() and all((path / name).is_file() for name in required)
+    ]
+    if not candidates:
+        raise FileNotFoundError(f"No synthoseis_lite result with generate_field_conditioned benchmark found under {root}.")
+    return sorted(candidates, key=lambda p: (p.stat().st_mtime, p.name))[-1] / "generate_field_conditioned"
 
 
 def _sample_kinds_for_training(model_id: str) -> set[str]:
@@ -134,12 +245,6 @@ def _write_train_manifest(
     patch_index_truncated: bool,
     max_patches: int | None,
 ) -> None:
-    gate_report_dir = resolve_relative_path(args.synthetic_gate_report_dir, root=REPO_ROOT)
-    gate_report_card = resolve_relative_path(args.synthetic_gate_report_card, root=REPO_ROOT)
-    if not gate_report_dir.is_dir():
-        raise FileNotFoundError(f"synthetic gate report directory not found: {gate_report_dir}")
-    if not gate_report_card.is_file():
-        raise FileNotFoundError(f"synthetic gate report card not found: {gate_report_card}")
     checkpoint_path = Path(train_result["checkpoint"])
     history_path = Path(train_result["history"])
     manifest = {
@@ -211,14 +316,40 @@ def _write_train_manifest(
         "training_history": repo_relative_path(history_path, root=REPO_ROOT),
         "training_history_sha256": sha256_file(history_path),
         "best_validation_loss": train_result["best_validation_loss"],
-        "synthetic_gate_evidence": {
-            "report_dir": repo_relative_path(gate_report_dir, root=REPO_ROOT),
-            "report_card": repo_relative_path(gate_report_card, root=REPO_ROOT),
-            "report_card_sha256": sha256_file(gate_report_card),
-            "is_current_frozen_candidate": bool(args.synthetic_gate_frozen_candidate),
-        },
+        "synthetic_gate_evidence_status": "pending",
     }
+    if args.synthetic_gate_report_dir is not None or args.synthetic_gate_report_card is not None:
+        if args.synthetic_gate_report_dir is None or args.synthetic_gate_report_card is None:
+            raise ValueError(
+                "--synthetic-gate-report-dir and --synthetic-gate-report-card must be provided together."
+            )
+        _stamp_gate_evidence(
+            manifest,
+            report_dir=resolve_relative_path(args.synthetic_gate_report_dir, root=REPO_ROOT),
+            report_card=resolve_relative_path(args.synthetic_gate_report_card, root=REPO_ROOT),
+            frozen_candidate=bool(args.synthetic_gate_frozen_candidate),
+        )
     write_json(output_dir / "model_run_manifest.json", manifest)
+
+
+def _stamp_gate_evidence(
+    manifest: dict,
+    *,
+    report_dir: Path,
+    report_card: Path,
+    frozen_candidate: bool,
+) -> None:
+    if not report_dir.is_dir():
+        raise FileNotFoundError(f"synthetic gate report directory not found: {report_dir}")
+    if not report_card.is_file():
+        raise FileNotFoundError(f"synthetic gate report card not found: {report_card}")
+    manifest["synthetic_gate_evidence_status"] = "ok"
+    manifest["synthetic_gate_evidence"] = {
+        "report_dir": repo_relative_path(report_dir, root=REPO_ROOT),
+        "report_card": repo_relative_path(report_card, root=REPO_ROOT),
+        "report_card_sha256": sha256_file(report_card),
+        "is_current_frozen_candidate": bool(frozen_candidate),
+    }
 
 
 def _infer_model_role(model_id: str) -> str:
@@ -231,9 +362,10 @@ def _infer_model_role(model_id: str) -> str:
 
 
 def run_train(args: argparse.Namespace) -> None:
-    benchmark_dir = resolve_relative_path(args.benchmark_dir, root=REPO_ROOT)
+    args = _apply_train_config(args)
+    benchmark_dir = _resolve_benchmark_dir(args.benchmark_dir)
     output_dir = _timestamped_output("ginn_v2_train", args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=False)
+    output_dir.mkdir(parents=True, exist_ok=args.output_dir is not None)
     benchmark = SynthoseisBenchmark(benchmark_dir)
     patch_spec = PatchSpec(
         lateral_samples=int(args.patch_lateral),
@@ -589,6 +721,25 @@ def run_summarize(args: argparse.Namespace) -> None:
     print(f"Reports: {len(rows)}")
 
 
+def run_stamp_gate(args: argparse.Namespace) -> None:
+    model_run_dir = resolve_relative_path(args.model_run_dir, root=REPO_ROOT)
+    manifest_path = model_run_dir / "model_run_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    _stamp_gate_evidence(
+        manifest,
+        report_dir=resolve_relative_path(args.synthetic_gate_report_dir, root=REPO_ROOT),
+        report_card=resolve_relative_path(args.synthetic_gate_report_card, root=REPO_ROOT),
+        frozen_candidate=bool(args.synthetic_gate_frozen_candidate),
+    )
+    write_json(manifest_path, manifest)
+    print("=== GINN-v2 model gate stamp ===")
+    print(f"Model run: {model_run_dir}")
+    print(f"Report card: {manifest['synthetic_gate_evidence']['report_card']}")
+
+
 def _parse_report_spec(spec: str) -> tuple[str, str, Path]:
     parts = spec.split(":", maxsplit=2)
     if len(parts) != 3 or not all(part.strip() for part in parts):
@@ -919,6 +1070,8 @@ def main() -> None:
         run_report(args)
     elif args.command == "summarize":
         run_summarize(args)
+    elif args.command == "stamp-gate":
+        run_stamp_gate(args)
     else:
         raise ValueError(f"Unsupported command: {args.command}")
 

@@ -7,7 +7,7 @@ then exports traceable preprocessed LAS files.
 Usage::
 
     python scripts/well_preprocess.py
-    python scripts/well_preprocess.py --config experiments/common.yaml
+    python scripts/well_preprocess.py --config experiments/common/common.yaml
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("experiments/common.yaml"),
+        default=Path("experiments/common/common.yaml"),
         help="Time-domain common config YAML.",
     )
     parser.add_argument(
@@ -111,7 +111,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "enabled": True,
             "lower_quantile": 0.01,
             "upper_quantile": 0.99,
-            "range_override_file": "experiments/well_preprocess_ranges.yaml",
+            "range_override_file": "experiments/common/well_preprocess_ranges.yaml",
             "min_samples_for_auto_threshold": 1000,
         },
     )

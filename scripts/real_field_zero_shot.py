@@ -17,12 +17,13 @@ import pandas as pd
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+repo_text = str(REPO_ROOT)
+src_text = str(SRC_DIR)
+sys.path = [path for path in sys.path if path not in {repo_text, src_text}]
+sys.path.insert(0, repo_text)
+sys.path.insert(0, src_text)
 
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
+from cup.utils.io import latest_checked_run, load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
 from cup.seismic.volume_export import export_volume_like_source
 from ginn_v2.real_field import (
     input_qc_frame,
@@ -33,48 +34,35 @@ from ginn_v2.real_field import (
 )
 
 
-DEFAULT_COMMON_CONFIG = Path("experiments/common.yaml")
+DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")
+DEFAULT_REAL_FIELD_SECTIONS = Path("experiments/common/real_field_sections.yaml")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("experiments/research/real_field_r0_r1.yaml"))
+    parser.add_argument("--config", type=Path, default=DEFAULT_COMMON_CONFIG)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--device", default=None, help="Torch device. Use 'cuda' to fail if GPU is unavailable.")
     parser.add_argument("--stitch-strategy", choices=("uniform", "center_crop"), default=None)
     return parser.parse_args()
 
 
-def _load_config_with_common(path: Path) -> tuple[Path, dict]:
-    cfg_path = resolve_relative_path(path, root=REPO_ROOT)
-    common_path = resolve_relative_path(DEFAULT_COMMON_CONFIG, root=REPO_ROOT)
-    common = load_yaml_config(common_path) if common_path.is_file() else {}
-    specific = load_yaml_config(cfg_path)
-    merged = dict(common)
-    merged.update(specific)
-    return cfg_path, merged
-
-
-def _load_model_set(run_cfg: dict) -> list[dict]:
-    if run_cfg.get("models") is not None:
-        raise ValueError("real_field_zero_shot.models is retired; use model_set_file with model_run_dir entries.")
-    model_set_file = str(run_cfg.get("model_set_file") or "").strip()
-    if not model_set_file:
-        raise ValueError("real_field_zero_shot.model_set_file must be configured.")
-    payload = load_yaml_config(resolve_relative_path(model_set_file, root=REPO_ROOT))
-    models = payload.get("models")
+def _load_models(run_cfg: dict) -> list[dict]:
+    if run_cfg.get("model_set_file") is not None:
+        raise ValueError("real_field_zero_shot.model_set_file is retired; put models in common.yaml.")
+    models = run_cfg.get("models")
     if not isinstance(models, list) or not models:
-        raise ValueError(f"{model_set_file} must contain a non-empty models list.")
+        raise ValueError("real_field_zero_shot.models must be a non-empty list.")
     clean = []
     for idx, item in enumerate(models):
         if not isinstance(item, dict):
-            raise ValueError(f"{model_set_file}.models[{idx}] must be a mapping.")
+            raise ValueError(f"real_field_zero_shot.models[{idx}] must be a mapping.")
         extra = sorted(set(item) - {"model_run_dir"})
         if extra:
-            raise ValueError(f"{model_set_file}.models[{idx}] only accepts model_run_dir; got {extra}.")
+            raise ValueError(f"real_field_zero_shot.models[{idx}] only accepts model_run_dir; got {extra}.")
         text = str(item.get("model_run_dir") or "").strip()
         if not text:
-            raise ValueError(f"{model_set_file}.models[{idx}].model_run_dir must be non-empty.")
+            raise ValueError(f"real_field_zero_shot.models[{idx}].model_run_dir must be non-empty.")
         clean.append({"model_run_dir": text})
     return clean
 
@@ -82,9 +70,7 @@ def _load_model_set(run_cfg: dict) -> list[dict]:
 def _load_sections_file(run_cfg: dict) -> list[dict]:
     if run_cfg.get("section") is not None:
         raise ValueError("real_field_zero_shot.section is retired; use sections_file.")
-    sections_file = str(run_cfg.get("sections_file") or "").strip()
-    if not sections_file:
-        return []
+    sections_file = str(run_cfg.get("sections_file") or DEFAULT_REAL_FIELD_SECTIONS).strip()
     payload = load_yaml_config(resolve_relative_path(sections_file, root=REPO_ROOT))
     sections = payload.get("sections")
     if not isinstance(sections, list) or not sections:
@@ -103,12 +89,46 @@ def _prepare_run_config(run_cfg: dict, cfg: dict) -> dict:
     if seismic.get("segy_options"):
         inputs["segy_options"] = dict(seismic["segy_options"])
     prepared["real_field_inputs"] = inputs
-    if str(prepared.get("mode") or "section").casefold() == "section":
+    if str(prepared.get("mode") or "volume").casefold() == "section":
         sections = _load_sections_file(prepared)
         if len(sections) != 1:
             raise ValueError("R0 section mode requires sections_file with exactly one section.")
         prepared["section"] = sections[0]
     return prepared
+
+
+def _prepare_real_field_inputs(run_cfg: dict, workflow_cfg: dict) -> dict:
+    prepared = dict(run_cfg)
+    inputs = dict(prepared.get("real_field_inputs") or {})
+    output_root = resolve_relative_path(workflow_cfg.get("output_root", "scripts/output"), root=REPO_ROOT)
+    if not inputs.get("lfm_file"):
+        lfm_dir = latest_checked_run(
+            output_root,
+            "real_field_lfm",
+            required_files=["real_field_lfm.npz", "real_field_lfm_summary.json"],
+            validator=_validate_real_field_lfm_run,
+        )
+        inputs["lfm_file"] = repo_relative_path(lfm_dir / "real_field_lfm.npz", root=REPO_ROOT)
+    source_runs = dict(prepared.get("source_runs") or {})
+    if not source_runs.get("wavelet_generation_dir"):
+        wavelet_dir = latest_checked_run(
+            output_root,
+            "wavelet_generation",
+            required_files=["selected_wavelet.csv", "selected_wavelet_summary.json"],
+        )
+        source_runs["wavelet_generation_dir"] = repo_relative_path(wavelet_dir, root=REPO_ROOT)
+    prepared["real_field_inputs"] = inputs
+    prepared["source_runs"] = source_runs
+    return prepared
+
+
+def _validate_real_field_lfm_run(path: Path) -> None:
+    with (path / "real_field_lfm_summary.json").open("r", encoding="utf-8") as handle:
+        summary = json.load(handle)
+    if str(summary.get("schema_version") or "") != "real_field_lfm_v1":
+        raise ValueError("real_field_lfm_summary.json schema_version is not real_field_lfm_v1")
+    if str(summary.get("status") or "") not in {"ok", "warning"}:
+        raise ValueError(f"real_field_lfm status is not consumable: {summary.get('status')}")
 
 
 def _timestamped_output(prefix: str, explicit: Path | None, *, output_root: Path) -> Path:
@@ -748,7 +768,7 @@ def _write_spectral_qc(output_dir: Path, *, run_cfg: dict, dt_s: float) -> dict[
 
 
 def _export_zero_shot_volumes(output_dir: Path, *, run_cfg: dict, data_root: Path) -> dict[str, dict[str, object]]:
-    if str(run_cfg.get("mode") or "section").casefold() != "volume":
+    if str(run_cfg.get("mode") or "volume").casefold() != "volume":
         return {}
     export_cfg = dict(run_cfg.get("volume_export") or {})
     if not bool(export_cfg.get("enabled", True)):
@@ -847,17 +867,19 @@ def _source_file_hashes(section_metadata: dict, source_runs: dict) -> dict[str, 
 
 def main() -> None:
     args = parse_args()
-    cfg_path, cfg = _load_config_with_common(args.config)
+    cfg_path = resolve_relative_path(args.config, root=REPO_ROOT)
+    cfg = load_yaml_config(cfg_path)
     run_cfg = dict(cfg.get("real_field_zero_shot") or {})
     if not run_cfg:
-        raise ValueError("experiments/common.yaml lacks real_field_zero_shot section.")
+        raise ValueError("experiments/common/common.yaml lacks real_field_zero_shot section.")
     output_root = resolve_relative_path(cfg.get("output_root", "scripts/output"), root=REPO_ROOT)
     output_dir = _timestamped_output("real_field_zero_shot", args.output_dir, output_root=output_root)
     output_dir.mkdir(parents=True, exist_ok=False)
 
     device = str(args.device or run_cfg.get("device") or "auto")
     stitch_strategy = str(args.stitch_strategy or run_cfg.get("stitch_strategy") or "uniform")
-    models = _load_model_set(run_cfg)
+    run_cfg = _prepare_real_field_inputs(run_cfg, cfg)
+    models = _load_models(run_cfg)
     data_root = resolve_relative_path(cfg.get("data_root", "data"), root=REPO_ROOT)
     run_cfg_for_load = _prepare_run_config(run_cfg, cfg)
     inputs_for_load = dict(run_cfg_for_load.get("real_field_inputs") or {})
@@ -869,7 +891,7 @@ def main() -> None:
         inputs_for_load["seismic_reference_stats_file"] = reference_payload["file"]
         inputs_for_load["seismic_reference_stats_sha256"] = reference_payload["sha256"]
         run_cfg_for_load["real_field_inputs"] = inputs_for_load
-    output_mode = str(run_cfg.get("mode") or "section").casefold()
+    output_mode = str(run_cfg.get("mode") or "volume").casefold()
     if output_mode == "section":
         field = load_real_field_section(config=run_cfg_for_load, root=REPO_ROOT, data_root=data_root)
     elif output_mode == "volume":

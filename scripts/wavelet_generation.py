@@ -7,7 +7,7 @@ optimizes a PCA consensus wavelet, and exports one selected global wavelet.
 Usage::
 
     python scripts/wavelet_generation.py
-    python scripts/wavelet_generation.py --config experiments/common.yaml
+    python scripts/wavelet_generation.py --config experiments/common/common.yaml
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ from wtie.processing import grid
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("experiments/common.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("experiments/common/common.yaml"))
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--well", type=str, default=None, help="Optional single evaluation well filter.")
     parser.add_argument("--debug", action="store_true", help="Write candidate, PCA, and optimizer debug artifacts.")

@@ -56,8 +56,9 @@ nav:
       - 旁路 井轨迹 QC: guide/well-trajectory.md
       - 04 井震自动标定: guide/4-well-auto-tie.md
       - 05 全局子波生成: guide/5-wavelet-generation.md
-      - 旁路 正演可观测性分析: guide/forward-observability-gate.md
+      - 06 正演可观测性分析: guide/6-forward-observability-gate.md
       - 旁路 合成基准生成与评估: guide/synthoseis-lite-benchmark.md
+      - 旁路 模型消融训练与评估: guide/ginn-v2-ablation.md
   - API:
       - API 总览: api/index.md
       - cup:

@@ -1,25 +1,32 @@
 # 合成基准生成与评估
 
-`synthoseis_lite.py` 是第二个研究闸门，做一件事：**冻结一个已知真值的二维声阻抗合成基准，用它来判断逆问题的实际可恢复性。** 它接在正演可观测性分析之后，先用井数据冻结阻抗校准（calibrate），再生成规范几何或场条件几何的真值剖面（generate），最后用模型无关的基线评估器（`evaluate_synthoseis_lite.py`）读出报告卡。第一个版本只冻结数据、切分和报告卡，**不设通过/失败阈值**。
+`synthoseis_lite.py` 是第二个研究闸门，做一件事：**冻结一个已知真值的二维声阻抗合成基准，用它来判断逆问题的实际可恢复性。** 它接在正演可观测性分析之后，先用井数据冻结阻抗校准（calibrate），再生成规范几何或场条件几何的真值剖面（generate），最后用模型无关的基线评估器（`evaluate_synthoseis_lite.py`）读出报告卡。
 
 ---
 
 ## 快速开始
 
 ```bash
+# 一键运行（推荐）：通过 PowerShell runner
+cd experiments/synthoseis_lite
+.\run_synthoseis_lite.ps1 <ExperimentName>
+# 自动顺序执行 calibrate → generate canonical → generate field_conditioned
+# 结果落在 experiments/synthoseis_lite/results/<ExperimentName>/
+
+# 手动分步运行：
 # 第一步：从井数据冻结阻抗校准
 python scripts/synthoseis_lite.py calibrate
-python scripts/synthoseis_lite.py calibrate --config experiments/my_project.yaml
+python scripts/synthoseis_lite.py calibrate --config experiments/synthoseis_lite/synthoseis_lite.yaml
 
 # 第二步：生成规范几何基准
 python scripts/synthoseis_lite.py generate \
   --suite canonical \
-  --impedance-calibration experiments/output/synthoseis_lite_calibrate_20250601/impedance_calibration.json
+  --impedance-calibration experiments/synthoseis_lite/results/<name>/calibrate/impedance_calibration.json
 
 # 第三步：生成场条件几何基准
 python scripts/synthoseis_lite.py generate \
   --suite field_conditioned \
-  --impedance-calibration experiments/output/synthoseis_lite_calibrate_20250601/impedance_calibration.json
+  --impedance-calibration experiments/synthoseis_lite/results/<name>/calibrate/impedance_calibration.json
 
 # 场条件调试选项
 python scripts/synthoseis_lite.py generate \
@@ -37,7 +44,7 @@ python scripts/synthoseis_lite.py generate \
 
 # 第四步：评估基线
 python scripts/evaluate_synthoseis_lite.py \
-  --benchmark-dir experiments/output/synthoseis_lite_generate_20250601
+  --benchmark-dir experiments/synthoseis_lite/results/<name>/generate_field_conditioned
 python scripts/evaluate_synthoseis_lite.py \
   --benchmark-dir <path> \
   --sample-kind base --sample-kind frequency_probe  # 只评估特定样本类
@@ -61,7 +68,7 @@ python scripts/evaluate_synthoseis_lite.py \
 | `evaluation_well_spatial_clusters.csv` | 第五步 | 空间簇分配 |
 | `selected_wavelet.csv` | 第五步 | 提取子波 dt，验证与输出 dt 匹配 |
 | 井分层文件 | Petrel | 构建区域边界 |
-| `experiments/common.yaml` | 项目配置 | `synthoseis_lite` 段 |
+| `experiments/synthoseis_lite/synthoseis_lite.yaml` | 合成旁路配置 | `synthoseis_lite` 段 |
 
 ### generate（生成阶段）
 
@@ -77,8 +84,6 @@ python scripts/evaluate_synthoseis_lite.py \
 | `evaluation_well_spatial_clusters.csv` | 第五步 | 来源闭环校验 |
 | 解释层位文件 | Petrel | 场条件几何构建（canonical 套件不需要） |
 
-**来源闭环：** `generate` 会读取正演可观测性分析的 `run_summary.json`，交叉验证其记录的第三步、第四步和第五步来源目录与配置的 `synthoseis_lite.source_runs` 完全一致。
-
 ### evaluate（评估阶段）
 
 | 输入 | 用途 |
@@ -92,14 +97,24 @@ python scripts/evaluate_synthoseis_lite.py \
 ## 配置参考
 
 ```yaml
+# 配置文件：experiments/synthoseis_lite/synthoseis_lite.yaml
+# 顶层包含 data_root / output_root / assets / seismic / target_interval 等工区事实，
+# 以及 synthoseis_lite 段：
+
 synthoseis_lite:
   global_seed: 20250615
 
+  # source_runs 可留空 —— 自动发现最新第六步产物并反查第三/四/五步来源
   source_runs:
-    forward_observability_dir: experiments/output/forward_observability_20250601
-    well_preprocess_dir: experiments/output/well_preprocess_20250601
-    well_auto_tie_dir: experiments/output/well_auto_tie_20250601
-    wavelet_generation_dir: experiments/output/wavelet_generation_20250601
+    forward_observability_dir: scripts/output/forward_observability_20250601
+
+  # sections 必填，定义合成剖面的几何路径
+  sections:
+    - section_id: section_A
+      path:
+        - {inline: 100, xline: 200}
+        - {inline: 150, xline: 250}
+      resample_interval_m: 25.0
 
   sampling:
     expected_output_dt_s: 0.002
@@ -108,15 +123,6 @@ synthoseis_lite:
   geometry:
     lateral_sample_interval_m: 25.0
     field_conditioned:
-      horizons:
-        - {name: H1, file: horizons/H1.dat}
-        - {name: H2, file: horizons/H2.dat}
-        - {name: H3, file: horizons/H3.dat}
-      sections:
-        - section_id: section_A
-          path:
-            - {inline: 100, xline: 200}
-            - {inline: 150, xline: 250}
       target_zone:
         mode: filled_target_zone
         min_thickness_s: 0.050
@@ -181,6 +187,12 @@ synthoseis_lite:
     lateral_shapes:
       - section_coherent
       - {name: localized_tukey, centered_fraction: 0.40, alpha: 0.5}
+
+target_interval:
+  horizons:
+    - {name: H3-1, file: interpre/H3-1}
+    - {name: H5-1, file: interpre/H5-1}
+    - {name: H7-1, file: interpre/H7-1}
 ```
 
 ### `global_seed`
@@ -189,7 +201,7 @@ synthoseis_lite:
 
 ### `source_runs`
 
-与正演可观测性分析一样的显式配置模式——四个目录必须全部指向实际存在的运行输出，且正演可观测性分析的 `run_summary.json` 中记录的来源路径必须与之闭环。
+可留空——脚本自动从 `output_root` 发现最新第六步（forward_observability）产物，并从其 `run_summary.json` 反查第三/四/五步来源。显式填写时仅需提供 `forward_observability_dir`，其余目录从第六步 summary 中读取并做闭环校验。
 
 ### `sampling`
 
@@ -198,7 +210,7 @@ synthoseis_lite:
 
 ### `geometry.field_conditioned`
 
-场条件几何的核心配置。`horizons` 是层位名和 Petrel 导出文件路径的列表，至少 2 个。`sections` 是剖面定义，每个剖面有一个 `section_id` 和一条由 inline/xline 点串定义的路径。`target_zone.mode` 控制目标区构建方式（当前仅 `filled_target_zone`）。
+场条件几何的核心配置。层位从顶层 `target_interval.horizons` 读取，剖面定义从 `synthoseis_lite.sections` 读取。`target_zone.mode` 控制目标区构建方式（当前仅 `filled_target_zone`）。
 
 ### `impedance_attribute_generator`
 
@@ -243,9 +255,9 @@ synthoseis_lite:
 
 ### calibrate（校准）阶段
 
-校准的目标是从井数据中提取一个冻结的、可复现的随机地质模型参数化。它不涉及任何神经网络或学习——纯统计。
+校准的目标是从井数据中提取一个冻结的、可复现的随机地质模型参数化。
 
-1. **投影井曲线到 TWT 轴：** 通过第四步的优化 TDT 将滤波后和完整的 log(AI) 从 MD 域分段积分平均到高分辨率 TWT 网格单元。每个网格单元的值是该单元内所有 MD 样本的积分平均，不是点采样。
+1. **投影井曲线到 TWT 轴：** 通过第四步的优化 TDT 将滤波后和完整的 log(AI) 从 MD 域分段积分平均到高分辨率 TWT 网格单元。每个网格单元的值是该单元内所有 MD 样本的积分平均。
 
 2. **逐区域背景拟合：** 对每个层位定义的区域，用滤波后的 log(AI) 做 OLS 线性背景拟合 `a + b*(2*zeta - 1)`，其中 zeta 是归一化 TWT 位置（0 到 1）。残差的标准差作为后续状态阈值的基础。
 

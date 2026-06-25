@@ -22,6 +22,7 @@ import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import numpy as np
@@ -65,18 +66,54 @@ def resolve_artifact_path(value: Any, *, root: Path, run_dir: Path) -> Path | No
     return candidates[0].resolve()
 
 
-def latest_run(output_root: str | Path, prefix: str, required_file: str) -> Path:
-    """Return the latest ``<prefix>_*`` run directory containing ``required_file``.
+def latest_run(output_root: str | Path, prefix: str, required_file: str | Sequence[str]) -> Path:
+    """Return the latest ``<prefix>_*`` run directory containing required file(s).
 
     This helper only discovers directories. Callers must still validate that
     the required file conforms to the expected CSV/NPZ schema.
     """
+    required_files = [required_file] if isinstance(required_file, str) else list(required_file)
     root = Path(output_root)
     pattern = f"{prefix}_*"
-    candidates = [p for p in root.glob(pattern) if p.is_dir() and (p / required_file).exists()]
+    candidates = [
+        p
+        for p in root.glob(pattern)
+        if p.is_dir() and all((p / name).exists() for name in required_files)
+    ]
     if not candidates:
-        raise FileNotFoundError(f"No run found under {root} for {pattern} containing {required_file!r}.")
+        raise FileNotFoundError(f"No run found under {root} for {pattern} containing {required_files!r}.")
     return sorted(candidates, key=lambda p: (p.stat().st_mtime, p.name))[-1]
+
+
+def latest_checked_run(
+    output_root: str | Path,
+    prefix: str,
+    *,
+    required_files: Sequence[str],
+    validator: Callable[[Path], None] | None = None,
+) -> Path:
+    """Return the latest run directory that has required files and passes validation."""
+    root = Path(output_root)
+    candidates = [
+        path
+        for path in root.glob(f"{prefix}_*")
+        if path.is_dir() and all((path / name).is_file() for name in required_files)
+    ]
+    checked = sorted(candidates, key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+    rejected: list[str] = []
+    for path in checked:
+        if validator is None:
+            return path
+        try:
+            validator(path)
+        except Exception as exc:
+            rejected.append(f"{path.name}: {exc}")
+            continue
+        return path
+    detail = f" Rejected candidates: {'; '.join(rejected)}" if rejected else ""
+    raise FileNotFoundError(
+        f"No valid run found under {root} for {prefix}_* containing {list(required_files)!r}.{detail}"
+    )
 
 
 def resolve_timestamped_output_dir(

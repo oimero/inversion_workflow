@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from cup.synthetic.calibration import GENERATOR_FAMILY
-from cup.utils.io import load_yaml_config, resolve_relative_path
+from cup.utils.io import resolve_relative_path
 
 
 DATA_SCHEMA = "synthoseis_lite_v1"
@@ -56,16 +56,16 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if "horizons" in field:
         raise ValueError("synthoseis_lite.geometry.field_conditioned.horizons is retired; use top-level target_interval.horizons.")
     if "sections" in field:
-        raise ValueError("synthoseis_lite.geometry.field_conditioned.sections is retired; use sections_file.")
+        raise ValueError("synthoseis_lite.geometry.field_conditioned.sections is retired; use synthoseis_lite.sections.")
     target_interval = _mapping(config.get("target_interval"), path="target_interval")
     horizons = target_interval.get("horizons")
-    sections_file = _required_text(root, "sections_file", path="synthoseis_lite")
-    sections_payload = load_yaml_config(resolve_relative_path(sections_file, root=Path.cwd()))
-    sections = sections_payload.get("sections")
+    if root.get("sections_file") is not None:
+        raise ValueError("synthoseis_lite.sections_file is retired; put sections in synthoseis_lite.sections.")
+    sections = root.get("sections")
     if not isinstance(horizons, list) or len(horizons) < 2:
-        raise ValueError("synthoseis_lite.geometry.field_conditioned.horizons needs at least two entries.")
+        raise ValueError("target_interval.horizons needs at least two entries.")
     if not isinstance(sections, list) or not sections:
-        raise ValueError("synthoseis_lite.geometry.field_conditioned.sections must be non-empty.")
+        raise ValueError("synthoseis_lite.sections must be non-empty.")
     horizon_items = []
     for index, item in enumerate(horizons):
         item = _mapping(item, path=f"synthoseis_lite.geometry.field_conditioned.horizons[{index}]")
@@ -77,7 +77,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         )
     section_items = []
     for index, item in enumerate(sections):
-        item = _mapping(item, path=f"synthoseis_lite.geometry.field_conditioned.sections[{index}]")
+        item = _mapping(item, path=f"synthoseis_lite.sections[{index}]")
         path_points = item.get("path")
         if not isinstance(path_points, list) or len(path_points) < 2:
             raise ValueError(f"sections[{index}].path needs at least two points.")

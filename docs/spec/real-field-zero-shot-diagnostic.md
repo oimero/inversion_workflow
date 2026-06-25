@@ -83,11 +83,12 @@ real_field_zero_shot:
     lfm_file: <real_field_lfm_v1/real_field_lfm.npz>
     lfm_value_transform: identity
     target_mask_file: <target-window mask or horizon-derived mask source>
-  model_set_file: experiments/model_sets/<candidate-set>.yaml
-  sections_file: experiments/sections/<sections>.yaml
+  models:
+    - model_run_dir: experiments/ginn_v2/results/<candidate-run-a>
+    - model_run_dir: experiments/ginn_v2/results/<candidate-run-b>
 ```
 
-真实地震体路径和类型来自顶层 `seismic`。`model_set_file` 每项只允许 `model_run_dir`；
+真实地震体路径和类型来自顶层 `seismic`。`models` 每项只允许 `model_run_dir`；
 R0 从 `model_run_manifest.json` 读取 `model_id`、角色、checkpoint、normalization、
 input reference stats、patch spec 和 `synthetic_gate_evidence`。
 

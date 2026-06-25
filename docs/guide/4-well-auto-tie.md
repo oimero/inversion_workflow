@@ -8,7 +8,7 @@
 
 ```bash
 python scripts/well_auto_tie.py
-python scripts/well_auto_tie.py --config experiments/common.yaml
+python scripts/well_auto_tie.py --config experiments/common/common.yaml
 python scripts/well_auto_tie.py --well <well-name>
 python scripts/well_auto_tie.py --output-dir scripts/output/well_auto_tie_test
 ```
@@ -96,7 +96,7 @@ well_auto_tie:
 | `vertical_anchor_from_tops` | 直井，无时深表 | 井分层 + 解释层位 + 预处理 LAS |
 | `deviated_with_tdt` | 斜井，有 Petrel 时深表和井轨迹 | 时深表 + 井轨迹 + 预处理 LAS |
 
-脚本自身的保守默认只启用前两条。主配置 `experiments/common.yaml` 额外启用了 `deviated_with_tdt`。如果你暂时不想跑斜井，从配置里删掉它即可——对应井会在 `well_tie_plan.csv` 里显示为 `skipped_disabled`，不会报错。
+脚本自身的保守默认只启用前两条。主配置 `experiments/common/common.yaml` 额外启用了 `deviated_with_tdt`。如果你暂时不想跑斜井，从配置里删掉它即可——对应井会在 `well_tie_plan.csv` 里显示为 `skipped_disabled`，不会报错。
 
 `deviated_anchor_from_tops`（斜井、无时深、有轨迹和分层）还没有落地，设计文档在 `docs/guide/deviated-well-src-cup-refactor.md`。
 

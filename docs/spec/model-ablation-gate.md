@@ -20,6 +20,15 @@
 - 报告：`scripts/ginn_v2.py report`
 - 核心包：`src/ginn_v2/`
 
+实验自动化分为两层：
+
+- 单模型 runner：`experiments/ginn_v2/train_network.ps1 <ExperimentName>`。它复制训练配置和入口脚本，
+  训练单个模型，并自动产出 `validation_base`、`test_base`、`validation_mismatch` 三组
+  `predict_*` / `report_*` 目录以及 `gate_candidate_manifest.json`。
+- 合成闸门 runner：`experiments/ginn_v2/run_synthetic_gate.ps1 <GateName> <NoLateralRun> <LateralRun>`。
+  它消费两条模型 run 的六份 report，生成全局 ablation summary/report card，并把同一份
+  synthetic gate evidence 盖章回两个 `model_run_manifest.json`。
+
 本文只冻结模型消融规范。具体网络结构、训练超参数和正式通过阈值必须由本闸门的实验结果
 再决定。
 

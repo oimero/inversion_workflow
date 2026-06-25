@@ -8,7 +8,7 @@
 
 ```bash
 python scripts/wavelet_generation.py
-python scripts/wavelet_generation.py --config experiments/common.yaml
+python scripts/wavelet_generation.py --config experiments/common/common.yaml
 python scripts/wavelet_generation.py --well <well-name>
 python scripts/wavelet_generation.py --debug
 python scripts/wavelet_generation.py --output-dir scripts/output/wavelet_generation_test

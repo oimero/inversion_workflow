@@ -7,7 +7,7 @@ conflicts, but does not read LAS curves or parse deviated-well trajectories.
 Usage::
 
     python scripts/well_inventory.py
-    python scripts/well_inventory.py --config experiments/common.yaml
+    python scripts/well_inventory.py --config experiments/common/common.yaml
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("experiments/common.yaml"),
+        default=Path("experiments/common/common.yaml"),
         help="Time-domain common config YAML.",
     )
     parser.add_argument(

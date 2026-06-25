@@ -12,7 +12,7 @@ python scripts/well_screen.py --config experiments/my_project.yaml
 python scripts/well_screen.py --output-dir /tmp/screen_test
 ```
 
-不带参数运行时，脚本读取 `experiments/common.yaml`，自动发现最新的 `well_inventory_*/well_inventory.csv`，在 `scripts/output/well_screen_<timestamp>/` 下写出结果。
+不带参数运行时，脚本读取 `experiments/common/common.yaml`，自动发现最新的 `well_inventory_*/well_inventory.csv`，在 `scripts/output/well_screen_<timestamp>/` 下写出结果。
 
 当前版本只使用可复现的本地 mnemonic 规则和人工 override。
 
@@ -57,7 +57,7 @@ well_screen:
 
   classification:
     curve_schema_file: null                  # null = 使用内置 CURVE_CATEGORY_MNEMONICS
-    curve_override_file: experiments/curve_alias_overrides.yaml
+    curve_override_file: experiments/common/curve_alias_overrides.yaml
 ```
 
 ### `source_runs`

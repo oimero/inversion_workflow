@@ -68,21 +68,71 @@ real_field_forward_diagnostic:
     candidate_wavelet_limit: 0                  # 默认 0（不限制）
 ```
 
+### `boundary`
+
+正演诊断时是否从连续有效 mask 段内侧做侵蚀，避免卷积边界伪影污染诊断统计：
+
+```yaml
+  boundary:
+    forward_diagnostic_erosion_s: 0.0
+```
+
+默认 `0.0`（不做侵蚀）。该侵蚀只作用于诊断统计区，不改写 R0 预测。
+
 ### `well_qc`
 
 控制井数据闭环检查。开启后从第四步读取所有标定成功井：用滤波 LAS 做正演基准、用低频模型做正演底线、用模型预测做正演对比。
 
-`max_xy_distance_m` 控制井位到推理网格迹的最大距离，井 QC 启用时必填。`include_deviated_wells` 控制是否包含斜井——体积模式默认包含，剖面模式默认排除。
+```yaml
+  well_qc:
+    enabled: true
+    max_xy_distance_m: 300.0
+    include_deviated_wells: false
+```
+
+| 参数 | 含义 |
+|------|------|
+| `enabled` | 开关。体积模式默认 `false`，剖面模式默认 `true` |
+| `max_xy_distance_m` | 井到推理网格迹的最大距离，井 QC 启用时必填 |
+| `include_deviated_wells` | 是否包含斜井。体积模式默认 `true`，剖面模式默认 `false` |
 
 ### `spectral_qc`
 
-不填时脚本按 `diagnostic_max_hz` 自动生成三段式频带划分。R1 的频带诊断比 R0 多一层：同时分析合成记录的频带拟合残差。只有需要自定义频带时才手动配置 `bands` 和 `manual_override_reason`。
+不填时按 `diagnostic_max_hz` 自动三等分。R1 的频带诊断比 R0 多一层：同时分析合成记录的频带拟合残差。需要自定义频带时：
+
+```yaml
+  spectral_qc:
+    bands:
+      - name: lowfreq
+        low_hz: 0.0
+        high_hz: 16.0
+      - name: observable_band
+        low_hz: 16.0
+        high_hz: 32.0
+      - name: highfreq_or_nullspace
+        low_hz: 32.0
+        high_hz: 80.0
+    manual_override_reason: "说明为什么不用默认三等分"
+```
+
+`bands` 每条必须有 `name`、`low_hz`、`high_hz`。`manual_override_reason` 在手动配置时必填。
 
 ### `diagnostic_scan`
 
-残差分解扫描参数。对每个阻抗输入做相位扫描和分数采样偏移扫描——如果残差能通过调整子波来显著降低，说明主要问题在子波或时深关系的不确定性，而非波阻抗本身有误。
+残差分解扫描参数。对每个阻抗输入做相位扫描和分数采样偏移扫描——如果残差能通过调整子波来显著降低，说明主要问题在子波或时深关系不确定性，而非波阻抗本身有误。
 
-`candidate_wavelet_limit` 控制子波敏感性检查使用的候选子波数量上限。设为 0 不限制。
+```yaml
+  diagnostic_scan:
+    phase_deg: [-20, -10, 0, 10, 20]
+    fractional_shift_samples: [-1.0, -0.5, 0.0, 0.5, 1.0]
+    candidate_wavelet_limit: 0
+```
+
+| 参数 | 默认 | 含义 |
+|------|------|------|
+| `phase_deg` | `[-20, -10, 0, 10, 20]` | 常相位扫描角度列表 |
+| `fractional_shift_samples` | `[-1.0, -0.5, 0.0, 0.5, 1.0]` | 分数采样偏移列表 |
+| `candidate_wavelet_limit` | `0` | 子波敏感性检查的候选子波数量上限。`0` 不限制 |
 
 ### `red_flag_thresholds`
 

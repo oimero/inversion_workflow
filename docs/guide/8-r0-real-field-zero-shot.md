@@ -102,19 +102,81 @@ real_field_zero_shot:
 
 ### `volume`
 
-控制输入体积的裁剪范围。留空 `{}` 时使用全工区。支持 `inline_start`/`inline_stop`、`xline_start`/`xline_stop`、`sample_start_s`/`sample_stop_s`，所有键可选。
+控制输入体积的裁剪范围。留空 `{}` 时使用全工区。支持以下可选键：
+
+```yaml
+  volume:
+    inline_start: 100
+    inline_stop: 500
+    xline_start: 200
+    xline_stop: 800
+    sample_start_s: 1.0
+    sample_stop_s: 2.5
+```
+
+四个范围键均为可选，只填需要裁剪的维度即可。常用于在小范围子体积上快速验证。
+
+### `boundary`
+
+控制推理边界的侵蚀和锥度参数，避免卷积边界伪影污染拼接结果：
+
+| 参数 | 默认 | 含义 |
+|------|------|------|
+| `loss_or_eval_erosion_s` | `0.0` | 从 patch 边缘向内侵蚀多少秒，不参与评估 |
+| `prediction_taper_halo_s` | `0.0` | 拼接时在 patch 边缘做锥度衰减的宽度 |
 
 ### `spectral_qc`
 
-不填时脚本按 `diagnostic_max_hz` 自动生成三段式频带划分。只有需要自定义频带边界时才手动配置 `bands` 和 `manual_override_reason`。
+不填时按 `diagnostic_max_hz` 自动三等分。需要自定义频带时：
+
+```yaml
+  spectral_qc:
+    bands:
+      - name: lowfreq
+        low_hz: 0.0
+        high_hz: 16.0
+      - name: observable_band
+        low_hz: 16.0
+        high_hz: 32.0
+      - name: highfreq_or_nullspace
+        low_hz: 32.0
+        high_hz: 80.0
+    manual_override_reason: "说明为什么不用默认三等分"
+```
+
+`bands` 是频带列表，每条必须有 `name`、`low_hz`、`high_hz`。`manual_override_reason` 在手动配置时必填。
 
 ### `well_qc`
 
 只在剖面模式下生效，体积模式下自动跳过。控制井位预测与滤波 LAS 的对比 QC。
 
+```yaml
+  well_qc:
+    enabled: true
+    max_xy_distance_m: 300.0
+    include_deviated_wells: false
+```
+
+| 参数 | 含义 |
+|------|------|
+| `enabled` | 开关，默认 `true`（但体积模式下忽略） |
+| `max_xy_distance_m` | 井到剖面迹的最大允许距离，必须显式填写 |
+| `include_deviated_wells` | 是否包含斜井，剖面模式默认 `false` |
+
 ### `volume_export`
 
 控制是否导出 ZGY 格式预测体，默认开启。
+
+```yaml
+  volume_export:
+    enabled: true
+    inline_chunk_size: 16
+```
+
+| 参数 | 默认 | 含义 |
+|------|------|------|
+| `enabled` | `true` | 是否导出 |
+| `inline_chunk_size` | `16` | ZGY 写入时的 inline 分块大小 |
 
 ---
 

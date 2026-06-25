@@ -98,24 +98,31 @@ python scripts/evaluate_synthoseis_lite.py \
 
 ```yaml
 # 配置文件：experiments/synthoseis_lite/synthoseis_lite.yaml
-# 顶层包含 data_root / output_root / assets / seismic / target_interval 等工区事实，
-# 以及 synthoseis_lite 段：
 
+# --- 必填 ---
 synthoseis_lite:
-  global_seed: 0
+  global_seed: <integer>
 
-  # source_runs 可留空 —— 自动发现最新第六步产物并反查第三/四/五步来源
-  source_runs:
-    forward_observability_dir: scripts/output/forward_observability_<timestamp>
-
-  # sections 必填，定义合成剖面的几何路径
   sections:
     - section_id: section_A
       path:
-        - {inline: 100, xline: 200}
-        - {inline: 150, xline: 250}
+        - {inline: <il>, xline: <xl>}
+        - {inline: <il>, xline: <xl>}
       resample_interval_m: 25.0
 
+target_interval:
+  horizons:
+    - {name: <top>, file: <horizon-file>}
+    - {name: <middle>, file: <horizon-file>}
+    - {name: <base>, file: <horizon-file>}
+
+# --- 可选（source_runs 缺失时自动发现最新第六步产物）---
+synthoseis_lite:
+  source_runs:
+    forward_observability_dir: scripts/output/forward_observability_<timestamp>
+
+# --- 可选（有默认值）---
+synthoseis_lite:
   sampling:
     expected_output_dt_s: 0.002
     vertical_oversampling_factor: 8
@@ -187,12 +194,6 @@ synthoseis_lite:
     lateral_shapes:
       - section_coherent
       - {name: localized_tukey, centered_fraction: 0.40, alpha: 0.5}
-
-target_interval:
-  horizons:
-    - {name: top_a, file: interpre/top_a}
-    - {name: middle_b, file: interpre/middle_b}
-    - {name: base_c, file: interpre/base_c}
 ```
 
 ### `global_seed`

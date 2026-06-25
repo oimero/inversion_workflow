@@ -1,4 +1,4 @@
-# 反演工作流
+# 工作流总览
 
 ```mermaid
 flowchart TB
@@ -26,8 +26,7 @@ flowchart TB
 
 | 步骤 | 配置文件 |
 |------|---------|
-| 01–05 · well_trajectory | `experiments/common/common.yaml` |
-| 06 · forward_observability | `experiments/common/common.yaml` |
+| 01–03 + well_trajectory + 04-06 | `experiments/common/common.yaml` |
 | 旁路 · synthoseis_lite | `experiments/synthoseis_lite/synthoseis_lite.yaml` |
 | 旁路 · ginn_v2 | `experiments/ginn_v2/train.yaml` |
 | 07 · real_field_lfm | `experiments/common/common.yaml` |

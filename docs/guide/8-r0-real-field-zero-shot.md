@@ -45,86 +45,76 @@ python scripts/real_field_zero_shot.py --output-dir scripts/output/real_field_ze
 
 ## 配置参考
 
-在 `experiments/common/common.yaml` 中：
-
 ```yaml
+# 以下字段写在 experiments/common/common.yaml 的 real_field_zero_shot 段下。
+
+# --- 必填 ---
 real_field_zero_shot:
-  mode: volume
-  device: cuda
-  stitch_strategy: uniform
-  diagnostic_max_hz: 80.0
-
-  real_field_inputs:
-    seismic_value_transform: p99_abs_matched
-    lfm_value_transform: identity
-
-  boundary:
-    loss_or_eval_erosion_s: 0.0
-    prediction_taper_halo_s: 0.0
-
-  spectral_qc:
-    bands:
-      - name: lowfreq
-        low_hz: 0.0
-        high_hz: 16.0
-      - name: observable_band
-        low_hz: 16.0
-        high_hz: 32.0
-      - name: highfreq_or_nullspace
-        low_hz: 32.0
-        high_hz: 80.0
-    manual_override_reason: "custom band boundaries"
-
-  well_qc:
-    enabled: true
-    max_xy_distance_m: 300.0
-    include_deviated_wells: false
-
-  volume_export:
-    enabled: true
-    inline_chunk_size: 16
-
   models:
     - model_run_dir: experiments/ginn_v2/results/<no_lateral_run>
     - model_run_dir: experiments/ginn_v2/results/<lateral_run>
+
+# --- 可选（有默认值）---
+real_field_zero_shot:
+  mode: volume                    # 默认 volume；可选 section
+  device: auto                    # 默认 auto；cuda / cpu / auto
+  stitch_strategy: uniform        # 默认 uniform；可选 center_crop
+  diagnostic_max_hz: 80.0         # 默认 80.0
+
+  real_field_inputs:
+    seismic_value_transform: identity    # 默认 identity；常见 p99_abs_matched
+    lfm_value_transform: identity        # 默认 identity
+    # lfm_file 缺失时自动发现第七步最新产物
+
+  boundary:
+    loss_or_eval_erosion_s: 0.0          # 默认 0.0
+    prediction_taper_halo_s: 0.0         # 默认 0.0
+
+  volume: {}                              # 默认 {}，留空即全工区
+    # inline_start / inline_stop / xline_start / xline_stop
+    # sample_start_s / sample_stop_s —— 可选裁剪子体积
+
+  spectral_qc:                            # 不填时自动按 diagnostic_max_hz 三等分
+    # bands 和 manual_override_reason 只在需要自定义频带时才配置
+
+  well_qc:                                # 只在剖面模式下生效，体积模式自动禁用
+    max_xy_distance_m: 300.0              # 默认不限制（但建议显式填写）
+    include_deviated_wells: false         # 剖面模式默认 false
+
+  volume_export:
+    enabled: true                         # 默认 true
+    inline_chunk_size: 16                 # 默认 16
 ```
-
-### `mode`
-
-支持两种模式：
-
-| 模式 | 适用场景 | 输入数据形状 |
-|------|---------|-------------|
-| `volume` | 全工区三维推理 | `[inline, xline, twt]` |
-| `section` | 单剖面快速验证 | `[lateral, twt]`（通过 `real_field_sections.yaml` 定义） |
-
-体积模式是默认和推荐模式。剖面模式只用于快速调试——此时必须提供恰好一个剖面的定义文件，且井质量控制会被自动禁用。
 
 ### `models`
 
-模型按 `model_run_dir` 逐一加载。通常包含两个模型：一个不含横向混合器（`trace_1d`），一个含横向混合器（`lateral_mixer`）。脚本自动按模型 ID 推断 `model_role`，输出时分别放在 `no_lateral` 和 `lateral` 子目录下。
+必填。模型按 `model_run_dir` 逐一加载，每个条目只需 `model_run_dir`。通常包含两个：一个不含横向混合器（推断为 `no_lateral`），一个含横向混合器（推断为 `lateral`）。
 
-### `seismic_value_transform`
+### `mode`
 
-控制输入地震数据的值域变换方式。常见值：
+支持 `volume`（全工区三维推理）和 `section`（单剖面快速验证）。默认 `volume`。剖面模式要求提供恰好一个剖面的定义文件（通过 `sections_file` 指定），且井 QC 自动禁用。
 
-- `identity` 或 `raw`：不做变换。要求模型在训练时也使用了相同的变换方式。
-- `p99_abs_matched`：用 P99 绝对值缩放。需要 `input_reference_stats.json`。
+### `real_field_inputs`
+
+- `seismic_value_transform`：地震数据值域变换方式。默认 `identity`。若设为 `p99_abs_matched` 等非 identity 值，需要模型的 `input_reference_stats.json`——脚本自动从第一个模型目录中读取。
+- `lfm_value_transform`：低频模型值域变换，默认 `identity`。
+- `lfm_file`：不填时自动发现第七步最新产物。
+
+### `volume`
+
+控制输入体积的裁剪范围。留空 `{}` 时使用全工区。支持 `inline_start`/`inline_stop`、`xline_start`/`xline_stop`、`sample_start_s`/`sample_stop_s`，所有键可选。
 
 ### `spectral_qc`
 
-脚本会默认把预测残差按频带拆分，输出各频带的能量分布。如果不想用默认的三段式划分（低频 / 可观测频带 / 高频或零空间），可以用 `bands` 手动指定频带，同时必须填写 `manual_override_reason` 说明原因。
+不填时脚本按 `diagnostic_max_hz` 自动生成三段式频带划分。只有需要自定义频带边界时才手动配置 `bands` 和 `manual_override_reason`。
 
 ### `well_qc`
 
-控制是否在剖面上用井数据做预测质量检查，只在剖面模式下生效。体积模式下井 QC 自动禁用。需要指定：
-
-- `max_xy_distance_m`：井到剖面迹的最大允许距离。超过此距离的井被跳过。
-- `include_deviated_wells`：是否包含斜井。剖面模式下默认关闭。
+只在剖面模式下生效，体积模式下自动跳过。控制井位预测与滤波 LAS 的对比 QC。
 
 ### `volume_export`
 
-控制是否把推理结果导出为 ZGY 格式的地震体，方便在地质软件中查看。默认为开启。
+控制是否导出 ZGY 格式预测体，默认开启。
 
 ---
 

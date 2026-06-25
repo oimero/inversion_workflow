@@ -32,47 +32,51 @@ python scripts/real_field_lfm.py --output-dir scripts/output/real_field_lfm_test
 
 ## 配置参考
 
-顶层 `target_interval.horizons` 定义目标层位（由浅到深，至少两个）。首层位和末层位之间的范围是完整目标窗；中间层位只用于 QC 和连续性检查，不拆分拟合。
-
 ```yaml
-# 顶层（必填）
+# 以下字段写在 experiments/common/common.yaml 的顶层或 real_field_lfm 段下。
+
+# --- 必填 ---
 target_interval:
   horizons:
     - {name: <top>, file: <horizon-file>}
     - {name: <bottom>, file: <horizon-file>}
-    # 中间层位可选
+    # 中间层位可选，只用于 QC
 
 seismic:
   file: <seismic-volume>
   type: zgy
 
-# real_field_lfm 段（有默认值，可不填）
+# --- 可选（有默认值）---
 real_field_lfm:
   output_geometry:
-    mode: volume
-    target_context_s: 0.05
+    mode: volume                    # 默认 volume
+    target_context_s: 0.05          # 默认 0.05
 
   trend_fit:
-    min_valid_samples_per_well: 32
-    huber_f_scale_log_ai: 0.05
+    min_valid_samples_per_well: 32  # 默认 32
+    huber_f_scale_log_ai: 0.05      # 默认 0.05
 
   parameter_modeling:
-    min_wells: 3
-    allow_constant_fallback: false
-    variogram: spherical
-    nugget: 0.0
+    min_wells: 3                    # 默认 3
+    allow_constant_fallback: false  # 默认 false
+    variogram: spherical            # 默认 spherical，可选 exponential / gaussian
+    nugget: 0.0                     # 默认 0.0
 
   lfm_qc:
-    min_time_diff_rms: 1.0e-4
-    min_trace_time_std_median: 1.0e-4
+    min_time_diff_rms: 1.0e-4       # 默认 1.0e-4
+    min_trace_time_std_median: 1.0e-4  # 默认 1.0e-4
 ```
+
+### `target_interval.horizons`
+
+从浅到深排列的层位列表，长度至少为 2。首层位和末层位之间的范围是完整目标窗，中间层位只用于 QC 和连续性检查，不拆分拟合。
 
 ### `output_geometry`
 
 | 参数 | 含义 |
 |------|------|
 | `mode` | `volume`（全工区三维）或 `section`（单剖面）。目前主要使用 volume |
-| `target_context_s` | 在顶层位之上和底层位之下各额外包含多少秒的输出上下文，默认 0.05 s |
+| `target_context_s` | 在顶层位之上和底层位之下各额外包含多少秒的输出上下文 |
 
 ### `trend_fit`
 
@@ -80,11 +84,11 @@ real_field_lfm:
 
 ### `parameter_modeling`
 
-控制 a、b 两个系数的空间参数场建模。脚本用 ordinary kriging（基于真实 XY 米制坐标）插值两个系数场。`min_wells` 控制最少需要多少口趋势合格的井；不足时运行失败（除非显式打开 `allow_constant_fallback`）。`variogram` 可选 `spherical`、`exponential` 或 `gaussian`。
+控制 a、b 两个系数的空间参数场建模。脚本用 ordinary kriging（基于真实 XY 米制坐标）插值两个系数场。`min_wells` 控制最少需要多少口趋势合格的井；不足时运行失败，除非显式打开 `allow_constant_fallback`。`variogram` 可选 `spherical`、`exponential` 或 `gaussian`。
 
 ### `lfm_qc`
 
-输出 LFM 的基本结构检查阈值。`min_time_diff_rms` 和 `min_trace_time_std_median` 用于检测 LFM 是否过于平坦——如果时间方向的差异或标准差低于阈值，标记 `lfm_time_flat_or_invalid`。
+输出 LFM 的基本结构检查阈值。`min_time_diff_rms` 和 `min_trace_time_std_median` 用于检测 LFM 是否过于平坦——如果低于阈值，标记 `lfm_time_flat_or_invalid`。
 
 ---
 

@@ -35,81 +35,63 @@ python scripts/real_field_forward_diagnostic.py --output-dir scripts/output/real
 
 ## 配置参考
 
-在 `experiments/common/common.yaml` 中：
-
 ```yaml
+# 以下字段写在 experiments/common/common.yaml 的 real_field_forward_diagnostic 段下。
+
+# --- 必填 ---
+# real_field_forward_diagnostic 段本身必须存在，但内部参数均可选。
+# zero_shot_dir 缺失时自动发现最新 R0 产物。
+real_field_forward_diagnostic: {}
+
+# --- 可选（有默认值）---
 real_field_forward_diagnostic:
-  diagnostic_max_hz: 80.0
+  diagnostic_max_hz: 80.0             # 默认 80.0
 
   boundary:
-    forward_diagnostic_erosion_s: 0.0
+    forward_diagnostic_erosion_s: 0.0 # 默认 0.0（不侵蚀）
 
   well_qc:
-    enabled: true
-    max_xy_distance_m: 300.0
-    include_deviated_wells: true
+    enabled: true                     # 体积模式默认 false，剖面模式默认 true
+    max_xy_distance_m: 300.0          # 井 QC 启用时必填
+    include_deviated_wells: false     # 体积模式默认 true，剖面模式默认 false
 
   red_flag_thresholds:
-    seismic_ood_fraction_abs_gt5: 0.05
-    lateral_nullspace_energy_ratio: 0.5
+    seismic_ood_fraction_abs_gt5: 0.05    # 默认 0.05
+    lateral_nullspace_energy_ratio: 0.5   # 默认 0.5
 
-  spectral_qc:
-    bands:
-      - name: lowfreq
-        low_hz: 0.0
-        high_hz: 16.0
-      - name: observable_band
-        low_hz: 16.0
-        high_hz: 32.0
-      - name: highfreq_or_nullspace
-        low_hz: 32.0
-        high_hz: 80.0
-    manual_override_reason: "custom band boundaries"
+  spectral_qc:                        # 不填时自动按 diagnostic_max_hz 三等分
+    # bands 和 manual_override_reason 只在需要自定义频带时才配置
 
   diagnostic_scan:
-    phase_deg: [-20, -10, 0, 10, 20]
-    fractional_shift_samples: [-1.0, -0.5, 0.0, 0.5, 1.0]
-    candidate_wavelet_limit: 0
+    phase_deg: [-20, -10, 0, 10, 20]           # 默认值
+    fractional_shift_samples: [-1.0, -0.5, 0.0, 0.5, 1.0]  # 默认值
+    candidate_wavelet_limit: 0                  # 默认 0（不限制）
 ```
-
-### `diagnostic_max_hz`
-
-诊断频率上限。默认 80 Hz。脚本内部还会用地震采样间隔算出的奈奎斯特频率做硬上限。
 
 ### `well_qc`
 
-控制井数据闭环检查。开启后脚本从第四步读取所有标定成功的井，做三件事：
+控制井数据闭环检查。开启后从第四步读取所有标定成功井：用滤波 LAS 做正演基准、用低频模型做正演底线、用模型预测做正演对比。
 
-1. 用每口井的滤波 LAS 做正演合成，作为“最佳可达到的正演匹配”基准。
-2. 用低频模型做正演合成，作为“模型必须超过的底线”。
-3. 用每个模型的预测波阻抗做正演合成，与观测地震比较。
-
-`max_xy_distance_m` 控制井位到推理网格迹的最大距离。`include_deviated_wells` 控制是否包含斜井——体积模式下默认包含，剖面模式下默认排除。
+`max_xy_distance_m` 控制井位到推理网格迹的最大距离，井 QC 启用时必填。`include_deviated_wells` 控制是否包含斜井——体积模式默认包含，剖面模式默认排除。
 
 ### `spectral_qc`
 
-默认和 R0 一样用三段式频带划分。R1 的频带诊断比 R0 多一层含义：它不仅分析预测波阻抗在各频带的能量，还分析正演合成记录在各频带的拟合残差。
+不填时脚本按 `diagnostic_max_hz` 自动生成三段式频带划分。R1 的频带诊断比 R0 多一层：同时分析合成记录的频带拟合残差。只有需要自定义频带时才手动配置 `bands` 和 `manual_override_reason`。
 
 ### `diagnostic_scan`
 
-残差分解扫描的参数。脚本对每个阻抗输入做相位扫描（±20° 范围）和分数采样偏移扫描（±1.0 样本范围），检查残差能否通过调整子波相位或对齐来显著降低——如果可以，说明残差的主要来源是子波或时深关系的不确定性，而非波阻抗本身有误。
+残差分解扫描参数。对每个阻抗输入做相位扫描和分数采样偏移扫描——如果残差能通过调整子波来显著降低，说明主要问题在子波或时深关系的不确定性，而非波阻抗本身有误。
 
-`candidate_wavelet_limit` 控制子波敏感性检查中使用的候选子波数量。设为 0 表示不限制，所有第四步的候选子波都参与。数量过多会显著增加运行时间。
+`candidate_wavelet_limit` 控制子波敏感性检查使用的候选子波数量上限。设为 0 不限制。
 
 ### `red_flag_thresholds`
 
-自动红色告警的阈值：
-
 | 参数 | 含义 |
 |------|------|
-| `seismic_ood_fraction_abs_gt5` | R0 输入地震标准化后，绝对值超过 5 个标准差的样本比例上限。超过此比例意味着真实地震分布与训练分布严重不匹配。 |
-| `lateral_nullspace_energy_ratio` | 两个模型预测差异中，高频率频带能量占比上限。超过此比例意味着横向混合器引入的差异集中在零空间——这通常是不可靠的。 |
+| `seismic_ood_fraction_abs_gt5` | R0 输入地震标准化后超过 5σ 的样本比例上限 |
+| `lateral_nullspace_energy_ratio` | 两个模型差异在高频零空间带的能量占比上限 |
 
 ---
-
-## 脚本在做什么
-
-脚本分五个阶段：**加载 → 正演 → 残差诊断 → 井闭环 → 综合判定**。
 
 ### 第一阶段：加载与校验
 

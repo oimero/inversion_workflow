@@ -61,43 +61,42 @@ python scripts/ginn_v2.py stamp-gate \
 ```yaml
 # 配置文件：experiments/ginn_v2/train.yaml
 
+# --- 必填 ---
 train:
   benchmark_dir: auto          # auto = 自动找最新合成基准，也可填显式路径
-  model_id: trace_1d_dilated_tcn_mismatch_training
-  model_role: no_lateral       # 留空则从 model_id 自动推断
 
-  # 切块参数
-  patch_lateral: 32            # 横向样本数
-  patch_twt: 128               # 时间方向样本数
-  lateral_stride: 16           # 横向滑动步长
-  twt_stride: 64               # 时间方向滑动步长
-  min_valid_fraction: 0.50     # 块内最低有效像素比例
+# --- 可选（有默认值）---
+train:
+  model_id: patch_2d_supervised          # 默认 patch_2d_supervised
+  model_role:                            # 默认自动从 model_id 推断
 
-  # 数据划分
-  split_policy: derive         # derive = 按剖面分组划分；strict = 随机划分
-  validation_fraction: 0.15    # 校验集比例
-  test_fraction: 0.15          # 测试集比例
-  max_patches:                 # 限制最大块数，留空则使用全量
+  patch_lateral: 32                      # 默认 32
+  patch_twt: 128                         # 默认 128
+  lateral_stride: 16                     # 默认 16
+  twt_stride: 64                         # 默认 64
+  min_valid_fraction: 0.50               # 默认 0.50
 
-  # 训练超参
-  epochs: 5
-  batch_size: 8
-  learning_rate: 0.001
-  hidden_channels: 32
-  depth: 5
+  split_policy: derive                   # 默认 derive；可选 strict
+  validation_fraction: 0.15              # 默认 0.15
+  test_fraction: 0.15                    # 默认 0.15
 
-  # 设备与种子
-  device: auto
-  seed: 0
+  epochs: 5                              # 默认 5
+  batch_size: 8                          # 默认 8
+  learning_rate: 0.001                   # 默认 0.001
+  hidden_channels: 32                    # 默认 32
+  depth: 5                               # 默认 5
 
-  # 物理正演辅助损失。设为 >0 时仅对 base 样本生效。
+  device: auto                           # 默认 auto
+  seed: 0                                # 没有默认值，训练时建议显式指定
+
+  # 物理正演辅助损失，>0 时仅对 base 样本生效
   # 支持模型：patch_2d_with_physics_loss、trace_1d_dilated_tcn_mismatch_training
-  lambda_physics: 0.0
+  lambda_physics: 0.0                    # 默认 0.0
 ```
 
 ### `benchmark_dir`
 
-设为 `auto` 时，脚本从 `experiments/synthoseis_lite/results/` 下搜索含 `generate_field_conditioned` 子目录且关键文件齐全的最新结果。也可以直接填写合成基准目录的路径来锁定特定版本。
+必填。设为 `auto` 时从 `experiments/synthoseis_lite/results/` 下搜索含 `generate_field_conditioned` 子目录且关键文件齐全的最新结果。也可以直接填写路径锁定特定版本。
 
 ### `model_id`
 

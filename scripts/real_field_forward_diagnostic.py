@@ -26,6 +26,7 @@ from cup.seismic.viz import plot_well_waveform_qc
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.config.sources import assert_same_path, load_summary, resolve_source_file_from_run, resolve_source_run
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
+from cup.utils.statistics import radius_connected_components
 from ginn_v2.real_field import (
     diagnostic_metrics,
     forward_log_ai,
@@ -722,9 +723,45 @@ def _load_well_inventory_info(cfg: dict) -> dict[str, dict[str, object]]:
         info[well] = {
             "inline_float": _coerce_float(row.get("inline_float")),
             "xline_float": _coerce_float(row.get("xline_float")),
+            "surface_x": _coerce_float(row.get("surface_x")),
+            "surface_y": _coerce_float(row.get("surface_y")),
             "wellbore_class": str(row.get("wellbore_class", "")),
         }
     return info
+
+
+def _well_spatial_clusters(
+    inventory_info: Mapping[str, Mapping[str, object]],
+    run_cfg: dict,
+    *,
+    well_names: set[str],
+) -> dict[str, dict[str, object]]:
+    wells = []
+    xy = []
+    for well_name, info in inventory_info.items():
+        if str(well_name) not in well_names:
+            continue
+        x = _coerce_float(info.get("surface_x"))
+        y = _coerce_float(info.get("surface_y"))
+        if not (well_name and np.isfinite(x) and np.isfinite(y)):
+            continue
+        wells.append(str(well_name))
+        xy.append((x, y))
+    if not wells:
+        return {}
+    spatial_cfg = dict(run_cfg.get("spatial_debias") or {})
+    radius_m = float(spatial_cfg.get("cluster_radius_m", 600.0))
+    labels = radius_connected_components(np.asarray(xy, dtype=np.float64), radius_m)
+    sizes: dict[int, int] = {}
+    for label in labels:
+        sizes[int(label)] = sizes.get(int(label), 0) + 1
+    return {
+        well: {
+            "spatial_cluster_id": int(label),
+            "spatial_cluster_size": int(sizes[int(label)]),
+        }
+        for well, label in zip(wells, labels)
+    }
 
 
 def _well_ai_metrics(*, well_log_ai: np.ndarray, pred_log_ai: np.ndarray, valid: np.ndarray) -> dict[str, object]:
@@ -820,7 +857,7 @@ def _well_sampling_coordinates(
     inventory: Mapping[str, object],
     twt_s: np.ndarray,
     include_deviated: bool,
-) -> tuple[str, np.ndarray, np.ndarray, np.ndarray, str]:
+) -> tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]:
     well = str(tie.get("well_name", "")).strip()
     wellbore_class = str(inventory.get("wellbore_class") or "")
     plan_text = str(tie.get("optimized_trace_sample_plan_file") or "").strip()
@@ -838,17 +875,23 @@ def _well_sampling_coordinates(
             pd.to_numeric(plan["inline_float"], errors="coerce").to_numpy(dtype=np.float64),
             pd.to_numeric(plan["xline_float"], errors="coerce").to_numpy(dtype=np.float64),
             pd.to_numeric(plan["twt_s"], errors="coerce").to_numpy(dtype=np.float64),
+            pd.to_numeric(plan["x_m"], errors="coerce").to_numpy(dtype=np.float64) if "x_m" in plan else np.full(plan.shape[0], np.nan, dtype=np.float64),
+            pd.to_numeric(plan["y_m"], errors="coerce").to_numpy(dtype=np.float64) if "y_m" in plan else np.full(plan.shape[0], np.nan, dtype=np.float64),
             wellbore_class,
         )
     inline_value = _coerce_float(inventory.get("inline_float"))
     xline_value = _coerce_float(inventory.get("xline_float"))
     if not (np.isfinite(inline_value) and np.isfinite(xline_value)):
         raise ValueError(f"Missing inline/xline for well {well}")
+    x_value = _coerce_float(inventory.get("surface_x"))
+    y_value = _coerce_float(inventory.get("surface_y"))
     return (
         "volume_vertical_bilinear",
         np.full(twt_s.shape, inline_value, dtype=np.float64),
         np.full(twt_s.shape, xline_value, dtype=np.float64),
         np.asarray(twt_s, dtype=np.float64),
+        np.full(twt_s.shape, x_value, dtype=np.float64),
+        np.full(twt_s.shape, y_value, dtype=np.float64),
         wellbore_class or "vertical",
     )
 
@@ -866,10 +909,10 @@ def _build_volume_well_forward_qc(
     ilines: np.ndarray,
     xlines: np.ndarray,
     twt_s: np.ndarray,
-) -> tuple[pd.DataFrame, dict[str, str]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, str]]:
     well_cfg = dict(run_cfg.get("well_qc") or {})
     if not bool(well_cfg.get("enabled", False)):
-        return pd.DataFrame.from_records([{"status": "disabled_by_config"}]), {}
+        return pd.DataFrame.from_records([{"status": "disabled_by_config"}]), pd.DataFrame(), {}
     well_auto_tie_text = str(well_cfg.get("well_auto_tie_dir") or "").strip()
     if not well_auto_tie_text:
         raise ValueError("real_field_forward_diagnostic.well_qc.well_auto_tie_dir must be explicit when well_qc is enabled.")
@@ -877,10 +920,16 @@ def _build_volume_well_forward_qc(
     metrics = pd.read_csv(well_auto_tie_dir / "well_tie_metrics.csv")
     metrics = metrics[metrics["tie_status"].astype(str).eq("success")].copy()
     inventory_info = _load_well_inventory_info(well_cfg)
+    spatial_clusters = _well_spatial_clusters(
+        inventory_info,
+        run_cfg,
+        well_names={str(value) for value in metrics["well_name"].dropna().unique()},
+    )
     include_deviated = bool(well_cfg.get("include_deviated_wells", True))
     dt_s = float(np.median(np.diff(twt_s))) if twt_s.size > 1 else 0.002
     bands = _configured_bands(run_cfg, dt_s=dt_s)
     rows: list[dict[str, object]] = []
+    sample_rows: list[dict[str, object]] = []
     figures: dict[str, str] = {}
     figures_dir = output_dir / "figures" / "wells"
     figures_dir.mkdir(parents=True, exist_ok=True)
@@ -890,7 +939,7 @@ def _build_volume_well_forward_qc(
         inventory = inventory_info.get(well_name, {})
         base_common = {"well_name": well_name, "sampling_mode": "volume"}
         try:
-            sample_method, sample_ilines, sample_xlines, sample_twt, wellbore_class = _well_sampling_coordinates(
+            sample_method, sample_ilines, sample_xlines, sample_twt, sample_x_m, sample_y_m, wellbore_class = _well_sampling_coordinates(
                 tie=tie,
                 inventory=inventory,
                 twt_s=twt_s,
@@ -933,6 +982,9 @@ def _build_volume_well_forward_qc(
             sample_twt_s=sample_twt,
         )
         model_valid = valid_inside & lfm_inside & (valid_trace > 0.5)
+        cluster_info = spatial_clusters.get(well_name, {})
+        spatial_cluster_id = cluster_info.get("spatial_cluster_id", -1)
+        spatial_cluster_size = cluster_info.get("spatial_cluster_size", 1)
         filtered_synthetic = forward_log_ai(well_log_ai[None, :], wavelet)[0]
         forward_twt = sample_twt[1:]
         forward_ilines = sample_ilines[1:]
@@ -1022,6 +1074,78 @@ def _build_volume_well_forward_qc(
             )
             role_valid = model_valid & pred_inside & (weight_trace > 0.0)
             ai_metrics = _well_ai_metrics(well_log_ai=well_log_ai, pred_log_ai=pred_trace, valid=role_valid)
+            r0_valid_mask = valid_inside & pred_inside & (valid_trace > 0.5)
+            well_twt_support_valid = lfm_inside & np.isfinite(well_log_ai)
+            finite_for_fit = (
+                role_valid
+                & well_twt_support_valid
+                & np.isfinite(lfm_trace)
+                & np.isfinite(pred_trace)
+                & np.isfinite(well_log_ai)
+            )
+            for sample_index, (
+                sample_twt_value,
+                inline_value,
+                xline_value,
+                x_value,
+                y_value,
+                filtered_value,
+                lfm_value,
+                pred_value,
+                r0_mask_value,
+                weight_value,
+                support_value,
+                fit_value,
+            ) in enumerate(
+                zip(
+                    sample_twt,
+                    sample_ilines,
+                    sample_xlines,
+                    sample_x_m,
+                    sample_y_m,
+                    well_log_ai,
+                    lfm_trace,
+                    pred_trace,
+                    r0_valid_mask,
+                    weight_trace,
+                    well_twt_support_valid,
+                    finite_for_fit,
+                )
+            ):
+                reason = "ok"
+                if not bool(support_value):
+                    reason = "well_twt_support_invalid"
+                elif not bool(r0_mask_value):
+                    reason = "r0_valid_mask_false"
+                elif not (np.isfinite(weight_value) and weight_value > 0.0):
+                    reason = "r0_blend_weight_nonpositive"
+                elif not (np.isfinite(filtered_value) and np.isfinite(lfm_value) and np.isfinite(pred_value)):
+                    reason = "nonfinite_ai_sample"
+                sample_rows.append(
+                    {
+                        "well_name": well_name,
+                        "sample_index": int(sample_index),
+                        "twt_s": float(sample_twt_value),
+                        "inline": float(inline_value),
+                        "xline": float(xline_value),
+                        "x_m": float(x_value),
+                        "y_m": float(y_value),
+                        "spatial_cluster_id": spatial_cluster_id,
+                        "spatial_cluster_size": spatial_cluster_size,
+                        "filtered_log_ai": float(filtered_value) if np.isfinite(filtered_value) else np.nan,
+                        "lfm_log_ai": float(lfm_value) if np.isfinite(lfm_value) else np.nan,
+                        "model_role": role,
+                        "r0_pred_log_ai": float(pred_value) if np.isfinite(pred_value) else np.nan,
+                        "r0_valid_mask": bool(r0_mask_value),
+                        "r0_blend_weight": float(weight_value) if np.isfinite(weight_value) else np.nan,
+                        "well_twt_support_valid": bool(support_value),
+                        "valid_for_fit": bool(fit_value),
+                        "valid_reason": reason if not bool(fit_value) else "ok",
+                        "sampling_mode": "volume",
+                        "sample_method": sample_method,
+                        "wellbore_class": wellbore_class,
+                    }
+                )
             local_spectrum: dict[str, object] = {}
             pred_delta_trace, _ = _sample_volume_bilinear(
                 np.asarray(arrays["pred_delta_vs_lfm"], dtype=np.float64),
@@ -1092,7 +1216,8 @@ def _build_volume_well_forward_qc(
                 }
             )
     frame = pd.DataFrame.from_records(rows)
-    return frame, figures
+    samples = pd.DataFrame.from_records(sample_rows)
+    return frame, samples, figures
 
 
 def _plot_volume_well_qc_case(
@@ -1933,7 +2058,11 @@ def _write_well_closure_tables(
     bands = _configured_bands(run_cfg)
     comparison_rows: list[dict[str, object]] = []
     band_rows: list[dict[str, object]] = []
-    roles = ["lateral", "no_lateral"]
+    roles = [
+        str(role)
+        for role in sorted(well_frame["model_role"].dropna().unique())
+        if str(role) not in {"", "filtered_las", "lfm_input"}
+    ]
     wells = sorted(str(value) for value in well_frame["well_name"].dropna().unique())
     for well_name in wells:
         lfm = _first_row(well_frame, well_name=well_name, role="lfm_input")
@@ -2109,6 +2238,7 @@ def main() -> None:
     run_cfg = dict(cfg.get("real_field_forward_diagnostic") or {})
     if not run_cfg:
         raise ValueError("experiments/common/common.yaml lacks real_field_forward_diagnostic section.")
+    run_cfg["spatial_debias"] = dict(cfg.get("spatial_debias") or run_cfg.get("spatial_debias") or {})
     output_root = resolve_relative_path(cfg.get("output_root", "scripts/output"), root=REPO_ROOT)
     zero_shot_dir = _resolve_zero_shot_dir(run_cfg, output_root=output_root, cli_value=args.zero_shot_dir)
     zero_shot_summary = _load_zero_shot_summary(zero_shot_dir)
@@ -2258,8 +2388,9 @@ def main() -> None:
     spatial_frame = pd.DataFrame.from_records(spatial_rows)
     spatial_frame.to_csv(spatial_path, index=False)
     well_path = output_dir / "well_forward_diagnostic.csv"
+    well_samples_path = output_dir / "well_ai_samples.csv"
     if output_mode == "volume":
-        well_frame, well_figure_outputs = _build_volume_well_forward_qc(
+        well_frame, well_samples_frame, well_figure_outputs = _build_volume_well_forward_qc(
             run_cfg=run_cfg,
             output_dir=output_dir,
             predictions=predictions,
@@ -2281,7 +2412,33 @@ def main() -> None:
             synthetic_dir=synthetic_dir,
             wavelet=wavelet,
         )
+        well_samples_frame = pd.DataFrame(
+            columns=[
+                "well_name",
+                "sample_index",
+                "twt_s",
+                "inline",
+                "xline",
+                "x_m",
+                "y_m",
+                "spatial_cluster_id",
+                "spatial_cluster_size",
+                "filtered_log_ai",
+                "lfm_log_ai",
+                "model_role",
+                "r0_pred_log_ai",
+                "r0_valid_mask",
+                "r0_blend_weight",
+                "well_twt_support_valid",
+                "valid_for_fit",
+                "valid_reason",
+                "sampling_mode",
+                "sample_method",
+                "wellbore_class",
+            ]
+        )
     well_frame.to_csv(well_path, index=False)
+    well_samples_frame.to_csv(well_samples_path, index=False)
     if output_mode == "volume" and not {"well_name", "model_role"}.issubset(well_frame.columns):
         well_comparison_frame = pd.DataFrame()
         well_band_frame = pd.DataFrame()
@@ -2331,6 +2488,7 @@ def main() -> None:
         "outputs": {
             "forward_diagnostic_metrics": repo_relative_path(metrics_path, root=REPO_ROOT),
             "well_forward_diagnostic": repo_relative_path(well_path, root=REPO_ROOT),
+            "well_ai_samples": repo_relative_path(well_samples_path, root=REPO_ROOT),
             "residual_decomposition": repo_relative_path(decomposition_path, root=REPO_ROOT),
             "wavelet_sensitivity": repo_relative_path(wavelet_sensitivity_path, root=REPO_ROOT),
             "spatial_residual_qc": repo_relative_path(spatial_path, root=REPO_ROOT),

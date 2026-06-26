@@ -1,6 +1,6 @@
 # 核心 CSV 契约
 
-这些 CSV 是当前工作流的跨脚本契约，覆盖主链第一至八步及两个旁路。
+这些 CSV 是当前工作流的跨脚本契约，覆盖主链第一至八步及三个旁路。
 
 下游读取上游结果时必须按本文解释字段语义，不得凭字段名猜测。
 标题中标记“诊断”的 CSV 只供人工审阅。
@@ -378,3 +378,240 @@ HDF5 文件，每个 sample 为一个 group，包含 `model_target_log_ai`、
 ### `evaluation_summary.json`
 
 包含 benchmark 文件 SHA-256、输出文件列表及各文件 SHA-256，确保评估可复现。
+
+## 旁路 · ginn_v2.py
+
+模型消融训练与评估。训练产物被第八步 R0 消费，汇总产物供人工审阅。
+
+### `model_run_manifest.json`
+
+消费者：第八步 R0 `real_field_zero_shot.py`
+
+训练完成时写出。R0 从此文件读取模型元数据和标准化参数，不扫描目录猜测。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `schema_version` | 固定 `ginn_v2_model_run_v1` |
+| `model_id` | 模型架构标识，来自注册的 10 个 ID 之一 |
+| `model_role` | `lateral` 或 `no_lateral`，决定 R0 输出子目录名。训练时自动从 `model_id` 推断，也可显式指定 |
+| `benchmark_dir` | 训练使用的合成基准目录 |
+| `benchmark_hashes` | 合成基准三文件（`.h5` / `sample_index.csv` / `benchmark_manifest.json`）的 SHA-256 |
+| `patch_spec` | 切块规格：`lateral_samples` / `twt_samples` / `lateral_stride` / `twt_stride` / `min_valid_fraction` |
+| `normalization` | 训练集统计：seismic/LFM/target/delta 的 mean/std |
+| `input_channels` | 固定 `["seismic", "lfm_controlled_degraded", "valid_mask_model"]` |
+| `train_sample_kinds` | 训练使用的样本类别列表 |
+| `loss` | 损失配置：`lambda_ai` / `lambda_physics` / `physics_loss_applied_sample_kinds` |
+| `model_info` | 参数量、感受野（lateral/twt）、输入/输出通道数 |
+| `checkpoint` | 模型权重文件路径 |
+| `best_validation_loss` | 最佳校验损失 |
+| `synthetic_gate_evidence` | 由 `stamp-gate` 盖章写入；R0 必检字段，缺失则拒绝推理 |
+
+### `input_reference_stats.json`
+
+消费者：第八步 R0
+
+当 R0 的 `seismic_value_transform` 非 identity 时，从此文件读取合成训练集地震的参考统计量，用于将真实地震变换到训练时的值域。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `stats` | 合成训练集地震的统计量（mean/std/P99 等） |
+| `sampling` | 统计所基于的样本信息 |
+| `file` | 本文件路径 |
+| `sha256` | 本文件 SHA-256 |
+
+## 07 · real_field_lfm.py
+
+第七步产物供第八步 R0 消费。schema 为 `real_field_lfm_v1`。
+
+### `real_field_lfm.npz`
+
+消费者：`real_field_zero_shot.py`
+
+| 数组 | 含义 |
+|------|------|
+| `log_ai` | 三维 `log(AI)` 低频模型，shape `[n_inline, n_xline, n_twt]` |
+| `valid_mask_model` | 目标层内且有效处为 true，R0 的权威有效边界 |
+| `lfm_support_mask` | 离控制井足够近处为 true，仅用于空间外推风险 QC |
+| `distance_to_control` | 每个网格点到最近控制井的距离，仅作 QC |
+| `a_field` | 趋势截距参数场，shape `[n_inline, n_xline]` |
+| `b_field` | 趋势斜率参数场，shape `[n_inline, n_xline]` |
+| `ilines` / `xlines` / `samples` | 坐标轴 |
+| `metadata_json` | schema 版本、值域、层位名、来源路径、地震体 SHA-256 |
+
+重建公式：`log_ai = a_field + b_field * (2*u - 1)`，其中 `u` 是顶底层位间的归一化坐标。
+
+### `well_trend_controls.csv`
+
+每口井的趋势拟合结果，一行一井。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `well_name` | 井名 |
+| `a` / `b` | Huber 回归拟合的趋势系数 |
+| `representative_x_m` / `representative_y_m` | 代表位置的真实 XY 坐标 |
+| `representative_inline` / `representative_xline` | 代表位置的 inline/xline |
+| `n_fit_samples` | 目标窗内有效 TWT 样点数 |
+| `residual_rms` | 趋势拟合的残差 RMS |
+| `status` | `ok` 或拒绝原因 |
+
+### `parameter_field_qc.csv`
+
+a/b 参数场的空间建模 QC，两行（一行 a、一行 b）。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `parameter` | `a` 或 `b` |
+| `n_controls` | 参与克里金的控制井数 |
+| `range_hint_m` | 从最近邻距离中位数估计的 range hint |
+| `variance_p50` / `variance_p95` | 克里金方差的分位数 |
+| `distance_to_control_p50_m` / `distance_to_control_p95_m` | 离最近控制井距离的分位数 |
+| `outside_control_hull_fraction` | 网格在控制点凸包外的比例 |
+| `variogram` / `nugget` | 变差函数模型和块金值 |
+
+### `internal_horizon_continuity_qc.csv`
+
+逐中间层位检查 LFM 在层位上下样点间是否存在非物理跃变。
+
+### `horizon_qc.csv`
+
+层位有效率、厚度统计、交叉道数、超出 TDT 支持的井数。
+
+### `real_field_lfm_summary.json`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `schema_version` | 固定 `real_field_lfm_v1` |
+| `status` | `ok` / `warning` / `insufficient_control_wells` |
+| `control_wells` | 接受/拒绝/总数 |
+| `lfm_stats` | 时间差分 RMS、每道时间标准差、横向标准差等 |
+| `source_runs` | 上游第四步和第一步来源路径 |
+| `outputs` | 所有输出文件路径 |
+
+## 08 R0 · real_field_zero_shot.py
+
+R0 产物供 R1 消费。schema 为 `real_field_zero_shot_summary_v1`。
+
+### `predictions.npz`（每个模型子目录）
+
+消费者：`real_field_forward_diagnostic.py`
+
+| 数组 | 含义 |
+|------|------|
+| `stitched_pred_log_ai` | 拼接后的最终预测 `log(AI)` |
+| `pred_delta_vs_lfm` | 预测与低频模型的差值 |
+| `lfm_input` | 输入的低频模型 |
+| `seismic_input` | 变换后的地震输入 |
+| `valid_mask_model` | 有效掩码 |
+| `stitching_weight` | patch 拼接权重 |
+| `ilines` / `xlines` / `twt_s` | 坐标轴 |
+
+### `real_field_zero_shot_summary.json`
+
+消费者：`real_field_forward_diagnostic.py`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `schema_version` | 固定 `real_field_zero_shot_summary_v1` |
+| `status` | 固定 `needs_forward_diagnostic`，表示尚未正演验证 |
+| `mode` | `volume` 或 `section` |
+| `source_runs` | 上游第五步、第七步来源路径 |
+| `axis_contract` | 坐标轴范围、采样间隔 |
+| `mask_contract` | 有效掩码比例和总数 |
+| `boundary_contract` | 侵蚀和锥度参数 |
+| `source_file_sha256` | 输入文件（地震体、LFM、子波等）的 SHA-256 |
+| `models` | 逐模型的推理元数据、标准化参数、输出路径 |
+| `outputs` | 所有输出文件路径 |
+| `wavelet_sha256` | 使用的全局子波 SHA-256 |
+
+### `model_input_qc.csv`
+
+真实工区输入在送入模型前的标准化分布检查。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `input` | 输入通道名（seismic / lfm） |
+| `fraction_abs_normalized_gt_3` / `fraction_abs_normalized_gt_5` | 标准化后超过 3σ / 5σ 的样本比例 |
+
+### `real_field_spectral_qc.csv`
+
+每个模型 × 每个频带的预测差值能量和可观测性证据联表。每行带 `observability_evidence_status` / `dominant_evidence_status` / `operator_support_summary` / `detectability_ratio_p25_range` 等第六步证据字段。
+
+### `lateral_difference_band_qc.csv`
+
+两模型预测差值的逐频带能量分析。若高频零空间带能量占比超阈值，标记 `lateral_difference_concentrated_in_nullspace`。
+
+## 08 R1 · real_field_forward_diagnostic.py
+
+R1 是当前流程的最终闭环。schema 为 `real_field_forward_diagnostic_summary_v1`。
+
+### `forward_diagnostic_metrics.csv`
+
+每个阻抗输入 × 子波场景一行。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `model_role` | `lfm_only` / `zero_shot_no_lateral` / `zero_shot_lateral` |
+| `source_role` | 阻抗来源标识 |
+| `forward_operator_id` | 正演算子标识，约定文档字符串 |
+| `reflectivity_hang_point` | 反射系数挂点约定 |
+| `residual_corr_raw` / `residual_corr_scaled` | 无缩放 / 带正尺度优化的相关系数 |
+| `residual_rms_raw` / `residual_rms_scaled` | 标准化后的残差 RMS |
+| `scale_positive` / `scale_status` | 正约束最小二乘缩放因子和状态 |
+
+### `well_forward_diagnostic.csv`
+
+逐井 × 逐角色（filtered_las / lfm_input / lateral / no_lateral）一行。包含四组指标：
+
+| 指标组 | 关键字段 |
+|--------|---------|
+| 波阻抗闭环 | `well_ai_rmse` / `well_ai_bias` / `well_ai_corr` / `well_ai_n_valid` |
+| 频带拆分 | `well_ai_<band>_rmse` / `well_ai_<band>_corr` / `pred_delta_<band>_rms` |
+| 波形匹配 | `waveform_residual_corr_scaled` / `waveform_residual_rms_scaled` / `waveform_scale_status` |
+| 井分类 | `status` / `classification` / `classification_explanation` |
+
+`filtered_las` 行是参考基准（自比 RMSE=0、corr=1），`lfm_input` 行是模型必须击败的基线。
+
+### `residual_decomposition.csv`
+
+每个阻抗输入的相位和分数偏移扫描结果。`scan_type` 为 `phase` 或 `fractional_shift`，记录各扫描点的 `residual_rms_scaled`。若最优相位远离 0° 或最优偏移远离 0，残差可通过调整子波来部分消除。
+
+### `wavelet_sensitivity.csv`
+
+候选子波场景下的正演诊断指标，评估子波不确定性对结论的影响。
+
+### `spatial_residual_qc.csv`
+
+逐 inline / xline 的残差模式，检查是否存在系统性空间偏差。
+
+### `forward_band_residual_qc.csv`
+
+各频带的观测 RMS、合成 RMS、残差 RMS 和残差/观测比值。
+
+### `ai_plausibility_qc.csv`
+
+预测波阻抗和预测差值的全局统计分布、频带能量、与训练分布的对比。含 `real_to_synthetic_std_ratio` 字段用于判断真实工区预测的幅度是否在训练集见过的范围内。
+
+### `well_ai_comparison_summary.csv`
+
+逐井 × 逐角色的 LFM vs 模型对比和分类。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `rmse_delta_model_minus_lfm` | 模型 RMSE - LFM RMSE，负值表示改善 |
+| `corr_delta_model_minus_lfm` | 模型 corr - LFM corr，正值表示改善 |
+| `classification` | `model_improves_ai` / `shape_improves_bias_worse` / `bias_improves_shape_worse` / `waveform_good_ai_worse` / `filtered_las_weak_reference` / `mixed_or_insufficient` |
+
+### `well_ai_band_comparison.csv`
+
+逐井 × 逐角色 × 逐频带的 RMSE 和相关系数，用于定位模型在哪个频带改善或退化了井曲线匹配。
+
+### `real_field_forward_diagnostic_summary.json`
+
+| 关键字段 | 含义 |
+|----------|------|
+| `schema_version` | 固定 `real_field_forward_diagnostic_summary_v1` |
+| `status` | `ok` |
+| `forward_contract` | 正演约定：反射率公式、卷积约定、对齐方式、丢弃样点数 |
+| `red_flags` | 自动红色告警列表，空列表表示无致命问题 |
+| `recommended_next_state` | `return_to_input_preparation_or_synthetic_diagnostic`（有告警）或 `future_sparse_well_adapter_candidate`（无告警） |
+| `wavelet_sha256` / `zero_shot_summary_sha256` | 输入文件校验值 |

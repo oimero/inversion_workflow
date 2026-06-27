@@ -1,4 +1,4 @@
-"""Build the Step 7 real-field LFM and model-grid well-target package.
+"""Build a reproducible real-field log(AI) LFM for R0 zero-shot input.
 
 This module is intentionally separate from the historical time-domain LFM
 pipeline.  It does not consume well-constraint control points and does not use
@@ -37,9 +37,7 @@ from cup.seismic.horizon import (
 )
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.volume_export import export_volume_like_source
-from cup.synthetic.forward import antialias_taps, downsample_continuous
 from cup.utils.io import (
-    array_sha256,
     load_yaml_config,
     repo_relative_path,
     resolve_artifact_path,
@@ -47,21 +45,18 @@ from cup.utils.io import (
     sha256_file,
     write_json,
 )
-from cup.utils.statistics import radius_connected_components
 from cup.well.assets import normalize_well_name
 from cup.well.las import read_las_curve
 from cup.well.td import load_workflow_time_depth_table_csv
 
 
-SCHEMA_VERSION = "real_field_model_inputs_v2"
+SCHEMA_VERSION = "real_field_lfm_v1"
 
 
 @dataclass(frozen=True)
-class RealFieldModelInputsConfig:
+class RealFieldLfmConfig:
     source_runs: dict[str, str]
     well_inventory_file: str
-    synthetic_benchmark_dir: str
-    spatial_cluster_radius_m: float
     seismic: dict[str, Any]
     horizons: tuple[dict[str, str], ...]
     trend_fit: dict[str, Any]
@@ -84,15 +79,13 @@ class OutputGeometry:
     y_grid_m: np.ndarray | None = None
 
 
-def parse_real_field_model_inputs_config(raw: Mapping[str, Any]) -> RealFieldModelInputsConfig:
-    if "real_field_lfm" in raw:
-        raise ValueError("real_field_lfm is retired; use real_field_model_inputs and rerun Step 7.")
-    root = _mapping(raw.get("real_field_model_inputs"), "real_field_model_inputs")
-    source_runs = _mapping(root.get("source_runs"), "real_field_model_inputs.source_runs")
+def parse_real_field_lfm_config(raw: Mapping[str, Any]) -> RealFieldLfmConfig:
+    root = _mapping(raw.get("real_field_lfm"), "real_field_lfm")
+    source_runs = _mapping(root.get("source_runs"), "real_field_lfm.source_runs")
     if "seismic" in root:
-        raise ValueError("real_field_model_inputs.seismic is retired; use top-level seismic.")
+        raise ValueError("real_field_lfm.seismic is retired; use top-level seismic.")
     if "target_interval" in root:
-        raise ValueError("real_field_model_inputs.target_interval is retired; use top-level target_interval.")
+        raise ValueError("real_field_lfm.target_interval is retired; use top-level target_interval.")
     horizons_parent = _mapping(raw.get("target_interval"), "target_interval")
     horizons_raw = horizons_parent.get("horizons")
     if not isinstance(horizons_raw, (list, tuple)) or len(horizons_raw) < 2:
@@ -110,31 +103,23 @@ def parse_real_field_model_inputs_config(raw: Mapping[str, Any]) -> RealFieldMod
         horizons.append({"name": name, "file": file})
     output_geometry = dict(root.get("output_geometry") or {"mode": "volume"})
     if isinstance(output_geometry.get("section"), Mapping):
-        raise ValueError("real_field_model_inputs.output_geometry.section is retired; use sections_file.")
+        raise ValueError("real_field_lfm.output_geometry.section is retired; use sections_file.")
     if str(output_geometry.get("mode") or "volume").casefold() == "section":
-        sections_file = _required_text(root, "sections_file", path="real_field_model_inputs")
+        sections_file = _required_text(root, "sections_file", path="real_field_lfm")
         sections_payload = load_yaml_config(resolve_relative_path(sections_file, root=Path.cwd()))
         sections = sections_payload.get("sections")
         if not isinstance(sections, list) or len(sections) != 1:
-            raise ValueError("real_field_model_inputs section mode requires sections_file with exactly one section.")
+            raise ValueError("real_field_lfm section mode requires sections_file with exactly one section.")
         output_geometry["section"] = dict(sections[0])
-    spatial = _mapping(raw.get("spatial_debias"), "spatial_debias")
-    return RealFieldModelInputsConfig(
+    return RealFieldLfmConfig(
         source_runs={
             "well_auto_tie_dir": _required_text(
                 source_runs,
                 "well_auto_tie_dir",
-                path="real_field_model_inputs.source_runs",
-            ),
-            "well_preprocess_dir": _required_text(
-                source_runs,
-                "well_preprocess_dir",
-                path="real_field_model_inputs.source_runs",
-            ),
+                path="real_field_lfm.source_runs",
+            )
         },
-        well_inventory_file=_required_text(root, "well_inventory_file", path="real_field_model_inputs"),
-        synthetic_benchmark_dir=_required_text(root, "synthetic_benchmark_dir", path="real_field_model_inputs"),
-        spatial_cluster_radius_m=float(spatial.get("cluster_radius_m", 600.0)),
+        well_inventory_file=_required_text(root, "well_inventory_file", path="real_field_lfm"),
         seismic=_mapping(raw.get("seismic"), "seismic"),
         horizons=tuple(horizons),
         trend_fit=dict(root.get("trend_fit") or {}),
@@ -144,9 +129,9 @@ def parse_real_field_model_inputs_config(raw: Mapping[str, Any]) -> RealFieldMod
     )
 
 
-def run_real_field_model_inputs(
+def run_real_field_lfm(
     *,
-    config: RealFieldModelInputsConfig,
+    config: RealFieldLfmConfig,
     repo_root: Path,
     data_root: Path,
     output_dir: Path,
@@ -156,28 +141,15 @@ def run_real_field_model_inputs(
     figures_dir.mkdir(parents=True, exist_ok=True)
 
     well_auto_tie_dir = resolve_relative_path(config.source_runs["well_auto_tie_dir"], root=repo_root)
-    well_preprocess_dir = resolve_relative_path(config.source_runs["well_preprocess_dir"], root=repo_root)
     well_inventory_file = resolve_relative_path(config.well_inventory_file, root=repo_root)
-    benchmark_dir = resolve_relative_path(config.synthetic_benchmark_dir, root=repo_root)
-    benchmark_manifest_path = benchmark_dir / "benchmark_manifest.json"
     metrics_path = well_auto_tie_dir / "well_tie_metrics.csv"
     if not metrics_path.is_file():
         raise FileNotFoundError(f"well_tie_metrics.csv not found: {metrics_path}")
     if not well_inventory_file.is_file():
         raise FileNotFoundError(f"well_inventory_file not found: {well_inventory_file}")
-    preprocess_status_path = well_preprocess_dir / "well_preprocess_status.csv"
-    if not preprocess_status_path.is_file():
-        raise FileNotFoundError(f"well_preprocess_status.csv not found: {preprocess_status_path}")
-    projection = _load_projection_contract(benchmark_manifest_path)
-    projection["benchmark_manifest"] = repo_relative_path(benchmark_manifest_path, root=repo_root)
-    _validate_auto_tie_preprocess_source(
-        well_auto_tie_dir=well_auto_tie_dir,
-        well_preprocess_dir=well_preprocess_dir,
-        repo_root=repo_root,
-    )
 
     seismic_path = resolve_relative_path(
-        _required_text(config.seismic, "file", path="real_field_model_inputs.seismic"),
+        _required_text(config.seismic, "file", path="real_field_lfm.seismic"),
         root=data_root,
     )
     seismic_type = str(config.seismic.get("type", "zgy")).casefold()
@@ -211,24 +183,6 @@ def run_real_field_model_inputs(
     controls = _attach_control_xy(controls, survey.line_geometry)
     controls_path = output_dir / "well_trend_controls.csv"
     controls.to_csv(controls_path, index=False)
-
-    targets, target_qc = _build_well_targets(
-        metrics_path=metrics_path,
-        preprocess_status_path=preprocess_status_path,
-        inventory_path=well_inventory_file,
-        well_auto_tie_dir=well_auto_tie_dir,
-        well_preprocess_dir=well_preprocess_dir,
-        repo_root=repo_root,
-        sample_axis=output_geometry.samples,
-        line_geometry=survey.line_geometry,
-        controls=controls,
-        projection=projection,
-        cluster_radius_m=config.spatial_cluster_radius_m,
-    )
-    targets_path = output_dir / "well_model_targets.csv"
-    target_qc_path = output_dir / "well_model_target_qc.csv"
-    targets.to_csv(targets_path, index=False)
-    target_qc.to_csv(target_qc_path, index=False)
 
     accepted = controls[controls["status"].eq("ok")].copy()
     min_wells = int(config.parameter_modeling.get("min_wells", 3))
@@ -270,13 +224,10 @@ def run_real_field_model_inputs(
             lfm_stats={},
             outputs={
                 "well_trend_controls": controls_path,
-                "well_model_targets": targets_path,
-                "well_model_target_qc": target_qc_path,
                 "parameter_field_qc": parameter_qc_path,
             },
         )
-        summary["target_projection"] = projection
-        write_json(output_dir / "real_field_model_inputs_summary.json", summary)
+        write_json(output_dir / "real_field_lfm_summary.json", summary)
         return summary
 
     fields, parameter_qc, distance_to_control = _build_parameter_fields(
@@ -293,8 +244,6 @@ def run_real_field_model_inputs(
     )
     lfm_stats = _lfm_stats(log_ai, valid_mask)
     lfm_status = _lfm_status(lfm_stats, config.lfm_qc)
-    if lfm_status == "ok" and not target_qc["status"].astype(str).eq("ok").all():
-        lfm_status = "warning"
 
     npz_path = output_dir / "real_field_lfm.npz"
     metadata = {
@@ -305,9 +254,6 @@ def run_real_field_model_inputs(
         "output_geometry_mode": output_geometry.mode,
         "horizon_names": [item["name"] for item in config.horizons],
         "well_auto_tie_dir": repo_relative_path(well_auto_tie_dir, root=repo_root),
-        "well_preprocess_dir": repo_relative_path(well_preprocess_dir, root=repo_root),
-        "benchmark_manifest": repo_relative_path(benchmark_manifest_path, root=repo_root),
-        "benchmark_manifest_sha256": sha256_file(benchmark_manifest_path),
         "well_inventory_file": repo_relative_path(well_inventory_file, root=repo_root),
         "seismic_file": repo_relative_path(seismic_path, root=repo_root),
         "seismic_sha256": sha256_file(seismic_path),
@@ -367,8 +313,6 @@ def run_real_field_model_inputs(
         lfm_stats=lfm_stats,
         outputs={
             "real_field_lfm": npz_path,
-            "well_model_targets": targets_path,
-            "well_model_target_qc": target_qc_path,
             **({"real_field_lfm_export": Path(export_payload["path"])} if export_payload.get("path") else {}),
             "well_trend_controls": controls_path,
             "parameter_field_qc": parameter_qc_path,
@@ -378,12 +322,7 @@ def run_real_field_model_inputs(
         },
     )
     summary["volume_export"] = export_payload
-    summary["target_projection"] = projection
-    summary["target_wells"] = {
-        "n_wells": int(targets["well_name"].nunique()),
-        "n_valid_samples": int(targets["target_valid"].sum()),
-    }
-    write_json(output_dir / "real_field_model_inputs_summary.json", summary)
+    write_json(output_dir / "real_field_lfm_summary.json", summary)
     return summary
 
 
@@ -460,291 +399,6 @@ def _load_horizon_surfaces(
             }
         )
     return surfaces, pd.DataFrame.from_records(qc_rows)
-
-
-def _load_projection_contract(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        raise FileNotFoundError(f"benchmark_manifest.json not found: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    antialias = _mapping(payload.get("antialias_filter"), "benchmark_manifest.antialias_filter")
-    output_dt_s = float(payload["output_dt_s"])
-    truth_dt_s = float(payload["truth_dt_s"])
-    factor = int(antialias["factor"])
-    if not np.isclose(output_dt_s / truth_dt_s, factor, rtol=0.0, atol=1e-9):
-        raise ValueError("benchmark projection dt/factor mismatch")
-    implementation = str(antialias["implementation"])
-    if implementation != "scipy.signal.firwin/resample_poly":
-        raise ValueError(f"unsupported benchmark antialias implementation: {implementation}")
-    numtaps = int(antialias["numtaps"])
-    if numtaps != 32 * factor + 1:
-        raise ValueError(f"benchmark antialias numtaps mismatch: {numtaps} != {32 * factor + 1}")
-    taps = antialias_taps(
-        factor,
-        cutoff_output_nyquist_fraction=float(antialias["cutoff_output_nyquist_fraction"]),
-        kaiser_beta=float(antialias["kaiser_beta"]),
-    )
-    taps_hash = array_sha256(taps)
-    expected_hash = str(antialias["taps_sha256"])
-    if taps_hash != expected_hash:
-        raise ValueError(f"benchmark antialias taps hash mismatch: {taps_hash} != {expected_hash}")
-    return {
-        "benchmark_manifest": str(path),
-        "benchmark_manifest_sha256": sha256_file(path),
-        "output_dt_s": output_dt_s,
-        "truth_dt_s": truth_dt_s,
-        "implementation": implementation,
-        "factor": factor,
-        "numtaps": numtaps,
-        "cutoff_output_nyquist_fraction": float(antialias["cutoff_output_nyquist_fraction"]),
-        "kaiser_beta": float(antialias["kaiser_beta"]),
-        "taps_sha256": taps_hash,
-    }
-
-
-def _validate_auto_tie_preprocess_source(
-    *, well_auto_tie_dir: Path, well_preprocess_dir: Path, repo_root: Path
-) -> None:
-    summary_path = well_auto_tie_dir / "run_summary.json"
-    if not summary_path.is_file():
-        raise FileNotFoundError(f"well auto-tie run_summary.json not found: {summary_path}")
-    payload = json.loads(summary_path.read_text(encoding="utf-8"))
-    recorded = _required_text(_mapping(payload.get("inputs"), "auto_tie.inputs"), "preprocess_status_file", path="auto_tie.inputs")
-    recorded_path = resolve_relative_path(recorded, root=repo_root)
-    expected = (well_preprocess_dir / "well_preprocess_status.csv").resolve()
-    if recorded_path.resolve() != expected:
-        raise ValueError(f"auto-tie preprocess source mismatch: {recorded_path} != {expected}")
-
-
-def _build_well_targets(
-    *,
-    metrics_path: Path,
-    preprocess_status_path: Path,
-    inventory_path: Path,
-    well_auto_tie_dir: Path,
-    well_preprocess_dir: Path,
-    repo_root: Path,
-    sample_axis: np.ndarray,
-    line_geometry: Any,
-    controls: pd.DataFrame,
-    projection: Mapping[str, Any],
-    cluster_radius_m: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    metrics = pd.read_csv(metrics_path)
-    preprocess = pd.read_csv(preprocess_status_path)
-    inventory = pd.read_csv(inventory_path)
-    for label, frame in (("metrics", metrics), ("preprocess", preprocess), ("inventory", inventory)):
-        if "well_name" not in frame:
-            raise ValueError(f"{label} table lacks well_name")
-        frame["_well_key"] = frame["well_name"].map(normalize_well_name)
-        if frame["_well_key"].duplicated().any():
-            raise ValueError(f"duplicate normalized well in {label} table")
-    pre_by_key = {str(row["_well_key"]): row for _, row in preprocess.iterrows()}
-    inv_by_key = {str(row["_well_key"]): row for _, row in inventory.iterrows()}
-    controls_by_key = {
-        normalize_well_name(str(row["well_name"])): row for _, row in controls.iterrows()
-    }
-    successful = metrics[metrics["tie_status"].astype(str).str.casefold().eq("success")].copy()
-    if successful.empty:
-        raise ValueError("Step 7 has no successful auto-tie wells for target construction")
-
-    model_dt = _regular_dt(sample_axis)
-    expected_dt = float(projection["output_dt_s"])
-    if not np.isclose(model_dt, expected_dt, rtol=0.0, atol=1e-9):
-        raise ValueError(f"model sample dt does not match benchmark output dt: {model_dt} != {expected_dt}")
-    target_rows: list[dict[str, Any]] = []
-    qc_rows: list[dict[str, Any]] = []
-    positions: list[tuple[str, float, float]] = []
-
-    for _, metric in successful.iterrows():
-        well_name = str(metric["well_name"])
-        key = normalize_well_name(well_name)
-        pre = pre_by_key.get(key)
-        inv = inv_by_key.get(key)
-        control = controls_by_key.get(key)
-        is_lfm_control = bool(control is not None and str(control.get("status", "")) == "ok")
-        lfm_status = "ok" if is_lfm_control else str(control.get("reason", "not_evaluated") if control is not None else "not_evaluated")
-        base_qc = {
-            "well_name": well_name,
-            "status": "rejected",
-            "reason": "",
-            "valid_sample_count": 0,
-            "gap_rejected_count": 0,
-            "fir_support_rejected_count": 0,
-            "full_ai_source": "",
-            "full_ai_sha256": "",
-            "optimized_tdt_sha256": "",
-        }
-        try:
-            if pre is None or str(pre.get("preprocess_status", "")).casefold() != "passed":
-                raise ValueError("preprocess_status_not_passed")
-            if inv is None:
-                raise ValueError("missing_well_inventory")
-            full_las = _required_artifact(
-                pre.get("preprocessed_las"), run_dir=well_preprocess_dir, repo_root=repo_root,
-                label=f"{well_name} preprocessed_las",
-            )
-            tdt_path = _required_artifact(
-                metric.get("optimized_tdt_file"), run_dir=well_auto_tie_dir, repo_root=repo_root,
-                label=f"{well_name} optimized_tdt_file",
-            )
-            table = load_workflow_time_depth_table_csv(tdt_path)
-            if not table.is_md_domain:
-                raise ValueError("optimized_tdt_not_md_domain")
-            full = read_las_curve(full_las, "AI", match_policy="exact", allow_all_nan=True)
-            target, projection_qc = _project_full_ai_to_model_grid(
-                full.basis, full.values, table=table, model_axis=sample_axis, projection=projection
-            )
-            trace_plan = _load_trace_plan(
-                metric.get("optimized_trace_sample_plan_file"),
-                run_dir=well_auto_tie_dir,
-                repo_root=repo_root,
-            )
-            inline, xline, x_m, y_m, sample_method = _well_coordinates_on_axis(
-                sample_axis=sample_axis, inv=inv, trace_plan=trace_plan, line_geometry=line_geometry
-            )
-            trajectory_valid = np.isfinite(inline) & np.isfinite(xline) & np.isfinite(x_m) & np.isfinite(y_m)
-            target_valid = np.isfinite(target) & trajectory_valid
-            wellbore_class = str(inv.get("wellbore_class", "unknown"))
-            tie_start = _coerce_float(metric.get("tie_window_start_s"))
-            tie_end = _coerce_float(metric.get("tie_window_end_s"))
-            rep_valid = trajectory_valid
-            if not np.any(rep_valid):
-                raise ValueError("no_valid_trajectory_positions")
-            positions.append((well_name, float(np.nanmedian(x_m[rep_valid])), float(np.nanmedian(y_m[rep_valid]))))
-            for index, twt in enumerate(sample_axis):
-                if target_valid[index]:
-                    reason = "ok"
-                elif not trajectory_valid[index]:
-                    reason = "trajectory_invalid"
-                else:
-                    reason = "target_projection_invalid"
-                target_rows.append({
-                    "well_name": well_name,
-                    "sample_index": int(index),
-                    "twt_s": float(twt),
-                    "inline": float(inline[index]) if np.isfinite(inline[index]) else np.nan,
-                    "xline": float(xline[index]) if np.isfinite(xline[index]) else np.nan,
-                    "x_m": float(x_m[index]) if np.isfinite(x_m[index]) else np.nan,
-                    "y_m": float(y_m[index]) if np.isfinite(y_m[index]) else np.nan,
-                    "target_log_ai": float(target[index]) if np.isfinite(target[index]) else np.nan,
-                    "target_valid": bool(target_valid[index]),
-                    "target_reason": reason,
-                    "sample_method": sample_method,
-                    "wellbore_class": wellbore_class,
-                    "is_lfm_control": is_lfm_control,
-                    "lfm_control_status": lfm_status,
-                    "tie_window_start_s": tie_start,
-                    "tie_window_end_s": tie_end,
-                })
-            qc_rows.append({
-                **base_qc,
-                "status": "ok" if np.any(target_valid) else "rejected",
-                "reason": "" if np.any(target_valid) else "no_valid_projected_samples",
-                "valid_sample_count": int(np.count_nonzero(target_valid)),
-                "valid_twt_min_s": _nanquantile(sample_axis[target_valid], 0.0),
-                "valid_twt_max_s": _nanquantile(sample_axis[target_valid], 1.0),
-                "gap_rejected_count": int(projection_qc["gap_rejected_count"]),
-                "fir_support_rejected_count": int(projection_qc["fir_support_rejected_count"]),
-                "full_ai_source": repo_relative_path(full_las, root=repo_root),
-                "full_ai_sha256": sha256_file(full_las),
-                "optimized_tdt_sha256": sha256_file(tdt_path),
-            })
-        except Exception as exc:
-            qc_rows.append({**base_qc, "reason": f"{type(exc).__name__}:{exc}"})
-
-    if not target_rows:
-        raise ValueError("Step 7 produced no well target rows")
-    frame = pd.DataFrame.from_records(target_rows)
-    if not frame["target_valid"].astype(bool).any():
-        raise ValueError("Step 7 produced no valid target_log_ai samples")
-    pos_frame = pd.DataFrame(positions, columns=["well_name", "cluster_x_m", "cluster_y_m"])
-    if pos_frame.empty or pos_frame[["cluster_x_m", "cluster_y_m"]].isna().any().any():
-        raise ValueError("cannot build spatial clusters from target-well positions")
-    pos_frame["spatial_cluster_id"] = radius_connected_components(
-        pos_frame[["cluster_x_m", "cluster_y_m"]].to_numpy(dtype=np.float64),
-        float(cluster_radius_m),
-    )
-    pos_frame["spatial_cluster_size"] = pos_frame.groupby("spatial_cluster_id")["well_name"].transform("count").astype(int)
-    frame = frame.merge(
-        pos_frame[["well_name", "spatial_cluster_id", "spatial_cluster_size"]],
-        on="well_name", how="left", validate="many_to_one",
-    )
-    ordered = [
-        "well_name", "sample_index", "twt_s", "inline", "xline", "x_m", "y_m",
-        "spatial_cluster_id", "spatial_cluster_size", "target_log_ai", "target_valid",
-        "target_reason", "sample_method", "wellbore_class", "is_lfm_control",
-        "lfm_control_status", "tie_window_start_s", "tie_window_end_s",
-    ]
-    return frame[ordered].sort_values(["well_name", "sample_index"]), pd.DataFrame.from_records(qc_rows)
-
-
-def _project_full_ai_to_model_grid(
-    md_m: np.ndarray,
-    ai: np.ndarray,
-    *,
-    table: Any,
-    model_axis: np.ndarray,
-    projection: Mapping[str, Any],
-) -> tuple[np.ndarray, dict[str, int]]:
-    factor = int(projection["factor"])
-    truth_dt = float(projection["truth_dt_s"])
-    n_high = (int(model_axis.size) - 1) * factor + 1
-    high_axis = float(model_axis[0]) + np.arange(n_high, dtype=np.float64) * truth_dt
-    high_values = _piecewise_cell_average_log_ai(md_m, ai, table=table, centers_s=high_axis, dt_s=truth_dt)
-    finite = np.isfinite(high_values)
-    taps = antialias_taps(
-        factor,
-        cutoff_output_nyquist_fraction=float(projection["cutoff_output_nyquist_fraction"]),
-        kaiser_beta=float(projection["kaiser_beta"]),
-    )
-    projected = downsample_continuous(np.where(finite, high_values, 0.0), factor, taps)
-    projected = projected[: model_axis.size]
-    support = np.zeros(model_axis.size, dtype=bool)
-    half = taps.size // 2
-    for index in range(model_axis.size):
-        center = index * factor
-        left, right = center - half, center + half + 1
-        support[index] = left >= 0 and right <= n_high and bool(np.all(finite[left:right]))
-    projected[~support] = np.nan
-    model_cell = _piecewise_cell_average_log_ai(
-        md_m, ai, table=table, centers_s=model_axis, dt_s=float(projection["output_dt_s"])
-    )
-    gap_rejected = np.isfinite(model_cell) & ~support
-    return projected, {
-        "gap_rejected_count": int(np.count_nonzero(gap_rejected)),
-        "fir_support_rejected_count": int(np.count_nonzero(~support)),
-    }
-
-
-def _well_coordinates_on_axis(
-    *, sample_axis: np.ndarray, inv: pd.Series, trace_plan: pd.DataFrame | None, line_geometry: Any
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]:
-    if trace_plan is not None and not trace_plan.empty:
-        required = {"twt_s", "inline_float", "xline_float", "x_m", "y_m"}
-        missing = required - set(trace_plan.columns)
-        if missing:
-            raise ValueError(f"trace plan missing coordinate columns: {sorted(missing)}")
-        twt = pd.to_numeric(trace_plan["twt_s"], errors="coerce").to_numpy(dtype=np.float64)
-        arrays = [pd.to_numeric(trace_plan[key], errors="coerce").to_numpy(dtype=np.float64) for key in ("inline_float", "xline_float", "x_m", "y_m")]
-        finite = np.isfinite(twt)
-        for values in arrays:
-            finite &= np.isfinite(values)
-        if np.count_nonzero(finite) < 2:
-            raise ValueError("invalid_optimized_trace_sample_plan")
-        order = np.argsort(twt[finite])
-        source_twt = twt[finite][order]
-        output = [np.interp(sample_axis, source_twt, values[finite][order], left=np.nan, right=np.nan) for values in arrays]
-        return output[0], output[1], output[2], output[3], "volume_trace_plan_bilinear"
-    inline_value = _coerce_float(inv.get("inline_float"))
-    xline_value = _coerce_float(inv.get("xline_float"))
-    if not np.isfinite(inline_value) or not np.isfinite(xline_value):
-        raise ValueError("missing_inventory_inline_xline")
-    x_value, y_value = line_geometry.line_to_coord(inline_value, xline_value)
-    shape = sample_axis.shape
-    return (
-        np.full(shape, inline_value), np.full(shape, xline_value),
-        np.full(shape, float(x_value)), np.full(shape, float(y_value)), "volume_vertical_fixed",
-    )
 
 
 def _fit_well_trends(
@@ -1158,14 +812,14 @@ def _resolve_output_geometry(
         )
         return OutputGeometry(**{**preliminary.__dict__, "samples": samples})
     if mode != "section":
-        raise ValueError(f"real_field_model_inputs.output_geometry.mode must be volume or section, got {mode!r}.")
-    section_cfg = _mapping(cfg.get("section"), "real_field_model_inputs.output_geometry.section")
+        raise ValueError(f"real_field_lfm.output_geometry.mode must be volume or section, got {mode!r}.")
+    section_cfg = _mapping(cfg.get("section"), "real_field_lfm.output_geometry.section")
     points = section_cfg.get("path")
     if not isinstance(points, list) or len(points) < 2:
-        raise ValueError("real_field_model_inputs.output_geometry.section.path must contain at least two points.")
+        raise ValueError("real_field_lfm.output_geometry.section.path must contain at least two points.")
     n_traces = int(section_cfg.get("n_traces") or _infer_trace_count(points[0], points[-1]))
-    first = _mapping(points[0], "real_field_model_inputs.output_geometry.section.path[0]")
-    last = _mapping(points[-1], "real_field_model_inputs.output_geometry.section.path[-1]")
+    first = _mapping(points[0], "real_field_lfm.output_geometry.section.path[0]")
+    last = _mapping(points[-1], "real_field_lfm.output_geometry.section.path[-1]")
     ilines = np.linspace(float(first["inline"]), float(last["inline"]), n_traces)
     xlines = np.linspace(float(first["xline"]), float(last["xline"]), n_traces)
     xy = np.asarray([survey.line_geometry.line_to_coord(il, xl) for il, xl in zip(ilines, xlines)], dtype=np.float64)
@@ -1213,7 +867,7 @@ def _crop_samples(
     i0 = max(0, i0)
     i1 = min(sample_axis.size, i1)
     if i0 >= i1:
-        raise ValueError("real_field_model_inputs.output_geometry selected an empty sample window.")
+        raise ValueError("real_field_lfm.output_geometry selected an empty sample window.")
     return np.asarray(sample_axis[i0:i1], dtype=np.float64)
 
 
@@ -1443,7 +1097,7 @@ def _write_figures(
             float(output_geometry.samples[0]),
         ]
         axes[0].imshow(np.where(valid_mask, log_ai, np.nan).T, aspect="auto", extent=extent, cmap="viridis")
-        axes[0].set_title("real_field_model_inputs LFM log(AI)")
+        axes[0].set_title("real_field_lfm log(AI)")
         axes[0].set_ylabel("TWT s")
         axes[1].plot(lateral_axis, a_field, label="a")
         axes[1].plot(lateral_axis, b_field, label="b")
@@ -1518,7 +1172,7 @@ def _export_lfm_volume(
         source_seismic_type=seismic_type,
         title="Real-field LFM log(AI)",
         details=[
-            f"schema={SCHEMA_VERSION}",
+            "schema=real_field_lfm_v1",
             "field=log_ai",
             "domain=log(AI)",
         ],
@@ -1532,7 +1186,7 @@ def _export_lfm_volume(
 def _summary_payload(
     *,
     status: str,
-    config: RealFieldModelInputsConfig,
+    config: RealFieldLfmConfig,
     repo_root: Path,
     data_root: Path,
     output_dir: Path,
@@ -1553,22 +1207,11 @@ def _summary_payload(
         "status": status,
         "source_runs": {
             "well_auto_tie_dir": repo_relative_path(well_auto_tie_dir, root=repo_root),
-            "well_preprocess_dir": repo_relative_path(
-                resolve_relative_path(config.source_runs["well_preprocess_dir"], root=repo_root),
-                root=repo_root,
-            ),
         },
         "inputs": {
             "well_inventory_file": repo_relative_path(well_inventory_file, root=repo_root),
             "seismic_file": repo_relative_path(seismic_path, root=repo_root),
             "seismic_sha256": sha256_file(seismic_path),
-            "benchmark_manifest": repo_relative_path(
-                resolve_relative_path(config.synthetic_benchmark_dir, root=repo_root) / "benchmark_manifest.json",
-                root=repo_root,
-            ),
-            "benchmark_manifest_sha256": sha256_file(
-                resolve_relative_path(config.synthetic_benchmark_dir, root=repo_root) / "benchmark_manifest.json"
-            ),
             "horizons": [
                 {
                     "name": item["name"],
@@ -1594,11 +1237,6 @@ def _summary_payload(
         "outputs": {
             key: repo_relative_path(path, root=repo_root)
             for key, path in outputs.items()
-        },
-        "output_sha256": {
-            key: sha256_file(path)
-            for key, path in outputs.items()
-            if path.is_file()
         },
         "legacy_lfm_statement": "No numeric values were read from historical lfm_precomputed_* artifacts.",
     }

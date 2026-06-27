@@ -9,8 +9,7 @@ flowchart TB
 
     prod --> S6["06 · forward_observability"]
 
-    S1 -.-> S7["07 · real_field_model_inputs"]
-    S3 -.-> S7
+    S1 -.-> S7["07 · real_field_lfm"]
     S4 -.-> S7
 
     S6 --> SL["旁路 · synthoseis_lite"]
@@ -21,7 +20,6 @@ flowchart TB
     GV --> R0
 
     R0 --> R1["08 R1 · real_field_forward_diagnostic"]
-    R1 --> R2["08 R2 · real_delta_adapter"]
 ```
 
 ## 配置文件
@@ -31,7 +29,6 @@ flowchart TB
 | 01–03 + well_trajectory + 04-06 | `experiments/common/common.yaml` |
 | 旁路 · synthoseis_lite | `experiments/synthoseis_lite/synthoseis_lite.yaml` |
 | 旁路 · ginn_v2 | `experiments/ginn_v2/train.yaml` |
-| 07 · real_field_model_inputs | `experiments/common/common.yaml` |
+| 07 · real_field_lfm | `experiments/common/common.yaml` |
 | 08 R0 · real_field_zero_shot | `experiments/common/common.yaml` |
 | 08 R1 · real_field_forward_diagnostic | `experiments/common/common.yaml` |
-| 08 R2 · real_delta_adapter | `experiments/common/common.yaml` |

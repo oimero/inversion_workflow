@@ -100,56 +100,36 @@ def _prepare_run_config(run_cfg: dict, cfg: dict) -> dict:
 
 def _prepare_real_field_inputs(run_cfg: dict, workflow_cfg: dict) -> dict:
     prepared = dict(run_cfg)
-    if "well_qc" in prepared:
-        raise ValueError("real_field_zero_shot.well_qc is retired; well QC belongs to R1.")
     inputs = dict(prepared.get("real_field_inputs") or {})
     output_root = resolve_relative_path(workflow_cfg.get("output_root", "scripts/output"), root=REPO_ROOT)
     if inputs.get("lfm_file"):
         lfm_file = resolve_source_file_from_run(
             inputs.get("lfm_file"),
             output_root=output_root,
-            prefix="real_field_model_inputs",
+            prefix="real_field_lfm",
             file_name="real_field_lfm.npz",
             root=REPO_ROOT,
-            label="real_field_model_inputs/real_field_lfm.npz",
+            label="real_field_lfm.npz",
         )
         load_summary(
-            lfm_file.parent / "real_field_model_inputs_summary.json",
-            schema_version="real_field_model_inputs_v2",
+            lfm_file.parent / "real_field_lfm_summary.json",
+            schema_version="real_field_lfm_v1",
             allowed_status={"ok", "warning"},
-            label="real_field_model_inputs_summary.json",
+            label="real_field_lfm_summary.json",
         )
     else:
         lfm_file = resolve_source_file_from_run(
             None,
             output_root=output_root,
-            prefix="real_field_model_inputs",
+            prefix="real_field_lfm",
             file_name="real_field_lfm.npz",
             root=REPO_ROOT,
-            label="real_field_model_inputs/real_field_lfm.npz",
-            run_required_files=["real_field_lfm.npz", "real_field_model_inputs_summary.json", "well_model_targets.csv"],
-            summary_file="real_field_model_inputs_summary.json",
-            schema_version="real_field_model_inputs_v2",
+            label="real_field_lfm.npz",
+            run_required_files=["real_field_lfm.npz", "real_field_lfm_summary.json"],
+            summary_file="real_field_lfm_summary.json",
+            schema_version="real_field_lfm_v1",
             allowed_status={"ok", "warning"},
         )
-    step7_summary = load_summary(
-        lfm_file.parent / "real_field_model_inputs_summary.json",
-        schema_version="real_field_model_inputs_v2",
-        allowed_status={"ok", "warning"},
-        label="real_field_model_inputs_summary.json",
-    )
-    target_text = str(dict(step7_summary.get("outputs") or {}).get("well_model_targets") or "").strip()
-    if not target_text:
-        raise ValueError("Step 7 v2 summary lacks outputs.well_model_targets")
-    target_path = resolve_relative_path(target_text, root=REPO_ROOT)
-    if target_path.parent.resolve() != lfm_file.parent.resolve() or not target_path.is_file():
-        raise ValueError("Step 7 well_model_targets.csv is missing or outside the selected input package")
-    output_hashes = dict(step7_summary.get("output_sha256") or {})
-    for key, path in (("real_field_lfm", lfm_file), ("well_model_targets", target_path)):
-        expected = str(output_hashes.get(key) or "")
-        actual = sha256_file(path)
-        if not expected or actual != expected:
-            raise ValueError(f"Step 7 output hash mismatch for {key}: {actual} != {expected}")
     inputs["lfm_file"] = repo_relative_path(lfm_file, root=REPO_ROOT)
     source_runs = dict(prepared.get("source_runs") or {})
     wavelet_dir = resolve_source_run(
@@ -164,32 +144,6 @@ def _prepare_real_field_inputs(run_cfg: dict, workflow_cfg: dict) -> dict:
     prepared["real_field_inputs"] = inputs
     prepared["source_runs"] = source_runs
     return prepared
-
-
-def _validate_model_projection_contract(run_cfg: dict, models: list[dict]) -> None:
-    inputs = dict(run_cfg.get("real_field_inputs") or {})
-    lfm_file = resolve_relative_path(str(inputs["lfm_file"]), root=REPO_ROOT)
-    step7_summary_path = lfm_file.parent / "real_field_model_inputs_summary.json"
-    step7 = load_summary(
-        step7_summary_path,
-        schema_version="real_field_model_inputs_v2",
-        allowed_status={"ok", "warning"},
-        label="real_field_model_inputs_summary.json",
-    )
-    expected = str(dict(step7.get("inputs") or {}).get("benchmark_manifest_sha256") or "")
-    if not expected:
-        raise ValueError("Step 7 summary lacks inputs.benchmark_manifest_sha256")
-    for item in models:
-        model_dir = resolve_relative_path(str(item["model_run_dir"]), root=REPO_ROOT)
-        manifest_path = model_dir / "model_run_manifest.json"
-        if not manifest_path.is_file():
-            raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        actual = str(dict(manifest.get("benchmark_hashes") or {}).get("benchmark_manifest.json") or "")
-        if actual != expected:
-            raise ValueError(
-                f"model/Step7 benchmark manifest mismatch for {model_dir}: {actual} != {expected}"
-            )
 
 def _timestamped_output(prefix: str, explicit: Path | None, *, output_root: Path) -> Path:
     if explicit is not None:
@@ -245,6 +199,206 @@ def _load_seismic_reference_payload(*, run_cfg: dict, models: list[dict]) -> dic
         "sampling": payload.get("sampling", {}),
         "file": repo_relative_path(stats_path, root=REPO_ROOT),
         "sha256": sha256_file(stats_path),
+    }
+
+
+def _coerce_float(value: object) -> float:
+    number = pd.to_numeric(value, errors="coerce")
+    try:
+        return float(number)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _load_well_positions(cfg: dict) -> dict[str, tuple[float, float]]:
+    inventory_text = str(cfg.get("well_inventory_file") or "").strip()
+    if not inventory_text:
+        return {}
+    inventory_path = resolve_relative_path(inventory_text, root=REPO_ROOT)
+    if not inventory_path.is_file():
+        return {}
+    inventory = pd.read_csv(inventory_path)
+    if not {"well_name", "inline_float", "xline_float"}.issubset(inventory.columns):
+        return {}
+    out: dict[str, tuple[float, float]] = {}
+    for _, row in inventory.iterrows():
+        well = str(row.get("well_name", ""))
+        inline = _coerce_float(row.get("inline_float"))
+        xline = _coerce_float(row.get("xline_float"))
+        if well and np.isfinite(inline) and np.isfinite(xline):
+            out[well] = (inline, xline)
+    return out
+
+
+def _log_ai_at_twt(*, las_path: Path, tdt_path: Path, twt_s: np.ndarray) -> np.ndarray:
+    import lasio
+
+    las = lasio.read(str(las_path))
+    frame = las.df()
+    if "AI" not in frame.columns:
+        raise ValueError(f"Filtered LAS lacks AI curve: {las_path}")
+    md_axis = frame.index.to_numpy(dtype=np.float64)
+    ai = frame["AI"].to_numpy(dtype=np.float64)
+    finite_ai = np.isfinite(md_axis) & np.isfinite(ai) & (ai > 0.0)
+    if int(np.count_nonzero(finite_ai)) < 2:
+        return np.full_like(twt_s, np.nan, dtype=np.float64)
+    tdt = pd.read_csv(tdt_path)
+    if not {"twt_s", "md_m"}.issubset(tdt.columns):
+        raise ValueError(f"Optimized TDT must contain twt_s/md_m: {tdt_path}")
+    tdt_twt = pd.to_numeric(tdt["twt_s"], errors="coerce").to_numpy(dtype=np.float64)
+    tdt_md = pd.to_numeric(tdt["md_m"], errors="coerce").to_numpy(dtype=np.float64)
+    finite_tdt = np.isfinite(tdt_twt) & np.isfinite(tdt_md)
+    if int(np.count_nonzero(finite_tdt)) < 2:
+        return np.full_like(twt_s, np.nan, dtype=np.float64)
+    order_tdt = np.argsort(tdt_twt[finite_tdt])
+    md_at_twt = np.interp(
+        twt_s,
+        tdt_twt[finite_tdt][order_tdt],
+        tdt_md[finite_tdt][order_tdt],
+        left=np.nan,
+        right=np.nan,
+    )
+    order_ai = np.argsort(md_axis[finite_ai])
+    ai_at_twt = np.interp(
+        md_at_twt,
+        md_axis[finite_ai][order_ai],
+        ai[finite_ai][order_ai],
+        left=np.nan,
+        right=np.nan,
+    )
+    return np.where(ai_at_twt > 0.0, np.log(ai_at_twt), np.nan)
+
+
+def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+    if a.size < 2 or np.std(a) <= 0.0 or np.std(b) <= 0.0:
+        return float("nan")
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _trace_distance_to_section(
+    *, well_inline: float, well_xline: float, section_ilines: np.ndarray, section_xlines: np.ndarray
+) -> tuple[int, float]:
+    distances = np.hypot(section_ilines - float(well_inline), section_xlines - float(well_xline))
+    index = int(np.nanargmin(distances))
+    return index, float(distances[index])
+
+
+def _write_well_prediction_qc(output_dir: Path, *, run_cfg: dict) -> dict[str, object]:
+    cfg = dict(run_cfg.get("well_qc") or {})
+    if not bool(cfg.get("enabled", True)):
+        return {"csv": "", "figures": {}, "status": "disabled"}
+    well_auto_tie_text = str(cfg.get("well_auto_tie_dir") or "").strip()
+    if not well_auto_tie_text:
+        raise ValueError("real_field_zero_shot.well_qc.well_auto_tie_dir must be explicit when well_qc is enabled.")
+    well_auto_tie_dir = resolve_relative_path(
+        well_auto_tie_text,
+        root=REPO_ROOT,
+    )
+    metrics_path = well_auto_tie_dir / "well_tie_metrics.csv"
+    if not metrics_path.is_file():
+        return {"csv": "", "figures": {}, "status": "missing_well_tie_metrics"}
+    ties = pd.read_csv(metrics_path)
+    ties = ties[ties["tie_status"].astype(str).eq("success")].copy()
+    positions = _load_well_positions(cfg)
+    model_arrays = {}
+    for child in sorted(output_dir.iterdir()):
+        if child.is_dir() and (child / "predictions.npz").is_file():
+            model_arrays[child.name] = np.load(child / "predictions.npz", allow_pickle=True)
+    if not model_arrays:
+        return {"csv": "", "figures": {}, "status": "missing_predictions"}
+    first = next(iter(model_arrays.values()))
+    ilines = np.asarray(first["ilines"], dtype=np.float64)
+    xlines = np.asarray(first["xlines"], dtype=np.float64)
+    twt_s = np.asarray(first["twt_s"], dtype=np.float64)
+    if "max_line_distance" in cfg:
+        raise ValueError("real_field_zero_shot.well_qc.max_line_distance is retired; use max_xy_distance_m.")
+    if cfg.get("max_xy_distance_m") is None:
+        raise ValueError("real_field_zero_shot.well_qc.max_xy_distance_m must be explicit.")
+    max_distance = float(cfg.get("max_xy_distance_m"))
+    rows: list[dict[str, object]] = []
+    figure_outputs: dict[str, str] = {}
+    figure_dir = output_dir / "figures" / "wells"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    for _, tie in ties.iterrows():
+        well = str(tie.get("well_name", ""))
+        inline = _coerce_float(tie.get("inline_float"))
+        xline = _coerce_float(tie.get("xline_float"))
+        position_source = "well_tie_metrics"
+        if (not np.isfinite(inline) or not np.isfinite(xline)) and well in positions:
+            inline, xline = positions[well]
+            position_source = "well_inventory"
+        base = {"well_name": well, "well_inline": inline, "well_xline": xline, "well_position_source": position_source}
+        if not np.isfinite(inline) or not np.isfinite(xline):
+            rows.append({**base, "model_role": "", "status": "skipped_missing_well_position"})
+            continue
+        trace_idx, distance = _trace_distance_to_section(
+            well_inline=inline,
+            well_xline=xline,
+            section_ilines=ilines,
+            section_xlines=xlines,
+        )
+        base.update(
+            {
+                "nearest_section_trace": trace_idx,
+                "nearest_section_inline": float(ilines[trace_idx]),
+                "nearest_section_xline": float(xlines[trace_idx]),
+                "section_line_distance": distance,
+            }
+        )
+        if distance > max_distance:
+            rows.append({**base, "model_role": "", "status": "skipped_outside_section_support", "max_xy_distance_m": max_distance})
+            continue
+        try:
+            well_log_ai = _log_ai_at_twt(
+                las_path=resolve_relative_path(str(tie["filtered_las_file"]), root=REPO_ROOT),
+                tdt_path=resolve_relative_path(str(tie["optimized_tdt_file"]), root=REPO_ROOT),
+                twt_s=twt_s,
+            )
+        except Exception as exc:
+            rows.append({**base, "model_role": "", "status": "skipped_well_log_projection_failed", "reason": str(exc)})
+            continue
+        fig, ax = plt.subplots(figsize=(4.5, 6.0))
+        ax.plot(well_log_ai, twt_s, label="well filtered log(AI)", color="black", linewidth=1.5)
+        for role, arrays in model_arrays.items():
+            pred = np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float64)[trace_idx]
+            valid = (
+                np.asarray(arrays["valid_mask_model"], dtype=bool)[trace_idx]
+                & (np.asarray(arrays["stitching_weight"], dtype=np.float64)[trace_idx] > 0.0)
+                & np.isfinite(well_log_ai)
+                & np.isfinite(pred)
+            )
+            n_valid = int(np.count_nonzero(valid))
+            residual = pred[valid] - well_log_ai[valid] if n_valid else np.asarray([])
+            rows.append(
+                {
+                    **base,
+                    "model_role": role,
+                    "status": "ok" if n_valid >= 8 else "insufficient_valid_samples",
+                    "n_valid": n_valid,
+                    "rmse": float(np.sqrt(np.mean(residual * residual))) if n_valid else float("nan"),
+                    "bias": float(np.mean(residual)) if n_valid else float("nan"),
+                    "corr": _safe_corr(well_log_ai[valid], pred[valid]) if n_valid else float("nan"),
+                    "pred_mean": float(np.mean(pred[valid])) if n_valid else float("nan"),
+                    "well_log_ai_mean": float(np.mean(well_log_ai[valid])) if n_valid else float("nan"),
+                }
+            )
+            ax.plot(pred, twt_s, label=role, linewidth=1.0)
+        ax.invert_yaxis()
+        ax.set_xlabel("log(AI)")
+        ax.set_ylabel("TWT s")
+        ax.set_title(f"R0 well prediction QC: {well}")
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        path = figure_dir / f"r0_well_prediction_qc_{well}.png"
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        figure_outputs[well] = repo_relative_path(path, root=REPO_ROOT)
+    csv_path = output_dir / "well_prediction_qc.csv"
+    pd.DataFrame.from_records(rows).to_csv(csv_path, index=False)
+    return {
+        "csv": repo_relative_path(csv_path, root=REPO_ROOT),
+        "figures": figure_outputs,
+        "status": "ok",
     }
 
 
@@ -740,7 +894,6 @@ def main() -> None:
     stitch_strategy = str(args.stitch_strategy or run_cfg.get("stitch_strategy") or "uniform")
     run_cfg = _prepare_real_field_inputs(run_cfg, cfg)
     models = _load_models(run_cfg)
-    _validate_model_projection_contract(run_cfg, models)
     data_root = resolve_relative_path(cfg.get("data_root", "data"), root=REPO_ROOT)
     run_cfg_for_load = _prepare_run_config(run_cfg, cfg)
     inputs_for_load = dict(run_cfg_for_load.get("real_field_inputs") or {})
@@ -787,6 +940,11 @@ def main() -> None:
             qc.to_csv(output_dir / "model_input_qc.csv", index=False)
             input_qc_written = True
     figure_outputs = _plot_zero_shot_qc(output_dir)
+    well_outputs = (
+        {"csv": "", "figures": {}, "status": "disabled_for_volume_mode"}
+        if output_mode == "volume"
+        else _write_well_prediction_qc(output_dir, run_cfg=run_cfg)
+    )
     volume_exports = _export_zero_shot_volumes(output_dir, run_cfg=run_cfg_for_load, data_root=data_root)
     dt_s = float(field.twt_s[1] - field.twt_s[0]) if field.twt_s.size > 1 else 0.002
     spectral_outputs = _write_spectral_qc(output_dir, run_cfg=run_cfg, dt_s=dt_s)
@@ -848,6 +1006,7 @@ def main() -> None:
         "outputs": {
             "model_input_qc": repo_relative_path(input_qc_path, root=REPO_ROOT),
             "figures": figure_outputs,
+            "well_prediction_qc": well_outputs,
             "volume_exports": volume_exports,
             **spectral_outputs,
         },

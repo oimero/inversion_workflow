@@ -58,7 +58,7 @@ nav:
       - 06 正演可观测性分析: guide/6-forward-observability-gate.md
       - 旁路 合成基准生成与评估: guide/synthoseis-lite-benchmark.md
       - 旁路 模型消融训练与评估: guide/ginn-v2-ablation.md
-      - 07 实际工区模型输入与井标签: guide/7-real-field-model-inputs.md
+      - 07 实际工区 LFM 输入准备: guide/7-real-field-lfm.md
       - 08 R0 实际工区零样本预测: guide/8-r0-real-field-zero-shot.md
       - 08 R1 正演闭环诊断: guide/8-r1-real-field-forward-diagnostic.md
   - API:

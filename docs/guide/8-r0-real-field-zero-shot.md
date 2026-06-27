@@ -27,7 +27,7 @@ python scripts/real_field_zero_shot.py --output-dir scripts/output/real_field_ze
 | 来源 | 文件 | 用途 |
 |------|------|------|
 | 第七步 | `real_field_lfm.npz` | 低频模型，作为推理的结构性输入 |
-| 第七步 | `real_field_model_inputs_summary.json` | 第七步 v2 状态、target 投影和来源校验 |
+| 第七步 | `real_field_lfm_summary.json` | 第七步状态和来源校验 |
 | 第五步 | `selected_wavelet.csv` | 全局子波，作为标准化参数之一 |
 | 旁路 | 模型 checkpoint + `model_run_manifest.json` | 冻结的模型权重和标准化参数 |
 | 旁路 | `input_reference_stats.json` | 地震数据值域变换的参考统计量 |
@@ -242,6 +242,7 @@ real_field_zero_shot:
 | `model_input_qc.csv` | 每个输入通道在推理前的标准化分布检查 |
 | `real_field_spectral_qc.csv` | 每个模型每个频带的预测差值能量分布和可观测性证据联表 |
 | `lateral_difference_band_qc.csv` | 两个模型预测差值的逐频带能量分析 |
+| `well_prediction_qc.csv` | 剖面模式下，每口井的预测 vs 滤波 LAS 指标（体积模式不生成） |
 
 ### 图表
 
@@ -251,6 +252,7 @@ real_field_zero_shot:
 | `figures/lateral_minus_no_lateral.png` | 两个模型的预测差异 |
 | `figures/lateral_minus_no_lateral_band_split.png` | 预测差异的逐频带拆分 |
 | `figures/spectral_band_energy_qc.png` | 各频带预测差值能量柱状图 |
+| `figures/wells/r0_well_prediction_qc_<well>.png` | 剖面模式下，井位预测与滤波 LAS 的 TWT 域对比 |
 
 ---
 
@@ -297,7 +299,7 @@ Status: needs_forward_diagnostic
 
 ### 第六步（仅剖面模式）：看井位 QC
 
-R0 不读取任何井标签，也不生成井 QC。volume 和 section 的井旁比较统一在 R1 完成。
+`well_prediction_qc.csv` 逐井列出每个模型的 RMSE、偏差和相关系数。打开对应井的 `figures/wells/r0_well_prediction_qc_<well>.png`，观察预测的 TWT 域趋势是否与滤波 LAS 一致。
 
 ---
 

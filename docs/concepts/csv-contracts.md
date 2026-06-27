@@ -419,10 +419,9 @@ HDF5 文件，每个 sample 为一个 group，包含 `model_target_log_ai`、
 | `file` | 本文件路径 |
 | `sha256` | 本文件 SHA-256 |
 
-## 07 · real_field_model_inputs.py
+## 07 · real_field_lfm.py
 
-第七步同时冻结 R0 的真实域 LFM 和 R1/R2 的模型网格井标签。schema 为
-`real_field_model_inputs_v2`；旧 `real_field_lfm_v1` 不兼容。
+第七步产物供第八步 R0 消费。schema 为 `real_field_lfm_v1`。
 
 ### `real_field_lfm.npz`
 
@@ -477,31 +476,15 @@ a/b 参数场的空间建模 QC，两行（一行 a、一行 b）。
 
 层位有效率、厚度统计、交叉道数、超出 TDT 支持的井数。
 
-### `well_model_targets.csv`
-
-角色无关，每个 `well_name + sample_index` 唯一。`target_log_ai` 只来自 full preprocessed AI
-经优化 TDT、高分辨率 cell average 和 synthoseis 同款抗混叠投影；filtered LAS 不进入此表。
-
-| 字段组 | 关键字段与语义 |
-|--------|----------------|
-| 样点键 | `well_name` / `sample_index` / `twt_s` |
-| 轨迹 | `inline` / `xline` / `x_m` / `y_m` |
-| 空间簇 | `spatial_cluster_id` / `spatial_cluster_size` |
-| 标签 | `target_log_ai` / `target_valid` / `target_reason` |
-| 来源 | `sample_method` / `wellbore_class` |
-| LFM 独立资格 | `is_lfm_control` / `lfm_control_status` |
-| 显示窗 | `tie_window_start_s` / `tie_window_end_s` |
-
-### `real_field_model_inputs_summary.json`
+### `real_field_lfm_summary.json`
 
 | 关键字段 | 含义 |
 |----------|------|
-| `schema_version` | 固定 `real_field_model_inputs_v2` |
+| `schema_version` | 固定 `real_field_lfm_v1` |
 | `status` | `ok` / `warning` / `insufficient_control_wells` |
 | `control_wells` | 接受/拒绝/总数 |
 | `lfm_stats` | 时间差分 RMS、每道时间标准差、横向标准差等 |
-| `source_runs` | 上游第四步和第三步来源路径 |
-| `target_projection` | benchmark manifest、dt/factor、FIR 参数与 taps hash |
+| `source_runs` | 上游第四步和第一步来源路径 |
 | `outputs` | 所有输出文件路径 |
 
 ## 08 R0 · real_field_zero_shot.py
@@ -559,7 +542,7 @@ R0 产物供 R1 消费。schema 为 `real_field_zero_shot_summary_v1`。
 
 ## 08 R1 · real_field_forward_diagnostic.py
 
-R1 是 R0 的井旁和真实地震正演闭环。schema 为 `real_field_forward_diagnostic_summary_v2`。
+R1 是当前流程的最终闭环。schema 为 `real_field_forward_diagnostic_summary_v1`。
 
 ### `forward_diagnostic_metrics.csv`
 
@@ -577,7 +560,7 @@ R1 是 R0 的井旁和真实地震正演闭环。schema 为 `real_field_forward_
 
 ### `well_forward_diagnostic.csv`
 
-逐井 × 逐角色（target / lfm_input / lateral / no_lateral）一行。包含四组指标：
+逐井 × 逐角色（filtered_las / lfm_input / lateral / no_lateral）一行。包含四组指标：
 
 | 指标组 | 关键字段 |
 |--------|---------|
@@ -586,38 +569,7 @@ R1 是 R0 的井旁和真实地震正演闭环。schema 为 `real_field_forward_
 | 波形匹配 | `waveform_residual_corr_scaled` / `waveform_residual_rms_scaled` / `waveform_scale_status` |
 | 井分类 | `status` / `classification` / `classification_explanation` |
 
-`target` 行是 full-AI 模型网格参考，`lfm_input` 行是模型必须击败的基线。
-
-### `well_ai_samples.csv`
-
-消费者：`r2_real_delta_adapter.py`。volume/section 使用同一字段语义；每行是一个
-`model_role × well_name × sample_index` 的井轨迹 TWT 样点。消费者必须使用
-`valid_for_fit`，不得根据空值重新推断有效性。
-
-| 字段组 | 关键字段与语义 |
-|--------|----------------|
-| 样点键 | `model_role` / `well_name` / `sample_index`，三者组合必须唯一 |
-| TWT 与坐标 | `twt_s` 为正秒 TWT；`inline` / `xline` 为浮点轨迹位置；`x_m` / `y_m` 为米制坐标 |
-| 空间去偏 | `spatial_cluster_id` / `spatial_cluster_size` 来自顶层 `spatial_debias.cluster_radius_m` |
-| AI 标签 | `target_log_ai` 是 full-AI 模型网格井监督；`lfm_log_ai` 是冻结 LFM；`r0_pred_log_ai` 是同轨迹采样的 R0 |
-| delta | `target_delta = target_log_ai - lfm_log_ai`；`r0_delta = r0_pred_log_ai - lfm_log_ai` |
-| R0 支撑 | `r0_valid_mask` / `r0_blend_weight` / `target_valid` |
-| 有效性 | `valid_for_fit` / `valid_reason`，只有 `valid_for_fit=true` 可进入 R2 |
-| 采样来源 | `sampling_mode=volume`；`sample_method` 区分直井双线性与斜井 trace-plan 双线性采样；`wellbore_class` 保存井型 |
-
-不同模型角色必须具有相同的井样点键、坐标、空间簇、井标签和 LFM；角色间只允许 R0 预测及
-其支撑字段不同。R2 定义：
-
-```text
-well_delta = target_log_ai - lfm_log_ai
-r0_delta   = r0_pred_log_ai - lfm_log_ai
-```
-
-### `well_waveform_samples.csv`
-
-角色无关的 R1 forward-axis 观测表。`forward_sample_index` 与 AI 的 `sample_index=1:` 对齐；
-包含轨迹坐标、`observed_seismic`、`observed_valid`、tie window、采样方法和井型。R2 井图只能
-复用此表，不得重新读取地震体。
+`filtered_las` 行是参考基准（自比 RMSE=0、corr=1），`lfm_input` 行是模型必须击败的基线。
 
 ### `residual_decomposition.csv`
 
@@ -647,7 +599,7 @@ r0_delta   = r0_pred_log_ai - lfm_log_ai
 |----------|------|
 | `rmse_delta_model_minus_lfm` | 模型 RMSE - LFM RMSE，负值表示改善 |
 | `corr_delta_model_minus_lfm` | 模型 corr - LFM corr，正值表示改善 |
-| `classification` | `model_improves_ai` / `shape_improves_bias_worse` / `bias_improves_shape_worse` / `waveform_good_ai_worse` / `target_weak_reference` / `mixed_or_insufficient` |
+| `classification` | `model_improves_ai` / `shape_improves_bias_worse` / `bias_improves_shape_worse` / `waveform_good_ai_worse` / `filtered_las_weak_reference` / `mixed_or_insufficient` |
 
 ### `well_ai_band_comparison.csv`
 
@@ -657,7 +609,7 @@ r0_delta   = r0_pred_log_ai - lfm_log_ai
 
 | 关键字段 | 含义 |
 |----------|------|
-| `schema_version` | 固定 `real_field_forward_diagnostic_summary_v2` |
+| `schema_version` | 固定 `real_field_forward_diagnostic_summary_v1` |
 | `status` | `ok` |
 | `forward_contract` | 正演约定：反射率公式、卷积约定、对齐方式、丢弃样点数 |
 | `red_flags` | 自动红色告警列表，空列表表示无致命问题 |

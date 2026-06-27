@@ -39,18 +39,8 @@ class Patch2DNet(nn.Module):
         self.net = nn.Sequential(*layers)
         self.depth = depth
 
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net[:-1](x)
-
-    def forward_head(self, features: torch.Tensor) -> torch.Tensor:
-        return self.net[-1](features)
-
-    @property
-    def output_head(self) -> nn.Module:
-        return self.net[-1]
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_head(self.forward_features(x))
+        return self.net(x)
 
 
 class Trace1DNet(nn.Module):
@@ -73,24 +63,11 @@ class Trace1DNet(nn.Module):
         self.net = nn.Sequential(*layers)
         self.depth = depth
 
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, lateral, twt = x.shape
         traces = x.permute(0, 2, 1, 3).reshape(b * lateral, c, twt)
-        features = self.net[:-1](traces)
-        return features.reshape(b, lateral, features.shape[1], twt).permute(0, 2, 1, 3)
-
-    def forward_head(self, features: torch.Tensor) -> torch.Tensor:
-        b, channels, lateral, twt = features.shape
-        traces = features.permute(0, 2, 1, 3).reshape(b * lateral, channels, twt)
-        out = self.net[-1](traces)
+        out = self.net(traces)
         return out.reshape(b, lateral, 1, twt).permute(0, 2, 1, 3)
-
-    @property
-    def output_head(self) -> nn.Module:
-        return self.net[-1]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_head(self.forward_features(x))
 
 
 class Trace1DDilatedTCN(nn.Module):
@@ -121,24 +98,11 @@ class Trace1DDilatedTCN(nn.Module):
         self.net = nn.Sequential(*layers)
         self.depth = depth
 
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, lateral, twt = x.shape
         traces = x.permute(0, 2, 1, 3).reshape(b * lateral, c, twt)
-        features = self.net[:-1](traces)
-        return features.reshape(b, lateral, features.shape[1], twt).permute(0, 2, 1, 3)
-
-    def forward_head(self, features: torch.Tensor) -> torch.Tensor:
-        b, channels, lateral, twt = features.shape
-        traces = features.permute(0, 2, 1, 3).reshape(b * lateral, channels, twt)
-        out = self.net[-1](traces)
+        out = self.net(traces)
         return out.reshape(b, lateral, 1, twt).permute(0, 2, 1, 3)
-
-    @property
-    def output_head(self) -> nn.Module:
-        return self.net[-1]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_head(self.forward_features(x))
 
 
 class Trace1DTCNShallowLateralMixer(nn.Module):
@@ -189,22 +153,13 @@ class Trace1DTCNShallowLateralMixer(nn.Module):
         self.depth = depth
         self.lateral_kernel = lateral_kernel
 
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, lateral, twt = x.shape
         traces = x.permute(0, 2, 1, 3).reshape(b * lateral, c, twt)
         encoded = self.temporal_encoder(traces)
         encoded = encoded.reshape(b, lateral, encoded.shape[1], twt).permute(0, 2, 1, 3)
-        return encoded + self.lateral_mixer(encoded)
-
-    def forward_head(self, features: torch.Tensor) -> torch.Tensor:
-        return self.output(features)
-
-    @property
-    def output_head(self) -> nn.Module:
-        return self.output
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_head(self.forward_features(x))
+        mixed = encoded + self.lateral_mixer(encoded)
+        return self.output(mixed)
 
 
 def build_model(

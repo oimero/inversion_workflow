@@ -1045,19 +1045,19 @@ def _validate_lfm_npz_contract(
         missing = sorted(required - files)
         if missing:
             raise ValueError(
-                f"R0 primary LFM must be real_field_model_inputs_v2 and is missing {missing}: {path}. "
+                f"R0 primary LFM must be real_field_lfm_v1 and is missing {missing}: {path}. "
                 "Set legacy_lfm_negative_control=true only for explicit historical negative controls."
             )
         if "samples" not in files and "twt_s" not in files:
             raise ValueError(f"R0 primary LFM must provide samples/twt_s axis: {path}")
         if str(lfm_transform) == "log":
             raise ValueError(
-                "real_field_model_inputs_v2/log_ai is already in log(AI); use lfm_value_transform=identity."
+                "real_field_lfm_v1/log_ai is already in log(AI); use lfm_value_transform=identity."
             )
         if "metadata_json" not in files:
             raise ValueError(f"R0 primary LFM lacks metadata_json: {path}")
         metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
-    if str(metadata.get("schema_version")) != "real_field_model_inputs_v2":
+    if str(metadata.get("schema_version")) != "real_field_lfm_v1":
         raise ValueError(f"Unsupported LFM schema_version={metadata.get('schema_version')!r}: {path}")
     if str(metadata.get("value_key")) != "log_ai":
         raise ValueError(f"LFM metadata value_key must be log_ai, got {metadata.get('value_key')!r}: {path}")
@@ -1192,7 +1192,7 @@ def _validate_lfm_log_domain(
             f"lfm_value_transform={lfm_transform!r}, p01={p01:.6g}, "
             f"median={median:.6g}, p99={p99:.6g}, path={path}. "
             "Use lfm_value_transform=log only for linear positive AI inputs, "
-            "or provide real_field_model_inputs_v2/log_ai with identity."
+            "or provide real_field_lfm_v1/log_ai with identity."
         )
 
 

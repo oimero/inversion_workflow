@@ -196,7 +196,7 @@ synthetic = convolve(r, wavelet)  # 挂在下部样本上
 | `shape_improves_bias_worse` | 相关系数改善但全频带 RMSE 变差 |
 | `bias_improves_shape_worse` | RMSE 改善但相关系数未改善 |
 | `waveform_good_ai_worse` | 波形匹配好但波阻抗指标不如 LFM |
-| `target_weak_reference` | full-AI 模型网格 target 的正演匹配本身很弱，需要检查投影或井震标定 |
+| `filtered_las_weak_reference` | 滤波 LAS 的正演匹配本身就很弱，无法作为有效基准 |
 | `mixed_or_insufficient` | 混合信号或有效样本不足 |
 
 ### 第五阶段：综合判定
@@ -294,7 +294,7 @@ synthetic = convolve(r, wavelet)  # 挂在下部样本上
 
 - `model_improves_ai` 的井数应该占多数。如果大部分井是 `model_improves_ai`，说明模型在井位处确实比低频模型更准确。
 - 如果 `waveform_good_ai_worse` 占多数，说明模型的波形虽然和地震匹配，但波阻抗本身还不如低频模型——这可能是因为模型在拟合噪声。
-- 如果 `target_weak_reference` 频繁出现，应检查 Step7 full-AI 投影、gap/FIR 支撑和井震标定。
+- 如果 `filtered_las_weak_reference` 频繁出现，说明这些井的滤波 LAS 本身正演匹配就很差——井的标定可能有问题，不应作为基准。
 
 ### 第五步：看频带分析
 

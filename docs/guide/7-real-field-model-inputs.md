@@ -1,18 +1,21 @@
-# 07 实际工区 LFM 输入准备
+# 07 实际工区模型输入与井标签准备
 
-`real_field_lfm.py` 是主链第七步。它把第四步的井震标定结果冻结为一份三维波阻抗低频模型，供第八步零样本推理使用。这一步不涉及训练或反演——它只做一件事：**把每口井的波阻抗趋势拟合成两个空间参数场，再用它们重建一张光滑的低频背景。**
+`real_field_model_inputs.py` 同时冻结两种语义不同的真实域资产：filtered LAS 只用于构建
+三维 LFM；full preprocessed LAS 经优化 TDT 和 synthoseis 同款抗混叠投影后形成
+`target_log_ai`，供 R1/R2 使用。两条分支不得混用。
 
 ---
 
 ## 快速开始
 
 ```bash
-python scripts/real_field_lfm.py
-python scripts/real_field_lfm.py --config experiments/common/common.yaml
-python scripts/real_field_lfm.py --output-dir scripts/output/real_field_lfm_test
+python scripts/real_field_model_inputs.py
+python scripts/real_field_model_inputs.py --config experiments/common/common.yaml
+python scripts/real_field_model_inputs.py --output-dir scripts/output/real_field_model_inputs_test
 ```
 
-不带参数时，脚本自动发现最新的第四步和第一步产物，在 `scripts/output/real_field_lfm_<timestamp>/` 下写出结果。
+不带参数时使用 `common.yaml` 的显式来源，在
+`scripts/output/real_field_model_inputs_<timestamp>/` 下写出结果。
 
 ---
 
@@ -25,7 +28,9 @@ python scripts/real_field_lfm.py --output-dir scripts/output/real_field_lfm_test
 | 第四步 | `well_tie_metrics.csv` | 标定成功的井列表、优化时深表路径、滤波 LAS 路径 |
 | 第四步 | `well_tie_plan.csv` | 井的路由信息 |
 | 第四步 | `wavelet_inventory.csv` | 候选子波清单（用于来源校验） |
+| 第三步 | `well_preprocess_status.csv` / full LAS | 生成模型网格 `target_log_ai` |
 | 第一步 | `well_inventory.csv` | 井口坐标（inline/xline）和井型 |
+| synthoseis | `benchmark_manifest.json` | 冻结 target 的 dt/factor/FIR 投影算子 |
 | 数据目录 | 地震体 | 提供输出网格的几何参数（inline/xline/TWT 轴），不参与数值拟合 |
 
 ---
@@ -33,7 +38,7 @@ python scripts/real_field_lfm.py --output-dir scripts/output/real_field_lfm_test
 ## 配置参考
 
 ```yaml
-# 以下字段写在 experiments/common/common.yaml 的顶层或 real_field_lfm 段下。
+# 以下字段写在 experiments/common/common.yaml 的顶层或 real_field_model_inputs 段下。
 
 # --- 必填 ---
 target_interval:
@@ -47,7 +52,12 @@ seismic:
   type: zgy
 
 # --- 可选（有默认值）---
-real_field_lfm:
+real_field_model_inputs:
+  source_runs:
+    well_auto_tie_dir: <step4-run>
+    well_preprocess_dir: <step3-run>
+  well_inventory_file: <step1-run>/well_inventory.csv
+  synthetic_benchmark_dir: <field-conditioned-benchmark-dir>
   output_geometry:
     mode: volume                    # 默认 volume
     target_context_s: 0.05          # 默认 0.05
@@ -141,14 +151,16 @@ lfm_log_ai(inline, xline, twt) = a_field(inline, xline) + b_field(inline, xline)
 
 ## 核心输出文件
 
-所有文件在 `<output_root>/real_field_lfm_<timestamp>/` 下：
+所有文件在 `<output_root>/real_field_model_inputs_<timestamp>/` 下：
 
 ### 主数据
 
 | 文件 | 内容 |
 |------|------|
 | `real_field_lfm.npz` | 三维 LFM，包含 `log_ai`、`valid_mask_model`、`lfm_support_mask`、`distance_to_control`、`a_field`、`b_field`、坐标轴和 metadata |
-| `real_field_lfm_summary.json` | 来源路径、控制井统计、LFM 统计、输出文件清单和 SHA-256 |
+| `well_model_targets.csv` | full-AI 模型网格井标签、轨迹、空间簇和独立有效性 |
+| `well_model_target_qc.csv` | 每井 full LAS/TDT hash、有效范围、gap/FIR 拒绝统计 |
+| `real_field_model_inputs_summary.json` | 来源、投影契约、控制井/target 统计和输出 SHA-256 |
 
 ### 井趋势
 
@@ -185,14 +197,14 @@ lfm_log_ai(inline, xline, twt) = a_field(inline, xline) + b_field(inline, xline)
 
 ```
 === Real-field LFM ===
-Output: scripts/output/real_field_lfm_<timestamp>
+Output: scripts/output/real_field_model_inputs_<timestamp>
 Status: ok
 Accepted controls: 15 / 16
 ```
 
 分母是第四步标定成功的井数，分子是通过了趋势拟合和参数场建模的井数。如果分子比分母少，看 `well_trend_controls.csv` 了解每口井的具体拒绝原因。
 
-### 第二步：看 `real_field_lfm_summary.json`
+### 第二步：看 `real_field_model_inputs_summary.json`
 
 - `status` 为 `ok` 表示 LFM 通过了基本结构检查。
 - `lfm_stats` 中的 `trace_time_std_median` 和 `time_diff_rms` 应显著大于零。如果这些值异常低，说明 LFM 过于平坦——可能是控制井太少或 `a`/`b` 系数几乎没有空间变化。

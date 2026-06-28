@@ -232,7 +232,7 @@ real_field_zero_shot:
 |------|------|
 | `predictions.npz` | 拼接后的预测数组，包含坐标轴和掩码 |
 | `real_field_zero_shot_model_summary.json` | 该模型的推理参数、标准化参数、体积维度 |
-| `<role>_pred_log_ai.zgy` | 预测结果的 ZGY 格式导出（如果体积导出已开启） |
+| `<role>_pred_ai.zgy` | 线性 AI 预测体，数值为 `exp(stitched_pred_log_ai)`；内部 NPZ 仍保持 log(AI) |
 
 ### 全局 QC 和摘要
 

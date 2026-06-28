@@ -18,6 +18,26 @@ from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.utils.io import build_segy_textual_header, sha256_file
 
 
+def log_ai_to_ai_volume(log_ai: np.ndarray) -> np.ndarray:
+    """Convert a log(AI) export volume to finite positive linear AI."""
+
+    values = np.asarray(log_ai, dtype=np.float64)
+    with np.errstate(over="ignore", invalid="ignore"):
+        ai = np.exp(values)
+    invalid = np.isfinite(values) & (
+        ~np.isfinite(ai)
+        | (ai <= 0.0)
+        | (ai > np.finfo(np.float32).max)
+    )
+    if np.any(invalid):
+        raise ValueError("Cannot export AI: exp(log_ai) produced non-finite or non-positive values.")
+    output = ai.astype(np.float32)
+    invalid_output = np.isfinite(values) & (~np.isfinite(output) | (output <= 0.0))
+    if np.any(invalid_output):
+        raise ValueError("Cannot export AI: exp(log_ai) is outside the float32 positive range.")
+    return output
+
+
 def export_volume_like_source(
     *,
     output_base: Path,

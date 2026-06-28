@@ -36,7 +36,7 @@ from cup.seismic.horizon import (
     normalize_interpretation_unit_for_geometry,
 )
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.seismic.volume_export import export_volume_like_source
+from cup.seismic.volume_export import export_volume_like_source, log_ai_to_ai_volume
 from cup.utils.io import (
     load_yaml_config,
     repo_relative_path,
@@ -1162,23 +1162,34 @@ def _export_lfm_volume(
         return {"status": "skipped_section_output", "format": "", "path": ""}
     if output_geometry.samples.size == 0:
         return {"status": "skipped_empty_sample_axis", "format": "", "path": ""}
+    ai = log_ai_to_ai_volume(log_ai)
     payload = export_volume_like_source(
-        output_base=output_dir / "real_field_lfm_log_ai",
-        volume=log_ai,
+        output_base=output_dir / "real_field_lfm_ai",
+        volume=ai,
         ilines=output_geometry.ilines,
         xlines=output_geometry.xlines,
         samples=output_geometry.samples,
         source_seismic_file=seismic_path,
         source_seismic_type=seismic_type,
-        title="Real-field LFM log(AI)",
+        title="Real-field LFM AI",
         details=[
             "schema=real_field_lfm_v1",
-            "field=log_ai",
-            "domain=log(AI)",
+            "field=ai",
+            "domain=AI",
+            "source_field=log_ai",
+            "transform=exp(log_ai)",
         ],
         seismic_options=seismic_cfg,
         inline_chunk_size=int(export_cfg.get("inline_chunk_size", seismic_cfg.get("zgy_inline_chunk_size", 16))),
         nan_fill=export_cfg.get("nan_fill"),
+    )
+    payload.update(
+        {
+            "field": "ai",
+            "value_domain": "AI",
+            "source_field": "log_ai",
+            "value_transform": "exp(log_ai)",
+        }
     )
     return payload
 

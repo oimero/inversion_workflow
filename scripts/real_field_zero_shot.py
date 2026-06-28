@@ -25,7 +25,7 @@ sys.path.insert(0, src_text)
 
 from cup.config.sources import load_summary, resolve_source_file_from_run, resolve_source_run
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
-from cup.seismic.volume_export import export_volume_like_source
+from cup.seismic.volume_export import export_volume_like_source, log_ai_to_ai_volume
 from ginn_v2.real_field import (
     input_qc_frame,
     load_real_field_section,
@@ -799,26 +799,37 @@ def _export_zero_shot_volumes(output_dir: Path, *, run_cfg: dict, data_root: Pat
         if not child.is_dir() or not npz_path.is_file():
             continue
         with np.load(npz_path, allow_pickle=False) as arrays:
-            pred = np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float32)
-            if pred.ndim != 3:
+            pred_log_ai = np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float32)
+            if pred_log_ai.ndim != 3:
                 continue
+            pred_ai = log_ai_to_ai_volume(pred_log_ai)
             payload = export_volume_like_source(
-                output_base=child / f"{child.name}_pred_log_ai",
-                volume=pred,
+                output_base=child / f"{child.name}_pred_ai",
+                volume=pred_ai,
                 ilines=np.asarray(arrays["ilines"], dtype=np.float64),
                 xlines=np.asarray(arrays["xlines"], dtype=np.float64),
                 samples=np.asarray(arrays["twt_s"], dtype=np.float64),
                 source_seismic_file=source_file,
                 source_seismic_type=source_type,
-                title=f"R0 zero-shot pred_log_ai: {child.name}",
+                title=f"R0 zero-shot pred_ai: {child.name}",
                 details=[
                     "schema=real_field_zero_shot_model_v1",
-                    "field=stitched_pred_log_ai",
-                    "domain=log(AI)",
+                    "field=pred_ai",
+                    "domain=AI",
+                    "source_field=stitched_pred_log_ai",
+                    "transform=exp(stitched_pred_log_ai)",
                 ],
                 seismic_options=inputs,
                 inline_chunk_size=inline_chunk_size,
                 nan_fill=nan_fill,
+            )
+            payload.update(
+                {
+                    "field": "pred_ai",
+                    "value_domain": "AI",
+                    "source_field": "stitched_pred_log_ai",
+                    "value_transform": "exp(stitched_pred_log_ai)",
+                }
             )
         payload["path"] = repo_relative_path(Path(str(payload["path"])), root=REPO_ROOT)
         outputs[child.name] = payload

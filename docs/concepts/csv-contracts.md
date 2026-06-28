@@ -615,3 +615,44 @@ R1 是当前流程的最终闭环。schema 为 `real_field_forward_diagnostic_su
 | `red_flags` | 自动红色告警列表，空列表表示无致命问题 |
 | `recommended_next_state` | `return_to_input_preparation_or_synthetic_diagnostic`（有告警）或 `future_sparse_well_adapter_candidate`（无告警） |
 | `wavelet_sha256` / `zero_shot_summary_sha256` | 输入文件校验值 |
+
+## 第八步 L0 · l0_real_delta_anchor.py
+
+L0 是独立的 synthetic + 真实井 delta-anchor 单井 holdout 研究验证，summary schema 为
+`l0_real_delta_anchor_v1`。完整实验约束见
+[`docs/spec/l0-real-delta-anchor-validation.md`](../spec/l0-real-delta-anchor-validation.md)。
+
+### `l0_well_anchor_samples.csv`
+
+模型无关的逐井逐 TWT 样点标签。每行一个井轨迹样点；`well_delta` 不落冗余列，由
+`filtered_log_ai - lfm_log_ai` 唯一派生。
+
+| 关键字段 | 含义 |
+|----------|------|
+| `well_name` / `sample_index` / `twt_s` | 井名、井内样点序号和 TWT 秒轴 |
+| `inline` / `xline` / `x_m` / `y_m` | 三维轨迹采样位置 |
+| `spatial_cluster_id` / `spatial_cluster_size` | 600 m 半径连通空间簇 |
+| `filtered_log_ai` / `lfm_log_ai` | 真实井目标与第七步 LFM，均为 log(AI) |
+| `valid_for_fit` / `valid_reason` | 是否进入 anchor loss 及唯一原因码 |
+| `sampling_mode` / `sample_method` / `wellbore_class` | 三维采样与井型审计字段 |
+
+### `l0_holdout_metrics.csv`
+
+每个 held-out well × `control`/`anchor` 一行。保存 full-AI、delta、能量、梯度、分频和
+waveform 指标，以及相对 paired control 的 gain、good-well 守门状态和三类井 QC 图路径。
+
+### `l0_holdout_summary.csv`
+
+每个被排除井一行，`is_primary_holdout=true` 标记配置的正式 holdout 井。正式判定只允许
+读取该行；同簇自动排除井只作辅助诊断。
+
+### `l0_training_history.csv` / `l0_anchor_sampling_qc.csv`
+
+前者逐 run × epoch 保存 synthetic/anchor/total loss、梯度尺度和覆盖计数；后者逐
+run × epoch × cluster × well 保存抽样次数。Held-out 井必须显式记录且
+`selected_count == 0`。
+
+### `l0_synthetic_preservation.csv` / `l0_decision_table.csv`
+
+前者逐 run × frozen synthetic scope 保存 RMSE/NRMSE/corr 及 warning/catastrophic 守门结果；
+后者逐条保存正式判定规则、观测值、阈值和布尔结果。

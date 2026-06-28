@@ -148,6 +148,7 @@ lfm_log_ai(inline, xline, twt) = a_field(inline, xline) + b_field(inline, xline)
 | 文件 | 内容 |
 |------|------|
 | `real_field_lfm.npz` | 三维 LFM，包含 `log_ai`、`valid_mask_model`、`lfm_support_mask`、`distance_to_control`、`a_field`、`b_field`、坐标轴和 metadata |
+| `real_field_lfm_ai.zgy` | 供解释软件使用的线性 AI 体，数值为 `exp(log_ai)`；内部 NPZ 仍保持 log(AI) |
 | `real_field_lfm_summary.json` | 来源路径、控制井统计、LFM 统计、输出文件清单和 SHA-256 |
 
 ### 井趋势

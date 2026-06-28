@@ -1035,22 +1035,6 @@ def _build_volume_well_forward_qc(
             }
         )
         lfm_ai_metrics = _well_ai_metrics(well_log_ai=well_log_ai, pred_log_ai=lfm_trace, valid=model_valid)
-        lfm_synthetic = forward_log_ai(lfm_trace[None, :], wavelet)[0]
-        figures.update(
-            _plot_volume_well_qc_case(
-                figures_dir=figures_dir,
-                well_name=well_name,
-                role="lfm_input",
-                selected_log_ai=lfm_trace,
-                filtered_log_ai=well_log_ai,
-                sample_twt=sample_twt,
-                observed=observed_forward,
-                synthetic=lfm_synthetic,
-                valid_forward=forward_valid_base & np.isfinite(lfm_synthetic),
-                tie_window_start_s=_coerce_float(tie.get("tie_window_start_s")),
-                tie_window_end_s=_coerce_float(tie.get("tie_window_end_s")),
-            )
-        )
         rows.append({**base, "model_role": "lfm_input", "status": "ok" if lfm_ai_metrics.get("well_ai_status") == "ok" else lfm_ai_metrics.get("well_ai_status"), **lfm_ai_metrics})
         for role, payload in predictions.items():
             arrays = payload["arrays"]

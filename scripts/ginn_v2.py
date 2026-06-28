@@ -116,6 +116,28 @@ TRAIN_CONFIG_KEYS = {
     "synthetic_gate_frozen_candidate": "synthetic-gate-frozen-candidate",
 }
 
+TRAIN_CONFIG_GROUPS = {
+    "sources": {"benchmark_dir", "patch_index", "normalization"},
+    "model": {"model_id", "model_role", "hidden_channels", "depth"},
+    "patching": {
+        "patch_lateral",
+        "patch_twt",
+        "lateral_stride",
+        "twt_stride",
+        "min_valid_fraction",
+    },
+    "split": {"split_policy", "validation_fraction", "test_fraction"},
+    "optimization": {"epochs", "batch_size", "learning_rate", "seed"},
+    "losses": {"lambda_physics", "lambda_real_delta"},
+    "runtime": {"device", "log_interval_batches"},
+    "smoke_test": {"max_patches", "overfit_tiny"},
+    "synthetic_gate": {
+        "synthetic_gate_report_dir",
+        "synthetic_gate_report_card",
+        "synthetic_gate_frozen_candidate",
+    },
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -224,8 +246,10 @@ def _apply_train_config(args: argparse.Namespace) -> argparse.Namespace:
         return args
     config_path = resolve_relative_path(args.config, root=REPO_ROOT)
     payload = load_yaml_config(config_path)
-    config = dict(payload.get("train") or payload)
-    real_delta = config.get("real_delta")
+    train_config = payload.get("train")
+    if not isinstance(train_config, Mapping):
+        raise ValueError("GINN-v2 config must contain a train mapping.")
+    config, real_delta = _flatten_train_config(train_config)
     if real_delta is not None and not isinstance(real_delta, dict):
         raise ValueError("train.real_delta must be a mapping when configured.")
     args.real_delta_config = dict(real_delta) if real_delta is not None else None
@@ -240,6 +264,37 @@ def _apply_train_config(args: argparse.Namespace) -> argparse.Namespace:
     if args.benchmark_dir is None:
         raise ValueError("ginn_v2.py train requires train.benchmark_dir in config or --benchmark-dir.")
     return args
+
+
+def _flatten_train_config(
+    train_config: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object] | None]:
+    allowed_groups = set(TRAIN_CONFIG_GROUPS) | {"real_delta"}
+    unexpected_groups = sorted(set(train_config) - allowed_groups)
+    if unexpected_groups:
+        raise ValueError(f"Unsupported train config groups: {unexpected_groups}")
+    flattened: dict[str, object] = {}
+    for group_name, allowed_keys in TRAIN_CONFIG_GROUPS.items():
+        group = train_config.get(group_name)
+        if group is None:
+            continue
+        if not isinstance(group, Mapping):
+            raise ValueError(f"train.{group_name} must be a mapping.")
+        unexpected_keys = sorted(set(group) - allowed_keys)
+        if unexpected_keys:
+            raise ValueError(
+                f"Unsupported keys in train.{group_name}: {unexpected_keys}"
+            )
+        for key, value in group.items():
+            if key in flattened:
+                raise ValueError(f"Duplicate train config key: {key}")
+            flattened[str(key)] = value
+    real_delta = train_config.get("real_delta")
+    if real_delta is None:
+        return flattened, None
+    if not isinstance(real_delta, Mapping):
+        raise ValueError("train.real_delta must be a mapping.")
+    return flattened, dict(real_delta)
 
 
 def _resolve_benchmark_dir(value: Path | str) -> Path:

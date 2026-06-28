@@ -16,7 +16,10 @@ Synthetic gate 的主候选仍是 `trace1d_tcn_lateral_mixer_mismatch`：强 1D 
 线性 sparse-well 支线已冻结为 rejected diagnostic。2026-06-27 的 final-head R2 虽被原始
 标量规则误判为 lateral positive，但 LOCO 与 all-well 预测均发生明显 delta 能量和梯度坍缩，
 synthetic preservation 同时严重失败。因此人工审计覆盖原判定：R2 已冻结为 rejected
-diagnostic，禁止进入原规划的 R3 full-field application。
+diagnostic，禁止进入原规划的 R3 full-field application。2026-06-28 的 from-scratch
+real-delta anchor 在未参与训练、且属于单井空间簇的 PH5 上显著改善 full-AI/delta corr 与
+RMSE，同时保持 synthetic evidence；该结果冻结为 positive proof-of-signal，delta 幅度偏低和
+井旁正演下降作为后续警告保留。
 
 ## 批次说明
 
@@ -29,6 +32,7 @@ diagnostic，禁止进入原规划的 R3 full-field application。
 | `20260623_six_section_r2_gate` | `0c216564d9a19e076665e133be791c40b7e31b4e` | 冻结六剖面 R0/R1 和 R2 全局常数 bias 诊断 | 当前真实工区推荐入口 |
 | `20260626_w0_w1_rejected_diagnostic` | `2e165832c2152701cd28c42038986f49572c03ed` | 冻结旧 W0/W1 线性 sparse-well 支线：W0 井侧正、W1 全场拒绝 | 废弃支线，仅作反例证据 |
 | `20260627_r2_final_head_rejected_diagnostic` | `572a124a6f88f202c8654ea586db01f66e916f4d` | 冻结 final-head real-delta adapter：标量改善来自 delta collapse | 废弃支线，禁止进入 full-field application |
+| `20260628_real_delta_anchor_ph5_positive_signal` | `c7d751afe8db3d408afc304eede663e308aba9ab` | 完整冻结 PH5 held-out real-delta anchor 输出、checkpoint 与图件 | Positive proof-of-signal；继续 GINN-v2 real-delta 研究 |
 
 ## 真实工区冻结位置
 
@@ -51,6 +55,12 @@ Final-head R2 rejected diagnostic 位置：
 
 ```text
 note/summary/final_audit/20260627_r2_final_head_rejected_diagnostic/
+```
+
+PH5 held-out real-delta positive-signal 完整冻结位置：
+
+```text
+note/summary/final_audit/20260628_real_delta_anchor_ph5_positive_signal/
 ```
 
 关键指标来自：

@@ -674,6 +674,7 @@ def prepare_real_delta_support(
     cfg = _validate_config(config)
     cfg["lambda_real_delta"] = float(lambda_real_delta)
     sources = _resolve_sources(cfg, repo_root=repo_root)
+    logger.info("real-delta source: %s", sources.lfm_dir)
     with input_reference_stats_path.open("r", encoding="utf-8") as handle:
         input_stats = json.load(handle)
     seismic_suffix = sources.seismic_path.suffix.casefold()
@@ -868,7 +869,7 @@ def _resolve_sources(
     *,
     repo_root: Path,
 ) -> RealDeltaSources:
-    lfm_dir = resolve_relative_path(str(config["real_field_lfm_dir"]), root=repo_root)
+    lfm_dir = _resolve_lfm_dir(config["real_field_lfm_dir"], repo_root=repo_root)
     summary_path = lfm_dir / "real_field_lfm_summary.json"
     summary = load_summary(
         summary_path,
@@ -908,6 +909,37 @@ def _resolve_sources(
         well_inventory_file=well_inventory_file,
         seismic_path=seismic_path,
     )
+
+
+def _resolve_lfm_dir(value: Any, *, repo_root: Path) -> Path:
+    text = str(value).strip()
+    if text.casefold() != "auto":
+        return resolve_relative_path(text, root=repo_root)
+    output_root = repo_root / "scripts" / "output"
+    candidates: list[Path] = []
+    for path in output_root.glob("real_field_lfm_*"):
+        if not path.is_dir():
+            continue
+        summary_path = path / "real_field_lfm_summary.json"
+        lfm_path = path / "real_field_lfm.npz"
+        if not summary_path.is_file() or not lfm_path.is_file():
+            continue
+        try:
+            with summary_path.open("r", encoding="utf-8") as handle:
+                summary = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            str(summary.get("schema_version") or "") == "real_field_lfm_v1"
+            and str(summary.get("status") or "") == "ok"
+        ):
+            candidates.append(path)
+    if not candidates:
+        raise FileNotFoundError(
+            "No successful real_field_lfm_* run with summary and real_field_lfm.npz "
+            f"was found under {output_root}."
+        )
+    return sorted(candidates, key=lambda path: (path.stat().st_mtime, path.name))[-1]
 
 
 def _source_summary(

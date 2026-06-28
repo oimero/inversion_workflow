@@ -123,7 +123,7 @@ def build_well_anchor_samples(
     )
     successful = metrics[metrics["tie_status"].astype(str).eq("success")].copy()
     if successful.empty:
-        raise ValueError("No successful well ties are available for L0 anchors.")
+        raise ValueError("No successful well ties are available for real-delta labels.")
     inventory = inventory.drop_duplicates("well_name").set_index("well_name", drop=False)
 
     cluster_rows: list[dict[str, Any]] = []
@@ -226,9 +226,9 @@ def build_well_anchor_samples(
         )
     frame = pd.DataFrame.from_records(rows, columns=ANCHOR_SAMPLE_COLUMNS)
     if frame.empty or not frame["valid_for_fit"].any():
-        raise ValueError("L0 well anchor builder produced no valid samples.")
+        raise ValueError("Real-delta well label builder produced no valid samples.")
     metadata = {
-        "schema_version": "l0_well_anchor_samples_v1",
+        "schema_version": "real_delta_well_samples_v1",
         "n_wells": int(frame["well_name"].nunique()),
         "n_clusters": int(frame["spatial_cluster_id"].nunique()),
         "n_samples": int(len(frame)),

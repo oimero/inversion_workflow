@@ -187,7 +187,7 @@ def _load_seismic_reference_payload(*, run_cfg: dict, models: list[dict]) -> dic
             "seismic_value_transform requires frozen input reference stats. "
             f"Expected {stats_path}. Re-run the training command with the current "
             "scripts/ginn_v2.py so input_reference_stats.json is produced next to "
-            "normalization.json and checkpoint.pt."
+            "normalization.json and the best/final checkpoints."
         )
     with stats_path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)

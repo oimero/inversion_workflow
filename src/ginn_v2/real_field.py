@@ -101,7 +101,10 @@ def load_model_manifest(model_cfg: Mapping[str, Any], *, root: Path) -> dict[str
     if not manifest_path.is_file():
         raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
     with manifest_path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+        manifest = json.load(handle)
+    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v2":
+        raise ValueError(f"Unsupported model run manifest schema: {manifest_path}")
+    return manifest
 
 
 def _model_manifest_and_dir(model_cfg: Mapping[str, Any], *, root: Path) -> tuple[Path, dict[str, Any]]:
@@ -114,7 +117,7 @@ def _model_manifest_and_dir(model_cfg: Mapping[str, Any], *, root: Path) -> tupl
         raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v1":
+    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v2":
         raise ValueError(f"Unsupported model run manifest schema: {manifest_path}")
     gate = manifest.get("synthetic_gate_evidence")
     if not isinstance(gate, Mapping):
@@ -141,6 +144,28 @@ def _manifest_model_role(manifest: Mapping[str, Any]) -> str:
     if not model_id:
         raise ValueError("Model manifest must contain model_id or model_role.")
     return model_id.replace("-", "_")
+
+
+def _primary_checkpoint_path(
+    manifest: Mapping[str, Any],
+    *,
+    root: Path,
+) -> Path:
+    checkpoints = manifest.get("checkpoints")
+    if not isinstance(checkpoints, Mapping):
+        raise ValueError("GINN-v2 v2 manifest lacks checkpoints mapping.")
+    primary = str(checkpoints.get("primary") or "")
+    if primary not in {"best", "final"}:
+        raise ValueError(f"Invalid GINN-v2 primary checkpoint: {primary!r}")
+    record = checkpoints.get(primary)
+    if not isinstance(record, Mapping):
+        raise ValueError(f"GINN-v2 manifest lacks primary checkpoint record: {primary}")
+    path = resolve_relative_path(str(record.get("path") or ""), root=root)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    if sha256_file(path) != str(record.get("sha256") or ""):
+        raise ValueError(f"GINN-v2 primary checkpoint SHA-256 mismatch: {path}")
+    return path
 
 
 def synthetic_train_values(
@@ -512,12 +537,7 @@ def run_zero_shot_model(
     model_role = _manifest_model_role(manifest)
     model_id_label = _required_text(manifest, "model_id")
     synthetic_gate_evidence = dict(manifest["synthetic_gate_evidence"])
-    checkpoint_path = _resolve_model_artifact(
-        manifest.get("checkpoint"),
-        root=root,
-        model_run_dir=model_run_dir,
-        fallback_name="checkpoint.pt",
-    )
+    checkpoint_path = _primary_checkpoint_path(manifest, root=root)
     model, checkpoint = load_checkpoint(checkpoint_path)
     normalization_path = None
     normalization_ref = manifest.get("normalization_path") or manifest.get("normalization_file")
@@ -661,12 +681,7 @@ def run_zero_shot_volume_model(
     model_role = _manifest_model_role(manifest)
     model_id_label = _required_text(manifest, "model_id")
     synthetic_gate_evidence = dict(manifest["synthetic_gate_evidence"])
-    checkpoint_path = _resolve_model_artifact(
-        manifest.get("checkpoint"),
-        root=root,
-        model_run_dir=model_run_dir,
-        fallback_name="checkpoint.pt",
-    )
+    checkpoint_path = _primary_checkpoint_path(manifest, root=root)
     model, checkpoint = load_checkpoint(checkpoint_path)
     normalization_path = None
     normalization_ref = manifest.get("normalization_path") or manifest.get("normalization_file")

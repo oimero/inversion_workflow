@@ -1,0 +1,1470 @@
+"""Sparse real-well delta supervision for ordinary GINN-v2 experiments."""
+
+from __future__ import annotations
+
+from collections import defaultdict, deque
+from dataclasses import dataclass
+import json
+import logging
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+
+from cup.config.sources import load_summary
+from cup.seismic.viz import plot_well_waveform_qc, waveform_qc_metrics
+from cup.utils.io import repo_relative_path, resolve_relative_path, sha256_file
+from cup.well.anchor import build_well_anchor_samples, sample_volume_trilinear
+from ginn_v2.real_field import (
+    RealFieldVolume,
+    build_real_field_patch_index,
+    forward_log_ai,
+    load_real_field_volume,
+    load_selected_wavelet,
+)
+from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
+from wtie.processing import grid
+
+
+@dataclass(frozen=True)
+class RealDeltaSources:
+    lfm_dir: Path
+    lfm_path: Path
+    lfm_summary_path: Path
+    lfm_summary: dict[str, Any]
+    well_auto_tie_dir: Path
+    well_inventory_file: Path
+    seismic_path: Path
+
+
+class BalancedRealDeltaSampler:
+    """Deterministic cluster and within-cluster shuffled cycles."""
+
+    def __init__(self, samples: pd.DataFrame, *, clusters_per_step: int, seed: int) -> None:
+        valid = samples[samples["valid_for_fit"].astype(bool)].copy()
+        if valid.empty:
+            raise ValueError("Real-delta sampler received no valid samples.")
+        self.wells_by_cluster = {
+            int(cluster): sorted(group["well_name"].astype(str).unique().tolist())
+            for cluster, group in valid.groupby("spatial_cluster_id", sort=True)
+        }
+        self.clusters = sorted(self.wells_by_cluster)
+        self.k = min(int(clusters_per_step), len(self.clusters))
+        if self.k <= 0:
+            raise ValueError("Real-delta sampler requires at least one training cluster.")
+        self.rng = np.random.default_rng(int(seed))
+        self.cluster_queue: deque[int] = deque()
+        self.well_queues: dict[int, deque[str]] = {
+            cluster: deque() for cluster in self.clusters
+        }
+        self.counts: dict[tuple[int, str], int] = defaultdict(int)
+
+    def _refill_clusters(self) -> None:
+        order = np.asarray(self.clusters, dtype=np.int64)
+        self.rng.shuffle(order)
+        self.cluster_queue.extend(int(value) for value in order)
+
+    def _next_clusters(self) -> list[int]:
+        selected: list[int] = []
+        deferred: list[int] = []
+        while len(selected) < self.k:
+            if not self.cluster_queue:
+                self._refill_clusters()
+            cluster = self.cluster_queue.popleft()
+            if cluster in selected:
+                deferred.append(cluster)
+                continue
+            selected.append(cluster)
+        self.cluster_queue.extendleft(reversed(deferred))
+        return selected
+
+    def _next_well(self, cluster: int) -> str:
+        queue = self.well_queues[cluster]
+        if not queue:
+            wells = np.asarray(self.wells_by_cluster[cluster], dtype=object)
+            self.rng.shuffle(wells)
+            queue.extend(str(value) for value in wells)
+        return queue.popleft()
+
+    def select(self) -> list[tuple[int, str]]:
+        selected = [
+            (cluster, self._next_well(cluster))
+            for cluster in self._next_clusters()
+        ]
+        for item in selected:
+            self.counts[item] += 1
+        return selected
+
+
+class DifferentiableWellPredictor:
+    """Canonical no-lateral patch/stitch inference sampled on well trajectories."""
+
+    def __init__(
+        self,
+        *,
+        volume: RealFieldVolume,
+        patch_spec: Mapping[str, Any],
+        normalization: Mapping[str, Any],
+        forward_batch_size: int = 256,
+    ) -> None:
+        self.volume = volume
+        self.patch_spec = dict(patch_spec)
+        self.normalization = dict(normalization)
+        self.forward_batch_size = int(forward_batch_size)
+        self._patches: dict[int, list[Any]] = {}
+        self._trace_task_cache: dict[tuple[int, int], list[tuple[Any, torch.Tensor]]] = {}
+        self._geometry_cache: dict[
+            tuple[int, ...],
+            tuple[
+                list[list[tuple[tuple[int, int], int, int, float, float]]],
+                set[tuple[int, int]],
+            ],
+        ] = {}
+
+    def prepare(
+        self,
+        wells: pd.DataFrame,
+        *,
+        logger: logging.Logger | None = None,
+    ) -> dict[str, int]:
+        all_nodes: set[tuple[int, int]] = set()
+        groups = list(wells.groupby("well_name", sort=True))
+        for index, (well_name, rows) in enumerate(groups, start=1):
+            _geometry, nodes = self._cached_point_geometry(rows)
+            all_nodes.update(nodes)
+            if logger is not None:
+                logger.info(
+                    "real-delta precompute: geometry well=%s (%d/%d) cumulative_nodes=%d",
+                    well_name,
+                    index,
+                    len(groups),
+                    len(all_nodes),
+                )
+        task_count = 0
+        ordered_nodes = sorted(all_nodes)
+        node_log_interval = max(1, len(ordered_nodes) // 10)
+        for index, node in enumerate(ordered_nodes, start=1):
+            task_count += len(self._trace_tasks_for_node(node))
+            if logger is not None and (
+                index == 1
+                or index == len(ordered_nodes)
+                or index % node_log_interval == 0
+            ):
+                logger.info(
+                    "real-delta precompute: support node=%d/%d trace_patches=%d",
+                    index,
+                    len(ordered_nodes),
+                    task_count,
+                )
+        return {
+            "n_prepared_wells": int(wells["well_name"].nunique()),
+            "n_support_nodes": int(len(all_nodes)),
+            "n_support_trace_patches": int(task_count),
+        }
+
+    def patches(self, inline_index: int) -> list[Any]:
+        if inline_index not in self._patches:
+            self._patches[inline_index] = build_real_field_patch_index(
+                self.volume.valid_mask[inline_index],
+                lateral_samples=int(self.patch_spec["lateral_samples"]),
+                twt_samples=int(self.patch_spec["twt_samples"]),
+                lateral_stride=int(self.patch_spec["lateral_stride"]),
+                twt_stride=int(self.patch_spec["twt_stride"]),
+                min_valid_fraction=float(self.patch_spec["min_valid_fraction"]),
+            )
+        return self._patches[inline_index]
+
+    def predict_delta_n(
+        self,
+        model: torch.nn.Module,
+        rows: pd.DataFrame,
+        *,
+        device: torch.device,
+        canonical_full_patch: bool = False,
+    ) -> torch.Tensor:
+        return self.predict_delta_n_groups(
+            model,
+            [rows],
+            device=device,
+            canonical_full_patch=canonical_full_patch,
+        )[0]
+
+    def predict_delta_n_groups(
+        self,
+        model: torch.nn.Module,
+        groups: Sequence[pd.DataFrame],
+        *,
+        device: torch.device,
+        canonical_full_patch: bool = False,
+    ) -> list[torch.Tensor]:
+        if not groups or any(rows.empty for rows in groups):
+            raise ValueError("Cannot predict an empty real-delta well sample group.")
+        geometries = []
+        nodes: set[tuple[int, int]] = set()
+        for rows in groups:
+            geometry, group_nodes = self._cached_point_geometry(rows)
+            geometries.append(geometry)
+            nodes.update(group_nodes)
+        node_predictions = self._predict_nodes(
+            model,
+            nodes,
+            device=device,
+            canonical_full_patch=canonical_full_patch,
+        )
+        return [
+            self._interpolate_geometry(geometry, node_predictions)
+            for geometry in geometries
+        ]
+
+    @staticmethod
+    def _interpolate_geometry(
+        point_geometry: list[list[tuple[tuple[int, int], int, int, float, float]]],
+        node_predictions: Mapping[tuple[int, int], torch.Tensor],
+    ) -> torch.Tensor:
+        predictions: list[torch.Tensor] = []
+        for geometry in point_geometry:
+            value: torch.Tensor | None = None
+            interpolation_weight = 0.0
+            for node, twt0, twt1, time_weight, spatial_weight in geometry:
+                trace = node_predictions[node]
+                for twt_index, temporal_weight in (
+                    (twt0, 1.0 - time_weight),
+                    (twt1, time_weight),
+                ):
+                    weight = spatial_weight * temporal_weight
+                    if weight <= 0.0 or not bool(torch.isfinite(trace[twt_index])):
+                        continue
+                    term = trace[twt_index] * weight
+                    value = term if value is None else value + term
+                    interpolation_weight += weight
+            if value is None or interpolation_weight <= 0.0:
+                raise ValueError("Real-delta predictor found an uncovered well sample.")
+            predictions.append(value / interpolation_weight)
+        return torch.stack(predictions)
+
+    def _cached_point_geometry(
+        self,
+        rows: pd.DataFrame,
+    ) -> tuple[
+        list[list[tuple[tuple[int, int], int, int, float, float]]],
+        set[tuple[int, int]],
+    ]:
+        if "_real_delta_row_id" not in rows:
+            return self._point_geometry(rows.reset_index(drop=True))
+        key = tuple(
+            pd.to_numeric(rows["_real_delta_row_id"], errors="raise")
+            .astype(int)
+            .tolist()
+        )
+        if key not in self._geometry_cache:
+            self._geometry_cache[key] = self._point_geometry(rows.reset_index(drop=True))
+        return self._geometry_cache[key]
+
+    def _point_geometry(
+        self,
+        rows: pd.DataFrame,
+    ) -> tuple[
+        list[list[tuple[tuple[int, int], int, int, float, float]]],
+        set[tuple[int, int]],
+    ]:
+        axes = (self.volume.ilines, self.volume.xlines, self.volume.twt_s)
+        columns = ("inline", "xline", "twt_s")
+        fractional = []
+        for axis, column in zip(axes, columns):
+            values = pd.to_numeric(rows[column], errors="coerce").to_numpy(dtype=np.float64)
+            fractional.append(
+                np.interp(values, axis, np.arange(axis.size), left=np.nan, right=np.nan)
+            )
+        output: list[list[tuple[tuple[int, int], int, int, float, float]]] = []
+        nodes: set[tuple[int, int]] = set()
+        for point in range(len(rows)):
+            if not all(np.isfinite(frac[point]) for frac in fractional):
+                raise ValueError("Well sample is outside a canonical real-field axis.")
+            positions = [float(frac[point]) for frac in fractional]
+            lower = [
+                min(int(np.floor(value)), axes[dim].size - 2)
+                for dim, value in enumerate(positions)
+            ]
+            weights = [value - index for value, index in zip(positions, lower)]
+            terms: list[tuple[tuple[int, int], int, int, float, float]] = []
+            for di in (0, 1):
+                for dj in (0, 1):
+                    spatial_weight = (weights[0] if di else 1.0 - weights[0]) * (
+                        weights[1] if dj else 1.0 - weights[1]
+                    )
+                    if spatial_weight <= 0.0:
+                        continue
+                    node = (lower[0] + di, lower[1] + dj)
+                    terms.append(
+                        (node, lower[2], lower[2] + 1, weights[2], spatial_weight)
+                    )
+                    nodes.add(node)
+            output.append(terms)
+        return output, nodes
+
+    def _predict_nodes(
+        self,
+        model: torch.nn.Module,
+        nodes: set[tuple[int, int]],
+        *,
+        device: torch.device,
+        canonical_full_patch: bool,
+    ) -> dict[tuple[int, int], torch.Tensor]:
+        if canonical_full_patch:
+            return self._predict_nodes_full_patch(model, nodes, device=device)
+        tasks: list[tuple[tuple[int, int], Any, torch.Tensor]] = []
+        for node in sorted(nodes):
+            for patch, tensor in self._trace_tasks_for_node(node):
+                tasks.append((node, patch, tensor))
+        if not tasks:
+            raise ValueError("No canonical real-field patches cover the well support nodes.")
+        outputs: list[torch.Tensor] = []
+        for start in range(0, len(tasks), self.forward_batch_size):
+            batch = torch.stack(
+                [task[2] for task in tasks[start : start + self.forward_batch_size]]
+            ).to(device)
+            outputs.extend(model(batch)[:, 0, 0, :].unbind(0))
+        return self._stitch_node_tasks(nodes, tasks, outputs, device=device)
+
+    def _trace_tasks_for_node(
+        self,
+        node: tuple[int, int],
+    ) -> list[tuple[Any, torch.Tensor]]:
+        if node in self._trace_task_cache:
+            return self._trace_task_cache[node]
+        inline_index, xline_index = node
+        tasks: list[tuple[Any, torch.Tensor]] = []
+        for patch in self.patches(inline_index):
+            if not patch.lateral_start <= xline_index < patch.lateral_stop:
+                continue
+            sl = (inline_index, xline_index, slice(patch.twt_start, patch.twt_stop))
+            valid = self.volume.valid_mask[sl]
+            inputs = self._input_tensor(self.volume.seismic[sl], self.volume.lfm[sl], valid)
+            tasks.append((patch, inputs[:, None, :].contiguous()))
+        self._trace_task_cache[node] = tasks
+        return tasks
+
+    def _predict_nodes_full_patch(
+        self,
+        model: torch.nn.Module,
+        nodes: set[tuple[int, int]],
+        *,
+        device: torch.device,
+    ) -> dict[tuple[int, int], torch.Tensor]:
+        patch_keys: dict[tuple[int, int, int], Any] = {}
+        for inline_index, xline_index in nodes:
+            for patch in self.patches(inline_index):
+                if patch.lateral_start <= xline_index < patch.lateral_stop:
+                    patch_keys[(inline_index, patch.lateral_start, patch.twt_start)] = patch
+        patch_outputs: dict[tuple[int, int, int], torch.Tensor] = {}
+        items = sorted(patch_keys.items())
+        chunk_size = max(
+            1,
+            self.forward_batch_size // int(self.patch_spec["lateral_samples"]),
+        )
+        for start in range(0, len(items), chunk_size):
+            chunk = items[start : start + chunk_size]
+            tensors = []
+            for (inline_index, _, _), patch in chunk:
+                sl = (
+                    inline_index,
+                    slice(patch.lateral_start, patch.lateral_stop),
+                    slice(patch.twt_start, patch.twt_stop),
+                )
+                tensors.append(
+                    self._input_tensor(
+                        self.volume.seismic[sl],
+                        self.volume.lfm[sl],
+                        self.volume.valid_mask[sl],
+                    )
+                )
+            predicted = model(torch.stack(tensors).to(device))[:, 0]
+            for (key, _patch), value in zip(chunk, predicted.unbind(0)):
+                patch_outputs[key] = value
+        tasks: list[tuple[tuple[int, int], Any, torch.Tensor]] = []
+        outputs: list[torch.Tensor] = []
+        for node in sorted(nodes):
+            inline_index, xline_index = node
+            for patch in self.patches(inline_index):
+                if patch.lateral_start <= xline_index < patch.lateral_stop:
+                    key = (inline_index, patch.lateral_start, patch.twt_start)
+                    tasks.append((node, patch, torch.empty(0)))
+                    outputs.append(patch_outputs[key][xline_index - patch.lateral_start])
+        return self._stitch_node_tasks(nodes, tasks, outputs, device=device)
+
+    def _stitch_node_tasks(
+        self,
+        nodes: set[tuple[int, int]],
+        tasks: Sequence[tuple[tuple[int, int], Any, torch.Tensor]],
+        outputs: Sequence[torch.Tensor],
+        *,
+        device: torch.device,
+    ) -> dict[tuple[int, int], torch.Tensor]:
+        nt = self.volume.twt_s.size
+        by_node: dict[tuple[int, int], list[tuple[Any, torch.Tensor]]] = defaultdict(list)
+        for (node, patch, _), output in zip(tasks, outputs):
+            by_node[node].append((patch, output))
+        stitched: dict[tuple[int, int], torch.Tensor] = {}
+        for node in nodes:
+            indices: list[torch.Tensor] = []
+            values: list[torch.Tensor] = []
+            weight = torch.zeros(nt, dtype=torch.float32, device=device)
+            inline_index, xline_index = node
+            for patch, output in by_node[node]:
+                valid = torch.as_tensor(
+                    self.volume.valid_mask[
+                        inline_index,
+                        xline_index,
+                        patch.twt_start : patch.twt_stop,
+                    ],
+                    dtype=torch.bool,
+                    device=device,
+                )
+                destination = torch.arange(
+                    patch.twt_start,
+                    patch.twt_stop,
+                    device=device,
+                )[valid]
+                indices.append(destination)
+                values.append(output[valid])
+                weight.index_add_(
+                    0,
+                    destination,
+                    torch.ones(destination.shape, dtype=torch.float32, device=device),
+                )
+            if not indices:
+                raise ValueError(f"No patch contributions for real-field node {node}.")
+            total = torch.zeros(nt, dtype=torch.float32, device=device).index_add(
+                0,
+                torch.cat(indices),
+                torch.cat(values),
+            )
+            stitched[node] = torch.where(
+                weight > 0.0,
+                total / weight,
+                torch.full_like(total, torch.nan),
+            )
+        return stitched
+
+    def _input_tensor(
+        self,
+        seismic: np.ndarray,
+        lfm: np.ndarray,
+        valid: np.ndarray,
+    ) -> torch.Tensor:
+        seismic_n = (
+            np.asarray(seismic, dtype=np.float32)
+            - float(self.normalization["seismic"]["mean"])
+        ) / float(self.normalization["seismic"]["std"])
+        lfm_n = (
+            np.asarray(lfm, dtype=np.float32)
+            - float(self.normalization["lfm"]["mean"])
+        ) / float(self.normalization["lfm"]["std"])
+        mask = np.asarray(valid, dtype=bool)
+        values = np.stack(
+            [
+                np.where(mask & np.isfinite(seismic_n), seismic_n, 0.0),
+                np.where(mask & np.isfinite(lfm_n), lfm_n, 0.0),
+                mask.astype(np.float32),
+            ],
+            axis=0,
+        )
+        return torch.from_numpy(values.astype(np.float32))
+
+
+class RealDeltaSupport:
+    """Prepared real-well labels and differentiable support for one model run."""
+
+    def __init__(
+        self,
+        *,
+        config: Mapping[str, Any],
+        sources: RealDeltaSources,
+        volume: RealFieldVolume,
+        samples: pd.DataFrame,
+        training_samples: pd.DataFrame,
+        excluded_wells: Sequence[str],
+        held_out_cluster: int,
+        predictor: DifferentiableWellPredictor,
+        sampler: BalancedRealDeltaSampler | None,
+        normalization: Mapping[str, Any],
+        precompute_summary: Mapping[str, Any],
+        source_summary: Mapping[str, Any],
+    ) -> None:
+        self.config = dict(config)
+        self.sources = sources
+        self.volume = volume
+        self.samples = samples
+        self.training_samples = training_samples
+        self.excluded_wells = list(excluded_wells)
+        self.held_out_cluster = int(held_out_cluster)
+        self.predictor = predictor
+        self.sampler = sampler
+        self.normalization = dict(normalization)
+        self.precompute_summary = dict(precompute_summary)
+        self.source_summary = dict(source_summary)
+        self.canonical_full_patch = False
+        self.reconstruction_max_abs_log_ai: float | None = None
+
+    def configure_model(self, *, receptive_field_lateral: int) -> None:
+        self.canonical_full_patch = int(receptive_field_lateral) != 1
+
+    def validate_reconstruction(
+        self,
+        model: torch.nn.Module,
+        *,
+        device: torch.device,
+    ) -> float:
+        was_training = model.training
+        model.eval()
+        if self.canonical_full_patch:
+            with torch.no_grad():
+                prediction = self.predictor.predict_delta_n(
+                    model,
+                    self.samples,
+                    device=device,
+                    canonical_full_patch=True,
+                )
+            model.train(was_training)
+            if not bool(torch.all(torch.isfinite(prediction))):
+                raise ValueError("Canonical full-patch real-well prediction is non-finite.")
+            return float("nan")
+        with torch.no_grad():
+            sparse = self.predictor.predict_delta_n(
+                model,
+                self.samples,
+                device=device,
+            )
+            canonical = self.predictor.predict_delta_n(
+                model,
+                self.samples,
+                device=device,
+                canonical_full_patch=True,
+            )
+        model.train(was_training)
+        error = float(torch.max(torch.abs(sparse - canonical)).cpu()) * float(
+            self.normalization["delta"]["std"]
+        )
+        tolerance = float(self.config["reconstruction_tolerance_log_ai"])
+        if not np.isfinite(error) or error > tolerance:
+            raise ValueError(
+                "real_field_well_reconstruction_mismatch: "
+                f"max_abs_log_ai={error:.9g}, tolerance={tolerance:.9g}"
+            )
+        self.reconstruction_max_abs_log_ai = error
+        return error
+
+    def training_loss(
+        self,
+        model: torch.nn.Module,
+        *,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, dict[str, int]]:
+        if self.sampler is None:
+            raise RuntimeError("Real-delta loss requested without an active sampler.")
+        selected = self.sampler.select()
+        groups = [
+            self.training_samples[
+                self.training_samples["spatial_cluster_id"].astype(int).eq(cluster)
+                & self.training_samples["well_name"].astype(str).eq(well_name)
+            ].sort_values("sample_index")
+            for cluster, well_name in selected
+        ]
+        predictions = self.predictor.predict_delta_n_groups(model, groups, device=device)
+        mean = float(self.normalization["delta"]["mean"])
+        std = float(self.normalization["delta"]["std"])
+        losses = []
+        n_samples = 0
+        for rows, prediction in zip(groups, predictions):
+            target = (
+                rows["filtered_log_ai"].to_numpy(dtype=np.float32)
+                - rows["lfm_log_ai"].to_numpy(dtype=np.float32)
+                - mean
+            ) / std
+            target_tensor = torch.as_tensor(target, dtype=torch.float32, device=device)
+            losses.append(torch.mean((prediction - target_tensor) ** 2))
+            n_samples += int(len(rows))
+        return torch.stack(losses).mean(), {
+            "selected_real_clusters": int(len(selected)),
+            "selected_real_wells": int(len(selected)),
+            "selected_real_samples": int(n_samples),
+        }
+
+    def sampling_qc_frame(self) -> pd.DataFrame:
+        rows = []
+        counts = self.sampler.counts if self.sampler is not None else {}
+        wells = self.samples.drop_duplicates("well_name").sort_values("well_name")
+        for _, row in wells.iterrows():
+            cluster = int(row["spatial_cluster_id"])
+            well_name = str(row["well_name"])
+            rows.append(
+                {
+                    "well_name": well_name,
+                    "spatial_cluster_id": cluster,
+                    "supervision_role": str(row["supervision_role"]),
+                    "used_for_real_delta_training": bool(
+                        row["used_for_real_delta_training"]
+                    ),
+                    "selected_count": int(counts.get((cluster, well_name), 0)),
+                    "n_valid_samples": int(
+                        self.samples[
+                            self.samples["well_name"].astype(str).eq(well_name)
+                            & self.samples["valid_for_fit"].astype(bool)
+                        ].shape[0]
+                    ),
+                }
+            )
+        return pd.DataFrame.from_records(rows)
+
+    def manifest_payload(self, *, repo_root: Path) -> dict[str, Any]:
+        public_config = {
+            key: value
+            for key, value in self.config.items()
+            if key != "samples_path"
+        }
+        return {
+            "config": public_config,
+            "held_out_cluster_id": self.held_out_cluster,
+            "excluded_wells": list(self.excluded_wells),
+            "same_cluster_training_leakage_risk": bool(
+                float(self.config["lambda_real_delta"]) > 0.0
+                and not self.config["exclude_same_cluster"]
+            ),
+            "n_wells": int(self.samples["well_name"].nunique()),
+            "n_training_wells": int(
+                self.samples.loc[
+                    self.samples["used_for_real_delta_training"].astype(bool),
+                    "well_name",
+                ].nunique()
+            ),
+            "n_clusters": int(self.samples["spatial_cluster_id"].nunique()),
+            "precompute": dict(self.precompute_summary),
+            "support_prediction_mode": (
+                "canonical_full_patch"
+                if self.canonical_full_patch
+                else "sparse_no_lateral"
+            ),
+            "reconstruction_max_abs_log_ai": self.reconstruction_max_abs_log_ai,
+            "sources": dict(self.source_summary),
+            "well_samples": {
+                "path": repo_relative_path(
+                    Path(self.config["samples_path"]),
+                    root=repo_root,
+                ),
+                "sha256": sha256_file(Path(self.config["samples_path"])),
+            },
+        }
+
+
+def prepare_real_delta_support(
+    *,
+    config: Mapping[str, Any],
+    repo_root: Path,
+    output_dir: Path,
+    normalization: Mapping[str, Any],
+    patch_spec: Mapping[str, Any],
+    input_reference_stats_path: Path,
+    lambda_real_delta: float,
+    seed: int,
+    logger: logging.Logger,
+) -> RealDeltaSupport:
+    cfg = _validate_config(config)
+    cfg["lambda_real_delta"] = float(lambda_real_delta)
+    sources = _resolve_sources(cfg, repo_root=repo_root)
+    with input_reference_stats_path.open("r", encoding="utf-8") as handle:
+        input_stats = json.load(handle)
+    seismic_suffix = sources.seismic_path.suffix.casefold()
+    seismic_type = "segy" if seismic_suffix in {".sgy", ".segy"} else seismic_suffix.lstrip(".")
+    real_cfg = {
+        "real_field_inputs": {
+            "lfm_file": repo_relative_path(sources.lfm_path, root=repo_root),
+            "seismic_file": repo_relative_path(sources.seismic_path, root=repo_root),
+            "seismic_type": seismic_type or "zgy",
+            "seismic_value_transform": cfg["seismic_value_transform"],
+            "lfm_value_transform": cfg["lfm_value_transform"],
+            "seismic_reference_stats": dict(input_stats["stats"]),
+            "seismic_reference_stats_file": repo_relative_path(
+                input_reference_stats_path,
+                root=repo_root,
+            ),
+            "seismic_reference_stats_sha256": sha256_file(input_reference_stats_path),
+        },
+        "volume": {},
+    }
+    logger.info("real-delta: loading real-field seismic and LFM volume")
+    volume = load_real_field_volume(
+        config=real_cfg,
+        root=repo_root,
+        data_root=repo_root,
+    )
+    logger.info("real-delta: building well labels")
+    samples, _metadata = build_well_anchor_samples(
+        well_auto_tie_dir=sources.well_auto_tie_dir,
+        well_inventory_file=sources.well_inventory_file,
+        lfm=volume.lfm,
+        valid_mask=volume.valid_mask,
+        ilines=volume.ilines,
+        xlines=volume.xlines,
+        twt_s=volume.twt_s,
+        repo_root=repo_root,
+        cluster_radius_m=float(cfg["cluster_radius_m"]),
+    )
+    valid = samples[samples["valid_for_fit"].astype(bool)].copy()
+    if valid.empty:
+        raise ValueError("Real-delta label builder produced no valid samples.")
+    valid["_real_delta_row_id"] = np.arange(len(valid), dtype=np.int64)
+    held_out_cluster, excluded_wells, training = assign_supervision_roles(
+        valid,
+        held_out_well=cfg["held_out_well"],
+        exclude_same_cluster=bool(cfg["exclude_same_cluster"]),
+        require_training=lambda_real_delta > 0.0,
+    )
+    if lambda_real_delta <= 0.0:
+        valid["used_for_real_delta_training"] = False
+        training["used_for_real_delta_training"] = False
+    role_lookup = (
+        valid.drop_duplicates("well_name")
+        .set_index("well_name")[
+            ["supervision_role", "used_for_real_delta_training", "exclusion_reason"]
+        ]
+        .to_dict(orient="index")
+    )
+    for column in (
+        "supervision_role",
+        "used_for_real_delta_training",
+        "exclusion_reason",
+    ):
+        samples[column] = samples["well_name"].astype(str).map(
+            {well: values[column] for well, values in role_lookup.items()}
+        )
+    samples_path = output_dir / "real_delta_well_samples.csv"
+    samples.to_csv(samples_path, index=False)
+    cfg["samples_path"] = str(samples_path)
+    predictor = DifferentiableWellPredictor(
+        volume=volume,
+        patch_spec=patch_spec,
+        normalization=normalization,
+    )
+    logger.info(
+        "real-delta: precomputing support for %d wells",
+        valid["well_name"].nunique(),
+    )
+    precompute = predictor.prepare(valid, logger=logger)
+    logger.info(
+        "real-delta: prepared %d nodes and %d trace patches",
+        precompute["n_support_nodes"],
+        precompute["n_support_trace_patches"],
+    )
+    sampler = (
+        BalancedRealDeltaSampler(
+            training,
+            clusters_per_step=int(cfg["clusters_per_step"]),
+            seed=int(seed) + 1_000_003,
+        )
+        if lambda_real_delta > 0.0
+        else None
+    )
+    return RealDeltaSupport(
+        config=cfg,
+        sources=sources,
+        volume=volume,
+        samples=valid,
+        training_samples=training,
+        excluded_wells=excluded_wells,
+        held_out_cluster=held_out_cluster,
+        predictor=predictor,
+        sampler=sampler,
+        normalization=normalization,
+        precompute_summary=precompute,
+        source_summary=_source_summary(sources, repo_root=repo_root),
+    )
+
+
+def assign_supervision_roles(
+    samples: pd.DataFrame,
+    *,
+    held_out_well: str,
+    exclude_same_cluster: bool,
+    require_training: bool,
+) -> tuple[int, list[str], pd.DataFrame]:
+    wells = set(samples["well_name"].astype(str).unique())
+    if held_out_well not in wells:
+        raise ValueError(
+            f"Configured held_out_well={held_out_well!r} is unavailable; "
+            f"available wells: {sorted(wells)}"
+        )
+    cluster_values = samples.loc[
+        samples["well_name"].astype(str).eq(held_out_well),
+        "spatial_cluster_id",
+    ].astype(int).unique()
+    if cluster_values.size != 1:
+        raise ValueError(f"Held-out well has ambiguous cluster: {held_out_well}")
+    cluster = int(cluster_values[0])
+    if exclude_same_cluster:
+        excluded = sorted(
+            samples.loc[
+                samples["spatial_cluster_id"].astype(int).eq(cluster),
+                "well_name",
+            ].astype(str).unique()
+        )
+    else:
+        excluded = [held_out_well]
+    samples["supervision_role"] = "training"
+    samples["exclusion_reason"] = ""
+    held_mask = samples["well_name"].astype(str).eq(held_out_well)
+    samples.loc[held_mask, "supervision_role"] = "held_out"
+    samples.loc[held_mask, "exclusion_reason"] = "configured_holdout"
+    same_cluster_mask = samples["well_name"].astype(str).isin(
+        set(excluded) - {held_out_well}
+    )
+    samples.loc[same_cluster_mask, "supervision_role"] = "same_cluster_excluded"
+    samples.loc[same_cluster_mask, "exclusion_reason"] = "same_cluster_as_holdout"
+    samples["used_for_real_delta_training"] = samples["supervision_role"].eq("training")
+    training = samples[samples["used_for_real_delta_training"]].copy()
+    if require_training and training.empty:
+        raise ValueError("Configured holdout leaves no real-delta training wells.")
+    return cluster, excluded, training
+
+
+def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    cfg = dict(config)
+    required = {
+        "real_field_lfm_dir",
+        "held_out_well",
+        "exclude_same_cluster",
+        "clusters_per_step",
+        "cluster_radius_m",
+        "diagnostic_max_hz",
+        "reconstruction_tolerance_log_ai",
+        "seismic_value_transform",
+        "lfm_value_transform",
+    }
+    missing = sorted(required - set(cfg))
+    if missing:
+        raise ValueError(f"train.real_delta is missing required keys: {missing}")
+    if not str(cfg["held_out_well"]).strip():
+        raise ValueError("train.real_delta.held_out_well must be non-empty.")
+    cfg["held_out_well"] = str(cfg["held_out_well"]).strip()
+    if not isinstance(cfg["exclude_same_cluster"], bool):
+        raise ValueError("train.real_delta.exclude_same_cluster must be a YAML boolean.")
+    if int(cfg["clusters_per_step"]) <= 0:
+        raise ValueError("train.real_delta.clusters_per_step must be positive.")
+    for key in (
+        "cluster_radius_m",
+        "diagnostic_max_hz",
+        "reconstruction_tolerance_log_ai",
+    ):
+        value = float(cfg[key])
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"train.real_delta.{key} must be finite and positive.")
+    return cfg
+
+
+def _resolve_sources(
+    config: Mapping[str, Any],
+    *,
+    repo_root: Path,
+) -> RealDeltaSources:
+    lfm_dir = resolve_relative_path(str(config["real_field_lfm_dir"]), root=repo_root)
+    summary_path = lfm_dir / "real_field_lfm_summary.json"
+    summary = load_summary(
+        summary_path,
+        schema_version="real_field_lfm_v1",
+        allowed_status={"ok"},
+        label="real_field_lfm_summary.json",
+    )
+    lfm_path = lfm_dir / "real_field_lfm.npz"
+    inputs = dict(summary["inputs"])
+    source_runs = dict(summary["source_runs"])
+    well_auto_tie_dir = resolve_relative_path(
+        str(source_runs["well_auto_tie_dir"]),
+        root=repo_root,
+    )
+    well_inventory_file = resolve_relative_path(
+        str(inputs["well_inventory_file"]),
+        root=repo_root,
+    )
+    seismic_path = resolve_relative_path(str(inputs["seismic_file"]), root=repo_root)
+    expected_seismic_hash = str(inputs["seismic_sha256"])
+    if sha256_file(seismic_path) != expected_seismic_hash:
+        raise ValueError("Step 7 seismic SHA-256 mismatch.")
+    for path in (
+        lfm_path,
+        well_auto_tie_dir / "well_tie_metrics.csv",
+        well_inventory_file,
+        seismic_path,
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    return RealDeltaSources(
+        lfm_dir=lfm_dir,
+        lfm_path=lfm_path,
+        lfm_summary_path=summary_path,
+        lfm_summary=summary,
+        well_auto_tie_dir=well_auto_tie_dir,
+        well_inventory_file=well_inventory_file,
+        seismic_path=seismic_path,
+    )
+
+
+def _source_summary(
+    sources: RealDeltaSources,
+    *,
+    repo_root: Path,
+) -> dict[str, Any]:
+    paths = {
+        "lfm": sources.lfm_path,
+        "lfm_summary": sources.lfm_summary_path,
+        "well_tie_metrics": sources.well_auto_tie_dir / "well_tie_metrics.csv",
+        "well_inventory": sources.well_inventory_file,
+        "seismic": sources.seismic_path,
+    }
+    return {
+        name: {
+            "path": repo_relative_path(path, root=repo_root),
+            "sha256": sha256_file(path),
+        }
+        for name, path in paths.items()
+    }
+
+
+def evaluate_real_wells(
+    *,
+    support: RealDeltaSupport,
+    models: Mapping[str, torch.nn.Module],
+    output_dir: Path,
+    benchmark_dir: Path,
+    repo_root: Path,
+    device: torch.device,
+    logger: logging.Logger,
+) -> dict[str, Path]:
+    """Evaluate best/final checkpoints on every valid real well."""
+
+    manifest_path = benchmark_dir / "benchmark_manifest.json"
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        benchmark_manifest = json.load(handle)
+    wavelet_dir = resolve_relative_path(
+        str(dict(benchmark_manifest["source_runs"])["wavelet_generation_dir"]),
+        root=repo_root,
+    )
+    wavelet, _wavelet_metadata = load_selected_wavelet(wavelet_dir)
+    tie_metrics = pd.read_csv(
+        support.sources.well_auto_tie_dir / "well_tie_metrics.csv"
+    ).set_index("well_name", drop=False)
+    groups = [
+        group.sort_values("sample_index").copy()
+        for _, group in support.samples.groupby("well_name", sort=True)
+    ]
+    metrics_rows: list[dict[str, Any]] = []
+    band_rows: list[dict[str, Any]] = []
+    waveform_rows: list[dict[str, Any]] = []
+    delta_mean = float(support.normalization["delta"]["mean"])
+    delta_std = float(support.normalization["delta"]["std"])
+
+    for checkpoint_name, model in models.items():
+        logger.info(
+            "real-delta QC: checkpoint=%s, wells=%d",
+            checkpoint_name,
+            len(groups),
+        )
+        model.eval()
+        with torch.no_grad():
+            predictions_n = support.predictor.predict_delta_n_groups(
+                model,
+                groups,
+                device=device,
+                canonical_full_patch=support.canonical_full_patch,
+            )
+        for index, (well, prediction_n) in enumerate(zip(groups, predictions_n), start=1):
+            well_name = str(well["well_name"].iloc[0])
+            cluster = int(well["spatial_cluster_id"].iloc[0])
+            pred_delta = prediction_n.detach().cpu().numpy() * delta_std + delta_mean
+            target_ai = well["filtered_log_ai"].to_numpy(dtype=np.float64)
+            lfm_ai = well["lfm_log_ai"].to_numpy(dtype=np.float64)
+            target_delta = target_ai - lfm_ai
+            pred_ai = lfm_ai + pred_delta
+            twt = well["twt_s"].to_numpy(dtype=np.float64)
+            common = {
+                "checkpoint": checkpoint_name,
+                "well_name": well_name,
+                "spatial_cluster_id": cluster,
+                "supervision_role": str(well["supervision_role"].iloc[0]),
+                "used_for_real_delta_training": bool(
+                    well["used_for_real_delta_training"].iloc[0]
+                ),
+                "exclusion_reason": str(well["exclusion_reason"].iloc[0]),
+            }
+            metrics_rows.append(
+                {
+                    **common,
+                    **_well_metrics(
+                        target_ai,
+                        target_delta,
+                        pred_ai,
+                        pred_delta,
+                        twt,
+                    ),
+                }
+            )
+            band_rows.append(
+                {
+                    **common,
+                    **_well_band_metrics(
+                        target_ai=target_ai,
+                        target_delta=target_delta,
+                        pred_ai=pred_ai,
+                        pred_delta=pred_delta,
+                        twt=twt,
+                        diagnostic_max_hz=float(
+                            support.config["diagnostic_max_hz"]
+                        ),
+                    ),
+                }
+            )
+            figures, waveform_status, waveform = _write_well_figures(
+                output_dir=output_dir,
+                checkpoint_name=checkpoint_name,
+                cluster=cluster,
+                well_name=well_name,
+                well=well,
+                target_ai=target_ai,
+                lfm_ai=lfm_ai,
+                pred_delta=pred_delta,
+                volume=support.volume,
+                wavelet=wavelet,
+                tie=tie_metrics.loc[well_name],
+                repo_root=repo_root,
+            )
+            waveform_rows.append(
+                {
+                    **common,
+                    "status": waveform_status,
+                    **waveform,
+                    **figures,
+                }
+            )
+            logger.info(
+                "real-delta QC: checkpoint=%s well=%s (%d/%d) status=%s",
+                checkpoint_name,
+                well_name,
+                index,
+                len(groups),
+                waveform_status,
+            )
+
+    outputs = {
+        "real_well_metrics": output_dir / "real_well_metrics.csv",
+        "real_well_band_metrics": output_dir / "real_well_band_metrics.csv",
+        "real_well_waveform_metrics": output_dir / "real_well_waveform_metrics.csv",
+        "real_delta_sampling_qc": output_dir / "real_delta_sampling_qc.csv",
+    }
+    pd.DataFrame.from_records(metrics_rows).to_csv(
+        outputs["real_well_metrics"],
+        index=False,
+    )
+    pd.DataFrame.from_records(band_rows).to_csv(
+        outputs["real_well_band_metrics"],
+        index=False,
+    )
+    pd.DataFrame.from_records(waveform_rows).to_csv(
+        outputs["real_well_waveform_metrics"],
+        index=False,
+    )
+    support.sampling_qc_frame().to_csv(
+        outputs["real_delta_sampling_qc"],
+        index=False,
+    )
+    return outputs
+
+
+def _well_metrics(
+    target_ai: np.ndarray,
+    target_delta: np.ndarray,
+    pred_ai: np.ndarray,
+    pred_delta: np.ndarray,
+    twt: np.ndarray,
+) -> dict[str, float | int]:
+    delta = _basic_metrics(target_delta, pred_delta)
+    full = _basic_metrics(target_ai, pred_ai)
+    target_delta_rms = _rms(target_delta)
+    pred_delta_rms = _rms(pred_delta)
+    target_gradient, pred_gradient = _paired_gradients(
+        target_delta,
+        pred_delta,
+        twt,
+    )
+    return {
+        "n_valid": int(delta["n_valid"]),
+        "delta_corr": delta["corr"],
+        "delta_rmse": delta["rmse"],
+        "delta_bias": delta["bias"],
+        "full_ai_corr": full["corr"],
+        "full_ai_rmse": full["rmse"],
+        "full_ai_bias": full["bias"],
+        "delta_rms": pred_delta_rms,
+        "target_delta_rms": target_delta_rms,
+        "delta_target_relative_log_error": _energy_error(
+            pred_delta_rms,
+            target_delta_rms,
+        ),
+        "gradient_rms": _rms(pred_gradient),
+        "target_gradient_rms": _rms(target_gradient),
+        "gradient_target_relative_log_error": _energy_error(
+            _rms(pred_gradient),
+            _rms(target_gradient),
+        ),
+    }
+
+
+def _basic_metrics(
+    target: np.ndarray,
+    prediction: np.ndarray,
+) -> dict[str, float | int]:
+    valid = np.isfinite(target) & np.isfinite(prediction)
+    n_valid = int(np.count_nonzero(valid))
+    if n_valid < 2:
+        return {
+            "n_valid": n_valid,
+            "corr": np.nan,
+            "rmse": np.nan,
+            "bias": np.nan,
+        }
+    target_valid = np.asarray(target)[valid]
+    prediction_valid = np.asarray(prediction)[valid]
+    residual = prediction_valid - target_valid
+    corr = (
+        float(np.corrcoef(target_valid, prediction_valid)[0, 1])
+        if np.std(target_valid) > 0.0 and np.std(prediction_valid) > 0.0
+        else np.nan
+    )
+    return {
+        "n_valid": n_valid,
+        "corr": corr,
+        "rmse": float(np.sqrt(np.mean(residual**2))),
+        "bias": float(np.mean(residual)),
+    }
+
+
+def _well_band_metrics(
+    *,
+    target_ai: np.ndarray,
+    target_delta: np.ndarray,
+    pred_ai: np.ndarray,
+    pred_delta: np.ndarray,
+    twt: np.ndarray,
+    diagnostic_max_hz: float,
+) -> dict[str, float | int]:
+    dt = float(np.nanmedian(np.diff(twt)))
+    if not np.isfinite(dt) or dt <= 0.0:
+        return {}
+    high = min(float(diagnostic_max_hz), 0.45 * (0.5 / dt))
+    bands = (
+        ("lowfreq", 0.0, 0.2 * high),
+        ("observable_band", 0.2 * high, 0.4 * high),
+        ("highfreq_or_nullspace", 0.4 * high, high),
+    )
+    output: dict[str, float | int] = {}
+    for name, low_hz, high_hz in bands:
+        for prefix, target, prediction in (
+            ("delta", target_delta, pred_delta),
+            ("full_ai", target_ai, pred_ai),
+        ):
+            target_band, prediction_band = _fft_band_pair(
+                target,
+                prediction,
+                dt=dt,
+                low_hz=low_hz,
+                high_hz=high_hz,
+            )
+            metrics = _basic_metrics(target_band, prediction_band)
+            output[f"{prefix}_{name}_n_valid"] = metrics["n_valid"]
+            output[f"{prefix}_{name}_corr"] = metrics["corr"]
+            output[f"{prefix}_{name}_rmse"] = metrics["rmse"]
+    return output
+
+
+def _fft_band_pair(
+    target: np.ndarray,
+    prediction: np.ndarray,
+    *,
+    dt: float,
+    low_hz: float,
+    high_hz: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    valid = np.isfinite(target) & np.isfinite(prediction)
+    run = _largest_true_run(valid)
+    if run is None or run[1] - run[0] < 8:
+        empty = np.asarray([], dtype=np.float64)
+        return empty, empty
+    sl = slice(*run)
+    output = []
+    for values in (
+        np.asarray(target, dtype=np.float64)[sl],
+        np.asarray(prediction, dtype=np.float64)[sl],
+    ):
+        centered = values - float(np.mean(values))
+        spectrum = np.fft.rfft(centered)
+        frequency = np.fft.rfftfreq(values.size, d=dt)
+        keep = (frequency >= float(low_hz)) & (frequency < float(high_hz))
+        if low_hz <= 0.0:
+            keep[0] = True
+            spectrum[0] = np.fft.rfft(values)[0]
+        output.append(
+            np.fft.irfft(np.where(keep, spectrum, 0.0), n=values.size)
+        )
+    return output[0], output[1]
+
+
+def _paired_gradients(
+    target: np.ndarray,
+    prediction: np.ndarray,
+    twt: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    dt = np.diff(twt)
+    nominal = float(np.nanmedian(dt))
+    valid = (
+        np.isfinite(target[:-1])
+        & np.isfinite(target[1:])
+        & np.isfinite(prediction[:-1])
+        & np.isfinite(prediction[1:])
+        & np.isfinite(dt)
+        & (dt > 0.0)
+        & (dt <= 1.5 * nominal)
+    )
+    return np.diff(target)[valid] / dt[valid], np.diff(prediction)[valid] / dt[valid]
+
+
+def _rms(values: np.ndarray) -> float:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    return float(np.sqrt(np.mean(finite**2))) if finite.size else np.nan
+
+
+def _energy_error(prediction_rms: float, target_rms: float) -> float:
+    if not (
+        np.isfinite(prediction_rms)
+        and np.isfinite(target_rms)
+        and prediction_rms > 0.0
+        and target_rms > 0.0
+    ):
+        return np.nan
+    return float(abs(np.log(prediction_rms / target_rms)))
+
+
+def _write_well_figures(
+    *,
+    output_dir: Path,
+    checkpoint_name: str,
+    cluster: int,
+    well_name: str,
+    well: pd.DataFrame,
+    target_ai: np.ndarray,
+    lfm_ai: np.ndarray,
+    pred_delta: np.ndarray,
+    volume: RealFieldVolume,
+    wavelet: np.ndarray,
+    tie: Mapping[str, Any],
+    repo_root: Path,
+) -> tuple[dict[str, str], str, dict[str, float | int]]:
+    figures_dir = output_dir / "figures" / "wells" / str(cluster)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    twt = well["twt_s"].to_numpy(dtype=np.float64)
+    pred_ai = lfm_ai + pred_delta
+    target_delta = target_ai - lfm_ai
+    ai_path = figures_dir / f"{well_name}_{checkpoint_name}_ai_delta_qc.png"
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(8.5, 7.5),
+        sharey=True,
+        constrained_layout=True,
+    )
+    for values, label, color in (
+        (target_ai, "Filtered logAI", "black"),
+        (lfm_ai, "LFM", "tab:blue"),
+        (pred_ai, f"{checkpoint_name} prediction", "tab:red"),
+    ):
+        axes[0].plot(values, twt, label=label, color=color, lw=1.2)
+    for values, label, color in (
+        (target_delta, "Well delta", "black"),
+        (pred_delta, f"{checkpoint_name} delta", "tab:red"),
+    ):
+        axes[1].plot(values, twt, label=label, color=color, lw=1.2)
+    for axis in axes:
+        axis.invert_yaxis()
+        axis.grid(True, alpha=0.25)
+        axis.legend(fontsize=8)
+    axes[0].set_ylabel("TWT (s)")
+    axes[0].set_xlabel("logAI")
+    axes[1].set_xlabel("delta logAI")
+    fig.suptitle(
+        f"GINN-v2 real-well QC | {well_name} | cluster {cluster} | {checkpoint_name}"
+    )
+    fig.savefig(ai_path, dpi=180)
+    plt.close(fig)
+
+    forward_path = figures_dir / f"{well_name}_{checkpoint_name}_forward_qc.png"
+    status, waveform = _write_forward_figure(
+        path=forward_path,
+        title=(
+            f"GINN-v2 real-well forward QC | {well_name} | "
+            f"cluster {cluster} | {checkpoint_name}"
+        ),
+        pred_log_ai=pred_ai,
+        filtered_log_ai=target_ai,
+        twt=twt,
+        well=well,
+        volume=volume,
+        wavelet=wavelet,
+        tie=tie,
+    )
+    return (
+        {
+            "ai_delta_qc_figure": repo_relative_path(ai_path, root=repo_root),
+            "forward_qc_figure": (
+                repo_relative_path(forward_path, root=repo_root)
+                if status == "ok"
+                else ""
+            ),
+        },
+        status,
+        waveform,
+    )
+
+
+def _write_forward_figure(
+    *,
+    path: Path,
+    title: str,
+    pred_log_ai: np.ndarray,
+    filtered_log_ai: np.ndarray,
+    twt: np.ndarray,
+    well: pd.DataFrame,
+    volume: RealFieldVolume,
+    wavelet: np.ndarray,
+    tie: Mapping[str, Any],
+) -> tuple[str, dict[str, float | int]]:
+    if twt.size < 9:
+        return "insufficient_forward_qc_support", {}
+    filled = _fill_nonfinite(pred_log_ai)
+    synthetic = forward_log_ai(filled[None, :], wavelet)[0]
+    observed, inside = sample_volume_trilinear(
+        volume.seismic,
+        ilines=volume.ilines,
+        xlines=volume.xlines,
+        twt_s=volume.twt_s,
+        inline_values=well["inline"].to_numpy(dtype=np.float64)[1:],
+        xline_values=well["xline"].to_numpy(dtype=np.float64)[1:],
+        sample_twt_s=twt[1:],
+    )
+    valid = inside & np.isfinite(synthetic) & np.isfinite(observed)
+    start = _number(tie.get("tie_window_start_s"))
+    stop = _number(tie.get("tie_window_end_s"))
+    if np.isfinite(start) and np.isfinite(stop):
+        valid &= (twt[1:] >= start) & (twt[1:] <= stop)
+    run = _largest_true_run(valid)
+    if run is None or run[1] - run[0] < 8:
+        return "insufficient_forward_qc_support", {}
+    sl = slice(*run)
+    basis = twt[1:][sl]
+    pred_ai = grid.Log(np.exp(filled[1:][sl]), basis, "twt", name="Predicted AI")
+    filtered_ai = grid.Log(
+        np.exp(_fill_nonfinite(filtered_log_ai)[1:][sl]),
+        basis,
+        "twt",
+        name="Filtered LAS AI",
+    )
+    reflectivity = grid.Reflectivity(
+        np.tanh(0.5 * np.diff(filled))[sl],
+        basis,
+        "twt",
+        name="Reflectivity",
+    )
+    synthetic_trace = grid.Seismic(synthetic[sl], basis, "twt", name="Synthetic")
+    observed_trace = grid.Seismic(observed[sl], basis, "twt", name="Seismic")
+    xcorr_values = normalized_xcorr(observed_trace.values, synthetic_trace.values)
+    xcorr_basis = synthetic_trace.sampling_rate * np.arange(
+        -(synthetic_trace.size - 1),
+        synthetic_trace.size,
+    )
+    xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
+    dxcorr = dynamic_normalized_xcorr(observed_trace, synthetic_trace)
+    fig, _ = plot_well_waveform_qc(
+        [pred_ai, filtered_ai],
+        reflectivity,
+        synthetic_trace,
+        observed_trace,
+        xcorr,
+        dxcorr,
+        figsize=(12.0, 7.5),
+        synthetic_ai=pred_ai,
+        title=title,
+    )
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    raw = waveform_qc_metrics(observed_trace.values, synthetic_trace.values)
+    denominator = float(np.dot(synthetic_trace.values, synthetic_trace.values))
+    positive_scale = (
+        max(
+            0.0,
+            float(
+                np.dot(observed_trace.values, synthetic_trace.values) / denominator
+            ),
+        )
+        if denominator > 0.0
+        else np.nan
+    )
+    scaled = (
+        waveform_qc_metrics(
+            observed_trace.values,
+            positive_scale * synthetic_trace.values,
+        )
+        if np.isfinite(positive_scale)
+        else {}
+    )
+    return "ok", {
+        **{f"waveform_raw_{key}": value for key, value in raw.items()},
+        **{f"waveform_scaled_{key}": value for key, value in scaled.items()},
+        "waveform_positive_scale": positive_scale,
+    }
+
+
+def _fill_nonfinite(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    valid = np.isfinite(values)
+    if np.count_nonzero(valid) < 2:
+        raise ValueError("Trace has insufficient finite samples.")
+    return np.interp(np.arange(values.size), np.flatnonzero(valid), values[valid])
+
+
+def _largest_true_run(mask: np.ndarray) -> tuple[int, int] | None:
+    best = None
+    start = None
+    for index, value in enumerate(np.r_[np.asarray(mask, dtype=bool), False]):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            if best is None or index - start > best[1] - best[0]:
+                best = (start, index)
+            start = None
+    return best
+
+
+def _number(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+__all__ = [
+    "BalancedRealDeltaSampler",
+    "DifferentiableWellPredictor",
+    "RealDeltaSupport",
+    "assign_supervision_roles",
+    "evaluate_real_wells",
+    "prepare_real_delta_support",
+]

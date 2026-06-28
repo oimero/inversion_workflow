@@ -92,6 +92,20 @@ train:
   # 物理正演辅助损失，>0 时仅对 base 样本生效
   # 支持模型：patch_2d_with_physics_loss、trace_1d_dilated_tcn_mismatch_training
   lambda_physics: 0.0                    # 默认 0.0
+  lambda_real_delta: 0.0                 # 默认 0.0；真实井 delta 损失权重
+  log_interval_batches: 10               # 首批、每 N 批和末批输出进度
+
+  # 可选；缺省时是纯 synthetic 实验
+  real_delta:
+    real_field_lfm_dir: scripts/output/<explicit-step-7-run>
+    held_out_well: PH5
+    exclude_same_cluster: false
+    clusters_per_step: 4
+    cluster_radius_m: 600.0
+    diagnostic_max_hz: 80.0
+    reconstruction_tolerance_log_ai: 1.0e-5
+    seismic_value_transform: p99_abs_matched
+    lfm_value_transform: identity
 ```
 
 ### `benchmark_dir`
@@ -123,6 +137,13 @@ train:
 
 合成基准的剖面被滑动窗口切成小块，每个块包含 `patch_lateral` 条道和 `patch_twt` 个时间采样点。步长越小块数越多，训练越慢但覆盖越密集。`min_valid_fraction` 过滤掉有效像素不足的块。
 
+### `lambda_real_delta` 与 `real_delta`
+
+真实井监督是普通 GINN-v2 loss，不是独立工作流步骤。未配置 `real_delta` 时不读取真实工区；
+配置该段且权重为 0 时只生成 best/final 全井 QC；权重大于 0 时从首个 epoch 加入
+`filtered_log_ai - lfm_log_ai` 的 normalized-delta MSE。首版非零权重只支持
+`no_lateral`。指定 holdout 井始终不参与监督，`exclude_same_cluster` 控制是否同时排除同簇井。
+
 ---
 
 ## 脚本在做什么
@@ -132,7 +153,9 @@ train:
 1. **加载基准**：校验合成基准的文件完整性（SHA-256），读取样本索引。
 2. **构建块索引**：按切块参数和划分策略，将所有可用剖面切分为训练块、校验块和测试块。`split_policy=derive` 时，同一剖面的块全部分到同一集合，避免训练集和校验集中出现同一剖面的不同块。
 3. **计算归一化与参考统计量**：在训练集上计算地震和低频模型的均值、标准差。
-4. **训练循环**：每个 epoch 后在校验集上评估损失并记录最佳值。
+4. **训练循环**：组合 synthetic、physics 和可选 real-delta loss；每个 epoch 后只用 synthetic validation loss 选择 best。
+5. **双 checkpoint**：同时保存 synthetic validation 最优的 best 和固定最终 epoch 的 final。
+6. **真实井 QC**：配置 `real_delta` 时，best/final 都对全部有效井输出 AI、delta、分频和正演 QC。
 
 ### 预测与报告阶段
 
@@ -163,12 +186,22 @@ train:
 
 | 文件 | 内容 |
 |------|------|
-| `checkpoint.pt` | 模型权重 |
-| `training_history.json` | 每个 epoch 的训练和校验损失 |
+| `checkpoint_best.pt` | synthetic validation loss 最优权重 |
+| `checkpoint_final.pt` | 最终 epoch 权重 |
+| `training.log` | 终端同款阶段、batch 耗时、loss 与 ETA 日志 |
+| `training_history.csv` | 每个 epoch 的各项训练损失、校验损失、耗时和 checkpoint 标记 |
 | `patch_index.csv` | 全部块的索引、划分和元数据 |
 | `normalization.json` | 输入数据的归一化参数 |
 | `input_reference_stats.json` | 地震和低频模型的参考统计量 |
 | `model_run_manifest.json` | 运行清单：架构、超参、基准哈希、切块参数、训练结果摘要 |
+
+Manifest schema 为不兼容旧版本的 `ginn_v2_model_run_v2`。下游默认读取 manifest 中
+`checkpoints.primary=best`；旧 v1 run 必须重训。手工预测可用
+`--checkpoint primary|best|final` 显式选择权重。
+
+配置真实井数据后还会生成 `real_delta_well_samples.csv`、`real_delta_sampling_qc.csv`、
+`real_well_metrics.csv`、`real_well_band_metrics.csv`、`real_well_waveform_metrics.csv` 和
+best/final 井 QC 图。它们只陈述当前 run 的绝对证据，不自动比较 control，也不产生通过判定。
 
 ### 预测与报告输出
 

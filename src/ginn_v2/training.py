@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 from pathlib import Path
+import sys
+import time
 from typing import Any, Mapping
 
 import h5py
@@ -24,6 +28,29 @@ PHYSICS_LOSS_MODEL_IDS = {
     "patch_2d_with_physics_loss",
     "trace_1d_dilated_tcn_mismatch_training",
 }
+
+
+def configure_training_logger(output_dir: Path) -> logging.Logger:
+    """Create the per-run terminal and file logger."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(f"ginn_v2.training.{output_dir.resolve()}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in logger.handlers:
+        handler.close()
+    logger.handlers.clear()
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(formatter)
+    file_handler = logging.FileHandler(output_dir / "training.log", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(stream)
+    logger.addHandler(file_handler)
+    return logger
 
 
 def resolve_device(device_name: str) -> tuple[torch.device, dict[str, Any]]:
@@ -77,9 +104,20 @@ def train_model(
     depth: int,
     device_name: str,
     lambda_physics: float,
+    lambda_real_delta: float,
     seed: int,
+    real_delta_support: Any | None = None,
+    log_interval_batches: int = 10,
+    logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    logger = logger or configure_training_logger(output_dir)
+    if not np.isfinite(lambda_real_delta) or float(lambda_real_delta) < 0.0:
+        raise ValueError("lambda_real_delta must be finite and non-negative.")
+    if int(log_interval_batches) <= 0:
+        raise ValueError("log_interval_batches must be positive.")
+    if float(lambda_real_delta) > 0.0 and real_delta_support is None:
+        raise ValueError("Non-zero lambda_real_delta requires train.real_delta configuration.")
     if lambda_physics != 0.0:
         if model_id not in PHYSICS_LOSS_MODEL_IDS:
             raise NotImplementedError(
@@ -99,6 +137,14 @@ def train_model(
     generator = torch.Generator()
     generator.manual_seed(int(seed))
     device, device_metadata = resolve_device(device_name)
+    logger.info(
+        "training setup: model=%s device=%s seed=%d epochs=%d batch_size=%d",
+        model_id,
+        device,
+        int(seed),
+        int(epochs),
+        int(batch_size),
+    )
     train_ds = PatchDataset(
         benchmark,
         patch_index,
@@ -124,6 +170,33 @@ def train_model(
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
     model, info = build_model(model_id, hidden_channels=hidden_channels, depth=depth)
     model.to(device)
+    logger.info(
+        "model ready: parameters=%d train_patches=%d validation_patches=%d",
+        info.parameter_count,
+        len(train_ds),
+        len(val_ds),
+    )
+    reconstruction_error = None
+    if real_delta_support is not None:
+        real_delta_support.configure_model(
+            receptive_field_lateral=int(info.receptive_field_lateral)
+        )
+        logger.info(
+            "real-delta: validating %s real-well support",
+            (
+                "canonical full-patch"
+                if real_delta_support.canonical_full_patch
+                else "sparse-support/full-patch equivalence"
+            ),
+        )
+        reconstruction_error = real_delta_support.validate_reconstruction(
+            model,
+            device=device,
+        )
+        logger.info(
+            "real-delta: reconstruction max_abs_log_ai=%.9g",
+            reconstruction_error,
+        )
     wavelet = (
         _load_nominal_wavelet(benchmark.run_dir).to(device)
         if float(lambda_physics) > 0.0
@@ -132,11 +205,35 @@ def train_model(
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(learning_rate))
     history: list[dict[str, Any]] = []
     best_val = float("inf")
-    best_path = output_dir / "checkpoint.pt"
+    best_epoch: int | None = None
+    best_path = output_dir / "checkpoint_best.pt"
+    final_path = output_dir / "checkpoint_final.pt"
+    history_path = output_dir / "training_history.csv"
+    existing_outputs = [
+        path for path in (best_path, final_path, history_path) if path.exists()
+    ]
+    if existing_outputs:
+        raise FileExistsError(
+            f"GINN-v2 training outputs already exist: {existing_outputs}"
+        )
+    sequence = hashlib.sha256()
+    total_batches = len(train_loader)
+    if total_batches <= 0:
+        raise ValueError("GINN-v2 training split has no batches.")
+    total_training_steps = int(epochs) * total_batches
+    completed_steps = 0
+    ema_batch_elapsed: float | None = None
+    run_started = time.perf_counter()
     for epoch in range(1, int(epochs) + 1):
+        epoch_started = time.perf_counter()
+        logger.info("epoch %d/%d: training started", epoch, int(epochs))
         model.train()
-        train_losses = []
-        for batch in train_loader:
+        train_rows: list[dict[str, float | int]] = []
+        for batch_index, batch in enumerate(train_loader, start=1):
+            batch_started = time.perf_counter()
+            for patch_id in batch["patch_id"]:
+                sequence.update(str(patch_id).encode("utf-8"))
+                sequence.update(b"\0")
             x = batch["input"].to(device)
             target = batch["target_delta"].to(device)
             mask = batch["valid_mask"].to(device)
@@ -144,72 +241,254 @@ def train_model(
             pred = model(x)
             loss_ai = masked_mse(pred, target, mask)
             loss = loss_ai
+            loss_physics = torch.zeros((), dtype=loss.dtype, device=device)
             if wavelet is not None:
                 sample_kinds = list(batch["sample_kind"])
                 physics_rows = [
                     idx for idx, kind in enumerate(sample_kinds)
                     if str(kind) == "base"
                 ]
-                if not physics_rows:
-                    loss.backward()
-                    optimizer.step()
-                    train_losses.append(float(loss.detach().cpu()))
-                    continue
-                physics_index = torch.as_tensor(physics_rows, dtype=torch.long, device=device)
-                lfm = batch["lfm"].to(device).index_select(0, physics_index)
-                seismic = batch["seismic"].to(device).index_select(0, physics_index)
-                physics_mask = mask.index_select(0, physics_index)
-                physics_pred = pred.index_select(0, physics_index)
-                pred_log_ai = lfm + _denormalize_delta_torch(physics_pred[:, 0], normalization)[:, None]
-                synthetic = _torch_forward_log_ai(pred_log_ai[:, 0], wavelet)
-                # The patch target is aligned to the seismic axis by dropping the
-                # preceding impedance sample.  For the auxiliary physics loss we
-                # use the interior samples where a local reflectivity is defined.
-                seismic_target = seismic[:, 0, :, 1:]
-                seismic_mask = physics_mask[:, 0, :, 1:]
-                loss_physics = masked_mse(
-                    synthetic[:, None],
-                    seismic_target[:, None],
-                    seismic_mask[:, None],
+                if physics_rows:
+                    physics_index = torch.as_tensor(
+                        physics_rows,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    lfm = batch["lfm"].to(device).index_select(0, physics_index)
+                    seismic = batch["seismic"].to(device).index_select(0, physics_index)
+                    physics_mask = mask.index_select(0, physics_index)
+                    physics_pred = pred.index_select(0, physics_index)
+                    pred_log_ai = lfm + _denormalize_delta_torch(
+                        physics_pred[:, 0],
+                        normalization,
+                    )[:, None]
+                    synthetic = _torch_forward_log_ai(pred_log_ai[:, 0], wavelet)
+                    seismic_target = seismic[:, 0, :, 1:]
+                    seismic_mask = physics_mask[:, 0, :, 1:]
+                    loss_physics = masked_mse(
+                        synthetic[:, None],
+                        seismic_target[:, None],
+                        seismic_mask[:, None],
+                    )
+                    loss = loss + float(lambda_physics) * loss_physics
+            loss_real_delta = torch.zeros((), dtype=loss.dtype, device=device)
+            real_counts = {
+                "selected_real_clusters": 0,
+                "selected_real_wells": 0,
+                "selected_real_samples": 0,
+            }
+            if float(lambda_real_delta) > 0.0:
+                loss_real_delta, real_counts = real_delta_support.training_loss(
+                    model,
+                    device=device,
                 )
-                loss = loss_ai + float(lambda_physics) * loss_physics
+                loss = loss + float(lambda_real_delta) * loss_real_delta
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError(
+                    f"Non-finite GINN-v2 loss at epoch={epoch}, batch={batch_index}."
+                )
             loss.backward()
             optimizer.step()
-            train_losses.append(float(loss.detach().cpu()))
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            batch_elapsed = time.perf_counter() - batch_started
+            ema_batch_elapsed = (
+                batch_elapsed
+                if ema_batch_elapsed is None
+                else 0.9 * ema_batch_elapsed + 0.1 * batch_elapsed
+            )
+            completed_steps += 1
+            values: dict[str, float | int] = {
+                "synthetic_loss": float(loss_ai.detach().cpu()),
+                "physics_loss": float(loss_physics.detach().cpu()),
+                "weighted_physics_loss": float(
+                    float(lambda_physics) * loss_physics.detach().cpu()
+                ),
+                "real_delta_loss": float(loss_real_delta.detach().cpu()),
+                "weighted_real_delta_loss": float(
+                    float(lambda_real_delta) * loss_real_delta.detach().cpu()
+                ),
+                "total_loss": float(loss.detach().cpu()),
+                **real_counts,
+            }
+            train_rows.append(values)
+            should_log = (
+                batch_index == 1
+                or batch_index == total_batches
+                or batch_index % int(log_interval_batches) == 0
+            )
+            if should_log:
+                epoch_remaining = total_batches - batch_index
+                run_remaining = total_training_steps - completed_steps
+                logger.info(
+                    "epoch=%d/%d batch=%d/%d synthetic=%.6g physics=%.6g "
+                    "weighted_physics=%.6g real_delta=%.6g "
+                    "weighted_real_delta=%.6g total=%.6g batch_s=%.2f "
+                    "ema_batch_s=%.2f epoch_eta_s=%.1f run_eta_s=%.1f "
+                    "real_clusters=%d real_wells=%d",
+                    epoch,
+                    int(epochs),
+                    batch_index,
+                    total_batches,
+                    values["synthetic_loss"],
+                    values["physics_loss"],
+                    values["weighted_physics_loss"],
+                    values["real_delta_loss"],
+                    values["weighted_real_delta_loss"],
+                    values["total_loss"],
+                    batch_elapsed,
+                    ema_batch_elapsed,
+                    epoch_remaining * ema_batch_elapsed,
+                    run_remaining * ema_batch_elapsed,
+                    values["selected_real_clusters"],
+                    values["selected_real_wells"],
+                )
+        logger.info("epoch %d/%d: synthetic validation started", epoch, int(epochs))
         val_loss = evaluate_loss(model, val_loader, device)
+        epoch_elapsed = time.perf_counter() - epoch_started
+        frame = pd.DataFrame.from_records(train_rows)
         row = {
             "epoch": epoch,
-            "train_loss": float(np.mean(train_losses)) if train_losses else float("nan"),
+            "synthetic_loss": float(frame["synthetic_loss"].mean()),
+            "physics_loss": float(frame["physics_loss"].mean()),
+            "weighted_physics_loss": float(frame["weighted_physics_loss"].mean()),
+            "real_delta_loss": float(frame["real_delta_loss"].mean()),
+            "weighted_real_delta_loss": float(
+                frame["weighted_real_delta_loss"].mean()
+            ),
+            "train_loss": float(frame["total_loss"].mean()),
             "validation_loss": val_loss,
+            "selected_real_clusters": int(frame["selected_real_clusters"].sum()),
+            "selected_real_wells": int(frame["selected_real_wells"].sum()),
+            "selected_real_samples": int(frame["selected_real_samples"].sum()),
+            "epoch_elapsed_s": float(epoch_elapsed),
+            "is_best_checkpoint": False,
+            "is_final_checkpoint": epoch == int(epochs),
         }
         history.append(row)
         if np.isfinite(val_loss) and val_loss < best_val:
             best_val = val_loss
+            best_epoch = epoch
+            row["is_best_checkpoint"] = True
             torch.save(
-                {
-                    "model_id": model_id,
-                    "state_dict": model.state_dict(),
-                    "normalization": dict(normalization),
-                    "model_info": info.__dict__,
-                    "architecture": {
-                        "hidden_channels": int(hidden_channels),
-                        "depth": int(depth),
-                    },
-                    "device": device_metadata,
-                },
+                _checkpoint_payload(
+                    model=model,
+                    model_id=model_id,
+                    normalization=normalization,
+                    model_info=info.__dict__,
+                    hidden_channels=hidden_channels,
+                    depth=depth,
+                    device_metadata=device_metadata,
+                    epoch=epoch,
+                    validation_loss=val_loss,
+                    checkpoint_kind="best",
+                ),
                 best_path,
             )
-    history_frame = pd.DataFrame.from_records(history)
-    history_path = output_dir / "training_history.csv"
-    history_frame.to_csv(history_path, index=False)
+            logger.info(
+                "checkpoint best updated: epoch=%d validation_loss=%.9g",
+                epoch,
+                val_loss,
+            )
+        pd.DataFrame.from_records([row]).to_csv(
+            history_path,
+            mode="a",
+            header=not history_path.exists(),
+            index=False,
+        )
+        logger.info(
+            "epoch %d/%d complete: train_loss=%.6g validation_loss=%.6g elapsed_s=%.1f",
+            epoch,
+            int(epochs),
+            row["train_loss"],
+            val_loss,
+            epoch_elapsed,
+        )
+    if best_epoch is None or not best_path.is_file():
+        raise FloatingPointError("No finite synthetic validation loss; best checkpoint unavailable.")
+    final_validation_loss = float(history[-1]["validation_loss"])
+    torch.save(
+        _checkpoint_payload(
+            model=model,
+            model_id=model_id,
+            normalization=normalization,
+            model_info=info.__dict__,
+            hidden_channels=hidden_channels,
+            depth=depth,
+            device_metadata=device_metadata,
+            epoch=int(epochs),
+            validation_loss=final_validation_loss,
+            checkpoint_kind="final",
+        ),
+        final_path,
+    )
+    logger.info(
+        "checkpoint final written: epoch=%d validation_loss=%.9g",
+        int(epochs),
+        final_validation_loss,
+    )
+    for row in history:
+        row["is_best_checkpoint"] = int(row["epoch"]) == int(best_epoch)
+    pd.DataFrame.from_records(history).to_csv(history_path, index=False)
+    logger.info(
+        "training complete: best_epoch=%d best_validation_loss=%.9g final_epoch=%d elapsed_s=%.1f",
+        best_epoch,
+        best_val,
+        int(epochs),
+        time.perf_counter() - run_started,
+    )
     return {
         "status": "ok",
         "device": str(device),
         "device_metadata": device_metadata,
-        "checkpoint": best_path,
+        "checkpoints": {
+            "primary": "best",
+            "best": {
+                "path": best_path,
+                "epoch": int(best_epoch),
+                "validation_loss": float(best_val),
+            },
+            "final": {
+                "path": final_path,
+                "epoch": int(epochs),
+                "validation_loss": final_validation_loss,
+            },
+        },
         "history": history_path,
         "best_validation_loss": best_val,
         "model_info": info.__dict__,
+        "synthetic_sequence_sha256": sequence.hexdigest(),
+        "real_field_reconstruction_max_abs_log_ai": reconstruction_error,
+    }
+
+
+def _checkpoint_payload(
+    *,
+    model: torch.nn.Module,
+    model_id: str,
+    normalization: Mapping[str, Any],
+    model_info: Mapping[str, Any],
+    hidden_channels: int,
+    depth: int,
+    device_metadata: Mapping[str, Any],
+    epoch: int,
+    validation_loss: float,
+    checkpoint_kind: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "ginn_v2_checkpoint_v2",
+        "checkpoint_kind": checkpoint_kind,
+        "epoch": int(epoch),
+        "validation_loss": float(validation_loss),
+        "model_id": model_id,
+        "state_dict": model.state_dict(),
+        "normalization": dict(normalization),
+        "model_info": dict(model_info),
+        "architecture": {
+            "hidden_channels": int(hidden_channels),
+            "depth": int(depth),
+        },
+        "device": dict(device_metadata),
     }
 
 
@@ -283,6 +562,8 @@ def _torch_forward_log_ai(log_ai: torch.Tensor, wavelet: torch.Tensor) -> torch.
 
 def load_checkpoint(path: Path, *, hidden_channels: int | None = None, depth: int | None = None) -> tuple[torch.nn.Module, dict[str, Any]]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if str(checkpoint.get("schema_version") or "") != "ginn_v2_checkpoint_v2":
+        raise ValueError(f"Unsupported GINN-v2 checkpoint schema: {path}")
     info = dict(checkpoint["model_info"])
     architecture = dict(checkpoint.get("architecture") or {})
     model, _ = build_model(

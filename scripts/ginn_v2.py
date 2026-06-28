@@ -7,6 +7,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import sys
+from typing import Mapping
 
 import pandas as pd
 
@@ -28,7 +29,16 @@ from ginn_v2.data import (
     default_eval_kinds,
     default_train_kinds,
 )
-from ginn_v2.training import predict_patches, report_predictions, train_model
+from ginn_v2.models import build_model
+from ginn_v2.real_delta import evaluate_real_wells, prepare_real_delta_support
+from ginn_v2.training import (
+    configure_training_logger,
+    load_checkpoint,
+    predict_patches,
+    report_predictions,
+    resolve_device,
+    train_model,
+)
 
 
 MODEL_IDS = (
@@ -65,6 +75,8 @@ TRAIN_DEFAULTS = {
     "hidden_channels": 32,
     "depth": 5,
     "lambda_physics": 0.0,
+    "lambda_real_delta": 0.0,
+    "log_interval_batches": 10,
     "device": "auto",
     "seed": 20260617,
     "model_role": None,
@@ -94,6 +106,8 @@ TRAIN_CONFIG_KEYS = {
     "hidden_channels": "hidden-channels",
     "depth": "depth",
     "lambda_physics": "lambda-physics",
+    "lambda_real_delta": "lambda-real-delta",
+    "log_interval_batches": "log-interval-batches",
     "device": "device",
     "seed": "seed",
     "model_role": "model-role",
@@ -130,6 +144,16 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--hidden-channels", type=int, default=TRAIN_DEFAULTS["hidden_channels"])
     train.add_argument("--depth", type=int, default=TRAIN_DEFAULTS["depth"])
     train.add_argument("--lambda-physics", type=float, default=TRAIN_DEFAULTS["lambda_physics"])
+    train.add_argument(
+        "--lambda-real-delta",
+        type=float,
+        default=TRAIN_DEFAULTS["lambda_real_delta"],
+    )
+    train.add_argument(
+        "--log-interval-batches",
+        type=int,
+        default=TRAIN_DEFAULTS["log_interval_batches"],
+    )
     train.add_argument("--device", default=TRAIN_DEFAULTS["device"])
     train.add_argument("--seed", type=int, default=TRAIN_DEFAULTS["seed"])
     train.add_argument("--model-role", default=TRAIN_DEFAULTS["model_role"])
@@ -155,6 +179,11 @@ def parse_args() -> argparse.Namespace:
     predict.add_argument("--split", default="validation", choices=("train", "validation", "test", "benchmark", "all"))
     predict.add_argument("--batch-size", type=int, default=8)
     predict.add_argument("--device", default="auto")
+    predict.add_argument(
+        "--checkpoint",
+        choices=("primary", "best", "final"),
+        default="primary",
+    )
 
     report = sub.add_parser("report")
     report.add_argument("--prediction-dir", type=Path, required=True)
@@ -188,6 +217,7 @@ def _timestamped_output(prefix: str, explicit: Path | None) -> Path:
 
 
 def _apply_train_config(args: argparse.Namespace) -> argparse.Namespace:
+    args.real_delta_config = None
     if args.config is None:
         if args.benchmark_dir is None:
             raise ValueError("ginn_v2.py train requires --benchmark-dir or --config with train.benchmark_dir.")
@@ -195,6 +225,10 @@ def _apply_train_config(args: argparse.Namespace) -> argparse.Namespace:
     config_path = resolve_relative_path(args.config, root=REPO_ROOT)
     payload = load_yaml_config(config_path)
     config = dict(payload.get("train") or payload)
+    real_delta = config.get("real_delta")
+    if real_delta is not None and not isinstance(real_delta, dict):
+        raise ValueError("train.real_delta must be a mapping when configured.")
+    args.real_delta_config = dict(real_delta) if real_delta is not None else None
     provided_flags = {token[2:] for token in sys.argv if token.startswith("--")}
     for key, flag in TRAIN_CONFIG_KEYS.items():
         if flag in provided_flags or key not in config:
@@ -244,11 +278,22 @@ def _write_train_manifest(
     train_result: dict,
     patch_index_truncated: bool,
     max_patches: int | None,
+    real_delta_manifest: Mapping[str, object] | None,
+    real_well_outputs: Mapping[str, Path] | None,
 ) -> None:
-    checkpoint_path = Path(train_result["checkpoint"])
     history_path = Path(train_result["history"])
+    checkpoints = {"primary": str(train_result["checkpoints"]["primary"])}
+    for checkpoint_name in ("best", "final"):
+        record = dict(train_result["checkpoints"][checkpoint_name])
+        checkpoint_path = Path(record["path"])
+        checkpoints[checkpoint_name] = {
+            "path": repo_relative_path(checkpoint_path, root=REPO_ROOT),
+            "sha256": sha256_file(checkpoint_path),
+            "epoch": int(record["epoch"]),
+            "validation_loss": float(record["validation_loss"]),
+        }
     manifest = {
-        "schema_version": "ginn_v2_model_run_v1",
+        "schema_version": "ginn_v2_model_run_v2",
         "status": "ok",
         "model_id": args.model_id,
         "model_role": str(args.model_role or _infer_model_role(args.model_id)),
@@ -291,6 +336,7 @@ def _write_train_manifest(
         "loss": {
             "lambda_ai": 1.0,
             "lambda_physics": float(args.lambda_physics),
+            "lambda_real_delta": float(args.lambda_real_delta),
             "physics_loss_applied_sample_kinds": (
                 ["base"] if float(args.lambda_physics) > 0.0 else []
             ),
@@ -308,14 +354,25 @@ def _write_train_manifest(
             "learning_rate": float(args.learning_rate),
             "overfit_tiny": bool(args.overfit_tiny),
             "seed": int(args.seed),
+            "log_interval_batches": int(args.log_interval_batches),
+            "synthetic_sequence_sha256": train_result["synthetic_sequence_sha256"],
         },
         "device": train_result.get("device_metadata", {"resolved_device": train_result.get("device", "")}),
         "model_info": train_result["model_info"],
-        "checkpoint": repo_relative_path(checkpoint_path, root=REPO_ROOT),
-        "checkpoint_sha256": sha256_file(checkpoint_path),
+        "checkpoints": checkpoints,
         "training_history": repo_relative_path(history_path, root=REPO_ROOT),
         "training_history_sha256": sha256_file(history_path),
+        "training_log": repo_relative_path(output_dir / "training.log", root=REPO_ROOT),
+        "training_log_sha256": sha256_file(output_dir / "training.log"),
         "best_validation_loss": train_result["best_validation_loss"],
+        "real_delta": dict(real_delta_manifest) if real_delta_manifest is not None else None,
+        "real_well_outputs": {
+            key: {
+                "path": repo_relative_path(path, root=REPO_ROOT),
+                "sha256": sha256_file(path),
+            }
+            for key, path in (real_well_outputs or {}).items()
+        },
         "synthetic_gate_evidence_status": "pending",
     }
     if args.synthetic_gate_report_dir is not None or args.synthetic_gate_report_card is not None:
@@ -361,11 +418,39 @@ def _infer_model_role(model_id: str) -> str:
     return text.replace("-", "_")
 
 
+def _resolve_checkpoint_from_manifest(
+    manifest: Mapping[str, object],
+    *,
+    selection: str,
+) -> tuple[str, Path, str]:
+    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v2":
+        raise ValueError("GINN-v2 model run must use schema ginn_v2_model_run_v2.")
+    checkpoints = manifest.get("checkpoints")
+    if not isinstance(checkpoints, Mapping):
+        raise ValueError("GINN-v2 v2 manifest lacks checkpoints mapping.")
+    resolved_name = str(checkpoints.get("primary")) if selection == "primary" else selection
+    if resolved_name not in {"best", "final"}:
+        raise ValueError(f"Invalid primary checkpoint selection: {resolved_name!r}")
+    record = checkpoints.get(resolved_name)
+    if not isinstance(record, Mapping):
+        raise ValueError(f"Manifest lacks checkpoint record: {resolved_name}")
+    path = resolve_relative_path(str(record.get("path") or ""), root=REPO_ROOT)
+    expected_hash = str(record.get("sha256") or "")
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    if sha256_file(path) != expected_hash:
+        raise ValueError(f"Checkpoint SHA-256 mismatch: {path}")
+    return resolved_name, path, expected_hash
+
+
 def run_train(args: argparse.Namespace) -> None:
     args = _apply_train_config(args)
     benchmark_dir = _resolve_benchmark_dir(args.benchmark_dir)
     output_dir = _timestamped_output("ginn_v2_train", args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=args.output_dir is not None)
+    logger = configure_training_logger(output_dir)
+    logger.info("GINN-v2 train output: %s", output_dir)
+    logger.info("benchmark: %s", benchmark_dir)
     benchmark = SynthoseisBenchmark(benchmark_dir)
     patch_spec = PatchSpec(
         lateral_samples=int(args.patch_lateral),
@@ -407,6 +492,7 @@ def run_train(args: argparse.Namespace) -> None:
         patch_index = pd.concat([first, validation], ignore_index=True)
     patch_index_path = output_dir / "patch_index.csv"
     patch_index.to_csv(patch_index_path, index=False)
+    logger.info("patch index ready: %d rows", len(patch_index))
     if args.normalization is not None:
         with resolve_relative_path(args.normalization, root=REPO_ROOT).open("r", encoding="utf-8") as handle:
             normalization = json.load(handle)
@@ -441,6 +527,40 @@ def run_train(args: argparse.Namespace) -> None:
     }
     input_reference_stats_path = output_dir / "input_reference_stats.json"
     write_json(input_reference_stats_path, input_reference_stats)
+    real_delta_support = None
+    if args.real_delta_config is not None:
+        _probe_model, probe_info = build_model(
+            args.model_id,
+            hidden_channels=int(args.hidden_channels),
+            depth=int(args.depth),
+        )
+        del _probe_model
+        resolved_role = str(args.model_role or _infer_model_role(args.model_id))
+        if float(args.lambda_real_delta) > 0.0 and (
+            resolved_role != "no_lateral"
+            or int(probe_info.receptive_field_lateral) != 1
+        ):
+            raise NotImplementedError(
+                "Non-zero lambda_real_delta currently requires a no-lateral model "
+                "role with receptive_field_lateral=1."
+            )
+        real_delta_support = prepare_real_delta_support(
+            config=args.real_delta_config,
+            repo_root=REPO_ROOT,
+            output_dir=output_dir,
+            normalization=normalization,
+            patch_spec={
+                "lateral_samples": int(args.patch_lateral),
+                "twt_samples": int(args.patch_twt),
+                "lateral_stride": int(args.lateral_stride),
+                "twt_stride": int(args.twt_stride),
+                "min_valid_fraction": float(args.min_valid_fraction),
+            },
+            input_reference_stats_path=input_reference_stats_path,
+            lambda_real_delta=float(args.lambda_real_delta),
+            seed=int(args.seed),
+            logger=logger,
+        )
     result = train_model(
         benchmark=benchmark,
         patch_index=patch_index,
@@ -454,8 +574,30 @@ def run_train(args: argparse.Namespace) -> None:
         depth=int(args.depth),
         device_name=str(args.device),
         lambda_physics=float(args.lambda_physics),
+        lambda_real_delta=float(args.lambda_real_delta),
         seed=int(args.seed),
+        real_delta_support=real_delta_support,
+        log_interval_batches=int(args.log_interval_batches),
+        logger=logger,
     )
+    real_well_outputs: dict[str, Path] = {}
+    if real_delta_support is not None:
+        device, _device_metadata = resolve_device(str(args.device))
+        qc_models = {}
+        for checkpoint_name in ("best", "final"):
+            checkpoint_path = Path(result["checkpoints"][checkpoint_name]["path"])
+            model, _checkpoint = load_checkpoint(checkpoint_path)
+            model.to(device)
+            qc_models[checkpoint_name] = model
+        real_well_outputs = evaluate_real_wells(
+            support=real_delta_support,
+            models=qc_models,
+            output_dir=output_dir,
+            benchmark_dir=benchmark_dir,
+            repo_root=REPO_ROOT,
+            device=device,
+            logger=logger,
+        )
     _write_train_manifest(
         output_dir=output_dir,
         args=args,
@@ -467,6 +609,12 @@ def run_train(args: argparse.Namespace) -> None:
         train_result=result,
         patch_index_truncated=patch_index_truncated,
         max_patches=max_patches,
+        real_delta_manifest=(
+            real_delta_support.manifest_payload(repo_root=REPO_ROOT)
+            if real_delta_support is not None
+            else None
+        ),
+        real_well_outputs=real_well_outputs,
     )
     print("=== GINN-v2 model ablation train ===")
     print(f"Output: {output_dir}")
@@ -479,6 +627,10 @@ def run_predict(args: argparse.Namespace) -> None:
     model_run_dir = resolve_relative_path(args.model_run_dir, root=REPO_ROOT)
     with (model_run_dir / "model_run_manifest.json").open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
+    checkpoint_name, checkpoint_path, _checkpoint_sha256 = _resolve_checkpoint_from_manifest(
+        manifest,
+        selection=str(args.checkpoint),
+    )
     benchmark_dir = (
         resolve_relative_path(args.benchmark_dir, root=REPO_ROOT)
         if args.benchmark_dir is not None
@@ -543,7 +695,7 @@ def run_predict(args: argparse.Namespace) -> None:
     result = predict_patches(
         benchmark=benchmark,
         patch_index=patch_index,
-        checkpoint_path=resolve_relative_path(manifest["checkpoint"], root=REPO_ROOT),
+        checkpoint_path=checkpoint_path,
         output_dir=output_dir,
         split=args.split,
         batch_size=int(args.batch_size),
@@ -559,6 +711,9 @@ def run_predict(args: argparse.Namespace) -> None:
         "patch_index": patch_index_source,
         "sample_kinds": sorted(set(patch_index["sample_kind"].astype(str))),
         "model_id": result["model_id"],
+        "checkpoint_selection": str(args.checkpoint),
+        "resolved_checkpoint": checkpoint_name,
+        "checkpoint": repo_relative_path(checkpoint_path, root=REPO_ROOT),
         "model_info": result["model_info"],
         "normalization": result["normalization"],
         "input_channels": ["seismic", "lfm_controlled_degraded", "valid_mask_model"],
@@ -728,6 +883,8 @@ def run_stamp_gate(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
+    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v2":
+        raise ValueError("stamp-gate requires ginn_v2_model_run_v2.")
     _stamp_gate_evidence(
         manifest,
         report_dir=resolve_relative_path(args.synthetic_gate_report_dir, root=REPO_ROOT),

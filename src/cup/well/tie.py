@@ -37,7 +37,6 @@ from cup.well.td import crop_logset_md, load_workflow_time_depth_table_csv
 
 
 class TieRoute(str, Enum):
-    VERTICAL_DEPTH = "vertical_depth"
     VERTICAL_WITH_TDT = "vertical_with_tdt"
     VERTICAL_ANCHOR_FROM_TOPS = "vertical_anchor_from_tops"
     DEVIATED_WITH_TDT = "deviated_with_tdt"
@@ -78,10 +77,6 @@ class WellTieResult:
     optimized_corr: float | None = None
     optimized_nmae: float | None = None
     best_table_shift_ms: float | None = None
-    sample_domain: str = "time"
-    extraction_corr: float | None = None
-    extraction_nmae: float | None = None
-    pseudo_twt_shift_s: float | None = None
     wavelet_file: str = ""
     optimized_tdt_file: str = ""
     qc_figure_dir: str = ""
@@ -268,13 +263,9 @@ def build_tie_plan(
     time_depth_lookup: Mapping[str, Path],
     trace_lookup: Mapping[str, Path],
     enabled_routes: Sequence[str],
-    sample_domain: str,
     allow_near_outside: bool = False,
 ) -> list[WellTiePlan]:
     """为清单中的每口井构建一行标定路由计划。"""
-    domain = str(sample_domain).strip().casefold()
-    if domain not in {"time", "depth"}:
-        raise ValueError("sample_domain must be 'time' or 'depth'.")
     preprocess_by_key = _build_lookup(preprocess_df)
     trajectory_by_key = _build_lookup(trajectory_df if trajectory_df is not None else pd.DataFrame())
     enabled = {str(route) for route in enabled_routes}
@@ -319,36 +310,28 @@ def build_tie_plan(
             reasons.append("unusable_density")
         if not input_las:
             reasons.append("no_preprocessed_las")
-        plan_kb = _optional_float(inv.get("kb_m"))
-        if domain == "depth" and plan_kb is None:
-            reasons.append("no_kb")
 
         route = TieRoute.REJECTED.value
         route_status = "rejected"
         route_reasons = list(reasons)
 
         base_assets_ok = in_allowed_survey and usable_p and usable_rho and bool(input_las)
-        base_assets_ok = base_assets_ok and (domain != "depth" or plan_kb is not None)
-        if domain == "depth" and base_assets_ok and wellbore_qc == "vertical":
-            route = TieRoute.VERTICAL_DEPTH.value
-        elif domain == "depth" and base_assets_ok and wellbore_qc == "deviated":
-            route_reasons.append("depth_deviated_not_supported_v1")
-        elif domain == "time" and base_assets_ok and wellbore_qc == "vertical" and has_time_depth:
+        if base_assets_ok and wellbore_qc == "vertical" and has_time_depth:
             route = TieRoute.VERTICAL_WITH_TDT.value
-        elif domain == "time" and base_assets_ok and wellbore_qc == "vertical" and (not has_time_depth) and has_well_tops:
+        elif base_assets_ok and wellbore_qc == "vertical" and (not has_time_depth) and has_well_tops:
             route = TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value
-        elif domain == "time" and base_assets_ok and wellbore_qc == "deviated" and has_time_depth and has_well_trace:
+        elif base_assets_ok and wellbore_qc == "deviated" and has_time_depth and has_well_trace:
             route = TieRoute.DEVIATED_WITH_TDT.value
-        elif domain == "time" and base_assets_ok and wellbore_qc == "deviated" and (not has_time_depth) and has_well_trace and has_well_tops:
+        elif base_assets_ok and wellbore_qc == "deviated" and (not has_time_depth) and has_well_trace and has_well_tops:
             route = TieRoute.DEVIATED_ANCHOR_FROM_TOPS.value
         else:
             if wellbore_qc not in {"vertical", "deviated"}:
                 route_reasons.append(f"wellbore_class_{wellbore_qc or 'unknown'}")
-            if domain == "time" and not has_time_depth:
+            if not has_time_depth:
                 route_reasons.append("no_time_depth")
-            if domain == "time" and wellbore_qc == "deviated" and not has_well_trace:
+            if wellbore_qc == "deviated" and not has_well_trace:
                 route_reasons.append("no_well_trace")
-            if domain == "time" and not has_well_tops:
+            if not has_well_tops:
                 route_reasons.append("no_well_tops")
 
         if route != TieRoute.REJECTED.value:
@@ -376,7 +359,7 @@ def build_tie_plan(
                 well_trace_file=_path_for_lookup(trace_lookup, well_name),
                 surface_x=_optional_float(inv.get("surface_x")),
                 surface_y=_optional_float(inv.get("surface_y")),
-                kb_m=plan_kb,
+                kb_m=_optional_float(inv.get("kb_m")),
                 reasons=";".join(dict.fromkeys(route_reasons)),
             )
         )

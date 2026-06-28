@@ -1,64 +1,17 @@
 # 04 井震自动标定
 
-`well_auto_tie.py` 是工作流的第四步，并按 `seismic.domain` 分派时间域或深度域路径。当前深度域路径把前三步的产出（井资产、曲线筛选、预处理 LAS）与深度地震组合起来，提取逐井候选时间子波；时间域路径继续使用时深表、井轨迹和原有 auto-tie 流程。
+当前深度域工区不接入标准 Step 4/5。一次性处理固定使用：
 
-## 当前深度域路径
-
-深度域 v1 只支持直井，路由名为 `vertical_depth`。它不需要外部时深表或井轨迹：
-
-1. 使用 `TVDSS = MD - KB` 对齐预处理 Vp/Rho 与井旁深度地震。
-2. 在目标深度层位窗口内选择最长的连续、联合有效 Vp/Rho 段；不填补非有限地震振幅。
-3. 用实测 Vp 的梯形慢度积分构造临时相对 TWT 映射。
-4. 把深度地震投影到规则相对 TWT，复用 `wtie.tie_v1` 提取候选时间子波。
-5. 禁用 stretch/squeeze；`table_t_shift` 仅记录为 `pseudo_twt_shift_s`。
-
-临时相对 TWT 映射不是地质 TDT，产物明确记录 `geological_tdt=false`。深度域 Step 4 不输出 optimized TDT 或 Petrel checkshot，也不执行 `W_depth` 深度闭环；`tie_status=success` 只表示候选子波提取成功。首次深度域正演准入在 Step 5 完成。
-
-当前深度配置示例：
-
-```yaml
-seismic:
-  file: raw/mero_84_coord_extend
-  type: segy
-  domain: depth
-  depth_basis: tvdss
-
-well_auto_tie:
-  target_interval:
-    top_horizon: interpre/base_of_salt_extend
-    bottom_horizon: interpre/base_of_itp_extend
-    margin_top_m: 100.0
-    margin_bottom_m: 100.0
-  depth_extraction:
-    log_gap_policy: interpolate_internal
-  enabled_routes:
-    - vertical_depth
+```powershell
+python scripts/vertical_well_auto_tie_depth.py --config experiments/common_depth.yaml --well NW11 --output-dir scripts/output/vertical_well_auto_tie_depth_NW11
+python scripts/wavelet_batch_synthetic_depth.py --config experiments/common_depth.yaml --output-dir scripts/output/wavelet_batch_synthetic_depth_NW11
 ```
 
-`depth_extraction.log_gap_policy` 控制深度域 Vp/Rho 缺口：
+第一份脚本仅从 NW11 提取固定时间子波；第二份脚本使用该子波批量生成合成记录及深度平移结果。二者是当前工区的遗留一次性路径，不属于标准工作流 API，也不作为后续统一正演重构的依赖。
 
-- `strict_contiguous`：只使用最长的联合连续有效段；
-- `interpolate_internal`：保留 Vp/Rho 共同实测支撑范围并线性填补内部缺口，不向任一曲线的首尾支撑之外外推。当前工区使用此策略。
+以下内容仅适用于时间域标准工作流。
 
-深度域的主井震匹配图和子波图与时间域调用同一套绘图函数；额外的 TVDSS/相对 TWT 图只用于说明临时投影关系。
-
-建议先跑单井：
-
-```bash
-python scripts/well_auto_tie.py --config experiments/common/common.yaml --well NW11
-```
-
-深度域新增/替代产物：
-
-| 文件 | 内容 |
-|---|---|
-| `pseudo_time/relative_tdt_non_geological_<well>.csv` | 实测 Vp 构造的临时相对 TWT 映射，固定标记 `geological_tdt=false` |
-| `pseudo_time/seismic_trace_relative_twt_<well>.csv` | 仅供子波提取的规则相对 TWT 地震道 |
-| `seismic_trace/seismic_trace_tvdss_<well>.csv` | 实际使用的 TVDSS 深度地震道 |
-| `synthetic_qc/tie_qc_<well>.csv` | 伪时间提取 QC，不是深度闭环指标 |
-| `wavelets/wavelet_201ms_<well>.csv` | 裁剪并显式 L2 归一化的候选时间子波 |
-
-下文关于 TDT、锚点和斜井的说明仅适用于 `seismic.domain: time` 路径。
+`well_auto_tie.py` 是时间域工作流的第四步。它把前三步的产出（井资产、曲线筛选、预处理 LAS）与时深表、井轨迹、地震体组合起来，对每口井做井震标定，输出优化后的时深关系、候选子波和合成记录 QC。
 
 ---
 

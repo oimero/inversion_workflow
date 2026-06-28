@@ -1,4 +1,4 @@
-"""Shared project configuration for the time-domain workflow."""
+"""Shared project configuration for the seismic workflow."""
 
 from __future__ import annotations
 
@@ -89,7 +89,8 @@ class AssetsConfig:
 class SeismicConfig:
     file: str
     type: str
-    zgy_inline_chunk_size: int
+    domain: str
+    zgy_inline_chunk_size: int | None = None
     iline: int | None = None
     xline: int | None = None
     istep: int | None = None
@@ -103,12 +104,16 @@ class SeismicConfig:
         seismic_type = _required_text(config, "type", path="seismic").casefold()
         if seismic_type not in {"zgy", "segy"}:
             raise ValueError("seismic.type must be 'zgy' or 'segy'.")
+        domain = _required_text(config, "domain", path="seismic").casefold()
+        if domain not in {"time", "depth"}:
+            raise ValueError("seismic.domain must be 'time' or 'depth'.")
         chunk_size = _optional_int(config, "zgy_inline_chunk_size", path="seismic")
-        if chunk_size is None or chunk_size <= 0:
-            raise ValueError("seismic.zgy_inline_chunk_size must be a positive integer.")
+        if chunk_size is not None and chunk_size <= 0:
+            raise ValueError("seismic.zgy_inline_chunk_size must be a positive integer or null.")
         return cls(
             file=_required_text(config, "file", path="seismic"),
             type=seismic_type,
+            domain=domain,
             zgy_inline_chunk_size=chunk_size,
             iline=_optional_int(config, "iline", path="seismic"),
             xline=_optional_int(config, "xline", path="seismic"),
@@ -122,6 +127,7 @@ class SeismicConfig:
         values = {
             "file": self.file,
             "type": self.type,
+            "domain": self.domain,
             "zgy_inline_chunk_size": self.zgy_inline_chunk_size,
             "iline": self.iline,
             "xline": self.xline,

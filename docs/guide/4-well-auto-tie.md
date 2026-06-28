@@ -45,6 +45,7 @@ assets:
 seismic:
   file: <seismic-volume-file>
   type: zgy
+  domain: time
   zgy_inline_chunk_size: 16
 
 well_auto_tie:

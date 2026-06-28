@@ -144,19 +144,35 @@ def _disabled_curves(well_override: Mapping[str, Any]) -> tuple[set[str], set[st
     return _split_exact_and_base_mnemonics(disabled)
 
 
-def _force_category(well_override: Mapping[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
-    forced = well_override.get("force_category", {})
-    if not isinstance(forced, Mapping):
-        return {}, {}
+def _split_forced_categories(value: Any, *, field_name: str) -> tuple[dict[str, str], dict[str, str]]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping.")
     exact: dict[str, str] = {}
     base: dict[str, str] = {}
-    for curve, category in forced.items():
+    for curve, category in value.items():
         curve_exact = exact_mnemonic(curve)
         if re.search(r":\d+$", curve_exact):
             exact[curve_exact] = str(category)
         else:
             base[normalize_mnemonic(curve_exact)] = str(category)
     return exact, base
+
+
+def _force_category(
+    overrides: Mapping[str, Any] | None,
+    well_override: Mapping[str, Any],
+) -> tuple[dict[str, str], dict[str, str]]:
+    global_exact, global_base = _split_forced_categories(
+        overrides.get("global_force_category", {}) if overrides else {},
+        field_name="global_force_category",
+    )
+    well_exact, well_base = _split_forced_categories(
+        well_override.get("force_category", {}),
+        field_name="wells.<well>.force_category",
+    )
+    global_exact.update(well_exact)
+    global_base.update(well_base)
+    return global_exact, global_base
 
 
 def _primary_override(well_override: Mapping[str, Any]) -> dict[str, str]:
@@ -191,12 +207,15 @@ def classify_curves_by_rules(
     list[CurveClassification]
         逐条曲线的分类结果。
     """
-    schema = schema or CURVE_CATEGORY_MNEMONICS
+    schema = CURVE_CATEGORY_MNEMONICS if schema is None else schema
     schema_categories = set(schema)
     lookup = _schema_lookup(schema)
     well_override = _well_override(overrides, well_name)
     disabled_exact, disabled_base = _disabled_curves(well_override)
-    forced_exact, forced_base = _force_category(well_override)
+    forced_exact, forced_base = _force_category(overrides, well_override)
+    unknown_forced_categories = sorted((set(forced_exact.values()) | set(forced_base.values())) - schema_categories)
+    if unknown_forced_categories:
+        raise ValueError(f"Override categories are not in schema: {unknown_forced_categories}")
 
     classifications: list[CurveClassification] = []
     for curve in curves:
@@ -286,7 +305,7 @@ def _priority_for_category(
     priority: list[str] = []
     if overrides and isinstance(overrides.get("global_priority"), Mapping):
         priority.extend(normalize_mnemonic(item) for item in overrides["global_priority"].get(category, []))
-    priority_source = category_priority or CURVE_CATEGORY_PRIORITY
+    priority_source = CURVE_CATEGORY_PRIORITY if category_priority is None else category_priority
     priority.extend(normalize_mnemonic(item) for item in priority_source.get(category, []))
 
     deduped: list[str] = []

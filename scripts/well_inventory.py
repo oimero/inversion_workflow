@@ -1,4 +1,4 @@
-"""Inventory well assets for the time-domain workflow.
+"""Inventory well assets for the seismic workflow.
 
 The script is deliberately non-destructive. It scans asset presence, classifies
 coarse spatial status, reports platform clusters and non-platform same-trace
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         "--config",
         type=Path,
         default=Path("experiments/common/common.yaml"),
-        help="Time-domain common config YAML.",
+        help="Common workflow config YAML.",
     )
     parser.add_argument(
         "--output-dir",
@@ -151,10 +151,11 @@ def _record_reasons_for_assets(
     has_well_trace: bool,
     has_time_depth: bool,
     has_well_tops: bool,
+    seismic_domain: str,
 ) -> None:
-    if not has_well_trace:
+    if not has_well_trace and record.wellbore_class != "vertical":
         record.reasons.append("no_well_trace")
-    if not has_time_depth:
+    if not has_time_depth and seismic_domain == "time":
         record.reasons.append("no_time_depth")
     if not has_well_tops:
         record.reasons.append("no_well_tops")
@@ -207,6 +208,7 @@ def build_inventory(
     tops_lookup: dict[str, str],
     survey: Any,
     config: dict[str, Any],
+    seismic_domain: str,
 ) -> WellInventory:
     heads = _head_lookup(well_heads_df)
     master_keys = set(heads) | set(las_lookup)
@@ -262,6 +264,7 @@ def build_inventory(
             has_well_trace=has_trace,
             has_time_depth=has_time_depth,
             has_well_tops=has_tops,
+            seismic_domain=seismic_domain,
         )
         records.append(record)
 
@@ -353,7 +356,7 @@ def main() -> None:
         seismic_type=seismic_type,
         segy_options=segy_options_from_config(seismic_cfg) if seismic_type == "segy" else None,
     )
-    geometry = survey.describe_geometry(domain="time")
+    geometry = survey.describe_geometry(domain=workflow.seismic.domain)
     bin_spacing = survey.line_geometry.bin_spacing_m()
     footprint = survey.line_geometry.footprint_xy()
 
@@ -365,6 +368,7 @@ def main() -> None:
         tops_lookup=tops_lookup,
         survey=survey,
         config=script_cfg,
+        seismic_domain=workflow.seismic.domain,
     )
 
     run_summary = {
@@ -379,6 +383,7 @@ def main() -> None:
             "time_depth_dir": repo_relative_path(time_depth_dir, root=REPO_ROOT),
             "seismic_file": repo_relative_path(seismic_file, root=REPO_ROOT),
             "seismic_type": seismic_type,
+            "seismic_domain": workflow.seismic.domain,
         },
         "thresholds": {
             "near_survey_threshold_m": float(script_cfg["spatial_qc"]["near_survey_threshold_m"]),

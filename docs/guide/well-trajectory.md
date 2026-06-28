@@ -35,6 +35,7 @@ assets:
 seismic:
   file: raw/your-seismic.zgy
   type: zgy
+  domain: time
   zgy_inline_chunk_size: 16
 
 well_trajectory:

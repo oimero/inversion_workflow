@@ -45,6 +45,7 @@ target_interval:
 seismic:
   file: <seismic-volume>
   type: zgy
+  domain: time
 
 # --- 可选（有默认值）---
 real_field_lfm:

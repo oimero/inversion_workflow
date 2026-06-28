@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         "--config",
         type=Path,
         default=Path("experiments/common/common.yaml"),
-        help="Time-domain common config YAML.",
+        help="Common workflow config YAML.",
     )
     parser.add_argument(
         "--output-dir",
@@ -122,8 +122,8 @@ def _load_curve_schema(schema_file: str | Path | None) -> Mapping[str, Sequence[
     if schema_file is None:
         return CURVE_CATEGORY_MNEMONICS
     path = _resolve_repo_path(schema_file)
-    if not path.exists():
-        return CURVE_CATEGORY_MNEMONICS
+    if not path.is_file():
+        raise FileNotFoundError(f"Curve schema file does not exist: {path}")
     data = load_yaml_config(path)
     categories = data.get("categories", data)
     schema: dict[str, Sequence[str]] = {}
@@ -144,8 +144,8 @@ def _load_overrides(override_file: str | Path | None) -> dict[str, Any]:
     if override_file is None:
         return {}
     path = _resolve_repo_path(override_file)
-    if not path.exists():
-        return {}
+    if not path.is_file():
+        raise FileNotFoundError(f"Curve override file does not exist: {path}")
     return load_yaml_config(path)
 
 
@@ -276,118 +276,82 @@ def run_screening(
         well_key = normalize_well_name(well_name)
         las_file = las_lookup.get(well_key)
         if las_file is None:
-            well_rows.append(
-                {
-                    "well_name": well_name,
-                    "las_file": "",
-                    "screen_status": "failed",
-                    "has_p_sonic": False,
-                    "has_density": False,
-                    "has_caliper": False,
-                    "primary_p_sonic": "",
-                    "primary_density": "",
-                    "primary_caliper": "",
-                    "selected_curve_count": 0,
-                    "exported_las": "",
-                    "reasons": "las_file_missing",
-                }
-            )
-            skipped_well_rows.append({"well_name": well_name, "reason": "las_file_missing"})
-            continue
-
-        try:
-            header, curves = scan_las_curves(las_file)
-            classifications = classify_curves_by_rules(
-                curves,
-                schema=schema,
-                well_name=well_name,
-                overrides=overrides,
-            )
-            selection = select_primary_curves(
-                classifications,
-                well_name=well_name,
-                las_file=repo_relative_path(las_file, root=REPO_ROOT),
-                selected_categories=config["curve_selection"]["selected_categories"],
-                required_categories=config["curve_selection"]["required_categories"],
-                overrides=overrides,
-                category_priority=CURVE_CATEGORY_PRIORITY,
+            raise FileNotFoundError(
+                f"Inventory marks well {well_name!r} as having LAS, but no matching file exists in {las_dir}."
             )
 
-            if selection.screen_status == "passed":
-                output_las = selected_las_dir / f"{sanitize_filename(well_name)}.las"
-                _, skipped, exported_mnemonics = export_selected_curves_to_las(
-                    las_file,
-                    output_las,
-                    selection.selected_mnemonics,
-                )
-                for item in skipped:
-                    skipped_curve_rows.append(
-                        {
-                            "well_name": well_name,
-                            "mnemonic": item.get("curve", ""),
-                            "category": "",
-                            "reason": item.get("reason", "export_failed"),
-                        }
-                    )
-                required_exported, missing_exported_categories = _exported_contains_required(
-                    selection=selection,
-                    exported_mnemonics=exported_mnemonics,
-                    required_categories=config["curve_selection"]["required_categories"],
-                )
-                if required_exported:
-                    selection.exported_las = repo_relative_path(output_las, root=REPO_ROOT)
-                else:
-                    selection.screen_status = "failed"
-                    selection.exported_las = None
-                    for category in missing_exported_categories:
-                        reason = f"export_missing_required_{category}"
-                        if reason not in selection.reasons:
-                            selection.reasons.append(reason)
-                    skipped_well_rows.append({"well_name": well_name, "reason": ";".join(selection.reasons)})
-            else:
-                skipped_well_rows.append({"well_name": well_name, "reason": ";".join(selection.reasons)})
+        header, curves = scan_las_curves(las_file)
+        classifications = classify_curves_by_rules(
+            curves,
+            schema=schema,
+            well_name=well_name,
+            overrides=overrides,
+        )
+        selection = select_primary_curves(
+            classifications,
+            well_name=well_name,
+            las_file=repo_relative_path(las_file, root=REPO_ROOT),
+            selected_categories=config["curve_selection"]["selected_categories"],
+            required_categories=config["curve_selection"]["required_categories"],
+            overrides=overrides,
+            category_priority=CURVE_CATEGORY_PRIORITY,
+        )
 
-            for item in selection.classifications:
-                curve_inventory_rows.append(item.to_inventory_row(well_name=well_name))
-                classification_source_counts[item.classification_source] = (
-                    classification_source_counts.get(item.classification_source, 0) + 1
+        if selection.screen_status == "passed":
+            output_las = selected_las_dir / f"{sanitize_filename(well_name)}.las"
+            _, skipped, exported_mnemonics = export_selected_curves_to_las(
+                las_file,
+                output_las,
+                selection.selected_mnemonics,
+            )
+            for item in skipped:
+                skipped_curve_rows.append(
+                    {
+                        "well_name": well_name,
+                        "mnemonic": item.get("curve", ""),
+                        "category": "",
+                        "reason": item.get("reason", "export_failed"),
+                    }
                 )
-                if item.category == "ambiguous" or item.disabled:
-                    skipped_curve_rows.append(
-                        {
-                            "well_name": well_name,
-                            "mnemonic": item.mnemonic,
-                            "category": item.category,
-                            "reason": item.notes or item.category,
-                        }
-                    )
-
-            _write_classification_json(
-                classification_dir / f"{sanitize_filename(well_name)}.json",
-                header=header,
+            required_exported, missing_exported_categories = _exported_contains_required(
                 selection=selection,
+                exported_mnemonics=exported_mnemonics,
+                required_categories=config["curve_selection"]["required_categories"],
             )
-            well_rows.append(_well_screen_row(selection))
+            if required_exported:
+                selection.exported_las = repo_relative_path(output_las, root=REPO_ROOT)
+            else:
+                selection.screen_status = "failed"
+                selection.exported_las = None
+                for category in missing_exported_categories:
+                    reason = f"export_missing_required_{category}"
+                    if reason not in selection.reasons:
+                        selection.reasons.append(reason)
+                skipped_well_rows.append({"well_name": well_name, "reason": ";".join(selection.reasons)})
+        else:
+            skipped_well_rows.append({"well_name": well_name, "reason": ";".join(selection.reasons)})
 
-        except Exception as exc:
-            reason = str(exc)
-            well_rows.append(
-                {
-                    "well_name": well_name,
-                    "las_file": repo_relative_path(las_file, root=REPO_ROOT),
-                    "screen_status": "failed",
-                    "has_p_sonic": False,
-                    "has_density": False,
-                    "has_caliper": False,
-                    "primary_p_sonic": "",
-                    "primary_density": "",
-                    "primary_caliper": "",
-                    "selected_curve_count": 0,
-                    "exported_las": "",
-                    "reasons": reason,
-                }
+        for item in selection.classifications:
+            curve_inventory_rows.append(item.to_inventory_row(well_name=well_name))
+            classification_source_counts[item.classification_source] = (
+                classification_source_counts.get(item.classification_source, 0) + 1
             )
-            skipped_well_rows.append({"well_name": well_name, "reason": reason})
+            if item.category == "ambiguous" or item.disabled:
+                skipped_curve_rows.append(
+                    {
+                        "well_name": well_name,
+                        "mnemonic": item.mnemonic,
+                        "category": item.category,
+                        "reason": item.notes or item.category,
+                    }
+                )
+
+        _write_classification_json(
+            classification_dir / f"{sanitize_filename(well_name)}.json",
+            header=header,
+            selection=selection,
+        )
+        well_rows.append(_well_screen_row(selection))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = {

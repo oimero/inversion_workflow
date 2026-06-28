@@ -98,6 +98,10 @@ global_priority:                  # 覆盖全局 primary 选择优先级
   p_sonic: [DT, DTC, AC, VP]
   density: [RHOB, DEN, RHOZ]
 
+global_force_category:            # 工区级特殊 mnemonic → 标准类别
+  DTCO_QYZ_CLAER: p_sonic
+  RHOZ_QYZ_CLAER: density
+
 wells:
   <well-name>:                    # 单井配置（井名大小写不敏感）
     primary:                      # 单井单类别指定 primary
@@ -108,6 +112,7 @@ wells:
 ```
 
 - `global_priority`：调整每类曲线的优先顺序，例如优先选原始测井曲线，少选派生产品。
+- `global_force_category`：为当前工区统一命名的特殊 mnemonic 补充分类，不污染全局内置词典。
 - `primary`：指定某口井某一类必须使用哪条曲线。
 - `disabled_curves`：跳过明确知道有问题的曲线。
 - `force_category`：把特殊命名但含义明确的曲线强制归入指定类别。
@@ -223,7 +228,9 @@ LAS curve screen summary: 61 candidates, 38 passed, 22 partial, 1 failed, 38 LAS
 
 - `passed` — 具备 p_sonic + density，已导出瘦身 LAS，进入第三步
 - `partial` — 有一些有用曲线但不满足 required，不导出 LAS，不进入第三步
-- `failed` — 完全缺少关键曲线，或 LAS 读取/导出失败
+- `failed` — 完全缺少关键曲线，或导出后的必需曲线契约校验失败
+
+LAS 文件缺失、解析异常或导出异常属于运行错误，脚本会直接抛出，不会降级成某口井的 `failed` 结果。
 
 关注 `reasons` 列：`missing_p_sonic`、`missing_density`、`export_missing_required_p_sonic` 等标签能快速定位失败原因。
 

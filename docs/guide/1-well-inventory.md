@@ -24,8 +24,8 @@ python scripts/well_inventory.py --output-dir /tmp/inventory_test
 | LAS 目录 | 判断每口井是否有可进入第二步的曲线文件 |
 | 井轨迹目录 | 判断是否存在轨迹文件；本步只查存在性 |
 | 井分层文件 | 判断是否有后续标定/建模可用的井分层 |
-| 时深表目录 | 判断每口井是否有 Petrel TDT |
-| 时间域地震体 | 解析工区几何，判断井口是否在工区内 |
+| 时深表目录 | 判断每口井是否有 Petrel TDT；深度域工区允许不存在 |
+| 地震体 | 解析工区几何，判断井口是否在工区内 |
 
 **数据资产的预期格式：**
 
@@ -55,8 +55,8 @@ assets:
 
 seismic:
   file: <path-to-seismic>
-  type: zgy
-  zgy_inline_chunk_size: 16
+  type: segy
+  domain: depth
 
 well_inventory:
   spatial_qc:
@@ -65,6 +65,9 @@ well_inventory:
     platform_cluster_threshold_m: 12.5
     dense_well_neighbor_threshold_m: 150.0
 ```
+
+`seismic.domain` 必须显式写成 `time` 或 `depth`，脚本不会根据文件名或采样值猜测。
+`zgy_inline_chunk_size` 不是 SEG-Y 读取参数；第一步不使用它，SEG-Y 工区应删除。
 
 ### `spatial_qc`
 
@@ -163,7 +166,7 @@ well_inventory:
 
 | JSON 路径 | 含义 |
 |-----------|------|
-| `geometry.sample_domain` / `geometry.sample_unit` | 采样轴类型和单位；时间域应为 `time` / `s` |
+| `geometry.sample_domain` / `geometry.sample_unit` | 采样轴类型和单位；时间域为 `time` / `s`，深度域为 `depth` / `m` |
 | `geometry.sample_min` / `geometry.sample_max` / `geometry.sample_step` | 采样轴起止值和采样间隔；查时间采样间隔就看 `geometry.sample_step` |
 | `geometry.n_sample` | 时间或深度采样点数 |
 | `geometry.inline_min` / `geometry.inline_max` / `geometry.inline_step` | inline 线号范围和线号步长 |
@@ -200,7 +203,7 @@ wellbore_class_counts: {deviated: 85, vertical: 18}
 
 这几行直接回答：有多少井？缺哪些资产？多少在工区内？多少看起来是斜井？
 
-如果要查地震几何，也从同一个 `run_summary.json` 开始。最常用的是 `geometry.sample_step`，它就是地震时间采样间隔，单位由 `geometry.sample_unit` 给出；时间域工作流里应为秒。线号范围看 `geometry.inline_*` 和 `geometry.xline_*`，近似物理道间距看 `bin_spacing_m.nominal`。
+如果要查地震几何，也从同一个 `run_summary.json` 开始。最常用的是 `geometry.sample_step`，其单位由 `geometry.sample_unit` 给出；时间域应为秒，深度域应为米。线号范围看 `geometry.inline_*` 和 `geometry.xline_*`，近似物理道间距看 `bin_spacing_m.nominal`。
 
 ### 第二步：如果有 `las_only` 井 → 补井头
 
@@ -221,7 +224,7 @@ wellbore_class_counts: {deviated: 85, vertical: 18}
 - 按 `survey_position` 筛选 `inside`，按 `inventory_status` 筛选 `usable_for_las_screen`——这是进入第二步的候选井。
 - 关注 `wellbore_class == deviated` 且 `has_well_trace == false` 的井——斜井但没有轨迹文件，第四步无法走斜井路径。
 - 关注 `wellbore_class == unknown` 的井——井头坐标缺失或无效。
-- `reasons` 列汇总了每口井的所有警告标签（`no_time_depth`、`outside_survey`、`invalid_surface_xy` 等），方便快速筛出有问题的井。
+- `reasons` 列汇总了每口井的所有警告标签。`no_time_depth` 只在时间域记录；`no_well_trace` 只对斜井或井型未知的井记录。
 
 ---
 

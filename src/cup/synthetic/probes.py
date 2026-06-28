@@ -1,4 +1,4 @@
-"""Frequency-amplitude probes derived from the forward-observability gate."""
+"""Frequency-amplitude probes derived from the forward-observability side route."""
 
 from __future__ import annotations
 

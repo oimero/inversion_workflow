@@ -12,5 +12,5 @@
 - wavelet_consensus: 对齐候选子波的 PCA 共识搜索。
 - trace_sampling: 直井与斜井的轨迹落道计划和地震道组装。
 - viz: 前五步井震与子波 QC 绘图。
-- observability: 第五步后的前向可观测性研究闸门数值核心。
+- observability: 第五步后的时间域前向可观测性旁路数值核心。
 """

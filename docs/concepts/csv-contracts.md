@@ -193,7 +193,7 @@
 | `spatial_cluster_id` | 跨井证据去偏使用的空间簇 |
 | `spatial_cluster_size` | 当前簇井数，仅作 QC |
 
-## 06 · forward_observability.py
+## 旁路 · forward_observability.py
 
 所有表使用 schema `forward_observability_v1`。上游来源可从配置显式指定，也可自动发现最新合格产物。
 

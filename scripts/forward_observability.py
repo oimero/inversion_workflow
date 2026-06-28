@@ -1,8 +1,9 @@
-"""Run the time-domain forward-observability research gate.
+"""Run the time-domain forward-observability side-route analysis.
 
 Third-, fourth-, and fifth-step run directories are discovered from
 ``output_root`` by default.  Set ``forward_observability.source_runs`` in the
-common config to pin a reproducible run.
+common config to pin a reproducible run.  This analysis does not occupy a
+numbered workflow step and does not gate the production chain.
 
 Usage::
 

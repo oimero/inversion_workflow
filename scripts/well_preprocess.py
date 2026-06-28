@@ -44,6 +44,8 @@ from cup.well.las import _header_value, export_logset_to_las
 from cup.well.preprocess import (
     DEFAULT_MISSING_SENTINELS,
     CurveThreshold,
+    IrregularMdCurve,
+    IrregularMdCurveSet,
     WellCurveSet,
     compute_global_quantile_thresholds,
     finite_stats,
@@ -295,26 +297,34 @@ def _load_raw_curves_for_well(
     return raw
 
 
-def _build_preprocessed_curve_set(well_name: str, curves: Sequence[CandidateCurve]) -> WellCurveSet:
+def _build_preprocessed_curve_set(
+    well_name: str,
+    curves: Sequence[CandidateCurve],
+) -> IrregularMdCurveSet:
     if not curves:
         raise ValueError(f"No final curves are available for well {well_name!r}.")
-    logs: dict[str, grid.Log] = {}
+    source_md = np.asarray(curves[0].raw.md, dtype=float)
+    irregular_curves: dict[str, IrregularMdCurve] = {}
     for curve in curves:
         if curve.final_values is None:
             raise ValueError(
                 f"Final curve {curve.standard_mnemonic!r} has no values for well {well_name!r}."
             )
-        logs[curve.standard_mnemonic] = grid.Log(
-            np.asarray(curve.final_values, dtype=float),
-            np.asarray(curve.raw.md, dtype=float),
-            "md",
+        curve_md = np.asarray(curve.raw.md, dtype=float)
+        if curve_md.shape != source_md.shape or not np.array_equal(curve_md, source_md):
+            raise ValueError(
+                f"Final curve {curve.standard_mnemonic!r} does not share the native MD axis "
+                f"for well {well_name!r}."
+            )
+        irregular_curves[curve.standard_mnemonic] = IrregularMdCurve(
+            values=np.asarray(curve.final_values, dtype=float),
             name=curve.standard_mnemonic,
             unit=curve.standard_unit,
-            allow_nan=True,
         )
-    curve_set = WellCurveSet(
+    curve_set = IrregularMdCurveSet(
         well_name=well_name,
-        logs=logs,
+        md_m=source_md,
+        curves=irregular_curves,
         source_las=str(curves[0].raw.source_las),
     )
     return curve_set

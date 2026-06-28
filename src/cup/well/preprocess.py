@@ -102,8 +102,65 @@ class CurveThreshold:
 
 
 @dataclass(frozen=True)
+class IrregularMdCurve:
+    """One curve sampled on an enclosing irregular MD axis."""
+
+    values: np.ndarray
+    name: str
+    unit: str
+
+    def __post_init__(self) -> None:
+        values = np.asarray(self.values)
+        if values.ndim != 1:
+            raise ValueError(f"Irregular MD curve {self.name!r} values must be one-dimensional.")
+        if not np.issubdtype(values.dtype, np.number):
+            raise TypeError(f"Irregular MD curve {self.name!r} values must be numeric.")
+
+
+@dataclass(frozen=True)
+class IrregularMdCurveSet:
+    """Curves sharing a possibly irregular native LAS MD axis.
+
+    This is the explicit pre-grid boundary type.  ``grid.Log`` is deliberately
+    not used until :func:`regularize_md_curve_set` has constructed a regular MD
+    axis.
+    """
+
+    well_name: str
+    md_m: np.ndarray
+    curves: Mapping[str, IrregularMdCurve]
+    source_las: str = ""
+
+    def __post_init__(self) -> None:
+        md = np.asarray(self.md_m)
+        if md.ndim != 1 or md.size < 2:
+            raise ValueError("Irregular MD basis must be one-dimensional with at least two samples.")
+        if not self.curves:
+            raise ValueError("IrregularMdCurveSet requires at least one curve.")
+        for name, curve in self.curves.items():
+            if not isinstance(curve, IrregularMdCurve):
+                raise TypeError(f"Curve {name!r} must be an IrregularMdCurve.")
+            if np.asarray(curve.values).shape != md.shape:
+                raise ValueError(
+                    f"Curve {name!r} length does not match the irregular MD basis."
+                )
+
+    @property
+    def basis(self) -> np.ndarray:
+        return np.asarray(self.md_m, dtype=float)
+
+    def require(self, name: str) -> IrregularMdCurve:
+        try:
+            return self.curves[name]
+        except KeyError as exc:
+            raise KeyError(
+                f"Curve {name!r} is not available in well {self.well_name!r}."
+            ) from exc
+
+
+@dataclass(frozen=True)
 class WellCurveSet:
-    """单井同一 MD 轴上的任意曲线集合。
+    """单井同一条规则 MD 轴上的任意曲线集合。
 
     与 ``wtie.processing.grid.LogSet`` 不同，本对象不要求必须包含 Vp/Rho。
     它用于预处理阶段承载 GR、井径、孔隙度、含水饱和度等辅助 LAS 曲线，
@@ -209,7 +266,7 @@ def _interpolate_without_crossing_long_gaps(
 
 
 def regularize_md_curve_set(
-    curve_set: WellCurveSet,
+    curve_set: IrregularMdCurveSet,
     *,
     step_m: float,
     max_interpolation_gap_m: float,
@@ -246,10 +303,10 @@ def regularize_md_curve_set(
 
     logs: dict[str, grid.Log] = {}
     curve_reports: dict[str, dict[str, Any]] = {}
-    for name, log in curve_set.logs.items():
+    for name, curve in curve_set.curves.items():
         output_values, curve_report = _interpolate_without_crossing_long_gaps(
             source_md,
-            np.asarray(log.values, dtype=np.float64),
+            np.asarray(curve.values, dtype=np.float64),
             target_md,
             max_gap_m=max_gap,
         )
@@ -257,8 +314,8 @@ def regularize_md_curve_set(
             output_values,
             target_md,
             "md",
-            name=log.name,
-            unit=log.unit,
+            name=curve.name,
+            unit=curve.unit,
             allow_nan=True,
         )
         curve_reports[name] = {"standard_mnemonic": name, **curve_report}

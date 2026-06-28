@@ -51,7 +51,8 @@
 | 井震与子波 QC | `cup.seismic.viz` | `plot_well_waveform_qc` |
 | 子波处理 | `cup.seismic.wavelet` | 加载、裁剪、归一化和频谱属性函数 |
 | 共识子波搜索 | `cup.seismic.wavelet_consensus` | `build_wavelet_pca_basis` / `optimize_consensus_wavelet` |
-| 前向可观测性 | `cup.seismic.observability` | 离散算子、扰动灵敏度、场景与空间簇证据聚合 |
+| 统一声学正演 | `cup.forward` | NumPy/PyTorch 时间域与深度域严格正演内核 |
+| 前向可观测性旁路 | `cup.seismic.observability` | 时间域离散算子、扰动灵敏度、场景与空间簇证据聚合 |
 | 合成基准校准 | `cup.synthetic.calibration` | 背景拟合、三态识别、对象轮廓拟合、层级化收缩 |
 | 合成基准生成 | `cup.synthetic.generation` | 随机地质真值、几何事件、探针矩阵、地震变体 |
 | 合成基准评估 | `cup.synthetic.metrics` / `cup.synthetic.dataset` | 回归指标、基准消费接口 |

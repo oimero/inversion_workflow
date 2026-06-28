@@ -7,12 +7,14 @@ flowchart TB
         WT["旁路 · well_trajectory"] -.-> S4
     end
 
-    prod --> S6["06 · forward_observability"]
+    prod --> FO["旁路 · forward_observability"]
+    S5 --> S6["06 · rock_physics_analysis"]
 
     S1 -.-> S7["07 · real_field_lfm"]
     S4 -.-> S7
 
     S6 --> SL["旁路 · synthoseis_lite"]
+    FO -.-> SL
     SL --> GV["旁路 · ginn_v2"]
 
     S5 -.-> R0["08 R0 · real_field_zero_shot"]
@@ -26,7 +28,9 @@ flowchart TB
 
 | 步骤 | 配置文件 |
 |------|---------|
-| 01–03 + well_trajectory + 04-06 | `experiments/common/common.yaml` |
+| 01–05 + well_trajectory | `experiments/common/common.yaml` |
+| 旁路 · forward_observability | `experiments/common/common.yaml` |
+| 06 · rock_physics_analysis | 规划中，契约见 `docs/spec/DEPTH_DOMAIN_FORWARD_REFACTOR.md` |
 | 旁路 · synthoseis_lite | `experiments/synthoseis_lite/synthoseis_lite.yaml` |
 | 旁路 · ginn_v2 | `experiments/ginn_v2/train.yaml` |
 | 07 · real_field_lfm | `experiments/common/common.yaml` |

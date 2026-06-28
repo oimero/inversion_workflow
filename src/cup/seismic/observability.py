@@ -1,7 +1,7 @@
-"""Forward-observability analysis for time-domain acoustic impedance.
+"""Forward-observability side-route analysis for time-domain acoustic impedance.
 
-The module contains the numerical core for the research gate described in
-``docs/spec/forward-observability-gate.md``.  It deliberately has no run
+The module contains the numerical core described in
+``docs/guide/forward-observability.md``.  It deliberately has no run
 directory discovery or project-data I/O.
 """
 
@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 from scipy.signal import hilbert
 from scipy.signal.windows import tukey
+
+from cup.forward.numpy_backend import forward_time
 
 
 FFT_CONVENTION = "numpy_forward_exp_minus_i_2pi_kn_over_n"
@@ -405,6 +407,7 @@ def finite_difference_response(
     *,
     basis_full: np.ndarray,
     output_indices: np.ndarray,
+    wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
     epsilon: float,
 ) -> np.ndarray:
@@ -419,8 +422,16 @@ def finite_difference_response(
     columns = []
     for column in range(2):
         perturbation = basis[:, column]
-        upper = forward_log_ai(baseline + float(epsilon) * perturbation, wavelet)
-        lower = forward_log_ai(baseline - float(epsilon) * perturbation, wavelet)
+        upper = forward_time(
+            baseline + float(epsilon) * perturbation,
+            wavelet_time_s,
+            wavelet,
+        )
+        lower = forward_time(
+            baseline - float(epsilon) * perturbation,
+            wavelet_time_s,
+            wavelet,
+        )
         derivative = (upper - lower) / (2.0 * float(epsilon))
         columns.append(derivative[indices - 1])
     return np.column_stack(columns)
@@ -508,7 +519,7 @@ def analyze_frequency_scenario(
     )
     basis_full = np.zeros((time.size, 2), dtype=np.float64)
     basis_full[indices, :] = phase_basis.values
-    synthetic_full = forward_log_ai(filtered, scenario.amplitude)
+    synthetic_full = forward_time(filtered, scenario.time_s, scenario.amplitude)
     synthetic = synthetic_full[indices - 1]
     observed_window = observed_values[indices - 1]
     fit = weighted_amplitude_fit(
@@ -522,6 +533,7 @@ def analyze_frequency_scenario(
         filtered,
         basis_full=basis_full,
         output_indices=indices,
+        wavelet_time_s=scenario.time_s,
         wavelet=scenario.amplitude,
         epsilon=float(epsilon),
     )
@@ -529,6 +541,7 @@ def analyze_frequency_scenario(
         preprocessed,
         basis_full=basis_full,
         output_indices=indices,
+        wavelet_time_s=scenario.time_s,
         wavelet=scenario.amplitude,
         epsilon=float(epsilon),
     )

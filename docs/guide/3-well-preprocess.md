@@ -75,6 +75,8 @@ well_preprocess:
 
 第三步输出的标准 LAS 必须使用规则 MD 网格。原始 LAS 可以是不规则采样，但必须在这里显式规则化一次，后续 Step 4/5 不再各自猜测或重复重采样。
 
+规则化之前，原生 LAS 曲线由 `IrregularMdCurveSet` 显式承载；只有生成规则 MD 轴后才构造 `grid.Log`。不得把 irregular MD 伪装成要求等采样的 `grid.Log`。
+
 - `step_m`：输出 MD 采样间隔，单位米。当前工区按原 LAS 名义 `STEP` 固定为 `0.1 m`。
 - `max_interpolation_gap_m`：允许插值的相邻有限源样点最大距离。超过该距离的缺口在规则网格上保持 NaN；当前配置为 `0.5 m`。
 

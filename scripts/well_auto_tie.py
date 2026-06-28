@@ -44,12 +44,13 @@ from cup.seismic.horizon import HorizonSurface
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.trace_sampling import assemble_bilinear_trace_from_plan, build_bilinear_trace_sample_plan
 from cup.seismic.viz import plot_well_waveform_qc
-from cup.config.workflow import TimeWorkflowConfig, merge_dict_defaults
+from cup.config.workflow import WorkflowConfig, merge_dict_defaults
 from cup.config.sources import resolve_source_run
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.coerce import as_bool
 from cup.utils.masks import true_runs
 from cup.well.assets import build_file_lookup
+from cup.well.depth_tie import prepare_vertical_depth_extraction
 from cup.well.gaps import fill_short_joint_gaps, prepare_continuous_tie_logs
 from cup.well.las import export_logset_to_las, load_standard_vp_rho_logs
 from cup.well.td import (
@@ -86,8 +87,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
+def _script_config(cfg: dict[str, Any], *, sample_domain: str) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_auto_tie") or {})
+    domain = str(sample_domain).strip().casefold()
+    if domain not in {"time", "depth"}:
+        raise ValueError("well_auto_tie sample_domain must be 'time' or 'depth'.")
     merge_dict_defaults(
         script_cfg,
         "source_runs",
@@ -98,18 +102,19 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "well_trajectory_dir": None,
         },
     )
-    merge_dict_defaults(
-        script_cfg,
-        "target_interval",
-        {
-            "top_horizon": "interpre/H3-1",
-            "bottom_horizon": "interpre/H7-1",
-            "margin_top_ms": 100.0,
-            "margin_bottom_ms": 100.0,
-            "twt_unit": "auto",
-        },
+    target_defaults = {
+        "top_horizon": "interpre/H3-1",
+        "bottom_horizon": "interpre/H7-1",
+    }
+    if domain == "depth":
+        target_defaults.update({"margin_top_m": 100.0, "margin_bottom_m": 100.0})
+    else:
+        target_defaults.update({"margin_top_ms": 100.0, "margin_bottom_ms": 100.0, "twt_unit": "auto"})
+    merge_dict_defaults(script_cfg, "target_interval", target_defaults)
+    script_cfg.setdefault(
+        "enabled_routes",
+        ["vertical_depth"] if domain == "depth" else ["vertical_with_tdt", "vertical_anchor_from_tops"],
     )
-    script_cfg.setdefault("enabled_routes", ["vertical_with_tdt", "vertical_anchor_from_tops"])
     script_cfg.setdefault("tutorial_model", "tutorial/trained_net_state_dict.pt")
     script_cfg.setdefault("tutorial_params", "tutorial/network_parameters.yaml")
     script_cfg.setdefault("target_crop_ms", 201.0)
@@ -155,6 +160,18 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             },
         },
     )
+    target_cfg = dict(script_cfg["target_interval"])
+    if domain == "depth":
+        forbidden = sorted({"margin_top_ms", "margin_bottom_ms", "twt_unit"} & set(target_cfg))
+        if forbidden:
+            raise ValueError(f"Depth-domain well_auto_tie.target_interval forbids time fields: {forbidden}.")
+        invalid_routes = sorted(set(script_cfg["enabled_routes"]) - {TieRoute.VERTICAL_DEPTH.value})
+        if invalid_routes:
+            raise ValueError(f"Depth-domain well_auto_tie only supports vertical_depth in v1: {invalid_routes}.")
+    else:
+        forbidden = sorted({"margin_top_m", "margin_bottom_m"} & set(target_cfg))
+        if forbidden:
+            raise ValueError(f"Time-domain well_auto_tie.target_interval forbids depth fields: {forbidden}.")
     return script_cfg
 
 
@@ -534,6 +551,65 @@ def _target_tie_window_for_plan(
     )
 
 
+def _target_depth_window_for_plan(
+    *,
+    plan: WellTiePlan,
+    survey: Any,
+    config: dict[str, Any],
+    horizon_cache: dict[str, HorizonSurface],
+    data_root: Path,
+) -> dict[str, Any]:
+    """Build one vertical-well target window in TVDSS metres."""
+    if plan.surface_x is None or plan.surface_y is None:
+        raise ValueError("Plan has no valid surface XY.")
+    target_cfg = dict(config["target_interval"])
+    top_value, top_name = _target_horizon_spec(config, "top")
+    bottom_value, bottom_name = _target_horizon_spec(config, "bottom")
+    inline_float, xline_float = survey.line_geometry.coord_to_line(float(plan.surface_x), float(plan.surface_y))
+    top_sample = _load_horizon_surface(
+        _target_horizon_path(top_value, data_root=data_root), horizon_cache
+    ).sample_at_line(inline_float, xline_float)
+    bottom_sample = _load_horizon_surface(
+        _target_horizon_path(bottom_value, data_root=data_root), horizon_cache
+    ).sample_at_line(inline_float, xline_float)
+    top_m = float(top_sample["value"])
+    bottom_m = float(bottom_sample["value"])
+    if not np.isfinite(top_m) or not np.isfinite(bottom_m):
+        raise ValueError(f"Target depth horizons are non-finite for well {plan.well_name}.")
+    if bottom_m < top_m:
+        top_m, bottom_m = bottom_m, top_m
+    margin_top_m = float(target_cfg["margin_top_m"])
+    margin_bottom_m = float(target_cfg["margin_bottom_m"])
+    if margin_top_m < 0.0 or margin_bottom_m < 0.0:
+        raise ValueError("Depth target margins must be non-negative metres.")
+    survey_axis = survey.sample_axis("depth")
+    if top_m < float(survey_axis.values[0]) or bottom_m > float(survey_axis.values[-1]):
+        raise ValueError(
+            f"Target horizons [{top_m}, {bottom_m}] m are outside seismic TVDSS range "
+            f"[{survey_axis.values[0]}, {survey_axis.values[-1]}] m for well {plan.well_name}."
+        )
+    start_m = max(float(survey_axis.values[0]), top_m - margin_top_m)
+    end_m = min(float(survey_axis.values[-1]), bottom_m + margin_bottom_m)
+    if end_m <= start_m:
+        raise ValueError(f"Invalid target TVDSS window [{start_m}, {end_m}] for well {plan.well_name}.")
+    return {
+        "sample_domain": "depth",
+        "depth_basis": "tvdss",
+        "target_top_name": top_name,
+        "target_bottom_name": bottom_name,
+        "target_top_tvdss_m": top_m,
+        "target_bottom_tvdss_m": bottom_m,
+        "target_window_start_m": start_m,
+        "target_window_end_m": end_m,
+        "margin_top_m": margin_top_m,
+        "margin_bottom_m": margin_bottom_m,
+        "top_sample_method": str(top_sample["method"]),
+        "bottom_sample_method": str(bottom_sample["method"]),
+        "top_nearest_line_distance": float(top_sample["nearest_line_distance"]),
+        "bottom_nearest_line_distance": float(bottom_sample["nearest_line_distance"]),
+    }
+
+
 def _target_tie_window_for_trajectory(
     *,
     plan: WellTiePlan,
@@ -652,6 +728,9 @@ def _build_output_paths(output_dir: Path, well_name: str) -> dict[str, Path]:
         "filtered_las": output_dir / "filtered_las" / f"filtered_logs_{safe}.las",
         "synthetic_qc": output_dir / "synthetic_qc" / f"tie_qc_{safe}.csv",
         "seismic_trace": output_dir / "seismic_trace" / f"seismic_trace_{safe}.csv",
+        "depth_seismic_trace": output_dir / "seismic_trace" / f"seismic_trace_tvdss_{safe}.csv",
+        "pseudo_twt_seismic_trace": output_dir / "pseudo_time" / f"seismic_trace_relative_twt_{safe}.csv",
+        "relative_tdt": output_dir / "pseudo_time" / f"relative_tdt_non_geological_{safe}.csv",
         "trace_sample_plan": output_dir / "trace_sample_plan" / f"trace_sample_plan_{safe}.csv",
         "optimized_trace_sample_plan": output_dir / "trace_sample_plan" / f"optimized_trace_sample_plan_{safe}.csv",
         "figure_dir": figure_dir,
@@ -659,6 +738,7 @@ def _build_output_paths(output_dir: Path, well_name: str) -> dict[str, Path]:
         "fig_tdt": figure_dir / "time_depth_table.png",
         "fig_tie": figure_dir / "synthetic_match.png",
         "fig_wavelet": figure_dir / "wavelet.png",
+        "fig_depth_mapping": figure_dir / "depth_to_relative_twt.png",
     }
 
 
@@ -670,6 +750,7 @@ def _ensure_output_dirs(output_dir: Path) -> None:
         "filtered_las",
         "synthetic_qc",
         "seismic_trace",
+        "pseudo_time",
         "trace_sample_plan",
         "figures",
     ]:
@@ -1046,6 +1127,214 @@ def _write_qc_figures(
 # =============================================================================
 # Route execution
 # =============================================================================
+
+
+def _write_depth_extraction_figures(
+    *,
+    paths: dict[str, Path],
+    prepared: Any,
+    outputs: Any,
+    wavelet: Any,
+    seismic_norm: np.ndarray,
+    synthetic: np.ndarray,
+    corr: float,
+    nmae: float,
+) -> None:
+    fig, axes = plt.subplots(1, 3, figsize=(12.0, 5.5), sharey=True)
+    axes[0].plot(prepared.logset_md.Vp.values, prepared.logset_md.basis - float(prepared.report["kb_m"]), lw=0.8)
+    axes[0].set_xlabel("Vp (m/s)")
+    axes[0].set_ylabel("TVDSS (m)")
+    axes[0].set_title("Continuous Vp")
+    axes[1].plot(prepared.seismic_depth.values, prepared.seismic_depth.basis, lw=0.8, color="black")
+    axes[1].set_xlabel("Seismic amplitude")
+    axes[1].set_title("Observed depth trace")
+    axes[2].plot(
+        prepared.relative_tdt_rows["twt_s"].to_numpy(dtype=np.float64) * 1000.0,
+        prepared.relative_tdt_rows["tvdss_m"].to_numpy(dtype=np.float64),
+        lw=0.9,
+    )
+    axes[2].set_xlabel("Relative TWT (ms)")
+    axes[2].set_title("Non-geological mapping")
+    axes[0].invert_yaxis()
+    for ax in axes:
+        ax.grid(True, alpha=0.25)
+    _save_current_figure(paths["fig_depth_mapping"])
+
+    twt_ms = np.asarray(outputs.seismic.basis, dtype=np.float64) * 1000.0
+    fig, axes = plt.subplots(1, 3, figsize=(11.0, 5.5), sharey=True)
+    axes[0].plot(outputs.r.values, twt_ms, lw=0.8, color="tab:purple")
+    axes[0].set_xlabel("Reflectivity")
+    axes[1].plot(seismic_norm, twt_ms, lw=0.9, color="black", label="seismic")
+    axes[1].plot(synthetic, twt_ms, lw=0.9, color="tab:red", label="synthetic")
+    axes[1].set_xlabel("Normalized amplitude")
+    axes[1].set_title(f"Extraction QC: corr={corr:.3f}, nmae={nmae:.3f}")
+    axes[1].legend(loc="best")
+    axes[2].plot(seismic_norm - synthetic, twt_ms, lw=0.8, color="tab:gray")
+    axes[2].set_xlabel("Residual")
+    axes[0].invert_yaxis()
+    for ax in axes:
+        ax.grid(True, alpha=0.25)
+    _save_current_figure(paths["fig_tie"])
+
+    fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.5))
+    axes[0].plot(np.asarray(wavelet.basis) * 1000.0, wavelet.values, lw=1.0)
+    axes[0].axvline(0.0, color="black", lw=0.7, alpha=0.5)
+    axes[0].set_xlabel("Time (ms)")
+    axes[0].set_title("Candidate time wavelet")
+    frequency = np.fft.rfftfreq(int(wavelet.size), d=float(wavelet.sampling_rate))
+    spectrum = np.abs(np.fft.rfft(np.asarray(wavelet.values, dtype=np.float64)))
+    axes[1].plot(frequency, spectrum / max(float(spectrum.max()), 1e-12), lw=1.0)
+    axes[1].set_xlabel("Frequency (Hz)")
+    axes[1].set_title("Normalized spectrum")
+    for ax in axes:
+        ax.grid(True, alpha=0.25)
+    _save_current_figure(paths["fig_wavelet"])
+
+    try:
+        outputs.plot_optimization_objective(figsize=(6, 3))
+        _save_current_figure(paths["fig_objective"])
+    except Exception:
+        plt.close("all")
+
+
+def _run_vertical_depth_extraction(
+    *,
+    plan: WellTiePlan,
+    survey: Any,
+    wavelet_extractor: Any,
+    modeler: Any,
+    config: dict[str, Any],
+    output_dir: Path,
+    horizon_cache: dict[str, HorizonSurface],
+    data_root: Path,
+) -> tuple[WellTieResult, dict[str, Any]]:
+    """Extract one candidate time wavelet from a vertical depth-domain well."""
+    from wtie.optimize import autotie
+    from wtie.utils.datasets.utils import InputSet
+
+    if plan.surface_x is None or plan.surface_y is None or plan.kb_m is None:
+        raise ValueError("vertical_depth requires surface_x, surface_y and kb_m.")
+    input_las = _resolve_repo_path(plan.input_las)
+    standard_logs = load_standard_vp_rho_logs(input_las)
+    target_window = _target_depth_window_for_plan(
+        plan=plan,
+        survey=survey,
+        config=config,
+        horizon_cache=horizon_cache,
+        data_root=data_root,
+    )
+    seismic_depth = survey.read_trace_at_xy(
+        float(plan.surface_x),
+        float(plan.surface_y),
+        sample_start=float(target_window["target_window_start_m"]),
+        sample_end=float(target_window["target_window_end_m"]),
+        domain="depth",
+    )
+    prepared = prepare_vertical_depth_extraction(
+        standard_logs.logs,
+        seismic_depth,
+        kb_m=float(plan.kb_m),
+        pseudo_dt_s=float(wavelet_extractor.expected_sampling),
+        min_tie_samples=int(config["reject"]["min_tie_samples"]),
+    )
+    prepared = replace(prepared, report={**prepared.report, "kb_m": float(plan.kb_m)})
+    paths = _build_output_paths(output_dir, plan.well_name)
+    relative_rows = prepared.relative_tdt_rows.copy()
+    relative_rows["geological_tdt"] = False
+    relative_rows.to_csv(paths["relative_tdt"], index=False)
+    pd.DataFrame(
+        {"tvdss_m": prepared.seismic_depth.basis, "seismic": prepared.seismic_depth.values}
+    ).to_csv(paths["depth_seismic_trace"], index=False)
+    pd.DataFrame(
+        {"relative_twt_s": prepared.seismic_pseudo_twt.basis, "seismic": prepared.seismic_pseudo_twt.values}
+    ).to_csv(paths["pseudo_twt_seismic_trace"], index=False)
+
+    inputs = InputSet(
+        logset_md=prepared.logset_md,
+        seismic=prepared.seismic_pseudo_twt,
+        table=prepared.relative_tdt,
+        wellpath=None,  # type: ignore[arg-type]
+    )
+    wavelet_scaling_params = {
+        "wavelet_min_scale": config["wavelet_scaling"]["min_scale"],
+        "wavelet_max_scale": config["wavelet_scaling"]["max_scale"],
+        "num_iters": config["wavelet_scaling"]["num_iters"],
+    }
+    search_params = {
+        "num_iters": config["search_params"]["num_iters"],
+        "similarity_std": config["search_params"]["similarity_std"],
+        "suppress_runtime_warnings": True,
+        "show_all_warnings": False,
+    }
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=r"Wavelet has even number of samples; appending one zero sample\.")
+        outputs = autotie.tie_v1(
+            inputs,
+            wavelet_extractor,
+            modeler,
+            wavelet_scaling_params,
+            search_params=search_params,
+            search_space=build_auto_tie_search_space(config["search_space"]),
+            stretch_and_squeeze_params=None,
+        )
+    candidate_wavelet, crop_info = crop_wavelet_center_energy_normalize(
+        outputs.wavelet, float(config["target_crop_ms"])
+    )
+    pd.DataFrame(
+        {"time_s": candidate_wavelet.basis, "amplitude": candidate_wavelet.values}
+    ).to_csv(paths["wavelet"], index=False)
+    seismic_norm, synthetic, extraction_corr, extraction_nmae, synthetic_scale = scaled_synthetic_metrics(
+        modeler, candidate_wavelet, outputs.r, outputs.seismic
+    )
+    qc_df = pd.DataFrame(
+        {
+            "relative_twt_s": outputs.seismic.basis,
+            "seismic_norm": seismic_norm,
+            "reflectivity": outputs.r.values,
+            "synthetic_cropped_scaled": synthetic,
+            "residual": seismic_norm - synthetic,
+        }
+    )
+    qc_df.to_csv(paths["synthetic_qc"], index=False)
+    best_params, _ = outputs.ax_client.get_best_parameters()
+    pseudo_shift_s = float(best_params["table_t_shift"])
+    _write_depth_extraction_figures(
+        paths=paths,
+        prepared=prepared,
+        outputs=outputs,
+        wavelet=candidate_wavelet,
+        seismic_norm=seismic_norm,
+        synthetic=synthetic,
+        corr=extraction_corr,
+        nmae=extraction_nmae,
+    )
+    result = WellTieResult(
+        well_name=plan.well_name,
+        route=plan.route,
+        tie_status="success",
+        sample_domain="depth",
+        extraction_corr=extraction_corr,
+        extraction_nmae=extraction_nmae,
+        pseudo_twt_shift_s=pseudo_shift_s,
+        wavelet_file=repo_relative_path(paths["wavelet"], root=REPO_ROOT),
+        qc_figure_dir=repo_relative_path(paths["figure_dir"], root=REPO_ROOT),
+    )
+    extra = {
+        "sample_domain": "depth",
+        "depth_basis": "tvdss",
+        "geological_tdt": False,
+        "pseudo_twt_shift_s": pseudo_shift_s,
+        "best_parameters": {key: value for key, value in best_params.items() if key != "table_t_shift"},
+        "crop_info": crop_info,
+        "synthetic_scale": synthetic_scale,
+        "tie_window": {**target_window, **prepared.report, "pseudo_twt_shift_s": pseudo_shift_s},
+        "input_las": repo_relative_path(input_las, root=REPO_ROOT),
+        "relative_tdt_file": repo_relative_path(paths["relative_tdt"], root=REPO_ROOT),
+        "depth_seismic_trace_file": repo_relative_path(paths["depth_seismic_trace"], root=REPO_ROOT),
+        "pseudo_twt_seismic_trace_file": repo_relative_path(paths["pseudo_twt_seismic_trace"], root=REPO_ROOT),
+        "synthetic_qc_file": repo_relative_path(paths["synthetic_qc"], root=REPO_ROOT),
+    }
+    return result, extra
 
 
 def _run_vertical_with_tdt(
@@ -1572,8 +1861,11 @@ def _write_wavelet_inventory(results: Sequence[WellTieResult], output_dir: Path)
                 "wavelet_file": result.wavelet_file,
                 "dt_s": dt_s,
                 "n_samples": int(len(df)),
-                "tie_corr": result.optimized_corr,
-                "tie_nmae": result.optimized_nmae,
+                "tie_corr": None if result.sample_domain == "depth" else result.optimized_corr,
+                "tie_nmae": None if result.sample_domain == "depth" else result.optimized_nmae,
+                "extraction_corr": result.extraction_corr,
+                "extraction_nmae": result.extraction_nmae,
+                "sample_domain": result.sample_domain,
                 "usable_as_candidate": True,
                 "reasons": "",
             }
@@ -1586,6 +1878,9 @@ def _write_wavelet_inventory(results: Sequence[WellTieResult], output_dir: Path)
         "n_samples",
         "tie_corr",
         "tie_nmae",
+        "extraction_corr",
+        "extraction_nmae",
+        "sample_domain",
         "usable_as_candidate",
         "reasons",
     ]
@@ -1597,8 +1892,8 @@ def _write_wavelet_inventory(results: Sequence[WellTieResult], output_dir: Path)
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
-    workflow = TimeWorkflowConfig.from_mapping(cfg)
-    script_cfg = _script_config(cfg)
+    workflow = WorkflowConfig.from_mapping(cfg)
+    script_cfg = _script_config(cfg, sample_domain=workflow.seismic.domain)
     data_root = _resolve_repo_path(workflow.data_root)
     output_dir = _resolve_output_dir(args, cfg)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1623,6 +1918,7 @@ def main() -> None:
         time_depth_lookup=time_depth_lookup,
         trace_lookup=trace_lookup,
         enabled_routes=script_cfg["enabled_routes"],
+        sample_domain=workflow.seismic.domain,
         allow_near_outside=as_bool(script_cfg["reject"]["allow_near_outside"]),
     )
     if args.well:
@@ -1649,6 +1945,7 @@ def main() -> None:
     results: list[WellTieResult] = []
     result_extras: dict[str, Any] = {}
     implemented_routes = {
+        TieRoute.VERTICAL_DEPTH.value,
         TieRoute.VERTICAL_WITH_TDT.value,
         TieRoute.VERTICAL_ANCHOR_FROM_TOPS.value,
         TieRoute.DEVIATED_WITH_TDT.value,
@@ -1665,13 +1962,28 @@ def main() -> None:
         )
         well_tops_df = import_well_tops_petrel(well_tops_file) if needs_anchor else pd.DataFrame()
         anchor_config = _load_anchor_config(anchor_cfg) if needs_anchor else {}
-        manual_shift_config = _load_manual_shift_config(dict(script_cfg["coarse_correction"].get("manual_shift") or {}))
+        manual_shift_config = (
+            _load_manual_shift_config(dict(script_cfg["coarse_correction"].get("manual_shift") or {}))
+            if workflow.seismic.domain == "time"
+            else {}
+        )
         horizon_cache: dict[str, HorizonSurface] = {}
         wavelet_extractor = _load_wavelet_extractor(model_path, params_path)
         modeler = ConvModeler()
         for plan in planned_to_run:
             try:
-                if plan.route == TieRoute.VERTICAL_WITH_TDT.value:
+                if plan.route == TieRoute.VERTICAL_DEPTH.value:
+                    result, extra = _run_vertical_depth_extraction(
+                        plan=plan,
+                        survey=survey,
+                        wavelet_extractor=wavelet_extractor,
+                        modeler=modeler,
+                        config=script_cfg,
+                        output_dir=output_dir,
+                        horizon_cache=horizon_cache,
+                        data_root=data_root,
+                    )
+                elif plan.route == TieRoute.VERTICAL_WITH_TDT.value:
                     result, extra = _run_vertical_with_tdt(
                         plan=plan,
                         survey=survey,
@@ -1767,6 +2079,7 @@ def main() -> None:
                         well_name=plan.well_name,
                         route=plan.route,
                         tie_status="failed",
+                        sample_domain=workflow.seismic.domain,
                         reasons=reason,
                     )
                 )
@@ -1784,6 +2097,12 @@ def main() -> None:
                     "well_name": result.well_name,
                     "tie_window_start_s": tie_window.get("tie_window_start_s"),
                     "tie_window_end_s": tie_window.get("tie_window_end_s"),
+                    "tvdss_start_m": tie_window.get("tvdss_start_m"),
+                    "tvdss_end_m": tie_window.get("tvdss_end_m"),
+                    "relative_twt_start_s": tie_window.get("relative_twt_start_s"),
+                    "relative_twt_end_s": tie_window.get("relative_twt_end_s"),
+                    "pseudo_twt_shift_s": tie_window.get("pseudo_twt_shift_s"),
+                    "geological_tdt": tie_window.get("geological_tdt"),
                     "tdt_support_class": tie_window.get("tdt_support_class"),
                     "original_tdt_window_fraction": tie_window.get("original_tdt_window_fraction"),
                     "joint_observed_fraction": tie_window.get("joint_observed_fraction"),
@@ -1799,6 +2118,9 @@ def main() -> None:
                     "petrel_checkshot_file": extra.get("petrel_checkshot_file"),
                     "filtered_las_file": extra.get("filtered_las_file"),
                     "optimized_trace_sample_plan_file": extra.get("optimized_trace_sample_plan_file"),
+                    "relative_tdt_file": extra.get("relative_tdt_file"),
+                    "depth_seismic_trace_file": extra.get("depth_seismic_trace_file"),
+                    "pseudo_twt_seismic_trace_file": extra.get("pseudo_twt_seismic_trace_file"),
                 }
             )
     if metric_extra_rows and not metrics_df.empty:
@@ -1844,6 +2166,8 @@ def main() -> None:
     run_summary = {
         "script": "well_auto_tie.py",
         "config_file": repo_relative_path(args.config, root=REPO_ROOT),
+        "sample_domain": workflow.seismic.domain,
+        "depth_basis": workflow.seismic.depth_basis,
         "inputs": {
             "inventory_file": repo_relative_path(paths["inventory_file"], root=REPO_ROOT),
             "well_screen_file": repo_relative_path(paths["well_screen_file"], root=REPO_ROOT),

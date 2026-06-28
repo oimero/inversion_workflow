@@ -34,7 +34,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.config.workflow import TimeWorkflowConfig
+from cup.config.workflow import WorkflowConfig
 from cup.config.sources import resolve_source_run
 from cup.utils.coerce import optional_float as _optional_float
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
@@ -732,7 +732,7 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], columns: Sequence[
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
-    workflow = TimeWorkflowConfig.from_mapping(cfg)
+    workflow = WorkflowConfig.from_mapping(cfg)
     script_cfg = _script_config(cfg)
     script_cfg["required_categories"] = list(workflow.well_curves.required_categories)
     script_cfg["selected_categories"] = list(workflow.well_curves.selected_categories)

@@ -90,6 +90,7 @@ class SeismicConfig:
     file: str
     type: str
     domain: str
+    depth_basis: str | None = None
     zgy_inline_chunk_size: int | None = None
     iline: int | None = None
     xline: int | None = None
@@ -107,6 +108,12 @@ class SeismicConfig:
         domain = _required_text(config, "domain", path="seismic").casefold()
         if domain not in {"time", "depth"}:
             raise ValueError("seismic.domain must be 'time' or 'depth'.")
+        depth_basis_value = config.get("depth_basis")
+        depth_basis = None if depth_basis_value is None else str(depth_basis_value).strip().casefold()
+        if domain == "depth" and depth_basis != "tvdss":
+            raise ValueError("seismic.depth_basis must be explicitly set to 'tvdss' when seismic.domain='depth'.")
+        if domain == "time" and depth_basis is not None:
+            raise ValueError("seismic.depth_basis is only valid when seismic.domain='depth'.")
         chunk_size = _optional_int(config, "zgy_inline_chunk_size", path="seismic")
         if chunk_size is not None and chunk_size <= 0:
             raise ValueError("seismic.zgy_inline_chunk_size must be a positive integer or null.")
@@ -114,6 +121,7 @@ class SeismicConfig:
             file=_required_text(config, "file", path="seismic"),
             type=seismic_type,
             domain=domain,
+            depth_basis=depth_basis,
             zgy_inline_chunk_size=chunk_size,
             iline=_optional_int(config, "iline", path="seismic"),
             xline=_optional_int(config, "xline", path="seismic"),
@@ -128,6 +136,7 @@ class SeismicConfig:
             "file": self.file,
             "type": self.type,
             "domain": self.domain,
+            "depth_basis": self.depth_basis,
             "zgy_inline_chunk_size": self.zgy_inline_chunk_size,
             "iline": self.iline,
             "xline": self.xline,
@@ -175,7 +184,7 @@ class SpatialDebiasConfig:
 
 
 @dataclass(frozen=True)
-class TimeWorkflowConfig:
+class WorkflowConfig:
     data_root: str
     output_root: str
     assets: AssetsConfig
@@ -184,7 +193,7 @@ class TimeWorkflowConfig:
     spatial_debias: SpatialDebiasConfig
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "TimeWorkflowConfig":
+    def from_mapping(cls, value: Mapping[str, Any]) -> "WorkflowConfig":
         config = dict(value)
         return cls(
             data_root=str(config.get("data_root", "data")),

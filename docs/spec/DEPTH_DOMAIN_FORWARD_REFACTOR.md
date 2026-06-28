@@ -386,8 +386,8 @@ seismic:
 ```mermaid
 flowchart LR
     A["Step 3：Vp / Rho / TVDSS"] --> B["Step 4：伪时间提取候选子波"]
-    B --> C["TVDSS 上 W_depth 闭环评分"]
-    C --> D["Step 5：全局时间子波 + AI–Vp 校准"]
+    B --> C["Step 5：TVDSS 上 W_depth 跨井评价"]
+    C --> D["全局时间子波 + AI–Vp 校准"]
     D --> E["冻结 forward_model_calibration.json"]
     E --> F["Step 6：深度 Jacobian / SVD"]
     E --> G["Synthoseis-lite v2"]
@@ -400,25 +400,31 @@ flowchart LR
 
 ### 8.1 Step 4：井震自动标定
 
+深度域 Step 4 的职责收缩为**候选时间子波提取**，不承担深度域正演闭环或最终井震标定成功判定。实现以历史脚本 `.ref/scripts_depth/vertical_well_auto_tie_depth.py` 为数值与流程参考，但接入当前 Step 1—3 产物、工区配置和批量路由。
+
 深度域流程：
 
 1. 将预处理后的 Vp、Rho 和地震道对齐到原始 TVDSS 轴。
 2. 使用实测 `AI = Vp * Rho` 构造 logAI，传播速度使用实测 Vp。
-3. 由实测 Vp 的梯形慢度积分生成相对 TWT。
-4. 临时把连续 Vp、Rho 和深度地震投影到规则相对 TWT，仅用于复用 `wtie` 的候选时间子波提取能力。
-5. 候选子波回到原始 TVDSS 轴，通过统一 `forward_depth` 生成 `N` 点深度合成地震。
-6. 所有最终评分、QC 图和成功判定以 TVDSS 上的深度闭环为准。
+3. 由实测 Vp 的梯形慢度积分生成局部相对 TWT 映射，第一点取 `twt=0`，不需要上覆层绝对 TWT。
+4. 临时把连续 Vp、Rho 和深度地震投影到规则相对 TWT，复用 `wtie.tie_v1` 提取候选时间子波。
+5. 禁用 stretch/squeeze；允许 `tie_v1` 在伪时间空间搜索日志滤波参数和整体 `table_t_shift`，但该时移只作为子波提取的 nuisance 参数。
+6. 居中裁剪候选时间子波并做显式 L2 能量归一化，写出伪时间提取 QC。
 
-深度域 Step 4：
+这里的局部相对 TWT 映射在数学上就是由实测 Vp 构造的临时 local TDT。它只存在于 Step 4 的适配器内部或诊断产物中，不能解释为地质时深表，也不能传递给后续步骤作为速度模型或井震校准结果。
 
-- 不生成 TDT；
-- 不优化 TDT；
-- 不允许 stretch/squeeze；
-- 只允许扫描常量 `depth_shift_m ∈ [-30, 30]`；
-- 深度平移与子波相位是两个独立参数，不互相替代；
+深度域 Step 4 的约束：
+
+- 不读取外部 TDT，不要求时深表资产；
+- 不把 `tie_v1` 返回的 shifted table 写成 `optimized_tdt`，也不导出 Petrel checkshot；
+- 不允许 stretch/squeeze 或任何深度依赖的动态时移；
+- `table_t_shift` 必须命名并记录为 `pseudo_twt_shift_s`，不得换算成米或解释为物理深度平移；
+- Step 4 不调用 `forward_depth`，也不扫描 `depth_shift_m`；
 - 不修改 `src/wtie/`。
 
-Step 4 产物必须记录 `sample_domain=depth`、`depth_basis=tvdss`、`depth_shift_m`、参与评分的 TVDSS 范围、Vp/Rho 来源和候选时间子波来源。深度域产物不得出现伪造或空白占位的 TDT 字段。
+Step 4 的 `tie_status=success` 只表示候选子波成功提取并通过基本形态/采样 QC，不表示该井已经通过深度域闭环。伪时间相关系数和 NMAE 只能命名为提取 QC，不得作为最终深度域井震标定指标。
+
+Step 4 产物必须记录 `sample_domain=depth`、`depth_basis=tvdss`、参与提取的 TVDSS 范围、临时相对 TWT 范围、`pseudo_twt_shift_s`、Vp/Rho 来源、候选时间子波来源及其裁剪/归一化 QC。临时 local TDT 若为诊断目的写出，文件名和元数据必须包含 `relative` 或 `pseudo`，并明确 `geological_tdt=false`。
 
 时间域 Step 4 保留现有 TDT/TWT 流程，但改为调用统一 NumPy 时间后端进行最终闭环，确保时间域没有发生数值漂移。
 
@@ -428,7 +434,11 @@ Step 4 产物必须记录 `sample_domain=depth`、`depth_basis=tvdss`、`depth_s
 
 深度域选择规则：
 
-- 每个候选子波必须在所有成功井上使用 `forward_depth` 评价；
+- Step 5 是深度域首次强制物理闭环；Step 4 的伪时间指标不参与最终成功判定；
+- 每个候选子波必须在所有 Step 4 候选提取成功且数据满足严格正演要求的井上使用 `forward_depth` 评价；
+- 每个候选子波/评价井组合都在原始 TVDSS 轴上扫描常量 `depth_shift_m ∈ [-30, 30]`，不允许 stretch/squeeze；
+- 深度平移与时间子波相位是两个独立参数，不互相替代；Step 4 的 `pseudo_twt_shift_s` 不继承、不换算为 Step 5 的 `depth_shift_m`；
+- 使用实测 `AI=Vp·Rho` 计算反射率，使用同一口井的实测 Vp 构造 `W_depth`，生成与评价窗口 TVDSS 轴一致的深度合成地震；
 - 先计算每口井的指标，再做等井权重汇总，避免长井或高采样井支配结果；
 - 最终冻结一条全工区时间子波；
 - 使用成功井的实测 AI、Vp，按等井权重 Huber 回归拟合全工区一组 `AI=a·Vp+b`；
@@ -436,7 +446,9 @@ Step 4 产物必须记录 `sample_domain=depth`、`depth_basis=tvdss`、`depth_s
 
 等井权重的实现必须先使每口井的样点权重和相同，再进入 Huber 优化；不得简单拼接所有样点后拟合。
 
-Step 5 输出冻结的 `forward_model_calibration.json`，后续步骤只读。任何会改变 a/b、子波或源井集合的操作都必须重新生成该文件及哈希。
+Step 5 必须写出逐候选、逐评价井的 TVDSS 深度闭环指标和最优 `depth_shift_m`。只有通过深度闭环准入的井才进入全局子波汇总和 AI—Vp 拟合。
+
+Step 5 输出冻结的 `forward_model_calibration.json`，后续步骤只读。任何会改变 a/b、子波、深度平移规则或源井集合的操作都必须重新生成该文件及哈希。
 
 ### 8.3 Step 6：正演可观测性分析
 
@@ -637,24 +649,26 @@ R1 摘要升级为 v2，至少包含：
 
 门禁：fixture 可独立加载，且没有通过导入遗留实现实时生成期望值。
 
-### 阶段 2：统一内核
+### 阶段 2：坐标与 Step 4 候选提取
+
+1. 修正 `survey.py` 的 TVDSS 语义。
+2. `TimeWorkflowConfig` 全量迁移为 `WorkflowConfig`，增加 domain/depth_basis 严格配置。
+3. 将历史深度脚本的“实测 Vp 构造局部相对 TWT → 深度地震投影到规则 TWT → `tie_v1` 提取子波”路径迁入当前 Step 4。
+4. 接入 Step 1—3 产物、目标 TVDSS 窗口、批量井路由和当前地震工区几何。
+5. 明确区分 `pseudo_twt_shift_s` 与物理深度平移，不输出 optimized TDT 或 Petrel checkshot。
+
+门禁：至少一口井及批量路由能够产出候选时间子波和伪时间提取 QC；产物明确声明 `sample_domain=depth`、`depth_basis=tvdss`、`geological_tdt=false`，且没有深度闭环成功声明。
+
+### 阶段 3：统一正演内核与 Step 5 深度闭环
 
 1. 实现 NumPy/PyTorch 时间内核。
 2. 实现相对 TWT、线性子波插值和完整深度算子。
 3. 实现默认 64 点输出分块路径。
 4. 实现 grid 适配器和 AI—Vp 变换。
+5. 迁移 Step 5，在原始 TVDSS 轴上对全部候选做跨井 `W_depth` 评价和 `depth_shift_m` 扫描。
+6. 以深度闭环准入井拟合 AI—Vp 关系并生成冻结正演校准。
 
-门禁：时间 fixture、旧深度 fixture、后端一致性和 gradcheck 全部通过。
-
-### 阶段 3：坐标和 Step 4/5
-
-1. 修正 `survey.py` 的 TVDSS 语义。
-2. `TimeWorkflowConfig` 全量迁移为 `WorkflowConfig`。
-3. 增加 domain/depth_basis 严格配置。
-4. 迁移 Step 4 的伪时间提取和 TVDSS 评分。
-5. 迁移 Step 5，并生成冻结正演校准。
-
-门禁：单井 Step 4 深度闭环和多井 Step 5 校准产物通过 schema、单位、哈希校验。
+门禁：时间 fixture、旧深度 fixture、后端一致性和 gradcheck 全部通过；多井 Step 5 的深度闭环、米制平移和校准产物通过 schema、单位、哈希校验。
 
 ### 阶段 4：可观测性
 
@@ -696,15 +710,18 @@ R1 摘要升级为 v2，至少包含：
 9. 非有限值、非正速度、非递增深度、偶数子波、非规则子波均明确失败。
 10. AI—Vp 正反变换、单位元数据、`a > 0` 和派生正速度校验。
 11. AI—Vp 等井权重 Huber 拟合不受单井样点数复制影响。
-12. Step 4 伪时间提取后回到原始 TVDSS 的闭环。
-13. Step 4 深度域拒绝 TDT 优化和 stretch/squeeze。
-14. Step 6 Jacobian 与中心有限差分抽查一致。
-15. time/depth 两套 Synthoseis-lite 小型端到端闭合。
-16. 深度高分辨率正演、抗混叠、5 m 降采样路径闭合。
-17. 数据集、模型、R1 对旧 schema 和错校准哈希明确失败。
-18. R1 深度合成、观测与 TVDSS 轴逐点严格一致，三者均为 `N` 点。
-19. 相位扰动只改变时间子波，深度平移只使用米制参数。
-20. inline 步长 1、xline 步长 4 的体采样集成测试。
+12. Step 4 从实测 Vp 构造的局部相对 TWT 与历史脚本参考结果一致。
+13. Step 4 只输出候选子波和伪时间提取 QC，拒绝 stretch/squeeze，不输出 optimized TDT 或 Petrel checkshot。
+14. Step 4 的 `pseudo_twt_shift_s` 不被换算或写入 `depth_shift_m`。
+15. Step 5 的每个候选都回到原始 TVDSS，通过 `W_depth` 做跨井评价。
+16. Step 5 的米制深度平移扫描覆盖 `[-30, 30] m`，且不继承 Step 4 的伪时间时移。
+17. Step 6 Jacobian 与中心有限差分抽查一致。
+18. time/depth 两套 Synthoseis-lite 小型端到端闭合。
+19. 深度高分辨率正演、抗混叠、5 m 降采样路径闭合。
+20. 数据集、模型、R1 对旧 schema 和错校准哈希明确失败。
+21. R1 深度合成、观测与 TVDSS 轴逐点严格一致，三者均为 `N` 点。
+22. 相位扰动只改变时间子波，深度平移只使用米制参数。
+23. inline 步长 1、xline 步长 4 的体采样集成测试。
 
 测试容差必须按 dtype 和运算路径显式设置。不能通过放宽全局容差掩盖 NumPy/PyTorch 的核翻转、界面对齐或半样点偏移错误。
 
@@ -715,8 +732,8 @@ R1 摘要升级为 v2，至少包含：
 - `src/cup/forward/` 是新工作流唯一的正演实现来源；
 - 时间域 fixture 证明重构没有改变既有 Robinson 数值结果；
 - 深度域输出为原始 TVDSS 轴上的 `N` 点，且分块/完整、NumPy/PyTorch 一致；
-- Step 4 在深度域不生成或优化 TDT，最终评分来自 TVDSS 深度闭环；
-- Step 5 冻结全局时间子波和一组等井权重 Huber AI—Vp 校准；
+- Step 4 在深度域只生成候选时间子波；局部相对 TWT 映射明确标为非地质 TDT，伪时间指标不冒充深度闭环；
+- Step 5 在原始 TVDSS 上完成首次强制 `W_depth` 跨井评价和米制深度平移，并冻结全局时间子波及一组等井权重 Huber AI—Vp 校准；
 - Step 6 同时报告固定速度和耦合速度敏感度，并使用 cycles/km；
 - Synthoseis-lite v2、GINN v2 model run v3、R1 v2 的 domain、轴、单位和哈希可追溯；
 - Step 7/R0 虽不正演，仍完整传递 domain、TVDSS 轴和校准哈希；
@@ -733,7 +750,8 @@ R1 摘要升级为 v2，至少包含：
 | PyTorch 卷积核方向错误 | 时间后端与 NumPy 相位相反 | 固化非对称子波 fixture |
 | 深度矩阵内存过大 | 批量训练 OOM | 默认 64 输出点分块，仅显式请求完整算子 |
 | AI—Vp 拟合被长井支配 | 派生速度偏向单井 | 等井权重 Huber，逐井和汇总 QC |
-| 伪时间步骤被误当最终结果 | Step 4 指标仍是时间域 | 伪时间只提取候选，最终成功判定必须来自 TVDSS 闭环 |
+| 伪时间步骤被误当最终结果 | Step 4 提取 QC 被写成最终井震标定指标 | Step 4 只声明候选提取成功；首次深度闭环和最终准入固定在 Step 5 |
+| 伪时间时移被误作深度校正 | `table_t_shift` 被换算成米或传入后续步骤 | 命名为 `pseudo_twt_shift_s`，仅作提取 nuisance 参数；Step 5 独立扫描 `depth_shift_m` |
 | 时间相位与深度静差混淆 | 场景不可解释 | 秒制子波扰动和米制平移使用独立字段及扫描 |
 | 旧产物混入新模型 | domain 或标定不可追溯 | schema 和 SHA-256 严格校验，不提供自动升级 |
 | 线号当数组下标 | xline 步长 4 时取错道 | 显式轴 + `SurveyLineGeometry` + 集成测试 |

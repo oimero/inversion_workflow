@@ -27,7 +27,7 @@ from cup.synthetic.workflow import (
     run_calibration,
     run_generation,
 )
-from cup.config.workflow import TimeWorkflowConfig
+from cup.config.workflow import WorkflowConfig
 from cup.config.sources import load_summary, resolve_source_run
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path
 
@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _output_dir(args: argparse.Namespace, workflow: TimeWorkflowConfig) -> Path:
+def _output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> Path:
     if args.output_dir is not None:
         return resolve_relative_path(args.output_dir, root=REPO_ROOT)
     root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
@@ -80,7 +80,7 @@ def _output_dir(args: argparse.Namespace, workflow: TimeWorkflowConfig) -> Path:
     return root / f"synthoseis_lite_{args.command}_{timestamp}"
 
 
-def _prepare_synthoseis_config(raw: dict, workflow: TimeWorkflowConfig) -> dict:
+def _prepare_synthoseis_config(raw: dict, workflow: WorkflowConfig) -> dict:
     prepared = dict(raw)
     root = dict(prepared.get("synthoseis_lite") or {})
     source_runs = dict(root.get("source_runs") or {})
@@ -113,7 +113,7 @@ def main() -> None:
     args = parse_args()
     config_path = resolve_relative_path(args.config, root=REPO_ROOT)
     raw = load_yaml_config(config_path)
-    workflow = TimeWorkflowConfig.from_mapping(raw)
+    workflow = WorkflowConfig.from_mapping(raw)
     raw = _prepare_synthoseis_config(raw, workflow)
     script_cfg = parse_synthoseis_config(raw)
     sources = resolve_sources(script_cfg, repo_root=REPO_ROOT)

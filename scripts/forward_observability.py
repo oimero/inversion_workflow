@@ -51,7 +51,7 @@ from cup.seismic.wavelet import (
     validate_wavelet_normalization,
     wavelet_half_amplitude_frequencies,
 )
-from cup.config.workflow import TimeWorkflowConfig
+from cup.config.workflow import WorkflowConfig
 from cup.config.sources import assert_recorded_source_matches, require_source_files, resolve_source_run
 from cup.utils.io import (
     load_yaml_config,
@@ -251,7 +251,7 @@ def _resolve_repo_path(value: str | Path) -> Path:
     return resolve_relative_path(value, root=REPO_ROOT)
 
 
-def _resolve_output_dir(args: argparse.Namespace, workflow: TimeWorkflowConfig) -> Path:
+def _resolve_output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> Path:
     if args.output_dir is not None:
         return _resolve_repo_path(args.output_dir)
     output_root = _resolve_repo_path(workflow.output_root)
@@ -1014,7 +1014,7 @@ def main() -> None:
     args = parse_args()
     config_path = _resolve_repo_path(args.config)
     config = load_yaml_config(config_path)
-    workflow = TimeWorkflowConfig.from_mapping(config)
+    workflow = WorkflowConfig.from_mapping(config)
     script_cfg = _script_config(config)
     script_cfg["output_root"] = workflow.output_root
     sources = _resolve_sources(script_cfg)

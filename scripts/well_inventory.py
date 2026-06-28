@@ -32,7 +32,7 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.petrel.load import import_well_heads_petrel, import_well_tops_petrel
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.config.workflow import TimeWorkflowConfig
+from cup.config.workflow import WorkflowConfig
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.well.assets import (
     WellHead,
@@ -328,7 +328,7 @@ def _write_outputs(inventory: WellInventory, output_dir: Path, run_summary: dict
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
-    workflow = TimeWorkflowConfig.from_mapping(cfg)
+    workflow = WorkflowConfig.from_mapping(cfg)
     script_cfg = _script_config(cfg)
 
     data_root = resolve_relative_path(workflow.data_root, root=REPO_ROOT)

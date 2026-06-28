@@ -75,7 +75,7 @@ def _domain_to_basis_type(domain: str) -> str:
     domain_lower = _normalize_domain(domain)
     if domain_lower == "time":
         return "twt"
-    return "md"
+    return "tvdss"
 
 
 def _interpolate_trace_from_4_neighbors(

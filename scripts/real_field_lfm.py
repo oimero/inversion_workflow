@@ -25,7 +25,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.seismic.real_field_lfm import parse_real_field_lfm_config, run_real_field_lfm
-from cup.config.workflow import TimeWorkflowConfig
+from cup.config.workflow import WorkflowConfig
 from cup.config.sources import resolve_source_file_from_run, resolve_source_run
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path
 
@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _output_dir(args: argparse.Namespace, workflow: TimeWorkflowConfig) -> Path:
+def _output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> Path:
     if args.output_dir is not None:
         return resolve_relative_path(args.output_dir, root=REPO_ROOT)
     root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
@@ -53,7 +53,7 @@ def _output_dir(args: argparse.Namespace, workflow: TimeWorkflowConfig) -> Path:
     return root / f"real_field_lfm_{timestamp}"
 
 
-def _prepare_real_field_lfm_config(raw: dict, workflow: TimeWorkflowConfig) -> dict:
+def _prepare_real_field_lfm_config(raw: dict, workflow: WorkflowConfig) -> dict:
     prepared = dict(raw)
     root = dict(prepared.get("real_field_lfm") or {})
     source_runs = dict(root.get("source_runs") or {})
@@ -89,7 +89,7 @@ def main() -> None:
     args = parse_args()
     config_path = resolve_relative_path(args.config, root=REPO_ROOT)
     raw = load_yaml_config(config_path)
-    workflow = TimeWorkflowConfig.from_mapping(raw)
+    workflow = WorkflowConfig.from_mapping(raw)
     prepared = _prepare_real_field_lfm_config(raw, workflow)
     script_cfg = parse_real_field_lfm_config(prepared)
     output_dir = _output_dir(args, workflow)

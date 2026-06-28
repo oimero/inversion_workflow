@@ -30,7 +30,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.config.workflow import TimeWorkflowConfig
+from cup.config.workflow import WorkflowConfig
 from cup.config.sources import resolve_source_run
 from cup.utils.coerce import as_bool
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
@@ -408,7 +408,7 @@ def run_screening(
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
-    workflow = TimeWorkflowConfig.from_mapping(cfg)
+    workflow = WorkflowConfig.from_mapping(cfg)
     script_cfg = _script_config(cfg)
     script_cfg["curve_selection"] = {
         "required_categories": list(workflow.well_curves.required_categories),

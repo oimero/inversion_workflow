@@ -12,7 +12,7 @@ import pandas as pd
 from cup.petrel.load import import_interpretation_petrel
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
-from cup.config.workflow import TimeWorkflowConfig
+from cup.config.workflow import WorkflowConfig
 from cup.utils.io import resolve_relative_path
 
 
@@ -117,7 +117,7 @@ def _section_target_zone_qc_rows(
 
 def build_section_geometries(
     *,
-    workflow: TimeWorkflowConfig,
+    workflow: WorkflowConfig,
     script_cfg: Mapping[str, Any],
     repo_root: Path,
 ) -> list[SectionGeometry]:

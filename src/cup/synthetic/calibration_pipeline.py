@@ -18,7 +18,7 @@ from cup.synthetic.calibration import (
 )
 from cup.synthetic.config import IMPLEMENTATION_SCOPE
 from cup.synthetic.figures import write_calibration_figures
-from cup.config.workflow import TimeWorkflowConfig
+from cup.config.workflow import WorkflowConfig
 from cup.utils.io import repo_relative_path, resolve_artifact_path, resolve_relative_path, sha256_file, write_json
 from cup.well.assets import normalize_well_name
 from cup.well.las import read_las_curve
@@ -80,7 +80,7 @@ def _artifact(value: Any, *, run_dir: Path, repo_root: Path, label: str) -> Path
 
 def build_calibration_inputs(
     *,
-    workflow: TimeWorkflowConfig,
+    workflow: WorkflowConfig,
     script_cfg: Mapping[str, Any],
     sources: Mapping[str, Path],
     repo_root: Path,
@@ -199,7 +199,7 @@ def build_calibration_inputs(
 
 def run_calibration(
     *,
-    workflow: TimeWorkflowConfig,
+    workflow: WorkflowConfig,
     script_cfg: Mapping[str, Any],
     sources: Mapping[str, Path],
     repo_root: Path,

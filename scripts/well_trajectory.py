@@ -33,7 +33,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.config.workflow import TimeWorkflowConfig, merge_dict_defaults
+from cup.config.workflow import WorkflowConfig, merge_dict_defaults
 from cup.config.sources import resolve_source_run
 from cup.utils.coerce import as_bool, optional_float
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
@@ -501,7 +501,7 @@ def run_trajectory(
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
-    workflow = TimeWorkflowConfig.from_mapping(cfg)
+    workflow = WorkflowConfig.from_mapping(cfg)
     script_cfg = _script_config(cfg)
     data_root = _resolve_repo_path(workflow.data_root)
     output_dir = _resolve_output_dir(args, cfg)

@@ -22,7 +22,7 @@ from cup.synthetic.io import write_generated_section, write_highres_forward_resu
 from cup.synthetic.lfm import LfmResult, derive_lfm_priors
 from cup.synthetic.probes import ProbeFrequency, build_probe_frequency_catalog, frequency_catalog_rows, generate_probe, probe_variants
 from cup.synthetic.seismic_variants import generate_seismic_variants
-from cup.config.workflow import TimeWorkflowConfig
+from cup.config.workflow import WorkflowConfig
 from cup.utils.io import array_sha256, repo_relative_path, resolve_relative_path, sha256_file, write_json
 
 
@@ -819,7 +819,7 @@ def _run_canonical_generation(
 
 def run_generation(
     *,
-    workflow: TimeWorkflowConfig,
+    workflow: WorkflowConfig,
     script_cfg: Mapping[str, Any],
     sources: Mapping[str, Path],
     calibration_path: Path,

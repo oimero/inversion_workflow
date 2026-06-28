@@ -29,9 +29,18 @@ well_auto_tie:
     bottom_horizon: interpre/base_of_itp_extend
     margin_top_m: 100.0
     margin_bottom_m: 100.0
+  depth_extraction:
+    log_gap_policy: interpolate_internal
   enabled_routes:
     - vertical_depth
 ```
+
+`depth_extraction.log_gap_policy` 控制深度域 Vp/Rho 缺口：
+
+- `strict_contiguous`：只使用最长的联合连续有效段；
+- `interpolate_internal`：保留 Vp/Rho 共同实测支撑范围并线性填补内部缺口，不向任一曲线的首尾支撑之外外推。当前工区使用此策略。
+
+深度域的主井震匹配图和子波图与时间域调用同一套绘图函数；额外的 TVDSS/相对 TWT 图只用于说明临时投影关系。
 
 建议先跑单井：
 

@@ -166,6 +166,51 @@ def _normalize_ai_traces(
     return traces, selected
 
 
+def _align_impedance_traces_to_basis(
+    traces: Sequence[grid.Log],
+    selected: grid.Log,
+    target_basis: np.ndarray,
+) -> tuple[list[grid.Log], grid.Log]:
+    """Interpolate TWT impedance traces onto the exact seismic tie window."""
+    target = np.asarray(target_basis, dtype=np.float64)
+    if target.ndim != 1 or target.size < 2 or np.any(~np.isfinite(target)) or np.any(np.diff(target) <= 0.0):
+        raise ValueError("Waveform QC target basis must be finite and strictly increasing.")
+    selected_index = next((index for index, trace in enumerate(traces) if trace is selected), None)
+    if selected_index is None:
+        raise ValueError("Waveform QC selected AI is not present in the impedance traces.")
+
+    aligned: list[grid.Log] = []
+    for trace in traces:
+        if not trace.is_twt:
+            raise ValueError("Waveform QC impedance traces must use a TWT basis.")
+        source_basis = np.asarray(trace.basis, dtype=np.float64)
+        source_values = np.asarray(trace.values, dtype=np.float64)
+        tolerance = max(abs(float(trace.sampling_rate)) * 0.5, 1e-9)
+        if target[0] < source_basis[0] - tolerance or target[-1] > source_basis[-1] + tolerance:
+            raise ValueError(
+                "Waveform QC seismic tie window lies outside the impedance trace support: "
+                f"seismic=[{target[0]}, {target[-1]}], AI=[{source_basis[0]}, {source_basis[-1]}]."
+            )
+        values = np.interp(target, source_basis, source_values)
+        aligned.append(
+            grid.Log(
+                values,
+                target,
+                "twt",
+                name=trace.name,
+                unit=trace.unit,
+                allow_nan=trace.allow_nan,
+            )
+        )
+    return aligned, aligned[selected_index]
+
+
+def _require_same_waveform_basis(label: str, basis: np.ndarray, expected: np.ndarray) -> None:
+    values = np.asarray(basis, dtype=np.float64)
+    if values.shape != expected.shape or not np.allclose(values, expected, equal_nan=True):
+        raise ValueError(f"Waveform QC {label} must share the seismic tie-window basis.")
+
+
 def _plot_impedance_traces(
     traces: Sequence[grid.Log],
     synthetic_ai: grid.Log,
@@ -290,6 +335,23 @@ def plot_well_waveform_qc(
     horizon_markers: Sequence[tuple[float, str]] = (),
 ) -> tuple:
     """Draw the shared six-panel well waveform QC with true amplitude axes."""
+    synthetic_basis = np.asarray(synthetic_seismic.basis, dtype=np.float64)
+    real_basis = np.asarray(real_seismic.basis, dtype=np.float64)
+    if synthetic_basis.shape != real_basis.shape or not np.allclose(
+        synthetic_basis,
+        real_basis,
+        equal_nan=True,
+    ):
+        raise ValueError("Synthetic and real seismic must share the same basis.")
+    _require_same_waveform_basis("reflectivity", reflectivity.basis, real_basis)
+    _require_same_waveform_basis("dynamic correlation", dxcorr.basis, real_basis)
+    impedance_traces, selected_ai = _normalize_ai_traces(logset, synthetic_ai)
+    impedance_traces, selected_ai = _align_impedance_traces_to_basis(
+        impedance_traces,
+        selected_ai,
+        real_basis,
+    )
+
     fig = plt.figure(figsize=figsize, constrained_layout=True)
     gs = gridspec.GridSpec(
         1,
@@ -306,16 +368,6 @@ def plot_well_waveform_qc(
         fig.add_subplot(gs[4]),
         fig.add_subplot(gs[5]),
     ]
-
-    impedance_traces, selected_ai = _normalize_ai_traces(logset, synthetic_ai)
-    synthetic_basis = np.asarray(synthetic_seismic.basis, dtype=np.float64)
-    real_basis = np.asarray(real_seismic.basis, dtype=np.float64)
-    if synthetic_basis.shape != real_basis.shape or not np.allclose(
-        synthetic_basis,
-        real_basis,
-        equal_nan=True,
-    ):
-        raise ValueError("Synthetic and real seismic must share the same basis.")
 
     _plot_impedance_traces(impedance_traces, selected_ai, fig_axes=(fig, axes[0]))
     _plot_reflectivity(reflectivity, fig_axes=(fig, axes[1]))
@@ -336,6 +388,7 @@ def plot_well_waveform_qc(
         ax.set_yticklabels("")
 
     for ax in axes:
+        ax.set_ylim(float(real_basis[-1]), float(real_basis[0]))
         ax.locator_params(axis="y", nbins=28)
 
     _draw_horizon_markers(axes, horizon_markers)

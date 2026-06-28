@@ -111,6 +111,12 @@ def _script_config(cfg: dict[str, Any], *, sample_domain: str) -> dict[str, Any]
     else:
         target_defaults.update({"margin_top_ms": 100.0, "margin_bottom_ms": 100.0, "twt_unit": "auto"})
     merge_dict_defaults(script_cfg, "target_interval", target_defaults)
+    if domain == "depth":
+        merge_dict_defaults(
+            script_cfg,
+            "depth_extraction",
+            {"log_gap_policy": "strict_contiguous"},
+        )
     script_cfg.setdefault(
         "enabled_routes",
         ["vertical_depth"] if domain == "depth" else ["vertical_with_tdt", "vertical_anchor_from_tops"],
@@ -168,6 +174,13 @@ def _script_config(cfg: dict[str, Any], *, sample_domain: str) -> dict[str, Any]
         invalid_routes = sorted(set(script_cfg["enabled_routes"]) - {TieRoute.VERTICAL_DEPTH.value})
         if invalid_routes:
             raise ValueError(f"Depth-domain well_auto_tie only supports vertical_depth in v1: {invalid_routes}.")
+        gap_policy = str(script_cfg["depth_extraction"]["log_gap_policy"]).strip().casefold()
+        if gap_policy not in {"strict_contiguous", "interpolate_internal"}:
+            raise ValueError(
+                "Depth-domain well_auto_tie.depth_extraction.log_gap_policy must be "
+                "'strict_contiguous' or 'interpolate_internal'."
+            )
+        script_cfg["depth_extraction"]["log_gap_policy"] = gap_policy
     else:
         forbidden = sorted({"margin_top_m", "margin_bottom_m"} & set(target_cfg))
         if forbidden:
@@ -1081,6 +1094,37 @@ def _write_qc_figures(
     ax.legend(loc="best")
     _save_current_figure(paths["fig_tdt"])
 
+    _write_shared_waveform_and_wavelet_figures(
+        paths=paths,
+        outputs=outputs,
+        cropped_wavelet=cropped_wavelet,
+        corr=optimized_corr,
+        nmae=optimized_nmae,
+        synthetic_scale=synthetic_scale,
+        title_prefix="Auto tie",
+        horizon_markers=(
+            []
+            if target_window is None
+            else [
+                (target_window.top_twt_s, target_window.top_name),
+                (target_window.bottom_twt_s, target_window.bottom_name),
+            ]
+        ),
+    )
+
+
+def _write_shared_waveform_and_wavelet_figures(
+    *,
+    paths: dict[str, Path],
+    outputs: Any,
+    cropped_wavelet: Any,
+    corr: float,
+    nmae: float,
+    synthetic_scale: float,
+    title_prefix: str,
+    horizon_markers: Sequence[tuple[float, str]] = (),
+) -> None:
+    """Write the identical waveform and wavelet QC used by both sample domains."""
     fig, axes = plot_well_waveform_qc(
         outputs.logset_twt,
         outputs.r,
@@ -1090,17 +1134,10 @@ def _write_qc_figures(
         outputs.dxcorr,
         figsize=(12.0, 7.5),
         title=(
-            f"Auto tie | corr={optimized_corr:.3f}, "
-            f"nmae={optimized_nmae:.3f}, scale={synthetic_scale:.3g}"
+            f"{title_prefix} | corr={corr:.3f}, "
+            f"nmae={nmae:.3f}, scale={synthetic_scale:.3g}"
         ),
-        horizon_markers=(
-            []
-            if target_window is None
-            else [
-                (target_window.top_twt_s, target_window.top_name),
-                (target_window.bottom_twt_s, target_window.bottom_name),
-            ]
-        ),
+        horizon_markers=horizon_markers,
     )
     _save_current_figure(paths["fig_tie"])
 
@@ -1135,10 +1172,9 @@ def _write_depth_extraction_figures(
     prepared: Any,
     outputs: Any,
     wavelet: Any,
-    seismic_norm: np.ndarray,
-    synthetic: np.ndarray,
     corr: float,
     nmae: float,
+    synthetic_scale: float,
 ) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(12.0, 5.5), sharey=True)
     axes[0].plot(prepared.logset_md.Vp.values, prepared.logset_md.basis - float(prepared.report["kb_m"]), lw=0.8)
@@ -1160,35 +1196,15 @@ def _write_depth_extraction_figures(
         ax.grid(True, alpha=0.25)
     _save_current_figure(paths["fig_depth_mapping"])
 
-    twt_ms = np.asarray(outputs.seismic.basis, dtype=np.float64) * 1000.0
-    fig, axes = plt.subplots(1, 3, figsize=(11.0, 5.5), sharey=True)
-    axes[0].plot(outputs.r.values, twt_ms, lw=0.8, color="tab:purple")
-    axes[0].set_xlabel("Reflectivity")
-    axes[1].plot(seismic_norm, twt_ms, lw=0.9, color="black", label="seismic")
-    axes[1].plot(synthetic, twt_ms, lw=0.9, color="tab:red", label="synthetic")
-    axes[1].set_xlabel("Normalized amplitude")
-    axes[1].set_title(f"Extraction QC: corr={corr:.3f}, nmae={nmae:.3f}")
-    axes[1].legend(loc="best")
-    axes[2].plot(seismic_norm - synthetic, twt_ms, lw=0.8, color="tab:gray")
-    axes[2].set_xlabel("Residual")
-    axes[0].invert_yaxis()
-    for ax in axes:
-        ax.grid(True, alpha=0.25)
-    _save_current_figure(paths["fig_tie"])
-
-    fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.5))
-    axes[0].plot(np.asarray(wavelet.basis) * 1000.0, wavelet.values, lw=1.0)
-    axes[0].axvline(0.0, color="black", lw=0.7, alpha=0.5)
-    axes[0].set_xlabel("Time (ms)")
-    axes[0].set_title("Candidate time wavelet")
-    frequency = np.fft.rfftfreq(int(wavelet.size), d=float(wavelet.sampling_rate))
-    spectrum = np.abs(np.fft.rfft(np.asarray(wavelet.values, dtype=np.float64)))
-    axes[1].plot(frequency, spectrum / max(float(spectrum.max()), 1e-12), lw=1.0)
-    axes[1].set_xlabel("Frequency (Hz)")
-    axes[1].set_title("Normalized spectrum")
-    for ax in axes:
-        ax.grid(True, alpha=0.25)
-    _save_current_figure(paths["fig_wavelet"])
+    _write_shared_waveform_and_wavelet_figures(
+        paths=paths,
+        outputs=outputs,
+        cropped_wavelet=wavelet,
+        corr=corr,
+        nmae=nmae,
+        synthetic_scale=synthetic_scale,
+        title_prefix="Pseudo-time wavelet extraction",
+    )
 
     try:
         outputs.plot_optimization_objective(figsize=(6, 3))
@@ -1236,6 +1252,7 @@ def _run_vertical_depth_extraction(
         kb_m=float(plan.kb_m),
         pseudo_dt_s=float(wavelet_extractor.expected_sampling),
         min_tie_samples=int(config["reject"]["min_tie_samples"]),
+        log_gap_policy=str(config["depth_extraction"]["log_gap_policy"]),
     )
     prepared = replace(prepared, report={**prepared.report, "kb_m": float(plan.kb_m)})
     paths = _build_output_paths(output_dir, plan.well_name)
@@ -1303,10 +1320,9 @@ def _run_vertical_depth_extraction(
         prepared=prepared,
         outputs=outputs,
         wavelet=candidate_wavelet,
-        seismic_norm=seismic_norm,
-        synthetic=synthetic,
         corr=extraction_corr,
         nmae=extraction_nmae,
+        synthetic_scale=synthetic_scale,
     )
     result = WellTieResult(
         well_name=plan.well_name,

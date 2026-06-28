@@ -43,6 +43,8 @@ from cup.utils.io import (
     resolve_relative_path,
     sanitize_filename,
 )
+from cup.config.workflow import WorkflowConfig
+from cup.seismic.survey import segy_options_from_config
 
 matplotlib.use("Agg")
 
@@ -71,8 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("experiments/common_depth.yaml"),
-        help="Depth-domain common config YAML.",
+        default=Path("experiments/common/common.yaml"),
+        help="Main workflow config YAML containing wavelet_batch_synthetic_depth.",
     )
     parser.add_argument(
         "--well",
@@ -600,7 +602,13 @@ def main() -> None:
     args = parse_args()
 
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
-    data_root = resolve_relative_path(cfg.get("data_root", "data"), root=REPO_ROOT)
+    workflow = WorkflowConfig.from_mapping(cfg)
+    if workflow.seismic.domain != "depth" or workflow.seismic.depth_basis != "tvdss":
+        raise ValueError(
+            "wavelet_batch_synthetic_depth requires seismic.domain='depth' "
+            "and seismic.depth_basis='tvdss'."
+        )
+    data_root = resolve_relative_path(workflow.data_root, root=REPO_ROOT)
 
     script_cfg = cfg.get("wavelet_batch_synthetic_depth", {})
     if not script_cfg:
@@ -613,8 +621,8 @@ def main() -> None:
 
     las_dir_str = str(script_cfg["las_dir"])
     las_dir = resolve_relative_path(las_dir_str, root=data_root)
-    well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
-    seismic_file = resolve_relative_path(str(cfg["segy"]["file"]), root=data_root)
+    well_heads_file = resolve_relative_path(workflow.assets.well_heads_file, root=data_root)
+    seismic_file = resolve_relative_path(workflow.seismic.file, root=data_root)
     source_auto_tie_dir = REPO_ROOT / str(script_cfg["source_auto_tie_dir"])
     source_well_name = str(script_cfg["source_well_name"])
     wavelet_path = source_auto_tie_dir / f"wavelet_201ms_{source_well_name}.csv"
@@ -634,7 +642,7 @@ def main() -> None:
 
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_root = REPO_ROOT / cfg.get("output_root", "scripts/output")
+        output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
         output_dir = output_root / f"wavelet_batch_synthetic_depth_{timestamp}"
     else:
         output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
@@ -735,14 +743,17 @@ def main() -> None:
 
     well_heads_df = import_well_heads_petrel(well_heads_file)
 
-    segy_cfg = cfg["segy"]
-    segy_options = {
-        "iline": segy_cfg["iline_byte"],
-        "xline": segy_cfg["xline_byte"],
-        "istep": segy_cfg["istep"],
-        "xstep": segy_cfg["xstep"],
-    }
-    survey = open_survey(seismic_file, seismic_type="segy", segy_options=segy_options)
+    seismic_cfg = workflow.seismic.as_dict()
+    segy_options = (
+        segy_options_from_config(seismic_cfg) or None
+        if workflow.seismic.type == "segy"
+        else None
+    )
+    survey = open_survey(
+        seismic_file,
+        seismic_type=workflow.seismic.type,
+        segy_options=segy_options,
+    )
     geometry_depth = survey.describe_geometry(domain="depth")
     modeler = ConvModeler()
 

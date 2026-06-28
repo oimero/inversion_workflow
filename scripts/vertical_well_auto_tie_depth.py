@@ -7,7 +7,7 @@ wavelet to a target length centered at 0 ms with L2 energy normalization.
 Usage::
 
     python scripts/vertical_well_auto_tie_depth.py --well NW11
-    python scripts/vertical_well_auto_tie_depth.py --config experiments/common_depth.yaml --well NW11
+    python scripts/vertical_well_auto_tie_depth.py --config experiments/common/common.yaml --well NW11
 """
 
 from __future__ import annotations
@@ -35,6 +35,8 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cup.config.workflow import WorkflowConfig
+from cup.seismic.survey import segy_options_from_config
 from cup.utils.io import load_yaml_config, resolve_relative_path, sanitize_filename
 
 if TYPE_CHECKING:
@@ -68,8 +70,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("experiments/common_depth.yaml"),
-        help="Depth-domain common config YAML.",
+        default=Path("experiments/common/common.yaml"),
+        help="Main workflow config YAML containing vertical_well_auto_tie_depth.",
     )
     parser.add_argument(
         "--well",
@@ -605,7 +607,13 @@ def main() -> None:
     args = parse_args()
 
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
-    data_root = resolve_relative_path(cfg.get("data_root", "data"), root=REPO_ROOT)
+    workflow = WorkflowConfig.from_mapping(cfg)
+    if workflow.seismic.domain != "depth" or workflow.seismic.depth_basis != "tvdss":
+        raise ValueError(
+            "vertical_well_auto_tie_depth requires seismic.domain='depth' "
+            "and seismic.depth_basis='tvdss'."
+        )
+    data_root = resolve_relative_path(workflow.data_root, root=REPO_ROOT)
 
     script_cfg = cfg.get("vertical_well_auto_tie_depth", {})
     if not script_cfg:
@@ -625,8 +633,8 @@ def main() -> None:
     if not las_file.exists():
         raise FileNotFoundError(f"LAS file not found: {las_file}")
 
-    well_heads_file = resolve_relative_path(str(cfg["well"]["well_heads_file"]), root=data_root)
-    seismic_file = resolve_relative_path(str(cfg["segy"]["file"]), root=data_root)
+    well_heads_file = resolve_relative_path(workflow.assets.well_heads_file, root=data_root)
+    seismic_file = resolve_relative_path(workflow.seismic.file, root=data_root)
     tutorial_model = resolve_relative_path(str(script_cfg["tutorial_model"]), root=data_root)
     tutorial_params = resolve_relative_path(str(script_cfg["tutorial_params"]), root=data_root)
 
@@ -637,7 +645,7 @@ def main() -> None:
     # Output dir
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_root = REPO_ROOT / cfg.get("output_root", "scripts/output")
+        output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
         output_dir = output_root / f"vertical_well_auto_tie_depth_{timestamp}"
     else:
         output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
@@ -659,13 +667,12 @@ def main() -> None:
 
     # ── Well head lookup ──
 
-    segy_cfg = cfg["segy"]
-    segy_options = {
-        "iline": segy_cfg["iline_byte"],
-        "xline": segy_cfg["xline_byte"],
-        "istep": segy_cfg["istep"],
-        "xstep": segy_cfg["xstep"],
-    }
+    seismic_cfg = workflow.seismic.as_dict()
+    segy_options = (
+        segy_options_from_config(seismic_cfg) or None
+        if workflow.seismic.type == "segy"
+        else None
+    )
 
     # Column names are fixed by import_well_heads_petrel:
     # Name, Surface X, Surface Y, Well datum value, ...
@@ -689,7 +696,11 @@ def main() -> None:
 
     # ── Survey ──
 
-    survey = open_survey(seismic_file, seismic_type="segy", segy_options=segy_options)
+    survey = open_survey(
+        seismic_file,
+        seismic_type=workflow.seismic.type,
+        segy_options=segy_options,
+    )
     geometry_depth = survey.describe_geometry(domain="depth")
     il_float, xl_float = survey.line_geometry.coord_to_line(well_x, well_y)
     if not (geometry_depth["inline_min"] <= il_float <= geometry_depth["inline_max"]):

@@ -787,6 +787,14 @@ def _build_las_from_well_data(
     las.well["NULL"].value = float(null_value)
 
     basis = _extract_basis(well_data)
+    if basis.size < 2 or np.any(~np.isfinite(basis)) or np.any(np.diff(basis) <= 0.0):
+        raise ValueError("LAS export MD basis must be finite and strictly increasing.")
+    basis_step = float(np.median(np.diff(basis)))
+    if not np.allclose(np.diff(basis), basis_step, rtol=1e-5, atol=1e-8):
+        raise ValueError("LAS export MD basis must be regularly sampled.")
+    las.well["STRT"].value = float(basis[0])
+    las.well["STOP"].value = float(basis[-1])
+    las.well["STEP"].value = basis_step
     las.append_curve(index_mnemonic, basis, unit=index_unit, descr=index_description)
 
     for curve_name in selected_curve_names:

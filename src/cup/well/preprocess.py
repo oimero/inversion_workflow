@@ -144,6 +144,154 @@ class WellCurveSet:
         return WellCurveSet(well_name=self.well_name, logs=logs, source_las=self.source_las)
 
 
+@dataclass(frozen=True)
+class MdRegularizationResult:
+    """A regular-MD curve set plus well- and curve-level audit records."""
+
+    curve_set: WellCurveSet
+    report: Mapping[str, Any]
+    curve_reports: Mapping[str, Mapping[str, Any]]
+
+
+def _is_regular_axis(values: np.ndarray) -> tuple[bool, float]:
+    diffs = np.diff(values)
+    step = float(np.median(diffs))
+    return bool(np.allclose(diffs, step, rtol=1e-5, atol=1e-8)), step
+
+
+def _interpolate_without_crossing_long_gaps(
+    source_md: np.ndarray,
+    source_values: np.ndarray,
+    target_md: np.ndarray,
+    *,
+    max_gap_m: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    values = np.asarray(source_values, dtype=np.float64)
+    valid_indices = np.flatnonzero(np.isfinite(values))
+    output = np.full(target_md.shape, np.nan, dtype=np.float64)
+    long_gap_count = 0
+    supported_interval_count = 0
+    tolerance = max(1e-9, max_gap_m * 1e-9)
+
+    for left_index, right_index in zip(valid_indices[:-1], valid_indices[1:]):
+        left_md = float(source_md[left_index])
+        right_md = float(source_md[right_index])
+        gap_m = right_md - left_md
+        if gap_m > max_gap_m + tolerance:
+            long_gap_count += 1
+            continue
+        supported_interval_count += 1
+        mask = (target_md >= left_md - tolerance) & (target_md <= right_md + tolerance)
+        if np.any(mask):
+            output[mask] = np.interp(
+                target_md[mask],
+                [left_md, right_md],
+                [float(values[left_index]), float(values[right_index])],
+            )
+
+    if valid_indices.size == 1:
+        nearest = int(np.argmin(np.abs(target_md - source_md[valid_indices[0]])))
+        if abs(float(target_md[nearest] - source_md[valid_indices[0]])) <= tolerance:
+            output[nearest] = float(values[valid_indices[0]])
+
+    exact_source = np.zeros(target_md.shape, dtype=bool)
+    for source_index in valid_indices:
+        exact_source |= np.isclose(target_md, source_md[source_index], rtol=0.0, atol=tolerance)
+    finite_output = np.isfinite(output)
+    return output, {
+        "input_valid_count": int(valid_indices.size),
+        "output_valid_count": int(np.count_nonzero(finite_output)),
+        "interpolated_sample_count": int(np.count_nonzero(finite_output & ~exact_source)),
+        "preserved_null_sample_count": int(np.count_nonzero(~finite_output)),
+        "supported_interval_count": int(supported_interval_count),
+        "long_gap_count": int(long_gap_count),
+    }
+
+
+def regularize_md_curve_set(
+    curve_set: WellCurveSet,
+    *,
+    step_m: float,
+    max_interpolation_gap_m: float,
+) -> MdRegularizationResult:
+    """Resample a shared irregular MD axis without bridging long data gaps.
+
+    The output grid starts at the first input MD sample and advances by the
+    explicitly configured ``step_m``. Interpolation is only allowed between
+    adjacent finite source samples whose MD separation does not exceed
+    ``max_interpolation_gap_m``.
+    """
+    source_md = np.asarray(curve_set.basis, dtype=np.float64)
+    if source_md.size < 2 or np.any(~np.isfinite(source_md)) or np.any(np.diff(source_md) <= 0.0):
+        raise ValueError("Input MD basis must be finite and strictly increasing.")
+    step = float(step_m)
+    max_gap = float(max_interpolation_gap_m)
+    if not np.isfinite(step) or step <= 0.0:
+        raise ValueError("md_resampling.step_m must be finite and positive.")
+    if not np.isfinite(max_gap) or max_gap < step:
+        raise ValueError("md_resampling.max_interpolation_gap_m must be finite and >= step_m.")
+
+    span = float(source_md[-1] - source_md[0])
+    output_count = int(np.floor(span / step + 1e-9)) + 1
+    if output_count < 2:
+        raise ValueError("Regularized MD basis would contain fewer than two samples.")
+    target_md = float(source_md[0]) + np.arange(output_count, dtype=np.float64) * step
+    if target_md[-1] > source_md[-1] + max(1e-8, step * 1e-8):
+        raise RuntimeError("Regularized MD basis exceeds the input support.")
+
+    original_regular, original_median_step = _is_regular_axis(source_md)
+    output_regular, output_median_step = _is_regular_axis(target_md)
+    if not output_regular or not np.isclose(output_median_step, step, rtol=1e-5, atol=1e-8):
+        raise RuntimeError("Constructed MD basis is not regularly sampled at step_m.")
+
+    logs: dict[str, grid.Log] = {}
+    curve_reports: dict[str, dict[str, Any]] = {}
+    for name, log in curve_set.logs.items():
+        output_values, curve_report = _interpolate_without_crossing_long_gaps(
+            source_md,
+            np.asarray(log.values, dtype=np.float64),
+            target_md,
+            max_gap_m=max_gap,
+        )
+        logs[name] = grid.Log(
+            output_values,
+            target_md,
+            "md",
+            name=log.name,
+            unit=log.unit,
+            allow_nan=True,
+        )
+        curve_reports[name] = {"standard_mnemonic": name, **curve_report}
+
+    diffs = np.diff(source_md)
+    report = {
+        "well_name": curve_set.well_name,
+        "source_las": curve_set.source_las,
+        "original_sample_count": int(source_md.size),
+        "original_md_start_m": float(source_md[0]),
+        "original_md_end_m": float(source_md[-1]),
+        "original_step_min_m": float(np.min(diffs)),
+        "original_step_median_m": float(original_median_step),
+        "original_step_max_m": float(np.max(diffs)),
+        "original_md_regular": bool(original_regular),
+        "output_sample_count": int(target_md.size),
+        "output_md_start_m": float(target_md[0]),
+        "output_md_end_m": float(target_md[-1]),
+        "output_step_m": float(step),
+        "output_md_regular": True,
+        "max_interpolation_gap_m": float(max_gap),
+    }
+    return MdRegularizationResult(
+        curve_set=WellCurveSet(
+            well_name=curve_set.well_name,
+            logs=logs,
+            source_las=curve_set.source_las,
+        ),
+        report=report,
+        curve_reports=curve_reports,
+    )
+
+
 def validate_shared_basis(logs: Mapping[str, grid.Log]) -> None:
     """校验所有曲线共享同一条 MD 采样轴。"""
     if not logs:

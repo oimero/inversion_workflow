@@ -1,4 +1,4 @@
-"""Preprocess selected LAS logs for the time-domain workflow.
+"""Preprocess selected LAS logs for the seismic workflow.
 
 This script consumes the second workflow step output. It standardizes curve
 mnemonics, converts supported units, removes strict constant runs and outliers,
@@ -49,6 +49,7 @@ from cup.well.preprocess import (
     finite_stats,
     is_curve_usable,
     remove_outliers,
+    regularize_md_curve_set,
     replace_constant_runs,
     standard_mnemonic_for_category,
     standardize_curve_unit,
@@ -120,6 +121,26 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
         {"min_valid_samples": 100, "min_valid_fraction_of_initial": 0.70},
     )
     script_cfg.setdefault("missing_sentinel_values", list(DEFAULT_MISSING_SENTINELS))
+    resampling = script_cfg.get("md_resampling")
+    if not isinstance(resampling, Mapping):
+        raise ValueError("well_preprocess.md_resampling must be explicitly configured.")
+    try:
+        step_m = float(resampling["step_m"])
+        max_gap_m = float(resampling["max_interpolation_gap_m"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "well_preprocess.md_resampling requires numeric step_m and max_interpolation_gap_m."
+        ) from exc
+    if not np.isfinite(step_m) or step_m <= 0.0:
+        raise ValueError("well_preprocess.md_resampling.step_m must be finite and positive.")
+    if not np.isfinite(max_gap_m) or max_gap_m < step_m:
+        raise ValueError(
+            "well_preprocess.md_resampling.max_interpolation_gap_m must be finite and >= step_m."
+        )
+    script_cfg["md_resampling"] = {
+        "step_m": step_m,
+        "max_interpolation_gap_m": max_gap_m,
+    }
     return script_cfg
 
 
@@ -296,7 +317,7 @@ def _build_preprocessed_curve_set(well_name: str, curves: Sequence[CandidateCurv
         logs=logs,
         source_las=str(curves[0].raw.source_las),
     )
-    return with_acoustic_impedance(curve_set)
+    return curve_set
 
 
 # =============================================================================
@@ -451,6 +472,7 @@ def run_preprocess(
     mapping_rows: list[dict[str, Any]] = []
     unit_report_rows: list[dict[str, Any]] = []
     unit_qc_rows: list[dict[str, Any]] = []
+    md_resampling_rows: list[dict[str, Any]] = []
     reselection_rows: list[dict[str, Any]] = []
     skipped_well_rows: list[dict[str, Any]] = []
     skipped_curve_rows: list[dict[str, Any]] = []
@@ -619,12 +641,37 @@ def run_preprocess(
         reasons = [f"missing_final_{category}" for category in missing_required]
         status = "passed" if not missing_required else "failed"
         preprocessed_las = ""
+        md_resampling_report: dict[str, Any] = {}
         final_curves = [final_by_category[category] for category in selected_categories if category in final_by_category]
         if status == "passed" and final_curves:
             first = final_curves[0].raw
             output_las = output_las_dir / f"{sanitize_filename(well_name)}.las"
             try:
-                curve_set = _build_preprocessed_curve_set(well_name, final_curves)
+                irregular_curve_set = _build_preprocessed_curve_set(well_name, final_curves)
+                resampling_cfg = dict(config["md_resampling"])
+                regularized = regularize_md_curve_set(
+                    irregular_curve_set,
+                    step_m=float(resampling_cfg["step_m"]),
+                    max_interpolation_gap_m=float(resampling_cfg["max_interpolation_gap_m"]),
+                )
+                md_resampling_report = dict(regularized.report)
+                for standard_mnemonic, curve_report in regularized.curve_reports.items():
+                    md_resampling_rows.append(
+                        {
+                            **md_resampling_report,
+                            "standard_mnemonic": standard_mnemonic,
+                            **dict(curve_report),
+                        }
+                    )
+                curve_set = with_acoustic_impedance(regularized.curve_set)
+                for category in required_categories:
+                    mnemonic = standard_mnemonic_for_category(category)
+                    output_valid_count = int(np.count_nonzero(np.isfinite(curve_set.require(mnemonic).values)))
+                    if output_valid_count < min_valid_samples:
+                        raise ValueError(
+                            f"Regularized required curve {mnemonic} has too few valid samples: "
+                            f"{output_valid_count} < {min_valid_samples}."
+                        )
                 export_logset_to_las(
                     well_name,
                     curve_set,
@@ -651,6 +698,13 @@ def run_preprocess(
                 "final_density": final_by_category.get("density").standard_mnemonic if "density" in final_by_category else "",
                 "final_caliper": final_by_category.get("caliper").standard_mnemonic if "caliper" in final_by_category else "",
                 "preprocessed_las": preprocessed_las,
+                "md_original_sample_count": md_resampling_report.get("original_sample_count"),
+                "md_original_step_median_m": md_resampling_report.get("original_step_median_m"),
+                "md_original_regular": md_resampling_report.get("original_md_regular"),
+                "md_output_sample_count": md_resampling_report.get("output_sample_count"),
+                "md_output_step_m": md_resampling_report.get("output_step_m"),
+                "md_output_regular": md_resampling_report.get("output_md_regular"),
+                "md_max_interpolation_gap_m": md_resampling_report.get("max_interpolation_gap_m"),
                 "reasons": ";".join(reasons),
             }
         )
@@ -661,6 +715,7 @@ def run_preprocess(
         "mnemonic_mapping_csv": output_dir / "mnemonic_mapping.csv",
         "unit_conversion_report_csv": output_dir / "unit_conversion_report.csv",
         "unit_mismatch_qc_csv": output_dir / "unit_mismatch_qc.csv",
+        "md_resampling_report_csv": output_dir / "md_resampling_report.csv",
         "primary_reselection_report_csv": output_dir / "primary_reselection_report.csv",
         "constant_run_report_csv": output_dir / "constant_run_report.csv",
         "outlier_report_csv": output_dir / "outlier_report.csv",
@@ -675,6 +730,7 @@ def run_preprocess(
     _write_csv(paths["mnemonic_mapping_csv"], mapping_rows)
     _write_csv(paths["unit_conversion_report_csv"], unit_report_rows)
     _write_csv(paths["unit_mismatch_qc_csv"], unit_qc_rows)
+    _write_csv(paths["md_resampling_report_csv"], md_resampling_rows)
     _write_csv(paths["primary_reselection_report_csv"], reselection_rows)
     _write_csv(paths["constant_run_report_csv"], constant_run_rows)
     _write_csv(paths["outlier_report_csv"], outlier_rows)
@@ -715,6 +771,10 @@ def run_preprocess(
         "exported_las_count": int((status_df["preprocessed_las"].astype(str) != "").sum()) if not status_df.empty else 0,
         "unit_hard_fail_count": int(sum(1 for row in unit_report_rows if row.get("hard_fail_reason"))),
         "unit_qc_count": int(len(unit_qc_rows)),
+        "md_resampling": dict(config["md_resampling"]),
+        "md_resampled_well_count": int(
+            len({str(row["well_name"]) for row in md_resampling_rows})
+        ),
         "constant_run_count": int(len(constant_run_rows)),
         "outlier_replaced_points": int(sum(int(row.get("replaced_points", 0) or 0) for row in outlier_rows)),
         "primary_reselection_count": int(len(reselection_rows)),

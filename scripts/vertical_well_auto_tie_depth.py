@@ -628,7 +628,7 @@ def main() -> None:
     las_rho_unit = str(script_cfg.get("las_rho_unit", "g/cm3"))
 
     # Resolve paths
-    las_dir = resolve_relative_path(str(script_cfg["las_dir"]), root=data_root)
+    las_dir = resolve_relative_path(str(script_cfg["las_dir"]), root=REPO_ROOT)
     las_file = las_dir / f"{well_name}.las"
     if not las_file.exists():
         raise FileNotFoundError(f"LAS file not found: {las_file}")

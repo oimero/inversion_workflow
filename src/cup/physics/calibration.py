@@ -1,8 +1,9 @@
 """Domain-independent frozen AI--Vp relation values.
 
-The robust multi-well fit and workflow artifact writer belong to the planned
-rock-physics step.  This module defines the strict relation object consumed by
-forward callers without performing file discovery or unit conversion.
+Robust fitting lives in :mod:`cup.physics.rock_physics`; workflow discovery
+and artifact writing live in ``scripts/rock_physics_analysis.py``.  This module
+defines the strict relation value consumed by forward callers without file
+discovery or unit conversion.
 """
 
 from __future__ import annotations
@@ -11,8 +12,8 @@ from dataclasses import dataclass
 import math
 from typing import Any, Mapping
 
-from cup.forward.numpy_backend import ai_from_velocity as _ai_from_velocity
-from cup.forward.numpy_backend import velocity_from_ai as _velocity_from_ai
+from cup.physics.numpy_backend import ai_from_velocity as _ai_from_velocity
+from cup.physics.numpy_backend import velocity_from_ai as _velocity_from_ai
 
 
 AI_UNIT = "m/s*g/cm3"

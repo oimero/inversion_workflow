@@ -193,6 +193,22 @@
 | `spatial_cluster_id` | 跨井证据去偏使用的空间簇 |
 | `spatial_cluster_size` | 当前簇井数，仅作 QC |
 
+## 06 · rock_physics_analysis.py
+
+### `well_input_inventory.csv`
+
+始终生成；每个 Step 3 状态行一行。关键字段为 `well_id`、
+`preprocess_status`、`selected_for_input`、`las_path`、`las_sha256`、
+`read_status`、`curve_names`、`curve_units` 和 `reasons`。只有
+`preprocess_status=passed` 的 LAS 会读取；其中任一缺失、损坏或路径重复会使整步失败。
+
+### `modules/ai_vp_linear/well_fit_qc.csv`
+
+每个 passed 候选井一行。`module_status` 为 `accepted` 或 `rejected`，
+`reasons` 保存唯一拒绝原因。Vp 字段使用 `*_mps`，AI 与残差字段使用
+`*_mps_gcc`；`well_total_weight` 是等井基础权重，
+`well_effective_weight` 是 Huber 降权后的实际权重。
+
 ## 旁路 · forward_observability.py
 
 所有表使用 schema `forward_observability_v1`。上游来源可从配置显式指定，也可自动发现最新合格产物。

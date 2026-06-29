@@ -8,7 +8,7 @@ flowchart TB
     end
 
     prod --> FO["旁路 · forward_observability"]
-    S5 --> S6["06 · rock_physics_analysis"]
+    S3 --> S6["06 · rock_physics_analysis"]
 
     S1 -.-> S7["07 · real_field_lfm"]
     S4 -.-> S7
@@ -30,9 +30,14 @@ flowchart TB
 |------|---------|
 | 01–05 + well_trajectory | `experiments/common/common.yaml` |
 | 旁路 · forward_observability | `experiments/common/common.yaml` |
-| 06 · rock_physics_analysis | 规划中，契约见 `docs/spec/DEPTH_DOMAIN_FORWARD_REFACTOR.md` |
+| 06 · rock_physics_analysis | `experiments/common/common.yaml` |
 | 旁路 · synthoseis_lite | `experiments/synthoseis_lite/synthoseis_lite.yaml` |
 | 旁路 · ginn_v2 | `experiments/ginn_v2/train.yaml` |
 | 07 · real_field_lfm | `experiments/common/common.yaml` |
 | 08 R0 · real_field_zero_shot | `experiments/common/common.yaml` |
 | 08 R1 · real_field_forward_diagnostic | `experiments/common/common.yaml` |
+
+## 第六步
+
+模块化岩石物理分析的运行方式与产物契约见
+[06 岩石物理分析](guide/6-rock-physics-analysis.md)。

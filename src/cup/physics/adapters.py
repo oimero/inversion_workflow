@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from cup.forward.numpy_backend import forward_depth, forward_time
+from cup.physics.numpy_backend import forward_depth, forward_time
 
 
 def _require_trace(trace: Any, *, name: str) -> None:

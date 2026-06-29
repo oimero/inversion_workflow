@@ -55,6 +55,7 @@ nav:
       - 旁路 井轨迹 QC: guide/well-trajectory.md
       - 04 井震自动标定: guide/4-well-auto-tie.md
       - 05 全局子波生成: guide/5-wavelet-generation.md
+      - 06 岩石物理分析: guide/6-rock-physics-analysis.md
       - 旁路 正演可观测性分析: guide/forward-observability.md
       - 旁路 合成基准生成与评估: guide/synthoseis-lite-benchmark.md
       - 旁路 模型消融训练与评估: guide/ginn-v2-ablation.md
@@ -66,7 +67,7 @@ nav:
       - cup:
           - 命名空间总览: api/cup/index.md
           - cup.config: api/cup/config.md
-          - cup.forward: api/cup/forward.md
+          - cup.physics: api/cup/physics.md
           - cup.petrel: api/cup/petrel.md
           - cup.seismic: api/cup/seismic.md
           - cup.well: api/cup/well.md

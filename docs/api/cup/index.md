@@ -6,6 +6,6 @@
 
 - `cup.petrel`
 - `cup.config`
-- `cup.forward`
+- `cup.physics`
 - `cup.seismic`
 - `cup.well`

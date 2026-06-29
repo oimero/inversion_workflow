@@ -620,7 +620,7 @@ def main() -> None:
     # ── Resolve input paths ──
 
     las_dir_str = str(script_cfg["las_dir"])
-    las_dir = resolve_relative_path(las_dir_str, root=data_root)
+    las_dir = resolve_relative_path(las_dir_str, root=REPO_ROOT)
     well_heads_file = resolve_relative_path(workflow.assets.well_heads_file, root=data_root)
     seismic_file = resolve_relative_path(workflow.seismic.file, root=data_root)
     source_auto_tie_dir = REPO_ROOT / str(script_cfg["source_auto_tie_dir"])

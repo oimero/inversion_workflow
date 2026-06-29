@@ -15,7 +15,7 @@ import pandas as pd
 from scipy.signal import hilbert
 from scipy.signal.windows import tukey
 
-from cup.forward.numpy_backend import forward_time
+from cup.physics.numpy_backend import forward_time
 
 
 FFT_CONVENTION = "numpy_forward_exp_minus_i_2pi_kn_over_n"

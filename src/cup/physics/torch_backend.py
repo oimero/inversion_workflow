@@ -1,7 +1,7 @@
 """Strict differentiable PyTorch acoustic forward models.
 
 Import this module explicitly when PyTorch support is needed.  The package
-``cup.forward`` does not import PyTorch at module import time.
+``cup.physics`` does not import PyTorch at module import time.
 """
 
 from __future__ import annotations

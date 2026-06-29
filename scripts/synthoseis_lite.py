@@ -6,8 +6,8 @@ Usage::
     python scripts/synthoseis_lite.py --config <file> generate \
         --suite field_conditioned --impedance-calibration <file>
 
-Composed v2 configurations implement the depth/TVDSS field-conditioned branch.
-Uncomposed legacy configurations retain the historical time-domain v1 branch.
+The ``synthoseis_lite.sample_domain`` and ``benchmark_schema`` keys explicitly
+select the time-v1 or depth-v2 branch.
 """
 
 from __future__ import annotations
@@ -30,16 +30,20 @@ from cup.synthetic.workflow import (
     run_calibration,
     run_generation,
 )
-from cup.synthetic.v2_calibration import run_depth_calibration
-from cup.synthetic.v2_config import (
+from cup.synthetic.depth.calibration import run_depth_calibration
+from cup.synthetic.depth.config import (
     load_composed_config,
     parse_depth_v2_config,
     resolve_depth_v2_sources,
 )
-from cup.synthetic.v2_generation import run_depth_generation
+from cup.synthetic.depth.generation import run_depth_generation
 from cup.config.workflow import WorkflowConfig
 from cup.config.sources import load_summary, resolve_source_run
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path
+
+
+TIME_SCHEMA = "synthoseis_lite_v1"
+DEPTH_SCHEMA = "synthoseis_lite_v2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,11 +123,31 @@ def _prepare_synthoseis_config(raw: dict, workflow: WorkflowConfig) -> dict:
     return prepared
 
 
+def _dispatch_keys(raw: dict) -> tuple[str, str]:
+    root = raw.get("synthoseis_lite")
+    if not isinstance(root, dict):
+        raise ValueError("Configuration must contain a synthoseis_lite mapping.")
+    sample_domain = str(root.get("sample_domain") or "").casefold()
+    benchmark_schema = str(root.get("benchmark_schema") or "")
+    if not sample_domain or not benchmark_schema:
+        raise ValueError(
+            "synthoseis_lite.sample_domain and synthoseis_lite.benchmark_schema "
+            "must explicitly select the Synthoseis branch."
+        )
+    return sample_domain, benchmark_schema
+
+
 def main() -> None:
     args = parse_args()
     config_path = resolve_relative_path(args.config, root=REPO_ROOT)
     experiment_raw = load_yaml_config(config_path)
-    if isinstance(experiment_raw, dict) and "workflow_config" in experiment_raw:
+    if not isinstance(experiment_raw, dict):
+        raise ValueError("Synthoseis-lite config root must be a mapping.")
+    sample_domain, benchmark_schema = _dispatch_keys(experiment_raw)
+
+    if (sample_domain, benchmark_schema) == ("depth", DEPTH_SCHEMA):
+        if "workflow_config" not in experiment_raw:
+            raise ValueError("Depth Synthoseis-lite v2 requires workflow_config.")
         raw, workflow, config_provenance = load_composed_config(config_path, repo_root=REPO_ROOT)
         if workflow.seismic.domain != "depth":
             raise ValueError("Composed Synthoseis-lite v2 currently implements the depth branch only.")
@@ -159,6 +183,13 @@ def main() -> None:
         print(f"Output: {output_dir}")
         print(f"Status: {summary.get('status', 'success')}")
         return
+    if (sample_domain, benchmark_schema) != ("time", TIME_SCHEMA):
+        raise ValueError(
+            "Unsupported Synthoseis-lite dispatch: "
+            f"sample_domain={sample_domain!r}, benchmark_schema={benchmark_schema!r}."
+        )
+    if "workflow_config" in experiment_raw:
+        raise ValueError("Time-domain Synthoseis-lite v1 currently expects a direct workflow config, not workflow_config composition.")
 
     raw = experiment_raw
     workflow = WorkflowConfig.from_mapping(raw)

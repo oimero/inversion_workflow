@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -16,21 +15,19 @@ import pandas as pd
 from cup.petrel.load import import_interpretation_petrel, import_well_tops_petrel
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
-from cup.synthetic.calibration import ImpedanceCalibration, WellZoneCurves, calibrate_impedance
-from cup.synthetic.v2_config import CALIBRATION_SCHEMA, GENERATOR_FAMILY
+from cup.synthetic.depth.config import CALIBRATION_SCHEMA, GENERATOR_FAMILY
+from cup.synthetic.depth.object_core_adapter import (
+    calibrate_depth_object_core,
+    depth_frame_from_object_core,
+    depth_payload_from_object_core_calibration,
+    depth_well_zone_curves_for_object_core,
+    load_depth_calibration_for_object_core,
+)
 from cup.utils.io import repo_relative_path, resolve_relative_path, sha256_file, write_json
 from cup.utils.statistics import radius_connected_components
 from cup.well.assets import normalize_well_name
 from cup.well.las import read_las_curve
 from cup.well.td import find_well_top_md
-
-
-def _json(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        value = json.load(handle)
-    if not isinstance(value, dict):
-        raise ValueError(f"Expected JSON object: {path}")
-    return value
 
 
 def _verify_file(path_value: Any, digest: Any, *, repo_root: Path, label: str) -> Path:
@@ -161,71 +158,7 @@ def _survey_and_target_zone(
     return survey, zone, paths
 
 
-def _rename_depth_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    return frame.rename(columns={
-        "twt_s": "tvdss_m",
-        "zone_duration_s": "zone_thickness_m",
-        "minimum_duration_s": "minimum_thickness_m",
-        "maximum_duration_s": "maximum_thickness_m",
-        "object_top_s": "object_top_tvdss_m",
-        "object_bottom_s": "object_bottom_tvdss_m",
-    })
-
-
-def _depth_payload(legacy: ImpedanceCalibration, *, extra: Mapping[str, Any]) -> dict[str, Any]:
-    payload = legacy.to_dict()
-    payload["schema_version"] = CALIBRATION_SCHEMA
-    payload["generator_family"] = GENERATOR_FAMILY
-    payload["truth_dz_m"] = float(payload.pop("truth_dt_s"))
-    payload["sample_domain"] = "depth"
-    payload["depth_basis"] = "tvdss"
-    payload["vertical_axis_unit"] = "m"
-    for model in payload["zone_models"].values():
-        background = model["background"]
-        if "zone_duration_s" in background:
-            background["zone_thickness_m"] = background.pop("zone_duration_s")
-    per_zone = {
-        zone_id: {
-            "minimum": float(model["ai_bounds"]["p01"]),
-            "maximum": float(model["ai_bounds"]["p99"]),
-        }
-        for zone_id, model in payload["zone_models"].items()
-    }
-    payload["generation_log_ai_bounds"] = {
-        "per_zone": per_zone,
-        "global": {
-            "minimum": min(item["minimum"] for item in per_zone.values()),
-            "maximum": max(item["maximum"] for item in per_zone.values()),
-        },
-    }
-    payload.update(dict(extra))
-    return payload
-
-
-def load_depth_calibration_as_legacy(path: Path) -> tuple[ImpedanceCalibration, dict[str, Any]]:
-    """Load v2 storage and adapt only the domain-neutral object core."""
-    payload = _json(path)
-    if payload.get("schema_version") != CALIBRATION_SCHEMA:
-        raise ValueError(f"Expected {CALIBRATION_SCHEMA}, got {payload.get('schema_version')}.")
-    legacy = dict(payload)
-    legacy["truth_dt_s"] = float(legacy.pop("truth_dz_m"))
-    for model in legacy["zone_models"].values():
-        background = model["background"]
-        if "zone_thickness_m" in background:
-            background["zone_duration_s"] = background.pop("zone_thickness_m")
-    adapter = ImpedanceCalibration(
-        schema_version=CALIBRATION_SCHEMA,
-        generator_family=GENERATOR_FAMILY,
-        truth_dt_s=float(legacy["truth_dt_s"]),
-        state_threshold_sigma=float(legacy["state_threshold_sigma"]),
-        ordered_horizons=tuple(legacy["ordered_horizons"]),
-        zones=tuple(legacy["zones"]),
-        parent=dict(legacy["parent"]),
-        zone_models=dict(legacy["zone_models"]),
-        source_runs=dict(legacy["source_runs"]),
-        source_hashes=dict(legacy["source_hashes"]),
-    )
-    return adapter, payload
+load_depth_calibration_as_legacy = load_depth_calibration_for_object_core
 
 
 def run_depth_calibration(
@@ -387,17 +320,17 @@ def run_depth_calibration(
             fitted, weights, metrics = _huber_background(
                 zeta, observed, delta_sigma=float(script_cfg["calibration"]["huber_delta_sigma"])
             )
-            inputs.append(WellZoneCurves(
+            inputs.append(depth_well_zone_curves_for_object_core(
                 well_name=well_name,
                 spatial_cluster_id=cluster_by_well[well_name],
                 zone_id=zone_id,
                 top_horizon=top_name,
                 bottom_horizon=bottom_name,
-                twt_s=zone_centers,
-                filtered_log_ai=fitted,
-                full_log_ai=observed,
-                zone_top_s=top,
-                zone_bottom_s=bottom,
+                tvdss_m=zone_centers,
+                fitted_log_ai=fitted,
+                observed_log_ai=observed,
+                zone_top_tvdss_m=top,
+                zone_bottom_tvdss_m=bottom,
             ))
             accepted_zones += 1
             zone_status.append({"well_name": well_name, "zone_id": zone_id, "status": "ok", "n_valid_cells": n_valid, "reason": ""})
@@ -420,15 +353,15 @@ def run_depth_calibration(
         **{f"horizon:{name}": sha256_file(path) for name, path in horizon_paths.items()},
         **{f"las:{item['well_id']}": str(item["sha256"]) for item in forward_inputs["source_preprocessed_las"]},
     }
-    legacy, objects, qc, samples, backgrounds, profile_samples = calibrate_impedance(
+    legacy, objects, qc, samples, backgrounds, profile_samples = calibrate_depth_object_core(
         inputs,
-        truth_dt_s=truth_dz,
+        truth_dz_m=truth_dz,
         ordered_horizons=[item["name"] for item in script_cfg["horizons"]],
         source_runs={key: repo_relative_path(path, root=repo_root) for key, path in sources.items()},
         source_hashes=source_hashes,
         state_threshold_sigma=float(script_cfg["impedance"]["state_threshold_sigma"]),
     )
-    payload = _depth_payload(legacy, extra={
+    payload = depth_payload_from_object_core_calibration(legacy, extra={
         "background_estimator": "per_well_zone_huber",
         "background_huber_delta_sigma": float(script_cfg["calibration"]["huber_delta_sigma"]),
         "horizon_contract": list(script_cfg["horizons"]),
@@ -448,11 +381,11 @@ def run_depth_calibration(
         "well_status.csv": pd.DataFrame.from_records(well_status),
         "well_zone_status.csv": pd.DataFrame.from_records(zone_status),
         "well_horizon_consistency.csv": pd.DataFrame.from_records(horizon_audit),
-        "well_calibration_samples.csv": _rename_depth_frame(samples),
+        "well_calibration_samples.csv": depth_frame_from_object_core(samples),
         "well_background_fits.csv": pd.DataFrame.from_records(background_qc),
         "well_background_samples.csv": pd.DataFrame.from_records(background_samples),
-        "well_object_catalog.csv": _rename_depth_frame(objects),
-        "well_object_profile_samples.csv": _rename_depth_frame(profile_samples),
+        "well_object_catalog.csv": depth_frame_from_object_core(objects),
+        "well_object_profile_samples.csv": depth_frame_from_object_core(profile_samples),
         "calibration_qc.csv": qc,
     }
     for name, frame in frames.items():

@@ -102,11 +102,16 @@ def load_composed_config(
 def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     root = _mapping(config.get("synthoseis_lite"), path="synthoseis_lite")
     allowed_root = {
-        "global_seed", "source_runs", "sampling", "geometry", "sections",
+        "sample_domain", "benchmark_schema", "global_seed", "source_runs", "sampling", "geometry", "sections",
         "calibration", "impedance_attribute_generator", "generation", "splits",
         "lfm", "seismic_mismatch", "canonical", "probe_selection", "figures",
     }
     _reject_unknown(root, allowed_root, path="synthoseis_lite")
+    if str(root.get("sample_domain") or "").casefold() != "depth" or str(root.get("benchmark_schema") or "") != SCHEMA_VERSION:
+        raise ValueError(
+            "Depth Synthoseis-lite v2 requires "
+            f"synthoseis_lite.sample_domain='depth' and benchmark_schema={SCHEMA_VERSION!r}."
+        )
     seismic = _mapping(config.get("seismic"), path="seismic")
     if str(seismic.get("domain", "")).casefold() != "depth":
         raise ValueError("Depth Synthoseis v2 requires seismic.domain='depth'.")
@@ -214,18 +219,12 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("generation acceptance fractions must satisfy 0 <= failure < warning <= 1.")
 
     splits = _mapping(root.get("splits"), path="synthoseis_lite.splits")
-    _reject_unknown(splits, {"assignment_unit", "held_out_geometry_family", "non_held_out_ratios"}, path="synthoseis_lite.splits")
+    _reject_unknown(splits, {"assignment_unit", "held_out_geometry_family"}, path="synthoseis_lite.splits")
     if splits.get("assignment_unit") != "parent_realization":
         raise ValueError("splits.assignment_unit must be parent_realization.")
     held_out = str(splits.get("held_out_geometry_family") or "")
     if held_out not in geometry_families:
         raise ValueError("held_out_geometry_family must be one configured geometry family.")
-    ratios = _mapping(splits.get("non_held_out_ratios"), path="splits.non_held_out_ratios")
-    if set(ratios) != {"train", "validation", "test"}:
-        raise ValueError("non_held_out_ratios must define train, validation and test.")
-    parsed_ratios = {key: float(value) for key, value in ratios.items()}
-    if any(value <= 0.0 for value in parsed_ratios.values()) or not np.isclose(sum(parsed_ratios.values()), 1.0):
-        raise ValueError("non_held_out_ratios must be positive and sum to one.")
 
     lfm = _mapping(root.get("lfm"), path="synthoseis_lite.lfm")
     _reject_unknown(lfm, {"enabled", "ideal", "controlled_degraded"}, path="synthoseis_lite.lfm")
@@ -287,6 +286,8 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
     return {
         "schema": SCHEMA_VERSION,
+        "sample_domain": "depth",
+        "benchmark_schema": SCHEMA_VERSION,
         "global_seed": int(root.get("global_seed")),
         "source_runs": {
             "well_inventory_dir": str(sources.get("well_inventory_dir") or "").strip(),
@@ -303,7 +304,7 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "calibration": {"background_estimator": "per_well_zone_huber", "huber_delta_sigma": _positive_float(calibration.get("huber_delta_sigma"), path="calibration.huber_delta_sigma"), "minimum_valid_cells_per_well_zone": _positive_int(calibration.get("minimum_valid_cells_per_well_zone"), path="calibration.minimum_valid_cells_per_well_zone")},
         "impedance": {"family": GENERATOR_FAMILY, "state_threshold_sigma": _positive_float(impedance.get("state_threshold_sigma"), path="impedance.state_threshold_sigma"), "sensitivity_threshold_sigmas": sensitivity, "minimum_calibration_object_cells": _positive_int(impedance.get("minimum_calibration_object_cells"), path="impedance.minimum_calibration_object_cells"), "minimum_highres_cells": _positive_int(standard_mode.get("minimum_highres_cells"), path="duration_modes.standard.minimum_highres_cells"), "correlation_length_section_fractions": [0.1, 0.3, 1.0], "coefficient_sigma_multipliers": [0.25, 0.50], "thickness_log_sigma_values": [0.10, 0.25], "max_global_reversal_fraction": 0.10, "max_object_reversal_fraction": 0.25, "max_global_clipping_fraction": 0.005, "max_object_clipping_fraction": 0.02},
         "generation": {"attempts_per_scenario": _positive_int(generation.get("attempts_per_scenario"), path="generation.attempts_per_scenario"), "duration_modes": ["standard"], "geometry_families": geometry_families, "geometry_directions": directions, "acceptance_qc": {"minimum_attempts_per_scenario": _positive_int(acceptance.get("minimum_attempts_per_scenario"), path="generation.acceptance_qc.minimum_attempts_per_scenario"), "warning_fraction": warning, "failure_fraction": failure}},
-        "splits": {"assignment_unit": "parent_realization", "held_out_geometry_family": held_out, "non_held_out_ratios": parsed_ratios},
+        "splits": {"assignment_unit": "parent_realization", "held_out_geometry_family": held_out},
         "lfm": parsed_lfm,
         "seismic_mismatch": parsed_mismatch,
         "figures": _mapping(root.get("figures") or {}, path="synthoseis_lite.figures"),

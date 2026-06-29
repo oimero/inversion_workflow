@@ -39,6 +39,13 @@ def _optional_float(value: Mapping[str, Any], key: str) -> float | None:
 
 def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     root = _mapping(config.get("synthoseis_lite"), path="synthoseis_lite")
+    sample_domain = str(root.get("sample_domain") or "").casefold()
+    benchmark_schema = str(root.get("benchmark_schema") or "")
+    if sample_domain != "time" or benchmark_schema != DATA_SCHEMA:
+        raise ValueError(
+            "Time-domain Synthoseis-lite requires "
+            f"synthoseis_lite.sample_domain='time' and benchmark_schema={DATA_SCHEMA!r}."
+        )
     sources = _mapping(root.get("source_runs"), path="synthoseis_lite.source_runs")
     source_runs = {
         key: _required_text(sources, key, path="synthoseis_lite.source_runs")
@@ -135,6 +142,8 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 _mapping(item, path=f"synthoseis_lite.probe_selection.lateral_shapes[{index}]")
             )
     parsed = {
+        "sample_domain": "time",
+        "benchmark_schema": DATA_SCHEMA,
         "global_seed": int(root.get("global_seed", 20260615)),
         "source_runs": source_runs,
         "sampling": {

@@ -86,17 +86,24 @@ def _row_split(
     split_policy: str,
     validation_fraction: float,
     test_fraction: float,
+    held_out_geometry_family: str = "",
 ) -> str:
     text = _clean_text(row.get("split")).lower()
-    if text in SPLIT_VALUES:
-        return text
     if split_policy == "strict":
+        if text in SPLIT_VALUES:
+            return text
         raise ValueError(
             f"Sample {row.get('sample_id')} has non-training split {text!r}; "
             "use --split-policy derive to create a research split."
         )
     if split_policy != "derive":
         raise ValueError(f"Unsupported split_policy: {split_policy}")
+    evaluation_role = _clean_text(row.get("evaluation_role")).lower()
+    geometry_family = _clean_text(row.get("geometry_family"))
+    if evaluation_role == "geometry_holdout" or (
+        held_out_geometry_family and geometry_family == held_out_geometry_family
+    ):
+        return "test"
     return _derive_split(
         _parent_id(row),
         validation_fraction=validation_fraction,
@@ -170,6 +177,9 @@ def build_patch_index(
         raise ValueError("max_patches is smoke-only and cannot be used when probe sample kinds are indexed.")
     rows: list[dict[str, Any]] = []
     sample_ids = benchmark.sample_ids(kinds=sample_kinds, status="ok")
+    held_out_geometry_family = str(
+        dict(getattr(benchmark, "manifest", {}).get("split_policy") or {}).get("held_out_geometry_family") or ""
+    )
     for sample_id in sample_ids:
         sample = benchmark.load_sample(sample_id)
         target, _, _, valid, raw_twt_offset_samples = _aligned_arrays(sample)
@@ -184,6 +194,7 @@ def build_patch_index(
             split_policy=split_policy,
             validation_fraction=validation_fraction,
             test_fraction=test_fraction,
+            held_out_geometry_family=held_out_geometry_family,
         )
         parent = _parent_id(row)
         for lateral_start in lateral_starts:
@@ -436,15 +447,20 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             lfm_ideal[sl],
             0.0,
         )
-        seismic_model_consistent = np.asarray(sample.seismic_model_consistent, dtype=np.float32)
-        physics_valid = np.asarray(sample.physics_valid_mask, dtype=bool)
-        if seismic_model_consistent.shape != target.shape or physics_valid.shape != target.shape:
-            raise ValueError(f"Physics target/mask shape mismatch for {sample.sample_id}.")
-        physics_seismic_patch = np.where(
-            physics_valid[sl] & np.isfinite(seismic_model_consistent[sl]),
-            seismic_model_consistent[sl],
-            0.0,
-        )
+        if str(getattr(sample, "sample_domain", "")) == "depth":
+            seismic_model_consistent = np.asarray(sample.seismic_model_consistent, dtype=np.float32)
+            physics_valid = np.asarray(sample.physics_valid_mask, dtype=bool)
+            if seismic_model_consistent.shape != target.shape or physics_valid.shape != target.shape:
+                raise ValueError(f"Physics target/mask shape mismatch for {sample.sample_id}.")
+            physics_seismic_patch = np.where(
+                physics_valid[sl] & np.isfinite(seismic_model_consistent[sl]),
+                seismic_model_consistent[sl],
+                0.0,
+            )
+            physics_valid_patch = physics_valid[sl]
+        else:
+            physics_seismic_patch = np.zeros_like(seismic_patch, dtype=np.float32)
+            physics_valid_patch = np.zeros_like(valid_patch, dtype=bool)
         inputs = np.stack(
             [
                 seismic_n,
@@ -464,7 +480,7 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
                 physics_seismic_patch.astype(np.float32)
             )[None, :, :],
             "physics_valid_mask": torch.from_numpy(
-                physics_valid[sl].astype(np.float32)
+                physics_valid_patch.astype(np.float32)
             )[None, :, :],
             "lfm": torch.from_numpy(lfm_patch.astype(np.float32))[None, :, :],
             "lfm_ideal": torch.from_numpy(lfm_ideal_patch.astype(np.float32))[None, :, :],

@@ -20,11 +20,14 @@ from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.wavelet import load_wavelet_csv
 from cup.synthetic.calibration import ImpedanceCalibration
-from cup.synthetic.generation import GenerationRejected, GenerationScenario, generate_field_section
+from cup.synthetic.generation import GenerationRejected, GenerationScenario
 from cup.synthetic.generation_pipeline import generation_scenarios
-from cup.synthetic.random import named_rng, named_seed
-from cup.synthetic.v2_calibration import load_depth_calibration_as_legacy
-from cup.synthetic.v2_config import GENERATOR_FAMILY, SCHEMA_VERSION
+from cup.synthetic.random import named_rng
+from cup.synthetic.depth.config import GENERATOR_FAMILY, SCHEMA_VERSION
+from cup.synthetic.depth.object_core_adapter import (
+    generate_depth_object_core_section,
+    load_depth_calibration_for_object_core,
+)
 from cup.utils.io import array_sha256, repo_relative_path, resolve_relative_path, sha256_file, write_json
 
 
@@ -278,14 +281,6 @@ def _controlled_degraded_lfm(
     return output
 
 
-def _rename_catalog(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    replacements = {
-        "object_top_s": "object_top_tvdss_m", "object_bottom_s": "object_bottom_tvdss_m",
-        "minimum_duration_s": "minimum_thickness_m", "maximum_duration_s": "maximum_thickness_m",
-    }
-    return [{replacements.get(key, key): value for key, value in record.items()} for record in records]
-
-
 def generate_depth_realization(
     calibration: ImpedanceCalibration,
     calibration_payload: Mapping[str, Any],
@@ -311,7 +306,7 @@ def generate_depth_realization(
     halo = np.ceil((0.5 * maximum_vp * wavelet_half_s) / model_dz) * model_dz
     context = float(halo + antialias_half_m)
     survey_axis = np.asarray(survey.sample_axis(domain="depth").values, dtype=np.float64)
-    legacy = generate_field_section(
+    object_core = generate_depth_object_core_section(
         calibration,
         realization_id=realization_id,
         scenario=scenario,
@@ -321,29 +316,26 @@ def generate_depth_realization(
         xline_float=section.xline_float,
         x_m=section.x_m,
         y_m=section.y_m,
-        horizon_twt_s=section.horizon_tvdss_m,
-        output_dt_s=model_dz,
-        wavelet=np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        horizon_tvdss_m=section.horizon_tvdss_m,
+        model_dz_m=model_dz,
         vertical_oversampling_factor=factor,
-        minimum_truth_samples=int(script_cfg["impedance"]["minimum_highres_cells"]),
+        minimum_highres_cells=int(script_cfg["impedance"]["minimum_highres_cells"]),
         max_global_reversal_fraction=float(script_cfg["impedance"]["max_global_reversal_fraction"]),
         max_object_reversal_fraction=float(script_cfg["impedance"]["max_object_reversal_fraction"]),
-        max_global_clipping_fraction=0.0,
-        max_object_clipping_fraction=0.0,
-        vertical_axis_origin=float(survey_axis[0]),
-        context_extent=context,
+        vertical_axis_origin_m=float(survey_axis[0]),
+        context_extent_m=context,
     )
-    if float(legacy.qc.get("global_clipping_fraction", 0.0)) != 0.0:
-        raise GenerationRejected(["nonzero_v2_clipping"], diagnostics=dict(legacy.qc), details=[])
-    high_axis = np.asarray(legacy.twt_highres_s, dtype=np.float64)
-    model_axis = np.asarray(legacy.twt_model_s, dtype=np.float64)
+    if float(object_core.qc.get("global_clipping_fraction", 0.0)) != 0.0:
+        raise GenerationRejected(["nonzero_v2_clipping"], diagnostics=dict(object_core.qc), details=[])
+    high_axis = np.asarray(object_core.tvdss_highres_m, dtype=np.float64)
+    model_axis = np.asarray(object_core.tvdss_model_m, dtype=np.float64)
     if model_axis.size < 2 or not np.array_equal(high_axis[::factor], model_axis):
         raise ValueError("Depth highres/model axes are not strictly nested.")
     survey_indices = np.searchsorted(survey_axis, model_axis)
     if np.any(survey_indices >= survey_axis.size) or not np.allclose(survey_axis[survey_indices], model_axis, rtol=0.0, atol=1e-9):
         raise ValueError(f"section_context_outside_survey_axis:{section.section_id}")
 
-    log_high = np.asarray(legacy.truth_log_ai_highres, dtype=np.float64)
+    log_high = np.asarray(object_core.log_ai_highres, dtype=np.float64)
     model_log, antialias_valid_1d = _valid_filter_decimate(log_high, factor=factor, taps=taps)
     relation = forward_inputs["ai_velocity_relation"]
     ai_high = np.exp(log_high)
@@ -370,17 +362,17 @@ def generate_depth_realization(
     if not np.allclose(reconstructed, seismic_model, rtol=1e-12, atol=1e-12):
         raise ValueError("model_grid_forward_closure_failed")
     categorical = {
-        "state_id_highres": legacy.state_id_highres,
-        "object_id_highres": legacy.object_id_highres,
-        "object_xi_highres": legacy.object_xi_highres,
-        "zone_id_highres": legacy.zone_id_highres,
-        "geometry_event_mask_highres": legacy.geometry_event_mask_highres,
-        "boundary_mask_highres": legacy.boundary_mask_highres,
-        "boundary_fraction_model": legacy.boundary_fraction_model,
-        "boundary_mask_model": legacy.boundary_mask_model,
-        "state_fraction_model": legacy.state_fraction_model,
-        "dominant_object_id_model": legacy.dominant_object_id_model,
-        "zone_id_model": legacy.zone_id_model,
+        "state_id_highres": object_core.state_id_highres,
+        "object_id_highres": object_core.object_id_highres,
+        "object_xi_highres": object_core.object_xi_highres,
+        "zone_id_highres": object_core.zone_id_highres,
+        "geometry_event_mask_highres": object_core.geometry_event_mask_highres,
+        "boundary_mask_highres": object_core.boundary_mask_highres,
+        "boundary_fraction_model": object_core.boundary_fraction_model,
+        "boundary_mask_model": object_core.boundary_mask_model,
+        "state_fraction_model": object_core.state_fraction_model,
+        "dominant_object_id_model": object_core.dominant_object_id_model,
+        "zone_id_model": object_core.zone_id_model,
     }
     observed_values = seismic_observed[valid]
     model_values = seismic_model[valid]
@@ -399,10 +391,10 @@ def generate_depth_realization(
         lfm_controlled_degraded=lfm_degraded, valid_mask_model=target,
         observed_valid_mask=valid, physics_valid_mask=valid.copy(),
         categorical=categorical,
-        object_catalog=_rename_catalog(legacy.object_catalog),
-        object_lateral_coefficients=_rename_catalog(legacy.object_lateral_coefficients),
+        object_catalog=object_core.object_catalog,
+        object_lateral_coefficients=object_core.object_lateral_coefficients,
         qc={
-            **{key: value for key, value in legacy.qc.items() if key != "field_qc"},
+            **{key: value for key, value in object_core.qc.items() if key != "field_qc"},
             "physics_halo_m": float(halo), "antialias_filter_half_width_m": float(antialias_half_m),
             "physics_halo_samples": int(round(halo / model_dz)),
             "context_m": context, "maximum_allowed_vp_mps": maximum_vp,
@@ -419,51 +411,21 @@ def generate_depth_realization(
     )
 
 
-def _largest_remainder_counts(n: int, ratios: Mapping[str, float]) -> dict[str, int]:
-    raw = {key: n * float(value) for key, value in ratios.items()}
-    counts = {key: int(np.floor(value)) for key, value in raw.items()}
-    for key in sorted(raw, key=lambda item: (-(raw[item] - counts[item]), item))[: n - sum(counts.values())]:
-        counts[key] += 1
-    if n >= len(counts):
-        missing = [key for key, value in counts.items() if value == 0]
-        for key in missing:
-            donor = max(counts, key=counts.get)
-            counts[donor] -= 1
-            counts[key] += 1
-    return counts
-
-
 def build_attempt_plan(script_cfg: Mapping[str, Any], sections: Sequence[DepthSectionGeometry]) -> pd.DataFrame:
     scenarios = generation_scenarios(script_cfg)
     rows = []
     attempts = int(script_cfg["generation"]["attempts_per_scenario"])
     held_out = str(script_cfg["splits"]["held_out_geometry_family"])
-    ratios = script_cfg["splits"]["non_held_out_ratios"]
     for section in sections:
         for scenario in scenarios:
-            local = []
             for attempt_id in range(attempts):
                 parent = f"{section.section_id}__{scenario.scenario_id}__a{attempt_id:03d}"
-                seed = named_seed(
-                    global_seed=int(script_cfg["global_seed"]), benchmark_version=SCHEMA_VERSION,
-                    generator_family=GENERATOR_FAMILY, stream_purpose="split_assignment",
-                    realization_id=parent,
-                )
-                local.append((seed, attempt_id, parent))
-            local.sort(key=lambda item: (item[0], item[2]))
-            if scenario.geometry_family == held_out:
-                assignments = {attempt_id: "test" for _, attempt_id, _ in local}
-            else:
-                counts = _largest_remainder_counts(attempts, ratios)
-                ordered_splits = [name for name in ("train", "validation", "test") for _ in range(counts[name])]
-                assignments = {attempt_id: split for (_, attempt_id, _), split in zip(local, ordered_splits)}
-            for seed, attempt_id, parent in sorted(local, key=lambda item: item[1]):
                 rows.append({
                     "parent_realization_id": parent, "section_id": section.section_id,
                     "scenario_id": scenario.scenario_id, "geometry_family": scenario.geometry_family,
                     "geometry_direction": scenario.geometry_direction, "duration_mode": scenario.duration_mode,
-                    "attempt_id": attempt_id, "assignment_hash": f"{seed:032x}",
-                    "split": assignments[attempt_id],
+                    "attempt_id": attempt_id,
+                    "evaluation_role": "geometry_holdout" if scenario.geometry_family == held_out else "development_pool",
                 })
     return pd.DataFrame.from_records(rows)
 
@@ -641,7 +603,7 @@ def run_depth_generation(
     debug_attempt_limit: int | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=False)
-    calibration, calibration_payload = load_depth_calibration_as_legacy(calibration_path)
+    calibration, calibration_payload = load_depth_calibration_for_object_core(calibration_path)
     if calibration_payload.get("forward_model_inputs_sha256") != forward_inputs["_sha256"]:
         raise ValueError("impedance calibration forward_model_inputs SHA-256 mismatch.")
     if list(calibration_payload.get("horizon_contract") or []) != list(script_cfg["horizons"]):
@@ -694,7 +656,7 @@ def run_depth_generation(
                     "parent_realization_id": base_id, "section_id": section.section_id,
                     "scenario_id": scenario.scenario_id, "geometry_family": scenario.geometry_family,
                     "geometry_direction": scenario.geometry_direction, "duration_mode": scenario.duration_mode,
-                    "split": row["split"], "split_assignment_hash": row["assignment_hash"],
+                    "evaluation_role": row["evaluation_role"],
                     "held_out_geometry_family": script_cfg["splits"]["held_out_geometry_family"],
                     "model_sample_count": generated.tvdss_model_m.size,
                     "model_dz_m": float(np.diff(generated.tvdss_model_m[:2])[0]),
@@ -796,9 +758,6 @@ def run_depth_generation(
     if not development and not base.empty:
         if catalog["acceptance_status"].isin({"failed", "insufficient_attempts"}).any():
             failure_reason = "depth_generation_acceptance_qc_failed"
-        split_counts = base.groupby("split").size().to_dict() if not base.empty else {}
-        if any(int(split_counts.get(name, 0)) == 0 for name in ("train", "validation", "test")):
-            failure_reason = failure_reason or "depth_generation_empty_split"
 
     file_names = [
         "synthetic_benchmark.h5", "sample_index.csv", "attempt_plan.csv", "scenario_catalog.csv",
@@ -825,9 +784,13 @@ def run_depth_generation(
         "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
         "source_runs": {key: repo_relative_path(path, root=repo_root) for key, path in sources.items()},
         "source_provenance": dict(source_provenance), "config_provenance": dict(config_provenance),
-        "split_policy": dict(script_cfg["splits"]),
+        "split_policy": {
+            "assignment_unit": "parent_realization",
+            "held_out_geometry_family": script_cfg["splits"]["held_out_geometry_family"],
+            "split_assignment_owner": "training",
+        },
         "sample_counts": {
-            "by_split": {str(key): int(value) for key, value in base.groupby("split").size().items()} if not base.empty else {},
+            "by_evaluation_role": {str(key): int(value) for key, value in base.groupby("evaluation_role").size().items()} if not base.empty else {},
             "seen_parent_realizations": int((~base["geometry_family"].eq(script_cfg["splits"]["held_out_geometry_family"])).sum()) if not base.empty else 0,
             "held_out_parent_realizations": int(base["geometry_family"].eq(script_cfg["splits"]["held_out_geometry_family"]).sum()) if not base.empty else 0,
         },
@@ -835,7 +798,7 @@ def run_depth_generation(
             "algorithm": "SHA-256/PCG64DXSM",
             "benchmark_version": SCHEMA_VERSION,
             "stream_purpose_registry": [
-                "split_assignment", "state_sequence", "duration", "zone_background",
+                "state_sequence", "duration", "zone_background",
                 "coefficient_<name>", "coefficient_lateral", "thickness_lateral",
                 "lfm_constant_bias", "lfm_vertical_trend", "lfm_zone_bias",
                 "lfm_lateral_bias", "lfm_amplitude_scale", "lfm_local_missing_control",

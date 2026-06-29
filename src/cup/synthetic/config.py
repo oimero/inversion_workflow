@@ -69,10 +69,11 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("synthoseis_lite.sections must be non-empty.")
     horizon_items = []
     for index, item in enumerate(horizons):
-        item = _mapping(item, path=f"synthoseis_lite.geometry.field_conditioned.horizons[{index}]")
+        item = _mapping(item, path=f"target_interval.horizons[{index}]")
         horizon_items.append(
             {
                 "name": _required_text(item, "name", path=f"horizons[{index}]"),
+                "well_top": _required_text(item, "well_top", path=f"horizons[{index}]"),
                 "file": _required_text(item, "file", path=f"horizons[{index}]"),
             }
         )

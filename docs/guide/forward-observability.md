@@ -78,9 +78,9 @@ forward_observability:
 # 层位从顶层 target_interval.horizons 读取，不在 forward_observability 下配置：
 target_interval:
   horizons:
-    - {name: top_a, file: interpre/top_a}
-    - {name: middle_b, file: interpre/middle_b}
-    - {name: base_c, file: interpre/base_c}
+    - {name: top_a, well_top: Petrel Top A, file: interpre/top_a}
+    - {name: middle_b, well_top: Petrel Marker B, file: interpre/middle_b}
+    - {name: base_c, well_top: Petrel Base C, file: interpre/base_c}
 ```
 
 ### `source_runs`
@@ -89,7 +89,7 @@ target_interval:
 
 ### `target_interval.horizons`
 
-从浅到深排列的层位列表，长度至少为 2。脚本用第一个和最后一个层位构建 `whole_target` 全目标窗口，用相邻层位对构建 `adjacent_zone` 相邻区域窗口。N 个层位产生 1 个全目标窗口和 N-1 个邻区窗口。层位名大小写不敏感，但不允许重复。
+从浅到深排列的层位列表，长度至少为 2。`name` 是输出使用的稳定内部层位 ID，`well_top` 是井分层 `Surface` 名，`file` 是解释层面文件；三项都必须显式配置。脚本用第一个和最后一个层位构建 `whole_target` 全目标窗口，用相邻层位对构建 `adjacent_zone` 相邻区域窗口。N 个层位产生 1 个全目标窗口和 N-1 个邻区窗口。内部层位 ID 大小写不敏感，但不允许重复。
 
 ### `frequency`
 

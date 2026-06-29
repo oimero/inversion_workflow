@@ -95,12 +95,13 @@ def parse_real_field_lfm_config(raw: Mapping[str, Any]) -> RealFieldLfmConfig:
     for idx, item in enumerate(horizons_raw):
         entry = _mapping(item, f"target_interval.horizons[{idx}]")
         name = _required_text(entry, "name", path=f"target_interval.horizons[{idx}]")
+        well_top = _required_text(entry, "well_top", path=f"target_interval.horizons[{idx}]")
         file = _required_text(entry, "file", path=f"target_interval.horizons[{idx}]")
         key = name.casefold()
         if key in seen:
             raise ValueError(f"Duplicate horizon name in target_interval.horizons: {name}")
         seen.add(key)
-        horizons.append({"name": name, "file": file})
+        horizons.append({"name": name, "well_top": well_top, "file": file})
     output_geometry = dict(root.get("output_geometry") or {"mode": "volume"})
     if isinstance(output_geometry.get("section"), Mapping):
         raise ValueError("real_field_lfm.output_geometry.section is retired; use sections_file.")
@@ -1226,6 +1227,7 @@ def _summary_payload(
             "horizons": [
                 {
                     "name": item["name"],
+                    "well_top": item["well_top"],
                     "file": repo_relative_path(resolve_relative_path(item["file"], root=data_root), root=repo_root),
                 }
                 for item in config.horizons

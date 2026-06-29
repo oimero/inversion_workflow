@@ -26,6 +26,18 @@ from cup.config.workflow import WorkflowConfig
 from cup.utils.io import array_sha256, repo_relative_path, resolve_relative_path, sha256_file, write_json
 
 
+def _validate_calibration_horizon_contract(
+    calibration: ImpedanceCalibration,
+    script_cfg: Mapping[str, Any],
+) -> None:
+    configured = tuple(str(item["name"]) for item in script_cfg["horizons"])
+    if configured != calibration.ordered_horizons:
+        raise ValueError(
+            "impedance_calibration_horizon_mismatch:"
+            f"configured={list(configured)}:calibrated={list(calibration.ordered_horizons)}"
+        )
+
+
 def generation_scenarios(script_cfg: Mapping[str, Any]) -> list[GenerationScenario]:
     generation = script_cfg["generation"]
     impedance = script_cfg["impedance"]
@@ -831,6 +843,7 @@ def run_generation(
     suite: str = "field_conditioned",
 ) -> dict[str, Any]:
     calibration = load_calibration(calibration_path)
+    _validate_calibration_horizon_contract(calibration, script_cfg)
     for key, recorded in calibration.source_runs.items():
         if key in sources and resolve_relative_path(recorded, root=repo_root).resolve() != sources[key].resolve():
             raise ValueError(f"impedance_calibration_source_mismatch:{key}")

@@ -136,10 +136,18 @@ def _script_config(config: Mapping[str, Any]) -> dict[str, Any]:
     raw_horizons = target_interval.get("horizons")
     if not isinstance(raw_horizons, (list, tuple)):
         raise ValueError("target_interval.horizons must be a list.")
-    ordered_names = [
-        _required_text(_mapping(item, path=f"target_interval.horizons[{idx}]"), "name", path=f"target_interval.horizons[{idx}]")
-        for idx, item in enumerate(raw_horizons)
-    ]
+    horizons = []
+    for idx, item in enumerate(raw_horizons):
+        path = f"target_interval.horizons[{idx}]"
+        entry = _mapping(item, path=path)
+        horizons.append(
+            {
+                "name": _required_text(entry, "name", path=path),
+                "well_top": _required_text(entry, "well_top", path=path),
+                "file": _required_text(entry, "file", path=path),
+            }
+        )
+    ordered_names = [item["name"] for item in horizons]
     if len(ordered_names) < 2 or any(not name for name in ordered_names):
         raise ValueError("target_interval.horizons needs at least two non-empty names.")
     normalized_names = [name.casefold() for name in ordered_names]
@@ -167,6 +175,7 @@ def _script_config(config: Mapping[str, Any]) -> dict[str, Any]:
         )
     return {
         "source_runs": sources,
+        "horizons": horizons,
         "ordered_horizons": ordered_names,
         "frequency": {
             "start_hz": _positive_float(
@@ -557,16 +566,20 @@ def _load_ai_on_seismic_axis(
 def _build_windows(
     *,
     well_name: str,
-    ordered_horizons: Sequence[str],
+    horizons: Sequence[Mapping[str, str]],
     well_tops: pd.DataFrame,
     table: Any,
 ) -> list[ObservabilityWindow]:
     horizon_times: list[tuple[str, float]] = []
-    for horizon in ordered_horizons:
-        md_m = find_well_top_md(well_tops, well_name=well_name, surface=horizon)
+    for horizon in horizons:
+        horizon_name = str(horizon["name"])
+        well_top = str(horizon["well_top"])
+        md_m = find_well_top_md(well_tops, well_name=well_name, surface=well_top)
         if md_m < float(table.md[0]) or md_m > float(table.md[-1]):
-            raise ValueError(f"outside_tdt_support:{horizon}:md={md_m:g}")
-        horizon_times.append((horizon, float(np.interp(md_m, table.md, table.twt))))
+            raise ValueError(
+                f"outside_tdt_support:{horizon_name}:well_top={well_top}:md={md_m:g}"
+            )
+        horizon_times.append((horizon_name, float(np.interp(md_m, table.md, table.twt))))
     times = np.asarray([value for _, value in horizon_times], dtype=np.float64)
     if np.any(np.diff(times) <= 0.0):
         raise ValueError("misordered_horizons")
@@ -663,7 +676,7 @@ def _analyze_well(
     preprocessed_las: Path,
     optimized_tdt: Path,
     seismic_trace: Path,
-    ordered_horizons: Sequence[str],
+    horizons: Sequence[Mapping[str, str]],
     well_tops: pd.DataFrame,
     scenarios: Sequence[WaveletScenario],
     frequencies_hz: np.ndarray,
@@ -693,7 +706,7 @@ def _analyze_well(
     )
     windows = _build_windows(
         well_name=well_name,
-        ordered_horizons=ordered_horizons,
+        horizons=horizons,
         well_tops=well_tops,
         table=table,
     )
@@ -1181,7 +1194,7 @@ def main() -> None:
                 preprocessed_las=preprocessed_las,
                 optimized_tdt=optimized_tdt,
                 seismic_trace=seismic_trace,
-                ordered_horizons=script_cfg["ordered_horizons"],
+                horizons=script_cfg["horizons"],
                 well_tops=well_tops,
                 scenarios=scenarios,
                 frequencies_hz=frequencies_hz,

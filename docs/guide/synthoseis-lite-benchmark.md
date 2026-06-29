@@ -112,9 +112,9 @@ synthoseis_lite:
 
 target_interval:
   horizons:
-    - {name: <top>, file: <horizon-file>}
-    - {name: <middle>, file: <horizon-file>}
-    - {name: <base>, file: <horizon-file>}
+    - {name: <top-id>, well_top: <well-top-surface>, file: <horizon-file>}
+    - {name: <middle-id>, well_top: <well-top-surface>, file: <horizon-file>}
+    - {name: <base-id>, well_top: <well-top-surface>, file: <horizon-file>}
 
 # --- 可选（source_runs 缺失时自动发现最新第六步产物）---
 synthoseis_lite:
@@ -212,6 +212,8 @@ synthoseis_lite:
 ### `geometry.field_conditioned`
 
 场条件几何的核心配置。层位从顶层 `target_interval.horizons` 读取，剖面定义从 `synthoseis_lite.sections` 读取。`target_zone.mode` 控制目标区构建方式（当前仅 `filled_target_zone`）。
+
+每个层位条目显式区分三种语义：`name` 是校准产物、区域 ID 和下游输出使用的稳定内部层位 ID；`well_top` 是井分层文件 `Surface` 列中的名称；`file` 是解释层面文件。三项均为必填，代码不会用 `name` 猜测 `well_top`，也不会从文件名猜测层位语义。`generate` 还会验证当前配置中的内部层位 ID 及顺序与冻结校准完全一致。
 
 ### `impedance_attribute_generator`
 

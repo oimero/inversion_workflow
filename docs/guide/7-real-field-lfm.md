@@ -38,8 +38,8 @@ python scripts/real_field_lfm.py --output-dir scripts/output/real_field_lfm_test
 # --- 必填 ---
 target_interval:
   horizons:
-    - {name: <top>, file: <horizon-file>}
-    - {name: <bottom>, file: <horizon-file>}
+    - {name: <top-id>, well_top: <well-top-surface>, file: <horizon-file>}
+    - {name: <bottom-id>, well_top: <well-top-surface>, file: <horizon-file>}
     # 中间层位可选，只用于 QC
 
 seismic:

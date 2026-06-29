@@ -78,6 +78,26 @@ def _artifact(value: Any, *, run_dir: Path, repo_root: Path, label: str) -> Path
         raise FileNotFoundError(f"{label} does not exist: {path}")
     return path
 
+
+def _horizon_times_from_well_tops(
+    well_tops_df: pd.DataFrame,
+    *,
+    well_name: str,
+    horizons: list[Mapping[str, Any]],
+    table: Any,
+) -> list[float]:
+    """Map explicitly configured well tops to TWT under stable horizon IDs."""
+    horizon_times: list[float] = []
+    for horizon in horizons:
+        horizon_name = str(horizon["name"])
+        well_top = str(horizon["well_top"])
+        md = find_well_top_md(well_tops_df, well_name=well_name, surface=well_top)
+        if not float(table.md[0]) <= md <= float(table.md[-1]):
+            raise ValueError(f"outside_tdt_support:{horizon_name}:well_top={well_top}")
+        horizon_times.append(float(np.interp(md, table.md, table.twt)))
+    return horizon_times
+
+
 def build_calibration_inputs(
     *,
     workflow: WorkflowConfig,
@@ -139,12 +159,12 @@ def build_calibration_inputs(
                 raise ValueError("optimized_tdt_not_md_domain")
             filtered = read_las_curve(filtered_path, "AI", match_policy="exact", allow_all_nan=True)
             full = read_las_curve(full_path, "AI", match_policy="exact", allow_all_nan=True)
-            horizon_times = []
-            for horizon in ordered_horizons:
-                md = find_well_top_md(well_tops, well_name=well_name, surface=horizon)
-                if not float(table.md[0]) <= md <= float(table.md[-1]):
-                    raise ValueError(f"outside_tdt_support:{horizon}")
-                horizon_times.append(float(np.interp(md, table.md, table.twt)))
+            horizon_times = _horizon_times_from_well_tops(
+                well_tops,
+                well_name=well_name,
+                horizons=list(script_cfg["horizons"]),
+                table=table,
+            )
             if np.any(np.diff(horizon_times) <= 0.0):
                 raise ValueError("misordered_horizons")
             zone_count = 0

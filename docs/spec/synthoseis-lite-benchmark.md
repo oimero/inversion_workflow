@@ -53,6 +53,18 @@
 最小配置形态为：
 
 ```yaml
+target_interval:
+  horizons:
+    - name: top_a
+      well_top: Petrel Well Top A
+      file: interpre/seismic_top_a
+    - name: marker_b
+      well_top: Petrel Well Top B
+      file: interpre/seismic_marker_b
+    - name: base_c
+      well_top: Petrel Well Top C
+      file: interpre/seismic_base_c
+
 synthoseis_lite:
   global_seed: 20260615
   source_runs:
@@ -87,18 +99,11 @@ synthoseis_lite:
     field_conditioned:
       enabled: true
       geometry_families: [none, wedge, pinchout]
-      horizons:
-        - name: top_a
-          file: interpre/top_a
-        - name: marker_b
-          file: interpre/marker_b
-        - name: base_c
-          file: interpre/base_c
-      sections:
-        - section_id: example_section
-          path:
-            - {inline: 300.0, xline: 900.0}
-            - {inline: 500.0, xline: 1200.0}
+  sections:
+    - section_id: example_section
+      path:
+        - {inline: 300.0, xline: 900.0}
+        - {inline: 500.0, xline: 1200.0}
   impedance_attribute_generator:
     family: object_coefficients_v1
     state_threshold_sigma: 1.0

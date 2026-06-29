@@ -123,6 +123,29 @@ def _prepare_synthoseis_config(raw: dict, workflow: WorkflowConfig) -> dict:
     return prepared
 
 
+def _load_time_config(experiment_raw: dict) -> tuple[dict, WorkflowConfig]:
+    """Load time-v1 config, supporting either legacy direct or common-overlay form."""
+    if "workflow_config" not in experiment_raw:
+        raw = experiment_raw
+        workflow = WorkflowConfig.from_mapping(raw)
+        return _prepare_synthoseis_config(raw, workflow), workflow
+
+    allowed = {"workflow_config", "synthoseis_lite"}
+    unknown = sorted(set(experiment_raw) - allowed)
+    if unknown:
+        raise ValueError(f"Time Synthoseis-lite composed config contains unknown top-level keys: {unknown}.")
+    common_path = resolve_relative_path(str(experiment_raw["workflow_config"]), root=REPO_ROOT)
+    common = load_yaml_config(common_path)
+    if not isinstance(common, dict):
+        raise ValueError(f"workflow_config must contain a mapping: {common_path}")
+    composed = dict(common)
+    composed["synthoseis_lite"] = dict(experiment_raw.get("synthoseis_lite") or {})
+    workflow = WorkflowConfig.from_mapping(composed)
+    if workflow.seismic.domain != "time":
+        raise ValueError("Time Synthoseis-lite v1 requires seismic.domain='time'.")
+    return _prepare_synthoseis_config(composed, workflow), workflow
+
+
 def _dispatch_keys(raw: dict) -> tuple[str, str]:
     root = raw.get("synthoseis_lite")
     if not isinstance(root, dict):
@@ -188,12 +211,7 @@ def main() -> None:
             "Unsupported Synthoseis-lite dispatch: "
             f"sample_domain={sample_domain!r}, benchmark_schema={benchmark_schema!r}."
         )
-    if "workflow_config" in experiment_raw:
-        raise ValueError("Time-domain Synthoseis-lite v1 currently expects a direct workflow config, not workflow_config composition.")
-
-    raw = experiment_raw
-    workflow = WorkflowConfig.from_mapping(raw)
-    raw = _prepare_synthoseis_config(raw, workflow)
+    raw, workflow = _load_time_config(experiment_raw)
     script_cfg = parse_synthoseis_config(raw)
     sources = resolve_sources(script_cfg, repo_root=REPO_ROOT)
     output_dir = _output_dir(args, workflow)

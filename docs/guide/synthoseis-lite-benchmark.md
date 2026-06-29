@@ -29,13 +29,28 @@ synthoseis_lite:
 
 ## 时间域 v1
 
-时间域配置是直接 workflow 配置，示例见：
+时间域 v1 支持两种配置形态：历史直接 workflow 配置，以及推荐的 common-overlay 形态。
+
+推荐形态：
+
+```yaml
+workflow_config: experiments/common/common.yaml
+
+synthoseis_lite:
+  sample_domain: time
+  benchmark_schema: synthoseis_lite_v1
+```
+
+`seismic.domain: time` 属于 workflow 真相，应写在 `experiments/common/common.yaml`
+的 `seismic` 段里；time 实验配置不应覆盖地震文件、资产、层位或井曲线等 workflow 字段。
+
+历史直接配置示例见：
 
 ```text
 experiments/synthoseis_lite/synthoseis_lite.yaml
 ```
 
-必须包含：
+无论哪种形态，都必须包含：
 
 ```yaml
 synthoseis_lite:

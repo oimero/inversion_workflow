@@ -109,6 +109,16 @@ def _aligned_arrays(sample: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
     seismic = np.asarray(sample.seismic_input, dtype=np.float32)
     lfm = np.asarray(sample.priors["lfm_controlled_degraded"], dtype=np.float32)
     valid = np.asarray(sample.valid_mask, dtype=bool)
+    if str(getattr(sample, "sample_domain", "")) == "depth":
+        if seismic.shape != target.shape:
+            raise ValueError(
+                f"Depth v2 requires N-point seismic/target alignment for {sample.sample_id}: "
+                f"{seismic.shape} vs {target.shape}"
+            )
+        observed_valid = np.asarray(sample.observed_valid_mask, dtype=bool)
+        if observed_valid.shape != target.shape:
+            raise ValueError(f"Depth observed-valid mask shape mismatch for {sample.sample_id}.")
+        valid &= observed_valid
     if target.ndim != 2 or seismic.ndim != 2 or lfm.ndim != 2 or valid.ndim != 2:
         raise ValueError(f"Expected 2D arrays for sample {sample.sample_id}.")
     if target.shape[0] != seismic.shape[0] or lfm.shape != target.shape or valid.shape != target.shape:
@@ -117,7 +127,9 @@ def _aligned_arrays(sample: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
             f"seismic={seismic.shape}, lfm={lfm.shape}, valid={valid.shape}"
         )
     raw_twt_offset_samples = 0
-    if seismic.shape[1] == target.shape[1] - 1:
+    if str(getattr(sample, "sample_domain", "")) == "depth":
+        raw_twt_offset_samples = 0
+    elif seismic.shape[1] == target.shape[1] - 1:
         target = target[:, 1:]
         lfm = lfm[:, 1:]
         valid = valid[:, 1:]
@@ -424,6 +436,15 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             lfm_ideal[sl],
             0.0,
         )
+        seismic_model_consistent = np.asarray(sample.seismic_model_consistent, dtype=np.float32)
+        physics_valid = np.asarray(sample.physics_valid_mask, dtype=bool)
+        if seismic_model_consistent.shape != target.shape or physics_valid.shape != target.shape:
+            raise ValueError(f"Physics target/mask shape mismatch for {sample.sample_id}.")
+        physics_seismic_patch = np.where(
+            physics_valid[sl] & np.isfinite(seismic_model_consistent[sl]),
+            seismic_model_consistent[sl],
+            0.0,
+        )
         inputs = np.stack(
             [
                 seismic_n,
@@ -438,6 +459,12 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             "target_log_ai": torch.from_numpy(target_patch.astype(np.float32))[None, :, :],
             "seismic": torch.from_numpy(
                 np.where(valid_patch & np.isfinite(seismic_patch), seismic_patch, 0.0).astype(np.float32)
+            )[None, :, :],
+            "seismic_model_consistent": torch.from_numpy(
+                physics_seismic_patch.astype(np.float32)
+            )[None, :, :],
+            "physics_valid_mask": torch.from_numpy(
+                physics_valid[sl].astype(np.float32)
             )[None, :, :],
             "lfm": torch.from_numpy(lfm_patch.astype(np.float32))[None, :, :],
             "lfm_ideal": torch.from_numpy(lfm_ideal_patch.astype(np.float32))[None, :, :],

@@ -1,10 +1,13 @@
-"""Calibrate and generate the truth-first synthoseis-lite benchmark slice.
+"""Calibrate and generate a truth-first Synthoseis-lite benchmark.
 
 Usage::
 
-    python scripts/synthoseis_lite.py calibrate
-    python scripts/synthoseis_lite.py generate --suite canonical --impedance-calibration <file>
-    python scripts/synthoseis_lite.py generate --suite field_conditioned --impedance-calibration <file>
+    python scripts/synthoseis_lite.py --config <file> calibrate
+    python scripts/synthoseis_lite.py --config <file> generate \
+        --suite field_conditioned --impedance-calibration <file>
+
+Composed v2 configurations implement the depth/TVDSS field-conditioned branch.
+Uncomposed legacy configurations retain the historical time-domain v1 branch.
 """
 
 from __future__ import annotations
@@ -27,6 +30,13 @@ from cup.synthetic.workflow import (
     run_calibration,
     run_generation,
 )
+from cup.synthetic.v2_calibration import run_depth_calibration
+from cup.synthetic.v2_config import (
+    load_composed_config,
+    parse_depth_v2_config,
+    resolve_depth_v2_sources,
+)
+from cup.synthetic.v2_generation import run_depth_generation
 from cup.config.workflow import WorkflowConfig
 from cup.config.sources import load_summary, resolve_source_run
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path
@@ -42,14 +52,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=None)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("calibrate", help="Freeze impedance calibration from third/fourth-step LAS.")
-    generate = subparsers.add_parser("generate", help="Generate canonical or field-conditioned truth.")
+    subparsers.add_parser("calibrate", help="Freeze impedance calibration from authoritative source runs.")
+    generate = subparsers.add_parser("generate", help="Generate one configured benchmark suite.")
     generate.add_argument("--impedance-calibration", type=Path, required=True)
     generate.add_argument(
         "--suite",
         choices=("canonical", "field_conditioned"),
         required=True,
-        help="Generate exactly one benchmark suite per run.",
+        help="Depth v2 requires field_conditioned; legacy time v1 also supports canonical.",
     )
     generate.add_argument(
         "--debug-attempt-limit",
@@ -112,7 +122,45 @@ def _prepare_synthoseis_config(raw: dict, workflow: WorkflowConfig) -> dict:
 def main() -> None:
     args = parse_args()
     config_path = resolve_relative_path(args.config, root=REPO_ROOT)
-    raw = load_yaml_config(config_path)
+    experiment_raw = load_yaml_config(config_path)
+    if isinstance(experiment_raw, dict) and "workflow_config" in experiment_raw:
+        raw, workflow, config_provenance = load_composed_config(config_path, repo_root=REPO_ROOT)
+        if workflow.seismic.domain != "depth":
+            raise ValueError("Composed Synthoseis-lite v2 currently implements the depth branch only.")
+        script_cfg = parse_depth_v2_config(raw)
+        sources, source_provenance, forward_inputs = resolve_depth_v2_sources(
+            script_cfg, workflow=workflow, repo_root=REPO_ROOT
+        )
+        output_dir = _output_dir(args, workflow)
+        if args.command == "calibrate":
+            summary = run_depth_calibration(
+                workflow=workflow, script_cfg=script_cfg, sources=sources,
+                source_provenance=source_provenance, forward_inputs=forward_inputs,
+                config_provenance=config_provenance, repo_root=REPO_ROOT,
+                output_dir=output_dir,
+            )
+        else:
+            if args.suite != "field_conditioned":
+                raise ValueError("Depth Synthoseis-lite v2 only supports --suite field_conditioned.")
+            if args.geometry_family:
+                raise ValueError("Depth v2 geometry filters must be frozen in configuration, not CLI overrides.")
+            if args.qc_only:
+                raise ValueError("Depth v2 does not persist a partial qc-only benchmark.")
+            summary = run_depth_generation(
+                workflow=workflow, script_cfg=script_cfg, sources=sources,
+                source_provenance=source_provenance, forward_inputs=forward_inputs,
+                config_provenance=config_provenance,
+                calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
+                repo_root=REPO_ROOT, output_dir=output_dir,
+                debug_attempt_limit=args.debug_attempt_limit,
+            )
+        print("=== synthoseis-lite v2 ===")
+        print(f"Command: {args.command}")
+        print(f"Output: {output_dir}")
+        print(f"Status: {summary.get('status', 'success')}")
+        return
+
+    raw = experiment_raw
     workflow = WorkflowConfig.from_mapping(raw)
     raw = _prepare_synthoseis_config(raw, workflow)
     script_cfg = parse_synthoseis_config(raw)

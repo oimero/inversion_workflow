@@ -41,13 +41,13 @@ def forward_time_log(
     *,
     name: str = "Synthetic",
 ):
-    """Forward one TWT ``grid.Log`` and return a lower-sample ``grid.Seismic``."""
+    """Forward one TWT ``grid.Log`` and return sample-aligned ``grid.Seismic``."""
     from wtie.processing import grid
 
     _require_trace(log_ai, name="log_ai")
     _require_basis(log_ai, name="log_ai", expected="twt")
     values = forward_time(log_ai.values, wavelet_time_s, wavelet_amp)
-    basis = np.asarray(log_ai.basis)[1:]
+    basis = np.asarray(log_ai.basis)
     if basis.size < 2:
         raise ValueError("grid time adapter requires at least three log_ai samples.")
     return grid.Seismic(

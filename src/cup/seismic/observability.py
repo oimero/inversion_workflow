@@ -433,7 +433,9 @@ def finite_difference_response(
             wavelet,
         )
         derivative = (upper - lower) / (2.0 * float(epsilon))
-        columns.append(derivative[indices - 1])
+        # forward_time is sample-aligned N; observed legacy traces remain on
+        # time_s[1:], so the same physical samples are selected by ``indices``.
+        columns.append(derivative[indices])
     return np.column_stack(columns)
 
 
@@ -520,7 +522,7 @@ def analyze_frequency_scenario(
     basis_full = np.zeros((time.size, 2), dtype=np.float64)
     basis_full[indices, :] = phase_basis.values
     synthetic_full = forward_time(filtered, scenario.time_s, scenario.amplitude)
-    synthetic = synthetic_full[indices - 1]
+    synthetic = synthetic_full[indices]
     observed_window = observed_values[indices - 1]
     fit = weighted_amplitude_fit(
         observed_window,

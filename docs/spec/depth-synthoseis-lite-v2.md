@@ -1,6 +1,6 @@
 # 深度域 Synthoseis-lite v2 设计规范
 
-> 状态：已决策，可实施  
+> 状态：首轮代码已实现，待用户分阶段验证
 > 适用范围：叠后、零偏移、声学、二维 field-conditioned 合成数据  
 > 当前工区：深度域、TVDSS 向下为正、模型采样间隔 5 m、井均为直井  
 > 本文是深度域 Synthoseis-lite 的唯一实施规范。`DEPTH_DOMAIN_FORWARD_REFACTOR.md`

@@ -110,6 +110,14 @@ def train_model(
     log_interval_batches: int = 10,
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
+    if (
+        str(benchmark.manifest.get("sample_domain", "")) == "depth"
+        and float(lambda_physics) > 0.0
+    ):
+        raise ValueError(
+            "Depth Synthoseis v2 physics-loss training is intentionally not implemented in this slice; "
+            "the depth GINN v2 training contract must be designed before enabling lambda_physics."
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = logger or configure_training_logger(output_dir)
     if not np.isfinite(lambda_real_delta) or float(lambda_real_delta) < 0.0:

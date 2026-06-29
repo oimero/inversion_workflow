@@ -127,18 +127,16 @@ def reflectivity_from_log_ai(log_ai: Any) -> Tensor:
     return torch.tanh(0.5 * (values[..., 1:] - values[..., :-1]))
 
 
-def _convolve_same_length(reflectivity: Tensor, wavelet_amp: Tensor) -> Tensor:
-    samples = reflectivity.shape[-1]
-    flattened = reflectivity.reshape((-1, 1, samples))
+def _convolve_sample_aligned(reflectivity: Tensor, wavelet_amp: Tensor) -> Tensor:
+    """Return ``N`` sample-aligned values from ``N-1`` lower-sample events."""
+    interfaces = reflectivity.shape[-1]
+    output_samples = interfaces + 1
+    flattened = reflectivity.reshape((-1, 1, interfaces))
     kernel = torch.flip(wavelet_amp, dims=[-1]).reshape((1, 1, -1))
     full = F.conv1d(flattened, kernel, padding=wavelet_amp.numel() - 1)
-    minimum = min(samples, wavelet_amp.numel())
-    maximum = max(samples, wavelet_amp.numel())
-    start = (minimum - 1) // 2
-    if wavelet_amp.numel() > samples:
-        start += (maximum - samples) // 2
-    output = full[..., start : start + samples]
-    return output.reshape(reflectivity.shape)
+    start = wavelet_amp.numel() // 2 - 1
+    output = full[..., start : start + output_samples]
+    return output.reshape((*reflectivity.shape[:-1], output_samples))
 
 
 def forward_time(
@@ -146,7 +144,7 @@ def forward_time(
     wavelet_time_s: Any,
     wavelet_amp: Any,
 ) -> Tensor:
-    """Apply the time-domain Robinson forward model and return ``[..., N-1]``."""
+    """Apply Robinson forward modeling and return ``N`` input-sample values."""
     values = _validate_log_ai(log_ai)
     _, amplitude = _validate_wavelet(wavelet_time_s, wavelet_amp)
     dtype = _promoted_dtype(values, amplitude)
@@ -155,7 +153,7 @@ def forward_time(
     reflectivity = torch.tanh(
         0.5 * (values_cast[..., 1:] - values_cast[..., :-1])
     )
-    return _convolve_same_length(reflectivity, amplitude_cast)
+    return _convolve_sample_aligned(reflectivity, amplitude_cast)
 
 
 def _relative_twt_axes(

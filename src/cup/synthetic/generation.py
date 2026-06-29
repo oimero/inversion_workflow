@@ -97,7 +97,11 @@ def _rng_keys(
 ) -> dict[str, Any]:
     return {
         "global_seed": int(global_seed),
-        "benchmark_version": "synthoseis_lite_v1",
+        "benchmark_version": (
+            "synthoseis_lite_v2"
+            if str(calibration.generator_family).endswith("_v2")
+            else "synthoseis_lite_v1"
+        ),
         "generator_family": calibration.generator_family,
         "stream_purpose": stream_purpose,
         "realization_id": realization_id,
@@ -581,6 +585,8 @@ def generate_field_section(
     max_object_reversal_fraction: float = 0.25,
     max_global_clipping_fraction: float = 0.005,
     max_object_clipping_fraction: float = 0.02,
+    vertical_axis_origin: float | None = None,
+    context_extent: float | None = None,
 ) -> GeneratedSection:
     """Generate one field-conditioned realization and its main closed forward model."""
     lateral = np.asarray(lateral_m, dtype=np.float64).reshape(-1)
@@ -594,9 +600,24 @@ def generate_field_section(
     if not np.isclose(truth_dt, calibration.truth_dt_s, rtol=0.0, atol=1e-12):
         raise ValueError("impedance_calibration_source_mismatch:truth_dt")
     wavelet_values = np.asarray(wavelet, dtype=np.float64).reshape(-1)
-    context_s = (wavelet_values.size // 2) * float(output_dt_s)
-    start_s = np.floor((float(np.min(horizons[:, 0])) - context_s) / truth_dt) * truth_dt
-    end_s = np.ceil((float(np.max(horizons[:, -1])) + context_s) / truth_dt) * truth_dt
+    context_s = (
+        (wavelet_values.size // 2) * float(output_dt_s)
+        if context_extent is None
+        else float(context_extent)
+    )
+    if not np.isfinite(context_s) or context_s < 0.0:
+        raise ValueError("context_extent must be finite and non-negative.")
+    if vertical_axis_origin is None:
+        start_s = np.floor((float(np.min(horizons[:, 0])) - context_s) / truth_dt) * truth_dt
+        end_s = np.ceil((float(np.max(horizons[:, -1])) + context_s) / truth_dt) * truth_dt
+    else:
+        origin = float(vertical_axis_origin)
+        start_s = origin + np.floor(
+            (float(np.min(horizons[:, 0])) - context_s - origin) / float(output_dt_s)
+        ) * float(output_dt_s)
+        end_s = origin + np.ceil(
+            (float(np.max(horizons[:, -1])) + context_s - origin) / float(output_dt_s)
+        ) * float(output_dt_s)
     n_model_intervals = int(np.ceil((end_s - start_s) / output_dt_s))
     n_highres = n_model_intervals * factor + 1
     twt_highres = start_s + np.arange(n_highres, dtype=np.float64) * truth_dt

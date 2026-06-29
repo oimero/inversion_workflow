@@ -117,19 +117,26 @@ def reflectivity_from_log_ai(log_ai: Any) -> np.ndarray:
     return np.tanh(0.5 * np.diff(values, axis=-1))
 
 
-def _convolve_same_length(reflectivity: np.ndarray, wavelet_amp: np.ndarray) -> np.ndarray:
-    """Match the repository's legacy NumPy ``mode='same'`` and crop semantics."""
-    samples = reflectivity.shape[-1]
-    flattened = reflectivity.reshape((-1, samples))
-    output = np.empty_like(flattened, dtype=np.result_type(reflectivity, wavelet_amp))
+def _convolve_sample_aligned(reflectivity: np.ndarray, wavelet_amp: np.ndarray) -> np.ndarray:
+    """Return ``N`` sample-aligned values from ``N-1`` lower-sample events.
+
+    With an odd wavelet of half-width ``c``, output sample ``l`` is full
+    convolution sample ``c + l - 1``.  Consequently ``output[..., 1:]`` is
+    exactly the repository's legacy Robinson ``same`` result, including the
+    historical crop behavior when the wavelet is longer than the trace.
+    """
+    interfaces = reflectivity.shape[-1]
+    output_samples = interfaces + 1
+    flattened = reflectivity.reshape((-1, interfaces))
+    output = np.empty(
+        (flattened.shape[0], output_samples),
+        dtype=np.result_type(reflectivity, wavelet_amp),
+    )
+    start = wavelet_amp.size // 2 - 1
     for index, trace in enumerate(flattened):
-        convolved = np.convolve(wavelet_amp, trace, mode="same")
-        if convolved.size != samples:
-            difference = convolved.size - samples
-            start = difference // 2
-            convolved = convolved[start : start + samples]
-        output[index] = convolved
-    return output.reshape(reflectivity.shape)
+        full = np.convolve(wavelet_amp, trace, mode="full")
+        output[index] = full[start : start + output_samples]
+    return output.reshape((*reflectivity.shape[:-1], output_samples))
 
 
 def forward_time(
@@ -137,11 +144,11 @@ def forward_time(
     wavelet_time_s: Any,
     wavelet_amp: Any,
 ) -> np.ndarray:
-    """Apply the time-domain Robinson forward model and return ``[..., N-1]``."""
+    """Apply Robinson forward modeling and return ``N`` input-sample values."""
     values = _validate_log_ai(log_ai)
     _, amplitude = _validate_wavelet(wavelet_time_s, wavelet_amp)
     reflectivity = reflectivity_from_log_ai(values)
-    return _convolve_same_length(reflectivity, amplitude)
+    return _convolve_sample_aligned(reflectivity, amplitude)
 
 
 def _relative_twt_axes(
@@ -254,7 +261,7 @@ def forward_depth(
         depth.astype(dtype, copy=False),
         dtype=dtype,
     )
-    output = np.empty((batch_size, n_samples), dtype=dtype)
+    output = np.zeros((batch_size, n_samples), dtype=dtype)
     operator = (
         np.empty((batch_size, n_samples, n_samples - 1), dtype=dtype)
         if bool(return_operator)
@@ -262,25 +269,52 @@ def forward_depth(
     )
     wavelet_time_cast = wavelet_time.astype(dtype, copy=False)
     amplitude_cast = amplitude.astype(dtype, copy=False)
-    for start in range(0, n_samples, chunk_size):
-        stop = min(start + chunk_size, n_samples)
-        weights = _wavelet_weights(
-            sample_twt,
-            interface_twt,
-            wavelet_time_cast,
-            amplitude_cast,
-            start=start,
-            stop=stop,
-            dtype=dtype,
-        )
-        output[:, start:stop] = np.einsum(
-            "bij,bj->bi",
-            weights,
-            reflectivity,
-            optimize=True,
-        )
-        if operator is not None:
+    if operator is not None:
+        for start in range(0, n_samples, chunk_size):
+            stop = min(start + chunk_size, n_samples)
+            weights = _wavelet_weights(
+                sample_twt,
+                interface_twt,
+                wavelet_time_cast,
+                amplitude_cast,
+                start=start,
+                stop=stop,
+                dtype=dtype,
+            )
+            output[:, start:stop] = np.einsum(
+                "bij,bj->bi",
+                weights,
+                reflectivity,
+                optimize=True,
+            )
             operator[:, start:stop, :] = weights
+    else:
+        # Exact finite-support banded path.  searchsorted removes only weights
+        # that the dense interpolation defines as exactly zero.
+        wavelet_min = float(wavelet_time_cast[0])
+        wavelet_max = float(wavelet_time_cast[-1])
+        for output_start in range(0, n_samples, chunk_size):
+            output_stop = min(output_start + chunk_size, n_samples)
+            for batch_index in range(batch_size):
+                events = interface_twt[batch_index]
+                for sample_index in range(output_start, output_stop):
+                    sample_time = sample_twt[batch_index, sample_index]
+                    first = int(np.searchsorted(events, sample_time - wavelet_max, side="left"))
+                    last = int(np.searchsorted(events, sample_time - wavelet_min, side="right"))
+                    if first >= last:
+                        continue
+                    tau = sample_time - events[first:last]
+                    weights = np.interp(
+                        tau,
+                        wavelet_time_cast,
+                        amplitude_cast,
+                        left=0.0,
+                        right=0.0,
+                    ).astype(dtype, copy=False)
+                    output[batch_index, sample_index] = np.dot(
+                        weights,
+                        reflectivity[batch_index, first:last],
+                    )
     output_shaped = output.reshape(log_values.shape)
     if operator is None:
         return output_shaped

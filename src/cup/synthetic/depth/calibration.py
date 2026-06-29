@@ -5,16 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 from cup.petrel.load import import_interpretation_petrel, import_well_tops_petrel
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
+from cup.synthetic.figures import write_calibration_figures
 from cup.synthetic.depth.config import CALIBRATION_SCHEMA, GENERATOR_FAMILY
 from cup.synthetic.depth.object_core_adapter import (
     calibrate_depth_object_core,
@@ -394,19 +391,7 @@ def run_depth_calibration(
     calibration_path = output_dir / "impedance_calibration.json"
     write_json(calibration_path, payload)
 
-    figures_dir = output_dir / "figures"
-    figures_dir.mkdir(parents=True, exist_ok=True)
-    sample_frame = frames["well_background_samples.csv"]
-    for (well_name, zone_id), group in sample_frame.groupby(["well_name", "zone_id"], sort=True):
-        fig, ax = plt.subplots(figsize=(7.5, 4.5))
-        ax.plot(group["observed_log_ai"], group["tvdss_m"], color="0.55", lw=0.8, label="observed")
-        ax.plot(group["background_log_ai"], group["tvdss_m"], color="tab:red", lw=1.2, label="Huber background")
-        ax.invert_yaxis()
-        ax.set(xlabel="log AI", ylabel="TVDSS (m)", title=f"{well_name} — {zone_id}")
-        ax.legend()
-        fig.tight_layout()
-        fig.savefig(figures_dir / f"{well_name}__{zone_id}.png", dpi=160)
-        plt.close(fig)
+    figure_summary = write_calibration_figures(output_dir, script_cfg.get("figures", {}))
 
     summary = {
         "schema_version": CALIBRATION_SCHEMA,
@@ -421,6 +406,14 @@ def run_depth_calibration(
         "outputs": {
             "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
             **{name.removesuffix(".csv"): repo_relative_path(output_dir / name, root=repo_root) for name in frames},
+        },
+        "figures": {
+            "generated_count": int(figure_summary.get("generated_count", 0)),
+            "skipped_count": int(figure_summary.get("skipped_count", 0)),
+            "figure_manifest": repo_relative_path(
+                Path(str(figure_summary.get("figure_manifest", output_dir / "figures" / "figure_manifest.json"))),
+                root=repo_root,
+            ),
         },
     }
     write_json(output_dir / "run_summary.json", summary)

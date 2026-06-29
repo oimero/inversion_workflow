@@ -20,6 +20,7 @@ from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.wavelet import load_wavelet_csv
 from cup.synthetic.calibration import ImpedanceCalibration
+from cup.synthetic.figures import write_generation_figures
 from cup.synthetic.generation import GenerationRejected, GenerationScenario
 from cup.synthetic.generation_pipeline import generation_scenarios
 from cup.synthetic.random import named_rng
@@ -759,11 +760,18 @@ def run_depth_generation(
         if catalog["acceptance_status"].isin({"failed", "insufficient_attempts"}).any():
             failure_reason = "depth_generation_acceptance_qc_failed"
 
+    figure_summary = write_generation_figures(
+        output_dir,
+        script_cfg.get("figures", {}),
+        suite="field_conditioned",
+        qc_only=False,
+    )
+
     file_names = [
         "synthetic_benchmark.h5", "sample_index.csv", "attempt_plan.csv", "scenario_catalog.csv",
         "generation_qc.csv", "generation_rejection_details.csv", "object_catalog.csv",
         "object_lateral_coefficients.csv", "highres_forward_qc.csv", "subgrid_forward_qc.csv",
-        "seismic_variant_results.csv", "section_geometry_qc.csv",
+        "seismic_variant_results.csv", "section_geometry_qc.csv", "figures/figure_manifest.json",
     ]
     manifest = {
         "schema": SCHEMA_VERSION, "status": "development_limited" if development else ("failed" if failure_reason else "success"),
@@ -784,6 +792,14 @@ def run_depth_generation(
         "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
         "source_runs": {key: repo_relative_path(path, root=repo_root) for key, path in sources.items()},
         "source_provenance": dict(source_provenance), "config_provenance": dict(config_provenance),
+        "figures": {
+            "generated_count": int(figure_summary.get("generated_count", 0)),
+            "skipped_count": int(figure_summary.get("skipped_count", 0)),
+            "figure_manifest": repo_relative_path(
+                Path(str(figure_summary.get("figure_manifest", output_dir / "figures" / "figure_manifest.json"))),
+                root=repo_root,
+            ),
+        },
         "split_policy": {
             "assignment_unit": "parent_realization",
             "held_out_geometry_family": script_cfg["splits"]["held_out_geometry_family"],

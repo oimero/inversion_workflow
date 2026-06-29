@@ -85,6 +85,7 @@ def depth_frame_from_object_core(frame: pd.DataFrame) -> pd.DataFrame:
     """Rename object-core vertical columns back to depth-domain names."""
     return frame.rename(columns={
         "twt_s": "tvdss_m",
+        "duration_s": "thickness_m",
         "zone_duration_s": "zone_thickness_m",
         "minimum_duration_s": "minimum_thickness_m",
         "maximum_duration_s": "maximum_thickness_m",

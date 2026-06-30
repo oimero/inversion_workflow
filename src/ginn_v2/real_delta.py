@@ -15,13 +15,13 @@ import pandas as pd
 import torch
 
 from cup.config.sources import load_summary
+from cup.physics.numpy_backend import forward_time
 from cup.seismic.viz import plot_well_waveform_qc, waveform_qc_metrics
 from cup.utils.io import repo_relative_path, resolve_relative_path, sha256_file
 from cup.well.anchor import build_well_anchor_samples, sample_volume_trilinear
 from ginn_v2.real_field import (
     RealFieldVolume,
     build_real_field_patch_index,
-    forward_log_ai,
     load_real_field_volume,
     load_selected_wavelet,
 )
@@ -982,7 +982,7 @@ def evaluate_real_wells(
         str(dict(benchmark_manifest["source_runs"])["wavelet_generation_dir"]),
         root=repo_root,
     )
-    wavelet, _wavelet_metadata = load_selected_wavelet(wavelet_dir)
+    wavelet_time_s, wavelet, _wavelet_metadata = load_selected_wavelet(wavelet_dir)
     tie_metrics = pd.read_csv(
         support.sources.well_auto_tie_dir / "well_tie_metrics.csv"
     ).set_index("well_name", drop=False)
@@ -1066,6 +1066,7 @@ def evaluate_real_wells(
                 lfm_ai=lfm_ai,
                 pred_delta=pred_delta,
                 volume=support.volume,
+                wavelet_time_s=wavelet_time_s,
                 wavelet=wavelet,
                 tie=tie_metrics.loc[well_name],
                 repo_root=repo_root,
@@ -1297,6 +1298,7 @@ def _write_well_figures(
     lfm_ai: np.ndarray,
     pred_delta: np.ndarray,
     volume: RealFieldVolume,
+    wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
     tie: Mapping[str, Any],
     repo_root: Path,
@@ -1350,6 +1352,7 @@ def _write_well_figures(
         twt=twt,
         well=well,
         volume=volume,
+        wavelet_time_s=wavelet_time_s,
         wavelet=wavelet,
         tie=tie,
     )
@@ -1376,47 +1379,54 @@ def _write_forward_figure(
     twt: np.ndarray,
     well: pd.DataFrame,
     volume: RealFieldVolume,
+    wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
     tie: Mapping[str, Any],
 ) -> tuple[str, dict[str, float | int]]:
     if twt.size < 9:
         return "insufficient_forward_qc_support", {}
     filled = _fill_nonfinite(pred_log_ai)
-    synthetic = forward_log_ai(filled[None, :], wavelet)[0]
+    synthetic = forward_time(filled[None, :], wavelet_time_s, wavelet)[0]
     observed, inside = sample_volume_trilinear(
         volume.seismic,
         ilines=volume.ilines,
         xlines=volume.xlines,
         twt_s=volume.twt_s,
-        inline_values=well["inline"].to_numpy(dtype=np.float64)[1:],
-        xline_values=well["xline"].to_numpy(dtype=np.float64)[1:],
-        sample_twt_s=twt[1:],
+        inline_values=well["inline"].to_numpy(dtype=np.float64),
+        xline_values=well["xline"].to_numpy(dtype=np.float64),
+        sample_twt_s=twt,
     )
     valid = inside & np.isfinite(synthetic) & np.isfinite(observed)
     start = _number(tie.get("tie_window_start_s"))
     stop = _number(tie.get("tie_window_end_s"))
     if np.isfinite(start) and np.isfinite(stop):
-        valid &= (twt[1:] >= start) & (twt[1:] <= stop)
+        valid &= (twt >= start) & (twt <= stop)
     run = _largest_true_run(valid)
     if run is None or run[1] - run[0] < 8:
         return "insufficient_forward_qc_support", {}
-    sl = slice(*run)
-    basis = twt[1:][sl]
-    pred_ai = grid.Log(np.exp(filled[1:][sl]), basis, "twt", name="Predicted AI")
+    metric_slice = slice(*run)
+    plot_start = max(run[0], 1)
+    plot_stop = run[1]
+    if plot_stop - plot_start < 8:
+        return "insufficient_forward_qc_support", {}
+    sample_slice = slice(plot_start, plot_stop)
+    interface_slice = slice(plot_start - 1, plot_stop - 1)
+    basis = twt[sample_slice]
+    pred_ai = grid.Log(np.exp(filled[sample_slice]), basis, "twt", name="Predicted AI")
     filtered_ai = grid.Log(
-        np.exp(_fill_nonfinite(filtered_log_ai)[1:][sl]),
+        np.exp(_fill_nonfinite(filtered_log_ai)[sample_slice]),
         basis,
         "twt",
         name="Filtered LAS AI",
     )
     reflectivity = grid.Reflectivity(
-        np.tanh(0.5 * np.diff(filled))[sl],
+        np.tanh(0.5 * np.diff(filled))[interface_slice],
         basis,
         "twt",
         name="Reflectivity",
     )
-    synthetic_trace = grid.Seismic(synthetic[sl], basis, "twt", name="Synthetic")
-    observed_trace = grid.Seismic(observed[sl], basis, "twt", name="Seismic")
+    synthetic_trace = grid.Seismic(synthetic[sample_slice], basis, "twt", name="Synthetic")
+    observed_trace = grid.Seismic(observed[sample_slice], basis, "twt", name="Seismic")
     xcorr_values = normalized_xcorr(observed_trace.values, synthetic_trace.values)
     xcorr_basis = synthetic_trace.sampling_rate * np.arange(
         -(synthetic_trace.size - 1),
@@ -1437,13 +1447,15 @@ def _write_forward_figure(
     )
     fig.savefig(path, dpi=180)
     plt.close(fig)
-    raw = waveform_qc_metrics(observed_trace.values, synthetic_trace.values)
-    denominator = float(np.dot(synthetic_trace.values, synthetic_trace.values))
+    observed_metrics = observed[metric_slice]
+    synthetic_metrics = synthetic[metric_slice]
+    raw = waveform_qc_metrics(observed_metrics, synthetic_metrics)
+    denominator = float(np.dot(synthetic_metrics, synthetic_metrics))
     positive_scale = (
         max(
             0.0,
             float(
-                np.dot(observed_trace.values, synthetic_trace.values) / denominator
+                np.dot(observed_metrics, synthetic_metrics) / denominator
             ),
         )
         if denominator > 0.0
@@ -1451,8 +1463,8 @@ def _write_forward_figure(
     )
     scaled = (
         waveform_qc_metrics(
-            observed_trace.values,
-            positive_scale * synthetic_trace.values,
+            observed_metrics,
+            positive_scale * synthetic_metrics,
         )
         if np.isfinite(positive_scale)
         else {}

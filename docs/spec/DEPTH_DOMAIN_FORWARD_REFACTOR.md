@@ -116,9 +116,11 @@ W_time[l, j] = w(twt_s[l] - event_twt_s[j])
 s_time[l]    = Σ_j W_time[l, j] * r[j]
 ```
 
-输出为 `N` 点。其中 `s_time[1:]` 应逐点复现旧 `N-1` Robinson
-`convolve(r, wavelet, mode="same")` 的结果；首点 `s_time[0]` 由有限子波支撑
-正常计算，不是补零。时间域训练不再需要"丢弃首样点"。
+输出为 `N` 点。`s_time[1:]` 是按上述显式挂点定义得到的常规居中 Robinson
+结果；当反射率道不短于子波时，它逐点复现旧 `N-1`
+`convolve(r, wavelet, mode="same")`。当子波长于偶数长度的反射率道时，NumPy
+的 `same` 裁剪存在一采样居中歧义，不再把该历史裁剪伪影作为基准。首点
+`s_time[0]` 由有限子波支撑正常计算，不是补零。时间域训练不再需要"丢弃首样点"。
 
 **深度域。** 沿用 §4.4–4.5 的非平稳算子，输出同样为 TVDSS 上的 `N` 点。
 界面时间 `t_interface_j = 0.5 * (t_sample_j + t_sample_{j+1})`（相邻样点
@@ -260,7 +262,8 @@ forward_time(
 - 构造显式 `W_time[N, N-1]` 后累加；不通过 `convolve(mode="same")` 隐式
   决定输出长度。
 - `wavelet_time_s` 与 `wavelet_amp` 先通过公共子波校验，再参与正演。
-- 输出 `[1:]` 与当前 Robinson 卷积结果逐点一致；首点由有限子波支撑正常计算。
+- 输出遵循 §4.3 的显式下界面挂点；在反射率道不短于子波时，`[1:]` 与当前
+  Robinson 卷积逐点一致；首点由有限子波支撑正常计算。
 
 ### 5.4 `build_depth_operator`
 
@@ -636,7 +639,9 @@ Step 4/5/6 已落地：
 
 测试由实现方编写，用户在本地环境运行。至少覆盖：
 
-1. 新时间 `N` 点输出 `[1:]` 与当前 Robinson 正演逐点一致；首点非补零。
+1. 新时间 `N` 点输出符合显式下界面算子；反射率道不短于子波时 `[1:]` 与
+   当前 Robinson 正演逐点一致；短道不继承 NumPy `same` 的偶数长度裁剪歧义；
+   首点非补零。
 2. NumPy/PyTorch 时间（`N` 点）和深度（`N` 点）结果分别一致。
 3. 分块深度结果与完整 `W_depth` fixture 一致；`return_operator` 两条路径 shape 正确。
 4. PyTorch 对 logAI 和速度分别通过双精度 `gradcheck`。
@@ -658,7 +663,8 @@ Step 4/5/6 已落地：
 本重构完成需同时满足：
 
 - `src/cup/physics/` 是新通用工作流唯一的正演和岩石物理实现来源；
-- `forward_time` 输出 `N` 点，`[1:]` 复现既有 Robinson 结果，首点非补零；
+- `forward_time` 输出 `N` 点，遵循显式下界面挂点；常规长度下 `[1:]` 复现
+  既有 Robinson 结果，首点非补零；
 - `forward_depth` 输出 TVDSS 上 `N` 点，分块/完整、NumPy/PyTorch 一致；
 - 时间域和深度域共享同一套 logAI（`N`）、反射率（`N-1`）、地震（`N`）形状契约；
 - Step 7 明确保持暂缓，实施前先完成独立的深度 LFM 设计；

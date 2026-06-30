@@ -122,8 +122,11 @@ def _convolve_sample_aligned(reflectivity: np.ndarray, wavelet_amp: np.ndarray) 
 
     With an odd wavelet of half-width ``c``, output sample ``l`` is full
     convolution sample ``c + l - 1``.  Consequently ``output[..., 1:]`` is
-    exactly the repository's legacy Robinson ``same`` result, including the
-    historical crop behavior when the wavelet is longer than the trace.
+    the conventional centered Robinson result.  It also matches the legacy
+    ``same`` implementation when the reflectivity trace is not shorter than
+    the wavelet.  For shorter even-length reflectivity traces, NumPy's
+    ``same`` crop is ambiguous by one sample; this explicit lower-interface
+    alignment remains authoritative.
     """
     interfaces = reflectivity.shape[-1]
     output_samples = interfaces + 1

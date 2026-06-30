@@ -25,11 +25,11 @@ sys.path.insert(0, src_text)
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.config.sources import assert_same_path, load_summary, resolve_source_file_from_run, resolve_source_run
+from cup.physics.numpy_backend import forward_time
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
 from cup.utils.statistics import radius_connected_components
 from ginn_v2.real_field import (
     diagnostic_metrics,
-    forward_log_ai,
     load_selected_wavelet,
     load_zero_shot_predictions,
     phase_shift_scan,
@@ -75,9 +75,9 @@ def _align_forward_arrays(
     synthetic: np.ndarray,
     valid: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    obs = np.asarray(observed, dtype=np.float64)[..., 1:]
+    obs = np.asarray(observed, dtype=np.float64)
     syn = np.asarray(synthetic, dtype=np.float64)
-    mask = np.asarray(valid, dtype=bool)[..., 1:]
+    mask = np.asarray(valid, dtype=bool)
     if obs.shape != syn.shape or mask.shape != syn.shape:
         raise ValueError(f"Forward diagnostic shape mismatch: obs={obs.shape}, syn={syn.shape}, mask={mask.shape}")
     return obs, syn, mask
@@ -337,14 +337,24 @@ def _band_rms_2d(values: np.ndarray, valid: np.ndarray, *, dt_s: float, low_hz: 
     return float(np.sqrt(np.mean(component[flat_mask] ** 2)))
 
 
-def _read_wavelet_csv(path: Path) -> np.ndarray:
+def _read_wavelet_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
     frame = pd.read_csv(path)
-    if "amplitude" not in frame:
-        raise ValueError(f"Wavelet CSV lacks amplitude column: {path}")
-    return frame["amplitude"].to_numpy(dtype=np.float64)
+    missing = sorted({"time_s", "amplitude"} - set(frame.columns))
+    if missing:
+        raise ValueError(f"Wavelet CSV lacks columns {missing}: {path}")
+    return (
+        frame["time_s"].to_numpy(dtype=np.float64),
+        frame["amplitude"].to_numpy(dtype=np.float64),
+    )
 
 
-def _load_wavelet_scenarios(wavelet_dir: Path, nominal: np.ndarray, nominal_meta: dict[str, object], run_cfg: dict) -> list[dict[str, object]]:
+def _load_wavelet_scenarios(
+    wavelet_dir: Path,
+    nominal_time_s: np.ndarray,
+    nominal: np.ndarray,
+    nominal_meta: dict[str, object],
+    run_cfg: dict,
+) -> list[dict[str, object]]:
     scan_cfg = dict(run_cfg.get("diagnostic_scan") or {})
     limit = int(scan_cfg.get("candidate_wavelet_limit", 0) or 0)
     scenarios: list[dict[str, object]] = [
@@ -354,6 +364,7 @@ def _load_wavelet_scenarios(wavelet_dir: Path, nominal: np.ndarray, nominal_meta
             "candidate_score": float("nan"),
             "wavelet_path": str(nominal_meta["selected_wavelet_csv"]),
             "wavelet_sha256": str(nominal_meta["wavelet_sha256"]),
+            "wavelet_time_s": nominal_time_s,
             "wavelet": nominal,
         }
     ]
@@ -378,8 +389,8 @@ def _load_wavelet_scenarios(wavelet_dir: Path, nominal: np.ndarray, nominal_meta
         path = source_auto_tie / "wavelets" / f"wavelet_201ms_{source_well}.csv"
         if not path.is_file():
             continue
-        wavelet = _read_wavelet_csv(path)
-        if wavelet.size != nominal.size:
+        candidate_time_s, wavelet = _read_wavelet_csv(path)
+        if wavelet.size != nominal.size or not np.array_equal(candidate_time_s, nominal_time_s):
             continue
         scenarios.append(
             {
@@ -388,6 +399,7 @@ def _load_wavelet_scenarios(wavelet_dir: Path, nominal: np.ndarray, nominal_meta
                 "candidate_score": float(pd.to_numeric(row.get("score"), errors="coerce")),
                 "wavelet_path": repo_relative_path(path, root=REPO_ROOT),
                 "wavelet_sha256": sha256_file(path),
+                "wavelet_time_s": candidate_time_s,
                 "wavelet": wavelet,
             }
         )
@@ -902,6 +914,7 @@ def _build_volume_well_forward_qc(
     output_dir: Path,
     predictions: dict[str, dict[str, object]],
     synthetic_by_role: dict[str, np.ndarray],
+    wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
     observed: np.ndarray,
     lfm: np.ndarray,
@@ -985,10 +998,12 @@ def _build_volume_well_forward_qc(
         cluster_info = spatial_clusters.get(well_name, {})
         spatial_cluster_id = cluster_info.get("spatial_cluster_id", -1)
         spatial_cluster_size = cluster_info.get("spatial_cluster_size", 1)
-        filtered_synthetic = forward_log_ai(well_log_ai[None, :], wavelet)[0]
-        forward_twt = sample_twt[1:]
-        forward_ilines = sample_ilines[1:]
-        forward_xlines = sample_xlines[1:]
+        filtered_synthetic = forward_time(
+            _fill_nonfinite_1d(well_log_ai)[None, :], wavelet_time_s, wavelet
+        )[0]
+        forward_twt = sample_twt
+        forward_ilines = sample_ilines
+        forward_xlines = sample_xlines
         observed_forward, observed_inside = _sample_volume_bilinear(
             observed,
             ilines=ilines,
@@ -998,7 +1013,7 @@ def _build_volume_well_forward_qc(
             xline_values=forward_xlines,
             sample_twt_s=forward_twt,
         )
-        forward_valid_base = observed_inside & model_valid[1:]
+        forward_valid_base = observed_inside & model_valid
         filtered_waveform = diagnostic_metrics(
             observed=observed_forward[None, :],
             synthetic=filtered_synthetic[None, :],
@@ -1164,7 +1179,7 @@ def _build_volume_well_forward_qc(
                     synthetic_by_role[synthetic_key],
                     ilines=ilines,
                     xlines=xlines,
-                    twt_s=twt_s[1:],
+                    twt_s=twt_s,
                     inline_values=forward_ilines,
                     xline_values=forward_xlines,
                     sample_twt_s=forward_twt,
@@ -1225,11 +1240,19 @@ def _plot_volume_well_qc_case(
     observed = np.asarray(observed, dtype=np.float64)
     synthetic = np.asarray(synthetic, dtype=np.float64)
     valid_forward = np.asarray(valid_forward, dtype=bool)
-    if sample_twt.size < 2 or observed.shape != synthetic.shape or observed.shape != sample_twt[1:].shape:
+    if sample_twt.size < 2 or observed.shape != synthetic.shape or observed.shape != sample_twt.shape:
         return outputs
     selected_filled = _fill_nonfinite_1d(selected_log_ai)
     reflectivity = np.tanh(0.5 * (selected_filled[1:] - selected_filled[:-1]))
-    plot_mask = valid_forward & np.isfinite(observed) & np.isfinite(synthetic) & np.isfinite(reflectivity)
+    observed_plot = observed[1:]
+    synthetic_plot = synthetic[1:]
+    valid_plot = valid_forward[1:]
+    plot_mask = (
+        valid_plot
+        & np.isfinite(observed_plot)
+        & np.isfinite(synthetic_plot)
+        & np.isfinite(reflectivity)
+    )
     twt_forward = sample_twt[1:]
     if np.isfinite(tie_window_start_s) and np.isfinite(tie_window_end_s):
         plot_mask &= (twt_forward >= float(tie_window_start_s)) & (twt_forward <= float(tie_window_end_s))
@@ -1243,8 +1266,8 @@ def _plot_volume_well_qc_case(
     basis = twt_forward[sl]
     selected_ai = np.exp(selected_filled[1:][sl])
     filtered_ai = np.exp(_fill_nonfinite_1d(filtered_log_ai)[1:][sl])
-    synthetic_trace = grid.Seismic(synthetic[sl], basis, "twt", name="Synthetic")
-    observed_trace = grid.Seismic(observed[sl], basis, "twt", name="Seismic")
+    synthetic_trace = grid.Seismic(synthetic_plot[sl], basis, "twt", name="Synthetic")
+    observed_trace = grid.Seismic(observed_plot[sl], basis, "twt", name="Seismic")
     reflectivity_trace = grid.Reflectivity(reflectivity[sl], basis, "twt", name="Reflectivity")
     selected_ai_trace = grid.Log(selected_ai, basis, "twt", name=f"{role} AI")
     traces: list[grid.Log] = [selected_ai_trace]
@@ -1281,6 +1304,7 @@ def _build_well_forward_qc(
     output_dir: Path,
     predictions: dict[str, dict[str, object]],
     synthetic_dir: Path,
+    wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
 ) -> tuple[pd.DataFrame, dict[str, str]]:
     cfg = dict(run_cfg.get("well_qc") or {})
@@ -1419,7 +1443,11 @@ def _build_well_forward_qc(
                 observed = np.asarray(syn_arrays["observed_seismic_forward_axis"], dtype=np.float64)[trace_idx : trace_idx + 1]
                 twt_forward = np.asarray(syn_arrays["twt_s_forward_axis"], dtype=np.float64)
                 valid_forward = np.asarray(syn_arrays["valid_mask_forward_axis"], dtype=bool)[trace_idx : trace_idx + 1]
-            filtered_synthetic = forward_log_ai(well_log_ai[None, :], wavelet)
+            filtered_synthetic = forward_time(
+                _fill_nonfinite_1d(well_log_ai)[None, :],
+                wavelet_time_s,
+                wavelet,
+            )
             tie_start = pd.to_numeric(tie.get("tie_window_start_s"), errors="coerce")
             tie_end = pd.to_numeric(tie.get("tie_window_end_s"), errors="coerce")
             if np.isfinite(tie_start) and np.isfinite(tie_end):
@@ -1568,7 +1596,6 @@ def _plot_well_qc(
     well_log_ai = np.asarray(well_log_ai, dtype=np.float64)
     if twt_model.size < 2:
         return outputs
-    twt_forward_model = twt_model[1:]
     for role, payload in predictions.items():
         arrays = payload["arrays"]
         synthetic_path = synthetic_dir / f"zero_shot_{role}.npz"
@@ -1584,14 +1611,22 @@ def _plot_well_qc(
             display_mask = np.asarray(syn_arrays["valid_mask_forward_axis"], dtype=bool)[trace_idx]
         if twt_forward.shape != observed.shape or twt_forward.shape != synthetic.shape:
             continue
-        if reflectivity.shape != twt_forward.shape:
-            if reflectivity.shape == twt_forward_model.shape and np.allclose(twt_forward, twt_forward_model, equal_nan=True):
-                pass
-            else:
-                continue
-        plot_mask = display_mask & np.isfinite(observed) & np.isfinite(synthetic) & np.isfinite(reflectivity)
+        if twt_forward.shape != twt_model.shape or not np.allclose(
+            twt_forward, twt_model, equal_nan=True
+        ):
+            continue
+        observed_plot = observed[1:]
+        synthetic_plot = synthetic[1:]
+        display_plot = display_mask[1:]
+        twt_plot = twt_forward[1:]
+        plot_mask = (
+            display_plot
+            & np.isfinite(observed_plot)
+            & np.isfinite(synthetic_plot)
+            & np.isfinite(reflectivity)
+        )
         if np.isfinite(tie_window_start_s) and np.isfinite(tie_window_end_s):
-            plot_mask &= (twt_forward >= float(tie_window_start_s)) & (twt_forward <= float(tie_window_end_s))
+            plot_mask &= (twt_plot >= float(tie_window_start_s)) & (twt_plot <= float(tie_window_end_s))
         run = _largest_true_run(plot_mask)
         if run is None:
             continue
@@ -1599,11 +1634,11 @@ def _plot_well_qc(
         if stop - start < 8:
             continue
         sl = slice(start, stop)
-        basis = twt_forward[sl]
+        basis = twt_plot[sl]
         pred_ai = np.exp(pred_filled[1:][sl])
         filtered_ai = np.exp(well_log_ai[1:][sl])
-        synthetic_trace = grid.Seismic(synthetic[sl], basis, "twt", name="Synthetic")
-        observed_trace = grid.Seismic(observed[sl], basis, "twt", name="Seismic")
+        synthetic_trace = grid.Seismic(synthetic_plot[sl], basis, "twt", name="Synthetic")
+        observed_trace = grid.Seismic(observed_plot[sl], basis, "twt", name="Seismic")
         reflectivity_trace = grid.Reflectivity(reflectivity[sl], basis, "twt", name="Reflectivity")
         pred_ai_trace = grid.Log(pred_ai, basis, "twt", name=f"{role} AI")
         filtered_ai_trace = grid.Log(filtered_ai, basis, "twt", name="Filtered LAS AI")
@@ -2246,8 +2281,14 @@ def main() -> None:
     dt_s = float(np.median(np.diff(twt_s))) if twt_s.size > 1 else 0.002
 
     wavelet_dir = _resolve_wavelet_dir(run_cfg, zero_shot_dir=zero_shot_dir, output_root=output_root)
-    wavelet, wavelet_meta = load_selected_wavelet(wavelet_dir)
-    wavelet_scenarios = _load_wavelet_scenarios(wavelet_dir, wavelet, wavelet_meta, run_cfg)
+    wavelet_time_s, wavelet, wavelet_meta = load_selected_wavelet(wavelet_dir)
+    wavelet_scenarios = _load_wavelet_scenarios(
+        wavelet_dir,
+        wavelet_time_s,
+        wavelet,
+        wavelet_meta,
+        run_cfg,
+    )
 
     scan_cfg = dict(run_cfg.get("diagnostic_scan") or {})
     phase_values = [float(v) for v in scan_cfg.get("phase_deg", [-20, -10, 0, 10, 20])]
@@ -2274,7 +2315,7 @@ def main() -> None:
     synthetic_dir = output_dir / "synthetic"
     synthetic_dir.mkdir(parents=True, exist_ok=False)
     for model_role, log_ai, source_role in impedance_inputs:
-        synthetic = forward_log_ai(log_ai, wavelet)
+        synthetic = forward_time(log_ai, wavelet_time_s, wavelet)
         synthetic_by_role[model_role] = synthetic
         obs_crop, syn_crop, valid_crop = _align_forward_arrays(
             observed,
@@ -2286,8 +2327,8 @@ def main() -> None:
             {
                 "model_role": model_role,
                 "source_role": source_role,
-                "forward_operator_id": "real_field_log_ai_tanh_reflectivity_nominal_wavelet_v1",
-                "reflectivity_hang_point": "r[j]=tanh((x[j]-x[j-1])/2), aligned to observed[:, 1:]",
+                "forward_operator_id": "cup.physics.forward_time_n_point_v1",
+                "reflectivity_hang_point": "r[j]=tanh((x[j+1]-x[j])/2), event_twt=twt[j+1]",
                 "diagnostic_window": "full_valid_mask",
                 **metrics,
             }
@@ -2295,17 +2336,17 @@ def main() -> None:
         figure_outputs[model_role] = _plot_forward_qc(
             output_dir=output_dir,
             model_role=model_role,
-            observed=observed[..., 1:],
+            observed=observed,
             synthetic=synthetic,
-            display_valid=valid[..., 1:],
+            display_valid=valid,
             diagnostic_valid=valid_crop,
         )
         np.savez_compressed(
             synthetic_dir / f"{model_role}.npz",
             synthetic_seismic=synthetic.astype(np.float32),
-            observed_seismic_forward_axis=observed[..., 1:].astype(np.float32),
-            valid_mask_forward_axis=valid[..., 1:].astype(bool),
-            twt_s_forward_axis=twt_s[1:],
+            observed_seismic_forward_axis=observed.astype(np.float32),
+            valid_mask_forward_axis=valid.astype(bool),
+            twt_s_forward_axis=twt_s,
         )
         scan = phase_shift_scan(
             observed=obs_crop,
@@ -2318,8 +2359,9 @@ def main() -> None:
         scan_frames.append(scan)
         spatial_rows.extend(_spatial_rows(model_role=model_role, observed=obs_crop, synthetic=syn_crop, valid=valid_crop))
         for scenario in wavelet_scenarios:
+            scenario_time_s = np.asarray(scenario["wavelet_time_s"], dtype=np.float64)
             scenario_wavelet = np.asarray(scenario["wavelet"], dtype=np.float64)
-            scenario_synthetic = forward_log_ai(log_ai, scenario_wavelet)
+            scenario_synthetic = forward_time(log_ai, scenario_time_s, scenario_wavelet)
             obs_wave, syn_wave, valid_wave = _align_forward_arrays(
                 observed,
                 scenario_synthetic,
@@ -2340,12 +2382,12 @@ def main() -> None:
                 }
             )
 
-    common_forward_valid = valid[..., 1:].astype(bool)
+    common_forward_valid = valid.astype(bool)
     forward_band_frame, forward_band_figures = _write_forward_band_residual_qc(
         output_dir,
         run_cfg=run_cfg,
         dt_s=dt_s,
-        observed_forward=observed[..., 1:],
+        observed_forward=observed,
         synthetic_by_role=synthetic_by_role,
         valid_forward=common_forward_valid,
     )
@@ -2379,6 +2421,7 @@ def main() -> None:
             output_dir=output_dir,
             predictions=predictions,
             synthetic_by_role=synthetic_by_role,
+            wavelet_time_s=wavelet_time_s,
             wavelet=wavelet,
             observed=observed,
             lfm=lfm,
@@ -2394,6 +2437,7 @@ def main() -> None:
             output_dir=output_dir,
             predictions=predictions,
             synthetic_dir=synthetic_dir,
+            wavelet_time_s=wavelet_time_s,
             wavelet=wavelet,
         )
         well_samples_frame = pd.DataFrame(
@@ -2448,20 +2492,20 @@ def main() -> None:
     )
 
     summary = {
-        "schema_version": "real_field_forward_diagnostic_summary_v1",
+        "schema_version": "real_field_forward_diagnostic_summary_v2",
         "status": "ok",
         "mode": output_mode,
         "config_file": repo_relative_path(cfg_path, root=REPO_ROOT),
         "zero_shot_dir": repo_relative_path(zero_shot_dir, root=REPO_ROOT),
         "wavelet": wavelet_meta,
         "forward_contract": {
-            "reflectivity": "r[j] = tanh((logAI[j] - logAI[j-1]) / 2)",
-            "convolution": "numpy.convolve(trace_reflectivity, wavelet, mode='same')",
-            "observed_alignment": "observed[:, 1:]",
-            "time_alignment_mode": "drop_first_observed_sample_to_match_N_minus_1_reflectivity_axis",
-            "discarded_samples_for_forward_axis": 1,
-            "synthetic_twt_axis": "twt_s[1:] on full valid mask",
-            "observed_twt_axis_after_alignment": "twt_s[1:] on full valid mask",
+            "reflectivity": "r[j] = tanh((logAI[j+1] - logAI[j]) / 2)",
+            "convolution": "cup.physics.numpy_backend.forward_time",
+            "observed_alignment": "observed and synthetic share the N-point twt_s axis",
+            "time_alignment_mode": "explicit_lower_interface_N_point_operator",
+            "discarded_samples_for_forward_axis": 0,
+            "synthetic_twt_axis": "twt_s on full valid mask",
+            "observed_twt_axis_after_alignment": "twt_s on full valid mask",
             "dt_s": dt_s,
             "diagnostic_window": "full_valid_mask",
             "forward_diagnostic_erosion": "disabled",

@@ -154,11 +154,15 @@ real_field_forward_diagnostic:
 对每个阻抗输入（低频模型、每个 R0 模型预测）执行 Robinson 正演：
 
 ```text
-r[j] = tanh((logAI[j] - logAI[j-1]) / 2)
-synthetic = convolve(r, wavelet)  # 挂在下部样本上
+r[j] = tanh((logAI[j+1] - logAI[j]) / 2)
+event_twt[j] = twt[j+1]
+synthetic[l] = Σ_j wavelet(twt[l] - event_twt[j]) * r[j]
 ```
 
-卷积约定与第四、五步一致：反射系数挂在下部样本上，合成记录对齐到 `observed[:, 1:]`（丢弃观测地震的第一个样点以保证维度匹配）。
+反射系数仍挂在下部界面，长度为 `N-1`；统一 `cup.physics.forward_time`
+在原始 TWT 样点轴上输出 `N` 点合成记录。合成、观测和有效掩码严格共享同一条
+`N` 点轴，不再丢弃观测地震的首样点。井 QC 图为了与 `N-1` 点反射率同轴展示，
+可以只在绘图边界显示第二个及后续样点，但该裁剪不进入 R1 数值指标或产物契约。
 
 这一步同时用全局子波和所有候选子波做多场景正演，用于测试子波不确定性的影响。
 

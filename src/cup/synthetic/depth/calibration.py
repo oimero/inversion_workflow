@@ -153,8 +153,10 @@ def _huber_background(
         if not np.isfinite(scale):
             raise ValueError("nonfinite_huber_scale")
         if scale <= np.finfo(np.float64).eps:
-            weights = np.ones_like(weights)
-            break
+            if float(np.max(np.abs(residual))) <= 1e-12:
+                weights = np.ones_like(weights)
+                break
+            raise ValueError("zero_huber_scale_for_nonexact_fit")
         threshold = float(delta_sigma) * scale
         absolute = np.abs(residual - center)
         new_weights = np.ones_like(weights)

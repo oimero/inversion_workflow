@@ -560,7 +560,9 @@ R0 产物供 R1 消费。schema 为 `real_field_zero_shot_summary_v1`。
 
 ## 08 R1 · real_field_forward_diagnostic.py
 
-R1 是当前流程的最终闭环。schema 为 `real_field_forward_diagnostic_summary_v1`。
+R1 是当前流程的最终闭环。schema 为 `real_field_forward_diagnostic_summary_v2`。
+v2 使用 `cup.physics.forward_time` 的 N 点时间正演契约；观测、合成、有效掩码和
+TWT 轴均为 N 点，不再丢弃首样点。v1 的 N−1 诊断产物不兼容，必须重建。
 
 ### `forward_diagnostic_metrics.csv`
 
@@ -627,9 +629,9 @@ R1 是当前流程的最终闭环。schema 为 `real_field_forward_diagnostic_su
 
 | 关键字段 | 含义 |
 |----------|------|
-| `schema_version` | 固定 `real_field_forward_diagnostic_summary_v1` |
+| `schema_version` | 固定 `real_field_forward_diagnostic_summary_v2` |
 | `status` | `ok` |
-| `forward_contract` | 正演约定：反射率公式、卷积约定、对齐方式、丢弃样点数 |
+| `forward_contract` | 正演约定：显式下界面挂点、N 点轴、对齐方式和丢弃样点数（固定为 0） |
 | `red_flags` | 自动红色告警列表，空列表表示无致命问题 |
 | `recommended_next_state` | `return_to_input_preparation_or_synthetic_diagnostic`（有告警）或 `future_sparse_well_adapter_candidate`（无告警） |
 | `wavelet_sha256` / `zero_shot_summary_sha256` | 输入文件校验值 |

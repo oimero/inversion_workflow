@@ -893,39 +893,9 @@ def input_qc_frame(section: RealFieldSection, normalization: Mapping[str, Any]) 
     return pd.DataFrame.from_records(rows)
 
 
-def forward_log_ai(log_ai: np.ndarray, wavelet: np.ndarray) -> np.ndarray:
-    values = np.asarray(log_ai, dtype=np.float64)
-    if values.ndim < 2:
-        raise ValueError("log_ai must have shape [..., twt].")
-    original_spatial_shape = values.shape[:-1]
-    values_2d = values.reshape((-1, values.shape[-1]))
-    values_2d = _fill_nonfinite_along_time(values_2d)
-    reflectivity = np.tanh(0.5 * (values_2d[:, 1:] - values_2d[:, :-1]))
-    wavelet_values = np.asarray(wavelet, dtype=np.float64).reshape(-1)
-    if wavelet_values.size < 3 or wavelet_values.size % 2 == 0:
-        raise ValueError("wavelet must have odd length >= 3.")
-    out = np.empty_like(reflectivity, dtype=np.float64)
-    for idx in range(reflectivity.shape[0]):
-        out[idx] = np.convolve(reflectivity[idx], wavelet_values, mode="same")
-    return out.reshape((*original_spatial_shape, values.shape[-1] - 1))
-
-
-def _fill_nonfinite_along_time(values: np.ndarray) -> np.ndarray:
-    filled = np.asarray(values, dtype=np.float64).copy()
-    coords = np.arange(filled.shape[1], dtype=np.float64)
-    for idx in range(filled.shape[0]):
-        row = filled[idx]
-        finite = np.isfinite(row)
-        if np.all(finite):
-            continue
-        if not np.any(finite):
-            filled[idx] = 0.0
-            continue
-        filled[idx] = np.interp(coords, coords[finite], row[finite])
-    return filled
-
-
-def load_selected_wavelet(wavelet_generation_dir: Path) -> tuple[np.ndarray, dict[str, Any]]:
+def load_selected_wavelet(
+    wavelet_generation_dir: Path,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     csv_path = wavelet_generation_dir / "selected_wavelet.csv"
     if not csv_path.is_file():
         raise FileNotFoundError(f"selected_wavelet.csv not found: {csv_path}")
@@ -943,7 +913,7 @@ def load_selected_wavelet(wavelet_generation_dir: Path) -> tuple[np.ndarray, dic
         wavelet,
         active_threshold=active_threshold,
     )
-    return wavelet, {
+    return time_s, wavelet, {
         "selected_wavelet_csv": str(csv_path),
         "wavelet_sha256": sha256_file(csv_path),
         "n_samples": int(wavelet.size),

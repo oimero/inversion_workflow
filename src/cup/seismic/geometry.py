@@ -320,9 +320,17 @@ class SurveyLineGeometry:
         i = (dx * self.dy_xline - dy * self.dx_xline) / det
         j = (dy * self.dx_inline - dx * self.dy_inline) / det
 
-        if not (0.0 <= i <= self.inline_axis.count - 1):
+        i_max = float(self.inline_axis.count - 1)
+        j_max = float(self.xline_axis.count - 1)
+        tolerance = 64.0 * np.finfo(np.float64).eps * max(abs(i), abs(j), i_max, j_max, 1.0)
+        if -tolerance <= i <= i_max + tolerance:
+            i = min(i_max, max(0.0, i))
+        if -tolerance <= j <= j_max + tolerance:
+            j = min(j_max, max(0.0, j))
+
+        if not (0.0 <= i <= i_max):
             raise ValueError(f"Point is outside survey inline range: {i}")
-        if not (0.0 <= j <= self.xline_axis.count - 1):
+        if not (0.0 <= j <= j_max):
             raise ValueError(f"Point is outside survey xline range: {j}")
         return float(i), float(j)
 

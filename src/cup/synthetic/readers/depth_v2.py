@@ -72,6 +72,8 @@ class DepthV2Benchmark:
             raise ValueError(
                 f"Synthoseis v2 manifest is not consumable: status={self.manifest.get('status')!r}."
             )
+        if bool(self.manifest.get("qc_only", False)) or self.manifest.get("training_consumable") is False:
+            raise ValueError("Synthoseis v2 qc-only benchmark is not training-consumable; regenerate without --qc-only.")
         if self.manifest.get("sample_domain") != "depth" or self.manifest.get("depth_basis") != "tvdss":
             raise ValueError("Synthoseis v2 reader requires sample_domain=depth and depth_basis=tvdss.")
         for name, digest in dict(self.manifest.get("files") or {}).items():

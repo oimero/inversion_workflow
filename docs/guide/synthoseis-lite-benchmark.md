@@ -134,6 +134,15 @@ python scripts/synthoseis_lite.py `
 初次验证可加 `--debug-attempt-limit 1`。该参数只缩小开发运行，不执行正式接受率门禁，
 因此产物状态为 `development_limited`，不得用于正式训练。
 
+深度 v2 的 `field_conditioned` 支持两个诊断型 CLI 开关：
+
+- `--geometry-family <none|wedge|pinchout>`：临时过滤本次生成的几何家族，不改配置文件；
+- `--qc-only`：完整执行生成和接受率统计，但不持久化 realization HDF5 数组。
+
+`--qc-only` 产物会写 `sample_index.csv`、`generation_qc.csv`、`scenario_catalog.csv`、
+`benchmark_manifest.json` 等 QC 文件，并在 manifest 中标记 `qc_only=true` 与
+`training_consumable=false`。reader 和训练端必须拒绝把它当正式 benchmark 使用。
+
 深度 v2 的 generator 只冻结父样本身份和评估角色：
 
 - `parent_realization_id`；
@@ -143,6 +152,20 @@ python scripts/synthoseis_lite.py `
 生成端不写 train/validation/test 比例。GINN 训练端在 `split_policy=derive` 下按
 `parent_realization_id` 哈希派生 train/validation/test；`geometry_holdout` 永远进入
 test。改变训练比例只重建 patch index 和 normalization，不重新生成 HDF5 benchmark。
+
+深度 v2 的 mismatch 覆盖与时间域 v1 对齐到可比范围：
+
+- 独立时间子波相位旋转和秒制子波平移，均重新执行深度正演；
+- 米制深度静差；
+- white/colored noise、global/tracewise gain；
+- `vertical_lateral_smooth_gain`，即横向与 TVDSS 方向共同变化的二维平滑增益场；
+- `combined_moderate`，按“扰动时间子波 → 深度正演 → 深度静差 → gain → noise”顺序执行。
+
+每个 depth seismic variant 在 HDF5 中写 `seismic_observed`、`observed_valid_mask`、
+`positive_gain` 和 `additive_noise`。depth LFM 在 `controlled_degraded` 后可配置米制
+`over_smoothing`；深度域禁止 Hz 低通字段，并额外写
+`residuals/residual_vs_lfm_ideal` 与
+`residuals/residual_vs_lfm_controlled_degraded`。
 
 ## Reader 与 GINN v2 接缝
 

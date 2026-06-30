@@ -235,7 +235,16 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
         item = _mapping(lfm.get(name), path=f"lfm.{name}")
         allowed_lfm = {"minimum_wavelength_m", "numtaps", "kaiser_beta"}
         if name == "controlled_degraded":
-            allowed_lfm |= {"constant_bias_sigma_log_ai", "linear_vertical_trend_sigma_log_ai", "zonewise_bias_sigma_log_ai", "lateral_smooth_bias_sigma_log_ai", "lateral_correlation_fraction", "amplitude_scale_sigma", "local_missing_control_bias"}
+            allowed_lfm |= {
+                "constant_bias_sigma_log_ai",
+                "linear_vertical_trend_sigma_log_ai",
+                "zonewise_bias_sigma_log_ai",
+                "lateral_smooth_bias_sigma_log_ai",
+                "lateral_correlation_fraction",
+                "amplitude_scale_sigma",
+                "local_missing_control_bias",
+                "over_smoothing",
+            }
         _reject_unknown(item, allowed_lfm, path=f"lfm.{name}")
         wavelength = _positive_float(item.get("minimum_wavelength_m"), path=f"lfm.{name}.minimum_wavelength_m")
         if wavelength != expected:
@@ -249,6 +258,31 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
             if not isinstance(local.get("enabled"), bool):
                 raise ValueError("local_missing_control_bias.enabled must be boolean.")
             parsed_lfm[name]["local_missing_control_bias"] = {"enabled": local["enabled"], "max_abs_log_ai": _positive_float(local.get("max_abs_log_ai"), path="local_missing_control_bias.max_abs_log_ai"), "lateral_width_fraction": _positive_float(local.get("lateral_width_fraction"), path="local_missing_control_bias.lateral_width_fraction"), "vertical_width_fraction": _positive_float(local.get("vertical_width_fraction"), path="local_missing_control_bias.vertical_width_fraction")}
+            smoothing = dict(item.get("over_smoothing") or {"enabled": False})
+            _reject_unknown(
+                smoothing,
+                {"enabled", "minimum_wavelength_m", "numtaps", "kaiser_beta", "blend"},
+                path="lfm.controlled_degraded.over_smoothing",
+            )
+            if not isinstance(smoothing.get("enabled"), bool):
+                raise ValueError("lfm.controlled_degraded.over_smoothing.enabled must be boolean.")
+            parsed_lfm[name]["over_smoothing"] = {"enabled": bool(smoothing["enabled"])}
+            if bool(smoothing["enabled"]):
+                blend = float(smoothing.get("blend"))
+                if not 0.0 <= blend <= 1.0:
+                    raise ValueError("lfm.controlled_degraded.over_smoothing.blend must be within [0, 1].")
+                parsed_lfm[name]["over_smoothing"].update({
+                    "minimum_wavelength_m": _positive_float(
+                        smoothing.get("minimum_wavelength_m"),
+                        path="lfm.controlled_degraded.over_smoothing.minimum_wavelength_m",
+                    ),
+                    "numtaps": _positive_int(
+                        smoothing.get("numtaps"),
+                        path="lfm.controlled_degraded.over_smoothing.numtaps",
+                    ),
+                    "kaiser_beta": float(smoothing.get("kaiser_beta")),
+                    "blend": blend,
+                })
 
     for disabled_name in ("canonical", "probe_selection"):
         disabled = _mapping(root.get(disabled_name), path=f"synthoseis_lite.{disabled_name}")
@@ -256,7 +290,7 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f"Depth v2 requires {disabled_name}.enabled=false with no extra fields.")
 
     mismatch = _mapping(root.get("seismic_mismatch"), path="synthoseis_lite.seismic_mismatch")
-    _reject_unknown(mismatch, {"enabled", "wavelet", "depth_static", "noise", "gain"}, path="synthoseis_lite.seismic_mismatch")
+    _reject_unknown(mismatch, {"enabled", "wavelet", "depth_static", "noise", "gain", "combined"}, path="synthoseis_lite.seismic_mismatch")
     if mismatch.get("enabled") is not True:
         raise ValueError("Depth v2 requires seismic_mismatch.enabled=true.")
     wavelet_mismatch = _mapping(mismatch.get("wavelet"), path="seismic_mismatch.wavelet")
@@ -266,7 +300,32 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     noise = _mapping(mismatch.get("noise"), path="seismic_mismatch.noise")
     _reject_unknown(noise, {"white_noise_rms_fraction", "colored_noise_rms_fraction", "colored_vertical_correlation_m"}, path="seismic_mismatch.noise")
     gain = _mapping(mismatch.get("gain"), path="seismic_mismatch.gain")
-    _reject_unknown(gain, {"global_log_sigma", "tracewise_log_sigma"}, path="seismic_mismatch.gain")
+    _reject_unknown(
+        gain,
+        {
+            "global_log_sigma",
+            "tracewise_log_sigma",
+            "vertical_lateral_log_sigma",
+            "lateral_correlation_fraction",
+            "vertical_correlation_fraction",
+        },
+        path="seismic_mismatch.gain",
+    )
+    combined = dict(mismatch.get("combined") or {"enabled": False})
+    _reject_unknown(
+        combined,
+        {
+            "enabled",
+            "phase_rotation_degrees",
+            "time_shift_s",
+            "depth_static_m",
+            "gain_log_sigma",
+            "noise_rms_fraction",
+        },
+        path="seismic_mismatch.combined",
+    )
+    if not isinstance(combined.get("enabled"), bool):
+        raise ValueError("seismic_mismatch.combined.enabled must be boolean.")
     parsed_mismatch = {
         "enabled": True,
         "wavelet": {
@@ -275,8 +334,23 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
         },
         "depth_static": {"shift_m": [float(value) for value in depth_static.get("shift_m", [])]},
         "noise": {key: _positive_float(noise.get(key), path=f"seismic_mismatch.noise.{key}") for key in ("white_noise_rms_fraction", "colored_noise_rms_fraction", "colored_vertical_correlation_m")},
-        "gain": {key: _positive_float(gain.get(key), path=f"seismic_mismatch.gain.{key}") for key in ("global_log_sigma", "tracewise_log_sigma")},
+        "gain": {
+            key: _positive_float(gain.get(key), path=f"seismic_mismatch.gain.{key}")
+            for key in ("global_log_sigma", "tracewise_log_sigma")
+        },
+        "combined": {"enabled": bool(combined["enabled"])},
     }
+    for key in ("vertical_lateral_log_sigma", "lateral_correlation_fraction", "vertical_correlation_fraction"):
+        if key in gain and gain.get(key) is not None:
+            parsed_mismatch["gain"][key] = _positive_float(gain.get(key), path=f"seismic_mismatch.gain.{key}")
+    if bool(combined["enabled"]):
+        parsed_mismatch["combined"].update({
+            "phase_rotation_degrees": float(combined.get("phase_rotation_degrees")),
+            "time_shift_s": float(combined.get("time_shift_s")),
+            "depth_static_m": float(combined.get("depth_static_m", 0.0)),
+            "gain_log_sigma": _positive_float(combined.get("gain_log_sigma"), path="seismic_mismatch.combined.gain_log_sigma"),
+            "noise_rms_fraction": _positive_float(combined.get("noise_rms_fraction"), path="seismic_mismatch.combined.noise_rms_fraction"),
+        })
     if parsed_mismatch["wavelet"]["phase_rotation_degrees"] != [-10.0, 10.0]:
         raise ValueError("Depth v2 wavelet phase rotations are frozen to [-10, 10] degrees.")
     if parsed_mismatch["wavelet"]["time_shift_s"] != [-0.001, 0.001]:

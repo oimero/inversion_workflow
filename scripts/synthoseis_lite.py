@@ -189,10 +189,6 @@ def main() -> None:
         else:
             if args.suite != "field_conditioned":
                 raise ValueError("Depth Synthoseis-lite v2 only supports --suite field_conditioned.")
-            if args.geometry_family:
-                raise ValueError("Depth v2 geometry filters must be frozen in configuration, not CLI overrides.")
-            if args.qc_only:
-                raise ValueError("Depth v2 does not persist a partial qc-only benchmark.")
             summary = run_depth_generation(
                 workflow=workflow, script_cfg=script_cfg, sources=sources,
                 source_provenance=source_provenance, forward_inputs=forward_inputs,
@@ -200,6 +196,8 @@ def main() -> None:
                 calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
                 repo_root=REPO_ROOT, output_dir=output_dir,
                 debug_attempt_limit=args.debug_attempt_limit,
+                geometry_families=args.geometry_family,
+                qc_only=args.qc_only,
             )
         print("=== synthoseis-lite v2 ===")
         print(f"Command: {args.command}")

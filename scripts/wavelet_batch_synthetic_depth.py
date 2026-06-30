@@ -255,19 +255,40 @@ def compute_depth_shift_curve(tdt_df: pd.DataFrame, twt_s: np.ndarray, shift_s: 
     return pd.DataFrame({"twt_s": twt_s[valid], "tvdss_m": z0, "depth_shift_m": z1 - z0})
 
 
-def build_shifted_md_logset_for_export(
-    logset_md: Any,
-    *,
-    kb_m: float,
-    depth_shift_df: pd.DataFrame,
-) -> dict[str, Any]:
-    from wtie.processing.grid import Log
+def _true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    mask = np.asarray(mask, dtype=bool).reshape(-1)
+    if mask.size == 0:
+        return []
+    padded = np.concatenate(([False], mask, [False]))
+    changes = np.flatnonzero(padded[1:] != padded[:-1])
+    return [(int(start), int(stop)) for start, stop in zip(changes[0::2], changes[1::2])]
 
+
+def _source_null_value(las: Any, default: float = -999.25) -> float:
+    try:
+        value = float(las.well["NULL"].value)
+    except Exception:
+        return float(default)
+    return value if np.isfinite(value) else float(default)
+
+
+def _finite_curve_values(values: np.ndarray, null_value: float) -> tuple[np.ndarray, np.ndarray]:
+    out = np.asarray(values, dtype=float).copy()
+    invalid = ~np.isfinite(out)
+    if np.isfinite(null_value):
+        invalid |= np.isclose(out, null_value, rtol=0.0, atol=1e-9)
+    out[invalid] = np.nan
+    return out, ~invalid
+
+
+def _depth_shift_at_tvdss(
+    tvdss_m: np.ndarray,
+    depth_shift_df: pd.DataFrame,
+) -> tuple[np.ndarray, dict[str, Any]]:
     if depth_shift_df.empty:
         raise ValueError("Depth shift curve is empty; cannot export shifted LAS.")
 
-    md_m = np.asarray(logset_md.basis, dtype=float)
-    tvdss_m = md_m - float(kb_m)
+    tvdss_m = np.asarray(tvdss_m, dtype=float)
     shift_z = depth_shift_df["tvdss_m"].to_numpy(dtype=float)
     shift_m = depth_shift_df["depth_shift_m"].to_numpy(dtype=float)
     finite_shift = np.isfinite(shift_z) & np.isfinite(shift_m)
@@ -281,6 +302,9 @@ def build_shifted_md_logset_for_export(
     unique_shift_z, unique_shift_idx = np.unique(shift_z, return_index=True)
     unique_shift_m = shift_m[unique_shift_idx]
 
+    finite_tvdss = np.isfinite(tvdss_m)
+    below = finite_tvdss & (tvdss_m < unique_shift_z[0])
+    above = finite_tvdss & (tvdss_m > unique_shift_z[-1])
     depth_shift_at_log = np.interp(
         tvdss_m,
         unique_shift_z,
@@ -288,12 +312,28 @@ def build_shifted_md_logset_for_export(
         left=unique_shift_m[0],
         right=unique_shift_m[-1],
     )
-    shifted_md_m = tvdss_m + depth_shift_at_log + float(kb_m)
+    total = int(np.count_nonzero(finite_tvdss))
+    extrapolated = int(np.count_nonzero(below) + np.count_nonzero(above))
+    stats = {
+        "shift_support_tvdss_min_m": float(unique_shift_z[0]),
+        "shift_support_tvdss_max_m": float(unique_shift_z[-1]),
+        "shift_extrapolated_top_count": int(np.count_nonzero(below)),
+        "shift_extrapolated_bottom_count": int(np.count_nonzero(above)),
+        "shift_extrapolated_sample_count": extrapolated,
+        "shift_extrapolated_total_count": total,
+        "shift_extrapolated_fraction": float(extrapolated / total) if total else np.nan,
+    }
+    return depth_shift_at_log, stats
 
-    finite_md = np.isfinite(md_m)
+
+def _regular_md_from_shifted(
+    source_md_m: np.ndarray,
+    shifted_md_m: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    finite_md = np.isfinite(source_md_m)
     if int(finite_md.sum()) < 2:
-        raise ValueError("Input logset has too few finite MD samples.")
-    md_step_m = float(np.nanmedian(np.diff(md_m[finite_md])))
+        raise ValueError("Input LAS has too few finite MD samples.")
+    md_step_m = float(np.nanmedian(np.diff(source_md_m[finite_md])))
     if not np.isfinite(md_step_m) or md_step_m <= 0.0:
         raise ValueError(f"Invalid MD sample step: {md_step_m}")
 
@@ -309,32 +349,346 @@ def build_shifted_md_logset_for_export(
         float(unique_shifted_md[-1]) + 0.5 * md_step_m,
         md_step_m,
     )
+    return regular_md, md_step_m
 
-    def interpolate_curve(values: np.ndarray, curve_name: str) -> np.ndarray:
-        values = np.asarray(values, dtype=float)
-        valid = finite_shifted_md & np.isfinite(values)
-        if int(valid.sum()) < 2:
+
+def _interpolate_curve_preserving_gaps(
+    shifted_md_m: np.ndarray,
+    values: np.ndarray,
+    regular_md: np.ndarray,
+    *,
+    curve_name: str,
+    require_two_samples: bool = False,
+) -> np.ndarray:
+    shifted_md_m = np.asarray(shifted_md_m, dtype=float)
+    values = np.asarray(values, dtype=float)
+    regular_md = np.asarray(regular_md, dtype=float)
+    out = np.full(regular_md.shape, np.nan, dtype=float)
+    valid = np.isfinite(shifted_md_m) & np.isfinite(values)
+    if int(valid.sum()) < 2:
+        if require_two_samples:
             raise ValueError(f"Curve {curve_name} has too few finite shifted samples.")
-        x = shifted_md_m[valid]
-        y = values[valid]
+        return out
+
+    for start, stop in _true_runs(valid):
+        if stop - start < 2:
+            continue
+        x = shifted_md_m[start:stop]
+        y = values[start:stop]
+        local = np.isfinite(x) & np.isfinite(y)
+        if int(local.sum()) < 2:
+            continue
+        x = x[local]
+        y = y[local]
         order = np.argsort(x)
         x = x[order]
         y = y[order]
         unique_x, unique_idx = np.unique(x, return_index=True)
         unique_y = y[unique_idx]
         if unique_x.size < 2:
-            raise ValueError(f"Curve {curve_name} has too few unique shifted samples.")
-        return np.interp(regular_md, unique_x, unique_y)
+            continue
+        inside = (regular_md >= unique_x[0]) & (regular_md <= unique_x[-1])
+        out[inside] = np.interp(regular_md[inside], unique_x, unique_y)
+    if require_two_samples and int(np.count_nonzero(np.isfinite(out))) < 2:
+        raise ValueError(f"Curve {curve_name} has too few finite shifted output samples.")
+    return out
 
-    vp_mps = interpolate_curve(logset_md.Vp.values, "VP_MPS")
-    rho_gcc = interpolate_curve(logset_md.Rho.values, "RHO_GCC")
-    ai = vp_mps * rho_gcc
 
-    return {
-        "VP_MPS": Log(vp_mps, regular_md, "md", name="VP_MPS", unit="m/s", allow_nan=False),
-        "RHO_GCC": Log(rho_gcc, regular_md, "md", name="RHO_GCC", unit="g/cm3", allow_nan=False),
-        "AI": Log(ai, regular_md, "md", name="AI", unit="m/s*g/cm3", allow_nan=False),
+def _curve_index_by_mnemonic(las: Any, mnemonic: str) -> int | None:
+    target = mnemonic.strip().casefold()
+    for idx, curve in enumerate(las.curves):
+        if str(curve.mnemonic).strip().casefold() == target:
+            return idx
+    return None
+
+
+def _append_las_curve_with_nulls(
+    las: Any,
+    mnemonic: str,
+    values: np.ndarray,
+    *,
+    unit: str,
+    descr: str,
+    null_value: float,
+) -> None:
+    out = np.asarray(values, dtype=float).copy()
+    out[~np.isfinite(out)] = float(null_value)
+    las.append_curve(str(mnemonic), out, unit=str(unit or ""), descr=str(descr or mnemonic))
+
+
+def export_shifted_preprocessed_las(
+    source_las: Path,
+    output_las: Path,
+    *,
+    kb_m: float,
+    depth_shift_df: pd.DataFrame,
+) -> tuple[Path, dict[str, Any]]:
+    """Shift a Step-3 preprocessed LAS while preserving all numeric curves and gaps."""
+    import lasio
+
+    source = lasio.read(str(source_las))
+    if len(source.curves) < 2:
+        raise ValueError(f"LAS file has no data curves: {source_las}")
+    data = np.asarray(source.data, dtype=float)
+    if data.ndim != 2 or data.shape[1] != len(source.curves):
+        raise ValueError(f"LAS data shape does not match curve headers: {source_las}")
+
+    null_value = _source_null_value(source)
+    md_m, md_valid = _finite_curve_values(data[:, 0], null_value)
+    if int(np.count_nonzero(md_valid)) < 2:
+        raise ValueError(f"LAS has too few finite MD samples: {source_las}")
+    tvdss_m = md_m - float(kb_m)
+    depth_shift_m, shift_stats = _depth_shift_at_tvdss(tvdss_m, depth_shift_df)
+    shifted_md_m = tvdss_m + depth_shift_m + float(kb_m)
+    regular_md, md_step_m = _regular_md_from_shifted(md_m, shifted_md_m)
+
+    out = lasio.LASFile()
+    for item in source.well:
+        out.well[item.mnemonic] = item
+    for item in source.params:
+        out.params[item.mnemonic] = item
+    out.well["NULL"].value = float(null_value)
+    out.well["STRT"].value = float(regular_md[0])
+    out.well["STOP"].value = float(regular_md[-1])
+    out.well["STEP"].value = float(md_step_m)
+
+    index_curve = source.curves[0]
+    out.append_curve(
+        str(index_curve.mnemonic),
+        regular_md,
+        unit=str(index_curve.unit or "m"),
+        descr=str(index_curve.descr or "Measured depth"),
+    )
+
+    dt_idx = _curve_index_by_mnemonic(source, "DT_USM")
+    rho_idx = _curve_index_by_mnemonic(source, "RHO_GCC")
+    ai_idx = _curve_index_by_mnemonic(source, "AI")
+    recomputed_ai: np.ndarray | None = None
+    if dt_idx is not None and rho_idx is not None:
+        dt_values, _ = _finite_curve_values(data[:, dt_idx], null_value)
+        rho_values, _ = _finite_curve_values(data[:, rho_idx], null_value)
+        shifted_dt = _interpolate_curve_preserving_gaps(
+            shifted_md_m,
+            dt_values,
+            regular_md,
+            curve_name="DT_USM",
+        )
+        shifted_rho = _interpolate_curve_preserving_gaps(
+            shifted_md_m,
+            rho_values,
+            regular_md,
+            curve_name="RHO_GCC",
+        )
+        valid_ai = np.isfinite(shifted_dt) & (shifted_dt > 0.0) & np.isfinite(shifted_rho)
+        recomputed_ai = np.full(regular_md.shape, np.nan, dtype=float)
+        recomputed_ai[valid_ai] = (1_000_000.0 / shifted_dt[valid_ai]) * shifted_rho[valid_ai]
+
+    exported_curves: list[str] = []
+    for idx, curve in enumerate(source.curves[1:], start=1):
+        mnemonic = str(curve.mnemonic)
+        if idx == ai_idx and recomputed_ai is not None:
+            values = recomputed_ai
+        else:
+            source_values, _ = _finite_curve_values(data[:, idx], null_value)
+            values = _interpolate_curve_preserving_gaps(
+                shifted_md_m,
+                source_values,
+                regular_md,
+                curve_name=mnemonic,
+            )
+        _append_las_curve_with_nulls(
+            out,
+            mnemonic,
+            values,
+            unit=str(curve.unit or ""),
+            descr=str(curve.descr or mnemonic),
+            null_value=null_value,
+        )
+        exported_curves.append(mnemonic)
+
+    if ai_idx is None and recomputed_ai is not None:
+        _append_las_curve_with_nulls(
+            out,
+            "AI",
+            recomputed_ai,
+            unit="m/s*g/cm3",
+            descr="AI",
+            null_value=null_value,
+        )
+        exported_curves.append("AI")
+
+    output_las = Path(output_las)
+    output_las.parent.mkdir(parents=True, exist_ok=True)
+    out.write(str(output_las), version=2.0, wrap=False, fmt="%.6f")
+    stats = {
+        **shift_stats,
+        "source_las": repo_relative_path(source_las, root=REPO_ROOT),
+        "exported_las": repo_relative_path(output_las, root=REPO_ROOT),
+        "exported_curve_count": len(exported_curves),
+        "exported_curves": exported_curves,
+        "ai_recomputed": bool(recomputed_ai is not None),
+        "output_md_start_m": float(regular_md[0]),
+        "output_md_end_m": float(regular_md[-1]),
+        "output_md_step_m": float(md_step_m),
+        "output_sample_count": int(regular_md.size),
     }
+    return output_las, stats
+
+
+def build_shifted_filtered_logset_for_export(
+    filtered_logset_md: Any,
+    *,
+    kb_m: float,
+    depth_shift_df: pd.DataFrame,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    from wtie.processing.grid import Log
+
+    md_m = np.asarray(filtered_logset_md.basis, dtype=float)
+    tvdss_m = md_m - float(kb_m)
+    depth_shift_m, shift_stats = _depth_shift_at_tvdss(tvdss_m, depth_shift_df)
+    shifted_md_m = tvdss_m + depth_shift_m + float(kb_m)
+    regular_md, md_step_m = _regular_md_from_shifted(md_m, shifted_md_m)
+
+    vp_mps = _interpolate_curve_preserving_gaps(
+        shifted_md_m,
+        np.asarray(filtered_logset_md.Vp.values, dtype=float),
+        regular_md,
+        curve_name="filtered VP_MPS",
+        require_two_samples=True,
+    )
+    rho_gcc = _interpolate_curve_preserving_gaps(
+        shifted_md_m,
+        np.asarray(filtered_logset_md.Rho.values, dtype=float),
+        regular_md,
+        curve_name="filtered RHO_GCC",
+        require_two_samples=True,
+    )
+    valid_dt = np.isfinite(vp_mps) & (vp_mps > 0.0)
+    dt_usm = np.full(regular_md.shape, np.nan, dtype=float)
+    dt_usm[valid_dt] = 1_000_000.0 / vp_mps[valid_dt]
+    ai = vp_mps * rho_gcc
+    stats = {
+        **shift_stats,
+        "exported_curve_count": 3,
+        "exported_curves": ["DT_USM", "RHO_GCC", "AI"],
+        "ai_recomputed": True,
+        "output_md_start_m": float(regular_md[0]),
+        "output_md_end_m": float(regular_md[-1]),
+        "output_md_step_m": float(md_step_m),
+        "output_sample_count": int(regular_md.size),
+    }
+
+    return (
+        {
+            "DT_USM": Log(dt_usm, regular_md, "md", name="DT_USM", unit="us/m", allow_nan=True),
+            "RHO_GCC": Log(rho_gcc, regular_md, "md", name="RHO_GCC", unit="g/cm3", allow_nan=True),
+            "AI": Log(ai, regular_md, "md", name="AI", unit="m/s*g/cm3", allow_nan=True),
+        },
+        stats,
+    )
+
+
+def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    valid = np.isfinite(a) & np.isfinite(b)
+    if int(np.count_nonzero(valid)) < 2:
+        return np.nan
+    aa = a[valid]
+    bb = b[valid]
+    if float(np.std(aa)) <= 0.0 or float(np.std(bb)) <= 0.0:
+        return np.nan
+    return float(np.corrcoef(aa, bb)[0, 1])
+
+
+def save_r1_style_synthetic_qc(
+    *,
+    well_name: str,
+    output_path: Path,
+    twt_s: np.ndarray,
+    filtered_logset_twt: Any,
+    reflectivity_shifted: np.ndarray,
+    seismic_norm: np.ndarray,
+    synthetic_scaled: np.ndarray,
+    eval_mask: np.ndarray,
+    best_shift_s: float,
+) -> Path:
+    from cup.seismic.viz import plot_well_waveform_qc
+    from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
+    from wtie.processing import grid
+
+    twt_s = np.asarray(twt_s, dtype=float)
+    filtered_ai_basis = np.asarray(filtered_logset_twt.basis, dtype=float)
+    filtered_ai = np.asarray(filtered_logset_twt.Vp.values, dtype=float) * np.asarray(
+        filtered_logset_twt.Rho.values,
+        dtype=float,
+    )
+    filtered_ai_on_twt = np.interp(twt_s, filtered_ai_basis, filtered_ai, left=np.nan, right=np.nan)
+
+    valid = (
+        np.asarray(eval_mask, dtype=bool)
+        & np.isfinite(twt_s)
+        & np.isfinite(filtered_ai_on_twt)
+        & np.isfinite(reflectivity_shifted)
+        & np.isfinite(seismic_norm)
+        & np.isfinite(synthetic_scaled)
+    )
+    runs = _true_runs(valid)
+    if not runs:
+        raise ValueError("No valid samples for R1-style synthetic QC figure.")
+    start, stop = max(runs, key=lambda item: item[1] - item[0])
+    if stop - start < 8:
+        raise ValueError(f"Too few valid samples for R1-style synthetic QC figure: {stop - start}")
+    sl = slice(start, stop)
+
+    basis = twt_s[sl]
+    selected_ai = grid.Log(filtered_ai_on_twt[sl], basis, "twt", name="Filtered AI")
+    reflectivity = grid.Reflectivity(
+        np.asarray(reflectivity_shifted, dtype=float)[sl],
+        basis,
+        "twt",
+        name="Shifted reflectivity",
+    )
+    synthetic_trace = grid.Seismic(
+        np.asarray(synthetic_scaled, dtype=float)[sl],
+        basis,
+        "twt",
+        name="Synthetic",
+    )
+    observed_trace = grid.Seismic(
+        np.asarray(seismic_norm, dtype=float)[sl],
+        basis,
+        "twt",
+        name="Seismic",
+    )
+    xcorr_values = normalized_xcorr(observed_trace.values, synthetic_trace.values)
+    xcorr_basis = synthetic_trace.sampling_rate * np.arange(
+        -(synthetic_trace.size - 1),
+        synthetic_trace.size,
+    )
+    xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
+    dxcorr = dynamic_normalized_xcorr(observed_trace, synthetic_trace)
+    corr = _safe_corr(observed_trace.values, synthetic_trace.values)
+    title = (
+        f"Depth Step 5 synthetic QC | {well_name} | relative TWT | "
+        f"corr={corr:.3f}, best shift={best_shift_s * 1000.0:.1f} ms"
+    )
+    fig, _axes = plot_well_waveform_qc(
+        [selected_ai],
+        reflectivity,
+        synthetic_trace,
+        observed_trace,
+        xcorr,
+        dxcorr,
+        figsize=(12.0, 7.5),
+        synthetic_ai=selected_ai,
+        title=title,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {output_path}")
+    return output_path
 
 
 # =============================================================================
@@ -362,7 +716,7 @@ def process_well(
     modeler: Any,
     output_dirs: dict[str, Path],
 ) -> dict[str, Any]:
-    from cup.well.las import export_logsets_to_las
+    from cup.well.las import export_logset_to_las
     from wtie.optimize import tie as tie_utils
     from wtie.processing import grid
     from wtie.processing.logs import interpolate_nans
@@ -485,46 +839,38 @@ def process_well(
     qc_df.to_csv(qc_path, index=False)
     depth_shift_df.to_csv(depth_shift_path, index=False)
 
-    # Export shifted LAS
-    shifted_logset_for_export = build_shifted_md_logset_for_export(
-        logset_md,
+    # Export depth-shifted LAS products for downstream Synthoseis calibration.
+    shifted_preprocessed_las_path, shifted_preprocessed_stats = export_shifted_preprocessed_las(
+        las_file,
+        output_dirs["shifted_preprocessed_las"] / f"{name}.las",
         kb_m=kb_m,
         depth_shift_df=depth_shift_df,
     )
-    shifted_las_export = export_logsets_to_las(
-        {well_name: shifted_logset_for_export},
-        output_dirs["shifted_las"],
-        curve_names=["VP_MPS", "RHO_GCC", "AI"],
-        write_fmt="%.6f",
+    shifted_filtered_logset_for_export, shifted_filtered_stats = build_shifted_filtered_logset_for_export(
+        filtered_logset_md,
+        kb_m=kb_m,
+        depth_shift_df=depth_shift_df,
     )
-    if not shifted_las_export["exported_files"]:
-        raise ValueError(f"Failed to export shifted LAS: {shifted_las_export}")
-    shifted_las_path = Path(shifted_las_export["exported_files"][0])
+    shifted_filtered_las_path = export_logset_to_las(
+        well_name,
+        shifted_filtered_logset_for_export,
+        output_dirs["shifted_filtered_las"] / f"{name}.las",
+        curve_names=["DT_USM", "RHO_GCC", "AI"],
+        template_las=las_file,
+    )
 
     # Per-well figures
-    fig, axes = plt.subplots(1, 3, figsize=(13, 5), sharey=True)
-    t_ms = twt_s * 1000.0
-    axes[0].plot(best["reflectivity_shifted"], t_ms, lw=0.8, color="tab:purple")
-    axes[0].invert_yaxis()
-    axes[0].set_xlabel("Reflectivity")
-    axes[0].set_ylabel("Relative TWT (ms)")
-    axes[0].set_title("Shifted reflectivity")
-    axes[0].grid(True, alpha=0.25)
-
-    axes[1].plot(seismic_norm, t_ms, lw=0.9, label="Seismic", color="black")
-    axes[1].plot(best_synthetic_scaled, t_ms, lw=0.9, label="Synthetic", color="tab:red", alpha=0.85)
-    axes[1].set_xlabel("Normalized amplitude")
-    axes[1].set_title(f"{well_name}: corr={best_metrics['corr']:.3f}, shift={best_shift_s * 1000:.1f} ms")
-    axes[1].legend(loc="best")
-    axes[1].grid(True, alpha=0.25)
-
-    axes[2].plot(seismic_norm - best_synthetic_scaled, t_ms, lw=0.9, color="tab:gray")
-    axes[2].axvline(0.0, color="black", lw=0.8, alpha=0.5)
-    axes[2].set_xlabel("Residual")
-    axes[2].set_title("Residual")
-    axes[2].grid(True, alpha=0.25)
-    _save_fig(output_dirs["figures"] / f"qc_{name}_synthetic_vs_seismic.png")
-    plt.close(fig)
+    synthetic_fig_path = save_r1_style_synthetic_qc(
+        well_name=well_name,
+        output_path=output_dirs["figures"] / f"qc_{name}_synthetic_vs_seismic.png",
+        twt_s=twt_s,
+        filtered_logset_twt=logset_twt,
+        reflectivity_shifted=best["reflectivity_shifted"],
+        seismic_norm=seismic_norm,
+        synthetic_scaled=best_synthetic_scaled,
+        eval_mask=best["eval_mask"],
+        best_shift_s=best_shift_s,
+    )
 
     fig, ax = plt.subplots(figsize=(7, 3.5))
     ax.plot(scan_df["shift_ms"], scan_df["corr"], lw=1.2, color="tab:blue")
@@ -582,11 +928,14 @@ def process_well(
             "synthetic_qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
             "shift_scan_path": repo_relative_path(scan_path, root=REPO_ROOT),
             "depth_shift_curve_path": repo_relative_path(depth_shift_path, root=REPO_ROOT),
-            "shifted_las_path": repo_relative_path(shifted_las_path, root=REPO_ROOT),
-            "synthetic_fig_path": repo_relative_path(
-                output_dirs["figures"] / f"qc_{name}_synthetic_vs_seismic.png",
-                root=REPO_ROOT,
-            ),
+            "shifted_preprocessed_las_path": repo_relative_path(shifted_preprocessed_las_path, root=REPO_ROOT),
+            "shifted_filtered_las_path": repo_relative_path(shifted_filtered_las_path, root=REPO_ROOT),
+            "shift_extrapolated_fraction": shifted_preprocessed_stats["shift_extrapolated_fraction"],
+            "shift_extrapolated_top_count": shifted_preprocessed_stats["shift_extrapolated_top_count"],
+            "shift_extrapolated_bottom_count": shifted_preprocessed_stats["shift_extrapolated_bottom_count"],
+            "shifted_preprocessed_curve_count": shifted_preprocessed_stats["exported_curve_count"],
+            "shifted_filtered_curve_count": shifted_filtered_stats["exported_curve_count"],
+            "synthetic_fig_path": repo_relative_path(synthetic_fig_path, root=REPO_ROOT),
             "shift_fig_path": repo_relative_path(output_dirs["figures"] / f"qc_{name}_shift_scan.png", root=REPO_ROOT),
         }
     )
@@ -652,7 +1001,8 @@ def main() -> None:
         "synthetic_qc": output_dir / "synthetic_qc",
         "shift_scans": output_dir / "shift_scans",
         "depth_shift_curves": output_dir / "depth_shift_curves",
-        "shifted_las": output_dir / "shifted_las",
+        "shifted_preprocessed_las": output_dir / "shifted_preprocessed_las",
+        "shifted_filtered_las": output_dir / "shifted_filtered_las",
         "figures": output_dir / "figures",
     }
     for d in output_dirs.values():
@@ -816,6 +1166,7 @@ def main() -> None:
     metrics_path = output_dir / "wavelet_batch_metrics.csv"
     metrics_df.to_csv(metrics_path, index=False)
     print(f"\nSaved {metrics_path}")
+    run_summary_path = output_dir / "run_summary.json"
 
     # ── Batch summary figures ──
 
@@ -911,10 +1262,63 @@ def main() -> None:
             print(f"  auto-tie table_t_shift = {source_expected_shift_s * 1000.0:.3f} ms")
             print(f"  difference = {delta_ms:.3f} ms")
 
+    ok_count = int((metrics_df["status"] == "ok").sum()) if "status" in metrics_df.columns else 0
+    failed_count = int((metrics_df["status"] != "ok").sum()) if "status" in metrics_df.columns else len(metrics_df)
+    summary_payload = {
+        "script": "wavelet_batch_synthetic_depth.py",
+        "status": "success" if failed_count == 0 else "failed",
+        "output_dir": repo_relative_path(output_dir, root=REPO_ROOT),
+        "inputs": {
+            "config": repo_relative_path(args.config, root=REPO_ROOT) if args.config.exists() else str(args.config),
+            "las_dir": repo_relative_path(las_dir, root=REPO_ROOT),
+            "source_auto_tie_dir": repo_relative_path(source_auto_tie_dir, root=REPO_ROOT),
+            "source_well_name": source_well_name,
+            "wavelet_file": repo_relative_path(wavelet_path, root=REPO_ROOT),
+            "seismic_file": repo_relative_path(seismic_file, root=REPO_ROOT),
+        },
+        "outputs": {
+            "metrics_csv": repo_relative_path(metrics_path, root=REPO_ROOT),
+            "synthetic_qc_dir": repo_relative_path(output_dirs["synthetic_qc"], root=REPO_ROOT),
+            "shift_scans_dir": repo_relative_path(output_dirs["shift_scans"], root=REPO_ROOT),
+            "depth_shift_curves_dir": repo_relative_path(output_dirs["depth_shift_curves"], root=REPO_ROOT),
+            "shifted_preprocessed_las_dir": repo_relative_path(output_dirs["shifted_preprocessed_las"], root=REPO_ROOT),
+            "shifted_filtered_las_dir": repo_relative_path(output_dirs["shifted_filtered_las"], root=REPO_ROOT),
+            "figures_dir": repo_relative_path(output_dirs["figures"], root=REPO_ROOT),
+        },
+        "las_contract": {
+            "shifted_preprocessed_las": {
+                "role": "depth-shifted full Step-3 preprocessed LAS for Synthoseis full_log_ai",
+                "source": "wavelet_batch_synthetic_depth.las_dir",
+                "curves": "all numeric source curves; AI recomputed from DT_USM/RHO_GCC when available",
+                "filtering": "none",
+                "gap_policy": "preserve finite segments; do not bridge source null gaps",
+            },
+            "shifted_filtered_las": {
+                "role": "depth-shifted filtered LAS for Synthoseis filtered_log_ai/background fit",
+                "source": "Step-5 filtered logset used by synthetic shift scan",
+                "curves": ["DT_USM", "RHO_GCC", "AI"],
+                "filtering": dict(auto_tie_log_filter_params),
+                "gap_policy": "same as Step-5 synthetic scan filtered logset",
+            },
+            "depth_shift_boundary_policy": "edge extrapolate outside depth_shift_curve support and record counts/fraction",
+        },
+        "counts": {
+            "requested_wells": len(well_names),
+            "successful_wells": ok_count,
+            "failed_wells": failed_count,
+        },
+    }
+    run_summary_path.write_text(
+        json.dumps(summary_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"Saved {run_summary_path}")
+
     # ── Manifest ──
 
     print(f"\n=== Outputs ===")
     print(f"Summary: {metrics_path}")
+    print(f"Run summary: {run_summary_path}")
     print(f"Batch figures:")
     print(f"  {output_dirs['figures'] / 'qc_01_batch_metric_summary.png'}")
     print(f"  {output_dirs['figures'] / 'qc_02_batch_depth_shift_summary.png'}")
@@ -926,7 +1330,8 @@ def main() -> None:
                 "synthetic_qc_path",
                 "shift_scan_path",
                 "depth_shift_curve_path",
-                "shifted_las_path",
+                "shifted_preprocessed_las_path",
+                "shifted_filtered_las_path",
                 "synthetic_fig_path",
                 "shift_fig_path",
             ]:

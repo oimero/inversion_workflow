@@ -7,7 +7,12 @@ python scripts/vertical_well_auto_tie_depth.py --config experiments/common_depth
 python scripts/wavelet_batch_synthetic_depth.py --config experiments/common_depth.yaml --output-dir scripts/output/wavelet_batch_synthetic_depth_NW11
 ```
 
-第一份脚本仅从 NW11 提取固定时间子波；第二份脚本使用该子波批量生成合成记录及深度平移结果。二者是当前工区的遗留一次性路径，不属于标准工作流 API，也不作为后续统一正演重构的依赖。
+第一份脚本仅从 NW11 提取固定时间子波；第二份脚本使用该子波批量生成合成记录、深度平移曲线，以及供深度域 Synthoseis 校准使用的两套 LAS：
+
+- `shifted_preprocessed_las/`：深度平移后的 Step 3 全曲线 LAS，相当于时间域工作流的 full AI 来源；
+- `shifted_filtered_las/`：深度平移后的 Step 5 filtered `DT_USM/RHO_GCC/AI`，相当于时间域工作流的 filtered AI 来源。
+
+二者是当前工区的遗留一次性路径，不属于标准工作流 API，也不作为后续统一正演重构的依赖。
 
 以下内容仅适用于时间域标准工作流。
 

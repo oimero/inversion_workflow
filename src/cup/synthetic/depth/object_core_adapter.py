@@ -201,6 +201,8 @@ def generate_depth_object_core_section(
     minimum_highres_cells: int,
     max_global_reversal_fraction: float,
     max_object_reversal_fraction: float,
+    max_global_clipping_fraction: float,
+    max_object_clipping_fraction: float,
     vertical_axis_origin_m: float,
     context_extent_m: float,
 ) -> DepthObjectCoreSection:
@@ -221,10 +223,11 @@ def generate_depth_object_core_section(
         minimum_truth_samples=int(minimum_highres_cells),
         max_global_reversal_fraction=float(max_global_reversal_fraction),
         max_object_reversal_fraction=float(max_object_reversal_fraction),
-        max_global_clipping_fraction=0.0,
-        max_object_clipping_fraction=0.0,
+        max_global_clipping_fraction=float(max_global_clipping_fraction),
+        max_object_clipping_fraction=float(max_object_clipping_fraction),
         vertical_axis_origin=float(vertical_axis_origin_m),
         context_extent=float(context_extent_m),
+        sequence_minimum_duration_reference="minimum",
     )
     return DepthObjectCoreSection(
         tvdss_highres_m=np.asarray(legacy.twt_highres_s, dtype=np.float64),

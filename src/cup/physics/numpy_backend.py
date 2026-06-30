@@ -293,28 +293,46 @@ def forward_depth(
         # that the dense interpolation defines as exactly zero.
         wavelet_min = float(wavelet_time_cast[0])
         wavelet_max = float(wavelet_time_cast[-1])
+        row_indices = np.arange(batch_size)[:, None]
         for output_start in range(0, n_samples, chunk_size):
             output_stop = min(output_start + chunk_size, n_samples)
-            for batch_index in range(batch_size):
-                events = interface_twt[batch_index]
-                for sample_index in range(output_start, output_stop):
-                    sample_time = sample_twt[batch_index, sample_index]
-                    first = int(np.searchsorted(events, sample_time - wavelet_max, side="left"))
-                    last = int(np.searchsorted(events, sample_time - wavelet_min, side="right"))
-                    if first >= last:
-                        continue
-                    tau = sample_time - events[first:last]
-                    weights = np.interp(
-                        tau,
-                        wavelet_time_cast,
-                        amplitude_cast,
-                        left=0.0,
-                        right=0.0,
-                    ).astype(dtype, copy=False)
-                    output[batch_index, sample_index] = np.dot(
-                        weights,
-                        reflectivity[batch_index, first:last],
-                    )
+            for sample_index in range(output_start, output_stop):
+                sample_times = sample_twt[:, sample_index]
+                firsts = np.fromiter(
+                    (
+                        np.searchsorted(events, sample_time - wavelet_max, side="left")
+                        for events, sample_time in zip(interface_twt, sample_times, strict=True)
+                    ),
+                    dtype=np.int64,
+                    count=batch_size,
+                )
+                lasts = np.fromiter(
+                    (
+                        np.searchsorted(events, sample_time - wavelet_min, side="right")
+                        for events, sample_time in zip(interface_twt, sample_times, strict=True)
+                    ),
+                    dtype=np.int64,
+                    count=batch_size,
+                )
+                first = int(np.min(firsts))
+                last = int(np.max(lasts))
+                if first >= last:
+                    continue
+                event_indices = np.arange(first, last, dtype=np.int64)[None, :]
+                tau = sample_times[:, None] - interface_twt[:, first:last]
+                active = (event_indices >= firsts[:, None]) & (event_indices < lasts[:, None])
+                weights = np.interp(
+                    tau.reshape(-1),
+                    wavelet_time_cast,
+                    amplitude_cast,
+                    left=0.0,
+                    right=0.0,
+                ).reshape(tau.shape).astype(dtype, copy=False)
+                weights[~active] = 0.0
+                output[:, sample_index] = np.sum(
+                    weights * reflectivity[row_indices, event_indices],
+                    axis=1,
+                )
     output_shaped = output.reshape(log_values.shape)
     if operator is None:
         return output_shaped

@@ -325,7 +325,12 @@ def _plot_section_geometry(output_dir: Path, generated: list[str], skipped: list
         for horizon, group in section.groupby("horizon_name", sort=False):
             group = group.sort_values("lateral_m")
             ax.plot(group["lateral_m"], group[horizon_col], linewidth=1.5, label=str(horizon))
-            filled = group[~group["trace_valid_control"].astype(bool)]
+            if "trace_valid_control" in group:
+                filled = group[~group["trace_valid_control"].astype(bool)]
+            elif "support_status" in group:
+                filled = group[~group["support_status"].astype(str).str.casefold().eq("ok")]
+            else:
+                filled = group.iloc[0:0]
             if not filled.empty:
                 ax.scatter(filled["lateral_m"], filled[horizon_col], s=10, marker="x", label=f"{horizon} filled")
         ax.invert_yaxis()

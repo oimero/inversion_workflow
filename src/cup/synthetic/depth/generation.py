@@ -426,11 +426,11 @@ def generate_depth_realization(
         minimum_highres_cells=int(script_cfg["impedance"]["minimum_highres_cells"]),
         max_global_reversal_fraction=float(script_cfg["impedance"]["max_global_reversal_fraction"]),
         max_object_reversal_fraction=float(script_cfg["impedance"]["max_object_reversal_fraction"]),
+        max_global_clipping_fraction=float(script_cfg["impedance"]["max_global_clipping_fraction"]),
+        max_object_clipping_fraction=float(script_cfg["impedance"]["max_object_clipping_fraction"]),
         vertical_axis_origin_m=float(survey_axis[0]),
         context_extent_m=context,
     )
-    if float(object_core.qc.get("global_clipping_fraction", 0.0)) != 0.0:
-        raise GenerationRejected(["nonzero_v2_clipping"], diagnostics=dict(object_core.qc), details=[])
     high_axis = np.asarray(object_core.tvdss_highres_m, dtype=np.float64)
     model_axis = np.asarray(object_core.tvdss_model_m, dtype=np.float64)
     if model_axis.size < 2 or not np.array_equal(high_axis[::factor], model_axis):

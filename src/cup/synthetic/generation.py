@@ -587,6 +587,7 @@ def generate_field_section(
     max_object_clipping_fraction: float = 0.02,
     vertical_axis_origin: float | None = None,
     context_extent: float | None = None,
+    sequence_minimum_duration_reference: str = "median",
 ) -> GeneratedSection:
     """Generate one field-conditioned realization and its main closed forward model."""
     lateral = np.asarray(lateral_m, dtype=np.float64).reshape(-1)
@@ -644,7 +645,14 @@ def generate_field_section(
     for zone_index, zone in enumerate(calibration.zones):
         zone_id = str(zone["zone_id"])
         zone_durations = horizons[:, zone_index + 1] - horizons[:, zone_index]
-        reference_duration = float(np.median(zone_durations))
+        if sequence_minimum_duration_reference == "median":
+            reference_duration = float(np.median(zone_durations))
+        elif sequence_minimum_duration_reference == "minimum":
+            reference_duration = float(np.min(zone_durations))
+        else:
+            raise ValueError(
+                "sequence_minimum_duration_reference must be 'median' or 'minimum'."
+            )
         minimum_fraction = minimum_truth_samples * truth_dt / reference_duration
         objects = _sample_object_sequence(
             calibration,

@@ -216,11 +216,14 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not directions or not set(directions) <= {"left_to_right", "right_to_left"}:
         raise ValueError("generation.geometry_directions contains unsupported values.")
     acceptance = _mapping(generation.get("acceptance_qc"), path="generation.acceptance_qc")
-    _reject_unknown(acceptance, {"minimum_attempts_per_scenario", "warning_fraction", "failure_fraction"}, path="generation.acceptance_qc")
+    _reject_unknown(acceptance, {"minimum_attempts_per_scenario", "warning_fraction", "failure_fraction", "enforcement"}, path="generation.acceptance_qc")
     warning = float(acceptance.get("warning_fraction"))
     failure = float(acceptance.get("failure_fraction"))
     if not 0.0 <= failure < warning <= 1.0:
         raise ValueError("generation acceptance fractions must satisfy 0 <= failure < warning <= 1.")
+    enforcement = str(acceptance.get("enforcement", "warn"))
+    if enforcement not in {"warn", "fail_fast"}:
+        raise ValueError("generation.acceptance_qc.enforcement must be warn or fail_fast.")
 
     splits = _mapping(root.get("splits"), path="synthoseis_lite.splits")
     _reject_unknown(splits, {"assignment_unit", "held_out_geometry_family"}, path="synthoseis_lite.splits")
@@ -382,7 +385,7 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "lateral_sample_interval_m": lateral_interval,
         "calibration": {"background_estimator": "per_well_zone_huber", "huber_delta_sigma": _positive_float(calibration.get("huber_delta_sigma"), path="calibration.huber_delta_sigma"), "minimum_valid_cells_per_well_zone": _positive_int(calibration.get("minimum_valid_cells_per_well_zone"), path="calibration.minimum_valid_cells_per_well_zone")},
         "impedance": {"family": GENERATOR_FAMILY, "state_threshold_sigma": _positive_float(impedance.get("state_threshold_sigma"), path="impedance.state_threshold_sigma"), "sensitivity_threshold_sigmas": sensitivity, "minimum_calibration_object_cells": _positive_int(impedance.get("minimum_calibration_object_cells"), path="impedance.minimum_calibration_object_cells"), "minimum_highres_cells": _positive_int(standard_mode.get("minimum_highres_cells"), path="duration_modes.standard.minimum_highres_cells"), "correlation_length_section_fractions": [0.1, 0.3, 1.0], "coefficient_sigma_multipliers": [0.25, 0.50], "thickness_log_sigma_values": [0.10, 0.25], "max_global_reversal_fraction": 0.10, "max_object_reversal_fraction": 0.25, "max_global_clipping_fraction": 0.005, "max_object_clipping_fraction": 0.02},
-        "generation": {"attempts_per_scenario": _positive_int(generation.get("attempts_per_scenario"), path="generation.attempts_per_scenario"), "duration_modes": ["standard"], "geometry_families": geometry_families, "geometry_directions": directions, "acceptance_qc": {"minimum_attempts_per_scenario": _positive_int(acceptance.get("minimum_attempts_per_scenario"), path="generation.acceptance_qc.minimum_attempts_per_scenario"), "warning_fraction": warning, "failure_fraction": failure}},
+        "generation": {"attempts_per_scenario": _positive_int(generation.get("attempts_per_scenario"), path="generation.attempts_per_scenario"), "duration_modes": ["standard"], "geometry_families": geometry_families, "geometry_directions": directions, "acceptance_qc": {"minimum_attempts_per_scenario": _positive_int(acceptance.get("minimum_attempts_per_scenario"), path="generation.acceptance_qc.minimum_attempts_per_scenario"), "warning_fraction": warning, "failure_fraction": failure, "enforcement": enforcement}},
         "splits": {"assignment_unit": "parent_realization", "held_out_geometry_family": held_out},
         "lfm": parsed_lfm,
         "seismic_mismatch": parsed_mismatch,

@@ -370,6 +370,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "minimum_attempts_per_scenario",
         "warning_fraction",
         "failure_fraction",
+        "enforcement",
     }
     _reject_unknown(
         acceptance,
@@ -377,8 +378,26 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         path="synthoseis_lite.generation.acceptance_qc",
     )
     _require_keys(
-        acceptance, acceptance_keys, path="synthoseis_lite.generation.acceptance_qc"
+        acceptance,
+        {
+            "minimum_attempts_per_scenario",
+            "warning_fraction",
+            "failure_fraction",
+        },
+        path="synthoseis_lite.generation.acceptance_qc",
     )
+    acceptance_failure = float(acceptance.get("failure_fraction"))
+    acceptance_warning = float(acceptance.get("warning_fraction"))
+    if not 0.0 <= acceptance_failure < acceptance_warning <= 1.0:
+        raise ValueError(
+            "generation acceptance fractions must satisfy "
+            "0 <= failure < warning <= 1."
+        )
+    acceptance_enforcement = str(acceptance.get("enforcement", "warn"))
+    if acceptance_enforcement not in {"warn", "fail_fast"}:
+        raise ValueError(
+            "generation.acceptance_qc.enforcement must be warn or fail_fast."
+        )
     splits = _mapping(root.get("splits"), path="synthoseis_lite.splits")
     split_keys = {"assignment_unit", "held_out_geometry_family"}
     _reject_unknown(
@@ -715,6 +734,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "scenario_acceptance_failure_fraction": float(
                 acceptance.get("failure_fraction")
             ),
+            "scenario_acceptance_enforcement": acceptance_enforcement,
         },
         "generation": {
             "attempts_per_scenario": int(generation.get("attempts_per_scenario", 20)),
@@ -727,6 +747,14 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                     "geometry_directions", ["left_to_right", "right_to_left"]
                 )
             ),
+            "acceptance_qc": {
+                "minimum_attempts_per_scenario": int(
+                    acceptance.get("minimum_attempts_per_scenario")
+                ),
+                "warning_fraction": float(acceptance.get("warning_fraction")),
+                "failure_fraction": float(acceptance.get("failure_fraction")),
+                "enforcement": acceptance_enforcement,
+            },
         },
         "splits": {
             "assignment_unit": "parent_realization",

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import time
 from typing import Any, Mapping, Sequence
 
 import h5py
@@ -27,6 +28,13 @@ from cup.synthetic.core import (
     geometry_feasibility_rows,
     rejection_reason_summary,
     write_dataset,
+)
+from cup.synthetic.core.progress import (
+    AttemptProgressLog,
+    acceptance_enforcement,
+    build_acceptance_catalog,
+    configure_generation_logger,
+    run_attempt_preflight,
 )
 from cup.synthetic.figures import write_generation_figures
 from cup.synthetic.generation import GenerationRejected, GenerationScenario
@@ -500,7 +508,8 @@ def generate_depth_realization(
     forward_inputs: Mapping[str, Any],
     survey: Any,
     repo_root: Path,
-) -> DepthGeneratedSection:
+    preflight_only: bool = False,
+) -> DepthGeneratedSection | None:
     realization_id = f"{section.section_id}__{scenario.scenario_id}__a{attempt_id:03d}"
     wavelet_path = resolve_relative_path(
         forward_inputs["wavelet"]["path"], root=repo_root
@@ -556,6 +565,8 @@ def generate_depth_realization(
         survey_axis[survey_indices], model_axis, rtol=0.0, atol=1e-9
     ):
         raise ValueError(f"section_context_outside_survey_axis:{section.section_id}")
+    if preflight_only:
+        return None
 
     log_high = np.asarray(object_core.log_ai_highres, dtype=np.float64)
     model_log, antialias_valid_1d = _valid_filter_decimate(
@@ -1289,6 +1300,8 @@ def run_depth_generation(
     qc_only: bool = False,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=False)
+    logger = configure_generation_logger(output_dir, sample_domain="depth")
+    logger.info("Depth Synthoseis generation started")
     calibration, calibration_payload = load_depth_calibration_for_object_core(
         calibration_path
     )
@@ -1352,15 +1365,72 @@ def run_depth_generation(
     plan.to_csv(output_dir / "attempt_plan.csv", index=False)
     scenarios = {item.scenario_id: item for item in generation_scenarios(script_cfg)}
     sections_by_id = {item.section_id: item for item in sections}
+    development = debug_attempt_limit is not None
+    acceptance_qc = dict(script_cfg["generation"]["acceptance_qc"])
+
+    def validate_attempt(row: Mapping[str, Any]) -> None:
+        generate_depth_realization(
+            calibration,
+            calibration_payload,
+            section=sections_by_id[str(row["section_id"])],
+            scenario=scenarios[str(row["scenario_id"])],
+            attempt_id=int(row["attempt_id"]),
+            script_cfg=script_cfg,
+            forward_inputs=forward_inputs,
+            survey=survey,
+            repo_root=repo_root,
+            preflight_only=True,
+        )
+
+    preflight = run_attempt_preflight(
+        plan,
+        validator=validate_attempt,
+        rejection_exceptions=(GenerationRejected, ValueError, FloatingPointError),
+        qc_config=acceptance_qc,
+        output_dir=output_dir,
+        logger=logger,
+        development_limited=development,
+    )
+    enforcement = acceptance_enforcement(acceptance_qc)
+    preflight_summary = {
+        "sample_domain": "depth",
+        "status": "failed" if not preflight.failed.empty else "ok",
+        "enforcement": enforcement,
+        "planned_attempts": int(len(plan)),
+        "accepted_attempts": int(len(preflight.accepted_plan)),
+        "rejected_attempts": int(len(plan) - len(preflight.accepted_plan)),
+        "failed_scenario_count": int(len(preflight.failed)),
+    }
+    write_json(output_dir / "preflight_summary.json", preflight_summary)
+    if preflight.accepted_plan.empty:
+        raise RuntimeError("depth_generation_preflight_no_accepted_realizations")
+    if enforcement == "fail_fast" and not preflight.failed.empty:
+        failed = preflight.failed[
+            ["section_id", "scenario_id", "acceptance_status"]
+        ].to_dict(orient="records")
+        raise RuntimeError(f"depth_generation_preflight_acceptance_qc_failed:{failed}")
+    if not preflight.failed.empty:
+        logger.warning(
+            "preflight acceptance QC has %d failed scenarios; enforcement=warn, "
+            "generation will preserve accepted realizations",
+            len(preflight.failed),
+        )
     index_rows: list[dict[str, Any]] = []
-    rejection_rows: list[dict[str, Any]] = []
+    rejection_rows: list[dict[str, Any]] = list(preflight.rejection_details)
     object_rows: list[dict[str, Any]] = []
     coefficient_rows: list[dict[str, Any]] = []
     highres_rows: list[dict[str, Any]] = []
     subgrid_rows: list[dict[str, Any]] = []
     variant_rows: list[dict[str, Any]] = []
     h5_path = output_dir / "synthetic_benchmark.h5"
-    with h5py.File(h5_path, "w") as h5:
+    with AttemptProgressLog(
+        output_dir / "attempt_progress.csv",
+        phase="generation",
+        plan=preflight.accepted_plan,
+        qc_config=acceptance_qc,
+        logger=logger,
+        append=True,
+    ) as production_progress, h5py.File(h5_path, "w") as h5:
         h5.attrs["schema"] = SCHEMA_VERSION
         h5.attrs["sample_domain"] = "depth"
         h5.attrs["depth_basis"] = "tvdss"
@@ -1369,9 +1439,14 @@ def run_depth_generation(
         h5.attrs["forward_model_inputs_sha256"] = forward_inputs["_sha256"]
         h5.attrs["impedance_calibration_sha256"] = sha256_file(calibration_path)
         h5.attrs["qc_only"] = bool(qc_only)
-        for row in plan.to_dict(orient="records"):
+        for sequence_index, row in enumerate(
+            preflight.accepted_plan.to_dict(orient="records"), start=1
+        ):
+            attempt_started = time.perf_counter()
             section = sections_by_id[str(row["section_id"])]
             scenario = scenarios[str(row["scenario_id"])]
+            progress_status = "rejected"
+            progress_reason = ""
             try:
                 generated = generate_depth_realization(
                     calibration,
@@ -1384,6 +1459,8 @@ def run_depth_generation(
                     survey=survey,
                     repo_root=repo_root,
                 )
+                if generated is None:
+                    raise RuntimeError("depth_generation_returned_no_realization")
                 group_path = "" if qc_only else _write_base(h5, generated)
                 base_id = generated.realization_id
                 common = {
@@ -1503,6 +1580,7 @@ def run_depth_generation(
                 coefficient_rows.extend(generated.object_lateral_coefficients)
                 highres_rows.append(local_highres_row)
                 subgrid_rows.append(local_subgrid_row)
+                progress_status = "accepted"
             except (GenerationRejected, ValueError, FloatingPointError) as exc:
                 failed_parent = str(row["parent_realization_id"])
                 failed_group = f"/realizations/{failed_parent}"
@@ -1515,6 +1593,14 @@ def run_depth_generation(
                         "reason": f"{type(exc).__name__}:{exc}",
                     }
                 )
+                progress_reason = f"{type(exc).__name__}:{exc}"
+            production_progress.record(
+                row,
+                sequence_index=sequence_index,
+                status=progress_status,
+                reason=progress_reason,
+                elapsed_s=time.perf_counter() - attempt_started,
+            )
 
     index = pd.DataFrame.from_records(index_rows)
     index.to_csv(output_dir / "sample_index.csv", index=False)
@@ -1546,45 +1632,26 @@ def run_depth_generation(
         if not index.empty
         else index
     )
-    accepted = (
-        base.groupby(["section_id", "scenario_id"]).size().rename("accepted_count")
+    successful_parent_ids = (
+        base["parent_realization_id"].astype(str)
         if not base.empty
-        else pd.Series(dtype=int)
+        else pd.Series(dtype=str)
     )
-    attempted = (
-        plan.groupby(["section_id", "scenario_id"]).size().rename("attempt_count")
-    )
-    catalog = (
-        attempted.to_frame()
-        .join(accepted, how="left")
-        .fillna({"accepted_count": 0})
-        .reset_index()
-    )
-    catalog["accepted_count"] = catalog["accepted_count"].astype(int)
-    catalog["acceptance_fraction"] = (
-        catalog["accepted_count"] / catalog["attempt_count"]
-    )
-    qc_cfg = script_cfg["generation"]["acceptance_qc"]
-    catalog["acceptance_status"] = np.where(
-        catalog["attempt_count"] < int(qc_cfg["minimum_attempts_per_scenario"]),
-        "insufficient_attempts",
-        np.where(
-            catalog["acceptance_fraction"] < float(qc_cfg["failure_fraction"]),
-            "failed",
-            np.where(
-                catalog["acceptance_fraction"] < float(qc_cfg["warning_fraction"]),
-                "warning",
-                "ok",
-            ),
-        ),
+    catalog = build_acceptance_catalog(
+        plan,
+        accepted_parent_ids=successful_parent_ids,
+        qc_config=acceptance_qc,
+        development_limited=development,
     )
     catalog.to_csv(output_dir / "scenario_catalog.csv", index=False)
     catalog.to_csv(output_dir / "generation_qc.csv", index=False)
-    development = debug_attempt_limit is not None
     failure_reason = "depth_generation_no_accepted_realizations" if base.empty else ""
-    if not development and not base.empty:
-        if catalog["acceptance_status"].isin({"failed", "insufficient_attempts"}).any():
-            failure_reason = "depth_generation_acceptance_qc_failed"
+    failed_scenarios = catalog["acceptance_status"].isin(
+        {"failed", "insufficient_attempts"}
+    )
+    completed_with_warnings = (
+        (not development) and (not base.empty) and bool(failed_scenarios.any())
+    )
 
     figure_summary = write_generation_figures(
         output_dir,
@@ -1609,12 +1676,20 @@ def run_depth_generation(
         "figures/figure_manifest.json",
         "section_geometry_feasibility_qc.csv",
         "rejection_reason_summary.csv",
+        "attempt_progress.csv",
+        "preflight_attempts.csv",
+        "preflight_scenario_catalog.csv",
+        "preflight_summary.json",
     ]
     manifest = {
         "schema": SCHEMA_VERSION,
         "status": "development_limited"
         if development
-        else ("failed" if failure_reason else "success"),
+        else (
+            "failed"
+            if failure_reason
+            else ("completed_with_warnings" if completed_with_warnings else "success")
+        ),
         "sample_domain": "depth",
         "depth_basis": "tvdss",
         "generator_family": GENERATOR_FAMILY,
@@ -1643,6 +1718,8 @@ def run_depth_generation(
         else sorted(
             {str(value) for value in script_cfg["generation"]["geometry_families"]}
         ),
+        "acceptance_qc": acceptance_qc,
+        "preflight": preflight_summary,
         "sampling": dict(script_cfg["sampling"]),
         "lfm": dict(script_cfg["lfm"]),
         "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
@@ -1729,16 +1806,34 @@ def run_depth_generation(
             ],
         },
         "files": {name: sha256_file(output_dir / name) for name in file_names},
+        "quality_warnings": (
+            []
+            if not completed_with_warnings
+            else ["scenario_acceptance_qc_failed"]
+        ),
     }
     write_json(output_dir / "benchmark_manifest.json", manifest)
     summary = {
         **manifest,
         "accepted_parent_realizations": int(len(base)),
-        "rejected_parent_realizations": int(len(rejection_rows)),
+        "rejected_parent_realizations": int(len(plan) - len(base)),
+        "failed_scenario_count": int(failed_scenarios.sum()),
     }
     write_json(output_dir / "run_summary.json", summary)
     if failure_reason:
         raise RuntimeError(failure_reason)
+    if (
+        (not development)
+        and enforcement == "fail_fast"
+        and bool(failed_scenarios.any())
+    ):
+        raise RuntimeError("depth_generation_acceptance_qc_failed")
+    logger.info(
+        "Depth Synthoseis generation finished: status=%s accepted=%d rejected=%d",
+        summary["status"],
+        summary["accepted_parent_realizations"],
+        summary["rejected_parent_realizations"],
+    )
     return summary
 
 

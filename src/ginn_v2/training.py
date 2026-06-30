@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-import sys
 import time
 from typing import Any, Mapping
 
@@ -19,6 +18,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from cup.synthetic.dataset import SynthoseisBenchmark
 from cup.synthetic.metrics import regression_metrics
 from cup.utils.io import sha256_file, write_json
+from cup.utils.logging import configure_run_logger
 from ginn_v2.data import PatchDataset, _aligned_arrays, default_train_kinds, denormalize_delta
 from ginn_v2.models import build_model
 
@@ -32,25 +32,11 @@ PHYSICS_LOSS_MODEL_IDS = {
 
 def configure_training_logger(output_dir: Path) -> logging.Logger:
     """Create the per-run terminal and file logger."""
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger(f"ginn_v2.training.{output_dir.resolve()}")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    for handler in logger.handlers:
-        handler.close()
-    logger.handlers.clear()
-    formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+    return configure_run_logger(
+        output_dir,
+        logger_name="ginn_v2.training",
+        file_name="training.log",
     )
-    stream = logging.StreamHandler(sys.stdout)
-    stream.setFormatter(formatter)
-    file_handler = logging.FileHandler(output_dir / "training.log", encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    logger.addHandler(stream)
-    logger.addHandler(file_handler)
-    return logger
 
 
 def resolve_device(device_name: str) -> tuple[torch.device, dict[str, Any]]:

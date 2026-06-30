@@ -355,6 +355,18 @@ HDF5 文件，每个 sample 为一个 group，包含 `model_target_log_ai`、
 - `scenario_catalog.csv`：所有场景的定义和场条件接受状态。
 - `generation_qc.csv`：每次生成尝试的 QC 指标和拒绝原因。
 - `section_geometry_qc.csv`：场条件截面的横向层位支撑状态。
+- `attempt_progress.csv`：time/depth 共用的增量进度日志；每次 preflight/正式生成后
+  立即刷新，记录 scenario 当前成功数、拒绝数、实际接受率、理论最高接受率及门禁
+  是否仍可达到。
+- `preflight_attempts.csv`：昂贵正演前的逐 attempt 结构检查结果。
+- `preflight_scenario_catalog.csv`：preflight 的逐 scenario 接受率和门禁状态。
+- `preflight_summary.json`：preflight 汇总及 `warn|fail_fast` 执行策略。
+- `generation.log`：与终端同步的带时间戳生成日志。
+
+最终 `scenario_catalog.csv` 的 `attempt_count` 来自冻结的 `attempt_plan.csv`；即使正式
+正演只处理 preflight 成功项，拒绝项仍保留在接受率分母中。接受率不足在
+`enforcement=warn` 时写为 `completed_with_warnings`，不作为脚本执行错误；只有显式
+`fail_fast` 才在昂贵 HDF5 生成前停止。
 
 ## 旁路 · evaluate_synthoseis_lite.py
 

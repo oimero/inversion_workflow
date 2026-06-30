@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any, Mapping, Sequence
 
 import h5py
@@ -32,6 +33,13 @@ from cup.synthetic.core import (
     file_chain_sha256,
     geometry_feasibility_rows,
     rejection_reason_summary,
+)
+from cup.synthetic.core.progress import (
+    AttemptProgressLog,
+    acceptance_enforcement,
+    build_acceptance_catalog,
+    configure_generation_logger,
+    run_attempt_preflight,
 )
 from cup.synthetic.forward import (
     HighresForwardResult,
@@ -891,6 +899,8 @@ def run_generation(
                 f"impedance_calibration_source_mismatch:sha256:{relative_name}"
             )
     output_dir.mkdir(parents=True, exist_ok=False)
+    logger = configure_generation_logger(output_dir, sample_domain="time")
+    logger.info("Synthoseis generation started: suite=%s", suite)
     wavelet_time, wavelet = load_wavelet_csv(
         sources["wavelet_generation_dir"] / "selected_wavelet.csv"
     )
@@ -970,11 +980,84 @@ def run_generation(
             duration_reference="minimum",
         )
     ).to_csv(feasibility_path, index=False)
+    acceptance_qc = dict(script_cfg["generation"]["acceptance_qc"])
+
+    def validate_attempt(plan_row: Mapping[str, Any]) -> None:
+        section = sections_by_id[str(plan_row["section_id"])]
+        scenario = scenarios_by_id[str(plan_row["scenario_id"])]
+        minimum_truth_samples = (
+            2 if scenario.duration_mode == "ultra_thin_stress" else 4
+        )
+        generate_field_section(
+            calibration,
+            realization_id=str(plan_row["parent_realization_id"]),
+            scenario=scenario,
+            global_seed=int(script_cfg["global_seed"]),
+            lateral_m=section.lateral_m,
+            inline_float=section.inline_float,
+            xline_float=section.xline_float,
+            x_m=section.x_m,
+            y_m=section.y_m,
+            horizon_twt_s=section.horizon_twt_s,
+            output_dt_s=output_dt,
+            wavelet=wavelet,
+            vertical_oversampling_factor=int(
+                script_cfg["sampling"]["vertical_oversampling_factor"]
+            ),
+            minimum_truth_samples=minimum_truth_samples,
+            max_global_reversal_fraction=float(
+                script_cfg["impedance"]["max_global_reversal_fraction"]
+            ),
+            max_object_reversal_fraction=float(
+                script_cfg["impedance"]["max_object_reversal_fraction"]
+            ),
+            max_global_clipping_fraction=float(
+                script_cfg["impedance"]["max_global_clipping_fraction"]
+            ),
+            max_object_clipping_fraction=float(
+                script_cfg["impedance"]["max_object_clipping_fraction"]
+            ),
+            sequence_minimum_duration_reference="minimum",
+        )
+
+    preflight = run_attempt_preflight(
+        attempt_plan,
+        validator=validate_attempt,
+        rejection_exceptions=(GenerationRejected, ValueError, FloatingPointError),
+        qc_config=acceptance_qc,
+        output_dir=output_dir,
+        logger=logger,
+        development_limited=development_limited,
+    )
+    enforcement = acceptance_enforcement(acceptance_qc)
+    preflight_summary = {
+        "sample_domain": "time",
+        "status": "failed" if not preflight.failed.empty else "ok",
+        "enforcement": enforcement,
+        "planned_attempts": int(len(attempt_plan)),
+        "accepted_attempts": int(len(preflight.accepted_plan)),
+        "rejected_attempts": int(len(attempt_plan) - len(preflight.accepted_plan)),
+        "failed_scenario_count": int(len(preflight.failed)),
+    }
+    write_json(output_dir / "preflight_summary.json", preflight_summary)
+    if preflight.accepted_plan.empty:
+        raise RuntimeError("field_conditioned_preflight_no_accepted_realizations")
+    if enforcement == "fail_fast" and not preflight.failed.empty:
+        failed = preflight.failed[
+            ["section_id", "scenario_id", "acceptance_status"]
+        ].to_dict(orient="records")
+        raise RuntimeError(f"field_conditioned_preflight_acceptance_qc_failed:{failed}")
+    if not preflight.failed.empty:
+        logger.warning(
+            "preflight acceptance QC has %d failed scenarios; enforcement=warn, "
+            "generation will preserve accepted realizations",
+            len(preflight.failed),
+        )
     index_records: list[dict[str, Any]] = []
     object_records: list[dict[str, Any]] = []
     object_lateral_records: list[dict[str, Any]] = []
     qc_records: list[dict[str, Any]] = []
-    rejection_records: list[dict[str, Any]] = []
+    rejection_records: list[dict[str, Any]] = list(preflight.rejection_details)
     probe_records: list[dict[str, Any]] = []
     seismic_variant_records: list[dict[str, Any]] = []
     probe_frequencies = _load_probe_frequencies(
@@ -993,7 +1076,14 @@ def run_generation(
     probe_parent_counts = {section.section_id: 0 for section in sections}
     h5_path = output_dir / "synthetic_benchmark.h5"
     forward_model_inputs_sha256 = _time_forward_model_inputs_sha256(sources)
-    with h5py.File(h5_path, "w") as h5:
+    with AttemptProgressLog(
+        output_dir / "attempt_progress.csv",
+        phase="generation",
+        plan=preflight.accepted_plan,
+        qc_config=acceptance_qc,
+        logger=logger,
+        append=True,
+    ) as production_progress, h5py.File(h5_path, "w") as h5:
         h5.attrs["schema"] = DATA_SCHEMA
         h5.attrs["schema_version"] = DATA_SCHEMA
         h5.attrs["sample_domain"] = "time"
@@ -1003,7 +1093,10 @@ def run_generation(
         h5.attrs["forward_model_inputs_sha256"] = forward_model_inputs_sha256
         h5.attrs["impedance_calibration_sha256"] = sha256_file(calibration_path)
         h5.attrs["qc_only"] = bool(qc_only)
-        for plan_row in attempt_plan.to_dict(orient="records"):
+        for sequence_index, plan_row in enumerate(
+            preflight.accepted_plan.to_dict(orient="records"), start=1
+        ):
+            attempt_started = time.perf_counter()
             section = sections_by_id[str(plan_row["section_id"])]
             scenario = scenarios_by_id[str(plan_row["scenario_id"])]
             attempt_id = int(plan_row["attempt_id"])
@@ -1234,6 +1327,13 @@ def run_generation(
                     },
                 }
             )
+            production_progress.record(
+                plan_row,
+                sequence_index=sequence_index,
+                status="accepted" if status == "ok" else "rejected",
+                reason=reasons,
+                elapsed_s=time.perf_counter() - attempt_started,
+            )
     index = pd.DataFrame.from_records(index_records)
     index.to_csv(output_dir / "sample_index.csv", index=False)
     object_columns = [
@@ -1352,31 +1452,22 @@ def run_generation(
     )
     rejection_summary_path = output_dir / "rejection_reason_summary.csv"
     rejection_summary.to_csv(rejection_summary_path, index=False)
-    catalog = (
-        index[index["sample_kind"].eq("base")]
-        .groupby(["section_id", "scenario_id"], dropna=False)["status"]
-        .value_counts()
-        .unstack(fill_value=0)
-        .reset_index()
+    successful_parent_ids = index.loc[
+        index["sample_kind"].eq("base") & index["status"].eq("ok"),
+        "parent_realization_id",
+    ].astype(str)
+    catalog = build_acceptance_catalog(
+        attempt_plan,
+        accepted_parent_ids=successful_parent_ids,
+        qc_config=acceptance_qc,
+        development_limited=development_limited,
     )
-    catalog["attempt_count"] = catalog.get("ok", 0) + catalog.get("rejected", 0)
-    catalog["acceptance_fraction"] = catalog.get("ok", 0) / catalog["attempt_count"]
-    if development_limited:
-        catalog["acceptance_status"] = "development_limit_no_verdict"
-    else:
-        minimum = int(script_cfg["impedance"]["minimum_attempts_per_scenario"])
-        warning = float(script_cfg["impedance"]["scenario_acceptance_warning_fraction"])
-        failure = float(script_cfg["impedance"]["scenario_acceptance_failure_fraction"])
-        catalog["acceptance_status"] = np.where(
-            catalog["attempt_count"] < minimum,
-            "insufficient_attempts_for_acceptance_qc",
-            np.where(
-                catalog["acceptance_fraction"] < failure,
-                "failed",
-                np.where(catalog["acceptance_fraction"] < warning, "warning", "ok"),
-            ),
-        )
     catalog.to_csv(output_dir / "scenario_catalog.csv", index=False)
+    failure_statuses = {"failed", "insufficient_attempts"}
+    failed_scenarios = catalog["acceptance_status"].isin(failure_statuses)
+    completed_with_warnings = (not development_limited) and bool(
+        failed_scenarios.any()
+    )
     figure_summary = write_generation_figures(
         output_dir,
         script_cfg.get("figures", {}),
@@ -1386,6 +1477,11 @@ def run_generation(
     manifest = {
         "schema": DATA_SCHEMA,
         "schema_version": DATA_SCHEMA,
+        "status": (
+            "development_limited"
+            if development_limited
+            else ("completed_with_warnings" if completed_with_warnings else "ok")
+        ),
         "generator_family": calibration.generator_family,
         "implementation_scope": IMPLEMENTATION_SCOPE,
         "development_limited": development_limited,
@@ -1405,6 +1501,8 @@ def run_generation(
         "n_sections": len(sections),
         "n_scenarios": len(scenarios),
         "attempts_per_scenario": attempts,
+        "acceptance_qc": acceptance_qc,
+        "preflight": preflight_summary,
         "geometry_filters": sorted(
             {scenario.geometry_family for scenario in scenarios}
         ),
@@ -1474,6 +1572,11 @@ def run_generation(
             if rejection_summary.empty
             else rejection_summary.to_dict(orient="records")
         ),
+        "quality_warnings": (
+            []
+            if not completed_with_warnings
+            else ["scenario_acceptance_qc_failed"]
+        ),
         "sample_counts": {
             "by_evaluation_role": {
                 str(key): int(value)
@@ -1526,6 +1629,12 @@ def run_generation(
             "rejection_reason_summary.csv": sha256_file(rejection_summary_path),
             "scenario_catalog.csv": sha256_file(output_dir / "scenario_catalog.csv"),
             "attempt_plan.csv": sha256_file(output_dir / "attempt_plan.csv"),
+            "attempt_progress.csv": sha256_file(output_dir / "attempt_progress.csv"),
+            "preflight_attempts.csv": sha256_file(output_dir / "preflight_attempts.csv"),
+            "preflight_scenario_catalog.csv": sha256_file(
+                output_dir / "preflight_scenario_catalog.csv"
+            ),
+            "preflight_summary.json": sha256_file(output_dir / "preflight_summary.json"),
             "section_geometry_qc.csv": sha256_file(section_geometry_qc_path),
             "section_geometry_feasibility_qc.csv": sha256_file(feasibility_path),
             "figures/figure_manifest.json": sha256_file(
@@ -1534,30 +1643,41 @@ def run_generation(
         },
     }
     write_json(output_dir / "benchmark_manifest.json", manifest)
-    failure_statuses = {"failed", "insufficient_attempts_for_acceptance_qc"}
-    failed_scenarios = catalog["acceptance_status"].isin(failure_statuses)
     summary = {
         **manifest,
         "status": (
             "development_limited"
             if development_limited
-            else ("failed_acceptance_qc" if bool(failed_scenarios.any()) else "ok")
+            else ("completed_with_warnings" if completed_with_warnings else "ok")
         ),
         "accepted_realizations": int(
             (index["sample_kind"].eq("base") & index["status"].eq("ok")).sum()
         ),
-        "rejected_realizations": int(
-            (index["sample_kind"].eq("base") & index["status"].eq("rejected")).sum()
-        ),
+        "rejected_realizations": int(len(attempt_plan) - len(successful_parent_ids)),
         "failed_scenario_count": int(failed_scenarios.sum()),
+        "quality_warnings": (
+            []
+            if not completed_with_warnings
+            else ["scenario_acceptance_qc_failed"]
+        ),
         "probe_variant_count": len(probe_records),
         "seismic_variant_count": len(seismic_variant_records),
     }
     write_json(output_dir / "run_summary.json", summary)
-    if (not development_limited) and bool(failed_scenarios.any()):
+    if (
+        (not development_limited)
+        and enforcement == "fail_fast"
+        and bool(failed_scenarios.any())
+    ):
         failed = catalog.loc[
             failed_scenarios,
             ["section_id", "scenario_id", "acceptance_status"],
         ].to_dict(orient="records")
         raise RuntimeError(f"field_conditioned_acceptance_qc_failed:{failed}")
+    logger.info(
+        "Synthoseis generation finished: status=%s accepted=%d rejected=%d",
+        summary["status"],
+        summary["accepted_realizations"],
+        summary["rejected_realizations"],
+    )
     return summary

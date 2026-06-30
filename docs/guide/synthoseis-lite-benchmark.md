@@ -154,6 +154,33 @@ python scripts/synthoseis_lite.py `
 初次验证可加 `--debug-attempt-limit 1`。该参数只缩小开发运行，不执行正式接受率门禁，
 因此产物状态为 `development_limited`，不得用于正式训练。
 
+time/depth 的 `field_conditioned` 共享两阶段生成契约。第一阶段先对全部 attempt
+执行不包含昂贵高分正演和 mismatch 生成的结构 preflight；第二阶段只正演
+preflight 通过的 parent。运行过程中终端和 `generation.log` 会逐 attempt 输出状态，
+同时持续刷新可在另一个终端读取的 `attempt_progress.csv`。因此不需要等 HDF5 关闭后
+才能知道当前 scenario 的成功数、拒绝原因和理论最高接受率。
+
+接受率配置为：
+
+```yaml
+generation:
+  acceptance_qc:
+    minimum_attempts_per_scenario: 20
+    warning_fraction: 0.80
+    failure_fraction: 0.50
+    enforcement: warn  # warn | fail_fast
+```
+
+- `warn` 是默认行为：接受率不足时保留全部成功样本，run/manifest 标记
+  `completed_with_warnings`，终端明确告警，但脚本正常完成。
+- `fail_fast`：preflight 确认任一 scenario 无法通过正式门禁后，在创建昂贵 HDF5
+  之前停止。
+- 没有任何 preflight 成功样本、输入损坏或正演契约错误仍属于运行失败，不降级为告警。
+
+preflight 固定输出 `preflight_attempts.csv`、`preflight_scenario_catalog.csv` 和
+`preflight_summary.json`。最终 `scenario_catalog.csv` 的分母始终是原始
+`attempt_plan.csv`，不会因为第二阶段只处理成功 parent 而虚假变成 100%。
+
 深度 v2 的 `field_conditioned` 支持两个诊断型 CLI 开关：
 
 - `--geometry-family <none|wedge|pinchout>`：临时过滤本次生成的几何家族，不改配置文件；

@@ -12,10 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from cup.synthetic.readers.depth_v2 import DepthSyntheticSample, DepthV2Benchmark
-from cup.synthetic.readers.time_v1 import TimeSyntheticSample, TimeV1Benchmark
+from cup.synthetic.readers.time_v2 import TimeV2Benchmark, TimeV2SyntheticSample
 
 
-SyntheticSample = TimeSyntheticSample | DepthSyntheticSample
+SyntheticSample = TimeV2SyntheticSample | DepthSyntheticSample
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -29,36 +29,45 @@ def _json(path: Path) -> dict[str, Any]:
 class SynthoseisBenchmark:
     """Read-only facade around supported Synthoseis-lite artifact schemas."""
 
-    def __init__(self, run_dir: str | Path, *, expected_forward_model_inputs_sha256: str | None = None) -> None:
+    def __init__(
+        self,
+        run_dir: str | Path,
+        *,
+        expected_forward_model_inputs_sha256: str | None = None,
+    ) -> None:
         self.run_dir = Path(run_dir)
         self.manifest_path = self.run_dir / "benchmark_manifest.json"
         if not self.manifest_path.is_file():
-            raise FileNotFoundError(f"benchmark_manifest.json not found: {self.manifest_path}")
+            raise FileNotFoundError(
+                f"benchmark_manifest.json not found: {self.manifest_path}"
+            )
         manifest = _json(self.manifest_path)
         schema = str(manifest.get("schema") or manifest.get("schema_version") or "")
         sample_domain = str(manifest.get("sample_domain") or "").casefold()
 
         if schema == "synthoseis_lite_v1":
-            if expected_forward_model_inputs_sha256 is not None:
-                raise ValueError("expected_forward_model_inputs_sha256 is only valid for depth v2 benchmarks.")
-            if sample_domain not in {"", "time"}:
-                raise ValueError(
-                    f"synthoseis_lite_v1 is the time-domain schema; got sample_domain={sample_domain!r}."
-                )
-            self._reader = TimeV1Benchmark(self.run_dir)
-        elif schema == "synthoseis_lite_v2":
-            if sample_domain != "depth":
-                raise ValueError(
-                    f"synthoseis_lite_v2 currently requires sample_domain='depth'; got {sample_domain!r}."
-                )
-            self._reader = DepthV2Benchmark(
-                self.run_dir,
-                expected_forward_model_inputs_sha256=expected_forward_model_inputs_sha256,
+            raise ValueError(
+                "time-v1 Synthoseis artifacts are legacy and are not supported by the v2 facade."
             )
+        if schema == "synthoseis_lite_v2":
+            if sample_domain == "time":
+                self._reader = TimeV2Benchmark(
+                    self.run_dir,
+                    expected_forward_model_inputs_sha256=expected_forward_model_inputs_sha256,
+                )
+            elif sample_domain == "depth":
+                self._reader = DepthV2Benchmark(
+                    self.run_dir,
+                    expected_forward_model_inputs_sha256=expected_forward_model_inputs_sha256,
+                )
+            else:
+                raise ValueError(
+                    f"synthoseis_lite_v2 requires sample_domain='time' or 'depth'; got {sample_domain!r}."
+                )
         else:
             raise ValueError(
                 f"Unsupported Synthoseis schema {schema!r}. "
-                "Supported schemas: synthoseis_lite_v1/time and synthoseis_lite_v2/depth."
+                "Supported schema: synthoseis_lite_v2 with sample_domain=time|depth."
             )
 
         self.schema = schema
@@ -88,6 +97,6 @@ __all__ = [
     "DepthV2Benchmark",
     "SyntheticSample",
     "SynthoseisBenchmark",
-    "TimeSyntheticSample",
-    "TimeV1Benchmark",
+    "TimeV2Benchmark",
+    "TimeV2SyntheticSample",
 ]

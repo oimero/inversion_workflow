@@ -8,7 +8,9 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from cup.petrel.load import import_well_tops_petrel
+from cup.petrel.load import import_interpretation_petrel, import_well_tops_petrel
+from cup.seismic.survey import open_survey
+from cup.seismic.target_zone import TargetZone
 from cup.seismic.wavelet import infer_wavelet_dt, load_wavelet_csv
 from cup.synthetic.calibration import (
     GENERATOR_FAMILY,
@@ -19,7 +21,13 @@ from cup.synthetic.calibration import (
 from cup.synthetic.config import IMPLEMENTATION_SCOPE
 from cup.synthetic.figures import write_calibration_figures
 from cup.config.workflow import WorkflowConfig
-from cup.utils.io import repo_relative_path, resolve_artifact_path, resolve_relative_path, sha256_file, write_json
+from cup.utils.io import (
+    repo_relative_path,
+    resolve_artifact_path,
+    resolve_relative_path,
+    sha256_file,
+    write_json,
+)
 from cup.well.assets import normalize_well_name
 from cup.well.las import read_las_curve
 from cup.well.td import find_well_top_md, load_workflow_time_depth_table_csv
@@ -105,30 +113,80 @@ def build_calibration_inputs(
     sources: Mapping[str, Path],
     repo_root: Path,
 ) -> tuple[list[WellZoneCurves], dict[str, Any]]:
-    clusters = pd.read_csv(sources["wavelet_generation_dir"] / "evaluation_well_spatial_clusters.csv")
+    clusters = pd.read_csv(
+        sources["wavelet_generation_dir"] / "evaluation_well_spatial_clusters.csv"
+    )
     metrics = pd.read_csv(sources["well_auto_tie_dir"] / "well_tie_metrics.csv")
-    preprocess = pd.read_csv(sources["well_preprocess_dir"] / "well_preprocess_status.csv")
-    for frame, column in ((clusters, "well_name"), (metrics, "well_name"), (preprocess, "well_name")):
+    preprocess = pd.read_csv(
+        sources["well_preprocess_dir"] / "well_preprocess_status.csv"
+    )
+    for frame, column in (
+        (clusters, "well_name"),
+        (metrics, "well_name"),
+        (preprocess, "well_name"),
+    ):
         frame["_well_key"] = frame[column].map(normalize_well_name)
         if frame["_well_key"].duplicated().any():
             raise ValueError(f"Duplicate normalized well name in {column} table.")
-    wells = clusters.merge(metrics, on=["well_name", "_well_key"], validate="one_to_one").merge(
+    wells = clusters.merge(
+        metrics, on=["well_name", "_well_key"], validate="one_to_one"
+    ).merge(
         preprocess[["_well_key", "preprocess_status", "preprocessed_las"]],
         on="_well_key",
         validate="one_to_one",
     )
     well_tops = import_well_tops_petrel(
-        resolve_relative_path(workflow.assets.well_tops_file, root=resolve_relative_path(workflow.data_root, root=repo_root))
+        resolve_relative_path(
+            workflow.assets.well_tops_file,
+            root=resolve_relative_path(workflow.data_root, root=repo_root),
+        )
     )
-    wavelet_time, _ = load_wavelet_csv(sources["wavelet_generation_dir"] / "selected_wavelet.csv")
+    data_root = resolve_relative_path(workflow.data_root, root=repo_root)
+    ordered_horizons = [item["name"] for item in script_cfg["horizons"]]
+    seismic_path = resolve_relative_path(workflow.seismic.file, root=data_root)
+    survey = open_survey(
+        seismic_path,
+        workflow.seismic.type,
+        segy_options={
+            key: value
+            for key, value in workflow.seismic.as_dict().items()
+            if key in {"iline", "xline", "istep", "xstep"} and value is not None
+        }
+        or None,
+    )
+    raw_horizons = {}
+    for horizon in script_cfg["horizons"]:
+        frame = import_interpretation_petrel(
+            resolve_relative_path(horizon["file"], root=data_root)
+        ).copy()
+        frame["interpretation"] = np.abs(
+            frame["interpretation"].to_numpy(dtype=np.float64)
+        )
+        raw_horizons[str(horizon["name"])] = frame
+    target_zone = TargetZone(
+        raw_horizons,
+        survey.describe_geometry(domain="time"),
+        ordered_horizons,
+        nearest_distance_limit=script_cfg["target_zone"].get("nearest_distance_limit"),
+        outlier_threshold=script_cfg["target_zone"].get("outlier_threshold"),
+        outlier_min_neighbor_count=int(
+            script_cfg["target_zone"].get("outlier_min_neighbor_count", 2)
+        ),
+        min_thickness=script_cfg["target_zone"].get("min_thickness_s"),
+    )
+    wavelet_time, _ = load_wavelet_csv(
+        sources["wavelet_generation_dir"] / "selected_wavelet.csv"
+    )
     output_dt = infer_wavelet_dt(wavelet_time)
     expected = float(script_cfg["sampling"]["expected_output_dt_s"])
     if not np.isclose(output_dt, expected, rtol=0.0, atol=1e-9):
-        raise ValueError(f"sampling_mismatch:wavelet_dt={output_dt}:expected={expected}")
+        raise ValueError(
+            f"sampling_mismatch:wavelet_dt={output_dt}:expected={expected}"
+        )
     truth_dt = output_dt / int(script_cfg["sampling"]["vertical_oversampling_factor"])
-    ordered_horizons = [item["name"] for item in script_cfg["horizons"]]
     records: list[WellZoneCurves] = []
     well_status: list[dict[str, Any]] = []
+    horizon_audit: list[dict[str, Any]] = []
     for row in wells.to_dict(orient="records"):
         well_name = str(row["well_name"])
         try:
@@ -157,19 +215,56 @@ def build_calibration_inputs(
             table = load_workflow_time_depth_table_csv(table_path)
             if not table.is_md_domain:
                 raise ValueError("optimized_tdt_not_md_domain")
-            filtered = read_las_curve(filtered_path, "AI", match_policy="exact", allow_all_nan=True)
-            full = read_las_curve(full_path, "AI", match_policy="exact", allow_all_nan=True)
-            horizon_times = _horizon_times_from_well_tops(
-                well_tops,
-                well_name=well_name,
-                horizons=list(script_cfg["horizons"]),
-                table=table,
+            filtered = read_las_curve(
+                filtered_path, "AI", match_policy="exact", allow_all_nan=True
             )
+            full = read_las_curve(
+                full_path, "AI", match_policy="exact", allow_all_nan=True
+            )
+            inline = float(row["inline_float"])
+            xline = float(row["xline_float"])
+            horizon_times: list[float] = []
+            for horizon in script_cfg["horizons"]:
+                horizon_name = str(horizon["name"])
+                well_top = str(horizon["well_top"])
+                md = find_well_top_md(well_tops, well_name=well_name, surface=well_top)
+                if not float(table.md[0]) <= md <= float(table.md[-1]):
+                    raise ValueError(
+                        f"outside_tdt_support:{horizon_name}:well_top={well_top}"
+                    )
+                well_top_twt = float(np.interp(md, table.md, table.twt))
+                sample = target_zone.get_horizon_surface(horizon_name).sample_at_line(
+                    inline, xline
+                )
+                interpreted = float(sample.value)
+                horizon_audit.append(
+                    {
+                        "well_name": well_name,
+                        "horizon_name": horizon_name,
+                        "well_top_surface": well_top,
+                        "inline_float": inline,
+                        "xline_float": xline,
+                        "well_top_md_m": float(md),
+                        "well_top_twt_s": well_top_twt,
+                        "interpreted_twt_s": interpreted,
+                        "delta_interpretation_minus_well_top_s": interpreted
+                        - well_top_twt,
+                        "sample_method": str(sample.method),
+                        "support_status": str(sample.support_status),
+                        "status": "ok",
+                        "reason": "",
+                    }
+                )
+                horizon_times.append(well_top_twt)
             if np.any(np.diff(horizon_times) <= 0.0):
                 raise ValueError("misordered_horizons")
             zone_count = 0
-            for zone_index, (top, bottom) in enumerate(zip(horizon_times[:-1], horizon_times[1:])):
-                centers = np.arange(top + 0.5 * truth_dt, bottom, truth_dt, dtype=np.float64)
+            for zone_index, (top, bottom) in enumerate(
+                zip(horizon_times[:-1], horizon_times[1:])
+            ):
+                centers = np.arange(
+                    top + 0.5 * truth_dt, bottom, truth_dt, dtype=np.float64
+                )
                 filtered_values = _piecewise_cell_average(
                     filtered.basis,
                     filtered.values,
@@ -205,7 +300,14 @@ def build_calibration_inputs(
                 zone_count += 1
             if zone_count == 0:
                 raise ValueError("no_valid_zones")
-            well_status.append({"well_name": well_name, "status": "ok", "n_zones": zone_count, "reasons": ""})
+            well_status.append(
+                {
+                    "well_name": well_name,
+                    "status": "ok",
+                    "n_zones": zone_count,
+                    "reasons": "",
+                }
+            )
         except Exception as exc:
             well_status.append(
                 {
@@ -215,7 +317,13 @@ def build_calibration_inputs(
                     "reasons": f"{type(exc).__name__}:{exc}",
                 }
             )
-    return records, {"well_status": well_status, "output_dt_s": output_dt, "truth_dt_s": truth_dt}
+    return records, {
+        "well_status": well_status,
+        "well_horizon_consistency": horizon_audit,
+        "output_dt_s": output_dt,
+        "truth_dt_s": truth_dt,
+    }
+
 
 def run_calibration(
     *,
@@ -234,35 +342,49 @@ def run_calibration(
     )
     source_hashes = {}
     for directory_key, names in {
-        "forward_observability_dir": ["run_summary.json", "frequency_evidence_bands.csv"],
+        "forward_observability_dir": [
+            "run_summary.json",
+            "frequency_evidence_bands.csv",
+        ],
         "well_preprocess_dir": ["well_preprocess_status.csv"],
         "well_auto_tie_dir": ["well_tie_metrics.csv"],
-        "wavelet_generation_dir": ["selected_wavelet.csv", "evaluation_well_spatial_clusters.csv"],
+        "wavelet_generation_dir": [
+            "selected_wavelet.csv",
+            "evaluation_well_spatial_clusters.csv",
+        ],
     }.items():
         for name in names:
-            source_hashes[f"{directory_key}/{name}"] = sha256_file(sources[directory_key] / name)
-    calibration, objects, qc, samples, backgrounds, profile_samples = calibrate_impedance(
-        inputs,
-        truth_dt_s=float(input_qc["truth_dt_s"]),
-        ordered_horizons=[item["name"] for item in script_cfg["horizons"]],
-        source_runs={
-            key: repo_relative_path(path, root=repo_root) for key, path in sources.items()
-        },
-        source_hashes=source_hashes,
-        state_threshold_sigma=float(script_cfg["impedance"]["state_threshold_sigma"]),
-        huber_delta_parent_sigma_floor=float(
-            script_cfg["impedance"]["huber_delta_parent_sigma_floor"]
-        ),
-        coefficient_sigma_parent_floor=float(
-            script_cfg["impedance"]["coefficient_sigma_parent_floor"]
-        ),
-        coefficient_sigma_parent_cap=float(
-            script_cfg["impedance"]["coefficient_sigma_parent_cap"]
-        ),
+            source_hashes[f"{directory_key}/{name}"] = sha256_file(
+                sources[directory_key] / name
+            )
+    calibration, objects, qc, samples, backgrounds, profile_samples = (
+        calibrate_impedance(
+            inputs,
+            truth_dt_s=float(input_qc["truth_dt_s"]),
+            ordered_horizons=[item["name"] for item in script_cfg["horizons"]],
+            source_runs={
+                key: repo_relative_path(path, root=repo_root)
+                for key, path in sources.items()
+            },
+            source_hashes=source_hashes,
+            state_threshold_sigma=float(
+                script_cfg["impedance"]["state_threshold_sigma"]
+            ),
+            huber_delta_parent_sigma_floor=float(
+                script_cfg["impedance"]["huber_delta_parent_sigma_floor"]
+            ),
+            coefficient_sigma_parent_floor=float(
+                script_cfg["impedance"]["coefficient_sigma_parent_floor"]
+            ),
+            coefficient_sigma_parent_cap=float(
+                script_cfg["impedance"]["coefficient_sigma_parent_cap"]
+            ),
+        )
     )
     objects_path = output_dir / "well_object_catalog.csv"
     qc_path = output_dir / "calibration_qc.csv"
     status_path = output_dir / "well_status.csv"
+    horizon_consistency_path = output_dir / "well_horizon_consistency.csv"
     samples_path = output_dir / "well_calibration_samples.csv"
     backgrounds_path = output_dir / "well_background_fits.csv"
     profile_samples_path = output_dir / "well_object_profile_samples.csv"
@@ -272,6 +394,9 @@ def run_calibration(
     backgrounds.to_csv(backgrounds_path, index=False)
     profile_samples.to_csv(profile_samples_path, index=False)
     pd.DataFrame.from_records(input_qc["well_status"]).to_csv(status_path, index=False)
+    pd.DataFrame.from_records(input_qc["well_horizon_consistency"]).to_csv(
+        horizon_consistency_path, index=False
+    )
     payload = calibration.to_dict()
     payload["artifact_hashes"] = {
         "well_object_catalog.csv": sha256_file(objects_path),
@@ -279,6 +404,7 @@ def run_calibration(
         "well_calibration_samples.csv": sha256_file(samples_path),
         "well_background_fits.csv": sha256_file(backgrounds_path),
         "well_object_profile_samples.csv": sha256_file(profile_samples_path),
+        "well_horizon_consistency.csv": sha256_file(horizon_consistency_path),
     }
     write_json(output_dir / "impedance_calibration.json", payload)
     figure_summary = write_calibration_figures(
@@ -294,22 +420,40 @@ def run_calibration(
         "n_objects": int(len(objects)),
         "well_status_counts": pd.Series(
             [row["status"] for row in input_qc["well_status"]]
-        ).value_counts().to_dict(),
+        )
+        .value_counts()
+        .to_dict(),
         "outputs": {
             "impedance_calibration": repo_relative_path(
                 output_dir / "impedance_calibration.json", root=repo_root
             ),
             "well_object_catalog": repo_relative_path(objects_path, root=repo_root),
             "calibration_qc": repo_relative_path(qc_path, root=repo_root),
-            "well_calibration_samples": repo_relative_path(samples_path, root=repo_root),
-            "well_background_fits": repo_relative_path(backgrounds_path, root=repo_root),
-            "well_object_profile_samples": repo_relative_path(profile_samples_path, root=repo_root),
+            "well_calibration_samples": repo_relative_path(
+                samples_path, root=repo_root
+            ),
+            "well_background_fits": repo_relative_path(
+                backgrounds_path, root=repo_root
+            ),
+            "well_object_profile_samples": repo_relative_path(
+                profile_samples_path, root=repo_root
+            ),
+            "well_horizon_consistency": repo_relative_path(
+                horizon_consistency_path, root=repo_root
+            ),
         },
         "figures": {
             "generated_count": int(figure_summary.get("generated_count", 0)),
             "skipped_count": int(figure_summary.get("skipped_count", 0)),
             "figure_manifest": repo_relative_path(
-                Path(str(figure_summary.get("figure_manifest", output_dir / "figures" / "figure_manifest.json"))),
+                Path(
+                    str(
+                        figure_summary.get(
+                            "figure_manifest",
+                            output_dir / "figures" / "figure_manifest.json",
+                        )
+                    )
+                ),
                 root=repo_root,
             ),
         },

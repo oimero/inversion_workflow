@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import h5py
 import numpy as np
 
+from cup.synthetic.core import write_dataset
 from cup.synthetic.generation import GeneratedSection
 from cup.synthetic.forward import HighresForwardResult
 from cup.synthetic.lfm import LfmResult
 from cup.synthetic.probes import ProbeFrequency, ProbeResult
 from cup.synthetic.seismic_variants import SeismicVariantResult
-from cup.utils.io import array_sha256, sha256_file
 
 
 def _dataset(
@@ -25,15 +23,15 @@ def _dataset(
     axis_order: list[str],
     axis_dataset: str = "",
 ) -> h5py.Dataset:
-    array = np.asarray(values)
-    dataset = group.create_dataset(name, data=array, compression="gzip", shuffle=True)
-    dataset.attrs["sha256"] = array_sha256(array)
-    dataset.attrs["unit"] = unit
-    dataset.attrs["domain"] = domain
-    dataset.attrs["axis_order"] = np.asarray(axis_order, dtype=h5py.string_dtype("utf-8"))
-    if axis_dataset:
-        dataset.attrs["axis_dataset"] = axis_dataset
-    return dataset
+    return write_dataset(
+        group,
+        name,
+        values,
+        unit=unit,
+        sample_domain="time",
+        axis_path=axis_dataset,
+        axis_order=axis_order,
+    )
 
 
 def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
@@ -43,13 +41,62 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
     root.attrs["status"] = str(section.qc.get("status", "ok"))
     root.attrs["suite"] = str(section.qc.get("suite", "field_conditioned"))
     axes = root.create_group("axes")
-    _dataset(axes, "lateral_m", section.lateral_m, unit="m", domain="distance", axis_order=["lateral"])
-    _dataset(axes, "inline_float", section.inline_float, unit="line", domain="survey", axis_order=["lateral"])
-    _dataset(axes, "xline_float", section.xline_float, unit="line", domain="survey", axis_order=["lateral"])
-    _dataset(axes, "x_m", section.x_m, unit="m", domain="projected_xy", axis_order=["lateral"])
-    _dataset(axes, "y_m", section.y_m, unit="m", domain="projected_xy", axis_order=["lateral"])
-    _dataset(axes, "twt_highres_s", section.twt_highres_s, unit="s", domain="twt", axis_order=["twt"])
-    _dataset(axes, "twt_model_s", section.twt_model_s, unit="s", domain="twt", axis_order=["twt"])
+    _dataset(
+        axes,
+        "lateral_m",
+        section.lateral_m,
+        unit="m",
+        domain="distance",
+        axis_order=["lateral"],
+    )
+    _dataset(
+        axes,
+        "inline_float",
+        section.inline_float,
+        unit="line",
+        domain="survey",
+        axis_order=["lateral"],
+    )
+    _dataset(
+        axes,
+        "xline_float",
+        section.xline_float,
+        unit="line",
+        domain="survey",
+        axis_order=["lateral"],
+    )
+    _dataset(
+        axes,
+        "x_m",
+        section.x_m,
+        unit="m",
+        domain="projected_xy",
+        axis_order=["lateral"],
+    )
+    _dataset(
+        axes,
+        "y_m",
+        section.y_m,
+        unit="m",
+        domain="projected_xy",
+        axis_order=["lateral"],
+    )
+    _dataset(
+        axes,
+        "twt_highres_s",
+        section.twt_highres_s,
+        unit="s",
+        domain="twt",
+        axis_order=["twt"],
+    )
+    _dataset(
+        axes,
+        "twt_model_s",
+        section.twt_model_s,
+        unit="s",
+        domain="twt",
+        axis_order=["twt"],
+    )
     _dataset(
         axes,
         "twt_forward_highres_s",
@@ -72,13 +119,28 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
     high_forward_axis = f"/{path}/axes/twt_forward_highres_s"
     model_forward_axis = f"/{path}/axes/twt_forward_model_s"
     for name, values, unit, axis in [
-        ("truth_log_ai_highres", section.truth_log_ai_highres, "ln(m/s*g/cm3)", high_axis),
-        ("model_target_log_ai", section.model_target_log_ai, "ln(m/s*g/cm3)", model_axis),
+        (
+            "truth_log_ai_highres",
+            section.truth_log_ai_highres,
+            "ln(m/s*g/cm3)",
+            high_axis,
+        ),
+        (
+            "model_target_log_ai",
+            section.model_target_log_ai,
+            "ln(m/s*g/cm3)",
+            model_axis,
+        ),
         ("rgt_highres", section.rgt_highres, "normalized_zone", high_axis),
         ("rgt_model", section.rgt_model, "normalized_zone", model_axis),
         ("state_id_highres", section.state_id_highres, "category", high_axis),
         ("object_id_highres", section.object_id_highres, "category", high_axis),
-        ("object_xi_highres", section.object_xi_highres, "normalized_object", high_axis),
+        (
+            "object_xi_highres",
+            section.object_xi_highres,
+            "normalized_object",
+            high_axis,
+        ),
         ("zone_id_highres", section.zone_id_highres, "category", high_axis),
         (
             "geometry_event_mask_highres",
@@ -87,9 +149,19 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
             high_axis,
         ),
         ("boundary_mask_highres", section.boundary_mask_highres, "bool", high_axis),
-        ("boundary_fraction_model", section.boundary_fraction_model, "fraction", model_axis),
+        (
+            "boundary_fraction_model",
+            section.boundary_fraction_model,
+            "fraction",
+            model_axis,
+        ),
         ("boundary_mask_model", section.boundary_mask_model, "bool", model_axis),
-        ("dominant_object_id_model", section.dominant_object_id_model, "category", model_axis),
+        (
+            "dominant_object_id_model",
+            section.dominant_object_id_model,
+            "category",
+            model_axis,
+        ),
         ("zone_id_model", section.zone_id_model, "category", model_axis),
         ("valid_mask_model", section.valid_mask_model, "bool", model_axis),
     ]:
@@ -109,6 +181,28 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
         unit="fraction",
         domain="twt",
         axis_order=["lateral", "twt", "state"],
+        axis_dataset=model_axis,
+    )
+    masks = root.create_group("masks")
+    _dataset(
+        masks,
+        "valid_mask_model",
+        section.valid_mask_model,
+        unit="bool",
+        domain="twt",
+        axis_order=["lateral", "twt"],
+        axis_dataset=model_axis,
+    )
+    physics_valid = np.zeros_like(section.valid_mask_model, dtype=bool)
+    physics_valid[:, 1:] = np.asarray(section.forward_valid_mask_model, dtype=bool)
+    physics_valid &= np.asarray(section.valid_mask_model, dtype=bool)
+    _dataset(
+        masks,
+        "physics_valid_mask",
+        physics_valid,
+        unit="bool",
+        domain="twt",
+        axis_order=["lateral", "twt"],
         axis_dataset=model_axis,
     )
     _dataset(
@@ -177,6 +271,21 @@ def write_highres_forward_result(
         domain="twt",
         axis_order=["lateral", "twt_forward"],
         axis_dataset=axis,
+    )
+    model = np.asarray(root["seismic/seismic_model_consistent"][()], dtype=np.float64)
+    residual_model = np.asarray(result.seismic_model_grid, dtype=np.float64) - model
+    model_axis = f"{realization_path}/axes/twt_model_s"
+    target_shape = root["truth/model_target_log_ai"].shape
+    padded = np.zeros(target_shape, dtype=np.float32)
+    padded[:, 1:] = residual_model.astype(np.float32)
+    _dataset(
+        seismic,
+        "subgrid_forward_residual",
+        padded,
+        unit="normalized_amplitude",
+        domain="twt",
+        axis_order=["lateral", "twt"],
+        axis_dataset=model_axis,
     )
     qc = root.require_group("qc")
     for key, value in result.qc.items():
@@ -248,22 +357,20 @@ def write_probe_result(
     group.attrs["phase"] = result.variant.phase
     group.attrs["lateral_shape"] = result.variant.lateral_shape
     group.attrs["amplitude_multiplier"] = result.variant.amplitude_multiplier
-    group.attrs["paired_zero_variant_id"] = (
-        result.variant.paired_zero_variant_id
-    )
+    group.attrs["paired_zero_variant_id"] = result.variant.paired_zero_variant_id
     group.attrs["evidence_status"] = frequency.evidence_status
     group.attrs["operator_support"] = frequency.operator_support
     group.attrs["experiment_class"] = frequency.experiment_class
     group.attrs["calibration_status"] = frequency.calibration_status
     group.attrs["target_semantics"] = "base_model_target_plus_probe_increment"
-    group.attrs["base_truth_dataset"] = (
-        f"{realization_path}/truth/truth_log_ai_highres"
-    )
+    group.attrs["base_truth_dataset"] = f"{realization_path}/truth/truth_log_ai_highres"
     group.attrs["base_model_target_dataset"] = (
         f"{realization_path}/truth/model_target_log_ai"
     )
     if lfm_result is not None:
-        group.attrs["lfm_semantics"] = "derived_from_base_model_target_plus_probe_increment"
+        group.attrs["lfm_semantics"] = (
+            "derived_from_base_model_target_plus_probe_increment"
+        )
     truth = group.create_group("truth")
     high_axis = f"{realization_path}/axes/twt_highres_s"
     model_axis = f"{realization_path}/axes/twt_model_s"

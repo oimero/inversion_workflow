@@ -47,7 +47,12 @@ def default_train_kinds(model_id: str) -> set[str]:
 
 
 def default_eval_kinds() -> set[str]:
-    return {"base", "frequency_probe", "seismic_variant", "frequency_probe_seismic_variant"}
+    return {
+        "base",
+        "frequency_probe",
+        "seismic_variant",
+        "frequency_probe_seismic_variant",
+    }
 
 
 def _clean_text(value: Any) -> str:
@@ -63,14 +68,21 @@ def _clean_text(value: Any) -> str:
 
 
 def _parent_id(row: Mapping[str, Any]) -> str:
-    for key in ("parent_realization_id", "source_sample_id", "realization_id", "sample_id"):
+    for key in (
+        "parent_realization_id",
+        "source_sample_id",
+        "realization_id",
+        "sample_id",
+    ):
         value = _clean_text(row.get(key))
         if value:
             return value
     raise ValueError("Cannot derive parent realization id from sample_index row.")
 
 
-def _derive_split(parent: str, *, validation_fraction: float, test_fraction: float) -> str:
+def _derive_split(
+    parent: str, *, validation_fraction: float, test_fraction: float
+) -> str:
     digest = hashlib.sha256(parent.encode("utf-8")).digest()
     value = int.from_bytes(digest[:8], "little") / float(2**64)
     if value < test_fraction:
@@ -111,7 +123,9 @@ def _row_split(
     )
 
 
-def _aligned_arrays(sample: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+def _aligned_arrays(
+    sample: Any,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
     target = np.asarray(sample.target_log_ai, dtype=np.float32)
     seismic = np.asarray(sample.seismic_input, dtype=np.float32)
     lfm = np.asarray(sample.priors["lfm_controlled_degraded"], dtype=np.float32)
@@ -124,17 +138,23 @@ def _aligned_arrays(sample: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
             )
         observed_valid = np.asarray(sample.observed_valid_mask, dtype=bool)
         if observed_valid.shape != target.shape:
-            raise ValueError(f"Depth observed-valid mask shape mismatch for {sample.sample_id}.")
+            raise ValueError(
+                f"Depth observed-valid mask shape mismatch for {sample.sample_id}."
+            )
         valid &= observed_valid
     if target.ndim != 2 or seismic.ndim != 2 or lfm.ndim != 2 or valid.ndim != 2:
         raise ValueError(f"Expected 2D arrays for sample {sample.sample_id}.")
-    if target.shape[0] != seismic.shape[0] or lfm.shape != target.shape or valid.shape != target.shape:
+    if (
+        target.shape[0] != seismic.shape[0]
+        or lfm.shape != target.shape
+        or valid.shape != target.shape
+    ):
         raise ValueError(
             f"Shape mismatch for {sample.sample_id}: target={target.shape}, "
             f"seismic={seismic.shape}, lfm={lfm.shape}, valid={valid.shape}"
         )
     raw_twt_offset_samples = 0
-    if str(getattr(sample, "sample_domain", "")) == "depth":
+    if str(getattr(sample, "sample_domain", "")) in {"depth"}:
         raw_twt_offset_samples = 0
     elif seismic.shape[1] == target.shape[1] - 1:
         target = target[:, 1:]
@@ -146,7 +166,9 @@ def _aligned_arrays(sample: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
             f"Unsupported seismic/target time shape for {sample.sample_id}: "
             f"{seismic.shape[1]} vs {target.shape[1]}"
         )
-    effective_valid = valid & np.isfinite(target) & np.isfinite(seismic) & np.isfinite(lfm)
+    effective_valid = (
+        valid & np.isfinite(target) & np.isfinite(seismic) & np.isfinite(lfm)
+    )
     return target, seismic, lfm, effective_valid, raw_twt_offset_samples
 
 
@@ -174,18 +196,27 @@ def build_patch_index(
 ) -> pd.DataFrame:
     probe_kinds = {"frequency_probe", "frequency_probe_seismic_variant"}
     if max_patches is not None and sample_kinds.intersection(probe_kinds):
-        raise ValueError("max_patches is smoke-only and cannot be used when probe sample kinds are indexed.")
+        raise ValueError(
+            "max_patches is smoke-only and cannot be used when probe sample kinds are indexed."
+        )
     rows: list[dict[str, Any]] = []
     sample_ids = benchmark.sample_ids(kinds=sample_kinds, status="ok")
     held_out_geometry_family = str(
-        dict(getattr(benchmark, "manifest", {}).get("split_policy") or {}).get("held_out_geometry_family") or ""
+        dict(getattr(benchmark, "manifest", {}).get("split_policy") or {}).get(
+            "held_out_geometry_family"
+        )
+        or ""
     )
     for sample_id in sample_ids:
         sample = benchmark.load_sample(sample_id)
         target, _, _, valid, raw_twt_offset_samples = _aligned_arrays(sample)
         n_lateral, n_twt = target.shape
-        lateral_starts = _window_starts(n_lateral, patch_spec.lateral_samples, patch_spec.lateral_stride)
-        twt_starts = _window_starts(n_twt, patch_spec.twt_samples, patch_spec.twt_stride)
+        lateral_starts = _window_starts(
+            n_lateral, patch_spec.lateral_samples, patch_spec.lateral_stride
+        )
+        twt_starts = _window_starts(
+            n_twt, patch_spec.twt_samples, patch_spec.twt_stride
+        )
         if not lateral_starts or not twt_starts:
             continue
         row = sample.row
@@ -238,10 +269,14 @@ def build_patch_index(
                         "probe_group_id": row.get("probe_group_id", ""),
                         "probe_frequency_hz": row.get("probe_frequency_hz", ""),
                         "probe_phase": row.get("probe_phase", ""),
-                        "probe_amplitude_multiplier": row.get("probe_amplitude_multiplier", ""),
+                        "probe_amplitude_multiplier": row.get(
+                            "probe_amplitude_multiplier", ""
+                        ),
                         "probe_lateral_shape": row.get("probe_lateral_shape", ""),
                         "seismic_variant_id": row.get("seismic_variant_id", ""),
-                        "seismic_mismatch_family": row.get("seismic_mismatch_family", ""),
+                        "seismic_mismatch_family": row.get(
+                            "seismic_mismatch_family", ""
+                        ),
                         "suite": row.get("suite", ""),
                         "section_id": row.get("section_id", ""),
                         "scenario_id": row.get("scenario_id", ""),
@@ -275,7 +310,9 @@ def _attach_paired_zero_patch_ids(frame: pd.DataFrame) -> pd.DataFrame:
         source_sample = _clean_text(row.get("source_sample_id"))
         seismic_variant = _clean_text(row.get("seismic_variant_id"))
         if source_sample and seismic_variant:
-            variant_keys[(source_sample, seismic_variant, *window)] = str(row["patch_id"])
+            variant_keys[(source_sample, seismic_variant, *window)] = str(
+                row["patch_id"]
+            )
     paired = []
     for _, row in frame.iterrows():
         pair_sample = _clean_text(row.get("paired_zero_sample_id"))
@@ -331,7 +368,9 @@ def compute_normalization(
     for key, chunks in buckets.items():
         values = np.concatenate([chunk for chunk in chunks if chunk.size])
         if values.size < 2:
-            raise ValueError(f"Insufficient finite train values for normalization: {key}")
+            raise ValueError(
+                f"Insufficient finite train values for normalization: {key}"
+            )
         mean = float(np.mean(values))
         std = float(np.std(values))
         stats[key] = {"mean": mean, "std": std if std > 0.0 else 1.0}
@@ -360,10 +399,14 @@ def compute_input_reference_stats(
         elif input_name == "target":
             chunks.append(_finite_values(target[sl], patch_valid))
         else:
-            raise ValueError(f"Unsupported input reference stats input_name: {input_name}")
+            raise ValueError(
+                f"Unsupported input reference stats input_name: {input_name}"
+            )
     values = np.concatenate([chunk for chunk in chunks if chunk.size])
     if values.size < 2:
-        raise ValueError(f"Insufficient finite train values for input reference stats: {input_name}")
+        raise ValueError(
+            f"Insufficient finite train values for input reference stats: {input_name}"
+        )
     median = float(np.median(values))
     mad = float(np.median(np.abs(values - median)))
     return {
@@ -427,7 +470,9 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         seismic_n = np.where(valid_patch & np.isfinite(seismic_n), seismic_n, 0.0)
         lfm_n = np.where(valid_patch & np.isfinite(lfm_n), lfm_n, 0.0)
         delta_n = np.where(valid_patch & np.isfinite(delta_n), delta_n, 0.0)
-        target_patch = np.where(valid_patch & np.isfinite(target_patch), target_patch, 0.0)
+        target_patch = np.where(
+            valid_patch & np.isfinite(target_patch), target_patch, 0.0
+        )
         lfm_patch = np.where(valid_patch & np.isfinite(lfm_patch), lfm_patch, 0.0)
         lfm_ideal = np.asarray(sample.priors["lfm_ideal"], dtype=np.float32)
         if lfm_ideal.shape[0] != target.shape[0]:
@@ -447,11 +492,20 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             lfm_ideal[sl],
             0.0,
         )
-        if str(getattr(sample, "sample_domain", "")) == "depth":
-            seismic_model_consistent = np.asarray(sample.seismic_model_consistent, dtype=np.float32)
+        if hasattr(sample, "seismic_model_consistent") and hasattr(
+            sample, "physics_valid_mask"
+        ):
+            seismic_model_consistent = np.asarray(
+                sample.seismic_model_consistent, dtype=np.float32
+            )
             physics_valid = np.asarray(sample.physics_valid_mask, dtype=bool)
-            if seismic_model_consistent.shape != target.shape or physics_valid.shape != target.shape:
-                raise ValueError(f"Physics target/mask shape mismatch for {sample.sample_id}.")
+            if (
+                seismic_model_consistent.shape != target.shape
+                or physics_valid.shape != target.shape
+            ):
+                raise ValueError(
+                    f"Physics target/mask shape mismatch for {sample.sample_id}."
+                )
             physics_seismic_patch = np.where(
                 physics_valid[sl] & np.isfinite(seismic_model_consistent[sl]),
                 seismic_model_consistent[sl],
@@ -472,9 +526,13 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         return {
             "input": torch.from_numpy(inputs.astype(np.float32)),
             "target_delta": torch.from_numpy(delta_n.astype(np.float32))[None, :, :],
-            "target_log_ai": torch.from_numpy(target_patch.astype(np.float32))[None, :, :],
+            "target_log_ai": torch.from_numpy(target_patch.astype(np.float32))[
+                None, :, :
+            ],
             "seismic": torch.from_numpy(
-                np.where(valid_patch & np.isfinite(seismic_patch), seismic_patch, 0.0).astype(np.float32)
+                np.where(
+                    valid_patch & np.isfinite(seismic_patch), seismic_patch, 0.0
+                ).astype(np.float32)
             )[None, :, :],
             "seismic_model_consistent": torch.from_numpy(
                 physics_seismic_patch.astype(np.float32)
@@ -483,7 +541,9 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
                 physics_valid_patch.astype(np.float32)
             )[None, :, :],
             "lfm": torch.from_numpy(lfm_patch.astype(np.float32))[None, :, :],
-            "lfm_ideal": torch.from_numpy(lfm_ideal_patch.astype(np.float32))[None, :, :],
+            "lfm_ideal": torch.from_numpy(lfm_ideal_patch.astype(np.float32))[
+                None, :, :
+            ],
             "valid_mask": torch.from_numpy(valid_patch.astype(np.float32))[None, :, :],
             "patch_id": str(row["patch_id"]),
             "sample_id": str(row["sample_id"]),
@@ -492,9 +552,15 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
 
 
 def _norm(values: np.ndarray, stats: Mapping[str, Any]) -> np.ndarray:
-    return (np.asarray(values, dtype=np.float32) - float(stats["mean"])) / float(stats["std"])
+    return (np.asarray(values, dtype=np.float32) - float(stats["mean"])) / float(
+        stats["std"]
+    )
 
 
-def denormalize_delta(values: np.ndarray, normalization: Mapping[str, Any]) -> np.ndarray:
+def denormalize_delta(
+    values: np.ndarray, normalization: Mapping[str, Any]
+) -> np.ndarray:
     stats = normalization["delta"]
-    return np.asarray(values, dtype=np.float32) * float(stats["std"]) + float(stats["mean"])
+    return np.asarray(values, dtype=np.float32) * float(stats["std"]) + float(
+        stats["mean"]
+    )

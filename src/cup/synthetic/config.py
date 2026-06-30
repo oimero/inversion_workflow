@@ -9,6 +9,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from cup.synthetic.calibration import GENERATOR_FAMILY
+from cup.synthetic.core.config import parse_object_core_controls
 from cup.config.sources import assert_recorded_source_matches, require_source_files
 from cup.utils.io import resolve_relative_path
 
@@ -106,14 +107,16 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             f"synthoseis_lite.sample_domain='time' and benchmark_schema={DATA_SCHEMA!r}."
         )
     sources = _mapping(root.get("source_runs"), path="synthoseis_lite.source_runs")
+    source_keys = (
+        "forward_observability_dir",
+        "well_preprocess_dir",
+        "well_auto_tie_dir",
+        "wavelet_generation_dir",
+    )
+    _reject_unknown(sources, set(source_keys), path="synthoseis_lite.source_runs")
     source_runs = {
         key: _required_text(sources, key, path="synthoseis_lite.source_runs")
-        for key in (
-            "forward_observability_dir",
-            "well_preprocess_dir",
-            "well_auto_tie_dir",
-            "wavelet_generation_dir",
-        )
+        for key in source_keys
     }
     sampling = _mapping(root.get("sampling"), path="synthoseis_lite.sampling")
     sampling_keys = {"expected_output_dt_s", "vertical_oversampling_factor"}
@@ -321,6 +324,10 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         robust_scale_keys,
         path="synthoseis_lite.impedance_attribute_generator.robust_scale",
     )
+    object_core_controls = parse_object_core_controls(impedance)
+    state_threshold_sigma = float(impedance.get("state_threshold_sigma"))
+    if not np.isfinite(state_threshold_sigma) or state_threshold_sigma <= 0.0:
+        raise ValueError("impedance_attribute_generator.state_threshold_sigma must be positive.")
     duration_modes = _mapping(
         impedance.get("duration_modes"),
         path="synthoseis_lite.impedance_attribute_generator.duration_modes",
@@ -363,6 +370,31 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         path="synthoseis_lite.generation",
     )
     _require_keys(generation, generation_keys, path="synthoseis_lite.generation")
+    attempts_per_scenario = int(generation.get("attempts_per_scenario"))
+    if attempts_per_scenario <= 0:
+        raise ValueError("generation.attempts_per_scenario must be a positive integer.")
+    configured_duration_modes = [str(value) for value in generation["duration_modes"]]
+    if not configured_duration_modes or not set(configured_duration_modes) <= {
+        "standard",
+        "ultra_thin_stress",
+    }:
+        raise ValueError("generation.duration_modes contains unsupported values.")
+    configured_geometry_families = [
+        str(value) for value in generation["geometry_families"]
+    ]
+    if not configured_geometry_families or not set(configured_geometry_families) <= {
+        "none",
+        "wedge",
+        "pinchout",
+    }:
+        raise ValueError("generation.geometry_families contains unsupported values.")
+    configured_geometry_directions = [
+        str(value) for value in generation["geometry_directions"]
+    ]
+    if not configured_geometry_directions or not set(
+        configured_geometry_directions
+    ) <= {"left_to_right", "right_to_left"}:
+        raise ValueError("generation.geometry_directions contains unsupported values.")
     acceptance = _mapping(
         generation.get("acceptance_qc"), path="synthoseis_lite.generation.acceptance_qc"
     )
@@ -686,42 +718,8 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         },
         "impedance": {
             "family": str(impedance.get("family", GENERATOR_FAMILY)),
-            "state_threshold_sigma": float(impedance.get("state_threshold_sigma", 1.0)),
-            "huber_delta_parent_sigma_floor": float(
-                robust_scale.get("huber_delta_parent_sigma_floor", 0.05)
-            ),
-            "coefficient_sigma_parent_floor": float(
-                robust_scale.get("coefficient_sigma_parent_floor", 0.05)
-            ),
-            "coefficient_sigma_parent_cap": float(
-                robust_scale.get("coefficient_sigma_parent_cap", 3.0)
-            ),
-            "correlation_length_section_fractions": [
-                float(value)
-                for value in lateral.get(
-                    "correlation_length_section_fractions", [0.1, 0.3, 1.0]
-                )
-            ],
-            "coefficient_sigma_multipliers": [
-                float(value)
-                for value in lateral.get("coefficient_sigma_multipliers", [0.25, 0.5])
-            ],
-            "thickness_log_sigma_values": [
-                float(value)
-                for value in lateral.get("thickness_log_sigma_values", [0.10, 0.25])
-            ],
-            "max_global_reversal_fraction": float(
-                qc.get("max_global_reversal_fraction", 0.10)
-            ),
-            "max_object_reversal_fraction": float(
-                qc.get("max_object_reversal_fraction", 0.25)
-            ),
-            "max_global_clipping_fraction": float(
-                qc.get("max_global_clipping_fraction", 0.005)
-            ),
-            "max_object_clipping_fraction": float(
-                qc.get("max_object_clipping_fraction", 0.02)
-            ),
+            "state_threshold_sigma": state_threshold_sigma,
+            **object_core_controls,
             "minimum_highres_cells": int(
                 standard_duration.get("minimum_highres_cells")
             ),
@@ -737,16 +735,10 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "scenario_acceptance_enforcement": acceptance_enforcement,
         },
         "generation": {
-            "attempts_per_scenario": int(generation.get("attempts_per_scenario", 20)),
-            "duration_modes": list(generation.get("duration_modes", ["standard"])),
-            "geometry_families": list(
-                generation.get("geometry_families", ["none", "wedge", "pinchout"])
-            ),
-            "geometry_directions": list(
-                generation.get(
-                    "geometry_directions", ["left_to_right", "right_to_left"]
-                )
-            ),
+            "attempts_per_scenario": attempts_per_scenario,
+            "duration_modes": configured_duration_modes,
+            "geometry_families": configured_geometry_families,
+            "geometry_directions": configured_geometry_directions,
             "acceptance_qc": {
                 "minimum_attempts_per_scenario": int(
                     acceptance.get("minimum_attempts_per_scenario")
@@ -968,6 +960,10 @@ def resolve_sources(
         "r", encoding="utf-8"
     ) as handle:
         summary = json.load(handle)
+    if summary.get("schema_version") != "forward_observability_v1":
+        raise ValueError(
+            "forward_observability run_summary.json must use forward_observability_v1."
+        )
     recorded = summary.get("source_runs") or {}
     for key in ("well_preprocess_dir", "well_auto_tie_dir", "wavelet_generation_dir"):
         assert_recorded_source_matches(recorded, key, sources[key], root=repo_root)

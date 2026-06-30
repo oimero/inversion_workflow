@@ -26,7 +26,9 @@ from cup.synthetic.calibration import ImpedanceCalibration
 from cup.synthetic.core import build_attempt_plan as build_core_attempt_plan
 from cup.synthetic.core import (
     geometry_feasibility_rows,
+    limit_attempt_plan,
     rejection_reason_summary,
+    validate_debug_attempt_limit,
     write_dataset,
 )
 from cup.synthetic.core.progress import (
@@ -1299,9 +1301,7 @@ def run_depth_generation(
     geometry_families: Sequence[str] | None = None,
     qc_only: bool = False,
 ) -> dict[str, Any]:
-    output_dir.mkdir(parents=True, exist_ok=False)
-    logger = configure_generation_logger(output_dir, sample_domain="depth")
-    logger.info("Depth Synthoseis generation started")
+    debug_attempt_limit = validate_debug_attempt_limit(debug_attempt_limit)
     calibration, calibration_payload = load_depth_calibration_for_object_core(
         calibration_path
     )
@@ -1338,6 +1338,9 @@ def run_depth_generation(
             != path.resolve()
         ):
             raise ValueError(f"impedance calibration source run mismatch: {key}")
+    output_dir.mkdir(parents=True, exist_ok=False)
+    logger = configure_generation_logger(output_dir, sample_domain="depth")
+    logger.info("Depth Synthoseis generation started")
     sections, survey = build_depth_sections(
         workflow=workflow, script_cfg=script_cfg, repo_root=repo_root
     )
@@ -1356,12 +1359,7 @@ def run_depth_generation(
         )
     ).to_csv(feasibility_path, index=False)
     plan = build_attempt_plan(script_cfg, sections, geometry_families=geometry_families)
-    if debug_attempt_limit is not None:
-        plan = (
-            plan.groupby(["section_id", "scenario_id"], sort=False)
-            .head(int(debug_attempt_limit))
-            .reset_index(drop=True)
-        )
+    plan = limit_attempt_plan(plan, debug_attempt_limit)
     plan.to_csv(output_dir / "attempt_plan.csv", index=False)
     scenarios = {item.scenario_id: item for item in generation_scenarios(script_cfg)}
     sections_by_id = {item.section_id: item for item in sections}
@@ -1422,6 +1420,7 @@ def run_depth_generation(
     highres_rows: list[dict[str, Any]] = []
     subgrid_rows: list[dict[str, Any]] = []
     variant_rows: list[dict[str, Any]] = []
+    generation_qc_rows: list[dict[str, Any]] = []
     h5_path = output_dir / "synthetic_benchmark.h5"
     with AttemptProgressLog(
         output_dir / "attempt_progress.csv",
@@ -1432,10 +1431,13 @@ def run_depth_generation(
         append=True,
     ) as production_progress, h5py.File(h5_path, "w") as h5:
         h5.attrs["schema"] = SCHEMA_VERSION
+        h5.attrs["schema_version"] = SCHEMA_VERSION
         h5.attrs["sample_domain"] = "depth"
         h5.attrs["depth_basis"] = "tvdss"
         h5.attrs["axis_positive_direction"] = "down"
         h5.attrs["generator_family"] = GENERATOR_FAMILY
+        h5.attrs["suite"] = "field_conditioned"
+        h5.attrs["global_seed"] = int(script_cfg["global_seed"])
         h5.attrs["forward_model_inputs_sha256"] = forward_inputs["_sha256"]
         h5.attrs["impedance_calibration_sha256"] = sha256_file(calibration_path)
         h5.attrs["qc_only"] = bool(qc_only)
@@ -1445,6 +1447,24 @@ def run_depth_generation(
             attempt_started = time.perf_counter()
             section = sections_by_id[str(row["section_id"])]
             scenario = scenarios[str(row["scenario_id"])]
+            base_id = str(row["parent_realization_id"])
+            common = {
+                "sample_domain": "depth",
+                "depth_basis": "tvdss",
+                "suite": "field_conditioned",
+                "parent_realization_id": base_id,
+                "section_id": section.section_id,
+                "scenario_id": scenario.scenario_id,
+                "geometry_family": scenario.geometry_family,
+                "geometry_direction": scenario.geometry_direction,
+                "duration_mode": scenario.duration_mode,
+                "attempt_id": int(row["attempt_id"]),
+                "evaluation_role": row["evaluation_role"],
+                "held_out_geometry_family": script_cfg["splits"][
+                    "held_out_geometry_family"
+                ],
+                "forward_model_inputs_sha256": forward_inputs["_sha256"],
+            }
             progress_status = "rejected"
             progress_reason = ""
             try:
@@ -1462,28 +1482,15 @@ def run_depth_generation(
                 if generated is None:
                     raise RuntimeError("depth_generation_returned_no_realization")
                 group_path = "" if qc_only else _write_base(h5, generated)
-                base_id = generated.realization_id
-                common = {
-                    "sample_domain": "depth",
-                    "depth_basis": "tvdss",
+                if generated.realization_id != base_id:
+                    raise RuntimeError("depth_generation_parent_identity_changed")
+                common.update({
                     "status": "ok",
-                    "suite": "field_conditioned",
-                    "parent_realization_id": base_id,
-                    "section_id": section.section_id,
-                    "scenario_id": scenario.scenario_id,
-                    "geometry_family": scenario.geometry_family,
-                    "geometry_direction": scenario.geometry_direction,
-                    "duration_mode": scenario.duration_mode,
-                    "evaluation_role": row["evaluation_role"],
-                    "held_out_geometry_family": script_cfg["splits"][
-                        "held_out_geometry_family"
-                    ],
                     "model_sample_count": generated.tvdss_model_m.size,
                     "model_dz_m": float(np.diff(generated.tvdss_model_m[:2])[0]),
                     "physics_halo_m": generated.qc["physics_halo_m"],
                     "physics_halo_samples": generated.qc["physics_halo_samples"],
-                    "forward_model_inputs_sha256": forward_inputs["_sha256"],
-                }
+                })
                 local_index_rows = [
                     {
                         **common,
@@ -1572,6 +1579,13 @@ def run_depth_generation(
                         "subgrid_amplitude_scale_ratio"
                     ],
                 }
+                local_generation_qc_row = {
+                    **common,
+                    "sample_id": base_id,
+                    "sample_kind": "base",
+                    "reasons": "",
+                    **generated.qc,
+                }
                 # Commit tabular records only after the complete HDF5 parent,
                 # including every configured variant and QC row, is ready.
                 index_rows.extend(local_index_rows)
@@ -1580,20 +1594,43 @@ def run_depth_generation(
                 coefficient_rows.extend(generated.object_lateral_coefficients)
                 highres_rows.append(local_highres_row)
                 subgrid_rows.append(local_subgrid_row)
+                generation_qc_rows.append(local_generation_qc_row)
                 progress_status = "accepted"
             except (GenerationRejected, ValueError, FloatingPointError) as exc:
-                failed_parent = str(row["parent_realization_id"])
-                failed_group = f"/realizations/{failed_parent}"
+                failed_group = f"/realizations/{base_id}"
                 if (not qc_only) and failed_group in h5:
                     del h5[failed_group]
+                reason = f"{type(exc).__name__}:{exc}"
+                index_rows.append(
+                    {
+                        **common,
+                        "sample_id": base_id,
+                        "sample_kind": "base",
+                        "source_sample_id": "",
+                        "hdf5_group": "",
+                        "seismic_input_dataset": "",
+                        "physics_target_dataset": "",
+                        "status": "rejected",
+                        "reasons": reason,
+                    }
+                )
                 rejection_rows.append(
                     {
                         **row,
                         "status": "rejected",
-                        "reason": f"{type(exc).__name__}:{exc}",
+                        "reason": reason,
                     }
                 )
-                progress_reason = f"{type(exc).__name__}:{exc}"
+                generation_qc_rows.append(
+                    {
+                        **common,
+                        "sample_id": base_id,
+                        "sample_kind": "base",
+                        "status": "rejected",
+                        "reasons": reason,
+                    }
+                )
+                progress_reason = reason
             production_progress.record(
                 row,
                 sequence_index=sequence_index,
@@ -1622,13 +1659,19 @@ def run_depth_generation(
     pd.DataFrame.from_records(variant_rows).to_csv(
         output_dir / "seismic_variant_results.csv", index=False
     )
+    pd.DataFrame.from_records(generation_qc_rows).to_csv(
+        output_dir / "generation_qc.csv", index=False
+    )
     rejection_summary = rejection_reason_summary(
         pd.DataFrame.from_records(rejection_rows), index
     )
     rejection_summary_path = output_dir / "rejection_reason_summary.csv"
     rejection_summary.to_csv(rejection_summary_path, index=False)
     base = (
-        index[index.get("sample_kind", pd.Series(dtype=str)).eq("base")].copy()
+        index[
+            index.get("sample_kind", pd.Series(dtype=str)).eq("base")
+            & index.get("status", pd.Series(dtype=str)).eq("ok")
+        ].copy()
         if not index.empty
         else index
     )
@@ -1644,7 +1687,6 @@ def run_depth_generation(
         development_limited=development,
     )
     catalog.to_csv(output_dir / "scenario_catalog.csv", index=False)
-    catalog.to_csv(output_dir / "generation_qc.csv", index=False)
     failure_reason = "depth_generation_no_accepted_realizations" if base.empty else ""
     failed_scenarios = catalog["acceptance_status"].isin(
         {"failed", "insufficient_attempts"}
@@ -1683,6 +1725,7 @@ def run_depth_generation(
     ]
     manifest = {
         "schema": SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION,
         "status": "development_limited"
         if development
         else (
@@ -1693,10 +1736,21 @@ def run_depth_generation(
         "sample_domain": "depth",
         "depth_basis": "tvdss",
         "generator_family": GENERATOR_FAMILY,
+        "suite": "field_conditioned",
+        "development_limited": development,
         "qc_only": bool(qc_only),
         "training_consumable": not bool(qc_only),
         "forward_model_inputs_sha256": forward_inputs["_sha256"],
         "forward_model_inputs_path": str(forward_inputs["_path"]),
+        "global_seed": int(script_cfg["global_seed"]),
+        "n_sections": len(sections),
+        "n_scenarios": int(plan["scenario_id"].nunique()),
+        "attempts_per_scenario": min(
+            int(script_cfg["generation"]["attempts_per_scenario"]),
+            int(debug_attempt_limit or script_cfg["generation"]["attempts_per_scenario"]),
+        ),
+        "accepted_parent_realizations": int(len(base)),
+        "rejected_parent_realizations": int(len(plan) - len(base)),
         "forward_inputs": {
             "wavelet_sha256": forward_inputs["wavelet"]["sha256"],
             "ai_velocity_relation_sha256": forward_inputs["ai_velocity_relation"][

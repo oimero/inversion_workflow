@@ -330,6 +330,7 @@ def run_calibration(
     workflow: WorkflowConfig,
     script_cfg: Mapping[str, Any],
     sources: Mapping[str, Path],
+    config_provenance: Mapping[str, str],
     repo_root: Path,
     output_dir: Path,
 ) -> dict[str, Any]:
@@ -398,6 +399,8 @@ def run_calibration(
         horizon_consistency_path, index=False
     )
     payload = calibration.to_dict()
+    payload["sample_domain"] = "time"
+    payload["config_provenance"] = dict(config_provenance)
     payload["artifact_hashes"] = {
         "well_object_catalog.csv": sha256_file(objects_path),
         "calibration_qc.csv": sha256_file(qc_path),
@@ -405,6 +408,7 @@ def run_calibration(
         "well_background_fits.csv": sha256_file(backgrounds_path),
         "well_object_profile_samples.csv": sha256_file(profile_samples_path),
         "well_horizon_consistency.csv": sha256_file(horizon_consistency_path),
+        "well_status.csv": sha256_file(status_path),
     }
     write_json(output_dir / "impedance_calibration.json", payload)
     figure_summary = write_calibration_figures(
@@ -413,9 +417,12 @@ def run_calibration(
     )
     summary = {
         "schema_version": CALIBRATION_SCHEMA,
+        "status": "success",
+        "sample_domain": "time",
         "generator_family": GENERATOR_FAMILY,
         "implementation_scope": IMPLEMENTATION_SCOPE,
         "source_runs": calibration.source_runs,
+        "config_provenance": dict(config_provenance),
         "n_well_zone_inputs": len(inputs),
         "n_objects": int(len(objects)),
         "well_status_counts": pd.Series(
@@ -441,6 +448,7 @@ def run_calibration(
             "well_horizon_consistency": repo_relative_path(
                 horizon_consistency_path, root=repo_root
             ),
+            "well_status": repo_relative_path(status_path, root=repo_root),
         },
         "figures": {
             "generated_count": int(figure_summary.get("generated_count", 0)),

@@ -39,11 +39,23 @@ from cup.synthetic.depth.config import (  # noqa: E402
 from cup.synthetic.depth.generation import run_depth_generation  # noqa: E402
 from cup.config.workflow import WorkflowConfig  # noqa: E402
 from cup.config.sources import load_summary, resolve_source_run  # noqa: E402
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path  # noqa: E402
+from cup.utils.io import (  # noqa: E402
+    load_yaml_config,
+    repo_relative_path,
+    resolve_relative_path,
+    sha256_file,
+)
 
 
 TIME_SCHEMA = "synthoseis_lite_v2"
 DEPTH_SCHEMA = "synthoseis_lite_v2"
+
+
+def _positive_int_arg(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     )
     generate.add_argument(
         "--debug-attempt-limit",
-        type=int,
+        type=_positive_int_arg,
         default=None,
         help="Development-only attempt cap; acceptance thresholds are not evaluated.",
     )
@@ -133,12 +145,20 @@ def _prepare_synthoseis_config(raw: dict, workflow: WorkflowConfig) -> dict:
     return prepared
 
 
-def _load_time_config(experiment_raw: dict) -> tuple[dict, WorkflowConfig]:
+def _load_time_config(
+    experiment_raw: dict, *, experiment_path: Path
+) -> tuple[dict, WorkflowConfig, dict[str, str]]:
     """Load time-v2 config, supporting either legacy direct or common-overlay form."""
     if "workflow_config" not in experiment_raw:
         raw = experiment_raw
         workflow = WorkflowConfig.from_mapping(raw)
-        return _prepare_synthoseis_config(raw, workflow), workflow
+        provenance = {
+            "experiment_file": str(experiment_path),
+            "experiment_sha256": sha256_file(experiment_path),
+            "workflow_config": str(experiment_path),
+            "workflow_config_sha256": sha256_file(experiment_path),
+        }
+        return _prepare_synthoseis_config(raw, workflow), workflow, provenance
 
     allowed = {"workflow_config", "synthoseis_lite"}
     unknown = sorted(set(experiment_raw) - allowed)
@@ -157,7 +177,13 @@ def _load_time_config(experiment_raw: dict) -> tuple[dict, WorkflowConfig]:
     workflow = WorkflowConfig.from_mapping(composed)
     if workflow.seismic.domain != "time":
         raise ValueError("Time Synthoseis-lite v2 requires seismic.domain='time'.")
-    return _prepare_synthoseis_config(composed, workflow), workflow
+    provenance = {
+        "experiment_file": str(experiment_path),
+        "experiment_sha256": sha256_file(experiment_path),
+        "workflow_config": str(common_path),
+        "workflow_config_sha256": sha256_file(common_path),
+    }
+    return _prepare_synthoseis_config(composed, workflow), workflow, provenance
 
 
 def _dispatch_keys(raw: dict) -> tuple[str, str]:
@@ -239,7 +265,9 @@ def main() -> None:
             "Unsupported Synthoseis-lite dispatch: "
             f"sample_domain={sample_domain!r}, benchmark_schema={benchmark_schema!r}."
         )
-    raw, workflow = _load_time_config(experiment_raw)
+    raw, workflow, config_provenance = _load_time_config(
+        experiment_raw, experiment_path=config_path
+    )
     script_cfg = parse_synthoseis_config(raw)
     sources = resolve_sources(script_cfg, repo_root=REPO_ROOT)
     output_dir = _output_dir(args, workflow)
@@ -248,6 +276,7 @@ def main() -> None:
             workflow=workflow,
             script_cfg=script_cfg,
             sources=sources,
+            config_provenance=config_provenance,
             repo_root=REPO_ROOT,
             output_dir=output_dir,
         )
@@ -257,6 +286,7 @@ def main() -> None:
             workflow=workflow,
             script_cfg=script_cfg,
             sources=sources,
+            config_provenance=config_provenance,
             calibration_path=calibration,
             repo_root=REPO_ROOT,
             output_dir=output_dir,
@@ -268,7 +298,7 @@ def main() -> None:
     print("=== synthoseis-lite ===")
     print(f"Command: {args.command}")
     print(f"Output: {output_dir}")
-    print(f"Status: {summary.get('status', 'ok')}")
+    print(f"Status: {summary.get('status', 'success')}")
 
 
 if __name__ == "__main__":

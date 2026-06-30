@@ -11,7 +11,11 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from cup.synthetic.core import validate_dataset_metadata
+from cup.synthetic.core import (
+    validate_dataset_metadata,
+    validate_manifest_files,
+    validate_training_manifest,
+)
 
 
 SCHEMA_VERSION = "synthoseis_lite_v2"
@@ -116,6 +120,10 @@ class TimeV2Benchmark:
             )
         if str(self.manifest.get("sample_domain") or "").casefold() != "time":
             raise ValueError("Time v2 reader requires sample_domain=time.")
+        validate_training_manifest(self.manifest, sample_domain="time")
+        validate_manifest_files(
+            self.run_dir, dict(self.manifest.get("files") or {})
+        )
         recorded_forward = str(self.manifest.get("forward_model_inputs_sha256") or "")
         if not recorded_forward:
             raise ValueError(
@@ -168,6 +176,25 @@ class TimeV2Benchmark:
         self._rows = {
             str(row["sample_id"]): row.to_dict() for _, row in self.index.iterrows()
         }
+        for row in self._rows.values():
+            if (
+                str(row.get("status") or "") != "ok"
+                or str(row.get("sample_kind") or "") not in SEISMIC_VARIANT_KINDS
+            ):
+                continue
+            source_id = _clean_path(row.get("source_sample_id"))
+            source = self._rows.get(source_id)
+            if source is None:
+                raise ValueError(f"Variant has an invalid source: {row['sample_id']}")
+            if (
+                str(source.get("parent_realization_id"))
+                != str(row.get("parent_realization_id"))
+                or str(source.get("evaluation_role"))
+                != str(row.get("evaluation_role"))
+            ):
+                raise ValueError(
+                    f"Variant crosses parent realization or evaluation role: {row['sample_id']}"
+                )
 
         with h5py.File(self.h5_path, "r") as h5:
             if (
@@ -181,12 +208,30 @@ class TimeV2Benchmark:
                 raise ValueError(
                     "HDF5 forward_model_inputs_sha256 does not match manifest."
                 )
+            if bool(h5.attrs.get("qc_only", False)) != bool(
+                self.manifest.get("qc_only", False)
+            ):
+                raise ValueError("HDF5 qc_only does not match manifest.")
+            for key in ("suite", "global_seed", "impedance_calibration_sha256"):
+                if key in self.manifest and str(h5.attrs.get(key)) != str(
+                    self.manifest[key]
+                ):
+                    raise ValueError(f"HDF5 {key} does not match manifest.")
 
             def visit(_: str, value: Any) -> None:
                 if isinstance(value, h5py.Dataset):
                     validate_dataset_metadata(value, sample_domain="time")
 
             h5.visititems(visit)
+
+            successful = self.index[self.index["status"].astype(str).eq("ok")]
+            for _, row in successful.iterrows():
+                group_path = _clean_path(row.get("hdf5_group"))
+                if not group_path or group_path not in h5:
+                    raise KeyError(
+                        "sample_index.csv references missing HDF5 group "
+                        f"{group_path!r}."
+                    )
 
     def sample_ids(
         self,

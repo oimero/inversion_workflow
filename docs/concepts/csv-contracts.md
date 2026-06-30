@@ -334,18 +334,21 @@ HDF5 文件，每个 sample 为一个 group，包含 `model_target_log_ai`、
 | `suite` | `canonical` / `field_conditioned` |
 | `section_id` | 所属剖面 |
 | `geometry_family` | `none` / `wedge` / `pinchout` 等 |
-| `status` | `ok` / `rejected` |
+| `status` | `ok` / `rejected`；time/depth 都保留正式生成阶段的拒绝 parent attempt |
 | `hdf5_group` | HDF5 内 group 路径 |
 
 ### `benchmark_manifest.json`
 
 | 关键字段 | 含义 |
 |----------|------|
-| `schema_version` | 固定 `synthoseis_lite_v1` |
+| `schema` / `schema_version` | 固定 `synthoseis_lite_v2` |
+| `sample_domain` | `time` / `depth` |
+| `status` | `success` / `completed_with_warnings` / `development_limited` |
+| `qc_only` / `training_consumable` | QC-only 产物必须明确禁止训练消费 |
 | `global_seed` | 全局随机种子 |
-| `config_summary` | 关键的生成配置参数快照 |
-| `file_hashes` | 所有输出文件的 SHA-256 |
-| `accepted_realizations` / `rejected_realizations` | 接受/拒绝计数 |
+| `config_provenance` | experiment/common 配置路径及 SHA-256 |
+| `files` | 所有冻结输出文件的 SHA-256 |
+| `accepted_parent_realizations` / `rejected_parent_realizations` | 接受/拒绝的 parent realization 计数 |
 
 ### 其他生成输出
 
@@ -353,7 +356,7 @@ HDF5 文件，每个 sample 为一个 group，包含 `model_target_log_ai`、
 - `probe_frequency_catalog.csv`：探针频率的选择理由和噪声等效参考。
 - `seismic_variant_results.csv`：每个地震变体（噪声、增益、相移等）的参数。
 - `scenario_catalog.csv`：所有场景的定义和场条件接受状态。
-- `generation_qc.csv`：每次生成尝试的 QC 指标和拒绝原因。
+- `generation_qc.csv`：time/depth 统一为正式生成阶段逐 attempt 的 QC 指标和拒绝原因；逐 scenario 汇总只写 `scenario_catalog.csv`。
 - `section_geometry_qc.csv`：场条件截面的横向层位支撑状态。
 - `attempt_progress.csv`：time/depth 共用的增量进度日志；每次 preflight/正式生成后
   立即刷新，记录 scenario 当前成功数、拒绝数、实际接受率、理论最高接受率及门禁

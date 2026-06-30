@@ -75,6 +75,26 @@ def build_attempt_plan(
     return pd.DataFrame.from_records(rows)
 
 
+def validate_debug_attempt_limit(limit: int | None) -> int | None:
+    if limit is None:
+        return None
+    if isinstance(limit, bool) or int(limit) <= 0 or float(limit) != float(int(limit)):
+        raise ValueError("debug_attempt_limit must be a positive integer.")
+    return int(limit)
+
+
+def limit_attempt_plan(plan: pd.DataFrame, limit: int | None) -> pd.DataFrame:
+    """Apply the development attempt cap identically in both domains."""
+    parsed_limit = validate_debug_attempt_limit(limit)
+    if parsed_limit is None:
+        return plan.reset_index(drop=True)
+    return (
+        plan.groupby(["section_id", "scenario_id"], sort=False)
+        .head(parsed_limit)
+        .reset_index(drop=True)
+    )
+
+
 def write_dataset(
     group: h5py.Group,
     name: str,
@@ -121,6 +141,75 @@ def validate_dataset_metadata(value: h5py.Dataset, *, sample_domain: str) -> Non
         raise ValueError(f"HDF5 dataset {value.name} shape metadata is stale.")
     if str(value.attrs["dtype"]) != str(value.dtype):
         raise ValueError(f"HDF5 dataset {value.name} dtype metadata is stale.")
+    if str(value.attrs["sha256"]) != array_sha256(value[()]):
+        raise ValueError(f"HDF5 dataset {value.name} content SHA-256 mismatch.")
+    axis_path = str(value.attrs["axis_path"])
+    if axis_path not in value.file or not isinstance(value.file[axis_path], h5py.Dataset):
+        raise ValueError(
+            f"HDF5 dataset {value.name} references a missing axis: {axis_path}"
+        )
+    axis_order = [
+        item.strip() for item in str(value.attrs["axis_order"]).split(",")
+    ]
+    axis_name = Path(axis_path).name.casefold()
+    if axis_name == "lateral_m":
+        candidates = [index for index, label in enumerate(axis_order) if label == "lateral"]
+    elif "tvdss" in axis_name:
+        candidates = [
+            index for index, label in enumerate(axis_order) if label.startswith("tvdss")
+        ]
+    elif "twt" in axis_name or "time" in axis_name:
+        candidates = [
+            index
+            for index, label in enumerate(axis_order)
+            if label.startswith("twt") or label.startswith("time")
+        ]
+    else:
+        raise ValueError(
+            f"HDF5 dataset {value.name} references an unknown axis: {axis_path}"
+        )
+    if (
+        len(candidates) != 1
+        or value.shape[candidates[0]] != value.file[axis_path].shape[0]
+    ):
+        raise ValueError(
+            f"HDF5 dataset {value.name} shape is inconsistent with axis {axis_path}."
+        )
+
+
+def validate_manifest_files(run_dir: Path, files: Mapping[str, Any]) -> None:
+    """Verify every artifact frozen in a benchmark manifest."""
+    if not files:
+        raise ValueError("Benchmark manifest lacks frozen artifact hashes.")
+    for name, digest in files.items():
+        if str(name) == "benchmark_manifest.json":
+            continue
+        path = run_dir / str(name)
+        if not path.is_file() or sha256_file(path) != str(digest):
+            raise ValueError(f"Benchmark artifact SHA-256 mismatch: {name}")
+
+
+def validate_training_manifest(
+    manifest: Mapping[str, Any], *, sample_domain: str
+) -> None:
+    """Apply the shared status and qc-only consumption contract."""
+    status = str(manifest.get("status") or "")
+    if status not in {
+        "ok",  # accepted for already-generated time-v2 artifacts
+        "success",
+        "completed_with_warnings",
+        "development_limited",
+    }:
+        raise ValueError(
+            f"Synthoseis v2 {sample_domain} manifest is not consumable: status={status!r}."
+        )
+    if bool(manifest.get("qc_only", False)) or manifest.get(
+        "training_consumable"
+    ) is False:
+        raise ValueError(
+            "Synthoseis v2 qc-only benchmark is not training-consumable; "
+            "regenerate without --qc-only."
+        )
 
 
 def geometry_feasibility_rows(
@@ -208,8 +297,12 @@ __all__ = [
     "evaluation_role",
     "file_chain_sha256",
     "geometry_feasibility_rows",
+    "limit_attempt_plan",
     "rejection_reason_summary",
     "stable_json_sha256",
     "validate_dataset_metadata",
+    "validate_debug_attempt_limit",
+    "validate_manifest_files",
+    "validate_training_manifest",
     "write_dataset",
 ]

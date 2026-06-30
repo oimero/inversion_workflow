@@ -12,7 +12,11 @@ import numpy as np
 import pandas as pd
 
 from cup.synthetic.depth.config import SCHEMA_VERSION
-from cup.utils.io import array_sha256, sha256_file
+from cup.synthetic.core import (
+    validate_dataset_metadata,
+    validate_manifest_files,
+    validate_training_manifest,
+)
 
 
 @dataclass(frozen=True)
@@ -68,34 +72,15 @@ class DepthV2Benchmark:
                 f"Unsupported Synthoseis schema {actual_schema!r}; expected {SCHEMA_VERSION!r}. "
                 "Re-run calibrate/generate to rebuild the benchmark."
             )
-        if self.manifest.get("status") not in {"success", "development_limited"}:
-            raise ValueError(
-                f"Synthoseis v2 manifest is not consumable: status={self.manifest.get('status')!r}."
-            )
-        if bool(self.manifest.get("qc_only", False)) or self.manifest.get("training_consumable") is False:
-            raise ValueError("Synthoseis v2 qc-only benchmark is not training-consumable; regenerate without --qc-only.")
         if self.manifest.get("sample_domain") != "depth" or self.manifest.get("depth_basis") != "tvdss":
             raise ValueError("Synthoseis v2 reader requires sample_domain=depth and depth_basis=tvdss.")
-        for name, digest in dict(self.manifest.get("files") or {}).items():
-            if name == "benchmark_manifest.json":
-                continue
-            path = self.run_dir / name
-            if not path.is_file() or sha256_file(path) != str(digest):
-                raise ValueError(f"Benchmark artifact SHA-256 mismatch: {name}")
+        validate_training_manifest(self.manifest, sample_domain="depth")
+        validate_manifest_files(self.run_dir, dict(self.manifest.get("files") or {}))
         recorded_forward = str(self.manifest.get("forward_model_inputs_sha256") or "")
         if not recorded_forward:
             raise ValueError("Benchmark manifest lacks forward_model_inputs_sha256; rebuild required.")
         if expected_forward_model_inputs_sha256 is not None and recorded_forward != str(expected_forward_model_inputs_sha256):
             raise ValueError("Benchmark forward_model_inputs_sha256 does not match the requested model run.")
-        forward_path_text = str(self.manifest.get("forward_model_inputs_path") or "")
-        if not forward_path_text:
-            raise ValueError("Benchmark manifest lacks forward_model_inputs_path; rebuild required.")
-        forward_path = Path(forward_path_text)
-        if not forward_path.is_absolute():
-            forward_path = self.run_dir / forward_path
-        if not forward_path.is_file() or sha256_file(forward_path) != recorded_forward:
-            raise ValueError("Current forward_model_inputs.json does not match the frozen benchmark hash.")
-
         self.index = pd.read_csv(self.index_path, dtype=str, keep_default_na=False)
         required = {
             "sample_id", "parent_realization_id", "sample_kind", "source_sample_id",
@@ -131,6 +116,8 @@ class DepthV2Benchmark:
                 raise ValueError("Held-out geometry family appears outside geometry_holdout.")
         self._rows = {str(row["sample_id"]): row.to_dict() for _, row in self.index.iterrows()}
         for row in self._rows.values():
+            if str(row.get("status") or "") != "ok":
+                continue
             if row["sample_kind"] == "seismic_variant":
                 source = self._rows.get(str(row["source_sample_id"]))
                 if source is None or source["sample_kind"] != "base":
@@ -147,37 +134,26 @@ class DepthV2Benchmark:
                 raise ValueError("HDF5 root has the wrong sample domain or basis.")
             if h5.attrs.get("forward_model_inputs_sha256") != forward_hash:
                 raise ValueError("HDF5 forward hash differs from benchmark manifest.")
+            if bool(h5.attrs.get("qc_only", False)) != bool(
+                self.manifest.get("qc_only", False)
+            ):
+                raise ValueError("HDF5 qc_only does not match manifest.")
+            for key in ("suite", "global_seed", "impedance_calibration_sha256"):
+                if key in self.manifest and str(h5.attrs.get(key)) != str(
+                    self.manifest[key]
+                ):
+                    raise ValueError(f"HDF5 {key} does not match manifest.")
 
             def validate_dataset(name: str, value: h5py.Dataset | h5py.Group) -> None:
                 if not isinstance(value, h5py.Dataset):
                     return
-                required = {"unit", "sample_domain", "axis_path", "axis_order", "shape_json", "dtype", "sha256"}
-                missing = sorted(required - set(value.attrs))
-                if missing:
-                    raise ValueError(f"HDF5 dataset {name} lacks attributes: {missing}")
-                if value.attrs["sample_domain"] != "depth":
-                    raise ValueError(f"HDF5 dataset {name} has a wrong sample domain.")
-                if json.loads(str(value.attrs["shape_json"])) != list(value.shape):
-                    raise ValueError(f"HDF5 dataset {name} shape metadata is stale.")
-                if str(value.attrs["dtype"]) != str(value.dtype):
-                    raise ValueError(f"HDF5 dataset {name} dtype metadata is stale.")
-                if str(value.attrs["sha256"]) != array_sha256(value[()]):
-                    raise ValueError(f"HDF5 dataset {name} content SHA-256 mismatch.")
-                axis_path = str(value.attrs["axis_path"])
-                if axis_path not in h5 or not isinstance(h5[axis_path], h5py.Dataset):
-                    raise ValueError(f"HDF5 dataset {name} references a missing axis: {axis_path}")
-                axis_order = [item.strip() for item in str(value.attrs["axis_order"]).split(",")]
-                axis_name = Path(axis_path).name
-                if axis_name == "lateral_m":
-                    candidates = [index for index, label in enumerate(axis_order) if label == "lateral"]
-                else:
-                    candidates = [index for index, label in enumerate(axis_order) if label.startswith("tvdss") or label == "tvdss"]
-                if len(candidates) != 1 or value.shape[candidates[0]] != h5[axis_path].shape[0]:
-                    raise ValueError(f"HDF5 dataset {name} shape is inconsistent with axis {axis_path}.")
+                validate_dataset_metadata(value, sample_domain="depth")
 
             h5.visititems(validate_dataset)
             factor = None
             for row in self._rows.values():
+                if str(row.get("status") or "") != "ok":
+                    continue
                 base_path = f"/realizations/{row['parent_realization_id']}"
                 if base_path not in h5:
                     raise KeyError(f"Missing base realization group: {base_path}")

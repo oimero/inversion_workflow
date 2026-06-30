@@ -10,6 +10,7 @@ import numpy as np
 
 from cup.config.sources import resolve_source_run
 from cup.config.workflow import WorkflowConfig
+from cup.synthetic.core.config import parse_object_core_controls
 from cup.utils.io import load_yaml_config, resolve_relative_path, sha256_file
 
 
@@ -125,6 +126,11 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     horizons: list[dict[str, str]] = []
     for index, raw in enumerate(raw_horizons):
         item = _mapping(raw, path=f"target_interval.horizons[{index}]")
+        _reject_unknown(
+            item,
+            {"name", "well_top", "file"},
+            path=f"target_interval.horizons[{index}]",
+        )
         horizons.append({
             "name": _required_text(item, "name", path=f"target_interval.horizons[{index}]"),
             "well_top": _required_text(item, "well_top", path=f"target_interval.horizons[{index}]"),
@@ -191,19 +197,26 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("calibration.background_estimator must be per_well_zone_huber.")
 
     impedance = _mapping(root.get("impedance_attribute_generator"), path="synthoseis_lite.impedance_attribute_generator")
-    _reject_unknown(impedance, {"family", "state_threshold_sigma", "sensitivity_threshold_sigmas", "minimum_calibration_object_cells", "duration_modes"}, path="synthoseis_lite.impedance_attribute_generator")
+    _reject_unknown(
+        impedance,
+        {
+            "family",
+            "state_threshold_sigma",
+            "lateral",
+            "qc",
+            "robust_scale",
+            "duration_modes",
+        },
+        path="synthoseis_lite.impedance_attribute_generator",
+    )
     if impedance.get("family") != GENERATOR_FAMILY:
         raise ValueError(f"impedance_attribute_generator.family must be {GENERATOR_FAMILY}.")
-    sensitivity = [float(value) for value in impedance.get("sensitivity_threshold_sigmas", [])]
-    if sensitivity != [0.75, 1.25]:
-        raise ValueError("sensitivity_threshold_sigmas must be [0.75, 1.25] for v2.")
+    object_core_controls = parse_object_core_controls(impedance)
     duration_models = _mapping(impedance.get("duration_modes"), path="impedance_attribute_generator.duration_modes")
     if set(duration_models) != {"standard"}:
         raise ValueError("Depth v2 first release supports only the standard duration mode.")
     standard_mode = _mapping(duration_models["standard"], path="duration_modes.standard")
     _reject_unknown(standard_mode, {"minimum_highres_cells"}, path="duration_modes.standard")
-    if _positive_int(impedance.get("minimum_calibration_object_cells"), path="impedance.minimum_calibration_object_cells") != 2:
-        raise ValueError("Depth v2 minimum_calibration_object_cells is frozen at 2.")
 
     generation = _mapping(root.get("generation"), path="synthoseis_lite.generation")
     _reject_unknown(generation, {"attempts_per_scenario", "duration_modes", "geometry_families", "geometry_directions", "acceptance_qc"}, path="synthoseis_lite.generation")
@@ -365,6 +378,22 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if parsed_mismatch["depth_static"]["shift_m"] != [-2.5, 2.5]:
         raise ValueError("Depth v2 depth statics are frozen to [-2.5, 2.5] metres.")
 
+    figures = _mapping(root.get("figures"), path="synthoseis_lite.figures")
+    _reject_unknown(
+        figures,
+        {"enabled", "max_example_objects_per_zone_state", "report_examples"},
+        path="synthoseis_lite.figures",
+    )
+    if not isinstance(figures.get("enabled"), bool):
+        raise ValueError("figures.enabled must be boolean.")
+    max_examples = _positive_int(
+        figures.get("max_example_objects_per_zone_state"),
+        path="figures.max_example_objects_per_zone_state",
+    )
+    report_examples = _mapping(
+        figures.get("report_examples"), path="figures.report_examples"
+    )
+
     return {
         "schema": SCHEMA_VERSION,
         "sample_domain": "depth",
@@ -384,12 +413,31 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
         },
         "lateral_sample_interval_m": lateral_interval,
         "calibration": {"background_estimator": "per_well_zone_huber", "huber_delta_sigma": _positive_float(calibration.get("huber_delta_sigma"), path="calibration.huber_delta_sigma"), "minimum_valid_cells_per_well_zone": _positive_int(calibration.get("minimum_valid_cells_per_well_zone"), path="calibration.minimum_valid_cells_per_well_zone")},
-        "impedance": {"family": GENERATOR_FAMILY, "state_threshold_sigma": _positive_float(impedance.get("state_threshold_sigma"), path="impedance.state_threshold_sigma"), "sensitivity_threshold_sigmas": sensitivity, "minimum_calibration_object_cells": _positive_int(impedance.get("minimum_calibration_object_cells"), path="impedance.minimum_calibration_object_cells"), "minimum_highres_cells": _positive_int(standard_mode.get("minimum_highres_cells"), path="duration_modes.standard.minimum_highres_cells"), "correlation_length_section_fractions": [0.1, 0.3, 1.0], "coefficient_sigma_multipliers": [0.25, 0.50], "thickness_log_sigma_values": [0.10, 0.25], "max_global_reversal_fraction": 0.10, "max_object_reversal_fraction": 0.25, "max_global_clipping_fraction": 0.005, "max_object_clipping_fraction": 0.02},
+        "impedance": {
+            "family": GENERATOR_FAMILY,
+            "state_threshold_sigma": _positive_float(
+                impedance.get("state_threshold_sigma"),
+                path="impedance.state_threshold_sigma",
+            ),
+            "minimum_highres_cells": _positive_int(
+                standard_mode.get("minimum_highres_cells"),
+                path="duration_modes.standard.minimum_highres_cells",
+            ),
+            **object_core_controls,
+        },
         "generation": {"attempts_per_scenario": _positive_int(generation.get("attempts_per_scenario"), path="generation.attempts_per_scenario"), "duration_modes": ["standard"], "geometry_families": geometry_families, "geometry_directions": directions, "acceptance_qc": {"minimum_attempts_per_scenario": _positive_int(acceptance.get("minimum_attempts_per_scenario"), path="generation.acceptance_qc.minimum_attempts_per_scenario"), "warning_fraction": warning, "failure_fraction": failure, "enforcement": enforcement}},
         "splits": {"assignment_unit": "parent_realization", "held_out_geometry_family": held_out},
         "lfm": parsed_lfm,
         "seismic_mismatch": parsed_mismatch,
-        "figures": _mapping(root.get("figures") or {}, path="synthoseis_lite.figures"),
+        "figures": {
+            "enabled": bool(figures["enabled"]),
+            "max_example_objects_per_zone_state": max_examples,
+            "report_examples": {
+                key: str(value)
+                for key, value in report_examples.items()
+                if value is not None and str(value).strip()
+            },
+        },
     }
 
 

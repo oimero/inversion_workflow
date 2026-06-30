@@ -451,6 +451,15 @@ def run_depth_calibration(
         source_runs={key: repo_relative_path(path, root=repo_root) for key, path in sources.items()},
         source_hashes=source_hashes,
         state_threshold_sigma=float(script_cfg["impedance"]["state_threshold_sigma"]),
+        huber_delta_parent_sigma_floor=float(
+            script_cfg["impedance"]["huber_delta_parent_sigma_floor"]
+        ),
+        coefficient_sigma_parent_floor=float(
+            script_cfg["impedance"]["coefficient_sigma_parent_floor"]
+        ),
+        coefficient_sigma_parent_cap=float(
+            script_cfg["impedance"]["coefficient_sigma_parent_cap"]
+        ),
     )
     payload = depth_payload_from_object_core_calibration(legacy, extra={
         "background_estimator": "per_well_zone_huber",
@@ -501,6 +510,7 @@ def run_depth_calibration(
         "generator_family": GENERATOR_FAMILY,
         "forward_model_inputs_sha256": str(forward_inputs["_sha256"]),
         "source_runs": payload["source_runs"],
+        "config_provenance": dict(config_provenance),
         "n_well_zone_inputs": len(inputs),
         "n_objects": int(len(objects)),
         "outputs": {

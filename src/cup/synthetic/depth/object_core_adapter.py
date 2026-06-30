@@ -172,6 +172,9 @@ def calibrate_depth_object_core(
     source_runs: Mapping[str, str],
     source_hashes: Mapping[str, str],
     state_threshold_sigma: float,
+    huber_delta_parent_sigma_floor: float,
+    coefficient_sigma_parent_floor: float,
+    coefficient_sigma_parent_cap: float,
 ) -> tuple[ImpedanceCalibration, pd.DataFrame, dict[str, pd.DataFrame], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Run the current object-core calibration with depth-domain naming."""
     return calibrate_impedance(
@@ -181,6 +184,9 @@ def calibrate_depth_object_core(
         source_runs=dict(source_runs),
         source_hashes=dict(source_hashes),
         state_threshold_sigma=float(state_threshold_sigma),
+        huber_delta_parent_sigma_floor=float(huber_delta_parent_sigma_floor),
+        coefficient_sigma_parent_floor=float(coefficient_sigma_parent_floor),
+        coefficient_sigma_parent_cap=float(coefficient_sigma_parent_cap),
     )
 
 

@@ -3,7 +3,7 @@
 Synthoseis-lite 当前有两条受支持分支，均使用 `synthoseis_lite_v2` 产物 schema：
 
 - 时间域 `sample_domain: time`：保留 canonical、field-conditioned、Hz probe、seismic variant 和 evaluate。
-- 深度域 `synthoseis_lite_v2`：TVDSS 米制 field-conditioned 流程，详细契约见 [`depth-synthoseis-lite-v2.md`](../spec/depth-synthoseis-lite-v2.md)。
+- 深度域 `synthoseis_lite_v2`：TVDSS 米制 field-conditioned 流程，契约见本文“深度域 v2”。
 
 入口脚本保持单一：
 
@@ -171,6 +171,26 @@ generation:
     enforcement: warn  # warn | fail_fast
 ```
 
+时间域和深度域共享的 object-core 门控配置位于
+`synthoseis_lite.impedance_attribute_generator`，不是 `generation`：
+
+```yaml
+impedance_attribute_generator:
+  lateral:
+    correlation_length_section_fractions: [0.1, 0.3, 1.0]
+    coefficient_sigma_multipliers: [0.25, 0.50]
+    thickness_log_sigma_values: [0.10, 0.25]
+  qc:
+    max_global_reversal_fraction: 0.10
+    max_object_reversal_fraction: 0.25
+    max_global_clipping_fraction: 0.005
+    max_object_clipping_fraction: 0.02
+  robust_scale:
+    huber_delta_parent_sigma_floor: 0.05
+    coefficient_sigma_parent_floor: 0.05
+    coefficient_sigma_parent_cap: 3.0
+```
+
 - `warn` 是默认行为：接受率不足时保留全部成功样本，run/manifest 标记
   `completed_with_warnings`，终端明确告警，但脚本正常完成。
 - `fail_fast`：preflight 确认任一 scenario 无法通过正式门禁后，在创建昂贵 HDF5
@@ -181,14 +201,15 @@ preflight 固定输出 `preflight_attempts.csv`、`preflight_scenario_catalog.cs
 `preflight_summary.json`。最终 `scenario_catalog.csv` 的分母始终是原始
 `attempt_plan.csv`，不会因为第二阶段只处理成功 parent 而虚假变成 100%。
 
-深度 v2 的 `field_conditioned` 支持两个诊断型 CLI 开关：
+time/depth 的 `field_conditioned` 都支持三个诊断型 CLI 开关：
 
 - `--geometry-family <none|wedge|pinchout>`：临时过滤本次生成的几何家族，不改配置文件；
 - `--qc-only`：完整执行生成和接受率统计，但不持久化 realization HDF5 数组。
+- `--debug-attempt-limit <正整数>`：逐 section/scenario 限制开发运行的 attempt 数。
 
 `--qc-only` 产物会写 `sample_index.csv`、`generation_qc.csv`、`scenario_catalog.csv`、
 `benchmark_manifest.json` 等 QC 文件，并在 manifest 中标记 `qc_only=true` 与
-`training_consumable=false`。reader 和训练端必须拒绝把它当正式 benchmark 使用。
+`training_consumable=false`。两个 domain reader 和训练端都拒绝把它当正式 benchmark 使用。
 
 深度 v2 的 generator 只冻结父样本身份和评估角色：
 

@@ -32,7 +32,9 @@ from cup.synthetic.core import (
     build_attempt_plan,
     file_chain_sha256,
     geometry_feasibility_rows,
+    limit_attempt_plan,
     rejection_reason_summary,
+    validate_debug_attempt_limit,
 )
 from cup.synthetic.core.progress import (
     AttemptProgressLog,
@@ -479,6 +481,7 @@ def _run_canonical_generation(
     *,
     script_cfg: Mapping[str, Any],
     sources: Mapping[str, Path],
+    config_provenance: Mapping[str, str],
     calibration: ImpedanceCalibration,
     calibration_path: Path,
     repo_root: Path,
@@ -519,6 +522,7 @@ def _run_canonical_generation(
         h5.attrs["generator_family"] = calibration.generator_family
         h5.attrs["implementation_scope"] = IMPLEMENTATION_SCOPE
         h5.attrs["suite"] = "canonical"
+        h5.attrs["global_seed"] = int(script_cfg["global_seed"])
         h5.attrs["forward_model_inputs_sha256"] = forward_model_inputs_sha256
         h5.attrs["impedance_calibration_sha256"] = sha256_file(calibration_path)
         h5.attrs["qc_only"] = bool(qc_only)
@@ -747,16 +751,19 @@ def _run_canonical_generation(
     manifest = {
         "schema": DATA_SCHEMA,
         "schema_version": DATA_SCHEMA,
+        "status": "success",
         "sample_domain": "time",
         "generator_family": calibration.generator_family,
         "implementation_scope": IMPLEMENTATION_SCOPE,
         "suite": "canonical",
         "development_limited": False,
         "qc_only": bool(qc_only),
+        "training_consumable": not bool(qc_only),
         "source_runs": {
             key: repo_relative_path(path, root=repo_root)
             for key, path in sources.items()
         },
+        "config_provenance": dict(config_provenance),
         "forward_model_inputs_sha256": forward_model_inputs_sha256,
         "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
         "impedance_calibration_sha256": sha256_file(calibration_path),
@@ -766,6 +773,8 @@ def _run_canonical_generation(
         "n_sections": 1,
         "n_scenarios": len(scenarios),
         "attempts_per_scenario": 1,
+        "accepted_parent_realizations": len(scenarios),
+        "rejected_parent_realizations": 0,
         "canonical_families": list(CANONICAL_FAMILIES),
         "canonical_config": dict(config),
         "canonical_reference_impedance": reference,
@@ -856,7 +865,7 @@ def _run_canonical_generation(
     write_json(output_dir / "benchmark_manifest.json", manifest)
     summary = {
         **manifest,
-        "status": "ok",
+        "status": "success",
         "accepted_realizations": len(scenarios),
         "rejected_realizations": 0,
         "failed_scenario_count": 0,
@@ -872,6 +881,7 @@ def run_generation(
     workflow: WorkflowConfig,
     script_cfg: Mapping[str, Any],
     sources: Mapping[str, Path],
+    config_provenance: Mapping[str, str],
     calibration_path: Path,
     repo_root: Path,
     output_dir: Path,
@@ -880,6 +890,7 @@ def run_generation(
     qc_only: bool = False,
     suite: str = "field_conditioned",
 ) -> dict[str, Any]:
+    debug_attempt_limit = validate_debug_attempt_limit(debug_attempt_limit)
     calibration = load_calibration(calibration_path)
     _validate_calibration_horizon_contract(calibration, script_cfg)
     for key, recorded in calibration.source_runs.items():
@@ -923,6 +934,7 @@ def run_generation(
         return _run_canonical_generation(
             script_cfg=script_cfg,
             sources=sources,
+            config_provenance=config_provenance,
             calibration=calibration,
             calibration_path=calibration_path,
             repo_root=repo_root,
@@ -955,17 +967,17 @@ def run_generation(
         ]
         if not scenarios:
             raise ValueError("No generation scenarios remain after geometry filtering.")
-    attempts = int(script_cfg["generation"]["attempts_per_scenario"])
     development_limited = debug_attempt_limit is not None
-    if debug_attempt_limit is not None:
-        attempts = min(attempts, int(debug_attempt_limit))
+    configured_attempts = int(script_cfg["generation"]["attempts_per_scenario"])
     held_out_geometry_family = str(script_cfg["splits"]["held_out_geometry_family"])
     attempt_plan = build_attempt_plan(
         section_ids=[str(section.section_id) for section in sections],
         scenarios=scenarios,
-        attempts_per_scenario=attempts,
+        attempts_per_scenario=configured_attempts,
         held_out_geometry_family=held_out_geometry_family,
     )
+    attempt_plan = limit_attempt_plan(attempt_plan, debug_attempt_limit)
+    attempts = min(configured_attempts, int(debug_attempt_limit or configured_attempts))
     attempt_plan.to_csv(output_dir / "attempt_plan.csv", index=False)
     sections_by_id = {str(section.section_id): section for section in sections}
     scenarios_by_id = {str(scenario.scenario_id): scenario for scenario in scenarios}
@@ -1090,6 +1102,7 @@ def run_generation(
         h5.attrs["generator_family"] = calibration.generator_family
         h5.attrs["implementation_scope"] = IMPLEMENTATION_SCOPE
         h5.attrs["suite"] = "field_conditioned"
+        h5.attrs["global_seed"] = int(script_cfg["global_seed"])
         h5.attrs["forward_model_inputs_sha256"] = forward_model_inputs_sha256
         h5.attrs["impedance_calibration_sha256"] = sha256_file(calibration_path)
         h5.attrs["qc_only"] = bool(qc_only)
@@ -1279,7 +1292,7 @@ def run_generation(
                     }
                     for detail in exc.details
                 )
-            except Exception as exc:
+            except (ValueError, FloatingPointError) as exc:
                 if str(exc).startswith(
                     (
                         "highres_forward_qc_failed",
@@ -1480,17 +1493,19 @@ def run_generation(
         "status": (
             "development_limited"
             if development_limited
-            else ("completed_with_warnings" if completed_with_warnings else "ok")
+            else ("completed_with_warnings" if completed_with_warnings else "success")
         ),
         "generator_family": calibration.generator_family,
         "implementation_scope": IMPLEMENTATION_SCOPE,
         "development_limited": development_limited,
         "qc_only": bool(qc_only),
+        "training_consumable": not bool(qc_only),
         "suite": "field_conditioned",
         "source_runs": {
             key: repo_relative_path(path, root=repo_root)
             for key, path in sources.items()
         },
+        "config_provenance": dict(config_provenance),
         "sample_domain": "time",
         "forward_model_inputs_sha256": forward_model_inputs_sha256,
         "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
@@ -1501,6 +1516,10 @@ def run_generation(
         "n_sections": len(sections),
         "n_scenarios": len(scenarios),
         "attempts_per_scenario": attempts,
+        "accepted_parent_realizations": int(len(successful_parent_ids)),
+        "rejected_parent_realizations": int(
+            len(attempt_plan) - len(successful_parent_ids)
+        ),
         "acceptance_qc": acceptance_qc,
         "preflight": preflight_summary,
         "geometry_filters": sorted(
@@ -1648,7 +1667,7 @@ def run_generation(
         "status": (
             "development_limited"
             if development_limited
-            else ("completed_with_warnings" if completed_with_warnings else "ok")
+            else ("completed_with_warnings" if completed_with_warnings else "success")
         ),
         "accepted_realizations": int(
             (index["sample_kind"].eq("base") & index["status"].eq("ok")).sum()

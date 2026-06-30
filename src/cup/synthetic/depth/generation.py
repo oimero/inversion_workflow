@@ -1022,7 +1022,7 @@ def run_depth_generation(
             "wavelet_sha256": forward_inputs["wavelet"]["sha256"],
             "ai_velocity_relation_sha256": forward_inputs["ai_velocity_relation"]["sha256"],
             "well_input_inventory_sha256": forward_inputs["well_input_inventory_sha256"],
-            "source_preprocessed_las": list(forward_inputs["source_preprocessed_las"]),
+            "shifted_las_sources": list(calibration_payload.get("shifted_las_sources") or []),
         },
         "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
         "impedance_calibration_sha256": sha256_file(calibration_path),

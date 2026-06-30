@@ -37,6 +37,57 @@ def _verify_file(path_value: Any, digest: Any, *, repo_root: Path, label: str) -
     return path
 
 
+def _required_file(path_value: Any, *, repo_root: Path, label: str) -> Path:
+    path = resolve_relative_path(str(path_value), root=repo_root)
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} does not exist: {path}")
+    return path
+
+
+def _load_step5_shifted_las_sources(
+    metrics_path: Path,
+    *,
+    repo_root: Path,
+) -> list[dict[str, Any]]:
+    metrics = pd.read_csv(metrics_path)
+    required = {
+        "well_name",
+        "status",
+        "shifted_preprocessed_las_path",
+        "shifted_filtered_las_path",
+    }
+    missing = sorted(required - set(metrics.columns))
+    if missing:
+        raise ValueError(f"Step 5 wavelet_batch_metrics.csv lacks columns: {missing}")
+    rows: list[dict[str, Any]] = []
+    for row in metrics.to_dict(orient="records"):
+        if str(row.get("status", "")).casefold() != "ok":
+            continue
+        well_name = str(row["well_name"])
+        full_path = _required_file(
+            row["shifted_preprocessed_las_path"],
+            repo_root=repo_root,
+            label=f"{well_name} shifted_preprocessed_las",
+        )
+        filtered_path = _required_file(
+            row["shifted_filtered_las_path"],
+            repo_root=repo_root,
+            label=f"{well_name} shifted_filtered_las",
+        )
+        rows.append(
+            {
+                "well_id": well_name,
+                "full_las_path": repo_relative_path(full_path, root=repo_root),
+                "full_las_sha256": sha256_file(full_path),
+                "filtered_las_path": repo_relative_path(filtered_path, root=repo_root),
+                "filtered_las_sha256": sha256_file(filtered_path),
+            }
+        )
+    if not rows:
+        raise ValueError("Step 5 wavelet_batch_metrics.csv has no successful shifted LAS wells.")
+    return rows
+
+
 def _continuous_cell_average(
     axis_m: np.ndarray,
     values: np.ndarray,
@@ -193,6 +244,8 @@ def run_depth_calibration(
     input_inventory_path = sources["rock_physics_analysis_dir"] / "well_input_inventory.csv"
     if sha256_file(input_inventory_path) != str(forward_inputs["well_input_inventory_sha256"]):
         raise ValueError("Step 6 well_input_inventory SHA-256 mismatch.")
+    step5_metrics_path = sources["wavelet_batch_synthetic_depth_dir"] / "wavelet_batch_metrics.csv"
+    shifted_las_sources = _load_step5_shifted_las_sources(step5_metrics_path, repo_root=repo_root)
 
     survey, target_zone, horizon_paths = _survey_and_target_zone(
         workflow=workflow, script_cfg=script_cfg, repo_root=repo_root
@@ -211,10 +264,10 @@ def run_depth_calibration(
     )
     well_tops = import_well_tops_petrel(well_tops_path)
     clusters_source = []
-    for item in forward_inputs["source_preprocessed_las"]:
+    for item in shifted_las_sources:
         key = normalize_well_name(str(item["well_id"]))
         if key not in inventory.index:
-            raise ValueError(f"Step 3 passed well is absent from Step 1 inventory: {item['well_id']}")
+            raise ValueError(f"Step 5 successful well is absent from Step 1 inventory: {item['well_id']}")
         row = inventory.loc[key]
         x, y = float(row["surface_x"]), float(row["surface_y"])
         if not np.isfinite(x) or not np.isfinite(y):
@@ -232,11 +285,22 @@ def run_depth_calibration(
     horizon_audit: list[dict[str, Any]] = []
     background_qc: list[dict[str, Any]] = []
     background_samples: list[dict[str, Any]] = []
-    for source in forward_inputs["source_preprocessed_las"]:
+    for source in shifted_las_sources:
         well_name = str(source["well_id"])
         key = normalize_well_name(well_name)
         row = inventory.loc[key]
-        las_path = _verify_file(source["path"], source["sha256"], repo_root=repo_root, label=f"{well_name} LAS")
+        full_las_path = _verify_file(
+            source["full_las_path"],
+            source["full_las_sha256"],
+            repo_root=repo_root,
+            label=f"{well_name} shifted_preprocessed_las",
+        )
+        filtered_las_path = _verify_file(
+            source["filtered_las_path"],
+            source["filtered_las_sha256"],
+            repo_root=repo_root,
+            label=f"{well_name} shifted_filtered_las",
+        )
         kb_m = float(row["kb_m"])
         il = float(row["inline_float"])
         xl = float(row["xline_float"])
@@ -248,14 +312,22 @@ def run_depth_calibration(
         nearest_j = int(np.clip(round(xl_index), 0, target_zone.no_support_mask.shape[1] - 1))
         if bool(target_zone.no_support_mask[nearest_i, nearest_j]):
             raise ValueError(f"no_interpretation_support_at_well:{well_name}")
-        ai = read_las_curve(las_path, "AI", match_policy="exact", allow_all_nan=True)
-        if str(getattr(ai, "unit", "")) != "m/s*g/cm3":
+        full_ai = read_las_curve(full_las_path, "AI", match_policy="exact", allow_all_nan=True)
+        filtered_ai = read_las_curve(filtered_las_path, "AI", match_policy="exact", allow_all_nan=True)
+        if str(getattr(full_ai, "unit", "")) != "m/s*g/cm3":
             raise ValueError(
-                f"AI unit mismatch for {well_name}: expected 'm/s*g/cm3', got {getattr(ai, 'unit', None)!r}"
+                f"Full AI unit mismatch for {well_name}: expected 'm/s*g/cm3', got {getattr(full_ai, 'unit', None)!r}"
             )
-        md = np.asarray(ai.basis, dtype=np.float64)
-        tvdss = md - kb_m
-        values = np.asarray(ai.values, dtype=np.float64)
+        if str(getattr(filtered_ai, "unit", "")) != "m/s*g/cm3":
+            raise ValueError(
+                f"Filtered AI unit mismatch for {well_name}: expected 'm/s*g/cm3', got {getattr(filtered_ai, 'unit', None)!r}"
+            )
+        full_md = np.asarray(full_ai.basis, dtype=np.float64)
+        filtered_md = np.asarray(filtered_ai.basis, dtype=np.float64)
+        full_tvdss = full_md - kb_m
+        filtered_tvdss = filtered_md - kb_m
+        full_values = np.asarray(full_ai.values, dtype=np.float64)
+        filtered_values = np.asarray(filtered_ai.values, dtype=np.float64)
         tops: dict[str, tuple[float, float]] = {}
         for horizon in script_cfg["horizons"]:
             name = str(horizon["name"])
@@ -304,18 +376,25 @@ def run_depth_calibration(
             last_edge_index = int(np.floor((bottom - origin) / truth_dz + 1e-12))
             edges = origin + np.arange(first_edge_index, last_edge_index + 1) * truth_dz
             centers = 0.5 * (edges[:-1] + edges[1:])
-            log_ai = _continuous_cell_average(tvdss, values, centers_m=centers, cell_size_m=truth_dz)
-            valid = np.isfinite(log_ai)
+            full_log_ai = _continuous_cell_average(full_tvdss, full_values, centers_m=centers, cell_size_m=truth_dz)
+            filtered_log_ai = _continuous_cell_average(
+                filtered_tvdss,
+                filtered_values,
+                centers_m=centers,
+                cell_size_m=truth_dz,
+            )
+            valid = np.isfinite(full_log_ai) & np.isfinite(filtered_log_ai)
             n_valid = int(np.count_nonzero(valid))
             minimum = int(script_cfg["calibration"]["minimum_valid_cells_per_well_zone"])
             if n_valid < minimum:
                 zone_status.append({"well_name": well_name, "zone_id": zone_id, "status": "rejected", "n_valid_cells": n_valid, "reason": "insufficient_valid_cells"})
                 continue
             zone_centers = centers[valid]
-            observed = log_ai[valid]
+            full_observed = full_log_ai[valid]
+            filtered_observed = filtered_log_ai[valid]
             zeta = (zone_centers - top) / (bottom - top)
             fitted, weights, metrics = _huber_background(
-                zeta, observed, delta_sigma=float(script_cfg["calibration"]["huber_delta_sigma"])
+                zeta, filtered_observed, delta_sigma=float(script_cfg["calibration"]["huber_delta_sigma"])
             )
             inputs.append(depth_well_zone_curves_for_object_core(
                 well_name=well_name,
@@ -324,16 +403,27 @@ def run_depth_calibration(
                 top_horizon=top_name,
                 bottom_horizon=bottom_name,
                 tvdss_m=zone_centers,
-                fitted_log_ai=fitted,
-                observed_log_ai=observed,
+                filtered_log_ai=filtered_observed,
+                observed_log_ai=full_observed,
                 zone_top_tvdss_m=top,
                 zone_bottom_tvdss_m=bottom,
             ))
             accepted_zones += 1
             zone_status.append({"well_name": well_name, "zone_id": zone_id, "status": "ok", "n_valid_cells": n_valid, "reason": ""})
             background_qc.append({"well_name": well_name, "zone_id": zone_id, "zone_thickness_m": bottom - top, "n_valid_cells": n_valid, **metrics})
-            for depth, coordinate, value, background, weight in zip(zone_centers, zeta, observed, fitted, weights):
-                background_samples.append({"well_name": well_name, "zone_id": zone_id, "tvdss_m": depth, "zeta": coordinate, "observed_log_ai": value, "background_log_ai": background, "residual": value - background, "irls_weight": weight})
+            for depth, coordinate, filtered_value, full_value, background, weight in zip(zone_centers, zeta, filtered_observed, full_observed, fitted, weights):
+                background_samples.append({
+                    "well_name": well_name,
+                    "zone_id": zone_id,
+                    "tvdss_m": depth,
+                    "zeta": coordinate,
+                    "filtered_log_ai": filtered_value,
+                    "full_log_ai": full_value,
+                    "background_log_ai": background,
+                    "filtered_residual": filtered_value - background,
+                    "full_residual": full_value - background,
+                    "irls_weight": weight,
+                })
         well_status.append({"well_name": well_name, "status": "ok" if accepted_zones else "rejected", "n_contributed_zones": accepted_zones, "reason": "" if accepted_zones else "no_complete_valid_zone"})
 
     if not inputs:
@@ -347,8 +437,10 @@ def run_depth_calibration(
         "ai_velocity_relation": str(forward_inputs["ai_velocity_relation"]["sha256"]),
         "workflow_config": str(config_provenance["workflow_config_sha256"]),
         "experiment_config": str(config_provenance["experiment_sha256"]),
+        "wavelet_batch_metrics.csv": sha256_file(step5_metrics_path),
         **{f"horizon:{name}": sha256_file(path) for name, path in horizon_paths.items()},
-        **{f"las:{item['well_id']}": str(item["sha256"]) for item in forward_inputs["source_preprocessed_las"]},
+        **{f"full_las:{item['well_id']}": str(item["full_las_sha256"]) for item in shifted_las_sources},
+        **{f"filtered_las:{item['well_id']}": str(item["filtered_las_sha256"]) for item in shifted_las_sources},
     }
     legacy, objects, qc, samples, backgrounds, profile_samples = calibrate_depth_object_core(
         inputs,
@@ -366,6 +458,12 @@ def run_depth_calibration(
         "config_provenance": dict(config_provenance),
         "forward_model_inputs_sha256": str(forward_inputs["_sha256"]),
         "locked_step3_run": str(dict(forward_inputs.get("source_runs") or {}).get("well_preprocess_dir") or ""),
+        "locked_step5_run": repo_relative_path(sources["wavelet_batch_synthetic_depth_dir"], root=repo_root),
+        "well_curve_source_contract": {
+            "full_log_ai": "Step 5 shifted_preprocessed_las/AI",
+            "filtered_log_ai": "Step 5 shifted_filtered_las/AI, used for background fitting",
+        },
+        "shifted_las_sources": shifted_las_sources,
     })
     relation = forward_inputs["ai_velocity_relation"]
     maximum_ai = float(np.exp(payload["generation_log_ai_bounds"]["global"]["maximum"]))

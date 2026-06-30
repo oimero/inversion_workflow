@@ -115,6 +115,22 @@ synthoseis_lite:
 - 显式 inline/xline 折线路径；
 - `field_conditioned` 套件，canonical 和 probe 均关闭。
 
+深度 v2 校准依赖最新合格 Step 1、Step 5 和 Step 6；复现实验时可显式固定：
+
+```yaml
+synthoseis_lite:
+  source_runs:
+    well_inventory_dir:
+    rock_physics_analysis_dir:
+    wavelet_batch_synthetic_depth_dir:
+```
+
+其中 Step 6 继续提供 `forward_model_inputs.json`、子波和 AI–Vp 关系；井曲线来源改为
+Step 5 的两套深度平移 LAS：
+
+- `shifted_filtered_las/AI` 只用于 background fit，避免背景图件和趋势被尖刺支配；
+- `shifted_preprocessed_las/AI` 用于 full logAI、对象残差和后续 truth 统计。
+
 运行顺序：
 
 ```powershell

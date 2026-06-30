@@ -167,16 +167,15 @@ def least_squares_scale(seismic_norm: np.ndarray, synthetic_raw: np.ndarray, mas
 def metrics_for_synthetic(
     seismic_norm: np.ndarray,
     synthetic_raw: np.ndarray,
-    eval_mask: np.ndarray,
 ) -> dict[str, Any]:
-    mask = eval_mask & np.isfinite(seismic_norm) & np.isfinite(synthetic_raw)
+    mask = np.isfinite(seismic_norm) & np.isfinite(synthetic_raw)
     if int(mask.sum()) < 5:
         return {
             "scale": np.nan,
             "signed_ls_scale": np.nan,
             "corr": np.nan,
             "nmae": np.nan,
-            "n_eval_samples": int(mask.sum()),
+            "n_score_samples": int(mask.sum()),
         }
     if np.std(synthetic_raw[mask]) <= 0:
         corr = np.nan
@@ -189,7 +188,7 @@ def metrics_for_synthetic(
             "signed_ls_scale": np.nan,
             "corr": corr,
             "nmae": np.nan,
-            "n_eval_samples": int(mask.sum()),
+            "n_score_samples": int(mask.sum()),
         }
     scale = abs(float(signed_scale))
     synthetic_scaled = scale * synthetic_raw
@@ -199,17 +198,8 @@ def metrics_for_synthetic(
         "signed_ls_scale": float(signed_scale),
         "corr": corr,
         "nmae": nmae,
-        "n_eval_samples": int(mask.sum()),
+        "n_score_samples": int(mask.sum()),
     }
-
-
-def make_eval_mask(twt_s: np.ndarray, boundary_half_support_s: float) -> np.ndarray:
-    if twt_s.size < 10:
-        return np.ones_like(twt_s, dtype=bool)
-    edge_mask = (twt_s >= twt_s[0] + boundary_half_support_s) & (twt_s <= twt_s[-1] - boundary_half_support_s)
-    if int(edge_mask.sum()) >= max(10, int(0.2 * twt_s.size)):
-        return edge_mask
-    return np.ones_like(twt_s, dtype=bool)
 
 
 def evaluate_shift(
@@ -221,20 +211,16 @@ def evaluate_shift(
     wavelet_amp: np.ndarray,
     shift_s: float,
     modeler: Any,
-    eval_mask_base: np.ndarray,
 ) -> dict[str, Any]:
     shifted_time = twt_s - shift_s
     shifted_ref = np.interp(shifted_time, ref_twt_s, ref_values, left=0.0, right=0.0)
     synthetic_raw = modeler(wavelet_amp, shifted_ref)
-    valid_shift = (shifted_time >= ref_twt_s[0]) & (shifted_time <= ref_twt_s[-1])
-    eval_mask = eval_mask_base & valid_shift
-    metric = metrics_for_synthetic(seismic_norm, synthetic_raw, eval_mask)
+    metric = metrics_for_synthetic(seismic_norm, synthetic_raw)
     metric.update({"shift_s": float(shift_s)})
     return {
         "metrics": metric,
         "reflectivity_shifted": shifted_ref,
         "synthetic_raw": synthetic_raw,
-        "eval_mask": eval_mask,
     }
 
 
@@ -610,7 +596,6 @@ def save_r1_style_synthetic_qc(
     reflectivity_shifted: np.ndarray,
     seismic_norm: np.ndarray,
     synthetic_scaled: np.ndarray,
-    eval_mask: np.ndarray,
     best_shift_s: float,
 ) -> Path:
     from cup.seismic.viz import plot_well_waveform_qc
@@ -626,9 +611,7 @@ def save_r1_style_synthetic_qc(
     filtered_ai_on_twt = np.interp(twt_s, filtered_ai_basis, filtered_ai, left=np.nan, right=np.nan)
 
     valid = (
-        np.asarray(eval_mask, dtype=bool)
-        & np.isfinite(twt_s)
-        & np.isfinite(filtered_ai_on_twt)
+        np.isfinite(twt_s)
         & np.isfinite(reflectivity_shifted)
         & np.isfinite(seismic_norm)
         & np.isfinite(synthetic_scaled)
@@ -710,7 +693,6 @@ def process_well(
     well_heads_df: pd.DataFrame,
     wavelet_amp: np.ndarray,
     wavelet_dt_s: float,
-    wavelet_active_half_support_s: float,
     shift_values_s: np.ndarray,
     auto_tie_log_filter_params: dict[str, Any],
     modeler: Any,
@@ -779,7 +761,6 @@ def process_well(
 
     seismic_raw = np.interp(twt_s, twt_seis, seis_twt)
     seismic_norm = zscore_trace(seismic_raw)
-    eval_mask_base = make_eval_mask(twt_s, wavelet_active_half_support_s)
 
     scan_rows = []
     best = None
@@ -792,7 +773,6 @@ def process_well(
             wavelet_amp=wavelet_amp,
             shift_s=float(shift_s),
             modeler=modeler,
-            eval_mask_base=eval_mask_base,
         )
         metric = result["metrics"]
         scan_rows.append(
@@ -804,7 +784,7 @@ def process_well(
                 "nmae": metric["nmae"],
                 "scale": metric["scale"],
                 "signed_ls_scale": metric["signed_ls_scale"],
-                "n_eval_samples": metric["n_eval_samples"],
+                "n_score_samples": metric["n_score_samples"],
             }
         )
         if np.isfinite(metric["corr"]):
@@ -828,7 +808,6 @@ def process_well(
             "reflectivity_shifted": best["reflectivity_shifted"],
             "synthetic_scaled": best_synthetic_scaled,
             "residual": seismic_norm - best_synthetic_scaled,
-            "eval_mask": best["eval_mask"],
         }
     )
 
@@ -868,7 +847,6 @@ def process_well(
         reflectivity_shifted=best["reflectivity_shifted"],
         seismic_norm=seismic_norm,
         synthetic_scaled=best_synthetic_scaled,
-        eval_mask=best["eval_mask"],
         best_shift_s=best_shift_s,
     )
 
@@ -918,7 +896,7 @@ def process_well(
             "nmae": float(best_metrics["nmae"]),
             "scale": float(best_metrics["scale"]),
             "signed_ls_scale": float(best_metrics["signed_ls_scale"]),
-            "n_eval_samples": int(best_metrics["n_eval_samples"]),
+            "n_score_samples": int(best_metrics["n_score_samples"]),
             "median_vp_mps": median_vp_mps,
             "median_depth_shift_m": median_depth_shift,
             "mean_depth_shift_m": mean_depth_shift,
@@ -1036,7 +1014,6 @@ def main() -> None:
     # ── Load wavelet ──
 
     from cup.seismic.wavelet import (
-        compute_wavelet_active_half_support_s,
         infer_wavelet_dt,
         load_wavelet_csv,
     )
@@ -1048,11 +1025,6 @@ def main() -> None:
         raise ValueError("Expected an odd-sample centered wavelet.")
     wavelet_dt_s = infer_wavelet_dt(wavelet_time_s)
     wavelet_full_half_s = max(abs(float(wavelet_time_s[0])), abs(float(wavelet_time_s[-1])))
-    # Uses cup.well.wavelet.DEFAULT_ACTIVE_SUPPORT_THRESHOLD (=0.05).
-    wavelet_active_half_support_s = compute_wavelet_active_half_support_s(
-        wavelet_time_s,
-        wavelet_amp,
-    )
     shift_min_ms = float(script_cfg["shift_min_ms"])
     shift_max_ms = float(script_cfg["shift_max_ms"])
     shift_values_s = np.arange(shift_min_ms / 1000.0, shift_max_ms / 1000.0 + 0.5 * wavelet_dt_s, wavelet_dt_s)
@@ -1076,10 +1048,7 @@ def main() -> None:
         }
 
     print(f"Wavelet samples={wavelet_amp.size}, dt={wavelet_dt_s * 1000:.3f} ms")
-    print(
-        f"Eval boundary half-support={wavelet_active_half_support_s * 1000:.1f} ms "
-        f"(full half={wavelet_full_half_s * 1000:.1f} ms)"
-    )
+    print(f"Wavelet full half-support={wavelet_full_half_s * 1000:.1f} ms")
     print(f"Shift scan: {shift_values_s[0] * 1000:.1f} to {shift_values_s[-1] * 1000:.1f} ms, n={shift_values_s.size}")
     if np.isfinite(source_expected_shift_s):
         print(f"Source auto-tie table_t_shift: {source_expected_shift_s * 1000:.3f} ms")
@@ -1146,7 +1115,6 @@ def main() -> None:
                     well_heads_df=well_heads_df,
                     wavelet_amp=wavelet_amp,
                     wavelet_dt_s=wavelet_dt_s,
-                    wavelet_active_half_support_s=wavelet_active_half_support_s,
                     shift_values_s=shift_values_s,
                     auto_tie_log_filter_params=auto_tie_log_filter_params,
                     modeler=modeler,

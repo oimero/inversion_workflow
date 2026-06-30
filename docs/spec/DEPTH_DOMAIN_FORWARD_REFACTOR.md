@@ -20,7 +20,7 @@
 - 新实现不修改、不依赖 `src/ginn/`、`src/ginn_depth/` 中的遗留实现。
 - 仓内调用迁移完成后删除重复正演函数，不保留静默兼容包装。
 
-Steps 1–6 已落地：Step 1–3 负责数据盘点与测井预处理；Step 4 从 NW11 提取固定时间子波；Step 5 完成七井批量合成与 shifted LAS；Step 6 通过可开关模块拟合全工区 AI–Vp 关系并生成 `forward_model_inputs.json`。Step 4/5 保留在 `scripts/` 不迁入公共 API；Step 6 独立消费 Step 3 预处理 LAS，不依赖井分层或井震标定结果。
+Steps 1–6 已落地：Step 1–3 负责数据盘点与测井预处理；Step 4 从 NW11 提取固定时间子波；Step 5 完成七井批量合成与深度平移后的 full/filtered LAS；Step 6 通过可开关模块拟合全工区 AI–Vp 关系并生成 `forward_model_inputs.json`。Step 4/5 保留在 `scripts/` 不迁入公共 API；Step 6 独立消费 Step 3 预处理 LAS，不依赖井分层或井震标定结果。Synthoseis-lite v2 的井曲线校准另行消费 Step 5：background fit 使用 `shifted_filtered_las/AI`，对象残差与 full truth 统计使用 `shifted_preprocessed_las/AI`。
 
 ## 2. 非目标
 
@@ -53,7 +53,7 @@ Steps 1–6 已落地：Step 1–3 负责数据盘点与测井预处理；Step 4
 
 ### 3.2 工作流中的时间域假设
 
-- Steps 4–6 已落地：NW11 子波、七井 shifted LAS 和全工区 AI–Vp 关系均为正式工区产物。
+- Steps 4–6 已落地：NW11 子波、七井深度平移 full/filtered LAS 和全工区 AI–Vp 关系均为正式工区产物。
 - 正演可观测性（原曾编号 Step 6）把正演视作平稳卷积，用 FFT 分析传递特性，并曾被设计为 Synthoseis 的强制门禁；现已降为非阻塞旁路。
 - Synthoseis-lite 当前契约和命名大量绑定 `twt_*`、`dt_s`。
 - GINN v2 的 physics loss 只实现时间域平稳卷积。

@@ -134,7 +134,11 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("target_interval horizon names must be unique.")
 
     sources = _mapping(root.get("source_runs") or {}, path="synthoseis_lite.source_runs")
-    _reject_unknown(sources, {"well_inventory_dir", "rock_physics_analysis_dir"}, path="synthoseis_lite.source_runs")
+    _reject_unknown(
+        sources,
+        {"well_inventory_dir", "rock_physics_analysis_dir", "wavelet_batch_synthetic_depth_dir"},
+        path="synthoseis_lite.source_runs",
+    )
 
     sampling = _mapping(root.get("sampling"), path="synthoseis_lite.sampling")
     _reject_unknown(sampling, {"expected_model_dz_m", "vertical_oversampling_factor", "antialias"}, path="synthoseis_lite.sampling")
@@ -366,6 +370,7 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "source_runs": {
             "well_inventory_dir": str(sources.get("well_inventory_dir") or "").strip(),
             "rock_physics_analysis_dir": str(sources.get("rock_physics_analysis_dir") or "").strip(),
+            "wavelet_batch_synthetic_depth_dir": str(sources.get("wavelet_batch_synthetic_depth_dir") or "").strip(),
         },
         "horizons": horizons,
         "sections": sections,
@@ -405,6 +410,7 @@ def resolve_depth_v2_sources(
     definitions = {
         "well_inventory_dir": ("well_inventory", ["well_inventory.csv", "run_summary.json"]),
         "rock_physics_analysis_dir": ("rock_physics_analysis", ["forward_model_inputs.json", "run_summary.json", "well_input_inventory.csv"]),
+        "wavelet_batch_synthetic_depth_dir": ("wavelet_batch_synthetic_depth", ["run_summary.json", "wavelet_batch_metrics.csv"]),
     }
     for key, (prefix, files) in definitions.items():
         explicit = str(script_cfg["source_runs"].get(key) or "").strip()
@@ -427,6 +433,9 @@ def resolve_depth_v2_sources(
     rock_summary = _load_json(resolved["rock_physics_analysis_dir"] / "run_summary.json")
     if rock_summary.get("schema") != "rock_physics_analysis_v1" or rock_summary.get("status") != "success":
         raise ValueError("rock_physics_analysis run is not a successful v1 run.")
+    wavelet_batch_summary = _load_json(resolved["wavelet_batch_synthetic_depth_dir"] / "run_summary.json")
+    if wavelet_batch_summary.get("status") != "success":
+        raise ValueError("wavelet_batch_synthetic_depth run is not successful.")
     forward_path = resolved["rock_physics_analysis_dir"] / "forward_model_inputs.json"
     forward = _load_json(forward_path)
     if forward.get("schema") != "forward_model_inputs_v1":

@@ -152,7 +152,6 @@ def _plot_background_and_residual(
     residual = subset["residual"].to_numpy(dtype=np.float64)
     fig, ax = plt.subplots(figsize=(6.0, 4.0))
     bins = min(40, max(12, int(np.sqrt(residual.size))))
-    ax.hist(residual, bins=bins, color="#a0aec0", edgecolor="white")
     for left, right, color, label in [
         (-np.inf, center - sigma, STATE_COLORS["low_impedance"], "low"),
         (center - sigma, center + sigma, STATE_COLORS["background"], "background"),

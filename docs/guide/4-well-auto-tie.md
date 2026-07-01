@@ -1,9 +1,5 @@
 # 04 井震自动标定
 
-深度域工区使用独立脚本 `vertical_well_auto_tie_depth.py` 和 `wavelet_batch_synthetic_depth.py`，详见 [深度域工作流](depth-domain-workflow.md)。
-
-以下内容仅适用于时间域标准工作流。
-
 `well_auto_tie.py` 是时间域工作流的第四步。它把前三步的产出（井资产、曲线筛选、预处理 LAS）与时深表、井轨迹、地震体组合起来，对每口井做井震标定，输出优化后的时深关系、候选子波和合成记录 QC。
 
 ---

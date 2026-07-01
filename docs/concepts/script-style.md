@@ -74,7 +74,3 @@
 
 - [核心 CSV 契约](csv-contracts.md)
 - [数据与单位约定](data-and-coordinate-conventions.md)
-
-当前正式契约覆盖步骤 01 至 05、井轨迹旁路、`forward_observability.py`
-研究闸门，以及 `synthoseis_lite.py` calibrate/generate 与
-`evaluate_synthoseis_lite.py` 研究闸门。

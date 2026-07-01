@@ -42,8 +42,3 @@ flowchart TB
 深度域是一次性处理路径，Step 1–3、6 与时间域共享。
 Step 4/5 使用独立脚本，详见
 [深度域工作流](guide/depth-domain-workflow.md)。
-
-## 第六步
-
-模块化岩石物理分析的运行方式与产物契约见
-[06 岩石物理分析](guide/6-rock-physics-analysis.md)。

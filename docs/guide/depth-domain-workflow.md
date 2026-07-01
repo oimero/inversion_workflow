@@ -92,17 +92,19 @@ seismic:
 
 ### 脚本在做什么
 
-脚本的核心流程（`run_auto_tie` 函数，[vertical_well_auto_tie_depth.py:319-598](scripts/vertical_well_auto_tie_depth.py#L319-L598)）：
+深度域地震的纵轴是海拔深度（米），测井曲线的纵轴是钻井测量深度（米），二者虽然单位相同，但无法直接比对——因为波阻抗界面产生的地震反射是按时间先后到达的，而深度域地震道本身没有直接记录每个深度点对应的波传播时间。要知道井曲线在哪个深度产生哪个时间的地震响应，必须先知道速度随深度的分布。
 
-**1) 加载井数据和井旁地震道。** 从来源井的 Step 3 预处理 LAS 中读取 Vp、Rho 曲线，对 NaN 做线性插值；通过 `survey.read_trace_at_xy(well_x, well_y, domain="depth")` 读取井口 XY 处的深度域地震道。
+脚本的做法分四步：
 
-**2) 计算重叠窗口并建立局部时深关系。** 将 MD 减去 KB 得到 TVDSS，取井 TVDSS 与地震深度轴的重叠范围。在重叠窗口内，由 Vp 做梯形慢度积分构建局部时深表（TVDSS ↔ 相对 TWT），调用 `grid.build_local_tdt_from_vp`（`wtie.processing.grid`）。然后将深度域地震道通过局部 TDT 插值到规则 TWT 轴。
+**1) 由速度曲线计算局部时深关系。** 从井的声波时差曲线得到速度，沿深度方向逐段累加声波的往返时间，得到一张该井的深度—时间对照表。同时读取井口坐标处的深度域地震道。
 
-**3) 运行 autotie 提取子波。** 将 LogSet（含 Vp、Rho）、TWT 域地震道和局部 TDT 组装为 `wtie` 的 `InputSet`，调用 `autotie.tie_v1` 做自动井震标定，输出 raw wavelet。
+**2) 将深度域地震道转换到时间域。** 用上一步得到的对照表，把深度域地震道从深度轴插值到规则的时间轴上。至此，测井曲线和地震道都在时间域了，可以做常规的井震标定。
 
-**4) 裁剪并能量归一化。** 将 raw wavelet 裁剪到 `target_crop_ms`（默认 201 ms，奇数点），中心在零时刻，L2 能量归一化到 1。最终输出 `wavelet_201ms_<source-well>.csv`。
+**3) 自动井震标定。** 用已有的标定模块在时间域内寻找最佳子波——这条子波描述了从波阻抗变化到地震振幅的转换关系。深度域和时间域共用同一个时间子波（子波本身定义在时间上），所以时间域提取的子波可以直接用于深度域正演。
 
-**5) 生成 QC 图。** 共 5 张图：深度-时间匹配、优化目标函数、raw tie window、裁剪后合成 vs 地震、子波时域/频域对比。
+**4) 裁剪和归一化。** 原始标定出的子波通常有几万个采样点，实际有用的能量集中在中心零点附近。脚本截取中心约 200 毫秒的片段，将其能量归一化到 1，输出为固定长度、可直接复用的子波文件。
+
+另外生成五张质量检查图：深度与时间的对应关系、标定收敛曲线、原始标定窗口的波形对比、裁剪子波的合成记录与地震对比、子波的波形和频谱。
 
 ### 核心输出文件
 
@@ -162,19 +164,19 @@ wavelet_batch_synthetic_depth:
 
 ### 脚本在做什么
 
-主循环 `process_well`（[wavelet_batch_synthetic_depth.py:682-920](scripts/wavelet_batch_synthetic_depth.py#L682-L920)）对每口井执行以下步骤：
+Step 4 只跑了一口井、产出一条子波。Step 5 用这条子波跑全工区所有有测井数据的井，做两件事：评估子波在每口井上的适用性，以及把每口井的测井曲线在深度上平移以对齐地震。
 
-**1) 加载井数据并取地震道。** 读取该井的 Step 3 预处理 LAS，对 Vp、Rho 做 NaN 线性插值。读取井口 XY 处的深度域地震道。计算井 TVDSS 与地震深度轴的重叠窗口。
+**1) 每口井各自计算时深关系。** 和 Step 4 一样，每口井用自身的速度曲线沿深度积分得到局部的深度—时间对照表，然后把井旁的深度域地震道换算到时间域。
 
-**2) 建立局部时深关系并转换到 TWT。** 由重叠窗口内的 Vp 积分构建局部时深表（`grid.build_local_tdt_from_vp`），将滤波后的 MD 域测井曲线通过 TDT 转到 TWT 域，计算反射系数。
+**2) 时移扫描。** 固定子波不变。用测井曲线计算反射系数，与子波卷积得到合成记录，在 ±40 毫秒范围内逐档平移反射系数，每次平移后计算合成记录与实际地震道的相似度，选出相关系数最高的平移量。这一步的目的是找出测井和地震之间的整体时间偏差。
 
-**3) 时移扫描。** 在 `[shift_min_ms, shift_max_ms]` 范围内按子波采样间隔扫描整体时移。对每个时移量：平移反射系数 → 与固定子波卷积 → 计算与归一化地震道的 corr、NMAE。选出相关系数最高的时移量。
+**3) 时间偏差转换为深度偏差。** 因为每口井的速度随深度变化，时间偏差和深度偏差之间不是固定比例。脚本通过该井的深度—时间对照表，把每个时间采样点的最佳时间偏移反查为对应的深度偏移，得到一条深度平移曲线。
 
-**4) 计算深度平移曲线。** 将最佳 TWT 时移通过局部 TDT 转换为 TVDSS 深度平移（`compute_depth_shift_curve`，[wavelet_batch_synthetic_depth.py:232-241](scripts/wavelet_batch_synthetic_depth.py#L232-L241)）。对 TWT 轴上的每个样点，查 TDT 得到当前位置的 TVDSS，再查 TDT 得到时移后位置的 TVDSS，差值即为深度平移量。输出 `depth_shift_curve_<well>.csv`。
+**4) 导出两套深度平移后的 LAS 文件。** 这是深度域工作流最重要的产出，供后续合成数据生成使用：
+- **全曲线版**（`shifted_preprocessed_las`）：把 Step 3 原始预处理 LAS 的全部曲线按深度平移曲线搬移到新位置，保留原始的数据空缺不填补。下游用它提取波阻抗的真实变化幅度。
+- **滤波版**（`shifted_filtered_las`）：只包含声波时差、密度、波阻抗三条曲线，且经过了平滑滤波。下游用它构建背景趋势，避免个别尖刺干扰背景拟合。
 
-**5) 导出 shifted_preprocessed_las。** `export_shifted_preprocessed_las`（[wavelet_batch_synthetic_depth.py:405-521](scripts/wavelet_batch_synthetic_depth.py#L405-L521)）读取原始 Step 3 LAS，对所有数值曲线按深度平移曲线做 TVDSS 方向的平移，重新插值到规则 MD 网格。保留原始间隙结构（不桥接 null gap）。当源 LAS 有 DT_USM 和 RHO_GCC 时，在输出 LAS 中重新计算 AI。
-
-**6) 导出 shifted_filtered_las。** `build_shifted_filtered_logset_for_export`（[wavelet_batch_synthetic_depth.py:524-574](scripts/wavelet_batch_synthetic_depth.py#L524-L574)）对 Step 5 内部滤波后的 LogSet 做同样的深度平移，输出 DT_USM、RHO_GCC、AI 三条曲线。
+**5) 质量检查。** 每口井生成两张图（合成记录与地震道的波形对比、时移扫描的相似度曲线），另外生成两张全工区汇总图（各井的相关性和时移量、深度平移量统计）。脚本末尾还会检查子波来源井在批量合成中的时移量是否与 Step 4 的标定结果一致。
 
 **7) 生成 QC 图。** 每井两张图：合成记录 vs 地震道波形对比（R1 风格六 panel）、时移扫描 corr 曲线。批量汇总两张图：全井指标柱状图、深度平移统计。
 

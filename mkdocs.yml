@@ -62,6 +62,7 @@ nav:
       - 07 实际工区 LFM 输入准备: guide/7-real-field-lfm.md
       - 08 R0 实际工区零样本预测: guide/8-r0-real-field-zero-shot.md
       - 08 R1 正演闭环诊断: guide/8-r1-real-field-forward-diagnostic.md
+      - 平行工作流 深度域反演工作流: guide/depth-domain-workflow.md
   - API:
       - API 总览: api/index.md
       - cup:

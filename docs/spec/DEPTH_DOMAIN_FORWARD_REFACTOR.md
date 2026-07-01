@@ -428,7 +428,7 @@ flowchart TD
     D --> F["Synthoseis-lite v2 → GINN v2<br/>(详见 depth-synthoseis-lite-v2.md)"]
     D --> G["R1：TVDSS 深度正演"]
     E -.-> H["旁路：正演可观测性"]
-    F --> I["Step 7：暂缓，另行设计"]
+    F --> I["Step 7：深度域框架约束 LFM<br/>(独立规范，待实施)"]
     I --> J["R0 → R1"]
 ```
 
@@ -471,9 +471,13 @@ Step 6 的 LAS 输入只来自 Step 3；井分层与 Step 4/5 标定结果不参
 
 ### 8.3 Step 7、R0 与 R1
 
-Step 7 暂缓。本轮不规定它使用 Step 3 LAS 还是 Step 5 shifted LAS，也不规定深度 LFM 的数据来源、重采样或窗口契约；这些问题在深度正演和训练闭合后单独设计。
+Step 7 的深度域实际工区 LFM 已完成独立设计，见
+[`DEPTH_DOMAIN_FRAMEWORK_LFM.md`](DEPTH_DOMAIN_FRAMEWORK_LFM.md)。该规范固定以
+Step 5 `shifted_filtered_las/AI` 构建 M0 层状插值模型，并以平面礁/滩多边形和
+三个解释层位生成 M1 框架场景模型；当前状态为待实施。合成 LFM 变体、GINN-v2
+训练以及 R0/R1 接入仍不属于 Step 7 v1 的实施范围。
 
-未来 Step 7 与 R0 虽不执行正演，仍必须携带：
+待实施的 Step 7 产物与未来 R0 虽不执行正演，仍必须携带：
 
 - `sample_domain`；
 - `depth_basis=tvdss`；
@@ -618,11 +622,15 @@ Step 4/5/6 已落地：
 - GINN v2 physics loss 迁移至统一后端；
 - 无可观测性产物时主路径完整运行。
 
-### 阶段 4：Step 7 单独设计
+### 阶段 4：Step 7 深度域框架约束 LFM
 
-在深度正演、Synthoseis 和训练闭合后，单独确定深度 LFM 的数据来源、窗口、重采样和 shifted LAS 使用策略。本规范不提前替该阶段作决定。
+按 [`DEPTH_DOMAIN_FRAMEWORK_LFM.md`](DEPTH_DOMAIN_FRAMEWORK_LFM.md) 实施：用
+Step 5 shifted filtered AI 构建严格的 M0 比例切片 LFM，再由平面 reef/shoal
+框架和相对地层坐标生成 M1。v1 先完成窗口对比和多剖面 QC，再进入全体积导出。
 
-门禁：先更新相应设计与数据契约，再实施 Step 7；不得把尚未决定的来源静默固化进代码。
+门禁：每个比例切片至少三口控制井，不允许邻切片填充或单井常值兜底；M0/M1
+必须同网格、同掩码、来源和场景参数可追溯。该阶段不得顺带修改 Synthoseis、
+GINN-v2、R0 或 R1。
 
 ### 阶段 5：R0/R1 与重复实现清理
 
@@ -667,7 +675,7 @@ Step 4/5/6 已落地：
   既有 Robinson 结果，首点非补零；
 - `forward_depth` 输出 TVDSS 上 `N` 点，分块/完整、NumPy/PyTorch 一致；
 - 时间域和深度域共享同一套 logAI（`N`）、反射率（`N-1`）、地震（`N`）形状契约；
-- Step 7 明确保持暂缓，实施前先完成独立的深度 LFM 设计；
+- Step 7 按独立的深度框架 LFM 规范实施，且不把尚未实现的产物伪装为已完成；
 - xline 步长 4 不造成位置偏移或错误索引；
 - 所有旧 schema 均以可操作错误要求重建，不被静默读取；
 - 核心没有 NaN 填充、自动归一化、gain 或单位猜测；

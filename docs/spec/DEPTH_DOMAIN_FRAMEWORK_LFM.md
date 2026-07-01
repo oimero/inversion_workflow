@@ -26,10 +26,16 @@ v1 必须具备以下性质：
 - M0、M1 使用相同的 inline、xline、TVDSS 轴和有效区掩码；
 - 规范值域为 `log(AI)`，AI 单位固定为 `m/s*g/cm3`；
 - M0 的 400 m 截止波长只约束井曲线背景；
-- M1 的框架倍率和过渡尺度全部由实验配置显式给出；
+- M1 的线性 AI 倍率和过渡尺度全部由实验配置显式给出；
 - 窗口模式用于快速迭代和多剖面 QC，全体积模式用于解释软件导出；
 - 所有来源、参数、轴和文件哈希可追溯；
 - 控制不足或语义不明时立即失败，不自动降低标准。
+
+命名约定：
+
+- **M0** 表示 baseline model，即常规层状插值低频初始模型；
+- **M1** 表示 framework scenario model，即在 M0 上叠加一个显式框架场景后的初始模型；
+- M0/M1 不是 schema 或神经网络版本号，二者均为真实工区 LFM 体。
 
 ## 2. 非目标
 
@@ -40,7 +46,7 @@ v1 不处理：
 - 多边形编辑 UI、Petrel 插件或解释文件交互；
 - 斜井的 MD—TVDSS 轨迹变换；
 - 根据井自动判定礁、滩或背景相；
-- 自动估计 reef/shoal multiplier；
+- 自动估计 reef/shoal `linear_ai_multiplier`；
 - 构建多套弱/中/强框架模型；v1 每次运行只有一个显式命名的 M1 场景；
 - 修改 Synthoseis-lite 的 LFM 生成、GINN-v2 训练、R0 或 R1；
 - 恢复或依赖 `src/ginn/`、`src/ginn_depth/` 以及 `.ref/` 中的旧生产接口。
@@ -76,13 +82,15 @@ TVDSS         = 4750 .. 7500 m, step 5 m
 
 ### 3.2 井曲线来源
 
-M0 只消费 `wavelet_batch_synthetic_depth.py` 成功运行后生成的：
+M0 只消费 `wavelet_batch_synthetic_depth` source run 生成的：
 
 - `wavelet_batch_metrics.csv`；
 - `shifted_filtered_las/*.las`；
 - `run_summary.json`。
 
-`shifted_filtered_las/AI` 是 Step 5 深度平移后的 filtered AI，LAS 深度轴仍是 MD。当前七口控制井均在 inventory 中判定为 `vertical`，因此 v1 显式使用：
+`shifted_filtered_las/AI` 是该 source run 生成的深度平移后 filtered AI，LAS 深度轴仍是 MD。`wavelet_batch_synthetic_depth_dir` 只用于定位和校验 `wavelet_batch_metrics.csv`、`shifted_filtered_las` 与 `run_summary.json`。本规范不再使用 Step 5/Step 6 编号描述这组来源，避免与时间域主流程编号混淆。
+
+当前七口控制井均在 inventory 中判定为 `vertical`，因此 v1 显式使用：
 
 ```text
 TVDSS = shifted_MD - KB
@@ -122,7 +130,7 @@ experiments/real_field_lfm_depth/framework_polygons.csv
 - `scripts/real_field_lfm_depth.py` 只负责 CLI、配置合并、来源解析、产物落盘和终端摘要；
 - `cup.seismic.lfm_depth` 负责配置值对象、井控制准备、米制低通、严格比例切片、平面框架栅格化、M1 合成、QC 统计和绘图数据准备；
 - 实验 YAML 存放可变场景假设；
-- `common.yaml` 继续只存工区地震、层位和资产事实，不写 multiplier 或 polygon 路径。
+- `common.yaml` 继续只存工区地震、层位和资产事实，不写 `linear_ai_multiplier` 或 polygon 路径。
 
 CLI 固定为：
 
@@ -132,7 +140,7 @@ python scripts/real_field_lfm_depth.py `
   --output-dir scripts/output/real_field_lfm_depth_test
 ```
 
-`--output-dir` 可省略；省略时写入 `scripts/output/real_field_lfm_depth_<timestamp>/`。CLI 不暴露 multiplier、taper、窗口或建模参数，这些必须进入可追溯的实验 YAML。
+`--output-dir` 可省略；省略时写入 `scripts/output/real_field_lfm_depth_<timestamp>/`。CLI 不暴露 `linear_ai_multiplier`、taper、窗口或建模参数，这些必须进入可追溯的实验 YAML。
 
 ## 5. 配置契约
 
@@ -172,7 +180,7 @@ real_field_lfm_depth:
       reef:
         top_horizon: base_of_salt
         bottom_horizon: base_of_bve
-        multiplier: <positive-number>
+        linear_ai_multiplier: <positive-number>
         edge_taper_m: <positive-number>
         top_taper_fraction: <number-in-(0,0.5)>
         bottom_taper_fraction: <number-in-(0,0.5)>
@@ -180,7 +188,7 @@ real_field_lfm_depth:
       # shoal:
       #   top_horizon: base_of_bve
       #   bottom_horizon: base_of_itp
-      #   multiplier: <positive-number>
+      #   linear_ai_multiplier: <positive-number>
       #   edge_taper_m: <positive-number>
       #   top_taper_fraction: <number-in-(0,0.5)>
       #   bottom_taper_fraction: <number-in-(0,0.5)>
@@ -201,7 +209,7 @@ real_field_lfm_depth:
 - v1 baseline 固定要求 400 m、六阶、`reflect`、32 slices、spherical ordinary kriging、`exact=true`、`nugget=0`；配置出现其他值时明确失败，而不是暗中覆盖；
 - `framework.classes` 必须为非空映射，只允许 `reef`、`shoal`；允许仅启用一类；
 - `reef` 和 `shoal` 的层位对必须分别精确匹配 §3.1；
-- multiplier 必须有限且大于 0；所有活动类别 multiplier 均为 1 时失败，因为 M1 将与 M0 相同；
+- `linear_ai_multiplier` 表示线性 AI 域倍率，必须有限且大于 0；所有活动类别倍率均为 1 时失败，因为 M1 将与 M0 相同；
 - `edge_taper_m` 必须有限且大于 0；
 - top/bottom taper fraction 必须分别位于 `(0, 0.5)`，且二者之和小于 1；
 - `qc.sections` 必须非空，每条线必须落在当前输出轴上；xline 必须遵守步长 4，不能按数组下标解释。
@@ -247,10 +255,10 @@ reef_001,reef,3,1630.0,6103.0
 
 ### 7.1 控制井准备
 
-1. 读取 Step 5 `wavelet_batch_metrics.csv`，只接受 `status=ok` 的记录；
+1. 读取 `wavelet_batch_synthetic_depth` source run 的 `wavelet_batch_metrics.csv`，只接受 `status=ok` 的记录；
 2. 按规范化井名与 `well_inventory.csv` 做 1:1 联接；
 3. 要求 `wellbore_class=vertical`、KB、inline、xline 均有限；
-4. `shifted_filtered_las_path` 必须存在并与 Step 5 summary 记录的输出目录一致；
+4. `shifted_filtered_las_path` 必须存在并与同一 source run summary 记录的输出目录一致；
 5. 以 exact mnemonic 读取 `AI`，单位必须精确规范化为 `m/s*g/cm3`；
 6. AI 有效值必须有限且大于 0，之后显式取自然对数；
 7. 用 `TVDSS = MD - KB` 构造 `grid.Log(..., basis_type="tvdss")`。
@@ -287,7 +295,7 @@ z_well(k) = (1-u_k) * z_top_well + u_k * z_bottom_well
 3. 要求不同控制井数不少于 3；
 4. 以 explicit inline/xline 轴归一化为网格 index 坐标；该转换必须除以各自真实线号步长；
 5. 使用 spherical ordinary kriging，`exact=true`、`nugget=0`；
-6. 写出切片值和 kriging variance；
+6. 按 §7.4 的固定规则逐切片派生 sill/range，并写出切片值、kriging variance 与实际参数；
 7. 再按每一道自身的 top/bottom 层位，把 32 个切片线性映射回 TVDSS 样点。
 
 任何层段的任何切片少于 3 口控制井时，整次运行失败。禁止：
@@ -300,7 +308,29 @@ z_well(k) = (1-u_k) * z_top_well + u_k * z_bottom_well
 
 调用 `cup.seismic.modeling` 前必须完成控制数预检；调用后再次检查 `slice_control_counts` 和 `slice_modes`，确认没有进入历史 fallback 分支。
 
-### 7.4 M0 掩码和值域
+### 7.4 Kriging 参数派生
+
+v1 不把 range、sill、anisotropy 或搜索邻域开放为场景调参项，而是冻结当前 `cup.seismic.modeling` 的确定性规则：
+
+```text
+normalized_inline = (inline - inline_min) / inline_step
+normalized_xline  = (xline - xline_min) / xline_step
+
+sill  = variance(control_log_ai_values)
+range = max(median(nearest_neighbor_distance_in_normalized_grid), 1.0)
+```
+
+其他约定：
+
+- 二维 isotropic spherical covariance；
+- `nugget=0`、`exact=true`；
+- 不设置 anisotropy；
+- 不设置搜索半径、邻域象限或最大控制点数；每个切片使用全部有效控制井；
+- 控制值方差为 0 会进入 constant-field 分支，按本规范必须失败，不能把 sill 改成任意常数继续运行。
+
+每个切片必须在 `slice_control_qc.csv` 中记录实际 `control_count`、`control_log_ai_variance`、`sill`、`range_normalized_grid`、控制井名和 kriging mode。summary 必须写明上述派生公式、isotropy 和全控制点策略，保证 M0 可复现。
+
+### 7.5 M0 掩码和值域
 
 `valid_mask_model` 使用 `TargetZone` 的 filled target zone：首层位到末层位之间为有效，窗外无效；层位交叉、厚度不足或无支持位置遵循 `TargetZone` 的显式 QC。
 
@@ -370,19 +400,19 @@ M1 只按以下公式生成：
 
 ```text
 logAI_M1 = logAI_M0
-         + P_reef  * log(multiplier_reef)
-         + P_shoal * log(multiplier_shoal)
+         + P_reef  * log(linear_ai_multiplier_reef)
+         + P_shoal * log(linear_ai_multiplier_shoal)
 ```
 
 未活动 class 的项不存在，不创建全零语义占位。线性域等价关系为：
 
 ```text
 AI_M1 = AI_M0
-      * multiplier_reef  ** P_reef
-      * multiplier_shoal ** P_shoal
+      * linear_ai_multiplier_reef  ** P_reef
+      * linear_ai_multiplier_shoal ** P_shoal
 ```
 
-M1 不做第二次 400 m 低通。框架的横向/垂向 taper 是独立、显式的场景尺度，必须分别进入 metadata 和 QC。
+M1 不做第二次 400 m 低通。框架的横向/垂向 taper 是独立、显式的场景尺度，必须分别进入 metadata 和 QC。M1 是 `framework-scenario initial model`，不保证满足与 M0 相同的整体频谱低通定义；不能因为文件名含 LFM 就宣称其全部空间变化均满足 400 m 截止波长。
 
 框架允许直接修改控制井位置，程序不得构造井保护半径或强制 M1 回到 M0。summary 和井旁 QC 必须明确记录每口井在各 class 下的最大概率、M0/M1 差值和倍率影响。因此 M1 必须标注为：
 
@@ -410,7 +440,20 @@ window 模式不导出 SEG-Y，只写 NPZ、CSV、JSON 和 PNG。
 - M0 kriging variance 独立保存，不复制为虚假的 M1 uncertainty；
 - 不把完整 XY 点云为每个 polygon 重复实体化。
 
-volume 模式额外导出 M0、M1 的线性 AI SEG-Y。目标窗外保持 NaN，`nan_fill=None`；不得为了兼容解释软件写 0。
+volume 模式同时输出规范 NPZ 和规范线性 AI SEG-Y。v1 固定要求源 SEG-Y 为格式码 5（4-byte IEEE float）；当前工区已满足该条件。M0/M1 SEG-Y 通过现有 `cup.seismic.volume_export.export_volume_like_source()` 共享源体头信息，并显式传入 `nan_fill=None`，目标窗外 NaN 不得填成 0、端点值或其他显示值。
+
+SEG-Y 分支共享源体头信息，现有公共方法不会使用调用方传入的 `ilines/xlines/samples` 重建头。因此调用前必须严格校验 M0/M1 的 shape、inline、xline、TVDSS 轴与源体全体积逐项一致；不得用该路径导出任意窗口或错位子体积。写出后必须用 cigsegy 回读并校验 sample format、shape、显式轴和目标窗外 NaN。
+
+v1 不输出 display-only filled SEG-Y，也不为 IBM float 预设兼容分支。若实际解释软件验证不能读取或正确显示规范 NaN SEG-Y，应另立显示产物规范，明确填充算法、文件角色和 mask；不得在本实现中静默改变规范体。
+
+固定文件命名：
+
+```text
+m0_layered_lfm.segy
+m1_framework_lfm.segy
+```
+
+textual header 必须写明 schema、M0/M1 角色、`domain=AI`、`unit=m/s*g/cm3`、`source_field=log_ai`、`transform=exp(log_ai)`、`outside_target=NaN` 及对应规范 NPZ 的路径与哈希。
 
 ## 10. 产物契约
 
@@ -463,7 +506,7 @@ metadata_json
 <class>_probability          [n_inline, n_xline, n_tvdss]
 ```
 
-`combined_framework_probability` 仅用于 QC，定义为活动 class 三维概率的逐点最大值，不能用于重建 M1；M1 必须按各 class 自己的 multiplier 分项计算。
+`combined_framework_probability` 仅用于 QC，定义为活动 class 三维概率的逐点最大值，不能用于重建 M1；M1 必须按各 class 自己的 `linear_ai_multiplier` 分项计算。
 
 ### 10.4 QC 表
 
@@ -472,24 +515,27 @@ metadata_json
 | 文件 | 内容 |
 |---|---|
 | `well_control_qc.csv` | 井来源、KB、线号、TVDSS 支撑、单位、低通状态 |
-| `slice_control_qc.csv` | zone、slice、u、控制井数、井名、kriging mode |
-| `polygon_qc.csv` | polygon/class、顶点数、面积、范围、窗口交叠、栅格占比 |
-| `framework_class_qc.csv` | class 的 multiplier、taper、概率分布、修改样点数 |
+| `slice_control_qc.csv` | zone、slice、u、控制井数、井名、控制值方差、实际 sill、归一化网格实际 range、kriging mode |
+| `polygon_qc.csv` | polygon/class、顶点数、面积、范围、窗口交叠、栅格占比、`max/mean P_map`、`P_map>0.5/0.9` 面积 |
+| `framework_class_qc.csv` | class 的线性 AI 倍率、taper、`max/mean P_map`、`P_map>0.5/0.9` 面积与占比、三维概率分布、修改样点数 |
 | `well_framework_effect_qc.csv` | 每井 M0/M1、概率和 delta 的统计；不因井被修改而失败 |
 | `section_metrics.csv` | 每条 QC 剖面的 M0/M1/delta/probability 统计 |
 
 CSV 不嵌套 Python 对象。井名列表、参数字典等复杂字段必须使用确定性 JSON 字符串，并在 CSV 契约文档中明确。
+
+`P_map` 指标只作事实记录，v1 不内置“约束过弱”告警阈值。使用者可直接看到窄 polygon 与大 `edge_taper_m` 是否导致概率从未接近 1；代码不得替地质解释自动缩小 taper。
 
 ### 10.5 图件
 
 输出：
 
 - `figures/framework_map_and_sections.png`：polygon、活动 class、控制井和 QC 线位置；
-- 每条配置剖面一张图，固定面板为 M0、M1、`M1-M0`、class probability；
-- M0/M1 使用相同色标，差值使用以 0 为中心的发散色标；
+- 每条配置剖面一张图，固定面板为线性 AI 的 M0、线性 AI 的 M1、AI percent difference、class probability；
+- M0/M1 默认显示 `AI=exp(logAI)`，单位为 `m/s*g/cm3`，并使用相同色标；
+- 差值面板显示 `100 * (AI_M1 / AI_M0 - 1)`，使用以 0 为中心的发散色标；ΔlogAI 保留在 NPZ/CSV 中，不用无单位色标冒充线性 AI；
 - 所有剖面叠加三个层位；
 - 纵轴为 TVDSS m，向下增加；
-- 图题写出 scenario id、活动 class、multiplier 和 taper，禁止生成无法追溯参数的“漂亮图”。
+- 图题写出 scenario id、活动 class、`linear_ai_multiplier` 和 taper，禁止生成无法追溯参数的“漂亮图”。
 
 ### 10.6 `run_summary.json`
 
@@ -511,6 +557,8 @@ well_sources_and_hashes
 axes_and_output_geometry
 baseline_parameters
 framework_parameters
+source_segy_sample_format_code
+segy_export_parameters
 control_counts
 output_files_and_hashes
 warnings
@@ -531,12 +579,14 @@ warnings
 - 低通跨越缺口，或任何 slice 少于 3 口控制井；
 - 建模结果使用了 single-well、neighbor-slice、constant-field 等 fallback mode；
 - polygon CSV 多列/缺列、class 不匹配、顺序断裂、自交、退化或越出工区；
-- multiplier/taper 缺失、非有限或越界；
+- `linear_ai_multiplier`/taper 缺失、非有限或越界；
 - M1 与 M0 完全相同；
 - M0/M1/probability/mask 的轴或 shape 不完全一致；
-- 有效样点出现 NaN/Inf，或无效样点被数值填充；
+- 规范 M0/M1 `log_ai` 在有效样点出现 NaN/Inf，或在无效样点不是 NaN；
 - window 与 volume 同一区域算法语义不同；
-- window 模式尝试导出 SEG-Y。
+- window 模式尝试导出 SEG-Y；
+- 源 SEG-Y sample format 不是 format code 5；
+- SEG-Y 导出前的全体积 shape/轴与源体不完全一致，或回读后的 format/shape/轴/NaN 不满足契约；
 
 禁止：
 
@@ -544,9 +594,10 @@ warnings
 - 猜测 polygon class、层段或顶点顺序；
 - 根据文件名扫描并拼接不在来源清单中的 LAS；
 - 自动裁剪越界 polygon；
-- 自动设置 multiplier、taper、切片数或窗口；
+- 自动设置 `linear_ai_multiplier`、taper、切片数或窗口；
 - 因控制不足而降低标准；
-- 在目标窗外填 0；
+- 在规范 NPZ 或规范 AI SEG-Y 的目标窗外填 0、端点值或其他有限显示值；
+- 在 v1 内生成 display-only filled SEG-Y；
 - 用旧 GINN 相控点代码作新模块依赖。
 
 ## 12. 实施顺序
@@ -574,10 +625,10 @@ warnings
 
 1. 验证 window/full 子区一致；
 2. 控制峰值内存并生成全体积 NPZ；
-3. 仅在 volume 模式导出 M0/M1 线性 AI SEG-Y；
+3. 确认源 SEG-Y 为 format code 5，严格校验全体积轴后复用 `export_volume_like_source(..., nan_fill=None)` 导出规范 M0/M1 AI SEG-Y，并回读验证；
 4. 冻结 schema、摘要和文件哈希。
 
-门禁：全体积输出可被解释软件读取，TVDSS/inline/xline 头信息与源地震一致。
+门禁：cigsegy 回读后 TVDSS/inline/xline 头信息与源地震一致，目标窗外仍为 NaN。解释软件兼容性通过实际导入验收；若不兼容，本阶段只报告事实，不生成临时填充体。
 
 ## 13. 测试规范
 
@@ -596,13 +647,17 @@ warnings
 11. 仅 reef、仅 shoal、reef+shoal 三种活动集合；
 12. 起伏层位下 `u`、top/bottom taper 及窗外精确为 0；
 13. log 域公式与线性 AI 幂乘公式逐点等价；
-14. multiplier 大于 1、小于 1、等于 1 的组合校验；
+14. `linear_ai_multiplier` 大于 1、小于 1、等于 1 的组合校验；
 15. 框架覆盖井位时 M1 确实改变井旁值并写入 QC；
 16. window 与 volume 同一子区的 M0/M1/mask/probability 一致；
 17. NPZ 必需键、dtype、shape、NaN 和 metadata schema；
-18. window 禁止 SEG-Y，volume 的 M0/M1 SEG-Y 轴和数值正确；
-19. 来源路径、配置、polygon、LAS、地震和层位哈希写入 summary；
-20. 旧时间域 LFM、旧 GINN 和无 schema 产物不能被静默消费。
+18. `max/mean P_map` 与 `P_map>0.5/0.9` 面积统计正确，且不触发未配置的告警阈值；
+19. window 禁止 SEG-Y，非 format code 5 源体明确失败；
+20. format code 5 的规范 NaN SEG-Y 经 cigsegy 往返仍保留 NaN；
+21. volume SEG-Y 的全体积 shape、轴、textual header、M0/M1 角色和数值正确；
+22. 任意错位/窗口数组不能通过共享头路径导出；
+23. 来源路径、配置、polygon、LAS、地震和层位哈希写入 summary；
+24. 旧时间域 LFM、旧 GINN 和无 schema 产物不能被静默消费。
 
 数值容差必须按 dtype 和计算路径显式设置。不得通过放宽全局容差掩盖线号偏移、边界概率、层位映射或 log/linear 值域错误。
 
@@ -612,27 +667,27 @@ v1 完成需同时满足：
 
 - `scripts/real_field_lfm_depth.py` 是唯一的新深度域实际工区 LFM 入口；
 - `cup.seismic.lfm_depth` 不依赖旧 GINN 或 `.ref` 代码；
-- M0 严格来自 Step 5 shifted filtered AI、TVDSS、400 m 低通和 32-slice kriging；
+- M0 严格来自同一个 `wavelet_batch_synthetic_depth` source run 的 shifted filtered AI、TVDSS、400 m 低通和 32-slice kriging；
 - 每个 slice 至少 3 口井，无任何数值兜底；
 - 平面 polygon 通过真实线号和 XY 米制距离生成框架概率；
 - reef/shoal 纵向范围跟随三个解释层位；
-- M1 可由 M0、各 class probability 和 multiplier 完整重建；
+- M1 可由 M0、各 class probability 和 `linear_ai_multiplier` 完整重建；
 - M1 修改井位的事实在 metadata 和 QC 中明确可见；
 - window/full 子区逐点一致；
-- 目标窗外为 NaN，不填 0；
+- 规范 M0/M1 NPZ 和 AI SEG-Y 的目标窗外均为 NaN，不填 0 或显示值；
 - 多剖面对比图、CSV、NPZ、summary 均可追溯到输入哈希和场景参数；
-- SEG-Y 只在 full-volume 模式输出；
+- SEG-Y 只在 full-volume 模式输出，固定为 format code 5 的 NaN 规范体；v1 不生成 display-only 产物；
 - Synthoseis、GINN-v2、R0/R1 未在本阶段被修改。
 
 ## 15. 后续接缝
 
-本规范完成后，下一份独立设计应处理“合成训练如何见到框架 LFM”。最低要求是：
+本规范完成后，下一份独立设计应处理“合成训练如何见到框架 LFM”。在 M1 被用于 GINN-v2 正式推理、训练对比或研究结论之前，必须先实现该合成 LFM variant 规范；只生成真实工区 M1 图件不构成正式模型接入。最低要求是：
 
 - 合成 truth/seismic 不变；
 - 同一 parent realization 派生 baseline/framework LFM variant；
 - residual target 始终按当前输入 LFM 重新计算；
 - split 仍按 parent realization，不得让同一真值的 LFM variants 泄漏到不同 split；
-- 合成 framework LFM 使用与本文同构的 log multiplier 和概率场语义；
+- 合成 framework LFM 使用与本文同构的 `log(linear_ai_multiplier)` 和概率场语义；
 - GINN-v2 输入仍保持 `seismic + LFM + valid_mask`，除非另有独立规范改变。
 
 这些接缝只用于界定未来方向，不授权本阶段实现合成训练或真实场反演。

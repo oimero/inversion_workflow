@@ -1,4 +1,4 @@
-"""Run modular Step 6 rock-physics analysis from Step 3 LAS outputs.
+"""Run modular rock-physics analysis from Step 3 LAS outputs.
 
 The input layer always audits every ``preprocess_status=passed`` LAS.  Analysis
 modules are explicitly enabled in the common config.  With every module

@@ -1,6 +1,6 @@
 # 核心 CSV 契约
 
-这些 CSV 是当前工作流的跨脚本契约，覆盖主链第一至八步及三个旁路。
+这些 CSV 是当前工作流的跨脚本契约，覆盖主链第一至八步及五个旁路。
 
 下游读取上游结果时必须按本文解释字段语义，不得凭字段名猜测。
 标题中标记“诊断”的 CSV 只供人工审阅。
@@ -193,7 +193,7 @@
 | `spatial_cluster_id` | 跨井证据去偏使用的空间簇 |
 | `spatial_cluster_size` | 当前簇井数，仅作 QC |
 
-## 06 · rock_physics_analysis.py
+## 旁路 · rock_physics_analysis.py
 
 ### `well_input_inventory.csv`
 

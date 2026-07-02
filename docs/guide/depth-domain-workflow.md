@@ -1,6 +1,6 @@
 # 深度域工作流
 
-深度域工作流定位为**一次性处理**，复用概率低。Step 1–3（井资产盘点、LAS 筛选、测井预处理）和 Step 6（岩石物理分析）与时间域共享，本文不再重复。
+深度域工作流定位为**一次性处理**，复用概率低。Step 1–3（井资产盘点、LAS 筛选、测井预处理）和旁路 岩石物理分析与时间域共享，本文不再重复。
 
 深度域特有的步骤只有两步：**固定子波提取**和**批量合成与深度平移**。二者是当前工区的遗留一次性路径，不属于标准工作流 API，也不作为后续统一正演重构的依赖。
 
@@ -262,7 +262,7 @@ synthoseis_lite:
 ```text
 时间域主链：Step 1 → 2 → 3 → 4(well_auto_tie) → 5(wavelet_generation) → ...
                                           ↓
-深度域旁路：Step 1 → 2 → 3 → 4(vawt_depth) → 5(wbs_depth) → 6(rock_physics)
+深度域旁路：Step 1 → 2 → 3 → 4(vawt_depth) → 5(wbs_depth) → 旁路(rock_physics)
                                                               ↓
                                               synthoseis_lite depth v2 → GINN v2
 ```
@@ -273,4 +273,4 @@ synthoseis_lite:
 - 时间域 Step 5 做全井交叉评测和共识子波优化；
 - 深度域 Step 5 用固定子波做全井时移扫描和深度平移 LAS 导出。
 
-Step 6（岩石物理分析）对两个域提供同一份 `forward_model_inputs.json`，消费的是 Step 3 的原始 MD LAS，不依赖 Step 4/5 的结果。
+旁路 岩石物理分析对两个域提供同一份 `forward_model_inputs.json`，消费的是 Step 3 的原始 MD LAS，不依赖 Step 4/5 的结果。

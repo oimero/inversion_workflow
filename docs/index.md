@@ -8,7 +8,7 @@ flowchart TB
     end
 
     prod --> FO["旁路 · forward_observability"]
-    S3 --> S6["06 · rock_physics_analysis"]
+    S3 --> RP["旁路 · rock_physics_analysis"]
 
     S1 -.-> S7["07 · real_field_lfm"]
     S4 -.-> S7
@@ -30,7 +30,7 @@ flowchart TB
 |------|---------|
 | 01–05 + well_trajectory | `experiments/common/common.yaml` |
 | 旁路 · forward_observability | `experiments/common/common.yaml` |
-| 06 · rock_physics_analysis | `experiments/common/common.yaml` |
+| 旁路 · rock_physics_analysis | `experiments/common/common.yaml` |
 | 旁路 · synthoseis_lite | `experiments/synthoseis_lite/synthoseis_lite.yaml` |
 | 旁路 · ginn_v2 | `experiments/ginn_v2/train.yaml` |
 | 07 · real_field_lfm | `experiments/common/common.yaml` |

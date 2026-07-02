@@ -1846,7 +1846,13 @@ def main() -> None:
     ]
     pd.DataFrame.from_records(anchor_rows, columns=anchor_report_columns).to_csv(anchor_report_path, index=False)
 
+    successful_tie_count = int((metrics_df["tie_status"] == "success").sum()) if not metrics_df.empty else 0
     run_summary = {
+        "schema_version": "well_auto_tie_v2",
+        "status": "success" if successful_tie_count > 0 else "failed",
+        "sample_domain": "time",
+        "sample_unit": "s",
+        "depth_basis": None,
         "script": "well_auto_tie.py",
         "config_file": repo_relative_path(args.config, root=REPO_ROOT),
         "inputs": {
@@ -1873,7 +1879,7 @@ def main() -> None:
         "route_status_counts": _series_value_counts(plan_df["route_status"]),
         "tie_status_counts": _series_value_counts(metrics_df["tie_status"]) if "tie_status" in metrics_df.columns else {},
         "planned_run_count": int(len(planned_to_run)),
-        "successful_tie_count": int((metrics_df["tie_status"] == "success").sum()) if not metrics_df.empty else 0,
+        "successful_tie_count": successful_tie_count,
         "wavelet_count": int(len(wavelet_df)),
         "anchor_report_count": int(len(anchor_rows)),
         "result_extras": result_extras,

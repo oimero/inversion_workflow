@@ -1233,8 +1233,13 @@ def main() -> None:
     ok_count = int((metrics_df["status"] == "ok").sum()) if "status" in metrics_df.columns else 0
     failed_count = int((metrics_df["status"] != "ok").sum()) if "status" in metrics_df.columns else len(metrics_df)
     summary_payload = {
+        "schema_version": "wavelet_batch_synthetic_depth_v2",
         "script": "wavelet_batch_synthetic_depth.py",
-        "status": "success" if failed_count == 0 else "failed",
+        "status": "success" if ok_count > 0 else "failed",
+        "completion_status": "complete" if failed_count == 0 else "partial" if ok_count > 0 else "failed",
+        "sample_domain": "depth",
+        "sample_unit": "m",
+        "depth_basis": "tvdss",
         "output_dir": repo_relative_path(output_dir, root=REPO_ROOT),
         "inputs": {
             "config": repo_relative_path(args.config, root=REPO_ROOT) if args.config.exists() else str(args.config),

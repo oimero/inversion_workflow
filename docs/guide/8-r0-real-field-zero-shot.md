@@ -16,7 +16,7 @@ python scripts/real_field_zero_shot.py --stitch-strategy center_crop
 python scripts/real_field_zero_shot.py --output-dir scripts/output/real_field_zero_shot_test
 ```
 
-不带参数时，脚本自动发现最新的第七步产物和全局子波，读取 `models` 列表中的每个模型依次推理，在 `scripts/output/real_field_zero_shot_<timestamp>/` 下写出结果。
+脚本会发现全局子波，但不会自动选择 LFM。调用者必须显式绑定一个已发布的 Step 7 variant 及其 Step 6 WellControlSet，再读取 `models` 列表中的每个模型依次推理。
 
 `--stitch-strategy` 控制大体积分块推理后如何拼接重叠区域：`uniform` 用等权平均，`center_crop` 只用块中心的无边界效应区域。默认使用 `uniform`。
 
@@ -26,8 +26,9 @@ python scripts/real_field_zero_shot.py --output-dir scripts/output/real_field_ze
 
 | 来源 | 文件 | 用途 |
 |------|------|------|
-| 第七步 | `real_field_lfm.npz` | 低频模型，作为推理的结构性输入 |
-| 第七步 | `real_field_lfm_summary.json` | 第七步状态和来源校验 |
+| 第七步 | `lfm_run_summary.json` / `variant_manifest.csv` | 成功 run、显式 variant 和哈希来源 |
+| 第七步 | `variants/<variant_id>/lfm.npz` | 所选低频模型，作为推理的结构性输入 |
+| 第六步 | `run_summary.json` / `well_control_manifest.csv` | 与 variant 哈希链一致的 canonical 井控 |
 | 第五步 | `selected_wavelet.csv` | 全局子波，作为标准化参数之一 |
 | 旁路 | 模型 checkpoint + `model_run_manifest.json` | 冻结的模型权重和标准化参数 |
 | 旁路 | `input_reference_stats.json` | 地震数据值域变换的参考统计量 |
@@ -62,9 +63,11 @@ real_field_zero_shot:
   diagnostic_max_hz: 80.0         # 默认 80.0
 
   real_field_inputs:
+    lfm_run_dir: scripts/output/real_field_lfm_<timestamp>
+    variant_id: <descriptive-variant-id>
+    well_control_run_dir: scripts/output/real_field_well_controls_<timestamp>
     seismic_value_transform: identity    # 默认 identity；常见 p99_abs_matched
-    lfm_value_transform: identity        # 默认 identity
-    # lfm_file 缺失时自动发现第七步最新产物
+    lfm_value_transform: identity        # v2 log(AI) 固定 identity
 
   boundary:
     loss_or_eval_erosion_s: 0.0          # 默认 0.0
@@ -97,8 +100,9 @@ real_field_zero_shot:
 ### `real_field_inputs`
 
 - `seismic_value_transform`：地震数据值域变换方式。默认 `identity`。若设为 `p99_abs_matched` 等非 identity 值，需要模型的 `input_reference_stats.json`——脚本自动从第一个模型目录中读取。
-- `lfm_value_transform`：低频模型值域变换，默认 `identity`。
-- `lfm_file`：不填时自动发现第七步最新产物。
+- `lfm_run_dir` / `variant_id` / `well_control_run_dir`：三者均必填且禁止 `auto`；R0 会校验 manifest、LFM 和井控 run 的 SHA-256 链。
+- `lfm_value_transform`：固定 `identity`；v2 主数组已经是 log(AI)。
+- `lfm_file` 和外部 `target_mask_file` 已退役；mask 只能来自所选 variant。
 
 ### `volume`
 
@@ -186,7 +190,7 @@ real_field_zero_shot:
 
 ### 第一阶段：加载输入
 
-1. 读取第七步的低频模型 `real_field_lfm.npz`。
+1. 从成功发布的 `variant_manifest.csv` 解析显式 `variant_id`，读取对应 `variants/<variant_id>/lfm.npz` 并校验 Step 6/7 哈希链。
 2. 按 `mode` 决定是加载整个地震体（体积模式）还是单个剖面（剖面模式）。
 3. 应用 `seismic_value_transform`，把原始地震振幅变换到模型训练时的值域。
 4. 从每个模型目录加载 checkpoint 权重和标准化参数。
@@ -307,12 +311,12 @@ Status: needs_forward_diagnostic
 
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
-| `real_field_lfm.npz` 找不到 | 第七步产物缺失或不符合格式 | 确认第七步已成功运行，或者显式指定 `lfm_file` |
+| variant 不存在或 hash 不一致 | Step 7 未完整发布、文件被修改，或 Step 6/7 配错 | 检查 `variant_manifest.csv` 并显式绑定同一 WellControlSet |
 | `input_reference_stats.json` 缺失 | 模型训练时未生成参考统计文件 | 用当前版 `ginn_v2.py train` 重新训练一次 |
 | `model_run_manifest.json` 缺少 `synthetic_gate_evidence` | 模型未通过合成基准闸门 | 运行 `ginn_v2.py stamp-gate` 为模型盖章 |
 | `input_distribution_ood` 告警 | 真实地震数据分布显著偏离训练分布 | 检查 `seismic_value_transform` 是否正确；考虑是否需要重新训练以匹配真实数据分布 |
 | 剖面模式下 `sections_file` 包含多个剖面 | R0 剖面模式只支持单个剖面 | 只保留一个剖面定义，或改用体积模式 |
-| `well_qc.well_auto_tie_dir` 缺失 | 剖面模式下井 QC 需要显式指定第四步目录 | 在配置中填写，或让脚本自动发现 |
+| WellControlSet 不匹配 | 剖面井 QC 使用的 Step 6 run 与 variant 不同 | 修正 `well_control_run_dir`；不得回退读取 Step 4 |
 
 ---
 

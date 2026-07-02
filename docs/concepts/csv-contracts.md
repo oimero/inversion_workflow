@@ -452,73 +452,42 @@ HDF5 文件，每个 sample 为一个 group，包含 `model_target_log_ai`、
 | `file` | 本文件路径 |
 | `sha256` | 本文件 SHA-256 |
 
+## 06 · real_field_well_controls.py
+
+Step 6 schema 固定为 `real_field_well_controls_v2`，只保存 canonical 井控事实。
+
+### `well_control_manifest.csv`
+
+一行一口候选井。核心字段为 `well_name/status/reason/source_run_type`、source summary/LAS/transform 的路径与 SHA-256、domain/unit/depth basis、井型、sampling mode、有效样点统计和井 NPZ 路径/hash。失败井保留行但没有可消费 NPZ。
+
+### `wells/<well_name>.npz`
+
+固定键为 `samples/log_ai/inline/xline/x_m/y_m/valid_mask/metadata_json`。无效样点的值和位置均为 NaN；禁止出现 LFM、delta、`valid_for_fit` 或 cluster。
+
 ## 07 · real_field_lfm.py
 
-第七步产物供第八步 R0 消费。schema 为 `real_field_lfm_v1`。
+Step 7 run schema 为 `real_field_lfm_run_v2`，variant schema 为 `real_field_lfm_variant_v2`。
 
-### `real_field_lfm.npz`
+### `variant_manifest.csv`
 
-消费者：`real_field_zero_shot.py`
+一行一 variant，记录 `variant_id`、baseline method、modifier chain、状态，以及主 NPZ、sidecar、summary 的路径和 SHA-256。不存在隐式 primary。
+
+### `variants/<variant_id>/lfm.npz`
+
+消费者：`real_field_zero_shot.py`。
 
 | 数组 | 含义 |
 |------|------|
-| `log_ai` | 三维 `log(AI)` 低频模型，shape `[n_inline, n_xline, n_twt]` |
-| `valid_mask_model` | 目标层内且有效处为 true，R0 的权威有效边界 |
-| `lfm_support_mask` | 离控制井足够近处为 true，仅用于空间外推风险 QC |
-| `distance_to_control` | 每个网格点到最近控制井的距离，仅作 QC |
-| `a_field` | 趋势截距参数场，shape `[n_inline, n_xline]` |
-| `b_field` | 趋势斜率参数场，shape `[n_inline, n_xline]` |
-| `ilines` / `xlines` / `samples` | 坐标轴 |
-| `metadata_json` | schema 版本、值域、层位名、来源路径、地震体 SHA-256 |
+| `log_ai` | 规范 log(AI) variant；volume/window 为 `[n_inline,n_xline,n_sample]`，section 为 `[n_trace,n_sample]` |
+| `valid_mask_model` | run 内所有 variant 逐点相同的权威有效掩码 |
+| `ilines` / `xlines` / `samples` | 显式真实线号与采样轴；xline 步长不得推断为 1 |
+| `metadata_json` | domain、unit、depth basis、baseline/modifier、Step 6/地震/层位和 sidecar hash 链 |
 
-重建公式：`log_ai = a_field + b_field * (2*u - 1)`，其中 `u` 是顶底层位间的归一化坐标。
+主 NPZ 不包含 a/b、kriging variance 或 framework probability。它们分别写入 `method_fields.npz`、可选 `modifier_fields.npz` 和 `qc/*.csv`。
 
-### `well_trend_controls.csv`
+### `lfm_run_summary.json`
 
-每口井的趋势拟合结果，一行一井。
-
-| 关键字段 | 含义 |
-|----------|------|
-| `well_name` | 井名 |
-| `a` / `b` | Huber 回归拟合的趋势系数 |
-| `representative_x_m` / `representative_y_m` | 代表位置的真实 XY 坐标 |
-| `representative_inline` / `representative_xline` | 代表位置的 inline/xline |
-| `n_fit_samples` | 目标窗内有效 TWT 样点数 |
-| `residual_rms` | 趋势拟合的残差 RMS |
-| `status` | `ok` 或拒绝原因 |
-
-### `parameter_field_qc.csv`
-
-a/b 参数场的空间建模 QC，两行（一行 a、一行 b）。
-
-| 关键字段 | 含义 |
-|----------|------|
-| `parameter` | `a` 或 `b` |
-| `n_controls` | 参与克里金的控制井数 |
-| `range_hint_m` | 从最近邻距离中位数估计的 range hint |
-| `variance_p50` / `variance_p95` | 克里金方差的分位数 |
-| `distance_to_control_p50_m` / `distance_to_control_p95_m` | 离最近控制井距离的分位数 |
-| `outside_control_hull_fraction` | 网格在控制点凸包外的比例 |
-| `variogram` / `nugget` | 变差函数模型和块金值 |
-
-### `internal_horizon_continuity_qc.csv`
-
-逐中间层位检查 LFM 在层位上下样点间是否存在非物理跃变。
-
-### `horizon_qc.csv`
-
-层位有效率、厚度统计、交叉道数、超出 TDT 支持的井数。
-
-### `real_field_lfm_summary.json`
-
-| 关键字段 | 含义 |
-|----------|------|
-| `schema_version` | 固定 `real_field_lfm_v1` |
-| `status` | `ok` / `warning` / `insufficient_control_wells` |
-| `control_wells` | 接受/拒绝/总数 |
-| `lfm_stats` | 时间差分 RMS、每道时间标准差、横向标准差等 |
-| `source_runs` | 上游第四步和第一步来源路径 |
-| `outputs` | 所有输出文件路径 |
+记录完整解析配置、请求的 variant/comparison、Step 6/地震/层位哈希、输出几何和产物清单。只有所有请求均成功并发布 manifest 后，`status` 才能为 `ok`。
 
 ## 08 R0 · real_field_zero_shot.py
 
@@ -655,17 +624,18 @@ TWT 轴均为 N 点，不再丢弃首样点。v1 的 N−1 诊断产物不兼容
 
 ### `real_delta_well_samples.csv`
 
-当普通 GINN-v2 实验配置 `train.real_delta` 时生成。每行一个井轨迹 TWT 样点；
-`well_delta` 不落冗余列，由 `filtered_log_ai - lfm_log_ai` 唯一派生。
+当普通 GINN-v2 实验配置 `train.real_delta` 时生成，schema 为 `real_delta_well_samples_v2`。每行一个 canonical 井轨迹样点；该文件必须针对一次显式 LFM variant 单独生成。
 
 | 关键字段 | 含义 |
 |----------|------|
-| `well_name` / `sample_index` / `twt_s` | 井名、井内样点序号和 TWT 秒轴 |
+| `well_name` / `sample_index` / `sample` | 井名、井内样点序号和显式采样坐标 |
+| `sample_domain` / `sample_unit` | `time+s` 或 `depth+m` |
 | `inline` / `xline` / `x_m` / `y_m` | 三维轨迹采样位置 |
 | `spatial_cluster_id` / `spatial_cluster_size` | 600 m 半径连通空间簇 |
-| `filtered_log_ai` / `lfm_log_ai` | 真实井目标与第七步 LFM，均为 log(AI) |
+| `well_log_ai` / `lfm_log_ai` / `target_delta` | canonical 井目标、所选 variant 和二者之差，均在 log(AI) 域 |
 | `valid_for_fit` / `valid_reason` | 样点是否满足真实井监督与 QC 的数据条件及唯一原因码 |
 | `sampling_mode` / `sample_method` / `wellbore_class` | 三维采样与井型审计字段 |
+| `variant_id` / `lfm_sha256` / `well_control_run_sha256` | 禁止跨 variant 共用 label 的哈希身份 |
 | `supervision_role` | `training` / `held_out` / `same_cluster_excluded` |
 | `used_for_real_delta_training` / `exclusion_reason` | 是否可进入真实井损失及排除原因 |
 

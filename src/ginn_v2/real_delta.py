@@ -14,8 +14,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from cup.config.sources import load_summary
 from cup.physics.numpy_backend import forward_time
+from cup.seismic.lfm.artifacts import resolve_lfm_variant
 from cup.seismic.viz import plot_well_waveform_qc, waveform_qc_metrics
 from cup.utils.io import repo_relative_path, resolve_relative_path, sha256_file
 from cup.well.anchor import build_well_anchor_samples, sample_volume_trilinear
@@ -31,12 +31,14 @@ from wtie.processing import grid
 
 @dataclass(frozen=True)
 class RealDeltaSources:
-    lfm_dir: Path
+    lfm_run_dir: Path
+    variant_id: str
     lfm_path: Path
-    lfm_summary_path: Path
-    lfm_summary: dict[str, Any]
-    well_auto_tie_dir: Path
-    well_inventory_file: Path
+    lfm_run_summary_path: Path
+    lfm_run_summary: dict[str, Any]
+    lfm_sha256: str
+    well_control_run_dir: Path
+    well_control_run_sha256: str
     seismic_path: Path
 
 
@@ -271,7 +273,7 @@ class DifferentiableWellPredictor:
         set[tuple[int, int]],
     ]:
         axes = (self.volume.ilines, self.volume.xlines, self.volume.twt_s)
-        columns = ("inline", "xline", "twt_s")
+        columns = ("inline", "xline", "sample")
         fractional = []
         for axis, column in zip(axes, columns):
             values = pd.to_numeric(rows[column], errors="coerce").to_numpy(dtype=np.float64)
@@ -580,7 +582,7 @@ class RealDeltaSupport:
         n_samples = 0
         for rows, prediction in zip(groups, predictions):
             target = (
-                rows["filtered_log_ai"].to_numpy(dtype=np.float32)
+                rows["well_log_ai"].to_numpy(dtype=np.float32)
                 - rows["lfm_log_ai"].to_numpy(dtype=np.float32)
                 - mean
             ) / std
@@ -674,16 +676,19 @@ def prepare_real_delta_support(
     cfg = _validate_config(config)
     cfg["lambda_real_delta"] = float(lambda_real_delta)
     sources = _resolve_sources(cfg, repo_root=repo_root)
-    logger.info("real-delta source: %s", sources.lfm_dir)
+    logger.info("real-delta source: %s variant=%s", sources.lfm_run_dir, sources.variant_id)
     with input_reference_stats_path.open("r", encoding="utf-8") as handle:
         input_stats = json.load(handle)
-    seismic_suffix = sources.seismic_path.suffix.casefold()
-    seismic_type = "segy" if seismic_suffix in {".sgy", ".segy"} else seismic_suffix.lstrip(".")
+    seismic_type = str(dict(sources.lfm_run_summary.get("seismic") or {}).get("type") or "").casefold()
+    if seismic_type not in {"segy", "zgy"}:
+        raise ValueError(f"Unified LFM run has unsupported seismic type: {seismic_type!r}")
     real_cfg = {
         "real_field_inputs": {
-            "lfm_file": repo_relative_path(sources.lfm_path, root=repo_root),
+            "lfm_run_dir": repo_relative_path(sources.lfm_run_dir, root=repo_root),
+            "variant_id": sources.variant_id,
+            "well_control_run_dir": repo_relative_path(sources.well_control_run_dir, root=repo_root),
             "seismic_file": repo_relative_path(sources.seismic_path, root=repo_root),
-            "seismic_type": seismic_type or "zgy",
+            "seismic_type": seismic_type,
             "seismic_value_transform": cfg["seismic_value_transform"],
             "lfm_value_transform": cfg["lfm_value_transform"],
             "seismic_reference_stats": dict(input_stats["stats"]),
@@ -702,16 +707,18 @@ def prepare_real_delta_support(
         data_root=repo_root,
     )
     logger.info("real-delta: building well labels")
-    samples, _metadata = build_well_anchor_samples(
-        well_auto_tie_dir=sources.well_auto_tie_dir,
-        well_inventory_file=sources.well_inventory_file,
+    samples, label_metadata = build_well_anchor_samples(
+        well_control_run_dir=sources.well_control_run_dir,
         lfm=volume.lfm,
         valid_mask=volume.valid_mask,
         ilines=volume.ilines,
         xlines=volume.xlines,
-        twt_s=volume.twt_s,
+        samples=volume.twt_s,
         repo_root=repo_root,
         cluster_radius_m=float(cfg["cluster_radius_m"]),
+        variant_id=sources.variant_id,
+        lfm_sha256=sources.lfm_sha256,
+        expected_well_control_run_sha256=sources.well_control_run_sha256,
     )
     valid = samples[samples["valid_for_fit"].astype(bool)].copy()
     if valid.empty:
@@ -744,6 +751,7 @@ def prepare_real_delta_support(
     samples_path = output_dir / "real_delta_well_samples.csv"
     samples.to_csv(samples_path, index=False)
     cfg["samples_path"] = str(samples_path)
+    cfg["label_metadata"] = label_metadata
     predictor = DifferentiableWellPredictor(
         volume=volume,
         patch_spec=patch_spec,
@@ -832,8 +840,16 @@ def assign_supervision_roles(
 
 def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
     cfg = dict(config)
+    retired = sorted({"lfm_file", "well_auto_tie_dir", "well_inventory_file"} & set(cfg))
+    if retired:
+        raise ValueError(
+            f"train.real_delta contains retired v1 source keys {retired}; "
+            "use lfm_run_dir + variant_id + well_control_run_dir."
+        )
     required = {
-        "real_field_lfm_dir",
+        "lfm_run_dir",
+        "variant_id",
+        "well_control_run_dir",
         "held_out_well",
         "exclude_same_cluster",
         "clusters_per_step",
@@ -849,6 +865,13 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not str(cfg["held_out_well"]).strip():
         raise ValueError("train.real_delta.held_out_well must be non-empty.")
     cfg["held_out_well"] = str(cfg["held_out_well"]).strip()
+    for key in ("lfm_run_dir", "variant_id", "well_control_run_dir"):
+        value = str(cfg[key]).strip()
+        if not value or value.casefold() == "auto":
+            raise ValueError(f"train.real_delta.{key} must be explicit and non-auto.")
+        cfg[key] = value
+    if str(cfg["lfm_value_transform"]).casefold() not in {"identity", "none"}:
+        raise ValueError("train.real_delta.lfm_value_transform must be identity for unified LFM v2.")
     if not isinstance(cfg["exclude_same_cluster"], bool):
         raise ValueError("train.real_delta.exclude_same_cluster must be a YAML boolean.")
     if int(cfg["clusters_per_step"]) <= 0:
@@ -869,77 +892,30 @@ def _resolve_sources(
     *,
     repo_root: Path,
 ) -> RealDeltaSources:
-    lfm_dir = _resolve_lfm_dir(config["real_field_lfm_dir"], repo_root=repo_root)
-    summary_path = lfm_dir / "real_field_lfm_summary.json"
-    summary = load_summary(
-        summary_path,
-        schema_version="real_field_lfm_v1",
-        allowed_status={"ok"},
-        label="real_field_lfm_summary.json",
-    )
-    lfm_path = lfm_dir / "real_field_lfm.npz"
-    inputs = dict(summary["inputs"])
-    source_runs = dict(summary["source_runs"])
-    well_auto_tie_dir = resolve_relative_path(
-        str(source_runs["well_auto_tie_dir"]),
-        root=repo_root,
-    )
-    well_inventory_file = resolve_relative_path(
-        str(inputs["well_inventory_file"]),
-        root=repo_root,
-    )
-    seismic_path = resolve_relative_path(str(inputs["seismic_file"]), root=repo_root)
-    expected_seismic_hash = str(inputs["seismic_sha256"])
+    selected = resolve_lfm_variant(config, repo_root=repo_root)
+    seismic = dict(selected.run_summary.get("seismic") or {})
+    seismic_path = resolve_relative_path(str(seismic.get("path") or ""), root=repo_root)
+    expected_seismic_hash = str(seismic.get("sha256") or "")
     if sha256_file(seismic_path) != expected_seismic_hash:
         raise ValueError("Step 7 seismic SHA-256 mismatch.")
     for path in (
-        lfm_path,
-        well_auto_tie_dir / "well_tie_metrics.csv",
-        well_inventory_file,
+        selected.lfm_path,
+        selected.well_control_run_dir / "well_control_manifest.csv",
         seismic_path,
     ):
         if not path.is_file():
             raise FileNotFoundError(path)
     return RealDeltaSources(
-        lfm_dir=lfm_dir,
-        lfm_path=lfm_path,
-        lfm_summary_path=summary_path,
-        lfm_summary=summary,
-        well_auto_tie_dir=well_auto_tie_dir,
-        well_inventory_file=well_inventory_file,
+        lfm_run_dir=selected.run_dir,
+        variant_id=selected.variant_id,
+        lfm_path=selected.lfm_path,
+        lfm_run_summary_path=selected.run_summary_path,
+        lfm_run_summary=dict(selected.run_summary),
+        lfm_sha256=selected.lfm_sha256,
+        well_control_run_dir=selected.well_control_run_dir,
+        well_control_run_sha256=selected.well_control_run_sha256,
         seismic_path=seismic_path,
     )
-
-
-def _resolve_lfm_dir(value: Any, *, repo_root: Path) -> Path:
-    text = str(value).strip()
-    if text.casefold() != "auto":
-        return resolve_relative_path(text, root=repo_root)
-    output_root = repo_root / "scripts" / "output"
-    candidates: list[Path] = []
-    for path in output_root.glob("real_field_lfm_*"):
-        if not path.is_dir():
-            continue
-        summary_path = path / "real_field_lfm_summary.json"
-        lfm_path = path / "real_field_lfm.npz"
-        if not summary_path.is_file() or not lfm_path.is_file():
-            continue
-        try:
-            with summary_path.open("r", encoding="utf-8") as handle:
-                summary = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            continue
-        if (
-            str(summary.get("schema_version") or "") == "real_field_lfm_v1"
-            and str(summary.get("status") or "") == "ok"
-        ):
-            candidates.append(path)
-    if not candidates:
-        raise FileNotFoundError(
-            "No successful real_field_lfm_* run with summary and real_field_lfm.npz "
-            f"was found under {output_root}."
-        )
-    return sorted(candidates, key=lambda path: (path.stat().st_mtime, path.name))[-1]
 
 
 def _source_summary(
@@ -949,9 +925,9 @@ def _source_summary(
 ) -> dict[str, Any]:
     paths = {
         "lfm": sources.lfm_path,
-        "lfm_summary": sources.lfm_summary_path,
-        "well_tie_metrics": sources.well_auto_tie_dir / "well_tie_metrics.csv",
-        "well_inventory": sources.well_inventory_file,
+        "lfm_run_summary": sources.lfm_run_summary_path,
+        "well_control_summary": sources.well_control_run_dir / "run_summary.json",
+        "well_control_manifest": sources.well_control_run_dir / "well_control_manifest.csv",
         "seismic": sources.seismic_path,
     }
     return {
@@ -983,9 +959,6 @@ def evaluate_real_wells(
         root=repo_root,
     )
     wavelet_time_s, wavelet, _wavelet_metadata = load_selected_wavelet(wavelet_dir)
-    tie_metrics = pd.read_csv(
-        support.sources.well_auto_tie_dir / "well_tie_metrics.csv"
-    ).set_index("well_name", drop=False)
     groups = [
         group.sort_values("sample_index").copy()
         for _, group in support.samples.groupby("well_name", sort=True)
@@ -1014,11 +987,11 @@ def evaluate_real_wells(
             well_name = str(well["well_name"].iloc[0])
             cluster = int(well["spatial_cluster_id"].iloc[0])
             pred_delta = prediction_n.detach().cpu().numpy() * delta_std + delta_mean
-            target_ai = well["filtered_log_ai"].to_numpy(dtype=np.float64)
+            target_ai = well["well_log_ai"].to_numpy(dtype=np.float64)
             lfm_ai = well["lfm_log_ai"].to_numpy(dtype=np.float64)
             target_delta = target_ai - lfm_ai
             pred_ai = lfm_ai + pred_delta
-            twt = well["twt_s"].to_numpy(dtype=np.float64)
+            twt = well["sample"].to_numpy(dtype=np.float64)
             common = {
                 "checkpoint": checkpoint_name,
                 "well_name": well_name,
@@ -1068,7 +1041,7 @@ def evaluate_real_wells(
                 volume=support.volume,
                 wavelet_time_s=wavelet_time_s,
                 wavelet=wavelet,
-                tie=tie_metrics.loc[well_name],
+                tie={},
                 repo_root=repo_root,
             )
             waveform_rows.append(
@@ -1305,7 +1278,7 @@ def _write_well_figures(
 ) -> tuple[dict[str, str], str, dict[str, float | int]]:
     figures_dir = output_dir / "figures" / "wells" / str(cluster)
     figures_dir.mkdir(parents=True, exist_ok=True)
-    twt = well["twt_s"].to_numpy(dtype=np.float64)
+    twt = well["sample"].to_numpy(dtype=np.float64)
     pred_ai = lfm_ai + pred_delta
     target_delta = target_ai - lfm_ai
     ai_path = figures_dir / f"{well_name}_{checkpoint_name}_ai_delta_qc.png"
@@ -1317,7 +1290,7 @@ def _write_well_figures(
         constrained_layout=True,
     )
     for values, label, color in (
-        (target_ai, "Filtered logAI", "black"),
+        (target_ai, "Canonical well logAI", "black"),
         (lfm_ai, "LFM", "tab:blue"),
         (pred_ai, f"{checkpoint_name} prediction", "tab:red"),
     ):
@@ -1348,7 +1321,7 @@ def _write_well_figures(
             f"cluster {cluster} | {checkpoint_name}"
         ),
         pred_log_ai=pred_ai,
-        filtered_log_ai=target_ai,
+        well_log_ai=target_ai,
         twt=twt,
         well=well,
         volume=volume,
@@ -1375,7 +1348,7 @@ def _write_forward_figure(
     path: Path,
     title: str,
     pred_log_ai: np.ndarray,
-    filtered_log_ai: np.ndarray,
+    well_log_ai: np.ndarray,
     twt: np.ndarray,
     well: pd.DataFrame,
     volume: RealFieldVolume,
@@ -1414,7 +1387,7 @@ def _write_forward_figure(
     basis = twt[sample_slice]
     pred_ai = grid.Log(np.exp(filled[sample_slice]), basis, "twt", name="Predicted AI")
     filtered_ai = grid.Log(
-        np.exp(_fill_nonfinite(filtered_log_ai)[sample_slice]),
+        np.exp(_fill_nonfinite(well_log_ai)[sample_slice]),
         basis,
         "twt",
         name="Filtered LAS AI",

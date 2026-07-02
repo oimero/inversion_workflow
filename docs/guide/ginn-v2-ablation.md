@@ -99,8 +99,9 @@ train:
 
   # anchor 和 QC-enabled control 均应保留此段
   real_delta:
-    # auto 选择最新的第七步 real_field_lfm 成功产物
-    real_field_lfm_dir: auto
+    lfm_run_dir: scripts/output/real_field_lfm_<timestamp>
+    variant_id: <descriptive-variant-id>
+    well_control_run_dir: scripts/output/real_field_well_controls_<timestamp>
     held_out_well: PH5
     exclude_same_cluster: false
     clusters_per_step: 4
@@ -331,7 +332,7 @@ total_loss = synthetic_mse
 
 **`lambda_physics`**：非零时在 base 样本上施加 Robinson 正演一致性损失。对模型预测的 log AI 做反射系数正演，与观测地震比较 MSE。目前只支持 `patch_2d_with_physics_loss` 和 `trace_1d_dilated_tcn_mismatch_training` 两个 model_id。
 
-**`lambda_real_delta`**：非零时在每个 training step 中额外采样真实井的 `filtered_log_ai - lfm_log_ai` 的 normalized-delta MSE。权重大于 0 时必须配置 `train.real_delta` 段，且当前只支持 `no_lateral` 角色。设为 0.0 但保留 `real_delta` 段时，不参与训练但仍生成 best/final 全井 QC（QC-enabled control）。
+**`lambda_real_delta`**：非零时在每个 training step 中额外采样显式 variant 的 `well_log_ai - lfm_log_ai` normalized-delta MSE。权重大于 0 时必须配置 `train.real_delta` 段，且当前只支持 `no_lateral` 角色。设为 0.0 但保留 `real_delta` 段时，不参与训练但仍生成 best/final 全井 QC（QC-enabled control）。
 
 校验 loss（用于选择 best checkpoint）始终只用 pure synthetic validation MSE，不受 `lambda_physics` 或 `lambda_real_delta` 影响。
 
@@ -343,7 +344,9 @@ total_loss = synthetic_mse
 
 ```yaml
   real_delta:
-    real_field_lfm_dir: auto
+    lfm_run_dir: scripts/output/real_field_lfm_<timestamp>
+    variant_id: <descriptive-variant-id>
+    well_control_run_dir: scripts/output/real_field_well_controls_<timestamp>
     held_out_well: PH5
     exclude_same_cluster: false
     clusters_per_step: 4
@@ -354,14 +357,9 @@ total_loss = synthetic_mse
     lfm_value_transform: identity
 ```
 
-#### `real_field_lfm_dir`
+#### `lfm_run_dir` / `variant_id` / `well_control_run_dir`
 
-指向第七步 `real_field_lfm` 的输出目录，或设为 `auto` 自动选择。`auto` 行为：在 `scripts/output/real_field_lfm_*` 下搜索同时满足以下条件的目录：
-- `real_field_lfm_summary.json` 的 `schema_version` 为 `real_field_lfm_v1`
-- `status` 为 `ok`
-- `real_field_lfm.npz` 文件存在
-
-选择修改时间最新的一个。解析后校验 `real_field_lfm_summary.json` 中记录的地震体 SHA-256 与实际文件一致。解析后的路径和来源哈希冻结进 manifest 的 `real_delta.sources`。
+三者必须显式提供，不接受 `auto`。解析时依次校验成功的 `real_field_lfm_run_v2`、`variant_manifest.csv`、所选 `real_field_lfm_variant_v2` 主 NPZ，以及它记录的 Step 6 `run_summary.json` SHA-256。解析后的 variant 和来源哈希冻结进 manifest 的 `real_delta.sources`。
 
 #### 井监督分配
 
@@ -391,7 +389,7 @@ total_loss = synthetic_mse
 3. 簇内所有井被均匀轮换后才重新洗牌
 4. 所有随机流从 `seed + 1_000_003` 确定性派生
 
-每个选中井的 `filtered_log_ai - lfm_log_ai`（来自第四步滤波 LAS 和第七步 LFM 三线性插值）作为 normalized-delta 的 target。每口井的选择次数记录在 `real_delta_sampling_qc.csv` 中。
+每个选中井的 `well_log_ai - lfm_log_ai`（来自 Step 6 canonical 控制和所选 Step 7 variant 三线性插值）作为 normalized-delta target。每口井的选择次数记录在 `real_delta_sampling_qc.csv` 中；variant ID、LFM hash 和 WellControlSet hash 写入样点契约。
 
 #### 可微井预测器
 

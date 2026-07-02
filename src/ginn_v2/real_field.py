@@ -295,15 +295,18 @@ def load_real_field_section(
     data_root: Path,
 ) -> RealFieldSection:
     inputs = _mapping(config.get("real_field_inputs"), "real_field_zero_shot.real_field_inputs")
+    if str(inputs.get("target_mask_file") or "").strip():
+        raise ValueError("Unified LFM v2 does not accept an external target_mask_file.")
     section_cfg = _mapping(config.get("section"), "real_field_zero_shot.section")
-    lfm_path = resolve_relative_path(_required_text(inputs, "lfm_file"), root=root)
+    from cup.seismic.lfm.artifacts import resolve_lfm_variant
+
+    selected_variant = resolve_lfm_variant(inputs, repo_root=root)
+    lfm_path = selected_variant.lfm_path
+    sample_domain = str(selected_variant.variant_metadata.get("sample_domain") or "")
+    if sample_domain not in {"time", "depth"}:
+        raise ValueError(f"Unsupported selected LFM sample_domain={sample_domain!r}.")
     lfm_transform = str(inputs.get("lfm_value_transform") or "identity").casefold()
-    legacy_lfm_negative_control = bool(inputs.get("legacy_lfm_negative_control", False))
-    _validate_lfm_npz_contract(
-        lfm_path,
-        lfm_transform=lfm_transform,
-        legacy_lfm_negative_control=legacy_lfm_negative_control,
-    )
+    _validate_lfm_npz_contract(lfm_path, lfm_transform=lfm_transform, expected_variant_id=selected_variant.variant_id)
     lfm_values, ilines, xlines, twt_s = _load_npz_grid_section(
         lfm_path,
         section_cfg=section_cfg,
@@ -340,6 +343,7 @@ def load_real_field_section(
             sample_start=sample_start,
             sample_end=sample_end,
             seismic_options=dict(inputs.get("segy_options") or {}),
+            sample_domain=sample_domain,
         )
         seismic, lfm_values, twt_s = _align_time_arrays(seismic, seismic_twt, lfm_values, twt_s)
 
@@ -398,7 +402,12 @@ def load_real_field_section(
             "seismic_type": seismic_type,
             "target_mask_file": mask_path_text,
             "lfm_value_transform": lfm_transform,
-            "legacy_lfm_negative_control": legacy_lfm_negative_control,
+            "lfm_run_dir": str(selected_variant.run_dir),
+            "variant_id": selected_variant.variant_id,
+            "well_control_run_dir": str(selected_variant.well_control_run_dir),
+            "lfm_sha256": selected_variant.lfm_sha256,
+            "sample_domain": sample_domain,
+            "sample_unit": selected_variant.variant_metadata.get("sample_unit"),
             "seismic_value_transform": str(seismic_transform),
             "seismic_reference_stats_file": str(inputs.get("seismic_reference_stats_file") or ""),
             "seismic_reference_stats_sha256": str(inputs.get("seismic_reference_stats_sha256") or ""),
@@ -415,15 +424,18 @@ def load_real_field_volume(
     data_root: Path,
 ) -> RealFieldVolume:
     inputs = _mapping(config.get("real_field_inputs"), "real_field_zero_shot.real_field_inputs")
+    if str(inputs.get("target_mask_file") or "").strip():
+        raise ValueError("Unified LFM v2 does not accept an external target_mask_file.")
     volume_cfg = dict(config.get("volume") or {})
-    lfm_path = resolve_relative_path(_required_text(inputs, "lfm_file"), root=root)
+    from cup.seismic.lfm.artifacts import resolve_lfm_variant
+
+    selected_variant = resolve_lfm_variant(inputs, repo_root=root)
+    lfm_path = selected_variant.lfm_path
+    sample_domain = str(selected_variant.variant_metadata.get("sample_domain") or "")
+    if sample_domain not in {"time", "depth"}:
+        raise ValueError(f"Unsupported selected LFM sample_domain={sample_domain!r}.")
     lfm_transform = str(inputs.get("lfm_value_transform") or "identity").casefold()
-    legacy_lfm_negative_control = bool(inputs.get("legacy_lfm_negative_control", False))
-    _validate_lfm_npz_contract(
-        lfm_path,
-        lfm_transform=lfm_transform,
-        legacy_lfm_negative_control=legacy_lfm_negative_control,
-    )
+    _validate_lfm_npz_contract(lfm_path, lfm_transform=lfm_transform, expected_variant_id=selected_variant.variant_id)
     lfm_values, ilines, xlines, twt_s = _load_npz_grid_volume(
         lfm_path,
         volume_cfg=volume_cfg,
@@ -456,6 +468,7 @@ def load_real_field_volume(
             sample_start=float(twt_s[0]),
             sample_end=float(twt_s[-1]),
             seismic_options=dict(inputs.get("segy_options") or {}),
+            sample_domain=sample_domain,
         )
         seismic, lfm_values, twt_s = _align_volume_time_arrays(seismic, seismic_twt, lfm_values, twt_s)
 
@@ -514,7 +527,12 @@ def load_real_field_volume(
             "seismic_type": seismic_type,
             "target_mask_file": mask_path_text,
             "lfm_value_transform": lfm_transform,
-            "legacy_lfm_negative_control": legacy_lfm_negative_control,
+            "lfm_run_dir": str(selected_variant.run_dir),
+            "variant_id": selected_variant.variant_id,
+            "well_control_run_dir": str(selected_variant.well_control_run_dir),
+            "lfm_sha256": selected_variant.lfm_sha256,
+            "sample_domain": sample_domain,
+            "sample_unit": selected_variant.variant_metadata.get("sample_unit"),
             "seismic_value_transform": str(seismic_transform),
             "seismic_reference_stats_file": str(inputs.get("seismic_reference_stats_file") or ""),
             "seismic_reference_stats_sha256": str(inputs.get("seismic_reference_stats_sha256") or ""),
@@ -1020,30 +1038,22 @@ def _validate_lfm_npz_contract(
     path: Path,
     *,
     lfm_transform: str,
-    legacy_lfm_negative_control: bool,
+    expected_variant_id: str,
 ) -> None:
     with np.load(path, allow_pickle=False) as data:
         files = set(data.files)
-        if legacy_lfm_negative_control:
-            return
-        required = {"log_ai", "valid_mask_model", "ilines", "xlines"}
-        missing = sorted(required - files)
-        if missing:
-            raise ValueError(
-                f"R0 primary LFM must be real_field_lfm_v1 and is missing {missing}: {path}. "
-                "Set legacy_lfm_negative_control=true only for explicit historical negative controls."
-            )
-        if "samples" not in files and "twt_s" not in files:
-            raise ValueError(f"R0 primary LFM must provide samples/twt_s axis: {path}")
-        if str(lfm_transform) == "log":
-            raise ValueError(
-                "real_field_lfm_v1/log_ai is already in log(AI); use lfm_value_transform=identity."
-            )
+        required = {"log_ai", "valid_mask_model", "ilines", "xlines", "samples", "metadata_json"}
+        if files != required:
+            raise ValueError(f"R0 primary LFM must use the minimal real_field_lfm_variant_v2 keys {sorted(required)}: {path}")
+        if str(lfm_transform).casefold() not in {"identity", "none"}:
+            raise ValueError("real_field_lfm_variant_v2/log_ai is already log(AI); use identity transform.")
         if "metadata_json" not in files:
             raise ValueError(f"R0 primary LFM lacks metadata_json: {path}")
         metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
-    if str(metadata.get("schema_version")) != "real_field_lfm_v1":
+    if str(metadata.get("schema_version")) != "real_field_lfm_variant_v2":
         raise ValueError(f"Unsupported LFM schema_version={metadata.get('schema_version')!r}: {path}")
+    if str(metadata.get("variant_id")) != str(expected_variant_id):
+        raise ValueError(f"LFM variant_id mismatch: expected {expected_variant_id!r}, got {metadata.get('variant_id')!r}")
     if str(metadata.get("value_key")) != "log_ai":
         raise ValueError(f"LFM metadata value_key must be log_ai, got {metadata.get('value_key')!r}: {path}")
     if str(metadata.get("value_domain")) != "log(AI)":
@@ -1078,7 +1088,7 @@ def _load_npz_grid_section(
     section_cfg: Mapping[str, Any],
     value_keys: Sequence[str],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    data = np.load(path, allow_pickle=True)
+    data = np.load(path, allow_pickle=False)
     key = next((candidate for candidate in value_keys if candidate in data.files), None)
     if key is None:
         raise ValueError(f"{path} lacks any value key from {list(value_keys)}; found {data.files}")
@@ -1119,7 +1129,7 @@ def _load_npz_grid_volume(
     volume_cfg: Mapping[str, Any],
     value_keys: Sequence[str],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    with np.load(path, allow_pickle=True) as data:
+    with np.load(path, allow_pickle=False) as data:
         key = next((candidate for candidate in value_keys if candidate in data.files), None)
         if key is None:
             raise ValueError(f"{path} lacks any value key from {list(value_keys)}; found {data.files}")
@@ -1176,8 +1186,7 @@ def _validate_lfm_log_domain(
             "LFM values do not look like log(AI). "
             f"lfm_value_transform={lfm_transform!r}, p01={p01:.6g}, "
             f"median={median:.6g}, p99={p99:.6g}, path={path}. "
-            "Use lfm_value_transform=log only for linear positive AI inputs, "
-            "or provide real_field_lfm_v1/log_ai with identity."
+            "Unified LFM v2 requires real_field_lfm_variant_v2/log_ai with identity transform."
         )
 
 
@@ -1209,6 +1218,7 @@ def _load_survey_section(
     sample_start: float,
     sample_end: float,
     seismic_options: Mapping[str, Any],
+    sample_domain: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     options = segy_options_from_config(dict(seismic_options)) if seismic_type == "segy" else None
     survey = open_survey(path, seismic_type, segy_options=options)
@@ -1220,7 +1230,7 @@ def _load_survey_section(
         indices,
         sample_start=float(sample_start),
         sample_end=float(sample_end),
-        domain="time",
+        domain=sample_domain,
     )
     first_trace = traces[indices[0]]
     twt_s = np.asarray(first_trace.basis, dtype=np.float64)
@@ -1241,6 +1251,7 @@ def _load_survey_volume(
     sample_start: float,
     sample_end: float,
     seismic_options: Mapping[str, Any],
+    sample_domain: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     options = segy_options_from_config(dict(seismic_options)) if seismic_type == "segy" else None
     survey = open_survey(path, seismic_type, segy_options=options)
@@ -1254,7 +1265,7 @@ def _load_survey_volume(
             trace_keys,
             sample_start=float(sample_start),
             sample_end=float(sample_end),
-            domain="time",
+            domain=sample_domain,
         )
         if not traces:
             raise ValueError(f"No survey traces read for inline index {il_idx}.")

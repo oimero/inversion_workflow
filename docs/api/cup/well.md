@@ -17,3 +17,5 @@
 ::: cup.well.td
 
 ::: cup.well.trajectory
+
+::: cup.well.real_field_controls

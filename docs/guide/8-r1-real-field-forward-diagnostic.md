@@ -325,7 +325,7 @@ synthetic[l] = Σ_j wavelet(twt[l] - event_twt[j]) * r[j]
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
 | R0 摘要缺失或 schema 不匹配 | R0 输出不完整或版本不对 | 重新运行 R0，确认 `real_field_zero_shot_summary.json` 存在且状态为 `needs_forward_diagnostic` |
-| `well_qc.well_auto_tie_dir` 缺失 | 井 QC 启用但第四步目录未指定 | 在配置中显式填写，或确认脚本能从 R0 → LFM 链路中自动发现 |
+| `well_qc.well_auto_tie_dir` 缺失 | R1 的旧时间域井旁正演 QC 仍单独依赖 Step 4 | 显式填写 Step 4 目录；该诊断迁移不属于 LFM v2 实施范围 |
 | 所有井被 `skipped_outside_section_support` 跳过 | `max_xy_distance_m` 太小 | 增大距离阈值，或确认井坐标和推理网格的对齐关系 |
 | 正演合成振幅接近零 | 子波加载失败或预测波阻抗全为常数 | 检查子波文件和预测波阻抗的数值范围 |
 | `red_flag: real_input_seismic_ood` | 真实地震数据严重偏离训练分布 | 检查地震值域变换配置；可能需要在更接近真实工区分布的数据上重新训练 |

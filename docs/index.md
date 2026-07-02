@@ -10,10 +10,11 @@ flowchart TB
     prod --> FO["旁路 · forward_observability"]
     S3 --> RP["旁路 · rock_physics_analysis"]
 
-    S1 -.-> S7["07 · real_field_lfm"]
-    S4 -.-> S7
+    S1 -.-> S6["06 · real_field_well_controls"]
+    S4 -.-> S6
+    S6 --> S7["07 · real_field_lfm variants"]
 
-    S6 --> SL["旁路 · synthoseis_lite"]
+    S3 --> SL["旁路 · synthoseis_lite"]
     FO -.-> SL
     SL --> GV["旁路 · ginn_v2"]
 
@@ -33,7 +34,7 @@ flowchart TB
 | 旁路 · rock_physics_analysis | `experiments/common/common.yaml` |
 | 旁路 · synthoseis_lite | `experiments/synthoseis_lite/synthoseis_lite.yaml` |
 | 旁路 · ginn_v2 | `experiments/ginn_v2/train.yaml` |
-| 07 · real_field_lfm | `experiments/common/common.yaml` |
+| 06–07 · real_field_well_controls / real_field_lfm | 独立实验 YAML（引用 `experiments/common/common.yaml`） |
 | 08 R0 · real_field_zero_shot | `experiments/common/common.yaml` |
 | 08 R1 · real_field_forward_diagnostic | `experiments/common/common.yaml` |
 

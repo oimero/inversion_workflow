@@ -23,7 +23,10 @@ sys.path = [path for path in sys.path if path not in {repo_text, src_text}]
 sys.path.insert(0, repo_text)
 sys.path.insert(0, src_text)
 
-from cup.config.sources import load_summary, resolve_source_file_from_run, resolve_source_run
+from cup.config.sources import resolve_source_run
+from cup.seismic.lfm.artifacts import resolve_lfm_variant
+from cup.seismic.survey import open_survey, segy_options_from_config
+from cup.well.real_field_controls import load_well_control_set
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
 from cup.seismic.volume_export import export_volume_like_source, log_ai_to_ai_volume
 from ginn_v2.real_field import (
@@ -87,8 +90,13 @@ def _prepare_run_config(run_cfg: dict, cfg: dict) -> dict:
         raise ValueError("real_field_zero_shot.real_field_inputs seismic fields are retired; use top-level seismic.")
     inputs["seismic_file"] = str(seismic.get("file") or "")
     inputs["seismic_type"] = str(seismic.get("type") or "")
-    if seismic.get("segy_options"):
-        inputs["segy_options"] = dict(seismic["segy_options"])
+    segy_options = {
+        key: seismic[key]
+        for key in ("iline", "xline", "istep", "xstep", "iline_byte", "xline_byte")
+        if seismic.get(key) is not None
+    }
+    if segy_options:
+        inputs["segy_options"] = segy_options
     prepared["real_field_inputs"] = inputs
     if str(prepared.get("mode") or "volume").casefold() == "section":
         sections = _load_sections_file(prepared)
@@ -102,36 +110,38 @@ def _prepare_real_field_inputs(run_cfg: dict, workflow_cfg: dict) -> dict:
     prepared = dict(run_cfg)
     inputs = dict(prepared.get("real_field_inputs") or {})
     output_root = resolve_relative_path(workflow_cfg.get("output_root", "scripts/output"), root=REPO_ROOT)
-    if inputs.get("lfm_file"):
-        lfm_file = resolve_source_file_from_run(
-            inputs.get("lfm_file"),
-            output_root=output_root,
-            prefix="real_field_lfm",
-            file_name="real_field_lfm.npz",
-            root=REPO_ROOT,
-            label="real_field_lfm.npz",
-        )
-        load_summary(
-            lfm_file.parent / "real_field_lfm_summary.json",
-            schema_version="real_field_lfm_v1",
-            allowed_status={"ok", "warning"},
-            label="real_field_lfm_summary.json",
-        )
-    else:
-        lfm_file = resolve_source_file_from_run(
-            None,
-            output_root=output_root,
-            prefix="real_field_lfm",
-            file_name="real_field_lfm.npz",
-            root=REPO_ROOT,
-            label="real_field_lfm.npz",
-            run_required_files=["real_field_lfm.npz", "real_field_lfm_summary.json"],
-            summary_file="real_field_lfm_summary.json",
-            schema_version="real_field_lfm_v1",
-            allowed_status={"ok", "warning"},
-        )
-    inputs["lfm_file"] = repo_relative_path(lfm_file, root=REPO_ROOT)
+    if "lfm_file" in inputs:
+        raise ValueError("real_field_inputs.lfm_file is retired; select lfm_run_dir + variant_id + well_control_run_dir.")
+    selected = resolve_lfm_variant(inputs, repo_root=REPO_ROOT)
+    seismic = dict(workflow_cfg.get("seismic") or {})
+    selected_domain = str(selected.variant_metadata.get("sample_domain") or "")
+    selected_basis = selected.variant_metadata.get("depth_basis")
+    if str(seismic.get("domain") or "").casefold() != selected_domain:
+        raise ValueError("Selected LFM variant sample_domain does not match top-level seismic.domain.")
+    if seismic.get("depth_basis") != selected_basis:
+        raise ValueError("Selected LFM variant depth_basis does not match top-level seismic.depth_basis.")
+    data_root = resolve_relative_path(workflow_cfg.get("data_root", "data"), root=REPO_ROOT)
+    current_seismic = resolve_relative_path(str(seismic.get("file") or ""), root=data_root)
+    recorded_seismic = dict(selected.variant_metadata.get("seismic_path_and_hash") or {})
+    recorded_seismic_path = resolve_relative_path(str(recorded_seismic.get("path") or ""), root=REPO_ROOT)
+    if current_seismic.resolve() != recorded_seismic_path.resolve():
+        raise ValueError("Selected LFM variant seismic path does not match top-level seismic.file.")
+    if sha256_file(current_seismic) != str(recorded_seismic.get("sha256") or ""):
+        raise ValueError("Selected LFM variant seismic SHA-256 does not match top-level seismic.file.")
+    transform = str(inputs.get("lfm_value_transform") or "identity").casefold()
+    if transform not in {"identity", "none"}:
+        raise ValueError("Unified LFM v2 is already log(AI); lfm_value_transform must be identity.")
+    if str(inputs.get("target_mask_file") or "").strip():
+        raise ValueError("Unified LFM v2 owns valid_mask_model; external target_mask_file is not accepted.")
+    inputs["lfm_file"] = repo_relative_path(selected.lfm_path, root=REPO_ROOT)
+    inputs["lfm_value_transform"] = "identity"
+    inputs["selected_lfm_sha256"] = selected.lfm_sha256
+    inputs["well_control_run_sha256"] = selected.well_control_run_sha256
+    inputs["selected_lfm_metadata"] = dict(selected.variant_metadata)
     source_runs = dict(prepared.get("source_runs") or {})
+    source_runs["lfm_run_dir"] = repo_relative_path(selected.run_dir, root=REPO_ROOT)
+    source_runs["variant_id"] = selected.variant_id
+    source_runs["well_control_run_dir"] = repo_relative_path(selected.well_control_run_dir, root=REPO_ROOT)
     wavelet_dir = resolve_source_run(
         source_runs.get("wavelet_generation_dir"),
         output_root=output_root,
@@ -202,104 +212,19 @@ def _load_seismic_reference_payload(*, run_cfg: dict, models: list[dict]) -> dic
     }
 
 
-def _coerce_float(value: object) -> float:
-    number = pd.to_numeric(value, errors="coerce")
-    try:
-        return float(number)
-    except (TypeError, ValueError):
-        return float("nan")
-
-
-def _load_well_positions(cfg: dict) -> dict[str, tuple[float, float]]:
-    inventory_text = str(cfg.get("well_inventory_file") or "").strip()
-    if not inventory_text:
-        return {}
-    inventory_path = resolve_relative_path(inventory_text, root=REPO_ROOT)
-    if not inventory_path.is_file():
-        return {}
-    inventory = pd.read_csv(inventory_path)
-    if not {"well_name", "inline_float", "xline_float"}.issubset(inventory.columns):
-        return {}
-    out: dict[str, tuple[float, float]] = {}
-    for _, row in inventory.iterrows():
-        well = str(row.get("well_name", ""))
-        inline = _coerce_float(row.get("inline_float"))
-        xline = _coerce_float(row.get("xline_float"))
-        if well and np.isfinite(inline) and np.isfinite(xline):
-            out[well] = (inline, xline)
-    return out
-
-
-def _log_ai_at_twt(*, las_path: Path, tdt_path: Path, twt_s: np.ndarray) -> np.ndarray:
-    import lasio
-
-    las = lasio.read(str(las_path))
-    frame = las.df()
-    if "AI" not in frame.columns:
-        raise ValueError(f"Filtered LAS lacks AI curve: {las_path}")
-    md_axis = frame.index.to_numpy(dtype=np.float64)
-    ai = frame["AI"].to_numpy(dtype=np.float64)
-    finite_ai = np.isfinite(md_axis) & np.isfinite(ai) & (ai > 0.0)
-    if int(np.count_nonzero(finite_ai)) < 2:
-        return np.full_like(twt_s, np.nan, dtype=np.float64)
-    tdt = pd.read_csv(tdt_path)
-    if not {"twt_s", "md_m"}.issubset(tdt.columns):
-        raise ValueError(f"Optimized TDT must contain twt_s/md_m: {tdt_path}")
-    tdt_twt = pd.to_numeric(tdt["twt_s"], errors="coerce").to_numpy(dtype=np.float64)
-    tdt_md = pd.to_numeric(tdt["md_m"], errors="coerce").to_numpy(dtype=np.float64)
-    finite_tdt = np.isfinite(tdt_twt) & np.isfinite(tdt_md)
-    if int(np.count_nonzero(finite_tdt)) < 2:
-        return np.full_like(twt_s, np.nan, dtype=np.float64)
-    order_tdt = np.argsort(tdt_twt[finite_tdt])
-    md_at_twt = np.interp(
-        twt_s,
-        tdt_twt[finite_tdt][order_tdt],
-        tdt_md[finite_tdt][order_tdt],
-        left=np.nan,
-        right=np.nan,
-    )
-    order_ai = np.argsort(md_axis[finite_ai])
-    ai_at_twt = np.interp(
-        md_at_twt,
-        md_axis[finite_ai][order_ai],
-        ai[finite_ai][order_ai],
-        left=np.nan,
-        right=np.nan,
-    )
-    return np.where(ai_at_twt > 0.0, np.log(ai_at_twt), np.nan)
-
-
 def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
     if a.size < 2 or np.std(a) <= 0.0 or np.std(b) <= 0.0:
         return float("nan")
     return float(np.corrcoef(a, b)[0, 1])
 
 
-def _trace_distance_to_section(
-    *, well_inline: float, well_xline: float, section_ilines: np.ndarray, section_xlines: np.ndarray
-) -> tuple[int, float]:
-    distances = np.hypot(section_ilines - float(well_inline), section_xlines - float(well_xline))
-    index = int(np.nanargmin(distances))
-    return index, float(distances[index])
-
-
 def _write_well_prediction_qc(output_dir: Path, *, run_cfg: dict) -> dict[str, object]:
     cfg = dict(run_cfg.get("well_qc") or {})
     if not bool(cfg.get("enabled", True)):
         return {"csv": "", "figures": {}, "status": "disabled"}
-    well_auto_tie_text = str(cfg.get("well_auto_tie_dir") or "").strip()
-    if not well_auto_tie_text:
-        raise ValueError("real_field_zero_shot.well_qc.well_auto_tie_dir must be explicit when well_qc is enabled.")
-    well_auto_tie_dir = resolve_relative_path(
-        well_auto_tie_text,
-        root=REPO_ROOT,
-    )
-    metrics_path = well_auto_tie_dir / "well_tie_metrics.csv"
-    if not metrics_path.is_file():
-        return {"csv": "", "figures": {}, "status": "missing_well_tie_metrics"}
-    ties = pd.read_csv(metrics_path)
-    ties = ties[ties["tie_status"].astype(str).eq("success")].copy()
-    positions = _load_well_positions(cfg)
+    inputs = dict(run_cfg.get("real_field_inputs") or {})
+    selected = resolve_lfm_variant(inputs, repo_root=REPO_ROOT)
+    controls = load_well_control_set(selected.well_control_run_dir, repo_root=REPO_ROOT)
     model_arrays = {}
     for child in sorted(output_dir.iterdir()):
         if child.is_dir() and (child / "predictions.npz").is_file():
@@ -309,7 +234,19 @@ def _write_well_prediction_qc(output_dir: Path, *, run_cfg: dict) -> dict[str, o
     first = next(iter(model_arrays.values()))
     ilines = np.asarray(first["ilines"], dtype=np.float64)
     xlines = np.asarray(first["xlines"], dtype=np.float64)
-    twt_s = np.asarray(first["twt_s"], dtype=np.float64)
+    samples = np.asarray(first["twt_s"], dtype=np.float64)
+    seismic_info = dict(selected.run_summary.get("seismic") or {})
+    seismic_path = resolve_relative_path(str(seismic_info.get("path") or ""), root=REPO_ROOT)
+    seismic_type = str(seismic_info.get("type") or "").casefold()
+    survey = open_survey(
+        seismic_path,
+        seismic_type,
+        segy_options=(segy_options_from_config(dict(inputs.get("segy_options") or {})) if seismic_type == "segy" else None),
+    )
+    section_xy = np.asarray(
+        [survey.line_geometry.line_to_coord(float(il), float(xl)) for il, xl in zip(ilines, xlines)],
+        dtype=np.float64,
+    )
     if "max_line_distance" in cfg:
         raise ValueError("real_field_zero_shot.well_qc.max_line_distance is retired; use max_xy_distance_m.")
     if cfg.get("max_xy_distance_m") is None:
@@ -319,51 +256,58 @@ def _write_well_prediction_qc(output_dir: Path, *, run_cfg: dict) -> dict[str, o
     figure_outputs: dict[str, str] = {}
     figure_dir = output_dir / "figures" / "wells"
     figure_dir.mkdir(parents=True, exist_ok=True)
-    for _, tie in ties.iterrows():
-        well = str(tie.get("well_name", ""))
-        inline = _coerce_float(tie.get("inline_float"))
-        xline = _coerce_float(tie.get("xline_float"))
-        position_source = "well_tie_metrics"
-        if (not np.isfinite(inline) or not np.isfinite(xline)) and well in positions:
-            inline, xline = positions[well]
-            position_source = "well_inventory"
-        base = {"well_name": well, "well_inline": inline, "well_xline": xline, "well_position_source": position_source}
-        if not np.isfinite(inline) or not np.isfinite(xline):
-            rows.append({**base, "model_role": "", "status": "skipped_missing_well_position"})
+    include_deviated = bool(cfg.get("include_deviated_wells", True))
+    for control in controls.controls:
+        well = control.well_name
+        if control.wellbore_class == "deviated" and not include_deviated:
+            rows.append({"well_name": well, "model_role": "", "status": "skipped_deviated_well"})
             continue
-        trace_idx, distance = _trace_distance_to_section(
-            well_inline=inline,
-            well_xline=xline,
-            section_ilines=ilines,
-            section_xlines=xlines,
-        )
+        source_samples = control.sample_axis.values
+        sample_indices = np.searchsorted(source_samples, samples)
+        sample_indices = np.clip(sample_indices, 0, source_samples.size - 1)
+        inside_axis = np.isclose(source_samples[sample_indices], samples, rtol=0.0, atol=1e-8)
+        well_log_ai = np.where(inside_axis, control.log_ai.values[sample_indices], np.nan)
+        well_x = np.where(inside_axis, control.x_m_by_sample[sample_indices], np.nan)
+        well_y = np.where(inside_axis, control.y_m_by_sample[sample_indices], np.nan)
+        distances = np.linalg.norm(np.column_stack([well_x, well_y])[:, None, :] - section_xy[None, :, :], axis=2)
+        distances[~np.isfinite(distances)] = np.inf
+        trace_indices = np.argmin(distances, axis=1)
+        nearest_distance = distances[np.arange(samples.size), trace_indices]
+        finite_distance = nearest_distance[np.isfinite(nearest_distance)]
+        if finite_distance.size == 0:
+            rows.append({"well_name": well, "model_role": "", "status": "skipped_missing_well_position"})
+            continue
+        base = {
+            "well_name": well,
+            "wellbore_class": control.wellbore_class,
+            "well_position_source": control.sampling_mode,
+            "nearest_section_distance_median_m": float(np.median(finite_distance)),
+            "nearest_section_distance_max_m": float(np.max(finite_distance)),
+        }
+        representative_index = int(np.nanargmin(nearest_distance))
+        trace_idx = int(trace_indices[representative_index])
         base.update(
             {
                 "nearest_section_trace": trace_idx,
                 "nearest_section_inline": float(ilines[trace_idx]),
                 "nearest_section_xline": float(xlines[trace_idx]),
-                "section_line_distance": distance,
             }
         )
-        if distance > max_distance:
+        if not np.any(nearest_distance <= max_distance):
             rows.append({**base, "model_role": "", "status": "skipped_outside_section_support", "max_xy_distance_m": max_distance})
             continue
-        try:
-            well_log_ai = _log_ai_at_twt(
-                las_path=resolve_relative_path(str(tie["filtered_las_file"]), root=REPO_ROOT),
-                tdt_path=resolve_relative_path(str(tie["optimized_tdt_file"]), root=REPO_ROOT),
-                twt_s=twt_s,
-            )
-        except Exception as exc:
-            rows.append({**base, "model_role": "", "status": "skipped_well_log_projection_failed", "reason": str(exc)})
-            continue
         fig, ax = plt.subplots(figsize=(4.5, 6.0))
-        ax.plot(well_log_ai, twt_s, label="well filtered log(AI)", color="black", linewidth=1.5)
+        ax.plot(well_log_ai, samples, label="canonical well log(AI)", color="black", linewidth=1.5)
         for role, arrays in model_arrays.items():
-            pred = np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float64)[trace_idx]
+            predictions = np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float64)
+            pred = predictions[trace_indices, np.arange(samples.size)]
+            prediction_mask = np.asarray(arrays["valid_mask_model"], dtype=bool)[trace_indices, np.arange(samples.size)]
+            stitching = np.asarray(arrays["stitching_weight"], dtype=np.float64)[trace_indices, np.arange(samples.size)]
             valid = (
-                np.asarray(arrays["valid_mask_model"], dtype=bool)[trace_idx]
-                & (np.asarray(arrays["stitching_weight"], dtype=np.float64)[trace_idx] > 0.0)
+                inside_axis
+                & (nearest_distance <= max_distance)
+                & prediction_mask
+                & (stitching > 0.0)
                 & np.isfinite(well_log_ai)
                 & np.isfinite(pred)
             )
@@ -382,10 +326,10 @@ def _write_well_prediction_qc(output_dir: Path, *, run_cfg: dict) -> dict[str, o
                     "well_log_ai_mean": float(np.mean(well_log_ai[valid])) if n_valid else float("nan"),
                 }
             )
-            ax.plot(pred, twt_s, label=role, linewidth=1.0)
+            ax.plot(pred, samples, label=role, linewidth=1.0)
         ax.invert_yaxis()
         ax.set_xlabel("log(AI)")
-        ax.set_ylabel("TWT s")
+        ax.set_ylabel(f"{controls.sample_domain} ({controls.sample_unit})")
         ax.set_title(f"R0 well prediction QC: {well}")
         ax.legend(fontsize=8)
         fig.tight_layout()
@@ -868,6 +812,16 @@ def _source_file_hashes(section_metadata: dict, source_runs: dict) -> dict[str, 
     }
     if section_metadata.get("target_mask_file"):
         files["target_mask_file"] = str(section_metadata["target_mask_file"])
+    lfm_run_text = str(section_metadata.get("lfm_run_dir") or source_runs.get("lfm_run_dir") or "").strip()
+    if lfm_run_text:
+        files["lfm_run_summary"] = str(resolve_relative_path(lfm_run_text, root=REPO_ROOT) / "lfm_run_summary.json")
+    control_run_text = str(
+        section_metadata.get("well_control_run_dir") or source_runs.get("well_control_run_dir") or ""
+    ).strip()
+    if control_run_text:
+        files["well_control_run_summary"] = str(
+            resolve_relative_path(control_run_text, root=REPO_ROOT) / "run_summary.json"
+        )
     wavelet_dir = source_runs.get("wavelet_generation_dir")
     if wavelet_dir:
         files["selected_wavelet_csv"] = str(resolve_relative_path(wavelet_dir, root=REPO_ROOT) / "selected_wavelet.csv")
@@ -954,7 +908,7 @@ def main() -> None:
     well_outputs = (
         {"csv": "", "figures": {}, "status": "disabled_for_volume_mode"}
         if output_mode == "volume"
-        else _write_well_prediction_qc(output_dir, run_cfg=run_cfg)
+        else _write_well_prediction_qc(output_dir, run_cfg=run_cfg_for_load)
     )
     volume_exports = _export_zero_shot_volumes(output_dir, run_cfg=run_cfg_for_load, data_root=data_root)
     dt_s = float(field.twt_s[1] - field.twt_s[0]) if field.twt_s.size > 1 else 0.002

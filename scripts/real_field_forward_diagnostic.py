@@ -541,20 +541,6 @@ def _resolve_wavelet_dir(run_cfg: dict, *, zero_shot_dir: Path, output_root: Pat
     )
 
 
-def _recorded_lfm_summary_from_zero_shot(zero_shot_summary: Mapping[str, object]) -> dict:
-    volume = dict(zero_shot_summary.get("volume") or {})
-    section = dict(zero_shot_summary.get("section") or {})
-    lfm_text = str(volume.get("lfm_file") or section.get("lfm_file") or "").strip()
-    if not lfm_text:
-        return {}
-    lfm_path = resolve_relative_path(lfm_text, root=REPO_ROOT)
-    summary_path = lfm_path.parent / "real_field_lfm_summary.json"
-    if not summary_path.is_file():
-        return {}
-    with summary_path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
 def _resolve_well_auto_tie_dir(
     run_cfg: dict,
     *,
@@ -564,13 +550,7 @@ def _resolve_well_auto_tie_dir(
     well_cfg = dict(run_cfg.get("well_qc") or {})
     explicit = str(well_cfg.get("well_auto_tie_dir") or "").strip()
     r0_source_runs = dict(zero_shot_summary.get("source_runs") or {})
-    lfm_summary = _recorded_lfm_summary_from_zero_shot(zero_shot_summary)
-    lfm_source_runs = dict(lfm_summary.get("source_runs") or {})
-    recorded = str(
-        r0_source_runs.get("well_auto_tie_dir")
-        or lfm_source_runs.get("well_auto_tie_dir")
-        or ""
-    ).strip()
+    recorded = str(r0_source_runs.get("well_auto_tie_dir") or "").strip()
     if explicit:
         well_auto_tie_dir = resolve_source_run(
             explicit,
@@ -615,8 +595,7 @@ def _resolve_well_inventory_file(
 ) -> Path:
     well_cfg = dict(run_cfg.get("well_qc") or {})
     explicit = str(well_cfg.get("well_inventory_file") or "").strip()
-    lfm_summary = _recorded_lfm_summary_from_zero_shot(zero_shot_summary)
-    recorded = str((lfm_summary.get("inputs") or {}).get("well_inventory_file") or "").strip()
+    recorded = ""
     if explicit:
         inventory_file = resolve_source_file_from_run(
             explicit,

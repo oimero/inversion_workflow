@@ -1,4 +1,4 @@
-"""Build explicit unified real-field LFM v2 variants from canonical well controls."""
+"""Build explicit unified real-field LFM v3 variants from canonical well controls."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ if str(SRC_DIR) not in sys.path:
 from cup.config.workflow import WorkflowConfig, deep_merge_dict
 from cup.seismic.lfm.pipeline import build_lfm_context, run_lfm_pipeline
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.utils.io import latest_checked_run, load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file
+from cup.utils.io import latest_checked_run, load_yaml_config, repo_relative_path, resolve_relative_path
 from cup.well.real_field_controls import SCHEMA_VERSION as WELL_CONTROL_SCHEMA, load_well_control_set
 
 
@@ -46,7 +46,7 @@ def _validate_control_run(path: Path, *, domain: str, depth_basis: str | None) -
     with (path / "run_summary.json").open("r", encoding="utf-8") as handle:
         summary = json.load(handle)
     if summary.get("schema_version") != WELL_CONTROL_SCHEMA or summary.get("status") != "ok":
-        raise ValueError("not a successful real_field_well_controls_v2 run")
+        raise ValueError(f"not a successful {WELL_CONTROL_SCHEMA} run")
     axis = dict(summary.get("sample_axis") or {})
     if axis.get("sample_domain") != domain or summary.get("depth_basis") != depth_basis:
         raise ValueError("well controls domain/depth_basis does not match seismic")
@@ -93,9 +93,6 @@ def main() -> None:
     )
     if recorded_seismic_path.resolve() != seismic_path.resolve():
         raise ValueError("WellControlSet target seismic path does not match the current workflow seismic.")
-    recorded_seismic_hash = str(controls.provenance.get("target_seismic_sha256") or "")
-    if not recorded_seismic_hash or recorded_seismic_hash != sha256_file(seismic_path):
-        raise ValueError("WellControlSet target seismic SHA-256 does not match the current workflow seismic.")
     seismic_options = segy_options_from_config(workflow.seismic.as_dict()) if workflow.seismic.type == "segy" else {}
     survey = open_survey(seismic_path, workflow.seismic.type, segy_options=seismic_options or None)
     if not np.array_equal(controls.sample_axis.values, survey.sample_axis(workflow.seismic.domain).values):
@@ -106,10 +103,9 @@ def main() -> None:
         survey=survey,
         data_root=data_root,
         repo_root=REPO_ROOT,
-        common_hashes={
+        common_sources={
             "seismic": {
                 "path": repo_relative_path(seismic_path, root=REPO_ROOT),
-                "sha256": sha256_file(seismic_path),
                 "type": workflow.seismic.type,
             }
         },
@@ -131,7 +127,7 @@ def main() -> None:
         output_dir=output_dir,
         repo_root=REPO_ROOT,
     )
-    print("=== Unified Real-field LFM v2 ===")
+    print("=== Unified Real-field LFM v3 ===")
     print(f"Output: {output_dir}")
     print(f"Variants: {len(summary['requested_variant_ids'])}")
     print(f"Status: {summary['status']}")

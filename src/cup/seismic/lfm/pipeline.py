@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 import re
@@ -24,20 +23,22 @@ from cup.seismic.lfm.framework import MODIFIERS
 from cup.seismic.lfm.types import LfmContext, LfmVariantResult, OutputGeometry
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.volume_export import export_volume_like_source, log_ai_to_ai_volume
-from cup.utils.io import repo_relative_path, resolve_relative_path, sha256_file, write_json
+from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
+    repo_relative_path,
+    require_contract_fingerprint,
+    resolve_relative_path,
+    write_json,
+)
 from cup.well.anchor import sample_volume_trilinear
 from cup.well.real_field_controls import WellControlSet
 
 
-RUN_SCHEMA = "real_field_lfm_run_v2"
-VARIANT_SCHEMA = "real_field_lfm_variant_v2"
+RUN_SCHEMA = "real_field_lfm_run_v3"
+VARIANT_SCHEMA = "real_field_lfm_variant_v3"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _NUMBERED_MODEL_ID = re.compile(r"^m\d+(?:[_.-].*)?$", re.IGNORECASE)
-
-
-def _json_hash(value: Any) -> str:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _validate_id(value: Any, *, label: str) -> str:
@@ -115,7 +116,7 @@ def build_lfm_context(
     survey: Any,
     data_root: Path,
     repo_root: Path,
-    common_hashes: Mapping[str, Any],
+    common_sources: Mapping[str, Any],
 ) -> tuple[LfmContext, list[dict[str, str]]]:
     sample_axis = survey.sample_axis(workflow.seismic.domain)
     geometry = survey.describe_geometry(workflow.seismic.domain)
@@ -141,7 +142,7 @@ def build_lfm_context(
         frame["interpretation"] = np.abs(values)
         raw_horizons[name] = frame
         names.append(name)
-        horizon_sources.append({"name": name, "path": repo_relative_path(path, root=repo_root), "sha256": sha256_file(path)})
+        horizon_sources.append({"name": name, "path": repo_relative_path(path, root=repo_root)})
     target_zone = TargetZone(raw_horizons, geometry, names, min_thickness=float(sample_axis.step))
     lfm_config = raw_config.get("real_field_lfm")
     if not isinstance(lfm_config, Mapping):
@@ -154,7 +155,7 @@ def build_lfm_context(
             target_zone=target_zone,
             output_geometry=output,
             depth_basis=workflow.seismic.depth_basis,
-            common_hashes=dict(common_hashes),
+            common_sources=dict(common_sources),
         ),
         horizon_sources,
     )
@@ -326,7 +327,6 @@ def build_lfm_variants(
                 modifier_config["bodies_file"] = str(bodies_path)
                 modifier_sources[modifier_id] = {
                     "bodies_file": repo_relative_path(bodies_path, root=repo_root),
-                    "bodies_file_sha256": sha256_file(bodies_path),
                 }
             result = MODIFIERS[str(modifier_config["method"])].apply(
                 modifier_id=modifier_id, config=modifier_config, parent=result, context=context
@@ -410,7 +410,6 @@ def _write_variant_figures(
     outputs = {
         "lfm_representative_section": {
             "path": repo_relative_path(final_directory / "qc" / "figures" / path.name, root=repo_root),
-            "sha256": sha256_file(path),
         }
     }
     class_keys = sorted(key for key in result.modifier_fields if key.startswith("class_probability__"))
@@ -465,7 +464,6 @@ def _write_variant_figures(
         plt.close(fig)
         outputs["framework_map_and_sections"] = {
             "path": repo_relative_path(final_directory / "qc" / "figures" / framework_path.name, root=repo_root),
-            "sha256": sha256_file(framework_path),
         }
     return outputs
 
@@ -485,7 +483,7 @@ def _write_variant(
     final_root: Path,
     repo_root: Path,
     controls_run: Path,
-    controls_hash: str,
+    controls_contract_fingerprint: str,
     horizon_sources: list[dict[str, str]],
 ) -> dict[str, Any]:
     relative = Path("variants") / variant_id
@@ -502,13 +500,25 @@ def _write_variant(
     for name, frame in result.qc_tables.items():
         path = qc_dir / f"{name}.csv"
         frame.to_csv(path, index=False)
-        qc_outputs[name] = {"path": repo_relative_path(final_directory / "qc" / path.name, root=repo_root), "sha256": sha256_file(path)}
+        qc_outputs[name] = {"path": repo_relative_path(final_directory / "qc" / path.name, root=repo_root)}
     figure_outputs = _write_variant_figures(
         result=result,
         context=context,
         directory=directory,
         final_directory=final_directory,
         repo_root=repo_root,
+    )
+    input_contracts = {
+        "well_control_set": {
+            "path": repo_relative_path(controls_run / "run_summary.json", root=repo_root),
+            "contract_fingerprint_sha256": controls_contract_fingerprint,
+        }
+    }
+    method_sidecar_path = repo_relative_path(final_directory / method_path.name, root=repo_root)
+    modifier_sidecar_path = (
+        repo_relative_path(final_directory / modifier_path.name, root=repo_root)
+        if result.modifier_fields
+        else None
     )
     metadata = {
         "schema_version": VARIANT_SCHEMA,
@@ -524,30 +534,14 @@ def _write_variant(
         "linear_ai_unit": "m/s*g/cm3",
         "valid_mask_key": "valid_mask_model",
         "output_geometry": context.output_geometry.describe(),
-        "well_control_run_path_and_hash": {"path": repo_relative_path(controls_run, root=repo_root), "run_summary_sha256": controls_hash},
-        "seismic_path_and_hash": context.common_hashes["seismic"],
-        "horizon_paths_and_hashes": horizon_sources,
-        "resolved_baseline_config_and_hash": {
-            "config": result.metadata["resolved_baseline_config"],
-            "sha256": _json_hash(result.metadata["resolved_baseline_config"]),
-        },
-        "resolved_modifier_configs_and_hashes": {
-            key: {"config": value, "sha256": _json_hash(value)}
-            for key, value in dict(result.metadata["resolved_modifier_configs"]).items()
-        },
-        "modifier_source_paths_and_hashes": dict(result.metadata.get("modifier_sources", {})),
-        "method_sidecar_path_and_hash": {
-            "path": repo_relative_path(final_directory / method_path.name, root=repo_root),
-            "sha256": sha256_file(method_path),
-        },
-        "modifier_sidecar_path_and_hash": (
-            {
-                "path": repo_relative_path(final_directory / modifier_path.name, root=repo_root),
-                "sha256": sha256_file(modifier_path),
-            }
-            if result.modifier_fields
-            else None
-        ),
+        "input_contracts": input_contracts,
+        "seismic_path": context.common_sources["seismic"]["path"],
+        "horizon_paths": horizon_sources,
+        "resolved_baseline_config": result.metadata["resolved_baseline_config"],
+        "resolved_modifier_configs": dict(result.metadata["resolved_modifier_configs"]),
+        "modifier_source_paths": dict(result.metadata.get("modifier_sources", {})),
+        "method_sidecar_path": method_sidecar_path,
+        "modifier_sidecar_path": modifier_sidecar_path,
         "method_metadata": {key: value for key, value in result.metadata.items() if not key.startswith("resolved_")},
     }
     lfm_path = directory / "lfm.npz"
@@ -560,9 +554,37 @@ def _write_variant(
         samples=context.output_geometry.samples.astype(np.float64),
         metadata_json=np.asarray(json.dumps(metadata, ensure_ascii=False, sort_keys=True)),
     )
+    primary_artifacts = {
+        "lfm": lfm_path,
+        "method_fields": method_path,
+    }
+    if result.modifier_fields:
+        primary_artifacts["modifier_fields"] = modifier_path
+    variant_config = {
+        "baseline": result.metadata["resolved_baseline_config"],
+        "modifiers": dict(result.metadata["resolved_modifier_configs"]),
+    }
+    contract_fingerprint = contract_fingerprint_sha256(
+        contract_schema_version=VARIANT_SCHEMA,
+        semantics={
+            "variant_id": variant_id,
+            "sample_domain": context.sample_axis.domain,
+            "sample_unit": context.sample_axis.unit,
+            "depth_basis": context.depth_basis,
+            "value_domain": "log(AI)",
+            "linear_ai_unit": "m/s*g/cm3",
+            "output_geometry": context.output_geometry.describe(),
+        },
+        business_config=variant_config,
+        input_contracts=input_contracts,
+        primary_artifacts=primary_artifacts,
+    )
     summary = {
         "schema_version": VARIANT_SCHEMA,
         "status": "ok",
+        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "contract_fingerprint_sha256": contract_fingerprint,
+        "input_contracts": input_contracts,
         "variant_id": variant_id,
         "metadata": metadata,
         "stats": {
@@ -572,9 +594,9 @@ def _write_variant(
             "log_ai_max": float(np.max(result.log_ai[result.valid_mask_model])),
         },
         "outputs": {
-            "lfm": {"path": repo_relative_path(final_directory / lfm_path.name, root=repo_root), "sha256": sha256_file(lfm_path)},
-            "method_fields": metadata["method_sidecar_path_and_hash"],
-            "modifier_fields": metadata["modifier_sidecar_path_and_hash"],
+            "lfm": {"path": repo_relative_path(final_directory / lfm_path.name, root=repo_root)},
+            "method_fields": {"path": method_sidecar_path},
+            "modifier_fields": None if modifier_sidecar_path is None else {"path": modifier_sidecar_path},
             "qc": qc_outputs,
             "figures": figure_outputs,
         },
@@ -588,13 +610,10 @@ def _write_variant(
         "modifier_chain": ";".join(result.metadata.get("modifier_chain", [])),
         "status": "ok",
         "lfm_path": summary["outputs"]["lfm"]["path"],
-        "lfm_sha256": summary["outputs"]["lfm"]["sha256"],
-        "method_fields_path": metadata["method_sidecar_path_and_hash"]["path"],
-        "method_fields_sha256": metadata["method_sidecar_path_and_hash"]["sha256"],
-        "modifier_fields_path": "" if metadata["modifier_sidecar_path_and_hash"] is None else metadata["modifier_sidecar_path_and_hash"]["path"],
-        "modifier_fields_sha256": "" if metadata["modifier_sidecar_path_and_hash"] is None else metadata["modifier_sidecar_path_and_hash"]["sha256"],
+        "method_fields_path": method_sidecar_path,
+        "modifier_fields_path": "" if modifier_sidecar_path is None else modifier_sidecar_path,
         "variant_summary_path": repo_relative_path(final_directory / summary_path.name, root=repo_root),
-        "variant_summary_sha256": sha256_file(summary_path),
+        "contract_fingerprint_sha256": contract_fingerprint,
     }
 
 
@@ -750,7 +769,6 @@ def _write_comparisons(
         figures = {
             "overview": {
                 "path": repo_relative_path(final_directory / "figures" / "overview.png", root=repo_root),
-                "sha256": sha256_file(figure_path),
             }
         }
         sections = comparison.get("sections") or []
@@ -778,11 +796,10 @@ def _write_comparisons(
             )
             figures[section_id] = {
                 "path": repo_relative_path(final_directory / "figures" / section_path.name, root=repo_root),
-                "sha256": sha256_file(section_path),
             }
         outputs[comparison_id] = {
-            "metrics": {"path": repo_relative_path(final_directory / "metrics.csv", root=repo_root), "sha256": sha256_file(metrics_path)},
-            "well_metrics": {"path": repo_relative_path(final_directory / "well_metrics.csv", root=repo_root), "sha256": sha256_file(well_path)},
+            "metrics": {"path": repo_relative_path(final_directory / "metrics.csv", root=repo_root)},
+            "well_metrics": {"path": repo_relative_path(final_directory / "well_metrics.csv", root=repo_root)},
             "figures": figures,
         }
     return outputs
@@ -805,8 +822,18 @@ def run_lfm_pipeline(
         raise FileExistsError(output_dir)
     temp_root = output_dir.parent / f".{output_dir.name}.tmp-{uuid4().hex}"
     temp_root.mkdir(parents=True)
-    controls_summary = controls_run / "run_summary.json"
-    controls_hash = sha256_file(controls_summary)
+    controls_summary_path = controls_run / "run_summary.json"
+    with controls_summary_path.open("r", encoding="utf-8") as handle:
+        controls_summary = json.load(handle)
+    controls_contract_fingerprint = require_contract_fingerprint(
+        controls_summary, label=f"WellControlSet {controls_run}"
+    )
+    input_contracts = {
+        "well_control_set": {
+            "path": repo_relative_path(controls_summary_path, root=repo_root),
+            "contract_fingerprint_sha256": controls_contract_fingerprint,
+        }
+    }
     try:
         results, comparisons = build_lfm_variants(config=config, controls=controls, context=context, repo_root=repo_root)
         rows = [
@@ -818,12 +845,11 @@ def run_lfm_pipeline(
                 final_root=output_dir,
                 repo_root=repo_root,
                 controls_run=controls_run,
-                controls_hash=controls_hash,
+                controls_contract_fingerprint=controls_contract_fingerprint,
                 horizon_sources=horizon_sources,
             )
             for variant_id, result in results.items()
         ]
-        row_by_variant = {row["variant_id"]: row for row in rows}
         comparison_outputs = _write_comparisons(
             comparisons=comparisons,
             results=results,
@@ -851,32 +877,44 @@ def run_lfm_pipeline(
                     samples=context.output_geometry.samples,
                     source_seismic_file=source_seismic_file,
                     source_seismic_type=source_seismic_type,
-                    title=f"Unified LFM v2 linear AI: {variant_id}",
+                    title=f"Unified LFM v3 linear AI: {variant_id}",
                     details=[
                         f"variant_id={variant_id}",
                         f"domain={context.sample_axis.domain}",
                         "unit=m/s*g/cm3",
                         f"lfm_npz={repo_relative_path(output_dir / 'variants' / variant_id / 'lfm.npz', root=repo_root)}",
-                        f"lfm_sha256={row_by_variant[variant_id]['lfm_sha256']}",
+                        f"variant_contract_fingerprint={next(row['contract_fingerprint_sha256'] for row in rows if row['variant_id'] == variant_id)}",
                     ],
                     seismic_options=seismic_options,
                     nan_fill=None,
                 )
+                payload.pop("sha256", None)
                 actual_path = Path(payload["path"])
                 payload["path"] = repo_relative_path(output_dir / "variants" / variant_id / actual_path.name, root=repo_root)
                 export_outputs[variant_id] = payload
         manifest_path = temp_root / "variant_manifest.csv"
         pd.DataFrame.from_records(rows).to_csv(manifest_path, index=False)
+        run_contract_fingerprint = contract_fingerprint_sha256(
+            contract_schema_version=RUN_SCHEMA,
+            semantics={
+                "sample_domain": context.sample_axis.domain,
+                "sample_unit": context.sample_axis.unit,
+                "depth_basis": context.depth_basis,
+                "output_geometry": context.output_geometry.describe(),
+                "requested_variant_ids": list(results),
+            },
+            business_config=config,
+            input_contracts=input_contracts,
+            primary_artifacts={"variant_manifest": manifest_path},
+        )
         summary = {
             "schema_version": RUN_SCHEMA,
-            "status": "building",
+            "status": "ok",
+            "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+            "contract_fingerprint_sha256": run_contract_fingerprint,
+            "input_contracts": input_contracts,
             "resolved_config": dict(config),
-            "resolved_config_sha256": _json_hash(config),
-            "well_control_run": {
-                "path": repo_relative_path(controls_run, root=repo_root),
-                "run_summary_sha256": controls_hash,
-            },
-            "seismic": context.common_hashes["seismic"],
+            "seismic": context.common_sources["seismic"],
             "horizons": horizon_sources,
             "output_geometry": context.output_geometry.describe(),
             "requested_variant_ids": list(results),
@@ -884,13 +922,11 @@ def run_lfm_pipeline(
             "outputs": {
                 "variant_manifest": {
                     "path": repo_relative_path(output_dir / manifest_path.name, root=repo_root),
-                    "sha256": sha256_file(manifest_path),
                 },
                 "comparisons": comparison_outputs,
                 "volume_exports": export_outputs,
             },
         }
-        summary["status"] = "ok"
         write_json(temp_root / "lfm_run_summary.json", summary)
         temp_root.replace(output_dir)
         return summary

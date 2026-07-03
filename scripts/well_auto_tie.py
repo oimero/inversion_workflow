@@ -46,7 +46,16 @@ from cup.seismic.trace_sampling import assemble_bilinear_trace_from_plan, build_
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.config.workflow import WorkflowConfig, merge_dict_defaults
 from cup.config.sources import resolve_source_run
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
+from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
+    load_yaml_config,
+    published_contract_reference,
+    repo_relative_path,
+    resolve_relative_path,
+    sanitize_filename,
+    write_json,
+)
 from cup.utils.coerce import as_bool
 from cup.utils.masks import true_runs
 from cup.well.assets import build_file_lookup
@@ -1606,7 +1615,7 @@ def main() -> None:
     script_cfg = _script_config(cfg)
     data_root = _resolve_repo_path(workflow.data_root)
     output_dir = _resolve_output_dir(args, cfg)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=False)
     _ensure_output_dirs(output_dir)
 
     paths = _resolve_inputs(cfg, script_cfg)
@@ -1848,7 +1857,7 @@ def main() -> None:
 
     successful_tie_count = int((metrics_df["tie_status"] == "success").sum()) if not metrics_df.empty else 0
     run_summary = {
-        "schema_version": "well_auto_tie_v2",
+        "schema_version": "well_auto_tie_v3",
         "status": "success" if successful_tie_count > 0 else "failed",
         "sample_domain": "time",
         "sample_unit": "s",
@@ -1892,6 +1901,64 @@ def main() -> None:
             "tie_window_report": repo_relative_path(tie_window_path, root=REPO_ROOT),
         },
     }
+    if successful_tie_count > 0:
+        input_contracts = {
+            "well_inventory": published_contract_reference(
+                paths["inventory_file"].parent / "run_summary.json",
+                root=REPO_ROOT,
+                label=f"well inventory run {paths['inventory_file'].parent}",
+            ),
+            "well_screen": published_contract_reference(
+                paths["well_screen_file"].parent / "run_summary.json",
+                root=REPO_ROOT,
+                label=f"well screen run {paths['well_screen_file'].parent}",
+            ),
+            "well_preprocess": published_contract_reference(
+                paths["preprocess_status_file"].parent / "run_summary.json",
+                root=REPO_ROOT,
+                label=f"well preprocess run {paths['preprocess_status_file'].parent}",
+            ),
+        }
+        if paths["well_trajectory_file"] is not None:
+            input_contracts["well_trajectory"] = published_contract_reference(
+                paths["well_trajectory_file"].parent / "run_summary.json",
+                root=REPO_ROOT,
+                label=f"well trajectory run {paths['well_trajectory_file'].parent}",
+            )
+        primary_artifacts = {
+            "well_tie_plan": plan_path,
+            "well_tie_metrics": metrics_path,
+            "wavelet_inventory": output_dir / "wavelet_inventory.csv",
+        }
+        for directory_name in (
+            "wavelets",
+            "time_depth",
+            "petrel_checkshots",
+            "filtered_las",
+            "seismic_trace",
+            "trace_sample_plan",
+        ):
+            primary_artifacts.update(
+                {
+                    f"{directory_name}:{path.relative_to(output_dir).as_posix()}": path
+                    for path in sorted((output_dir / directory_name).rglob("*"))
+                    if path.is_file()
+                }
+            )
+        run_summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+        run_summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+            contract_schema_version="well_auto_tie_v3",
+            semantics={
+                "sample_domain": "time",
+                "sample_unit": "s",
+                "depth_basis": None,
+                "enabled_routes": run_summary["enabled_routes"],
+            },
+            business_config=script_cfg,
+            input_contracts=input_contracts,
+            primary_artifacts=primary_artifacts,
+        )
+        run_summary["input_contracts"] = input_contracts
     write_json(output_dir / "run_summary.json", run_summary)
     print(
         f"Wrote auto-tie plan for {len(plan_df)} wells to {repo_relative_path(output_dir, root=REPO_ROOT)}; "

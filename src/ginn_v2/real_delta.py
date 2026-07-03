@@ -17,7 +17,7 @@ import torch
 from cup.physics.numpy_backend import forward_time
 from cup.seismic.lfm.artifacts import resolve_lfm_variant
 from cup.seismic.viz import plot_well_waveform_qc, waveform_qc_metrics
-from cup.utils.io import repo_relative_path, resolve_relative_path, sha256_file
+from cup.utils.io import repo_relative_path, resolve_relative_path
 from cup.well.anchor import build_well_anchor_samples, sample_volume_trilinear
 from ginn_v2.real_field import (
     RealFieldVolume,
@@ -36,9 +36,9 @@ class RealDeltaSources:
     lfm_path: Path
     lfm_run_summary_path: Path
     lfm_run_summary: dict[str, Any]
-    lfm_sha256: str
+    lfm_contract_fingerprint_sha256: str
     well_control_run_dir: Path
-    well_control_run_sha256: str
+    well_control_contract_fingerprint_sha256: str
     seismic_path: Path
 
 
@@ -656,7 +656,6 @@ class RealDeltaSupport:
                     Path(self.config["samples_path"]),
                     root=repo_root,
                 ),
-                "sha256": sha256_file(Path(self.config["samples_path"])),
             },
         }
 
@@ -696,7 +695,6 @@ def prepare_real_delta_support(
                 input_reference_stats_path,
                 root=repo_root,
             ),
-            "seismic_reference_stats_sha256": sha256_file(input_reference_stats_path),
         },
         "volume": {},
     }
@@ -717,8 +715,10 @@ def prepare_real_delta_support(
         repo_root=repo_root,
         cluster_radius_m=float(cfg["cluster_radius_m"]),
         variant_id=sources.variant_id,
-        lfm_sha256=sources.lfm_sha256,
-        expected_well_control_run_sha256=sources.well_control_run_sha256,
+        lfm_contract_fingerprint_sha256=sources.lfm_contract_fingerprint_sha256,
+        expected_well_control_contract_fingerprint_sha256=(
+            sources.well_control_contract_fingerprint_sha256
+        ),
     )
     valid = samples[samples["valid_for_fit"].astype(bool)].copy()
     if valid.empty:
@@ -895,9 +895,6 @@ def _resolve_sources(
     selected = resolve_lfm_variant(config, repo_root=repo_root)
     seismic = dict(selected.run_summary.get("seismic") or {})
     seismic_path = resolve_relative_path(str(seismic.get("path") or ""), root=repo_root)
-    expected_seismic_hash = str(seismic.get("sha256") or "")
-    if sha256_file(seismic_path) != expected_seismic_hash:
-        raise ValueError("Step 7 seismic SHA-256 mismatch.")
     for path in (
         selected.lfm_path,
         selected.well_control_run_dir / "well_control_manifest.csv",
@@ -911,9 +908,11 @@ def _resolve_sources(
         lfm_path=selected.lfm_path,
         lfm_run_summary_path=selected.run_summary_path,
         lfm_run_summary=dict(selected.run_summary),
-        lfm_sha256=selected.lfm_sha256,
+        lfm_contract_fingerprint_sha256=selected.contract_fingerprint_sha256,
         well_control_run_dir=selected.well_control_run_dir,
-        well_control_run_sha256=selected.well_control_run_sha256,
+        well_control_contract_fingerprint_sha256=(
+            selected.well_control_contract_fingerprint_sha256
+        ),
         seismic_path=seismic_path,
     )
 
@@ -930,13 +929,17 @@ def _source_summary(
         "well_control_manifest": sources.well_control_run_dir / "well_control_manifest.csv",
         "seismic": sources.seismic_path,
     }
-    return {
-        name: {
-            "path": repo_relative_path(path, root=repo_root),
-            "sha256": sha256_file(path),
-        }
+    summary = {
+        name: {"path": repo_relative_path(path, root=repo_root)}
         for name, path in paths.items()
     }
+    summary["lfm"]["contract_fingerprint_sha256"] = (
+        sources.lfm_contract_fingerprint_sha256
+    )
+    summary["well_control_summary"]["contract_fingerprint_sha256"] = (
+        sources.well_control_contract_fingerprint_sha256
+    )
+    return summary
 
 
 def evaluate_real_wells(

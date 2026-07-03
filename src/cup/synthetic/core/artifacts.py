@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -11,20 +10,6 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from cup.utils.io import array_sha256, sha256_file
-
-
-def stable_json_sha256(value: Mapping[str, Any]) -> str:
-    payload = json.dumps(
-        dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def file_chain_sha256(paths: Mapping[str, Path]) -> str:
-    return stable_json_sha256(
-        {key: sha256_file(path) for key, path in sorted(paths.items())}
-    )
 
 
 def evaluation_role(geometry_family: str, held_out_geometry_family: str) -> str:
@@ -116,7 +101,6 @@ def write_dataset(
         dataset.attrs["axis_order"] = ",".join(str(value) for value in axis_order)
     dataset.attrs["shape_json"] = json.dumps(list(data.shape))
     dataset.attrs["dtype"] = str(data.dtype)
-    dataset.attrs["sha256"] = array_sha256(data)
     return dataset
 
 
@@ -128,7 +112,6 @@ def validate_dataset_metadata(value: h5py.Dataset, *, sample_domain: str) -> Non
         "axis_order",
         "shape_json",
         "dtype",
-        "sha256",
     }
     missing = required - set(value.attrs)
     if missing:
@@ -141,8 +124,6 @@ def validate_dataset_metadata(value: h5py.Dataset, *, sample_domain: str) -> Non
         raise ValueError(f"HDF5 dataset {value.name} shape metadata is stale.")
     if str(value.attrs["dtype"]) != str(value.dtype):
         raise ValueError(f"HDF5 dataset {value.name} dtype metadata is stale.")
-    if str(value.attrs["sha256"]) != array_sha256(value[()]):
-        raise ValueError(f"HDF5 dataset {value.name} content SHA-256 mismatch.")
     axis_path = str(value.attrs["axis_path"])
     if axis_path not in value.file or not isinstance(value.file[axis_path], h5py.Dataset):
         raise ValueError(
@@ -177,37 +158,25 @@ def validate_dataset_metadata(value: h5py.Dataset, *, sample_domain: str) -> Non
         )
 
 
-def validate_manifest_files(run_dir: Path, files: Mapping[str, Any]) -> None:
-    """Verify every artifact frozen in a benchmark manifest."""
-    if not files:
-        raise ValueError("Benchmark manifest lacks frozen artifact hashes.")
-    for name, digest in files.items():
-        if str(name) == "benchmark_manifest.json":
-            continue
-        path = run_dir / str(name)
-        if not path.is_file() or sha256_file(path) != str(digest):
-            raise ValueError(f"Benchmark artifact SHA-256 mismatch: {name}")
-
-
 def validate_training_manifest(
     manifest: Mapping[str, Any], *, sample_domain: str
 ) -> None:
     """Apply the shared status and qc-only consumption contract."""
     status = str(manifest.get("status") or "")
     if status not in {
-        "ok",  # accepted for already-generated time-v2 artifacts
+        "ok",
         "success",
         "completed_with_warnings",
         "development_limited",
     }:
         raise ValueError(
-            f"Synthoseis v2 {sample_domain} manifest is not consumable: status={status!r}."
+            f"Synthoseis v3 {sample_domain} manifest is not consumable: status={status!r}."
         )
     if bool(manifest.get("qc_only", False)) or manifest.get(
         "training_consumable"
     ) is False:
         raise ValueError(
-            "Synthoseis v2 qc-only benchmark is not training-consumable; "
+            "Synthoseis v3 qc-only benchmark is not training-consumable; "
             "regenerate without --qc-only."
         )
 
@@ -295,14 +264,11 @@ def rejection_reason_summary(
 __all__ = [
     "build_attempt_plan",
     "evaluation_role",
-    "file_chain_sha256",
     "geometry_feasibility_rows",
     "limit_attempt_plan",
     "rejection_reason_summary",
-    "stable_json_sha256",
     "validate_dataset_metadata",
     "validate_debug_attempt_limit",
-    "validate_manifest_files",
     "validate_training_manifest",
     "write_dataset",
 ]

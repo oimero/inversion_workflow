@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import time
 from typing import Any, Mapping, Sequence
@@ -30,7 +31,6 @@ from cup.synthetic.canonical import (
 from cup.synthetic.config import DATA_SCHEMA, IMPLEMENTATION_SCOPE
 from cup.synthetic.core import (
     build_attempt_plan,
-    file_chain_sha256,
     geometry_feasibility_rows,
     limit_attempt_plan,
     rejection_reason_summary,
@@ -76,10 +76,10 @@ from cup.synthetic.probes import (
 from cup.synthetic.seismic_variants import generate_seismic_variants
 from cup.config.workflow import WorkflowConfig
 from cup.utils.io import (
-    array_sha256,
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
     repo_relative_path,
-    resolve_relative_path,
-    sha256_file,
+    require_contract_fingerprint,
     write_json,
 )
 
@@ -96,19 +96,37 @@ def _validate_calibration_horizon_contract(
         )
 
 
-def _time_forward_model_inputs_sha256(sources: Mapping[str, Path]) -> str:
-    return file_chain_sha256(
-        {
-            "selected_wavelet.csv": sources["wavelet_generation_dir"]
-            / "selected_wavelet.csv",
-            "selected_wavelet_summary.json": sources["wavelet_generation_dir"]
-            / "selected_wavelet_summary.json",
-            "frequency_evidence_bands.csv": sources["forward_observability_dir"]
-            / "frequency_evidence_bands.csv",
-            "well_frequency_sensitivity.csv": sources["forward_observability_dir"]
-            / "well_frequency_sensitivity.csv",
+def _generation_input_contracts(
+    *,
+    calibration_path: Path,
+    sources: Mapping[str, Path],
+    repo_root: Path,
+) -> dict[str, dict[str, str]]:
+    with calibration_path.open("r", encoding="utf-8") as handle:
+        calibration_payload = json.load(handle)
+    contracts = {
+        "calibration": {
+            "path": repo_relative_path(calibration_path, root=repo_root),
+            "contract_fingerprint_sha256": require_contract_fingerprint(
+                calibration_payload, label=f"calibration {calibration_path}"
+            ),
         }
-    )
+    }
+    for source_key, role in (
+        ("wavelet_generation_dir", "wavelet_generation"),
+        ("forward_observability_dir", "forward_observability"),
+    ):
+        source_dir = sources[source_key]
+        current_summary_path = source_dir / "run_summary.json"
+        with current_summary_path.open("r", encoding="utf-8") as handle:
+            current_summary = json.load(handle)
+        contracts[role] = {
+            "path": repo_relative_path(current_summary_path, root=repo_root),
+            "contract_fingerprint_sha256": require_contract_fingerprint(
+                current_summary, label=f"{role} {source_dir}"
+            ),
+        }
+    return contracts
 
 
 def generation_scenarios(script_cfg: Mapping[str, Any]) -> list[GenerationScenario]:
@@ -514,7 +532,12 @@ def _run_canonical_generation(
         else None
     )
     h5_path = output_dir / "synthetic_benchmark.h5"
-    forward_model_inputs_sha256 = _time_forward_model_inputs_sha256(sources)
+    input_contracts = _generation_input_contracts(
+        calibration_path=calibration_path,
+        calibration=calibration,
+        sources=sources,
+        repo_root=repo_root,
+    )
     with h5py.File(h5_path, "w") as h5:
         h5.attrs["schema"] = DATA_SCHEMA
         h5.attrs["schema_version"] = DATA_SCHEMA
@@ -523,8 +546,6 @@ def _run_canonical_generation(
         h5.attrs["implementation_scope"] = IMPLEMENTATION_SCOPE
         h5.attrs["suite"] = "canonical"
         h5.attrs["global_seed"] = int(script_cfg["global_seed"])
-        h5.attrs["forward_model_inputs_sha256"] = forward_model_inputs_sha256
-        h5.attrs["impedance_calibration_sha256"] = sha256_file(calibration_path)
         h5.attrs["qc_only"] = bool(qc_only)
         for scenario in scenarios:
             generated = generate_canonical_section(
@@ -748,10 +769,36 @@ def _run_canonical_generation(
         qc_only=qc_only,
     )
     reference = canonical_reference_impedance(calibration)
+    contract_fingerprint = contract_fingerprint_sha256(
+        contract_schema_version=DATA_SCHEMA,
+        semantics={
+            "sample_domain": "time",
+            "suite": "canonical",
+            "output_dt_s": output_dt,
+            "truth_dt_s": calibration.truth_dt_s,
+            "generator_family": calibration.generator_family,
+        },
+        business_config={
+            "global_seed": int(script_cfg["global_seed"]),
+            "canonical": config,
+            "sampling": dict(script_cfg["sampling"]),
+            "forward_qc": dict(script_cfg["forward_qc"]),
+            "lfm": dict(script_cfg["lfm"]),
+            "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
+        },
+        input_contracts=input_contracts,
+        primary_artifacts={
+            "synthetic_benchmark": h5_path,
+            "sample_index": output_dir / "sample_index.csv",
+        },
+    )
     manifest = {
         "schema": DATA_SCHEMA,
         "schema_version": DATA_SCHEMA,
         "status": "success",
+        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "contract_fingerprint_sha256": contract_fingerprint,
+        "input_contracts": input_contracts,
         "sample_domain": "time",
         "generator_family": calibration.generator_family,
         "implementation_scope": IMPLEMENTATION_SCOPE,
@@ -764,9 +811,7 @@ def _run_canonical_generation(
             for key, path in sources.items()
         },
         "config_provenance": dict(config_provenance),
-        "forward_model_inputs_sha256": forward_model_inputs_sha256,
         "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
-        "impedance_calibration_sha256": sha256_file(calibration_path),
         "global_seed": int(script_cfg["global_seed"]),
         "output_dt_s": output_dt,
         "truth_dt_s": calibration.truth_dt_s,
@@ -792,7 +837,6 @@ def _run_canonical_generation(
                 "dt_s": float(highres_wavelet.time_s[1] - highres_wavelet.time_s[0]),
                 "n_samples": int(highres_wavelet.amplitude.size),
                 "l2_energy": float(np.linalg.norm(highres_wavelet.amplitude)),
-                "sha256": array_sha256(highres_wavelet.amplitude),
             }
         ),
         "antialias_filter": {
@@ -806,19 +850,6 @@ def _run_canonical_generation(
             ),
             "cutoff_output_nyquist_fraction": 0.9,
             "kaiser_beta": 8.6,
-            "taps_sha256": array_sha256(
-                antialias_taps(
-                    int(script_cfg["sampling"]["vertical_oversampling_factor"])
-                )
-            ),
-        },
-        "probe_source_hashes": {
-            "frequency_evidence_bands.csv": sha256_file(
-                sources["forward_observability_dir"] / "frequency_evidence_bands.csv"
-            ),
-            "well_frequency_sensitivity.csv": sha256_file(
-                sources["forward_observability_dir"] / "well_frequency_sensitivity.csv"
-            ),
         },
         "not_yet_implemented": [],
         "figures": {
@@ -834,31 +865,6 @@ def _run_canonical_generation(
                     )
                 ),
                 root=repo_root,
-            ),
-        },
-        "files": {
-            "synthetic_benchmark.h5": sha256_file(h5_path),
-            "sample_index.csv": sha256_file(output_dir / "sample_index.csv"),
-            "object_catalog.csv": sha256_file(output_dir / "object_catalog.csv"),
-            "generation_qc.csv": sha256_file(output_dir / "generation_qc.csv"),
-            "canonical_geometry_qc.csv": sha256_file(
-                output_dir / "canonical_geometry_qc.csv"
-            ),
-            "frequency_probe_results.csv": sha256_file(
-                output_dir / "frequency_probe_results.csv"
-            ),
-            "probe_frequency_catalog.csv": sha256_file(
-                output_dir / "probe_frequency_catalog.csv"
-            ),
-            "seismic_variant_results.csv": sha256_file(
-                output_dir / "seismic_variant_results.csv"
-            ),
-            "generation_rejection_details.csv": sha256_file(
-                output_dir / "generation_rejection_details.csv"
-            ),
-            "scenario_catalog.csv": sha256_file(output_dir / "scenario_catalog.csv"),
-            "figures/figure_manifest.json": sha256_file(
-                output_dir / "figures" / "figure_manifest.json"
             ),
         },
     }
@@ -893,22 +899,11 @@ def run_generation(
     debug_attempt_limit = validate_debug_attempt_limit(debug_attempt_limit)
     calibration = load_calibration(calibration_path)
     _validate_calibration_horizon_contract(calibration, script_cfg)
-    for key, recorded in calibration.source_runs.items():
-        if (
-            key in sources
-            and resolve_relative_path(recorded, root=repo_root).resolve()
-            != sources[key].resolve()
-        ):
-            raise ValueError(f"impedance_calibration_source_mismatch:{key}")
-    for relative_name, expected_hash in calibration.source_hashes.items():
-        directory_key, filename = relative_name.split("/", maxsplit=1)
-        if directory_key not in sources:
-            raise ValueError(f"impedance_calibration_source_mismatch:{directory_key}")
-        actual_hash = sha256_file(sources[directory_key] / filename)
-        if actual_hash != expected_hash:
-            raise ValueError(
-                f"impedance_calibration_source_mismatch:sha256:{relative_name}"
-            )
+    input_contracts = _generation_input_contracts(
+        calibration_path=calibration_path,
+        sources=sources,
+        repo_root=repo_root,
+    )
     output_dir.mkdir(parents=True, exist_ok=False)
     logger = configure_generation_logger(output_dir, sample_domain="time")
     logger.info("Synthoseis generation started: suite=%s", suite)
@@ -1087,7 +1082,6 @@ def run_generation(
     )
     probe_parent_counts = {section.section_id: 0 for section in sections}
     h5_path = output_dir / "synthetic_benchmark.h5"
-    forward_model_inputs_sha256 = _time_forward_model_inputs_sha256(sources)
     with AttemptProgressLog(
         output_dir / "attempt_progress.csv",
         phase="generation",
@@ -1103,8 +1097,6 @@ def run_generation(
         h5.attrs["implementation_scope"] = IMPLEMENTATION_SCOPE
         h5.attrs["suite"] = "field_conditioned"
         h5.attrs["global_seed"] = int(script_cfg["global_seed"])
-        h5.attrs["forward_model_inputs_sha256"] = forward_model_inputs_sha256
-        h5.attrs["impedance_calibration_sha256"] = sha256_file(calibration_path)
         h5.attrs["qc_only"] = bool(qc_only)
         for sequence_index, plan_row in enumerate(
             preflight.accepted_plan.to_dict(orient="records"), start=1
@@ -1487,6 +1479,29 @@ def run_generation(
         suite="field_conditioned",
         qc_only=qc_only,
     )
+    contract_fingerprint = contract_fingerprint_sha256(
+        contract_schema_version=DATA_SCHEMA,
+        semantics={
+            "sample_domain": "time",
+            "suite": "field_conditioned",
+            "output_dt_s": output_dt,
+            "truth_dt_s": calibration.truth_dt_s,
+            "generator_family": calibration.generator_family,
+        },
+        business_config={
+            "global_seed": int(script_cfg["global_seed"]),
+            "sampling": dict(script_cfg["sampling"]),
+            "generation": dict(script_cfg["generation"]),
+            "forward_qc": dict(script_cfg["forward_qc"]),
+            "lfm": dict(script_cfg["lfm"]),
+            "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
+        },
+        input_contracts=input_contracts,
+        primary_artifacts={
+            "synthetic_benchmark": h5_path,
+            "sample_index": output_dir / "sample_index.csv",
+        },
+    )
     manifest = {
         "schema": DATA_SCHEMA,
         "schema_version": DATA_SCHEMA,
@@ -1495,6 +1510,9 @@ def run_generation(
             if development_limited
             else ("completed_with_warnings" if completed_with_warnings else "success")
         ),
+        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "contract_fingerprint_sha256": contract_fingerprint,
+        "input_contracts": input_contracts,
         "generator_family": calibration.generator_family,
         "implementation_scope": IMPLEMENTATION_SCOPE,
         "development_limited": development_limited,
@@ -1507,9 +1525,7 @@ def run_generation(
         },
         "config_provenance": dict(config_provenance),
         "sample_domain": "time",
-        "forward_model_inputs_sha256": forward_model_inputs_sha256,
         "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
-        "impedance_calibration_sha256": sha256_file(calibration_path),
         "global_seed": int(script_cfg["global_seed"]),
         "output_dt_s": output_dt,
         "truth_dt_s": calibration.truth_dt_s,
@@ -1552,7 +1568,6 @@ def run_generation(
                 "dt_s": float(highres_wavelet.time_s[1] - highres_wavelet.time_s[0]),
                 "n_samples": int(highres_wavelet.amplitude.size),
                 "l2_energy": float(np.linalg.norm(highres_wavelet.amplitude)),
-                "sha256": array_sha256(highres_wavelet.amplitude),
             }
         ),
         "antialias_filter": {
@@ -1566,19 +1581,6 @@ def run_generation(
             ),
             "cutoff_output_nyquist_fraction": 0.9,
             "kaiser_beta": 8.6,
-            "taps_sha256": array_sha256(
-                antialias_taps(
-                    int(script_cfg["sampling"]["vertical_oversampling_factor"])
-                )
-            ),
-        },
-        "probe_source_hashes": {
-            "frequency_evidence_bands.csv": sha256_file(
-                sources["forward_observability_dir"] / "frequency_evidence_bands.csv"
-            ),
-            "well_frequency_sensitivity.csv": sha256_file(
-                sources["forward_observability_dir"] / "well_frequency_sensitivity.csv"
-            ),
         },
         "not_yet_implemented": [],
         "split_policy": {
@@ -1623,41 +1625,6 @@ def run_generation(
                     )
                 ),
                 root=repo_root,
-            ),
-        },
-        "files": {
-            "synthetic_benchmark.h5": sha256_file(h5_path),
-            "sample_index.csv": sha256_file(output_dir / "sample_index.csv"),
-            "object_catalog.csv": sha256_file(output_dir / "object_catalog.csv"),
-            "object_lateral_coefficients.csv": sha256_file(
-                output_dir / "object_lateral_coefficients.csv"
-            ),
-            "generation_qc.csv": sha256_file(output_dir / "generation_qc.csv"),
-            "frequency_probe_results.csv": sha256_file(
-                output_dir / "frequency_probe_results.csv"
-            ),
-            "probe_frequency_catalog.csv": sha256_file(
-                output_dir / "probe_frequency_catalog.csv"
-            ),
-            "seismic_variant_results.csv": sha256_file(
-                output_dir / "seismic_variant_results.csv"
-            ),
-            "generation_rejection_details.csv": sha256_file(
-                output_dir / "generation_rejection_details.csv"
-            ),
-            "rejection_reason_summary.csv": sha256_file(rejection_summary_path),
-            "scenario_catalog.csv": sha256_file(output_dir / "scenario_catalog.csv"),
-            "attempt_plan.csv": sha256_file(output_dir / "attempt_plan.csv"),
-            "attempt_progress.csv": sha256_file(output_dir / "attempt_progress.csv"),
-            "preflight_attempts.csv": sha256_file(output_dir / "preflight_attempts.csv"),
-            "preflight_scenario_catalog.csv": sha256_file(
-                output_dir / "preflight_scenario_catalog.csv"
-            ),
-            "preflight_summary.json": sha256_file(output_dir / "preflight_summary.json"),
-            "section_geometry_qc.csv": sha256_file(section_geometry_qc_path),
-            "section_geometry_feasibility_qc.csv": sha256_file(feasibility_path),
-            "figures/figure_manifest.json": sha256_file(
-                output_dir / "figures" / "figure_manifest.json"
             ),
         },
     }

@@ -1,4 +1,4 @@
-"""Depth field-conditioned generation and v2 artifact writer."""
+"""Depth field-conditioned generation and v3 artifact writer."""
 
 from __future__ import annotations
 
@@ -48,10 +48,11 @@ from cup.synthetic.depth.object_core_adapter import (
     load_depth_calibration_for_object_core,
 )
 from cup.utils.io import (
-    array_sha256,
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
     repo_relative_path,
+    require_contract_fingerprint,
     resolve_relative_path,
-    sha256_file,
     write_json,
 )
 
@@ -682,8 +683,6 @@ def generate_depth_realization(
             "physics_halo_samples": int(round(halo / model_dz)),
             "context_m": context,
             "maximum_allowed_vp_mps": maximum_vp,
-            "highres_seismic_sha256": array_sha256(seismic_high),
-            "antialias_taps_sha256": array_sha256(taps),
             "antialias_numtaps": int(taps.size),
             "antialias_scipy_version": scipy.__version__,
             "seismic_observed_rms": observed_rms,
@@ -1291,7 +1290,6 @@ def run_depth_generation(
     workflow: Any,
     script_cfg: Mapping[str, Any],
     sources: Mapping[str, Path],
-    source_provenance: Mapping[str, Any],
     forward_inputs: Mapping[str, Any],
     config_provenance: Mapping[str, str],
     calibration_path: Path,
@@ -1305,11 +1303,29 @@ def run_depth_generation(
     calibration, calibration_payload = load_depth_calibration_for_object_core(
         calibration_path
     )
-    if (
-        calibration_payload.get("forward_model_inputs_sha256")
-        != forward_inputs["_sha256"]
+    calibration_contract_fingerprint = require_contract_fingerprint(
+        calibration_payload, label=f"depth calibration {calibration_path}"
+    )
+    recorded_rock_contract = dict(calibration.input_contracts.get("rock_physics_analysis") or {})
+    if str(recorded_rock_contract.get("contract_fingerprint_sha256") or "") != str(
+        forward_inputs["_contract_fingerprint_sha256"]
     ):
-        raise ValueError("impedance calibration forward_model_inputs SHA-256 mismatch.")
+        raise ValueError("impedance calibration and forward inputs use different rock-physics contracts.")
+    input_contracts = {
+        "calibration": {
+            "path": repo_relative_path(calibration_path, root=repo_root),
+            "contract_fingerprint_sha256": calibration_contract_fingerprint,
+        },
+        "rock_physics_analysis": {
+            "path": repo_relative_path(
+                sources["rock_physics_analysis_dir"] / "run_summary.json",
+                root=repo_root,
+            ),
+            "contract_fingerprint_sha256": str(
+                forward_inputs["_contract_fingerprint_sha256"]
+            ),
+        },
+    }
     if list(calibration_payload.get("horizon_contract") or []) != list(
         script_cfg["horizons"]
     ):
@@ -1328,16 +1344,6 @@ def run_depth_generation(
         raise ValueError(
             "impedance calibration truth_dz_m differs from current sampling config."
         )
-    for key, path in sources.items():
-        recorded = str(
-            dict(calibration_payload.get("source_runs") or {}).get(key) or ""
-        )
-        if (
-            not recorded
-            or resolve_relative_path(recorded, root=repo_root).resolve()
-            != path.resolve()
-        ):
-            raise ValueError(f"impedance calibration source run mismatch: {key}")
     output_dir.mkdir(parents=True, exist_ok=False)
     logger = configure_generation_logger(output_dir, sample_domain="depth")
     logger.info("Depth Synthoseis generation started")
@@ -1438,8 +1444,6 @@ def run_depth_generation(
         h5.attrs["generator_family"] = GENERATOR_FAMILY
         h5.attrs["suite"] = "field_conditioned"
         h5.attrs["global_seed"] = int(script_cfg["global_seed"])
-        h5.attrs["forward_model_inputs_sha256"] = forward_inputs["_sha256"]
-        h5.attrs["impedance_calibration_sha256"] = sha256_file(calibration_path)
         h5.attrs["qc_only"] = bool(qc_only)
         for sequence_index, row in enumerate(
             preflight.accepted_plan.to_dict(orient="records"), start=1
@@ -1463,7 +1467,6 @@ def run_depth_generation(
                 "held_out_geometry_family": script_cfg["splits"][
                     "held_out_geometry_family"
                 ],
-                "forward_model_inputs_sha256": forward_inputs["_sha256"],
             }
             progress_status = "rejected"
             progress_reason = ""
@@ -1550,7 +1553,6 @@ def run_depth_generation(
                     )
                 local_highres_row = {
                     "parent_realization_id": base_id,
-                    "highres_seismic_sha256": generated.qc["highres_seismic_sha256"],
                     "physics_halo_m": generated.qc["physics_halo_m"],
                     "antialias_filter_half_width_m": generated.qc[
                         "antialias_filter_half_width_m"
@@ -1562,7 +1564,6 @@ def run_depth_generation(
                     "highres_dz_m": float(np.diff(generated.tvdss_highres_m[:2])[0]),
                     "model_dz_m": float(np.diff(generated.tvdss_model_m[:2])[0]),
                     "antialias_numtaps": generated.qc["antialias_numtaps"],
-                    "antialias_taps_sha256": generated.qc["antialias_taps_sha256"],
                 }
                 local_subgrid_row = {
                     "parent_realization_id": base_id,
@@ -1702,27 +1703,28 @@ def run_depth_generation(
         qc_only=qc_only,
     )
 
-    file_names = [
-        "synthetic_benchmark.h5",
-        "sample_index.csv",
-        "attempt_plan.csv",
-        "scenario_catalog.csv",
-        "generation_qc.csv",
-        "generation_rejection_details.csv",
-        "object_catalog.csv",
-        "object_lateral_coefficients.csv",
-        "highres_forward_qc.csv",
-        "subgrid_forward_qc.csv",
-        "seismic_variant_results.csv",
-        "section_geometry_qc.csv",
-        "figures/figure_manifest.json",
-        "section_geometry_feasibility_qc.csv",
-        "rejection_reason_summary.csv",
-        "attempt_progress.csv",
-        "preflight_attempts.csv",
-        "preflight_scenario_catalog.csv",
-        "preflight_summary.json",
-    ]
+    contract_fingerprint = contract_fingerprint_sha256(
+        contract_schema_version=SCHEMA_VERSION,
+        semantics={
+            "sample_domain": "depth",
+            "sample_unit": "m",
+            "depth_basis": "tvdss",
+            "suite": "field_conditioned",
+            "generator_family": GENERATOR_FAMILY,
+            "sampling": dict(script_cfg["sampling"]),
+        },
+        business_config={
+            "global_seed": int(script_cfg["global_seed"]),
+            "generation": dict(script_cfg["generation"]),
+            "lfm": dict(script_cfg["lfm"]),
+            "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
+        },
+        input_contracts=input_contracts,
+        primary_artifacts={
+            "synthetic_benchmark": h5_path,
+            "sample_index": output_dir / "sample_index.csv",
+        },
+    )
     manifest = {
         "schema": SCHEMA_VERSION,
         "schema_version": SCHEMA_VERSION,
@@ -1733,6 +1735,9 @@ def run_depth_generation(
             if failure_reason
             else ("completed_with_warnings" if completed_with_warnings else "success")
         ),
+        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "contract_fingerprint_sha256": contract_fingerprint,
+        "input_contracts": input_contracts,
         "sample_domain": "depth",
         "depth_basis": "tvdss",
         "generator_family": GENERATOR_FAMILY,
@@ -1740,7 +1745,6 @@ def run_depth_generation(
         "development_limited": development,
         "qc_only": bool(qc_only),
         "training_consumable": not bool(qc_only),
-        "forward_model_inputs_sha256": forward_inputs["_sha256"],
         "forward_model_inputs_path": str(forward_inputs["_path"]),
         "global_seed": int(script_cfg["global_seed"]),
         "n_sections": len(sections),
@@ -1752,19 +1756,13 @@ def run_depth_generation(
         "accepted_parent_realizations": int(len(base)),
         "rejected_parent_realizations": int(len(plan) - len(base)),
         "forward_inputs": {
-            "wavelet_sha256": forward_inputs["wavelet"]["sha256"],
-            "ai_velocity_relation_sha256": forward_inputs["ai_velocity_relation"][
-                "sha256"
-            ],
-            "well_input_inventory_sha256": forward_inputs[
-                "well_input_inventory_sha256"
-            ],
+            "wavelet_path": forward_inputs["wavelet"]["path"],
+            "ai_velocity_relation_path": forward_inputs["ai_velocity_relation"]["path"],
             "shifted_las_sources": list(
                 calibration_payload.get("shifted_las_sources") or []
             ),
         },
         "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
-        "impedance_calibration_sha256": sha256_file(calibration_path),
         "canonical_enabled": False,
         "probe_enabled": False,
         "geometry_filters": sorted({str(value) for value in geometry_families})
@@ -1781,7 +1779,6 @@ def run_depth_generation(
             key: repo_relative_path(path, root=repo_root)
             for key, path in sources.items()
         },
-        "source_provenance": dict(source_provenance),
         "config_provenance": dict(config_provenance),
         "rejection_reason_summary": (
             []
@@ -1859,7 +1856,6 @@ def run_depth_generation(
                 "combined_moderate",
             ],
         },
-        "files": {name: sha256_file(output_dir / name) for name in file_names},
         "quality_warnings": (
             []
             if not completed_with_warnings

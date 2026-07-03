@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -21,9 +20,9 @@ from cup.seismic.wavelet import (
 from cup.synthetic.dataset import SynthoseisBenchmark
 from cup.utils.io import (
     repo_relative_path,
+    require_contract_fingerprint,
     resolve_artifact_path,
     resolve_relative_path,
-    sha256_file,
     write_json,
 )
 from ginn_v2.data import denormalize_delta
@@ -102,8 +101,9 @@ def load_model_manifest(model_cfg: Mapping[str, Any], *, root: Path) -> dict[str
         raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v2":
+    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v3":
         raise ValueError(f"Unsupported model run manifest schema: {manifest_path}")
+    require_contract_fingerprint(manifest, label=f"model run {model_run_dir}")
     return manifest
 
 
@@ -117,18 +117,16 @@ def _model_manifest_and_dir(model_cfg: Mapping[str, Any], *, root: Path) -> tupl
         raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v2":
+    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v3":
         raise ValueError(f"Unsupported model run manifest schema: {manifest_path}")
+    require_contract_fingerprint(manifest, label=f"model run {model_run_dir}")
     gate = manifest.get("synthetic_gate_evidence")
     if not isinstance(gate, Mapping):
         raise ValueError(f"Model run manifest lacks synthetic_gate_evidence: {manifest_path}")
-    required_gate = ("report_dir", "report_card", "report_card_sha256", "is_current_frozen_candidate")
+    required_gate = ("report_dir", "report_card", "is_current_frozen_candidate")
     missing_gate = [key for key in required_gate if key not in gate]
     if missing_gate:
         raise ValueError(f"synthetic_gate_evidence missing {missing_gate}: {manifest_path}")
-    digest = str(gate.get("report_card_sha256") or "")
-    if len(digest) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in digest):
-        raise ValueError(f"synthetic_gate_evidence.report_card_sha256 must be a full SHA-256 digest: {manifest_path}")
     return model_run_dir, manifest
 
 
@@ -153,7 +151,7 @@ def _primary_checkpoint_path(
 ) -> Path:
     checkpoints = manifest.get("checkpoints")
     if not isinstance(checkpoints, Mapping):
-        raise ValueError("GINN-v2 v2 manifest lacks checkpoints mapping.")
+        raise ValueError("GINN-v2 v3 manifest lacks checkpoints mapping.")
     primary = str(checkpoints.get("primary") or "")
     if primary not in {"best", "final"}:
         raise ValueError(f"Invalid GINN-v2 primary checkpoint: {primary!r}")
@@ -163,8 +161,6 @@ def _primary_checkpoint_path(
     path = resolve_relative_path(str(record.get("path") or ""), root=root)
     if not path.is_file():
         raise FileNotFoundError(path)
-    if sha256_file(path) != str(record.get("sha256") or ""):
-        raise ValueError(f"GINN-v2 primary checkpoint SHA-256 mismatch: {path}")
     return path
 
 
@@ -405,12 +401,11 @@ def load_real_field_section(
             "lfm_run_dir": str(selected_variant.run_dir),
             "variant_id": selected_variant.variant_id,
             "well_control_run_dir": str(selected_variant.well_control_run_dir),
-            "lfm_sha256": selected_variant.lfm_sha256,
+            "lfm_contract_fingerprint_sha256": selected_variant.contract_fingerprint_sha256,
             "sample_domain": sample_domain,
             "sample_unit": selected_variant.variant_metadata.get("sample_unit"),
             "seismic_value_transform": str(seismic_transform),
             "seismic_reference_stats_file": str(inputs.get("seismic_reference_stats_file") or ""),
-            "seismic_reference_stats_sha256": str(inputs.get("seismic_reference_stats_sha256") or ""),
             "seismic_transform_metadata": seismic_transform_metadata,
             "section": dict(section_cfg),
         },
@@ -530,12 +525,11 @@ def load_real_field_volume(
             "lfm_run_dir": str(selected_variant.run_dir),
             "variant_id": selected_variant.variant_id,
             "well_control_run_dir": str(selected_variant.well_control_run_dir),
-            "lfm_sha256": selected_variant.lfm_sha256,
+            "lfm_contract_fingerprint_sha256": selected_variant.contract_fingerprint_sha256,
             "sample_domain": sample_domain,
             "sample_unit": selected_variant.variant_metadata.get("sample_unit"),
             "seismic_value_transform": str(seismic_transform),
             "seismic_reference_stats_file": str(inputs.get("seismic_reference_stats_file") or ""),
-            "seismic_reference_stats_sha256": str(inputs.get("seismic_reference_stats_sha256") or ""),
             "seismic_transform_metadata": seismic_transform_metadata,
             "volume": volume_cfg,
         },
@@ -654,21 +648,24 @@ def run_zero_shot_model(
     index_path = model_dir / "prediction_index.csv"
     pd.DataFrame.from_records(rows).to_csv(index_path, index=False)
     summary = {
-        "schema_version": "real_field_zero_shot_model_v1",
+        "schema_version": "real_field_zero_shot_model_v2",
         "status": "ok",
+        "input_contracts": {
+            "model_run": {
+                "path": repo_relative_path(model_run_dir / "model_run_manifest.json", root=root),
+                "contract_fingerprint_sha256": require_contract_fingerprint(
+                    manifest, label=f"model run {model_run_dir}"
+                ),
+            }
+        },
         "model_role": model_role,
         "model_id": model_id_label,
         "checkpoint_model_id": str(checkpoint["model_id"]),
         "model_run_dir": repo_relative_path(model_run_dir, root=root),
         "checkpoint": repo_relative_path(checkpoint_path, root=root),
-        "checkpoint_sha256": sha256_file(checkpoint_path),
         "normalization_file": (
             repo_relative_path(normalization_path, root=root) if normalization_path is not None else ""
         ),
-        "normalization_file_sha256": sha256_file(normalization_path) if normalization_path is not None else "",
-        "normalization_sha256": hashlib.sha256(
-            json.dumps(normalization, sort_keys=True).encode("utf-8")
-        ).hexdigest(),
         "synthetic_gate_evidence": synthetic_gate_evidence,
         "device": device_metadata,
         "normalization": normalization,
@@ -679,7 +676,6 @@ def run_zero_shot_model(
             "predictions": repo_relative_path(npz_path, root=root),
             "prediction_index": repo_relative_path(index_path, root=root),
         },
-        "output_prediction_sha256": sha256_file(npz_path),
         "prediction_coverage_fraction": float(np.mean(weight > 0.0)),
     }
     write_json(model_dir / "real_field_zero_shot_model_summary.json", summary)
@@ -807,22 +803,25 @@ def run_zero_shot_volume_model(
     index_path = model_dir / "prediction_index.csv"
     pd.DataFrame.from_records(rows).to_csv(index_path, index=False)
     summary = {
-        "schema_version": "real_field_zero_shot_model_v1",
+        "schema_version": "real_field_zero_shot_model_v2",
         "status": "ok",
+        "input_contracts": {
+            "model_run": {
+                "path": repo_relative_path(model_run_dir / "model_run_manifest.json", root=root),
+                "contract_fingerprint_sha256": require_contract_fingerprint(
+                    manifest, label=f"model run {model_run_dir}"
+                ),
+            }
+        },
         "output_mode": "volume",
         "model_role": model_role,
         "model_id": model_id_label,
         "checkpoint_model_id": str(checkpoint["model_id"]),
         "model_run_dir": repo_relative_path(model_run_dir, root=root),
         "checkpoint": repo_relative_path(checkpoint_path, root=root),
-        "checkpoint_sha256": sha256_file(checkpoint_path),
         "normalization_file": (
             repo_relative_path(normalization_path, root=root) if normalization_path is not None else ""
         ),
-        "normalization_file_sha256": sha256_file(normalization_path) if normalization_path is not None else "",
-        "normalization_sha256": hashlib.sha256(
-            json.dumps(normalization, sort_keys=True).encode("utf-8")
-        ).hexdigest(),
         "synthetic_gate_evidence": synthetic_gate_evidence,
         "device": device_metadata,
         "normalization": normalization,
@@ -834,7 +833,6 @@ def run_zero_shot_volume_model(
             "predictions": repo_relative_path(npz_path, root=root),
             "prediction_index": repo_relative_path(index_path, root=root),
         },
-        "output_prediction_sha256": sha256_file(npz_path),
         "prediction_coverage_fraction": float(np.mean(weight > 0.0)),
     }
     write_json(model_dir / "real_field_zero_shot_model_summary.json", summary)
@@ -933,7 +931,6 @@ def load_selected_wavelet(
     )
     return time_s, wavelet, {
         "selected_wavelet_csv": str(csv_path),
-        "wavelet_sha256": sha256_file(csv_path),
         "n_samples": int(wavelet.size),
         "dt_s": float(dt_s),
         "active_support_threshold": float(active_threshold),
@@ -1044,13 +1041,13 @@ def _validate_lfm_npz_contract(
         files = set(data.files)
         required = {"log_ai", "valid_mask_model", "ilines", "xlines", "samples", "metadata_json"}
         if files != required:
-            raise ValueError(f"R0 primary LFM must use the minimal real_field_lfm_variant_v2 keys {sorted(required)}: {path}")
+            raise ValueError(f"R0 primary LFM must use the minimal real_field_lfm_variant_v3 keys {sorted(required)}: {path}")
         if str(lfm_transform).casefold() not in {"identity", "none"}:
-            raise ValueError("real_field_lfm_variant_v2/log_ai is already log(AI); use identity transform.")
+            raise ValueError("real_field_lfm_variant_v3/log_ai is already log(AI); use identity transform.")
         if "metadata_json" not in files:
             raise ValueError(f"R0 primary LFM lacks metadata_json: {path}")
         metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
-    if str(metadata.get("schema_version")) != "real_field_lfm_variant_v2":
+    if str(metadata.get("schema_version")) != "real_field_lfm_variant_v3":
         raise ValueError(f"Unsupported LFM schema_version={metadata.get('schema_version')!r}: {path}")
     if str(metadata.get("variant_id")) != str(expected_variant_id):
         raise ValueError(f"LFM variant_id mismatch: expected {expected_variant_id!r}, got {metadata.get('variant_id')!r}")
@@ -1186,7 +1183,7 @@ def _validate_lfm_log_domain(
             "LFM values do not look like log(AI). "
             f"lfm_value_transform={lfm_transform!r}, p01={p01:.6g}, "
             f"median={median:.6g}, p99={p99:.6g}, path={path}. "
-            "Unified LFM v2 requires real_field_lfm_variant_v2/log_ai with identity transform."
+            "Unified LFM v3 requires real_field_lfm_variant_v3/log_ai with identity transform."
         )
 
 

@@ -1,4 +1,4 @@
-"""Depth-domain calibration adapters for Synthoseis-lite v2."""
+"""Depth-domain calibration adapters for Synthoseis-lite v3."""
 
 from __future__ import annotations
 
@@ -20,21 +20,17 @@ from cup.synthetic.depth.object_core_adapter import (
     depth_well_zone_curves_for_object_core,
     load_depth_calibration_for_object_core,
 )
-from cup.utils.io import repo_relative_path, resolve_relative_path, sha256_file, write_json
+from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
+    repo_relative_path,
+    resolve_relative_path,
+    write_json,
+)
 from cup.utils.statistics import radius_connected_components
 from cup.well.assets import normalize_well_name
 from cup.well.las import read_las_curve
 from cup.well.td import find_well_top_md
-
-
-def _verify_file(path_value: Any, digest: Any, *, repo_root: Path, label: str) -> Path:
-    path = resolve_relative_path(str(path_value), root=repo_root)
-    if not path.is_file():
-        raise FileNotFoundError(f"{label} does not exist: {path}")
-    actual = sha256_file(path)
-    if actual != str(digest):
-        raise ValueError(f"{label} SHA-256 mismatch: expected={digest}, actual={actual}")
-    return path
 
 
 def _required_file(path_value: Any, *, repo_root: Path, label: str) -> Path:
@@ -78,9 +74,7 @@ def _load_step5_shifted_las_sources(
             {
                 "well_id": well_name,
                 "full_las_path": repo_relative_path(full_path, root=repo_root),
-                "full_las_sha256": sha256_file(full_path),
                 "filtered_las_path": repo_relative_path(filtered_path, root=repo_root),
-                "filtered_las_sha256": sha256_file(filtered_path),
             }
         )
     if not rows:
@@ -235,17 +229,15 @@ def run_depth_calibration(
     inventory = inventory.set_index("_key", drop=False)
 
     forward_path = Path(str(forward_inputs["_path"]))
-    _verify_file(
-        forward_inputs["wavelet"]["path"], forward_inputs["wavelet"]["sha256"],
-        repo_root=repo_root, label="forward wavelet",
+    _required_file(
+        forward_inputs["wavelet"]["path"], repo_root=repo_root, label="forward wavelet"
     )
-    _verify_file(
-        forward_inputs["ai_velocity_relation"]["path"], forward_inputs["ai_velocity_relation"]["sha256"],
-        repo_root=repo_root, label="AI-Vp relation",
+    _required_file(
+        forward_inputs["ai_velocity_relation"]["path"], repo_root=repo_root, label="AI-Vp relation"
     )
     input_inventory_path = sources["rock_physics_analysis_dir"] / "well_input_inventory.csv"
-    if sha256_file(input_inventory_path) != str(forward_inputs["well_input_inventory_sha256"]):
-        raise ValueError("Step 6 well_input_inventory SHA-256 mismatch.")
+    if not input_inventory_path.is_file():
+        raise FileNotFoundError(input_inventory_path)
     step5_metrics_path = sources["wavelet_batch_synthetic_depth_dir"] / "wavelet_batch_metrics.csv"
     shifted_las_sources = _load_step5_shifted_las_sources(step5_metrics_path, repo_root=repo_root)
 
@@ -291,15 +283,13 @@ def run_depth_calibration(
         well_name = str(source["well_id"])
         key = normalize_well_name(well_name)
         row = inventory.loc[key]
-        full_las_path = _verify_file(
+        full_las_path = _required_file(
             source["full_las_path"],
-            source["full_las_sha256"],
             repo_root=repo_root,
             label=f"{well_name} shifted_preprocessed_las",
         )
-        filtered_las_path = _verify_file(
+        filtered_las_path = _required_file(
             source["filtered_las_path"],
-            source["filtered_las_sha256"],
             repo_root=repo_root,
             label=f"{well_name} shifted_filtered_las",
         )
@@ -430,26 +420,19 @@ def run_depth_calibration(
 
     if not inputs:
         raise ValueError("Depth calibration produced no valid well-zone inputs.")
-    source_hashes = {
-        "well_inventory.csv": sha256_file(inventory_path),
-        "forward_model_inputs.json": sha256_file(forward_path),
-        "well_input_inventory.csv": sha256_file(input_inventory_path),
-        "well_tops": sha256_file(well_tops_path),
-        "wavelet": str(forward_inputs["wavelet"]["sha256"]),
-        "ai_velocity_relation": str(forward_inputs["ai_velocity_relation"]["sha256"]),
-        "workflow_config": str(config_provenance["workflow_config_sha256"]),
-        "experiment_config": str(config_provenance["experiment_sha256"]),
-        "wavelet_batch_metrics.csv": sha256_file(step5_metrics_path),
-        **{f"horizon:{name}": sha256_file(path) for name, path in horizon_paths.items()},
-        **{f"full_las:{item['well_id']}": str(item["full_las_sha256"]) for item in shifted_las_sources},
-        **{f"filtered_las:{item['well_id']}": str(item["filtered_las_sha256"]) for item in shifted_las_sources},
+    input_contracts = {
+        key.removesuffix("_dir"): {
+            "path": repo_relative_path(sources[key] / "run_summary.json", root=repo_root),
+            "contract_fingerprint_sha256": str(value["contract_fingerprint_sha256"]),
+        }
+        for key, value in source_provenance.items()
     }
     legacy, objects, qc, samples, backgrounds, profile_samples = calibrate_depth_object_core(
         inputs,
         truth_dz_m=truth_dz,
         ordered_horizons=[item["name"] for item in script_cfg["horizons"]],
         source_runs={key: repo_relative_path(path, root=repo_root) for key, path in sources.items()},
-        source_hashes=source_hashes,
+        input_contracts=input_contracts,
         state_threshold_sigma=float(script_cfg["impedance"]["state_threshold_sigma"]),
         huber_delta_parent_sigma_floor=float(
             script_cfg["impedance"]["huber_delta_parent_sigma_floor"]
@@ -467,7 +450,6 @@ def run_depth_calibration(
         "horizon_contract": list(script_cfg["horizons"]),
         "source_provenance": dict(source_provenance),
         "config_provenance": dict(config_provenance),
-        "forward_model_inputs_sha256": str(forward_inputs["_sha256"]),
         "locked_step3_run": str(dict(forward_inputs.get("source_runs") or {}).get("well_preprocess_dir") or ""),
         "locked_step5_run": repo_relative_path(sources["wavelet_batch_synthetic_depth_dir"], root=repo_root),
         "well_curve_source_contract": {
@@ -496,7 +478,32 @@ def run_depth_calibration(
     }
     for name, frame in frames.items():
         frame.to_csv(output_dir / name, index=False)
-    payload["artifact_hashes"] = {name: sha256_file(output_dir / name) for name in frames}
+    contract_fingerprint = contract_fingerprint_sha256(
+        contract_schema_version=CALIBRATION_SCHEMA,
+        semantics={
+            "sample_domain": "depth",
+            "sample_unit": "m",
+            "depth_basis": "tvdss",
+            "truth_dz_m": truth_dz,
+            "ordered_horizons": list(payload["ordered_horizons"]),
+            "generator_family": GENERATOR_FAMILY,
+            "calibration_model": {
+                "parent": payload["parent"],
+                "zones": payload["zones"],
+                "zone_models": payload["zone_models"],
+            },
+        },
+        business_config=script_cfg,
+        input_contracts=input_contracts,
+        primary_artifacts={
+            "well_object_catalog": output_dir / "well_object_catalog.csv",
+            "well_calibration_samples": output_dir / "well_calibration_samples.csv",
+            "well_background_fits": output_dir / "well_background_fits.csv",
+            "well_object_profile_samples": output_dir / "well_object_profile_samples.csv",
+        },
+    )
+    payload["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+    payload["contract_fingerprint_sha256"] = contract_fingerprint
     calibration_path = output_dir / "impedance_calibration.json"
     write_json(calibration_path, payload)
 
@@ -508,7 +515,9 @@ def run_depth_calibration(
         "sample_domain": "depth",
         "depth_basis": "tvdss",
         "generator_family": GENERATOR_FAMILY,
-        "forward_model_inputs_sha256": str(forward_inputs["_sha256"]),
+        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "contract_fingerprint_sha256": contract_fingerprint,
+        "input_contracts": input_contracts,
         "source_runs": payload["source_runs"],
         "config_provenance": dict(config_provenance),
         "n_well_zone_inputs": len(inputs),

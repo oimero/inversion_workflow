@@ -24,7 +24,7 @@ python scripts/real_field_well_controls.py --output-dir scripts/output/well_cont
 
 | 来源 | 文件 | 用途 |
 |------|------|------|
-| 第四步（时间域）或第五步（深度域） | `run_summary.json` | schema/domain 校验和 SHA-256 溯源 |
+| 第四步（时间域）或第五步（深度域） | `run_summary.json` | schema/domain 校验和直接上游契约身份 |
 | 第四步（时间域）或第五步（深度域） | 指标 CSV | 成功井清单和产物路径 |
 | 上游 LAS | 每井 filtered LAS 或 shifted filtered LAS | `AI [m/s*g/cm3]` 曲线 |
 | 上游转换表 | 每井优化 TDT | MD→TWT 映射（仅时间域） |
@@ -129,15 +129,15 @@ real_field_well_controls:
 | `x_m_by_sample` / `y_m_by_sample` | 每个样点的真实米制 XY |
 | `valid_mask` | 布尔数组，标记 log_ai 和四个位置数组同时有限的样点 |
 | `sampling_mode` | 时间直井 `vertical_inventory_position`，时间斜井 `optimized_trace_plan`，深度直井 `vertical_md_minus_kb`，深度斜井 `trajectory_tvdss` |
-| `provenance` | 来源 LAS 路径/SHA-256、转换表路径/SHA-256 |
+| `provenance` | 来源 LAS 与转换表路径；其发布 run 身份由 summary 的 `input_contracts` 表达 |
 
 构建时还会做几何一致性校验：对每个有效样点，用 survey geometry 把真实 XY 反算线号，与记录的 inline/xline 逐点对照。不一致的井被拒绝。
 
 ### 第五步：写入磁盘
 
 1. **逐井 NPZ。** `wells/<normalized_well_name>.npz`，固定字段为 `samples`、`log_ai`、`inline`、`xline`、`x_m`、`y_m`、`valid_mask`、`metadata_json`。无效样点的 log_ai 和位置为 NaN。禁止 pickle/object array。
-2. **Manifest。** `well_control_manifest.csv`，每口候选井一行，记录状态、来源路径/SHA-256、井型、采样模式、有效样点数、NPZ 路径/SHA-256 等。失败的井也保留行，但 `well_npz_path` 为空。
-3. **Run summary。** `run_summary.json`，schema 固定为 `real_field_well_controls_v2`，记录 source adapter、SampleAxis、成功/失败井统计、所有路径和 SHA-256。
+2. **Manifest。** `well_control_manifest.csv`，每口候选井一行，记录状态、来源路径、井型、采样模式、有效样点数和 NPZ 路径等。失败的井也保留行，但 `well_npz_path` 为空。
+3. **Run summary。** `run_summary.json`，schema 固定为 `real_field_well_controls_v3`，记录 source adapter、SampleAxis、直接上游契约、成功/失败井统计、产物路径和唯一契约指纹。
 
 ### 第六步明确不做什么
 
@@ -175,7 +175,9 @@ real_field_well_controls_<timestamp>/
 | `wellbore_class` | `vertical` 或 `deviated` |
 | `sampling_mode` | 具体采样方式 |
 | `n_samples` / `n_valid_samples` | 总样点数 / 有效样点数 |
-| `well_npz_path` / `well_npz_sha256` | NPZ 路径和哈希（失败时为空） |
+| `well_npz_path` | NPZ 路径（失败时为空）；消费者不再重算逐井文件哈希 |
+
+`run_summary.json` 使用 `real_field_well_controls_v3`，通过 `input_contracts` 记录直接上游，并只发布一个 `contract_fingerprint_sha256`。
 
 ### `wells/<well_name>.npz`
 
@@ -194,7 +196,7 @@ real_field_well_controls_<timestamp>/
 
 ### `run_summary.json`
 
-记录 resolved config、source adapter、SampleAxis 描述、成功/失败计数和所有产物的路径与 SHA-256。
+记录业务配置、source adapter、SampleAxis 描述、成功/失败计数、产物路径、直接上游契约和唯一 `contract_fingerprint_sha256`。
 
 ---
 

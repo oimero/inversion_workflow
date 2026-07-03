@@ -14,7 +14,7 @@ from cup.config.sources import assert_recorded_source_matches, require_source_fi
 from cup.utils.io import resolve_relative_path
 
 
-DATA_SCHEMA = "synthoseis_lite_v2"
+DATA_SCHEMA = "synthoseis_lite_v3"
 IMPLEMENTATION_SCOPE = (
     "impedance_truth_frequency_probes_forward_qc_lfm_and_seismic_mismatch"
 )
@@ -147,7 +147,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     _require_keys(field, field_keys, path="synthoseis_lite.geometry.field_conditioned")
     if field.get("enabled") is not True:
         raise ValueError(
-            "Time Synthoseis-lite v2 requires geometry.field_conditioned.enabled=true."
+            "Time Synthoseis-lite v3 requires geometry.field_conditioned.enabled=true."
         )
     canonical = _mapping(
         geometry.get("canonical"), path="synthoseis_lite.geometry.canonical"
@@ -960,9 +960,9 @@ def resolve_sources(
         "r", encoding="utf-8"
     ) as handle:
         summary = json.load(handle)
-    if summary.get("schema_version") != "forward_observability_v1":
+    if summary.get("schema_version") != "forward_observability_v2":
         raise ValueError(
-            "forward_observability run_summary.json must use forward_observability_v1."
+            "forward_observability run_summary.json must use forward_observability_v2."
         )
     recorded = summary.get("source_runs") or {}
     for key in ("well_preprocess_dir", "well_auto_tie_dir", "wavelet_generation_dir"):

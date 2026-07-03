@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from cup.utils.io import sha256_file
+from cup.utils.io import require_contract_fingerprint
 from cup.utils.statistics import radius_connected_components
 from cup.well.real_field_controls import load_well_control_set
 
@@ -34,8 +35,8 @@ ANCHOR_SAMPLE_COLUMNS = [
     "sample_method",
     "wellbore_class",
     "variant_id",
-    "lfm_sha256",
-    "well_control_run_sha256",
+    "lfm_contract_fingerprint_sha256",
+    "well_control_contract_fingerprint_sha256",
 ]
 
 
@@ -114,18 +115,22 @@ def build_well_anchor_samples(
     repo_root: Path,
     cluster_radius_m: float,
     variant_id: str,
-    lfm_sha256: str,
-    expected_well_control_run_sha256: str,
+    lfm_contract_fingerprint_sha256: str,
+    expected_well_control_contract_fingerprint_sha256: str,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Sample one selected LFM variant and derive its unique real-delta labels."""
 
     summary_path = well_control_run_dir / "run_summary.json"
-    actual_control_hash = sha256_file(summary_path)
-    if actual_control_hash != str(expected_well_control_run_sha256):
-        raise ValueError("Canonical WellControlSet run_summary SHA-256 mismatch.")
+    with summary_path.open("r", encoding="utf-8") as handle:
+        control_summary = json.load(handle)
+    actual_control_fingerprint = require_contract_fingerprint(
+        control_summary, label=f"WellControlSet {well_control_run_dir}"
+    )
+    if actual_control_fingerprint != str(expected_well_control_contract_fingerprint_sha256):
+        raise ValueError("Canonical WellControlSet contract identity mismatch.")
     controls = load_well_control_set(well_control_run_dir, repo_root=repo_root)
-    if not str(variant_id).strip() or not str(lfm_sha256).strip():
-        raise ValueError("variant_id and lfm_sha256 must be explicit.")
+    if not str(variant_id).strip() or not str(lfm_contract_fingerprint_sha256).strip():
+        raise ValueError("variant_id and lfm_contract_fingerprint_sha256 must be explicit.")
     axes = (np.asarray(ilines), np.asarray(xlines), np.asarray(samples))
     if lfm.shape != tuple(axis.size for axis in axes) or valid_mask.shape != lfm.shape:
         raise ValueError("Selected LFM volume/mask does not match explicit axes.")
@@ -218,8 +223,8 @@ def build_well_anchor_samples(
                     "sample_method": "volume_trilinear",
                     "wellbore_class": control.wellbore_class,
                     "variant_id": str(variant_id),
-                    "lfm_sha256": str(lfm_sha256),
-                    "well_control_run_sha256": actual_control_hash,
+                    "lfm_contract_fingerprint_sha256": str(lfm_contract_fingerprint_sha256),
+                    "well_control_contract_fingerprint_sha256": actual_control_fingerprint,
                 }
             )
         well_status.append(
@@ -234,10 +239,10 @@ def build_well_anchor_samples(
     if frame.empty or not frame["valid_for_fit"].any():
         raise ValueError("Variant-specific real-delta label builder produced no valid samples.")
     metadata = {
-        "schema_version": "real_delta_well_samples_v2",
+        "schema_version": "real_delta_well_samples_v3",
         "variant_id": str(variant_id),
-        "lfm_sha256": str(lfm_sha256),
-        "well_control_run_sha256": actual_control_hash,
+        "lfm_contract_fingerprint_sha256": str(lfm_contract_fingerprint_sha256),
+        "well_control_contract_fingerprint_sha256": actual_control_fingerprint,
         "sample_domain": controls.sample_domain,
         "sample_unit": controls.sample_unit,
         "n_wells": int(frame["well_name"].nunique()),

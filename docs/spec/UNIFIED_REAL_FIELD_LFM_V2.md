@@ -1,5 +1,9 @@
 # 统一真实工区 LFM v2 架构规范
 
+> SHA-256 注意：本文保留 v2 架构迁移时的历史字段。所有哈希身份、准入和 provenance
+> 规则已由 [SHA-256 契约瘦身规范](SHA256_CONTRACT_SLIMMING.md) 取代；现行实现使用
+> Step 6/7 v3 契约，不得按本文的逐文件哈希字段恢复兼容。
+
 > 状态：已实施（测试由用户本地执行）
 > 范围：Step 6 真实井控制准备、Step 7 时间/深度域 LFM variant 构建，以及 R0/GINN-v2 real-delta 接缝
 > 迁移策略：直接切换 v2，不保留 `real_field_lfm_v1` 双读兼容

@@ -12,7 +12,7 @@ import pandas as pd
 from scipy.optimize import least_squares
 
 
-SCHEMA_VERSION = "synthoseis_lite_impedance_calibration_v1"
+SCHEMA_VERSION = "synthoseis_lite_impedance_calibration_v2"
 GENERATOR_FAMILY = "object_coefficients_v1"
 STATE_NAMES = ("low_impedance", "background", "high_impedance")
 PROFILE_METRICS = (
@@ -60,7 +60,7 @@ class ImpedanceCalibration:
     parent: dict[str, Any]
     zone_models: dict[str, Any]
     source_runs: dict[str, str]
-    source_hashes: dict[str, str]
+    input_contracts: dict[str, dict[str, str]]
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -102,7 +102,10 @@ class ImpedanceCalibration:
             parent=dict(payload["parent"]),
             zone_models=dict(payload["zone_models"]),
             source_runs=dict(payload["source_runs"]),
-            source_hashes=dict(payload["source_hashes"]),
+            input_contracts={
+                str(key): dict(item)
+                for key, item in dict(payload["input_contracts"]).items()
+            },
         )
 
 
@@ -297,7 +300,7 @@ def calibrate_impedance(
     truth_dt_s: float,
     ordered_horizons: Sequence[str],
     source_runs: Mapping[str, str],
-    source_hashes: Mapping[str, str],
+    input_contracts: Mapping[str, Mapping[str, str]],
     state_threshold_sigma: float = 1.0,
     huber_delta_parent_sigma_floor: float = 0.05,
     coefficient_sigma_parent_floor: float = 0.05,
@@ -691,7 +694,7 @@ def calibrate_impedance(
         parent={"states": parent_states},
         zone_models=zone_models,
         source_runs=dict(source_runs),
-        source_hashes=dict(source_hashes),
+        input_contracts={str(key): dict(item) for key, item in input_contracts.items()},
     )
     return (
         calibration,

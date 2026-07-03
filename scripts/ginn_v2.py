@@ -20,7 +20,15 @@ sys.path = [path for path in sys.path if path != src_text]
 sys.path.insert(0, src_text)
 
 from cup.synthetic.dataset import SynthoseisBenchmark
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
+from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
+    load_yaml_config,
+    repo_relative_path,
+    require_contract_fingerprint,
+    resolve_relative_path,
+    write_json,
+)
 from ginn_v2.data import (
     PatchSpec,
     build_patch_index,
@@ -343,27 +351,43 @@ def _write_train_manifest(
         checkpoint_path = Path(record["path"])
         checkpoints[checkpoint_name] = {
             "path": repo_relative_path(checkpoint_path, root=REPO_ROOT),
-            "sha256": sha256_file(checkpoint_path),
             "epoch": int(record["epoch"]),
             "validation_loss": float(record["validation_loss"]),
         }
+    benchmark_manifest_path = benchmark_dir / "benchmark_manifest.json"
+    with benchmark_manifest_path.open("r", encoding="utf-8") as handle:
+        benchmark_manifest = json.load(handle)
+    benchmark_contract_fingerprint = require_contract_fingerprint(
+        benchmark_manifest, label=f"benchmark {benchmark_dir}"
+    )
+    input_contracts = {
+        "benchmark": {
+            "path": repo_relative_path(benchmark_manifest_path, root=REPO_ROOT),
+            "contract_fingerprint_sha256": benchmark_contract_fingerprint,
+        }
+    }
+    if real_delta_manifest is not None:
+        real_sources = dict(real_delta_manifest.get("sources") or {})
+        for source_key, role in (
+            ("lfm", "real_delta_lfm_variant"),
+            ("well_control_summary", "real_delta_well_controls"),
+        ):
+            reference = dict(real_sources.get(source_key) or {})
+            fingerprint = str(reference.get("contract_fingerprint_sha256") or "")
+            if not fingerprint:
+                raise ValueError(f"real_delta.sources.{source_key} lacks a contract fingerprint.")
+            input_contracts[role] = {
+                "path": str(reference["path"]),
+                "contract_fingerprint_sha256": fingerprint,
+            }
     manifest = {
-        "schema_version": "ginn_v2_model_run_v2",
+        "schema_version": "ginn_v2_model_run_v3",
         "status": "ok",
+        "input_contracts": input_contracts,
         "model_id": args.model_id,
         "model_role": str(args.model_role or _infer_model_role(args.model_id)),
         "benchmark_dir": repo_relative_path(benchmark_dir, root=REPO_ROOT),
-        "benchmark_hashes": {
-            "synthetic_benchmark.h5": sha256_file(benchmark_dir / "synthetic_benchmark.h5"),
-            "sample_index.csv": sha256_file(benchmark_dir / "sample_index.csv"),
-            "benchmark_manifest.json": (
-                sha256_file(benchmark_dir / "benchmark_manifest.json")
-                if (benchmark_dir / "benchmark_manifest.json").is_file()
-                else ""
-            ),
-        },
         "patch_index": repo_relative_path(patch_index_path, root=REPO_ROOT),
-        "patch_index_sha256": sha256_file(patch_index_path),
         "patch_index_truncated": bool(patch_index_truncated),
         "max_patches": max_patches,
         "patch_spec": {
@@ -378,9 +402,7 @@ def _write_train_manifest(
         "test_fraction": float(args.test_fraction),
         "normalization": normalization,
         "normalization_path": repo_relative_path(normalization_path, root=REPO_ROOT),
-        "normalization_sha256": sha256_file(normalization_path),
         "input_reference_stats": repo_relative_path(input_reference_stats_path, root=REPO_ROOT),
-        "input_reference_stats_sha256": sha256_file(input_reference_stats_path),
         "input_channels": ["seismic", "lfm_controlled_degraded", "valid_mask_model"],
         "output_semantics": "pred_log_ai = lfm_controlled_degraded + pred_delta_log_ai",
         "train_sample_kinds": sorted(_sample_kinds_for_training(args.model_id)),
@@ -416,16 +438,11 @@ def _write_train_manifest(
         "model_info": train_result["model_info"],
         "checkpoints": checkpoints,
         "training_history": repo_relative_path(history_path, root=REPO_ROOT),
-        "training_history_sha256": sha256_file(history_path),
         "training_log": repo_relative_path(output_dir / "training.log", root=REPO_ROOT),
-        "training_log_sha256": sha256_file(output_dir / "training.log"),
         "best_validation_loss": train_result["best_validation_loss"],
         "real_delta": dict(real_delta_manifest) if real_delta_manifest is not None else None,
         "real_well_outputs": {
-            key: {
-                "path": repo_relative_path(path, root=REPO_ROOT),
-                "sha256": sha256_file(path),
-            }
+            key: {"path": repo_relative_path(path, root=REPO_ROOT)}
             for key, path in (real_well_outputs or {}).items()
         },
         "synthetic_gate_evidence_status": "pending",
@@ -441,6 +458,38 @@ def _write_train_manifest(
             report_card=resolve_relative_path(args.synthetic_gate_report_card, root=REPO_ROOT),
             frozen_candidate=bool(args.synthetic_gate_frozen_candidate),
         )
+    primary_name = str(checkpoints["primary"])
+    primary_checkpoint = resolve_relative_path(
+        str(dict(checkpoints[primary_name])["path"]), root=REPO_ROOT
+    )
+    manifest["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+    manifest["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+        contract_schema_version="ginn_v2_model_run_v3",
+        semantics={
+            "model_id": manifest["model_id"],
+            "model_role": manifest["model_role"],
+            "input_channels": manifest["input_channels"],
+            "output_semantics": manifest["output_semantics"],
+            "patch_spec": manifest["patch_spec"],
+        },
+        business_config={
+            "split_policy": manifest["split_policy"],
+            "validation_fraction": manifest["validation_fraction"],
+            "test_fraction": manifest["test_fraction"],
+            "loss": manifest["loss"],
+            "training": manifest["training"],
+            "model_info": manifest["model_info"],
+            "synthetic_gate_evidence_status": manifest["synthetic_gate_evidence_status"],
+            "synthetic_gate_evidence": manifest.get("synthetic_gate_evidence"),
+        },
+        input_contracts=input_contracts,
+        primary_artifacts={
+            "primary_checkpoint": primary_checkpoint,
+            "normalization": normalization_path,
+            "input_reference_stats": input_reference_stats_path,
+            "patch_index": patch_index_path,
+        },
+    )
     write_json(output_dir / "model_run_manifest.json", manifest)
 
 
@@ -455,11 +504,26 @@ def _stamp_gate_evidence(
         raise FileNotFoundError(f"synthetic gate report directory not found: {report_dir}")
     if not report_card.is_file():
         raise FileNotFoundError(f"synthetic gate report card not found: {report_card}")
+    evaluation_summary_path = report_dir / "evaluation_summary.json"
+    if not evaluation_summary_path.is_file():
+        raise FileNotFoundError(
+            f"synthetic gate evaluation summary not found: {evaluation_summary_path}"
+        )
+    with evaluation_summary_path.open("r", encoding="utf-8") as handle:
+        evaluation_summary = json.load(handle)
+    if evaluation_summary.get("schema_version") != "synthoseis_lite_report_v2":
+        raise ValueError("Synthetic gate evaluation must use synthoseis_lite_report_v2.")
+    gate_contract_fingerprint = require_contract_fingerprint(
+        evaluation_summary, label=f"synthetic gate evaluation {evaluation_summary_path}"
+    )
+    manifest["input_contracts"]["synthetic_gate_evaluation"] = {
+        "path": repo_relative_path(evaluation_summary_path, root=REPO_ROOT),
+        "contract_fingerprint_sha256": gate_contract_fingerprint,
+    }
     manifest["synthetic_gate_evidence_status"] = "ok"
     manifest["synthetic_gate_evidence"] = {
         "report_dir": repo_relative_path(report_dir, root=REPO_ROOT),
         "report_card": repo_relative_path(report_card, root=REPO_ROOT),
-        "report_card_sha256": sha256_file(report_card),
         "is_current_frozen_candidate": bool(frozen_candidate),
     }
 
@@ -477,12 +541,13 @@ def _resolve_checkpoint_from_manifest(
     manifest: Mapping[str, object],
     *,
     selection: str,
-) -> tuple[str, Path, str]:
-    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v2":
-        raise ValueError("GINN-v2 model run must use schema ginn_v2_model_run_v2.")
+) -> tuple[str, Path]:
+    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v3":
+        raise ValueError("GINN-v2 model run must use schema ginn_v2_model_run_v3.")
+    require_contract_fingerprint(manifest, label="GINN-v2 model run")
     checkpoints = manifest.get("checkpoints")
     if not isinstance(checkpoints, Mapping):
-        raise ValueError("GINN-v2 v2 manifest lacks checkpoints mapping.")
+        raise ValueError("GINN-v2 v3 manifest lacks checkpoints mapping.")
     resolved_name = str(checkpoints.get("primary")) if selection == "primary" else selection
     if resolved_name not in {"best", "final"}:
         raise ValueError(f"Invalid primary checkpoint selection: {resolved_name!r}")
@@ -490,19 +555,16 @@ def _resolve_checkpoint_from_manifest(
     if not isinstance(record, Mapping):
         raise ValueError(f"Manifest lacks checkpoint record: {resolved_name}")
     path = resolve_relative_path(str(record.get("path") or ""), root=REPO_ROOT)
-    expected_hash = str(record.get("sha256") or "")
     if not path.is_file():
         raise FileNotFoundError(path)
-    if sha256_file(path) != expected_hash:
-        raise ValueError(f"Checkpoint SHA-256 mismatch: {path}")
-    return resolved_name, path, expected_hash
+    return resolved_name, path
 
 
 def run_train(args: argparse.Namespace) -> None:
     args = _apply_train_config(args)
     benchmark_dir = _resolve_benchmark_dir(args.benchmark_dir)
     output_dir = _timestamped_output("ginn_v2_train", args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=args.output_dir is not None)
+    output_dir.mkdir(parents=True, exist_ok=False)
     logger = configure_training_logger(output_dir)
     logger.info("GINN-v2 train output: %s", output_dir)
     logger.info("benchmark: %s", benchmark_dir)
@@ -568,16 +630,6 @@ def run_train(args: argparse.Namespace) -> None:
         "sources": {
             "benchmark_dir": repo_relative_path(benchmark_dir, root=REPO_ROOT),
             "patch_index": repo_relative_path(patch_index_path, root=REPO_ROOT),
-        },
-        "source_sha256": {
-            "patch_index": sha256_file(patch_index_path),
-            "synthetic_benchmark_h5": sha256_file(benchmark_dir / "synthetic_benchmark.h5"),
-            "sample_index_csv": sha256_file(benchmark_dir / "sample_index.csv"),
-            "benchmark_manifest_json": (
-                sha256_file(benchmark_dir / "benchmark_manifest.json")
-                if (benchmark_dir / "benchmark_manifest.json").is_file()
-                else ""
-            ),
         },
     }
     input_reference_stats_path = output_dir / "input_reference_stats.json"
@@ -682,7 +734,7 @@ def run_predict(args: argparse.Namespace) -> None:
     model_run_dir = resolve_relative_path(args.model_run_dir, root=REPO_ROOT)
     with (model_run_dir / "model_run_manifest.json").open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    checkpoint_name, checkpoint_path, _checkpoint_sha256 = _resolve_checkpoint_from_manifest(
+    checkpoint_name, checkpoint_path = _resolve_checkpoint_from_manifest(
         manifest,
         selection=str(args.checkpoint),
     )
@@ -709,7 +761,6 @@ def run_predict(args: argparse.Namespace) -> None:
         eval_index_path = output_dir / "eval_patch_index.csv"
         patch_index.to_csv(eval_index_path, index=False)
         patch_index_source = repo_relative_path(eval_index_path, root=REPO_ROOT)
-        patch_index_sha256 = sha256_file(eval_index_path)
     elif args.index_source == "train":
         patch_index = pd.read_csv(resolve_relative_path(manifest["patch_index"], root=REPO_ROOT))
         if args.sample_kind:
@@ -725,7 +776,6 @@ def run_predict(args: argparse.Namespace) -> None:
         eval_index_path = output_dir / "eval_patch_index.csv"
         patch_index.to_csv(eval_index_path, index=False)
         patch_index_source = repo_relative_path(eval_index_path, root=REPO_ROOT)
-        patch_index_sha256 = sha256_file(eval_index_path)
     else:
         sample_kinds = set(args.sample_kind) if args.sample_kind else default_eval_kinds()
         spec_cfg = dict(manifest["patch_spec"])
@@ -746,7 +796,6 @@ def run_predict(args: argparse.Namespace) -> None:
         eval_index_path = output_dir / "eval_patch_index.csv"
         patch_index.to_csv(eval_index_path, index=False)
         patch_index_source = repo_relative_path(eval_index_path, root=REPO_ROOT)
-        patch_index_sha256 = sha256_file(eval_index_path)
     result = predict_patches(
         benchmark=benchmark,
         patch_index=patch_index,
@@ -756,9 +805,39 @@ def run_predict(args: argparse.Namespace) -> None:
         batch_size=int(args.batch_size),
         device_name=str(args.device),
     )
+    input_contracts = {
+        "model_run": {
+            "path": repo_relative_path(model_run_dir / "model_run_manifest.json", root=REPO_ROOT),
+            "contract_fingerprint_sha256": require_contract_fingerprint(
+                manifest, label=f"model run {model_run_dir}"
+            ),
+        },
+        "benchmark": dict(dict(manifest.get("input_contracts") or {}).get("benchmark") or {}),
+    }
+    prediction_contract_fingerprint = contract_fingerprint_sha256(
+        contract_schema_version="ginn_v2_prediction_v2",
+        semantics={
+            "model_id": result["model_id"],
+            "split": args.split,
+            "sample_kinds": sorted(set(patch_index["sample_kind"].astype(str))),
+        },
+        business_config={
+            "index_source": args.index_source,
+            "checkpoint_selection": str(args.checkpoint),
+            "batch_size": int(args.batch_size),
+        },
+        input_contracts=input_contracts,
+        primary_artifacts={
+            "predictions": result["prediction_npz"],
+            "prediction_index": result["prediction_index"],
+        },
+    )
     summary = {
-        "schema_version": "ginn_v2_prediction_v1",
+        "schema_version": "ginn_v2_prediction_v2",
         "status": "ok",
+        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "contract_fingerprint_sha256": prediction_contract_fingerprint,
+        "input_contracts": input_contracts,
         "model_run_dir": repo_relative_path(model_run_dir, root=REPO_ROOT),
         "benchmark_dir": repo_relative_path(benchmark_dir, root=REPO_ROOT),
         "split": args.split,
@@ -777,10 +856,6 @@ def run_predict(args: argparse.Namespace) -> None:
             "predictions": repo_relative_path(result["prediction_npz"], root=REPO_ROOT),
             "prediction_index": repo_relative_path(result["prediction_index"], root=REPO_ROOT),
         },
-        "benchmark_hashes": manifest.get("benchmark_hashes", {}),
-        "patch_index_sha256": patch_index_sha256,
-        "checkpoint_sha256": result["checkpoint_sha256"],
-        "prediction_sha256": result["prediction_sha256"],
         "device": result.get("device_metadata", {}),
     }
     write_json(output_dir / "prediction_summary.json", summary)
@@ -890,7 +965,6 @@ def run_summarize(args: argparse.Namespace) -> None:
                 "realization_center_crop_n_ok": realization_center_aggregate.get("n_ok"),
                 "realization_center_crop_rmse": realization_center_aggregate.get("mean_rmse"),
                 "report_dir": repo_relative_path(report_path, root=REPO_ROOT),
-                "report_card_sha256": sha256_file(card_path),
             }
         )
         frequency_path = report_path / "model_probe_metrics_by_frequency.csv"
@@ -932,24 +1006,11 @@ def run_summarize(args: argparse.Namespace) -> None:
 
 
 def run_stamp_gate(args: argparse.Namespace) -> None:
-    model_run_dir = resolve_relative_path(args.model_run_dir, root=REPO_ROOT)
-    manifest_path = model_run_dir / "model_run_manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        manifest = json.load(handle)
-    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v2":
-        raise ValueError("stamp-gate requires ginn_v2_model_run_v2.")
-    _stamp_gate_evidence(
-        manifest,
-        report_dir=resolve_relative_path(args.synthetic_gate_report_dir, root=REPO_ROOT),
-        report_card=resolve_relative_path(args.synthetic_gate_report_card, root=REPO_ROOT),
-        frozen_candidate=bool(args.synthetic_gate_frozen_candidate),
+    raise ValueError(
+        "stamp-gate is retired for immutable model runs. Re-run training with "
+        "--synthetic-gate-report-dir and --synthetic-gate-report-card so gate evidence "
+        "is included before the v3 model contract is published."
     )
-    write_json(manifest_path, manifest)
-    print("=== GINN-v2 model gate stamp ===")
-    print(f"Model run: {model_run_dir}")
-    print(f"Report card: {manifest['synthetic_gate_evidence']['report_card']}")
 
 
 def _parse_report_spec(spec: str) -> tuple[str, str, Path]:

@@ -22,7 +22,7 @@ import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -245,10 +245,183 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 # ── Hashing ──
 
 
-def array_sha256(values: np.ndarray) -> str:
-    """SHA-256 digest of an array's contiguous byte representation."""
-    array = np.ascontiguousarray(np.asarray(values))
-    return hashlib.sha256(array.view(np.uint8).tobytes()).hexdigest()
+CONTRACT_FINGERPRINT_SCHEMA = "contract_fingerprint_v1"
+
+_NON_BUSINESS_CONFIG_KEYS = {
+    "created_at",
+    "completed_at",
+    "device",
+    "devices",
+    "log",
+    "logging",
+    "log_level",
+    "output",
+    "output_dir",
+    "output_root",
+    "report_card",
+    "run_id",
+    "timestamp",
+    "updated_at",
+}
+_NON_BUSINESS_CONFIG_SUFFIXES = (
+    "_path",
+    "_paths",
+    "_dir",
+    "_dirs",
+    "_directory",
+    "_directories",
+    "_file",
+    "_files",
+    "_root",
+)
+
+
+def _canonical_contract_value(value: Any) -> Any:
+    """Convert a contract fingerprint input to strict canonical JSON values."""
+    if isinstance(value, Path):
+        return value.as_posix()
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return _canonical_contract_value(value.item())
+        return [_canonical_contract_value(item) for item in value.tolist()]
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        result = float(value)
+        if not np.isfinite(result):
+            raise ValueError("Contract fingerprint inputs must not contain NaN or Infinity.")
+        return result
+    if isinstance(value, np.generic):
+        return _canonical_contract_value(value.item())
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_contract_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_contract_value(item) for item in value]
+    if value is None or isinstance(value, str):
+        return value
+    raise TypeError(
+        "Contract fingerprint inputs must be JSON values, Path objects, or numpy values; "
+        f"got {type(value).__name__}."
+    )
+
+
+def _canonical_business_config(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove location/runtime-only keys before canonical JSON encoding."""
+
+    def visit(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            result: dict[str, Any] = {}
+            for raw_key, raw_value in item.items():
+                key = str(raw_key)
+                normalized = key.casefold().replace("-", "_")
+                if (
+                    normalized in _NON_BUSINESS_CONFIG_KEYS
+                    or normalized.startswith("log_")
+                    or normalized.endswith(_NON_BUSINESS_CONFIG_SUFFIXES)
+                ):
+                    continue
+                result[key] = visit(raw_value)
+            return result
+        if isinstance(item, (list, tuple)):
+            return [visit(value) for value in item]
+        if isinstance(item, Path):
+            # Paths should normally be attached to a *_path/*_dir key. Keeping a
+            # neutral marker here also prevents an unusually named Path value from
+            # making an otherwise identical contract location-dependent.
+            return None
+        return _canonical_contract_value(item)
+
+    return visit(value)
+
+
+def require_contract_fingerprint(payload: Mapping[str, Any], *, label: str) -> str:
+    """Return the single published fingerprint from a successful contract."""
+    if str(payload.get("contract_fingerprint_schema") or "") != CONTRACT_FINGERPRINT_SCHEMA:
+        raise ValueError(f"{label} does not use {CONTRACT_FINGERPRINT_SCHEMA}.")
+    digest = str(payload.get("contract_fingerprint_sha256") or "")
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError(f"{label} has an invalid contract_fingerprint_sha256.")
+    return digest
+
+
+def published_contract_reference(
+    summary_path: str | Path,
+    *,
+    root: Path,
+    label: str,
+) -> dict[str, str]:
+    """Load one upstream publish manifest without re-hashing any artifact."""
+    path = Path(summary_path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{label} publish manifest must be a JSON object: {path}")
+    return {
+        "path": repo_relative_path(path, root=root),
+        "contract_fingerprint_sha256": require_contract_fingerprint(payload, label=label),
+    }
+
+
+def contract_fingerprint_sha256(
+    *,
+    contract_schema_version: str,
+    semantics: Mapping[str, Any],
+    business_config: Mapping[str, Any],
+    input_contracts: Mapping[str, str | Mapping[str, Any]],
+    primary_artifacts: Mapping[str, str | Path],
+) -> str:
+    """Compute one producer-side fingerprint for an immutable published contract.
+
+    Per-file digests are deliberately transient: only the returned aggregate digest
+    belongs in the published manifest. Consumers must copy that digest into their
+    own ``input_contracts`` and must not call this function for upstream files.
+    """
+    schema = str(contract_schema_version).strip()
+    if not schema:
+        raise ValueError("contract_schema_version must be explicit.")
+    inputs: dict[str, str] = {}
+    for role, value in input_contracts.items():
+        if isinstance(value, Mapping):
+            digest = str(value.get("contract_fingerprint_sha256") or "")
+        else:
+            digest = str(value)
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError(f"input_contracts.{role} must be a lowercase SHA-256 digest.")
+        inputs[str(role)] = digest
+    artifacts: dict[str, str] = {}
+    for logical_name, path_value in primary_artifacts.items():
+        name = str(logical_name).strip()
+        if not name or name in artifacts:
+            raise ValueError("Primary artifact logical names must be non-empty and unique.")
+        path = Path(path_value)
+        if not path.is_file():
+            raise FileNotFoundError(f"Primary contract artifact does not exist: {name} -> {path}")
+        artifacts[name] = sha256_file(path)
+    if not artifacts:
+        raise ValueError("A published contract requires at least one primary artifact.")
+    fingerprint_payload = {
+        "fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "contract_schema_version": schema,
+        "semantics": _canonical_contract_value(semantics),
+        "business_config": _canonical_business_config(business_config),
+        "input_contracts": _canonical_contract_value(inputs),
+        "primary_artifacts": _canonical_contract_value(artifacts),
+    }
+    encoded = json.dumps(
+        fingerprint_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def sha256_file(path: str | Path) -> str:

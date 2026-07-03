@@ -41,19 +41,21 @@ from cup.config.workflow import WorkflowConfig
 from cup.physics.numpy_backend import forward_time
 from cup.physics.rock_physics import WellAiVpSamples, fit_equal_well_huber, well_fit_metrics
 from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
     load_yaml_config,
     repo_relative_path,
+    require_contract_fingerprint,
     resolve_relative_path,
     resolve_timestamped_output_dir,
-    sha256_file,
     write_json,
 )
 
 
-SCHEMA_VERSION = "rock_physics_analysis_v1"
+SCHEMA_VERSION = "rock_physics_analysis_v2"
 SCRIPT_VERSION = 1
 RELATION_SCHEMA = "rock_physics_relation_v1"
-FORWARD_INPUTS_SCHEMA = "forward_model_inputs_v1"
+FORWARD_INPUTS_SCHEMA = "forward_model_inputs_v2"
 DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")
 KNOWN_MODULES = {"ai_vp_linear"}
 EXPECTED_CURVES = {
@@ -77,7 +79,6 @@ class AiVpModuleConfig:
 class LoadedLas:
     well_id: str
     path: Path
-    sha256: str
     las: lasio.LASFile
 
 
@@ -252,7 +253,6 @@ def _load_inputs(status: pd.DataFrame, *, output_dir: Path) -> tuple[dict[str, L
             "preprocess_status": preprocess_status,
             "selected_for_input": selected,
             "las_path": raw_path,
-            "las_sha256": "",
             "read_status": "not_selected",
             "curve_names": "",
             "curve_units": "",
@@ -270,19 +270,17 @@ def _load_inputs(status: pd.DataFrame, *, output_dir: Path) -> tuple[dict[str, L
             seen_paths[path] = well_id
             if not path.is_file():
                 raise FileNotFoundError(f"LAS file does not exist: {path}")
-            digest = sha256_file(path)
             las = lasio.read(path)
             curve_names, curve_units = _curve_inventory(las)
             item.update(
                 {
                     "las_path": repo_relative_path(path, root=REPO_ROOT),
-                    "las_sha256": digest,
                     "read_status": "success",
                     "curve_names": curve_names,
                     "curve_units": curve_units,
                 }
             )
-            loaded[well_id] = LoadedLas(well_id=well_id, path=path, sha256=digest, las=las)
+            loaded[well_id] = LoadedLas(well_id=well_id, path=path, las=las)
         except Exception as exc:
             item["read_status"] = "failed"
             item["reasons"] = f"input_contract_error:{exc}"
@@ -466,7 +464,6 @@ def _relation_payload(
             {
                 "well_id": well_id,
                 "path": repo_relative_path(loaded[well_id].path, root=REPO_ROOT),
-                "sha256": loaded[well_id].sha256,
             }
             for well_id in candidate_wells
         ],
@@ -499,6 +496,17 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
     discovery_mode = "explicit" if script_config["explicit_source"] else "auto_discovered"
     status_path = source_dir / "well_preprocess_status.csv"
     inventory_path = output_dir / "well_input_inventory.csv"
+    source_summary_path = source_dir / "run_summary.json"
+    with source_summary_path.open("r", encoding="utf-8") as handle:
+        source_run_summary = json.load(handle)
+    input_contracts = {
+        "well_preprocess": {
+            "path": repo_relative_path(source_summary_path, root=REPO_ROOT),
+            "contract_fingerprint_sha256": require_contract_fingerprint(
+                source_run_summary, label=f"well preprocess run {source_dir}"
+            ),
+        }
+    }
     source_summary = {
         "well_preprocess_dir": repo_relative_path(source_dir, root=REPO_ROOT),
         "discovery_mode": discovery_mode,
@@ -521,7 +529,6 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
                     if inventory_path.is_file()
                     else None
                 ),
-                "inventory_sha256": sha256_file(inventory_path) if inventory_path.is_file() else None,
                 "input_contract_error_count": 1,
                 "reason": str(exc),
             },
@@ -538,12 +545,12 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
         "script_version": SCRIPT_VERSION,
         "created_at": datetime.now().astimezone().isoformat(),
         "status": "success",
+        "input_contracts": input_contracts,
         "source_run": source_summary,
         "input": {
             "passed_wells": sorted(loaded, key=str.casefold),
             "successfully_read_wells": sorted(loaded, key=str.casefold),
             "inventory_path": repo_relative_path(inventory_path, root=REPO_ROOT),
-            "inventory_sha256": sha256_file(inventory_path),
             "input_contract_error_count": 0,
         },
         "modules": {},
@@ -553,6 +560,18 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
     if not module_config.enabled:
         base_summary["reason"] = "no_analysis_modules_enabled"
         base_summary["modules"]["ai_vp_linear"] = {"enabled": False, "status": "disabled"}
+        base_summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+        base_summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+            contract_schema_version=SCHEMA_VERSION,
+            semantics={
+                "sample_domain": workflow.seismic.domain,
+                "depth_basis": workflow.seismic.depth_basis,
+                "modules": base_summary["modules"],
+            },
+            business_config=script_config,
+            input_contracts=input_contracts,
+            primary_artifacts={"well_input_inventory": inventory_path},
+        )
         write_json(output_dir / "run_summary.json", base_summary)
         return output_dir
 
@@ -617,7 +636,6 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
         }
         base_summary["artifacts"]["well_fit_qc"] = {
             "path": repo_relative_path(qc_path, root=REPO_ROOT),
-            "sha256": sha256_file(qc_path),
         }
         write_json(output_dir / "run_summary.json", base_summary)
         raise
@@ -653,14 +671,13 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
         },
     }
     base_summary["artifacts"] = {
-        "well_fit_qc": {"path": repo_relative_path(qc_path, root=REPO_ROOT), "sha256": sha256_file(qc_path)},
+        "well_fit_qc": {"path": repo_relative_path(qc_path, root=REPO_ROOT)},
     }
 
     forward_model = script_config["forward_model"]
     wavelet_path = resolve_relative_path(forward_model["wavelet_file"], root=REPO_ROOT)
     try:
         wavelet_time, _ = _load_wavelet(wavelet_path)
-        wavelet_sha256 = sha256_file(wavelet_path)
     except Exception as exc:
         base_summary["status"] = "failed"
         base_summary["forward_model_inputs"] = {
@@ -670,17 +687,14 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
         write_json(output_dir / "run_summary.json", base_summary)
         raise
     write_json(relation_path, relation_payload)
-    relation_sha256 = sha256_file(relation_path)
     _plot_fit(figure_path, samples, fit.relation.a, fit.relation.b)
     base_summary["artifacts"].update(
         {
             "rock_physics_relation": {
                 "path": repo_relative_path(relation_path, root=REPO_ROOT),
-                "sha256": relation_sha256,
             },
             "ai_vp_fit_figure": {
                 "path": repo_relative_path(figure_path, root=REPO_ROOT),
-                "sha256": sha256_file(figure_path),
             },
         }
     )
@@ -688,7 +702,6 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
         {
             "well_id": well_id,
             "path": repo_relative_path(loaded[well_id].path, root=REPO_ROOT),
-            "sha256": loaded[well_id].sha256,
         }
         for well_id in candidate_wells
     ]
@@ -699,14 +712,12 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
         "wavelet": {
             "source_well": forward_model["source_well"],
             "path": repo_relative_path(wavelet_path, root=REPO_ROOT),
-            "sha256": wavelet_sha256,
             "time_unit": "s",
             "sample_count": int(wavelet_time.size),
             "dt_s": float(wavelet_time[1] - wavelet_time[0]),
         },
         "ai_velocity_relation": {
             "path": repo_relative_path(relation_path, root=REPO_ROOT),
-            "sha256": relation_sha256,
             "formula": "AI = a * Vp + b",
             "a": fit.relation.a,
             "b": fit.relation.b,
@@ -717,7 +728,6 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
             "accepted_wells": accepted_wells,
         },
         "source_runs": {"well_preprocess_dir": repo_relative_path(source_dir, root=REPO_ROOT)},
-        "well_input_inventory_sha256": sha256_file(inventory_path),
         "source_preprocessed_las": source_files,
     }
     forward_inputs_path = output_dir / "forward_model_inputs.json"
@@ -725,12 +735,29 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
 
     base_summary["artifacts"].update(
         {
-            "wavelet": {"path": repo_relative_path(wavelet_path, root=REPO_ROOT), "sha256": wavelet_sha256},
+            "wavelet": {"path": repo_relative_path(wavelet_path, root=REPO_ROOT)},
             "forward_model_inputs": {
                 "path": repo_relative_path(forward_inputs_path, root=REPO_ROOT),
-                "sha256": sha256_file(forward_inputs_path),
             },
         }
+    )
+    base_summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+    base_summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+        contract_schema_version=SCHEMA_VERSION,
+        semantics={
+            "sample_domain": workflow.seismic.domain,
+            "depth_basis": workflow.seismic.depth_basis,
+            "relation_schema": RELATION_SCHEMA,
+            "forward_inputs_schema": FORWARD_INPUTS_SCHEMA,
+        },
+        business_config=script_config,
+        input_contracts=input_contracts,
+        primary_artifacts={
+            "well_input_inventory": inventory_path,
+            "rock_physics_relation": relation_path,
+            "forward_model_inputs": forward_inputs_path,
+            "external_wavelet": wavelet_path,
+        },
     )
     write_json(output_dir / "run_summary.json", base_summary)
     return output_dir

@@ -37,7 +37,15 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.config.workflow import WorkflowConfig
 from cup.seismic.survey import segy_options_from_config
-from cup.utils.io import load_yaml_config, resolve_relative_path, sanitize_filename
+from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
+    load_yaml_config,
+    published_contract_reference,
+    repo_relative_path,
+    resolve_relative_path,
+    sanitize_filename,
+)
 
 if TYPE_CHECKING:
     from wtie.modeling.modeling import ConvModeler
@@ -89,6 +97,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_output_tree(output_dir: Path, well_name: str) -> dict[str, Path]:
+    output_dir.mkdir(parents=True, exist_ok=False)
     dirs = {
         "wavelet_raw": output_dir / "wavelet_raw",
         "depth_match": output_dir / "depth_match",
@@ -96,7 +105,7 @@ def build_output_tree(output_dir: Path, well_name: str) -> dict[str, Path]:
         "figures": output_dir / "figures",
     }
     for d in dirs.values():
-        d.mkdir(parents=True, exist_ok=True)
+        d.mkdir()
     safe = sanitize_filename(well_name)
     return {
         "root": output_dir,
@@ -467,6 +476,8 @@ def run_auto_tie(
     best_objective_means, best_objective_covariances = best_values  # type: ignore
 
     summary: dict[str, Any] = {
+        "schema_version": "vertical_well_auto_tie_depth_v2",
+        "status": "success",
         "well_name": well_name,
         "kb_m": kb_m,
         "overlap_tvdss_min_m": overlap_z_min,
@@ -485,6 +496,32 @@ def run_auto_tie(
         "cropped_synthetic_corr": cropped_corr,
         "cropped_synthetic_nmae": cropped_nmae,
     }
+    input_contracts = {
+        "well_preprocess": published_contract_reference(
+            las_dir.parent / "run_summary.json",
+            root=REPO_ROOT,
+            label=f"well preprocess run {las_dir.parent}",
+        )
+    }
+    summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+    summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+        contract_schema_version="vertical_well_auto_tie_depth_v2",
+        semantics={
+            "sample_domain": "depth",
+            "sample_unit": "m",
+            "depth_basis": "tvdss",
+            "well_name": well_name,
+        },
+        business_config=script_cfg,
+        input_contracts=input_contracts,
+        primary_artifacts={
+            "wavelet": output["wavelet_final_csv"],
+            "raw_wavelet": output["wavelet_raw_csv"],
+            "local_tdt": output["local_tdt_csv"],
+            "seismic_twt": output["seismic_twt_csv"],
+        },
+    )
+    summary["input_contracts"] = input_contracts
     output["summary_json"].write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(crop_info)

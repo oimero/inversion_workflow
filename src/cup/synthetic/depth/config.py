@@ -1,4 +1,4 @@
-"""Strict configuration and source contracts for Synthoseis-lite v2."""
+"""Strict configuration and source contracts for Synthoseis-lite v3."""
 
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ import numpy as np
 from cup.config.sources import resolve_source_run
 from cup.config.workflow import WorkflowConfig
 from cup.synthetic.core.config import parse_object_core_controls
-from cup.utils.io import load_yaml_config, resolve_relative_path, sha256_file
+from cup.utils.io import load_yaml_config, require_contract_fingerprint, resolve_relative_path
 
 
-SCHEMA_VERSION = "synthoseis_lite_v2"
+SCHEMA_VERSION = "synthoseis_lite_v3"
 CALIBRATION_SCHEMA = "synthoseis_lite_impedance_calibration_v2"
 GENERATOR_FAMILY = "object_coefficients_v2"
 
@@ -94,9 +94,7 @@ def load_composed_config(
     workflow = WorkflowConfig.from_mapping(composed)
     return composed, workflow, {
         "experiment_file": str(experiment_path),
-        "experiment_sha256": sha256_file(experiment_path),
         "workflow_config": str(common_path),
-        "workflow_config_sha256": sha256_file(common_path),
     }
 
 
@@ -110,14 +108,14 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     _reject_unknown(root, allowed_root, path="synthoseis_lite")
     if str(root.get("sample_domain") or "").casefold() != "depth" or str(root.get("benchmark_schema") or "") != SCHEMA_VERSION:
         raise ValueError(
-            "Depth Synthoseis-lite v2 requires "
+            "Depth Synthoseis-lite v3 requires "
             f"synthoseis_lite.sample_domain='depth' and benchmark_schema={SCHEMA_VERSION!r}."
         )
     seismic = _mapping(config.get("seismic"), path="seismic")
     if str(seismic.get("domain", "")).casefold() != "depth":
-        raise ValueError("Depth Synthoseis v2 requires seismic.domain='depth'.")
+        raise ValueError("Depth Synthoseis v3 requires seismic.domain='depth'.")
     if str(seismic.get("depth_basis", "")).casefold() != "tvdss":
-        raise ValueError("Depth Synthoseis v2 requires seismic.depth_basis='tvdss'.")
+        raise ValueError("Depth Synthoseis v3 requires seismic.depth_basis='tvdss'.")
 
     target = _mapping(config.get("target_interval"), path="target_interval")
     raw_horizons = target.get("horizons")
@@ -159,20 +157,20 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     model_dz = _positive_float(sampling.get("expected_model_dz_m"), path="sampling.expected_model_dz_m")
     oversampling = _positive_int(sampling.get("vertical_oversampling_factor"), path="sampling.vertical_oversampling_factor")
     if model_dz != 5.0 or oversampling != 8:
-        raise ValueError("Depth v2 first release is frozen to 5 m model sampling and 8x oversampling.")
+        raise ValueError("Depth v3 is frozen to 5 m model sampling and 8x oversampling.")
 
     geometry = _mapping(root.get("geometry"), path="synthoseis_lite.geometry")
     _reject_unknown(geometry, {"lateral_sample_interval_m", "field_conditioned"}, path="synthoseis_lite.geometry")
     field = _mapping(geometry.get("field_conditioned"), path="synthoseis_lite.geometry.field_conditioned")
     _reject_unknown(field, {"enabled", "target_zone"}, path="synthoseis_lite.geometry.field_conditioned")
     if field.get("enabled") is not True:
-        raise ValueError("Depth v2 requires geometry.field_conditioned.enabled=true.")
+        raise ValueError("Depth v3 requires geometry.field_conditioned.enabled=true.")
     target_zone = _mapping(field.get("target_zone"), path="synthoseis_lite.geometry.field_conditioned.target_zone")
     if target_zone != {"mode": "filled_target_zone"}:
-        raise ValueError("Depth v2 target_zone must be exactly mode=filled_target_zone.")
+        raise ValueError("Depth v3 target_zone must be exactly mode=filled_target_zone.")
     lateral_interval = _positive_float(geometry.get("lateral_sample_interval_m"), path="geometry.lateral_sample_interval_m")
     if lateral_interval != 25.0:
-        raise ValueError("Depth v2 first release uses a frozen 25 m lateral sample interval.")
+        raise ValueError("Depth v3 uses a frozen 25 m lateral sample interval.")
 
     raw_sections = root.get("sections")
     if not isinstance(raw_sections, list) or not raw_sections:
@@ -214,7 +212,7 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     object_core_controls = parse_object_core_controls(impedance)
     duration_models = _mapping(impedance.get("duration_modes"), path="impedance_attribute_generator.duration_modes")
     if set(duration_models) != {"standard"}:
-        raise ValueError("Depth v2 first release supports only the standard duration mode.")
+        raise ValueError("Depth v3 supports only the standard duration mode.")
     standard_mode = _mapping(duration_models["standard"], path="duration_modes.standard")
     _reject_unknown(standard_mode, {"minimum_highres_cells"}, path="duration_modes.standard")
 
@@ -249,7 +247,7 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     lfm = _mapping(root.get("lfm"), path="synthoseis_lite.lfm")
     _reject_unknown(lfm, {"enabled", "ideal", "controlled_degraded"}, path="synthoseis_lite.lfm")
     if lfm.get("enabled") is not True:
-        raise ValueError("Depth v2 requires lfm.enabled=true.")
+        raise ValueError("Depth v3 requires lfm.enabled=true.")
     parsed_lfm: dict[str, Any] = {"enabled": True}
     for name, expected in (("ideal", 250.0), ("controlled_degraded", 400.0)):
         item = _mapping(lfm.get(name), path=f"lfm.{name}")
@@ -307,12 +305,12 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     for disabled_name in ("canonical", "probe_selection"):
         disabled = _mapping(root.get(disabled_name), path=f"synthoseis_lite.{disabled_name}")
         if disabled != {"enabled": False}:
-            raise ValueError(f"Depth v2 requires {disabled_name}.enabled=false with no extra fields.")
+            raise ValueError(f"Depth v3 requires {disabled_name}.enabled=false with no extra fields.")
 
     mismatch = _mapping(root.get("seismic_mismatch"), path="synthoseis_lite.seismic_mismatch")
     _reject_unknown(mismatch, {"enabled", "wavelet", "depth_static", "noise", "gain", "combined"}, path="synthoseis_lite.seismic_mismatch")
     if mismatch.get("enabled") is not True:
-        raise ValueError("Depth v2 requires seismic_mismatch.enabled=true.")
+        raise ValueError("Depth v3 requires seismic_mismatch.enabled=true.")
     wavelet_mismatch = _mapping(mismatch.get("wavelet"), path="seismic_mismatch.wavelet")
     _reject_unknown(wavelet_mismatch, {"phase_rotation_degrees", "time_shift_s"}, path="seismic_mismatch.wavelet")
     depth_static = _mapping(mismatch.get("depth_static"), path="seismic_mismatch.depth_static")
@@ -372,11 +370,11 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "noise_rms_fraction": _positive_float(combined.get("noise_rms_fraction"), path="seismic_mismatch.combined.noise_rms_fraction"),
         })
     if parsed_mismatch["wavelet"]["phase_rotation_degrees"] != [-10.0, 10.0]:
-        raise ValueError("Depth v2 wavelet phase rotations are frozen to [-10, 10] degrees.")
+        raise ValueError("Depth v3 wavelet phase rotations are frozen to [-10, 10] degrees.")
     if parsed_mismatch["wavelet"]["time_shift_s"] != [-0.001, 0.001]:
-        raise ValueError("Depth v2 wavelet time shifts are frozen to [-0.001, 0.001] seconds.")
+        raise ValueError("Depth v3 wavelet time shifts are frozen to [-0.001, 0.001] seconds.")
     if parsed_mismatch["depth_static"]["shift_m"] != [-2.5, 2.5]:
-        raise ValueError("Depth v2 depth statics are frozen to [-2.5, 2.5] metres.")
+        raise ValueError("Depth v3 depth statics are frozen to [-2.5, 2.5] metres.")
 
     figures = _mapping(root.get("figures"), path="synthoseis_lite.figures")
     _reject_unknown(
@@ -474,23 +472,26 @@ def resolve_depth_v2_sources(
             label=key,
         )
         resolved[key] = path
+        source_summary = _load_json(path / "run_summary.json")
         provenance[key] = {
             "resolution_mode": "explicit" if explicit else "auto",
             "path": str(path),
-            "run_summary_sha256": sha256_file(path / "run_summary.json"),
+            "contract_fingerprint_sha256": require_contract_fingerprint(
+                source_summary, label=f"{key} {path}"
+            ),
             "required_files": list(files),
         }
 
     rock_summary = _load_json(resolved["rock_physics_analysis_dir"] / "run_summary.json")
-    if rock_summary.get("schema") != "rock_physics_analysis_v1" or rock_summary.get("status") != "success":
-        raise ValueError("rock_physics_analysis run is not a successful v1 run.")
+    if rock_summary.get("schema") != "rock_physics_analysis_v2" or rock_summary.get("status") != "success":
+        raise ValueError("rock_physics_analysis run is not a successful v2 run.")
     wavelet_batch_summary = _load_json(resolved["wavelet_batch_synthetic_depth_dir"] / "run_summary.json")
     if wavelet_batch_summary.get("status") != "success":
         raise ValueError("wavelet_batch_synthetic_depth run is not successful.")
     forward_path = resolved["rock_physics_analysis_dir"] / "forward_model_inputs.json"
     forward = _load_json(forward_path)
-    if forward.get("schema") != "forward_model_inputs_v1":
-        raise ValueError("forward_model_inputs schema must be forward_model_inputs_v1.")
+    if forward.get("schema") != "forward_model_inputs_v2":
+        raise ValueError("forward_model_inputs schema must be forward_model_inputs_v2.")
     if forward.get("sample_domain") != "depth" or forward.get("depth_basis") != "tvdss":
         raise ValueError("forward_model_inputs must declare depth/TVDSS.")
     inventory_summary = _load_json(resolved["well_inventory_dir"] / "run_summary.json")
@@ -506,7 +507,9 @@ def resolve_depth_v2_sources(
     if recorded_seismic.resolve() != expected_seismic.resolve():
         raise ValueError("well_inventory seismic source does not match the current workflow config.")
     forward["_path"] = str(forward_path)
-    forward["_sha256"] = sha256_file(forward_path)
+    forward["_contract_fingerprint_sha256"] = require_contract_fingerprint(
+        rock_summary, label=f"rock physics run {resolved['rock_physics_analysis_dir']}"
+    )
     return resolved, provenance, forward
 
 

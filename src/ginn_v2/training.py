@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from cup.synthetic.dataset import SynthoseisBenchmark
 from cup.synthetic.metrics import regression_metrics
-from cup.utils.io import sha256_file, write_json
+from cup.utils.io import write_json
 from cup.utils.logging import configure_run_logger
 from ginn_v2.data import PatchDataset, _aligned_arrays, default_train_kinds, denormalize_delta
 from ginn_v2.models import build_model
@@ -101,7 +101,7 @@ def train_model(
         and float(lambda_physics) > 0.0
     ):
         raise ValueError(
-            "Depth Synthoseis v2 physics-loss training is intentionally not implemented in this slice; "
+            "Depth Synthoseis v3 physics-loss training is intentionally not implemented in this slice; "
             "the depth GINN v2 training contract must be designed before enabling lambda_physics."
         )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -643,8 +643,6 @@ def predict_patches(
         "prediction_npz": npz_path,
         "prediction_index": index_path,
         "n_predictions": int(pred_array.shape[0]),
-        "prediction_sha256": sha256_file(npz_path),
-        "checkpoint_sha256": sha256_file(checkpoint_path),
         "model_id": str(checkpoint["model_id"]),
         "model_info": dict(checkpoint["model_info"]),
         "normalization": dict(checkpoint["normalization"]),

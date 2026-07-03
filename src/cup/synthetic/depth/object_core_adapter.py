@@ -159,7 +159,10 @@ def load_depth_calibration_for_object_core(path: Path) -> tuple[ImpedanceCalibra
         parent=dict(legacy["parent"]),
         zone_models=dict(legacy["zone_models"]),
         source_runs=dict(legacy["source_runs"]),
-        source_hashes=dict(legacy["source_hashes"]),
+        input_contracts={
+            str(key): dict(value)
+            for key, value in dict(legacy["input_contracts"]).items()
+        },
     )
     return adapter, payload
 
@@ -170,7 +173,7 @@ def calibrate_depth_object_core(
     truth_dz_m: float,
     ordered_horizons: Sequence[str],
     source_runs: Mapping[str, str],
-    source_hashes: Mapping[str, str],
+    input_contracts: Mapping[str, Mapping[str, str]],
     state_threshold_sigma: float,
     huber_delta_parent_sigma_floor: float,
     coefficient_sigma_parent_floor: float,
@@ -182,7 +185,7 @@ def calibrate_depth_object_core(
         truth_dt_s=float(truth_dz_m),
         ordered_horizons=list(ordered_horizons),
         source_runs=dict(source_runs),
-        source_hashes=dict(source_hashes),
+        input_contracts=input_contracts,
         state_threshold_sigma=float(state_threshold_sigma),
         huber_delta_parent_sigma_floor=float(huber_delta_parent_sigma_floor),
         coefficient_sigma_parent_floor=float(coefficient_sigma_parent_floor),

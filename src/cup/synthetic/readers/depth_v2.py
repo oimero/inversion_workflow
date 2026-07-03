@@ -14,9 +14,9 @@ import pandas as pd
 from cup.synthetic.depth.config import SCHEMA_VERSION
 from cup.synthetic.core import (
     validate_dataset_metadata,
-    validate_manifest_files,
     validate_training_manifest,
 )
+from cup.utils.io import require_contract_fingerprint
 
 
 @dataclass(frozen=True)
@@ -52,12 +52,12 @@ def _json(path: Path) -> dict[str, Any]:
 
 
 class DepthV2Benchmark:
-    """Validate and read ``synthoseis_lite_v2`` depth artifacts only."""
+    """Validate and read ``synthoseis_lite_v3`` depth artifacts only."""
 
     schema = SCHEMA_VERSION
     sample_domain = "depth"
 
-    def __init__(self, run_dir: str | Path, *, expected_forward_model_inputs_sha256: str | None = None) -> None:
+    def __init__(self, run_dir: str | Path) -> None:
         self.run_dir = Path(run_dir)
         self.h5_path = self.run_dir / "synthetic_benchmark.h5"
         self.index_path = self.run_dir / "sample_index.csv"
@@ -75,17 +75,11 @@ class DepthV2Benchmark:
         if self.manifest.get("sample_domain") != "depth" or self.manifest.get("depth_basis") != "tvdss":
             raise ValueError("Synthoseis v2 reader requires sample_domain=depth and depth_basis=tvdss.")
         validate_training_manifest(self.manifest, sample_domain="depth")
-        validate_manifest_files(self.run_dir, dict(self.manifest.get("files") or {}))
-        recorded_forward = str(self.manifest.get("forward_model_inputs_sha256") or "")
-        if not recorded_forward:
-            raise ValueError("Benchmark manifest lacks forward_model_inputs_sha256; rebuild required.")
-        if expected_forward_model_inputs_sha256 is not None and recorded_forward != str(expected_forward_model_inputs_sha256):
-            raise ValueError("Benchmark forward_model_inputs_sha256 does not match the requested model run.")
+        require_contract_fingerprint(self.manifest, label=f"benchmark {self.run_dir}")
         self.index = pd.read_csv(self.index_path, dtype=str, keep_default_na=False)
         required = {
             "sample_id", "parent_realization_id", "sample_kind", "source_sample_id",
             "hdf5_group", "sample_domain", "depth_basis", "suite", "evaluation_role",
-            "forward_model_inputs_sha256",
         }
         missing = sorted(required - set(self.index))
         if missing:
@@ -105,8 +99,6 @@ class DepthV2Benchmark:
         present_forbidden = sorted(forbidden_columns.intersection(self.index.columns))
         if present_forbidden:
             raise ValueError(f"Depth v2 sample_index.csv contains forbidden time/probe fields: {present_forbidden}")
-        if not self.index["forward_model_inputs_sha256"].eq(recorded_forward).all():
-            raise ValueError("sample_index.csv forward hash differs from benchmark manifest.")
         if not set(self.index["evaluation_role"]) <= {"development_pool", "geometry_holdout"}:
             raise ValueError("sample_index.csv contains unknown evaluation_role values.")
         held_out = str(dict(self.manifest.get("split_policy") or {}).get("held_out_geometry_family") or "")
@@ -124,21 +116,19 @@ class DepthV2Benchmark:
                     raise ValueError(f"Variant has an invalid base source: {row['sample_id']}")
                 if source["parent_realization_id"] != row["parent_realization_id"] or source["evaluation_role"] != row["evaluation_role"]:
                     raise ValueError(f"Variant crosses parent realization or evaluation role: {row['sample_id']}")
-        self._validate_hdf5(recorded_forward)
+        self._validate_hdf5()
 
-    def _validate_hdf5(self, forward_hash: str) -> None:
+    def _validate_hdf5(self) -> None:
         with h5py.File(self.h5_path, "r") as h5:
             if h5.attrs.get("schema") != SCHEMA_VERSION:
-                raise ValueError("HDF5 schema does not match synthoseis_lite_v2.")
+                raise ValueError("HDF5 schema does not match synthoseis_lite_v3.")
             if h5.attrs.get("sample_domain") != "depth" or h5.attrs.get("depth_basis") != "tvdss":
                 raise ValueError("HDF5 root has the wrong sample domain or basis.")
-            if h5.attrs.get("forward_model_inputs_sha256") != forward_hash:
-                raise ValueError("HDF5 forward hash differs from benchmark manifest.")
             if bool(h5.attrs.get("qc_only", False)) != bool(
                 self.manifest.get("qc_only", False)
             ):
                 raise ValueError("HDF5 qc_only does not match manifest.")
-            for key in ("suite", "global_seed", "impedance_calibration_sha256"):
+            for key in ("suite", "global_seed"):
                 if key in self.manifest and str(h5.attrs.get(key)) != str(
                     self.manifest[key]
                 ):

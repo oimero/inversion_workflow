@@ -13,12 +13,12 @@ import pandas as pd
 
 from cup.synthetic.core import (
     validate_dataset_metadata,
-    validate_manifest_files,
     validate_training_manifest,
 )
+from cup.utils.io import require_contract_fingerprint
 
 
-SCHEMA_VERSION = "synthoseis_lite_v2"
+SCHEMA_VERSION = "synthoseis_lite_v3"
 SEISMIC_VARIANT_KINDS = {"seismic_variant", "frequency_probe_seismic_variant"}
 
 
@@ -86,7 +86,7 @@ def _pad_forward_to_model(
 
 
 class TimeV2Benchmark:
-    """Read-only accessor around ``synthoseis_lite_v2`` time artifacts."""
+    """Read-only accessor around ``synthoseis_lite_v3`` time artifacts."""
 
     schema = SCHEMA_VERSION
     sample_domain = "time"
@@ -94,8 +94,6 @@ class TimeV2Benchmark:
     def __init__(
         self,
         run_dir: str | Path,
-        *,
-        expected_forward_model_inputs_sha256: str | None = None,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.h5_path = self.run_dir / "synthetic_benchmark.h5"
@@ -121,20 +119,7 @@ class TimeV2Benchmark:
         if str(self.manifest.get("sample_domain") or "").casefold() != "time":
             raise ValueError("Time v2 reader requires sample_domain=time.")
         validate_training_manifest(self.manifest, sample_domain="time")
-        validate_manifest_files(
-            self.run_dir, dict(self.manifest.get("files") or {})
-        )
-        recorded_forward = str(self.manifest.get("forward_model_inputs_sha256") or "")
-        if not recorded_forward:
-            raise ValueError(
-                "Benchmark manifest lacks forward_model_inputs_sha256; rebuild required."
-            )
-        if expected_forward_model_inputs_sha256 is not None and recorded_forward != str(
-            expected_forward_model_inputs_sha256
-        ):
-            raise ValueError(
-                "Benchmark forward_model_inputs_sha256 does not match the requested model run."
-            )
+        require_contract_fingerprint(self.manifest, label=f"benchmark {self.run_dir}")
 
         self.index = pd.read_csv(self.index_path, dtype=str, keep_default_na=False)
         if self.index.empty:
@@ -201,18 +186,14 @@ class TimeV2Benchmark:
                 h5.attrs.get("schema") != SCHEMA_VERSION
                 and h5.attrs.get("schema_version") != SCHEMA_VERSION
             ):
-                raise ValueError("HDF5 schema does not match synthoseis_lite_v2.")
+                raise ValueError("HDF5 schema does not match synthoseis_lite_v3.")
             if h5.attrs.get("sample_domain") != "time":
                 raise ValueError("HDF5 sample_domain does not match time.")
-            if h5.attrs.get("forward_model_inputs_sha256") != recorded_forward:
-                raise ValueError(
-                    "HDF5 forward_model_inputs_sha256 does not match manifest."
-                )
             if bool(h5.attrs.get("qc_only", False)) != bool(
                 self.manifest.get("qc_only", False)
             ):
                 raise ValueError("HDF5 qc_only does not match manifest.")
-            for key in ("suite", "global_seed", "impedance_calibration_sha256"):
+            for key in ("suite", "global_seed"):
                 if key in self.manifest and str(h5.attrs.get(key)) != str(
                     self.manifest[key]
                 ):

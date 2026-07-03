@@ -37,7 +37,16 @@ if str(SRC_DIR) not in sys.path:
 from cup.config.workflow import WorkflowConfig
 from cup.config.sources import resolve_source_run
 from cup.utils.coerce import optional_float as _optional_float
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
+from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
+    load_yaml_config,
+    published_contract_reference,
+    repo_relative_path,
+    resolve_relative_path,
+    sanitize_filename,
+    write_json,
+)
 from cup.well.assets import normalize_well_name
 from cup.well.curves import exact_mnemonic, normalize_mnemonic
 from cup.well.las import _header_value, export_logset_to_las
@@ -467,13 +476,14 @@ def run_preprocess(
     config: dict[str, Any],
     range_overrides: Mapping[str, Any],
 ) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=False)
     screen_df = pd.read_csv(screen_file)
     curve_inventory_df = pd.read_csv(curve_inventory_file)
     required_categories = [str(item) for item in config["required_categories"]]
     selected_categories = [str(item) for item in config["selected_categories"]]
 
     output_las_dir = output_dir / "preprocessed_las"
-    output_las_dir.mkdir(parents=True, exist_ok=True)
+    output_las_dir.mkdir()
 
     constant_run_rows: list[dict[str, Any]] = []
     outlier_rows: list[dict[str, Any]] = []
@@ -734,7 +744,6 @@ def run_preprocess(
         "skipped_curves_csv": output_dir / "skipped_curves.csv",
         "run_summary_json": output_dir / "run_summary.json",
     }
-    output_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(paths["preprocess_summary_csv"], preprocess_rows)
     _write_csv(paths["well_preprocess_status_csv"], well_rows)
     _write_csv(paths["mnemonic_mapping_csv"], mapping_rows)
@@ -759,6 +768,8 @@ def run_preprocess(
         else {}
     )
     summary = {
+        "schema_version": "well_preprocess_v2",
+        "status": "success",
         "script": "well_preprocess.py",
         "inputs": {
             "screen_file": repo_relative_path(screen_file, root=REPO_ROOT),
@@ -790,6 +801,32 @@ def run_preprocess(
         "primary_reselection_count": int(len(reselection_rows)),
         "paths": {key: repo_relative_path(path, root=REPO_ROOT) for key, path in paths.items()},
     }
+    input_contracts = {
+        "well_screen": published_contract_reference(
+            screen_file.parent / "run_summary.json",
+            root=REPO_ROOT,
+            label=f"well screen run {screen_file.parent}",
+        )
+    }
+    primary_artifacts = {
+        "well_preprocess_status": paths["well_preprocess_status_csv"],
+    }
+    primary_artifacts.update(
+        {f"preprocessed_las:{path.name}": path for path in sorted(output_las_dir.glob("*.las"))}
+    )
+    summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+    summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+        contract_schema_version="well_preprocess_v2",
+        semantics={
+            "required_categories": required_categories,
+            "selected_categories": selected_categories,
+            "md_resampling": summary["md_resampling"],
+        },
+        business_config=config,
+        input_contracts=input_contracts,
+        primary_artifacts=primary_artifacts,
+    )
+    summary["input_contracts"] = input_contracts
     write_json(paths["run_summary_json"], summary)
     return {"paths": paths, "summary": summary}
 

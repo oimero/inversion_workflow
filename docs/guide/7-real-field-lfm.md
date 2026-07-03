@@ -22,7 +22,7 @@ python scripts/real_field_lfm.py --output-dir scripts/output/lfm_test
 
 | 来源 | 文件 | 用途 |
 |------|------|------|
-| 第六步 | `run_summary.json` | WellControlSet schema/domain 校验和 SHA-256 溯源 |
+| 第六步 | `run_summary.json` | WellControlSet schema/domain 校验和直接契约身份 |
 | 第六步 | `well_control_manifest.csv` | 成功井清单和逐井 NPZ 路径 |
 | 第六步 | `wells/<well_name>.npz` | 每井 canonical log(AI) 和逐样点位置 |
 | 数据目录 | 地震体 | 目标 SampleAxis、survey geometry 和 inline/xline 线网 |
@@ -35,9 +35,9 @@ python scripts/real_field_lfm.py --output-dir scripts/output/lfm_test
 
 层位文件为 Petrel 导出格式，通过 `import_interpretation_petrel` 读取，内部做绝对值处理。路径相对于 `data_root`。
 
-### 第六步 hash 校验
+### 第六步契约身份
 
-Step 7 加载 WellControlSet 时不仅校验 schema 版本，还会验明第六步记录的 `target_seismic_path` 和 `target_seismic_sha256` 与当前工作流地震体一致。如果地震体被替换过但第六步没重建，Step 7 会直接失败——不会静默使用不同地震体上建立的井控。
+Step 7 加载 WellControlSet 时校验 schema、domain/unit、采样轴、坐标和 shape 等显式语义，并把第六步发布的 `contract_fingerprint_sha256` 记为直接输入。消费者不重算地震体或逐井 NPZ 的 SHA；若地震体等业务输入发生变化，必须重建 Step 6，形成新的不可变 run。
 
 ---
 
@@ -280,8 +280,8 @@ comparisons:
 
 ### 第一阶段：加载与校验
 
-1. 加载第六步 WellControlSet，校验 `run_summary.json` schema、manifest SHA-256、逐井 NPZ SHA-256 和 provenance 哈希链。
-2. 校验 WellControlSet 的 `target_seismic_path/hash` 与当前工作流地震体一致。
+1. 加载第六步 WellControlSet，校验 `run_summary.json` schema、直接契约身份，以及 manifest/逐井 NPZ 的结构、轴、dtype、shape 和 mask 语义。
+2. 校验 WellControlSet 与当前地震的 domain、SampleAxis 和 survey geometry 一致；不重算地震文件哈希。
 3. 校验 WellControlSet 的 SampleAxis 与当前地震体的 SampleAxis 逐点一致。
 4. 解析 `real_field_lfm` 配置段，校验各 ID 全局唯一、引用存在、无自动组合。
 
@@ -319,7 +319,7 @@ comparisons:
    - `lfm.npz`：只包含 `log_ai`（float32）、`valid_mask_model`（bool）、`ilines`/`xlines`/`samples`（float64）、`metadata_json`。
    - `method_fields.npz`：a/b field、kriging variance 等。
    - `modifier_fields.npz`：class probability、class map QC 等（仅含 modifier 时）。
-   - `variant_summary.json`：完整 metadata、统计量、产物路径和哈希。
+   - `variant_summary.json`：完整 metadata、统计量、产物路径和当前 variant 唯一契约指纹。
 2. **逐 comparison 写入：** `metrics.csv`（全局差异统计）、`well_metrics.csv`（每井差异）、`figures/overview.png`（七面板对比图）。
 3. **volume 模式导出体：** 对每个 variant 输出线性 AI 的 SEG-Y 或 ZGY，mask 外保留 NaN。
 4. **写入 `variant_manifest.csv` 和 `lfm_run_summary.json`，然后原子 rename 临时目录为最终目录。**
@@ -354,7 +354,7 @@ real_field_lfm_<timestamp>/
 
 ### `lfm_run_summary.json`
 
-Schema 固定为 `real_field_lfm_run_v2`。记录完整 resolved config 和 SHA-256、WellControlSet/地震/层位哈希、输出几何、请求的 variant/comparison ID 列表、全部产物路径和哈希。
+Schema 固定为 `real_field_lfm_run_v3`。记录业务配置、WellControlSet 直接上游契约、输出几何、请求的 variant/comparison ID 列表和产物路径，并发布一个 run 级契约指纹。
 
 ### `variant_manifest.csv`
 
@@ -365,8 +365,9 @@ Schema 固定为 `real_field_lfm_run_v2`。记录完整 resolved config 和 SHA-
 | `variant_id` | 描述性标识符 |
 | `baseline_id` / `baseline_method` | 来源 baseline |
 | `modifier_chain` | 分号分隔的 modifier ID 列表 |
-| `lfm_path` / `lfm_sha256` | 主 NPZ 路径和哈希 |
-| `method_fields_path` / `method_fields_sha256` | 方法 sidecar 路径和哈希 |
+| `lfm_path` | 主 NPZ 路径 |
+| `method_fields_path` | 方法 sidecar 路径 |
+| `contract_fingerprint_sha256` | 当前 variant 唯一契约指纹 |
 
 ### `variants/<variant_id>/lfm.npz`
 
@@ -383,7 +384,7 @@ a/b、kriging variance、framework probability 等方法专属字段只在 sidec
 
 ### `variants/<variant_id>/variant_summary.json`
 
-完整 metadata：variant 身份、baseline/modifier 链、配置和哈希、来源路径和哈希、产物哈希、体统计量（valid 样点数、logAI 范围）。
+完整 metadata：variant 身份、baseline/modifier 链、业务配置、直接上游契约、产物路径、体统计量（valid 样点数、logAI 范围）和当前 variant 唯一契约指纹。
 
 ### QC 表格
 
@@ -411,7 +412,7 @@ a/b、kriging variance、framework probability 等方法专属字段只在 sidec
 ### 第一步：看终端输出
 
 ```
-=== Unified Real-field LFM v2 ===
+=== Unified Real-field LFM v3 ===
 Output: scripts/output/real_field_lfm_<timestamp>
 Variants: 3
 Status: ok
@@ -421,7 +422,7 @@ Status: ok
 
 ### 第二步：看 `lfm_run_summary.json`
 
-关注 `resolved_config_sha256`——这是整次 run 的配置指纹。后续如果有任何参数被意外修改，hash 会变化。
+关注 `contract_fingerprint_sha256` 和 `input_contracts`：前者是本次不可变 run 的唯一身份，后者只列直接上游。配置、直接上游或主产物变化都会形成新指纹。
 
 ### 第三步：看 variant QC 图
 
@@ -462,7 +463,7 @@ Status: ok
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
 | WellControlSet schema 不是 v2 | 第六步未完成或用旧版脚本生成 | 重建第六步 |
-| WellControlSet 地震 hash 不一致 | 第六步用了一个不同的地震体 | 用当前地震体重建第六步 |
+| WellControlSet 几何/采样轴不一致 | 第六步使用了不同的地震契约 | 用当前地震重建第六步；不要靠文件哈希替代轴语义校验 |
 | 配置段缺少必要字段 | baseline/modifier/variant 配置不完整 | 对照配置参考补全 |
 | variant ID 使用 `M0`/`M1` | 禁止编号式命名 | 使用描述性 ID |
 | baseline ID 或 modifier ID 重复 | ID 必须全局唯一 | 重命名冲突的 ID |

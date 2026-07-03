@@ -32,7 +32,7 @@ def _rng(
 ) -> np.random.Generator:
     return named_rng(
         global_seed=global_seed,
-        benchmark_version="synthoseis_lite_v1",
+        benchmark_version="synthoseis_lite_v3",
         generator_family=generator_family,
         stream_purpose="seismic_mismatch",
         realization_id=realization_id,

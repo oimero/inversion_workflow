@@ -55,7 +55,10 @@ from cup.seismic.wavelet import (
 from cup.config.workflow import WorkflowConfig
 from cup.config.sources import assert_recorded_source_matches, require_source_files, resolve_source_run
 from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
     load_yaml_config,
+    published_contract_reference,
     repo_relative_path,
     resolve_artifact_path,
     resolve_relative_path,
@@ -69,7 +72,7 @@ from cup.well.td import find_well_top_md, load_workflow_time_depth_table_csv
 from cup.well.tie import load_saved_seismic_trace_csv
 
 
-SCHEMA_VERSION = "forward_observability_v1"
+SCHEMA_VERSION = "forward_observability_v2"
 DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")
 
 
@@ -1320,6 +1323,7 @@ def main() -> None:
     )
     summary = {
         "schema_version": SCHEMA_VERSION,
+        "status": "success",
         "config_file": repo_relative_path(config_path, root=REPO_ROOT),
         "source_runs": {
             key: repo_relative_path(path, root=REPO_ROOT) for key, path in sources.items()
@@ -1351,6 +1355,35 @@ def main() -> None:
         "warnings": warnings,
         "recommended_ranges": ranges,
     }
+    input_contracts = {
+        key.removesuffix("_dir"): published_contract_reference(
+            path / "run_summary.json",
+            root=REPO_ROOT,
+            label=f"{key} {path}",
+        )
+        for key, path in sources.items()
+    }
+    summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+    summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+        contract_schema_version=SCHEMA_VERSION,
+        semantics={
+            "sample_domain": "time",
+            "frequencies_hz": frequencies_hz,
+            "ordered_horizons": script_cfg["ordered_horizons"],
+        },
+        business_config={
+            "frequency": script_cfg["frequency"],
+            "perturbation": script_cfg["perturbation"],
+            "thresholds": script_cfg["thresholds"],
+        },
+        input_contracts=input_contracts,
+        primary_artifacts={
+            "frequency_evidence_bands": output_dir / "frequency_evidence_bands.csv",
+            "well_frequency_sensitivity": output_dir / "well_frequency_sensitivity.csv",
+            "recommended_experiment_ranges": output_dir / "recommended_experiment_ranges.json",
+        },
+    )
+    summary["input_contracts"] = input_contracts
     write_json(output_dir / "run_summary.json", summary)
 
     _plot_operator(operator_rows, figures_dir / "operator_transfer.png")

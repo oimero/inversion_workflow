@@ -25,10 +25,17 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.synthetic.dataset import SynthoseisBenchmark
 from cup.synthetic.metrics import aggregate_metric_rows, metric_row, regression_metrics
-from cup.utils.io import repo_relative_path, resolve_relative_path, sha256_file, write_json
+from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
+    repo_relative_path,
+    require_contract_fingerprint,
+    resolve_relative_path,
+    write_json,
+)
 
 
-SCHEMA_VERSION = "synthoseis_lite_report_v1"
+SCHEMA_VERSION = "synthoseis_lite_report_v2"
 BASELINES = ("lfm_controlled_degraded", "lfm_ideal", "oracle_target")
 
 
@@ -263,30 +270,41 @@ def main() -> None:
     report_path = output_dir / "model_report_card.json"
     write_json(report_path, report)
 
+    benchmark_manifest_path = benchmark_dir / "benchmark_manifest.json"
+    with benchmark_manifest_path.open("r", encoding="utf-8") as handle:
+        benchmark_manifest = json.load(handle)
+    input_contracts = {
+        "benchmark": {
+            "path": repo_relative_path(benchmark_manifest_path, root=REPO_ROOT),
+            "contract_fingerprint_sha256": require_contract_fingerprint(
+                benchmark_manifest, label=f"benchmark {benchmark_dir}"
+            ),
+        }
+    }
+    contract_fingerprint = contract_fingerprint_sha256(
+        contract_schema_version=SCHEMA_VERSION,
+        semantics={"baseline_ids": baselines, "sample_kinds": sorted(kinds)},
+        business_config={"sample_count": len(sample_ids)},
+        input_contracts=input_contracts,
+        primary_artifacts={
+            "model_sample_metrics": sample_metrics_path,
+            "model_probe_metrics": probe_metrics_path,
+            "model_geometry_metrics": geometry_metrics_path,
+            "model_report_card": report_path,
+        },
+    )
     summary = {
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
+        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "contract_fingerprint_sha256": contract_fingerprint,
+        "input_contracts": input_contracts,
         "benchmark_dir": repo_relative_path(benchmark_dir, root=REPO_ROOT),
-        "benchmark_files": {
-            "synthetic_benchmark.h5": sha256_file(benchmark_dir / "synthetic_benchmark.h5"),
-            "sample_index.csv": sha256_file(benchmark_dir / "sample_index.csv"),
-            "benchmark_manifest.json": (
-                sha256_file(benchmark_dir / "benchmark_manifest.json")
-                if (benchmark_dir / "benchmark_manifest.json").is_file()
-                else ""
-            ),
-        },
         "outputs": {
             "model_sample_metrics": repo_relative_path(sample_metrics_path, root=REPO_ROOT),
             "model_probe_metrics": repo_relative_path(probe_metrics_path, root=REPO_ROOT),
             "model_geometry_metrics": repo_relative_path(geometry_metrics_path, root=REPO_ROOT),
             "model_report_card": repo_relative_path(report_path, root=REPO_ROOT),
-        },
-        "output_hashes": {
-            "model_sample_metrics.csv": sha256_file(sample_metrics_path),
-            "model_probe_metrics.csv": sha256_file(probe_metrics_path),
-            "model_geometry_metrics.csv": sha256_file(geometry_metrics_path),
-            "model_report_card.json": sha256_file(report_path),
         },
     }
     summary_path = output_dir / "evaluation_summary.json"

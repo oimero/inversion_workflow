@@ -43,12 +43,11 @@ from cup.utils.io import (  # noqa: E402
     load_yaml_config,
     repo_relative_path,
     resolve_relative_path,
-    sha256_file,
 )
 
 
-TIME_SCHEMA = "synthoseis_lite_v2"
-DEPTH_SCHEMA = "synthoseis_lite_v2"
+TIME_SCHEMA = "synthoseis_lite_v3"
+DEPTH_SCHEMA = "synthoseis_lite_v3"
 
 
 def _positive_int_arg(value: str) -> int:
@@ -79,7 +78,7 @@ def parse_args() -> argparse.Namespace:
         "--suite",
         choices=("canonical", "field_conditioned"),
         required=True,
-        help="Depth v2 requires field_conditioned; time v2 also supports canonical.",
+        help="Depth v3 requires field_conditioned; time v3 also supports canonical.",
     )
     generate.add_argument(
         "--debug-attempt-limit",
@@ -128,10 +127,10 @@ def _prepare_synthoseis_config(raw: dict, workflow: WorkflowConfig) -> dict:
             root=REPO_ROOT,
             label="forward_observability",
             summary_file="run_summary.json",
-            schema_version="forward_observability_v1",
+            schema_version="forward_observability_v2",
         )
         summary = load_summary(
-            obs_dir / "run_summary.json", schema_version="forward_observability_v1"
+            obs_dir / "run_summary.json", schema_version="forward_observability_v2"
         )
         recorded = dict(summary.get("source_runs") or {})
         source_runs = {
@@ -154,9 +153,7 @@ def _load_time_config(
         workflow = WorkflowConfig.from_mapping(raw)
         provenance = {
             "experiment_file": str(experiment_path),
-            "experiment_sha256": sha256_file(experiment_path),
             "workflow_config": str(experiment_path),
-            "workflow_config_sha256": sha256_file(experiment_path),
         }
         return _prepare_synthoseis_config(raw, workflow), workflow, provenance
 
@@ -176,12 +173,10 @@ def _load_time_config(
     composed["synthoseis_lite"] = dict(experiment_raw.get("synthoseis_lite") or {})
     workflow = WorkflowConfig.from_mapping(composed)
     if workflow.seismic.domain != "time":
-        raise ValueError("Time Synthoseis-lite v2 requires seismic.domain='time'.")
+        raise ValueError("Time Synthoseis-lite v3 requires seismic.domain='time'.")
     provenance = {
         "experiment_file": str(experiment_path),
-        "experiment_sha256": sha256_file(experiment_path),
         "workflow_config": str(common_path),
-        "workflow_config_sha256": sha256_file(common_path),
     }
     return _prepare_synthoseis_config(composed, workflow), workflow, provenance
 
@@ -210,13 +205,13 @@ def main() -> None:
 
     if (sample_domain, benchmark_schema) == ("depth", DEPTH_SCHEMA):
         if "workflow_config" not in experiment_raw:
-            raise ValueError("Depth Synthoseis-lite v2 requires workflow_config.")
+            raise ValueError("Depth Synthoseis-lite v3 requires workflow_config.")
         raw, workflow, config_provenance = load_composed_config(
             config_path, repo_root=REPO_ROOT
         )
         if workflow.seismic.domain != "depth":
             raise ValueError(
-                "Composed Synthoseis-lite v2 currently implements the depth branch only."
+                "Composed Synthoseis-lite v3 currently implements the depth branch only."
             )
         script_cfg = parse_depth_v2_config(raw)
         sources, source_provenance, forward_inputs = resolve_depth_v2_sources(
@@ -237,13 +232,12 @@ def main() -> None:
         else:
             if args.suite != "field_conditioned":
                 raise ValueError(
-                    "Depth Synthoseis-lite v2 only supports --suite field_conditioned."
+                    "Depth Synthoseis-lite v3 only supports --suite field_conditioned."
                 )
             summary = run_depth_generation(
                 workflow=workflow,
                 script_cfg=script_cfg,
                 sources=sources,
-                source_provenance=source_provenance,
                 forward_inputs=forward_inputs,
                 config_provenance=config_provenance,
                 calibration_path=resolve_relative_path(

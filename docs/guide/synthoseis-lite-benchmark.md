@@ -46,7 +46,7 @@ python scripts/synthoseis_lite.py --config <config-yaml> generate \
 |------|------|------|
 | 第四步 | `well_tie_metrics.csv`、`filtered_las/` | 标定成功的井、滤波后的测井曲线 |
 | 第五步 | `selected_wavelet.csv`、`selected_wavelet_summary.json` | 全局子波，用于正演和 mismatch 扰动 |
-| 旁路 | `forward_observability/` | 频率探针证据，用于 probe benchmark 构建；也是 forward_model_inputs_sha256 的来源之一 |
+| 旁路 | `forward_observability/` | 频率探针证据，用于 probe benchmark 构建；其 run 契约指纹作为校准或生成的直接输入 |
 | 数据目录 | 地震体、解释层位、井分层 | 几何约束、目标窗口定义 |
 
 ### 深度域
@@ -290,9 +290,9 @@ seismic_mismatch:
 
 **6) 低频模型推导。** 从波阻抗真值出发，用理想低通滤波得到理想低频模型，再叠加受控退化（幅值误差、趋势倾斜、层段偏差、空间平滑偏差、局部缺失控制井偏差）得到退化低频模型。这些低频模型是训练时模型输入的一部分。
 
-**7) 写入 HDF5。** 将每个成功样本的波阻抗真值、各种地震数据（理想、噪声、增益、组合失配）、低频模型、有效掩码等写入 `synthetic_benchmark.h5`。每个数据集附带单位、采样域、轴定义和 SHA-256 哈希。
+**7) 写入 HDF5。** 将每个成功样本的波阻抗真值、各种地震数据（理想、噪声、增益、组合失配）、低频模型、有效掩码等写入 `synthetic_benchmark.h5`。每个数据集附带单位、采样域、轴、shape 和 dtype；不写 dataset 级 SHA。
 
-**8) 输出清单与报告。** 写 `sample_index.csv`（每个样本的元数据一行）、`benchmark_manifest.json`（全局元数据、哈希链、接受率统计）、`scenario_catalog.csv`（场景级统计）。
+**8) 输出清单与报告。** 写 `sample_index.csv`（每个样本的元数据一行）、`benchmark_manifest.json`（全局元数据、直接上游契约、唯一 benchmark 指纹、接受率统计）、`scenario_catalog.csv`（场景级统计）。
 
 ### 深度域生成的特殊之处
 
@@ -314,7 +314,7 @@ seismic_mismatch:
 
 | 文件 | 内容 |
 |------|------|
-| `impedance_calibration.json` | 冻结的统计模型：区域定义、三态高斯参数、对象目录、转移矩阵、来源哈希 |
+| `impedance_calibration.json` | 冻结的统计模型：区域定义、三态高斯参数、对象目录、转移矩阵和直接上游契约 |
 | `zone_models.csv` | 每个区域每种态的样本数和分布参数 |
 | `object_catalog.csv` | 所有提取到的异常体：来源井、区域、态、轮廓系数、厚度 |
 | `transfer_matrix.csv` | 态之间的转移概率 |
@@ -327,7 +327,7 @@ seismic_mismatch:
 |------|------|
 | `synthetic_benchmark.h5` | 所有样本的数据数组（波阻抗、地震、低频模型、掩码），附带完整元数据属性 |
 | `sample_index.csv` | 每个样本一行：ID、所属剖面、几何类型、状态、HDF5 路径 |
-| `benchmark_manifest.json` | 全局元数据：域、schema、状态、哈希链、接受率统计 |
+| `benchmark_manifest.json` | 全局元数据：域、schema、状态、直接上游契约、唯一 benchmark 指纹和接受率统计 |
 | `scenario_catalog.csv` | 每个场景的尝试数、成功数、接受率、门禁状态 |
 | `attempt_plan.csv` | 全部计划的尝试列表 |
 | `attempt_progress.csv` | 增量进度日志，运行时持续刷新 |
@@ -364,7 +364,8 @@ Status: success
 - `status`：`success` / `completed_with_warnings` / `development_limited`
 - `qc_only` / `training_consumable`：QC-only 运行不能用于训练
 - `accepted_parent_realizations` / `rejected_parent_realizations`：全局接受率
-- `files`：所有输出文件的 SHA-256
+- `input_contracts`：只列 calibration 等直接上游契约
+- `contract_fingerprint_sha256`：benchmark 唯一契约指纹
 
 ### 第三步：看 `scenario_catalog.csv`
 
@@ -390,7 +391,7 @@ Status: success
 | `preflight: insufficient horizon support` | 剖面路径上的层位约束不足 | 检查解释层位覆盖面，或更换剖面路径 |
 | `scenario acceptance below failure_fraction` | 某场景接受率低于失败线且 enforcement 为 fail_fast | 放宽 QC 门控、调整剖面路径、或增加 attempts_per_scenario |
 | `scenario acceptance below warning_fraction` | 接受率在告警线和失败线之间 | 检查 `rejection_reason_summary.csv` 定位主要拒绝原因 |
-| `forward_model_inputs sha256 mismatch` | 冻结的正演输入哈希与当前配置不一致 | 深度域：重新运行岩石物理分析旁路和校准；时间域：确认第五步和正演可观测性旁路产物一致 |
+| `contract fingerprint/schema mismatch` | 输入仍是旧 schema，或所选直接上游契约与校准记录不一致 | 重建相关上游、校准和 benchmark；不提供旧哈希字段 fallback |
 | `calibration schema mismatch` | 校准产物版本与生成阶段期望不一致 | 重新运行校准 |
 
 ---

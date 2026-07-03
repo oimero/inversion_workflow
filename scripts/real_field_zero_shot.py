@@ -27,7 +27,15 @@ from cup.config.sources import resolve_source_run
 from cup.seismic.lfm.artifacts import resolve_lfm_variant
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.well.real_field_controls import load_well_control_set
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
+from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
+    load_yaml_config,
+    repo_relative_path,
+    require_contract_fingerprint,
+    resolve_relative_path,
+    write_json,
+)
 from cup.seismic.volume_export import export_volume_like_source, log_ai_to_ai_volume
 from ginn_v2.real_field import (
     input_qc_frame,
@@ -122,21 +130,28 @@ def _prepare_real_field_inputs(run_cfg: dict, workflow_cfg: dict) -> dict:
         raise ValueError("Selected LFM variant depth_basis does not match top-level seismic.depth_basis.")
     data_root = resolve_relative_path(workflow_cfg.get("data_root", "data"), root=REPO_ROOT)
     current_seismic = resolve_relative_path(str(seismic.get("file") or ""), root=data_root)
-    recorded_seismic = dict(selected.variant_metadata.get("seismic_path_and_hash") or {})
-    recorded_seismic_path = resolve_relative_path(str(recorded_seismic.get("path") or ""), root=REPO_ROOT)
+    recorded_seismic_path = resolve_relative_path(
+        str(selected.variant_metadata.get("seismic_path") or ""), root=REPO_ROOT
+    )
     if current_seismic.resolve() != recorded_seismic_path.resolve():
         raise ValueError("Selected LFM variant seismic path does not match top-level seismic.file.")
-    if sha256_file(current_seismic) != str(recorded_seismic.get("sha256") or ""):
-        raise ValueError("Selected LFM variant seismic SHA-256 does not match top-level seismic.file.")
     transform = str(inputs.get("lfm_value_transform") or "identity").casefold()
     if transform not in {"identity", "none"}:
-        raise ValueError("Unified LFM v2 is already log(AI); lfm_value_transform must be identity.")
+        raise ValueError("Unified LFM v3 is already log(AI); lfm_value_transform must be identity.")
     if str(inputs.get("target_mask_file") or "").strip():
-        raise ValueError("Unified LFM v2 owns valid_mask_model; external target_mask_file is not accepted.")
+        raise ValueError("Unified LFM v3 owns valid_mask_model; external target_mask_file is not accepted.")
     inputs["lfm_file"] = repo_relative_path(selected.lfm_path, root=REPO_ROOT)
     inputs["lfm_value_transform"] = "identity"
-    inputs["selected_lfm_sha256"] = selected.lfm_sha256
-    inputs["well_control_run_sha256"] = selected.well_control_run_sha256
+    inputs["selected_lfm_contract_fingerprint_sha256"] = selected.contract_fingerprint_sha256
+    inputs["selected_lfm_contract_path"] = repo_relative_path(
+        selected.variant_dir / "variant_summary.json", root=REPO_ROOT
+    )
+    inputs["well_control_contract_fingerprint_sha256"] = (
+        selected.well_control_contract_fingerprint_sha256
+    )
+    inputs["well_control_contract_path"] = repo_relative_path(
+        selected.well_control_run_dir / "run_summary.json", root=REPO_ROOT
+    )
     inputs["selected_lfm_metadata"] = dict(selected.variant_metadata)
     source_runs = dict(prepared.get("source_runs") or {})
     source_runs["lfm_run_dir"] = repo_relative_path(selected.run_dir, root=REPO_ROOT)
@@ -208,7 +223,6 @@ def _load_seismic_reference_payload(*, run_cfg: dict, models: list[dict]) -> dic
         "stats": stats,
         "sampling": payload.get("sampling", {}),
         "file": repo_relative_path(stats_path, root=REPO_ROOT),
-        "sha256": sha256_file(stats_path),
     }
 
 
@@ -805,45 +819,6 @@ def _input_distribution_warnings(qc_path: Path) -> list[dict[str, object]]:
     return warnings
 
 
-def _source_file_hashes(section_metadata: dict, source_runs: dict) -> dict[str, dict[str, object]]:
-    files: dict[str, str] = {
-        "seismic_file": str(section_metadata.get("seismic_file") or ""),
-        "lfm_file": str(section_metadata.get("lfm_file") or ""),
-    }
-    if section_metadata.get("target_mask_file"):
-        files["target_mask_file"] = str(section_metadata["target_mask_file"])
-    lfm_run_text = str(section_metadata.get("lfm_run_dir") or source_runs.get("lfm_run_dir") or "").strip()
-    if lfm_run_text:
-        files["lfm_run_summary"] = str(resolve_relative_path(lfm_run_text, root=REPO_ROOT) / "lfm_run_summary.json")
-    control_run_text = str(
-        section_metadata.get("well_control_run_dir") or source_runs.get("well_control_run_dir") or ""
-    ).strip()
-    if control_run_text:
-        files["well_control_run_summary"] = str(
-            resolve_relative_path(control_run_text, root=REPO_ROOT) / "run_summary.json"
-        )
-    wavelet_dir = source_runs.get("wavelet_generation_dir")
-    if wavelet_dir:
-        files["selected_wavelet_csv"] = str(resolve_relative_path(wavelet_dir, root=REPO_ROOT) / "selected_wavelet.csv")
-    out = {}
-    for key, text in files.items():
-        if not text:
-            continue
-        path = Path(text)
-        if not path.is_absolute():
-            path = resolve_relative_path(path, root=REPO_ROOT)
-        if not path.is_file():
-            out[key] = {"path": str(path), "sha256": "", "status": "missing"}
-            continue
-        out[key] = {
-            "path": repo_relative_path(path, root=REPO_ROOT),
-            "sha256": sha256_file(path),
-            "bytes": int(path.stat().st_size),
-            "status": "ok",
-        }
-    return out
-
-
 def main() -> None:
     args = parse_args()
     cfg_path = resolve_relative_path(args.config, root=REPO_ROOT)
@@ -868,7 +843,6 @@ def main() -> None:
         inputs_for_load["seismic_reference_stats"] = reference_payload["stats"]
         inputs_for_load["seismic_reference_sampling"] = reference_payload["sampling"]
         inputs_for_load["seismic_reference_stats_file"] = reference_payload["file"]
-        inputs_for_load["seismic_reference_stats_sha256"] = reference_payload["sha256"]
         run_cfg_for_load["real_field_inputs"] = inputs_for_load
     output_mode = str(run_cfg.get("mode") or "volume").casefold()
     if output_mode == "section":
@@ -918,7 +892,6 @@ def main() -> None:
     boundary = dict(run_cfg.get("boundary") or {})
     dt_s = float(field.twt_s[1] - field.twt_s[0]) if field.twt_s.size > 1 else 0.002
     input_qc_path = output_dir / "model_input_qc.csv"
-    source_hashes = _source_file_hashes(field.metadata, source_runs)
     if output_mode == "volume":
         axis_contract = {
             "n_inline": int(field.lfm.shape[0]),
@@ -940,9 +913,65 @@ def main() -> None:
             "twt_stop_s": float(field.twt_s[-1]),
             "dt_s": float(field.twt_s[1] - field.twt_s[0]) if field.twt_s.size > 1 else None,
         }
+    input_contracts = {
+        "lfm_variant": {
+            "path": str(inputs_for_load["selected_lfm_contract_path"]),
+            "contract_fingerprint_sha256": str(
+                inputs_for_load["selected_lfm_contract_fingerprint_sha256"]
+            ),
+        },
+        "well_control_set": {
+            "path": str(inputs_for_load["well_control_contract_path"]),
+            "contract_fingerprint_sha256": str(
+                inputs_for_load["well_control_contract_fingerprint_sha256"]
+            ),
+        },
+    }
+    for model_summary in model_summaries:
+        model_role = str(model_summary["model_role"])
+        model_input = dict(dict(model_summary.get("input_contracts") or {}).get("model_run") or {})
+        if not model_input:
+            raise ValueError(f"R0 model summary lacks model_run contract: {model_role}")
+        input_contracts[f"model:{model_role}"] = model_input
+    wavelet_dir_text = str(source_runs.get("wavelet_generation_dir") or "").strip()
+    if wavelet_dir_text:
+        wavelet_summary_path = resolve_relative_path(wavelet_dir_text, root=REPO_ROOT) / "run_summary.json"
+        with wavelet_summary_path.open("r", encoding="utf-8") as handle:
+            wavelet_summary = json.load(handle)
+        input_contracts["wavelet"] = {
+            "path": repo_relative_path(wavelet_summary_path, root=REPO_ROOT),
+            "contract_fingerprint_sha256": require_contract_fingerprint(
+                wavelet_summary, label=f"wavelet run {wavelet_summary_path.parent}"
+            ),
+        }
+    primary_artifacts = {
+        f"prediction:{str(model_summary['model_role'])}": resolve_relative_path(
+            str(dict(model_summary["outputs"])["predictions"]), root=REPO_ROOT
+        )
+        for model_summary in model_summaries
+    }
+    contract_fingerprint = contract_fingerprint_sha256(
+        contract_schema_version="real_field_zero_shot_summary_v2",
+        semantics={
+            "mode": output_mode,
+            "sample_domain": str(field.metadata.get("sample_domain") or "time"),
+            "axis_contract": axis_contract,
+        },
+        business_config={
+            "mode": output_mode,
+            "stitch_strategy": stitch_strategy,
+            "boundary": boundary,
+            "volume": dict(run_cfg.get("volume") or {}),
+        },
+        input_contracts=input_contracts,
+        primary_artifacts=primary_artifacts,
+    )
     summary = {
-        "schema_version": "real_field_zero_shot_summary_v1",
+        "schema_version": "real_field_zero_shot_summary_v2",
         "status": "needs_forward_diagnostic",
+        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "contract_fingerprint_sha256": contract_fingerprint,
+        "input_contracts": input_contracts,
         "mode": output_mode,
         "config_file": repo_relative_path(cfg_path, root=REPO_ROOT),
         "device_requested": device,
@@ -963,7 +992,6 @@ def main() -> None:
             "prediction_taper_halo_samples": int(np.ceil(float(boundary.get("prediction_taper_halo_s", 0.0) or 0.0) / dt_s)),
             "dt_s": dt_s,
         },
-        "source_file_sha256": source_hashes,
         "input_distribution_qc": {
             "path": repo_relative_path(input_qc_path, root=REPO_ROOT),
             "warnings": _input_distribution_warnings(input_qc_path),
@@ -978,12 +1006,6 @@ def main() -> None:
         "models": model_summaries,
         "code_version_or_git_commit": str(run_cfg.get("code_version_or_git_commit") or _git_commit()),
     }
-    wavelet_dir_text = (source_runs.get("wavelet_generation_dir") or "").strip()
-    if wavelet_dir_text:
-        wavelet_dir = resolve_relative_path(wavelet_dir_text, root=REPO_ROOT)
-        selected = wavelet_dir / "selected_wavelet.csv"
-        if selected.is_file():
-            summary["wavelet_sha256"] = sha256_file(selected)
     write_json(output_dir / "real_field_zero_shot_summary.json", summary)
     print("=== Real Field Zero-Shot ===")
     print(f"Output: {output_dir}")

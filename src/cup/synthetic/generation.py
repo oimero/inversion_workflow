@@ -97,11 +97,7 @@ def _rng_keys(
 ) -> dict[str, Any]:
     return {
         "global_seed": int(global_seed),
-        "benchmark_version": (
-            "synthoseis_lite_v2"
-            if str(calibration.generator_family).endswith("_v2")
-            else "synthoseis_lite_v1"
-        ),
+        "benchmark_version": "synthoseis_lite_v3",
         "generator_family": calibration.generator_family,
         "stream_purpose": stream_purpose,
         "realization_id": realization_id,

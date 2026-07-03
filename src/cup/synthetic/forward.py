@@ -9,7 +9,6 @@ import numpy as np
 from scipy.signal import firwin, resample_poly
 
 from cup.seismic.observability import forward_log_ai
-from cup.utils.io import array_sha256
 
 
 def antialias_taps(
@@ -236,10 +235,6 @@ def highres_forward_to_model_grid(
         "highres_wavelet_n_samples": int(highres_wavelet.amplitude.size),
         "highres_wavelet_l2_energy": float(
             np.linalg.norm(highres_wavelet.amplitude)
-        ),
-        "highres_wavelet_sha256": array_sha256(highres_wavelet.amplitude),
-        "highres_forward_filter_sha256": array_sha256(
-            highres_wavelet.filter_taps
         ),
     }
     return HighresForwardResult(seismic_model_grid=downsampled, qc=qc)

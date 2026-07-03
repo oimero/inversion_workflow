@@ -26,7 +26,15 @@ from cup.seismic.viz import plot_well_waveform_qc
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.config.sources import assert_same_path, load_summary, resolve_source_file_from_run, resolve_source_run
 from cup.physics.numpy_backend import forward_time
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sha256_file, write_json
+from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
+    load_yaml_config,
+    published_contract_reference,
+    repo_relative_path,
+    resolve_relative_path,
+    write_json,
+)
 from cup.utils.statistics import radius_connected_components
 from ginn_v2.real_field import (
     diagnostic_metrics,
@@ -363,7 +371,6 @@ def _load_wavelet_scenarios(
             "source_well": str((nominal_meta.get("selected_source_well") or "optimized_consensus")),
             "candidate_score": float("nan"),
             "wavelet_path": str(nominal_meta["selected_wavelet_csv"]),
-            "wavelet_sha256": str(nominal_meta["wavelet_sha256"]),
             "wavelet_time_s": nominal_time_s,
             "wavelet": nominal,
         }
@@ -398,7 +405,6 @@ def _load_wavelet_scenarios(
                 "source_well": source_well,
                 "candidate_score": float(pd.to_numeric(row.get("score"), errors="coerce")),
                 "wavelet_path": repo_relative_path(path, root=REPO_ROOT),
-                "wavelet_sha256": sha256_file(path),
                 "wavelet_time_s": candidate_time_s,
                 "wavelet": wavelet,
             }
@@ -476,7 +482,7 @@ def _load_zero_shot_line_geometry(zero_shot_dir: Path):
 def _load_zero_shot_summary(zero_shot_dir: Path) -> dict:
     return load_summary(
         zero_shot_dir / "real_field_zero_shot_summary.json",
-        schema_version="real_field_zero_shot_summary_v1",
+        schema_version="real_field_zero_shot_summary_v2",
         allowed_status={"needs_forward_diagnostic", "ok"},
         label="real_field_zero_shot_summary.json",
     )
@@ -491,7 +497,7 @@ def _resolve_zero_shot_dir(run_cfg: dict, *, output_root: Path, cli_value: Path 
         root=REPO_ROOT,
         label="real_field_zero_shot",
         summary_file="real_field_zero_shot_summary.json",
-        schema_version="real_field_zero_shot_summary_v1",
+        schema_version="real_field_zero_shot_summary_v2",
         allowed_status={"needs_forward_diagnostic", "ok"},
     )
 
@@ -2355,7 +2361,6 @@ def main() -> None:
                     "source_well": scenario["source_well"],
                     "candidate_score": scenario["candidate_score"],
                     "wavelet_path": scenario["wavelet_path"],
-                    "wavelet_sha256": scenario["wavelet_sha256"],
                     "diagnostic_window": "full_valid_mask",
                     **scenario_metrics,
                 }
@@ -2470,9 +2475,41 @@ def main() -> None:
         else "future_sparse_well_adapter_candidate"
     )
 
+    input_contracts = {
+        "real_field_zero_shot": published_contract_reference(
+            zero_shot_dir / "real_field_zero_shot_summary.json",
+            root=REPO_ROOT,
+            label=f"R0 run {zero_shot_dir}",
+        ),
+        "wavelet": published_contract_reference(
+            wavelet_dir / "run_summary.json",
+            root=REPO_ROOT,
+            label=f"wavelet run {wavelet_dir}",
+        ),
+    }
+    contract_fingerprint = contract_fingerprint_sha256(
+        contract_schema_version="real_field_forward_diagnostic_summary_v3",
+        semantics={"mode": output_mode, "dt_s": dt_s, "forward_operator": "cup.physics.numpy_backend.forward_time"},
+        business_config={
+            "phase_scan_deg": phase_values,
+            "fractional_shift_scan_samples": shift_values,
+            "diagnostic_max_hz": run_cfg.get("diagnostic_max_hz"),
+        },
+        input_contracts=input_contracts,
+        primary_artifacts={
+            "forward_diagnostic_metrics": metrics_path,
+            "well_forward_diagnostic": well_path,
+            "residual_decomposition": decomposition_path,
+            "wavelet_sensitivity": wavelet_sensitivity_path,
+            "spatial_residual_qc": spatial_path,
+        },
+    )
     summary = {
-        "schema_version": "real_field_forward_diagnostic_summary_v2",
+        "schema_version": "real_field_forward_diagnostic_summary_v3",
         "status": "ok",
+        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "contract_fingerprint_sha256": contract_fingerprint,
+        "input_contracts": input_contracts,
         "mode": output_mode,
         "config_file": repo_relative_path(cfg_path, root=REPO_ROOT),
         "zero_shot_dir": repo_relative_path(zero_shot_dir, root=REPO_ROOT),
@@ -2508,12 +2545,6 @@ def main() -> None:
         },
         "red_flags": red_flags,
         "recommended_next_state": recommended_next_state,
-        "wavelet_sha256": wavelet_meta["wavelet_sha256"],
-        "zero_shot_summary_sha256": (
-            sha256_file(zero_shot_dir / "real_field_zero_shot_summary.json")
-            if (zero_shot_dir / "real_field_zero_shot_summary.json").is_file()
-            else ""
-        ),
         "code_version_or_git_commit": str(run_cfg.get("code_version_or_git_commit") or _git_commit()),
     }
     write_json(output_dir / "real_field_forward_diagnostic_summary.json", summary)

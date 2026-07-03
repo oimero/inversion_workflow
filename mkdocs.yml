@@ -46,6 +46,7 @@ nav:
   - 快速开始:
       - 核心 CSV 契约: concepts/csv-contracts.md
       - 数据与单位约定: concepts/data-and-coordinate-conventions.md
+      - SHA-256 契约瘦身规范: spec/SHA256_CONTRACT_SLIMMING.md
       - 脚本风格指南: concepts/script-style.md
   - 教程:
       - 常见问题: guide/0-troubleshooting.md

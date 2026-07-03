@@ -133,7 +133,7 @@ def _aligned_arrays(
     if str(getattr(sample, "sample_domain", "")) == "depth":
         if seismic.shape != target.shape:
             raise ValueError(
-                f"Depth v2 requires N-point seismic/target alignment for {sample.sample_id}: "
+                f"Depth v3 requires N-point seismic/target alignment for {sample.sample_id}: "
                 f"{seismic.shape} vs {target.shape}"
             )
         observed_valid = np.asarray(sample.observed_valid_mask, dtype=bool)

@@ -36,7 +36,16 @@ from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.config.workflow import WorkflowConfig, merge_dict_defaults
 from cup.config.sources import resolve_source_run
 from cup.utils.coerce import as_bool, optional_float
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
+from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
+    load_yaml_config,
+    published_contract_reference,
+    repo_relative_path,
+    resolve_relative_path,
+    sanitize_filename,
+    write_json,
+)
 from cup.well.assets import build_file_lookup, normalize_well_name
 from cup.well.trajectory import WellTrajectory, trajectory_summary, z_tvd_residual_m
 
@@ -505,7 +514,7 @@ def main() -> None:
     script_cfg = _script_config(cfg)
     data_root = _resolve_repo_path(workflow.data_root)
     output_dir = _resolve_output_dir(args, cfg)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=False)
 
     inventory_file = _resolve_inventory_file(cfg, script_cfg)
     if not inventory_file.exists():
@@ -545,6 +554,8 @@ def main() -> None:
     failed_df.to_csv(paths["failed_trajectories"], index=False)
 
     run_summary = {
+        "schema_version": "well_trajectory_v2",
+        "status": "success",
         "script": "well_trajectory.py",
         "config_file": repo_relative_path(args.config, root=REPO_ROOT),
         "inputs": {
@@ -560,6 +571,22 @@ def main() -> None:
         "summary": summary,
         "paths": {key: repo_relative_path(path, root=REPO_ROOT) for key, path in paths.items()},
     }
+    input_contracts = {
+        "well_inventory": published_contract_reference(
+            inventory_file.parent / "run_summary.json",
+            root=REPO_ROOT,
+            label=f"well inventory run {inventory_file.parent}",
+        )
+    }
+    run_summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+    run_summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+        contract_schema_version="well_trajectory_v2",
+        semantics={"geometry": geometry, "summary": summary},
+        business_config={"classification": script_cfg["classification"], "survey_qc": survey_cfg},
+        input_contracts=input_contracts,
+        primary_artifacts={"well_trajectory": paths["well_trajectory"]},
+    )
+    run_summary["input_contracts"] = input_contracts
     write_json(paths["run_summary"], run_summary)
 
     print(

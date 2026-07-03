@@ -17,11 +17,13 @@ import pandas as pd
 
 from cup.seismic.geometry import SampleAxis, SurveyLineGeometry
 from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
     repo_relative_path,
+    require_contract_fingerprint,
     resolve_artifact_path,
     resolve_relative_path,
     sanitize_filename,
-    sha256_file,
 )
 from cup.well.assets import build_file_lookup, normalize_well_name
 from cup.well.td import load_workflow_time_depth_table_csv
@@ -29,9 +31,9 @@ from cup.well.trajectory import WellTrajectory
 from wtie.processing import grid
 
 
-SCHEMA_VERSION = "real_field_well_controls_v2"
-TIME_SOURCE_SCHEMA = "well_auto_tie_v2"
-DEPTH_SOURCE_SCHEMA = "wavelet_batch_synthetic_depth_v2"
+SCHEMA_VERSION = "real_field_well_controls_v3"
+TIME_SOURCE_SCHEMA = "well_auto_tie_v3"
+DEPTH_SOURCE_SCHEMA = "wavelet_batch_synthetic_depth_v3"
 LINEAR_AI_UNIT = "m/s*g/cm3"
 
 MANIFEST_COLUMNS = [
@@ -41,11 +43,8 @@ MANIFEST_COLUMNS = [
     "source_run_type",
     "source_run_path",
     "source_summary_path",
-    "source_summary_sha256",
     "source_las_path",
-    "source_las_sha256",
     "source_transform_path",
-    "source_transform_sha256",
     "wellbore_class",
     "sample_domain",
     "sample_unit",
@@ -56,7 +55,6 @@ MANIFEST_COLUMNS = [
     "sample_min",
     "sample_max",
     "well_npz_path",
-    "well_npz_sha256",
 ]
 
 
@@ -359,11 +357,8 @@ def _time_control(
         source_run_type="well_auto_tie",
         provenance={
             "source_las_path": str(las_path),
-            "source_las_sha256": sha256_file(las_path),
             "source_transform_path": str(transform_path),
-            "source_transform_sha256": sha256_file(transform_path),
             "optimized_tdt_path": str(tdt_path),
-            "optimized_tdt_sha256": sha256_file(tdt_path),
         },
     )
 
@@ -437,9 +432,7 @@ def _depth_control(
         source_run_type="wavelet_batch_synthetic_depth",
         provenance={
             "source_las_path": str(las_path),
-            "source_las_sha256": sha256_file(las_path),
             "source_transform_path": "" if transform_path is None else str(transform_path),
-            "source_transform_sha256": "" if transform_path is None else sha256_file(transform_path),
             **transform_metadata,
         },
     )
@@ -522,7 +515,17 @@ def build_well_control_set(
     trace_lookup = build_file_lookup(trace_dir.iterdir(), asset_label=str(trace_dir)) if trace_dir.is_dir() else {}
     controls: list[WellControl] = []
     rows: list[dict[str, Any]] = []
-    source_summary_sha = sha256_file(summary_path)
+    source_contract_fingerprint = require_contract_fingerprint(
+        source_summary, label=f"source run {summary_path}"
+    )
+    inventory_summary_path = inventory_path.parent / "run_summary.json"
+    if not inventory_summary_path.is_file():
+        raise FileNotFoundError(inventory_summary_path)
+    with inventory_summary_path.open("r", encoding="utf-8") as handle:
+        inventory_summary = json.load(handle)
+    inventory_contract_fingerprint = require_contract_fingerprint(
+        inventory_summary, label=f"well inventory run {inventory_summary_path}"
+    )
     for (_, source_row), source_ok in zip(metrics.iterrows(), success.to_numpy(dtype=bool)):
         well_name = str(source_row["well_name"]).strip()
         base = {
@@ -532,11 +535,8 @@ def build_well_control_set(
             "source_run_type": source_run_type,
             "source_run_path": repo_relative_path(source_run_dir, root=repo_root),
             "source_summary_path": repo_relative_path(summary_path, root=repo_root),
-            "source_summary_sha256": source_summary_sha,
             "source_las_path": "",
-            "source_las_sha256": "",
             "source_transform_path": "",
-            "source_transform_sha256": "",
             "wellbore_class": "",
             "sample_domain": sample_axis.domain,
             "sample_unit": sample_axis.unit,
@@ -547,7 +547,6 @@ def build_well_control_set(
             "sample_min": float(sample_axis.values[0]),
             "sample_max": float(sample_axis.values[-1]),
             "well_npz_path": "",
-            "well_npz_sha256": "",
         }
         if not source_ok:
             rows.append(base)
@@ -594,11 +593,9 @@ def build_well_control_set(
                 "status": "ok",
                 "reason": "",
                 "source_las_path": repo_relative_path(provenance["source_las_path"], root=repo_root),
-                "source_las_sha256": provenance["source_las_sha256"],
                 "source_transform_path": (
                     repo_relative_path(transform_text, root=repo_root) if transform_text else ""
                 ),
-                "source_transform_sha256": str(provenance.get("source_transform_sha256") or ""),
                 "wellbore_class": control.wellbore_class,
                 "sampling_mode": control.sampling_mode,
                 "n_valid_samples": int(np.count_nonzero(control.valid_mask)),
@@ -618,13 +615,19 @@ def build_well_control_set(
         provenance={
             "source_run_path": str(source_run_dir),
             "source_summary_path": str(summary_path),
-            "source_summary_sha256": source_summary_sha,
             "metrics_path": str(metrics_path),
-            "metrics_sha256": sha256_file(metrics_path),
             "well_inventory_path": str(inventory_path),
-            "well_inventory_sha256": sha256_file(inventory_path),
             "target_seismic_path": str(seismic_path),
-            "target_seismic_sha256": sha256_file(seismic_path),
+            "input_contracts": {
+                "source_run": {
+                    "path": repo_relative_path(summary_path, root=repo_root),
+                    "contract_fingerprint_sha256": source_contract_fingerprint,
+                },
+                "well_inventory": {
+                    "path": repo_relative_path(inventory_summary_path, root=repo_root),
+                    "contract_fingerprint_sha256": inventory_contract_fingerprint,
+                },
+            },
         },
     )
     return control_set, pd.DataFrame.from_records(rows, columns=MANIFEST_COLUMNS)
@@ -646,7 +649,7 @@ def write_well_control_set(
         return out
 
     if list(manifest.columns) != MANIFEST_COLUMNS:
-        raise ValueError("Well-control manifest columns do not match the frozen v2 contract.")
+        raise ValueError("Well-control manifest columns do not match the frozen v3 contract.")
     manifest_names = [normalize_well_name(value) for value in manifest["well_name"]]
     if len(manifest_names) != len(set(manifest_names)):
         raise ValueError("Well-control manifest well names must be unique after normalization.")
@@ -699,12 +702,35 @@ def write_well_control_set(
         )
         match = manifest_out["well_name"].astype(str).str.casefold().eq(control.well_name.casefold())
         manifest_out.loc[match, "well_npz_path"] = repo_relative_path(path, root=repo_root)
-        manifest_out.loc[match, "well_npz_sha256"] = sha256_file(path)
     manifest_path = output_dir / "well_control_manifest.csv"
     manifest_out.to_csv(manifest_path, index=False)
+    input_contracts = dict(control_set.provenance.get("input_contracts") or {})
+    primary_artifacts = {"well_control_manifest": manifest_path}
+    primary_artifacts.update(
+        {
+            f"well:{sanitize_filename(control.well_name)}": wells_dir / f"{sanitize_filename(control.well_name)}.npz"
+            for control in control_set.controls
+        }
+    )
+    contract_fingerprint = contract_fingerprint_sha256(
+        contract_schema_version=SCHEMA_VERSION,
+        semantics={
+            "sample_domain": control_set.sample_domain,
+            "sample_unit": control_set.sample_unit,
+            "depth_basis": control_set.depth_basis,
+            "value_domain": "log(AI)",
+            "linear_ai_unit": LINEAR_AI_UNIT,
+        },
+        business_config=resolved_config,
+        input_contracts=input_contracts,
+        primary_artifacts=primary_artifacts,
+    )
     summary = {
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
+        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "contract_fingerprint_sha256": contract_fingerprint,
+        "input_contracts": input_contracts,
         "resolved_config": dict(resolved_config),
         "source_adapter": control_set.source_run_type,
         "sample_axis": control_set.sample_axis.describe(),
@@ -718,7 +744,6 @@ def write_well_control_set(
         "provenance": portable_provenance(control_set.provenance),
         "outputs": {
             "well_control_manifest": repo_relative_path(manifest_path, root=repo_root),
-            "well_control_manifest_sha256": sha256_file(manifest_path),
             "wells_dir": repo_relative_path(wells_dir, root=repo_root),
         },
     }
@@ -729,7 +754,7 @@ def write_well_control_set(
 
 
 def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
-    """Load and hash-validate a canonical Step 6 run."""
+    """Load and semantically validate a canonical immutable Step 6 run."""
 
     summary_path = run_dir / "run_summary.json"
     manifest_path = run_dir / "well_control_manifest.csv"
@@ -739,18 +764,15 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
         summary = json.load(handle)
     if summary.get("schema_version") != SCHEMA_VERSION or summary.get("status") != "ok":
         raise ValueError(f"Unsupported or unsuccessful well-control run: {run_dir}")
+    require_contract_fingerprint(summary, label=f"WellControlSet {run_dir}")
     outputs = dict(summary.get("outputs") or {})
-    expected_manifest_hash = str(outputs.get("well_control_manifest_sha256") or "")
     recorded_manifest_path = resolve_relative_path(
         str(outputs.get("well_control_manifest") or ""), root=repo_root
     )
     if (
         recorded_manifest_path.resolve() != manifest_path.resolve()
-        or not expected_manifest_hash
-        or sha256_file(manifest_path) != expected_manifest_hash
     ):
-        raise ValueError("well_control_manifest.csv SHA-256 mismatch.")
-    _validate_provenance_hashes(dict(summary.get("provenance") or {}), repo_root=repo_root)
+        raise ValueError("well_control_manifest.csv path does not match run_summary.json.")
     manifest = pd.read_csv(manifest_path, keep_default_na=False)
     _required_columns(manifest, set(MANIFEST_COLUMNS), path=manifest_path)
     manifest_names = [normalize_well_name(value) for value in manifest["well_name"]]
@@ -760,18 +782,13 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
     if not status_values.issubset({"ok", "failed"}):
         raise ValueError(f"well_control_manifest.csv contains unsupported statuses: {sorted(status_values)}")
     failed = manifest[manifest["status"].astype(str).eq("failed")]
-    if (
-        failed["well_npz_path"].astype(str).str.strip().ne("").any()
-        or failed["well_npz_sha256"].astype(str).str.strip().ne("").any()
-    ):
+    if failed["well_npz_path"].astype(str).str.strip().ne("").any():
         raise ValueError("Failed well-control manifest rows must not reference consumable NPZ files.")
     successful = manifest[manifest["status"].astype(str).eq("ok")]
     if successful.empty:
         raise ValueError("Successful well-control run has no successful manifest rows.")
     first_row = successful.iloc[0]
     first_path = resolve_relative_path(str(first_row["well_npz_path"]), root=repo_root)
-    if sha256_file(first_path) != str(first_row["well_npz_sha256"]):
-        raise ValueError(f"Well control SHA-256 mismatch: {first_row['well_name']}")
     with np.load(first_path, allow_pickle=False) as first_data:
         first_samples = np.asarray(first_data["samples"], dtype=np.float64)
     axis_info = dict(summary["sample_axis"])
@@ -799,8 +816,6 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
     controls: list[WellControl] = []
     for _, row in successful.iterrows():
         path = resolve_relative_path(str(row["well_npz_path"]), root=repo_root)
-        if sha256_file(path) != str(row["well_npz_sha256"]):
-            raise ValueError(f"Well control SHA-256 mismatch: {row['well_name']}")
         with np.load(path, allow_pickle=False) as data:
             if set(data.files) != {"samples", "log_ai", "inline", "xline", "x_m", "y_m", "valid_mask", "metadata_json"}:
                 raise ValueError(f"Unexpected well-control NPZ keys: {path}")
@@ -832,7 +847,6 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
                     )
             if normalize_well_name(metadata.get("well_name")) != normalize_well_name(row["well_name"]):
                 raise ValueError(f"Well-control manifest/NPZ well_name mismatch: {path}")
-            _validate_provenance_hashes(dict(metadata.get("provenance") or {}), repo_root=repo_root)
             file_axis = np.asarray(data["samples"], dtype=np.float64)
             if not np.array_equal(file_axis, axis.values):
                 raise ValueError(f"Well-control SampleAxis mismatch: {path}")
@@ -861,22 +875,6 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
         source_run_type=str(summary["source_adapter"]),
         provenance=dict(summary["provenance"]),
     )
-
-
-def _validate_provenance_hashes(provenance: Mapping[str, Any], *, repo_root: Path) -> None:
-    for path_key, path_value in provenance.items():
-        if not path_key.endswith("_path"):
-            continue
-        hash_key = f"{path_key[:-5]}_sha256"
-        expected = str(provenance.get(hash_key) or "").strip()
-        if not expected:
-            continue
-        path = resolve_relative_path(str(path_value), root=repo_root)
-        if not path.is_file():
-            raise FileNotFoundError(path)
-        if sha256_file(path) != expected:
-            raise ValueError(f"WellControlSet provenance SHA-256 mismatch: {path_key}")
-
 
 __all__ = [
     "DEPTH_SOURCE_SCHEMA",

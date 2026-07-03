@@ -80,7 +80,7 @@ class LfmContext:
     target_zone: TargetZone
     output_geometry: OutputGeometry
     depth_basis: str | None
-    common_hashes: Mapping[str, Any] = field(default_factory=dict)
+    common_sources: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not np.allclose(self.target_zone.samples, self.sample_axis.values, rtol=0.0, atol=1e-9):

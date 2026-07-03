@@ -33,7 +33,14 @@ if str(SRC_DIR) not in sys.path:
 from cup.petrel.load import import_well_heads_petrel, import_well_tops_petrel
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.config.workflow import WorkflowConfig
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
+from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
+    load_yaml_config,
+    repo_relative_path,
+    resolve_relative_path,
+    write_json,
+)
 from cup.well.assets import (
     WellHead,
     WellInventory,
@@ -306,7 +313,7 @@ def build_inventory(
 
 
 def _write_outputs(inventory: WellInventory, output_dir: Path, run_summary: dict[str, Any]) -> dict[str, Path]:
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=False)
     paths = {
         "well_inventory_csv": output_dir / "well_inventory.csv",
         "well_neighbor_pairs_csv": output_dir / "well_neighbor_pairs.csv",
@@ -316,6 +323,23 @@ def _write_outputs(inventory: WellInventory, output_dir: Path, run_summary: dict
     inventory.records_dataframe().to_csv(paths["well_inventory_csv"], index=False, encoding="utf-8")
     inventory.neighbor_pairs_dataframe().to_csv(paths["well_neighbor_pairs_csv"], index=False, encoding="utf-8")
     inventory.clusters_dataframe().to_csv(paths["well_clusters_csv"], index=False, encoding="utf-8")
+    run_summary["schema_version"] = "well_inventory_v2"
+    run_summary["status"] = "success"
+    run_summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+    run_summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+        contract_schema_version="well_inventory_v2",
+        semantics={
+            "sample_domain": run_summary["inputs"]["seismic_domain"],
+            "geometry": run_summary["geometry"],
+        },
+        business_config={"thresholds": run_summary["thresholds"]},
+        input_contracts={},
+        primary_artifacts={
+            "well_inventory": paths["well_inventory_csv"],
+            "well_neighbor_pairs": paths["well_neighbor_pairs_csv"],
+            "well_clusters": paths["well_clusters_csv"],
+        },
+    )
     write_json(paths["run_summary_json"], run_summary)
     return paths
 

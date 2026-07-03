@@ -38,7 +38,10 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
     load_yaml_config,
+    published_contract_reference,
     repo_relative_path,
     resolve_relative_path,
     sanitize_filename,
@@ -953,15 +956,9 @@ def main() -> None:
     source_auto_tie_dir = REPO_ROOT / str(script_cfg["source_auto_tie_dir"])
     source_well_name = str(script_cfg["source_well_name"])
     wavelet_path = source_auto_tie_dir / f"wavelet_201ms_{source_well_name}.csv"
-    # Try both naming conventions (run_summary_NW11.json from new script,
-    # run_summary_auto_well_tie_NW11.json from old notebook).
-    run_summary_candidates = [
-        source_auto_tie_dir / f"run_summary_{source_well_name}.json",
-        source_auto_tie_dir / f"run_summary_auto_well_tie_{source_well_name}.json",
-    ]
-    wavelet_run_summary_path = next((p for p in run_summary_candidates if p.exists()), None)
+    wavelet_run_summary_path = source_auto_tie_dir / f"run_summary_{source_well_name}.json"
 
-    for p in [las_dir, well_heads_file, seismic_file, wavelet_path]:
+    for p in [las_dir, well_heads_file, seismic_file, wavelet_path, wavelet_run_summary_path]:
         if not p.exists():
             raise FileNotFoundError(f"Missing input: {p}")
 
@@ -974,8 +971,8 @@ def main() -> None:
     else:
         output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
 
+    output_dir.mkdir(parents=True, exist_ok=False)
     output_dirs = {
-        "root": output_dir,
         "synthetic_qc": output_dir / "synthetic_qc",
         "shift_scans": output_dir / "shift_scans",
         "depth_shift_curves": output_dir / "depth_shift_curves",
@@ -984,7 +981,8 @@ def main() -> None:
         "figures": output_dir / "figures",
     }
     for d in output_dirs.values():
-        d.mkdir(parents=True, exist_ok=True)
+        d.mkdir()
+    output_dirs["root"] = output_dir
 
     # ── Well list ──
 
@@ -1030,10 +1028,7 @@ def main() -> None:
     shift_values_s = np.arange(shift_min_ms / 1000.0, shift_max_ms / 1000.0 + 0.5 * wavelet_dt_s, wavelet_dt_s)
 
     # Load auto-tie run summary for log filter params (with fallback)
-    if wavelet_run_summary_path is not None:
-        source_run_summary = json.loads(wavelet_run_summary_path.read_text(encoding="utf-8"))
-    else:
-        source_run_summary = {}
+    source_run_summary = json.loads(wavelet_run_summary_path.read_text(encoding="utf-8"))
     source_expected_shift_s = float(source_run_summary.get("auto_tie_best_parameters", {}).get("table_t_shift", np.nan))
     auto_tie_log_filter_params = {
         key: source_run_summary.get("auto_tie_best_parameters", {}).get(key)
@@ -1233,7 +1228,7 @@ def main() -> None:
     ok_count = int((metrics_df["status"] == "ok").sum()) if "status" in metrics_df.columns else 0
     failed_count = int((metrics_df["status"] != "ok").sum()) if "status" in metrics_df.columns else len(metrics_df)
     summary_payload = {
-        "schema_version": "wavelet_batch_synthetic_depth_v2",
+        "schema_version": "wavelet_batch_synthetic_depth_v3",
         "script": "wavelet_batch_synthetic_depth.py",
         "status": "success" if ok_count > 0 else "failed",
         "completion_status": "complete" if failed_count == 0 else "partial" if ok_count > 0 else "failed",
@@ -1281,6 +1276,46 @@ def main() -> None:
             "failed_wells": failed_count,
         },
     }
+    if ok_count > 0:
+        input_contracts = {
+            "vertical_well_auto_tie_depth": published_contract_reference(
+                wavelet_run_summary_path,
+                root=REPO_ROOT,
+                label=f"depth wavelet run {source_auto_tie_dir}",
+            ),
+            "well_preprocess": published_contract_reference(
+                las_dir.parent / "run_summary.json",
+                root=REPO_ROOT,
+                label=f"well preprocess run {las_dir.parent}",
+            ),
+        }
+        primary_artifacts = {"wavelet_batch_metrics": metrics_path}
+        for directory_name in (
+            "shifted_preprocessed_las",
+            "shifted_filtered_las",
+            "depth_shift_curves",
+        ):
+            primary_artifacts.update(
+                {
+                    f"{directory_name}:{path.name}": path
+                    for path in sorted(output_dirs[directory_name].glob("*"))
+                    if path.is_file()
+                }
+            )
+        summary_payload["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+        summary_payload["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+            contract_schema_version="wavelet_batch_synthetic_depth_v3",
+            semantics={
+                "sample_domain": "depth",
+                "sample_unit": "m",
+                "depth_basis": "tvdss",
+                "source_well_name": source_well_name,
+            },
+            business_config=script_cfg,
+            input_contracts=input_contracts,
+            primary_artifacts=primary_artifacts,
+        )
+        summary_payload["input_contracts"] = input_contracts
     run_summary_path.write_text(
         json.dumps(summary_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",

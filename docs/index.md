@@ -25,6 +25,10 @@ flowchart TB
     R0 --> R1["08 R1 · real_field_forward_diagnostic"]
 ```
 
+步骤间身份、不可变 run 和 SHA-256 的职责以
+[SHA-256 契约瘦身规范](spec/SHA256_CONTRACT_SLIMMING.md)为准。内部消费者只复制直接上游契约指纹，
+仍必须独立校验 domain/unit、显式采样轴、坐标步长、shape、dtype、mask 和状态。
+
 ## 配置文件
 
 | 步骤 | 配置文件 |

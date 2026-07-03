@@ -35,7 +35,16 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.config.workflow import WorkflowConfig, merge_dict_defaults
 from cup.config.sources import resolve_source_run
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
+from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
+    load_yaml_config,
+    published_contract_reference,
+    repo_relative_path,
+    resolve_relative_path,
+    sanitize_filename,
+    write_json,
+)
 from cup.utils.statistics import aggregate_cluster_then_global
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.well.assets import normalize_well_name
@@ -168,14 +177,15 @@ def _resolve_source_dirs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dic
 
 
 def _ensure_output_dirs(output_dir: Path) -> dict[str, Path]:
+    output_dir.mkdir(parents=True, exist_ok=False)
     dirs = {
-        "root": output_dir,
         "synthetic_qc": output_dir / "synthetic_qc",
         "figures": output_dir / "figures",
         "batch_synthetic_qc_figures": output_dir / "figures" / "batch_synthetic_qc",
     }
     for path in dirs.values():
         path.mkdir(parents=True, exist_ok=True)
+    dirs["root"] = output_dir
     return dirs
 
 
@@ -794,6 +804,8 @@ def main() -> None:
     plot_wavelets["mean_of_candidates" if selection_mode == "insufficient_eval_fallback" else "consensus"] = consensus_wavelet
     _plot_wavelets(wavelet_time_s, plot_wavelets, output_dirs["figures"] / "selected_wavelet.png")
     summary = {
+        "schema_version": "wavelet_generation_v2",
+        "status": "success",
         "selection_mode": selection_mode,
         "selected_wavelet": selected_name,
         "selected_source_well": selected_source,
@@ -810,7 +822,34 @@ def main() -> None:
         "batch_synthetic_qc_figure_count": len(batch_qc_figure_paths),
     }
     write_json(output_dir / "selected_wavelet_summary.json", summary)
-    write_json(output_dir / "run_summary.json", {"config": script_cfg, **summary})
+    input_contracts = {
+        "well_auto_tie": published_contract_reference(
+            source_dirs["auto_tie_dir"] / "run_summary.json",
+            root=REPO_ROOT,
+            label=f"well auto-tie run {source_dirs['auto_tie_dir']}",
+        )
+    }
+    primary_names = (
+        "selected_wavelet.csv",
+        "selected_wavelet_summary.json",
+        "batch_synthetic_metrics.csv",
+        "wavelet_candidate_aggregate.csv",
+        "evaluation_well_spatial_clusters.csv",
+    )
+    primary_artifacts = {
+        name: output_dir / name for name in primary_names if (output_dir / name).is_file()
+    }
+    run_summary = {"config": script_cfg, **summary}
+    run_summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+    run_summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+        contract_schema_version="wavelet_generation_v2",
+        semantics={"sample_domain": "time", "sample_unit": "s", "selection_mode": selection_mode},
+        business_config=script_cfg,
+        input_contracts=input_contracts,
+        primary_artifacts=primary_artifacts,
+    )
+    run_summary["input_contracts"] = input_contracts
+    write_json(output_dir / "run_summary.json", run_summary)
 
     print("=== Global Wavelet Generation ===")
     print(f"Output: {output_dir}")

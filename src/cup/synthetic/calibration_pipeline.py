@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -22,10 +23,12 @@ from cup.synthetic.config import IMPLEMENTATION_SCOPE
 from cup.synthetic.figures import write_calibration_figures
 from cup.config.workflow import WorkflowConfig
 from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
     repo_relative_path,
+    require_contract_fingerprint,
     resolve_artifact_path,
     resolve_relative_path,
-    sha256_file,
     write_json,
 )
 from cup.well.assets import normalize_well_name
@@ -341,23 +344,22 @@ def run_calibration(
         sources=sources,
         repo_root=repo_root,
     )
-    source_hashes = {}
-    for directory_key, names in {
-        "forward_observability_dir": [
-            "run_summary.json",
-            "frequency_evidence_bands.csv",
-        ],
-        "well_preprocess_dir": ["well_preprocess_status.csv"],
-        "well_auto_tie_dir": ["well_tie_metrics.csv"],
-        "wavelet_generation_dir": [
-            "selected_wavelet.csv",
-            "evaluation_well_spatial_clusters.csv",
-        ],
-    }.items():
-        for name in names:
-            source_hashes[f"{directory_key}/{name}"] = sha256_file(
-                sources[directory_key] / name
-            )
+    input_contracts: dict[str, dict[str, str]] = {}
+    for directory_key in (
+        "forward_observability_dir",
+        "well_preprocess_dir",
+        "well_auto_tie_dir",
+        "wavelet_generation_dir",
+    ):
+        summary_path = sources[directory_key] / "run_summary.json"
+        with summary_path.open("r", encoding="utf-8") as handle:
+            source_summary = json.load(handle)
+        input_contracts[directory_key.removesuffix("_dir")] = {
+            "path": repo_relative_path(summary_path, root=repo_root),
+            "contract_fingerprint_sha256": require_contract_fingerprint(
+                source_summary, label=f"{directory_key} {summary_path.parent}"
+            ),
+        }
     calibration, objects, qc, samples, backgrounds, profile_samples = (
         calibrate_impedance(
             inputs,
@@ -367,7 +369,7 @@ def run_calibration(
                 key: repo_relative_path(path, root=repo_root)
                 for key, path in sources.items()
             },
-            source_hashes=source_hashes,
+            input_contracts=input_contracts,
             state_threshold_sigma=float(
                 script_cfg["impedance"]["state_threshold_sigma"]
             ),
@@ -401,15 +403,26 @@ def run_calibration(
     payload = calibration.to_dict()
     payload["sample_domain"] = "time"
     payload["config_provenance"] = dict(config_provenance)
-    payload["artifact_hashes"] = {
-        "well_object_catalog.csv": sha256_file(objects_path),
-        "calibration_qc.csv": sha256_file(qc_path),
-        "well_calibration_samples.csv": sha256_file(samples_path),
-        "well_background_fits.csv": sha256_file(backgrounds_path),
-        "well_object_profile_samples.csv": sha256_file(profile_samples_path),
-        "well_horizon_consistency.csv": sha256_file(horizon_consistency_path),
-        "well_status.csv": sha256_file(status_path),
-    }
+    contract_fingerprint = contract_fingerprint_sha256(
+        contract_schema_version=CALIBRATION_SCHEMA,
+        semantics={
+            "sample_domain": "time",
+            "truth_dt_s": calibration.truth_dt_s,
+            "ordered_horizons": list(calibration.ordered_horizons),
+            "generator_family": calibration.generator_family,
+            "calibration_model": calibration.to_dict(),
+        },
+        business_config=script_cfg,
+        input_contracts=input_contracts,
+        primary_artifacts={
+            "well_object_catalog": objects_path,
+            "well_calibration_samples": samples_path,
+            "well_background_fits": backgrounds_path,
+            "well_object_profile_samples": profile_samples_path,
+        },
+    )
+    payload["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+    payload["contract_fingerprint_sha256"] = contract_fingerprint
     write_json(output_dir / "impedance_calibration.json", payload)
     figure_summary = write_calibration_figures(
         output_dir,
@@ -418,6 +431,9 @@ def run_calibration(
     summary = {
         "schema_version": CALIBRATION_SCHEMA,
         "status": "success",
+        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "contract_fingerprint_sha256": contract_fingerprint,
+        "input_contracts": input_contracts,
         "sample_domain": "time",
         "generator_family": GENERATOR_FAMILY,
         "implementation_scope": IMPLEMENTATION_SCOPE,

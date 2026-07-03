@@ -33,7 +33,16 @@ if str(SRC_DIR) not in sys.path:
 from cup.config.workflow import WorkflowConfig
 from cup.config.sources import resolve_source_run
 from cup.utils.coerce import as_bool
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
+from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
+    load_yaml_config,
+    published_contract_reference,
+    repo_relative_path,
+    resolve_relative_path,
+    sanitize_filename,
+    write_json,
+)
 from cup.well.assets import build_file_lookup, normalize_well_name
 from cup.well.curves import (
     CurveSelection,
@@ -253,6 +262,7 @@ def run_screening(
     schema: Mapping[str, Sequence[str]],
     overrides: Mapping[str, Any],
 ) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=False)
     inventory_df = pd.read_csv(inventory_file)
     candidates = _candidate_inventory_rows(
         inventory_df,
@@ -262,8 +272,8 @@ def run_screening(
 
     selected_las_dir = output_dir / "selected_las"
     classification_dir = output_dir / "curve_classification"
-    selected_las_dir.mkdir(parents=True, exist_ok=True)
-    classification_dir.mkdir(parents=True, exist_ok=True)
+    selected_las_dir.mkdir()
+    classification_dir.mkdir()
 
     curve_inventory_rows: list[dict[str, Any]] = []
     well_rows: list[dict[str, Any]] = []
@@ -353,7 +363,6 @@ def run_screening(
         )
         well_rows.append(_well_screen_row(selection))
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     paths = {
         "las_curve_inventory_csv": output_dir / "las_curve_inventory.csv",
         "well_screen_csv": output_dir / "well_screen.csv",
@@ -381,6 +390,8 @@ def run_screening(
         else {}
     )
     summary = {
+        "schema_version": "well_screen_v2",
+        "status": "success",
         "script": "well_screen.py",
         "inputs": {
             "inventory_file": repo_relative_path(inventory_file, root=REPO_ROOT),
@@ -401,6 +412,32 @@ def run_screening(
         "has_caliper_count": int(well_screen_df["has_caliper"].sum()) if not well_screen_df.empty else 0,
         "paths": {key: repo_relative_path(path, root=REPO_ROOT) for key, path in paths.items()},
     }
+    input_contracts = {
+        "well_inventory": published_contract_reference(
+            inventory_file.parent / "run_summary.json",
+            root=REPO_ROOT,
+            label=f"well inventory run {inventory_file.parent}",
+        )
+    }
+    primary_artifacts = {
+        "well_screen": paths["well_screen_csv"],
+        "las_curve_inventory": paths["las_curve_inventory_csv"],
+    }
+    primary_artifacts.update(
+        {f"selected_las:{path.name}": path for path in sorted(selected_las_dir.glob("*.las"))}
+    )
+    primary_artifacts.update(
+        {f"classification:{path.name}": path for path in sorted(classification_dir.glob("*.json"))}
+    )
+    summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+    summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+        contract_schema_version="well_screen_v2",
+        semantics={"required_categories": summary["required_categories"], "selected_categories": summary["selected_categories"]},
+        business_config=config,
+        input_contracts=input_contracts,
+        primary_artifacts=primary_artifacts,
+    )
+    summary["input_contracts"] = input_contracts
     write_json(paths["run_summary_json"], summary)
     return {"paths": paths, "summary": summary}
 

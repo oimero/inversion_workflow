@@ -32,8 +32,6 @@ class SynthoseisBenchmark:
     def __init__(
         self,
         run_dir: str | Path,
-        *,
-        expected_forward_model_inputs_sha256: str | None = None,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.manifest_path = self.run_dir / "benchmark_manifest.json"
@@ -47,27 +45,25 @@ class SynthoseisBenchmark:
 
         if schema == "synthoseis_lite_v1":
             raise ValueError(
-                "time-v1 Synthoseis artifacts are legacy and are not supported by the v2 facade."
+                "time-v1 Synthoseis artifacts are legacy and are not supported by the v3 facade."
             )
-        if schema == "synthoseis_lite_v2":
+        if schema == "synthoseis_lite_v3":
             if sample_domain == "time":
                 self._reader = TimeV2Benchmark(
                     self.run_dir,
-                    expected_forward_model_inputs_sha256=expected_forward_model_inputs_sha256,
                 )
             elif sample_domain == "depth":
                 self._reader = DepthV2Benchmark(
                     self.run_dir,
-                    expected_forward_model_inputs_sha256=expected_forward_model_inputs_sha256,
                 )
             else:
                 raise ValueError(
-                    f"synthoseis_lite_v2 requires sample_domain='time' or 'depth'; got {sample_domain!r}."
+                    f"synthoseis_lite_v3 requires sample_domain='time' or 'depth'; got {sample_domain!r}."
                 )
         else:
             raise ValueError(
                 f"Unsupported Synthoseis schema {schema!r}. "
-                "Supported schema: synthoseis_lite_v2 with sample_domain=time|depth."
+                "Supported schema: synthoseis_lite_v3 with sample_domain=time|depth."
             )
 
         self.schema = schema

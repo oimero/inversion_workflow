@@ -15,7 +15,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.utils.io import build_segy_textual_header, sha256_file
+from cup.utils.io import build_segy_textual_header
 
 
 def log_ai_to_ai_volume(log_ai: np.ndarray) -> np.ndarray:
@@ -105,7 +105,6 @@ def _export_payload(path: Path, fmt: str) -> dict[str, Any]:
         "status": "written",
         "format": fmt,
         "path": str(path),
-        "sha256": sha256_file(path),
     }
 
 

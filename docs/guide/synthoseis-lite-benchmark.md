@@ -1,6 +1,6 @@
 # 旁路：Synthoseis-lite 合成基准
 
-`synthoseis_lite.py` 生成带真实工区统计约束的二维合成波阻抗剖面和配套地震数据，供模型训练和评估使用。它分为两个子命令：`calibrate`（从真实井数据冻结统计模型）和 `generate`（按统计模型产出合成样本）。
+`synthoseis_lite.py` 是工作流的研究旁路。它生成带真实工区统计约束的二维合成波阻抗剖面和配套地震数据，供模型训练和评估使用。它分为两个子命令：`calibrate`（从真实井数据冻结统计模型）和 `generate`（按统计模型产出合成样本）。
 
 时间域和深度域共用同一入口脚本，通过配置中的 `sample_domain` 字段分派到不同分支。
 
@@ -46,8 +46,7 @@ python scripts/synthoseis_lite.py --config <config-yaml> generate \
 |------|------|------|
 | 第四步 | `well_tie_metrics.csv`、`filtered_las/` | 标定成功的井、滤波后的测井曲线 |
 | 第五步 | `selected_wavelet.csv`、`selected_wavelet_summary.json` | 全局子波，用于正演和 mismatch 扰动 |
-| 第六步 | `forward_model_inputs.json` | 冻结的子波引用、岩石物理关系、来源哈希 |
-| 旁路 | `forward_observability/` | 频率探针证据，用于 probe benchmark 构建 |
+| 旁路 | `forward_observability/` | 频率探针证据，用于 probe benchmark 构建；也是 forward_model_inputs_sha256 的来源之一 |
 | 数据目录 | 地震体、解释层位、井分层 | 几何约束、目标窗口定义 |
 
 ### 深度域
@@ -58,7 +57,7 @@ python scripts/synthoseis_lite.py --config <config-yaml> generate \
 |------|------|------|
 | 第一步 | `well_inventory.csv` | 井口坐标 |
 | 第五步（深度域）| `wavelet_batch_metrics.csv`、`shifted_preprocessed_las/`、`shifted_filtered_las/` | 深度平移后的两套 LAS |
-| 第六步 | `forward_model_inputs.json` | 冻结子波和 AI–Vp 关系（同时间域） |
+| 旁路 | `forward_model_inputs.json` | 冻结子波和 AI–Vp 关系（来自岩石物理分析旁路） |
 
 深度域不使用第四步时间域标定结果和第五步全局子波，也不使用正演可观测性旁路。井曲线来自深度域 Step 5 产出的两套平移 LAS：滤波版用于背景拟合，全曲线版用于提取波阻抗变化幅度。
 
@@ -391,7 +390,7 @@ Status: success
 | `preflight: insufficient horizon support` | 剖面路径上的层位约束不足 | 检查解释层位覆盖面，或更换剖面路径 |
 | `scenario acceptance below failure_fraction` | 某场景接受率低于失败线且 enforcement 为 fail_fast | 放宽 QC 门控、调整剖面路径、或增加 attempts_per_scenario |
 | `scenario acceptance below warning_fraction` | 接受率在告警线和失败线之间 | 检查 `rejection_reason_summary.csv` 定位主要拒绝原因 |
-| `forward_model_inputs sha256 mismatch` | 第六步冻结的正演输入与当前配置不一致 | 重新运行第六步和校准 |
+| `forward_model_inputs sha256 mismatch` | 冻结的正演输入哈希与当前配置不一致 | 深度域：重新运行岩石物理分析旁路和校准；时间域：确认第五步和正演可观测性旁路产物一致 |
 | `calibration schema mismatch` | 校准产物版本与生成阶段期望不一致 | 重新运行校准 |
 
 ---

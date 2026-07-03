@@ -31,7 +31,7 @@ python scripts/wavelet_generation.py --output-dir scripts/output/wavelet_generat
 | 第四步 | `wavelet_inventory.csv` | 哪些子波可以作为候选、采样间隔、来源井指标 |
 | 第四步 | `filtered_las/filtered_logs_<well>.las` | 读取第四步最优参数滤波后的 `DT_USM` 和 `RHO_GCC`，构造波阻抗和反射系数 |
 | 第四步 | `time_depth/optimized_tdt_<well>.csv` | 优化后的时深表——第五步的固定评测基准 |
-| 第四步 | `seismic_trace/seismic_trace_<well>.csv` | 井旁或沿轨迹地震道——第五步不重新取道 |
+| 第四步 | `seismic_trace/seismic_trace_<well>.csv` | 井旁或沿轨迹地震道 |
 
 ---
 

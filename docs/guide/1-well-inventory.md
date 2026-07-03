@@ -24,7 +24,7 @@ python scripts/well_inventory.py --output-dir /tmp/inventory_test
 | LAS 目录 | 判断每口井是否有可进入第二步的曲线文件 |
 | 井轨迹目录 | 判断是否存在轨迹文件；本步只查存在性 |
 | 井分层文件 | 判断是否有后续标定/建模可用的井分层 |
-| 时深表目录 | 判断每口井是否有 Petrel TDT；深度域工区允许不存在 |
+| 时深表目录 | 判断每口井是否有 Petrel TDT |
 | 地震体 | 解析工区几何，判断井口是否在工区内 |
 
 **数据资产的预期格式：**
@@ -56,7 +56,12 @@ assets:
 seismic:
   file: <path-to-seismic>
   type: segy
-  domain: depth
+  domain: time
+  iline_byte: 189
+  xline_byte: 193
+  istep: 1
+  xstep: 1
+
 
 well_inventory:
   spatial_qc:
@@ -66,8 +71,34 @@ well_inventory:
     dense_well_neighbor_threshold_m: 150.0
 ```
 
-`seismic.domain` 必须显式写成 `time` 或 `depth`，脚本不会根据文件名或采样值猜测。
-`zgy_inline_chunk_size` 不是 SEG-Y 读取参数；第一步不使用它，SEG-Y 工区应删除。
+### `seismic`
+
+`seismic` 块描述工区地震体。第一步只从中读取工区几何（线号范围、道间距、footprint 四角），**不读取地震道数据**。
+
+#### 通用字段
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `file` | 是 | 地震体路径，相对于 `data_root` |
+| `type` | 是 | 地震体格式：`segy` 或 `zgy` |
+| `domain` | 是 | 采样轴域：`time` 或 `depth`。**必须显式写出**，脚本不会根据文件名或采样值猜测 |
+
+#### `depth_basis`（深度域必填）
+
+当 `domain: depth` 时，`depth_basis` 必须设为 `tvdss`。当 `domain: time` 时，该字段不得出现，出现即报错。
+
+#### 格式相关参数
+
+这些参数并非第一步的逻辑依赖，但会随 `seismic` 块一起加载到配置模型中。配不配取决于你的数据格式：
+
+| 字段 | 适用 `type` | 说明 |
+|------|-------------|------|
+| `zgy_inline_chunk_size` | `zgy` | inline 分块读取大小（正整数），影响后续步骤的 trace 读取性能。第一步不读 trace，**对第一步无影响** |
+| `iline`、`xline` | `segy` | 覆盖 SEG-Y 道头中 inline/xline 号的字节位置 |
+| `istep`、`xstep` | `segy` | 覆盖 inline/xline 步长 |
+| `iline_byte`、`xline_byte` | `segy` | 与 `iline`/`xline` 等效，映射到同一底层读取参数 |
+
+如果你的 SEG-Y 使用标准道头位置，这些 SEG-Y 字段一个都不需要写。ZGY `zgy_inline_chunk_size` 默认 16。
 
 ### `spatial_qc`
 

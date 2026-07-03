@@ -1,6 +1,6 @@
 # 06 真实井控制准备
 
-`real_field_well_controls.py` 是第六步。它只做一件事：**把不同上游标定产物的 log(AI) 统一转换成相同的井控事实，冻结为与任何 LFM 无关的 canonical WellControlSet。**
+`real_field_well_controls.py` 是工作流的第六步。它只做一件事：**把不同上游标定产物的 log(AI) 统一转换成相同的井控事实，冻结为与任何 LFM 无关的 canonical WellControlSet。**
 
 这一步是整个统一 LFM v2 架构的根基。Step 7 的所有 baseline 和 modifier 只消费同一种 WellControlSet 接口，永远不需要知道井控来自时间域标定还是深度域合成旁路。
 

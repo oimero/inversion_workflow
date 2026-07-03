@@ -252,7 +252,7 @@ nominal-only 进入空间聚合。
 经验状态、nominal/conservative 解析支持和 zone warnings。全目标窗至少需要 5 井、
 3 簇，否则为 `insufficient_evidence`。
 
-### 其他正式输出
+### 其他输出
 
 - `well_status.csv`：来源核验和逐井运行状态，并保留第五步 batch 指标作为 QC。
 - `well_window_status.csv`：逐井窗口的实际连续分析范围与拒绝原因。
@@ -350,7 +350,7 @@ HDF5 文件，每个 sample 为一个 group，包含 `model_target_log_ai`、
 | `files` | 所有冻结输出文件的 SHA-256 |
 | `accepted_parent_realizations` / `rejected_parent_realizations` | 接受/拒绝的 parent realization 计数 |
 
-### 其他生成输出
+### 其他输出
 
 - `frequency_probe_results.csv`：每个探针变体的频率、振幅、相位、横向形状和 RMS。
 - `probe_frequency_catalog.csv`：探针频率的选择理由和噪声等效参考。

@@ -1,6 +1,6 @@
 # 07 实际工区 LFM 变体构建
 
-`real_field_lfm.py` 是第七步。它从第六步冻结的 WellControlSet 出发，按配置中显式声明的 baseline、modifier 和 variant 图，一次性构建所有请求的低频模型变体。
+`real_field_lfm.py` 是工作流的第七步。它从第六步冻结的 WellControlSet 出发，按配置中显式声明的 baseline、modifier 和 variant 图，一次性构建所有请求的低频模型变体。
 
 这是统一 LFM v2 架构的核心：**同一套 builder 在时间域和深度域之间共享，framework 是可选 modifier 而非第三种 baseline。** 时间域与深度域的差异只体现在 cutoff 单位、采样轴单位和 source adapter——builder 和 modifier 内部逻辑完全相同。
 

@@ -444,22 +444,26 @@ def _structured_primary_artifact_sha256(path: Path) -> str:
                 value = np.asarray(arrays[name])
                 digest.update(name.encode("utf-8"))
                 digest.update(b"\0")
-                digest.update(value.dtype.str.encode("ascii"))
-                digest.update(b"\0")
-                digest.update(
-                    json.dumps(list(value.shape), separators=(",", ":")).encode("ascii")
-                )
-                digest.update(b"\0")
                 if (
                     name.endswith("metadata_json")
                     and value.ndim == 0
                     and value.dtype.kind in {"S", "U"}
                 ):
+                    # metadata_json is a logical JSON document. Its numpy string
+                    # storage width only reflects serialized text length and must
+                    # not leak path length into the published contract identity.
+                    digest.update(b"canonical-json\0")
                     raw_metadata = value.item()
                     if isinstance(raw_metadata, bytes):
                         raw_metadata = raw_metadata.decode("utf-8")
                     digest.update(_canonical_json_bytes(json.loads(str(raw_metadata))))
                 else:
+                    digest.update(value.dtype.str.encode("ascii"))
+                    digest.update(b"\0")
+                    digest.update(
+                        json.dumps(list(value.shape), separators=(",", ":")).encode("ascii")
+                    )
+                    digest.update(b"\0")
                     digest.update(np.ascontiguousarray(value).tobytes())
         return digest.hexdigest()
     return sha256_file(path)

@@ -92,7 +92,7 @@ well_trajectory:
 
 - 文件缺少 `MD/X/Y/Z/TVD` 任一列
 - 有效轨迹点少于 2 个
-- MD 不单调递增
+- 测深不单调递增
 - XY 全为空或非有限值
 - 文件头缺少 KB 基准面
 
@@ -123,7 +123,7 @@ well_trajectory:
 - 轨迹整体偏移明显 → 复核为斜井
 - 落在两个阈值之间 → 暂时标记为不确定
 
-如果配置了地震工区，还会把每个轨迹点投影到 inline/xline，统计：
+如果配置了地震工区，还会把每个轨迹点投影到线号/道号，统计：
 
 - 井口和井底在工区内还是工区外
 - 全部轨迹点中有多大比例在工区内
@@ -142,11 +142,11 @@ well_trajectory:
 | `Z` | 高程/深度坐标 |
 | `TVD` | 真垂深，从 KB 起算，向下为正 |
 
-可选列（缺失时填 NaN，不影响解析）：`DX`、`DY`、`AZIM`、`INCL`、`DLS`。
+可选列（缺失时填空值，不影响解析）：`DX`、`DY`、`AZIM`、`INCL`、`DLS`。
 
 轨迹里的 `Z` 和 `TVD` 应满足 `Z ≈ KB - TVD`。脚本计算残差 `Z - (KB - TVD)`，超过 `z_tvd_tolerance_m` 时发出警告。
 
-### TVDSS 口径
+### 亚海真垂深口径
 
 脚本内部按 `tvdss_m = tvd_kb_m - kb_m` 计算。这个换算只在本模块和后续时深转换模块中实现，后续脚本不要自己散写这份逻辑。
 
@@ -186,7 +186,7 @@ well_trajectory:
 
 ### `trajectory_points/<well>.csv` — 每口井逐轨迹点
 
-仅当 `output.write_trajectory_points: true` 时写出。每行包含该轨迹点的 MD、TVD、TVDSS、Z、XY、DX/DY、井斜角、方位角、DLS、浮点线号、最近线号、工区内外。
+仅当 `output.write_trajectory_points: true` 时写出。每行包含该轨迹点的测深、TVD、亚海真垂深、Z、XY、DX/DY、井斜角、方位角、DLS、浮点线号、最近线号、工区内外。
 
 ### `failed_trajectories.csv`
 
@@ -239,7 +239,7 @@ Wrote trajectory QC for 103 wells to ... ({'passed': 80, 'warning': 18, 'failed'
 
 ### 第五步：抽查一口井的轨迹点
 
-打开 `trajectory_points/<well>.csv`，看 `incl_deg` 列的最大值、`x_m`/`y_m` 随 MD 的变化趋势，对斜井形成直观印象。
+打开 `trajectory_points/<well>.csv`，看 `incl_deg` 列的最大值、`x_m`/`y_m` 随测深的变化趋势，对斜井形成直观印象。
 
 ---
 

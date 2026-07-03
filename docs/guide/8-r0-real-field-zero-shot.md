@@ -16,7 +16,7 @@ python scripts/real_field_zero_shot.py --stitch-strategy center_crop
 python scripts/real_field_zero_shot.py --output-dir scripts/output/real_field_zero_shot_test
 ```
 
-脚本会发现全局子波，但不会自动选择 LFM。调用者必须显式绑定一个已发布的 Step 7 variant 及其 Step 6 WellControlSet，再读取 `models` 列表中的每个模型依次推理。
+脚本会发现全局子波，但不会自动选择低频模型。调用者必须显式绑定一个已发布的第7步变体及其第6步井控集，再读取 `models` 列表中的每个模型依次推理。
 
 `--stitch-strategy` 控制大体积分块推理后如何拼接重叠区域：`uniform` 用等权平均，`center_crop` 只用块中心的无边界效应区域。默认使用 `uniform`。
 
@@ -100,9 +100,9 @@ real_field_zero_shot:
 ### `real_field_inputs`
 
 - `seismic_value_transform`：地震数据值域变换方式。默认 `identity`。若设为 `p99_abs_matched` 等非 identity 值，需要模型的 `input_reference_stats.json`——脚本自动从第一个模型目录中读取。
-- `lfm_run_dir` / `variant_id` / `well_control_run_dir`：三者均必填且禁止 `auto`；R0 会核对直接契约身份，并校验 schema、轴、shape、dtype 和 mask 等显式语义，不重算文件 SHA。
-- `lfm_value_transform`：固定 `identity`；v2 主数组已经是 log(AI)。
-- `lfm_file` 和外部 `target_mask_file` 已退役；mask 只能来自所选 variant。
+- `lfm_run_dir` / `variant_id` / `well_control_run_dir`：三者均必填且禁止 `auto`；R0 会核对直接契约身份，并校验数据模式、轴、形状、数据类型和掩码等显式语义，不重算文件 SHA。
+- `lfm_value_transform`：固定 `identity`；v2 主数组已经是波阻抗对数。
+- `lfm_file` 和外部 `target_mask_file` 已退役；掩码只能来自所选变体。
 
 ### `volume`
 
@@ -190,7 +190,7 @@ real_field_zero_shot:
 
 ### 第一阶段：加载输入
 
-1. 从成功发布的 `variant_manifest.csv` 解析显式 `variant_id`，读取对应 `variants/<variant_id>/lfm.npz`，核对 variant 与 Step 6 的直接契约身份并做语义校验。
+1. 从成功发布的 `variant_manifest.csv` 解析显式 `variant_id`，读取对应 `variants/<variant_id>/lfm.npz`，核对变体与第6步的直接契约身份并做语义校验。
 2. 按 `mode` 决定是加载整个地震体（体积模式）还是单个剖面（剖面模式）。
 3. 应用 `seismic_value_transform`，把原始地震振幅变换到模型训练时的值域。
 4. 从每个模型目录加载 checkpoint 权重和标准化参数。
@@ -283,8 +283,8 @@ Status: needs_forward_diagnostic
 
 打开 `figures/<role>_lfm_delta_pred.png`：
 
-- **左图（LFM）**：低频背景。应该展现光滑的大尺度结构。
-- **中图（Pred - LFM）**：预测差值。这部分是模型从地震数据里推断出的高频修正——如果几乎全为零，可能说明模型没有利用地震信息。
+- **左图（低频模型）**：低频背景。应该展现光滑的大尺度结构。
+- **中图（Pred - 低频模型）**：预测差值。这部分是模型从地震数据里推断出的高频修正——如果几乎全为零，可能说明模型没有利用地震信息。
 - **右图（Pred）**：完整的预测波阻抗。结构和数值范围是否地质合理。
 
 ### 第四步：看两模型差异
@@ -303,7 +303,7 @@ Status: needs_forward_diagnostic
 
 ### 第六步（仅剖面模式）：看井位 QC
 
-`well_prediction_qc.csv` 逐井列出每个模型的 RMSE、偏差和相关系数。打开对应井的 `figures/wells/r0_well_prediction_qc_<well>.png`，观察预测的 TWT 域趋势是否与滤波 LAS 一致。
+`well_prediction_qc.csv` 逐井列出每个模型的 RMSE、偏差和相关系数。打开对应井的 `figures/wells/r0_well_prediction_qc_<well>.png`，观察预测的双程旅行时域趋势是否与滤波 LAS 一致。
 
 ---
 

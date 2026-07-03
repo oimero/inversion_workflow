@@ -1,8 +1,8 @@
 # 06 真实井控制准备
 
-`real_field_well_controls.py` 是工作流的第六步。它只做一件事：**把不同上游标定产物的 log(AI) 统一转换成相同的井控事实，冻结为与任何 LFM 无关的 canonical WellControlSet。**
+`real_field_well_controls.py` 是工作流的第六步。它只做一件事：**把不同上游标定产物的波阻抗对数统一转换成相同的井控事实，冻结为与任何低频模型无关的标准井控集。**
 
-这一步是整个统一 LFM v2 架构的根基。Step 7 的所有 baseline 和 modifier 只消费同一种 WellControlSet 接口，永远不需要知道井控来自时间域标定还是深度域合成旁路。
+这一步是整个统一低频模型架构的根基。第七步的所有基线模型和修饰器只消费同一种井控集接口，永远不需要知道井控来自时间域标定还是深度域合成旁路。
 
 ---
 
@@ -14,7 +14,7 @@ python scripts/real_field_well_controls.py --config experiments/my_project.yaml
 python scripts/real_field_well_controls.py --output-dir scripts/output/well_controls_test
 ```
 
-不带 `--output-dir` 时，脚本在输出目录下自动创建 `real_field_well_controls_<timestamp>/`。已有目录会被拒绝，避免覆盖历史 run。
+不带 `--output-dir` 时，脚本在输出目录下自动创建 `real_field_well_controls_<timestamp>/`。已有目录会被拒绝，避免覆盖历史运行。
 
 ---
 
@@ -35,28 +35,28 @@ python scripts/real_field_well_controls.py --output-dir scripts/output/well_cont
 
 ### Source adapter 概念
 
-配置必须显式声明一种 `source_run_type`，它同时决定了脚本从上游读取哪些字段、如何做域转换、以及如何校验 schema：
+配置必须显式声明一种来源运行类型，它同时决定了脚本从上游读取哪些字段、如何做域转换、以及如何校验数据模式：
 
 | `source_run_type` | 目标域 | 上游 |
 |---|---|---|
 | `well_auto_tie` | time + s | 第四步 `well_tie_metrics.csv`，每井 filtered LAS + 优化 TDT |
 | `wavelet_batch_synthetic_depth` | depth + tvdss + m | 第五步（深度域） `wavelet_batch_metrics.csv`，每井 shifted filtered LAS |
 
-脚本不会根据目录名、CSV 某个字段或 LAS 文件名猜 adapter。adapter 与上游 summary 的 schema/domain 不一致时直接失败。
+脚本不会根据目录名、CSV 某个字段或 LAS 文件名猜测适配器。适配器与上游运行摘要的数据模式或采样域不一致时直接失败。
 
 ### 时间域特有要求
 
 - 只接受第四步 `tie_status=success` 的井。
 - 每井必须有 filtered LAS（含 AI 曲线，单位 `m/s*g/cm3`）和优化 TDT 表。
-- 斜井还必须有 `optimized_trace_sample_plan_file`，提供每个 TWT 采样点的 inline/xline/XY 和 `survey_position` 标记。
+- 斜井还必须有优化轨迹采样计划文件，提供每个双程旅行时采样点的线号、道号和平面坐标，以及测线位置标记。
 
 ### 深度域特有要求
 
 - 只接受第五步（深度域）`status=ok` 的井。
-- 每井必须有 `shifted_filtered_las_path` 指向深度平移后的过滤 LAS。
+- 每井必须有深度平移后的过滤 LAS 路径。
 - shifted filtered LAS 的纵轴仍按 MD 解释——它只是被平移到更好的深度位置，坐标体系不变。
 - 斜井需要项目井轨迹文件（Petrel 导出），用于 MD→TVDSS 转换。
-- 直井走 `MD - KB` 公式，不需要轨迹文件。
+- 直井走测深减补心海拔公式，不需要轨迹文件。
 
 ---
 
@@ -78,11 +78,11 @@ real_field_well_controls:
 
 ### `source_run_dir`
 
-指向第四步（时间域）或第五步（深度域）的运行目录。留空时脚本做 schema-aware 自动发现：按 `source_run_type` 前缀在输出目录下找到最新的、summary schema 和 domain 匹配的成功 run。显式填路径则固定使用该目录，适合复现。
+指向第四步（时间域）或第五步（深度域）的运行目录。留空时脚本做模式感知自动发现：按来源运行类型前缀在输出目录下找到最新的、数据模式和采样域匹配的成功运行。显式填路径则固定使用该目录，适合复现。
 
 ### `well_inventory_file`
 
-指向第一步产出的 `well_inventory.csv`。脚本从中读取每口井的 `wellbore_class`（`vertical` 或 `deviated`）、`surface_x/y`、`inline_float/xline_float` 和 `kb_m`。
+指向第一步产出的 `well_inventory.csv`。脚本从中读取每口井的井型（直井或斜井）、井口坐标、线号和道号，以及补心海拔。
 
 ### `well_trace_dir`
 
@@ -92,7 +92,7 @@ real_field_well_controls:
 
 ## 脚本在做什么
 
-脚本的核心逻辑只有一层：**逐井做域转换，把上游 LAS 的 MD 域 log(AI) 映射到目标地震的 SampleAxis 上，同时为每个有效样点附上空间坐标。**
+脚本的核心逻辑只有一层：**逐井做域转换，把上游 LAS 的 MD 域波阻抗对数映射到目标地震的采样轴上，同时为每个有效样点附上空间坐标。**
 
 ### 第一步：校验来源
 
@@ -104,18 +104,18 @@ real_field_well_controls:
 
 对每口时间域井：
 
-1. **读取 filtered LAS。** 校验 AI 曲线存在且单位为 `m/s*g/cm3`，AI 值全为正。对原值取自然对数得到 MD 域的 `log_ai_md`。
-2. **用优化 TDT 做 MD→TWT 投影。** 从 TDT 表中读取 `MD` 列和 `TWT` 列，插值得到每个目标 TWT 采样点对应的 MD。插值不做外推——目标 TWT 落在 TDT 覆盖范围外即标记无效。
-3. **在 MD 域逐连续有限段插值。** 这是关键细节：LAS 的有限段之间可能有 NaN 间隙。脚本不会跨缺口插值——每个连续有限段独立处理，缺口处严格输出 NaN。这保证了"井控事实不补洞"的契约。
-4. **处理空间位置。** 直井把 inventory 中的固定 inline/xline/XY 广播到全部样点。斜井从 trace sample plan 读取每个 TWT 的逐样点 inline/xline/XY，只取 `survey_position=inside` 的行，非 inside 行置 NaN 后逐有限段独立插值——避免把 inside/outside 之间的间隙错误连接。
+1. **读取 filtered LAS。** 校验 AI 曲线存在且单位为 `m/s*g/cm3`，AI 值全为正。对原值取自然对数得到 MD 域的波阻抗对数。
+2. **用优化 TDT 做 MD→TWT 投影。** 从 TDT 表中读取测深列和双程旅行时列，插值得到每个目标 TWT 采样点对应的 MD。插值不做外推——目标 TWT 落在 TDT 覆盖范围外即标记无效。
+3. **在 MD 域逐连续有限段插值。** 这是关键细节：LAS 的有限段之间可能有空值间隙。脚本不会跨缺口插值——每个连续有限段独立处理，缺口处严格输出空值。这保证了"井控事实不补洞"的契约。
+4. **处理空间位置。** 直井把井资产盘点中的固定线号、道号和 XY 广播到全部样点。斜井从轨迹采样计划读取每个 TWT 的逐样点线号、道号和 XY，只取测线位置在工区内的行，工区外的行置空值后逐有限段独立插值——避免把工区内外之间的间隙错误连接。
 
 ### 第三步：域转换（深度域）
 
 对每口深度域井：
 
 1. **读取 shifted filtered LAS。** 同上校验 AI 单位和正值。
-2. **做 MD→TVDSS 转换。** 直井用 `TVDSS = MD - KB`。斜井从项目轨迹文件加载 `TVDSS_m` 和 `MD_m`，插值得到 shifted LAS MD 对应的 TVDSS，再用 TVDSS 反查到目标采样轴的 MD。
-3. **空间定位。** 直井把 inventory 位置广播到所有样点。斜井从轨迹中插值出每个样点的 XY，再通过 survey geometry 换算为 inline/xline。如果某个样点的 XY 换算后与 survey 线网不一致，该样点标记无效。
+2. **做 MD→TVDSS 转换。** 直井用"亚海真垂深等于测深减补心海拔"。斜井从项目轨迹文件加载亚海真垂深列和测深列，插值得到 shifted LAS MD 对应的 TVDSS，再用 TVDSS 反查到目标采样轴的 MD。
+3. **空间定位。** 直井把井资产盘点位置广播到所有样点。斜井从轨迹中插值出每个样点的 XY，再通过测网几何换算为线号和道号。如果某个样点的 XY 换算后与测网线网不一致，该样点标记无效。
 4. **逐有限段插值。** 同样遵守不跨缺口原则。
 
 ### 第四步：构建 WellControl 并校验
@@ -131,13 +131,13 @@ real_field_well_controls:
 | `sampling_mode` | 时间直井 `vertical_inventory_position`，时间斜井 `optimized_trace_plan`，深度直井 `vertical_md_minus_kb`，深度斜井 `trajectory_tvdss` |
 | `provenance` | 来源 LAS 与转换表路径；其发布 run 身份由 summary 的 `input_contracts` 表达 |
 
-构建时还会做几何一致性校验：对每个有效样点，用 survey geometry 把真实 XY 反算线号，与记录的 inline/xline 逐点对照。不一致的井被拒绝。
+构建时还会做几何一致性校验：对每个有效样点，用测网几何把真实 XY 反算线号，与记录的线号/道号逐点对照。不一致的井被拒绝。
 
 ### 第五步：写入磁盘
 
-1. **逐井 NPZ。** `wells/<normalized_well_name>.npz`，固定字段为 `samples`、`log_ai`、`inline`、`xline`、`x_m`、`y_m`、`valid_mask`、`metadata_json`。无效样点的 log_ai 和位置为 NaN。禁止 pickle/object array。
+1. **逐井 NPZ。** `wells/<normalized_well_name>.npz`，固定字段为 `samples`、`log_ai`、`inline`、`xline`、`x_m`、`y_m`、`valid_mask`、`metadata_json`。无效样点的波阻抗对数和位置为空值。禁止使用 pickle 序列化或对象数组。
 2. **Manifest。** `well_control_manifest.csv`，每口候选井一行，记录状态、来源路径、井型、采样模式、有效样点数和 NPZ 路径等。失败的井也保留行，但 `well_npz_path` 为空。
-3. **Run summary。** `run_summary.json`，schema 固定为 `real_field_well_controls_v3`，记录 source adapter、SampleAxis、直接上游契约、成功/失败井统计、产物路径和唯一契约指纹。
+3. **运行摘要。** `run_summary.json`，数据模式固定为 `real_field_well_controls_v3`，记录来源适配器、采样轴、直接上游契约、成功/失败井统计、产物路径和唯一契约指纹。
 
 这些属于 variant-specific label preparation（Step 7 之后的下游），与井控事实无关。
 
@@ -188,7 +188,7 @@ real_field_well_controls_<timestamp>/
 
 ### `run_summary.json`
 
-记录业务配置、source adapter、SampleAxis 描述、成功/失败计数、产物路径、直接上游契约和唯一 `contract_fingerprint_sha256`。
+记录业务配置、来源适配器、采样轴描述、成功/失败计数、产物路径、直接上游契约和唯一契约指纹。
 
 ---
 
@@ -202,21 +202,21 @@ Output: scripts/output/real_field_well_controls_<timestamp>
 Successful wells: 12
 ```
 
-成功井数至少为 1 即表示 Step 6 完成。具体哪些 baseline 能建模是 Step 7 的事。
+成功井数至少为 1 即表示第六步完成。具体哪些基线模型能建模是第七步的事。
 
 ### 第二步：看 `well_control_manifest.csv`
 
 按 `status` 列分组：
 
-- **ok 井：** 关注 `n_valid_samples`。有效样点数远少于总样点数说明该井的 LAS 或 TDT/轨迹覆盖范围与目标 SampleAxis 重叠有限。这在目标窗口边缘是正常的；如果一口井的有效覆盖率异常低，检查上游 LAS 的深度范围或 TDT 表的时间范围。
-- **failed 井：** 看 `reason` 列。常见原因见下一节。
+- **ok 井：** 关注有效样点数。有效样点数远少于总样点数说明该井的 LAS 或 TDT/轨迹覆盖范围与目标采样轴重叠有限。这在目标窗口边缘是正常的；如果一口井的有效覆盖率异常低，检查上游 LAS 的深度范围或 TDT 表的时间范围。
+- **failed 井：** 看原因列。常见原因见下一节。
 
 ### 第三步：抽查一口井的 NPZ
 
 如果你需要确认某口井的域转换是否正确，可以直接加载它的 NPZ：
 
-- 检查 `log_ai[valid_mask]` 的数值范围是否合理（ln(AI) 通常在 8~10 左右，对应线性 AI 约 3000~22000 m/s*g/cm3）。
-- 检查直井的 inline/xline 是否为常数，斜井是否随样点变化。
+- 检查有效掩码对应的波阻抗对数值范围是否合理（波阻抗对数值通常在 8~10 左右，对应线性 AI 约 3000~22000 m/s*g/cm3）。
+- 检查直井的线号和道号是否为常数，斜井是否随样点变化。
 
 ---
 

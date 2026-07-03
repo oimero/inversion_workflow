@@ -194,7 +194,7 @@ completion 行为（切片控制不足时）：
 
 ### `modifiers`
 
-当前只有 `framework` 一种 modifier。framework 不是"更高级的 baseline"——它是显式注入地质场景假设的修饰器。框架正确时可能改善初始模型，框架错误时会主动注入系统误差。
+当前只有 `framework` 一种 modifier。framework 是显式注入地质场景假设的修饰器。框架正确时可能改善初始模型，框架错误时会主动注入系统误差。
 
 #### 逐 class 配置
 

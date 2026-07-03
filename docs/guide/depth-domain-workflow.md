@@ -38,7 +38,7 @@ wavelet_batch_synthetic_depth.py
 
 ## Step 4（深度域）：固定子波提取
 
-`vertical_well_auto_tie_depth.py` 从指定井提取一条固定时间子波，供后续批量合成使用。它**不是**通用井震标定——只跑一口井、输出一条子波。
+`vertical_well_auto_tie_depth.py` 是一个单井专用子波提取脚本，只跑一口井、输出一条固定时间子波，供后续批量合成使用。
 
 ### 快速开始
 

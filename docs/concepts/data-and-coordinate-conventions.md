@@ -92,7 +92,7 @@ trace =
 | 密度 `RHO_GCC` | g/cm³ | 第三步预处理后的密度曲线 |
 | 速度 `Vp/Vs` | m/s | 工作流内部属性 |
 | 密度 `Rho` | g/cm³ | 工作流内部属性 |
-| 声阻抗 `AI` | m/s*g/cm³ | `AI = Vp_mps * Rho_gcc`；不换算为数值相差 1000 倍的 SI 表示 |
+| 声阻抗 `AI` | m/s*g/cm³ | `AI = Vp_mps * Rho_gcc` |
 
 ## 坐标轴单位
 
@@ -108,4 +108,4 @@ trace =
 | `seismic_sample_index` | 整数 | 地震体全局采样轴上的派生索引，依赖当前采样轴；体采样仍以 TWT/TVDSS 等规范坐标重新计算并交叉校验 |
 | `trajectory_point_index` | 整数 | 原始井轨迹点在轨迹文件内的局部序号 |
 | `trajectory_sample_index` | 整数 | 井轨迹在传入 TWT 轴上重采样后的局部序号 |
-| `trace_plan_index` | 整数 | 当前 trace plan 内的局部行号；裁剪后重新从 0 编号，绝不是地震全局样点索引 |
+| `trace_plan_index` | 整数 | 当前 trace plan 内的局部行号，裁剪后重新从 0 编号 |

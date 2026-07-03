@@ -139,14 +139,6 @@ real_field_well_controls:
 2. **Manifest。** `well_control_manifest.csv`，每口候选井一行，记录状态、来源路径、井型、采样模式、有效样点数和 NPZ 路径等。失败的井也保留行，但 `well_npz_path` 为空。
 3. **Run summary。** `run_summary.json`，schema 固定为 `real_field_well_controls_v3`，记录 source adapter、SampleAxis、直接上游契约、成功/失败井统计、产物路径和唯一契约指纹。
 
-### 第六步明确不做什么
-
-- 不读取任何 LFM。
-- 不计算 delta（`well_log_ai - lfm_log_ai`）。
-- 不生成 `valid_for_fit` 标记。
-- 不做空间聚类。
-- 不把采样后的 LFM 值或任何 variant 派生量写回 NPZ。
-
 这些属于 variant-specific label preparation（Step 7 之后的下游），与井控事实无关。
 
 ---

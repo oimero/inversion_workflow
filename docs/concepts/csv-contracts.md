@@ -126,14 +126,14 @@
 | `tie_window_clipped_for_log_gap` | 标定窗是否因长缺口裁剪 |
 
 `optimized_trace_sample_plan_file` 中的 `trace_plan_index` 是当前计划内的局部行号。
-裁剪或重建计划后会重新编号，不是地震体全局索引。解释轨迹位置时应读取同一行的
+裁剪或重建计划后会重新编号。解释轨迹位置时应读取同一行的
 `twt_s`、`inline_float` 和 `xline_float`。
 
 ### `wavelet_inventory.csv`
 
 消费者：`wavelet_generation.py`
 
-第四步写出的候选子波清单。第五步只从此表选择候选，不扫描目录中的其他子波文件。
+第四步写出的候选子波清单。第五步只从此表选择候选。
 
 | 关键字段 | 含义 |
 |----------|------|
@@ -321,7 +321,7 @@ nominal-only 进入空间聚合。
 
 HDF5 文件，每个 sample 为一个 group，包含 `model_target_log_ai`、
 `seismic_input`、`valid_mask` 及 priors。所有数组带有 `unit`、
-`sample_domain`、`axis_path`、`axis_order`、`shape_json` 和 `dtype` 属性；不再保存或读取时重算 dataset 级 SHA。
+`sample_domain`、`axis_path`、`axis_order`、`shape_json` 和 `dtype` 属性。
 
 ### `sample_index.csv`
 
@@ -347,7 +347,7 @@ HDF5 文件，每个 sample 为一个 group，包含 `model_target_log_ai`、
 | `qc_only` / `training_consumable` | QC-only 产物必须明确禁止训练消费 |
 | `global_seed` | 全局随机种子 |
 | `input_contracts` | calibration 等直接上游契约指纹 |
-| `contract_fingerprint_sha256` | benchmark 唯一契约指纹；不发布全输出文件哈希表 |
+| `contract_fingerprint_sha256` | benchmark 唯一契约指纹 |
 | `accepted_parent_realizations` / `rejected_parent_realizations` | 接受/拒绝的 parent realization 计数 |
 
 ### 其他输出
@@ -368,7 +368,7 @@ HDF5 文件，每个 sample 为一个 group，包含 `model_target_log_ai`、
 
 最终 `scenario_catalog.csv` 的 `attempt_count` 来自冻结的 `attempt_plan.csv`；即使正式
 正演只处理 preflight 成功项，拒绝项仍保留在接受率分母中。接受率不足在
-`enforcement=warn` 时写为 `completed_with_warnings`，不作为脚本执行错误；只有显式
+`enforcement=warn` 时写为 `completed_with_warnings`，只有显式
 `fail_fast` 才在昂贵 HDF5 生成前停止。
 
 ## 旁路 · evaluate_synthoseis_lite.py
@@ -408,7 +408,7 @@ HDF5 文件，每个 sample 为一个 group，包含 `model_target_log_ai`、
 
 ### `evaluation_summary.json`
 
-通过 `input_contracts` 记录 benchmark 直接契约，并为评估结果发布一个 `contract_fingerprint_sha256`；不展开 benchmark 或输出逐文件哈希。
+通过 `input_contracts` 记录 benchmark 直接契约，并为评估结果发布一个 `contract_fingerprint_sha256`。
 
 ## 旁路 · ginn_v2.py
 
@@ -418,11 +418,11 @@ HDF5 文件，每个 sample 为一个 group，包含 `model_target_log_ai`、
 
 消费者：第八步 R0 `real_field_zero_shot.py`
 
-训练完成时写出。R0 从此文件读取模型元数据和标准化参数，不扫描目录猜测。
+训练完成时写出，R0 从此文件读取模型元数据和标准化参数。
 
 | 关键字段 | 含义 |
 |----------|------|
-| `schema_version` | 固定 `ginn_v2_model_run_v3`；旧 run 必须重建 |
+| `schema_version` | 固定 `ginn_v2_model_run_v3` |
 | `model_id` | 模型架构标识，来自注册的 10 个 ID 之一 |
 | `model_role` | `lateral` 或 `no_lateral`，决定 R0 输出子目录名。训练时自动从 `model_id` 推断，也可显式指定 |
 | `benchmark_dir` | 训练使用的合成基准目录 |
@@ -470,7 +470,7 @@ Step 7 run schema 为 `real_field_lfm_run_v3`，variant schema 为 `real_field_l
 
 ### `variant_manifest.csv`
 
-一行一 variant，记录 `variant_id`、baseline method、modifier chain、状态、主 NPZ/sidecar/summary 路径及该 variant 唯一的 `contract_fingerprint_sha256`。不存在隐式 primary。
+一行一 variant，记录 `variant_id`、baseline method、modifier chain、状态、主 NPZ/sidecar/summary 路径及该 variant 唯一的 `contract_fingerprint_sha256`。
 
 ### `variants/<variant_id>/lfm.npz`
 
@@ -480,8 +480,8 @@ Step 7 run schema 为 `real_field_lfm_run_v3`，variant schema 为 `real_field_l
 |------|------|
 | `log_ai` | 规范 log(AI) variant；volume/window 为 `[n_inline,n_xline,n_sample]`，section 为 `[n_trace,n_sample]` |
 | `valid_mask_model` | run 内所有 variant 逐点相同的权威有效掩码 |
-| `ilines` / `xlines` / `samples` | 显式真实线号与采样轴；xline 步长不得推断为 1 |
-| `metadata_json` | domain、unit、depth basis、baseline/modifier 和直接上游契约身份；不展开逐文件或祖先 hash 链 |
+| `ilines` / `xlines` / `samples` | 显式真实线号与采样轴 |
+| `metadata_json` | domain、unit、depth basis、baseline/modifier 和直接上游契约身份 |
 
 主 NPZ 不包含 a/b、kriging variance 或 framework probability。它们分别写入 `method_fields.npz`、可选 `modifier_fields.npz` 和 `qc/*.csv`。
 
@@ -545,7 +545,7 @@ R0 产物供 R1 消费。schema 为 `real_field_zero_shot_summary_v2`。
 
 R1 是当前流程的最终闭环。schema 为 `real_field_forward_diagnostic_summary_v2`。
 v2 使用 `cup.physics.forward_time` 的 N 点时间正演契约；观测、合成、有效掩码和
-TWT 轴均为 N 点，不再丢弃首样点。v1 的 N−1 诊断产物不兼容，必须重建。
+TWT 轴均为 N 点。v1 的 N−1 诊断产物不兼容，必须重建。
 
 ### `forward_diagnostic_metrics.csv`
 
@@ -642,7 +642,7 @@ TWT 轴均为 N 点，不再丢弃首样点。v1 的 N−1 诊断产物不兼容
 ### `real_well_metrics.csv`
 
 每个 checkpoint（`best` / `final`）× 全部有效井一行。保存 full-AI、delta、RMS、梯度和
-监督角色。这里只报告本 run 的绝对指标，不计算相对其他实验的 gain。
+监督角色。报告本 run 的绝对指标。
 
 ### `real_well_band_metrics.csv` / `real_well_waveform_metrics.csv`
 

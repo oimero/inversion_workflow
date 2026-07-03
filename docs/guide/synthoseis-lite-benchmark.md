@@ -172,7 +172,7 @@ sections:
       - {inline: 350, xline: 450}
 ```
 
-时间域的 section 路径使用 inline/xline 索引；深度域使用显式 inline/xline 折线路径，不得假设线号步长为 1。
+时间域的 section 路径使用 inline/xline 索引；深度域使用显式 inline/xline 坐标对序列，线号步长由相邻点的实际坐标差值决定。
 
 ### `impedance_attribute_generator`
 
@@ -199,7 +199,7 @@ impedance_attribute_generator:
       minimum_highres_cells: 8
 ```
 
-时间域使用 `object_coefficients_v1`，深度域使用 `object_coefficients_v2`。二者由校准阶段自动写入，生成阶段读取校准产物后自动选择正确的族，用户不需要手动区分。
+时间域使用 `object_coefficients_v1`，深度域使用 `object_coefficients_v2`。校准阶段自动写入正确的族标识，生成阶段读取校准产物后自动选择对应族。
 
 ### `generation`
 
@@ -290,7 +290,7 @@ seismic_mismatch:
 
 **6) 低频模型推导。** 从波阻抗真值出发，用理想低通滤波得到理想低频模型，再叠加受控退化（幅值误差、趋势倾斜、层段偏差、空间平滑偏差、局部缺失控制井偏差）得到退化低频模型。这些低频模型是训练时模型输入的一部分。
 
-**7) 写入 HDF5。** 将每个成功样本的波阻抗真值、各种地震数据（理想、噪声、增益、组合失配）、低频模型、有效掩码等写入 `synthetic_benchmark.h5`。每个数据集附带单位、采样域、轴、shape 和 dtype；不写 dataset 级 SHA。
+**7) 写入 HDF5。** 将每个成功样本的波阻抗真值、各种地震数据（理想、噪声、增益、组合失配）、低频模型、有效掩码等写入 `synthetic_benchmark.h5`。每个数据集附带单位、采样域、轴、shape 和 dtype 等元数据属性。
 
 **8) 输出清单与报告。** 写 `sample_index.csv`（每个样本的元数据一行）、`benchmark_manifest.json`（全局元数据、直接上游契约、唯一 benchmark 指纹、接受率统计）、`scenario_catalog.csv`（场景级统计）。
 
@@ -391,7 +391,7 @@ Status: success
 | `preflight: insufficient horizon support` | 剖面路径上的层位约束不足 | 检查解释层位覆盖面，或更换剖面路径 |
 | `scenario acceptance below failure_fraction` | 某场景接受率低于失败线且 enforcement 为 fail_fast | 放宽 QC 门控、调整剖面路径、或增加 attempts_per_scenario |
 | `scenario acceptance below warning_fraction` | 接受率在告警线和失败线之间 | 检查 `rejection_reason_summary.csv` 定位主要拒绝原因 |
-| `contract fingerprint/schema mismatch` | 输入仍是旧 schema，或所选直接上游契约与校准记录不一致 | 重建相关上游、校准和 benchmark；不提供旧哈希字段 fallback |
+| `contract fingerprint/schema mismatch` | 输入仍是旧 schema，或所选直接上游契约与校准记录不一致 | 重建相关上游、校准和 benchmark；上游契约的旧哈希字段必须与校准记录完全匹配 |
 | `calibration schema mismatch` | 校准产物版本与生成阶段期望不一致 | 重新运行校准 |
 
 ---

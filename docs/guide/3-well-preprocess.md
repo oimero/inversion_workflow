@@ -92,7 +92,7 @@ well_preprocess:
 
 #### `min_run_length`
 
-用于识别”长时间完全不变”的可疑曲线段。这类段落常见于仪器、导出或填充值问题，会被置为空值。不同曲线对常值段的容忍度不同，可通过 `min_run_length_by_category` 让声波、密度、GR 等类别单独设阈值；没有单独配置的类别才使用 `min_run_length`。
+用于识别“长时间完全不变”的可疑曲线段。这类段落常见于仪器、导出或填充值问题，会被置为空值。不同曲线对常值段的容忍度不同，可通过 `min_run_length_by_category` 让声波、密度、GR 等类别单独设阈值；没有单独配置的类别才使用 `min_run_length`。
 
 #### `exclude_categories`
 

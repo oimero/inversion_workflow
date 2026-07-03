@@ -403,6 +403,8 @@ def run_calibration(
     payload = calibration.to_dict()
     payload["sample_domain"] = "time"
     payload["config_provenance"] = dict(config_provenance)
+    calibration_path = output_dir / "impedance_calibration.json"
+    write_json(calibration_path, payload)
     contract_fingerprint = contract_fingerprint_sha256(
         contract_schema_version=CALIBRATION_SCHEMA,
         semantics={
@@ -415,15 +417,13 @@ def run_calibration(
         business_config=script_cfg,
         input_contracts=input_contracts,
         primary_artifacts={
+            "impedance_calibration": calibration_path,
             "well_object_catalog": objects_path,
             "well_calibration_samples": samples_path,
             "well_background_fits": backgrounds_path,
             "well_object_profile_samples": profile_samples_path,
         },
     )
-    payload["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
-    payload["contract_fingerprint_sha256"] = contract_fingerprint
-    write_json(output_dir / "impedance_calibration.json", payload)
     figure_summary = write_calibration_figures(
         output_dir,
         script_cfg.get("figures", {}),
@@ -448,7 +448,7 @@ def run_calibration(
         .to_dict(),
         "outputs": {
             "impedance_calibration": repo_relative_path(
-                output_dir / "impedance_calibration.json", root=repo_root
+                calibration_path, root=repo_root
             ),
             "well_object_catalog": repo_relative_path(objects_path, root=repo_root),
             "calibration_qc": repo_relative_path(qc_path, root=repo_root),

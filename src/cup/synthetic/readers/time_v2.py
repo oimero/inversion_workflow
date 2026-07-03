@@ -1,4 +1,4 @@
-"""Reader for frozen Synthoseis-lite v2 time-domain artifacts."""
+"""Reader for frozen Synthoseis-lite v3 time-domain artifacts."""
 
 from __future__ import annotations
 
@@ -117,7 +117,7 @@ class TimeV2Benchmark:
                 f"Unsupported time Synthoseis schema {actual_schema!r}; expected {SCHEMA_VERSION!r}."
             )
         if str(self.manifest.get("sample_domain") or "").casefold() != "time":
-            raise ValueError("Time v2 reader requires sample_domain=time.")
+            raise ValueError("Time v3 reader requires sample_domain=time.")
         validate_training_manifest(self.manifest, sample_domain="time")
         require_contract_fingerprint(self.manifest, label=f"benchmark {self.run_dir}")
 
@@ -229,7 +229,7 @@ class TimeV2Benchmark:
         if split is not None:
             if "split" not in frame:
                 raise ValueError(
-                    "Time v2 train/validation/test split is derived by the training adapter."
+                    "Time v3 train/validation/test split is derived by the training adapter."
                 )
             frame = frame[frame["split"].astype(str).eq(split)]
         return [str(value) for value in frame["sample_id"].tolist()]

@@ -478,6 +478,8 @@ def run_depth_calibration(
     }
     for name, frame in frames.items():
         frame.to_csv(output_dir / name, index=False)
+    calibration_path = output_dir / "impedance_calibration.json"
+    write_json(calibration_path, payload)
     contract_fingerprint = contract_fingerprint_sha256(
         contract_schema_version=CALIBRATION_SCHEMA,
         semantics={
@@ -496,16 +498,13 @@ def run_depth_calibration(
         business_config=script_cfg,
         input_contracts=input_contracts,
         primary_artifacts={
+            "impedance_calibration": calibration_path,
             "well_object_catalog": output_dir / "well_object_catalog.csv",
             "well_calibration_samples": output_dir / "well_calibration_samples.csv",
             "well_background_fits": output_dir / "well_background_fits.csv",
             "well_object_profile_samples": output_dir / "well_object_profile_samples.csv",
         },
     )
-    payload["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
-    payload["contract_fingerprint_sha256"] = contract_fingerprint
-    calibration_path = output_dir / "impedance_calibration.json"
-    write_json(calibration_path, payload)
 
     figure_summary = write_calibration_figures(output_dir, script_cfg.get("figures", {}))
 

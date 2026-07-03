@@ -280,7 +280,9 @@ nominal-only 进入空间聚合。
 | `parent` | 父先验：每种态的参数均值、协方差和权重 |
 | `zone_models` | 每个区域的三态高斯模型参数 |
 | `input_contracts` | 校准所用直接上游 run 的契约指纹 |
-| `contract_fingerprint_sha256` | 校准契约的唯一指纹 |
+
+同目录的 `run_summary.json` 是发布 manifest，保存校准契约唯一的
+`contract_fingerprint_sha256`；`impedance_calibration.json` 作为主产物纳入该指纹，不自带第二份指纹字段。
 
 ### `zone_models.csv`
 

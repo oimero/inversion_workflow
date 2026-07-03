@@ -1,4 +1,4 @@
-"""Strict reader for frozen Synthoseis-lite v2 depth benchmarks."""
+"""Strict reader for frozen Synthoseis-lite v3 depth benchmarks."""
 
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ class DepthV2Benchmark:
         self.manifest_path = self.run_dir / "benchmark_manifest.json"
         for path in (self.h5_path, self.index_path, self.manifest_path):
             if not path.is_file():
-                raise FileNotFoundError(f"Required Synthoseis v2 artifact not found: {path}")
+                raise FileNotFoundError(f"Required Synthoseis v3 artifact not found: {path}")
         self.manifest = _json(self.manifest_path)
         actual_schema = str(self.manifest.get("schema") or self.manifest.get("schema_version") or "missing")
         if actual_schema != SCHEMA_VERSION:
@@ -73,7 +73,7 @@ class DepthV2Benchmark:
                 "Re-run calibrate/generate to rebuild the benchmark."
             )
         if self.manifest.get("sample_domain") != "depth" or self.manifest.get("depth_basis") != "tvdss":
-            raise ValueError("Synthoseis v2 reader requires sample_domain=depth and depth_basis=tvdss.")
+            raise ValueError("Synthoseis v3 reader requires sample_domain=depth and depth_basis=tvdss.")
         validate_training_manifest(self.manifest, sample_domain="depth")
         require_contract_fingerprint(self.manifest, label=f"benchmark {self.run_dir}")
         self.index = pd.read_csv(self.index_path, dtype=str, keep_default_na=False)
@@ -83,22 +83,22 @@ class DepthV2Benchmark:
         }
         missing = sorted(required - set(self.index))
         if missing:
-            raise ValueError(f"sample_index.csv lacks v2 columns: {missing}")
+            raise ValueError(f"sample_index.csv lacks v3 columns: {missing}")
         if self.index.empty or self.index["sample_id"].duplicated().any():
             raise ValueError("sample_index.csv must be non-empty with unique sample_id values.")
         if not self.index["sample_domain"].eq("depth").all() or not self.index["depth_basis"].eq("tvdss").all():
             raise ValueError("sample_index.csv contains a wrong domain or depth basis.")
         if not self.index["suite"].eq("field_conditioned").all():
-            raise ValueError("Depth v2 sample_index.csv must contain only field_conditioned samples.")
+            raise ValueError("Depth v3 sample_index.csv must contain only field_conditioned samples.")
         if not set(self.index["sample_kind"]) <= {"base", "seismic_variant"}:
-            raise ValueError("Depth v2 sample_index.csv contains canonical/probe/unknown sample kinds.")
+            raise ValueError("Depth v3 sample_index.csv contains canonical/probe/unknown sample kinds.")
         forbidden_columns = {
             "sample_axis", "twt_model_s", "twt_highres_s", "probe_frequency_hz",
             "probe_phase", "probe_amplitude_multiplier", "probe_lateral_shape",
         }
         present_forbidden = sorted(forbidden_columns.intersection(self.index.columns))
         if present_forbidden:
-            raise ValueError(f"Depth v2 sample_index.csv contains forbidden time/probe fields: {present_forbidden}")
+            raise ValueError(f"Depth v3 sample_index.csv contains forbidden time/probe fields: {present_forbidden}")
         if not set(self.index["evaluation_role"]) <= {"development_pool", "geometry_holdout"}:
             raise ValueError("sample_index.csv contains unknown evaluation_role values.")
         held_out = str(dict(self.manifest.get("split_policy") or {}).get("held_out_geometry_family") or "")
@@ -170,7 +170,7 @@ class DepthV2Benchmark:
             frame = frame[frame["sample_kind"].isin(kinds)]
         if split is not None:
             if "split" not in frame:
-                raise ValueError("Depth v2 train/validation/test split is derived by the training adapter.")
+                raise ValueError("Depth v3 train/validation/test split is derived by the training adapter.")
             frame = frame[frame["split"].eq(split)]
         return frame["sample_id"].tolist()
 

@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 from datetime import datetime
@@ -246,22 +247,43 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 CONTRACT_FINGERPRINT_SCHEMA = "contract_fingerprint_v1"
+CONSUMABLE_CONTRACT_STATUSES = frozenset(
+    {
+        "success",
+        "ok",
+        "completed_with_warnings",
+        "development_limited",
+        "needs_forward_diagnostic",
+    }
+)
 
 _NON_BUSINESS_CONFIG_KEYS = {
     "created_at",
     "completed_at",
     "device",
     "devices",
+    "diagnostic",
+    "diagnostics",
+    "figure",
+    "figures",
     "log",
     "logging",
     "log_level",
+    "num_threads",
+    "num_workers",
     "output",
     "output_dir",
     "output_root",
+    "preprocessed_las",
     "report_card",
     "run_id",
+    "thread_count",
+    "threads",
     "timestamp",
     "updated_at",
+    "visualization",
+    "visualizations",
+    "workers",
 }
 _NON_BUSINESS_CONFIG_SUFFIXES = (
     "_path",
@@ -274,6 +296,25 @@ _NON_BUSINESS_CONFIG_SUFFIXES = (
     "_files",
     "_root",
 )
+
+_ARTIFACT_LOCATION_KEYS = {
+    "completed_at",
+    "config_file",
+    "config_provenance",
+    "created_at",
+    "device",
+    "devices",
+    "log",
+    "logging",
+    "log_level",
+    "output_dir",
+    "output_root",
+    "preprocessed_las",
+    "report_card",
+    "run_id",
+    "timestamp",
+    "updated_at",
+}
 
 
 def _canonical_contract_value(value: Any) -> Any:
@@ -321,7 +362,9 @@ def _canonical_business_config(value: Mapping[str, Any]) -> dict[str, Any]:
                 normalized = key.casefold().replace("-", "_")
                 if (
                     normalized in _NON_BUSINESS_CONFIG_KEYS
-                    or normalized.startswith("log_")
+                    or normalized.startswith(
+                        ("debug_", "diagnostic_", "figure_", "log_", "plot_")
+                    )
                     or normalized.endswith(_NON_BUSINESS_CONFIG_SUFFIXES)
                 ):
                     continue
@@ -339,8 +382,96 @@ def _canonical_business_config(value: Mapping[str, Any]) -> dict[str, Any]:
     return visit(value)
 
 
+def _is_artifact_location_key(key: str) -> bool:
+    normalized = str(key).casefold().replace("-", "_")
+    return (
+        normalized in _ARTIFACT_LOCATION_KEYS
+        or normalized.startswith("log_")
+        or normalized.endswith(_NON_BUSINESS_CONFIG_SUFFIXES)
+    )
+
+
+def _canonical_artifact_value(value: Any) -> Any:
+    """Remove filesystem/runtime provenance from structured primary content."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_artifact_value(item)
+            for key, item in value.items()
+            if not _is_artifact_location_key(str(key))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_artifact_value(item) for item in value]
+    return _canonical_contract_value(value)
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        _canonical_artifact_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _structured_primary_artifact_sha256(path: Path) -> str:
+    """Hash logical structured content while ignoring stored filesystem locations."""
+    suffix = path.suffix.casefold()
+    digest = hashlib.sha256()
+    if suffix == ".json":
+        with path.open("r", encoding="utf-8") as handle:
+            digest.update(b"json\0")
+            digest.update(_canonical_json_bytes(json.load(handle)))
+        return digest.hexdigest()
+    if suffix == ".csv":
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None:
+                raise ValueError(f"Primary CSV has no header: {path}")
+            fields = [
+                name
+                for name in reader.fieldnames
+                if not _is_artifact_location_key(name)
+            ]
+            rows = [{name: row.get(name, "") for name in fields} for row in reader]
+        digest.update(b"csv\0")
+        digest.update(_canonical_json_bytes({"fields": fields, "rows": rows}))
+        return digest.hexdigest()
+    if suffix == ".npz":
+        digest.update(b"npz\0")
+        with np.load(path, allow_pickle=False) as arrays:
+            for name in sorted(arrays.files):
+                value = np.asarray(arrays[name])
+                digest.update(name.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(value.dtype.str.encode("ascii"))
+                digest.update(b"\0")
+                digest.update(
+                    json.dumps(list(value.shape), separators=(",", ":")).encode("ascii")
+                )
+                digest.update(b"\0")
+                if (
+                    name.endswith("metadata_json")
+                    and value.ndim == 0
+                    and value.dtype.kind in {"S", "U"}
+                ):
+                    raw_metadata = value.item()
+                    if isinstance(raw_metadata, bytes):
+                        raw_metadata = raw_metadata.decode("utf-8")
+                    digest.update(_canonical_json_bytes(json.loads(str(raw_metadata))))
+                else:
+                    digest.update(np.ascontiguousarray(value).tobytes())
+        return digest.hexdigest()
+    return sha256_file(path)
+
+
 def require_contract_fingerprint(payload: Mapping[str, Any], *, label: str) -> str:
     """Return the single published fingerprint from a successful contract."""
+    status = str(payload.get("status") or "").casefold()
+    if status not in CONSUMABLE_CONTRACT_STATUSES:
+        raise ValueError(
+            f"{label} is not a consumable published contract: status={status!r}."
+        )
     if str(payload.get("contract_fingerprint_schema") or "") != CONTRACT_FINGERPRINT_SCHEMA:
         raise ValueError(f"{label} does not use {CONTRACT_FINGERPRINT_SCHEMA}.")
     digest = str(payload.get("contract_fingerprint_sha256") or "")
@@ -403,7 +534,7 @@ def contract_fingerprint_sha256(
         path = Path(path_value)
         if not path.is_file():
             raise FileNotFoundError(f"Primary contract artifact does not exist: {name} -> {path}")
-        artifacts[name] = sha256_file(path)
+        artifacts[name] = _structured_primary_artifact_sha256(path)
     if not artifacts:
         raise ValueError("A published contract requires at least one primary artifact.")
     fingerprint_payload = {

@@ -35,13 +35,16 @@ CSV 字段语义仍以[核心 CSV 契约](../concepts/csv-contracts.md)为准，
 
 - Step 1–6 通常一个成功 run 对应一个契约；
 - Step 7 的每个可选 LFM variant 是独立契约；
-- 一次 Synthoseis calibration、一个 benchmark、一个模型 run、一次 R0 预测分别是独立契约；
+- 一次 Synthoseis calibration、一个 benchmark、一个模型 run、一次 R0 预测和一次 R1 诊断分别是独立契约；
 - QC 图、日志、临时表和可重新生成的报告附件不是契约。
 
 ### 3.2 发布规则
 
 生产者必须在临时目录完成写出和语义校验，最后计算契约指纹，再写最终 manifest，
 然后原子发布或关闭该 run。只有成功状态的 run 才能拥有 `contract_fingerprint_sha256`。
+“成功状态”由各 schema 定义，包括 `success`、`ok`、可消费的
+`completed_with_warnings` / `development_limited`，以及 R0 的终态
+`needs_forward_diagnostic`；`failed` 和构建中状态绝不能拥有契约指纹。
 
 成功发布后：
 
@@ -50,8 +53,8 @@ CSV 字段语义仍以[核心 CSV 契约](../concepts/csv-contracts.md)为准，
 - 修改任何输入或业务配置必须创建新 run；
 - 失败或构建中的目录不得被下游当作契约消费。
 
-当前 06 以后多数入口已经使用时间戳目录并拒绝覆盖；01–05 仍有复用输出目录的代码路径。
-因此，全步骤不可变是实施本规范的前置迁移，不是已经满足的事实。
+当前 01–07、研究旁路、Synthoseis、模型和 R0/R1 发布入口均拒绝复用已有输出目录；
+成功 run 的不可变性已经作为本次 schema 硬切换的一部分实施。
 
 ## 4. 唯一契约指纹
 
@@ -74,9 +77,9 @@ CSV 字段语义仍以[核心 CSV 契约](../concepts/csv-contracts.md)为准，
 }
 ```
 
-`input_contracts` 只列直接输入。例如 R0 记录所选 LFM variant、模型 run 和子波契约，
-不再展开 Step 7 内部记录的 WellControlSet、层位、井和地震来源。完整历史通过逐层 manifest
-追溯。
+`input_contracts` 只列直接输入。例如 R0 记录所选 LFM variant、显式消费的 WellControlSet、
+模型 run 和子波契约，但不展开这些输入各自记录的更早祖先。层位、井和地震来源等完整历史
+通过逐层 manifest 追溯。
 
 路径用于定位，指纹用于标识。路径、输出根目录和时间戳不参与指纹计算。
 
@@ -120,6 +123,9 @@ Git commit、命令行、环境版本和普通来源路径仍可作为 provenanc
 ### 4.3 主产物摘要
 
 `primary_artifacts` 中的逐文件摘要只是生产者计算顶层指纹时的临时数据，不写入 manifest。
+为兑现“路径不参与身份”，JSON、CSV 和 NPZ 中只用于定位的 `*_path`、`*_dir`、
+`*_file`、输出根目录、时间戳、设备和日志 provenance 在内容摘要前规范化移除；数组值、
+dtype、shape、结构键和非定位元数据仍参与摘要。二进制主件则按其内容顺序读取。
 
 纳入的文件必须满足“其字节会被下游作为科研输入直接消费”，例如：
 
@@ -214,8 +220,8 @@ Git commit、命令行、环境版本和普通来源路径仍可作为 provenanc
 |------|---------------|------------|----------|
 | 01 → 02 → 03 → 04 → 05 | 主链基本不做运行时 SHA；依赖 CSV、LAS、TDT 和状态语义 | 合理，也证明 SHA 不是步骤契约的必要条件 | 各成功 run 发布一个指纹；消费者只做语义校验 |
 | 井轨迹 → 04 | 无 SHA 准入，按井名、坐标和轨迹字段联接 | 合理；风险是坐标语义而非字节替换 | 发布单一轨迹契约指纹，保留空间语义校验 |
-| 深度 Step 3 → Step 4 → Step 5 | 当前无正式哈希链 | 合理；应优先校验 depth/TVDSS、时间子波和深度平移语义 | 三个 run 各自发布一个指纹，Step 5 只记录直接输入 |
-| Step 4/5 → 正演可观测性 | 当前不以 SHA 作为输入准入，按井、子波场景、空间簇和频率证据联接 | 合理；主要风险是场景联接和窗口语义 | 可观测性 run 发布一个指纹，只记录直接的 Step 4/5 输入 |
+| 深度 Step 3 → Step 4 → Step 5 | 当时无正式哈希链 | 合理；应优先校验 depth/TVDSS、时间子波和深度平移语义 | 三个 run 各自发布一个指纹，Step 5 只记录直接输入 |
+| Step 4/5 → 正演可观测性 | 当时不以 SHA 作为输入准入，按井、子波场景、空间簇和频率证据联接 | 合理；主要风险是场景联接和窗口语义 | 可观测性 run 发布一个指纹，只记录直接的 Step 4/5 输入 |
 | Step 3 → 岩石物理 | 读取 LAS 时计算 `las_sha256`，并给 inventory、关系、图件等记录哈希 | 多数只是分散 provenance；图件哈希没有契约价值 | 岩石物理 run 发布一个指纹，QC/图件全部排除 |
 | Step 4/5/可观测性 → 时间域 calibration | calibration 保存多份 `source_hashes`，generate 再逐文件比较 | 重复读取早期产物；路径和哈希链耦合，语义校验更重要 | calibration 只记录直接上游契约指纹；generate 不重算 |
 | 岩石物理 + 深度 Step 5 → 深度 calibration | 严格核验 wavelet、AI–Vp 关系、inventory，并为 shifted LAS 等逐文件哈希 | 过度；真正需要的是关系单位、正速度、LAS 曲线和 domain/basis | 直接上游指纹 + calibration 自身指纹；移除逐文件准入 |
@@ -227,19 +233,19 @@ Git commit、命令行、环境版本和普通来源路径仍可作为 provenanc
 | Step 7 variant → real-delta/R0 | 校验地震、层位、manifest、LFM、summary、sidecar、body、Step 6 manifest 和 summary 哈希链 | 链条最深；一个来源文件变化会让已发布 variant 无法消费 | 每个可选 variant 发布自己的指纹；消费者只读所选 variant 并做语义校验 |
 | benchmark → GINN-v2 train/eval | 模型 manifest 再记录 benchmark 三文件、patch index、normalization、日志和 history 哈希 | 主输入可追溯有价值，但逐文件字段和日志哈希没有准入价值 | 模型 run 记录 benchmark 直接指纹；模型自身发布单一指纹 |
 | 模型 run → R0 | checkpoint 做运行时 SHA 校验；report card 有哈希字段但部分路径只检查摘要格式 | 策略不一致；格式正确的摘要并未证明报告内容 | checkpoint 纳入模型指纹；R0 校验 checkpoint 格式/模型语义但不重算 SHA |
-| Step 7 + 模型 + Step 5 → R0 | R0 继续校验地震/LFM 链，并记录大量 `source_file_sha256` | 与不可变直接输入契约重复 | 只记录 LFM variant、模型和子波等直接契约指纹 |
+| Step 7 + Step 6 + 模型 + Step 5 → R0 | R0 继续校验地震/LFM 链，并记录大量 `source_file_sha256` | 与不可变直接输入契约重复 | 只记录 LFM variant、显式消费的 WellControlSet、模型和子波等直接契约指纹 |
 | R0 → R1 | R1 记录 `zero_shot_summary_sha256` 和 wavelet hash，主要用于 summary | 没有形成一致的准入策略 | R1 记录 R0 和子波直接契约指纹，不新增逐文件 SHA |
 
 ### 6.3 HDF5 特例
 
-Synthoseis 当前同时存在：
+迁移前 Synthoseis 同时存在：
 
 1. benchmark manifest 中的整个 HDF5 文件 SHA；
 2. 每个 dataset 的 `sha256` 属性；
 3. reader 构造时遍历全部 dataset、读取完整数组并重算哈希；
 4. 同一 reader 随后再执行 shape、axis、domain 等语义检查。
 
-目标实现删除第 2、3 项，并用 benchmark 顶层契约指纹替代第 1 项。HDF5 reader 仍须校验：
+现行实现已删除第 2、3 项，并用 benchmark 顶层契约指纹替代第 1 项。HDF5 reader 仍须校验：
 
 - 文件可打开、schema/status 可消费；
 - dataset 路径存在；

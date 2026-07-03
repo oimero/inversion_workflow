@@ -67,12 +67,12 @@ python scripts/synthoseis_lite.py --config <config-yaml> generate \
 # 时间域
 synthoseis_lite:
   sample_domain: time
-  benchmark_schema: synthoseis_lite_v2
+  benchmark_schema: synthoseis_lite_v3
 
 # 深度域
 synthoseis_lite:
   sample_domain: depth
-  benchmark_schema: synthoseis_lite_v2
+  benchmark_schema: synthoseis_lite_v3
 ```
 
 ---
@@ -98,7 +98,7 @@ target_interval:
 
 synthoseis_lite:
   sample_domain: time
-  benchmark_schema: synthoseis_lite_v2
+  benchmark_schema: synthoseis_lite_v3
   global_seed: 20260615
   source_runs: ...
   sampling: ...
@@ -113,7 +113,7 @@ workflow_config: <path-to-common-yaml>
 
 synthoseis_lite:
   sample_domain: time          # 或 depth
-  benchmark_schema: synthoseis_lite_v2
+  benchmark_schema: synthoseis_lite_v3
   global_seed: 20260615
   source_runs: ...
   ...
@@ -391,7 +391,7 @@ Status: success
 | `preflight: insufficient horizon support` | 剖面路径上的层位约束不足 | 检查解释层位覆盖面，或更换剖面路径 |
 | `scenario acceptance below failure_fraction` | 某场景接受率低于失败线且 enforcement 为 fail_fast | 放宽 QC 门控、调整剖面路径、或增加 attempts_per_scenario |
 | `scenario acceptance below warning_fraction` | 接受率在告警线和失败线之间 | 检查 `rejection_reason_summary.csv` 定位主要拒绝原因 |
-| `contract fingerprint/schema mismatch` | 输入仍是旧 schema，或所选直接上游契约与校准记录不一致 | 重建相关上游、校准和 benchmark；上游契约的旧哈希字段必须与校准记录完全匹配 |
+| `contract fingerprint/schema mismatch` | 输入仍是旧 schema，或所选直接上游契约与校准记录不一致 | 重建相关上游、校准和 benchmark；要求上游契约的哈希字段与校准记录匹配，不使用兼容回退 |
 | `calibration schema mismatch` | 校准产物版本与生成阶段期望不一致 | 重新运行校准 |
 
 ---

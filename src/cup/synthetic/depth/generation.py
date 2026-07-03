@@ -42,7 +42,7 @@ from cup.synthetic.figures import write_generation_figures
 from cup.synthetic.generation import GenerationRejected, GenerationScenario
 from cup.synthetic.generation_pipeline import generation_scenarios
 from cup.synthetic.random import named_rng
-from cup.synthetic.depth.config import GENERATOR_FAMILY, SCHEMA_VERSION
+from cup.synthetic.depth.config import CALIBRATION_SCHEMA, GENERATOR_FAMILY, SCHEMA_VERSION
 from cup.synthetic.depth.object_core_adapter import (
     generate_depth_object_core_section,
     load_depth_calibration_for_object_core,
@@ -1303,17 +1303,42 @@ def run_depth_generation(
     calibration, calibration_payload = load_depth_calibration_for_object_core(
         calibration_path
     )
-    calibration_contract_fingerprint = require_contract_fingerprint(
-        calibration_payload, label=f"depth calibration {calibration_path}"
+    calibration_summary_path = calibration_path.parent / "run_summary.json"
+    with calibration_summary_path.open("r", encoding="utf-8") as handle:
+        calibration_summary = json.load(handle)
+    if (
+        calibration_summary.get("schema_version") != CALIBRATION_SCHEMA
+        or calibration_summary.get("status") != "success"
+    ):
+        raise ValueError(
+            f"Depth calibration run is not a successful {CALIBRATION_SCHEMA} contract."
+        )
+    recorded_calibration_path = resolve_relative_path(
+        str(
+            dict(calibration_summary.get("outputs") or {}).get(
+                "impedance_calibration"
+            )
+            or ""
+        ),
+        root=repo_root,
     )
-    recorded_rock_contract = dict(calibration.input_contracts.get("rock_physics_analysis") or {})
+    if recorded_calibration_path.resolve() != calibration_path.resolve():
+        raise ValueError(
+            "Depth calibration run summary points to a different impedance_calibration.json."
+        )
+    calibration_contract_fingerprint = require_contract_fingerprint(
+        calibration_summary, label=f"depth calibration {calibration_summary_path.parent}"
+    )
+    recorded_rock_contract = dict(
+        calibration.input_contracts.get("rock_physics_analysis") or {}
+    )
     if str(recorded_rock_contract.get("contract_fingerprint_sha256") or "") != str(
         forward_inputs["_contract_fingerprint_sha256"]
     ):
         raise ValueError("impedance calibration and forward inputs use different rock-physics contracts.")
     input_contracts = {
         "calibration": {
-            "path": repo_relative_path(calibration_path, root=repo_root),
+            "path": repo_relative_path(calibration_summary_path, root=repo_root),
             "contract_fingerprint_sha256": calibration_contract_fingerprint,
         },
         "rock_physics_analysis": {
@@ -1688,12 +1713,21 @@ def run_depth_generation(
         development_limited=development,
     )
     catalog.to_csv(output_dir / "scenario_catalog.csv", index=False)
-    failure_reason = "depth_generation_no_accepted_realizations" if base.empty else ""
     failed_scenarios = catalog["acceptance_status"].isin(
         {"failed", "insufficient_attempts"}
     )
+    failure_reason = "depth_generation_no_accepted_realizations" if base.empty else ""
+    if (
+        not failure_reason
+        and not development
+        and enforcement == "fail_fast"
+        and bool(failed_scenarios.any())
+    ):
+        failure_reason = "depth_generation_acceptance_qc_failed"
     completed_with_warnings = (
-        (not development) and (not base.empty) and bool(failed_scenarios.any())
+        (not development)
+        and not failure_reason
+        and bool(failed_scenarios.any())
     )
 
     figure_summary = write_generation_figures(
@@ -1703,40 +1737,45 @@ def run_depth_generation(
         qc_only=qc_only,
     )
 
-    contract_fingerprint = contract_fingerprint_sha256(
-        contract_schema_version=SCHEMA_VERSION,
-        semantics={
-            "sample_domain": "depth",
-            "sample_unit": "m",
-            "depth_basis": "tvdss",
-            "suite": "field_conditioned",
-            "generator_family": GENERATOR_FAMILY,
-            "sampling": dict(script_cfg["sampling"]),
-        },
-        business_config={
-            "global_seed": int(script_cfg["global_seed"]),
-            "generation": dict(script_cfg["generation"]),
-            "lfm": dict(script_cfg["lfm"]),
-            "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
-        },
-        input_contracts=input_contracts,
-        primary_artifacts={
-            "synthetic_benchmark": h5_path,
-            "sample_index": output_dir / "sample_index.csv",
-        },
-    )
+    contract_fields: dict[str, str] = {}
+    if not failure_reason:
+        contract_fields = {
+            "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+            "contract_fingerprint_sha256": contract_fingerprint_sha256(
+                contract_schema_version=SCHEMA_VERSION,
+                semantics={
+                    "sample_domain": "depth",
+                    "sample_unit": "m",
+                    "depth_basis": "tvdss",
+                    "suite": "field_conditioned",
+                    "generator_family": GENERATOR_FAMILY,
+                    "sampling": dict(script_cfg["sampling"]),
+                },
+                business_config={
+                    "global_seed": int(script_cfg["global_seed"]),
+                    "generation": dict(script_cfg["generation"]),
+                    "lfm": dict(script_cfg["lfm"]),
+                    "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
+                },
+                input_contracts=input_contracts,
+                primary_artifacts={
+                    "synthetic_benchmark": h5_path,
+                    "sample_index": output_dir / "sample_index.csv",
+                },
+            ),
+        }
     manifest = {
         "schema": SCHEMA_VERSION,
         "schema_version": SCHEMA_VERSION,
-        "status": "development_limited"
-        if development
+        "status": "failed"
+        if failure_reason
         else (
-            "failed"
-            if failure_reason
+            "development_limited"
+            if development
             else ("completed_with_warnings" if completed_with_warnings else "success")
         ),
-        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
-        "contract_fingerprint_sha256": contract_fingerprint,
+        **contract_fields,
+        "failure_reason": failure_reason,
         "input_contracts": input_contracts,
         "sample_domain": "depth",
         "depth_basis": "tvdss",
@@ -1872,12 +1911,6 @@ def run_depth_generation(
     write_json(output_dir / "run_summary.json", summary)
     if failure_reason:
         raise RuntimeError(failure_reason)
-    if (
-        (not development)
-        and enforcement == "fail_fast"
-        and bool(failed_scenarios.any())
-    ):
-        raise RuntimeError("depth_generation_acceptance_qc_failed")
     logger.info(
         "Depth Synthoseis generation finished: status=%s accepted=%d rejected=%d",
         summary["status"],

@@ -372,7 +372,6 @@ def train_model(
                     model_info=info.__dict__,
                     hidden_channels=hidden_channels,
                     depth=depth,
-                    device_metadata=device_metadata,
                     epoch=epoch,
                     validation_loss=val_loss,
                     checkpoint_kind="best",
@@ -409,7 +408,6 @@ def train_model(
             model_info=info.__dict__,
             hidden_channels=hidden_channels,
             depth=depth,
-            device_metadata=device_metadata,
             epoch=int(epochs),
             validation_loss=final_validation_loss,
             checkpoint_kind="final",
@@ -464,25 +462,27 @@ def _checkpoint_payload(
     model_info: Mapping[str, Any],
     hidden_channels: int,
     depth: int,
-    device_metadata: Mapping[str, Any],
     epoch: int,
     validation_loss: float,
     checkpoint_kind: str,
 ) -> dict[str, Any]:
+    state_dict = {
+        name: value.detach().cpu()
+        for name, value in model.state_dict().items()
+    }
     return {
         "schema_version": "ginn_v2_checkpoint_v2",
         "checkpoint_kind": checkpoint_kind,
         "epoch": int(epoch),
         "validation_loss": float(validation_loss),
         "model_id": model_id,
-        "state_dict": model.state_dict(),
+        "state_dict": state_dict,
         "normalization": dict(normalization),
         "model_info": dict(model_info),
         "architecture": {
             "hidden_channels": int(hidden_channels),
             "depth": int(depth),
         },
-        "device": dict(device_metadata),
     }
 
 

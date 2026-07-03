@@ -80,6 +80,7 @@ from cup.utils.io import (
     contract_fingerprint_sha256,
     repo_relative_path,
     require_contract_fingerprint,
+    resolve_relative_path,
     write_json,
 )
 
@@ -102,13 +103,34 @@ def _generation_input_contracts(
     sources: Mapping[str, Path],
     repo_root: Path,
 ) -> dict[str, dict[str, str]]:
-    with calibration_path.open("r", encoding="utf-8") as handle:
-        calibration_payload = json.load(handle)
+    calibration_summary_path = calibration_path.parent / "run_summary.json"
+    with calibration_summary_path.open("r", encoding="utf-8") as handle:
+        calibration_summary = json.load(handle)
+    if (
+        calibration_summary.get("schema_version") != CALIBRATION_SCHEMA
+        or calibration_summary.get("status") != "success"
+    ):
+        raise ValueError(
+            f"Calibration run is not a successful {CALIBRATION_SCHEMA} contract."
+        )
+    recorded_calibration_path = resolve_relative_path(
+        str(
+            dict(calibration_summary.get("outputs") or {}).get(
+                "impedance_calibration"
+            )
+            or ""
+        ),
+        root=repo_root,
+    )
+    if recorded_calibration_path.resolve() != calibration_path.resolve():
+        raise ValueError(
+            "Calibration run summary points to a different impedance_calibration.json."
+        )
     contracts = {
         "calibration": {
-            "path": repo_relative_path(calibration_path, root=repo_root),
+            "path": repo_relative_path(calibration_summary_path, root=repo_root),
             "contract_fingerprint_sha256": require_contract_fingerprint(
-                calibration_payload, label=f"calibration {calibration_path}"
+                calibration_summary, label=f"calibration {calibration_summary_path.parent}"
             ),
         }
     }
@@ -1470,8 +1492,22 @@ def run_generation(
     catalog.to_csv(output_dir / "scenario_catalog.csv", index=False)
     failure_statuses = {"failed", "insufficient_attempts"}
     failed_scenarios = catalog["acceptance_status"].isin(failure_statuses)
-    completed_with_warnings = (not development_limited) and bool(
-        failed_scenarios.any()
+    failure_reason = (
+        "field_conditioned_no_accepted_realizations"
+        if successful_parent_ids.empty
+        else ""
+    )
+    if (
+        not failure_reason
+        and not development_limited
+        and enforcement == "fail_fast"
+        and bool(failed_scenarios.any())
+    ):
+        failure_reason = "field_conditioned_acceptance_qc_failed"
+    completed_with_warnings = (
+        not development_limited
+        and not failure_reason
+        and bool(failed_scenarios.any())
     )
     figure_summary = write_generation_figures(
         output_dir,
@@ -1479,39 +1515,48 @@ def run_generation(
         suite="field_conditioned",
         qc_only=qc_only,
     )
-    contract_fingerprint = contract_fingerprint_sha256(
-        contract_schema_version=DATA_SCHEMA,
-        semantics={
-            "sample_domain": "time",
-            "suite": "field_conditioned",
-            "output_dt_s": output_dt,
-            "truth_dt_s": calibration.truth_dt_s,
-            "generator_family": calibration.generator_family,
-        },
-        business_config={
-            "global_seed": int(script_cfg["global_seed"]),
-            "sampling": dict(script_cfg["sampling"]),
-            "generation": dict(script_cfg["generation"]),
-            "forward_qc": dict(script_cfg["forward_qc"]),
-            "lfm": dict(script_cfg["lfm"]),
-            "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
-        },
-        input_contracts=input_contracts,
-        primary_artifacts={
-            "synthetic_benchmark": h5_path,
-            "sample_index": output_dir / "sample_index.csv",
-        },
-    )
+    contract_fields: dict[str, str] = {}
+    if not failure_reason:
+        contract_fields = {
+            "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+            "contract_fingerprint_sha256": contract_fingerprint_sha256(
+                contract_schema_version=DATA_SCHEMA,
+                semantics={
+                    "sample_domain": "time",
+                    "suite": "field_conditioned",
+                    "output_dt_s": output_dt,
+                    "truth_dt_s": calibration.truth_dt_s,
+                    "generator_family": calibration.generator_family,
+                },
+                business_config={
+                    "global_seed": int(script_cfg["global_seed"]),
+                    "sampling": dict(script_cfg["sampling"]),
+                    "generation": dict(script_cfg["generation"]),
+                    "forward_qc": dict(script_cfg["forward_qc"]),
+                    "lfm": dict(script_cfg["lfm"]),
+                    "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
+                },
+                input_contracts=input_contracts,
+                primary_artifacts={
+                    "synthetic_benchmark": h5_path,
+                    "sample_index": output_dir / "sample_index.csv",
+                },
+            ),
+        }
     manifest = {
         "schema": DATA_SCHEMA,
         "schema_version": DATA_SCHEMA,
         "status": (
-            "development_limited"
-            if development_limited
-            else ("completed_with_warnings" if completed_with_warnings else "success")
+            "failed"
+            if failure_reason
+            else (
+                "development_limited"
+                if development_limited
+                else ("completed_with_warnings" if completed_with_warnings else "success")
+            )
         ),
-        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
-        "contract_fingerprint_sha256": contract_fingerprint,
+        **contract_fields,
+        "failure_reason": failure_reason,
         "input_contracts": input_contracts,
         "generator_family": calibration.generator_family,
         "implementation_scope": IMPLEMENTATION_SCOPE,
@@ -1631,11 +1676,7 @@ def run_generation(
     write_json(output_dir / "benchmark_manifest.json", manifest)
     summary = {
         **manifest,
-        "status": (
-            "development_limited"
-            if development_limited
-            else ("completed_with_warnings" if completed_with_warnings else "success")
-        ),
+        "status": manifest["status"],
         "accepted_realizations": int(
             (index["sample_kind"].eq("base") & index["status"].eq("ok")).sum()
         ),
@@ -1650,11 +1691,9 @@ def run_generation(
         "seismic_variant_count": len(seismic_variant_records),
     }
     write_json(output_dir / "run_summary.json", summary)
-    if (
-        (not development_limited)
-        and enforcement == "fail_fast"
-        and bool(failed_scenarios.any())
-    ):
+    if failure_reason == "field_conditioned_no_accepted_realizations":
+        raise RuntimeError(failure_reason)
+    if failure_reason == "field_conditioned_acceptance_qc_failed":
         failed = catalog.loc[
             failed_scenarios,
             ["section_id", "scenario_id", "acceptance_status"],

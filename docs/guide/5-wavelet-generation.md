@@ -22,8 +22,6 @@ python scripts/wavelet_generation.py --output-dir scripts/output/wavelet_generat
 
 ## 运行前需要什么
 
-第五步只依赖第四步产物：
-
 | 来源 | 文件 | 用途 |
 |------|------|------|
 | 第四步 | `well_tie_plan.csv` | 每口井的路由、井口坐标 |

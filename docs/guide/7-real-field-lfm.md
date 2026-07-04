@@ -27,35 +27,17 @@ python scripts/real_field_lfm.py --output-dir scripts/output/lfm_test
 | 数据目录 | 层位文件 | Petrel 导出的解释层位，定义 TargetZone 的几何边界 |
 | 可选 | framework body CSV | 仅使用 framework modifier 时需要 |
 
-### 层位要求
-
-`target_interval.horizons` 必须声明至少两个层位的名称和文件路径。首个层位和末尾层位定义趋势窗的顶和底；中间的层位只参与 TargetZone 几何定义和连续性校验，不增加趋势参数。
-
-层位文件为 Petrel 导出格式，通过 `import_interpretation_petrel` 读取，内部做绝对值处理。路径相对于 `data_root`。
-
-### 第六步契约身份
-
-第七步加载井控集时校验数据模式、domain/unit、采样轴、坐标和 shape 等显式语义，并把第六步发布的契约指纹记为直接输入。消费者不重算地震体或逐井 NPZ 的 SHA；若地震体等业务输入发生变化，必须重建第六步，形成新的不可变运行。
-
 ---
 
 ## 配置参考
 
-第七步的配置是整份规范中最丰富的一段。它分为五个子段：`source_runs`、`output_geometry`、`baselines`、`modifiers`、`variants`、`comparisons`。
-
 ```yaml
 real_field_lfm:
   source_runs:
-    well_control_run_dir: scripts/output/real_field_well_controls_<timestamp>
+    well_control_run_dir:                        # 留空自动发现最新第六步
 
   output_geometry:
-    mode: window
-    inline_min: 1600
-    inline_max: 1800
-    xline_min: 5003
-    xline_max: 6203
-    sample_min: 1.0
-    sample_max: 2.5
+    mode: volume                                 # 全工区规则体
 
   baselines:
     trend_main:
@@ -71,7 +53,7 @@ real_field_lfm:
         huber_f_scale_log_ai: 0.05
       spatial: {variogram: spherical, exact: true, nugget: 0.0}
 
-    slice_main:
+    proportional_slice_main:
       method: proportional_kriging
       filter:
         enabled: true
@@ -82,54 +64,87 @@ real_field_lfm:
       n_slices: 32
       spatial: {variogram: spherical, exact: true, nugget: 0.0}
 
-  modifiers:
-    reef_scenario:
-      method: framework
-      bodies_file: experiments/real_field_lfm/framework_bodies.csv
-      classes:
-        reef:
-          top_horizon: horizon_a
-          bottom_horizon: horizon_b
-          linear_ai_multiplier: 1.06
-          edge_taper_m: 100.0
-          top_taper_fraction: 0.1
-          bottom_taper_fraction: 0.1
+  modifiers: {}
 
   variants:
     - variant_id: trend_baseline
       baseline_id: trend_main
       modifier_ids: []
-    - variant_id: trend_with_reef
-      baseline_id: trend_main
-      modifier_ids: [reef_scenario]
-    - variant_id: slice_baseline
-      baseline_id: slice_main
+    - variant_id: proportional_slice_baseline
+      baseline_id: proportional_slice_main
       modifier_ids: []
 
-  comparisons:
-    - comparison_id: trend_vs_slice
-      left_variant_id: trend_baseline
-      right_variant_id: slice_baseline
-    - comparison_id: framework_effect
-      left_variant_id: trend_baseline
-      right_variant_id: trend_with_reef
+  comparisons: []
 ```
+
+### 顶层配置
+
+顶层配置的 `target_interval.horizons` 必须声明至少两个层位的名称和文件路径。首个层位和末尾层位定义趋势窗的顶和底；中间的层位只参与 TargetZone 几何定义和连续性校验，不增加趋势参数。层位文件为 Petrel 导出格式，通过 `import_interpretation_petrel` 读取，内部做绝对值处理，路径相对于 `data_root`。
+
+### `source_runs`
+
+指向第六步产出的井控集运行目录。留空时自动发现最新的 `real_field_well_controls_*`。第七步加载井控集时校验数据模式、domain/unit、采样轴、坐标和 shape 等显式语义，并把第六步发布的契约指纹记为直接输入。消费者不重算地震体或逐井 NPZ 的 SHA；若地震体等业务输入发生变化，必须重建第六步，形成新的不可变运行。
 
 ### `output_geometry`
 
-三种模式：
+控制低频模型输出的空间范围。三种模式互斥，每种有各自的参数要求。所有第六步成功井都参与建模——`output_geometry` 只控制最终写出体的网格范围，不减少使用的控制井。
 
-| mode | 含义 | 允许导出体 |
-|------|------|-----------|
-| `volume` | 全工区规则体，轴与源地震严格一致 | 是 |
-| `window` | 矩形子体，需显式指定 inline/xline/sample 起止 | 否 |
-| `section` | 二维剖面，由折线路径 + 采样点数定义 | 否 |
+#### `volume` — 全工区体
 
-`window` 和 `section` 只裁输出，不减少基线模型可使用的控制井集合——所有第六步成功井都参与建模，裁的是最终写出的体范围。
+输出轴与源地震严格一致。不需要任何额外参数。
 
-`section` 需配置 `points`（至少两个 `{inline, xline}` 端点）和 `n_traces`（至少 2）。剖面端点间的折线段数自动检测，不要求每条线段长度相等。
+```yaml
+output_geometry:
+  mode: volume
+```
 
-线号/道号始终是真实线号。例如 xline 步长为 4 时，`5003`、`5007`、`5011` 是不同有效线号，不能把它们当成数组下标或步长 1。
+> 输出轴与源地震严格一致，只有 volume 模式能导出 SEG-Y/ZGY。
+
+#### `window` — 矩形子体
+
+从全工区中裁出一个矩形窗口。六个参数缺一不可，端点必须精确落在 survey 线网上。
+
+```yaml
+output_geometry:
+  mode: window
+  inline_min: 1000
+  inline_max: 1200
+  xline_min: 3000
+  xline_max: 3400
+  sample_min: 1.0
+  sample_max: 2.5
+```
+
+| 参数 | 含义 |
+|------|------|
+| `inline_min` / `inline_max` | inline 起止线号（含） |
+| `xline_min` / `xline_max` | xline 起止线号（含） |
+| `sample_min` / `sample_max` | 深度或时间采样轴起止（含） |
+
+下标轴只接受真实线号。例如 xline 步长为 4 时 `5003`、`5007`、`5011` 是不同有效线号，不能当成数组下标。
+
+#### `section` — 二维剖面
+
+由折线路径定义，沿路径按 XY 米制距离均匀采样 `n_traces` 个道位置。
+
+```yaml
+output_geometry:
+  mode: section
+  points:
+    - {inline: 1100.0, xline: 3000.0}
+    - {inline: 1100.0, xline: 3200.0}
+  n_traces: 101
+  sample_min: 1.0
+  sample_max: 2.5
+```
+
+| 参数 | 含义 |
+|------|------|
+| `points` | 至少两个 `{inline, xline}` 端点，定义折线路径 |
+| `n_traces` | 沿路径均匀采样的道数，至少为 2 |
+| `sample_min` / `sample_max` | 深度或时间采样轴起止（含） |
+
+`n_traces` 不需要和 survey 线网对齐——函数在 XY 米制空间均匀采样后反算浮点 inline/xline。写成不同数值只是改变采样密度，都不会报错。
 
 ### `baselines`
 
@@ -231,15 +246,6 @@ body_id,framework_class,u_top,u_bottom,vertex_order,inline,xline
 - 所有顶点必须落在显式 survey 线网上。
 - 同一平面位置允许多个纵向窗不同的 body。
 
-#### 修饰公式
-
-对每个样点，先独立计算每个 body 的三维概率 `P_body = P_map(x,y) × P_vertical(v_body)`，再对同一 class 内的所有 body 取最大值 `P_class = max(P_body)`。最后在波阻抗对数域叠加：
-
-```text
-logAI_modified = logAI_parent + Σ(P_class × ln(multiplier_class))
-```
-
-先形成三维 body 再取最大值——不先合并二维 polygon。不同 class 的 body 独立计算、线性叠加。mask 外保持空值。
 
 ### `variants`
 
@@ -274,55 +280,64 @@ comparisons:
 
 ## 脚本在做什么
 
-脚本分五个阶段：**加载与校验 → 构建 context → 构建基线模型 → 应用修饰器 → 原子发布**。所有阶段在临时目录中执行，全部成功后才发布到最终目录。
+脚本分五个阶段：**加载 → 构建上下文 → 构建基线模型 → 应用修饰器 → 原子发布**。所有阶段在临时目录中执行，任一失败整次运行失败，临时目录保留诊断信息。
 
-### 第一阶段：加载与校验
+### 第一阶段：加载
 
-1. 加载第六步井控集，校验 `run_summary.json` 数据模式、直接契约身份，以及 manifest/逐井 NPZ 的结构、轴、dtype、shape 和 mask 语义。
-2. 校验井控集与当前地震的 domain、采样轴和 survey geometry 一致；不重算地震文件哈希。
-3. 校验井控集的采样轴与当前地震体的采样轴逐点一致。
-4. 解析 `real_field_lfm` 配置段，校验各 ID 全局唯一、引用存在、无自动组合。
+1. 加载第六步井控集，校验数据模式、契约身份和采样轴与当前地震体一致。
+2. 解析配置，校验所有基线模型、修饰器、变体和 comparison 的 ID 全局唯一且引用有效。
 
-### 第二阶段：构建低频模型上下文
+### 第二阶段：构建上下文
 
-1. 加载并归一化所有 target horizon。
-2. 构建 TargetZone（层位面 + 采样轴 + 最小厚度约束）。
-3. 按 `output_geometry.mode` 解析输出网格：
-   - `volume`：全 survey 轴，XY 网格由 survey geometry 提供。
-   - `window`：子轴必须落在显式 survey 线网上，端点必须精确匹配已有坐标。
-   - `section`：由折线端点 + 道数插值生成线号/道号轴，XY 由 survey geometry 换算。
+1. 加载并归一化目标层位，构建 TargetZone（层位面 + 采样轴 + 最小厚度约束）。
+2. 按输出模式确定网格：`volume` 用全 survey 轴，`window` 用指定的 inline/xline/sample 子范围，`section` 由折线路径插值生成道网格。
 
 ### 第三阶段：构建基线模型
 
-按变体图中引用的基线模型 ID 去重后依次构建：
+按变体图中引用的基线模型去重后依次构建。两种方法共享低通滤波和 XY kriging 原语。
 
-1. **读取基线模型配置**，校验 method、filter、fit（仅 trend）、n_slices（仅 proportional）和 spatial 字段。
-2. **对每口控制井应用低通滤波**，输出仍是同 basis、同单位的 `grid.Log`。滤波参数来自基线模型自己的 filter 配置。
-3. **构建基线模型体：**
-   - trend：每井拟合 a/b → XY kriging 插值参数场 → 逐道重建 → 用 target mask 写值。
-   - proportional_kriging：逐层段切片采样 → 逐切片 XY kriging → neighbor_slice_fill 补齐空切片 → 逐道线性插值 → 跨层段拼接。
-4. 生成 method sidecar（`a_field`、`b_field`、`kriging_variance`、`distance_to_control_m`、`slice_u` 等）和 QC 表格。
+**Trend：** 高偏差、低方差。对每口控制井在目标窗内拟合一条 logAI = a + b·(2u-1) 的直线，然后在 XY 平面上分别对 a 和 b 做 ordinary kriging，逐道按参数场重建体。单井控制时直接生成常数场。
+
+**Proportional kriging：** 降低纵向结构偏差。把目标区间按层段切分为等距比例切片，每口井在每个切片位置采样滤波后的波阻抗对数，逐切片独立做 XY kriging，再在切片间线性插值重建体。控制不足的切片由相邻切片补齐，整层段无控制时失败。
 
 ### 第四阶段：应用修饰器
 
-对每个变体声明的修饰器列表，按顺序应用：
+对每个变体声明的修饰器列表按序应用。当前只有 framework 修饰器，它的逻辑是在基线模型上叠加地质场景假设——比如"这里有一块礁体，AI 比背景高 6%"。
 
-1. **framework 修饰器：** 加载 body CSV，校验 polygon 拓扑和 class 参数 → 逐 class 计算三维概率 → 在 parent 的波阻抗对数上累加 `P_class × ln(multiplier)` → 生成 class probability sidecar 和 body/class QC。
-2. 修饰后的体保持 parent 的 `valid_mask_model`、axes 和 shape 不变。
-3. 额外生成 `well_framework_effect_qc.csv`：逐井统计修饰器在各井位置上的波阻抗对数偏移量和 class 概率。
+修饰过程分三步：
+
+**第一步：计算每个 body 的三维概率场。**
+
+一个 body 由一个 polygon（平面范围）加一个纵向窗（层段内的相对深度区间）定义。对体中的每个样点：
+
+- 横向：判断该道是否在 polygon 内。polygon 边缘有羽化过渡带（`edge_taper_m`），从边界向内概率从 0 平滑上升到 1，避免多边形边缘出现硬边界。
+- 纵向：判断该样点是否落在 body 的纵向窗内。窗的顶和底各有一段 raised-cosine 渐变带（各占纵向窗的 `top_taper_fraction` / `bottom_taper_fraction`），从窗边界向内概率从 0 平滑上升到 1。窗的中部概率为 1。
+
+三维概率 = 横向概率 × 纵向概率。polygon 外或纵向窗外概率为零，完全落在内部且不在任何渐变带的样点概率为 1。
+
+**第二步：同 class 内取最大值。**
+
+如果同一个 class 下有多个 body，每个样点取所有 body 概率的最大值。这样可以在不合并 polygon 的前提下处理复杂形状——多个小 polygon 拼出一个不规则地质体。不同 class 之间完全独立，后续线性叠加。
+
+**第三步：叠加到基线模型。**
+
+在波阻抗对数域上，每个 class 独立贡献一项：
+
+```
+logAI_modified = logAI_parent + P_class × ln(multiplier)
+```
+
+`multiplier` 是 AI 倍率。例如 `multiplier=1.06` 表示该 class 覆盖区域 AI 比背景高 6%，贡献量 `ln(1.06) ≈ 0.058`。`P_class` 接近 1 的区域获得完整倍率效果，渐变带内按概率比例减弱，完全在外的区域不受影响。
+
+多个 class 各自独立计算、直接累加。修饰后的体保持与基线相同的网格和有效掩码。
 
 ### 第五阶段：原子发布
 
-1. **逐变体写入：**
-   - `lfm.npz`：只包含 `log_ai`（float32）、`valid_mask_model`（bool）、`ilines`/`xlines`/`samples`（float64）、`metadata_json`。
-   - `method_fields.npz`：a/b field、kriging variance 等。
-   - `modifier_fields.npz`：class probability、class map QC 等（仅含修饰器时）。
-   - `variant_summary.json`：完整 metadata、统计量、产物路径和当前变体唯一契约指纹。
-2. **逐 comparison 写入：** `metrics.csv`（全局差异统计）、`well_metrics.csv`（每井差异）、`figures/overview.png`（七面板对比图）。
-3. **volume 模式导出体：** 对每个变体输出线性 AI 的 SEG-Y 或 ZGY，mask 外保留空值。
-4. **写入 `variant_manifest.csv` 和 `lfm_run_summary.json`，然后原子 rename 临时目录为最终目录。**
-
-任一变体或 comparison 失败，整次运行失败——临时目录被重命名为 `_failed_<uuid>` 保留诊断信息，不发布可被 R0 自动发现的 manifest。
+1. 逐变体写出主 NPZ、方法 sidecar、修饰器 sidecar 和变体摘要。
+2. 逐 comparison 写出差异统计表和七面板对比图。
+3. 写入 `variant_manifest.csv` 和 `lfm_run_summary.json`。
+4. volume 模式额外导出线性 AI 的 SEG-Y 或 ZGY 体。
+5. 全部成功后原子 rename 临时目录为最终目录。
 
 ---
 
@@ -412,7 +427,7 @@ a/b、kriging variance、framework probability 等方法专属字段只在 sidec
 ```
 === Unified Real-field LFM v3 ===
 Output: scripts/output/real_field_lfm_<timestamp>
-Variants: 3
+Variants: 2
 Status: ok
 ```
 

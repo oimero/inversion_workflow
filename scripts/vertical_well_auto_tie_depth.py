@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -341,6 +342,8 @@ def run_auto_tie(
     search_params: dict[str, Any],
     wavelet_scaling_params: dict[str, Any],
     target_crop_ms: float,
+    business_config: dict[str, Any],
+    input_contracts: dict[str, dict[str, str]],
     output: dict[str, Path],
 ) -> None:
     from wtie.modeling.modeling import ConvModeler
@@ -416,15 +419,20 @@ def run_auto_tie(
         "show_all_warnings": False,
     }
 
-    outputs = autotie.tie_v1(
-        inputs,
-        wavelet_extractor,
-        modeler,
-        wavelet_scaling_params,
-        search_params=search_params_full,
-        search_space=search_space,  # type: ignore
-        stretch_and_squeeze_params=None,  # type: ignore
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Wavelet has even number of samples; appending one zero sample\.",
+        )
+        outputs = autotie.tie_v1(
+            inputs,
+            wavelet_extractor,
+            modeler,
+            wavelet_scaling_params,
+            search_params=search_params_full,
+            search_space=search_space,  # type: ignore
+            stretch_and_squeeze_params=None,  # type: ignore
+        )
 
     raw_wavelet = outputs.wavelet
     raw_wavelet_df = pd.DataFrame({"time_s": raw_wavelet.basis, "amplitude": raw_wavelet.values})
@@ -496,13 +504,6 @@ def run_auto_tie(
         "cropped_synthetic_corr": cropped_corr,
         "cropped_synthetic_nmae": cropped_nmae,
     }
-    input_contracts = {
-        "well_preprocess": published_contract_reference(
-            las_dir.parent / "run_summary.json",
-            root=REPO_ROOT,
-            label=f"well preprocess run {las_dir.parent}",
-        )
-    }
     summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
     summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
         contract_schema_version="vertical_well_auto_tie_depth_v2",
@@ -512,7 +513,7 @@ def run_auto_tie(
             "depth_basis": "tvdss",
             "well_name": well_name,
         },
-        business_config=script_cfg,
+        business_config=business_config,
         input_contracts=input_contracts,
         primary_artifacts={
             "wavelet": output["wavelet_final_csv"],
@@ -678,6 +679,13 @@ def main() -> None:
     for p in [las_file, well_heads_file, seismic_file, tutorial_model, tutorial_params]:
         if not p.exists():
             raise FileNotFoundError(f"Missing input file: {p}")
+    input_contracts = {
+        "well_preprocess": published_contract_reference(
+            las_dir.parent / "run_summary.json",
+            root=REPO_ROOT,
+            label=f"well preprocess run {las_dir.parent}",
+        )
+    }
 
     # Output dir
     if args.output_dir is None:
@@ -768,6 +776,8 @@ def main() -> None:
         search_params=script_cfg["search_params"],
         wavelet_scaling_params=wavelet_scaling_params,
         target_crop_ms=target_crop_ms,
+        business_config=dict(script_cfg),
+        input_contracts=input_contracts,
         output=output,
     )
 

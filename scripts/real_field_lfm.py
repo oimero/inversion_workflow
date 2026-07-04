@@ -1,4 +1,11 @@
-"""Build explicit unified real-field LFM v3 variants from canonical well controls."""
+"""Build explicit unified real-field LFM v3 variants from canonical well controls.
+
+Usage::
+
+    python scripts/real_field_lfm.py
+    python scripts/real_field_lfm.py --config experiments/my_project.yaml
+    python scripts/real_field_lfm.py --output-dir scripts/output/lfm_test
+"""
 
 from __future__ import annotations
 

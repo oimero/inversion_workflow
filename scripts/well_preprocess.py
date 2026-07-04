@@ -24,10 +24,7 @@ import lasio
 import numpy as np
 import pandas as pd
 
-# =============================================================================
 # Bootstrap
-# =============================================================================
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -70,12 +67,7 @@ from cup.well.preprocess import (
 )
 from wtie.processing import grid
 
-
-# =============================================================================
 # CLI and config
-# =============================================================================
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -91,7 +83,6 @@ def parse_args() -> argparse.Namespace:
         help="Output directory. Defaults to <output_root>/well_preprocess_<timestamp>.",
     )
     return parser.parse_args()
-
 
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_preprocess") or {})
@@ -154,10 +145,8 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     }
     return script_cfg
 
-
 def _resolve_repo_path(value: str | Path) -> Path:
     return resolve_relative_path(value, root=REPO_ROOT)
-
 
 def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     if args.output_dir is not None:
@@ -165,7 +154,6 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return output_root / f"well_preprocess_{timestamp}"
-
 
 def _resolve_screen_dir(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
     source_runs = dict(script_cfg.get("source_runs") or {})
@@ -179,7 +167,6 @@ def _resolve_screen_dir(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path
         label="well_screen",
     )
 
-
 def _resolve_inputs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str, Path]:
     latest_dir = _resolve_screen_dir(cfg, script_cfg)
     return {
@@ -188,7 +175,6 @@ def _resolve_inputs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str
         "curve_inventory_file": latest_dir / "las_curve_inventory.csv",
         "classification_dir": latest_dir / "curve_classification",
     }
-
 
 def _load_range_overrides(script_cfg: dict[str, Any]) -> dict[str, Any]:
     outlier_cfg = dict(script_cfg.get("outliers") or {})
@@ -200,12 +186,7 @@ def _load_range_overrides(script_cfg: dict[str, Any]) -> dict[str, Any]:
         return {}
     return load_yaml_config(path)
 
-
-# =============================================================================
 # LAS helpers
-# =============================================================================
-
-
 @dataclass
 class RawCurve:
     well_name: str
@@ -219,7 +200,6 @@ class RawCurve:
     values: np.ndarray
     source_las: Path
     las_null_value: float | None
-
 
 @dataclass
 class CandidateCurve:
@@ -240,14 +220,12 @@ class CandidateCurve:
     final_valid_count: int = 0
     final_valid_fraction: float = 0.0
 
-
 def _curve_index(las: lasio.LASFile) -> tuple[dict[str, int], dict[str, list[int]]]:
     by_exact = {exact_mnemonic(curve.mnemonic): index for index, curve in enumerate(las.curves)}
     by_norm: dict[str, list[int]] = {}
     for index, curve in enumerate(las.curves):
         by_norm.setdefault(normalize_mnemonic(curve.mnemonic), []).append(index)
     return by_exact, by_norm
-
 
 def _resolve_curve_index(by_exact: Mapping[str, int], by_norm: Mapping[str, list[int]], mnemonic: str) -> int | None:
     exact = exact_mnemonic(mnemonic)
@@ -257,7 +235,6 @@ def _resolve_curve_index(by_exact: Mapping[str, int], by_norm: Mapping[str, list
     if candidates:
         return int(candidates[0])
     return None
-
 
 def _load_raw_curves_for_well(
     *,
@@ -305,7 +282,6 @@ def _load_raw_curves_for_well(
     raw.sort(key=lambda curve: (curve.category, not curve.is_step2_primary, curve.index))
     return raw
 
-
 def _build_preprocessed_curve_set(
     well_name: str,
     curves: Sequence[CandidateCurve],
@@ -338,18 +314,12 @@ def _build_preprocessed_curve_set(
     )
     return curve_set
 
-
-# =============================================================================
 # Preprocess orchestration
-# =============================================================================
-
-
 def _min_run_length(category: str, constant_cfg: Mapping[str, Any]) -> int:
     by_category = constant_cfg.get("min_run_length_by_category", {})
     if isinstance(by_category, Mapping) and category in by_category:
         return int(by_category[category])
     return int(constant_cfg.get("min_run_length", 8))
-
 
 def _prepare_candidate(
     raw: RawCurve,
@@ -433,7 +403,6 @@ def _prepare_candidate(
         )
     return candidate
 
-
 def _candidate_summary_row(candidate: CandidateCurve) -> dict[str, Any]:
     final_values = candidate.final_values if candidate.final_values is not None else candidate.after_constant_values
     stats = finite_stats(final_values)
@@ -464,7 +433,6 @@ def _candidate_summary_row(candidate: CandidateCurve) -> dict[str, Any]:
         "final_p01": stats["p01"],
         "final_p99": stats["p99"],
     }
-
 
 def run_preprocess(
     *,
@@ -830,11 +798,9 @@ def run_preprocess(
     write_json(paths["run_summary_json"], summary)
     return {"paths": paths, "summary": summary}
 
-
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], columns: Sequence[str] | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame.from_records(rows, columns=columns).to_csv(path, index=False, encoding="utf-8")
-
 
 def main() -> None:
     args = parse_args()
@@ -865,7 +831,6 @@ def main() -> None:
         f"{summary['preprocess_status_counts'].get('failed', 0)} failed, "
         f"{summary['exported_las_count']} LAS exported."
     )
-
 
 if __name__ == "__main__":
     main()

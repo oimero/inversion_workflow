@@ -20,10 +20,7 @@ from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
-# =============================================================================
 # Bootstrap
-# =============================================================================
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -54,12 +51,7 @@ from cup.well.curves import (
 from cup.well.las import export_selected_curves_to_las, scan_las_curves
 from cup.well.mnemonics import CURVE_CATEGORY_MNEMONICS, CURVE_CATEGORY_PRIORITY
 
-
-# =============================================================================
 # CLI
-# =============================================================================
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -76,12 +68,7 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
-# =============================================================================
 # Config
-# =============================================================================
-
-
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_screen") or {})
     source_runs = dict(script_cfg.get("source_runs") or {})
@@ -96,14 +83,11 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg["classification"] = classification
     return script_cfg
 
-
 def _resolve_data_path(value: str | Path, *, data_root: Path) -> Path:
     return resolve_relative_path(value, root=data_root)
 
-
 def _resolve_repo_path(value: str | Path) -> Path:
     return resolve_relative_path(value, root=REPO_ROOT)
-
 
 def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     if args.output_dir is not None:
@@ -111,7 +95,6 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return output_root / f"well_screen_{timestamp}"
-
 
 def _resolve_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
     source_runs = dict(script_cfg.get("source_runs") or {})
@@ -125,7 +108,6 @@ def _resolve_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> 
         label="well_inventory",
     )
     return inventory_dir / "well_inventory.csv"
-
 
 def _load_curve_schema(schema_file: str | Path | None) -> Mapping[str, Sequence[str]]:
     if schema_file is None:
@@ -148,7 +130,6 @@ def _load_curve_schema(schema_file: str | Path | None) -> Mapping[str, Sequence[
         schema[str(category)] = [str(item) for item in mnemonics]
     return schema
 
-
 def _load_overrides(override_file: str | Path | None) -> dict[str, Any]:
     if override_file is None:
         return {}
@@ -157,12 +138,7 @@ def _load_overrides(override_file: str | Path | None) -> dict[str, Any]:
         raise FileNotFoundError(f"Curve override file does not exist: {path}")
     return load_yaml_config(path)
 
-
-# =============================================================================
 # Inventory filtering
-# =============================================================================
-
-
 def _candidate_inventory_rows(
     inventory_df: pd.DataFrame,
     *,
@@ -182,7 +158,6 @@ def _candidate_inventory_rows(
     )
     return inventory_df.loc[mask].copy()
 
-
 def _well_screen_row(selection: CurveSelection) -> dict[str, Any]:
     exported_las = selection.exported_las or ""
     return {
@@ -199,7 +174,6 @@ def _well_screen_row(selection: CurveSelection) -> dict[str, Any]:
         "exported_las": exported_las,
         "reasons": ";".join(selection.reasons),
     }
-
 
 def _write_classification_json(output_file: Path, *, header: Any, selection: CurveSelection) -> None:
     payload = {
@@ -227,10 +201,8 @@ def _write_classification_json(output_file: Path, *, header: Any, selection: Cur
     }
     write_json(output_file, payload)
 
-
 def _empty_skipped_curves_columns() -> list[str]:
     return ["well_name", "mnemonic", "category", "reason"]
-
 
 def _exported_contains_required(
     *,
@@ -251,7 +223,6 @@ def _exported_contains_required(
             continue
         missing.append(category)
     return not missing, missing
-
 
 def run_screening(
     *,
@@ -441,7 +412,6 @@ def run_screening(
     write_json(paths["run_summary_json"], summary)
     return {"paths": paths, "summary": summary}
 
-
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
@@ -481,7 +451,6 @@ def main() -> None:
         f"{summary['screen_status_counts'].get('failed', 0)} failed, "
         f"{summary['exported_las_count']} LAS exported."
     )
-
 
 if __name__ == "__main__":
     main()

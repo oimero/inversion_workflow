@@ -20,10 +20,7 @@ from typing import Any
 
 import pandas as pd
 
-# =============================================================================
 # Bootstrap
-# =============================================================================
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -56,12 +53,7 @@ from cup.well.assets import (
     value_counts,
 )
 
-
-# =============================================================================
 # CLI
-# =============================================================================
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -78,15 +70,9 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
-# =============================================================================
 # Config and paths
-# =============================================================================
-
-
 def _resolve_data_path(value: str | Path, *, data_root: Path) -> Path:
     return resolve_relative_path(value, root=data_root)
-
 
 def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     if args.output_dir is not None:
@@ -94,7 +80,6 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     output_root = resolve_relative_path(str(cfg.get("output_root", "scripts/output")), root=REPO_ROOT)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return output_root / f"well_inventory_{timestamp}"
-
 
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_inventory") or {})
@@ -106,12 +91,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg["spatial_qc"] = spatial_qc
     return script_cfg
 
-
-# =============================================================================
 # Inventory
-# =============================================================================
-
-
 def _load_asset_lookups(
     *,
     well_heads_file: Path,
@@ -143,14 +123,12 @@ def _load_asset_lookups(
 
     return well_heads_df, las_lookup, trace_lookup, time_depth_lookup, tops_lookup
 
-
 def _head_lookup(well_heads_df: pd.DataFrame) -> dict[str, WellHead]:
     lookup: dict[str, WellHead] = {}
     for _, row in well_heads_df.iterrows():
         head = WellHead.from_petrel_row(row)
         lookup[normalize_well_name(head.well_name)] = head
     return lookup
-
 
 def _record_reasons_for_assets(
     record: WellInventoryRecord,
@@ -166,7 +144,6 @@ def _record_reasons_for_assets(
         record.reasons.append("no_time_depth")
     if not has_well_tops:
         record.reasons.append("no_well_tops")
-
 
 def _classify_survey_position(
     record: WellInventoryRecord,
@@ -204,7 +181,6 @@ def _classify_survey_position(
         else:
             record.survey_position = "outside"
             record.reasons.append("outside_survey")
-
 
 def build_inventory(
     *,
@@ -311,7 +287,6 @@ def build_inventory(
     }
     return WellInventory(records=records, neighbor_pairs=neighbor_pairs, cluster_rows=cluster_rows, summary=summary)
 
-
 def _write_outputs(inventory: WellInventory, output_dir: Path, run_summary: dict[str, Any]) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=False)
     paths = {
@@ -343,12 +318,7 @@ def _write_outputs(inventory: WellInventory, output_dir: Path, run_summary: dict
     write_json(paths["run_summary_json"], run_summary)
     return paths
 
-
-# =============================================================================
 # Main
-# =============================================================================
-
-
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
@@ -434,7 +404,6 @@ def main() -> None:
         f"{inventory.summary['neighbor_summary']['exported_neighbor_pair_count']} exported same-trace conflicts, "
         f"{inventory.summary['neighbor_summary']['platform_cluster_count']} platform clusters."
     )
-
 
 if __name__ == "__main__":
     main()

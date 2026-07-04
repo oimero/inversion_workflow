@@ -26,10 +26,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-# =============================================================================
 # Bootstrap
-# =============================================================================
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -57,7 +54,6 @@ matplotlib.use("Agg")
 plt.rcParams["figure.dpi"] = 120
 pd.set_option("display.max_columns", 30)
 
-
 def _save_fig(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -68,12 +64,7 @@ def _save_fig(path: Path) -> None:
     plt.close()
     print(f"Saved {path}")
 
-
-# =============================================================================
 # CLI
-# =============================================================================
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -95,7 +86,6 @@ def parse_args() -> argparse.Namespace:
         help="Output directory. Defaults to scripts/output/vertical_well_auto_tie_depth_<timestamp>.",
     )
     return parser.parse_args()
-
 
 def build_output_tree(output_dir: Path, well_name: str) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -125,12 +115,7 @@ def build_output_tree(output_dir: Path, well_name: str) -> dict[str, Path]:
         "fig_05_wavelet_raw_vs_cropped": dirs["figures"] / f"qc_05_wavelet_raw_vs_cropped_{safe}.png",
     }
 
-
-# =============================================================================
 # JSON serialization
-# =============================================================================
-
-
 def to_jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): to_jsonable(item) for key, item in value.items()}
@@ -146,12 +131,7 @@ def to_jsonable(value: Any) -> Any:
         return bool(value)
     return value
 
-
-# =============================================================================
 # Auto-tie utilities
-# =============================================================================
-
-
 def build_auto_tie_search_space(config: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
@@ -182,12 +162,7 @@ def build_auto_tie_search_space(config: dict[str, Any]) -> list[dict[str, Any]]:
         },
     ]
 
-
-# =============================================================================
 # Depth / TWT conversion
-# =============================================================================
-
-
 def load_interpolated_standard_vp_rho(las_file: Path) -> "LogSet":
     """Adapt current DT_USM/RHO_GCC LAS files to the legacy all-gap-filled path."""
     from cup.well.las import load_standard_vp_rho_logs
@@ -204,7 +179,6 @@ def load_interpolated_standard_vp_rho(las_file: Path) -> "LogSet":
             "Rho": grid.Log(rho, md, "md", name="Rho", unit="g/cm3", allow_nan=False),
         }
     )
-
 
 def depth_trace_to_twt(
     depth_tvdss: np.ndarray,
@@ -231,7 +205,6 @@ def depth_trace_to_twt(
     amp_t = np.interp(twt_regular, twt_z, amp_z)
     return Seismic(amp_t, twt_regular, "twt", name="Depth-derived seismic")
 
-
 def clip_logset_by_md(
     logset: "LogSet",
     md_min: float,
@@ -254,12 +227,7 @@ def clip_logset_by_md(
         )
     return LogSet(logs)
 
-
-# =============================================================================
 # Wavelet post-processing
-# =============================================================================
-
-
 def crop_wavelet_center_energy_normalize(
     wavelet: "Wavelet",
     target_ms: float,
@@ -300,7 +268,6 @@ def crop_wavelet_center_energy_normalize(
     }
     return cropped, info
 
-
 def scaled_synthetic_for_qc(
     modeler: "ConvModeler",
     wavelet: "Wavelet",
@@ -320,12 +287,7 @@ def scaled_synthetic_for_qc(
     nmae = float(np.sum(np.abs(seis_norm - synthetic)) / np.sum(np.abs(seis_norm)))
     return synthetic, scale, corr, nmae
 
-
-# =============================================================================
 # Core logic
-# =============================================================================
-
-
 def run_auto_tie(
     *,
     well_name: str,
@@ -635,12 +597,7 @@ def run_auto_tie(
             print(f"  {key}: {value}")
     print(f"  objective means: {best_objective_means}")
 
-
-# =============================================================================
 # Main
-# =============================================================================
-
-
 def main() -> None:
     args = parse_args()
 
@@ -787,7 +744,6 @@ def main() -> None:
     for key, path in output.items():
         if key != "root" and path.exists():
             print(f"  {path}")
-
 
 if __name__ == "__main__":
     main()

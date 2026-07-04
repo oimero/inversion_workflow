@@ -1,4 +1,12 @@
-"""Run R1 fixed forward diagnostics for R0 real-field zero-shot outputs."""
+"""Run R1 fixed forward diagnostics for R0 real-field zero-shot outputs.
+
+Usage::
+
+    python scripts/real_field_forward_diagnostic.py
+    python scripts/real_field_forward_diagnostic.py --config experiments/common/common.yaml
+    python scripts/real_field_forward_diagnostic.py --zero-shot-dir scripts/output/real_field_zero_shot_<timestamp>
+    python scripts/real_field_forward_diagnostic.py --output-dir scripts/output/real_field_forward_diagnostic_test
+"""
 
 from __future__ import annotations
 

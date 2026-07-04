@@ -27,10 +27,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-# =============================================================================
 # Bootstrap
-# =============================================================================
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -54,7 +51,6 @@ matplotlib.use("Agg")
 plt.rcParams["figure.dpi"] = 120
 pd.set_option("display.max_columns", 80)
 
-
 def _save_fig(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -65,12 +61,7 @@ def _save_fig(path: Path) -> None:
     plt.close()
     print(f"Saved {path}")
 
-
-# =============================================================================
 # CLI
-# =============================================================================
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -93,12 +84,7 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
-# =============================================================================
 # Depth / TWT conversion
-# =============================================================================
-
-
 def load_interpolated_standard_vp_rho(las_file: Path):
     """Adapt current DT_USM/RHO_GCC LAS files to the legacy all-gap-filled path."""
     from cup.well.las import load_standard_vp_rho_logs
@@ -116,7 +102,6 @@ def load_interpolated_standard_vp_rho(las_file: Path):
         }
     )
 
-
 def zscore_trace(values: np.ndarray) -> np.ndarray:
     """Legacy whole-trace z-score used by this one-off script."""
     from wtie.processing.logs import interpolate_nans
@@ -126,7 +111,6 @@ def zscore_trace(values: np.ndarray) -> np.ndarray:
     if not np.isfinite(scale) or scale <= 0.0:
         raise ValueError("Trace has non-positive standard deviation.")
     return (finite - float(np.mean(finite))) / scale
-
 
 def depth_curve_to_twt(
     depth_tvdss: np.ndarray,
@@ -152,12 +136,7 @@ def depth_curve_to_twt(
     values_t = np.interp(twt_regular, twt_z, values_z)
     return twt_regular, values_t
 
-
-# =============================================================================
 # Synthetic metrics
-# =============================================================================
-
-
 def least_squares_scale(seismic_norm: np.ndarray, synthetic_raw: np.ndarray, mask: np.ndarray) -> float:
     s = seismic_norm[mask]
     y = synthetic_raw[mask]
@@ -165,7 +144,6 @@ def least_squares_scale(seismic_norm: np.ndarray, synthetic_raw: np.ndarray, mas
     if denom <= 1e-12:
         return np.nan
     return float(np.dot(s, y) / denom)
-
 
 def metrics_for_synthetic(
     seismic_norm: np.ndarray,
@@ -204,7 +182,6 @@ def metrics_for_synthetic(
         "n_score_samples": int(mask.sum()),
     }
 
-
 def evaluate_shift(
     *,
     twt_s: np.ndarray,
@@ -226,12 +203,7 @@ def evaluate_shift(
         "synthetic_raw": synthetic_raw,
     }
 
-
-# =============================================================================
 # Depth shift
-# =============================================================================
-
-
 def compute_depth_shift_curve(tdt_df: pd.DataFrame, twt_s: np.ndarray, shift_s: float) -> pd.DataFrame:
     tdt_t = tdt_df["twt_s"].to_numpy(dtype=float)
     tdt_z = tdt_df["tvdss_m"].to_numpy(dtype=float)
@@ -243,7 +215,6 @@ def compute_depth_shift_curve(tdt_df: pd.DataFrame, twt_s: np.ndarray, shift_s: 
     z1 = np.interp(shifted_t[valid], tdt_t, tdt_z)
     return pd.DataFrame({"twt_s": twt_s[valid], "tvdss_m": z0, "depth_shift_m": z1 - z0})
 
-
 def _true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
     mask = np.asarray(mask, dtype=bool).reshape(-1)
     if mask.size == 0:
@@ -252,14 +223,12 @@ def _true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
     changes = np.flatnonzero(padded[1:] != padded[:-1])
     return [(int(start), int(stop)) for start, stop in zip(changes[0::2], changes[1::2])]
 
-
 def _source_null_value(las: Any, default: float = -999.25) -> float:
     try:
         value = float(las.well["NULL"].value)
     except Exception:
         return float(default)
     return value if np.isfinite(value) else float(default)
-
 
 def _finite_curve_values(values: np.ndarray, null_value: float) -> tuple[np.ndarray, np.ndarray]:
     out = np.asarray(values, dtype=float).copy()
@@ -268,7 +237,6 @@ def _finite_curve_values(values: np.ndarray, null_value: float) -> tuple[np.ndar
         invalid |= np.isclose(out, null_value, rtol=0.0, atol=1e-9)
     out[invalid] = np.nan
     return out, ~invalid
-
 
 def _depth_shift_at_tvdss(
     tvdss_m: np.ndarray,
@@ -314,7 +282,6 @@ def _depth_shift_at_tvdss(
     }
     return depth_shift_at_log, stats
 
-
 def _regular_md_from_shifted(
     source_md_m: np.ndarray,
     shifted_md_m: np.ndarray,
@@ -339,7 +306,6 @@ def _regular_md_from_shifted(
         md_step_m,
     )
     return regular_md, md_step_m
-
 
 def _interpolate_curve_preserving_gaps(
     shifted_md_m: np.ndarray,
@@ -382,14 +348,12 @@ def _interpolate_curve_preserving_gaps(
         raise ValueError(f"Curve {curve_name} has too few finite shifted output samples.")
     return out
 
-
 def _curve_index_by_mnemonic(las: Any, mnemonic: str) -> int | None:
     target = mnemonic.strip().casefold()
     for idx, curve in enumerate(las.curves):
         if str(curve.mnemonic).strip().casefold() == target:
             return idx
     return None
-
 
 def _append_las_curve_with_nulls(
     las: Any,
@@ -403,7 +367,6 @@ def _append_las_curve_with_nulls(
     out = np.asarray(values, dtype=float).copy()
     out[~np.isfinite(out)] = float(null_value)
     las.append_curve(str(mnemonic), out, unit=str(unit or ""), descr=str(descr or mnemonic))
-
 
 def export_shifted_preprocessed_las(
     source_las: Path,
@@ -523,7 +486,6 @@ def export_shifted_preprocessed_las(
     }
     return output_las, stats
 
-
 def build_shifted_filtered_logset_for_export(
     filtered_logset_md: Any,
     *,
@@ -576,7 +538,6 @@ def build_shifted_filtered_logset_for_export(
         stats,
     )
 
-
 def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
@@ -588,7 +549,6 @@ def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
     if float(np.std(aa)) <= 0.0 or float(np.std(bb)) <= 0.0:
         return np.nan
     return float(np.corrcoef(aa, bb)[0, 1])
-
 
 def save_r1_style_synthetic_qc(
     *,
@@ -676,12 +636,7 @@ def save_r1_style_synthetic_qc(
     print(f"Saved {output_path}")
     return output_path
 
-
-# =============================================================================
 # Single-well processor
-# =============================================================================
-
-
 def process_well(
     well_name: str,
     *,
@@ -922,12 +877,7 @@ def process_well(
     )
     return row
 
-
-# =============================================================================
 # Main
-# =============================================================================
-
-
 def main() -> None:
     args = parse_args()
 
@@ -1351,7 +1301,6 @@ def main() -> None:
             f"{row.well_name}: {row.error}" for row in failed.itertuples(index=False)
         )
         raise RuntimeError(f"Depth batch completed with failed wells: {details}")
-
 
 if __name__ == "__main__":
     main()

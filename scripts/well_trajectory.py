@@ -22,10 +22,7 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 
-# =============================================================================
 # Bootstrap
-# =============================================================================
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -49,12 +46,7 @@ from cup.utils.io import (
 from cup.well.assets import build_file_lookup, normalize_well_name
 from cup.well.trajectory import WellTrajectory, trajectory_summary, z_tvd_residual_m
 
-
-# =============================================================================
 # CLI and config
-# =============================================================================
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -70,7 +62,6 @@ def parse_args() -> argparse.Namespace:
         help="Output directory. Defaults to <output_root>/well_trajectory_<timestamp>.",
     )
     return parser.parse_args()
-
 
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_trajectory") or {})
@@ -90,14 +81,11 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     merge_dict_defaults(script_cfg, "output", {"write_trajectory_points": True})
     return script_cfg
 
-
 def _resolve_repo_path(value: str | Path) -> Path:
     return resolve_relative_path(value, root=REPO_ROOT)
 
-
 def _resolve_data_path(value: str | Path, *, data_root: Path) -> Path:
     return resolve_relative_path(value, root=data_root)
-
 
 def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     if args.output_dir is not None:
@@ -105,7 +93,6 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return output_root / f"well_trajectory_{timestamp}"
-
 
 def _resolve_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> Path:
     source_runs = dict(script_cfg.get("source_runs") or {})
@@ -120,12 +107,7 @@ def _resolve_inventory_file(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> 
     )
     return inventory_dir / "well_inventory.csv"
 
-
-# =============================================================================
 # Survey helpers
-# =============================================================================
-
-
 @dataclass(frozen=True)
 class SurveyPointQc:
     inline_float: float | None
@@ -133,7 +115,6 @@ class SurveyPointQc:
     nearest_inline: float | None
     nearest_xline: float | None
     survey_position: str
-
 
 def _classify_point_survey_position(x: float, y: float, *, survey: Any, geometry: dict[str, Any]) -> SurveyPointQc:
     try:
@@ -148,7 +129,6 @@ def _classify_point_survey_position(x: float, y: float, *, survey: Any, geometry
         nearest_xline=survey.line_geometry.snap_xline(float(xline_float)),
         survey_position="inside",
     )
-
 
 def _trajectory_point_qc(trajectory: WellTrajectory, *, survey: Any | None, geometry: dict[str, Any] | None) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
@@ -187,12 +167,7 @@ def _trajectory_point_qc(trajectory: WellTrajectory, *, survey: Any | None, geom
         )
     return pd.DataFrame.from_records(rows, columns=TRAJECTORY_POINT_COLUMNS)
 
-
-# =============================================================================
 # QC logic
-# =============================================================================
-
-
 MAIN_COLUMNS = [
     "well_name",
     "trajectory_file",
@@ -247,7 +222,6 @@ TRAJECTORY_POINT_COLUMNS = [
     "survey_position",
 ]
 
-
 def _classify_wellbore_from_trajectory(
     max_horizontal_offset_m: float | None,
     *,
@@ -262,7 +236,6 @@ def _classify_wellbore_from_trajectory(
         return "deviated"
     return "unknown"
 
-
 def _status_from_flags(*, hard_reasons: Sequence[str], qc_flags: Sequence[str]) -> str:
     if hard_reasons:
         return "failed"
@@ -270,10 +243,8 @@ def _status_from_flags(*, hard_reasons: Sequence[str], qc_flags: Sequence[str]) 
         return "warning"
     return "passed"
 
-
 def _joined(values: Sequence[str]) -> str:
     return ";".join(values)
-
 
 def _base_missing_row(well_name: str, wellbore_class_initial: str, trace_path: Path | None, status: str, reasons: Sequence[str]) -> dict[str, Any]:
     row = {column: None for column in MAIN_COLUMNS}
@@ -290,7 +261,6 @@ def _base_missing_row(well_name: str, wellbore_class_initial: str, trace_path: P
         }
     )
     return row
-
 
 def _qc_inventory_consistency(
     trajectory: WellTrajectory,
@@ -323,7 +293,6 @@ def _qc_inventory_consistency(
         flags.append("invalid_required_rows_dropped")
 
     return flags
-
 
 def _build_success_row(
     *,
@@ -384,7 +353,6 @@ def _build_success_row(
     )
     return row
 
-
 def _failed_report_rows(main_rows: Sequence[dict[str, Any]]) -> pd.DataFrame:
     rows = [
         {
@@ -399,7 +367,6 @@ def _failed_report_rows(main_rows: Sequence[dict[str, Any]]) -> pd.DataFrame:
     ]
     return pd.DataFrame.from_records(rows, columns=FAILED_COLUMNS)
 
-
 def _value_counts(rows: Sequence[dict[str, Any]], key: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     for row in rows:
@@ -407,12 +374,7 @@ def _value_counts(rows: Sequence[dict[str, Any]], key: str) -> dict[str, int]:
         counts[value] = counts.get(value, 0) + 1
     return counts
 
-
-# =============================================================================
 # Main workflow
-# =============================================================================
-
-
 def run_trajectory(
     *,
     inventory_df: pd.DataFrame,
@@ -506,7 +468,6 @@ def run_trajectory(
     }
     return main_df, failed_df, summary
 
-
 def main() -> None:
     args = parse_args()
     cfg = load_yaml_config(args.config, base_dir=REPO_ROOT)
@@ -593,7 +554,6 @@ def main() -> None:
         f"Wrote trajectory QC for {len(main_df)} wells to {repo_relative_path(output_dir, root=REPO_ROOT)} "
         f"({summary['trajectory_status_counts']})."
     )
-
 
 if __name__ == "__main__":
     main()

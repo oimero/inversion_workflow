@@ -1,4 +1,13 @@
-"""Run R0 real-field zero-shot prediction for frozen GINN-v2 candidates."""
+"""Run R0 real-field zero-shot prediction for frozen GINN-v2 candidates.
+
+Usage::
+
+    python scripts/real_field_zero_shot.py
+    python scripts/real_field_zero_shot.py --config experiments/common/common.yaml
+    python scripts/real_field_zero_shot.py --device cuda
+    python scripts/real_field_zero_shot.py --stitch-strategy center_crop
+    python scripts/real_field_zero_shot.py --output-dir scripts/output/real_field_zero_shot_test
+"""
 
 from __future__ import annotations
 

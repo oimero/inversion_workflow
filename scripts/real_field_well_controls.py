@@ -1,4 +1,11 @@
-"""Prepare canonical real-field WellControlSet artifacts for every LFM variant."""
+"""Prepare canonical real-field WellControlSet artifacts for every LFM variant.
+
+Usage::
+
+    python scripts/real_field_well_controls.py
+    python scripts/real_field_well_controls.py --config experiments/my_project.yaml
+    python scripts/real_field_well_controls.py --output-dir scripts/output/well_controls_test
+"""
 
 from __future__ import annotations
 

@@ -9,12 +9,11 @@
 2. from __future__ import annotations
 3. 标准库与第三方依赖
 4. SCRIPT_DIR / REPO_ROOT / SRC_DIR bootstrap
-5. 模块级常量（SCHEMA_VERSION 等）
-6. cup 与 wtie 导入
-7. parse_args()
-8. 输入和输出路径解析（_resolve_output_dir helper）
-9. main()
-10. if __name__ == "__main__": main()
+5. cup 与 wtie 导入
+6. parse_args()
+7. 输入和输出路径解析（_resolve_output_dir helper）
+8. main()
+9. if __name__ == "__main__": main()
 ```
 
 其中：

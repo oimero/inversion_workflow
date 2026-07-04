@@ -29,10 +29,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-# =============================================================================
 # Bootstrap
-# =============================================================================
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -81,19 +78,13 @@ from cup.well.trajectory import WellTrajectory, sample_trajectory_on_twt
 from cup.seismic.wavelet import crop_wavelet_center_energy_normalize
 from wtie.processing import grid
 
-
-# =============================================================================
 # CLI and config
-# =============================================================================
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("experiments/common/common.yaml"))
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--well", type=str, default=None, help="Optional single well execution filter.")
     return parser.parse_args()
-
 
 def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     script_cfg = dict(cfg.get("well_auto_tie") or {})
@@ -166,14 +157,11 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     )
     return script_cfg
 
-
 def _resolve_repo_path(value: str | Path) -> Path:
     return resolve_relative_path(value, root=REPO_ROOT)
 
-
 def _resolve_data_path(value: str | Path, *, data_root: Path) -> Path:
     return resolve_relative_path(value, root=data_root)
-
 
 def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     if args.output_dir is not None:
@@ -181,7 +169,6 @@ def _resolve_output_dir(args: argparse.Namespace, cfg: dict[str, Any]) -> Path:
     output_root = _resolve_repo_path(str(cfg.get("output_root", "scripts/output")))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return output_root / f"well_auto_tie_{timestamp}"
-
 
 def _resolve_inputs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str, Path | None]:
     source_runs = dict(script_cfg.get("source_runs") or {})
@@ -250,12 +237,10 @@ def _resolve_inputs(cfg: dict[str, Any], script_cfg: dict[str, Any]) -> dict[str
         ),
     }
 
-
 def _series_value_counts(series: pd.Series) -> dict[str, int]:
     if series.empty:
         return {}
     return {str(key): int(value) for key, value in series.value_counts(dropna=False).sort_index().items()}
-
 
 def _load_anchor_config(anchor_cfg: dict[str, Any]) -> dict[str, Any]:
     config = {"default": {}, "wells": {}}
@@ -272,7 +257,6 @@ def _load_anchor_config(anchor_cfg: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("coarse_correction.anchor config_file requires default.well_top and default.horizon.")
     return config
 
-
 def _anchor_spec_for_well(anchor_config: dict[str, Any], well_name: str) -> dict[str, Any]:
     spec = dict(anchor_config.get("default") or {})
     wells = dict(anchor_config.get("wells") or {})
@@ -283,13 +267,11 @@ def _anchor_spec_for_well(anchor_config: dict[str, Any], well_name: str) -> dict
     spec.setdefault("twt_unit", "auto")
     return spec
 
-
 def _anchor_enabled_for_route(config: dict[str, Any], route: str) -> bool:
     anchor_cfg = dict(config["coarse_correction"].get("anchor") or {})
     if not as_bool(anchor_cfg.get("enabled", False)):
         return False
     return str(route) in {str(value) for value in anchor_cfg.get("apply_to_routes") or []}
-
 
 def _load_manual_shift_config(manual_cfg: dict[str, Any]) -> dict[str, Any]:
     config = {
@@ -310,7 +292,6 @@ def _load_manual_shift_config(manual_cfg: dict[str, Any]) -> dict[str, Any]:
             config["wells_ms"].update(dict(shifts.get("wells_ms") or {}))
     return config
 
-
 def _manual_shift_seconds(manual_shift_config: dict[str, Any], *, route: str, well_name: str) -> float:
     shift_ms = float(manual_shift_config.get("default_ms", 0.0) or 0.0)
     by_route = dict(manual_shift_config.get("by_route_ms") or {})
@@ -323,7 +304,6 @@ def _manual_shift_seconds(manual_shift_config: dict[str, Any], *, route: str, we
             break
     return shift_ms / 1000.0
 
-
 def _shift_time_depth_table(table: grid.TimeDepthTable, shift_s: float) -> grid.TimeDepthTable:
     shift = float(shift_s)
     if abs(shift) <= 1e-12:
@@ -331,7 +311,6 @@ def _shift_time_depth_table(table: grid.TimeDepthTable, shift_s: float) -> grid.
     if table.is_md_domain:
         return grid.TimeDepthTable(twt=np.asarray(table.twt, dtype=np.float64) + shift, md=np.asarray(table.md, dtype=np.float64))
     return grid.TimeDepthTable(twt=np.asarray(table.twt, dtype=np.float64) + shift, tvdss=np.asarray(table.tvdss, dtype=np.float64))
-
 
 def _anchor_position_for_plan(
     *,
@@ -345,7 +324,6 @@ def _anchor_position_for_plan(
     if plan.surface_x is None or plan.surface_y is None:
         raise ValueError("Plan has no valid surface XY for anchor sampling.")
     return float(plan.surface_x), float(plan.surface_y), "surface_xy"
-
 
 def _sample_anchor_for_plan(
     *,
@@ -388,7 +366,6 @@ def _sample_anchor_for_plan(
         "horizon_nearest_xline": float(horizon_sample["nearest_xline"]),
     }
 
-
 def _coarse_report(*, anchor_shift_s: float, manual_shift_s: float, anchor_info: dict[str, Any] | None) -> dict[str, Any]:
     total_shift_s = float(anchor_shift_s) + float(manual_shift_s)
     return {
@@ -399,12 +376,10 @@ def _coarse_report(*, anchor_shift_s: float, manual_shift_s: float, anchor_info:
         "coarse_manual_applied": bool(abs(float(manual_shift_s)) > 1e-12),
     }
 
-
 def _with_report(prepared: PreparedTieWindow, values: dict[str, Any]) -> PreparedTieWindow:
     report = dict(prepared.report)
     report.update(values)
     return replace(prepared, report=report)
-
 
 def _apply_coarse_correction_to_existing_tdt(
     *,
@@ -456,13 +431,11 @@ def _apply_coarse_correction_to_existing_tdt(
         anchor_info=anchor_info,
     ), anchor_info
 
-
 def _load_horizon_surface(path: Path, cache: dict[str, HorizonSurface]) -> HorizonSurface:
     key = str(path.resolve())
     if key not in cache:
         cache[key] = HorizonSurface.from_petrel_dataframe(import_interpretation_petrel(path), name=path.name)
     return cache[key]
-
 
 class RerouteToAnchor(Exception):
     """Signal that a TDT route should be executed with the anchor route."""
@@ -472,7 +445,6 @@ class RerouteToAnchor(Exception):
         self.reason = reason
         self.target_window = target_window
 
-
 def _target_horizon_path(value: str, *, data_root: Path) -> Path:
     text = str(value).strip()
     if not text:
@@ -481,11 +453,9 @@ def _target_horizon_path(value: str, *, data_root: Path) -> Path:
         text = f"interpre/{text}"
     return _resolve_data_path(text, data_root=data_root)
 
-
 def _target_horizon_name(value: str) -> str:
     text = str(value).strip()
     return Path(text).name if ("/" in text or "\\" in text) else text
-
 
 def _target_horizon_spec(config: dict[str, Any], side: str) -> tuple[str, str]:
     """Return horizon path-like value and display name for the target window."""
@@ -496,7 +466,6 @@ def _target_horizon_spec(config: dict[str, Any], side: str) -> tuple[str, str]:
         raise ValueError(f"target_interval.{horizon_key} is required.")
 
     return str(value), _target_horizon_name(str(value))
-
 
 def _target_tie_window_for_plan(
     *,
@@ -541,7 +510,6 @@ def _target_tie_window_for_plan(
         top_nearest_line_distance=float(top_sample["nearest_line_distance"]),
         bottom_nearest_line_distance=float(bottom_sample["nearest_line_distance"]),
     )
-
 
 def _target_tie_window_for_trajectory(
     *,
@@ -644,12 +612,7 @@ def _target_tie_window_for_trajectory(
         bottom_nearest_line_distance=float(np.nanmax(bottom_distances)) if bottom_distances else None,
     )
 
-
-# =============================================================================
 # Output helpers
-# =============================================================================
-
-
 def _build_output_paths(output_dir: Path, well_name: str) -> dict[str, Path]:
     safe = sanitize_filename(well_name)
     figure_dir = output_dir / "figures" / safe
@@ -670,7 +633,6 @@ def _build_output_paths(output_dir: Path, well_name: str) -> dict[str, Path]:
         "fig_wavelet": figure_dir / "wavelet.png",
     }
 
-
 def _ensure_output_dirs(output_dir: Path) -> None:
     for name in [
         "wavelets",
@@ -684,7 +646,6 @@ def _ensure_output_dirs(output_dir: Path) -> None:
     ]:
         (output_dir / name).mkdir(parents=True, exist_ok=True)
 
-
 def _save_current_figure(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fig = plt.gcf()
@@ -696,7 +657,6 @@ def _save_current_figure(path: Path) -> None:
     fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
-
 def _compute_table_synthetic_metrics(logset_md: Any, seismic: Any, table: Any, wavelet: Any, modeler: Any, dt_s: float) -> tuple[float, float]:
     from wtie.optimize import tie as tie_ops
 
@@ -705,7 +665,6 @@ def _compute_table_synthetic_metrics(logset_md: Any, seismic: Any, table: Any, w
     seismic_match, reflectivity_match = tie_ops.match_seismic_and_reflectivity(seismic, reflectivity)
     _, _, corr, nmae, _ = scaled_synthetic_metrics(modeler, wavelet, reflectivity_match, seismic_match)
     return corr, nmae
-
 
 def _snap_seismic_sampling_if_close(seismic: Any, expected_dt_s: float, *, rtol: float = 1e-5) -> Any:
     """Rebuild a seismic trace with an exact dt when floating-point drift is negligible."""
@@ -724,13 +683,11 @@ def _snap_seismic_sampling_if_close(seismic: Any, expected_dt_s: float, *, rtol:
         theta=getattr(seismic, "theta", 0),
     )
 
-
 def _finite_float(value: Any, *, label: str) -> float:
     number = float(value)
     if not np.isfinite(number):
         raise ValueError(f"{label} must be finite.")
     return number
-
 
 def _md_tdt_to_vertical_petrel_tvdss_table(table: Any, *, kb_m: float) -> grid.TimeDepthTable:
     """Convert an MD-domain workflow TDT to the TVDSS-domain table expected by the Petrel exporter."""
@@ -743,7 +700,6 @@ def _md_tdt_to_vertical_petrel_tvdss_table(table: Any, *, kb_m: float) -> grid.T
     if np.any(tvdss < 0.0):
         raise ValueError("Petrel vertical checkshot export does not support samples above the KB datum.")
     return grid.TimeDepthTable(twt=np.asarray(table.twt, dtype=np.float64), tvdss=tvdss)
-
 
 def _export_petrel_checkshot_tdt(paths: dict[str, Path], plan: WellTiePlan, table: Any) -> Path:
     if plan.surface_x is None or plan.surface_y is None or plan.kb_m is None:
@@ -758,7 +714,6 @@ def _export_petrel_checkshot_tdt(paths: dict[str, Path], plan: WellTiePlan, tabl
         x=_finite_float(plan.surface_x, label="surface_x"),
         y=_finite_float(plan.surface_y, label="surface_y"),
     )
-
 
 def _write_optimized_trace_sample_plan(
     *,
@@ -785,7 +740,6 @@ def _write_optimized_trace_sample_plan(
     trace_plan = build_bilinear_trace_sample_plan(samples, survey)
     trace_plan.to_dataframe().to_csv(paths["optimized_trace_sample_plan"], index=False)
     return paths["optimized_trace_sample_plan"]
-
 
 def _filtered_standard_las_logset(
     logset_md: Any,
@@ -849,7 +803,6 @@ def _filtered_standard_las_logset(
         ),
     }
 
-
 def _export_filtered_las(
     paths: dict[str, Path],
     plan: WellTiePlan,
@@ -872,7 +825,6 @@ def _export_filtered_las(
         curve_names=["DT_USM", "RHO_GCC", "AI"],
         template_las=_resolve_repo_path(plan.input_las),
     )
-
 
 def _provisional_anchor_tdt_logset(standard: Any) -> tuple[grid.LogSet, int]:
     """Build a mapping-only continuous logset for anchor-based initial TDT construction."""
@@ -903,14 +855,12 @@ def _provisional_anchor_tdt_logset(standard: Any) -> tuple[grid.LogSet, int]:
         int(np.count_nonzero(~joint_valid)),
     )
 
-
 def _source_at_twt(rows: pd.DataFrame, twt_s: float) -> str:
     values = rows["twt_s"].to_numpy(dtype=np.float64)
     sources = rows["source"].astype(str).to_numpy(dtype=object)
     index = int(np.searchsorted(values, float(twt_s), side="left"))
     index = max(0, min(index, len(sources) - 1))
     return str(sources[index])
-
 
 def _clip_prepared_tie_window(
     prepared: PreparedTieWindow,
@@ -968,7 +918,6 @@ def _clip_prepared_tie_window(
     existing_reason = str(report.get("window_clip_reason") or "")
     report["window_clip_reason"] = ";".join([value for value in [existing_reason, clip_reason] if value])
     return PreparedTieWindow(table=clipped_table, logset_md=clipped_logset, table_rows=rows, report=report)
-
 
 def _write_qc_figures(
     paths: dict[str, Path],
@@ -1051,12 +1000,7 @@ def _write_qc_figures(
     axes[1].grid(True, alpha=0.25)
     _save_current_figure(paths["fig_wavelet"])
 
-
-# =============================================================================
 # Route execution
-# =============================================================================
-
-
 def _run_vertical_with_tdt(
     *,
     plan: WellTiePlan,
@@ -1136,7 +1080,6 @@ def _run_vertical_with_tdt(
             "anchor": anchor_info,
         },
     )
-
 
 def _run_vertical_anchor_from_tops(
     *,
@@ -1234,7 +1177,6 @@ def _run_vertical_anchor_from_tops(
             "coarse_correction": coarse_report,
         },
     )
-
 
 def _run_deviated_with_tdt(
     *,
@@ -1386,7 +1328,6 @@ def _run_deviated_with_tdt(
         optimized_trace_trajectory=trajectory,
     )
     return result, extra
-
 
 def _run_tie_with_initial_table(
     *,
@@ -1548,12 +1489,7 @@ def _run_tie_with_initial_table(
     )
     return result, extra
 
-
-# =============================================================================
 # Main
-# =============================================================================
-
-
 def _load_wavelet_extractor(model_path: Path, params_path: Path) -> Any:
     if not model_path.exists():
         raise FileNotFoundError(f"tutorial_model does not exist: {model_path}")
@@ -1564,7 +1500,6 @@ def _load_wavelet_extractor(model_path: Path, params_path: Path) -> Any:
     with params_path.open("r", encoding="utf-8") as fp:
         training_parameters = yaml.load(fp, Loader=yaml.Loader)
     return tutorial_mod.load_wavelet_extractor(training_parameters, model_path)
-
 
 def _write_wavelet_inventory(results: Sequence[WellTieResult], output_dir: Path) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
@@ -1601,7 +1536,6 @@ def _write_wavelet_inventory(results: Sequence[WellTieResult], output_dir: Path)
     wavelet_df = pd.DataFrame.from_records(rows, columns=columns)
     wavelet_df.to_csv(output_dir / "wavelet_inventory.csv", index=False)
     return wavelet_df
-
 
 def main() -> None:
     args = parse_args()
@@ -1964,7 +1898,6 @@ def main() -> None:
         f"Wrote auto-tie plan for {len(plan_df)} wells to {repo_relative_path(output_dir, root=REPO_ROOT)}; "
         f"executed {len(planned_to_run)} implemented-route wells."
     )
-
 
 if __name__ == "__main__":
     main()

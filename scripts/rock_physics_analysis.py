@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -211,6 +212,20 @@ def _parse_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "explicit_source": explicit_source,
         "ai_vp_linear": module_config,
         "forward_model": forward_model,
+    }
+
+
+def _contract_business_config(script_config: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert typed runtime config to strict, location-independent contract JSON."""
+    module_config = script_config.get("ai_vp_linear")
+    if not isinstance(module_config, AiVpModuleConfig):
+        raise TypeError("script_config.ai_vp_linear must be AiVpModuleConfig.")
+    forward_model = script_config.get("forward_model")
+    if forward_model is not None and not isinstance(forward_model, Mapping):
+        raise TypeError("script_config.forward_model must be a mapping or None.")
+    return {
+        "modules": {"ai_vp_linear": asdict(module_config)},
+        "forward_model": None if forward_model is None else dict(forward_model),
     }
 
 
@@ -478,6 +493,7 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
     raw_config = load_yaml_config(config_file)
     workflow = WorkflowConfig.from_mapping(raw_config)
     script_config = _parse_config(raw_config)
+    business_config = _contract_business_config(script_config)
     output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
     output_dir = (
         resolve_relative_path(output_dir_arg, root=REPO_ROOT)
@@ -569,7 +585,7 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
                 "depth_basis": workflow.seismic.depth_basis,
                 "modules": base_summary["modules"],
             },
-            business_config=script_config,
+            business_config=business_config,
             input_contracts=input_contracts,
             primary_artifacts={"well_input_inventory": inventory_path},
         )
@@ -751,7 +767,7 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
             "relation_schema": RELATION_SCHEMA,
             "forward_inputs_schema": FORWARD_INPUTS_SCHEMA,
         },
-        business_config=script_config,
+        business_config=business_config,
         input_contracts=input_contracts,
         primary_artifacts={
             "well_input_inventory": inventory_path,

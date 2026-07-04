@@ -101,7 +101,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> Path:
+def _resolve_output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> Path:
     if args.output_dir is not None:
         return resolve_relative_path(args.output_dir, root=REPO_ROOT)
     root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
@@ -217,7 +217,7 @@ def main() -> None:
         sources, source_provenance, forward_inputs = resolve_depth_v2_sources(
             script_cfg, workflow=workflow, repo_root=REPO_ROOT
         )
-        output_dir = _output_dir(args, workflow)
+        output_dir = _resolve_output_dir(args, workflow)
         if args.command == "calibrate":
             summary = run_depth_calibration(
                 workflow=workflow,
@@ -264,7 +264,7 @@ def main() -> None:
     )
     script_cfg = parse_synthoseis_config(raw)
     sources = resolve_sources(script_cfg, repo_root=REPO_ROOT)
-    output_dir = _output_dir(args, workflow)
+    output_dir = _resolve_output_dir(args, workflow)
     if args.command == "calibrate":
         summary = run_calibration(
             workflow=workflow,

@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _output_dir(args: argparse.Namespace, benchmark_dir: Path) -> Path:
+def _resolve_output_dir(args: argparse.Namespace, benchmark_dir: Path) -> Path:
     if args.output_dir is not None:
         return resolve_relative_path(args.output_dir, root=REPO_ROOT)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -223,7 +223,7 @@ def main() -> None:
         sample_ids = sample_ids[: int(args.max_samples)]
     if not sample_ids:
         raise ValueError("No benchmark samples selected for evaluation.")
-    output_dir = _output_dir(args, benchmark_dir)
+    output_dir = _resolve_output_dir(args, benchmark_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
 
     sample_rows: list[dict[str, Any]] = []

@@ -597,6 +597,15 @@ def run_auto_tie(
             print(f"  {key}: {value}")
     print(f"  objective means: {best_objective_means}")
 
+
+def _resolve_output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> Path:
+    if args.output_dir is not None:
+        return args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
+    return output_root / f"vertical_well_auto_tie_depth_{timestamp}"
+
+
 # Main
 def main() -> None:
     args = parse_args()
@@ -645,12 +654,7 @@ def main() -> None:
     }
 
     # Output dir
-    if args.output_dir is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
-        output_dir = output_root / f"vertical_well_auto_tie_depth_{timestamp}"
-    else:
-        output_dir = args.output_dir if args.output_dir.is_absolute() else REPO_ROOT / args.output_dir
+    output_dir = _resolve_output_dir(args, workflow)
 
     output = build_output_tree(output_dir, well_name)
 

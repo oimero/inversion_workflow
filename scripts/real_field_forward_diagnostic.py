@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _timestamped_output(prefix: str, explicit: Path | None, *, output_root: Path) -> Path:
+def _resolve_output_dir(prefix: str, explicit: Path | None, *, output_root: Path) -> Path:
     if explicit is not None:
         return resolve_relative_path(explicit, root=REPO_ROOT)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2259,7 +2259,7 @@ def main() -> None:
         zero_shot_summary=zero_shot_summary,
         output_root=output_root,
     )
-    output_dir = _timestamped_output("real_field_forward_diagnostic", args.output_dir, output_root=output_root)
+    output_dir = _resolve_output_dir("real_field_forward_diagnostic", args.output_dir, output_root=output_root)
     output_dir.mkdir(parents=True, exist_ok=False)
 
     predictions = load_zero_shot_predictions(zero_shot_dir)

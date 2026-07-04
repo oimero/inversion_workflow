@@ -239,7 +239,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _timestamped_output(prefix: str, explicit: Path | None) -> Path:
+def _resolve_output_dir(prefix: str, explicit: Path | None) -> Path:
     if explicit is not None:
         return resolve_relative_path(explicit, root=REPO_ROOT)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -563,7 +563,7 @@ def _resolve_checkpoint_from_manifest(
 def run_train(args: argparse.Namespace) -> None:
     args = _apply_train_config(args)
     benchmark_dir = _resolve_benchmark_dir(args.benchmark_dir)
-    output_dir = _timestamped_output("ginn_v2_train", args.output_dir)
+    output_dir = _resolve_output_dir("ginn_v2_train", args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
     logger = configure_training_logger(output_dir)
     logger.info("GINN-v2 train output: %s", output_dir)
@@ -743,7 +743,7 @@ def run_predict(args: argparse.Namespace) -> None:
         if args.benchmark_dir is not None
         else resolve_relative_path(manifest["benchmark_dir"], root=REPO_ROOT)
     )
-    output_dir = _timestamped_output("ginn_v2_predict", args.output_dir)
+    output_dir = _resolve_output_dir("ginn_v2_predict", args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
     benchmark = SynthoseisBenchmark(benchmark_dir)
     if args.eval_patch_index is not None:
@@ -867,7 +867,7 @@ def run_predict(args: argparse.Namespace) -> None:
 
 def run_report(args: argparse.Namespace) -> None:
     prediction_dir = resolve_relative_path(args.prediction_dir, root=REPO_ROOT)
-    output_dir = _timestamped_output("ginn_v2_report", args.output_dir)
+    output_dir = _resolve_output_dir("ginn_v2_report", args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
     result = report_predictions(prediction_dir=prediction_dir, output_dir=output_dir)
     summary = {
@@ -888,7 +888,7 @@ def run_report(args: argparse.Namespace) -> None:
 
 
 def run_summarize(args: argparse.Namespace) -> None:
-    output_dir = _timestamped_output("ginn_v2_summary", args.output_dir)
+    output_dir = _resolve_output_dir("ginn_v2_summary", args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
     rows: list[dict[str, object]] = []
     frequency_frames: list[pd.DataFrame] = []

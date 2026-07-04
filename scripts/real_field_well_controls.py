@@ -115,6 +115,14 @@ def _resolved_config(raw: dict[str, Any], workflow: WorkflowConfig) -> dict[str,
     return config
 
 
+def _resolve_output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> Path:
+    if args.output_dir is not None:
+        return resolve_relative_path(args.output_dir, root=REPO_ROOT)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
+    return output_root / f"real_field_well_controls_{timestamp}"
+
+
 def main() -> None:
     args = parse_args()
     config_path = resolve_relative_path(args.config, root=REPO_ROOT)
@@ -139,11 +147,7 @@ def main() -> None:
         data_root=data_root,
         seismic_path=seismic_path,
     )
-    if args.output_dir is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = resolve_relative_path(workflow.output_root, root=REPO_ROOT) / f"real_field_well_controls_{timestamp}"
-    else:
-        output_dir = resolve_relative_path(args.output_dir, root=REPO_ROOT)
+    output_dir = _resolve_output_dir(args, workflow)
     summary = write_well_control_set(
         controls,
         manifest,

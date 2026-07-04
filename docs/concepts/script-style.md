@@ -5,13 +5,13 @@
 脚本统一采用以下结构：
 
 ```text
-1. 英文模块 docstring（含 Usage 块）
+1. 英文模块 docstring
 2. from __future__ import annotations
 3. 标准库与第三方依赖
 4. SCRIPT_DIR / REPO_ROOT / SRC_DIR bootstrap
 5. cup 与 wtie 导入
 6. parse_args()
-7. 输入和输出路径解析（_resolve_output_dir helper）
+7. 输入和输出路径解析
 8. main()
 9. if __name__ == "__main__": main()
 ```
@@ -30,10 +30,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 ```
 
-**7. parse_args()**：`--config` 默认值直接写在 `default=` 中，无需额外的
-`DEFAULT_CONFIG` 模块常量。
-
-**8. 路径解析**：输出目录解析统一命名为 `_resolve_output_dir()`；输入路径
+**7. 路径解析**：输出目录解析统一命名为 `_resolve_output_dir()`；输入路径
 统一使用 `resolve_relative_path()`。
 
 ## 约束

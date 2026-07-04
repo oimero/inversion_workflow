@@ -26,10 +26,8 @@ import pandas as pd
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
-repo_text = str(REPO_ROOT)
 src_text = str(SRC_DIR)
-sys.path = [path for path in sys.path if path not in {repo_text, src_text}]
-sys.path.insert(0, repo_text)
+sys.path = [path for path in sys.path if path != src_text]
 sys.path.insert(0, src_text)
 
 from cup.config.sources import resolve_source_run
@@ -179,7 +177,7 @@ def _prepare_real_field_inputs(run_cfg: dict, workflow_cfg: dict) -> dict:
     prepared["source_runs"] = source_runs
     return prepared
 
-def _timestamped_output(prefix: str, explicit: Path | None, *, output_root: Path) -> Path:
+def _resolve_output_dir(prefix: str, explicit: Path | None, *, output_root: Path) -> Path:
     if explicit is not None:
         return resolve_relative_path(explicit, root=REPO_ROOT)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -836,7 +834,7 @@ def main() -> None:
     if not run_cfg:
         raise ValueError("experiments/common/common.yaml lacks real_field_zero_shot section.")
     output_root = resolve_relative_path(cfg.get("output_root", "scripts/output"), root=REPO_ROOT)
-    output_dir = _timestamped_output("real_field_zero_shot", args.output_dir, output_root=output_root)
+    output_dir = _resolve_output_dir("real_field_zero_shot", args.output_dir, output_root=output_root)
     output_dir.mkdir(parents=True, exist_ok=False)
 
     device = str(args.device or run_cfg.get("device") or "auto")

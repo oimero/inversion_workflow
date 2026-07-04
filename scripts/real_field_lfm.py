@@ -78,6 +78,14 @@ def _control_run(config: dict[str, Any], workflow: WorkflowConfig) -> Path:
     )
 
 
+def _resolve_output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> Path:
+    if args.output_dir is not None:
+        return resolve_relative_path(args.output_dir, root=REPO_ROOT)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
+    return output_root / f"real_field_lfm_{timestamp}"
+
+
 def main() -> None:
     args = parse_args()
     config_path = resolve_relative_path(args.config, root=REPO_ROOT)
@@ -117,11 +125,7 @@ def main() -> None:
             }
         },
     )
-    if args.output_dir is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = resolve_relative_path(workflow.output_root, root=REPO_ROOT) / f"real_field_lfm_{timestamp}"
-    else:
-        output_dir = resolve_relative_path(args.output_dir, root=REPO_ROOT)
+    output_dir = _resolve_output_dir(args, workflow)
     summary = run_lfm_pipeline(
         config=lfm_config,
         controls=controls,

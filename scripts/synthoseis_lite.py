@@ -13,10 +13,9 @@ select the time-v2 or depth-v2 branch.
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import datetime
 from pathlib import Path
-import sys
-
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -24,12 +23,10 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.synthetic.workflow import (  # noqa: E402
-    parse_synthoseis_config,
-    resolve_sources,
-    run_calibration,
-    run_generation,
-)
+from cup.config.sources import load_summary, resolve_source_run  # noqa: E402
+from cup.config.workflow import WorkflowConfig  # noqa: E402
+from cup.seismic.contracts import FORWARD_OBSERVABILITY_SCHEMA_VERSION  # noqa: E402
+from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION  # noqa: E402
 from cup.synthetic.depth.calibration import run_depth_calibration  # noqa: E402
 from cup.synthetic.depth.config import (  # noqa: E402
     load_composed_config,
@@ -37,10 +34,12 @@ from cup.synthetic.depth.config import (  # noqa: E402
     resolve_depth_v2_sources,
 )
 from cup.synthetic.depth.generation import run_depth_generation  # noqa: E402
-from cup.seismic.contracts import FORWARD_OBSERVABILITY_SCHEMA_VERSION  # noqa: E402
-from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION  # noqa: E402
-from cup.config.workflow import WorkflowConfig  # noqa: E402
-from cup.config.sources import load_summary, resolve_source_run  # noqa: E402
+from cup.synthetic.workflow import (  # noqa: E402
+    parse_synthoseis_config,
+    resolve_sources,
+    run_calibration,
+    run_generation,
+)
 from cup.utils.io import (  # noqa: E402
     load_yaml_config,
     repo_relative_path,
@@ -65,12 +64,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=None)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser(
-        "calibrate", help="Freeze impedance calibration from authoritative source runs."
-    )
-    generate = subparsers.add_parser(
-        "generate", help="Generate one configured benchmark suite."
-    )
+    subparsers.add_parser("calibrate", help="Freeze impedance calibration from authoritative source runs.")
+    generate = subparsers.add_parser("generate", help="Generate one configured benchmark suite.")
     generate.add_argument("--impedance-calibration", type=Path, required=True)
     generate.add_argument(
         "--suite",
@@ -127,9 +122,7 @@ def _prepare_synthoseis_config(raw: dict, workflow: WorkflowConfig) -> dict:
             summary_file="run_summary.json",
             schema_version=FORWARD_OBSERVABILITY_SCHEMA_VERSION,
         )
-        summary = load_summary(
-            obs_dir / "run_summary.json", schema_version=FORWARD_OBSERVABILITY_SCHEMA_VERSION
-        )
+        summary = load_summary(obs_dir / "run_summary.json", schema_version=FORWARD_OBSERVABILITY_SCHEMA_VERSION)
         recorded = dict(summary.get("source_runs") or {})
         source_runs = {
             "forward_observability_dir": repo_relative_path(obs_dir, root=REPO_ROOT),
@@ -142,9 +135,7 @@ def _prepare_synthoseis_config(raw: dict, workflow: WorkflowConfig) -> dict:
     return prepared
 
 
-def _load_time_config(
-    experiment_raw: dict, *, experiment_path: Path
-) -> tuple[dict, WorkflowConfig, dict[str, str]]:
+def _load_time_config(experiment_raw: dict, *, experiment_path: Path) -> tuple[dict, WorkflowConfig, dict[str, str]]:
     """Load time-v2 config, supporting either legacy direct or common-overlay form."""
     if "workflow_config" not in experiment_raw:
         raw = experiment_raw
@@ -158,12 +149,8 @@ def _load_time_config(
     allowed = {"workflow_config", "synthoseis_lite"}
     unknown = sorted(set(experiment_raw) - allowed)
     if unknown:
-        raise ValueError(
-            f"Time Synthoseis-lite composed config contains unknown top-level keys: {unknown}."
-        )
-    common_path = resolve_relative_path(
-        str(experiment_raw["workflow_config"]), root=REPO_ROOT
-    )
+        raise ValueError(f"Time Synthoseis-lite composed config contains unknown top-level keys: {unknown}.")
+    common_path = resolve_relative_path(str(experiment_raw["workflow_config"]), root=REPO_ROOT)
     common = load_yaml_config(common_path)
     if not isinstance(common, dict):
         raise ValueError(f"workflow_config must contain a mapping: {common_path}")
@@ -204,13 +191,9 @@ def main() -> None:
     if (sample_domain, benchmark_schema) == ("depth", BENCHMARK_SCHEMA_VERSION):
         if "workflow_config" not in experiment_raw:
             raise ValueError("Depth Synthoseis-lite v3 requires workflow_config.")
-        raw, workflow, config_provenance = load_composed_config(
-            config_path, repo_root=REPO_ROOT
-        )
+        raw, workflow, config_provenance = load_composed_config(config_path, repo_root=REPO_ROOT)
         if workflow.seismic.domain != "depth":
-            raise ValueError(
-                "Composed Synthoseis-lite v3 currently implements the depth branch only."
-            )
+            raise ValueError("Composed Synthoseis-lite v3 currently implements the depth branch only.")
         script_cfg = parse_depth_v2_config(raw)
         sources, source_provenance, forward_inputs = resolve_depth_v2_sources(
             script_cfg, workflow=workflow, repo_root=REPO_ROOT
@@ -229,25 +212,21 @@ def main() -> None:
             )
         else:
             if args.suite != "field_conditioned":
-                raise ValueError(
-                    "Depth Synthoseis-lite v3 only supports --suite field_conditioned."
-                )
+                raise ValueError("Depth Synthoseis-lite v3 only supports --suite field_conditioned.")
             summary = run_depth_generation(
                 workflow=workflow,
                 script_cfg=script_cfg,
                 sources=sources,
                 forward_inputs=forward_inputs,
                 config_provenance=config_provenance,
-                calibration_path=resolve_relative_path(
-                    args.impedance_calibration, root=REPO_ROOT
-                ),
+                calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
                 repo_root=REPO_ROOT,
                 output_dir=output_dir,
                 debug_attempt_limit=args.debug_attempt_limit,
                 geometry_families=args.geometry_family,
                 qc_only=args.qc_only,
             )
-        print("=== synthoseis-lite v2 ===")
+        print("=== synthoseis-lite v3 ===")
         print(f"Command: {args.command}")
         print(f"Output: {output_dir}")
         print(f"Status: {summary.get('status', 'success')}")
@@ -257,9 +236,7 @@ def main() -> None:
             "Unsupported Synthoseis-lite dispatch: "
             f"sample_domain={sample_domain!r}, benchmark_schema={benchmark_schema!r}."
         )
-    raw, workflow, config_provenance = _load_time_config(
-        experiment_raw, experiment_path=config_path
-    )
+    raw, workflow, config_provenance = _load_time_config(experiment_raw, experiment_path=config_path)
     script_cfg = parse_synthoseis_config(raw)
     sources = resolve_sources(script_cfg, repo_root=REPO_ROOT)
     output_dir = _resolve_output_dir(args, workflow)

@@ -2,45 +2,31 @@
 
 ```mermaid
 flowchart TB
-    subgraph prod["稳定生产链"]
-        S1["01 · well_inventory"] --> S2["02 · well_screen"] --> S3["03 · well_preprocess"] --> S4["04 · well_auto_tie"] --> S5["05 · wavelet_generation"]
-        WT["旁路 · well_trajectory"] -.-> S4
-    end
+    S1["01 井资产盘点"] --> S2["02 LAS 曲线筛选与导出"] --> S3["03 测井预处理"] --> S4["04 井震自动标定"] --> S5["05 全局共识子波生成"] --> S6["06 真实工区井控数据集"] --> S7["07 真实工区低频模型"] --> R0["08 R0 实际工区零样本预测"] --> R1["08 R1 正演闭环诊断"]
 
-    prod --> FO["旁路 · forward_observability"]
-    S3 --> RP["旁路 · rock_physics_analysis"]
+    WT["旁路 井轨迹 QC"]
+    S1 -.-> WT -.-> S4
 
-    S1 -.-> S6["06 · real_field_well_controls"]
-    S4 -.-> S6
-    S6 --> S7["07 · real_field_lfm variants"]
+    RP["旁路 岩石物理分析"]
+    S3 -.-> RP
 
-    S3 --> SL["旁路 · synthoseis_lite"]
-    FO -.-> SL
-    SL --> GV["旁路 · ginn_v2"]
-
-    S5 -.-> R0["08 R0 · real_field_zero_shot"]
-    S7 --> R0
-    GV --> R0
-
-    R0 --> R1["08 R1 · real_field_forward_diagnostic"]
+    FO["旁路 正演可观测性分析"] --> SL["旁路 合成基准生成与评估"] --> GV["旁路 模型消融训练与评估"]
+    S5 -.-> FO
+    GV -.-> R0
 ```
-
-步骤间身份、不可变 run 和 SHA-256 的职责以
-[SHA-256 契约瘦身规范](spec/SHA256_CONTRACT_SLIMMING.md)为准。内部消费者只复制直接上游契约指纹，
-仍必须独立校验 domain/unit、显式采样轴、坐标步长、shape、dtype、mask 和状态。
 
 ## 配置文件
 
 | 步骤 | 配置文件 |
 |------|---------|
-| 01–05 + well_trajectory | `experiments/common/common.yaml` |
-| 旁路 · forward_observability | `experiments/common/common.yaml` |
+| 01–07 | `experiments/common/common.yaml` |
+| 07 · modifier 实验 | `experiments/real_field_lfm/real_field_lfm.yaml` |
+| 旁路 · well_trajectory | `experiments/common/common.yaml` |
 | 旁路 · rock_physics_analysis | `experiments/common/common.yaml` |
+| 旁路 · forward_observability | `experiments/common/common.yaml` |
 | 旁路 · synthoseis_lite | `experiments/synthoseis_lite/synthoseis_lite.yaml` |
 | 旁路 · ginn_v2 | `experiments/ginn_v2/train.yaml` |
-| 06–07 · real_field_well_controls / real_field_lfm | 独立实验 YAML（引用 `experiments/common/common.yaml`） |
-| 08 R0 · real_field_zero_shot | `experiments/common/common.yaml` |
-| 08 R1 · real_field_forward_diagnostic | `experiments/common/common.yaml` |
+| 08 R0-R1 | `experiments/common/common.yaml` |
 
 ## 深度域工作流
 

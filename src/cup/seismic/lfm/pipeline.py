@@ -399,10 +399,10 @@ def _write_variant_figures(
         mesh = axis.pcolormesh(lateral, samples, values.T, shading="auto", cmap="viridis")
         for name, horizon in zip(context.target_zone.horizon_names, horizon_sections):
             axis.plot(lateral, horizon, linewidth=0.8, label=name)
-        axis.invert_yaxis()
         axis.set_title(title)
         axis.set_xlabel("xline" if result.log_ai.ndim == 3 else "section trace")
         fig.colorbar(mesh, ax=axis)
+    axes[0].set_ylim(float(samples[-1]), float(samples[0]))
     axes[0].set_ylabel(f"{context.sample_axis.domain} ({context.sample_axis.unit})")
     axes[1].legend(fontsize=7)
     fig.tight_layout()

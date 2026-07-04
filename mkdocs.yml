@@ -44,26 +44,24 @@ markdown_extensions:
 nav:
   - 首页: index.md
   - 快速开始:
-      - 核心 CSV 契约: concepts/csv-contracts.md
       - 数据与单位约定: concepts/data-and-coordinate-conventions.md
-      - SHA-256 契约瘦身规范: spec/SHA256_CONTRACT_SLIMMING.md
       - 脚本风格指南: concepts/script-style.md
   - 教程:
       - 常见问题: guide/0-troubleshooting.md
       - 01 井资产盘点: guide/1-well-inventory.md
+      - 旁路 井轨迹 QC: guide/well-trajectory.md
       - 02 LAS 曲线筛选与导出: guide/2-well-screen.md
       - 03 测井预处理: guide/3-well-preprocess.md
-      - 旁路 井轨迹 QC: guide/well-trajectory.md
-      - 04 井震自动标定: guide/4-well-auto-tie.md
-      - 05 全局子波生成: guide/5-wavelet-generation.md
       - 旁路 岩石物理分析: guide/rock-physics-analysis.md
+      - 04 井震自动标定: guide/4-well-auto-tie.md
+      - 05 全局共识子波生成: guide/5-wavelet-generation.md
       - 旁路 正演可观测性分析: guide/forward-observability.md
       - 旁路 合成基准生成与评估: guide/synthoseis-lite-benchmark.md
       - 旁路 模型消融训练与评估: guide/ginn-v2-ablation.md
-      - 06 真实井控制准备: guide/6-real-field-well-controls.md
-      - 07 实际工区 LFM 变体构建: guide/7-real-field-lfm.md
-      - 08 R0 实际工区零样本预测: guide/8-r0-real-field-zero-shot.md
-      - 08 R1 正演闭环诊断: guide/8-r1-real-field-forward-diagnostic.md
+      - 06 真实工区井控数据集: guide/6-real-field-well-controls.md
+      - 07 真实工区低频模型: guide/7-real-field-lfm.md
+      - 08 R0 真实工区零样本预测: guide/8-r0-real-field-zero-shot.md
+      - 08 R1 真实工区正演闭环诊断: guide/8-r1-real-field-forward-diagnostic.md
       - 平行工作流 深度域反演工作流: guide/depth-domain-workflow.md
   - API:
       - API 总览: api/index.md

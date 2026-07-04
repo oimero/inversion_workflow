@@ -19,6 +19,7 @@ from cup.synthetic.dataset import SynthoseisBenchmark
 from cup.synthetic.metrics import regression_metrics
 from cup.utils.io import write_json
 from cup.utils.logging import configure_run_logger
+from ginn_v2.contracts import CHECKPOINT_SCHEMA_VERSION, PATCH_SMOKE_REPORT_SCHEMA_VERSION
 from ginn_v2.data import PatchDataset, _aligned_arrays, default_train_kinds, denormalize_delta
 from ginn_v2.models import build_model
 
@@ -471,7 +472,7 @@ def _checkpoint_payload(
         for name, value in model.state_dict().items()
     }
     return {
-        "schema_version": "ginn_v2_checkpoint_v2",
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "checkpoint_kind": checkpoint_kind,
         "epoch": int(epoch),
         "validation_loss": float(validation_loss),
@@ -556,7 +557,7 @@ def _torch_forward_log_ai(log_ai: torch.Tensor, wavelet: torch.Tensor) -> torch.
 
 def load_checkpoint(path: Path, *, hidden_channels: int | None = None, depth: int | None = None) -> tuple[torch.nn.Module, dict[str, Any]]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    if str(checkpoint.get("schema_version") or "") != "ginn_v2_checkpoint_v2":
+    if str(checkpoint.get("schema_version") or "") != CHECKPOINT_SCHEMA_VERSION:
         raise ValueError(f"Unsupported GINN-v2 checkpoint schema: {path}")
     info = dict(checkpoint["model_info"])
     architecture = dict(checkpoint.get("architecture") or {})
@@ -733,7 +734,7 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     lfm_ideal_aggregate = _aggregate(lfm_ideal_frame)
     oracle_aggregate = _aggregate(oracle_frame)
     report = {
-        "schema_version": "ginn_v2_patch_smoke_report_v1",
+        "schema_version": PATCH_SMOKE_REPORT_SCHEMA_VERSION,
         "report_scope": "patch_smoke",
         "not_synthoseis_lite_report": True,
         "status": "ok",

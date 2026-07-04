@@ -15,10 +15,11 @@ from cup.synthetic.core import (
     validate_dataset_metadata,
     validate_training_manifest,
 )
+from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION
 from cup.utils.io import require_contract_fingerprint
 
 
-SCHEMA_VERSION = "synthoseis_lite_v3"
+SCHEMA_VERSION = BENCHMARK_SCHEMA_VERSION
 SEISMIC_VARIANT_KINDS = {"seismic_variant", "frequency_probe_seismic_variant"}
 
 
@@ -186,7 +187,7 @@ class TimeV2Benchmark:
                 h5.attrs.get("schema") != SCHEMA_VERSION
                 and h5.attrs.get("schema_version") != SCHEMA_VERSION
             ):
-                raise ValueError("HDF5 schema does not match synthoseis_lite_v3.")
+                raise ValueError(f"HDF5 schema does not match {SCHEMA_VERSION}.")
             if h5.attrs.get("sample_domain") != "time":
                 raise ValueError("HDF5 sample_domain does not match time.")
             if bool(h5.attrs.get("qc_only", False)) != bool(

@@ -121,7 +121,7 @@ class DepthV2Benchmark:
     def _validate_hdf5(self) -> None:
         with h5py.File(self.h5_path, "r") as h5:
             if h5.attrs.get("schema") != SCHEMA_VERSION:
-                raise ValueError("HDF5 schema does not match synthoseis_lite_v3.")
+                raise ValueError(f"HDF5 schema does not match {SCHEMA_VERSION}.")
             if h5.attrs.get("sample_domain") != "depth" or h5.attrs.get("depth_basis") != "tvdss":
                 raise ValueError("HDF5 root has the wrong sample domain or basis.")
             if bool(h5.attrs.get("qc_only", False)) != bool(

@@ -10,12 +10,17 @@ import numpy as np
 
 from cup.config.sources import resolve_source_run
 from cup.config.workflow import WorkflowConfig
+from cup.synthetic.calibration import SCHEMA_VERSION as CALIBRATION_SCHEMA
+from cup.synthetic.contracts import (
+    BENCHMARK_SCHEMA_VERSION,
+    FORWARD_MODEL_INPUTS_SCHEMA_VERSION,
+    ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION,
+)
 from cup.synthetic.core.config import parse_object_core_controls
 from cup.utils.io import load_yaml_config, require_contract_fingerprint, resolve_relative_path
 
 
-SCHEMA_VERSION = "synthoseis_lite_v3"
-CALIBRATION_SCHEMA = "synthoseis_lite_impedance_calibration_v2"
+SCHEMA_VERSION = BENCHMARK_SCHEMA_VERSION
 GENERATOR_FAMILY = "object_coefficients_v2"
 
 _WORKFLOW_KEYS = {
@@ -483,15 +488,15 @@ def resolve_depth_v2_sources(
         }
 
     rock_summary = _load_json(resolved["rock_physics_analysis_dir"] / "run_summary.json")
-    if rock_summary.get("schema") != "rock_physics_analysis_v2" or rock_summary.get("status") != "success":
+    if rock_summary.get("schema") != ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION or rock_summary.get("status") != "success":
         raise ValueError("rock_physics_analysis run is not a successful v2 run.")
     wavelet_batch_summary = _load_json(resolved["wavelet_batch_synthetic_depth_dir"] / "run_summary.json")
     if wavelet_batch_summary.get("status") != "success":
         raise ValueError("wavelet_batch_synthetic_depth run is not successful.")
     forward_path = resolved["rock_physics_analysis_dir"] / "forward_model_inputs.json"
     forward = _load_json(forward_path)
-    if forward.get("schema") != "forward_model_inputs_v2":
-        raise ValueError("forward_model_inputs schema must be forward_model_inputs_v2.")
+    if forward.get("schema") != FORWARD_MODEL_INPUTS_SCHEMA_VERSION:
+        raise ValueError(f"forward_model_inputs schema must be {FORWARD_MODEL_INPUTS_SCHEMA_VERSION}.")
     if forward.get("sample_domain") != "depth" or forward.get("depth_basis") != "tvdss":
         raise ValueError("forward_model_inputs must declare depth/TVDSS.")
     inventory_summary = _load_json(resolved["well_inventory_dir"] / "run_summary.json")

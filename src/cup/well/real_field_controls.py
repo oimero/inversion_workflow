@@ -26,14 +26,15 @@ from cup.utils.io import (
     sanitize_filename,
 )
 from cup.well.assets import build_file_lookup, normalize_well_name
+from cup.well.contracts import DEPTH_WAVELET_BATCH_SCHEMA_VERSION, WELL_AUTO_TIE_SCHEMA_VERSION
 from cup.well.td import load_workflow_time_depth_table_csv
 from cup.well.trajectory import WellTrajectory
 from wtie.processing import grid
 
 
 SCHEMA_VERSION = "real_field_well_controls_v3"
-TIME_SOURCE_SCHEMA = "well_auto_tie_v3"
-DEPTH_SOURCE_SCHEMA = "wavelet_batch_synthetic_depth_v3"
+TIME_SOURCE_SCHEMA = WELL_AUTO_TIE_SCHEMA_VERSION
+DEPTH_SOURCE_SCHEMA = DEPTH_WAVELET_BATCH_SCHEMA_VERSION
 LINEAR_AI_UNIT = "m/s*g/cm3"
 
 MANIFEST_COLUMNS = [

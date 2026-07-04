@@ -70,6 +70,8 @@ from wtie.optimize import tie as tie_ops
 from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
 from wtie.processing import grid
 
+SCHEMA_VERSION = "wavelet_generation_v2"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -804,7 +806,7 @@ def main() -> None:
     plot_wavelets["mean_of_candidates" if selection_mode == "insufficient_eval_fallback" else "consensus"] = consensus_wavelet
     _plot_wavelets(wavelet_time_s, plot_wavelets, output_dirs["figures"] / "selected_wavelet.png")
     summary = {
-        "schema_version": "wavelet_generation_v2",
+        "schema_version": SCHEMA_VERSION,
         "status": "success",
         "selection_mode": selection_mode,
         "selected_wavelet": selected_name,
@@ -842,7 +844,7 @@ def main() -> None:
     run_summary = {"config": script_cfg, **summary}
     run_summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
     run_summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
-        contract_schema_version="wavelet_generation_v2",
+        contract_schema_version=SCHEMA_VERSION,
         semantics={"sample_domain": "time", "sample_unit": "s", "selection_mode": selection_mode},
         business_config=script_cfg,
         input_contracts=input_contracts,

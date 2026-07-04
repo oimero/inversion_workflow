@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 
 from cup.seismic.survey import open_survey, segy_options_from_config
+from cup.seismic.lfm.contracts import VARIANT_SCHEMA as LFM_VARIANT_SCHEMA
 from cup.seismic.wavelet import (
     DEFAULT_ACTIVE_SUPPORT_THRESHOLD,
     compute_wavelet_active_half_support_s,
@@ -24,6 +25,10 @@ from cup.utils.io import (
     resolve_artifact_path,
     resolve_relative_path,
     write_json,
+)
+from ginn_v2.contracts import (
+    MODEL_RUN_SCHEMA_VERSION,
+    ZERO_SHOT_MODEL_SCHEMA_VERSION,
 )
 from ginn_v2.data import denormalize_delta
 from ginn_v2.training import load_checkpoint, resolve_device
@@ -101,7 +106,7 @@ def load_model_manifest(model_cfg: Mapping[str, Any], *, root: Path) -> dict[str
         raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v3":
+    if str(manifest.get("schema_version") or "") != MODEL_RUN_SCHEMA_VERSION:
         raise ValueError(f"Unsupported model run manifest schema: {manifest_path}")
     require_contract_fingerprint(manifest, label=f"model run {model_run_dir}")
     return manifest
@@ -117,7 +122,7 @@ def _model_manifest_and_dir(model_cfg: Mapping[str, Any], *, root: Path) -> tupl
         raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v3":
+    if str(manifest.get("schema_version") or "") != MODEL_RUN_SCHEMA_VERSION:
         raise ValueError(f"Unsupported model run manifest schema: {manifest_path}")
     require_contract_fingerprint(manifest, label=f"model run {model_run_dir}")
     gate = manifest.get("synthetic_gate_evidence")
@@ -648,7 +653,7 @@ def run_zero_shot_model(
     index_path = model_dir / "prediction_index.csv"
     pd.DataFrame.from_records(rows).to_csv(index_path, index=False)
     summary = {
-        "schema_version": "real_field_zero_shot_model_v2",
+        "schema_version": ZERO_SHOT_MODEL_SCHEMA_VERSION,
         "status": "ok",
         "input_contracts": {
             "model_run": {
@@ -803,7 +808,7 @@ def run_zero_shot_volume_model(
     index_path = model_dir / "prediction_index.csv"
     pd.DataFrame.from_records(rows).to_csv(index_path, index=False)
     summary = {
-        "schema_version": "real_field_zero_shot_model_v2",
+        "schema_version": ZERO_SHOT_MODEL_SCHEMA_VERSION,
         "status": "ok",
         "input_contracts": {
             "model_run": {
@@ -1041,13 +1046,13 @@ def _validate_lfm_npz_contract(
         files = set(data.files)
         required = {"log_ai", "valid_mask_model", "ilines", "xlines", "samples", "metadata_json"}
         if files != required:
-            raise ValueError(f"R0 primary LFM must use the minimal real_field_lfm_variant_v3 keys {sorted(required)}: {path}")
+            raise ValueError(f"R0 primary LFM must use the minimal {LFM_VARIANT_SCHEMA} keys {sorted(required)}: {path}")
         if str(lfm_transform).casefold() not in {"identity", "none"}:
-            raise ValueError("real_field_lfm_variant_v3/log_ai is already log(AI); use identity transform.")
+            raise ValueError(f"{LFM_VARIANT_SCHEMA}/log_ai is already log(AI); use identity transform.")
         if "metadata_json" not in files:
             raise ValueError(f"R0 primary LFM lacks metadata_json: {path}")
         metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
-    if str(metadata.get("schema_version")) != "real_field_lfm_variant_v3":
+    if str(metadata.get("schema_version")) != LFM_VARIANT_SCHEMA:
         raise ValueError(f"Unsupported LFM schema_version={metadata.get('schema_version')!r}: {path}")
     if str(metadata.get("variant_id")) != str(expected_variant_id):
         raise ValueError(f"LFM variant_id mismatch: expected {expected_variant_id!r}, got {metadata.get('variant_id')!r}")
@@ -1183,7 +1188,7 @@ def _validate_lfm_log_domain(
             "LFM values do not look like log(AI). "
             f"lfm_value_transform={lfm_transform!r}, p01={p01:.6g}, "
             f"median={median:.6g}, p99={p99:.6g}, path={path}. "
-            "Unified LFM v3 requires real_field_lfm_variant_v3/log_ai with identity transform."
+            f"Unified LFM v3 requires {LFM_VARIANT_SCHEMA}/log_ai with identity transform."
         )
 
 

@@ -35,6 +35,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.petrel.load import import_well_tops_petrel
+from cup.seismic.contracts import FORWARD_OBSERVABILITY_SCHEMA_VERSION
 from cup.seismic.observability import (
     ObservabilityWindow,
     WaveletScenario,
@@ -72,8 +73,8 @@ from cup.well.td import find_well_top_md, load_workflow_time_depth_table_csv
 from cup.well.tie import load_saved_seismic_trace_csv
 
 
-SCHEMA_VERSION = "forward_observability_v2"
 DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")
+SCHEMA_VERSION = FORWARD_OBSERVABILITY_SCHEMA_VERSION
 
 
 def parse_args() -> argparse.Namespace:

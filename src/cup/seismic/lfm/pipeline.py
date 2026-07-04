@@ -20,6 +20,7 @@ from cup.config.workflow import WorkflowConfig
 from cup.petrel.load import import_interpretation_petrel
 from cup.seismic.horizon import normalize_interpretation_unit_for_geometry
 from cup.seismic.lfm.builders import BUILDERS
+from cup.seismic.lfm.contracts import RUN_SCHEMA, VARIANT_SCHEMA
 from cup.seismic.lfm.framework import MODIFIERS
 from cup.seismic.lfm.types import LfmContext, LfmVariantResult, OutputGeometry
 from cup.seismic.target_zone import TargetZone
@@ -36,8 +37,6 @@ from cup.well.anchor import sample_volume_trilinear
 from cup.well.real_field_controls import WellControlSet
 
 
-RUN_SCHEMA = "real_field_lfm_run_v3"
-VARIANT_SCHEMA = "real_field_lfm_variant_v3"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _NUMBERED_MODEL_ID = re.compile(r"^m\d+(?:[_.-].*)?$", re.IGNORECASE)
 

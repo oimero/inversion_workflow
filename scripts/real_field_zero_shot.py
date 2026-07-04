@@ -44,6 +44,7 @@ from cup.utils.io import (
     write_json,
 )
 from cup.seismic.volume_export import export_volume_like_source, log_ai_to_ai_volume
+from ginn_v2.contracts import ZERO_SHOT_SUMMARY_SCHEMA_VERSION
 from ginn_v2.real_field import (
     input_qc_frame,
     load_real_field_section,
@@ -958,7 +959,7 @@ def main() -> None:
         for model_summary in model_summaries
     }
     contract_fingerprint = contract_fingerprint_sha256(
-        contract_schema_version="real_field_zero_shot_summary_v2",
+        contract_schema_version=ZERO_SHOT_SUMMARY_SCHEMA_VERSION,
         semantics={
             "mode": output_mode,
             "sample_domain": str(field.metadata.get("sample_domain") or "time"),
@@ -974,7 +975,7 @@ def main() -> None:
         primary_artifacts=primary_artifacts,
     )
     summary = {
-        "schema_version": "real_field_zero_shot_summary_v2",
+        "schema_version": ZERO_SHOT_SUMMARY_SCHEMA_VERSION,
         "status": "needs_forward_diagnostic",
         "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
         "contract_fingerprint_sha256": contract_fingerprint,

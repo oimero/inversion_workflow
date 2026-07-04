@@ -54,6 +54,8 @@ matplotlib.use("Agg")
 plt.rcParams["figure.dpi"] = 120
 pd.set_option("display.max_columns", 30)
 
+SCHEMA_VERSION = "vertical_well_auto_tie_depth_v2"
+
 def _save_fig(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -446,7 +448,7 @@ def run_auto_tie(
     best_objective_means, best_objective_covariances = best_values  # type: ignore
 
     summary: dict[str, Any] = {
-        "schema_version": "vertical_well_auto_tie_depth_v2",
+        "schema_version": SCHEMA_VERSION,
         "status": "success",
         "well_name": well_name,
         "kb_m": kb_m,
@@ -468,7 +470,7 @@ def run_auto_tie(
     }
     summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
     summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
-        contract_schema_version="vertical_well_auto_tie_depth_v2",
+        contract_schema_version=SCHEMA_VERSION,
         semantics={
             "sample_domain": "depth",
             "sample_unit": "m",

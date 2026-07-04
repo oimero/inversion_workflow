@@ -44,6 +44,7 @@ from cup.utils.io import (
     write_json,
 )
 from cup.utils.statistics import radius_connected_components
+from ginn_v2.contracts import ZERO_SHOT_SUMMARY_SCHEMA_VERSION
 from ginn_v2.real_field import (
     diagnostic_metrics,
     load_selected_wavelet,
@@ -55,6 +56,7 @@ from wtie.processing import grid
 
 
 DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")
+SCHEMA_VERSION = "real_field_forward_diagnostic_summary_v3"
 
 
 def parse_args() -> argparse.Namespace:
@@ -490,7 +492,7 @@ def _load_zero_shot_line_geometry(zero_shot_dir: Path):
 def _load_zero_shot_summary(zero_shot_dir: Path) -> dict:
     return load_summary(
         zero_shot_dir / "real_field_zero_shot_summary.json",
-        schema_version="real_field_zero_shot_summary_v2",
+        schema_version=ZERO_SHOT_SUMMARY_SCHEMA_VERSION,
         allowed_status={"needs_forward_diagnostic", "ok"},
         label="real_field_zero_shot_summary.json",
     )
@@ -505,7 +507,7 @@ def _resolve_zero_shot_dir(run_cfg: dict, *, output_root: Path, cli_value: Path 
         root=REPO_ROOT,
         label="real_field_zero_shot",
         summary_file="real_field_zero_shot_summary.json",
-        schema_version="real_field_zero_shot_summary_v2",
+        schema_version=ZERO_SHOT_SUMMARY_SCHEMA_VERSION,
         allowed_status={"needs_forward_diagnostic", "ok"},
     )
 
@@ -2496,7 +2498,7 @@ def main() -> None:
         ),
     }
     contract_fingerprint = contract_fingerprint_sha256(
-        contract_schema_version="real_field_forward_diagnostic_summary_v3",
+        contract_schema_version=SCHEMA_VERSION,
         semantics={"mode": output_mode, "dt_s": dt_s, "forward_operator": "cup.physics.numpy_backend.forward_time"},
         business_config={
             "phase_scan_deg": phase_values,
@@ -2513,7 +2515,7 @@ def main() -> None:
         },
     )
     summary = {
-        "schema_version": "real_field_forward_diagnostic_summary_v3",
+        "schema_version": SCHEMA_VERSION,
         "status": "ok",
         "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
         "contract_fingerprint_sha256": contract_fingerprint,

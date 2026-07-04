@@ -42,6 +42,7 @@ from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.trace_sampling import assemble_bilinear_trace_from_plan, build_bilinear_trace_sample_plan
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.config.workflow import WorkflowConfig, merge_dict_defaults
+from cup.well.contracts import WELL_AUTO_TIE_SCHEMA_VERSION
 from cup.config.sources import resolve_source_run
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
@@ -1791,7 +1792,7 @@ def main() -> None:
 
     successful_tie_count = int((metrics_df["tie_status"] == "success").sum()) if not metrics_df.empty else 0
     run_summary = {
-        "schema_version": "well_auto_tie_v3",
+        "schema_version": WELL_AUTO_TIE_SCHEMA_VERSION,
         "status": "success" if successful_tie_count > 0 else "failed",
         "sample_domain": "time",
         "sample_unit": "s",
@@ -1881,7 +1882,7 @@ def main() -> None:
             )
         run_summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
         run_summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
-            contract_schema_version="well_auto_tie_v3",
+            contract_schema_version=WELL_AUTO_TIE_SCHEMA_VERSION,
             semantics={
                 "sample_domain": "time",
                 "sample_unit": "s",

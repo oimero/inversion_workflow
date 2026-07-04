@@ -20,6 +20,7 @@ sys.path = [path for path in sys.path if path != src_text]
 sys.path.insert(0, src_text)
 
 from cup.synthetic.dataset import SynthoseisBenchmark
+from cup.synthetic.contracts import REPORT_SCHEMA_VERSION as SYNTHOSEIS_REPORT_SCHEMA_VERSION
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
@@ -28,6 +29,14 @@ from cup.utils.io import (
     require_contract_fingerprint,
     resolve_relative_path,
     write_json,
+)
+from ginn_v2.contracts import (
+    ABLATION_REPORT_CARD_SCHEMA_VERSION,
+    ABLATION_SUMMARY_SCHEMA_VERSION,
+    INPUT_REFERENCE_STATS_SCHEMA_VERSION,
+    MODEL_RUN_SCHEMA_VERSION,
+    PATCH_SMOKE_REPORT_SCHEMA_VERSION,
+    PREDICTION_SCHEMA_VERSION,
 )
 from ginn_v2.data import (
     PatchSpec,
@@ -381,7 +390,7 @@ def _write_train_manifest(
                 "contract_fingerprint_sha256": fingerprint,
             }
     manifest = {
-        "schema_version": "ginn_v2_model_run_v3",
+        "schema_version": MODEL_RUN_SCHEMA_VERSION,
         "status": "ok",
         "input_contracts": input_contracts,
         "model_id": args.model_id,
@@ -464,7 +473,7 @@ def _write_train_manifest(
     )
     manifest["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
     manifest["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
-        contract_schema_version="ginn_v2_model_run_v3",
+        contract_schema_version=MODEL_RUN_SCHEMA_VERSION,
         semantics={
             "model_id": manifest["model_id"],
             "model_role": manifest["model_role"],
@@ -511,8 +520,8 @@ def _stamp_gate_evidence(
         )
     with evaluation_summary_path.open("r", encoding="utf-8") as handle:
         evaluation_summary = json.load(handle)
-    if evaluation_summary.get("schema_version") != "synthoseis_lite_report_v2":
-        raise ValueError("Synthetic gate evaluation must use synthoseis_lite_report_v2.")
+    if evaluation_summary.get("schema_version") != SYNTHOSEIS_REPORT_SCHEMA_VERSION:
+        raise ValueError(f"Synthetic gate evaluation must use {SYNTHOSEIS_REPORT_SCHEMA_VERSION}.")
     gate_contract_fingerprint = require_contract_fingerprint(
         evaluation_summary, label=f"synthetic gate evaluation {evaluation_summary_path}"
     )
@@ -542,8 +551,8 @@ def _resolve_checkpoint_from_manifest(
     *,
     selection: str,
 ) -> tuple[str, Path]:
-    if str(manifest.get("schema_version") or "") != "ginn_v2_model_run_v3":
-        raise ValueError("GINN-v2 model run must use schema ginn_v2_model_run_v3.")
+    if str(manifest.get("schema_version") or "") != MODEL_RUN_SCHEMA_VERSION:
+        raise ValueError(f"GINN-v2 model run must use schema {MODEL_RUN_SCHEMA_VERSION}.")
     require_contract_fingerprint(manifest, label="GINN-v2 model run")
     checkpoints = manifest.get("checkpoints")
     if not isinstance(checkpoints, Mapping):
@@ -618,7 +627,7 @@ def run_train(args: argparse.Namespace) -> None:
     normalization_path = output_dir / "normalization.json"
     write_json(normalization_path, normalization)
     input_reference_stats = {
-        "schema_version": "real_field_input_reference_stats_v1",
+        "schema_version": INPUT_REFERENCE_STATS_SCHEMA_VERSION,
         "input_name": "seismic",
         "stats": compute_input_reference_stats(benchmark, patch_index, input_name="seismic"),
         "sampling": {
@@ -815,7 +824,7 @@ def run_predict(args: argparse.Namespace) -> None:
         "benchmark": dict(dict(manifest.get("input_contracts") or {}).get("benchmark") or {}),
     }
     prediction_contract_fingerprint = contract_fingerprint_sha256(
-        contract_schema_version="ginn_v2_prediction_v2",
+        contract_schema_version=PREDICTION_SCHEMA_VERSION,
         semantics={
             "model_id": result["model_id"],
             "split": args.split,
@@ -833,7 +842,7 @@ def run_predict(args: argparse.Namespace) -> None:
         },
     )
     summary = {
-        "schema_version": "ginn_v2_prediction_v2",
+        "schema_version": PREDICTION_SCHEMA_VERSION,
         "status": "ok",
         "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
         "contract_fingerprint_sha256": prediction_contract_fingerprint,
@@ -871,7 +880,7 @@ def run_report(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=False)
     result = report_predictions(prediction_dir=prediction_dir, output_dir=output_dir)
     summary = {
-        "schema_version": "ginn_v2_patch_smoke_report_v1",
+        "schema_version": PATCH_SMOKE_REPORT_SCHEMA_VERSION,
         "report_scope": "patch_smoke",
         "not_synthoseis_lite_report": True,
         "status": "ok",
@@ -988,7 +997,7 @@ def run_summarize(args: argparse.Namespace) -> None:
     markdown_path = output_dir / "ablation_report.md"
     markdown_path.write_text(_format_ablation_markdown(report_card), encoding="utf-8")
     run_summary = {
-        "schema_version": "ginn_v2_ablation_summary_v1",
+        "schema_version": ABLATION_SUMMARY_SCHEMA_VERSION,
         "status": "ok",
         "n_reports": int(len(rows)),
         "outputs": {
@@ -1162,7 +1171,7 @@ def _build_ablation_report_card(summary: pd.DataFrame, frequency_path: Path) -> 
     missing = [key for key in required_for_full_gate if not coverage.get(key)]
     conclusion = _ablation_conclusion(best, stability)
     return {
-        "schema_version": "ginn_v2_ablation_report_card_v1",
+        "schema_version": ABLATION_REPORT_CARD_SCHEMA_VERSION,
         "status": status,
         "coverage": coverage,
         "required_for_full_gate": required_for_full_gate,

@@ -8,13 +8,15 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from cup.seismic.contracts import FORWARD_OBSERVABILITY_SCHEMA_VERSION
 from cup.synthetic.calibration import GENERATOR_FAMILY
+from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION
 from cup.synthetic.core.config import parse_object_core_controls
 from cup.config.sources import assert_recorded_source_matches, require_source_files
 from cup.utils.io import resolve_relative_path
 
 
-DATA_SCHEMA = "synthoseis_lite_v3"
+DATA_SCHEMA = BENCHMARK_SCHEMA_VERSION
 IMPLEMENTATION_SCOPE = (
     "impedance_truth_frequency_probes_forward_qc_lfm_and_seismic_mismatch"
 )
@@ -960,9 +962,10 @@ def resolve_sources(
         "r", encoding="utf-8"
     ) as handle:
         summary = json.load(handle)
-    if summary.get("schema_version") != "forward_observability_v2":
+    if summary.get("schema_version") != FORWARD_OBSERVABILITY_SCHEMA_VERSION:
         raise ValueError(
-            "forward_observability run_summary.json must use forward_observability_v2."
+            "forward_observability run_summary.json must use "
+            f"{FORWARD_OBSERVABILITY_SCHEMA_VERSION}."
         )
     recorded = summary.get("source_runs") or {}
     for key in ("well_preprocess_dir", "well_auto_tie_dir", "wavelet_generation_dir"):

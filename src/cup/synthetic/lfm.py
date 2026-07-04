@@ -8,6 +8,7 @@ from typing import Any, Mapping
 import numpy as np
 from scipy.signal import firwin
 
+from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION
 from cup.synthetic.random import ar1_irregular, named_rng
 from cup.utils.statistics import centered_rms
 
@@ -32,7 +33,7 @@ def _rng(
 ) -> np.random.Generator:
     return named_rng(
         global_seed=global_seed,
-        benchmark_version="synthoseis_lite_v3",
+        benchmark_version=BENCHMARK_SCHEMA_VERSION,
         generator_family=generator_family,
         stream_purpose=stream_purpose,
         realization_id=realization_id,

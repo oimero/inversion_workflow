@@ -67,6 +67,8 @@ from cup.well.preprocess import (
 )
 from wtie.processing import grid
 
+SCHEMA_VERSION = "well_preprocess_v2"
+
 # CLI and config
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -736,7 +738,7 @@ def run_preprocess(
         else {}
     )
     summary = {
-        "schema_version": "well_preprocess_v2",
+        "schema_version": SCHEMA_VERSION,
         "status": "success",
         "script": "well_preprocess.py",
         "inputs": {
@@ -784,7 +786,7 @@ def run_preprocess(
     )
     summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
     summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
-        contract_schema_version="well_preprocess_v2",
+        contract_schema_version=SCHEMA_VERSION,
         semantics={
             "required_categories": required_categories,
             "selected_categories": selected_categories,

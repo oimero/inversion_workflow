@@ -51,6 +51,8 @@ from cup.well.curves import (
 from cup.well.las import export_selected_curves_to_las, scan_las_curves
 from cup.well.mnemonics import CURVE_CATEGORY_MNEMONICS, CURVE_CATEGORY_PRIORITY
 
+SCHEMA_VERSION = "well_screen_v2"
+
 # CLI
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -361,7 +363,7 @@ def run_screening(
         else {}
     )
     summary = {
-        "schema_version": "well_screen_v2",
+        "schema_version": SCHEMA_VERSION,
         "status": "success",
         "script": "well_screen.py",
         "inputs": {
@@ -402,7 +404,7 @@ def run_screening(
     )
     summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
     summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
-        contract_schema_version="well_screen_v2",
+        contract_schema_version=SCHEMA_VERSION,
         semantics={"required_categories": summary["required_categories"], "selected_categories": summary["selected_categories"]},
         business_config=config,
         input_contracts=input_contracts,

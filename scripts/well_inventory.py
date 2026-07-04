@@ -53,6 +53,8 @@ from cup.well.assets import (
     value_counts,
 )
 
+SCHEMA_VERSION = "well_inventory_v2"
+
 # CLI
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -298,11 +300,11 @@ def _write_outputs(inventory: WellInventory, output_dir: Path, run_summary: dict
     inventory.records_dataframe().to_csv(paths["well_inventory_csv"], index=False, encoding="utf-8")
     inventory.neighbor_pairs_dataframe().to_csv(paths["well_neighbor_pairs_csv"], index=False, encoding="utf-8")
     inventory.clusters_dataframe().to_csv(paths["well_clusters_csv"], index=False, encoding="utf-8")
-    run_summary["schema_version"] = "well_inventory_v2"
+    run_summary["schema_version"] = SCHEMA_VERSION
     run_summary["status"] = "success"
     run_summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
     run_summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
-        contract_schema_version="well_inventory_v2",
+        contract_schema_version=SCHEMA_VERSION,
         semantics={
             "sample_domain": run_summary["inputs"]["seismic_domain"],
             "geometry": run_summary["geometry"],

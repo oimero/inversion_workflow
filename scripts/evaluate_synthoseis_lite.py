@@ -24,6 +24,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.synthetic.dataset import SynthoseisBenchmark
+from cup.synthetic.contracts import REPORT_SCHEMA_VERSION
 from cup.synthetic.metrics import aggregate_metric_rows, metric_row, regression_metrics
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
@@ -35,7 +36,6 @@ from cup.utils.io import (
 )
 
 
-SCHEMA_VERSION = "synthoseis_lite_report_v2"
 BASELINES = ("lfm_controlled_degraded", "lfm_ideal", "oracle_target")
 
 
@@ -254,7 +254,7 @@ def main() -> None:
     geometry_metrics.to_csv(geometry_metrics_path, index=False)
 
     report = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": REPORT_SCHEMA_VERSION,
         "benchmark_dir": repo_relative_path(benchmark_dir, root=REPO_ROOT),
         "baseline_ids": baselines,
         "sample_kinds": sorted(kinds),
@@ -282,7 +282,7 @@ def main() -> None:
         }
     }
     contract_fingerprint = contract_fingerprint_sha256(
-        contract_schema_version=SCHEMA_VERSION,
+        contract_schema_version=REPORT_SCHEMA_VERSION,
         semantics={"baseline_ids": baselines, "sample_kinds": sorted(kinds)},
         business_config={"sample_count": len(sample_ids)},
         input_contracts=input_contracts,
@@ -294,7 +294,7 @@ def main() -> None:
         },
     )
     summary = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": REPORT_SCHEMA_VERSION,
         "status": "ok",
         "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
         "contract_fingerprint_sha256": contract_fingerprint,

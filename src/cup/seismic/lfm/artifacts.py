@@ -10,7 +10,7 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from cup.seismic.lfm.pipeline import RUN_SCHEMA, VARIANT_SCHEMA
+from cup.seismic.lfm.contracts import RUN_SCHEMA, VARIANT_SCHEMA
 from cup.utils.io import require_contract_fingerprint, resolve_relative_path
 from cup.well.real_field_controls import SCHEMA_VERSION as WELL_CONTROL_SCHEMA
 

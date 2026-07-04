@@ -46,6 +46,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 BOUNDARY_EFFECT_WAVELET_THRESHOLD = DEFAULT_ACTIVE_SUPPORT_THRESHOLD
 DYNAMIC_GAIN_LOG_CLIP = 3.0
+DYNAMIC_GAIN_SCHEMA_VERSION = "dynamic_gain_v3"
 
 
 def compute_dynamic_gain_median(
@@ -289,7 +290,7 @@ def _validate_dynamic_gain_npz_contract(
 
     metadata = _json_scalar_to_dict(archive["metadata_json"])
     expected = {
-        "schema_version": "dynamic_gain_v3",
+        "schema_version": DYNAMIC_GAIN_SCHEMA_VERSION,
         "sample_domain": "time",
         "sample_unit": "s",
         "normalization": "seismic_raw_divided_by_train_mask_rms",
@@ -402,7 +403,8 @@ def load_dynamic_gain_model(gain_model_file: Path, seismic_geometry: dict[str, A
 
     if gain_path.suffix.lower() != ".npz":
         raise ValueError(
-            f"Dynamic gain model must be a dynamic_gain_v3 .npz file, got suffix {gain_path.suffix!r}: {gain_path}"
+            f"Dynamic gain model must be a {DYNAMIC_GAIN_SCHEMA_VERSION} .npz file, "
+            f"got suffix {gain_path.suffix!r}: {gain_path}"
         )
 
     with np.load(gain_path, allow_pickle=False) as archive:

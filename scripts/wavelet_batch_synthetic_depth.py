@@ -44,6 +44,7 @@ from cup.utils.io import (
     sanitize_filename,
 )
 from cup.config.workflow import WorkflowConfig
+from cup.well.contracts import DEPTH_WAVELET_BATCH_SCHEMA_VERSION
 from cup.seismic.survey import segy_options_from_config
 
 matplotlib.use("Agg")
@@ -1182,7 +1183,7 @@ def main() -> None:
     ok_count = int((metrics_df["status"] == "ok").sum()) if "status" in metrics_df.columns else 0
     failed_count = int((metrics_df["status"] != "ok").sum()) if "status" in metrics_df.columns else len(metrics_df)
     summary_payload = {
-        "schema_version": "wavelet_batch_synthetic_depth_v3",
+        "schema_version": DEPTH_WAVELET_BATCH_SCHEMA_VERSION,
         "script": "wavelet_batch_synthetic_depth.py",
         "status": "success" if ok_count > 0 else "failed",
         "completion_status": "complete" if failed_count == 0 else "partial" if ok_count > 0 else "failed",
@@ -1258,7 +1259,7 @@ def main() -> None:
             )
         summary_payload["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
         summary_payload["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
-            contract_schema_version="wavelet_batch_synthetic_depth_v3",
+            contract_schema_version=DEPTH_WAVELET_BATCH_SCHEMA_VERSION,
             semantics={
                 "sample_domain": "depth",
                 "sample_unit": "m",

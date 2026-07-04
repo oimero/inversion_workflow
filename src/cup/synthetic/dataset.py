@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION, LEGACY_BENCHMARK_SCHEMA_VERSION
 from cup.synthetic.readers.depth_v2 import DepthSyntheticSample, DepthV2Benchmark
 from cup.synthetic.readers.time_v2 import TimeV2Benchmark, TimeV2SyntheticSample
 
@@ -43,11 +44,11 @@ class SynthoseisBenchmark:
         schema = str(manifest.get("schema") or manifest.get("schema_version") or "")
         sample_domain = str(manifest.get("sample_domain") or "").casefold()
 
-        if schema == "synthoseis_lite_v1":
+        if schema == LEGACY_BENCHMARK_SCHEMA_VERSION:
             raise ValueError(
                 "time-v1 Synthoseis artifacts are legacy and are not supported by the v3 facade."
             )
-        if schema == "synthoseis_lite_v3":
+        if schema == BENCHMARK_SCHEMA_VERSION:
             if sample_domain == "time":
                 self._reader = TimeV2Benchmark(
                     self.run_dir,
@@ -58,12 +59,12 @@ class SynthoseisBenchmark:
                 )
             else:
                 raise ValueError(
-                    f"synthoseis_lite_v3 requires sample_domain='time' or 'depth'; got {sample_domain!r}."
+                    f"{BENCHMARK_SCHEMA_VERSION} requires sample_domain='time' or 'depth'; got {sample_domain!r}."
                 )
         else:
             raise ValueError(
                 f"Unsupported Synthoseis schema {schema!r}. "
-                "Supported schema: synthoseis_lite_v3 with sample_domain=time|depth."
+                f"Supported schema: {BENCHMARK_SCHEMA_VERSION} with sample_domain=time|depth."
             )
 
         self.schema = schema

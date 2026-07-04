@@ -14,6 +14,8 @@ from cup.utils.statistics import radius_connected_components
 from cup.well.real_field_controls import load_well_control_set
 
 
+SCHEMA_VERSION = "real_delta_well_samples_v3"
+
 ANCHOR_SAMPLE_COLUMNS = [
     "well_name",
     "sample_index",
@@ -239,7 +241,7 @@ def build_well_anchor_samples(
     if frame.empty or not frame["valid_for_fit"].any():
         raise ValueError("Variant-specific real-delta label builder produced no valid samples.")
     metadata = {
-        "schema_version": "real_delta_well_samples_v3",
+        "schema_version": SCHEMA_VERSION,
         "variant_id": str(variant_id),
         "lfm_contract_fingerprint_sha256": str(lfm_contract_fingerprint_sha256),
         "well_control_contract_fingerprint_sha256": actual_control_fingerprint,

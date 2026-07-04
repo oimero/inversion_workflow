@@ -14,6 +14,7 @@ from cup.synthetic.calibration import (
     STATE_NAMES,
     object_profile_metrics,
 )
+from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION
 from cup.synthetic.forward import antialias_taps, categorical_model_grids, downsample_continuous
 from cup.synthetic.random import ar1_irregular, named_rng
 
@@ -97,7 +98,7 @@ def _rng_keys(
 ) -> dict[str, Any]:
     return {
         "global_seed": int(global_seed),
-        "benchmark_version": "synthoseis_lite_v3",
+        "benchmark_version": BENCHMARK_SCHEMA_VERSION,
         "generator_family": calibration.generator_family,
         "stream_purpose": stream_purpose,
         "realization_id": realization_id,

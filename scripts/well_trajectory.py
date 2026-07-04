@@ -46,6 +46,8 @@ from cup.utils.io import (
 from cup.well.assets import build_file_lookup, normalize_well_name
 from cup.well.trajectory import WellTrajectory, trajectory_summary, z_tvd_residual_m
 
+SCHEMA_VERSION = "well_trajectory_v2"
+
 # CLI and config
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -515,7 +517,7 @@ def main() -> None:
     failed_df.to_csv(paths["failed_trajectories"], index=False)
 
     run_summary = {
-        "schema_version": "well_trajectory_v2",
+        "schema_version": SCHEMA_VERSION,
         "status": "success",
         "script": "well_trajectory.py",
         "config_file": repo_relative_path(args.config, root=REPO_ROOT),
@@ -541,7 +543,7 @@ def main() -> None:
     }
     run_summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
     run_summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
-        contract_schema_version="well_trajectory_v2",
+        contract_schema_version=SCHEMA_VERSION,
         semantics={"geometry": geometry, "summary": summary},
         business_config={"classification": script_cfg["classification"], "survey_qc": survey_cfg},
         input_contracts=input_contracts,

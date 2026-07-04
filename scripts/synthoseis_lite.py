@@ -37,6 +37,8 @@ from cup.synthetic.depth.config import (  # noqa: E402
     resolve_depth_v2_sources,
 )
 from cup.synthetic.depth.generation import run_depth_generation  # noqa: E402
+from cup.seismic.contracts import FORWARD_OBSERVABILITY_SCHEMA_VERSION  # noqa: E402
+from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION  # noqa: E402
 from cup.config.workflow import WorkflowConfig  # noqa: E402
 from cup.config.sources import load_summary, resolve_source_run  # noqa: E402
 from cup.utils.io import (  # noqa: E402
@@ -44,10 +46,6 @@ from cup.utils.io import (  # noqa: E402
     repo_relative_path,
     resolve_relative_path,
 )
-
-
-TIME_SCHEMA = "synthoseis_lite_v3"
-DEPTH_SCHEMA = "synthoseis_lite_v3"
 
 
 def _positive_int_arg(value: str) -> int:
@@ -127,10 +125,10 @@ def _prepare_synthoseis_config(raw: dict, workflow: WorkflowConfig) -> dict:
             root=REPO_ROOT,
             label="forward_observability",
             summary_file="run_summary.json",
-            schema_version="forward_observability_v2",
+            schema_version=FORWARD_OBSERVABILITY_SCHEMA_VERSION,
         )
         summary = load_summary(
-            obs_dir / "run_summary.json", schema_version="forward_observability_v2"
+            obs_dir / "run_summary.json", schema_version=FORWARD_OBSERVABILITY_SCHEMA_VERSION
         )
         recorded = dict(summary.get("source_runs") or {})
         source_runs = {
@@ -203,7 +201,7 @@ def main() -> None:
         raise ValueError("Synthoseis-lite config root must be a mapping.")
     sample_domain, benchmark_schema = _dispatch_keys(experiment_raw)
 
-    if (sample_domain, benchmark_schema) == ("depth", DEPTH_SCHEMA):
+    if (sample_domain, benchmark_schema) == ("depth", BENCHMARK_SCHEMA_VERSION):
         if "workflow_config" not in experiment_raw:
             raise ValueError("Depth Synthoseis-lite v3 requires workflow_config.")
         raw, workflow, config_provenance = load_composed_config(
@@ -254,7 +252,7 @@ def main() -> None:
         print(f"Output: {output_dir}")
         print(f"Status: {summary.get('status', 'success')}")
         return
-    if (sample_domain, benchmark_schema) != ("time", TIME_SCHEMA):
+    if (sample_domain, benchmark_schema) != ("time", BENCHMARK_SCHEMA_VERSION):
         raise ValueError(
             "Unsupported Synthoseis-lite dispatch: "
             f"sample_domain={sample_domain!r}, benchmark_schema={benchmark_schema!r}."

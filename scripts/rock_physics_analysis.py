@@ -40,6 +40,7 @@ from cup.config.sources import resolve_source_run
 from cup.config.workflow import WorkflowConfig
 from cup.physics.numpy_backend import forward_time
 from cup.physics.rock_physics import WellAiVpSamples, fit_equal_well_huber, well_fit_metrics
+from cup.synthetic.contracts import FORWARD_MODEL_INPUTS_SCHEMA_VERSION, ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
@@ -52,10 +53,10 @@ from cup.utils.io import (
 )
 
 
-SCHEMA_VERSION = "rock_physics_analysis_v2"
+SCHEMA_VERSION = ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION
 SCRIPT_VERSION = 1
 RELATION_SCHEMA = "rock_physics_relation_v1"
-FORWARD_INPUTS_SCHEMA = "forward_model_inputs_v2"
+FORWARD_INPUTS_SCHEMA = FORWARD_MODEL_INPUTS_SCHEMA_VERSION
 DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")
 KNOWN_MODULES = {"ai_vp_linear"}
 EXPECTED_CURVES = {

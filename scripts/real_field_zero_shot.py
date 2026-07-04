@@ -31,6 +31,7 @@ sys.path = [path for path in sys.path if path != src_text]
 sys.path.insert(0, src_text)
 
 from cup.config.sources import resolve_source_run
+from cup.seismic.geometry import SampleAxis
 from cup.seismic.lfm.artifacts import resolve_lfm_variant
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.well.real_field_controls import load_well_control_set
@@ -45,6 +46,7 @@ from cup.utils.io import (
 )
 from cup.seismic.volume_export import export_volume_like_source, log_ai_to_ai_volume
 from ginn_v2.contracts import ZERO_SHOT_SUMMARY_SCHEMA_VERSION
+from ginn_v2.contracts import ZERO_SHOT_MODEL_SCHEMA_VERSION
 from ginn_v2.real_field import (
     input_qc_frame,
     load_real_field_section,
@@ -165,15 +167,21 @@ def _prepare_real_field_inputs(run_cfg: dict, workflow_cfg: dict) -> dict:
     source_runs["lfm_run_dir"] = repo_relative_path(selected.run_dir, root=REPO_ROOT)
     source_runs["variant_id"] = selected.variant_id
     source_runs["well_control_run_dir"] = repo_relative_path(selected.well_control_run_dir, root=REPO_ROOT)
-    wavelet_dir = resolve_source_run(
-        source_runs.get("wavelet_generation_dir"),
-        output_root=output_root,
-        prefix="wavelet_generation",
-        required_files=["selected_wavelet.csv", "selected_wavelet_summary.json"],
-        root=REPO_ROOT,
-        label="wavelet_generation",
-    )
-    source_runs["wavelet_generation_dir"] = repo_relative_path(wavelet_dir, root=REPO_ROOT)
+    if selected_domain == "time":
+        wavelet_dir = resolve_source_run(
+            source_runs.get("wavelet_generation_dir"),
+            output_root=output_root,
+            prefix="wavelet_generation",
+            required_files=["selected_wavelet.csv", "selected_wavelet_summary.json"],
+            root=REPO_ROOT,
+            label="wavelet_generation",
+        )
+        source_runs["wavelet_generation_dir"] = repo_relative_path(wavelet_dir, root=REPO_ROOT)
+    elif str(source_runs.get("wavelet_generation_dir") or "").strip():
+        raise ValueError(
+            "Depth R0 rejects source_runs.wavelet_generation_dir; "
+            "the model forward_model_inputs contract owns the depth wavelet."
+        )
     prepared["real_field_inputs"] = inputs
     prepared["source_runs"] = source_runs
     return prepared
@@ -256,7 +264,7 @@ def _write_well_prediction_qc(output_dir: Path, *, run_cfg: dict) -> dict[str, o
     first = next(iter(model_arrays.values()))
     ilines = np.asarray(first["ilines"], dtype=np.float64)
     xlines = np.asarray(first["xlines"], dtype=np.float64)
-    samples = np.asarray(first["twt_s"], dtype=np.float64)
+    samples = np.asarray(first["samples"], dtype=np.float64)
     seismic_info = dict(selected.run_summary.get("seismic") or {})
     seismic_path = resolve_relative_path(str(seismic_info.get("path") or ""), root=REPO_ROOT)
     seismic_type = str(seismic_info.get("type") or "").casefold()
@@ -378,6 +386,11 @@ def _plot_zero_shot_qc(output_dir: Path) -> dict[str, str]:
             continue
         arrays = np.load(child / "predictions.npz", allow_pickle=True)
         model_arrays[child.name] = arrays
+        vertical_label = (
+            "TVDSS sample"
+            if str(np.asarray(arrays["sample_domain"]).item()) == "depth"
+            else "TWT sample"
+        )
         lfm = arrays["lfm_input"]
         pred = arrays["stitched_pred_log_ai"]
         delta = arrays["pred_delta_vs_lfm"]
@@ -401,7 +414,7 @@ def _plot_zero_shot_qc(output_dir: Path) -> dict[str, str]:
                     ax.set_title(title)
                     ax.set_xlabel(xlabel)
                     fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-                axes[0].set_ylabel("TWT sample" if suffix != "central_time_slice" else "inline")
+                axes[0].set_ylabel(vertical_label if suffix != "central_time_slice" else "inline")
                 fig.suptitle(f"R0 volume QC {suffix}: {child.name}")
                 fig.tight_layout()
                 path = figures / f"{child.name}_{suffix}_lfm_delta_pred.png"
@@ -419,7 +432,7 @@ def _plot_zero_shot_qc(output_dir: Path) -> dict[str, str]:
             ax.set_title(title)
             ax.set_xlabel("lateral trace")
             fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-        axes[0].set_ylabel("TWT sample")
+        axes[0].set_ylabel(vertical_label)
         fig.suptitle(f"R0 zero-shot QC: {child.name}")
         fig.tight_layout()
         path = figures / f"{child.name}_lfm_delta_pred.png"
@@ -427,14 +440,19 @@ def _plot_zero_shot_qc(output_dir: Path) -> dict[str, str]:
         plt.close(fig)
         outputs[f"{child.name}_triptych"] = repo_relative_path(path, root=REPO_ROOT)
     if "lateral" in model_arrays and "no_lateral" in model_arrays:
+        vertical_label = (
+            "TVDSS sample"
+            if str(np.asarray(model_arrays["lateral"]["sample_domain"]).item()) == "depth"
+            else "TWT sample"
+        )
         diff = model_arrays["lateral"]["stitched_pred_log_ai"] - model_arrays["no_lateral"]["stitched_pred_log_ai"]
         if diff.ndim == 3:
             il_mid = diff.shape[0] // 2
             xl_mid = diff.shape[1] // 2
             twt_mid = diff.shape[2] // 2
             panels = [
-                ("central_inline", diff[il_mid], "xline", "TWT sample"),
-                ("central_xline", diff[:, xl_mid, :], "inline", "TWT sample"),
+                ("central_inline", diff[il_mid], "xline", vertical_label),
+                ("central_xline", diff[:, xl_mid, :], "inline", vertical_label),
                 ("central_time_slice", diff[:, :, twt_mid], "xline", "inline"),
             ]
             for suffix, values, xlabel, ylabel in panels:
@@ -457,7 +475,7 @@ def _plot_zero_shot_qc(output_dir: Path) -> dict[str, str]:
         image = ax.imshow(diff.T, aspect="auto", origin="upper", cmap="coolwarm", vmin=-vmax, vmax=vmax)
         ax.set_title("lateral - no_lateral log(AI)")
         ax.set_xlabel("lateral trace")
-        ax.set_ylabel("TWT sample")
+        ax.set_ylabel(vertical_label)
         fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
         fig.tight_layout()
         path = figures / "lateral_minus_no_lateral.png"
@@ -774,12 +792,12 @@ def _export_zero_shot_volumes(output_dir: Path, *, run_cfg: dict, data_root: Pat
                 volume=pred_ai,
                 ilines=np.asarray(arrays["ilines"], dtype=np.float64),
                 xlines=np.asarray(arrays["xlines"], dtype=np.float64),
-                samples=np.asarray(arrays["twt_s"], dtype=np.float64),
+                samples=np.asarray(arrays["samples"], dtype=np.float64),
                 source_seismic_file=source_file,
                 source_seismic_type=source_type,
                 title=f"R0 zero-shot pred_ai: {child.name}",
                 details=[
-                    "schema=real_field_zero_shot_model_v1",
+                    f"schema={ZERO_SHOT_MODEL_SCHEMA_VERSION}",
                     "field=pred_ai",
                     "domain=AI",
                     "source_field=stitched_pred_log_ai",
@@ -827,6 +845,42 @@ def _input_distribution_warnings(qc_path: Path) -> list[dict[str, object]]:
     return warnings
 
 
+def _boundary_contract(
+    boundary: dict[str, object],
+    *,
+    sample_axis: SampleAxis,
+) -> dict[str, object]:
+    if sample_axis.step <= 0.0:
+        raise ValueError("R0 boundary contract requires a positive sample step.")
+    if sample_axis.domain == "time":
+        active = ("loss_or_eval_erosion_s", "prediction_taper_halo_s")
+        forbidden = ("loss_or_eval_erosion_m", "prediction_taper_halo_m")
+    elif sample_axis.domain == "depth":
+        active = ("loss_or_eval_erosion_m", "prediction_taper_halo_m")
+        forbidden = ("loss_or_eval_erosion_s", "prediction_taper_halo_s")
+    else:
+        raise ValueError(f"Unsupported R0 sample domain: {sample_axis.domain!r}")
+    present_forbidden = [key for key in forbidden if boundary.get(key) is not None]
+    if present_forbidden:
+        raise ValueError(
+            f"{sample_axis.domain} R0 boundary rejects wrong-domain fields: "
+            f"{present_forbidden}"
+        )
+    erosion = float(boundary.get(active[0], 0.0) or 0.0)
+    taper = float(boundary.get(active[1], 0.0) or 0.0)
+    if not np.isfinite(erosion) or not np.isfinite(taper) or erosion < 0.0 or taper < 0.0:
+        raise ValueError("R0 boundary widths must be finite and non-negative.")
+    return {
+        active[0]: erosion,
+        active[1]: taper,
+        "loss_or_eval_erosion_samples": int(np.ceil(erosion / sample_axis.step)),
+        "prediction_taper_halo_samples": int(np.ceil(taper / sample_axis.step)),
+        "sample_step": float(sample_axis.step),
+        "sample_unit": sample_axis.unit,
+        "forward_diagnostic_erosion": "disabled",
+    }
+
+
 def main() -> None:
     args = parse_args()
     cfg_path = resolve_relative_path(args.config, root=REPO_ROOT)
@@ -859,6 +913,9 @@ def main() -> None:
         field = load_real_field_volume(config=run_cfg_for_load, root=REPO_ROOT, data_root=data_root)
     else:
         raise ValueError(f"Unsupported real_field_zero_shot.mode: {output_mode}")
+    sample_axis = field.sample_axis
+    boundary = dict(run_cfg.get("boundary") or {})
+    boundary_contract = _boundary_contract(boundary, sample_axis=sample_axis)
 
     model_summaries = []
     input_qc_written = False
@@ -893,33 +950,32 @@ def main() -> None:
         else _write_well_prediction_qc(output_dir, run_cfg=run_cfg_for_load)
     )
     volume_exports = _export_zero_shot_volumes(output_dir, run_cfg=run_cfg_for_load, data_root=data_root)
-    dt_s = float(field.twt_s[1] - field.twt_s[0]) if field.twt_s.size > 1 else 0.002
-    spectral_outputs = _write_spectral_qc(output_dir, run_cfg=run_cfg, dt_s=dt_s)
+    if sample_axis.domain == "time":
+        spectral_outputs = _write_spectral_qc(
+            output_dir,
+            run_cfg=run_cfg,
+            dt_s=float(sample_axis.step),
+        )
+    else:
+        spectral_outputs = {}
 
     source_runs = dict(run_cfg.get("source_runs") or {})
-    boundary = dict(run_cfg.get("boundary") or {})
-    dt_s = float(field.twt_s[1] - field.twt_s[0]) if field.twt_s.size > 1 else 0.002
     input_qc_path = output_dir / "model_input_qc.csv"
     if output_mode == "volume":
         axis_contract = {
             "n_inline": int(field.lfm.shape[0]),
             "n_xline": int(field.lfm.shape[1]),
-            "n_twt": int(field.lfm.shape[2]),
+            "n_sample": int(field.lfm.shape[2]),
             "inline_start": float(field.ilines[0]),
             "inline_stop": float(field.ilines[-1]),
             "xline_start": float(field.xlines[0]),
             "xline_stop": float(field.xlines[-1]),
-            "twt_start_s": float(field.twt_s[0]),
-            "twt_stop_s": float(field.twt_s[-1]),
-            "dt_s": float(field.twt_s[1] - field.twt_s[0]) if field.twt_s.size > 1 else None,
+            **sample_axis.describe(),
         }
     else:
         axis_contract = {
             "n_lateral": int(field.lfm.shape[0]),
-            "n_twt": int(field.lfm.shape[1]),
-            "twt_start_s": float(field.twt_s[0]),
-            "twt_stop_s": float(field.twt_s[-1]),
-            "dt_s": float(field.twt_s[1] - field.twt_s[0]) if field.twt_s.size > 1 else None,
+            **sample_axis.describe(),
         }
     input_contracts = {
         "lfm_variant": {
@@ -942,7 +998,7 @@ def main() -> None:
             raise ValueError(f"R0 model summary lacks model_run contract: {model_role}")
         input_contracts[f"model:{model_role}"] = model_input
     wavelet_dir_text = str(source_runs.get("wavelet_generation_dir") or "").strip()
-    if wavelet_dir_text:
+    if sample_axis.domain == "time" and wavelet_dir_text:
         wavelet_summary_path = resolve_relative_path(wavelet_dir_text, root=REPO_ROOT) / "run_summary.json"
         with wavelet_summary_path.open("r", encoding="utf-8") as handle:
             wavelet_summary = json.load(handle)
@@ -958,6 +1014,18 @@ def main() -> None:
         )
         for model_summary in model_summaries
     }
+    forward_model_inputs_paths = {
+        str(model_summary.get("forward_model_inputs_path") or "")
+        for model_summary in model_summaries
+    }
+    if sample_axis.domain == "depth":
+        if len(forward_model_inputs_paths) != 1 or not next(iter(forward_model_inputs_paths)):
+            raise ValueError(
+                "Depth R0 models must share one explicit forward_model_inputs_path."
+            )
+        forward_model_inputs_path = next(iter(forward_model_inputs_paths))
+    else:
+        forward_model_inputs_path = ""
     contract_fingerprint = contract_fingerprint_sha256(
         contract_schema_version=ZERO_SHOT_SUMMARY_SCHEMA_VERSION,
         semantics={
@@ -985,6 +1053,12 @@ def main() -> None:
         "device_requested": device,
         "stitch_strategy": stitch_strategy,
         "source_runs": source_runs,
+        "sample_domain": sample_axis.domain,
+        "sample_unit": sample_axis.unit,
+        "depth_basis": field.depth_basis,
+        "forward_model_inputs": {"path": forward_model_inputs_path}
+        if forward_model_inputs_path
+        else {},
         "section": field.metadata if output_mode == "section" else {},
         "volume": field.metadata if output_mode == "volume" else {},
         "axis_contract": axis_contract,
@@ -992,14 +1066,7 @@ def main() -> None:
             "valid_fraction": float(field.valid_mask.mean()),
             "valid_samples": int(field.valid_mask.sum()),
         },
-        "boundary_contract": {
-            "loss_or_eval_erosion_s": float(boundary.get("loss_or_eval_erosion_s", 0.0) or 0.0),
-            "prediction_taper_halo_s": float(boundary.get("prediction_taper_halo_s", 0.0) or 0.0),
-            "forward_diagnostic_erosion": "disabled",
-            "loss_or_eval_erosion_samples": int(np.ceil(float(boundary.get("loss_or_eval_erosion_s", 0.0) or 0.0) / dt_s)),
-            "prediction_taper_halo_samples": int(np.ceil(float(boundary.get("prediction_taper_halo_s", 0.0) or 0.0) / dt_s)),
-            "dt_s": dt_s,
-        },
+        "boundary_contract": boundary_contract,
         "input_distribution_qc": {
             "path": repo_relative_path(input_qc_path, root=REPO_ROOT),
             "warnings": _input_distribution_warnings(input_qc_path),

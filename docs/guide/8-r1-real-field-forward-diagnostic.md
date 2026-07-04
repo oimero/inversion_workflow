@@ -25,8 +25,8 @@ python scripts/real_field_forward_diagnostic.py --output-dir scripts/output/real
 |------|------|------|
 | 第八步 R0 | `real_field_zero_shot_summary.json` | R0 推理的完整元数据和来源回溯 |
 | 第八步 R0 | `predictions.npz`（每个模型子目录） | 预测波阻抗和地震输入 |
-| 第五步 | `selected_wavelet.csv` | 全局子波，用于正演合成地震记录 |
-| 第五步 | `selected_wavelet_summary.json` | 子波来源校验 |
+| 第五步（时间域） | `selected_wavelet.csv` | 时间域正演子波 |
+| 岩石物理旁路（深度域） | `forward_model_inputs.json` | 深度域冻结子波、速度关系与来源契约 |
 | 第四步 | `well_tie_metrics.csv` | 井的标定状态和坐标，用于井 QC |
 | 第四步 | `wavelet_inventory.csv` | 候选子波清单，用于子波不确定性扫描 |
 | 第一步 | `well_inventory.csv` | 井位坐标和井型信息 |
@@ -68,6 +68,18 @@ real_field_forward_diagnostic:
     candidate_wavelet_limit: 0                  # 默认 0（不限制）
 ```
 
+上例是时间域配置。深度域使用三组彼此独立的扰动：
+
+```yaml
+real_field_forward_diagnostic:
+  diagnostic_scan:
+    phase_deg: [-20, -10, 0, 10, 20]
+    wavelet_time_shift_s: [-0.002, 0.0, 0.002]
+    depth_static_m: [-10.0, -5.0, 0.0, 5.0, 10.0]
+```
+
+深度域不接受分数采样偏移和赫兹频带配置。时间子波始终使用秒，观测地震、预测阻抗与合成地震始终使用米制 TVDSS。
+
 ### `boundary`
 
 正演诊断时是否从连续有效掩码段内侧做侵蚀，避免卷积边界伪影污染诊断统计：
@@ -82,6 +94,8 @@ real_field_forward_diagnostic:
 ### `well_qc`
 
 控制井数据闭环检查。开启后从第四步读取所有标定成功井：用滤波 LAS 做正演基准、用低频模型做正演底线、用模型预测做正演对比。
+
+深度域从统一井控读取 TVDSS 上的波阻抗，不经过时深表投影。体积模式按显式 inline/xline 轴采样；剖面模式使用测量几何计算井到剖面的距离。
 
 ```yaml
   well_qc:
@@ -99,6 +113,8 @@ real_field_forward_diagnostic:
 ### `spectral_qc`
 
 不填时按 `diagnostic_max_hz` 自动三等分。R1 的频带诊断比 R0 多一层：同时分析合成记录的频带拟合残差。需要自定义频带时：
+
+该节只适用于时间域。深度域保留 TVDSS 波形闭环指标，不运行以等间隔 TWT 为前提的赫兹诊断。
 
 ```yaml
   spectral_qc:
@@ -133,6 +149,14 @@ real_field_forward_diagnostic:
 | `phase_deg` | `[-20, -10, 0, 10, 20]` | 常相位扫描角度列表 |
 | `fractional_shift_samples` | `[-1.0, -0.5, 0.0, 0.5, 1.0]` | 分数采样偏移列表 |
 | `candidate_wavelet_limit` | `0` | 子波敏感性检查的候选子波数量上限。`0` 不限制 |
+
+深度域字段如下：
+
+| 参数 | 含义 |
+|------|------|
+| `phase_deg` | 秒制时间子波的常相位扫描 |
+| `wavelet_time_shift_s` | 子波时间轴上的秒制平移 |
+| `depth_static_m` | 合成深度记录在 TVDSS 上的米制静差 |
 
 ### `red_flag_thresholds`
 
@@ -223,7 +247,7 @@ synthetic[l] = Σ_j wavelet(twt[l] - event_twt[j]) * r[j]
 | `real_field_forward_diagnostic_summary.json` | 诊断摘要：来源路径、正演约定、红色告警、推荐下一步 |
 | `forward_diagnostic_metrics.csv` | 每个阻抗 × 子波场景的基本波形指标和缩放信息 |
 | `residual_decomposition.csv` | 相位扫描和分数偏移扫描的残差分解明细 |
-| `wavelet_sensitivity.csv` | 各候选子波场景下的波形指标，用于评估子波不确定性的影响 |
+| `wavelet_sensitivity.csv` | 时间域各候选子波场景下的波形指标 |
 | `spatial_residual_qc.csv` | 逐 inline/xline 的空间残差模式 |
 
 ### 频带分析
@@ -252,7 +276,7 @@ synthetic[l] = Σ_j wavelet(twt[l] - event_twt[j]) * r[j]
 | 文件 | 内容 |
 |------|------|
 | `figures/<role>_observed_synthetic_residual.png` | 三面板：观测 / 合成 / 残差 |
-| `figures/phase_shift_gain_scan.png` | 相位和分数偏移扫描曲线 |
+| `figures/phase_shift_gain_scan.png` | 时间域相位和分数偏移扫描曲线 |
 | `figures/spatial_residual_qc.png` | 空间残差模式（逐线） |
 | `figures/forward_band_residual_qc.png` | 各频带残差/观测比值柱状图 |
 | `figures/ai_band_energy_qc.png` | 预测差值频带能量分布 |

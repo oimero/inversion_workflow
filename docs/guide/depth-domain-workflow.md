@@ -242,7 +242,18 @@ synthoseis_lite:
 | 输出 | N 点 | N 点 |
 | 坐标 | TWT | TVDSS，通过梯形慢度积分转相对 TWT，再套用时间子波 |
 
-核心实现在 `src/cup/physics/`。
+核心实现在 `src/cup/physics/`，NumPy 与 PyTorch 双后端提供同名、同语义 API。调用方按采样域分派到 `forward_time` 或 `forward_depth`；反射率统一使用 `reflectivity_from_log_ai`（下界面挂点，长度 N-1）。合成地震与观测轴均为 N 点，不按域裁剪首尾样点。
+
+深度域正演额外要求 AI–Vp 关系，由 Step 6 岩石物理分析产出：
+
+```text
+AI = a * Vp + b          (a: g/cm³, b: m/s*g/cm³)
+Vp = (AI - b) / a
+```
+
+正演时由 `velocity_from_ai` 将预测阻抗转为传播速度，与冻结子波和 TVDSS 轴一起传入 `forward_depth`。子波始终使用秒制时间轴，不随采样域改变。
+
+内核严格拒绝：NaN 输入、非正速度、非递增深度、错域输入、偶数长度子波、形状刚好可广播但实际上不同义的数组。任何数据清洗必须在进入核心前以命名步骤显式执行。
 
 ### 工作流配置
 
@@ -252,6 +263,10 @@ synthoseis_lite:
 - `seismic.depth_basis: tvdss`
 - 米制边界使用 `_m` 后缀（`margin_top_m`、`margin_bottom_m`），不使用 `_ms`
 - 错域字段直接报错，不静默忽略
+
+模型训练、零样本预测和正演闭环沿用同一采样域契约。模型清单与检查点记录深度域、米制单位、TVDSS 基准和岩石物理来源；零样本预测使用通用采样轴；正演闭环由预测阻抗和冻结速度关系生成逐样点速度，再在原生 TVDSS 轴上合成地震。
+
+零样本预测的边缘宽度使用米制配置。正演闭环把子波相位、子波秒制时移和米制深度静差分别扫描。深度域不运行赫兹频带诊断。
 
 ### 体数据几何
 
@@ -266,7 +281,9 @@ synthoseis_lite:
                                           ↓
 深度域旁路：Step 1 → 2 → 3 → 4(vawt_depth) → 5(wbs_depth) → 旁路(rock_physics)
                                                               ↓
-                                              synthoseis_lite depth v2 → GINN v2
+                                              synthoseis_lite depth v3 → GINN v2
+                                                                          ↓
+                                                   统一井控 → LFM v3 → R0 → R1(TVDSS)
 ```
 
 深度域第4步/5 与时间域第4步/5 **互不依赖**、**平行存在**：

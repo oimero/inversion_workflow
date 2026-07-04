@@ -15,6 +15,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
+from cup.physics.torch_backend import forward_depth, forward_time, velocity_from_ai
 from cup.synthetic.dataset import SynthoseisBenchmark
 from cup.synthetic.metrics import regression_metrics
 from cup.utils.io import write_json
@@ -97,14 +98,7 @@ def train_model(
     log_interval_batches: int = 10,
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
-    if (
-        str(benchmark.manifest.get("sample_domain", "")) == "depth"
-        and float(lambda_physics) > 0.0
-    ):
-        raise ValueError(
-            "Depth Synthoseis v3 physics-loss training is intentionally not implemented in this slice; "
-            "the depth GINN v2 training contract must be designed before enabling lambda_physics."
-        )
+    sample_axis_contract = _benchmark_sample_axis_contract(benchmark.manifest)
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = logger or configure_training_logger(output_dir)
     if not np.isfinite(lambda_real_delta) or float(lambda_real_delta) < 0.0:
@@ -193,7 +187,7 @@ def train_model(
             reconstruction_error,
         )
     wavelet = (
-        _load_nominal_wavelet(benchmark.run_dir).to(device)
+        _load_nominal_wavelet(benchmark.run_dir, device=device)
         if float(lambda_physics) > 0.0
         else None
     )
@@ -250,20 +244,29 @@ def train_model(
                         device=device,
                     )
                     lfm = batch["lfm"].to(device).index_select(0, physics_index)
-                    seismic = batch["seismic"].to(device).index_select(0, physics_index)
+                    seismic = batch["seismic_model_consistent"].to(device).index_select(0, physics_index)
                     physics_mask = mask.index_select(0, physics_index)
                     physics_pred = pred.index_select(0, physics_index)
                     pred_log_ai = lfm + _denormalize_delta_torch(
                         physics_pred[:, 0],
                         normalization,
                     )[:, None]
-                    synthetic = _torch_forward_log_ai(pred_log_ai[:, 0], wavelet)
-                    seismic_target = seismic[:, 0, :, 1:]
-                    seismic_mask = physics_mask[:, 0, :, 1:]
+                    wavelet_time_s, wavelet_amp, relation = wavelet
+                    sample_axes = batch["sample_axis"].to(device).index_select(0, physics_index)
+                    synthetic = _forward_physics_batch(
+                        pred_log_ai[:, 0],
+                        sample_axes=sample_axes,
+                        sample_domain=str(sample_axis_contract["sample_domain"]),
+                        wavelet_time_s=wavelet_time_s,
+                        wavelet_amp=wavelet_amp,
+                        ai_velocity_relation=relation,
+                    )
+                    seismic_target = seismic[:, 0]
+                    seismic_mask = batch["physics_valid_mask"].to(device).index_select(0, physics_index)[:, 0]
                     loss_physics = masked_mse(
-                        synthetic[:, None],
-                        seismic_target[:, None],
-                        seismic_mask[:, None],
+                        synthetic,
+                        seismic_target,
+                        seismic_mask,
                     )
                     loss = loss + float(lambda_physics) * loss_physics
             loss_real_delta = torch.zeros((), dtype=loss.dtype, device=device)
@@ -376,6 +379,7 @@ def train_model(
                     epoch=epoch,
                     validation_loss=val_loss,
                     checkpoint_kind="best",
+                    sample_axis_contract=sample_axis_contract,
                 ),
                 best_path,
             )
@@ -412,6 +416,7 @@ def train_model(
             epoch=int(epochs),
             validation_loss=final_validation_loss,
             checkpoint_kind="final",
+            sample_axis_contract=sample_axis_contract,
         ),
         final_path,
     )
@@ -466,6 +471,7 @@ def _checkpoint_payload(
     epoch: int,
     validation_loss: float,
     checkpoint_kind: str,
+    sample_axis_contract: Mapping[str, Any],
 ) -> dict[str, Any]:
     state_dict = {
         name: value.detach().cpu()
@@ -484,6 +490,7 @@ def _checkpoint_payload(
             "hidden_channels": int(hidden_channels),
             "depth": int(depth),
         },
+        "sample_axis_contract": dict(sample_axis_contract),
     }
 
 
@@ -499,31 +506,100 @@ def evaluate_loss(model: torch.nn.Module, loader: DataLoader, device: torch.devi
     return float(np.mean(losses)) if losses else float("nan")
 
 
-def _load_nominal_wavelet(benchmark_dir: Path) -> torch.Tensor:
+def _benchmark_sample_axis_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    domain = str(manifest.get("sample_domain") or "")
+    if domain == "time":
+        unit, basis = "s", None
+    elif domain == "depth" and manifest.get("depth_basis") == "tvdss":
+        unit, basis = "m", "tvdss"
+    else:
+        raise ValueError(
+            "Benchmark must declare sample_domain=time or depth with depth_basis=tvdss."
+        )
+    return {
+        "sample_domain": domain,
+        "sample_unit": unit,
+        "depth_basis": basis,
+    }
+
+
+def _resolve_manifest_path(value: object, *, label: str) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"Benchmark manifest lacks {label}.")
+    path = Path(text)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} not found: {path}")
+    return path
+
+
+def _load_nominal_wavelet(
+    benchmark_dir: Path,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float] | None]:
     manifest_path = Path(benchmark_dir) / "benchmark_manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"benchmark_manifest.json not found: {manifest_path}")
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    source_runs = manifest.get("source_runs") or {}
-    wavelet_dir = source_runs.get("wavelet_generation_dir")
-    if not wavelet_dir:
-        raise ValueError("benchmark manifest lacks source_runs.wavelet_generation_dir")
-    wavelet_path = Path(wavelet_dir)
-    if not wavelet_path.is_absolute():
-        wavelet_path = Path.cwd() / wavelet_path
-    csv_path = wavelet_path / "selected_wavelet.csv"
-    if not csv_path.is_file():
-        raise FileNotFoundError(f"selected_wavelet.csv not found: {csv_path}")
+    domain = str(manifest.get("sample_domain") or "")
+    if domain == "depth":
+        forward_inputs_path = _resolve_manifest_path(
+            manifest.get("forward_model_inputs_path"),
+            label="forward_model_inputs_path",
+        )
+        with forward_inputs_path.open("r", encoding="utf-8") as handle:
+            forward_inputs = json.load(handle)
+        if (
+            forward_inputs.get("sample_domain") != "depth"
+            or forward_inputs.get("depth_basis") != "tvdss"
+        ):
+            raise ValueError("Depth forward_model_inputs must declare depth/TVDSS.")
+        raw_relation = dict(forward_inputs.get("ai_velocity_relation") or {})
+        if raw_relation.get("ai_unit") != "m/s*g/cm3" or raw_relation.get("vp_unit") != "m/s":
+            raise ValueError("Depth AI–Vp relation units are invalid.")
+        relation: dict[str, float] | None = {
+            "a": float(raw_relation["a"]),
+            "b": float(raw_relation["b"]),
+        }
+        csv_path = _resolve_manifest_path(
+            dict(forward_inputs.get("wavelet") or {}).get("path"),
+            label="forward_model_inputs.wavelet.path",
+        )
+    elif domain == "time":
+        relation = None
+        source_runs = manifest.get("source_runs") or {}
+        wavelet_dir = source_runs.get("wavelet_generation_dir")
+        if not wavelet_dir:
+            raise ValueError("Time benchmark lacks source_runs.wavelet_generation_dir.")
+        wavelet_path = Path(wavelet_dir)
+        if not wavelet_path.is_absolute():
+            wavelet_path = Path.cwd() / wavelet_path
+        csv_path = wavelet_path / "selected_wavelet.csv"
+        if not csv_path.is_file():
+            raise FileNotFoundError(f"selected_wavelet.csv not found: {csv_path}")
+    else:
+        raise ValueError(f"Unsupported benchmark sample_domain: {domain!r}")
     frame = pd.read_csv(csv_path)
-    if "amplitude" not in frame:
-        raise ValueError(f"selected_wavelet.csv lacks amplitude column: {csv_path}")
+    missing = sorted({"time_s", "amplitude"} - set(frame.columns))
+    if missing:
+        raise ValueError(f"Wavelet CSV lacks columns {missing}: {csv_path}")
+    time_s = frame["time_s"].to_numpy(dtype=np.float64)
     wavelet = frame["amplitude"].to_numpy(dtype=np.float32)
     if wavelet.size < 3 or wavelet.size % 2 == 0:
         raise ValueError("nominal wavelet must have odd length >= 3")
     if not np.all(np.isfinite(wavelet)):
         raise ValueError("nominal wavelet contains non-finite values")
-    return torch.as_tensor(wavelet.reshape(1, 1, -1), dtype=torch.float32)
+    if not np.all(np.isfinite(time_s)):
+        raise ValueError("nominal wavelet time axis contains non-finite values")
+    return (
+        torch.as_tensor(time_s, dtype=torch.float32, device=device),
+        torch.as_tensor(wavelet, dtype=torch.float32, device=device),
+        relation,
+    )
 
 
 def _denormalize_delta_torch(values: torch.Tensor, normalization: Mapping[str, Any]) -> torch.Tensor:
@@ -531,28 +607,43 @@ def _denormalize_delta_torch(values: torch.Tensor, normalization: Mapping[str, A
     return values * float(stats["std"]) + float(stats["mean"])
 
 
-def _torch_forward_log_ai(log_ai: torch.Tensor, wavelet: torch.Tensor) -> torch.Tensor:
-    """Differentiable project forward model for patch tensors.
-
-    Input shape is ``[batch, lateral, twt]`` and output shape is
-    ``[batch, lateral, twt - 1]``.  The implementation mirrors
-    ``numpy.convolve(wavelet, reflectivity, mode='same')`` for the common case
-    where the wavelet is shorter than the local reflectivity.
-    """
-
+def _forward_physics_batch(
+    log_ai: torch.Tensor,
+    *,
+    sample_axes: torch.Tensor,
+    sample_domain: str,
+    wavelet_time_s: torch.Tensor,
+    wavelet_amp: torch.Tensor,
+    ai_velocity_relation: Mapping[str, float] | None,
+) -> torch.Tensor:
     if log_ai.ndim != 3:
-        raise ValueError("log_ai must have shape [batch, lateral, twt]")
-    reflectivity = torch.tanh(0.5 * (log_ai[:, :, 1:] - log_ai[:, :, :-1]))
-    batch, lateral, samples = reflectivity.shape
-    traces = reflectivity.reshape(batch * lateral, 1, samples)
-    kernel = torch.flip(wavelet.to(dtype=traces.dtype, device=traces.device), dims=[-1])
-    padding = int(kernel.shape[-1] // 2)
-    convolved = torch.nn.functional.conv1d(traces, kernel, padding=padding)
-    if convolved.shape[-1] != samples:
-        difference = convolved.shape[-1] - samples
-        start = difference // 2
-        convolved = convolved[..., start : start + samples]
-    return convolved.reshape(batch, lateral, samples)
+        raise ValueError("Physics forward expects [batch, lateral, sample] logAI.")
+    if sample_domain == "time":
+        return forward_time(log_ai, wavelet_time_s, wavelet_amp)
+    if sample_domain != "depth":
+        raise ValueError(f"Unsupported physics sample domain: {sample_domain!r}")
+    if sample_axes.shape != (log_ai.shape[0], log_ai.shape[-1]):
+        raise ValueError("Depth physics axes must have shape [batch, sample].")
+    if ai_velocity_relation is None:
+        raise ValueError("Depth physics requires the frozen AI–Vp relation.")
+    velocity_mps = velocity_from_ai(
+        torch.exp(log_ai),
+        a=float(ai_velocity_relation["a"]),
+        b=float(ai_velocity_relation["b"]),
+    )
+    return torch.stack(
+        [
+            forward_depth(
+                log_ai[row_index],
+                velocity_mps[row_index],
+                sample_axes[row_index],
+                wavelet_time_s,
+                wavelet_amp,
+            )
+            for row_index in range(log_ai.shape[0])
+        ],
+        dim=0,
+    )
 
 
 def load_checkpoint(path: Path, *, hidden_channels: int | None = None, depth: int | None = None) -> tuple[torch.nn.Module, dict[str, Any]]:

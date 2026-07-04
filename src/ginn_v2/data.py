@@ -515,6 +515,22 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         else:
             physics_seismic_patch = np.zeros_like(seismic_patch, dtype=np.float32)
             physics_valid_patch = np.zeros_like(valid_patch, dtype=bool)
+        sample_domain = str(getattr(sample, "sample_domain", ""))
+        if sample_domain == "depth":
+            sample_axis = np.asarray(sample.tvdss_model_m, dtype=np.float64)
+        elif sample_domain == "time":
+            sample_axis = np.asarray(sample.twt_model_s, dtype=np.float64)
+        else:
+            raise ValueError(
+                f"Unsupported sample domain for {sample.sample_id}: {sample_domain!r}"
+            )
+        vertical_slice = sl[1]
+        sample_axis_patch = sample_axis[vertical_slice]
+        if sample_axis_patch.size != target_patch.shape[-1]:
+            raise ValueError(
+                f"Sample axis/patch mismatch for {sample.sample_id}: "
+                f"{sample_axis_patch.size} vs {target_patch.shape[-1]}"
+            )
         inputs = np.stack(
             [
                 seismic_n,
@@ -540,6 +556,7 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             "physics_valid_mask": torch.from_numpy(
                 physics_valid_patch.astype(np.float32)
             )[None, :, :],
+            "sample_axis": torch.from_numpy(sample_axis_patch.astype(np.float64)),
             "lfm": torch.from_numpy(lfm_patch.astype(np.float32))[None, :, :],
             "lfm_ideal": torch.from_numpy(lfm_ideal_patch.astype(np.float32))[
                 None, :, :
@@ -548,6 +565,7 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             "patch_id": str(row["patch_id"]),
             "sample_id": str(row["sample_id"]),
             "sample_kind": str(row.get("sample_kind", "")),
+            "sample_domain": sample_domain,
         }
 
 

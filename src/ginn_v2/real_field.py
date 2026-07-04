@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 
 from cup.seismic.survey import open_survey, segy_options_from_config
+from cup.seismic.geometry import SampleAxis
 from cup.seismic.lfm.contracts import VARIANT_SCHEMA as LFM_VARIANT_SCHEMA
 from cup.seismic.wavelet import (
     DEFAULT_ACTIVE_SUPPORT_THRESHOLD,
@@ -41,7 +42,8 @@ class RealFieldSection:
     valid_mask: np.ndarray
     ilines: np.ndarray
     xlines: np.ndarray
-    twt_s: np.ndarray
+    sample_axis: SampleAxis
+    depth_basis: str | None
     metadata: dict[str, Any]
 
 
@@ -52,7 +54,8 @@ class RealFieldVolume:
     valid_mask: np.ndarray
     ilines: np.ndarray
     xlines: np.ndarray
-    twt_s: np.ndarray
+    sample_axis: SampleAxis
+    depth_basis: str | None
     metadata: dict[str, Any]
 
 
@@ -60,8 +63,8 @@ class RealFieldVolume:
 class PatchGeometry:
     lateral_start: int
     lateral_stop: int
-    twt_start: int
-    twt_stop: int
+    sample_start: int
+    sample_stop: int
     valid_fraction: float
 
 
@@ -133,6 +136,34 @@ def _model_manifest_and_dir(model_cfg: Mapping[str, Any], *, root: Path) -> tupl
     if missing_gate:
         raise ValueError(f"synthetic_gate_evidence missing {missing_gate}: {manifest_path}")
     return model_run_dir, manifest
+
+
+def _validate_model_sample_axis(
+    manifest: Mapping[str, Any],
+    checkpoint: Mapping[str, Any],
+    *,
+    sample_axis: SampleAxis,
+    depth_basis: str | None,
+) -> None:
+    expected = {
+        "sample_domain": sample_axis.domain,
+        "sample_unit": sample_axis.unit,
+        "depth_basis": depth_basis,
+    }
+    actual = {
+        "sample_domain": manifest.get("sample_domain"),
+        "sample_unit": manifest.get("sample_unit"),
+        "depth_basis": manifest.get("depth_basis"),
+    }
+    if actual != expected:
+        raise ValueError(
+            f"Model/LFM sample-axis mismatch: model={actual}, real_field={expected}. "
+            "Rebuild or select a model trained in the same sampling domain."
+        )
+    if dict(checkpoint.get("sample_axis_contract") or {}) != expected:
+        raise ValueError(
+            "Checkpoint sample_axis_contract does not match its model manifest."
+        )
 
 
 def _manifest_model_role(manifest: Mapping[str, Any]) -> str:
@@ -311,6 +342,7 @@ def load_real_field_section(
     lfm_values, ilines, xlines, twt_s = _load_npz_grid_section(
         lfm_path,
         section_cfg=section_cfg,
+        sample_domain=sample_domain,
         value_keys=("log_ai", "lfm", "volume", "pred_log_ai"),
     )
     if lfm_transform == "log":
@@ -329,11 +361,12 @@ def load_real_field_section(
         seismic, seismic_ilines, seismic_xlines, seismic_twt = _load_npz_grid_section(
             seismic_path,
             section_cfg=section_cfg,
+            sample_domain=sample_domain,
             value_keys=("seismic", "volume", "seismic_input"),
         )
         _assert_axes_close("seismic ilines", seismic_ilines, ilines)
         _assert_axes_close("seismic xlines", seismic_xlines, xlines)
-        seismic, lfm_values, twt_s = _align_time_arrays(seismic, seismic_twt, lfm_values, twt_s)
+        seismic, lfm_values, twt_s = _align_sample_arrays(seismic, seismic_twt, lfm_values, twt_s)
     else:
         seismic, seismic_twt = _load_survey_section(
             seismic_path,
@@ -346,7 +379,7 @@ def load_real_field_section(
             seismic_options=dict(inputs.get("segy_options") or {}),
             sample_domain=sample_domain,
         )
-        seismic, lfm_values, twt_s = _align_time_arrays(seismic, seismic_twt, lfm_values, twt_s)
+        seismic, lfm_values, twt_s = _align_sample_arrays(seismic, seismic_twt, lfm_values, twt_s)
 
     mask_path_text = str(inputs.get("target_mask_file") or "").strip()
     if mask_path_text:
@@ -354,21 +387,23 @@ def load_real_field_section(
         mask, mask_ilines, mask_xlines, mask_twt = _load_npz_grid_section(
             mask_path,
             section_cfg=section_cfg,
+            sample_domain=sample_domain,
             value_keys=("valid_mask_model", "mask", "target_mask", "volume"),
         )
         _assert_axes_close("mask ilines", mask_ilines, ilines)
         _assert_axes_close("mask xlines", mask_xlines, xlines)
-        mask, _, _ = _align_time_arrays(mask.astype(float), mask_twt, lfm_values, twt_s)
+        mask, _, _ = _align_sample_arrays(mask.astype(float), mask_twt, lfm_values, twt_s)
         valid_mask = mask > 0.5
     elif _npz_has_any(lfm_path, ("valid_mask_model", "mask", "target_mask")):
         mask, mask_ilines, mask_xlines, mask_twt = _load_npz_grid_section(
             lfm_path,
             section_cfg=section_cfg,
+            sample_domain=sample_domain,
             value_keys=("valid_mask_model", "mask", "target_mask"),
         )
         _assert_axes_close("lfm mask ilines", mask_ilines, ilines)
         _assert_axes_close("lfm mask xlines", mask_xlines, xlines)
-        mask, _, _ = _align_time_arrays(mask.astype(float), mask_twt, lfm_values, twt_s)
+        mask, _, _ = _align_sample_arrays(mask.astype(float), mask_twt, lfm_values, twt_s)
         valid_mask = mask > 0.5
     else:
         valid_mask = np.isfinite(lfm_values) & np.isfinite(seismic)
@@ -396,7 +431,12 @@ def load_real_field_section(
         valid_mask=np.asarray(valid_mask, dtype=bool),
         ilines=np.asarray(ilines, dtype=np.float64),
         xlines=np.asarray(xlines, dtype=np.float64),
-        twt_s=np.asarray(twt_s, dtype=np.float64),
+        sample_axis=SampleAxis(
+            np.asarray(twt_s, dtype=np.float64),
+            sample_domain,
+            str(selected_variant.variant_metadata.get("sample_unit") or ""),
+        ),
+        depth_basis=selected_variant.variant_metadata.get("depth_basis"),
         metadata={
             "lfm_file": str(lfm_path),
             "seismic_file": str(seismic_path),
@@ -409,6 +449,7 @@ def load_real_field_section(
             "lfm_contract_fingerprint_sha256": selected_variant.contract_fingerprint_sha256,
             "sample_domain": sample_domain,
             "sample_unit": selected_variant.variant_metadata.get("sample_unit"),
+            "depth_basis": selected_variant.variant_metadata.get("depth_basis"),
             "seismic_value_transform": str(seismic_transform),
             "seismic_reference_stats_file": str(inputs.get("seismic_reference_stats_file") or ""),
             "seismic_transform_metadata": seismic_transform_metadata,
@@ -439,6 +480,7 @@ def load_real_field_volume(
     lfm_values, ilines, xlines, twt_s = _load_npz_grid_volume(
         lfm_path,
         volume_cfg=volume_cfg,
+        sample_domain=sample_domain,
         value_keys=("log_ai", "lfm", "volume", "pred_log_ai"),
     )
     if lfm_transform == "log":
@@ -454,11 +496,12 @@ def load_real_field_volume(
         seismic, seismic_ilines, seismic_xlines, seismic_twt = _load_npz_grid_volume(
             seismic_path,
             volume_cfg=volume_cfg,
+            sample_domain=sample_domain,
             value_keys=("seismic", "volume", "seismic_input"),
         )
         _assert_axes_close("seismic ilines", seismic_ilines, ilines)
         _assert_axes_close("seismic xlines", seismic_xlines, xlines)
-        seismic, lfm_values, twt_s = _align_volume_time_arrays(seismic, seismic_twt, lfm_values, twt_s)
+        seismic, lfm_values, twt_s = _align_volume_sample_arrays(seismic, seismic_twt, lfm_values, twt_s)
     else:
         seismic, seismic_twt = _load_survey_volume(
             seismic_path,
@@ -470,7 +513,7 @@ def load_real_field_volume(
             seismic_options=dict(inputs.get("segy_options") or {}),
             sample_domain=sample_domain,
         )
-        seismic, lfm_values, twt_s = _align_volume_time_arrays(seismic, seismic_twt, lfm_values, twt_s)
+        seismic, lfm_values, twt_s = _align_volume_sample_arrays(seismic, seismic_twt, lfm_values, twt_s)
 
     mask_path_text = str(inputs.get("target_mask_file") or "").strip()
     if mask_path_text:
@@ -478,21 +521,23 @@ def load_real_field_volume(
         mask, mask_ilines, mask_xlines, mask_twt = _load_npz_grid_volume(
             mask_path,
             volume_cfg=volume_cfg,
+            sample_domain=sample_domain,
             value_keys=("valid_mask_model", "mask", "target_mask", "volume"),
         )
         _assert_axes_close("mask ilines", mask_ilines, ilines)
         _assert_axes_close("mask xlines", mask_xlines, xlines)
-        mask, _, _ = _align_volume_time_arrays(mask.astype(float), mask_twt, lfm_values, twt_s)
+        mask, _, _ = _align_volume_sample_arrays(mask.astype(float), mask_twt, lfm_values, twt_s)
         valid_mask = mask > 0.5
     elif _npz_has_any(lfm_path, ("valid_mask_model", "mask", "target_mask")):
         mask, mask_ilines, mask_xlines, mask_twt = _load_npz_grid_volume(
             lfm_path,
             volume_cfg=volume_cfg,
+            sample_domain=sample_domain,
             value_keys=("valid_mask_model", "mask", "target_mask"),
         )
         _assert_axes_close("lfm mask ilines", mask_ilines, ilines)
         _assert_axes_close("lfm mask xlines", mask_xlines, xlines)
-        mask, _, _ = _align_volume_time_arrays(mask.astype(float), mask_twt, lfm_values, twt_s)
+        mask, _, _ = _align_volume_sample_arrays(mask.astype(float), mask_twt, lfm_values, twt_s)
         valid_mask = mask > 0.5
     else:
         valid_mask = np.isfinite(lfm_values) & np.isfinite(seismic)
@@ -520,7 +565,12 @@ def load_real_field_volume(
         valid_mask=np.asarray(valid_mask, dtype=bool),
         ilines=np.asarray(ilines, dtype=np.float64),
         xlines=np.asarray(xlines, dtype=np.float64),
-        twt_s=np.asarray(twt_s, dtype=np.float64),
+        sample_axis=SampleAxis(
+            np.asarray(twt_s, dtype=np.float64),
+            sample_domain,
+            str(selected_variant.variant_metadata.get("sample_unit") or ""),
+        ),
+        depth_basis=selected_variant.variant_metadata.get("depth_basis"),
         metadata={
             "lfm_file": str(lfm_path),
             "seismic_file": str(seismic_path),
@@ -533,6 +583,7 @@ def load_real_field_volume(
             "lfm_contract_fingerprint_sha256": selected_variant.contract_fingerprint_sha256,
             "sample_domain": sample_domain,
             "sample_unit": selected_variant.variant_metadata.get("sample_unit"),
+            "depth_basis": selected_variant.variant_metadata.get("depth_basis"),
             "seismic_value_transform": str(seismic_transform),
             "seismic_reference_stats_file": str(inputs.get("seismic_reference_stats_file") or ""),
             "seismic_transform_metadata": seismic_transform_metadata,
@@ -556,6 +607,12 @@ def run_zero_shot_model(
     synthetic_gate_evidence = dict(manifest["synthetic_gate_evidence"])
     checkpoint_path = _primary_checkpoint_path(manifest, root=root)
     model, checkpoint = load_checkpoint(checkpoint_path)
+    _validate_model_sample_axis(
+        manifest,
+        checkpoint,
+        sample_axis=section.sample_axis,
+        depth_basis=section.depth_basis,
+    )
     normalization_path = None
     normalization_ref = manifest.get("normalization_path") or manifest.get("normalization_file")
     if normalization_ref:
@@ -577,9 +634,9 @@ def run_zero_shot_model(
     patches = build_real_field_patch_index(
         section.valid_mask,
         lateral_samples=int(patch_spec["lateral_samples"]),
-        twt_samples=int(patch_spec["twt_samples"]),
+        vertical_samples=int(patch_spec["vertical_samples"]),
         lateral_stride=int(patch_spec["lateral_stride"]),
-        twt_stride=int(patch_spec["twt_stride"]),
+        vertical_stride=int(patch_spec["vertical_stride"]),
         min_valid_fraction=float(patch_spec["min_valid_fraction"]),
     )
     if not patches:
@@ -591,7 +648,7 @@ def run_zero_shot_model(
     patch_predictions: list[np.ndarray] = []
     with torch.no_grad():
         for patch_idx, patch in enumerate(patches):
-            sl = (slice(patch.lateral_start, patch.lateral_stop), slice(patch.twt_start, patch.twt_stop))
+            sl = (slice(patch.lateral_start, patch.lateral_stop), slice(patch.sample_start, patch.sample_stop))
             seismic_patch = section.seismic[sl]
             lfm_patch = section.lfm[sl]
             valid_patch = section.valid_mask[sl]
@@ -620,14 +677,16 @@ def run_zero_shot_model(
                     "checkpoint_model_id": str(checkpoint["model_id"]),
                     "lateral_start": patch.lateral_start,
                     "lateral_stop": patch.lateral_stop,
-                    "twt_start": patch.twt_start,
-                    "twt_stop": patch.twt_stop,
+                    "sample_start_index": patch.sample_start,
+                    "sample_stop_index": patch.sample_stop,
                     "inline_start": float(section.ilines[patch.lateral_start]),
                     "inline_stop": float(section.ilines[patch.lateral_stop - 1]),
                     "xline_start": float(section.xlines[patch.lateral_start]),
                     "xline_stop": float(section.xlines[patch.lateral_stop - 1]),
-                    "twt_start_s": float(section.twt_s[patch.twt_start]),
-                    "twt_stop_s": float(section.twt_s[patch.twt_stop - 1]),
+                    "sample_start": float(section.sample_axis.values[patch.sample_start]),
+                    "sample_stop": float(section.sample_axis.values[patch.sample_stop - 1]),
+                    "sample_domain": section.sample_axis.domain,
+                    "sample_unit": section.sample_axis.unit,
                     "valid_fraction": patch.valid_fraction,
                     "stitch_strategy": stitch_strategy,
                 }
@@ -647,7 +706,10 @@ def run_zero_shot_model(
         valid_mask_model=section.valid_mask.astype(bool),
         ilines=section.ilines,
         xlines=section.xlines,
-        twt_s=section.twt_s,
+        samples=section.sample_axis.values,
+        sample_domain=np.asarray(section.sample_axis.domain),
+        sample_unit=np.asarray(section.sample_axis.unit),
+        depth_basis=np.asarray(section.depth_basis or ""),
         patch_pred_log_ai=np.asarray(patch_predictions, dtype=np.float32),
     )
     index_path = model_dir / "prediction_index.csv"
@@ -675,6 +737,14 @@ def run_zero_shot_model(
         "device": device_metadata,
         "normalization": normalization,
         "patch_spec": patch_spec,
+        "sample_axis_contract": {
+            "sample_domain": section.sample_axis.domain,
+            "sample_unit": section.sample_axis.unit,
+            "depth_basis": section.depth_basis,
+        },
+        "forward_model_inputs_path": str(
+            manifest.get("forward_model_inputs_path") or ""
+        ),
         "stitch_strategy": stitch_strategy,
         "n_patches": int(len(patches)),
         "outputs": {
@@ -702,6 +772,12 @@ def run_zero_shot_volume_model(
     synthetic_gate_evidence = dict(manifest["synthetic_gate_evidence"])
     checkpoint_path = _primary_checkpoint_path(manifest, root=root)
     model, checkpoint = load_checkpoint(checkpoint_path)
+    _validate_model_sample_axis(
+        manifest,
+        checkpoint,
+        sample_axis=volume.sample_axis,
+        depth_basis=volume.depth_basis,
+    )
     normalization_path = None
     normalization_ref = manifest.get("normalization_path") or manifest.get("normalization_file")
     if normalization_ref:
@@ -733,16 +809,16 @@ def run_zero_shot_volume_model(
             patches = build_real_field_patch_index(
                 section_valid,
                 lateral_samples=int(patch_spec["lateral_samples"]),
-                twt_samples=int(patch_spec["twt_samples"]),
+                vertical_samples=int(patch_spec["vertical_samples"]),
                 lateral_stride=int(patch_spec["lateral_stride"]),
-                twt_stride=int(patch_spec["twt_stride"]),
+                vertical_stride=int(patch_spec["vertical_stride"]),
                 min_valid_fraction=float(patch_spec["min_valid_fraction"]),
             )
             for patch in patches:
                 sl = (
                     inline_idx,
                     slice(patch.lateral_start, patch.lateral_stop),
-                    slice(patch.twt_start, patch.twt_stop),
+                    slice(patch.sample_start, patch.sample_stop),
                 )
                 seismic_patch = volume.seismic[sl]
                 lfm_patch = volume.lfm[sl]
@@ -774,12 +850,14 @@ def run_zero_shot_volume_model(
                         "inline": float(inline_no),
                         "xline_start_index": patch.lateral_start,
                         "xline_stop_index": patch.lateral_stop,
-                        "twt_start": patch.twt_start,
-                        "twt_stop": patch.twt_stop,
+                        "sample_start_index": patch.sample_start,
+                        "sample_stop_index": patch.sample_stop,
                         "xline_start": float(volume.xlines[patch.lateral_start]),
                         "xline_stop": float(volume.xlines[patch.lateral_stop - 1]),
-                        "twt_start_s": float(volume.twt_s[patch.twt_start]),
-                        "twt_stop_s": float(volume.twt_s[patch.twt_stop - 1]),
+                        "sample_start": float(volume.sample_axis.values[patch.sample_start]),
+                        "sample_stop": float(volume.sample_axis.values[patch.sample_stop - 1]),
+                        "sample_domain": volume.sample_axis.domain,
+                        "sample_unit": volume.sample_axis.unit,
                         "valid_fraction": patch.valid_fraction,
                         "stitch_strategy": stitch_strategy,
                     }
@@ -802,7 +880,10 @@ def run_zero_shot_volume_model(
         valid_mask_model=volume.valid_mask.astype(bool),
         ilines=volume.ilines,
         xlines=volume.xlines,
-        twt_s=volume.twt_s,
+        samples=volume.sample_axis.values,
+        sample_domain=np.asarray(volume.sample_axis.domain),
+        sample_unit=np.asarray(volume.sample_axis.unit),
+        depth_basis=np.asarray(volume.depth_basis or ""),
         output_mode=np.asarray("volume"),
     )
     index_path = model_dir / "prediction_index.csv"
@@ -831,6 +912,14 @@ def run_zero_shot_volume_model(
         "device": device_metadata,
         "normalization": normalization,
         "patch_spec": patch_spec,
+        "sample_axis_contract": {
+            "sample_domain": volume.sample_axis.domain,
+            "sample_unit": volume.sample_axis.unit,
+            "depth_basis": volume.depth_basis,
+        },
+        "forward_model_inputs_path": str(
+            manifest.get("forward_model_inputs_path") or ""
+        ),
         "stitch_strategy": stitch_strategy,
         "n_patches": int(n_patches),
         "n_inline_rows": int(volume.ilines.size),
@@ -848,22 +937,22 @@ def build_real_field_patch_index(
     valid_mask: np.ndarray,
     *,
     lateral_samples: int,
-    twt_samples: int,
+    vertical_samples: int,
     lateral_stride: int,
-    twt_stride: int,
+    vertical_stride: int,
     min_valid_fraction: float,
 ) -> list[PatchGeometry]:
     valid = np.asarray(valid_mask, dtype=bool)
     if valid.ndim != 2:
-        raise ValueError("valid_mask must be 2D [lateral, twt].")
+        raise ValueError("valid_mask must be 2D [lateral, sample].")
     lateral_starts = _window_starts(valid.shape[0], int(lateral_samples), int(lateral_stride))
-    twt_starts = _window_starts(valid.shape[1], int(twt_samples), int(twt_stride))
+    sample_starts = _window_starts(valid.shape[1], int(vertical_samples), int(vertical_stride))
     rows: list[PatchGeometry] = []
     for lateral_start in lateral_starts:
-        for twt_start in twt_starts:
+        for sample_start in sample_starts:
             patch_mask = valid[
                 lateral_start : lateral_start + lateral_samples,
-                twt_start : twt_start + twt_samples,
+                sample_start : sample_start + vertical_samples,
             ]
             fraction = float(np.mean(patch_mask))
             if fraction >= float(min_valid_fraction):
@@ -871,8 +960,8 @@ def build_real_field_patch_index(
                     PatchGeometry(
                         lateral_start=lateral_start,
                         lateral_stop=lateral_start + lateral_samples,
-                        twt_start=twt_start,
-                        twt_stop=twt_start + twt_samples,
+                        sample_start=sample_start,
+                        sample_stop=sample_start + vertical_samples,
                         valid_fraction=fraction,
                     )
                 )
@@ -1088,6 +1177,7 @@ def _load_npz_grid_section(
     path: Path,
     *,
     section_cfg: Mapping[str, Any],
+    sample_domain: str,
     value_keys: Sequence[str],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     data = np.load(path, allow_pickle=False)
@@ -1095,17 +1185,14 @@ def _load_npz_grid_section(
     if key is None:
         raise ValueError(f"{path} lacks any value key from {list(value_keys)}; found {data.files}")
     values = np.asarray(data[key])
-    if "samples" in data.files:
-        twt = np.asarray(data["samples"], dtype=np.float64)
-    elif "twt_s" in data.files:
-        twt = np.asarray(data["twt_s"], dtype=np.float64)
-    else:
-        raise ValueError(f"{path} lacks samples/twt_s axis.")
+    if "samples" not in data.files:
+        raise ValueError(f"{path} lacks the required samples axis; rebuild the artifact.")
+    twt = np.asarray(data["samples"], dtype=np.float64)
     if twt.ndim != 1:
         raise ValueError(f"{path} sample axis must be 1D.")
     if values.ndim == 2:
         lateral = values.shape[0]
-        sample_slice, cropped_twt = _crop_twt_axis(twt, section_cfg)
+        sample_slice, cropped_twt = _crop_sample_axis(twt, section_cfg, sample_domain=sample_domain)
         ilines, xlines = _npz_lateral_axes(data, path=path, lateral=lateral)
         return (
             np.asarray(values[:, sample_slice], dtype=np.float32),
@@ -1120,7 +1207,7 @@ def _load_npz_grid_section(
     ilines, xlines = _section_line_path(section_cfg)
     il_idx = _nearest_axis_indices(il_axis, ilines, axis_name="inline")
     xl_idx = _nearest_axis_indices(xl_axis, xlines, axis_name="xline")
-    sample_slice, cropped_twt = _crop_twt_axis(twt, section_cfg)
+    sample_slice, cropped_twt = _crop_sample_axis(twt, section_cfg, sample_domain=sample_domain)
     section = values[il_idx, xl_idx, :][:, sample_slice]
     return np.asarray(section, dtype=np.float32), ilines, xlines, cropped_twt
 
@@ -1129,6 +1216,7 @@ def _load_npz_grid_volume(
     path: Path,
     *,
     volume_cfg: Mapping[str, Any],
+    sample_domain: str,
     value_keys: Sequence[str],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     with np.load(path, allow_pickle=False) as data:
@@ -1138,12 +1226,9 @@ def _load_npz_grid_volume(
         values = np.asarray(data[key])
         if values.ndim != 3:
             raise ValueError(f"{path} volume values must be 3D [inline, xline, twt], got shape {values.shape}.")
-        if "samples" in data.files:
-            twt = np.asarray(data["samples"], dtype=np.float64)
-        elif "twt_s" in data.files:
-            twt = np.asarray(data["twt_s"], dtype=np.float64)
-        else:
-            raise ValueError(f"{path} lacks samples/twt_s axis.")
+        if "samples" not in data.files:
+            raise ValueError(f"{path} lacks the required samples axis; rebuild the artifact.")
+        twt = np.asarray(data["samples"], dtype=np.float64)
         if "ilines" not in data.files or "xlines" not in data.files:
             raise ValueError(f"{path} volume must provide ilines and xlines axes.")
         ilines = np.asarray(data["ilines"], dtype=np.float64).reshape(-1)
@@ -1154,7 +1239,7 @@ def _load_npz_grid_volume(
         )
     il_slice = _axis_slice_from_cfg(ilines, volume_cfg, start_keys=("inline_start", "iline_start"), stop_keys=("inline_stop", "iline_stop"))
     xl_slice = _axis_slice_from_cfg(xlines, volume_cfg, start_keys=("xline_start",), stop_keys=("xline_stop",))
-    sample_slice, cropped_twt = _crop_twt_axis(twt, volume_cfg)
+    sample_slice, cropped_twt = _crop_sample_axis(twt, volume_cfg, sample_domain=sample_domain)
     return (
         np.asarray(values[il_slice, xl_slice, sample_slice], dtype=np.float32),
         np.asarray(ilines[il_slice], dtype=np.float64),
@@ -1238,8 +1323,12 @@ def _load_survey_section(
     twt_s = np.asarray(first_trace.basis, dtype=np.float64)
     values = [np.asarray(traces[key].values, dtype=np.float32) for key in indices]
     arr = np.asarray(values, dtype=np.float32)
-    expected = int(np.asarray(section_cfg.get("expected_twt_samples", arr.shape[1])).item())
-    if "expected_twt_samples" in section_cfg and arr.shape[1] != expected:
+    expected_key = "expected_twt_samples" if sample_domain == "time" else "expected_depth_samples"
+    wrong_key = "expected_depth_samples" if sample_domain == "time" else "expected_twt_samples"
+    if section_cfg.get(wrong_key) is not None:
+        raise ValueError(f"{sample_domain} section rejects {wrong_key}.")
+    expected = int(np.asarray(section_cfg.get(expected_key, arr.shape[1])).item())
+    if expected_key in section_cfg and arr.shape[1] != expected:
         raise ValueError(f"Survey section sample count {arr.shape[1]} != expected {expected}.")
     return arr, twt_s
 
@@ -1346,19 +1435,37 @@ def _axis_slice_from_cfg(
     return slice(i0, i1)
 
 
-def _crop_twt_axis(twt: np.ndarray, section_cfg: Mapping[str, Any]) -> tuple[slice, np.ndarray]:
-    start = section_cfg.get("sample_start_s")
-    end = section_cfg.get("sample_end_s")
-    i0 = 0 if start is None else int(np.searchsorted(twt, float(start), side="left"))
-    i1 = twt.size if end is None else int(np.searchsorted(twt, float(end), side="right"))
+def _crop_sample_axis(
+    samples: np.ndarray,
+    section_cfg: Mapping[str, Any],
+    *,
+    sample_domain: str,
+) -> tuple[slice, np.ndarray]:
+    if sample_domain == "time":
+        active = ("sample_start_s", "sample_end_s")
+        forbidden = ("sample_start_m", "sample_end_m")
+    elif sample_domain == "depth":
+        active = ("sample_start_m", "sample_end_m")
+        forbidden = ("sample_start_s", "sample_end_s")
+    else:
+        raise ValueError(f"Unsupported sample_domain: {sample_domain!r}")
+    present_forbidden = [key for key in forbidden if section_cfg.get(key) is not None]
+    if present_forbidden:
+        raise ValueError(
+            f"{sample_domain} sample window rejects wrong-domain fields: {present_forbidden}"
+        )
+    start = section_cfg.get(active[0])
+    end = section_cfg.get(active[1])
+    i0 = 0 if start is None else int(np.searchsorted(samples, float(start), side="left"))
+    i1 = samples.size if end is None else int(np.searchsorted(samples, float(end), side="right"))
     i0 = max(0, i0)
-    i1 = min(twt.size, i1)
+    i1 = min(samples.size, i1)
     if i0 >= i1:
-        raise ValueError("Selected TWT window is empty.")
-    return slice(i0, i1), np.asarray(twt[i0:i1], dtype=np.float64)
+        raise ValueError("Selected sample window is empty.")
+    return slice(i0, i1), np.asarray(samples[i0:i1], dtype=np.float64)
 
 
-def _align_time_arrays(
+def _align_sample_arrays(
     first: np.ndarray,
     first_twt: np.ndarray,
     second: np.ndarray,
@@ -1369,22 +1476,22 @@ def _align_time_arrays(
     dt_first = float(np.median(np.diff(first_twt)))
     dt_second = float(np.median(np.diff(second_twt)))
     if not np.isclose(dt_first, dt_second, rtol=0.0, atol=1e-8):
-        raise ValueError(f"Cannot align time axes with different dt: {dt_first} vs {dt_second}")
+        raise ValueError(f"Cannot align sample axes with different steps: {dt_first} vs {dt_second}")
     start = max(float(first_twt[0]), float(second_twt[0]))
     end = min(float(first_twt[-1]), float(second_twt[-1]))
     if start > end:
-        raise ValueError("Time axes do not overlap.")
+        raise ValueError("Sample axes do not overlap.")
     dt = dt_first
     n = int(np.floor((end - start) / dt + 0.5)) + 1
     if n <= 0:
-        raise ValueError("Time axes have no common samples.")
+        raise ValueError("Sample axes have no common samples.")
     common = start + np.arange(n, dtype=np.float64) * dt
-    first_idx = _nearest_time_indices(first_twt, common, dt=dt, name="first_twt")
-    second_idx = _nearest_time_indices(second_twt, common, dt=dt, name="second_twt")
+    first_idx = _nearest_aligned_sample_indices(first_twt, common, step=dt, name="first_samples")
+    second_idx = _nearest_aligned_sample_indices(second_twt, common, step=dt, name="second_samples")
     return first[:, first_idx], second[:, second_idx], common
 
 
-def _align_volume_time_arrays(
+def _align_volume_sample_arrays(
     first: np.ndarray,
     first_twt: np.ndarray,
     second: np.ndarray,
@@ -1395,30 +1502,30 @@ def _align_volume_time_arrays(
     dt_first = float(np.median(np.diff(first_twt)))
     dt_second = float(np.median(np.diff(second_twt)))
     if not np.isclose(dt_first, dt_second, rtol=0.0, atol=1e-8):
-        raise ValueError(f"Cannot align volume time axes with different dt: {dt_first} vs {dt_second}")
+        raise ValueError(f"Cannot align volume sample axes with different steps: {dt_first} vs {dt_second}")
     start = max(float(first_twt[0]), float(second_twt[0]))
     end = min(float(first_twt[-1]), float(second_twt[-1]))
     if start > end:
-        raise ValueError("Volume time axes do not overlap.")
+        raise ValueError("Volume sample axes do not overlap.")
     dt = dt_first
     n = int(np.floor((end - start) / dt + 0.5)) + 1
     if n <= 0:
-        raise ValueError("Volume time axes have no common samples.")
+        raise ValueError("Volume sample axes have no common samples.")
     common = start + np.arange(n, dtype=np.float64) * dt
-    first_idx = _nearest_time_indices(first_twt, common, dt=dt, name="first_twt")
-    second_idx = _nearest_time_indices(second_twt, common, dt=dt, name="second_twt")
+    first_idx = _nearest_aligned_sample_indices(first_twt, common, step=dt, name="first_samples")
+    second_idx = _nearest_aligned_sample_indices(second_twt, common, step=dt, name="second_samples")
     return first[:, :, first_idx], second[:, :, second_idx], common
 
 
-def _nearest_time_indices(axis: np.ndarray, values: np.ndarray, *, dt: float, name: str) -> np.ndarray:
+def _nearest_aligned_sample_indices(axis: np.ndarray, values: np.ndarray, *, step: float, name: str) -> np.ndarray:
     indices = np.searchsorted(axis, values)
     indices = np.clip(indices, 0, axis.size - 1)
     left = np.maximum(indices - 1, 0)
     choose_left = np.abs(axis[left] - values) < np.abs(axis[indices] - values)
     nearest = np.where(choose_left, left, indices)
     delta = np.abs(axis[nearest] - values)
-    if np.any(delta > max(abs(dt) * 0.25, 1e-8)):
-        raise ValueError(f"{name} cannot be aligned to common TWT axis.")
+    if np.any(delta > max(abs(step) * 0.25, 1e-8)):
+        raise ValueError(f"{name} cannot be aligned to the common sample axis.")
     return nearest.astype(np.int64)
 
 
@@ -1456,18 +1563,18 @@ def _window_starts(size: int, window: int, stride: int) -> list[int]:
 
 def _stitch_slices(patch: PatchGeometry, *, strategy: str) -> tuple[tuple[slice, slice], tuple[slice, slice]]:
     lateral = patch.lateral_stop - patch.lateral_start
-    twt = patch.twt_stop - patch.twt_start
+    vertical = patch.sample_stop - patch.sample_start
     if strategy == "uniform":
         l0, l1 = 0, lateral
-        t0, t1 = 0, twt
+        t0, t1 = 0, vertical
     elif strategy == "center_crop":
         l0, l1 = _center_crop_bounds(lateral)
-        t0, t1 = _center_crop_bounds(twt)
+        t0, t1 = _center_crop_bounds(vertical)
     else:
         raise ValueError(f"Unsupported stitch strategy: {strategy}")
     return (
         (slice(l0, l1), slice(t0, t1)),
-        (slice(patch.lateral_start + l0, patch.lateral_start + l1), slice(patch.twt_start + t0, patch.twt_start + t1)),
+        (slice(patch.lateral_start + l0, patch.lateral_start + l1), slice(patch.sample_start + t0, patch.sample_start + t1)),
     )
 
 

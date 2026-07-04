@@ -369,12 +369,38 @@ def _write_train_manifest(
     benchmark_contract_fingerprint = require_contract_fingerprint(
         benchmark_manifest, label=f"benchmark {benchmark_dir}"
     )
+    sample_domain = str(benchmark_manifest.get("sample_domain") or "")
+    if sample_domain == "time":
+        sample_unit, depth_basis = "s", None
+    elif sample_domain == "depth" and benchmark_manifest.get("depth_basis") == "tvdss":
+        sample_unit, depth_basis = "m", "tvdss"
+    else:
+        raise ValueError("Benchmark has an invalid sample domain/depth basis contract.")
     input_contracts = {
         "benchmark": {
             "path": repo_relative_path(benchmark_manifest_path, root=REPO_ROOT),
             "contract_fingerprint_sha256": benchmark_contract_fingerprint,
         }
     }
+    if sample_domain == "depth":
+        rock_contract = dict(
+            dict(benchmark_manifest.get("input_contracts") or {}).get(
+                "rock_physics_analysis"
+            )
+            or {}
+        )
+        if not str(rock_contract.get("contract_fingerprint_sha256") or ""):
+            raise ValueError(
+                "Depth benchmark lacks input_contracts.rock_physics_analysis."
+            )
+        input_contracts["rock_physics_analysis"] = rock_contract
+        forward_inputs_path = str(
+            benchmark_manifest.get("forward_model_inputs_path") or ""
+        ).strip()
+        if not forward_inputs_path:
+            raise ValueError("Depth benchmark lacks forward_model_inputs_path.")
+    else:
+        forward_inputs_path = ""
     if real_delta_manifest is not None:
         real_sources = dict(real_delta_manifest.get("sources") or {})
         for source_key, role in (
@@ -395,15 +421,19 @@ def _write_train_manifest(
         "input_contracts": input_contracts,
         "model_id": args.model_id,
         "model_role": str(args.model_role or _infer_model_role(args.model_id)),
+        "sample_domain": sample_domain,
+        "sample_unit": sample_unit,
+        "depth_basis": depth_basis,
+        "forward_model_inputs_path": forward_inputs_path,
         "benchmark_dir": repo_relative_path(benchmark_dir, root=REPO_ROOT),
         "patch_index": repo_relative_path(patch_index_path, root=REPO_ROOT),
         "patch_index_truncated": bool(patch_index_truncated),
         "max_patches": max_patches,
         "patch_spec": {
             "lateral_samples": int(args.patch_lateral),
-            "twt_samples": int(args.patch_twt),
+            "vertical_samples": int(args.patch_twt),
             "lateral_stride": int(args.lateral_stride),
-            "twt_stride": int(args.twt_stride),
+            "vertical_stride": int(args.twt_stride),
             "min_valid_fraction": float(args.min_valid_fraction),
         },
         "split_policy": args.split_policy,
@@ -427,7 +457,11 @@ def _write_train_manifest(
                 ["base"] if float(args.lambda_physics) > 0.0 else []
             ),
             "physics_forward_operator_id": (
-                "nominal_selected_wavelet_forward_log_ai_interior_patch"
+                (
+                    "cup.physics.torch_backend.forward_depth"
+                    if sample_domain == "depth"
+                    else "cup.physics.torch_backend.forward_time"
+                )
                 if float(args.lambda_physics) > 0.0
                 else ""
             ),
@@ -480,6 +514,9 @@ def _write_train_manifest(
             "input_channels": manifest["input_channels"],
             "output_semantics": manifest["output_semantics"],
             "patch_spec": manifest["patch_spec"],
+            "sample_domain": sample_domain,
+            "sample_unit": sample_unit,
+            "depth_basis": depth_basis,
         },
         business_config={
             "split_policy": manifest["split_policy"],
@@ -667,9 +704,9 @@ def run_train(args: argparse.Namespace) -> None:
             normalization=normalization,
             patch_spec={
                 "lateral_samples": int(args.patch_lateral),
-                "twt_samples": int(args.patch_twt),
+                "vertical_samples": int(args.patch_twt),
                 "lateral_stride": int(args.lateral_stride),
-                "twt_stride": int(args.twt_stride),
+                "vertical_stride": int(args.twt_stride),
                 "min_valid_fraction": float(args.min_valid_fraction),
             },
             input_reference_stats_path=input_reference_stats_path,
@@ -792,9 +829,9 @@ def run_predict(args: argparse.Namespace) -> None:
             benchmark,
             patch_spec=PatchSpec(
                 lateral_samples=int(spec_cfg["lateral_samples"]),
-                twt_samples=int(spec_cfg["twt_samples"]),
+                twt_samples=int(spec_cfg["vertical_samples"]),
                 lateral_stride=int(spec_cfg["lateral_stride"]),
-                twt_stride=int(spec_cfg["twt_stride"]),
+                twt_stride=int(spec_cfg["vertical_stride"]),
                 min_valid_fraction=float(spec_cfg["min_valid_fraction"]),
             ),
             sample_kinds=sample_kinds,

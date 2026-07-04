@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 
-MODEL_RUN_SCHEMA_VERSION = "ginn_v2_model_run_v3"
+MODEL_RUN_SCHEMA_VERSION = "ginn_v2_model_run_v4"
 INPUT_REFERENCE_STATS_SCHEMA_VERSION = "real_field_input_reference_stats_v1"
 PREDICTION_SCHEMA_VERSION = "ginn_v2_prediction_v2"
-CHECKPOINT_SCHEMA_VERSION = "ginn_v2_checkpoint_v2"
+CHECKPOINT_SCHEMA_VERSION = "ginn_v2_checkpoint_v3"
 PATCH_SMOKE_REPORT_SCHEMA_VERSION = "ginn_v2_patch_smoke_report_v1"
 ABLATION_SUMMARY_SCHEMA_VERSION = "ginn_v2_ablation_summary_v1"
 ABLATION_REPORT_CARD_SCHEMA_VERSION = "ginn_v2_ablation_report_card_v1"
-ZERO_SHOT_MODEL_SCHEMA_VERSION = "real_field_zero_shot_model_v2"
-ZERO_SHOT_SUMMARY_SCHEMA_VERSION = "real_field_zero_shot_summary_v2"
+ZERO_SHOT_MODEL_SCHEMA_VERSION = "real_field_zero_shot_model_v3"
+ZERO_SHOT_SUMMARY_SCHEMA_VERSION = "real_field_zero_shot_summary_v3"
 
 
 __all__ = [

@@ -29,7 +29,8 @@ python scripts/real_field_zero_shot.py --output-dir scripts/output/real_field_ze
 | 第七步 | `lfm_run_summary.json` / `variant_manifest.csv` | 成功 run、显式 variant 和直接契约身份 |
 | 第七步 | `variants/<variant_id>/lfm.npz` | 所选低频模型，作为推理的结构性输入 |
 | 第六步 | `run_summary.json` / `well_control_manifest.csv` | 与 variant 直接契约一致的 canonical 井控 |
-| 第五步 | `selected_wavelet.csv` | 全局子波，作为标准化参数之一 |
+| 第五步（时间域） | `selected_wavelet.csv` | 时间域模型的冻结子波来源 |
+| 岩石物理旁路（深度域） | `forward_model_inputs.json` | 深度域冻结子波、速度关系和直接上游契约 |
 | 旁路 | 模型 checkpoint + `model_run_manifest.json` | 冻结的模型权重和标准化参数 |
 | 旁路 | `input_reference_stats.json` | 地震数据值域变换的参考统计量 |
 | 数据目录 | 地震体 | 真实工区地震数据 |
@@ -37,6 +38,8 @@ python scripts/real_field_zero_shot.py --output-dir scripts/output/real_field_ze
 ### 模型要求
 
 `models` 列表中每个条目只需要 `model_run_dir`，指向一个包含 `model_run_manifest.json` 的目录。清单中必须包含 `synthetic_gate_evidence`，证明该模型已经通过了合成基准的闸门校验。
+
+模型清单和检查点必须声明采样域、采样单位与深度基准。它们必须和所选低频模型、井控及地震体完全一致；时间域模型不能读取深度域输入。
 
 ### 地震值域变换
 
@@ -67,7 +70,7 @@ real_field_zero_shot:
     variant_id: <descriptive-variant-id>
     well_control_run_dir: scripts/output/real_field_well_controls_<timestamp>
     seismic_value_transform: identity    # 默认 identity；常见 p99_abs_matched
-    lfm_value_transform: identity        # v2 log(AI) 固定 identity
+    lfm_value_transform: identity        # v3 log(AI) 固定 identity
 
   boundary:
     loss_or_eval_erosion_s: 0.0          # 默认 0.0
@@ -89,6 +92,18 @@ real_field_zero_shot:
     inline_chunk_size: 16                 # 默认 16
 ```
 
+上例是时间域配置。深度域使用米制字段，并且不配置频率诊断：
+
+```yaml
+real_field_zero_shot:
+  boundary:
+    loss_or_eval_erosion_m: 0.0
+    prediction_taper_halo_m: 0.0
+  volume:
+    sample_start_m: 1000.0
+    sample_end_m: 2500.0
+```
+
 ### `models`
 
 必填。模型按 `model_run_dir` 逐一加载，每个条目只需 `model_run_dir`。通常包含两个：一个不含横向混合器（推断为 `no_lateral`），一个含横向混合器（推断为 `lateral`）。
@@ -101,7 +116,7 @@ real_field_zero_shot:
 
 - `seismic_value_transform`：地震数据值域变换方式。默认 `identity`。若设为 `p99_abs_matched` 等非 identity 值，需要模型的 `input_reference_stats.json`——脚本自动从第一个模型目录中读取。
 - `lfm_run_dir` / `variant_id` / `well_control_run_dir`：三者均必填且禁止 `auto`；R0 会核对直接契约身份，并校验数据模式、轴、形状、数据类型和掩码等显式语义，不重算文件 SHA。
-- `lfm_value_transform`：固定 `identity`；v2 主数组已经是波阻抗对数。
+- `lfm_value_transform`：固定 `identity`；v3 主数组已经是波阻抗对数。
 - `lfm_file` 和外部 `target_mask_file` 已退役；掩码只能来自所选变体。
 
 ### `volume`
@@ -129,9 +144,20 @@ real_field_zero_shot:
 | `loss_or_eval_erosion_s` | `0.0` | 从 patch 边缘向内侵蚀多少秒，不参与评估 |
 | `prediction_taper_halo_s` | `0.0` | 拼接时在 patch 边缘做锥度衰减的宽度 |
 
+深度域边缘字段如下：
+
+| 参数 | 含义 |
+|------|------|
+| `loss_or_eval_erosion_m` | 从块边缘向内侵蚀的米数 |
+| `prediction_taper_halo_m` | 拼接锥度的米制宽度 |
+
+秒制与米制字段不能同时出现，错域配置会立即失败。
+
 ### `spectral_qc`
 
 不填时按 `diagnostic_max_hz` 自动三等分。需要自定义频带时：
+
+该诊断只在时间域运行。深度域不会把米制采样间隔解释为秒，也不会发布赫兹频带结果。
 
 ```yaml
   spectral_qc:
@@ -209,7 +235,7 @@ real_field_zero_shot:
    - `seismic_input`：变换后的地震输入
    - `valid_mask_model`：有效掩码
    - `stitching_weight`：拼接权重
-   - 坐标轴（`ilines`、`xlines`、`twt_s`）
+   - 坐标轴（`ilines`、`xlines`、`samples`）及采样域、单位、深度基准
 
 ### 第三阶段：质量控制图表
 
@@ -244,7 +270,7 @@ real_field_zero_shot:
 |------|------|
 | `real_field_zero_shot_summary.json` | 来源路径、模型清单、坐标轴约定、掩码统计、输出文件清单 |
 | `model_input_qc.csv` | 每个输入通道在推理前的标准化分布检查 |
-| `real_field_spectral_qc.csv` | 每个模型每个频带的预测差值能量分布和可观测性证据联表 |
+| `real_field_spectral_qc.csv` | 时间域每个模型每个频带的预测差值能量分布和可观测性证据联表 |
 | `lateral_difference_band_qc.csv` | 两个模型预测差值的逐频带能量分析 |
 | `well_prediction_qc.csv` | 剖面模式下，每口井的预测 vs 滤波 LAS 指标（体积模式不生成） |
 
@@ -256,7 +282,7 @@ real_field_zero_shot:
 | `figures/lateral_minus_no_lateral.png` | 两个模型的预测差异 |
 | `figures/lateral_minus_no_lateral_band_split.png` | 预测差异的逐频带拆分 |
 | `figures/spectral_band_energy_qc.png` | 各频带预测差值能量柱状图 |
-| `figures/wells/r0_well_prediction_qc_<well>.png` | 剖面模式下，井位预测与滤波 LAS 的 TWT 域对比 |
+| `figures/wells/r0_well_prediction_qc_<well>.png` | 剖面模式下，井位预测与统一井控在当前采样域的对比 |
 
 ---
 

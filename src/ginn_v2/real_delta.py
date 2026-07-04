@@ -172,9 +172,9 @@ class DifferentiableWellPredictor:
             self._patches[inline_index] = build_real_field_patch_index(
                 self.volume.valid_mask[inline_index],
                 lateral_samples=int(self.patch_spec["lateral_samples"]),
-                twt_samples=int(self.patch_spec["twt_samples"]),
+                vertical_samples=int(self.patch_spec["vertical_samples"]),
                 lateral_stride=int(self.patch_spec["lateral_stride"]),
-                twt_stride=int(self.patch_spec["twt_stride"]),
+                vertical_stride=int(self.patch_spec["vertical_stride"]),
                 min_valid_fraction=float(self.patch_spec["min_valid_fraction"]),
             )
         return self._patches[inline_index]
@@ -272,7 +272,7 @@ class DifferentiableWellPredictor:
         list[list[tuple[tuple[int, int], int, int, float, float]]],
         set[tuple[int, int]],
     ]:
-        axes = (self.volume.ilines, self.volume.xlines, self.volume.twt_s)
+        axes = (self.volume.ilines, self.volume.xlines, self.volume.sample_axis.values)
         columns = ("inline", "xline", "sample")
         fractional = []
         for axis, column in zip(axes, columns):
@@ -342,7 +342,7 @@ class DifferentiableWellPredictor:
         for patch in self.patches(inline_index):
             if not patch.lateral_start <= xline_index < patch.lateral_stop:
                 continue
-            sl = (inline_index, xline_index, slice(patch.twt_start, patch.twt_stop))
+            sl = (inline_index, xline_index, slice(patch.sample_start, patch.sample_stop))
             valid = self.volume.valid_mask[sl]
             inputs = self._input_tensor(self.volume.seismic[sl], self.volume.lfm[sl], valid)
             tasks.append((patch, inputs[:, None, :].contiguous()))
@@ -360,7 +360,7 @@ class DifferentiableWellPredictor:
         for inline_index, xline_index in nodes:
             for patch in self.patches(inline_index):
                 if patch.lateral_start <= xline_index < patch.lateral_stop:
-                    patch_keys[(inline_index, patch.lateral_start, patch.twt_start)] = patch
+                    patch_keys[(inline_index, patch.lateral_start, patch.sample_start)] = patch
         patch_outputs: dict[tuple[int, int, int], torch.Tensor] = {}
         items = sorted(patch_keys.items())
         chunk_size = max(
@@ -374,7 +374,7 @@ class DifferentiableWellPredictor:
                 sl = (
                     inline_index,
                     slice(patch.lateral_start, patch.lateral_stop),
-                    slice(patch.twt_start, patch.twt_stop),
+                    slice(patch.sample_start, patch.sample_stop),
                 )
                 tensors.append(
                     self._input_tensor(
@@ -392,7 +392,7 @@ class DifferentiableWellPredictor:
             inline_index, xline_index = node
             for patch in self.patches(inline_index):
                 if patch.lateral_start <= xline_index < patch.lateral_stop:
-                    key = (inline_index, patch.lateral_start, patch.twt_start)
+                    key = (inline_index, patch.lateral_start, patch.sample_start)
                     tasks.append((node, patch, torch.empty(0)))
                     outputs.append(patch_outputs[key][xline_index - patch.lateral_start])
         return self._stitch_node_tasks(nodes, tasks, outputs, device=device)
@@ -405,7 +405,7 @@ class DifferentiableWellPredictor:
         *,
         device: torch.device,
     ) -> dict[tuple[int, int], torch.Tensor]:
-        nt = self.volume.twt_s.size
+        nt = self.volume.sample_axis.values.size
         by_node: dict[tuple[int, int], list[tuple[Any, torch.Tensor]]] = defaultdict(list)
         for (node, patch, _), output in zip(tasks, outputs):
             by_node[node].append((patch, output))
@@ -420,14 +420,14 @@ class DifferentiableWellPredictor:
                     self.volume.valid_mask[
                         inline_index,
                         xline_index,
-                        patch.twt_start : patch.twt_stop,
+                        patch.sample_start : patch.sample_stop,
                     ],
                     dtype=torch.bool,
                     device=device,
                 )
                 destination = torch.arange(
-                    patch.twt_start,
-                    patch.twt_stop,
+                    patch.sample_start,
+                    patch.sample_stop,
                     device=device,
                 )[valid]
                 indices.append(destination)
@@ -711,7 +711,7 @@ def prepare_real_delta_support(
         valid_mask=volume.valid_mask,
         ilines=volume.ilines,
         xlines=volume.xlines,
-        samples=volume.twt_s,
+        samples=volume.sample_axis.values,
         repo_root=repo_root,
         cluster_radius_m=float(cfg["cluster_radius_m"]),
         variant_id=sources.variant_id,
@@ -1367,7 +1367,7 @@ def _write_forward_figure(
         volume.seismic,
         ilines=volume.ilines,
         xlines=volume.xlines,
-        twt_s=volume.twt_s,
+        twt_s=volume.sample_axis.values,
         inline_values=well["inline"].to_numpy(dtype=np.float64),
         xline_values=well["xline"].to_numpy(dtype=np.float64),
         sample_twt_s=twt,

@@ -33,7 +33,10 @@ sys.path.insert(0, src_text)
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.config.sources import assert_same_path, load_summary, resolve_source_file_from_run, resolve_source_run
-from cup.physics.numpy_backend import forward_time
+from cup.physics.numpy_backend import forward_depth, forward_time, velocity_from_ai
+from cup.synthetic.contracts import FORWARD_MODEL_INPUTS_SCHEMA_VERSION
+from cup.well.anchor import sample_volume_trilinear
+from cup.well.real_field_controls import load_well_control_set
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
@@ -56,7 +59,7 @@ from wtie.processing import grid
 
 
 DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")
-SCHEMA_VERSION = "real_field_forward_diagnostic_summary_v3"
+SCHEMA_VERSION = "real_field_forward_diagnostic_summary_v4"
 
 
 def parse_args() -> argparse.Namespace:
@@ -484,7 +487,7 @@ def _load_zero_shot_line_geometry(zero_shot_dir: Path):
         raise ValueError("R1 XY well QC requires top-level seismic.file.")
     seismic_path = resolve_relative_path(seismic_text, root=data_root)
     seismic_type = str(seismic.get("type", "zgy")).casefold()
-    segy_options = segy_options_from_config(dict(seismic.get("segy_options") or {})) if seismic_type == "segy" else None
+    segy_options = segy_options_from_config(seismic) if seismic_type == "segy" else None
     survey = open_survey(seismic_path, seismic_type, segy_options=segy_options)
     return survey.line_geometry
 
@@ -1334,7 +1337,7 @@ def _build_well_forward_qc(
     first_arrays = next(iter(predictions.values()))["arrays"]
     section_ilines = np.asarray(first_arrays["ilines"], dtype=np.float64)
     section_xlines = np.asarray(first_arrays["xlines"], dtype=np.float64)
-    twt_model = np.asarray(first_arrays["twt_s"], dtype=np.float64)
+    twt_model = np.asarray(first_arrays["samples"], dtype=np.float64)
     if "max_line_distance" in cfg:
         raise ValueError("real_field_forward_diagnostic.well_qc.max_line_distance is retired; use max_xy_distance_m.")
     if cfg.get("max_xy_distance_m") is None:
@@ -1700,6 +1703,7 @@ def _plot_forward_qc(
     synthetic: np.ndarray,
     display_valid: np.ndarray,
     diagnostic_valid: np.ndarray,
+    sample_domain: str,
 ) -> str:
     figures = output_dir / "figures"
     figures.mkdir(parents=True, exist_ok=True)
@@ -1721,7 +1725,7 @@ def _plot_forward_qc(
         ax.set_title(title)
         ax.set_xlabel("lateral trace")
         fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-    axes[0].set_ylabel("forward TWT sample")
+    axes[0].set_ylabel("TVDSS sample" if sample_domain == "depth" else "TWT sample")
     fig.suptitle(f"R1 forward QC: {model_role}")
     fig.tight_layout()
     path = figures / f"{model_role}_observed_synthetic_residual.png"
@@ -2245,6 +2249,492 @@ def _red_flags(
     return flags
 
 
+def _finite_true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    values = np.asarray(mask, dtype=bool).reshape(-1)
+    padded = np.pad(values.astype(np.int8), (1, 1))
+    changes = np.diff(padded)
+    return [
+        (int(start), int(stop))
+        for start, stop in zip(np.flatnonzero(changes == 1), np.flatnonzero(changes == -1))
+        if int(stop) - int(start) >= 2
+    ]
+
+
+def _forward_depth_masked(
+    log_ai: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    tvdss_m: np.ndarray,
+    wavelet_time_s: np.ndarray,
+    wavelet: np.ndarray,
+    relation: Mapping[str, object],
+) -> tuple[np.ndarray, np.ndarray]:
+    values = np.asarray(log_ai, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(values)
+    if values.shape != valid.shape or values.shape[-1] != tvdss_m.size:
+        raise ValueError("Depth R1 logAI/mask/TVDSS shape mismatch.")
+    output = np.full(values.shape, np.nan, dtype=np.float64)
+    output_valid = np.zeros(values.shape, dtype=bool)
+    flat_values = values.reshape((-1, values.shape[-1]))
+    flat_valid = valid.reshape((-1, valid.shape[-1]))
+    flat_output = output.reshape((-1, output.shape[-1]))
+    flat_output_valid = output_valid.reshape((-1, output_valid.shape[-1]))
+    for trace_index, (trace, trace_valid) in enumerate(zip(flat_values, flat_valid)):
+        for start, stop in _finite_true_runs(trace_valid):
+            segment = trace[start:stop]
+            ai = np.exp(segment)
+            velocity = velocity_from_ai(
+                ai,
+                a=float(relation["a"]),
+                b=float(relation["b"]),
+            )
+            synthetic = forward_depth(
+                segment,
+                velocity,
+                tvdss_m[start:stop],
+                wavelet_time_s,
+                wavelet,
+            )
+            flat_output[trace_index, start:stop] = synthetic
+            flat_output_valid[trace_index, start:stop] = True
+    return output, output_valid
+
+
+def _phase_rotate_wavelet(wavelet: np.ndarray, phase_deg: float) -> np.ndarray:
+    values = np.asarray(wavelet, dtype=np.float64)
+    spectrum = np.fft.fft(values)
+    n = values.size
+    multiplier = np.zeros(n, dtype=np.float64)
+    if n % 2 == 0:
+        multiplier[0] = multiplier[n // 2] = 1.0
+        multiplier[1 : n // 2] = 2.0
+    else:
+        multiplier[0] = 1.0
+        multiplier[1 : (n + 1) // 2] = 2.0
+    analytic = np.fft.ifft(spectrum * multiplier)
+    return np.real(analytic * np.exp(1j * np.deg2rad(float(phase_deg))))
+
+
+def _time_shift_wavelet(
+    time_s: np.ndarray,
+    wavelet: np.ndarray,
+    shift_s: float,
+) -> np.ndarray:
+    return np.interp(
+        np.asarray(time_s, dtype=np.float64) - float(shift_s),
+        np.asarray(time_s, dtype=np.float64),
+        np.asarray(wavelet, dtype=np.float64),
+        left=0.0,
+        right=0.0,
+    )
+
+
+def _depth_shift_volume(
+    values: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    tvdss_m: np.ndarray,
+    shift_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    data = np.asarray(values, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(data)
+    shifted = np.full(data.shape, np.nan, dtype=np.float64)
+    shifted_valid = np.zeros(data.shape, dtype=bool)
+    query = np.asarray(tvdss_m, dtype=np.float64) - float(shift_m)
+    for source, source_valid, target, target_valid in zip(
+        data.reshape((-1, data.shape[-1])),
+        valid.reshape((-1, valid.shape[-1])),
+        shifted.reshape((-1, shifted.shape[-1])),
+        shifted_valid.reshape((-1, shifted_valid.shape[-1])),
+    ):
+        for start, stop in _finite_true_runs(source_valid):
+            inside = (query >= tvdss_m[start]) & (query <= tvdss_m[stop - 1])
+            target[inside] = np.interp(query[inside], tvdss_m[start:stop], source[start:stop])
+            target_valid[inside] = True
+    return shifted, shifted_valid
+
+
+def _load_depth_forward_inputs(
+    zero_shot_summary: Mapping[str, object],
+) -> tuple[Path, dict[str, object], np.ndarray, np.ndarray]:
+    reference = dict(zero_shot_summary.get("forward_model_inputs") or {})
+    path = resolve_relative_path(str(reference.get("path") or ""), root=REPO_ROOT)
+    if not path.is_file():
+        raise FileNotFoundError(f"Depth R0 forward_model_inputs not found: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("schema") != FORWARD_MODEL_INPUTS_SCHEMA_VERSION:
+        raise ValueError(
+            f"Depth R1 expected {FORWARD_MODEL_INPUTS_SCHEMA_VERSION}, "
+            f"got {payload.get('schema')!r}; rebuild rock-physics analysis."
+        )
+    if payload.get("sample_domain") != "depth" or payload.get("depth_basis") != "tvdss":
+        raise ValueError("Depth R1 forward_model_inputs must declare depth/TVDSS.")
+    relation = dict(payload.get("ai_velocity_relation") or {})
+    if relation.get("vp_unit") != "m/s" or relation.get("ai_unit") != "m/s*g/cm3":
+        raise ValueError("Depth R1 AI–Vp relation units are invalid.")
+    wavelet_path = resolve_relative_path(
+        str(dict(payload.get("wavelet") or {}).get("path") or ""),
+        root=REPO_ROOT,
+    )
+    wavelet_time_s, wavelet = _read_wavelet_csv(wavelet_path)
+    return path, relation, wavelet_time_s, wavelet
+
+
+def _depth_well_qc(
+    *,
+    zero_shot_dir: Path,
+    zero_shot_summary: Mapping[str, object],
+    observed: np.ndarray,
+    synthetic_by_role: Mapping[str, np.ndarray],
+    predictions: Mapping[str, Mapping[str, object]],
+    ilines: np.ndarray,
+    xlines: np.ndarray,
+    tvdss_m: np.ndarray,
+) -> pd.DataFrame:
+    controls_ref = dict(dict(zero_shot_summary.get("input_contracts") or {}).get("well_control_set") or {})
+    controls_summary = resolve_relative_path(str(controls_ref.get("path") or ""), root=REPO_ROOT)
+    controls = load_well_control_set(controls_summary.parent, repo_root=REPO_ROOT)
+    if controls.sample_domain != "depth" or controls.depth_basis != "tvdss":
+        raise ValueError("Depth R1 requires a depth/TVDSS WellControlSet.")
+    is_volume = observed.ndim == 3
+    line_geometry = _load_zero_shot_line_geometry(zero_shot_dir)
+    section_xy = np.asarray(
+        [line_geometry.line_to_coord(float(il), float(xl)) for il, xl in zip(ilines, xlines)],
+        dtype=np.float64,
+    ) if not is_volume else np.empty((0, 2), dtype=np.float64)
+    rows: list[dict[str, object]] = []
+    for control in controls.controls:
+        indices = np.searchsorted(control.sample_axis.values, tvdss_m)
+        indices = np.clip(indices, 0, control.sample_axis.values.size - 1)
+        same_axis = np.isclose(control.sample_axis.values[indices], tvdss_m, rtol=0.0, atol=1e-8)
+        well_log_ai = np.where(same_axis, control.log_ai.values[indices], np.nan)
+        inline_values = control.inline_by_sample[indices]
+        xline_values = control.xline_by_sample[indices]
+        if is_volume:
+            sample_kwargs = {
+                "ilines": ilines,
+                "xlines": xlines,
+                "twt_s": tvdss_m,
+                "inline_values": inline_values,
+                "xline_values": xline_values,
+                "sample_twt_s": tvdss_m,
+            }
+            observed_well, observed_inside = sample_volume_trilinear(observed, **sample_kwargs)
+        else:
+            well_xy = np.column_stack([control.x_m_by_sample[indices], control.y_m_by_sample[indices]])
+            distances = np.linalg.norm(well_xy[:, None, :] - section_xy[None, :, :], axis=2)
+            trace_indices = np.argmin(distances, axis=1)
+            observed_well = observed[trace_indices, np.arange(tvdss_m.size)]
+            observed_inside = np.isfinite(distances[np.arange(tvdss_m.size), trace_indices])
+        for role, synthetic in synthetic_by_role.items():
+            if is_volume:
+                synthetic_well, synthetic_inside = sample_volume_trilinear(synthetic, **sample_kwargs)
+            else:
+                synthetic_well = synthetic[trace_indices, np.arange(tvdss_m.size)]
+                synthetic_inside = observed_inside
+            model_role = role.removeprefix("zero_shot_")
+            pred_payload = predictions.get(model_role)
+            if pred_payload is None:
+                pred_values = np.full_like(well_log_ai, np.nan)
+            else:
+                pred = np.asarray(pred_payload["arrays"]["stitched_pred_log_ai"], dtype=np.float64)
+                if is_volume:
+                    pred_values, _ = sample_volume_trilinear(pred, **sample_kwargs)
+                else:
+                    pred_values = pred[trace_indices, np.arange(tvdss_m.size)]
+            valid = (
+                same_axis
+                & control.valid_mask[indices]
+                & observed_inside
+                & synthetic_inside
+                & np.isfinite(observed_well)
+                & np.isfinite(synthetic_well)
+            )
+            metrics = diagnostic_metrics(
+                observed=observed_well,
+                synthetic=synthetic_well,
+                valid_mask=valid,
+            )
+            ai_valid = valid & np.isfinite(well_log_ai) & np.isfinite(pred_values)
+            rows.append(
+                {
+                    "well_name": control.well_name,
+                    "model_role": role,
+                    "sample_domain": "depth",
+                    "sample_unit": "m",
+                    "depth_basis": "tvdss",
+                    "n_ai_valid": int(np.count_nonzero(ai_valid)),
+                    "ai_rmse": float(np.sqrt(np.mean((pred_values[ai_valid] - well_log_ai[ai_valid]) ** 2)))
+                    if np.any(ai_valid)
+                    else float("nan"),
+                    **metrics,
+                }
+            )
+    return pd.DataFrame.from_records(rows)
+
+
+def _run_depth_diagnostic(
+    *,
+    run_cfg: dict,
+    cfg_path: Path,
+    zero_shot_dir: Path,
+    zero_shot_summary: Mapping[str, object],
+    output_dir: Path,
+) -> None:
+    predictions = load_zero_shot_predictions(zero_shot_dir)
+    first = next(iter(predictions.values()))["arrays"]
+    observed = np.asarray(first["seismic_input"], dtype=np.float64)
+    lfm = np.asarray(first["lfm_input"], dtype=np.float64)
+    valid = np.asarray(first["valid_mask_model"], dtype=bool)
+    ilines = np.asarray(first["ilines"], dtype=np.float64)
+    xlines = np.asarray(first["xlines"], dtype=np.float64)
+    tvdss_m = np.asarray(first["samples"], dtype=np.float64)
+    if str(np.asarray(first["sample_domain"]).item()) != "depth":
+        raise ValueError("Depth R1 prediction artifact does not declare sample_domain=depth.")
+    if str(np.asarray(first["sample_unit"]).item()) != "m" or str(np.asarray(first["depth_basis"]).item()) != "tvdss":
+        raise ValueError("Depth R1 prediction artifact must use metre TVDSS samples.")
+    for role, payload in predictions.items():
+        arrays = payload["arrays"]
+        if not np.array_equal(np.asarray(arrays["samples"], dtype=np.float64), tvdss_m):
+            raise ValueError(f"R1 model {role} uses a different TVDSS axis.")
+    forward_inputs_path, relation, wavelet_time_s, wavelet = _load_depth_forward_inputs(zero_shot_summary)
+    impedance_inputs: list[tuple[str, np.ndarray]] = [("lfm_only", lfm)]
+    impedance_inputs.extend(
+        (f"zero_shot_{role}", np.asarray(payload["arrays"]["stitched_pred_log_ai"], dtype=np.float64))
+        for role, payload in predictions.items()
+    )
+    scan_cfg = dict(run_cfg.get("diagnostic_scan") or {})
+    phase_values = [float(value) for value in scan_cfg.get("phase_deg", [-20, -10, 0, 10, 20])]
+    time_shift_values = [float(value) for value in scan_cfg.get("wavelet_time_shift_s", [0.0])]
+    depth_shift_values = [float(value) for value in scan_cfg.get("depth_static_m", [-10.0, -5.0, 0.0, 5.0, 10.0])]
+    wrong_fields = [key for key in ("fractional_shift_samples", "diagnostic_max_hz") if key in scan_cfg or key in run_cfg]
+    if wrong_fields:
+        raise ValueError(f"Depth R1 rejects time-axis diagnostic fields: {wrong_fields}")
+    metrics_rows: list[dict[str, object]] = []
+    scan_rows: list[dict[str, object]] = []
+    spatial_rows: list[dict[str, object]] = []
+    synthetic_by_role: dict[str, np.ndarray] = {}
+    figures: dict[str, str] = {}
+    synthetic_dir = output_dir / "synthetic"
+    synthetic_dir.mkdir(parents=True, exist_ok=False)
+    for role, log_ai in impedance_inputs:
+        synthetic, forward_valid = _forward_depth_masked(
+            log_ai,
+            valid,
+            tvdss_m=tvdss_m,
+            wavelet_time_s=wavelet_time_s,
+            wavelet=wavelet,
+            relation=relation,
+        )
+        diagnostic_valid = valid & forward_valid & np.isfinite(observed)
+        synthetic_by_role[role] = synthetic
+        metrics_rows.append(
+            {
+                "model_role": role,
+                "forward_operator_id": "cup.physics.numpy_backend.forward_depth",
+                "sample_domain": "depth",
+                "sample_unit": "m",
+                "depth_basis": "tvdss",
+                **diagnostic_metrics(observed=observed, synthetic=synthetic, valid_mask=diagnostic_valid),
+            }
+        )
+        figures[role] = _plot_forward_qc(
+            output_dir=output_dir,
+            model_role=role,
+            observed=observed,
+            synthetic=synthetic,
+            display_valid=diagnostic_valid,
+            diagnostic_valid=diagnostic_valid,
+            sample_domain="depth",
+        )
+        np.savez_compressed(
+            synthetic_dir / f"{role}.npz",
+            synthetic_seismic=synthetic.astype(np.float32),
+            observed_seismic=observed.astype(np.float32),
+            valid_mask=diagnostic_valid,
+            samples=tvdss_m,
+            sample_domain=np.asarray("depth"),
+            sample_unit=np.asarray("m"),
+            depth_basis=np.asarray("tvdss"),
+        )
+        spatial_rows.extend(
+            _spatial_rows(
+                model_role=role,
+                observed=observed,
+                synthetic=synthetic,
+                valid=diagnostic_valid,
+            )
+        )
+        for phase_deg in phase_values:
+            candidate, candidate_valid = _forward_depth_masked(
+                log_ai,
+                valid,
+                tvdss_m=tvdss_m,
+                wavelet_time_s=wavelet_time_s,
+                wavelet=_phase_rotate_wavelet(wavelet, phase_deg),
+                relation=relation,
+            )
+            scan_rows.append(
+                {
+                    "model_role": role,
+                    "scan_type": "wavelet_phase",
+                    "phase_deg": phase_deg,
+                    "wavelet_time_shift_s": 0.0,
+                    "depth_static_m": 0.0,
+                    **diagnostic_metrics(observed=observed, synthetic=candidate, valid_mask=valid & candidate_valid),
+                }
+            )
+        for time_shift_s in time_shift_values:
+            candidate, candidate_valid = _forward_depth_masked(
+                log_ai,
+                valid,
+                tvdss_m=tvdss_m,
+                wavelet_time_s=wavelet_time_s,
+                wavelet=_time_shift_wavelet(wavelet_time_s, wavelet, time_shift_s),
+                relation=relation,
+            )
+            scan_rows.append(
+                {
+                    "model_role": role,
+                    "scan_type": "wavelet_time_shift",
+                    "phase_deg": 0.0,
+                    "wavelet_time_shift_s": time_shift_s,
+                    "depth_static_m": 0.0,
+                    **diagnostic_metrics(observed=observed, synthetic=candidate, valid_mask=valid & candidate_valid),
+                }
+            )
+        for depth_static_m in depth_shift_values:
+            candidate, candidate_valid = _depth_shift_volume(
+                synthetic,
+                diagnostic_valid,
+                tvdss_m=tvdss_m,
+                shift_m=depth_static_m,
+            )
+            scan_rows.append(
+                {
+                    "model_role": role,
+                    "scan_type": "depth_static",
+                    "phase_deg": 0.0,
+                    "wavelet_time_shift_s": 0.0,
+                    "depth_static_m": depth_static_m,
+                    **diagnostic_metrics(observed=observed, synthetic=candidate, valid_mask=valid & candidate_valid),
+                }
+            )
+    metrics_path = output_dir / "forward_diagnostic_metrics.csv"
+    scan_path = output_dir / "residual_decomposition.csv"
+    spatial_path = output_dir / "spatial_residual_qc.csv"
+    well_path = output_dir / "well_forward_diagnostic.csv"
+    pd.DataFrame.from_records(metrics_rows).to_csv(metrics_path, index=False)
+    pd.DataFrame.from_records(scan_rows).to_csv(scan_path, index=False)
+    pd.DataFrame.from_records(spatial_rows).to_csv(spatial_path, index=False)
+    _depth_well_qc(
+        zero_shot_dir=zero_shot_dir,
+        zero_shot_summary=zero_shot_summary,
+        observed=observed,
+        synthetic_by_role=synthetic_by_role,
+        predictions=predictions,
+        ilines=ilines,
+        xlines=xlines,
+        tvdss_m=tvdss_m,
+    ).to_csv(well_path, index=False)
+    model_manifests = []
+    for payload in predictions.values():
+        model_dir = resolve_relative_path(str(payload["summary"]["model_run_dir"]), root=REPO_ROOT)
+        with (model_dir / "model_run_manifest.json").open("r", encoding="utf-8") as handle:
+            model_manifests.append(json.load(handle))
+    rock_contracts = [dict(dict(item.get("input_contracts") or {}).get("rock_physics_analysis") or {}) for item in model_manifests]
+    if (
+        not rock_contracts
+        or not str(rock_contracts[0].get("contract_fingerprint_sha256") or "")
+        or any(item != rock_contracts[0] for item in rock_contracts[1:])
+    ):
+        raise ValueError("Depth R1 models do not share one rock-physics contract.")
+    recorded_rock_summary = resolve_relative_path(
+        str(rock_contracts[0].get("path") or ""), root=REPO_ROOT
+    )
+    if recorded_rock_summary.parent.resolve() != forward_inputs_path.parent.resolve():
+        raise ValueError(
+            "Depth R1 forward_model_inputs and model rock-physics contract "
+            "come from different runs."
+        )
+    input_contracts = {
+        "real_field_zero_shot": published_contract_reference(
+            zero_shot_dir / "real_field_zero_shot_summary.json",
+            root=REPO_ROOT,
+            label=f"R0 run {zero_shot_dir}",
+        ),
+        "rock_physics_analysis": rock_contracts[0],
+    }
+    fingerprint = contract_fingerprint_sha256(
+        contract_schema_version=SCHEMA_VERSION,
+        semantics={
+            "mode": "volume" if observed.ndim == 3 else "section",
+            "sample_domain": "depth",
+            "sample_unit": "m",
+            "depth_basis": "tvdss",
+            "forward_operator": "cup.physics.numpy_backend.forward_depth",
+        },
+        business_config={
+            "phase_scan_deg": phase_values,
+            "wavelet_time_shift_s": time_shift_values,
+            "depth_static_m": depth_shift_values,
+        },
+        input_contracts=input_contracts,
+        primary_artifacts={
+            "forward_diagnostic_metrics": metrics_path,
+            "well_forward_diagnostic": well_path,
+            "residual_decomposition": scan_path,
+            "spatial_residual_qc": spatial_path,
+        },
+    )
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "ok",
+        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "contract_fingerprint_sha256": fingerprint,
+        "input_contracts": input_contracts,
+        "mode": "volume" if observed.ndim == 3 else "section",
+        "sample_domain": "depth",
+        "sample_unit": "m",
+        "depth_basis": "tvdss",
+        "axis_contract": {
+            "n_sample": int(tvdss_m.size),
+            "sample_min": float(tvdss_m[0]),
+            "sample_max": float(tvdss_m[-1]),
+            "sample_step": float(np.median(np.diff(tvdss_m))),
+        },
+        "forward_model_inputs": {"path": repo_relative_path(forward_inputs_path, root=REPO_ROOT)},
+        "wavelet": {
+            "time_unit": "s",
+            "sample_count": int(wavelet.size),
+            "dt_s": float(np.median(np.diff(wavelet_time_s))),
+        },
+        "forward_contract": {
+            "operator": "cup.physics.numpy_backend.forward_depth",
+            "alignment": "observed, synthetic and logAI share the N-point TVDSS axis",
+            "wavelet_time_unit": "s",
+            "phase_scan_deg": phase_values,
+            "wavelet_time_shift_s": time_shift_values,
+            "depth_static_m": depth_shift_values,
+        },
+        "outputs": {
+            "forward_diagnostic_metrics": repo_relative_path(metrics_path, root=REPO_ROOT),
+            "well_forward_diagnostic": repo_relative_path(well_path, root=REPO_ROOT),
+            "residual_decomposition": repo_relative_path(scan_path, root=REPO_ROOT),
+            "spatial_residual_qc": repo_relative_path(spatial_path, root=REPO_ROOT),
+            "synthetic_dir": repo_relative_path(synthetic_dir, root=REPO_ROOT),
+            "figures": figures,
+        },
+        "red_flags": [],
+        "recommended_next_state": "depth_forward_closure_complete",
+        "config_file": repo_relative_path(cfg_path, root=REPO_ROOT),
+        "zero_shot_dir": repo_relative_path(zero_shot_dir, root=REPO_ROOT),
+        "code_version_or_git_commit": str(run_cfg.get("code_version_or_git_commit") or _git_commit()),
+    }
+    write_json(output_dir / "real_field_forward_diagnostic_summary.json", summary)
+
+
 def main() -> None:
     args = parse_args()
     cfg_path = resolve_relative_path(args.config, root=REPO_ROOT)
@@ -2256,14 +2746,31 @@ def main() -> None:
     output_root = resolve_relative_path(cfg.get("output_root", "scripts/output"), root=REPO_ROOT)
     zero_shot_dir = _resolve_zero_shot_dir(run_cfg, output_root=output_root, cli_value=args.zero_shot_dir)
     zero_shot_summary = _load_zero_shot_summary(zero_shot_dir)
+    sample_domain = str(zero_shot_summary.get("sample_domain") or "")
+    if sample_domain not in {"time", "depth"}:
+        raise ValueError("R0 summary must declare sample_domain=time or depth.")
+    output_dir = _resolve_output_dir("real_field_forward_diagnostic", args.output_dir, output_root=output_root)
+    output_dir.mkdir(parents=True, exist_ok=False)
+    if sample_domain == "depth":
+        if zero_shot_summary.get("sample_unit") != "m" or zero_shot_summary.get("depth_basis") != "tvdss":
+            raise ValueError("Depth R0 summary must declare metre TVDSS samples.")
+        _run_depth_diagnostic(
+            run_cfg=run_cfg,
+            cfg_path=cfg_path,
+            zero_shot_dir=zero_shot_dir,
+            zero_shot_summary=zero_shot_summary,
+            output_dir=output_dir,
+        )
+        print("=== Real Field Forward Diagnostic ===")
+        print(f"Output: {output_dir}")
+        print("Domain: depth/TVDSS")
+        print("Status: ok")
+        return
     run_cfg = _prepare_well_qc_sources(
         run_cfg,
         zero_shot_summary=zero_shot_summary,
         output_root=output_root,
     )
-    output_dir = _resolve_output_dir("real_field_forward_diagnostic", args.output_dir, output_root=output_root)
-    output_dir.mkdir(parents=True, exist_ok=False)
-
     predictions = load_zero_shot_predictions(zero_shot_dir)
     first = next(iter(predictions.values()))["arrays"]
     observed = np.asarray(first["seismic_input"], dtype=np.float64)
@@ -2272,7 +2779,7 @@ def main() -> None:
     ilines = np.asarray(first["ilines"], dtype=np.float64)
     xlines = np.asarray(first["xlines"], dtype=np.float64)
     output_mode = "volume" if observed.ndim == 3 else "section"
-    twt_s = np.asarray(first["twt_s"], dtype=np.float64)
+    twt_s = np.asarray(first["samples"], dtype=np.float64)
     dt_s = float(np.median(np.diff(twt_s))) if twt_s.size > 1 else 0.002
 
     wavelet_dir = _resolve_wavelet_dir(run_cfg, zero_shot_dir=zero_shot_dir, output_root=output_root)
@@ -2335,6 +2842,7 @@ def main() -> None:
             synthetic=synthetic,
             display_valid=valid,
             diagnostic_valid=valid_crop,
+            sample_domain="time",
         )
         np.savez_compressed(
             synthetic_dir / f"{model_role}.npz",
@@ -2521,6 +3029,9 @@ def main() -> None:
         "contract_fingerprint_sha256": contract_fingerprint,
         "input_contracts": input_contracts,
         "mode": output_mode,
+        "sample_domain": "time",
+        "sample_unit": "s",
+        "depth_basis": None,
         "config_file": repo_relative_path(cfg_path, root=REPO_ROOT),
         "zero_shot_dir": repo_relative_path(zero_shot_dir, root=REPO_ROOT),
         "wavelet": wavelet_meta,

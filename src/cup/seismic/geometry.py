@@ -96,8 +96,20 @@ class SampleAxis:
 
     def __post_init__(self) -> None:
         values = np.asarray(self.values, dtype=np.float64)
-        if values.ndim != 1 or values.size == 0:
-            raise ValueError("SampleAxis values must be a non-empty 1D array.")
+        if (
+            values.ndim != 1
+            or values.size == 0
+            or np.any(~np.isfinite(values))
+            or (values.size > 1 and np.any(np.diff(values) <= 0.0))
+        ):
+            raise ValueError(
+                "SampleAxis values must be a finite, strictly increasing 1D array."
+            )
+        expected_unit = "s" if self.domain == "time" else "m" if self.domain == "depth" else None
+        if expected_unit is None or self.unit != expected_unit:
+            raise ValueError(
+                f"Unsupported SampleAxis domain/unit: {self.domain!r}/{self.unit!r}."
+            )
         object.__setattr__(self, "values", values)
 
     @property

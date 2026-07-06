@@ -820,7 +820,7 @@ def run_lfm_pipeline(
 ) -> dict[str, Any]:
     if output_dir.exists():
         raise FileExistsError(output_dir)
-    temp_root = output_dir.parent / f".{output_dir.name}.tmp-{uuid4().hex}"
+    temp_root = output_dir.parent / f".tmp-{uuid4().hex[:8]}"
     temp_root.mkdir(parents=True)
     controls_summary_path = controls_run / "run_summary.json"
     with controls_summary_path.open("r", encoding="utf-8") as handle:

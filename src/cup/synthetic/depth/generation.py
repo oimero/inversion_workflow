@@ -812,6 +812,22 @@ def _write_base(h5: h5py.File, section: DepthGeneratedSection) -> str:
             axis_path=f"{path}/axes/{axis}",
             axis_order="lateral,tvdss",
         )
+    _dataset(
+        truth,
+        "geometry_event_mask_highres",
+        section.categorical["geometry_event_mask_highres"],
+        unit="bool",
+        axis_path=f"{path}/axes/tvdss_highres_m",
+        axis_order="lateral,tvdss",
+    )
+    _dataset(
+        truth,
+        "boundary_mask_model",
+        section.categorical["boundary_mask_model"],
+        unit="bool",
+        axis_path=f"{path}/axes/tvdss_model_m",
+        axis_order="lateral,tvdss",
+    )
     categorical = truth.create_group("categorical")
     for name, values in section.categorical.items():
         axis = (

@@ -803,7 +803,7 @@ def _export_zero_shot_volumes(output_dir: Path, *, run_cfg: dict, data_root: Pat
                     "source_field=stitched_pred_log_ai",
                     "transform=exp(stitched_pred_log_ai)",
                 ],
-                seismic_options=inputs,
+                seismic_options=dict(inputs.get("segy_options") or {}),
                 inline_chunk_size=inline_chunk_size,
                 nan_fill=nan_fill,
             )

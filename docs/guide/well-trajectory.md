@@ -146,7 +146,7 @@ well_trajectory:
 
 轨迹里的 `Z` 和 `TVD` 应满足 `Z ≈ KB - TVD`。脚本计算残差 `Z - (KB - TVD)`，超过 `z_tvd_tolerance_m` 时发出警告。
 
-### 亚海真垂深口径
+### TVDSS 口径
 
 脚本内部按 `tvdss_m = tvd_kb_m - kb_m` 计算。这个换算只在本模块和后续时深转换模块中实现，后续脚本不要自己散写这份逻辑。
 
@@ -186,7 +186,7 @@ well_trajectory:
 
 ### `trajectory_points/<well>.csv` — 每口井逐轨迹点
 
-仅当 `output.write_trajectory_points: true` 时写出。每行包含该轨迹点的测深、TVD、亚海真垂深、Z、XY、DX/DY、井斜角、方位角、DLS、浮点线号、最近线号、工区内外。
+仅当 `output.write_trajectory_points: true` 时写出。每行包含该轨迹点的测深、TVD、TVDSS、Z、XY、DX/DY、井斜角、方位角、DLS、浮点线号、最近线号、工区内外。
 
 ### `failed_trajectories.csv`
 

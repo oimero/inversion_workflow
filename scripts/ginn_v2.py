@@ -610,7 +610,7 @@ def run_train(args: argparse.Namespace) -> None:
     args = _apply_train_config(args)
     benchmark_dir = _resolve_benchmark_dir(args.benchmark_dir)
     output_dir = _resolve_output_dir("ginn_v2_train", args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=False)
+    output_dir.mkdir(parents=True, exist_ok=args.output_dir is not None)
     logger = configure_training_logger(output_dir)
     logger.info("GINN-v2 train output: %s", output_dir)
     logger.info("benchmark: %s", benchmark_dir)

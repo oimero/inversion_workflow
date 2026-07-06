@@ -348,8 +348,12 @@ def compute_normalization(
     if train.empty:
         raise ValueError("Cannot compute normalization without train patches.")
     buckets = {"seismic": [], "lfm": [], "target": [], "delta": []}
+    samples: dict[str, Any] = {}
     for _, row in train.iterrows():
-        sample = benchmark.load_sample(str(row["sample_id"]))
+        sample_id = str(row["sample_id"])
+        if sample_id not in samples:
+            samples[sample_id] = benchmark.load_sample(sample_id)
+        sample = samples[sample_id]
         target, seismic, lfm, valid, _ = _aligned_arrays(sample)
         sl = _row_slice(row)
         patch_valid = valid[sl]
@@ -387,8 +391,12 @@ def compute_input_reference_stats(
     if train.empty:
         raise ValueError("Cannot compute input reference stats without train patches.")
     chunks: list[np.ndarray] = []
+    samples: dict[str, Any] = {}
     for _, row in train.iterrows():
-        sample = benchmark.load_sample(str(row["sample_id"]))
+        sample_id = str(row["sample_id"])
+        if sample_id not in samples:
+            samples[sample_id] = benchmark.load_sample(sample_id)
+        sample = samples[sample_id]
         target, seismic, lfm, valid, _ = _aligned_arrays(sample)
         sl = _row_slice(row)
         patch_valid = valid[sl]

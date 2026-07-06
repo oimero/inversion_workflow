@@ -59,7 +59,7 @@ python scripts/synthoseis_lite.py --config <config-yaml> generate \
 | 第五步（深度域）| `wavelet_batch_metrics.csv`、`shifted_preprocessed_las/`、`shifted_filtered_las/` | 深度平移后的两套 LAS |
 | 旁路 | `forward_model_inputs.json` | 冻结子波和 AI–Vp 关系（来自岩石物理分析旁路） |
 
-深度域不使用第四步时间域标定结果和第五步全局子波，也不使用正演可观测性旁路。井曲线来自深度域第5步产出的两套平移 LAS：滤波版用于背景拟合，全曲线版用于提取波阻抗变化幅度。
+深度域的井曲线来自深度域第5步产出的两套平移 LAS：滤波版用于背景拟合，全曲线版用于提取波阻抗变化幅度。
 
 两种域都需要在配置中声明 `sample_domain` 和 `benchmark_schema`：
 
@@ -131,7 +131,7 @@ sampling:
   vertical_oversampling_factor: 8     # 高分辨率真值网格相对于模型网格的过采样倍数
 ```
 
-深度域不使用 `expected_output_dt_s`，模型网格的纵轴是亚海真垂深（米），分辨率由工区原生采样决定。
+深度域模型网格的纵轴是 TVDSS（米，真垂深，海平面以下），分辨率由工区原生采样决定。
 
 ### `geometry`
 
@@ -298,7 +298,7 @@ seismic_mismatch:
 
 深度域生成的整体流程与时间域相同，差异集中在几个关键点：
 
-- **坐标体系**：纵轴是亚海真垂深（米）而非双程旅行时（秒），模型网格分辨率由工区原生采样决定。
+- **坐标体系**：纵轴是 TVDSS（米）而非双程旅行时（秒），模型网格分辨率由工区原生采样决定。
 - **正演**：调 `cup.physics.forward_depth`（而非 `forward_time`），使用非平稳深度正演矩阵。子波米制宽度随速度变化。
 - **低频模型**：退化参数使用米制（如平滑截止波长而非截止频率），禁止 Hz 低通字段。
 - **失配**：额外支持独立的米制深度静差，与秒制子波相位和时移相互独立，可交叉组合。

@@ -46,7 +46,7 @@ python scripts/synthoseis_lite.py --config <config-yaml> generate \
 |------|------|------|
 | 第四步 | `well_tie_metrics.csv`、`filtered_las/` | 标定成功的井、滤波后的测井曲线 |
 | 第五步 | `selected_wavelet.csv`、`selected_wavelet_summary.json` | 全局子波，用于正演和 mismatch 扰动 |
-| 旁路 | `forward_observability/` | 频率探针证据，用于 probe benchmark 构建；其 run 契约指纹作为校准或生成的直接输入 |
+| 可选旁路 | `forward_observability/` | 仅在 `probe_selection.enabled: true` 时读取，用于 frequency probe benchmark 构建 |
 | 数据目录 | 地震体、解释层位、井分层 | 几何约束、目标窗口定义 |
 
 ### 深度域
@@ -239,11 +239,11 @@ seismic_mismatch:
     ...
   wavelet:
     phase_rotation_degrees: [-10.0, 10.0]
-    time_shift_samples: [-0.5, 0.5]
+    time_shift_s: [-0.001, 0.001]
   combined:
     enabled: true
     phase_rotation_degrees: 10.0
-    time_shift_samples: 0.5
+    time_shift_s: 0.001
     gain_log_sigma: 0.10
     noise_rms_fraction: 0.05
 ```
@@ -253,6 +253,22 @@ seismic_mismatch:
 ### `lfm` 和 `probe_selection`
 
 `lfm` 控制低频模型的生成（理想低通和受控退化两种），`probe_selection` 控制频率探针的选择和参数。深度域的 `lfm.controlled_degraded.over_smoothing` 使用米制截止参数。
+
+```yaml
+lfm:
+  controlled_degraded:
+    over_smoothing:
+      enabled: true
+      cutoff_hz: 6.0
+      numtaps: 129
+      kaiser_beta: 8.6
+      blend: 1.0
+
+probe_selection:
+  enabled: false
+```
+
+时间域中 `probe_selection.enabled: false` 时，脚本不读取 `forward_observability` 产物，不生成 frequency probe 样本，`probe_frequency_catalog.csv` 和 `frequency_probe_results.csv` 为空。常规的 field-conditioned/canonical 样本仍按第三、四、五步产物生成。
 
 ---
 
@@ -409,7 +425,7 @@ Status: success
 | 生成器族 | `object_coefficients_v1` | `object_coefficients_v2` |
 | 低频模型截止 | Hz | 米制 |
 | 深度静差 mismatch | 无 | 有，与子波平移独立 |
-| 正演可观测性 | 有 probe benchmark | 无 |
+| 正演可观测性 | probe benchmark 可选 | 无 |
 
 ### 深度域两套 LAS 的分工
 

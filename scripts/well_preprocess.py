@@ -53,6 +53,7 @@ from cup.well.preprocess import (
     IrregularMdCurve,
     IrregularMdCurveSet,
     WellCurveSet,
+    build_native_md_curve_set,
     compute_global_quantile_thresholds,
     finite_stats,
     is_curve_usable,
@@ -128,6 +129,13 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
     resampling = script_cfg.get("md_resampling")
     if not isinstance(resampling, Mapping):
         raise ValueError("well_preprocess.md_resampling must be explicitly configured.")
+    enabled = resampling.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("well_preprocess.md_resampling.enabled must be a boolean.")
+    normalized_resampling = {"enabled": enabled}
+    if not enabled:
+        script_cfg["md_resampling"] = normalized_resampling
+        return script_cfg
     try:
         step_m = float(resampling["step_m"])
         max_gap_m = float(resampling["max_interpolation_gap_m"])
@@ -142,6 +150,7 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "well_preprocess.md_resampling.max_interpolation_gap_m must be finite and >= step_m."
         )
     script_cfg["md_resampling"] = {
+        "enabled": enabled,
         "step_m": step_m,
         "max_interpolation_gap_m": max_gap_m,
     }
@@ -639,27 +648,33 @@ def run_preprocess(
             try:
                 irregular_curve_set = _build_preprocessed_curve_set(well_name, final_curves)
                 resampling_cfg = dict(config["md_resampling"])
-                regularized = regularize_md_curve_set(
-                    irregular_curve_set,
-                    step_m=float(resampling_cfg["step_m"]),
-                    max_interpolation_gap_m=float(resampling_cfg["max_interpolation_gap_m"]),
-                )
-                md_resampling_report = dict(regularized.report)
-                for standard_mnemonic, curve_report in regularized.curve_reports.items():
-                    md_resampling_rows.append(
-                        {
-                            **md_resampling_report,
-                            "standard_mnemonic": standard_mnemonic,
-                            **dict(curve_report),
-                        }
+                if bool(resampling_cfg["enabled"]):
+                    regularized = regularize_md_curve_set(
+                        irregular_curve_set,
+                        step_m=float(resampling_cfg["step_m"]),
+                        max_interpolation_gap_m=float(resampling_cfg["max_interpolation_gap_m"]),
                     )
-                curve_set = with_acoustic_impedance(regularized.curve_set)
+                    md_resampling_report = dict(regularized.report)
+                    for standard_mnemonic, curve_report in regularized.curve_reports.items():
+                        md_resampling_rows.append(
+                            {
+                                **md_resampling_report,
+                                "standard_mnemonic": standard_mnemonic,
+                                **dict(curve_report),
+                            }
+                        )
+                    base_curve_set = regularized.curve_set
+                    required_curve_label = "Regularized required curve"
+                else:
+                    base_curve_set = build_native_md_curve_set(irregular_curve_set)
+                    required_curve_label = "Required curve"
+                curve_set = with_acoustic_impedance(base_curve_set)
                 for category in required_categories:
                     mnemonic = standard_mnemonic_for_category(category)
                     output_valid_count = int(np.count_nonzero(np.isfinite(curve_set.require(mnemonic).values)))
                     if output_valid_count < min_valid_samples:
                         raise ValueError(
-                            f"Regularized required curve {mnemonic} has too few valid samples: "
+                            f"{required_curve_label} {mnemonic} has too few valid samples: "
                             f"{output_valid_count} < {min_valid_samples}."
                         )
                 export_logset_to_las(

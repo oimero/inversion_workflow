@@ -349,6 +349,33 @@ def regularize_md_curve_set(
     )
 
 
+def build_native_md_curve_set(curve_set: IrregularMdCurveSet) -> WellCurveSet:
+    """Materialize curves on their native MD axis.
+
+    The native axis must already satisfy ``grid.Log`` regular-sampling
+    requirements; otherwise construction fails at this boundary.
+    """
+    source_md = np.asarray(curve_set.basis, dtype=np.float64)
+    if source_md.size < 2 or np.any(~np.isfinite(source_md)) or np.any(np.diff(source_md) <= 0.0):
+        raise ValueError("Input MD basis must be finite and strictly increasing.")
+
+    logs: dict[str, grid.Log] = {}
+    for name, curve in curve_set.curves.items():
+        logs[name] = grid.Log(
+            np.asarray(curve.values, dtype=np.float64),
+            source_md,
+            "md",
+            name=curve.name,
+            unit=curve.unit,
+            allow_nan=True,
+        )
+    return WellCurveSet(
+        well_name=curve_set.well_name,
+        logs=logs,
+        source_las=curve_set.source_las,
+    )
+
+
 def validate_shared_basis(logs: Mapping[str, grid.Log]) -> None:
     """校验所有曲线共享同一条 MD 采样轴。"""
     if not logs:

@@ -19,6 +19,7 @@ from cup.seismic.wavelet import (
 )
 from cup.synthetic.calibration import (
     GENERATOR_FAMILY,
+    SCHEMA_VERSION as CALIBRATION_SCHEMA,
     ImpedanceCalibration,
     load_calibration,
 )
@@ -138,6 +139,8 @@ def _generation_input_contracts(
         ("wavelet_generation_dir", "wavelet_generation"),
         ("forward_observability_dir", "forward_observability"),
     ):
+        if source_key not in sources:
+            continue
         source_dir = sources[source_key]
         current_summary_path = source_dir / "run_summary.json"
         with current_summary_path.open("r", encoding="utf-8") as handle:
@@ -294,6 +297,7 @@ def _seismic_variant_records_for_sample(
         forward_valid_mask=forward_valid_mask,
         lateral_m=lateral_m,
         config=script_cfg["seismic_mismatch"],
+        output_dt_s=float(script_cfg["sampling"]["expected_output_dt_s"]),
         global_seed=int(script_cfg["global_seed"]),
         generator_family=GENERATOR_FAMILY,
         realization_id=str(source_index_record["parent_realization_id"]),
@@ -556,7 +560,6 @@ def _run_canonical_generation(
     h5_path = output_dir / "synthetic_benchmark.h5"
     input_contracts = _generation_input_contracts(
         calibration_path=calibration_path,
-        calibration=calibration,
         sources=sources,
         repo_root=repo_root,
     )

@@ -265,17 +265,21 @@ def derive_lfm_priors(
         )
 
     smoothing = dict(degraded_config.get("over_smoothing") or {})
-    over_cutoff = float(smoothing.get("cutoff_hz", 6.0))
-    blend = float(smoothing.get("blend", 1.0))
-    over_smoothed, over_qc = lowpass_model_grid(
-        degraded,
-        valid_mask=valid,
-        dt_s=dt_s,
-        cutoff_hz=over_cutoff,
-        numtaps=int(smoothing.get("numtaps", ideal_qc["numtaps"])),
-        kaiser_beta=float(smoothing.get("kaiser_beta", ideal_qc["kaiser_beta"])),
-    )
-    degraded[valid] = (1.0 - blend) * degraded[valid] + blend * over_smoothed[valid]
+    over_enabled = bool(smoothing.get("enabled", False))
+    over_cutoff = float("nan")
+    blend = 0.0
+    if over_enabled:
+        over_cutoff = float(smoothing.get("cutoff_hz", 6.0))
+        blend = float(smoothing.get("blend", 1.0))
+        over_smoothed, over_qc = lowpass_model_grid(
+            degraded,
+            valid_mask=valid,
+            dt_s=dt_s,
+            cutoff_hz=over_cutoff,
+            numtaps=int(smoothing.get("numtaps", ideal_qc["numtaps"])),
+            kaiser_beta=float(smoothing.get("kaiser_beta", ideal_qc["kaiser_beta"])),
+        )
+        degraded[valid] = (1.0 - blend) * degraded[valid] + blend * over_smoothed[valid]
 
     missing = dict(degraded_config.get("local_missing_control_bias") or {})
     if bool(missing.get("enabled", True)):
@@ -319,6 +323,7 @@ def derive_lfm_priors(
         "lfm_ideal_cutoff_hz": float(ideal_qc["cutoff_hz"]),
         "lfm_ideal_numtaps": int(ideal_qc["numtaps"]),
         "lfm_ideal_filter_family": ideal_qc["filter_family"],
+        "lfm_controlled_degraded_over_smoothing_enabled": over_enabled,
         "lfm_controlled_degraded_over_smoothing_cutoff_hz": over_cutoff,
         "lfm_controlled_degraded_over_smoothing_blend": blend,
         "lfm_amplitude_scale_bias": amplitude_scale,

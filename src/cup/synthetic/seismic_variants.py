@@ -108,6 +108,13 @@ def _fractional_shift(seismic: np.ndarray, samples: float) -> np.ndarray:
     return shifted
 
 
+def _seconds_to_fractional_samples(time_shift_s: float, output_dt_s: float) -> float:
+    dt = float(output_dt_s)
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError("invalid_seismic_variant:nonpositive_output_dt_s")
+    return float(time_shift_s) / dt
+
+
 def _tracewise_gain(
     *,
     lateral_m: np.ndarray,
@@ -223,6 +230,7 @@ def generate_seismic_variants(
     forward_valid_mask: np.ndarray,
     lateral_m: np.ndarray,
     config: Mapping[str, Any],
+    output_dt_s: float,
     global_seed: int,
     generator_family: str,
     realization_id: str,
@@ -385,18 +393,19 @@ def generate_seismic_variants(
                 extra_qc={"phase_rotation_degrees": value},
             )
         )
-    for shift in config["wavelet"]["time_shift_samples"]:
-        value = float(shift)
-        variant_id = f"fractional_time_shift_{value:+g}samples".replace("+", "p").replace("-", "m").replace(".", "p")
+    for shift in config["wavelet"]["time_shift_s"]:
+        value_s = float(shift)
+        shift_samples = _seconds_to_fractional_samples(value_s, output_dt_s)
+        variant_id = f"wavelet_time_shift_{value_s:+g}s".replace("+", "p").replace("-", "m").replace(".", "p")
         results.append(
             _build_result(
                 variant_id=variant_id,
                 mismatch_family="fractional_time_shift",
-                seismic_convolved=_fractional_shift(seismic, value),
+                seismic_convolved=_fractional_shift(seismic, shift_samples),
                 mask=mask,
                 gain=ones,
                 noise=zeros,
-                extra_qc={"time_shift_samples": value},
+                extra_qc={"wavelet_time_shift_s": value_s},
             )
         )
     combined_cfg = config["combined"]
@@ -404,7 +413,10 @@ def generate_seismic_variants(
         combined_id = "combined_moderate"
         shifted = _fractional_shift(
             _phase_rotate(seismic, float(combined_cfg["phase_rotation_degrees"])),
-            float(combined_cfg["time_shift_samples"]),
+            _seconds_to_fractional_samples(
+                float(combined_cfg["time_shift_s"]),
+                output_dt_s,
+            ),
         )
         combined_gain, combined_gain_qc = _tracewise_gain(
             lateral_m=lateral_m,
@@ -448,7 +460,7 @@ def generate_seismic_variants(
                 noise=combined_noise,
                 extra_qc={
                     "phase_rotation_degrees": float(combined_cfg["phase_rotation_degrees"]),
-                    "time_shift_samples": float(combined_cfg["time_shift_samples"]),
+                    "wavelet_time_shift_s": float(combined_cfg["time_shift_s"]),
                     "requested_noise_rms": combined_rms,
                     **{f"gain_{key}": value for key, value in combined_gain_qc.items()},
                 },

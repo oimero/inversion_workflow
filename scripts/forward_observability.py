@@ -54,7 +54,7 @@ from cup.seismic.wavelet import (
     wavelet_half_amplitude_frequencies,
 )
 from cup.config.workflow import WorkflowConfig
-from cup.config.sources import assert_recorded_source_matches, require_source_files, resolve_source_run
+from cup.config.sources import assert_recorded_source_matches, assert_same_path, require_source_files, resolve_source_run
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
@@ -1187,8 +1187,12 @@ def main() -> None:
                 run_dir=auto_tie_dir,
                 label=f"{well_name} planned input LAS",
             )
-            if not _same_path(preprocessed_las, planned_las):
-                raise ValueError("source_run_mismatch: fourth-step input_las differs from explicit preprocess run")
+            assert_same_path(
+                preprocessed_las,
+                planned_las,
+                root=REPO_ROOT,
+                message="source_run_mismatch: fourth-step input_las differs from explicit preprocess run",
+            )
 
             well_rows, window_rows, plot_payload = _analyze_well(
                 well_name=well_name,

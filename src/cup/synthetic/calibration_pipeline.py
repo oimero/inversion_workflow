@@ -123,10 +123,28 @@ def build_calibration_inputs(
     preprocess = pd.read_csv(
         sources["well_preprocess_dir"] / "well_preprocess_status.csv"
     )
+    with (sources["well_auto_tie_dir"] / "run_summary.json").open(
+        "r", encoding="utf-8"
+    ) as handle:
+        auto_tie_summary = json.load(handle)
+    inventory_text = str(
+        dict(auto_tie_summary.get("inputs") or {}).get("inventory_file") or ""
+    ).strip()
+    if not inventory_text:
+        raise ValueError("well_auto_tie run_summary.json lacks inputs.inventory_file")
+    inventory_path = resolve_relative_path(inventory_text, root=repo_root)
+    inventory = pd.read_csv(inventory_path)
+    inventory_required = {"well_name", "inline_float", "xline_float"}
+    missing_inventory = sorted(inventory_required - set(inventory.columns))
+    if missing_inventory:
+        raise ValueError(
+            f"well_inventory.csv is missing columns: {missing_inventory}"
+        )
     for frame, column in (
         (clusters, "well_name"),
         (metrics, "well_name"),
         (preprocess, "well_name"),
+        (inventory, "well_name"),
     ):
         frame["_well_key"] = frame[column].map(normalize_well_name)
         if frame["_well_key"].duplicated().any():
@@ -135,6 +153,10 @@ def build_calibration_inputs(
         metrics, on=["well_name", "_well_key"], validate="one_to_one"
     ).merge(
         preprocess[["_well_key", "preprocess_status", "preprocessed_las"]],
+        on="_well_key",
+        validate="one_to_one",
+    ).merge(
+        inventory[["_well_key", "inline_float", "xline_float"]],
         on="_well_key",
         validate="one_to_one",
     )
@@ -345,12 +367,14 @@ def run_calibration(
         repo_root=repo_root,
     )
     input_contracts: dict[str, dict[str, str]] = {}
-    for directory_key in (
-        "forward_observability_dir",
+    contract_source_keys = [
         "well_preprocess_dir",
         "well_auto_tie_dir",
         "wavelet_generation_dir",
-    ):
+    ]
+    if bool(script_cfg["probe_selection"]["enabled"]):
+        contract_source_keys.append("forward_observability_dir")
+    for directory_key in contract_source_keys:
         summary_path = sources[directory_key] / "run_summary.json"
         with summary_path.open("r", encoding="utf-8") as handle:
             source_summary = json.load(handle)

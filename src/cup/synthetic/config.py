@@ -108,14 +108,44 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "Time-domain Synthoseis-lite requires "
             f"synthoseis_lite.sample_domain='time' and benchmark_schema={DATA_SCHEMA!r}."
         )
+    probe_selection = _mapping(
+        root.get("probe_selection"), path="synthoseis_lite.probe_selection"
+    )
+    probe_keys = {
+        "enabled",
+        "weak_representatives_per_band",
+        "unsupported_representatives_per_band",
+        "minimum_noise_equivalent_clusters",
+        "low_probe_energy_warning_fraction",
+        "conservative_to_nominal_warning_ratio",
+        "vertical_tukey_alpha",
+        "amplitude_multipliers",
+        "phases",
+        "lateral_shapes",
+        "field_parent_geometry_family",
+        "field_parents_per_section",
+    }
+    _reject_unknown(probe_selection, probe_keys, path="synthoseis_lite.probe_selection")
+    _require_keys(probe_selection, {"enabled"}, path="synthoseis_lite.probe_selection")
+    if not isinstance(probe_selection.get("enabled"), bool):
+        raise ValueError("synthoseis_lite.probe_selection.enabled must be boolean.")
+    probe_enabled = bool(probe_selection["enabled"])
+    if not probe_enabled and probe_selection != {"enabled": False}:
+        raise ValueError(
+            "Time Synthoseis-lite requires probe_selection.enabled=false with no extra fields."
+        )
+    if probe_enabled:
+        _require_keys(probe_selection, probe_keys, path="synthoseis_lite.probe_selection")
     sources = _mapping(root.get("source_runs"), path="synthoseis_lite.source_runs")
-    source_keys = (
-        "forward_observability_dir",
+    source_keys = [
         "well_preprocess_dir",
         "well_auto_tie_dir",
         "wavelet_generation_dir",
-    )
-    _reject_unknown(sources, set(source_keys), path="synthoseis_lite.source_runs")
+    ]
+    allowed_source_keys = set(source_keys) | {"forward_observability_dir"}
+    if probe_enabled:
+        source_keys.append("forward_observability_dir")
+    _reject_unknown(sources, allowed_source_keys, path="synthoseis_lite.source_runs")
     source_runs = {
         key: _required_text(sources, key, path="synthoseis_lite.source_runs")
         for key in source_keys
@@ -460,25 +490,6 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         highres_mismatch_keys,
         path="synthoseis_lite.forward_qc.highres_mismatch",
     )
-    probe_selection = _mapping(
-        root.get("probe_selection"), path="synthoseis_lite.probe_selection"
-    )
-    probe_keys = {
-        "enabled",
-        "weak_representatives_per_band",
-        "unsupported_representatives_per_band",
-        "minimum_noise_equivalent_clusters",
-        "low_probe_energy_warning_fraction",
-        "conservative_to_nominal_warning_ratio",
-        "vertical_tukey_alpha",
-        "amplitude_multipliers",
-        "phases",
-        "lateral_shapes",
-        "field_parent_geometry_family",
-        "field_parents_per_section",
-    }
-    _reject_unknown(probe_selection, probe_keys, path="synthoseis_lite.probe_selection")
-    _require_keys(probe_selection, probe_keys, path="synthoseis_lite.probe_selection")
     figures = _mapping(root.get("figures"), path="synthoseis_lite.figures")
     figure_keys = {"enabled", "max_example_objects_per_zone_state", "report_examples"}
     _reject_unknown(figures, figure_keys, path="synthoseis_lite.figures")
@@ -519,7 +530,13 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         lfm_degraded.get("over_smoothing"),
         path="synthoseis_lite.lfm.controlled_degraded.over_smoothing",
     )
-    lfm_over_smoothing_keys = {"cutoff_hz", "numtaps", "kaiser_beta", "blend"}
+    lfm_over_smoothing_keys = {
+        "enabled",
+        "cutoff_hz",
+        "numtaps",
+        "kaiser_beta",
+        "blend",
+    }
     _reject_unknown(
         lfm_over_smoothing,
         lfm_over_smoothing_keys,
@@ -527,9 +544,19 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     )
     _require_keys(
         lfm_over_smoothing,
-        lfm_over_smoothing_keys,
+        {"enabled"},
         path="synthoseis_lite.lfm.controlled_degraded.over_smoothing",
     )
+    if not isinstance(lfm_over_smoothing.get("enabled"), bool):
+        raise ValueError(
+            "synthoseis_lite.lfm.controlled_degraded.over_smoothing.enabled must be boolean."
+        )
+    if bool(lfm_over_smoothing["enabled"]):
+        _require_keys(
+            lfm_over_smoothing,
+            lfm_over_smoothing_keys,
+            path="synthoseis_lite.lfm.controlled_degraded.over_smoothing",
+        )
     lfm_missing = _mapping(
         lfm_degraded.get("local_missing_control_bias"),
         path="synthoseis_lite.lfm.controlled_degraded.local_missing_control_bias",
@@ -598,7 +625,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     mismatch_wavelet = _mapping(
         mismatch.get("wavelet"), path="synthoseis_lite.seismic_mismatch.wavelet"
     )
-    mismatch_wavelet_keys = {"phase_rotation_degrees", "time_shift_samples"}
+    mismatch_wavelet_keys = {"phase_rotation_degrees", "time_shift_s"}
     _reject_unknown(
         mismatch_wavelet,
         mismatch_wavelet_keys,
@@ -615,7 +642,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     mismatch_combined_keys = {
         "enabled",
         "phase_rotation_degrees",
-        "time_shift_samples",
+        "time_shift_s",
         "gain_log_sigma",
         "noise_rms_fraction",
     }
@@ -629,27 +656,28 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         mismatch_combined_keys,
         path="synthoseis_lite.seismic_mismatch.combined",
     )
-    raw_lateral_shapes = probe_selection.get("lateral_shapes")
-    if not isinstance(raw_lateral_shapes, list) or not raw_lateral_shapes:
-        raise ValueError(
-            "synthoseis_lite.probe_selection.lateral_shapes must be a non-empty list."
-        )
     lateral_shapes = []
-    for index, item in enumerate(raw_lateral_shapes):
-        if isinstance(item, str):
-            lateral_shapes.append({"name": item})
-        else:
-            shape_path = f"synthoseis_lite.probe_selection.lateral_shapes[{index}]"
-            shape = _mapping(item, path=shape_path)
-            _reject_unknown(
-                shape,
-                {"name", "centered_fraction", "alpha"},
-                path=shape_path,
+    if probe_enabled:
+        raw_lateral_shapes = probe_selection.get("lateral_shapes")
+        if not isinstance(raw_lateral_shapes, list) or not raw_lateral_shapes:
+            raise ValueError(
+                "synthoseis_lite.probe_selection.lateral_shapes must be a non-empty list."
             )
-            _require_keys(
-                shape, {"name", "centered_fraction", "alpha"}, path=shape_path
-            )
-            lateral_shapes.append(shape)
+        for index, item in enumerate(raw_lateral_shapes):
+            if isinstance(item, str):
+                lateral_shapes.append({"name": item})
+            else:
+                shape_path = f"synthoseis_lite.probe_selection.lateral_shapes[{index}]"
+                shape = _mapping(item, path=shape_path)
+                _reject_unknown(
+                    shape,
+                    {"name", "centered_fraction", "alpha"},
+                    path=shape_path,
+                )
+                _require_keys(
+                    shape, {"name", "centered_fraction", "alpha"}, path=shape_path
+                )
+                lateral_shapes.append(shape)
     parsed = {
         "sample_domain": "time",
         "benchmark_schema": DATA_SCHEMA,
@@ -786,12 +814,19 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 "amplitude_scale_sigma": float(
                     lfm_degraded.get("amplitude_scale_sigma", 0.05)
                 ),
-                "over_smoothing": {
-                    "cutoff_hz": float(lfm_over_smoothing.get("cutoff_hz", 6.0)),
-                    "numtaps": int(lfm_over_smoothing.get("numtaps", 129)),
-                    "kaiser_beta": float(lfm_over_smoothing.get("kaiser_beta", 8.6)),
-                    "blend": float(lfm_over_smoothing.get("blend", 1.0)),
-                },
+                "over_smoothing": (
+                    {
+                        "enabled": True,
+                        "cutoff_hz": float(lfm_over_smoothing.get("cutoff_hz", 6.0)),
+                        "numtaps": int(lfm_over_smoothing.get("numtaps", 129)),
+                        "kaiser_beta": float(
+                            lfm_over_smoothing.get("kaiser_beta", 8.6)
+                        ),
+                        "blend": float(lfm_over_smoothing.get("blend", 1.0)),
+                    }
+                    if bool(lfm_over_smoothing["enabled"])
+                    else {"enabled": False}
+                ),
                 "local_missing_control_bias": {
                     "enabled": bool(lfm_missing.get("enabled", True)),
                     "max_abs_log_ai": float(lfm_missing.get("max_abs_log_ai", 0.04)),
@@ -843,11 +878,11 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                         [-10.0, 10.0],
                     )
                 ],
-                "time_shift_samples": [
+                "time_shift_s": [
                     float(value)
                     for value in mismatch_wavelet.get(
-                        "time_shift_samples",
-                        [-0.5, 0.5],
+                        "time_shift_s",
+                        [-0.001, 0.001],
                     )
                 ],
             },
@@ -856,8 +891,8 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 "phase_rotation_degrees": float(
                     mismatch_combined.get("phase_rotation_degrees", 10.0)
                 ),
-                "time_shift_samples": float(
-                    mismatch_combined.get("time_shift_samples", 0.5)
+                "time_shift_s": float(
+                    mismatch_combined.get("time_shift_s", 0.001)
                 ),
                 "gain_log_sigma": float(mismatch_combined.get("gain_log_sigma", 0.10)),
                 "noise_rms_fraction": float(
@@ -865,47 +900,52 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 ),
             },
         },
-        "probe_selection": {
-            "enabled": bool(probe_selection.get("enabled", True)),
-            "weak_representatives_per_band": int(
-                probe_selection.get("weak_representatives_per_band", 3)
-            ),
-            "unsupported_representatives_per_band": int(
-                probe_selection.get("unsupported_representatives_per_band", 3)
-            ),
-            "minimum_noise_equivalent_clusters": int(
-                probe_selection.get("minimum_noise_equivalent_clusters", 3)
-            ),
-            "low_probe_energy_warning_fraction": float(
-                probe_selection.get("low_probe_energy_warning_fraction", 0.01)
-            ),
-            "conservative_to_nominal_warning_ratio": float(
-                probe_selection.get(
-                    "conservative_to_nominal_warning_ratio",
-                    1.5,
-                )
-            ),
-            "vertical_tukey_alpha": float(
-                probe_selection.get("vertical_tukey_alpha", 0.5)
-            ),
-            "amplitude_multipliers": [
-                float(value)
-                for value in probe_selection.get(
-                    "amplitude_multipliers",
-                    [0.0, 0.25, 0.5, 1.0, 2.0, 4.0],
-                )
-            ],
-            "phases": [
-                str(value) for value in probe_selection.get("phases", ["sin", "cos"])
-            ],
-            "lateral_shapes": lateral_shapes,
-            "field_parent_geometry_family": str(
-                probe_selection.get("field_parent_geometry_family", "none")
-            ),
-            "field_parents_per_section": int(
-                probe_selection.get("field_parents_per_section", 1)
-            ),
-        },
+        "probe_selection": (
+            {
+                "enabled": True,
+                "weak_representatives_per_band": int(
+                    probe_selection.get("weak_representatives_per_band", 3)
+                ),
+                "unsupported_representatives_per_band": int(
+                    probe_selection.get("unsupported_representatives_per_band", 3)
+                ),
+                "minimum_noise_equivalent_clusters": int(
+                    probe_selection.get("minimum_noise_equivalent_clusters", 3)
+                ),
+                "low_probe_energy_warning_fraction": float(
+                    probe_selection.get("low_probe_energy_warning_fraction", 0.01)
+                ),
+                "conservative_to_nominal_warning_ratio": float(
+                    probe_selection.get(
+                        "conservative_to_nominal_warning_ratio",
+                        1.5,
+                    )
+                ),
+                "vertical_tukey_alpha": float(
+                    probe_selection.get("vertical_tukey_alpha", 0.5)
+                ),
+                "amplitude_multipliers": [
+                    float(value)
+                    for value in probe_selection.get(
+                        "amplitude_multipliers",
+                        [0.0, 0.25, 0.5, 1.0, 2.0, 4.0],
+                    )
+                ],
+                "phases": [
+                    str(value)
+                    for value in probe_selection.get("phases", ["sin", "cos"])
+                ],
+                "lateral_shapes": lateral_shapes,
+                "field_parent_geometry_family": str(
+                    probe_selection.get("field_parent_geometry_family", "none")
+                ),
+                "field_parents_per_section": int(
+                    probe_selection.get("field_parents_per_section", 1)
+                ),
+            }
+            if probe_enabled
+            else {"enabled": False}
+        ),
         "figures": {
             "enabled": bool(figures.get("enabled", True)),
             "max_example_objects_per_zone_state": int(
@@ -937,27 +977,54 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
 def resolve_sources(
     script_cfg: Mapping[str, Any], *, repo_root: Path
 ) -> dict[str, Path]:
+    probe_enabled = bool(script_cfg["probe_selection"]["enabled"])
     sources = {
         key: resolve_relative_path(value, root=repo_root)
         for key, value in script_cfg["source_runs"].items()
     }
     required = {
-        "forward_observability_dir": [
-            "run_summary.json",
-            "frequency_evidence_bands.csv",
-            "well_frequency_sensitivity.csv",
-        ],
-        "well_preprocess_dir": ["well_preprocess_status.csv"],
-        "well_auto_tie_dir": ["well_tie_metrics.csv"],
+        "well_preprocess_dir": ["run_summary.json", "well_preprocess_status.csv"],
+        "well_auto_tie_dir": ["run_summary.json", "well_tie_metrics.csv"],
         "wavelet_generation_dir": [
+            "run_summary.json",
             "selected_wavelet.csv",
             "selected_wavelet_summary.json",
             "evaluation_well_spatial_clusters.csv",
         ],
     }
+    if probe_enabled:
+        required["forward_observability_dir"] = [
+            "run_summary.json",
+            "frequency_evidence_bands.csv",
+            "well_frequency_sensitivity.csv",
+        ]
     for key, names in required.items():
         directory = sources[key]
         require_source_files(directory, names, label=key)
+    with (sources["wavelet_generation_dir"] / "selected_wavelet_summary.json").open(
+        "r", encoding="utf-8"
+    ) as handle:
+        wavelet_summary = json.load(handle)
+    assert_recorded_source_matches(
+        wavelet_summary,
+        "source_auto_tie_dir",
+        sources["well_auto_tie_dir"],
+        root=repo_root,
+    )
+    with (sources["well_auto_tie_dir"] / "run_summary.json").open(
+        "r", encoding="utf-8"
+    ) as handle:
+        auto_tie_summary = json.load(handle)
+    preprocess_status_text = str(
+        dict(auto_tie_summary.get("inputs") or {}).get("preprocess_status_file") or ""
+    )
+    if not preprocess_status_text:
+        raise ValueError("source_run_mismatch: well_auto_tie summary lacks preprocess_status_file")
+    recorded_preprocess_dir = resolve_relative_path(preprocess_status_text, root=repo_root).parent
+    if recorded_preprocess_dir.resolve() != sources["well_preprocess_dir"].resolve():
+        raise ValueError("source_run_mismatch:well_preprocess_dir")
+    if not probe_enabled:
+        return sources
     with (sources["forward_observability_dir"] / "run_summary.json").open(
         "r", encoding="utf-8"
     ) as handle:
@@ -1029,15 +1096,18 @@ def _validate_lfm_config(config: Mapping[str, Any], *, output_dt_s: float) -> No
             "lfm.controlled_degraded.lateral_correlation_fraction must be positive."
         )
     smoothing = degraded["over_smoothing"]
-    over_cutoff = float(smoothing["cutoff_hz"])
-    if not 0.0 < over_cutoff <= cutoff:
-        raise ValueError(
-            "lfm over_smoothing.cutoff_hz must be within (0, ideal cutoff]."
-        )
-    if int(smoothing["numtaps"]) < 3:
-        raise ValueError("lfm over_smoothing.numtaps must be >= 3.")
-    if not 0.0 <= float(smoothing["blend"]) <= 1.0:
-        raise ValueError("lfm over_smoothing.blend must be within [0, 1].")
+    if not isinstance(smoothing["enabled"], bool):
+        raise ValueError("lfm over_smoothing.enabled must be boolean.")
+    if bool(smoothing["enabled"]):
+        over_cutoff = float(smoothing["cutoff_hz"])
+        if not 0.0 < over_cutoff <= cutoff:
+            raise ValueError(
+                "lfm over_smoothing.cutoff_hz must be within (0, ideal cutoff]."
+            )
+        if int(smoothing["numtaps"]) < 3:
+            raise ValueError("lfm over_smoothing.numtaps must be >= 3.")
+        if not 0.0 <= float(smoothing["blend"]) <= 1.0:
+            raise ValueError("lfm over_smoothing.blend must be within [0, 1].")
     missing = degraded["local_missing_control_bias"]
     if float(missing["max_abs_log_ai"]) < 0.0:
         raise ValueError(
@@ -1080,7 +1150,7 @@ def _validate_seismic_mismatch_config(config: Mapping[str, Any]) -> None:
         if not np.isfinite(value) or value <= 0.0:
             raise ValueError(f"seismic_mismatch.gain.{key} must be positive.")
     wavelet = config["wavelet"]
-    for key in ("phase_rotation_degrees", "time_shift_samples"):
+    for key in ("phase_rotation_degrees", "time_shift_s"):
         values = list(wavelet[key])
         if not values or any(not np.isfinite(float(value)) for value in values):
             raise ValueError(
@@ -1089,7 +1159,7 @@ def _validate_seismic_mismatch_config(config: Mapping[str, Any]) -> None:
     combined = config["combined"]
     for key in (
         "phase_rotation_degrees",
-        "time_shift_samples",
+        "time_shift_s",
         "gain_log_sigma",
         "noise_rms_fraction",
     ):
@@ -1106,6 +1176,8 @@ def _validate_seismic_mismatch_config(config: Mapping[str, Any]) -> None:
 
 
 def _validate_probe_config(config: Mapping[str, Any]) -> None:
+    if not bool(config["enabled"]):
+        return
     if int(config["weak_representatives_per_band"]) < 1:
         raise ValueError("weak_representatives_per_band must be positive.")
     if int(config["unsupported_representatives_per_band"]) < 1:

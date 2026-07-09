@@ -37,6 +37,7 @@ well_curves:
 
 well_preprocess:
   md_resampling:
+    enabled: true
     step_m: 0.1
     max_interpolation_gap_m: 0.5
 
@@ -73,10 +74,11 @@ well_preprocess:
 
 ### `md_resampling`
 
-第三步输出的标准 LAS 必须使用规则测深网格。原始 LAS 可以是不规则采样，但必须在这里显式规则化一次，后续第4步/5 不再各自猜测或重复重采样。
+用于控制第三步导出的标准 LAS 是否执行测深规则化。启用时，原始 LAS 可以是不规则采样，脚本会在这里显式规则化一次，后续第4步/5 读取规则测深网格。
 
 规则化之前，原生 LAS 曲线由 `IrregularMdCurveSet` 显式承载；只有生成规则测深轴后才构造 `grid.Log`。不得把 irregular 测深伪装成要求等采样的 `grid.Log`。
 
+- `enabled`：是否启用测深规则化。当前公共配置为启用。关闭时，脚本按原生测深轴构造输出曲线；原生轴需要满足标准 LAS 导出的规则采样要求。
 - `step_m`：输出测深采样间隔，单位米。当前工区按原 LAS 名义 `STEP` 固定为 `0.1 m`。
 - `max_interpolation_gap_m`：允许插值的相邻有限源样点最大距离。超过该距离的缺口在规则网格上保持空值；当前配置为 `0.5 m`。
 
@@ -149,8 +151,8 @@ well_curve:
 3. **极值替换** — 超出上下限的有限值置为空值。
 4. **可用性判定** — 检查最终有效点是否满足最低数量和相对初始有效点的最低比例。
 5. **Primary 接管** — 如果某 category 的 primary 曲线不可用，按顺序尝试同类 secondary。接管只在同一 category 内发生。
-6. **测深规则化** — 对最终入选曲线统一重采样到配置的规则测深网格，只在不超过 `max_interpolation_gap_m` 的有限样点之间插值。
-7. **派生 AI** — 在规则化后的 `DT_USM` 和 `RHO_GCC` 上重新计算 AI，然后导出标准 LAS。
+6. **测深处理** — 启用测深规则化时，对最终入选曲线统一重采样到配置的规则测深网格，只在不超过 `max_interpolation_gap_m` 的有限样点之间插值；关闭时使用原生测深轴。
+7. **派生 AI** — 在最终输出轴上的 `DT_USM` 和 `RHO_GCC` 上重新计算 AI，然后导出标准 LAS。
 
 ---
 
@@ -209,11 +211,11 @@ AI (m/s*g/cm3) = (1e6 / DT_USM) * RHO_GCC
 
 ### `preprocessed_las/*.las`
 
-通过预处理的井的标准 LAS。测深已按 `md_resampling.step_m` 规则采样，LAS 头中的 `STRT/STOP/STEP` 与实际输出轴一致。曲线使用标准曲线名，单位已统一，固定包含 `DT_USM`、`RHO_GCC` 和规则化后重新派生的 `AI`；其他入选辅助曲线照常保留。长缺口保持缺失并写为 `-999.25`。只有 `preprocess_status == passed` 的井才会导出。
+通过预处理的井的标准 LAS。启用测深规则化时，测深按 `md_resampling.step_m` 规则采样；关闭时使用原生规则测深轴。LAS 头中的 `STRT/STOP/STEP` 与实际输出轴一致。曲线使用标准曲线名，单位已统一，固定包含 `DT_USM`、`RHO_GCC` 和重新派生的 `AI`；其他入选辅助曲线照常保留。长缺口保持缺失并写为 `-999.25`。只有 `preprocess_status == passed` 的井才会导出。
 
 ### `md_resampling_report.csv`
 
-每井每条导出曲线一行，记录原始/输出测深范围与样点数、原始步长 min/median/max、输出步长、插值样点数、保留空值数和未跨越的长缺口数量。
+启用测深规则化时，每井每条导出曲线一行，记录原始/输出测深范围与样点数、原始步长 min/median/max、输出步长、插值样点数、保留空值数和未跨越的长缺口数量。
 
 ### `well_preprocess_status.csv` — 每井一行
 

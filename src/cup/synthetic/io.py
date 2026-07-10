@@ -194,6 +194,7 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
         axis_dataset=model_axis,
     )
     physics_valid = np.zeros_like(section.valid_mask_model, dtype=bool)
+    physics_valid[:, 0] = np.asarray(section.forward_valid_mask_model, dtype=bool)[:, 0]
     physics_valid[:, 1:] = np.asarray(section.forward_valid_mask_model, dtype=bool)
     physics_valid &= np.asarray(section.valid_mask_model, dtype=bool)
     _dataset(

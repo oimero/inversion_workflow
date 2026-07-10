@@ -227,6 +227,7 @@ def generate_depth_object_core_section(
         y_m=y_m,
         horizon_twt_s=horizon_tvdss_m,
         output_dt_s=float(model_dz_m),
+        wavelet_time_s=np.array([-1.0, 0.0, 1.0], dtype=np.float64),
         wavelet=np.array([0.0, 1.0, 0.0], dtype=np.float64),
         vertical_oversampling_factor=int(vertical_oversampling_factor),
         minimum_truth_samples=int(minimum_highres_cells),

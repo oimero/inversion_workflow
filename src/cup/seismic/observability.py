@@ -19,8 +19,8 @@ from cup.physics.numpy_backend import forward_time
 
 
 FFT_CONVENTION = "numpy_forward_exp_minus_i_2pi_kn_over_n"
-DIFFERENCE_CONVENTION = "r[j]=tanh((x[j]-x[j-1])/2), basis=t[j]"
-CONVOLUTION_CONVENTION = "numpy.convolve(wavelet, reflectivity, mode='same')"
+DIFFERENCE_CONVENTION = "r[j]=tanh((x[j+1]-x[j])/2), event_basis=t[j+1]"
+CONVOLUTION_CONVENTION = "cup.physics.forward_time, lower_interface, N_sample_output"
 
 
 @dataclass(frozen=True)
@@ -93,32 +93,6 @@ def l2_normalize(values: np.ndarray) -> np.ndarray:
     if not np.isfinite(norm) or norm <= 0.0:
         raise ValueError("Cannot normalize a zero-energy vector.")
     return array / norm
-
-
-def acoustic_reflectivity_from_log_ai(log_ai: np.ndarray) -> np.ndarray:
-    """Compute exact vertical acoustic reflectivity on the lower sample."""
-    values = np.asarray(log_ai, dtype=np.float64).reshape(-1)
-    if values.size < 2:
-        raise ValueError("log_ai must contain at least two samples.")
-    if np.any(~np.isfinite(values)):
-        raise ValueError("log_ai must be finite.")
-    return np.tanh(0.5 * np.diff(values))
-
-
-def forward_log_ai(log_ai: np.ndarray, wavelet: np.ndarray) -> np.ndarray:
-    """Apply the project Robinson forward model to regularly sampled log(AI)."""
-    reflectivity = acoustic_reflectivity_from_log_ai(log_ai)
-    wavelet_values = np.asarray(wavelet, dtype=np.float64).reshape(-1)
-    if wavelet_values.size < 3 or wavelet_values.size % 2 == 0:
-        raise ValueError("wavelet must have odd length >= 3.")
-    if np.any(~np.isfinite(wavelet_values)):
-        raise ValueError("wavelet must be finite.")
-    trace = np.convolve(wavelet_values, reflectivity, mode="same")
-    if wavelet_values.size > reflectivity.size:
-        difference = trace.size - reflectivity.size
-        start = difference // 2
-        trace = trace[start : start + reflectivity.size]
-    return trace
 
 
 def _zero_padded_length(size: int) -> int:
@@ -433,8 +407,6 @@ def finite_difference_response(
             wavelet,
         )
         derivative = (upper - lower) / (2.0 * float(epsilon))
-        # forward_time is sample-aligned N; observed legacy traces remain on
-        # time_s[1:], so the same physical samples are selected by ``indices``.
         columns.append(derivative[indices])
     return np.column_stack(columns)
 
@@ -505,10 +477,10 @@ def analyze_frequency_scenario(
     indices = np.asarray(output_indices, dtype=np.int64).reshape(-1)
     if filtered.shape != time.shape or preprocessed.shape != time.shape:
         raise ValueError("time and both log_ai arrays must have matching shapes.")
-    if observed_values.size != time.size - 1:
-        raise ValueError("observed must align with time_s[1:].")
-    if indices.size == 0 or np.any(indices < 1) or np.any(indices >= time.size):
-        raise ValueError("output_indices must select samples from time_s[1:].")
+    if observed_values.size != time.size:
+        raise ValueError("observed must align with the N-point time_s axis.")
+    if indices.size == 0 or np.any(indices < 0) or np.any(indices >= time.size):
+        raise ValueError("output_indices must select samples from the time_s axis.")
     if np.any(np.diff(indices) != 1):
         raise ValueError("output_indices must be one continuous run.")
 
@@ -523,7 +495,7 @@ def analyze_frequency_scenario(
     basis_full[indices, :] = phase_basis.values
     synthetic_full = forward_time(filtered, scenario.time_s, scenario.amplitude)
     synthetic = synthetic_full[indices]
-    observed_window = observed_values[indices - 1]
+    observed_window = observed_values[indices]
     fit = weighted_amplitude_fit(
         observed_window,
         synthetic,

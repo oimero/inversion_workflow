@@ -745,7 +745,7 @@ def _analyze_well(
             local_time = time_s[context_slice]
             local_filtered = filtered_log_ai[context_slice]
             local_preprocessed = preprocessed_log_ai[context_slice]
-            local_observed = observed_full[context_slice][1:]
+            local_observed = observed_full[context_slice]
             n_samples = int(local_indices.size)
             window_rows.append(
                 {
@@ -1006,7 +1006,7 @@ def _plot_well_qc(
     axes[0].legend()
     axes[0].grid(alpha=0.2)
 
-    axes[1].plot(observed[indices - 1], local_time[indices], color="black")
+    axes[1].plot(observed[indices], local_time[indices], color="black")
     axes[1].invert_yaxis()
     axes[1].set_xlabel("Observed seismic")
     axes[1].grid(alpha=0.2)

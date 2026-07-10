@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 from scipy.signal import firwin, resample_poly
 
-from cup.seismic.observability import forward_log_ai
+from cup.physics.numpy_backend import forward_time
 
 
 def antialias_taps(
@@ -85,6 +85,17 @@ class HighresWavelet:
 class HighresForwardResult:
     seismic_model_grid: np.ndarray
     qc: dict[str, Any]
+
+
+def forward_sample_valid_mask(interface_mask: np.ndarray) -> np.ndarray:
+    """Project the N-1 lower-interface validity contract onto N seismic samples."""
+    valid = np.asarray(interface_mask, dtype=bool)
+    if valid.ndim < 1 or valid.shape[-1] < 1:
+        raise ValueError("forward interface mask must contain at least one interface")
+    output = np.empty((*valid.shape[:-1], valid.shape[-1] + 1), dtype=bool)
+    output[..., 0] = valid[..., 0]
+    output[..., 1:] = valid
+    return output
 
 
 def resample_wavelet_to_highres(
@@ -170,17 +181,17 @@ def highres_forward_to_model_grid(
     """Forward high-resolution truth and anti-alias it onto the model axis."""
     truth = np.asarray(truth_log_ai_highres, dtype=np.float64)
     reference = np.asarray(seismic_model_consistent, dtype=np.float64)
-    valid = np.asarray(forward_valid_mask_model, dtype=bool)
+    interface_valid = np.asarray(forward_valid_mask_model, dtype=bool)
+    valid = forward_sample_valid_mask(interface_valid)
     if truth.ndim != 2 or reference.ndim != 2 or valid.shape != reference.shape:
         raise ValueError("invalid_highres_forward_shapes")
     factor = int(highres_wavelet.factor)
-    highres = np.stack(
-        [forward_log_ai(trace, highres_wavelet.amplitude) for trace in truth],
-        axis=0,
+    highres = forward_time(
+        truth,
+        highres_wavelet.time_s,
+        highres_wavelet.amplitude,
     )
-    # High-resolution reflectivity sample 0 hangs on truth sample 1. The first
-    # model-grid reflectivity hangs on truth sample ``factor``.
-    aligned = highres[:, factor - 1 :]
+    aligned = highres
     downsampled = downsample_continuous(
         aligned,
         factor,
@@ -243,15 +254,13 @@ def highres_forward_to_model_grid(
 def model_grid_closure_qc(
     model_target_log_ai: np.ndarray,
     seismic_model_consistent: np.ndarray,
+    wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
 ) -> dict[str, Any]:
     """Verify the primary 2 ms forward path closes exactly."""
     target = np.asarray(model_target_log_ai, dtype=np.float64)
     reference = np.asarray(seismic_model_consistent, dtype=np.float64)
-    recomputed = np.stack(
-        [forward_log_ai(trace, wavelet) for trace in target],
-        axis=0,
-    )
+    recomputed = forward_time(target, wavelet_time_s, wavelet)
     if recomputed.shape != reference.shape:
         raise ValueError("invalid_model_grid_forward_alignment")
     difference = recomputed - reference

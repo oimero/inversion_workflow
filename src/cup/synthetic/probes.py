@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from scipy.signal.windows import tukey
 
-from cup.seismic.observability import forward_log_ai
+from cup.physics.numpy_backend import forward_time, reflectivity_from_log_ai
 from cup.synthetic.forward import downsample_continuous
 from cup.synthetic.generation import GeneratedSection
 from cup.utils.statistics import centered_rms
@@ -389,6 +389,7 @@ def generate_probe(
     frequency: ProbeFrequency,
     variant: ProbeVariant,
     *,
+    wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
     antialias_filter_taps: np.ndarray,
     vertical_tukey_alpha: float,
@@ -451,11 +452,8 @@ def generate_probe(
         antialias_filter_taps,
     )[..., : section.twt_model_s.size]
     target_model = section.model_target_log_ai + probe_model
-    reflectivity_model = np.tanh(0.5 * np.diff(target_model, axis=-1))
-    seismic = np.stack(
-        [forward_log_ai(trace, wavelet) for trace in target_model],
-        axis=0,
-    )
+    reflectivity_model = reflectivity_from_log_ai(target_model)
+    seismic = forward_time(target_model, wavelet_time_s, wavelet)
     model_mask = section.valid_mask_model & np.isfinite(target_model)
     model_probe_rms = centered_rms(probe_model, model_mask, min_count=2)
     total_rms = centered_rms(target_model, model_mask, min_count=2)

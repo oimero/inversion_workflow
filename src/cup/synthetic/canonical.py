@@ -7,7 +7,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from cup.seismic.observability import acoustic_reflectivity_from_log_ai, forward_log_ai
+from cup.physics.numpy_backend import forward_time, reflectivity_from_log_ai
 from cup.seismic.wavelet import wavelet_spectrum_features
 from cup.synthetic.calibration import ImpedanceCalibration
 from cup.synthetic.forward import antialias_taps, categorical_model_grids, downsample_continuous
@@ -323,18 +323,9 @@ def generate_canonical_section(
     taps = antialias_taps(factor)
     model_log_ai = downsample_continuous(log_ai, factor, taps)[..., : twt_model.size]
     rgt_model = downsample_continuous(rgt, factor, taps)[..., : twt_model.size]
-    reflectivity_highres = np.stack(
-        [acoustic_reflectivity_from_log_ai(trace) for trace in log_ai],
-        axis=0,
-    )
-    reflectivity_model = np.stack(
-        [acoustic_reflectivity_from_log_ai(trace) for trace in model_log_ai],
-        axis=0,
-    )
-    seismic = np.stack(
-        [forward_log_ai(trace, wavelet_values) for trace in model_log_ai],
-        axis=0,
-    )
+    reflectivity_highres = reflectivity_from_log_ai(log_ai)
+    reflectivity_model = reflectivity_from_log_ai(model_log_ai)
+    seismic = forward_time(model_log_ai, wavelet_time, wavelet_values)
     state_fraction, dominant, zone_model, boundary_fraction, valid_model = (
         categorical_model_grids(
             state_id,

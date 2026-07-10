@@ -7,7 +7,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from cup.seismic.observability import acoustic_reflectivity_from_log_ai, forward_log_ai
+from cup.physics.numpy_backend import forward_time, reflectivity_from_log_ai
 from cup.synthetic.calibration import (
     PROFILE_METRICS,
     ImpedanceCalibration,
@@ -575,6 +575,7 @@ def generate_field_section(
     y_m: np.ndarray,
     horizon_twt_s: np.ndarray,
     output_dt_s: float,
+    wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
     vertical_oversampling_factor: int = 8,
     minimum_truth_samples: int = 4,
@@ -1070,15 +1071,9 @@ def generate_field_section(
     taps = antialias_taps(factor)
     model_log_ai = downsample_continuous(log_ai, factor, taps)[..., : twt_model.size]
     rgt_model = downsample_continuous(rgt, factor, taps)[..., : twt_model.size]
-    reflectivity_highres = np.stack(
-        [acoustic_reflectivity_from_log_ai(trace) for trace in log_ai], axis=0
-    )
-    reflectivity_model = np.stack(
-        [acoustic_reflectivity_from_log_ai(trace) for trace in model_log_ai], axis=0
-    )
-    seismic = np.stack(
-        [forward_log_ai(trace, wavelet_values) for trace in model_log_ai], axis=0
-    )
+    reflectivity_highres = reflectivity_from_log_ai(log_ai)
+    reflectivity_model = reflectivity_from_log_ai(model_log_ai)
+    seismic = forward_time(model_log_ai, wavelet_time_s, wavelet_values)
     state_fraction, dominant, zone_model, boundary_fraction, valid_model = categorical_model_grids(
         state_id, object_id, zone_id_grid, boundary, factor, twt_model.size
     )

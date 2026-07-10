@@ -50,6 +50,7 @@ from cup.synthetic.forward import (
     antialias_taps,
     highres_forward_to_model_grid,
     model_grid_closure_qc,
+    forward_sample_valid_mask,
     resample_wavelet_to_highres,
 )
 from cup.synthetic.figures import write_generation_figures
@@ -224,6 +225,7 @@ def _load_probe_frequencies(
 def _section_forward_qc(
     section: Any,
     *,
+    wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
     highres_wavelet: HighresWavelet | None,
     required: bool,
@@ -231,6 +233,7 @@ def _section_forward_qc(
     qc = model_grid_closure_qc(
         section.model_target_log_ai,
         section.seismic_model_consistent,
+        wavelet_time_s,
         wavelet,
     )
     if highres_wavelet is None:
@@ -359,6 +362,7 @@ def _probe_records_for_parent(
     evaluation_role: str,
     frequencies: Sequence[ProbeFrequency],
     script_cfg: Mapping[str, Any],
+    wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
     highres_wavelet: HighresWavelet | None,
     base_highres_forward: HighresForwardResult | None,
@@ -381,6 +385,7 @@ def _probe_records_for_parent(
                 section,
                 frequency,
                 variant,
+                wavelet_time_s=wavelet_time_s,
                 wavelet=wavelet,
                 antialias_filter_taps=taps,
                 vertical_tukey_alpha=float(config["vertical_tukey_alpha"]),
@@ -392,6 +397,7 @@ def _probe_records_for_parent(
             closure = model_grid_closure_qc(
                 result.model_target_log_ai,
                 result.seismic_model_consistent,
+                wavelet_time_s,
                 wavelet,
             )
             lfm_result = derive_lfm_priors(
@@ -483,7 +489,7 @@ def _probe_records_for_parent(
                 ),
                 source_index_record=index_record,
                 seismic_model_consistent=result.seismic_model_consistent,
-                forward_valid_mask=section.forward_valid_mask_model,
+                forward_valid_mask=forward_sample_valid_mask(section.forward_valid_mask_model),
                 lateral_m=section.lateral_m,
                 script_cfg=script_cfg,
                 qc_only=qc_only,
@@ -600,6 +606,7 @@ def _run_canonical_generation(
                     )
             highres_result, forward_qc = _section_forward_qc(
                 generated,
+                wavelet_time_s=wavelet_time,
                 wavelet=wavelet,
                 highres_wavelet=highres_wavelet,
                 required=bool(script_cfg["forward_qc"]["highres_mismatch_required"]),
@@ -658,7 +665,7 @@ def _run_canonical_generation(
                 ),
                 source_index_record=record,
                 seismic_model_consistent=generated.seismic_model_consistent,
-                forward_valid_mask=generated.forward_valid_mask_model,
+                forward_valid_mask=forward_sample_valid_mask(generated.forward_valid_mask_model),
                 lateral_m=generated.lateral_m,
                 script_cfg=script_cfg,
                 qc_only=qc_only,
@@ -686,6 +693,7 @@ def _run_canonical_generation(
                     evaluation_role="development_pool",
                     frequencies=probe_frequencies,
                     script_cfg=script_cfg,
+                    wavelet_time_s=wavelet_time,
                     wavelet=wavelet,
                     highres_wavelet=highres_wavelet,
                     base_highres_forward=highres_result,
@@ -1032,6 +1040,7 @@ def run_generation(
             y_m=section.y_m,
             horizon_twt_s=section.horizon_twt_s,
             output_dt_s=output_dt,
+            wavelet_time_s=wavelet_time,
             wavelet=wavelet,
             vertical_oversampling_factor=int(
                 script_cfg["sampling"]["vertical_oversampling_factor"]
@@ -1153,6 +1162,7 @@ def run_generation(
                     y_m=section.y_m,
                     horizon_twt_s=section.horizon_twt_s,
                     output_dt_s=output_dt,
+                    wavelet_time_s=wavelet_time,
                     wavelet=wavelet,
                     vertical_oversampling_factor=int(
                         script_cfg["sampling"]["vertical_oversampling_factor"]
@@ -1174,6 +1184,7 @@ def run_generation(
                 )
                 highres_result, forward_qc = _section_forward_qc(
                     generated,
+                    wavelet_time_s=wavelet_time,
                     wavelet=wavelet,
                     highres_wavelet=highres_wavelet,
                     required=bool(
@@ -1236,7 +1247,7 @@ def run_generation(
                     ),
                     source_index_record=base_record_for_variants,
                     seismic_model_consistent=generated.seismic_model_consistent,
-                    forward_valid_mask=generated.forward_valid_mask_model,
+                    forward_valid_mask=forward_sample_valid_mask(generated.forward_valid_mask_model),
                     lateral_m=generated.lateral_m,
                     script_cfg=script_cfg,
                     qc_only=qc_only,
@@ -1272,6 +1283,7 @@ def run_generation(
                             evaluation_role=evaluation_role,
                             frequencies=probe_frequencies,
                             script_cfg=script_cfg,
+                            wavelet_time_s=wavelet_time,
                             wavelet=wavelet,
                             highres_wavelet=highres_wavelet,
                             base_highres_forward=highres_result,

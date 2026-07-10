@@ -14,7 +14,9 @@ import numpy as np
 import pandas as pd
 import torch
 
-from cup.physics.numpy_backend import forward_time
+from cup.physics.calibration import AIVelocityRelation
+from cup.physics.numpy_backend import forward_depth, forward_time, reflectivity_from_log_ai
+from cup.synthetic.contracts import FORWARD_MODEL_INPUTS_SCHEMA_VERSION
 from cup.seismic.lfm.artifacts import resolve_lfm_variant
 from cup.seismic.viz import plot_well_waveform_qc, waveform_qc_metrics
 from cup.utils.io import repo_relative_path, resolve_relative_path
@@ -942,6 +944,65 @@ def _source_summary(
     return summary
 
 
+def _load_depth_forward_inputs(
+    benchmark_manifest: Mapping[str, Any],
+    *,
+    repo_root: Path,
+) -> tuple[np.ndarray, np.ndarray, AIVelocityRelation]:
+    reference = str(benchmark_manifest.get("forward_model_inputs_path") or "").strip()
+    if not reference:
+        raise ValueError("Depth real-delta benchmark lacks forward_model_inputs_path.")
+    path = resolve_relative_path(reference, root=repo_root)
+    if not path.is_file():
+        raise FileNotFoundError(f"Depth real-delta forward inputs not found: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("schema") != FORWARD_MODEL_INPUTS_SCHEMA_VERSION:
+        raise ValueError(
+            "Depth real-delta expected "
+            f"{FORWARD_MODEL_INPUTS_SCHEMA_VERSION}, got {payload.get('schema')!r}; "
+            "rebuild the rock-physics analysis."
+        )
+    if payload.get("sample_domain") != "depth" or payload.get("depth_basis") != "tvdss":
+        raise ValueError("Depth real-delta forward inputs must declare depth/TVDSS.")
+    relation = AIVelocityRelation.from_mapping(
+        dict(payload.get("ai_velocity_relation") or {})
+    )
+    wavelet_ref = dict(payload.get("wavelet") or {})
+    if wavelet_ref.get("time_unit") != "s":
+        raise ValueError("Depth real-delta wavelet time_unit must be 's'.")
+    wavelet_path = resolve_relative_path(str(wavelet_ref.get("path") or ""), root=repo_root)
+    if not wavelet_path.is_file():
+        raise FileNotFoundError(f"Depth real-delta wavelet not found: {wavelet_path}")
+    frame = pd.read_csv(wavelet_path)
+    required = {"time_s", "amplitude"}
+    if not required.issubset(frame.columns):
+        raise ValueError(f"Depth real-delta wavelet must contain columns {sorted(required)}.")
+    return (
+        frame["time_s"].to_numpy(dtype=np.float64),
+        frame["amplitude"].to_numpy(dtype=np.float64),
+        relation,
+    )
+
+
+def _validate_well_sample_contract(well: pd.DataFrame, *, volume: RealFieldVolume) -> None:
+    domains = set(well["sample_domain"].astype(str))
+    units = set(well["sample_unit"].astype(str))
+    expected_units = {volume.sample_axis.unit}
+    if domains != {volume.sample_axis.domain} or units != expected_units:
+        raise ValueError(
+            "Real-delta well/LFM sample-axis mismatch: "
+            f"well_domain={sorted(domains)}, well_unit={sorted(units)}, "
+            f"lfm_domain={volume.sample_axis.domain!r}, lfm_unit={volume.sample_axis.unit!r}."
+        )
+    if volume.sample_axis.domain == "depth" and (
+        volume.depth_basis != "tvdss" or volume.sample_axis.unit != "m"
+    ):
+        raise ValueError("Depth real-delta well QC requires LFM TVDSS in metres.")
+    if volume.sample_axis.domain == "time" and volume.sample_axis.unit != "s":
+        raise ValueError("Time real-delta well QC requires TWT in seconds.")
+
+
 def evaluate_real_wells(
     *,
     support: RealDeltaSupport,
@@ -957,11 +1018,21 @@ def evaluate_real_wells(
     manifest_path = benchmark_dir / "benchmark_manifest.json"
     with manifest_path.open("r", encoding="utf-8") as handle:
         benchmark_manifest = json.load(handle)
-    wavelet_dir = resolve_relative_path(
-        str(dict(benchmark_manifest["source_runs"])["wavelet_generation_dir"]),
-        root=repo_root,
-    )
-    wavelet_time_s, wavelet, _wavelet_metadata = load_selected_wavelet(wavelet_dir)
+    sample_domain = support.volume.sample_axis.domain
+    relation: AIVelocityRelation | None = None
+    if sample_domain == "time":
+        wavelet_dir = resolve_relative_path(
+            str(dict(benchmark_manifest["source_runs"])["wavelet_generation_dir"]),
+            root=repo_root,
+        )
+        wavelet_time_s, wavelet, _wavelet_metadata = load_selected_wavelet(wavelet_dir)
+    elif sample_domain == "depth":
+        wavelet_time_s, wavelet, relation = _load_depth_forward_inputs(
+            benchmark_manifest,
+            repo_root=repo_root,
+        )
+    else:
+        raise ValueError(f"Unsupported real-delta sample domain: {sample_domain!r}.")
     groups = [
         group.sort_values("sample_index").copy()
         for _, group in support.samples.groupby("well_name", sort=True)
@@ -994,10 +1065,14 @@ def evaluate_real_wells(
             lfm_ai = well["lfm_log_ai"].to_numpy(dtype=np.float64)
             target_delta = target_ai - lfm_ai
             pred_ai = lfm_ai + pred_delta
-            twt = well["sample"].to_numpy(dtype=np.float64)
+            sample_axis = well["sample"].to_numpy(dtype=np.float64)
+            _validate_well_sample_contract(well, volume=support.volume)
             common = {
                 "checkpoint": checkpoint_name,
                 "well_name": well_name,
+                "sample_domain": sample_domain,
+                "sample_unit": support.volume.sample_axis.unit,
+                "depth_basis": support.volume.depth_basis or "",
                 "spatial_cluster_id": cluster,
                 "supervision_role": str(well["supervision_role"].iloc[0]),
                 "used_for_real_delta_training": bool(
@@ -1013,7 +1088,7 @@ def evaluate_real_wells(
                         target_delta,
                         pred_ai,
                         pred_delta,
-                        twt,
+                        sample_axis,
                     ),
                 }
             )
@@ -1025,7 +1100,8 @@ def evaluate_real_wells(
                         target_delta=target_delta,
                         pred_ai=pred_ai,
                         pred_delta=pred_delta,
-                        twt=twt,
+                        sample_axis=sample_axis,
+                        sample_domain=sample_domain,
                         diagnostic_max_hz=float(
                             support.config["diagnostic_max_hz"]
                         ),
@@ -1044,6 +1120,7 @@ def evaluate_real_wells(
                 volume=support.volume,
                 wavelet_time_s=wavelet_time_s,
                 wavelet=wavelet,
+                relation=relation,
                 tie={},
                 repo_root=repo_root,
             )
@@ -1163,10 +1240,15 @@ def _well_band_metrics(
     target_delta: np.ndarray,
     pred_ai: np.ndarray,
     pred_delta: np.ndarray,
-    twt: np.ndarray,
+    sample_axis: np.ndarray,
+    sample_domain: str,
     diagnostic_max_hz: float,
 ) -> dict[str, float | int]:
-    dt = float(np.nanmedian(np.diff(twt)))
+    if sample_domain == "depth":
+        return {}
+    if sample_domain != "time":
+        raise ValueError(f"Unsupported real-delta sample domain: {sample_domain!r}.")
+    dt = float(np.nanmedian(np.diff(sample_axis)))
     if not np.isfinite(dt) or dt <= 0.0:
         return {}
     high = min(float(diagnostic_max_hz), 0.45 * (0.5 / dt))
@@ -1276,12 +1358,15 @@ def _write_well_figures(
     volume: RealFieldVolume,
     wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
+    relation: AIVelocityRelation | None,
     tie: Mapping[str, Any],
     repo_root: Path,
 ) -> tuple[dict[str, str], str, dict[str, float | int]]:
     figures_dir = output_dir / "figures" / "wells" / str(cluster)
     figures_dir.mkdir(parents=True, exist_ok=True)
-    twt = well["sample"].to_numpy(dtype=np.float64)
+    sample_axis = well["sample"].to_numpy(dtype=np.float64)
+    sample_domain = volume.sample_axis.domain
+    sample_label = "TVDSS (m)" if sample_domain == "depth" else "TWT (s)"
     pred_ai = lfm_ai + pred_delta
     target_delta = target_ai - lfm_ai
     ai_path = figures_dir / f"{well_name}_{checkpoint_name}_ai_delta_qc.png"
@@ -1297,17 +1382,17 @@ def _write_well_figures(
         (lfm_ai, "LFM", "tab:blue"),
         (pred_ai, f"{checkpoint_name} prediction", "tab:red"),
     ):
-        axes[0].plot(values, twt, label=label, color=color, lw=1.2)
+        axes[0].plot(values, sample_axis, label=label, color=color, lw=1.2)
     for values, label, color in (
         (target_delta, "Well delta", "black"),
         (pred_delta, f"{checkpoint_name} delta", "tab:red"),
     ):
-        axes[1].plot(values, twt, label=label, color=color, lw=1.2)
+        axes[1].plot(values, sample_axis, label=label, color=color, lw=1.2)
     for axis in axes:
         axis.invert_yaxis()
         axis.grid(True, alpha=0.25)
         axis.legend(fontsize=8)
-    axes[0].set_ylabel("TWT (s)")
+    axes[0].set_ylabel(sample_label)
     axes[0].set_xlabel("logAI")
     axes[1].set_xlabel("delta logAI")
     fig.suptitle(
@@ -1325,11 +1410,12 @@ def _write_well_figures(
         ),
         pred_log_ai=pred_ai,
         well_log_ai=target_ai,
-        twt=twt,
+        sample_axis=sample_axis,
         well=well,
         volume=volume,
         wavelet_time_s=wavelet_time_s,
         wavelet=wavelet,
+        relation=relation,
         tie=tie,
     )
     return (
@@ -1352,17 +1438,37 @@ def _write_forward_figure(
     title: str,
     pred_log_ai: np.ndarray,
     well_log_ai: np.ndarray,
-    twt: np.ndarray,
+    sample_axis: np.ndarray,
     well: pd.DataFrame,
     volume: RealFieldVolume,
     wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
+    relation: AIVelocityRelation | None,
     tie: Mapping[str, Any],
 ) -> tuple[str, dict[str, float | int]]:
-    if twt.size < 9:
+    if sample_axis.size < 9:
         return "insufficient_forward_qc_support", {}
     filled = _fill_nonfinite(pred_log_ai)
-    synthetic = forward_time(filled[None, :], wavelet_time_s, wavelet)[0]
+    sample_domain = volume.sample_axis.domain
+    if sample_domain == "time":
+        if relation is not None:
+            raise ValueError("Time real-delta forward QC rejects an AI--Vp relation.")
+        synthetic = forward_time(filled[None, :], wavelet_time_s, wavelet)[0]
+    elif sample_domain == "depth":
+        if volume.depth_basis != "tvdss" or volume.sample_axis.unit != "m":
+            raise ValueError("Depth real-delta forward QC requires TVDSS in metres.")
+        if relation is None:
+            raise ValueError("Depth real-delta forward QC requires a frozen AI--Vp relation.")
+        velocity = relation.velocity_from_ai(np.exp(filled))
+        synthetic = forward_depth(
+            filled[None, :],
+            velocity[None, :],
+            sample_axis,
+            wavelet_time_s,
+            wavelet,
+        )[0]
+    else:
+        raise ValueError(f"Unsupported real-delta sample domain: {sample_domain!r}.")
     observed, inside = sample_volume_trilinear(
         volume.seismic,
         ilines=volume.ilines,
@@ -1370,13 +1476,14 @@ def _write_forward_figure(
         twt_s=volume.sample_axis.values,
         inline_values=well["inline"].to_numpy(dtype=np.float64),
         xline_values=well["xline"].to_numpy(dtype=np.float64),
-        sample_twt_s=twt,
+        sample_twt_s=sample_axis,
     )
     valid = inside & np.isfinite(synthetic) & np.isfinite(observed)
-    start = _number(tie.get("tie_window_start_s"))
-    stop = _number(tie.get("tie_window_end_s"))
+    window_suffix = "m" if sample_domain == "depth" else "s"
+    start = _number(tie.get(f"tie_window_start_{window_suffix}"))
+    stop = _number(tie.get(f"tie_window_end_{window_suffix}"))
     if np.isfinite(start) and np.isfinite(stop):
-        valid &= (twt >= start) & (twt <= stop)
+        valid &= (sample_axis >= start) & (sample_axis <= stop)
     run = _largest_true_run(valid)
     if run is None or run[1] - run[0] < 8:
         return "insufficient_forward_qc_support", {}
@@ -1387,28 +1494,30 @@ def _write_forward_figure(
         return "insufficient_forward_qc_support", {}
     sample_slice = slice(plot_start, plot_stop)
     interface_slice = slice(plot_start - 1, plot_stop - 1)
-    basis = twt[sample_slice]
-    pred_ai = grid.Log(np.exp(filled[sample_slice]), basis, "twt", name="Predicted AI")
+    basis = sample_axis[sample_slice]
+    grid_basis = "tvdss" if sample_domain == "depth" else "twt"
+    pred_ai = grid.Log(np.exp(filled[sample_slice]), basis, grid_basis, name="Predicted AI")
     filtered_ai = grid.Log(
         np.exp(_fill_nonfinite(well_log_ai)[sample_slice]),
         basis,
-        "twt",
+        grid_basis,
         name="Filtered LAS AI",
     )
     reflectivity = grid.Reflectivity(
-        np.tanh(0.5 * np.diff(filled))[interface_slice],
+        reflectivity_from_log_ai(filled)[interface_slice],
         basis,
-        "twt",
+        grid_basis,
         name="Reflectivity",
     )
-    synthetic_trace = grid.Seismic(synthetic[sample_slice], basis, "twt", name="Synthetic")
-    observed_trace = grid.Seismic(observed[sample_slice], basis, "twt", name="Seismic")
+    synthetic_trace = grid.Seismic(synthetic[sample_slice], basis, grid_basis, name="Synthetic")
+    observed_trace = grid.Seismic(observed[sample_slice], basis, grid_basis, name="Seismic")
     xcorr_values = normalized_xcorr(observed_trace.values, synthetic_trace.values)
     xcorr_basis = synthetic_trace.sampling_rate * np.arange(
         -(synthetic_trace.size - 1),
         synthetic_trace.size,
     )
-    xcorr = grid.XCorr(xcorr_values, xcorr_basis, "tlag", name="XCorr")
+    lag_basis = "zlag" if sample_domain == "depth" else "tlag"
+    xcorr = grid.XCorr(xcorr_values, xcorr_basis, lag_basis, name="XCorr")
     dxcorr = dynamic_normalized_xcorr(observed_trace, synthetic_trace)
     fig, _ = plot_well_waveform_qc(
         [pred_ai, filtered_ai],

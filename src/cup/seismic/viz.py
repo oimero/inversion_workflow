@@ -376,7 +376,20 @@ def plot_well_waveform_qc(
     common_xlim = _symmetric_limits(synthetic_seismic.values, real_seismic.values)
     _plot_wiggle_trace(synthetic_seismic, fig_axes=(fig, axes[2]), xlim=common_xlim)
     _plot_wiggle_trace(real_seismic, fig_axes=(fig, axes[3]), xlim=common_xlim)
-    residual = grid.Seismic(real_seismic.values - synthetic_seismic.values, real_seismic.basis, "twt", name="Residual")
+    if real_seismic.is_twt:
+        seismic_basis_type = "twt"
+    elif real_seismic.is_tvdss:
+        seismic_basis_type = "tvdss"
+    else:
+        raise ValueError(
+            "Well waveform QC seismic must use TWT or TVDSS basis."
+        )
+    residual = grid.Seismic(
+        real_seismic.values - synthetic_seismic.values,
+        real_seismic.basis,
+        seismic_basis_type,
+        name="Residual",
+    )
     _plot_wiggle_trace(residual, fig_axes=(fig, axes[4]), xlim=_symmetric_limits(residual.values))
 
     # dxcoor

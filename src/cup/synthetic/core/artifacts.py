@@ -125,6 +125,12 @@ def validate_dataset_metadata(value: h5py.Dataset, *, sample_domain: str) -> Non
     if str(value.attrs["dtype"]) != str(value.dtype):
         raise ValueError(f"HDF5 dataset {value.name} dtype metadata is stale.")
     axis_path = str(value.attrs["axis_path"])
+    if not axis_path:
+        if Path(value.parent.name).name.casefold() != "axes":
+            raise ValueError(
+                f"HDF5 dataset {value.name} has no axis reference outside an axes group."
+            )
+        return
     if axis_path not in value.file or not isinstance(value.file[axis_path], h5py.Dataset):
         raise ValueError(
             f"HDF5 dataset {value.name} references a missing axis: {axis_path}"

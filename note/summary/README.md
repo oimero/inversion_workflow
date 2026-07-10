@@ -2,24 +2,11 @@
 
 本目录冻结 `synthoseis-lite` 模型消融阶段，以及真实工区 R0/R1/R2 研究诊断阶段的可信报告。
 
-当前 HEAD：
-
-```text
-0c216564d9a19e076665e133be791c40b7e31b4e
-```
-
 ## 当前结论
 
-Synthetic gate 的主候选仍是 `trace1d_tcn_lateral_mixer_mismatch`：强 1D TCN 时间主干加浅横向 mixer，在多 seed 消融中整体优于纯 1D；`k5` 仍是下一轮候选，不替代当前 full-training `k3` 主候选。
-
-真实工区 zero-shot 正演一致性稳定，但井旁阻抗可信度尚未被钉牢。2026-06-26 的旧 W0/W1
-线性 sparse-well 支线已冻结为 rejected diagnostic。2026-06-27 的 final-head R2 虽被原始
-标量规则误判为 lateral positive，但 LOCO 与 all-well 预测均发生明显 delta 能量和梯度坍缩，
-synthetic preservation 同时严重失败。因此人工审计覆盖原判定：R2 已冻结为 rejected
-diagnostic，禁止进入原规划的 R3 full-field application。2026-06-28 的 from-scratch
-real-delta anchor 在未参与训练、且属于单井空间簇的 PH5 上显著改善 full-AI/delta corr 与
-RMSE，同时保持 synthetic evidence；该结果冻结为 positive proof-of-signal，delta 幅度偏低和
-井旁正演下降作为后续警告保留。
+- Synthetic 主候选是 full-training k3 lateral mixer，纯 1D TCN 保留为对照。
+- 完整体 zero-shot 正演相关性约 `0.925`，相对 LFM-only 消除约 `84%` 的残差能量，但井旁 AI 改善不稳定。
+- PH5 from-scratch real-delta anchor 是 positive proof-of-signal，但仍有 delta 幅度偏低和井旁正演下降风险。
 
 ## 批次说明
 
@@ -30,67 +17,14 @@ RMSE，同时保持 synthetic evidence；该结果冻结为 positive proof-of-si
 | `20260619_smoothing_width_gate` | `60aeb3a310cee090090041084344da72a218edd3` | 冻结 post-hoc smoothing、mixer width 和 k5 subset 多 seed 复核 | 当前 synthetic 推荐入口 |
 | `20260622_real_field_gate` | `1dd88ac969793a16cd94c0525e10e76675e82a18` | 冻结新 LFM、R0 zero-shot 和 R1 forward diagnostic | 当前真实工区 R0/R1 推荐入口 |
 | `20260623_six_section_r2_gate` | `0c216564d9a19e076665e133be791c40b7e31b4e` | 冻结六剖面 R0/R1 和 R2 全局常数 bias 诊断 | 当前真实工区推荐入口 |
+| `20260625_volume_r0_r1_gate` | `471f6f9` / `210ad92` | 冻结完整体 R0 zero-shot 与 R1 forward diagnostic | 0626 W0/W1 的权威体模式对照 |
 | `20260626_w0_w1_rejected_diagnostic` | `2e165832c2152701cd28c42038986f49572c03ed` | 冻结旧 W0/W1 线性 sparse-well 支线：W0 井侧正、W1 全场拒绝 | 废弃支线，仅作反例证据 |
 | `20260627_r2_final_head_rejected_diagnostic` | `572a124a6f88f202c8654ea586db01f66e916f4d` | 冻结 final-head real-delta adapter：标量改善来自 delta collapse | 废弃支线，禁止进入 full-field application |
 | `20260628_real_delta_anchor_ph5_positive_signal` | `c7d751afe8db3d408afc304eede663e308aba9ab` | 完整冻结 PH5 held-out real-delta anchor 输出、checkpoint 与图件 | Positive proof-of-signal；继续 GINN-v2 real-delta 研究 |
-
-## 真实工区冻结位置
-
-```text
-note/summary/final_audit/20260623_six_section_r2_gate/
-  README.md
-  configs/real_field_six_section_configs_20260623/
-  r0/
-  r1/
-  r2/real_field_lowfreq_calibration_current/
-```
-
-旧 W0/W1 rejected diagnostic 位置：
-
-```text
-note/summary/final_audit/20260626_w0_w1_rejected_diagnostic/
-```
-
-Final-head R2 rejected diagnostic 位置：
-
-```text
-note/summary/final_audit/20260627_r2_final_head_rejected_diagnostic/
-```
-
-PH5 held-out real-delta positive-signal 完整冻结位置：
-
-```text
-note/summary/final_audit/20260628_real_delta_anchor_ph5_positive_signal/
-```
-
-关键指标来自：
-
-```text
-note/summary/final_audit/20260623_six_section_r2_gate/r2/real_field_lowfreq_calibration_current/calibration_bias_by_model.csv
-note/summary/final_audit/20260623_six_section_r2_gate/r2/real_field_lowfreq_calibration_current/calibrated_forward_metrics.csv
-```
 
 ## 当前候选排序
 
 | 排名 | 模型 | 状态 |
 | ---: | --- | --- |
 | 1 | `trace1d_tcn_lateral_mixer_mismatch` | Synthetic gate 综合主候选 |
-| 2 | `trace1d_tcn_lateral_mixer_k5_subset` | 下一轮 full-training 候选 |
-| 3 | `trace1d_tcn_mismatch` | 强 1D 对照基线 |
-| 4 | `trace1d_tcn` | clean probe 参考 |
-| - | `trace1d_tcn_mismatch + tiny physics` | coverage 实验，不作为提升候选 |
-
-## 数据可靠性声明
-
-`sample_kind` 过滤修复前的 mismatch-training base 指标全部废弃。20260618 baseline gate 只引用 `20260618_baseline_gate` 下的冻结副本；20260619 lateral mixer gate 只引用 `20260619_lateral_mixer_gate` 下的冻结副本；post-hoc smoothing 与 mixer width 复核只引用 `20260619_smoothing_width_gate` 下的冻结副本。
-
-真实工区历史六剖面结果只引用 `20260623_six_section_r2_gate` 下的冻结副本。2026-06-26 的
-旧 W0/W1 与 2026-06-27 的 final-head R2 均只引用各自 rejected diagnostic 结论页，不升级为
-主结论。更早的 `real_field_*` 输出，尤其是旧 LFM、NaN 正演污染、图件纵轴修复前或单剖面
-阶段的结果，不再作为当前主结论。
-
-合成基准冻结位置：
-
-```text
-note/summary/source_data/synthoseis_lite_generate_20260617_202613
-```
+| 2 | `trace_1d_dilated_tcn_mismatch` | 强 1D 对照基线 |

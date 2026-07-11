@@ -51,7 +51,7 @@ LOSS_KEYS = {
 }
 VALIDATION_METRICS = {
     "synthetic_supervised": {"mse"},
-    "physics": {"waveform_mse", "delta_l2", "total", "valid_sample_count", "skipped_item_count"},
+    "physics": {"waveform_mse", "delta_l2", "total"},
     "real_well_supervised": {"mse"},
 }
 LEGACY_KEYS = {
@@ -189,7 +189,7 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         _reject_extra(source, SOURCE_KEYS[kind], f"sources.{source_id}")
         required_by_kind = {
             "synthoseis_lite": {"benchmark_dir"},
-            "real_field": {"lfm_run_dir", "variant_id", "well_control_run_dir"},
+            "real_field": {"lfm_run_dir", "variant_id"},
             "real_wells": {"field_source", "well_control_run_dir", "held_out_well"},
         }
         missing = sorted(required_by_kind[kind] - set(source))
@@ -200,10 +200,15 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         if kind == "real_field":
             split = _mapping(source.get("validation_split"), f"sources.{source_id}.validation_split")
             _reject_extra(split, {"kind", "fraction", "gap_m", "anchor"}, f"sources.{source_id}.validation_split")
-            if split.get("kind") != "spatial_block" or split.get("anchor") not in {"maxmin"}:
+            if split.get("kind") != "spatial_block" or split.get("anchor") != "high_inline_tail":
                 raise ValueError(
-                    f"sources.{source_id}.validation_split requires kind=spatial_block and anchor=maxmin."
+                    f"sources.{source_id}.validation_split requires "
+                    "kind=spatial_block and anchor=high_inline_tail."
                 )
+            split["fraction"] = _finite(split.get("fraction"), f"sources.{source_id}.validation_split.fraction", positive=True)
+            if split["fraction"] >= 1.0:
+                raise ValueError(f"sources.{source_id}.validation_split.fraction must be below one.")
+            split["gap_m"] = _finite(split.get("gap_m", 0.0), f"sources.{source_id}.validation_split.gap_m", nonnegative=True)
             source["validation_split"] = split
         sources[str(source_id)] = source
 
@@ -266,6 +271,23 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
                 block[key] = _positive_int(block.get(key), f"{block_id}.{key}")
             if kind == "physics":
                 block["delta_l2_weight"] = _finite(block.get("delta_l2_weight"), f"{block_id}.delta_l2_weight", positive=True)
+                source_kind = str(sources[source_id]["kind"])
+                expected_standardization = "masked_centered_rms" if source_kind == "real_field" else "raw"
+                actual_standardization = str(block.get("waveform_standardization") or expected_standardization)
+                if actual_standardization != expected_standardization:
+                    raise ValueError(
+                        f"{block_id}.waveform_standardization must be "
+                        f"{expected_standardization!r} for {source_kind}."
+                    )
+                block["waveform_standardization"] = actual_standardization
+                block["centered_rms_epsilon"] = _finite(
+                    block.get("centered_rms_epsilon", 1e-12),
+                    f"{block_id}.centered_rms_epsilon", positive=True,
+                )
+                block["min_centered_rms"] = _finite(
+                    block.get("min_centered_rms", 1e-6),
+                    f"{block_id}.min_centered_rms", positive=True,
+                )
             block_ids.add(block_id)
             blocks.append(block)
         if not any(block["update_interval"] == 1 and block["weight"] > 0 for block in blocks):

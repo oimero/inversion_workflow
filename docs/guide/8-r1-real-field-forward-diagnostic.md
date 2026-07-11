@@ -1,6 +1,6 @@
 # 08 R1 真实工区正演闭环诊断
 
-`real_field_forward_diagnostic.py` 是第八步的第二轮，也是当前流程的最终闭环。它回答一个核心问题：**R0 零样本预测真的比低频背景模型更接近观测地震数据吗？** 脚本把每个模型的预测波阻抗用全局子波正演合成地震记录，与观测地震做系统比较，从四个维度给出判断：地震波形残差、波阻抗与井曲线的一致性、子波不确定性下的稳键性、以及横向信息的副作用。
+`real_field_forward_diagnostic.py` 是第八步的第二轮，也是当前流程的最终闭环。它回答一个核心问题：**R0 零样本预测真的比低频背景模型更接近观测地震数据吗？** 脚本把每个模型的预测波阻抗用全局子波正演合成地震记录，与观测地震做系统比较，从四个维度给出判断：地震波形残差、波阻抗与井曲线的一致性、子波不确定性下的稳键性、以及不同模型间的差异来源。
 
 这一步不是可选的 QC——它是判定 R0 预测是否具有物理可信度的必要环节。
 
@@ -23,7 +23,7 @@ python scripts/real_field_forward_diagnostic.py --output-dir scripts/output/real
 
 | 来源 | 文件 | 用途 |
 |------|------|------|
-| 第八步 R0 | `real_field_zero_shot_summary.json` | R0 推理的完整元数据和来源回溯 |
+| 第八步 R0 | `real_field_zero_shot_summary.json` | R0 推理的完整元数据和来源回溯，包含每个模型的 experiment_id |
 | 第八步 R0 | `predictions.npz`（每个模型子目录） | 预测波阻抗和地震输入 |
 | 第五步（时间域） | `selected_wavelet.csv` | 时间域正演子波 |
 | 岩石物理旁路（深度域） | `forward_model_inputs.json` | 深度域冻结子波、速度关系与来源契约 |
@@ -163,13 +163,15 @@ real_field_forward_diagnostic:
 | 参数 | 含义 |
 |------|------|
 | `seismic_ood_fraction_abs_gt5` | R0 输入地震标准化后超过 5σ 的样本比例上限 |
-| `lateral_nullspace_energy_ratio` | 两个模型差异在高频零空间带的能量占比上限 |
+| `lateral_nullspace_energy_ratio` | 模型间差异在高频零空间带的能量占比上限 |
 
 ---
 
+## 脚本在做什么
+
 ### 第一阶段：加载与校验
 
-1. 从 R0 的摘要中加载所有信息和来源路径。
+1. 从 R0 的摘要中加载所有信息和来源路径，包括每个模型的 `experiment_id`。
 2. 加载全局子波和候选子波，准备多场景正演。
 3. 校验来源闭环：R0 → 低频模型 → 第四步 → 第一步的链路必须完整且路径一致。
 
@@ -183,10 +185,7 @@ event_twt[j] = twt[j+1]
 synthetic[l] = Σ_j wavelet(twt[l] - event_twt[j]) * r[j]
 ```
 
-反射系数仍挂在下部界面，长度为 `N-1`；统一 `cup.physics.forward_time`
-在原始双程旅行时样点轴上输出 `N` 点合成记录。合成、观测和有效掩码严格共享同一条
-`N` 点轴，不再丢弃观测地震的首样点。井 QC 图为了与 `N-1` 点反射率同轴展示，
-可以只在绘图边界显示第二个及后续样点，但该裁剪不进入 R1 数值指标或产物契约。
+反射系数仍挂在下部界面，长度为 `N-1`；统一 `cup.physics.forward_time` 在原始双程旅行时样点轴上输出 `N` 点合成记录。合成、观测和有效掩码严格共享同一条 `N` 点轴，不再丢弃观测地震的首样点。井 QC 图为了与 `N-1` 点反射率同轴展示，可以只在绘图边界显示第二个及后续样点，但该裁剪不进入 R1 数值指标或产物契约。
 
 这一步同时用全局子波和所有候选子波做多场景正演，用于测试子波不确定性的影响。
 
@@ -199,7 +198,7 @@ synthetic[l] = Σ_j wavelet(twt[l] - event_twt[j]) * r[j]
 - **频带分解**：在每个频带内单独计算观测 RMS、合成 RMS 和残差 RMS，判断各频带的拟合质量。
 - **空间残差模式**：逐 inline / xline 计算残差的 RMS，检查是否存在系统性的空间偏差（如工区边缘残差系统偏高）。
 
-所有指标汇总到 `forward_diagnostic_metrics.csv`。
+所有指标汇总到 `forward_diagnostic_metrics.csv`。每个模型按其 `experiment_id` 标识。
 
 ### 第四阶段：井数据闭环
 
@@ -208,8 +207,8 @@ synthetic[l] = Σ_j wavelet(twt[l] - event_twt[j]) * r[j]
 1. 从推理网格中提取井位处的预测波阻抗。
 2. 从第四步获取该井的滤波 LAS 波阻抗（以优化 TDT 投影到双程旅行时域）。
 3. 计算预测 vs 井曲线的 RMSE、偏差和相关系数。
-4. 用滤波 LAS 做正演，作为“完美波阻抗的正演匹配”基准。
-5. 用低频模型做正演，作为“模型必须击败的基线”。
+4. 用滤波 LAS 做正演，作为"完美波阻抗的正演匹配"基准。
+5. 用低频模型做正演，作为"模型必须击败的基线"。
 6. 对每个模型，比较四个指标：
    - 波阻抗 RMSE（比低频模型低吗？）
    - 波阻抗相关系数（比低频模型高吗？）
@@ -245,7 +244,7 @@ synthetic[l] = Σ_j wavelet(twt[l] - event_twt[j]) * r[j]
 | 文件 | 内容 |
 |------|------|
 | `real_field_forward_diagnostic_summary.json` | 诊断摘要：来源路径、正演约定、红色告警、推荐下一步 |
-| `forward_diagnostic_metrics.csv` | 每个阻抗 × 子波场景的基本波形指标和缩放信息 |
+| `forward_diagnostic_metrics.csv` | 每个阻抗 × 子波场景的基本波形指标和缩放信息，按 experiment_id 标识模型 |
 | `residual_decomposition.csv` | 相位扫描和分数偏移扫描的残差分解明细 |
 | `wavelet_sensitivity.csv` | 时间域各候选子波场景下的波形指标 |
 | `spatial_residual_qc.csv` | 逐 inline/xline 的空间残差模式 |
@@ -261,31 +260,30 @@ synthetic[l] = Σ_j wavelet(twt[l] - event_twt[j]) * r[j]
 
 | 文件 | 内容 |
 |------|------|
-| `well_forward_diagnostic.csv` | 每口井每个角色的完整诊断：波阻抗指标、频带指标、波形指标 |
-| `well_ai_comparison_summary.csv` | LFM vs 模型对比及逐井分类 |
-| `well_ai_band_comparison.csv` | 逐井逐角色逐频带的 RMSE 和相关系数 |
+| `well_forward_diagnostic.csv` | 每口井每个模型的完整诊断：波阻抗指标、频带指标、波形指标 |
+| `well_ai_comparison_summary.csv` | LFM vs 各模型对比及逐井分类 |
+| `well_ai_band_comparison.csv` | 逐井逐模型逐频带的 RMSE 和相关系数 |
 
 ### 正演合成记录
 
 | 目录 | 内容 |
 |------|------|
-| `synthetic/` | 每个阻抗输入的正演合成地震记录（`.npz` 格式），包含合成记录、观测地震和有效掩码 |
+| `synthetic/` | 每个阻抗输入的正演合成地震记录（`.npz` 格式），包含合成记录、观测地震和有效掩码。模型合成记录按 `zero_shot_<experiment_id>.npz` 命名 |
 
 ### 图表
 
 | 文件 | 内容 |
 |------|------|
-| `figures/<role>_observed_synthetic_residual.png` | 三面板：观测 / 合成 / 残差 |
+| `figures/<experiment_id>_observed_synthetic_residual.png` | 三面板：观测 / 合成 / 残差 |
 | `figures/phase_shift_gain_scan.png` | 时间域相位和分数偏移扫描曲线 |
 | `figures/spatial_residual_qc.png` | 空间残差模式（逐线） |
 | `figures/forward_band_residual_qc.png` | 各频带残差/观测比值柱状图 |
 | `figures/ai_band_energy_qc.png` | 预测差值频带能量分布 |
 | `figures/well_ai_comparison_summary.png` | 井分类统计柱状图 |
 | `figures/well_ai_band_comparison.png` | 逐频带井曲线匹配中位数 RMSE |
-| `figures/wells/well_forward_qc_<well>_<role>.png` | 单井六面板波形 QC 图（波阻抗、反射系数、合成、观测、互相关、动态互相关） |
+| `figures/wells/well_forward_qc_<well>_<experiment_id>.png` | 单井六面板波形 QC 图（波阻抗、反射系数、合成、观测、互相关、动态互相关） |
 
-井 QC 图只为 `filtered_las` 和预测模型角色生成；`lfm_input` 仍保留在 CSV 指标中作为数值
-基线，但不生成独立井 QC 图。
+井 QC 图只为 `filtered_las` 和各模型生成；`lfm_input` 仍保留在 CSV 指标中作为数值基线，但不生成独立井 QC 图。
 
 ---
 
@@ -296,16 +294,16 @@ synthetic[l] = Σ_j wavelet(twt[l] - event_twt[j]) * r[j]
 直接跳到 `red_flags` 字段：
 
 - 空列表：没有致命问题，R0 预测在物理上是自洽的。
-- 有红色告警：按 severity 逐个查看。`seismic_ood` 类型的告警通常意味着需要回溯 R0 的输入标准化配置；`scale_status_not_ok` 意味着正演合成记录的振幅尺度异常；`lateral_difference_concentrated_in_nullspace` 意味着横向混合器的效果不可靠。
+- 有红色告警：按 severity 逐个查看。`seismic_ood` 类型的告警通常意味着需要回溯 R0 的输入标准化配置；`scale_status_not_ok` 意味着正演合成记录的振幅尺度异常；`lateral_difference_concentrated_in_nullspace` 意味着模型间差异集中在不可靠的高频带。
 
 同时看 `recommended_next_state`：它告诉你脚本认为下一步应该做什么。
 
 ### 第二步：看 `forward_diagnostic_metrics.csv`
 
-按 `model_role` 分组，比较各角色的 `residual_corr_scaled`（带尺度优化的波形相关系数）和 `residual_rms_scaled`（标准化后的残差 RMS）：
+按 `model_role` 列分组，比较各类输入的 `residual_corr_scaled`（带尺度优化的波形相关系数）和 `residual_rms_scaled`（标准化后的残差 RMS）：
 
 - `lfm_only`：低频模型的正演匹配——这是基线。如果它已经很差（如相关系数 < 0.3），说明正演所用的子波本身就和地震数据不匹配。
-- `zero_shot_lateral` / `zero_shot_no_lateral`：模型的匹配应该优于 `lfm_only`。如果更差，说明模型的波阻抗偏离了物理约束。
+- 各模型的 experiment_id：模型的匹配应该优于 `lfm_only`。如果更差，说明模型的波阻抗偏离了物理约束。
 
 ### 第三步：看 `residual_decomposition.csv`
 
@@ -332,11 +330,11 @@ synthetic[l] = Σ_j wavelet(twt[l] - event_twt[j]) * r[j]
 `forward_band_residual_qc.csv` 中 `residual_to_observed_ratio` 越低的频带，拟合越好：
 
 - 如果高频带的比值接近 1.0，说明该频带几乎没有被拟合——这是正常的，通常高频带本身就是噪声为主的零空间。
-- 对比 `no_lateral` 和 `lateral` 在各频带的残差/观测比值：如果 `lateral` 只在低频带有改善，说明横向混合器并没有引入虚假的高频信息。
+- 对比不同模型在各频带的残差/观测比值：如果某个模型只在低频带有改善，说明其横向信息并没有引入虚假的高频信息。
 
 ### 第六步：抽查井 QC 图
 
-打开 `figures/wells/well_forward_qc_<well>_<role>.png`：
+打开 `figures/wells/well_forward_qc_<well>_<experiment_id>.png`：
 
 - 六个面板从左上到右下：预测 AI + 滤波 AI、反射系数、合成地震 wiggle、观测地震 wiggle、静态互相关、动态互相关。
 - 合成和观测的 wiggle 应该在目标窗口内形态相似。
@@ -353,7 +351,7 @@ synthetic[l] = Σ_j wavelet(twt[l] - event_twt[j]) * r[j]
 | 所有井被 `skipped_outside_section_support` 跳过 | `max_xy_distance_m` 太小 | 增大距离阈值，或确认井坐标和推理网格的对齐关系 |
 | 正演合成振幅接近零 | 子波加载失败或预测波阻抗全为常数 | 检查子波文件和预测波阻抗的数值范围 |
 | `red_flag: real_input_seismic_ood` | 真实地震数据严重偏离训练分布 | 检查地震值域变换配置；可能需要在更接近真实工区分布的数据上重新训练 |
-| `red_flag: lateral_difference_concentrated_in_nullspace` | 横向混合器的效果集中在不可靠的高频带 | 横向模型的可信度存疑；考虑只用不含横向混合器的模型 |
+| `red_flag: lateral_difference_concentrated_in_nullspace` | 模型间差异集中在不可靠的高频带 | 差异可能来自噪声而非结构改进；审慎对待差异较大的频带 |
 
 ---
 

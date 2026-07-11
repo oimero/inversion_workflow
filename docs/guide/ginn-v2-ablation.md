@@ -278,7 +278,7 @@ ginn_v2:
 | 损失块 source 类型不匹配 | 损失块引用了不兼容的数据源 | 检查每个 block 的 kind 和 source 是否匹配 |
 | 验证指标未引用当前块 | `selection_metric` 指向了不存在的 block | 修改为当前阶段的某个 `block_id.metric` |
 | 真实工区没有训练或验证块 | 空间切分或有效样点下限过严 | 检查 validation split 参数和 `min_valid_samples` |
-| 阶段没有任何 `update_interval: 1` 的 block | 每个 step 必须有至少一个 block 提供梯度 | 确保至少一个 loss block 的 update_interval 为 1 |
+| 阶段没有正权重且 `update_interval: 1` 的 block | 每个 step 必须有至少一个 block 提供梯度 | 确保至少一个 loss block 的 update_interval 为 1 且 weight 为正 |
 | 第一阶段未从零初始化 | `initialize_from` 引用了不存在的阶段 | 第一阶段使用 `initialize_from: zero` 或省略此字段 |
 | 部署 checkpoint 引用无效 | `deployment_checkpoint` 指向不存在的阶段 | 检查 stage ID 和 best/final 后缀 |
 | 合成基准 `auto` 发现失败 | `experiments/synthoseis_lite/results/` 下没有完整基准 | 先生成合成基准 |

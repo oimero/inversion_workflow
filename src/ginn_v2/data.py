@@ -448,6 +448,7 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         target_patch = target[sl]
         seismic_patch = seismic[sl]
         lfm_patch = lfm[sl]
+        forward_lfm_patch = np.asarray(lfm_patch, dtype=np.float32)
         valid_patch = valid[sl]
         delta = target_patch - lfm_patch
         seismic_n = _norm(seismic_patch, self.normalization["seismic"])
@@ -541,6 +542,7 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             )[None, :, :],
             "sample_axis": torch.from_numpy(sample_axis_patch.astype(np.float64)),
             "lfm": torch.from_numpy(lfm_patch.astype(np.float32))[None, :, :],
+            "forward_lfm": torch.from_numpy(forward_lfm_patch)[None, :, :],
             "lfm_ideal": torch.from_numpy(lfm_ideal_patch.astype(np.float32))[
                 None, :, :
             ],

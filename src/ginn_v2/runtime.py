@@ -38,13 +38,13 @@ def masked_mse(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tenso
     return torch.mean(residual.square())
 
 
-def _required_file(value: object, *, label: str) -> Path:
+def _required_file(value: object, *, label: str, base_dir: Path) -> Path:
     text = str(value or "").strip()
     if not text:
         raise ValueError(f"Benchmark manifest lacks {label}.")
     path = Path(text)
     if not path.is_absolute():
-        path = Path.cwd() / path
+        path = base_dir / path
     if not path.is_file():
         raise FileNotFoundError(f"{label} not found: {path}")
     return path
@@ -54,6 +54,7 @@ def load_benchmark_wavelet(
     benchmark_dir: Path,
     *,
     device: torch.device,
+    artifact_root: Path,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float] | None]:
     manifest_path = Path(benchmark_dir) / "benchmark_manifest.json"
     with manifest_path.open("r", encoding="utf-8") as handle:
@@ -61,7 +62,8 @@ def load_benchmark_wavelet(
     domain = str(manifest.get("sample_domain") or "")
     if domain == "depth":
         with _required_file(
-            manifest.get("forward_model_inputs_path"), label="forward_model_inputs_path"
+            manifest.get("forward_model_inputs_path"), label="forward_model_inputs_path",
+            base_dir=artifact_root,
         ).open("r", encoding="utf-8") as handle:
             forward_inputs = json.load(handle)
         if forward_inputs.get("sample_domain") != "depth" or forward_inputs.get("depth_basis") != "tvdss":
@@ -75,6 +77,7 @@ def load_benchmark_wavelet(
         csv_path = _required_file(
             dict(forward_inputs.get("wavelet") or {}).get("path"),
             label="forward_model_inputs.wavelet.path",
+            base_dir=artifact_root,
         )
     elif domain == "time":
         relation = None
@@ -83,7 +86,7 @@ def load_benchmark_wavelet(
             raise ValueError("Time benchmark lacks source_runs.wavelet_generation_dir.")
         csv_path = Path(str(wavelet_dir)) / "selected_wavelet.csv"
         if not csv_path.is_absolute():
-            csv_path = Path.cwd() / csv_path
+            csv_path = artifact_root / csv_path
     else:
         raise ValueError(f"Unsupported benchmark sample_domain: {domain!r}")
     frame = pd.read_csv(csv_path)

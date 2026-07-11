@@ -83,7 +83,7 @@ ginn_v2:
         kind: spatial_block
         fraction: 0.10
         gap_m: 250.0
-        anchor: maxmin
+        anchor: high_inline_tail
 
     wells:
       kind: real_wells
@@ -138,7 +138,7 @@ ginn_v2:
           batch_size: 8
           min_valid_samples: 128
           delta_l2_weight: 0.01
-          waveform_standardization: patch_centered_rms
+          waveform_standardization: masked_centered_rms
           centered_rms_epsilon: 1.0e-12
           min_centered_rms: 1.0e-6
         - block_id: well_anchor

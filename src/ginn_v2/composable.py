@@ -18,10 +18,16 @@ from cup.synthetic.dataset import SynthoseisBenchmark
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.utils.io import repo_relative_path, write_json
 from ginn_v2.contracts import CHECKPOINT_SCHEMA_VERSION, EXPERIMENT_SCHEMA_VERSION
-from ginn_v2.data import PatchDataset, PatchSpec, build_patch_index, compute_normalization
+from ginn_v2.data import (
+    PatchDataset, PatchSpec, build_patch_index, compute_input_reference_stats,
+    compute_normalization,
+)
 from ginn_v2.experiment import ExperimentConfig
 from ginn_v2.models import build_model
-from ginn_v2.real_field import RealFieldVolume, build_real_field_patch_index, load_real_field_volume
+from ginn_v2.real_field import (
+    RealFieldVolume, build_real_field_patch_index, finite_summary_stats,
+    load_real_field_volume,
+)
 from ginn_v2.real_delta import prepare_real_delta_support
 from ginn_v2.runtime import forward_physics_batch, load_benchmark_wavelet, masked_mse, resolve_device
 
@@ -41,8 +47,7 @@ class RealFieldPatchDataset(Dataset[dict[str, Any]]):
         self, model_volume: RealFieldVolume, physics_volume: RealFieldVolume,
         rows: pd.DataFrame, normalization: Mapping[str, Any], patch_spec: PatchSpec,
     ) -> None:
-        if model_volume.lfm.shape != physics_volume.lfm.shape:
-            raise ValueError("Real-field model-input and physics-target volumes differ in shape.")
+        _validate_aligned_real_volumes(model_volume, physics_volume)
         self.model_volume = model_volume
         self.physics_volume = physics_volume
         self.rows = rows.reset_index(drop=True)
@@ -60,12 +65,14 @@ class RealFieldPatchDataset(Dataset[dict[str, Any]]):
         seismic = self.model_volume.seismic[inline, lateral, vertical]
         target = self.physics_volume.seismic[inline, lateral, vertical]
         lfm = self.model_volume.lfm[inline, lateral, vertical]
+        forward_lfm = np.asarray(lfm, dtype=np.float32)
         valid = self.model_volume.valid_mask[inline, lateral, vertical]
         shape = (self.patch_spec.lateral_samples, self.patch_spec.twt_samples)
         padding = ((0, shape[0] - valid.shape[0]), (0, shape[1] - valid.shape[1]))
         seismic = np.pad(seismic, padding, constant_values=0.0)
         target = np.pad(target, padding, constant_values=0.0)
         lfm = np.pad(lfm, padding, constant_values=0.0)
+        forward_lfm = np.pad(forward_lfm, padding, constant_values=np.nan)
         valid = np.pad(valid, padding, constant_values=False)
         seismic_n = np.where(valid, (seismic - float(self.normalization["seismic"]["mean"])) / float(self.normalization["seismic"]["std"]), 0.0)
         lfm_n = np.where(valid, (lfm - float(self.normalization["lfm"]["mean"])) / float(self.normalization["lfm"]["std"]), 0.0)
@@ -77,12 +84,31 @@ class RealFieldPatchDataset(Dataset[dict[str, Any]]):
         return {
             "input": torch.from_numpy(inputs),
             "lfm": torch.from_numpy(np.where(valid, lfm, 0.0).astype(np.float32))[None],
+            "forward_lfm": torch.from_numpy(forward_lfm)[None],
             "valid_mask": torch.from_numpy(valid.astype(np.float32))[None],
             "physics_valid_mask": torch.from_numpy(valid.astype(np.float32))[None],
             "seismic_model_consistent": torch.from_numpy(np.where(valid, target, 0.0).astype(np.float32))[None],
             "sample_axis": torch.from_numpy(np.asarray(axis, dtype=np.float64)),
             "patch_id": str(row["patch_id"]),
         }
+
+
+def _validate_aligned_real_volumes(left: RealFieldVolume, right: RealFieldVolume) -> None:
+    for name in ("ilines", "xlines"):
+        if not np.array_equal(getattr(left, name), getattr(right, name)):
+            raise ValueError(f"Real-field model-input and physics-target {name} axes differ.")
+    if not np.array_equal(left.sample_axis.values, right.sample_axis.values):
+        raise ValueError("Real-field model-input and physics-target sample axes differ.")
+    if (
+        left.sample_axis.domain != right.sample_axis.domain
+        or left.sample_axis.unit != right.sample_axis.unit
+        or left.depth_basis != right.depth_basis
+    ):
+        raise ValueError("Real-field model-input and physics-target sample contracts differ.")
+    if not np.array_equal(left.valid_mask, right.valid_mask):
+        raise ValueError("Real-field model-input and physics-target valid masks differ.")
+    if not np.array_equal(left.lfm, right.lfm, equal_nan=True):
+        raise ValueError("Real-field model-input and physics-target LFM volumes differ.")
 
 
 class DeterministicCycler:
@@ -122,6 +148,41 @@ def validate_source_axis_contracts(
             f"without an explicit resampling adapter: {details}"
         )
     return dict(source_contracts[next(iter(consumed_sources))])
+
+
+def _sample_axis_contract(
+    values: np.ndarray, *, domain: str, unit: str, depth_basis: str | None,
+) -> dict[str, Any]:
+    axis = np.asarray(values, dtype=np.float64)
+    if axis.ndim != 1 or axis.size < 2 or not np.all(np.isfinite(axis)):
+        raise ValueError("Sample axis must be a finite one-dimensional array with at least two samples.")
+    differences = np.diff(axis)
+    step = float(differences[0])
+    if step <= 0 or not np.allclose(differences, step, rtol=0.0, atol=max(1e-12, abs(step) * 1e-9)):
+        raise ValueError("GINN-v2 requires a regular increasing sample axis.")
+    return {
+        "sample_domain": domain,
+        "sample_unit": unit,
+        "depth_basis": depth_basis,
+        "sample_step": step,
+        "axis_direction": "increasing",
+        "axis_regularity": "regular",
+    }
+
+
+def _synthetic_axis_contract(benchmark: SynthoseisBenchmark) -> dict[str, Any]:
+    sample_ids = benchmark.sample_ids(status="ok")
+    if not sample_ids:
+        raise ValueError("Synthoseis-lite benchmark has no usable samples.")
+    sample = benchmark.load_sample(sample_ids[0])
+    domain = str(sample.sample_domain)
+    values = sample.twt_model_s if domain == "time" else sample.tvdss_model_m
+    return _sample_axis_contract(
+        values,
+        domain=domain,
+        unit="s" if domain == "time" else "m",
+        depth_basis=benchmark.manifest.get("depth_basis"),
+    )
 
 
 def _resolve_auto_benchmark(root: Path) -> Path:
@@ -176,6 +237,14 @@ def _prepare_synthetic_indices(
             for _, row in index.iterrows():
                 sample_id = str(row["sample_id"])
                 sample = cache.setdefault(sample_id, benchmark.load_sample(sample_id))
+                if str(sample.sample_domain) == "depth":
+                    lfm_context = np.asarray(sample.priors["lfm_controlled_degraded"], dtype=np.float64)[
+                        int(row["lateral_start"]):int(row["lateral_stop"]),
+                        int(row["twt_start"]):int(row["twt_stop"]),
+                    ]
+                    if not np.all(np.isfinite(lfm_context)):
+                        counts.append(0)
+                        continue
                 mask = np.asarray(sample.physics_valid_mask, dtype=bool)[
                     int(row["lateral_start"]):int(row["lateral_stop"]),
                     int(row["twt_start"]):int(row["twt_stop"]),
@@ -202,36 +271,53 @@ def _normalization_for_synthetic(benchmark: SynthoseisBenchmark, index: pd.DataF
     return normalization
 
 
-def _real_field_config(source: Mapping[str, Any], *, root: Path, transform: str) -> dict[str, Any]:
+def _real_field_config(
+    source: Mapping[str, Any], *, root: Path, transform: str,
+    reference_stats: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     lfm_run_dir = _source_path(source.get("lfm_run_dir"), root)
     with (lfm_run_dir / "lfm_run_summary.json").open("r", encoding="utf-8") as handle:
         summary = json.load(handle)
     seismic = dict(summary.get("seismic") or {})
-    return {
-        "real_field_inputs": {
+    inputs = {
             "lfm_run_dir": str(lfm_run_dir),
             "variant_id": str(source.get("variant_id") or ""),
-            "well_control_run_dir": str(_source_path(source.get("well_control_run_dir"), root)),
             "seismic_file": str(_source_path(seismic.get("path"), root)),
             "seismic_type": str(seismic.get("type") or ""),
             "segy_options": dict(source.get("segy_options") or {}),
             "seismic_value_transform": transform,
+            "seismic_reference_stats": dict(reference_stats or {}),
             "lfm_value_transform": "identity",
-        },
+    }
+    if source.get("well_control_run_dir") is not None:
+        inputs["well_control_run_dir"] = str(_source_path(source["well_control_run_dir"], root))
+    return {
+        "real_field_inputs": inputs,
         "volume": dict(source.get("volume") or {}),
     }
 
 
-def _load_real_source(source: Mapping[str, Any], *, root: Path) -> tuple[RealFieldVolume, RealFieldVolume]:
+def _load_real_source(
+    source: Mapping[str, Any], *, root: Path,
+    reference_stats: Mapping[str, Any] | None = None,
+) -> tuple[RealFieldVolume, RealFieldVolume]:
     model_transform = str(source.get("model_input_seismic_transform") or "identity")
-    model_volume = load_real_field_volume(config=_real_field_config(source, root=root, transform=model_transform), root=root, data_root=root)
+    model_volume = load_real_field_volume(config=_real_field_config(source, root=root, transform=model_transform, reference_stats=reference_stats), root=root, data_root=root)
     physics_transform = str(source.get("physics_target_seismic_transform") or "identity")
     physics_volume = load_real_field_volume(
-        config=_real_field_config(source, root=root, transform=physics_transform),
+        config=_real_field_config(source, root=root, transform=physics_transform, reference_stats=reference_stats),
         root=root,
         data_root=root,
     )
     return model_volume, physics_volume
+
+
+def _input_reference_stats_for_real(
+    volume: RealFieldVolume, train_inline_indices: np.ndarray,
+) -> dict[str, float]:
+    values = np.asarray(volume.seismic, dtype=np.float64)[train_inline_indices]
+    valid = volume.valid_mask[train_inline_indices] & np.isfinite(values)
+    return finite_summary_stats(values[valid])
 
 
 def _normalization_for_real(volume: RealFieldVolume, train_inline_indices: np.ndarray) -> dict[str, Any]:
@@ -289,6 +375,15 @@ def _real_patch_rows(
             vertical_samples=patch_spec.twt_samples, lateral_stride=patch_spec.lateral_stride,
             vertical_stride=patch_spec.twt_stride,
         )):
+            lfm_context = volume.lfm[
+                inline_index, patch.lateral_start:patch.lateral_stop,
+                patch.sample_start:patch.sample_stop,
+            ]
+            if volume.sample_axis.domain == "depth" and (
+                lfm_context.shape != (patch_spec.lateral_samples, patch_spec.twt_samples)
+                or not np.all(np.isfinite(lfm_context))
+            ):
+                continue
             mask = volume.valid_mask[inline_index, patch.lateral_start:patch.lateral_stop, patch.sample_start:patch.sample_stop]
             final_mask = (
                 _forward_support_safe_mask_numpy(mask, wavelet_amp)
@@ -418,20 +513,37 @@ def _block_loss(
     kind = str(cfg["kind"])
     if kind == "real_well_supervised":
         loss, counts = prepared.real_well_support.training_loss(model, device=device)
+        if int(counts["selected_real_samples"]) < int(cfg["min_valid_samples"]):
+            raise ValueError(
+                f"Real-well block {cfg['block_id']} selected "
+                f"{counts['selected_real_samples']} valid samples, below "
+                f"min_valid_samples={cfg['min_valid_samples']}."
+            )
         return loss, {"mse": float(loss.detach().cpu()), **{key: float(value) for key, value in counts.items()}}
     x = batch["input"].to(device)
     prediction = model(x)
     if kind == "synthetic_supervised":
-        loss = masked_mse(prediction, batch["target_delta"].to(device), batch["valid_mask"].to(device))
-        return loss, {"mse": float(loss.detach().cpu())}
+        supervised_mask = batch["valid_mask"].to(device)
+        loss = masked_mse(prediction, batch["target_delta"].to(device), supervised_mask)
+        return loss, {
+            "mse": float(loss.detach().cpu()),
+            "valid_sample_count": float(torch.count_nonzero(supervised_mask).item()),
+        }
     if kind != "physics" or prepared.wavelet is None:
         raise ValueError(f"Unsupported prepared loss block: {kind}")
-    lfm = batch["lfm"].to(device)
+    forward_lfm = batch["forward_lfm"].to(device)
     valid = batch["valid_mask"].to(device)
-    pred_log_ai = lfm + prediction
+    pred_log_ai = forward_lfm + prediction * valid
     wavelet_time, wavelet_amp, relation = prepared.wavelet
     if prepared.sample_axis_contract is None:
         raise ValueError(f"Loss block {cfg['block_id']} lacks a sample-axis contract.")
+    if str(prepared.sample_axis_contract["sample_domain"]) == "depth" and not bool(
+        torch.all(torch.isfinite(pred_log_ai))
+    ):
+        raise ValueError(
+            "Depth physics requires a complete finite LFM forward context; "
+            "masked or padded logAI context is not accepted."
+        )
     synthetic = forward_physics_batch(
         pred_log_ai[:, 0], sample_axes=batch["sample_axis"].to(device),
         sample_domain=str(prepared.sample_axis_contract["sample_domain"]), wavelet_time_s=wavelet_time,
@@ -463,6 +575,7 @@ def _block_loss(
         if not bool(torch.any(usable)):
             raise ValueError("Real physics batch has no item above min_centered_rms.")
         waveform = masked_mse(pred_n[usable], target_n[usable], mask[usable])
+        waveform_mask = mask[usable]
         diagnostics = {
             "observed_centered_rms": float(target_rms[usable].mean().detach().cpu()),
             "predicted_centered_rms": float(pred_rms[usable].mean().detach().cpu()),
@@ -470,13 +583,15 @@ def _block_loss(
         }
     else:
         waveform = masked_mse(synthetic, target, mask)
+        waveform_mask = mask
         diagnostics = {}
     delta_l2 = masked_mse(prediction_for_l2, torch.zeros_like(prediction_for_l2), valid_for_l2)
     diagnostics["waveform"] = float(waveform.detach().cpu())
     diagnostics["delta_l2"] = float(delta_l2.detach().cpu())
     total = waveform + float(cfg["delta_l2_weight"]) * delta_l2
     diagnostics["total"] = float(total.detach().cpu())
-    diagnostics["valid_sample_count"] = float(torch.count_nonzero(mask).item())
+    diagnostics["valid_sample_count"] = float(torch.count_nonzero(waveform_mask).item())
+    diagnostics["delta_valid_sample_count"] = float(torch.count_nonzero(valid_for_l2).item())
     diagnostics["skipped_item_count"] = float(skipped_item_count)
     return total, diagnostics
 
@@ -536,21 +651,32 @@ def _evaluate(
             losses.append(torch.mean((prediction - target) ** 2))
         return {"mse": float(torch.stack(losses).mean().cpu())}
     assert prepared.validation_dataset is not None
-    cycler = DeterministicCycler(prepared.validation_dataset, batch_size=int(prepared.config["batch_size"]), seed=0)
-    count = int(steps) if steps is not None else int(np.ceil(len(prepared.validation_dataset) / int(prepared.config["batch_size"])))
+    batch_size = int(prepared.config["batch_size"])
+    if steps is None:
+        batches: Iterator[Any] = iter(DataLoader(
+            prepared.validation_dataset, batch_size=batch_size, shuffle=False,
+        ))
+    else:
+        cycler = DeterministicCycler(prepared.validation_dataset, batch_size=batch_size, seed=0)
+        batches = (cycler.next() for _ in range(int(steps)))
     rows: list[dict[str, float]] = []
     model.eval()
     with torch.no_grad():
-        for _ in range(count):
-            loss, diagnostics = _block_loss(prepared, cycler.next(), model, device=device, normalization=normalization)
+        for batch in batches:
+            loss, diagnostics = _block_loss(prepared, batch, model, device=device, normalization=normalization)
             rows.append({"total": float(loss.detach().cpu()), **diagnostics})
     if prepared.config["kind"] != "physics":
-        return {"mse": float(np.mean([row["mse"] for row in rows]))}
+        count = float(np.sum([row["valid_sample_count"] for row in rows]))
+        return {"mse": float(np.sum([row["mse"] * row["valid_sample_count"] for row in rows]) / count)}
+    waveform_count = float(np.sum([row["valid_sample_count"] for row in rows]))
+    delta_count = float(np.sum([row["delta_valid_sample_count"] for row in rows]))
+    waveform_mse = float(np.sum([row["waveform"] * row["valid_sample_count"] for row in rows]) / waveform_count)
+    delta_l2 = float(np.sum([row["delta_l2"] * row["delta_valid_sample_count"] for row in rows]) / delta_count)
     return {
-        "waveform_mse": float(np.mean([row["waveform"] for row in rows])),
-        "delta_l2": float(np.mean([row["delta_l2"] for row in rows])),
-        "total": float(np.mean([row["total"] for row in rows])),
-        "valid_sample_count": float(np.sum([row["valid_sample_count"] for row in rows])),
+        "waveform_mse": waveform_mse,
+        "delta_l2": delta_l2,
+        "total": waveform_mse + float(prepared.config["delta_l2_weight"]) * delta_l2,
+        "valid_sample_count": waveform_count,
         "skipped_item_count": float(np.sum([row["skipped_item_count"] for row in rows])),
     }
 
@@ -588,11 +714,7 @@ def run_experiment(
             synthetic[source_id] = (SynthoseisBenchmark(benchmark_dir), benchmark_dir)
             manifest = synthetic[source_id][0].manifest
             domain = str(manifest.get("sample_domain") or "")
-            source_contracts[source_id] = {
-                "sample_domain": domain,
-                "sample_unit": "s" if domain == "time" else "m" if domain == "depth" else "",
-                "depth_basis": manifest.get("depth_basis"),
-            }
+            source_contracts[source_id] = _synthetic_axis_contract(synthetic[source_id][0])
             resolved_sources[source_id] = {
                 "kind": "synthoseis_lite",
                 "benchmark_dir": repo_relative_path(benchmark_dir, root=root),
@@ -602,7 +724,11 @@ def run_experiment(
                 "physics_target_variant": source.get("physics_target_variant", "model_consistent"),
             }
         elif source["kind"] == "real_field":
-            real_fields[source_id] = _load_real_source(source, root=root)
+            raw_source = dict(source) | {
+                "model_input_seismic_transform": "identity",
+                "physics_target_seismic_transform": "identity",
+            }
+            real_fields[source_id] = _load_real_source(raw_source, root=root)
             real_cfg = _real_field_config(source, root=root, transform="identity")
             seismic_cfg = dict(real_cfg["real_field_inputs"])
             real_geometries[source_id] = open_survey(
@@ -611,21 +737,25 @@ def run_experiment(
                 segy_options=segy_options_from_config(dict(source.get("segy_options") or {})),
             ).line_geometry
             volume = real_fields[source_id][0]
-            source_contracts[source_id] = {
-                "sample_domain": volume.sample_axis.domain,
-                "sample_unit": volume.sample_axis.unit,
-                "depth_basis": volume.depth_basis,
-            }
+            source_contracts[source_id] = _sample_axis_contract(
+                volume.sample_axis.values,
+                domain=volume.sample_axis.domain,
+                unit=volume.sample_axis.unit,
+                depth_basis=volume.depth_basis,
+            )
             resolved_sources[source_id] = {
                 "kind": "real_field",
                 "lfm_run_dir": repo_relative_path(_source_path(source["lfm_run_dir"], root), root=root),
                 "variant_id": source["variant_id"],
-                "well_control_run_dir": repo_relative_path(_source_path(source["well_control_run_dir"], root), root=root),
                 "sample_axis_contract": dict(source_contracts[source_id]),
                 "model_input_seismic_transform": source.get("model_input_seismic_transform", "identity"),
                 "physics_target_seismic_transform": source.get("physics_target_seismic_transform", "identity"),
                 "validation_split": dict(source["validation_split"]),
             }
+            if source.get("well_control_run_dir") is not None:
+                resolved_sources[source_id]["well_control_run_dir"] = repo_relative_path(
+                    _source_path(source["well_control_run_dir"], root), root=root
+                )
     for source_id, source in config.sources.items():
         if source["kind"] == "real_wells":
             source_contracts[source_id] = dict(source_contracts[str(source["field_source"])])
@@ -643,6 +773,8 @@ def run_experiment(
         for block in stage["loss_blocks"]
     }
     experiment_axis_contract = validate_source_axis_contracts(source_contracts, consumed_sources)
+    reference_index: pd.DataFrame | None = None
+    reference_rows: pd.DataFrame | None = None
     if config.normalization_reference in synthetic:
         reference_benchmark, _ = synthetic[config.normalization_reference]
         reference_index = build_patch_index(
@@ -656,7 +788,9 @@ def run_experiment(
                 else None
             ),
         )
-        normalization = _normalization_for_synthetic(reference_benchmark, reference_index)
+        input_reference_stats = compute_input_reference_stats(
+            reference_benchmark, reference_index, input_name="seismic"
+        )
     else:
         reference_volume = real_fields[config.normalization_reference][0]
         reference_rows = _real_patch_rows(
@@ -669,10 +803,27 @@ def run_experiment(
         train_inline_indices = np.sort(
             reference_rows.loc[reference_rows["split"] == "train", "inline_index"].unique().astype(int)
         )
+        input_reference_stats = _input_reference_stats_for_real(
+            reference_volume, train_inline_indices
+        )
+    for source_id, source in config.sources.items():
+        if source["kind"] == "real_field":
+            real_fields[source_id] = _load_real_source(
+                source, root=root, reference_stats=input_reference_stats
+            )
+    if config.normalization_reference in synthetic:
+        assert reference_index is not None
+        normalization = _normalization_for_synthetic(reference_benchmark, reference_index)
+    else:
+        assert reference_rows is not None
+        reference_volume = real_fields[config.normalization_reference][0]
+        train_inline_indices = np.sort(
+            reference_rows.loc[reference_rows["split"] == "train", "inline_index"].unique().astype(int)
+        )
         normalization = _normalization_for_real(reference_volume, train_inline_indices)
     write_json(output_dir / "normalization.json", normalization)
     input_stats_path = output_dir / "input_reference_stats.json"
-    write_json(input_stats_path, {"stats": dict(normalization["seismic"])})
+    write_json(input_stats_path, {"stats": input_reference_stats})
     manifest_stages: list[dict[str, Any]] = []
     checkpoints: dict[tuple[str, str], Path] = {}
     sample_axis_contract: dict[str, Any] | None = dict(experiment_axis_contract)
@@ -696,7 +847,9 @@ def run_experiment(
             cfg = dict(block) | {"source_kind": source["kind"]}
             if source["kind"] == "synthoseis_lite":
                 benchmark, benchmark_dir = synthetic[source_id]
-                wavelet = load_benchmark_wavelet(benchmark_dir, device=device) if block["kind"] == "physics" else None
+                wavelet = load_benchmark_wavelet(
+                    benchmark_dir, device=device, artifact_root=root
+                ) if block["kind"] == "physics" else None
                 indices = _prepare_synthetic_indices(
                     benchmark=benchmark, source=source, patch_spec=patch_spec,
                     blocks=[block], output_dir=stage_dir,
@@ -791,6 +944,11 @@ def run_experiment(
                 for name, value in metrics.items():
                     validation_values[f"{prepared.config['block_id']}.{name}"] = value
             selected = float(validation_values[metric_name])
+            if not np.isfinite(selected):
+                raise FloatingPointError(
+                    f"Selection metric {metric_name} is non-finite at "
+                    f"{stage_id} epoch={epoch}: {selected}"
+                )
             training_values: dict[str, float] = {}
             for block_id, block_rows in totals.items():
                 metric_keys = sorted({key for values in block_rows for key in values})

@@ -148,6 +148,9 @@ def _validate_model_sample_axis(
         "sample_domain": sample_axis.domain,
         "sample_unit": sample_axis.unit,
         "depth_basis": depth_basis,
+        "sample_step": float(sample_axis.step),
+        "axis_direction": "increasing",
+        "axis_regularity": "regular",
     }
     actual = dict(manifest.get("sample_axis_contract") or {})
     if actual != expected:

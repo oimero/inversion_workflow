@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from cup.synthetic.dataset import SynthoseisBenchmark
+from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.utils.io import repo_relative_path, write_json
 from ginn_v2.contracts import CHECKPOINT_SCHEMA_VERSION, EXPERIMENT_SCHEMA_VERSION
 from ginn_v2.data import PatchDataset, PatchSpec, build_patch_index, compute_normalization
@@ -22,7 +23,7 @@ from ginn_v2.experiment import ExperimentConfig
 from ginn_v2.models import build_model
 from ginn_v2.real_field import RealFieldVolume, build_real_field_patch_index, load_real_field_volume
 from ginn_v2.real_delta import prepare_real_delta_support
-from ginn_v2.training import _forward_physics_batch, _load_nominal_wavelet, masked_mse, resolve_device
+from ginn_v2.runtime import forward_physics_batch, load_benchmark_wavelet, masked_mse, resolve_device
 
 
 @dataclass
@@ -32,6 +33,7 @@ class PreparedBlock:
     validation_dataset: Dataset[Any] | None
     wavelet: tuple[torch.Tensor, torch.Tensor, dict[str, float] | None] | None = None
     real_well_support: Any | None = None
+    sample_axis_contract: dict[str, Any] | None = None
 
 
 class RealFieldPatchDataset(Dataset[dict[str, Any]]):
@@ -105,6 +107,23 @@ def _seed(base: int, stage_index: int, block_index: int, epoch: int) -> int:
     return int(np.random.SeedSequence([base, stage_index, block_index, epoch]).generate_state(1)[0])
 
 
+def validate_source_axis_contracts(
+    source_contracts: Mapping[str, Mapping[str, Any]],
+    consumed_sources: set[str],
+) -> dict[str, Any]:
+    contracts = {
+        tuple(dict(source_contracts[source_id]).items())
+        for source_id in consumed_sources
+    }
+    if len(contracts) != 1:
+        details = {source_id: dict(source_contracts[source_id]) for source_id in sorted(consumed_sources)}
+        raise ValueError(
+            "A GINN-v2 experiment cannot mix time/depth or incompatible sample-axis contracts "
+            f"without an explicit resampling adapter: {details}"
+        )
+    return dict(source_contracts[next(iter(consumed_sources))])
+
+
 def _resolve_auto_benchmark(root: Path) -> Path:
     results = root / "experiments" / "synthoseis_lite" / "results"
     candidates = [
@@ -136,6 +155,7 @@ def _synthetic_sample_kinds(source: Mapping[str, Any]) -> set[str]:
 def _prepare_synthetic_indices(
     *, benchmark: SynthoseisBenchmark, source: Mapping[str, Any], patch_spec: PatchSpec,
     blocks: list[Mapping[str, Any]], output_dir: Path,
+    wavelet_amp: np.ndarray | None = None,
 ) -> dict[str, pd.DataFrame]:
     result = {}
     for block in blocks:
@@ -148,6 +168,8 @@ def _prepare_synthetic_indices(
             max_patches=(int(source["max_patches"]) if source.get("max_patches") is not None else None),
         )
         if block["kind"] == "physics":
+            if wavelet_amp is None:
+                raise ValueError(f"Physics block {block_id} requires a frozen wavelet before indexing.")
             # Physics target is defined only where its final target mask is valid.
             counts = []
             cache: dict[str, Any] = {}
@@ -158,7 +180,8 @@ def _prepare_synthetic_indices(
                     int(row["lateral_start"]):int(row["lateral_stop"]),
                     int(row["twt_start"]):int(row["twt_stop"]),
                 ]
-                counts.append(int(np.count_nonzero(mask)))
+                safe = _forward_support_safe_mask_numpy(mask, wavelet_amp)
+                counts.append(int(np.count_nonzero(safe)))
             index["supervision_valid_samples"] = counts
             index = index[index["supervision_valid_samples"] >= int(block["min_valid_samples"])].copy()
         if source.get("max_patches") is not None and "validation" not in set(index["split"].astype(str)):
@@ -191,6 +214,7 @@ def _real_field_config(source: Mapping[str, Any], *, root: Path, transform: str)
             "well_control_run_dir": str(_source_path(source.get("well_control_run_dir"), root)),
             "seismic_file": str(_source_path(seismic.get("path"), root)),
             "seismic_type": str(seismic.get("type") or ""),
+            "segy_options": dict(source.get("segy_options") or {}),
             "seismic_value_transform": transform,
             "lfm_value_transform": "identity",
         },
@@ -201,17 +225,22 @@ def _real_field_config(source: Mapping[str, Any], *, root: Path, transform: str)
 def _load_real_source(source: Mapping[str, Any], *, root: Path) -> tuple[RealFieldVolume, RealFieldVolume]:
     model_transform = str(source.get("model_input_seismic_transform") or "identity")
     model_volume = load_real_field_volume(config=_real_field_config(source, root=root, transform=model_transform), root=root, data_root=root)
-    if model_transform in {"identity", "raw", "none"}:
-        return model_volume, model_volume
-    physics_volume = load_real_field_volume(config=_real_field_config(source, root=root, transform=str(source.get("physics_target_seismic_transform") or "identity")), root=root, data_root=root)
+    physics_transform = str(source.get("physics_target_seismic_transform") or "identity")
+    physics_volume = load_real_field_volume(
+        config=_real_field_config(source, root=root, transform=physics_transform),
+        root=root,
+        data_root=root,
+    )
     return model_volume, physics_volume
 
 
-def _normalization_for_real(volume: RealFieldVolume) -> dict[str, Any]:
-    valid = volume.valid_mask
+def _normalization_for_real(volume: RealFieldVolume, train_inline_indices: np.ndarray) -> dict[str, Any]:
+    if train_inline_indices.size == 0:
+        raise ValueError("Real normalization reference has no training spatial support.")
+    valid = volume.valid_mask[train_inline_indices]
     result: dict[str, Any] = {"normalization_scope": "reference_source_train_partition", "normalization_mask": "valid_mask_model"}
     for name, values in (("seismic", volume.seismic), ("lfm", volume.lfm)):
-        selected = np.asarray(values, dtype=np.float64)[valid]
+        selected = np.asarray(values, dtype=np.float64)[train_inline_indices][valid]
         std = float(np.std(selected))
         if selected.size < 2 or not np.isfinite(std) or std <= 0:
             raise ValueError(f"Real normalization reference has invalid {name} values.")
@@ -221,20 +250,38 @@ def _normalization_for_real(volume: RealFieldVolume) -> dict[str, Any]:
 
 def _real_patch_rows(
     volume: RealFieldVolume, *, patch_spec: PatchSpec, min_valid_samples: int,
-    validation: Mapping[str, Any],
+    validation: Mapping[str, Any], geometry: Any,
+    wavelet_amp: np.ndarray | None = None,
 ) -> pd.DataFrame:
     fraction = float(validation.get("fraction", 0.1))
     if not 0 < fraction < 1:
         raise ValueError("real_field.validation_split.fraction must be between zero and one.")
     n_validation = max(1, int(np.ceil(volume.ilines.size * fraction)))
     gap_m = float(validation.get("gap_m", 0.0))
-    spatial_step_m = float(validation.get("spatial_step_m", 25.0))
-    gap_rows = int(np.ceil(gap_m / spatial_step_m))
     validation_start = volume.ilines.size - n_validation
-    training_stop = max(0, validation_start - gap_rows)
+    validation_inline = float(volume.ilines[validation_start])
+    validation_segment = np.asarray(
+        [
+            geometry.line_to_coord(validation_inline, float(volume.xlines[0])),
+            geometry.line_to_coord(validation_inline, float(volume.xlines[-1])),
+        ],
+        dtype=np.float64,
+    )
     rows: list[dict[str, Any]] = []
     for inline_index in range(volume.ilines.size):
-        split = "validation" if inline_index >= validation_start else "train" if inline_index < training_stop else "gap"
+        if inline_index >= validation_start:
+            split = "validation"
+            distance_to_validation_m = 0.0
+        else:
+            inline_segment = np.asarray(
+                [
+                    geometry.line_to_coord(float(volume.ilines[inline_index]), float(volume.xlines[0])),
+                    geometry.line_to_coord(float(volume.ilines[inline_index]), float(volume.xlines[-1])),
+                ],
+                dtype=np.float64,
+            )
+            distance_to_validation_m = _segment_distance_m(inline_segment, validation_segment)
+            split = "train" if distance_to_validation_m >= gap_m else "gap"
         if split == "gap":
             continue
         for patch_index, patch in enumerate(build_real_field_patch_index(
@@ -243,7 +290,12 @@ def _real_patch_rows(
             vertical_stride=patch_spec.twt_stride,
         )):
             mask = volume.valid_mask[inline_index, patch.lateral_start:patch.lateral_stop, patch.sample_start:patch.sample_stop]
-            count = int(np.count_nonzero(mask))
+            final_mask = (
+                _forward_support_safe_mask_numpy(mask, wavelet_amp)
+                if wavelet_amp is not None
+                else mask
+            )
+            count = int(np.count_nonzero(final_mask))
             if count < int(min_valid_samples):
                 continue
             rows.append({
@@ -251,11 +303,49 @@ def _real_patch_rows(
                 "inline_index": inline_index, "lateral_start": patch.lateral_start,
                 "lateral_stop": patch.lateral_stop, "vertical_start": patch.sample_start,
                 "vertical_stop": patch.sample_stop, "supervision_valid_samples": count,
+                "distance_to_validation_m": float(distance_to_validation_m),
             })
     frame = pd.DataFrame(rows)
     if frame.empty or not {"train", "validation"}.issubset(set(frame["split"])):
         raise ValueError("Real-field spatial split did not produce both train and validation patches.")
     return frame
+
+
+def _point_segment_distance(point: np.ndarray, segment: np.ndarray) -> float:
+    vector = segment[1] - segment[0]
+    denominator = float(np.dot(vector, vector))
+    if denominator == 0.0:
+        return float(np.linalg.norm(point - segment[0]))
+    fraction = float(np.dot(point - segment[0], vector) / denominator)
+    projection = segment[0] + min(1.0, max(0.0, fraction)) * vector
+    return float(np.linalg.norm(point - projection))
+
+
+def _segment_distance_m(left: np.ndarray, right: np.ndarray) -> float:
+    return min(
+        _point_segment_distance(left[0], right),
+        _point_segment_distance(left[1], right),
+        _point_segment_distance(right[0], left),
+        _point_segment_distance(right[1], left),
+    )
+
+
+def _forward_support_safe_mask_numpy(mask: np.ndarray, wavelet: np.ndarray) -> np.ndarray:
+    values = np.asarray(wavelet, dtype=np.float64).reshape(-1)
+    active = np.flatnonzero(np.abs(values) >= 0.05 * np.max(np.abs(values)))
+    if active.size == 0:
+        raise ValueError("Wavelet has no active support at threshold 0.05.")
+    half = int(np.max(np.abs(active - values.size // 2)))
+    valid = np.asarray(mask, dtype=bool)
+    if half == 0:
+        return valid
+    padded = np.pad(valid.astype(np.int32), ((0, 0), (half, half)), constant_values=0)
+    cumulative = np.pad(np.cumsum(padded, axis=-1), ((0, 0), (1, 0)), constant_values=0)
+    width = 2 * half + 1
+    counts = cumulative[:, width:] - cumulative[:, :-width]
+    safe = counts == width
+    safe[np.count_nonzero(safe, axis=-1) < 2, :] = False
+    return safe
 
 
 def _load_real_wavelet(
@@ -315,38 +405,50 @@ def forward_support_safe_mask(mask: torch.Tensor, wavelet: torch.Tensor) -> torc
     width = 2 * half + 1
     flat = (mask > 0.5).to(torch.float32).reshape(-1, 1, mask.shape[-1])
     counts = F.conv1d(flat, torch.ones((1, 1, width), device=mask.device), padding=half)
-    return (counts == width).reshape_as(mask)
+    safe = (counts == width).reshape_as(mask)
+    trace_count = safe.sum(dim=-1, keepdim=True)
+    return safe & (trace_count >= 2)
 
 
 def _block_loss(
     prepared: PreparedBlock, batch: Any, model: torch.nn.Module, *, device: torch.device,
-    normalization: Mapping[str, Any], sample_domain: str,
+    normalization: Mapping[str, Any],
 ) -> tuple[torch.Tensor, dict[str, float]]:
     cfg = prepared.config
     kind = str(cfg["kind"])
     if kind == "real_well_supervised":
         loss, counts = prepared.real_well_support.training_loss(model, device=device)
-        return loss, {key: float(value) for key, value in counts.items()}
+        return loss, {"mse": float(loss.detach().cpu()), **{key: float(value) for key, value in counts.items()}}
     x = batch["input"].to(device)
     prediction = model(x)
     if kind == "synthetic_supervised":
-        return masked_mse(prediction, batch["target_delta"].to(device), batch["valid_mask"].to(device)), {}
+        loss = masked_mse(prediction, batch["target_delta"].to(device), batch["valid_mask"].to(device))
+        return loss, {"mse": float(loss.detach().cpu())}
     if kind != "physics" or prepared.wavelet is None:
         raise ValueError(f"Unsupported prepared loss block: {kind}")
     lfm = batch["lfm"].to(device)
     valid = batch["valid_mask"].to(device)
     pred_log_ai = lfm + prediction
     wavelet_time, wavelet_amp, relation = prepared.wavelet
-    synthetic = _forward_physics_batch(
+    if prepared.sample_axis_contract is None:
+        raise ValueError(f"Loss block {cfg['block_id']} lacks a sample-axis contract.")
+    synthetic = forward_physics_batch(
         pred_log_ai[:, 0], sample_axes=batch["sample_axis"].to(device),
-        sample_domain=sample_domain, wavelet_time_s=wavelet_time,
+        sample_domain=str(prepared.sample_axis_contract["sample_domain"]), wavelet_time_s=wavelet_time,
         wavelet_amp=wavelet_amp, ai_velocity_relation=relation,
     )
     target = batch["seismic_model_consistent"].to(device)[:, 0]
     mask = forward_support_safe_mask(batch["physics_valid_mask"].to(device)[:, 0], wavelet_amp)
-    enough_waveform = mask.reshape(mask.shape[0], -1).sum(dim=1) >= 2
+    enough_waveform = (
+        mask.reshape(mask.shape[0], -1).sum(dim=1)
+        >= int(cfg["min_valid_samples"])
+    )
+    skipped_item_count = int(mask.shape[0] - torch.count_nonzero(enough_waveform).item())
     if not bool(torch.any(enough_waveform)):
-        raise ValueError("Physics batch has no item with two forward-support-safe waveform samples.")
+        raise AssertionError(
+            "Physics patch index admitted a batch with no item meeting min_valid_samples "
+            "after the frozen forward-support mask."
+        )
     synthetic = synthetic[enough_waveform]
     target = target[enough_waveform]
     mask = mask[enough_waveform]
@@ -357,6 +459,7 @@ def _block_loss(
         target_n, target_rms = masked_centered_rms(target, mask, epsilon=float(cfg.get("centered_rms_epsilon", 1e-12)))
         minimum = float(cfg.get("min_centered_rms", 1e-6))
         usable = (pred_rms >= minimum) & (target_rms >= minimum)
+        skipped_item_count += int(usable.numel() - torch.count_nonzero(usable).item())
         if not bool(torch.any(usable)):
             raise ValueError("Real physics batch has no item above min_centered_rms.")
         waveform = masked_mse(pred_n[usable], target_n[usable], mask[usable])
@@ -371,7 +474,11 @@ def _block_loss(
     delta_l2 = masked_mse(prediction_for_l2, torch.zeros_like(prediction_for_l2), valid_for_l2)
     diagnostics["waveform"] = float(waveform.detach().cpu())
     diagnostics["delta_l2"] = float(delta_l2.detach().cpu())
-    return waveform + float(cfg["delta_l2_weight"]) * delta_l2, diagnostics
+    total = waveform + float(cfg["delta_l2_weight"]) * delta_l2
+    diagnostics["total"] = float(total.detach().cpu())
+    diagnostics["valid_sample_count"] = float(torch.count_nonzero(mask).item())
+    diagnostics["skipped_item_count"] = float(skipped_item_count)
+    return total, diagnostics
 
 
 def _checkpoint_payload(
@@ -405,7 +512,7 @@ def _checkpoint_payload(
 
 def _evaluate(
     *, prepared: PreparedBlock, model: torch.nn.Module, device: torch.device,
-    normalization: Mapping[str, Any], sample_domain: str, steps: int | None,
+    normalization: Mapping[str, Any], steps: int | None,
 ) -> dict[str, float]:
     if prepared.config["kind"] == "real_well_supervised":
         support = prepared.real_well_support
@@ -431,14 +538,21 @@ def _evaluate(
     assert prepared.validation_dataset is not None
     cycler = DeterministicCycler(prepared.validation_dataset, batch_size=int(prepared.config["batch_size"]), seed=0)
     count = int(steps) if steps is not None else int(np.ceil(len(prepared.validation_dataset) / int(prepared.config["batch_size"])))
-    rows: list[float] = []
+    rows: list[dict[str, float]] = []
     model.eval()
     with torch.no_grad():
         for _ in range(count):
-            loss, _ = _block_loss(prepared, cycler.next(), model, device=device, normalization=normalization, sample_domain=sample_domain)
-            rows.append(float(loss.detach().cpu()))
-    key = "mse" if prepared.config["kind"] != "physics" else "total"
-    return {key: float(np.mean(rows))}
+            loss, diagnostics = _block_loss(prepared, cycler.next(), model, device=device, normalization=normalization)
+            rows.append({"total": float(loss.detach().cpu()), **diagnostics})
+    if prepared.config["kind"] != "physics":
+        return {"mse": float(np.mean([row["mse"] for row in rows]))}
+    return {
+        "waveform_mse": float(np.mean([row["waveform"] for row in rows])),
+        "delta_l2": float(np.mean([row["delta_l2"] for row in rows])),
+        "total": float(np.mean([row["total"] for row in rows])),
+        "valid_sample_count": float(np.sum([row["valid_sample_count"] for row in rows])),
+        "skipped_item_count": float(np.sum([row["skipped_item_count"] for row in rows])),
+    }
 
 
 def run_experiment(
@@ -464,33 +578,104 @@ def run_experiment(
     )
     synthetic: dict[str, tuple[SynthoseisBenchmark, Path]] = {}
     real_fields: dict[str, tuple[RealFieldVolume, RealFieldVolume]] = {}
+    real_geometries: dict[str, Any] = {}
+    source_contracts: dict[str, dict[str, Any]] = {}
+    resolved_sources: dict[str, dict[str, Any]] = {}
     for source_id, source in config.sources.items():
         if source["kind"] == "synthoseis_lite":
             raw_dir = source.get("benchmark_dir")
             benchmark_dir = _resolve_auto_benchmark(root) if str(raw_dir).casefold() == "auto" else _source_path(raw_dir, root)
             synthetic[source_id] = (SynthoseisBenchmark(benchmark_dir), benchmark_dir)
+            manifest = synthetic[source_id][0].manifest
+            domain = str(manifest.get("sample_domain") or "")
+            source_contracts[source_id] = {
+                "sample_domain": domain,
+                "sample_unit": "s" if domain == "time" else "m" if domain == "depth" else "",
+                "depth_basis": manifest.get("depth_basis"),
+            }
+            resolved_sources[source_id] = {
+                "kind": "synthoseis_lite",
+                "benchmark_dir": repo_relative_path(benchmark_dir, root=root),
+                "schema_version": manifest.get("schema_version"),
+                "sample_axis_contract": dict(source_contracts[source_id]),
+                "input_seismic_variant": source.get("input_seismic_variant", "nominal"),
+                "physics_target_variant": source.get("physics_target_variant", "model_consistent"),
+            }
         elif source["kind"] == "real_field":
             real_fields[source_id] = _load_real_source(source, root=root)
+            real_cfg = _real_field_config(source, root=root, transform="identity")
+            seismic_cfg = dict(real_cfg["real_field_inputs"])
+            real_geometries[source_id] = open_survey(
+                Path(str(seismic_cfg["seismic_file"])),
+                str(seismic_cfg["seismic_type"]),
+                segy_options=segy_options_from_config(dict(source.get("segy_options") or {})),
+            ).line_geometry
+            volume = real_fields[source_id][0]
+            source_contracts[source_id] = {
+                "sample_domain": volume.sample_axis.domain,
+                "sample_unit": volume.sample_axis.unit,
+                "depth_basis": volume.depth_basis,
+            }
+            resolved_sources[source_id] = {
+                "kind": "real_field",
+                "lfm_run_dir": repo_relative_path(_source_path(source["lfm_run_dir"], root), root=root),
+                "variant_id": source["variant_id"],
+                "well_control_run_dir": repo_relative_path(_source_path(source["well_control_run_dir"], root), root=root),
+                "sample_axis_contract": dict(source_contracts[source_id]),
+                "model_input_seismic_transform": source.get("model_input_seismic_transform", "identity"),
+                "physics_target_seismic_transform": source.get("physics_target_seismic_transform", "identity"),
+                "validation_split": dict(source["validation_split"]),
+            }
+    for source_id, source in config.sources.items():
+        if source["kind"] == "real_wells":
+            source_contracts[source_id] = dict(source_contracts[str(source["field_source"])])
+            resolved_sources[source_id] = {
+                "kind": "real_wells",
+                "field_source": source["field_source"],
+                "well_control_run_dir": repo_relative_path(_source_path(source["well_control_run_dir"], root), root=root),
+                "sample_axis_contract": dict(source_contracts[source_id]),
+                "held_out_well": source["held_out_well"],
+                "exclude_same_cluster": source.get("exclude_same_cluster", True),
+            }
+    consumed_sources = {
+        str(block["source"])
+        for stage in config.stages
+        for block in stage["loss_blocks"]
+    }
+    experiment_axis_contract = validate_source_axis_contracts(source_contracts, consumed_sources)
     if config.normalization_reference in synthetic:
         reference_benchmark, _ = synthetic[config.normalization_reference]
-        reference_blocks = [
-            block for stage in config.stages for block in stage["loss_blocks"]
-            if block["source"] == config.normalization_reference
-        ]
-        reference_indices = _prepare_synthetic_indices(
-            benchmark=reference_benchmark,
-            source=config.sources[config.normalization_reference],
-            patch_spec=patch_spec, blocks=reference_blocks, output_dir=output_dir,
+        reference_index = build_patch_index(
+            reference_benchmark,
+            patch_spec=patch_spec,
+            sample_kinds=_synthetic_sample_kinds(config.sources[config.normalization_reference]),
+            min_valid_samples=1,
+            max_patches=(
+                int(config.sources[config.normalization_reference]["max_patches"])
+                if config.sources[config.normalization_reference].get("max_patches") is not None
+                else None
+            ),
         )
-        normalization = _normalization_for_synthetic(reference_benchmark, next(iter(reference_indices.values())))
+        normalization = _normalization_for_synthetic(reference_benchmark, reference_index)
     else:
-        normalization = _normalization_for_real(real_fields[config.normalization_reference][0])
+        reference_volume = real_fields[config.normalization_reference][0]
+        reference_rows = _real_patch_rows(
+            reference_volume,
+            patch_spec=patch_spec,
+            min_valid_samples=1,
+            validation=dict(config.sources[config.normalization_reference]["validation_split"]),
+            geometry=real_geometries[config.normalization_reference],
+        )
+        train_inline_indices = np.sort(
+            reference_rows.loc[reference_rows["split"] == "train", "inline_index"].unique().astype(int)
+        )
+        normalization = _normalization_for_real(reference_volume, train_inline_indices)
     write_json(output_dir / "normalization.json", normalization)
     input_stats_path = output_dir / "input_reference_stats.json"
     write_json(input_stats_path, {"stats": dict(normalization["seismic"])})
     manifest_stages: list[dict[str, Any]] = []
     checkpoints: dict[tuple[str, str], Path] = {}
-    sample_axis_contract: dict[str, Any] | None = None
+    sample_axis_contract: dict[str, Any] | None = dict(experiment_axis_contract)
     for stage_index, stage in enumerate(config.stages):
         stage_id = str(stage["stage_id"])
         stage_dir = output_dir / "stages" / stage_id
@@ -511,29 +696,32 @@ def run_experiment(
             cfg = dict(block) | {"source_kind": source["kind"]}
             if source["kind"] == "synthoseis_lite":
                 benchmark, benchmark_dir = synthetic[source_id]
+                wavelet = load_benchmark_wavelet(benchmark_dir, device=device) if block["kind"] == "physics" else None
                 indices = _prepare_synthetic_indices(
                     benchmark=benchmark, source=source, patch_spec=patch_spec,
                     blocks=[block], output_dir=stage_dir,
+                    wavelet_amp=(wavelet[1].detach().cpu().numpy() if wavelet is not None else None),
                 )[str(block["block_id"])]
                 train_dataset = PatchDataset(benchmark, indices, split="train", normalization=normalization)
                 validation_dataset = PatchDataset(benchmark, indices, split="validation", normalization=normalization)
-                wavelet = _load_nominal_wavelet(benchmark_dir, device=device) if block["kind"] == "physics" else None
-                prepared_blocks.append(PreparedBlock(cfg, train_dataset, validation_dataset, wavelet))
+                prepared_blocks.append(PreparedBlock(cfg, train_dataset, validation_dataset, wavelet, sample_axis_contract=dict(source_contracts[source_id])))
                 if sample_axis_contract is None:
                     domain = str(benchmark.manifest.get("sample_domain"))
                     sample_axis_contract = {"sample_domain": domain, "sample_unit": "s" if domain == "time" else "m", "depth_basis": benchmark.manifest.get("depth_basis")}
             elif source["kind"] == "real_field":
                 model_volume, physics_volume = real_fields[source_id]
+                wavelet = _load_real_wavelet(source, model_volume, root=root, device=device)
                 rows = _real_patch_rows(
                     model_volume, patch_spec=patch_spec,
                     min_valid_samples=int(block["min_valid_samples"]),
                     validation=dict(source.get("validation_split") or {}),
+                    geometry=real_geometries[source_id],
+                    wavelet_amp=wavelet[1].detach().cpu().numpy(),
                 )
                 rows.to_csv(stage_dir / f"{block['block_id']}_patch_index.csv", index=False)
                 train_dataset = RealFieldPatchDataset(model_volume, physics_volume, rows[rows["split"] == "train"], normalization, patch_spec)
                 validation_dataset = RealFieldPatchDataset(model_volume, physics_volume, rows[rows["split"] == "validation"], normalization, patch_spec)
-                wavelet = _load_real_wavelet(source, model_volume, root=root, device=device)
-                prepared_blocks.append(PreparedBlock(cfg, train_dataset, validation_dataset, wavelet))
+                prepared_blocks.append(PreparedBlock(cfg, train_dataset, validation_dataset, wavelet, sample_axis_contract=dict(source_contracts[source_id])))
                 if sample_axis_contract is None:
                     sample_axis_contract = {"sample_domain": model_volume.sample_axis.domain, "sample_unit": model_volume.sample_axis.unit, "depth_basis": model_volume.depth_basis}
             else:
@@ -560,7 +748,7 @@ def run_experiment(
                     seed=_seed(config.seed, stage_index, len(prepared_blocks), 0), logger=logger,
                 )
                 support.configure_model(receptive_field_lateral=info.lateral_receptive_field)
-                prepared_blocks.append(PreparedBlock(cfg, None, None, real_well_support=support))
+                prepared_blocks.append(PreparedBlock(cfg, None, None, real_well_support=support, sample_axis_contract=dict(source_contracts[source_id])))
                 volume = real_fields[field_source_id][0]
                 if sample_axis_contract is None:
                     sample_axis_contract = {"sample_domain": volume.sample_axis.domain, "sample_unit": volume.sample_axis.unit, "depth_basis": volume.depth_basis}
@@ -574,7 +762,9 @@ def run_experiment(
                 for index, block in enumerate(prepared_blocks)
             ]
             model.train()
-            totals = {str(block.config["block_id"]): [] for block in prepared_blocks}
+            totals: dict[str, list[dict[str, float]]] = {
+                str(block.config["block_id"]): [] for block in prepared_blocks
+            }
             batch_counts = {str(block.config["block_id"]): 0 for block in prepared_blocks}
             for step in range(int(stage["steps_per_epoch"])):
                 optimizer.zero_grad(set_to_none=True)
@@ -583,10 +773,12 @@ def run_experiment(
                     if step % int(prepared.config["update_interval"]) != 0:
                         continue
                     batch = cyclers[block_index].next() if cyclers[block_index] is not None else None
-                    loss, _ = _block_loss(prepared, batch, model, device=device, normalization=normalization, sample_domain=str(sample_axis_contract["sample_domain"]))
+                    loss, diagnostics = _block_loss(prepared, batch, model, device=device, normalization=normalization)
                     weighted = float(prepared.config["weight"]) * loss
                     combined = weighted if combined is None else combined + weighted
-                    totals[str(prepared.config["block_id"])].append(float(loss.detach().cpu()))
+                    totals[str(prepared.config["block_id"])].append(
+                        {"total": float(loss.detach().cpu()), **diagnostics}
+                    )
                     batch_counts[str(prepared.config["block_id"])] += 1
                 if combined is None or not bool(torch.isfinite(combined)):
                     raise FloatingPointError(f"Invalid combined loss at {stage_id} epoch={epoch} step={step}.")
@@ -595,11 +787,25 @@ def run_experiment(
             validation_values: dict[str, float] = {}
             validation_steps = stage["validation"].get("steps") if stage["validation"]["mode"] == "fixed_steps" else None
             for prepared in prepared_blocks:
-                metrics = _evaluate(prepared=prepared, model=model, device=device, normalization=normalization, sample_domain=str(sample_axis_contract["sample_domain"]), steps=validation_steps)
+                metrics = _evaluate(prepared=prepared, model=model, device=device, normalization=normalization, steps=validation_steps)
                 for name, value in metrics.items():
                     validation_values[f"{prepared.config['block_id']}.{name}"] = value
             selected = float(validation_values[metric_name])
-            row = {"epoch": epoch, "selection_metric": metric_name, "selection_metric_value": selected, "batch_counts": batch_counts, **validation_values}
+            training_values: dict[str, float] = {}
+            for block_id, block_rows in totals.items():
+                metric_keys = sorted({key for values in block_rows for key in values})
+                for key in metric_keys:
+                    values = [row[key] for row in block_rows if key in row]
+                    aggregate = np.sum if key in {"valid_sample_count", "skipped_item_count"} else np.mean
+                    training_values[f"{block_id}.train_{key}"] = float(aggregate(values))
+            row = {
+                "epoch": epoch,
+                "selection_metric": metric_name,
+                "selection_metric_value": selected,
+                **{f"{block_id}.batch_count": count for block_id, count in batch_counts.items()},
+                **training_values,
+                **validation_values,
+            }
             history.append(row)
             if selected < best_value:
                 best_value, best_epoch = selected, epoch
@@ -628,7 +834,7 @@ def run_experiment(
         "normalization_reference": {"source": config.normalization_reference},
         "normalization": normalization,
         "normalization_path": repo_relative_path(output_dir / "normalization.json", root=root),
-        "sources": config.sources,
+        "sources": resolved_sources,
         "patching": config.patching.as_dict(),
         "input_channels": ["seismic", "lfm", "valid_mask"],
         "output_semantics": "pred_log_ai = lfm_log_ai + physical_delta_log_ai",
@@ -649,4 +855,7 @@ def run_experiment(
     return manifest
 
 
-__all__ = ["DeterministicCycler", "masked_centered_rms", "run_experiment"]
+__all__ = [
+    "DeterministicCycler", "masked_centered_rms", "run_experiment",
+    "validate_source_axis_contracts",
+]

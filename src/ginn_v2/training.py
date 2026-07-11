@@ -98,6 +98,10 @@ def train_model(
     log_interval_batches: int = 10,
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
+    raise RuntimeError(
+        "The pre-composable GINN-v2 trainer is retired. "
+        "Use ginn_v2.composable.run_experiment with ginn_v2_experiment_v1."
+    )
     sample_axis_contract = _benchmark_sample_axis_contract(benchmark.manifest)
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = logger or configure_training_logger(output_dir)

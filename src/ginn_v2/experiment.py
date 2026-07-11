@@ -18,6 +18,42 @@ LOSS_SOURCE_KINDS = {
     "physics": {"synthoseis_lite", "real_field"},
     "real_well_supervised": {"real_wells"},
 }
+SOURCE_KEYS = {
+    "synthoseis_lite": {
+        "kind", "benchmark_dir", "input_seismic_variant", "physics_target_variant",
+    },
+    "real_field": {
+        "kind", "lfm_run_dir", "variant_id", "well_control_run_dir",
+        "model_input_seismic_transform", "physics_target_seismic_transform",
+        "validation_split", "wavelet_generation_dir", "forward_model_inputs_path",
+        "volume", "segy_options",
+    },
+    "real_wells": {
+        "kind", "field_source", "well_control_run_dir", "held_out_well",
+        "exclude_same_cluster", "cluster_radius_m", "diagnostic_max_hz",
+        "reconstruction_tolerance_log_ai",
+    },
+}
+LOSS_KEYS = {
+    "synthetic_supervised": {
+        "block_id", "kind", "source", "weight", "update_interval", "batch_size",
+        "min_valid_samples",
+    },
+    "physics": {
+        "block_id", "kind", "source", "weight", "update_interval", "batch_size",
+        "min_valid_samples", "delta_l2_weight", "waveform_standardization",
+        "centered_rms_epsilon", "min_centered_rms",
+    },
+    "real_well_supervised": {
+        "block_id", "kind", "source", "weight", "update_interval", "batch_size",
+        "min_valid_samples",
+    },
+}
+VALIDATION_METRICS = {
+    "synthetic_supervised": {"mse"},
+    "physics": {"waveform_mse", "delta_l2", "total", "valid_sample_count", "skipped_item_count"},
+    "real_well_supervised": {"mse"},
+}
 LEGACY_KEYS = {
     "train", "model_id", "model_role", "min_valid_fraction",
     "lambda_physics", "lambda_real_delta", "real_delta",
@@ -150,6 +186,7 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         kind = str(source.get("kind") or "")
         if kind not in SOURCE_KINDS:
             raise ValueError(f"sources.{source_id}.kind must be one of {sorted(SOURCE_KINDS)}.")
+        _reject_extra(source, SOURCE_KEYS[kind], f"sources.{source_id}")
         required_by_kind = {
             "synthoseis_lite": {"benchmark_dir"},
             "real_field": {"lfm_run_dir", "variant_id", "well_control_run_dir"},
@@ -160,6 +197,14 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
             raise ValueError(f"sources.{source_id} is missing required fields: {missing}")
         if kind == "synthoseis_lite" and source.get("physics_target_variant", "model_consistent") != "model_consistent":
             raise ValueError("Synthoseis physics_target_variant must be model_consistent.")
+        if kind == "real_field":
+            split = _mapping(source.get("validation_split"), f"sources.{source_id}.validation_split")
+            _reject_extra(split, {"kind", "fraction", "gap_m", "anchor"}, f"sources.{source_id}.validation_split")
+            if split.get("kind") != "spatial_block" or split.get("anchor") not in {"maxmin"}:
+                raise ValueError(
+                    f"sources.{source_id}.validation_split requires kind=spatial_block and anchor=maxmin."
+                )
+            source["validation_split"] = split
         sources[str(source_id)] = source
 
     norm = _mapping(cfg.get("normalization_reference"), "ginn_v2.normalization_reference")
@@ -213,6 +258,7 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
                 raise ValueError(f"Loss block ID must be valid and unique in its stage: {block_id!r}")
             if kind not in LOSS_SOURCE_KINDS or source_id not in sources:
                 raise ValueError(f"Invalid loss block kind/source: {kind!r}/{source_id!r}")
+            _reject_extra(block, LOSS_KEYS[kind], f"stages[{stage_index}].loss_blocks[{block_index}]")
             if sources[source_id]["kind"] not in LOSS_SOURCE_KINDS[kind]:
                 raise ValueError(f"Loss block {block_id} cannot consume source kind {sources[source_id]['kind']}.")
             block["weight"] = _finite(block.get("weight"), f"{block_id}.weight", nonnegative=True)
@@ -222,12 +268,19 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
                 block["delta_l2_weight"] = _finite(block.get("delta_l2_weight"), f"{block_id}.delta_l2_weight", positive=True)
             block_ids.add(block_id)
             blocks.append(block)
-        if not any(block["update_interval"] == 1 for block in blocks):
-            raise ValueError(f"Stage {stage_id} requires at least one loss block with update_interval=1.")
+        if not any(block["update_interval"] == 1 and block["weight"] > 0 for block in blocks):
+            raise ValueError(f"Stage {stage_id} requires a positive-weight loss block with update_interval=1.")
         validation = _mapping(stage.get("validation"), f"stages[{stage_index}].validation")
         metric = str(validation.get("selection_metric") or "")
-        if metric.split(".", 1)[0] not in block_ids:
+        metric_parts = metric.split(".", 1)
+        if len(metric_parts) != 2 or metric_parts[0] not in block_ids:
             raise ValueError(f"Stage {stage_id} selection_metric must reference one of its loss blocks.")
+        metric_block = next(block for block in blocks if block["block_id"] == metric_parts[0])
+        if metric_parts[1] not in VALIDATION_METRICS[str(metric_block["kind"])]:
+            raise ValueError(
+                f"Stage {stage_id} selection_metric {metric!r} is not exported by "
+                f"{metric_block['kind']}."
+            )
         mode = str(validation.get("mode") or "")
         if mode not in {"full", "fixed_steps"}:
             raise ValueError(f"Stage {stage_id} validation.mode must be full or fixed_steps.")

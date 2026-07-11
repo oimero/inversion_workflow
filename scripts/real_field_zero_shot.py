@@ -1019,11 +1019,11 @@ def main() -> None:
         },
     }
     for model_summary in model_summaries:
-        model_role = str(model_summary["experiment_id"])
+        experiment_id = str(model_summary["experiment_id"])
         model_input = dict(dict(model_summary.get("input_contracts") or {}).get("model_run") or {})
         if not model_input:
-            raise ValueError(f"R0 model summary lacks model_run contract: {model_role}")
-        input_contracts[f"model:{model_role}"] = model_input
+            raise ValueError(f"R0 model summary lacks model_run contract: {experiment_id}")
+        input_contracts[f"model:{experiment_id}"] = model_input
     wavelet_dir_text = str(source_runs.get("wavelet_generation_dir") or "").strip()
     if sample_axis.domain == "time" and wavelet_dir_text:
         wavelet_summary_path = resolve_relative_path(wavelet_dir_text, root=REPO_ROOT) / "run_summary.json"

@@ -47,7 +47,7 @@ from cup.utils.io import (
     write_json,
 )
 from cup.utils.statistics import radius_connected_components
-from ginn_v2.contracts import ZERO_SHOT_SUMMARY_SCHEMA_VERSION
+from ginn_v2.contracts import FORWARD_DIAGNOSTIC_SCHEMA_VERSION, ZERO_SHOT_SUMMARY_SCHEMA_VERSION
 from ginn_v2.real_field import (
     diagnostic_metrics,
     load_selected_wavelet,
@@ -59,7 +59,7 @@ from wtie.processing import grid
 
 
 DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")
-SCHEMA_VERSION = "real_field_forward_diagnostic_summary_v4"
+SCHEMA_VERSION = FORWARD_DIAGNOSTIC_SCHEMA_VERSION
 
 
 def parse_args() -> argparse.Namespace:

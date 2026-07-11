@@ -32,7 +32,8 @@ from ginn_v2.contracts import (
     ZERO_SHOT_MODEL_SCHEMA_VERSION,
 )
 from ginn_v2.data import denormalize_delta
-from ginn_v2.training import load_checkpoint, resolve_device
+from ginn_v2.checkpoint import load_checkpoint
+from ginn_v2.runtime import resolve_device
 
 
 @dataclass(frozen=True)
@@ -160,7 +161,7 @@ def _validate_model_sample_axis(
         )
 
 
-def _manifest_model_role(manifest: Mapping[str, Any]) -> str:
+def _manifest_experiment_id(manifest: Mapping[str, Any]) -> str:
     experiment_id = str(manifest.get("experiment_id") or "").strip()
     if not experiment_id:
         raise ValueError("GINN-v2 v1 manifest must contain experiment_id; model_role is obsolete.")
@@ -585,7 +586,7 @@ def run_zero_shot_model(
     if stitch_strategy != "uniform":
         raise ValueError("GINN-v2 R0 production stitching is fixed to uniform.")
     model_run_dir, manifest = _model_manifest_and_dir(model_cfg, root=root)
-    model_role = _manifest_model_role(manifest)
+    experiment_id = _manifest_experiment_id(manifest)
     architecture_id = _required_text(_mapping(manifest.get("architecture"), "architecture"), "id")
     checkpoint_path = _primary_checkpoint_path(manifest, root=root)
     model, checkpoint = load_checkpoint(checkpoint_path)
@@ -612,7 +613,7 @@ def run_zero_shot_model(
     model.to(device)
     model.eval()
     normalization = dict(checkpoint["normalization"])
-    patch_spec = _mapping(manifest.get("patching"), f"{model_role}.patching")
+    patch_spec = _mapping(manifest.get("patching"), f"{experiment_id}.patching")
     patches = build_real_field_patch_index(
         section.valid_mask,
         lateral_samples=int(patch_spec["lateral_samples"]),
@@ -621,7 +622,7 @@ def run_zero_shot_model(
         vertical_stride=int(patch_spec["vertical_stride"]),
     )
     if not patches:
-        raise ValueError(f"No valid real-field patches for model role={model_role}.")
+        raise ValueError(f"No valid real-field patches for experiment_id={experiment_id}.")
 
     pred_sum = np.zeros_like(section.lfm, dtype=np.float64)
     weight = np.zeros_like(section.lfm, dtype=np.float64)
@@ -658,8 +659,8 @@ def run_zero_shot_model(
             )
             rows.append(
                 {
-                    "patch_id": f"{model_role}__p{patch_idx:05d}",
-                    "experiment_id": model_role,
+                    "patch_id": f"{experiment_id}__p{patch_idx:05d}",
+                    "experiment_id": experiment_id,
                     "architecture_id": architecture_id,
                     "lateral_start": patch.lateral_start,
                     "lateral_stop": patch.lateral_stop,
@@ -682,7 +683,7 @@ def run_zero_shot_model(
     if np.any(~np.isfinite(stitched[section.valid_mask])):
         raise FloatingPointError("R0 produced non-finite predictions at valid samples.")
     pred_delta_vs_lfm = stitched - section.lfm
-    model_dir = output_dir / model_role
+    model_dir = output_dir / experiment_id
     model_dir.mkdir(parents=True, exist_ok=False)
     npz_path = model_dir / "predictions.npz"
     np.savez_compressed(
@@ -713,7 +714,7 @@ def run_zero_shot_model(
                 "path": repo_relative_path(model_run_dir / "model_run_manifest.json", root=root),
             }
         },
-        "experiment_id": model_role,
+        "experiment_id": experiment_id,
         "architecture_id": architecture_id,
         "model_run_dir": repo_relative_path(model_run_dir, root=root),
         "checkpoint": repo_relative_path(checkpoint_path, root=root),
@@ -756,7 +757,7 @@ def run_zero_shot_volume_model(
     if stitch_strategy != "uniform":
         raise ValueError("GINN-v2 R0 production stitching is fixed to uniform.")
     model_run_dir, manifest = _model_manifest_and_dir(model_cfg, root=root)
-    model_role = _manifest_model_role(manifest)
+    experiment_id = _manifest_experiment_id(manifest)
     architecture_id = _required_text(_mapping(manifest.get("architecture"), "architecture"), "id")
     checkpoint_path = _primary_checkpoint_path(manifest, root=root)
     model, checkpoint = load_checkpoint(checkpoint_path)
@@ -783,7 +784,7 @@ def run_zero_shot_volume_model(
     model.to(device)
     model.eval()
     normalization = dict(checkpoint["normalization"])
-    patch_spec = _mapping(manifest.get("patching"), f"{model_role}.patching")
+    patch_spec = _mapping(manifest.get("patching"), f"{experiment_id}.patching")
 
     pred_sum = np.zeros_like(volume.lfm, dtype=np.float64)
     weight = np.zeros_like(volume.lfm, dtype=np.float64)
@@ -835,8 +836,8 @@ def run_zero_shot_volume_model(
                 )
                 rows.append(
                     {
-                        "patch_id": f"{model_role}__il{inline_idx:04d}__p{n_patches:07d}",
-                        "experiment_id": model_role,
+                        "patch_id": f"{experiment_id}__il{inline_idx:04d}__p{n_patches:07d}",
+                        "experiment_id": experiment_id,
                         "architecture_id": architecture_id,
                         "inline_index": int(inline_idx),
                         "inline": float(inline_no),
@@ -856,13 +857,13 @@ def run_zero_shot_volume_model(
                 )
                 n_patches += 1
     if n_patches <= 0:
-        raise ValueError(f"No valid real-field volume patches for model role={model_role}.")
+        raise ValueError(f"No valid real-field volume patches for experiment_id={experiment_id}.")
     stitched = np.divide(pred_sum, weight, out=np.full_like(pred_sum, np.nan), where=weight > 0.0)
     _require_complete_valid_coverage(weight, volume.valid_mask, ilines=volume.ilines, xlines=volume.xlines, samples=volume.sample_axis.values)
     if np.any(~np.isfinite(stitched[volume.valid_mask])):
         raise FloatingPointError("R0 produced non-finite predictions at valid samples.")
     pred_delta_vs_lfm = stitched - volume.lfm
-    model_dir = output_dir / model_role
+    model_dir = output_dir / experiment_id
     model_dir.mkdir(parents=True, exist_ok=False)
     npz_path = model_dir / "predictions.npz"
     np.savez_compressed(
@@ -894,7 +895,7 @@ def run_zero_shot_volume_model(
             }
         },
         "output_mode": "volume",
-        "experiment_id": model_role,
+        "experiment_id": experiment_id,
         "architecture_id": architecture_id,
         "model_run_dir": repo_relative_path(model_run_dir, root=root),
         "checkpoint": repo_relative_path(checkpoint_path, root=root),

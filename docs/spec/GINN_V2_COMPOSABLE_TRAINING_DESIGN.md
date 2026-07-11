@@ -69,13 +69,16 @@ ginn_v2:
     synthetic:
       kind: synthoseis_lite
       benchmark_dir: auto
+      input_seismic_variant: observed_mismatch
+      physics_target_variant: model_consistent
 
     field:
       kind: real_field
       lfm_run_dir: scripts/output/real_field_lfm_<run>
       variant_id: trend_baseline
       well_control_run_dir: scripts/output/real_field_well_controls_<run>
-      seismic_value_transform: p99_abs_matched
+      model_input_seismic_transform: p99_abs_matched
+      physics_target_seismic_transform: identity
       validation_split:
         kind: spatial_block
         fraction: 0.10
@@ -117,6 +120,7 @@ ginn_v2:
           min_valid_samples: 128
       validation:
         selection_metric: synthetic_ai.mse
+        mode: full
 
     - stage_id: field_physics
       epochs: 10
@@ -134,6 +138,9 @@ ginn_v2:
           batch_size: 8
           min_valid_samples: 128
           delta_l2_weight: 0.01
+          waveform_standardization: patch_centered_rms
+          centered_rms_epsilon: 1.0e-12
+          min_centered_rms: 1.0e-6
         - block_id: well_anchor
           kind: real_well_supervised
           source: wells
@@ -143,6 +150,8 @@ ginn_v2:
           min_valid_samples: 8
       validation:
         selection_metric: field_waveform.total
+        mode: fixed_steps
+        steps: 100
 
   deployment_checkpoint: last_stage.best
 ```
@@ -163,12 +172,12 @@ ginn_v2:
 
 首版只注册四个纯架构标识：
 
-| 架构标识 | 网络 | 横向感受野 |
+| 架构标识 | 网络 | 横向行为 |
 |---|---|---|
 | `trace_conv1d` | 逐道普通一维卷积 | 1 |
 | `trace_dilated_tcn` | 逐道膨胀一维 TCN | 1 |
-| `trace_lateral_mixer` | 膨胀 TCN 加浅层横向混合 | `lateral_kernel` |
-| `patch_conv2d` | 二维卷积 patch 网络 | `1 + 2 * depth` |
+| `trace_lateral_mixer` | 膨胀 TCN 加浅层横向混合 | 由 mixer 合同计算 |
+| `patch_conv2d` | 二维卷积 patch 网络 | 由二维卷积合同计算 |
 
 公共参数：
 
@@ -177,6 +186,8 @@ ginn_v2:
 - `lateral_kernel`：仅 `trace_lateral_mixer` 接受，必须是正奇数。
 
 不属于当前架构的参数出现时明确报错。
+
+架构合同还必须冻结实际 kernel、dilation schedule、block 数、mixer 层数和 padding 规则。架构实例根据这些字段计算并导出 `vertical_receptive_field` 与 `lateral_receptive_field`；manifest 不用简化公式或架构名称猜测感受野。
 
 ### 4.3 数据源
 
@@ -194,6 +205,42 @@ ginn_v2:
 
 `real_wells.field_source` 必须引用一个 `real_field` source。井监督在该 source 的 LFM、采样轴和几何上构造井旁 delta 标签，禁止按字段名猜测或另行发现 LFM。
 
+`real_field` 和引用它的 `real_wells` 都显式记录 well-control 路径。两者解析出的合同指纹必须相同；不一致时明确失败。保留两处路径是为了让真实体 source 和井标签 source 各自拥有完整、可审计的输入合同。
+
+#### 4.3.1 模型输入与物理目标张量
+
+每个可用于 physics 的 source 必须显式提供四个不同语义的张量：
+
+| 张量 | 语义 |
+|---|---|
+| `seismic_model_input` | 经过 source 模型输入变换和实验归一化后的网络输入 |
+| `seismic_physics_target` | 只经过冻结 physics-target 预处理的波形目标，不应用模型 mean/std |
+| `lfm_model_input` | 经过实验归一化后的网络输入 LFM |
+| `lfm_log_ai_physical` | 未标准化的物理 logAI，用于组装预测 logAI 和物理正演 |
+
+数据流固定为：
+
+```text
+seismic_raw
+  -> model_input_seismic_transform
+  -> experiment seismic mean/std
+  -> seismic_model_input
+
+seismic_raw
+  -> physics_target_seismic_transform
+  -> seismic_physics_target
+
+lfm_log_ai_physical
+  -> experiment LFM mean/std
+  -> lfm_model_input
+```
+
+physics loss 禁止把 `seismic_model_input` 当成波形目标，也禁止把 `lfm_model_input` 当成物理 logAI。
+
+Synthoseis source 必须显式声明 `input_seismic_variant`。首版允许 `nominal` 或 `observed_mismatch`。`physics_target_variant` 固定且必须为 `model_consistent`；其他值明确失败。这样网络可以消费 mismatch 输入，但物理目标始终来自同一 AI 的一致正演。
+
+真实 source 的两类 seismic transform 分别冻结并写入 manifest。physics target 不应用实验级模型输入 mean/std；真实 MaskedRMS 在 loss 内处理其尺度。
+
 经过真实工区物理训练的 checkpoint 允许用于其他工区。跨工区 R0/R1 必须继续校验：
 
 - 时间域或深度域一致；
@@ -201,7 +248,7 @@ ginn_v2:
 - 深度域使用 TVDSS；
 - 模型输入通道和归一化合同一致。
 
-真实输入合同指纹不要求相同，但必须写入运行摘要，并执行输入分布 OOD QC。
+真实输入合同指纹不要求相同。若 deployment checkpoint 的任一训练阶段消费过 `real_field` physics source，而部署工区合同指纹不同，R0/R1 默认明确拒绝；用户必须配置 `allow_cross_field_adapted_checkpoint: true` 才能继续。允许后仍须在运行摘要醒目标记 adaptation source 与 deployment source，并执行输入分布 OOD QC。
 
 ### 4.4 实验级归一化
 
@@ -256,7 +303,7 @@ ginn_v2:
 
 每个阶段显式声明正整数 `epochs` 和 `steps_per_epoch`，因此 epoch 不依赖任一数据源长度。
 
-每个 loss block 有独立的确定性循环采样器。随机种子由实验 seed、stage ID、block ID 和 epoch 派生。
+每个 loss block 有独立的确定性循环采样器。随机种子使用 `numpy.random.SeedSequence([experiment_seed, stage_index, block_index, epoch])` 派生，其中两个 index 是 stage 和 block 在冻结配置中的位置。禁止使用 Python 内置 `hash()`。
 
 在全局 stage step `s` 上，满足下面条件的 block 到期：
 
@@ -275,12 +322,12 @@ block 的有效频率由 `update_interval` 本身表达，不对低频 block 的
 - `checkpoint_best.pt`；
 - `checkpoint_final.pt`；
 - 每 epoch 训练和验证指标；
-- 实际 batch 序列指纹；
+- 实际执行 step 数和各 block 的 batch 数；
 - best epoch 和 selection metric 值。
 
 `validation.selection_metric` 必须引用当前阶段某个 loss block 导出的验证指标。selection metric 必须有限且按最小化选择。
 
-默认部署 checkpoint 为最后阶段 best。`deployment_checkpoint` 可以显式引用任意阶段的 best/final。
+配置中的 `deployment_checkpoint` 可以省略。配置解析时立即将缺省值解析为最后阶段 best；也可以显式引用任意阶段的 best/final。实验 manifest 必须写入完整的已解析 stage ID、checkpoint kind 和路径。R0/R1 只读取 manifest 中的显式记录，不再次应用默认值。
 
 ## 6. 损失块
 
@@ -299,6 +346,14 @@ block 的有效频率由 `update_interval` 本身表达，不对低频 block 的
 block 先构造自身最终监督 mask。只有监督 mask 中有效样点数不少于 `min_valid_samples` 的 patch 才进入该 block 的训练或验证索引。
 
 同一个原始窗口可以进入一个 block 而不进入另一个 block。
+
+`min_valid_samples` 的计数单位由 block kind 固定：
+
+- `synthetic_supervised`：label-valid 网格样点；
+- `physics`：最终 forward-support-safe waveform 样点；
+- `real_well_supervised`：有效井监督点。
+
+不得用 input-valid 数量代替上述 block 专属计数。
 
 ### 6.2 合成监督损失
 
@@ -336,10 +391,15 @@ L_physics = L_waveform + delta_l2_weight * L_delta
 
 时间域使用公共 PyTorch `forward_time`。深度域使用冻结 AI–Vp 关系从预测 AI 派生 Vp，再调用公共 PyTorch `forward_depth`。核心正演输入全部来自 source 合同。
 
+waveform loss 使用的 mask 必须是 forward-support-safe 布尔 mask，而不是 input-valid mask。子波有效支撑阈值固定使用公共 `DEFAULT_ACTIVE_SUPPORT_THRESHOLD=0.05`，并写入 source 与 stage manifest。对某个输出样点，正演算子中所有超过该阈值的有效贡献界面必须位于同一个连续有效段内，且不能穿过 patch 边界；否则该输出样点不参与 waveform loss。
+
+时间域可以按子波有效半支撑构造布尔腐蚀；深度域必须按当前位置速度和非平稳算子支撑判断。该操作只判定物理上下文是否合法，不引入软权重，因此不属于 taper。
+
 #### 合成 source
 
 - 观测目标固定为 `seismic_model_consistent`；
 - 不把含噪声、gain、相位或静差的 seismic variant 当作物理真值；
+- `physics_valid_mask` 必须遵守同一 forward-support-safe 契约；
 - 在 `physics_valid_mask` 上计算原始振幅 masked MSE。
 
 ```text
@@ -349,16 +409,49 @@ L_waveform_synthetic = sum(mask * (pred_seismic - seismic_model_consistent)^2)
 
 #### 真实 source
 
-每道按连续 input-valid 区段独立正演，区段少于两个样点时不产生 waveform 监督。区段之间不插值、不连接，也不填充虚构 AI。
+每道按连续 input-valid 区段独立构造正演输入。区段之间不插值、不连接，也不填充虚构 AI。最终 waveform-safe mask 还必须排除正演支撑穿过区段或 patch 边界的样点。
 
-对每道的观测和合成分别在 waveform mask 内去均值并除以 RMS：
+标准化粒度固定为单个 batch item/patch，不是单道，也不跨 batch item 共享统计量。这样保留一个 patch 内不同 trace 的相对振幅关系。
+
+对于 patch 张量 `x` 和完整 waveform-safe mask `m`：
 
 ```text
-standardize(x, m) = (x - masked_mean(x, m)) / masked_rms(x, m)
-L_waveform_real = masked_mse(standardize(pred_seismic), standardize(observed_seismic))
+masked_mean(x, m) = sum(m * x) / sum(m)
+centered_rms(x, m) = sqrt(
+    sum(m * (x - masked_mean(x, m))^2) / sum(m)
+    + centered_rms_epsilon
+)
+standardize(x, m) = where(
+    m,
+    (x - masked_mean(x, m)) / centered_rms(x, m),
+    0
+)
 ```
 
-RMS 必须有限且大于零；不满足时该道从 waveform mask 排除。这里没有可训练 gain、显式振幅拟合、taper、相位扫描或 TV 正则。
+观测和合成分别计算自己的 mean 与 centered RMS，但使用同一个 waveform-safe mask。合成侧统计量不 detach，梯度必须穿过 mean、centered RMS 和标准化运算。
+
+`centered_rms_epsilon` 必须为有限正数，默认 `1e-12`；`min_centered_rms` 必须为有限正数，默认 `1e-6`。任一侧 centered RMS 小于 `min_centered_rms` 时，该 patch 的 waveform item 无效：训练器跳过该 item、增加带原因的计数并写入 epoch 指标。若一个 batch 或冻结数据索引没有任何有效 waveform item，则明确失败，禁止产生 NaN loss。
+
+```text
+L_waveform_real = masked_mse(
+    standardize(pred_seismic, waveform_safe_mask),
+    standardize(seismic_physics_target, waveform_safe_mask)
+)
+```
+
+这里没有可训练 gain、显式振幅拟合、taper、相位扫描或 TV 正则。
+
+##### 振幅可识别性限制
+
+观测和合成独立做 patch-centered RMS 标准化后，真实 waveform loss 对两者之间的正整体振幅缩放不敏感。因此 real-only physics-first 不声称仅依靠 waveform loss 恢复绝对反射强度。它主要约束事件时序、极性、相位结构、patch 内横向相对振幅和波形形状；阻抗对比度幅度由 LFM 锚定、零 delta 初始化、delta L2、可选井监督或先前监督阶段共同决定。
+
+真实 physics block 无论是否作为 selection metric，都必须记录：
+
+- `observed_centered_rms`；
+- `predicted_centered_rms`；
+- `predicted_to_observed_rms_ratio`；
+- `delta_log_ai_rms`；
+- 因样点不足、低 RMS 或非有限值跳过的 item 数量和比例。
 
 真实 source 的 validation split 使用确定性 XY 空间块和物理距离 gap。训练窗口与验证窗口的实际空间支撑不得重叠或穿过 gap。
 
@@ -385,7 +478,12 @@ L_well = mean((pred_delta_log_ai_at_well - target_delta_log_ai)^2)
 
 ## 7. 验证与选优
 
-每个 block 每 epoch 都计算验证指标，不受训练时 `update_interval` 影响。
+每个 block 每 epoch 都计算验证指标，不受训练时 `update_interval` 影响。每个 stage 的 validation 必须显式选择以下模式之一：
+
+- `mode: full`：遍历冻结验证索引的全部 batch，禁止同时填写 `steps`；
+- `mode: fixed_steps`：必须填写正整数 `steps`，从冻结验证索引循环读取固定数量 batch。
+
+验证采样器与训练采样器相互独立，不随 epoch 重洗。解析后的验证索引保存为显式索引文件并由该 stage 的所有 epoch 复用；manifest 记录索引文件路径和采样 seed。
 
 | block | 验证隔离 | 可选主指标 |
 |---|---|---|
@@ -409,6 +507,16 @@ L_well = mean((pred_delta_log_ai_at_well - target_delta_log_ai)^2)
 R0 只读取模型 patch 几何，不读取任何训练 block 的 `min_valid_samples`。
 
 每个 inline/section 使用覆盖完整横向和采样轴的规则窗口，包括轴末端补齐窗口。窗口内只要存在一个 `valid_mask_model=True` 样点就必须执行推理。
+
+窗口构造和填充值固定如下：
+
+- 轴长度大于或等于 patch 长度时，规则 stride 后的最后一个窗口起点固定为 `axis_length - patch_length`，避免不必要 padding；
+- 轴长度小于 patch 长度时，从索引 0 开始并只在轴末端做右侧 padding；横向轴和采样轴采用相同规则；
+- 原始 invalid 位置和 padding 位置的 normalized seismic 固定为 0；
+- 原始 invalid 位置和 padding 位置的 normalized LFM 固定为 0；
+- 原始 invalid 位置和 padding 位置的 valid mask 固定为 0；
+- 这些零表示实验 normalization 下的参考中心，不表示物理地震或物理 LFM 为零；
+- 只有原始轴内的 valid 点参与 stitching，padding 和原始 invalid 点永不参与累计。
 
 生产拼接固定为 uniform：
 
@@ -457,6 +565,7 @@ R0 配置按模型实验目录加载，输出以 `experiment_id` 为键。多个
 
 ```yaml
 real_field_zero_shot:
+  allow_cross_field_adapted_checkpoint: false
   models:
     - experiment_dir: experiments/ginn_v2/results/trace_baseline
     - experiment_dir: experiments/ginn_v2/results/lateral_model
@@ -480,23 +589,35 @@ R1 使用同一 `experiment_id` 和 comparison ID。单模型诊断不要求 com
 至少记录：
 
 - `experiment_id`；
-- architecture ID、参数、感受野和参数量；
+- architecture ID、kernel/dilation/mixer 合同、实例计算的双轴感受野和参数量；
 - 固定输入/输出语义；
 - normalization reference、统计量和输入合同；
-- 全部 source 路径、schema 和指纹；
+- 全部 source 路径、schema 和已有的直接上游合同指纹；
 - 有序 stage 配置；
 - 每阶段实际 loss blocks、update interval、采样 seed 和 optimizer；
-- 每阶段 best/final checkpoint 与 selection metric；
+- 每阶段 best/final checkpoint、selection metric、验证模式和验证索引文件；
 - deployment checkpoint；
 - sample domain、sample unit、depth basis；
-- 时间/深度正演算子和 forward inputs；
-- 代码版本和完整实验合同指纹。
+- 时间/深度正演算子、有效支撑阈值和 forward inputs；
+- 所有真实 physics adaptation source；
+- 代码版本和单个实验级合同指纹。
+
+指纹的边界保持克制：实验 manifest 可以记录现有直接上游合同的指纹，并为解析后的完整实验合同生成一个实验级指纹。checkpoint、patch/验证索引、batch 序列、指标、图件、数组和其他输出文件不单独计算摘要，也不建立递归的祖先指纹链。
 
 ### 10.2 Checkpoint
 
 新 schema：`ginn_v2_checkpoint_v4`。
 
-checkpoint 记录纯 architecture ID、architecture 参数、直接 delta logAI 输出契约、固定 normalization、sample-axis 合同、所属 experiment/stage、checkpoint kind 和模型权重。
+checkpoint 记录纯 architecture ID、完整 architecture 合同、直接 delta logAI 输出契约、固定 normalization、sample-axis 合同、所属 experiment/stage、checkpoint kind 和模型权重。
+
+deployment checkpoint 还必须记录 patch deployment contract：
+
+- `lateral_samples`、`vertical_samples`；
+- `lateral_stride`、`vertical_stride`；
+- 轴末端窗口起点规则；
+- 短轴右侧 padding 规则；
+- invalid/padding 三通道填充值；
+- uniform stitching 和全覆盖后置条件。
 
 optimizer 状态可以存在于阶段恢复 checkpoint，但 deployment checkpoint 不依赖它。
 
@@ -516,7 +637,7 @@ R0 模型产物不得再出现 `model_role`。所有模型引用使用 `experime
 - 旧的十个带训练语义 model ID；
 - 包含 `model_role`、全局 `min_valid_fraction` 或 normalized delta 输出语义的配置；
 - `ginn_v2_checkpoint_v3` 及更早 checkpoint；
-- 缺少 architecture、normalization reference、stages 或 deployment checkpoint 的 manifest；
+- 缺少 architecture、normalization reference、stages 或已解析 deployment checkpoint 的 manifest；
 - R0/R1 中按 `no_lateral`/`lateral` 猜测模型身份的旧配置。
 
 错误信息必须包含实际 schema、期望 schema 和新配置文档入口。不得自动翻译旧 ID、注入默认 stage、从 checkpoint 文件名推断训练配方或补造归一化统计量。
@@ -567,6 +688,8 @@ R0 模型产物不得再出现 `model_role`。所有模型引用使用 `experime
 - supervised → physics → supervised；
 - 同阶段多 block、不同 update interval；
 - batch 序列在相同 seed 下完全一致；
+- `SeedSequence` 派生结果跨进程一致；
+- full/fixed-steps 验证量和冻结索引顺序可复现；
 - 下一阶段默认加载上一阶段 best；
 - 显式加载先前 final；
 - optimizer 状态未跨阶段继承。
@@ -575,10 +698,16 @@ R0 模型产物不得再出现 `model_role`。所有模型引用使用 `experime
 
 - 时间域和深度域的合成 physics 前向、反向和有限梯度；
 - 时间域和深度域的真实 physics 连续有效段；
+- 模型输入 seismic 与 physics target 使用不同冻结数据流，互换时测试失败；
+- forward-support-safe mask 排除穿越无效区或 patch 边界的输出；
+- patch 级标准化保留 patch 内 trace 间相对振幅，且不跨 batch item 共享统计量；
+- centered mean/RMS 的合成侧梯度有限且非零；
+- mask 外标准化值严格为零；
 - real-only physics-first 不读取 synthetic delta 统计量；
 - masked RMS 对整体振幅缩放不敏感；
-- 零 RMS、单样点区段和非有限输入明确排除或失败；
+- 低于 min RMS、单样点区段和非有限输入按原因计数；全 batch/索引无有效 item 时失败；
 - delta L2 对常量漂移产生非零约束。
+- 四项振幅可识别性诊断及跳过计数可复算。
 
 ### 13.4 真实井
 
@@ -593,6 +722,7 @@ R0 模型产物不得再出现 `model_role`。所有模型引用使用 `experime
 - invalid 点保持 NaN，valid 点全部有限；
 - inline 步长 1、xline 步长 4；
 - 轴首尾和不足 stride 的末端窗口；
+- 短轴右侧 padding 和三通道零填充值；
 - center-crop 配置进入生产 R0 时明确拒绝；
 - 支持度数组和摘要可复算；
 - inline 1661、xline 4599–5079 薄有效带 fixture 全覆盖，即使窗口有效率约 10%。
@@ -602,6 +732,7 @@ R0 模型产物不得再出现 `model_role`。所有模型引用使用 `experime
 - 任意合法 experiment ID 的 R0/R1；
 - 显式 comparison 的左右引用和轴一致性；
 - 跨工区使用时记录 provenance 并执行 OOD QC；
+- field-adapted checkpoint 跨工区默认拒绝，显式 override 后才允许；
 - 所有旧配置、旧模型 ID、旧 checkpoint 和旧 R0/R1 schema 明确失败。
 
 ## 14. 验收条件

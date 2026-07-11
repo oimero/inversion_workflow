@@ -125,17 +125,22 @@ def _row_split(
 
 def _aligned_arrays(
     sample: Any,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     target = np.asarray(sample.target_log_ai, dtype=np.float32)
     seismic = np.asarray(sample.seismic_input, dtype=np.float32)
     lfm = np.asarray(sample.priors["lfm_controlled_degraded"], dtype=np.float32)
     valid = np.asarray(sample.valid_mask, dtype=bool)
-    if str(getattr(sample, "sample_domain", "")) == "depth":
-        if seismic.shape != target.shape:
-            raise ValueError(
-                f"Depth v3 requires N-point seismic/target alignment for {sample.sample_id}: "
-                f"{seismic.shape} vs {target.shape}"
-            )
+    sample_domain = str(getattr(sample, "sample_domain", ""))
+    if sample_domain not in {"time", "depth"}:
+        raise ValueError(
+            f"Unsupported sample domain for {sample.sample_id}: {sample_domain!r}"
+        )
+    if seismic.shape != target.shape:
+        raise ValueError(
+            f"{sample_domain.capitalize()} v3 requires N-point seismic/target alignment "
+            f"for {sample.sample_id}: {seismic.shape} vs {target.shape}"
+        )
+    if sample_domain == "depth":
         observed_valid = np.asarray(sample.observed_valid_mask, dtype=bool)
         if observed_valid.shape != target.shape:
             raise ValueError(
@@ -153,23 +158,10 @@ def _aligned_arrays(
             f"Shape mismatch for {sample.sample_id}: target={target.shape}, "
             f"seismic={seismic.shape}, lfm={lfm.shape}, valid={valid.shape}"
         )
-    raw_twt_offset_samples = 0
-    if str(getattr(sample, "sample_domain", "")) in {"depth"}:
-        raw_twt_offset_samples = 0
-    elif seismic.shape[1] == target.shape[1] - 1:
-        target = target[:, 1:]
-        lfm = lfm[:, 1:]
-        valid = valid[:, 1:]
-        raw_twt_offset_samples = 1
-    elif seismic.shape[1] != target.shape[1]:
-        raise ValueError(
-            f"Unsupported seismic/target time shape for {sample.sample_id}: "
-            f"{seismic.shape[1]} vs {target.shape[1]}"
-        )
     effective_valid = (
         valid & np.isfinite(target) & np.isfinite(seismic) & np.isfinite(lfm)
     )
-    return target, seismic, lfm, effective_valid, raw_twt_offset_samples
+    return target, seismic, lfm, effective_valid
 
 
 def _window_starts(size: int, window: int, stride: int) -> list[int]:
@@ -209,7 +201,7 @@ def build_patch_index(
     )
     for sample_id in sample_ids:
         sample = benchmark.load_sample(sample_id)
-        target, _, _, valid, raw_twt_offset_samples = _aligned_arrays(sample)
+        target, _, _, valid = _aligned_arrays(sample)
         n_lateral, n_twt = target.shape
         lateral_starts = _window_starts(
             n_lateral, patch_spec.lateral_samples, patch_spec.lateral_stride
@@ -256,12 +248,7 @@ def build_patch_index(
                         "twt_stop": twt_start + patch_spec.twt_samples,
                         "model_twt_start": twt_start,
                         "model_twt_stop": twt_start + patch_spec.twt_samples,
-                        "raw_twt_offset_samples": raw_twt_offset_samples,
-                        "time_alignment_mode": (
-                            "target_lfm_mask_drop_first_sample_when_seismic_uses_forward_axis"
-                            if raw_twt_offset_samples
-                            else "native_model_grid"
-                        ),
+                        "time_alignment_mode": "explicit_lower_interface_N_point_operator",
                         "patch_lateral_samples": patch_spec.lateral_samples,
                         "patch_twt_samples": patch_spec.twt_samples,
                         "valid_fraction": valid_fraction,
@@ -354,7 +341,7 @@ def compute_normalization(
         if sample_id not in samples:
             samples[sample_id] = benchmark.load_sample(sample_id)
         sample = samples[sample_id]
-        target, seismic, lfm, valid, _ = _aligned_arrays(sample)
+        target, seismic, lfm, valid = _aligned_arrays(sample)
         sl = _row_slice(row)
         patch_valid = valid[sl]
         patch_target = target[sl]
@@ -367,7 +354,7 @@ def compute_normalization(
     stats = {
         "normalization_scope": "train_only",
         "normalization_mask": "valid_mask_model",
-        "time_alignment": "target_lfm_mask_drop_first_sample_when_seismic_uses_forward_axis",
+        "time_alignment": "explicit_lower_interface_N_point_operator",
     }
     for key, chunks in buckets.items():
         values = np.concatenate([chunk for chunk in chunks if chunk.size])
@@ -397,7 +384,7 @@ def compute_input_reference_stats(
         if sample_id not in samples:
             samples[sample_id] = benchmark.load_sample(sample_id)
         sample = samples[sample_id]
-        target, seismic, lfm, valid, _ = _aligned_arrays(sample)
+        target, seismic, lfm, valid = _aligned_arrays(sample)
         sl = _row_slice(row)
         patch_valid = valid[sl]
         if input_name == "seismic":
@@ -465,7 +452,7 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         row = self.frame.iloc[int(index)].to_dict()
         sample = self.benchmark.load_sample(str(row["sample_id"]))
-        target, seismic, lfm, valid, _ = _aligned_arrays(sample)
+        target, seismic, lfm, valid = _aligned_arrays(sample)
         sl = _row_slice(row)
         target_patch = target[sl]
         seismic_patch = seismic[sl]
@@ -488,8 +475,6 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
                 f"lfm_ideal lateral shape mismatch for {sample.sample_id}: "
                 f"{lfm_ideal.shape} vs {target.shape}"
             )
-        if lfm_ideal.shape[1] == target.shape[1] + 1:
-            lfm_ideal = lfm_ideal[:, 1:]
         if lfm_ideal.shape != target.shape:
             raise ValueError(
                 f"lfm_ideal/target shape mismatch for {sample.sample_id}: "

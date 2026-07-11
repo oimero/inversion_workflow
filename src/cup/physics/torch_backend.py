@@ -53,10 +53,11 @@ def _validate_wavelet(
     if bool(torch.any(differences <= 0.0).item()):
         raise ValueError("wavelet_time_s must be strictly increasing.")
     dt_s = differences[0]
+    regular_rtol = max(1e-6, 64.0 * torch.finfo(time.dtype).eps)
     if not torch.allclose(
         differences,
         dt_s.expand_as(differences),
-        rtol=1e-6,
+        rtol=regular_rtol,
         atol=1e-12,
     ):
         raise ValueError("wavelet_time_s must be regularly sampled.")

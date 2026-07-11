@@ -50,7 +50,8 @@ def _validate_wavelet(
     if np.any(differences <= 0.0):
         raise ValueError("wavelet_time_s must be strictly increasing.")
     dt_s = float(differences[0])
-    if not np.allclose(differences, dt_s, rtol=1e-6, atol=1e-12):
+    regular_rtol = max(1e-6, 64.0 * np.finfo(time.dtype).eps)
+    if not np.allclose(differences, dt_s, rtol=regular_rtol, atol=1e-12):
         raise ValueError("wavelet_time_s must be regularly sampled.")
     center = time.size // 2
     center_tolerance = max(1e-12, abs(dt_s) * 1e-6)

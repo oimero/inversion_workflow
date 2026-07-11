@@ -986,10 +986,8 @@ def _load_lfm_ideal_patches(
     patches: list[np.ndarray] = []
     for _, row in index.iterrows():
         sample = benchmark.load_sample(str(row["sample_id"]))
-        target, _, _, _, _ = _aligned_arrays(sample)
+        target, _, _, _ = _aligned_arrays(sample)
         lfm_ideal = np.asarray(sample.priors["lfm_ideal"], dtype=np.float32)
-        if lfm_ideal.shape[1] == target.shape[1] + 1:
-            lfm_ideal = lfm_ideal[:, 1:]
         if lfm_ideal.shape != target.shape:
             raise ValueError(
                 f"lfm_ideal/target shape mismatch for {sample.sample_id}: "
@@ -1030,7 +1028,7 @@ def _geometry_patch_metrics(
             if geometry is None:
                 geometry = _read_geometry_masks(h5, root)
                 geometry_cache[root] = geometry
-            sl = _patch_slice(row, offset=int(row.get("raw_twt_offset_samples", 0) or 0))
+            sl = _patch_slice(row, offset=0)
             boundary = geometry["boundary_mask_model"][sl]
             event = geometry["geometry_event_mask_model"][sl]
             valid = (

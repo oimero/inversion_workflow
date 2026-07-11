@@ -234,16 +234,26 @@ def _load_seismic_reference_payload(*, run_cfg: dict, models: list[dict]) -> dic
     if explicit:
         stats_path = resolve_relative_path(explicit, root=REPO_ROOT)
     else:
-        first_model = dict(models[0])
-        model_run_dir = resolve_relative_path(str(first_model["experiment_dir"]), root=REPO_ROOT)
-        manifest_path = model_run_dir / "model_run_manifest.json"
-        stats_path = model_run_dir / "input_reference_stats.json"
-        if manifest_path.is_file():
-            with manifest_path.open("r", encoding="utf-8") as handle:
-                manifest = json.load(handle)
-            manifest_stats = str(manifest.get("input_reference_stats") or "").strip()
-            if manifest_stats:
-                stats_path = resolve_relative_path(manifest_stats, root=REPO_ROOT)
+        model_stats: list[tuple[Path, dict[str, object]]] = []
+        for model in models:
+            model_run_dir = resolve_relative_path(str(model["experiment_dir"]), root=REPO_ROOT)
+            candidate = model_run_dir / "input_reference_stats.json"
+            if not candidate.is_file():
+                raise FileNotFoundError(
+                    f"seismic_value_transform requires frozen input reference stats: {candidate}"
+                )
+            with candidate.open("r", encoding="utf-8") as handle:
+                candidate_payload = json.load(handle)
+            candidate_stats = candidate_payload.get("stats")
+            if not isinstance(candidate_stats, dict):
+                raise ValueError(f"Input reference stats file lacks 'stats' object: {candidate}")
+            model_stats.append((candidate, candidate_stats))
+        stats_path, shared_stats = model_stats[0]
+        if any(stats != shared_stats for _, stats in model_stats[1:]):
+            raise ValueError(
+                "Models in one R0 run must share identical input reference stats. "
+                "Run experiments with different input contracts separately."
+            )
     if not stats_path.is_file():
         raise FileNotFoundError(
             "seismic_value_transform requires frozen input reference stats. "

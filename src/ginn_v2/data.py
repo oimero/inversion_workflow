@@ -340,11 +340,12 @@ def compute_normalization(
         patch_target = target[sl]
         patch_seismic = seismic[sl]
         patch_lfm = lfm[sl]
-        buckets["seismic"].append(_finite_values(patch_seismic, patch_valid))
-        buckets["lfm"].append(_finite_values(patch_lfm, patch_valid))
+        input_valid = np.isfinite(patch_seismic) & np.isfinite(patch_lfm)
+        buckets["seismic"].append(_finite_values(patch_seismic, input_valid))
+        buckets["lfm"].append(_finite_values(patch_lfm, input_valid))
     stats = {
         "normalization_scope": "train_only",
-        "normalization_mask": "valid_mask_model",
+        "normalization_mask": "finite_non_padding",
         "time_alignment": "explicit_lower_interface_N_point_operator",
     }
     for key, chunks in buckets.items():
@@ -377,7 +378,7 @@ def compute_input_reference_stats(
         sample = samples[sample_id]
         target, seismic, lfm, valid = _aligned_arrays(sample)
         sl = _row_slice(row)
-        patch_valid = valid[sl]
+        patch_valid = np.isfinite(seismic[sl]) & np.isfinite(lfm[sl])
         if input_name == "seismic":
             chunks.append(_finite_values(seismic[sl], patch_valid))
         elif input_name == "lfm":
@@ -450,11 +451,12 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         lfm_patch = lfm[sl]
         forward_lfm_patch = np.asarray(lfm_patch, dtype=np.float32)
         valid_patch = valid[sl]
+        input_valid_patch = np.isfinite(seismic_patch) & np.isfinite(lfm_patch)
         delta = target_patch - lfm_patch
         seismic_n = _norm(seismic_patch, self.normalization["seismic"])
         lfm_n = _norm(lfm_patch, self.normalization["lfm"])
-        seismic_n = np.where(valid_patch & np.isfinite(seismic_n), seismic_n, 0.0)
-        lfm_n = np.where(valid_patch & np.isfinite(lfm_n), lfm_n, 0.0)
+        seismic_n = np.where(input_valid_patch & np.isfinite(seismic_n), seismic_n, 0.0)
+        lfm_n = np.where(input_valid_patch & np.isfinite(lfm_n), lfm_n, 0.0)
         delta = np.where(valid_patch & np.isfinite(delta), delta, 0.0)
         target_patch = np.where(
             valid_patch & np.isfinite(target_patch), target_patch, 0.0
@@ -476,13 +478,11 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             lfm_ideal[sl],
             0.0,
         )
-        if hasattr(sample, "seismic_model_consistent") and hasattr(
-            sample, "physics_valid_mask"
-        ):
+        if hasattr(sample, "seismic_model_consistent"):
             seismic_model_consistent = np.asarray(
                 sample.seismic_model_consistent, dtype=np.float32
             )
-            physics_valid = np.asarray(sample.physics_valid_mask, dtype=bool)
+            physics_valid = np.isfinite(seismic_model_consistent) & np.isfinite(lfm)
             if (
                 seismic_model_consistent.shape != target.shape
                 or physics_valid.shape != target.shape
@@ -537,7 +537,7 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             "seismic_model_consistent": torch.from_numpy(
                 physics_seismic_patch.astype(np.float32)
             )[None, :, :],
-            "physics_valid_mask": torch.from_numpy(
+            "waveform_valid_mask": torch.from_numpy(
                 physics_valid_patch.astype(np.float32)
             )[None, :, :],
             "sample_axis": torch.from_numpy(sample_axis_patch.astype(np.float64)),

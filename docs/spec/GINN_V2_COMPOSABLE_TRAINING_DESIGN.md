@@ -350,7 +350,7 @@ block 先构造自身最终监督 mask。只有监督 mask 中有效样点数不
 `min_valid_samples` 的计数单位由 block kind 固定：
 
 - `synthetic_supervised`：label-valid 网格样点；
-- `physics`：最终 forward-support-safe waveform 样点；
+- `physics`：观测、LFM 和物理目标均有限且不属于 padding 的 waveform 样点；
 - `real_well_supervised`：有效井监督点。
 
 不得用 input-valid 数量代替上述 block 专属计数。
@@ -391,16 +391,15 @@ L_physics = L_waveform + delta_l2_weight * L_delta
 
 时间域使用公共 PyTorch `forward_time`。深度域使用冻结 AI–Vp 关系从预测 AI 派生 Vp，再调用公共 PyTorch `forward_depth`。核心正演输入全部来自 source 合同。
 
-waveform loss 使用的 mask 必须是 forward-support-safe 布尔 mask，而不是 input-valid mask。子波有效支撑阈值固定使用公共 `DEFAULT_ACTIVE_SUPPORT_THRESHOLD=0.05`，并写入 source 与 stage manifest。对某个输出样点，正演算子中所有超过该阈值的有效贡献界面必须位于同一个连续有效段内，且不能穿过 patch 边界；否则该输出样点不参与 waveform loss。
+physics 使用完整、连续且有限的 LFM patch 作为背景。模型在整个 patch 输出 delta，正演一次性处理完整 patch，不按目标层切段，不在目标 mask 外强制 delta 为零，也不对子波支撑构造额外腐蚀 mask。
 
-时间域可以按子波有效半支撑构造布尔腐蚀；深度域必须按当前位置速度和非平稳算子支撑判断。该操作只判定物理上下文是否合法，不引入软权重，因此不属于 taper。
+waveform loss 的 mask 只表示观测、LFM 和合成目标是否有限，以及样点是否属于真实数据而非 padding。第三个网络输入通道仍表示主要解释区域，但它是模型提示，不是正演边界，也不决定 waveform loss 的范围。合成标签的 label-valid mask 只用于监督损失。
 
 #### 合成 source
 
 - 观测目标固定为 `seismic_model_consistent`；
 - 不把含噪声、gain、相位或静差的 seismic variant 当作物理真值；
-- `physics_valid_mask` 必须遵守同一 forward-support-safe 契约；
-- 在 `physics_valid_mask` 上计算原始振幅 masked MSE。
+- 在观测目标、LFM 均有限且不属于 padding 的样点上计算原始振幅 masked MSE。
 
 ```text
 L_waveform_synthetic = sum(mask * (pred_seismic - seismic_model_consistent)^2)
@@ -409,33 +408,31 @@ L_waveform_synthetic = sum(mask * (pred_seismic - seismic_model_consistent)^2)
 
 #### 真实 source
 
-每道按连续 input-valid 区段独立构造正演输入。区段之间不插值、不连接，也不填充虚构 AI。最终 waveform-safe mask 还必须排除正演支撑穿过区段或 patch 边界的样点。
+对完整 patch 执行一次连续正演。真实地震、LFM 或合成波形非有限以及 patch padding 的样点不参与 waveform loss；目标层边界不裁剪正演输入和损失。
 
 标准化粒度固定为单个 batch item/patch，不是单道，也不跨 batch item 共享统计量。这样保留一个 patch 内不同 trace 的相对振幅关系。
 
-对于 patch 张量 `x` 和完整 waveform-safe mask `m`：
+对于 patch 张量 `x` 和 finite/padding mask `m`：
 
 ```text
 masked_mean(x, m) = sum(m * x) / sum(m)
-centered_rms(x, m) = sqrt(
-    sum(m * (x - masked_mean(x, m))^2) / sum(m)
-    + centered_rms_epsilon
-)
+centered_rms(x, m) = sqrt(sum(m * (x - masked_mean(x, m))^2) / sum(m))
+denominator(x, m) = max(centered_rms(x, m), sqrt(centered_rms_epsilon))
 standardize(x, m) = where(
     m,
-    (x - masked_mean(x, m)) / centered_rms(x, m),
+    (x - masked_mean(x, m)) / denominator(x, m),
     0
 )
 ```
 
-观测和合成分别计算自己的 mean 与 centered RMS，但使用同一个 waveform-safe mask。合成侧统计量不 detach，梯度必须穿过 mean、centered RMS 和标准化运算。
+观测和合成分别计算自己的 mean 与 centered RMS，但使用同一个 finite/padding mask。合成侧统计量不 detach，梯度必须穿过 mean、centered RMS 和标准化运算。
 
 `centered_rms_epsilon` 必须为有限正数，默认 `1e-12`；`min_centered_rms` 必须为有限正数，默认 `1e-6`。任一侧 centered RMS 小于 `min_centered_rms` 时，该 patch 的 waveform item 无效：训练器跳过该 item、增加带原因的计数并写入 epoch 指标。若一个 batch 或冻结数据索引没有任何有效 waveform item，则明确失败，禁止产生 NaN loss。
 
 ```text
 L_waveform_real = masked_mse(
-    standardize(pred_seismic, waveform_safe_mask),
-    standardize(seismic_physics_target, waveform_safe_mask)
+    standardize(pred_seismic, finite_padding_mask),
+    standardize(seismic_physics_target, finite_padding_mask)
 )
 ```
 
@@ -697,9 +694,9 @@ R0 模型产物不得再出现 `model_role`。所有模型引用使用 `experime
 ### 13.3 物理损失
 
 - 时间域和深度域的合成 physics 前向、反向和有限梯度；
-- 时间域和深度域的真实 physics 连续有效段；
+- 时间域和深度域的真实 physics 完整连续 patch；
 - 模型输入 seismic 与 physics target 使用不同冻结数据流，互换时测试失败；
-- forward-support-safe mask 排除穿越无效区或 patch 边界的输出；
+- 目标层 mask 不裁剪正演、不限制 waveform loss，也不强制 mask 外 delta 为零；
 - patch 级标准化保留 patch 内 trace 间相对振幅，且不跨 batch item 共享统计量；
 - centered mean/RMS 的合成侧梯度有限且非零；
 - mask 外标准化值严格为零；

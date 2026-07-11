@@ -11,7 +11,6 @@ from typing import Any, Iterator, Mapping
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from cup.synthetic.dataset import SynthoseisBenchmark
@@ -67,6 +66,8 @@ class RealFieldPatchDataset(Dataset[dict[str, Any]]):
         lfm = self.model_volume.lfm[inline, lateral, vertical]
         forward_lfm = np.asarray(lfm, dtype=np.float32)
         valid = self.model_volume.valid_mask[inline, lateral, vertical]
+        input_valid = np.isfinite(seismic) & np.isfinite(lfm)
+        physics_valid = input_valid & np.isfinite(target)
         shape = (self.patch_spec.lateral_samples, self.patch_spec.twt_samples)
         padding = ((0, shape[0] - valid.shape[0]), (0, shape[1] - valid.shape[1]))
         seismic = np.pad(seismic, padding, constant_values=0.0)
@@ -74,8 +75,10 @@ class RealFieldPatchDataset(Dataset[dict[str, Any]]):
         lfm = np.pad(lfm, padding, constant_values=0.0)
         forward_lfm = np.pad(forward_lfm, padding, constant_values=np.nan)
         valid = np.pad(valid, padding, constant_values=False)
-        seismic_n = np.where(valid, (seismic - float(self.normalization["seismic"]["mean"])) / float(self.normalization["seismic"]["std"]), 0.0)
-        lfm_n = np.where(valid, (lfm - float(self.normalization["lfm"]["mean"])) / float(self.normalization["lfm"]["std"]), 0.0)
+        input_valid = np.pad(input_valid, padding, constant_values=False)
+        physics_valid = np.pad(physics_valid, padding, constant_values=False)
+        seismic_n = np.where(input_valid, (seismic - float(self.normalization["seismic"]["mean"])) / float(self.normalization["seismic"]["std"]), 0.0)
+        lfm_n = np.where(input_valid, (lfm - float(self.normalization["lfm"]["mean"])) / float(self.normalization["lfm"]["std"]), 0.0)
         inputs = np.stack([seismic_n, lfm_n, valid.astype(np.float32)], axis=0).astype(np.float32)
         axis = self.model_volume.sample_axis.values[vertical]
         if len(axis) < shape[1]:
@@ -86,8 +89,8 @@ class RealFieldPatchDataset(Dataset[dict[str, Any]]):
             "lfm": torch.from_numpy(np.where(valid, lfm, 0.0).astype(np.float32))[None],
             "forward_lfm": torch.from_numpy(forward_lfm)[None],
             "valid_mask": torch.from_numpy(valid.astype(np.float32))[None],
-            "physics_valid_mask": torch.from_numpy(valid.astype(np.float32))[None],
-            "seismic_model_consistent": torch.from_numpy(np.where(valid, target, 0.0).astype(np.float32))[None],
+            "waveform_valid_mask": torch.from_numpy(physics_valid.astype(np.float32))[None],
+            "seismic_model_consistent": torch.from_numpy(np.where(physics_valid, target, 0.0).astype(np.float32))[None],
             "sample_axis": torch.from_numpy(np.asarray(axis, dtype=np.float64)),
             "patch_id": str(row["patch_id"]),
         }
@@ -216,7 +219,6 @@ def _synthetic_sample_kinds(source: Mapping[str, Any]) -> set[str]:
 def _prepare_synthetic_indices(
     *, benchmark: SynthoseisBenchmark, source: Mapping[str, Any], patch_spec: PatchSpec,
     blocks: list[Mapping[str, Any]], output_dir: Path,
-    wavelet_amp: np.ndarray | None = None,
 ) -> dict[str, pd.DataFrame]:
     result = {}
     for block in blocks:
@@ -225,32 +227,27 @@ def _prepare_synthetic_indices(
             benchmark,
             patch_spec=patch_spec,
             sample_kinds=_synthetic_sample_kinds(source),
-            min_valid_samples=int(block["min_valid_samples"]),
+            min_valid_samples=(1 if block["kind"] == "physics" else int(block["min_valid_samples"])),
             max_patches=(int(source["max_patches"]) if source.get("max_patches") is not None else None),
         )
         if block["kind"] == "physics":
-            if wavelet_amp is None:
-                raise ValueError(f"Physics block {block_id} requires a frozen wavelet before indexing.")
-            # Physics target is defined only where its final target mask is valid.
             counts = []
             cache: dict[str, Any] = {}
             for _, row in index.iterrows():
                 sample_id = str(row["sample_id"])
                 sample = cache.setdefault(sample_id, benchmark.load_sample(sample_id))
-                if str(sample.sample_domain) == "depth":
-                    lfm_context = np.asarray(sample.priors["lfm_controlled_degraded"], dtype=np.float64)[
-                        int(row["lateral_start"]):int(row["lateral_stop"]),
-                        int(row["twt_start"]):int(row["twt_stop"]),
-                    ]
-                    if not np.all(np.isfinite(lfm_context)):
-                        counts.append(0)
-                        continue
-                mask = np.asarray(sample.physics_valid_mask, dtype=bool)[
+                lfm_context = np.asarray(sample.priors["lfm_controlled_degraded"], dtype=np.float64)[
                     int(row["lateral_start"]):int(row["lateral_stop"]),
                     int(row["twt_start"]):int(row["twt_stop"]),
                 ]
-                safe = _forward_support_safe_mask_numpy(mask, wavelet_amp)
-                counts.append(int(np.count_nonzero(safe)))
+                if not np.all(np.isfinite(lfm_context)):
+                    counts.append(0)
+                    continue
+                physics_target = np.asarray(sample.seismic_model_consistent, dtype=np.float64)[
+                    int(row["lateral_start"]):int(row["lateral_stop"]),
+                    int(row["twt_start"]):int(row["twt_stop"]),
+                ]
+                counts.append(int(np.count_nonzero(np.isfinite(physics_target) & np.isfinite(lfm_context))))
             index["supervision_valid_samples"] = counts
             index = index[index["supervision_valid_samples"] >= int(block["min_valid_samples"])].copy()
         if source.get("max_patches") is not None and "validation" not in set(index["split"].astype(str)):
@@ -316,15 +313,18 @@ def _input_reference_stats_for_real(
     volume: RealFieldVolume, train_inline_indices: np.ndarray,
 ) -> dict[str, float]:
     values = np.asarray(volume.seismic, dtype=np.float64)[train_inline_indices]
-    valid = volume.valid_mask[train_inline_indices] & np.isfinite(values)
+    valid = np.isfinite(values) & np.isfinite(volume.lfm[train_inline_indices])
     return finite_summary_stats(values[valid])
 
 
 def _normalization_for_real(volume: RealFieldVolume, train_inline_indices: np.ndarray) -> dict[str, Any]:
     if train_inline_indices.size == 0:
         raise ValueError("Real normalization reference has no training spatial support.")
-    valid = volume.valid_mask[train_inline_indices]
-    result: dict[str, Any] = {"normalization_scope": "reference_source_train_partition", "normalization_mask": "valid_mask_model"}
+    valid = (
+        np.isfinite(volume.seismic[train_inline_indices])
+        & np.isfinite(volume.lfm[train_inline_indices])
+    )
+    result: dict[str, Any] = {"normalization_scope": "reference_source_train_partition", "normalization_mask": "finite_non_padding"}
     for name, values in (("seismic", volume.seismic), ("lfm", volume.lfm)):
         selected = np.asarray(values, dtype=np.float64)[train_inline_indices][valid]
         std = float(np.std(selected))
@@ -337,7 +337,6 @@ def _normalization_for_real(volume: RealFieldVolume, train_inline_indices: np.nd
 def _real_patch_rows(
     volume: RealFieldVolume, *, patch_spec: PatchSpec, min_valid_samples: int,
     validation: Mapping[str, Any], geometry: Any,
-    wavelet_amp: np.ndarray | None = None,
 ) -> pd.DataFrame:
     fraction = float(validation.get("fraction", 0.1))
     if not 0 < fraction < 1:
@@ -370,8 +369,9 @@ def _real_patch_rows(
             split = "train" if distance_to_validation_m >= gap_m else "gap"
         if split == "gap":
             continue
+        data_valid = np.isfinite(volume.seismic[inline_index]) & np.isfinite(volume.lfm[inline_index])
         for patch_index, patch in enumerate(build_real_field_patch_index(
-            volume.valid_mask[inline_index], lateral_samples=patch_spec.lateral_samples,
+            data_valid, lateral_samples=patch_spec.lateral_samples,
             vertical_samples=patch_spec.twt_samples, lateral_stride=patch_spec.lateral_stride,
             vertical_stride=patch_spec.twt_stride,
         )):
@@ -379,18 +379,13 @@ def _real_patch_rows(
                 inline_index, patch.lateral_start:patch.lateral_stop,
                 patch.sample_start:patch.sample_stop,
             ]
-            if volume.sample_axis.domain == "depth" and (
+            if (
                 lfm_context.shape != (patch_spec.lateral_samples, patch_spec.twt_samples)
                 or not np.all(np.isfinite(lfm_context))
             ):
                 continue
-            mask = volume.valid_mask[inline_index, patch.lateral_start:patch.lateral_stop, patch.sample_start:patch.sample_stop]
-            final_mask = (
-                _forward_support_safe_mask_numpy(mask, wavelet_amp)
-                if wavelet_amp is not None
-                else mask
-            )
-            count = int(np.count_nonzero(final_mask))
+            mask = data_valid[patch.lateral_start:patch.lateral_stop, patch.sample_start:patch.sample_stop]
+            count = int(np.count_nonzero(mask))
             if count < int(min_valid_samples):
                 continue
             rows.append({
@@ -423,24 +418,6 @@ def _segment_distance_m(left: np.ndarray, right: np.ndarray) -> float:
         _point_segment_distance(right[0], left),
         _point_segment_distance(right[1], left),
     )
-
-
-def _forward_support_safe_mask_numpy(mask: np.ndarray, wavelet: np.ndarray) -> np.ndarray:
-    values = np.asarray(wavelet, dtype=np.float64).reshape(-1)
-    active = np.flatnonzero(np.abs(values) >= 0.05 * np.max(np.abs(values)))
-    if active.size == 0:
-        raise ValueError("Wavelet has no active support at threshold 0.05.")
-    half = int(np.max(np.abs(active - values.size // 2)))
-    valid = np.asarray(mask, dtype=bool)
-    if half == 0:
-        return valid
-    padded = np.pad(valid.astype(np.int32), ((0, 0), (half, half)), constant_values=0)
-    cumulative = np.pad(np.cumsum(padded, axis=-1), ((0, 0), (1, 0)), constant_values=0)
-    width = 2 * half + 1
-    counts = cumulative[:, width:] - cumulative[:, :-width]
-    safe = counts == width
-    safe[np.count_nonzero(safe, axis=-1) < 2, :] = False
-    return safe
 
 
 def _load_real_wavelet(
@@ -484,25 +461,10 @@ def masked_centered_rms(
     weights = flat_m.to(values.dtype)
     mean = (flat_x * weights).sum(dim=1) / count
     centered = flat_x - mean[:, None]
-    rms = torch.sqrt((centered.square() * weights).sum(dim=1) / count + float(epsilon))
-    standardized = torch.where(flat_m, centered / rms[:, None], torch.zeros_like(centered))
+    rms = torch.sqrt((centered.square() * weights).sum(dim=1) / count)
+    denominator = torch.clamp(rms, min=float(epsilon) ** 0.5)
+    standardized = torch.where(flat_m, centered / denominator[:, None], torch.zeros_like(centered))
     return standardized.reshape_as(values), rms
-
-
-def forward_support_safe_mask(mask: torch.Tensor, wavelet: torch.Tensor) -> torch.Tensor:
-    """Conservatively require a complete valid segment across active wavelet support."""
-    active = torch.nonzero(torch.abs(wavelet) >= 0.05 * torch.max(torch.abs(wavelet)), as_tuple=False).flatten()
-    if active.numel() == 0:
-        raise ValueError("Wavelet has no active support at threshold 0.05.")
-    half = int(torch.max(torch.abs(active - wavelet.numel() // 2)).item())
-    if half == 0:
-        return mask > 0.5
-    width = 2 * half + 1
-    flat = (mask > 0.5).to(torch.float32).reshape(-1, 1, mask.shape[-1])
-    counts = F.conv1d(flat, torch.ones((1, 1, width), device=mask.device), padding=half)
-    safe = (counts == width).reshape_as(mask)
-    trace_count = safe.sum(dim=-1, keepdim=True)
-    return safe & (trace_count >= 2)
 
 
 def _block_loss(
@@ -532,17 +494,15 @@ def _block_loss(
     if kind != "physics" or prepared.wavelet is None:
         raise ValueError(f"Unsupported prepared loss block: {kind}")
     forward_lfm = batch["forward_lfm"].to(device)
-    valid = batch["valid_mask"].to(device)
-    pred_log_ai = forward_lfm + prediction * valid
+    physics_valid = batch["waveform_valid_mask"].to(device)
+    pred_log_ai = forward_lfm + prediction
     wavelet_time, wavelet_amp, relation = prepared.wavelet
     if prepared.sample_axis_contract is None:
         raise ValueError(f"Loss block {cfg['block_id']} lacks a sample-axis contract.")
-    if str(prepared.sample_axis_contract["sample_domain"]) == "depth" and not bool(
-        torch.all(torch.isfinite(pred_log_ai))
-    ):
+    if not bool(torch.all(torch.isfinite(pred_log_ai))):
         raise ValueError(
-            "Depth physics requires a complete finite LFM forward context; "
-            "masked or padded logAI context is not accepted."
+            "Physics requires a complete finite LFM patch; padded or non-finite "
+            "logAI context is not accepted."
         )
     synthetic = forward_physics_batch(
         pred_log_ai[:, 0], sample_axes=batch["sample_axis"].to(device),
@@ -550,7 +510,7 @@ def _block_loss(
         wavelet_amp=wavelet_amp, ai_velocity_relation=relation,
     )
     target = batch["seismic_model_consistent"].to(device)[:, 0]
-    mask = forward_support_safe_mask(batch["physics_valid_mask"].to(device)[:, 0], wavelet_amp)
+    mask = physics_valid[:, 0] > 0.5
     enough_waveform = (
         mask.reshape(mask.shape[0], -1).sum(dim=1)
         >= int(cfg["min_valid_samples"])
@@ -559,13 +519,13 @@ def _block_loss(
     if not bool(torch.any(enough_waveform)):
         raise AssertionError(
             "Physics patch index admitted a batch with no item meeting min_valid_samples "
-            "after the frozen forward-support mask."
+            "on finite, non-padding waveform samples."
         )
     synthetic = synthetic[enough_waveform]
     target = target[enough_waveform]
     mask = mask[enough_waveform]
     prediction_for_l2 = prediction[enough_waveform]
-    valid_for_l2 = valid[enough_waveform]
+    valid_for_l2 = physics_valid[enough_waveform]
     if str(cfg.get("source_kind")) == "real_field":
         pred_n, pred_rms = masked_centered_rms(synthetic, mask, epsilon=float(cfg.get("centered_rms_epsilon", 1e-12)))
         target_n, target_rms = masked_centered_rms(target, mask, epsilon=float(cfg.get("centered_rms_epsilon", 1e-12)))
@@ -696,6 +656,7 @@ def run_experiment(
         "lateral_kernel": config.architecture.lateral_kernel,
     }))
     model.to(device)
+    initial_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
     patch_spec = PatchSpec(
         lateral_samples=config.patching.lateral_samples,
         twt_samples=config.patching.vertical_samples,
@@ -832,7 +793,9 @@ def run_experiment(
         stage_dir = output_dir / "stages" / stage_id
         stage_dir.mkdir(parents=True, exist_ok=False)
         initialize = str(stage["initialize_from"])
-        if initialize != "zero":
+        if initialize == "zero":
+            model.load_state_dict(initial_state)
+        else:
             parent_stage, parent_kind = initialize.rsplit(".", 1)
             payload = torch.load(checkpoints[(parent_stage, parent_kind)], map_location="cpu", weights_only=False)
             model.load_state_dict(payload["state_dict"])
@@ -853,7 +816,6 @@ def run_experiment(
                 indices = _prepare_synthetic_indices(
                     benchmark=benchmark, source=source, patch_spec=patch_spec,
                     blocks=[block], output_dir=stage_dir,
-                    wavelet_amp=(wavelet[1].detach().cpu().numpy() if wavelet is not None else None),
                 )[str(block["block_id"])]
                 train_dataset = PatchDataset(benchmark, indices, split="train", normalization=normalization)
                 validation_dataset = PatchDataset(benchmark, indices, split="validation", normalization=normalization)
@@ -869,7 +831,6 @@ def run_experiment(
                     min_valid_samples=int(block["min_valid_samples"]),
                     validation=dict(source.get("validation_split") or {}),
                     geometry=real_geometries[source_id],
-                    wavelet_amp=wavelet[1].detach().cpu().numpy(),
                 )
                 rows.to_csv(stage_dir / f"{block['block_id']}_patch_index.csv", index=False)
                 train_dataset = RealFieldPatchDataset(model_volume, physics_volume, rows[rows["split"] == "train"], normalization, patch_spec)

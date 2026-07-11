@@ -2,8 +2,6 @@
 
 `ginn_v2.py` 是工作流的研究旁路。它把网络架构、数据源、损失函数和训练阶段分别配置，通过受控消融实验揭示不同架构选择和训练策略的实际增益。一个实验由稳定的实验标识管理，产物写入实验目录，可直接用于后续真实工区的零样本推理。
 
-完整字段契约见 [GINN v2 积木式训练设计](../spec/GINN_V2_COMPOSABLE_TRAINING_DESIGN.md)。本文档聚焦实用工作流，不重复规范中的全部字段细节。
-
 ---
 
 ## 快速开始
@@ -47,103 +45,218 @@ python scripts/ginn_v2.py --output-dir scripts/output/ginn_v2_report `
 
 ## 配置参考
 
-配置根节点为 `ginn_v2`，包含以下顶层段：
+GINN v2 的训练配方由五层组件自由组合而成：
+
+```
+实验 identity
+  └─ 架构           ← 网络长什么样（拓扑、容量）
+  └─ 数据源         ← 喂什么数据（合成 / 真实工区 / 井）
+  └─ 损失块         ← 学什么目标（监督 / 物理 / 井约束）
+  └─ 阶段           ← 以什么顺序学（单阶段 / 多阶段序列）
+  └─ 归一化参考     ← 输入标准化从哪算
+```
+
+每一层只管自己的事。架构不知道训练数据从哪来；损失块不知道网络有没有横向混合。**你做消融实验时，只要换其中一层，其他层不用动。**
+
+下面逐一说明每层组件有哪些选项、各自什么意思、怎么选。
+
+---
+
+### 架构：网络长什么样
+
+四个架构的核心差异是**有没有横向视野**——即是否能看到相邻道的信息：
+
+| 架构 | 横向行为 | 纵向行为 | 适用场景 |
+|------|------|------|------|
+| `trace_conv1d` | 逐道独立，完全看不到邻居 | 5 层普通 Conv1d | 最简单的基线——如果没有横向信息，模型能做到什么程度？ |
+| `trace_dilated_tcn` | 逐道独立 | 膨胀 Conv1d，depth=5 时纵向感受野约 125 点 | 单道基线但纵向视野更大——比 trace_conv1d 看得更深 |
+| `trace_lateral_mixer` | 浅层横向混合，视野 = `lateral_kernel`（默认 3） | 同 dilated TCN | **关键消融点**：加了一点点横向信息，效果变好还是变差？ |
+| `patch_conv2d` | 全横向，视野 = `1 + 2*depth` | 同横向视野 | 完全二维——横向信息最多但也最重 |
+
+三个公共参数：
+
+| 参数 | 含义 | 怎么调 |
+|------|------|------|
+| `hidden_channels` | 隐藏层通道数，默认 32 | 越大模型容量越高，但也更容易过拟合合成基准 |
+| `depth` | 网络层数，默认 5，须 ≥ 2 | 越大纵向感受野越大；dilated TCN 族随 depth 指数增长 |
+| `lateral_kernel` | 仅 `trace_lateral_mixer`，须为正奇数 | 默认 3，增大可让横向混合看到更远的道 |
+
+所有架构的输出层权重和偏置初始化为零，所以**训练前的预测严格等于低频模型**——这保证你看到的所有改善都来自训练，不是初始化的偶然。
+
+### 数据源：喂什么数据
+
+用自定义 ID 声明一个或多个数据源（如 `synthetic`、`field`、`wells`）。ID 可以随便取，后面的损失块通过 ID 引用。
+
+**`synthoseis_lite` — 合成基准**
+
+从合成基准旁路产出的冻结数据。这是消融实验的主战场——所有条件完全受控，可以干净地比较架构和训练策略。
+
+| 字段 | 含义 |
+|------|------|
+| `benchmark_dir` | 合成基准目录。填 `auto` 自动发现最新场条件基准 |
+| `input_seismic_variant` | 网络输入用哪种地震。`nominal` 用理想正演；`observed_mismatch` 用加了噪声和子波失配的地震——训练出来的模型更鲁棒 |
+
+`input_seismic_variant` 的选择影响训练样本种类：`nominal` 只用基础样本，`observed_mismatch` 同时用基础样本和失配变体样本。
+
+**`real_field` — 真实工区**
+
+真实工区的地震体和低频模型。它不提供真值标签，只能用于物理约束——让正演合成尽量接近观测地震。
+
+| 字段 | 含义 |
+|------|------|
+| `lfm_run_dir` / `variant_id` | 指向第七步产出的低频模型变体 |
+| `model_input_seismic_transform` | 网络输入前对地震做什么变换。`identity` 不处理；`p99_abs_matched` 按 p99 绝对值归一化 |
+| `physics_target_seismic_transform` | 物理损失的目标地震经过什么变换。可以和模型输入不同——比如网络看 p99 归一化后的地震，但物理损失用原始振幅做比较 |
+| `validation_split` | 训练/验证的空间切分方式。`kind: spatial_block` 按 inline 尾段划出验证区，`gap_m` 控制训练和验证之间的隔离带宽度 |
+| `wavelet_generation_dir` | 仅时间域，指向第五步子波结果目录 |
+| `forward_model_inputs_path` | 仅深度域，指向岩石物理旁路产出的冻结子波和 AI–Vp 关系 |
+
+`model_input_seismic_transform` 和 `physics_target_seismic_transform` 是两条独立管线：输入变换过的是为了让网络好训练，物理目标保持原始振幅是为了让物理约束有意义。两者不能互换。
+
+**`real_wells` — 真实井**
+
+从第六步井控集读取每口井的波阻抗，提供稀疏的绝对阻抗监督。它不独立存在——必须通过 `field_source` 引用一个 `real_field` source，共享该 source 的低频模型和采样轴。
+
+| 字段 | 含义 |
+|------|------|
+| `field_source` | 引用哪个 `real_field` source |
+| `well_control_run_dir` | 第六步井控集目录 |
+| `held_out_well` | 始终不参与训练的井名，用作验证 |
+| `exclude_same_cluster` | 是否同时排除与 held-out 井同空间簇的井 |
+| `cluster_radius_m` | 空间聚类半径，用于均衡采样 |
+
+井按空间位置聚类，每个训练 step 随机选择若干簇、每簇随机选一口井。这样避免了空间相邻井在同一个 batch 里造成梯度重复。
+
+### 损失块：学什么目标
+
+在阶段中声明一个或多个损失块。每个块独立管理自己的 batch、采样器和有效资格判断。
+
+**公共字段（所有 block 都有）：**
+
+| 字段 | 含义 |
+|------|------|
+| `block_id` | 阶段内唯一标识 |
+| `source` | 引用哪个数据源 |
+| `weight` | 该 block 损失在总损失中的权重。多个 block 时先各自算 loss，再按 weight 加权求和 |
+| `update_interval` | 每多少个 step 执行一次该 block。设为 2 表示隔步执行——低频 block 不占每步的计算量 |
+| `batch_size` | 该 block 每个 step 取多少个 patch |
+| `min_valid_samples` | 该 block 对 patch 有效性的最低要求。patch 内有效样点不够就丢弃 |
+
+关键设计：**同一个原始窗口可以进入 block A 而不进入 block B**——每个 block 按自己的 mask 和 `min_valid_samples` 独立判断资格。所以各 block 的训练样本不完全重叠是正常的。
+
+**`synthetic_supervised` — 你有答案**
+
+计算网络输出的 `delta_log_ai` 与合成基准真值 delta 的 MSE。只在有效标签点上计算。
+
+最直接的监督信号。优点是干净、梯度好；缺点是只在合成数据上有——真实工区没有这份答案。
+
+**`physics` — 正演闭环**
+
+把预测波阻抗做正演合成地震记录，和观测地震比波形相似度。这是唯一能在真实工区上使用的无标签约束。
+
+| 特有字段 | 含义 |
+|------|------|
+| `delta_l2_weight` | delta L2 正则的权重。防止模型仅靠正演拟合波形却产生不合理的绝对阻抗值 |
+| `waveform_standardization` | 合成数据固定 `raw`，真实工区固定 `masked_centered_rms`（在 patch 内独立做零均值 RMS 归一化后再比较） |
+
+合成数据上：`总损失 = waveform MSE + delta_l2_weight × (pred_delta² 的均值)`。
+
+真实工区上：观测和合成各自在 patch 内独立做 centered RMS 标准化，比较标准化后的波形。这意味着**正演约束对整体振幅不敏感**——它管的是事件时序、极性、相位——绝对阻抗幅度由 LFM 锚定、delta L2 约束、或来自其他阶段的监督提供。
+
+**`real_well_supervised` — 井告诉你的**
+
+在井位处计算预测 delta 与井控 delta 的 MSE。稀疏但绝对——井上的波阻抗是对的。
+
+只有 training 井参与损失；held-out 井和同簇排除井只做验证。
+
+### 阶段：按什么顺序学
+
+一个实验由一个或多个阶段顺序组成。每个阶段独立配置优化器、训练步数、包含哪些损失块、以及用什么指标选最优 checkpoint。
+
+```
+阶段 1：synthetic_pretrain
+  优化器: AdamW lr=0.001
+  损失: synthetic_supervised (weight=1.0)
+  验证: 全量，选优指标 = synthetic_ai.mse
+
+阶段 2：field_physics
+  优化器: AdamW lr=0.0001   ← 学习率独立设置
+  损失: physics (weight=1.0) + real_well_supervised (weight=0.1, update_interval=4)
+  验证: 固定 100 步，选优指标 = waveform.total
+```
+
+阶段之间只传模型权重。上一阶段的 optimizer 状态（动量、学习率衰减等）全部清零重建。默认从上一阶段 best checkpoint 继承，也可以显式指定 `initialize_from: <stage_id>.final`。
+
+### 如何组合：典型的实验配方
+
+以下是一个完整的两阶段实验配置——先在合成基准上学阻抗反演，再在真实工区上做物理适配：
 
 ```yaml
 ginn_v2:
-  experiment_id: <descriptive-id>      # 必填，决定产物目录名
+  experiment_id: tcn_synthetic_then_field
   seed: 20260617
 
-  architecture:                         # 网络拓扑
+  architecture:
     id: trace_dilated_tcn
     hidden_channels: 32
     depth: 5
 
-  sources:                              # 数据源声明
+  sources:
     synthetic:
       kind: synthoseis_lite
       benchmark_dir: auto
       input_seismic_variant: observed_mismatch
 
-  normalization_reference:              # 归一化统计量的来源
+    field:
+      kind: real_field
+      lfm_run_dir: scripts/output/real_field_lfm_<run>
+      variant_id: trend_baseline
+      model_input_seismic_transform: p99_abs_matched
+      physics_target_seismic_transform: identity
+      validation_split: {kind: spatial_block, fraction: 0.10, gap_m: 250.0}
+      wavelet_generation_dir: scripts/output/wavelet_generation_<run>
+
+  normalization_reference:
     source: synthetic
 
-  patching:                             # 滑动窗口参数
+  patching:
     lateral_samples: 32
     vertical_samples: 128
     lateral_stride: 16
     vertical_stride: 64
 
-  stages:                               # 有序训练阶段列表
+  stages:
     - stage_id: synthetic_pretrain
-      ...
+      epochs: 20
+      steps_per_epoch: 500
+      optimizer: {kind: adamw, learning_rate: 0.001, weight_decay: 0.0001}
+      loss_blocks:
+        - {block_id: synthetic_ai, kind: synthetic_supervised, source: synthetic, weight: 1.0, update_interval: 1, batch_size: 8, min_valid_samples: 128}
+      validation: {selection_metric: synthetic_ai.mse, mode: full}
 
-  deployment_checkpoint: last_stage.best  # 部署时使用的 checkpoint
+    - stage_id: field_physics
+      epochs: 10
+      steps_per_epoch: 300
+      optimizer: {kind: adamw, learning_rate: 0.0001, weight_decay: 0.0001}
+      loss_blocks:
+        - {block_id: waveform, kind: physics, source: field, weight: 1.0, update_interval: 1, batch_size: 8, min_valid_samples: 128, delta_l2_weight: 0.01}
+      validation: {selection_metric: waveform.total, mode: fixed_steps, steps: 100}
+
+  deployment_checkpoint: last_stage.best
 ```
 
-### 架构
+**这个配方在测什么？** 第一阶段在合成数据上学会"从地震推断阻抗"的基本能力。第二阶段把这能力迁移到真实工区——没有任何标签，只靠"正演合成应该像观测地震"这一条物理约束来适应真实数据的分布。通过比较两个阶段的 checkpoint，你可以量化物理适配到底带来了多大改善。
 
-首版提供四类网络，按横向感受野从小到大排列：
+**常见的组合思路：**
 
-| 架构 | 网络 | 横向行为 |
-|------|------|------|
-| `trace_conv1d` | 逐道一维卷积 | 道间独立 |
-| `trace_dilated_tcn` | 逐道膨胀一维 TCN | 道间独立 |
-| `trace_lateral_mixer` | 膨胀 TCN 加浅层横向混合 | 由 mixer 核大小决定 |
-| `patch_conv2d` | 二维卷积 | 由卷积层数决定 |
-
-所有网络固定接收三个输入通道（地震、低频模型、有效掩码），直接输出物理量 `delta_log_ai`。输出层使用零权重和零偏置初始化，因此未训练模型的预测严格等于低频模型。
-
-架构标识只描述网络拓扑，不编码训练样本类型或损失函数。任何架构都可以使用任何首版损失块——能力由组合决定，不由架构限制。
-
-### 数据源
-
-实验可以声明三类数据源，以用户自定义 ID 为键：
-
-| source kind | 提供什么 | 可用损失块 |
-|------|------|------|
-| `synthoseis_lite` | 合成地震、真值 logAI、LFM、一致正演 | 合成监督、物理约束 |
-| `real_field` | 真实地震、工区 LFM、有效掩码 | 物理约束 |
-| `real_wells` | 井 logAI、LFM、空间簇信息 | 真实井监督 |
-
-每个 source 在实验开始时解析一次并冻结。`real_wells` 必须引用一个 `real_field` source——井监督使用该 source 的低频模型和采样轴，不自行发现。
-
-深度域真实物理约束的数据源需要显式填写正演输入合同文件路径；时间域则填写子波结果目录。配置示例见规范文档。
-
-### 损失块
-
-三类损失块与数据源一一对应：
-
-| loss kind | 接受 source | 核心计算 |
-|------|------|------|
-| `synthetic_supervised` | `synthoseis_lite` | 预测 delta logAI 与真值 delta 的 masked MSE |
-| `physics` | `synthoseis_lite` 或 `real_field` | 预测 logAI 正演合成与观测地震的 waveform MSE + delta L2 |
-| `real_well_supervised` | `real_wells` | 井旁预测 delta 与井控 delta 的 MSE |
-
-每个损失块独立声明自己的 batch size、update interval、权重和有效样点下限。一个阶段可以组合多个不同数据源的损失块——到期损失按权重求和后只执行一次参数更新。
-
-物理损失在合成和真实工区上有不同的标准化策略。合成数据使用原始振幅的 masked MSE；真实工区数据在 patch 内独立做 centered RMS 标准化后再比较波形，不引入可训练增益。
-
-### 多阶段训练
-
-阶段按配置顺序执行。每个阶段独立声明：
-
-- 优化器（首版仅支持 AdamW）
-- 训练 epoch 数和每 epoch 的 step 数
-- 包含哪些损失块
-- 验证模式（全量或固定步数）和选优指标
-
-阶段之间只继承模型权重，不继承优化器或调度器状态。默认从上一阶段的最佳 checkpoint 初始化，也可以显式引用更早阶段的 best 或 final。第一阶段使用零初始化模型。
-
-支持的阶段组合包括：监督后物理约束、物理约束后监督、多次交替，以及同阶段多数据源联合训练。
-
-### 旧配置兼容
-
-以下配置会被明确拒绝，错误信息会指明期望的 schema 和文档入口：
-
-- 根节点为旧 `train` 的配置
-- 包含 `model_id`、`model_role`、`min_valid_fraction` 的配置
-- 旧的十个带训练语义的模型标识
+| 你想知道什么 | 怎么组合 |
+|------|------|
+| 架构 A 比架构 B 强吗？ | 两个实验，唯一差异是 `architecture.id`，其余全部相同 |
+| mismatch 训练有用吗？ | `input_seismic_variant: nominal` vs `observed_mismatch`，在 mismatch 验证集上比指标 |
+| 物理约束能改善真实工区迁移吗？ | 阶段 1 纯监督 → 阶段 2 纯物理，对比只用阶段 1 checkpoint 和阶段 2 checkpoint 的 R0 结果 |
+| 井监督比物理约束信号更强吗？ | 阶段 2 加一个 `real_well_supervised` block（小 weight），对比纯物理 |
+| 低频 block 有效吗？ | 对比 `update_interval: 1` vs `update_interval: 4`（同样的总 step 数），看低频 block 是否浪费了计算 |
+| 纯真实工区训练可行吗？ | `normalization_reference.source` 指 `real_field`，只用 `physics` 损失块，不依赖合成标签 |
 
 ---
 
@@ -164,11 +277,12 @@ ginn_v2:
 **4) 构建块索引。** 按 patching 参数和每个损失块的 `min_valid_samples`，为每个 block 独立构建训练和验证的 patch 索引。同一个窗口可以进入一个 block 而不进入另一个——每个 block 根据自己的监督 mask 独立判断资格。合成数据的训练和验证按父实现分组，同一剖面的不同块不会同时出现在训练集和验证集中，避免空间泄漏。
 
 **5) 逐阶段训练。** 按 stages 列表顺序执行。每个阶段：
-  - 加载初始权重（零初始化或从指定阶段承接）
-  - 创建新的 AdamW 优化器
-  - 按 steps_per_epoch 和 epochs 训练，每个 step 中到期的 loss block 各自取 batch、计算标量损失，加权求和后一次反向传播
-  - 每 epoch 后在冻结的验证索引上计算选优指标，更新 best checkpoint
-  - 阶段结束时写出 best 和 final 两个 checkpoint 及完整训练历史
+
+- 加载初始权重（零初始化或从指定阶段承接）
+- 创建新的 AdamW 优化器
+- 按 steps_per_epoch 和 epochs 训练，每个 step 中到期的 loss block 各自取 batch、计算标量损失，加权求和后一次反向传播
+- 每 epoch 后在冻结的验证索引上计算选优指标，更新 best checkpoint
+- 阶段结束时写出 best 和 final 两个 checkpoint 及完整训练历史
 
 **6) 写入实验 manifest。** 记录完整的架构合同、归一化统计量、全部 source 路径和契约指纹、有序 stage 配置、每阶段的 checkpoints 和训练历史、部署 checkpoint 的显式引用，以及实验级唯一契约指纹。
 

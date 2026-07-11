@@ -23,27 +23,17 @@ class PatchSpec:
     twt_samples: int = 128
     lateral_stride: int = 16
     twt_stride: int = 64
-    min_valid_fraction: float = 0.50
 
 
-def default_train_kinds(model_id: str) -> set[str]:
-    if model_id in {
-        "trace_1d_tcn_lateral_mixer_k1_mismatch_training",
-        "trace_1d_tcn_lateral_mixer_mismatch_training",
-        "trace_1d_tcn_lateral_mixer_k5_mismatch_training",
-        "trace_1d_dilated_tcn_mismatch_training",
-        "trace_1d_mismatch_training",
-        "patch_2d_mismatch_training",
+def default_train_kinds(architecture_id: str) -> set[str]:
+    """Compatibility helper for evaluation code; training kinds belong to sources."""
+    if architecture_id not in {
+        "trace_conv1d", "trace_dilated_tcn", "trace_lateral_mixer", "patch_conv2d"
     }:
-        return {"base", "seismic_variant"}
-    if model_id in {
-        "trace_1d",
-        "trace_1d_dilated_tcn",
-        "patch_2d_supervised",
-        "patch_2d_with_physics_loss",
-    }:
-        return {"base"}
-    raise ValueError(f"Unsupported model_id: {model_id}")
+        raise ValueError(
+            "Legacy model IDs are not accepted; sample variants are configured on sources."
+        )
+    return {"base"}
 
 
 def default_eval_kinds() -> set[str]:
@@ -185,6 +175,7 @@ def build_patch_index(
     validation_fraction: float = 0.15,
     test_fraction: float = 0.15,
     max_patches: int | None = None,
+    min_valid_samples: int = 1,
 ) -> pd.DataFrame:
     probe_kinds = {"frequency_probe", "frequency_probe_seismic_variant"}
     if max_patches is not None and sample_kinds.intersection(probe_kinds):
@@ -226,9 +217,10 @@ def build_patch_index(
                     lateral_start : lateral_start + patch_spec.lateral_samples,
                     twt_start : twt_start + patch_spec.twt_samples,
                 ]
-                valid_fraction = float(np.mean(patch_mask))
-                if valid_fraction < patch_spec.min_valid_fraction:
+                valid_count = int(np.count_nonzero(patch_mask))
+                if valid_count < int(min_valid_samples):
                     continue
+                valid_fraction = float(np.mean(patch_mask))
                 patch_id = (
                     f"{sample_id}__l{lateral_start:04d}_{lateral_start + patch_spec.lateral_samples:04d}"
                     f"__t{twt_start:04d}_{twt_start + patch_spec.twt_samples:04d}"
@@ -252,6 +244,7 @@ def build_patch_index(
                         "patch_lateral_samples": patch_spec.lateral_samples,
                         "patch_twt_samples": patch_spec.twt_samples,
                         "valid_fraction": valid_fraction,
+                        "valid_samples": valid_count,
                         "paired_zero_sample_id": row.get("paired_zero_sample_id", ""),
                         "probe_group_id": row.get("probe_group_id", ""),
                         "probe_frequency_hz": row.get("probe_frequency_hz", ""),
@@ -334,7 +327,7 @@ def compute_normalization(
     train = patch_index[patch_index["split"].eq("train")]
     if train.empty:
         raise ValueError("Cannot compute normalization without train patches.")
-    buckets = {"seismic": [], "lfm": [], "target": [], "delta": []}
+    buckets = {"seismic": [], "lfm": []}
     samples: dict[str, Any] = {}
     for _, row in train.iterrows():
         sample_id = str(row["sample_id"])
@@ -349,8 +342,6 @@ def compute_normalization(
         patch_lfm = lfm[sl]
         buckets["seismic"].append(_finite_values(patch_seismic, patch_valid))
         buckets["lfm"].append(_finite_values(patch_lfm, patch_valid))
-        buckets["target"].append(_finite_values(patch_target, patch_valid))
-        buckets["delta"].append(_finite_values(patch_target - patch_lfm, patch_valid))
     stats = {
         "normalization_scope": "train_only",
         "normalization_mask": "valid_mask_model",
@@ -461,10 +452,9 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         delta = target_patch - lfm_patch
         seismic_n = _norm(seismic_patch, self.normalization["seismic"])
         lfm_n = _norm(lfm_patch, self.normalization["lfm"])
-        delta_n = _norm(delta, self.normalization["delta"])
         seismic_n = np.where(valid_patch & np.isfinite(seismic_n), seismic_n, 0.0)
         lfm_n = np.where(valid_patch & np.isfinite(lfm_n), lfm_n, 0.0)
-        delta_n = np.where(valid_patch & np.isfinite(delta_n), delta_n, 0.0)
+        delta = np.where(valid_patch & np.isfinite(delta), delta, 0.0)
         target_patch = np.where(
             valid_patch & np.isfinite(target_patch), target_patch, 0.0
         )
@@ -534,7 +524,7 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         )
         return {
             "input": torch.from_numpy(inputs.astype(np.float32)),
-            "target_delta": torch.from_numpy(delta_n.astype(np.float32))[None, :, :],
+            "target_delta": torch.from_numpy(delta.astype(np.float32))[None, :, :],
             "target_log_ai": torch.from_numpy(target_patch.astype(np.float32))[
                 None, :, :
             ],
@@ -571,7 +561,8 @@ def _norm(values: np.ndarray, stats: Mapping[str, Any]) -> np.ndarray:
 def denormalize_delta(
     values: np.ndarray, normalization: Mapping[str, Any]
 ) -> np.ndarray:
-    stats = normalization["delta"]
-    return np.asarray(values, dtype=np.float32) * float(stats["std"]) + float(
-        stats["mean"]
-    )
+    if "delta" in normalization:
+        raise ValueError(
+            "Normalized-delta checkpoints are obsolete; GINN-v2 v4 outputs physical delta_log_ai."
+        )
+    return np.asarray(values, dtype=np.float32)

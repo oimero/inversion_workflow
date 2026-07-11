@@ -111,15 +111,19 @@ def load_model_manifest(model_cfg: Mapping[str, Any], *, root: Path) -> dict[str
         manifest = json.load(handle)
     if str(manifest.get("schema_version") or "") != MODEL_RUN_SCHEMA_VERSION:
         raise ValueError(f"Unsupported model run manifest schema: {manifest_path}")
-    require_contract_fingerprint(manifest, label=f"model run {model_run_dir}")
+    if not str(manifest.get("experiment_id") or ""):
+        raise ValueError("GINN-v2 experiment manifest lacks experiment_id.")
     return manifest
 
 
 def _model_manifest_and_dir(model_cfg: Mapping[str, Any], *, root: Path) -> tuple[Path, dict[str, Any]]:
-    extra = sorted(set(model_cfg) - {"model_run_dir"})
+    extra = sorted(set(model_cfg) - {"model_run_dir", "experiment_dir"})
     if extra:
         raise ValueError(f"R0 model entries only accept model_run_dir; got {extra}.")
-    model_run_dir = resolve_relative_path(_required_text(model_cfg, "model_run_dir"), root=root)
+    directory = model_cfg.get("experiment_dir") or model_cfg.get("model_run_dir")
+    if not str(directory or "").strip():
+        raise ValueError("R0 model entry requires experiment_dir.")
+    model_run_dir = resolve_relative_path(str(directory), root=root)
     manifest_path = model_run_dir / "model_run_manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"model_run_manifest.json not found: {manifest_path}")
@@ -127,14 +131,8 @@ def _model_manifest_and_dir(model_cfg: Mapping[str, Any], *, root: Path) -> tupl
         manifest = json.load(handle)
     if str(manifest.get("schema_version") or "") != MODEL_RUN_SCHEMA_VERSION:
         raise ValueError(f"Unsupported model run manifest schema: {manifest_path}")
-    require_contract_fingerprint(manifest, label=f"model run {model_run_dir}")
-    gate = manifest.get("synthetic_gate_evidence")
-    if not isinstance(gate, Mapping):
-        raise ValueError(f"Model run manifest lacks synthetic_gate_evidence: {manifest_path}")
-    required_gate = ("report_dir", "report_card", "is_current_frozen_candidate")
-    missing_gate = [key for key in required_gate if key not in gate]
-    if missing_gate:
-        raise ValueError(f"synthetic_gate_evidence missing {missing_gate}: {manifest_path}")
+    if not str(manifest.get("experiment_id") or ""):
+        raise ValueError("GINN-v2 experiment manifest lacks experiment_id.")
     return model_run_dir, manifest
 
 
@@ -150,11 +148,7 @@ def _validate_model_sample_axis(
         "sample_unit": sample_axis.unit,
         "depth_basis": depth_basis,
     }
-    actual = {
-        "sample_domain": manifest.get("sample_domain"),
-        "sample_unit": manifest.get("sample_unit"),
-        "depth_basis": manifest.get("depth_basis"),
-    }
+    actual = dict(manifest.get("sample_axis_contract") or {})
     if actual != expected:
         raise ValueError(
             f"Model/LFM sample-axis mismatch: model={actual}, real_field={expected}. "
@@ -167,17 +161,10 @@ def _validate_model_sample_axis(
 
 
 def _manifest_model_role(manifest: Mapping[str, Any]) -> str:
-    explicit = str(manifest.get("model_role") or "").strip()
-    if explicit:
-        return explicit
-    model_id = str(manifest.get("model_id") or "").strip()
-    if "lateral_mixer" in model_id:
-        return "lateral"
-    if "trace_1d" in model_id or "trace1d" in model_id:
-        return "no_lateral"
-    if not model_id:
-        raise ValueError("Model manifest must contain model_id or model_role.")
-    return model_id.replace("-", "_")
+    experiment_id = str(manifest.get("experiment_id") or "").strip()
+    if not experiment_id:
+        raise ValueError("GINN-v2 v1 manifest must contain experiment_id; model_role is obsolete.")
+    return experiment_id
 
 
 def _primary_checkpoint_path(
@@ -185,15 +172,9 @@ def _primary_checkpoint_path(
     *,
     root: Path,
 ) -> Path:
-    checkpoints = manifest.get("checkpoints")
-    if not isinstance(checkpoints, Mapping):
-        raise ValueError("GINN-v2 v3 manifest lacks checkpoints mapping.")
-    primary = str(checkpoints.get("primary") or "")
-    if primary not in {"best", "final"}:
-        raise ValueError(f"Invalid GINN-v2 primary checkpoint: {primary!r}")
-    record = checkpoints.get(primary)
+    record = manifest.get("deployment_checkpoint")
     if not isinstance(record, Mapping):
-        raise ValueError(f"GINN-v2 manifest lacks primary checkpoint record: {primary}")
+        raise ValueError("GINN-v2 experiment manifest lacks resolved deployment_checkpoint.")
     path = resolve_relative_path(str(record.get("path") or ""), root=root)
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -601,10 +582,11 @@ def run_zero_shot_model(
     device_name: str,
     stitch_strategy: str,
 ) -> dict[str, Any]:
+    if stitch_strategy != "uniform":
+        raise ValueError("GINN-v2 R0 production stitching is fixed to uniform.")
     model_run_dir, manifest = _model_manifest_and_dir(model_cfg, root=root)
     model_role = _manifest_model_role(manifest)
-    model_id_label = _required_text(manifest, "model_id")
-    synthetic_gate_evidence = dict(manifest["synthetic_gate_evidence"])
+    architecture_id = _required_text(_mapping(manifest.get("architecture"), "architecture"), "id")
     checkpoint_path = _primary_checkpoint_path(manifest, root=root)
     model, checkpoint = load_checkpoint(checkpoint_path)
     _validate_model_sample_axis(
@@ -630,28 +612,29 @@ def run_zero_shot_model(
     model.to(device)
     model.eval()
     normalization = dict(checkpoint["normalization"])
-    patch_spec = _mapping(manifest.get("patch_spec"), f"{model_role}.patch_spec")
+    patch_spec = _mapping(manifest.get("patching"), f"{model_role}.patching")
     patches = build_real_field_patch_index(
         section.valid_mask,
         lateral_samples=int(patch_spec["lateral_samples"]),
         vertical_samples=int(patch_spec["vertical_samples"]),
         lateral_stride=int(patch_spec["lateral_stride"]),
         vertical_stride=int(patch_spec["vertical_stride"]),
-        min_valid_fraction=float(patch_spec["min_valid_fraction"]),
     )
     if not patches:
         raise ValueError(f"No valid real-field patches for model role={model_role}.")
 
     pred_sum = np.zeros_like(section.lfm, dtype=np.float64)
     weight = np.zeros_like(section.lfm, dtype=np.float64)
+    max_context = np.zeros_like(section.lfm, dtype=np.float32)
     rows: list[dict[str, Any]] = []
     patch_predictions: list[np.ndarray] = []
     with torch.no_grad():
         for patch_idx, patch in enumerate(patches):
             sl = (slice(patch.lateral_start, patch.lateral_stop), slice(patch.sample_start, patch.sample_stop))
-            seismic_patch = section.seismic[sl]
-            lfm_patch = section.lfm[sl]
-            valid_patch = section.valid_mask[sl]
+            seismic_patch, lfm_patch, valid_patch, actual_shape = _extract_padded_patch(
+                section.seismic, section.lfm, section.valid_mask, sl,
+                shape=(int(patch_spec["lateral_samples"]), int(patch_spec["vertical_samples"])),
+            )
             inputs = np.stack(
                 [
                     _normalize_with_mask(seismic_patch, valid_patch, normalization["seismic"]),
@@ -661,20 +644,23 @@ def run_zero_shot_model(
                 axis=0,
             )[None, ...]
             tensor = torch.as_tensor(inputs, dtype=torch.float32, device=device)
-            pred_delta_n = model(tensor).detach().cpu().numpy()[0, 0]
-            pred_delta = denormalize_delta(pred_delta_n, normalization)
+            pred_delta = model(tensor).detach().cpu().numpy()[0, 0]
             prediction = np.asarray(lfm_patch + pred_delta, dtype=np.float32)
+            prediction = prediction[:actual_shape[0], :actual_shape[1]]
+            valid_patch = valid_patch[:actual_shape[0], :actual_shape[1]]
             patch_predictions.append(prediction)
             local, dest = _stitch_slices(patch, strategy=stitch_strategy)
             local_valid = valid_patch[local]
             pred_sum[dest] += np.where(local_valid, prediction[local], 0.0)
             weight[dest] += local_valid.astype(np.float64)
+            max_context[dest] = np.maximum(
+                max_context[dest], np.where(local_valid, patch.valid_fraction, 0.0)
+            )
             rows.append(
                 {
                     "patch_id": f"{model_role}__p{patch_idx:05d}",
-                    "model_role": model_role,
-                    "model_id": model_id_label,
-                    "checkpoint_model_id": str(checkpoint["model_id"]),
+                    "experiment_id": model_role,
+                    "architecture_id": architecture_id,
                     "lateral_start": patch.lateral_start,
                     "lateral_stop": patch.lateral_stop,
                     "sample_start_index": patch.sample_start,
@@ -692,6 +678,9 @@ def run_zero_shot_model(
                 }
             )
     stitched = np.divide(pred_sum, weight, out=np.full_like(pred_sum, np.nan), where=weight > 0.0)
+    _require_complete_valid_coverage(weight, section.valid_mask, ilines=section.ilines, xlines=section.xlines, samples=section.sample_axis.values)
+    if np.any(~np.isfinite(stitched[section.valid_mask])):
+        raise FloatingPointError("R0 produced non-finite predictions at valid samples.")
     pred_delta_vs_lfm = stitched - section.lfm
     model_dir = output_dir / model_role
     model_dir.mkdir(parents=True, exist_ok=False)
@@ -701,6 +690,8 @@ def run_zero_shot_model(
         stitched_pred_log_ai=stitched.astype(np.float32),
         pred_delta_vs_lfm=pred_delta_vs_lfm.astype(np.float32),
         stitching_weight=weight.astype(np.float32),
+        prediction_support_count=weight.astype(np.uint16),
+        max_context_valid_fraction=max_context,
         lfm_input=section.lfm.astype(np.float32),
         seismic_input=section.seismic.astype(np.float32),
         valid_mask_model=section.valid_mask.astype(bool),
@@ -720,23 +711,18 @@ def run_zero_shot_model(
         "input_contracts": {
             "model_run": {
                 "path": repo_relative_path(model_run_dir / "model_run_manifest.json", root=root),
-                "contract_fingerprint_sha256": require_contract_fingerprint(
-                    manifest, label=f"model run {model_run_dir}"
-                ),
             }
         },
-        "model_role": model_role,
-        "model_id": model_id_label,
-        "checkpoint_model_id": str(checkpoint["model_id"]),
+        "experiment_id": model_role,
+        "architecture_id": architecture_id,
         "model_run_dir": repo_relative_path(model_run_dir, root=root),
         "checkpoint": repo_relative_path(checkpoint_path, root=root),
         "normalization_file": (
             repo_relative_path(normalization_path, root=root) if normalization_path is not None else ""
         ),
-        "synthetic_gate_evidence": synthetic_gate_evidence,
         "device": device_metadata,
         "normalization": normalization,
-        "patch_spec": patch_spec,
+        "patching": patch_spec,
         "sample_axis_contract": {
             "sample_domain": section.sample_axis.domain,
             "sample_unit": section.sample_axis.unit,
@@ -752,6 +738,7 @@ def run_zero_shot_model(
             "prediction_index": repo_relative_path(index_path, root=root),
         },
         "prediction_coverage_fraction": float(np.mean(weight > 0.0)),
+        "support_qc": _support_qc(weight, max_context, section.valid_mask),
     }
     write_json(model_dir / "real_field_zero_shot_model_summary.json", summary)
     return summary
@@ -766,10 +753,11 @@ def run_zero_shot_volume_model(
     device_name: str,
     stitch_strategy: str,
 ) -> dict[str, Any]:
+    if stitch_strategy != "uniform":
+        raise ValueError("GINN-v2 R0 production stitching is fixed to uniform.")
     model_run_dir, manifest = _model_manifest_and_dir(model_cfg, root=root)
     model_role = _manifest_model_role(manifest)
-    model_id_label = _required_text(manifest, "model_id")
-    synthetic_gate_evidence = dict(manifest["synthetic_gate_evidence"])
+    architecture_id = _required_text(_mapping(manifest.get("architecture"), "architecture"), "id")
     checkpoint_path = _primary_checkpoint_path(manifest, root=root)
     model, checkpoint = load_checkpoint(checkpoint_path)
     _validate_model_sample_axis(
@@ -795,10 +783,11 @@ def run_zero_shot_volume_model(
     model.to(device)
     model.eval()
     normalization = dict(checkpoint["normalization"])
-    patch_spec = _mapping(manifest.get("patch_spec"), f"{model_role}.patch_spec")
+    patch_spec = _mapping(manifest.get("patching"), f"{model_role}.patching")
 
     pred_sum = np.zeros_like(volume.lfm, dtype=np.float64)
     weight = np.zeros_like(volume.lfm, dtype=np.float64)
+    max_context = np.zeros_like(volume.lfm, dtype=np.float32)
     rows: list[dict[str, Any]] = []
     n_patches = 0
     with torch.no_grad():
@@ -812,7 +801,6 @@ def run_zero_shot_volume_model(
                 vertical_samples=int(patch_spec["vertical_samples"]),
                 lateral_stride=int(patch_spec["lateral_stride"]),
                 vertical_stride=int(patch_spec["vertical_stride"]),
-                min_valid_fraction=float(patch_spec["min_valid_fraction"]),
             )
             for patch in patches:
                 sl = (
@@ -820,9 +808,10 @@ def run_zero_shot_volume_model(
                     slice(patch.lateral_start, patch.lateral_stop),
                     slice(patch.sample_start, patch.sample_stop),
                 )
-                seismic_patch = volume.seismic[sl]
-                lfm_patch = volume.lfm[sl]
-                valid_patch = volume.valid_mask[sl]
+                seismic_patch, lfm_patch, valid_patch, actual_shape = _extract_padded_patch(
+                    volume.seismic[inline_idx], volume.lfm[inline_idx], volume.valid_mask[inline_idx], sl[1:],
+                    shape=(int(patch_spec["lateral_samples"]), int(patch_spec["vertical_samples"])),
+                )
                 inputs = np.stack(
                     [
                         _normalize_with_mask(seismic_patch, valid_patch, normalization["seismic"]),
@@ -832,20 +821,23 @@ def run_zero_shot_volume_model(
                     axis=0,
                 )[None, ...]
                 tensor = torch.as_tensor(inputs, dtype=torch.float32, device=device)
-                pred_delta_n = model(tensor).detach().cpu().numpy()[0, 0]
-                pred_delta = denormalize_delta(pred_delta_n, normalization)
+                pred_delta = model(tensor).detach().cpu().numpy()[0, 0]
                 prediction = np.asarray(lfm_patch + pred_delta, dtype=np.float32)
+                prediction = prediction[:actual_shape[0], :actual_shape[1]]
+                valid_patch = valid_patch[:actual_shape[0], :actual_shape[1]]
                 local, dest_2d = _stitch_slices(patch, strategy=stitch_strategy)
                 local_valid = valid_patch[local]
                 dest = (inline_idx, dest_2d[0], dest_2d[1])
                 pred_sum[dest] += np.where(local_valid, prediction[local], 0.0)
                 weight[dest] += local_valid.astype(np.float64)
+                max_context[dest] = np.maximum(
+                    max_context[dest], np.where(local_valid, patch.valid_fraction, 0.0)
+                )
                 rows.append(
                     {
                         "patch_id": f"{model_role}__il{inline_idx:04d}__p{n_patches:07d}",
-                        "model_role": model_role,
-                        "model_id": model_id_label,
-                        "checkpoint_model_id": str(checkpoint["model_id"]),
+                        "experiment_id": model_role,
+                        "architecture_id": architecture_id,
                         "inline_index": int(inline_idx),
                         "inline": float(inline_no),
                         "xline_start_index": patch.lateral_start,
@@ -866,6 +858,9 @@ def run_zero_shot_volume_model(
     if n_patches <= 0:
         raise ValueError(f"No valid real-field volume patches for model role={model_role}.")
     stitched = np.divide(pred_sum, weight, out=np.full_like(pred_sum, np.nan), where=weight > 0.0)
+    _require_complete_valid_coverage(weight, volume.valid_mask, ilines=volume.ilines, xlines=volume.xlines, samples=volume.sample_axis.values)
+    if np.any(~np.isfinite(stitched[volume.valid_mask])):
+        raise FloatingPointError("R0 produced non-finite predictions at valid samples.")
     pred_delta_vs_lfm = stitched - volume.lfm
     model_dir = output_dir / model_role
     model_dir.mkdir(parents=True, exist_ok=False)
@@ -875,6 +870,8 @@ def run_zero_shot_volume_model(
         stitched_pred_log_ai=stitched.astype(np.float32),
         pred_delta_vs_lfm=pred_delta_vs_lfm.astype(np.float32),
         stitching_weight=weight.astype(np.float32),
+        prediction_support_count=weight.astype(np.uint16),
+        max_context_valid_fraction=max_context,
         lfm_input=volume.lfm.astype(np.float32),
         seismic_input=volume.seismic.astype(np.float32),
         valid_mask_model=volume.valid_mask.astype(bool),
@@ -894,24 +891,19 @@ def run_zero_shot_volume_model(
         "input_contracts": {
             "model_run": {
                 "path": repo_relative_path(model_run_dir / "model_run_manifest.json", root=root),
-                "contract_fingerprint_sha256": require_contract_fingerprint(
-                    manifest, label=f"model run {model_run_dir}"
-                ),
             }
         },
         "output_mode": "volume",
-        "model_role": model_role,
-        "model_id": model_id_label,
-        "checkpoint_model_id": str(checkpoint["model_id"]),
+        "experiment_id": model_role,
+        "architecture_id": architecture_id,
         "model_run_dir": repo_relative_path(model_run_dir, root=root),
         "checkpoint": repo_relative_path(checkpoint_path, root=root),
         "normalization_file": (
             repo_relative_path(normalization_path, root=root) if normalization_path is not None else ""
         ),
-        "synthetic_gate_evidence": synthetic_gate_evidence,
         "device": device_metadata,
         "normalization": normalization,
-        "patch_spec": patch_spec,
+        "patching": patch_spec,
         "sample_axis_contract": {
             "sample_domain": volume.sample_axis.domain,
             "sample_unit": volume.sample_axis.unit,
@@ -928,9 +920,57 @@ def run_zero_shot_volume_model(
             "prediction_index": repo_relative_path(index_path, root=root),
         },
         "prediction_coverage_fraction": float(np.mean(weight > 0.0)),
+        "support_qc": _support_qc(weight, max_context, volume.valid_mask),
     }
     write_json(model_dir / "real_field_zero_shot_model_summary.json", summary)
     return summary
+
+
+def _require_complete_valid_coverage(
+    weight: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    ilines: np.ndarray,
+    xlines: np.ndarray,
+    samples: np.ndarray,
+) -> None:
+    support = np.asarray(weight) > 0
+    valid = np.asarray(valid_mask, dtype=bool)
+    if not np.array_equal(support, valid):
+        missing = np.argwhere(valid & ~support)
+        preview = []
+        for index in missing[:20]:
+            if valid.ndim == 3:
+                i, x, z = (int(value) for value in index)
+                preview.append({"inline": float(ilines[i]), "xline": float(xlines[x]), "sample": float(samples[z])})
+            else:
+                lateral, z = (int(value) for value in index)
+                preview.append({"inline": float(ilines[lateral]), "xline": float(xlines[lateral]), "sample": float(samples[z])})
+        raise RuntimeError(
+            "R0 coverage contract failed: valid samples without prediction support: "
+            f"count={len(missing)}, coordinates={preview}"
+        )
+    if np.any(~np.isfinite(weight[valid])):
+        raise FloatingPointError("R0 support count is non-finite at valid samples.")
+
+
+def _support_qc(weight: np.ndarray, max_context: np.ndarray, valid_mask: np.ndarray) -> dict[str, Any]:
+    valid = np.asarray(valid_mask, dtype=bool)
+    support = np.asarray(weight)[valid]
+    context = np.asarray(max_context)[valid]
+    quantiles = (0.0, 0.01, 0.05, 0.5, 0.95, 0.99, 1.0)
+    low_regions: list[dict[str, int]] = []
+    one = (np.asarray(weight) == 1) & valid
+    for trace_index, trace in enumerate(one.reshape(-1, one.shape[-1])):
+        edges = np.diff(np.pad(trace.astype(np.int8), (1, 1)))
+        for start, stop in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+            low_regions.append({"trace_index": int(trace_index), "sample_start_index": int(start), "sample_stop_index": int(stop)})
+    return {
+        "support_count_quantiles": {str(q): float(np.quantile(support, q)) for q in quantiles},
+        "max_context_valid_fraction_quantiles": {str(q): float(np.quantile(context, q)) for q in quantiles},
+        "support_count_one_fraction": float(np.mean(support == 1)),
+        "support_count_one_regions": low_regions,
+    }
 
 
 def build_real_field_patch_index(
@@ -940,7 +980,6 @@ def build_real_field_patch_index(
     vertical_samples: int,
     lateral_stride: int,
     vertical_stride: int,
-    min_valid_fraction: float,
 ) -> list[PatchGeometry]:
     valid = np.asarray(valid_mask, dtype=bool)
     if valid.ndim != 2:
@@ -954,14 +993,14 @@ def build_real_field_patch_index(
                 lateral_start : lateral_start + lateral_samples,
                 sample_start : sample_start + vertical_samples,
             ]
-            fraction = float(np.mean(patch_mask))
-            if fraction >= float(min_valid_fraction):
+            fraction = float(np.count_nonzero(patch_mask) / (int(lateral_samples) * int(vertical_samples)))
+            if np.any(patch_mask):
                 rows.append(
                     PatchGeometry(
                         lateral_start=lateral_start,
-                        lateral_stop=lateral_start + lateral_samples,
+                        lateral_stop=min(valid.shape[0], lateral_start + lateral_samples),
                         sample_start=sample_start,
-                        sample_stop=sample_start + vertical_samples,
+                        sample_stop=min(valid.shape[1], sample_start + vertical_samples),
                         valid_fraction=fraction,
                     )
                 )
@@ -1118,7 +1157,7 @@ def load_zero_shot_predictions(run_dir: Path) -> dict[str, dict[str, Any]]:
         if summary_path.is_file():
             with summary_path.open("r", encoding="utf-8") as handle:
                 summary = json.load(handle)
-        role = str(summary.get("model_role") or child.name)
+        role = str(summary.get("experiment_id") or child.name)
         out[role] = {"dir": child, "arrays": arrays, "summary": summary}
     if not out:
         raise FileNotFoundError(f"No R0 model predictions found under {run_dir}")
@@ -1549,11 +1588,34 @@ def _normalize_with_mask(values: np.ndarray, mask: np.ndarray, stats: Mapping[st
     return np.where(mask & np.isfinite(out), out, 0.0).astype(np.float32)
 
 
+def _extract_padded_patch(
+    seismic: np.ndarray,
+    lfm: np.ndarray,
+    valid: np.ndarray,
+    slices: tuple[slice, slice],
+    *,
+    shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]:
+    seismic_actual = np.asarray(seismic[slices], dtype=np.float32)
+    lfm_actual = np.asarray(lfm[slices], dtype=np.float32)
+    valid_actual = np.asarray(valid[slices], dtype=bool)
+    actual_shape = valid_actual.shape
+    padding = ((0, shape[0] - actual_shape[0]), (0, shape[1] - actual_shape[1]))
+    if padding[0][1] < 0 or padding[1][1] < 0:
+        raise ValueError("Requested padded patch shape is smaller than the actual window.")
+    return (
+        np.pad(seismic_actual, padding, constant_values=0.0),
+        np.pad(lfm_actual, padding, constant_values=0.0),
+        np.pad(valid_actual, padding, constant_values=False),
+        actual_shape,
+    )
+
+
 def _window_starts(size: int, window: int, stride: int) -> list[int]:
     if window <= 0 or stride <= 0:
         raise ValueError("Patch window and stride must be positive.")
     if size < window:
-        raise ValueError(f"Section size {size} is smaller than patch window {window}.")
+        return [0]
     starts = list(range(0, size - window + 1, stride))
     last = size - window
     if starts[-1] != last:

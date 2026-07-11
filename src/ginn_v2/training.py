@@ -603,8 +603,9 @@ def _load_nominal_wavelet(
 
 
 def _denormalize_delta_torch(values: torch.Tensor, normalization: Mapping[str, Any]) -> torch.Tensor:
-    stats = normalization["delta"]
-    return values * float(stats["std"]) + float(stats["mean"])
+    if "delta" in normalization:
+        raise ValueError("Normalized-delta checkpoints are obsolete in GINN-v2 checkpoint v4.")
+    return values
 
 
 def _forward_physics_batch(
@@ -650,12 +651,17 @@ def load_checkpoint(path: Path, *, hidden_channels: int | None = None, depth: in
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if str(checkpoint.get("schema_version") or "") != CHECKPOINT_SCHEMA_VERSION:
         raise ValueError(f"Unsupported GINN-v2 checkpoint schema: {path}")
-    info = dict(checkpoint["model_info"])
     architecture = dict(checkpoint.get("architecture") or {})
+    architecture_id = str(architecture.get("id") or "")
+    if not architecture_id:
+        raise ValueError(
+            "GINN-v2 checkpoint lacks the v4 architecture contract; legacy checkpoints are not supported."
+        )
     model, _ = build_model(
-        str(checkpoint["model_id"]),
+        architecture_id,
         hidden_channels=int(hidden_channels or architecture.get("hidden_channels", 32)),
         depth=int(depth or architecture.get("depth", 5)),
+        lateral_kernel=architecture.get("lateral_kernel"),
     )
     model.load_state_dict(checkpoint["state_dict"])
     return model, checkpoint
@@ -698,8 +704,7 @@ def predict_patches(
     with torch.no_grad():
         for batch in loader:
             x = batch["input"].to(device)
-            pred_delta_n = model(x).detach().cpu().numpy()
-            pred_delta = denormalize_delta(pred_delta_n[:, 0], checkpoint["normalization"])
+            pred_delta = model(x).detach().cpu().numpy()[:, 0]
             lfm = batch["lfm"].numpy()[:, 0]
             prediction = lfm + pred_delta
             predictions.append(prediction.astype(np.float32))
@@ -727,7 +732,7 @@ def predict_patches(
     )
     selected = selected.set_index("patch_id").loc[patch_ids].reset_index()
     selected["prediction_row"] = np.arange(len(selected), dtype=int)
-    selected["model_id"] = str(checkpoint["model_id"])
+    selected["architecture_id"] = str(checkpoint["architecture"]["id"])
     index_path = output_dir / "prediction_index.csv"
     selected.to_csv(index_path, index=False)
     return {
@@ -735,7 +740,7 @@ def predict_patches(
         "prediction_npz": npz_path,
         "prediction_index": index_path,
         "n_predictions": int(pred_array.shape[0]),
-        "model_id": str(checkpoint["model_id"]),
+        "architecture_id": str(checkpoint["architecture"]["id"]),
         "model_info": dict(checkpoint["model_info"]),
         "normalization": dict(checkpoint["normalization"]),
         "device_metadata": device_metadata,

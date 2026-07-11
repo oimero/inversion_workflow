@@ -1958,9 +1958,14 @@ def _write_ai_plausibility_qc(
                     "energy_ratio": pred_band / full_pred if np.isfinite(full_pred) and full_pred > 0 else float("nan"),
                 }
             )
-    if "lateral" in predictions and "no_lateral" in predictions:
-        lat = predictions["lateral"]["arrays"]
-        no = predictions["no_lateral"]["arrays"]
+    for comparison in list(run_cfg.get("comparisons") or []):
+        comparison_id = str(comparison["comparison_id"])
+        left_id = str(comparison["left"])
+        right_id = str(comparison["right"])
+        if left_id not in predictions or right_id not in predictions:
+            raise ValueError(f"R1 comparison {comparison_id} references unavailable experiments.")
+        lat = predictions[left_id]["arrays"]
+        no = predictions[right_id]["arrays"]
         diff = np.asarray(lat["stitched_pred_log_ai"], dtype=np.float64) - np.asarray(no["stitched_pred_log_ai"], dtype=np.float64)
         diff_valid = (
             valid
@@ -1970,7 +1975,7 @@ def _write_ai_plausibility_qc(
             & (np.asarray(no["stitching_weight"]) > 0.0)
         )
         full = _band_rms_2d(diff, diff_valid, dt_s=dt_s, low_hz=0.0, high_hz=float("inf"))
-        rows.append({"model_role": "lateral_minus_no_lateral", "signal": "pred_log_ai_difference", **_finite_stats(diff, diff_valid)})
+        rows.append({"model_role": comparison_id, "signal": "pred_log_ai_difference", "left_experiment_id": left_id, "right_experiment_id": right_id, **_finite_stats(diff, diff_valid)})
         for band in bands:
             band_rms = _band_rms_2d(
                 diff,
@@ -1981,7 +1986,9 @@ def _write_ai_plausibility_qc(
             )
             rows.append(
                 {
-                    "model_role": "lateral_minus_no_lateral",
+                    "model_role": comparison_id,
+                    "left_experiment_id": left_id,
+                    "right_experiment_id": right_id,
                     "signal": "pred_log_ai_difference_band",
                     "band": band["name"],
                     "low_hz": band["low_hz"],
@@ -2746,6 +2753,7 @@ def main() -> None:
     output_root = resolve_relative_path(cfg.get("output_root", "scripts/output"), root=REPO_ROOT)
     zero_shot_dir = _resolve_zero_shot_dir(run_cfg, output_root=output_root, cli_value=args.zero_shot_dir)
     zero_shot_summary = _load_zero_shot_summary(zero_shot_dir)
+    run_cfg["comparisons"] = list(zero_shot_summary.get("comparisons") or [])
     sample_domain = str(zero_shot_summary.get("sample_domain") or "")
     if sample_domain not in {"time", "depth"}:
         raise ValueError("R0 summary must declare sample_domain=time or depth.")

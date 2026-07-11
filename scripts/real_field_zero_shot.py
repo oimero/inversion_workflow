@@ -79,14 +79,35 @@ def _load_models(run_cfg: dict) -> list[dict]:
     for idx, item in enumerate(models):
         if not isinstance(item, dict):
             raise ValueError(f"real_field_zero_shot.models[{idx}] must be a mapping.")
-        extra = sorted(set(item) - {"model_run_dir"})
+        extra = sorted(set(item) - {"experiment_dir"})
         if extra:
-            raise ValueError(f"real_field_zero_shot.models[{idx}] only accepts model_run_dir; got {extra}.")
-        text = str(item.get("model_run_dir") or "").strip()
+            raise ValueError(f"real_field_zero_shot.models[{idx}] only accepts experiment_dir; got {extra}.")
+        text = str(item.get("experiment_dir") or "").strip()
         if not text:
-            raise ValueError(f"real_field_zero_shot.models[{idx}].model_run_dir must be non-empty.")
-        clean.append({"model_run_dir": text})
+            raise ValueError(f"real_field_zero_shot.models[{idx}].experiment_dir must be non-empty.")
+        clean.append({"experiment_dir": text})
     return clean
+
+
+def _load_comparisons(run_cfg: dict, experiment_ids: set[str]) -> list[dict[str, str]]:
+    values = run_cfg.get("comparisons") or []
+    if not isinstance(values, list):
+        raise ValueError("real_field_zero_shot.comparisons must be a list.")
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, value in enumerate(values):
+        if not isinstance(value, dict):
+            raise ValueError(f"comparisons[{index}] must be a mapping.")
+        extra = sorted(set(value) - {"comparison_id", "left", "right"})
+        comparison_id = str(value.get("comparison_id") or "")
+        left, right = str(value.get("left") or ""), str(value.get("right") or "")
+        if extra or not comparison_id or comparison_id in seen:
+            raise ValueError(f"Invalid explicit comparison at index {index}: extra={extra}.")
+        if left not in experiment_ids or right not in experiment_ids or left == right:
+            raise ValueError(f"Comparison {comparison_id} must reference two distinct configured experiment IDs.")
+        result.append({"comparison_id": comparison_id, "left": left, "right": right})
+        seen.add(comparison_id)
+    return result
 
 
 def _load_sections_file(run_cfg: dict) -> list[dict]:
@@ -214,7 +235,7 @@ def _load_seismic_reference_payload(*, run_cfg: dict, models: list[dict]) -> dic
         stats_path = resolve_relative_path(explicit, root=REPO_ROOT)
     else:
         first_model = dict(models[0])
-        model_run_dir = resolve_relative_path(str(first_model["model_run_dir"]), root=REPO_ROOT)
+        model_run_dir = resolve_relative_path(str(first_model["experiment_dir"]), root=REPO_ROOT)
         manifest_path = model_run_dir / "model_run_manifest.json"
         stats_path = model_run_dir / "input_reference_stats.json"
         if manifest_path.is_file():
@@ -290,7 +311,7 @@ def _write_well_prediction_qc(output_dir: Path, *, run_cfg: dict) -> dict[str, o
     for control in controls.controls:
         well = control.well_name
         if control.wellbore_class == "deviated" and not include_deviated:
-            rows.append({"well_name": well, "model_role": "", "status": "skipped_deviated_well"})
+            rows.append({"well_name": well, "experiment_id": "", "status": "skipped_deviated_well"})
             continue
         source_samples = control.sample_axis.values
         sample_indices = np.searchsorted(source_samples, samples)
@@ -305,7 +326,7 @@ def _write_well_prediction_qc(output_dir: Path, *, run_cfg: dict) -> dict[str, o
         nearest_distance = distances[np.arange(samples.size), trace_indices]
         finite_distance = nearest_distance[np.isfinite(nearest_distance)]
         if finite_distance.size == 0:
-            rows.append({"well_name": well, "model_role": "", "status": "skipped_missing_well_position"})
+            rows.append({"well_name": well, "experiment_id": "", "status": "skipped_missing_well_position"})
             continue
         base = {
             "well_name": well,
@@ -324,7 +345,7 @@ def _write_well_prediction_qc(output_dir: Path, *, run_cfg: dict) -> dict[str, o
             }
         )
         if not np.any(nearest_distance <= max_distance):
-            rows.append({**base, "model_role": "", "status": "skipped_outside_section_support", "max_xy_distance_m": max_distance})
+            rows.append({**base, "experiment_id": "", "status": "skipped_outside_section_support", "max_xy_distance_m": max_distance})
             continue
         fig, ax = plt.subplots(figsize=(4.5, 6.0))
         ax.plot(well_log_ai, samples, label="canonical well log(AI)", color="black", linewidth=1.5)
@@ -346,7 +367,7 @@ def _write_well_prediction_qc(output_dir: Path, *, run_cfg: dict) -> dict[str, o
             rows.append(
                 {
                     **base,
-                    "model_role": role,
+                    "experiment_id": role,
                     "status": "ok" if n_valid >= 8 else "insufficient_valid_samples",
                     "n_valid": n_valid,
                     "rmse": float(np.sqrt(np.mean(residual * residual))) if n_valid else float("nan"),
@@ -644,7 +665,7 @@ def _write_spectral_qc(output_dir: Path, *, run_cfg: dict, dt_s: float) -> dict[
             )
             rows.append(
                 {
-                    "model_role": child.name,
+                    "experiment_id": child.name,
                     "signal": "pred_delta_vs_lfm",
                     "band": band["name"],
                     "low_hz": band["low_hz"],
@@ -745,7 +766,7 @@ def _write_spectral_qc(output_dir: Path, *, run_cfg: dict, dt_s: float) -> dict[
     if rows:
         frame = pd.DataFrame.from_records(rows)
         fig, ax = plt.subplots(figsize=(8, 4))
-        for role, group in frame.groupby("model_role"):
+        for role, group in frame.groupby("experiment_id"):
             ax.plot(group["band"], group["band_rms"], marker="o", label=role)
         ax.set_ylabel("RMS log(AI)")
         ax.set_title("R0 pred_delta_vs_lfm band energy")
@@ -894,6 +915,8 @@ def main() -> None:
 
     device = str(args.device or run_cfg.get("device") or "auto")
     stitch_strategy = str(args.stitch_strategy or run_cfg.get("stitch_strategy") or "uniform")
+    if stitch_strategy != "uniform":
+        raise ValueError("R0 production stitching is fixed to uniform.")
     run_cfg = _prepare_real_field_inputs(run_cfg, cfg)
     models = _load_models(run_cfg)
     data_root = resolve_relative_path(cfg.get("data_root", "data"), root=REPO_ROOT)
@@ -943,6 +966,10 @@ def main() -> None:
             qc = input_qc_frame(field, summary.get("normalization", {}) or {})
             qc.to_csv(output_dir / "model_input_qc.csv", index=False)
             input_qc_written = True
+    comparisons = _load_comparisons(
+        run_cfg,
+        {str(summary["experiment_id"]) for summary in model_summaries},
+    )
     figure_outputs = _plot_zero_shot_qc(output_dir)
     well_outputs = (
         {"csv": "", "figures": {}, "status": "disabled_for_volume_mode"}
@@ -992,7 +1019,7 @@ def main() -> None:
         },
     }
     for model_summary in model_summaries:
-        model_role = str(model_summary["model_role"])
+        model_role = str(model_summary["experiment_id"])
         model_input = dict(dict(model_summary.get("input_contracts") or {}).get("model_run") or {})
         if not model_input:
             raise ValueError(f"R0 model summary lacks model_run contract: {model_role}")
@@ -1009,7 +1036,7 @@ def main() -> None:
             ),
         }
     primary_artifacts = {
-        f"prediction:{str(model_summary['model_role'])}": resolve_relative_path(
+        f"prediction:{str(model_summary['experiment_id'])}": resolve_relative_path(
             str(dict(model_summary["outputs"])["predictions"]), root=REPO_ROOT
         )
         for model_summary in model_summaries
@@ -1053,6 +1080,7 @@ def main() -> None:
         "device_requested": device,
         "stitch_strategy": stitch_strategy,
         "source_runs": source_runs,
+        "comparisons": comparisons,
         "sample_domain": sample_axis.domain,
         "sample_unit": sample_axis.unit,
         "depth_basis": field.depth_basis,

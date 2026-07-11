@@ -1,4 +1,4 @@
-"""GINN-v2 model-ablation utilities built on synthoseis-lite."""
+"""Composable GINN-v2 inversion experiments."""
 
 from ginn_v2.data import (
     PatchDataset,
@@ -8,6 +8,7 @@ from ginn_v2.data import (
     compute_normalization,
 )
 from ginn_v2.models import build_model
+from ginn_v2.experiment import parse_experiment_config
 
 __all__ = [
     "PatchDataset",
@@ -16,4 +17,5 @@ __all__ = [
     "build_patch_index",
     "compute_input_reference_stats",
     "compute_normalization",
+    "parse_experiment_config",
 ]

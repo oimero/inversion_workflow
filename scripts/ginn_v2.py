@@ -56,6 +56,8 @@ from ginn_v2.training import (
     resolve_device,
     train_model,
 )
+from ginn_v2.composable import run_experiment
+from ginn_v2.experiment import parse_experiment_config
 
 
 MODEL_IDS = (
@@ -590,16 +592,19 @@ def _resolve_checkpoint_from_manifest(
 ) -> tuple[str, Path]:
     if str(manifest.get("schema_version") or "") != MODEL_RUN_SCHEMA_VERSION:
         raise ValueError(f"GINN-v2 model run must use schema {MODEL_RUN_SCHEMA_VERSION}.")
-    require_contract_fingerprint(manifest, label="GINN-v2 model run")
-    checkpoints = manifest.get("checkpoints")
-    if not isinstance(checkpoints, Mapping):
-        raise ValueError("GINN-v2 v3 manifest lacks checkpoints mapping.")
-    resolved_name = str(checkpoints.get("primary")) if selection == "primary" else selection
-    if resolved_name not in {"best", "final"}:
-        raise ValueError(f"Invalid primary checkpoint selection: {resolved_name!r}")
-    record = checkpoints.get(resolved_name)
-    if not isinstance(record, Mapping):
-        raise ValueError(f"Manifest lacks checkpoint record: {resolved_name}")
+    deployment = manifest.get("deployment_checkpoint")
+    if not isinstance(deployment, Mapping):
+        raise ValueError("GINN-v2 experiment manifest lacks deployment_checkpoint.")
+    resolved_name = str(deployment.get("kind")) if selection == "primary" else selection
+    if resolved_name == str(deployment.get("kind")):
+        record = deployment
+    else:
+        stage_id = str(deployment.get("stage_id"))
+        stage = next((item for item in manifest.get("stages", []) if item.get("stage_id") == stage_id), None)
+        if not isinstance(stage, Mapping):
+            raise ValueError(f"Deployment stage is missing: {stage_id}")
+        path_value = dict(stage.get("checkpoints") or {}).get(resolved_name)
+        record = {"path": path_value}
     path = resolve_relative_path(str(record.get("path") or ""), root=REPO_ROOT)
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -607,6 +612,32 @@ def _resolve_checkpoint_from_manifest(
 
 
 def run_train(args: argparse.Namespace) -> None:
+    if args.config is None:
+        raise ValueError(
+            "GINN-v2 training now requires --config with the ginn_v2_experiment_v1 root. "
+            "Legacy training flags are not accepted; see "
+            "docs/spec/GINN_V2_COMPOSABLE_TRAINING_DESIGN.md."
+        )
+    config_path = resolve_relative_path(args.config, root=REPO_ROOT)
+    experiment = parse_experiment_config(load_yaml_config(config_path))
+    output_dir = (
+        resolve_relative_path(args.output_dir, root=REPO_ROOT)
+        if args.output_dir is not None
+        else REPO_ROOT / "experiments" / "ginn_v2" / "results" / experiment.experiment_id
+    )
+    logger = configure_training_logger(output_dir)
+    manifest = run_experiment(
+        config=experiment,
+        root=REPO_ROOT,
+        output_dir=output_dir,
+        logger=logger,
+    )
+    print("=== GINN-v2 composable experiment ===")
+    print(f"Output: {output_dir}")
+    print(f"Experiment: {experiment.experiment_id}")
+    print(f"Deployment: {manifest['deployment_checkpoint']['path']}")
+    return
+
     args = _apply_train_config(args)
     benchmark_dir = _resolve_benchmark_dir(args.benchmark_dir)
     output_dir = _resolve_output_dir("ginn_v2_train", args.output_dir)

@@ -177,7 +177,6 @@ class DifferentiableWellPredictor:
                 vertical_samples=int(self.patch_spec["vertical_samples"]),
                 lateral_stride=int(self.patch_spec["lateral_stride"]),
                 vertical_stride=int(self.patch_spec["vertical_stride"]),
-                min_valid_fraction=float(self.patch_spec["min_valid_fraction"]),
             )
         return self._patches[inline_index]
 
@@ -549,9 +548,7 @@ class RealDeltaSupport:
                 canonical_full_patch=True,
             )
         model.train(was_training)
-        error = float(torch.max(torch.abs(sparse - canonical)).cpu()) * float(
-            self.normalization["delta"]["std"]
-        )
+        error = float(torch.max(torch.abs(sparse - canonical)).cpu())
         tolerance = float(self.config["reconstruction_tolerance_log_ai"])
         if not np.isfinite(error) or error > tolerance:
             raise ValueError(
@@ -578,16 +575,13 @@ class RealDeltaSupport:
             for cluster, well_name in selected
         ]
         predictions = self.predictor.predict_delta_n_groups(model, groups, device=device)
-        mean = float(self.normalization["delta"]["mean"])
-        std = float(self.normalization["delta"]["std"])
         losses = []
         n_samples = 0
         for rows, prediction in zip(groups, predictions):
             target = (
                 rows["well_log_ai"].to_numpy(dtype=np.float32)
                 - rows["lfm_log_ai"].to_numpy(dtype=np.float32)
-                - mean
-            ) / std
+            )
             target_tensor = torch.as_tensor(target, dtype=torch.float32, device=device)
             losses.append(torch.mean((prediction - target_tensor) ** 2))
             n_samples += int(len(rows))
@@ -1040,8 +1034,6 @@ def evaluate_real_wells(
     metrics_rows: list[dict[str, Any]] = []
     band_rows: list[dict[str, Any]] = []
     waveform_rows: list[dict[str, Any]] = []
-    delta_mean = float(support.normalization["delta"]["mean"])
-    delta_std = float(support.normalization["delta"]["std"])
 
     for checkpoint_name, model in models.items():
         logger.info(
@@ -1060,7 +1052,7 @@ def evaluate_real_wells(
         for index, (well, prediction_n) in enumerate(zip(groups, predictions_n), start=1):
             well_name = str(well["well_name"].iloc[0])
             cluster = int(well["spatial_cluster_id"].iloc[0])
-            pred_delta = prediction_n.detach().cpu().numpy() * delta_std + delta_mean
+            pred_delta = prediction_n.detach().cpu().numpy()
             target_ai = well["well_log_ai"].to_numpy(dtype=np.float64)
             lfm_ai = well["lfm_log_ai"].to_numpy(dtype=np.float64)
             target_delta = target_ai - lfm_ai

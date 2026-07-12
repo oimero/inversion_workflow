@@ -16,7 +16,12 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 from cup.synthetic.dataset import SynthoseisBenchmark
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.utils.io import repo_relative_path, write_json
+from cup.utils.io import (
+    CONTRACT_FINGERPRINT_SCHEMA,
+    contract_fingerprint_sha256,
+    repo_relative_path,
+    write_json,
+)
 from ginn_v2.contracts import CHECKPOINT_SCHEMA_VERSION, EXPERIMENT_SCHEMA_VERSION
 from ginn_v2.data import (
     PatchDataset, PatchSpec, build_patch_index, compute_input_reference_stats,
@@ -276,6 +281,26 @@ def _resolve_auto_benchmark(root: Path) -> Path:
     return max(candidates, key=lambda path: (path.stat().st_mtime, path.name))
 
 
+def _benchmark_forward_model_inputs_path(
+    benchmark: SynthoseisBenchmark, benchmark_dir: Path,
+) -> Path | None:
+    if str(benchmark.manifest.get("sample_domain") or "") != "depth":
+        return None
+    raw_path = str(benchmark.manifest.get("forward_model_inputs_path") or "").strip()
+    if not raw_path:
+        raise ValueError(
+            "Depth Synthoseis benchmark lacks forward_model_inputs_path; "
+            "R0/R1 require the frozen depth forward contract."
+        )
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = benchmark_dir / path
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Depth forward_model_inputs_path not found: {path}")
+    return path
+
+
 def _source_path(value: Any, root: Path) -> Path:
     path = Path(str(value))
     return path if path.is_absolute() else root / path
@@ -394,6 +419,10 @@ def _real_field_config(
             "seismic_reference_stats": dict(reference_stats or {}),
             "lfm_value_transform": "identity",
     }
+    if source.get("forward_model_inputs_path") is not None:
+        inputs["forward_model_inputs_path"] = str(
+            _source_path(source["forward_model_inputs_path"], root)
+        )
     if source.get("well_control_run_dir") is not None:
         inputs["well_control_run_dir"] = str(_source_path(source["well_control_run_dir"], root))
     return {
@@ -668,8 +697,9 @@ def _checkpoint_payload(
     *, model: torch.nn.Module, config: ExperimentConfig, model_info: Mapping[str, Any],
     normalization: Mapping[str, Any], stage_id: str, kind: str, epoch: int,
     metric_name: str, metric_value: float, sample_axis: Mapping[str, Any],
+    forward_model_inputs_path: str = "",
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "experiment_id": config.experiment_id,
         "stage_id": stage_id,
@@ -691,6 +721,9 @@ def _checkpoint_payload(
         },
         "state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
     }
+    if forward_model_inputs_path:
+        payload["forward_model_inputs_path"] = forward_model_inputs_path
+    return payload
 
 
 def _evaluate(
@@ -785,6 +818,7 @@ def run_experiment(
     real_geometries: dict[str, Any] = {}
     source_contracts: dict[str, dict[str, Any]] = {}
     resolved_sources: dict[str, dict[str, Any]] = {}
+    forward_model_inputs_by_source: dict[str, Path] = {}
     for source_id, source in config.sources.items():
         if source["kind"] == "synthoseis_lite":
             raw_dir = source.get("benchmark_dir")
@@ -793,14 +827,23 @@ def run_experiment(
             manifest = synthetic[source_id][0].manifest
             domain = str(manifest.get("sample_domain") or "")
             source_contracts[source_id] = _synthetic_axis_contract(synthetic[source_id][0])
+            forward_inputs_path = _benchmark_forward_model_inputs_path(
+                synthetic[source_id][0], benchmark_dir,
+            )
             resolved_sources[source_id] = {
                 "kind": "synthoseis_lite",
                 "benchmark_dir": repo_relative_path(benchmark_dir, root=root),
                 "schema_version": manifest.get("schema_version"),
+                "contract_fingerprint_sha256": manifest.get("contract_fingerprint_sha256", ""),
                 "sample_axis_contract": dict(source_contracts[source_id]),
                 "input_seismic_variant": source.get("input_seismic_variant", "nominal"),
                 "physics_target_variant": source.get("physics_target_variant", "model_consistent"),
             }
+            if forward_inputs_path is not None:
+                forward_model_inputs_by_source[source_id] = forward_inputs_path
+                resolved_sources[source_id]["forward_model_inputs_path"] = repo_relative_path(
+                    forward_inputs_path, root=root,
+                )
         elif source["kind"] == "real_field":
             raw_source = dict(source) | {
                 "model_input_seismic_transform": "identity",
@@ -830,6 +873,14 @@ def run_experiment(
                 "physics_target_seismic_transform": source.get("physics_target_seismic_transform", "identity"),
                 "validation_split": dict(source["validation_split"]),
             }
+            if source.get("forward_model_inputs_path") is not None:
+                forward_inputs_path = _source_path(source["forward_model_inputs_path"], root).resolve()
+                if not forward_inputs_path.is_file():
+                    raise FileNotFoundError(f"Depth forward_model_inputs_path not found: {forward_inputs_path}")
+                forward_model_inputs_by_source[source_id] = forward_inputs_path
+                resolved_sources[source_id]["forward_model_inputs_path"] = repo_relative_path(
+                    forward_inputs_path, root=root,
+                )
             if source.get("well_control_run_dir") is not None:
                 resolved_sources[source_id]["well_control_run_dir"] = repo_relative_path(
                     _source_path(source["well_control_run_dir"], root), root=root
@@ -860,6 +911,17 @@ def run_experiment(
         for block in stage["loss_blocks"]
     }
     experiment_axis_contract = validate_source_axis_contracts(source_contracts, consumed_sources)
+    forward_model_inputs_paths = {
+        path.resolve() for path in forward_model_inputs_by_source.values()
+    }
+    if len(forward_model_inputs_paths) > 1:
+        raise ValueError(
+            "A GINN-v2 experiment must use one depth forward_model_inputs contract."
+        )
+    forward_model_inputs_path = (
+        repo_relative_path(next(iter(forward_model_inputs_paths)), root=root)
+        if forward_model_inputs_paths else ""
+    )
     reference_index: pd.DataFrame | None = None
     reference_rows: pd.DataFrame | None = None
     if config.normalization_reference in synthetic:
@@ -1192,7 +1254,7 @@ def run_experiment(
             if selected < best_value:
                 best_value, best_epoch = selected, epoch
                 path = stage_dir / "checkpoint_best.pt"
-                torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="best", epoch=epoch, metric_name=metric_name, metric_value=selected, sample_axis=sample_axis_contract), path)
+                torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="best", epoch=epoch, metric_name=metric_name, metric_value=selected, sample_axis=sample_axis_contract, forward_model_inputs_path=forward_model_inputs_path), path)
                 checkpoints[(stage_id, "best")] = path
                 logger.info(
                     "checkpoint_best stage_id=%s epoch=%d metric=%s value=%.6g path=%s",
@@ -1203,7 +1265,7 @@ def run_experiment(
                     path,
                 )
         final_path = stage_dir / "checkpoint_final.pt"
-        torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="final", epoch=int(stage["epochs"]), metric_name=metric_name, metric_value=float(history[-1]["selection_metric_value"]), sample_axis=sample_axis_contract), final_path)
+        torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="final", epoch=int(stage["epochs"]), metric_name=metric_name, metric_value=float(history[-1]["selection_metric_value"]), sample_axis=sample_axis_contract, forward_model_inputs_path=forward_model_inputs_path), final_path)
         checkpoints[(stage_id, "final")] = final_path
         pd.DataFrame(history).to_csv(stage_dir / "training_history.csv", index=False)
         logger.info(
@@ -1237,6 +1299,7 @@ def run_experiment(
         "input_channels": ["seismic", "lfm", "valid_mask"],
         "output_semantics": "pred_log_ai = lfm_log_ai + physical_delta_log_ai",
         "sample_axis_contract": sample_axis_contract,
+        "forward_model_inputs_path": forward_model_inputs_path,
         "stages": manifest_stages,
         "deployment_checkpoint": {
             "stage_id": config.deployment_stage_id,
@@ -1248,6 +1311,30 @@ def run_experiment(
     if first_synthetic is not None and deployment_indices:
         manifest["benchmark_dir"] = repo_relative_path(first_synthetic[1], root=root)
         manifest["patch_index"] = repo_relative_path(deployment_indices[0], root=root)
+    manifest["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+    manifest["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+        contract_schema_version=EXPERIMENT_SCHEMA_VERSION,
+        semantics={
+            "experiment_id": config.experiment_id,
+            "sample_axis_contract": sample_axis_contract,
+            "output_semantics": manifest["output_semantics"],
+        },
+        business_config={
+            "architecture": config.architecture.as_dict(),
+            "patching": config.patching.as_dict(),
+            "deployment_checkpoint": manifest["deployment_checkpoint"],
+        },
+        input_contracts={
+            f"source:{source_id}": str(source["contract_fingerprint_sha256"])
+            for source_id, source in resolved_sources.items()
+            if str(source.get("contract_fingerprint_sha256") or "")
+        },
+        primary_artifacts={
+            "deployment_checkpoint": deployment_path,
+            "normalization": output_dir / "normalization.json",
+            "input_reference_stats": input_stats_path,
+        },
+    )
     write_json(output_dir / "experiment_manifest.json", manifest)
     write_json(output_dir / "model_run_manifest.json", manifest)
     logger.info(

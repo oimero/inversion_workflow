@@ -715,6 +715,9 @@ def run_zero_shot_model(
         "input_contracts": {
             "model_run": {
                 "path": repo_relative_path(model_run_dir / "model_run_manifest.json", root=root),
+                "contract_fingerprint_sha256": require_contract_fingerprint(
+                    manifest, label=f"model run {model_run_dir}"
+                ),
             }
         },
         "experiment_id": experiment_id,
@@ -895,6 +898,9 @@ def run_zero_shot_volume_model(
         "input_contracts": {
             "model_run": {
                 "path": repo_relative_path(model_run_dir / "model_run_manifest.json", root=root),
+                "contract_fingerprint_sha256": require_contract_fingerprint(
+                    manifest, label=f"model run {model_run_dir}"
+                ),
             }
         },
         "output_mode": "volume",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
 from typing import Any, Iterable, Mapping
@@ -409,6 +410,8 @@ def _row_slice(row: Mapping[str, Any]) -> tuple[slice, slice]:
 
 
 class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
+    _DEFAULT_SAMPLE_CACHE_SIZE = 8
+
     def __init__(
         self,
         benchmark: SynthoseisBenchmark,
@@ -416,6 +419,7 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         *,
         split: str | Iterable[str],
         normalization: Mapping[str, Any],
+        sample_cache_size: int = _DEFAULT_SAMPLE_CACHE_SIZE,
     ) -> None:
         if isinstance(split, str):
             splits = {split}
@@ -427,13 +431,26 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         self.benchmark = benchmark
         self.frame = frame.reset_index(drop=True)
         self.normalization = normalization
+        if int(sample_cache_size) <= 0:
+            raise ValueError("sample_cache_size must be positive.")
+        self._sample_cache_size = int(sample_cache_size)
+        self._sample_cache: OrderedDict[str, Any] = OrderedDict()
 
     def __len__(self) -> int:
         return int(len(self.frame))
 
+    def _load_sample(self, sample_id: str) -> Any:
+        cached = self._sample_cache.pop(sample_id, None)
+        if cached is None:
+            cached = self.benchmark.load_sample(sample_id)
+        self._sample_cache[sample_id] = cached
+        while len(self._sample_cache) > self._sample_cache_size:
+            self._sample_cache.popitem(last=False)
+        return cached
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         row = self.frame.iloc[int(index)].to_dict()
-        sample = self.benchmark.load_sample(str(row["sample_id"]))
+        sample = self._load_sample(str(row["sample_id"]))
         target, seismic, lfm, valid = _aligned_arrays(sample)
         sl = _row_slice(row)
         target_patch = target[sl]

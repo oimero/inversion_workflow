@@ -6,6 +6,7 @@ The composable runner owns training; this module owns benchmark patch evaluation
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
 from typing import Any, Mapping
 
 import h5py
@@ -53,42 +54,80 @@ def predict_patches(
         normalization=checkpoint["normalization"],
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-    predictions = []
-    targets = []
-    masks = []
-    lfm_values = []
-    lfm_ideal_values = []
-    patch_ids = []
-    sample_ids = []
-    with torch.no_grad():
-        for batch in loader:
-            x = batch["input"].to(device)
-            pred_delta = model(x).detach().cpu().numpy()[:, 0]
-            lfm = batch["lfm"].numpy()[:, 0]
-            prediction = lfm + pred_delta
-            predictions.append(prediction.astype(np.float32))
-            targets.append(batch["target_log_ai"].numpy()[:, 0].astype(np.float32))
-            masks.append(batch["valid_mask"].numpy()[:, 0].astype(bool))
-            lfm_values.append(lfm.astype(np.float32))
-            lfm_ideal_values.append(batch["lfm_ideal"].numpy()[:, 0].astype(np.float32))
-            patch_ids.extend([str(value) for value in batch["patch_id"]])
-            sample_ids.extend([str(value) for value in batch["sample_id"]])
-    pred_array = np.concatenate(predictions, axis=0)
-    target_array = np.concatenate(targets, axis=0)
-    mask_array = np.concatenate(masks, axis=0)
-    lfm_array = np.concatenate(lfm_values, axis=0)
-    lfm_ideal_array = np.concatenate(lfm_ideal_values, axis=0)
     npz_path = output_dir / "predictions.npz"
-    np.savez_compressed(
-        npz_path,
-        pred_log_ai=pred_array,
-        target_log_ai=target_array,
-        valid_mask_model=mask_array,
-        lfm_controlled_degraded=lfm_array,
-        lfm_ideal=lfm_ideal_array,
-        patch_id=np.asarray(patch_ids),
-        sample_id=np.asarray(sample_ids),
-    )
+    patch_count = int(len(selected))
+    lateral_sizes = selected["patch_lateral_samples"].astype(int).unique()
+    vertical_sizes = selected["patch_twt_samples"].astype(int).unique()
+    if len(lateral_sizes) != 1 or len(vertical_sizes) != 1:
+        raise ValueError("Prediction patch index must use one fixed patch shape.")
+    patch_shape = (int(lateral_sizes[0]), int(vertical_sizes[0]))
+    buffer_dir = output_dir / ".predict_buffers"
+    if buffer_dir.exists():
+        shutil.rmtree(buffer_dir, ignore_errors=True)
+    buffer_dir.mkdir()
+    buffers = {
+        "pred_log_ai": np.lib.format.open_memmap(
+            buffer_dir / "pred_log_ai.npy", mode="w+", dtype=np.float32,
+            shape=(patch_count, *patch_shape),
+        ),
+        "target_log_ai": np.lib.format.open_memmap(
+            buffer_dir / "target_log_ai.npy", mode="w+", dtype=np.float32,
+            shape=(patch_count, *patch_shape),
+        ),
+        "valid_mask_model": np.lib.format.open_memmap(
+            buffer_dir / "valid_mask_model.npy", mode="w+", dtype=bool,
+            shape=(patch_count, *patch_shape),
+        ),
+        "lfm_controlled_degraded": np.lib.format.open_memmap(
+            buffer_dir / "lfm_controlled_degraded.npy", mode="w+", dtype=np.float32,
+            shape=(patch_count, *patch_shape),
+        ),
+        "lfm_ideal": np.lib.format.open_memmap(
+            buffer_dir / "lfm_ideal.npy", mode="w+", dtype=np.float32,
+            shape=(patch_count, *patch_shape),
+        ),
+    }
+    patch_ids: list[str] = []
+    sample_ids: list[str] = []
+    offset = 0
+    try:
+        with torch.no_grad():
+            for batch in loader:
+                x = batch["input"].to(device)
+                pred_delta = model(x).detach().cpu().numpy()[:, 0]
+                lfm = batch["lfm"].numpy()[:, 0]
+                prediction = lfm + pred_delta
+                batch_count = int(prediction.shape[0])
+                end = offset + batch_count
+                if end > patch_count:
+                    raise RuntimeError("Prediction loader returned more patches than its index.")
+                buffers["pred_log_ai"][offset:end] = prediction.astype(np.float32)
+                buffers["target_log_ai"][offset:end] = batch["target_log_ai"].numpy()[:, 0].astype(np.float32)
+                buffers["valid_mask_model"][offset:end] = batch["valid_mask"].numpy()[:, 0].astype(bool)
+                buffers["lfm_controlled_degraded"][offset:end] = lfm.astype(np.float32)
+                buffers["lfm_ideal"][offset:end] = batch["lfm_ideal"].numpy()[:, 0].astype(np.float32)
+                patch_ids.extend(str(value) for value in batch["patch_id"])
+                sample_ids.extend(str(value) for value in batch["sample_id"])
+                offset = end
+        if offset != patch_count:
+            raise RuntimeError(
+                f"Prediction loader returned {offset} patches but its index contains {patch_count}."
+            )
+        for array in buffers.values():
+            array.flush()
+        np.savez_compressed(
+            npz_path,
+            pred_log_ai=buffers["pred_log_ai"],
+            target_log_ai=buffers["target_log_ai"],
+            valid_mask_model=buffers["valid_mask_model"],
+            lfm_controlled_degraded=buffers["lfm_controlled_degraded"],
+            lfm_ideal=buffers["lfm_ideal"],
+            patch_id=np.asarray(patch_ids),
+            sample_id=np.asarray(sample_ids),
+        )
+    finally:
+        buffers.clear()
+        shutil.rmtree(buffer_dir, ignore_errors=True)
     selected = selected.set_index("patch_id").loc[patch_ids].reset_index()
     selected["prediction_row"] = np.arange(len(selected), dtype=int)
     selected["architecture_id"] = str(checkpoint["architecture"]["id"])
@@ -98,7 +137,7 @@ def predict_patches(
         "status": "ok",
         "prediction_npz": npz_path,
         "prediction_index": index_path,
-        "n_predictions": int(pred_array.shape[0]),
+        "n_predictions": patch_count,
         "architecture_id": str(checkpoint["architecture"]["id"]),
         "model_info": dict(checkpoint["model_info"]),
         "normalization": dict(checkpoint["normalization"]),

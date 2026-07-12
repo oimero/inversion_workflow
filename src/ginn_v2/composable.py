@@ -132,6 +132,79 @@ class DeterministicCycler:
         return next(iter(DataLoader(Subset(self.dataset, indices), batch_size=len(indices), shuffle=False)))
 
 
+class DeterministicSampleKindCycler:
+    """Deterministically balance synthetic sample kinds at epoch scope."""
+
+    def __init__(
+        self,
+        dataset: Dataset[Any],
+        *,
+        batch_size: int,
+        num_batches: int,
+        seed: int,
+    ) -> None:
+        if len(dataset) == 0:
+            raise ValueError("Loss block dataset is empty.")
+        if int(batch_size) <= 0 or int(num_batches) <= 0:
+            raise ValueError("Balanced sampler batch_size and num_batches must be positive.")
+        frame = getattr(dataset, "frame", None)
+        if not isinstance(frame, pd.DataFrame) or "sample_kind" not in frame:
+            raise ValueError("balanced_sample_kind requires a patch dataset with sample_kind metadata.")
+        groups: dict[str, list[int]] = {}
+        for index, value in enumerate(frame["sample_kind"].astype(str)):
+            groups.setdefault(value, []).append(int(index))
+        groups = {kind: indices for kind, indices in sorted(groups.items()) if indices}
+        if not groups:
+            raise ValueError("balanced_sample_kind found no sample-kind groups.")
+        if len(groups) > 2:
+            raise ValueError(
+                "balanced_sample_kind only supports base and seismic_variant groups; "
+                f"found {sorted(groups)}."
+            )
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.num_batches = int(num_batches)
+        self.sample_kinds = tuple(groups)
+        self.degenerated = len(groups) == 1
+        rng = np.random.default_rng(int(seed))
+        total_items = self.batch_size * self.num_batches
+        if self.degenerated:
+            schedule = [self.sample_kinds[0]] * total_items
+        else:
+            half = total_items // 2
+            extra_to_first = int(rng.integers(0, 2)) if total_items % 2 else 0
+            counts = [half + extra_to_first, total_items - half - extra_to_first]
+            schedule = [self.sample_kinds[0]] * counts[0] + [self.sample_kinds[1]] * counts[1]
+            rng.shuffle(schedule)
+        self._schedule = schedule
+        self._cursor = 0
+        self._rng = rng
+        self._orders = {
+            kind: rng.permutation(indices).tolist() for kind, indices in groups.items()
+        }
+        self._positions = {kind: 0 for kind in groups}
+        self.last_batch_counts: dict[str, int] = {}
+
+    def next(self) -> Any:
+        if self._cursor + self.batch_size > len(self._schedule):
+            raise RuntimeError("Balanced sampler exhausted its configured epoch batch count.")
+        indices: list[int] = []
+        counts: dict[str, int] = {}
+        for kind in self._schedule[self._cursor : self._cursor + self.batch_size]:
+            position = self._positions[kind]
+            order = self._orders[kind]
+            if position >= len(order):
+                order = self._rng.permutation(order).tolist()
+                self._orders[kind] = order
+                position = 0
+            indices.append(order[position])
+            self._positions[kind] = position + 1
+            counts[kind] = counts.get(kind, 0) + 1
+        self._cursor += self.batch_size
+        self.last_batch_counts = counts
+        return next(iter(DataLoader(Subset(self.dataset, indices), batch_size=len(indices), shuffle=False)))
+
+
 def _seed(base: int, stage_index: int, block_index: int, epoch: int) -> int:
     return int(np.random.SeedSequence([base, stage_index, block_index, epoch]).generate_state(1)[0])
 
@@ -871,22 +944,74 @@ def run_experiment(
         history: list[dict[str, Any]] = []
         metric_name = str(stage["validation"]["selection_metric"])
         for epoch in range(1, int(stage["epochs"]) + 1):
-            cyclers = [
-                (DeterministicCycler(block.train_dataset, batch_size=int(block.config["batch_size"]), seed=_seed(config.seed, stage_index, index, epoch)) if block.train_dataset is not None else None)
-                for index, block in enumerate(prepared_blocks)
-            ]
+            cyclers = []
+            for index, block in enumerate(prepared_blocks):
+                if block.train_dataset is None:
+                    cyclers.append(None)
+                    continue
+                batch_size = int(block.config["batch_size"])
+                interval = int(block.config["update_interval"])
+                num_batches = (int(stage["steps_per_epoch"]) + interval - 1) // interval
+                sampling_kind = str(dict(block.config.get("sampling") or {}).get("kind") or "uniform_patch")
+                seed = _seed(config.seed, stage_index, index, epoch)
+                if sampling_kind == "balanced_sample_kind":
+                    if str(block.config.get("source_kind")) != "synthoseis_lite":
+                        raise ValueError(
+                            f"Loss block {block.config['block_id']} uses balanced_sample_kind "
+                            "with a non-synthetic source."
+                        )
+                    cycler = DeterministicSampleKindCycler(
+                        block.train_dataset,
+                        batch_size=batch_size,
+                        num_batches=num_batches,
+                        seed=seed,
+                    )
+                    if cycler.degenerated:
+                        logger.info(
+                            "block=%s sampling=balanced_sample_kind "
+                            "balanced_sample_kind_degenerated_to_single_group",
+                            block.config["block_id"],
+                        )
+                elif sampling_kind == "uniform_patch":
+                    cycler = DeterministicCycler(
+                        block.train_dataset,
+                        batch_size=batch_size,
+                        seed=seed,
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported sampling.kind for block {block.config['block_id']}: "
+                        f"{sampling_kind!r}"
+                    )
+                cyclers.append(cycler)
             model.train()
             totals: dict[str, list[dict[str, float]]] = {
                 str(block.config["block_id"]): [] for block in prepared_blocks
             }
             batch_counts = {str(block.config["block_id"]): 0 for block in prepared_blocks}
+            sampled_kind_counts: dict[str, dict[str, int]] = {
+                str(block.config["block_id"]): {} for block in prepared_blocks
+            }
             for step in range(int(stage["steps_per_epoch"])):
                 optimizer.zero_grad(set_to_none=True)
                 combined: torch.Tensor | None = None
                 for block_index, prepared in enumerate(prepared_blocks):
                     if step % int(prepared.config["update_interval"]) != 0:
                         continue
-                    batch = cyclers[block_index].next() if cyclers[block_index] is not None else None
+                    cycler = cyclers[block_index]
+                    batch = cycler.next() if cycler is not None else None
+                    if cycler is not None and hasattr(cycler, "last_batch_counts"):
+                        block_counts = sampled_kind_counts[str(prepared.config["block_id"])]
+                        for sample_kind, count in cycler.last_batch_counts.items():
+                            block_counts[sample_kind] = block_counts.get(sample_kind, 0) + int(count)
+                    elif isinstance(batch, dict) and "sample_kind" in batch:
+                        block_counts = sampled_kind_counts[str(prepared.config["block_id"])]
+                        values = batch["sample_kind"]
+                        if isinstance(values, str):
+                            values = [values]
+                        for sample_kind in values:
+                            key = str(sample_kind)
+                            block_counts[key] = block_counts.get(key, 0) + 1
                     loss, diagnostics = _block_loss(prepared, batch, model, device=device, normalization=normalization)
                     weighted = float(prepared.config["weight"]) * loss
                     combined = weighted if combined is None else combined + weighted
@@ -899,9 +1024,8 @@ def run_experiment(
                 combined.backward()
                 optimizer.step()
             validation_values: dict[str, float] = {}
-            validation_steps = stage["validation"].get("steps") if stage["validation"]["mode"] == "fixed_steps" else None
             for prepared in prepared_blocks:
-                metrics = _evaluate(prepared=prepared, model=model, device=device, normalization=normalization, steps=validation_steps)
+                metrics = _evaluate(prepared=prepared, model=model, device=device, normalization=normalization, steps=None)
                 for name, value in metrics.items():
                     validation_values[f"{prepared.config['block_id']}.{name}"] = value
             selected = float(validation_values[metric_name])
@@ -925,6 +1049,13 @@ def run_experiment(
                 **training_values,
                 **validation_values,
             }
+            for block_id, kind_counts in sampled_kind_counts.items():
+                for sample_kind in ("base", "seismic_variant"):
+                    row[f"{block_id}.sampled_{sample_kind}_count"] = int(kind_counts.get(sample_kind, 0))
+                row[f"{block_id}.sampled_other_kind_count"] = int(
+                    sum(count for sample_kind, count in kind_counts.items()
+                        if sample_kind not in {"base", "seismic_variant"})
+                )
             history.append(row)
             if selected < best_value:
                 best_value, best_epoch = selected, epoch
@@ -975,6 +1106,6 @@ def run_experiment(
 
 
 __all__ = [
-    "DeterministicCycler", "masked_centered_rms", "run_experiment",
+    "DeterministicCycler", "DeterministicSampleKindCycler", "masked_centered_rms", "run_experiment",
     "validate_source_axis_contracts",
 ]

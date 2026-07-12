@@ -25,17 +25,6 @@ class PatchSpec:
     twt_stride: int = 64
 
 
-def default_train_kinds(architecture_id: str) -> set[str]:
-    """Compatibility helper for evaluation code; training kinds belong to sources."""
-    if architecture_id not in {
-        "trace_conv1d", "trace_dilated_tcn", "trace_lateral_mixer", "patch_conv2d"
-    }:
-        raise ValueError(
-            "Legacy model IDs are not accepted; sample variants are configured on sources."
-        )
-    return {"base"}
-
-
 def default_eval_kinds() -> set[str]:
     return {
         "base",
@@ -233,6 +222,7 @@ def build_patch_index(
                         "sample_kind": row.get("sample_kind", "base"),
                         "parent_realization_id": parent,
                         "split": split,
+                        "evaluation_role": row.get("evaluation_role", ""),
                         "hdf5_group": row.get("hdf5_group", ""),
                         "lateral_start": lateral_start,
                         "lateral_stop": lateral_start + patch_spec.lateral_samples,

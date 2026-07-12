@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -11,6 +12,16 @@ import pandas as pd
 import torch
 
 from cup.physics.torch_backend import forward_depth, forward_time, velocity_from_ai
+from cup.utils.logging import configure_run_logger
+
+
+def configure_training_logger(output_dir: Path) -> logging.Logger:
+    """Create the logger shared by the composable runner and CLI."""
+    return configure_run_logger(
+        output_dir,
+        logger_name="ginn_v2",
+        file_name="training.log",
+    )
 
 
 def resolve_device(device_name: str) -> tuple[torch.device, dict[str, Any]]:
@@ -142,4 +153,10 @@ def forward_physics_batch(
     )
 
 
-__all__ = ["forward_physics_batch", "load_benchmark_wavelet", "masked_mse", "resolve_device"]
+__all__ = [
+    "configure_training_logger",
+    "forward_physics_batch",
+    "load_benchmark_wavelet",
+    "masked_mse",
+    "resolve_device",
+]

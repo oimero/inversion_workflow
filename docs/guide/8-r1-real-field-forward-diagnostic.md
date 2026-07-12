@@ -300,7 +300,7 @@ synthetic[l] = Σ_j wavelet(twt[l] - event_twt[j]) * r[j]
 
 ### 第二步：看 `forward_diagnostic_metrics.csv`
 
-按 `model_role` 列分组，比较各类输入的 `residual_corr_scaled`（带尺度优化的波形相关系数）和 `residual_rms_scaled`（标准化后的残差 RMS）：
+按 `model` 列分组，比较各类输入的 `residual_corr_scaled`（带尺度优化的波形相关系数）和 `residual_rms_scaled`（标准化后的残差 RMS）：
 
 - `lfm_only`：低频模型的正演匹配——这是基线。如果它已经很差（如相关系数 < 0.3），说明正演所用的子波本身就和地震数据不匹配。
 - 各模型的 experiment_id：模型的匹配应该优于 `lfm_only`。如果更差，说明模型的波阻抗偏离了物理约束。

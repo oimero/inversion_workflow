@@ -167,7 +167,7 @@ def _validate_model_sample_axis(
 def _manifest_experiment_id(manifest: Mapping[str, Any]) -> str:
     experiment_id = str(manifest.get("experiment_id") or "").strip()
     if not experiment_id:
-        raise ValueError("GINN-v2 v1 manifest must contain experiment_id; model_role is obsolete.")
+        raise ValueError("GINN-v2 v1 manifest must contain experiment_id.")
     return experiment_id
 
 

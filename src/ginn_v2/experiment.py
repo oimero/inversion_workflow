@@ -37,12 +37,12 @@ SOURCE_KEYS = {
 LOSS_KEYS = {
     "synthetic_supervised": {
         "block_id", "kind", "source", "weight", "update_interval", "batch_size",
-        "min_valid_samples",
+        "min_valid_samples", "sampling",
     },
     "physics": {
         "block_id", "kind", "source", "weight", "update_interval", "batch_size",
         "min_valid_samples", "delta_l2_weight", "waveform_standardization",
-        "centered_rms_epsilon", "min_centered_rms",
+        "centered_rms_epsilon", "min_centered_rms", "sampling",
     },
     "real_well_supervised": {
         "block_id", "kind", "source", "weight", "update_interval", "batch_size",
@@ -269,6 +269,29 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
             block["weight"] = _finite(block.get("weight"), f"{block_id}.weight", nonnegative=True)
             for key in ("update_interval", "batch_size", "min_valid_samples"):
                 block[key] = _positive_int(block.get(key), f"{block_id}.{key}")
+            if kind in {"synthetic_supervised", "physics"}:
+                if sources[source_id]["kind"] == "synthoseis_lite":
+                    sampling = _mapping(
+                        block.get("sampling") or {"kind": "uniform_patch"},
+                        f"{block_id}.sampling",
+                    )
+                    _reject_extra(sampling, {"kind"}, f"{block_id}.sampling")
+                    sampling_kind = str(sampling.get("kind") or "")
+                    if sampling_kind not in {"uniform_patch", "balanced_sample_kind"}:
+                        raise ValueError(
+                            f"{block_id}.sampling.kind must be uniform_patch or "
+                            "balanced_sample_kind."
+                        )
+                    block["sampling"] = {"kind": sampling_kind}
+                    if sampling_kind == "balanced_sample_kind":
+                        block["sampling"]["groups"] = {
+                            "base": 0.5,
+                            "seismic_variant": 0.5,
+                        }
+                elif "sampling" in block:
+                    raise ValueError(
+                        f"{block_id}.sampling is only supported for synthoseis_lite blocks."
+                    )
             if kind == "physics":
                 block["delta_l2_weight"] = _finite(block.get("delta_l2_weight"), f"{block_id}.delta_l2_weight", positive=True)
                 source_kind = str(sources[source_id]["kind"])
@@ -303,13 +326,14 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
                 f"Stage {stage_id} selection_metric {metric!r} is not exported by "
                 f"{metric_block['kind']}."
             )
-        mode = str(validation.get("mode") or "")
-        if mode not in {"full", "fixed_steps"}:
-            raise ValueError(f"Stage {stage_id} validation.mode must be full or fixed_steps.")
-        if mode == "full" and "steps" in validation:
-            raise ValueError("validation.steps is not allowed for mode=full.")
-        if mode == "fixed_steps":
-            validation["steps"] = _positive_int(validation.get("steps"), "validation.steps")
+        mode = str(validation.get("mode") or "full")
+        if mode != "full":
+            raise ValueError(
+                f"Stage {stage_id} validation.mode must be full; v1 validation never resamples."
+            )
+        if "steps" in validation:
+            raise ValueError("validation.steps is not supported; validation is a full deterministic pass.")
+        validation["mode"] = "full"
         stage.update({
             "epochs": _positive_int(stage.get("epochs"), f"{stage_id}.epochs"),
             "steps_per_epoch": _positive_int(stage.get("steps_per_epoch"), f"{stage_id}.steps_per_epoch"),

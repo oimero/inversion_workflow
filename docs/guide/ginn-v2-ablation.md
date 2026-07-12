@@ -69,7 +69,7 @@ GINN v2 的训练配方由五层组件自由组合而成：
 | 架构 | 横向行为 | 纵向行为 | 适用场景 |
 |------|------|------|------|
 | `trace_conv1d` | 逐道独立，完全看不到邻居 | 5 层普通 Conv1d | 最简单的基线——如果没有横向信息，模型能做到什么程度？ |
-| `trace_dilated_tcn` | 逐道独立 | 膨胀 Conv1d，depth=5 时纵向感受野约 125 点 | 单道基线但纵向视野更大——比 trace_conv1d 看得更深 |
+| `trace_dilated_tcn` | 逐道独立 | 膨胀 Conv1d，depth=5 时纵向感受野 61 点 | 单道基线但纵向视野更大——比 trace_conv1d 看得更深 |
 | `trace_lateral_mixer` | 浅层横向混合，视野 = `lateral_kernel`（默认 3） | 同 dilated TCN | **关键消融点**：加了一点点横向信息，效果变好还是变差？ |
 | `patch_conv2d` | 全横向，视野 = `1 + 2*depth` | 同横向视野 | 完全二维——横向信息最多但也最重 |
 
@@ -142,6 +142,10 @@ GINN v2 的训练配方由五层组件自由组合而成：
 | `batch_size` | 该 block 每个 step 取多少个 patch |
 | `min_valid_samples` | 该 block 对 patch 有效性的最低要求。patch 内有效样点不够就丢弃 |
 
+合成 block 还可以声明 `sampling.kind`：`uniform_patch` 按 patch 均匀循环，
+`balanced_sample_kind` 在 `base` 与 `seismic_variant` 之间按 epoch 级 50:50 抽样。
+使用 `observed_mismatch` 时，如果实验需要消除样本种类比例影响，必须显式选择后者。
+
 关键设计：**同一个原始窗口可以进入 block A 而不进入 block B**——每个 block 按自己的 mask 和 `min_valid_samples` 独立判断资格。所以各 block 的训练样本不完全重叠是正常的。
 
 **`synthetic_supervised` — 你有答案**
@@ -158,6 +162,8 @@ GINN v2 的训练配方由五层组件自由组合而成：
 |------|------|
 | `delta_l2_weight` | delta L2 正则的权重。防止模型仅靠正演拟合波形却产生不合理的绝对阻抗值 |
 | `waveform_standardization` | 合成数据固定 `raw`，真实工区固定 `masked_centered_rms`（在 patch 内独立做零均值 RMS 归一化后再比较） |
+| `centered_rms_epsilon` | 仅真实工区。centered RMS 分母的防零小量，默认 1e-12 |
+| `min_centered_rms` | 仅真实工区。waveform 项可用的最低 centered RMS 阈值，默认 1e-6 |
 
 合成数据上：`总损失 = waveform MSE + delta_l2_weight × (pred_delta² 的均值)`。
 
@@ -182,7 +188,7 @@ GINN v2 的训练配方由五层组件自由组合而成：
 阶段 2：field_physics
   优化器: AdamW lr=0.0001   ← 学习率独立设置
   损失: physics (weight=1.0) + real_well_supervised (weight=0.1, update_interval=4)
-  验证: 固定 100 步，选优指标 = waveform.total
+  验证: 全量，选优指标 = waveform.total
 ```
 
 阶段之间只传模型权重。上一阶段的 optimizer 状态（动量、学习率衰减等）全部清零重建。默认从上一阶段 best checkpoint 继承，也可以显式指定 `initialize_from: <stage_id>.final`。
@@ -231,7 +237,14 @@ ginn_v2:
       steps_per_epoch: 500
       optimizer: {kind: adamw, learning_rate: 0.001, weight_decay: 0.0001}
       loss_blocks:
-        - {block_id: synthetic_ai, kind: synthetic_supervised, source: synthetic, weight: 1.0, update_interval: 1, batch_size: 8, min_valid_samples: 128}
+        - block_id: synthetic_ai
+          kind: synthetic_supervised
+          source: synthetic
+          weight: 1.0
+          update_interval: 1
+          batch_size: 8
+          min_valid_samples: 128
+          sampling: {kind: balanced_sample_kind}
       validation: {selection_metric: synthetic_ai.mse, mode: full}
 
     - stage_id: field_physics
@@ -240,7 +253,7 @@ ginn_v2:
       optimizer: {kind: adamw, learning_rate: 0.0001, weight_decay: 0.0001}
       loss_blocks:
         - {block_id: waveform, kind: physics, source: field, weight: 1.0, update_interval: 1, batch_size: 8, min_valid_samples: 128, delta_l2_weight: 0.01}
-      validation: {selection_metric: waveform.total, mode: fixed_steps, steps: 100}
+      validation: {selection_metric: waveform.total, mode: full}
 
   deployment_checkpoint: last_stage.best
 ```
@@ -284,7 +297,7 @@ ginn_v2:
 - 每 epoch 后在冻结的验证索引上计算选优指标，更新 best checkpoint
 - 阶段结束时写出 best 和 final 两个 checkpoint 及完整训练历史
 
-**6) 写入实验 manifest。** 记录完整的架构合同、归一化统计量、全部 source 路径和契约指纹、有序 stage 配置、每阶段的 checkpoints 和训练历史、部署 checkpoint 的显式引用，以及实验级唯一契约指纹。
+**6) 写入实验 manifest。** 记录完整的架构合同、归一化统计量、全部 source 路径和采样/轴合同、有序 stage 配置、每阶段的 checkpoints 和训练历史，以及部署 checkpoint 的显式引用。
 
 ### 合成评估
 
@@ -294,11 +307,23 @@ ginn_v2:
 
 **报告（`report` 子命令）：** 消费预测结果，计算回归指标（RMSE、NRMSE、相关系数）、几何分解指标（边界误差、事件误差、横向梯度误差）、拼接指标和频率探针指标。同时计算低频模型基线和理想低频基线的对照指标。输出指标 CSV 和多面板对比图。
 
+正式实验还要单独评估 geometry holdout：
+
+```powershell
+python scripts/ginn_v2.py --output-dir scripts/output/ginn_v2_test_predict `
+  predict --model-run-dir experiments/ginn_v2/results/<experiment_id> --split test
+python scripts/ginn_v2.py --output-dir scripts/output/ginn_v2_test_report `
+  report --prediction-dir scripts/output/ginn_v2_test_predict
+```
+
+报告中的 `model_patch_metrics_geometry_holdout.csv` 和
+`model_patch_metrics_geometry_holdout_by_family.csv` 是 pinchout holdout 的独立结果。
+
 ### 真实工区推理
 
 训练完成的模型可以直接用于真实工区的零样本推理（R0）。详见 [08 R0 真实工区零样本预测](8-r0-real-field-zero-shot.md)。新架构下的关键变化：
 
-- 通过 `experiment_id` 引用模型，不再使用 `model_role`
+- 实验和部署产物通过 `experiment_id` 组织；R0 读取该实验的 deployment checkpoint
 - 部署 checkpoint 的 patch 几何、归一化和覆盖合同全部冻结在 manifest 中
 - R0 推理读取这些合同，确保任何包含有效样点的窗口都参与推理，不再因全局有效比例阈值丢弃窗口
 
@@ -312,7 +337,7 @@ ginn_v2:
 
 | 文件 | 内容 |
 |------|------|
-| `experiment_manifest.json` | 完整实验身份：架构合同、source 路径和契约、归一化、有序 stage 摘要、部署 checkpoint 引用、实验级契约指纹 |
+| `experiment_manifest.json` | 完整实验身份：架构合同、source 路径和采样/轴合同、归一化、有序 stage 摘要、部署 checkpoint 引用 |
 | `model_run_manifest.json` | 与 experiment manifest 内容相同，用于下游模型消费 |
 | `normalization.json` | 冻结的地震和 LFM 均值/标准差 |
 | `input_reference_stats.json` | 地震数据值域变换的参考统计量 |
@@ -337,6 +362,7 @@ ginn_v2:
 | `predictions.npz` | 预测 logAI、真值、低频模型和 mask |
 | `prediction_index.csv` | 每个 patch 的元数据 |
 | `model_patch_metrics.csv` | 每个 patch 的回归指标 |
+| `model_patch_metrics_by_sample_kind.csv` | 按 sample kind 分组的回归指标 |
 | `model_geometry_patch_metrics.csv` | 每个 patch 的几何分解指标 |
 | `model_report_card.json` | 汇总报告卡 |
 

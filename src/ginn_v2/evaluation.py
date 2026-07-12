@@ -1,674 +1,29 @@
-"""Training and prediction helpers for GINN-v2 ablations."""
+"""Synthetic patch prediction and reporting for GINN-v2.
+
+The composable runner owns training; this module owns benchmark patch evaluation.
+"""
 
 from __future__ import annotations
 
-import hashlib
-import json
-import logging
 from pathlib import Path
-import time
 from typing import Any, Mapping
 
 import h5py
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 
-from cup.physics.torch_backend import forward_depth, forward_time, velocity_from_ai
 from cup.synthetic.dataset import SynthoseisBenchmark
 from cup.synthetic.metrics import regression_metrics
 from cup.utils.io import write_json
-from cup.utils.logging import configure_run_logger
-from ginn_v2.contracts import CHECKPOINT_SCHEMA_VERSION, PATCH_SMOKE_REPORT_SCHEMA_VERSION
-from ginn_v2.data import PatchDataset, _aligned_arrays, default_train_kinds, denormalize_delta
-from ginn_v2.models import build_model
+from ginn_v2.checkpoint import load_checkpoint
+from ginn_v2.contracts import PATCH_SMOKE_REPORT_SCHEMA_VERSION
+from ginn_v2.data import PatchDataset, _aligned_arrays
+from ginn_v2.runtime import resolve_device
 
 
 PROBE_SAMPLE_KINDS = {"frequency_probe", "frequency_probe_seismic_variant"}
-PHYSICS_LOSS_MODEL_IDS = {
-    "patch_2d_with_physics_loss",
-    "trace_1d_dilated_tcn_mismatch_training",
-}
-
-
-def configure_training_logger(output_dir: Path) -> logging.Logger:
-    """Create the per-run terminal and file logger."""
-    return configure_run_logger(
-        output_dir,
-        logger_name="ginn_v2.training",
-        file_name="training.log",
-    )
-
-
-def resolve_device(device_name: str) -> tuple[torch.device, dict[str, Any]]:
-    """Resolve a requested torch device and return auditable metadata.
-
-    ``auto`` keeps the historical behavior: use CUDA when available, otherwise
-    CPU.  Explicit values such as ``cuda`` are not softened into a fallback; if
-    the runtime cannot satisfy them, PyTorch will fail before the run produces
-    outputs.
-    """
-
-    requested = str(device_name or "auto")
-    cuda_available = bool(torch.cuda.is_available())
-    resolved = requested if requested != "auto" else ("cuda" if cuda_available else "cpu")
-    if requested.startswith("cuda") and not cuda_available:
-        raise RuntimeError("Requested CUDA device, but torch.cuda.is_available() is false.")
-    device = torch.device(resolved)
-    device_name_text = ""
-    if device.type == "cuda" and cuda_available:
-        device_name_text = torch.cuda.get_device_name(device)
-    metadata = {
-        "requested_device": requested,
-        "resolved_device": str(device),
-        "cuda_available": cuda_available,
-        "cuda_device_count": int(torch.cuda.device_count()) if cuda_available else 0,
-        "cuda_device_name": device_name_text,
-        "torch_version": str(torch.__version__),
-    }
-    return device, metadata
-
-
-def masked_mse(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    valid = mask > 0.5
-    if torch.count_nonzero(valid) == 0:
-        raise ValueError("Batch has no valid samples.")
-    residual = prediction[valid] - target[valid]
-    return torch.mean(residual * residual)
-
-
-def train_model(
-    *,
-    benchmark: SynthoseisBenchmark,
-    patch_index: pd.DataFrame,
-    normalization: Mapping[str, Any],
-    output_dir: Path,
-    model_id: str,
-    epochs: int,
-    batch_size: int,
-    learning_rate: float,
-    hidden_channels: int,
-    depth: int,
-    device_name: str,
-    lambda_physics: float,
-    lambda_real_delta: float,
-    seed: int,
-    real_delta_support: Any | None = None,
-    log_interval_batches: int = 10,
-    logger: logging.Logger | None = None,
-) -> dict[str, Any]:
-    raise RuntimeError(
-        "The pre-composable GINN-v2 trainer is retired. "
-        "Use ginn_v2.composable.run_experiment with ginn_v2_experiment_v1."
-    )
-    sample_axis_contract = _benchmark_sample_axis_contract(benchmark.manifest)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    logger = logger or configure_training_logger(output_dir)
-    if not np.isfinite(lambda_real_delta) or float(lambda_real_delta) < 0.0:
-        raise ValueError("lambda_real_delta must be finite and non-negative.")
-    if int(log_interval_batches) <= 0:
-        raise ValueError("log_interval_batches must be positive.")
-    if float(lambda_real_delta) > 0.0 and real_delta_support is None:
-        raise ValueError("Non-zero lambda_real_delta requires train.real_delta configuration.")
-    if lambda_physics != 0.0:
-        if model_id not in PHYSICS_LOSS_MODEL_IDS:
-            raise NotImplementedError(
-                "Non-zero physics loss is currently only implemented for: "
-                f"{sorted(PHYSICS_LOSS_MODEL_IDS)}."
-            )
-    allowed_kinds = default_train_kinds(model_id)
-    unexpected = sorted(set(patch_index["sample_kind"].astype(str)) - allowed_kinds)
-    if unexpected:
-        raise ValueError(
-            f"Patch index contains sample_kind values not allowed for {model_id}: {unexpected}. "
-            f"Allowed: {sorted(allowed_kinds)}"
-        )
-    torch.manual_seed(int(seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(seed))
-    generator = torch.Generator()
-    generator.manual_seed(int(seed))
-    device, device_metadata = resolve_device(device_name)
-    logger.info(
-        "training setup: model=%s device=%s seed=%d epochs=%d batch_size=%d",
-        model_id,
-        device,
-        int(seed),
-        int(epochs),
-        int(batch_size),
-    )
-    train_ds = PatchDataset(
-        benchmark,
-        patch_index,
-        split="train",
-        normalization=normalization,
-    )
-    val_ds = PatchDataset(
-        benchmark,
-        patch_index,
-        split="validation",
-        normalization=normalization,
-    )
-    train_sample_kinds = train_ds.frame["sample_kind"].astype(str)
-    kind_counts = train_sample_kinds.value_counts().to_dict()
-    sample_weights = [1.0 / float(kind_counts[kind]) for kind in train_sample_kinds]
-    sampler = WeightedRandomSampler(
-        weights=torch.as_tensor(sample_weights, dtype=torch.double),
-        num_samples=len(sample_weights),
-        replacement=True,
-        generator=generator,
-    )
-    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
-    model, info = build_model(model_id, hidden_channels=hidden_channels, depth=depth)
-    model.to(device)
-    logger.info(
-        "model ready: parameters=%d train_patches=%d validation_patches=%d",
-        info.parameter_count,
-        len(train_ds),
-        len(val_ds),
-    )
-    reconstruction_error = None
-    if real_delta_support is not None:
-        real_delta_support.configure_model(
-            receptive_field_lateral=int(info.receptive_field_lateral)
-        )
-        logger.info(
-            "real-delta: validating %s real-well support",
-            (
-                "canonical full-patch"
-                if real_delta_support.canonical_full_patch
-                else "sparse-support/full-patch equivalence"
-            ),
-        )
-        reconstruction_error = real_delta_support.validate_reconstruction(
-            model,
-            device=device,
-        )
-        logger.info(
-            "real-delta: reconstruction max_abs_log_ai=%.9g",
-            reconstruction_error,
-        )
-    wavelet = (
-        _load_nominal_wavelet(benchmark.run_dir, device=device)
-        if float(lambda_physics) > 0.0
-        else None
-    )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(learning_rate))
-    history: list[dict[str, Any]] = []
-    best_val = float("inf")
-    best_epoch: int | None = None
-    best_path = output_dir / "checkpoint_best.pt"
-    final_path = output_dir / "checkpoint_final.pt"
-    history_path = output_dir / "training_history.csv"
-    existing_outputs = [
-        path for path in (best_path, final_path, history_path) if path.exists()
-    ]
-    if existing_outputs:
-        raise FileExistsError(
-            f"GINN-v2 training outputs already exist: {existing_outputs}"
-        )
-    sequence = hashlib.sha256()
-    total_batches = len(train_loader)
-    if total_batches <= 0:
-        raise ValueError("GINN-v2 training split has no batches.")
-    total_training_steps = int(epochs) * total_batches
-    completed_steps = 0
-    ema_batch_elapsed: float | None = None
-    run_started = time.perf_counter()
-    for epoch in range(1, int(epochs) + 1):
-        epoch_started = time.perf_counter()
-        logger.info("epoch %d/%d: training started", epoch, int(epochs))
-        model.train()
-        train_rows: list[dict[str, float | int]] = []
-        for batch_index, batch in enumerate(train_loader, start=1):
-            batch_started = time.perf_counter()
-            for patch_id in batch["patch_id"]:
-                sequence.update(str(patch_id).encode("utf-8"))
-                sequence.update(b"\0")
-            x = batch["input"].to(device)
-            target = batch["target_delta"].to(device)
-            mask = batch["valid_mask"].to(device)
-            optimizer.zero_grad(set_to_none=True)
-            pred = model(x)
-            loss_ai = masked_mse(pred, target, mask)
-            loss = loss_ai
-            loss_physics = torch.zeros((), dtype=loss.dtype, device=device)
-            if wavelet is not None:
-                sample_kinds = list(batch["sample_kind"])
-                physics_rows = [
-                    idx for idx, kind in enumerate(sample_kinds)
-                    if str(kind) == "base"
-                ]
-                if physics_rows:
-                    physics_index = torch.as_tensor(
-                        physics_rows,
-                        dtype=torch.long,
-                        device=device,
-                    )
-                    lfm = batch["lfm"].to(device).index_select(0, physics_index)
-                    seismic = batch["seismic_model_consistent"].to(device).index_select(0, physics_index)
-                    physics_mask = mask.index_select(0, physics_index)
-                    physics_pred = pred.index_select(0, physics_index)
-                    pred_log_ai = lfm + _denormalize_delta_torch(
-                        physics_pred[:, 0],
-                        normalization,
-                    )[:, None]
-                    wavelet_time_s, wavelet_amp, relation = wavelet
-                    sample_axes = batch["sample_axis"].to(device).index_select(0, physics_index)
-                    synthetic = _forward_physics_batch(
-                        pred_log_ai[:, 0],
-                        sample_axes=sample_axes,
-                        sample_domain=str(sample_axis_contract["sample_domain"]),
-                        wavelet_time_s=wavelet_time_s,
-                        wavelet_amp=wavelet_amp,
-                        ai_velocity_relation=relation,
-                    )
-                    seismic_target = seismic[:, 0]
-                    seismic_mask = batch["physics_valid_mask"].to(device).index_select(0, physics_index)[:, 0]
-                    loss_physics = masked_mse(
-                        synthetic,
-                        seismic_target,
-                        seismic_mask,
-                    )
-                    loss = loss + float(lambda_physics) * loss_physics
-            loss_real_delta = torch.zeros((), dtype=loss.dtype, device=device)
-            real_counts = {
-                "selected_real_clusters": 0,
-                "selected_real_wells": 0,
-                "selected_real_samples": 0,
-            }
-            if float(lambda_real_delta) > 0.0:
-                loss_real_delta, real_counts = real_delta_support.training_loss(
-                    model,
-                    device=device,
-                )
-                loss = loss + float(lambda_real_delta) * loss_real_delta
-            if not bool(torch.isfinite(loss)):
-                raise FloatingPointError(
-                    f"Non-finite GINN-v2 loss at epoch={epoch}, batch={batch_index}."
-                )
-            loss.backward()
-            optimizer.step()
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            batch_elapsed = time.perf_counter() - batch_started
-            ema_batch_elapsed = (
-                batch_elapsed
-                if ema_batch_elapsed is None
-                else 0.9 * ema_batch_elapsed + 0.1 * batch_elapsed
-            )
-            completed_steps += 1
-            values: dict[str, float | int] = {
-                "synthetic_loss": float(loss_ai.detach().cpu()),
-                "physics_loss": float(loss_physics.detach().cpu()),
-                "weighted_physics_loss": float(
-                    float(lambda_physics) * loss_physics.detach().cpu()
-                ),
-                "real_delta_loss": float(loss_real_delta.detach().cpu()),
-                "weighted_real_delta_loss": float(
-                    float(lambda_real_delta) * loss_real_delta.detach().cpu()
-                ),
-                "total_loss": float(loss.detach().cpu()),
-                **real_counts,
-            }
-            train_rows.append(values)
-            should_log = (
-                batch_index == 1
-                or batch_index == total_batches
-                or batch_index % int(log_interval_batches) == 0
-            )
-            if should_log:
-                epoch_remaining = total_batches - batch_index
-                run_remaining = total_training_steps - completed_steps
-                logger.info(
-                    "epoch=%d/%d batch=%d/%d synthetic=%.6g physics=%.6g "
-                    "weighted_physics=%.6g real_delta=%.6g "
-                    "weighted_real_delta=%.6g total=%.6g batch_s=%.2f "
-                    "ema_batch_s=%.2f epoch_eta_s=%.1f run_eta_s=%.1f "
-                    "real_clusters=%d real_wells=%d",
-                    epoch,
-                    int(epochs),
-                    batch_index,
-                    total_batches,
-                    values["synthetic_loss"],
-                    values["physics_loss"],
-                    values["weighted_physics_loss"],
-                    values["real_delta_loss"],
-                    values["weighted_real_delta_loss"],
-                    values["total_loss"],
-                    batch_elapsed,
-                    ema_batch_elapsed,
-                    epoch_remaining * ema_batch_elapsed,
-                    run_remaining * ema_batch_elapsed,
-                    values["selected_real_clusters"],
-                    values["selected_real_wells"],
-                )
-        logger.info("epoch %d/%d: synthetic validation started", epoch, int(epochs))
-        val_loss = evaluate_loss(model, val_loader, device)
-        epoch_elapsed = time.perf_counter() - epoch_started
-        frame = pd.DataFrame.from_records(train_rows)
-        row = {
-            "epoch": epoch,
-            "synthetic_loss": float(frame["synthetic_loss"].mean()),
-            "physics_loss": float(frame["physics_loss"].mean()),
-            "weighted_physics_loss": float(frame["weighted_physics_loss"].mean()),
-            "real_delta_loss": float(frame["real_delta_loss"].mean()),
-            "weighted_real_delta_loss": float(
-                frame["weighted_real_delta_loss"].mean()
-            ),
-            "train_loss": float(frame["total_loss"].mean()),
-            "validation_loss": val_loss,
-            "selected_real_clusters": int(frame["selected_real_clusters"].sum()),
-            "selected_real_wells": int(frame["selected_real_wells"].sum()),
-            "selected_real_samples": int(frame["selected_real_samples"].sum()),
-            "epoch_elapsed_s": float(epoch_elapsed),
-            "is_best_checkpoint": False,
-            "is_final_checkpoint": epoch == int(epochs),
-        }
-        history.append(row)
-        if np.isfinite(val_loss) and val_loss < best_val:
-            best_val = val_loss
-            best_epoch = epoch
-            row["is_best_checkpoint"] = True
-            torch.save(
-                _checkpoint_payload(
-                    model=model,
-                    model_id=model_id,
-                    normalization=normalization,
-                    model_info=info.__dict__,
-                    hidden_channels=hidden_channels,
-                    depth=depth,
-                    epoch=epoch,
-                    validation_loss=val_loss,
-                    checkpoint_kind="best",
-                    sample_axis_contract=sample_axis_contract,
-                ),
-                best_path,
-            )
-            logger.info(
-                "checkpoint best updated: epoch=%d validation_loss=%.9g",
-                epoch,
-                val_loss,
-            )
-        pd.DataFrame.from_records([row]).to_csv(
-            history_path,
-            mode="a",
-            header=not history_path.exists(),
-            index=False,
-        )
-        logger.info(
-            "epoch %d/%d complete: train_loss=%.6g validation_loss=%.6g elapsed_s=%.1f",
-            epoch,
-            int(epochs),
-            row["train_loss"],
-            val_loss,
-            epoch_elapsed,
-        )
-    if best_epoch is None or not best_path.is_file():
-        raise FloatingPointError("No finite synthetic validation loss; best checkpoint unavailable.")
-    final_validation_loss = float(history[-1]["validation_loss"])
-    torch.save(
-        _checkpoint_payload(
-            model=model,
-            model_id=model_id,
-            normalization=normalization,
-            model_info=info.__dict__,
-            hidden_channels=hidden_channels,
-            depth=depth,
-            epoch=int(epochs),
-            validation_loss=final_validation_loss,
-            checkpoint_kind="final",
-            sample_axis_contract=sample_axis_contract,
-        ),
-        final_path,
-    )
-    logger.info(
-        "checkpoint final written: epoch=%d validation_loss=%.9g",
-        int(epochs),
-        final_validation_loss,
-    )
-    for row in history:
-        row["is_best_checkpoint"] = int(row["epoch"]) == int(best_epoch)
-    pd.DataFrame.from_records(history).to_csv(history_path, index=False)
-    logger.info(
-        "training complete: best_epoch=%d best_validation_loss=%.9g final_epoch=%d elapsed_s=%.1f",
-        best_epoch,
-        best_val,
-        int(epochs),
-        time.perf_counter() - run_started,
-    )
-    return {
-        "status": "ok",
-        "device": str(device),
-        "device_metadata": device_metadata,
-        "checkpoints": {
-            "primary": "best",
-            "best": {
-                "path": best_path,
-                "epoch": int(best_epoch),
-                "validation_loss": float(best_val),
-            },
-            "final": {
-                "path": final_path,
-                "epoch": int(epochs),
-                "validation_loss": final_validation_loss,
-            },
-        },
-        "history": history_path,
-        "best_validation_loss": best_val,
-        "model_info": info.__dict__,
-        "synthetic_sequence_sha256": sequence.hexdigest(),
-        "real_field_reconstruction_max_abs_log_ai": reconstruction_error,
-    }
-
-
-def _checkpoint_payload(
-    *,
-    model: torch.nn.Module,
-    model_id: str,
-    normalization: Mapping[str, Any],
-    model_info: Mapping[str, Any],
-    hidden_channels: int,
-    depth: int,
-    epoch: int,
-    validation_loss: float,
-    checkpoint_kind: str,
-    sample_axis_contract: Mapping[str, Any],
-) -> dict[str, Any]:
-    state_dict = {
-        name: value.detach().cpu()
-        for name, value in model.state_dict().items()
-    }
-    return {
-        "schema_version": CHECKPOINT_SCHEMA_VERSION,
-        "checkpoint_kind": checkpoint_kind,
-        "epoch": int(epoch),
-        "validation_loss": float(validation_loss),
-        "model_id": model_id,
-        "state_dict": state_dict,
-        "normalization": dict(normalization),
-        "model_info": dict(model_info),
-        "architecture": {
-            "hidden_channels": int(hidden_channels),
-            "depth": int(depth),
-        },
-        "sample_axis_contract": dict(sample_axis_contract),
-    }
-
-
-def evaluate_loss(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> float:
-    model.eval()
-    losses = []
-    with torch.no_grad():
-        for batch in loader:
-            x = batch["input"].to(device)
-            target = batch["target_delta"].to(device)
-            mask = batch["valid_mask"].to(device)
-            losses.append(float(masked_mse(model(x), target, mask).detach().cpu()))
-    return float(np.mean(losses)) if losses else float("nan")
-
-
-def _benchmark_sample_axis_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
-    domain = str(manifest.get("sample_domain") or "")
-    if domain == "time":
-        unit, basis = "s", None
-    elif domain == "depth" and manifest.get("depth_basis") == "tvdss":
-        unit, basis = "m", "tvdss"
-    else:
-        raise ValueError(
-            "Benchmark must declare sample_domain=time or depth with depth_basis=tvdss."
-        )
-    return {
-        "sample_domain": domain,
-        "sample_unit": unit,
-        "depth_basis": basis,
-    }
-
-
-def _resolve_manifest_path(value: object, *, label: str) -> Path:
-    text = str(value or "").strip()
-    if not text:
-        raise ValueError(f"Benchmark manifest lacks {label}.")
-    path = Path(text)
-    if not path.is_absolute():
-        path = Path.cwd() / path
-    if not path.is_file():
-        raise FileNotFoundError(f"{label} not found: {path}")
-    return path
-
-
-def _load_nominal_wavelet(
-    benchmark_dir: Path,
-    *,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, float] | None]:
-    manifest_path = Path(benchmark_dir) / "benchmark_manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"benchmark_manifest.json not found: {manifest_path}")
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        manifest = json.load(handle)
-    domain = str(manifest.get("sample_domain") or "")
-    if domain == "depth":
-        forward_inputs_path = _resolve_manifest_path(
-            manifest.get("forward_model_inputs_path"),
-            label="forward_model_inputs_path",
-        )
-        with forward_inputs_path.open("r", encoding="utf-8") as handle:
-            forward_inputs = json.load(handle)
-        if (
-            forward_inputs.get("sample_domain") != "depth"
-            or forward_inputs.get("depth_basis") != "tvdss"
-        ):
-            raise ValueError("Depth forward_model_inputs must declare depth/TVDSS.")
-        raw_relation = dict(forward_inputs.get("ai_velocity_relation") or {})
-        if raw_relation.get("ai_unit") != "m/s*g/cm3" or raw_relation.get("vp_unit") != "m/s":
-            raise ValueError("Depth AI–Vp relation units are invalid.")
-        relation: dict[str, float] | None = {
-            "a": float(raw_relation["a"]),
-            "b": float(raw_relation["b"]),
-        }
-        csv_path = _resolve_manifest_path(
-            dict(forward_inputs.get("wavelet") or {}).get("path"),
-            label="forward_model_inputs.wavelet.path",
-        )
-    elif domain == "time":
-        relation = None
-        source_runs = manifest.get("source_runs") or {}
-        wavelet_dir = source_runs.get("wavelet_generation_dir")
-        if not wavelet_dir:
-            raise ValueError("Time benchmark lacks source_runs.wavelet_generation_dir.")
-        wavelet_path = Path(wavelet_dir)
-        if not wavelet_path.is_absolute():
-            wavelet_path = Path.cwd() / wavelet_path
-        csv_path = wavelet_path / "selected_wavelet.csv"
-        if not csv_path.is_file():
-            raise FileNotFoundError(f"selected_wavelet.csv not found: {csv_path}")
-    else:
-        raise ValueError(f"Unsupported benchmark sample_domain: {domain!r}")
-    frame = pd.read_csv(csv_path)
-    missing = sorted({"time_s", "amplitude"} - set(frame.columns))
-    if missing:
-        raise ValueError(f"Wavelet CSV lacks columns {missing}: {csv_path}")
-    time_s = frame["time_s"].to_numpy(dtype=np.float64)
-    wavelet = frame["amplitude"].to_numpy(dtype=np.float32)
-    if wavelet.size < 3 or wavelet.size % 2 == 0:
-        raise ValueError("nominal wavelet must have odd length >= 3")
-    if not np.all(np.isfinite(wavelet)):
-        raise ValueError("nominal wavelet contains non-finite values")
-    if not np.all(np.isfinite(time_s)):
-        raise ValueError("nominal wavelet time axis contains non-finite values")
-    return (
-        torch.as_tensor(time_s, dtype=torch.float32, device=device),
-        torch.as_tensor(wavelet, dtype=torch.float32, device=device),
-        relation,
-    )
-
-
-def _denormalize_delta_torch(values: torch.Tensor, normalization: Mapping[str, Any]) -> torch.Tensor:
-    if "delta" in normalization:
-        raise ValueError("Normalized-delta checkpoints are obsolete in GINN-v2 checkpoint v4.")
-    return values
-
-
-def _forward_physics_batch(
-    log_ai: torch.Tensor,
-    *,
-    sample_axes: torch.Tensor,
-    sample_domain: str,
-    wavelet_time_s: torch.Tensor,
-    wavelet_amp: torch.Tensor,
-    ai_velocity_relation: Mapping[str, float] | None,
-) -> torch.Tensor:
-    if log_ai.ndim != 3:
-        raise ValueError("Physics forward expects [batch, lateral, sample] logAI.")
-    if sample_domain == "time":
-        return forward_time(log_ai, wavelet_time_s, wavelet_amp)
-    if sample_domain != "depth":
-        raise ValueError(f"Unsupported physics sample domain: {sample_domain!r}")
-    if sample_axes.shape != (log_ai.shape[0], log_ai.shape[-1]):
-        raise ValueError("Depth physics axes must have shape [batch, sample].")
-    if ai_velocity_relation is None:
-        raise ValueError("Depth physics requires the frozen AI–Vp relation.")
-    velocity_mps = velocity_from_ai(
-        torch.exp(log_ai),
-        a=float(ai_velocity_relation["a"]),
-        b=float(ai_velocity_relation["b"]),
-    )
-    return torch.stack(
-        [
-            forward_depth(
-                log_ai[row_index],
-                velocity_mps[row_index],
-                sample_axes[row_index],
-                wavelet_time_s,
-                wavelet_amp,
-            )
-            for row_index in range(log_ai.shape[0])
-        ],
-        dim=0,
-    )
-
-
-def load_checkpoint(path: Path, *, hidden_channels: int | None = None, depth: int | None = None) -> tuple[torch.nn.Module, dict[str, Any]]:
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    if str(checkpoint.get("schema_version") or "") != CHECKPOINT_SCHEMA_VERSION:
-        raise ValueError(f"Unsupported GINN-v2 checkpoint schema: {path}")
-    architecture = dict(checkpoint.get("architecture") or {})
-    architecture_id = str(architecture.get("id") or "")
-    if not architecture_id:
-        raise ValueError(
-            "GINN-v2 checkpoint lacks the v4 architecture contract; legacy checkpoints are not supported."
-        )
-    model, _ = build_model(
-        architecture_id,
-        hidden_channels=int(hidden_channels or architecture.get("hidden_channels", 32)),
-        depth=int(depth or architecture.get("depth", 5)),
-        lateral_kernel=architecture.get("lateral_kernel"),
-    )
-    model.load_state_dict(checkpoint["state_dict"])
-    return model, checkpoint
 
 
 def predict_patches(
@@ -771,20 +126,32 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     for _, row in index.iterrows():
         i = int(row["prediction_row"])
         metrics = regression_metrics(target[i], pred[i], valid_mask=mask[i])
-        rows.append({**row.to_dict(), "model_id": row.get("model_id", ""), **metrics})
+        rows.append({**row.to_dict(), "series_id": row.get("series_id", ""), **metrics})
         lfm_metrics = regression_metrics(target[i], lfm[i], valid_mask=mask[i])
-        lfm_rows.append({**row.to_dict(), "model_id": "lfm_controlled_degraded", **lfm_metrics})
+        lfm_rows.append({**row.to_dict(), "series_id": "lfm_controlled_degraded", **lfm_metrics})
         lfm_ideal_metrics = regression_metrics(target[i], lfm_ideal[i], valid_mask=mask[i])
-        lfm_ideal_rows.append({**row.to_dict(), "model_id": "lfm_ideal", **lfm_ideal_metrics})
+        lfm_ideal_rows.append({**row.to_dict(), "series_id": "lfm_ideal", **lfm_ideal_metrics})
         oracle_metrics = regression_metrics(target[i], target[i], valid_mask=mask[i])
-        oracle_rows.append({**row.to_dict(), "model_id": "oracle_target", **oracle_metrics})
+        oracle_rows.append({**row.to_dict(), "series_id": "oracle_target", **oracle_metrics})
     metrics_frame = pd.DataFrame.from_records(rows)
     metrics_path = output_dir / "model_patch_metrics.csv"
     metrics_frame.to_csv(metrics_path, index=False)
+    sample_kind_path = output_dir / "model_patch_metrics_by_sample_kind.csv"
+    _grouped_patch_metrics(metrics_frame, ["sample_kind"]).to_csv(
+        sample_kind_path,
+        index=False,
+    )
     geometry_path = output_dir / "model_patch_metrics_by_geometry.csv"
     _grouped_patch_metrics(metrics_frame, ["geometry_family"]).to_csv(geometry_path, index=False)
     mismatch_path = output_dir / "model_patch_metrics_by_mismatch_family.csv"
     _grouped_patch_metrics(metrics_frame, ["seismic_mismatch_family"]).to_csv(mismatch_path, index=False)
+    holdout_role = metrics_frame.get("evaluation_role", pd.Series("", index=metrics_frame.index)).astype(str).str.casefold()
+    holdout_geometry = metrics_frame.get("geometry_family", pd.Series("", index=metrics_frame.index)).astype(str).str.casefold()
+    holdout_frame = metrics_frame[holdout_role.eq("geometry_holdout") | holdout_geometry.eq("pinchout")].copy()
+    holdout_path = output_dir / "model_patch_metrics_geometry_holdout.csv"
+    holdout_frame.to_csv(holdout_path, index=False)
+    holdout_geometry_path = output_dir / "model_patch_metrics_geometry_holdout_by_family.csv"
+    _grouped_patch_metrics(holdout_frame, ["geometry_family"]).to_csv(holdout_geometry_path, index=False)
     geometry_detail_frame = _geometry_patch_metrics(metrics_frame, pred, target, mask, prediction_dir)
     geometry_detail_path = output_dir / "model_geometry_patch_metrics.csv"
     geometry_detail_frame.to_csv(geometry_detail_path, index=False)
@@ -847,12 +214,14 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
         "probe_aggregate": _aggregate(probe_frame),
         "probe_amplitude_phase_aggregate": _aggregate_amplitude_phase(probe_frame),
         "geometry_aggregate": _aggregate_geometry(geometry_detail_frame),
+        "geometry_holdout_aggregate": _aggregate(holdout_frame),
+        "pinchout_holdout_n_patches": int(len(holdout_frame)),
         "realization_uniform_aggregate": _aggregate(
-            stitched["uniform"][stitched["uniform"]["model_id"].astype(str).ne("lfm_controlled_degraded")]
+            stitched["uniform"][stitched["uniform"]["series_id"].astype(str).ne("lfm_controlled_degraded")]
         ),
         "realization_center_crop_aggregate": _aggregate(
             stitched["center_crop"][
-                stitched["center_crop"]["model_id"].astype(str).ne("lfm_controlled_degraded")
+                stitched["center_crop"]["series_id"].astype(str).ne("lfm_controlled_degraded")
             ]
         ),
         "zero_x_false_prediction_aggregate": _aggregate(zero_x_frame),
@@ -867,8 +236,11 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     return {
         "status": "ok",
         "model_patch_metrics": metrics_path,
+        "model_patch_metrics_by_sample_kind": sample_kind_path,
         "model_patch_metrics_by_geometry": geometry_path,
         "model_patch_metrics_by_mismatch_family": mismatch_path,
+        "model_patch_metrics_geometry_holdout": holdout_path,
+        "model_patch_metrics_geometry_holdout_by_family": holdout_geometry_path,
         "model_geometry_patch_metrics": geometry_detail_path,
         "model_geometry_metrics_by_family": geometry_aggregate_path,
         "model_realization_metrics_uniform": stitched_uniform_path,
@@ -1353,14 +725,14 @@ def _stitch_one_strategy(
         rows.append(
             {
                 **base,
-                "model_id": first_row.get("model_id", ""),
+                "series_id": first_row.get("series_id", ""),
                 **regression_metrics(target_full, pred_full, valid_mask=valid),
             }
         )
         rows.append(
             {
                 **base,
-                "model_id": "lfm_controlled_degraded",
+                "series_id": "lfm_controlled_degraded",
                 **regression_metrics(target_full, lfm_full, valid_mask=valid),
             }
         )
@@ -1782,3 +1154,5 @@ def _grouped_probe_metrics(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame
         )
         rows.append(row)
     return pd.DataFrame.from_records(rows)
+
+__all__ = ["predict_patches", "report_predictions"]

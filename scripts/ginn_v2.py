@@ -1,4 +1,4 @@
-"""Train, predict, and report GINN-v2 model-ablation baselines."""
+"""Train, predict, and report GINN-v2 composable experiments."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from typing import Mapping
 
 import pandas as pd
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -20,7 +19,6 @@ sys.path = [path for path in sys.path if path != src_text]
 sys.path.insert(0, src_text)
 
 from cup.synthetic.dataset import SynthoseisBenchmark
-from cup.synthetic.contracts import REPORT_SCHEMA_VERSION as SYNTHOSEIS_REPORT_SCHEMA_VERSION
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
@@ -33,129 +31,15 @@ from cup.utils.io import (
 from ginn_v2.contracts import (
     ABLATION_REPORT_CARD_SCHEMA_VERSION,
     ABLATION_SUMMARY_SCHEMA_VERSION,
-    INPUT_REFERENCE_STATS_SCHEMA_VERSION,
     MODEL_RUN_SCHEMA_VERSION,
     PATCH_SMOKE_REPORT_SCHEMA_VERSION,
     PREDICTION_SCHEMA_VERSION,
 )
-from ginn_v2.data import (
-    PatchSpec,
-    build_patch_index,
-    compute_input_reference_stats,
-    compute_normalization,
-    default_eval_kinds,
-    default_train_kinds,
-)
-from ginn_v2.models import build_model
-from ginn_v2.real_delta import evaluate_real_wells, prepare_real_delta_support
-from ginn_v2.training import (
-    configure_training_logger,
-    load_checkpoint,
-    predict_patches,
-    report_predictions,
-    resolve_device,
-    train_model,
-)
+from ginn_v2.data import PatchSpec, build_patch_index, default_eval_kinds
+from ginn_v2.evaluation import predict_patches, report_predictions
 from ginn_v2.composable import run_experiment
 from ginn_v2.experiment import parse_experiment_config
-
-
-MODEL_IDS = (
-    "trace_1d",
-    "trace_1d_dilated_tcn",
-    "trace_1d_dilated_tcn_mismatch_training",
-    "trace_1d_tcn_lateral_mixer_k1_mismatch_training",
-    "trace_1d_tcn_lateral_mixer_mismatch_training",
-    "trace_1d_tcn_lateral_mixer_k5_mismatch_training",
-    "trace_1d_mismatch_training",
-    "patch_2d_supervised",
-    "patch_2d_with_physics_loss",
-    "patch_2d_mismatch_training",
-)
-
-TRAIN_DEFAULTS = {
-    "benchmark_dir": None,
-    "model_id": "patch_2d_supervised",
-    "patch_lateral": 32,
-    "patch_twt": 128,
-    "lateral_stride": 16,
-    "twt_stride": 64,
-    "min_valid_fraction": 0.50,
-    "split_policy": "derive",
-    "validation_fraction": 0.15,
-    "test_fraction": 0.15,
-    "max_patches": None,
-    "patch_index": None,
-    "normalization": None,
-    "overfit_tiny": False,
-    "epochs": 5,
-    "batch_size": 8,
-    "learning_rate": 1e-3,
-    "hidden_channels": 32,
-    "depth": 5,
-    "lambda_physics": 0.0,
-    "lambda_real_delta": 0.0,
-    "log_interval_batches": 10,
-    "device": "auto",
-    "seed": 20260617,
-    "model_role": None,
-    "synthetic_gate_report_dir": None,
-    "synthetic_gate_report_card": None,
-    "synthetic_gate_frozen_candidate": False,
-}
-
-TRAIN_CONFIG_KEYS = {
-    "benchmark_dir": "benchmark-dir",
-    "model_id": "model-id",
-    "patch_lateral": "patch-lateral",
-    "patch_twt": "patch-twt",
-    "lateral_stride": "lateral-stride",
-    "twt_stride": "twt-stride",
-    "min_valid_fraction": "min-valid-fraction",
-    "split_policy": "split-policy",
-    "validation_fraction": "validation-fraction",
-    "test_fraction": "test-fraction",
-    "max_patches": "max-patches",
-    "patch_index": "patch-index",
-    "normalization": "normalization",
-    "overfit_tiny": "overfit-tiny",
-    "epochs": "epochs",
-    "batch_size": "batch-size",
-    "learning_rate": "learning-rate",
-    "hidden_channels": "hidden-channels",
-    "depth": "depth",
-    "lambda_physics": "lambda-physics",
-    "lambda_real_delta": "lambda-real-delta",
-    "log_interval_batches": "log-interval-batches",
-    "device": "device",
-    "seed": "seed",
-    "model_role": "model-role",
-    "synthetic_gate_report_dir": "synthetic-gate-report-dir",
-    "synthetic_gate_report_card": "synthetic-gate-report-card",
-    "synthetic_gate_frozen_candidate": "synthetic-gate-frozen-candidate",
-}
-
-TRAIN_CONFIG_GROUPS = {
-    "sources": {"benchmark_dir", "patch_index", "normalization"},
-    "model": {"model_id", "model_role", "hidden_channels", "depth"},
-    "patching": {
-        "patch_lateral",
-        "patch_twt",
-        "lateral_stride",
-        "twt_stride",
-        "min_valid_fraction",
-    },
-    "split": {"split_policy", "validation_fraction", "test_fraction"},
-    "optimization": {"epochs", "batch_size", "learning_rate", "seed"},
-    "losses": {"lambda_physics", "lambda_real_delta"},
-    "runtime": {"device", "log_interval_batches"},
-    "smoke_test": {"max_patches", "overfit_tiny"},
-    "synthetic_gate": {
-        "synthetic_gate_report_dir",
-        "synthetic_gate_report_card",
-        "synthetic_gate_frozen_candidate",
-    },
-}
+from ginn_v2.runtime import configure_training_logger
 
 
 def parse_args() -> argparse.Namespace:
@@ -198,15 +82,6 @@ def parse_args() -> argparse.Namespace:
         help="Report entry. Repeat for each model/scope report directory.",
     )
 
-    stamp = sub.add_parser("stamp-gate")
-    stamp.add_argument("--model-run-dir", type=Path, required=True)
-    stamp.add_argument("--synthetic-gate-report-dir", type=Path, required=True)
-    stamp.add_argument("--synthetic-gate-report-card", type=Path, required=True)
-    stamp.add_argument(
-        "--synthetic-gate-frozen-candidate",
-        action="store_true",
-        help="Mark this model run as belonging to the current frozen synthetic-gate candidate set.",
-    )
     return parser.parse_args()
 
 
@@ -215,334 +90,6 @@ def _resolve_output_dir(prefix: str, explicit: Path | None) -> Path:
         return resolve_relative_path(explicit, root=REPO_ROOT)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     return REPO_ROOT / "scripts" / "output" / f"{prefix}_{timestamp}"
-
-
-def _apply_train_config(args: argparse.Namespace) -> argparse.Namespace:
-    args.real_delta_config = None
-    if args.config is None:
-        if args.benchmark_dir is None:
-            raise ValueError("ginn_v2.py train requires --benchmark-dir or --config with train.benchmark_dir.")
-        return args
-    config_path = resolve_relative_path(args.config, root=REPO_ROOT)
-    payload = load_yaml_config(config_path)
-    train_config = payload.get("train")
-    if not isinstance(train_config, Mapping):
-        raise ValueError("GINN-v2 config must contain a train mapping.")
-    config, real_delta = _flatten_train_config(train_config)
-    if real_delta is not None and not isinstance(real_delta, dict):
-        raise ValueError("train.real_delta must be a mapping when configured.")
-    args.real_delta_config = dict(real_delta) if real_delta is not None else None
-    provided_flags = {token[2:] for token in sys.argv if token.startswith("--")}
-    for key, flag in TRAIN_CONFIG_KEYS.items():
-        if flag in provided_flags or key not in config:
-            continue
-        value = config[key]
-        if key in {"benchmark_dir", "patch_index", "normalization", "synthetic_gate_report_dir", "synthetic_gate_report_card"}:
-            value = None if value is None or str(value).strip() == "" else Path(str(value))
-        setattr(args, key, value)
-    if args.benchmark_dir is None:
-        raise ValueError("ginn_v2.py train requires train.benchmark_dir in config or --benchmark-dir.")
-    return args
-
-
-def _flatten_train_config(
-    train_config: Mapping[str, object],
-) -> tuple[dict[str, object], dict[str, object] | None]:
-    allowed_groups = set(TRAIN_CONFIG_GROUPS) | {"real_delta"}
-    unexpected_groups = sorted(set(train_config) - allowed_groups)
-    if unexpected_groups:
-        raise ValueError(f"Unsupported train config groups: {unexpected_groups}")
-    flattened: dict[str, object] = {}
-    for group_name, allowed_keys in TRAIN_CONFIG_GROUPS.items():
-        group = train_config.get(group_name)
-        if group is None:
-            continue
-        if not isinstance(group, Mapping):
-            raise ValueError(f"train.{group_name} must be a mapping.")
-        unexpected_keys = sorted(set(group) - allowed_keys)
-        if unexpected_keys:
-            raise ValueError(
-                f"Unsupported keys in train.{group_name}: {unexpected_keys}"
-            )
-        for key, value in group.items():
-            if key in flattened:
-                raise ValueError(f"Duplicate train config key: {key}")
-            flattened[str(key)] = value
-    real_delta = train_config.get("real_delta")
-    if real_delta is None:
-        return flattened, None
-    if not isinstance(real_delta, Mapping):
-        raise ValueError("train.real_delta must be a mapping.")
-    return flattened, dict(real_delta)
-
-
-def _resolve_benchmark_dir(value: Path | str) -> Path:
-    text = str(value).strip()
-    if text.casefold() != "auto":
-        return resolve_relative_path(value, root=REPO_ROOT)
-    root = REPO_ROOT / "experiments" / "synthoseis_lite" / "results"
-    required = [
-        "generate_field_conditioned/synthetic_benchmark.h5",
-        "generate_field_conditioned/sample_index.csv",
-        "generate_field_conditioned/benchmark_manifest.json",
-    ]
-    candidates = [
-        path
-        for path in root.glob("*")
-        if path.is_dir() and all((path / name).is_file() for name in required)
-    ]
-    if not candidates:
-        raise FileNotFoundError(f"No synthoseis_lite result with generate_field_conditioned benchmark found under {root}.")
-    return sorted(candidates, key=lambda p: (p.stat().st_mtime, p.name))[-1] / "generate_field_conditioned"
-
-
-def _sample_kinds_for_training(model_id: str) -> set[str]:
-    return default_train_kinds(model_id)
-
-
-def _write_train_manifest(
-    *,
-    output_dir: Path,
-    args: argparse.Namespace,
-    benchmark_dir: Path,
-    patch_index_path: Path,
-    normalization_path: Path,
-    normalization: dict,
-    input_reference_stats_path: Path,
-    train_result: dict,
-    patch_index_truncated: bool,
-    max_patches: int | None,
-    real_delta_manifest: Mapping[str, object] | None,
-    real_well_outputs: Mapping[str, Path] | None,
-) -> None:
-    history_path = Path(train_result["history"])
-    checkpoints = {"primary": str(train_result["checkpoints"]["primary"])}
-    for checkpoint_name in ("best", "final"):
-        record = dict(train_result["checkpoints"][checkpoint_name])
-        checkpoint_path = Path(record["path"])
-        checkpoints[checkpoint_name] = {
-            "path": repo_relative_path(checkpoint_path, root=REPO_ROOT),
-            "epoch": int(record["epoch"]),
-            "validation_loss": float(record["validation_loss"]),
-        }
-    benchmark_manifest_path = benchmark_dir / "benchmark_manifest.json"
-    with benchmark_manifest_path.open("r", encoding="utf-8") as handle:
-        benchmark_manifest = json.load(handle)
-    benchmark_contract_fingerprint = require_contract_fingerprint(
-        benchmark_manifest, label=f"benchmark {benchmark_dir}"
-    )
-    sample_domain = str(benchmark_manifest.get("sample_domain") or "")
-    if sample_domain == "time":
-        sample_unit, depth_basis = "s", None
-    elif sample_domain == "depth" and benchmark_manifest.get("depth_basis") == "tvdss":
-        sample_unit, depth_basis = "m", "tvdss"
-    else:
-        raise ValueError("Benchmark has an invalid sample domain/depth basis contract.")
-    input_contracts = {
-        "benchmark": {
-            "path": repo_relative_path(benchmark_manifest_path, root=REPO_ROOT),
-            "contract_fingerprint_sha256": benchmark_contract_fingerprint,
-        }
-    }
-    if sample_domain == "depth":
-        rock_contract = dict(
-            dict(benchmark_manifest.get("input_contracts") or {}).get(
-                "rock_physics_analysis"
-            )
-            or {}
-        )
-        if not str(rock_contract.get("contract_fingerprint_sha256") or ""):
-            raise ValueError(
-                "Depth benchmark lacks input_contracts.rock_physics_analysis."
-            )
-        input_contracts["rock_physics_analysis"] = rock_contract
-        forward_inputs_path = str(
-            benchmark_manifest.get("forward_model_inputs_path") or ""
-        ).strip()
-        if not forward_inputs_path:
-            raise ValueError("Depth benchmark lacks forward_model_inputs_path.")
-    else:
-        forward_inputs_path = ""
-    if real_delta_manifest is not None:
-        real_sources = dict(real_delta_manifest.get("sources") or {})
-        for source_key, role in (
-            ("lfm", "real_delta_lfm_variant"),
-            ("well_control_summary", "real_delta_well_controls"),
-        ):
-            reference = dict(real_sources.get(source_key) or {})
-            fingerprint = str(reference.get("contract_fingerprint_sha256") or "")
-            if not fingerprint:
-                raise ValueError(f"real_delta.sources.{source_key} lacks a contract fingerprint.")
-            input_contracts[role] = {
-                "path": str(reference["path"]),
-                "contract_fingerprint_sha256": fingerprint,
-            }
-    manifest = {
-        "schema_version": MODEL_RUN_SCHEMA_VERSION,
-        "status": "ok",
-        "input_contracts": input_contracts,
-        "model_id": args.model_id,
-        "model_role": str(args.model_role or _infer_model_role(args.model_id)),
-        "sample_domain": sample_domain,
-        "sample_unit": sample_unit,
-        "depth_basis": depth_basis,
-        "forward_model_inputs_path": forward_inputs_path,
-        "benchmark_dir": repo_relative_path(benchmark_dir, root=REPO_ROOT),
-        "patch_index": repo_relative_path(patch_index_path, root=REPO_ROOT),
-        "patch_index_truncated": bool(patch_index_truncated),
-        "max_patches": max_patches,
-        "patch_spec": {
-            "lateral_samples": int(args.patch_lateral),
-            "vertical_samples": int(args.patch_twt),
-            "lateral_stride": int(args.lateral_stride),
-            "vertical_stride": int(args.twt_stride),
-            "min_valid_fraction": float(args.min_valid_fraction),
-        },
-        "split_policy": args.split_policy,
-        "validation_fraction": float(args.validation_fraction),
-        "test_fraction": float(args.test_fraction),
-        "normalization": normalization,
-        "normalization_path": repo_relative_path(normalization_path, root=REPO_ROOT),
-        "input_reference_stats": repo_relative_path(input_reference_stats_path, root=REPO_ROOT),
-        "input_channels": ["seismic", "lfm_controlled_degraded", "valid_mask_model"],
-        "output_semantics": "pred_log_ai = lfm_controlled_degraded + pred_delta_log_ai",
-        "train_sample_kinds": sorted(_sample_kinds_for_training(args.model_id)),
-        "sample_kind_sampling_weights": {
-            kind: 1.0 for kind in sorted(_sample_kinds_for_training(args.model_id))
-        },
-        "train_sampler": "balanced_by_sample_kind",
-        "loss": {
-            "lambda_ai": 1.0,
-            "lambda_physics": float(args.lambda_physics),
-            "lambda_real_delta": float(args.lambda_real_delta),
-            "physics_loss_applied_sample_kinds": (
-                ["base"] if float(args.lambda_physics) > 0.0 else []
-            ),
-            "physics_forward_operator_id": (
-                (
-                    "cup.physics.torch_backend.forward_depth"
-                    if sample_domain == "depth"
-                    else "cup.physics.torch_backend.forward_time"
-                )
-                if float(args.lambda_physics) > 0.0
-                else ""
-            ),
-            "wavelet_scenario_id": "",
-            "gain_scenario_id": "",
-        },
-        "training": {
-            "epochs": int(args.epochs),
-            "batch_size": int(args.batch_size),
-            "learning_rate": float(args.learning_rate),
-            "overfit_tiny": bool(args.overfit_tiny),
-            "seed": int(args.seed),
-            "log_interval_batches": int(args.log_interval_batches),
-            "synthetic_sequence_sha256": train_result["synthetic_sequence_sha256"],
-        },
-        "device": train_result.get("device_metadata", {"resolved_device": train_result.get("device", "")}),
-        "model_info": train_result["model_info"],
-        "checkpoints": checkpoints,
-        "training_history": repo_relative_path(history_path, root=REPO_ROOT),
-        "training_log": repo_relative_path(output_dir / "training.log", root=REPO_ROOT),
-        "best_validation_loss": train_result["best_validation_loss"],
-        "real_delta": dict(real_delta_manifest) if real_delta_manifest is not None else None,
-        "real_well_outputs": {
-            key: {"path": repo_relative_path(path, root=REPO_ROOT)}
-            for key, path in (real_well_outputs or {}).items()
-        },
-        "synthetic_gate_evidence_status": "pending",
-    }
-    if args.synthetic_gate_report_dir is not None or args.synthetic_gate_report_card is not None:
-        if args.synthetic_gate_report_dir is None or args.synthetic_gate_report_card is None:
-            raise ValueError(
-                "--synthetic-gate-report-dir and --synthetic-gate-report-card must be provided together."
-            )
-        _stamp_gate_evidence(
-            manifest,
-            report_dir=resolve_relative_path(args.synthetic_gate_report_dir, root=REPO_ROOT),
-            report_card=resolve_relative_path(args.synthetic_gate_report_card, root=REPO_ROOT),
-            frozen_candidate=bool(args.synthetic_gate_frozen_candidate),
-        )
-    primary_name = str(checkpoints["primary"])
-    primary_checkpoint = resolve_relative_path(
-        str(dict(checkpoints[primary_name])["path"]), root=REPO_ROOT
-    )
-    manifest["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
-    manifest["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
-        contract_schema_version=MODEL_RUN_SCHEMA_VERSION,
-        semantics={
-            "model_id": manifest["model_id"],
-            "model_role": manifest["model_role"],
-            "input_channels": manifest["input_channels"],
-            "output_semantics": manifest["output_semantics"],
-            "patch_spec": manifest["patch_spec"],
-            "sample_domain": sample_domain,
-            "sample_unit": sample_unit,
-            "depth_basis": depth_basis,
-        },
-        business_config={
-            "split_policy": manifest["split_policy"],
-            "validation_fraction": manifest["validation_fraction"],
-            "test_fraction": manifest["test_fraction"],
-            "loss": manifest["loss"],
-            "training": manifest["training"],
-            "model_info": manifest["model_info"],
-            "synthetic_gate_evidence_status": manifest["synthetic_gate_evidence_status"],
-            "synthetic_gate_evidence": manifest.get("synthetic_gate_evidence"),
-        },
-        input_contracts=input_contracts,
-        primary_artifacts={
-            "primary_checkpoint": primary_checkpoint,
-            "normalization": normalization_path,
-            "input_reference_stats": input_reference_stats_path,
-            "patch_index": patch_index_path,
-        },
-    )
-    write_json(output_dir / "model_run_manifest.json", manifest)
-
-
-def _stamp_gate_evidence(
-    manifest: dict,
-    *,
-    report_dir: Path,
-    report_card: Path,
-    frozen_candidate: bool,
-) -> None:
-    if not report_dir.is_dir():
-        raise FileNotFoundError(f"synthetic gate report directory not found: {report_dir}")
-    if not report_card.is_file():
-        raise FileNotFoundError(f"synthetic gate report card not found: {report_card}")
-    evaluation_summary_path = report_dir / "evaluation_summary.json"
-    if not evaluation_summary_path.is_file():
-        raise FileNotFoundError(
-            f"synthetic gate evaluation summary not found: {evaluation_summary_path}"
-        )
-    with evaluation_summary_path.open("r", encoding="utf-8") as handle:
-        evaluation_summary = json.load(handle)
-    if evaluation_summary.get("schema_version") != SYNTHOSEIS_REPORT_SCHEMA_VERSION:
-        raise ValueError(f"Synthetic gate evaluation must use {SYNTHOSEIS_REPORT_SCHEMA_VERSION}.")
-    gate_contract_fingerprint = require_contract_fingerprint(
-        evaluation_summary, label=f"synthetic gate evaluation {evaluation_summary_path}"
-    )
-    manifest["input_contracts"]["synthetic_gate_evaluation"] = {
-        "path": repo_relative_path(evaluation_summary_path, root=REPO_ROOT),
-        "contract_fingerprint_sha256": gate_contract_fingerprint,
-    }
-    manifest["synthetic_gate_evidence_status"] = "ok"
-    manifest["synthetic_gate_evidence"] = {
-        "report_dir": repo_relative_path(report_dir, root=REPO_ROOT),
-        "report_card": repo_relative_path(report_card, root=REPO_ROOT),
-        "is_current_frozen_candidate": bool(frozen_candidate),
-    }
-
-
-def _infer_model_role(model_id: str) -> str:
-    text = str(model_id)
-    if "lateral_mixer" in text:
-        return "lateral"
-    if "trace_1d" in text or "trace1d" in text:
-        return "no_lateral"
-    return text.replace("-", "_")
 
 
 def _resolve_checkpoint_from_manifest(
@@ -646,7 +193,9 @@ def run_predict(args: argparse.Namespace) -> None:
         patch_index_source = repo_relative_path(eval_index_path, root=REPO_ROOT)
     else:
         sample_kinds = set(args.sample_kind) if args.sample_kind else default_eval_kinds()
-        spec_cfg = dict(manifest["patch_spec"])
+        spec_cfg = dict(manifest.get("patching") or manifest.get("patch_spec") or {})
+        if not spec_cfg:
+            raise ValueError("Model run manifest lacks patching contract.")
         patch_index = build_patch_index(
             benchmark,
             patch_spec=PatchSpec(
@@ -654,12 +203,12 @@ def run_predict(args: argparse.Namespace) -> None:
                 twt_samples=int(spec_cfg["vertical_samples"]),
                 lateral_stride=int(spec_cfg["lateral_stride"]),
                 twt_stride=int(spec_cfg["vertical_stride"]),
-                min_valid_fraction=float(spec_cfg["min_valid_fraction"]),
             ),
             sample_kinds=sample_kinds,
             split_policy=str(manifest.get("split_policy", "derive")),
             validation_fraction=float(manifest.get("validation_fraction", 0.15)),
             test_fraction=float(manifest.get("test_fraction", 0.15)),
+            min_valid_samples=1,
         )
         eval_index_path = output_dir / "eval_patch_index.csv"
         patch_index.to_csv(eval_index_path, index=False)
@@ -673,46 +222,53 @@ def run_predict(args: argparse.Namespace) -> None:
         batch_size=int(args.batch_size),
         device_name=str(args.device),
     )
+    model_contract = {
+        "path": repo_relative_path(model_run_dir / "model_run_manifest.json", root=REPO_ROOT),
+    }
+    if str(manifest.get("contract_fingerprint_sha256") or ""):
+        model_contract["contract_fingerprint_sha256"] = require_contract_fingerprint(
+            manifest, label=f"model run {model_run_dir}"
+        )
     input_contracts = {
-        "model_run": {
-            "path": repo_relative_path(model_run_dir / "model_run_manifest.json", root=REPO_ROOT),
-            "contract_fingerprint_sha256": require_contract_fingerprint(
-                manifest, label=f"model run {model_run_dir}"
-            ),
-        },
+        "model_run": model_contract,
         "benchmark": dict(dict(manifest.get("input_contracts") or {}).get("benchmark") or {}),
     }
-    prediction_contract_fingerprint = contract_fingerprint_sha256(
-        contract_schema_version=PREDICTION_SCHEMA_VERSION,
-        semantics={
-            "model_id": result["model_id"],
-            "split": args.split,
-            "sample_kinds": sorted(set(patch_index["sample_kind"].astype(str))),
-        },
-        business_config={
-            "index_source": args.index_source,
-            "checkpoint_selection": str(args.checkpoint),
-            "batch_size": int(args.batch_size),
-        },
-        input_contracts=input_contracts,
-        primary_artifacts={
-            "predictions": result["prediction_npz"],
-            "prediction_index": result["prediction_index"],
-        },
-    )
+    prediction_contract_fingerprint = None
+    if all(
+        str(value.get("contract_fingerprint_sha256") or "")
+        for value in input_contracts.values()
+        if isinstance(value, Mapping)
+    ):
+        prediction_contract_fingerprint = contract_fingerprint_sha256(
+            contract_schema_version=PREDICTION_SCHEMA_VERSION,
+            semantics={
+                "architecture_id": result["architecture_id"],
+                "split": args.split,
+                "sample_kinds": sorted(set(patch_index["sample_kind"].astype(str))),
+            },
+            business_config={
+                "index_source": args.index_source,
+                "checkpoint_selection": str(args.checkpoint),
+                "batch_size": int(args.batch_size),
+            },
+            input_contracts=input_contracts,
+            primary_artifacts={
+                "predictions": result["prediction_npz"],
+                "prediction_index": result["prediction_index"],
+            },
+        )
     summary = {
         "schema_version": PREDICTION_SCHEMA_VERSION,
         "status": "ok",
-        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
-        "contract_fingerprint_sha256": prediction_contract_fingerprint,
         "input_contracts": input_contracts,
+        "experiment_id": str(manifest.get("experiment_id") or ""),
         "model_run_dir": repo_relative_path(model_run_dir, root=REPO_ROOT),
         "benchmark_dir": repo_relative_path(benchmark_dir, root=REPO_ROOT),
         "split": args.split,
         "index_source": args.index_source,
         "patch_index": patch_index_source,
         "sample_kinds": sorted(set(patch_index["sample_kind"].astype(str))),
-        "model_id": result["model_id"],
+        "architecture_id": result["architecture_id"],
         "checkpoint_selection": str(args.checkpoint),
         "resolved_checkpoint": checkpoint_name,
         "checkpoint": repo_relative_path(checkpoint_path, root=REPO_ROOT),
@@ -726,6 +282,9 @@ def run_predict(args: argparse.Namespace) -> None:
         },
         "device": result.get("device_metadata", {}),
     }
+    if prediction_contract_fingerprint is not None:
+        summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
+        summary["contract_fingerprint_sha256"] = prediction_contract_fingerprint
     write_json(output_dir / "prediction_summary.json", summary)
     write_json(output_dir / "prediction_manifest.json", summary)
     print("=== GINN-v2 model ablation predict ===")
@@ -779,6 +338,7 @@ def run_summarize(args: argparse.Namespace) -> None:
         zero_x_energy_aggregate = dict(card.get("zero_x_false_energy_aggregate") or {})
         unsupported_energy_aggregate = dict(card.get("unsupported_false_energy_aggregate") or {})
         geometry_aggregate = dict(card.get("geometry_aggregate") or {})
+        geometry_holdout_aggregate = dict(card.get("geometry_holdout_aggregate") or {})
         realization_uniform_aggregate = dict(card.get("realization_uniform_aggregate") or {})
         realization_center_aggregate = dict(card.get("realization_center_crop_aggregate") or {})
         rows.append(
@@ -828,6 +388,8 @@ def run_summarize(args: argparse.Namespace) -> None:
                 "geometry_lateral_gradient_rmse": geometry_aggregate.get(
                     "mean_lateral_gradient_rmse"
                 ),
+                "geometry_holdout_n_ok": geometry_holdout_aggregate.get("n_ok"),
+                "geometry_holdout_rmse": geometry_holdout_aggregate.get("mean_rmse"),
                 "realization_uniform_n_ok": realization_uniform_aggregate.get("n_ok"),
                 "realization_uniform_rmse": realization_uniform_aggregate.get("mean_rmse"),
                 "realization_center_crop_n_ok": realization_center_aggregate.get("n_ok"),
@@ -873,14 +435,6 @@ def run_summarize(args: argparse.Namespace) -> None:
     print(f"Reports: {len(rows)}")
 
 
-def run_stamp_gate(args: argparse.Namespace) -> None:
-    raise ValueError(
-        "stamp-gate is retired for immutable model runs. Re-run training with "
-        "--synthetic-gate-report-dir and --synthetic-gate-report-card so gate evidence "
-        "is included before the v3 model contract is published."
-    )
-
-
 def _parse_report_spec(spec: str) -> tuple[str, str, Path]:
     parts = spec.split(":", maxsplit=2)
     if len(parts) != 3 or not all(part.strip() for part in parts):
@@ -915,16 +469,13 @@ def _build_ablation_report_card(summary: pd.DataFrame, frequency_path: Path) -> 
             .any()
         ),
         "mismatch_degradation": bool((summary["scope"].astype(str) == "validation_mismatch").any()),
-        "trace_1d": bool(summary["model"].astype(str).str.contains("trace1d").any()),
-        "patch_2d_supervised": bool(summary["model"].astype(str).str.contains("patch2d").any()),
-        "patch_2d_mismatch_training": bool(
-            summary["model"].astype(str).str.contains(r"patch2d.*mismatch|patch_2d_mismatch").any()
+        "trace_architecture": bool(summary["model"].astype(str).str.contains("trace", case=False).any()),
+        "patch_architecture": bool(summary["model"].astype(str).str.contains("patch", case=False).any()),
+        "patch_mismatch_training": bool(
+            summary["model"].astype(str).str.contains(r"patch.*mismatch", case=False, regex=True).any()
         ),
-        "trace_1d_mismatch_training": bool(
-            summary["model"].astype(str).str.contains("trace1d_mismatch").any()
-        ),
-        "trace_1d_dilated_tcn_mismatch_training": bool(
-            summary["model"].astype(str).str.contains("trace1d_tcn_mismatch").any()
+        "trace_mismatch_training": bool(
+            summary["model"].astype(str).str.contains("trace.*mismatch", case=False, regex=True).any()
         ),
         "zero_x_false_prediction_error": bool(
             summary.get("zero_x_false_prediction_n_ok", pd.Series(dtype=float))
@@ -1003,7 +554,7 @@ def _build_ablation_report_card(summary: pd.DataFrame, frequency_path: Path) -> 
         coverage["base_fullband"]
         and coverage["probe_paired_increment"]
         and coverage["mismatch_degradation"]
-        and stability.get("trace1d_test_model_rmse_std") is not None
+        and stability.get("trace_test_base_model_rmse_std") is not None
     ):
         status = "baseline_evidence_ready"
     required_for_full_gate = [
@@ -1014,11 +565,10 @@ def _build_ablation_report_card(summary: pd.DataFrame, frequency_path: Path) -> 
         "mismatch_degradation",
         "lfm_ideal_baseline",
         "oracle_target_self_check",
-        "trace_1d",
-        "patch_2d_supervised",
-        "patch_2d_mismatch_training",
-        "trace_1d_mismatch_training",
-        "trace_1d_dilated_tcn_mismatch_training",
+        "trace_architecture",
+        "patch_architecture",
+        "patch_mismatch_training",
+        "trace_mismatch_training",
         "physics_loss",
         "geometry_metrics",
         "patch_geometry_metrics",
@@ -1056,10 +606,10 @@ def _best_row(frame: pd.DataFrame, *, metric: str, ascending: bool) -> dict[str,
 
 def _seed_stability(summary: pd.DataFrame) -> dict[str, object]:
     result: dict[str, object] = {}
-    trace = summary[summary["model"].astype(str).str.startswith("trace1d_s")].copy()
+    trace = summary[summary["model"].astype(str).str.contains("trace", case=False)].copy()
     if trace.empty:
         return result
-    for scope, prefix in [("test_base", "trace1d_test"), ("benchmark_probe", "trace1d_probe")]:
+    for scope, prefix in [("test_base", "trace_test_base"), ("benchmark_probe", "trace_benchmark_probe")]:
         scoped = trace[trace["scope"].astype(str).eq(scope)].copy()
         if scoped.empty:
             continue
@@ -1101,15 +651,15 @@ def _ablation_conclusion(best: dict[str, object], stability: dict[str, object]) 
             f"Best validation-mismatch RMSE is {mismatch_best.get('model')} "
             f"({float(mismatch_best.get('model_rmse')):.6g})."
         )
-    if str(test_best.get("model", "")).startswith("trace1d") and str(probe_best.get("model", "")).startswith("trace1d"):
-        recommendation = "treat_trace1d_as_strong_baseline"
+    if "trace" in str(test_best.get("model", "")).casefold() and "trace" in str(probe_best.get("model", "")).casefold():
+        recommendation = "treat_trace_architecture_as_strong_baseline"
         statements.append(
-            "Trace-1D remains the strongest current baseline for base and paired-probe metrics."
+            "A trace architecture remains the strongest current baseline for base and paired-probe metrics."
         )
     else:
         recommendation = "continue_ablation"
     if stability:
-        statements.append("Trace-1D seed stability has been measured and is low-variance for current metrics.")
+        statements.append("Trace architecture seed stability has been measured and is low-variance for current metrics.")
     return {
         "recommendation": recommendation,
         "statements": statements,
@@ -1211,8 +761,6 @@ def main() -> None:
         run_report(args)
     elif args.command == "summarize":
         run_summarize(args)
-    elif args.command == "stamp-gate":
-        run_stamp_gate(args)
     else:
         raise ValueError(f"Unsupported command: {args.command}")
 

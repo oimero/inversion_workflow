@@ -322,6 +322,7 @@ def run_summarize(args: argparse.Namespace) -> None:
     for spec in args.report:
         model, scope, report_dir = _parse_report_spec(spec)
         report_path = resolve_relative_path(report_dir, root=REPO_ROOT)
+        experiment_metadata = _load_report_experiment_metadata(report_path)
         card_path = report_path / "model_report_card.json"
         with card_path.open("r", encoding="utf-8") as handle:
             card = json.load(handle)
@@ -345,6 +346,13 @@ def run_summarize(args: argparse.Namespace) -> None:
             {
                 "model": model,
                 "scope": scope,
+                "experiment_id": experiment_metadata["experiment_id"],
+                "architecture_id": experiment_metadata["architecture_id"],
+                "architecture_family": experiment_metadata["architecture_family"],
+                "loss_kinds": experiment_metadata["loss_kinds"],
+                "has_physics_loss": experiment_metadata["has_physics_loss"],
+                "has_mismatch_training": experiment_metadata["has_mismatch_training"],
+                "metadata_source": experiment_metadata["metadata_source"],
                 "n_patches": card.get("n_patches"),
                 "model_rmse": aggregate.get("mean_rmse"),
                 "model_nrmse": aggregate.get("mean_nrmse"),
@@ -435,6 +443,107 @@ def run_summarize(args: argparse.Namespace) -> None:
     print(f"Reports: {len(rows)}")
 
 
+def _load_report_experiment_metadata(report_path: Path) -> dict[str, object]:
+    """Load architecture/training semantics from the report's model manifest.
+
+    The user-provided report label remains a display label only. New coverage
+    decisions use the manifest that produced the prediction, so arbitrary
+    experiment IDs do not change the report card.
+    """
+    metadata: dict[str, object] = {
+        "experiment_id": "",
+        "architecture_id": "",
+        "architecture_family": "",
+        "loss_kinds": "",
+        "has_physics_loss": False,
+        "has_mismatch_training": False,
+        "metadata_source": "unavailable",
+    }
+    prediction_summary: dict[str, object] = {}
+    report_summary_path = report_path / "report_summary.json"
+    if report_summary_path.is_file():
+        with report_summary_path.open("r", encoding="utf-8") as handle:
+            report_summary = json.load(handle)
+        prediction_dir_value = str(report_summary.get("prediction_dir") or "").strip()
+        if prediction_dir_value:
+            prediction_dir = resolve_relative_path(prediction_dir_value, root=REPO_ROOT)
+            for name in ("prediction_summary.json", "prediction_manifest.json"):
+                candidate = prediction_dir / name
+                if candidate.is_file():
+                    with candidate.open("r", encoding="utf-8") as handle:
+                        prediction_summary = json.load(handle)
+                    break
+    if not prediction_summary:
+        for name in ("prediction_summary.json", "prediction_manifest.json"):
+            candidate = report_path / name
+            if candidate.is_file():
+                with candidate.open("r", encoding="utf-8") as handle:
+                    prediction_summary = json.load(handle)
+                break
+    metadata["experiment_id"] = str(prediction_summary.get("experiment_id") or "")
+    metadata["architecture_id"] = str(prediction_summary.get("architecture_id") or "")
+    model_run_dir_value = str(prediction_summary.get("model_run_dir") or "").strip()
+    manifest: dict[str, object] = {}
+    if model_run_dir_value:
+        model_run_dir = resolve_relative_path(model_run_dir_value, root=REPO_ROOT)
+        for name in ("model_run_manifest.json", "experiment_manifest.json"):
+            candidate = model_run_dir / name
+            if candidate.is_file():
+                with candidate.open("r", encoding="utf-8") as handle:
+                    manifest = json.load(handle)
+                metadata["metadata_source"] = "model_run_manifest"
+                break
+    if not manifest:
+        if metadata["architecture_id"]:
+            metadata["metadata_source"] = "prediction_summary"
+        return metadata
+
+    metadata["experiment_id"] = str(manifest.get("experiment_id") or metadata["experiment_id"])
+    architecture = manifest.get("architecture")
+    if isinstance(architecture, Mapping):
+        metadata["architecture_id"] = str(architecture.get("id") or metadata["architecture_id"])
+    architecture_id = str(metadata["architecture_id"])
+    if architecture_id in {"trace_conv1d", "trace_dilated_tcn", "trace_lateral_mixer"}:
+        metadata["architecture_family"] = "trace"
+    elif architecture_id == "patch_conv2d":
+        metadata["architecture_family"] = "patch"
+
+    sources = manifest.get("sources")
+    source_map = dict(sources) if isinstance(sources, Mapping) else {}
+    loss_kinds: set[str] = set()
+    has_mismatch_training = False
+    stages = manifest.get("stages")
+    if isinstance(stages, list):
+        for stage in stages:
+            if not isinstance(stage, Mapping):
+                continue
+            blocks = stage.get("loss_blocks")
+            if not isinstance(blocks, list):
+                continue
+            for block in blocks:
+                if not isinstance(block, Mapping):
+                    continue
+                kind = str(block.get("kind") or "").strip()
+                if kind:
+                    loss_kinds.add(kind)
+                source = source_map.get(str(block.get("source") or ""), {})
+                if isinstance(source, Mapping) and str(
+                    source.get("input_seismic_variant") or ""
+                ).casefold() == "observed_mismatch":
+                    has_mismatch_training = True
+    if not has_mismatch_training:
+        for source in source_map.values():
+            if isinstance(source, Mapping) and str(
+                source.get("input_seismic_variant") or ""
+            ).casefold() == "observed_mismatch":
+                has_mismatch_training = True
+                break
+    metadata["loss_kinds"] = ",".join(sorted(loss_kinds))
+    metadata["has_physics_loss"] = "physics" in loss_kinds
+    metadata["has_mismatch_training"] = has_mismatch_training
+    return metadata
+
+
 def _parse_report_spec(spec: str) -> tuple[str, str, Path]:
     parts = spec.split(":", maxsplit=2)
     if len(parts) != 3 or not all(part.strip() for part in parts):
@@ -443,6 +552,15 @@ def _parse_report_spec(spec: str) -> tuple[str, str, Path]:
 
 
 def _build_ablation_report_card(summary: pd.DataFrame, frequency_path: Path) -> dict[str, object]:
+    architecture_family = summary.get(
+        "architecture_family", pd.Series("", index=summary.index)
+    ).fillna("").astype(str).str.casefold()
+    has_mismatch_training = summary.get(
+        "has_mismatch_training", pd.Series(False, index=summary.index)
+    ).fillna(False).astype(bool)
+    has_physics_loss = summary.get(
+        "has_physics_loss", pd.Series(False, index=summary.index)
+    ).fillna(False).astype(bool)
     coverage = {
         "base_fullband": bool((summary["scope"].astype(str) == "test_base").any()),
         "validation_base": bool((summary["scope"].astype(str) == "validation_base").any()),
@@ -469,13 +587,13 @@ def _build_ablation_report_card(summary: pd.DataFrame, frequency_path: Path) -> 
             .any()
         ),
         "mismatch_degradation": bool((summary["scope"].astype(str) == "validation_mismatch").any()),
-        "trace_architecture": bool(summary["model"].astype(str).str.contains("trace", case=False).any()),
-        "patch_architecture": bool(summary["model"].astype(str).str.contains("patch", case=False).any()),
+        "trace_architecture": bool(architecture_family.eq("trace").any()),
+        "patch_architecture": bool(architecture_family.eq("patch").any()),
         "patch_mismatch_training": bool(
-            summary["model"].astype(str).str.contains(r"patch.*mismatch", case=False, regex=True).any()
+            (architecture_family.eq("patch") & has_mismatch_training).any()
         ),
         "trace_mismatch_training": bool(
-            summary["model"].astype(str).str.contains("trace.*mismatch", case=False, regex=True).any()
+            (architecture_family.eq("trace") & has_mismatch_training).any()
         ),
         "zero_x_false_prediction_error": bool(
             summary.get("zero_x_false_prediction_n_ok", pd.Series(dtype=float))
@@ -491,7 +609,7 @@ def _build_ablation_report_card(summary: pd.DataFrame, frequency_path: Path) -> 
             .gt(0)
             .any()
         ),
-        "physics_loss": bool(summary["model"].astype(str).str.contains("phys", case=False).any()),
+        "physics_loss": bool(has_physics_loss.any()),
         "geometry_metrics": False,
         "patch_geometry_metrics": bool(
             summary.get("geometry_n_ok", pd.Series(dtype=float))
@@ -606,7 +724,10 @@ def _best_row(frame: pd.DataFrame, *, metric: str, ascending: bool) -> dict[str,
 
 def _seed_stability(summary: pd.DataFrame) -> dict[str, object]:
     result: dict[str, object] = {}
-    trace = summary[summary["model"].astype(str).str.contains("trace", case=False)].copy()
+    architecture_family = summary.get(
+        "architecture_family", pd.Series("", index=summary.index)
+    ).fillna("").astype(str).str.casefold()
+    trace = summary[architecture_family.eq("trace")].copy()
     if trace.empty:
         return result
     for scope, prefix in [("test_base", "trace_test_base"), ("benchmark_probe", "trace_benchmark_probe")]:
@@ -651,7 +772,10 @@ def _ablation_conclusion(best: dict[str, object], stability: dict[str, object]) 
             f"Best validation-mismatch RMSE is {mismatch_best.get('model')} "
             f"({float(mismatch_best.get('model_rmse')):.6g})."
         )
-    if "trace" in str(test_best.get("model", "")).casefold() and "trace" in str(probe_best.get("model", "")).casefold():
+    if (
+        str(test_best.get("architecture_family", "")).casefold() == "trace"
+        and str(probe_best.get("architecture_family", "")).casefold() == "trace"
+    ):
         recommendation = "treat_trace_architecture_as_strong_baseline"
         statements.append(
             "A trace architecture remains the strongest current baseline for base and paired-probe metrics."

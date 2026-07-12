@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
+import time
 from typing import Any, Iterator, Mapping
 
 import numpy as np
@@ -291,11 +292,14 @@ def _synthetic_sample_kinds(source: Mapping[str, Any]) -> set[str]:
 
 def _prepare_synthetic_indices(
     *, benchmark: SynthoseisBenchmark, source: Mapping[str, Any], patch_spec: PatchSpec,
-    blocks: list[Mapping[str, Any]], output_dir: Path,
+    blocks: list[Mapping[str, Any]], output_dir: Path, logger: logging.Logger | None = None,
 ) -> dict[str, pd.DataFrame]:
     result = {}
     for block in blocks:
         block_id = str(block["block_id"])
+        build_started = time.perf_counter()
+        if logger is not None:
+            logger.info("patch_index_build_start block_id=%s kind=%s", block_id, block["kind"])
         index = build_patch_index(
             benchmark,
             patch_spec=patch_spec,
@@ -303,24 +307,55 @@ def _prepare_synthetic_indices(
             min_valid_samples=(1 if block["kind"] == "physics" else int(block["min_valid_samples"])),
             max_patches=(int(source["max_patches"]) if source.get("max_patches") is not None else None),
         )
+        if logger is not None:
+            logger.info(
+                "patch_index_build_end block_id=%s rows=%d elapsed_s=%.1f",
+                block_id,
+                len(index),
+                time.perf_counter() - build_started,
+            )
         if block["kind"] == "physics":
             counts = []
             cache: dict[str, Any] = {}
-            for _, row in index.iterrows():
+            cache_limit = 8
+            loaded_sample_count = 0
+            progress_interval = max(1, len(index) // 10)
+            index_started = time.perf_counter()
+            for row_number, (_, row) in enumerate(index.iterrows(), start=1):
                 sample_id = str(row["sample_id"])
-                sample = cache.setdefault(sample_id, benchmark.load_sample(sample_id))
+                sample = cache.get(sample_id)
+                if sample is None:
+                    sample = benchmark.load_sample(sample_id)
+                    if len(cache) >= cache_limit:
+                        cache.pop(next(iter(cache)))
+                    cache[sample_id] = sample
+                    loaded_sample_count += 1
                 lfm_context = np.asarray(sample.priors["lfm_controlled_degraded"], dtype=np.float64)[
                     int(row["lateral_start"]):int(row["lateral_stop"]),
                     int(row["twt_start"]):int(row["twt_stop"]),
                 ]
                 if not np.all(np.isfinite(lfm_context)):
                     counts.append(0)
-                    continue
-                physics_target = np.asarray(sample.seismic_model_consistent, dtype=np.float64)[
-                    int(row["lateral_start"]):int(row["lateral_stop"]),
-                    int(row["twt_start"]):int(row["twt_stop"]),
-                ]
-                counts.append(int(np.count_nonzero(np.isfinite(physics_target) & np.isfinite(lfm_context))))
+                else:
+                    physics_target = np.asarray(sample.seismic_model_consistent, dtype=np.float64)[
+                        int(row["lateral_start"]):int(row["lateral_stop"]),
+                        int(row["twt_start"]):int(row["twt_stop"]),
+                    ]
+                    counts.append(int(np.count_nonzero(np.isfinite(physics_target) & np.isfinite(lfm_context))))
+                if logger is not None and (
+                    row_number == 1
+                    or row_number % progress_interval == 0
+                    or row_number == len(index)
+                ):
+                    logger.info(
+                        "physics_index_progress block_id=%s rows=%d/%d loaded_samples=%d cached_samples=%d elapsed_s=%.1f",
+                        block_id,
+                        row_number,
+                        len(index),
+                        loaded_sample_count,
+                        len(cache),
+                        time.perf_counter() - index_started,
+                    )
             index["supervision_valid_samples"] = counts
             index = index[index["supervision_valid_samples"] >= int(block["min_valid_samples"])].copy()
         if source.get("max_patches") is not None and "validation" not in set(index["split"].astype(str)):
@@ -729,6 +764,15 @@ def run_experiment(
         "lateral_kernel": config.architecture.lateral_kernel,
     }))
     model.to(device)
+    run_started = time.perf_counter()
+    logger.info(
+        "experiment_start experiment_id=%s architecture=%s device=%s output_dir=%s",
+        config.experiment_id,
+        config.architecture.id,
+        device,
+        output_dir,
+    )
+    logger.info("device_metadata=%s", device_metadata)
     initial_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
     patch_spec = PatchSpec(
         lateral_samples=config.patching.lateral_samples,
@@ -801,6 +845,15 @@ def run_experiment(
                 "held_out_well": source["held_out_well"],
                 "exclude_same_cluster": source.get("exclude_same_cluster", True),
             }
+    logger.info(
+        "sources_ready source_ids=%s consumed_source_ids=%s",
+        sorted(resolved_sources),
+        sorted({
+            str(block["source"])
+            for stage in config.stages
+            for block in stage["loss_blocks"]
+        }),
+    )
     consumed_sources = {
         str(block["source"])
         for stage in config.stages
@@ -858,6 +911,13 @@ def run_experiment(
     write_json(output_dir / "normalization.json", normalization)
     input_stats_path = output_dir / "input_reference_stats.json"
     write_json(input_stats_path, {"stats": input_reference_stats})
+    reference_patch_count = len(reference_index) if reference_index is not None else len(reference_rows)
+    logger.info(
+        "normalization_ready reference_source=%s reference_patch_count=%d input_reference_stats_path=%s",
+        config.normalization_reference,
+        reference_patch_count,
+        input_stats_path,
+    )
     manifest_stages: list[dict[str, Any]] = []
     checkpoints: dict[tuple[str, str], Path] = {}
     sample_axis_contract: dict[str, Any] | None = dict(experiment_axis_contract)
@@ -865,7 +925,17 @@ def run_experiment(
         stage_id = str(stage["stage_id"])
         stage_dir = output_dir / "stages" / stage_id
         stage_dir.mkdir(parents=True, exist_ok=False)
+        stage_started = time.perf_counter()
         initialize = str(stage["initialize_from"])
+        logger.info(
+            "stage_start stage_id=%s stage_index=%d initialize_from=%s epochs=%d steps_per_epoch=%d loss_blocks=%s",
+            stage_id,
+            stage_index,
+            initialize,
+            int(stage["epochs"]),
+            int(stage["steps_per_epoch"]),
+            [str(block["block_id"]) for block in stage["loss_blocks"]],
+        )
         if initialize == "zero":
             model.load_state_dict(initial_state)
         else:
@@ -878,9 +948,17 @@ def run_experiment(
         )
         prepared_blocks: list[PreparedBlock] = []
         for block in stage["loss_blocks"]:
+            block_started = time.perf_counter()
             source_id = str(block["source"])
             source = config.sources[source_id]
             cfg = dict(block) | {"source_kind": source["kind"]}
+            logger.info(
+                "block_prepare_start stage_id=%s block_id=%s kind=%s source=%s",
+                stage_id,
+                block["block_id"],
+                block["kind"],
+                source_id,
+            )
             if source["kind"] == "synthoseis_lite":
                 benchmark, benchmark_dir = synthetic[source_id]
                 wavelet = load_benchmark_wavelet(
@@ -888,7 +966,7 @@ def run_experiment(
                 ) if block["kind"] == "physics" else None
                 indices = _prepare_synthetic_indices(
                     benchmark=benchmark, source=source, patch_spec=patch_spec,
-                    blocks=[block], output_dir=stage_dir,
+                    blocks=[block], output_dir=stage_dir, logger=logger,
                 )[str(block["block_id"])]
                 train_dataset = PatchDataset(benchmark, indices, split="train", normalization=normalization)
                 validation_dataset = PatchDataset(benchmark, indices, split="validation", normalization=normalization)
@@ -939,11 +1017,26 @@ def run_experiment(
                 volume = real_fields[field_source_id][0]
                 if sample_axis_contract is None:
                     sample_axis_contract = {"sample_domain": volume.sample_axis.domain, "sample_unit": volume.sample_axis.unit, "depth_basis": volume.depth_basis}
+            prepared = prepared_blocks[-1]
+            train_size = len(prepared.train_dataset) if prepared.train_dataset is not None else 0
+            validation_size = len(prepared.validation_dataset) if prepared.validation_dataset is not None else 0
+            logger.info(
+                "block_ready stage_id=%s block_id=%s train_patches=%d validation_patches=%d real_well_support=%s elapsed_s=%.1f",
+                stage_id,
+                block["block_id"],
+                train_size,
+                validation_size,
+                prepared.real_well_support is not None,
+                time.perf_counter() - block_started,
+            )
         best_value = float("inf")
         best_epoch = 0
         history: list[dict[str, Any]] = []
         metric_name = str(stage["validation"]["selection_metric"])
+        steps_per_epoch = int(stage["steps_per_epoch"])
         for epoch in range(1, int(stage["epochs"]) + 1):
+            epoch_started = time.perf_counter()
+            logger.info("epoch_start stage_id=%s epoch=%d/%d", stage_id, epoch, int(stage["epochs"]))
             cyclers = []
             for index, block in enumerate(prepared_blocks):
                 if block.train_dataset is None:
@@ -951,7 +1044,7 @@ def run_experiment(
                     continue
                 batch_size = int(block.config["batch_size"])
                 interval = int(block.config["update_interval"])
-                num_batches = (int(stage["steps_per_epoch"]) + interval - 1) // interval
+                num_batches = (steps_per_epoch + interval - 1) // interval
                 sampling_kind = str(dict(block.config.get("sampling") or {}).get("kind") or "uniform_patch")
                 seed = _seed(config.seed, stage_index, index, epoch)
                 if sampling_kind == "balanced_sample_kind":
@@ -992,7 +1085,10 @@ def run_experiment(
             sampled_kind_counts: dict[str, dict[str, int]] = {
                 str(block.config["block_id"]): {} for block in prepared_blocks
             }
-            for step in range(int(stage["steps_per_epoch"])):
+            progress_interval = max(1, steps_per_epoch // 10)
+            last_combined = float("nan")
+            for step in range(steps_per_epoch):
+                step_started = time.perf_counter()
                 optimizer.zero_grad(set_to_none=True)
                 combined: torch.Tensor | None = None
                 for block_index, prepared in enumerate(prepared_blocks):
@@ -1021,13 +1117,36 @@ def run_experiment(
                     batch_counts[str(prepared.config["block_id"])] += 1
                 if combined is None or not bool(torch.isfinite(combined)):
                     raise FloatingPointError(f"Invalid combined loss at {stage_id} epoch={epoch} step={step}.")
+                last_combined = float(combined.detach().cpu())
                 combined.backward()
                 optimizer.step()
+                if step == 0 or (step + 1) % progress_interval == 0 or step + 1 == steps_per_epoch:
+                    logger.info(
+                        "step_progress stage_id=%s epoch=%d/%d step=%d/%d loss=%.6g step_elapsed_s=%.1f epoch_elapsed_s=%.1f",
+                        stage_id,
+                        epoch,
+                        int(stage["epochs"]),
+                        step + 1,
+                        steps_per_epoch,
+                        last_combined,
+                        time.perf_counter() - step_started,
+                        time.perf_counter() - epoch_started,
+                    )
+            validation_started = time.perf_counter()
+            logger.info("validation_start stage_id=%s epoch=%d/%d", stage_id, epoch, int(stage["epochs"]))
             validation_values: dict[str, float] = {}
             for prepared in prepared_blocks:
                 metrics = _evaluate(prepared=prepared, model=model, device=device, normalization=normalization, steps=None)
                 for name, value in metrics.items():
                     validation_values[f"{prepared.config['block_id']}.{name}"] = value
+            logger.info(
+                "validation_end stage_id=%s epoch=%d/%d metrics=%s elapsed_s=%.1f",
+                stage_id,
+                epoch,
+                int(stage["epochs"]),
+                validation_values,
+                time.perf_counter() - validation_started,
+            )
             selected = float(validation_values[metric_name])
             if not np.isfinite(selected):
                 raise FloatingPointError(
@@ -1057,15 +1176,44 @@ def run_experiment(
                         if sample_kind not in {"base", "seismic_variant"})
                 )
             history.append(row)
+            logger.info(
+                "epoch_end stage_id=%s epoch=%d/%d last_train_loss=%.6g selected_metric=%s selected_value=%.6g training=%s validation=%s sampled_kind_counts=%s elapsed_s=%.1f",
+                stage_id,
+                epoch,
+                int(stage["epochs"]),
+                last_combined,
+                metric_name,
+                selected,
+                training_values,
+                validation_values,
+                sampled_kind_counts,
+                time.perf_counter() - epoch_started,
+            )
             if selected < best_value:
                 best_value, best_epoch = selected, epoch
                 path = stage_dir / "checkpoint_best.pt"
                 torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="best", epoch=epoch, metric_name=metric_name, metric_value=selected, sample_axis=sample_axis_contract), path)
                 checkpoints[(stage_id, "best")] = path
+                logger.info(
+                    "checkpoint_best stage_id=%s epoch=%d metric=%s value=%.6g path=%s",
+                    stage_id,
+                    epoch,
+                    metric_name,
+                    selected,
+                    path,
+                )
         final_path = stage_dir / "checkpoint_final.pt"
         torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="final", epoch=int(stage["epochs"]), metric_name=metric_name, metric_value=float(history[-1]["selection_metric_value"]), sample_axis=sample_axis_contract), final_path)
         checkpoints[(stage_id, "final")] = final_path
         pd.DataFrame(history).to_csv(stage_dir / "training_history.csv", index=False)
+        logger.info(
+            "stage_end stage_id=%s best_epoch=%d best_value=%.6g final_checkpoint=%s elapsed_s=%.1f",
+            stage_id,
+            best_epoch,
+            best_value,
+            final_path,
+            time.perf_counter() - stage_started,
+        )
         manifest_stages.append({
             **stage, "best_epoch": best_epoch, "best_selection_metric_value": best_value,
             "checkpoints": {kind: repo_relative_path(checkpoints[(stage_id, kind)], root=root) for kind in ("best", "final")},
@@ -1102,6 +1250,12 @@ def run_experiment(
         manifest["patch_index"] = repo_relative_path(deployment_indices[0], root=root)
     write_json(output_dir / "experiment_manifest.json", manifest)
     write_json(output_dir / "model_run_manifest.json", manifest)
+    logger.info(
+        "experiment_end experiment_id=%s deployment_checkpoint=%s elapsed_s=%.1f",
+        config.experiment_id,
+        deployment_path,
+        time.perf_counter() - run_started,
+    )
     return manifest
 
 

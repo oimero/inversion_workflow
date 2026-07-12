@@ -62,6 +62,7 @@ real_field_zero_shot:
   mode: volume                    # 默认 volume；可选 section
   device: auto                    # 默认 auto；cuda / cpu / auto
   diagnostic_max_hz: 80.0         # 默认 80.0
+  sections_file: experiments/common/real_field_sections.yaml  # section 模式下的一个或多个剖面
 
   real_field_inputs:
     lfm_run_dir: scripts/output/real_field_lfm_<timestamp>
@@ -128,7 +129,20 @@ real_field_zero_shot:
 
 ### `mode`
 
-支持 `volume`（全工区三维推理）和 `section`（单剖面快速验证）。默认 `volume`。剖面模式要求提供恰好一个剖面的定义文件（通过 `sections_file` 指定），且井 QC 自动禁用。
+支持 `volume`（全工区三维推理）和 `section`（一个或多个剖面批处理）。默认 `volume`。section 模式从 `sections_file` 读取 `sections` 列表；每个剖面独立写入输出子目录，并生成自己的预测、图表、井 QC 和摘要，同时根目录生成跨剖面的汇总摘要。
+
+section 文件中的每个条目需要唯一的 `section_id` 和 `path`。对于 xline 步长不为 1 的工区，显式填写 `n_traces`，使路径坐标落在实际 survey 轴上：
+
+```yaml
+sections:
+  - section_id: well_a
+    path:
+      - {inline: 1684.0, xline: 6111.0}
+      - {inline: 1684.0, xline: 6591.0}
+    n_traces: 121
+```
+
+批处理输出目录下的 `<section_id>/real_field_zero_shot_summary.json` 可以直接作为该剖面的 R1 输入；根目录摘要记录所有剖面的索引和汇总 QC。
 
 ### `real_field_inputs`
 
@@ -235,7 +249,7 @@ real_field_zero_shot:
 ### 第一阶段：加载输入
 
 1. 从成功发布的 `variant_manifest.csv` 解析显式 `variant_id`，读取对应 `variants/<variant_id>/lfm.npz`，核对变体与第六步的直接契约身份并做语义校验。
-2. 按 `mode` 决定是加载整个地震体（体积模式）还是单个剖面（剖面模式）。
+2. 按 `mode` 决定是加载整个地震体（体积模式）还是逐个加载 `sections_file` 中的剖面（剖面模式）。
 3. 应用 `seismic_value_transform`，把原始地震振幅变换到模型训练时的值域。
 4. 从每个模型目录加载 manifest，读取 `experiment_id`（不再从架构名称推断角色）、checkpoint 权重和标准化参数。
 
@@ -262,7 +276,7 @@ real_field_zero_shot:
 
 1. 生成每个模型的三面板图（低频模型 / 差值 / 预测），检查推断结果的全局分布。
 2. 如果配置了 `comparisons`，生成每对 comparison 的模型间差值图，按频带拆分以判断差异在哪些频率起作用。
-3. 在剖面模式下，抽取井位置处的预测值与井上波阻抗做对比，生成井位 QC 图。
+3. 在剖面模式下，对每个剖面抽取井位置处的预测值与井上波阻抗做对比，生成剖面级井位 QC 图，并在根目录汇总。
 4. 写出一系列频带能量 QC 表格。
 
 ### 第四阶段：摘要
@@ -277,7 +291,7 @@ real_field_zero_shot:
 
 ### 模型推理输出
 
-每个模型一个以 `experiment_id` 命名的子目录，内部包含：
+体积模式下每个模型一个以 `experiment_id` 命名的子目录；剖面模式下先按 `<section_id>/` 分目录，再在其中按 `experiment_id` 分模型目录。每个模型目录内部包含：
 
 | 文件 | 内容 |
 |------|------|
@@ -299,11 +313,11 @@ real_field_zero_shot:
 
 | 文件 | 内容 |
 |------|------|
-| `figures/<experiment_id>_lfm_delta_pred.png` | 三面板对比：低频模型 / 预测差值 / 预测 |
+| `<section_id>/figures/<experiment_id>_lfm_delta_pred.png` | 剖面模式下的三面板对比：低频模型 / 预测差值 / 预测 |
 | `figures/<comparison_id>_difference.png` | comparison 中左右模型的预测差异 |
 | `figures/<comparison_id>_difference_band_split.png` | comparison 预测差异的逐频带拆分 |
 | `figures/spectral_band_energy_qc.png` | 各频带预测差值能量柱状图 |
-| `figures/wells/r0_well_prediction_qc_<well>.png` | 剖面模式下，井位预测与统一井控在当前采样域的对比 |
+| `<section_id>/figures/wells/r0_well_prediction_qc_<well>.png` | 剖面模式下，井位预测与统一井控在当前采样域的对比 |
 
 ---
 
@@ -314,7 +328,8 @@ real_field_zero_shot:
 ```
 === Real Field Zero-Shot ===
 Output: scripts/output/real_field_zero_shot_<timestamp>
-Models: 2
+Sections: 10
+Models per section: 2
 Status: needs_forward_diagnostic
 ```
 
@@ -329,7 +344,7 @@ Status: needs_forward_diagnostic
 
 ### 第三步：看预测三面板图
 
-打开 `figures/<experiment_id>_lfm_delta_pred.png`：
+体积模式打开 `figures/<experiment_id>_lfm_delta_pred.png`；section 模式打开对应的 `<section_id>/figures/<experiment_id>_lfm_delta_pred.png`：
 
 - **左图（低频模型）**：低频背景。应该展现光滑的大尺度结构。
 - **中图（Pred - 低频模型）**：预测差值。这部分是模型从地震数据里推断出的高频修正——如果几乎全为零，可能说明模型没有利用地震信息。
@@ -364,7 +379,7 @@ Status: needs_forward_diagnostic
 | `input_reference_stats.json` 缺失 | 模型训练时未生成参考统计文件 | 用当前版重新训练一次 |
 | `model_run_manifest.json` 缺少 experiment_id | 旧 manifest schema | 重新训练当前实验 |
 | `input_distribution_ood` 告警 | 真实地震数据分布显著偏离训练分布 | 检查 `seismic_value_transform` 是否正确；考虑是否需要重新训练以匹配真实数据分布 |
-| 剖面模式下 `sections_file` 包含多个剖面 | R0 剖面模式只支持单个剖面 | 只保留一个剖面定义，或改用体积模式 |
+| section 条目缺少或重复 `section_id` | 批处理无法稳定组织输出 | 为每个剖面指定唯一的 `section_id` |
 | WellControlSet 不匹配 | 剖面井 QC 使用的 Step 6 run 与 variant 不同 | 修正 `well_control_run_dir`；不得回退读取 Step 4 |
 | R0 有效点没有预测支持 | 有效样点未被任何推理窗口覆盖 | 检查模型的 patch 几何合同与推理体积是否匹配；不要用数值回填掩盖 |
 | comparison 左右模型输出形状不一致 | 两个实验使用了不同的 patch 几何或输出范围 | 确认两个实验的 patching 配置一致 |
@@ -372,9 +387,8 @@ Status: needs_forward_diagnostic
 
 ---
 
-## 留到第二轮
+## 后续工作
 
-- 多剖面批量推理（当前剖面模式只支持单个剖面）。
 - 推理时的不确定性量化（如使用模型集成或多轮随机丢弃）。
 - 在不重新训练的前提下对真实工区做自适应微调（如 AdaBN 或浅层适配）。
 - 体积模式下沿井轨迹的自动对比（当前只在剖面模式下支持井 QC）。

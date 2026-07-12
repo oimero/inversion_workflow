@@ -7,6 +7,9 @@ Usage::
     python scripts/real_field_zero_shot.py --device cuda
     python scripts/real_field_zero_shot.py --stitch-strategy center_crop
     python scripts/real_field_zero_shot.py --output-dir scripts/output/real_field_zero_shot_test
+
+In section mode, ``sections_file`` may contain multiple section entries; each
+section is written below its own output subdirectory.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ import argparse
 from datetime import datetime
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -118,7 +122,20 @@ def _load_sections_file(run_cfg: dict) -> list[dict]:
     sections = payload.get("sections")
     if not isinstance(sections, list) or not sections:
         raise ValueError(f"{sections_file} must contain a non-empty sections list.")
-    return [dict(item) for item in sections]
+    result: list[dict] = []
+    seen: set[str] = set()
+    for index, item in enumerate(sections):
+        if not isinstance(item, dict):
+            raise ValueError(f"{sections_file}.sections[{index}] must be a mapping.")
+        section_id = str(item.get("section_id") or "").strip()
+        if not section_id:
+            raise ValueError(f"{sections_file}.sections[{index}] requires section_id.")
+        section_key = section_id.casefold()
+        if section_key in seen:
+            raise ValueError(f"{sections_file} repeats section_id={section_id!r}.")
+        seen.add(section_key)
+        result.append(dict(item))
+    return result
 
 
 def _prepare_run_config(run_cfg: dict, cfg: dict) -> dict:
@@ -139,9 +156,7 @@ def _prepare_run_config(run_cfg: dict, cfg: dict) -> dict:
     prepared["real_field_inputs"] = inputs
     if str(prepared.get("mode") or "volume").casefold() == "section":
         sections = _load_sections_file(prepared)
-        if len(sections) != 1:
-            raise ValueError("R0 section mode requires sections_file with exactly one section.")
-        prepared["section"] = sections[0]
+        prepared["sections"] = sections
     return prepared
 
 
@@ -912,6 +927,407 @@ def _boundary_contract(
     }
 
 
+def _section_directory_name(section_id: str, index: int, used: set[str]) -> str:
+    """Return a stable filesystem name for one configured section."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(section_id).strip()).strip("._")
+    if not safe:
+        safe = f"section_{index:04d}"
+    safe_key = safe.casefold()
+    if safe_key in used:
+        raise ValueError(
+            f"Section IDs produce the same output directory name: {section_id!r} -> {safe!r}."
+        )
+    used.add(safe_key)
+    return safe
+
+
+def _r0_input_contracts(
+    inputs_for_load: dict[str, object], model_summaries: list[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    contracts: dict[str, dict[str, object]] = {
+        "lfm_variant": {
+            "path": str(inputs_for_load["selected_lfm_contract_path"]),
+            "contract_fingerprint_sha256": str(
+                inputs_for_load["selected_lfm_contract_fingerprint_sha256"]
+            ),
+        },
+        "well_control_set": {
+            "path": str(inputs_for_load["well_control_contract_path"]),
+            "contract_fingerprint_sha256": str(
+                inputs_for_load["well_control_contract_fingerprint_sha256"]
+            ),
+        },
+    }
+    for model_summary in model_summaries:
+        experiment_id = str(model_summary["experiment_id"])
+        model_input = dict(dict(model_summary.get("input_contracts") or {}).get("model_run") or {})
+        if not model_input:
+            raise ValueError(f"R0 model summary lacks model_run contract: {experiment_id}")
+        key = f"model:{experiment_id}"
+        if key in contracts and contracts[key] != model_input:
+            raise ValueError(
+                f"R0 sections received different model contracts for experiment_id={experiment_id}."
+            )
+        contracts[key] = model_input
+    return contracts
+
+
+def _forward_model_inputs_path(
+    model_summaries: list[dict[str, object]], sample_domain: str,
+) -> str:
+    paths = {str(summary.get("forward_model_inputs_path") or "").strip() for summary in model_summaries}
+    if sample_domain == "depth":
+        if len(paths) != 1 or not next(iter(paths)):
+            raise ValueError(
+                "Depth R0 models must share one explicit forward_model_inputs_path."
+            )
+        return next(iter(paths))
+    return ""
+
+
+def _section_axis_contract(field: object) -> dict[str, object]:
+    return {
+        "n_lateral": int(field.lfm.shape[0]),
+        **field.sample_axis.describe(),
+    }
+
+
+def _merge_section_csvs(
+    records: list[dict[str, object]], filename: str, output_path: Path,
+) -> Path:
+    frames: list[pd.DataFrame] = []
+    for record in records:
+        path = Path(record["output_dir"]) / filename
+        if not path.is_file():
+            continue
+        frame = pd.read_csv(path)
+        frame.insert(0, "section_id", str(record["section_id"]))
+        frames.append(frame)
+    merged = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    merged.to_csv(output_path, index=False)
+    return output_path
+
+
+def _build_section_summary(
+    *,
+    cfg_path: Path,
+    run_cfg: dict,
+    inputs_for_load: dict[str, object],
+    section_id: str,
+    section_cfg: dict,
+    field: object,
+    model_summaries: list[dict[str, object]],
+    device: str,
+    stitch_strategy: str,
+    boundary_contract: dict[str, object],
+    outputs: dict[str, object],
+    input_qc_path: Path,
+    comparisons: list[dict[str, str]],
+) -> dict[str, object]:
+    axis_contract = _section_axis_contract(field)
+    input_contracts = _r0_input_contracts(inputs_for_load, model_summaries)
+    forward_inputs_path = _forward_model_inputs_path(
+        model_summaries, str(field.sample_axis.domain)
+    )
+    primary_artifacts = {
+        f"prediction:{summary['experiment_id']}": resolve_relative_path(
+            str(dict(summary["outputs"])["predictions"]), root=REPO_ROOT
+        )
+        for summary in model_summaries
+    }
+    summary: dict[str, object] = {
+        "schema_version": ZERO_SHOT_SUMMARY_SCHEMA_VERSION,
+        "status": "needs_forward_diagnostic",
+        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "input_contracts": input_contracts,
+        "mode": "section",
+        "section_id": section_id,
+        "sections_file": repo_relative_path(
+            resolve_relative_path(str(run_cfg.get("sections_file") or DEFAULT_REAL_FIELD_SECTIONS), root=REPO_ROOT),
+            root=REPO_ROOT,
+        ),
+        "config_file": repo_relative_path(cfg_path, root=REPO_ROOT),
+        "device_requested": device,
+        "stitch_strategy": stitch_strategy,
+        "source_runs": dict(run_cfg.get("source_runs") or {}),
+        "comparisons": comparisons,
+        "sample_domain": field.sample_axis.domain,
+        "sample_unit": field.sample_axis.unit,
+        "depth_basis": field.depth_basis,
+        "forward_model_inputs": {"path": forward_inputs_path} if forward_inputs_path else {},
+        "section": {**dict(field.metadata), "section_id": section_id, "section_config": section_cfg},
+        "axis_contract": axis_contract,
+        "mask_contract": {
+            "valid_fraction": float(field.valid_mask.mean()),
+            "valid_samples": int(field.valid_mask.sum()),
+            "total_samples": int(field.valid_mask.size),
+        },
+        "boundary_contract": boundary_contract,
+        "input_distribution_qc": {
+            "path": repo_relative_path(input_qc_path, root=REPO_ROOT),
+            "warnings": _input_distribution_warnings(input_qc_path),
+        },
+        "outputs": outputs,
+        "models": model_summaries,
+        "code_version_or_git_commit": str(run_cfg.get("code_version_or_git_commit") or _git_commit()),
+    }
+    summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+        contract_schema_version=ZERO_SHOT_SUMMARY_SCHEMA_VERSION,
+        semantics={
+            "mode": "section",
+            "sample_domain": str(field.sample_axis.domain),
+            "axis_contract": axis_contract,
+        },
+        business_config={
+            "mode": "section",
+            "stitch_strategy": stitch_strategy,
+            "boundary": dict(run_cfg.get("boundary") or {}),
+            "section_id": section_id,
+            "section_config": section_cfg,
+        },
+        input_contracts=input_contracts,
+        primary_artifacts=primary_artifacts,
+    )
+    return summary
+
+
+def _run_section_batch(
+    *,
+    cfg_path: Path,
+    run_cfg: dict,
+    run_cfg_for_load: dict,
+    inputs_for_load: dict[str, object],
+    models: list[dict],
+    data_root: Path,
+    output_dir: Path,
+    device: str,
+    stitch_strategy: str,
+) -> dict[str, object]:
+    section_configs = list(run_cfg_for_load.get("sections") or [])
+    if not section_configs:
+        raise ValueError("R0 section mode requires at least one section configuration.")
+
+    records: list[dict[str, object]] = []
+    used_directory_names: set[str] = set()
+    for index, section_cfg_value in enumerate(section_configs):
+        section_cfg = dict(section_cfg_value)
+        section_id = str(section_cfg["section_id"])
+        section_dir = output_dir / _section_directory_name(section_id, index, used_directory_names)
+        section_dir.mkdir(parents=True, exist_ok=False)
+        section_run_cfg = dict(run_cfg_for_load)
+        section_run_cfg["section"] = section_cfg
+        field = load_real_field_section(
+            config=section_run_cfg,
+            root=REPO_ROOT,
+            data_root=data_root,
+        )
+        model_summaries: list[dict[str, object]] = []
+        input_qc_written = False
+        input_qc_path = section_dir / "model_input_qc.csv"
+        for model_cfg in models:
+            summary = run_zero_shot_model(
+                section=field,
+                model_cfg=model_cfg,
+                output_dir=section_dir,
+                root=REPO_ROOT,
+                device_name=device,
+                stitch_strategy=stitch_strategy,
+            )
+            model_summaries.append(summary)
+            if not input_qc_written:
+                input_qc_frame(field, summary.get("normalization", {}) or {}).to_csv(
+                    input_qc_path, index=False
+                )
+                input_qc_written = True
+        figures = _plot_zero_shot_qc(section_dir)
+        well_outputs = _write_well_prediction_qc(section_dir, run_cfg=section_run_cfg)
+        spectral_outputs = (
+            _write_spectral_qc(section_dir, run_cfg=run_cfg, dt_s=float(field.sample_axis.step))
+            if field.sample_axis.domain == "time"
+            else {}
+        )
+        boundary_contract = _boundary_contract(
+            dict(run_cfg.get("boundary") or {}), sample_axis=field.sample_axis
+        )
+        records.append(
+            {
+                "section_id": section_id,
+                "section_cfg": section_cfg,
+                "output_dir": section_dir,
+                "field": field,
+                "model_summaries": model_summaries,
+                "input_qc_path": input_qc_path,
+                "boundary_contract": boundary_contract,
+                "outputs": {
+                    "model_input_qc": repo_relative_path(input_qc_path, root=REPO_ROOT),
+                    "figures": figures,
+                    "well_prediction_qc": well_outputs,
+                    "volume_exports": {},
+                    **spectral_outputs,
+                },
+            }
+        )
+
+    experiment_ids = {
+        str(summary["experiment_id"])
+        for record in records
+        for summary in record["model_summaries"]
+    }
+    comparisons = _load_comparisons(run_cfg, experiment_ids)
+    section_payloads: list[dict[str, object]] = []
+    for record in records:
+        payload = _build_section_summary(
+            cfg_path=cfg_path,
+            run_cfg=run_cfg,
+            inputs_for_load=inputs_for_load,
+            section_id=str(record["section_id"]),
+            section_cfg=dict(record["section_cfg"]),
+            field=record["field"],
+            model_summaries=list(record["model_summaries"]),
+            device=device,
+            stitch_strategy=stitch_strategy,
+            boundary_contract=dict(record["boundary_contract"]),
+            outputs=dict(record["outputs"]),
+            input_qc_path=Path(record["input_qc_path"]),
+            comparisons=comparisons,
+        )
+        section_summary_path = Path(record["output_dir"]) / "real_field_zero_shot_summary.json"
+        write_json(section_summary_path, payload)
+        record["summary"] = payload
+        section_payloads.append(payload)
+
+    merged_input_qc = _merge_section_csvs(
+        records, "model_input_qc.csv", output_dir / "model_input_qc.csv"
+    )
+    merged_well_qc = _merge_section_csvs(
+        records, "well_prediction_qc.csv", output_dir / "well_prediction_qc.csv"
+    )
+    all_model_summaries: list[dict[str, object]] = []
+    for record in records:
+        for model_summary in record["model_summaries"]:
+            item = dict(model_summary)
+            item["section_id"] = str(record["section_id"])
+            all_model_summaries.append(item)
+    input_contracts = _r0_input_contracts(inputs_for_load, all_model_summaries)
+    sample_domain = str(section_payloads[0]["sample_domain"])
+    sample_unit = str(section_payloads[0]["sample_unit"])
+    depth_basis = section_payloads[0].get("depth_basis")
+    forward_inputs_path = _forward_model_inputs_path(all_model_summaries, sample_domain)
+    section_axis_contracts = {
+        str(payload["section_id"]): dict(payload["axis_contract"])
+        for payload in section_payloads
+    }
+    total_valid = sum(int(dict(payload["mask_contract"])["valid_samples"]) for payload in section_payloads)
+    total_samples = sum(int(dict(payload["mask_contract"])["total_samples"]) for payload in section_payloads)
+    section_outputs: dict[str, object] = {}
+    aggregate_figures: dict[str, str] = {}
+    aggregate_well_figures: dict[str, str] = {}
+    warnings: list[dict[str, object]] = []
+    for record, payload in zip(records, section_payloads):
+        section_id = str(record["section_id"])
+        outputs = dict(payload["outputs"])
+        figures = dict(outputs.get("figures") or {})
+        aggregate_figures.update({f"{section_id}:{key}": value for key, value in figures.items()})
+        well_outputs = dict(outputs.get("well_prediction_qc") or {})
+        aggregate_well_figures.update(
+            {
+                f"{section_id}:{key}": value
+                for key, value in dict(well_outputs.get("figures") or {}).items()
+            }
+        )
+        warnings.extend(list(dict(payload["input_distribution_qc"]).get("warnings") or []))
+        section_outputs[section_id] = {
+            "directory": repo_relative_path(Path(record["output_dir"]), root=REPO_ROOT),
+            "summary": repo_relative_path(
+                Path(record["output_dir"]) / "real_field_zero_shot_summary.json", root=REPO_ROOT
+            ),
+            "outputs": outputs,
+        }
+    aggregate_outputs: dict[str, object] = {
+        "model_input_qc": repo_relative_path(merged_input_qc, root=REPO_ROOT),
+        "figures": aggregate_figures,
+        "well_prediction_qc": {
+            "csv": repo_relative_path(merged_well_qc, root=REPO_ROOT),
+            "figures": aggregate_well_figures,
+            "status": "ok",
+        },
+        "sections": section_outputs,
+        "volume_exports": {},
+    }
+    aggregate_axis_contract = {
+        "n_sections": len(section_payloads),
+        "sections": section_axis_contracts,
+    }
+    primary_artifacts = {
+        f"prediction:{record['section_id']}:{summary['experiment_id']}": resolve_relative_path(
+            str(dict(summary["outputs"])["predictions"]), root=REPO_ROOT
+        )
+        for record in records
+        for summary in record["model_summaries"]
+    }
+    aggregate_summary: dict[str, object] = {
+        "schema_version": ZERO_SHOT_SUMMARY_SCHEMA_VERSION,
+        "status": "needs_forward_diagnostic",
+        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
+        "input_contracts": input_contracts,
+        "mode": "section",
+        "section_batch": True,
+        "sections_file": repo_relative_path(
+            resolve_relative_path(str(run_cfg.get("sections_file") or DEFAULT_REAL_FIELD_SECTIONS), root=REPO_ROOT),
+            root=REPO_ROOT,
+        ),
+        "n_sections": len(section_payloads),
+        "section_ids": [str(payload["section_id"]) for payload in section_payloads],
+        "config_file": repo_relative_path(cfg_path, root=REPO_ROOT),
+        "device_requested": device,
+        "stitch_strategy": stitch_strategy,
+        "source_runs": dict(run_cfg.get("source_runs") or {}),
+        "comparisons": comparisons,
+        "sample_domain": sample_domain,
+        "sample_unit": sample_unit,
+        "depth_basis": depth_basis,
+        "forward_model_inputs": {"path": forward_inputs_path} if forward_inputs_path else {},
+        "section": {},
+        "sections": section_payloads,
+        "axis_contract": aggregate_axis_contract,
+        "mask_contract": {
+            "valid_fraction": float(total_valid / total_samples) if total_samples else 0.0,
+            "valid_samples": total_valid,
+            "total_samples": total_samples,
+        },
+        "boundary_contract": dict(section_payloads[0]["boundary_contract"]),
+        "input_distribution_qc": {
+            "path": repo_relative_path(merged_input_qc, root=REPO_ROOT),
+            "warnings": warnings,
+        },
+        "outputs": aggregate_outputs,
+        "models": all_model_summaries,
+        "code_version_or_git_commit": str(run_cfg.get("code_version_or_git_commit") or _git_commit()),
+    }
+    aggregate_summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
+        contract_schema_version=ZERO_SHOT_SUMMARY_SCHEMA_VERSION,
+        semantics={
+            "mode": "section",
+            "sample_domain": sample_domain,
+            "sample_unit": sample_unit,
+            "depth_basis": depth_basis,
+            "axis_contract": aggregate_axis_contract,
+        },
+        business_config={
+            "mode": "section",
+            "section_batch": True,
+            "sections_file": str(run_cfg.get("sections_file") or DEFAULT_REAL_FIELD_SECTIONS),
+            "section_ids": [str(payload["section_id"]) for payload in section_payloads],
+            "stitch_strategy": stitch_strategy,
+            "boundary": dict(run_cfg.get("boundary") or {}),
+        },
+        input_contracts=input_contracts,
+        primary_artifacts=primary_artifacts,
+    )
+    write_json(output_dir / "real_field_zero_shot_summary.json", aggregate_summary)
+    return aggregate_summary
+
+
 def main() -> None:
     args = parse_args()
     cfg_path = resolve_relative_path(args.config, root=REPO_ROOT)
@@ -941,11 +1357,26 @@ def main() -> None:
         run_cfg_for_load["real_field_inputs"] = inputs_for_load
     output_mode = str(run_cfg.get("mode") or "volume").casefold()
     if output_mode == "section":
-        field = load_real_field_section(config=run_cfg_for_load, root=REPO_ROOT, data_root=data_root)
-    elif output_mode == "volume":
-        field = load_real_field_volume(config=run_cfg_for_load, root=REPO_ROOT, data_root=data_root)
-    else:
+        summary = _run_section_batch(
+            cfg_path=cfg_path,
+            run_cfg=run_cfg,
+            run_cfg_for_load=run_cfg_for_load,
+            inputs_for_load=inputs_for_load,
+            models=models,
+            data_root=data_root,
+            output_dir=output_dir,
+            device=device,
+            stitch_strategy=stitch_strategy,
+        )
+        print("=== Real Field Zero-Shot ===")
+        print(f"Output: {output_dir}")
+        print(f"Sections: {summary['n_sections']}")
+        print(f"Models per section: {len(models)}")
+        print(f"Status: {summary['status']}")
+        return
+    if output_mode != "volume":
         raise ValueError(f"Unsupported real_field_zero_shot.mode: {output_mode}")
+    field = load_real_field_volume(config=run_cfg_for_load, root=REPO_ROOT, data_root=data_root)
     sample_axis = field.sample_axis
     boundary = dict(run_cfg.get("boundary") or {})
     boundary_contract = _boundary_contract(boundary, sample_axis=sample_axis)

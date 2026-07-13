@@ -141,6 +141,46 @@ QC 只用于诊断和方法比较，不是消费端重新滤波的理由。
 低通次数为零，且不允许 post-lowpass vertical warp。其他 LFM producer 可以另行
 定义 profile，不把所有业务规则塞进通用 validator。
 
+### 3.1 Seismic input contract
+
+v4 的网络输入合同固定为 `observed_highres_forward`。time 与 depth 的数值正演
+实现可以不同，但二者都必须把经过高分辨率正演（以及该域已有的抗混叠处理）的
+观测地震物化为 `seismic_observed`，并将它放在最终 model axis 上。manifest 中的
+`seismic_input_contract` 至少包含：
+
+```yaml
+policy: observed_highres_forward
+sample_domain: depth             # time 或 depth
+sample_axis: model
+input_dataset: seismic_observed
+base_source: truth_highres_forward
+variant_input_family: observed
+model_consistent_dataset: seismic_model_consistent
+model_consistent_role: physics_and_closure
+operator: depth_ai_vp_highres_forward_antialias
+```
+
+`seismic_model_consistent` 是独立的 physics/closure 参照，不是网络输入的隐式
+fallback。`sample_index.csv` 对每个成功 row 都必须显式写出：
+
+```text
+seismic_input_dataset
+seismic_model_consistent_dataset
+observed_valid_mask_dataset
+```
+
+`seismic_variant` row 还必须写出 `seismic_variant_id`、
+`seismic_mismatch_family`、`seismic_variant_operator_source`、
+`seismic_variant_valid_sample_count` 和参数 JSON；变体的数值 QC 写入对应的
+variant result 表和 HDF5 `qc` group。reader 只沿索引取数据，不根据 sample kind
+猜路径。缺少上述 manifest/index 合同的旧 v4 直接失败。
+
+两域保留各自 operator source：时间域使用
+`time_forward_highres_wavelet_antialias`，深度域使用
+`depth_ai_vp_highres_forward_antialias`。时间域 mismatch 从 observed base 做波形
+变换；深度域的 wavelet re-forward、antialias 和米制 static 继续由 depth adapter
+实现。公共层只负责变体目录、参数、随机流和 QC 字段的编排，不强行统一正演算法。
+
 ## 4. v4 probe 关闭
 
 v4 配置不包含 `probe_selection`。time/depth parser 一旦看到该字段，或任何
@@ -173,7 +213,11 @@ src/cup/synthetic/
 │   ├── random.py
 │   ├── artifacts.py
 │   ├── config.py
-│   └── progress.py
+│   ├── progress.py
+│   ├── contracts.py
+│   ├── protocols.py
+│   ├── lfm.py
+│   └── seismic_variants.py
 ├── time/
 │   ├── __init__.py
 │   ├── config.py
@@ -215,6 +259,17 @@ artifact schema 和进度工具。time/depth 通过明确 seam 使用 core、`cu
 重新低通、不在 patch 内生成标签、不猜字段含义。`reporting` 只做图和指标，不参与
 生成或训练。不存在 `old`、`legacy`、`compat` wrapper。
 
+两个 reader 实现同一个最小消费 protocol：`sample_id`、`sample_kind`、
+`sample_domain`、`sample_axis`、`target_log_ai`、canonical 三字段、
+`input_lfm_log_ai`、`seismic_input`、`seismic_model_consistent`、`valid_mask`、
+`observed_valid_mask`、`physics_valid_mask` 和 `lateral_m`。time 专属的 TWT/反射率
+字段与 depth 专属的 TVDSS/速度字段继续保留在各自 dataclass；protocol 不要求两个
+域共享正演内部数组。
+
+LFM 退化 metadata 使用同一 component 顺序、variant catalog 和随机流目的。时间域
+保留 TWT/秒制参数，深度域保留 TVDSS/米制参数；公共 validator 只验证可解析的
+metadata，不比较两个域的数值结果。
+
 `cup.synthetic` 是时间域主产品 façade，根目录导出的默认生成、正演和 LFM 工具
 属于时间域主链；`cup.synthetic.depth` 是面向当前研究工区的扩展，不承诺与时间域
 文件数量或能力完全对称。深度域仍由 `scripts/synthoseis_lite.py` 根据
@@ -250,6 +305,23 @@ targets/target_increment_log_ai
 priors/input_lfm_variants/<variant>/log_ai
 ```
 
+旧的 `seismic_from_highres_truth_model_grid`、`seismic_observed_dataset` 或
+`physics_target_dataset` 字段不属于当前索引合同；reader 不把它们猜测为新字段。
+
+观测输入和 physics 参照字段为：
+
+```text
+seismic/seismic_observed
+seismic/seismic_model_consistent
+masks/observed_valid_mask
+```
+
+time 的高分辨率 truth forward/downsample 结果写入 `seismic_observed`；depth
+沿用 AI–Vp、深度正演和抗混叠结果写入同名字段。两域的 observed 输入都在 model
+axis 上，`seismic_model_consistent` 只供 physics/closure 使用。每个 mismatch
+variant 都有自己的 `seismic_observed`、`observed_valid_mask`、operator source、
+family、参数和 QC；它们不会覆盖 base observed 数据。
+
 完整道先计算 `P(target_log_ai)` 与 `target_increment_log_ai`，patch 或 reader 只
 切片已有结果。v4 重新生成时写入新的 `increment_contract` 和 `lfm_contract`；旧 v4
 manifest 缺字段时直接失败，不做自动补全。
@@ -268,7 +340,9 @@ manifest 缺字段时直接失败，不做自动补全。
 | operator | time/depth 独立复算；连续有限段不跨 NaN；短段失败；输出轴 float64 |
 | contract entry | 直接构造的非法对象、错误 semantics/unit/filter 和容差直接失败 |
 | LFM | producer contract、Synthoseis profile、domain compatibility、错误计数和 QC 状态失败 |
-| writer/reader | time/depth v4 字段树、manifest contract 和 shared target increment |
+| writer/reader | time/depth v4 字段树、manifest contract、observed input、model-consistent 参照和 shared target increment |
+| reader protocol | 两域共享 sample axis、seismic input、三类 mask、LFM 与 canonical 字段；域内专属数组继续隔离 |
+| mismatch | 两域共享 variant catalog、operator source、参数和 QC persistence；数值算子按域实现 |
 | probe | 配置、index、reader、report 遇 probe 明确失败或不生成 |
 | package | `cup.impedance`、`cup.synthetic.benchmark`、time/depth reader import smoke |
 | cleanup | 正式 synthetic 包不存在旧 root import、microtexture emitter 或 probe writer |
@@ -286,7 +360,7 @@ $env:PYTHONPATH = "src"
 本次稳定化验证结果：
 
 - `compileall -q src/cup src/ginn_v2` 通过；
-- canonical、writer/reader、LFM profile/QC、probe 失败和命名 smoke 共 `25 passed`；
+- canonical、writer/reader、按 mask 的 LFM 退化、LFM profile/QC、probe 失败和命名 smoke 共 `28 passed`；
 - 深度真实小烟测输出到 `scripts/output/synthoseis_lite_stage_2_5_depth_smoke_20260713`，
   4 个通过样本写入 v4 HDF5，`SynthoseisBenchmark` 成功读取 52 个有效 sample；
 - `evaluate_synthoseis_lite.py --max-samples 4` 完成三种 baseline 评估；

@@ -20,6 +20,9 @@ from cup.impedance import (
 )
 from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION
 from cup.synthetic.core import (
+    validate_lfm_degradation_metadata,
+    validate_seismic_variant_metadata,
+    validate_seismic_input_contract,
     validate_dataset_metadata,
     validate_training_manifest,
 )
@@ -51,6 +54,10 @@ class DepthSyntheticSample:
     def seismic_input(self) -> np.ndarray:
         """Explicit network input selected by the v4 contract."""
         return self.seismic_observed
+
+    @property
+    def sample_axis(self) -> np.ndarray:
+        return self.tvdss_model_m
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -94,12 +101,22 @@ class DepthBenchmark:
         )
         validate_synthoseis_lfm_contract(self.lfm_contract)
         validate_contract_compatibility(self.increment_contract, self.lfm_contract)
+        self.seismic_input_contract = validate_seismic_input_contract(
+            self.manifest.get("seismic_input_contract") or {},
+            sample_domain="depth",
+        )
+        self.lfm_degradation = validate_lfm_degradation_metadata(
+            self.manifest.get("lfm_degradation") or {},
+            sample_domain="depth",
+        )
         validate_training_manifest(self.manifest, sample_domain="depth")
         require_contract_fingerprint(self.manifest, label=f"benchmark {self.run_dir}")
         self.index = pd.read_csv(self.index_path, dtype=str, keep_default_na=False)
         required = {
             "sample_id", "parent_realization_id", "sample_kind", "source_sample_id",
             "hdf5_group", "sample_domain", "depth_basis", "suite", "evaluation_role",
+            "seismic_input_dataset", "seismic_model_consistent_dataset",
+            "observed_valid_mask_dataset",
         }
         missing = sorted(required - set(self.index))
         if missing:
@@ -131,6 +148,21 @@ class DepthBenchmark:
             if str(row.get("status") or "") != "ok":
                 continue
             if row["sample_kind"] == "seismic_variant":
+                normalized_variant_metadata = validate_seismic_variant_metadata(
+                    {
+                        "variant_id": row.get("seismic_variant_id"),
+                        "mismatch_family": row.get("seismic_mismatch_family"),
+                        "operator_source": row.get(
+                            "seismic_variant_operator_source"
+                        ),
+                        "valid_sample_count": row.get(
+                            "seismic_variant_valid_sample_count"
+                        ),
+                    }
+                )
+                row["seismic_variant_valid_sample_count"] = normalized_variant_metadata[
+                    "valid_sample_count"
+                ]
                 source = self._rows.get(str(row["source_sample_id"]))
                 if source is None or source["sample_kind"] != "base":
                     raise ValueError(f"Variant has an invalid base source: {row['sample_id']}")
@@ -167,7 +199,26 @@ class DepthBenchmark:
                 base_path = f"/realizations/{row['parent_realization_id']}"
                 if base_path not in h5:
                     raise KeyError(f"Missing base realization group: {base_path}")
-                for field in ("hdf5_group", "seismic_input_dataset", "physics_target_dataset"):
+                if row["sample_kind"] == "seismic_variant":
+                    variant_group = h5[str(row["hdf5_group"])]
+                    for column, attribute in (
+                        ("seismic_variant_id", "variant_id"),
+                        ("seismic_mismatch_family", "mismatch_family"),
+                        ("seismic_variant_operator_source", "operator_source"),
+                    ):
+                        if str(variant_group.attrs.get(attribute) or "") != str(
+                            row.get(column) or ""
+                        ):
+                            raise ValueError(
+                                "Variant HDF5 metadata does not match sample_index.csv: "
+                                f"{column}={row.get(column)!r}."
+                            )
+                for field in (
+                    "hdf5_group",
+                    "seismic_input_dataset",
+                    "seismic_model_consistent_dataset",
+                    "observed_valid_mask_dataset",
+                ):
                     referenced = str(row.get(field) or "")
                     if not referenced or referenced not in h5:
                         raise KeyError(f"sample_index.csv references missing HDF5 path {field}={referenced!r}.")
@@ -210,9 +261,15 @@ class DepthBenchmark:
                 "target_increment": np.asarray(h5[f"{base_path}/targets/target_increment_log_ai"][()], dtype=np.float64),
                 "vp": np.asarray(h5[f"{base_path}/truth/vp_model_mps"][()], dtype=np.float64),
                 "observed": np.asarray(h5[input_path][()], dtype=np.float64),
-                "consistent": np.asarray(h5[f"{base_path}/seismic/seismic_model_consistent"][()], dtype=np.float64),
+                "consistent": np.asarray(
+                    h5[str(row["seismic_model_consistent_dataset"])][()],
+                    dtype=np.float64,
+                ),
                 "valid": np.asarray(h5[f"{base_path}/masks/valid_mask_model"][()], dtype=bool),
-                "observed_valid": np.asarray(h5[f"{base_path}/masks/observed_valid_mask"][()], dtype=bool),
+                "observed_valid": np.asarray(
+                    h5[str(row["observed_valid_mask_dataset"])][()],
+                    dtype=bool,
+                ),
                 "physics_valid": np.asarray(h5[f"{base_path}/masks/physics_valid_mask"][()], dtype=bool),
                 "lateral": np.asarray(h5[f"{base_path}/axes/lateral_m"][()], dtype=np.float64),
                 "axis": np.asarray(h5[f"{base_path}/axes/tvdss_model_m"][()], dtype=np.float64),
@@ -225,12 +282,18 @@ class DepthBenchmark:
             if not input_lfm_path:
                 input_lfm_path = f"{base_path}/priors/input_lfm_variants/{variant_id}/log_ai"
             arrays["input_lfm"] = np.asarray(h5[input_lfm_path][()], dtype=np.float64)
-            if row["sample_kind"] == "seismic_variant":
-                arrays["observed_valid"] = np.asarray(h5[f"{row['hdf5_group']}/observed_valid_mask"][()], dtype=bool)
         shape = arrays["target"].shape
         for name in ("vp", "observed", "consistent", "valid", "observed_valid", "physics_valid", "lfm_ideal", "lfm_degraded", "canonical_background", "target_increment", "input_lfm"):
             if arrays[name].shape != shape:
                 raise ValueError(f"N-point shape contract failed for {sample_id}: {name}={arrays[name].shape}, target={shape}")
+        if row["sample_kind"] == "seismic_variant":
+            declared_count = int(row["seismic_variant_valid_sample_count"])
+            actual_count = int(np.count_nonzero(arrays["observed_valid"]))
+            if declared_count != actual_count:
+                raise ValueError(
+                    f"Variant valid sample count mismatch for {sample_id}: "
+                    f"declared={declared_count}, actual={actual_count}."
+                )
         finite = np.isfinite(arrays["target"]) & np.isfinite(arrays["canonical_background"]) & np.isfinite(arrays["target_increment"])
         if np.any(finite & (np.abs(arrays["target"] - arrays["canonical_background"] - arrays["target_increment"]) > 1e-5)):
             raise ValueError(f"Canonical increment decomposition mismatch for {sample_id}.")

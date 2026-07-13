@@ -434,9 +434,12 @@ def _plot_hdf5_examples(
             highres_axis_name = model_axis_name
         model_axis = group[f"axes/{model_axis_name}"][()]
         highres_axis = group[f"axes/{highres_axis_name}"][()]
-        seismic_axis = group["axes/twt_forward_model_s"][()] if "axes/twt_forward_model_s" in group else model_axis
+        # v4 observed/model-consistent seismic fields are materialized on the
+        # model axis.  Reflectivity keeps its separate N-1 forward-interface
+        # axis, but this figure is for the seismic field itself.
+        seismic_axis = model_axis
         model_axis_label = _axis_label(model_axis_name)
-        seismic_axis_label = _axis_label("twt_model_s" if "axes/twt_forward_model_s" in group else model_axis_name)
+        seismic_axis_label = model_axis_label
         generated.append(
             _imshow_section(
                 group["truth/model_target_log_ai"][()],

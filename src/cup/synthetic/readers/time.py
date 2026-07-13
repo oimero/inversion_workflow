@@ -19,6 +19,9 @@ from cup.impedance import (
     validate_synthoseis_lfm_contract,
 )
 from cup.synthetic.core import (
+    validate_lfm_degradation_metadata,
+    validate_seismic_variant_metadata,
+    validate_seismic_input_contract,
     validate_dataset_metadata,
     validate_training_manifest,
 )
@@ -43,10 +46,15 @@ class TimeSyntheticSample:
     seismic_input: np.ndarray
     seismic_model_consistent: np.ndarray
     valid_mask: np.ndarray
+    observed_valid_mask: np.ndarray
     physics_valid_mask: np.ndarray
     lateral_m: np.ndarray
     twt_model_s: np.ndarray
     priors: dict[str, np.ndarray]
+
+    @property
+    def sample_axis(self) -> np.ndarray:
+        return self.twt_model_s
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -94,6 +102,21 @@ def _pad_forward_to_model(
     )
 
 
+def _pad_forward_mask_to_model(
+    values: np.ndarray, model_shape: tuple[int, int]
+) -> np.ndarray:
+    array = np.asarray(values, dtype=bool)
+    if array.shape == model_shape:
+        return array
+    if array.shape == (model_shape[0], model_shape[1] - 1):
+        padded = np.zeros(model_shape, dtype=bool)
+        padded[:, 1:] = array
+        return padded
+    raise ValueError(
+        f"Cannot align forward mask {array.shape} to model grid {model_shape}."
+    )
+
+
 class TimeBenchmark:
     """Read-only accessor around ``synthoseis_lite_v4`` time artifacts."""
 
@@ -137,6 +160,14 @@ class TimeBenchmark:
         )
         validate_synthoseis_lfm_contract(self.lfm_contract)
         validate_contract_compatibility(self.increment_contract, self.lfm_contract)
+        self.seismic_input_contract = validate_seismic_input_contract(
+            self.manifest.get("seismic_input_contract") or {},
+            sample_domain="time",
+        )
+        self.lfm_degradation = validate_lfm_degradation_metadata(
+            self.manifest.get("lfm_degradation") or {},
+            sample_domain="time",
+        )
         validate_training_manifest(self.manifest, sample_domain="time")
         require_contract_fingerprint(self.manifest, label=f"benchmark {self.run_dir}")
 
@@ -150,6 +181,9 @@ class TimeBenchmark:
             "status",
             "hdf5_group",
             "evaluation_role",
+            "seismic_input_dataset",
+            "seismic_model_consistent_dataset",
+            "observed_valid_mask_dataset",
         }
         missing = required - set(self.index)
         if missing:
@@ -195,6 +229,22 @@ class TimeBenchmark:
                 or str(row.get("sample_kind") or "") not in SEISMIC_VARIANT_KINDS
             ):
                 continue
+            variant_metadata = {
+                "variant_id": _clean_path(row.get("seismic_variant_id")),
+                "mismatch_family": _clean_path(row.get("seismic_mismatch_family")),
+                "operator_source": _clean_path(
+                    row.get("seismic_variant_operator_source")
+                ),
+                "valid_sample_count": row.get(
+                    "seismic_variant_valid_sample_count"
+                ),
+            }
+            normalized_variant_metadata = validate_seismic_variant_metadata(
+                variant_metadata
+            )
+            row["seismic_variant_valid_sample_count"] = normalized_variant_metadata[
+                "valid_sample_count"
+            ]
             source_id = _clean_path(row.get("source_sample_id"))
             source = self._rows.get(source_id)
             if source is None:
@@ -241,6 +291,31 @@ class TimeBenchmark:
                         "sample_index.csv references missing HDF5 group "
                         f"{group_path!r}."
                     )
+                if str(row.get("sample_kind") or "") in SEISMIC_VARIANT_KINDS:
+                    group = h5[group_path]
+                    for column, attribute in (
+                        ("seismic_variant_id", "variant_id"),
+                        ("seismic_mismatch_family", "mismatch_family"),
+                        ("seismic_variant_operator_source", "operator_source"),
+                    ):
+                        if str(group.attrs.get(attribute) or "") != str(
+                            row.get(column) or ""
+                        ):
+                            raise ValueError(
+                                "Variant HDF5 metadata does not match sample_index.csv: "
+                                f"{column}={row.get(column)!r}."
+                            )
+                for field in (
+                    "seismic_input_dataset",
+                    "seismic_model_consistent_dataset",
+                    "observed_valid_mask_dataset",
+                ):
+                    dataset_path = _clean_path(row.get(field))
+                    if not dataset_path or dataset_path not in h5:
+                        raise KeyError(
+                            "sample_index.csv references missing HDF5 dataset "
+                            f"{field}={dataset_path!r}."
+                        )
 
     def sample_ids(
         self,
@@ -290,10 +365,20 @@ class TimeBenchmark:
             target = self._read_target(h5, source_group, source_kind)
             model_shape = tuple(np.asarray(target).shape)
             seismic = _pad_forward_to_model(
-                self._read_seismic(h5, group_path, sample_kind), model_shape
+                self._read_indexed_dataset(h5, row, "seismic_input_dataset"),
+                model_shape,
             )
             consistent = _pad_forward_to_model(
-                h5[f"{root_path}/seismic/seismic_model_consistent"][()], model_shape
+                self._read_indexed_dataset(
+                    h5, row, "seismic_model_consistent_dataset"
+                ),
+                model_shape,
+            )
+            observed_valid = _pad_forward_mask_to_model(
+                self._read_indexed_dataset(
+                    h5, row, "observed_valid_mask_dataset"
+                ),
+                model_shape,
             )
             valid = np.asarray(
                 h5[f"{root_path}/masks/valid_mask_model"][()], dtype=bool
@@ -341,6 +426,7 @@ class TimeBenchmark:
             "physics_valid": physics_valid,
             "seismic": seismic,
             "consistent": consistent,
+            "observed_valid": observed_valid,
             "canonical_background": canonical_background,
             "target_increment": target_increment,
             "input_lfm": priors["input_lfm_log_ai"],
@@ -348,6 +434,14 @@ class TimeBenchmark:
             if values.shape != model_shape:
                 raise ValueError(
                     f"{name}/target shape mismatch for {sample_id}: {values.shape} vs {model_shape}"
+                )
+        if sample_kind in SEISMIC_VARIANT_KINDS:
+            declared_count = int(row["seismic_variant_valid_sample_count"])
+            actual_count = int(np.count_nonzero(observed_valid))
+            if declared_count != actual_count:
+                raise ValueError(
+                    f"Variant valid sample count mismatch for {sample_id}: "
+                    f"declared={declared_count}, actual={actual_count}."
                 )
         finite = np.isfinite(target) & np.isfinite(canonical_background) & np.isfinite(target_increment)
         if np.any(finite & (np.abs(target - canonical_background - target_increment) > 1e-5)):
@@ -364,6 +458,7 @@ class TimeBenchmark:
             seismic_input=seismic,
             seismic_model_consistent=consistent,
             valid_mask=valid,
+            observed_valid_mask=observed_valid,
             physics_valid_mask=physics_valid,
             lateral_m=lateral,
             twt_model_s=twt,
@@ -382,10 +477,15 @@ class TimeBenchmark:
         return np.asarray(h5[f"{group_path}/truth/model_target_log_ai"][()])
 
     @staticmethod
-    def _read_seismic(h5: h5py.File, group_path: str, sample_kind: str) -> np.ndarray:
-        if sample_kind in SEISMIC_VARIANT_KINDS:
-            return np.asarray(h5[f"{group_path}/seismic_observed"][()])
-        return np.asarray(h5[f"{group_path}/seismic/seismic_model_consistent"][()])
+    def _read_indexed_dataset(
+        h5: h5py.File,
+        row: Mapping[str, Any],
+        column: str,
+    ) -> np.ndarray:
+        path = _clean_path(row.get(column))
+        if not path or path not in h5:
+            raise KeyError(f"Missing HDF5 dataset for {column}: {path!r}")
+        return np.asarray(h5[path][()])
 
     @staticmethod
     def _read_optional_dataset(

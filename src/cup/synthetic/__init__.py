@@ -6,6 +6,7 @@ separate from generation so consumers depend on materialized contracts.
 """
 
 from cup.synthetic.benchmark import SyntheticSample, SynthoseisBenchmark
+from cup.synthetic.core.protocols import SyntheticSampleProtocol
 from cup.synthetic.core.calibration import (
     ImpedanceCalibration,
     WellZoneCurves,
@@ -48,6 +49,7 @@ __all__ = [
     "LfmResult",
     "SeismicVariantResult",
     "SyntheticSample",
+    "SyntheticSampleProtocol",
     "SynthoseisBenchmark",
     "WellZoneCurves",
     "aggregate_metric_rows",

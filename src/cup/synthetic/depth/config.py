@@ -108,7 +108,7 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     allowed_root = {
         "sample_domain", "benchmark_schema", "global_seed", "source_runs", "sampling", "geometry", "sections",
         "calibration", "impedance_attribute_generator", "generation", "splits",
-        "lfm", "seismic_mismatch", "canonical", "figures",
+        "seismic_input", "lfm", "seismic_mismatch", "canonical", "figures",
     }
     if "probe_selection" in root:
         raise ValueError(
@@ -119,6 +119,17 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "Depth Synthoseis-lite v4 requires "
             f"synthoseis_lite.sample_domain='depth' and benchmark_schema={SCHEMA_VERSION!r}."
+        )
+    seismic_input = _mapping(
+        root.get("seismic_input"), path="synthoseis_lite.seismic_input"
+    )
+    _reject_unknown(
+        seismic_input, {"policy"}, path="synthoseis_lite.seismic_input"
+    )
+    if set(seismic_input) != {"policy"} or str(seismic_input.get("policy")) != "observed_highres_forward":
+        raise ValueError(
+            "Depth Synthoseis v4 requires "
+            "seismic_input.policy='observed_highres_forward'."
         )
     seismic = _mapping(config.get("seismic"), path="seismic")
     if str(seismic.get("domain", "")).casefold() != "depth":
@@ -434,6 +445,7 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
         },
         "generation": {"attempts_per_scenario": _positive_int(generation.get("attempts_per_scenario"), path="generation.attempts_per_scenario"), "duration_modes": ["standard"], "geometry_families": geometry_families, "geometry_directions": directions, "acceptance_qc": {"minimum_attempts_per_scenario": _positive_int(acceptance.get("minimum_attempts_per_scenario"), path="generation.acceptance_qc.minimum_attempts_per_scenario"), "warning_fraction": warning, "failure_fraction": failure, "enforcement": enforcement}},
         "splits": {"assignment_unit": "parent_realization", "held_out_geometry_family": held_out},
+        "seismic_input": {"policy": "observed_highres_forward"},
         "lfm": parsed_lfm,
         "seismic_mismatch": parsed_mismatch,
         "figures": {
@@ -493,7 +505,9 @@ def resolve_depth_sources(
 
     rock_summary = _load_json(resolved["rock_physics_analysis_dir"] / "run_summary.json")
     if rock_summary.get("schema") != ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION or rock_summary.get("status") != "success":
-        raise ValueError("rock_physics_analysis run is not a successful v2 run.")
+        raise ValueError(
+            "rock_physics_analysis source is not a successful contracted run."
+        )
     wavelet_batch_summary = _load_json(resolved["wavelet_batch_synthetic_depth_dir"] / "run_summary.json")
     if wavelet_batch_summary.get("status") != "success":
         raise ValueError("wavelet_batch_synthetic_depth run is not successful.")

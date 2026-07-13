@@ -31,8 +31,8 @@ wavelet_batch_synthetic_depth.py
 
 两套 shifted LAS 的下游消费：
 
-- `shifted_preprocessed_las/AI` → Synthoseis-lite depth v2 的 `full_log_ai` 和 truth 统计；
-- `shifted_filtered_las/AI` → Synthoseis-lite depth v2 的 background fit，避免背景被尖刺支配。
+- `shifted_preprocessed_las/AI` → Synthoseis-lite depth v4 的完整波阻抗真值和统计；
+- `shifted_filtered_las/AI` → Synthoseis-lite depth v4 的背景拟合，避免背景被尖刺支配。
 
 ---
 
@@ -214,6 +214,8 @@ wavelet_batch_synthetic_depth:
 synthoseis_lite:
   sample_domain: depth        # time | depth
   benchmark_schema: synthoseis_lite_v4
+  seismic_input:
+    policy: observed_highres_forward
 ```
 
 主要差异：
@@ -224,6 +226,8 @@ synthoseis_lite:
 | 井曲线来源 | Step 4 filtered LAS + Step 5 全局子波 | Step 5 `shifted_filtered_las/AI` + `shifted_preprocessed_las/AI`、Step 6 冻结子波和 AI–Vp 关系 |
 | 可用套件 | canonical, field_conditioned, seismic_variant | 仅 `field_conditioned`；canonical 和 probe 关闭 |
 | 模型轴 | TWT 方向 | 工区原生 5 m + 8× 高分轴 |
+| 网络地震输入 | 高分辨率正演/抗混叠后的 `seismic_observed` | 高分辨率 AI–Vp 正演/抗混叠后的 `seismic_observed` |
+| physics/closure 参照 | `seismic_model_consistent` | `seismic_model_consistent` |
 | 空间路径 | inline/xline 索引 | 显式 inline/xline 折线路径 |
 | 校准依赖 | Step 4/5/6 时间域来源 | Step 1 + Step 5（深度域）+ Step 6 |
 | mismatch 深度静差 | 不支持（只有时间方向平移） | 独立的米制深度静差，与秒制子波平移相互独立 |

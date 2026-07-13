@@ -17,9 +17,12 @@ from cup.utils.statistics import centered_rms
 class SeismicVariantResult:
     variant_id: str
     mismatch_family: str
+    operator_source: str
     seismic_observed: np.ndarray
     positive_gain: np.ndarray
     additive_noise: np.ndarray
+    observed_valid_mask: np.ndarray
+    parameters: dict[str, Any]
     qc: dict[str, Any]
 
 
@@ -195,6 +198,7 @@ def _build_result(
     gain: np.ndarray,
     noise: np.ndarray,
     extra_qc: Mapping[str, Any],
+    operator_source: str = "observed_base",
 ) -> SeismicVariantResult:
     observed = gain * seismic_convolved + noise
     valid = np.asarray(mask, dtype=bool) & np.isfinite(observed)
@@ -206,6 +210,7 @@ def _build_result(
         "seismic_variant_status": "ok",
         "seismic_variant_id": variant_id,
         "seismic_mismatch_family": mismatch_family,
+        "seismic_variant_operator_source": operator_source,
         "seismic_observed_rms": centered_rms(observed, valid),
         "seismic_convolved_rms": centered_rms(seismic_convolved, valid),
         "additive_noise_rms": float(np.sqrt(np.mean(noise_valid * noise_valid))),
@@ -217,16 +222,19 @@ def _build_result(
     return SeismicVariantResult(
         variant_id=variant_id,
         mismatch_family=mismatch_family,
+        operator_source=operator_source,
         seismic_observed=observed,
         positive_gain=gain,
         additive_noise=noise,
+        observed_valid_mask=valid,
+        parameters=dict(extra_qc),
         qc=qc,
     )
 
 
 def generate_seismic_variants(
     *,
-    seismic_model_consistent: np.ndarray,
+    seismic_input: np.ndarray,
     forward_valid_mask: np.ndarray,
     lateral_m: np.ndarray,
     config: Mapping[str, Any],
@@ -239,7 +247,7 @@ def generate_seismic_variants(
     """Generate a finite suite of named observed-seismic mismatch variants."""
     if not bool(config.get("enabled", True)):
         return []
-    seismic = np.asarray(seismic_model_consistent, dtype=np.float64)
+    seismic = np.asarray(seismic_input, dtype=np.float64)
     mask = np.asarray(forward_valid_mask, dtype=bool) & np.isfinite(seismic)
     shape = seismic.shape
     ones = np.ones(shape, dtype=np.float64)

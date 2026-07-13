@@ -33,6 +33,9 @@ from cup.synthetic.time.config import DATA_SCHEMA, IMPLEMENTATION_SCOPE
 from cup.impedance import build_lfm_producer_contract, generation_contract
 from cup.synthetic.core import (
     build_attempt_plan,
+    build_lfm_degradation_metadata,
+    build_seismic_variant_metadata,
+    build_seismic_input_contract,
     geometry_feasibility_rows,
     limit_attempt_plan,
     rejection_reason_summary,
@@ -216,16 +219,17 @@ def _seismic_variant_records_for_sample(
     h5: h5py.File,
     owner_path: str,
     source_index_record: Mapping[str, Any],
-    seismic_model_consistent: np.ndarray,
-    forward_valid_mask: np.ndarray,
+    seismic_input: np.ndarray,
+    observed_valid_mask: np.ndarray,
+    seismic_model_consistent_dataset: str,
     lateral_m: np.ndarray,
     script_cfg: Mapping[str, Any],
     qc_only: bool,
     source_variant_id: str = "",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     results = generate_seismic_variants(
-        seismic_model_consistent=seismic_model_consistent,
-        forward_valid_mask=forward_valid_mask,
+        seismic_input=seismic_input,
+        forward_valid_mask=observed_valid_mask,
         lateral_m=lateral_m,
         config=script_cfg["seismic_mismatch"],
         output_dt_s=float(script_cfg["sampling"]["expected_output_dt_s"]),
@@ -238,6 +242,13 @@ def _seismic_variant_records_for_sample(
     result_records: list[dict[str, Any]] = []
     source_sample_id = str(source_index_record["sample_id"])
     for result in results:
+        variant_metadata = build_seismic_variant_metadata(
+            variant_id=result.variant_id,
+            mismatch_family=result.mismatch_family,
+            operator_source=result.operator_source,
+            valid_sample_count=int(np.count_nonzero(result.observed_valid_mask)),
+            parameters=result.parameters,
+        )
         variant_group = (
             ""
             if qc_only
@@ -256,10 +267,33 @@ def _seismic_variant_records_for_sample(
             "source_sample_kind": str(source_index_record.get("sample_kind", "base")),
             "sample_kind": "seismic_variant",
             "hdf5_group": variant_group,
-            "seismic_variant_id": result.variant_id,
-            "seismic_mismatch_family": result.mismatch_family,
-            "seismic_observed_dataset": (
+            "seismic_variant_id": variant_metadata["variant_id"],
+            "seismic_mismatch_family": variant_metadata["mismatch_family"],
+            "seismic_variant_operator_source": variant_metadata["operator_source"],
+            "seismic_variant_valid_sample_count": variant_metadata[
+                "valid_sample_count"
+            ],
+            "seismic_variant_parameters_json": json.dumps(
+                {
+                    str(key): value
+                    for key, value in variant_metadata.items()
+                    if key not in {
+                        "variant_id",
+                        "mismatch_family",
+                        "operator_source",
+                        "valid_sample_count",
+                    }
+                },
+                sort_keys=True,
+            ),
+            "seismic_input_dataset": (
                 "" if not variant_group else f"{variant_group}/seismic_observed"
+            ),
+            "seismic_model_consistent_dataset": seismic_model_consistent_dataset,
+            "observed_valid_mask_dataset": (
+                ""
+                if not variant_group
+                else f"{variant_group}/observed_valid_mask"
             ),
             "positive_gain_dataset": (
                 "" if not variant_group else f"{variant_group}/positive_gain"
@@ -269,7 +303,7 @@ def _seismic_variant_records_for_sample(
             ),
         }
         index_records.append(record)
-        result_records.append({**record, **result.qc})
+        result_records.append({**record, **variant_metadata, **result.qc})
     return index_records, result_records
 
 
@@ -301,7 +335,7 @@ def _run_canonical_generation(
             wavelet,
             factor=int(script_cfg["sampling"]["vertical_oversampling_factor"]),
         )
-        if bool(script_cfg["forward_qc"]["highres_mismatch_enabled"])
+        if bool(script_cfg["forward_qc"]["highres_forward_enabled"])
         else None
     )
     h5_path = output_dir / "synthetic_benchmark.h5"
@@ -350,7 +384,9 @@ def _run_canonical_generation(
                 wavelet_time_s=wavelet_time,
                 wavelet=wavelet,
                 highres_wavelet=highres_wavelet,
-                required=bool(script_cfg["forward_qc"]["highres_mismatch_required"]),
+                required=bool(
+                    script_cfg["forward_qc"]["highres_forward_required"]
+                ),
             )
             generated.qc.update(forward_qc)
             lfm_result = derive_lfm_priors(
@@ -367,6 +403,9 @@ def _run_canonical_generation(
                     h5,
                     realization_path=hdf5_group,
                     result=highres_result,
+                    observed_valid_mask=forward_sample_valid_mask(
+                        generated.forward_valid_mask_model
+                    ),
                 )
             if not qc_only:
                 write_lfm_result(
@@ -391,6 +430,21 @@ def _run_canonical_generation(
                 "status": "ok",
                 "reasons": "",
                 "sample_kind": "base",
+                "seismic_input_dataset": (
+                    ""
+                    if not hdf5_group
+                    else f"{hdf5_group}/seismic/seismic_observed"
+                ),
+                "seismic_model_consistent_dataset": (
+                    ""
+                    if not hdf5_group
+                    else f"{hdf5_group}/seismic/seismic_model_consistent"
+                ),
+                "observed_valid_mask_dataset": (
+                    ""
+                    if not hdf5_group
+                    else f"{hdf5_group}/masks/observed_valid_mask"
+                ),
                 "canonical_parameter_name": scenario.parameter_name,
                 "canonical_parameter_value": scenario.parameter_value,
                 "canonical_parameter_unit": scenario.parameter_unit,
@@ -405,8 +459,15 @@ def _run_canonical_generation(
                     else f"/realizations/{generated.realization_id}"
                 ),
                 source_index_record=record,
-                seismic_model_consistent=generated.seismic_model_consistent,
-                forward_valid_mask=forward_sample_valid_mask(generated.forward_valid_mask_model),
+                seismic_input=highres_result.seismic_model_grid,
+                observed_valid_mask=forward_sample_valid_mask(
+                    generated.forward_valid_mask_model
+                ),
+                seismic_model_consistent_dataset=(
+                    ""
+                    if not hdf5_group
+                    else f"{hdf5_group}/seismic/seismic_model_consistent"
+                ),
                 lateral_m=generated.lateral_m,
                 script_cfg=script_cfg,
                 qc_only=qc_only,
@@ -511,6 +572,7 @@ def _run_canonical_generation(
             "global_seed": int(script_cfg["global_seed"]),
             "canonical": config,
             "sampling": dict(script_cfg["sampling"]),
+            "seismic_input": dict(script_cfg["seismic_input"]),
             "forward_qc": dict(script_cfg["forward_qc"]),
             "lfm": dict(script_cfg["lfm"]),
             "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
@@ -530,6 +592,12 @@ def _run_canonical_generation(
         "input_contracts": input_contracts,
         "sample_domain": "time",
         "increment_contract": generation_contract("time", output_dt).as_dict(),
+        "seismic_input_contract": build_seismic_input_contract(
+            "time", operator="time_forward_highres_wavelet_antialias"
+        ),
+        "lfm_degradation": build_lfm_degradation_metadata(
+            "time", axis_unit="s", component_values=lfm_result.qc
+        ),
         "input_lfm_variants": ["canonical", "controlled_default"],
         "lfm_contract": build_lfm_producer_contract(
             generation_contract("time", output_dt),
@@ -808,7 +876,7 @@ def run_generation(
             wavelet,
             factor=int(script_cfg["sampling"]["vertical_oversampling_factor"]),
         )
-        if bool(script_cfg["forward_qc"]["highres_mismatch_enabled"])
+        if bool(script_cfg["forward_qc"]["highres_forward_enabled"])
         else None
     )
     h5_path = output_dir / "synthetic_benchmark.h5"
@@ -882,7 +950,7 @@ def run_generation(
                     wavelet=wavelet,
                     highres_wavelet=highres_wavelet,
                     required=bool(
-                        script_cfg["forward_qc"]["highres_mismatch_required"]
+                        script_cfg["forward_qc"]["highres_forward_required"]
                     ),
                 )
                 generated.qc.update(forward_qc)
@@ -900,6 +968,9 @@ def run_generation(
                         h5,
                         realization_path=hdf5_group,
                         result=highres_result,
+                        observed_valid_mask=forward_sample_valid_mask(
+                            generated.forward_valid_mask_model
+                        ),
                     )
                 if not qc_only:
                     write_lfm_result(
@@ -927,6 +998,21 @@ def run_generation(
                     "status": "ok",
                     "reasons": "",
                     "sample_kind": "base",
+                    "seismic_input_dataset": (
+                        ""
+                        if not hdf5_group
+                        else f"{hdf5_group}/seismic/seismic_observed"
+                    ),
+                    "seismic_model_consistent_dataset": (
+                        ""
+                        if not hdf5_group
+                        else f"{hdf5_group}/seismic/seismic_model_consistent"
+                    ),
+                    "observed_valid_mask_dataset": (
+                        ""
+                        if not hdf5_group
+                        else f"{hdf5_group}/masks/observed_valid_mask"
+                    ),
                     **base_lfm_index,
                 }
                 (
@@ -940,8 +1026,15 @@ def run_generation(
                         else f"/realizations/{generated.realization_id}"
                     ),
                     source_index_record=base_record_for_variants,
-                    seismic_model_consistent=generated.seismic_model_consistent,
-                    forward_valid_mask=forward_sample_valid_mask(generated.forward_valid_mask_model),
+                    seismic_input=highres_result.seismic_model_grid,
+                    observed_valid_mask=forward_sample_valid_mask(
+                        generated.forward_valid_mask_model
+                    ),
+                    seismic_model_consistent_dataset=(
+                        ""
+                        if not hdf5_group
+                        else f"{hdf5_group}/seismic/seismic_model_consistent"
+                    ),
                     lateral_m=generated.lateral_m,
                     script_cfg=script_cfg,
                     qc_only=qc_only,
@@ -1000,6 +1093,21 @@ def run_generation(
                 "status": status,
                 "reasons": reasons,
                 "sample_kind": "base",
+                "seismic_input_dataset": (
+                    ""
+                    if not hdf5_group
+                    else f"{hdf5_group}/seismic/seismic_observed"
+                ),
+                "seismic_model_consistent_dataset": (
+                    ""
+                    if not hdf5_group
+                    else f"{hdf5_group}/seismic/seismic_model_consistent"
+                ),
+                "observed_valid_mask_dataset": (
+                    ""
+                    if not hdf5_group
+                    else f"{hdf5_group}/masks/observed_valid_mask"
+                ),
                 **base_lfm_index,
             }
             index_records.append(record)
@@ -1176,6 +1284,7 @@ def run_generation(
                     "global_seed": int(script_cfg["global_seed"]),
                     "sampling": dict(script_cfg["sampling"]),
                     "generation": dict(script_cfg["generation"]),
+                    "seismic_input": dict(script_cfg["seismic_input"]),
                     "forward_qc": dict(script_cfg["forward_qc"]),
                     "lfm": dict(script_cfg["lfm"]),
                     "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
@@ -1215,6 +1324,12 @@ def run_generation(
         "config_provenance": dict(config_provenance),
         "sample_domain": "time",
         "increment_contract": generation_contract("time", output_dt).as_dict(),
+        "seismic_input_contract": build_seismic_input_contract(
+            "time", operator="time_forward_highres_wavelet_antialias"
+        ),
+        "lfm_degradation": build_lfm_degradation_metadata(
+            "time", axis_unit="s"
+        ),
         "input_lfm_variants": ["canonical", "controlled_default"],
         "lfm_contract": build_lfm_producer_contract(
             generation_contract("time", output_dt),

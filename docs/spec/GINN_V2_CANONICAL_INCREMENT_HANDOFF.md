@@ -85,6 +85,31 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 
 这些事项是后续 goal 的工作内容，不在本 HANDOFF 中假定已经完成。阶段 1 和阶段 2 已落地在 `cup.impedance`、Synthoseis-lite v4 writer/reader、LFM variant writer 和生成 manifest 中；阶段 2.5 的稳定性门禁完成后才允许开始阶段 3。
 
+### 3.3 阶段 2.5 对称性收口（本轮）
+
+本轮把两个域的消费合同统一到 observed high-resolution forward：
+
+- 配置必须声明 `seismic_input.policy=observed_highres_forward`；时间域还必须将
+  `forward_qc.highres_forward.enabled/required` 同时设为 `true`；
+- manifest 写入 `seismic_input_contract`，明确 model axis、`seismic_observed` 网络
+  输入和仅供 physics/closure 的 `seismic_model_consistent`；
+- time 将高分辨率 truth forward/downsample 结果写入
+  `seismic/seismic_observed`，并写出 `masks/observed_valid_mask`；depth 沿用
+  AI–Vp、深度正演和抗混叠结果写入同名字段；
+- 两域 `sample_index.csv` 都显式记录
+  `seismic_input_dataset`、`seismic_model_consistent_dataset` 和
+  `observed_valid_mask_dataset`；变体还记录 family、operator source、有效样点数
+  与参数 JSON；
+- 两个 reader 通过同一最小 sample protocol 暴露 `sample_axis`、canonical 字段、
+  `seismic_input`、`seismic_model_consistent` 和三类 mask。缺少新 manifest/index
+  合同的旧 v4 直接失败；不提供字段回退；
+- LFM component 顺序、variant catalog、随机流目的和 QC metadata 共用同一编排层，
+  但时间域的秒制算子与深度域的米制/AI–Vp 算子保持各自实现。
+- 深度域受控 LFM 退化改为按有效 mask 做幅度缩放和空间平滑，无效区继续写 NaN；
+  CSV 变体有效样点数统一归一化为整数后再由 reader 校验。
+
+本轮不改微纹理、GINN v2、physics、R0/R1，也不迁移旧 v4 产物。
+
 ## 4. 推荐实施顺序与完成条件
 
 每一步都应保持主分支可测试；下一步只能消费上一步已冻结的字段和数值合同。
@@ -119,10 +144,12 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - [x] 删除提前落地的 microtexture emitter；
 - [x] canonical contract 对象入口、LFM profile/QC 状态和实现版本命名完成稳定化；
 - [x] 更新本地 ignored fixture，跑完 canonical、writer/reader、LFM 合同和 probe 失败测试；
-- [x] 使用现有深度 source 完成 writer → manifest → reader → baseline evaluator 小烟测；
+- [x] 两域 observed input、model-consistent 参照、observed mask 和 mismatch metadata
+  使用统一索引字段；
+- [x] 使用当前可用深度 source 完成 writer → manifest → reader → baseline evaluator 小烟测；
 - [ ] 用新合同重新生成需要消费的 v4 benchmark，不覆盖冻结目录。
 
-完成条件：新包 import/compile smoke 通过，LFM profile 和 QC 状态语义通过，旧实现版本命名不再出现在正式 reader/config/CLI 路径，probe 正式路径仍明确失败（保留失败测试与 observability 旁路），reader 拒绝缺少新合同的旧 v4。状态：合同、命名和深度真实小烟测已完成，完整工区重生成仍待执行。
+完成条件：新包 import/compile smoke 通过，LFM profile 和 QC 状态语义通过，旧实现版本命名不再出现在正式 reader/config/CLI 路径，probe 正式路径仍明确失败（保留失败测试与 observability 旁路），reader 拒绝缺少新合同的旧 v4。状态：对称性合同、本地 fixture 和深度 debug smoke 已完成；完整工区 v4 重生成仍待执行。
 
 说明：`scripts/ginn_v2.py summarize` 仍可读取冻结历史 report-card 中的旧 probe 字段，
 但 v4 writer、reader、baseline evaluator 和 GINN v2 新 report 不再生成这些字段；该历史
@@ -286,19 +313,21 @@ python -m compileall -q src/cup src/ginn_v2
 python -m pytest -q -p no:cacheprovider tests/test_canonical_increment.py tests/test_synthoseis_v4_canonical.py tests/test_synthoseis_stage_2_5.py
 ```
 
-结果：稳定化测试 `25 passed`。`compileall` 与 `cup.impedance`、synthetic time/depth
-reader import smoke 同样通过。测试文件继续被 `.gitignore` 忽略；本节只记录本机结果，
-不声称测试已提交。深度真实小烟测已完成，完整 v4 工区重生成尚未运行。
+结果：稳定化和对称性测试 `28 passed`。`compileall` 与 `cup.impedance`、synthetic
+time/depth reader import smoke 同样通过。测试文件继续被 `.gitignore` 忽略；本节只记录
+本机结果，不声称测试已提交。
 
 稳定化烟测记录：
 
 - 时间域：当前工作区没有可直接复用的真实时间域 source，本阶段只做 fixture reader/baseline 验证；
-- 深度域：使用 `experiments/synthoseis_lite/synthoseis_lite.yaml`、
-  `experiments/synthoseis_lite/results/20260706/calibrate/impedance_calibration.json` 和新输出目录执行
-  `field_conditioned`、`--debug-attempt-limit 1`、`--geometry-family none`，生成 4 个通过样本、
-  52 个有效 sample；新 reader 成功读取，baseline evaluator 对 4 个样本完成三种 baseline 评估；
-- 深度烟测输出：`scripts/output/synthoseis_lite_stage_2_5_depth_smoke_20260713`；状态为
-  `development_limited`（由 debug attempt 限制导致，符合 smoke 预期）；
+- 深度域：先由 `calibrate` 生成
+  `scripts/output/synthoseis_lite_calibrate_20260713/impedance_calibration.json`，
+  再以 `field_conditioned`、`--debug-attempt-limit 1` 和
+  `--geometry-family none` 完成 writer → manifest → reader smoke，输出目录为
+  `scripts/output/synthoseis_lite_symmetry_depth_smoke_20260713_fixed`；4 个场景生成成功，
+  2 个对象参数组合在 preflight 被拒绝，整体状态为 `development_limited`；
+- 深度域 baseline evaluator 使用 `--max-samples 2` 成功读取同一 smoke benchmark，
+  输出目录为 `scripts/output/synthoseis_lite_evaluate_depth_smoke_20260713_fixed_rerun3`；
 - 旧 v3 与阶段 2 之前生成的 v4 目录不覆盖、不迁移。
 
 ## 8. 相关文档

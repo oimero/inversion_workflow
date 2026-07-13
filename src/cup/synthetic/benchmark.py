@@ -18,6 +18,7 @@ from cup.synthetic.schemas import (
 )
 from cup.synthetic.readers.depth import DepthBenchmark, DepthSyntheticSample
 from cup.synthetic.readers.time import TimeBenchmark, TimeSyntheticSample
+from cup.synthetic.core.protocols import SyntheticSampleProtocol
 
 
 SyntheticSample = TimeSyntheticSample | DepthSyntheticSample
@@ -102,6 +103,7 @@ __all__ = [
     "DepthSyntheticSample",
     "DepthBenchmark",
     "SyntheticSample",
+    "SyntheticSampleProtocol",
     "SynthoseisBenchmark",
     "TimeBenchmark",
     "TimeSyntheticSample",

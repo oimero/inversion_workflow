@@ -30,6 +30,9 @@ from cup.seismic.wavelet import load_wavelet_csv
 from cup.synthetic.core.calibration import ImpedanceCalibration
 from cup.synthetic.core import build_attempt_plan as build_core_attempt_plan
 from cup.synthetic.core import (
+    build_lfm_degradation_metadata,
+    build_seismic_variant_metadata,
+    build_seismic_input_contract,
     geometry_feasibility_rows,
     limit_attempt_plan,
     rejection_reason_summary,
@@ -248,8 +251,21 @@ def _valid_filter_decimate(
     return output, valid
 
 
+def _finite_segments(mask: np.ndarray) -> list[tuple[int, int]]:
+    padded = np.concatenate(([False], np.asarray(mask, dtype=bool), [False]))
+    starts = np.flatnonzero(~padded[:-1] & padded[1:])
+    stops = np.flatnonzero(padded[:-1] & ~padded[1:])
+    return [(int(start), int(stop)) for start, stop in zip(starts, stops)]
+
+
 def _spatial_lowpass(
-    values: np.ndarray, *, dz_m: float, wavelength_m: float, numtaps: int, beta: float
+    values: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None = None,
+    dz_m: float,
+    wavelength_m: float,
+    numtaps: int,
+    beta: float,
 ) -> np.ndarray:
     nyquist = 0.5 / dz_m
     cutoff = 1.0 / wavelength_m
@@ -260,12 +276,25 @@ def _spatial_lowpass(
         raise ValueError("LFM numtaps must be odd and >= 3.")
     taps = firwin(count, cutoff / nyquist, window=("kaiser", float(beta)), scale=True)
     half = count // 2
-    return np.stack(
-        [
-            np.convolve(np.pad(row, (half, half), mode="edge"), taps, mode="valid")
-            for row in np.asarray(values, dtype=np.float64)
-        ]
-    )
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 2:
+        raise ValueError("Depth LFM spatial lowpass expects a [lateral, depth] array.")
+    if valid_mask is None:
+        valid = np.isfinite(array)
+    else:
+        valid = np.array(valid_mask, dtype=bool, copy=True)
+        if valid.shape != array.shape:
+            raise ValueError("Depth LFM spatial lowpass valid_mask must match values.")
+        valid &= np.isfinite(array)
+    output = np.full_like(array, np.nan, dtype=np.float64)
+    for lateral_index, row in enumerate(array):
+        for start, stop in _finite_segments(valid[lateral_index]):
+            segment = row[start:stop]
+            padded = np.pad(segment, (half, half), mode="edge")
+            output[lateral_index, start:stop] = np.convolve(
+                padded, taps, mode="valid"
+            )
+    return output
 
 
 def _phase_rotate(wavelet: np.ndarray, degrees: float) -> np.ndarray:
@@ -387,10 +416,15 @@ def _controlled_degraded_lfm(
     config: Mapping[str, Any],
     section: DepthSectionGeometry,
     axis_m: np.ndarray,
+    valid_mask: np.ndarray,
     global_seed: int,
     realization_id: str,
 ) -> np.ndarray:
     output = np.asarray(base, dtype=np.float64).copy()
+    valid = np.array(valid_mask, dtype=bool, copy=True)
+    if valid.shape != output.shape:
+        raise ValueError("Depth LFM valid_mask must match the base array.")
+    valid &= np.isfinite(output)
 
     def rng(purpose: str) -> np.random.Generator:
         return named_rng(
@@ -401,20 +435,22 @@ def _controlled_degraded_lfm(
             realization_id=realization_id,
         )
 
-    output += rng("lfm_constant_bias").normal(
+    constant_bias = rng("lfm_constant_bias").normal(
         0.0, float(config["constant_bias_sigma_log_ai"])
     )
+    output[valid] += constant_bias
     trend_amplitude = rng("lfm_vertical_trend").normal(
         0.0, float(config["linear_vertical_trend_sigma_log_ai"])
     )
-    output += trend_amplitude * np.linspace(-1.0, 1.0, axis_m.size)[None, :]
+    trend = trend_amplitude * np.linspace(-1.0, 1.0, axis_m.size)[None, :]
+    output[valid] += np.broadcast_to(trend, output.shape)[valid]
     zone_rng = rng("lfm_zonewise_bias")
     for zone_index in range(section.horizon_tvdss_m.shape[1] - 1):
         bias = zone_rng.normal(0.0, float(config["zonewise_bias_sigma_log_ai"]))
         top = section.horizon_tvdss_m[:, zone_index]
         bottom = section.horizon_tvdss_m[:, zone_index + 1]
         mask = (axis_m[None, :] >= top[:, None]) & (axis_m[None, :] <= bottom[:, None])
-        output[mask] += bias
+        output[mask & valid] += bias
     lateral_rng = rng("lfm_lateral_smooth_bias")
     field = lateral_rng.normal(size=section.lateral_m.size)
     requested = float(config["lateral_correlation_fraction"]) * max(
@@ -427,12 +463,16 @@ def _controlled_degraded_lfm(
     field *= float(config["lateral_smooth_bias_sigma_log_ai"]) / max(
         float(np.std(field)), np.finfo(np.float64).eps
     )
-    output += field[:, None]
-    center = float(np.mean(output))
+    lateral_bias = np.broadcast_to(field[:, None], output.shape)
+    output[valid] += lateral_bias[valid]
+    finite_valid = valid & np.isfinite(output)
+    if not np.any(finite_valid):
+        return np.full_like(output, np.nan, dtype=np.float64)
+    center = float(np.mean(output[finite_valid]))
     scale = np.exp(
         rng("lfm_amplitude_scale").normal(0.0, float(config["amplitude_scale_sigma"]))
     )
-    output = center + scale * (output - center)
+    output[finite_valid] = center + scale * (output[finite_valid] - center)
     local = dict(config["local_missing_control_bias"])
     if bool(local["enabled"]):
         local_rng = rng("lfm_local_missing_control_bias")
@@ -452,18 +492,21 @@ def _controlled_degraded_lfm(
             -0.5 * ((section.lateral_m[:, None] - center_l) / width_l) ** 2
             - 0.5 * ((axis_m[None, :] - center_z) / width_z) ** 2
         )
-        output += amplitude * blob
+        output[valid] += np.asarray(amplitude * blob)[valid]
     smoothing = dict(config.get("over_smoothing") or {})
     if bool(smoothing.get("enabled", False)):
         over = _spatial_lowpass(
             output,
+            valid_mask=valid,
             dz_m=float(np.diff(axis_m[:2])[0]),
             wavelength_m=float(smoothing["minimum_wavelength_m"]),
             numtaps=int(smoothing["numtaps"]),
             beta=float(smoothing["kaiser_beta"]),
         )
         blend = float(smoothing["blend"])
-        output = (1.0 - blend) * output + blend * over
+        smoothed = finite_valid & np.isfinite(over)
+        output[smoothed] = (1.0 - blend) * output[smoothed] + blend * over[smoothed]
+    output[~valid] = np.nan
     return output
 
 
@@ -575,6 +618,7 @@ def generate_depth_realization(
         config=degraded_cfg,
         section=section,
         axis_m=model_axis,
+        valid_mask=valid,
         global_seed=int(script_cfg["global_seed"]),
         realization_id=realization_id,
     )
@@ -585,6 +629,7 @@ def generate_depth_realization(
         valid_mask=valid,
     )
     lfm_degraded = lfm_ideal + lfm_degradation
+    lfm_degraded[~valid] = np.nan
     residual_vs_lfm_ideal = model_log - lfm_ideal
     residual_vs_lfm_degraded = model_log - lfm_degraded
 
@@ -994,6 +1039,7 @@ def _write_variants(
         *,
         gain: np.ndarray | None = None,
         noise: np.ndarray | None = None,
+        operator_source: str = "observed_base",
     ) -> None:
         positive_gain = np.broadcast_to(
             ones if gain is None else np.asarray(gain, dtype=np.float64),
@@ -1042,15 +1088,21 @@ def _write_variants(
                 axis_path=f"{root_path}/axes/tvdss_model_m",
                 axis_order="lateral,tvdss",
             )
+            group.attrs["variant_id"] = str(variant_id)
             group.attrs["mismatch_family"] = family
+            group.attrs["operator_source"] = str(operator_source)
             group.attrs["parameters_json"] = json.dumps(
                 dict(parameters), sort_keys=True
             )
         valid_values = observed[valid]
         row = {
-            "variant_id": variant_id,
-            "mismatch_family": family,
-            "valid_sample_count": int(np.count_nonzero(valid)),
+            **build_seismic_variant_metadata(
+                variant_id=variant_id,
+                mismatch_family=family,
+                operator_source=operator_source,
+                valid_sample_count=int(np.count_nonzero(valid)),
+                parameters=parameters,
+            ),
             "seismic_observed_rms": float(np.sqrt(np.mean(valid_values * valid_values)))
             if valid_values.size
             else float("nan"),
@@ -1087,6 +1139,7 @@ def _write_variants(
             observed,
             base_mask & valid_1d[None, :],
             {"phase_rotation_degrees": float(degrees)},
+            operator_source="truth_highres_forward",
         )
     for shift_s in wave_cfg.get("time_shift_s", []):
         perturbed = _shift_wavelet(wavelet_time, wavelet, float(shift_s))
@@ -1104,6 +1157,7 @@ def _write_variants(
             observed,
             base_mask & valid_1d[None, :],
             {"wavelet_time_shift_s": float(shift_s)},
+            operator_source="truth_highres_forward",
         )
     for shift_m in dict(config.get("depth_static") or {}).get("shift_m", []):
         shifted, shifted_valid = _static_shift(
@@ -1323,6 +1377,7 @@ def _write_variants(
             },
             gain=gain,
             noise=noise,
+            operator_source="truth_highres_forward",
         )
     return rows
 
@@ -1575,9 +1630,12 @@ def run_depth_generation(
                         "seismic_input_dataset": ""
                         if qc_only
                         else f"{group_path}/seismic/seismic_observed",
-                        "physics_target_dataset": ""
+                        "seismic_model_consistent_dataset": ""
                         if qc_only
                         else f"{group_path}/seismic/seismic_model_consistent",
+                        "observed_valid_mask_dataset": ""
+                        if qc_only
+                        else f"{group_path}/masks/observed_valid_mask",
                     }
                 ]
                 local_variant_rows = []
@@ -1600,15 +1658,36 @@ def run_depth_generation(
                             **common,
                             "sample_id": variant_id,
                             "sample_kind": "seismic_variant",
+                            "seismic_variant_id": variant["variant_id"],
                             "source_sample_id": base_id,
                             "hdf5_group": variant_path,
                             "seismic_input_dataset": ""
                             if qc_only
                             else f"{variant_path}/seismic_observed",
-                            "physics_target_dataset": ""
+                            "seismic_model_consistent_dataset": ""
                             if qc_only
                             else f"{group_path}/seismic/seismic_model_consistent",
-                            "mismatch_family": variant["mismatch_family"],
+                            "observed_valid_mask_dataset": ""
+                            if qc_only
+                            else f"{variant_path}/observed_valid_mask",
+                            "seismic_mismatch_family": variant["mismatch_family"],
+                            "seismic_variant_operator_source": variant["operator_source"],
+                            "seismic_variant_valid_sample_count": variant[
+                                "valid_sample_count"
+                            ],
+                            "seismic_variant_parameters_json": json.dumps(
+                                {
+                                    str(key): value
+                                    for key, value in variant.items()
+                                    if key not in {
+                                        "variant_id",
+                                        "mismatch_family",
+                                        "operator_source",
+                                        "valid_sample_count",
+                                    }
+                                },
+                                sort_keys=True,
+                            ),
                             "mismatch_parameters_json": json.dumps(
                                 {
                                     key: value
@@ -1681,7 +1760,8 @@ def run_depth_generation(
                         "source_sample_id": "",
                         "hdf5_group": "",
                         "seismic_input_dataset": "",
-                        "physics_target_dataset": "",
+                        "seismic_model_consistent_dataset": "",
+                        "observed_valid_mask_dataset": "",
                         "status": "rejected",
                         "reasons": reason,
                     }
@@ -1800,6 +1880,7 @@ def run_depth_generation(
                 business_config={
                     "global_seed": int(script_cfg["global_seed"]),
                     "generation": dict(script_cfg["generation"]),
+                    "seismic_input": dict(script_cfg["seismic_input"]),
                     "lfm": dict(script_cfg["lfm"]),
                     "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
                 },
@@ -1825,6 +1906,12 @@ def run_depth_generation(
         "input_contracts": input_contracts,
         "sample_domain": "depth",
         "increment_contract": generation_contract("depth", float(script_cfg["sampling"]["expected_model_dz_m"])).as_dict(),
+        "seismic_input_contract": build_seismic_input_contract(
+            "depth", operator="depth_ai_vp_highres_forward_antialias"
+        ),
+        "lfm_degradation": build_lfm_degradation_metadata(
+            "depth", axis_unit="m"
+        ),
         "input_lfm_variants": ["canonical", "controlled_default"],
         "lfm_contract": build_lfm_producer_contract(
             generation_contract(

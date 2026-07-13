@@ -240,6 +240,11 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
     physics_valid[:, 0] = np.asarray(section.forward_valid_mask_model, dtype=bool)[:, 0]
     physics_valid[:, 1:] = np.asarray(section.forward_valid_mask_model, dtype=bool)
     physics_valid &= np.asarray(section.valid_mask_model, dtype=bool)
+    if np.asarray(section.seismic_model_consistent).shape == (
+        physics_valid.shape[0],
+        physics_valid.shape[1] - 1,
+    ):
+        physics_valid[:, 0] = False
     _dataset(
         masks,
         "physics_valid_mask",
@@ -286,14 +291,26 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
         axis_dataset=model_forward_axis,
     )
     seismic = root.create_group("seismic")
+    model_shape = tuple(np.asarray(section.model_target_log_ai).shape)
+    model_consistent = np.asarray(section.seismic_model_consistent)
+    if model_consistent.shape == model_shape:
+        model_consistent_on_axis = model_consistent
+    elif model_consistent.shape == (model_shape[0], model_shape[1] - 1):
+        model_consistent_on_axis = np.zeros(model_shape, dtype=np.float64)
+        model_consistent_on_axis[:, 1:] = model_consistent
+    else:
+        raise ValueError(
+            "seismic_model_consistent must align with the model axis or its "
+            "N-1 forward-interface axis."
+        )
     _dataset(
         seismic,
         "seismic_model_consistent",
-        section.seismic_model_consistent,
+        model_consistent_on_axis,
         unit="normalized_amplitude",
         domain="twt",
-        axis_order=["lateral", "twt_forward"],
-        axis_dataset=model_forward_axis,
+        axis_order=["lateral", "twt"],
+        axis_dataset=model_axis,
     )
     return f"/{path}"
 
@@ -303,25 +320,67 @@ def write_highres_forward_result(
     *,
     realization_path: str,
     result: HighresForwardResult,
+    observed_valid_mask: np.ndarray,
 ) -> str:
     root = h5[realization_path]
     seismic = root["seismic"]
-    axis = f"{realization_path}/axes/twt_forward_model_s"
+    axis = f"{realization_path}/axes/twt_model_s"
+    target_shape = root["truth/model_target_log_ai"].shape
+    observed = np.asarray(result.seismic_model_grid, dtype=np.float64)
+    observed_mask = np.asarray(observed_valid_mask, dtype=bool)
+    if observed.shape == target_shape:
+        observed_on_axis = observed
+    elif observed.shape == (target_shape[0], target_shape[1] - 1):
+        observed_on_axis = np.zeros(target_shape, dtype=np.float64)
+        observed_on_axis[:, 1:] = observed
+    else:
+        raise ValueError(
+            "highres forward observed data does not align with the model target axis."
+        )
+    if observed_mask.shape == target_shape:
+        observed_mask_on_axis = observed_mask.copy()
+    elif observed_mask.shape == (target_shape[0], target_shape[1] - 1):
+        observed_mask_on_axis = np.zeros(target_shape, dtype=bool)
+        observed_mask_on_axis[:, 1:] = observed_mask
+    else:
+        raise ValueError(
+            "highres forward observed mask does not align with the model target axis."
+        )
+    if observed.shape == (target_shape[0], target_shape[1] - 1):
+        # The padded sample has no forward interface support, even when a
+        # caller supplied the already-expanded mask.
+        observed_mask_on_axis[:, 0] = False
     _dataset(
         seismic,
-        "seismic_from_highres_truth_model_grid",
-        result.seismic_model_grid.astype(np.float32),
+        "seismic_observed",
+        observed_on_axis.astype(np.float32),
         unit="normalized_amplitude",
         domain="twt",
-        axis_order=["lateral", "twt_forward"],
+        axis_order=["lateral", "twt"],
+        axis_dataset=axis,
+    )
+    masks = root.require_group("masks")
+    _dataset(
+        masks,
+        "observed_valid_mask",
+        observed_mask_on_axis,
+        unit="bool",
+        domain="twt",
+        axis_order=["lateral", "twt"],
         axis_dataset=axis,
     )
     model = np.asarray(root["seismic/seismic_model_consistent"][()], dtype=np.float64)
-    residual_model = np.asarray(result.seismic_model_grid, dtype=np.float64) - model
+    residual_model = observed_on_axis - model
     model_axis = f"{realization_path}/axes/twt_model_s"
-    target_shape = root["truth/model_target_log_ai"].shape
-    padded = np.zeros(target_shape, dtype=np.float32)
-    padded[:, 1:] = residual_model.astype(np.float32)
+    if residual_model.shape == target_shape:
+        padded = residual_model.astype(np.float32)
+    elif residual_model.shape == (target_shape[0], target_shape[1] - 1):
+        padded = np.zeros(target_shape, dtype=np.float32)
+        padded[:, 1:] = residual_model.astype(np.float32)
+    else:
+        raise ValueError(
+            "highres forward residual does not align with the model target axis."
+        )
     _dataset(
         seismic,
         "subgrid_forward_residual",
@@ -334,7 +393,7 @@ def write_highres_forward_result(
     qc = root.require_group("qc")
     for key, value in result.qc.items():
         qc.attrs[key] = value
-    return f"{realization_path}/seismic/seismic_from_highres_truth_model_grid"
+    return f"{realization_path}/seismic/seismic_observed"
 
 
 def write_lfm_result(
@@ -416,15 +475,19 @@ def write_seismic_variant_result(
     group = variants.create_group(result.variant_id)
     group.attrs["variant_id"] = result.variant_id
     group.attrs["mismatch_family"] = result.mismatch_family
+    group.attrs["operator_source"] = result.operator_source
+    group.attrs["parameters_json"] = json.dumps(
+        result.parameters, sort_keys=True
+    )
     axis_root = owner_path
-    forward_axis = f"{axis_root}/axes/twt_forward_model_s"
+    forward_axis = f"{axis_root}/axes/twt_model_s"
     _dataset(
         group,
         "seismic_observed",
         result.seismic_observed.astype(np.float32),
         unit="normalized_amplitude",
         domain="twt",
-        axis_order=["lateral", "twt_forward"],
+        axis_order=["lateral", "twt"],
         axis_dataset=forward_axis,
     )
     _dataset(
@@ -433,7 +496,7 @@ def write_seismic_variant_result(
         result.positive_gain.astype(np.float32),
         unit="ratio",
         domain="twt",
-        axis_order=["lateral", "twt_forward"],
+        axis_order=["lateral", "twt"],
         axis_dataset=forward_axis,
     )
     _dataset(
@@ -442,7 +505,16 @@ def write_seismic_variant_result(
         result.additive_noise.astype(np.float32),
         unit="normalized_amplitude",
         domain="twt",
-        axis_order=["lateral", "twt_forward"],
+        axis_order=["lateral", "twt"],
+        axis_dataset=forward_axis,
+    )
+    _dataset(
+        group,
+        "observed_valid_mask",
+        np.asarray(result.observed_valid_mask, dtype=bool),
+        unit="bool",
+        domain="twt",
+        axis_order=["lateral", "twt"],
         axis_dataset=forward_axis,
     )
     qc = group.create_group("qc")

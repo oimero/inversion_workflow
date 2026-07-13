@@ -75,6 +75,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "impedance_attribute_generator",
             "generation",
             "splits",
+            "seismic_input",
             "forward_qc",
             "lfm",
             "seismic_mismatch",
@@ -95,6 +96,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "impedance_attribute_generator",
             "generation",
             "splits",
+            "seismic_input",
             "forward_qc",
             "lfm",
             "seismic_mismatch",
@@ -442,24 +444,41 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     _require_keys(splits, split_keys, path="synthoseis_lite.splits")
     if splits.get("assignment_unit") != "parent_realization":
         raise ValueError("splits.assignment_unit must be parent_realization.")
-    forward_qc = _mapping(root.get("forward_qc"), path="synthoseis_lite.forward_qc")
-    _reject_unknown(forward_qc, {"highres_mismatch"}, path="synthoseis_lite.forward_qc")
-    _require_keys(forward_qc, {"highres_mismatch"}, path="synthoseis_lite.forward_qc")
-    highres_mismatch = _mapping(
-        forward_qc.get("highres_mismatch"),
-        path="synthoseis_lite.forward_qc.highres_mismatch",
+    seismic_input = _mapping(
+        root.get("seismic_input"), path="synthoseis_lite.seismic_input"
     )
-    highres_mismatch_keys = {"enabled", "required"}
     _reject_unknown(
-        highres_mismatch,
-        highres_mismatch_keys,
-        path="synthoseis_lite.forward_qc.highres_mismatch",
+        seismic_input, {"policy"}, path="synthoseis_lite.seismic_input"
+    )
+    _require_keys(seismic_input, {"policy"}, path="synthoseis_lite.seismic_input")
+    if str(seismic_input.get("policy") or "") != "observed_highres_forward":
+        raise ValueError(
+            "Time Synthoseis v4 requires "
+            "seismic_input.policy='observed_highres_forward'."
+        )
+    forward_qc = _mapping(root.get("forward_qc"), path="synthoseis_lite.forward_qc")
+    _reject_unknown(forward_qc, {"highres_forward"}, path="synthoseis_lite.forward_qc")
+    _require_keys(forward_qc, {"highres_forward"}, path="synthoseis_lite.forward_qc")
+    highres_forward = _mapping(
+        forward_qc.get("highres_forward"),
+        path="synthoseis_lite.forward_qc.highres_forward",
+    )
+    highres_forward_keys = {"enabled", "required"}
+    _reject_unknown(
+        highres_forward,
+        highres_forward_keys,
+        path="synthoseis_lite.forward_qc.highres_forward",
     )
     _require_keys(
-        highres_mismatch,
-        highres_mismatch_keys,
-        path="synthoseis_lite.forward_qc.highres_mismatch",
+        highres_forward,
+        highres_forward_keys,
+        path="synthoseis_lite.forward_qc.highres_forward",
     )
+    if highres_forward.get("enabled") is not True or highres_forward.get("required") is not True:
+        raise ValueError(
+            "Time Synthoseis v4 requires forward_qc.highres_forward.enabled=true "
+            "and required=true."
+        )
     figures = _mapping(root.get("figures"), path="synthoseis_lite.figures")
     figure_keys = {"enabled", "max_example_objects_per_zone_state", "report_examples"}
     _reject_unknown(figures, figure_keys, path="synthoseis_lite.figures")
@@ -733,9 +752,10 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             ),
         },
         "forward_qc": {
-            "highres_mismatch_enabled": bool(highres_mismatch.get("enabled", True)),
-            "highres_mismatch_required": bool(highres_mismatch.get("required", False)),
+            "highres_forward_enabled": bool(highres_forward.get("enabled", True)),
+            "highres_forward_required": bool(highres_forward.get("required", True)),
         },
+        "seismic_input": {"policy": "observed_highres_forward"},
         "lfm": {
             "enabled": bool(lfm.get("enabled", True)),
             "ideal": {

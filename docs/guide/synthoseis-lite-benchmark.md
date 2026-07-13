@@ -68,12 +68,25 @@ python scripts/synthoseis_lite.py --config <config-yaml> generate \
 synthoseis_lite:
   sample_domain: time
   benchmark_schema: synthoseis_lite_v4
+  seismic_input:
+    policy: observed_highres_forward
+  forward_qc:
+    highres_forward:
+      enabled: true
+      required: true
 
 # 深度域
 synthoseis_lite:
   sample_domain: depth
   benchmark_schema: synthoseis_lite_v4
+  seismic_input:
+    policy: observed_highres_forward
 ```
+
+v4 两个域都把 `seismic/seismic_observed` 作为网络输入；它位于 model axis，来自该
+域的高分辨率正演和抗混叠路径。`seismic/seismic_model_consistent` 只用于 physics
+或 closure，不能由 reader 作为输入回退。时间域的 `forward_qc.highres_forward`
+必须启用且设为 required；深度域的等价高分辨率正演由 depth 分支固定执行。
 
 ---
 
@@ -114,6 +127,11 @@ workflow_config: <path-to-common-yaml>
 synthoseis_lite:
   sample_domain: time          # 或 depth
   benchmark_schema: synthoseis_lite_v4
+  seismic_input:
+    policy: observed_highres_forward
+  # 时间域还必须声明：
+  # forward_qc.highres_forward.enabled=true
+  # forward_qc.highres_forward.required=true
   global_seed: 20260615
   source_runs: ...
   ...
@@ -343,7 +361,7 @@ lfm:
 | 文件 | 内容 |
 |------|------|
 | `synthetic_benchmark.h5` | 所有样本的数据数组（波阻抗、地震、低频模型、掩码），附带完整元数据属性 |
-| `sample_index.csv` | 每个样本一行：ID、所属剖面、几何类型、状态、HDF5 路径 |
+| `sample_index.csv` | 每个样本一行：ID、所属剖面、几何类型、状态、observed 输入/physics 参照/有效掩码 HDF5 路径；变体另有 family、operator source、参数和 QC |
 | `benchmark_manifest.json` | 全局元数据：域、schema、状态、直接上游契约、唯一 benchmark 指纹和接受率统计 |
 | `scenario_catalog.csv` | 每个场景的尝试数、成功数、接受率、门禁状态 |
 | `attempt_plan.csv` | 全部计划的尝试列表 |
@@ -395,6 +413,10 @@ Status: success
 ### 第五步：抽查样本
 
 打开 `sample_index.csv`，筛出 `status == ok` 的行，随机挑几个 `hdf5_group`，用 HDF5 工具查看对应的波阻抗剖面和地震剖面。重点关注：异常体的形态是否自然、层位约束是否正确施加、地震响应是否与波阻抗变化在视觉上一致。
+
+抽查地震字段时，网络输入读取 `seismic_input_dataset` 指向的
+`seismic_observed`；`seismic_model_consistent_dataset` 是 physics/closure 参照，
+两者应分别查看，不能用 sample kind 推断路径。
 
 ---
 

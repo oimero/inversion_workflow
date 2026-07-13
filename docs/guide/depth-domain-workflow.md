@@ -216,6 +216,9 @@ synthoseis_lite:
   benchmark_schema: synthoseis_lite_v4
   seismic_input:
     policy: observed_highres_forward
+  seismic_forward:
+    backend: auto        # auto | numpy | torch_cuda
+    dtype: float64
 ```
 
 主要差异：
@@ -228,6 +231,12 @@ synthoseis_lite:
 | 模型轴 | TWT 方向 | 工区原生 5 m + 8× 高分轴 |
 | 网络地震输入 | 高分辨率正演/抗混叠后的 `seismic_observed` | 高分辨率 AI–Vp 正演/抗混叠后的 `seismic_observed` |
 | physics/closure 参照 | `seismic_model_consistent` | `seismic_model_consistent` |
+
+两个域的样本都使用 `masks/valid_mask` 表示完整目标 ROI。生成阶段保证该 ROI 内的
+目标、LFM 和两类地震数组有限；高分辨率 forward support 只作为 QC。深度域
+`seismic_forward.backend=auto` 会在 CUDA 可用时使用 Torch depth backend，设为
+`numpy` 可显式使用 CPU；`torch_cuda` 在 CUDA 不可用时直接失败。xline 步长 4
+保持真实横向坐标语义，不改变 TVDSS 纵向采样单位。
 | 空间路径 | inline/xline 索引 | 显式 inline/xline 折线路径 |
 | 校准依赖 | Step 4/5/6 时间域来源 | Step 1 + Step 5（深度域）+ Step 6 |
 | mismatch 深度静差 | 不支持（只有时间方向平移） | 独立的米制深度静差，与秒制子波平移相互独立 |

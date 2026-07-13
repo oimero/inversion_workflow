@@ -20,8 +20,6 @@ class SyntheticSampleProtocol(Protocol):
     seismic_input: np.ndarray
     seismic_model_consistent: np.ndarray
     valid_mask: np.ndarray
-    observed_valid_mask: np.ndarray
-    physics_valid_mask: np.ndarray
     lateral_m: np.ndarray
 
     @property

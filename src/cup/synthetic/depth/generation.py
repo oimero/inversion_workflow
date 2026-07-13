@@ -33,6 +33,7 @@ from cup.synthetic.core import (
     build_lfm_degradation_metadata,
     build_seismic_variant_metadata,
     build_seismic_input_contract,
+    build_mask_contract,
     geometry_feasibility_rows,
     limit_attempt_plan,
     rejection_reason_summary,
@@ -64,6 +65,73 @@ from cup.utils.io import (
     resolve_relative_path,
     write_json,
 )
+
+
+class _DepthForwardExecutor:
+    """Select the depth forward backend once per generation run."""
+
+    def __init__(self, config: Mapping[str, Any]) -> None:
+        requested = str(config.get("backend") or "auto").strip().casefold()
+        dtype = str(config.get("dtype") or "float64").strip().casefold()
+        if dtype != "float64":
+            raise ValueError("Depth Synthoseis forward dtype is fixed to float64.")
+        if requested not in {"auto", "numpy", "torch_cuda"}:
+            raise ValueError(
+                "Depth Synthoseis forward backend must be auto, numpy, or torch_cuda."
+            )
+        self.requested = requested
+        self.dtype = dtype
+        self._torch = None
+        self._torch_forward = None
+        if requested != "numpy":
+            try:
+                import torch
+                from cup.physics.torch_backend import forward_depth as torch_forward
+            except Exception as exc:
+                if requested == "torch_cuda":
+                    raise RuntimeError("torch_cuda backend requires PyTorch with CUDA support.") from exc
+                torch = None
+                torch_forward = None
+            if torch is not None and bool(torch.cuda.is_available()):
+                self._torch = torch
+                self._torch_forward = torch_forward
+        if requested == "torch_cuda" and self._torch is None:
+            raise RuntimeError("Requested torch_cuda backend, but CUDA is unavailable.")
+        self.resolved = "torch_cuda" if self._torch is not None else "numpy"
+
+    @property
+    def manifest_fields(self) -> dict[str, str]:
+        return {
+            "requested_backend": self.requested,
+            "resolved_backend": self.resolved,
+            "dtype": self.dtype,
+        }
+
+    def __call__(
+        self,
+        log_ai: np.ndarray,
+        velocity_mps: np.ndarray,
+        depth_m: np.ndarray,
+        wavelet_time_s: np.ndarray,
+        wavelet_amp: np.ndarray,
+    ) -> np.ndarray:
+        if self.resolved == "numpy":
+            return np.asarray(
+                forward_depth(log_ai, velocity_mps, depth_m, wavelet_time_s, wavelet_amp),
+                dtype=np.float64,
+            )
+        torch = self._torch
+        assert torch is not None and self._torch_forward is not None
+        device = torch.device("cuda")
+        with torch.inference_mode():
+            result = self._torch_forward(
+                torch.as_tensor(log_ai, dtype=torch.float64, device=device),
+                torch.as_tensor(velocity_mps, dtype=torch.float64, device=device),
+                torch.as_tensor(depth_m, dtype=torch.float64, device=device),
+                torch.as_tensor(wavelet_time_s, dtype=torch.float64, device=device),
+                torch.as_tensor(wavelet_amp, dtype=torch.float64, device=device),
+            )
+        return result.detach().cpu().numpy().astype(np.float64, copy=False)
 
 
 def _survey(workflow: Any, *, repo_root: Path) -> Any:
@@ -521,6 +589,7 @@ def generate_depth_realization(
     forward_inputs: Mapping[str, Any],
     survey: Any,
     repo_root: Path,
+    forward_executor: _DepthForwardExecutor | None = None,
     preflight_only: bool = False,
 ) -> DepthGeneratedSection | None:
     realization_id = f"{section.section_id}__{scenario.scenario_id}__a{attempt_id:03d}"
@@ -528,6 +597,7 @@ def generate_depth_realization(
         forward_inputs["wavelet"]["path"], root=repo_root
     )
     wavelet_time, wavelet = load_wavelet_csv(wavelet_path)
+    forward = forward_executor or _DepthForwardExecutor(script_cfg["seismic_forward"])
     factor = int(script_cfg["sampling"]["vertical_oversampling_factor"])
     model_dz = float(script_cfg["sampling"]["expected_model_dz_m"])
     high_dz = model_dz / factor
@@ -592,16 +662,18 @@ def generate_depth_realization(
     vp_model = velocity_from_ai(
         ai_model, a=float(relation["a"]), b=float(relation["b"])
     )
-    seismic_high = forward_depth(log_high, vp_high, high_axis, wavelet_time, wavelet)
+    seismic_high = forward(log_high, vp_high, high_axis, wavelet_time, wavelet)
     seismic_observed, seismic_antialias_valid = _valid_filter_decimate(
         seismic_high, factor=factor, taps=taps
     )
-    seismic_model = forward_depth(
+    seismic_model = forward(
         model_log, vp_model, model_axis, wavelet_time, wavelet
     )
     residual = seismic_observed - seismic_model
     target = _target_mask(model_axis, section.horizon_tvdss_m)
-    valid = target & antialias_valid_1d[None, :] & seismic_antialias_valid[None, :]
+    # The public mask is the geometric target ROI.  Context/halo must make all
+    # generated arrays finite there; support failures reject the attempt below.
+    valid = target
 
     ideal_cfg = script_cfg["lfm"]["ideal"]
     degraded_cfg = script_cfg["lfm"]["controlled_degraded"]
@@ -633,11 +705,17 @@ def generate_depth_realization(
     residual_vs_lfm_ideal = model_log - lfm_ideal
     residual_vs_lfm_degraded = model_log - lfm_degraded
 
-    reconstructed = forward_depth(
-        model_log, vp_model, model_axis, wavelet_time, wavelet
-    )
-    if not np.allclose(reconstructed, seismic_model, rtol=1e-12, atol=1e-12):
-        raise ValueError("model_grid_forward_closure_failed")
+    required_support = {
+        "target_log_ai": model_log,
+        "canonical_background_log_ai": lfm_ideal,
+        "target_increment_log_ai": model_log - lfm_ideal,
+        "input_lfm_log_ai": lfm_degraded,
+        "seismic_observed": seismic_observed,
+        "seismic_model_consistent": seismic_model,
+    }
+    for name, values in required_support.items():
+        if np.any(valid & ~np.isfinite(values)):
+            raise ValueError(f"valid_mask_support_not_finite:{name}")
     categorical = {
         "state_id_highres": object_core.state_id_highres,
         "object_id_highres": object_core.object_id_highres,
@@ -682,8 +760,6 @@ def generate_depth_realization(
         residual_vs_lfm_ideal=residual_vs_lfm_ideal,
         residual_vs_lfm_controlled_degraded=residual_vs_lfm_degraded,
         valid_mask_model=target,
-        observed_valid_mask=valid,
-        physics_valid_mask=valid.copy(),
         categorical=categorical,
         object_catalog=object_core.object_catalog,
         object_lateral_coefficients=object_core.object_lateral_coefficients,
@@ -964,11 +1040,7 @@ def _write_base(h5: h5py.File, section: DepthGeneratedSection) -> str:
         axis_order="lateral,tvdss",
     )
     masks = root.create_group("masks")
-    for name, values in (
-        ("valid_mask_model", section.valid_mask_model),
-        ("observed_valid_mask", section.observed_valid_mask),
-        ("physics_valid_mask", section.physics_valid_mask),
-    ):
+    for name, values in (("valid_mask", section.valid_mask_model),):
         _dataset(
             masks,
             name,
@@ -1019,6 +1091,7 @@ def _write_variants(
     script_cfg: Mapping[str, Any],
     forward_inputs: Mapping[str, Any],
     repo_root: Path,
+    forward_executor: _DepthForwardExecutor,
 ) -> list[dict[str, Any]]:
     config = script_cfg["seismic_mismatch"]
     if not bool(config.get("enabled", True)):
@@ -1026,7 +1099,8 @@ def _write_variants(
     root_path = f"/realizations/{section.realization_id}"
     variants = None if h5 is None else h5[root_path].create_group("seismic_variants")
     rows = []
-    base_mask = section.observed_valid_mask
+    base_mask = np.asarray(section.valid_mask_model, dtype=bool)
+    source_support = np.isfinite(section.seismic_observed)
     ones = np.ones_like(section.seismic_observed, dtype=np.float64)
     zeros = np.zeros_like(section.seismic_observed, dtype=np.float64)
 
@@ -1053,7 +1127,17 @@ def _write_variants(
             positive_gain * np.asarray(seismic_convolved, dtype=np.float64)
             + additive_noise
         )
-        valid = np.asarray(mask, dtype=bool) & np.isfinite(observed)
+        valid = np.asarray(mask, dtype=bool)
+        if not np.array_equal(valid, base_mask):
+            mismatch = int(np.count_nonzero(valid != base_mask))
+            raise ValueError(
+                "invalid_seismic_variant:roi_support_incomplete:"
+                f"variant={variant_id}:mismatch={mismatch}:"
+                f"valid={int(np.count_nonzero(valid))}:"
+                f"base={int(np.count_nonzero(base_mask))}"
+            )
+        if np.any(valid & ~np.isfinite(observed)):
+            raise ValueError("invalid_seismic_variant:roi_support_not_finite")
         if variants is not None:
             group = variants.create_group(variant_id)
             _dataset(
@@ -1061,14 +1145,6 @@ def _write_variants(
                 "seismic_observed",
                 observed.astype(np.float32),
                 unit="amplitude",
-                axis_path=f"{root_path}/axes/tvdss_model_m",
-                axis_order="lateral,tvdss",
-            )
-            _dataset(
-                group,
-                "observed_valid_mask",
-                valid,
-                unit="bool",
                 axis_path=f"{root_path}/axes/tvdss_model_m",
                 axis_order="lateral,tvdss",
             )
@@ -1100,12 +1176,12 @@ def _write_variants(
                 variant_id=variant_id,
                 mismatch_family=family,
                 operator_source=operator_source,
-                valid_sample_count=int(np.count_nonzero(valid)),
                 parameters=parameters,
             ),
             "seismic_observed_rms": float(np.sqrt(np.mean(valid_values * valid_values)))
             if valid_values.size
             else float("nan"),
+            "valid_sample_count": int(np.count_nonzero(valid)),
             "positive_gain_min": float(np.min(positive_gain[valid]))
             if np.any(valid)
             else float("nan"),
@@ -1125,7 +1201,7 @@ def _write_variants(
     wave_cfg = dict(config.get("wavelet") or {})
     for degrees in wave_cfg.get("phase_rotation_degrees", []):
         perturbed = _phase_rotate(wavelet, float(degrees))
-        high = forward_depth(
+        high = forward_executor(
             section.log_ai_highres,
             section.vp_highres_mps,
             section.tvdss_highres_m,
@@ -1143,7 +1219,7 @@ def _write_variants(
         )
     for shift_s in wave_cfg.get("time_shift_s", []):
         perturbed = _shift_wavelet(wavelet_time, wavelet, float(shift_s))
-        high = forward_depth(
+        high = forward_executor(
             section.log_ai_highres,
             section.vp_highres_mps,
             section.tvdss_highres_m,
@@ -1164,13 +1240,13 @@ def _write_variants(
             section.seismic_observed,
             section.tvdss_model_m,
             float(shift_m),
-            source_valid_mask=base_mask,
+            source_valid_mask=source_support,
         )
         persist(
             f"depth_static_{float(shift_m):+g}m",
             "depth_static",
             shifted,
-            shifted_valid,
+            base_mask & shifted_valid,
             {"depth_static_m": float(shift_m)},
         )
 
@@ -1303,7 +1379,7 @@ def _write_variants(
             _phase_rotate(wavelet, float(combined_cfg["phase_rotation_degrees"])),
             float(combined_cfg["time_shift_s"]),
         )
-        high = forward_depth(
+        high = forward_executor(
             section.log_ai_highres,
             section.vp_highres_mps,
             section.tvdss_highres_m,
@@ -1316,12 +1392,15 @@ def _write_variants(
         combined_mask = base_mask & valid_1d[None, :]
         depth_static_m = float(combined_cfg.get("depth_static_m", 0.0))
         if depth_static_m != 0.0:
-            combined_seismic, combined_mask = _static_shift(
+            combined_seismic, shifted_valid = _static_shift(
                 combined_seismic,
                 section.tvdss_model_m,
                 depth_static_m,
-                source_valid_mask=combined_mask,
+                source_valid_mask=(
+                    np.isfinite(combined_seismic) & valid_1d[None, :]
+                ),
             )
+            combined_mask = base_mask & shifted_valid
         gain = _lateral_smooth_gain(
             lateral_m=section.geometry.lateral_m,
             shape=section.seismic_observed.shape,
@@ -1469,6 +1548,13 @@ def run_depth_generation(
     output_dir.mkdir(parents=True, exist_ok=False)
     logger = configure_generation_logger(output_dir, sample_domain="depth")
     logger.info("Depth Synthoseis generation started")
+    forward_executor = _DepthForwardExecutor(script_cfg["seismic_forward"])
+    logger.info(
+        "Depth forward backend: requested=%s resolved=%s dtype=%s",
+        forward_executor.requested,
+        forward_executor.resolved,
+        forward_executor.dtype,
+    )
     sections, survey = build_depth_sections(
         workflow=workflow, script_cfg=script_cfg, repo_root=repo_root
     )
@@ -1505,6 +1591,7 @@ def run_depth_generation(
             forward_inputs=forward_inputs,
             survey=survey,
             repo_root=repo_root,
+            forward_executor=forward_executor,
             preflight_only=True,
         )
 
@@ -1603,6 +1690,7 @@ def run_depth_generation(
                     forward_inputs=forward_inputs,
                     survey=survey,
                     repo_root=repo_root,
+                    forward_executor=forward_executor,
                 )
                 if generated is None:
                     raise RuntimeError("depth_generation_returned_no_realization")
@@ -1633,9 +1721,10 @@ def run_depth_generation(
                         "seismic_model_consistent_dataset": ""
                         if qc_only
                         else f"{group_path}/seismic/seismic_model_consistent",
-                        "observed_valid_mask_dataset": ""
+                        "valid_mask_dataset": ""
                         if qc_only
-                        else f"{group_path}/masks/observed_valid_mask",
+                        else f"{group_path}/masks/valid_mask",
+                        "valid_sample_count": int(np.count_nonzero(generated.valid_mask_model)),
                     }
                 ]
                 local_variant_rows = []
@@ -1645,6 +1734,7 @@ def run_depth_generation(
                     script_cfg=script_cfg,
                     forward_inputs=forward_inputs,
                     repo_root=repo_root,
+                    forward_executor=forward_executor,
                 )
                 for variant in generated_variants:
                     variant_id = f"{base_id}__{variant['variant_id']}"
@@ -1667,14 +1757,12 @@ def run_depth_generation(
                             "seismic_model_consistent_dataset": ""
                             if qc_only
                             else f"{group_path}/seismic/seismic_model_consistent",
-                            "observed_valid_mask_dataset": ""
+                            "valid_mask_dataset": ""
                             if qc_only
-                            else f"{variant_path}/observed_valid_mask",
+                            else f"{group_path}/masks/valid_mask",
+                            "valid_sample_count": int(np.count_nonzero(generated.valid_mask_model)),
                             "seismic_mismatch_family": variant["mismatch_family"],
                             "seismic_variant_operator_source": variant["operator_source"],
-                            "seismic_variant_valid_sample_count": variant[
-                                "valid_sample_count"
-                            ],
                             "seismic_variant_parameters_json": json.dumps(
                                 {
                                     str(key): value
@@ -1683,7 +1771,6 @@ def run_depth_generation(
                                         "variant_id",
                                         "mismatch_family",
                                         "operator_source",
-                                        "valid_sample_count",
                                     }
                                 },
                                 sort_keys=True,
@@ -1761,7 +1848,8 @@ def run_depth_generation(
                         "hdf5_group": "",
                         "seismic_input_dataset": "",
                         "seismic_model_consistent_dataset": "",
-                        "observed_valid_mask_dataset": "",
+                        "valid_mask_dataset": "",
+                        "valid_sample_count": "",
                         "status": "rejected",
                         "reasons": reason,
                     }
@@ -1881,8 +1969,10 @@ def run_depth_generation(
                     "global_seed": int(script_cfg["global_seed"]),
                     "generation": dict(script_cfg["generation"]),
                     "seismic_input": dict(script_cfg["seismic_input"]),
+                    "seismic_forward": dict(script_cfg["seismic_forward"]),
                     "lfm": dict(script_cfg["lfm"]),
                     "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
+                    "mask_contract": build_mask_contract(),
                 },
                 input_contracts=input_contracts,
                 primary_artifacts={
@@ -1905,10 +1995,12 @@ def run_depth_generation(
         "failure_reason": failure_reason,
         "input_contracts": input_contracts,
         "sample_domain": "depth",
+        "mask_contract": build_mask_contract(),
         "increment_contract": generation_contract("depth", float(script_cfg["sampling"]["expected_model_dz_m"])).as_dict(),
         "seismic_input_contract": build_seismic_input_contract(
             "depth", operator="depth_ai_vp_highres_forward_antialias"
         ),
+        "seismic_forward": forward_executor.manifest_fields,
         "lfm_degradation": build_lfm_degradation_metadata(
             "depth", axis_unit="m"
         ),

@@ -25,6 +25,7 @@ from cup.synthetic.core import (
     validate_seismic_input_contract,
     validate_dataset_metadata,
     validate_training_manifest,
+    validate_mask_contract,
 )
 from cup.utils.io import require_contract_fingerprint
 
@@ -44,8 +45,6 @@ class DepthSyntheticSample:
     seismic_observed: np.ndarray
     seismic_model_consistent: np.ndarray
     valid_mask: np.ndarray
-    observed_valid_mask: np.ndarray
-    physics_valid_mask: np.ndarray
     lateral_m: np.ndarray
     tvdss_model_m: np.ndarray
     priors: dict[str, np.ndarray]
@@ -91,6 +90,7 @@ class DepthBenchmark:
             )
         if self.manifest.get("sample_domain") != "depth" or self.manifest.get("depth_basis") != "tvdss":
             raise ValueError("Synthoseis v4 reader requires sample_domain=depth and depth_basis=tvdss.")
+        self.mask_contract = validate_mask_contract(self.manifest.get("mask_contract") or {})
         self.increment_contract = CanonicalIncrementContract.from_mapping(
             self.manifest.get("increment_contract") or {}
         )
@@ -116,11 +116,21 @@ class DepthBenchmark:
             "sample_id", "parent_realization_id", "sample_kind", "source_sample_id",
             "hdf5_group", "sample_domain", "depth_basis", "suite", "evaluation_role",
             "seismic_input_dataset", "seismic_model_consistent_dataset",
-            "observed_valid_mask_dataset",
+            "valid_mask_dataset",
         }
         missing = sorted(required - set(self.index))
         if missing:
             raise ValueError(f"sample_index.csv lacks v4 columns: {missing}")
+        legacy_mask_columns = {
+            "observed_valid_mask_dataset",
+            "physics_valid_mask_dataset",
+            "seismic_variant_valid_sample_count",
+        }.intersection(self.index.columns)
+        if legacy_mask_columns:
+            raise ValueError(
+                "Synthoseis v4 single_valid_mask contract rejects legacy mask columns: "
+                f"{sorted(legacy_mask_columns)}"
+            )
         if self.index.empty or self.index["sample_id"].duplicated().any():
             raise ValueError("sample_index.csv must be non-empty with unique sample_id values.")
         if not self.index["sample_domain"].eq("depth").all() or not self.index["depth_basis"].eq("tvdss").all():
@@ -155,14 +165,8 @@ class DepthBenchmark:
                         "operator_source": row.get(
                             "seismic_variant_operator_source"
                         ),
-                        "valid_sample_count": row.get(
-                            "seismic_variant_valid_sample_count"
-                        ),
                     }
                 )
-                row["seismic_variant_valid_sample_count"] = normalized_variant_metadata[
-                    "valid_sample_count"
-                ]
                 source = self._rows.get(str(row["source_sample_id"]))
                 if source is None or source["sample_kind"] != "base":
                     raise ValueError(f"Variant has an invalid base source: {row['sample_id']}")
@@ -217,7 +221,7 @@ class DepthBenchmark:
                     "hdf5_group",
                     "seismic_input_dataset",
                     "seismic_model_consistent_dataset",
-                    "observed_valid_mask_dataset",
+                    "valid_mask_dataset",
                 ):
                     referenced = str(row.get(field) or "")
                     if not referenced or referenced not in h5:
@@ -265,12 +269,7 @@ class DepthBenchmark:
                     h5[str(row["seismic_model_consistent_dataset"])][()],
                     dtype=np.float64,
                 ),
-                "valid": np.asarray(h5[f"{base_path}/masks/valid_mask_model"][()], dtype=bool),
-                "observed_valid": np.asarray(
-                    h5[str(row["observed_valid_mask_dataset"])][()],
-                    dtype=bool,
-                ),
-                "physics_valid": np.asarray(h5[f"{base_path}/masks/physics_valid_mask"][()], dtype=bool),
+                "valid": np.asarray(h5[str(row["valid_mask_dataset"])][()], dtype=bool),
                 "lateral": np.asarray(h5[f"{base_path}/axes/lateral_m"][()], dtype=np.float64),
                 "axis": np.asarray(h5[f"{base_path}/axes/tvdss_model_m"][()], dtype=np.float64),
                 "lfm_ideal": np.asarray(h5[f"{base_path}/priors/lfm_ideal"][()], dtype=np.float64),
@@ -283,17 +282,21 @@ class DepthBenchmark:
                 input_lfm_path = f"{base_path}/priors/input_lfm_variants/{variant_id}/log_ai"
             arrays["input_lfm"] = np.asarray(h5[input_lfm_path][()], dtype=np.float64)
         shape = arrays["target"].shape
-        for name in ("vp", "observed", "consistent", "valid", "observed_valid", "physics_valid", "lfm_ideal", "lfm_degraded", "canonical_background", "target_increment", "input_lfm"):
+        for name in ("vp", "observed", "consistent", "valid", "lfm_ideal", "lfm_degraded", "canonical_background", "target_increment", "input_lfm"):
             if arrays[name].shape != shape:
                 raise ValueError(f"N-point shape contract failed for {sample_id}: {name}={arrays[name].shape}, target={shape}")
-        if row["sample_kind"] == "seismic_variant":
-            declared_count = int(row["seismic_variant_valid_sample_count"])
-            actual_count = int(np.count_nonzero(arrays["observed_valid"]))
-            if declared_count != actual_count:
-                raise ValueError(
-                    f"Variant valid sample count mismatch for {sample_id}: "
-                    f"declared={declared_count}, actual={actual_count}."
-                )
+        if np.any(arrays["valid"] & (
+            ~np.isfinite(arrays["target"])
+            | ~np.isfinite(arrays["canonical_background"])
+            | ~np.isfinite(arrays["target_increment"])
+            | ~np.isfinite(arrays["input_lfm"])
+            | ~np.isfinite(arrays["lfm_ideal"])
+            | ~np.isfinite(arrays["lfm_degraded"])
+            | ~np.isfinite(arrays["vp"])
+            | ~np.isfinite(arrays["observed"])
+            | ~np.isfinite(arrays["consistent"])
+        )):
+            raise ValueError(f"Synthoseis sample has non-finite values inside valid_mask: {sample_id}")
         finite = np.isfinite(arrays["target"]) & np.isfinite(arrays["canonical_background"]) & np.isfinite(arrays["target_increment"])
         if np.any(finite & (np.abs(arrays["target"] - arrays["canonical_background"] - arrays["target_increment"]) > 1e-5)):
             raise ValueError(f"Canonical increment decomposition mismatch for {sample_id}.")
@@ -305,8 +308,7 @@ class DepthBenchmark:
             target_increment_log_ai=arrays["target_increment"],
             input_lfm_log_ai=arrays["input_lfm"],
             seismic_observed=arrays["observed"], seismic_model_consistent=arrays["consistent"],
-            valid_mask=arrays["valid"], observed_valid_mask=arrays["observed_valid"],
-            physics_valid_mask=arrays["physics_valid"], lateral_m=arrays["lateral"],
+            valid_mask=arrays["valid"], lateral_m=arrays["lateral"],
             tvdss_model_m=arrays["axis"], priors={
                 "lfm_ideal": arrays["lfm_ideal"],
                 "lfm_controlled_degraded": arrays["lfm_degraded"],

@@ -108,7 +108,7 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     allowed_root = {
         "sample_domain", "benchmark_schema", "global_seed", "source_runs", "sampling", "geometry", "sections",
         "calibration", "impedance_attribute_generator", "generation", "splits",
-        "seismic_input", "lfm", "seismic_mismatch", "canonical", "figures",
+        "seismic_input", "seismic_forward", "lfm", "seismic_mismatch", "canonical", "figures",
     }
     if "probe_selection" in root:
         raise ValueError(
@@ -131,6 +131,22 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "Depth Synthoseis v4 requires "
             "seismic_input.policy='observed_highres_forward'."
         )
+    seismic_forward = _mapping(
+        root.get("seismic_forward"), path="synthoseis_lite.seismic_forward"
+    )
+    _reject_unknown(
+        seismic_forward,
+        {"backend", "dtype"},
+        path="synthoseis_lite.seismic_forward",
+    )
+    backend = str(seismic_forward.get("backend") or "").strip().casefold()
+    if backend not in {"auto", "numpy", "torch_cuda"}:
+        raise ValueError(
+            "synthoseis_lite.seismic_forward.backend must be auto, numpy, or torch_cuda."
+        )
+    dtype = str(seismic_forward.get("dtype") or "").strip().casefold()
+    if dtype != "float64":
+        raise ValueError("Depth Synthoseis forward dtype is fixed to float64.")
     seismic = _mapping(config.get("seismic"), path="seismic")
     if str(seismic.get("domain", "")).casefold() != "depth":
         raise ValueError("Depth Synthoseis v4 requires seismic.domain='depth'.")
@@ -446,6 +462,7 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "generation": {"attempts_per_scenario": _positive_int(generation.get("attempts_per_scenario"), path="generation.attempts_per_scenario"), "duration_modes": ["standard"], "geometry_families": geometry_families, "geometry_directions": directions, "acceptance_qc": {"minimum_attempts_per_scenario": _positive_int(acceptance.get("minimum_attempts_per_scenario"), path="generation.acceptance_qc.minimum_attempts_per_scenario"), "warning_fraction": warning, "failure_fraction": failure, "enforcement": enforcement}},
         "splits": {"assignment_unit": "parent_realization", "held_out_geometry_family": held_out},
         "seismic_input": {"policy": "observed_highres_forward"},
+        "seismic_forward": {"backend": backend, "dtype": "float64"},
         "lfm": parsed_lfm,
         "seismic_mismatch": parsed_mismatch,
         "figures": {

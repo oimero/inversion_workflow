@@ -24,6 +24,7 @@ from cup.synthetic.core import (
     validate_seismic_input_contract,
     validate_dataset_metadata,
     validate_training_manifest,
+    validate_mask_contract,
 )
 from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION
 from cup.utils.io import require_contract_fingerprint
@@ -46,8 +47,6 @@ class TimeSyntheticSample:
     seismic_input: np.ndarray
     seismic_model_consistent: np.ndarray
     valid_mask: np.ndarray
-    observed_valid_mask: np.ndarray
-    physics_valid_mask: np.ndarray
     lateral_m: np.ndarray
     twt_model_s: np.ndarray
     priors: dict[str, np.ndarray]
@@ -150,6 +149,7 @@ class TimeBenchmark:
             )
         if str(self.manifest.get("sample_domain") or "").casefold() != "time":
             raise ValueError("Time v4 reader requires sample_domain=time.")
+        self.mask_contract = validate_mask_contract(self.manifest.get("mask_contract") or {})
         self.increment_contract = CanonicalIncrementContract.from_mapping(
             self.manifest.get("increment_contract") or {}
         )
@@ -183,11 +183,21 @@ class TimeBenchmark:
             "evaluation_role",
             "seismic_input_dataset",
             "seismic_model_consistent_dataset",
-            "observed_valid_mask_dataset",
+            "valid_mask_dataset",
         }
         missing = required - set(self.index)
         if missing:
             raise ValueError(f"sample_index.csv lacks columns: {sorted(missing)}")
+        legacy_mask_columns = {
+            "observed_valid_mask_dataset",
+            "physics_valid_mask_dataset",
+            "seismic_variant_valid_sample_count",
+        }.intersection(self.index.columns)
+        if legacy_mask_columns:
+            raise ValueError(
+                "Synthoseis v4 single_valid_mask contract rejects legacy mask columns: "
+                f"{sorted(legacy_mask_columns)}"
+            )
         forbidden_probe_kinds = {
             "frequency_probe",
             "frequency_probe_seismic_variant",
@@ -235,16 +245,10 @@ class TimeBenchmark:
                 "operator_source": _clean_path(
                     row.get("seismic_variant_operator_source")
                 ),
-                "valid_sample_count": row.get(
-                    "seismic_variant_valid_sample_count"
-                ),
             }
             normalized_variant_metadata = validate_seismic_variant_metadata(
                 variant_metadata
             )
-            row["seismic_variant_valid_sample_count"] = normalized_variant_metadata[
-                "valid_sample_count"
-            ]
             source_id = _clean_path(row.get("source_sample_id"))
             source = self._rows.get(source_id)
             if source is None:
@@ -308,7 +312,7 @@ class TimeBenchmark:
                 for field in (
                     "seismic_input_dataset",
                     "seismic_model_consistent_dataset",
-                    "observed_valid_mask_dataset",
+                    "valid_mask_dataset",
                 ):
                     dataset_path = _clean_path(row.get(field))
                     if not dataset_path or dataset_path not in h5:
@@ -374,17 +378,8 @@ class TimeBenchmark:
                 ),
                 model_shape,
             )
-            observed_valid = _pad_forward_mask_to_model(
-                self._read_indexed_dataset(
-                    h5, row, "observed_valid_mask_dataset"
-                ),
-                model_shape,
-            )
             valid = np.asarray(
-                h5[f"{root_path}/masks/valid_mask_model"][()], dtype=bool
-            )
-            physics_valid = np.asarray(
-                h5[f"{root_path}/masks/physics_valid_mask"][()], dtype=bool
+                h5[str(row["valid_mask_dataset"])][()], dtype=bool
             )
             lateral = np.asarray(
                 h5[f"{root_path}/axes/lateral_m"][()], dtype=np.float64
@@ -423,10 +418,8 @@ class TimeBenchmark:
             }
         for name, values in {
             "valid": valid,
-            "physics_valid": physics_valid,
             "seismic": seismic,
             "consistent": consistent,
-            "observed_valid": observed_valid,
             "canonical_background": canonical_background,
             "target_increment": target_increment,
             "input_lfm": priors["input_lfm_log_ai"],
@@ -435,14 +428,17 @@ class TimeBenchmark:
                 raise ValueError(
                     f"{name}/target shape mismatch for {sample_id}: {values.shape} vs {model_shape}"
                 )
-        if sample_kind in SEISMIC_VARIANT_KINDS:
-            declared_count = int(row["seismic_variant_valid_sample_count"])
-            actual_count = int(np.count_nonzero(observed_valid))
-            if declared_count != actual_count:
-                raise ValueError(
-                    f"Variant valid sample count mismatch for {sample_id}: "
-                    f"declared={declared_count}, actual={actual_count}."
-                )
+        if np.any(valid & (
+            ~np.isfinite(target)
+            | ~np.isfinite(canonical_background)
+            | ~np.isfinite(target_increment)
+            | ~np.isfinite(priors["input_lfm_log_ai"])
+            | ~np.isfinite(priors["lfm_ideal"])
+            | ~np.isfinite(priors["lfm_controlled_degraded"])
+            | ~np.isfinite(seismic)
+            | ~np.isfinite(consistent)
+        )):
+            raise ValueError(f"Synthoseis sample has non-finite values inside valid_mask: {sample_id}")
         finite = np.isfinite(target) & np.isfinite(canonical_background) & np.isfinite(target_increment)
         if np.any(finite & (np.abs(target - canonical_background - target_increment) > 1e-5)):
             raise ValueError(f"Canonical increment decomposition mismatch for {sample_id}.")
@@ -458,8 +454,6 @@ class TimeBenchmark:
             seismic_input=seismic,
             seismic_model_consistent=consistent,
             valid_mask=valid,
-            observed_valid_mask=observed_valid,
-            physics_valid_mask=physics_valid,
             lateral_m=lateral,
             twt_model_s=twt,
             priors={

@@ -85,7 +85,7 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 
 这些事项是后续 goal 的工作内容，不在本 HANDOFF 中假定已经完成。阶段 1 和阶段 2 已落地在 `cup.impedance`、Synthoseis-lite v4 writer/reader、LFM variant writer 和生成 manifest 中。微纹理规格中的阶段 3/4 不作为阶段 2.5 的直接后继；先完成 v4 主链和 GINN v2 核心链路，随后才进入本 HANDOFF 的阶段 11/12。
 
-### 3.3 阶段 2.5 对称性收口（本轮）
+### 3.3 阶段 2.5 对称性收口与单一 mask（本轮）
 
 本轮把两个域的消费合同统一到 observed high-resolution forward：
 
@@ -94,21 +94,22 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - manifest 写入 `seismic_input_contract`，明确 model axis、`seismic_observed` 网络
   输入和仅供 physics/closure 的 `seismic_model_consistent`；
 - time 将高分辨率 truth forward/downsample 结果写入
-  `seismic/seismic_observed`，并写出 `masks/observed_valid_mask`；depth 沿用
-  AI–Vp、深度正演和抗混叠结果写入同名字段；
+  `seismic/seismic_observed`；depth 沿用 AI–Vp、深度正演和抗混叠结果写入同名字段；
 - 两域 `sample_index.csv` 都显式记录
   `seismic_input_dataset`、`seismic_model_consistent_dataset` 和
-  `observed_valid_mask_dataset`；变体还记录 family、operator source、有效样点数
-  与参数 JSON；
+  `valid_mask_dataset`；变体还记录 family、operator source 和参数 JSON；
 - 两个 reader 通过同一最小 sample protocol 暴露 `sample_axis`、canonical 字段、
-  `seismic_input`、`seismic_model_consistent` 和三类 mask。缺少新 manifest/index
-  合同的旧 v4 直接失败；不提供字段回退；
+  `seismic_input`、`seismic_model_consistent` 和单一 `valid_mask`。缺少新
+  `mask_contract` 或仍包含旧 mask index 字段的 v4 直接失败；不提供字段回退；
 - LFM component 顺序、variant catalog、随机流目的和 QC metadata 共用同一编排层，
   但时间域的秒制算子与深度域的米制/AI–Vp 算子保持各自实现。
 - 时间域和深度域均按 `local_missing_control_bias -> over_smoothing` 执行 LFM
   退化；两者的组合顺序由本地回归测试锁定。
-- 深度域受控 LFM 退化改为按有效 mask 做幅度缩放和空间平滑，无效区继续写 NaN；
-  CSV 变体有效样点数统一归一化为整数后再由 reader 校验。
+- 深度域受控 LFM 退化改为按 `valid_mask` 做幅度缩放和空间平滑，无效区继续写 NaN；
+- 深度 forward 增加 `seismic_forward.backend=auto|numpy|torch_cuda` 与 float64 合同，
+  auto 在 CUDA 可用时复用 Torch depth backend；manifest 记录 requested/resolved backend；
+- 高分辨率 forward support 只作为生成 QC，reader、训练协议和 loss 只消费 `valid_mask`；
+  physics halo/central-crop 仍留在后续 GINN 训练阶段。
 
 本轮不改微纹理、GINN v2、physics、R0/R1，也不迁移旧 v4 产物。
 
@@ -148,12 +149,15 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - [x] 删除提前落地的 microtexture emitter；
 - [x] canonical contract 对象入口、LFM profile/QC 状态和实现版本命名完成稳定化；
 - [x] 更新本地 ignored fixture，跑完 canonical、writer/reader、LFM 合同和 probe 失败测试；
-- [x] 两域 observed input、model-consistent 参照、observed mask 和 mismatch metadata
+- [x] 两域 observed input、model-consistent 参照、`valid_mask` 和 mismatch metadata
   使用统一索引字段；
+- [x] 两域统一到 `mask_contract=single_valid_mask_v1` 与单一 `valid_mask`；
+- [x] 深度域增加 auto CUDA/显式 NumPy CPU 的 float64 forward backend，并移除重复
+  model-grid closure forward；
 - [x] 使用当前可用深度 source 完成 writer → manifest → reader → baseline evaluator 小烟测；
 - [ ] 用新合同重新生成需要消费的 v4 benchmark，不覆盖冻结目录。
 
-完成条件：新包 import/compile smoke 通过，LFM profile 和 QC 状态语义通过，旧实现版本命名不再出现在正式 reader/config/CLI 路径，probe 正式路径仍明确失败（保留失败测试与 observability 旁路），reader 拒绝缺少新合同的旧 v4。状态：对称性合同、本地 fixture 和深度 debug smoke 已完成；完整工区 v4 重生成仍待执行。
+完成条件：新包 import/compile smoke 通过，LFM profile 和 QC 状态语义通过，旧实现版本命名不再出现在正式 reader/config/CLI 路径，probe 正式路径仍明确失败（保留失败测试与 observability 旁路），reader 拒绝缺少新合同的旧 v4。状态：单一 mask 合同、深度 GPU backend 和本地 fixture 正在本轮稳定化；完整工区 v4 重生成仍待执行。
 
 说明：`scripts/ginn_v2.py summarize` 仍可读取冻结历史 report-card 中的旧 probe 字段，
 但 v4 writer、reader、baseline evaluator 和 GINN v2 新 report 不再生成这些字段；该历史
@@ -167,7 +171,8 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - [ ] 记录场景接受率、拒绝原因和 `development_limited` 等状态，不把 attempt-level 拒绝误报为生成成功；
 - [ ] 形成一份可冻结的 v4 baseline manifest 和评估报告，不覆盖 20260706 等历史目录。
 
-时间域真实 source 可用前只做 fixture reader/baseline 验证，不声称完成时间域工区 smoke。深度域当前运行的 `20260714` 输出在完成后写入本阶段证据。
+时间域真实 source 可用前只做 fixture reader/baseline 验证，不声称完成时间域工区 smoke。
+深度域完整工区需要在当前实现完成后用新输出目录重新生成；本阶段只冻结小烟测证据。
 
 完成条件：新输出目录可被 v4 reader 和 baseline evaluator 独立读取；有限点的 canonical 重组成立；observed input、model-consistent 参照、mask、LFM variant 和坐标轴合同完整；旧 probe 和旧 v4 schema 明确失败；生成 acceptance/report 已冻结。
 
@@ -325,6 +330,7 @@ PYTHONPATH=src python -m pytest -q -p no:cacheprovider tests/test_canonical_incr
 - v4 writer 写入 `canonical_background_log_ai`、`target_increment_log_ai`；
 - 时间域和深度域 writer 均写入 canonical 字段；
 - canonical 与 controlled 两个 LFM variant；
+
 - LFM producer 的 canonical background 和 variant 复算；
 - v4 reader 暴露 canonical 字段；
 - v4 facade 拒绝冻结 v3 manifest；
@@ -363,7 +369,45 @@ time/depth reader import smoke 同样通过。测试文件继续被 `.gitignore`
   输出目录为 `scripts/output/synthoseis_lite_evaluate_depth_smoke_20260713_fixed_rerun3`；
 - 旧 v3 与阶段 2 之前生成的 v4 目录不覆盖、不迁移。
 
-## 8. 相关文档
+## 8. 本轮单一 mask 与深度 GPU 验证证据
+
+本轮实现后的本地验证：
+
+```text
+PYTHONPATH=src python -m pytest -q -p no:cacheprovider \
+  tests/test_canonical_increment.py \
+  tests/test_synthoseis_v4_canonical.py \
+  tests/test_synthoseis_stage_2_5.py
+```
+
+结果：`33 passed`；`compileall -q src/cup src/ginn_v2` 通过。新增回归覆盖深度静态
+mismatch 的 halo 源支持与 GINN patch 的单一 mask/有限零填充。
+
+深度域实际 smoke 输出：
+
+```text
+scripts/output/synthoseis_lite_single_valid_mask_depth_smoke_gpu2_20260714
+```
+
+该目录使用 `field_conditioned --debug-attempt-limit 1 --geometry-family none`，
+manifest 记录 `requested_backend=auto`、`resolved_backend=torch_cuda`、`dtype=float64`；
+HDF5 realization 只有 `masks/valid_mask`，reader 能加载 ROI 内有限的 observed 和
+model-consistent seismic，baseline evaluator 也成功消费同一目录。完整 v4 工区仍需
+在新输出目录重新生成，历史目录不覆盖。
+
+显式 CPU 覆盖也已完成同样的 writer → manifest → reader smoke：
+
+```text
+scripts/output/synthoseis_lite_single_valid_mask_depth_smoke_cpu3_20260714
+```
+
+manifest 记录 `requested_backend=numpy`、`resolved_backend=numpy`、`dtype=float64`，
+4 个场景生成成功，2 个对象参数组合在 preflight 被拒绝，整体状态为
+`development_limited`。该 smoke 同时验证了带 halo 的深度静态 mismatch 先使用完整
+源支持平移、再与公共 ROI 相交；所有变体最终共享同一 `valid_mask`。baseline
+evaluator 也已用 `--max-samples 2` 读取该 CPU smoke 目录。
+
+## 9. 相关文档
 
 - [Canonical Increment 语义规格](GINN_V2_CANONICAL_INCREMENT_SEMANTICS.md)
 - [Synthoseis-lite 微纹理生成规格](SYNTHOSEIS_MICROTEXTURE_GENERATION_DESIGN.md)

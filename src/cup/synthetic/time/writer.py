@@ -174,7 +174,6 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
             model_axis,
         ),
         ("zone_id_model", section.zone_id_model, "category", model_axis),
-        ("valid_mask_model", section.valid_mask_model, "bool", model_axis),
     ]:
         _dataset(
             truth,
@@ -229,31 +228,14 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
     masks = root.create_group("masks")
     _dataset(
         masks,
-        "valid_mask_model",
+        "valid_mask",
         section.valid_mask_model,
         unit="bool",
         domain="twt",
         axis_order=["lateral", "twt"],
         axis_dataset=model_axis,
     )
-    physics_valid = np.zeros_like(section.valid_mask_model, dtype=bool)
-    physics_valid[:, 0] = np.asarray(section.forward_valid_mask_model, dtype=bool)[:, 0]
-    physics_valid[:, 1:] = np.asarray(section.forward_valid_mask_model, dtype=bool)
-    physics_valid &= np.asarray(section.valid_mask_model, dtype=bool)
-    if np.asarray(section.seismic_model_consistent).shape == (
-        physics_valid.shape[0],
-        physics_valid.shape[1] - 1,
-    ):
-        physics_valid[:, 0] = False
-    _dataset(
-        masks,
-        "physics_valid_mask",
-        physics_valid,
-        unit="bool",
-        domain="twt",
-        axis_order=["lateral", "twt"],
-        axis_dataset=model_axis,
-    )
+    valid = np.asarray(section.valid_mask_model, dtype=bool)
     _dataset(
         truth,
         "reflectivity_highres",
@@ -303,6 +285,11 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
             "seismic_model_consistent must align with the model axis or its "
             "N-1 forward-interface axis."
         )
+    if np.any(valid & (
+        ~np.isfinite(section.model_target_log_ai)
+        | ~np.isfinite(model_consistent_on_axis)
+    )):
+        raise ValueError("time valid_mask support is not finite for required arrays.")
     _dataset(
         seismic,
         "seismic_model_consistent",
@@ -320,14 +307,12 @@ def write_highres_forward_result(
     *,
     realization_path: str,
     result: HighresForwardResult,
-    observed_valid_mask: np.ndarray,
 ) -> str:
     root = h5[realization_path]
     seismic = root["seismic"]
     axis = f"{realization_path}/axes/twt_model_s"
     target_shape = root["truth/model_target_log_ai"].shape
     observed = np.asarray(result.seismic_model_grid, dtype=np.float64)
-    observed_mask = np.asarray(observed_valid_mask, dtype=bool)
     if observed.shape == target_shape:
         observed_on_axis = observed
     elif observed.shape == (target_shape[0], target_shape[1] - 1):
@@ -337,34 +322,18 @@ def write_highres_forward_result(
         raise ValueError(
             "highres forward observed data does not align with the model target axis."
         )
-    if observed_mask.shape == target_shape:
-        observed_mask_on_axis = observed_mask.copy()
-    elif observed_mask.shape == (target_shape[0], target_shape[1] - 1):
-        observed_mask_on_axis = np.zeros(target_shape, dtype=bool)
-        observed_mask_on_axis[:, 1:] = observed_mask
-    else:
-        raise ValueError(
-            "highres forward observed mask does not align with the model target axis."
-        )
-    if observed.shape == (target_shape[0], target_shape[1] - 1):
-        # The padded sample has no forward interface support, even when a
-        # caller supplied the already-expanded mask.
-        observed_mask_on_axis[:, 0] = False
+    valid_mask = np.asarray(root["masks/valid_mask"][()], dtype=bool)
+    if valid_mask.shape != target_shape:
+        raise ValueError("valid_mask does not align with the model target axis.")
+    if observed.shape == (target_shape[0], target_shape[1] - 1) and np.any(valid_mask[:, 0]):
+        raise ValueError("highres forward lacks support for valid first model samples.")
+    if np.any(valid_mask & ~np.isfinite(observed_on_axis)):
+        raise ValueError("highres forward observed data is not finite inside valid_mask.")
     _dataset(
         seismic,
         "seismic_observed",
         observed_on_axis.astype(np.float32),
         unit="normalized_amplitude",
-        domain="twt",
-        axis_order=["lateral", "twt"],
-        axis_dataset=axis,
-    )
-    masks = root.require_group("masks")
-    _dataset(
-        masks,
-        "observed_valid_mask",
-        observed_mask_on_axis,
-        unit="bool",
         domain="twt",
         axis_order=["lateral", "twt"],
         axis_dataset=axis,
@@ -411,7 +380,18 @@ def write_lfm_result(
     variant_values = dict(result.input_lfm_variants or {})
     if not variant_values:
         variant_values = {"controlled_default": result.lfm_controlled_degraded}
+    valid = np.asarray(root["masks/valid_mask"][()], dtype=bool)
+    for name, values in (
+        ("lfm_ideal", result.lfm_ideal),
+        ("lfm_controlled_degraded", result.lfm_controlled_degraded),
+    ):
+        values_array = np.asarray(values, dtype=np.float64)
+        if values_array.shape != valid.shape or np.any(valid & ~np.isfinite(values_array)):
+            raise ValueError(f"time {name} is not finite inside valid_mask.")
     for variant_id, values in variant_values.items():
+        values_array = np.asarray(values, dtype=np.float64)
+        if values_array.shape != valid.shape or np.any(valid & ~np.isfinite(values_array)):
+            raise ValueError("time LFM variant is not finite inside valid_mask.")
         variant_group = variants.require_group(str(variant_id))
         _dataset(
             variant_group,
@@ -504,15 +484,6 @@ def write_seismic_variant_result(
         "additive_noise",
         result.additive_noise.astype(np.float32),
         unit="normalized_amplitude",
-        domain="twt",
-        axis_order=["lateral", "twt"],
-        axis_dataset=forward_axis,
-    )
-    _dataset(
-        group,
-        "observed_valid_mask",
-        np.asarray(result.observed_valid_mask, dtype=bool),
-        unit="bool",
         domain="twt",
         axis_order=["lateral", "twt"],
         axis_dataset=forward_axis,

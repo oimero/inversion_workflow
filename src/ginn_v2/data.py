@@ -115,16 +115,9 @@ def _aligned_arrays(
         )
     if seismic.shape != target.shape:
         raise ValueError(
-            f"{sample_domain.capitalize()} v3 requires N-point seismic/target alignment "
+            f"{sample_domain.capitalize()} v4 requires N-point seismic/target alignment "
             f"for {sample.sample_id}: {seismic.shape} vs {target.shape}"
         )
-    if sample_domain == "depth":
-        observed_valid = np.asarray(sample.observed_valid_mask, dtype=bool)
-        if observed_valid.shape != target.shape:
-            raise ValueError(
-                f"Depth observed-valid mask shape mismatch for {sample.sample_id}."
-            )
-        valid &= observed_valid
     if target.ndim != 2 or seismic.ndim != 2 or lfm.ndim != 2 or valid.ndim != 2:
         raise ValueError(f"Expected 2D arrays for sample {sample.sample_id}.")
     if (
@@ -136,10 +129,13 @@ def _aligned_arrays(
             f"Shape mismatch for {sample.sample_id}: target={target.shape}, "
             f"seismic={seismic.shape}, lfm={lfm.shape}, valid={valid.shape}"
         )
-    effective_valid = (
-        valid & np.isfinite(target) & np.isfinite(seismic) & np.isfinite(lfm)
-    )
-    return target, seismic, lfm, effective_valid
+    if np.any(valid & (
+        ~np.isfinite(target) | ~np.isfinite(seismic) | ~np.isfinite(lfm)
+    )):
+        raise ValueError(
+            f"Sample {sample.sample_id} has non-finite values inside valid_mask."
+        )
+    return target, seismic, lfm, valid
 
 
 def _window_starts(size: int, window: int, stride: int) -> list[int]:
@@ -442,9 +438,13 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         target_patch = target[sl]
         seismic_patch = seismic[sl]
         lfm_patch = lfm[sl]
-        forward_lfm_patch = np.asarray(lfm_patch, dtype=np.float32)
         valid_patch = valid[sl]
-        input_valid_patch = np.isfinite(seismic_patch) & np.isfinite(lfm_patch)
+        input_valid_patch = valid_patch
+        forward_lfm_patch = np.where(
+            valid_patch & np.isfinite(lfm_patch),
+            lfm_patch,
+            0.0,
+        ).astype(np.float32)
         delta = target_patch - lfm_patch
         seismic_n = _norm(seismic_patch, self.normalization["seismic"])
         lfm_n = _norm(lfm_patch, self.normalization["lfm"])
@@ -471,27 +471,20 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             lfm_ideal[sl],
             0.0,
         )
-        if hasattr(sample, "seismic_model_consistent"):
-            seismic_model_consistent = np.asarray(
-                sample.seismic_model_consistent, dtype=np.float32
+        seismic_model_consistent = np.asarray(
+            sample.seismic_model_consistent, dtype=np.float32
+        )
+        if seismic_model_consistent.shape != target.shape:
+            raise ValueError(
+                f"Physics target shape mismatch for {sample.sample_id}."
             )
-            physics_valid = np.isfinite(seismic_model_consistent) & np.isfinite(lfm)
-            if (
-                seismic_model_consistent.shape != target.shape
-                or physics_valid.shape != target.shape
-            ):
-                raise ValueError(
-                    f"Physics target/mask shape mismatch for {sample.sample_id}."
-                )
-            physics_seismic_patch = np.where(
-                physics_valid[sl] & np.isfinite(seismic_model_consistent[sl]),
-                seismic_model_consistent[sl],
-                0.0,
+        if np.any(valid & ~np.isfinite(seismic_model_consistent)):
+            raise ValueError(
+                f"Physics target has non-finite values inside valid_mask for {sample.sample_id}."
             )
-            physics_valid_patch = physics_valid[sl]
-        else:
-            physics_seismic_patch = np.zeros_like(seismic_patch, dtype=np.float32)
-            physics_valid_patch = np.zeros_like(valid_patch, dtype=bool)
+        physics_seismic_patch = np.where(
+            valid_patch, seismic_model_consistent[sl], 0.0
+        )
         sample_domain = str(getattr(sample, "sample_domain", ""))
         if sample_domain == "depth":
             sample_axis = np.asarray(sample.tvdss_model_m, dtype=np.float64)
@@ -529,9 +522,6 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             )[None, :, :],
             "seismic_model_consistent": torch.from_numpy(
                 physics_seismic_patch.astype(np.float32)
-            )[None, :, :],
-            "waveform_valid_mask": torch.from_numpy(
-                physics_valid_patch.astype(np.float32)
             )[None, :, :],
             "sample_axis": torch.from_numpy(sample_axis_patch.astype(np.float64)),
             "lfm": torch.from_numpy(lfm_patch.astype(np.float32))[None, :, :],

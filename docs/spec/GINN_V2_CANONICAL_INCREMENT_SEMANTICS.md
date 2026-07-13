@@ -377,13 +377,26 @@ HDF5 基础 realization 至少保存：
 /targets/target_increment_log_ai
 ```
 
-reader 根据训练采样器选定的 `lfm_variant_id` 将对应数组暴露为 `input_lfm_log_ai`。`target_increment_log_ai` 与 `model_target_log_ai`、`canonical_background_log_ai`、模型采样轴和 `valid_mask_model` 同形。invalid 点保持 NaN。seismic variant 复用父 realization 的三项阻抗数组。
+reader 根据训练采样器选定的 `lfm_variant_id` 将对应数组暴露为 `input_lfm_log_ai`。`target_increment_log_ai` 与 `model_target_log_ai`、`canonical_background_log_ai`、模型采样轴和单一 `valid_mask` 同形。invalid 点保持 NaN。seismic variant 复用父 realization 的三项阻抗数组。
 
 每个父 realization 至少生成两个不同的 `input_lfm_log_ai` variant，共享相同 seismic、canonical background 和 target increment。benchmark 在父 realization 下保存 LFM variant，而不是把同一 patch 按 variant 复制成多行。训练采样器先按现有父 realization/seismic sample 规则选择样本，再从该父 realization 的 LFM variant 中确定性均匀选择一个，避免 LFM variant 数量改变父样本权重。首版不增加 paired consistency loss。
 
 生成器内部的对象级 profile 使用 `geologic_perturbation` 或更具体的地质名称。`seismic_observed - seismic_model_consistent` 使用 `subgrid_forward_error`。这些对象不进入网络增量合同。
 
-### 4.2 版本
+### 4.2 有效区域与正演支持
+
+Synthoseis v4 manifest 通过 `mask_contract=single_valid_mask_v1` 固定公共掩码：
+`masks/valid_mask` 表示完整目标 ROI。合成生成器使用上下文和 halo 保证 ROI 内的
+target、canonical background、increment、input LFM、observed seismic 与
+model-consistent seismic 有限；支持不足时拒绝当前 attempt，而不是改变 ROI。
+
+高分辨率正演支持数组可以作为生成 QC 保存，但不作为训练 mask。GINN v2 的三个
+输入通道仍为 normalized seismic、input LFM 和 `valid_mask`。physics 的固定 halo 与
+central-crop 规则属于后续训练阶段的 patch 合同，本阶段不在生成器中实现。
+patch 外的 seismic/LFM/physics 数值仅作有限的零填充，训练和正演 loss 始终由
+`valid_mask` 决定，不把数值填充当作新的有效区域。
+
+### 4.3 版本
 
 新 benchmark schema 为：
 
@@ -431,7 +444,7 @@ L_supervised = masked_mse(
 )
 ```
 
-最终监督 mask 要求 seismic、input LFM、target increment 和 target logAI 有限，并继续使用 block 的 `min_valid_samples`。
+合成监督直接使用 benchmark 的 `valid_mask`；reader 已在该区域完成 seismic、input LFM、target increment 和 target logAI 的有限性断言，block 只使用 `min_valid_samples` 判断 patch 是否可训练。
 
 ### 5.3 真实井监督
 
@@ -535,7 +548,7 @@ predicted_log_ai = external_lfm_log_ai + predicted_increment_log_ai
 生产推理继续满足：
 
 ```text
-(prediction_support_count > 0) == valid_mask_model
+(prediction_support_count > 0) == valid_mask
 ```
 
 valid 点的增量和最终阻抗均有限；invalid 点保持 NaN。xline 步长 4 只由显式坐标轴决定，不参与数组步长猜测。
@@ -548,7 +561,7 @@ predicted_log_ai
 input_lfm_log_ai
 prediction_support_count
 max_context_valid_fraction
-valid_mask_model
+valid_mask
 ilines
 xlines
 samples

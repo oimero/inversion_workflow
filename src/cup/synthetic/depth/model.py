@@ -46,8 +46,6 @@ class DepthGeneratedSection:
     residual_vs_lfm_ideal: np.ndarray
     residual_vs_lfm_controlled_degraded: np.ndarray
     valid_mask_model: np.ndarray
-    observed_valid_mask: np.ndarray
-    physics_valid_mask: np.ndarray
     categorical: dict[str, np.ndarray]
     object_catalog: list[dict[str, Any]]
     object_lateral_coefficients: list[dict[str, Any]]

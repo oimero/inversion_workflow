@@ -21,7 +21,6 @@ class SeismicVariantResult:
     seismic_observed: np.ndarray
     positive_gain: np.ndarray
     additive_noise: np.ndarray
-    observed_valid_mask: np.ndarray
     parameters: dict[str, Any]
     qc: dict[str, Any]
 
@@ -201,7 +200,9 @@ def _build_result(
     operator_source: str = "observed_base",
 ) -> SeismicVariantResult:
     observed = gain * seismic_convolved + noise
-    valid = np.asarray(mask, dtype=bool) & np.isfinite(observed)
+    valid = np.asarray(mask, dtype=bool)
+    if np.any(valid & ~np.isfinite(observed)):
+        raise ValueError("invalid_seismic_variant:roi_support_not_finite")
     if not np.any(valid):
         raise ValueError("invalid_seismic_variant:no_valid_samples")
     gain_valid = gain[valid]
@@ -226,7 +227,6 @@ def _build_result(
         seismic_observed=observed,
         positive_gain=gain,
         additive_noise=noise,
-        observed_valid_mask=valid,
         parameters=dict(extra_qc),
         qc=qc,
     )
@@ -235,7 +235,7 @@ def _build_result(
 def generate_seismic_variants(
     *,
     seismic_input: np.ndarray,
-    forward_valid_mask: np.ndarray,
+    valid_mask: np.ndarray,
     lateral_m: np.ndarray,
     config: Mapping[str, Any],
     output_dt_s: float,
@@ -248,7 +248,11 @@ def generate_seismic_variants(
     if not bool(config.get("enabled", True)):
         return []
     seismic = np.asarray(seismic_input, dtype=np.float64)
-    mask = np.asarray(forward_valid_mask, dtype=bool) & np.isfinite(seismic)
+    mask = np.asarray(valid_mask, dtype=bool)
+    if mask.shape != seismic.shape:
+        raise ValueError("invalid_seismic_variant:valid_mask_shape")
+    if np.any(mask & ~np.isfinite(seismic)):
+        raise ValueError("invalid_seismic_variant:base_support_not_finite")
     shape = seismic.shape
     ones = np.ones(shape, dtype=np.float64)
     zeros = np.zeros(shape, dtype=np.float64)

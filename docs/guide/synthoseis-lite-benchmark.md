@@ -81,12 +81,17 @@ synthoseis_lite:
   benchmark_schema: synthoseis_lite_v4
   seismic_input:
     policy: observed_highres_forward
+  seismic_forward:
+    backend: auto        # auto | numpy | torch_cuda
+    dtype: float64
 ```
 
 v4 两个域都把 `seismic/seismic_observed` 作为网络输入；它位于 model axis，来自该
 域的高分辨率正演和抗混叠路径。`seismic/seismic_model_consistent` 只用于 physics
-或 closure，不能由 reader 作为输入回退。时间域的 `forward_qc.highres_forward`
-必须启用且设为 required；深度域的等价高分辨率正演由 depth 分支固定执行。
+或 closure，不能由 reader 作为输入回退。两个域的公共有效区域是
+`masks/valid_mask`；高分辨率 forward support 只作为生成 QC。时间域的
+`forward_qc.highres_forward` 必须启用且设为 required；深度域的等价高分辨率正演
+由 depth 分支固定执行，`seismic_forward.backend=auto` 会自动选择 CUDA 或 NumPy。
 
 ---
 

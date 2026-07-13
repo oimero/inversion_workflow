@@ -13,10 +13,40 @@ SEISMIC_INPUT_POLICY = "observed_highres_forward"
 SEISMIC_INPUT_SAMPLE_AXIS = "model"
 SEISMIC_INPUT_VARIANT_FAMILY = "observed"
 SEISMIC_MODEL_CONSISTENT_ROLE = "physics_and_closure"
+MASK_CONTRACT_ID = "single_valid_mask_v1"
+MASK_CONTRACT_SEMANTICS = "roi_exact_full_support"
+MASK_CONTRACT_DATASET = "masks/valid_mask"
 SEISMIC_INPUT_OPERATORS = {
     "time": "time_forward_highres_wavelet_antialias",
     "depth": "depth_ai_vp_highres_forward_antialias",
 }
+
+
+def build_mask_contract() -> dict[str, str]:
+    """Build the v4 single-mask contract shared by both domain readers."""
+    return {
+        "id": MASK_CONTRACT_ID,
+        "semantics": MASK_CONTRACT_SEMANTICS,
+        "dataset": MASK_CONTRACT_DATASET,
+    }
+
+
+def validate_mask_contract(value: Mapping[str, Any]) -> dict[str, str]:
+    """Validate the strict v4 mask contract and reject older v4 artifacts."""
+    if not isinstance(value, Mapping):
+        raise ValueError("mask_contract must be a mapping.")
+    expected = build_mask_contract()
+    missing = sorted(set(expected) - set(value))
+    if missing:
+        raise ValueError(
+            "Synthoseis v4 requires mask_contract fields: " + ", ".join(missing)
+        )
+    for key, expected_value in expected.items():
+        if str(value.get(key)) != expected_value:
+            raise ValueError(
+                f"mask_contract.{key} must be {expected_value!r}."
+            )
+    return {key: str(value[key]) for key in expected}
 
 
 def build_seismic_input_contract(
@@ -114,11 +144,16 @@ def validate_seismic_input_contract(
 
 
 __all__ = [
+    "MASK_CONTRACT_DATASET",
+    "MASK_CONTRACT_ID",
+    "MASK_CONTRACT_SEMANTICS",
     "SEISMIC_INPUT_POLICY",
     "SEISMIC_INPUT_SAMPLE_AXIS",
     "SEISMIC_INPUT_VARIANT_FAMILY",
     "SEISMIC_MODEL_CONSISTENT_ROLE",
+    "build_mask_contract",
     "SEISMIC_INPUT_OPERATORS",
     "build_seismic_input_contract",
+    "validate_mask_contract",
     "validate_seismic_input_contract",
 ]

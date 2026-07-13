@@ -70,19 +70,23 @@ class RealFieldPatchDataset(Dataset[dict[str, Any]]):
         seismic = self.model_volume.seismic[inline, lateral, vertical]
         target = self.physics_volume.seismic[inline, lateral, vertical]
         lfm = self.model_volume.lfm[inline, lateral, vertical]
-        forward_lfm = np.asarray(lfm, dtype=np.float32)
         valid = self.model_volume.valid_mask[inline, lateral, vertical]
-        input_valid = np.isfinite(seismic) & np.isfinite(lfm)
-        physics_valid = input_valid & np.isfinite(target)
+        forward_lfm = np.where(
+            valid & np.isfinite(lfm),
+            lfm,
+            0.0,
+        ).astype(np.float32)
+        input_valid = valid
+        if np.any(valid & (~np.isfinite(seismic) | ~np.isfinite(lfm) | ~np.isfinite(target))):
+            raise ValueError("Real-field patch has non-finite values inside valid_mask.")
         shape = (self.patch_spec.lateral_samples, self.patch_spec.twt_samples)
         padding = ((0, shape[0] - valid.shape[0]), (0, shape[1] - valid.shape[1]))
         seismic = np.pad(seismic, padding, constant_values=0.0)
         target = np.pad(target, padding, constant_values=0.0)
         lfm = np.pad(lfm, padding, constant_values=0.0)
-        forward_lfm = np.pad(forward_lfm, padding, constant_values=np.nan)
+        forward_lfm = np.pad(forward_lfm, padding, constant_values=0.0)
         valid = np.pad(valid, padding, constant_values=False)
         input_valid = np.pad(input_valid, padding, constant_values=False)
-        physics_valid = np.pad(physics_valid, padding, constant_values=False)
         seismic_n = np.where(input_valid, (seismic - float(self.normalization["seismic"]["mean"])) / float(self.normalization["seismic"]["std"]), 0.0)
         lfm_n = np.where(input_valid, (lfm - float(self.normalization["lfm"]["mean"])) / float(self.normalization["lfm"]["std"]), 0.0)
         inputs = np.stack([seismic_n, lfm_n, valid.astype(np.float32)], axis=0).astype(np.float32)
@@ -95,8 +99,7 @@ class RealFieldPatchDataset(Dataset[dict[str, Any]]):
             "lfm": torch.from_numpy(np.where(valid, lfm, 0.0).astype(np.float32))[None],
             "forward_lfm": torch.from_numpy(forward_lfm)[None],
             "valid_mask": torch.from_numpy(valid.astype(np.float32))[None],
-            "waveform_valid_mask": torch.from_numpy(physics_valid.astype(np.float32))[None],
-            "seismic_model_consistent": torch.from_numpy(np.where(physics_valid, target, 0.0).astype(np.float32))[None],
+            "seismic_model_consistent": torch.from_numpy(np.where(valid, target, 0.0).astype(np.float32))[None],
             "sample_axis": torch.from_numpy(np.asarray(axis, dtype=np.float64)),
             "patch_id": str(row["patch_id"]),
         }
@@ -631,7 +634,7 @@ def _block_loss(
     if kind != "physics" or prepared.wavelet is None:
         raise ValueError(f"Unsupported prepared loss block: {kind}")
     forward_lfm = batch["forward_lfm"].to(device)
-    physics_valid = batch["waveform_valid_mask"].to(device)
+    physics_valid = batch["valid_mask"].to(device)
     pred_log_ai = forward_lfm + prediction
     wavelet_time, wavelet_amp, relation = prepared.wavelet
     if prepared.sample_axis_contract is None:

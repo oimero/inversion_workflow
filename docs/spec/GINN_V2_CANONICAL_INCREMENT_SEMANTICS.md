@@ -70,11 +70,12 @@ crop original segment
 
 这里的 `15 Hz` 或 `1/400 cycles/m` 是单程六阶 Butterworth 的设计截止点：单程幅度为 `1/sqrt(2)`（约 −3.0103 dB），前后向最终幅度为 `1/2`（约 −6.0206 dB）。不做最终 −3 dB 截止补偿。
 
-滤波输入和持久化采样轴统一使用 float64。`increment_contract.sample_interval` 是权威采样间隔，规则轴由它重建并验证：
+滤波输入和持久化采样轴统一使用 float64。入口数值轴转换为 float64；NaN、Inf、非递增、重复和非等间隔轴失败。`increment_contract.sample_interval` 是权威采样间隔，规则轴由它重建并验证：
 
 ```text
 expected_axis = sample_axis[0] + arange(n_sample) * sample_interval
-allclose(sample_axis, expected_axis, rtol=0, atol=1e-9 axis units)
+allclose(sample_axis, expected_axis, rtol=sample_interval_relative_tolerance,
+        atol=sample_interval_absolute_tolerance)
 ```
 
 设计阶数 6 产生 3 个 SOS section。`21` 是本项目保留的 structural minimum，不是 `padtype=None` 对 SciPy 的必要 padlen。实际最小连续有限段长度为：
@@ -97,13 +98,15 @@ ginn_v2:
   experiment_id: depth_tcn_canonical_increment
 
   increment_contract:
+    contract_version: canonical_increment_v1
     semantics: canonical_complement_log_ai
     sample_domain: depth
     sample_unit: m
     sample_interval: 5.0
     sample_axis_uniform: true
     sample_axis_dtype: float64
-    sample_axis_absolute_tolerance: 1.0e-9
+    sample_interval_relative_tolerance: 1.0e-6
+    sample_interval_absolute_tolerance: 1.0e-9
     depth_basis: tvdss
     value_domain: log(AI)
     log_base: natural
@@ -130,13 +133,15 @@ ginn_v2:
 
 ```yaml
   increment_contract:
+    contract_version: canonical_increment_v1
     semantics: canonical_complement_log_ai
     sample_domain: time
     sample_unit: s
     sample_interval: 0.002
     sample_axis_uniform: true
     sample_axis_dtype: float64
-    sample_axis_absolute_tolerance: 1.0e-9
+    sample_interval_relative_tolerance: 1.0e-6
+    sample_interval_absolute_tolerance: 1.0e-9
     value_domain: log(AI)
     log_base: natural
     ai_unit_convention: m/s*g/cm3
@@ -182,7 +187,8 @@ sample_unit
 sample_interval
 sample_axis_uniform
 sample_axis_dtype = float64
-sample_axis_absolute_tolerance
+sample_interval_relative_tolerance
+sample_interval_absolute_tolerance
 depth_basis
 value_domain = log(AI)
 log_base = natural
@@ -228,13 +234,15 @@ ginn_v2:
   device: auto
 
   increment_contract:
+    contract_version: canonical_increment_v1
     semantics: canonical_complement_log_ai
     sample_domain: depth
     sample_unit: m
     sample_interval: 5.0
     sample_axis_uniform: true
     sample_axis_dtype: float64
-    sample_axis_absolute_tolerance: 1.0e-9
+    sample_interval_relative_tolerance: 1.0e-6
+    sample_interval_absolute_tolerance: 1.0e-9
     depth_basis: tvdss
     value_domain: log(AI)
     log_base: natural

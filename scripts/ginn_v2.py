@@ -18,7 +18,7 @@ src_text = str(SRC_DIR)
 sys.path = [path for path in sys.path if path != src_text]
 sys.path.insert(0, src_text)
 
-from cup.synthetic.dataset import SynthoseisBenchmark
+from cup.synthetic.benchmark import SynthoseisBenchmark
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
@@ -57,9 +57,7 @@ def parse_args() -> argparse.Namespace:
     predict.add_argument("--eval-patch-index", type=Path, default=None)
     predict.add_argument("--sample-kind", action="append", choices=(
         "base",
-        "frequency_probe",
         "seismic_variant",
-        "frequency_probe_seismic_variant",
     ))
     predict.add_argument("--split", default="validation", choices=("train", "validation", "test", "benchmark", "all"))
     predict.add_argument("--batch-size", type=int, default=8)

@@ -10,8 +10,8 @@ import numpy as np
 
 from cup.config.sources import resolve_source_run
 from cup.config.workflow import WorkflowConfig
-from cup.synthetic.calibration import SCHEMA_VERSION as CALIBRATION_SCHEMA
-from cup.synthetic.contracts import (
+from cup.synthetic.core.calibration import SCHEMA_VERSION as CALIBRATION_SCHEMA
+from cup.synthetic.schemas import (
     BENCHMARK_SCHEMA_VERSION,
     FORWARD_MODEL_INPUTS_SCHEMA_VERSION,
     ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION,
@@ -108,8 +108,12 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     allowed_root = {
         "sample_domain", "benchmark_schema", "global_seed", "source_runs", "sampling", "geometry", "sections",
         "calibration", "impedance_attribute_generator", "generation", "splits",
-        "lfm", "seismic_mismatch", "canonical", "probe_selection", "figures",
+        "lfm", "seismic_mismatch", "canonical", "figures",
     }
+    if "probe_selection" in root:
+        raise ValueError(
+            "synthoseis_lite.probe_selection is not part of the v4 canonical benchmark."
+        )
     _reject_unknown(root, allowed_root, path="synthoseis_lite")
     if str(root.get("sample_domain") or "").casefold() != "depth" or str(root.get("benchmark_schema") or "") != SCHEMA_VERSION:
         raise ValueError(
@@ -307,7 +311,7 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
                     "blend": blend,
                 })
 
-    for disabled_name in ("canonical", "probe_selection"):
+    for disabled_name in ("canonical",):
         disabled = _mapping(root.get(disabled_name), path=f"synthoseis_lite.{disabled_name}")
         if disabled != {"enabled": False}:
             raise ValueError(f"Depth v4 requires {disabled_name}.enabled=false with no extra fields.")

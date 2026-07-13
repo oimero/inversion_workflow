@@ -15,16 +15,13 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from cup.synthetic.dataset import SynthoseisBenchmark
-from cup.synthetic.metrics import regression_metrics
+from cup.synthetic.benchmark import SynthoseisBenchmark
+from cup.synthetic.reporting.metrics import regression_metrics
 from cup.utils.io import write_json
 from ginn_v2.checkpoint import load_checkpoint
 from ginn_v2.contracts import PATCH_SMOKE_REPORT_SCHEMA_VERSION
 from ginn_v2.data import PatchDataset, _aligned_arrays
 from ginn_v2.runtime import resolve_device
-
-
-PROBE_SAMPLE_KINDS = {"frequency_probe", "frequency_probe_seismic_variant"}
 
 
 def predict_patches(
@@ -213,28 +210,6 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     oracle_frame = pd.DataFrame.from_records(oracle_rows)
     oracle_path = output_dir / "oracle_patch_metrics.csv"
     oracle_frame.to_csv(oracle_path, index=False)
-    probe_rows = _paired_probe_rows(metrics_frame, pred, target, mask, prediction_dir)
-    probe_frame = pd.DataFrame.from_records(probe_rows)
-    probe_path = output_dir / "model_probe_metrics.csv"
-    probe_frame.to_csv(probe_path, index=False)
-    probe_frequency_path = output_dir / "model_probe_metrics_by_frequency.csv"
-    _grouped_probe_metrics(probe_frame, ["probe_frequency_hz"]).to_csv(probe_frequency_path, index=False)
-    probe_frequency_amplitude_path = output_dir / "model_probe_metrics_by_frequency_amplitude.csv"
-    _grouped_probe_metrics(
-        probe_frame,
-        ["probe_frequency_hz", "probe_amplitude_multiplier"],
-    ).to_csv(probe_frequency_amplitude_path, index=False)
-    zero_x_path = output_dir / "model_zero_x_false_prediction_error.csv"
-    zero_x_frame = _zero_x_false_prediction_error(metrics_frame, prediction_dir)
-    zero_x_frame.to_csv(zero_x_path, index=False)
-    zero_x_energy_path = output_dir / "model_zero_x_false_frequency_energy.csv"
-    zero_x_energy_frame = _zero_x_false_frequency_energy(metrics_frame, pred, target, mask, prediction_dir)
-    zero_x_energy_frame.to_csv(zero_x_energy_path, index=False)
-    zero_x_energy_by_frequency_path = output_dir / "model_zero_x_false_frequency_energy_by_frequency.csv"
-    _grouped_false_energy(zero_x_energy_frame, ["probe_frequency_hz"]).to_csv(
-        zero_x_energy_by_frequency_path,
-        index=False,
-    )
     model_aggregate = _aggregate(metrics_frame)
     lfm_aggregate = _aggregate(lfm_frame)
     lfm_ideal_aggregate = _aggregate(lfm_ideal_frame)
@@ -250,8 +225,6 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
         "lfm_ideal_aggregate": lfm_ideal_aggregate,
         "oracle_aggregate": oracle_aggregate,
         "rmse_improvement_pct_vs_lfm": _rmse_improvement_pct(model_aggregate, lfm_aggregate),
-        "probe_aggregate": _aggregate(probe_frame),
-        "probe_amplitude_phase_aggregate": _aggregate_amplitude_phase(probe_frame),
         "geometry_aggregate": _aggregate_geometry(geometry_detail_frame),
         "geometry_holdout_aggregate": _aggregate(holdout_frame),
         "pinchout_holdout_n_patches": int(len(holdout_frame)),
@@ -262,12 +235,6 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
             stitched["center_crop"][
                 stitched["center_crop"]["series_id"].astype(str).ne("lfm_controlled_degraded")
             ]
-        ),
-        "zero_x_false_prediction_aggregate": _aggregate(zero_x_frame),
-        "unsupported_zero_x_false_prediction_aggregate": _aggregate(_filter_unsupported_zero_x(zero_x_frame)),
-        "zero_x_false_energy_aggregate": _aggregate_false_energy(zero_x_energy_frame),
-        "unsupported_false_energy_aggregate": _aggregate_false_energy(
-            _filter_unsupported_zero_x(zero_x_energy_frame)
         ),
     }
     report_path = output_dir / "model_report_card.json"
@@ -287,12 +254,6 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
         "lfm_patch_metrics": lfm_path,
         "lfm_ideal_patch_metrics": lfm_ideal_path,
         "oracle_patch_metrics": oracle_path,
-        "model_probe_metrics": probe_path,
-        "model_probe_metrics_by_frequency": probe_frequency_path,
-        "model_probe_metrics_by_frequency_amplitude": probe_frequency_amplitude_path,
-        "model_zero_x_false_prediction_error": zero_x_path,
-        "model_zero_x_false_frequency_energy": zero_x_energy_path,
-        "model_zero_x_false_frequency_energy_by_frequency": zero_x_energy_by_frequency_path,
         "model_report_card": report_path,
     }
 

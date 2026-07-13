@@ -11,7 +11,12 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from cup.canonical_increment import CanonicalIncrementContract, validate_sample_axis
+from cup.impedance import (
+    CanonicalIncrementContract,
+    validate_contract_compatibility,
+    validate_lfm_producer_contract,
+    validate_sample_axis,
+)
 from cup.synthetic.depth.config import SCHEMA_VERSION
 from cup.synthetic.core import (
     validate_dataset_metadata,
@@ -83,6 +88,10 @@ class DepthV2Benchmark:
         )
         if self.increment_contract.sample_domain != "depth":
             raise ValueError("Depth benchmark increment_contract must use sample_domain=depth.")
+        self.lfm_contract = validate_lfm_producer_contract(
+            self.manifest.get("lfm_contract") or {}
+        )
+        validate_contract_compatibility(self.increment_contract, self.lfm_contract)
         validate_training_manifest(self.manifest, sample_domain="depth")
         require_contract_fingerprint(self.manifest, label=f"benchmark {self.run_dir}")
         self.index = pd.read_csv(self.index_path, dtype=str, keep_default_na=False)

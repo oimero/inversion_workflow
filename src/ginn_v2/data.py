@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from cup.synthetic.dataset import SynthoseisBenchmark
+from cup.synthetic.benchmark import SynthoseisBenchmark
 
 
 SPLIT_VALUES = {"train", "validation", "test", "benchmark"}
@@ -29,9 +29,7 @@ class PatchSpec:
 def default_eval_kinds() -> set[str]:
     return {
         "base",
-        "frequency_probe",
         "seismic_variant",
-        "frequency_probe_seismic_variant",
     }
 
 
@@ -167,11 +165,6 @@ def build_patch_index(
     max_patches: int | None = None,
     min_valid_samples: int = 1,
 ) -> pd.DataFrame:
-    probe_kinds = {"frequency_probe", "frequency_probe_seismic_variant"}
-    if max_patches is not None and sample_kinds.intersection(probe_kinds):
-        raise ValueError(
-            "max_patches is smoke-only and cannot be used when probe sample kinds are indexed."
-        )
     rows: list[dict[str, Any]] = []
     sample_ids = benchmark.sample_ids(kinds=sample_kinds, status="ok")
     held_out_geometry_family = str(
@@ -237,13 +230,6 @@ def build_patch_index(
                         "valid_fraction": valid_fraction,
                         "valid_samples": valid_count,
                         "paired_zero_sample_id": row.get("paired_zero_sample_id", ""),
-                        "probe_group_id": row.get("probe_group_id", ""),
-                        "probe_frequency_hz": row.get("probe_frequency_hz", ""),
-                        "probe_phase": row.get("probe_phase", ""),
-                        "probe_amplitude_multiplier": row.get(
-                            "probe_amplitude_multiplier", ""
-                        ),
-                        "probe_lateral_shape": row.get("probe_lateral_shape", ""),
                         "seismic_variant_id": row.get("seismic_variant_id", ""),
                         "seismic_mismatch_family": row.get(
                             "seismic_mismatch_family", ""

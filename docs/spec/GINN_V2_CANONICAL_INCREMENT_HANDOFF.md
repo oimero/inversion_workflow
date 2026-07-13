@@ -2,12 +2,13 @@
 
 ## 1. 文档目的
 
-本文是两份设计规格之间的实施交接单：
+本文是 canonical increment、Synthoseis-lite 阶段 2.5 和微纹理设计之间的实施交接单：
 
 - [GINN v2 Canonical Increment 语义重构规格](GINN_V2_CANONICAL_INCREMENT_SEMANTICS.md)；
 - [Synthoseis-lite 微纹理生成方法论规格](SYNTHOSEIS_MICROTEXTURE_GENERATION_DESIGN.md)。
+- [Synthoseis-lite 阶段 2.5 边界重构规格](SYNTHOSEIS_LITE_STAGE_2_5_REFACTOR_AND_REVIEW_FIXES.md)。
 
-它记录已经锁定的公共语义、实现顺序、每个阶段的完成条件和当前状态，供后续开启 goal 模式后逐项推进。阶段 1/2 已修改共享算子、Synthoseis-lite v4 生产/读取链路和对应测试；历史产物目录保持不变。
+它记录已经锁定的公共语义、实现顺序、每个阶段的完成条件和当前状态，供后续开启 goal 模式后逐项推进。阶段 1/2 的代码已落地，阶段 2.5 负责在进入微纹理前完成公共合同、probe 关闭和包边界收口；历史产物目录保持不变。
 
 ## 2. 当前结论
 
@@ -55,7 +56,7 @@ predicted_log_ai            = external_lfm_log_ai + predicted_increment_log_ai
 | --- | --- | --- | --- |
 | A | `three_parameter` | `none` | 宏观基线与 false-texture 对照 |
 | B | `three_parameter` | `thin_bed_cluster` | 参数化交替薄层先验 |
-| C | `three_parameter` | `canonical_well_texture` | 训练井 canonical increment 去宏观纹理先验 |
+| C | `three_parameter` | `canonical_well_patch` | 训练井 canonical increment 去宏观纹理先验 |
 
 HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 seismic mismatch 使用 common-random 规则。任一模式失败，整个 paired group 拒绝；只有三种模式都成功时才进入 A/B/C benchmark。
 
@@ -82,7 +83,7 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - canonical/deployment closure、R0/R1 新字段和反事实报告；
 - 旧生产实现的清理提交。
 
-这些事项是后续 goal 的工作内容，不在本 HANDOFF 中假定已经完成。阶段 1 和阶段 2 已落地在共享 `cup.canonical_increment`、Synthoseis-lite v4 writer/reader、LFM variant writer 和生成 manifest 中。
+这些事项是后续 goal 的工作内容，不在本 HANDOFF 中假定已经完成。阶段 1 和阶段 2 已落地在 `cup.impedance`、Synthoseis-lite v4 writer/reader、LFM variant writer 和生成 manifest 中；阶段 2.5 的稳定性门禁完成后才允许开始阶段 3。
 
 ## 4. 推荐实施顺序与完成条件
 
@@ -96,7 +97,7 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - [x] 按权威 `sample_interval` 检查 float64 规则轴；
 - [x] 输出 `canonical_background_log_ai` 与 `target_increment_log_ai`。
 
-完成条件：时间域、深度域、NaN 间隙、短段和 cutoff 响应 fixture 全部通过；`target == background + increment` 在有限点成立。状态：已完成。
+完成条件：时间域、深度域、NaN 间隙、短段和 cutoff 响应 fixture 全部通过；`target == background + increment` 在有限点成立。状态：代码已落地，并通过阶段 2.5 本地合同验收。
 
 ### 阶段 2：Synthoseis-lite v4 生产端
 
@@ -106,14 +107,31 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - [x] 为微纹理组件和对象目录预留 v4 字段；
 - [x] 保持历史 benchmark 目录不变。
 
-完成条件：v4 fixture 可独立复算 composite、canonical background、target increment 和 LFM variant；patch 标签等于完整道标签的直接切片。状态：fixture 已完成，完整工区重生成留待后续运行。
+完成条件：v4 fixture 可独立复算 composite、canonical background、target increment 和 LFM variant；patch 标签等于完整道标签的直接切片。状态：writer/reader 已切换新合同并通过本地 fixture，完整工区需要按阶段 2.5 合同重新生成。
+
+### 阶段 2.5：边界重构与检阅建议修复
+
+- [x] `cup.canonical_increment` 收口到 `cup.impedance`，增加 contract version 与双轴容差；
+- [x] LFM producer contract 和 increment/LFM compatibility validator 落地；
+- [x] v4 删除 probe 生成、writer、reader 和正式 baseline report 分支，并对旧 probe row 明确失败；
+- [x] synthetic 按 `core/time/depth/readers/reporting` 实际依赖拆分；
+- [x] 深度生成记录抽到 `depth/model.py`，保留其余数值 seam 的渐进拆分边界；
+- [x] 删除提前落地的 microtexture emitter；
+- [x] 更新本地 ignored fixture，跑完 canonical、writer/reader、LFM 合同和 probe 失败测试；
+- [ ] 用新合同重新生成需要消费的 v4 benchmark，不覆盖冻结目录。
+
+完成条件：新包 import/compile smoke 通过，旧 root import 和 probe 正式路径搜索为空（保留明确失败测试与 observability 旁路），reader 拒绝缺少新合同的旧 v4。状态：实现与本地验证完成，完整工区重生成仍待执行。
+
+说明：`scripts/ginn_v2.py summarize` 仍可读取冻结历史 report-card 中的旧 probe 字段，
+但 v4 writer、reader、baseline evaluator 和 GINN v2 新 report 不再生成这些字段；该历史
+读取不参与新训练或 v4 benchmark 消费。
 
 ### 阶段 3：微纹理 bank 与领域无关 emitter
 
 - [ ] 固定 `MicrotextureEmission` 接口、物理单位、seed 和 metadata；
 - [ ] 在最终规则时间轴/TVDSS 轴上建立训练井 canonical texture bank；
 - [ ] 检查训练井、留出井和 bank coverage 隔离；
-- [ ] 实现 A 的 `none`、B 的 `thin_bed_cluster`、C 的 `canonical_well_texture`；
+- [ ] 实现 A 的 `none`、B 的 `thin_bed_cluster`、C 的 `canonical_well_patch`；
 - [ ] 对对象边界、厚度、振幅、端点跳变、clipping 和 reversal 做 QC。
 
 完成条件：固定 seed 完全确定；对象外扰动为零；所有厚度和长度以秒/米表达；A/B/C 的 emitter 输出均可独立复算。
@@ -123,7 +141,7 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - [ ] 一次生成 `macro_parent`，再实例化三个 mode；
 - [ ] 实现组级全成功/全拒绝和原因记录；
 - [ ] 保持三组 benchmark 的 parent 集合、split、LFM、mismatch 和预算一致；
-- [ ] 生成 `shared_none_test`、`shared_thin_bed_cluster_test`、`shared_canonical_well_texture_test`。
+- [ ] 生成 `shared_none_test`、`shared_thin_bed_cluster_test`、`shared_canonical_well_patch_test`。
 
 完成条件：三组 benchmark 的 `macro_parent_id` 集合一致；任一 mode 失败不会留下不完整 paired group；跨模式测试矩阵可运行。
 
@@ -230,13 +248,13 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 
 ## 7. 阶段 1/2 验证证据
 
-已运行：
+阶段 1/2 的历史验证（迁移前路径）已运行：
 
 ```text
 PYTHONPATH=src python -m pytest -q -p no:cacheprovider tests/test_canonical_increment.py tests/test_synthoseis_v4_canonical.py
 ```
 
-结果：`11 passed`。
+结果：`11 passed`。该结果不替代阶段 2.5 迁移后的新路径验证。
 
 覆盖内容：
 
@@ -257,6 +275,18 @@ PYTHONPATH=src python -m pytest -q -p no:cacheprovider tests/test_canonical_incr
 - `python -m compileall -q src/cup` 通过；
 - 当前深度 v4 组合配置可由 `load_composed_config` 与 `parse_depth_v2_config` 解析；
 - 读取 `experiments/synthoseis_lite/results/20260706/generate_field_conditioned` 时明确拒绝冻结的 v3 benchmark。
+
+阶段 2.5 实施后的本地验证命令和结果：
+
+```text
+$env:PYTHONPATH = "src"
+python -m compileall -q src/cup src/ginn_v2
+python -m pytest -q -p no:cacheprovider tests/test_canonical_increment.py tests/test_synthoseis_v4_canonical.py tests/test_synthoseis_stage_2_5.py
+```
+
+结果：`22 passed in 2.92s`。`compileall` 与 `cup.impedance`、synthetic time/depth
+reader import smoke 同样通过。测试文件继续被 `.gitignore` 忽略；本节只记录本机结果，
+不声称测试已提交。完整 v4 工区重生成尚未运行。
 
 ## 8. 相关文档
 

@@ -11,7 +11,7 @@ import pandas as pd
 from cup.petrel.load import import_interpretation_petrel, import_well_tops_petrel
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
-from cup.synthetic.figures import write_calibration_figures
+from cup.synthetic.reporting.figures import write_calibration_figures
 from cup.synthetic.depth.config import CALIBRATION_SCHEMA, GENERATOR_FAMILY
 from cup.synthetic.depth.object_core_adapter import (
     calibrate_depth_object_core,

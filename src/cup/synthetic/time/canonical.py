@@ -9,9 +9,9 @@ import numpy as np
 
 from cup.physics.numpy_backend import forward_time, reflectivity_from_log_ai
 from cup.seismic.wavelet import wavelet_spectrum_features
-from cup.synthetic.calibration import ImpedanceCalibration
-from cup.synthetic.forward import antialias_taps, categorical_model_grids, downsample_continuous
-from cup.synthetic.generation import GeneratedSection, GenerationScenario
+from cup.synthetic.core.calibration import ImpedanceCalibration
+from cup.synthetic.time.forward import antialias_taps, categorical_model_grids, downsample_continuous
+from cup.synthetic.core.generation import GeneratedSection, GenerationScenario
 
 
 CANONICAL_FAMILIES = (
@@ -20,7 +20,6 @@ CANONICAL_FAMILIES = (
     "pinchout",
     "dipping_layers",
     "lateral_impedance_change",
-    "frequency_probe",
 )
 
 
@@ -112,15 +111,6 @@ def canonical_scenarios(config: Mapping[str, Any]) -> list[CanonicalScenario]:
                 parameter_unit="ratio",
             )
         )
-    scenarios.append(
-        CanonicalScenario(
-            scenario_id="frequency_probe__smooth_background",
-            family="frequency_probe",
-            parameter_name="background_type",
-            parameter_value=0.0,
-            parameter_unit="smooth_background",
-        )
-    )
     return scenarios
 
 
@@ -157,10 +147,6 @@ def _target_geometry(
         thickness = np.full(x.shape, 0.25 * peak_period_s)
         top = np.full(x.shape, center_twt_s - 0.125 * peak_period_s)
         contrast_multiplier = np.where(x < 0.5, 1.0, scenario.parameter_value)
-    elif scenario.family == "frequency_probe":
-        thickness = np.zeros(x.shape)
-        top = np.full(x.shape, center_twt_s)
-        contrast_multiplier = np.zeros(x.shape)
     else:
         raise ValueError(f"Unsupported canonical family: {scenario.family}")
     return top, thickness, contrast_multiplier
@@ -359,10 +345,7 @@ def generate_canonical_section(
         thickness_log_sigma=0.0,
         variant_id="",
     )
-    object_catalog = (
-        []
-        if scenario.family == "frequency_probe"
-        else [{
+    object_catalog = [{
             "realization_id": scenario.scenario_id,
             "scenario_id": scenario.scenario_id,
             "zone_id": "canonical",
@@ -386,7 +369,6 @@ def generate_canonical_section(
             "contrast_multiplier_start": float(contrast_multiplier[0]),
             "contrast_multiplier_end": float(contrast_multiplier[-1]),
         }]
-    )
     return GeneratedSection(
         realization_id=scenario.scenario_id,
         scenario=generation_scenario,

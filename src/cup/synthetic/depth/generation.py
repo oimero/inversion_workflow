@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 from pathlib import Path
 import time
@@ -14,7 +13,12 @@ import pandas as pd
 import scipy
 from scipy.signal import firwin, hilbert
 
-from cup.canonical_increment import canonical_lowpass, decompose_log_ai, generation_contract
+from cup.impedance import (
+    build_lfm_producer_contract,
+    canonical_lowpass,
+    decompose_log_ai,
+    generation_contract,
+)
 from cup.petrel.load import import_interpretation_petrel
 from cup.physics.numpy_backend import (
     forward_depth,
@@ -23,7 +27,7 @@ from cup.physics.numpy_backend import (
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.wavelet import load_wavelet_csv
-from cup.synthetic.calibration import ImpedanceCalibration
+from cup.synthetic.core.calibration import ImpedanceCalibration
 from cup.synthetic.core import build_attempt_plan as build_core_attempt_plan
 from cup.synthetic.core import (
     geometry_feasibility_rows,
@@ -39,11 +43,12 @@ from cup.synthetic.core.progress import (
     configure_generation_logger,
     run_attempt_preflight,
 )
-from cup.synthetic.figures import write_generation_figures
-from cup.synthetic.generation import GenerationRejected, GenerationScenario
-from cup.synthetic.generation_pipeline import generation_scenarios
-from cup.synthetic.random import named_rng
+from cup.synthetic.reporting.figures import write_generation_figures
+from cup.synthetic.core.generation import GenerationRejected, GenerationScenario
+from cup.synthetic.core.generation import generation_scenarios
+from cup.synthetic.core.random import named_rng
 from cup.synthetic.depth.config import CALIBRATION_SCHEMA, GENERATOR_FAMILY, SCHEMA_VERSION
+from cup.synthetic.depth.model import DepthGeneratedSection, DepthSectionGeometry
 from cup.synthetic.depth.object_core_adapter import (
     generate_depth_object_core_section,
     load_depth_calibration_for_object_core,
@@ -56,45 +61,6 @@ from cup.utils.io import (
     resolve_relative_path,
     write_json,
 )
-
-
-@dataclass(frozen=True)
-class DepthSectionGeometry:
-    section_id: str
-    lateral_m: np.ndarray
-    inline_float: np.ndarray
-    xline_float: np.ndarray
-    x_m: np.ndarray
-    y_m: np.ndarray
-    horizon_tvdss_m: np.ndarray
-    qc_rows: tuple[dict[str, Any], ...]
-
-
-@dataclass(frozen=True)
-class DepthGeneratedSection:
-    realization_id: str
-    scenario: GenerationScenario
-    geometry: DepthSectionGeometry
-    tvdss_highres_m: np.ndarray
-    tvdss_model_m: np.ndarray
-    log_ai_highres: np.ndarray
-    vp_highres_mps: np.ndarray
-    model_target_log_ai: np.ndarray
-    vp_model_mps: np.ndarray
-    seismic_observed: np.ndarray
-    seismic_model_consistent: np.ndarray
-    subgrid_forward_residual: np.ndarray
-    lfm_ideal: np.ndarray
-    lfm_controlled_degraded: np.ndarray
-    residual_vs_lfm_ideal: np.ndarray
-    residual_vs_lfm_controlled_degraded: np.ndarray
-    valid_mask_model: np.ndarray
-    observed_valid_mask: np.ndarray
-    physics_valid_mask: np.ndarray
-    categorical: dict[str, np.ndarray]
-    object_catalog: list[dict[str, Any]]
-    object_lateral_coefficients: list[dict[str, Any]]
-    qc: dict[str, Any]
 
 
 def _survey(workflow: Any, *, repo_root: Path) -> Any:
@@ -739,6 +705,16 @@ def _dataset(
     axis_path: str,
     axis_order: str,
 ) -> h5py.Dataset:
+    if name in {
+        "lateral_m",
+        "inline_float",
+        "xline_float",
+        "x_m",
+        "y_m",
+        "tvdss_highres_m",
+        "tvdss_model_m",
+    }:
+        values = np.asarray(values, dtype=np.float64)
     return write_dataset(
         group,
         name,
@@ -755,8 +731,6 @@ def _write_base(h5: h5py.File, section: DepthGeneratedSection) -> str:
     root = h5.create_group(path)
     root.attrs["sample_domain"] = "depth"
     root.attrs["depth_basis"] = "tvdss"
-    root.attrs["microtexture_schema"] = "microtexture_emission_v1"
-    root.attrs["microtexture_mode"] = "none"
     axes = root.create_group("axes")
     _dataset(
         axes,
@@ -1851,14 +1825,17 @@ def run_depth_generation(
         "input_contracts": input_contracts,
         "sample_domain": "depth",
         "increment_contract": generation_contract("depth", float(script_cfg["sampling"]["expected_model_dz_m"])).as_dict(),
-        "microtexture_schema": "microtexture_emission_v1",
-        "microtexture_mode": "none",
         "input_lfm_variants": ["canonical", "controlled_default"],
-        "lfm_contract": {
-            "producer_schema": SCHEMA_VERSION,
-            "canonical_lowpass_application_count": 1,
-            "variant_selection": "controlled_default",
-        },
+        "lfm_contract": build_lfm_producer_contract(
+            generation_contract(
+                "depth", float(script_cfg["sampling"]["expected_model_dz_m"])
+            ),
+            producer_schema=SCHEMA_VERSION,
+            variant_selection={
+                "selected": "controlled_default",
+                "available": ["canonical", "controlled_default"],
+            },
+        ),
         "depth_basis": "tvdss",
         "generator_family": GENERATOR_FAMILY,
         "suite": "field_conditioned",
@@ -1884,7 +1861,6 @@ def run_depth_generation(
         },
         "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
         "canonical_enabled": False,
-        "probe_enabled": False,
         "geometry_filters": sorted({str(value) for value in geometry_families})
         if geometry_families
         else sorted(

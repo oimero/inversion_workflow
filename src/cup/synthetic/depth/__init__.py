@@ -10,6 +10,7 @@ from cup.synthetic.depth.config import (
 )
 from cup.synthetic.depth.calibration import run_depth_calibration
 from cup.synthetic.depth.generation import run_depth_generation
+from cup.synthetic.depth.model import DepthGeneratedSection, DepthSectionGeometry
 
 __all__ = [
     "CALIBRATION_SCHEMA",
@@ -20,4 +21,6 @@ __all__ = [
     "resolve_depth_v2_sources",
     "run_depth_calibration",
     "run_depth_generation",
+    "DepthGeneratedSection",
+    "DepthSectionGeometry",
 ]

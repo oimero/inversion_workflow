@@ -11,13 +11,13 @@ import json
 from pathlib import Path
 from typing import Any
 
-from cup.synthetic.contracts import (
+from cup.synthetic.schemas import (
     BENCHMARK_SCHEMA_VERSION,
     FROZEN_BENCHMARK_SCHEMA_VERSION,
     LEGACY_BENCHMARK_SCHEMA_VERSION,
 )
-from cup.synthetic.readers.depth_v2 import DepthSyntheticSample, DepthV2Benchmark
-from cup.synthetic.readers.time_v2 import TimeV2Benchmark, TimeV2SyntheticSample
+from cup.synthetic.readers.depth import DepthSyntheticSample, DepthV2Benchmark
+from cup.synthetic.readers.time import TimeV2Benchmark, TimeV2SyntheticSample
 
 
 SyntheticSample = TimeV2SyntheticSample | DepthSyntheticSample

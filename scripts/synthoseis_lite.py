@@ -25,8 +25,7 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.config.sources import load_summary, resolve_source_run  # noqa: E402
 from cup.config.workflow import WorkflowConfig  # noqa: E402
-from cup.seismic.contracts import FORWARD_OBSERVABILITY_SCHEMA_VERSION  # noqa: E402
-from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION  # noqa: E402
+from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION  # noqa: E402
 from cup.synthetic.depth.calibration import run_depth_calibration  # noqa: E402
 from cup.synthetic.depth.config import (  # noqa: E402
     load_composed_config,
@@ -102,11 +101,6 @@ def _resolve_output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> P
     return root / f"synthoseis_lite_{args.command}_{timestamp}"
 
 
-def _probe_selection_enabled(root: dict) -> bool:
-    probe_selection = dict(root.get("probe_selection") or {})
-    return bool(probe_selection.get("enabled", True))
-
-
 def _recorded_time_source_runs_from_wavelet(workflow: WorkflowConfig) -> dict[str, str]:
     output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
     wavelet_dir = resolve_source_run(
@@ -144,36 +138,8 @@ def _prepare_synthoseis_config(raw: dict, workflow: WorkflowConfig) -> dict:
     prepared = dict(raw)
     root = dict(prepared.get("synthoseis_lite") or {})
     source_runs = dict(root.get("source_runs") or {})
-    probe_enabled = _probe_selection_enabled(root)
     if not source_runs:
-        if probe_enabled:
-            output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
-            obs_dir = resolve_source_run(
-                None,
-                output_root=output_root,
-                prefix="forward_observability",
-                required_files=[
-                    "run_summary.json",
-                    "frequency_evidence_bands.csv",
-                    "well_frequency_sensitivity.csv",
-                ],
-                root=REPO_ROOT,
-                label="forward_observability",
-                summary_file="run_summary.json",
-                schema_version=FORWARD_OBSERVABILITY_SCHEMA_VERSION,
-            )
-            summary = load_summary(obs_dir / "run_summary.json", schema_version=FORWARD_OBSERVABILITY_SCHEMA_VERSION)
-            recorded = dict(summary.get("source_runs") or {})
-            source_runs = {
-                "forward_observability_dir": repo_relative_path(obs_dir, root=REPO_ROOT),
-                "well_preprocess_dir": str(recorded.get("well_preprocess_dir") or ""),
-                "well_auto_tie_dir": str(recorded.get("well_auto_tie_dir") or ""),
-                "wavelet_generation_dir": str(recorded.get("wavelet_generation_dir") or ""),
-            }
-        else:
-            source_runs = _recorded_time_source_runs_from_wavelet(workflow)
-    if not probe_enabled:
-        source_runs.pop("forward_observability_dir", None)
+        source_runs = _recorded_time_source_runs_from_wavelet(workflow)
     root["source_runs"] = source_runs
     prepared["synthoseis_lite"] = root
     return prepared

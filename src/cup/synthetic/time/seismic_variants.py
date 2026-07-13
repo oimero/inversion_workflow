@@ -8,8 +8,8 @@ from typing import Any, Mapping
 import numpy as np
 from scipy.signal import hilbert
 
-from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION
-from cup.synthetic.random import ar1_irregular, named_rng
+from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION
+from cup.synthetic.core.random import ar1_irregular, named_rng
 from cup.utils.statistics import centered_rms
 
 

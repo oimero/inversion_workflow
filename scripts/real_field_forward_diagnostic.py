@@ -34,7 +34,7 @@ from cup.seismic.viz import plot_well_waveform_qc
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.config.sources import assert_same_path, load_summary, resolve_source_file_from_run, resolve_source_run
 from cup.physics.numpy_backend import forward_depth, forward_time, velocity_from_ai
-from cup.synthetic.contracts import FORWARD_MODEL_INPUTS_SCHEMA_VERSION
+from cup.synthetic.schemas import FORWARD_MODEL_INPUTS_SCHEMA_VERSION
 from cup.well.anchor import sample_volume_trilinear
 from cup.well.real_field_controls import load_well_control_set
 from cup.utils.io import (

@@ -8,9 +8,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from cup.seismic.contracts import FORWARD_OBSERVABILITY_SCHEMA_VERSION
-from cup.synthetic.calibration import GENERATOR_FAMILY
-from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION
+from cup.synthetic.core.calibration import GENERATOR_FAMILY
+from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION
 from cup.synthetic.core.config import parse_object_core_controls
 from cup.config.sources import assert_recorded_source_matches, require_source_files
 from cup.utils.io import resolve_relative_path
@@ -18,7 +17,7 @@ from cup.utils.io import resolve_relative_path
 
 DATA_SCHEMA = BENCHMARK_SCHEMA_VERSION
 IMPLEMENTATION_SCOPE = (
-    "impedance_truth_frequency_probes_forward_qc_lfm_and_seismic_mismatch"
+    "impedance_truth_forward_qc_lfm_and_seismic_mismatch"
 )
 
 
@@ -59,6 +58,10 @@ def _optional_float(value: Mapping[str, Any], key: str) -> float | None:
 
 def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     root = _mapping(config.get("synthoseis_lite"), path="synthoseis_lite")
+    if "probe_selection" in root:
+        raise ValueError(
+            "synthoseis_lite.probe_selection is not part of the v4 canonical benchmark."
+        )
     _reject_unknown(
         root,
         {
@@ -75,7 +78,6 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "forward_qc",
             "lfm",
             "seismic_mismatch",
-            "probe_selection",
             "figures",
         },
         path="synthoseis_lite",
@@ -96,7 +98,6 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "forward_qc",
             "lfm",
             "seismic_mismatch",
-            "probe_selection",
             "figures",
         },
         path="synthoseis_lite",
@@ -108,44 +109,13 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "Time-domain Synthoseis-lite requires "
             f"synthoseis_lite.sample_domain='time' and benchmark_schema={DATA_SCHEMA!r}."
         )
-    probe_selection = _mapping(
-        root.get("probe_selection"), path="synthoseis_lite.probe_selection"
-    )
-    probe_keys = {
-        "enabled",
-        "weak_representatives_per_band",
-        "unsupported_representatives_per_band",
-        "minimum_noise_equivalent_clusters",
-        "low_probe_energy_warning_fraction",
-        "conservative_to_nominal_warning_ratio",
-        "vertical_tukey_alpha",
-        "amplitude_multipliers",
-        "phases",
-        "lateral_shapes",
-        "field_parent_geometry_family",
-        "field_parents_per_section",
-    }
-    _reject_unknown(probe_selection, probe_keys, path="synthoseis_lite.probe_selection")
-    _require_keys(probe_selection, {"enabled"}, path="synthoseis_lite.probe_selection")
-    if not isinstance(probe_selection.get("enabled"), bool):
-        raise ValueError("synthoseis_lite.probe_selection.enabled must be boolean.")
-    probe_enabled = bool(probe_selection["enabled"])
-    if not probe_enabled and probe_selection != {"enabled": False}:
-        raise ValueError(
-            "Time Synthoseis-lite requires probe_selection.enabled=false with no extra fields."
-        )
-    if probe_enabled:
-        _require_keys(probe_selection, probe_keys, path="synthoseis_lite.probe_selection")
     sources = _mapping(root.get("source_runs"), path="synthoseis_lite.source_runs")
     source_keys = [
         "well_preprocess_dir",
         "well_auto_tie_dir",
         "wavelet_generation_dir",
     ]
-    allowed_source_keys = set(source_keys) | {"forward_observability_dir"}
-    if probe_enabled:
-        source_keys.append("forward_observability_dir")
-    _reject_unknown(sources, allowed_source_keys, path="synthoseis_lite.source_runs")
+    _reject_unknown(sources, set(source_keys), path="synthoseis_lite.source_runs")
     source_runs = {
         key: _required_text(sources, key, path="synthoseis_lite.source_runs")
         for key in source_keys
@@ -656,28 +626,6 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         mismatch_combined_keys,
         path="synthoseis_lite.seismic_mismatch.combined",
     )
-    lateral_shapes = []
-    if probe_enabled:
-        raw_lateral_shapes = probe_selection.get("lateral_shapes")
-        if not isinstance(raw_lateral_shapes, list) or not raw_lateral_shapes:
-            raise ValueError(
-                "synthoseis_lite.probe_selection.lateral_shapes must be a non-empty list."
-            )
-        for index, item in enumerate(raw_lateral_shapes):
-            if isinstance(item, str):
-                lateral_shapes.append({"name": item})
-            else:
-                shape_path = f"synthoseis_lite.probe_selection.lateral_shapes[{index}]"
-                shape = _mapping(item, path=shape_path)
-                _reject_unknown(
-                    shape,
-                    {"name", "centered_fraction", "alpha"},
-                    path=shape_path,
-                )
-                _require_keys(
-                    shape, {"name", "centered_fraction", "alpha"}, path=shape_path
-                )
-                lateral_shapes.append(shape)
     parsed = {
         "sample_domain": "time",
         "benchmark_schema": DATA_SCHEMA,
@@ -900,52 +848,6 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 ),
             },
         },
-        "probe_selection": (
-            {
-                "enabled": True,
-                "weak_representatives_per_band": int(
-                    probe_selection.get("weak_representatives_per_band", 3)
-                ),
-                "unsupported_representatives_per_band": int(
-                    probe_selection.get("unsupported_representatives_per_band", 3)
-                ),
-                "minimum_noise_equivalent_clusters": int(
-                    probe_selection.get("minimum_noise_equivalent_clusters", 3)
-                ),
-                "low_probe_energy_warning_fraction": float(
-                    probe_selection.get("low_probe_energy_warning_fraction", 0.01)
-                ),
-                "conservative_to_nominal_warning_ratio": float(
-                    probe_selection.get(
-                        "conservative_to_nominal_warning_ratio",
-                        1.5,
-                    )
-                ),
-                "vertical_tukey_alpha": float(
-                    probe_selection.get("vertical_tukey_alpha", 0.5)
-                ),
-                "amplitude_multipliers": [
-                    float(value)
-                    for value in probe_selection.get(
-                        "amplitude_multipliers",
-                        [0.0, 0.25, 0.5, 1.0, 2.0, 4.0],
-                    )
-                ],
-                "phases": [
-                    str(value)
-                    for value in probe_selection.get("phases", ["sin", "cos"])
-                ],
-                "lateral_shapes": lateral_shapes,
-                "field_parent_geometry_family": str(
-                    probe_selection.get("field_parent_geometry_family", "none")
-                ),
-                "field_parents_per_section": int(
-                    probe_selection.get("field_parents_per_section", 1)
-                ),
-            }
-            if probe_enabled
-            else {"enabled": False}
-        ),
         "figures": {
             "enabled": bool(figures.get("enabled", True)),
             "max_example_objects_per_zone_state": int(
@@ -963,7 +865,6 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         parsed["lfm"], output_dt_s=parsed["sampling"]["expected_output_dt_s"]
     )
     _validate_seismic_mismatch_config(parsed["seismic_mismatch"])
-    _validate_probe_config(parsed["probe_selection"])
     if (
         parsed["splits"]["held_out_geometry_family"]
         not in parsed["generation"]["geometry_families"]
@@ -977,7 +878,6 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
 def resolve_sources(
     script_cfg: Mapping[str, Any], *, repo_root: Path
 ) -> dict[str, Path]:
-    probe_enabled = bool(script_cfg["probe_selection"]["enabled"])
     sources = {
         key: resolve_relative_path(value, root=repo_root)
         for key, value in script_cfg["source_runs"].items()
@@ -992,12 +892,6 @@ def resolve_sources(
             "evaluation_well_spatial_clusters.csv",
         ],
     }
-    if probe_enabled:
-        required["forward_observability_dir"] = [
-            "run_summary.json",
-            "frequency_evidence_bands.csv",
-            "well_frequency_sensitivity.csv",
-        ]
     for key, names in required.items():
         directory = sources[key]
         require_source_files(directory, names, label=key)
@@ -1023,20 +917,6 @@ def resolve_sources(
     recorded_preprocess_dir = resolve_relative_path(preprocess_status_text, root=repo_root).parent
     if recorded_preprocess_dir.resolve() != sources["well_preprocess_dir"].resolve():
         raise ValueError("source_run_mismatch:well_preprocess_dir")
-    if not probe_enabled:
-        return sources
-    with (sources["forward_observability_dir"] / "run_summary.json").open(
-        "r", encoding="utf-8"
-    ) as handle:
-        summary = json.load(handle)
-    if summary.get("schema_version") != FORWARD_OBSERVABILITY_SCHEMA_VERSION:
-        raise ValueError(
-            "forward_observability run_summary.json must use "
-            f"{FORWARD_OBSERVABILITY_SCHEMA_VERSION}."
-        )
-    recorded = summary.get("source_runs") or {}
-    for key in ("well_preprocess_dir", "well_auto_tie_dir", "wavelet_generation_dir"):
-        assert_recorded_source_matches(recorded, key, sources[key], root=repo_root)
     return sources
 
 
@@ -1179,49 +1059,3 @@ def _validate_seismic_mismatch_config(config: Mapping[str, Any]) -> None:
         )
 
 
-def _validate_probe_config(config: Mapping[str, Any]) -> None:
-    if not bool(config["enabled"]):
-        return
-    if int(config["weak_representatives_per_band"]) < 1:
-        raise ValueError("weak_representatives_per_band must be positive.")
-    if int(config["unsupported_representatives_per_band"]) < 1:
-        raise ValueError("unsupported_representatives_per_band must be positive.")
-    if int(config["minimum_noise_equivalent_clusters"]) < 1:
-        raise ValueError("minimum_noise_equivalent_clusters must be positive.")
-    if int(config["field_parents_per_section"]) < 1:
-        raise ValueError("field_parents_per_section must be positive.")
-    if str(config["field_parent_geometry_family"]) not in {
-        "none",
-        "wedge",
-        "pinchout",
-    }:
-        raise ValueError(
-            "field_parent_geometry_family must be none, wedge, or pinchout."
-        )
-    if not 0.0 <= float(config["vertical_tukey_alpha"]) <= 1.0:
-        raise ValueError("vertical_tukey_alpha must be within [0, 1].")
-    multipliers = list(config["amplitude_multipliers"])
-    if (
-        not multipliers
-        or 0.0 not in multipliers
-        or any(not np.isfinite(value) or value < 0.0 for value in multipliers)
-    ):
-        raise ValueError(
-            "probe amplitude_multipliers must be finite, nonnegative, and include 0."
-        )
-    if set(config["phases"]) != {"sin", "cos"}:
-        raise ValueError("probe phases must contain exactly sin and cos.")
-    names = [str(item.get("name", "")) for item in config["lateral_shapes"]]
-    if set(names) != {"section_coherent", "localized_tukey"}:
-        raise ValueError(
-            "probe lateral_shapes must contain section_coherent and localized_tukey."
-        )
-    localized = next(
-        item
-        for item in config["lateral_shapes"]
-        if str(item["name"]) == "localized_tukey"
-    )
-    if not 0.0 < float(localized.get("centered_fraction", 0.0)) <= 1.0:
-        raise ValueError("localized_tukey centered_fraction must be within (0, 1].")
-    if not 0.0 <= float(localized.get("alpha", -1.0)) <= 1.0:
-        raise ValueError("localized_tukey alpha must be within [0, 1].")

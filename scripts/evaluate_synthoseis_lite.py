@@ -23,9 +23,9 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.synthetic.dataset import SynthoseisBenchmark
-from cup.synthetic.contracts import REPORT_SCHEMA_VERSION
-from cup.synthetic.metrics import aggregate_metric_rows, metric_row, regression_metrics
+from cup.synthetic.benchmark import SynthoseisBenchmark
+from cup.synthetic.schemas import REPORT_SCHEMA_VERSION
+from cup.synthetic.reporting.metrics import aggregate_metric_rows, metric_row
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
@@ -51,12 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sample-kind",
         action="append",
-        choices=(
-            "base",
-            "frequency_probe",
-            "seismic_variant",
-            "frequency_probe_seismic_variant",
-        ),
+        choices=("base", "seismic_variant"),
         default=None,
         help="Restrict evaluation to one or more sample kinds.",
     )
@@ -133,76 +128,6 @@ def _geometry_metrics(sample_metrics: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
-def _probe_metrics(
-    benchmark: SynthoseisBenchmark,
-    sample_ids: list[str],
-    baselines: list[str],
-) -> list[dict[str, Any]]:
-    probe_ids = [
-        sample_id
-        for sample_id in sample_ids
-        if str(benchmark.row(sample_id).get("sample_kind", "")) == "frequency_probe"
-    ]
-    if not probe_ids:
-        return []
-    cache: dict[tuple[str, str], tuple[Any, np.ndarray]] = {}
-
-    def get_prediction(sample_id: str, baseline_id: str) -> tuple[Any, np.ndarray]:
-        key = (sample_id, baseline_id)
-        if key not in cache:
-            sample = benchmark.load_sample(sample_id)
-            cache[key] = (sample, _prediction(sample, baseline_id))
-        return cache[key]
-
-    rows: list[dict[str, Any]] = []
-    for sample_id in probe_ids:
-        row = benchmark.row(sample_id)
-        pair_id = str(row.get("paired_zero_sample_id") or "").strip()
-        amplitude = row.get("probe_amplitude_multiplier", "")
-        try:
-            amplitude_value = float(amplitude)
-        except (TypeError, ValueError):
-            amplitude_value = float("nan")
-        for baseline_id in baselines:
-            sample, prediction = get_prediction(sample_id, baseline_id)
-            base = {
-                "sample_id": sample_id,
-                "baseline_id": baseline_id,
-                "probe_frequency_hz": row.get("probe_frequency_hz", ""),
-                "probe_phase": row.get("probe_phase", ""),
-                "probe_lateral_shape": row.get("probe_lateral_shape", ""),
-                "probe_amplitude_multiplier": amplitude,
-                "paired_zero_sample_id": pair_id,
-            }
-            if amplitude_value == 0.0 or not pair_id or pair_id not in benchmark._rows:
-                metrics = regression_metrics(
-                    sample.target_log_ai,
-                    prediction,
-                    valid_mask=sample.valid_mask,
-                )
-                rows.append(
-                    {
-                        **base,
-                        "probe_metric_semantics": "absolute_zero_or_unpaired_probe_error",
-                        **metrics,
-                    }
-                )
-                continue
-            pair, pair_prediction = get_prediction(pair_id, baseline_id)
-            valid = sample.valid_mask & pair.valid_mask
-            target_delta = sample.target_log_ai - pair.target_log_ai
-            prediction_delta = prediction - pair_prediction
-            metrics = regression_metrics(target_delta, prediction_delta, valid_mask=valid)
-            rows.append(
-                {
-                    **base,
-                    "probe_metric_semantics": "paired_probe_increment_error",
-                    **metrics,
-                }
-            )
-    return rows
-
-
 def main() -> None:
     args = parse_args()
     benchmark_dir = resolve_relative_path(args.benchmark_dir, root=REPO_ROOT)
@@ -212,9 +137,7 @@ def main() -> None:
         if args.sample_kind
         else {
             "base",
-            "frequency_probe",
             "seismic_variant",
-            "frequency_probe_seismic_variant",
         }
     )
     baselines = list(dict.fromkeys(args.baseline or BASELINES))
@@ -244,11 +167,6 @@ def main() -> None:
     sample_metrics_path = output_dir / "model_sample_metrics.csv"
     sample_metrics.to_csv(sample_metrics_path, index=False)
 
-    probe_rows = _probe_metrics(benchmark, sample_ids, baselines)
-    probe_metrics = pd.DataFrame.from_records(probe_rows)
-    probe_metrics_path = output_dir / "model_probe_metrics.csv"
-    probe_metrics.to_csv(probe_metrics_path, index=False)
-
     geometry_metrics = _geometry_metrics(sample_metrics)
     geometry_metrics_path = output_dir / "model_geometry_metrics.csv"
     geometry_metrics.to_csv(geometry_metrics_path, index=False)
@@ -260,7 +178,6 @@ def main() -> None:
         "sample_kinds": sorted(kinds),
         "sample_count": len(sample_ids),
         "baseline_aggregate": aggregate_metric_rows(sample_rows),
-        "probe_aggregate": aggregate_metric_rows(probe_rows),
         "semantics": {
             "oracle_target": "pipeline self-check only, not a model baseline",
             "lfm_ideal": "ideal lowpass prior copied from benchmark",
@@ -288,7 +205,6 @@ def main() -> None:
         input_contracts=input_contracts,
         primary_artifacts={
             "model_sample_metrics": sample_metrics_path,
-            "model_probe_metrics": probe_metrics_path,
             "model_geometry_metrics": geometry_metrics_path,
             "model_report_card": report_path,
         },
@@ -302,7 +218,6 @@ def main() -> None:
         "benchmark_dir": repo_relative_path(benchmark_dir, root=REPO_ROOT),
         "outputs": {
             "model_sample_metrics": repo_relative_path(sample_metrics_path, root=REPO_ROOT),
-            "model_probe_metrics": repo_relative_path(probe_metrics_path, root=REPO_ROOT),
             "model_geometry_metrics": repo_relative_path(geometry_metrics_path, root=REPO_ROOT),
             "model_report_card": repo_relative_path(report_path, root=REPO_ROOT),
         },

@@ -14,7 +14,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from cup.synthetic.dataset import SynthoseisBenchmark
+from cup.synthetic.benchmark import SynthoseisBenchmark
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,

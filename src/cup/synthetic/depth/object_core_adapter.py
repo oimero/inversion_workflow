@@ -17,8 +17,9 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from cup.synthetic.calibration import ImpedanceCalibration, WellZoneCurves, calibrate_impedance
-from cup.synthetic.generation import GeneratedSection, GenerationScenario, generate_field_section
+from cup.synthetic.core.calibration import ImpedanceCalibration, WellZoneCurves, calibrate_impedance
+from cup.synthetic.core.generation import GeneratedSection, GenerationScenario
+from cup.synthetic.time.generation import generate_field_section
 from cup.synthetic.depth.config import CALIBRATION_SCHEMA, GENERATOR_FAMILY
 
 

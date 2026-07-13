@@ -13,14 +13,14 @@ from cup.petrel.load import import_interpretation_petrel, import_well_tops_petre
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.wavelet import infer_wavelet_dt, load_wavelet_csv
-from cup.synthetic.calibration import (
+from cup.synthetic.core.calibration import (
     GENERATOR_FAMILY,
     SCHEMA_VERSION as CALIBRATION_SCHEMA,
     WellZoneCurves,
     calibrate_impedance,
 )
-from cup.synthetic.config import IMPLEMENTATION_SCOPE
-from cup.synthetic.figures import write_calibration_figures
+from cup.synthetic.time.config import IMPLEMENTATION_SCOPE
+from cup.synthetic.reporting.figures import write_calibration_figures
 from cup.config.workflow import WorkflowConfig
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
@@ -372,8 +372,6 @@ def run_calibration(
         "well_auto_tie_dir",
         "wavelet_generation_dir",
     ]
-    if bool(script_cfg["probe_selection"]["enabled"]):
-        contract_source_keys.append("forward_observability_dir")
     for directory_key in contract_source_keys:
         summary_path = sources[directory_key] / "run_summary.json"
         with summary_path.open("r", encoding="utf-8") as handle:

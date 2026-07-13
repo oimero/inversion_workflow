@@ -11,17 +11,22 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from cup.canonical_increment import CanonicalIncrementContract, validate_sample_axis
+from cup.impedance import (
+    CanonicalIncrementContract,
+    validate_contract_compatibility,
+    validate_lfm_producer_contract,
+    validate_sample_axis,
+)
 from cup.synthetic.core import (
     validate_dataset_metadata,
     validate_training_manifest,
 )
-from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION
+from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION
 from cup.utils.io import require_contract_fingerprint
 
 
 SCHEMA_VERSION = BENCHMARK_SCHEMA_VERSION
-SEISMIC_VARIANT_KINDS = {"seismic_variant", "frequency_probe_seismic_variant"}
+SEISMIC_VARIANT_KINDS = {"seismic_variant"}
 
 
 @dataclass(frozen=True)
@@ -68,8 +73,6 @@ def _clean_path(value: Any) -> str:
 
 
 def _root_from_group(group_path: str) -> str:
-    if "/probes/" in group_path:
-        return group_path.split("/probes/", maxsplit=1)[0]
     if "/seismic_variants/" in group_path:
         return group_path.split("/seismic_variants/", maxsplit=1)[0]
     return group_path
@@ -128,6 +131,10 @@ class TimeV2Benchmark:
         )
         if self.increment_contract.sample_domain != "time":
             raise ValueError("Time benchmark increment_contract must use sample_domain=time.")
+        self.lfm_contract = validate_lfm_producer_contract(
+            self.manifest.get("lfm_contract") or {}
+        )
+        validate_contract_compatibility(self.increment_contract, self.lfm_contract)
         validate_training_manifest(self.manifest, sample_domain="time")
         require_contract_fingerprint(self.manifest, label=f"benchmark {self.run_dir}")
 
@@ -145,6 +152,15 @@ class TimeV2Benchmark:
         missing = required - set(self.index)
         if missing:
             raise ValueError(f"sample_index.csv lacks columns: {sorted(missing)}")
+        forbidden_probe_kinds = {
+            "frequency_probe",
+            "frequency_probe_seismic_variant",
+        }.intersection(set(self.index["sample_kind"]))
+        if forbidden_probe_kinds:
+            raise ValueError(
+                "frequency_probe samples do not belong to the v4 canonical benchmark: "
+                f"{sorted(forbidden_probe_kinds)}"
+            )
         if bool(self.index["sample_id"].duplicated().any()):
             raise ValueError("sample_index.csv contains duplicate sample_id values.")
         if not set(self.index["evaluation_role"]) <= {
@@ -357,13 +373,10 @@ class TimeV2Benchmark:
 
     @staticmethod
     def _read_target(h5: h5py.File, group_path: str, sample_kind: str) -> np.ndarray:
-        if sample_kind == "frequency_probe":
-            root_path = _root_from_group(group_path)
-            base = np.asarray(h5[f"{root_path}/truth/model_target_log_ai"][()])
-            increment = np.asarray(
-                h5[f"{group_path}/truth/probe_log_ai_model_grid"][()]
+        if sample_kind in {"frequency_probe", "frequency_probe_seismic_variant"}:
+            raise ValueError(
+                "frequency_probe samples do not belong to the v4 canonical benchmark."
             )
-            return base + increment
         return np.asarray(h5[f"{group_path}/truth/model_target_log_ai"][()])
 
     @staticmethod

@@ -1,29 +1,23 @@
-"""Truth-first synthetic impedance calibration and generation."""
+"""Synthoseis-lite benchmark facade.
 
-from cup.synthetic.calibration import (
+Generation is split by sampling domain; readers and reporting are separate
+from generation so consumers only depend on materialized artifact contracts.
+"""
+
+from cup.synthetic.benchmark import SyntheticSample, SynthoseisBenchmark
+from cup.synthetic.core.calibration import (
     ImpedanceCalibration,
     WellZoneCurves,
     calibrate_impedance,
 )
-from cup.synthetic.canonical import (
-    CanonicalScenario,
-    canonical_scenarios,
-    generate_canonical_section,
-)
-from cup.synthetic.dataset import SyntheticSample, SynthoseisBenchmark
-from cup.synthetic.generation import (
-    GeneratedSection,
-    GenerationScenario,
-    generate_field_section,
-)
-from cup.synthetic.metrics import (
+from cup.synthetic.reporting.metrics import (
     aggregate_metric_rows,
     energy_rms,
     finite_mask,
     metric_row,
     regression_metrics,
 )
-from cup.synthetic.forward import (
+from cup.synthetic.time.forward import (
     HighresForwardResult,
     HighresWavelet,
     antialias_taps,
@@ -31,49 +25,37 @@ from cup.synthetic.forward import (
     highres_forward_to_model_grid,
     resample_wavelet_to_highres,
 )
-from cup.synthetic.lfm import (
-    LfmResult,
-    derive_lfm_priors,
-    lowpass_model_grid,
+from cup.synthetic.core.generation import (
+    GeneratedSection,
+    GenerationRejected,
+    GenerationScenario,
 )
-from cup.synthetic.probes import (
-    ProbeFrequency,
-    ProbeResult,
-    ProbeVariant,
-    build_probe_frequency_catalog,
-    generate_probe,
-)
-from cup.synthetic.seismic_variants import (
+from cup.synthetic.time.generation import generate_field_section
+from cup.synthetic.time.lfm import LfmResult, derive_lfm_priors, lowpass_model_grid
+from cup.synthetic.time.seismic_variants import (
     SeismicVariantResult,
     generate_seismic_variants,
 )
 
 __all__ = [
     "GeneratedSection",
+    "GenerationRejected",
     "GenerationScenario",
     "HighresForwardResult",
     "HighresWavelet",
-    "LfmResult",
-    "CanonicalScenario",
     "ImpedanceCalibration",
+    "LfmResult",
+    "SeismicVariantResult",
     "SyntheticSample",
     "SynthoseisBenchmark",
     "WellZoneCurves",
     "aggregate_metric_rows",
     "antialias_taps",
     "calibrate_impedance",
-    "canonical_scenarios",
     "downsample_continuous",
     "energy_rms",
     "finite_mask",
-    "generate_canonical_section",
     "generate_field_section",
-    "ProbeFrequency",
-    "ProbeResult",
-    "ProbeVariant",
-    "SeismicVariantResult",
-    "build_probe_frequency_catalog",
-    "generate_probe",
     "generate_seismic_variants",
     "highres_forward_to_model_grid",
     "derive_lfm_priors",

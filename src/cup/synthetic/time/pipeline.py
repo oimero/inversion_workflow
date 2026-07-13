@@ -17,20 +17,20 @@ from cup.seismic.wavelet import (
     load_wavelet_csv,
     validate_wavelet_normalization,
 )
-from cup.synthetic.calibration import (
+from cup.synthetic.core.calibration import (
     GENERATOR_FAMILY,
     SCHEMA_VERSION as CALIBRATION_SCHEMA,
     ImpedanceCalibration,
     load_calibration,
 )
-from cup.synthetic.canonical import (
+from cup.synthetic.time.canonical import (
     CANONICAL_FAMILIES,
     canonical_reference_impedance,
     canonical_scenarios,
     generate_canonical_section,
 )
-from cup.synthetic.config import DATA_SCHEMA, IMPLEMENTATION_SCOPE
-from cup.canonical_increment import generation_contract
+from cup.synthetic.time.config import DATA_SCHEMA, IMPLEMENTATION_SCOPE
+from cup.impedance import build_lfm_producer_contract, generation_contract
 from cup.synthetic.core import (
     build_attempt_plan,
     geometry_feasibility_rows,
@@ -45,7 +45,7 @@ from cup.synthetic.core.progress import (
     configure_generation_logger,
     run_attempt_preflight,
 )
-from cup.synthetic.forward import (
+from cup.synthetic.time.forward import (
     HighresForwardResult,
     HighresWavelet,
     antialias_taps,
@@ -54,29 +54,22 @@ from cup.synthetic.forward import (
     forward_sample_valid_mask,
     resample_wavelet_to_highres,
 )
-from cup.synthetic.figures import write_generation_figures
-from cup.synthetic.generation import (
+from cup.synthetic.reporting.figures import write_generation_figures
+from cup.synthetic.core.generation import (
     GenerationRejected,
     GenerationScenario,
-    generate_field_section,
+    generation_scenarios,
 )
-from cup.synthetic.geometry import build_section_geometries
-from cup.synthetic.io import (
+from cup.synthetic.time.generation import generate_field_section
+from cup.synthetic.time.geometry import build_section_geometries
+from cup.synthetic.time.writer import (
     write_generated_section,
     write_highres_forward_result,
     write_lfm_result,
-    write_probe_result,
     write_seismic_variant_result,
 )
-from cup.synthetic.lfm import LfmResult, derive_lfm_priors
-from cup.synthetic.probes import (
-    ProbeFrequency,
-    build_probe_frequency_catalog,
-    frequency_catalog_rows,
-    generate_probe,
-    probe_variants,
-)
-from cup.synthetic.seismic_variants import generate_seismic_variants
+from cup.synthetic.time.lfm import LfmResult, derive_lfm_priors
+from cup.synthetic.time.seismic_variants import generate_seismic_variants
 from cup.config.workflow import WorkflowConfig
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
@@ -137,10 +130,7 @@ def _generation_input_contracts(
             ),
         }
     }
-    for source_key, role in (
-        ("wavelet_generation_dir", "wavelet_generation"),
-        ("forward_observability_dir", "forward_observability"),
-    ):
+    for source_key, role in (("wavelet_generation_dir", "wavelet_generation"),):
         if source_key not in sources:
             continue
         source_dir = sources[source_key]
@@ -154,73 +144,6 @@ def _generation_input_contracts(
             ),
         }
     return contracts
-
-
-def generation_scenarios(script_cfg: Mapping[str, Any]) -> list[GenerationScenario]:
-    generation = script_cfg["generation"]
-    impedance = script_cfg["impedance"]
-    scenarios: list[GenerationScenario] = []
-    for duration_mode in generation["duration_modes"]:
-        for correlation in impedance["correlation_length_section_fractions"]:
-            pairs = zip(
-                impedance["coefficient_sigma_multipliers"],
-                impedance["thickness_log_sigma_values"],
-            )
-            for coefficient_sigma, thickness_sigma in pairs:
-                for family in generation["geometry_families"]:
-                    directions = (
-                        generation["geometry_directions"]
-                        if family != "none"
-                        else ["none"]
-                    )
-                    variants = ["035", "065"] if family == "pinchout" else [""]
-                    for direction in directions:
-                        for variant in variants:
-                            scenario_id = (
-                                f"{duration_mode}__lx{correlation:g}__a{coefficient_sigma:g}"
-                                f"__t{thickness_sigma:g}__{family}__{direction}"
-                                + (f"__{variant}" if variant else "")
-                            )
-                            scenarios.append(
-                                GenerationScenario(
-                                    scenario_id=scenario_id,
-                                    duration_mode=str(duration_mode),
-                                    geometry_family=str(family),
-                                    geometry_direction=str(direction),
-                                    correlation_length_fraction=float(correlation),
-                                    coefficient_sigma_multiplier=float(
-                                        coefficient_sigma
-                                    ),
-                                    thickness_log_sigma=float(thickness_sigma),
-                                    variant_id=str(variant),
-                                )
-                            )
-    return scenarios
-
-
-def _load_probe_frequencies(
-    *,
-    script_cfg: Mapping[str, Any],
-    sources: Mapping[str, Path],
-) -> list[ProbeFrequency]:
-    config = script_cfg["probe_selection"]
-    if not bool(config["enabled"]):
-        return []
-    evidence = pd.read_csv(
-        sources["forward_observability_dir"] / "frequency_evidence_bands.csv"
-    )
-    sensitivity = pd.read_csv(
-        sources["forward_observability_dir"] / "well_frequency_sensitivity.csv"
-    )
-    return build_probe_frequency_catalog(
-        evidence,
-        sensitivity,
-        weak_representatives_per_band=int(config["weak_representatives_per_band"]),
-        unsupported_representatives_per_band=int(
-            config["unsupported_representatives_per_band"]
-        ),
-        minimum_clusters=int(config["minimum_noise_equivalent_clusters"]),
-    )
 
 
 def _section_forward_qc(
@@ -314,7 +237,6 @@ def _seismic_variant_records_for_sample(
     index_records: list[dict[str, Any]] = []
     result_records: list[dict[str, Any]] = []
     source_sample_id = str(source_index_record["sample_id"])
-    source_kind = str(source_index_record.get("sample_kind", "base"))
     for result in results:
         variant_group = (
             ""
@@ -326,18 +248,13 @@ def _seismic_variant_records_for_sample(
             )
         )
         sample_id = f"{source_sample_id}__seismic__{result.variant_id}"
-        sample_kind = (
-            "frequency_probe_seismic_variant"
-            if source_kind == "frequency_probe"
-            else "seismic_variant"
-        )
         record = {
             **dict(source_index_record),
             "sample_id": sample_id,
             "realization_id": sample_id,
             "source_sample_id": source_sample_id,
-            "source_sample_kind": source_kind,
-            "sample_kind": sample_kind,
+            "source_sample_kind": str(source_index_record.get("sample_kind", "base")),
+            "sample_kind": "seismic_variant",
             "hdf5_group": variant_group,
             "seismic_variant_id": result.variant_id,
             "seismic_mismatch_family": result.mismatch_family,
@@ -354,182 +271,6 @@ def _seismic_variant_records_for_sample(
         index_records.append(record)
         result_records.append({**record, **result.qc})
     return index_records, result_records
-
-
-def _probe_records_for_parent(
-    *,
-    h5: h5py.File,
-    parent_path: str,
-    section: Any,
-    suite: str,
-    section_id: str,
-    split: str,
-    evaluation_role: str,
-    frequencies: Sequence[ProbeFrequency],
-    script_cfg: Mapping[str, Any],
-    wavelet_time_s: np.ndarray,
-    wavelet: np.ndarray,
-    highres_wavelet: HighresWavelet | None,
-    base_highres_forward: HighresForwardResult | None,
-    qc_only: bool,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    config = script_cfg["probe_selection"]
-    taps = antialias_taps(int(script_cfg["sampling"]["vertical_oversampling_factor"]))
-    index_records: list[dict[str, Any]] = []
-    result_records: list[dict[str, Any]] = []
-    seismic_variant_records: list[dict[str, Any]] = []
-    for frequency in frequencies:
-        variants = probe_variants(
-            frequency,
-            amplitude_multipliers=config["amplitude_multipliers"],
-            phases=config["phases"],
-            lateral_shapes=config["lateral_shapes"],
-        )
-        for variant in variants:
-            result = generate_probe(
-                section,
-                frequency,
-                variant,
-                wavelet_time_s=wavelet_time_s,
-                wavelet=wavelet,
-                antialias_filter_taps=taps,
-                vertical_tukey_alpha=float(config["vertical_tukey_alpha"]),
-                lateral_shapes=config["lateral_shapes"],
-                low_probe_energy_warning_fraction=float(
-                    config["low_probe_energy_warning_fraction"]
-                ),
-            )
-            closure = model_grid_closure_qc(
-                result.model_target_log_ai,
-                result.seismic_model_consistent,
-                wavelet_time_s,
-                wavelet,
-            )
-            lfm_result = derive_lfm_priors(
-                section,
-                config=script_cfg["lfm"],
-                global_seed=int(script_cfg["global_seed"]),
-                generator_family=GENERATOR_FAMILY,
-                model_target_log_ai=result.model_target_log_ai,
-                degradation_variant_id=section.realization_id,
-            )
-            if variant.amplitude_multiplier == 0.0:
-                highres_result = base_highres_forward
-                highres_qc = (
-                    {} if base_highres_forward is None else base_highres_forward.qc
-                )
-            elif highres_wavelet is not None:
-                try:
-                    highres_result = highres_forward_to_model_grid(
-                        section.truth_log_ai_highres + result.probe_log_ai_highres,
-                        result.seismic_model_consistent,
-                        highres_wavelet=highres_wavelet,
-                        forward_valid_mask_model=(section.forward_valid_mask_model),
-                    )
-                    highres_qc = highres_result.qc
-                except Exception as exc:
-                    if bool(script_cfg["forward_qc"]["highres_mismatch_required"]):
-                        raise ValueError(
-                            f"highres_forward_qc_failed:"
-                            f"{section.realization_id}:{variant.variant_id}:{exc}"
-                        ) from exc
-                    highres_result = None
-                    highres_qc = {
-                        "highres_forward_status": "failed",
-                        "highres_forward_reasons": (f"{type(exc).__name__}:{exc}"),
-                    }
-            else:
-                highres_result = None
-                highres_qc = {
-                    "highres_forward_status": "disabled",
-                    "highres_forward_reasons": "",
-                }
-            hdf5_group = (
-                ""
-                if qc_only
-                else write_probe_result(
-                    h5,
-                    realization_path=parent_path,
-                    frequency=frequency,
-                    result=result,
-                    highres_forward=highres_result,
-                    lfm_result=lfm_result,
-                )
-            )
-            sample_id = f"{section.realization_id}__probe__{variant.variant_id}"
-            pair_id = (
-                f"{section.realization_id}__probe__{variant.paired_zero_variant_id}"
-            )
-            index_record = {
-                "sample_id": sample_id,
-                "realization_id": sample_id,
-                "parent_realization_id": section.realization_id,
-                "suite": suite,
-                "section_id": section_id,
-                "scenario_id": "frequency_probe",
-                "geometry_family": section.scenario.geometry_family,
-                "duration_mode": section.scenario.duration_mode,
-                "split": split,
-                "evaluation_role": evaluation_role,
-                "hdf5_group": hdf5_group,
-                "attempt_id": "",
-                "status": "ok",
-                "reasons": "",
-                "sample_kind": "frequency_probe",
-                "probe_variant_id": variant.variant_id,
-                "paired_zero_sample_id": pair_id,
-                "probe_frequency_hz": frequency.frequency_hz,
-                "probe_phase": variant.phase,
-                "probe_lateral_shape": variant.lateral_shape,
-                "probe_amplitude_multiplier": (variant.amplitude_multiplier),
-                **_lfm_records(lfm_result, base_path=hdf5_group),
-            }
-            index_records.append(index_record)
-            seismic_index, seismic_results = _seismic_variant_records_for_sample(
-                h5=h5,
-                owner_path=(
-                    hdf5_group
-                    if hdf5_group
-                    else f"{parent_path}/probes/{variant.variant_id}"
-                ),
-                source_index_record=index_record,
-                seismic_model_consistent=result.seismic_model_consistent,
-                forward_valid_mask=forward_sample_valid_mask(section.forward_valid_mask_model),
-                lateral_m=section.lateral_m,
-                script_cfg=script_cfg,
-                qc_only=qc_only,
-                source_variant_id=variant.variant_id,
-            )
-            index_records.extend(seismic_index)
-            seismic_variant_records.extend(seismic_results)
-            result_records.append(
-                {
-                    **index_record,
-                    "evidence_status": frequency.evidence_status,
-                    "operator_support": frequency.operator_support,
-                    "experiment_class": frequency.experiment_class,
-                    "selection_reason": frequency.selection_reason,
-                    "noise_equivalent_calibration_status": (
-                        frequency.calibration_status
-                    ),
-                    "wavelet_uncertainty_warning": bool(
-                        np.isfinite(frequency.conservative_to_nominal_ratio)
-                        and frequency.conservative_to_nominal_ratio
-                        > float(config["conservative_to_nominal_warning_ratio"])
-                    ),
-                    "valid_nominal_cluster_count": (
-                        frequency.valid_nominal_cluster_count
-                    ),
-                    "valid_conservative_cluster_count": (
-                        frequency.valid_conservative_cluster_count
-                    ),
-                    **result.qc,
-                    **closure,
-                    **highres_qc,
-                    **lfm_result.qc,
-                }
-            )
-    return index_records, result_records, seismic_variant_records
 
 
 def _run_canonical_generation(
@@ -553,12 +294,7 @@ def _run_canonical_generation(
     index_records: list[dict[str, Any]] = []
     object_records: list[dict[str, Any]] = []
     qc_records: list[dict[str, Any]] = []
-    probe_records: list[dict[str, Any]] = []
     seismic_variant_records: list[dict[str, Any]] = []
-    probe_frequencies = _load_probe_frequencies(
-        script_cfg=script_cfg,
-        sources=sources,
-    )
     highres_wavelet = (
         resample_wavelet_to_highres(
             wavelet_time,
@@ -679,34 +415,6 @@ def _run_canonical_generation(
             index_records.extend(seismic_index)
             seismic_variant_records.extend(seismic_results)
             qc_records.append({**record, **generated.qc})
-            if scenario.family == "frequency_probe" and probe_frequencies:
-                (
-                    probe_index,
-                    parent_probe_records,
-                    probe_seismic_records,
-                ) = _probe_records_for_parent(
-                    h5=h5,
-                    parent_path=(
-                        hdf5_group
-                        if hdf5_group
-                        else f"/realizations/{generated.realization_id}"
-                    ),
-                    section=generated,
-                    suite="canonical",
-                    section_id="canonical",
-                    split="benchmark",
-                    evaluation_role="development_pool",
-                    frequencies=probe_frequencies,
-                    script_cfg=script_cfg,
-                    wavelet_time_s=wavelet_time,
-                    wavelet=wavelet,
-                    highres_wavelet=highres_wavelet,
-                    base_highres_forward=highres_result,
-                    qc_only=qc_only,
-                )
-                index_records.extend(probe_index)
-                probe_records.extend(parent_probe_records)
-                seismic_variant_records.extend(probe_seismic_records)
 
     index = pd.DataFrame.from_records(index_records)
     index.to_csv(output_dir / "sample_index.csv", index=False)
@@ -738,25 +446,8 @@ def _run_canonical_generation(
     qc_frame = pd.DataFrame.from_records(qc_records)
     qc_frame.to_csv(output_dir / "generation_qc.csv", index=False)
     qc_frame.to_csv(output_dir / "canonical_geometry_qc.csv", index=False)
-    pd.DataFrame.from_records(probe_records).to_csv(
-        output_dir / "frequency_probe_results.csv",
-        index=False,
-    )
     pd.DataFrame.from_records(seismic_variant_records).to_csv(
         output_dir / "seismic_variant_results.csv",
-        index=False,
-    )
-    probe_frequency_frame = pd.DataFrame.from_records(
-        frequency_catalog_rows(probe_frequencies)
-    )
-    if not probe_frequency_frame.empty:
-        probe_frequency_frame["wavelet_uncertainty_warning"] = probe_frequency_frame[
-            "conservative_to_nominal_ratio"
-        ] > float(
-            script_cfg["probe_selection"]["conservative_to_nominal_warning_ratio"]
-        )
-    probe_frequency_frame.to_csv(
-        output_dir / "probe_frequency_catalog.csv",
         index=False,
     )
     rejection_columns = [
@@ -839,14 +530,15 @@ def _run_canonical_generation(
         "input_contracts": input_contracts,
         "sample_domain": "time",
         "increment_contract": generation_contract("time", output_dt).as_dict(),
-        "microtexture_schema": "microtexture_emission_v1",
-        "microtexture_mode": "none",
         "input_lfm_variants": ["canonical", "controlled_default"],
-        "lfm_contract": {
-            "producer_schema": DATA_SCHEMA,
-            "canonical_lowpass_application_count": 1,
-            "variant_selection": "controlled_default",
-        },
+        "lfm_contract": build_lfm_producer_contract(
+            generation_contract("time", output_dt),
+            producer_schema=DATA_SCHEMA,
+            variant_selection={
+                "selected": "controlled_default",
+                "available": ["canonical", "controlled_default"],
+            },
+        ),
         "generator_family": calibration.generator_family,
         "implementation_scope": IMPLEMENTATION_SCOPE,
         "suite": "canonical",
@@ -870,9 +562,6 @@ def _run_canonical_generation(
         "canonical_families": list(CANONICAL_FAMILIES),
         "canonical_config": dict(config),
         "canonical_reference_impedance": reference,
-        "probe_selection": dict(script_cfg["probe_selection"]),
-        "probe_frequency_count": len(probe_frequencies),
-        "probe_variant_count": len(probe_records),
         "seismic_variant_count": len(seismic_variant_records),
         "forward_qc": dict(script_cfg["forward_qc"]),
         "lfm": dict(script_cfg["lfm"]),
@@ -922,7 +611,6 @@ def _run_canonical_generation(
         "accepted_realizations": len(scenarios),
         "rejected_realizations": 0,
         "failed_scenario_count": 0,
-        "probe_variant_count": len(probe_records),
         "seismic_variant_count": len(seismic_variant_records),
     }
     write_json(output_dir / "run_summary.json", summary)
@@ -1113,12 +801,7 @@ def run_generation(
     object_lateral_records: list[dict[str, Any]] = []
     qc_records: list[dict[str, Any]] = []
     rejection_records: list[dict[str, Any]] = list(preflight.rejection_details)
-    probe_records: list[dict[str, Any]] = []
     seismic_variant_records: list[dict[str, Any]] = []
-    probe_frequencies = _load_probe_frequencies(
-        script_cfg=script_cfg,
-        sources=sources,
-    )
     highres_wavelet = (
         resample_wavelet_to_highres(
             wavelet_time,
@@ -1128,7 +811,6 @@ def run_generation(
         if bool(script_cfg["forward_qc"]["highres_mismatch_enabled"])
         else None
     )
-    probe_parent_counts = {section.section_id: 0 for section in sections}
     h5_path = output_dir / "synthetic_benchmark.h5"
     with AttemptProgressLog(
         output_dir / "attempt_progress.csv",
@@ -1156,8 +838,6 @@ def run_generation(
             realization_id = str(plan_row["parent_realization_id"])
             evaluation_role = str(plan_row["evaluation_role"])
             hdf5_group = ""
-            probe_index_local: list[dict[str, Any]] = []
-            probe_records_local: list[dict[str, Any]] = []
             seismic_variant_records_local: list[dict[str, Any]] = []
             base_lfm_index: dict[str, Any] = {}
             try:
@@ -1267,53 +947,8 @@ def run_generation(
                     qc_only=qc_only,
                     source_variant_id="base",
                 )
-                probe_index_local.extend(base_seismic_index)
+                index_records.extend(base_seismic_index)
                 seismic_variant_records_local.extend(base_seismic_results)
-                probe_config = script_cfg["probe_selection"]
-                is_probe_parent = (
-                    probe_frequencies
-                    and scenario.geometry_family
-                    == str(probe_config["field_parent_geometry_family"])
-                    and probe_parent_counts[section.section_id]
-                    < int(probe_config["field_parents_per_section"])
-                )
-                if is_probe_parent:
-                    try:
-                        (
-                            probe_index_extra,
-                            probe_records_extra,
-                            probe_seismic_records_extra,
-                        ) = _probe_records_for_parent(
-                            h5=h5,
-                            parent_path=(
-                                hdf5_group
-                                if hdf5_group
-                                else f"/realizations/{generated.realization_id}"
-                            ),
-                            section=generated,
-                            suite="field_conditioned",
-                            section_id=section.section_id,
-                            split="benchmark",
-                            evaluation_role=evaluation_role,
-                            frequencies=probe_frequencies,
-                            script_cfg=script_cfg,
-                            wavelet_time_s=wavelet_time,
-                            wavelet=wavelet,
-                            highres_wavelet=highres_wavelet,
-                            base_highres_forward=highres_result,
-                            qc_only=qc_only,
-                        )
-                        probe_index_local.extend(probe_index_extra)
-                        probe_records_local.extend(probe_records_extra)
-                        seismic_variant_records_local.extend(
-                            probe_seismic_records_extra
-                        )
-                    except Exception as exc:
-                        raise RuntimeError(
-                            "frequency_probe_generation_failed:"
-                            f"{generated.realization_id}:{exc}"
-                        ) from exc
-                    probe_parent_counts[section.section_id] += 1
                 object_records.extend(generated.object_catalog)
                 object_lateral_records.extend(generated.object_lateral_coefficients)
                 status = "ok"
@@ -1340,7 +975,6 @@ def run_generation(
                     (
                         "highres_forward_qc_failed",
                         "invalid_model_grid_forward",
-                        "frequency_probe_generation_failed",
                     )
                 ):
                     raise
@@ -1370,8 +1004,6 @@ def run_generation(
             }
             index_records.append(record)
             if status == "ok":
-                index_records.extend(probe_index_local)
-                probe_records.extend(probe_records_local)
                 seismic_variant_records.extend(seismic_variant_records_local)
             qc_records.append(
                 {
@@ -1455,25 +1087,8 @@ def run_generation(
     pd.DataFrame.from_records(qc_records).to_csv(
         output_dir / "generation_qc.csv", index=False
     )
-    pd.DataFrame.from_records(probe_records).to_csv(
-        output_dir / "frequency_probe_results.csv",
-        index=False,
-    )
     pd.DataFrame.from_records(seismic_variant_records).to_csv(
         output_dir / "seismic_variant_results.csv",
-        index=False,
-    )
-    probe_frequency_frame = pd.DataFrame.from_records(
-        frequency_catalog_rows(probe_frequencies)
-    )
-    if not probe_frequency_frame.empty:
-        probe_frequency_frame["wavelet_uncertainty_warning"] = probe_frequency_frame[
-            "conservative_to_nominal_ratio"
-        ] > float(
-            script_cfg["probe_selection"]["conservative_to_nominal_warning_ratio"]
-        )
-    probe_frequency_frame.to_csv(
-        output_dir / "probe_frequency_catalog.csv",
         index=False,
     )
     rejection_columns = [
@@ -1600,14 +1215,15 @@ def run_generation(
         "config_provenance": dict(config_provenance),
         "sample_domain": "time",
         "increment_contract": generation_contract("time", output_dt).as_dict(),
-        "microtexture_schema": "microtexture_emission_v1",
-        "microtexture_mode": "none",
         "input_lfm_variants": ["canonical", "controlled_default"],
-        "lfm_contract": {
-            "producer_schema": DATA_SCHEMA,
-            "canonical_lowpass_application_count": 1,
-            "variant_selection": "controlled_default",
-        },
+        "lfm_contract": build_lfm_producer_contract(
+            generation_contract("time", output_dt),
+            producer_schema=DATA_SCHEMA,
+            variant_selection={
+                "selected": "controlled_default",
+                "available": ["canonical", "controlled_default"],
+            },
+        ),
         "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
         "global_seed": int(script_cfg["global_seed"]),
         "output_dt_s": output_dt,
@@ -1636,10 +1252,6 @@ def run_generation(
                 feasibility_path, root=repo_root
             ),
         },
-        "probe_selection": dict(script_cfg["probe_selection"]),
-        "probe_frequency_count": len(probe_frequencies),
-        "probe_variant_count": len(probe_records),
-        "probe_parent_counts": probe_parent_counts,
         "seismic_variant_count": len(seismic_variant_records),
         "forward_qc": dict(script_cfg["forward_qc"]),
         "lfm": dict(script_cfg["lfm"]),
@@ -1725,7 +1337,6 @@ def run_generation(
             if not completed_with_warnings
             else ["scenario_acceptance_qc_failed"]
         ),
-        "probe_variant_count": len(probe_records),
         "seismic_variant_count": len(seismic_variant_records),
     }
     write_json(output_dir / "run_summary.json", summary)

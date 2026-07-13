@@ -9,9 +9,9 @@ from typing import Any, Mapping
 import numpy as np
 from scipy.signal import firwin
 
-from cup.canonical_increment import canonical_lowpass, decompose_log_ai, generation_contract
-from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION
-from cup.synthetic.random import ar1_irregular, named_rng
+from cup.impedance import canonical_lowpass, decompose_log_ai, generation_contract
+from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION
+from cup.synthetic.core.random import ar1_irregular, named_rng
 from cup.utils.statistics import centered_rms
 
 

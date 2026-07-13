@@ -2,87 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
 from cup.physics.numpy_backend import forward_time, reflectivity_from_log_ai
-from cup.synthetic.calibration import (
+from cup.synthetic.core.calibration import (
     PROFILE_METRICS,
     ImpedanceCalibration,
     STATE_NAMES,
     object_profile_metrics,
 )
-from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION
-from cup.synthetic.forward import antialias_taps, categorical_model_grids, downsample_continuous
-from cup.synthetic.random import ar1_irregular, named_rng
-
-
-@dataclass(frozen=True)
-class GenerationScenario:
-    scenario_id: str
-    duration_mode: str
-    geometry_family: str
-    geometry_direction: str
-    correlation_length_fraction: float
-    coefficient_sigma_multiplier: float
-    thickness_log_sigma: float
-    variant_id: str = ""
-
-
-@dataclass(frozen=True)
-class GeneratedSection:
-    realization_id: str
-    scenario: GenerationScenario
-    lateral_m: np.ndarray
-    inline_float: np.ndarray
-    xline_float: np.ndarray
-    x_m: np.ndarray
-    y_m: np.ndarray
-    twt_highres_s: np.ndarray
-    twt_model_s: np.ndarray
-    truth_log_ai_highres: np.ndarray
-    model_target_log_ai: np.ndarray
-    reflectivity_highres: np.ndarray
-    reflectivity_model: np.ndarray
-    seismic_model_consistent: np.ndarray
-    rgt_highres: np.ndarray
-    rgt_model: np.ndarray
-    state_id_highres: np.ndarray
-    object_id_highres: np.ndarray
-    object_xi_highres: np.ndarray
-    zone_id_highres: np.ndarray
-    geometry_event_mask_highres: np.ndarray
-    boundary_mask_highres: np.ndarray
-    boundary_fraction_model: np.ndarray
-    boundary_mask_model: np.ndarray
-    state_fraction_model: np.ndarray
-    dominant_object_id_model: np.ndarray
-    zone_id_model: np.ndarray
-    valid_mask_model: np.ndarray
-    forward_valid_mask_highres: np.ndarray
-    forward_valid_mask_model: np.ndarray
-    object_catalog: list[dict[str, Any]]
-    object_lateral_coefficients: list[dict[str, Any]]
-    qc: dict[str, Any]
-
-
-class GenerationRejected(ValueError):
-    """A complete realization that failed one or more frozen QC rules."""
-
-    def __init__(
-        self,
-        reasons: Sequence[str],
-        *,
-        diagnostics: Mapping[str, Any],
-        details: Sequence[Mapping[str, Any]],
-    ) -> None:
-        unique_reasons = tuple(dict.fromkeys(str(reason) for reason in reasons))
-        super().__init__(";".join(unique_reasons))
-        self.reasons = unique_reasons
-        self.diagnostics = dict(diagnostics)
-        self.details = [dict(item) for item in details]
+from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION
+from cup.synthetic.time.forward import antialias_taps, categorical_model_grids, downsample_continuous
+from cup.synthetic.core.random import ar1_irregular, named_rng
+from cup.synthetic.core.generation import GeneratedSection, GenerationRejected, GenerationScenario
 
 
 def _rng_keys(

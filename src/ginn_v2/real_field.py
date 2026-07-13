@@ -19,7 +19,7 @@ from cup.seismic.wavelet import (
     compute_wavelet_active_half_support_s,
     infer_wavelet_dt,
 )
-from cup.synthetic.dataset import SynthoseisBenchmark
+from cup.synthetic.benchmark import SynthoseisBenchmark
 from cup.utils.io import (
     repo_relative_path,
     require_contract_fingerprint,

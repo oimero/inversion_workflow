@@ -8,7 +8,7 @@
 - [Synthoseis-lite 微纹理生成方法论规格](SYNTHOSEIS_MICROTEXTURE_GENERATION_DESIGN.md)。
 - [Synthoseis-lite 阶段 2.5 边界重构规格](SYNTHOSEIS_LITE_STAGE_2_5_REFACTOR_AND_REVIEW_FIXES.md)。
 
-它记录已经锁定的公共语义、实现顺序、每个阶段的完成条件和当前状态，供后续开启 goal 模式后逐项推进。阶段 1/2 的代码已落地，阶段 2.5 负责在进入微纹理前完成公共合同、probe 关闭和包边界收口；历史产物目录保持不变。
+它记录已经锁定的公共语义、实现顺序、每个阶段的完成条件和当前状态，供后续开启 goal 模式后逐项推进。阶段 1/2 的代码已落地，阶段 2.5 负责完成公共合同、probe 关闭和包边界收口；阶段 3 先稳定现有 v4 主链，微纹理及其 A/B/C benchmark 延后到主链验收之后；历史产物目录保持不变。
 
 ## 2. 当前结论
 
@@ -83,7 +83,7 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - canonical/deployment closure、R0/R1 新字段和反事实报告；
 - 旧生产实现的清理提交。
 
-这些事项是后续 goal 的工作内容，不在本 HANDOFF 中假定已经完成。阶段 1 和阶段 2 已落地在 `cup.impedance`、Synthoseis-lite v4 writer/reader、LFM variant writer 和生成 manifest 中；阶段 2.5 的稳定性门禁完成后才允许开始阶段 3。
+这些事项是后续 goal 的工作内容，不在本 HANDOFF 中假定已经完成。阶段 1 和阶段 2 已落地在 `cup.impedance`、Synthoseis-lite v4 writer/reader、LFM variant writer 和生成 manifest 中。微纹理规格中的阶段 3/4 不作为阶段 2.5 的直接后继；先完成 v4 主链和 GINN v2 核心链路，随后才进入本 HANDOFF 的阶段 11/12。
 
 ### 3.3 阶段 2.5 对称性收口（本轮）
 
@@ -111,6 +111,8 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
   CSV 变体有效样点数统一归一化为整数后再由 reader 校验。
 
 本轮不改微纹理、GINN v2、physics、R0/R1，也不迁移旧 v4 产物。
+
+阶段调整：原计划中的“阶段 3：微纹理 bank 与 emitter”和“阶段 4：paired A/B/C benchmark”分别延期为本 HANDOFF 的阶段 11 和阶段 12。当前正在运行的完整 v4 工区生成属于阶段 3 的主链稳定化门禁；在它以及后续 GINN v2、R0/R1 主链验收完成前，不引入微纹理变量，以免把生成合同问题和模型消融问题混在一起。
 
 ## 4. 推荐实施顺序与完成条件
 
@@ -157,26 +159,19 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 但 v4 writer、reader、baseline evaluator 和 GINN v2 新 report 不再生成这些字段；该历史
 读取不参与新训练或 v4 benchmark 消费。
 
-### 阶段 3：微纹理 bank 与领域无关 emitter
+### 阶段 3：Synthoseis-lite v4 主链稳定化与基线冻结
 
-- [ ] 固定 `MicrotextureEmission` 接口、物理单位、seed 和 metadata；
-- [ ] 在最终规则时间轴/TVDSS 轴上建立训练井 canonical texture bank；
-- [ ] 检查训练井、留出井和 bank coverage 隔离；
-- [ ] 实现 A 的 `none`、B 的 `thin_bed_cluster`、C 的 `canonical_well_patch`；
-- [ ] 对对象边界、厚度、振幅、端点跳变、clipping 和 reversal 做 QC。
+- [ ] 完成当前 v4 深度域全量工区生成，确认 preflight、writer、manifest、reader 和 baseline evaluator 能消费同一新目录；
+- [ ] 对生成结果执行 sample index、canonical decomposition、observed/model-consistent seismic、mask、LFM variant 和 split 的完整检查；
+- [ ] 保持 `microtexture_mode=none` 的现有主链，不在本阶段加入纹理 emitter 或 paired benchmark；
+- [ ] 记录场景接受率、拒绝原因和 `development_limited` 等状态，不把 attempt-level 拒绝误报为生成成功；
+- [ ] 形成一份可冻结的 v4 baseline manifest 和评估报告，不覆盖 20260706 等历史目录。
 
-完成条件：固定 seed 完全确定；对象外扰动为零；所有厚度和长度以秒/米表达；A/B/C 的 emitter 输出均可独立复算。
+时间域真实 source 可用前只做 fixture reader/baseline 验证，不声称完成时间域工区 smoke。深度域当前运行的 `20260714` 输出在完成后写入本阶段证据。
 
-### 阶段 4：paired A/B/C benchmark
+完成条件：新输出目录可被 v4 reader 和 baseline evaluator 独立读取；有限点的 canonical 重组成立；observed input、model-consistent 参照、mask、LFM variant 和坐标轴合同完整；旧 probe 和旧 v4 schema 明确失败；生成 acceptance/report 已冻结。
 
-- [ ] 一次生成 `macro_parent`，再实例化三个 mode；
-- [ ] 实现组级全成功/全拒绝和原因记录；
-- [ ] 保持三组 benchmark 的 parent 集合、split、LFM、mismatch 和预算一致；
-- [ ] 生成 `shared_none_test`、`shared_thin_bed_cluster_test`、`shared_canonical_well_patch_test`。
-
-完成条件：三组 benchmark 的 `macro_parent_id` 集合一致；任一 mode 失败不会留下不完整 paired group；跨模式测试矩阵可运行。
-
-### 阶段 5：最小 GINN v2 synthetic supervised 垂直切片
+### 阶段 4：最小 GINN v2 synthetic supervised 垂直切片
 
 - [ ] v4 reader 只暴露 canonical 字段；
 - [ ] 先选择最简单 trace 架构打通 `v4 -> batch -> increment MSE`；
@@ -186,7 +181,7 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 
 完成条件：一个最小 epoch smoke 可以从 v4 fixture 完成监督训练、恢复 checkpoint 和增量预测；旧 schema 输入明确失败。
 
-### 阶段 6：四类架构与 synthetic closure
+### 阶段 5：四类架构与 synthetic closure
 
 - [ ] 将同一 canonical 接口扩展到四种纯架构；
 - [ ] 实现 canonical closure 与 deployment closure；
@@ -195,7 +190,7 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 
 完成条件：四种架构输出形状、零初始化和有限梯度一致；两类 closure 可以由保存数组复算。
 
-### 阶段 7：synthetic physics 与部署资格
+### 阶段 6：synthetic physics 与部署资格
 
 - [ ] physics 使用 canonical background 或明确的 deployment LFM 组合；
 - [ ] `increment_l2_weight` 作为唯一增量正则字段；
@@ -205,7 +200,7 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 
 完成条件：监督后 physics 前向、反向和有限梯度通过；非法 physics-first、zero-initialized physics 和不具备部署资格的 checkpoint 明确失败。
 
-### 阶段 8：真实 LFM 与真实井监督
+### 阶段 7：真实 LFM 与真实井监督
 
 - [ ] 真实井按 MD -> 轨迹/时深映射 -> 最终规则轴重采样 -> canonical P -> well increment 顺序处理；
 - [ ] 真实 LFM 只校验 producer metadata，并透传最终体 complement-response QC；
@@ -213,6 +208,15 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - [ ] 井间 physics 漂移、LFM-only 指标和最终 AI 指标分开报告。
 
 完成条件：时间域和深度域 golden fixture 在最终规则轴上复算一致；井监督与 synthetic increment 语义一致。
+
+### 阶段 8：真实 physics 与部署闭环
+
+- [ ] synthetic/real physics 使用明确的 canonical/deployment closure 输入；
+- [ ] 真实工区 physics 只在合法 supervised ancestor 上启动；
+- [ ] 报告 physics 前后 increment 漂移、LFM-only 指标和井间 QC；
+- [ ] 记录真实 physics 阶段的 selection metric 与 deployment eligibility。
+
+完成条件：时间域和深度域 physics 前向、反向和有限梯度通过；real-well-plus-physics 仍按 experimental 规则处理；不存在 physics-first 或 waveform-best 直接部署路径。
 
 ### 阶段 9：R0、R1 与反事实报告
 
@@ -225,15 +229,42 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 
 完成条件：R0/R1 只接受新 checkpoint/LFM schema；覆盖、坐标和 closure 数组可复算。
 
-### 阶段 10：A/B/C GINN 消融与默认入口切换
+### 阶段 10：核心主链对照、默认入口切换与旧代码清理
 
-- [ ] A/B/C 使用相同架构、split、seed、normalization 和训练预算分别训练；
-- [ ] 交叉测试 false texture、薄层漏检、井纹理覆盖和跨模式迁移；
-- [ ] 对照 full-correction 基线，单独报告合同正确性和模型效果；
+- [ ] 对照冻结的 full-correction 基线，单独报告 canonical contract 正确性和模型效果；
+- [ ] 确认 v4 → GINN v2 → R0/R1 主链在新 schema 下可重复运行；
 - [ ] 只有完整回归通过后才切换默认入口；
 - [ ] 按清单退役被替代的旧生产代码，历史产物由冻结目录和 Git 历史保证可复现。
 
-完成条件：第 10.1–10.5 验收矩阵和完整 smoke 通过；默认入口与文档入口使用 canonical increment 语义。
+完成条件：主规格第 10.1–10.5 验收矩阵和完整 smoke 通过；默认入口与文档入口使用 canonical increment 语义。
+
+### 阶段 11（延期）：微纹理 bank 与领域无关 emitter
+
+- [ ] 固定 `MicrotextureEmission` 接口、物理单位、seed 和 metadata；
+- [ ] 在最终规则时间轴/TVDSS 轴上建立训练井 canonical texture bank；
+- [ ] 检查训练井、留出井和 bank coverage 隔离；
+- [ ] 实现 A 的 `none`、B 的 `thin_bed_cluster`、C 的 `canonical_well_patch`；
+- [ ] 对对象边界、厚度、振幅、端点跳变、clipping 和 reversal 做 QC。
+
+完成条件：固定 seed 完全确定；对象外扰动为零；所有厚度和长度以秒/米表达；A/B/C 的 emitter 输出均可独立复算。只有阶段 10 主链稳定后才开启本阶段。
+
+### 阶段 12（延期）：paired A/B/C benchmark
+
+- [ ] 一次生成 `macro_parent`，再实例化三个 mode；
+- [ ] 实现组级全成功/全拒绝和原因记录；
+- [ ] 保持三组 benchmark 的 parent 集合、split、LFM、mismatch 和预算一致；
+- [ ] 生成 `shared_none_test`、`shared_thin_bed_cluster_test`、`shared_canonical_well_patch_test`。
+
+完成条件：三组 benchmark 的 `macro_parent_id` 集合一致；任一 mode 失败不会留下不完整 paired group；跨模式测试矩阵可运行。
+
+### 阶段 13（延期）：A/B/C GINN 消融与后续入口评估
+
+- [ ] A/B/C 使用相同架构、split、seed、normalization 和训练预算分别训练；
+- [ ] 交叉测试 false texture、薄层漏检、井纹理覆盖和跨模式迁移；
+- [ ] 只在合同、主链回归和 paired benchmark 全部通过后，评估是否切换微纹理默认入口；
+- [ ] 微纹理实验与无纹理 v4 baseline 分开报告，不覆盖既有主链结果。
+
+完成条件：微纹理 A/B/C 的数据生成、训练和评估均可独立复现；效果结论作为消融报告，不反向修改 canonical increment 语义。
 
 ## 5. 关键验收矩阵
 
@@ -275,7 +306,7 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 
 ## 6. 后续 goal 的首个任务
 
-建议下一个 goal 从阶段 3 开始，先实现微纹理 bank 与领域无关 emitter，再建立 A/B/C paired benchmark。不要同时接入 GINN v2、physics、真实井或 R0。每完成一项就在对应复选框勾选并记录测试命令、fixture 和产物路径。
+建议下一个 goal 从阶段 3 开始，先完成当前 v4 主链的全量生成、reader/evaluator 验收和 baseline 冻结；不要在此之前实现微纹理。阶段 3 通过后，再按阶段 4–10 逐层接入 GINN v2、physics、真实井、R0/R1 和默认入口切换，最后才开启阶段 11/12 的微纹理与 paired A/B/C。每完成一项就在对应复选框勾选并记录测试命令、fixture 和产物路径。
 
 ## 7. 阶段 1/2 验证证据
 

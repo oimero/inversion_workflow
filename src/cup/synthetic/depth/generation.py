@@ -1,4 +1,4 @@
-"""Depth field-conditioned generation and v3 artifact writer."""
+"""Depth field-conditioned generation and v4 artifact writer."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import pandas as pd
 import scipy
 from scipy.signal import firwin, hilbert
 
+from cup.canonical_increment import canonical_lowpass, decompose_log_ai, generation_contract
 from cup.petrel.load import import_interpretation_petrel
 from cup.physics.numpy_backend import (
     forward_depth,
@@ -595,20 +596,14 @@ def generate_depth_realization(
 
     ideal_cfg = script_cfg["lfm"]["ideal"]
     degraded_cfg = script_cfg["lfm"]["controlled_degraded"]
-    lfm_ideal = _spatial_lowpass(
+    canonical_contract = generation_contract("depth", model_dz)
+    lfm_ideal, _target_increment = decompose_log_ai(
         model_log,
-        dz_m=model_dz,
-        wavelength_m=float(ideal_cfg["minimum_wavelength_m"]),
-        numtaps=int(ideal_cfg["numtaps"]),
-        beta=float(ideal_cfg["kaiser_beta"]),
+        model_axis,
+        canonical_contract,
+        valid_mask=valid,
     )
-    lfm_degraded = _spatial_lowpass(
-        model_log,
-        dz_m=model_dz,
-        wavelength_m=float(degraded_cfg["minimum_wavelength_m"]),
-        numtaps=int(degraded_cfg["numtaps"]),
-        beta=float(degraded_cfg["kaiser_beta"]),
-    )
+    lfm_degraded = lfm_ideal.copy()
     lfm_degraded = _controlled_degraded_lfm(
         lfm_degraded,
         config=degraded_cfg,
@@ -617,6 +612,13 @@ def generate_depth_realization(
         global_seed=int(script_cfg["global_seed"]),
         realization_id=realization_id,
     )
+    lfm_degradation = canonical_lowpass(
+        lfm_degraded - lfm_ideal,
+        model_axis,
+        canonical_contract,
+        valid_mask=valid,
+    )
+    lfm_degraded = lfm_ideal + lfm_degradation
     residual_vs_lfm_ideal = model_log - lfm_ideal
     residual_vs_lfm_degraded = model_log - lfm_degraded
 
@@ -753,6 +755,8 @@ def _write_base(h5: h5py.File, section: DepthGeneratedSection) -> str:
     root = h5.create_group(path)
     root.attrs["sample_domain"] = "depth"
     root.attrs["depth_basis"] = "tvdss"
+    root.attrs["microtexture_schema"] = "microtexture_emission_v1"
+    root.attrs["microtexture_mode"] = "none"
     axes = root.create_group("axes")
     _dataset(
         axes,
@@ -812,6 +816,36 @@ def _write_base(h5: h5py.File, section: DepthGeneratedSection) -> str:
             axis_path=f"{path}/axes/{axis}",
             axis_order="lateral,tvdss",
         )
+    canonical_contract = generation_contract(
+        "depth", float(np.diff(np.asarray(section.tvdss_model_m, dtype=np.float64)[:2])[0])
+    )
+    canonical_background, target_increment = decompose_log_ai(
+        np.asarray(section.model_target_log_ai, dtype=np.float64),
+        np.asarray(section.tvdss_model_m, dtype=np.float64),
+        canonical_contract,
+        valid_mask=np.asarray(section.valid_mask_model, dtype=bool),
+    )
+    root.attrs["increment_contract_json"] = json.dumps(
+        canonical_contract.as_dict(), sort_keys=True
+    )
+    priors = root.create_group("priors")
+    targets = root.create_group("targets")
+    _dataset(
+        priors,
+        "canonical_background_log_ai",
+        canonical_background.astype(np.float32),
+        unit="ln(m/s*g/cm3)",
+        axis_path=f"{path}/axes/tvdss_model_m",
+        axis_order="lateral,tvdss",
+    )
+    _dataset(
+        targets,
+        "target_increment_log_ai",
+        target_increment.astype(np.float32),
+        unit="ln(m/s*g/cm3)",
+        axis_path=f"{path}/axes/tvdss_model_m",
+        axis_order="lateral,tvdss",
+    )
     _dataset(
         truth,
         "geometry_event_mask_highres",
@@ -858,7 +892,6 @@ def _write_base(h5: h5py.File, section: DepthGeneratedSection) -> str:
             axis_path=f"{path}/axes/tvdss_model_m",
             axis_order="lateral,tvdss",
         )
-    priors = root.create_group("priors")
     _dataset(
         priors,
         "lfm_ideal",
@@ -870,6 +903,25 @@ def _write_base(h5: h5py.File, section: DepthGeneratedSection) -> str:
     _dataset(
         priors,
         "lfm_controlled_degraded",
+        section.lfm_controlled_degraded.astype(np.float32),
+        unit="ln(m/s*g/cm3)",
+        axis_path=f"{path}/axes/tvdss_model_m",
+        axis_order="lateral,tvdss",
+    )
+    input_variants = priors.create_group("input_lfm_variants")
+    canonical = input_variants.create_group("canonical")
+    _dataset(
+        canonical,
+        "log_ai",
+        section.lfm_ideal.astype(np.float32),
+        unit="ln(m/s*g/cm3)",
+        axis_path=f"{path}/axes/tvdss_model_m",
+        axis_order="lateral,tvdss",
+    )
+    controlled = input_variants.create_group("controlled_default")
+    _dataset(
+        controlled,
+        "log_ai",
         section.lfm_controlled_degraded.astype(np.float32),
         unit="ln(m/s*g/cm3)",
         axis_path=f"{path}/axes/tvdss_model_m",
@@ -1534,6 +1586,10 @@ def run_depth_generation(
                     "model_dz_m": float(np.diff(generated.tvdss_model_m[:2])[0]),
                     "physics_halo_m": generated.qc["physics_halo_m"],
                     "physics_halo_samples": generated.qc["physics_halo_samples"],
+                    "lfm_variant_id": "controlled_default",
+                    "input_lfm_log_ai_dataset": (
+                        "" if qc_only else f"{group_path}/priors/input_lfm_variants/controlled_default/log_ai"
+                    ),
                 })
                 local_index_rows = [
                     {
@@ -1794,6 +1850,15 @@ def run_depth_generation(
         "failure_reason": failure_reason,
         "input_contracts": input_contracts,
         "sample_domain": "depth",
+        "increment_contract": generation_contract("depth", float(script_cfg["sampling"]["expected_model_dz_m"])).as_dict(),
+        "microtexture_schema": "microtexture_emission_v1",
+        "microtexture_mode": "none",
+        "input_lfm_variants": ["canonical", "controlled_default"],
+        "lfm_contract": {
+            "producer_schema": SCHEMA_VERSION,
+            "canonical_lowpass_application_count": 1,
+            "variant_selection": "controlled_default",
+        },
         "depth_basis": "tvdss",
         "generator_family": GENERATOR_FAMILY,
         "suite": "field_conditioned",

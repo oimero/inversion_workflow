@@ -1,4 +1,4 @@
-"""Reader for frozen Synthoseis-lite v3 time-domain artifacts."""
+"""Reader for Synthoseis-lite v4 time-domain artifacts."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import h5py
 import numpy as np
 import pandas as pd
 
+from cup.canonical_increment import CanonicalIncrementContract, validate_sample_axis
 from cup.synthetic.core import (
     validate_dataset_metadata,
     validate_training_manifest,
@@ -30,6 +31,9 @@ class TimeV2SyntheticSample:
     row: dict[str, Any]
     sample_domain: str
     target_log_ai: np.ndarray
+    canonical_background_log_ai: np.ndarray
+    target_increment_log_ai: np.ndarray
+    input_lfm_log_ai: np.ndarray
     seismic_input: np.ndarray
     seismic_model_consistent: np.ndarray
     valid_mask: np.ndarray
@@ -87,7 +91,7 @@ def _pad_forward_to_model(
 
 
 class TimeV2Benchmark:
-    """Read-only accessor around ``synthoseis_lite_v3`` time artifacts."""
+    """Read-only accessor around ``synthoseis_lite_v4`` time artifacts."""
 
     schema = SCHEMA_VERSION
     sample_domain = "time"
@@ -118,7 +122,12 @@ class TimeV2Benchmark:
                 f"Unsupported time Synthoseis schema {actual_schema!r}; expected {SCHEMA_VERSION!r}."
             )
         if str(self.manifest.get("sample_domain") or "").casefold() != "time":
-            raise ValueError("Time v3 reader requires sample_domain=time.")
+            raise ValueError("Time v4 reader requires sample_domain=time.")
+        self.increment_contract = CanonicalIncrementContract.from_mapping(
+            self.manifest.get("increment_contract") or {}
+        )
+        if self.increment_contract.sample_domain != "time":
+            raise ValueError("Time benchmark increment_contract must use sample_domain=time.")
         validate_training_manifest(self.manifest, sample_domain="time")
         require_contract_fingerprint(self.manifest, label=f"benchmark {self.run_dir}")
 
@@ -230,7 +239,7 @@ class TimeV2Benchmark:
         if split is not None:
             if "split" not in frame:
                 raise ValueError(
-                    "Time v3 train/validation/test split is derived by the training adapter."
+                    "Time v4 train/validation/test split is derived by the training adapter."
                 )
             frame = frame[frame["split"].astype(str).eq(split)]
         return [str(value) for value in frame["sample_id"].tolist()]
@@ -278,6 +287,21 @@ class TimeV2Benchmark:
                 h5[f"{root_path}/axes/lateral_m"][()], dtype=np.float64
             )
             twt = np.asarray(h5[f"{root_path}/axes/twt_model_s"][()], dtype=np.float64)
+            validate_sample_axis(twt, self.increment_contract)
+            canonical_background = np.asarray(
+                h5[f"{root_path}/priors/canonical_background_log_ai"][()],
+                dtype=np.float64,
+            )
+            target_increment = np.asarray(
+                h5[f"{root_path}/targets/target_increment_log_ai"][()],
+                dtype=np.float64,
+            )
+            variant_id = _clean_path(row.get("lfm_variant_id")) or "controlled_default"
+            input_lfm_path = _clean_path(row.get("input_lfm_log_ai_dataset"))
+            if not input_lfm_path:
+                input_lfm_path = (
+                    f"{root_path}/priors/input_lfm_variants/{variant_id}/log_ai"
+                )
             priors = {
                 "lfm_ideal": self._read_optional_dataset(
                     h5,
@@ -291,23 +315,34 @@ class TimeV2Benchmark:
                     "lfm_controlled_degraded_dataset",
                     f"{source_group}/priors/lfm_controlled_degraded",
                 ),
+                "canonical_background_log_ai": canonical_background,
+                "input_lfm_log_ai": np.asarray(h5[input_lfm_path][()], dtype=np.float64),
             }
         for name, values in {
             "valid": valid,
             "physics_valid": physics_valid,
             "seismic": seismic,
             "consistent": consistent,
+            "canonical_background": canonical_background,
+            "target_increment": target_increment,
+            "input_lfm": priors["input_lfm_log_ai"],
         }.items():
             if values.shape != model_shape:
                 raise ValueError(
                     f"{name}/target shape mismatch for {sample_id}: {values.shape} vs {model_shape}"
                 )
+        finite = np.isfinite(target) & np.isfinite(canonical_background) & np.isfinite(target_increment)
+        if np.any(finite & (np.abs(target - canonical_background - target_increment) > 1e-5)):
+            raise ValueError(f"Canonical increment decomposition mismatch for {sample_id}.")
         return TimeV2SyntheticSample(
             sample_id=str(sample_id),
             sample_kind=sample_kind,
             row=row,
             sample_domain="time",
             target_log_ai=np.asarray(target, dtype=np.float64),
+            canonical_background_log_ai=canonical_background,
+            target_increment_log_ai=target_increment,
+            input_lfm_log_ai=priors["input_lfm_log_ai"],
             seismic_input=seismic,
             seismic_model_consistent=consistent,
             valid_mask=valid,

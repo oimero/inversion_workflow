@@ -7,7 +7,7 @@
 - [GINN v2 Canonical Increment 语义重构规格](GINN_V2_CANONICAL_INCREMENT_SEMANTICS.md)；
 - [Synthoseis-lite 微纹理生成方法论规格](SYNTHOSEIS_MICROTEXTURE_GENERATION_DESIGN.md)。
 
-它记录已经锁定的公共语义、实现顺序、每个阶段的完成条件和当前状态，供后续开启 goal 模式后逐项推进。本文本身只描述实施边界和验收合同；本轮没有修改生产代码、配置、测试或历史产物。
+它记录已经锁定的公共语义、实现顺序、每个阶段的完成条件和当前状态，供后续开启 goal 模式后逐项推进。阶段 1/2 已修改共享算子、Synthoseis-lite v4 生产/读取链路和对应测试；历史产物目录保持不变。
 
 ## 2. 当前结论
 
@@ -76,15 +76,13 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 
 ### 3.2 本轮尚未实施
 
-- 共享 canonical operator 的生产代码；
-- v4 benchmark writer/reader 与完整道标签写入；
 - 微纹理 bank、三种 emitter 和 paired-group 生成器；
 - GINN v2 v2/v5 schema、increment batch/loss/checkpoint；
 - 真实井 canonical increment reader；
 - canonical/deployment closure、R0/R1 新字段和反事实报告；
 - 旧生产实现的清理提交。
 
-这些事项是后续 goal 的工作内容，不在本 HANDOFF 中假定已经完成。
+这些事项是后续 goal 的工作内容，不在本 HANDOFF 中假定已经完成。阶段 1 和阶段 2 已落地在共享 `cup.canonical_increment`、Synthoseis-lite v4 writer/reader、LFM variant writer 和生成 manifest 中。
 
 ## 4. 推荐实施顺序与完成条件
 
@@ -92,23 +90,23 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 
 ### 阶段 1：共享 canonical 基础算子
 
-- [ ] 增加领域无关的 canonical lowpass/decomposition 模块；
-- [ ] 实现时间域和深度域合同解析；
-- [ ] 支持连续有限段、NaN 间隙、invalid mask 和短段明确失败；
-- [ ] 按权威 `sample_interval` 检查 float64 规则轴；
-- [ ] 输出 `canonical_background_log_ai` 与 `target_increment_log_ai`。
+- [x] 增加领域无关的 canonical lowpass/decomposition 模块；
+- [x] 实现时间域和深度域合同解析；
+- [x] 支持连续有限段、NaN 间隙、invalid mask 和短段明确失败；
+- [x] 按权威 `sample_interval` 检查 float64 规则轴；
+- [x] 输出 `canonical_background_log_ai` 与 `target_increment_log_ai`。
 
-完成条件：时间域、深度域、NaN 间隙、短段和 cutoff 响应 fixture 全部通过；`target == background + increment` 在有限点成立。
+完成条件：时间域、深度域、NaN 间隙、短段和 cutoff 响应 fixture 全部通过；`target == background + increment` 在有限点成立。状态：已完成。
 
 ### 阶段 2：Synthoseis-lite v4 生产端
 
-- [ ] 在完整合成道上写入规范背景和规范增量；
-- [ ] 写入多个 `input_lfm_log_ai` variant，并保证同一父 realization 共享 target increment；
-- [ ] 写入 canonical contract 和 LFM producer metadata；
-- [ ] 为微纹理组件和对象目录预留 v4 字段；
-- [ ] 保持历史 benchmark 目录不变。
+- [x] 在完整合成道上写入规范背景和规范增量；
+- [x] 写入多个 `input_lfm_log_ai` variant，并保证同一父 realization 共享 target increment；
+- [x] 写入 canonical contract 和 LFM producer metadata；
+- [x] 为微纹理组件和对象目录预留 v4 字段；
+- [x] 保持历史 benchmark 目录不变。
 
-完成条件：v4 fixture 可独立复算 composite、canonical background、target increment 和 LFM variant；patch 标签等于完整道标签的直接切片。
+完成条件：v4 fixture 可独立复算 composite、canonical background、target increment 和 LFM variant；patch 标签等于完整道标签的直接切片。状态：fixture 已完成，完整工区重生成留待后续运行。
 
 ### 阶段 3：微纹理 bank 与领域无关 emitter
 
@@ -228,9 +226,39 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 
 ## 6. 后续 goal 的首个任务
 
-建议下一个 goal 从阶段 1 开始，只实现共享 canonical 基础算子和对应 fixture。不要同时接入微纹理、physics、真实井或 R0。阶段 1 通过后，再按本 HANDOFF 的阶段 2 到阶段 10 推进，每完成一项就在对应复选框勾选并记录测试命令、fixture 和产物路径。
+建议下一个 goal 从阶段 3 开始，先实现微纹理 bank 与领域无关 emitter，再建立 A/B/C paired benchmark。不要同时接入 GINN v2、physics、真实井或 R0。每完成一项就在对应复选框勾选并记录测试命令、fixture 和产物路径。
 
-## 7. 相关文档
+## 7. 阶段 1/2 验证证据
+
+已运行：
+
+```text
+PYTHONPATH=src python -m pytest -q -p no:cacheprovider tests/test_canonical_increment.py tests/test_synthoseis_v4_canonical.py
+```
+
+结果：`11 passed`。
+
+覆盖内容：
+
+- 时间域和深度域完整道分解恒等式；
+- NaN 间隙独立滤波、短段显式失败和规则采样轴校验；
+- v4 writer 写入 `canonical_background_log_ai`、`target_increment_log_ai`；
+- 时间域和深度域 writer 均写入 canonical 字段；
+- canonical 与 controlled 两个 LFM variant；
+- LFM producer 的 canonical background 和 variant 复算；
+- v4 reader 暴露 canonical 字段；
+- v4 facade 拒绝冻结 v3 manifest；
+- 固定 seed 的微纹理 `none` emitter 接口预留。
+
+完整工区 v4 生成尚未作为长时间 smoke 运行；运行前应使用新的 v4 配置和新的输出目录，不覆盖 20260706 冻结目录。
+
+补充验证：
+
+- `python -m compileall -q src/cup` 通过；
+- 当前深度 v4 组合配置可由 `load_composed_config` 与 `parse_depth_v2_config` 解析；
+- 读取 `experiments/synthoseis_lite/results/20260706/generate_field_conditioned` 时明确拒绝冻结的 v3 benchmark。
+
+## 8. 相关文档
 
 - [Canonical Increment 语义规格](GINN_V2_CANONICAL_INCREMENT_SEMANTICS.md)
 - [Synthoseis-lite 微纹理生成规格](SYNTHOSEIS_MICROTEXTURE_GENERATION_DESIGN.md)

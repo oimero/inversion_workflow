@@ -30,6 +30,7 @@ from cup.synthetic.canonical import (
     generate_canonical_section,
 )
 from cup.synthetic.config import DATA_SCHEMA, IMPLEMENTATION_SCOPE
+from cup.canonical_increment import generation_contract
 from cup.synthetic.core import (
     build_attempt_plan,
     geometry_feasibility_rows,
@@ -267,7 +268,11 @@ def _section_forward_qc(
 def _lfm_records(result: LfmResult, *, base_path: str) -> dict[str, Any]:
     return {
         **result.qc,
-        "lfm_versions": "ideal;controlled_degraded",
+        "lfm_versions": "canonical_background;input_lfm_variants",
+        "lfm_variant_id": "controlled_default",
+        "input_lfm_log_ai_dataset": (
+            "" if not base_path else f"{base_path}/priors/input_lfm_variants/controlled_default/log_ai"
+        ),
         "lfm_ideal_dataset": ("" if not base_path else f"{base_path}/priors/lfm_ideal"),
         "lfm_controlled_degraded_dataset": (
             "" if not base_path else f"{base_path}/priors/lfm_controlled_degraded"
@@ -833,6 +838,15 @@ def _run_canonical_generation(
         "contract_fingerprint_sha256": contract_fingerprint,
         "input_contracts": input_contracts,
         "sample_domain": "time",
+        "increment_contract": generation_contract("time", output_dt).as_dict(),
+        "microtexture_schema": "microtexture_emission_v1",
+        "microtexture_mode": "none",
+        "input_lfm_variants": ["canonical", "controlled_default"],
+        "lfm_contract": {
+            "producer_schema": DATA_SCHEMA,
+            "canonical_lowpass_application_count": 1,
+            "variant_selection": "controlled_default",
+        },
         "generator_family": calibration.generator_family,
         "implementation_scope": IMPLEMENTATION_SCOPE,
         "suite": "canonical",
@@ -1585,6 +1599,15 @@ def run_generation(
         },
         "config_provenance": dict(config_provenance),
         "sample_domain": "time",
+        "increment_contract": generation_contract("time", output_dt).as_dict(),
+        "microtexture_schema": "microtexture_emission_v1",
+        "microtexture_mode": "none",
+        "input_lfm_variants": ["canonical", "controlled_default"],
+        "lfm_contract": {
+            "producer_schema": DATA_SCHEMA,
+            "canonical_lowpass_application_count": 1,
+            "variant_selection": "controlled_default",
+        },
         "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
         "global_seed": int(script_cfg["global_seed"]),
         "output_dt_s": output_dt,

@@ -176,13 +176,13 @@ def validate_training_manifest(
         "development_limited",
     }:
         raise ValueError(
-            f"Synthoseis v3 {sample_domain} manifest is not consumable: status={status!r}."
+            f"Synthoseis v4 {sample_domain} manifest is not consumable: status={status!r}."
         )
     if bool(manifest.get("qc_only", False)) or manifest.get(
         "training_consumable"
     ) is False:
         raise ValueError(
-            "Synthoseis v3 qc-only benchmark is not training-consumable; "
+            "Synthoseis v4 qc-only benchmark is not training-consumable; "
             "regenerate without --qc-only."
         )
 

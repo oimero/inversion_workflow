@@ -1,4 +1,4 @@
-"""Strict reader for frozen Synthoseis-lite v3 depth benchmarks."""
+"""Strict reader for Synthoseis-lite v4 depth benchmarks."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import h5py
 import numpy as np
 import pandas as pd
 
+from cup.canonical_increment import CanonicalIncrementContract, validate_sample_axis
 from cup.synthetic.depth.config import SCHEMA_VERSION
 from cup.synthetic.core import (
     validate_dataset_metadata,
@@ -27,6 +28,9 @@ class DepthSyntheticSample:
     sample_domain: str
     depth_basis: str
     target_log_ai: np.ndarray
+    canonical_background_log_ai: np.ndarray
+    target_increment_log_ai: np.ndarray
+    input_lfm_log_ai: np.ndarray
     vp_model_mps: np.ndarray
     seismic_observed: np.ndarray
     seismic_model_consistent: np.ndarray
@@ -52,7 +56,7 @@ def _json(path: Path) -> dict[str, Any]:
 
 
 class DepthV2Benchmark:
-    """Validate and read ``synthoseis_lite_v3`` depth artifacts only."""
+    """Validate and read ``synthoseis_lite_v4`` depth artifacts only."""
 
     schema = SCHEMA_VERSION
     sample_domain = "depth"
@@ -64,7 +68,7 @@ class DepthV2Benchmark:
         self.manifest_path = self.run_dir / "benchmark_manifest.json"
         for path in (self.h5_path, self.index_path, self.manifest_path):
             if not path.is_file():
-                raise FileNotFoundError(f"Required Synthoseis v3 artifact not found: {path}")
+                raise FileNotFoundError(f"Required Synthoseis v4 artifact not found: {path}")
         self.manifest = _json(self.manifest_path)
         actual_schema = str(self.manifest.get("schema") or self.manifest.get("schema_version") or "missing")
         if actual_schema != SCHEMA_VERSION:
@@ -73,7 +77,12 @@ class DepthV2Benchmark:
                 "Re-run calibrate/generate to rebuild the benchmark."
             )
         if self.manifest.get("sample_domain") != "depth" or self.manifest.get("depth_basis") != "tvdss":
-            raise ValueError("Synthoseis v3 reader requires sample_domain=depth and depth_basis=tvdss.")
+            raise ValueError("Synthoseis v4 reader requires sample_domain=depth and depth_basis=tvdss.")
+        self.increment_contract = CanonicalIncrementContract.from_mapping(
+            self.manifest.get("increment_contract") or {}
+        )
+        if self.increment_contract.sample_domain != "depth":
+            raise ValueError("Depth benchmark increment_contract must use sample_domain=depth.")
         validate_training_manifest(self.manifest, sample_domain="depth")
         require_contract_fingerprint(self.manifest, label=f"benchmark {self.run_dir}")
         self.index = pd.read_csv(self.index_path, dtype=str, keep_default_na=False)
@@ -83,22 +92,22 @@ class DepthV2Benchmark:
         }
         missing = sorted(required - set(self.index))
         if missing:
-            raise ValueError(f"sample_index.csv lacks v3 columns: {missing}")
+            raise ValueError(f"sample_index.csv lacks v4 columns: {missing}")
         if self.index.empty or self.index["sample_id"].duplicated().any():
             raise ValueError("sample_index.csv must be non-empty with unique sample_id values.")
         if not self.index["sample_domain"].eq("depth").all() or not self.index["depth_basis"].eq("tvdss").all():
             raise ValueError("sample_index.csv contains a wrong domain or depth basis.")
         if not self.index["suite"].eq("field_conditioned").all():
-            raise ValueError("Depth v3 sample_index.csv must contain only field_conditioned samples.")
+            raise ValueError("Depth v4 sample_index.csv must contain only field_conditioned samples.")
         if not set(self.index["sample_kind"]) <= {"base", "seismic_variant"}:
-            raise ValueError("Depth v3 sample_index.csv contains canonical/probe/unknown sample kinds.")
+            raise ValueError("Depth v4 sample_index.csv contains canonical/probe/unknown sample kinds.")
         forbidden_columns = {
             "sample_axis", "twt_model_s", "twt_highres_s", "probe_frequency_hz",
             "probe_phase", "probe_amplitude_multiplier", "probe_lateral_shape",
         }
         present_forbidden = sorted(forbidden_columns.intersection(self.index.columns))
         if present_forbidden:
-            raise ValueError(f"Depth v3 sample_index.csv contains forbidden time/probe fields: {present_forbidden}")
+            raise ValueError(f"Depth v4 sample_index.csv contains forbidden time/probe fields: {present_forbidden}")
         if not set(self.index["evaluation_role"]) <= {"development_pool", "geometry_holdout"}:
             raise ValueError("sample_index.csv contains unknown evaluation_role values.")
         held_out = str(dict(self.manifest.get("split_policy") or {}).get("held_out_geometry_family") or "")
@@ -170,7 +179,7 @@ class DepthV2Benchmark:
             frame = frame[frame["sample_kind"].isin(kinds)]
         if split is not None:
             if "split" not in frame:
-                raise ValueError("Depth v3 train/validation/test split is derived by the training adapter.")
+                raise ValueError("Depth v4 train/validation/test split is derived by the training adapter.")
             frame = frame[frame["split"].eq(split)]
         return frame["sample_id"].tolist()
 
@@ -186,6 +195,8 @@ class DepthV2Benchmark:
         with h5py.File(self.h5_path, "r") as h5:
             arrays = {
                 "target": np.asarray(h5[f"{base_path}/truth/model_target_log_ai"][()], dtype=np.float64),
+                "canonical_background": np.asarray(h5[f"{base_path}/priors/canonical_background_log_ai"][()], dtype=np.float64),
+                "target_increment": np.asarray(h5[f"{base_path}/targets/target_increment_log_ai"][()], dtype=np.float64),
                 "vp": np.asarray(h5[f"{base_path}/truth/vp_model_mps"][()], dtype=np.float64),
                 "observed": np.asarray(h5[input_path][()], dtype=np.float64),
                 "consistent": np.asarray(h5[f"{base_path}/seismic/seismic_model_consistent"][()], dtype=np.float64),
@@ -197,20 +208,37 @@ class DepthV2Benchmark:
                 "lfm_ideal": np.asarray(h5[f"{base_path}/priors/lfm_ideal"][()], dtype=np.float64),
                 "lfm_degraded": np.asarray(h5[f"{base_path}/priors/lfm_controlled_degraded"][()], dtype=np.float64),
             }
+            validate_sample_axis(arrays["axis"], self.increment_contract)
+            variant_id = str(row.get("lfm_variant_id") or "controlled_default")
+            input_lfm_path = str(row.get("input_lfm_log_ai_dataset") or "").strip()
+            if not input_lfm_path:
+                input_lfm_path = f"{base_path}/priors/input_lfm_variants/{variant_id}/log_ai"
+            arrays["input_lfm"] = np.asarray(h5[input_lfm_path][()], dtype=np.float64)
             if row["sample_kind"] == "seismic_variant":
                 arrays["observed_valid"] = np.asarray(h5[f"{row['hdf5_group']}/observed_valid_mask"][()], dtype=bool)
         shape = arrays["target"].shape
-        for name in ("vp", "observed", "consistent", "valid", "observed_valid", "physics_valid", "lfm_ideal", "lfm_degraded"):
+        for name in ("vp", "observed", "consistent", "valid", "observed_valid", "physics_valid", "lfm_ideal", "lfm_degraded", "canonical_background", "target_increment", "input_lfm"):
             if arrays[name].shape != shape:
                 raise ValueError(f"N-point shape contract failed for {sample_id}: {name}={arrays[name].shape}, target={shape}")
+        finite = np.isfinite(arrays["target"]) & np.isfinite(arrays["canonical_background"]) & np.isfinite(arrays["target_increment"])
+        if np.any(finite & (np.abs(arrays["target"] - arrays["canonical_background"] - arrays["target_increment"]) > 1e-5)):
+            raise ValueError(f"Canonical increment decomposition mismatch for {sample_id}.")
         return DepthSyntheticSample(
             sample_id=str(sample_id), sample_kind=str(row["sample_kind"]), row=row,
             sample_domain="depth", depth_basis="tvdss",
             target_log_ai=arrays["target"], vp_model_mps=arrays["vp"],
+            canonical_background_log_ai=arrays["canonical_background"],
+            target_increment_log_ai=arrays["target_increment"],
+            input_lfm_log_ai=arrays["input_lfm"],
             seismic_observed=arrays["observed"], seismic_model_consistent=arrays["consistent"],
             valid_mask=arrays["valid"], observed_valid_mask=arrays["observed_valid"],
             physics_valid_mask=arrays["physics_valid"], lateral_m=arrays["lateral"],
-            tvdss_model_m=arrays["axis"], priors={"lfm_ideal": arrays["lfm_ideal"], "lfm_controlled_degraded": arrays["lfm_degraded"]},
+            tvdss_model_m=arrays["axis"], priors={
+                "lfm_ideal": arrays["lfm_ideal"],
+                "lfm_controlled_degraded": arrays["lfm_degraded"],
+                "canonical_background_log_ai": arrays["canonical_background"],
+                "input_lfm_log_ai": arrays["input_lfm"],
+            },
         )
 
 

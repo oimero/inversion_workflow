@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import h5py
 import numpy as np
 
+from cup.canonical_increment import decompose_log_ai, generation_contract
 from cup.synthetic.core import write_dataset
 from cup.synthetic.generation import GeneratedSection
 from cup.synthetic.forward import HighresForwardResult
@@ -40,6 +42,8 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
     root.attrs["scenario_id"] = section.scenario.scenario_id
     root.attrs["status"] = str(section.qc.get("status", "ok"))
     root.attrs["suite"] = str(section.qc.get("suite", "field_conditioned"))
+    root.attrs["microtexture_schema"] = "microtexture_emission_v1"
+    root.attrs["microtexture_mode"] = "none"
     axes = root.create_group("axes")
     _dataset(
         axes,
@@ -174,6 +178,38 @@ def write_generated_section(h5: h5py.File, section: GeneratedSection) -> str:
             axis_order=["lateral", "twt"],
             axis_dataset=axis,
         )
+    canonical_contract = generation_contract(
+        "time", float(np.diff(np.asarray(section.twt_model_s, dtype=np.float64)[:2])[0])
+    )
+    canonical_background, target_increment = decompose_log_ai(
+        np.asarray(section.model_target_log_ai, dtype=np.float64),
+        np.asarray(section.twt_model_s, dtype=np.float64),
+        canonical_contract,
+        valid_mask=np.asarray(section.valid_mask_model, dtype=bool),
+    )
+    root.attrs["increment_contract_json"] = json.dumps(
+        canonical_contract.as_dict(), sort_keys=True
+    )
+    priors = root.create_group("priors")
+    targets = root.create_group("targets")
+    _dataset(
+        priors,
+        "canonical_background_log_ai",
+        canonical_background.astype(np.float32),
+        unit="ln(m/s*g/cm3)",
+        domain="twt",
+        axis_order=["lateral", "twt"],
+        axis_dataset=model_axis,
+    )
+    _dataset(
+        targets,
+        "target_increment_log_ai",
+        target_increment.astype(np.float32),
+        unit="ln(m/s*g/cm3)",
+        domain="twt",
+        axis_order=["lateral", "twt"],
+        axis_dataset=model_axis,
+    )
     _dataset(
         truth,
         "state_fraction_model",
@@ -305,6 +341,26 @@ def write_lfm_result(
     priors = root.require_group("priors")
     residuals = root.require_group("residuals")
     paths = {}
+    variants = priors.require_group("input_lfm_variants")
+    variant_values = dict(result.input_lfm_variants or {})
+    if not variant_values:
+        variant_values = {"controlled_default": result.lfm_controlled_degraded}
+    for variant_id, values in variant_values.items():
+        variant_group = variants.require_group(str(variant_id))
+        _dataset(
+            variant_group,
+            "log_ai",
+            np.asarray(values, dtype=np.float32),
+            unit="ln(m/s*g/cm3)",
+            domain="twt",
+            axis_order=["lateral", "twt"],
+            axis_dataset=axis,
+        )
+    default_variant = "controlled_default" if "controlled_default" in variant_values else sorted(variant_values)[0]
+    paths["input_lfm_log_ai_dataset"] = (
+        f"{realization_path}/priors/input_lfm_variants/{default_variant}/log_ai"
+    )
+    paths["lfm_variant_id"] = default_variant
     for name, values in (
         ("lfm_ideal", result.lfm_ideal),
         ("lfm_controlled_degraded", result.lfm_controlled_degraded),

@@ -1,13 +1,15 @@
-"""Low-frequency priors and residual targets for synthoseis-lite."""
+"""Low-frequency priors and diagnostic target differences for synthoseis-lite."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Any, Mapping
 
 import numpy as np
 from scipy.signal import firwin
 
+from cup.canonical_increment import canonical_lowpass, decompose_log_ai, generation_contract
 from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION
 from cup.synthetic.random import ar1_irregular, named_rng
 from cup.utils.statistics import centered_rms
@@ -20,6 +22,7 @@ class LfmResult:
     residual_vs_lfm_ideal: np.ndarray
     residual_vs_lfm_controlled_degraded: np.ndarray
     qc: dict[str, Any]
+    input_lfm_variants: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 def _rng(
@@ -147,18 +150,24 @@ def derive_lfm_priors(
             residual_vs_lfm_ideal=nan,
             residual_vs_lfm_controlled_degraded=nan,
             qc={"lfm_status": "disabled"},
+            input_lfm_variants={},
         )
 
     ideal_config = dict(config.get("ideal") or {})
     degraded_config = dict(config.get("controlled_degraded") or {})
-    ideal, ideal_qc = lowpass_model_grid(
+    canonical_contract = generation_contract("time", dt_s)
+    ideal, _target_increment = decompose_log_ai(
         target,
+        np.asarray(section.twt_model_s, dtype=np.float64),
+        canonical_contract,
         valid_mask=valid,
-        dt_s=dt_s,
-        cutoff_hz=float(ideal_config.get("cutoff_hz", 10.0)),
-        numtaps=int(ideal_config.get("numtaps", 129)),
-        kaiser_beta=float(ideal_config.get("kaiser_beta", 8.6)),
     )
+    ideal_qc = {
+        "cutoff_hz": canonical_contract.cutoff,
+        "numtaps": 0,
+        "kaiser_beta": 0.0,
+        "filter_family": canonical_contract.implementation,
+    }
     degraded = ideal.copy()
     variant_id = (
         str(degradation_variant_id)
@@ -311,6 +320,13 @@ def derive_lfm_priors(
         components["local_missing_control_bias_peak"] = amplitude
         components["local_missing_control_bias_rms"] = centered_rms(missing_bias, valid)
 
+    degradation = canonical_lowpass(
+        degraded - ideal,
+        np.asarray(section.twt_model_s, dtype=np.float64),
+        canonical_contract,
+        valid_mask=valid,
+    )
+    degraded = ideal + degradation
     degraded[~valid] = np.nan
     ideal[~valid] = np.nan
     residual_ideal = target - ideal
@@ -349,4 +365,8 @@ def derive_lfm_priors(
         residual_vs_lfm_ideal=residual_ideal,
         residual_vs_lfm_controlled_degraded=residual_degraded,
         qc=qc,
+        input_lfm_variants={
+            "canonical": ideal.copy(),
+            "controlled_default": degraded.copy(),
+        },
     )

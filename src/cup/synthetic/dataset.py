@@ -11,7 +11,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-from cup.synthetic.contracts import BENCHMARK_SCHEMA_VERSION, LEGACY_BENCHMARK_SCHEMA_VERSION
+from cup.synthetic.contracts import (
+    BENCHMARK_SCHEMA_VERSION,
+    FROZEN_BENCHMARK_SCHEMA_VERSION,
+    LEGACY_BENCHMARK_SCHEMA_VERSION,
+)
 from cup.synthetic.readers.depth_v2 import DepthSyntheticSample, DepthV2Benchmark
 from cup.synthetic.readers.time_v2 import TimeV2Benchmark, TimeV2SyntheticSample
 
@@ -46,7 +50,12 @@ class SynthoseisBenchmark:
 
         if schema == LEGACY_BENCHMARK_SCHEMA_VERSION:
             raise ValueError(
-                "time-v1 Synthoseis artifacts are legacy and are not supported by the v3 facade."
+                "Legacy Synthoseis artifacts are not accepted by the v4 reader."
+            )
+        if schema == FROZEN_BENCHMARK_SCHEMA_VERSION:
+            raise ValueError(
+                "Frozen Synthoseis v3 artifacts are baseline-only and are not accepted "
+                "by the v4 canonical-increment reader."
             )
         if schema == BENCHMARK_SCHEMA_VERSION:
             if sample_domain == "time":

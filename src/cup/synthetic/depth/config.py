@@ -1,4 +1,4 @@
-"""Strict configuration and source contracts for Synthoseis-lite v3."""
+"""Strict configuration and source contracts for Synthoseis-lite v4."""
 
 from __future__ import annotations
 
@@ -113,14 +113,14 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     _reject_unknown(root, allowed_root, path="synthoseis_lite")
     if str(root.get("sample_domain") or "").casefold() != "depth" or str(root.get("benchmark_schema") or "") != SCHEMA_VERSION:
         raise ValueError(
-            "Depth Synthoseis-lite v3 requires "
+            "Depth Synthoseis-lite v4 requires "
             f"synthoseis_lite.sample_domain='depth' and benchmark_schema={SCHEMA_VERSION!r}."
         )
     seismic = _mapping(config.get("seismic"), path="seismic")
     if str(seismic.get("domain", "")).casefold() != "depth":
-        raise ValueError("Depth Synthoseis v3 requires seismic.domain='depth'.")
+        raise ValueError("Depth Synthoseis v4 requires seismic.domain='depth'.")
     if str(seismic.get("depth_basis", "")).casefold() != "tvdss":
-        raise ValueError("Depth Synthoseis v3 requires seismic.depth_basis='tvdss'.")
+        raise ValueError("Depth Synthoseis v4 requires seismic.depth_basis='tvdss'.")
 
     target = _mapping(config.get("target_interval"), path="target_interval")
     raw_horizons = target.get("horizons")
@@ -162,20 +162,20 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     model_dz = _positive_float(sampling.get("expected_model_dz_m"), path="sampling.expected_model_dz_m")
     oversampling = _positive_int(sampling.get("vertical_oversampling_factor"), path="sampling.vertical_oversampling_factor")
     if model_dz != 5.0 or oversampling != 8:
-        raise ValueError("Depth v3 is frozen to 5 m model sampling and 8x oversampling.")
+        raise ValueError("Depth v4 is frozen to 5 m model sampling and 8x oversampling.")
 
     geometry = _mapping(root.get("geometry"), path="synthoseis_lite.geometry")
     _reject_unknown(geometry, {"lateral_sample_interval_m", "field_conditioned"}, path="synthoseis_lite.geometry")
     field = _mapping(geometry.get("field_conditioned"), path="synthoseis_lite.geometry.field_conditioned")
     _reject_unknown(field, {"enabled", "target_zone"}, path="synthoseis_lite.geometry.field_conditioned")
     if field.get("enabled") is not True:
-        raise ValueError("Depth v3 requires geometry.field_conditioned.enabled=true.")
+        raise ValueError("Depth v4 requires geometry.field_conditioned.enabled=true.")
     target_zone = _mapping(field.get("target_zone"), path="synthoseis_lite.geometry.field_conditioned.target_zone")
     if target_zone != {"mode": "filled_target_zone"}:
-        raise ValueError("Depth v3 target_zone must be exactly mode=filled_target_zone.")
+        raise ValueError("Depth v4 target_zone must be exactly mode=filled_target_zone.")
     lateral_interval = _positive_float(geometry.get("lateral_sample_interval_m"), path="geometry.lateral_sample_interval_m")
     if lateral_interval != 25.0:
-        raise ValueError("Depth v3 uses a frozen 25 m lateral sample interval.")
+        raise ValueError("Depth v4 uses a frozen 25 m lateral sample interval.")
 
     raw_sections = root.get("sections")
     if not isinstance(raw_sections, list) or not raw_sections:
@@ -217,7 +217,7 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     object_core_controls = parse_object_core_controls(impedance)
     duration_models = _mapping(impedance.get("duration_modes"), path="impedance_attribute_generator.duration_modes")
     if set(duration_models) != {"standard"}:
-        raise ValueError("Depth v3 supports only the standard duration mode.")
+        raise ValueError("Depth v4 supports only the standard duration mode.")
     standard_mode = _mapping(duration_models["standard"], path="duration_modes.standard")
     _reject_unknown(standard_mode, {"minimum_highres_cells"}, path="duration_modes.standard")
 
@@ -252,9 +252,9 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     lfm = _mapping(root.get("lfm"), path="synthoseis_lite.lfm")
     _reject_unknown(lfm, {"enabled", "ideal", "controlled_degraded"}, path="synthoseis_lite.lfm")
     if lfm.get("enabled") is not True:
-        raise ValueError("Depth v3 requires lfm.enabled=true.")
+        raise ValueError("Depth v4 requires lfm.enabled=true.")
     parsed_lfm: dict[str, Any] = {"enabled": True}
-    for name, expected in (("ideal", 250.0), ("controlled_degraded", 400.0)):
+    for name, expected in (("ideal", 400.0), ("controlled_degraded", 400.0)):
         item = _mapping(lfm.get(name), path=f"lfm.{name}")
         allowed_lfm = {"minimum_wavelength_m", "numtaps", "kaiser_beta"}
         if name == "controlled_degraded":
@@ -271,7 +271,7 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
         _reject_unknown(item, allowed_lfm, path=f"lfm.{name}")
         wavelength = _positive_float(item.get("minimum_wavelength_m"), path=f"lfm.{name}.minimum_wavelength_m")
         if wavelength != expected:
-            raise ValueError(f"lfm.{name}.minimum_wavelength_m must be {expected:g} in v2.")
+            raise ValueError(f"lfm.{name}.minimum_wavelength_m must be {expected:g} in v4.")
         parsed_lfm[name] = {"minimum_wavelength_m": wavelength, "numtaps": _positive_int(item.get("numtaps"), path=f"lfm.{name}.numtaps"), "kaiser_beta": float(item.get("kaiser_beta"))}
         if name == "controlled_degraded":
             for key in ("constant_bias_sigma_log_ai", "linear_vertical_trend_sigma_log_ai", "zonewise_bias_sigma_log_ai", "lateral_smooth_bias_sigma_log_ai", "lateral_correlation_fraction", "amplitude_scale_sigma"):
@@ -310,12 +310,12 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
     for disabled_name in ("canonical", "probe_selection"):
         disabled = _mapping(root.get(disabled_name), path=f"synthoseis_lite.{disabled_name}")
         if disabled != {"enabled": False}:
-            raise ValueError(f"Depth v3 requires {disabled_name}.enabled=false with no extra fields.")
+            raise ValueError(f"Depth v4 requires {disabled_name}.enabled=false with no extra fields.")
 
     mismatch = _mapping(root.get("seismic_mismatch"), path="synthoseis_lite.seismic_mismatch")
     _reject_unknown(mismatch, {"enabled", "wavelet", "depth_static", "noise", "gain", "combined"}, path="synthoseis_lite.seismic_mismatch")
     if mismatch.get("enabled") is not True:
-        raise ValueError("Depth v3 requires seismic_mismatch.enabled=true.")
+        raise ValueError("Depth v4 requires seismic_mismatch.enabled=true.")
     wavelet_mismatch = _mapping(mismatch.get("wavelet"), path="seismic_mismatch.wavelet")
     _reject_unknown(wavelet_mismatch, {"phase_rotation_degrees", "time_shift_s"}, path="seismic_mismatch.wavelet")
     depth_static = _mapping(mismatch.get("depth_static"), path="seismic_mismatch.depth_static")
@@ -375,11 +375,11 @@ def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "noise_rms_fraction": _positive_float(combined.get("noise_rms_fraction"), path="seismic_mismatch.combined.noise_rms_fraction"),
         })
     if parsed_mismatch["wavelet"]["phase_rotation_degrees"] != [-10.0, 10.0]:
-        raise ValueError("Depth v3 wavelet phase rotations are frozen to [-10, 10] degrees.")
+        raise ValueError("Depth v4 wavelet phase rotations are frozen to [-10, 10] degrees.")
     if parsed_mismatch["wavelet"]["time_shift_s"] != [-0.001, 0.001]:
-        raise ValueError("Depth v3 wavelet time shifts are frozen to [-0.001, 0.001] seconds.")
+        raise ValueError("Depth v4 wavelet time shifts are frozen to [-0.001, 0.001] seconds.")
     if parsed_mismatch["depth_static"]["shift_m"] != [-2.5, 2.5]:
-        raise ValueError("Depth v3 depth statics are frozen to [-2.5, 2.5] metres.")
+        raise ValueError("Depth v4 depth statics are frozen to [-2.5, 2.5] metres.")
 
     figures = _mapping(root.get("figures"), path="synthoseis_lite.figures")
     _reject_unknown(

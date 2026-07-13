@@ -1,4 +1,4 @@
-"""Depth-domain calibration adapters for Synthoseis-lite v3."""
+"""Depth-domain calibration adapters for Synthoseis-lite v4."""
 
 from __future__ import annotations
 

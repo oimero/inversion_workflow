@@ -179,7 +179,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     _require_keys(field, field_keys, path="synthoseis_lite.geometry.field_conditioned")
     if field.get("enabled") is not True:
         raise ValueError(
-            "Time Synthoseis-lite v3 requires geometry.field_conditioned.enabled=true."
+            "Time Synthoseis-lite v4 requires geometry.field_conditioned.enabled=true."
         )
     canonical = _mapping(
         geometry.get("canonical"), path="synthoseis_lite.geometry.canonical"
@@ -791,7 +791,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "lfm": {
             "enabled": bool(lfm.get("enabled", True)),
             "ideal": {
-                "cutoff_hz": float(lfm_ideal.get("cutoff_hz", 10.0)),
+                "cutoff_hz": float(lfm_ideal.get("cutoff_hz", 15.0)),
                 "numtaps": int(lfm_ideal.get("numtaps", 129)),
                 "kaiser_beta": float(lfm_ideal.get("kaiser_beta", 8.6)),
             },
@@ -1076,6 +1076,10 @@ def _validate_lfm_config(config: Mapping[str, Any], *, output_dt_s: float) -> No
     cutoff = float(ideal["cutoff_hz"])
     if not 0.0 < cutoff < nyquist:
         raise ValueError("lfm.ideal.cutoff_hz must be within (0, Nyquist).")
+    if not np.isclose(cutoff, 15.0, rtol=0.0, atol=1.0e-12):
+        raise ValueError(
+            "Time Synthoseis-lite v4 canonical LFM requires lfm.ideal.cutoff_hz=15.0."
+        )
     if int(ideal["numtaps"]) < 3:
         raise ValueError("lfm.ideal.numtaps must be >= 3.")
     if float(ideal["kaiser_beta"]) < 0.0:

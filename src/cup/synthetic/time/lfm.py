@@ -273,23 +273,6 @@ def derive_lfm_priors(
             mean + amplitude_scale * (degraded[lateral_index, row_valid] - mean)
         )
 
-    smoothing = dict(degraded_config.get("over_smoothing") or {})
-    over_enabled = bool(smoothing.get("enabled", False))
-    over_cutoff = float("nan")
-    blend = 0.0
-    if over_enabled:
-        over_cutoff = float(smoothing.get("cutoff_hz", 6.0))
-        blend = float(smoothing.get("blend", 1.0))
-        over_smoothed, over_qc = lowpass_model_grid(
-            degraded,
-            valid_mask=valid,
-            dt_s=dt_s,
-            cutoff_hz=over_cutoff,
-            numtaps=int(smoothing.get("numtaps", ideal_qc["numtaps"])),
-            kaiser_beta=float(smoothing.get("kaiser_beta", ideal_qc["kaiser_beta"])),
-        )
-        degraded[valid] = (1.0 - blend) * degraded[valid] + blend * over_smoothed[valid]
-
     missing = dict(degraded_config.get("local_missing_control_bias") or {})
     if bool(missing.get("enabled", True)):
         missing_rng = _rng(
@@ -319,6 +302,23 @@ def derive_lfm_priors(
         _add_valid(degraded, missing_bias, valid)
         components["local_missing_control_bias_peak"] = amplitude
         components["local_missing_control_bias_rms"] = centered_rms(missing_bias, valid)
+
+    smoothing = dict(degraded_config.get("over_smoothing") or {})
+    over_enabled = bool(smoothing.get("enabled", False))
+    over_cutoff = float("nan")
+    blend = 0.0
+    if over_enabled:
+        over_cutoff = float(smoothing.get("cutoff_hz", 6.0))
+        blend = float(smoothing.get("blend", 1.0))
+        over_smoothed, over_qc = lowpass_model_grid(
+            degraded,
+            valid_mask=valid,
+            dt_s=dt_s,
+            cutoff_hz=over_cutoff,
+            numtaps=int(smoothing.get("numtaps", ideal_qc["numtaps"])),
+            kaiser_beta=float(smoothing.get("kaiser_beta", ideal_qc["kaiser_beta"])),
+        )
+        degraded[valid] = (1.0 - blend) * degraded[valid] + blend * over_smoothed[valid]
 
     degradation = canonical_lowpass(
         degraded - ideal,

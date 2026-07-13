@@ -105,6 +105,8 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
   合同的旧 v4 直接失败；不提供字段回退；
 - LFM component 顺序、variant catalog、随机流目的和 QC metadata 共用同一编排层，
   但时间域的秒制算子与深度域的米制/AI–Vp 算子保持各自实现。
+- 时间域和深度域均按 `local_missing_control_bias -> over_smoothing` 执行 LFM
+  退化；两者的组合顺序由本地回归测试锁定。
 - 深度域受控 LFM 退化改为按有效 mask 做幅度缩放和空间平滑，无效区继续写 NaN；
   CSV 变体有效样点数统一归一化为整数后再由 reader 校验。
 
@@ -313,7 +315,7 @@ python -m compileall -q src/cup src/ginn_v2
 python -m pytest -q -p no:cacheprovider tests/test_canonical_increment.py tests/test_synthoseis_v4_canonical.py tests/test_synthoseis_stage_2_5.py
 ```
 
-结果：稳定化和对称性测试 `28 passed`。`compileall` 与 `cup.impedance`、synthetic
+结果：稳定化和对称性测试 `29 passed`。`compileall` 与 `cup.impedance`、synthetic
 time/depth reader import smoke 同样通过。测试文件继续被 `.gitignore` 忽略；本节只记录
 本机结果，不声称测试已提交。
 

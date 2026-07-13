@@ -360,7 +360,7 @@ $env:PYTHONPATH = "src"
 本次稳定化验证结果：
 
 - `compileall -q src/cup src/ginn_v2` 通过；
-- canonical、writer/reader、按 mask 的 LFM 退化、LFM profile/QC、probe 失败和命名 smoke 共 `28 passed`；
+- canonical、writer/reader、按 mask 的 LFM 退化、LFM profile/QC、probe 失败和命名 smoke 共 `29 passed`；
 - 深度真实小烟测输出到 `scripts/output/synthoseis_lite_stage_2_5_depth_smoke_20260713`，
   4 个通过样本写入 v4 HDF5，`SynthoseisBenchmark` 成功读取 52 个有效 sample；
 - `evaluate_synthoseis_lite.py --max-samples 4` 完成三种 baseline 评估；

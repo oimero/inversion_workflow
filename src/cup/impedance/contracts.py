@@ -196,11 +196,6 @@ class CanonicalIncrementContract:
         )
 
     @property
-    def axis_absolute_tolerance(self) -> float:
-        """Compatibility name for internal callers during the v4 rewrite."""
-        return self.sample_interval_absolute_tolerance
-
-    @property
     def cutoff_cycles_per_unit(self) -> float:
         return self.cutoff if self.sample_domain == "time" else 1.0 / self.cutoff
 
@@ -247,7 +242,7 @@ def validate_increment_contract(
 ) -> CanonicalIncrementContract:
     """Parse and validate a materialized canonical increment contract."""
     if isinstance(value, CanonicalIncrementContract):
-        return value
+        value = value.as_dict()
     return CanonicalIncrementContract.from_mapping(value)
 
 
@@ -358,6 +353,7 @@ def validate_lfm_producer_contract(value: Mapping[str, Any]) -> dict[str, Any]:
         "buffer_mode",
         "buffer_axis_units",
         "variant_selection",
+        "final_background_complement_response_status",
         "final_background_complement_response_rms",
         "final_background_complement_response_ratio",
         "final_background_max_trace_response_ratio",
@@ -419,12 +415,25 @@ def validate_lfm_producer_contract(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("lfm_contract.post_lowpass_vertical_warp_applied must be boolean.")
     if not isinstance(raw["variant_selection"], Mapping):
         raise ValueError("lfm_contract.variant_selection must be a mapping.")
+    qc_status = str(raw["final_background_complement_response_status"] or "").strip().lower()
+    if qc_status not in {"not_computed", "measured"}:
+        raise ValueError(
+            "lfm_contract.final_background_complement_response_status must be "
+            "'not_computed' or 'measured'."
+        )
     for key in (
         "final_background_complement_response_rms",
         "final_background_complement_response_ratio",
         "final_background_max_trace_response_ratio",
     ):
-        _nonnegative_float(raw[key], f"lfm_contract.{key}")
+        value = raw[key]
+        if qc_status == "not_computed":
+            if value is not None:
+                raise ValueError(
+                    f"lfm_contract.{key} must be null when complement-response QC is not computed."
+                )
+        else:
+            _nonnegative_float(value, f"lfm_contract.{key}")
     cutoff_key = "cutoff_hz" if domain == "time" else "cutoff_wavelength_m"
     unexpected_cutoff = "cutoff_wavelength_m" if domain == "time" else "cutoff_hz"
     if unexpected_cutoff in raw:
@@ -446,6 +455,34 @@ def validate_lfm_producer_contract(value: Mapping[str, Any]) -> dict[str, Any]:
     return raw
 
 
+def validate_synthoseis_lfm_contract(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the fixed LFM production profile used by Synthoseis-lite v4."""
+    raw = validate_lfm_producer_contract(value)
+    if raw["producer_kind"] != "synthoseis_lite":
+        raise ValueError("Synthoseis LFM contracts require producer_kind='synthoseis_lite'.")
+    if raw["producer_schema"] != "synthoseis_lite_v4":
+        raise ValueError("Synthoseis LFM contracts require producer_schema='synthoseis_lite_v4'.")
+    if raw["canonical_lowpass_applied_to"] != "target_log_ai":
+        raise ValueError(
+            "Synthoseis LFM contracts require canonical_lowpass_applied_to='target_log_ai'."
+        )
+    expected_counts = {
+        "canonical_lowpass_application_count": 1,
+        "well_control_lowpass_application_count": 0,
+        "final_volume_lowpass_application_count": 0,
+    }
+    for key, expected in expected_counts.items():
+        if int(raw[key]) != expected:
+            raise ValueError(
+                f"Synthoseis LFM contracts require {key}={expected}."
+            )
+    if raw["post_lowpass_vertical_warp_applied"] is not False:
+        raise ValueError(
+            "Synthoseis LFM contracts require post_lowpass_vertical_warp_applied=false."
+        )
+    return raw
+
+
 def build_lfm_producer_contract(
     increment_contract: CanonicalIncrementContract | Mapping[str, Any],
     *,
@@ -457,9 +494,10 @@ def build_lfm_producer_contract(
     well_control_lowpass_application_count: int = 0,
     final_volume_lowpass_application_count: int = 0,
     post_lowpass_vertical_warp_applied: bool = False,
-    final_background_complement_response_rms: float = 0.0,
-    final_background_complement_response_ratio: float = 0.0,
-    final_background_max_trace_response_ratio: float = 0.0,
+    final_background_complement_response_status: str = "not_computed",
+    final_background_complement_response_rms: float | None = None,
+    final_background_complement_response_ratio: float | None = None,
+    final_background_max_trace_response_ratio: float | None = None,
 ) -> dict[str, Any]:
     """Create the small manifest contract shared by synthetic and field LFM producers."""
     contract = validate_increment_contract(increment_contract)
@@ -490,9 +528,24 @@ def build_lfm_producer_contract(
         "buffer_mode": contract.buffer_mode,
         "buffer_axis_units": contract.buffer_axis_units,
         "variant_selection": dict(variant_selection),
-        "final_background_complement_response_rms": float(final_background_complement_response_rms),
-        "final_background_complement_response_ratio": float(final_background_complement_response_ratio),
-        "final_background_max_trace_response_ratio": float(final_background_max_trace_response_ratio),
+        "final_background_complement_response_status": str(
+            final_background_complement_response_status
+        ),
+        "final_background_complement_response_rms": (
+            None
+            if final_background_complement_response_rms is None
+            else float(final_background_complement_response_rms)
+        ),
+        "final_background_complement_response_ratio": (
+            None
+            if final_background_complement_response_ratio is None
+            else float(final_background_complement_response_ratio)
+        ),
+        "final_background_max_trace_response_ratio": (
+            None
+            if final_background_max_trace_response_ratio is None
+            else float(final_background_max_trace_response_ratio)
+        ),
     }
     if contract.depth_basis is not None:
         result["depth_basis"] = contract.depth_basis
@@ -515,5 +568,6 @@ __all__ = [
     "build_lfm_producer_contract",
     "validate_increment_contract",
     "validate_lfm_producer_contract",
+    "validate_synthoseis_lfm_contract",
     "validate_sample_axis",
 ]

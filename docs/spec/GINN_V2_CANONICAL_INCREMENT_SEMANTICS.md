@@ -193,7 +193,8 @@ depth_basis
 value_domain = log(AI)
 log_base = natural
 ai_unit_convention = m/s*g/cm3
-well_control_lowpass_applied = true
+canonical_lowpass_applied_to
+canonical_lowpass_application_count
 well_control_lowpass_application_count = 1
 final_volume_lowpass_application_count = 0
 post_lowpass_vertical_warp_applied
@@ -210,7 +211,7 @@ buffer_axis_units
 
 井控经过低通并不能证明空间建模后的最终规则体严格位于 canonical background 频带内。外部 LFM 的严格语义是 **contract-compatible deployment background**，不保证等于未知真实阻抗的 `P(m)`；它与 canonical increment 可能存在频带重叠。
 
-LFM 生产者必须在最终规则模型体上逐道计算并汇总：
+LFM 生产者在具备最终体 QC 的阶段应在最终规则模型体上逐道计算并汇总：
 
 ```text
 final_background_complement_response_rms = RMS(LFM - P(LFM))
@@ -220,7 +221,12 @@ final_background_max_trace_response_ratio
 post_lowpass_vertical_warp_applied
 ```
 
-这些指标只用于对比 LFM 方法和发现空间建模引入的纵向频带变化，不设通过阈值，也不能证明数组由指定生产流程生成。GINN v2 记录并透传该 QC，不在消费端重复生成或修改 LFM。
+合同同时包含 `final_background_complement_response_status`。状态为
+`measured` 时上述三个值必须是有限非负数；阶段 2.5 的 Synthoseis v4 writer
+尚未计算最终体 QC，因此写入 `not_computed` 和三个 `null`，不把未测量结果写成
+零。上述指标只用于对比 LFM 方法和发现空间建模引入的纵向频带变化，不设通过阈值，
+也不能证明数组由指定生产流程生成。GINN v2 记录并透传该 QC，不在消费端重复生成
+或修改 LFM。
 
 ### 3.4 完整训练示例
 

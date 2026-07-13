@@ -12,6 +12,7 @@ from cup.impedance.contracts import (
     validate_increment_contract,
     validate_lfm_producer_contract,
     validate_sample_axis,
+    validate_synthoseis_lfm_contract,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "validate_increment_contract",
     "validate_lfm_producer_contract",
     "validate_sample_axis",
+    "validate_synthoseis_lfm_contract",
 ]

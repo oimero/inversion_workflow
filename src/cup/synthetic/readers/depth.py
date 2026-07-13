@@ -16,8 +16,9 @@ from cup.impedance import (
     validate_contract_compatibility,
     validate_lfm_producer_contract,
     validate_sample_axis,
+    validate_synthoseis_lfm_contract,
 )
-from cup.synthetic.depth.config import SCHEMA_VERSION
+from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION
 from cup.synthetic.core import (
     validate_dataset_metadata,
     validate_training_manifest,
@@ -48,7 +49,7 @@ class DepthSyntheticSample:
 
     @property
     def seismic_input(self) -> np.ndarray:
-        """Explicit network input selected by the v2 contract."""
+        """Explicit network input selected by the v4 contract."""
         return self.seismic_observed
 
 
@@ -60,10 +61,10 @@ def _json(path: Path) -> dict[str, Any]:
     return value
 
 
-class DepthV2Benchmark:
+class DepthBenchmark:
     """Validate and read ``synthoseis_lite_v4`` depth artifacts only."""
 
-    schema = SCHEMA_VERSION
+    schema = BENCHMARK_SCHEMA_VERSION
     sample_domain = "depth"
 
     def __init__(self, run_dir: str | Path) -> None:
@@ -76,9 +77,9 @@ class DepthV2Benchmark:
                 raise FileNotFoundError(f"Required Synthoseis v4 artifact not found: {path}")
         self.manifest = _json(self.manifest_path)
         actual_schema = str(self.manifest.get("schema") or self.manifest.get("schema_version") or "missing")
-        if actual_schema != SCHEMA_VERSION:
+        if actual_schema != BENCHMARK_SCHEMA_VERSION:
             raise ValueError(
-                f"Unsupported Synthoseis schema {actual_schema!r}; expected {SCHEMA_VERSION!r}. "
+                f"Unsupported Synthoseis schema {actual_schema!r}; expected {BENCHMARK_SCHEMA_VERSION!r}. "
                 "Re-run calibrate/generate to rebuild the benchmark."
             )
         if self.manifest.get("sample_domain") != "depth" or self.manifest.get("depth_basis") != "tvdss":
@@ -91,6 +92,7 @@ class DepthV2Benchmark:
         self.lfm_contract = validate_lfm_producer_contract(
             self.manifest.get("lfm_contract") or {}
         )
+        validate_synthoseis_lfm_contract(self.lfm_contract)
         validate_contract_compatibility(self.increment_contract, self.lfm_contract)
         validate_training_manifest(self.manifest, sample_domain="depth")
         require_contract_fingerprint(self.manifest, label=f"benchmark {self.run_dir}")
@@ -138,8 +140,8 @@ class DepthV2Benchmark:
 
     def _validate_hdf5(self) -> None:
         with h5py.File(self.h5_path, "r") as h5:
-            if h5.attrs.get("schema") != SCHEMA_VERSION:
-                raise ValueError(f"HDF5 schema does not match {SCHEMA_VERSION}.")
+            if h5.attrs.get("schema") != BENCHMARK_SCHEMA_VERSION:
+                raise ValueError(f"HDF5 schema does not match {BENCHMARK_SCHEMA_VERSION}.")
             if h5.attrs.get("sample_domain") != "depth" or h5.attrs.get("depth_basis") != "tvdss":
                 raise ValueError("HDF5 root has the wrong sample domain or basis.")
             if bool(h5.attrs.get("qc_only", False)) != bool(
@@ -251,4 +253,4 @@ class DepthV2Benchmark:
         )
 
 
-__all__ = ["DepthSyntheticSample", "DepthV2Benchmark"]
+__all__ = ["DepthSyntheticSample", "DepthBenchmark"]

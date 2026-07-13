@@ -117,10 +117,12 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - [x] synthetic 按 `core/time/depth/readers/reporting` 实际依赖拆分；
 - [x] 深度生成记录抽到 `depth/model.py`，保留其余数值 seam 的渐进拆分边界；
 - [x] 删除提前落地的 microtexture emitter；
+- [x] canonical contract 对象入口、LFM profile/QC 状态和实现版本命名完成稳定化；
 - [x] 更新本地 ignored fixture，跑完 canonical、writer/reader、LFM 合同和 probe 失败测试；
+- [x] 使用现有深度 source 完成 writer → manifest → reader → baseline evaluator 小烟测；
 - [ ] 用新合同重新生成需要消费的 v4 benchmark，不覆盖冻结目录。
 
-完成条件：新包 import/compile smoke 通过，旧 root import 和 probe 正式路径搜索为空（保留明确失败测试与 observability 旁路），reader 拒绝缺少新合同的旧 v4。状态：实现与本地验证完成，完整工区重生成仍待执行。
+完成条件：新包 import/compile smoke 通过，LFM profile 和 QC 状态语义通过，旧实现版本命名不再出现在正式 reader/config/CLI 路径，probe 正式路径仍明确失败（保留失败测试与 observability 旁路），reader 拒绝缺少新合同的旧 v4。状态：合同、命名和深度真实小烟测已完成，完整工区重生成仍待执行。
 
 说明：`scripts/ginn_v2.py summarize` 仍可读取冻结历史 report-card 中的旧 probe 字段，
 但 v4 writer、reader、baseline evaluator 和 GINN v2 新 report 不再生成这些字段；该历史
@@ -273,7 +275,7 @@ PYTHONPATH=src python -m pytest -q -p no:cacheprovider tests/test_canonical_incr
 补充验证：
 
 - `python -m compileall -q src/cup` 通过；
-- 当前深度 v4 组合配置可由 `load_composed_config` 与 `parse_depth_v2_config` 解析；
+- 当前深度 v4 组合配置可由 `load_composed_config` 与 `parse_depth_config` 解析；
 - 读取 `experiments/synthoseis_lite/results/20260706/generate_field_conditioned` 时明确拒绝冻结的 v3 benchmark。
 
 阶段 2.5 实施后的本地验证命令和结果：
@@ -284,9 +286,20 @@ python -m compileall -q src/cup src/ginn_v2
 python -m pytest -q -p no:cacheprovider tests/test_canonical_increment.py tests/test_synthoseis_v4_canonical.py tests/test_synthoseis_stage_2_5.py
 ```
 
-结果：`22 passed in 2.92s`。`compileall` 与 `cup.impedance`、synthetic time/depth
+结果：稳定化测试 `25 passed`。`compileall` 与 `cup.impedance`、synthetic time/depth
 reader import smoke 同样通过。测试文件继续被 `.gitignore` 忽略；本节只记录本机结果，
-不声称测试已提交。完整 v4 工区重生成尚未运行。
+不声称测试已提交。深度真实小烟测已完成，完整 v4 工区重生成尚未运行。
+
+稳定化烟测记录：
+
+- 时间域：当前工作区没有可直接复用的真实时间域 source，本阶段只做 fixture reader/baseline 验证；
+- 深度域：使用 `experiments/synthoseis_lite/synthoseis_lite.yaml`、
+  `experiments/synthoseis_lite/results/20260706/calibrate/impedance_calibration.json` 和新输出目录执行
+  `field_conditioned`、`--debug-attempt-limit 1`、`--geometry-family none`，生成 4 个通过样本、
+  52 个有效 sample；新 reader 成功读取，baseline evaluator 对 4 个样本完成三种 baseline 评估；
+- 深度烟测输出：`scripts/output/synthoseis_lite_stage_2_5_depth_smoke_20260713`；状态为
+  `development_limited`（由 debug attempt 限制导致，符合 smoke 预期）；
+- 旧 v3 与阶段 2 之前生成的 v4 目录不覆盖、不迁移。
 
 ## 8. 相关文档
 

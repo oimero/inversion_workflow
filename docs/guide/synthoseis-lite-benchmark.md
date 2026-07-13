@@ -46,7 +46,7 @@ python scripts/synthoseis_lite.py --config <config-yaml> generate \
 |------|------|------|
 | 第四步 | `well_tie_metrics.csv`、`filtered_las/` | 标定成功的井、滤波后的测井曲线 |
 | 第五步 | `selected_wavelet.csv`、`selected_wavelet_summary.json` | 全局子波，用于正演和 mismatch 扰动 |
-| 可选旁路 | `forward_observability/` | 仅在 `probe_selection.enabled: true` 时读取，用于 frequency probe benchmark 构建 |
+| 独立旁路 | `forward_observability/` | 只保存正演可观测性分析结果，不作为 v4 benchmark 的样本选择器 |
 | 数据目录 | 地震体、解释层位、井分层 | 几何约束、目标窗口定义 |
 
 ### 深度域
@@ -67,12 +67,12 @@ python scripts/synthoseis_lite.py --config <config-yaml> generate \
 # 时间域
 synthoseis_lite:
   sample_domain: time
-  benchmark_schema: synthoseis_lite_v3
+  benchmark_schema: synthoseis_lite_v4
 
 # 深度域
 synthoseis_lite:
   sample_domain: depth
-  benchmark_schema: synthoseis_lite_v3
+  benchmark_schema: synthoseis_lite_v4
 ```
 
 ---
@@ -98,7 +98,7 @@ target_interval:
 
 synthoseis_lite:
   sample_domain: time
-  benchmark_schema: synthoseis_lite_v3
+  benchmark_schema: synthoseis_lite_v4
   global_seed: 20260615
   source_runs: ...
   sampling: ...
@@ -113,7 +113,7 @@ workflow_config: <path-to-common-yaml>
 
 synthoseis_lite:
   sample_domain: time          # 或 depth
-  benchmark_schema: synthoseis_lite_v3
+  benchmark_schema: synthoseis_lite_v4
   global_seed: 20260615
   source_runs: ...
   ...
@@ -250,9 +250,11 @@ seismic_mismatch:
 
 深度域额外支持独立的米制深度静差（与秒制子波平移分开扫描），禁止 Hz 低通字段。
 
-### `lfm` 和 `probe_selection`
+### `lfm`
 
-`lfm` 控制低频模型的生成（理想低通和受控退化两种），`probe_selection` 控制频率探针的选择和参数。深度域的 `lfm.controlled_degraded.over_smoothing` 使用米制截止参数。
+`lfm` 控制低频模型的生成（理想低通和受控退化两种）。深度域的
+`lfm.controlled_degraded.over_smoothing` 使用米制截止参数。v4 benchmark 不读取
+`forward_observability`，也不接受 `probe_selection`。
 
 ```yaml
 lfm:
@@ -264,11 +266,10 @@ lfm:
       kaiser_beta: 8.6
       blend: 1.0
 
-probe_selection:
-  enabled: false
 ```
 
-时间域中 `probe_selection.enabled: false` 时，脚本不读取 `forward_observability` 产物，不生成 frequency probe 样本，`probe_frequency_catalog.csv` 和 `frequency_probe_results.csv` 为空。常规的 field-conditioned/canonical 样本仍按第三、四、五步产物生成。
+频率探针和对应的 sample row、HDF5 group、报告字段不属于 v4 canonical benchmark；
+需要观测性证据时，单独运行 `forward_observability.py` 并阅读其分析报告。
 
 ---
 
@@ -421,11 +422,11 @@ Status: success
 | 纵轴 | TWT（秒） | TVDSS（米） |
 | 井曲线来源 | Step 4 filtered LAS | Step 5 shifted LAS |
 | 正演 | `forward_time` | `forward_depth` |
-| 可用套件 | canonical, field_conditioned, probe | 仅 field_conditioned |
+| 可用套件 | canonical, field_conditioned, seismic_variant | 仅 field_conditioned |
 | 生成器族 | `object_coefficients_v1` | `object_coefficients_v2` |
 | 低频模型截止 | Hz | 米制 |
 | 深度静差 mismatch | 无 | 有，与子波平移独立 |
-| 正演可观测性 | probe benchmark 可选 | 无 |
+| 正演可观测性 | 独立 observability 分析旁路 | 独立 observability 分析旁路 |
 
 ### 深度域两套 LAS 的分工
 
@@ -435,7 +436,7 @@ Status: success
 
 ## 留到第二轮
 
-- 深度域 canonical 和 frequency_probe 套件的支持。
+- 深度域 canonical 套件的支持，以及是否需要为特定窗口重新组织 observability 分析。
 - 是否允许按区块或层段分组校准，产出多组统计模型。
 - 训练数据拆分比例的自动推演（当前由 GINN 训练端按 `parent_realization_id` 哈希派生）。
 - 校准图的交互式版本。

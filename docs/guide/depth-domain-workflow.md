@@ -207,21 +207,22 @@ wavelet_batch_synthetic_depth:
 
 ### 合成旁路（Synthoseis-lite）
 
-深度域 v3 与时间域 v3 共享同一入口脚本 `scripts/synthoseis_lite.py` 和 `synthoseis_lite_v3` 数据模式，通过 `sample_domain` 配置分派：
+深度域 v4 与时间域 v4 共用入口脚本 `scripts/synthoseis_lite.py` 和
+`synthoseis_lite_v4` 数据模式，通过 `sample_domain` 配置分派：
 
 ```yaml
 synthoseis_lite:
   sample_domain: depth        # time | depth
-  benchmark_schema: synthoseis_lite_v3
+  benchmark_schema: synthoseis_lite_v4
 ```
 
 主要差异：
 
-| 维度 | 时间域 v3 | 深度域 v3 |
+| 维度 | 时间域 v4 | 深度域 v4 |
 |------|-----------|-----------|
 | 采样轴 | TWT (ms) | TVDSS (m)，向下为正 |
 | 井曲线来源 | Step 4 filtered LAS + Step 5 全局子波 | Step 5 `shifted_filtered_las/AI` + `shifted_preprocessed_las/AI`、Step 6 冻结子波和 AI–Vp 关系 |
-| 可用套件 | canonical, field_conditioned, frequency_probe, seismic_variant | 仅 `field_conditioned`；canonical 和 probe 关闭 |
+| 可用套件 | canonical, field_conditioned, seismic_variant | 仅 `field_conditioned`；canonical 和 probe 关闭 |
 | 模型轴 | TWT 方向 | 工区原生 5 m + 8× 高分轴 |
 | 空间路径 | inline/xline 索引 | 显式 inline/xline 折线路径 |
 | 校准依赖 | Step 4/5/6 时间域来源 | Step 1 + Step 5（深度域）+ Step 6 |
@@ -281,7 +282,7 @@ Vp = (AI - b) / a
                                           ↓
 深度域旁路：Step 1 → 2 → 3 → 4(vawt_depth) → 5(wbs_depth) → 旁路(rock_physics)
                                                               ↓
-                                              synthoseis_lite depth v3 → GINN v2
+                                              synthoseis_lite depth v4 → GINN v2
                                                                           ↓
                                                    统一井控 → LFM v3 → R0 → R1(TVDSS)
 ```

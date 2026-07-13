@@ -7,7 +7,7 @@ Usage::
         --suite field_conditioned --impedance-calibration <file>
 
 The ``synthoseis_lite.sample_domain`` and ``benchmark_schema`` keys explicitly
-select the time-v2 or depth-v2 branch.
+select the primary time-domain or depth-domain extension branch.
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION  # noqa: E402
 from cup.synthetic.depth.calibration import run_depth_calibration  # noqa: E402
 from cup.synthetic.depth.config import (  # noqa: E402
     load_composed_config,
-    parse_depth_v2_config,
-    resolve_depth_v2_sources,
+    parse_depth_config,
+    resolve_depth_sources,
 )
 from cup.synthetic.depth.generation import run_depth_generation  # noqa: E402
 from cup.synthetic.workflow import (  # noqa: E402
@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
         "--suite",
         choices=("canonical", "field_conditioned"),
         required=True,
-        help="Depth v3 requires field_conditioned; time v3 also supports canonical.",
+        help="Depth v4 requires field_conditioned; time v4 also supports canonical.",
     )
     generate.add_argument(
         "--debug-attempt-limit",
@@ -146,7 +146,7 @@ def _prepare_synthoseis_config(raw: dict, workflow: WorkflowConfig) -> dict:
 
 
 def _load_time_config(experiment_raw: dict, *, experiment_path: Path) -> tuple[dict, WorkflowConfig, dict[str, str]]:
-    """Load time-v2 config, supporting either legacy direct or common-overlay form."""
+    """Load the primary time-domain config in direct or common-overlay form."""
     if "workflow_config" not in experiment_raw:
         raw = experiment_raw
         workflow = WorkflowConfig.from_mapping(raw)
@@ -168,7 +168,7 @@ def _load_time_config(experiment_raw: dict, *, experiment_path: Path) -> tuple[d
     composed["synthoseis_lite"] = dict(experiment_raw.get("synthoseis_lite") or {})
     workflow = WorkflowConfig.from_mapping(composed)
     if workflow.seismic.domain != "time":
-        raise ValueError("Time Synthoseis-lite v3 requires seismic.domain='time'.")
+        raise ValueError("Time Synthoseis-lite v4 requires seismic.domain='time'.")
     provenance = {
         "experiment_file": str(experiment_path),
         "workflow_config": str(common_path),
@@ -200,12 +200,12 @@ def main() -> None:
 
     if (sample_domain, benchmark_schema) == ("depth", BENCHMARK_SCHEMA_VERSION):
         if "workflow_config" not in experiment_raw:
-            raise ValueError("Depth Synthoseis-lite v3 requires workflow_config.")
+            raise ValueError("Depth Synthoseis-lite v4 requires workflow_config.")
         raw, workflow, config_provenance = load_composed_config(config_path, repo_root=REPO_ROOT)
         if workflow.seismic.domain != "depth":
-            raise ValueError("Composed Synthoseis-lite v3 currently implements the depth branch only.")
-        script_cfg = parse_depth_v2_config(raw)
-        sources, source_provenance, forward_inputs = resolve_depth_v2_sources(
+            raise ValueError("Composed Synthoseis-lite v4 currently implements the depth branch only.")
+        script_cfg = parse_depth_config(raw)
+        sources, source_provenance, forward_inputs = resolve_depth_sources(
             script_cfg, workflow=workflow, repo_root=REPO_ROOT
         )
         output_dir = _resolve_output_dir(args, workflow)
@@ -222,7 +222,7 @@ def main() -> None:
             )
         else:
             if args.suite != "field_conditioned":
-                raise ValueError("Depth Synthoseis-lite v3 only supports --suite field_conditioned.")
+                raise ValueError("Depth Synthoseis-lite v4 only supports --suite field_conditioned.")
             summary = run_depth_generation(
                 workflow=workflow,
                 script_cfg=script_cfg,
@@ -236,7 +236,7 @@ def main() -> None:
                 geometry_families=args.geometry_family,
                 qc_only=args.qc_only,
             )
-        print("=== synthoseis-lite v3 ===")
+        print("=== synthoseis-lite v4 (depth) ===")
         print(f"Command: {args.command}")
         print(f"Output: {output_dir}")
         print(f"Status: {summary.get('status', 'success')}")

@@ -1,7 +1,8 @@
-"""Synthoseis-lite benchmark facade.
+"""Primary time-domain Synthoseis-lite facade.
 
-Generation is split by sampling domain; readers and reporting are separate
-from generation so consumers only depend on materialized artifact contracts.
+The root package is the default time-domain product.  The depth-domain
+extension lives under :mod:`cup.synthetic.depth`; readers and reporting stay
+separate from generation so consumers depend on materialized contracts.
 """
 
 from cup.synthetic.benchmark import SyntheticSample, SynthoseisBenchmark

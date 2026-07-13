@@ -1,4 +1,8 @@
-"""Facade for synthoseis-lite calibration and generation workflows."""
+"""Primary time-domain Synthoseis-lite calibration and generation workflow.
+
+The depth-domain extension is dispatched explicitly by the command-line
+entrypoint and is not required to mirror this workflow module.
+"""
 
 from __future__ import annotations
 

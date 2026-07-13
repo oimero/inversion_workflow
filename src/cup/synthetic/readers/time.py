@@ -16,6 +16,7 @@ from cup.impedance import (
     validate_contract_compatibility,
     validate_lfm_producer_contract,
     validate_sample_axis,
+    validate_synthoseis_lfm_contract,
 )
 from cup.synthetic.core import (
     validate_dataset_metadata,
@@ -30,7 +31,7 @@ SEISMIC_VARIANT_KINDS = {"seismic_variant"}
 
 
 @dataclass(frozen=True)
-class TimeV2SyntheticSample:
+class TimeSyntheticSample:
     sample_id: str
     sample_kind: str
     row: dict[str, Any]
@@ -93,7 +94,7 @@ def _pad_forward_to_model(
     )
 
 
-class TimeV2Benchmark:
+class TimeBenchmark:
     """Read-only accessor around ``synthoseis_lite_v4`` time artifacts."""
 
     schema = SCHEMA_VERSION
@@ -134,6 +135,7 @@ class TimeV2Benchmark:
         self.lfm_contract = validate_lfm_producer_contract(
             self.manifest.get("lfm_contract") or {}
         )
+        validate_synthoseis_lfm_contract(self.lfm_contract)
         validate_contract_compatibility(self.increment_contract, self.lfm_contract)
         validate_training_manifest(self.manifest, sample_domain="time")
         require_contract_fingerprint(self.manifest, label=f"benchmark {self.run_dir}")
@@ -266,7 +268,7 @@ class TimeV2Benchmark:
         except KeyError as exc:
             raise KeyError(f"Unknown sample_id: {sample_id}") from exc
 
-    def load_sample(self, sample_id: str) -> TimeV2SyntheticSample:
+    def load_sample(self, sample_id: str) -> TimeSyntheticSample:
         row = self.row(sample_id)
         sample_kind = str(row.get("sample_kind", "base"))
         group_path = _clean_path(row.get("hdf5_group"))
@@ -350,7 +352,7 @@ class TimeV2Benchmark:
         finite = np.isfinite(target) & np.isfinite(canonical_background) & np.isfinite(target_increment)
         if np.any(finite & (np.abs(target - canonical_background - target_increment) > 1e-5)):
             raise ValueError(f"Canonical increment decomposition mismatch for {sample_id}.")
-        return TimeV2SyntheticSample(
+        return TimeSyntheticSample(
             sample_id=str(sample_id),
             sample_kind=sample_kind,
             row=row,
@@ -398,6 +400,6 @@ class TimeV2Benchmark:
 __all__ = [
     "SCHEMA_VERSION",
     "SEISMIC_VARIANT_KINDS",
-    "TimeV2Benchmark",
-    "TimeV2SyntheticSample",
+    "TimeBenchmark",
+    "TimeSyntheticSample",
 ]

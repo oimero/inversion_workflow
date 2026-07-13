@@ -1,4 +1,4 @@
-"""Adapters between depth-domain v2 and the domain-neutral object core.
+"""Adapters between the depth-domain extension and the domain-neutral object core.
 
 The first depth Synthoseis slice deliberately reuses the existing object-core
 calibration and realization generator.  That core was originally written for
@@ -140,7 +140,7 @@ def depth_payload_from_object_core_calibration(
 
 
 def load_depth_calibration_for_object_core(path: Path) -> tuple[ImpedanceCalibration, dict[str, Any]]:
-    """Load depth v2 storage and adapt only the object-core seam."""
+    """Load depth storage and adapt only the object-core seam."""
     payload = _json(path)
     if payload.get("schema_version") != CALIBRATION_SCHEMA:
         raise ValueError(f"Expected {CALIBRATION_SCHEMA}, got {payload.get('schema_version')}.")

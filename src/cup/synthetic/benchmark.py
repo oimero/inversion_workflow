@@ -16,11 +16,11 @@ from cup.synthetic.schemas import (
     FROZEN_BENCHMARK_SCHEMA_VERSION,
     LEGACY_BENCHMARK_SCHEMA_VERSION,
 )
-from cup.synthetic.readers.depth import DepthSyntheticSample, DepthV2Benchmark
-from cup.synthetic.readers.time import TimeV2Benchmark, TimeV2SyntheticSample
+from cup.synthetic.readers.depth import DepthBenchmark, DepthSyntheticSample
+from cup.synthetic.readers.time import TimeBenchmark, TimeSyntheticSample
 
 
-SyntheticSample = TimeV2SyntheticSample | DepthSyntheticSample
+SyntheticSample = TimeSyntheticSample | DepthSyntheticSample
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -59,11 +59,11 @@ class SynthoseisBenchmark:
             )
         if schema == BENCHMARK_SCHEMA_VERSION:
             if sample_domain == "time":
-                self._reader = TimeV2Benchmark(
+                self._reader = TimeBenchmark(
                     self.run_dir,
                 )
             elif sample_domain == "depth":
-                self._reader = DepthV2Benchmark(
+                self._reader = DepthBenchmark(
                     self.run_dir,
                 )
             else:
@@ -100,9 +100,9 @@ class SynthoseisBenchmark:
 
 __all__ = [
     "DepthSyntheticSample",
-    "DepthV2Benchmark",
+    "DepthBenchmark",
     "SyntheticSample",
     "SynthoseisBenchmark",
-    "TimeV2Benchmark",
-    "TimeV2SyntheticSample",
+    "TimeBenchmark",
+    "TimeSyntheticSample",
 ]

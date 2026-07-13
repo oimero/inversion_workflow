@@ -5,8 +5,8 @@ from cup.synthetic.depth.config import (
     GENERATOR_FAMILY,
     SCHEMA_VERSION,
     load_composed_config,
-    parse_depth_v2_config,
-    resolve_depth_v2_sources,
+    parse_depth_config,
+    resolve_depth_sources,
 )
 from cup.synthetic.depth.calibration import run_depth_calibration
 from cup.synthetic.depth.generation import run_depth_generation
@@ -17,8 +17,8 @@ __all__ = [
     "GENERATOR_FAMILY",
     "SCHEMA_VERSION",
     "load_composed_config",
-    "parse_depth_v2_config",
-    "resolve_depth_v2_sources",
+    "parse_depth_config",
+    "resolve_depth_sources",
     "run_depth_calibration",
     "run_depth_generation",
     "DepthGeneratedSection",

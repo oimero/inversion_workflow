@@ -46,9 +46,9 @@ decompose_log_ai
 generation_contract
 ```
 
-LFM metadata 另有 `validate_lfm_producer_contract` 和
-`validate_contract_compatibility`。`build_lfm_producer_contract` 只负责生成
-manifest 字段，不改变 canonical 数学定义。
+LFM metadata 另有 `validate_lfm_producer_contract`、
+`validate_synthoseis_lfm_contract` 和 `validate_contract_compatibility`。
+`build_lfm_producer_contract` 只负责生成 manifest 字段，不改变 canonical 数学定义。
 
 ### 2.1 Canonical contract
 
@@ -122,15 +122,24 @@ buffer_axis_units: 400.0
 variant_selection:
   selected: controlled_default
   available: [canonical, controlled_default]
-final_background_complement_response_rms: 0.0
-final_background_complement_response_ratio: 0.0
-final_background_max_trace_response_ratio: 0.0
+final_background_complement_response_status: not_computed
+final_background_complement_response_rms: null
+final_background_complement_response_ratio: null
+final_background_max_trace_response_ratio: null
 ```
 
 时间域使用 `sample_unit=s` 和 `cutoff_hz=15.0`，并省略 `depth_basis`。
 `well_control_lowpass_application_count` 与 `final_volume_lowpass_application_count`
 分开记录；空间建模后的最终体不被“井控曾低通过”自动证明为严格的 `P(m)`。
-最终体 complement-response QC 只用于诊断和方法比较，不是消费端重新滤波的理由。
+`final_background_complement_response_status=not_computed` 时三个 QC 值必须为
+`null`；只有状态为 `measured` 时才写入有限非负数。最终体 complement-response
+QC 只用于诊断和方法比较，不是消费端重新滤波的理由。
+
+通用 `validate_lfm_producer_contract` 只检查字段格式和固定数值合同；
+`validate_synthoseis_lfm_contract` 另外锁定 Synthoseis-lite v4 profile：生产者为
+`synthoseis_lite`、canonical 低通作用于 `target_log_ai` 且恰好一次，井控和最终体
+低通次数为零，且不允许 post-lowpass vertical warp。其他 LFM producer 可以另行
+定义 profile，不把所有业务规则塞进通用 validator。
 
 ## 4. v4 probe 关闭
 
@@ -206,6 +215,21 @@ artifact schema 和进度工具。time/depth 通过明确 seam 使用 core、`cu
 重新低通、不在 patch 内生成标签、不猜字段含义。`reporting` 只做图和指标，不参与
 生成或训练。不存在 `old`、`legacy`、`compat` wrapper。
 
+`cup.synthetic` 是时间域主产品 façade，根目录导出的默认生成、正演和 LFM 工具
+属于时间域主链；`cup.synthetic.depth` 是面向当前研究工区的扩展，不承诺与时间域
+文件数量或能力完全对称。深度域仍由 `scripts/synthoseis_lite.py` 根据
+`sample_domain` 显式分派。能力差异必须在文档中标记为 `primary`、`supported`、
+`experimental` 或 `not applicable`，不能仅凭目录是否存在对应文件推断。
+
+| 能力 | 时间域 | 深度域 |
+| --- | --- | --- |
+| canonical increment 与 v4 reader | primary | required |
+| 默认 Synthoseis workflow | primary | not applicable |
+| TVDSS、AI–Vp 与深度正演 | not applicable | required |
+| 频率/子波时间参数 | primary | not applicable 或 experimental |
+| 米制 depth static | not applicable | supported |
+| 当前真实工区 benchmark | primary | supported |
+
 阶段 2.5 已完成 time、core、readers、reporting 的实际迁移，并将深度域的数据记录
 抽到 `depth/model.py`；深度域的数值生成仍由 `depth/generation.py` 统一编排，
 `depth/lfm.py`、`depth/writer.py` 和 `depth/pipeline.py` 是后续按 seam 拆分的目标
@@ -239,10 +263,11 @@ manifest 缺字段时直接失败，不做自动补全。
 
 | 类别 | 验收 |
 | --- | --- |
-| contract | 错 semantics、unit、log base、cutoff、buffer、implementation、版本直接失败 |
+| canonical contract | 错 semantics、unit、log base、cutoff、buffer、implementation、版本直接失败 |
 | axis | NaN/Inf、反向、重复、非等间隔失败；相对/绝对容差按合同工作 |
 | operator | time/depth 独立复算；连续有限段不跨 NaN；短段失败；输出轴 float64 |
-| LFM | producer contract 完整字段、domain compatibility 和错误计数失败 |
+| contract entry | 直接构造的非法对象、错误 semantics/unit/filter 和容差直接失败 |
+| LFM | producer contract、Synthoseis profile、domain compatibility、错误计数和 QC 状态失败 |
 | writer/reader | time/depth v4 字段树、manifest contract 和 shared target increment |
 | probe | 配置、index、reader、report 遇 probe 明确失败或不生成 |
 | package | `cup.impedance`、`cup.synthetic.benchmark`、time/depth reader import smoke |
@@ -258,6 +283,15 @@ $env:PYTHONPATH = "src"
 
 测试文件不随本阶段提交；Handoff 只记录本地运行结果和失败原因。
 
+本次稳定化验证结果：
+
+- `compileall -q src/cup src/ginn_v2` 通过；
+- canonical、writer/reader、LFM profile/QC、probe 失败和命名 smoke 共 `25 passed`；
+- 深度真实小烟测输出到 `scripts/output/synthoseis_lite_stage_2_5_depth_smoke_20260713`，
+  4 个通过样本写入 v4 HDF5，`SynthoseisBenchmark` 成功读取 52 个有效 sample；
+- `evaluate_synthoseis_lite.py --max-samples 4` 完成三种 baseline 评估；
+- 时间域没有可复用真实 source，本阶段只做 fixture reader/baseline 验证。
+
 ## 8. 阶段门禁与后续
 
 阶段 2.5 完成门禁：
@@ -266,7 +300,8 @@ $env:PYTHONPATH = "src"
 2. time/depth v4 writer/reader 能读新 manifest，并拒绝缺少新合同的旧 v4；
 3. probe 配置、row、writer、reader 和 report 正式路径全部关闭；
 4. 新包 import smoke 和 `compileall` 通过；
-5. Handoff 写明重生成范围、测试命令和未覆盖项。
+5. 至少一个深度域真实 source 小烟测完成 writer → manifest → reader → baseline evaluator；
+6. Handoff 写明时间域暂无真实 source、fixture 验证范围、重生成范围、测试命令和未覆盖项。
 
 只有这些门禁全部满足后，阶段 3 才能重新设计并实现 `thin_bed_cluster`、
 `canonical_well_patch` 和 paired A/B/C benchmark。阶段 3 继续复用同一

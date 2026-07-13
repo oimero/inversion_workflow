@@ -103,7 +103,7 @@ def load_composed_config(
     }
 
 
-def parse_depth_v2_config(config: Mapping[str, Any]) -> dict[str, Any]:
+def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     root = _mapping(config.get("synthoseis_lite"), path="synthoseis_lite")
     allowed_root = {
         "sample_domain", "benchmark_schema", "global_seed", "source_runs", "sampling", "geometry", "sections",
@@ -456,7 +456,7 @@ def _load_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def resolve_depth_v2_sources(
+def resolve_depth_sources(
     script_cfg: Mapping[str, Any],
     *,
     workflow: WorkflowConfig,
@@ -527,6 +527,6 @@ __all__ = [
     "GENERATOR_FAMILY",
     "SCHEMA_VERSION",
     "load_composed_config",
-    "parse_depth_v2_config",
-    "resolve_depth_v2_sources",
+    "parse_depth_config",
+    "resolve_depth_sources",
 ]

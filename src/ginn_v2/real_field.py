@@ -178,6 +178,11 @@ def _primary_checkpoint_path(
     record = manifest.get("deployment_checkpoint")
     if not isinstance(record, Mapping):
         raise ValueError("GINN-v2 experiment manifest lacks resolved deployment_checkpoint.")
+    if manifest.get("deployment_eligible") is not True or record.get("eligible") is not True:
+        raise ValueError(
+            "GINN-v2 model run is marked deployment_eligible=false; "
+            "R0 requires a standard training run with an eligible checkpoint."
+        )
     path = resolve_relative_path(str(record.get("path") or ""), root=root)
     if not path.is_file():
         raise FileNotFoundError(path)

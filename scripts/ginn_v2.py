@@ -10,6 +10,7 @@ import sys
 from typing import Mapping
 
 import pandas as pd
+import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -19,6 +20,7 @@ sys.path = [path for path in sys.path if path != src_text]
 sys.path.insert(0, src_text)
 
 from cup.synthetic.benchmark import SynthoseisBenchmark
+from cup.impedance import validate_increment_contract
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
@@ -116,6 +118,48 @@ def _resolve_checkpoint_from_manifest(
     return resolved_name, path
 
 
+def _benchmark_contract_payload(benchmark: SynthoseisBenchmark) -> dict[str, object]:
+    contract = validate_increment_contract(
+        benchmark.manifest.get("increment_contract") or {}
+    ).as_dict()
+    sample_axis_contract = {
+        "sample_domain": contract["sample_domain"],
+        "sample_unit": contract["sample_unit"],
+        "depth_basis": contract.get("depth_basis"),
+        "sample_step": contract["sample_interval"],
+        "axis_direction": "increasing",
+        "axis_regularity": "regular",
+    }
+    return {
+        "schema_version": str(benchmark.schema),
+        "sample_domain": str(benchmark.sample_domain),
+        "increment_contract": contract,
+        "sample_axis_contract": sample_axis_contract,
+        "contract_fingerprint_sha256": require_contract_fingerprint(
+            benchmark.manifest, label=f"benchmark {benchmark.run_dir}"
+        ),
+    }
+
+
+def _validate_checkpoint_benchmark_compatibility(
+    checkpoint: Mapping[str, object], benchmark: SynthoseisBenchmark,
+) -> dict[str, object]:
+    actual = _benchmark_contract_payload(benchmark)
+    checkpoint_contract = validate_increment_contract(
+        checkpoint.get("increment_contract") or {}
+    ).as_dict()
+    if checkpoint_contract != actual["increment_contract"]:
+        raise ValueError(
+            "Prediction benchmark increment_contract does not exactly match the checkpoint contract."
+        )
+    checkpoint_axis = dict(checkpoint.get("sample_axis_contract") or {})
+    if checkpoint_axis != actual["sample_axis_contract"]:
+        raise ValueError(
+            "Prediction benchmark sample-axis contract does not exactly match the checkpoint contract."
+        )
+    return actual
+
+
 def run_train(args: argparse.Namespace) -> None:
     if args.config is None:
         raise ValueError(
@@ -140,7 +184,14 @@ def run_train(args: argparse.Namespace) -> None:
     print("=== GINN-v2 composable experiment ===")
     print(f"Output: {output_dir}")
     print(f"Experiment: {experiment.experiment_id}")
-    print(f"Deployment: {manifest['deployment_checkpoint']['path']}")
+    deployment = dict(manifest["deployment_checkpoint"])
+    if deployment.get("eligible", True):
+        print(f"Deployment: {deployment['path']}")
+    else:
+        print(
+            "Checkpoint (smoke-only; deployment_eligible=false): "
+            f"{deployment['path']}"
+        )
 
 
 def run_predict(args: argparse.Namespace) -> None:
@@ -159,6 +210,10 @@ def run_predict(args: argparse.Namespace) -> None:
     output_dir = _resolve_output_dir("ginn_v2_predict", args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
     benchmark = SynthoseisBenchmark(benchmark_dir)
+    benchmark_contract = _validate_checkpoint_benchmark_compatibility(
+        checkpoint=torch.load(checkpoint_path, map_location="cpu", weights_only=False),
+        benchmark=benchmark,
+    )
     if args.eval_patch_index is not None:
         patch_index_source_path = resolve_relative_path(args.eval_patch_index, root=REPO_ROOT)
         patch_index = pd.read_csv(patch_index_source_path)
@@ -229,7 +284,7 @@ def run_predict(args: argparse.Namespace) -> None:
         )
     input_contracts = {
         "model_run": model_contract,
-        "benchmark": dict(dict(manifest.get("input_contracts") or {}).get("benchmark") or {}),
+        "benchmark": benchmark_contract,
     }
     prediction_contract_fingerprint = None
     if all(
@@ -260,8 +315,12 @@ def run_predict(args: argparse.Namespace) -> None:
         "status": "ok",
         "input_contracts": input_contracts,
         "experiment_id": str(manifest.get("experiment_id") or ""),
+        "run_mode": str(manifest.get("run_mode") or "standard"),
+        "development_limited": bool(manifest.get("development_limited", False)),
+        "deployment_eligible": bool(manifest.get("deployment_eligible", False)),
         "model_run_dir": repo_relative_path(model_run_dir, root=REPO_ROOT),
         "benchmark_dir": repo_relative_path(benchmark_dir, root=REPO_ROOT),
+        "benchmark_contract": benchmark_contract,
         "split": args.split,
         "index_source": args.index_source,
         "patch_index": patch_index_source,

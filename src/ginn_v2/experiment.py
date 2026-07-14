@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 
+from cup.impedance import validate_increment_contract
 from ginn_v2.contracts import EXPERIMENT_SCHEMA_VERSION
 from ginn_v2.models import ARCHITECTURE_IDS
 
@@ -100,6 +101,10 @@ class ExperimentConfig:
     deployment_stage_id: str
     deployment_checkpoint_kind: str
     device: str
+    increment_contract: dict[str, Any]
+    run_mode: str
+    development_limited: bool
+    validation_semantics: str
     raw: dict[str, Any]
 
 
@@ -149,11 +154,36 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
     _reject_extra(cfg, {
         "schema_version", "experiment_id", "seed", "architecture", "sources",
         "normalization_reference", "patching", "stages", "deployment_checkpoint",
-        "device",
+        "device", "increment_contract", "run_mode", "development_limited",
+        "validation_semantics",
     }, "ginn_v2")
     schema = str(cfg.get("schema_version") or EXPERIMENT_SCHEMA_VERSION)
     if schema != EXPERIMENT_SCHEMA_VERSION:
         raise ValueError(f"Unsupported GINN-v2 experiment schema {schema!r}; expected {EXPERIMENT_SCHEMA_VERSION}.")
+    increment_contract = validate_increment_contract(
+        _mapping(cfg.get("increment_contract"), "ginn_v2.increment_contract")
+    ).as_dict()
+    run_mode = str(cfg.get("run_mode") or "standard").strip().lower()
+    if run_mode not in {"standard", "smoke"}:
+        raise ValueError("ginn_v2.run_mode must be standard or smoke.")
+    development_limited = cfg.get("development_limited", run_mode == "smoke")
+    if not isinstance(development_limited, bool):
+        raise ValueError("ginn_v2.development_limited must be boolean.")
+    if run_mode == "smoke" and not development_limited:
+        raise ValueError("ginn_v2 smoke runs must set development_limited=true.")
+    validation_semantics = str(
+        cfg.get("validation_semantics")
+        or ("duplicated_training_patch" if run_mode == "smoke" else "independent_parent")
+    ).strip()
+    if validation_semantics not in {"independent_parent", "duplicated_training_patch"}:
+        raise ValueError(
+            "ginn_v2.validation_semantics must be independent_parent or "
+            "duplicated_training_patch."
+        )
+    if run_mode == "standard" and validation_semantics == "duplicated_training_patch":
+        raise ValueError(
+            "duplicated_training_patch validation is only allowed in run_mode=smoke."
+        )
     experiment_id = str(cfg.get("experiment_id") or "").strip()
     if not _ID.fullmatch(experiment_id):
         raise ValueError("ginn_v2.experiment_id must be a non-empty directory-safe identifier.")
@@ -373,6 +403,10 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         deployment_stage_id=deployment_stage,
         deployment_checkpoint_kind=deployment_kind,
         device=str(cfg.get("device") or "auto"),
+        increment_contract=increment_contract,
+        run_mode=run_mode,
+        development_limited=development_limited,
+        validation_semantics=validation_semantics,
         raw=cfg,
     )
 

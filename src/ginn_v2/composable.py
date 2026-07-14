@@ -14,6 +14,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 
+from cup.impedance import validate_increment_contract
 from cup.synthetic.benchmark import SynthoseisBenchmark
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.utils.io import (
@@ -272,6 +273,36 @@ def _synthetic_axis_contract(benchmark: SynthoseisBenchmark) -> dict[str, Any]:
     )
 
 
+def _increment_axis_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
+    resolved = validate_increment_contract(contract)
+    return {
+        "sample_domain": resolved.sample_domain,
+        "sample_unit": resolved.sample_unit,
+        "depth_basis": resolved.depth_basis,
+        "sample_step": resolved.sample_interval,
+        "axis_direction": "increasing",
+        "axis_regularity": "regular",
+    }
+
+
+def _validate_increment_contract_against_axis(
+    increment_contract: Mapping[str, Any], axis_contract: Mapping[str, Any], *, label: str,
+) -> None:
+    expected = _increment_axis_contract(increment_contract)
+    actual = dict(axis_contract)
+    for key in ("sample_domain", "sample_unit", "depth_basis", "axis_direction", "axis_regularity"):
+        if actual.get(key) != expected.get(key):
+            raise ValueError(
+                f"{label} sample-axis field {key!r} is incompatible with increment_contract: "
+                f"expected {expected.get(key)!r}, got {actual.get(key)!r}."
+            )
+    if not np.isclose(float(actual.get("sample_step")), float(expected["sample_step"]), rtol=0.0, atol=1.0e-12):
+        raise ValueError(
+            f"{label} sample interval is incompatible with increment_contract: "
+            f"expected {expected['sample_step']}, got {actual.get('sample_step')}."
+        )
+
+
 def _resolve_auto_benchmark(root: Path) -> Path:
     results = root / "experiments" / "synthoseis_lite" / "results"
     candidates = [
@@ -323,6 +354,7 @@ def _synthetic_sample_kinds(source: Mapping[str, Any]) -> set[str]:
 def _prepare_synthetic_indices(
     *, benchmark: SynthoseisBenchmark, source: Mapping[str, Any], patch_spec: PatchSpec,
     blocks: list[Mapping[str, Any]], output_dir: Path, logger: logging.Logger | None = None,
+    allow_smoke_validation_duplication: bool = False,
 ) -> dict[str, pd.DataFrame]:
     result = {}
     for block in blocks:
@@ -389,6 +421,11 @@ def _prepare_synthetic_indices(
             index["supervision_valid_samples"] = counts
             index = index[index["supervision_valid_samples"] >= int(block["min_valid_samples"])].copy()
         if source.get("max_patches") is not None and "validation" not in set(index["split"].astype(str)):
+            if not allow_smoke_validation_duplication:
+                raise ValueError(
+                    "Capped synthetic patch indices produced no independent validation parent; "
+                    "use run_mode=smoke with development_limited=true for a duplicated validation patch."
+                )
             validation = index.head(min(4, len(index))).copy()
             validation["patch_id"] = validation["patch_id"].astype(str) + "__smoke_validation"
             validation["split"] = "validation"
@@ -706,6 +743,9 @@ def _checkpoint_payload(
     *, model: torch.nn.Module, config: ExperimentConfig, model_info: Mapping[str, Any],
     normalization: Mapping[str, Any], stage_id: str, kind: str, epoch: int,
     metric_name: str, metric_value: float, sample_axis: Mapping[str, Any],
+    increment_contract: Mapping[str, Any],
+    training_sources: Mapping[str, Any],
+    stage_lineage: list[Mapping[str, Any]],
     forward_model_inputs_path: str = "",
 ) -> dict[str, Any]:
     payload = {
@@ -721,6 +761,12 @@ def _checkpoint_payload(
         "input_channels": ["seismic", "input_lfm_log_ai", "valid_mask"],
         "output_semantics": "predicted_increment_log_ai",
         "normalization": dict(normalization),
+        "increment_contract": validate_increment_contract(increment_contract).as_dict(),
+        "training_sources": {key: dict(value) for key, value in training_sources.items()},
+        "stage_lineage": [dict(value) for value in stage_lineage],
+        "run_mode": config.run_mode,
+        "development_limited": config.development_limited,
+        "deployment_eligible": not config.development_limited,
         "sample_axis_contract": dict(sample_axis),
         "patch_deployment_contract": config.patching.as_dict() | {
             "axis_end_rule": "append_axis_length_minus_window",
@@ -831,6 +877,9 @@ def run_experiment(
     source_contracts: dict[str, dict[str, Any]] = {}
     resolved_sources: dict[str, dict[str, Any]] = {}
     forward_model_inputs_by_source: dict[str, Path] = {}
+    experiment_increment_contract = validate_increment_contract(
+        config.increment_contract
+    ).as_dict()
     for source_id, source in config.sources.items():
         if source["kind"] == "synthoseis_lite":
             raw_dir = source.get("benchmark_dir")
@@ -839,6 +888,12 @@ def run_experiment(
             manifest = synthetic[source_id][0].manifest
             domain = str(manifest.get("sample_domain") or "")
             source_contracts[source_id] = _synthetic_axis_contract(synthetic[source_id][0])
+            benchmark_increment_contract = synthetic[source_id][0].increment_contract.as_dict()
+            if benchmark_increment_contract != experiment_increment_contract:
+                raise ValueError(
+                    f"Synthetic source {source_id} increment_contract does not exactly match "
+                    "ginn_v2.increment_contract."
+                )
             forward_inputs_path = _benchmark_forward_model_inputs_path(
                 synthetic[source_id][0], benchmark_dir,
             )
@@ -847,6 +902,7 @@ def run_experiment(
                 "benchmark_dir": repo_relative_path(benchmark_dir, root=root),
                 "schema_version": manifest.get("schema_version"),
                 "contract_fingerprint_sha256": manifest.get("contract_fingerprint_sha256", ""),
+                "increment_contract": benchmark_increment_contract,
                 "sample_axis_contract": dict(source_contracts[source_id]),
                 "input_seismic_variant": source.get("input_seismic_variant", "nominal"),
                 "physics_target_variant": source.get("physics_target_variant", "model_consistent"),
@@ -908,6 +964,12 @@ def run_experiment(
                 "held_out_well": source["held_out_well"],
                 "exclude_same_cluster": source.get("exclude_same_cluster", True),
             }
+    for source_id, axis_contract in source_contracts.items():
+        _validate_increment_contract_against_axis(
+            experiment_increment_contract,
+            axis_contract,
+            label=f"source {source_id}",
+        )
     logger.info(
         "sources_ready source_ids=%s consumed_source_ids=%s",
         sorted(resolved_sources),
@@ -921,6 +983,11 @@ def run_experiment(
         str(block["source"])
         for stage in config.stages
         for block in stage["loss_blocks"]
+    }
+    training_source_ids = consumed_sources | {config.normalization_reference}
+    training_sources = {
+        source_id: dict(resolved_sources[source_id])
+        for source_id in sorted(training_source_ids)
     }
     experiment_axis_contract = validate_source_axis_contracts(source_contracts, consumed_sources)
     forward_model_inputs_paths = {
@@ -1041,6 +1108,10 @@ def run_experiment(
                 indices = _prepare_synthetic_indices(
                     benchmark=benchmark, source=source, patch_spec=patch_spec,
                     blocks=[block], output_dir=stage_dir, logger=logger,
+                    allow_smoke_validation_duplication=(
+                        config.run_mode == "smoke"
+                        and config.validation_semantics == "duplicated_training_patch"
+                    ),
                 )[str(block["block_id"])]
                 train_dataset = PatchDataset(benchmark, indices, split="train", normalization=normalization)
                 validation_dataset = PatchDataset(benchmark, indices, split="validation", normalization=normalization)
@@ -1103,6 +1174,18 @@ def run_experiment(
                 prepared.real_well_support is not None,
                 time.perf_counter() - block_started,
             )
+        stage_lineage = [
+            {
+                "stage_id": str(item["stage_id"]),
+                "initialize_from": str(item.get("initialize_from") or ""),
+                "checkpoints": dict(item.get("checkpoints") or {}),
+            }
+            for item in manifest_stages
+        ]
+        stage_lineage.append({
+            "stage_id": stage_id,
+            "initialize_from": initialize,
+        })
         best_value = float("inf")
         best_epoch = 0
         history: list[dict[str, Any]] = []
@@ -1266,7 +1349,7 @@ def run_experiment(
             if selected < best_value:
                 best_value, best_epoch = selected, epoch
                 path = stage_dir / "checkpoint_best.pt"
-                torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="best", epoch=epoch, metric_name=metric_name, metric_value=selected, sample_axis=sample_axis_contract, forward_model_inputs_path=forward_model_inputs_path), path)
+                torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="best", epoch=epoch, metric_name=metric_name, metric_value=selected, sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, forward_model_inputs_path=forward_model_inputs_path), path)
                 checkpoints[(stage_id, "best")] = path
                 logger.info(
                     "checkpoint_best stage_id=%s epoch=%d metric=%s value=%.6g path=%s",
@@ -1277,7 +1360,7 @@ def run_experiment(
                     path,
                 )
         final_path = stage_dir / "checkpoint_final.pt"
-        torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="final", epoch=int(stage["epochs"]), metric_name=metric_name, metric_value=float(history[-1]["selection_metric_value"]), sample_axis=sample_axis_contract, forward_model_inputs_path=forward_model_inputs_path), final_path)
+        torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="final", epoch=int(stage["epochs"]), metric_name=metric_name, metric_value=float(history[-1]["selection_metric_value"]), sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, forward_model_inputs_path=forward_model_inputs_path), final_path)
         checkpoints[(stage_id, "final")] = final_path
         pd.DataFrame(history).to_csv(stage_dir / "training_history.csv", index=False)
         logger.info(
@@ -1301,12 +1384,17 @@ def run_experiment(
         "schema_version": EXPERIMENT_SCHEMA_VERSION,
         "status": "ok",
         "experiment_id": config.experiment_id,
+        "run_mode": config.run_mode,
+        "development_limited": config.development_limited,
+        "validation_semantics": config.validation_semantics,
+        "deployment_eligible": not config.development_limited,
         "architecture": config.architecture.as_dict(),
         "model_info": info.__dict__,
         "normalization_reference": {"source": config.normalization_reference},
         "normalization": normalization,
         "normalization_path": repo_relative_path(output_dir / "normalization.json", root=root),
         "sources": resolved_sources,
+        "increment_contract": experiment_increment_contract,
         "patching": config.patching.as_dict(),
         "input_channels": ["seismic", "input_lfm_log_ai", "valid_mask"],
         "output_semantics": (
@@ -1319,8 +1407,22 @@ def run_experiment(
             "stage_id": config.deployment_stage_id,
             "kind": config.deployment_checkpoint_kind,
             "path": repo_relative_path(deployment_path, root=root),
+            "eligible": not config.development_limited,
         },
         "device": device_metadata,
+    }
+    manifest["input_contracts"] = {
+        source_id: {
+            "kind": str(source.get("kind") or ""),
+            "schema_version": source.get("schema_version"),
+            "increment_contract": dict(source.get("increment_contract") or {}),
+            "sample_axis_contract": dict(source.get("sample_axis_contract") or {}),
+            "contract_fingerprint_sha256": str(
+                source.get("contract_fingerprint_sha256") or ""
+            ),
+        }
+        for source_id, source in resolved_sources.items()
+        if source_id in training_source_ids
     }
     if first_synthetic is not None and deployment_indices:
         manifest["benchmark_dir"] = repo_relative_path(first_synthetic[1], root=root)
@@ -1330,12 +1432,16 @@ def run_experiment(
         contract_schema_version=EXPERIMENT_SCHEMA_VERSION,
         semantics={
             "experiment_id": config.experiment_id,
+            "increment_contract": experiment_increment_contract,
             "sample_axis_contract": sample_axis_contract,
             "output_semantics": manifest["output_semantics"],
         },
         business_config={
             "architecture": config.architecture.as_dict(),
             "patching": config.patching.as_dict(),
+            "run_mode": config.run_mode,
+            "development_limited": config.development_limited,
+            "validation_semantics": config.validation_semantics,
             "deployment_checkpoint": manifest["deployment_checkpoint"],
         },
         input_contracts={

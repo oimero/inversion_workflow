@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from cup.impedance import validate_increment_contract
 from ginn_v2.contracts import CHECKPOINT_SCHEMA_VERSION
 from ginn_v2.models import build_model
 
@@ -31,6 +32,32 @@ def load_checkpoint(
     ]:
         raise ValueError(
             f"GINN-v2 checkpoint in {path} has a non-canonical input channel contract."
+        )
+    checkpoint["increment_contract"] = validate_increment_contract(
+        checkpoint.get("increment_contract") or {}
+    ).as_dict()
+    if not isinstance(checkpoint.get("training_sources"), dict):
+        raise ValueError(f"GINN-v2 checkpoint in {path} lacks training_sources provenance.")
+    if not isinstance(checkpoint.get("stage_lineage"), list):
+        raise ValueError(f"GINN-v2 checkpoint in {path} lacks stage_lineage provenance.")
+    run_mode = str(checkpoint.get("run_mode") or "")
+    if run_mode not in {"standard", "smoke"}:
+        raise ValueError(
+            f"GINN-v2 checkpoint in {path} lacks a valid run_mode (standard or smoke)."
+        )
+    development_limited = checkpoint.get("development_limited")
+    if not isinstance(development_limited, bool):
+        raise ValueError(f"GINN-v2 checkpoint in {path} lacks development_limited metadata.")
+    deployment_eligible = checkpoint.get("deployment_eligible")
+    if not isinstance(deployment_eligible, bool):
+        raise ValueError(f"GINN-v2 checkpoint in {path} lacks deployment_eligible metadata.")
+    if run_mode == "smoke" and not development_limited:
+        raise ValueError(
+            f"GINN-v2 checkpoint in {path} marks a smoke run as not development_limited."
+        )
+    if deployment_eligible != (not development_limited):
+        raise ValueError(
+            f"GINN-v2 checkpoint in {path} has inconsistent deployment eligibility metadata."
         )
     architecture = dict(checkpoint.get("architecture") or {})
     architecture_id = str(architecture.get("id") or "")

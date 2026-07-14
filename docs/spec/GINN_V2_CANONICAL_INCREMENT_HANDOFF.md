@@ -200,20 +200,27 @@ wedge 场景低于 0.5 acceptance threshold（`lx0.3/a0.25`、`lx0.3/a0.5`、
 ```text
 配置：experiments/ginn_v2/train.yaml
 架构：trace_conv1d(hidden_channels=8, depth=2)
-训练产物：experiments/ginn_v2/results/canonical_increment_synthetic_v4_s20260714
-预测产物：experiments/ginn_v2/results/canonical_increment_synthetic_v4_s20260714/predict_validation
-报告产物：scripts/output/ginn_v2_canonical_increment_report_smoke_final_20260714
-训练：1 epoch / 2 steps，CUDA，synthetic_increment.mse=0.0090784924
+训练产物：experiments/ginn_v2/results/canonical_increment_contract_smoke_final_20260714
+预测产物：scripts/output/ginn_v2_canonical_increment_contract_predict_final_20260714
+报告产物：scripts/output/ginn_v2_canonical_increment_contract_report_final_20260714
+训练：1 epoch / 2 steps，CUDA，synthetic_increment.mse=0.0090645645
 checkpoint：ginn_v2_checkpoint_v5，成功恢复 Trace1DNet
 prediction.npz：包含 predicted_increment_log_ai、predicted_log_ai、
   target_increment_log_ai、input_lfm_log_ai、valid_mask；
   max|predicted_log_ai-(input_lfm_log_ai+predicted_increment_log_ai)| = 0
 零初始化：trace_conv1d 输出最大绝对值 = 0
-回归测试：38 passed；compileall src/cup src/ginn_v2 scripts/ginn_v2.py 通过
+合同复验：checkpoint 写入完整 increment_contract、training_sources、stage_lineage；
+  prediction_summary 按实际 benchmark 记录 increment_contract、sample_axis_contract 和
+  benchmark contract fingerprint；benchmark override 先做合同兼容性检查
+smoke 标记：run_mode=smoke，validation_semantics=duplicated_training_patch，
+  development_limited=true，deployment_eligible=false；该 checkpoint 只作为合同烟测产物，
+  R0 入口会拒绝使用它
+回归测试：43 passed；compileall src/cup src/ginn_v2 scripts/ginn_v2.py 通过
 旧配置：ginn_v2_experiment_v1 明确拒绝，期望 ginn_v2_experiment_v2
 ```
 
 本切片只覆盖 synthetic supervised 和最简单 trace 架构；physics、其部署资格和其余架构仍按后续阶段实施。
+当前证据是合同烟测而非正式模型部署；正式训练需使用独立 validation parent，并由后续阶段重新评估部署资格。
 
 ### 阶段 5：四类架构与 synthetic closure
 

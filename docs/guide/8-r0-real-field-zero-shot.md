@@ -149,7 +149,7 @@ sections:
 - `seismic_value_transform`：地震数据值域变换方式。默认 `identity`。若设为 `p99_abs_matched` 等非 identity 值，需要模型的 `input_reference_stats.json`——脚本自动从第一个模型目录中读取。
 - `lfm_run_dir` / `variant_id` / `well_control_run_dir`：三者均必填且禁止 `auto`；R0 会核对直接契约身份，并校验数据模式、轴、形状、数据类型和掩码等显式语义，不重算文件 SHA。
 - `lfm_value_transform`：固定 `identity`；v3 主数组已经是波阻抗对数。
-- `lfm_file` 和外部 `target_mask_file` 已退役；掩码只能来自所选变体。
+- `lfm_file` 和外部 `target_mask_file` 不属于当前入口；掩码只能来自所选变体。
 
 ### `volume`
 

@@ -166,7 +166,7 @@ def _validate_model_sample_axis(
 def _manifest_experiment_id(manifest: Mapping[str, Any]) -> str:
     experiment_id = str(manifest.get("experiment_id") or "").strip()
     if not experiment_id:
-        raise ValueError("GINN-v2 v1 manifest must contain experiment_id.")
+        raise ValueError("GINN-v2 manifest must contain experiment_id.")
     return experiment_id
 
 
@@ -317,7 +317,7 @@ def load_real_field_section(
 ) -> RealFieldSection:
     inputs = _mapping(config.get("real_field_inputs"), "real_field_zero_shot.real_field_inputs")
     if str(inputs.get("target_mask_file") or "").strip():
-        raise ValueError("Unified LFM v2 does not accept an external target_mask_file.")
+        raise ValueError("Canonical LFM contract does not accept an external target_mask_file.")
     section_cfg = _mapping(config.get("section"), "real_field_zero_shot.section")
     from cup.seismic.lfm.artifacts import resolve_lfm_variant
 
@@ -370,20 +370,7 @@ def load_real_field_section(
         )
         seismic, lfm_values, twt_s = _align_sample_arrays(seismic, seismic_twt, lfm_values, twt_s)
 
-    mask_path_text = str(inputs.get("target_mask_file") or "").strip()
-    if mask_path_text:
-        mask_path = resolve_relative_path(mask_path_text, root=root)
-        mask, mask_ilines, mask_xlines, mask_twt = _load_npz_grid_section(
-            mask_path,
-            section_cfg=section_cfg,
-            sample_domain=sample_domain,
-            value_keys=("valid_mask_model", "mask", "target_mask", "volume"),
-        )
-        _assert_axes_close("mask ilines", mask_ilines, ilines)
-        _assert_axes_close("mask xlines", mask_xlines, xlines)
-        mask, _, _ = _align_sample_arrays(mask.astype(float), mask_twt, lfm_values, twt_s)
-        valid_mask = mask > 0.5
-    elif _npz_has_any(lfm_path, ("valid_mask_model", "mask", "target_mask")):
+    if _npz_has_any(lfm_path, ("valid_mask_model", "mask", "target_mask")):
         mask, mask_ilines, mask_xlines, mask_twt = _load_npz_grid_section(
             lfm_path,
             section_cfg=section_cfg,
@@ -430,7 +417,6 @@ def load_real_field_section(
             "lfm_file": str(lfm_path),
             "seismic_file": str(seismic_path),
             "seismic_type": seismic_type,
-            "target_mask_file": mask_path_text,
             "lfm_value_transform": lfm_transform,
             "lfm_run_dir": str(selected_variant.run_dir),
             "variant_id": selected_variant.variant_id,
@@ -455,7 +441,7 @@ def load_real_field_volume(
 ) -> RealFieldVolume:
     inputs = _mapping(config.get("real_field_inputs"), "real_field_zero_shot.real_field_inputs")
     if str(inputs.get("target_mask_file") or "").strip():
-        raise ValueError("Unified LFM v2 does not accept an external target_mask_file.")
+        raise ValueError("Canonical LFM contract does not accept an external target_mask_file.")
     volume_cfg = dict(config.get("volume") or {})
     from cup.seismic.lfm.artifacts import resolve_lfm_variant
 
@@ -504,20 +490,7 @@ def load_real_field_volume(
         )
         seismic, lfm_values, twt_s = _align_volume_sample_arrays(seismic, seismic_twt, lfm_values, twt_s)
 
-    mask_path_text = str(inputs.get("target_mask_file") or "").strip()
-    if mask_path_text:
-        mask_path = resolve_relative_path(mask_path_text, root=root)
-        mask, mask_ilines, mask_xlines, mask_twt = _load_npz_grid_volume(
-            mask_path,
-            volume_cfg=volume_cfg,
-            sample_domain=sample_domain,
-            value_keys=("valid_mask_model", "mask", "target_mask", "volume"),
-        )
-        _assert_axes_close("mask ilines", mask_ilines, ilines)
-        _assert_axes_close("mask xlines", mask_xlines, xlines)
-        mask, _, _ = _align_volume_sample_arrays(mask.astype(float), mask_twt, lfm_values, twt_s)
-        valid_mask = mask > 0.5
-    elif _npz_has_any(lfm_path, ("valid_mask_model", "mask", "target_mask")):
+    if _npz_has_any(lfm_path, ("valid_mask_model", "mask", "target_mask")):
         mask, mask_ilines, mask_xlines, mask_twt = _load_npz_grid_volume(
             lfm_path,
             volume_cfg=volume_cfg,
@@ -564,7 +537,6 @@ def load_real_field_volume(
             "lfm_file": str(lfm_path),
             "seismic_file": str(seismic_path),
             "seismic_type": seismic_type,
-            "target_mask_file": mask_path_text,
             "lfm_value_transform": lfm_transform,
             "lfm_run_dir": str(selected_variant.run_dir),
             "variant_id": selected_variant.variant_id,
@@ -1209,6 +1181,7 @@ def load_zero_shot_predictions(run_dir: Path) -> dict[str, dict[str, Any]]:
         missing = sorted(required - set(arrays.files))
         if missing:
             raise ValueError(f"R0 prediction artifact {npz_path} lacks canonical fields: {missing}")
+        # Failure-only vocabulary: retired aliases are never read as predictions.
         forbidden = sorted(
             set(arrays.files).intersection(
                 {"stitched_pred_log_ai", "pred_delta_vs_lfm", "lfm_input", "valid_mask_model"}

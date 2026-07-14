@@ -2408,6 +2408,7 @@ def _depth_well_qc(
     zero_shot_dir: Path,
     zero_shot_summary: Mapping[str, object],
     observed: np.ndarray,
+    lfm_log_ai: np.ndarray,
     synthetic_by_role: Mapping[str, np.ndarray],
     predictions: Mapping[str, Mapping[str, object]],
     ilines: np.ndarray,
@@ -2455,16 +2456,24 @@ def _depth_well_qc(
             else:
                 synthetic_well = synthetic[trace_indices, np.arange(tvdss_m.size)]
                 synthetic_inside = observed_inside
-            model_role = role.removeprefix("zero_shot_")
-            pred_payload = predictions.get(model_role)
-            if pred_payload is None:
-                pred_values = np.full_like(well_log_ai, np.nan)
-            else:
-                pred = np.asarray(pred_payload["arrays"]["predicted_log_ai"], dtype=np.float64)
+            if role == "lfm_only":
                 if is_volume:
-                    pred_values, _ = sample_volume_trilinear(pred, **sample_kwargs)
+                    pred_values, _ = sample_volume_trilinear(lfm_log_ai, **sample_kwargs)
                 else:
-                    pred_values = pred[trace_indices, np.arange(tvdss_m.size)]
+                    pred_values = lfm_log_ai[trace_indices, np.arange(tvdss_m.size)]
+                closure_type = "lfm_only"
+            else:
+                model_role = role.removeprefix("zero_shot_")
+                pred_payload = predictions.get(model_role)
+                if pred_payload is None:
+                    pred_values = np.full_like(well_log_ai, np.nan)
+                else:
+                    pred = np.asarray(pred_payload["arrays"]["predicted_log_ai"], dtype=np.float64)
+                    if is_volume:
+                        pred_values, _ = sample_volume_trilinear(pred, **sample_kwargs)
+                    else:
+                        pred_values = pred[trace_indices, np.arange(tvdss_m.size)]
+                closure_type = "deployment_closure"
             valid = (
                 same_axis
                 & control.valid_mask[indices]
@@ -2484,7 +2493,7 @@ def _depth_well_qc(
                     "well_name": control.well_name,
                     "model_role": role,
                     "experiment_id": _experiment_id_for_role(predictions, role),
-                    "closure_type": "deployment_closure",
+                    "closure_type": closure_type,
                     "sample_domain": "depth",
                     "sample_unit": "m",
                     "depth_basis": "tvdss",
@@ -2665,6 +2674,7 @@ def _run_depth_diagnostic(
         zero_shot_dir=zero_shot_dir,
         zero_shot_summary=zero_shot_summary,
         observed=observed,
+        lfm_log_ai=lfm,
         synthetic_by_role=synthetic_by_role,
         predictions=predictions,
         ilines=ilines,

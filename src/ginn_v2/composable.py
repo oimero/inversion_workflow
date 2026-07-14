@@ -789,6 +789,8 @@ def _checkpoint_payload(
                 "block_id": str(value.get("block_id") or ""),
                 "kind": str(value.get("kind") or ""),
                 "source": str(value.get("source") or ""),
+                "weight": float(value.get("weight", 0.0)),
+                "update_interval": int(value.get("update_interval", 0)),
             }
             for value in stage_loss_blocks
         ],
@@ -1507,7 +1509,14 @@ def run_experiment(
                     path,
                 )
         final_path = stage_dir / "checkpoint_final.pt"
-        torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="final", epoch=int(stage["epochs"]), metric_name=metric_name, metric_value=float(history[-1]["selection_metric_value"]), sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, stage_deployment_eligible=bool(stage.get("deployment_eligible", False)), stage_deployment_eligibility_reason=str(stage.get("deployment_eligibility_reason") or ""), physics_closures=list(stage.get("physics_closures") or []), stage_loss_blocks=list(stage.get("loss_blocks") or []), forward_model_inputs_path=forward_model_inputs_path), final_path)
+        final_has_physics = bool(stage.get("physics_closures"))
+        final_eligible = bool(stage.get("deployment_eligible", False)) and not final_has_physics
+        final_reason = (
+            "physics_stage_final_checkpoint_diagnostic_only"
+            if final_has_physics
+            else str(stage.get("deployment_eligibility_reason") or "")
+        )
+        torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="final", epoch=int(stage["epochs"]), metric_name=metric_name, metric_value=float(history[-1]["selection_metric_value"]), sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, stage_deployment_eligible=final_eligible, stage_deployment_eligibility_reason=final_reason, physics_closures=list(stage.get("physics_closures") or []), stage_loss_blocks=list(stage.get("loss_blocks") or []), forward_model_inputs_path=forward_model_inputs_path), final_path)
         checkpoints[(stage_id, "final")] = final_path
         pd.DataFrame(history).to_csv(stage_dir / "training_history.csv", index=False)
         logger.info(

@@ -864,7 +864,7 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f"train.real_well_supervised.{key} must be explicit and non-auto.")
         cfg[key] = value
     if str(cfg["lfm_value_transform"]).casefold() not in {"identity", "none"}:
-        raise ValueError("train.real_well_supervised.lfm_value_transform must be identity for unified LFM v2.")
+        raise ValueError("train.real_well_supervised.lfm_value_transform must be identity for the canonical LFM contract.")
     if not isinstance(cfg["exclude_same_cluster"], bool):
         raise ValueError("train.real_well_supervised.exclude_same_cluster must be a YAML boolean.")
     if int(cfg["clusters_per_step"]) <= 0:

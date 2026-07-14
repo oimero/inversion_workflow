@@ -185,7 +185,7 @@ def _prepare_real_field_inputs(run_cfg: dict, workflow_cfg: dict) -> dict:
     if transform not in {"identity", "none"}:
         raise ValueError("Unified LFM v3 is already log(AI); lfm_value_transform must be identity.")
     if str(inputs.get("target_mask_file") or "").strip():
-        raise ValueError("Unified LFM v3 owns valid_mask_model; external target_mask_file is not accepted.")
+        raise ValueError("Canonical LFM owns valid_mask_model; external target_mask_file is not accepted.")
     inputs["lfm_file"] = repo_relative_path(selected.lfm_path, root=REPO_ROOT)
     inputs["lfm_value_transform"] = "identity"
     inputs["selected_lfm_contract_fingerprint_sha256"] = selected.contract_fingerprint_sha256

@@ -56,6 +56,8 @@ VALIDATION_METRICS = {
     "physics": {"waveform_mse", "increment_l2", "total"},
     "real_well_supervised": {"mse"},
 }
+# Failure-only vocabulary: these names are rejected at the new-schema boundary;
+# no compatibility or fallback execution path uses them.
 LEGACY_KEYS = {
     "train", "model_id", "model_role", "min_valid_fraction",
     "lambda_physics", "lambda_real_delta", "real_delta", "delta_l2_weight",
@@ -153,7 +155,10 @@ def _stage_deployment_eligibility(
     if "physics" not in kinds:
         return True, "supervised_stage"
     synthetic_blocks = [
-        block for block in blocks if str(block.get("kind") or "") == "synthetic_supervised"
+        block
+        for block in blocks
+        if str(block.get("kind") or "") == "synthetic_supervised"
+        and float(block.get("weight", 0.0)) > 0.0
     ]
     if not synthetic_blocks:
         if "real_well_supervised" in kinds:
@@ -392,6 +397,7 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         stage_has_physics = any(block["kind"] == "physics" for block in blocks)
         stage_has_current_supervised = any(
             block["kind"] in {"synthetic_supervised", "real_well_supervised"}
+            and block["weight"] > 0.0
             for block in blocks
         )
         if stage_has_physics:
@@ -471,6 +477,14 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
             raise ValueError("deployment_checkpoint must reference a stage best/final.")
         deployment_stage, deployment_kind = parts
     selected_stage = next(stage for stage in stages if stage["stage_id"] == deployment_stage)
+    if deployment_kind == "final" and any(
+        str(block.get("kind") or "") == "physics"
+        for block in selected_stage.get("loss_blocks", [])
+    ):
+        raise ValueError(
+            f"deployment_checkpoint={deployment!r} is not deployment eligible: "
+            "physics stages may deploy only their supervised-metric best checkpoint."
+        )
     # Development-limited runs intentionally may select a diagnostic checkpoint;
     # the manifest and checkpoint carry deployment_eligible=false and R0 rejects
     # them.  Standard runs must select a stage whose selection contract is safe

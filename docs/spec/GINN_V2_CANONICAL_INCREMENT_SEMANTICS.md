@@ -529,7 +529,7 @@ L_physics = L_waveform + increment_l2_weight * L_increment
 可部署 checkpoint 仅有两类：
 
 1. 只包含监督 block 的阶段 best/final；
-2. 同时包含 physics 和 `synthetic_supervised` block、从监督 checkpoint 初始化，并使用该 synthetic block 的 `<block_id>.mse` 作为 selection metric 的阶段 best/final。
+2. 同时包含 physics 和有效（正权重）`synthetic_supervised` block、从监督 checkpoint 初始化，并使用该 synthetic block 的 `<block_id>.mse` 作为 selection metric 的阶段 **best**。该阶段的 final checkpoint 只作诊断，不能部署。
 
 仅由 `real_well_supervised` 提供监督的联合 physics 阶段标记为 experimental，即使按井点 MSE 选优也不自动具备部署资格。稀疏井指标不能约束井间区域沿 physics 多解方向的漂移。
 

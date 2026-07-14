@@ -69,6 +69,12 @@ def load_checkpoint(
     stage_loss_blocks = checkpoint.get("stage_loss_blocks")
     if not isinstance(stage_loss_blocks, list):
         raise ValueError(f"GINN-v2 checkpoint in {path} lacks stage_loss_blocks metadata.")
+    for item in stage_loss_blocks:
+        if not isinstance(item, dict) or "weight" not in item or "update_interval" not in item:
+            raise ValueError(
+                f"GINN-v2 checkpoint in {path} has incomplete stage_loss_blocks metadata; "
+                "weight and update_interval are required."
+            )
     if not isinstance(checkpoint.get("stage_selection_metric"), str):
         raise ValueError(f"GINN-v2 checkpoint in {path} lacks stage_selection_metric metadata.")
     stage_kinds = {str(item.get("kind") or "") for item in stage_loss_blocks}
@@ -77,12 +83,15 @@ def load_checkpoint(
             str(item.get("block_id") or "")
             for item in stage_loss_blocks
             if str(item.get("kind") or "") == "synthetic_supervised"
+            and float(item.get("weight", 0.0)) > 0.0
+            and int(item.get("update_interval", 0)) > 0
         }
         safe_physics_selection = any(
             str(checkpoint["stage_selection_metric"]) == f"{block_id}.mse"
             for block_id in dense_ids
         ) and "real_well_supervised" not in stage_kinds
-        if deployment_eligible != safe_physics_selection:
+        expected_eligible = safe_physics_selection and str(checkpoint.get("checkpoint_kind")) == "best"
+        if deployment_eligible != expected_eligible:
             raise ValueError(
                 f"GINN-v2 checkpoint in {path} has invalid physics deployment eligibility; "
                 "waveform-only and real-well physics checkpoints are diagnostic/experimental."

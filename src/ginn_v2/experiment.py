@@ -300,6 +300,11 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
                 raise ValueError(f"Loss block ID must be valid and unique in its stage: {block_id!r}")
             if kind not in LOSS_SOURCE_KINDS or source_id not in sources:
                 raise ValueError(f"Invalid loss block kind/source: {kind!r}/{source_id!r}")
+            if kind == "physics":
+                raise ValueError(
+                    "GINN-v2 physics loss blocks are deferred to HANDOFF stage 9; "
+                    "use a supervised loss block in the current stages."
+                )
             _reject_extra(block, LOSS_KEYS[kind], f"stages[{stage_index}].loss_blocks[{block_index}]")
             if sources[source_id]["kind"] not in LOSS_SOURCE_KINDS[kind]:
                 raise ValueError(f"Loss block {block_id} cannot consume source kind {sources[source_id]['kind']}.")

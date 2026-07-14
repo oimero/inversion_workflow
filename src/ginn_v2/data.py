@@ -106,10 +106,7 @@ def _aligned_arrays(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     target = np.asarray(sample.target_log_ai, dtype=np.float32)
     increment = np.asarray(sample.target_increment_log_ai, dtype=np.float32)
-    canonical_background = np.asarray(
-        getattr(sample, "canonical_background_log_ai", target - increment),
-        dtype=np.float32,
-    )
+    canonical_background = np.asarray(sample.canonical_background_log_ai, dtype=np.float32)
     seismic = np.asarray(sample.seismic_input, dtype=np.float32)
     lfm = np.asarray(sample.input_lfm_log_ai, dtype=np.float32)
     valid = np.asarray(sample.valid_mask, dtype=bool)
@@ -460,17 +457,15 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         target_patch = target[sl]
         increment = np.asarray(sample.target_increment_log_ai, dtype=np.float32)[sl]
         canonical_background = np.asarray(
-            getattr(sample, "canonical_background_log_ai", target),
+            sample.canonical_background_log_ai,
             dtype=np.float32,
         )
         if canonical_background.shape != target.shape:
             raise ValueError(
                 f"Canonical background/target shape mismatch for {sample.sample_id}: "
                 f"{canonical_background.shape} vs {target.shape}"
-            )
+        )
         canonical_patch = canonical_background[sl]
-        if not hasattr(sample, "canonical_background_log_ai"):
-            canonical_patch = target_patch - increment
         valid_patch = valid[sl]
         if np.any(
             valid_patch
@@ -504,22 +499,6 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             valid_patch & np.isfinite(canonical_patch), canonical_patch, 0.0
         )
         lfm_patch = np.where(valid_patch & np.isfinite(lfm_patch), lfm_patch, 0.0)
-        lfm_ideal = np.asarray(sample.priors["lfm_ideal"], dtype=np.float32)
-        if lfm_ideal.shape[0] != target.shape[0]:
-            raise ValueError(
-                f"lfm_ideal lateral shape mismatch for {sample.sample_id}: "
-                f"{lfm_ideal.shape} vs {target.shape}"
-            )
-        if lfm_ideal.shape != target.shape:
-            raise ValueError(
-                f"lfm_ideal/target shape mismatch for {sample.sample_id}: "
-                f"{lfm_ideal.shape} vs {target.shape}"
-            )
-        lfm_ideal_patch = np.where(
-            valid_patch & np.isfinite(lfm_ideal[sl]),
-            lfm_ideal[sl],
-            0.0,
-        )
         seismic_model_consistent = np.asarray(
             sample.seismic_model_consistent, dtype=np.float32
         )
@@ -582,9 +561,6 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
                 lfm_patch.astype(np.float32)
             )[None, :, :],
             "forward_lfm": torch.from_numpy(forward_lfm_patch)[None, :, :],
-            "lfm_ideal": torch.from_numpy(lfm_ideal_patch.astype(np.float32))[
-                None, :, :
-            ],
             "valid_mask": torch.from_numpy(valid_patch.astype(np.float32))[None, :, :],
             "patch_id": str(row["patch_id"]),
             "sample_id": str(row["sample_id"]),

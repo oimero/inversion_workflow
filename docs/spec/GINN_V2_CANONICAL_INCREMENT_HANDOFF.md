@@ -111,9 +111,33 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - 高分辨率 forward support 只作为生成 QC，reader、训练协议和 loss 只消费 `valid_mask`；
   physics halo/central-crop 仍留在后续 GINN 训练阶段。
 
-本轮不改微纹理、GINN v2、physics、R0/R1，也不迁移旧 v4 产物。
+阶段 2.5 本身不改微纹理、physics、R0/R1，也不迁移旧 v4 产物；当前阶段 8 收口只涉及
+GINN v2 synthetic-supervised 读取、评估和 parser 边界，见 3.4。
 
 阶段调整：原计划中的“阶段 3：微纹理 bank 与 emitter”和“阶段 4：paired A/B/C benchmark”分别延期为本 HANDOFF 的阶段 10 和阶段 11；A/B/C GINN 消融为阶段 12。physics 训练、真实 physics 适配、部署资格和 R1 正演闭环统一延期为阶段 9，作为进入微纹理前的最后一个大阶段。当前正在运行的完整 v4 工区生成属于阶段 3 的主链稳定化门禁；在 v4、GINN v2 核心链路、R0 以及阶段 9 的 physics 门禁完成前，不引入微纹理变量，以免把生成合同、物理适配和模型消融问题混在一起。
+
+### 3.4 阶段 8 检阅收口（当前增量）
+
+本轮只收紧当前可部署的 synthetic-supervised 主链，不提前实现阶段 9：
+
+- 新配置解析器和实验 runner 对 `physics` loss block 直接失败，并明确提示阶段 9；
+  手工构造的配置也在 runner 入口再次拒绝，避免绕过 parser；
+- `PatchDataset` 和 canonical reader 直接要求物化的
+  `canonical_background_log_ai`，缺字段即失败，不从 `target - increment` 静默重建；
+- 真实井 QC 图使用已生成的 `well_target_increment_log_ai`，不再用 `well_log_ai - lfm_log_ai`
+  代替监督增量；
+- `lfm_ideal` 只作为评估基线按需从预测产物或 benchmark 加载，不进入训练 batch、网络输入或
+  checkpoint 训练状态；
+- 阶段 9 的真实工区变换 provenance、physics 数据路径和 R0/R1 历史别名仍按下方
+  allowlist 保留，当前不把它们伪装成已经完成的功能。
+
+这些收口不改变 `ginn_v2_prediction_v3` 的公共预测语义；没有 `lfm_ideal` 时，评估报告仍输出
+空的基线表和 `n_ok=0` 摘要，表示该诊断未计算，而不是把它混入训练数据。
+
+本轮验证：45 个 canonical/v4/GINN ignored tests 通过，`compileall -q src/cup src/ginn_v2
+scripts/ginn_v2.py` 通过；使用既有 6-patch prediction smoke 重新执行 report，产出
+`scripts/output/ginn_v2_report_20260714_184124_507557`，`lfm_ideal` 仍能从 benchmark
+按需评估。
 
 ## 4. 推荐实施顺序与完成条件
 
@@ -269,8 +293,10 @@ closure smoke 输出 `scripts/output/ginn_v2_stage5_closure_smoke_20260714_final
   使用 canonical increment 命名；旧 probe report-card 和 evaluation helper 已从正式路径删除。
   `LEGACY_KEYS` 仅保留为新 parser 的明确失败入口，R0 中供阶段 9 R1 使用的旧别名仍列为
   延期 allowlist，不作为新训练或新预测字段。
+- [x] 当前主链不接受阶段 9 之前的 physics block；canonical background 缺失、真实井 QC
+  增量来源和 `lfm_ideal` 训练耦合问题已收紧。
 
-完成条件：主链合同、默认入口、R0 覆盖和旧代码清理验收通过。已验证：43 个 canonical/
+完成条件：主链合同、默认入口、R0 覆盖和旧代码清理验收通过。已验证：45 个 canonical/
 v4/GINN 测试通过、compileall 通过、canonical summarize smoke 产出
 `canonical_increment_ready`。阶段 9 仍负责 R1 物理闭环和 R0 延期别名的最终清理；physics
 本身保持为下一阶段的独立门禁。

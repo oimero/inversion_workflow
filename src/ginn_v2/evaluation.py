@@ -136,10 +136,6 @@ def predict_patches(
             buffer_dir / "input_lfm_log_ai.npy", mode="w+", dtype=np.float32,
             shape=(patch_count, *patch_shape),
         ),
-        "lfm_ideal": np.lib.format.open_memmap(
-            buffer_dir / "lfm_ideal.npy", mode="w+", dtype=np.float32,
-            shape=(patch_count, *patch_shape),
-        ),
     }
     patch_ids: list[str] = []
     sample_ids: list[str] = []
@@ -164,7 +160,6 @@ def predict_patches(
                 buffers["target_log_ai"][offset:end] = batch["target_log_ai"].numpy()[:, 0].astype(np.float32)
                 buffers["valid_mask"][offset:end] = batch["valid_mask"].numpy()[:, 0].astype(bool)
                 buffers["input_lfm_log_ai"][offset:end] = input_lfm.astype(np.float32)
-                buffers["lfm_ideal"][offset:end] = batch["lfm_ideal"].numpy()[:, 0].astype(np.float32)
                 patch_ids.extend(str(value) for value in batch["patch_id"])
                 sample_ids.extend(str(value) for value in batch["sample_id"])
                 offset = end
@@ -183,7 +178,6 @@ def predict_patches(
             target_log_ai=buffers["target_log_ai"],
             valid_mask=buffers["valid_mask"],
             input_lfm_log_ai=buffers["input_lfm_log_ai"],
-            lfm_ideal=buffers["lfm_ideal"],
             patch_id=np.asarray(patch_ids),
             sample_id=np.asarray(sample_ids),
         )
@@ -267,8 +261,9 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
         )
         lfm_metrics = regression_metrics(target[i], lfm[i], valid_mask=mask[i])
         lfm_rows.append({**row.to_dict(), "series_id": "input_lfm_log_ai", **lfm_metrics})
-        lfm_ideal_metrics = regression_metrics(target[i], lfm_ideal[i], valid_mask=mask[i])
-        lfm_ideal_rows.append({**row.to_dict(), "series_id": "lfm_ideal", **lfm_ideal_metrics})
+        if lfm_ideal is not None:
+            lfm_ideal_metrics = regression_metrics(target[i], lfm_ideal[i], valid_mask=mask[i])
+            lfm_ideal_rows.append({**row.to_dict(), "series_id": "lfm_ideal", **lfm_ideal_metrics})
         oracle_metrics = regression_metrics(target[i], target[i], valid_mask=mask[i])
         oracle_rows.append({**row.to_dict(), "series_id": "oracle_target", **oracle_metrics})
     metrics_frame = pd.DataFrame.from_records(rows)
@@ -425,16 +420,19 @@ def _load_lfm_ideal_patches(
     prediction_dir: Path,
     index: pd.DataFrame,
     expected_shape: tuple[int, ...],
-) -> np.ndarray:
+) -> np.ndarray | None:
     benchmark_dir = _benchmark_dir_from_prediction(prediction_dir)
     if benchmark_dir is None:
-        raise ValueError("Cannot load lfm_ideal: prediction manifest lacks benchmark_dir.")
+        return None
     benchmark = SynthoseisBenchmark(benchmark_dir)
     patches: list[np.ndarray] = []
     for _, row in index.iterrows():
         sample = benchmark.load_sample(str(row["sample_id"]))
         target, _, _, _ = _aligned_arrays(sample)
-        lfm_ideal = np.asarray(sample.priors["lfm_ideal"], dtype=np.float32)
+        try:
+            lfm_ideal = np.asarray(sample.priors["lfm_ideal"], dtype=np.float32)
+        except (AttributeError, KeyError, TypeError):
+            return None
         if lfm_ideal.shape != target.shape:
             raise ValueError(
                 f"lfm_ideal/target shape mismatch for {sample.sample_id}: "

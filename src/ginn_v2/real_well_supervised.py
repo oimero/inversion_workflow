@@ -1104,6 +1104,7 @@ def evaluate_real_wells(
                 well_name=well_name,
                 well=well,
                 target_ai=target_ai,
+                target_increment=target_increment,
                 lfm_ai=lfm_ai,
                 pred_increment=pred_increment,
                 volume=support.volume,
@@ -1342,6 +1343,7 @@ def _write_well_figures(
     well_name: str,
     well: pd.DataFrame,
     target_ai: np.ndarray,
+    target_increment: np.ndarray,
     lfm_ai: np.ndarray,
     pred_increment: np.ndarray,
     volume: RealFieldVolume,
@@ -1357,7 +1359,6 @@ def _write_well_figures(
     sample_domain = volume.sample_axis.domain
     sample_label = "TVDSS (m)" if sample_domain == "depth" else "TWT (s)"
     pred_ai = lfm_ai + pred_increment
-    target_increment = target_ai - lfm_ai
     ai_path = figures_dir / f"{well_name}_{checkpoint_name}_ai_increment_qc.png"
     fig, axes = plt.subplots(
         1,

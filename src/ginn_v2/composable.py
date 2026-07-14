@@ -844,6 +844,15 @@ def run_experiment(
     *, config: ExperimentConfig, root: Path, output_dir: Path, logger: logging.Logger,
 ) -> dict[str, Any]:
     """Run a strict canonical-increment experiment."""
+    if any(
+        str(block.get("kind") or "") == "physics"
+        for stage in config.stages
+        for block in stage.get("loss_blocks", [])
+    ):
+        raise ValueError(
+            "GINN-v2 physics loss blocks are deferred to HANDOFF stage 9; "
+            "the current runner accepts supervised blocks only."
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     if (output_dir / "experiment_manifest.json").exists() or (output_dir / "stages").exists():
         raise FileExistsError(f"GINN-v2 experiment outputs already exist: {output_dir}")

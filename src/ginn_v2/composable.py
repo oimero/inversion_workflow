@@ -34,7 +34,7 @@ from ginn_v2.real_field import (
     RealFieldVolume, build_real_field_patch_index, finite_summary_stats,
     load_real_field_volume,
 )
-from ginn_v2.real_delta import prepare_real_delta_support
+from ginn_v2.real_well_supervised import prepare_real_well_supervised_support
 from ginn_v2.runtime import forward_physics_batch, load_benchmark_wavelet, masked_mse, resolve_device
 
 
@@ -801,7 +801,7 @@ def _evaluate(
         losses = []
         for rows, prediction in zip(groups, predictions):
             target = torch.as_tensor(
-                rows["well_log_ai"].to_numpy(dtype=np.float32) - rows["lfm_log_ai"].to_numpy(dtype=np.float32),
+                rows["well_target_increment_log_ai"].to_numpy(dtype=np.float32),
                 device=device,
             )
             losses.append(torch.mean((prediction - target) ** 2))
@@ -1151,10 +1151,10 @@ def run_experiment(
                     "seismic_value_transform": str(config.sources[field_source_id].get("model_input_seismic_transform") or "identity"),
                     "lfm_value_transform": "identity",
                 }
-                support = prepare_real_delta_support(
+                support = prepare_real_well_supervised_support(
                     config=support_cfg, repo_root=root, output_dir=stage_dir,
                     normalization=normalization, patch_spec=config.patching.as_dict(),
-                    input_reference_stats_path=input_stats_path, lambda_real_delta=1.0,
+                    input_reference_stats_path=input_stats_path, lambda_real_well_supervised=1.0,
                     seed=_seed(config.seed, stage_index, len(prepared_blocks), 0), logger=logger,
                 )
                 support.configure_model(receptive_field_lateral=info.lateral_receptive_field)

@@ -377,7 +377,6 @@ def run_summarize(args: argparse.Namespace) -> None:
     output_dir = _resolve_output_dir("ginn_v2_summary", args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
     rows: list[dict[str, object]] = []
-    frequency_frames: list[pd.DataFrame] = []
     for spec in args.report:
         model, scope, report_dir = _parse_report_spec(spec)
         report_path = resolve_relative_path(report_dir, root=REPO_ROOT)
@@ -386,17 +385,11 @@ def run_summarize(args: argparse.Namespace) -> None:
         with card_path.open("r", encoding="utf-8") as handle:
             card = json.load(handle)
         aggregate = dict(card.get("aggregate") or {})
+        increment_aggregate = dict(card.get("increment_aggregate") or {})
+        canonical_closure_aggregate = dict(card.get("canonical_closure_aggregate") or {})
         lfm_aggregate = dict(card.get("lfm_aggregate") or {})
         lfm_ideal_aggregate = dict(card.get("lfm_ideal_aggregate") or {})
         oracle_aggregate = dict(card.get("oracle_aggregate") or {})
-        probe_aggregate = dict(card.get("probe_aggregate") or {})
-        amplitude_phase_aggregate = dict(card.get("probe_amplitude_phase_aggregate") or {})
-        zero_x_aggregate = dict(card.get("zero_x_false_prediction_aggregate") or {})
-        unsupported_zero_x_aggregate = dict(
-            card.get("unsupported_zero_x_false_prediction_aggregate") or {}
-        )
-        zero_x_energy_aggregate = dict(card.get("zero_x_false_energy_aggregate") or {})
-        unsupported_energy_aggregate = dict(card.get("unsupported_false_energy_aggregate") or {})
         geometry_aggregate = dict(card.get("geometry_aggregate") or {})
         geometry_holdout_aggregate = dict(card.get("geometry_holdout_aggregate") or {})
         realization_uniform_aggregate = dict(card.get("realization_uniform_aggregate") or {})
@@ -416,6 +409,12 @@ def run_summarize(args: argparse.Namespace) -> None:
                 "model_rmse": aggregate.get("mean_rmse"),
                 "model_nrmse": aggregate.get("mean_nrmse"),
                 "model_corr": aggregate.get("median_corr"),
+                "increment_rmse": increment_aggregate.get("mean_rmse"),
+                "increment_nrmse": increment_aggregate.get("mean_nrmse"),
+                "increment_corr": increment_aggregate.get("median_corr"),
+                "canonical_closure_rmse": canonical_closure_aggregate.get("mean_rmse"),
+                "canonical_closure_nrmse": canonical_closure_aggregate.get("mean_nrmse"),
+                "canonical_closure_corr": canonical_closure_aggregate.get("median_corr"),
                 "lfm_rmse": lfm_aggregate.get("mean_rmse"),
                 "lfm_nrmse": lfm_aggregate.get("mean_nrmse"),
                 "lfm_corr": lfm_aggregate.get("median_corr"),
@@ -426,29 +425,6 @@ def run_summarize(args: argparse.Namespace) -> None:
                 "oracle_nrmse": oracle_aggregate.get("mean_nrmse"),
                 "oracle_corr": oracle_aggregate.get("median_corr"),
                 "rmse_improvement_pct_vs_lfm": card.get("rmse_improvement_pct_vs_lfm"),
-                "probe_n_ok": probe_aggregate.get("n_ok"),
-                "probe_nrmse": probe_aggregate.get("mean_nrmse"),
-                "probe_corr": probe_aggregate.get("median_corr"),
-                "probe_amplitude_phase_n_ok": amplitude_phase_aggregate.get("n_ok"),
-                "probe_mean_abs_amplitude_error": amplitude_phase_aggregate.get(
-                    "mean_abs_amplitude_error"
-                ),
-                "probe_median_amplitude_ratio": amplitude_phase_aggregate.get(
-                    "median_amplitude_ratio"
-                ),
-                "probe_median_abs_phase_error_deg": amplitude_phase_aggregate.get(
-                    "median_abs_phase_error_deg"
-                ),
-                "zero_x_false_prediction_n_ok": zero_x_aggregate.get("n_ok"),
-                "zero_x_false_prediction_rmse": zero_x_aggregate.get("mean_rmse"),
-                "unsupported_zero_x_false_prediction_n_ok": unsupported_zero_x_aggregate.get("n_ok"),
-                "unsupported_zero_x_false_prediction_rmse": unsupported_zero_x_aggregate.get("mean_rmse"),
-                "zero_x_false_energy_n_ok": zero_x_energy_aggregate.get("n_ok"),
-                "zero_x_false_frequency_rms": zero_x_energy_aggregate.get("mean_false_frequency_rms"),
-                "unsupported_false_energy_n_ok": unsupported_energy_aggregate.get("n_ok"),
-                "unsupported_false_frequency_rms": unsupported_energy_aggregate.get(
-                    "mean_false_frequency_rms"
-                ),
                 "geometry_n_ok": geometry_aggregate.get("n_ok"),
                 "geometry_boundary_rmse": geometry_aggregate.get("mean_boundary_rmse"),
                 "geometry_event_rmse": geometry_aggregate.get("mean_event_rmse"),
@@ -464,22 +440,12 @@ def run_summarize(args: argparse.Namespace) -> None:
                 "report_dir": repo_relative_path(report_path, root=REPO_ROOT),
             }
         )
-        frequency_path = report_path / "model_probe_metrics_by_frequency.csv"
-        if frequency_path.is_file():
-            frame = pd.read_csv(frequency_path)
-            if not frame.empty:
-                frame.insert(0, "scope", scope)
-                frame.insert(0, "model", model)
-                frequency_frames.append(frame)
     summary = pd.DataFrame.from_records(rows)
     summary_path = output_dir / "ablation_summary.csv"
     summary.to_csv(summary_path, index=False)
-    frequency_path = output_dir / "probe_metrics_by_frequency.csv"
-    if frequency_frames:
-        pd.concat(frequency_frames, ignore_index=True).to_csv(frequency_path, index=False)
-    else:
-        pd.DataFrame().to_csv(frequency_path, index=False)
-    report_card = _build_ablation_report_card(summary, frequency_path)
+    canonical_metrics_path = output_dir / "canonical_metrics_by_report.csv"
+    summary.to_csv(canonical_metrics_path, index=False)
+    report_card = _build_canonical_ablation_report_card(summary, canonical_metrics_path)
     report_card_path = output_dir / "ablation_report_card.json"
     write_json(report_card_path, report_card)
     markdown_path = output_dir / "ablation_report.md"
@@ -490,7 +456,7 @@ def run_summarize(args: argparse.Namespace) -> None:
         "n_reports": int(len(rows)),
         "outputs": {
             "ablation_summary": repo_relative_path(summary_path, root=REPO_ROOT),
-            "probe_metrics_by_frequency": repo_relative_path(frequency_path, root=REPO_ROOT),
+            "canonical_metrics_by_report": repo_relative_path(canonical_metrics_path, root=REPO_ROOT),
             "ablation_report_card": repo_relative_path(report_card_path, root=REPO_ROOT),
             "ablation_report": repo_relative_path(markdown_path, root=REPO_ROOT),
         },
@@ -610,164 +576,62 @@ def _parse_report_spec(spec: str) -> tuple[str, str, Path]:
     return parts[0].strip(), parts[1].strip(), Path(parts[2].strip())
 
 
-def _build_ablation_report_card(summary: pd.DataFrame, frequency_path: Path) -> dict[str, object]:
-    architecture_family = summary.get(
-        "architecture_family", pd.Series("", index=summary.index)
-    ).fillna("").astype(str).str.casefold()
-    has_mismatch_training = summary.get(
-        "has_mismatch_training", pd.Series(False, index=summary.index)
-    ).fillna(False).astype(bool)
-    has_physics_loss = summary.get(
-        "has_physics_loss", pd.Series(False, index=summary.index)
-    ).fillna(False).astype(bool)
+def _canonical_ablation_report_card(
+    summary: pd.DataFrame, frequency_path: Path
+) -> dict[str, object]:
+    """Build the v4 coverage card from manifest/closure fields only.
+
+    Frequency probes are not part of the v4 canonical benchmark.  Keeping the
+    coverage gate on increment and closure metrics makes arbitrary experiment
+    IDs harmless and prevents the historical probe report from becoming a
+    deployment gate.
+    """
+    def _has_numeric(column: str) -> bool:
+        return bool(
+            column in summary
+            and pd.to_numeric(summary[column], errors="coerce").notna().any()
+        )
+
+    architecture_ids = set(summary.get("architecture_id", pd.Series(dtype=str)).astype(str))
     coverage = {
-        "base_fullband": bool((summary["scope"].astype(str) == "test_base").any()),
-        "validation_base": bool((summary["scope"].astype(str) == "validation_base").any()),
-        "probe_paired_increment": bool(summary["probe_n_ok"].fillna(0).astype(float).gt(0).any()),
-        "probe_mismatch_paired_increment": bool(
-            summary[summary["scope"].astype(str).eq("benchmark_probe_mismatch")]
-            .get("probe_n_ok", pd.Series(dtype=float))
-            .fillna(0)
-            .astype(float)
-            .gt(0)
-            .any()
+        "increment_fidelity": _has_numeric("increment_rmse"),
+        "canonical_closure": _has_numeric("canonical_closure_rmse"),
+        "deployment_closure": _has_numeric("model_rmse"),
+        "lfm_only_baseline": _has_numeric("lfm_rmse"),
+        "geometry_holdout": bool(
+            pd.to_numeric(summary.get("geometry_holdout_n_ok", pd.Series(dtype=float)), errors="coerce")
+            .fillna(0).gt(0).any()
         ),
-        "lfm_ideal_baseline": bool(
-            summary.get("lfm_ideal_rmse", pd.Series(dtype=float))
-            .fillna(float("nan"))
-            .notna()
-            .any()
-        ),
-        "oracle_target_self_check": bool(
-            summary.get("oracle_rmse", pd.Series(dtype=float))
-            .fillna(float("nan"))
-            .astype(float)
-            .le(1e-8)
-            .any()
-        ),
-        "mismatch_degradation": bool((summary["scope"].astype(str) == "validation_mismatch").any()),
-        "trace_architecture": bool(architecture_family.eq("trace").any()),
-        "patch_architecture": bool(architecture_family.eq("patch").any()),
-        "patch_mismatch_training": bool(
-            (architecture_family.eq("patch") & has_mismatch_training).any()
-        ),
-        "trace_mismatch_training": bool(
-            (architecture_family.eq("trace") & has_mismatch_training).any()
-        ),
-        "zero_x_false_prediction_error": bool(
-            summary.get("zero_x_false_prediction_n_ok", pd.Series(dtype=float))
-            .fillna(0)
-            .astype(float)
-            .gt(0)
-            .any()
-        ),
-        "unsupported_zero_x_false_prediction_error": bool(
-            summary.get("unsupported_zero_x_false_prediction_n_ok", pd.Series(dtype=float))
-            .fillna(0)
-            .astype(float)
-            .gt(0)
-            .any()
-        ),
-        "physics_loss": bool(has_physics_loss.any()),
-        "geometry_metrics": False,
-        "patch_geometry_metrics": bool(
-            summary.get("geometry_n_ok", pd.Series(dtype=float))
-            .fillna(0)
-            .astype(float)
-            .gt(0)
-            .any()
-        ),
-        "band_amplitude_phase_metrics": bool(
-            summary.get("probe_amplitude_phase_n_ok", pd.Series(dtype=float))
-            .fillna(0)
-            .astype(float)
-            .gt(0)
-            .any()
-        ),
-        "zero_x_false_energy": bool(
-            summary.get("zero_x_false_energy_n_ok", pd.Series(dtype=float))
-            .fillna(0)
-            .astype(float)
-            .gt(0)
-            .any()
-        ),
-        "unsupported_false_energy": bool(
-            summary.get("unsupported_false_energy_n_ok", pd.Series(dtype=float))
-            .fillna(0)
-            .astype(float)
-            .gt(0)
-            .any()
-        ),
-        "realization_level_stitching": bool(
-            summary.get("realization_uniform_n_ok", pd.Series(dtype=float))
-            .fillna(0)
-            .astype(float)
-            .gt(0)
-            .any()
-            and summary.get("realization_center_crop_n_ok", pd.Series(dtype=float))
-            .fillna(0)
-            .astype(float)
-            .gt(0)
-            .any()
+        "all_four_architectures": architecture_ids.issuperset(
+            {"trace_conv1d", "trace_dilated_tcn", "trace_lateral_mixer", "patch_conv2d"}
         ),
     }
-    coverage["geometry_metrics"] = bool(coverage["patch_geometry_metrics"])
-    test_base = summary[summary["scope"].astype(str).eq("test_base")].copy()
-    benchmark_probe = summary[summary["scope"].astype(str).eq("benchmark_probe")].copy()
-    mismatch = summary[summary["scope"].astype(str).eq("validation_mismatch")].copy()
+    required = ["increment_fidelity", "canonical_closure", "deployment_closure", "lfm_only_baseline"]
+    missing = [key for key in required if not coverage[key]]
+    status = "canonical_increment_ready" if not missing else "partial"
     best = {
-        "test_base_by_rmse": _best_row(test_base, metric="model_rmse", ascending=True),
-        "probe_by_nrmse": _best_row(benchmark_probe, metric="probe_nrmse", ascending=True),
-        "probe_mismatch_by_nrmse": _best_row(
-            summary[summary["scope"].astype(str).eq("benchmark_probe_mismatch")].copy(),
-            metric="probe_nrmse",
-            ascending=True,
-        ),
-        "mismatch_by_rmse": _best_row(mismatch, metric="model_rmse", ascending=True),
+        "best_increment_by_rmse": _best_row(summary, metric="increment_rmse", ascending=True),
+        "best_canonical_closure_by_rmse": _best_row(summary, metric="canonical_closure_rmse", ascending=True),
+        "best_deployment_closure_by_rmse": _best_row(summary, metric="model_rmse", ascending=True),
     }
-    stability = _seed_stability(summary)
-    status = "partial"
-    if (
-        coverage["base_fullband"]
-        and coverage["probe_paired_increment"]
-        and coverage["mismatch_degradation"]
-        and stability.get("trace_test_base_model_rmse_std") is not None
-    ):
-        status = "baseline_evidence_ready"
-    required_for_full_gate = [
-        "base_fullband",
-        "validation_base",
-        "probe_paired_increment",
-        "probe_mismatch_paired_increment",
-        "mismatch_degradation",
-        "lfm_ideal_baseline",
-        "oracle_target_self_check",
-        "trace_architecture",
-        "patch_architecture",
-        "patch_mismatch_training",
-        "trace_mismatch_training",
-        "physics_loss",
-        "geometry_metrics",
-        "patch_geometry_metrics",
-        "band_amplitude_phase_metrics",
-        "zero_x_false_energy",
-        "unsupported_false_energy",
-        "realization_level_stitching",
+    statements = [
+        "Coverage is derived from checkpoint manifests and explicit closure metrics; experiment-id text is descriptive only.",
+        "The v4 canonical benchmark has no frequency-probe coverage gate.",
     ]
-    missing = [key for key in required_for_full_gate if not coverage.get(key)]
-    conclusion = _ablation_conclusion(best, stability)
     return {
         "schema_version": ABLATION_REPORT_CARD_SCHEMA_VERSION,
         "status": status,
         "coverage": coverage,
-        "required_for_full_gate": required_for_full_gate,
-        "metric_notes": _ablation_metric_notes(),
+        "required_for_full_gate": required,
         "missing_for_full_gate": missing,
         "best": best,
-        "stability": stability,
-        "conclusion": conclusion,
+        "stability": {},
+        "conclusion": {"recommendation": "continue_canonical_increment_ablation", "statements": statements},
         "source_frequency_table": repo_relative_path(frequency_path, root=REPO_ROOT),
     }
+
+
+_build_canonical_ablation_report_card = _canonical_ablation_report_card
 
 
 def _best_row(frame: pd.DataFrame, *, metric: str, ascending: bool) -> dict[str, object] | None:
@@ -779,114 +643,6 @@ def _best_row(frame: pd.DataFrame, *, metric: str, ascending: bool) -> dict[str,
     valid[metric] = pd.to_numeric(valid[metric], errors="coerce")
     row = valid.sort_values(metric, ascending=ascending).iloc[0].to_dict()
     return _jsonable_dict(row)
-
-
-def _seed_stability(summary: pd.DataFrame) -> dict[str, object]:
-    result: dict[str, object] = {}
-    architecture_family = summary.get(
-        "architecture_family", pd.Series("", index=summary.index)
-    ).fillna("").astype(str).str.casefold()
-    trace = summary[architecture_family.eq("trace")].copy()
-    if trace.empty:
-        return result
-    for scope, prefix in [("test_base", "trace_test_base"), ("benchmark_probe", "trace_benchmark_probe")]:
-        scoped = trace[trace["scope"].astype(str).eq(scope)].copy()
-        if scoped.empty:
-            continue
-        for metric in ["model_rmse", "model_corr", "probe_nrmse", "probe_corr"]:
-            if metric not in scoped:
-                continue
-            values = pd.to_numeric(scoped[metric], errors="coerce").dropna()
-            if values.empty:
-                continue
-            result[f"{prefix}_{metric}_mean"] = float(values.mean())
-            result[f"{prefix}_{metric}_std"] = float(values.std(ddof=1)) if len(values) > 1 else 0.0
-            result[f"{prefix}_{metric}_n"] = int(len(values))
-    return result
-
-
-def _ablation_conclusion(best: dict[str, object], stability: dict[str, object]) -> dict[str, object]:
-    test_best = best.get("test_base_by_rmse") or {}
-    probe_best = best.get("probe_by_nrmse") or {}
-    mismatch_best = best.get("mismatch_by_rmse") or {}
-    statements = []
-    if test_best:
-        statements.append(
-            f"Best test-base RMSE is {test_best.get('model')} "
-            f"({float(test_best.get('model_rmse')):.6g})."
-        )
-    if probe_best:
-        statements.append(
-            f"Best paired-probe NRMSE is {probe_best.get('model')} "
-            f"({float(probe_best.get('probe_nrmse')):.6g})."
-        )
-    probe_mismatch_best = best.get("probe_mismatch_by_nrmse") or {}
-    if probe_mismatch_best:
-        statements.append(
-            f"Best paired-probe+mismatch NRMSE is {probe_mismatch_best.get('model')} "
-            f"({float(probe_mismatch_best.get('probe_nrmse')):.6g})."
-        )
-    if mismatch_best:
-        statements.append(
-            f"Best validation-mismatch RMSE is {mismatch_best.get('model')} "
-            f"({float(mismatch_best.get('model_rmse')):.6g})."
-        )
-    if (
-        str(test_best.get("architecture_family", "")).casefold() == "trace"
-        and str(probe_best.get("architecture_family", "")).casefold() == "trace"
-    ):
-        recommendation = "treat_trace_architecture_as_strong_baseline"
-        statements.append(
-            "A trace architecture remains the strongest current baseline for base and paired-probe metrics."
-        )
-    else:
-        recommendation = "continue_ablation"
-    if stability:
-        statements.append("Trace architecture seed stability has been measured and is low-variance for current metrics.")
-    return {
-        "recommendation": recommendation,
-        "statements": statements,
-    }
-
-
-def _ablation_metric_notes() -> list[dict[str, str]]:
-    return [
-        {
-            "metric": "zero_x_false_prediction_error",
-            "role": "sanity_check",
-            "note": (
-                "Absolute prediction error on 0x frequency-probe samples. Because 0x samples "
-                "share the same no-increment target across probe frequencies, this metric is "
-                "not frequency selective and is not used as the primary unsupported-frequency "
-                "false-energy gate."
-            ),
-        },
-        {
-            "metric": "unsupported_zero_x_false_prediction_error",
-            "role": "sanity_check",
-            "note": (
-                "The unsupported subset verifies probe-frequency catalog filtering, but its "
-                "absolute RMSE can match all 0x RMSE when the same 0x target is repeated across "
-                "frequency labels. Use unsupported_false_energy for frequency-selective evidence."
-            ),
-        },
-        {
-            "metric": "zero_x_false_energy",
-            "role": "gate_metric",
-            "note": (
-                "Weighted sin/cos projection of the 0x residual at the labeled probe frequency. "
-                "This is the primary false-frequency-energy diagnostic."
-            ),
-        },
-        {
-            "metric": "unsupported_false_energy",
-            "role": "gate_metric",
-            "note": (
-                "Frequency-projection false energy restricted to operator-unsupported 0x probes. "
-                "This is the primary unsupported-frequency false-energy diagnostic."
-            ),
-        },
-    ]
 
 
 def _format_ablation_markdown(report_card: Mapping[str, object]) -> str:

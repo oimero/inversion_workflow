@@ -17,12 +17,48 @@ import torch
 from torch.utils.data import DataLoader
 
 from cup.synthetic.benchmark import SynthoseisBenchmark
+from cup.impedance import canonical_lowpass
 from cup.synthetic.reporting.metrics import regression_metrics
 from cup.utils.io import write_json
 from ginn_v2.checkpoint import load_checkpoint
 from ginn_v2.contracts import PATCH_SMOKE_REPORT_SCHEMA_VERSION, PREDICTION_SCHEMA_VERSION
 from ginn_v2.data import PatchDataset, _aligned_arrays
 from ginn_v2.runtime import resolve_device
+
+
+def canonical_closure_arrays(
+    *,
+    target_log_ai: np.ndarray,
+    target_increment_log_ai: np.ndarray,
+    predicted_increment_log_ai: np.ndarray,
+    input_lfm_log_ai: np.ndarray,
+    valid_mask: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Build the two canonical/deployment closures from physical arrays.
+
+    The benchmark stores the complete target and its canonical increment.  The
+    canonical background is therefore reconstructed as ``target - increment``;
+    no second filter is applied at evaluation time.
+    """
+    target = np.asarray(target_log_ai)
+    target_increment = np.asarray(target_increment_log_ai)
+    predicted_increment = np.asarray(predicted_increment_log_ai)
+    input_lfm = np.asarray(input_lfm_log_ai)
+    mask = np.asarray(valid_mask, dtype=bool)
+    shapes = {array.shape for array in (target, target_increment, predicted_increment, input_lfm, mask)}
+    if len(shapes) != 1:
+        raise ValueError(f"Canonical closure arrays must have one shape; got {sorted(shapes, key=str)}")
+    canonical_background = target - target_increment
+    finite = mask & np.isfinite(target) & np.isfinite(canonical_background) & np.isfinite(target_increment)
+    if np.any(finite & (np.abs(target - canonical_background - target_increment) > 1e-5)):
+        raise ValueError("Stored target and increment do not reconstruct canonical background.")
+    canonical_prediction = canonical_background + predicted_increment
+    deployment_prediction = input_lfm + predicted_increment
+    return {
+        "canonical_background_log_ai": canonical_background,
+        "canonical_closure_log_ai": canonical_prediction,
+        "deployment_closure_log_ai": deployment_prediction,
+    }
 
 
 def predict_patches(
@@ -84,6 +120,10 @@ def predict_patches(
             buffer_dir / "target_increment_log_ai.npy", mode="w+", dtype=np.float32,
             shape=(patch_count, *patch_shape),
         ),
+        "canonical_background_log_ai": np.lib.format.open_memmap(
+            buffer_dir / "canonical_background_log_ai.npy", mode="w+", dtype=np.float32,
+            shape=(patch_count, *patch_shape),
+        ),
         "target_log_ai": np.lib.format.open_memmap(
             buffer_dir / "target_log_ai.npy", mode="w+", dtype=np.float32,
             shape=(patch_count, *patch_shape),
@@ -118,6 +158,9 @@ def predict_patches(
                 buffers["predicted_increment_log_ai"][offset:end] = predicted_increment.astype(np.float32)
                 buffers["predicted_log_ai"][offset:end] = prediction.astype(np.float32)
                 buffers["target_increment_log_ai"][offset:end] = batch["target_increment_log_ai"].numpy()[:, 0].astype(np.float32)
+                buffers["canonical_background_log_ai"][offset:end] = batch[
+                    "canonical_background_log_ai"
+                ].numpy()[:, 0].astype(np.float32)
                 buffers["target_log_ai"][offset:end] = batch["target_log_ai"].numpy()[:, 0].astype(np.float32)
                 buffers["valid_mask"][offset:end] = batch["valid_mask"].numpy()[:, 0].astype(bool)
                 buffers["input_lfm_log_ai"][offset:end] = input_lfm.astype(np.float32)
@@ -136,6 +179,7 @@ def predict_patches(
             predicted_increment_log_ai=buffers["predicted_increment_log_ai"],
             predicted_log_ai=buffers["predicted_log_ai"],
             target_increment_log_ai=buffers["target_increment_log_ai"],
+            canonical_background_log_ai=buffers["canonical_background_log_ai"],
             target_log_ai=buffers["target_log_ai"],
             valid_mask=buffers["valid_mask"],
             input_lfm_log_ai=buffers["input_lfm_log_ai"],
@@ -180,7 +224,9 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     index = pd.read_csv(prediction_dir / "prediction_index.csv")
     arrays = np.load(prediction_dir / "predictions.npz", allow_pickle=True)
     pred = arrays["predicted_log_ai"]
+    pred_increment = arrays["predicted_increment_log_ai"]
     target = arrays["target_log_ai"]
+    target_increment = arrays["target_increment_log_ai"]
     mask = arrays["valid_mask"].astype(bool)
     lfm = arrays["input_lfm_log_ai"]
     lfm_ideal = (
@@ -188,14 +234,37 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
         if "lfm_ideal" in arrays
         else _load_lfm_ideal_patches(prediction_dir, index, target.shape)
     )
+    closure = canonical_closure_arrays(
+        target_log_ai=target,
+        target_increment_log_ai=target_increment,
+        predicted_increment_log_ai=pred_increment,
+        input_lfm_log_ai=lfm,
+        valid_mask=mask,
+    )
+    canonical_background = closure["canonical_background_log_ai"]
     rows = []
     lfm_rows = []
     lfm_ideal_rows = []
     oracle_rows = []
+    increment_rows = []
+    canonical_rows = []
     for _, row in index.iterrows():
         i = int(row["prediction_row"])
         metrics = regression_metrics(target[i], pred[i], valid_mask=mask[i])
         rows.append({**row.to_dict(), "series_id": row.get("series_id", ""), **metrics})
+        increment_metrics = regression_metrics(
+            target_increment[i], pred_increment[i], valid_mask=mask[i]
+        )
+        increment_rows.append(
+            {**row.to_dict(), "series_id": "predicted_increment_log_ai", **increment_metrics}
+        )
+        canonical_prediction = closure["canonical_closure_log_ai"][i]
+        canonical_metrics = regression_metrics(
+            target[i], canonical_prediction, valid_mask=mask[i]
+        )
+        canonical_rows.append(
+            {**row.to_dict(), "series_id": "canonical_closure", **canonical_metrics}
+        )
         lfm_metrics = regression_metrics(target[i], lfm[i], valid_mask=mask[i])
         lfm_rows.append({**row.to_dict(), "series_id": "input_lfm_log_ai", **lfm_metrics})
         lfm_ideal_metrics = regression_metrics(target[i], lfm_ideal[i], valid_mask=mask[i])
@@ -205,6 +274,21 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     metrics_frame = pd.DataFrame.from_records(rows)
     metrics_path = output_dir / "model_patch_metrics.csv"
     metrics_frame.to_csv(metrics_path, index=False)
+    increment_frame = pd.DataFrame.from_records(increment_rows)
+    increment_path = output_dir / "increment_patch_metrics.csv"
+    increment_frame.to_csv(increment_path, index=False)
+    canonical_frame = pd.DataFrame.from_records(canonical_rows)
+    canonical_path = output_dir / "canonical_closure_patch_metrics.csv"
+    canonical_frame.to_csv(canonical_path, index=False)
+    lowpass_frame = _increment_lowpass_qc(
+        prediction_dir=prediction_dir,
+        index=index,
+        predicted_increment=pred_increment,
+        target_increment=target_increment,
+        mask=mask,
+    )
+    lowpass_path = output_dir / "increment_lowpass_qc.csv"
+    lowpass_frame.to_csv(lowpass_path, index=False)
     sample_kind_path = output_dir / "model_patch_metrics_by_sample_kind.csv"
     _grouped_patch_metrics(metrics_frame, ["sample_kind"]).to_csv(
         sample_kind_path,
@@ -254,6 +338,12 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
         "status": "ok",
         "n_patches": int(len(metrics_frame)),
         "aggregate": model_aggregate,
+        "increment_aggregate": _aggregate(increment_frame),
+        "canonical_closure_aggregate": _aggregate(canonical_frame),
+        "increment_lowpass_qc": {
+            "status": "ok" if not lowpass_frame.empty else "not_computed",
+            "n_rows": int(len(lowpass_frame)),
+        },
         "lfm_aggregate": lfm_aggregate,
         "lfm_ideal_aggregate": lfm_ideal_aggregate,
         "oracle_aggregate": oracle_aggregate,
@@ -275,6 +365,9 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     return {
         "status": "ok",
         "model_patch_metrics": metrics_path,
+        "increment_patch_metrics": increment_path,
+        "canonical_closure_patch_metrics": canonical_path,
+        "increment_lowpass_qc": lowpass_path,
         "model_patch_metrics_by_sample_kind": sample_kind_path,
         "model_patch_metrics_by_geometry": geometry_path,
         "model_patch_metrics_by_mismatch_family": mismatch_path,
@@ -289,66 +382,6 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
         "oracle_patch_metrics": oracle_path,
         "model_report_card": report_path,
     }
-
-
-def _paired_probe_rows(
-    index: pd.DataFrame,
-    pred: np.ndarray,
-    target: np.ndarray,
-    mask: np.ndarray,
-    prediction_dir: Path,
-) -> list[dict[str, Any]]:
-    by_patch = {str(row["patch_id"]): row for _, row in index.iterrows()}
-    rows = []
-    dt_s = _model_dt_s(prediction_dir)
-    for _, row in index.iterrows():
-        pair_id = _clean_report_text(row.get("paired_zero_patch_id"))
-        if not pair_id or pair_id not in by_patch:
-            continue
-        amp = row.get("probe_amplitude_multiplier", "")
-        try:
-            if float(amp) == 0.0:
-                continue
-        except (TypeError, ValueError):
-            pass
-        i = int(row["prediction_row"])
-        j = int(by_patch[pair_id]["prediction_row"])
-        valid = mask[i] & mask[j]
-        target_diff = target[i] - target[j]
-        pred_diff = pred[i] - pred[j]
-        metrics = regression_metrics(target_diff, pred_diff, valid_mask=valid)
-        amp_phase = _amplitude_phase_metrics(
-            target_diff=target_diff,
-            pred_diff=pred_diff,
-            valid=valid,
-            frequency_hz=_safe_float(row.get("probe_frequency_hz")),
-            dt_s=dt_s,
-        )
-        rows.append(
-            {
-                "patch_id": row["patch_id"],
-                "paired_zero_patch_id": pair_id,
-                "sample_id": row.get("sample_id", ""),
-                "paired_zero_sample_id": row.get("paired_zero_sample_id", ""),
-                "sample_kind": row.get("sample_kind", ""),
-                "source_sample_id": row.get("source_sample_id", ""),
-                "source_sample_kind": row.get("source_sample_kind", ""),
-                "seismic_variant_id": row.get("seismic_variant_id", ""),
-                "seismic_mismatch_family": row.get("seismic_mismatch_family", ""),
-                "probe_frequency_hz": row.get("probe_frequency_hz", ""),
-                "probe_phase": row.get("probe_phase", ""),
-                "probe_lateral_shape": row.get("probe_lateral_shape", ""),
-                "probe_amplitude_multiplier": amp,
-                "probe_metric_semantics": (
-                    "paired_probe_increment_error_under_seismic_mismatch"
-                    if str(row.get("sample_kind", "")) == "frequency_probe_seismic_variant"
-                    else "paired_probe_increment_error"
-                ),
-                **metrics,
-                **amp_phase,
-            }
-        )
-    return rows
 
 
 def _clean_report_text(value: Any) -> str:
@@ -412,6 +445,91 @@ def _load_lfm_ideal_patches(
     if result.shape != expected_shape:
         raise ValueError(f"lfm_ideal patch shape mismatch: {result.shape} vs {expected_shape}")
     return result
+
+
+def _increment_lowpass_qc(
+    *,
+    prediction_dir: Path,
+    index: pd.DataFrame,
+    predicted_increment: np.ndarray,
+    target_increment: np.ndarray,
+    mask: np.ndarray,
+) -> pd.DataFrame:
+    """Report conservative low-pass response ratios on a bounded patch sample.
+
+    Labels are filtered on the complete benchmark trace.  Predicted patches
+    are filtered only when their local valid segment satisfies the canonical
+    operator's length contract; otherwise the row is reported as
+    ``not_computed`` rather than being used as a gate.
+    """
+    if len(index) > 2048:
+        return pd.DataFrame(
+            [{"status": "not_computed", "reason": "prediction_patch_count_over_2048"}]
+        )
+    benchmark_dir = _benchmark_dir_from_prediction(prediction_dir)
+    if benchmark_dir is None:
+        return pd.DataFrame([{"status": "not_computed", "reason": "benchmark_dir_missing"}])
+    benchmark = SynthoseisBenchmark(benchmark_dir)
+    rows: list[dict[str, Any]] = []
+    cache: dict[str, Any] = {}
+    for _, row in index.iterrows():
+        i = int(row["prediction_row"])
+        sample_id = str(row["sample_id"])
+        sample = cache.get(sample_id)
+        if sample is None:
+            sample = benchmark.load_sample(sample_id)
+            cache[sample_id] = sample
+        axis = np.asarray(sample.sample_axis, dtype=np.float64)
+        full_mask = np.asarray(sample.valid_mask, dtype=bool)
+        target_full = np.asarray(sample.target_increment_log_ai, dtype=np.float64)
+        target_lp = canonical_lowpass(
+            target_full,
+            axis,
+            benchmark.increment_contract,
+            valid_mask=full_mask,
+        )
+        sl = _patch_slice(row)
+        target_patch = target_full[sl]
+        target_lp_patch = target_lp[sl]
+        valid = mask[i] & np.isfinite(target_patch) & np.isfinite(target_lp_patch)
+        row_out: dict[str, Any] = {
+            "patch_id": row.get("patch_id", ""),
+            "sample_id": sample_id,
+            "status": "not_computed",
+            "target_lowpass_output_power_ratio": float("nan"),
+            "predicted_lowpass_output_power_ratio": float("nan"),
+        }
+        if np.count_nonzero(valid) >= 2:
+            target_rms = float(np.sqrt(np.mean(target_patch[valid] ** 2)))
+            target_lp_rms = float(np.sqrt(np.mean(target_lp_patch[valid] ** 2)))
+            try:
+                patch_axis = axis[int(row["twt_start"]):int(row["twt_stop"])]
+                predicted_lp = canonical_lowpass(
+                    np.asarray(predicted_increment[i], dtype=np.float64),
+                    patch_axis,
+                    benchmark.increment_contract,
+                    valid_mask=mask[i],
+                )
+                predicted_values = np.asarray(predicted_increment[i], dtype=np.float64)
+                predicted_rms = float(np.sqrt(np.mean(predicted_values[valid] ** 2)))
+                predicted_lp_rms = float(np.sqrt(np.mean(predicted_lp[valid] ** 2)))
+                row_out.update(
+                    {
+                        "status": "ok",
+                        "target_lowpass_output_power_ratio": (
+                            (target_lp_rms * target_lp_rms) / (target_rms * target_rms)
+                            if target_rms > 0.0 else float("nan")
+                        ),
+                        "predicted_lowpass_output_power_ratio": (
+                            (predicted_lp_rms * predicted_lp_rms) / (predicted_rms * predicted_rms)
+                            if predicted_rms > 0.0 else float("nan")
+                        ),
+                    }
+                )
+            except ValueError as exc:
+                row_out["reason"] = str(exc)
+        rows.append(row_out)
+    return pd.DataFrame.from_records(rows)
 
 
 def _geometry_patch_metrics(
@@ -505,7 +623,7 @@ def _root_from_group_path(group_path: str) -> str:
     group_path = str(group_path).strip()
     if not group_path:
         return ""
-    for marker in ("/probes/", "/seismic_variants/"):
+    for marker in ("/seismic_variants/",):
         if marker in group_path:
             return group_path.split(marker, maxsplit=1)[0]
     return group_path
@@ -807,332 +925,6 @@ def _center_crop_bounds(size: int) -> tuple[int, int]:
     return start, stop
 
 
-def _filter_unsupported_zero_x(frame: pd.DataFrame) -> pd.DataFrame:
-    if frame.empty or "operator_support" not in frame:
-        return frame.iloc[0:0].copy()
-    return frame[frame["operator_support"].astype(str).eq("unsupported")].copy()
-
-
-def _zero_x_false_frequency_energy(
-    metrics_frame: pd.DataFrame,
-    pred: np.ndarray,
-    target: np.ndarray,
-    mask: np.ndarray,
-    prediction_dir: Path,
-) -> pd.DataFrame:
-    zero = _zero_x_false_prediction_error(metrics_frame, prediction_dir)
-    if zero.empty:
-        return zero
-    dt_s = _model_dt_s(prediction_dir)
-    rows: list[dict[str, Any]] = []
-    for _, row in zero.iterrows():
-        frequency = _safe_float(row.get("probe_frequency_hz"))
-        prediction_row = int(row["prediction_row"])
-        metrics = _frequency_projection_metrics(
-            residual=pred[prediction_row] - target[prediction_row],
-            target=target[prediction_row],
-            valid=mask[prediction_row],
-            frequency_hz=frequency,
-            dt_s=dt_s,
-        )
-        rows.append(
-            {
-                **row.to_dict(),
-                "false_energy_semantics": (
-                    "weighted least-squares sin/cos projection of pred-target residual "
-                    "at the 0x probe frequency"
-                ),
-                "model_dt_s": dt_s,
-                **metrics,
-            }
-        )
-    return pd.DataFrame.from_records(rows)
-
-
-def _frequency_projection_metrics(
-    *,
-    residual: np.ndarray,
-    target: np.ndarray,
-    valid: np.ndarray,
-    frequency_hz: float,
-    dt_s: float,
-) -> dict[str, Any]:
-    if not np.isfinite(frequency_hz) or frequency_hz <= 0.0:
-        return {"energy_status": "invalid_frequency"}
-    residual = np.asarray(residual, dtype=np.float64)
-    target = np.asarray(target, dtype=np.float64)
-    valid = np.asarray(valid, dtype=bool) & np.isfinite(residual) & np.isfinite(target)
-    n_valid = int(np.count_nonzero(valid))
-    if residual.ndim != 2 or n_valid < 8:
-        return {"energy_status": "insufficient_valid_samples", "energy_n_valid": n_valid}
-    nt = residual.shape[1]
-    t = np.arange(nt, dtype=np.float64) * float(dt_s)
-    taper = _tukey_window(nt, alpha=0.5)
-    sin_basis = np.sin(2.0 * np.pi * frequency_hz * t)
-    cos_basis = np.cos(2.0 * np.pi * frequency_hz * t)
-    weights = valid.astype(np.float64) * taper[None, :]
-    residual_amp = _weighted_sincos_amplitude(residual, weights, sin_basis, cos_basis)
-    target_amp = _weighted_sincos_amplitude(target, weights, sin_basis, cos_basis)
-    false_rms = residual_amp / np.sqrt(2.0) if np.isfinite(residual_amp) else float("nan")
-    target_rms = target_amp / np.sqrt(2.0) if np.isfinite(target_amp) else float("nan")
-    return {
-        "energy_status": "ok" if np.isfinite(false_rms) else "invalid_projection",
-        "energy_n_valid": n_valid,
-        "false_frequency_amplitude": float(residual_amp),
-        "false_frequency_rms": float(false_rms),
-        "target_frequency_amplitude": float(target_amp),
-        "target_frequency_rms": float(target_rms),
-        "false_to_target_frequency_rms": (
-            float(false_rms / target_rms)
-            if np.isfinite(false_rms) and np.isfinite(target_rms) and target_rms > 0.0
-            else float("nan")
-        ),
-    }
-
-
-def _weighted_sincos_amplitude(
-    values: np.ndarray,
-    weights: np.ndarray,
-    sin_basis: np.ndarray,
-    cos_basis: np.ndarray,
-) -> float:
-    coeffs = _weighted_sincos_coefficients(values, weights, sin_basis, cos_basis)
-    if coeffs is None:
-        return float("nan")
-    return float(np.sqrt(coeffs[0] ** 2 + coeffs[1] ** 2))
-
-
-def _weighted_sincos_coefficients(
-    values: np.ndarray,
-    weights: np.ndarray,
-    sin_basis: np.ndarray,
-    cos_basis: np.ndarray,
-) -> tuple[float, float] | None:
-    mask = weights > 0.0
-    if int(np.count_nonzero(mask)) < 8:
-        return None
-    y = np.asarray(values, dtype=np.float64)[mask]
-    w = weights[mask]
-    sin2d = np.broadcast_to(sin_basis[None, :], values.shape)[mask]
-    cos2d = np.broadcast_to(cos_basis[None, :], values.shape)[mask]
-    basis = np.column_stack([sin2d, cos2d, np.ones_like(sin2d)])
-    sw = np.sqrt(w)
-    try:
-        beta, *_ = np.linalg.lstsq(basis * sw[:, None], y * sw, rcond=None)
-    except np.linalg.LinAlgError:
-        return None
-    return float(beta[0]), float(beta[1])
-
-
-def _amplitude_phase_metrics(
-    *,
-    target_diff: np.ndarray,
-    pred_diff: np.ndarray,
-    valid: np.ndarray,
-    frequency_hz: float,
-    dt_s: float,
-) -> dict[str, Any]:
-    if not np.isfinite(frequency_hz) or frequency_hz <= 0.0:
-        return {"amplitude_phase_status": "invalid_frequency"}
-    target_diff = np.asarray(target_diff, dtype=np.float64)
-    pred_diff = np.asarray(pred_diff, dtype=np.float64)
-    valid = np.asarray(valid, dtype=bool) & np.isfinite(target_diff) & np.isfinite(pred_diff)
-    if target_diff.ndim != 2 or int(np.count_nonzero(valid)) < 8:
-        return {
-            "amplitude_phase_status": "insufficient_valid_samples",
-            "amplitude_phase_n_valid": int(np.count_nonzero(valid)),
-        }
-    nt = target_diff.shape[1]
-    t = np.arange(nt, dtype=np.float64) * float(dt_s)
-    taper = _tukey_window(nt, alpha=0.5)
-    sin_basis = np.sin(2.0 * np.pi * frequency_hz * t)
-    cos_basis = np.cos(2.0 * np.pi * frequency_hz * t)
-    weights = valid.astype(np.float64) * taper[None, :]
-    target_coeff = _weighted_sincos_coefficients(target_diff, weights, sin_basis, cos_basis)
-    pred_coeff = _weighted_sincos_coefficients(pred_diff, weights, sin_basis, cos_basis)
-    if target_coeff is None or pred_coeff is None:
-        return {"amplitude_phase_status": "invalid_projection"}
-    target_amp = float(np.sqrt(target_coeff[0] ** 2 + target_coeff[1] ** 2))
-    pred_amp = float(np.sqrt(pred_coeff[0] ** 2 + pred_coeff[1] ** 2))
-    target_phase = float(np.arctan2(target_coeff[1], target_coeff[0]))
-    pred_phase = float(np.arctan2(pred_coeff[1], pred_coeff[0]))
-    phase_error = float(np.arctan2(np.sin(pred_phase - target_phase), np.cos(pred_phase - target_phase)))
-    return {
-        "amplitude_phase_status": "ok",
-        "amplitude_phase_n_valid": int(np.count_nonzero(valid)),
-        "target_probe_amplitude": target_amp,
-        "pred_probe_amplitude": pred_amp,
-        "probe_amplitude_error": float(pred_amp - target_amp),
-        "probe_abs_amplitude_error": float(abs(pred_amp - target_amp)),
-        "probe_amplitude_ratio": (
-            float(pred_amp / target_amp) if np.isfinite(target_amp) and target_amp > 0.0 else float("nan")
-        ),
-        "target_probe_phase_rad": target_phase,
-        "pred_probe_phase_rad": pred_phase,
-        "probe_phase_error_rad": phase_error,
-        "probe_abs_phase_error_deg": float(abs(np.rad2deg(phase_error))),
-    }
-
-
-def _tukey_window(size: int, *, alpha: float) -> np.ndarray:
-    if size <= 0:
-        return np.zeros(0, dtype=np.float64)
-    if size == 1:
-        return np.ones(1, dtype=np.float64)
-    x = np.linspace(0.0, 1.0, size)
-    window = np.ones(size, dtype=np.float64)
-    edge = float(alpha) / 2.0
-    if edge <= 0.0:
-        return window
-    left = x < edge
-    right = x > 1.0 - edge
-    window[left] = 0.5 * (1.0 + np.cos(np.pi * (2.0 * x[left] / alpha - 1.0)))
-    window[right] = 0.5 * (1.0 + np.cos(np.pi * (2.0 * x[right] / alpha - 2.0 / alpha + 1.0)))
-    return window
-
-
-def _aggregate_false_energy(frame: pd.DataFrame) -> dict[str, Any]:
-    if frame.empty or "energy_status" not in frame:
-        return {"n_ok": 0}
-    ok = frame[frame["energy_status"].eq("ok")]
-    return {
-        "n_ok": int(len(ok)),
-        "mean_false_frequency_rms": float(ok["false_frequency_rms"].mean()) if not ok.empty else float("nan"),
-        "median_false_frequency_rms": float(ok["false_frequency_rms"].median()) if not ok.empty else float("nan"),
-        "median_false_to_target_frequency_rms": (
-            float(ok["false_to_target_frequency_rms"].median()) if not ok.empty else float("nan")
-        ),
-    }
-
-
-def _aggregate_amplitude_phase(frame: pd.DataFrame) -> dict[str, Any]:
-    if frame.empty or "amplitude_phase_status" not in frame:
-        return {"n_ok": 0}
-    ok = frame[frame["amplitude_phase_status"].eq("ok")]
-    return {
-        "n_ok": int(len(ok)),
-        "mean_abs_amplitude_error": (
-            float(ok["probe_abs_amplitude_error"].mean()) if not ok.empty else float("nan")
-        ),
-        "median_amplitude_ratio": (
-            float(ok["probe_amplitude_ratio"].median()) if not ok.empty else float("nan")
-        ),
-        "median_abs_phase_error_deg": (
-            float(ok["probe_abs_phase_error_deg"].median()) if not ok.empty else float("nan")
-        ),
-    }
-
-
-def _grouped_false_energy(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
-    if frame.empty:
-        return pd.DataFrame(
-            columns=[
-                *keys,
-                "n_ok",
-                "mean_false_frequency_rms",
-                "median_false_frequency_rms",
-                "median_false_to_target_frequency_rms",
-            ]
-        )
-    rows: list[dict[str, Any]] = []
-    for key_values, group in frame.groupby(keys, dropna=False):
-        if not isinstance(key_values, tuple):
-            key_values = (key_values,)
-        row = {key: value for key, value in zip(keys, key_values)}
-        row.update(_aggregate_false_energy(group))
-        rows.append(row)
-    return pd.DataFrame.from_records(rows)
-
-
-def _zero_x_false_prediction_error(metrics_frame: pd.DataFrame, prediction_dir: Path) -> pd.DataFrame:
-    if metrics_frame.empty or "probe_amplitude_multiplier" not in metrics_frame:
-        return pd.DataFrame()
-    probe_amp = pd.to_numeric(metrics_frame["probe_amplitude_multiplier"], errors="coerce")
-    zero = metrics_frame[
-        metrics_frame["sample_kind"].astype(str).isin(PROBE_SAMPLE_KINDS)
-        & probe_amp.eq(0.0)
-    ].copy()
-    if zero.empty:
-        return zero
-    zero["zero_x_false_error_semantics"] = (
-        "absolute prediction error on 0x frequency-probe samples; "
-        "not a full spectral false-energy decomposition"
-    )
-    catalog = _load_probe_frequency_catalog(prediction_dir)
-    if catalog is not None and "probe_frequency_hz" in zero:
-        zero["probe_frequency_hz"] = pd.to_numeric(zero["probe_frequency_hz"], errors="coerce")
-        zero = zero.merge(
-            catalog,
-            left_on="probe_frequency_hz",
-            right_on="frequency_hz",
-            how="left",
-            suffixes=("", "_catalog"),
-        )
-    return zero
-
-
-def _load_probe_frequency_catalog(prediction_dir: Path) -> pd.DataFrame | None:
-    import json
-
-    manifest_path = prediction_dir / "prediction_manifest.json"
-    if not manifest_path.is_file():
-        return None
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        manifest = json.load(handle)
-    benchmark_dir = manifest.get("benchmark_dir")
-    if not benchmark_dir:
-        return None
-    catalog_path = Path(benchmark_dir) / "probe_frequency_catalog.csv"
-    if not catalog_path.is_absolute():
-        catalog_path = Path.cwd() / catalog_path
-    if not catalog_path.is_file():
-        return None
-    catalog = pd.read_csv(catalog_path)
-    if "frequency_hz" in catalog:
-        catalog["frequency_hz"] = pd.to_numeric(catalog["frequency_hz"], errors="coerce")
-    keep = [
-        column
-        for column in [
-            "frequency_hz",
-            "evidence_status",
-            "operator_support",
-            "experiment_class",
-            "selection_reason",
-            "calibration_status",
-        ]
-        if column in catalog
-    ]
-    return catalog[keep].drop_duplicates("frequency_hz")
-
-
-def _model_dt_s(prediction_dir: Path) -> float:
-    import json
-
-    manifest_path = prediction_dir / "prediction_manifest.json"
-    if manifest_path.is_file():
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            manifest = json.load(handle)
-        benchmark_dir = manifest.get("benchmark_dir")
-        if benchmark_dir:
-            summary_path = Path(benchmark_dir) / "run_summary.json"
-            if not summary_path.is_absolute():
-                summary_path = Path.cwd() / summary_path
-            if summary_path.is_file():
-                with summary_path.open("r", encoding="utf-8") as handle:
-                    summary = json.load(handle)
-                value = _safe_float(summary.get("output_dt_s"))
-                if np.isfinite(value) and value > 0.0:
-                    return float(value)
-    return 0.002
-
-
-def _safe_float(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float("nan")
-
-
 def _rmse_improvement_pct(model: Mapping[str, Any], baseline: Mapping[str, Any]) -> float:
     model_rmse = float(model.get("mean_rmse", float("nan")))
     baseline_rmse = float(baseline.get("mean_rmse", float("nan")))
@@ -1141,51 +933,4 @@ def _rmse_improvement_pct(model: Mapping[str, Any], baseline: Mapping[str, Any])
     return float((baseline_rmse - model_rmse) / baseline_rmse * 100.0)
 
 
-def _grouped_probe_metrics(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
-    if frame.empty:
-        columns = [
-            *keys,
-            "n_ok",
-            "mean_rmse",
-            "mean_nrmse",
-            "median_corr",
-            "median_target_rms",
-            "mean_abs_amplitude_error",
-            "median_amplitude_ratio",
-            "median_abs_phase_error_deg",
-        ]
-        return pd.DataFrame(columns=columns)
-    rows: list[dict[str, Any]] = []
-    for key_values, group in frame.groupby(keys, dropna=False):
-        if not isinstance(key_values, tuple):
-            key_values = (key_values,)
-        ok = group[group["status"].eq("ok")]
-        row = {key: value for key, value in zip(keys, key_values)}
-        row.update(
-            {
-                "n_ok": int(len(ok)),
-                "mean_rmse": float(ok["rmse"].mean()) if not ok.empty else float("nan"),
-                "mean_nrmse": float(ok["nrmse"].mean()) if not ok.empty else float("nan"),
-                "median_corr": float(ok["corr"].median()) if not ok.empty else float("nan"),
-                "median_target_rms": float(ok["target_rms"].median()) if not ok.empty else float("nan"),
-                "mean_abs_amplitude_error": (
-                    float(ok["probe_abs_amplitude_error"].mean())
-                    if not ok.empty and "probe_abs_amplitude_error" in ok
-                    else float("nan")
-                ),
-                "median_amplitude_ratio": (
-                    float(ok["probe_amplitude_ratio"].median())
-                    if not ok.empty and "probe_amplitude_ratio" in ok
-                    else float("nan")
-                ),
-                "median_abs_phase_error_deg": (
-                    float(ok["probe_abs_phase_error_deg"].median())
-                    if not ok.empty and "probe_abs_phase_error_deg" in ok
-                    else float("nan")
-                ),
-            }
-        )
-        rows.append(row)
-    return pd.DataFrame.from_records(rows)
-
-__all__ = ["predict_patches", "report_predictions"]
+__all__ = ["canonical_closure_arrays", "predict_patches", "report_predictions"]

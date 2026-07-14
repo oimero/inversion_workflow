@@ -695,6 +695,10 @@ def run_zero_shot_model(
     npz_path = model_dir / "predictions.npz"
     np.savez_compressed(
         npz_path,
+        predicted_log_ai=stitched.astype(np.float32),
+        predicted_increment_log_ai=pred_delta_vs_lfm.astype(np.float32),
+        input_lfm_log_ai=section.lfm.astype(np.float32),
+        valid_mask=section.valid_mask.astype(bool),
         stitched_pred_log_ai=stitched.astype(np.float32),
         pred_delta_vs_lfm=pred_delta_vs_lfm.astype(np.float32),
         stitching_weight=weight.astype(np.float32),
@@ -726,6 +730,7 @@ def run_zero_shot_model(
         },
         "experiment_id": experiment_id,
         "architecture_id": architecture_id,
+        "output_semantics": "predicted_log_ai = input_lfm_log_ai + predicted_increment_log_ai",
         "model_run_dir": repo_relative_path(model_run_dir, root=root),
         "checkpoint": repo_relative_path(checkpoint_path, root=root),
         "normalization_file": (
@@ -878,6 +883,10 @@ def run_zero_shot_volume_model(
     npz_path = model_dir / "predictions.npz"
     np.savez_compressed(
         npz_path,
+        predicted_log_ai=stitched.astype(np.float32),
+        predicted_increment_log_ai=pred_delta_vs_lfm.astype(np.float32),
+        input_lfm_log_ai=volume.lfm.astype(np.float32),
+        valid_mask=volume.valid_mask.astype(bool),
         stitched_pred_log_ai=stitched.astype(np.float32),
         pred_delta_vs_lfm=pred_delta_vs_lfm.astype(np.float32),
         stitching_weight=weight.astype(np.float32),
@@ -910,6 +919,7 @@ def run_zero_shot_volume_model(
         "output_mode": "volume",
         "experiment_id": experiment_id,
         "architecture_id": architecture_id,
+        "output_semantics": "predicted_log_ai = input_lfm_log_ai + predicted_increment_log_ai",
         "model_run_dir": repo_relative_path(model_run_dir, root=root),
         "checkpoint": repo_relative_path(checkpoint_path, root=root),
         "normalization_file": (
@@ -1726,3 +1736,67 @@ def _required_text(config: Mapping[str, Any], key: str) -> str:
     if not text:
         raise ValueError(f"Missing required config value: {key}")
     return text
+
+
+def paired_lfm_counterfactual_metrics(
+    left: Mapping[str, np.ndarray],
+    right: Mapping[str, np.ndarray],
+) -> dict[str, float | int | str]:
+    """Summarize a paired-LFM run without conflating its three effects.
+
+    ``predicted_increment_log_ai`` is compared separately from the direct LFM
+    replacement and from the final deployment closure.  The two inputs must
+    describe the same seismic/axis support; this helper does not resample or
+    silently intersect different geometries.
+    """
+    def _pick(payload: Mapping[str, np.ndarray], primary: str, legacy: str = "") -> np.ndarray:
+        if primary in payload:
+            return np.asarray(payload[primary], dtype=np.float64)
+        if legacy and legacy in payload:
+            return np.asarray(payload[legacy], dtype=np.float64)
+        raise ValueError(f"Paired R0 payload lacks {primary!r}.")
+
+    left_lfm = _pick(left, "input_lfm_log_ai", "lfm_input")
+    right_lfm = _pick(right, "input_lfm_log_ai", "lfm_input")
+    left_increment = _pick(left, "predicted_increment_log_ai", "pred_delta_vs_lfm")
+    right_increment = _pick(right, "predicted_increment_log_ai", "pred_delta_vs_lfm")
+    left_prediction = _pick(left, "predicted_log_ai", "stitched_pred_log_ai")
+    right_prediction = _pick(right, "predicted_log_ai", "stitched_pred_log_ai")
+    left_mask = _pick(left, "valid_mask", "valid_mask_model").astype(bool)
+    right_mask = _pick(right, "valid_mask", "valid_mask_model").astype(bool)
+    if left_lfm.shape != right_lfm.shape or left_increment.shape != right_increment.shape:
+        raise ValueError("Paired LFM payloads must have identical array shapes.")
+    if left_prediction.shape != left_lfm.shape or left_mask.shape != left_lfm.shape:
+        raise ValueError("Paired LFM payload has inconsistent prediction/valid-mask shapes.")
+    for key in ("seismic_input", "samples"):
+        if key in left and key in right and not np.allclose(
+            np.asarray(left[key]), np.asarray(right[key]), equal_nan=True
+        ):
+            raise ValueError(f"Paired LFM payloads differ in shared {key}.")
+    valid = (
+        left_mask
+        & right_mask
+        & np.isfinite(left_lfm)
+        & np.isfinite(right_lfm)
+        & np.isfinite(left_increment)
+        & np.isfinite(right_increment)
+        & np.isfinite(left_prediction)
+        & np.isfinite(right_prediction)
+    )
+    n_valid = int(np.count_nonzero(valid))
+    if n_valid == 0:
+        raise ValueError("Paired LFM payloads have no common finite valid samples.")
+    lfm_difference = left_lfm - right_lfm
+    increment_difference = left_increment - right_increment
+    final_difference = left_prediction - right_prediction
+    residual_after_direct_lfm = final_difference - lfm_difference
+    rms = lambda values: float(np.sqrt(np.mean(np.asarray(values, dtype=np.float64)[valid] ** 2)))
+    return {
+        "status": "ok",
+        "n_valid": n_valid,
+        "lfm_direct_difference_rms": rms(lfm_difference),
+        "increment_condition_difference_rms": rms(increment_difference),
+        "final_prediction_difference_rms": rms(final_difference),
+        "increment_residual_after_lfm_replacement_rms": rms(residual_after_direct_lfm),
+        "semantics": "final_difference = direct_lfm_difference + increment_condition_difference",
+    }

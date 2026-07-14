@@ -799,7 +799,7 @@ synthoseis_lite_v4
 - `delta_l2_weight` alias、fallback 和兼容解析；
 - patch 内计算 `truth-input_lfm` 标签的实现；
 - 被新 reader、writer、loss、prediction、R0 或 R1 替代的函数、类和模块；
-- 被 v4 reader 取代的 `src/cup/synthetic/readers/time_v2.py`、`depth_v2.py`，以及被新真实井监督模块取代的 `src/ginn_v2/real_delta.py`；
+- 被 v4 reader 取代的 `src/cup/synthetic/readers/time_v2.py`、`depth_v2.py`，以及被新真实井监督模块取代的旧 `src/ginn_v2/real_delta.py`；当前真实井监督实现位于 `src/ginn_v2/real_well_supervised.py`；
 - 只验证退役生产行为的测试、fixture、示例配置、教程和 notebook；
 - 迁移期实验入口、adapter、wrapper、feature flag 和双路径分派。
 

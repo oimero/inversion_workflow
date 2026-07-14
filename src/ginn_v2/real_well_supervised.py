@@ -1,4 +1,4 @@
-"""Sparse real-well delta supervision for ordinary GINN-v2 experiments."""
+"""Sparse real-well canonical-increment supervision for GINN-v2."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ from wtie.processing import grid
 
 
 @dataclass(frozen=True)
-class RealDeltaSources:
+class RealWellSupervisedSources:
     lfm_run_dir: Path
     variant_id: str
     lfm_path: Path
@@ -44,13 +44,13 @@ class RealDeltaSources:
     seismic_path: Path
 
 
-class BalancedRealDeltaSampler:
+class BalancedRealWellSampler:
     """Deterministic cluster and within-cluster shuffled cycles."""
 
     def __init__(self, samples: pd.DataFrame, *, clusters_per_step: int, seed: int) -> None:
         valid = samples[samples["valid_for_fit"].astype(bool)].copy()
         if valid.empty:
-            raise ValueError("Real-delta sampler received no valid samples.")
+            raise ValueError("Real-well sampler received no valid samples.")
         self.wells_by_cluster = {
             int(cluster): sorted(group["well_name"].astype(str).unique().tolist())
             for cluster, group in valid.groupby("spatial_cluster_id", sort=True)
@@ -58,7 +58,7 @@ class BalancedRealDeltaSampler:
         self.clusters = sorted(self.wells_by_cluster)
         self.k = min(int(clusters_per_step), len(self.clusters))
         if self.k <= 0:
-            raise ValueError("Real-delta sampler requires at least one training cluster.")
+            raise ValueError("Real-well sampler requires at least one training cluster.")
         self.rng = np.random.default_rng(int(seed))
         self.cluster_queue: deque[int] = deque()
         self.well_queues: dict[int, deque[str]] = {
@@ -141,7 +141,7 @@ class DifferentiableWellPredictor:
             all_nodes.update(nodes)
             if logger is not None:
                 logger.info(
-                    "real-delta precompute: geometry well=%s (%d/%d) cumulative_nodes=%d",
+                    "real-well precompute: geometry well=%s (%d/%d) cumulative_nodes=%d",
                     well_name,
                     index,
                     len(groups),
@@ -158,7 +158,7 @@ class DifferentiableWellPredictor:
                 or index % node_log_interval == 0
             ):
                 logger.info(
-                    "real-delta precompute: support node=%d/%d trace_patches=%d",
+                    "real-well precompute: support node=%d/%d trace_patches=%d",
                     index,
                     len(ordered_nodes),
                     task_count,
@@ -180,7 +180,7 @@ class DifferentiableWellPredictor:
             )
         return self._patches[inline_index]
 
-    def predict_delta_n(
+    def predict_increment_n(
         self,
         model: torch.nn.Module,
         rows: pd.DataFrame,
@@ -188,14 +188,14 @@ class DifferentiableWellPredictor:
         device: torch.device,
         canonical_full_patch: bool = False,
     ) -> torch.Tensor:
-        return self.predict_delta_n_groups(
+        return self.predict_increment_n_groups(
             model,
             [rows],
             device=device,
             canonical_full_patch=canonical_full_patch,
         )[0]
 
-    def predict_delta_n_groups(
+    def predict_increment_n_groups(
         self,
         model: torch.nn.Module,
         groups: Sequence[pd.DataFrame],
@@ -204,7 +204,7 @@ class DifferentiableWellPredictor:
         canonical_full_patch: bool = False,
     ) -> list[torch.Tensor]:
         if not groups or any(rows.empty for rows in groups):
-            raise ValueError("Cannot predict an empty real-delta well sample group.")
+            raise ValueError("Cannot predict an empty real-well sample group.")
         geometries = []
         nodes: set[tuple[int, int]] = set()
         for rows in groups:
@@ -244,7 +244,7 @@ class DifferentiableWellPredictor:
                     value = term if value is None else value + term
                     interpolation_weight += weight
             if value is None or interpolation_weight <= 0.0:
-                raise ValueError("Real-delta predictor found an uncovered well sample.")
+                raise ValueError("Canonical-increment predictor found an uncovered well sample.")
             predictions.append(value / interpolation_weight)
         return torch.stack(predictions)
 
@@ -255,10 +255,10 @@ class DifferentiableWellPredictor:
         list[list[tuple[tuple[int, int], int, int, float, float]]],
         set[tuple[int, int]],
     ]:
-        if "_real_delta_row_id" not in rows:
+        if "_real_well_row_id" not in rows:
             return self._point_geometry(rows.reset_index(drop=True))
         key = tuple(
-            pd.to_numeric(rows["_real_delta_row_id"], errors="raise")
+            pd.to_numeric(rows["_real_well_row_id"], errors="raise")
             .astype(int)
             .tolist()
         )
@@ -478,21 +478,21 @@ class DifferentiableWellPredictor:
         return torch.from_numpy(values.astype(np.float32))
 
 
-class RealDeltaSupport:
+class RealWellSupervisedSupport:
     """Prepared real-well labels and differentiable support for one model run."""
 
     def __init__(
         self,
         *,
         config: Mapping[str, Any],
-        sources: RealDeltaSources,
+        sources: RealWellSupervisedSources,
         volume: RealFieldVolume,
         samples: pd.DataFrame,
         training_samples: pd.DataFrame,
         excluded_wells: Sequence[str],
         held_out_cluster: int,
         predictor: DifferentiableWellPredictor,
-        sampler: BalancedRealDeltaSampler | None,
+        sampler: BalancedRealWellSampler | None,
         normalization: Mapping[str, Any],
         precompute_summary: Mapping[str, Any],
         source_summary: Mapping[str, Any],
@@ -525,7 +525,7 @@ class RealDeltaSupport:
         model.eval()
         if self.canonical_full_patch:
             with torch.no_grad():
-                prediction = self.predictor.predict_delta_n(
+                prediction = self.predictor.predict_increment_n(
                     model,
                     self.samples,
                     device=device,
@@ -536,12 +536,12 @@ class RealDeltaSupport:
                 raise ValueError("Canonical full-patch real-well prediction is non-finite.")
             return float("nan")
         with torch.no_grad():
-            sparse = self.predictor.predict_delta_n(
+            sparse = self.predictor.predict_increment_n(
                 model,
                 self.samples,
                 device=device,
             )
-            canonical = self.predictor.predict_delta_n(
+            canonical = self.predictor.predict_increment_n(
                 model,
                 self.samples,
                 device=device,
@@ -565,7 +565,7 @@ class RealDeltaSupport:
         device: torch.device,
     ) -> tuple[torch.Tensor, dict[str, int]]:
         if self.sampler is None:
-            raise RuntimeError("Real-delta loss requested without an active sampler.")
+            raise RuntimeError("Real-well supervised loss requested without an active sampler.")
         selected = self.sampler.select()
         groups = [
             self.training_samples[
@@ -574,14 +574,11 @@ class RealDeltaSupport:
             ].sort_values("sample_index")
             for cluster, well_name in selected
         ]
-        predictions = self.predictor.predict_delta_n_groups(model, groups, device=device)
+        predictions = self.predictor.predict_increment_n_groups(model, groups, device=device)
         losses = []
         n_samples = 0
         for rows, prediction in zip(groups, predictions):
-            target = (
-                rows["well_log_ai"].to_numpy(dtype=np.float32)
-                - rows["lfm_log_ai"].to_numpy(dtype=np.float32)
-            )
+            target = rows["well_target_increment_log_ai"].to_numpy(dtype=np.float32)
             target_tensor = torch.as_tensor(target, dtype=torch.float32, device=device)
             losses.append(torch.mean((prediction - target_tensor) ** 2))
             n_samples += int(len(rows))
@@ -603,8 +600,8 @@ class RealDeltaSupport:
                     "well_name": well_name,
                     "spatial_cluster_id": cluster,
                     "supervision_role": str(row["supervision_role"]),
-                    "used_for_real_delta_training": bool(
-                        row["used_for_real_delta_training"]
+                    "used_for_real_well_training": bool(
+                        row["used_for_real_well_training"]
                     ),
                     "selected_count": int(counts.get((cluster, well_name), 0)),
                     "n_valid_samples": int(
@@ -628,13 +625,13 @@ class RealDeltaSupport:
             "held_out_cluster_id": self.held_out_cluster,
             "excluded_wells": list(self.excluded_wells),
             "same_cluster_training_leakage_risk": bool(
-                float(self.config["lambda_real_delta"]) > 0.0
+                float(self.config["lambda_real_well_supervised"]) > 0.0
                 and not self.config["exclude_same_cluster"]
             ),
             "n_wells": int(self.samples["well_name"].nunique()),
             "n_training_wells": int(
                 self.samples.loc[
-                    self.samples["used_for_real_delta_training"].astype(bool),
+                    self.samples["used_for_real_well_training"].astype(bool),
                     "well_name",
                 ].nunique()
             ),
@@ -656,7 +653,7 @@ class RealDeltaSupport:
         }
 
 
-def prepare_real_delta_support(
+def prepare_real_well_supervised_support(
     *,
     config: Mapping[str, Any],
     repo_root: Path,
@@ -664,14 +661,14 @@ def prepare_real_delta_support(
     normalization: Mapping[str, Any],
     patch_spec: Mapping[str, Any],
     input_reference_stats_path: Path,
-    lambda_real_delta: float,
+    lambda_real_well_supervised: float,
     seed: int,
     logger: logging.Logger,
-) -> RealDeltaSupport:
+) -> RealWellSupervisedSupport:
     cfg = _validate_config(config)
-    cfg["lambda_real_delta"] = float(lambda_real_delta)
+    cfg["lambda_real_well_supervised"] = float(lambda_real_well_supervised)
     sources = _resolve_sources(cfg, repo_root=repo_root)
-    logger.info("real-delta source: %s variant=%s", sources.lfm_run_dir, sources.variant_id)
+    logger.info("real-well source: %s variant=%s", sources.lfm_run_dir, sources.variant_id)
     with input_reference_stats_path.open("r", encoding="utf-8") as handle:
         input_stats = json.load(handle)
     seismic_type = str(dict(sources.lfm_run_summary.get("seismic") or {}).get("type") or "").casefold()
@@ -694,13 +691,13 @@ def prepare_real_delta_support(
         },
         "volume": {},
     }
-    logger.info("real-delta: loading real-field seismic and LFM volume")
+    logger.info("real-well: loading real-field seismic and LFM volume")
     volume = load_real_field_volume(
         config=real_cfg,
         root=repo_root,
         data_root=repo_root,
     )
-    logger.info("real-delta: building well labels")
+    logger.info("real-well: building canonical increment labels")
     samples, label_metadata = build_well_anchor_samples(
         well_control_run_dir=sources.well_control_run_dir,
         lfm=volume.lfm,
@@ -718,33 +715,33 @@ def prepare_real_delta_support(
     )
     valid = samples[samples["valid_for_fit"].astype(bool)].copy()
     if valid.empty:
-        raise ValueError("Real-delta label builder produced no valid samples.")
-    valid["_real_delta_row_id"] = np.arange(len(valid), dtype=np.int64)
+        raise ValueError("Real-well label builder produced no valid samples.")
+    valid["_real_well_row_id"] = np.arange(len(valid), dtype=np.int64)
     held_out_cluster, excluded_wells, training = assign_supervision_roles(
         valid,
         held_out_well=cfg["held_out_well"],
         exclude_same_cluster=bool(cfg["exclude_same_cluster"]),
-        require_training=lambda_real_delta > 0.0,
+        require_training=lambda_real_well_supervised > 0.0,
     )
-    if lambda_real_delta <= 0.0:
-        valid["used_for_real_delta_training"] = False
-        training["used_for_real_delta_training"] = False
+    if lambda_real_well_supervised <= 0.0:
+        valid["used_for_real_well_training"] = False
+        training["used_for_real_well_training"] = False
     role_lookup = (
         valid.drop_duplicates("well_name")
         .set_index("well_name")[
-            ["supervision_role", "used_for_real_delta_training", "exclusion_reason"]
+            ["supervision_role", "used_for_real_well_training", "exclusion_reason"]
         ]
         .to_dict(orient="index")
     )
     for column in (
         "supervision_role",
-        "used_for_real_delta_training",
+        "used_for_real_well_training",
         "exclusion_reason",
     ):
         samples[column] = samples["well_name"].astype(str).map(
             {well: values[column] for well, values in role_lookup.items()}
         )
-    samples_path = output_dir / "real_delta_well_samples.csv"
+    samples_path = output_dir / "real_well_supervised_samples.csv"
     samples.to_csv(samples_path, index=False)
     cfg["samples_path"] = str(samples_path)
     cfg["label_metadata"] = label_metadata
@@ -754,25 +751,25 @@ def prepare_real_delta_support(
         normalization=normalization,
     )
     logger.info(
-        "real-delta: precomputing support for %d wells",
+        "real-well: precomputing support for %d wells",
         valid["well_name"].nunique(),
     )
     precompute = predictor.prepare(valid, logger=logger)
     logger.info(
-        "real-delta: prepared %d nodes and %d trace patches",
+        "real-well: prepared %d nodes and %d trace patches",
         precompute["n_support_nodes"],
         precompute["n_support_trace_patches"],
     )
     sampler = (
-        BalancedRealDeltaSampler(
+        BalancedRealWellSampler(
             training,
             clusters_per_step=int(cfg["clusters_per_step"]),
             seed=int(seed) + 1_000_003,
         )
-        if lambda_real_delta > 0.0
+        if lambda_real_well_supervised > 0.0
         else None
     )
-    return RealDeltaSupport(
+    return RealWellSupervisedSupport(
         config=cfg,
         sources=sources,
         volume=volume,
@@ -827,10 +824,10 @@ def assign_supervision_roles(
     )
     samples.loc[same_cluster_mask, "supervision_role"] = "same_cluster_excluded"
     samples.loc[same_cluster_mask, "exclusion_reason"] = "same_cluster_as_holdout"
-    samples["used_for_real_delta_training"] = samples["supervision_role"].eq("training")
-    training = samples[samples["used_for_real_delta_training"]].copy()
+    samples["used_for_real_well_training"] = samples["supervision_role"].eq("training")
+    training = samples[samples["used_for_real_well_training"]].copy()
     if require_training and training.empty:
-        raise ValueError("Configured holdout leaves no real-delta training wells.")
+        raise ValueError("Configured holdout leaves no real-well training wells.")
     return cluster, excluded, training
 
 
@@ -839,7 +836,7 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
     retired = sorted({"lfm_file", "well_auto_tie_dir", "well_inventory_file"} & set(cfg))
     if retired:
         raise ValueError(
-            f"train.real_delta contains retired v1 source keys {retired}; "
+            f"train.real_well_supervised contains retired v1 source keys {retired}; "
             "use lfm_run_dir + variant_id + well_control_run_dir."
         )
     required = {
@@ -857,21 +854,21 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
     }
     missing = sorted(required - set(cfg))
     if missing:
-        raise ValueError(f"train.real_delta is missing required keys: {missing}")
+        raise ValueError(f"train.real_well_supervised is missing required keys: {missing}")
     if not str(cfg["held_out_well"]).strip():
-        raise ValueError("train.real_delta.held_out_well must be non-empty.")
+        raise ValueError("train.real_well_supervised.held_out_well must be non-empty.")
     cfg["held_out_well"] = str(cfg["held_out_well"]).strip()
     for key in ("lfm_run_dir", "variant_id", "well_control_run_dir"):
         value = str(cfg[key]).strip()
         if not value or value.casefold() == "auto":
-            raise ValueError(f"train.real_delta.{key} must be explicit and non-auto.")
+            raise ValueError(f"train.real_well_supervised.{key} must be explicit and non-auto.")
         cfg[key] = value
     if str(cfg["lfm_value_transform"]).casefold() not in {"identity", "none"}:
-        raise ValueError("train.real_delta.lfm_value_transform must be identity for unified LFM v2.")
+        raise ValueError("train.real_well_supervised.lfm_value_transform must be identity for unified LFM v2.")
     if not isinstance(cfg["exclude_same_cluster"], bool):
-        raise ValueError("train.real_delta.exclude_same_cluster must be a YAML boolean.")
+        raise ValueError("train.real_well_supervised.exclude_same_cluster must be a YAML boolean.")
     if int(cfg["clusters_per_step"]) <= 0:
-        raise ValueError("train.real_delta.clusters_per_step must be positive.")
+        raise ValueError("train.real_well_supervised.clusters_per_step must be positive.")
     for key in (
         "cluster_radius_m",
         "diagnostic_max_hz",
@@ -879,7 +876,7 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
     ):
         value = float(cfg[key])
         if not np.isfinite(value) or value <= 0.0:
-            raise ValueError(f"train.real_delta.{key} must be finite and positive.")
+            raise ValueError(f"train.real_well_supervised.{key} must be finite and positive.")
     return cfg
 
 
@@ -887,7 +884,7 @@ def _resolve_sources(
     config: Mapping[str, Any],
     *,
     repo_root: Path,
-) -> RealDeltaSources:
+) -> RealWellSupervisedSources:
     selected = resolve_lfm_variant(config, repo_root=repo_root)
     seismic = dict(selected.run_summary.get("seismic") or {})
     seismic_path = resolve_relative_path(str(seismic.get("path") or ""), root=repo_root)
@@ -898,7 +895,7 @@ def _resolve_sources(
     ):
         if not path.is_file():
             raise FileNotFoundError(path)
-    return RealDeltaSources(
+    return RealWellSupervisedSources(
         lfm_run_dir=selected.run_dir,
         variant_id=selected.variant_id,
         lfm_path=selected.lfm_path,
@@ -914,7 +911,7 @@ def _resolve_sources(
 
 
 def _source_summary(
-    sources: RealDeltaSources,
+    sources: RealWellSupervisedSources,
     *,
     repo_root: Path,
 ) -> dict[str, Any]:
@@ -945,33 +942,33 @@ def _load_depth_forward_inputs(
 ) -> tuple[np.ndarray, np.ndarray, AIVelocityRelation]:
     reference = str(benchmark_manifest.get("forward_model_inputs_path") or "").strip()
     if not reference:
-        raise ValueError("Depth real-delta benchmark lacks forward_model_inputs_path.")
+        raise ValueError("Depth real-well benchmark lacks forward_model_inputs_path.")
     path = resolve_relative_path(reference, root=repo_root)
     if not path.is_file():
-        raise FileNotFoundError(f"Depth real-delta forward inputs not found: {path}")
+        raise FileNotFoundError(f"Depth real-well forward inputs not found: {path}")
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     if payload.get("schema") != FORWARD_MODEL_INPUTS_SCHEMA_VERSION:
         raise ValueError(
-            "Depth real-delta expected "
+            "Depth real-well expected "
             f"{FORWARD_MODEL_INPUTS_SCHEMA_VERSION}, got {payload.get('schema')!r}; "
             "rebuild the rock-physics analysis."
         )
     if payload.get("sample_domain") != "depth" or payload.get("depth_basis") != "tvdss":
-        raise ValueError("Depth real-delta forward inputs must declare depth/TVDSS.")
+        raise ValueError("Depth real-well forward inputs must declare depth/TVDSS.")
     relation = AIVelocityRelation.from_mapping(
         dict(payload.get("ai_velocity_relation") or {})
     )
     wavelet_ref = dict(payload.get("wavelet") or {})
     if wavelet_ref.get("time_unit") != "s":
-        raise ValueError("Depth real-delta wavelet time_unit must be 's'.")
+        raise ValueError("Depth real-well wavelet time_unit must be 's'.")
     wavelet_path = resolve_relative_path(str(wavelet_ref.get("path") or ""), root=repo_root)
     if not wavelet_path.is_file():
-        raise FileNotFoundError(f"Depth real-delta wavelet not found: {wavelet_path}")
+        raise FileNotFoundError(f"Depth real-well wavelet not found: {wavelet_path}")
     frame = pd.read_csv(wavelet_path)
     required = {"time_s", "amplitude"}
     if not required.issubset(frame.columns):
-        raise ValueError(f"Depth real-delta wavelet must contain columns {sorted(required)}.")
+        raise ValueError(f"Depth real-well wavelet must contain columns {sorted(required)}.")
     return (
         frame["time_s"].to_numpy(dtype=np.float64),
         frame["amplitude"].to_numpy(dtype=np.float64),
@@ -985,21 +982,21 @@ def _validate_well_sample_contract(well: pd.DataFrame, *, volume: RealFieldVolum
     expected_units = {volume.sample_axis.unit}
     if domains != {volume.sample_axis.domain} or units != expected_units:
         raise ValueError(
-            "Real-delta well/LFM sample-axis mismatch: "
+            "Real-well/LFM sample-axis mismatch: "
             f"well_domain={sorted(domains)}, well_unit={sorted(units)}, "
             f"lfm_domain={volume.sample_axis.domain!r}, lfm_unit={volume.sample_axis.unit!r}."
         )
     if volume.sample_axis.domain == "depth" and (
         volume.depth_basis != "tvdss" or volume.sample_axis.unit != "m"
     ):
-        raise ValueError("Depth real-delta well QC requires LFM TVDSS in metres.")
+        raise ValueError("Depth real-well QC requires LFM TVDSS in metres.")
     if volume.sample_axis.domain == "time" and volume.sample_axis.unit != "s":
-        raise ValueError("Time real-delta well QC requires TWT in seconds.")
+        raise ValueError("Time real-well QC requires TWT in seconds.")
 
 
 def evaluate_real_wells(
     *,
-    support: RealDeltaSupport,
+    support: RealWellSupervisedSupport,
     models: Mapping[str, torch.nn.Module],
     output_dir: Path,
     benchmark_dir: Path,
@@ -1026,7 +1023,7 @@ def evaluate_real_wells(
             repo_root=repo_root,
         )
     else:
-        raise ValueError(f"Unsupported real-delta sample domain: {sample_domain!r}.")
+        raise ValueError(f"Unsupported real-well sample domain: {sample_domain!r}.")
     groups = [
         group.sort_values("sample_index").copy()
         for _, group in support.samples.groupby("well_name", sort=True)
@@ -1037,13 +1034,13 @@ def evaluate_real_wells(
 
     for checkpoint_name, model in models.items():
         logger.info(
-            "real-delta QC: checkpoint=%s, wells=%d",
+            "real-well QC: checkpoint=%s, wells=%d",
             checkpoint_name,
             len(groups),
         )
         model.eval()
         with torch.no_grad():
-            predictions_n = support.predictor.predict_delta_n_groups(
+            predictions_n = support.predictor.predict_increment_n_groups(
                 model,
                 groups,
                 device=device,
@@ -1052,11 +1049,11 @@ def evaluate_real_wells(
         for index, (well, prediction_n) in enumerate(zip(groups, predictions_n), start=1):
             well_name = str(well["well_name"].iloc[0])
             cluster = int(well["spatial_cluster_id"].iloc[0])
-            pred_delta = prediction_n.detach().cpu().numpy()
+            pred_increment = prediction_n.detach().cpu().numpy()
             target_ai = well["well_log_ai"].to_numpy(dtype=np.float64)
             lfm_ai = well["lfm_log_ai"].to_numpy(dtype=np.float64)
-            target_delta = target_ai - lfm_ai
-            pred_ai = lfm_ai + pred_delta
+            target_increment = well["well_target_increment_log_ai"].to_numpy(dtype=np.float64)
+            pred_ai = lfm_ai + pred_increment
             sample_axis = well["sample"].to_numpy(dtype=np.float64)
             _validate_well_sample_contract(well, volume=support.volume)
             common = {
@@ -1067,8 +1064,8 @@ def evaluate_real_wells(
                 "depth_basis": support.volume.depth_basis or "",
                 "spatial_cluster_id": cluster,
                 "supervision_role": str(well["supervision_role"].iloc[0]),
-                "used_for_real_delta_training": bool(
-                    well["used_for_real_delta_training"].iloc[0]
+                "used_for_real_well_training": bool(
+                    well["used_for_real_well_training"].iloc[0]
                 ),
                 "exclusion_reason": str(well["exclusion_reason"].iloc[0]),
             }
@@ -1077,9 +1074,9 @@ def evaluate_real_wells(
                     **common,
                     **_well_metrics(
                         target_ai,
-                        target_delta,
+                        target_increment,
                         pred_ai,
-                        pred_delta,
+                        pred_increment,
                         sample_axis,
                     ),
                 }
@@ -1089,9 +1086,9 @@ def evaluate_real_wells(
                     **common,
                     **_well_band_metrics(
                         target_ai=target_ai,
-                        target_delta=target_delta,
+                        target_increment=target_increment,
                         pred_ai=pred_ai,
-                        pred_delta=pred_delta,
+                        pred_increment=pred_increment,
                         sample_axis=sample_axis,
                         sample_domain=sample_domain,
                         diagnostic_max_hz=float(
@@ -1108,7 +1105,7 @@ def evaluate_real_wells(
                 well=well,
                 target_ai=target_ai,
                 lfm_ai=lfm_ai,
-                pred_delta=pred_delta,
+                pred_increment=pred_increment,
                 volume=support.volume,
                 wavelet_time_s=wavelet_time_s,
                 wavelet=wavelet,
@@ -1125,7 +1122,7 @@ def evaluate_real_wells(
                 }
             )
             logger.info(
-                "real-delta QC: checkpoint=%s well=%s (%d/%d) status=%s",
+                "real-well QC: checkpoint=%s well=%s (%d/%d) status=%s",
                 checkpoint_name,
                 well_name,
                 index,
@@ -1137,7 +1134,7 @@ def evaluate_real_wells(
         "real_well_metrics": output_dir / "real_well_metrics.csv",
         "real_well_band_metrics": output_dir / "real_well_band_metrics.csv",
         "real_well_waveform_metrics": output_dir / "real_well_waveform_metrics.csv",
-        "real_delta_sampling_qc": output_dir / "real_delta_sampling_qc.csv",
+        "real_well_supervised_sampling_qc": output_dir / "real_well_supervised_sampling_qc.csv",
     }
     pd.DataFrame.from_records(metrics_rows).to_csv(
         outputs["real_well_metrics"],
@@ -1152,7 +1149,7 @@ def evaluate_real_wells(
         index=False,
     )
     support.sampling_qc_frame().to_csv(
-        outputs["real_delta_sampling_qc"],
+        outputs["real_well_supervised_sampling_qc"],
         index=False,
     )
     return outputs
@@ -1160,33 +1157,33 @@ def evaluate_real_wells(
 
 def _well_metrics(
     target_ai: np.ndarray,
-    target_delta: np.ndarray,
+    target_increment: np.ndarray,
     pred_ai: np.ndarray,
-    pred_delta: np.ndarray,
+    pred_increment: np.ndarray,
     twt: np.ndarray,
 ) -> dict[str, float | int]:
-    delta = _basic_metrics(target_delta, pred_delta)
+    increment = _basic_metrics(target_increment, pred_increment)
     full = _basic_metrics(target_ai, pred_ai)
-    target_delta_rms = _rms(target_delta)
-    pred_delta_rms = _rms(pred_delta)
+    target_increment_rms = _rms(target_increment)
+    pred_increment_rms = _rms(pred_increment)
     target_gradient, pred_gradient = _paired_gradients(
-        target_delta,
-        pred_delta,
+        target_increment,
+        pred_increment,
         twt,
     )
     return {
-        "n_valid": int(delta["n_valid"]),
-        "delta_corr": delta["corr"],
-        "delta_rmse": delta["rmse"],
-        "delta_bias": delta["bias"],
+        "n_valid": int(increment["n_valid"]),
+        "increment_corr": increment["corr"],
+        "increment_rmse": increment["rmse"],
+        "increment_bias": increment["bias"],
         "full_ai_corr": full["corr"],
         "full_ai_rmse": full["rmse"],
         "full_ai_bias": full["bias"],
-        "delta_rms": pred_delta_rms,
-        "target_delta_rms": target_delta_rms,
-        "delta_target_relative_log_error": _energy_error(
-            pred_delta_rms,
-            target_delta_rms,
+        "predicted_increment_rms": pred_increment_rms,
+        "target_increment_rms": target_increment_rms,
+        "increment_target_relative_log_error": _energy_error(
+            pred_increment_rms,
+            target_increment_rms,
         ),
         "gradient_rms": _rms(pred_gradient),
         "target_gradient_rms": _rms(target_gradient),
@@ -1229,9 +1226,9 @@ def _basic_metrics(
 def _well_band_metrics(
     *,
     target_ai: np.ndarray,
-    target_delta: np.ndarray,
+    target_increment: np.ndarray,
     pred_ai: np.ndarray,
-    pred_delta: np.ndarray,
+    pred_increment: np.ndarray,
     sample_axis: np.ndarray,
     sample_domain: str,
     diagnostic_max_hz: float,
@@ -1239,7 +1236,7 @@ def _well_band_metrics(
     if sample_domain == "depth":
         return {}
     if sample_domain != "time":
-        raise ValueError(f"Unsupported real-delta sample domain: {sample_domain!r}.")
+        raise ValueError(f"Unsupported real-well sample domain: {sample_domain!r}.")
     dt = float(np.nanmedian(np.diff(sample_axis)))
     if not np.isfinite(dt) or dt <= 0.0:
         return {}
@@ -1252,7 +1249,7 @@ def _well_band_metrics(
     output: dict[str, float | int] = {}
     for name, low_hz, high_hz in bands:
         for prefix, target, prediction in (
-            ("delta", target_delta, pred_delta),
+            ("increment", target_increment, pred_increment),
             ("full_ai", target_ai, pred_ai),
         ):
             target_band, prediction_band = _fft_band_pair(
@@ -1346,7 +1343,7 @@ def _write_well_figures(
     well: pd.DataFrame,
     target_ai: np.ndarray,
     lfm_ai: np.ndarray,
-    pred_delta: np.ndarray,
+    pred_increment: np.ndarray,
     volume: RealFieldVolume,
     wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
@@ -1359,9 +1356,9 @@ def _write_well_figures(
     sample_axis = well["sample"].to_numpy(dtype=np.float64)
     sample_domain = volume.sample_axis.domain
     sample_label = "TVDSS (m)" if sample_domain == "depth" else "TWT (s)"
-    pred_ai = lfm_ai + pred_delta
-    target_delta = target_ai - lfm_ai
-    ai_path = figures_dir / f"{well_name}_{checkpoint_name}_ai_delta_qc.png"
+    pred_ai = lfm_ai + pred_increment
+    target_increment = target_ai - lfm_ai
+    ai_path = figures_dir / f"{well_name}_{checkpoint_name}_ai_increment_qc.png"
     fig, axes = plt.subplots(
         1,
         2,
@@ -1376,8 +1373,8 @@ def _write_well_figures(
     ):
         axes[0].plot(values, sample_axis, label=label, color=color, lw=1.2)
     for values, label, color in (
-        (target_delta, "Well delta", "black"),
-        (pred_delta, f"{checkpoint_name} delta", "tab:red"),
+        (target_increment, "Well canonical increment", "black"),
+        (pred_increment, f"{checkpoint_name} increment", "tab:red"),
     ):
         axes[1].plot(values, sample_axis, label=label, color=color, lw=1.2)
     for axis in axes:
@@ -1386,7 +1383,7 @@ def _write_well_figures(
         axis.legend(fontsize=8)
     axes[0].set_ylabel(sample_label)
     axes[0].set_xlabel("logAI")
-    axes[1].set_xlabel("delta logAI")
+    axes[1].set_xlabel("canonical increment logAI")
     fig.suptitle(
         f"GINN-v2 real-well QC | {well_name} | cluster {cluster} | {checkpoint_name}"
     )
@@ -1412,7 +1409,7 @@ def _write_well_figures(
     )
     return (
         {
-            "ai_delta_qc_figure": repo_relative_path(ai_path, root=repo_root),
+            "ai_increment_qc_figure": repo_relative_path(ai_path, root=repo_root),
             "forward_qc_figure": (
                 repo_relative_path(forward_path, root=repo_root)
                 if status == "ok"
@@ -1444,13 +1441,13 @@ def _write_forward_figure(
     sample_domain = volume.sample_axis.domain
     if sample_domain == "time":
         if relation is not None:
-            raise ValueError("Time real-delta forward QC rejects an AI--Vp relation.")
+            raise ValueError("Time real-well forward QC rejects an AI--Vp relation.")
         synthetic = forward_time(filled[None, :], wavelet_time_s, wavelet)[0]
     elif sample_domain == "depth":
         if volume.depth_basis != "tvdss" or volume.sample_axis.unit != "m":
-            raise ValueError("Depth real-delta forward QC requires TVDSS in metres.")
+            raise ValueError("Depth real-well forward QC requires TVDSS in metres.")
         if relation is None:
-            raise ValueError("Depth real-delta forward QC requires a frozen AI--Vp relation.")
+            raise ValueError("Depth real-well forward QC requires a frozen AI--Vp relation.")
         velocity = relation.velocity_from_ai(np.exp(filled))
         synthetic = forward_depth(
             filled[None, :],
@@ -1460,7 +1457,7 @@ def _write_forward_figure(
             wavelet,
         )[0]
     else:
-        raise ValueError(f"Unsupported real-delta sample domain: {sample_domain!r}.")
+        raise ValueError(f"Unsupported real-well sample domain: {sample_domain!r}.")
     observed, inside = sample_volume_trilinear(
         volume.seismic,
         ilines=volume.ilines,
@@ -1582,10 +1579,10 @@ def _number(value: Any) -> float:
 
 
 __all__ = [
-    "BalancedRealDeltaSampler",
+    "BalancedRealWellSampler",
     "DifferentiableWellPredictor",
-    "RealDeltaSupport",
+    "RealWellSupervisedSupport",
     "assign_supervision_roles",
     "evaluate_real_wells",
-    "prepare_real_delta_support",
+    "prepare_real_well_supervised_support",
 ]

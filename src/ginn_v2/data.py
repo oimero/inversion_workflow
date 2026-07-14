@@ -106,6 +106,10 @@ def _aligned_arrays(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     target = np.asarray(sample.target_log_ai, dtype=np.float32)
     increment = np.asarray(sample.target_increment_log_ai, dtype=np.float32)
+    canonical_background = np.asarray(
+        getattr(sample, "canonical_background_log_ai", target - increment),
+        dtype=np.float32,
+    )
     seismic = np.asarray(sample.seismic_input, dtype=np.float32)
     lfm = np.asarray(sample.input_lfm_log_ai, dtype=np.float32)
     valid = np.asarray(sample.valid_mask, dtype=bool)
@@ -121,6 +125,7 @@ def _aligned_arrays(
         )
     if (
         target.ndim != 2
+        or canonical_background.ndim != 2
         or increment.ndim != 2
         or seismic.ndim != 2
         or lfm.ndim != 2
@@ -129,6 +134,7 @@ def _aligned_arrays(
         raise ValueError(f"Expected 2D arrays for sample {sample.sample_id}.")
     if (
         target.shape[0] != seismic.shape[0]
+        or canonical_background.shape != target.shape
         or increment.shape != target.shape
         or lfm.shape != target.shape
         or valid.shape != target.shape
@@ -139,12 +145,17 @@ def _aligned_arrays(
         )
     if np.any(valid & (
         ~np.isfinite(target)
+        | ~np.isfinite(canonical_background)
         | ~np.isfinite(increment)
         | ~np.isfinite(seismic)
         | ~np.isfinite(lfm)
     )):
         raise ValueError(
             f"Sample {sample.sample_id} has non-finite values inside valid_mask."
+        )
+    if np.any(valid & (np.abs(target - canonical_background - increment) > 1e-5)):
+        raise ValueError(
+            f"Sample {sample.sample_id} violates target = canonical_background + target_increment."
         )
     return target, seismic, lfm, valid
 
@@ -448,9 +459,31 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         sl = _row_slice(row)
         target_patch = target[sl]
         increment = np.asarray(sample.target_increment_log_ai, dtype=np.float32)[sl]
+        canonical_background = np.asarray(
+            getattr(sample, "canonical_background_log_ai", target),
+            dtype=np.float32,
+        )
+        if canonical_background.shape != target.shape:
+            raise ValueError(
+                f"Canonical background/target shape mismatch for {sample.sample_id}: "
+                f"{canonical_background.shape} vs {target.shape}"
+            )
+        canonical_patch = canonical_background[sl]
+        if not hasattr(sample, "canonical_background_log_ai"):
+            canonical_patch = target_patch - increment
+        valid_patch = valid[sl]
+        if np.any(
+            valid_patch
+            & (
+                ~np.isfinite(canonical_patch)
+                | (np.abs(target_patch - canonical_patch - increment) > 1e-5)
+            )
+        ):
+            raise ValueError(
+                f"Canonical decomposition mismatch inside valid patch for {sample.sample_id}."
+            )
         seismic_patch = seismic[sl]
         lfm_patch = lfm[sl]
-        valid_patch = valid[sl]
         input_valid_patch = valid_patch
         forward_lfm_patch = np.where(
             valid_patch & np.isfinite(lfm_patch),
@@ -466,6 +499,9 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         )
         target_patch = np.where(
             valid_patch & np.isfinite(target_patch), target_patch, 0.0
+        )
+        canonical_patch = np.where(
+            valid_patch & np.isfinite(canonical_patch), canonical_patch, 0.0
         )
         lfm_patch = np.where(valid_patch & np.isfinite(lfm_patch), lfm_patch, 0.0)
         lfm_ideal = np.asarray(sample.priors["lfm_ideal"], dtype=np.float32)
@@ -530,6 +566,9 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             "target_log_ai": torch.from_numpy(target_patch.astype(np.float32))[
                 None, :, :
             ],
+            "canonical_background_log_ai": torch.from_numpy(
+                canonical_patch.astype(np.float32)
+            )[None, :, :],
             "seismic": torch.from_numpy(
                 np.where(
                     valid_patch & np.isfinite(seismic_patch), seismic_patch, 0.0

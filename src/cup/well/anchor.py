@@ -9,12 +9,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from cup.impedance import decompose_log_ai, generation_contract, validate_sample_axis
 from cup.utils.io import require_contract_fingerprint
 from cup.utils.statistics import radius_connected_components
 from cup.well.real_field_controls import load_well_control_set
 
 
-SCHEMA_VERSION = "real_delta_well_samples_v3"
+SCHEMA_VERSION = "real_well_supervised_samples_v1"
 
 ANCHOR_SAMPLE_COLUMNS = [
     "well_name",
@@ -30,7 +31,8 @@ ANCHOR_SAMPLE_COLUMNS = [
     "spatial_cluster_size",
     "well_log_ai",
     "lfm_log_ai",
-    "target_delta",
+    "canonical_background_log_ai",
+    "well_target_increment_log_ai",
     "valid_for_fit",
     "valid_reason",
     "sampling_mode",
@@ -120,7 +122,7 @@ def build_well_anchor_samples(
     lfm_contract_fingerprint_sha256: str,
     expected_well_control_contract_fingerprint_sha256: str,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Sample one selected LFM variant and derive its unique real-delta labels."""
+    """Sample one selected LFM variant and derive canonical well-increment labels."""
 
     summary_path = well_control_run_dir / "run_summary.json"
     with summary_path.open("r", encoding="utf-8") as handle:
@@ -137,6 +139,12 @@ def build_well_anchor_samples(
     if lfm.shape != tuple(axis.size for axis in axes) or valid_mask.shape != lfm.shape:
         raise ValueError("Selected LFM volume/mask does not match explicit axes.")
     selected_samples = np.asarray(samples, dtype=np.float64)
+    if selected_samples.size < 2:
+        raise ValueError("The real-well target axis must contain at least two samples.")
+    increment_contract = generation_contract(
+        controls.sample_domain, float(selected_samples[1] - selected_samples[0])
+    )
+    validate_sample_axis(selected_samples, increment_contract)
     selected_indices = np.searchsorted(controls.sample_axis.values, selected_samples)
     selected_indices = np.clip(selected_indices, 0, controls.sample_axis.values.size - 1)
     if not np.allclose(
@@ -164,36 +172,52 @@ def build_well_anchor_samples(
     rows: list[dict[str, Any]] = []
     well_status = []
     for control in controls.controls:
+        control_indices = selected_indices
+        control_axis = np.asarray(control.sample_axis.values, dtype=np.float64)[control_indices]
+        control_valid = np.asarray(control.valid_mask, dtype=bool)[control_indices]
+        control_inline = np.asarray(control.inline_by_sample, dtype=np.float64)[control_indices]
+        control_xline = np.asarray(control.xline_by_sample, dtype=np.float64)[control_indices]
+        control_x_m = np.asarray(control.x_m_by_sample, dtype=np.float64)[control_indices]
+        control_y_m = np.asarray(control.y_m_by_sample, dtype=np.float64)[control_indices]
+        control_log_ai = np.asarray(control.log_ai.values, dtype=np.float64)[control_indices]
         sampled_lfm, lfm_inside = sample_volume_trilinear(
             lfm,
             ilines=np.asarray(ilines),
             xlines=np.asarray(xlines),
             twt_s=np.asarray(samples),
-            inline_values=control.inline_by_sample,
-            xline_values=control.xline_by_sample,
-            sample_twt_s=control.sample_axis.values,
+            inline_values=control_inline,
+            xline_values=control_xline,
+            sample_twt_s=control_axis,
         )
         sampled_mask, mask_inside = sample_volume_trilinear(
             np.asarray(valid_mask, dtype=np.float32),
             ilines=np.asarray(ilines),
             xlines=np.asarray(xlines),
             twt_s=np.asarray(samples),
-            inline_values=control.inline_by_sample,
-            xline_values=control.xline_by_sample,
-            sample_twt_s=control.sample_axis.values,
+            inline_values=control_inline,
+            xline_values=control_xline,
+            sample_twt_s=control_axis,
         )
-        well_log_ai = np.asarray(control.log_ai.values, dtype=np.float64)
+        well_log_ai = control_log_ai
+        canonical_background, well_target_increment = decompose_log_ai(
+            well_log_ai,
+            control_axis,
+            increment_contract,
+            valid_mask=control_valid,
+        )
         valid = (
-            control.valid_mask
+            control_valid
             & lfm_inside
             & mask_inside
             & (sampled_mask > 0.5)
             & np.isfinite(well_log_ai)
             & np.isfinite(sampled_lfm)
+            & np.isfinite(canonical_background)
+            & np.isfinite(well_target_increment)
         )
         cluster = cluster_lookup[control.well_name]
-        for index in range(control.sample_axis.values.size):
-            if not control.valid_mask[index]:
+        for index in range(selected_samples.size):
+            if not control_valid[index]:
                 reason = "well_control_invalid"
             elif not lfm_inside[index]:
                 reason = "outside_lfm_support"
@@ -207,18 +231,23 @@ def build_well_anchor_samples(
                 {
                     "well_name": control.well_name,
                     "sample_index": int(index),
-                    "sample": float(control.sample_axis.values[index]),
+                    "sample": float(selected_samples[index]),
                     "sample_domain": controls.sample_domain,
                     "sample_unit": controls.sample_unit,
-                    "inline": float(control.inline_by_sample[index]),
-                    "xline": float(control.xline_by_sample[index]),
-                    "x_m": float(control.x_m_by_sample[index]),
-                    "y_m": float(control.y_m_by_sample[index]),
+                    "inline": float(control_inline[index]),
+                    "xline": float(control_xline[index]),
+                    "x_m": float(control_x_m[index]),
+                    "y_m": float(control_y_m[index]),
                     "spatial_cluster_id": int(cluster["spatial_cluster_id"]),
                     "spatial_cluster_size": int(cluster["spatial_cluster_size"]),
                     "well_log_ai": float(well_log_ai[index]) if np.isfinite(well_log_ai[index]) else np.nan,
                     "lfm_log_ai": float(sampled_lfm[index]) if np.isfinite(sampled_lfm[index]) else np.nan,
-                    "target_delta": float(well_log_ai[index] - sampled_lfm[index]) if valid[index] else np.nan,
+                    "canonical_background_log_ai": (
+                        float(canonical_background[index]) if np.isfinite(canonical_background[index]) else np.nan
+                    ),
+                    "well_target_increment_log_ai": (
+                        float(well_target_increment[index]) if valid[index] else np.nan
+                    ),
                     "valid_for_fit": bool(valid[index]),
                     "valid_reason": reason,
                     "sampling_mode": control.sampling_mode,
@@ -232,7 +261,7 @@ def build_well_anchor_samples(
         well_status.append(
             {
                 "well_name": control.well_name,
-                "n_samples": int(control.sample_axis.values.size),
+                "n_samples": int(selected_samples.size),
                 "n_valid": int(np.count_nonzero(valid)),
                 "sampling_mode": control.sampling_mode,
             }

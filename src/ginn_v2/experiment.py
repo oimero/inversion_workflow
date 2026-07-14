@@ -134,6 +134,40 @@ def _reject_extra(mapping: Mapping[str, Any], allowed: set[str], label: str) -> 
         raise ValueError(f"Unsupported keys in {label}: {extra}")
 
 
+def _stage_deployment_eligibility(
+    stage: Mapping[str, Any], *, development_limited: bool,
+) -> tuple[bool, str]:
+    """Return whether a stage checkpoint may be used by R0.
+
+    Physics is deliberately conservative: a physics stage is deployable only
+    when the same stage retains dense synthetic increment supervision and the
+    selection metric is that supervised MSE.  A waveform-only physics stage is
+    still useful as a diagnostic, but it must not silently become a model
+    deployment choice.  Sparse real-well supervision follows the same rule and
+    remains experimental when combined with physics.
+    """
+    if development_limited:
+        return False, "development_limited_run"
+    blocks = list(stage.get("loss_blocks") or [])
+    kinds = {str(block.get("kind") or "") for block in blocks}
+    if "physics" not in kinds:
+        return True, "supervised_stage"
+    synthetic_blocks = [
+        block for block in blocks if str(block.get("kind") or "") == "synthetic_supervised"
+    ]
+    if not synthetic_blocks:
+        if "real_well_supervised" in kinds:
+            return False, "real_well_supervised_plus_physics_experimental"
+        return False, "physics_diagnostic_only"
+    metric = str(dict(stage.get("validation") or {}).get("selection_metric") or "")
+    synthetic_ids = {str(block.get("block_id") or "") for block in synthetic_blocks}
+    if metric.split(".", 1)[0] not in synthetic_ids or not metric.endswith(".mse"):
+        return False, "physics_requires_dense_synthetic_mse_selection"
+    if "real_well_supervised" in kinds:
+        return False, "real_well_supervised_plus_physics_experimental"
+    return True, "dense_synthetic_supervised_mse_with_physics"
+
+
 def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
     root = dict(payload)
     if "ginn_v2" not in root:
@@ -269,6 +303,7 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         raise ValueError("ginn_v2.stages must be a non-empty list.")
     stages: list[dict[str, Any]] = []
     stage_ids: list[str] = []
+    stage_has_supervised_ancestor: dict[str, bool] = {}
     for stage_index, value in enumerate(stages_value):
         stage = _mapping(value, f"stages[{stage_index}]")
         _reject_extra(stage, {"stage_id", "epochs", "steps_per_epoch", "optimizer", "loss_blocks", "validation", "initialize_from"}, f"stages[{stage_index}]")
@@ -300,11 +335,6 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
                 raise ValueError(f"Loss block ID must be valid and unique in its stage: {block_id!r}")
             if kind not in LOSS_SOURCE_KINDS or source_id not in sources:
                 raise ValueError(f"Invalid loss block kind/source: {kind!r}/{source_id!r}")
-            if kind == "physics":
-                raise ValueError(
-                    "GINN-v2 physics loss blocks are deferred to HANDOFF stage 9; "
-                    "use a supervised loss block in the current stages."
-                )
             _reject_extra(block, LOSS_KEYS[kind], f"stages[{stage_index}].loss_blocks[{block_index}]")
             if sources[source_id]["kind"] not in LOSS_SOURCE_KINDS[kind]:
                 raise ValueError(f"Loss block {block_id} cannot consume source kind {sources[source_id]['kind']}.")
@@ -359,6 +389,23 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
                 )
             block_ids.add(block_id)
             blocks.append(block)
+        stage_has_physics = any(block["kind"] == "physics" for block in blocks)
+        stage_has_current_supervised = any(
+            block["kind"] in {"synthetic_supervised", "real_well_supervised"}
+            for block in blocks
+        )
+        if stage_has_physics:
+            if initialize == "zero":
+                raise ValueError(
+                    f"Stage {stage_id} contains physics but initialize_from=zero; "
+                    "physics must start from an earlier supervised checkpoint."
+                )
+            parent_stage = initialize.rsplit(".", 1)[0]
+            if not stage_has_supervised_ancestor.get(parent_stage, False):
+                raise ValueError(
+                    f"Stage {stage_id} contains physics but its checkpoint lineage has no "
+                    "completed synthetic_supervised or real_well_supervised stage."
+                )
         if not any(block["update_interval"] == 1 and block["weight"] > 0 for block in blocks):
             raise ValueError(f"Stage {stage_id} requires a positive-weight loss block with update_interval=1.")
         validation = _mapping(stage.get("validation"), f"stages[{stage_index}].validation")
@@ -386,6 +433,32 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
             "optimizer": optimizer, "loss_blocks": blocks, "validation": validation,
             "initialize_from": initialize,
         })
+        stage["physics_closures"] = []
+        for block in blocks:
+            if str(block["kind"]) != "physics":
+                continue
+            source_config = sources[str(block["source"])]
+            source_kind = str(source_config["kind"])
+            stage["physics_closures"].append({
+                "block_id": str(block["block_id"]),
+                "source": str(block["source"]),
+                "source_kind": source_kind,
+                "closure": (
+                    "canonical_closure"
+                    if source_kind == "synthoseis_lite"
+                    else "deployment_closure"
+                ),
+            })
+        parent_stage = initialize.rsplit(".", 1)[0] if initialize != "zero" else ""
+        stage_has_supervised_ancestor[stage_id] = bool(
+            stage_has_current_supervised
+            or stage_has_supervised_ancestor.get(parent_stage, False)
+        )
+        eligible, reason = _stage_deployment_eligibility(
+            stage, development_limited=development_limited
+        )
+        stage["deployment_eligible"] = bool(eligible)
+        stage["deployment_eligibility_reason"] = reason
         stages.append(stage)
         stage_ids.append(stage_id)
 
@@ -397,6 +470,16 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         if len(parts) != 2 or parts[0] not in stage_ids or parts[1] not in {"best", "final"}:
             raise ValueError("deployment_checkpoint must reference a stage best/final.")
         deployment_stage, deployment_kind = parts
+    selected_stage = next(stage for stage in stages if stage["stage_id"] == deployment_stage)
+    # Development-limited runs intentionally may select a diagnostic checkpoint;
+    # the manifest and checkpoint carry deployment_eligible=false and R0 rejects
+    # them.  Standard runs must select a stage whose selection contract is safe
+    # for deployment.
+    if not bool(selected_stage.get("deployment_eligible", False)) and not development_limited:
+        raise ValueError(
+            f"deployment_checkpoint={deployment!r} is not deployment eligible: "
+            f"{selected_stage.get('deployment_eligibility_reason', 'unknown')}"
+        )
     return ExperimentConfig(
         experiment_id=experiment_id,
         seed=int(cfg.get("seed", 20260617)),

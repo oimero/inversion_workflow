@@ -396,14 +396,19 @@ def _prepare_synthetic_indices(
                     int(row["lateral_start"]):int(row["lateral_stop"]),
                     int(row["twt_start"]):int(row["twt_stop"]),
                 ]
-                if not np.all(np.isfinite(lfm_context)):
-                    counts.append(0)
-                else:
-                    physics_target = np.asarray(sample.seismic_model_consistent, dtype=np.float64)[
-                        int(row["lateral_start"]):int(row["lateral_stop"]),
-                        int(row["twt_start"]):int(row["twt_stop"]),
-                    ]
-                    counts.append(int(np.count_nonzero(np.isfinite(physics_target) & np.isfinite(lfm_context))))
+                valid_context = np.asarray(sample.valid_mask, dtype=bool)[
+                    int(row["lateral_start"]):int(row["lateral_stop"]),
+                    int(row["twt_start"]):int(row["twt_stop"]),
+                ]
+                physics_target = np.asarray(sample.seismic_model_consistent, dtype=np.float64)[
+                    int(row["lateral_start"]):int(row["lateral_stop"]),
+                    int(row["twt_start"]):int(row["twt_stop"]),
+                ]
+                counts.append(int(np.count_nonzero(
+                    valid_context
+                    & np.isfinite(physics_target)
+                    & np.isfinite(lfm_context)
+                )))
                 if logger is not None and (
                     row_number == 1
                     or row_number % progress_interval == 0
@@ -678,7 +683,11 @@ def _block_loss(
         raise ValueError(f"Unsupported prepared loss block: {kind}")
     forward_lfm = batch["forward_lfm"].to(device)
     physics_valid = batch["valid_mask"].to(device)
-    pred_log_ai = forward_lfm + prediction
+    if str(cfg.get("source_kind")) == "synthoseis_lite":
+        physics_background = batch["canonical_background_log_ai"].to(device)
+    else:
+        physics_background = forward_lfm
+    pred_log_ai = physics_background + prediction
     wavelet_time, wavelet_amp, relation = prepared.wavelet
     if prepared.sample_axis_contract is None:
         raise ValueError(f"Loss block {cfg['block_id']} lacks a sample-axis contract.")
@@ -746,6 +755,10 @@ def _checkpoint_payload(
     increment_contract: Mapping[str, Any],
     training_sources: Mapping[str, Any],
     stage_lineage: list[Mapping[str, Any]],
+    stage_deployment_eligible: bool,
+    stage_deployment_eligibility_reason: str,
+    physics_closures: list[Mapping[str, Any]],
+    stage_loss_blocks: list[Mapping[str, Any]],
     forward_model_inputs_path: str = "",
 ) -> dict[str, Any]:
     payload = {
@@ -766,7 +779,20 @@ def _checkpoint_payload(
         "stage_lineage": [dict(value) for value in stage_lineage],
         "run_mode": config.run_mode,
         "development_limited": config.development_limited,
-        "deployment_eligible": not config.development_limited,
+        "deployment_eligible": bool(stage_deployment_eligible),
+        "deployment_eligibility_reason": str(stage_deployment_eligibility_reason),
+        "stage_deployment_eligible": bool(stage_deployment_eligible),
+        "stage_deployment_eligibility_reason": str(stage_deployment_eligibility_reason),
+        "physics_closures": [dict(item) for item in physics_closures],
+        "stage_loss_blocks": [
+            {
+                "block_id": str(value.get("block_id") or ""),
+                "kind": str(value.get("kind") or ""),
+                "source": str(value.get("source") or ""),
+            }
+            for value in stage_loss_blocks
+        ],
+        "stage_selection_metric": metric_name,
         "sample_axis_contract": dict(sample_axis),
         "patch_deployment_contract": config.patching.as_dict() | {
             "axis_end_rule": "append_axis_length_minus_window",
@@ -840,19 +866,73 @@ def _evaluate(
     }
 
 
+def _collect_validation_increment_predictions(
+    *, prepared: PreparedBlock, model: torch.nn.Module, device: torch.device,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Capture a deterministic validation prediction reference for physics drift QC."""
+    if prepared.validation_dataset is None:
+        return []
+    was_training = model.training
+    model.eval()
+    result: list[tuple[np.ndarray, np.ndarray]] = []
+    loader = DataLoader(
+        prepared.validation_dataset,
+        batch_size=int(prepared.config["batch_size"]),
+        shuffle=False,
+    )
+    with torch.no_grad():
+        for batch in loader:
+            prediction = model(batch["input"].to(device)).detach().cpu().numpy()
+            mask = batch["valid_mask"].detach().cpu().numpy() > 0.5
+            result.append((prediction, mask))
+    if was_training:
+        model.train()
+    return result
+
+
+def _validation_increment_drift_mse(
+    *, prepared: PreparedBlock, model: torch.nn.Module, device: torch.device,
+    reference: list[tuple[np.ndarray, np.ndarray]],
+) -> float:
+    """Measure prediction drift from the checkpoint entering a physics stage."""
+    if prepared.validation_dataset is None or not reference:
+        return float("nan")
+    was_training = model.training
+    model.eval()
+    numerator = 0.0
+    denominator = 0
+    ref_index = 0
+    loader = DataLoader(
+        prepared.validation_dataset,
+        batch_size=int(prepared.config["batch_size"]),
+        shuffle=False,
+    )
+    with torch.no_grad():
+        for batch in loader:
+            prediction = model(batch["input"].to(device)).detach().cpu().numpy()
+            mask = batch["valid_mask"].detach().cpu().numpy() > 0.5
+            if ref_index >= len(reference):
+                raise AssertionError("Physics drift reference and validation batches differ.")
+            reference_prediction, reference_mask = reference[ref_index]
+            if prediction.shape != reference_prediction.shape or not np.array_equal(mask, reference_mask):
+                raise AssertionError("Physics drift reference and validation batch shapes differ.")
+            finite = mask & np.isfinite(prediction) & np.isfinite(reference_prediction)
+            if np.any(finite):
+                difference = prediction[finite] - reference_prediction[finite]
+                numerator += float(np.sum(difference * difference, dtype=np.float64))
+                denominator += int(np.count_nonzero(finite))
+            ref_index += 1
+    if was_training:
+        model.train()
+    if ref_index != len(reference):
+        raise AssertionError("Physics drift reference contains unused validation batches.")
+    return float(numerator / denominator) if denominator else float("nan")
+
+
 def run_experiment(
     *, config: ExperimentConfig, root: Path, output_dir: Path, logger: logging.Logger,
 ) -> dict[str, Any]:
     """Run a strict canonical-increment experiment."""
-    if any(
-        str(block.get("kind") or "") == "physics"
-        for stage in config.stages
-        for block in stage.get("loss_blocks", [])
-    ):
-        raise ValueError(
-            "GINN-v2 physics loss blocks are deferred to HANDOFF stage 9; "
-            "the current runner accepts supervised blocks only."
-        )
     output_dir.mkdir(parents=True, exist_ok=True)
     if (output_dir / "experiment_manifest.json").exists() or (output_dir / "stages").exists():
         raise FileExistsError(f"GINN-v2 experiment outputs already exist: {output_dir}")
@@ -1188,13 +1268,46 @@ def run_experiment(
                 "stage_id": str(item["stage_id"]),
                 "initialize_from": str(item.get("initialize_from") or ""),
                 "checkpoints": dict(item.get("checkpoints") or {}),
+                "loss_blocks": [
+                    {
+                        "block_id": str(block.get("block_id") or ""),
+                        "kind": str(block.get("kind") or ""),
+                        "source": str(block.get("source") or ""),
+                    }
+                    for block in list(item.get("loss_blocks") or [])
+                ],
+                "deployment_eligible": bool(item.get("deployment_eligible", False)),
+                "deployment_eligibility_reason": str(
+                    item.get("deployment_eligibility_reason") or ""
+                ),
             }
             for item in manifest_stages
         ]
         stage_lineage.append({
             "stage_id": stage_id,
             "initialize_from": initialize,
+            "loss_blocks": [
+                {
+                    "block_id": str(block.get("block_id") or ""),
+                    "kind": str(block.get("kind") or ""),
+                    "source": str(block.get("source") or ""),
+                }
+                for block in list(stage.get("loss_blocks") or [])
+            ],
+            "deployment_eligible": bool(stage.get("deployment_eligible", False)),
+            "deployment_eligibility_reason": str(
+                stage.get("deployment_eligibility_reason") or ""
+            ),
         })
+        physics_reference_predictions = {
+            str(prepared.config["block_id"]): _collect_validation_increment_predictions(
+                prepared=prepared, model=model, device=device
+            )
+            for prepared in prepared_blocks
+            if str(prepared.config.get("kind") or "") == "physics"
+        }
+        physics_drift_after = float("nan")
+        physics_drift_blocks: dict[str, float] = {}
         best_value = float("inf")
         best_epoch = 0
         history: list[dict[str, Any]] = []
@@ -1313,6 +1426,26 @@ def run_experiment(
                 validation_values,
                 time.perf_counter() - validation_started,
             )
+            if physics_reference_predictions:
+                physics_drift_blocks = {
+                    block_id: _validation_increment_drift_mse(
+                        prepared=prepared,
+                        model=model,
+                        device=device,
+                        reference=physics_reference_predictions[block_id],
+                    )
+                    for block_id, prepared in (
+                        (str(prepared.config["block_id"]), prepared)
+                        for prepared in prepared_blocks
+                        if str(prepared.config.get("kind") or "") == "physics"
+                    )
+                }
+                finite_drifts = [
+                    value for value in physics_drift_blocks.values() if np.isfinite(value)
+                ]
+                physics_drift_after = (
+                    float(np.mean(finite_drifts)) if finite_drifts else float("nan")
+                )
             selected = float(validation_values[metric_name])
             if not np.isfinite(selected):
                 raise FloatingPointError(
@@ -1334,6 +1467,11 @@ def run_experiment(
                 **training_values,
                 **validation_values,
             }
+            if physics_reference_predictions:
+                row["physics_increment_drift_before_mse"] = 0.0
+                row["physics_increment_drift_after_mse"] = physics_drift_after
+                for block_id, value in physics_drift_blocks.items():
+                    row[f"{block_id}.increment_drift_after_mse"] = float(value)
             for block_id, kind_counts in sampled_kind_counts.items():
                 for sample_kind in ("base", "seismic_variant"):
                     row[f"{block_id}.sampled_{sample_kind}_count"] = int(kind_counts.get(sample_kind, 0))
@@ -1358,7 +1496,7 @@ def run_experiment(
             if selected < best_value:
                 best_value, best_epoch = selected, epoch
                 path = stage_dir / "checkpoint_best.pt"
-                torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="best", epoch=epoch, metric_name=metric_name, metric_value=selected, sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, forward_model_inputs_path=forward_model_inputs_path), path)
+                torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="best", epoch=epoch, metric_name=metric_name, metric_value=selected, sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, stage_deployment_eligible=bool(stage.get("deployment_eligible", False)), stage_deployment_eligibility_reason=str(stage.get("deployment_eligibility_reason") or ""), physics_closures=list(stage.get("physics_closures") or []), stage_loss_blocks=list(stage.get("loss_blocks") or []), forward_model_inputs_path=forward_model_inputs_path), path)
                 checkpoints[(stage_id, "best")] = path
                 logger.info(
                     "checkpoint_best stage_id=%s epoch=%d metric=%s value=%.6g path=%s",
@@ -1369,7 +1507,7 @@ def run_experiment(
                     path,
                 )
         final_path = stage_dir / "checkpoint_final.pt"
-        torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="final", epoch=int(stage["epochs"]), metric_name=metric_name, metric_value=float(history[-1]["selection_metric_value"]), sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, forward_model_inputs_path=forward_model_inputs_path), final_path)
+        torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="final", epoch=int(stage["epochs"]), metric_name=metric_name, metric_value=float(history[-1]["selection_metric_value"]), sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, stage_deployment_eligible=bool(stage.get("deployment_eligible", False)), stage_deployment_eligibility_reason=str(stage.get("deployment_eligibility_reason") or ""), physics_closures=list(stage.get("physics_closures") or []), stage_loss_blocks=list(stage.get("loss_blocks") or []), forward_model_inputs_path=forward_model_inputs_path), final_path)
         checkpoints[(stage_id, "final")] = final_path
         pd.DataFrame(history).to_csv(stage_dir / "training_history.csv", index=False)
         logger.info(
@@ -1384,8 +1522,22 @@ def run_experiment(
             **stage, "best_epoch": best_epoch, "best_selection_metric_value": best_value,
             "checkpoints": {kind: repo_relative_path(checkpoints[(stage_id, kind)], root=root) for kind in ("best", "final")},
             "training_history": repo_relative_path(stage_dir / "training_history.csv", root=root),
+            "physics_diagnostics": {
+                "selection_metric": metric_name,
+                "increment_drift_before_mse": 0.0,
+                "increment_drift_after_mse": physics_drift_after,
+                "increment_drift_by_block": dict(physics_drift_blocks),
+            } if physics_reference_predictions else {},
         })
     deployment_path = checkpoints[(config.deployment_stage_id, config.deployment_checkpoint_kind)]
+    deployment_stage_record = next(
+        stage for stage in manifest_stages
+        if str(stage.get("stage_id") or "") == config.deployment_stage_id
+    )
+    deployment_eligible = bool(deployment_stage_record.get("deployment_eligible", False))
+    deployment_eligibility_reason = str(
+        deployment_stage_record.get("deployment_eligibility_reason") or ""
+    )
     deployment_stage_dir = output_dir / "stages" / config.deployment_stage_id
     deployment_indices = sorted(deployment_stage_dir.glob("*_patch_index.csv"))
     first_synthetic = next(iter(synthetic.values()), None)
@@ -1396,7 +1548,8 @@ def run_experiment(
         "run_mode": config.run_mode,
         "development_limited": config.development_limited,
         "validation_semantics": config.validation_semantics,
-        "deployment_eligible": not config.development_limited,
+        "deployment_eligible": deployment_eligible,
+        "deployment_eligibility_reason": deployment_eligibility_reason,
         "architecture": config.architecture.as_dict(),
         "model_info": info.__dict__,
         "normalization_reference": {"source": config.normalization_reference},
@@ -1416,7 +1569,8 @@ def run_experiment(
             "stage_id": config.deployment_stage_id,
             "kind": config.deployment_checkpoint_kind,
             "path": repo_relative_path(deployment_path, root=root),
-            "eligible": not config.development_limited,
+            "eligible": deployment_eligible,
+            "reason": deployment_eligibility_reason,
         },
         "device": device_metadata,
     }

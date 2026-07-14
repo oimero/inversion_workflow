@@ -283,7 +283,7 @@ synthetic[l] = Σ_j wavelet(twt[l] - event_twt[j]) * r[j]
 | `figures/well_ai_band_comparison.png` | 逐频带井曲线匹配中位数 RMSE |
 | `figures/wells/well_forward_qc_<well>_<experiment_id>.png` | 单井六面板波形 QC 图（波阻抗、反射系数、合成、观测、互相关、动态互相关） |
 
-井 QC 图只为 `filtered_las` 和各模型生成；`lfm_input` 仍保留在 CSV 指标中作为数值基线，但不生成独立井 QC 图。
+井 QC 图只为 `filtered_las` 和各模型生成；`lfm_only` 仍保留在 CSV 指标中作为数值基线，但不生成独立井 QC 图。
 
 ---
 

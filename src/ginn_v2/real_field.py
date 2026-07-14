@@ -689,24 +689,20 @@ def run_zero_shot_model(
     _require_complete_valid_coverage(weight, section.valid_mask, ilines=section.ilines, xlines=section.xlines, samples=section.sample_axis.values)
     if np.any(~np.isfinite(stitched[section.valid_mask])):
         raise FloatingPointError("R0 produced non-finite predictions at valid samples.")
-    pred_delta_vs_lfm = stitched - section.lfm
+    predicted_increment_log_ai = stitched - section.lfm
     model_dir = output_dir / experiment_id
     model_dir.mkdir(parents=True, exist_ok=False)
     npz_path = model_dir / "predictions.npz"
     np.savez_compressed(
         npz_path,
         predicted_log_ai=stitched.astype(np.float32),
-        predicted_increment_log_ai=pred_delta_vs_lfm.astype(np.float32),
+        predicted_increment_log_ai=predicted_increment_log_ai.astype(np.float32),
         input_lfm_log_ai=section.lfm.astype(np.float32),
         valid_mask=section.valid_mask.astype(bool),
-        stitched_pred_log_ai=stitched.astype(np.float32),
-        pred_delta_vs_lfm=pred_delta_vs_lfm.astype(np.float32),
         stitching_weight=weight.astype(np.float32),
         prediction_support_count=weight.astype(np.uint16),
         max_context_valid_fraction=max_context,
-        lfm_input=section.lfm.astype(np.float32),
         seismic_input=section.seismic.astype(np.float32),
-        valid_mask_model=section.valid_mask.astype(bool),
         ilines=section.ilines,
         xlines=section.xlines,
         samples=section.sample_axis.values,
@@ -731,6 +727,12 @@ def run_zero_shot_model(
         "experiment_id": experiment_id,
         "architecture_id": architecture_id,
         "output_semantics": "predicted_log_ai = input_lfm_log_ai + predicted_increment_log_ai",
+        "closure_contract": {
+            "kind": "deployment_closure",
+            "background_field": "input_lfm_log_ai",
+            "increment_field": "predicted_increment_log_ai",
+            "output_field": "predicted_log_ai",
+        },
         "model_run_dir": repo_relative_path(model_run_dir, root=root),
         "checkpoint": repo_relative_path(checkpoint_path, root=root),
         "normalization_file": (
@@ -877,24 +879,20 @@ def run_zero_shot_volume_model(
     _require_complete_valid_coverage(weight, volume.valid_mask, ilines=volume.ilines, xlines=volume.xlines, samples=volume.sample_axis.values)
     if np.any(~np.isfinite(stitched[volume.valid_mask])):
         raise FloatingPointError("R0 produced non-finite predictions at valid samples.")
-    pred_delta_vs_lfm = stitched - volume.lfm
+    predicted_increment_log_ai = stitched - volume.lfm
     model_dir = output_dir / experiment_id
     model_dir.mkdir(parents=True, exist_ok=False)
     npz_path = model_dir / "predictions.npz"
     np.savez_compressed(
         npz_path,
         predicted_log_ai=stitched.astype(np.float32),
-        predicted_increment_log_ai=pred_delta_vs_lfm.astype(np.float32),
+        predicted_increment_log_ai=predicted_increment_log_ai.astype(np.float32),
         input_lfm_log_ai=volume.lfm.astype(np.float32),
         valid_mask=volume.valid_mask.astype(bool),
-        stitched_pred_log_ai=stitched.astype(np.float32),
-        pred_delta_vs_lfm=pred_delta_vs_lfm.astype(np.float32),
         stitching_weight=weight.astype(np.float32),
         prediction_support_count=weight.astype(np.uint16),
         max_context_valid_fraction=max_context,
-        lfm_input=volume.lfm.astype(np.float32),
         seismic_input=volume.seismic.astype(np.float32),
-        valid_mask_model=volume.valid_mask.astype(bool),
         ilines=volume.ilines,
         xlines=volume.xlines,
         samples=volume.sample_axis.values,
@@ -920,6 +918,12 @@ def run_zero_shot_volume_model(
         "experiment_id": experiment_id,
         "architecture_id": architecture_id,
         "output_semantics": "predicted_log_ai = input_lfm_log_ai + predicted_increment_log_ai",
+        "closure_contract": {
+            "kind": "deployment_closure",
+            "background_field": "input_lfm_log_ai",
+            "increment_field": "predicted_increment_log_ai",
+            "output_field": "predicted_log_ai",
+        },
         "model_run_dir": repo_relative_path(model_run_dir, root=root),
         "checkpoint": repo_relative_path(checkpoint_path, root=root),
         "normalization_file": (
@@ -1181,6 +1185,39 @@ def load_zero_shot_predictions(run_dir: Path) -> dict[str, dict[str, Any]]:
         if summary_path.is_file():
             with summary_path.open("r", encoding="utf-8") as handle:
                 summary = json.load(handle)
+        if str(summary.get("schema_version") or "") != ZERO_SHOT_MODEL_SCHEMA_VERSION:
+            raise ValueError(
+                f"Unsupported R0 model summary schema in {summary_path}; "
+                f"expected {ZERO_SHOT_MODEL_SCHEMA_VERSION}."
+            )
+        required = {
+            "predicted_log_ai",
+            "predicted_increment_log_ai",
+            "input_lfm_log_ai",
+            "valid_mask",
+            "stitching_weight",
+            "prediction_support_count",
+            "max_context_valid_fraction",
+            "seismic_input",
+            "ilines",
+            "xlines",
+            "samples",
+            "sample_domain",
+            "sample_unit",
+            "depth_basis",
+        }
+        missing = sorted(required - set(arrays.files))
+        if missing:
+            raise ValueError(f"R0 prediction artifact {npz_path} lacks canonical fields: {missing}")
+        forbidden = sorted(
+            set(arrays.files).intersection(
+                {"stitched_pred_log_ai", "pred_delta_vs_lfm", "lfm_input", "valid_mask_model"}
+            )
+        )
+        if forbidden:
+            raise ValueError(
+                f"R0 prediction artifact {npz_path} contains retired fields: {forbidden}"
+            )
         role = str(summary.get("experiment_id") or child.name)
         out[role] = {"dir": child, "arrays": arrays, "summary": summary}
     if not out:
@@ -1749,21 +1786,19 @@ def paired_lfm_counterfactual_metrics(
     describe the same seismic/axis support; this helper does not resample or
     silently intersect different geometries.
     """
-    def _pick(payload: Mapping[str, np.ndarray], primary: str, legacy: str = "") -> np.ndarray:
-        if primary in payload:
-            return np.asarray(payload[primary], dtype=np.float64)
-        if legacy and legacy in payload:
-            return np.asarray(payload[legacy], dtype=np.float64)
-        raise ValueError(f"Paired R0 payload lacks {primary!r}.")
+    def _pick(payload: Mapping[str, np.ndarray], key: str) -> np.ndarray:
+        if key not in payload:
+            raise ValueError(f"Paired R0 payload lacks canonical field {key!r}.")
+        return np.asarray(payload[key], dtype=np.float64)
 
-    left_lfm = _pick(left, "input_lfm_log_ai", "lfm_input")
-    right_lfm = _pick(right, "input_lfm_log_ai", "lfm_input")
-    left_increment = _pick(left, "predicted_increment_log_ai", "pred_delta_vs_lfm")
-    right_increment = _pick(right, "predicted_increment_log_ai", "pred_delta_vs_lfm")
-    left_prediction = _pick(left, "predicted_log_ai", "stitched_pred_log_ai")
-    right_prediction = _pick(right, "predicted_log_ai", "stitched_pred_log_ai")
-    left_mask = _pick(left, "valid_mask", "valid_mask_model").astype(bool)
-    right_mask = _pick(right, "valid_mask", "valid_mask_model").astype(bool)
+    left_lfm = _pick(left, "input_lfm_log_ai")
+    right_lfm = _pick(right, "input_lfm_log_ai")
+    left_increment = _pick(left, "predicted_increment_log_ai")
+    right_increment = _pick(right, "predicted_increment_log_ai")
+    left_prediction = _pick(left, "predicted_log_ai")
+    right_prediction = _pick(right, "predicted_log_ai")
+    left_mask = _pick(left, "valid_mask").astype(bool)
+    right_mask = _pick(right, "valid_mask").astype(bool)
     if left_lfm.shape != right_lfm.shape or left_increment.shape != right_increment.shape:
         raise ValueError("Paired LFM payloads must have identical array shapes.")
     if left_prediction.shape != left_lfm.shape or left_mask.shape != left_lfm.shape:

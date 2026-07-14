@@ -75,15 +75,15 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - R0/R1 同时报告 increment、canonical closure、deployment closure、LFM-only 与最终 AI 指标；
 - 20260706 full-correction benchmark、旧 checkpoint 和历史报告作为冻结基线记录。
 
-### 3.2 本轮尚未实施
+### 3.2 当前仍未实施
 
 - 微纹理 bank、三种 emitter 和 paired-group 生成器；
-- GINN v2 v2/v5 schema、increment batch/loss/checkpoint；
-- 真实井 canonical increment reader；
-- canonical/deployment closure、R0/R1 新字段和反事实报告；
-- 旧生产实现的清理提交。
+- 阶段 9 的真实工区 physics 与 R1 source smoke；
+- 旧生产实现清理提交的最终删除清单。
 
-这些事项是后续 goal 的工作内容，不在本 HANDOFF 中假定已经完成。阶段 1 和阶段 2 已落地在 `cup.impedance`、Synthoseis-lite v4 writer/reader、LFM variant writer 和生成 manifest 中。微纹理规格中的阶段 3/4 不作为阶段 2.5 的直接后继；先完成 v4 主链和 GINN v2 核心链路，再完成延期的 physics 阶段，随后才进入本 HANDOFF 的阶段 10–12。
+canonical increment 的 GINN v2 v2/v5 schema、物化井增量、canonical/deployment
+closure 字段、R0/R1 新 schema 和 physics 训练门禁已经落到正式路径；阶段 9 的
+synthetic physics fixture 已通过。阶段 10–12 仍等待真实工区 physics/R1 验收后再开启。
 
 ### 3.3 阶段 2.5 对称性收口与单一 mask（本轮）
 
@@ -111,33 +111,73 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - 高分辨率 forward support 只作为生成 QC，reader、训练协议和 loss 只消费 `valid_mask`；
   physics halo/central-crop 仍留在后续 GINN 训练阶段。
 
-阶段 2.5 本身不改微纹理、physics、R0/R1，也不迁移旧 v4 产物；当前阶段 8 收口只涉及
-GINN v2 synthetic-supervised 读取、评估和 parser 边界，见 3.4。
+阶段 2.5 本身不改微纹理，也不迁移旧 v4 产物；physics、R0/R1 和部署资格由阶段 9
+在同一 canonical 合同上继续实现，见 3.5。
 
 阶段调整：原计划中的“阶段 3：微纹理 bank 与 emitter”和“阶段 4：paired A/B/C benchmark”分别延期为本 HANDOFF 的阶段 10 和阶段 11；A/B/C GINN 消融为阶段 12。physics 训练、真实 physics 适配、部署资格和 R1 正演闭环统一延期为阶段 9，作为进入微纹理前的最后一个大阶段。当前正在运行的完整 v4 工区生成属于阶段 3 的主链稳定化门禁；在 v4、GINN v2 核心链路、R0 以及阶段 9 的 physics 门禁完成前，不引入微纹理变量，以免把生成合同、物理适配和模型消融问题混在一起。
 
-### 3.4 阶段 8 检阅收口（当前增量）
+### 3.4 阶段 8 主链收口（当前基础）
 
-本轮只收紧当前可部署的 synthetic-supervised 主链，不提前实现阶段 9：
+当前主链保持以下边界：
 
-- 新配置解析器和实验 runner 对 `physics` loss block 直接失败，并明确提示阶段 9；
-  手工构造的配置也在 runner 入口再次拒绝，避免绕过 parser；
+- synthetic-supervised 是最小部署垂直切片；physics 由阶段 9 的显式祖先和部署资格
+  校验接入，不能绕过 parser 或 runner；
 - `PatchDataset` 和 canonical reader 直接要求物化的
   `canonical_background_log_ai`，缺字段即失败，不从 `target - increment` 静默重建；
 - 真实井 QC 图使用已生成的 `well_target_increment_log_ai`，不再用 `well_log_ai - lfm_log_ai`
   代替监督增量；
 - `lfm_ideal` 只作为评估基线按需从预测产物或 benchmark 加载，不进入训练 batch、网络输入或
   checkpoint 训练状态；
-- 阶段 9 的真实工区变换 provenance、physics 数据路径和 R0/R1 历史别名仍按下方
-  allowlist 保留，当前不把它们伪装成已经完成的功能。
+- R0/R1 只消费 canonical 增量字段；旧 prediction alias 不写入新产物，冻结旧结果
+  仍按 schema 拒绝。
 
 这些收口不改变 `ginn_v2_prediction_v3` 的公共预测语义；没有 `lfm_ideal` 时，评估报告仍输出
 空的基线表和 `n_ok=0` 摘要，表示该诊断未计算，而不是把它混入训练数据。
 
-本轮验证：45 个 canonical/v4/GINN ignored tests 通过，`compileall -q src/cup src/ginn_v2
-scripts/ginn_v2.py` 通过；使用既有 6-patch prediction smoke 重新执行 report，产出
-`scripts/output/ginn_v2_report_20260714_184124_507557`，`lfm_ideal` 仍能从 benchmark
-按需评估。
+阶段 8 基线验证：45 个 canonical/v4/GINN ignored tests 通过，`compileall -q src/cup
+src/ginn_v2 scripts/ginn_v2.py` 通过；使用既有 6-patch prediction smoke 重新执行
+report，产出 `scripts/output/ginn_v2_report_20260714_184124_507557`，`lfm_ideal` 仍能
+从 benchmark 按需评估。
+
+### 3.5 阶段 9 代码落地（当前增量）
+
+- parser 允许 `physics` block，但要求其初始化引用已有的
+  `synthetic_supervised` 或 `real_well_supervised` 祖先；physics-first、zero-init 和
+  无监督 lineage 明确失败；
+- synthetic physics 使用 `canonical_background_log_ai + predicted_increment_log_ai`
+  的 canonical closure，真实工区 physics 使用 `input_lfm_log_ai +
+  predicted_increment_log_ai` 的 deployment closure；`increment_l2_weight` 是唯一增量
+  正则字段；
+- stage/checkpoint manifest 写入 closure、loss block、祖先 lineage 和
+  `deployment_eligible`；waveform-best physics 以及 real-well-plus-physics 默认标记为
+  diagnostic/experimental，只有 dense synthetic MSE 选择的联合阶段可自动部署；
+- physics validation history 写入 stage 前后 increment drift；R0 产物统一写
+  `predicted_log_ai`、`predicted_increment_log_ai`、`input_lfm_log_ai` 和
+  `valid_mask`，旧字段不再写入；
+- R0/R1 schema 升级为 `real_field_zero_shot_model_v5`、
+  `real_field_zero_shot_summary_v5` 和 `real_field_forward_diagnostic_summary_v6`；
+  R1 明确报告 LFM-only、deployment closure、waveform error 和 experiment ID。
+
+阶段 9 synthetic physics smoke：
+`scripts/output/stage9_physics_smoke_cpu_20260714`，两阶段（监督祖先 →
+canonical physics diagnostic）各 1 epoch/1 step，forward/backward 有限；manifest
+记录 physics drift，physics checkpoint 的 `deployment_eligible=false`，R0 资格门禁
+符合预期。当前尚未用真实工区 source 跑 R1 full smoke，因此该项仍作为阶段 9 的收尾
+验收，不把 synthetic fixture 结果冒充真实工区闭环。
+
+本轮本地验证：
+
+```text
+PYTHONPATH=src python -m pytest -q -p no:cacheprovider \
+  tests/test_ginn_v2_canonical_increment.py \
+  tests/test_canonical_increment.py \
+  tests/test_synthoseis_stage_2_5.py \
+  tests/test_synthoseis_v4_canonical.py
+结果：50 passed
+python -m compileall -q src/cup src/ginn_v2 scripts/ginn_v2.py \
+  scripts/real_field_zero_shot.py scripts/real_field_forward_diagnostic.py
+结果：通过
+```
 
 ## 4. 推荐实施顺序与完成条件
 
@@ -303,15 +343,18 @@ v4/GINN 测试通过、compileall 通过、canonical summarize smoke 产出
 
 ### 阶段 9（延期至微纹理前）：synthetic/real physics、R1 与部署资格
 
-- [ ] physics 使用 canonical background 或明确的 deployment LFM 组合；
-- [ ] `increment_l2_weight` 作为唯一增量正则字段；
-- [ ] physics 阶段必须从已完成的 synthetic/real-well supervised checkpoint 初始化；
-- [ ] waveform-best physics checkpoint 仅作为诊断；
-- [ ] real-well-plus-physics 默认保留 experimental 标记；
-- [ ] 真实工区 physics 记录前后 increment 漂移、LFM-only 指标、井间 QC 和 selection metric；
-- [ ] R1 使用明确的 canonical/deployment closure 字段。
+- [x] physics 使用 canonical background 或明确的 deployment LFM 组合；
+- [x] `increment_l2_weight` 作为唯一增量正则字段；
+- [x] physics 阶段必须从已完成的 synthetic/real-well supervised checkpoint 初始化；
+- [x] waveform-best physics checkpoint 仅作为诊断；
+- [x] real-well-plus-physics 默认保留 experimental 标记；
+- [x] physics stage history 记录前后 increment drift 和 selection metric；
+- [x] R0/R1 使用明确的 LFM-only、canonical/deployment closure 字段与 experiment ID；
+- [ ] 真实工区 physics 与 R1 source smoke 在最终 source 上复跑并冻结报告。
 
-完成条件：synthetic/real physics 前向、反向和有限梯度通过；非法 physics-first、zero-initialized physics 和不具备部署资格的 checkpoint 明确失败；R1 闭环可复算。只有本阶段完成后才进入微纹理。
+完成条件：synthetic physics 前向、反向和有限梯度、非法初始化和部署资格门禁已通过；
+R0/R1 新 schema 和 canonical 字段已实现。真实工区 physics/R1 smoke 仍是本阶段最后的
+验收项；完成后才进入微纹理。
 
 ### 阶段 10（延期）：微纹理 bank 与领域无关 emitter
 
@@ -363,18 +406,18 @@ v4/GINN 测试通过、compileall 通过、canonical summarize smoke 产出
 
 ### GINN v2 与部署
 
-- [ ] 四类架构均使用三通道输入和单一 increment 输出；
-- [ ] 零初始化严格输出 LFM；
-- [ ] synthetic/real-well supervised 的梯度有限；
-- [ ] supervised 后 physics 合法，physics-first 非法；
-- [ ] physics checkpoint 的部署资格按 dense synthetic supervised 指标控制；
-- [ ] R0 有效点全覆盖且无有效点 NaN；
-- [ ] R1、LFM-only、canonical closure 和 deployment closure 指标分开。
+- [x] 四类架构均使用三通道输入和单一 increment 输出；
+- [x] 零初始化严格输出 LFM；
+- [x] synthetic/real-well supervised 的梯度有限；
+- [x] supervised 后 physics 合法，physics-first 非法；
+- [x] physics checkpoint 的部署资格按 dense synthetic supervised 指标控制；
+- [x] R0 有效点全覆盖且无有效点 NaN；
+- [x] R1、LFM-only、canonical closure 和 deployment closure 字段分开；真实工区 smoke 待完成。
 
 ### 迁移与清理
 
-- [ ] v4 benchmark、experiment v2、checkpoint v5、prediction v3 和 R0/R1 新 schema 相互匹配；
-- [ ] 旧 schema 只触发明确失败，不进入新 reader/loader；
+- [x] v4 benchmark、experiment v2、checkpoint v5、prediction v3 和 R0/R1 新 schema 相互匹配；
+- [x] 旧 schema 只触发明确失败，不进入新 reader/loader；
 - [ ] 旧 full-correction 产物只作为冻结基线；
 - [ ] 正式生产路径中的旧字段、alias、fallback 和双语义分派按主规格清理；
 - [ ] 清理提交附带删除清单和回归 smoke 结果。
@@ -384,9 +427,9 @@ v4/GINN 测试通过、compileall 通过、canonical summarize smoke 产出
 阶段 3 的主链证据和阶段 4 的最小监督切片已经完成；20260714 生成目录中的 3 个 wedge
 acceptance warning 仍作为生成质量记录，不阻塞当前 canonical 主链。阶段 5–8 已完成
 四架构 closure、真实井 canonical increment 接线、R0 覆盖/反事实报告以及生产路径清理。
-下一步只进入阶段 9：集中接入 physics 与 R1，并在该阶段完成 R0 延期别名的最终清理；
-阶段 9 通过后才开启阶段 10–12 的微纹理与 paired A/B/C。每完成一项就在对应复选框勾选
-并记录测试命令、fixture 和产物路径。
+阶段 9 的代码门禁、synthetic physics fixture 和 R0/R1 schema 已落地；下一步是用可用的
+真实工区 source 跑 R1/physics full smoke，验收通过后再开启阶段 10–12 的微纹理与
+paired A/B/C。每完成一项就在对应复选框勾选并记录测试命令、fixture 和产物路径。
 
 ## 7. 阶段 1/2 验证证据
 

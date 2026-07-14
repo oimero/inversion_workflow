@@ -263,11 +263,11 @@ sections:
 4. 拼接固定使用均匀策略：每个有效样点取覆盖它的所有 patch 预测值的等权平均。
 5. 推理完成后强制校验：每个有效样点必须至少被一个 patch 覆盖（即拼接权重大于零），否则整次运行失败并报告缺口坐标。
 6. 输出 `predictions.npz`，包含：
-   - `stitched_pred_log_ai`：拼接后的最终预测对数波阻抗
-   - `pred_delta_vs_lfm`：预测与低频模型的差值
-   - `lfm_input`：输入的低频模型
+   - `predicted_log_ai`：拼接后的最终预测对数波阻抗
+   - `predicted_increment_log_ai`：预测增量
+   - `input_lfm_log_ai`：输入的外部 LFM
    - `seismic_input`：变换后的地震输入
-   - `valid_mask_model`：有效掩码
+   - `valid_mask`：有效掩码
    - `stitching_weight`：拼接权重
    - `prediction_support_count`：每个有效样点被多少个 patch 覆盖
    - 坐标轴（`ilines`、`xlines`、`samples`）及采样域、单位、深度基准
@@ -297,7 +297,7 @@ sections:
 |------|------|
 | `predictions.npz` | 拼接后的预测数组，包含坐标轴、掩码和支持度 |
 | `real_field_zero_shot_model_summary.json` | 该模型的推理参数、标准化参数、体积维度 |
-| `<experiment_id>_pred_ai.zgy` | 线性 AI 预测体，数值为 `exp(stitched_pred_log_ai)`；内部 NPZ 仍保持 log(AI) |
+| `<experiment_id>_pred_ai.zgy` | 线性 AI 预测体，数值为 `exp(predicted_log_ai)`；内部 NPZ 仍保持 log(AI) |
 
 ### 全局 QC 和摘要
 

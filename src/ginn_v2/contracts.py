@@ -11,9 +11,9 @@ CHECKPOINT_SCHEMA_VERSION = "ginn_v2_checkpoint_v5"
 PATCH_SMOKE_REPORT_SCHEMA_VERSION = "ginn_v2_patch_smoke_report_v1"
 ABLATION_SUMMARY_SCHEMA_VERSION = "ginn_v2_ablation_summary_v1"
 ABLATION_REPORT_CARD_SCHEMA_VERSION = "ginn_v2_ablation_report_card_v1"
-ZERO_SHOT_MODEL_SCHEMA_VERSION = "real_field_zero_shot_model_v4"
-ZERO_SHOT_SUMMARY_SCHEMA_VERSION = "real_field_zero_shot_summary_v4"
-FORWARD_DIAGNOSTIC_SCHEMA_VERSION = "real_field_forward_diagnostic_summary_v5"
+ZERO_SHOT_MODEL_SCHEMA_VERSION = "real_field_zero_shot_model_v5"
+ZERO_SHOT_SUMMARY_SCHEMA_VERSION = "real_field_zero_shot_summary_v5"
+FORWARD_DIAGNOSTIC_SCHEMA_VERSION = "real_field_forward_diagnostic_summary_v6"
 
 
 __all__ = [

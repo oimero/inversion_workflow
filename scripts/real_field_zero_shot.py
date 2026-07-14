@@ -375,9 +375,9 @@ def _write_well_prediction_qc(output_dir: Path, *, run_cfg: dict) -> dict[str, o
         fig, ax = plt.subplots(figsize=(4.5, 6.0))
         ax.plot(well_log_ai, samples, label="canonical well log(AI)", color="black", linewidth=1.5)
         for role, arrays in model_arrays.items():
-            predictions = np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float64)
+            predictions = np.asarray(arrays["predicted_log_ai"], dtype=np.float64)
             pred = predictions[trace_indices, np.arange(samples.size)]
-            prediction_mask = np.asarray(arrays["valid_mask_model"], dtype=bool)[trace_indices, np.arange(samples.size)]
+            prediction_mask = np.asarray(arrays["valid_mask"], dtype=bool)[trace_indices, np.arange(samples.size)]
             stitching = np.asarray(arrays["stitching_weight"], dtype=np.float64)[trace_indices, np.arange(samples.size)]
             valid = (
                 inside_axis
@@ -437,9 +437,9 @@ def _plot_zero_shot_qc(output_dir: Path) -> dict[str, str]:
             if str(np.asarray(arrays["sample_domain"]).item()) == "depth"
             else "TWT sample"
         )
-        lfm = arrays["lfm_input"]
-        pred = arrays["stitched_pred_log_ai"]
-        delta = arrays["pred_delta_vs_lfm"]
+        lfm = arrays["input_lfm_log_ai"]
+        pred = arrays["predicted_log_ai"]
+        delta = arrays["predicted_increment_log_ai"]
         if pred.ndim == 3:
             il_mid = pred.shape[0] // 2
             xl_mid = pred.shape[1] // 2
@@ -491,7 +491,7 @@ def _plot_zero_shot_qc(output_dir: Path) -> dict[str, str]:
             if str(np.asarray(model_arrays["lateral"]["sample_domain"]).item()) == "depth"
             else "TWT sample"
         )
-        diff = model_arrays["lateral"]["stitched_pred_log_ai"] - model_arrays["no_lateral"]["stitched_pred_log_ai"]
+        diff = model_arrays["lateral"]["predicted_log_ai"] - model_arrays["no_lateral"]["predicted_log_ai"]
         if diff.ndim == 3:
             il_mid = diff.shape[0] // 2
             xl_mid = diff.shape[1] // 2
@@ -670,8 +670,8 @@ def _write_spectral_qc(output_dir: Path, *, run_cfg: dict, dt_s: float) -> dict[
             continue
         arrays = np.load(child / "predictions.npz", allow_pickle=True)
         arrays_by_role[child.name] = arrays
-        delta = arrays["pred_delta_vs_lfm"]
-        valid = arrays["valid_mask_model"].astype(bool) & (arrays["stitching_weight"] > 0.0)
+        delta = arrays["predicted_increment_log_ai"]
+        valid = arrays["valid_mask"].astype(bool) & (arrays["stitching_weight"] > 0.0)
         full = _band_rms(delta, valid, dt_s=dt_s, low_hz=0.0, high_hz=float("inf"))
         summary_path = child / "real_field_zero_shot_model_summary.json"
         synthetic_delta_std = float("nan")
@@ -691,7 +691,7 @@ def _write_spectral_qc(output_dir: Path, *, run_cfg: dict, dt_s: float) -> dict[
             rows.append(
                 {
                     "experiment_id": child.name,
-                    "signal": "pred_delta_vs_lfm",
+                    "signal": "predicted_increment_log_ai",
                     "band": band["name"],
                     "low_hz": band["low_hz"],
                     "high_hz": band["high_hz"],
@@ -720,10 +720,10 @@ def _write_spectral_qc(output_dir: Path, *, run_cfg: dict, dt_s: float) -> dict[
     if "lateral" in arrays_by_role and "no_lateral" in arrays_by_role:
         lateral = arrays_by_role["lateral"]
         no_lateral = arrays_by_role["no_lateral"]
-        diff = lateral["stitched_pred_log_ai"] - no_lateral["stitched_pred_log_ai"]
+        diff = lateral["predicted_log_ai"] - no_lateral["predicted_log_ai"]
         valid = (
-            lateral["valid_mask_model"].astype(bool)
-            & no_lateral["valid_mask_model"].astype(bool)
+            lateral["valid_mask"].astype(bool)
+            & no_lateral["valid_mask"].astype(bool)
             & (lateral["stitching_weight"] > 0.0)
             & (no_lateral["stitching_weight"] > 0.0)
         )
@@ -794,7 +794,7 @@ def _write_spectral_qc(output_dir: Path, *, run_cfg: dict, dt_s: float) -> dict[
         for role, group in frame.groupby("experiment_id"):
             ax.plot(group["band"], group["band_rms"], marker="o", label=role)
         ax.set_ylabel("RMS log(AI)")
-        ax.set_title("R0 pred_delta_vs_lfm band energy")
+        ax.set_title("R0 predicted increment band energy")
         ax.legend()
         fig.tight_layout()
         fig.savefig(figure_path, dpi=160)
@@ -829,7 +829,7 @@ def _export_zero_shot_volumes(output_dir: Path, *, run_cfg: dict, data_root: Pat
         if not child.is_dir() or not npz_path.is_file():
             continue
         with np.load(npz_path, allow_pickle=False) as arrays:
-            pred_log_ai = np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float32)
+            pred_log_ai = np.asarray(arrays["predicted_log_ai"], dtype=np.float32)
             if pred_log_ai.ndim != 3:
                 continue
             pred_ai = log_ai_to_ai_volume(pred_log_ai)
@@ -846,8 +846,8 @@ def _export_zero_shot_volumes(output_dir: Path, *, run_cfg: dict, data_root: Pat
                     f"schema={ZERO_SHOT_MODEL_SCHEMA_VERSION}",
                     "field=pred_ai",
                     "domain=AI",
-                    "source_field=stitched_pred_log_ai",
-                    "transform=exp(stitched_pred_log_ai)",
+                    "source_field=predicted_log_ai",
+                    "transform=exp(predicted_log_ai)",
                 ],
                 seismic_options=dict(inputs.get("segy_options") or {}),
                 inline_chunk_size=inline_chunk_size,
@@ -857,8 +857,8 @@ def _export_zero_shot_volumes(output_dir: Path, *, run_cfg: dict, data_root: Pat
                 {
                     "field": "pred_ai",
                     "value_domain": "AI",
-                    "source_field": "stitched_pred_log_ai",
-                    "value_transform": "exp(stitched_pred_log_ai)",
+                    "source_field": "predicted_log_ai",
+                    "value_transform": "exp(predicted_log_ai)",
                 }
             )
         payload["path"] = repo_relative_path(Path(str(payload["path"])), root=REPO_ROOT)
@@ -1054,6 +1054,12 @@ def _build_section_summary(
         "sample_domain": field.sample_axis.domain,
         "sample_unit": field.sample_axis.unit,
         "depth_basis": field.depth_basis,
+        "closure_contract": {
+            "kind": "deployment_closure",
+            "background_field": "input_lfm_log_ai",
+            "increment_field": "predicted_increment_log_ai",
+            "output_field": "predicted_log_ai",
+        },
         "forward_model_inputs": {"path": forward_inputs_path} if forward_inputs_path else {},
         "section": {**dict(field.metadata), "section_id": section_id, "section_config": section_cfg},
         "axis_contract": axis_contract,
@@ -1286,6 +1292,12 @@ def _run_section_batch(
         "sample_domain": sample_domain,
         "sample_unit": sample_unit,
         "depth_basis": depth_basis,
+        "closure_contract": {
+            "kind": "deployment_closure",
+            "background_field": "input_lfm_log_ai",
+            "increment_field": "predicted_increment_log_ai",
+            "output_field": "predicted_log_ai",
+        },
         "forward_model_inputs": {"path": forward_inputs_path} if forward_inputs_path else {},
         "section": {},
         "sections": section_payloads,
@@ -1525,6 +1537,12 @@ def main() -> None:
         "sample_domain": sample_axis.domain,
         "sample_unit": sample_axis.unit,
         "depth_basis": field.depth_basis,
+        "closure_contract": {
+            "kind": "deployment_closure",
+            "background_field": "input_lfm_log_ai",
+            "increment_field": "predicted_increment_log_ai",
+            "output_field": "predicted_log_ai",
+        },
         "forward_model_inputs": {"path": forward_model_inputs_path}
         if forward_model_inputs_path
         else {},

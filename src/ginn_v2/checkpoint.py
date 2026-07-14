@@ -51,13 +51,45 @@ def load_checkpoint(
     deployment_eligible = checkpoint.get("deployment_eligible")
     if not isinstance(deployment_eligible, bool):
         raise ValueError(f"GINN-v2 checkpoint in {path} lacks deployment_eligible metadata.")
+    stage_deployment_eligible = checkpoint.get("stage_deployment_eligible")
+    if not isinstance(stage_deployment_eligible, bool):
+        raise ValueError(
+            f"GINN-v2 checkpoint in {path} lacks stage_deployment_eligible metadata."
+        )
+    if deployment_eligible != stage_deployment_eligible:
+        raise ValueError(
+            f"GINN-v2 checkpoint in {path} has inconsistent stage/deployment eligibility metadata."
+        )
+    if not isinstance(checkpoint.get("stage_deployment_eligibility_reason"), str):
+        raise ValueError(
+            f"GINN-v2 checkpoint in {path} lacks stage_deployment_eligibility_reason metadata."
+        )
+    if not isinstance(checkpoint.get("physics_closures"), list):
+        raise ValueError(f"GINN-v2 checkpoint in {path} lacks physics_closures metadata.")
+    stage_loss_blocks = checkpoint.get("stage_loss_blocks")
+    if not isinstance(stage_loss_blocks, list):
+        raise ValueError(f"GINN-v2 checkpoint in {path} lacks stage_loss_blocks metadata.")
+    if not isinstance(checkpoint.get("stage_selection_metric"), str):
+        raise ValueError(f"GINN-v2 checkpoint in {path} lacks stage_selection_metric metadata.")
+    stage_kinds = {str(item.get("kind") or "") for item in stage_loss_blocks}
+    if "physics" in stage_kinds:
+        dense_ids = {
+            str(item.get("block_id") or "")
+            for item in stage_loss_blocks
+            if str(item.get("kind") or "") == "synthetic_supervised"
+        }
+        safe_physics_selection = any(
+            str(checkpoint["stage_selection_metric"]) == f"{block_id}.mse"
+            for block_id in dense_ids
+        ) and "real_well_supervised" not in stage_kinds
+        if deployment_eligible != safe_physics_selection:
+            raise ValueError(
+                f"GINN-v2 checkpoint in {path} has invalid physics deployment eligibility; "
+                "waveform-only and real-well physics checkpoints are diagnostic/experimental."
+            )
     if run_mode == "smoke" and not development_limited:
         raise ValueError(
             f"GINN-v2 checkpoint in {path} marks a smoke run as not development_limited."
-        )
-    if deployment_eligible != (not development_limited):
-        raise ValueError(
-            f"GINN-v2 checkpoint in {path} has inconsistent deployment eligibility metadata."
         )
     architecture = dict(checkpoint.get("architecture") or {})
     architecture_id = str(architecture.get("id") or "")

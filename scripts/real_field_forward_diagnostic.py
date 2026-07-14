@@ -182,6 +182,21 @@ def _normalization_for_role(predictions: dict[str, dict[str, object]], role: str
     return {}
 
 
+def _experiment_id_for_role(
+    predictions: Mapping[str, Mapping[str, object]], role: str,
+) -> str:
+    """Resolve the stable experiment identity recorded by R0."""
+    if role == "lfm_only":
+        return ""
+    payload = predictions.get(str(role).removeprefix("zero_shot_"))
+    if payload is None:
+        return str(role).removeprefix("zero_shot_")
+    summary = payload.get("summary")
+    if isinstance(summary, Mapping) and str(summary.get("experiment_id") or "").strip():
+        return str(summary["experiment_id"])
+    return str(role).removeprefix("zero_shot_")
+
+
 def _normalization_stats(normalization: dict[str, object], key: str) -> tuple[float, float]:
     item = normalization.get(key)
     if not isinstance(item, dict):
@@ -1048,11 +1063,11 @@ def _build_volume_well_forward_qc(
             }
         )
         lfm_ai_metrics = _well_ai_metrics(well_log_ai=well_log_ai, pred_log_ai=lfm_trace, valid=model_valid)
-        rows.append({**base, "model_role": "lfm_input", "status": "ok" if lfm_ai_metrics.get("well_ai_status") == "ok" else lfm_ai_metrics.get("well_ai_status"), **lfm_ai_metrics})
+        rows.append({**base, "model_role": "lfm_only", "status": "ok" if lfm_ai_metrics.get("well_ai_status") == "ok" else lfm_ai_metrics.get("well_ai_status"), **lfm_ai_metrics})
         for role, payload in predictions.items():
             arrays = payload["arrays"]
             pred_trace, pred_inside = _sample_volume_bilinear(
-                np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float64),
+                np.asarray(arrays["predicted_log_ai"], dtype=np.float64),
                 ilines=ilines,
                 xlines=xlines,
                 twt_s=twt_s,
@@ -1145,7 +1160,7 @@ def _build_volume_well_forward_qc(
                 )
             local_spectrum: dict[str, object] = {}
             pred_delta_trace, _ = _sample_volume_bilinear(
-                np.asarray(arrays["pred_delta_vs_lfm"], dtype=np.float64),
+                np.asarray(arrays["predicted_increment_log_ai"], dtype=np.float64),
                 ilines=ilines,
                 xlines=xlines,
                 twt_s=twt_s,
@@ -1469,9 +1484,9 @@ def _build_well_forward_qc(
                     **{f"waveform_{key}": value for key, value in filtered_waveform.items()},
                 }
             )
-        lfm_log_ai = np.asarray(first_arrays["lfm_input"], dtype=np.float64)[trace_idx]
+        lfm_log_ai = np.asarray(first_arrays["input_lfm_log_ai"], dtype=np.float64)[trace_idx]
         lfm_valid = (
-            np.asarray(first_arrays["valid_mask_model"], dtype=bool)[trace_idx]
+            np.asarray(first_arrays["valid_mask"], dtype=bool)[trace_idx]
             & np.isfinite(lfm_log_ai)
             & np.isfinite(well_log_ai)
         )
@@ -1493,7 +1508,7 @@ def _build_well_forward_qc(
         rows.append(
             {
                 **base,
-                "model_role": "lfm_input",
+                "model_role": "lfm_only",
                 "status": "ok" if lfm_ai_metrics.get("well_ai_status") == "ok" else lfm_ai_metrics.get("well_ai_status"),
                 **lfm_ai_metrics,
                 **lfm_band_metrics,
@@ -1501,12 +1516,12 @@ def _build_well_forward_qc(
         )
         for role, payload in predictions.items():
             arrays = payload["arrays"]
-            pred = np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float64)[trace_idx]
-            valid = np.asarray(arrays["valid_mask_model"], dtype=bool)[trace_idx] & (np.asarray(arrays["stitching_weight"])[trace_idx] > 0.0)
+            pred = np.asarray(arrays["predicted_log_ai"], dtype=np.float64)[trace_idx]
+            valid = np.asarray(arrays["valid_mask"], dtype=bool)[trace_idx] & (np.asarray(arrays["stitching_weight"])[trace_idx] > 0.0)
             ai_metrics = _well_ai_metrics(well_log_ai=well_log_ai, pred_log_ai=pred, valid=valid)
             local_spectrum = {}
             residual = pred - well_log_ai
-            pred_delta = np.asarray(arrays["pred_delta_vs_lfm"], dtype=np.float64)[trace_idx]
+            pred_delta = np.asarray(arrays["predicted_increment_log_ai"], dtype=np.float64)[trace_idx]
             for band in bands:
                 name = str(band["name"])
                 local_spectrum[f"well_ai_residual_{name}_rms"] = _band_rms(
@@ -1599,7 +1614,7 @@ def _plot_well_qc(
         synthetic_path = synthetic_dir / f"zero_shot_{role}.npz"
         if not synthetic_path.is_file():
             continue
-        pred_log_ai = np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float64)[trace_idx]
+        pred_log_ai = np.asarray(arrays["predicted_log_ai"], dtype=np.float64)[trace_idx]
         pred_filled = _fill_nonfinite_1d(pred_log_ai)
         reflectivity = np.tanh(0.5 * (pred_filled[1:] - pred_filled[:-1]))
         with np.load(synthetic_path, allow_pickle=True) as syn_arrays:
@@ -1886,9 +1901,9 @@ def _write_ai_plausibility_qc(
     rows.append({"model_role": "lfm_only", "signal": "lfm_log_ai", **_finite_stats(lfm, valid)})
     for role, payload in predictions.items():
         arrays = payload["arrays"]
-        pred = np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float64)
-        delta = np.asarray(arrays["pred_delta_vs_lfm"], dtype=np.float64)
-        role_valid = valid & np.asarray(arrays["valid_mask_model"], dtype=bool) & (np.asarray(arrays["stitching_weight"]) > 0.0)
+        pred = np.asarray(arrays["predicted_log_ai"], dtype=np.float64)
+        delta = np.asarray(arrays["predicted_increment_log_ai"], dtype=np.float64)
+        role_valid = valid & np.asarray(arrays["valid_mask"], dtype=bool) & (np.asarray(arrays["stitching_weight"]) > 0.0)
         normalization = _normalization_for_role(predictions, role)
         delta_mean, delta_std = _normalization_stats(normalization, "delta")
         lfm_mean, lfm_std = _normalization_stats(normalization, "lfm")
@@ -1903,7 +1918,7 @@ def _write_ai_plausibility_qc(
         )
         delta_row = {
             "model_role": role,
-            "signal": "pred_delta_vs_lfm",
+            "signal": "predicted_increment_log_ai",
             **_finite_stats(delta, role_valid),
             "synthetic_train_mean": delta_mean,
             "synthetic_train_std": delta_std,
@@ -1914,7 +1929,7 @@ def _write_ai_plausibility_qc(
         rows.append(delta_row)
         lfm_row = {
             "model_role": role,
-            "signal": "lfm_input_for_role",
+            "signal": "input_lfm_log_ai",
             **_finite_stats(lfm, role_valid),
             "synthetic_train_mean": lfm_mean,
             "synthetic_train_std": lfm_std,
@@ -1933,7 +1948,7 @@ def _write_ai_plausibility_qc(
             rows.append(
                 {
                     "model_role": role,
-                    "signal": "pred_delta_vs_lfm_band",
+                    "signal": "predicted_increment_log_ai_band",
                     "band": band["name"],
                     "low_hz": low,
                     "high_hz": high,
@@ -1966,11 +1981,11 @@ def _write_ai_plausibility_qc(
             raise ValueError(f"R1 comparison {comparison_id} references unavailable experiments.")
         lat = predictions[left_id]["arrays"]
         no = predictions[right_id]["arrays"]
-        diff = np.asarray(lat["stitched_pred_log_ai"], dtype=np.float64) - np.asarray(no["stitched_pred_log_ai"], dtype=np.float64)
+        diff = np.asarray(lat["predicted_log_ai"], dtype=np.float64) - np.asarray(no["predicted_log_ai"], dtype=np.float64)
         diff_valid = (
             valid
-            & np.asarray(lat["valid_mask_model"], dtype=bool)
-            & np.asarray(no["valid_mask_model"], dtype=bool)
+            & np.asarray(lat["valid_mask"], dtype=bool)
+            & np.asarray(no["valid_mask"], dtype=bool)
             & (np.asarray(lat["stitching_weight"]) > 0.0)
             & (np.asarray(no["stitching_weight"]) > 0.0)
         )
@@ -2008,11 +2023,11 @@ def _write_ai_plausibility_qc(
     fig_path = fig_dir / "ai_band_energy_qc.png"
     fig, ax = plt.subplots(figsize=(9, 4.5))
     for (role, signal), group in band_frame.groupby(["model_role", "signal"]):
-        if str(signal) != "pred_delta_vs_lfm_band":
+        if str(signal) != "predicted_increment_log_ai_band":
             continue
         ax.plot(group["band"], group["energy_ratio"], marker="o", label=str(role))
     ax.set_ylabel("band RMS / fullband RMS")
-    ax.set_title("AI pred_delta_vs_lfm band energy")
+    ax.set_title("AI predicted increment band energy")
     ax.tick_params(axis="x", rotation=20)
     ax.grid(True, alpha=0.25)
     ax.legend(fontsize=8)
@@ -2086,15 +2101,15 @@ def _write_well_closure_tables(
     roles = [
         str(role)
         for role in sorted(well_frame["model_role"].dropna().unique())
-        if str(role) not in {"", "filtered_las", "lfm_input"}
+        if str(role) not in {"", "filtered_las", "lfm_only"}
     ]
     wells = sorted(str(value) for value in well_frame["well_name"].dropna().unique())
     for well_name in wells:
-        lfm = _first_row(well_frame, well_name=well_name, role="lfm_input")
+        lfm = _first_row(well_frame, well_name=well_name, role="lfm_only")
         filtered = _first_row(well_frame, well_name=well_name, role="filtered_las")
         if lfm is None:
             continue
-        for role in ["lfm_input", *roles]:
+        for role in ["lfm_only", *roles]:
             row = _first_row(well_frame, well_name=well_name, role=role)
             if row is None:
                 continue
@@ -2445,7 +2460,7 @@ def _depth_well_qc(
             if pred_payload is None:
                 pred_values = np.full_like(well_log_ai, np.nan)
             else:
-                pred = np.asarray(pred_payload["arrays"]["stitched_pred_log_ai"], dtype=np.float64)
+                pred = np.asarray(pred_payload["arrays"]["predicted_log_ai"], dtype=np.float64)
                 if is_volume:
                     pred_values, _ = sample_volume_trilinear(pred, **sample_kwargs)
                 else:
@@ -2468,6 +2483,8 @@ def _depth_well_qc(
                 {
                     "well_name": control.well_name,
                     "model_role": role,
+                    "experiment_id": _experiment_id_for_role(predictions, role),
+                    "closure_type": "deployment_closure",
                     "sample_domain": "depth",
                     "sample_unit": "m",
                     "depth_basis": "tvdss",
@@ -2492,8 +2509,8 @@ def _run_depth_diagnostic(
     predictions = load_zero_shot_predictions(zero_shot_dir)
     first = next(iter(predictions.values()))["arrays"]
     observed = np.asarray(first["seismic_input"], dtype=np.float64)
-    lfm = np.asarray(first["lfm_input"], dtype=np.float64)
-    valid = np.asarray(first["valid_mask_model"], dtype=bool)
+    lfm = np.asarray(first["input_lfm_log_ai"], dtype=np.float64)
+    valid = np.asarray(first["valid_mask"], dtype=bool)
     ilines = np.asarray(first["ilines"], dtype=np.float64)
     xlines = np.asarray(first["xlines"], dtype=np.float64)
     tvdss_m = np.asarray(first["samples"], dtype=np.float64)
@@ -2508,7 +2525,7 @@ def _run_depth_diagnostic(
     forward_inputs_path, relation, wavelet_time_s, wavelet = _load_depth_forward_inputs(zero_shot_summary)
     impedance_inputs: list[tuple[str, np.ndarray]] = [("lfm_only", lfm)]
     impedance_inputs.extend(
-        (f"zero_shot_{role}", np.asarray(payload["arrays"]["stitched_pred_log_ai"], dtype=np.float64))
+        (f"zero_shot_{role}", np.asarray(payload["arrays"]["predicted_log_ai"], dtype=np.float64))
         for role, payload in predictions.items()
     )
     scan_cfg = dict(run_cfg.get("diagnostic_scan") or {})
@@ -2526,6 +2543,7 @@ def _run_depth_diagnostic(
     synthetic_dir = output_dir / "synthetic"
     synthetic_dir.mkdir(parents=True, exist_ok=False)
     for role, log_ai in impedance_inputs:
+        experiment_id = _experiment_id_for_role(predictions, role)
         synthetic, forward_valid = _forward_depth_masked(
             log_ai,
             valid,
@@ -2539,6 +2557,8 @@ def _run_depth_diagnostic(
         metrics_rows.append(
             {
                 "model_role": role,
+                "experiment_id": experiment_id,
+                "closure_type": "lfm_only" if role == "lfm_only" else "deployment_closure",
                 "forward_operator_id": "cup.physics.numpy_backend.forward_depth",
                 "sample_domain": "depth",
                 "sample_unit": "m",
@@ -2585,6 +2605,8 @@ def _run_depth_diagnostic(
             scan_rows.append(
                 {
                     "model_role": role,
+                    "experiment_id": experiment_id,
+                    "closure_type": "lfm_only" if role == "lfm_only" else "deployment_closure",
                     "scan_type": "wavelet_phase",
                     "phase_deg": phase_deg,
                     "wavelet_time_shift_s": 0.0,
@@ -2604,6 +2626,8 @@ def _run_depth_diagnostic(
             scan_rows.append(
                 {
                     "model_role": role,
+                    "experiment_id": experiment_id,
+                    "closure_type": "lfm_only" if role == "lfm_only" else "deployment_closure",
                     "scan_type": "wavelet_time_shift",
                     "phase_deg": 0.0,
                     "wavelet_time_shift_s": time_shift_s,
@@ -2621,6 +2645,8 @@ def _run_depth_diagnostic(
             scan_rows.append(
                 {
                     "model_role": role,
+                    "experiment_id": experiment_id,
+                    "closure_type": "lfm_only" if role == "lfm_only" else "deployment_closure",
                     "scan_type": "depth_static",
                     "phase_deg": 0.0,
                     "wavelet_time_shift_s": 0.0,
@@ -2705,6 +2731,28 @@ def _run_depth_diagnostic(
         "sample_domain": "depth",
         "sample_unit": "m",
         "depth_basis": "tvdss",
+        "closure_contract": {
+            "lfm_only": {
+                "kind": "lfm_only",
+                "background_field": "input_lfm_log_ai",
+                "output_field": "input_lfm_log_ai",
+            },
+            "deployment": {
+                "kind": "deployment_closure",
+                "background_field": "input_lfm_log_ai",
+                "increment_field": "predicted_increment_log_ai",
+                "output_field": "predicted_log_ai",
+            },
+            "waveform_error": "observed_seismic - synthetic_seismic",
+        },
+        "experiment_ids": sorted(
+            {
+                value for value in (
+                    _experiment_id_for_role(predictions, role)
+                    for role in predictions
+                ) if value
+            }
+        ),
         "axis_contract": {
             "n_sample": int(tvdss_m.size),
             "sample_min": float(tvdss_m[0]),
@@ -2782,8 +2830,8 @@ def main() -> None:
     predictions = load_zero_shot_predictions(zero_shot_dir)
     first = next(iter(predictions.values()))["arrays"]
     observed = np.asarray(first["seismic_input"], dtype=np.float64)
-    lfm = np.asarray(first["lfm_input"], dtype=np.float64)
-    valid = np.asarray(first["valid_mask_model"], dtype=bool)
+    lfm = np.asarray(first["input_lfm_log_ai"], dtype=np.float64)
+    valid = np.asarray(first["valid_mask"], dtype=bool)
     ilines = np.asarray(first["ilines"], dtype=np.float64)
     xlines = np.asarray(first["xlines"], dtype=np.float64)
     output_mode = "volume" if observed.ndim == 3 else "section"
@@ -2811,10 +2859,10 @@ def main() -> None:
     if boundary.get("forward_diagnostic_erosion_s") not in (None, 0, 0.0):
         raise ValueError("forward_diagnostic_erosion_s is disabled in R1; remove it or set it to 0.")
 
-    impedance_inputs: list[tuple[str, np.ndarray, str]] = [("lfm_only", lfm, "lfm_input")]
+    impedance_inputs: list[tuple[str, np.ndarray, str]] = [("lfm_only", lfm, "input_lfm_log_ai")]
     for role, payload in predictions.items():
         arrays = payload["arrays"]
-        impedance_inputs.append((f"zero_shot_{role}", np.asarray(arrays["stitched_pred_log_ai"], dtype=np.float64), role))
+        impedance_inputs.append((f"zero_shot_{role}", np.asarray(arrays["predicted_log_ai"], dtype=np.float64), role))
 
     metric_rows = []
     wavelet_rows = []
@@ -2825,6 +2873,8 @@ def main() -> None:
     synthetic_dir = output_dir / "synthetic"
     synthetic_dir.mkdir(parents=True, exist_ok=False)
     for model_role, log_ai, source_role in impedance_inputs:
+        experiment_id = _experiment_id_for_role(predictions, model_role)
+        closure_type = "lfm_only" if model_role == "lfm_only" else "deployment_closure"
         synthetic = forward_time(log_ai, wavelet_time_s, wavelet)
         synthetic_by_role[model_role] = synthetic
         obs_crop, syn_crop, valid_crop = _align_forward_arrays(
@@ -2836,6 +2886,8 @@ def main() -> None:
         metric_rows.append(
             {
                 "model_role": model_role,
+                "experiment_id": experiment_id,
+                "closure_type": closure_type,
                 "source_role": source_role,
                 "forward_operator_id": "cup.physics.forward_time_n_point_v1",
                 "reflectivity_hang_point": "r[j]=tanh((x[j+1]-x[j])/2), event_twt=twt[j+1]",
@@ -2867,6 +2919,8 @@ def main() -> None:
             fractional_shift_samples=shift_values,
         )
         scan.insert(0, "model_role", model_role)
+        scan.insert(1, "experiment_id", experiment_id)
+        scan.insert(2, "closure_type", closure_type)
         scan_frames.append(scan)
         spatial_rows.extend(_spatial_rows(model_role=model_role, observed=obs_crop, synthetic=syn_crop, valid=valid_crop))
         for scenario in wavelet_scenarios:
@@ -2882,6 +2936,8 @@ def main() -> None:
             wavelet_rows.append(
                 {
                     "model_role": model_role,
+                    "experiment_id": experiment_id,
+                    "closure_type": closure_type,
                     "source_role": source_role,
                     "wavelet_scenario_id": scenario["wavelet_scenario_id"],
                     "source_well": scenario["source_well"],
@@ -3040,6 +3096,28 @@ def main() -> None:
         "sample_domain": "time",
         "sample_unit": "s",
         "depth_basis": None,
+        "closure_contract": {
+            "lfm_only": {
+                "kind": "lfm_only",
+                "background_field": "input_lfm_log_ai",
+                "output_field": "input_lfm_log_ai",
+            },
+            "deployment": {
+                "kind": "deployment_closure",
+                "background_field": "input_lfm_log_ai",
+                "increment_field": "predicted_increment_log_ai",
+                "output_field": "predicted_log_ai",
+            },
+            "waveform_error": "observed_seismic - synthetic_seismic",
+        },
+        "experiment_ids": sorted(
+            {
+                value for value in (
+                    _experiment_id_for_role(predictions, role)
+                    for role in predictions
+                ) if value
+            }
+        ),
         "config_file": repo_relative_path(cfg_path, root=REPO_ROOT),
         "zero_shot_dir": repo_relative_path(zero_shot_dir, root=REPO_ROOT),
         "wavelet": wavelet_meta,

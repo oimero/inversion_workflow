@@ -96,7 +96,9 @@ class RealFieldPatchDataset(Dataset[dict[str, Any]]):
             axis = np.concatenate([axis, axis[-1] + step * np.arange(1, shape[1] - len(axis) + 1)])
         return {
             "input": torch.from_numpy(inputs),
-            "lfm": torch.from_numpy(np.where(valid, lfm, 0.0).astype(np.float32))[None],
+            "input_lfm_log_ai": torch.from_numpy(
+                np.where(valid, lfm, 0.0).astype(np.float32)
+            )[None],
             "forward_lfm": torch.from_numpy(forward_lfm)[None],
             "valid_mask": torch.from_numpy(valid.astype(np.float32))[None],
             "seismic_model_consistent": torch.from_numpy(np.where(valid, target, 0.0).astype(np.float32))[None],
@@ -358,7 +360,7 @@ def _prepare_synthetic_indices(
                         cache.pop(next(iter(cache)))
                     cache[sample_id] = sample
                     loaded_sample_count += 1
-                lfm_context = np.asarray(sample.priors["lfm_controlled_degraded"], dtype=np.float64)[
+                lfm_context = np.asarray(sample.input_lfm_log_ai, dtype=np.float64)[
                     int(row["lateral_start"]):int(row["lateral_stop"]),
                     int(row["twt_start"]):int(row["twt_stop"]),
                 ]
@@ -626,7 +628,11 @@ def _block_loss(
     prediction = model(x)
     if kind == "synthetic_supervised":
         supervised_mask = batch["valid_mask"].to(device)
-        loss = masked_mse(prediction, batch["target_delta"].to(device), supervised_mask)
+        loss = masked_mse(
+            prediction,
+            batch["target_increment_log_ai"].to(device),
+            supervised_mask,
+        )
         return loss, {
             "mse": float(loss.detach().cpu()),
             "valid_sample_count": float(torch.count_nonzero(supervised_mask).item()),
@@ -687,11 +693,11 @@ def _block_loss(
         diagnostics = {}
     delta_l2 = masked_mse(prediction_for_l2, torch.zeros_like(prediction_for_l2), valid_for_l2)
     diagnostics["waveform"] = float(waveform.detach().cpu())
-    diagnostics["delta_l2"] = float(delta_l2.detach().cpu())
-    total = waveform + float(cfg["delta_l2_weight"]) * delta_l2
+    diagnostics["increment_l2"] = float(delta_l2.detach().cpu())
+    total = waveform + float(cfg["increment_l2_weight"]) * delta_l2
     diagnostics["total"] = float(total.detach().cpu())
     diagnostics["valid_sample_count"] = float(torch.count_nonzero(waveform_mask).item())
-    diagnostics["delta_valid_sample_count"] = float(torch.count_nonzero(valid_for_l2).item())
+    diagnostics["increment_valid_sample_count"] = float(torch.count_nonzero(valid_for_l2).item())
     diagnostics["skipped_item_count"] = float(skipped_item_count)
     return total, diagnostics
 
@@ -712,8 +718,8 @@ def _checkpoint_payload(
         "selection_metric_value": float(metric_value),
         "architecture": config.architecture.as_dict(),
         "model_info": dict(model_info),
-        "input_channels": ["seismic", "lfm", "valid_mask"],
-        "output_semantics": "physical_delta_log_ai",
+        "input_channels": ["seismic", "input_lfm_log_ai", "valid_mask"],
+        "output_semantics": "predicted_increment_log_ai",
         "normalization": dict(normalization),
         "sample_axis_contract": dict(sample_axis),
         "patch_deployment_contract": config.patching.as_dict() | {
@@ -773,13 +779,16 @@ def _evaluate(
         count = float(np.sum([row["valid_sample_count"] for row in rows]))
         return {"mse": float(np.sum([row["mse"] * row["valid_sample_count"] for row in rows]) / count)}
     waveform_count = float(np.sum([row["valid_sample_count"] for row in rows]))
-    delta_count = float(np.sum([row["delta_valid_sample_count"] for row in rows]))
+    increment_count = float(np.sum([row["increment_valid_sample_count"] for row in rows]))
     waveform_mse = float(np.sum([row["waveform"] * row["valid_sample_count"] for row in rows]) / waveform_count)
-    delta_l2 = float(np.sum([row["delta_l2"] * row["delta_valid_sample_count"] for row in rows]) / delta_count)
+    increment_l2 = float(
+        np.sum([row["increment_l2"] * row["increment_valid_sample_count"] for row in rows])
+        / increment_count
+    )
     return {
         "waveform_mse": waveform_mse,
-        "delta_l2": delta_l2,
-        "total": waveform_mse + float(prepared.config["delta_l2_weight"]) * delta_l2,
+        "increment_l2": increment_l2,
+        "total": waveform_mse + float(prepared.config["increment_l2_weight"]) * increment_l2,
         "valid_sample_count": waveform_count,
         "skipped_item_count": float(np.sum([row["skipped_item_count"] for row in rows])),
     }
@@ -788,7 +797,7 @@ def _evaluate(
 def run_experiment(
     *, config: ExperimentConfig, root: Path, output_dir: Path, logger: logging.Logger,
 ) -> dict[str, Any]:
-    """Run the strict v1 experiment. Synthetic blocks and existing real-well support are composable."""
+    """Run a strict canonical-increment experiment."""
     output_dir.mkdir(parents=True, exist_ok=True)
     if (output_dir / "experiment_manifest.json").exists() or (output_dir / "stages").exists():
         raise FileExistsError(f"GINN-v2 experiment outputs already exist: {output_dir}")
@@ -1299,8 +1308,10 @@ def run_experiment(
         "normalization_path": repo_relative_path(output_dir / "normalization.json", root=root),
         "sources": resolved_sources,
         "patching": config.patching.as_dict(),
-        "input_channels": ["seismic", "lfm", "valid_mask"],
-        "output_semantics": "pred_log_ai = lfm_log_ai + physical_delta_log_ai",
+        "input_channels": ["seismic", "input_lfm_log_ai", "valid_mask"],
+        "output_semantics": (
+            "predicted_log_ai = input_lfm_log_ai + predicted_increment_log_ai"
+        ),
         "sample_axis_contract": sample_axis_contract,
         "forward_model_inputs_path": forward_model_inputs_path,
         "stages": manifest_stages,

@@ -119,7 +119,7 @@ def _resolve_checkpoint_from_manifest(
 def run_train(args: argparse.Namespace) -> None:
     if args.config is None:
         raise ValueError(
-            "GINN-v2 training now requires --config with the ginn_v2_experiment_v1 root. "
+            "GINN-v2 training now requires --config with the ginn_v2_experiment_v2 root. "
             "Legacy training flags are not accepted; see "
             "docs/spec/GINN_V2_COMPOSABLE_TRAINING_DESIGN.md."
         )
@@ -272,8 +272,10 @@ def run_predict(args: argparse.Namespace) -> None:
         "checkpoint": repo_relative_path(checkpoint_path, root=REPO_ROOT),
         "model_info": result["model_info"],
         "normalization": result["normalization"],
-        "input_channels": ["seismic", "lfm_controlled_degraded", "valid_mask_model"],
-        "output_semantics": "pred_log_ai = lfm_controlled_degraded + pred_delta_log_ai",
+        "input_channels": ["seismic", "input_lfm_log_ai", "valid_mask"],
+        "output_semantics": (
+            "predicted_log_ai = input_lfm_log_ai + predicted_increment_log_ai"
+        ),
         "outputs": {
             "predictions": repo_relative_path(result["prediction_npz"], root=REPO_ROOT),
             "prediction_index": repo_relative_path(result["prediction_index"], root=REPO_ROOT),

@@ -155,9 +155,9 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 - [x] 深度域增加 auto CUDA/显式 NumPy CPU 的 float64 forward backend，并移除重复
   model-grid closure forward；
 - [x] 使用当前可用深度 source 完成 writer → manifest → reader → baseline evaluator 小烟测；
-- [ ] 用新合同重新生成需要消费的 v4 benchmark，不覆盖冻结目录。
+- [x] 用新合同重新生成需要消费的 v4 benchmark，不覆盖冻结目录。
 
-完成条件：新包 import/compile smoke 通过，LFM profile 和 QC 状态语义通过，旧实现版本命名不再出现在正式 reader/config/CLI 路径，probe 正式路径仍明确失败（保留失败测试与 observability 旁路），reader 拒绝缺少新合同的旧 v4。状态：单一 mask 合同、深度 GPU backend 和本地 fixture 正在本轮稳定化；完整工区 v4 重生成仍待执行。
+完成条件：新包 import/compile smoke 通过，LFM profile 和 QC 状态语义通过，旧实现版本命名不再出现在正式 reader/config/CLI 路径，probe 正式路径仍明确失败（保留失败测试与 observability 旁路），reader 拒绝缺少新合同的旧 v4。状态：单一 mask 合同、深度 GPU backend、本地 fixture 和完整工区重生成均已完成；严格无告警 baseline 仍由阶段 3 最后一项决定。
 
 说明：`scripts/ginn_v2.py summarize` 仍可读取冻结历史 report-card 中的旧 probe 字段，
 但 v4 writer、reader、baseline evaluator 和 GINN v2 新 report 不再生成这些字段；该历史
@@ -165,26 +165,55 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 
 ### 阶段 3：Synthoseis-lite v4 主链稳定化与基线冻结
 
-- [ ] 完成当前 v4 深度域全量工区生成，确认 preflight、writer、manifest、reader 和 baseline evaluator 能消费同一新目录；
-- [ ] 对生成结果执行 sample index、canonical decomposition、observed/model-consistent seismic、mask、LFM variant 和 split 的完整检查；
-- [ ] 保持 `microtexture_mode=none` 的现有主链，不在本阶段加入纹理 emitter 或 paired benchmark；
-- [ ] 记录场景接受率、拒绝原因和 `development_limited` 等状态，不把 attempt-level 拒绝误报为生成成功；
+- [x] 完成当前 v4 深度域全量工区生成，确认 preflight、writer、manifest、reader 和 baseline evaluator 能消费同一新目录；
+- [x] 对生成结果执行 sample index、canonical decomposition、observed/model-consistent seismic、mask、LFM variant 和 split 的完整检查；
+- [x] 保持 `microtexture_mode=none` 的现有主链，不在本阶段加入纹理 emitter 或 paired benchmark；
+- [x] 记录场景接受率、拒绝原因和 `development_limited` 等状态，不把 attempt-level 拒绝误报为生成成功；
 - [ ] 形成一份可冻结的 v4 baseline manifest 和评估报告，不覆盖 20260706 等历史目录。
 
 时间域真实 source 可用前只做 fixture reader/baseline 验证，不声称完成时间域工区 smoke。
-深度域完整工区需要在当前实现完成后用新输出目录重新生成；本阶段只冻结小烟测证据。
+深度域完整工区已在当前实现上用新输出目录重新生成；严格无告警 baseline 仍由最后一项单独决定。
 
-完成条件：新输出目录可被 v4 reader 和 baseline evaluator 独立读取；有限点的 canonical 重组成立；observed input、model-consistent 参照、mask、LFM variant 和坐标轴合同完整；旧 probe 和旧 v4 schema 明确失败；生成 acceptance/report 已冻结。
+完整工区新运行 `experiments/synthoseis_lite/results/20260714/generate_field_conditioned`
+已完成：manifest 为 `synthoseis_lite_v4`、`mask_contract=single_valid_mask_v1`，
+`auto -> torch_cuda`/float64；sample index 共 6,942 行（534 个 base、6,408 个
+seismic variant），全部为 `status=ok`，reader 和 baseline evaluator 均已读取通过。
+生成状态为 `completed_with_warnings`：840 个 planned attempts 中 534 个接受，3 个
+wedge 场景低于 0.5 acceptance threshold（`lx0.3/a0.25`、`lx0.3/a0.5`、
+`lx1/a0.5` 的 left-to-right），因 enforcement=warn 保留了已接受样本。该目录可作
+主链验收产物，但在把它标为严格全场 baseline 前，应先决定是否接受这 3 个场景的警告。
+
+完成条件：新输出目录可被 v4 reader 和 baseline evaluator 独立读取；有限点的 canonical 重组成立；observed input、model-consistent 参照、mask、LFM variant 和坐标轴合同完整；旧 probe 和旧 v4 schema 明确失败；生成 acceptance/report 已记录。当前 3 个 wedge 场景低于阈值的告警仍未被标记为严格全场 baseline。
 
 ### 阶段 4：最小 GINN v2 synthetic supervised 垂直切片
 
-- [ ] v4 reader 只暴露 canonical 字段；
-- [ ] 先选择最简单 trace 架构打通 `v4 -> batch -> increment MSE`；
-- [ ] 输出 `predicted_increment_log_ai`，并生成 `predicted_log_ai`；
-- [ ] 写入新 experiment/checkpoint/prediction schema；
-- [ ] 验证零初始化输出增量为零且最终结果等于输入 LFM。
+- [x] v4 reader 只向训练 batch 暴露 canonical 字段；
+- [x] 选择 `trace_conv1d` 打通 `v4 -> batch -> increment MSE`；
+- [x] 输出 `predicted_increment_log_ai`，并生成 `predicted_log_ai`；
+- [x] 写入 `ginn_v2_experiment_v2`、`ginn_v2_checkpoint_v5` 和 `ginn_v2_prediction_v3`；
+- [x] 验证零初始化输出增量为零且最终结果等于输入 LFM。
 
-完成条件：一个最小 epoch smoke 可以从 v4 fixture 完成监督训练、恢复 checkpoint 和增量预测；旧 schema 输入明确失败。
+完成条件已满足：一个最小 epoch smoke 从 20260714 v4 benchmark 完成监督训练、checkpoint 恢复、canonical increment prediction 和 report；旧 experiment schema 明确失败。
+
+阶段 4 垂直切片证据：
+
+```text
+配置：experiments/ginn_v2/train.yaml
+架构：trace_conv1d(hidden_channels=8, depth=2)
+训练产物：experiments/ginn_v2/results/canonical_increment_synthetic_v4_s20260714
+预测产物：experiments/ginn_v2/results/canonical_increment_synthetic_v4_s20260714/predict_validation
+报告产物：scripts/output/ginn_v2_canonical_increment_report_smoke_final_20260714
+训练：1 epoch / 2 steps，CUDA，synthetic_increment.mse=0.0090784924
+checkpoint：ginn_v2_checkpoint_v5，成功恢复 Trace1DNet
+prediction.npz：包含 predicted_increment_log_ai、predicted_log_ai、
+  target_increment_log_ai、input_lfm_log_ai、valid_mask；
+  max|predicted_log_ai-(input_lfm_log_ai+predicted_increment_log_ai)| = 0
+零初始化：trace_conv1d 输出最大绝对值 = 0
+回归测试：38 passed；compileall src/cup src/ginn_v2 scripts/ginn_v2.py 通过
+旧配置：ginn_v2_experiment_v1 明确拒绝，期望 ginn_v2_experiment_v2
+```
+
+本切片只覆盖 synthetic supervised 和最简单 trace 架构；physics、其部署资格和其余架构仍按后续阶段实施。
 
 ### 阶段 5：四类架构与 synthetic closure
 
@@ -311,7 +340,11 @@ HSMM 状态序列、对象厚度、几何事件、横向坐标、LFM 退化和 s
 
 ## 6. 后续 goal 的首个任务
 
-建议下一个 goal 从阶段 3 开始，先完成当前 v4 主链的全量生成、reader/evaluator 验收和 baseline 冻结；不要在此之前实现微纹理。阶段 3 通过后，再按阶段 4–10 逐层接入 GINN v2、physics、真实井、R0/R1 和默认入口切换，最后才开启阶段 11/12 的微纹理与 paired A/B/C。每完成一项就在对应复选框勾选并记录测试命令、fixture 和产物路径。
+阶段 3 的主链证据和阶段 4 的最小监督切片已经完成；当前只需决定是否接受 20260714
+生成目录中的 3 个 wedge acceptance warning，才能把阶段 3 标记为严格无告警 baseline。
+下一步从阶段 5 开始扩展其余架构和 synthetic closure，再按阶段 6–10 接入 physics、真实井、
+R0/R1 和默认入口切换，最后才开启阶段 11/12 的微纹理与 paired A/B/C。每完成一项就在
+对应复选框勾选并记录测试命令、fixture 和产物路径。
 
 ## 7. 阶段 1/2 验证证据
 

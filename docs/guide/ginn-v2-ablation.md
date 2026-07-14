@@ -24,7 +24,7 @@ python scripts/ginn_v2.py --output-dir scripts/output/ginn_v2_report `
   report --prediction-dir scripts/output/ginn_v2_predict
 ```
 
-训练配置使用 `ginn_v2_experiment_v1` schema。旧的训练配置和旧 checkpoint 会明确报错，不会静默兼容。
+训练配置使用 `ginn_v2_experiment_v2` schema。旧的训练配置和旧 checkpoint 会明确报错，不会静默兼容。
 
 ---
 
@@ -150,7 +150,7 @@ GINN v2 的训练配方由五层组件自由组合而成：
 
 **`synthetic_supervised` — 你有答案**
 
-计算网络输出的 `delta_log_ai` 与合成基准真值 delta 的 MSE。只在有效标签点上计算。
+计算网络输出的 `predicted_increment_log_ai` 与合成基准 `target_increment_log_ai` 的 MSE。只在有效标签点上计算。
 
 最直接的监督信号。优点是干净、梯度好；缺点是只在合成数据上有——真实工区没有这份答案。
 
@@ -160,18 +160,18 @@ GINN v2 的训练配方由五层组件自由组合而成：
 
 | 特有字段 | 含义 |
 |------|------|
-| `delta_l2_weight` | delta L2 正则的权重。防止模型仅靠正演拟合波形却产生不合理的绝对阻抗值 |
+| `increment_l2_weight` | 增量 L2 正则的权重。防止模型仅靠正演拟合波形却产生不合理的增量 |
 | `waveform_standardization` | 合成数据固定 `raw`，真实工区固定 `masked_centered_rms`（在 patch 内独立做零均值 RMS 归一化后再比较） |
 | `centered_rms_epsilon` | 仅真实工区。centered RMS 分母的防零小量，默认 1e-12 |
 | `min_centered_rms` | 仅真实工区。waveform 项可用的最低 centered RMS 阈值，默认 1e-6 |
 
-合成数据上：`总损失 = waveform MSE + delta_l2_weight × (pred_delta² 的均值)`。
+合成数据上：`总损失 = waveform MSE + increment_l2_weight × (predicted_increment_log_ai² 的均值)`。
 
 真实工区上：观测和合成各自在 patch 内独立做 centered RMS 标准化，比较标准化后的波形。这意味着**正演约束对整体振幅不敏感**——它管的是事件时序、极性、相位——绝对阻抗幅度由 LFM 锚定、delta L2 约束、或来自其他阶段的监督提供。
 
 **`real_well_supervised` — 井告诉你的**
 
-在井位处计算预测 delta 与井控 delta 的 MSE。稀疏但绝对——井上的波阻抗是对的。
+在井位处计算预测增量与井控 `well_target_increment_log_ai` 的 MSE。稀疏但绝对——井上的规范增量是对的。
 
 只有 training 井参与损失；held-out 井和同簇排除井只做验证。
 
@@ -252,7 +252,7 @@ ginn_v2:
       steps_per_epoch: 300
       optimizer: {kind: adamw, learning_rate: 0.0001, weight_decay: 0.0001}
       loss_blocks:
-        - {block_id: waveform, kind: physics, source: field, weight: 1.0, update_interval: 1, batch_size: 8, min_valid_samples: 128, delta_l2_weight: 0.01}
+        - {block_id: waveform, kind: physics, source: field, weight: 1.0, update_interval: 1, batch_size: 8, min_valid_samples: 128, increment_l2_weight: 0.01}
       validation: {selection_metric: waveform.total, mode: full}
 
   deployment_checkpoint: last_stage.best
@@ -303,7 +303,7 @@ ginn_v2:
 
 训练完成后，可以在合成基准上做评估。流程分两步：
 
-**预测（`predict` 子命令）：** 加载指定 checkpoint，在合成基准的指定 split 上做前向推理。对每个 patch 输出预测 logAI、真值、低频模型和 mask，写入 `predictions.npz`。
+**预测（`predict` 子命令）：** 加载指定 checkpoint，在合成基准的指定 split 上做前向推理。对每个 patch 输出 `predicted_increment_log_ai`、`predicted_log_ai`、目标增量、输入 LFM 和 `valid_mask`，写入 `predictions.npz`。
 
 **报告（`report` 子命令）：** 消费预测结果，计算回归指标（RMSE、NRMSE、相关系数）、几何分解指标（边界误差、事件误差、横向梯度误差）、拼接指标和频率探针指标。同时计算低频模型基线和理想低频基线的对照指标。输出指标 CSV 和多面板对比图。
 
@@ -348,7 +348,7 @@ python scripts/ginn_v2.py --output-dir scripts/output/ginn_v2_test_report `
 
 | 文件 | 内容 |
 |------|------|
-| `checkpoint_best.pt` | 选优指标最优的权重，使用 `ginn_v2_checkpoint_v4` schema |
+| `checkpoint_best.pt` | 选优指标最优的权重，使用 `ginn_v2_checkpoint_v5` schema |
 | `checkpoint_final.pt` | 最终 epoch 的权重 |
 | `training_history.csv` | 每个 epoch 的指标、loss 分量、batch 计数和耗时 |
 | `<block_id>_patch_index.csv` | 该 block 的全部 patch 索引、划分和有效性计数 |
@@ -359,7 +359,7 @@ python scripts/ginn_v2.py --output-dir scripts/output/ginn_v2_test_report `
 
 | 文件 | 内容 |
 |------|------|
-| `predictions.npz` | 预测 logAI、真值、低频模型和 mask |
+| `predictions.npz` | `predicted_increment_log_ai`、`predicted_log_ai`、目标增量、输入 LFM 和 `valid_mask` |
 | `prediction_index.csv` | 每个 patch 的元数据 |
 | `model_patch_metrics.csv` | 每个 patch 的回归指标 |
 | `model_patch_metrics_by_sample_kind.csv` | 按 sample kind 分组的回归指标 |
@@ -433,4 +433,4 @@ python scripts/ginn_v2.py --output-dir scripts/output/ginn_v2_test_report `
 - 与真实工区 R1 诊断结果的双向反馈：真实工区正演闭环诊断的结论反向校准合成基准的退化参数，使两个闸门的难度对齐。
 - 早期停止策略：当前固定 epoch 数训练，后续应支持基于验证指标的 patience-based 早期停止。
 - 跨工区模型迁移的 OOD 检测自动化：当前跨工区使用 adapted checkpoint 需要手动确认，后续应自动量化输入分布偏移程度。
-- 合成探针增量评估的完整覆盖：当前频率探针指标依赖独立的 predict + report 路径，后续应纳入训练后的默认评估管线。
+- 合成旁路的频率 probe 不属于 v4 canonical benchmark；观测性分析保留在独立的 `cup.seismic.observability` 旁路中。

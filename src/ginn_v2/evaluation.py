@@ -5,6 +5,7 @@ The composable runner owns training; this module owns benchmark patch evaluation
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shutil
 from typing import Any, Mapping
@@ -19,7 +20,7 @@ from cup.synthetic.benchmark import SynthoseisBenchmark
 from cup.synthetic.reporting.metrics import regression_metrics
 from cup.utils.io import write_json
 from ginn_v2.checkpoint import load_checkpoint
-from ginn_v2.contracts import PATCH_SMOKE_REPORT_SCHEMA_VERSION
+from ginn_v2.contracts import PATCH_SMOKE_REPORT_SCHEMA_VERSION, PREDICTION_SCHEMA_VERSION
 from ginn_v2.data import PatchDataset, _aligned_arrays
 from ginn_v2.runtime import resolve_device
 
@@ -36,6 +37,14 @@ def predict_patches(
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     model, checkpoint = load_checkpoint(checkpoint_path)
+    if str(checkpoint.get("output_semantics") or "") != "predicted_increment_log_ai":
+        raise ValueError(
+            "GINN-v2 checkpoint does not use predicted_increment_log_ai output semantics."
+        )
+    if list(checkpoint.get("input_channels") or []) != [
+        "seismic", "input_lfm_log_ai", "valid_mask"
+    ]:
+        raise ValueError("GINN-v2 checkpoint input channel contract is not canonical.")
     device, device_metadata = resolve_device(device_name)
     model.to(device)
     model.eval()
@@ -63,20 +72,28 @@ def predict_patches(
         shutil.rmtree(buffer_dir, ignore_errors=True)
     buffer_dir.mkdir()
     buffers = {
-        "pred_log_ai": np.lib.format.open_memmap(
-            buffer_dir / "pred_log_ai.npy", mode="w+", dtype=np.float32,
+        "predicted_increment_log_ai": np.lib.format.open_memmap(
+            buffer_dir / "predicted_increment_log_ai.npy", mode="w+", dtype=np.float32,
+            shape=(patch_count, *patch_shape),
+        ),
+        "predicted_log_ai": np.lib.format.open_memmap(
+            buffer_dir / "predicted_log_ai.npy", mode="w+", dtype=np.float32,
+            shape=(patch_count, *patch_shape),
+        ),
+        "target_increment_log_ai": np.lib.format.open_memmap(
+            buffer_dir / "target_increment_log_ai.npy", mode="w+", dtype=np.float32,
             shape=(patch_count, *patch_shape),
         ),
         "target_log_ai": np.lib.format.open_memmap(
             buffer_dir / "target_log_ai.npy", mode="w+", dtype=np.float32,
             shape=(patch_count, *patch_shape),
         ),
-        "valid_mask_model": np.lib.format.open_memmap(
-            buffer_dir / "valid_mask_model.npy", mode="w+", dtype=bool,
+        "valid_mask": np.lib.format.open_memmap(
+            buffer_dir / "valid_mask.npy", mode="w+", dtype=bool,
             shape=(patch_count, *patch_shape),
         ),
-        "lfm_controlled_degraded": np.lib.format.open_memmap(
-            buffer_dir / "lfm_controlled_degraded.npy", mode="w+", dtype=np.float32,
+        "input_lfm_log_ai": np.lib.format.open_memmap(
+            buffer_dir / "input_lfm_log_ai.npy", mode="w+", dtype=np.float32,
             shape=(patch_count, *patch_shape),
         ),
         "lfm_ideal": np.lib.format.open_memmap(
@@ -91,17 +108,19 @@ def predict_patches(
         with torch.no_grad():
             for batch in loader:
                 x = batch["input"].to(device)
-                pred_delta = model(x).detach().cpu().numpy()[:, 0]
-                lfm = batch["lfm"].numpy()[:, 0]
-                prediction = lfm + pred_delta
+                predicted_increment = model(x).detach().cpu().numpy()[:, 0]
+                input_lfm = batch["input_lfm_log_ai"].numpy()[:, 0]
+                prediction = input_lfm + predicted_increment
                 batch_count = int(prediction.shape[0])
                 end = offset + batch_count
                 if end > patch_count:
                     raise RuntimeError("Prediction loader returned more patches than its index.")
-                buffers["pred_log_ai"][offset:end] = prediction.astype(np.float32)
+                buffers["predicted_increment_log_ai"][offset:end] = predicted_increment.astype(np.float32)
+                buffers["predicted_log_ai"][offset:end] = prediction.astype(np.float32)
+                buffers["target_increment_log_ai"][offset:end] = batch["target_increment_log_ai"].numpy()[:, 0].astype(np.float32)
                 buffers["target_log_ai"][offset:end] = batch["target_log_ai"].numpy()[:, 0].astype(np.float32)
-                buffers["valid_mask_model"][offset:end] = batch["valid_mask"].numpy()[:, 0].astype(bool)
-                buffers["lfm_controlled_degraded"][offset:end] = lfm.astype(np.float32)
+                buffers["valid_mask"][offset:end] = batch["valid_mask"].numpy()[:, 0].astype(bool)
+                buffers["input_lfm_log_ai"][offset:end] = input_lfm.astype(np.float32)
                 buffers["lfm_ideal"][offset:end] = batch["lfm_ideal"].numpy()[:, 0].astype(np.float32)
                 patch_ids.extend(str(value) for value in batch["patch_id"])
                 sample_ids.extend(str(value) for value in batch["sample_id"])
@@ -114,10 +133,12 @@ def predict_patches(
             array.flush()
         np.savez_compressed(
             npz_path,
-            pred_log_ai=buffers["pred_log_ai"],
+            predicted_increment_log_ai=buffers["predicted_increment_log_ai"],
+            predicted_log_ai=buffers["predicted_log_ai"],
+            target_increment_log_ai=buffers["target_increment_log_ai"],
             target_log_ai=buffers["target_log_ai"],
-            valid_mask_model=buffers["valid_mask_model"],
-            lfm_controlled_degraded=buffers["lfm_controlled_degraded"],
+            valid_mask=buffers["valid_mask"],
+            input_lfm_log_ai=buffers["input_lfm_log_ai"],
             lfm_ideal=buffers["lfm_ideal"],
             patch_id=np.asarray(patch_ids),
             sample_id=np.asarray(sample_ids),
@@ -144,12 +165,24 @@ def predict_patches(
 
 def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = prediction_dir / "prediction_summary.json"
+    if not summary_path.is_file():
+        raise FileNotFoundError(
+            f"Canonical GINN-v2 prediction summary not found: {summary_path}"
+        )
+    with summary_path.open("r", encoding="utf-8") as handle:
+        summary = json.load(handle)
+    if str(summary.get("schema_version") or "") != PREDICTION_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported GINN-v2 prediction schema {summary.get('schema_version')!r}; "
+            f"expected {PREDICTION_SCHEMA_VERSION}."
+        )
     index = pd.read_csv(prediction_dir / "prediction_index.csv")
     arrays = np.load(prediction_dir / "predictions.npz", allow_pickle=True)
-    pred = arrays["pred_log_ai"]
+    pred = arrays["predicted_log_ai"]
     target = arrays["target_log_ai"]
-    mask = arrays["valid_mask_model"].astype(bool)
-    lfm = arrays["lfm_controlled_degraded"]
+    mask = arrays["valid_mask"].astype(bool)
+    lfm = arrays["input_lfm_log_ai"]
     lfm_ideal = (
         arrays["lfm_ideal"]
         if "lfm_ideal" in arrays
@@ -164,7 +197,7 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
         metrics = regression_metrics(target[i], pred[i], valid_mask=mask[i])
         rows.append({**row.to_dict(), "series_id": row.get("series_id", ""), **metrics})
         lfm_metrics = regression_metrics(target[i], lfm[i], valid_mask=mask[i])
-        lfm_rows.append({**row.to_dict(), "series_id": "lfm_controlled_degraded", **lfm_metrics})
+        lfm_rows.append({**row.to_dict(), "series_id": "input_lfm_log_ai", **lfm_metrics})
         lfm_ideal_metrics = regression_metrics(target[i], lfm_ideal[i], valid_mask=mask[i])
         lfm_ideal_rows.append({**row.to_dict(), "series_id": "lfm_ideal", **lfm_ideal_metrics})
         oracle_metrics = regression_metrics(target[i], target[i], valid_mask=mask[i])
@@ -229,11 +262,11 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
         "geometry_holdout_aggregate": _aggregate(holdout_frame),
         "pinchout_holdout_n_patches": int(len(holdout_frame)),
         "realization_uniform_aggregate": _aggregate(
-            stitched["uniform"][stitched["uniform"]["series_id"].astype(str).ne("lfm_controlled_degraded")]
+            stitched["uniform"][stitched["uniform"]["series_id"].astype(str).ne("input_lfm_log_ai")]
         ),
         "realization_center_crop_aggregate": _aggregate(
             stitched["center_crop"][
-                stitched["center_crop"]["series_id"].astype(str).ne("lfm_controlled_degraded")
+                stitched["center_crop"]["series_id"].astype(str).ne("input_lfm_log_ai")
             ]
         ),
     }
@@ -732,7 +765,7 @@ def _stitch_one_strategy(
         rows.append(
             {
                 **base,
-                "series_id": "lfm_controlled_degraded",
+                "series_id": "input_lfm_log_ai",
                 **regression_metrics(target_full, lfm_full, valid_mask=valid),
             }
         )

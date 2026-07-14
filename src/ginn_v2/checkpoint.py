@@ -1,4 +1,4 @@
-"""GINN-v2 checkpoint v4 loading."""
+"""GINN-v2 canonical-increment checkpoint loading."""
 
 from __future__ import annotations
 
@@ -22,10 +22,20 @@ def load_checkpoint(
         raise ValueError(
             f"Unsupported GINN-v2 checkpoint schema in {path}; expected {CHECKPOINT_SCHEMA_VERSION}."
         )
+    if str(checkpoint.get("output_semantics") or "") != "predicted_increment_log_ai":
+        raise ValueError(
+            f"GINN-v2 checkpoint in {path} does not use predicted_increment_log_ai semantics."
+        )
+    if list(checkpoint.get("input_channels") or []) != [
+        "seismic", "input_lfm_log_ai", "valid_mask"
+    ]:
+        raise ValueError(
+            f"GINN-v2 checkpoint in {path} has a non-canonical input channel contract."
+        )
     architecture = dict(checkpoint.get("architecture") or {})
     architecture_id = str(architecture.get("id") or "")
     if not architecture_id:
-        raise ValueError("GINN-v2 checkpoint lacks the v4 architecture contract.")
+        raise ValueError("GINN-v2 checkpoint lacks the canonical architecture contract.")
     model, _ = build_model(
         architecture_id,
         hidden_channels=int(hidden_channels or architecture.get("hidden_channels", 32)),

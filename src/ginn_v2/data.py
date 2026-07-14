@@ -105,8 +105,9 @@ def _aligned_arrays(
     sample: Any,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     target = np.asarray(sample.target_log_ai, dtype=np.float32)
+    increment = np.asarray(sample.target_increment_log_ai, dtype=np.float32)
     seismic = np.asarray(sample.seismic_input, dtype=np.float32)
-    lfm = np.asarray(sample.priors["lfm_controlled_degraded"], dtype=np.float32)
+    lfm = np.asarray(sample.input_lfm_log_ai, dtype=np.float32)
     valid = np.asarray(sample.valid_mask, dtype=bool)
     sample_domain = str(getattr(sample, "sample_domain", ""))
     if sample_domain not in {"time", "depth"}:
@@ -118,10 +119,17 @@ def _aligned_arrays(
             f"{sample_domain.capitalize()} v4 requires N-point seismic/target alignment "
             f"for {sample.sample_id}: {seismic.shape} vs {target.shape}"
         )
-    if target.ndim != 2 or seismic.ndim != 2 or lfm.ndim != 2 or valid.ndim != 2:
+    if (
+        target.ndim != 2
+        or increment.ndim != 2
+        or seismic.ndim != 2
+        or lfm.ndim != 2
+        or valid.ndim != 2
+    ):
         raise ValueError(f"Expected 2D arrays for sample {sample.sample_id}.")
     if (
         target.shape[0] != seismic.shape[0]
+        or increment.shape != target.shape
         or lfm.shape != target.shape
         or valid.shape != target.shape
     ):
@@ -130,7 +138,10 @@ def _aligned_arrays(
             f"seismic={seismic.shape}, lfm={lfm.shape}, valid={valid.shape}"
         )
     if np.any(valid & (
-        ~np.isfinite(target) | ~np.isfinite(seismic) | ~np.isfinite(lfm)
+        ~np.isfinite(target)
+        | ~np.isfinite(increment)
+        | ~np.isfinite(seismic)
+        | ~np.isfinite(lfm)
     )):
         raise ValueError(
             f"Sample {sample.sample_id} has non-finite values inside valid_mask."
@@ -436,6 +447,7 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         target, seismic, lfm, valid = _aligned_arrays(sample)
         sl = _row_slice(row)
         target_patch = target[sl]
+        increment = np.asarray(sample.target_increment_log_ai, dtype=np.float32)[sl]
         seismic_patch = seismic[sl]
         lfm_patch = lfm[sl]
         valid_patch = valid[sl]
@@ -445,12 +457,13 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             lfm_patch,
             0.0,
         ).astype(np.float32)
-        delta = target_patch - lfm_patch
         seismic_n = _norm(seismic_patch, self.normalization["seismic"])
         lfm_n = _norm(lfm_patch, self.normalization["lfm"])
         seismic_n = np.where(input_valid_patch & np.isfinite(seismic_n), seismic_n, 0.0)
         lfm_n = np.where(input_valid_patch & np.isfinite(lfm_n), lfm_n, 0.0)
-        delta = np.where(valid_patch & np.isfinite(delta), delta, 0.0)
+        increment = np.where(
+            valid_patch & np.isfinite(increment), increment, 0.0
+        )
         target_patch = np.where(
             valid_patch & np.isfinite(target_patch), target_patch, 0.0
         )
@@ -511,7 +524,9 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         )
         return {
             "input": torch.from_numpy(inputs.astype(np.float32)),
-            "target_delta": torch.from_numpy(delta.astype(np.float32))[None, :, :],
+            "target_increment_log_ai": torch.from_numpy(
+                increment.astype(np.float32)
+            )[None, :, :],
             "target_log_ai": torch.from_numpy(target_patch.astype(np.float32))[
                 None, :, :
             ],
@@ -524,7 +539,9 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
                 physics_seismic_patch.astype(np.float32)
             )[None, :, :],
             "sample_axis": torch.from_numpy(sample_axis_patch.astype(np.float64)),
-            "lfm": torch.from_numpy(lfm_patch.astype(np.float32))[None, :, :],
+            "input_lfm_log_ai": torch.from_numpy(
+                lfm_patch.astype(np.float32)
+            )[None, :, :],
             "forward_lfm": torch.from_numpy(forward_lfm_patch)[None, :, :],
             "lfm_ideal": torch.from_numpy(lfm_ideal_patch.astype(np.float32))[
                 None, :, :
@@ -543,11 +560,11 @@ def _norm(values: np.ndarray, stats: Mapping[str, Any]) -> np.ndarray:
     )
 
 
-def denormalize_delta(
+def denormalize_increment(
     values: np.ndarray, normalization: Mapping[str, Any]
 ) -> np.ndarray:
     if "delta" in normalization:
         raise ValueError(
-            "Normalized-delta checkpoints are obsolete; GINN-v2 v4 outputs physical delta_log_ai."
+            "Normalized-increment checkpoints are obsolete; GINN-v2 v5 outputs physical predicted_increment_log_ai."
         )
     return np.asarray(values, dtype=np.float32)

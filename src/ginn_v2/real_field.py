@@ -31,7 +31,6 @@ from ginn_v2.contracts import (
     MODEL_RUN_SCHEMA_VERSION,
     ZERO_SHOT_MODEL_SCHEMA_VERSION,
 )
-from ginn_v2.data import denormalize_delta
 from ginn_v2.checkpoint import load_checkpoint
 from ginn_v2.runtime import resolve_device
 

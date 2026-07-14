@@ -21,6 +21,7 @@ LOSS_SOURCE_KINDS = {
 SOURCE_KEYS = {
     "synthoseis_lite": {
         "kind", "benchmark_dir", "input_seismic_variant", "physics_target_variant",
+        "max_patches",
     },
     "real_field": {
         "kind", "lfm_run_dir", "variant_id", "well_control_run_dir",
@@ -41,7 +42,7 @@ LOSS_KEYS = {
     },
     "physics": {
         "block_id", "kind", "source", "weight", "update_interval", "batch_size",
-        "min_valid_samples", "delta_l2_weight", "waveform_standardization",
+        "min_valid_samples", "increment_l2_weight", "waveform_standardization",
         "centered_rms_epsilon", "min_centered_rms", "sampling",
     },
     "real_well_supervised": {
@@ -51,12 +52,13 @@ LOSS_KEYS = {
 }
 VALIDATION_METRICS = {
     "synthetic_supervised": {"mse"},
-    "physics": {"waveform_mse", "delta_l2", "total"},
+    "physics": {"waveform_mse", "increment_l2", "total"},
     "real_well_supervised": {"mse"},
 }
 LEGACY_KEYS = {
     "train", "model_id", "model_role", "min_valid_fraction",
-    "lambda_physics", "lambda_real_delta", "real_delta",
+    "lambda_physics", "lambda_real_delta", "real_delta", "delta_l2_weight",
+    "physical_delta_log_ai", "pred_delta_log_ai", "target_delta",
 }
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -133,7 +135,7 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         legacy = sorted(set(root).intersection(LEGACY_KEYS))
         detail = f" Legacy fields found: {legacy}." if legacy else ""
         raise ValueError(
-            "GINN-v2 requires the ginn_v2_experiment_v1 configuration root 'ginn_v2'."
+            "GINN-v2 requires the ginn_v2_experiment_v2 configuration root 'ginn_v2'."
             + detail
             + " See docs/spec/GINN_V2_COMPOSABLE_TRAINING_DESIGN.md."
         )
@@ -197,6 +199,11 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
             raise ValueError(f"sources.{source_id} is missing required fields: {missing}")
         if kind == "synthoseis_lite" and source.get("physics_target_variant", "model_consistent") != "model_consistent":
             raise ValueError("Synthoseis physics_target_variant must be model_consistent.")
+        if kind == "synthoseis_lite" and source.get("max_patches") is not None:
+            source["max_patches"] = _positive_int(
+                source["max_patches"],
+                f"sources.{source_id}.max_patches",
+            )
         if kind == "real_field":
             split = _mapping(source.get("validation_split"), f"sources.{source_id}.validation_split")
             _reject_extra(split, {"kind", "fraction", "gap_m", "anchor"}, f"sources.{source_id}.validation_split")
@@ -246,7 +253,7 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         optimizer = _mapping(stage.get("optimizer"), f"stages[{stage_index}].optimizer")
         _reject_extra(optimizer, {"kind", "learning_rate", "weight_decay"}, f"stages[{stage_index}].optimizer")
         if optimizer.get("kind") != "adamw":
-            raise ValueError("GINN-v2 v1 only supports optimizer.kind=adamw.")
+            raise ValueError("GINN-v2 v2 only supports optimizer.kind=adamw.")
         optimizer["learning_rate"] = _finite(optimizer.get("learning_rate"), "optimizer.learning_rate", positive=True)
         optimizer["weight_decay"] = _finite(optimizer.get("weight_decay", 0.0), "optimizer.weight_decay", nonnegative=True)
         blocks_value = stage.get("loss_blocks")
@@ -293,7 +300,11 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
                         f"{block_id}.sampling is only supported for synthoseis_lite blocks."
                     )
             if kind == "physics":
-                block["delta_l2_weight"] = _finite(block.get("delta_l2_weight"), f"{block_id}.delta_l2_weight", positive=True)
+                block["increment_l2_weight"] = _finite(
+                    block.get("increment_l2_weight"),
+                    f"{block_id}.increment_l2_weight",
+                    positive=True,
+                )
                 source_kind = str(sources[source_id]["kind"])
                 expected_standardization = "masked_centered_rms" if source_kind == "real_field" else "raw"
                 actual_standardization = str(block.get("waveform_standardization") or expected_standardization)
@@ -329,7 +340,7 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         mode = str(validation.get("mode") or "full")
         if mode != "full":
             raise ValueError(
-                f"Stage {stage_id} validation.mode must be full; v1 validation never resamples."
+                f"Stage {stage_id} validation.mode must be full; v2 validation never resamples."
             )
         if "steps" in validation:
             raise ValueError("validation.steps is not supported; validation is a full deterministic pass.")

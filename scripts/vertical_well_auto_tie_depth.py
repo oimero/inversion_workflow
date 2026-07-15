@@ -34,6 +34,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.config.workflow import WorkflowConfig
+from cup.config.sources import resolve_source_run
 from cup.seismic.survey import segy_options_from_config
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
@@ -608,6 +609,19 @@ def _resolve_output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> P
     return output_root / f"vertical_well_auto_tie_depth_{timestamp}"
 
 
+def _resolve_preprocess_dir(workflow: WorkflowConfig, script_cfg: dict[str, Any]) -> Path:
+    source_runs = dict(script_cfg.get("source_runs") or {})
+    output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
+    return resolve_source_run(
+        source_runs.get("well_preprocess_dir"),
+        output_root=output_root,
+        prefix="well_preprocess",
+        required_files=["well_preprocess_status.csv", "run_summary.json"],
+        root=REPO_ROOT,
+        label="well_preprocess",
+    )
+
+
 # Main
 def main() -> None:
     args = parse_args()
@@ -634,7 +648,8 @@ def main() -> None:
     las_rho_unit = str(script_cfg.get("las_rho_unit", "g/cm3"))
 
     # Resolve paths
-    las_dir = resolve_relative_path(str(script_cfg["las_dir"]), root=REPO_ROOT)
+    preprocess_dir = _resolve_preprocess_dir(workflow, script_cfg)
+    las_dir = preprocess_dir / "preprocessed_las"
     las_file = las_dir / f"{well_name}.las"
     if not las_file.exists():
         raise FileNotFoundError(f"LAS file not found: {las_file}")

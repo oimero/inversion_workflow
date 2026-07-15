@@ -43,6 +43,7 @@ from cup.utils.io import (
     resolve_relative_path,
     sanitize_filename,
 )
+from cup.config.sources import resolve_source_run
 from cup.config.workflow import WorkflowConfig
 from cup.well.contracts import DEPTH_WAVELET_BATCH_SCHEMA_VERSION
 from cup.seismic.survey import segy_options_from_config
@@ -887,6 +888,39 @@ def _resolve_output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> P
     return output_root / f"wavelet_batch_synthetic_depth_{timestamp}"
 
 
+def _resolve_source_dirs(
+    workflow: WorkflowConfig,
+    script_cfg: dict[str, Any],
+    *,
+    source_well_name: str,
+) -> dict[str, Path]:
+    source_runs = dict(script_cfg.get("source_runs") or {})
+    output_root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
+    preprocess_dir = resolve_source_run(
+        source_runs.get("well_preprocess_dir"),
+        output_root=output_root,
+        prefix="well_preprocess",
+        required_files=["well_preprocess_status.csv", "run_summary.json"],
+        root=REPO_ROOT,
+        label="well_preprocess",
+    )
+    auto_tie_dir = resolve_source_run(
+        source_runs.get("vertical_well_auto_tie_depth_dir"),
+        output_root=output_root,
+        prefix="vertical_well_auto_tie_depth",
+        required_files=[
+            f"wavelet_201ms_{source_well_name}.csv",
+            f"run_summary_{source_well_name}.json",
+        ],
+        root=REPO_ROOT,
+        label="vertical_well_auto_tie_depth",
+    )
+    return {
+        "preprocess_dir": preprocess_dir,
+        "auto_tie_dir": auto_tie_dir,
+    }
+
+
 # Main
 def main() -> None:
     args = parse_args()
@@ -909,12 +943,16 @@ def main() -> None:
 
     # ── Resolve input paths ──
 
-    las_dir_str = str(script_cfg["las_dir"])
-    las_dir = resolve_relative_path(las_dir_str, root=REPO_ROOT)
+    source_well_name = str(script_cfg["source_well_name"])
+    source_dirs = _resolve_source_dirs(
+        workflow,
+        script_cfg,
+        source_well_name=source_well_name,
+    )
+    las_dir = source_dirs["preprocess_dir"] / "preprocessed_las"
     well_heads_file = resolve_relative_path(workflow.assets.well_heads_file, root=data_root)
     seismic_file = resolve_relative_path(workflow.seismic.file, root=data_root)
-    source_auto_tie_dir = REPO_ROOT / str(script_cfg["source_auto_tie_dir"])
-    source_well_name = str(script_cfg["source_well_name"])
+    source_auto_tie_dir = source_dirs["auto_tie_dir"]
     wavelet_path = source_auto_tie_dir / f"wavelet_201ms_{source_well_name}.csv"
     wavelet_run_summary_path = source_auto_tie_dir / f"run_summary_{source_well_name}.json"
 

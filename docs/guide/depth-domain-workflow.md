@@ -54,7 +54,8 @@ python scripts/vertical_well_auto_tie_depth.py --config <config-yaml> --well <so
 ```yaml
 vertical_well_auto_tie_depth:
   well_name: <source-well>          # 子波来源井
-  las_dir: <path-to-las-dir>        # Step 3 预处理 LAS 所在目录
+  source_runs:
+    well_preprocess_dir:            # 留空时自动发现最新的第3步产物
   las_vp_unit: us/m                 # DT 单位
   las_rho_unit: g/cm3               # 密度单位
   target_crop_ms: 201.0             # 最终子波目标长度 (ms)
@@ -77,6 +78,9 @@ vertical_well_auto_tie_depth:
     max_scale: 2.0
     num_iters: 20
 ```
+
+默认自动接上最新一次测井预处理结果。复现实验时可按需填写
+`source_runs.well_preprocess_dir` 固定整套输入。
 
 此外还需顶层 `seismic` 段声明深度域：
 
@@ -140,11 +144,12 @@ python scripts/wavelet_batch_synthetic_depth.py --config <config-yaml> --output-
 
 ```yaml
 wavelet_batch_synthetic_depth:
-  las_dir: <path-to-las-dir>            # Step 3 预处理 LAS 目录
+  source_runs:
+    well_preprocess_dir:                 # 留空时自动发现最新的第3步产物
+    vertical_well_auto_tie_depth_dir:    # 留空时自动发现最新的深度域第4步产物
   las_vp_unit: us/m
   las_rho_unit: g/cm3
 
-  source_auto_tie_dir: scripts/output/vertical_well_auto_tie_depth_<timestamp>
   source_well_name: <source-well>          # 子波来源井名
 
   shift_min_ms: -40.0                    # 时移扫描下限
@@ -160,7 +165,9 @@ wavelet_batch_synthetic_depth:
 
 同样需要顶层 `seismic.domain: depth` + `seismic.depth_basis: tvdss`。
 
-脚本从 `source_auto_tie_dir` 读取子波和 `run_summary_<source-well>.json`，日志过滤参数优先从 autotie 的 `best_parameters` 继承（`logs_median_size`、`logs_median_threshold`、`logs_std`），读取失败时回退到 `fallback_log_filter`。
+默认自动接上最新一次测井预处理结果和最新一次包含指定来源井产物的深度域第4步结果。复现实验时可按需填写 `source_runs` 下对应的运行目录固定输入。
+
+脚本从发现的深度域第4步目录读取子波和 `run_summary_<source-well>.json`，日志过滤参数优先从 autotie 的 `best_parameters` 继承（`logs_median_size`、`logs_median_threshold`、`logs_std`），读取失败时回退到 `fallback_log_filter`。
 
 ### 脚本在做什么
 
@@ -205,86 +212,7 @@ wavelet_batch_synthetic_depth:
 
 ## 深度域与时间域的关键差异
 
-### 合成旁路（Synthoseis-lite）
-
-深度域 v4 与时间域 v4 共用入口脚本 `scripts/synthoseis_lite.py` 和
-`synthoseis_lite_v4` 数据模式，通过 `sample_domain` 配置分派：
-
-```yaml
-synthoseis_lite:
-  sample_domain: depth        # time | depth
-  benchmark_schema: synthoseis_lite_v4
-  seismic_input:
-    policy: observed_highres_forward
-  seismic_forward:
-    backend: auto        # auto | numpy | torch_cuda
-    dtype: float64
-```
-
-主要差异：
-
-| 维度 | 时间域 v4 | 深度域 v4 |
-|------|-----------|-----------|
-| 采样轴 | TWT (ms) | TVDSS (m)，向下为正 |
-| 井曲线来源 | Step 4 filtered LAS + Step 5 全局子波 | Step 5 `shifted_filtered_las/AI` + `shifted_preprocessed_las/AI`、Step 6 冻结子波和 AI–Vp 关系 |
-| 可用套件 | canonical, field_conditioned, seismic_variant | 仅 `field_conditioned`；canonical 和 probe 关闭 |
-| 模型轴 | TWT 方向 | 工区原生 5 m + 8× 高分轴 |
-| 网络地震输入 | 高分辨率正演/抗混叠后的 `seismic_observed` | 高分辨率 AI–Vp 正演/抗混叠后的 `seismic_observed` |
-| physics/closure 参照 | `seismic_model_consistent` | `seismic_model_consistent` |
-
-两个域的样本都使用 `masks/valid_mask` 表示完整目标 ROI。生成阶段保证该 ROI 内的
-目标、LFM 和两类地震数组有限；高分辨率 forward support 只作为 QC。深度域
-`seismic_forward.backend=auto` 会在 CUDA 可用时使用 Torch depth backend，设为
-`numpy` 可显式使用 CPU；`torch_cuda` 在 CUDA 不可用时直接失败。xline 步长 4
-保持真实横向坐标语义，不改变 TVDSS 纵向采样单位。
-| 空间路径 | inline/xline 索引 | 显式 inline/xline 折线路径 |
-| 校准依赖 | Step 4/5/6 时间域来源 | Step 1 + Step 5（深度域）+ Step 6 |
-| mismatch 深度静差 | 不支持（只有时间方向平移） | 独立的米制深度静差，与秒制子波平移相互独立 |
-| mismatch 额外残余 | — | `residuals/residual_vs_lfm_ideal`、`residuals/residual_vs_lfm_controlled_degraded` |
-| LFM over_smoothing | 秒制 | 米制 |
-| Hz 低通字段 | 支持 | 禁止 |
-
-深度域 mismatch 的完整扰动链：扰动时间子波 → 深度正演 → 米制深度静差 → gain → noise。时间子波相位旋转和秒制平移独立于米制深度静差，三个维度可交叉组合。
-
-### 正演内核
-
-| 维度 | 时间域 | 深度域 |
-|------|--------|--------|
-| 正演算子 | 平稳卷积（子波宽度恒定） | 非平稳矩阵（子波米制宽度随速度变化） |
-| 正演函数 | `forward_time` | `forward_depth` |
-| 反射率 | 下界面挂点 | 下界面挂点 |
-| 输出 | N 点 | N 点 |
-| 坐标 | TWT | TVDSS，通过梯形慢度积分转相对 TWT，再套用时间子波 |
-
-核心实现在 `src/cup/physics/`，NumPy 与 PyTorch 双后端提供同名、同语义 API。调用方按采样域分派到 `forward_time` 或 `forward_depth`；反射率统一使用 `reflectivity_from_log_ai`（下界面挂点，长度 N-1）。合成地震与观测轴均为 N 点，不按域裁剪首尾样点。
-
-深度域正演额外要求 AI–Vp 关系，由 Step 6 岩石物理分析产出：
-
-```text
-AI = a * Vp + b          (a: g/cm³, b: m/s*g/cm³)
-Vp = (AI - b) / a
-```
-
-正演时由 `velocity_from_ai` 将预测阻抗转为传播速度，与冻结子波和 TVDSS 轴一起传入 `forward_depth`。子波始终使用秒制时间轴，不随采样域改变。
-
-内核严格拒绝：NaN 输入、非正速度、非递增深度、错域输入、偶数长度子波、形状刚好可广播但实际上不同义的数组。任何数据清洗必须在进入核心前以命名步骤显式执行。
-
-### 工作流配置
-
-深度域强制：
-
-- `seismic.domain: depth`
-- `seismic.depth_basis: tvdss`
-- 米制边界使用 `_m` 后缀（`margin_top_m`、`margin_bottom_m`），不使用 `_ms`
-- 错域字段直接报错，不静默忽略
-
-模型训练、零样本预测和正演闭环沿用同一采样域契约。模型清单与检查点记录深度域、米制单位、TVDSS 基准和岩石物理来源；零样本预测使用通用采样轴；正演闭环由预测阻抗和冻结速度关系生成逐样点速度，再在原生 TVDSS 轴上合成地震。
-
-零样本预测的边缘宽度使用米制配置。正演闭环把子波相位、子波秒制时移和米制深度静差分别扫描。深度域不运行赫兹频带诊断。
-
-### 体数据几何
-
-当前深度域地震体 inline 步长 1、xline 步长 4。所有体数据抽取必须通过显式 iline/xline 轴和 `SurveyLineGeometry` 计算数组位置，不得假设步长为 1 或把线号差直接当下标。
+TODO
 
 ---
 

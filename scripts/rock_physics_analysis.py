@@ -73,6 +73,7 @@ class AiVpModuleConfig:
     min_valid_samples_per_well: int | None = None
     min_valid_wells: int | None = None
     huber_delta_sigma: float | None = None
+    excluded_well_names: tuple[str, ...] = ()
 
 
 @dataclass
@@ -131,6 +132,38 @@ def _positive_float(value: Any, *, path: str) -> float:
     return result
 
 
+def _well_name_list(value: Any, *, path: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(f"{path} must be a list or null.")
+    names: list[str] = []
+    for index, item in enumerate(value):
+        name = str(item or "").strip()
+        if not name:
+            raise ValueError(f"{path}[{index}] must be a non-empty well name.")
+        names.append(name)
+    duplicates = sorted(
+        {name for name in names if names.count(name) > 1}, key=str.casefold
+    )
+    if duplicates:
+        raise ValueError(f"{path} contains duplicate well names: {duplicates}.")
+    return tuple(names)
+
+
+def _candidate_wells(
+    input_wells: list[str], excluded_well_names: tuple[str, ...]
+) -> list[str]:
+    unknown = sorted(set(excluded_well_names) - set(input_wells), key=str.casefold)
+    if unknown:
+        raise ValueError(
+            "rock_physics_analysis.modules.ai_vp_linear.excluded_well_names "
+            f"contains wells absent from the selected Step-3 run: {unknown}."
+        )
+    excluded = set(excluded_well_names)
+    return [well_id for well_id in input_wells if well_id not in excluded]
+
+
 def _parse_config(config: Mapping[str, Any]) -> dict[str, Any]:
     root = _mapping(config.get("rock_physics_analysis"), path="rock_physics_analysis")
     _reject_unknown(root, {"source_runs", "modules"}, path="rock_physics_analysis")
@@ -148,12 +181,22 @@ def _parse_config(config: Mapping[str, Any]) -> dict[str, Any]:
     ai_cfg = _mapping(modules["ai_vp_linear"], path="rock_physics_analysis.modules.ai_vp_linear")
     _reject_unknown(
         ai_cfg,
-        {"enabled", "min_valid_samples_per_well", "min_valid_wells", "huber_delta_sigma"},
+        {
+            "enabled",
+            "min_valid_samples_per_well",
+            "min_valid_wells",
+            "huber_delta_sigma",
+            "excluded_well_names",
+        },
         path="rock_physics_analysis.modules.ai_vp_linear",
     )
     if "enabled" not in ai_cfg or not isinstance(ai_cfg["enabled"], bool):
         raise ValueError("rock_physics_analysis.modules.ai_vp_linear.enabled must be explicitly true or false.")
     enabled = ai_cfg["enabled"]
+    excluded_well_names = _well_name_list(
+        ai_cfg.get("excluded_well_names"),
+        path="rock_physics_analysis.modules.ai_vp_linear.excluded_well_names",
+    )
     if enabled:
         required = {"min_valid_samples_per_well", "min_valid_wells", "huber_delta_sigma"}
         missing = sorted(required - set(ai_cfg))
@@ -179,9 +222,13 @@ def _parse_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 ai_cfg["huber_delta_sigma"],
                 path="rock_physics_analysis.modules.ai_vp_linear.huber_delta_sigma",
             ),
+            excluded_well_names=excluded_well_names,
         )
     else:
-        module_config = AiVpModuleConfig(enabled=False)
+        module_config = AiVpModuleConfig(
+            enabled=False,
+            excluded_well_names=excluded_well_names,
+        )
 
     return {
         "explicit_source": explicit_source,
@@ -403,6 +450,7 @@ def _relation_payload(
     fit: Any,
     *,
     module_config: AiVpModuleConfig,
+    input_wells: list[str],
     candidate_wells: list[str],
     accepted_wells: list[str],
     rejected: list[dict[str, str]],
@@ -429,6 +477,7 @@ def _relation_payload(
             "well_effective_weights": dict(fit.well_effective_weights),
         },
         "ai_consistency": {"rtol": AI_CONSISTENCY_RTOL, "atol_mps_gcc": AI_CONSISTENCY_ATOL},
+        "configured_excluded_wells": list(module_config.excluded_well_names),
         "candidate_wells": candidate_wells,
         "accepted_wells": accepted_wells,
         "rejected_wells": rejected,
@@ -437,7 +486,7 @@ def _relation_payload(
                 "well_id": well_id,
                 "path": repo_relative_path(loaded[well_id].path, root=REPO_ROOT),
             }
-            for well_id in candidate_wells
+            for well_id in input_wells
         ],
         "validation": {"a_positive": True, "inverse_velocity_finite_positive": True},
         "aggregate_qc": dict(fit.aggregate_qc),
@@ -550,11 +599,20 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
         write_json(output_dir / "run_summary.json", base_summary)
         return output_dir
 
+    input_wells = sorted(loaded, key=str.casefold)
+    candidate_wells = _candidate_wells(
+        input_wells, module_config.excluded_well_names
+    )
     module_dir = output_dir / "modules" / "ai_vp_linear"
     module_dir.mkdir(parents=True, exist_ok=False)
-    candidate_wells = sorted(loaded, key=str.casefold)
     samples: dict[str, WellAiVpSamples] = {}
-    qc_by_well: dict[str, dict[str, Any]] = {}
+    qc_by_well: dict[str, dict[str, Any]] = {
+        well_id: {
+            **_failed_qc(well_id, "configured_exclusion"),
+            "module_status": "configured_excluded",
+        }
+        for well_id in module_config.excluded_well_names
+    }
     rejected: list[dict[str, str]] = []
     for well_id in candidate_wells:
         try:
@@ -582,11 +640,12 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
     accepted_wells = sorted(samples, key=str.casefold)
     if len(accepted_wells) < int(module_config.min_valid_wells):
         qc_path = module_dir / "well_fit_qc.csv"
-        pd.DataFrame([qc_by_well[well_id] for well_id in candidate_wells]).to_csv(qc_path, index=False)
+        pd.DataFrame([qc_by_well[well_id] for well_id in input_wells]).to_csv(qc_path, index=False)
         base_summary["status"] = "failed"
         base_summary["modules"]["ai_vp_linear"] = {
             "enabled": True,
             "status": "failed",
+            "configured_excluded_wells": list(module_config.excluded_well_names),
             "candidate_wells": candidate_wells,
             "accepted_wells": accepted_wells,
             "rejected_wells": rejected,
@@ -599,11 +658,12 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
         fit = fit_equal_well_huber(samples, huber_delta_sigma=float(module_config.huber_delta_sigma))
     except Exception as exc:
         qc_path = module_dir / "well_fit_qc.csv"
-        pd.DataFrame([qc_by_well[well_id] for well_id in candidate_wells]).to_csv(qc_path, index=False)
+        pd.DataFrame([qc_by_well[well_id] for well_id in input_wells]).to_csv(qc_path, index=False)
         base_summary["status"] = "failed"
         base_summary["modules"]["ai_vp_linear"] = {
             "enabled": True,
             "status": "failed",
+            "configured_excluded_wells": list(module_config.excluded_well_names),
             "candidate_wells": candidate_wells,
             "accepted_wells": accepted_wells,
             "rejected_wells": rejected,
@@ -619,12 +679,13 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
         qc_by_well[well_id]["well_total_weight"] = fit.well_base_weights[well_id]
         qc_by_well[well_id]["well_effective_weight"] = fit.well_effective_weights[well_id]
     qc_path = module_dir / "well_fit_qc.csv"
-    pd.DataFrame([qc_by_well[well_id] for well_id in candidate_wells]).to_csv(qc_path, index=False)
+    pd.DataFrame([qc_by_well[well_id] for well_id in input_wells]).to_csv(qc_path, index=False)
 
     relation_path = module_dir / "rock_physics_relation.json"
     relation_payload = _relation_payload(
         fit,
         module_config=module_config,
+        input_wells=input_wells,
         candidate_wells=candidate_wells,
         accepted_wells=accepted_wells,
         rejected=rejected,
@@ -636,6 +697,7 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
     base_summary["modules"]["ai_vp_linear"] = {
         "enabled": True,
         "status": "success",
+        "configured_excluded_wells": list(module_config.excluded_well_names),
         "candidate_wells": candidate_wells,
         "accepted_wells": accepted_wells,
         "rejected_wells": rejected,

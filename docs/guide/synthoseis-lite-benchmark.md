@@ -57,7 +57,7 @@ python scripts/synthoseis_lite.py --config <config-yaml> generate \
 |------|------|------|
 | 第一步 | `well_inventory.csv` | 井口坐标 |
 | 第五步（深度域）| `wavelet_batch_metrics.csv`、`shifted_preprocessed_las/`、`shifted_filtered_las/` | 深度平移后的两套 LAS |
-| 旁路 | `forward_model_inputs.json` | 冻结子波和 AI–Vp 关系（来自岩石物理分析旁路） |
+| 深度域正演输入冻结旁路 | `forward_model_inputs.json` | 冻结子波和 AI–Vp 关系 |
 
 深度域的井曲线来自深度域第5步产出的两套平移 LAS：滤波版用于背景拟合，全曲线版用于提取波阻抗变化幅度。
 

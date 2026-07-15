@@ -29,7 +29,7 @@ python scripts/real_field_zero_shot.py --output-dir scripts/output/real_field_ze
 | 第七步 | `variants/<variant_id>/lfm.npz` | 所选低频模型，作为推理的结构性输入 |
 | 第六步 | `run_summary.json` / `well_control_manifest.csv` | 与 variant 直接契约一致的 canonical 井控 |
 | 第五步（时间域） | `selected_wavelet.csv` | 时间域模型的冻结子波来源 |
-| 岩石物理旁路（深度域） | `forward_model_inputs.json` | 深度域冻结子波、速度关系和直接上游契约 |
+| 深度域正演输入冻结旁路 | `forward_model_inputs.json` | 深度域冻结子波、速度关系和直接上游契约 |
 | 旁路 | 模型 checkpoint + `model_run_manifest.json` | 冻结的模型权重和标准化参数，manifest 中必须包含 `experiment_id` |
 | 旁路 | `input_reference_stats.json` | 地震数据值域变换的参考统计量 |
 | 数据目录 | 地震体 | 真实工区地震数据 |

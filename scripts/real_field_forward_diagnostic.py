@@ -2408,7 +2408,7 @@ def _load_depth_forward_inputs(
     if payload.get("schema") != FORWARD_MODEL_INPUTS_SCHEMA_VERSION:
         raise ValueError(
             f"Depth R1 expected {FORWARD_MODEL_INPUTS_SCHEMA_VERSION}, "
-            f"got {payload.get('schema')!r}; rebuild rock-physics analysis."
+            f"got {payload.get('schema')!r}; rebuild depth forward-model inputs."
         )
     if payload.get("sample_domain") != "depth" or payload.get("depth_basis") != "tvdss":
         raise ValueError("Depth R1 forward_model_inputs must declare depth/TVDSS.")

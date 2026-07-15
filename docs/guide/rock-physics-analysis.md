@@ -1,6 +1,6 @@
 # 岩石物理分析
 
-`rock_physics_analysis.py` 是工作流的研究旁路。它自动发现最新合格的第三步预处理产物，读取全部通过预处理的井的 LAS 曲线，通过可开关的分析模块拟合全工区统一的岩石物理关系，并冻结为正演输入清单供后续合成、训练和诊断使用。
+`rock_physics_analysis.py` 是工作流的研究旁路。它自动发现最新合格的第三步预处理产物，读取全部通过预处理的井的 LAS 曲线，通过可开关的分析模块拟合全工区统一的岩石物理关系。
 
 ---
 
@@ -23,9 +23,9 @@ python scripts/rock_physics_analysis.py --output-dir scripts/output/rock_physics
 | 第三步 | `well_preprocess_status.csv` | 权威井清单；只读取 `preprocess_status=passed` 的井 |
 | 第三步 | `preprocessed_las/*.las` | 每口通过预处理的井的规则 MD 网格 LAS |
 
-### 子波依赖
+### AI–Vp 关系
 
-仅当 `ai_vp_linear` 模块启用且拟合成功时，脚本才会读取配置中显式指定的时间子波文件，用于装配正演输入清单。时间域和深度域均可使用——时间域通常来自第五步全局子波，深度域通常来自 `vertical_well_auto_tie_depth.py` 产出的固定子波。
+拟合成功后产出 `rock_physics_relation.json`，供下游正演输入装配使用。
 
 ---
 
@@ -41,9 +41,6 @@ rock_physics_analysis:
       min_valid_samples_per_well: 100
       min_valid_wells: 3
       huber_delta_sigma: 1.345
-  forward_model:
-    wavelet_file: <path-to-wavelet-csv>
-    source_well: <well-name>       # 子波来源井名
 ```
 
 ### `source_runs`
@@ -54,7 +51,7 @@ rock_physics_analysis:
 
 ### `modules`
 
-当前只有 `ai_vp_linear` 一个模块。`enabled` 必须显式填写；设为 `false` 时脚本仍完整读取所有输入并写出审计结果，但不生成关系或正演清单。
+当前只有 `ai_vp_linear` 一个模块。`enabled` 必须显式填写；设为 `false` 时脚本仍完整读取所有输入并写出审计结果，但不生成关系。
 
 未来新增模块（如多孔介质替换、流体替代等）只需在 `modules` 下增加同名配置段，脚本会按白名单校验并顺序执行。
 
@@ -72,15 +69,11 @@ rock_physics_analysis:
 
 Huber 损失函数中区分二次损失和线性损失的阈值，以稳健尺度的倍数为单位。`1.345` 是标准值——当残差服从正态分布时，约 95% 的样点落在二次区。增大阈值让拟合更接近普通最小二乘，减小阈值让拟合对异常点更不敏感。
 
-### `forward_model`
-
-仅在 `ai_vp_linear` 启用时必填。`wavelet_file` 指向时间子波 CSV（时间域来自第五步，深度域来自 `vertical_well_auto_tie_depth.py`），`source_well` 记录子波来源井名。模块关闭时这一段可以省略，脚本也不会去检查子波文件是否存在。
-
 ---
 
 ## 脚本在做什么
 
-脚本分三层：**输入审计 → 模块分析 → 正演清单装配**。输入审计始终执行，后两层由模块开关控制。
+脚本分两层：**输入审计 → 模块分析**。输入审计始终执行，模块分析由开关控制。
 
 ### 第一层：输入审计（始终执行）
 
@@ -116,19 +109,9 @@ AI [m/s*g/cm³] = a [g/cm³] × Vp [m/s] + b [m/s*g/cm³]
 - **等井权**：每口井基础权重相同，与井深和采样密度无关。井内每个样点均分该井权重。
 - **稳健尺度**：用加权残差的中位数绝对偏差（MAD）估计数据离散度，天然抑制极端样点的影响力。
 - **Huber 迭代**：以等井权最小二乘为初值，在 `1.345σ` 阈值下迭代重加权，逐步降低异常点影响力。
-- **硬约束**：斜率 `a` 必须大于零，且全部拟合样点的 AI 反算回速度后必须全部有限且为正。任一条件不满足，模块失败且不生成正演清单。
+- **硬约束**：斜率 `a` 必须大于零，且全部拟合样点的 AI 反算回速度后必须全部有限且为正。任一条件不满足，模块失败。
 
 拟合完成后生成逐井 QC 指标和全局散点图，但这些逐井系数仅供诊断用途。
-
-### 第三层：正演清单装配（条件执行）
-
-模块成功后才触发。脚本读取配置中指定的时间子波，校验采样规则性和中心零点，然后装配 `forward_model_inputs.json`。该文件固定记录：
-
-- 第三步直接上游契约身份和合格井清单；
-- 岩石物理关系的 a/b、单位；
-- 子波路径、来源井和采样间隔。
-
-岩石物理运行只发布一个 `contract_fingerprint_sha256`。下游直接复制这个指纹，从而继承生产者发布时确定的内容身份，而无需重新访问原始文件；domain/unit、采样轴和子波中心等仍由显式语义校验负责。
 
 ---
 
@@ -149,7 +132,6 @@ AI [m/s*g/cm³] = a [g/cm³] × Vp [m/s] + b [m/s*g/cm³]
 
 | 文件 | 内容 |
 |------|------|
-| `forward_model_inputs.json` | 冻结的正演输入：子波引用、岩石物理关系和直接上游契约 |
 | `modules/ai_vp_linear/rock_physics_relation.json` | 全局 a/b、公式、单位、合格井清单、Huber 参数、收敛信息和汇总指标 |
 | `modules/ai_vp_linear/well_fit_qc.csv` | 全部候选井的校验状态、样点数、值域、AI 一致性偏差、R²、RMSE、MAE、偏差和权重 |
 | `modules/ai_vp_linear/figures/ai_vp_fit.png` | 分井散点图 + 全局拟合直线 + 残差图 |
@@ -185,9 +167,9 @@ Wrote rock-physics analysis to scripts/output/rock_physics_analysis_<timestamp>
 
 `figures/ai_vp_fit.png` 左侧是纵波速度–AI 散点图，右侧是残差图。全局关系应该穿过大多数井的主体点云。如果有整口井的系统性偏离（散点在线的同一侧），说明该井可能有独立的岩石物理趋势，被 Huber 降权是合理的。
 
-### 第五步：确认正演输入
+### 第五步：确认下游契约
 
-如果后续 Synthoseis 报契约不匹配，核对岩石物理 run 与校准/生成 manifest 的 `input_contracts`。旧数据模式不兼容；上游 LAS、关系或子波发生变化时，重建岩石物理 run 及其下游。
+如果后续步骤报契约不匹配，核对本旁路 `run_summary.json` 的 `contract_fingerprint_sha256` 与下游 manifest 中的 `input_contracts`。上游 LAS 发生变化时，重建本旁路及所有下游产物。
 
 ---
 

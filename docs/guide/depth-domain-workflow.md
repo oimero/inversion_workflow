@@ -15,7 +15,7 @@
 
 ---
 
-## 第4步（深度域）：固定子波提取
+## 第 4 步：固定子波提取
 
 `vertical_well_auto_tie_depth.py` 是一个单井专用子波提取脚本，只跑一口井、输出一条固定时间子波，供后续批量合成使用。
 
@@ -103,7 +103,7 @@ seismic:
 
 ---
 
-## 第5步（深度域）：批量合成与深度平移
+## 第 5 步：批量合成与深度平移
 
 `wavelet_batch_synthetic_depth.py` 用第4步产出的固定子波，对全部井做批量合成记录，并导出按各井时移策略处理后的两套 LAS。
 
@@ -131,11 +131,11 @@ wavelet_batch_synthetic_depth:
 
   source_well_name: <source-well>          # 子波来源井名
   skip_shift_scan_well_names:             # 保持输入深度、不扫描时移的井
-    - L3-NW2A
-    - L6-NW3A
+    - <well-with-untrusted-shift-a>
+    - <well-with-untrusted-shift-b>
 
-  shift_min_ms: -40.0                    # 时移扫描下限
-  shift_max_ms: 40.0                     # 时移扫描上限
+  shift_min_ms: -20.0                    # 时移扫描下限
+  shift_max_ms: 20.0                     # 时移扫描上限
 ```
 
 同样需要顶层 `seismic.domain: depth` + `seismic.depth_basis: tvdss`。
@@ -181,15 +181,74 @@ wavelet_batch_synthetic_depth:
 | `figures/qc_<well>_synthetic_vs_seismic.png` | 每井 R1 风格六 panel 波形 QC 图 |
 | `figures/qc_<well>_shift_scan.png` | 执行扫描井的时移扫描 corr 曲线 |
 
-### 来源井一致性检查
+---
 
-脚本末尾会检查子波来源井在批量合成中的实际采用时移是否与 autotie 阶段的 `table_t_shift` 一致。差异过大会在终端醒目提示。
+## 旁路：深度域正演输入冻结
+
+`depth_forward_model_inputs.py` 将岩石物理分析产出的 AI–Vp 关系与深度域第 4 步产出的固定子波组装为统一的 `forward_model_inputs.json`，供 Synthoseis-lite 深度域、GINN v2 和 R1 正演诊断使用。
+
+岩石物理分析和子波提取各自独立重跑，本旁路只在子波或关系发生变化时才需要重跑，避免更新子波时必须重跑整个岩石物理拟合。
+
+### 快速开始
+
+```powershell
+python scripts/depth_forward_model_inputs.py
+python scripts/depth_forward_model_inputs.py --config experiments/common/common.yaml
+python scripts/depth_forward_model_inputs.py --output-dir scripts/output/depth_forward_model_inputs_test
+```
+
+不带参数时，脚本自动发现最新的岩石物理分析和深度域第 4 步产物。
+
+### 配置参考
+
+所有配置在 `depth_forward_model_inputs` 段下：
+
+```yaml
+depth_forward_model_inputs:
+  source_runs:
+    rock_physics_analysis_dir:           # 留空时自动发现最新的 rock_physics_analysis 产物
+    vertical_well_auto_tie_depth_dir:     # 留空时自动发现最新的 vertical_well_auto_tie_depth 产物
+  source_well_name: <well-name>           # 子波来源井名
+```
+
+同时需要顶层 `seismic.domain: depth` + `seismic.depth_basis: tvdss`。
+
+### 脚本在做什么
+
+1. 校验来源。确认岩石物理分析运行成功且 `ai_vp_linear` 模块拟合通过，确认深度域第 4 步运行成功且来源井名匹配。
+2. 校验子波。读取子波 CSV，检查奇数长度、零时间居中，通过一次正向卷积验证子波可用。
+3. 校验岩石物理关系。确认 `rock_physics_relation.json` 的 schema、公式、单位和系数合法，合格井清单非空无重复。
+4. 冻结契约。将岩石物理关系路径、子波路径及参数、来源运行指纹写入 `forward_model_inputs.json`。
+
+### 核心输出文件
+
+| 文件 | 内容 |
+|------|------|
+| `forward_model_inputs.json` | 冻结的正演输入：子波路径与参数、AI–Vp 关系路径与系数、来源运行契约指纹 |
+| `run_summary.json` | 来源运行发现方式、`source_well_name`、契约指纹 |
 
 ---
 
 ## 深度域与时间域的关键差异
 
-TODO
+前五步的差异已在上面各节说明——深度域第 4 步只跑一口井输出固定子波，第 5 步用固定子波做全井深度平移。从第 6 步开始，两个域的数据流汇入同一套 `cup` 模块，差异体现在合同参数上。
+
+### 第 6 步：真实工区井控数据集
+
+时间域第 6 步的输入是时间域第 5 步（`well_auto_tie` 全井标定），深度域第 6 步的输入是深度域第 5 步（`wavelet_batch_synthetic_depth` 批量深度平移）。两者的输出 schema 完全相同（`real_field_well_controls_v3`），都产出一个 `WellControlSet`。
+
+关键差异：
+
+| | 时间域 | 深度域 |
+|---|---|---|
+| 上游步骤 | `well_auto_tie` | `wavelet_batch_synthetic_depth` |
+| 输入 LAS | 时间对齐后的标定 LAS | 深度平移后的 LAS |
+| `sample_domain` | `time` | `depth` |
+| `sample_unit` | `s` | `m` |
+| 轴间距 | ~2 ms | 5.0 m |
+| `depth_basis` | 无 | `tvdss` |
+
+其余逻辑完全一致：每口井从对齐后的曲线提取 AI，在 5 m 规则轴上重采样，产出 `canonical_background_log_ai` 和采样点掩码。
 
 ---
 
@@ -198,8 +257,10 @@ TODO
 ```text
 时间域主链：Step 1 → 2 → 3 → 4(well_auto_tie) → 5(wavelet_generation) → ...
                                           ↓
-深度域旁路：Step 1 → 2 → 3 → 4(vawt_depth) → 5(wbs_depth) → 旁路(rock_physics)
-                                                              ↓
+深度域旁路：Step 1 → 2 → 3 → 4(vawt_depth) → 5(wbs_depth)
+                         ↓                        ↓
+                    rock_physics ──────→ depth_forward_model_inputs
+                                              ↓
                                               synthoseis_lite depth v4 → GINN v2
                                                                           ↓
                                                    统一井控 → LFM v3 → R0 → R1(TVDSS)

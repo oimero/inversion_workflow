@@ -34,6 +34,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.config.workflow import WorkflowConfig
+from cup.well.contracts import DEPTH_VERTICAL_AUTO_TIE_SCHEMA_VERSION
 from cup.config.sources import resolve_source_run
 from cup.seismic.survey import segy_options_from_config
 from cup.utils.io import (
@@ -55,7 +56,7 @@ matplotlib.use("Agg")
 plt.rcParams["figure.dpi"] = 120
 pd.set_option("display.max_columns", 30)
 
-SCHEMA_VERSION = "vertical_well_auto_tie_depth_v2"
+SCHEMA_VERSION = DEPTH_VERTICAL_AUTO_TIE_SCHEMA_VERSION
 
 def _save_fig(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,8 @@
 # 06 真实工区井控数据集
 
-`real_field_well_controls.py` 是工作流的第六步。它只做一件事：**把不同上游标定产物的波阻抗对数统一转换成相同的井控事实。**
+`real_field_well_controls.py` 是工作流的第六步。它只做一件事：**把第四步标定产物的波阻抗对数统一转换成相同的井控事实。**
+
+> 深度域工区使用第五步（`wavelet_batch_synthetic_depth`）作为上游，配置方式见文末。
 
 ---
 
@@ -20,13 +22,12 @@ python scripts/real_field_well_controls.py --output-dir scripts/output/well_cont
 
 | 来源 | 文件 | 用途 |
 |------|------|------|
-| 第四步（时间域）或第五步（深度域） | `run_summary.json` | schema/domain 校验和直接上游契约身份 |
-| 第四步（时间域）或第五步（深度域） | 指标 CSV | 成功井清单和产物路径 |
-| 上游 LAS | 每井 filtered LAS 或 shifted filtered LAS | `AI [m/s*g/cm3]` 曲线 |
-| 上游转换表 | 每井优化 TDT | MD→TWT 映射（仅时间域） |
-| 上游轨迹计划 | 每井 trace sample plan | 斜井逐样点 inline/xline/XY（仅时间域斜井） |
+| 第四步 | `run_summary.json` | schema/domain 校验和直接上游契约身份 |
+| 第四步 | `well_tie_metrics.csv` | 成功井清单和产物路径 |
+| 第四步 | 每井 filtered LAS | `AI [m/s*g/cm3]` 曲线 |
+| 第四步 | 每井优化 TDT | MD→TWT 映射 |
+| 第四步 | 每井 trace sample plan | 斜井逐样点 inline/xline/XY（仅斜井） |
 | 第一步 | `well_inventory.csv` | 井口坐标、KB 高程、井型 |
-| 项目资产 | 井轨迹文件 | MD→TVDSS 映射（仅深度域斜井） |
 | 数据目录 | 地震体 | 目标 SampleAxis 和 survey geometry |
 
 ---
@@ -45,28 +46,22 @@ real_field_well_controls:
 
 ### `source_run_type`
 
-必填。只能是 `well_auto_tie` 或 `wavelet_batch_synthetic_depth`。不能为空、不能缩写、不能自动推断。脚本不会根据目录名、CSV 字段或 LAS 文件名猜测适配器，与上游数据模式或采样域不一致时直接失败。
+必填。时间域工区填 `well_auto_tie`。深度域工区填 `wavelet_batch_synthetic_depth`（详见文末）。不能为空、不能缩写、不能自动推断。
 
 | 值 | 目标域 | 上游 |
 |---|---|---|
 | `well_auto_tie` | time + s | 第四步 `well_tie_metrics.csv`，每井 filtered LAS + 优化 TDT |
-| `wavelet_batch_synthetic_depth` | depth + tvdss + m | 第五步（深度域） `wavelet_batch_metrics.csv`，每井 shifted filtered LAS |
+| `wavelet_batch_synthetic_depth` | depth + tvdss + m | 深度域第五步 `wavelet_batch_metrics.csv`，每井 shifted filtered LAS |
 
-时间域输入要求：
+输入要求：
 
 - 只接受第四步 `tie_status=success` 的井。
 - 每井必须有 filtered LAS（含 AI 曲线，单位 `m/s*g/cm3`）和优化 TDT 表。
 - 斜井还需要优化轨迹采样计划文件。
 
-深度域输入要求：
-
-- 只接受第五步（深度域）`status=ok` 的井。
-- 每井必须有深度平移后的过滤 LAS 路径。其纵轴仍按 MD 解释——只是被平移到了更好的深度位置，坐标体系不变。
-- 斜井需要项目井轨迹文件（Petrel 导出），用于 MD→TVDSS 转换；直井走 `md - kb` 公式，不需要轨迹文件。
-
 ### `source_run_dir`
 
-指向第四步（时间域）或第五步（深度域）的运行目录。留空时脚本做模式感知自动发现：按来源运行类型前缀在输出目录下找到最新的、数据模式和采样域匹配的成功运行。显式填路径则固定使用该目录，适合复现。
+指向第四步的运行目录。留空时脚本按 `source_run_type` 前缀在输出目录下自动发现最新的成功运行。显式填路径则固定使用该目录，适合复现。
 
 ### `well_inventory_file`
 
@@ -74,7 +69,7 @@ real_field_well_controls:
 
 ### `well_trace_dir`
 
-深度域斜井需要的井轨迹目录。时间域直井不需要，但配置段必须存在（可为空路径）。
+当前未使用。配置段必须存在，可为空路径。
 
 ---
 
@@ -85,22 +80,14 @@ real_field_well_controls:
 ### 第一阶段：适配
 
 1. 读取上游 `run_summary.json`，确认 schema、domain、status 匹配当前配置的 `source_run_type`。
-2. 读取指标 CSV，只保留状态成功的井。
+2. 读取 `well_tie_metrics.csv`，只保留 `tie_status=success` 的井。
 3. 读取 `well_inventory.csv`，与上游成功井做井名匹配。上游成功但 inventory 中不存在的井被拒绝。
 
 ### 第二阶段：域转换
 
-这是脚本的主体。时间域和深度域走不同的转换路径，但目标一致——把 MD 域的 ln(AI) 映射到地震采样轴上，同时不跨越 LAS 数据中的空值缺口。
+对每口井，通过优化 TDT 表把每个 TWT 采样点映射到 MD 轴上的一个位置，再从 LAS 的 MD 轴上读出该位置的 ln(AI) 值。空间位置方面，直井直接把井口的固定线号道号广播到所有样点；斜井从第四步产出的轨迹采样计划读取逐样点的线号、道号和 XY。
 
-**时间域：**
-
-对每口井，先通过优化 TDT 表把每个 TWT 采样点映射到 MD 轴上的一个位置，再从 LAS 的 MD 轴上读出该位置的 ln(AI) 值。空间位置方面，直井直接把井口的固定线号道号广播到所有样点；斜井从第四步产出的轨迹采样计划读取逐样点的线号、道号和 XY。
-
-**深度域：**
-
-更简单——没有 TDT 投影这个环节。直井直接用"测深减补心海拔"把 LAS 的 MD 轴转成 TVDSS 轴，在 TVDSS 上对齐到地震深度采样轴。斜井通过项目轨迹文件做 MD→TVDSS 映射，再从 TVDSS 反查到采样轴上。空间位置同样由井型决定：直井广播固定井位，斜井从轨迹插值 XY 再换算线号道号。
-
-两条路径共享一个关键约束：**LAS 中连续有限段之间的空值间隙不会被填补**。每个连续数据段独立插值，缺口处严格保留空值。这保证了井控事实不引入人为插值。
+关键约束：**LAS 中连续有限段之间的空值间隙不会被填补**。每个连续数据段独立插值，缺口处严格保留空值。这保证了井控事实不引入人为插值。
 
 ### 第三阶段：校验与写入
 
@@ -196,10 +183,10 @@ Successful wells: 12
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
 | schema_version 不匹配 | 上游 run summary 不是 v2 schema | 用当前版脚本重建上游 run |
-| source adapter/domain 不一致 | `source_run_type` 与上游 summary 的 domain 不匹配 | 时间域用 `well_auto_tie`，深度域用 `wavelet_batch_synthetic_depth` |
+| source adapter/domain 不一致 | `source_run_type` 与上游 summary 的 domain 不匹配 | 时间域用 `well_auto_tie` |
 | AI 单位不是 `m/s*g/cm3` | LAS 中 AI 曲线单位错误或缺失 | 检查上游 LAS 导出配置 |
 | AI 包含非正值 | LAS 中有零或负的 AI 值 | 检查上游测井曲线质量 |
-| TDT 或 trajectory 缺失 | 时间域井缺优化 TDT，或深度域斜井缺项目轨迹 | 补充对应文件 |
+| TDT 缺失 | 井缺优化 TDT 表 | 重新运行第四步确保该井标定成功 |
 | inventory 行缺失 | 上游成功的井在 well_inventory.csv 中找不到 | 重新运行第一步或检查井名是否变化 |
 | XY 与线号不一致 | 井的 physical XY 与 survey geometry 反算的线号不匹配 | 检查 inventory 中井口坐标或斜井轨迹是否正确 |
 | 有效样点为零 | 井的 LAS 覆盖范围与目标 SampleAxis 完全不重叠 | 检查目标窗口是否设得合理 |
@@ -208,7 +195,6 @@ Successful wells: 12
 
 ## 留到第二轮
 
-- 是否支持时间域和深度域之外的第三种 source adapter（如直接从 Petrel 导出的 TWT 域 LAS）。
 - 是否在 manifest 中增加逐井目标窗口覆盖率的百分比指标。
 - 是否对斜井轨迹做更精细的 QC（如轨迹点间距检查、狗腿度告警）。
-- 是否在 Step 6 中直接输出每井的 TDT/TVDSS 转换质量图。
+- 是否在 Step 6 中直接输出每井的 TDT 转换质量图。

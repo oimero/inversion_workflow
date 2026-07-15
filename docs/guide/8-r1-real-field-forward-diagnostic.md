@@ -26,7 +26,7 @@ python scripts/real_field_forward_diagnostic.py --output-dir scripts/output/real
 | 第八步 R0 | `real_field_zero_shot_summary.json` | R0 推理的完整元数据和来源回溯，包含每个模型的 experiment_id |
 | 第八步 R0 | `predictions.npz`（每个模型子目录） | 预测波阻抗和地震输入 |
 | 第五步（时间域） | `selected_wavelet.csv` | 时间域正演子波 |
-| 岩石物理旁路（深度域） | `forward_model_inputs.json` | 深度域冻结子波、速度关系与来源契约 |
+| 深度域正演输入冻结旁路 | `forward_model_inputs.json` | 深度域冻结子波、速度关系与来源契约 |
 | 第四步 | `well_tie_metrics.csv` | 井的标定状态和坐标，用于井 QC |
 | 第四步 | `wavelet_inventory.csv` | 候选子波清单，用于子波不确定性扫描 |
 | 第一步 | `well_inventory.csv` | 井位坐标和井型信息 |

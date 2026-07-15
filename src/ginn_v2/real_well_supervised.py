@@ -1022,7 +1022,7 @@ def _load_depth_forward_inputs(
         raise ValueError(
             "Depth real-well expected "
             f"{FORWARD_MODEL_INPUTS_SCHEMA_VERSION}, got {payload.get('schema')!r}; "
-            "rebuild the rock-physics analysis."
+            "rebuild the depth forward-model inputs."
         )
     if payload.get("sample_domain") != "depth" or payload.get("depth_basis") != "tvdss":
         raise ValueError("Depth real-well forward inputs must declare depth/TVDSS.")

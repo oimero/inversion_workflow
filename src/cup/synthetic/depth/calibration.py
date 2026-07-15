@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -444,13 +445,22 @@ def run_depth_calibration(
             script_cfg["impedance"]["coefficient_sigma_parent_cap"]
         ),
     )
+    with (
+        sources["rock_physics_analysis_dir"] / "run_summary.json"
+    ).open("r", encoding="utf-8") as handle:
+        rock_summary = json.load(handle)
+    locked_step3_run = str(
+        dict(rock_summary.get("source_run") or {}).get("well_preprocess_dir") or ""
+    )
+    if not locked_step3_run:
+        raise ValueError("Rock-physics summary does not identify its Step-3 source run.")
     payload = depth_payload_from_object_core_calibration(legacy, extra={
         "background_estimator": "per_well_zone_huber",
         "background_huber_delta_sigma": float(script_cfg["calibration"]["huber_delta_sigma"]),
         "horizon_contract": list(script_cfg["horizons"]),
         "source_provenance": dict(source_provenance),
         "config_provenance": dict(config_provenance),
-        "locked_step3_run": str(dict(forward_inputs.get("source_runs") or {}).get("well_preprocess_dir") or ""),
+        "locked_step3_run": locked_step3_run,
         "locked_step5_run": repo_relative_path(sources["wavelet_batch_synthetic_depth_dir"], root=repo_root),
         "well_curve_source_contract": {
             "full_log_ai": "Step 5 shifted_preprocessed_las/AI",

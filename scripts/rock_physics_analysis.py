@@ -39,9 +39,8 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.config.sources import resolve_source_run
 from cup.config.workflow import WorkflowConfig
-from cup.physics.numpy_backend import forward_time
 from cup.physics.rock_physics import WellAiVpSamples, fit_equal_well_huber, well_fit_metrics
-from cup.synthetic.schemas import FORWARD_MODEL_INPUTS_SCHEMA_VERSION, ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION
+from cup.synthetic.schemas import ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
@@ -57,7 +56,6 @@ from cup.utils.io import (
 SCHEMA_VERSION = ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION
 SCRIPT_VERSION = 1
 RELATION_SCHEMA = "rock_physics_relation_v1"
-FORWARD_INPUTS_SCHEMA = FORWARD_MODEL_INPUTS_SCHEMA_VERSION
 DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")
 KNOWN_MODULES = {"ai_vp_linear"}
 EXPECTED_CURVES = {
@@ -133,17 +131,9 @@ def _positive_float(value: Any, *, path: str) -> float:
     return result
 
 
-def _required_text(mapping: Mapping[str, Any], key: str, *, path: str) -> str:
-    value = mapping.get(key)
-    text = "" if value is None else str(value).strip()
-    if not text:
-        raise ValueError(f"{path}.{key} must be a non-empty string.")
-    return text
-
-
 def _parse_config(config: Mapping[str, Any]) -> dict[str, Any]:
     root = _mapping(config.get("rock_physics_analysis"), path="rock_physics_analysis")
-    _reject_unknown(root, {"source_runs", "modules", "forward_model"}, path="rock_physics_analysis")
+    _reject_unknown(root, {"source_runs", "modules"}, path="rock_physics_analysis")
 
     source_runs = _mapping(root.get("source_runs", {}), path="rock_physics_analysis.source_runs")
     _reject_unknown(source_runs, {"well_preprocess_dir"}, path="rock_physics_analysis.source_runs")
@@ -193,25 +183,9 @@ def _parse_config(config: Mapping[str, Any]) -> dict[str, Any]:
     else:
         module_config = AiVpModuleConfig(enabled=False)
 
-    forward_model_raw = root.get("forward_model")
-    forward_model: dict[str, str] | None = None
-    if forward_model_raw is not None:
-        inspected_forward = _mapping(forward_model_raw, path="rock_physics_analysis.forward_model")
-        _reject_unknown(
-            inspected_forward,
-            {"wavelet_file", "source_well"},
-            path="rock_physics_analysis.forward_model",
-        )
-    if enabled:
-        forward_cfg = _mapping(forward_model_raw, path="rock_physics_analysis.forward_model")
-        forward_model = {
-            "wavelet_file": _required_text(forward_cfg, "wavelet_file", path="rock_physics_analysis.forward_model"),
-            "source_well": _required_text(forward_cfg, "source_well", path="rock_physics_analysis.forward_model"),
-        }
     return {
         "explicit_source": explicit_source,
         "ai_vp_linear": module_config,
-        "forward_model": forward_model,
     }
 
 
@@ -220,13 +194,7 @@ def _contract_business_config(script_config: Mapping[str, Any]) -> dict[str, Any
     module_config = script_config.get("ai_vp_linear")
     if not isinstance(module_config, AiVpModuleConfig):
         raise TypeError("script_config.ai_vp_linear must be AiVpModuleConfig.")
-    forward_model = script_config.get("forward_model")
-    if forward_model is not None and not isinstance(forward_model, Mapping):
-        raise TypeError("script_config.forward_model must be a mapping or None.")
-    return {
-        "modules": {"ai_vp_linear": asdict(module_config)},
-        "forward_model": None if forward_model is None else dict(forward_model),
-    }
+    return {"modules": {"ai_vp_linear": asdict(module_config)}}
 
 
 def _status_table(path: Path) -> pd.DataFrame:
@@ -431,18 +399,6 @@ def _plot_fit(path: Path, samples: Mapping[str, WellAiVpSamples], a: float, b: f
     plt.close(fig)
 
 
-def _load_wavelet(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    if not path.is_file():
-        raise FileNotFoundError(f"Configured wavelet file does not exist: {path}")
-    table = pd.read_csv(path)
-    if list(table.columns) != ["time_s", "amplitude"]:
-        raise ValueError("Wavelet CSV columns must be exactly ['time_s', 'amplitude'].")
-    time_s = table["time_s"].to_numpy(dtype=np.float64)
-    amplitude = table["amplitude"].to_numpy(dtype=np.float64)
-    forward_time(np.array([0.0, 0.0], dtype=np.float64), time_s, amplitude)
-    return time_s, amplitude
-
-
 def _relation_payload(
     fit: Any,
     *,
@@ -562,6 +518,8 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
         "script_version": SCRIPT_VERSION,
         "created_at": datetime.now().astimezone().isoformat(),
         "status": "success",
+        "sample_domain": workflow.seismic.domain,
+        "depth_basis": workflow.seismic.depth_basis,
         "input_contracts": input_contracts,
         "source_run": source_summary,
         "input": {
@@ -691,18 +649,6 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
         "well_fit_qc": {"path": repo_relative_path(qc_path, root=REPO_ROOT)},
     }
 
-    forward_model = script_config["forward_model"]
-    wavelet_path = resolve_relative_path(forward_model["wavelet_file"], root=REPO_ROOT)
-    try:
-        wavelet_time, _ = _load_wavelet(wavelet_path)
-    except Exception as exc:
-        base_summary["status"] = "failed"
-        base_summary["forward_model_inputs"] = {
-            "status": "failed",
-            "reason": f"wavelet_validation_failed:{exc}",
-        }
-        write_json(output_dir / "run_summary.json", base_summary)
-        raise
     write_json(relation_path, relation_payload)
     _plot_fit(figure_path, samples, fit.relation.a, fit.relation.b)
     base_summary["artifacts"].update(
@@ -715,49 +661,6 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
             },
         }
     )
-    source_files = [
-        {
-            "well_id": well_id,
-            "path": repo_relative_path(loaded[well_id].path, root=REPO_ROOT),
-        }
-        for well_id in candidate_wells
-    ]
-    forward_inputs = {
-        "schema": FORWARD_INPUTS_SCHEMA,
-        "sample_domain": workflow.seismic.domain,
-        "depth_basis": workflow.seismic.depth_basis,
-        "wavelet": {
-            "source_well": forward_model["source_well"],
-            "path": repo_relative_path(wavelet_path, root=REPO_ROOT),
-            "time_unit": "s",
-            "sample_count": int(wavelet_time.size),
-            "dt_s": float(wavelet_time[1] - wavelet_time[0]),
-        },
-        "ai_velocity_relation": {
-            "path": repo_relative_path(relation_path, root=REPO_ROOT),
-            "formula": "AI = a * Vp + b",
-            "a": fit.relation.a,
-            "b": fit.relation.b,
-            "ai_unit": "m/s*g/cm3",
-            "vp_unit": "m/s",
-            "a_unit": "g/cm3",
-            "b_unit": "m/s*g/cm3",
-            "accepted_wells": accepted_wells,
-        },
-        "source_runs": {"well_preprocess_dir": repo_relative_path(source_dir, root=REPO_ROOT)},
-        "source_preprocessed_las": source_files,
-    }
-    forward_inputs_path = output_dir / "forward_model_inputs.json"
-    write_json(forward_inputs_path, forward_inputs)
-
-    base_summary["artifacts"].update(
-        {
-            "wavelet": {"path": repo_relative_path(wavelet_path, root=REPO_ROOT)},
-            "forward_model_inputs": {
-                "path": repo_relative_path(forward_inputs_path, root=REPO_ROOT),
-            },
-        }
-    )
     base_summary["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
     base_summary["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
         contract_schema_version=SCHEMA_VERSION,
@@ -765,15 +668,12 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
             "sample_domain": workflow.seismic.domain,
             "depth_basis": workflow.seismic.depth_basis,
             "relation_schema": RELATION_SCHEMA,
-            "forward_inputs_schema": FORWARD_INPUTS_SCHEMA,
         },
         business_config=business_config,
         input_contracts=input_contracts,
         primary_artifacts={
             "well_input_inventory": inventory_path,
             "rock_physics_relation": relation_path,
-            "forward_model_inputs": forward_inputs_path,
-            "external_wavelet": wavelet_path,
         },
     )
     write_json(output_dir / "run_summary.json", base_summary)

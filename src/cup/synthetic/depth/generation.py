@@ -1440,9 +1440,18 @@ def run_depth_generation(
         calibration.input_contracts.get("rock_physics_analysis") or {}
     )
     if str(recorded_rock_contract.get("contract_fingerprint_sha256") or "") != str(
-        forward_inputs["_contract_fingerprint_sha256"]
+        forward_inputs["_rock_physics_contract_fingerprint_sha256"]
     ):
         raise ValueError("impedance calibration and forward inputs use different rock-physics contracts.")
+    recorded_forward_contract = dict(
+        calibration.input_contracts.get("depth_forward_model_inputs") or {}
+    )
+    if str(recorded_forward_contract.get("contract_fingerprint_sha256") or "") != str(
+        forward_inputs["_contract_fingerprint_sha256"]
+    ):
+        raise ValueError(
+            "impedance calibration and generation use different depth forward-model inputs."
+        )
     input_contracts = {
         "calibration": {
             "path": repo_relative_path(calibration_summary_path, root=repo_root),
@@ -1451,6 +1460,15 @@ def run_depth_generation(
         "rock_physics_analysis": {
             "path": repo_relative_path(
                 sources["rock_physics_analysis_dir"] / "run_summary.json",
+                root=repo_root,
+            ),
+            "contract_fingerprint_sha256": str(
+                forward_inputs["_rock_physics_contract_fingerprint_sha256"]
+            ),
+        },
+        "depth_forward_model_inputs": {
+            "path": repo_relative_path(
+                sources["depth_forward_model_inputs_dir"] / "run_summary.json",
                 root=repo_root,
             ),
             "contract_fingerprint_sha256": str(

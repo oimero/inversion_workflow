@@ -36,7 +36,7 @@ python scripts/ginn_v2.py --output-dir scripts/output/ginn_v2_report `
 | 第七步 | `lfm_run_summary.json`、`variants/<id>/lfm.npz` | 真实工区低频模型（仅使用真实数据源时） |
 | 第六步 | `run_summary.json`、`well_control_manifest.csv` | 井控事实（仅使用真实井监督时） |
 | 第五步（时间域） | `selected_wavelet.csv` | 全局子波（仅时间域物理损失） |
-| 岩石物理旁路（深度域） | `forward_model_inputs.json` | 冻结子波和 AI–Vp 关系（仅深度域物理损失） |
+| 深度域正演输入冻结旁路 | `forward_model_inputs.json` | 冻结子波和 AI–Vp 关系 |
 | 用户配置 | `experiments/ginn_v2/train.yaml` | 实验配方 |
 
 合成基准目录设为 `auto` 时，脚本自动从合成基准的结果目录下搜索最新且完整的场条件基准。显式填路径则固定使用该目录。
@@ -109,7 +109,7 @@ GINN v2 的训练配方由五层组件自由组合而成：
 | `physics_target_seismic_transform` | 物理损失的目标地震经过什么变换。可以和模型输入不同——比如网络看 p99 归一化后的地震，但物理损失用原始振幅做比较 |
 | `validation_split` | 训练/验证的空间切分方式。`kind: spatial_block` 按 inline 尾段划出验证区，`gap_m` 控制训练和验证之间的隔离带宽度 |
 | `wavelet_generation_dir` | 仅时间域，指向第五步子波结果目录 |
-| `forward_model_inputs_path` | 仅深度域，指向岩石物理旁路产出的冻结子波和 AI–Vp 关系 |
+| `forward_model_inputs_path` | 仅深度域，指向深度域正演输入冻结旁路产出的冻结子波和 AI–Vp 关系 |
 
 `model_input_seismic_transform` 和 `physics_target_seismic_transform` 是两条独立管线：输入变换过的是为了让网络好训练，物理目标保持原始振幅是为了让物理约束有意义。两者不能互换。
 

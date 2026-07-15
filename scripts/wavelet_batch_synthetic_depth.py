@@ -1,8 +1,8 @@
 """Batch depth-domain well tie using a fixed wavelet.
 
 Takes a single auto-tie wavelet, generates synthetic seismograms for all wells,
-scans bulk time shifts to find the best match, and exports depth-shifted LAS
-files for downstream LFM building.
+applies each well's configured bulk-shift policy, and exports LAS files for
+downstream LFM building.
 
 Usage::
 
@@ -552,6 +552,66 @@ def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
         return np.nan
     return float(np.corrcoef(aa, bb)[0, 1])
 
+
+def evaluate_shift_policy(
+    *,
+    well_name: str,
+    twt_s: np.ndarray,
+    seismic_norm: np.ndarray,
+    ref_twt_s: np.ndarray,
+    ref_values: np.ndarray,
+    wavelet_amp: np.ndarray,
+    shift_values_s: np.ndarray,
+    skip_shift_scan: bool,
+    modeler: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]], float, str]:
+    scan_rows: list[dict[str, Any]] = []
+    if skip_shift_scan:
+        applied = evaluate_shift(
+            twt_s=twt_s,
+            seismic_norm=seismic_norm,
+            ref_twt_s=ref_twt_s,
+            ref_values=ref_values,
+            wavelet_amp=wavelet_amp,
+            shift_s=0.0,
+            modeler=modeler,
+        )
+        if not np.isfinite(applied["metrics"]["corr"]):
+            raise ValueError("Zero-shift synthetic correlation is not finite.")
+        return applied, scan_rows, np.nan, "skip_scan_zero_shift"
+
+    best: dict[str, Any] | None = None
+    for shift_s in shift_values_s:
+        result = evaluate_shift(
+            twt_s=twt_s,
+            seismic_norm=seismic_norm,
+            ref_twt_s=ref_twt_s,
+            ref_values=ref_values,
+            wavelet_amp=wavelet_amp,
+            shift_s=float(shift_s),
+            modeler=modeler,
+        )
+        metric = result["metrics"]
+        scan_rows.append(
+            {
+                "well_name": well_name,
+                "shift_s": metric["shift_s"],
+                "shift_ms": metric["shift_s"] * 1000.0,
+                "corr": metric["corr"],
+                "nmae": metric["nmae"],
+                "scale": metric["scale"],
+                "signed_ls_scale": metric["signed_ls_scale"],
+                "n_score_samples": metric["n_score_samples"],
+            }
+        )
+        if np.isfinite(metric["corr"]):
+            if best is None or metric["corr"] > best["metrics"]["corr"]:
+                best = result
+    if best is None:
+        raise ValueError("No finite shift-scan correlation values.")
+    return best, scan_rows, float(best["metrics"]["shift_s"]), "scan_best"
+
+
 def save_r1_style_synthetic_qc(
     *,
     well_name: str,
@@ -561,7 +621,7 @@ def save_r1_style_synthetic_qc(
     reflectivity_shifted: np.ndarray,
     seismic_norm: np.ndarray,
     synthetic_scaled: np.ndarray,
-    best_shift_s: float,
+    applied_shift_s: float,
 ) -> Path:
     from cup.seismic.viz import plot_well_waveform_qc
     from wtie.optimize.similarity import dynamic_normalized_xcorr, normalized_xcorr
@@ -619,7 +679,7 @@ def save_r1_style_synthetic_qc(
     corr = _safe_corr(observed_trace.values, synthetic_trace.values)
     title = (
         f"Depth Step 5 synthetic QC | {well_name} | relative TWT | "
-        f"corr={corr:.3f}, best shift={best_shift_s * 1000.0:.1f} ms"
+        f"corr={corr:.3f}, applied shift={applied_shift_s * 1000.0:.1f} ms"
     )
     fig, _axes = plot_well_waveform_qc(
         [selected_ai],
@@ -654,6 +714,7 @@ def process_well(
     wavelet_amp: np.ndarray,
     wavelet_dt_s: float,
     shift_values_s: np.ndarray,
+    skip_shift_scan: bool,
     auto_tie_log_filter_params: dict[str, Any],
     modeler: Any,
     output_dirs: dict[str, Path],
@@ -722,59 +783,40 @@ def process_well(
     seismic_raw = np.interp(twt_s, twt_seis, seis_twt)
     seismic_norm = zscore_trace(seismic_raw)
 
-    scan_rows = []
-    best = None
-    for shift_s in shift_values_s:
-        result = evaluate_shift(
-            twt_s=twt_s,
-            seismic_norm=seismic_norm,
-            ref_twt_s=twt_ref,
-            ref_values=ref_twt,
-            wavelet_amp=wavelet_amp,
-            shift_s=float(shift_s),
-            modeler=modeler,
-        )
-        metric = result["metrics"]
-        scan_rows.append(
-            {
-                "well_name": well_name,
-                "shift_s": metric["shift_s"],
-                "shift_ms": metric["shift_s"] * 1000.0,
-                "corr": metric["corr"],
-                "nmae": metric["nmae"],
-                "scale": metric["scale"],
-                "signed_ls_scale": metric["signed_ls_scale"],
-                "n_score_samples": metric["n_score_samples"],
-            }
-        )
-        if np.isfinite(metric["corr"]):
-            if best is None or metric["corr"] > best["metrics"]["corr"]:
-                best = result
+    applied, scan_rows, best_shift_s, shift_policy = evaluate_shift_policy(
+        well_name=well_name,
+        twt_s=twt_s,
+        seismic_norm=seismic_norm,
+        ref_twt_s=twt_ref,
+        ref_values=ref_twt,
+        wavelet_amp=wavelet_amp,
+        shift_values_s=shift_values_s,
+        skip_shift_scan=skip_shift_scan,
+        modeler=modeler,
+    )
 
-    if best is None:
-        raise ValueError("No finite shift-scan correlation values.")
-
-    best_metrics = best["metrics"]
-    best_shift_s = float(best_metrics["shift_s"])
-    best_synthetic_scaled = best_metrics["scale"] * best["synthetic_raw"]
-    depth_shift_df = compute_depth_shift_curve(tdt_df, twt_s, best_shift_s)
+    applied_metrics = applied["metrics"]
+    applied_shift_s = float(applied_metrics["shift_s"])
+    applied_synthetic_scaled = applied_metrics["scale"] * applied["synthetic_raw"]
+    depth_shift_df = compute_depth_shift_curve(tdt_df, twt_s, applied_shift_s)
 
     # Save per-well CSVs
-    scan_df = pd.DataFrame(scan_rows)
     qc_df = pd.DataFrame(
         {
             "twt_s": twt_s,
             "seismic_norm": seismic_norm,
-            "reflectivity_shifted": best["reflectivity_shifted"],
-            "synthetic_scaled": best_synthetic_scaled,
-            "residual": seismic_norm - best_synthetic_scaled,
+            "reflectivity_shifted": applied["reflectivity_shifted"],
+            "synthetic_scaled": applied_synthetic_scaled,
+            "residual": seismic_norm - applied_synthetic_scaled,
         }
     )
 
-    scan_path = output_dirs["shift_scans"] / f"shift_scan_{name}.csv"
+    scan_path: Path | None = None
     qc_path = output_dirs["synthetic_qc"] / f"synthetic_qc_{name}.csv"
     depth_shift_path = output_dirs["depth_shift_curves"] / f"depth_shift_curve_{name}.csv"
-    scan_df.to_csv(scan_path, index=False)
+    if not skip_shift_scan:
+        scan_path = output_dirs["shift_scans"] / f"shift_scan_{name}.csv"
+        pd.DataFrame(scan_rows).to_csv(scan_path, index=False)
     qc_df.to_csv(qc_path, index=False)
     depth_shift_df.to_csv(depth_shift_path, index=False)
 
@@ -804,22 +846,26 @@ def process_well(
         output_path=output_dirs["figures"] / f"qc_{name}_synthetic_vs_seismic.png",
         twt_s=twt_s,
         filtered_logset_twt=logset_twt,
-        reflectivity_shifted=best["reflectivity_shifted"],
+        reflectivity_shifted=applied["reflectivity_shifted"],
         seismic_norm=seismic_norm,
-        synthetic_scaled=best_synthetic_scaled,
-        best_shift_s=best_shift_s,
+        synthetic_scaled=applied_synthetic_scaled,
+        applied_shift_s=applied_shift_s,
     )
 
-    fig, ax = plt.subplots(figsize=(7, 3.5))
-    ax.plot(scan_df["shift_ms"], scan_df["corr"], lw=1.2, color="tab:blue")
-    ax.axvline(best_shift_s * 1000.0, color="tab:red", lw=1.0, ls="--", label="best shift")
-    ax.set_xlabel("Bulk time shift (ms)")
-    ax.set_ylabel("Correlation")
-    ax.set_title(f"{well_name} shift scan")
-    ax.legend(loc="best")
-    ax.grid(True, alpha=0.25)
-    _save_fig(output_dirs["figures"] / f"qc_{name}_shift_scan.png")
-    plt.close(fig)
+    shift_fig_path: Path | None = None
+    if not skip_shift_scan:
+        scan_df = pd.DataFrame(scan_rows)
+        fig, ax = plt.subplots(figsize=(7, 3.5))
+        ax.plot(scan_df["shift_ms"], scan_df["corr"], lw=1.2, color="tab:blue")
+        ax.axvline(applied_shift_s * 1000.0, color="tab:red", lw=1.0, ls="--", label="best shift")
+        ax.set_xlabel("Bulk time shift (ms)")
+        ax.set_ylabel("Correlation")
+        ax.set_title(f"{well_name} shift scan")
+        ax.legend(loc="best")
+        ax.grid(True, alpha=0.25)
+        shift_fig_path = output_dirs["figures"] / f"qc_{name}_shift_scan.png"
+        _save_fig(shift_fig_path)
+        plt.close(fig)
 
     # Depth shift statistics
     if depth_shift_df.empty:
@@ -835,7 +881,7 @@ def process_well(
         p90_depth_shift = float(np.nanpercentile(depth_values, 90))
 
     median_vp_mps = float(np.nanmedian(tdt_df["vp_mps"].to_numpy(dtype=float)))
-    approx_depth_shift_m = float(median_vp_mps * best_shift_s / 2.0)
+    approx_depth_shift_m = float(median_vp_mps * applied_shift_s / 2.0)
 
     row.update(
         {
@@ -850,13 +896,16 @@ def process_well(
             "twt_min_s": float(twt_s[0]),
             "twt_max_s": float(twt_s[-1]),
             "n_samples": int(twt_s.size),
+            "shift_policy": shift_policy,
             "best_shift_s": best_shift_s,
             "best_shift_ms": best_shift_s * 1000.0,
-            "corr": float(best_metrics["corr"]),
-            "nmae": float(best_metrics["nmae"]),
-            "scale": float(best_metrics["scale"]),
-            "signed_ls_scale": float(best_metrics["signed_ls_scale"]),
-            "n_score_samples": int(best_metrics["n_score_samples"]),
+            "applied_shift_s": applied_shift_s,
+            "applied_shift_ms": applied_shift_s * 1000.0,
+            "corr": float(applied_metrics["corr"]),
+            "nmae": float(applied_metrics["nmae"]),
+            "scale": float(applied_metrics["scale"]),
+            "signed_ls_scale": float(applied_metrics["signed_ls_scale"]),
+            "n_score_samples": int(applied_metrics["n_score_samples"]),
             "median_vp_mps": median_vp_mps,
             "median_depth_shift_m": median_depth_shift,
             "mean_depth_shift_m": mean_depth_shift,
@@ -864,7 +913,7 @@ def process_well(
             "p90_depth_shift_m": p90_depth_shift,
             "approx_depth_shift_m": approx_depth_shift_m,
             "synthetic_qc_path": repo_relative_path(qc_path, root=REPO_ROOT),
-            "shift_scan_path": repo_relative_path(scan_path, root=REPO_ROOT),
+            "shift_scan_path": "" if scan_path is None else repo_relative_path(scan_path, root=REPO_ROOT),
             "depth_shift_curve_path": repo_relative_path(depth_shift_path, root=REPO_ROOT),
             "shifted_preprocessed_las_path": repo_relative_path(shifted_preprocessed_las_path, root=REPO_ROOT),
             "shifted_filtered_las_path": repo_relative_path(shifted_filtered_las_path, root=REPO_ROOT),
@@ -874,7 +923,7 @@ def process_well(
             "shifted_preprocessed_curve_count": shifted_preprocessed_stats["exported_curve_count"],
             "shifted_filtered_curve_count": shifted_filtered_stats["exported_curve_count"],
             "synthetic_fig_path": repo_relative_path(synthetic_fig_path, root=REPO_ROOT),
-            "shift_fig_path": repo_relative_path(output_dirs["figures"] / f"qc_{name}_shift_scan.png", root=REPO_ROOT),
+            "shift_fig_path": "" if shift_fig_path is None else repo_relative_path(shift_fig_path, root=REPO_ROOT),
         }
     )
     return row
@@ -919,6 +968,39 @@ def _resolve_source_dirs(
         "preprocess_dir": preprocess_dir,
         "auto_tie_dir": auto_tie_dir,
     }
+
+
+def validate_skip_shift_scan_well_names(
+    value: Any,
+    *,
+    available_well_names: list[str],
+    source_well_name: str,
+) -> list[str]:
+    if value is None or value == "":
+        names: list[str] = []
+    elif isinstance(value, list):
+        names = []
+        for index, item in enumerate(value):
+            name = str(item).strip()
+            if not name:
+                raise ValueError(
+                    "skip_shift_scan_well_names entries must be non-empty; "
+                    f"entry {index} is blank."
+                )
+            names.append(name)
+    else:
+        raise ValueError("skip_shift_scan_well_names must be a YAML list, blank, or null.")
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"Duplicate skip_shift_scan_well_names: {duplicates}")
+    unknown = sorted(set(names) - set(available_well_names))
+    if unknown:
+        raise ValueError(f"Shift-scan skip wells do not have LAS files: {unknown}")
+    if source_well_name in names:
+        raise ValueError(
+            f"Source well {source_well_name!r} cannot appear in skip_shift_scan_well_names."
+        )
+    return names
 
 
 # Main
@@ -979,20 +1061,19 @@ def main() -> None:
 
     # ── Well list ──
 
-    excluded_well_names = list(script_cfg.get("excluded_well_names", []))
     all_las_well_names = sorted(path.stem for path in las_dir.glob("*.las"))
     if not all_las_well_names:
         raise ValueError(f"No LAS files found in {las_dir}")
-    excluded_set = set(excluded_well_names)
-    unknown = sorted(excluded_set - set(all_las_well_names))
-    if unknown:
-        raise ValueError(f"Excluded wells do not have LAS files: {unknown}")
-    well_names = [w for w in all_las_well_names if w not in excluded_set]
-    if not well_names:
-        raise ValueError("No wells left after applying excluded_well_names.")
+    skip_shift_scan_well_names = validate_skip_shift_scan_well_names(
+        script_cfg.get("skip_shift_scan_well_names"),
+        available_well_names=all_las_well_names,
+        source_well_name=source_well_name,
+    )
+    skip_shift_scan_set = set(skip_shift_scan_well_names)
+    well_names = list(all_las_well_names)
     if args.well:
         if args.well not in well_names:
-            raise ValueError(f"--well {args.well} not in well list (or excluded). Available: {well_names}")
+            raise ValueError(f"--well {args.well} not in well list. Available: {well_names}")
         well_names = [args.well]
 
     print("=== Batch Synthetic Depth ===")
@@ -1001,6 +1082,7 @@ def main() -> None:
     print(f"Seismic: {seismic_file}")
     print(f"Output dir: {output_dir}")
     print(f"Wells to process ({len(well_names)}): {well_names}")
+    print(f"Wells using zero shift without scan: {skip_shift_scan_well_names}")
 
     # ── Load wavelet ──
 
@@ -1020,20 +1102,26 @@ def main() -> None:
     shift_max_ms = float(script_cfg["shift_max_ms"])
     shift_values_s = np.arange(shift_min_ms / 1000.0, shift_max_ms / 1000.0 + 0.5 * wavelet_dt_s, wavelet_dt_s)
 
-    # Load auto-tie run summary for log filter params (with fallback)
+    # Load the exact log-filter parameters selected by the source auto-tie run.
     source_run_summary = json.loads(wavelet_run_summary_path.read_text(encoding="utf-8"))
-    source_expected_shift_s = float(source_run_summary.get("auto_tie_best_parameters", {}).get("table_t_shift", np.nan))
-    auto_tie_log_filter_params = {
-        key: source_run_summary.get("auto_tie_best_parameters", {}).get(key)
-        for key in ["logs_median_size", "logs_median_threshold", "logs_std"]
-    }
-    if any(value is None for value in auto_tie_log_filter_params.values()):
-        fallback = script_cfg["fallback_log_filter"]
-        auto_tie_log_filter_params = {
-            "logs_median_size": fallback["logs_median_size"],
-            "logs_median_threshold": fallback["logs_median_threshold"],
-            "logs_std": fallback["logs_std"],
-        }
+    best_parameters = source_run_summary.get("auto_tie_best_parameters")
+    if not isinstance(best_parameters, dict):
+        raise ValueError(
+            f"Source auto-tie summary lacks auto_tie_best_parameters: {wavelet_run_summary_path}"
+        )
+    required_log_filter_keys = ["logs_median_size", "logs_median_threshold", "logs_std"]
+    missing_log_filter_keys = [
+        key
+        for key in required_log_filter_keys
+        if key not in best_parameters or best_parameters[key] is None
+    ]
+    if missing_log_filter_keys:
+        raise ValueError(
+            "Source auto-tie summary is missing required log-filter parameters "
+            f"{missing_log_filter_keys}: {wavelet_run_summary_path}"
+        )
+    source_expected_shift_s = float(best_parameters.get("table_t_shift", np.nan))
+    auto_tie_log_filter_params = {key: best_parameters[key] for key in required_log_filter_keys}
 
     print(f"Wavelet samples={wavelet_amp.size}, dt={wavelet_dt_s * 1000:.3f} ms")
     print(f"Wavelet full half-support={wavelet_full_half_s * 1000:.1f} ms")
@@ -1104,12 +1192,13 @@ def main() -> None:
                     wavelet_amp=wavelet_amp,
                     wavelet_dt_s=wavelet_dt_s,
                     shift_values_s=shift_values_s,
+                    skip_shift_scan=well_name in skip_shift_scan_set,
                     auto_tie_log_filter_params=auto_tie_log_filter_params,
                     modeler=modeler,
                     output_dirs=output_dirs,
                 )
             print(
-                f"OK: shift={row['best_shift_ms']:.1f} ms, corr={row['corr']:.3f}, "
+                f"OK: shift={row['applied_shift_ms']:.1f} ms, corr={row['corr']:.3f}, "
                 f"nmae={row['nmae']:.3f}, depth_shift={row['median_depth_shift_m']:.1f} m"
             )
         except Exception as exc:
@@ -1139,7 +1228,7 @@ def main() -> None:
         axes[0].set_xticks(x)
         axes[0].set_xticklabels(labels, rotation=45, ha="right")
         axes[0].set_ylabel("Correlation")
-        axes[0].set_title("Best-shift correlation")
+        axes[0].set_title("Applied-shift correlation")
         axes[0].set_ylim(-1, 1)
         axes[0].grid(True, axis="y", alpha=0.25)
 
@@ -1147,10 +1236,10 @@ def main() -> None:
         axes[1].set_xticks(x)
         axes[1].set_xticklabels(labels, rotation=45, ha="right")
         axes[1].set_ylabel("NMAE")
-        axes[1].set_title("Best-shift NMAE")
+        axes[1].set_title("Applied-shift NMAE")
         axes[1].grid(True, axis="y", alpha=0.25)
 
-        axes[2].bar(x, ok_df["best_shift_ms"], color="tab:green", alpha=0.85)
+        axes[2].bar(x, ok_df["applied_shift_ms"], color="tab:green", alpha=0.85)
         axes[2].axhline(0.0, color="black", lw=0.8)
         if np.isfinite(source_expected_shift_s):
             axes[2].axhline(
@@ -1163,7 +1252,7 @@ def main() -> None:
             axes[2].legend(loc="best")
         axes[2].set_xticks(x)
         axes[2].set_xticklabels(labels, rotation=45, ha="right")
-        axes[2].set_ylabel("Best shift (ms)")
+        axes[2].set_ylabel("Applied shift (ms)")
         axes[2].set_title("Bulk time shift")
         axes[2].grid(True, axis="y", alpha=0.25)
         _save_fig(output_dirs["figures"] / "qc_01_batch_metric_summary.png")
@@ -1212,9 +1301,9 @@ def main() -> None:
     if source_well_name in metrics_df["well_name"].values and np.isfinite(source_expected_shift_s):
         source_row = metrics_df.loc[metrics_df["well_name"] == source_well_name].iloc[0]
         if source_row["status"] == "ok":
-            delta_ms = float(source_row["best_shift_ms"] - source_expected_shift_s * 1000.0)
+            delta_ms = float(source_row["applied_shift_ms"] - source_expected_shift_s * 1000.0)
             print(f"\n{source_well_name} sanity check:")
-            print(f"  batch best shift = {source_row['best_shift_ms']:.3f} ms")
+            print(f"  batch applied shift = {source_row['applied_shift_ms']:.3f} ms")
             print(f"  auto-tie table_t_shift = {source_expected_shift_s * 1000.0:.3f} ms")
             print(f"  difference = {delta_ms:.3f} ms")
 
@@ -1263,10 +1352,22 @@ def main() -> None:
             },
             "depth_shift_boundary_policy": "edge extrapolate outside depth_shift_curve support and record counts/fraction",
         },
+        "metrics_contract": {
+            "shift_policy_values": ["scan_best", "skip_scan_zero_shift"],
+            "best_shift_fields": "nullable scan diagnostics",
+            "applied_shift_fields": "time shift used by QC, LAS export, and depth-shift statistics",
+            "skip_scan_artifacts": "shift_scan_path and shift_fig_path are empty",
+        },
         "counts": {
             "requested_wells": len(well_names),
             "successful_wells": ok_count,
             "failed_wells": failed_count,
+            "shift_scanned_wells": int(
+                (ok_df.get("shift_policy", pd.Series(dtype=str)) == "scan_best").sum()
+            ),
+            "shift_scan_skipped_wells": int(
+                (ok_df.get("shift_policy", pd.Series(dtype=str)) == "skip_scan_zero_shift").sum()
+            ),
         },
     }
     if ok_count > 0:

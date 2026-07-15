@@ -2,37 +2,16 @@
 
 深度域工作流定位为**一次性处理**，复用概率低。第1步–3（井资产盘点、LAS 筛选、测井预处理）和旁路岩石物理分析与时间域共享，本文不再重复。
 
-深度域特有的步骤只有两步：**固定子波提取**和**批量合成与深度平移**。二者是当前工区的遗留一次性路径，不属于标准工作流 API，也不作为后续统一正演重构的依赖。
-
 ---
 
 ## 总览
 
-| 步骤 | 脚本 | 做什么 |
-|------|------|--------|
-| Step 4（深度域） | `scripts/vertical_well_auto_tie_depth.py` | 从指定井提取一条固定时间子波 |
-| Step 5（深度域） | `scripts/wavelet_batch_synthetic_depth.py` | 用该子波做全井批量合成、时移扫描、导出深度平移后的两套 LAS |
+深度域特有的步骤只有两步：**固定子波提取**和**批量合成与深度平移**。深度域第4步/5 与时间域第4步/5 **互不依赖**、**平行存在**：
 
-产物关系：
-
-```text
-vertical_well_auto_tie_depth.py
-  → wavelet_201ms_<source-well>.csv        （固定时间子波，供 Step 5 使用）
-
-wavelet_batch_synthetic_depth.py
-  → wavelet_batch_metrics.csv     （全井指标汇总）
-  → shifted_preprocessed_las/     （深度平移后的 Step 3 全曲线 LAS）
-  → shifted_filtered_las/         （深度平移后的 filtered DT_USM/RHO_GCC/AI）
-  → shift_scans/                  （每井时移扫描明细）
-  → depth_shift_curves/           （每井深度平移曲线）
-  → synthetic_qc/                 （每井合成记录 QC）
-  → figures/                      （每井 QC 图 + 批量汇总图）
-```
-
-两套 shifted LAS 的下游消费：
-
-- `shifted_preprocessed_las/AI` → Synthoseis-lite depth v4 的完整波阻抗真值和统计；
-- `shifted_filtered_las/AI` → Synthoseis-lite depth v4 的背景拟合，避免背景被尖刺支配。
+- 时间域第4步做全井自动标定，输出每井候选子波；
+- 深度域第4步只跑一口指定井，输出一条固定子波；
+- 时间域第5步做全井交叉评测和共识子波优化；
+- 深度域第5步用固定子波做全井时移扫描和深度平移 LAS 导出。
 
 ---
 
@@ -126,7 +105,7 @@ seismic:
 
 ## 第5步（深度域）：批量合成与深度平移
 
-`wavelet_batch_synthetic_depth.py` 用第4步产出的固定子波，对全部井做批量合成记录、时移扫描，并导出深度平移后的两套 LAS。
+`wavelet_batch_synthetic_depth.py` 用第4步产出的固定子波，对全部井做批量合成记录，并导出按各井时移策略处理后的两套 LAS。
 
 ### 快速开始
 
@@ -151,23 +130,19 @@ wavelet_batch_synthetic_depth:
   las_rho_unit: g/cm3
 
   source_well_name: <source-well>          # 子波来源井名
+  skip_shift_scan_well_names:             # 保持输入深度、不扫描时移的井
+    - L3-NW2A
+    - L6-NW3A
 
   shift_min_ms: -40.0                    # 时移扫描下限
   shift_max_ms: 40.0                     # 时移扫描上限
-
-  excluded_well_names: []                # 排除的井名列表
-
-  fallback_log_filter:                   # 当日志过滤参数从 source run 读取失败时的回退
-    logs_median_size: 7
-    logs_median_threshold: 0.15
-    logs_std: 0.15
 ```
 
 同样需要顶层 `seismic.domain: depth` + `seismic.depth_basis: tvdss`。
 
 默认自动接上最新一次测井预处理结果和最新一次包含指定来源井产物的深度域第4步结果。复现实验时可按需填写 `source_runs` 下对应的运行目录固定输入。
 
-脚本从发现的深度域第4步目录读取子波和 `run_summary_<source-well>.json`，日志过滤参数优先从 autotie 的 `best_parameters` 继承（`logs_median_size`、`logs_median_threshold`、`logs_std`），读取失败时回退到 `fallback_log_filter`。
+脚本从发现的深度域第4步目录读取子波和 `run_summary_<source-well>.json`，并使用该次标定选出的测井中值滤波窗口、去尖峰阈值和高斯平滑标准差。摘要缺少任一参数时脚本直接报错。
 
 ### 脚本在做什么
 
@@ -177,6 +152,8 @@ wavelet_batch_synthetic_depth:
 
 **2) 时移扫描。** 固定子波不变。用测井曲线计算反射系数，与子波卷积得到合成记录，在 ±40 毫秒范围内逐档平移反射系数，每次平移后计算合成记录与实际地震道的相似度，选出相关系数最高的平移量。这一步的目的是找出测井和地震之间的整体时间偏差。
 
+名单中的井只在零时移位置计算一次合成记录、相关系数和 NMAE，不生成扫描明细与扫描图。它们的深度平移曲线为零，两套 LAS 保持输入深度坐标；滤波版仍使用第4步继承的测井滤波参数。名单留空或写成空列表时，所有井都执行正常扫描。子波来源井不能放入该名单，未知井名和重复井名会使脚本直接报错。
+
 **3) 时间偏差转换为深度偏差。** 因为每口井的速度随深度变化，时间偏差和深度偏差之间不是固定比例。脚本通过该井的深度—时间对照表，把每个时间采样点的最佳时间偏移反查为对应的深度偏移，得到一条深度平移曲线。
 
 **4) 导出两套深度平移后的 LAS 文件。** 这是深度域工作流最重要的产出，供后续合成数据生成使用：
@@ -184,29 +161,29 @@ wavelet_batch_synthetic_depth:
 - **全曲线版**（`shifted_preprocessed_las`）：把第3步原始预处理 LAS 的全部曲线按深度平移曲线搬移到新位置，保留原始的数据空缺不填补。下游用它提取波阻抗的真实变化幅度。
 - **滤波版**（`shifted_filtered_las`）：只包含声波时差、密度、波阻抗三条曲线，且经过了平滑滤波。下游用它构建背景趋势，避免个别尖刺干扰背景拟合。
 
-**5) 质量检查。** 每口井生成两张图（合成记录与地震道的波形对比、时移扫描的相似度曲线），另外生成两张全工区汇总图（各井的相关性和时移量、深度平移量统计）。脚本末尾还会检查子波来源井在批量合成中的时移量是否与第4步的标定结果一致。
+**5) 质量检查。** 每口井都生成合成记录与地震道的波形对比图；执行扫描的井另外生成时移扫描相似度图。全工区汇总图使用实际采用的时移量，跳过扫描的井显示为零。脚本末尾还会检查子波来源井在批量合成中的时移量是否与第4步的标定结果一致。
 
-**7) 生成 QC 图。** 每井两张图：合成记录 vs 地震道波形对比（R1 风格六 panel）、时移扫描 corr 曲线。批量汇总两张图：全井指标柱状图、深度平移统计。
+跳过扫描只改变该井的深度平移策略，不改变井的发布资格。成功产出的井会继续进入第六步井控集、全部低频模型基线和 Synthoseis-lite。
 
 ### 核心输出文件
 
 | 文件 | 内容 |
 |------|------|
-| `wavelet_batch_metrics.csv` | 全井汇总：best shift、corr、NMAE、深度平移统计、产物路径 |
+| `wavelet_batch_metrics.csv` | 全井汇总：时移策略、扫描最佳时移、实际采用时移、corr、NMAE、深度平移统计、产物路径 |
 | `run_summary.json` | 输入路径、LAS 契约说明、成功/失败计数 |
 | `shifted_preprocessed_las/<well>.las` | 深度平移后的 Step 3 全曲线 LAS |
 | `shifted_filtered_las/<well>.las` | 深度平移后的 filtered DT_USM/RHO_GCC/AI |
-| `shift_scans/shift_scan_<well>.csv` | 每井时移扫描明细（shift_s, corr, nmae, scale） |
+| `shift_scans/shift_scan_<well>.csv` | 执行扫描井的时移扫描明细（shift_s, corr, nmae, scale） |
 | `depth_shift_curves/depth_shift_curve_<well>.csv` | 每井深度平移曲线（twt_s, tvdss_m, depth_shift_m） |
-| `synthetic_qc/synthetic_qc_<well>.csv` | 每井最佳时移下的合成记录 QC |
-| `figures/qc_01_batch_metric_summary.png` | 批量指标汇总（corr, NMAE, best shift） |
+| `synthetic_qc/synthetic_qc_<well>.csv` | 每井实际采用时移下的合成记录 QC |
+| `figures/qc_01_batch_metric_summary.png` | 批量指标汇总（corr, NMAE, applied shift） |
 | `figures/qc_02_batch_depth_shift_summary.png` | 深度平移汇总（median + P10-P90） |
 | `figures/qc_<well>_synthetic_vs_seismic.png` | 每井 R1 风格六 panel 波形 QC 图 |
-| `figures/qc_<well>_shift_scan.png` | 每井时移扫描 corr 曲线 |
+| `figures/qc_<well>_shift_scan.png` | 执行扫描井的时移扫描 corr 曲线 |
 
 ### 来源井一致性检查
 
-脚本末尾会检查子波来源井在批量合成中的 best shift 是否与 autotie 阶段的 `table_t_shift` 一致。差异过大会在终端醒目提示。
+脚本末尾会检查子波来源井在批量合成中的实际采用时移是否与 autotie 阶段的 `table_t_shift` 一致。差异过大会在终端醒目提示。
 
 ---
 
@@ -227,10 +204,3 @@ TODO
                                                                           ↓
                                                    统一井控 → LFM v3 → R0 → R1(TVDSS)
 ```
-
-深度域第4步/5 与时间域第4步/5 **互不依赖**、**平行存在**：
-
-- 时间域第4步做全井自动标定，输出每井候选子波；
-- 深度域第4步只跑一口指定井，输出一条固定子波；
-- 时间域第5步做全井交叉评测和共识子波优化；
-- 深度域第5步用固定子波做全井时移扫描和深度平移 LAS 导出。

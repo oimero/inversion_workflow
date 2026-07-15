@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 WELL_AUTO_TIE_SCHEMA_VERSION = "well_auto_tie_v3"
-DEPTH_WAVELET_BATCH_SCHEMA_VERSION = "wavelet_batch_synthetic_depth_v3"
+DEPTH_WAVELET_BATCH_SCHEMA_VERSION = "wavelet_batch_synthetic_depth_v4"
 
 
 __all__ = [

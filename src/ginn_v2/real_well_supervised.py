@@ -490,6 +490,7 @@ class RealWellSupervisedSupport:
         samples: pd.DataFrame,
         training_samples: pd.DataFrame,
         excluded_wells: Sequence[str],
+        supervision_excluded_wells: Sequence[str],
         held_out_cluster: int,
         predictor: DifferentiableWellPredictor,
         sampler: BalancedRealWellSampler | None,
@@ -503,6 +504,7 @@ class RealWellSupervisedSupport:
         self.samples = samples
         self.training_samples = training_samples
         self.excluded_wells = list(excluded_wells)
+        self.supervision_excluded_wells = list(supervision_excluded_wells)
         self.held_out_cluster = int(held_out_cluster)
         self.predictor = predictor
         self.sampler = sampler
@@ -603,6 +605,7 @@ class RealWellSupervisedSupport:
                     "used_for_real_well_training": bool(
                         row["used_for_real_well_training"]
                     ),
+                    "exclusion_reason": str(row["exclusion_reason"]),
                     "selected_count": int(counts.get((cluster, well_name), 0)),
                     "n_valid_samples": int(
                         self.samples[
@@ -623,7 +626,10 @@ class RealWellSupervisedSupport:
         return {
             "config": public_config,
             "held_out_cluster_id": self.held_out_cluster,
-            "excluded_wells": list(self.excluded_wells),
+            "holdout_excluded_wells": list(self.excluded_wells),
+            "supervision_excluded_well_names": list(
+                self.supervision_excluded_wells
+            ),
             "same_cluster_training_leakage_risk": bool(
                 float(self.config["lambda_real_well_supervised"]) > 0.0
                 and not self.config["exclude_same_cluster"]
@@ -721,6 +727,7 @@ def prepare_real_well_supervised_support(
         valid,
         held_out_well=cfg["held_out_well"],
         exclude_same_cluster=bool(cfg["exclude_same_cluster"]),
+        supervision_excluded_well_names=cfg["supervision_excluded_well_names"],
         require_training=lambda_real_well_supervised > 0.0,
     )
     if lambda_real_well_supervised <= 0.0:
@@ -776,6 +783,7 @@ def prepare_real_well_supervised_support(
         samples=valid,
         training_samples=training,
         excluded_wells=excluded_wells,
+        supervision_excluded_wells=cfg["supervision_excluded_well_names"],
         held_out_cluster=held_out_cluster,
         predictor=predictor,
         sampler=sampler,
@@ -790,9 +798,29 @@ def assign_supervision_roles(
     *,
     held_out_well: str,
     exclude_same_cluster: bool,
+    supervision_excluded_well_names: Sequence[str],
     require_training: bool,
 ) -> tuple[int, list[str], pd.DataFrame]:
     wells = set(samples["well_name"].astype(str).unique())
+    supervision_excluded = [str(name).strip() for name in supervision_excluded_well_names]
+    duplicates = sorted(
+        {name for name in supervision_excluded if supervision_excluded.count(name) > 1}
+    )
+    if duplicates:
+        raise ValueError(
+            f"Duplicate supervision_excluded_well_names: {duplicates}"
+        )
+    unknown = sorted(set(supervision_excluded) - wells)
+    if unknown:
+        raise ValueError(
+            "Configured supervision-excluded wells are unavailable; "
+            f"unknown wells: {unknown}; available wells: {sorted(wells)}"
+        )
+    if held_out_well in supervision_excluded:
+        raise ValueError(
+            f"held_out_well={held_out_well!r} overlaps "
+            "supervision_excluded_well_names."
+        )
     if held_out_well not in wells:
         raise ValueError(
             f"Configured held_out_well={held_out_well!r} is unavailable; "
@@ -824,6 +852,15 @@ def assign_supervision_roles(
     )
     samples.loc[same_cluster_mask, "supervision_role"] = "same_cluster_excluded"
     samples.loc[same_cluster_mask, "exclusion_reason"] = "same_cluster_as_holdout"
+    configured_exclusion_mask = samples["well_name"].astype(str).isin(
+        supervision_excluded
+    )
+    samples.loc[
+        configured_exclusion_mask, "supervision_role"
+    ] = "configured_supervision_excluded"
+    samples.loc[
+        configured_exclusion_mask, "exclusion_reason"
+    ] = "configured_supervision_exclusion"
     samples["used_for_real_well_training"] = samples["supervision_role"].eq("training")
     training = samples[samples["used_for_real_well_training"]].copy()
     if require_training and training.empty:
@@ -844,6 +881,7 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "variant_id",
         "well_control_run_dir",
         "held_out_well",
+        "supervision_excluded_well_names",
         "exclude_same_cluster",
         "clusters_per_step",
         "cluster_radius_m",
@@ -858,6 +896,38 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not str(cfg["held_out_well"]).strip():
         raise ValueError("train.real_well_supervised.held_out_well must be non-empty.")
     cfg["held_out_well"] = str(cfg["held_out_well"]).strip()
+    excluded_value = cfg["supervision_excluded_well_names"]
+    if excluded_value is None:
+        excluded_names: list[str] = []
+    elif isinstance(excluded_value, list):
+        excluded_names = []
+        for index, item in enumerate(excluded_value):
+            name = str(item).strip()
+            if not name:
+                raise ValueError(
+                    "train.real_well_supervised."
+                    f"supervision_excluded_well_names[{index}] must be non-empty."
+                )
+            excluded_names.append(name)
+    else:
+        raise ValueError(
+            "train.real_well_supervised.supervision_excluded_well_names "
+            "must be a YAML list or null."
+        )
+    duplicates = sorted(
+        {name for name in excluded_names if excluded_names.count(name) > 1}
+    )
+    if duplicates:
+        raise ValueError(
+            "train.real_well_supervised.supervision_excluded_well_names "
+            f"contains duplicates: {duplicates}"
+        )
+    if cfg["held_out_well"] in excluded_names:
+        raise ValueError(
+            "train.real_well_supervised.held_out_well overlaps "
+            "supervision_excluded_well_names."
+        )
+    cfg["supervision_excluded_well_names"] = excluded_names
     for key in ("lfm_run_dir", "variant_id", "well_control_run_dir"):
         value = str(cfg[key]).strip()
         if not value or value.casefold() == "auto":

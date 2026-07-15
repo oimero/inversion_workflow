@@ -1119,6 +1119,9 @@ def run_experiment(
                 "sample_axis_contract": dict(source_contracts[source_id]),
                 "held_out_well": source["held_out_well"],
                 "exclude_same_cluster": source.get("exclude_same_cluster", True),
+                "supervision_excluded_well_names": list(
+                    source.get("supervision_excluded_well_names") or []
+                ),
             }
     for source_id, axis_contract in source_contracts.items():
         _validate_increment_contract_against_axis(
@@ -1300,6 +1303,9 @@ def run_experiment(
                     "well_control_run_dir": source["well_control_run_dir"],
                     "held_out_well": source["held_out_well"],
                     "exclude_same_cluster": bool(source.get("exclude_same_cluster", True)),
+                    "supervision_excluded_well_names": list(
+                        source.get("supervision_excluded_well_names") or []
+                    ),
                     "clusters_per_step": int(block["batch_size"]),
                     "cluster_radius_m": float(source.get("cluster_radius_m", 500.0)),
                     "diagnostic_max_hz": float(source.get("diagnostic_max_hz", 80.0)),

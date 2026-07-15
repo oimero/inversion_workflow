@@ -122,10 +122,13 @@ GINN v2 的训练配方由五层组件自由组合而成：
 | `field_source` | 引用哪个 `real_field` source |
 | `well_control_run_dir` | 第六步井控集目录 |
 | `held_out_well` | 始终不参与训练的井名，用作验证 |
+| `supervision_excluded_well_names` | 不作为真实井训练或验证标签、但保留逐井诊断的井名列表 |
 | `exclude_same_cluster` | 是否同时排除与 held-out 井同空间簇的井 |
 | `cluster_radius_m` | 空间聚类半径，用于均衡采样 |
 
 井按空间位置聚类，每个训练 step 随机选择若干簇、每簇随机选一口井。这样避免了空间相邻井在同一个 batch 里造成梯度重复。
+
+真实井共有三种互相独立的非训练角色：配置排除井仅用于逐井预测、曲线、井指标和采样检查；留出井提供验证 MSE 并参与 checkpoint 选择；同簇排除井用于隔离留出井附近的空间信息。配置排除井不进入 sampler、损失、验证聚合或 checkpoint 选择，其诊断指标也不汇入验证值。配置排除名单中的井必须存在，不能重复，也不能与留出井重叠。
 
 ### 损失块：学什么目标
 

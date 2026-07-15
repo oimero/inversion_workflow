@@ -33,7 +33,7 @@ SOURCE_KEYS = {
     "real_wells": {
         "kind", "field_source", "well_control_run_dir", "held_out_well",
         "exclude_same_cluster", "cluster_radius_m", "diagnostic_max_hz",
-        "reconstruction_tolerance_log_ai",
+        "reconstruction_tolerance_log_ai", "supervision_excluded_well_names",
     },
 }
 LOSS_KEYS = {
@@ -134,6 +134,23 @@ def _reject_extra(mapping: Mapping[str, Any], allowed: set[str], label: str) -> 
     extra = sorted(set(mapping) - allowed)
     if extra:
         raise ValueError(f"Unsupported keys in {label}: {extra}")
+
+
+def _unique_string_list(value: Any, label: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a YAML list or null.")
+    result = []
+    for index, item in enumerate(value):
+        name = str(item).strip()
+        if not name:
+            raise ValueError(f"{label}[{index}] must be non-empty.")
+        result.append(name)
+    duplicates = sorted({name for name in result if result.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"{label} contains duplicate well names: {duplicates}")
+    return result
 
 
 def _stage_deployment_eligibility(
@@ -287,6 +304,21 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
                 raise ValueError(f"sources.{source_id}.validation_split.fraction must be below one.")
             split["gap_m"] = _finite(split.get("gap_m", 0.0), f"sources.{source_id}.validation_split.gap_m", nonnegative=True)
             source["validation_split"] = split
+        if kind == "real_wells":
+            label = f"sources.{source_id}.supervision_excluded_well_names"
+            source["supervision_excluded_well_names"] = _unique_string_list(
+                source.get("supervision_excluded_well_names"),
+                label,
+            )
+            held_out_well = str(source["held_out_well"]).strip()
+            if not held_out_well:
+                raise ValueError(f"sources.{source_id}.held_out_well must be non-empty.")
+            source["held_out_well"] = held_out_well
+            if held_out_well in source["supervision_excluded_well_names"]:
+                raise ValueError(
+                    f"sources.{source_id}.held_out_well overlaps "
+                    "supervision_excluded_well_names."
+                )
         sources[str(source_id)] = source
 
     norm = _mapping(cfg.get("normalization_reference"), "ginn_v2.normalization_reference")

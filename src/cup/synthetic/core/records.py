@@ -171,15 +171,31 @@ class BenchmarkVariant:
     variant_id: str
     sample_kind: str
     seismic_observed: np.ndarray
-    seismic_model_consistent: np.ndarray
     positive_gain: np.ndarray
     additive_noise: np.ndarray
     metadata: Mapping[str, object]
-    residuals: BenchmarkResiduals | None = None
     qc: Mapping[str, object] = field(default_factory=dict)
     sample_domain: str = "time"
 
     def __post_init__(self) -> None:
+        if not self.owner_realization_id.strip() or not self.variant_id.strip():
+            raise ValueError("Benchmark variant owner and variant id must be non-empty.")
+        if self.sample_kind != "seismic_variant":
+            raise ValueError("Benchmark variant sample_kind must be 'seismic_variant'.")
+        domain = self.sample_domain.strip().casefold()
+        if domain not in {"time", "depth"}:
+            raise ValueError("Benchmark variant domain must be time or depth.")
+        observed = np.asarray(self.seismic_observed, dtype=np.float64)
+        gain = np.asarray(self.positive_gain, dtype=np.float64)
+        noise = np.asarray(self.additive_noise, dtype=np.float64)
+        if observed.ndim != 2 or gain.shape != observed.shape or noise.shape != observed.shape:
+            raise ValueError("Benchmark variant arrays must share one 2-D shape.")
+        if np.any(~np.isfinite(gain)) or np.any(gain <= 0.0):
+            raise ValueError("Benchmark variant positive_gain must be finite and positive.")
+        object.__setattr__(self, "sample_domain", domain)
+        object.__setattr__(self, "seismic_observed", observed)
+        object.__setattr__(self, "positive_gain", gain)
+        object.__setattr__(self, "additive_noise", noise)
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
         object.__setattr__(self, "qc", MappingProxyType(dict(self.qc)))
 

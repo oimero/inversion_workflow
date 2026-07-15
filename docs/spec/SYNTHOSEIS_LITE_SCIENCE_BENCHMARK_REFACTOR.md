@@ -349,14 +349,17 @@ class BenchmarkVariant:
     owner_realization_id: str
     variant_id: str
     sample_kind: str
+    sample_domain: str
     seismic_observed: np.ndarray
-    seismic_model_consistent: np.ndarray
-    residuals: BenchmarkResiduals
+    positive_gain: np.ndarray
+    additive_noise: np.ndarray
     metadata: Mapping[str, object]
+    qc: Mapping[str, object]
 ```
 
 LFM variants 是同一个 base realization 内的 input-prior variant；seismic variants 是具有
-独立 sample index row 的 Benchmark 样本变体。二者不使用同一层级记录。
+独立 sample index row 的 Benchmark 样本变体。model-consistent seismic、valid mask、target
+和 residual 由 owner base realization 提供，variant record 不重复持有。二者不使用同一层级记录。
 
 ## 8. Rejection Interface
 
@@ -570,8 +573,9 @@ canonical closure、field-conditioned/canonical suite、v4 base Writer/reader、
 
 ### 阶段 4：迁移 seismic variants
 
-在 base path 稳定后，再迁移 white/colored noise、global/lateral/axis-lateral gain 和公共 QC
-到 `core/seismic_variants.py`。时间 phase/time shift 与深度 static shift 留在域 Adapter。
+共享层统一 `BenchmarkVariant` record、metadata 合同和 variant Writer。time/depth 的噪声、
+gain、相位与位移数值实现保留在域 Module：两域的轴单位、AR(1) 边界、随机流和 forward
+operator 不同，不建立表面相同但数值合同不同的公共实现。
 
 每个 `BenchmarkVariant` 必须拥有独立 sample index row；LFM variants 继续属于 base sample
 内部。共享 Writer 分别验证 base 与 variant group。用户确认两域 variant 门禁后进入阶段 5。

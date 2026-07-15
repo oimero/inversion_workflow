@@ -1,4 +1,4 @@
-"""Depth field-conditioned generation and v4 artifact writer."""
+"""Depth field-conditioned pipeline and domain-specific variant orchestration."""
 
 from __future__ import annotations
 
@@ -32,7 +32,6 @@ from cup.synthetic.core import (
     limit_attempt_plan,
     rejection_reason_summary,
     validate_debug_attempt_limit,
-    write_dataset,
 )
 from cup.synthetic.core.progress import (
     AttemptProgressLog,
@@ -552,36 +551,6 @@ def build_attempt_plan(
     )
 
 
-def _dataset(
-    group: h5py.Group,
-    name: str,
-    values: np.ndarray,
-    *,
-    unit: str,
-    axis_path: str,
-    axis_order: str,
-) -> h5py.Dataset:
-    if name in {
-        "lateral_m",
-        "inline_float",
-        "xline_float",
-        "x_m",
-        "y_m",
-        "tvdss_highres_m",
-        "tvdss_model_m",
-    }:
-        values = np.asarray(values, dtype=np.float64)
-    return write_dataset(
-        group,
-        name,
-        values,
-        unit=unit,
-        sample_domain="depth",
-        axis_path=axis_path,
-        axis_order=axis_order,
-    )
-
-
 def _static_shift(
     data: np.ndarray,
     axis: np.ndarray,
@@ -672,7 +641,6 @@ def _write_variants(
                     variant_id=variant_id,
                     sample_kind="seismic_variant",
                     seismic_observed=observed,
-                    seismic_model_consistent=np.empty(0, dtype=np.float64),
                     positive_gain=positive_gain,
                     additive_noise=additive_noise,
                     metadata={

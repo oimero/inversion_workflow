@@ -110,7 +110,7 @@ def build_time_field_sample(
             degradation_variant_id=realization_id,
         ),
         build_policy=BenchmarkBuildPolicy(
-            require_forward_support=False,
+            require_forward_support=True,
             domain_metadata={
                 "sample_domain": "time",
                 "increment_contract": contract.as_dict(),
@@ -185,7 +185,7 @@ def build_time_canonical_sample(
             degradation_variant_id=truth.realization_id,
         ),
         build_policy=BenchmarkBuildPolicy(
-            require_forward_support=False,
+            require_forward_support=True,
             domain_metadata={
                 "sample_domain": "time",
                 "increment_contract": contract.as_dict(),

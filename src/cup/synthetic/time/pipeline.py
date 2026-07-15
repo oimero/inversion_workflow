@@ -206,7 +206,6 @@ def _seismic_variant_records_for_sample(
                     variant_id=result.variant_id,
                     sample_kind="seismic_variant",
                     seismic_observed=result.seismic_observed,
-                    seismic_model_consistent=np.empty(0, dtype=np.float64),
                     positive_gain=result.positive_gain,
                     additive_noise=result.additive_noise,
                     metadata={

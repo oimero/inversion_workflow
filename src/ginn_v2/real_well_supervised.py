@@ -17,7 +17,7 @@ import torch
 from cup.physics.calibration import AIVelocityRelation
 from cup.physics.numpy_backend import forward_depth, forward_time, reflectivity_from_log_ai
 from cup.synthetic.schemas import FORWARD_MODEL_INPUTS_SCHEMA_VERSION
-from cup.seismic.lfm.artifacts import resolve_lfm_variant
+from cup.lfm.artifacts import resolve_lfm_variant
 from cup.seismic.viz import plot_well_waveform_qc, waveform_qc_metrics
 from cup.utils.io import repo_relative_path, resolve_relative_path
 from cup.well.anchor import build_well_anchor_samples, sample_volume_trilinear

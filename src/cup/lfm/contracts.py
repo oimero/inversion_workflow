@@ -1,4 +1,4 @@
-"""Schema versions for persisted low-frequency-model artifacts."""
+"""Schema versions for persisted top-level LFM artifacts."""
 
 from __future__ import annotations
 

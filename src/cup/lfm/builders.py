@@ -8,13 +8,13 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from cup.seismic.lfm.math import (
+from cup.lfm.math import (
     apply_lfm_lowpass,
     ordinary_krige_xy,
     parse_lowpass_spec,
     values_are_constant,
 )
-from cup.seismic.lfm.types import LfmContext, LfmVariantResult
+from cup.lfm.types import LfmContext, LfmVariantResult
 from cup.well.real_field_controls import WellControl, WellControlSet
 
 

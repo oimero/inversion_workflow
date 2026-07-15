@@ -13,7 +13,7 @@ import torch
 
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.geometry import SampleAxis
-from cup.seismic.lfm.contracts import VARIANT_SCHEMA as LFM_VARIANT_SCHEMA
+from cup.lfm.contracts import VARIANT_SCHEMA as LFM_VARIANT_SCHEMA
 from cup.seismic.wavelet import (
     DEFAULT_ACTIVE_SUPPORT_THRESHOLD,
     compute_wavelet_active_half_support_s,
@@ -319,7 +319,7 @@ def load_real_field_section(
     if str(inputs.get("target_mask_file") or "").strip():
         raise ValueError("Canonical LFM contract does not accept an external target_mask_file.")
     section_cfg = _mapping(config.get("section"), "real_field_zero_shot.section")
-    from cup.seismic.lfm.artifacts import resolve_lfm_variant
+    from cup.lfm.artifacts import resolve_lfm_variant
 
     selected_variant = resolve_lfm_variant(inputs, repo_root=root)
     lfm_path = selected_variant.lfm_path
@@ -443,7 +443,7 @@ def load_real_field_volume(
     if str(inputs.get("target_mask_file") or "").strip():
         raise ValueError("Canonical LFM contract does not accept an external target_mask_file.")
     volume_cfg = dict(config.get("volume") or {})
-    from cup.seismic.lfm.artifacts import resolve_lfm_variant
+    from cup.lfm.artifacts import resolve_lfm_variant
 
     selected_variant = resolve_lfm_variant(inputs, repo_root=root)
     lfm_path = selected_variant.lfm_path

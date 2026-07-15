@@ -26,7 +26,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.config.workflow import WorkflowConfig, deep_merge_dict
-from cup.seismic.lfm.pipeline import build_lfm_context, run_lfm_pipeline
+from cup.lfm.pipeline import build_lfm_context, run_lfm_pipeline
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.utils.io import latest_checked_run, load_yaml_config, repo_relative_path, resolve_relative_path
 from cup.well.real_field_controls import SCHEMA_VERSION as WELL_CONTROL_SCHEMA, load_well_control_set

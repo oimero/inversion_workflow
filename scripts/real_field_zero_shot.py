@@ -36,7 +36,7 @@ sys.path.insert(0, src_text)
 
 from cup.config.sources import resolve_source_run
 from cup.seismic.geometry import SampleAxis
-from cup.seismic.lfm.artifacts import resolve_lfm_variant
+from cup.lfm.artifacts import resolve_lfm_variant
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.well.real_field_controls import load_well_control_set
 from cup.utils.io import (

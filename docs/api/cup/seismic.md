@@ -8,8 +8,6 @@
 
 ::: cup.seismic.target_zone
 
-::: cup.seismic.lfm
-
 ::: cup.seismic.wavelet
 
 ::: cup.seismic.wavelet_consensus

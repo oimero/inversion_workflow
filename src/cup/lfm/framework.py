@@ -10,8 +10,8 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from cup.seismic.lfm.builders import _surface_for_output
-from cup.seismic.lfm.types import LfmContext, LfmVariantResult
+from cup.lfm.builders import _surface_for_output
+from cup.lfm.types import LfmContext, LfmVariantResult
 
 
 BODY_COLUMNS = ["body_id", "framework_class", "u_top", "u_bottom", "vertex_order", "inline", "xline"]

@@ -1,8 +1,8 @@
 """Unified, domain-neutral real-field low-frequency model interface."""
 
-from cup.seismic.lfm.math import apply_lfm_lowpass, ordinary_krige_xy
-from cup.seismic.lfm.pipeline import build_lfm_variants
-from cup.seismic.lfm.types import LfmBuilder, LfmContext, LfmModifier, LfmVariantResult
+from cup.lfm.math import apply_lfm_lowpass, ordinary_krige_xy
+from cup.lfm.pipeline import build_lfm_variants
+from cup.lfm.types import LfmBuilder, LfmContext, LfmModifier, LfmVariantResult
 
 __all__ = [
     "LfmBuilder",

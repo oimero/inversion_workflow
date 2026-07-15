@@ -19,10 +19,10 @@ import pandas as pd
 from cup.config.workflow import WorkflowConfig
 from cup.petrel.load import import_interpretation_petrel
 from cup.seismic.horizon import normalize_interpretation_unit_for_geometry
-from cup.seismic.lfm.builders import BUILDERS
-from cup.seismic.lfm.contracts import RUN_SCHEMA, VARIANT_SCHEMA
-from cup.seismic.lfm.framework import MODIFIERS
-from cup.seismic.lfm.types import LfmContext, LfmVariantResult, OutputGeometry
+from cup.lfm.builders import BUILDERS
+from cup.lfm.contracts import RUN_SCHEMA, VARIANT_SCHEMA
+from cup.lfm.framework import MODIFIERS
+from cup.lfm.types import LfmContext, LfmVariantResult, OutputGeometry
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.volume_export import export_volume_like_source, log_ai_to_ai_volume
 from cup.utils.io import (
@@ -469,7 +469,7 @@ def _write_variant_figures(
 
 
 def _surface_for_figure(context: LfmContext, horizon_name: str) -> np.ndarray:
-    from cup.seismic.lfm.builders import _surface_for_output
+    from cup.lfm.builders import _surface_for_output
 
     return _surface_for_output(context, horizon_name)
 

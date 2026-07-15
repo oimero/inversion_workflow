@@ -1,4 +1,4 @@
-"""Public domain-neutral types for unified real-field LFM construction."""
+"""Public types for the top-level real-field LFM module."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Shared low-pass and real-XY ordinary kriging primitives."""
+"""Shared LFM low-pass and real-XY ordinary kriging primitives."""
 
 from __future__ import annotations
 

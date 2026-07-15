@@ -27,7 +27,6 @@ from cup.synthetic.time.canonical import (
     CANONICAL_FAMILIES,
     canonical_reference_impedance,
     canonical_scenarios,
-    generate_canonical_section,
 )
 from cup.synthetic.time.config import DATA_SCHEMA, IMPLEMENTATION_SCOPE
 from cup.impedance import build_lfm_producer_contract, generation_contract
@@ -50,28 +49,19 @@ from cup.synthetic.core.progress import (
     run_attempt_preflight,
 )
 from cup.synthetic.time.forward import (
-    HighresForwardResult,
-    HighresWavelet,
     antialias_taps,
-    highres_forward_to_model_grid,
-    model_grid_closure_qc,
     resample_wavelet_to_highres,
 )
 from cup.synthetic.reporting.figures import write_generation_figures
-from cup.synthetic.core.generation import (
-    GenerationRejected,
-    GenerationScenario,
-    generation_scenarios,
-)
-from cup.synthetic.time.generation import generate_field_section
+from cup.synthetic.core.rejections import StagedRejection
+from cup.synthetic.core.records import BenchmarkVariant
+from cup.synthetic.core.scenarios import GenerationScenario, generation_scenarios
+from cup.synthetic.core.writer import write_benchmark_sample, write_benchmark_variant
 from cup.synthetic.time.geometry import build_section_geometries
-from cup.synthetic.time.writer import (
-    write_generated_section,
-    write_highres_forward_result,
-    write_lfm_result,
-    write_seismic_variant_result,
+from cup.synthetic.time.sample_builder import (
+    build_time_canonical_sample,
+    build_time_field_sample,
 )
-from cup.synthetic.time.lfm import LfmResult, derive_lfm_priors
 from cup.synthetic.time.seismic_variants import generate_seismic_variants
 from cup.config.workflow import WorkflowConfig
 from cup.utils.io import (
@@ -149,57 +139,15 @@ def _generation_input_contracts(
     return contracts
 
 
-def _section_forward_qc(
-    section: Any,
-    *,
-    wavelet_time_s: np.ndarray,
-    wavelet: np.ndarray,
-    highres_wavelet: HighresWavelet | None,
-    required: bool,
-) -> tuple[HighresForwardResult | None, dict[str, Any]]:
-    qc = model_grid_closure_qc(
-        section.model_target_log_ai,
-        section.seismic_model_consistent,
-        wavelet_time_s,
-        wavelet,
-    )
-    if highres_wavelet is None:
-        return None, {
-            **qc,
-            "highres_forward_status": "disabled",
-            "highres_forward_reasons": "",
-        }
-    try:
-        result = highres_forward_to_model_grid(
-            section.truth_log_ai_highres,
-            section.seismic_model_consistent,
-            highres_wavelet=highres_wavelet,
-            forward_valid_mask_model=section.forward_valid_mask_model,
-        )
-        return result, {
-            **qc,
-            **result.qc,
-            "highres_forward_reasons": "",
-        }
-    except Exception as exc:
-        if required:
-            raise ValueError(f"highres_forward_qc_failed:{exc}") from exc
-        return None, {
-            **qc,
-            "highres_forward_status": "failed",
-            "highres_forward_reasons": f"{type(exc).__name__}:{exc}",
-        }
-
-
-def _lfm_records(result: LfmResult, *, base_path: str) -> dict[str, Any]:
+def _benchmark_lfm_records(generated: Any, *, base_path: str) -> dict[str, Any]:
     return {
-        **result.qc,
+        **{key: value for key, value in generated.qc.items() if key.startswith("lfm_")},
         "lfm_versions": "canonical_background;input_lfm_variants",
         "lfm_variant_id": "controlled_default",
         "input_lfm_log_ai_dataset": (
             "" if not base_path else f"{base_path}/priors/input_lfm_variants/controlled_default/log_ai"
         ),
-        "lfm_ideal_dataset": ("" if not base_path else f"{base_path}/priors/lfm_ideal"),
+        "lfm_ideal_dataset": "" if not base_path else f"{base_path}/priors/lfm_ideal",
         "lfm_controlled_degraded_dataset": (
             "" if not base_path else f"{base_path}/priors/lfm_controlled_degraded"
         ),
@@ -207,9 +155,7 @@ def _lfm_records(result: LfmResult, *, base_path: str) -> dict[str, Any]:
             "" if not base_path else f"{base_path}/residuals/residual_vs_lfm_ideal"
         ),
         "residual_vs_lfm_controlled_degraded_dataset": (
-            ""
-            if not base_path
-            else f"{base_path}/residuals/residual_vs_lfm_controlled_degraded"
+            "" if not base_path else f"{base_path}/residuals/residual_vs_lfm_controlled_degraded"
         ),
     }
 
@@ -251,11 +197,27 @@ def _seismic_variant_records_for_sample(
         variant_group = (
             ""
             if qc_only
-            else write_seismic_variant_result(
+            else write_benchmark_variant(
                 h5,
-                owner_path=owner_path,
-                result=result,
-            )
+                BenchmarkVariant(
+                    owner_realization_id=str(
+                        source_index_record["parent_realization_id"]
+                    ),
+                    variant_id=result.variant_id,
+                    sample_kind="seismic_variant",
+                    seismic_observed=result.seismic_observed,
+                    seismic_model_consistent=np.empty(0, dtype=np.float64),
+                    positive_gain=result.positive_gain,
+                    additive_noise=result.additive_noise,
+                    metadata={
+                        "mismatch_family": result.mismatch_family,
+                        "operator_source": result.operator_source,
+                        "parameters": result.parameters,
+                    },
+                    qc=result.qc,
+                    sample_domain="time",
+                ),
+            ).hdf5_group
         )
         sample_id = f"{source_sample_id}__seismic__{result.variant_id}"
         record = {
@@ -345,16 +307,13 @@ def _run_canonical_generation(
         h5.attrs["global_seed"] = int(script_cfg["global_seed"])
         h5.attrs["qc_only"] = bool(qc_only)
         for scenario in scenarios:
-            generated = generate_canonical_section(
+            generated = build_time_canonical_sample(
                 calibration,
                 scenario=scenario,
-                config=config,
-                output_dt_s=output_dt,
+                canonical_config=config,
+                script_cfg=script_cfg,
                 wavelet_time_s=wavelet_time,
                 wavelet=wavelet,
-                vertical_oversampling_factor=int(
-                    script_cfg["sampling"]["vertical_oversampling_factor"]
-                ),
             )
             thickness_error = float(generated.qc["maximum_thickness_absolute_error_s"])
             if thickness_error > calibration.truth_dt_s + 1e-12:
@@ -370,37 +329,8 @@ def _run_canonical_generation(
                     raise ValueError(
                         f"canonical_geometry_qc_failed:{scenario.scenario_id}:termination_error"
                     )
-            highres_result, forward_qc = _section_forward_qc(
-                generated,
-                wavelet_time_s=wavelet_time,
-                wavelet=wavelet,
-                highres_wavelet=highres_wavelet,
-                required=bool(
-                    script_cfg["forward_qc"]["highres_forward_required"]
-                ),
-            )
-            generated.qc.update(forward_qc)
-            lfm_result = derive_lfm_priors(
-                generated,
-                config=script_cfg["lfm"],
-                global_seed=int(script_cfg["global_seed"]),
-                generator_family=GENERATOR_FAMILY,
-                degradation_variant_id=generated.realization_id,
-            )
-            generated.qc.update(lfm_result.qc)
-            hdf5_group = "" if qc_only else write_generated_section(h5, generated)
-            if not qc_only and highres_result is not None:
-                write_highres_forward_result(
-                    h5,
-                    realization_path=hdf5_group,
-                    result=highres_result,
-                )
-            if not qc_only:
-                write_lfm_result(
-                    h5,
-                    realization_path=hdf5_group,
-                    result=lfm_result,
-                )
+            reference = None if qc_only else write_benchmark_sample(h5, generated.sample)
+            hdf5_group = "" if reference is None else reference.hdf5_group
             object_records.extend(generated.object_catalog)
             record = {
                 "sample_id": scenario.scenario_id,
@@ -437,7 +367,7 @@ def _run_canonical_generation(
                 "canonical_parameter_name": scenario.parameter_name,
                 "canonical_parameter_value": scenario.parameter_value,
                 "canonical_parameter_unit": scenario.parameter_unit,
-                **_lfm_records(lfm_result, base_path=hdf5_group),
+                **_benchmark_lfm_records(generated, base_path=hdf5_group),
             }
             index_records.append(record)
             seismic_index, seismic_results = _seismic_variant_records_for_sample(
@@ -448,7 +378,7 @@ def _run_canonical_generation(
                     else f"/realizations/{generated.realization_id}"
                 ),
                 source_index_record=record,
-                seismic_input=highres_result.seismic_model_grid,
+                seismic_input=generated.seismic_observed,
                 valid_mask=np.asarray(generated.valid_mask_model, dtype=bool),
                 seismic_model_consistent_dataset=(
                     ""
@@ -784,46 +714,25 @@ def run_generation(
     def validate_attempt(plan_row: Mapping[str, Any]) -> None:
         section = sections_by_id[str(plan_row["section_id"])]
         scenario = scenarios_by_id[str(plan_row["scenario_id"])]
-        minimum_truth_samples = (
-            2 if scenario.duration_mode == "ultra_thin_stress" else 4
-        )
-        generate_field_section(
+        build_time_field_sample(
             calibration,
             realization_id=str(plan_row["parent_realization_id"]),
             scenario=scenario,
-            global_seed=int(script_cfg["global_seed"]),
-            lateral_m=section.lateral_m,
-            inline_float=section.inline_float,
-            xline_float=section.xline_float,
-            x_m=section.x_m,
-            y_m=section.y_m,
-            horizon_twt_s=section.horizon_twt_s,
-            output_dt_s=output_dt,
+            section=section,
+            script_cfg=script_cfg,
             wavelet_time_s=wavelet_time,
             wavelet=wavelet,
-            vertical_oversampling_factor=int(
-                script_cfg["sampling"]["vertical_oversampling_factor"]
-            ),
-            minimum_truth_samples=minimum_truth_samples,
-            max_global_reversal_fraction=float(
-                script_cfg["impedance"]["max_global_reversal_fraction"]
-            ),
-            max_object_reversal_fraction=float(
-                script_cfg["impedance"]["max_object_reversal_fraction"]
-            ),
-            max_global_clipping_fraction=float(
-                script_cfg["impedance"]["max_global_clipping_fraction"]
-            ),
-            max_object_clipping_fraction=float(
-                script_cfg["impedance"]["max_object_clipping_fraction"]
-            ),
-            sequence_minimum_duration_reference="minimum",
+            preflight_only=True,
         )
 
     preflight = run_attempt_preflight(
         attempt_plan,
         validator=validate_attempt,
-        rejection_exceptions=(GenerationRejected, ValueError, FloatingPointError),
+        rejection_exceptions=(
+            StagedRejection,
+            ValueError,
+            FloatingPointError,
+        ),
         qc_config=acceptance_qc,
         output_dir=output_dir,
         logger=logger,
@@ -898,75 +807,25 @@ def run_generation(
             seismic_variant_records_local: list[dict[str, Any]] = []
             base_lfm_index: dict[str, Any] = {}
             try:
-                minimum_truth_samples = (
-                    2 if scenario.duration_mode == "ultra_thin_stress" else 4
-                )
-                generated = generate_field_section(
+                generated = build_time_field_sample(
                     calibration,
                     realization_id=realization_id,
                     scenario=scenario,
-                    global_seed=int(script_cfg["global_seed"]),
-                    lateral_m=section.lateral_m,
-                    inline_float=section.inline_float,
-                    xline_float=section.xline_float,
-                    x_m=section.x_m,
-                    y_m=section.y_m,
-                    horizon_twt_s=section.horizon_twt_s,
-                    output_dt_s=output_dt,
+                    section=section,
+                    script_cfg=script_cfg,
                     wavelet_time_s=wavelet_time,
                     wavelet=wavelet,
-                    vertical_oversampling_factor=int(
-                        script_cfg["sampling"]["vertical_oversampling_factor"]
-                    ),
-                    minimum_truth_samples=minimum_truth_samples,
-                    max_global_reversal_fraction=float(
-                        script_cfg["impedance"]["max_global_reversal_fraction"]
-                    ),
-                    max_object_reversal_fraction=float(
-                        script_cfg["impedance"]["max_object_reversal_fraction"]
-                    ),
-                    max_global_clipping_fraction=float(
-                        script_cfg["impedance"]["max_global_clipping_fraction"]
-                    ),
-                    max_object_clipping_fraction=float(
-                        script_cfg["impedance"]["max_object_clipping_fraction"]
-                    ),
-                    sequence_minimum_duration_reference="minimum",
                 )
-                highres_result, forward_qc = _section_forward_qc(
-                    generated,
-                    wavelet_time_s=wavelet_time,
-                    wavelet=wavelet,
-                    highres_wavelet=highres_wavelet,
-                    required=bool(
-                        script_cfg["forward_qc"]["highres_forward_required"]
-                    ),
+                if generated is None:
+                    raise RuntimeError("time production builder returned no sample")
+                reference = (
+                    None
+                    if qc_only
+                    else write_benchmark_sample(h5, generated.sample)
                 )
-                generated.qc.update(forward_qc)
-                lfm_result = derive_lfm_priors(
-                    generated,
-                    config=script_cfg["lfm"],
-                    global_seed=int(script_cfg["global_seed"]),
-                    generator_family=GENERATOR_FAMILY,
-                    degradation_variant_id=generated.realization_id,
-                )
-                generated.qc.update(lfm_result.qc)
-                hdf5_group = "" if qc_only else write_generated_section(h5, generated)
-                if not qc_only and highres_result is not None:
-                    write_highres_forward_result(
-                        h5,
-                        realization_path=hdf5_group,
-                        result=highres_result,
-                    )
-                if not qc_only:
-                    write_lfm_result(
-                        h5,
-                        realization_path=hdf5_group,
-                        result=lfm_result,
-                    )
-                base_lfm_index = _lfm_records(
-                    lfm_result,
-                    base_path=hdf5_group,
+                hdf5_group = "" if reference is None else reference.hdf5_group
+                base_lfm_index = _benchmark_lfm_records(
+                    generated, base_path=hdf5_group
                 )
                 base_record_for_variants = {
                     "sample_id": realization_id,
@@ -1013,7 +872,7 @@ def run_generation(
                         else f"/realizations/{generated.realization_id}"
                     ),
                     source_index_record=base_record_for_variants,
-                    seismic_input=highres_result.seismic_model_grid,
+                    seismic_input=generated.seismic_observed,
                     valid_mask=np.asarray(generated.valid_mask_model, dtype=bool),
                     seismic_model_consistent_dataset=(
                         ""
@@ -1032,7 +891,7 @@ def run_generation(
                 status = "ok"
                 reasons = ""
                 qc_payload = generated.qc
-            except GenerationRejected as exc:
+            except StagedRejection as exc:
                 hdf5_group = ""
                 status = "rejected"
                 reasons = ";".join(exc.reasons)

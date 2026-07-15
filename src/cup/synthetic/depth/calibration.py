@@ -14,7 +14,7 @@ from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.synthetic.reporting.figures import write_calibration_figures
 from cup.synthetic.depth.config import CALIBRATION_SCHEMA, GENERATOR_FAMILY
-from cup.synthetic.depth.object_core_adapter import (
+from cup.synthetic.depth.calibration_adapter import (
     calibrate_depth_object_core,
     depth_frame_from_object_core,
     depth_payload_from_object_core_calibration,

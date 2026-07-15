@@ -1,26 +1,146 @@
-"""Field-conditioned truth generation for ``object_coefficients_v1``."""
+"""Domain-neutral field-conditioned scientific truth generation."""
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Mapping
 
 import numpy as np
 
-from cup.physics.numpy_backend import forward_time, reflectivity_from_log_ai
 from cup.synthetic.core.calibration import (
     PROFILE_METRICS,
     ImpedanceCalibration,
     STATE_NAMES,
     object_profile_metrics,
 )
-from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION
-from cup.synthetic.time.forward import antialias_taps, categorical_model_grids, downsample_continuous
-from cup.synthetic.core.random import ar1_irregular, named_rng
-from cup.synthetic.core.generation import GeneratedSection, GenerationRejected, GenerationScenario
+from cup.synthetic.core.random import RandomNamespace, ar1_irregular, named_rng
+from cup.synthetic.core.rejections import TruthGenerationRejected
+from cup.synthetic.core.scenarios import GenerationScenario
+
+
+@dataclass(frozen=True)
+class TruthGenerationRequest:
+    realization_id: str
+    scenario: GenerationScenario
+    global_seed: int
+    random_namespace: RandomNamespace
+    sample_domain: str
+    axis_unit: str
+    lateral_m: np.ndarray
+    inline_float: np.ndarray
+    xline_float: np.ndarray
+    x_m: np.ndarray
+    y_m: np.ndarray
+    horizon_coordinates: np.ndarray
+    model_sample_interval: float
+    vertical_oversampling_factor: int
+    minimum_highres_cells: int
+    vertical_axis_origin: float | None
+    context_extent: float
+    sequence_minimum_duration_reference: str
+    max_global_reversal_fraction: float
+    max_object_reversal_fraction: float
+    max_global_clipping_fraction: float
+    max_object_clipping_fraction: float
+
+    def __post_init__(self) -> None:
+        domain = self.sample_domain.strip().lower()
+        if (domain, self.axis_unit) not in {("time", "s"), ("depth", "m")}:
+            raise ValueError("truth request domain/unit must be time/s or depth/m.")
+        if not self.realization_id.strip():
+            raise ValueError("truth realization_id must be non-empty.")
+        if not np.isfinite(self.model_sample_interval) or self.model_sample_interval <= 0.0:
+            raise ValueError("truth model sample interval must be positive.")
+        if (
+            self.vertical_oversampling_factor < 1
+            or int(self.vertical_oversampling_factor) != self.vertical_oversampling_factor
+            or self.minimum_highres_cells < 1
+            or int(self.minimum_highres_cells) != self.minimum_highres_cells
+        ):
+            raise ValueError("truth sampling factors must be positive integers.")
+        if self.sequence_minimum_duration_reference not in {"median", "minimum"}:
+            raise ValueError(
+                "sequence_minimum_duration_reference must be 'median' or 'minimum'."
+            )
+        if self.vertical_axis_origin is not None and not np.isfinite(self.vertical_axis_origin):
+            raise ValueError("truth vertical axis origin must be finite.")
+        if not np.isfinite(self.context_extent) or self.context_extent < 0.0:
+            raise ValueError("truth context extent must be finite and non-negative.")
+        for name in (
+            "max_global_reversal_fraction",
+            "max_object_reversal_fraction",
+            "max_global_clipping_fraction",
+            "max_object_clipping_fraction",
+        ):
+            if not np.isfinite(getattr(self, name)):
+                raise ValueError(f"truth QC threshold {name} must be finite.")
+        lateral = np.asarray(self.lateral_m, dtype=np.float64).reshape(-1)
+        if lateral.size < 2 or np.any(~np.isfinite(lateral)) or np.any(np.diff(lateral) <= 0.0):
+            raise ValueError("truth lateral axis must be finite and strictly increasing.")
+        one_dimensional = {
+            "inline_float": self.inline_float,
+            "xline_float": self.xline_float,
+            "x_m": self.x_m,
+            "y_m": self.y_m,
+        }
+        for name, values in one_dimensional.items():
+            array = np.asarray(values, dtype=np.float64).reshape(-1)
+            if array.shape != lateral.shape or np.any(~np.isfinite(array)):
+                raise ValueError(f"truth {name} must be finite and match lateral_m.")
+            object.__setattr__(self, name, array)
+        horizons = np.asarray(self.horizon_coordinates, dtype=np.float64)
+        if horizons.ndim != 2 or horizons.shape[0] != lateral.size:
+            raise ValueError("truth horizons must have shape [lateral, horizon].")
+        if np.any(~np.isfinite(horizons)) or np.any(np.diff(horizons, axis=1) <= 0.0):
+            raise ValueError("crossing_horizons")
+        object.__setattr__(self, "sample_domain", domain)
+        object.__setattr__(self, "lateral_m", lateral)
+        object.__setattr__(self, "horizon_coordinates", horizons)
+
+
+@dataclass(frozen=True)
+class SyntheticTruth:
+    realization_id: str
+    scenario: GenerationScenario
+    sample_domain: str
+    axis_unit: str
+    highres_axis: np.ndarray
+    highres_sample_interval: float
+    lateral_m: np.ndarray
+    inline_float: np.ndarray
+    xline_float: np.ndarray
+    x_m: np.ndarray
+    y_m: np.ndarray
+    log_ai_highres: np.ndarray
+    rgt_highres: np.ndarray
+    state_id_highres: np.ndarray
+    object_id_highres: np.ndarray
+    object_xi_highres: np.ndarray
+    zone_id_highres: np.ndarray
+    geometry_event_mask_highres: np.ndarray
+    boundary_mask_highres: np.ndarray
+    object_catalog: tuple[Mapping[str, Any], ...]
+    object_lateral_coefficients: tuple[Mapping[str, Any], ...]
+    diagnostics: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "object_catalog",
+            tuple(MappingProxyType(dict(row)) for row in self.object_catalog),
+        )
+        object.__setattr__(
+            self,
+            "object_lateral_coefficients",
+            tuple(MappingProxyType(dict(row)) for row in self.object_lateral_coefficients),
+        )
+        object.__setattr__(self, "diagnostics", MappingProxyType(dict(self.diagnostics)))
 
 
 def _rng_keys(
     calibration: ImpedanceCalibration,
+    namespace: RandomNamespace,
     *,
     global_seed: int,
     stream_purpose: str,
@@ -32,8 +152,8 @@ def _rng_keys(
 ) -> dict[str, Any]:
     return {
         "global_seed": int(global_seed),
-        "benchmark_version": BENCHMARK_SCHEMA_VERSION,
-        "generator_family": calibration.generator_family,
+        "benchmark_version": namespace.benchmark_version,
+        "generator_family": namespace.generator_family,
         "stream_purpose": stream_purpose,
         "realization_id": realization_id,
         "zone_id": zone_id,
@@ -60,6 +180,7 @@ def _truncated_normal(
 
 def _sample_object_sequence(
     calibration: ImpedanceCalibration,
+    namespace: RandomNamespace,
     *,
     zone_id: str,
     realization_id: str,
@@ -71,6 +192,7 @@ def _sample_object_sequence(
     initial_rng = named_rng(
         **_rng_keys(
             calibration,
+            namespace,
             global_seed=global_seed,
             stream_purpose="state_sequence",
             realization_id=realization_id,
@@ -89,6 +211,7 @@ def _sample_object_sequence(
         duration_rng = named_rng(
             **_rng_keys(
                 calibration,
+                namespace,
                 global_seed=global_seed,
                 stream_purpose="duration",
                 realization_id=realization_id,
@@ -134,6 +257,7 @@ def _sample_object_sequence(
 
 def _sample_background(
     calibration: ImpedanceCalibration,
+    namespace: RandomNamespace,
     *,
     zone_id: str,
     realization_id: str,
@@ -147,6 +271,7 @@ def _sample_background(
         rng = named_rng(
             **_rng_keys(
                 calibration,
+                namespace,
                 global_seed=global_seed,
                 stream_purpose="zone_background",
                 realization_id=realization_id,
@@ -254,6 +379,7 @@ def _condition_c0_to_ai_bounds(
 
 def _object_lateral_parameters(
     calibration: ImpedanceCalibration,
+    namespace: RandomNamespace,
     *,
     objects: list[dict[str, Any]],
     zone_id: str,
@@ -277,13 +403,14 @@ def _object_lateral_parameters(
             base_rng = named_rng(
                 **_rng_keys(
                     calibration,
+                    namespace,
                     global_seed=global_seed,
                     stream_purpose=f"coefficient_{coefficient_name}",
                     realization_id=realization_id,
                     zone_id=zone_id,
                     object_id=item["object_id"],
                     coefficient_name=coefficient_name,
-                    variant_id=scenario.variant_id,
+                    variant_id=scenario.geometry_variant_id,
                 )
             )
             base = _truncated_normal(distribution, base_rng)
@@ -293,13 +420,14 @@ def _object_lateral_parameters(
                 rng=named_rng(
                     **_rng_keys(
                         calibration,
+                        namespace,
                         global_seed=global_seed,
                         stream_purpose="coefficient_lateral",
                         realization_id=realization_id,
                         zone_id=zone_id,
                         object_id=item["object_id"],
                         coefficient_name=coefficient_name,
-                        variant_id=scenario.variant_id,
+                        variant_id=scenario.geometry_variant_id,
                     )
                 ),
             )
@@ -329,12 +457,13 @@ def _object_lateral_parameters(
             rng=named_rng(
                 **_rng_keys(
                     calibration,
+                    namespace,
                     global_seed=global_seed,
                     stream_purpose="thickness_lateral",
                     realization_id=realization_id,
                     zone_id=zone_id,
                     object_id=item["object_id"],
-                    variant_id=scenario.variant_id,
+                    variant_id=scenario.geometry_variant_id,
                 )
             ),
         )
@@ -375,7 +504,7 @@ def _apply_geometry_event(
     if scenario.geometry_family == "wedge":
         multiplier = 0.25 + 1.5 * coordinate
     elif scenario.geometry_family == "pinchout":
-        location = 0.35 if "035" in scenario.variant_id else 0.65
+        location = 0.35 if "035" in scenario.geometry_variant_id else 0.65
         width = 0.25
         start = max(0.0, location - width)
         scaled = np.clip((coordinate - start) / max(width, 1e-9), 0.0, 1.0)
@@ -402,7 +531,7 @@ def _apply_geometry_event(
         target = candidate
         break
     if target is None:
-        raise GenerationRejected(
+        raise TruthGenerationRejected(
             ["missing_geometry_event_target"],
             diagnostics={
                 "global_reversal_fraction": float("nan"),
@@ -460,7 +589,7 @@ def _enforce_minimum_thickness(
         available = 1.0 - exempt_weight
         required = len(included) * float(floor[lateral_index])
         if available + 1e-12 < required:
-            raise GenerationRejected(
+            raise TruthGenerationRejected(
                 ["invalid_layer_duration"],
                 diagnostics={
                     "global_reversal_fraction": float("nan"),
@@ -496,65 +625,67 @@ def _enforce_minimum_thickness(
     return output
 
 
-def generate_field_section(
+def generate_field_conditioned_truth(
     calibration: ImpedanceCalibration,
-    *,
-    realization_id: str,
-    scenario: GenerationScenario,
-    global_seed: int,
-    lateral_m: np.ndarray,
-    inline_float: np.ndarray,
-    xline_float: np.ndarray,
-    x_m: np.ndarray,
-    y_m: np.ndarray,
-    horizon_twt_s: np.ndarray,
-    output_dt_s: float,
-    wavelet_time_s: np.ndarray,
-    wavelet: np.ndarray,
-    vertical_oversampling_factor: int = 8,
-    minimum_truth_samples: int = 4,
-    max_global_reversal_fraction: float = 0.10,
-    max_object_reversal_fraction: float = 0.25,
-    max_global_clipping_fraction: float = 0.005,
-    max_object_clipping_fraction: float = 0.02,
-    vertical_axis_origin: float | None = None,
-    context_extent: float | None = None,
-    sequence_minimum_duration_reference: str = "median",
-) -> GeneratedSection:
-    """Generate one field-conditioned realization and its main closed forward model."""
-    lateral = np.asarray(lateral_m, dtype=np.float64).reshape(-1)
-    horizons = np.asarray(horizon_twt_s, dtype=np.float64)
+    request: TruthGenerationRequest,
+) -> SyntheticTruth:
+    """Generate only high-resolution underground truth and scientific diagnostics."""
+    if request.random_namespace.generator_family != calibration.generator_family:
+        raise ValueError("truth random namespace generator family does not match calibration.")
+    realization_id = request.realization_id
+    scenario = request.scenario
+    global_seed = request.global_seed
+    namespace = request.random_namespace
+    lateral = request.lateral_m
+    inline_float = request.inline_float
+    xline_float = request.xline_float
+    x_m = request.x_m
+    y_m = request.y_m
+    horizons = request.horizon_coordinates
+    output_interval = float(request.model_sample_interval)
+    factor = int(request.vertical_oversampling_factor)
+    minimum_truth_samples = int(request.minimum_highres_cells)
+    max_global_reversal_fraction = float(request.max_global_reversal_fraction)
+    max_object_reversal_fraction = float(request.max_object_reversal_fraction)
+    max_global_clipping_fraction = float(request.max_global_clipping_fraction)
+    max_object_clipping_fraction = float(request.max_object_clipping_fraction)
+    vertical_axis_origin = request.vertical_axis_origin
+    context_extent = float(request.context_extent)
+    sequence_minimum_duration_reference = request.sequence_minimum_duration_reference
     if horizons.shape != (lateral.size, len(calibration.ordered_horizons)):
-        raise ValueError("horizon_twt_s shape does not match lateral samples and calibrated horizons.")
-    if np.any(np.diff(horizons, axis=1) <= 0.0):
-        raise ValueError("crossing_horizons")
-    factor = int(vertical_oversampling_factor)
-    truth_dt = float(output_dt_s) / factor
-    if not np.isclose(truth_dt, calibration.truth_dt_s, rtol=0.0, atol=1e-12):
+        raise ValueError("horizon shape does not match lateral samples and calibrated horizons.")
+    highres_interval = output_interval / factor
+    if not np.isclose(highres_interval, calibration.truth_dt_s, rtol=0.0, atol=1e-12):
         raise ValueError("impedance_calibration_source_mismatch:truth_dt")
-    wavelet_values = np.asarray(wavelet, dtype=np.float64).reshape(-1)
-    context_s = (
-        (wavelet_values.size // 2) * float(output_dt_s)
-        if context_extent is None
-        else float(context_extent)
-    )
-    if not np.isfinite(context_s) or context_s < 0.0:
-        raise ValueError("context_extent must be finite and non-negative.")
     if vertical_axis_origin is None:
-        start_s = np.floor((float(np.min(horizons[:, 0])) - context_s) / truth_dt) * truth_dt
-        end_s = np.ceil((float(np.max(horizons[:, -1])) + context_s) / truth_dt) * truth_dt
+        start_coordinate = (
+            np.floor(
+                (float(np.min(horizons[:, 0])) - context_extent) / highres_interval
+            )
+            * highres_interval
+        )
+        end_coordinate = (
+            np.ceil(
+                (float(np.max(horizons[:, -1])) + context_extent) / highres_interval
+            )
+            * highres_interval
+        )
     else:
         origin = float(vertical_axis_origin)
-        start_s = origin + np.floor(
-            (float(np.min(horizons[:, 0])) - context_s - origin) / float(output_dt_s)
-        ) * float(output_dt_s)
-        end_s = origin + np.ceil(
-            (float(np.max(horizons[:, -1])) + context_s - origin) / float(output_dt_s)
-        ) * float(output_dt_s)
-    n_model_intervals = int(np.ceil((end_s - start_s) / output_dt_s))
+        start_coordinate = origin + np.floor(
+            (float(np.min(horizons[:, 0])) - context_extent - origin) / output_interval
+        ) * output_interval
+        end_coordinate = origin + np.ceil(
+            (float(np.max(horizons[:, -1])) + context_extent - origin) / output_interval
+        ) * output_interval
+    n_model_intervals = int(
+        np.ceil((end_coordinate - start_coordinate) / output_interval)
+    )
     n_highres = n_model_intervals * factor + 1
-    twt_highres = start_s + np.arange(n_highres, dtype=np.float64) * truth_dt
-    twt_model = twt_highres[::factor]
+    highres_axis = (
+        start_coordinate
+        + np.arange(n_highres, dtype=np.float64) * highres_interval
+    )
     n_lateral = lateral.size
     log_ai = np.full((n_lateral, n_highres), np.nan, dtype=np.float64)
     rgt = np.full_like(log_ai, np.nan)
@@ -585,17 +716,19 @@ def generate_field_section(
             raise ValueError(
                 "sequence_minimum_duration_reference must be 'median' or 'minimum'."
             )
-        minimum_fraction = minimum_truth_samples * truth_dt / reference_duration
+        minimum_fraction = minimum_truth_samples * highres_interval / reference_duration
         objects = _sample_object_sequence(
             calibration,
+            namespace,
             zone_id=zone_id,
             realization_id=realization_id,
             global_seed=global_seed,
             minimum_fraction=minimum_fraction,
-            variant_id=scenario.variant_id,
+            variant_id=scenario.geometry_variant_id,
         )
         coefficients, thickness_weights, qc_rows = _object_lateral_parameters(
             calibration,
+            namespace,
             objects=objects,
             zone_id=zone_id,
             realization_id=realization_id,
@@ -604,8 +737,10 @@ def generate_field_section(
             scenario=scenario,
         )
         field_qc.extend(qc_rows)
-        minimum_fraction_by_lateral = minimum_truth_samples * truth_dt / zone_durations
-        minimum_wedge_target_fraction = 2.0 * truth_dt / zone_durations
+        minimum_fraction_by_lateral = (
+            minimum_truth_samples * highres_interval / zone_durations
+        )
+        minimum_wedge_target_fraction = 2.0 * highres_interval / zone_durations
         thickness_weights, event_target, event_multiplier = _apply_geometry_event(
             objects,
             thickness_weights,
@@ -622,10 +757,11 @@ def generate_field_section(
         )
         a, b = _sample_background(
             calibration,
+            namespace,
             zone_id=zone_id,
             realization_id=realization_id,
             global_seed=global_seed,
-            variant_id=scenario.variant_id,
+            variant_id=scenario.geometry_variant_id,
         )
         cumulative = np.vstack((np.zeros(n_lateral), np.cumsum(thickness_weights, axis=0)))
         for local_object_index, item in enumerate(objects):
@@ -654,8 +790,10 @@ def generate_field_section(
                 bottom = horizons[lateral_index, zone_index + 1]
                 object_top = top + cumulative[local_object_index, lateral_index] * (bottom - top)
                 object_bottom = top + cumulative[local_object_index + 1, lateral_index] * (bottom - top)
-                mask = (twt_highres >= object_top) & (
-                    twt_highres < object_bottom if local_object_index + 1 < len(objects) else twt_highres <= object_bottom
+                mask = (highres_axis >= object_top) & (
+                    highres_axis < object_bottom
+                    if local_object_index + 1 < len(objects)
+                    else highres_axis <= object_bottom
                 )
                 indices = np.flatnonzero(mask)
                 if indices.size == 0:
@@ -670,15 +808,21 @@ def generate_field_section(
                     maximum_object_truth_samples,
                     int(indices.size),
                 )
-                xi = (twt_highres[indices] - object_top) / max(object_bottom - object_top, truth_dt)
-                zeta = (twt_highres[indices] - top) / max(bottom - top, truth_dt)
+                xi = (highres_axis[indices] - object_top) / max(
+                    object_bottom - object_top, highres_interval
+                )
+                zeta = (highres_axis[indices] - top) / max(
+                    bottom - top, highres_interval
+                )
                 if indices.size >= 2:
                     qc_xi = xi
                     qc_zeta = zeta
                 else:
                     qc_xi = np.linspace(0.0, 1.0, 5, dtype=np.float64)
-                    qc_twt = object_top + qc_xi * (object_bottom - object_top)
-                    qc_zeta = (qc_twt - top) / max(bottom - top, truth_dt)
+                    qc_coordinate = object_top + qc_xi * (object_bottom - object_top)
+                    qc_zeta = (qc_coordinate - top) / max(
+                        bottom - top, highres_interval
+                    )
                 projected, projection = _project_profile_coefficients(
                     coefficients[local_object_index, lateral_index],
                     xi=qc_xi,
@@ -714,8 +858,8 @@ def generate_field_section(
                         "thickness_fraction": float(
                             thickness_weights[local_object_index, lateral_index]
                         ),
-                        "object_top_s": float(object_top),
-                        "object_bottom_s": float(object_bottom),
+                        "object_top_coordinate": float(object_top),
+                        "object_bottom_coordinate": float(object_bottom),
                         "profile_projection_scale": float(projection),
                         "c0_conditioning_adjustment": float(c0_adjustment),
                     }
@@ -860,10 +1004,10 @@ def generate_field_section(
                     "maximum_duration_fraction": float(
                         np.max(thickness_weights[local_object_index])
                     ),
-                    "minimum_duration_s": float(
+                    "minimum_extent": float(
                         np.min(thickness_weights[local_object_index] * zone_durations)
                     ),
-                    "maximum_duration_s": float(
+                    "maximum_extent": float(
                         np.max(thickness_weights[local_object_index] * zone_durations)
                     ),
                     "minimum_truth_samples": (
@@ -1000,19 +1144,10 @@ def generate_field_section(
                 }
             ),
         }
-        raise GenerationRejected(reasons, diagnostics=diagnostics, details=rejection_details)
+        raise TruthGenerationRejected(
+            reasons, diagnostics=diagnostics, details=rejection_details
+        )
 
-    taps = antialias_taps(factor)
-    model_log_ai = downsample_continuous(log_ai, factor, taps)[..., : twt_model.size]
-    rgt_model = downsample_continuous(rgt, factor, taps)[..., : twt_model.size]
-    reflectivity_highres = reflectivity_from_log_ai(log_ai)
-    reflectivity_model = reflectivity_from_log_ai(model_log_ai)
-    seismic = forward_time(model_log_ai, wavelet_time_s, wavelet_values)
-    state_fraction, dominant, zone_model, boundary_fraction, valid_model = categorical_model_grids(
-        state_id, object_id, zone_id_grid, boundary, factor, twt_model.size
-    )
-    forward_valid_highres = np.isfinite(log_ai[:, :-1]) & np.isfinite(log_ai[:, 1:])
-    forward_valid_model = np.isfinite(model_log_ai[:, :-1]) & np.isfinite(model_log_ai[:, 1:])
     correlation_warnings = [
         row
         for row in field_qc
@@ -1022,40 +1157,29 @@ def generate_field_section(
         / row["effective_lx_m"]
         > 0.35
     ]
-    return GeneratedSection(
+    return SyntheticTruth(
         realization_id=realization_id,
         scenario=scenario,
+        sample_domain=request.sample_domain,
+        axis_unit=request.axis_unit,
+        highres_axis=highres_axis,
+        highres_sample_interval=highres_interval,
         lateral_m=lateral,
         inline_float=np.asarray(inline_float, dtype=np.float64),
         xline_float=np.asarray(xline_float, dtype=np.float64),
         x_m=np.asarray(x_m, dtype=np.float64),
         y_m=np.asarray(y_m, dtype=np.float64),
-        twt_highres_s=twt_highres,
-        twt_model_s=twt_model,
-        truth_log_ai_highres=log_ai,
-        model_target_log_ai=model_log_ai,
-        reflectivity_highres=reflectivity_highres,
-        reflectivity_model=reflectivity_model,
-        seismic_model_consistent=seismic,
+        log_ai_highres=log_ai,
         rgt_highres=rgt,
-        rgt_model=rgt_model,
         state_id_highres=state_id,
         object_id_highres=object_id,
         object_xi_highres=object_xi,
         zone_id_highres=zone_id_grid,
         geometry_event_mask_highres=geometry_event_mask,
         boundary_mask_highres=boundary,
-        boundary_fraction_model=boundary_fraction,
-        boundary_mask_model=boundary_fraction > 0.0,
-        state_fraction_model=state_fraction,
-        dominant_object_id_model=dominant,
-        zone_id_model=zone_model,
-        valid_mask_model=valid_model,
-        forward_valid_mask_highres=forward_valid_highres,
-        forward_valid_mask_model=forward_valid_model,
-        object_catalog=object_catalog,
-        object_lateral_coefficients=object_lateral_coefficients,
-        qc={
+        object_catalog=tuple(object_catalog),
+        object_lateral_coefficients=tuple(object_lateral_coefficients),
+        diagnostics={
             "status": "ok",
             "global_reversal_fraction": global_reversal,
             "global_clipping_fraction": global_clipping,
@@ -1099,3 +1223,10 @@ def generate_field_section(
             "field_qc": field_qc,
         },
     )
+
+
+__all__ = [
+    "SyntheticTruth",
+    "TruthGenerationRequest",
+    "generate_field_conditioned_truth",
+]

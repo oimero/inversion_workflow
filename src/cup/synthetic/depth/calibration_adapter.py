@@ -1,15 +1,7 @@
-"""Adapters between the depth-domain extension and the domain-neutral object core.
-
-The first depth Synthoseis slice deliberately reuses the existing object-core
-calibration and realization generator.  That core was originally written for
-time-domain v1, so its Python interface still uses names such as ``twt_s`` and
-``truth_dt_s``.  Keep that vocabulary confined to this Adapter; depth callers
-should use TVDSS/metre names everywhere else.
-"""
+"""Translate depth calibration artifacts to the shared scientific calibration."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -18,8 +10,6 @@ import numpy as np
 import pandas as pd
 
 from cup.synthetic.core.calibration import ImpedanceCalibration, WellZoneCurves, calibrate_impedance
-from cup.synthetic.core.generation import GeneratedSection, GenerationScenario
-from cup.synthetic.time.generation import generate_field_section
 from cup.synthetic.depth.config import CALIBRATION_SCHEMA, GENERATOR_FAMILY
 
 
@@ -29,29 +19,6 @@ def _json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"Expected JSON object: {path}")
     return value
-
-
-@dataclass(frozen=True)
-class DepthObjectCoreSection:
-    tvdss_highres_m: np.ndarray
-    tvdss_model_m: np.ndarray
-    log_ai_highres: np.ndarray
-    model_target_log_ai: np.ndarray
-    state_id_highres: np.ndarray
-    object_id_highres: np.ndarray
-    object_xi_highres: np.ndarray
-    zone_id_highres: np.ndarray
-    geometry_event_mask_highres: np.ndarray
-    boundary_mask_highres: np.ndarray
-    boundary_fraction_model: np.ndarray
-    boundary_mask_model: np.ndarray
-    state_fraction_model: np.ndarray
-    dominant_object_id_model: np.ndarray
-    zone_id_model: np.ndarray
-    categorical: dict[str, np.ndarray]
-    object_catalog: list[dict[str, Any]]
-    object_lateral_coefficients: list[dict[str, Any]]
-    qc: dict[str, Any]
 
 
 def depth_well_zone_curves_for_object_core(
@@ -103,6 +70,21 @@ def depth_catalog_from_object_core(records: Sequence[Mapping[str, Any]]) -> list
         "maximum_duration_s": "maximum_thickness_m",
     }
     return [{replacements.get(key, key): value for key, value in record.items()} for record in records]
+
+
+def depth_catalog_from_synthetic_truth(
+    records: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    replacements = {
+        "object_top_coordinate": "object_top_tvdss_m",
+        "object_bottom_coordinate": "object_bottom_tvdss_m",
+        "minimum_extent": "minimum_thickness_m",
+        "maximum_extent": "maximum_thickness_m",
+    }
+    return [
+        {replacements.get(key, key): value for key, value in record.items()}
+        for record in records
+    ]
 
 
 def depth_payload_from_object_core_calibration(
@@ -194,94 +176,13 @@ def calibrate_depth_object_core(
     )
 
 
-def generate_depth_object_core_section(
-    calibration: ImpedanceCalibration,
-    *,
-    realization_id: str,
-    scenario: GenerationScenario,
-    global_seed: int,
-    lateral_m: np.ndarray,
-    inline_float: np.ndarray,
-    xline_float: np.ndarray,
-    x_m: np.ndarray,
-    y_m: np.ndarray,
-    horizon_tvdss_m: np.ndarray,
-    model_dz_m: float,
-    vertical_oversampling_factor: int,
-    minimum_highres_cells: int,
-    max_global_reversal_fraction: float,
-    max_object_reversal_fraction: float,
-    max_global_clipping_fraction: float,
-    max_object_clipping_fraction: float,
-    vertical_axis_origin_m: float,
-    context_extent_m: float,
-) -> DepthObjectCoreSection:
-    legacy: GeneratedSection = generate_field_section(
-        calibration,
-        realization_id=realization_id,
-        scenario=scenario,
-        global_seed=int(global_seed),
-        lateral_m=lateral_m,
-        inline_float=inline_float,
-        xline_float=xline_float,
-        x_m=x_m,
-        y_m=y_m,
-        horizon_twt_s=horizon_tvdss_m,
-        output_dt_s=float(model_dz_m),
-        wavelet_time_s=np.array([-1.0, 0.0, 1.0], dtype=np.float64),
-        wavelet=np.array([0.0, 1.0, 0.0], dtype=np.float64),
-        vertical_oversampling_factor=int(vertical_oversampling_factor),
-        minimum_truth_samples=int(minimum_highres_cells),
-        max_global_reversal_fraction=float(max_global_reversal_fraction),
-        max_object_reversal_fraction=float(max_object_reversal_fraction),
-        max_global_clipping_fraction=float(max_global_clipping_fraction),
-        max_object_clipping_fraction=float(max_object_clipping_fraction),
-        vertical_axis_origin=float(vertical_axis_origin_m),
-        context_extent=float(context_extent_m),
-        sequence_minimum_duration_reference="minimum",
-    )
-    return DepthObjectCoreSection(
-        tvdss_highres_m=np.asarray(legacy.twt_highres_s, dtype=np.float64),
-        tvdss_model_m=np.asarray(legacy.twt_model_s, dtype=np.float64),
-        log_ai_highres=np.asarray(legacy.truth_log_ai_highres, dtype=np.float64),
-        model_target_log_ai=np.asarray(legacy.model_target_log_ai, dtype=np.float64),
-        state_id_highres=np.asarray(legacy.state_id_highres),
-        object_id_highres=np.asarray(legacy.object_id_highres),
-        object_xi_highres=np.asarray(legacy.object_xi_highres),
-        zone_id_highres=np.asarray(legacy.zone_id_highres),
-        geometry_event_mask_highres=np.asarray(legacy.geometry_event_mask_highres),
-        boundary_mask_highres=np.asarray(legacy.boundary_mask_highres),
-        boundary_fraction_model=np.asarray(legacy.boundary_fraction_model),
-        boundary_mask_model=np.asarray(legacy.boundary_mask_model),
-        state_fraction_model=np.asarray(legacy.state_fraction_model),
-        dominant_object_id_model=np.asarray(legacy.dominant_object_id_model),
-        zone_id_model=np.asarray(legacy.zone_id_model),
-        categorical={
-            "state_id_highres": np.asarray(legacy.state_id_highres),
-            "object_id_highres": np.asarray(legacy.object_id_highres),
-            "object_xi_highres": np.asarray(legacy.object_xi_highres),
-            "zone_id_highres": np.asarray(legacy.zone_id_highres),
-            "geometry_event_mask_highres": np.asarray(legacy.geometry_event_mask_highres),
-            "boundary_mask_highres": np.asarray(legacy.boundary_mask_highres),
-            "boundary_fraction_model": np.asarray(legacy.boundary_fraction_model),
-            "boundary_mask_model": np.asarray(legacy.boundary_mask_model),
-            "state_fraction_model": np.asarray(legacy.state_fraction_model),
-            "dominant_object_id_model": np.asarray(legacy.dominant_object_id_model),
-            "zone_id_model": np.asarray(legacy.zone_id_model),
-        },
-        object_catalog=depth_catalog_from_object_core(legacy.object_catalog),
-        object_lateral_coefficients=depth_catalog_from_object_core(legacy.object_lateral_coefficients),
-        qc=dict(legacy.qc),
-    )
-
 
 __all__ = [
-    "DepthObjectCoreSection",
     "calibrate_depth_object_core",
     "depth_catalog_from_object_core",
+    "depth_catalog_from_synthetic_truth",
     "depth_frame_from_object_core",
     "depth_payload_from_object_core_calibration",
     "depth_well_zone_curves_for_object_core",
-    "generate_depth_object_core_section",
     "load_depth_calibration_for_object_core",
 ]

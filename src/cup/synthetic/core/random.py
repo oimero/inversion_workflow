@@ -4,9 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+
+
+@dataclass(frozen=True)
+class RandomNamespace:
+    """Stable namespace prefix for all named scientific random streams."""
+
+    benchmark_version: str
+    generator_family: str
+
+    def __post_init__(self) -> None:
+        if not self.benchmark_version.strip() or not self.generator_family.strip():
+            raise ValueError("random namespace fields must be non-empty.")
 
 
 def named_seed(

@@ -15,12 +15,9 @@ from scipy.signal import firwin, hilbert
 
 from cup.impedance import (
     build_lfm_producer_contract,
-    canonical_lowpass,
-    decompose_log_ai,
     generation_contract,
 )
 from cup.petrel.load import import_interpretation_petrel
-from cup.physics.numpy_backend import velocity_from_ai
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.wavelet import load_wavelet_csv
@@ -45,15 +42,25 @@ from cup.synthetic.core.progress import (
     run_attempt_preflight,
 )
 from cup.synthetic.reporting.figures import write_generation_figures
-from cup.synthetic.core.generation import GenerationRejected, GenerationScenario
-from cup.synthetic.core.generation import generation_scenarios
-from cup.synthetic.core.random import named_rng
+from cup.synthetic.core.lfm import LfmPolicy
+from cup.synthetic.core.random import RandomNamespace, named_rng
+from cup.synthetic.core.records import BenchmarkVariant, DepthForwardExtras
+from cup.synthetic.core.rejections import StagedRejection, frozen_external_reason
+from cup.synthetic.core.sample_builder import (
+    BenchmarkBuildPolicy,
+    BenchmarkBuilder,
+    CanonicalIncrementPolicy,
+)
+from cup.synthetic.core.scenarios import GenerationScenario, generation_scenarios
+from cup.synthetic.core.truth import TruthGenerationRequest, generate_field_conditioned_truth
+from cup.synthetic.core.writer import write_benchmark_sample, write_benchmark_variant
 from cup.synthetic.depth.config import CALIBRATION_SCHEMA, GENERATOR_FAMILY, SCHEMA_VERSION
 from cup.synthetic.depth.model import DepthGeneratedSection, DepthSectionGeometry
-from cup.synthetic.depth.object_core_adapter import (
-    generate_depth_object_core_section,
+from cup.synthetic.depth.calibration_adapter import (
+    depth_catalog_from_synthetic_truth,
     load_depth_calibration_for_object_core,
 )
+from cup.synthetic.depth.forward_adapter import DepthForwardAdapter
 from cup.physics.execution import DepthForwardExecutor
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
@@ -250,52 +257,6 @@ def _valid_filter_decimate(
     return output, valid
 
 
-def _finite_segments(mask: np.ndarray) -> list[tuple[int, int]]:
-    padded = np.concatenate(([False], np.asarray(mask, dtype=bool), [False]))
-    starts = np.flatnonzero(~padded[:-1] & padded[1:])
-    stops = np.flatnonzero(padded[:-1] & ~padded[1:])
-    return [(int(start), int(stop)) for start, stop in zip(starts, stops)]
-
-
-def _spatial_lowpass(
-    values: np.ndarray,
-    *,
-    valid_mask: np.ndarray | None = None,
-    dz_m: float,
-    wavelength_m: float,
-    numtaps: int,
-    beta: float,
-) -> np.ndarray:
-    nyquist = 0.5 / dz_m
-    cutoff = 1.0 / wavelength_m
-    if not 0.0 < cutoff < nyquist:
-        raise ValueError("LFM spatial cutoff is outside (0, Nyquist).")
-    count = int(numtaps)
-    if count < 3 or count % 2 == 0:
-        raise ValueError("LFM numtaps must be odd and >= 3.")
-    taps = firwin(count, cutoff / nyquist, window=("kaiser", float(beta)), scale=True)
-    half = count // 2
-    array = np.asarray(values, dtype=np.float64)
-    if array.ndim != 2:
-        raise ValueError("Depth LFM spatial lowpass expects a [lateral, depth] array.")
-    if valid_mask is None:
-        valid = np.isfinite(array)
-    else:
-        valid = np.array(valid_mask, dtype=bool, copy=True)
-        if valid.shape != array.shape:
-            raise ValueError("Depth LFM spatial lowpass valid_mask must match values.")
-        valid &= np.isfinite(array)
-    output = np.full_like(array, np.nan, dtype=np.float64)
-    for lateral_index, row in enumerate(array):
-        for start, stop in _finite_segments(valid[lateral_index]):
-            segment = row[start:stop]
-            padded = np.pad(segment, (half, half), mode="edge")
-            output[lateral_index, start:stop] = np.convolve(
-                padded, taps, mode="valid"
-            )
-    return output
-
-
 def _phase_rotate(wavelet: np.ndarray, degrees: float) -> np.ndarray:
     analytic = hilbert(np.asarray(wavelet, dtype=np.float64))
     return np.real(analytic * np.exp(1j * np.deg2rad(float(degrees))))
@@ -405,110 +366,6 @@ def _vertical_lateral_smooth_gain(
     return np.exp(float(log_sigma) * raw)
 
 
-def _target_mask(axis: np.ndarray, horizons: np.ndarray) -> np.ndarray:
-    return (axis[None, :] >= horizons[:, :1]) & (axis[None, :] <= horizons[:, -1:])
-
-
-def _controlled_degraded_lfm(
-    base: np.ndarray,
-    *,
-    config: Mapping[str, Any],
-    section: DepthSectionGeometry,
-    axis_m: np.ndarray,
-    valid_mask: np.ndarray,
-    global_seed: int,
-    realization_id: str,
-) -> np.ndarray:
-    output = np.asarray(base, dtype=np.float64).copy()
-    valid = np.array(valid_mask, dtype=bool, copy=True)
-    if valid.shape != output.shape:
-        raise ValueError("Depth LFM valid_mask must match the base array.")
-    valid &= np.isfinite(output)
-
-    def rng(purpose: str) -> np.random.Generator:
-        return named_rng(
-            global_seed=global_seed,
-            benchmark_version=SCHEMA_VERSION,
-            generator_family=GENERATOR_FAMILY,
-            stream_purpose=purpose,
-            realization_id=realization_id,
-        )
-
-    constant_bias = rng("lfm_constant_bias").normal(
-        0.0, float(config["constant_bias_sigma_log_ai"])
-    )
-    output[valid] += constant_bias
-    trend_amplitude = rng("lfm_vertical_trend").normal(
-        0.0, float(config["linear_vertical_trend_sigma_log_ai"])
-    )
-    trend = trend_amplitude * np.linspace(-1.0, 1.0, axis_m.size)[None, :]
-    output[valid] += np.broadcast_to(trend, output.shape)[valid]
-    zone_rng = rng("lfm_zonewise_bias")
-    for zone_index in range(section.horizon_tvdss_m.shape[1] - 1):
-        bias = zone_rng.normal(0.0, float(config["zonewise_bias_sigma_log_ai"]))
-        top = section.horizon_tvdss_m[:, zone_index]
-        bottom = section.horizon_tvdss_m[:, zone_index + 1]
-        mask = (axis_m[None, :] >= top[:, None]) & (axis_m[None, :] <= bottom[:, None])
-        output[mask & valid] += bias
-    lateral_rng = rng("lfm_lateral_smooth_bias")
-    field = lateral_rng.normal(size=section.lateral_m.size)
-    requested = float(config["lateral_correlation_fraction"]) * max(
-        float(section.lateral_m[-1]), 1.0
-    )
-    spacing = float(np.median(np.diff(section.lateral_m)))
-    alpha = np.exp(-spacing / max(requested, spacing))
-    for index in range(1, field.size):
-        field[index] = alpha * field[index - 1] + np.sqrt(1.0 - alpha**2) * field[index]
-    field *= float(config["lateral_smooth_bias_sigma_log_ai"]) / max(
-        float(np.std(field)), np.finfo(np.float64).eps
-    )
-    lateral_bias = np.broadcast_to(field[:, None], output.shape)
-    output[valid] += lateral_bias[valid]
-    finite_valid = valid & np.isfinite(output)
-    if not np.any(finite_valid):
-        return np.full_like(output, np.nan, dtype=np.float64)
-    center = float(np.mean(output[finite_valid]))
-    scale = np.exp(
-        rng("lfm_amplitude_scale").normal(0.0, float(config["amplitude_scale_sigma"]))
-    )
-    output[finite_valid] = center + scale * (output[finite_valid] - center)
-    local = dict(config["local_missing_control_bias"])
-    if bool(local["enabled"]):
-        local_rng = rng("lfm_local_missing_control_bias")
-        center_l = local_rng.uniform(0.2, 0.8) * max(float(section.lateral_m[-1]), 1.0)
-        center_z = local_rng.uniform(float(axis_m[0]), float(axis_m[-1]))
-        width_l = max(
-            float(local["lateral_width_fraction"])
-            * max(float(section.lateral_m[-1]), 1.0),
-            spacing,
-        )
-        width_z = max(
-            float(local["vertical_width_fraction"]) * float(axis_m[-1] - axis_m[0]),
-            float(np.diff(axis_m[:2])[0]),
-        )
-        amplitude = local_rng.uniform(-1.0, 1.0) * float(local["max_abs_log_ai"])
-        blob = np.exp(
-            -0.5 * ((section.lateral_m[:, None] - center_l) / width_l) ** 2
-            - 0.5 * ((axis_m[None, :] - center_z) / width_z) ** 2
-        )
-        output[valid] += np.asarray(amplitude * blob)[valid]
-    smoothing = dict(config.get("over_smoothing") or {})
-    if bool(smoothing.get("enabled", False)):
-        over = _spatial_lowpass(
-            output,
-            valid_mask=valid,
-            dz_m=float(np.diff(axis_m[:2])[0]),
-            wavelength_m=float(smoothing["minimum_wavelength_m"]),
-            numtaps=int(smoothing["numtaps"]),
-            beta=float(smoothing["kaiser_beta"]),
-        )
-        blend = float(smoothing["blend"])
-        smoothed = finite_valid & np.isfinite(over)
-        output[smoothed] = (1.0 - blend) * output[smoothed] + blend * over[smoothed]
-    output[~valid] = np.nan
-    return output
-
-
 def generate_depth_realization(
     calibration: ImpedanceCalibration,
     calibration_payload: Mapping[str, Any],
@@ -523,197 +380,144 @@ def generate_depth_realization(
     forward_executor: DepthForwardExecutor | None = None,
     preflight_only: bool = False,
 ) -> DepthGeneratedSection | None:
+    """Build one depth realization through the shared truth and base-sample Seam."""
     realization_id = f"{section.section_id}__{scenario.scenario_id}__a{attempt_id:03d}"
     wavelet_path = resolve_relative_path(
         forward_inputs["wavelet"]["path"], root=repo_root
     )
     wavelet_time, wavelet = load_wavelet_csv(wavelet_path)
-    forward = forward_executor or DepthForwardExecutor(script_cfg["seismic_forward"])
+    executor = forward_executor or DepthForwardExecutor(script_cfg["seismic_forward"])
     factor = int(script_cfg["sampling"]["vertical_oversampling_factor"])
     model_dz = float(script_cfg["sampling"]["expected_model_dz_m"])
-    high_dz = model_dz / factor
-    taps = _antialias_taps(script_cfg["sampling"]["antialias"], factor)
-    antialias_half_m = (taps.size // 2) * high_dz
-    wavelet_half_s = float(np.max(np.abs(wavelet_time)))
-    maximum_vp = float(calibration_payload["maximum_allowed_vp_mps"])
-    halo = np.ceil((0.5 * maximum_vp * wavelet_half_s) / model_dz) * model_dz
-    context = float(halo + antialias_half_m)
     survey_axis = np.asarray(
         survey.sample_axis(domain="depth").values, dtype=np.float64
     )
-    object_core = generate_depth_object_core_section(
-        calibration,
-        realization_id=realization_id,
-        scenario=scenario,
-        global_seed=int(script_cfg["global_seed"]),
-        lateral_m=section.lateral_m,
-        inline_float=section.inline_float,
-        xline_float=section.xline_float,
-        x_m=section.x_m,
-        y_m=section.y_m,
+    adapter = DepthForwardAdapter()
+    preparation = adapter.prepare(
         horizon_tvdss_m=section.horizon_tvdss_m,
+        survey_axis_m=survey_axis,
+        wavelet_time_s=wavelet_time,
+        wavelet=wavelet,
         model_dz_m=model_dz,
         vertical_oversampling_factor=factor,
-        minimum_highres_cells=int(script_cfg["impedance"]["minimum_highres_cells"]),
-        max_global_reversal_fraction=float(
-            script_cfg["impedance"]["max_global_reversal_fraction"]
-        ),
-        max_object_reversal_fraction=float(
-            script_cfg["impedance"]["max_object_reversal_fraction"]
-        ),
-        max_global_clipping_fraction=float(
-            script_cfg["impedance"]["max_global_clipping_fraction"]
-        ),
-        max_object_clipping_fraction=float(
-            script_cfg["impedance"]["max_object_clipping_fraction"]
-        ),
-        vertical_axis_origin_m=float(survey_axis[0]),
-        context_extent_m=context,
+        antialias_config=script_cfg["sampling"]["antialias"],
+        maximum_allowed_vp_mps=float(calibration_payload["maximum_allowed_vp_mps"]),
+        ai_velocity_relation=forward_inputs["ai_velocity_relation"],
+        executor=executor,
     )
-    high_axis = np.asarray(object_core.tvdss_highres_m, dtype=np.float64)
-    model_axis = np.asarray(object_core.tvdss_model_m, dtype=np.float64)
-    if model_axis.size < 2 or not np.array_equal(high_axis[::factor], model_axis):
-        raise ValueError("Depth highres/model axes are not strictly nested.")
-    survey_indices = np.searchsorted(survey_axis, model_axis)
-    if np.any(survey_indices >= survey_axis.size) or not np.allclose(
-        survey_axis[survey_indices], model_axis, rtol=0.0, atol=1e-9
+    namespace = RandomNamespace(
+        benchmark_version=SCHEMA_VERSION,
+        generator_family=calibration.generator_family,
+    )
+    truth = generate_field_conditioned_truth(
+        calibration,
+        TruthGenerationRequest(
+            realization_id=realization_id,
+            scenario=scenario,
+            global_seed=int(script_cfg["global_seed"]),
+            random_namespace=namespace,
+            sample_domain="depth",
+            axis_unit="m",
+            lateral_m=section.lateral_m,
+            inline_float=section.inline_float,
+            xline_float=section.xline_float,
+            x_m=section.x_m,
+            y_m=section.y_m,
+            horizon_coordinates=section.horizon_tvdss_m,
+            model_sample_interval=model_dz,
+            vertical_oversampling_factor=factor,
+            minimum_highres_cells=int(script_cfg["impedance"]["minimum_highres_cells"]),
+            vertical_axis_origin=float(survey_axis[0]),
+            context_extent=preparation.required_context_extent,
+            sequence_minimum_duration_reference="minimum",
+            max_global_reversal_fraction=float(
+                script_cfg["impedance"]["max_global_reversal_fraction"]
+            ),
+            max_object_reversal_fraction=float(
+                script_cfg["impedance"]["max_object_reversal_fraction"]
+            ),
+            max_global_clipping_fraction=float(
+                script_cfg["impedance"]["max_global_clipping_fraction"]
+            ),
+            max_object_clipping_fraction=float(
+                script_cfg["impedance"]["max_object_clipping_fraction"]
+            ),
+        ),
+    )
+    if not np.array_equal(
+        truth.highres_axis[::factor], preparation.model_axis.coordinates
     ):
-        raise ValueError(f"section_context_outside_survey_axis:{section.section_id}")
+        raise ValueError("Depth highres/model axes are not strictly nested.")
     if preflight_only:
         return None
 
-    log_high = np.asarray(object_core.log_ai_highres, dtype=np.float64)
-    model_log, antialias_valid_1d = _valid_filter_decimate(
-        log_high, factor=factor, taps=taps
-    )
-    relation = forward_inputs["ai_velocity_relation"]
-    ai_high = np.exp(log_high)
-    ai_model = np.exp(model_log)
-    vp_high = velocity_from_ai(ai_high, a=float(relation["a"]), b=float(relation["b"]))
-    vp_model = velocity_from_ai(
-        ai_model, a=float(relation["a"]), b=float(relation["b"])
-    )
-    seismic_high = forward(log_high, vp_high, high_axis, wavelet_time, wavelet)
-    seismic_observed, seismic_antialias_valid = _valid_filter_decimate(
-        seismic_high, factor=factor, taps=taps
-    )
-    seismic_model = forward(
-        model_log, vp_model, model_axis, wavelet_time, wavelet
-    )
-    residual = seismic_observed - seismic_model
-    target = _target_mask(model_axis, section.horizon_tvdss_m)
-    # The public mask is the geometric target ROI.  Context/halo must make all
-    # generated arrays finite there; support failures reject the attempt below.
-    valid = target
-
-    ideal_cfg = script_cfg["lfm"]["ideal"]
-    degraded_cfg = script_cfg["lfm"]["controlled_degraded"]
     canonical_contract = generation_contract("depth", model_dz)
-    lfm_ideal, _target_increment = decompose_log_ai(
-        model_log,
-        model_axis,
-        canonical_contract,
-        valid_mask=valid,
+    sample = BenchmarkBuilder().build(
+        truth=truth,
+        preparation=preparation,
+        forward_adapter=adapter,
+        canonical_policy=CanonicalIncrementPolicy(contract=canonical_contract),
+        lfm_policy=LfmPolicy(
+            sample_domain="depth",
+            axis_unit="m",
+            global_seed=int(script_cfg["global_seed"]),
+            random_namespace=namespace,
+            realization_id=realization_id,
+            horizon_coordinates=section.horizon_tvdss_m,
+            controlled_degraded=script_cfg["lfm"]["controlled_degraded"],
+        ),
+        build_policy=BenchmarkBuildPolicy(
+            domain_metadata={
+                "sample_domain": "depth",
+                "depth_basis": "tvdss",
+                "increment_contract": canonical_contract.as_dict(),
+            }
+        ),
     )
-    lfm_degraded = lfm_ideal.copy()
-    lfm_degraded = _controlled_degraded_lfm(
-        lfm_degraded,
-        config=degraded_cfg,
-        section=section,
-        axis_m=model_axis,
-        valid_mask=valid,
-        global_seed=int(script_cfg["global_seed"]),
-        realization_id=realization_id,
-    )
-    lfm_degradation = canonical_lowpass(
-        lfm_degraded - lfm_ideal,
-        model_axis,
-        canonical_contract,
-        valid_mask=valid,
-    )
-    lfm_degraded = lfm_ideal + lfm_degradation
-    lfm_degraded[~valid] = np.nan
-    residual_vs_lfm_ideal = model_log - lfm_ideal
-    residual_vs_lfm_degraded = model_log - lfm_degraded
-
-    required_support = {
-        "target_log_ai": model_log,
-        "canonical_background_log_ai": lfm_ideal,
-        "target_increment_log_ai": model_log - lfm_ideal,
-        "input_lfm_log_ai": lfm_degraded,
-        "seismic_observed": seismic_observed,
-        "seismic_model_consistent": seismic_model,
-    }
-    for name, values in required_support.items():
-        if np.any(valid & ~np.isfinite(values)):
-            raise ValueError(f"valid_mask_support_not_finite:{name}")
+    projected = sample.projected
+    forward = sample.forward
+    if not isinstance(forward.extras, DepthForwardExtras):
+        raise TypeError("depth builder returned non-depth forward extras.")
     categorical = {
-        "state_id_highres": object_core.state_id_highres,
-        "object_id_highres": object_core.object_id_highres,
-        "object_xi_highres": object_core.object_xi_highres,
-        "zone_id_highres": object_core.zone_id_highres,
-        "geometry_event_mask_highres": object_core.geometry_event_mask_highres,
-        "boundary_mask_highres": object_core.boundary_mask_highres,
-        "boundary_fraction_model": object_core.boundary_fraction_model,
-        "boundary_mask_model": object_core.boundary_mask_model,
-        "state_fraction_model": object_core.state_fraction_model,
-        "dominant_object_id_model": object_core.dominant_object_id_model,
-        "zone_id_model": object_core.zone_id_model,
+        "state_id_highres": truth.state_id_highres,
+        "object_id_highres": truth.object_id_highres,
+        "object_xi_highres": truth.object_xi_highres,
+        "zone_id_highres": truth.zone_id_highres,
+        "geometry_event_mask_highres": truth.geometry_event_mask_highres,
+        "boundary_mask_highres": truth.boundary_mask_highres,
+        "boundary_fraction_model": projected.boundary_fraction_model,
+        "boundary_mask_model": projected.boundary_mask_model,
+        "state_fraction_model": projected.state_fraction_model,
+        "dominant_object_id_model": projected.dominant_object_id_model,
+        "zone_id_model": projected.zone_id_model,
     }
-    observed_values = seismic_observed[valid]
-    model_values = seismic_model[valid]
-    residual_values = residual[valid]
-    observed_rms = float(np.sqrt(np.mean(observed_values**2)))
-    model_rms = float(np.sqrt(np.mean(model_values**2)))
-    residual_rms = float(np.sqrt(np.mean(residual_values**2)))
-    correlation = (
-        float(np.corrcoef(observed_values, model_values)[0, 1])
-        if observed_values.size >= 2
-        and np.std(observed_values) > 0.0
-        and np.std(model_values) > 0.0
-        else float("nan")
-    )
     return DepthGeneratedSection(
         realization_id=realization_id,
         scenario=scenario,
         geometry=section,
-        tvdss_highres_m=high_axis,
-        tvdss_model_m=model_axis,
-        log_ai_highres=log_high,
-        vp_highres_mps=vp_high,
-        model_target_log_ai=model_log,
-        vp_model_mps=vp_model,
-        seismic_observed=seismic_observed,
-        seismic_model_consistent=seismic_model,
-        subgrid_forward_residual=residual,
-        lfm_ideal=lfm_ideal,
-        lfm_controlled_degraded=lfm_degraded,
-        residual_vs_lfm_ideal=residual_vs_lfm_ideal,
-        residual_vs_lfm_controlled_degraded=residual_vs_lfm_degraded,
-        valid_mask_model=target,
+        tvdss_highres_m=truth.highres_axis,
+        tvdss_model_m=projected.model_axis.coordinates,
+        log_ai_highres=truth.log_ai_highres,
+        vp_highres_mps=forward.extras.vp_highres_mps,
+        model_target_log_ai=projected.model_target_log_ai,
+        vp_model_mps=forward.extras.vp_model_mps,
+        seismic_observed=forward.seismic_observed,
+        seismic_model_consistent=forward.seismic_model_consistent,
+        subgrid_forward_residual=forward.subgrid_forward_residual,
+        lfm_ideal=sample.input_lfm_canonical_log_ai,
+        lfm_controlled_degraded=sample.input_lfm_controlled_degraded_log_ai,
+        residual_vs_lfm_ideal=sample.residuals.residual_vs_lfm_ideal,
+        residual_vs_lfm_controlled_degraded=(
+            sample.residuals.residual_vs_lfm_controlled_degraded
+        ),
+        valid_mask_model=sample.valid_mask,
         categorical=categorical,
-        object_catalog=object_core.object_catalog,
-        object_lateral_coefficients=object_core.object_lateral_coefficients,
-        qc={
-            **{
-                key: value for key, value in object_core.qc.items() if key != "field_qc"
-            },
-            "physics_halo_m": float(halo),
-            "antialias_filter_half_width_m": float(antialias_half_m),
-            "physics_halo_samples": int(round(halo / model_dz)),
-            "context_m": context,
-            "maximum_allowed_vp_mps": maximum_vp,
-            "antialias_numtaps": int(taps.size),
-            "antialias_scipy_version": scipy.__version__,
-            "seismic_observed_rms": observed_rms,
-            "seismic_model_consistent_rms": model_rms,
-            "subgrid_residual_rms": residual_rms,
-            "subgrid_residual_nrmse": residual_rms
-            / max(observed_rms, np.finfo(np.float64).eps),
-            "subgrid_observed_model_correlation": correlation,
-            "subgrid_amplitude_scale_ratio": observed_rms
-            / max(model_rms, np.finfo(np.float64).eps),
-        },
+        object_catalog=depth_catalog_from_synthetic_truth(truth.object_catalog),
+        object_lateral_coefficients=depth_catalog_from_synthetic_truth(
+            truth.object_lateral_coefficients
+        ),
+        qc={key: value for key, value in sample.qc.items() if key != "field_qc"},
+        benchmark_sample=sample,
     )
 
 
@@ -776,215 +580,6 @@ def _dataset(
         axis_path=axis_path,
         axis_order=axis_order,
     )
-
-
-def _write_base(h5: h5py.File, section: DepthGeneratedSection) -> str:
-    path = f"/realizations/{section.realization_id}"
-    root = h5.create_group(path)
-    root.attrs["sample_domain"] = "depth"
-    root.attrs["depth_basis"] = "tvdss"
-    axes = root.create_group("axes")
-    _dataset(
-        axes,
-        "lateral_m",
-        section.geometry.lateral_m,
-        unit="m",
-        axis_path=f"{path}/axes/lateral_m",
-        axis_order="lateral",
-    )
-    _dataset(
-        axes,
-        "tvdss_highres_m",
-        section.tvdss_highres_m,
-        unit="m",
-        axis_path=f"{path}/axes/tvdss_highres_m",
-        axis_order="tvdss_highres",
-    )
-    _dataset(
-        axes,
-        "tvdss_model_m",
-        section.tvdss_model_m,
-        unit="m",
-        axis_path=f"{path}/axes/tvdss_model_m",
-        axis_order="tvdss_model",
-    )
-    for name, values in (
-        ("inline_float", section.geometry.inline_float),
-        ("xline_float", section.geometry.xline_float),
-        ("x_m", section.geometry.x_m),
-        ("y_m", section.geometry.y_m),
-    ):
-        _dataset(
-            axes,
-            name,
-            values,
-            unit="line" if "line" in name else "m",
-            axis_path=f"{path}/axes/lateral_m",
-            axis_order="lateral",
-        )
-    truth = root.create_group("truth")
-    for name, values, unit, axis in (
-        ("log_ai_highres", section.log_ai_highres, "ln(m/s*g/cm3)", "tvdss_highres_m"),
-        ("vp_highres_mps", section.vp_highres_mps, "m/s", "tvdss_highres_m"),
-        (
-            "model_target_log_ai",
-            section.model_target_log_ai,
-            "ln(m/s*g/cm3)",
-            "tvdss_model_m",
-        ),
-        ("vp_model_mps", section.vp_model_mps, "m/s", "tvdss_model_m"),
-    ):
-        _dataset(
-            truth,
-            name,
-            values.astype(np.float32),
-            unit=unit,
-            axis_path=f"{path}/axes/{axis}",
-            axis_order="lateral,tvdss",
-        )
-    canonical_contract = generation_contract(
-        "depth", float(np.diff(np.asarray(section.tvdss_model_m, dtype=np.float64)[:2])[0])
-    )
-    canonical_background, target_increment = decompose_log_ai(
-        np.asarray(section.model_target_log_ai, dtype=np.float64),
-        np.asarray(section.tvdss_model_m, dtype=np.float64),
-        canonical_contract,
-        valid_mask=np.asarray(section.valid_mask_model, dtype=bool),
-    )
-    root.attrs["increment_contract_json"] = json.dumps(
-        canonical_contract.as_dict(), sort_keys=True
-    )
-    priors = root.create_group("priors")
-    targets = root.create_group("targets")
-    _dataset(
-        priors,
-        "canonical_background_log_ai",
-        canonical_background.astype(np.float32),
-        unit="ln(m/s*g/cm3)",
-        axis_path=f"{path}/axes/tvdss_model_m",
-        axis_order="lateral,tvdss",
-    )
-    _dataset(
-        targets,
-        "target_increment_log_ai",
-        target_increment.astype(np.float32),
-        unit="ln(m/s*g/cm3)",
-        axis_path=f"{path}/axes/tvdss_model_m",
-        axis_order="lateral,tvdss",
-    )
-    _dataset(
-        truth,
-        "geometry_event_mask_highres",
-        section.categorical["geometry_event_mask_highres"],
-        unit="bool",
-        axis_path=f"{path}/axes/tvdss_highres_m",
-        axis_order="lateral,tvdss",
-    )
-    _dataset(
-        truth,
-        "boundary_mask_model",
-        section.categorical["boundary_mask_model"],
-        unit="bool",
-        axis_path=f"{path}/axes/tvdss_model_m",
-        axis_order="lateral,tvdss",
-    )
-    categorical = truth.create_group("categorical")
-    for name, values in section.categorical.items():
-        axis = (
-            "tvdss_highres_m"
-            if values.shape[1] == section.tvdss_highres_m.size
-            else "tvdss_model_m"
-        )
-        order = "lateral,tvdss,state" if values.ndim == 3 else "lateral,tvdss"
-        _dataset(
-            categorical,
-            name,
-            values,
-            unit="category",
-            axis_path=f"{path}/axes/{axis}",
-            axis_order=order,
-        )
-    seismic = root.create_group("seismic")
-    for name, values in (
-        ("seismic_observed", section.seismic_observed),
-        ("seismic_model_consistent", section.seismic_model_consistent),
-        ("subgrid_forward_residual", section.subgrid_forward_residual),
-    ):
-        _dataset(
-            seismic,
-            name,
-            values.astype(np.float32),
-            unit="amplitude",
-            axis_path=f"{path}/axes/tvdss_model_m",
-            axis_order="lateral,tvdss",
-        )
-    _dataset(
-        priors,
-        "lfm_ideal",
-        section.lfm_ideal.astype(np.float32),
-        unit="ln(m/s*g/cm3)",
-        axis_path=f"{path}/axes/tvdss_model_m",
-        axis_order="lateral,tvdss",
-    )
-    _dataset(
-        priors,
-        "lfm_controlled_degraded",
-        section.lfm_controlled_degraded.astype(np.float32),
-        unit="ln(m/s*g/cm3)",
-        axis_path=f"{path}/axes/tvdss_model_m",
-        axis_order="lateral,tvdss",
-    )
-    input_variants = priors.create_group("input_lfm_variants")
-    canonical = input_variants.create_group("canonical")
-    _dataset(
-        canonical,
-        "log_ai",
-        section.lfm_ideal.astype(np.float32),
-        unit="ln(m/s*g/cm3)",
-        axis_path=f"{path}/axes/tvdss_model_m",
-        axis_order="lateral,tvdss",
-    )
-    controlled = input_variants.create_group("controlled_default")
-    _dataset(
-        controlled,
-        "log_ai",
-        section.lfm_controlled_degraded.astype(np.float32),
-        unit="ln(m/s*g/cm3)",
-        axis_path=f"{path}/axes/tvdss_model_m",
-        axis_order="lateral,tvdss",
-    )
-    residuals = root.create_group("residuals")
-    _dataset(
-        residuals,
-        "residual_vs_lfm_ideal",
-        section.residual_vs_lfm_ideal.astype(np.float32),
-        unit="ln(m/s*g/cm3)",
-        axis_path=f"{path}/axes/tvdss_model_m",
-        axis_order="lateral,tvdss",
-    )
-    _dataset(
-        residuals,
-        "residual_vs_lfm_controlled_degraded",
-        section.residual_vs_lfm_controlled_degraded.astype(np.float32),
-        unit="ln(m/s*g/cm3)",
-        axis_path=f"{path}/axes/tvdss_model_m",
-        axis_order="lateral,tvdss",
-    )
-    masks = root.create_group("masks")
-    for name, values in (("valid_mask", section.valid_mask_model),):
-        _dataset(
-            masks,
-            name,
-            values,
-            unit="bool",
-            axis_path=f"{path}/axes/tvdss_model_m",
-            axis_order="lateral,tvdss",
-        )
-    qc = root.create_group("qc")
-    for key, value in section.qc.items():
-        if np.isscalar(value) and not isinstance(value, (dict, list, tuple)):
-            qc.attrs[key] = value
-    return path
 
 
 def _static_shift(
@@ -1070,36 +665,23 @@ def _write_variants(
         if np.any(valid & ~np.isfinite(observed)):
             raise ValueError("invalid_seismic_variant:roi_support_not_finite")
         if variants is not None:
-            group = variants.create_group(variant_id)
-            _dataset(
-                group,
-                "seismic_observed",
-                observed.astype(np.float32),
-                unit="amplitude",
-                axis_path=f"{root_path}/axes/tvdss_model_m",
-                axis_order="lateral,tvdss",
-            )
-            _dataset(
-                group,
-                "positive_gain",
-                positive_gain.astype(np.float32),
-                unit="ratio",
-                axis_path=f"{root_path}/axes/tvdss_model_m",
-                axis_order="lateral,tvdss",
-            )
-            _dataset(
-                group,
-                "additive_noise",
-                additive_noise.astype(np.float32),
-                unit="amplitude",
-                axis_path=f"{root_path}/axes/tvdss_model_m",
-                axis_order="lateral,tvdss",
-            )
-            group.attrs["variant_id"] = str(variant_id)
-            group.attrs["mismatch_family"] = family
-            group.attrs["operator_source"] = str(operator_source)
-            group.attrs["parameters_json"] = json.dumps(
-                dict(parameters), sort_keys=True
+            write_benchmark_variant(
+                h5,
+                BenchmarkVariant(
+                    owner_realization_id=section.realization_id,
+                    variant_id=variant_id,
+                    sample_kind="seismic_variant",
+                    seismic_observed=observed,
+                    seismic_model_consistent=np.empty(0, dtype=np.float64),
+                    positive_gain=positive_gain,
+                    additive_noise=additive_noise,
+                    metadata={
+                        "mismatch_family": family,
+                        "operator_source": operator_source,
+                        "parameters": dict(parameters),
+                    },
+                    sample_domain="depth",
+                ),
             )
         valid_values = observed[valid]
         row = {
@@ -1547,11 +1129,14 @@ def run_depth_generation(
     preflight = run_attempt_preflight(
         plan,
         validator=validate_attempt,
-        rejection_exceptions=(GenerationRejected, ValueError, FloatingPointError),
+        rejection_exceptions=(StagedRejection, ValueError, FloatingPointError),
         qc_config=acceptance_qc,
         output_dir=output_dir,
         logger=logger,
         development_limited=development,
+        rejection_formatter=lambda exc: frozen_external_reason(
+            exc, sample_domain="depth"
+        ),
     )
     enforcement = acceptance_enforcement(acceptance_qc)
     preflight_summary = {
@@ -1643,7 +1228,14 @@ def run_depth_generation(
                 )
                 if generated is None:
                     raise RuntimeError("depth_generation_returned_no_realization")
-                group_path = "" if qc_only else _write_base(h5, generated)
+                if qc_only:
+                    group_path = ""
+                else:
+                    if generated.benchmark_sample is None:
+                        raise RuntimeError("depth_generation_missing_benchmark_sample")
+                    group_path = write_benchmark_sample(
+                        h5, generated.benchmark_sample
+                    ).hdf5_group
                 if generated.realization_id != base_id:
                     raise RuntimeError("depth_generation_parent_identity_changed")
                 common.update({
@@ -1783,11 +1375,11 @@ def run_depth_generation(
                 subgrid_rows.append(local_subgrid_row)
                 generation_qc_rows.append(local_generation_qc_row)
                 progress_status = "accepted"
-            except (GenerationRejected, ValueError, FloatingPointError) as exc:
+            except (StagedRejection, ValueError, FloatingPointError) as exc:
                 failed_group = f"/realizations/{base_id}"
                 if (not qc_only) and failed_group in h5:
                     del h5[failed_group]
-                reason = f"{type(exc).__name__}:{exc}"
+                reason = frozen_external_reason(exc, sample_domain="depth")
                 index_rows.append(
                     {
                         **common,

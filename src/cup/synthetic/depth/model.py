@@ -12,7 +12,8 @@ from typing import Any
 
 import numpy as np
 
-from cup.synthetic.core.generation import GenerationScenario
+from cup.synthetic.core.records import BenchmarkSample
+from cup.synthetic.core.scenarios import GenerationScenario
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class DepthGeneratedSection:
     object_catalog: list[dict[str, Any]]
     object_lateral_coefficients: list[dict[str, Any]]
     qc: dict[str, Any]
+    benchmark_sample: BenchmarkSample | None = None
 
 
 __all__ = ["DepthGeneratedSection", "DepthSectionGeometry"]

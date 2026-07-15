@@ -274,6 +274,7 @@ def run_attempt_preflight(
     output_dir: Path,
     logger: logging.Logger,
     development_limited: bool,
+    rejection_formatter: Callable[[BaseException], str] | None = None,
 ) -> PreflightResult:
     """Run cheap structural validation before any HDF5 forward generation."""
     logger.info("preflight started: %d planned attempts", len(plan))
@@ -298,7 +299,11 @@ def run_attempt_preflight(
                 accepted_ids.append(str(row["parent_realization_id"]))
             except tuple(rejection_exceptions) as exc:
                 status = "rejected"
-                reason = f"{type(exc).__name__}:{exc}"
+                reason = (
+                    rejection_formatter(exc)
+                    if rejection_formatter is not None
+                    else f"{type(exc).__name__}:{exc}"
+                )
                 details = list(getattr(exc, "details", []) or [{}])
                 rejection_details.extend(
                     {

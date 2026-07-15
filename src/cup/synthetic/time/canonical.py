@@ -11,7 +11,8 @@ from cup.physics.numpy_backend import forward_time, reflectivity_from_log_ai
 from cup.seismic.wavelet import wavelet_spectrum_features
 from cup.synthetic.core.calibration import ImpedanceCalibration
 from cup.synthetic.time.forward import antialias_taps, categorical_model_grids, downsample_continuous
-from cup.synthetic.core.generation import GeneratedSection, GenerationScenario
+from cup.synthetic.core.scenarios import GenerationScenario
+from cup.synthetic.core.truth import SyntheticTruth
 
 
 CANONICAL_FAMILIES = (
@@ -30,6 +31,43 @@ class CanonicalScenario:
     parameter_name: str
     parameter_value: float
     parameter_unit: str
+
+
+@dataclass(frozen=True)
+class _CanonicalSection:
+    realization_id: str
+    scenario: GenerationScenario
+    lateral_m: np.ndarray
+    inline_float: np.ndarray
+    xline_float: np.ndarray
+    x_m: np.ndarray
+    y_m: np.ndarray
+    twt_highres_s: np.ndarray
+    twt_model_s: np.ndarray
+    truth_log_ai_highres: np.ndarray
+    model_target_log_ai: np.ndarray
+    reflectivity_highres: np.ndarray
+    reflectivity_model: np.ndarray
+    seismic_model_consistent: np.ndarray
+    rgt_highres: np.ndarray
+    rgt_model: np.ndarray
+    state_id_highres: np.ndarray
+    object_id_highres: np.ndarray
+    object_xi_highres: np.ndarray
+    zone_id_highres: np.ndarray
+    geometry_event_mask_highres: np.ndarray
+    boundary_mask_highres: np.ndarray
+    boundary_fraction_model: np.ndarray
+    boundary_mask_model: np.ndarray
+    state_fraction_model: np.ndarray
+    dominant_object_id_model: np.ndarray
+    zone_id_model: np.ndarray
+    valid_mask_model: np.ndarray
+    forward_valid_mask_highres: np.ndarray
+    forward_valid_mask_model: np.ndarray
+    object_catalog: list[dict[str, Any]]
+    object_lateral_coefficients: list[dict[str, Any]]
+    qc: dict[str, Any]
 
 
 def canonical_reference_impedance(
@@ -228,7 +266,7 @@ def generate_canonical_section(
     wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
     vertical_oversampling_factor: int = 8,
-) -> GeneratedSection:
+) -> _CanonicalSection:
     """Generate one fixed canonical geometry and its nominal closed forward model."""
     wavelet_time = np.asarray(wavelet_time_s, dtype=np.float64).reshape(-1)
     wavelet_values = np.asarray(wavelet, dtype=np.float64).reshape(-1)
@@ -343,7 +381,7 @@ def generate_canonical_section(
         correlation_length_fraction=0.0,
         coefficient_sigma_multiplier=0.0,
         thickness_log_sigma=0.0,
-        variant_id="",
+        geometry_variant_id="",
     )
     object_catalog = [{
             "realization_id": scenario.scenario_id,
@@ -369,7 +407,7 @@ def generate_canonical_section(
             "contrast_multiplier_start": float(contrast_multiplier[0]),
             "contrast_multiplier_end": float(contrast_multiplier[-1]),
         }]
-    return GeneratedSection(
+    return _CanonicalSection(
         realization_id=scenario.scenario_id,
         scenario=generation_scenario,
         lateral_m=lateral,
@@ -407,4 +445,69 @@ def generate_canonical_section(
         object_catalog=object_catalog,
         object_lateral_coefficients=[],
         qc=qc,
+    )
+
+
+def generate_canonical_truth(
+    calibration: ImpedanceCalibration,
+    *,
+    scenario: CanonicalScenario,
+    config: Mapping[str, Any],
+    output_dt_s: float,
+    wavelet_time_s: np.ndarray,
+    wavelet: np.ndarray,
+    vertical_oversampling_factor: int = 8,
+) -> SyntheticTruth:
+    """Produce canonical high-resolution truth through the shared truth record."""
+    legacy = generate_canonical_section(
+        calibration,
+        scenario=scenario,
+        config=config,
+        output_dt_s=output_dt_s,
+        wavelet_time_s=wavelet_time_s,
+        wavelet=wavelet,
+        vertical_oversampling_factor=vertical_oversampling_factor,
+    )
+    names = {
+        "object_top_s": "object_top_coordinate",
+        "object_bottom_s": "object_bottom_coordinate",
+        "minimum_duration_s": "minimum_extent",
+        "maximum_duration_s": "maximum_extent",
+    }
+    catalog = tuple(
+        {names.get(key, key): value for key, value in row.items()}
+        for row in legacy.object_catalog
+    )
+    return SyntheticTruth(
+        realization_id=legacy.realization_id,
+        scenario=GenerationScenario(
+            scenario_id=legacy.scenario.scenario_id,
+            duration_mode=legacy.scenario.duration_mode,
+            geometry_family=legacy.scenario.geometry_family,
+            geometry_direction=legacy.scenario.geometry_direction,
+            correlation_length_fraction=legacy.scenario.correlation_length_fraction,
+            coefficient_sigma_multiplier=legacy.scenario.coefficient_sigma_multiplier,
+            thickness_log_sigma=legacy.scenario.thickness_log_sigma,
+            geometry_variant_id=legacy.scenario.geometry_variant_id,
+        ),
+        sample_domain="time",
+        axis_unit="s",
+        highres_axis=legacy.twt_highres_s,
+        highres_sample_interval=float(output_dt_s) / int(vertical_oversampling_factor),
+        lateral_m=legacy.lateral_m,
+        inline_float=legacy.inline_float,
+        xline_float=legacy.xline_float,
+        x_m=legacy.x_m,
+        y_m=legacy.y_m,
+        log_ai_highres=legacy.truth_log_ai_highres,
+        rgt_highres=legacy.rgt_highres,
+        state_id_highres=legacy.state_id_highres,
+        object_id_highres=legacy.object_id_highres,
+        object_xi_highres=legacy.object_xi_highres,
+        zone_id_highres=legacy.zone_id_highres,
+        geometry_event_mask_highres=legacy.geometry_event_mask_highres,
+        boundary_mask_highres=legacy.boundary_mask_highres,
+        object_catalog=catalog,
+        object_lateral_coefficients=(),
+        diagnostics=legacy.qc,
     )

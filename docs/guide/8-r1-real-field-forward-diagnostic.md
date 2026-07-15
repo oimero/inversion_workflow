@@ -72,6 +72,11 @@ real_field_forward_diagnostic:
 
 ```yaml
 real_field_forward_diagnostic:
+  depth_forward:
+    backend: auto                       # auto | numpy | torch_cuda
+    dtype: float64                      # 固定 float64
+    batch_size: 64                      # 同一有效深度段的批量道数
+
   diagnostic_scan:
     phase_deg: [-20, -10, 0, 10, 20]
     wavelet_time_shift_s: [-0.002, 0.0, 0.002]
@@ -79,6 +84,7 @@ real_field_forward_diagnostic:
 ```
 
 深度域不接受分数采样偏移和赫兹频带配置。时间子波始终使用秒，观测地震、预测阻抗与合成地震始终使用米制 TVDSS。
+`auto` 在 CUDA 可用时选择 Torch CUDA，否则选择 NumPy；实际 backend、批量大小和算子写入 R1 summary。0° 相位和 0 s 子波平移直接复用基准正演，不重复计算。
 
 ### `boundary`
 
@@ -164,6 +170,10 @@ real_field_forward_diagnostic:
 |------|------|
 | `seismic_ood_fraction_abs_gt5` | R0 输入地震标准化后超过 5σ 的样本比例上限 |
 | `lateral_nullspace_energy_ratio` | 模型间差异在高频零空间带的能量占比上限 |
+| `raw_forward_rms_ratio_min` | 合成/观测原始 RMS 比值的诊断下限，默认 `0.001` |
+| `raw_forward_rms_ratio_max` | 合成/观测原始 RMS 比值的诊断上限，默认 `1000` |
+
+原始 RMS 比值越界只产生 QC warning。缩放后的波形指标仍可用于比较形状、相位和相对变化，但不能解释为绝对振幅闭环。
 
 ---
 

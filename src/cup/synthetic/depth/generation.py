@@ -20,10 +20,7 @@ from cup.impedance import (
     generation_contract,
 )
 from cup.petrel.load import import_interpretation_petrel
-from cup.physics.numpy_backend import (
-    forward_depth,
-    velocity_from_ai,
-)
+from cup.physics.numpy_backend import velocity_from_ai
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.wavelet import load_wavelet_csv
@@ -57,6 +54,7 @@ from cup.synthetic.depth.object_core_adapter import (
     generate_depth_object_core_section,
     load_depth_calibration_for_object_core,
 )
+from cup.physics.execution import DepthForwardExecutor
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
@@ -65,73 +63,6 @@ from cup.utils.io import (
     resolve_relative_path,
     write_json,
 )
-
-
-class _DepthForwardExecutor:
-    """Select the depth forward backend once per generation run."""
-
-    def __init__(self, config: Mapping[str, Any]) -> None:
-        requested = str(config.get("backend") or "auto").strip().casefold()
-        dtype = str(config.get("dtype") or "float64").strip().casefold()
-        if dtype != "float64":
-            raise ValueError("Depth Synthoseis forward dtype is fixed to float64.")
-        if requested not in {"auto", "numpy", "torch_cuda"}:
-            raise ValueError(
-                "Depth Synthoseis forward backend must be auto, numpy, or torch_cuda."
-            )
-        self.requested = requested
-        self.dtype = dtype
-        self._torch = None
-        self._torch_forward = None
-        if requested != "numpy":
-            try:
-                import torch
-                from cup.physics.torch_backend import forward_depth as torch_forward
-            except Exception as exc:
-                if requested == "torch_cuda":
-                    raise RuntimeError("torch_cuda backend requires PyTorch with CUDA support.") from exc
-                torch = None
-                torch_forward = None
-            if torch is not None and bool(torch.cuda.is_available()):
-                self._torch = torch
-                self._torch_forward = torch_forward
-        if requested == "torch_cuda" and self._torch is None:
-            raise RuntimeError("Requested torch_cuda backend, but CUDA is unavailable.")
-        self.resolved = "torch_cuda" if self._torch is not None else "numpy"
-
-    @property
-    def manifest_fields(self) -> dict[str, str]:
-        return {
-            "requested_backend": self.requested,
-            "resolved_backend": self.resolved,
-            "dtype": self.dtype,
-        }
-
-    def __call__(
-        self,
-        log_ai: np.ndarray,
-        velocity_mps: np.ndarray,
-        depth_m: np.ndarray,
-        wavelet_time_s: np.ndarray,
-        wavelet_amp: np.ndarray,
-    ) -> np.ndarray:
-        if self.resolved == "numpy":
-            return np.asarray(
-                forward_depth(log_ai, velocity_mps, depth_m, wavelet_time_s, wavelet_amp),
-                dtype=np.float64,
-            )
-        torch = self._torch
-        assert torch is not None and self._torch_forward is not None
-        device = torch.device("cuda")
-        with torch.inference_mode():
-            result = self._torch_forward(
-                torch.as_tensor(log_ai, dtype=torch.float64, device=device),
-                torch.as_tensor(velocity_mps, dtype=torch.float64, device=device),
-                torch.as_tensor(depth_m, dtype=torch.float64, device=device),
-                torch.as_tensor(wavelet_time_s, dtype=torch.float64, device=device),
-                torch.as_tensor(wavelet_amp, dtype=torch.float64, device=device),
-            )
-        return result.detach().cpu().numpy().astype(np.float64, copy=False)
 
 
 def _survey(workflow: Any, *, repo_root: Path) -> Any:
@@ -589,7 +520,7 @@ def generate_depth_realization(
     forward_inputs: Mapping[str, Any],
     survey: Any,
     repo_root: Path,
-    forward_executor: _DepthForwardExecutor | None = None,
+    forward_executor: DepthForwardExecutor | None = None,
     preflight_only: bool = False,
 ) -> DepthGeneratedSection | None:
     realization_id = f"{section.section_id}__{scenario.scenario_id}__a{attempt_id:03d}"
@@ -597,7 +528,7 @@ def generate_depth_realization(
         forward_inputs["wavelet"]["path"], root=repo_root
     )
     wavelet_time, wavelet = load_wavelet_csv(wavelet_path)
-    forward = forward_executor or _DepthForwardExecutor(script_cfg["seismic_forward"])
+    forward = forward_executor or DepthForwardExecutor(script_cfg["seismic_forward"])
     factor = int(script_cfg["sampling"]["vertical_oversampling_factor"])
     model_dz = float(script_cfg["sampling"]["expected_model_dz_m"])
     high_dz = model_dz / factor
@@ -1091,7 +1022,7 @@ def _write_variants(
     script_cfg: Mapping[str, Any],
     forward_inputs: Mapping[str, Any],
     repo_root: Path,
-    forward_executor: _DepthForwardExecutor,
+    forward_executor: DepthForwardExecutor,
 ) -> list[dict[str, Any]]:
     config = script_cfg["seismic_mismatch"]
     if not bool(config.get("enabled", True)):
@@ -1548,7 +1479,7 @@ def run_depth_generation(
     output_dir.mkdir(parents=True, exist_ok=False)
     logger = configure_generation_logger(output_dir, sample_domain="depth")
     logger.info("Depth Synthoseis generation started")
-    forward_executor = _DepthForwardExecutor(script_cfg["seismic_forward"])
+    forward_executor = DepthForwardExecutor(script_cfg["seismic_forward"])
     logger.info(
         "Depth forward backend: requested=%s resolved=%s dtype=%s",
         forward_executor.requested,

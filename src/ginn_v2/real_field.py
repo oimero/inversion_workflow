@@ -1110,6 +1110,7 @@ def diagnostic_metrics(
         "n_valid": n_valid,
         "observed_rms": obs_rms,
         "synthetic_rms_before_scale": syn_rms,
+        "synthetic_to_observed_rms_ratio_raw": syn_rms / max(obs_rms, 1e-12),
         "scale_positive": scale,
         "scale_status": scale_status,
         "intercept": intercept,

@@ -159,6 +159,7 @@ def _stage_deployment_eligibility(
         for block in blocks
         if str(block.get("kind") or "") == "synthetic_supervised"
         and float(block.get("weight", 0.0)) > 0.0
+        and int(block.get("update_interval", 0)) == 1
     ]
     if not synthetic_blocks:
         if "real_well_supervised" in kinds:

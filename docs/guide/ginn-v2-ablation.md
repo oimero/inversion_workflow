@@ -167,7 +167,7 @@ GINN v2 的训练配方由五层组件自由组合而成：
 
 合成数据上：`总损失 = waveform MSE + increment_l2_weight × (predicted_increment_log_ai² 的均值)`。
 
-真实工区上：观测和合成各自在 patch 内独立做 centered RMS 标准化，比较标准化后的波形。这意味着**正演约束对整体振幅不敏感**——它管的是事件时序、极性、相位——绝对阻抗幅度由 LFM 锚定、delta L2 约束、或来自其他阶段的监督提供。
+真实工区上：观测和合成各自在 patch 内独立做 centered RMS 标准化，比较标准化后的波形。这意味着**正演约束对整体振幅不敏感**——它管的是事件时序、极性、相位——绝对阻抗幅度由 LFM、增量 L2 和监督祖先共同约束。训练日志会报告合成/观测原始 RMS 比值；比值超出 `0.001–1000` 时产生 shape-only 警告。
 
 **`real_well_supervised` — 井告诉你的**
 
@@ -187,8 +187,8 @@ GINN v2 的训练配方由五层组件自由组合而成：
 
 阶段 2：field_physics
   优化器: AdamW lr=0.0001   ← 学习率独立设置
-  损失: physics (weight=1.0) + real_well_supervised (weight=0.1, update_interval=4)
-  验证: 全量，选优指标 = waveform.total
+  损失: synthetic_supervised (weight=1.0, update_interval=1) + physics (weight=0.05)
+  验证: 全量，选优指标 = synthetic_anchor.mse
 ```
 
 阶段之间只传模型权重。上一阶段的 optimizer 状态（动量、学习率衰减等）全部清零重建。默认从上一阶段 best checkpoint 继承，也可以显式指定 `initialize_from: <stage_id>.final`。
@@ -248,17 +248,19 @@ ginn_v2:
       validation: {selection_metric: synthetic_ai.mse, mode: full}
 
     - stage_id: field_physics
+      initialize_from: synthetic_pretrain.best
       epochs: 10
       steps_per_epoch: 300
       optimizer: {kind: adamw, learning_rate: 0.0001, weight_decay: 0.0001}
       loss_blocks:
-        - {block_id: waveform, kind: physics, source: field, weight: 1.0, update_interval: 1, batch_size: 8, min_valid_samples: 128, increment_l2_weight: 0.01}
-      validation: {selection_metric: waveform.total, mode: full}
+        - {block_id: synthetic_anchor, kind: synthetic_supervised, source: synthetic, weight: 1.0, update_interval: 1, batch_size: 8, min_valid_samples: 128, sampling: {kind: balanced_sample_kind}}
+        - {block_id: waveform, kind: physics, source: field, weight: 0.05, update_interval: 1, batch_size: 8, min_valid_samples: 128, increment_l2_weight: 0.0001}
+      validation: {selection_metric: synthetic_anchor.mse, mode: full}
 
-  deployment_checkpoint: last_stage.best
+  deployment_checkpoint: field_physics.best
 ```
 
-**这个配方在测什么？** 第一阶段在合成数据上学会"从地震推断阻抗"的基本能力。第二阶段把这能力迁移到真实工区——没有任何标签，只靠"正演合成应该像观测地震"这一条物理约束来适应真实数据的分布。通过比较两个阶段的 checkpoint，你可以量化物理适配到底带来了多大改善。
+**这个配方在测什么？** 第一阶段学习规范阻抗增量。第二阶段用真实波形做低学习率适配，同时每步保留合成监督锚点，并按合成增量 MSE 选 best。纯 physics checkpoint 只用于诊断，不作为部署模型。
 
 **常见的组合思路：**
 
@@ -266,10 +268,10 @@ ginn_v2:
 |------|------|
 | 架构 A 比架构 B 强吗？ | 两个实验，唯一差异是 `architecture.id`，其余全部相同 |
 | mismatch 训练有用吗？ | `input_seismic_variant: nominal` vs `observed_mismatch`，在 mismatch 验证集上比指标 |
-| 物理约束能改善真实工区迁移吗？ | 阶段 1 纯监督 → 阶段 2 纯物理，对比只用阶段 1 checkpoint 和阶段 2 checkpoint 的 R0 结果 |
+| 物理约束能改善真实工区迁移吗？ | 阶段 1 纯监督 → 阶段 2 合成监督锚点 + 真实 physics，对比两个阶段 best 的 R0/R1 结果 |
 | 井监督比物理约束信号更强吗？ | 阶段 2 加一个 `real_well_supervised` block（小 weight），对比纯物理 |
 | 低频 block 有效吗？ | 对比 `update_interval: 1` vs `update_interval: 4`（同样的总 step 数），看低频 block 是否浪费了计算 |
-| 纯真实工区训练可行吗？ | `normalization_reference.source` 指 `real_field`，只用 `physics` 损失块，不依赖合成标签 |
+| 纯真实工区 physics 有什么效果？ | 从已完成监督 checkpoint 初始化，产出仅作诊断；首版不支持 physics-first，也不把纯 physics checkpoint 部署 |
 
 ---
 

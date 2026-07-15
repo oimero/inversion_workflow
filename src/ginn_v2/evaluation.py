@@ -72,6 +72,24 @@ def predict_patches(
     device_name: str,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    required_columns = {
+        "patch_id",
+        "sample_id",
+        "sample_kind",
+        "split",
+        "lateral_start",
+        "lateral_stop",
+        "twt_start",
+        "twt_stop",
+        "patch_lateral_samples",
+        "patch_twt_samples",
+    }
+    missing_columns = sorted(required_columns - set(patch_index.columns))
+    if missing_columns:
+        raise ValueError(
+            "Synthetic patch prediction received an incompatible patch index; "
+            f"missing={missing_columns}, available={sorted(patch_index.columns)}."
+        )
     model, checkpoint = load_checkpoint(checkpoint_path)
     if str(checkpoint.get("output_semantics") or "") != "predicted_increment_log_ai":
         raise ValueError(

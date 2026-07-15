@@ -84,7 +84,7 @@ def load_checkpoint(
             for item in stage_loss_blocks
             if str(item.get("kind") or "") == "synthetic_supervised"
             and float(item.get("weight", 0.0)) > 0.0
-            and int(item.get("update_interval", 0)) > 0
+            and int(item.get("update_interval", 0)) == 1
         }
         safe_physics_selection = any(
             str(checkpoint["stage_selection_metric"]) == f"{block_id}.mse"

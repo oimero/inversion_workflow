@@ -441,6 +441,71 @@ def _prepare_synthetic_indices(
     return result
 
 
+_SYNTHETIC_PREDICTION_INDEX_COLUMNS = {
+    "patch_id",
+    "sample_id",
+    "sample_kind",
+    "split",
+    "lateral_start",
+    "lateral_stop",
+    "twt_start",
+    "twt_stop",
+    "patch_lateral_samples",
+    "patch_twt_samples",
+}
+
+
+def _deployment_patch_index_contract(
+    *,
+    stage: Mapping[str, Any],
+    stage_dir: Path,
+    sources: Mapping[str, Mapping[str, Any]],
+    root: Path,
+) -> tuple[Path | None, dict[str, dict[str, Any]], str | None]:
+    """Resolve the synthetic evaluation index from the selection block."""
+    blocks = {
+        str(block.get("block_id") or ""): dict(block)
+        for block in stage.get("loss_blocks", [])
+    }
+    catalog: dict[str, dict[str, Any]] = {}
+    for block_id, block in blocks.items():
+        path = stage_dir / f"{block_id}_patch_index.csv"
+        if not path.is_file():
+            continue
+        source_id = str(block.get("source") or "")
+        source_kind = str(dict(sources.get(source_id) or {}).get("kind") or "")
+        catalog[block_id] = {
+            "source": source_id,
+            "source_kind": source_kind,
+            "path": repo_relative_path(path, root=root),
+        }
+    selection_metric = str(dict(stage.get("validation") or {}).get("selection_metric") or "")
+    selection_block_id = selection_metric.split(".", 1)[0] if selection_metric else ""
+    selection_block = blocks.get(selection_block_id)
+    if selection_block is None:
+        raise ValueError(
+            f"Deployment stage selection block is missing: {selection_block_id!r}."
+        )
+    if str(selection_block.get("kind") or "") != "synthetic_supervised":
+        return None, catalog, None
+    source_id = str(selection_block.get("source") or "")
+    if str(dict(sources.get(source_id) or {}).get("kind") or "") != "synthoseis_lite":
+        raise ValueError(
+            "Synthetic deployment selection block must consume a synthoseis_lite source."
+        )
+    path = stage_dir / f"{selection_block_id}_patch_index.csv"
+    if not path.is_file():
+        raise FileNotFoundError(f"Deployment selection patch index is missing: {path}")
+    columns = set(pd.read_csv(path, nrows=0).columns)
+    missing = sorted(_SYNTHETIC_PREDICTION_INDEX_COLUMNS - columns)
+    if missing:
+        raise ValueError(
+            f"Deployment synthetic patch index has incompatible columns: missing={missing}, "
+            f"available={sorted(columns)}."
+        )
+    return path, catalog, source_id
+
+
 def _normalization_for_synthetic(benchmark: SynthoseisBenchmark, index: pd.DataFrame) -> dict[str, Any]:
     normalization = compute_normalization(benchmark, index)
     if "delta" in normalization:
@@ -1461,6 +1526,21 @@ def run_experiment(
                     values = [row[key] for row in block_rows if key in row]
                     aggregate = np.sum if key in {"valid_sample_count", "skipped_item_count"} else np.mean
                     training_values[f"{block_id}.train_{key}"] = float(aggregate(values))
+                raw_ratio = training_values.get(
+                    f"{block_id}.train_predicted_to_observed_rms_ratio"
+                )
+                if raw_ratio is not None and np.isfinite(raw_ratio) and not (
+                    1.0e-3 <= raw_ratio <= 1.0e3
+                ):
+                    logger.warning(
+                        "physics_raw_amplitude_scale_mismatch stage_id=%s epoch=%d "
+                        "block_id=%s predicted_to_observed_rms_ratio=%.6g "
+                        "waveform_standardization=masked_centered_rms interpretation=shape_only",
+                        stage_id,
+                        epoch,
+                        block_id,
+                        raw_ratio,
+                    )
             row = {
                 "epoch": epoch,
                 "selection_metric": metric_name,
@@ -1548,8 +1628,14 @@ def run_experiment(
         deployment_stage_record.get("deployment_eligibility_reason") or ""
     )
     deployment_stage_dir = output_dir / "stages" / config.deployment_stage_id
-    deployment_indices = sorted(deployment_stage_dir.glob("*_patch_index.csv"))
-    first_synthetic = next(iter(synthetic.values()), None)
+    deployment_eval_index, deployment_index_catalog, deployment_eval_source_id = (
+        _deployment_patch_index_contract(
+            stage=deployment_stage_record,
+            stage_dir=deployment_stage_dir,
+            sources=resolved_sources,
+            root=root,
+        )
+    )
     manifest = {
         "schema_version": EXPERIMENT_SCHEMA_VERSION,
         "status": "ok",
@@ -1596,9 +1682,13 @@ def run_experiment(
         for source_id, source in resolved_sources.items()
         if source_id in training_source_ids
     }
-    if first_synthetic is not None and deployment_indices:
-        manifest["benchmark_dir"] = repo_relative_path(first_synthetic[1], root=root)
-        manifest["patch_index"] = repo_relative_path(deployment_indices[0], root=root)
+    if deployment_index_catalog:
+        manifest["patch_indices"] = deployment_index_catalog
+    if deployment_eval_index is not None and deployment_eval_source_id is not None:
+        selected_synthetic = synthetic[deployment_eval_source_id]
+        manifest["benchmark_dir"] = repo_relative_path(selected_synthetic[1], root=root)
+        manifest["patch_index"] = repo_relative_path(deployment_eval_index, root=root)
+        manifest["deployment_evaluation_patch_index"] = manifest["patch_index"]
     manifest["contract_fingerprint_schema"] = CONTRACT_FINGERPRINT_SCHEMA
     manifest["contract_fingerprint_sha256"] = contract_fingerprint_sha256(
         contract_schema_version=EXPERIMENT_SCHEMA_VERSION,

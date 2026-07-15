@@ -33,19 +33,12 @@ sys.path.insert(0, src_text)
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.config.sources import assert_same_path, load_summary, resolve_source_file_from_run, resolve_source_run
-from cup.physics.numpy_backend import forward_depth, forward_time, velocity_from_ai
+from cup.physics.execution import DepthForwardExecutor
+from cup.physics.numpy_backend import forward_time, velocity_from_ai
 from cup.synthetic.schemas import FORWARD_MODEL_INPUTS_SCHEMA_VERSION
 from cup.well.anchor import sample_volume_trilinear
 from cup.well.real_field_controls import load_well_control_set
-from cup.utils.io import (
-    CONTRACT_FINGERPRINT_SCHEMA,
-    contract_fingerprint_sha256,
-    load_yaml_config,
-    published_contract_reference,
-    repo_relative_path,
-    resolve_relative_path,
-    write_json,
-)
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.utils.statistics import radius_connected_components
 from ginn_v2.contracts import FORWARD_DIAGNOSTIC_SCHEMA_VERSION, ZERO_SHOT_SUMMARY_SCHEMA_VERSION
 from ginn_v2.real_field import (
@@ -2215,6 +2208,8 @@ def _red_flags(
     thresholds = dict(run_cfg.get("red_flag_thresholds") or {})
     seismic_ood_gt5 = float(thresholds.get("seismic_ood_fraction_abs_gt5", 0.05))
     nullspace_ratio_threshold = float(thresholds.get("lateral_nullspace_energy_ratio", 0.5))
+    raw_rms_ratio_min = float(thresholds.get("raw_forward_rms_ratio_min", 1.0e-3))
+    raw_rms_ratio_max = float(thresholds.get("raw_forward_rms_ratio_max", 1.0e3))
     flags: list[dict[str, object]] = []
     input_qc_path = zero_shot_dir / "model_input_qc.csv"
     if input_qc_path.is_file():
@@ -2251,6 +2246,27 @@ def _red_flags(
                     "severity": "red",
                     "model_role": row.get("model_role", ""),
                     "scale_status": scale_status,
+                }
+            )
+        raw_ratio = float(
+            pd.to_numeric(
+                row.get("synthetic_to_observed_rms_ratio_raw"), errors="coerce"
+            )
+        )
+        if np.isfinite(raw_ratio) and not (
+            raw_rms_ratio_min <= raw_ratio <= raw_rms_ratio_max
+        ):
+            flags.append(
+                {
+                    "flag": "raw_forward_amplitude_scale_mismatch",
+                    "severity": "warning",
+                    "model_role": row.get("model_role", ""),
+                    "value": raw_ratio,
+                    "acceptable_range": [raw_rms_ratio_min, raw_rms_ratio_max],
+                    "meaning": (
+                        "Waveform metrics remain shape-based after scaling; raw observed and "
+                        "synthetic amplitudes are not physically comparable."
+                    ),
                 }
             )
     band_path = zero_shot_dir / "lateral_difference_band_qc.csv"
@@ -2290,6 +2306,7 @@ def _forward_depth_masked(
     wavelet_time_s: np.ndarray,
     wavelet: np.ndarray,
     relation: Mapping[str, object],
+    executor: DepthForwardExecutor,
 ) -> tuple[np.ndarray, np.ndarray]:
     values = np.asarray(log_ai, dtype=np.float64)
     valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(values)
@@ -2301,24 +2318,27 @@ def _forward_depth_masked(
     flat_valid = valid.reshape((-1, valid.shape[-1]))
     flat_output = output.reshape((-1, output.shape[-1]))
     flat_output_valid = output_valid.reshape((-1, output_valid.shape[-1]))
-    for trace_index, (trace, trace_valid) in enumerate(zip(flat_values, flat_valid)):
+    segment_groups: dict[tuple[int, int], list[int]] = {}
+    for trace_index, trace_valid in enumerate(flat_valid):
         for start, stop in _finite_true_runs(trace_valid):
-            segment = trace[start:stop]
-            ai = np.exp(segment)
-            velocity = velocity_from_ai(
-                ai,
-                a=float(relation["a"]),
-                b=float(relation["b"]),
-            )
-            synthetic = forward_depth(
-                segment,
-                velocity,
-                tvdss_m[start:stop],
-                wavelet_time_s,
-                wavelet,
-            )
-            flat_output[trace_index, start:stop] = synthetic
-            flat_output_valid[trace_index, start:stop] = True
+            segment_groups.setdefault((start, stop), []).append(trace_index)
+    for (start, stop), trace_indices in segment_groups.items():
+        indices = np.asarray(trace_indices, dtype=np.int64)
+        segments = flat_values[indices, start:stop]
+        velocity = velocity_from_ai(
+            np.exp(segments),
+            a=float(relation["a"]),
+            b=float(relation["b"]),
+        )
+        synthetic = executor(
+            segments,
+            velocity,
+            tvdss_m[start:stop],
+            wavelet_time_s,
+            wavelet,
+        )
+        flat_output[indices, start:stop] = synthetic
+        flat_output_valid[indices, start:stop] = True
     return output, output_valid
 
 
@@ -2532,6 +2552,12 @@ def _run_depth_diagnostic(
         if not np.array_equal(np.asarray(arrays["samples"], dtype=np.float64), tvdss_m):
             raise ValueError(f"R1 model {role} uses a different TVDSS axis.")
     forward_inputs_path, relation, wavelet_time_s, wavelet = _load_depth_forward_inputs(zero_shot_summary)
+    depth_forward_cfg = dict(run_cfg.get("depth_forward") or {})
+    executor = DepthForwardExecutor({
+        "backend": depth_forward_cfg.get("backend", "auto"),
+        "dtype": depth_forward_cfg.get("dtype", "float64"),
+        "batch_size": depth_forward_cfg.get("batch_size", 64),
+    })
     impedance_inputs: list[tuple[str, np.ndarray]] = [("lfm_only", lfm)]
     impedance_inputs.extend(
         (f"zero_shot_{role}", np.asarray(payload["arrays"]["predicted_log_ai"], dtype=np.float64))
@@ -2560,6 +2586,7 @@ def _run_depth_diagnostic(
             wavelet_time_s=wavelet_time_s,
             wavelet=wavelet,
             relation=relation,
+            executor=executor,
         )
         diagnostic_valid = valid & forward_valid & np.isfinite(observed)
         synthetic_by_role[role] = synthetic
@@ -2568,7 +2595,7 @@ def _run_depth_diagnostic(
                 "model_role": role,
                 "experiment_id": experiment_id,
                 "closure_type": "lfm_only" if role == "lfm_only" else "deployment_closure",
-                "forward_operator_id": "cup.physics.numpy_backend.forward_depth",
+                "forward_operator_id": executor.operator_id,
                 "sample_domain": "depth",
                 "sample_unit": "m",
                 "depth_basis": "tvdss",
@@ -2603,14 +2630,18 @@ def _run_depth_diagnostic(
             )
         )
         for phase_deg in phase_values:
-            candidate, candidate_valid = _forward_depth_masked(
-                log_ai,
-                valid,
-                tvdss_m=tvdss_m,
-                wavelet_time_s=wavelet_time_s,
-                wavelet=_phase_rotate_wavelet(wavelet, phase_deg),
-                relation=relation,
-            )
+            if phase_deg == 0.0:
+                candidate, candidate_valid = synthetic, forward_valid
+            else:
+                candidate, candidate_valid = _forward_depth_masked(
+                    log_ai,
+                    valid,
+                    tvdss_m=tvdss_m,
+                    wavelet_time_s=wavelet_time_s,
+                    wavelet=_phase_rotate_wavelet(wavelet, phase_deg),
+                    relation=relation,
+                    executor=executor,
+                )
             scan_rows.append(
                 {
                     "model_role": role,
@@ -2624,14 +2655,18 @@ def _run_depth_diagnostic(
                 }
             )
         for time_shift_s in time_shift_values:
-            candidate, candidate_valid = _forward_depth_masked(
-                log_ai,
-                valid,
-                tvdss_m=tvdss_m,
-                wavelet_time_s=wavelet_time_s,
-                wavelet=_time_shift_wavelet(wavelet_time_s, wavelet, time_shift_s),
-                relation=relation,
-            )
+            if time_shift_s == 0.0:
+                candidate, candidate_valid = synthetic, forward_valid
+            else:
+                candidate, candidate_valid = _forward_depth_masked(
+                    log_ai,
+                    valid,
+                    tvdss_m=tvdss_m,
+                    wavelet_time_s=wavelet_time_s,
+                    wavelet=_time_shift_wavelet(wavelet_time_s, wavelet, time_shift_s),
+                    relation=relation,
+                    executor=executor,
+                )
             scan_rows.append(
                 {
                     "model_role": role,
@@ -2667,7 +2702,8 @@ def _run_depth_diagnostic(
     scan_path = output_dir / "residual_decomposition.csv"
     spatial_path = output_dir / "spatial_residual_qc.csv"
     well_path = output_dir / "well_forward_diagnostic.csv"
-    pd.DataFrame.from_records(metrics_rows).to_csv(metrics_path, index=False)
+    metrics_frame = pd.DataFrame.from_records(metrics_rows)
+    metrics_frame.to_csv(metrics_path, index=False)
     pd.DataFrame.from_records(scan_rows).to_csv(scan_path, index=False)
     pd.DataFrame.from_records(spatial_rows).to_csv(spatial_path, index=False)
     _depth_well_qc(
@@ -2686,56 +2722,32 @@ def _run_depth_diagnostic(
         model_dir = resolve_relative_path(str(payload["summary"]["model_run_dir"]), root=REPO_ROOT)
         with (model_dir / "model_run_manifest.json").open("r", encoding="utf-8") as handle:
             model_manifests.append(json.load(handle))
-    rock_contracts = [dict(dict(item.get("input_contracts") or {}).get("rock_physics_analysis") or {}) for item in model_manifests]
-    if (
-        not rock_contracts
-        or not str(rock_contracts[0].get("contract_fingerprint_sha256") or "")
-        or any(item != rock_contracts[0] for item in rock_contracts[1:])
+    model_forward_inputs = [
+        resolve_relative_path(str(item.get("forward_model_inputs_path") or ""), root=REPO_ROOT)
+        for item in model_manifests
+    ]
+    if not model_forward_inputs or any(
+        path.resolve() != model_forward_inputs[0].resolve()
+        for path in model_forward_inputs[1:]
     ):
-        raise ValueError("Depth R1 models do not share one rock-physics contract.")
-    recorded_rock_summary = resolve_relative_path(
-        str(rock_contracts[0].get("path") or ""), root=REPO_ROOT
-    )
-    if recorded_rock_summary.parent.resolve() != forward_inputs_path.parent.resolve():
+        raise ValueError("Depth R1 models do not share one forward_model_inputs path.")
+    if model_forward_inputs[0].resolve() != forward_inputs_path.resolve():
         raise ValueError(
-            "Depth R1 forward_model_inputs and model rock-physics contract "
-            "come from different runs."
+            "Depth R1 forward_model_inputs path does not match the model manifest."
         )
     input_contracts = {
-        "real_field_zero_shot": published_contract_reference(
-            zero_shot_dir / "real_field_zero_shot_summary.json",
-            root=REPO_ROOT,
-            label=f"R0 run {zero_shot_dir}",
-        ),
-        "rock_physics_analysis": rock_contracts[0],
+        "real_field_zero_shot": {
+            "path": repo_relative_path(
+                zero_shot_dir / "real_field_zero_shot_summary.json", root=REPO_ROOT
+            )
+        },
+        "forward_model_inputs": {
+            "path": repo_relative_path(forward_inputs_path, root=REPO_ROOT),
+        },
     }
-    fingerprint = contract_fingerprint_sha256(
-        contract_schema_version=SCHEMA_VERSION,
-        semantics={
-            "mode": "volume" if observed.ndim == 3 else "section",
-            "sample_domain": "depth",
-            "sample_unit": "m",
-            "depth_basis": "tvdss",
-            "forward_operator": "cup.physics.numpy_backend.forward_depth",
-        },
-        business_config={
-            "phase_scan_deg": phase_values,
-            "wavelet_time_shift_s": time_shift_values,
-            "depth_static_m": depth_shift_values,
-        },
-        input_contracts=input_contracts,
-        primary_artifacts={
-            "forward_diagnostic_metrics": metrics_path,
-            "well_forward_diagnostic": well_path,
-            "residual_decomposition": scan_path,
-            "spatial_residual_qc": spatial_path,
-        },
-    )
     summary = {
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
-        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
-        "contract_fingerprint_sha256": fingerprint,
         "input_contracts": input_contracts,
         "mode": "volume" if observed.ndim == 3 else "section",
         "sample_domain": "depth",
@@ -2776,7 +2788,7 @@ def _run_depth_diagnostic(
             "dt_s": float(np.median(np.diff(wavelet_time_s))),
         },
         "forward_contract": {
-            "operator": "cup.physics.numpy_backend.forward_depth",
+            **executor.manifest_fields,
             "alignment": "observed, synthetic and logAI share the N-point TVDSS axis",
             "wavelet_time_unit": "s",
             "phase_scan_deg": phase_values,
@@ -2791,7 +2803,11 @@ def _run_depth_diagnostic(
             "synthetic_dir": repo_relative_path(synthetic_dir, root=REPO_ROOT),
             "figures": figures,
         },
-        "red_flags": [],
+        "red_flags": _red_flags(
+            zero_shot_dir=zero_shot_dir,
+            metrics=metrics_frame,
+            run_cfg=run_cfg,
+        ),
         "recommended_next_state": "depth_forward_closure_complete",
         "config_file": repo_relative_path(cfg_path, root=REPO_ROOT),
         "zero_shot_dir": repo_relative_path(zero_shot_dir, root=REPO_ROOT),
@@ -3068,39 +3084,18 @@ def main() -> None:
     )
 
     input_contracts = {
-        "real_field_zero_shot": published_contract_reference(
-            zero_shot_dir / "real_field_zero_shot_summary.json",
-            root=REPO_ROOT,
-            label=f"R0 run {zero_shot_dir}",
-        ),
-        "wavelet": published_contract_reference(
-            wavelet_dir / "run_summary.json",
-            root=REPO_ROOT,
-            label=f"wavelet run {wavelet_dir}",
-        ),
+        "real_field_zero_shot": {
+            "path": repo_relative_path(
+                zero_shot_dir / "real_field_zero_shot_summary.json", root=REPO_ROOT
+            )
+        },
+        "wavelet": {
+            "path": repo_relative_path(wavelet_dir / "run_summary.json", root=REPO_ROOT)
+        },
     }
-    contract_fingerprint = contract_fingerprint_sha256(
-        contract_schema_version=SCHEMA_VERSION,
-        semantics={"mode": output_mode, "dt_s": dt_s, "forward_operator": "cup.physics.numpy_backend.forward_time"},
-        business_config={
-            "phase_scan_deg": phase_values,
-            "fractional_shift_scan_samples": shift_values,
-            "diagnostic_max_hz": run_cfg.get("diagnostic_max_hz"),
-        },
-        input_contracts=input_contracts,
-        primary_artifacts={
-            "forward_diagnostic_metrics": metrics_path,
-            "well_forward_diagnostic": well_path,
-            "residual_decomposition": decomposition_path,
-            "wavelet_sensitivity": wavelet_sensitivity_path,
-            "spatial_residual_qc": spatial_path,
-        },
-    )
     summary = {
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
-        "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
-        "contract_fingerprint_sha256": contract_fingerprint,
         "input_contracts": input_contracts,
         "mode": output_mode,
         "sample_domain": "time",

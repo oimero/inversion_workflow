@@ -45,37 +45,6 @@ class SampleAxis:
 
 
 @dataclass(frozen=True)
-class ProjectionPolicy:
-    continuous_method: str
-    edge_mode: str
-    support_mode: str
-    antialias_taps_per_factor: int
-    cutoff_output_nyquist_fraction: float
-    kaiser_beta: float
-    categorical_window_mode: str = "centered_factor_plus_one"
-    geometric_valid_mode: str = "categorical_window_any"
-
-    def __post_init__(self) -> None:
-        supported = {
-            ("scipy_resample_poly", "line", "full"),
-            ("valid_fir_decimate", "finite_support", "valid_fir"),
-        }
-        if (self.continuous_method, self.edge_mode, self.support_mode) not in supported:
-            raise ValueError("unsupported projection policy combination.")
-        if self.antialias_taps_per_factor < 1:
-            raise ValueError("antialias_taps_per_factor must be positive.")
-        if not 0.0 < self.cutoff_output_nyquist_fraction < 1.0:
-            raise ValueError("projection cutoff fraction must lie in (0, 1).")
-        if self.categorical_window_mode != "centered_factor_plus_one":
-            raise ValueError("unsupported categorical window mode.")
-        if self.geometric_valid_mode not in {
-            "categorical_window_any",
-            "point_sample_highres",
-        }:
-            raise ValueError("unsupported geometric valid mode.")
-
-
-@dataclass(frozen=True)
 class ProjectedTruth:
     model_axis: SampleAxis
     model_target_log_ai: np.ndarray
@@ -95,7 +64,6 @@ class ProjectedTruth:
 class DomainPreparation:
     model_axis: SampleAxis
     required_context_extent: float
-    projection_policy: ProjectionPolicy
     forward_configuration: object
 
     def __post_init__(self) -> None:
@@ -209,7 +177,6 @@ __all__ = [
     "ForwardResult",
     "ForwardSupport",
     "ProjectedTruth",
-    "ProjectionPolicy",
     "SampleAxis",
     "TimeForwardExtras",
 ]

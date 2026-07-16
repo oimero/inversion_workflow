@@ -18,7 +18,7 @@ from cup.impedance import (
     validate_sample_axis,
     validate_synthoseis_lfm_contract,
 )
-from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION
+from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION, require_science_contract
 from cup.synthetic.core import (
     validate_lfm_degradation_metadata,
     validate_seismic_variant_metadata,
@@ -28,6 +28,7 @@ from cup.synthetic.core import (
     validate_mask_contract,
 )
 from cup.utils.io import require_contract_fingerprint
+from cup.synthetic.core.reader_contract import validate_benchmark_header
 
 
 @dataclass(frozen=True)
@@ -83,13 +84,9 @@ class DepthBenchmark:
                 raise FileNotFoundError(f"Required Synthoseis v4 artifact not found: {path}")
         self.manifest = _json(self.manifest_path)
         actual_schema = str(self.manifest.get("schema") or self.manifest.get("schema_version") or "missing")
-        if actual_schema != BENCHMARK_SCHEMA_VERSION:
-            raise ValueError(
-                f"Unsupported Synthoseis schema {actual_schema!r}; expected {BENCHMARK_SCHEMA_VERSION!r}. "
-                "Re-run calibrate/generate to rebuild the benchmark."
-            )
-        if self.manifest.get("sample_domain") != "depth" or self.manifest.get("depth_basis") != "tvdss":
-            raise ValueError("Synthoseis v4 reader requires sample_domain=depth and depth_basis=tvdss.")
+        validate_benchmark_header(
+            self.manifest, sample_domain="depth", label="depth benchmark manifest"
+        )
         self.mask_contract = validate_mask_contract(self.manifest.get("mask_contract") or {})
         self.increment_contract = CanonicalIncrementContract.from_mapping(
             self.manifest.get("increment_contract") or {}
@@ -176,6 +173,7 @@ class DepthBenchmark:
 
     def _validate_hdf5(self) -> None:
         with h5py.File(self.h5_path, "r") as h5:
+            require_science_contract(h5.attrs, label="depth benchmark HDF5 root")
             if h5.attrs.get("schema") != BENCHMARK_SCHEMA_VERSION:
                 raise ValueError(f"HDF5 schema does not match {BENCHMARK_SCHEMA_VERSION}.")
             if h5.attrs.get("sample_domain") != "depth" or h5.attrs.get("depth_basis") != "tvdss":
@@ -259,6 +257,7 @@ class DepthBenchmark:
         base_path = f"/realizations/{row['parent_realization_id']}"
         input_path = str(row["seismic_input_dataset"])
         with h5py.File(self.h5_path, "r") as h5:
+            require_science_contract(h5.attrs, label="depth benchmark HDF5 root")
             arrays = {
                 "target": np.asarray(h5[f"{base_path}/truth/model_target_log_ai"][()], dtype=np.float64),
                 "canonical_background": np.asarray(h5[f"{base_path}/priors/canonical_background_log_ai"][()], dtype=np.float64),

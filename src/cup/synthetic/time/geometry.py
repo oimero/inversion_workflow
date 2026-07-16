@@ -14,6 +14,7 @@ from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.config.workflow import WorkflowConfig
 from cup.utils.io import resolve_relative_path
+from cup.synthetic.core.geometry import resample_section_path
 
 
 @dataclass(frozen=True)
@@ -33,23 +34,7 @@ def _resample_section_path(
     geometry: Any,
     sample_interval_m: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    vertex_lines = np.asarray([[float(point["inline"]), float(point["xline"])] for point in points])
-    vertex_xy = np.asarray(
-        [geometry.line_to_coord(inline, xline) for inline, xline in vertex_lines],
-        dtype=np.float64,
-    )
-    segment_lengths = np.linalg.norm(np.diff(vertex_xy, axis=0), axis=1)
-    cumulative = np.r_[0.0, np.cumsum(segment_lengths)]
-    total = float(cumulative[-1])
-    if total <= 0.0:
-        raise ValueError("invalid_section_path")
-    lateral = np.arange(0.0, total, float(sample_interval_m), dtype=np.float64)
-    if lateral.size == 0 or not np.isclose(lateral[-1], total):
-        lateral = np.r_[lateral, total]
-    x = np.interp(lateral, cumulative, vertex_xy[:, 0])
-    y = np.interp(lateral, cumulative, vertex_xy[:, 1])
-    lines = np.asarray([geometry.coord_to_line(xi, yi) for xi, yi in zip(x, y)])
-    return lateral, lines[:, 0], lines[:, 1], x, y
+    return resample_section_path(points, geometry=geometry, sample_interval_m=sample_interval_m)
 
 def _nearest_grid_index(value: float, *, minimum: float, step: float, size: int) -> int:
     index = int(round((float(value) - float(minimum)) / float(step)))

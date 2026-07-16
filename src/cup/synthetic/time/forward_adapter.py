@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from cup.physics.numpy_backend import forward_time, reflectivity_from_log_ai
-from cup.synthetic.core.projection import time_projection_policy
+from cup.synthetic.core.signal import fir_half_width, required_context
 from cup.synthetic.core.records import (
     DomainPreparation,
     ForwardResult,
@@ -49,7 +49,13 @@ class TimeForwardAdapter:
         factor = int(vertical_oversampling_factor)
         output_dt = float(output_dt_s)
         truth_dt = output_dt / factor
-        context = (wavelet_values.size // 2) * output_dt
+        wavelet_halo = (wavelet_values.size // 2) * output_dt
+        projection_half = fir_half_width(factor, truth_dt)
+        context = required_context(
+            projection_fir_half_width=projection_half,
+            forward_input_halo=wavelet_halo,
+            observed_decimation_fir_half_width=projection_half,
+        )
         start = np.floor((float(np.min(horizons[:, 0])) - context) / truth_dt) * truth_dt
         end = np.ceil((float(np.max(horizons[:, -1])) + context) / truth_dt) * truth_dt
         n_model_intervals = int(np.ceil((end - start) / output_dt))
@@ -63,7 +69,6 @@ class TimeForwardAdapter:
                 positive_direction="increasing_time",
             ),
             required_context_extent=context,
-            projection_policy=time_projection_policy(),
             forward_configuration=TimeForwardConfiguration(
                 wavelet_time_s=np.asarray(wavelet_time_s, dtype=np.float64),
                 wavelet=wavelet_values,
@@ -104,7 +109,10 @@ class TimeForwardAdapter:
             forward_valid_mask_model=forward_valid_model,
         )
         observed = np.asarray(highres.seismic_model_grid, dtype=np.float64)
-        observed_support = forward_sample_valid_mask(forward_valid_model)
+        observed_support = (
+            forward_sample_valid_mask(forward_valid_model)
+            & highres.decimation_support_1d[None, :]
+        )
         physics_support = (
             np.isfinite(model_target)
             & np.isfinite(observed)

@@ -4,7 +4,7 @@ Usage::
 
     python scripts/synthoseis_lite.py --config <file> calibrate
     python scripts/synthoseis_lite.py --config <file> generate \
-        --suite field_conditioned --impedance-calibration <file>
+        --impedance-calibration <file>
 
 The ``synthoseis_lite.sample_domain`` and ``benchmark_schema`` keys explicitly
 select the primary time-domain or depth-domain extension branch.
@@ -66,12 +66,6 @@ def parse_args() -> argparse.Namespace:
     subparsers.add_parser("calibrate", help="Freeze impedance calibration from authoritative source runs.")
     generate = subparsers.add_parser("generate", help="Generate one configured benchmark suite.")
     generate.add_argument("--impedance-calibration", type=Path, required=True)
-    generate.add_argument(
-        "--suite",
-        choices=("canonical", "field_conditioned"),
-        required=True,
-        help="Depth v4 requires field_conditioned; time v4 also supports canonical.",
-    )
     generate.add_argument(
         "--debug-attempt-limit",
         type=_positive_int_arg,
@@ -221,8 +215,6 @@ def main() -> None:
                 output_dir=output_dir,
             )
         else:
-            if args.suite != "field_conditioned":
-                raise ValueError("Depth Synthoseis-lite v4 only supports --suite field_conditioned.")
             summary = run_depth_generation(
                 workflow=workflow,
                 script_cfg=script_cfg,
@@ -272,7 +264,6 @@ def main() -> None:
             debug_attempt_limit=args.debug_attempt_limit,
             geometry_families=args.geometry_family,
             qc_only=args.qc_only,
-            suite=args.suite,
         )
     print("=== synthoseis-lite ===")
     print(f"Command: {args.command}")

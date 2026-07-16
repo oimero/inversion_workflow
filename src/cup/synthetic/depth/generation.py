@@ -11,7 +11,7 @@ import h5py
 import numpy as np
 import pandas as pd
 import scipy
-from scipy.signal import firwin, hilbert
+from scipy.signal import hilbert
 
 from cup.impedance import (
     build_lfm_producer_contract,
@@ -33,16 +33,20 @@ from cup.synthetic.core import (
     rejection_reason_summary,
     validate_debug_attempt_limit,
 )
-from cup.synthetic.core.progress import (
+from cup.synthetic.core.field_runner import (
     AttemptProgressLog,
     acceptance_enforcement,
     build_acceptance_catalog,
     configure_generation_logger,
     run_attempt_preflight,
+    stable_records_frame,
 )
 from cup.synthetic.reporting.figures import write_generation_figures
 from cup.synthetic.core.lfm import LfmPolicy
-from cup.synthetic.core.random import RandomNamespace, named_rng
+from cup.synthetic.core.geometry import resample_section_path, validate_line_geometry
+from cup.synthetic.core.signal import finite_support_fir, valid_filter_decimate
+from cup.synthetic.core.variant_runner import generate_seismic_variants
+from cup.synthetic.core.random import RandomNamespace
 from cup.synthetic.core.records import BenchmarkVariant, DepthForwardExtras
 from cup.synthetic.core.rejections import StagedRejection, frozen_external_reason
 from cup.synthetic.core.sample_builder import (
@@ -60,6 +64,12 @@ from cup.synthetic.depth.calibration_adapter import (
     load_depth_calibration_for_object_core,
 )
 from cup.synthetic.depth.forward_adapter import DepthForwardAdapter
+from cup.synthetic.schemas import (
+    RANDOM_STREAM_CONTRACT_VERSION,
+    SCIENCE_CONTRACT,
+    SCIENCE_REVISION,
+    require_science_contract,
+)
 from cup.physics.execution import DepthForwardExecutor
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
@@ -80,28 +90,7 @@ def _survey(workflow: Any, *, repo_root: Path) -> Any:
         if key in {"iline", "xline", "istep", "xstep"}
     }
     survey = open_survey(path, workflow.seismic.type, segy_options=options or None)
-    geometry = survey.line_geometry
-    for axis in (geometry.inline_axis, geometry.xline_axis):
-        if (
-            axis.count <= 0
-            or not np.isfinite(axis.step)
-            or (axis.count > 1 and axis.step == 0.0)
-        ):
-            raise ValueError(f"Invalid survey line axis: {axis.name}")
-    for inline in (geometry.inline_axis.minimum, geometry.inline_axis.maximum):
-        for xline in (geometry.xline_axis.minimum, geometry.xline_axis.maximum):
-            xy = geometry.line_to_coord(inline, xline)
-            restored = geometry.coord_to_line(*xy)
-            if not np.allclose(
-                restored,
-                (inline, xline),
-                rtol=0.0,
-                atol=1e-8
-                * max(
-                    abs(geometry.inline_axis.step), abs(geometry.xline_axis.step), 1.0
-                ),
-            ):
-                raise ValueError("Survey line/XY corner round-trip failed.")
+    validate_line_geometry(survey.line_geometry)
     return survey
 
 
@@ -111,28 +100,7 @@ def _resample_path(
     geometry: Any,
     interval_m: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    lines = np.asarray(
-        [[float(item["inline"]), float(item["xline"])] for item in points]
-    )
-    xy = np.asarray(
-        [geometry.line_to_coord(il, xl) for il, xl in lines], dtype=np.float64
-    )
-    lengths = np.linalg.norm(np.diff(xy, axis=0), axis=1)
-    cumulative = np.r_[0.0, np.cumsum(lengths)]
-    if cumulative[-1] <= 0.0:
-        raise ValueError("invalid_section_path")
-    lateral = np.arange(0.0, cumulative[-1], interval_m, dtype=np.float64)
-    if lateral.size == 0 or not np.isclose(lateral[-1], cumulative[-1]):
-        lateral = np.r_[lateral, cumulative[-1]]
-    x = np.interp(lateral, cumulative, xy[:, 0])
-    y = np.interp(lateral, cumulative, xy[:, 1])
-    line_samples = np.asarray([geometry.coord_to_line(xi, yi) for xi, yi in zip(x, y)])
-    # Round-trip is a runtime contract, not a fixture tied to a particular step.
-    roundtrip = np.asarray([geometry.line_to_coord(il, xl) for il, xl in line_samples])
-    tolerance = max(1e-7, 1e-8 * max(float(np.ptp(x)), float(np.ptp(y)), 1.0))
-    if not np.allclose(roundtrip, np.column_stack((x, y)), rtol=0.0, atol=tolerance):
-        raise ValueError("section_line_xy_roundtrip_failed")
-    return lateral, line_samples[:, 0], line_samples[:, 1], x, y
+    return resample_section_path(points, geometry=geometry, sample_interval_m=interval_m)
 
 
 def build_depth_sections(
@@ -224,38 +192,6 @@ def build_depth_sections(
     return sections, survey
 
 
-def _antialias_taps(config: Mapping[str, Any], factor: int) -> np.ndarray:
-    count = int(config["taps_per_factor"]) * int(factor) + 1
-    if count % 2 == 0:
-        raise ValueError("Depth antialias FIR must have odd length.")
-    return firwin(
-        count,
-        float(config["cutoff_output_nyquist_fraction"]) / int(factor),
-        window=("kaiser", float(config["kaiser_beta"])),
-        scale=True,
-    ).astype(np.float64)
-
-
-def _valid_filter_decimate(
-    values: np.ndarray, *, factor: int, taps: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    data = np.asarray(values, dtype=np.float64)
-    n_model = (data.shape[-1] - 1) // factor + 1
-    output = data[..., ::factor].copy()
-    valid = np.zeros(n_model, dtype=bool)
-    half = taps.size // 2
-    model_high_indices = np.arange(n_model, dtype=np.int64) * factor
-    supported = (model_high_indices >= half) & (
-        model_high_indices < data.shape[-1] - half
-    )
-    for row_index, row in enumerate(data.reshape((-1, data.shape[-1]))):
-        filtered = np.convolve(row, taps, mode="valid")
-        centers = model_high_indices[supported] - half
-        output.reshape((-1, n_model))[row_index, supported] = filtered[centers]
-    valid[supported] = True
-    return output, valid
-
-
 def _phase_rotate(wavelet: np.ndarray, degrees: float) -> np.ndarray:
     analytic = hilbert(np.asarray(wavelet, dtype=np.float64))
     return np.real(analytic * np.exp(1j * np.deg2rad(float(degrees))))
@@ -265,104 +201,6 @@ def _shift_wavelet(
     time_s: np.ndarray, amplitude: np.ndarray, shift_s: float
 ) -> np.ndarray:
     return np.interp(time_s - float(shift_s), time_s, amplitude, left=0.0, right=0.0)
-
-
-def _safe_rms(values: np.ndarray, mask: np.ndarray) -> float:
-    valid = np.asarray(mask, dtype=bool) & np.isfinite(values)
-    if not np.any(valid):
-        return 0.0
-    selected = np.asarray(values, dtype=np.float64)[valid]
-    return float(np.sqrt(np.mean(selected * selected)))
-
-
-def _normalize_to_rms(values: np.ndarray, mask: np.ndarray, rms: float) -> np.ndarray:
-    output = np.asarray(values, dtype=np.float64).copy()
-    valid = np.asarray(mask, dtype=bool) & np.isfinite(output)
-    if not np.any(valid):
-        return np.zeros_like(output)
-    output[~valid] = 0.0
-    output[valid] -= float(np.mean(output[valid]))
-    current = float(np.sqrt(np.mean(output[valid] * output[valid])))
-    if current <= 0.0 or not np.isfinite(current):
-        return np.zeros_like(output)
-    return output * (float(rms) / current)
-
-
-def _regular_ar1(
-    size: int, *, rng: np.random.Generator, correlation_fraction: float
-) -> np.ndarray:
-    if size < 2:
-        return np.zeros(size, dtype=np.float64)
-    corr = max(float(correlation_fraction) * size, 1.0)
-    rho = float(np.exp(-1.0 / corr))
-    raw = np.empty(size, dtype=np.float64)
-    raw[0] = rng.normal()
-    scale = float(np.sqrt(max(0.0, 1.0 - rho * rho)))
-    for index in range(1, size):
-        raw[index] = rho * raw[index - 1] + scale * rng.normal()
-    clipped = np.clip(raw, -3.0, 3.0)
-    centered = clipped - float(np.mean(clipped))
-    rms = float(np.sqrt(np.mean(centered * centered)))
-    return centered / rms if rms > 0.0 else np.zeros_like(centered)
-
-
-def _lateral_smooth_gain(
-    *,
-    lateral_m: np.ndarray,
-    shape: tuple[int, int],
-    log_sigma: float,
-    rng: np.random.Generator,
-    correlation_fraction: float = 0.30,
-) -> np.ndarray:
-    lateral = np.asarray(lateral_m, dtype=np.float64).reshape(-1)
-    if lateral.size < 2 or float(log_sigma) <= 0.0:
-        return np.ones(shape, dtype=np.float64)
-    requested = float(correlation_fraction) * max(
-        float(lateral[-1] - lateral[0]), np.finfo(np.float64).eps
-    )
-    spacing = float(np.median(np.diff(lateral)))
-    effective = max(requested, 4.0 * spacing)
-    field = rng.normal(size=lateral.size)
-    alpha = np.exp(-spacing / max(effective, spacing))
-    for index in range(1, field.size):
-        field[index] = alpha * field[index - 1] + np.sqrt(1.0 - alpha**2) * field[index]
-    field -= float(np.mean(field))
-    field_rms = float(np.sqrt(np.mean(field * field)))
-    if field_rms > 0.0:
-        field /= field_rms
-    return np.exp(float(log_sigma) * field)[:, None] * np.ones(shape, dtype=np.float64)
-
-
-def _vertical_lateral_smooth_gain(
-    *,
-    lateral_m: np.ndarray,
-    axis_m: np.ndarray,
-    shape: tuple[int, int],
-    log_sigma: float,
-    lateral_correlation_fraction: float,
-    vertical_correlation_fraction: float,
-    rng_lateral: np.random.Generator,
-    rng_vertical: np.random.Generator,
-) -> np.ndarray:
-    lateral_gain = _lateral_smooth_gain(
-        lateral_m=lateral_m,
-        shape=shape,
-        log_sigma=1.0,
-        rng=rng_lateral,
-        correlation_fraction=lateral_correlation_fraction,
-    )
-    lateral_field = np.log(lateral_gain[:, 0])
-    vertical_field = _regular_ar1(
-        axis_m.size,
-        rng=rng_vertical,
-        correlation_fraction=vertical_correlation_fraction,
-    )
-    raw = lateral_field[:, None] + vertical_field[None, :]
-    raw -= float(np.mean(raw))
-    raw_rms = float(np.sqrt(np.mean(raw * raw)))
-    if raw_rms > 0.0:
-        raw /= raw_rms
-    return np.exp(float(log_sigma) * raw)
 
 
 def generate_depth_realization(
@@ -406,6 +244,8 @@ def generate_depth_realization(
     )
     namespace = RandomNamespace(
         benchmark_version=SCHEMA_VERSION,
+        science_revision=SCIENCE_REVISION,
+        random_stream_contract_version=RANDOM_STREAM_CONTRACT_VERSION,
         generator_family=calibration.generator_family,
     )
     truth = generate_field_conditioned_truth(
@@ -551,34 +391,6 @@ def build_attempt_plan(
     )
 
 
-def _static_shift(
-    data: np.ndarray,
-    axis: np.ndarray,
-    shift_m: float,
-    *,
-    source_valid_mask: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    output = np.zeros_like(data)
-    valid = np.zeros_like(data, dtype=bool)
-    source = axis - float(shift_m)
-    inside = (source >= axis[0]) & (source <= axis[-1])
-    for index, trace in enumerate(data):
-        output[index, inside] = np.interp(source[inside], axis, trace)
-        positions = np.searchsorted(axis, source[inside], side="left")
-        positions = np.clip(positions, 0, axis.size - 1)
-        exact = np.isclose(axis[positions], source[inside], rtol=0.0, atol=1e-12)
-        lower = np.maximum(positions - 1, 0)
-        upper = positions
-        source_valid = np.asarray(source_valid_mask[index], dtype=bool)
-        supported = np.where(
-            exact,
-            source_valid[upper],
-            source_valid[lower] & source_valid[upper],
-        )
-        valid[index, np.flatnonzero(inside)] = supported
-    return output, valid
-
-
 def _write_variants(
     h5: h5py.File | None,
     section: DepthGeneratedSection,
@@ -588,359 +400,116 @@ def _write_variants(
     repo_root: Path,
     forward_executor: DepthForwardExecutor,
 ) -> list[dict[str, Any]]:
+    """Depth configuration and Forward Adapters for the shared variant runner."""
     config = script_cfg["seismic_mismatch"]
-    if not bool(config.get("enabled", True)):
+    if not bool(config["enabled"]):
         return []
-    root_path = f"/realizations/{section.realization_id}"
-    variants = None if h5 is None else h5[root_path].create_group("seismic_variants")
-    rows = []
-    base_mask = np.asarray(section.valid_mask_model, dtype=bool)
-    source_support = np.isfinite(section.seismic_observed)
-    ones = np.ones_like(section.seismic_observed, dtype=np.float64)
-    zeros = np.zeros_like(section.seismic_observed, dtype=np.float64)
-
-    def persist(
-        variant_id: str,
-        family: str,
-        seismic_convolved: np.ndarray,
-        mask: np.ndarray,
-        parameters: Mapping[str, Any],
-        *,
-        gain: np.ndarray | None = None,
-        noise: np.ndarray | None = None,
-        operator_source: str = "observed_base",
-    ) -> None:
-        positive_gain = np.broadcast_to(
-            ones if gain is None else np.asarray(gain, dtype=np.float64),
-            section.seismic_observed.shape,
-        ).copy()
-        additive_noise = np.broadcast_to(
-            zeros if noise is None else np.asarray(noise, dtype=np.float64),
-            section.seismic_observed.shape,
-        ).copy()
-        observed = (
-            positive_gain * np.asarray(seismic_convolved, dtype=np.float64)
-            + additive_noise
-        )
-        valid = np.asarray(mask, dtype=bool)
-        if not np.array_equal(valid, base_mask):
-            mismatch = int(np.count_nonzero(valid != base_mask))
-            raise ValueError(
-                "invalid_seismic_variant:roi_support_incomplete:"
-                f"variant={variant_id}:mismatch={mismatch}:"
-                f"valid={int(np.count_nonzero(valid))}:"
-                f"base={int(np.count_nonzero(base_mask))}"
-            )
-        if np.any(valid & ~np.isfinite(observed)):
-            raise ValueError("invalid_seismic_variant:roi_support_not_finite")
-        if variants is not None:
-            write_benchmark_variant(
-                h5,
-                BenchmarkVariant(
-                    owner_realization_id=section.realization_id,
-                    variant_id=variant_id,
-                    sample_kind="seismic_variant",
-                    seismic_observed=observed,
-                    positive_gain=positive_gain,
-                    additive_noise=additive_noise,
-                    metadata={
-                        "mismatch_family": family,
-                        "operator_source": operator_source,
-                        "parameters": dict(parameters),
-                    },
-                    sample_domain="depth",
-                ),
-            )
-        valid_values = observed[valid]
-        row = {
-            **build_seismic_variant_metadata(
-                variant_id=variant_id,
-                mismatch_family=family,
-                operator_source=operator_source,
-                parameters=parameters,
-            ),
-            "seismic_observed_rms": float(np.sqrt(np.mean(valid_values * valid_values)))
-            if valid_values.size
-            else float("nan"),
-            "valid_sample_count": int(np.count_nonzero(valid)),
-            "positive_gain_min": float(np.min(positive_gain[valid]))
-            if np.any(valid)
-            else float("nan"),
-            "positive_gain_max": float(np.max(positive_gain[valid]))
-            if np.any(valid)
-            else float("nan"),
-            "additive_noise_rms": _safe_rms(additive_noise, valid),
-            **dict(parameters),
-        }
-        rows.append(row)
-
     wavelet_time, wavelet = load_wavelet_csv(
         resolve_relative_path(forward_inputs["wavelet"]["path"], root=repo_root)
     )
     factor = int(script_cfg["sampling"]["vertical_oversampling_factor"])
-    taps = _antialias_taps(script_cfg["sampling"]["antialias"], factor)
-    wave_cfg = dict(config.get("wavelet") or {})
-    for degrees in wave_cfg.get("phase_rotation_degrees", []):
-        perturbed = _phase_rotate(wavelet, float(degrees))
-        high = forward_executor(
-            section.log_ai_highres,
-            section.vp_highres_mps,
-            section.tvdss_highres_m,
-            wavelet_time,
-            perturbed,
-        )
-        observed, valid_1d = _valid_filter_decimate(high, factor=factor, taps=taps)
-        persist(
-            f"wavelet_phase_{float(degrees):+g}deg",
-            "wavelet_phase",
-            observed,
-            base_mask & valid_1d[None, :],
-            {"phase_rotation_degrees": float(degrees)},
-            operator_source="truth_highres_forward",
-        )
-    for shift_s in wave_cfg.get("time_shift_s", []):
-        perturbed = _shift_wavelet(wavelet_time, wavelet, float(shift_s))
-        high = forward_executor(
-            section.log_ai_highres,
-            section.vp_highres_mps,
-            section.tvdss_highres_m,
-            wavelet_time,
-            perturbed,
-        )
-        observed, valid_1d = _valid_filter_decimate(high, factor=factor, taps=taps)
-        persist(
-            f"wavelet_shift_{float(shift_s) * 1000:+g}ms",
-            "wavelet_time_shift",
-            observed,
-            base_mask & valid_1d[None, :],
-            {"wavelet_time_shift_s": float(shift_s)},
-            operator_source="truth_highres_forward",
-        )
-    for shift_m in dict(config.get("depth_static") or {}).get("shift_m", []):
-        shifted, shifted_valid = _static_shift(
-            section.seismic_observed,
-            section.tvdss_model_m,
-            float(shift_m),
-            source_valid_mask=source_support,
-        )
-        persist(
-            f"depth_static_{float(shift_m):+g}m",
-            "depth_static",
-            shifted,
-            base_mask & shifted_valid,
-            {"depth_static_m": float(shift_m)},
-        )
+    taps = finite_support_fir(factor)
+    depth_noise = dict(config["noise"])
+    depth_gain = dict(config["gain"])
+    common_config = {
+        "enabled": True,
+        "wavelet": dict(config["wavelet"]),
+        "noise": {
+            "white_noise_rms_fraction": float(depth_noise["white_noise_rms_fraction"]),
+            "colored_noise_rms_fraction": float(depth_noise["colored_noise_rms_fraction"]),
+            "colored_axis_correlation_length": float(
+                depth_noise["colored_vertical_correlation_m"]
+            ),
+        },
+        "gain": {
+            "global_log_sigma": float(depth_gain["global_log_sigma"]),
+            "tracewise_log_sigma": float(depth_gain["tracewise_log_sigma"]),
+            "axis_lateral_log_sigma": float(depth_gain["vertical_lateral_log_sigma"]),
+            "lateral_correlation_fraction": float(depth_gain["lateral_correlation_fraction"]),
+            "axis_correlation_fraction": float(depth_gain["vertical_correlation_fraction"]),
+        },
+        "combined": {
+            key: value
+            for key, value in dict(config["combined"]).items()
+            if key != "depth_static_m"
+        },
+    }
 
-    rms = _safe_rms(section.seismic_observed, base_mask)
-    noise_cfg = dict(config.get("noise") or {})
-    for name, fraction in (
-        ("white_noise", noise_cfg.get("white_noise_rms_fraction")),
-        ("colored_noise", noise_cfg.get("colored_noise_rms_fraction")),
-    ):
-        if fraction is None:
-            continue
-        rng = named_rng(
-            global_seed=int(script_cfg["global_seed"]),
-            benchmark_version=SCHEMA_VERSION,
-            generator_family=GENERATOR_FAMILY,
-            stream_purpose=name,
-            realization_id=section.realization_id,
-        )
-        noise = rng.standard_normal(section.seismic_observed.shape)
-        if name == "colored_noise":
-            length = max(
-                float(noise_cfg.get("colored_vertical_correlation_m", 25.0))
-                / float(np.diff(section.tvdss_model_m[:2])[0]),
-                1.0,
-            )
-            alpha = np.exp(-1.0 / length)
-            for index in range(1, noise.shape[-1]):
-                noise[:, index] = (
-                    alpha * noise[:, index - 1]
-                    + np.sqrt(1.0 - alpha**2) * noise[:, index]
-                )
-        noise = _normalize_to_rms(noise, base_mask, float(fraction) * rms)
-        persist(
-            name,
-            name,
-            section.seismic_observed,
-            base_mask,
-            {"noise_rms_fraction": float(fraction)},
-            noise=noise,
-        )
-    gain_cfg = dict(config.get("gain") or {})
-    for name, sigma in (
-        ("global_gain", gain_cfg.get("global_log_sigma")),
-        ("tracewise_gain", gain_cfg.get("tracewise_log_sigma")),
-    ):
-        if sigma is None:
-            continue
-        rng = named_rng(
-            global_seed=int(script_cfg["global_seed"]),
-            benchmark_version=SCHEMA_VERSION,
-            generator_family=GENERATOR_FAMILY,
-            stream_purpose=name,
-            realization_id=section.realization_id,
-        )
-        if name == "global_gain":
-            gain = np.full(
-                section.seismic_observed.shape,
-                float(np.exp(rng.normal(0.0, float(sigma)))),
-                dtype=np.float64,
-            )
-        else:
-            gain = _lateral_smooth_gain(
-                lateral_m=section.geometry.lateral_m,
-                shape=section.seismic_observed.shape,
-                log_sigma=float(sigma),
-                rng=rng,
-                correlation_fraction=float(
-                    gain_cfg.get("lateral_correlation_fraction", 0.30)
-                ),
-            )
-        persist(
-            name,
-            name,
-            section.seismic_observed,
-            base_mask,
-            {"gain_log_sigma": float(sigma)},
-            gain=gain,
-        )
-    if "vertical_lateral_log_sigma" in gain_cfg:
-        rng_lateral = named_rng(
-            global_seed=int(script_cfg["global_seed"]),
-            benchmark_version=SCHEMA_VERSION,
-            generator_family=GENERATOR_FAMILY,
-            stream_purpose="vertical_lateral_smooth_gain",
-            realization_id=section.realization_id,
-            coefficient_name="lateral",
-        )
-        rng_vertical = named_rng(
-            global_seed=int(script_cfg["global_seed"]),
-            benchmark_version=SCHEMA_VERSION,
-            generator_family=GENERATOR_FAMILY,
-            stream_purpose="vertical_lateral_smooth_gain",
-            realization_id=section.realization_id,
-            coefficient_name="vertical",
-        )
-        gain = _vertical_lateral_smooth_gain(
-            lateral_m=section.geometry.lateral_m,
-            axis_m=section.tvdss_model_m,
-            shape=section.seismic_observed.shape,
-            log_sigma=float(gain_cfg["vertical_lateral_log_sigma"]),
-            lateral_correlation_fraction=float(
-                gain_cfg.get("lateral_correlation_fraction", 0.30)
-            ),
-            vertical_correlation_fraction=float(
-                gain_cfg.get("vertical_correlation_fraction", 0.30)
-            ),
-            rng_lateral=rng_lateral,
-            rng_vertical=rng_vertical,
-        )
-        persist(
-            "vertical_lateral_smooth_gain",
-            "vertical_lateral_smooth_gain",
-            section.seismic_observed,
-            base_mask,
-            {
-                "gain_log_sigma": float(gain_cfg["vertical_lateral_log_sigma"]),
-                "lateral_correlation_fraction": float(
-                    gain_cfg.get("lateral_correlation_fraction", 0.30)
-                ),
-                "vertical_correlation_fraction": float(
-                    gain_cfg.get("vertical_correlation_fraction", 0.30)
-                ),
-            },
-            gain=gain,
-        )
-    combined_cfg = dict(config.get("combined") or {})
-    if bool(combined_cfg.get("enabled", False)):
-        perturbed = _shift_wavelet(
-            wavelet_time,
-            _phase_rotate(wavelet, float(combined_cfg["phase_rotation_degrees"])),
-            float(combined_cfg["time_shift_s"]),
-        )
-        high = forward_executor(
+    def perturbed_forward(
+        phase_degrees: float, shift_s: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        rotated = _phase_rotate(wavelet, phase_degrees)
+        perturbed = _shift_wavelet(wavelet_time, rotated, shift_s)
+        highres = forward_executor(
             section.log_ai_highres,
             section.vp_highres_mps,
             section.tvdss_highres_m,
             wavelet_time,
             perturbed,
         )
-        combined_seismic, valid_1d = _valid_filter_decimate(
-            high, factor=factor, taps=taps
+        observed, support_1d = valid_filter_decimate(
+            highres, factor=factor, taps=taps
         )
-        combined_mask = base_mask & valid_1d[None, :]
-        depth_static_m = float(combined_cfg.get("depth_static_m", 0.0))
-        if depth_static_m != 0.0:
-            combined_seismic, shifted_valid = _static_shift(
-                combined_seismic,
-                section.tvdss_model_m,
-                depth_static_m,
-                source_valid_mask=(
-                    np.isfinite(combined_seismic) & valid_1d[None, :]
+        observed = observed[..., : section.seismic_observed.shape[-1]]
+        support = np.broadcast_to(
+            support_1d[: observed.shape[-1]], observed.shape
+        )
+        base_mask = np.asarray(section.valid_mask_model, dtype=bool)
+        if np.any(base_mask & ~support):
+            raise ValueError(
+                "invalid_seismic_variant:perturbed_wavelet_support_incomplete"
+            )
+        return observed, base_mask
+
+    results = generate_seismic_variants(
+        seismic_input=section.seismic_observed,
+        valid_mask=section.valid_mask_model,
+        lateral_m=section.geometry.lateral_m,
+        sample_axis=section.tvdss_model_m,
+        config=common_config,
+        global_seed=int(script_cfg["global_seed"]),
+        generator_family=GENERATOR_FAMILY,
+        realization_id=section.realization_id,
+        perturbed_wavelet_forward=perturbed_forward,
+        axis_static_shifts=tuple(
+            float(value) for value in config["depth_static"]["shift_m"]
+        ),
+        combined_axis_static_shift=float(
+            dict(config["combined"]).get("depth_static_m", 0.0)
+        ),
+        base_operator_support=np.isfinite(section.seismic_observed),
+    )
+    rows: list[dict[str, Any]] = []
+    for result in results:
+        if h5 is not None:
+            write_benchmark_variant(
+                h5,
+                BenchmarkVariant(
+                    owner_realization_id=section.realization_id,
+                    variant_id=result.variant_id,
+                    sample_kind="seismic_variant",
+                    seismic_observed=result.seismic_observed,
+                    positive_gain=result.positive_gain,
+                    additive_noise=result.additive_noise,
+                    metadata={
+                        "mismatch_family": result.mismatch_family,
+                        "operator_source": result.operator_source,
+                        "parameters": result.parameters,
+                    },
+                    qc=result.qc,
+                    sample_domain="depth",
                 ),
             )
-            combined_mask = base_mask & shifted_valid
-        gain = _lateral_smooth_gain(
-            lateral_m=section.geometry.lateral_m,
-            shape=section.seismic_observed.shape,
-            log_sigma=float(combined_cfg["gain_log_sigma"]),
-            rng=named_rng(
-                global_seed=int(script_cfg["global_seed"]),
-                benchmark_version=SCHEMA_VERSION,
-                generator_family=GENERATOR_FAMILY,
-                stream_purpose="combined_moderate",
-                realization_id=section.realization_id,
-                coefficient_name="gain",
+        rows.append({
+            **build_seismic_variant_metadata(
+                variant_id=result.variant_id,
+                mismatch_family=result.mismatch_family,
+                operator_source=result.operator_source,
+                parameters=result.parameters,
             ),
-            correlation_fraction=float(
-                gain_cfg.get("lateral_correlation_fraction", 0.30)
-            ),
-        )
-        noise_rng = named_rng(
-            global_seed=int(script_cfg["global_seed"]),
-            benchmark_version=SCHEMA_VERSION,
-            generator_family=GENERATOR_FAMILY,
-            stream_purpose="combined_moderate",
-            realization_id=section.realization_id,
-            coefficient_name="noise",
-        )
-        noise = noise_rng.standard_normal(section.seismic_observed.shape)
-        length = max(
-            float(noise_cfg.get("colored_vertical_correlation_m", 25.0))
-            / float(np.diff(section.tvdss_model_m[:2])[0]),
-            1.0,
-        )
-        alpha = np.exp(-1.0 / length)
-        for index in range(1, noise.shape[-1]):
-            noise[:, index] = (
-                alpha * noise[:, index - 1] + np.sqrt(1.0 - alpha**2) * noise[:, index]
-            )
-        noise = _normalize_to_rms(
-            noise,
-            combined_mask,
-            float(combined_cfg["noise_rms_fraction"])
-            * _safe_rms(combined_seismic, combined_mask),
-        )
-        persist(
-            "combined_moderate",
-            "combined_phase_wavelet_shift_depth_static_gain_noise",
-            combined_seismic,
-            combined_mask,
-            {
-                "phase_rotation_degrees": float(combined_cfg["phase_rotation_degrees"]),
-                "wavelet_time_shift_s": float(combined_cfg["time_shift_s"]),
-                "depth_static_m": depth_static_m,
-                "gain_log_sigma": float(combined_cfg["gain_log_sigma"]),
-                "noise_rms_fraction": float(combined_cfg["noise_rms_fraction"]),
-            },
-            gain=gain,
-            noise=noise,
-            operator_source="truth_highres_forward",
-        )
+            **result.qc,
+        })
     return rows
-
 
 def run_depth_generation(
     *,
@@ -963,6 +532,7 @@ def run_depth_generation(
     calibration_summary_path = calibration_path.parent / "run_summary.json"
     with calibration_summary_path.open("r", encoding="utf-8") as handle:
         calibration_summary = json.load(handle)
+    require_science_contract(calibration_summary, label="depth calibration run summary")
     if (
         calibration_summary.get("schema_version") != CALIBRATION_SCHEMA
         or calibration_summary.get("status") != "success"
@@ -1149,6 +719,8 @@ def run_depth_generation(
     ) as production_progress, h5py.File(h5_path, "w") as h5:
         h5.attrs["schema"] = SCHEMA_VERSION
         h5.attrs["schema_version"] = SCHEMA_VERSION
+        for key, value in SCIENCE_CONTRACT.items():
+            h5.attrs[key] = value
         h5.attrs["sample_domain"] = "depth"
         h5.attrs["depth_basis"] = "tvdss"
         h5.attrs["axis_positive_direction"] = "down"
@@ -1388,31 +960,59 @@ def run_depth_generation(
                 elapsed_s=time.perf_counter() - attempt_started,
             )
 
-    index = pd.DataFrame.from_records(index_rows)
+    index = stable_records_frame(
+        index_rows,
+        sort_by=("section_id", "scenario_id", "attempt_id", "sample_kind", "sample_id"),
+    )
     index.to_csv(output_dir / "sample_index.csv", index=False)
-    pd.DataFrame.from_records(object_rows).to_csv(
+    stable_records_frame(
+        object_rows,
+        sort_by=("realization_id", "zone_id", "object_id"),
+    ).to_csv(
         output_dir / "object_catalog.csv", index=False
     )
-    pd.DataFrame.from_records(coefficient_rows).to_csv(
+    stable_records_frame(
+        coefficient_rows,
+        sort_by=("realization_id", "zone_id", "object_id", "lateral_index"),
+    ).to_csv(
         output_dir / "object_lateral_coefficients.csv", index=False
     )
-    pd.DataFrame.from_records(rejection_rows).to_csv(
+    stable_records_frame(
+        rejection_rows,
+        sort_by=("section_id", "scenario_id", "attempt_id", "reason"),
+    ).to_csv(
         output_dir / "generation_rejection_details.csv", index=False
     )
-    pd.DataFrame.from_records(highres_rows).to_csv(
+    stable_records_frame(
+        highres_rows,
+        sort_by=("parent_realization_id",),
+    ).to_csv(
         output_dir / "highres_forward_qc.csv", index=False
     )
-    pd.DataFrame.from_records(subgrid_rows).to_csv(
+    stable_records_frame(
+        subgrid_rows,
+        sort_by=("parent_realization_id",),
+    ).to_csv(
         output_dir / "subgrid_forward_qc.csv", index=False
     )
-    pd.DataFrame.from_records(variant_rows).to_csv(
+    stable_records_frame(
+        variant_rows,
+        sort_by=("parent_realization_id", "variant_id"),
+    ).to_csv(
         output_dir / "seismic_variant_results.csv", index=False
     )
-    pd.DataFrame.from_records(generation_qc_rows).to_csv(
+    stable_records_frame(
+        generation_qc_rows,
+        sort_by=("section_id", "scenario_id", "attempt_id", "sample_kind", "sample_id"),
+    ).to_csv(
         output_dir / "generation_qc.csv", index=False
     )
     rejection_summary = rejection_reason_summary(
-        pd.DataFrame.from_records(rejection_rows), index
+        stable_records_frame(
+            rejection_rows,
+            sort_by=("section_id", "scenario_id", "attempt_id", "reason"),
+        ),
+        index,
     )
     rejection_summary_path = output_dir / "rejection_reason_summary.csv"
     rejection_summary.to_csv(rejection_summary_path, index=False)
@@ -1467,6 +1067,7 @@ def run_depth_generation(
             "contract_fingerprint_sha256": contract_fingerprint_sha256(
                 contract_schema_version=SCHEMA_VERSION,
                 semantics={
+                    **SCIENCE_CONTRACT,
                     "sample_domain": "depth",
                     "sample_unit": "m",
                     "depth_basis": "tvdss",
@@ -1493,6 +1094,7 @@ def run_depth_generation(
     manifest = {
         "schema": SCHEMA_VERSION,
         "schema_version": SCHEMA_VERSION,
+        **SCIENCE_CONTRACT,
         "status": "failed"
         if failure_reason
         else (
@@ -1618,6 +1220,8 @@ def run_depth_generation(
         "random_stream": {
             "algorithm": "SHA-256/PCG64DXSM",
             "benchmark_version": SCHEMA_VERSION,
+            "science_revision": SCIENCE_REVISION,
+            "random_stream_contract_version": RANDOM_STREAM_CONTRACT_VERSION,
             "stream_purpose_registry": [
                 "state_sequence",
                 "duration",
@@ -1625,19 +1229,8 @@ def run_depth_generation(
                 "coefficient_<name>",
                 "coefficient_lateral",
                 "thickness_lateral",
-                "lfm_constant_bias",
-                "lfm_vertical_trend",
-                "lfm_zone_bias",
-                "lfm_lateral_bias",
-                "lfm_amplitude_scale",
-                "lfm_local_missing_control",
-                "lfm_over_smoothing",
-                "white_noise",
-                "colored_noise",
-                "global_gain",
-                "tracewise_gain",
-                "vertical_lateral_smooth_gain",
-                "combined_moderate",
+                "lfm_degradation/<component coefficient name>",
+                "seismic_mismatch/<variant id>/<component coefficient name>",
             ],
         },
         "quality_warnings": (

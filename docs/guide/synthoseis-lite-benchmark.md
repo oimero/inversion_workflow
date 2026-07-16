@@ -13,7 +13,6 @@
 ```powershell
 python scripts/synthoseis_lite.py --config <config-yaml> calibrate
 python scripts/synthoseis_lite.py --config <config-yaml> generate \
-    --suite field_conditioned \
     --impedance-calibration scripts/output/synthoseis_lite_calibrate_<timestamp>/impedance_calibration.json
 ```
 
@@ -22,7 +21,6 @@ python scripts/synthoseis_lite.py --config <config-yaml> generate \
 ```powershell
 python scripts/synthoseis_lite.py --config <config-yaml> calibrate
 python scripts/synthoseis_lite.py --config <config-yaml> generate \
-    --suite field_conditioned \
     --impedance-calibration scripts/output/synthoseis_lite_calibrate_<timestamp>/impedance_calibration.json
 ```
 
@@ -68,6 +66,7 @@ python scripts/synthoseis_lite.py --config <config-yaml> generate \
 synthoseis_lite:
   sample_domain: time
   benchmark_schema: synthoseis_lite_v4
+  science_revision: synthoseis_lite_science_v2
   seismic_input:
     policy: observed_highres_forward
   forward_qc:
@@ -79,6 +78,7 @@ synthoseis_lite:
 synthoseis_lite:
   sample_domain: depth
   benchmark_schema: synthoseis_lite_v4
+  science_revision: synthoseis_lite_science_v2
   seismic_input:
     policy: observed_highres_forward
   seismic_forward:
@@ -117,6 +117,7 @@ target_interval:
 synthoseis_lite:
   sample_domain: time
   benchmark_schema: synthoseis_lite_v4
+  science_revision: synthoseis_lite_science_v2
   global_seed: 20260615
   source_runs: ...
   sampling: ...
@@ -132,6 +133,7 @@ workflow_config: <path-to-common-yaml>
 synthoseis_lite:
   sample_domain: time          # 或 depth
   benchmark_schema: synthoseis_lite_v4
+  science_revision: synthoseis_lite_science_v2
   seismic_input:
     policy: observed_highres_forward
   # 时间域还必须声明：
@@ -169,15 +171,9 @@ geometry:
       mode: filled_target_zone        # 目标区域模式
       nearest_distance_limit: null    # 可选，限制离最近控制井的距离
       ...
-  canonical:                          # 仅时间域
-    enabled: true
-    lateral_sample_interval_m: 25.0
-    lateral_samples: 128
-    center_twt_s: 1.5
-    ...
 ```
 
-深度域仅开放 `field_conditioned`，不支持 `canonical`。
+时间域与深度域都生成工区条件化基准。
 
 ### `sections`
 
@@ -253,7 +249,6 @@ seismic_mismatch:
   noise:
     white_noise_rms_fraction: 0.05
     colored_noise_rms_fraction: 0.05
-    absolute_noise_rms_floor: 0.01
     ...
   gain:
     global_log_sigma: 0.15
@@ -449,7 +444,7 @@ Status: success
 | 纵轴 | TWT（秒） | TVDSS（米） |
 | 井曲线来源 | Step 4 filtered LAS | Step 5 shifted LAS |
 | 正演 | `forward_time` | `forward_depth` |
-| 可用套件 | canonical, field_conditioned, seismic_variant | 仅 field_conditioned |
+| 样本范围 | 工区条件化基准及其地震变体 | 工区条件化基准及其地震变体 |
 | 生成器族 | `object_coefficients_v1` | `object_coefficients_v2` |
 | 低频模型截止 | Hz | 米制 |
 | 深度静差 mismatch | 无 | 有，与子波平移独立 |
@@ -463,7 +458,6 @@ Status: success
 
 ## 留到第二轮
 
-- 深度域 canonical 套件的支持，以及是否需要为特定窗口重新组织 observability 分析。
 - 是否允许按区块或层段分组校准，产出多组统计模型。
 - 训练数据拆分比例的自动推演（当前由 GINN 训练端按 `parent_realization_id` 哈希派生）。
 - 校准图的交互式版本。

@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares
 
+from cup.synthetic.schemas import require_science_contract
+
 
 SCHEMA_VERSION = "synthoseis_lite_impedance_calibration_v2"
 GENERATOR_FAMILY = "object_coefficients_v1"
@@ -30,21 +32,21 @@ class WellZoneCurves:
     zone_id: str
     top_horizon: str
     bottom_horizon: str
-    twt_s: np.ndarray
+    vertical_coordinate: np.ndarray
     filtered_log_ai: np.ndarray
     full_log_ai: np.ndarray
-    zone_top_s: float
-    zone_bottom_s: float
+    zone_top_coordinate: float
+    zone_bottom_coordinate: float
 
     def __post_init__(self) -> None:
         arrays = [
-            np.asarray(self.twt_s, dtype=np.float64).reshape(-1),
+            np.asarray(self.vertical_coordinate, dtype=np.float64).reshape(-1),
             np.asarray(self.filtered_log_ai, dtype=np.float64).reshape(-1),
             np.asarray(self.full_log_ai, dtype=np.float64).reshape(-1),
         ]
         if len({array.size for array in arrays}) != 1 or arrays[0].size < 2:
             raise ValueError("WellZoneCurves arrays must have matching lengths >= 2.")
-        object.__setattr__(self, "twt_s", arrays[0])
+        object.__setattr__(self, "vertical_coordinate", arrays[0])
         object.__setattr__(self, "filtered_log_ai", arrays[1])
         object.__setattr__(self, "full_log_ai", arrays[2])
 
@@ -53,7 +55,9 @@ class WellZoneCurves:
 class ImpedanceCalibration:
     schema_version: str
     generator_family: str
-    truth_dt_s: float
+    truth_sample_interval: float
+    axis_unit: str
+    depth_basis: str | None
     state_threshold_sigma: float
     ordered_horizons: tuple[str, ...]
     zones: tuple[dict[str, Any], ...]
@@ -73,6 +77,12 @@ class ImpedanceCalibration:
         payload = dict(value)
         if payload.get("schema_version") != SCHEMA_VERSION:
             raise ValueError(f"Unsupported impedance calibration schema: {payload.get('schema_version')}")
+        require_science_contract(payload, label="impedance calibration")
+        zone_models = json.loads(json.dumps(payload["zone_models"]))
+        stored_extent = "zone_duration_s" if payload.get("sample_domain") == "time" else "zone_thickness_m"
+        for model in zone_models.values():
+            background = model["background"]
+            background["zone_extent"] = background.pop(stored_extent)
         if payload.get("generator_family") != GENERATOR_FAMILY:
             raise ValueError(f"Unsupported generator family: {payload.get('generator_family')}")
         for zone_id, zone_model in dict(payload.get("zone_models") or {}).items():
@@ -95,12 +105,16 @@ class ImpedanceCalibration:
         return cls(
             schema_version=str(payload["schema_version"]),
             generator_family=str(payload["generator_family"]),
-            truth_dt_s=float(payload["truth_dt_s"]),
+            truth_sample_interval=float(
+                payload["truth_dt_s"] if payload.get("sample_domain") == "time" else payload["truth_dz_m"]
+            ),
+            axis_unit="s" if payload.get("sample_domain") == "time" else "m",
+            depth_basis=None if payload.get("sample_domain") == "time" else str(payload["depth_basis"]),
             state_threshold_sigma=float(payload["state_threshold_sigma"]),
             ordered_horizons=tuple(payload["ordered_horizons"]),
             zones=tuple(payload["zones"]),
             parent=dict(payload["parent"]),
-            zone_models=dict(payload["zone_models"]),
+            zone_models=zone_models,
             source_runs=dict(payload["source_runs"]),
             input_contracts={
                 str(key): dict(item)
@@ -297,7 +311,9 @@ def _final_distribution(
 def calibrate_impedance(
     curves: Sequence[WellZoneCurves],
     *,
-    truth_dt_s: float,
+    truth_sample_interval: float,
+    axis_unit: str,
+    depth_basis: str | None,
     ordered_horizons: Sequence[str],
     source_runs: Mapping[str, str],
     input_contracts: Mapping[str, Mapping[str, str]],
@@ -312,10 +328,10 @@ def calibrate_impedance(
     sample_records: list[dict[str, Any]] = []
     background_records: list[dict[str, Any]] = []
     for item in curves:
-        duration = float(item.zone_bottom_s - item.zone_top_s)
+        duration = float(item.zone_bottom_coordinate - item.zone_top_coordinate)
         if duration <= 0.0:
             continue
-        zeta = (item.twt_s - item.zone_top_s) / duration
+        zeta = (item.vertical_coordinate - item.zone_top_coordinate) / duration
         valid = (
             (zeta >= 0.0)
             & (zeta <= 1.0)
@@ -332,14 +348,14 @@ def calibrate_impedance(
                 "zone_id": item.zone_id,
                 "background_a": a,
                 "background_b": b,
-                "zone_duration_s": duration,
+                "zone_extent": duration,
             }
         )
         background = a + b * (2.0 * zeta[valid] - 1.0)
         residual_values = item.full_log_ai[valid] - background
         for local_index, (time, coordinate, filtered, full, bg, residual) in enumerate(
             zip(
-                item.twt_s[valid],
+                item.vertical_coordinate[valid],
                 zeta[valid],
                 item.filtered_log_ai[valid],
                 item.full_log_ai[valid],
@@ -355,13 +371,13 @@ def calibrate_impedance(
                     "top_horizon": item.top_horizon,
                     "bottom_horizon": item.bottom_horizon,
                     "sample_id": local_index,
-                    "twt_s": float(time),
+                    "vertical_coordinate": float(time),
                     "zeta": float(coordinate),
                     "filtered_log_ai": float(filtered),
                     "full_log_ai": float(full),
                     "background_log_ai": float(bg),
                     "residual": float(residual),
-                    "zone_duration_s": duration,
+                    "zone_extent": duration,
                 }
             )
     samples = pd.DataFrame.from_records(sample_records)
@@ -448,7 +464,7 @@ def calibrate_impedance(
                     "zeta_top": float(zeta[0]),
                     "zeta_bottom": float(zeta[-1]),
                     "duration_fraction": float(zeta[-1] - zeta[0]),
-                    "duration_s": float(group["twt_s"].iloc[end - 1] - group["twt_s"].iloc[start]),
+                    "extent": float(group["vertical_coordinate"].iloc[end - 1] - group["vertical_coordinate"].iloc[start]),
                     "n_truth_samples": int(end - start),
                     "c0": float(coefficients[0]),
                     "c1": float(coefficients[1]),
@@ -458,7 +474,7 @@ def calibrate_impedance(
             )
             for point_index, (time, coordinate, observed, predicted) in enumerate(
                 zip(
-                    group["twt_s"].to_numpy()[start:end],
+                    group["vertical_coordinate"].to_numpy()[start:end],
                     xi,
                     residual[start:end],
                     fitted,
@@ -474,7 +490,7 @@ def calibrate_impedance(
                         "state_id": int(states[start]),
                         "state": STATE_NAMES[int(states[start])],
                         "point_index": int(point_index),
-                        "twt_s": float(time),
+                        "vertical_coordinate": float(time),
                         "xi": float(coordinate),
                         "residual": float(observed),
                         "fitted_residual": float(predicted),
@@ -533,7 +549,7 @@ def calibrate_impedance(
         )
         background_model = {
             column: _distribution(zone_backgrounds, column, background_weights)
-            for column in ("background_a", "background_b", "zone_duration_s")
+            for column in ("background_a", "background_b", "zone_extent")
         }
         sample_weights = hierarchical_weights(zone_samples.reset_index(drop=True), unit_column="sample_id")
         raw_ai_bounds = {
@@ -687,7 +703,9 @@ def calibrate_impedance(
     calibration = ImpedanceCalibration(
         schema_version=SCHEMA_VERSION,
         generator_family=GENERATOR_FAMILY,
-        truth_dt_s=float(truth_dt_s),
+        truth_sample_interval=float(truth_sample_interval),
+        axis_unit=str(axis_unit),
+        depth_basis=depth_basis,
         state_threshold_sigma=float(state_threshold_sigma),
         ordered_horizons=tuple(ordered_horizons),
         zones=tuple(zones),

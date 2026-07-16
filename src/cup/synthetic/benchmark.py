@@ -15,6 +15,7 @@ from cup.synthetic.schemas import (
     BENCHMARK_SCHEMA_VERSION,
     FROZEN_BENCHMARK_SCHEMA_VERSION,
     LEGACY_BENCHMARK_SCHEMA_VERSION,
+    require_science_contract,
 )
 from cup.synthetic.readers.depth import DepthBenchmark, DepthSyntheticSample
 from cup.synthetic.readers.time import TimeBenchmark, TimeSyntheticSample
@@ -59,6 +60,7 @@ class SynthoseisBenchmark:
                 "by the v4 canonical-increment reader."
             )
         if schema == BENCHMARK_SCHEMA_VERSION:
+            require_science_contract(manifest, label="Synthoseis benchmark manifest")
             if sample_domain == "time":
                 self._reader = TimeBenchmark(
                     self.run_dir,

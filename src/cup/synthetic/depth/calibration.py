@@ -13,6 +13,7 @@ from cup.petrel.load import import_interpretation_petrel, import_well_tops_petre
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.synthetic.reporting.figures import write_calibration_figures
+from cup.synthetic.schemas import SCIENCE_CONTRACT
 from cup.synthetic.depth.config import CALIBRATION_SCHEMA, GENERATOR_FAMILY
 from cup.synthetic.depth.calibration_adapter import (
     calibrate_depth_object_core,
@@ -474,6 +475,7 @@ def run_depth_calibration(
     if not np.isfinite(maximum_vp) or maximum_vp <= 0.0:
         raise ValueError("Calibration generation bound produces non-positive maximum Vp.")
     payload["maximum_allowed_vp_mps"] = maximum_vp
+    payload.update(SCIENCE_CONTRACT)
 
     frames = {
         "well_status.csv": pd.DataFrame.from_records(well_status),
@@ -493,6 +495,7 @@ def run_depth_calibration(
     contract_fingerprint = contract_fingerprint_sha256(
         contract_schema_version=CALIBRATION_SCHEMA,
         semantics={
+            **SCIENCE_CONTRACT,
             "sample_domain": "depth",
             "sample_unit": "m",
             "depth_basis": "tvdss",
@@ -520,6 +523,7 @@ def run_depth_calibration(
 
     summary = {
         "schema_version": CALIBRATION_SCHEMA,
+        **SCIENCE_CONTRACT,
         "status": "success",
         "sample_domain": "depth",
         "depth_basis": "tvdss",

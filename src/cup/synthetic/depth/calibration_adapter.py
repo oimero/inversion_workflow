@@ -41,35 +41,25 @@ def depth_well_zone_curves_for_object_core(
         zone_id=zone_id,
         top_horizon=top_horizon,
         bottom_horizon=bottom_horizon,
-        twt_s=np.asarray(tvdss_m, dtype=np.float64),
+        vertical_coordinate=np.asarray(tvdss_m, dtype=np.float64),
         filtered_log_ai=np.asarray(filtered_log_ai, dtype=np.float64),
         full_log_ai=np.asarray(observed_log_ai, dtype=np.float64),
-        zone_top_s=float(zone_top_tvdss_m),
-        zone_bottom_s=float(zone_bottom_tvdss_m),
+        zone_top_coordinate=float(zone_top_tvdss_m),
+        zone_bottom_coordinate=float(zone_bottom_tvdss_m),
     )
 
 
 def depth_frame_from_object_core(frame: pd.DataFrame) -> pd.DataFrame:
     """Rename object-core vertical columns back to depth-domain names."""
     return frame.rename(columns={
-        "twt_s": "tvdss_m",
-        "duration_s": "thickness_m",
-        "zone_duration_s": "zone_thickness_m",
+        "vertical_coordinate": "tvdss_m",
+        "extent": "thickness_m",
+        "zone_extent": "zone_thickness_m",
         "minimum_duration_s": "minimum_thickness_m",
         "maximum_duration_s": "maximum_thickness_m",
         "object_top_s": "object_top_tvdss_m",
         "object_bottom_s": "object_bottom_tvdss_m",
     })
-
-
-def depth_catalog_from_object_core(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    replacements = {
-        "object_top_s": "object_top_tvdss_m",
-        "object_bottom_s": "object_bottom_tvdss_m",
-        "minimum_duration_s": "minimum_thickness_m",
-        "maximum_duration_s": "maximum_thickness_m",
-    }
-    return [{replacements.get(key, key): value for key, value in record.items()} for record in records]
 
 
 def depth_catalog_from_synthetic_truth(
@@ -95,14 +85,16 @@ def depth_payload_from_object_core_calibration(
     payload = legacy.to_dict()
     payload["schema_version"] = CALIBRATION_SCHEMA
     payload["generator_family"] = GENERATOR_FAMILY
-    payload["truth_dz_m"] = float(payload.pop("truth_dt_s"))
+    payload["truth_dz_m"] = float(payload.pop("truth_sample_interval"))
+    payload.pop("axis_unit")
+    payload.pop("depth_basis")
     payload["sample_domain"] = "depth"
     payload["depth_basis"] = "tvdss"
     payload["vertical_axis_unit"] = "m"
     for model in payload["zone_models"].values():
         background = model["background"]
-        if "zone_duration_s" in background:
-            background["zone_thickness_m"] = background.pop("zone_duration_s")
+        if "zone_extent" in background:
+            background["zone_thickness_m"] = background.pop("zone_extent")
     per_zone = {
         zone_id: {
             "minimum": float(model["ai_bounds"]["p01"]),
@@ -124,18 +116,22 @@ def depth_payload_from_object_core_calibration(
 def load_depth_calibration_for_object_core(path: Path) -> tuple[ImpedanceCalibration, dict[str, Any]]:
     """Load depth storage and adapt only the object-core seam."""
     payload = _json(path)
+    from cup.synthetic.schemas import require_science_contract
+
+    require_science_contract(payload, label="depth impedance calibration")
     if payload.get("schema_version") != CALIBRATION_SCHEMA:
         raise ValueError(f"Expected {CALIBRATION_SCHEMA}, got {payload.get('schema_version')}.")
     legacy = dict(payload)
-    legacy["truth_dt_s"] = float(legacy.pop("truth_dz_m"))
     for model in legacy["zone_models"].values():
         background = model["background"]
         if "zone_thickness_m" in background:
-            background["zone_duration_s"] = background.pop("zone_thickness_m")
+            background["zone_extent"] = background.pop("zone_thickness_m")
     adapter = ImpedanceCalibration(
         schema_version=CALIBRATION_SCHEMA,
         generator_family=GENERATOR_FAMILY,
-        truth_dt_s=float(legacy["truth_dt_s"]),
+        truth_sample_interval=float(legacy["truth_dz_m"]),
+        axis_unit="m",
+        depth_basis="tvdss",
         state_threshold_sigma=float(legacy["state_threshold_sigma"]),
         ordered_horizons=tuple(legacy["ordered_horizons"]),
         zones=tuple(legacy["zones"]),
@@ -165,7 +161,9 @@ def calibrate_depth_object_core(
     """Run the current object-core calibration with depth-domain naming."""
     return calibrate_impedance(
         inputs,
-        truth_dt_s=float(truth_dz_m),
+        truth_sample_interval=float(truth_dz_m),
+        axis_unit="m",
+        depth_basis="tvdss",
         ordered_horizons=list(ordered_horizons),
         source_runs=dict(source_runs),
         input_contracts=input_contracts,
@@ -179,7 +177,6 @@ def calibrate_depth_object_core(
 
 __all__ = [
     "calibrate_depth_object_core",
-    "depth_catalog_from_object_core",
     "depth_catalog_from_synthetic_truth",
     "depth_frame_from_object_core",
     "depth_payload_from_object_core_calibration",

@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 
 from cup.physics.torch_backend import forward_depth, forward_time, velocity_from_ai
+from cup.synthetic.schemas import require_science_contract
 from cup.utils.logging import configure_run_logger
 
 
@@ -70,6 +71,7 @@ def load_benchmark_wavelet(
     manifest_path = Path(benchmark_dir) / "benchmark_manifest.json"
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
+    require_science_contract(manifest, label="GINN v2 Synthoseis benchmark")
     domain = str(manifest.get("sample_domain") or "")
     if domain == "depth":
         with _required_file(

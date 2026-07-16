@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from cup.synthetic.core.calibration import GENERATOR_FAMILY
-from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION
+from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION, SCIENCE_REVISION
 from cup.synthetic.core.config import parse_object_core_controls
 from cup.config.sources import assert_recorded_source_matches, require_source_files
 from cup.utils.io import resolve_relative_path
@@ -67,6 +67,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         {
             "sample_domain",
             "benchmark_schema",
+            "science_revision",
             "global_seed",
             "source_runs",
             "sampling",
@@ -88,6 +89,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         {
             "sample_domain",
             "benchmark_schema",
+            "science_revision",
             "global_seed",
             "source_runs",
             "sampling",
@@ -106,6 +108,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     )
     sample_domain = str(root.get("sample_domain") or "").casefold()
     benchmark_schema = str(root.get("benchmark_schema") or "")
+    science_revision = str(root.get("science_revision") or "")
     if sample_domain != "time" or benchmark_schema != DATA_SCHEMA:
         raise ValueError(
             "Time-domain Synthoseis-lite requires "
@@ -131,7 +134,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     )
     _require_keys(sampling, sampling_keys, path="synthoseis_lite.sampling")
     geometry = _mapping(root.get("geometry"), path="synthoseis_lite.geometry")
-    geometry_keys = {"lateral_sample_interval_m", "field_conditioned", "canonical"}
+    geometry_keys = {"lateral_sample_interval_m", "field_conditioned"}
     _reject_unknown(
         geometry,
         geometry_keys,
@@ -153,25 +156,6 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "Time Synthoseis-lite v4 requires geometry.field_conditioned.enabled=true."
         )
-    canonical = _mapping(
-        geometry.get("canonical"), path="synthoseis_lite.geometry.canonical"
-    )
-    canonical_keys = {
-        "enabled",
-        "lateral_sample_interval_m",
-        "lateral_samples",
-        "center_twt_s",
-        "vertical_extent_periods",
-        "thin_bed_period_ratios",
-        "wedge_transition_fraction",
-        "pinchout_termination_fraction",
-        "dip_drop_period_ratios",
-        "lateral_contrast_multipliers",
-    }
-    _reject_unknown(
-        canonical, canonical_keys, path="synthoseis_lite.geometry.canonical"
-    )
-    _require_keys(canonical, canonical_keys, path="synthoseis_lite.geometry.canonical")
     target_zone = _mapping(
         field.get("target_zone"),
         path="synthoseis_lite.geometry.field_conditioned.target_zone",
@@ -456,6 +440,10 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "Time Synthoseis v4 requires "
             "seismic_input.policy='observed_highres_forward'."
         )
+    if science_revision != SCIENCE_REVISION:
+        raise ValueError(
+            f"Time-domain Synthoseis-lite requires science_revision={SCIENCE_REVISION!r}."
+        )
     forward_qc = _mapping(root.get("forward_qc"), path="synthoseis_lite.forward_qc")
     _reject_unknown(forward_qc, {"highres_forward"}, path="synthoseis_lite.forward_qc")
     _require_keys(forward_qc, {"highres_forward"}, path="synthoseis_lite.forward_qc")
@@ -497,7 +485,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     )
     lfm_degraded_keys = {
         "constant_bias_sigma_log_ai",
-        "linear_twt_trend_sigma_log_ai",
+        "axis_trend_sigma_log_ai",
         "zonewise_bias_sigma_log_ai",
         "lateral_smooth_bias_sigma_log_ai",
         "lateral_correlation_fraction",
@@ -578,7 +566,6 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     mismatch_noise_keys = {
         "white_noise_rms_fraction",
         "colored_noise_rms_fraction",
-        "absolute_noise_rms_floor",
         "colored_time_correlation_samples",
     }
     _reject_unknown(
@@ -597,7 +584,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     mismatch_gain_keys = {
         "global_log_sigma",
         "tracewise_log_sigma",
-        "time_lateral_log_sigma",
+        "axis_lateral_log_sigma",
         "lateral_correlation_fraction",
         "time_correlation_fraction",
     }
@@ -648,6 +635,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     parsed = {
         "sample_domain": "time",
         "benchmark_schema": DATA_SCHEMA,
+        "science_revision": SCIENCE_REVISION,
         "global_seed": int(root.get("global_seed", 20260615)),
         "source_runs": source_runs,
         "sampling": {
@@ -671,47 +659,6 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 target_zone.get("outlier_min_neighbor_count", 2)
             ),
             "min_thickness_s": _optional_float(target_zone, "min_thickness_s"),
-        },
-        "canonical": {
-            "enabled": bool(canonical.get("enabled", True)),
-            "lateral_sample_interval_m": float(
-                canonical.get(
-                    "lateral_sample_interval_m",
-                    geometry.get("lateral_sample_interval_m", 25.0),
-                )
-            ),
-            "lateral_samples": int(canonical.get("lateral_samples", 128)),
-            "center_twt_s": float(canonical.get("center_twt_s", 1.5)),
-            "vertical_extent_periods": float(
-                canonical.get("vertical_extent_periods", 6.0)
-            ),
-            "thin_bed_period_ratios": [
-                float(value)
-                for value in canonical.get(
-                    "thin_bed_period_ratios",
-                    [1.0 / 16.0, 1.0 / 8.0, 1.0 / 4.0, 1.0 / 2.0, 1.0],
-                )
-            ],
-            "wedge_transition_fraction": float(
-                canonical.get("wedge_transition_fraction", 0.80)
-            ),
-            "pinchout_termination_fraction": float(
-                canonical.get("pinchout_termination_fraction", 0.75)
-            ),
-            "dip_drop_period_ratios": [
-                float(value)
-                for value in canonical.get(
-                    "dip_drop_period_ratios",
-                    [0.25, 0.5, 1.0],
-                )
-            ],
-            "lateral_contrast_multipliers": [
-                float(value)
-                for value in canonical.get(
-                    "lateral_contrast_multipliers",
-                    [0.25, 0.5, 1.0, 2.0],
-                )
-            ],
         },
         "impedance": {
             "family": str(impedance.get("family", GENERATOR_FAMILY)),
@@ -767,7 +714,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 "constant_bias_sigma_log_ai": float(
                     lfm_degraded.get("constant_bias_sigma_log_ai", 0.02)
                 ),
-                "linear_twt_trend_sigma_log_ai": float(
+                "axis_trend_sigma_log_ai": float(
                     lfm_degraded.get("linear_twt_trend_sigma_log_ai", 0.02)
                 ),
                 "zonewise_bias_sigma_log_ai": float(
@@ -785,7 +732,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 "over_smoothing": (
                     {
                         "enabled": True,
-                        "cutoff_hz": float(lfm_over_smoothing.get("cutoff_hz", 6.0)),
+                        "cycles_per_axis_unit": float(lfm_over_smoothing.get("cutoff_hz", 6.0)),
                         "numtaps": int(lfm_over_smoothing.get("numtaps", 129)),
                         "kaiser_beta": float(
                             lfm_over_smoothing.get("kaiser_beta", 8.6)
@@ -793,7 +740,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                         "blend": float(lfm_over_smoothing.get("blend", 1.0)),
                     }
                     if bool(lfm_over_smoothing["enabled"])
-                    else {"enabled": False}
+                    else {"enabled": False, "cycles_per_axis_unit": 6.0, "numtaps": 129, "kaiser_beta": 8.6, "blend": 0.0}
                 ),
                 "local_missing_control_bias": {
                     "enabled": bool(lfm_missing.get("enabled", True)),
@@ -801,7 +748,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                     "lateral_width_fraction": float(
                         lfm_missing.get("lateral_width_fraction", 0.30)
                     ),
-                    "twt_width_fraction": float(
+                    "axis_width_fraction": float(
                         lfm_missing.get("twt_width_fraction", 0.30)
                     ),
                 },
@@ -816,25 +763,22 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 "colored_noise_rms_fraction": float(
                     mismatch_noise.get("colored_noise_rms_fraction", 0.05)
                 ),
-                "absolute_noise_rms_floor": float(
-                    mismatch_noise.get("absolute_noise_rms_floor", 0.01)
-                ),
-                "colored_time_correlation_samples": float(
+                "colored_axis_correlation_length": float(
                     mismatch_noise.get("colored_time_correlation_samples", 5.0)
-                ),
+                ) * float(sampling.get("expected_output_dt_s", 0.002)),
             },
             "gain": {
                 "global_log_sigma": float(mismatch_gain.get("global_log_sigma", 0.15)),
                 "tracewise_log_sigma": float(
                     mismatch_gain.get("tracewise_log_sigma", 0.15)
                 ),
-                "time_lateral_log_sigma": float(
+                "axis_lateral_log_sigma": float(
                     mismatch_gain.get("time_lateral_log_sigma", 0.15)
                 ),
                 "lateral_correlation_fraction": float(
                     mismatch_gain.get("lateral_correlation_fraction", 0.30)
                 ),
-                "time_correlation_fraction": float(
+                "axis_correlation_fraction": float(
                     mismatch_gain.get("time_correlation_fraction", 0.25)
                 ),
             },
@@ -880,7 +824,6 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             },
         },
     }
-    _validate_canonical_config(parsed["canonical"])
     _validate_lfm_config(
         parsed["lfm"], output_dt_s=parsed["sampling"]["expected_output_dt_s"]
     )
@@ -940,33 +883,6 @@ def resolve_sources(
     return sources
 
 
-def _validate_canonical_config(config: Mapping[str, Any]) -> None:
-    if int(config["lateral_samples"]) < 8:
-        raise ValueError(
-            "synthoseis_lite.geometry.canonical.lateral_samples must be >= 8."
-        )
-    if float(config["lateral_sample_interval_m"]) <= 0.0:
-        raise ValueError("canonical lateral_sample_interval_m must be positive.")
-    if float(config["center_twt_s"]) <= 0.0:
-        raise ValueError("canonical center_twt_s must be positive.")
-    if float(config["vertical_extent_periods"]) < 2.0:
-        raise ValueError("canonical vertical_extent_periods must be >= 2.")
-    for key in (
-        "thin_bed_period_ratios",
-        "dip_drop_period_ratios",
-        "lateral_contrast_multipliers",
-    ):
-        values = list(config[key])
-        if not values or any(
-            not np.isfinite(value) or value <= 0.0 for value in values
-        ):
-            raise ValueError(f"canonical {key} must contain positive finite values.")
-    for key in ("wedge_transition_fraction", "pinchout_termination_fraction"):
-        value = float(config[key])
-        if not 0.0 < value < 1.0:
-            raise ValueError(f"canonical {key} must be within (0, 1).")
-
-
 def _validate_lfm_config(config: Mapping[str, Any], *, output_dt_s: float) -> None:
     if not bool(config["enabled"]):
         return
@@ -1003,7 +919,7 @@ def _validate_lfm_config(config: Mapping[str, Any], *, output_dt_s: float) -> No
     if not isinstance(smoothing["enabled"], bool):
         raise ValueError("lfm over_smoothing.enabled must be boolean.")
     if bool(smoothing["enabled"]):
-        over_cutoff = float(smoothing["cutoff_hz"])
+        over_cutoff = float(smoothing["cycles_per_axis_unit"])
         if not 0.0 < over_cutoff <= cutoff:
             raise ValueError(
                 "lfm over_smoothing.cutoff_hz must be within (0, ideal cutoff]."
@@ -1017,7 +933,7 @@ def _validate_lfm_config(config: Mapping[str, Any], *, output_dt_s: float) -> No
         raise ValueError(
             "lfm local_missing_control_bias.max_abs_log_ai must be nonnegative."
         )
-    for key in ("lateral_width_fraction", "twt_width_fraction"):
+    for key in ("lateral_width_fraction", "axis_width_fraction"):
         if not 0.0 < float(missing[key]) <= 1.0:
             raise ValueError(
                 f"lfm local_missing_control_bias.{key} must be within (0, 1]."
@@ -1031,12 +947,11 @@ def _validate_seismic_mismatch_config(config: Mapping[str, Any]) -> None:
     for key in (
         "white_noise_rms_fraction",
         "colored_noise_rms_fraction",
-        "absolute_noise_rms_floor",
     ):
         value = float(noise[key])
         if not np.isfinite(value) or value < 0.0:
             raise ValueError(f"seismic_mismatch.noise.{key} must be nonnegative.")
-    if float(noise["colored_time_correlation_samples"]) <= 0.0:
+    if float(noise["colored_axis_correlation_length"]) <= 0.0:
         raise ValueError(
             "seismic_mismatch.noise.colored_time_correlation_samples must be positive."
         )
@@ -1044,12 +959,12 @@ def _validate_seismic_mismatch_config(config: Mapping[str, Any]) -> None:
     for key in (
         "global_log_sigma",
         "tracewise_log_sigma",
-        "time_lateral_log_sigma",
+        "axis_lateral_log_sigma",
     ):
         value = float(gain[key])
         if not np.isfinite(value) or value < 0.0:
             raise ValueError(f"seismic_mismatch.gain.{key} must be nonnegative.")
-    for key in ("lateral_correlation_fraction", "time_correlation_fraction"):
+    for key in ("lateral_correlation_fraction", "axis_correlation_fraction"):
         value = float(gain[key])
         if not np.isfinite(value) or value <= 0.0:
             raise ValueError(f"seismic_mismatch.gain.{key} must be positive.")
@@ -1077,5 +992,3 @@ def _validate_seismic_mismatch_config(config: Mapping[str, Any]) -> None:
         raise ValueError(
             "seismic_mismatch.combined gain/noise magnitudes must be nonnegative."
         )
-
-

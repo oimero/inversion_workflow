@@ -26,6 +26,52 @@ class ArtifactReference:
     valid_mask_dataset: str
 
 
+@dataclass(frozen=True)
+class DatasetPlanItem:
+    group_path: str
+    name: str
+    values: np.ndarray
+    unit: str
+    dtype: object | None = np.float32
+
+
+def _common_dataset_plan(
+    sample: BenchmarkSample, *, amplitude_unit: str, model_consistent_dtype: object | None
+) -> tuple[DatasetPlanItem, ...]:
+    forward = sample.forward
+    return (
+        DatasetPlanItem("priors", "canonical_background_log_ai", sample.canonical_background_log_ai, "ln(m/s*g/cm3)"),
+        DatasetPlanItem("targets", "target_increment_log_ai", sample.target_increment_log_ai, "ln(m/s*g/cm3)"),
+        DatasetPlanItem("priors", "lfm_ideal", sample.input_lfm_canonical_log_ai, "ln(m/s*g/cm3)"),
+        DatasetPlanItem("priors", "lfm_controlled_degraded", sample.input_lfm_controlled_degraded_log_ai, "ln(m/s*g/cm3)"),
+        DatasetPlanItem("priors/input_lfm_variants/canonical", "log_ai", sample.input_lfm_canonical_log_ai, "ln(m/s*g/cm3)"),
+        DatasetPlanItem("priors/input_lfm_variants/controlled_default", "log_ai", sample.input_lfm_controlled_degraded_log_ai, "ln(m/s*g/cm3)"),
+        DatasetPlanItem("seismic", "seismic_observed", forward.seismic_observed, amplitude_unit),
+        DatasetPlanItem("seismic", "seismic_model_consistent", forward.seismic_model_consistent, amplitude_unit, model_consistent_dtype),
+        DatasetPlanItem("seismic", "subgrid_forward_residual", forward.subgrid_forward_residual, amplitude_unit),
+        DatasetPlanItem("residuals", "residual_vs_lfm_ideal", sample.residuals.residual_vs_lfm_ideal, "ln(m/s*g/cm3)"),
+        DatasetPlanItem("residuals", "residual_vs_lfm_controlled_degraded", sample.residuals.residual_vs_lfm_controlled_degraded, "ln(m/s*g/cm3)"),
+        DatasetPlanItem("masks", "valid_mask", sample.valid_mask, "bool", None),
+    )
+
+
+def _write_common_dataset_plan(
+    root: h5py.Group, sample: BenchmarkSample, *, sample_domain: str,
+    model_axis_path: str, axis_order: str | list[str], amplitude_unit: str,
+    model_consistent_dtype: object | None,
+) -> None:
+    for item in _common_dataset_plan(
+        sample, amplitude_unit=amplitude_unit,
+        model_consistent_dtype=model_consistent_dtype,
+    ):
+        group = root.require_group(item.group_path)
+        values = np.asarray(item.values, dtype=item.dtype) if item.dtype is not None else np.asarray(item.values)
+        _dataset(
+            group, item.name, values, unit=item.unit, sample_domain=sample_domain,
+            axis_path=model_axis_path, axis_order=axis_order,
+        )
+
+
 def _dataset(
     group: h5py.Group,
     name: str,
@@ -159,96 +205,14 @@ def _write_depth_sample(h5: h5py.File, sample: BenchmarkSample) -> ArtifactRefer
             axis_order=("lateral,tvdss,state" if np.asarray(values).ndim == 3 else "lateral,tvdss"),
         )
 
-    priors = root.create_group("priors")
-    targets = root.create_group("targets")
-    _dataset(
-        priors,
-        "canonical_background_log_ai",
-        sample.canonical_background_log_ai.astype(np.float32),
-        unit="ln(m/s*g/cm3)",
+    _write_common_dataset_plan(
+        root,
+        sample,
         sample_domain="depth",
-        axis_path=model_axis_path,
+        model_axis_path=model_axis_path,
         axis_order="lateral,tvdss",
-    )
-    _dataset(
-        targets,
-        "target_increment_log_ai",
-        sample.target_increment_log_ai.astype(np.float32),
-        unit="ln(m/s*g/cm3)",
-        sample_domain="depth",
-        axis_path=model_axis_path,
-        axis_order="lateral,tvdss",
-    )
-    for name, values in (
-        ("lfm_ideal", sample.input_lfm_canonical_log_ai),
-        ("lfm_controlled_degraded", sample.input_lfm_controlled_degraded_log_ai),
-    ):
-        _dataset(
-            priors,
-            name,
-            values.astype(np.float32),
-            unit="ln(m/s*g/cm3)",
-            sample_domain="depth",
-            axis_path=model_axis_path,
-            axis_order="lateral,tvdss",
-        )
-    input_variants = priors.create_group("input_lfm_variants")
-    for variant_id, values in (
-        ("canonical", sample.input_lfm_canonical_log_ai),
-        ("controlled_default", sample.input_lfm_controlled_degraded_log_ai),
-    ):
-        variant = input_variants.create_group(variant_id)
-        _dataset(
-            variant,
-            "log_ai",
-            values.astype(np.float32),
-            unit="ln(m/s*g/cm3)",
-            sample_domain="depth",
-            axis_path=model_axis_path,
-            axis_order="lateral,tvdss",
-        )
-
-    seismic = root.create_group("seismic")
-    for name, values in (
-        ("seismic_observed", forward.seismic_observed),
-        ("seismic_model_consistent", forward.seismic_model_consistent),
-        ("subgrid_forward_residual", forward.subgrid_forward_residual),
-    ):
-        _dataset(
-            seismic,
-            name,
-            values.astype(np.float32),
-            unit="amplitude",
-            sample_domain="depth",
-            axis_path=model_axis_path,
-            axis_order="lateral,tvdss",
-        )
-    residuals = root.create_group("residuals")
-    for name, values in (
-        ("residual_vs_lfm_ideal", sample.residuals.residual_vs_lfm_ideal),
-        (
-            "residual_vs_lfm_controlled_degraded",
-            sample.residuals.residual_vs_lfm_controlled_degraded,
-        ),
-    ):
-        _dataset(
-            residuals,
-            name,
-            values.astype(np.float32),
-            unit="ln(m/s*g/cm3)",
-            sample_domain="depth",
-            axis_path=model_axis_path,
-            axis_order="lateral,tvdss",
-        )
-    masks = root.create_group("masks")
-    _dataset(
-        masks,
-        "valid_mask",
-        sample.valid_mask,
-        unit="bool",
-        sample_domain="depth",
-        axis_path=model_axis_path,
-        axis_order="lateral,tvdss",
+        amplitude_unit="amplitude",
+        model_consistent_dtype=np.float32,
     )
     qc = root.create_group("qc")
     for key, value in sample.qc.items():
@@ -366,95 +330,15 @@ def _write_time_sample(h5: h5py.File, sample: BenchmarkSample) -> ArtifactRefere
             axis_order=["lateral", "twt_forward"],
         )
 
-    priors = root.create_group("priors")
-    targets = root.create_group("targets")
-    _dataset(
-        priors,
-        "canonical_background_log_ai",
-        sample.canonical_background_log_ai.astype(np.float32),
-        unit="ln(m/s*g/cm3)",
+    _write_common_dataset_plan(
+        root,
+        sample,
         sample_domain="time",
-        axis_path=model_axis,
+        model_axis_path=model_axis,
         axis_order=["lateral", "twt"],
+        amplitude_unit="normalized_amplitude",
+        model_consistent_dtype=None,
     )
-    _dataset(
-        targets,
-        "target_increment_log_ai",
-        sample.target_increment_log_ai.astype(np.float32),
-        unit="ln(m/s*g/cm3)",
-        sample_domain="time",
-        axis_path=model_axis,
-        axis_order=["lateral", "twt"],
-    )
-    for name, values in (
-        ("lfm_ideal", sample.input_lfm_canonical_log_ai),
-        ("lfm_controlled_degraded", sample.input_lfm_controlled_degraded_log_ai),
-    ):
-        _dataset(
-            priors,
-            name,
-            values.astype(np.float32),
-            unit="ln(m/s*g/cm3)",
-            sample_domain="time",
-            axis_path=model_axis,
-            axis_order=["lateral", "twt"],
-        )
-    variants = priors.create_group("input_lfm_variants")
-    for variant_id, values in (
-        ("canonical", sample.input_lfm_canonical_log_ai),
-        ("controlled_default", sample.input_lfm_controlled_degraded_log_ai),
-    ):
-        group = variants.create_group(variant_id)
-        _dataset(
-            group,
-            "log_ai",
-            values.astype(np.float32),
-            unit="ln(m/s*g/cm3)",
-            sample_domain="time",
-            axis_path=model_axis,
-            axis_order=["lateral", "twt"],
-        )
-
-    masks = root.create_group("masks")
-    _dataset(
-        masks,
-        "valid_mask",
-        sample.valid_mask,
-        unit="bool",
-        sample_domain="time",
-        axis_path=model_axis,
-        axis_order=["lateral", "twt"],
-    )
-    seismic = root.create_group("seismic")
-    for name, values, dtype in (
-        ("seismic_model_consistent", forward.seismic_model_consistent, None),
-        ("seismic_observed", forward.seismic_observed, np.float32),
-        ("subgrid_forward_residual", forward.subgrid_forward_residual, np.float32),
-    ):
-        array = np.asarray(values, dtype=dtype) if dtype is not None else np.asarray(values)
-        _dataset(
-            seismic,
-            name,
-            array,
-            unit="normalized_amplitude",
-            sample_domain="time",
-            axis_path=model_axis,
-            axis_order=["lateral", "twt"],
-        )
-    residuals = root.create_group("residuals")
-    for name, values in (
-        ("residual_vs_lfm_ideal", sample.residuals.residual_vs_lfm_ideal),
-        ("residual_vs_lfm_controlled_degraded", sample.residuals.residual_vs_lfm_controlled_degraded),
-    ):
-        _dataset(
-            residuals,
-            name,
-            values.astype(np.float32),
-            unit="ln(m/s*g/cm3)",
-            sample_domain="time",
-            axis_path=model_axis,
-            axis_order=["lateral", "twt"],
-        )
     qc = root.create_group("qc")
     for key, value in sample.qc.items():
         serialized = key.startswith(

@@ -16,6 +16,7 @@ from cup.synthetic.schemas import (
     DEPTH_FORWARD_MODEL_INPUTS_RUN_SCHEMA_VERSION,
     FORWARD_MODEL_INPUTS_SCHEMA_VERSION,
     ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION,
+    SCIENCE_REVISION,
 )
 from cup.synthetic.core.config import parse_object_core_controls
 from cup.utils.io import (
@@ -112,9 +113,9 @@ def load_composed_config(
 def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     root = _mapping(config.get("synthoseis_lite"), path="synthoseis_lite")
     allowed_root = {
-        "sample_domain", "benchmark_schema", "global_seed", "source_runs", "sampling", "geometry", "sections",
+        "sample_domain", "benchmark_schema", "science_revision", "global_seed", "source_runs", "sampling", "geometry", "sections",
         "calibration", "impedance_attribute_generator", "generation", "splits",
-        "seismic_input", "seismic_forward", "lfm", "seismic_mismatch", "canonical", "figures",
+        "seismic_input", "seismic_forward", "lfm", "seismic_mismatch", "figures",
     }
     if "probe_selection" in root:
         raise ValueError(
@@ -125,6 +126,10 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "Depth Synthoseis-lite v4 requires "
             f"synthoseis_lite.sample_domain='depth' and benchmark_schema={SCHEMA_VERSION!r}."
+        )
+    if str(root.get("science_revision") or "") != SCIENCE_REVISION:
+        raise ValueError(
+            f"Depth-domain Synthoseis-lite requires science_revision={SCIENCE_REVISION!r}."
         )
     seismic_input = _mapping(
         root.get("seismic_input"), path="synthoseis_lite.seismic_input"
@@ -318,11 +323,12 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
         if name == "controlled_degraded":
             for key in ("constant_bias_sigma_log_ai", "linear_vertical_trend_sigma_log_ai", "zonewise_bias_sigma_log_ai", "lateral_smooth_bias_sigma_log_ai", "lateral_correlation_fraction", "amplitude_scale_sigma"):
                 parsed_lfm[name][key] = _positive_float(item.get(key), path=f"lfm.{name}.{key}")
+            parsed_lfm[name]["axis_trend_sigma_log_ai"] = parsed_lfm[name].pop("linear_vertical_trend_sigma_log_ai")
             local = _mapping(item.get("local_missing_control_bias"), path="lfm.controlled_degraded.local_missing_control_bias")
             _reject_unknown(local, {"enabled", "max_abs_log_ai", "lateral_width_fraction", "vertical_width_fraction"}, path="lfm.controlled_degraded.local_missing_control_bias")
             if not isinstance(local.get("enabled"), bool):
                 raise ValueError("local_missing_control_bias.enabled must be boolean.")
-            parsed_lfm[name]["local_missing_control_bias"] = {"enabled": local["enabled"], "max_abs_log_ai": _positive_float(local.get("max_abs_log_ai"), path="local_missing_control_bias.max_abs_log_ai"), "lateral_width_fraction": _positive_float(local.get("lateral_width_fraction"), path="local_missing_control_bias.lateral_width_fraction"), "vertical_width_fraction": _positive_float(local.get("vertical_width_fraction"), path="local_missing_control_bias.vertical_width_fraction")}
+            parsed_lfm[name]["local_missing_control_bias"] = {"enabled": local["enabled"], "max_abs_log_ai": _positive_float(local.get("max_abs_log_ai"), path="local_missing_control_bias.max_abs_log_ai"), "lateral_width_fraction": _positive_float(local.get("lateral_width_fraction"), path="local_missing_control_bias.lateral_width_fraction"), "axis_width_fraction": _positive_float(local.get("vertical_width_fraction"), path="local_missing_control_bias.vertical_width_fraction")}
             smoothing = dict(item.get("over_smoothing") or {"enabled": False})
             _reject_unknown(
                 smoothing,
@@ -331,13 +337,13 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
             )
             if not isinstance(smoothing.get("enabled"), bool):
                 raise ValueError("lfm.controlled_degraded.over_smoothing.enabled must be boolean.")
-            parsed_lfm[name]["over_smoothing"] = {"enabled": bool(smoothing["enabled"])}
+            parsed_lfm[name]["over_smoothing"] = {"enabled": bool(smoothing["enabled"]), "cycles_per_axis_unit": 1.0 / 800.0, "numtaps": 129, "kaiser_beta": 8.6, "blend": 0.0}
             if bool(smoothing["enabled"]):
                 blend = float(smoothing.get("blend"))
                 if not 0.0 <= blend <= 1.0:
                     raise ValueError("lfm.controlled_degraded.over_smoothing.blend must be within [0, 1].")
                 parsed_lfm[name]["over_smoothing"].update({
-                    "minimum_wavelength_m": _positive_float(
+                    "cycles_per_axis_unit": 1.0 / _positive_float(
                         smoothing.get("minimum_wavelength_m"),
                         path="lfm.controlled_degraded.over_smoothing.minimum_wavelength_m",
                     ),
@@ -348,11 +354,6 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
                     "kaiser_beta": float(smoothing.get("kaiser_beta")),
                     "blend": blend,
                 })
-
-    for disabled_name in ("canonical",):
-        disabled = _mapping(root.get(disabled_name), path=f"synthoseis_lite.{disabled_name}")
-        if disabled != {"enabled": False}:
-            raise ValueError(f"Depth v4 requires {disabled_name}.enabled=false with no extra fields.")
 
     mismatch = _mapping(root.get("seismic_mismatch"), path="synthoseis_lite.seismic_mismatch")
     _reject_unknown(mismatch, {"enabled", "wavelet", "depth_static", "noise", "gain", "combined"}, path="synthoseis_lite.seismic_mismatch")
@@ -443,6 +444,7 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "schema": SCHEMA_VERSION,
         "sample_domain": "depth",
         "benchmark_schema": SCHEMA_VERSION,
+        "science_revision": SCIENCE_REVISION,
         "global_seed": int(root.get("global_seed")),
         "source_runs": {
             "well_inventory_dir": str(sources.get("well_inventory_dir") or "").strip(),

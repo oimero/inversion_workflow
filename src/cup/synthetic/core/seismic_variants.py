@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from cup.synthetic.schemas import SEISMIC_VARIANT_CONTRACT_VERSION
+
 
 SEISMIC_VARIANT_REQUIRED_FIELDS = (
     "variant_id",
@@ -33,6 +35,7 @@ def build_seismic_variant_metadata(
             + ", ".join(sorted(overlap))
         )
     return {
+        "contract_version": SEISMIC_VARIANT_CONTRACT_VERSION,
         "variant_id": variant,
         "mismatch_family": family,
         "operator_source": source,
@@ -51,6 +54,8 @@ def validate_seismic_variant_metadata(value: Mapping[str, Any]) -> dict[str, Any
     missing = [key for key in SEISMIC_VARIANT_REQUIRED_FIELDS if key not in value]
     if missing:
         raise ValueError(f"Seismic variant metadata lacks fields: {missing}")
+    if value.get("contract_version") != SEISMIC_VARIANT_CONTRACT_VERSION:
+        raise ValueError("seismic variant metadata does not use seismic_variants_v2")
     return build_seismic_variant_metadata(
         variant_id=str(value["variant_id"]),
         mismatch_family=str(value["mismatch_family"]),
@@ -58,7 +63,7 @@ def validate_seismic_variant_metadata(value: Mapping[str, Any]) -> dict[str, Any
         parameters={
             str(key): item
             for key, item in value.items()
-            if key not in SEISMIC_VARIANT_REQUIRED_FIELDS
+            if key not in (*SEISMIC_VARIANT_REQUIRED_FIELDS, "contract_version")
         },
     )
 

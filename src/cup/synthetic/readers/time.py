@@ -26,8 +26,9 @@ from cup.synthetic.core import (
     validate_training_manifest,
     validate_mask_contract,
 )
-from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION
+from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION, require_science_contract
 from cup.utils.io import require_contract_fingerprint
+from cup.synthetic.core.reader_contract import validate_benchmark_header
 
 
 SCHEMA_VERSION = BENCHMARK_SCHEMA_VERSION
@@ -143,12 +144,9 @@ class TimeBenchmark:
         actual_schema = str(
             self.manifest.get("schema") or self.manifest.get("schema_version") or ""
         )
-        if actual_schema != SCHEMA_VERSION:
-            raise ValueError(
-                f"Unsupported time Synthoseis schema {actual_schema!r}; expected {SCHEMA_VERSION!r}."
-            )
-        if str(self.manifest.get("sample_domain") or "").casefold() != "time":
-            raise ValueError("Time v4 reader requires sample_domain=time.")
+        validate_benchmark_header(
+            self.manifest, sample_domain="time", label="time benchmark manifest"
+        )
         self.mask_contract = validate_mask_contract(self.manifest.get("mask_contract") or {})
         self.increment_contract = CanonicalIncrementContract.from_mapping(
             self.manifest.get("increment_contract") or {}
@@ -198,6 +196,7 @@ class TimeBenchmark:
                 "Synthoseis v4 single_valid_mask contract rejects legacy mask columns: "
                 f"{sorted(legacy_mask_columns)}"
             )
+        require_science_contract(self.manifest, label="time benchmark manifest")
         forbidden_probe_kinds = {
             "frequency_probe",
             "frequency_probe_seismic_variant",
@@ -264,6 +263,7 @@ class TimeBenchmark:
                 )
 
         with h5py.File(self.h5_path, "r") as h5:
+            require_science_contract(h5.attrs, label="time benchmark HDF5 root")
             if (
                 h5.attrs.get("schema") != SCHEMA_VERSION
                 and h5.attrs.get("schema_version") != SCHEMA_VERSION
@@ -366,6 +366,7 @@ class TimeBenchmark:
             raise ValueError(f"source sample has empty hdf5_group: {sample_id}")
         root_path = _root_from_group(source_group)
         with h5py.File(self.h5_path, "r") as h5:
+            require_science_contract(h5.attrs, label="time benchmark HDF5 root")
             target = self._read_target(h5, source_group, source_kind)
             model_shape = tuple(np.asarray(target).shape)
             seismic = _pad_forward_to_model(

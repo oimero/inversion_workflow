@@ -21,6 +21,7 @@ from cup.synthetic.core.calibration import (
 )
 from cup.synthetic.time.config import IMPLEMENTATION_SCOPE
 from cup.synthetic.reporting.figures import write_calibration_figures
+from cup.synthetic.schemas import SCIENCE_CONTRACT
 from cup.config.workflow import WorkflowConfig
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
@@ -315,11 +316,11 @@ def build_calibration_inputs(
                         zone_id=f"{top_name}__to__{bottom_name}",
                         top_horizon=top_name,
                         bottom_horizon=bottom_name,
-                        twt_s=centers[valid],
+                        vertical_coordinate=centers[valid],
                         filtered_log_ai=filtered_values[valid],
                         full_log_ai=full_values[valid],
-                        zone_top_s=top,
-                        zone_bottom_s=bottom,
+                        zone_top_coordinate=top,
+                        zone_bottom_coordinate=bottom,
                     )
                 )
                 zone_count += 1
@@ -385,7 +386,9 @@ def run_calibration(
     calibration, objects, qc, samples, backgrounds, profile_samples = (
         calibrate_impedance(
             inputs,
-            truth_dt_s=float(input_qc["truth_dt_s"]),
+            truth_sample_interval=float(input_qc["truth_dt_s"]),
+            axis_unit="s",
+            depth_basis=None,
             ordered_horizons=[item["name"] for item in script_cfg["horizons"]],
             source_runs={
                 key: repo_relative_path(path, root=repo_root)
@@ -413,16 +416,28 @@ def run_calibration(
     samples_path = output_dir / "well_calibration_samples.csv"
     backgrounds_path = output_dir / "well_background_fits.csv"
     profile_samples_path = output_dir / "well_object_profile_samples.csv"
-    objects.to_csv(objects_path, index=False)
+    time_names = {
+        "vertical_coordinate": "twt_s",
+        "extent": "duration_s",
+        "zone_extent": "zone_duration_s",
+    }
+    objects.rename(columns=time_names).to_csv(objects_path, index=False)
     qc.to_csv(qc_path, index=False)
-    samples.to_csv(samples_path, index=False)
-    backgrounds.to_csv(backgrounds_path, index=False)
-    profile_samples.to_csv(profile_samples_path, index=False)
+    samples.rename(columns=time_names).to_csv(samples_path, index=False)
+    backgrounds.rename(columns=time_names).to_csv(backgrounds_path, index=False)
+    profile_samples.rename(columns=time_names).to_csv(profile_samples_path, index=False)
     pd.DataFrame.from_records(input_qc["well_status"]).to_csv(status_path, index=False)
     pd.DataFrame.from_records(input_qc["well_horizon_consistency"]).to_csv(
         horizon_consistency_path, index=False
     )
     payload = calibration.to_dict()
+    payload["truth_dt_s"] = float(payload.pop("truth_sample_interval"))
+    payload.pop("axis_unit")
+    payload.pop("depth_basis")
+    for model in payload["zone_models"].values():
+        background = model["background"]
+        background["zone_duration_s"] = background.pop("zone_extent")
+    payload.update(SCIENCE_CONTRACT)
     payload["sample_domain"] = "time"
     payload["config_provenance"] = dict(config_provenance)
     calibration_path = output_dir / "impedance_calibration.json"
@@ -430,8 +445,9 @@ def run_calibration(
     contract_fingerprint = contract_fingerprint_sha256(
         contract_schema_version=CALIBRATION_SCHEMA,
         semantics={
+            **SCIENCE_CONTRACT,
             "sample_domain": "time",
-            "truth_dt_s": calibration.truth_dt_s,
+            "truth_dt_s": calibration.truth_sample_interval,
             "ordered_horizons": list(calibration.ordered_horizons),
             "generator_family": calibration.generator_family,
             "calibration_model": calibration.to_dict(),
@@ -452,6 +468,7 @@ def run_calibration(
     )
     summary = {
         "schema_version": CALIBRATION_SCHEMA,
+        **SCIENCE_CONTRACT,
         "status": "success",
         "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
         "contract_fingerprint_sha256": contract_fingerprint,

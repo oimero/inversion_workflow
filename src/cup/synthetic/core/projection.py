@@ -1,78 +1,12 @@
-"""Domain-neutral truth projection with frozen time and depth policies."""
+"""Domain-neutral finite-support truth projection for science v2."""
 
 from __future__ import annotations
 
 import numpy as np
-from scipy.signal import firwin, resample_poly
-
-from cup.synthetic.core.records import ProjectedTruth, ProjectionPolicy, SampleAxis
+from cup.synthetic.core.records import ProjectedTruth, SampleAxis
 from cup.synthetic.core.rejections import ProjectionRejected
+from cup.synthetic.core.signal import finite_support_fir, valid_filter_decimate
 from cup.synthetic.core.truth import SyntheticTruth
-
-
-def time_projection_policy() -> ProjectionPolicy:
-    return ProjectionPolicy(
-        continuous_method="scipy_resample_poly",
-        edge_mode="line",
-        support_mode="full",
-        antialias_taps_per_factor=32,
-        cutoff_output_nyquist_fraction=0.9,
-        kaiser_beta=8.6,
-        geometric_valid_mode="categorical_window_any",
-    )
-
-
-def depth_projection_policy() -> ProjectionPolicy:
-    return ProjectionPolicy(
-        continuous_method="valid_fir_decimate",
-        edge_mode="finite_support",
-        support_mode="valid_fir",
-        antialias_taps_per_factor=32,
-        cutoff_output_nyquist_fraction=0.9,
-        kaiser_beta=8.6,
-        geometric_valid_mode="point_sample_highres",
-    )
-
-
-def _antialias_taps(factor: int, policy: ProjectionPolicy) -> np.ndarray:
-    count = int(policy.antialias_taps_per_factor) * factor + 1
-    if count % 2 == 0:
-        raise ProjectionRejected(
-            ["invalid_antialias_filter"],
-            diagnostics={"factor": factor, "tap_count": count},
-            details=[{"reason": "invalid_antialias_filter", "tap_count": count}],
-        )
-    return firwin(
-        count,
-        float(policy.cutoff_output_nyquist_fraction) / factor,
-        window=("kaiser", float(policy.kaiser_beta)),
-        scale=True,
-    ).astype(np.float64)
-
-
-def _valid_filter_decimate(
-    values: np.ndarray,
-    *,
-    factor: int,
-    taps: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    data = np.asarray(values, dtype=np.float64)
-    n_model = (data.shape[-1] - 1) // factor + 1
-    output = data[..., ::factor].copy()
-    valid = np.zeros(n_model, dtype=bool)
-    half = taps.size // 2
-    model_high_indices = np.arange(n_model, dtype=np.int64) * factor
-    supported = (model_high_indices >= half) & (
-        model_high_indices < data.shape[-1] - half
-    )
-    flat_input = data.reshape((-1, data.shape[-1]))
-    flat_output = output.reshape((-1, n_model))
-    for row_index, row in enumerate(flat_input):
-        filtered = np.convolve(row, taps, mode="valid")
-        centers = model_high_indices[supported] - half
-        flat_output[row_index, supported] = filtered[centers]
-    valid[supported] = True
-    return output, valid
 
 
 def _categorical_model_grids(
@@ -93,8 +27,10 @@ def _categorical_model_grids(
     valid = np.zeros((n_lateral, n_model), dtype=bool)
     for model_index in range(n_model):
         center = model_index * factor
-        start = max(0, center - factor // 2)
-        end = min(n_highres, center + factor // 2 + 1)
+        left = factor // 2
+        right = factor - left
+        start = max(0, center - left)
+        end = min(n_highres, center + right + 1)
         for lateral_index in range(n_lateral):
             states = state_highres[lateral_index, start:end]
             objects = object_highres[lateral_index, start:end]
@@ -145,66 +81,29 @@ def _projection_factor(truth: SyntheticTruth, model_axis: SampleAxis) -> int:
 def project_truth_to_model_grid(
     truth: SyntheticTruth,
     axis: SampleAxis,
-    policy: ProjectionPolicy,
 ) -> ProjectedTruth:
-    """Project high-resolution scientific truth using one frozen domain policy."""
+    """Project truth with the single finite-support science-v2 operator."""
     factor = _projection_factor(truth, axis)
-    taps = _antialias_taps(factor, policy)
+    taps = finite_support_fir(factor)
     n_model = axis.coordinates.size
     n_lateral = truth.lateral_m.size
 
-    if policy.continuous_method == "scipy_resample_poly":
-        model_log_ai = np.asarray(
-            resample_poly(
-                truth.log_ai_highres,
-                up=1,
-                down=factor,
-                axis=-1,
-                window=taps,
-                padtype="line",
-            ),
-            dtype=np.float64,
-        )[..., :n_model]
-        rgt_model = np.asarray(
-            resample_poly(
-                truth.rgt_highres,
-                up=1,
-                down=factor,
-                axis=-1,
-                window=taps,
-                padtype="line",
-            ),
-            dtype=np.float64,
-        )[..., :n_model]
-        model_support_1d = np.ones(n_model, dtype=bool)
-        high_support_1d = np.ones(truth.highres_axis.size, dtype=bool)
-    elif policy.continuous_method == "valid_fir_decimate":
-        model_log_ai, model_support_1d = _valid_filter_decimate(
+    model_log_ai, model_support_1d = valid_filter_decimate(
             truth.log_ai_highres, factor=factor, taps=taps
         )
-        rgt_model, rgt_support = _valid_filter_decimate(
+    rgt_model, rgt_support = valid_filter_decimate(
             truth.rgt_highres, factor=factor, taps=taps
         )
-        if not np.array_equal(model_support_1d, rgt_support):
-            raise ProjectionRejected(
-                ["projection_support_mismatch"],
-                diagnostics={},
-                details=[{"reason": "projection_support_mismatch"}],
-            )
-        half = taps.size // 2
-        high_support_1d = np.zeros(truth.highres_axis.size, dtype=bool)
-        high_support_1d[half : truth.highres_axis.size - half] = True
-    else:  # guarded by ProjectionPolicy
-        raise AssertionError(policy.continuous_method)
+    if not np.array_equal(model_support_1d, rgt_support):
+        raise ProjectionRejected(["projection_support_mismatch"], diagnostics={}, details=[{"reason": "projection_support_mismatch"}])
+    half = taps.size // 2
+    high_support_1d = np.zeros(truth.highres_axis.size, dtype=bool)
+    high_support_1d[half : truth.highres_axis.size - half] = True
 
     fractions, dominant, zones, boundary_fraction, categorical_valid = (
         _categorical_model_grids(truth, factor=factor, n_model=n_model)
     )
-    geometric_valid = (
-        categorical_valid
-        if policy.geometric_valid_mode == "categorical_window_any"
-        else truth.state_id_highres[:, ::factor] >= 0
-    )
+    geometric_valid = truth.state_id_highres[:, ::factor] >= 0
     return ProjectedTruth(
         model_axis=axis,
         model_target_log_ai=model_log_ai,
@@ -226,7 +125,5 @@ def project_truth_to_model_grid(
 
 
 __all__ = [
-    "depth_projection_policy",
     "project_truth_to_model_grid",
-    "time_projection_policy",
 ]

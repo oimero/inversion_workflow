@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from scipy.signal import firwin, resample_poly
+from scipy.signal import resample_poly
 
 from cup.physics.numpy_backend import forward_time
+from cup.synthetic.core.signal import finite_support_fir, valid_filter_decimate
 
 
 def antialias_taps(
@@ -20,57 +21,9 @@ def antialias_taps(
 ) -> np.ndarray:
     if factor < 1:
         raise ValueError("factor must be positive.")
-    return firwin(
-        taps_per_factor * factor + 1,
-        cutoff_output_nyquist_fraction / factor,
-        window=("kaiser", kaiser_beta),
-        scale=True,
-    ).astype(np.float64)
-
-
-def downsample_continuous(values: np.ndarray, factor: int, taps: np.ndarray) -> np.ndarray:
-    return np.asarray(
-        resample_poly(values, up=1, down=factor, axis=-1, window=taps, padtype="line"),
-        dtype=np.float64,
-    )
-
-
-def categorical_model_grids(
-    state_highres: np.ndarray,
-    object_highres: np.ndarray,
-    zone_highres: np.ndarray,
-    boundary_highres: np.ndarray,
-    factor: int,
-    n_model: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    n_lateral, n_highres = state_highres.shape
-    fractions = np.zeros((n_lateral, n_model, 3), dtype=np.float32)
-    dominant = np.full((n_lateral, n_model), -1, dtype=np.int32)
-    zone_model = np.full((n_lateral, n_model), -1, dtype=np.int16)
-    boundary_fraction = np.zeros((n_lateral, n_model), dtype=np.float32)
-    valid = np.zeros((n_lateral, n_model), dtype=bool)
-    for model_index in range(n_model):
-        center = model_index * factor
-        start = max(0, center - factor // 2)
-        end = min(n_highres, center + factor // 2 + 1)
-        for lateral_index in range(n_lateral):
-            states = state_highres[lateral_index, start:end]
-            objects = object_highres[lateral_index, start:end]
-            zones = zone_highres[lateral_index, start:end]
-            finite = states >= 0
-            if not np.any(finite):
-                continue
-            valid[lateral_index, model_index] = True
-            for state in range(3):
-                fractions[lateral_index, model_index, state] = np.mean(states[finite] == state)
-            object_values, object_counts = np.unique(objects[finite], return_counts=True)
-            dominant[lateral_index, model_index] = int(object_values[np.argmax(object_counts)])
-            zone_values, zone_counts = np.unique(zones[finite], return_counts=True)
-            zone_model[lateral_index, model_index] = int(zone_values[np.argmax(zone_counts)])
-            boundary_fraction[lateral_index, model_index] = float(
-                np.mean(boundary_highres[lateral_index, start:end])
-            )
-    return fractions, dominant, zone_model, boundary_fraction, valid
+    if (taps_per_factor, cutoff_output_nyquist_fraction, kaiser_beta) != (32, 0.9, 8.6):
+        raise ValueError("science v2 uses one fixed antialias filter")
+    return finite_support_fir(factor)
 
 
 @dataclass(frozen=True)
@@ -84,6 +37,7 @@ class HighresWavelet:
 @dataclass(frozen=True)
 class HighresForwardResult:
     seismic_model_grid: np.ndarray
+    decimation_support_1d: np.ndarray
     qc: dict[str, Any]
 
 
@@ -192,14 +146,14 @@ def highres_forward_to_model_grid(
         highres_wavelet.amplitude,
     )
     aligned = highres
-    downsampled = downsample_continuous(
-        aligned,
-        factor,
-        highres_wavelet.filter_taps,
-    )[..., : reference.shape[-1]]
+    downsampled, decimation_support = valid_filter_decimate(
+        aligned, factor=factor, taps=highres_wavelet.filter_taps
+    )
+    downsampled = downsampled[..., : reference.shape[-1]]
+    decimation_support = decimation_support[: reference.shape[-1]]
     if downsampled.shape != reference.shape:
         raise ValueError("invalid_highres_forward_alignment")
-    mask = valid & np.isfinite(reference) & np.isfinite(downsampled)
+    mask = valid & decimation_support[None, :] & np.isfinite(reference) & np.isfinite(downsampled)
     if np.count_nonzero(mask) < 3:
         raise ValueError("insufficient_highres_forward_qc_samples")
     ref_values = reference[mask]
@@ -248,7 +202,11 @@ def highres_forward_to_model_grid(
             np.linalg.norm(highres_wavelet.amplitude)
         ),
     }
-    return HighresForwardResult(seismic_model_grid=downsampled, qc=qc)
+    return HighresForwardResult(
+        seismic_model_grid=downsampled,
+        decimation_support_1d=decimation_support,
+        qc=qc,
+    )
 
 
 def model_grid_closure_qc(

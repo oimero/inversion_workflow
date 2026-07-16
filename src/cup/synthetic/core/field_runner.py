@@ -1,4 +1,4 @@
-"""Shared preflight, progress, and acceptance-QC support for Synthoseis."""
+"""Shared field-conditioned attempt lifecycle and acceptance runner."""
 
 from __future__ import annotations
 
@@ -359,6 +359,22 @@ def acceptance_enforcement(qc_config: Mapping[str, Any]) -> str:
     return value
 
 
+def stable_records_frame(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    columns: Sequence[str] | None = None,
+    sort_by: Sequence[str] = (),
+) -> pd.DataFrame:
+    """Materialize a deterministic table without guessing missing schema fields."""
+    frame = pd.DataFrame.from_records(records, columns=columns)
+    keys = [key for key in sort_by if key in frame.columns]
+    if not frame.empty and keys:
+        frame = frame.sort_values(
+            keys, kind="mergesort", na_position="last", ignore_index=True
+        )
+    return frame
+
+
 __all__ = [
     "AttemptProgressLog",
     "PreflightResult",
@@ -366,4 +382,5 @@ __all__ = [
     "build_acceptance_catalog",
     "configure_generation_logger",
     "run_attempt_preflight",
+    "stable_records_frame",
 ]

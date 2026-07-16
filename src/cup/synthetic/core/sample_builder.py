@@ -55,9 +55,8 @@ class BenchmarkBuilder:
         projected = project_truth_to_model_grid(
             truth,
             preparation.model_axis,
-            preparation.projection_policy,
         )
-        if lfm_policy.algorithm == "time" and lfm_policy.zone_id_model is None:
+        if lfm_policy.zone_id_model is None:
             lfm_policy = replace(
                 lfm_policy, zone_id_model=projected.zone_id_model
             )
@@ -131,7 +130,7 @@ class BenchmarkBuilder:
             qc={
                 **dict(truth.diagnostics),
                 **dict(forward.qc),
-                **(dict(lfm.qc or {}) if lfm_policy.algorithm == "time" else {}),
+                **dict(lfm.qc),
             },
             domain_metadata=dict(build_policy.domain_metadata),
         )

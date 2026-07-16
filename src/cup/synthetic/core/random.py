@@ -15,17 +15,37 @@ class RandomNamespace:
     """Stable namespace prefix for all named scientific random streams."""
 
     benchmark_version: str
+    science_revision: str
+    random_stream_contract_version: str
     generator_family: str
 
     def __post_init__(self) -> None:
-        if not self.benchmark_version.strip() or not self.generator_family.strip():
+        if not all(
+            value.strip()
+            for value in (
+                self.benchmark_version,
+                self.science_revision,
+                self.random_stream_contract_version,
+                self.generator_family,
+            )
+        ):
             raise ValueError("random namespace fields must be non-empty.")
+
+    def keys(self) -> dict[str, str]:
+        return {
+            "benchmark_version": self.benchmark_version,
+            "science_revision": self.science_revision,
+            "random_stream_contract_version": self.random_stream_contract_version,
+            "generator_family": self.generator_family,
+        }
 
 
 def named_seed(
     *,
     global_seed: int,
     benchmark_version: str,
+    science_revision: str,
+    random_stream_contract_version: str,
     generator_family: str,
     stream_purpose: str,
     realization_id: str = "",
@@ -38,6 +58,8 @@ def named_seed(
     payload = [
         str(int(global_seed)),
         str(benchmark_version),
+        str(science_revision),
+        str(random_stream_contract_version),
         str(generator_family),
         str(stream_purpose),
         str(realization_id),

@@ -7,11 +7,10 @@ from typing import Any, Mapping
 
 import numpy as np
 import scipy
-from scipy.signal import firwin
 
 from cup.physics.execution import DepthForwardExecutor
 from cup.physics.numpy_backend import velocity_from_ai
-from cup.synthetic.core.projection import depth_projection_policy
+from cup.synthetic.core.signal import finite_support_fir, required_context, valid_filter_decimate
 from cup.synthetic.core.records import (
     DepthForwardExtras,
     DomainPreparation,
@@ -36,41 +35,6 @@ class DepthForwardConfiguration:
     maximum_allowed_vp_mps: float
 
 
-def _antialias_taps(config: Mapping[str, Any], factor: int) -> np.ndarray:
-    count = int(config["taps_per_factor"]) * factor + 1
-    if count % 2 == 0:
-        raise ValueError("Depth antialias FIR must have odd length.")
-    return firwin(
-        count,
-        float(config["cutoff_output_nyquist_fraction"]) / factor,
-        window=("kaiser", float(config["kaiser_beta"])),
-        scale=True,
-    ).astype(np.float64)
-
-
-def _valid_filter_decimate(
-    values: np.ndarray,
-    *,
-    factor: int,
-    taps: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    data = np.asarray(values, dtype=np.float64)
-    n_model = (data.shape[-1] - 1) // factor + 1
-    output = data[..., ::factor].copy()
-    valid = np.zeros(n_model, dtype=bool)
-    half = taps.size // 2
-    model_high_indices = np.arange(n_model, dtype=np.int64) * factor
-    supported = (model_high_indices >= half) & (
-        model_high_indices < data.shape[-1] - half
-    )
-    for row_index, row in enumerate(data.reshape((-1, data.shape[-1]))):
-        filtered = np.convolve(row, taps, mode="valid")
-        centers = model_high_indices[supported] - half
-        output.reshape((-1, n_model))[row_index, supported] = filtered[centers]
-    valid[supported] = True
-    return output, valid
-
-
 class DepthForwardAdapter:
     def prepare(
         self,
@@ -89,12 +53,24 @@ class DepthForwardAdapter:
         factor = int(vertical_oversampling_factor)
         model_dz = float(model_dz_m)
         high_dz = model_dz / factor
-        taps = _antialias_taps(antialias_config, factor)
+        expected = {
+            "taps_per_factor": 32,
+            "cutoff_output_nyquist_fraction": 0.9,
+            "kaiser_beta": 8.6,
+        }
+        for key, value in expected.items():
+            if not np.isclose(float(antialias_config[key]), value, rtol=0.0, atol=1e-12):
+                raise ValueError(f"sampling.antialias.{key} must equal science-v2 value {value}")
+        taps = finite_support_fir(factor)
         antialias_half_m = (taps.size // 2) * high_dz
         wavelet_half_s = float(np.max(np.abs(wavelet_time_s)))
         maximum_vp = float(maximum_allowed_vp_mps)
         halo = np.ceil((0.5 * maximum_vp * wavelet_half_s) / model_dz) * model_dz
-        context = float(halo + antialias_half_m)
+        context = required_context(
+            projection_fir_half_width=antialias_half_m,
+            forward_input_halo=float(halo),
+            observed_decimation_fir_half_width=antialias_half_m,
+        )
         survey_axis = np.asarray(survey_axis_m, dtype=np.float64)
         origin = float(survey_axis[0])
         horizons = np.asarray(horizon_tvdss_m, dtype=np.float64)
@@ -121,7 +97,6 @@ class DepthForwardAdapter:
                 depth_basis="tvdss",
             ),
             required_context_extent=context,
-            projection_policy=depth_projection_policy(),
             forward_configuration=DepthForwardConfiguration(
                 wavelet_time_s=np.asarray(wavelet_time_s, dtype=np.float64),
                 wavelet=np.asarray(wavelet, dtype=np.float64),
@@ -165,7 +140,7 @@ class DepthForwardAdapter:
             config.wavelet_time_s,
             config.wavelet,
         )
-        seismic_observed, observed_support_1d = _valid_filter_decimate(
+        seismic_observed, observed_support_1d = valid_filter_decimate(
             seismic_high,
             factor=factor,
             taps=config.antialias_taps,

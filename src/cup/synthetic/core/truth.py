@@ -153,6 +153,8 @@ def _rng_keys(
     return {
         "global_seed": int(global_seed),
         "benchmark_version": namespace.benchmark_version,
+        "science_revision": namespace.science_revision,
+        "random_stream_contract_version": namespace.random_stream_contract_version,
         "generator_family": namespace.generator_family,
         "stream_purpose": stream_purpose,
         "realization_id": realization_id,
@@ -655,7 +657,7 @@ def generate_field_conditioned_truth(
     if horizons.shape != (lateral.size, len(calibration.ordered_horizons)):
         raise ValueError("horizon shape does not match lateral samples and calibrated horizons.")
     highres_interval = output_interval / factor
-    if not np.isclose(highres_interval, calibration.truth_dt_s, rtol=0.0, atol=1e-12):
+    if not np.isclose(highres_interval, calibration.truth_sample_interval, rtol=0.0, atol=1e-12):
         raise ValueError("impedance_calibration_source_mismatch:truth_dt")
     if vertical_axis_origin is None:
         start_coordinate = (

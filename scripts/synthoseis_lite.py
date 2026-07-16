@@ -33,12 +33,12 @@ from cup.synthetic.depth.config import (  # noqa: E402
     resolve_depth_sources,
 )
 from cup.synthetic.depth.generation import run_depth_generation  # noqa: E402
-from cup.synthetic.workflow import (  # noqa: E402
+from cup.synthetic.time.calibration_pipeline import run_calibration  # noqa: E402
+from cup.synthetic.time.config import (  # noqa: E402
     parse_synthoseis_config,
     resolve_sources,
-    run_calibration,
-    run_generation,
 )
+from cup.synthetic.time.pipeline import run_generation  # noqa: E402
 from cup.utils.io import (  # noqa: E402
     load_yaml_config,
     repo_relative_path,

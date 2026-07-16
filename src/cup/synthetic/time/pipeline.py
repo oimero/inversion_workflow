@@ -56,7 +56,7 @@ from cup.synthetic.time.geometry import build_section_geometries
 from cup.synthetic.time.sample_builder import (
     build_time_field_sample,
 )
-from cup.synthetic.time.seismic_variants import generate_seismic_variants
+from cup.synthetic.core.variant_runner import generate_seismic_variants
 from cup.synthetic.schemas import SCIENCE_CONTRACT, require_science_contract
 from cup.physics.numpy_backend import forward_time
 from cup.synthetic.core.signal import finite_support_fir, valid_filter_decimate

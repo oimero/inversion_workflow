@@ -872,7 +872,9 @@ def run_generation(
             "time", operator="time_forward_highres_wavelet_antialias"
         ),
         "lfm_degradation": build_lfm_degradation_metadata(
-            "time", axis_unit="s"
+            "time",
+            axis_unit="s",
+            component_values=script_cfg["lfm"]["controlled_degraded"],
         ),
         "input_lfm_variants": ["canonical", "controlled_default"],
         "lfm_contract": build_lfm_producer_contract(

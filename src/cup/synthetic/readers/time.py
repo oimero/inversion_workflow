@@ -26,7 +26,11 @@ from cup.synthetic.core import (
     validate_training_manifest,
     validate_mask_contract,
 )
-from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION, require_science_contract
+from cup.synthetic.schemas import (
+    BENCHMARK_SCHEMA_VERSION,
+    SEISMIC_VARIANT_CONTRACT_VERSION,
+    require_science_contract,
+)
 from cup.utils.io import require_contract_fingerprint
 from cup.synthetic.core.reader_contract import validate_benchmark_header
 
@@ -239,6 +243,7 @@ class TimeBenchmark:
             ):
                 continue
             variant_metadata = {
+                "contract_version": SEISMIC_VARIANT_CONTRACT_VERSION,
                 "variant_id": _clean_path(row.get("seismic_variant_id")),
                 "mismatch_family": _clean_path(row.get("seismic_mismatch_family")),
                 "operator_source": _clean_path(
@@ -297,6 +302,13 @@ class TimeBenchmark:
                     )
                 if str(row.get("sample_kind") or "") in SEISMIC_VARIANT_KINDS:
                     group = h5[group_path]
+                    if (
+                        group.attrs.get("contract_version")
+                        != SEISMIC_VARIANT_CONTRACT_VERSION
+                    ):
+                        raise ValueError(
+                            "Variant HDF5 group does not use seismic_variants_v2."
+                        )
                     for column, attribute in (
                         ("seismic_variant_id", "variant_id"),
                         ("seismic_mismatch_family", "mismatch_family"),

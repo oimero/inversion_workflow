@@ -1113,7 +1113,9 @@ def run_depth_generation(
         ),
         "seismic_forward": forward_executor.manifest_fields,
         "lfm_degradation": build_lfm_degradation_metadata(
-            "depth", axis_unit="m"
+            "depth",
+            axis_unit="m",
+            component_values=script_cfg["lfm"]["controlled_degraded"],
         ),
         "input_lfm_variants": ["canonical", "controlled_default"],
         "lfm_contract": build_lfm_producer_contract(

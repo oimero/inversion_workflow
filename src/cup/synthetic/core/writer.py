@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any
+from typing import Any, Mapping
 
 import h5py
 import numpy as np
@@ -16,6 +16,7 @@ from cup.synthetic.core.records import (
     DepthForwardExtras,
     TimeForwardExtras,
 )
+from cup.synthetic.schemas import SEISMIC_VARIANT_CONTRACT_VERSION
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,20 @@ def _dataset(
         axis_path=axis_path,
         axis_order=axis_order,
     )
+
+
+def serialize_qc_attributes(qc_values: Mapping[str, Any]) -> dict[str, Any]:
+    """Select the domain-neutral scalar QC surface persisted in HDF5."""
+    return {
+        str(key): value
+        for key, value in qc_values.items()
+        if np.isscalar(value) and not isinstance(value, (dict, list, tuple))
+    }
+
+
+def _write_qc_attributes(group: h5py.Group, qc_values: Mapping[str, Any]) -> None:
+    for key, value in serialize_qc_attributes(qc_values).items():
+        group.attrs[key] = value
 
 
 def _write_depth_sample(h5: h5py.File, sample: BenchmarkSample) -> ArtifactReference:
@@ -215,9 +230,7 @@ def _write_depth_sample(h5: h5py.File, sample: BenchmarkSample) -> ArtifactRefer
         model_consistent_dtype=np.float32,
     )
     qc = root.create_group("qc")
-    for key, value in sample.qc.items():
-        if np.isscalar(value) and not isinstance(value, (dict, list, tuple)):
-            qc.attrs[key] = value
+    _write_qc_attributes(qc, sample.qc)
     return ArtifactReference(
         hdf5_group=path,
         seismic_input_dataset=f"{path}/seismic/seismic_observed",
@@ -340,12 +353,7 @@ def _write_time_sample(h5: h5py.File, sample: BenchmarkSample) -> ArtifactRefere
         model_consistent_dtype=None,
     )
     qc = root.create_group("qc")
-    for key, value in sample.qc.items():
-        serialized = key.startswith(
-            ("model_grid_", "highres_", "lfm_", "residual_vs_")
-        ) and not key.startswith("model_grid_closure_") and key != "highres_forward_reasons"
-        if serialized and np.isscalar(value) and not isinstance(value, (dict, list, tuple)):
-            qc.attrs[key] = value
+    _write_qc_attributes(qc, sample.qc)
     return ArtifactReference(
         hdf5_group=path,
         seismic_input_dataset=f"{path}/seismic/seismic_observed",
@@ -372,6 +380,7 @@ def write_benchmark_variant(
     group = variants.create_group(variant.variant_id)
     metadata = dict(variant.metadata)
     group.attrs["variant_id"] = variant.variant_id
+    group.attrs["contract_version"] = SEISMIC_VARIANT_CONTRACT_VERSION
     group.attrs["mismatch_family"] = str(metadata["mismatch_family"])
     group.attrs["operator_source"] = str(metadata["operator_source"])
     group.attrs["parameters_json"] = json.dumps(
@@ -401,10 +410,8 @@ def write_benchmark_variant(
             axis_path=axis_path,
             axis_order=axis_order,
         )
-    if variant.sample_domain == "time":
-        qc = group.create_group("qc")
-        for key, value in variant.qc.items():
-            qc.attrs[key] = value
+    qc = group.create_group("qc")
+    _write_qc_attributes(qc, variant.qc)
     path = f"{owner_path}/seismic_variants/{variant.variant_id}"
     return ArtifactReference(
         hdf5_group=path,
@@ -416,6 +423,7 @@ def write_benchmark_variant(
 
 __all__ = [
     "ArtifactReference",
+    "serialize_qc_attributes",
     "write_benchmark_sample",
     "write_benchmark_variant",
 ]

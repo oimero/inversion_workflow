@@ -20,6 +20,16 @@ LFM_COMPONENT_ORDER = (
     "amplitude_scale", "local_missing_control_bias", "over_smoothing",
     "canonicalize_degradation_once",
 )
+LFM_POLICY_FIELDS = (
+    "constant_bias_sigma_log_ai",
+    "axis_trend_sigma_log_ai",
+    "zonewise_bias_sigma_log_ai",
+    "lateral_smooth_bias_sigma_log_ai",
+    "lateral_correlation_fraction",
+    "amplitude_scale_sigma",
+    "local_missing_control_bias",
+    "over_smoothing",
+)
 
 
 @dataclass(frozen=True)
@@ -225,6 +235,9 @@ def build_lfm_products(
     for array in (ideal, increment, degraded, residual_ideal, residual_degraded):
         array[~valid] = np.nan
     qc.update({
+        "lfm_component_canonicalize_degradation_once_rms": centered_rms(
+            degradation, valid
+        ),
         "lfm_valid_sample_count": int(np.count_nonzero(valid)),
         "lfm_ideal_rms": centered_rms(ideal, valid),
         "lfm_controlled_degraded_rms": centered_rms(degraded, valid),
@@ -235,7 +248,18 @@ def build_lfm_products(
     return LfmProducts(ideal, increment, degraded, residual_ideal, residual_degraded, qc)
 
 
-def build_lfm_degradation_metadata(sample_domain: str, *, axis_unit: str, component_values: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def normalized_lfm_component_values(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only the materialized policy fields consumed by science v2."""
+    missing = [key for key in LFM_POLICY_FIELDS if key not in value]
+    if missing:
+        raise ValueError(f"controlled LFM policy lacks fields: {missing}")
+    return {
+        key: dict(value[key]) if isinstance(value[key], Mapping) else value[key]
+        for key in LFM_POLICY_FIELDS
+    }
+
+
+def build_lfm_degradation_metadata(sample_domain: str, *, axis_unit: str, component_values: Mapping[str, Any]) -> dict[str, Any]:
     domain = str(sample_domain).casefold()
     if (domain, axis_unit) not in {("time", "s"), ("depth", "m")}:
         raise ValueError("LFM domain/unit must be time/s or depth/m")
@@ -243,22 +267,34 @@ def build_lfm_degradation_metadata(sample_domain: str, *, axis_unit: str, compon
         "contract_version": LFM_DEGRADATION_CONTRACT_VERSION,
         "sample_domain": domain, "axis_unit": axis_unit,
         "variant_ids": list(LFM_VARIANT_IDS), "component_order": list(LFM_COMPONENT_ORDER),
-        "component_values": dict(component_values or {}),
+        "component_values": normalized_lfm_component_values(component_values),
         "canonicalization": "canonical_lowpass_difference_once",
     }
 
 
 def validate_lfm_degradation_metadata(value: Mapping[str, Any], *, sample_domain: str) -> dict[str, Any]:
-    expected = build_lfm_degradation_metadata(sample_domain, axis_unit="s" if sample_domain == "time" else "m")
     for key in ("contract_version", "sample_domain", "axis_unit", "variant_ids", "component_order", "component_values", "canonicalization"):
         if key not in value:
             raise ValueError(f"lfm_degradation lacks required field: {key}")
+    if not isinstance(value["component_values"], Mapping):
+        raise ValueError("lfm_degradation component_values must be a mapping")
+    if not value["component_values"]:
+        raise ValueError("lfm_degradation component_values must not be empty")
+    unexpected = sorted(set(value["component_values"]) - set(LFM_POLICY_FIELDS))
+    if unexpected:
+        raise ValueError(
+            f"lfm_degradation component_values has non-scientific fields: {unexpected}"
+        )
+    normalized_lfm_component_values(value["component_values"])
+    expected = build_lfm_degradation_metadata(
+        sample_domain,
+        axis_unit="s" if sample_domain == "time" else "m",
+        component_values=value["component_values"],
+    )
     for key in ("contract_version", "sample_domain", "axis_unit", "variant_ids", "component_order", "canonicalization"):
         if value[key] != expected[key]:
             raise ValueError(f"lfm_degradation {key} does not match science v2")
-    if not isinstance(value["component_values"], Mapping):
-        raise ValueError("lfm_degradation component_values must be a mapping")
     return dict(value)
 
 
-__all__ = ["LFM_COMPONENT_ORDER", "LFM_VARIANT_IDS", "LfmPolicy", "LfmProducts", "build_lfm_products", "build_lfm_degradation_metadata", "validate_lfm_degradation_metadata"]
+__all__ = ["LFM_COMPONENT_ORDER", "LFM_POLICY_FIELDS", "LFM_VARIANT_IDS", "LfmPolicy", "LfmProducts", "build_lfm_products", "build_lfm_degradation_metadata", "normalized_lfm_component_values", "validate_lfm_degradation_metadata"]

@@ -18,7 +18,11 @@ from cup.impedance import (
     validate_sample_axis,
     validate_synthoseis_lfm_contract,
 )
-from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION, require_science_contract
+from cup.synthetic.schemas import (
+    BENCHMARK_SCHEMA_VERSION,
+    SEISMIC_VARIANT_CONTRACT_VERSION,
+    require_science_contract,
+)
 from cup.synthetic.core import (
     validate_lfm_degradation_metadata,
     validate_seismic_variant_metadata,
@@ -157,6 +161,7 @@ class DepthBenchmark:
             if row["sample_kind"] == "seismic_variant":
                 normalized_variant_metadata = validate_seismic_variant_metadata(
                     {
+                        "contract_version": SEISMIC_VARIANT_CONTRACT_VERSION,
                         "variant_id": row.get("seismic_variant_id"),
                         "mismatch_family": row.get("seismic_mismatch_family"),
                         "operator_source": row.get(
@@ -203,6 +208,13 @@ class DepthBenchmark:
                     raise KeyError(f"Missing base realization group: {base_path}")
                 if row["sample_kind"] == "seismic_variant":
                     variant_group = h5[str(row["hdf5_group"])]
+                    if (
+                        variant_group.attrs.get("contract_version")
+                        != SEISMIC_VARIANT_CONTRACT_VERSION
+                    ):
+                        raise ValueError(
+                            "Variant HDF5 group does not use seismic_variants_v2."
+                        )
                     for column, attribute in (
                         ("seismic_variant_id", "variant_id"),
                         ("seismic_mismatch_family", "mismatch_family"),

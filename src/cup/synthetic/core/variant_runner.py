@@ -174,7 +174,7 @@ def _axis_lateral_gain(
     lateral_correlation_fraction: float,
     axis_correlation_fraction: float,
     rng_lateral: np.random.Generator,
-    rng_time: np.random.Generator,
+    rng_axis: np.random.Generator,
 ) -> tuple[np.ndarray, dict[str, float]]:
     trace_gain, lateral_qc = _tracewise_gain(
         lateral_m=lateral_m,
@@ -184,7 +184,9 @@ def _axis_lateral_gain(
         rng=rng_lateral,
     )
     lateral_field = np.log(trace_gain[:, 0])
-    axis_field = _regular_ar1(shape[1], rng=rng_time, correlation_fraction=axis_correlation_fraction)
+    axis_field = _regular_ar1(
+        shape[1], rng=rng_axis, correlation_fraction=axis_correlation_fraction
+    )
     raw = lateral_field[:, None] + axis_field[None, :]
     raw -= float(np.mean(raw))
     raw_rms = float(np.sqrt(np.mean(raw * raw)))
@@ -387,7 +389,7 @@ def generate_seismic_variants(
         variant_id=tl_id,
             coefficient_name="axis_lateral_gain:lateral",
         ),
-        rng_time=_rng(
+        rng_axis=_rng(
             global_seed=global_seed,
             generator_family=generator_family,
             realization_id=realization_id,

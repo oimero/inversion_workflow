@@ -78,11 +78,11 @@ def depth_catalog_from_synthetic_truth(
 
 
 def depth_payload_from_object_core_calibration(
-    legacy: ImpedanceCalibration,
+    neutral_calibration: ImpedanceCalibration,
     *,
     extra: Mapping[str, Any],
 ) -> dict[str, Any]:
-    payload = legacy.to_dict()
+    payload = neutral_calibration.to_dict()
     payload["schema_version"] = CALIBRATION_SCHEMA
     payload["generator_family"] = GENERATOR_FAMILY
     payload["truth_dz_m"] = float(payload.pop("truth_sample_interval"))
@@ -121,26 +121,26 @@ def load_depth_calibration_for_object_core(path: Path) -> tuple[ImpedanceCalibra
     require_science_contract(payload, label="depth impedance calibration")
     if payload.get("schema_version") != CALIBRATION_SCHEMA:
         raise ValueError(f"Expected {CALIBRATION_SCHEMA}, got {payload.get('schema_version')}.")
-    legacy = dict(payload)
-    for model in legacy["zone_models"].values():
+    neutral_payload = dict(payload)
+    for model in neutral_payload["zone_models"].values():
         background = model["background"]
         if "zone_thickness_m" in background:
             background["zone_extent"] = background.pop("zone_thickness_m")
     adapter = ImpedanceCalibration(
         schema_version=CALIBRATION_SCHEMA,
         generator_family=GENERATOR_FAMILY,
-        truth_sample_interval=float(legacy["truth_dz_m"]),
+        truth_sample_interval=float(neutral_payload["truth_dz_m"]),
         axis_unit="m",
         depth_basis="tvdss",
-        state_threshold_sigma=float(legacy["state_threshold_sigma"]),
-        ordered_horizons=tuple(legacy["ordered_horizons"]),
-        zones=tuple(legacy["zones"]),
-        parent=dict(legacy["parent"]),
-        zone_models=dict(legacy["zone_models"]),
-        source_runs=dict(legacy["source_runs"]),
+        state_threshold_sigma=float(neutral_payload["state_threshold_sigma"]),
+        ordered_horizons=tuple(neutral_payload["ordered_horizons"]),
+        zones=tuple(neutral_payload["zones"]),
+        parent=dict(neutral_payload["parent"]),
+        zone_models=dict(neutral_payload["zone_models"]),
+        source_runs=dict(neutral_payload["source_runs"]),
         input_contracts={
             str(key): dict(value)
-            for key, value in dict(legacy["input_contracts"]).items()
+            for key, value in dict(neutral_payload["input_contracts"]).items()
         },
     )
     return adapter, payload

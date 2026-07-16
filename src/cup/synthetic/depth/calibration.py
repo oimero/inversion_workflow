@@ -204,9 +204,6 @@ def _survey_and_target_zone(
     return survey, zone, paths
 
 
-load_depth_calibration_as_legacy = load_depth_calibration_for_object_core
-
-
 def run_depth_calibration(
     *,
     workflow: Any,
@@ -429,7 +426,7 @@ def run_depth_calibration(
         }
         for key, value in source_provenance.items()
     }
-    legacy, objects, qc, samples, backgrounds, profile_samples = calibrate_depth_object_core(
+    neutral_calibration, objects, qc, samples, backgrounds, profile_samples = calibrate_depth_object_core(
         inputs,
         truth_dz_m=truth_dz,
         ordered_horizons=[item["name"] for item in script_cfg["horizons"]],
@@ -455,7 +452,7 @@ def run_depth_calibration(
     )
     if not locked_step3_run:
         raise ValueError("Rock-physics summary does not identify its Step-3 source run.")
-    payload = depth_payload_from_object_core_calibration(legacy, extra={
+    payload = depth_payload_from_object_core_calibration(neutral_calibration, extra={
         "background_estimator": "per_well_zone_huber",
         "background_huber_delta_sigma": float(script_cfg["calibration"]["huber_delta_sigma"]),
         "horizon_contract": list(script_cfg["horizons"]),
@@ -552,4 +549,4 @@ def run_depth_calibration(
     return summary
 
 
-__all__ = ["load_depth_calibration_as_legacy", "run_depth_calibration"]
+__all__ = ["run_depth_calibration"]

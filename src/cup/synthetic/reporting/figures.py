@@ -487,42 +487,6 @@ def _plot_hdf5_examples(
             generated.append(_finish(fig, figures_dir / f"state_strip_{safe}.png"))
         else:
             skipped.append({"figure": f"state_strip:{group_path}", "reason": "missing state_id_highres dataset"})
-        if "priors/lfm_controlled_degraded" in group:
-            model = group["truth/model_target_log_ai"][()]
-            lfm = group["priors/lfm_controlled_degraded"][()]
-            residual = (
-                group["residuals/residual_vs_lfm_controlled_degraded"][()]
-                if "residuals/residual_vs_lfm_controlled_degraded" in group
-                else model - lfm
-            )
-            fig, axes = plt.subplots(3, 1, figsize=(8.0, 9.0), sharex=True, sharey=True)
-            for ax, values, title, cmap in [
-                (axes[0], model, "model target log(AI)", "viridis"),
-                (axes[1], lfm, "controlled degraded LFM", "viridis"),
-                (axes[2], residual, "target - controlled LFM", "seismic"),
-            ]:
-                symmetric = cmap == "seismic"
-                if symmetric:
-                    limit = float(np.nanpercentile(np.abs(values), 99.0))
-                    vmin, vmax = -limit, limit
-                else:
-                    vmin, vmax = np.nanpercentile(values, [1.0, 99.0])
-                image = ax.imshow(
-                    values.T,
-                    aspect="auto",
-                    extent=[lateral[0], lateral[-1], model_axis[-1], model_axis[0]],
-                    cmap=cmap,
-                    vmin=vmin,
-                    vmax=vmax,
-                )
-                ax.set_title(title)
-                ax.set_ylabel(model_axis_label)
-                fig.colorbar(image, ax=ax, fraction=0.025, pad=0.02)
-            axes[-1].set_xlabel("lateral distance (m)")
-            generated.append(_finish(fig, figures_dir / f"lfm_residual_overview_{safe}.png"))
-        else:
-            skipped.append({"figure": f"lfm_residual_overview:{group_path}", "reason": "missing controlled degraded LFM"})
-
     coeffs = _read_csv(output_dir / "object_lateral_coefficients.csv")
     if coeffs.empty:
         skipped.append({"figure": "c0_lateral", "reason": "empty object_lateral_coefficients.csv"})

@@ -235,10 +235,6 @@ depth_forward_model_inputs:
 
 ### 第 6 步：真实工区井控数据集
 
-时间域第 6 步的输入是时间域第 5 步（`well_auto_tie` 全井标定），深度域第 6 步的输入是深度域第 5 步（`wavelet_batch_synthetic_depth` 批量深度平移）。两者的输出 schema 完全相同（`real_field_well_controls_v3`），都产出一个 `WellControlSet`。
-
-关键差异：
-
 | | 时间域 | 深度域 |
 |---|---|---|
 | 上游步骤 | `well_auto_tie` | `wavelet_batch_synthetic_depth` |
@@ -249,6 +245,27 @@ depth_forward_model_inputs:
 | `depth_basis` | 无 | `tvdss` |
 
 其余逻辑完全一致：每口井从对齐后的曲线提取 AI，在 5 m 规则轴上重采样，产出 `canonical_background_log_ai` 和采样点掩码。
+
+### 第 7 步：真实工区低频模型
+
+关键差异：
+
+| | 时间域 | 深度域 |
+|---|---|---|
+| 上游步骤 | 第 6 步 (`well_auto_tie`) | 第 6 步 (`wavelet_batch_synthetic_depth`) |
+| `sample_domain` | `time` | `depth` |
+| `sample_unit` | `s` | `m` |
+| 轴间距 | ~2 ms | 5.0 m |
+| `depth_basis` | 无 | `tvdss` |
+| 滤波 cutoff 参数 | `cutoff_hz` (cycles/s) | `cutoff_wavelength_m` (m/cycle) |
+| 滤波内部表示 | `cutoff_hz` 原值 | `1.0 / cutoff_wavelength_m` (cycles/m) |
+| Log basis 标签 | `twt` | `tvdss` |
+
+低通滤波是差异最集中的地方。`parse_lowpass_spec()` 根据 `sample_axis.domain` 校验配置中的 cutoff 参数名：时间域配置必须用 `cutoff_hz`，深度域配置必须用 `cutoff_wavelength_m`，错域参数直接失败。`filter.enabled: false` 时不接受任何 filter 参数。滤波实现 `apply_lfm_lowpass()` 内部统一转为 cycles-per-axis-unit 后走同一个 Butterworth 滤波，区别只在 Log 的 basis 标签。
+
+`LfmContext` 初始化时强制校验：深度域必须 `depth_basis='tvdss'`，时间域 `depth_basis` 必须为 None。
+
+其余逻辑完全一致：两种基线模型方法（trend 和 proportional_kriging）的构建流程、XY ordinary kriging 的空间插值、framework 修饰器的概率场叠加、变体图和 comparison 的生成，以及 volume 模式的 SEG-Y/ZGY 导出，都不区分域。
 
 ---
 

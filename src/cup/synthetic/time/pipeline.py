@@ -170,7 +170,7 @@ def _time_perturbed_wavelet_forward(
     mask = np.asarray(generated.valid_mask_model, dtype=bool)
     if np.any(mask & ~support):
         raise ValueError("invalid_seismic_view:perturbed_wavelet_support_incomplete")
-    return observed, mask
+    return observed, support
 
 
 def _seismic_view_records_for_sample(
@@ -180,6 +180,7 @@ def _seismic_view_records_for_sample(
     source_index_record: Mapping[str, Any],
     seismic_input: np.ndarray,
     valid_mask: np.ndarray,
+    operator_source_support: np.ndarray,
     seismic_model_consistent_dataset: str,
     lateral_m: np.ndarray,
     sample_axis: np.ndarray,
@@ -200,7 +201,8 @@ def _seismic_view_records_for_sample(
         SeismicViewContext(
             realization_id=str(source_index_record["parent_realization_id"]),
             base_seismic=seismic_input,
-            valid_mask=valid_mask,
+            public_valid_mask=valid_mask,
+            operator_source_support=operator_source_support,
             lateral_m=lateral_m,
             sample_axis=sample_axis,
         ),
@@ -520,6 +522,10 @@ def run_generation(
                     source_index_record=base_record_for_views,
                     seismic_input=generated.seismic_observed,
                     valid_mask=np.asarray(generated.valid_mask_model, dtype=bool),
+                    operator_source_support=np.asarray(
+                        generated.sample.forward.support.observed,
+                        dtype=bool,
+                    ),
                     seismic_model_consistent_dataset=(
                         ""
                         if not hdf5_group

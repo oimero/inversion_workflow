@@ -168,7 +168,13 @@ class DeterministicParentBalancedViewCycler:
         if "parent_realization_id" not in frame or "sample_kind" not in frame:
             raise ValueError("parent_balanced_seismic_view requires parent and sample-kind columns.")
         parent_weights = {str(key): float(value) for key, value in parent_weights.items()}
-        view_weights = {str(key): float(value) for key, value in view_weights.items()}
+        # Mapping order is presentation, not part of the scientific random
+        # contract.  Canonicalize view IDs before passing them to the RNG so
+        # reordering equivalent YAML keys cannot change a sampled sequence.
+        view_weights = {
+            str(key): float(value) for key, value in view_weights.items()
+        }
+        view_weights = dict(sorted(view_weights.items()))
         if set(parent_weights) != {"base", "variant"}:
             raise ValueError("parent_balanced_seismic_view requires explicit base/variant weights.")
         if any(value < 0.0 for value in parent_weights.values()) or not np.isclose(
@@ -504,13 +510,11 @@ def _materialize_parent_split_assignment(
 
 def _prepare_synthetic_indices(
     *, benchmark: SynthoseisBenchmark, source: Mapping[str, Any], patch_spec: PatchSpec,
-    blocks: list[Mapping[str, Any]], output_dir: Path, logger: logging.Logger | None = None,
+    blocks: list[Mapping[str, Any]], split_assignment: Mapping[str, str],
+    logger: logging.Logger | None = None,
     allow_smoke_validation_duplication: bool = False,
 ) -> dict[str, pd.DataFrame]:
     result = {}
-    split_assignment = _materialize_parent_split_assignment(
-        benchmark, path=output_dir / "split_assignment.csv"
-    )
     for block in blocks:
         block_id = str(block["block_id"])
         build_started = time.perf_counter()
@@ -1003,7 +1007,7 @@ def _checkpoint_payload(
                 "projection_contract_version", "seismic_view_contract_version",
                 "seismic_operator_contract_version", "random_stream_contract_version",
                 "contract_fingerprint_sha256", "materialized_view_ids",
-                "materialized_view_spec_hashes",
+                "materialized_view_spec_hashes", "split_assignment_path",
             )
             if key in source
         }
@@ -1540,14 +1544,24 @@ def run_experiment(
         repo_relative_path(next(iter(forward_model_inputs_paths)), root=root)
         if forward_model_inputs_paths else ""
     )
+    split_assignment_paths: dict[str, Path] = {}
+    split_assignments: dict[str, dict[str, str]] = {}
+    for source_id, (benchmark, _) in synthetic.items():
+        assignment_path = output_dir / f"split_assignment_{source_id}.csv"
+        split_assignments[source_id] = _materialize_parent_split_assignment(
+            benchmark, path=assignment_path
+        )
+        split_assignment_paths[source_id] = assignment_path
+        resolved_sources[source_id]["split_assignment_path"] = repo_relative_path(
+            assignment_path, root=root
+        )
+        if source_id in training_sources:
+            training_sources[source_id] = dict(resolved_sources[source_id])
     reference_index: pd.DataFrame | None = None
     reference_rows: pd.DataFrame | None = None
     if config.normalization_reference in synthetic:
         reference_benchmark, _ = synthetic[config.normalization_reference]
-        reference_split_assignment = _materialize_parent_split_assignment(
-            reference_benchmark,
-            path=output_dir / "split_assignment.csv",
-        )
+        reference_split_assignment = split_assignments[config.normalization_reference]
         reference_index = build_patch_index(
             reference_benchmark,
             patch_spec=patch_spec,
@@ -1654,7 +1668,9 @@ def run_experiment(
                 ) if block["kind"] == "physics" else None
                 indices = _prepare_synthetic_indices(
                     benchmark=benchmark, source=source, patch_spec=patch_spec,
-                    blocks=[block], output_dir=stage_dir, logger=logger,
+                    blocks=[block],
+                    split_assignment=split_assignments[source_id],
+                    logger=logger,
                     allow_smoke_validation_duplication=(
                         config.run_mode == "smoke"
                         and config.validation_semantics == "duplicated_training_patch"
@@ -2051,7 +2067,17 @@ def run_experiment(
         "normalization_reference": {"source": config.normalization_reference},
         "normalization": normalization,
         "normalization_path": repo_relative_path(output_dir / "normalization.json", root=root),
-        "split_assignment": repo_relative_path(output_dir / "split_assignment.csv", root=root),
+        "split_assignment": (
+            repo_relative_path(
+                split_assignment_paths[config.normalization_reference], root=root
+            )
+            if config.normalization_reference in split_assignment_paths
+            else ""
+        ),
+        "split_assignments": {
+            source_id: repo_relative_path(path, root=root)
+            for source_id, path in sorted(split_assignment_paths.items())
+        },
         "patch_catalog_role": "parent_window_without_view_replication",
         "sources": resolved_sources,
         "increment_contract": experiment_increment_contract,

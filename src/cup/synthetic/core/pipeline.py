@@ -39,7 +39,8 @@ class SeismicViewContext:
 
     realization_id: str
     base_seismic: np.ndarray
-    valid_mask: np.ndarray
+    public_valid_mask: np.ndarray
+    operator_source_support: np.ndarray
     lateral_m: np.ndarray
     sample_axis: np.ndarray
 
@@ -74,7 +75,8 @@ class SeismicViewPipeline:
             callback = getattr(self.domain_adapter, "forward_with_parameters", None)
         return generate_seismic_views(
             base_seismic=context.base_seismic,
-            valid_mask=context.valid_mask,
+            valid_mask=context.public_valid_mask,
+            operator_source_support=context.operator_source_support,
             lateral_m=context.lateral_m,
             sample_axis=axis,
             view_specs=self.specs,

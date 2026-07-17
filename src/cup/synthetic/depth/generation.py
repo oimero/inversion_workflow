@@ -405,6 +405,8 @@ def _write_views(
     )
     if not view_pipeline.specs:
         return []
+    if section.benchmark_sample is None:
+        raise RuntimeError("depth view generation requires the shared benchmark sample support")
     wavelet_time, wavelet = load_wavelet_csv(
         resolve_relative_path(forward_inputs["wavelet"]["path"], root=repo_root)
     )
@@ -435,13 +437,17 @@ def _write_views(
             raise ValueError(
                 "invalid_seismic_view:perturbed_wavelet_support_incomplete"
             )
-        return observed, base_mask
+        return observed, support
 
     results = view_pipeline.generate(
         SeismicViewContext(
             realization_id=section.realization_id,
             base_seismic=section.seismic_observed,
-            valid_mask=section.valid_mask_model,
+            public_valid_mask=section.valid_mask_model,
+            operator_source_support=np.asarray(
+                section.benchmark_sample.forward.support.observed,
+                dtype=bool,
+            ),
             lateral_m=section.geometry.lateral_m,
             sample_axis=section.tvdss_model_m,
         ),

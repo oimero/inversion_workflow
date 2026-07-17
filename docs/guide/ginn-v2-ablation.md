@@ -30,7 +30,7 @@ sampling:
 
 ## 实验 split 与 normalization
 
-benchmark 只发布 `evaluation_role`。GINN 在构建 patch catalog 前写出 `split_assignment.csv`，使用固定的父实现 hash 合同：
+benchmark 只发布 `evaluation_role`。GINN 在构建 patch catalog 前按 synthetic source 写出 `split_assignment_<source_id>.csv`，使用固定的父实现 hash 合同：
 
 ```yaml
 split_contract:
@@ -73,7 +73,7 @@ validation:
 
 ## 主要产物
 
-实验目录包含 `experiment_manifest.json`、`normalization.json`、`split_assignment.csv`、每阶段 patch index、training history、best/final checkpoint 和验证诊断。checkpoint 至少记录 benchmark v5 identity、science/view/operator/random 合同、双索引、split identity、normalization identity、训练/验证权重和实际采样计数。
+实验目录包含 `experiment_manifest.json`、`normalization.json`、每个 synthetic source 的 split assignment、每阶段 patch index、training history、best/final checkpoint 和验证诊断。checkpoint 至少记录 benchmark v5 identity、science/view/operator/random 合同、双索引、split identity、normalization identity、训练/验证权重和实际采样计数。
 
 ## 检查清单
 

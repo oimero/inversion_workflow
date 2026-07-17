@@ -172,6 +172,7 @@ def generate_seismic_views(
     *,
     base_seismic: np.ndarray,
     valid_mask: np.ndarray,
+    operator_source_support: np.ndarray,
     lateral_m: np.ndarray,
     sample_axis: np.ndarray,
     view_specs: Sequence[SeismicViewSpec],
@@ -185,16 +186,28 @@ def generate_seismic_views(
 
     base = np.asarray(base_seismic, dtype=np.float64)
     mask = np.asarray(valid_mask, dtype=bool)
+    source_support = np.asarray(operator_source_support, dtype=bool)
     axis = np.asarray(sample_axis, dtype=np.float64).reshape(-1)
     lateral = np.asarray(lateral_m, dtype=np.float64).reshape(-1)
-    if base.ndim != 2 or mask.shape != base.shape or base.shape != (lateral.size, axis.size):
-        raise ValueError("base seismic, mask, lateral axis and sample axis are misaligned")
+    if (
+        base.ndim != 2
+        or mask.shape != base.shape
+        or source_support.shape != base.shape
+        or base.shape != (lateral.size, axis.size)
+    ):
+        raise ValueError(
+            "base seismic, public mask, operator source support, lateral axis "
+            "and sample axis are misaligned"
+        )
     if np.any(mask & ~np.isfinite(base)):
         raise ValueError("base seismic has non-finite valid samples")
+    if np.any(mask & ~source_support):
+        raise ValueError("public valid mask is outside operator source support")
     results: list[SeismicViewResult] = []
     for spec in view_specs:
         state = base.copy()
         state_mask = mask.copy()
+        state_source_support = source_support.copy()
         cumulative_gain = np.ones_like(base)
         cumulative_noise = np.zeros_like(base)
         qc: dict[str, Any] = {}
@@ -214,9 +227,16 @@ def generate_seismic_views(
             state, forward_mask = perturbed_forward(phase, shift)
             state = np.asarray(state, dtype=np.float64)
             forward_mask = np.asarray(forward_mask, dtype=bool)
-            if state.shape != base.shape or not np.array_equal(forward_mask, mask):
-                raise ValueError(f"view {spec.view_id!r} forward support differs from base")
+            if state.shape != base.shape or forward_mask.shape != base.shape:
+                raise ValueError(
+                    f"view {spec.view_id!r} forward output/support differs from base shape"
+                )
+            if np.any(mask & ~forward_mask):
+                raise ValueError(
+                    f"view {spec.view_id!r} forward support does not cover public mask"
+                )
             state_mask = mask.copy()
+            state_source_support = forward_mask.copy()
         for operator_id in spec.sampled_operator_ids:
             operator = spec.operators[operator_id]
             kind = str(operator["kind"])
@@ -224,12 +244,25 @@ def generate_seismic_views(
                 shift_value = operator.get("shift")
                 if not isinstance(shift_value, Mapping) or str(shift_value.get("unit")) != axis_unit:
                     raise ValueError(f"axis_static operator {operator_id!r} has wrong axis unit")
-                state, support = _static(state, axis, float(shift_value["value"]), state_mask)
-                cumulative_gain, gain_support = _static(cumulative_gain, axis, float(shift_value["value"]), state_mask)
-                cumulative_noise, noise_support = _static(cumulative_noise, axis, float(shift_value["value"]), state_mask)
+                shift_value_axis = float(shift_value["value"])
+                state, support = _static(
+                    state, axis, shift_value_axis, state_source_support
+                )
+                cumulative_gain, gain_support = _static(
+                    cumulative_gain, axis, shift_value_axis, state_source_support
+                )
+                cumulative_noise, noise_support = _static(
+                    cumulative_noise, axis, shift_value_axis, state_source_support
+                )
                 if not np.array_equal(mask & support, mask):
                     raise ValueError(f"view {spec.view_id!r} axis_static loses valid support")
-                state_mask = mask & support & gain_support & noise_support
+                if not np.array_equal(support, gain_support) or not np.array_equal(
+                    support, noise_support
+                ):
+                    raise ValueError(
+                        f"view {spec.view_id!r} axis_static auxiliary support differs"
+                    )
+                state_source_support = support
             elif kind in {"global_gain", "tracewise_gain", "axis_lateral_gain"}:
                 gain, gain_qc = _gain_operator(
                     operator_id=operator_id,

@@ -92,6 +92,41 @@ def _resolve_output_dir(prefix: str, explicit: Path | None) -> Path:
     return REPO_ROOT / "scripts" / "output" / f"{prefix}_{timestamp}"
 
 
+def _split_assignment_path_for_benchmark(
+    manifest: Mapping[str, object], benchmark_dir: Path,
+) -> Path:
+    """Resolve the split contract belonging to the selected benchmark source."""
+    assignments = manifest.get("split_assignments")
+    if isinstance(assignments, Mapping) and assignments:
+        sources = manifest.get("sources")
+        if not isinstance(sources, Mapping):
+            raise ValueError("Model run split_assignments requires a sources mapping.")
+        matches: list[Path] = []
+        for source_id, raw_path in assignments.items():
+            source = sources.get(source_id)
+            if not isinstance(source, Mapping):
+                continue
+            raw_benchmark_dir = str(source.get("benchmark_dir") or "").strip()
+            if not raw_benchmark_dir:
+                continue
+            source_dir = resolve_relative_path(raw_benchmark_dir, root=REPO_ROOT)
+            if source_dir.resolve() == benchmark_dir.resolve():
+                matches.append(resolve_relative_path(str(raw_path), root=REPO_ROOT))
+        if len(matches) != 1:
+            raise ValueError(
+                "Model run does not identify exactly one split_assignment for "
+                f"benchmark {benchmark_dir}: matches={len(matches)}"
+            )
+        return matches[0]
+    raw_path = str(manifest.get("split_assignment") or "").strip()
+    if not raw_path:
+        raise ValueError(
+            "GINN-v2 prediction requires the model run's split_assignment contract "
+            "when rebuilding a v5 patch catalog."
+        )
+    return resolve_relative_path(raw_path, root=REPO_ROOT)
+
+
 def _resolve_checkpoint_from_manifest(
     manifest: Mapping[str, object],
     *,
@@ -285,19 +320,12 @@ def run_predict(args: argparse.Namespace) -> None:
         spec_cfg = dict(manifest.get("patching") or manifest.get("patch_spec") or {})
         if not spec_cfg:
             raise ValueError("Model run manifest lacks patching contract.")
-        split_assignment_path_value = str(manifest.get("split_assignment") or "")
-        if not split_assignment_path_value:
-            raise ValueError(
-                "GINN-v2 prediction requires the model run's split_assignment contract "
-                "when rebuilding a v5 patch catalog."
-            )
-        split_assignment_path = resolve_relative_path(
-            split_assignment_path_value,
-            root=REPO_ROOT,
+        split_assignment_path = _split_assignment_path_for_benchmark(
+            manifest, benchmark_dir
         )
         if not split_assignment_path.is_file():
             raise FileNotFoundError(
-                f"Model run split_assignment.csv not found: {split_assignment_path}"
+                f"Model run split assignment not found: {split_assignment_path}"
             )
         split_frame = pd.read_csv(
             split_assignment_path,

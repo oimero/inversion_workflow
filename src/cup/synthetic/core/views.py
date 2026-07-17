@@ -269,6 +269,12 @@ def resolve_view_specs(config: Mapping[str, Any]) -> tuple[SeismicViewSpec, ...]
 
     if not isinstance(config, Mapping):
         raise ValueError("seismic_views must be a mapping")
+    unknown_config = sorted(set(config) - {"operators", "views"})
+    if unknown_config:
+        raise ValueError(
+            "seismic_views contains unknown keys: "
+            f"{unknown_config}"
+        )
     operators_raw = config.get("operators")
     views_raw = config.get("views")
     if not isinstance(operators_raw, Mapping) or not isinstance(views_raw, Sequence) or isinstance(views_raw, (str, bytes)):
@@ -318,12 +324,23 @@ def resolve_view_specs(config: Mapping[str, Any]) -> tuple[SeismicViewSpec, ...]
     for raw_view in views_raw:
         if not isinstance(raw_view, Mapping):
             raise ValueError("each seismic view must be a mapping")
+        unknown_view = sorted(set(raw_view) - {"view_id", "operator_ids"})
+        if unknown_view:
+            raise ValueError(
+                "seismic view contains unknown keys: "
+                f"{unknown_view}"
+            )
         view_id = str(raw_view.get("view_id") or "")
         if not view_id or view_id in seen_views:
             raise ValueError(f"duplicate or empty seismic view ID: {view_id!r}")
         operator_ids_raw = raw_view.get("operator_ids")
         if not isinstance(operator_ids_raw, Sequence) or isinstance(operator_ids_raw, (str, bytes)):
             raise ValueError(f"seismic view {view_id!r} requires operator_ids list")
+        if not operator_ids_raw:
+            raise ValueError(
+                f"seismic view {view_id!r} must reference at least one operator; "
+                "base is represented by the empty views list"
+            )
         operator_ids = validate_operator_sequence(operator_ids_raw, operators)
         view_payload = {
             "view_id": view_id,

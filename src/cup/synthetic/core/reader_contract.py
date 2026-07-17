@@ -1,4 +1,4 @@
-"""Shared manifest and HDF5 ownership checks for v4 science-v2 readers."""
+"""Shared manifest and HDF5 ownership checks for v5 readers."""
 
 from __future__ import annotations
 

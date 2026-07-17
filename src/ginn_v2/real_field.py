@@ -210,7 +210,7 @@ def synthetic_train_values(
         sample = benchmark.load_sample(str(row["sample_id"]))
         target = np.asarray(sample.target_log_ai, dtype=np.float32)
         seismic = np.asarray(sample.seismic_input, dtype=np.float32)
-        lfm = np.asarray(sample.priors["lfm_controlled_degraded"], dtype=np.float32)
+        lfm = np.asarray(sample.input_lfm_log_ai, dtype=np.float32)
         valid = np.asarray(sample.valid_mask, dtype=bool)
         if seismic.shape[1] == target.shape[1] - 1:
             target = target[:, 1:]

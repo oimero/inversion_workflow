@@ -24,11 +24,9 @@ from cup.synthetic.core.calibration import (
     load_calibration,
 )
 from cup.synthetic.time.config import DATA_SCHEMA, IMPLEMENTATION_SCOPE
-from cup.impedance import build_lfm_producer_contract, generation_contract
+from cup.impedance import generation_contract
 from cup.synthetic.core import (
     build_attempt_plan,
-    build_lfm_degradation_metadata,
-    build_seismic_variant_metadata,
     build_seismic_input_contract,
     build_mask_contract,
     geometry_feasibility_rows,
@@ -49,14 +47,16 @@ from cup.synthetic.time.forward import (
 )
 from cup.synthetic.reporting.figures import write_generation_figures
 from cup.synthetic.core.rejections import StagedRejection
-from cup.synthetic.core.records import BenchmarkVariant
+from cup.synthetic.core.records import BenchmarkView
 from cup.synthetic.core.scenarios import GenerationScenario, generation_scenarios
-from cup.synthetic.core.writer import write_benchmark_sample, write_benchmark_variant
+from cup.synthetic.core.writer import write_benchmark_sample, write_benchmark_view
 from cup.synthetic.time.geometry import build_section_geometries
 from cup.synthetic.time.sample_builder import (
     build_time_field_sample,
 )
-from cup.synthetic.core.variant_runner import generate_seismic_variants
+from cup.synthetic.core.pipeline import SeismicViewContext
+from cup.synthetic.adapters import TimeSyntheticDomainAdapter
+from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
 from cup.synthetic.schemas import SCIENCE_CONTRACT, require_science_contract
 from cup.physics.numpy_backend import forward_time
 from cup.synthetic.core.signal import finite_support_fir, valid_filter_decimate
@@ -137,23 +137,11 @@ def _generation_input_contracts(
     return contracts
 
 
-def _benchmark_lfm_records(generated: Any, *, base_path: str) -> dict[str, Any]:
+def _benchmark_canonical_records(generated: Any, *, base_path: str) -> dict[str, Any]:
     return {
         **{key: value for key, value in generated.qc.items() if key.startswith("lfm_")},
-        "lfm_versions": "canonical_background;input_lfm_variants",
-        "lfm_variant_id": "controlled_default",
-        "input_lfm_log_ai_dataset": (
-            "" if not base_path else f"{base_path}/priors/input_lfm_variants/controlled_default/log_ai"
-        ),
-        "lfm_ideal_dataset": "" if not base_path else f"{base_path}/priors/lfm_ideal",
-        "lfm_controlled_degraded_dataset": (
-            "" if not base_path else f"{base_path}/priors/lfm_controlled_degraded"
-        ),
-        "residual_vs_lfm_ideal_dataset": (
-            "" if not base_path else f"{base_path}/residuals/residual_vs_lfm_ideal"
-        ),
-        "residual_vs_lfm_controlled_degraded_dataset": (
-            "" if not base_path else f"{base_path}/residuals/residual_vs_lfm_controlled_degraded"
+        "canonical_background_dataset": (
+            "" if not base_path else f"{base_path}/priors/canonical_background_log_ai"
         ),
     }
 
@@ -181,11 +169,11 @@ def _time_perturbed_wavelet_forward(
     support = np.broadcast_to(support_1d[: observed.shape[-1]], observed.shape)
     mask = np.asarray(generated.valid_mask_model, dtype=bool)
     if np.any(mask & ~support):
-        raise ValueError("invalid_seismic_variant:perturbed_wavelet_support_incomplete")
+        raise ValueError("invalid_seismic_view:perturbed_wavelet_support_incomplete")
     return observed, mask
 
 
-def _seismic_variant_records_for_sample(
+def _seismic_view_records_for_sample(
     *,
     h5: h5py.File,
     owner_path: str,
@@ -199,89 +187,81 @@ def _seismic_variant_records_for_sample(
     qc_only: bool,
     perturbed_wavelet_forward=None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    results = generate_seismic_variants(
-        seismic_input=seismic_input,
-        valid_mask=valid_mask,
-        lateral_m=lateral_m,
-        sample_axis=sample_axis,
-        config=script_cfg["seismic_mismatch"],
-        global_seed=int(script_cfg["global_seed"]),
-        generator_family=GENERATOR_FAMILY,
-        realization_id=str(source_index_record["parent_realization_id"]),
-        perturbed_wavelet_forward=perturbed_wavelet_forward,
+    adapter = TimeSyntheticDomainAdapter(forward_callback=perturbed_wavelet_forward)
+    view_pipeline = SyntheticBenchmarkPipeline(adapter).build_view_pipeline(
+        {
+            "sample_domain": "time",
+            "seismic_views": script_cfg["seismic_views"],
+            "global_seed": int(script_cfg["global_seed"]),
+            "generator_family": GENERATOR_FAMILY,
+        }
+    )
+    results = view_pipeline.generate(
+        SeismicViewContext(
+            realization_id=str(source_index_record["parent_realization_id"]),
+            base_seismic=seismic_input,
+            valid_mask=valid_mask,
+            lateral_m=lateral_m,
+            sample_axis=sample_axis,
+        ),
+        perturbed_forward=perturbed_wavelet_forward,
     )
     index_records: list[dict[str, Any]] = []
     result_records: list[dict[str, Any]] = []
     source_sample_id = str(source_index_record["sample_id"])
     for result in results:
-        variant_metadata = build_seismic_variant_metadata(
-            variant_id=result.variant_id,
-            mismatch_family=result.mismatch_family,
-            operator_source=result.operator_source,
-            parameters=result.parameters,
-        )
-        variant_group = (
+        view_metadata = dict(result.metadata)
+        view_group = (
             ""
             if qc_only
-            else write_benchmark_variant(
+            else write_benchmark_view(
                 h5,
-                BenchmarkVariant(
+                BenchmarkView(
                     owner_realization_id=str(
                         source_index_record["parent_realization_id"]
                     ),
-                    variant_id=result.variant_id,
-                    sample_kind="seismic_variant",
+                    view_id=result.view_id,
                     seismic_observed=result.seismic_observed,
                     positive_gain=result.positive_gain,
                     additive_noise=result.additive_noise,
-                    metadata={
-                        "mismatch_family": result.mismatch_family,
-                        "operator_source": result.operator_source,
-                        "parameters": result.parameters,
-                    },
+                    metadata=view_metadata,
                     qc=result.qc,
                     sample_domain="time",
                 ),
             ).hdf5_group
         )
-        sample_id = f"{source_sample_id}__seismic__{result.variant_id}"
+        sample_id = f"{source_sample_id}__view__{result.view_id}"
         record = {
             **dict(source_index_record),
             "sample_id": sample_id,
             "realization_id": sample_id,
             "source_sample_id": source_sample_id,
             "source_sample_kind": str(source_index_record.get("sample_kind", "base")),
-            "sample_kind": "seismic_variant",
-            "hdf5_group": variant_group,
-            "seismic_variant_id": variant_metadata["variant_id"],
-            "seismic_mismatch_family": variant_metadata["mismatch_family"],
-            "seismic_variant_operator_source": variant_metadata["operator_source"],
-            "seismic_variant_parameters_json": json.dumps(
-                {
-                    str(key): value
-                    for key, value in variant_metadata.items()
-                    if key not in {
-                        "variant_id",
-                        "mismatch_family",
-                        "operator_source",
-                    }
-                },
-                sort_keys=True,
-            ),
+            "sample_kind": "seismic_view",
+            "hdf5_group": view_group,
+            "view_id": result.view_id,
+            "view_spec_sha256": view_metadata["view_spec_sha256"],
+            "view_spec_canonical_json": view_metadata["view_spec_canonical_json"],
+            "operator_ids_json": json.dumps(view_metadata["operator_ids"], sort_keys=True),
+            "operator_kinds_json": json.dumps(view_metadata["operator_kinds"], sort_keys=True),
+            "operator_parameters_json": json.dumps(view_metadata.get("operator_parameters", {}), sort_keys=True),
+            "operator_contract_versions_json": json.dumps(view_metadata.get("operator_contract_versions", {}), sort_keys=True),
+            "random_stream_identity_json": json.dumps(view_metadata.get("random_stream_identity", {}), sort_keys=True),
+            "operator_trace_dataset": "" if not view_group else f"{view_group}/operator_trace_json",
             "seismic_input_dataset": (
-                "" if not variant_group else f"{variant_group}/seismic_observed"
+                "" if not view_group else f"{view_group}/seismic_observed"
             ),
             "seismic_model_consistent_dataset": seismic_model_consistent_dataset,
             "valid_mask_dataset": source_index_record.get("valid_mask_dataset", ""),
             "positive_gain_dataset": (
-                "" if not variant_group else f"{variant_group}/positive_gain"
+                "" if not view_group else f"{view_group}/positive_gain"
             ),
             "additive_noise_dataset": (
-                "" if not variant_group else f"{variant_group}/additive_noise"
+                "" if not view_group else f"{view_group}/additive_noise"
             ),
         }
         index_records.append(record)
-        result_records.append({**record, **variant_metadata, **result.qc})
+        result_records.append({**record, **view_metadata, **result.qc})
     return index_records, result_records
 
 
@@ -427,7 +407,9 @@ def run_generation(
     object_lateral_records: list[dict[str, Any]] = []
     qc_records: list[dict[str, Any]] = []
     rejection_records: list[dict[str, Any]] = list(preflight.rejection_details)
-    seismic_variant_records: list[dict[str, Any]] = []
+    seismic_view_records: list[dict[str, Any]] = []
+    realization_rows: list[dict[str, Any]] = []
+    view_rows: list[dict[str, Any]] = []
     highres_wavelet = (
         resample_wavelet_to_highres(
             wavelet_time,
@@ -451,6 +433,7 @@ def run_generation(
         for key, value in SCIENCE_CONTRACT.items():
             h5.attrs[key] = value
         h5.attrs["sample_domain"] = "time"
+        h5.attrs["sample_unit"] = "s"
         h5.attrs["generator_family"] = calibration.generator_family
         h5.attrs["implementation_scope"] = IMPLEMENTATION_SCOPE
         h5.attrs["suite"] = "field_conditioned"
@@ -466,8 +449,9 @@ def run_generation(
             realization_id = str(plan_row["parent_realization_id"])
             evaluation_role = str(plan_row["evaluation_role"])
             hdf5_group = ""
-            seismic_variant_records_local: list[dict[str, Any]] = []
-            base_lfm_index: dict[str, Any] = {}
+            seismic_view_records_local: list[dict[str, Any]] = []
+            view_rows_local: list[dict[str, Any]] = []
+            base_canonical_index: dict[str, Any] = {}
             try:
                 generated = build_time_field_sample(
                     calibration,
@@ -486,10 +470,10 @@ def run_generation(
                     else write_benchmark_sample(h5, generated.sample)
                 )
                 hdf5_group = "" if reference is None else reference.hdf5_group
-                base_lfm_index = _benchmark_lfm_records(
+                base_canonical_index = _benchmark_canonical_records(
                     generated, base_path=hdf5_group
                 )
-                base_record_for_variants = {
+                base_record_for_views = {
                     "sample_id": realization_id,
                     "realization_id": realization_id,
                     "parent_realization_id": realization_id,
@@ -521,19 +505,19 @@ def run_generation(
                         else f"{hdf5_group}/masks/valid_mask"
                     ),
                     "valid_sample_count": int(np.count_nonzero(generated.valid_mask_model)),
-                    **base_lfm_index,
+                    **base_canonical_index,
                 }
                 (
                     base_seismic_index,
                     base_seismic_results,
-                ) = _seismic_variant_records_for_sample(
+                ) = _seismic_view_records_for_sample(
                     h5=h5,
                     owner_path=(
                         hdf5_group
                         if hdf5_group
                         else f"/realizations/{generated.realization_id}"
                     ),
-                    source_index_record=base_record_for_variants,
+                    source_index_record=base_record_for_views,
                     seismic_input=generated.seismic_observed,
                     valid_mask=np.asarray(generated.valid_mask_model, dtype=bool),
                     seismic_model_consistent_dataset=(
@@ -556,14 +540,40 @@ def run_generation(
                         )
                     ),
                 )
-                index_records.extend(base_seismic_index)
-                seismic_variant_records_local.extend(base_seismic_results)
+                view_rows_local.extend(
+                    {
+                        "parent_realization_id": realization_id,
+                        "realization_id": realization_id,
+                        "view_id": row["view_id"],
+                        "sample_domain": "time",
+                        "sample_unit": "s",
+                        "evaluation_role": evaluation_role,
+                        "hdf5_group": row["hdf5_group"],
+                        "seismic_input_dataset": row["seismic_input_dataset"],
+                        "seismic_model_consistent_dataset": row["seismic_model_consistent_dataset"],
+                        "valid_mask_dataset": row["valid_mask_dataset"],
+                        "view_spec_sha256": row["view_spec_sha256"],
+                        "view_spec_canonical_json": row["view_spec_canonical_json"],
+                        "operator_ids_json": row["operator_ids_json"],
+                        "operator_kinds_json": row["operator_kinds_json"],
+                        "operator_parameters_json": row.get("operator_parameters_json", ""),
+                        "operator_contract_versions_json": row.get("operator_contract_versions_json", ""),
+                        "random_stream_identity_json": row.get("random_stream_identity_json", ""),
+                        "operator_trace_dataset": row["operator_trace_dataset"],
+                        "seismic_observed_dataset": row["seismic_input_dataset"],
+                        "n_valid": row.get("valid_sample_count", ""),
+                    }
+                    for row in base_seismic_index
+                )
+                seismic_view_records_local.extend(base_seismic_results)
                 object_records.extend(generated.object_catalog)
                 object_lateral_records.extend(generated.object_lateral_coefficients)
                 status = "ok"
                 reasons = ""
                 qc_payload = generated.qc
             except StagedRejection as exc:
+                if hdf5_group and hdf5_group in h5:
+                    del h5[hdf5_group]
                 hdf5_group = ""
                 status = "rejected"
                 reasons = ";".join(exc.reasons)
@@ -625,11 +635,36 @@ def run_generation(
                     else f"{hdf5_group}/masks/valid_mask"
                 ),
                 "valid_sample_count": int(np.count_nonzero(generated.valid_mask_model)) if status == "ok" else "",
-                **base_lfm_index,
+                **base_canonical_index,
             }
             index_records.append(record)
             if status == "ok":
-                seismic_variant_records.extend(seismic_variant_records_local)
+                index_records.extend(base_seismic_index)
+                realization_rows.append(
+                    {
+                        "realization_id": realization_id,
+                        "sample_domain": "time",
+                        "sample_unit": "s",
+                        "depth_basis": "",
+                        "section_id": section.section_id,
+                        "scenario_id": scenario.scenario_id,
+                        "geometry_family": scenario.geometry_family,
+                        "duration_mode": scenario.duration_mode,
+                        "suite": "field_conditioned",
+                        "evaluation_role": evaluation_role,
+                        "parent_realization_id": realization_id,
+                        "hdf5_group": hdf5_group,
+                        "base_seismic_dataset": record["seismic_input_dataset"],
+                        "seismic_model_consistent_dataset": record["seismic_model_consistent_dataset"],
+                        "valid_mask_dataset": record["valid_mask_dataset"],
+                        "target_dataset": f"{hdf5_group}/truth/model_target_log_ai" if hdf5_group else "",
+                        "canonical_background_dataset": f"{hdf5_group}/priors/canonical_background_log_ai" if hdf5_group else "",
+                        "target_increment_dataset": f"{hdf5_group}/targets/target_increment_log_ai" if hdf5_group else "",
+                        "n_valid": record["valid_sample_count"],
+                    }
+                )
+                view_rows.extend(view_rows_local)
+                seismic_view_records.extend(seismic_view_records_local)
             qc_records.append(
                 {
                     **record,
@@ -651,7 +686,9 @@ def run_generation(
         index_records,
         sort_by=("section_id", "scenario_id", "attempt_id", "sample_kind", "sample_id"),
     )
-    index.to_csv(output_dir / "sample_index.csv", index=False)
+    SyntheticBenchmarkPipeline(TimeSyntheticDomainAdapter()).publish_indexes(
+        output_dir, realization_rows, view_rows
+    )
     object_columns = [
         "realization_id",
         "scenario_id",
@@ -724,10 +761,10 @@ def run_generation(
         output_dir / "generation_qc.csv", index=False
     )
     stable_records_frame(
-        seismic_variant_records,
-        sort_by=("parent_realization_id", "variant_id"),
+        seismic_view_records,
+        sort_by=("parent_realization_id", "view_id"),
     ).to_csv(
-        output_dir / "seismic_variant_results.csv",
+        output_dir / "seismic_view_results.csv",
         index=False,
     )
     rejection_columns = [
@@ -827,13 +864,13 @@ def run_generation(
                     "seismic_input": dict(script_cfg["seismic_input"]),
                     "mask_contract": build_mask_contract(),
                     "forward_qc": dict(script_cfg["forward_qc"]),
-                    "lfm": dict(script_cfg["lfm"]),
-                    "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
+                    "seismic_views": dict(script_cfg["seismic_views"]),
                 },
                 input_contracts=input_contracts,
                 primary_artifacts={
                     "synthetic_benchmark": h5_path,
-                    "sample_index": output_dir / "sample_index.csv",
+                    "realization_index": output_dir / "realization_index.csv",
+                    "seismic_view_index": output_dir / "seismic_view_index.csv",
                 },
             ),
         }
@@ -859,32 +896,19 @@ def run_generation(
         "qc_only": bool(qc_only),
         "training_consumable": not bool(qc_only),
         "suite": "field_conditioned",
-        "canonical_enabled": False,
         "source_runs": {
             key: repo_relative_path(path, root=repo_root)
             for key, path in sources.items()
         },
         "config_provenance": dict(config_provenance),
         "sample_domain": "time",
+        "sample_unit": "s",
         "mask_contract": build_mask_contract(),
         "increment_contract": generation_contract("time", output_dt).as_dict(),
         "seismic_input_contract": build_seismic_input_contract(
             "time", operator="time_forward_highres_wavelet_antialias"
         ),
-        "lfm_degradation": build_lfm_degradation_metadata(
-            "time",
-            axis_unit="s",
-            component_values=script_cfg["lfm"]["controlled_degraded"],
-        ),
-        "input_lfm_variants": ["canonical", "controlled_default"],
-        "lfm_contract": build_lfm_producer_contract(
-            generation_contract("time", output_dt),
-            producer_schema=DATA_SCHEMA,
-            variant_selection={
-                "selected": "controlled_default",
-                "available": ["canonical", "controlled_default"],
-            },
-        ),
+        "seismic_views": dict(script_cfg["seismic_views"]),
         "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
         "global_seed": int(script_cfg["global_seed"]),
         "random_stream": {
@@ -897,8 +921,7 @@ def run_generation(
             "stream_purpose_registry": [
                 "state_sequence", "duration", "zone_background",
                 "coefficient_<name>", "coefficient_lateral", "thickness_lateral",
-                "lfm_degradation/<component coefficient name>",
-                "seismic_mismatch/<variant id>/<component coefficient name>",
+                "seismic_view/<view id>/<operator id>",
             ],
         },
         "output_dt_s": output_dt,
@@ -927,10 +950,8 @@ def run_generation(
                 feasibility_path, root=repo_root
             ),
         },
-        "seismic_variant_count": len(seismic_variant_records),
+        "seismic_view_count": len(seismic_view_records),
         "forward_qc": dict(script_cfg["forward_qc"]),
-        "lfm": dict(script_cfg["lfm"]),
-        "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
         "highres_wavelet": (
             {}
             if highres_wavelet is None
@@ -1012,7 +1033,7 @@ def run_generation(
             if not completed_with_warnings
             else ["scenario_acceptance_qc_failed"]
         ),
-        "seismic_variant_count": len(seismic_variant_records),
+        "seismic_view_count": len(seismic_view_records),
     }
     write_json(output_dir / "run_summary.json", summary)
     if failure_reason == "field_conditioned_no_accepted_realizations":

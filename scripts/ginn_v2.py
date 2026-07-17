@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     predict.add_argument("--eval-patch-index", type=Path, default=None)
     predict.add_argument("--sample-kind", action="append", choices=(
         "base",
-        "seismic_variant",
+        "seismic_view",
     ))
     predict.add_argument("--split", default="validation", choices=("train", "validation", "test", "benchmark", "all"))
     predict.add_argument("--batch-size", type=int, default=8)
@@ -138,6 +138,17 @@ def _benchmark_contract_payload(benchmark: SynthoseisBenchmark) -> dict[str, obj
         "contract_fingerprint_sha256": require_contract_fingerprint(
             benchmark.manifest, label=f"benchmark {benchmark.run_dir}"
         ),
+        "materialized_view_ids": sorted(
+            str(value)
+            for value in benchmark.views.get("view_id", pd.Series(dtype=str)).tolist()
+        ),
+        "materialized_view_spec_hashes": sorted(
+            str(value)
+            for value in benchmark.views.get(
+                "view_spec_sha256", pd.Series(dtype=str)
+            ).tolist()
+            if str(value).strip()
+        ),
     }
 
 
@@ -157,6 +168,31 @@ def _validate_checkpoint_benchmark_compatibility(
         raise ValueError(
             "Prediction benchmark sample-axis contract does not exactly match the checkpoint contract."
         )
+    benchmark_identity = dict(checkpoint.get("benchmark_identity") or {})
+    if not benchmark_identity:
+        raise ValueError("GINN-v2 checkpoint lacks benchmark identity provenance.")
+    matching = [
+        dict(value)
+        for value in benchmark_identity.values()
+        if isinstance(value, Mapping)
+        and str(value.get("schema_version") or "") == actual["schema_version"]
+    ]
+    if len(matching) != 1:
+        raise ValueError(
+            "Prediction benchmark does not match exactly one checkpoint benchmark identity."
+        )
+    expected = matching[0]
+    for key in (
+        "schema_version",
+        "sample_domain",
+        "contract_fingerprint_sha256",
+        "materialized_view_ids",
+        "materialized_view_spec_hashes",
+    ):
+        if expected.get(key) != actual.get(key):
+            raise ValueError(
+                f"Prediction benchmark {key} does not match checkpoint provenance."
+            )
     return actual
 
 
@@ -249,6 +285,40 @@ def run_predict(args: argparse.Namespace) -> None:
         spec_cfg = dict(manifest.get("patching") or manifest.get("patch_spec") or {})
         if not spec_cfg:
             raise ValueError("Model run manifest lacks patching contract.")
+        split_assignment_path_value = str(manifest.get("split_assignment") or "")
+        if not split_assignment_path_value:
+            raise ValueError(
+                "GINN-v2 prediction requires the model run's split_assignment contract "
+                "when rebuilding a v5 patch catalog."
+            )
+        split_assignment_path = resolve_relative_path(
+            split_assignment_path_value,
+            root=REPO_ROOT,
+        )
+        if not split_assignment_path.is_file():
+            raise FileNotFoundError(
+                f"Model run split_assignment.csv not found: {split_assignment_path}"
+            )
+        split_frame = pd.read_csv(
+            split_assignment_path,
+            dtype=str,
+            keep_default_na=False,
+        )
+        required_split_columns = {"realization_id", "split"}
+        missing_split_columns = sorted(required_split_columns - set(split_frame.columns))
+        if missing_split_columns:
+            raise ValueError(
+                "Model run split_assignment.csv is missing required columns: "
+                f"{missing_split_columns}"
+            )
+        if split_frame["realization_id"].duplicated().any():
+            raise ValueError("Model run split_assignment.csv contains duplicate realization_id.")
+        split_assignment = dict(
+            zip(
+                split_frame["realization_id"].astype(str),
+                split_frame["split"].astype(str),
+            )
+        )
         patch_index = build_patch_index(
             benchmark,
             patch_spec=PatchSpec(
@@ -262,6 +332,7 @@ def run_predict(args: argparse.Namespace) -> None:
             validation_fraction=float(manifest.get("validation_fraction", 0.15)),
             test_fraction=float(manifest.get("test_fraction", 0.15)),
             min_valid_samples=1,
+            split_assignment=split_assignment,
         )
         eval_index_path = output_dir / "eval_patch_index.csv"
         patch_index.to_csv(eval_index_path, index=False)
@@ -388,7 +459,6 @@ def run_summarize(args: argparse.Namespace) -> None:
         increment_aggregate = dict(card.get("increment_aggregate") or {})
         canonical_closure_aggregate = dict(card.get("canonical_closure_aggregate") or {})
         lfm_aggregate = dict(card.get("lfm_aggregate") or {})
-        lfm_ideal_aggregate = dict(card.get("lfm_ideal_aggregate") or {})
         oracle_aggregate = dict(card.get("oracle_aggregate") or {})
         geometry_aggregate = dict(card.get("geometry_aggregate") or {})
         geometry_holdout_aggregate = dict(card.get("geometry_holdout_aggregate") or {})
@@ -403,7 +473,7 @@ def run_summarize(args: argparse.Namespace) -> None:
                 "architecture_family": experiment_metadata["architecture_family"],
                 "loss_kinds": experiment_metadata["loss_kinds"],
                 "has_physics_loss": experiment_metadata["has_physics_loss"],
-                "has_mismatch_training": experiment_metadata["has_mismatch_training"],
+                "has_view_training": experiment_metadata["has_view_training"],
                 "metadata_source": experiment_metadata["metadata_source"],
                 "n_patches": card.get("n_patches"),
                 "model_rmse": aggregate.get("mean_rmse"),
@@ -418,9 +488,6 @@ def run_summarize(args: argparse.Namespace) -> None:
                 "lfm_rmse": lfm_aggregate.get("mean_rmse"),
                 "lfm_nrmse": lfm_aggregate.get("mean_nrmse"),
                 "lfm_corr": lfm_aggregate.get("median_corr"),
-                "lfm_ideal_rmse": lfm_ideal_aggregate.get("mean_rmse"),
-                "lfm_ideal_nrmse": lfm_ideal_aggregate.get("mean_nrmse"),
-                "lfm_ideal_corr": lfm_ideal_aggregate.get("median_corr"),
                 "oracle_rmse": oracle_aggregate.get("mean_rmse"),
                 "oracle_nrmse": oracle_aggregate.get("mean_nrmse"),
                 "oracle_corr": oracle_aggregate.get("median_corr"),
@@ -481,7 +548,7 @@ def _load_report_experiment_metadata(report_path: Path) -> dict[str, object]:
         "architecture_family": "",
         "loss_kinds": "",
         "has_physics_loss": False,
-        "has_mismatch_training": False,
+        "has_view_training": False,
         "metadata_source": "unavailable",
     }
     prediction_summary: dict[str, object] = {}
@@ -536,7 +603,7 @@ def _load_report_experiment_metadata(report_path: Path) -> dict[str, object]:
     sources = manifest.get("sources")
     source_map = dict(sources) if isinstance(sources, Mapping) else {}
     loss_kinds: set[str] = set()
-    has_mismatch_training = False
+    has_view_training = False
     stages = manifest.get("stages")
     if isinstance(stages, list):
         for stage in stages:
@@ -552,20 +619,16 @@ def _load_report_experiment_metadata(report_path: Path) -> dict[str, object]:
                 if kind:
                     loss_kinds.add(kind)
                 source = source_map.get(str(block.get("source") or ""), {})
-                if isinstance(source, Mapping) and str(
-                    source.get("input_seismic_variant") or ""
-                ).casefold() == "observed_mismatch":
-                    has_mismatch_training = True
-    if not has_mismatch_training:
+                if isinstance(source, Mapping) and source.get("configured_seismic_view_weights"):
+                    has_view_training = True
+    if not has_view_training:
         for source in source_map.values():
-            if isinstance(source, Mapping) and str(
-                source.get("input_seismic_variant") or ""
-            ).casefold() == "observed_mismatch":
-                has_mismatch_training = True
+            if isinstance(source, Mapping) and source.get("configured_seismic_view_weights"):
+                has_view_training = True
                 break
     metadata["loss_kinds"] = ",".join(sorted(loss_kinds))
     metadata["has_physics_loss"] = "physics" in loss_kinds
-    metadata["has_mismatch_training"] = has_mismatch_training
+    metadata["has_view_training"] = has_view_training
     return metadata
 
 
@@ -579,9 +642,9 @@ def _parse_report_spec(spec: str) -> tuple[str, str, Path]:
 def _canonical_ablation_report_card(
     summary: pd.DataFrame, frequency_path: Path
 ) -> dict[str, object]:
-    """Build the v4 coverage card from manifest/closure fields only.
+    """Build the v5 coverage card from manifest/closure fields only.
 
-    Frequency probes are not part of the v4 canonical benchmark.  Keeping the
+    Frequency probes are not part of the v5 canonical benchmark.  Keeping the
     coverage gate on increment and closure metrics makes arbitrary experiment
     IDs harmless and prevents the historical probe report from becoming a
     deployment gate.
@@ -616,7 +679,7 @@ def _canonical_ablation_report_card(
     }
     statements = [
         "Coverage is derived from checkpoint manifests and explicit closure metrics; experiment-id text is descriptive only.",
-        "The v4 canonical benchmark has no frequency-probe coverage gate.",
+        "The v5 canonical benchmark has no frequency-probe coverage gate.",
     ]
     return {
         "schema_version": ABLATION_REPORT_CARD_SCHEMA_VERSION,

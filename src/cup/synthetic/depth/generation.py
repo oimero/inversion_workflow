@@ -1,4 +1,4 @@
-"""Depth field-conditioned pipeline and domain-specific variant orchestration."""
+"""Depth field-conditioned pipeline and domain-specific view orchestration."""
 
 from __future__ import annotations
 
@@ -13,10 +13,7 @@ import pandas as pd
 import scipy
 from scipy.signal import hilbert
 
-from cup.impedance import (
-    build_lfm_producer_contract,
-    generation_contract,
-)
+from cup.impedance import generation_contract
 from cup.petrel.load import import_interpretation_petrel
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
@@ -24,8 +21,6 @@ from cup.seismic.wavelet import load_wavelet_csv
 from cup.synthetic.core.calibration import ImpedanceCalibration
 from cup.synthetic.core import build_attempt_plan as build_core_attempt_plan
 from cup.synthetic.core import (
-    build_lfm_degradation_metadata,
-    build_seismic_variant_metadata,
     build_seismic_input_contract,
     build_mask_contract,
     geometry_feasibility_rows,
@@ -45,9 +40,11 @@ from cup.synthetic.reporting.figures import write_generation_figures
 from cup.synthetic.core.lfm import LfmPolicy
 from cup.synthetic.core.geometry import resample_section_path, validate_line_geometry
 from cup.synthetic.core.signal import finite_support_fir, valid_filter_decimate
-from cup.synthetic.core.variant_runner import generate_seismic_variants
+from cup.synthetic.core.pipeline import SeismicViewContext
+from cup.synthetic.adapters import DepthSyntheticDomainAdapter
+from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
 from cup.synthetic.core.random import RandomNamespace
-from cup.synthetic.core.records import BenchmarkVariant, DepthForwardExtras
+from cup.synthetic.core.records import BenchmarkView, DepthForwardExtras
 from cup.synthetic.core.rejections import StagedRejection, frozen_external_reason
 from cup.synthetic.core.sample_builder import (
     BenchmarkBuildPolicy,
@@ -56,7 +53,7 @@ from cup.synthetic.core.sample_builder import (
 )
 from cup.synthetic.core.scenarios import GenerationScenario, generation_scenarios
 from cup.synthetic.core.truth import TruthGenerationRequest, generate_field_conditioned_truth
-from cup.synthetic.core.writer import write_benchmark_sample, write_benchmark_variant
+from cup.synthetic.core.writer import write_benchmark_sample, write_benchmark_view
 from cup.synthetic.depth.config import CALIBRATION_SCHEMA, GENERATOR_FAMILY, SCHEMA_VERSION
 from cup.synthetic.depth.model import DepthGeneratedSection, DepthSectionGeometry
 from cup.synthetic.depth.calibration_adapter import (
@@ -303,7 +300,6 @@ def generate_depth_realization(
             random_namespace=namespace,
             realization_id=realization_id,
             horizon_coordinates=section.horizon_tvdss_m,
-            controlled_degraded=script_cfg["lfm"]["controlled_degraded"],
         ),
         build_policy=BenchmarkBuildPolicy(
             domain_metadata={
@@ -343,12 +339,8 @@ def generate_depth_realization(
         seismic_observed=forward.seismic_observed,
         seismic_model_consistent=forward.seismic_model_consistent,
         subgrid_forward_residual=forward.subgrid_forward_residual,
-        lfm_ideal=sample.input_lfm_canonical_log_ai,
-        lfm_controlled_degraded=sample.input_lfm_controlled_degraded_log_ai,
-        residual_vs_lfm_ideal=sample.residuals.residual_vs_lfm_ideal,
-        residual_vs_lfm_controlled_degraded=(
-            sample.residuals.residual_vs_lfm_controlled_degraded
-        ),
+        canonical_background_log_ai=sample.input_lfm_canonical_log_ai,
+        target_increment_log_ai=sample.target_increment_log_ai,
         valid_mask_model=sample.valid_mask,
         categorical=categorical,
         object_catalog=depth_catalog_from_synthetic_truth(truth.object_catalog),
@@ -391,7 +383,7 @@ def build_attempt_plan(
     )
 
 
-def _write_variants(
+def _write_views(
     h5: h5py.File | None,
     section: DepthGeneratedSection,
     *,
@@ -400,40 +392,24 @@ def _write_variants(
     repo_root: Path,
     forward_executor: DepthForwardExecutor,
 ) -> list[dict[str, Any]]:
-    """Depth configuration and Forward Adapters for the shared variant runner."""
-    config = script_cfg["seismic_mismatch"]
-    if not bool(config["enabled"]):
+    """Depth Adapter seam for the shared v5 seismic-view Module."""
+    view_pipeline = SyntheticBenchmarkPipeline(
+        DepthSyntheticDomainAdapter()
+    ).build_view_pipeline(
+        {
+            "sample_domain": "depth",
+            "seismic_views": script_cfg["seismic_views"],
+            "global_seed": int(script_cfg["global_seed"]),
+            "generator_family": GENERATOR_FAMILY,
+        }
+    )
+    if not view_pipeline.specs:
         return []
     wavelet_time, wavelet = load_wavelet_csv(
         resolve_relative_path(forward_inputs["wavelet"]["path"], root=repo_root)
     )
     factor = int(script_cfg["sampling"]["vertical_oversampling_factor"])
     taps = finite_support_fir(factor)
-    depth_noise = dict(config["noise"])
-    depth_gain = dict(config["gain"])
-    common_config = {
-        "enabled": True,
-        "wavelet": dict(config["wavelet"]),
-        "noise": {
-            "white_noise_rms_fraction": float(depth_noise["white_noise_rms_fraction"]),
-            "colored_noise_rms_fraction": float(depth_noise["colored_noise_rms_fraction"]),
-            "colored_axis_correlation_length": float(
-                depth_noise["colored_vertical_correlation_m"]
-            ),
-        },
-        "gain": {
-            "global_log_sigma": float(depth_gain["global_log_sigma"]),
-            "tracewise_log_sigma": float(depth_gain["tracewise_log_sigma"]),
-            "axis_lateral_log_sigma": float(depth_gain["vertical_lateral_log_sigma"]),
-            "lateral_correlation_fraction": float(depth_gain["lateral_correlation_fraction"]),
-            "axis_correlation_fraction": float(depth_gain["vertical_correlation_fraction"]),
-        },
-        "combined": {
-            key: value
-            for key, value in dict(config["combined"]).items()
-            if key != "depth_static_m"
-        },
-    }
 
     def perturbed_forward(
         phase_degrees: float, shift_s: float
@@ -457,56 +433,39 @@ def _write_variants(
         base_mask = np.asarray(section.valid_mask_model, dtype=bool)
         if np.any(base_mask & ~support):
             raise ValueError(
-                "invalid_seismic_variant:perturbed_wavelet_support_incomplete"
+                "invalid_seismic_view:perturbed_wavelet_support_incomplete"
             )
         return observed, base_mask
 
-    results = generate_seismic_variants(
-        seismic_input=section.seismic_observed,
-        valid_mask=section.valid_mask_model,
-        lateral_m=section.geometry.lateral_m,
-        sample_axis=section.tvdss_model_m,
-        config=common_config,
-        global_seed=int(script_cfg["global_seed"]),
-        generator_family=GENERATOR_FAMILY,
-        realization_id=section.realization_id,
-        perturbed_wavelet_forward=perturbed_forward,
-        axis_static_shifts=tuple(
-            float(value) for value in config["depth_static"]["shift_m"]
+    results = view_pipeline.generate(
+        SeismicViewContext(
+            realization_id=section.realization_id,
+            base_seismic=section.seismic_observed,
+            valid_mask=section.valid_mask_model,
+            lateral_m=section.geometry.lateral_m,
+            sample_axis=section.tvdss_model_m,
         ),
-        combined_axis_static_shift=float(
-            dict(config["combined"]).get("depth_static_m", 0.0)
-        ),
-        base_operator_support=np.isfinite(section.seismic_observed),
+        perturbed_forward=perturbed_forward,
     )
     rows: list[dict[str, Any]] = []
     for result in results:
         if h5 is not None:
-            write_benchmark_variant(
+            write_benchmark_view(
                 h5,
-                BenchmarkVariant(
+                BenchmarkView(
                     owner_realization_id=section.realization_id,
-                    variant_id=result.variant_id,
-                    sample_kind="seismic_variant",
+                    view_id=result.view_id,
                     seismic_observed=result.seismic_observed,
                     positive_gain=result.positive_gain,
                     additive_noise=result.additive_noise,
-                    metadata={
-                        "mismatch_family": result.mismatch_family,
-                        "operator_source": result.operator_source,
-                        "parameters": result.parameters,
-                    },
+                    metadata=dict(result.metadata),
                     qc=result.qc,
                     sample_domain="depth",
                 ),
             )
         rows.append({
-            **build_seismic_variant_metadata(
-                variant_id=result.variant_id,
-                mismatch_family=result.mismatch_family,
-                operator_source=result.operator_source,
-                parameters=result.parameters,
-            ),
+            **dict(result.metadata),
+            "view_id": result.view_id,
             **result.qc,
         })
     return rows
@@ -706,7 +665,9 @@ def run_depth_generation(
     coefficient_rows: list[dict[str, Any]] = []
     highres_rows: list[dict[str, Any]] = []
     subgrid_rows: list[dict[str, Any]] = []
-    variant_rows: list[dict[str, Any]] = []
+    view_result_rows: list[dict[str, Any]] = []
+    realization_rows: list[dict[str, Any]] = []
+    view_rows: list[dict[str, Any]] = []
     generation_qc_rows: list[dict[str, Any]] = []
     h5_path = output_dir / "synthetic_benchmark.h5"
     with AttemptProgressLog(
@@ -722,6 +683,7 @@ def run_depth_generation(
         for key, value in SCIENCE_CONTRACT.items():
             h5.attrs[key] = value
         h5.attrs["sample_domain"] = "depth"
+        h5.attrs["sample_unit"] = "m"
         h5.attrs["depth_basis"] = "tvdss"
         h5.attrs["axis_positive_direction"] = "down"
         h5.attrs["generator_family"] = GENERATOR_FAMILY
@@ -784,9 +746,8 @@ def run_depth_generation(
                     "model_dz_m": float(np.diff(generated.tvdss_model_m[:2])[0]),
                     "physics_halo_m": generated.qc["physics_halo_m"],
                     "physics_halo_samples": generated.qc["physics_halo_samples"],
-                    "lfm_variant_id": "controlled_default",
-                    "input_lfm_log_ai_dataset": (
-                        "" if qc_only else f"{group_path}/priors/input_lfm_variants/controlled_default/log_ai"
+                    "canonical_background_dataset": (
+                        "" if qc_only else f"{group_path}/priors/canonical_background_log_ai"
                     ),
                 })
                 local_index_rows = [
@@ -808,8 +769,9 @@ def run_depth_generation(
                         "valid_sample_count": int(np.count_nonzero(generated.valid_mask_model)),
                     }
                 ]
-                local_variant_rows = []
-                generated_variants = _write_variants(
+                local_view_result_rows = []
+                local_view_rows = []
+                generated_views = _write_views(
                     None if qc_only else h5,
                     generated,
                     script_cfg=script_cfg,
@@ -817,24 +779,33 @@ def run_depth_generation(
                     repo_root=repo_root,
                     forward_executor=forward_executor,
                 )
-                for variant in generated_variants:
-                    variant_id = f"{base_id}__{variant['variant_id']}"
-                    variant_path = (
+                for view in generated_views:
+                    view_id = str(view["view_id"])
+                    view_sample_id = f"{base_id}__view__{view_id}"
+                    view_path = (
                         ""
                         if qc_only
-                        else f"{group_path}/seismic_variants/{variant['variant_id']}"
+                        else f"{group_path}/seismic_views/{view_id}"
                     )
                     local_index_rows.append(
                         {
                             **common,
-                            "sample_id": variant_id,
-                            "sample_kind": "seismic_variant",
-                            "seismic_variant_id": variant["variant_id"],
+                            "sample_id": view_sample_id,
+                            "sample_kind": "seismic_view",
+                            "view_id": view_id,
+                            "view_spec_sha256": view["view_spec_sha256"],
+                            "view_spec_canonical_json": view["view_spec_canonical_json"],
+                            "operator_ids_json": json.dumps(view["operator_ids"], sort_keys=True),
+                            "operator_kinds_json": json.dumps(view["operator_kinds"], sort_keys=True),
+                            "operator_parameters_json": json.dumps(view.get("operator_parameters", {}), sort_keys=True),
+                            "operator_contract_versions_json": json.dumps(view.get("operator_contract_versions", {}), sort_keys=True),
+                            "random_stream_identity_json": json.dumps(view.get("random_stream_identity", {}), sort_keys=True),
+                            "operator_trace_dataset": "" if qc_only else f"{view_path}/operator_trace_json",
                             "source_sample_id": base_id,
-                            "hdf5_group": variant_path,
+                            "hdf5_group": view_path,
                             "seismic_input_dataset": ""
                             if qc_only
-                            else f"{variant_path}/seismic_observed",
+                            else f"{view_path}/seismic_observed",
                             "seismic_model_consistent_dataset": ""
                             if qc_only
                             else f"{group_path}/seismic/seismic_model_consistent",
@@ -842,32 +813,34 @@ def run_depth_generation(
                             if qc_only
                             else f"{group_path}/masks/valid_mask",
                             "valid_sample_count": int(np.count_nonzero(generated.valid_mask_model)),
-                            "seismic_mismatch_family": variant["mismatch_family"],
-                            "seismic_variant_operator_source": variant["operator_source"],
-                            "seismic_variant_parameters_json": json.dumps(
-                                {
-                                    str(key): value
-                                    for key, value in variant.items()
-                                    if key not in {
-                                        "variant_id",
-                                        "mismatch_family",
-                                        "operator_source",
-                                    }
-                                },
-                                sort_keys=True,
-                            ),
-                            "mismatch_parameters_json": json.dumps(
-                                {
-                                    key: value
-                                    for key, value in variant.items()
-                                    if key not in {"variant_id", "mismatch_family"}
-                                },
-                                sort_keys=True,
-                            ),
                         }
                     )
-                    local_variant_rows.append(
-                        {"parent_realization_id": base_id, **variant}
+                    local_view_result_rows.append(
+                        {"parent_realization_id": base_id, **view}
+                    )
+                    local_view_rows.append(
+                        {
+                            "parent_realization_id": base_id,
+                            "realization_id": base_id,
+                            "view_id": view_id,
+                            "sample_domain": "depth",
+                            "sample_unit": "m",
+                            "evaluation_role": row["evaluation_role"],
+                            "hdf5_group": view_path,
+                            "seismic_input_dataset": "" if qc_only else f"{view_path}/seismic_observed",
+                            "seismic_model_consistent_dataset": "" if qc_only else f"{group_path}/seismic/seismic_model_consistent",
+                            "valid_mask_dataset": "" if qc_only else f"{group_path}/masks/valid_mask",
+                            "view_spec_sha256": view["view_spec_sha256"],
+                            "view_spec_canonical_json": view["view_spec_canonical_json"],
+                            "operator_ids_json": json.dumps(view["operator_ids"], sort_keys=True),
+                            "operator_kinds_json": json.dumps(view["operator_kinds"], sort_keys=True),
+                            "operator_parameters_json": json.dumps(view.get("operator_parameters", {}), sort_keys=True),
+                            "operator_contract_versions_json": json.dumps(view.get("operator_contract_versions", {}), sort_keys=True),
+                            "random_stream_identity_json": json.dumps(view.get("random_stream_identity", {}), sort_keys=True),
+                            "operator_trace_dataset": "" if qc_only else f"{view_path}/operator_trace_json",
+                            "seismic_observed_dataset": "" if qc_only else f"{view_path}/seismic_observed",
+                            "n_valid": int(np.count_nonzero(generated.valid_mask_model)),
+                        }
                     )
                 local_highres_row = {
                     "parent_realization_id": base_id,
@@ -906,9 +879,33 @@ def run_depth_generation(
                     **generated.qc,
                 }
                 # Commit tabular records only after the complete HDF5 parent,
-                # including every configured variant and QC row, is ready.
+                # including every configured view and QC row, is ready.
                 index_rows.extend(local_index_rows)
-                variant_rows.extend(local_variant_rows)
+                realization_rows.append(
+                    {
+                        "realization_id": base_id,
+                        "sample_domain": "depth",
+                        "sample_unit": "m",
+                        "depth_basis": "tvdss",
+                        "section_id": section.section_id,
+                        "scenario_id": scenario.scenario_id,
+                        "geometry_family": scenario.geometry_family,
+                        "duration_mode": scenario.duration_mode,
+                        "suite": "field_conditioned",
+                        "evaluation_role": row["evaluation_role"],
+                        "parent_realization_id": base_id,
+                        "hdf5_group": group_path,
+                        "base_seismic_dataset": "" if qc_only else f"{group_path}/seismic/seismic_observed",
+                        "seismic_model_consistent_dataset": "" if qc_only else f"{group_path}/seismic/seismic_model_consistent",
+                        "valid_mask_dataset": "" if qc_only else f"{group_path}/masks/valid_mask",
+                        "target_dataset": "" if qc_only else f"{group_path}/truth/model_target_log_ai",
+                        "canonical_background_dataset": "" if qc_only else f"{group_path}/priors/canonical_background_log_ai",
+                        "target_increment_dataset": "" if qc_only else f"{group_path}/targets/target_increment_log_ai",
+                        "n_valid": int(np.count_nonzero(generated.valid_mask_model)),
+                    }
+                )
+                view_rows.extend(local_view_rows)
+                view_result_rows.extend(local_view_result_rows)
                 object_rows.extend(generated.object_catalog)
                 coefficient_rows.extend(generated.object_lateral_coefficients)
                 highres_rows.append(local_highres_row)
@@ -964,7 +961,9 @@ def run_depth_generation(
         index_rows,
         sort_by=("section_id", "scenario_id", "attempt_id", "sample_kind", "sample_id"),
     )
-    index.to_csv(output_dir / "sample_index.csv", index=False)
+    SyntheticBenchmarkPipeline(DepthSyntheticDomainAdapter()).publish_indexes(
+        output_dir, realization_rows, view_rows
+    )
     stable_records_frame(
         object_rows,
         sort_by=("realization_id", "zone_id", "object_id"),
@@ -996,10 +995,10 @@ def run_depth_generation(
         output_dir / "subgrid_forward_qc.csv", index=False
     )
     stable_records_frame(
-        variant_rows,
-        sort_by=("parent_realization_id", "variant_id"),
+        view_result_rows,
+        sort_by=("parent_realization_id", "view_id"),
     ).to_csv(
-        output_dir / "seismic_variant_results.csv", index=False
+        output_dir / "seismic_view_results.csv", index=False
     )
     stable_records_frame(
         generation_qc_rows,
@@ -1080,14 +1079,14 @@ def run_depth_generation(
                     "generation": dict(script_cfg["generation"]),
                     "seismic_input": dict(script_cfg["seismic_input"]),
                     "seismic_forward": dict(script_cfg["seismic_forward"]),
-                    "lfm": dict(script_cfg["lfm"]),
-                    "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
+                    "seismic_views": dict(script_cfg["seismic_views"]),
                     "mask_contract": build_mask_contract(),
                 },
                 input_contracts=input_contracts,
                 primary_artifacts={
                     "synthetic_benchmark": h5_path,
-                    "sample_index": output_dir / "sample_index.csv",
+                    "realization_index": output_dir / "realization_index.csv",
+                    "seismic_view_index": output_dir / "seismic_view_index.csv",
                 },
             ),
         }
@@ -1106,28 +1105,13 @@ def run_depth_generation(
         "failure_reason": failure_reason,
         "input_contracts": input_contracts,
         "sample_domain": "depth",
+        "sample_unit": "m",
         "mask_contract": build_mask_contract(),
         "increment_contract": generation_contract("depth", float(script_cfg["sampling"]["expected_model_dz_m"])).as_dict(),
         "seismic_input_contract": build_seismic_input_contract(
             "depth", operator="depth_ai_vp_highres_forward_antialias"
         ),
         "seismic_forward": forward_executor.manifest_fields,
-        "lfm_degradation": build_lfm_degradation_metadata(
-            "depth",
-            axis_unit="m",
-            component_values=script_cfg["lfm"]["controlled_degraded"],
-        ),
-        "input_lfm_variants": ["canonical", "controlled_default"],
-        "lfm_contract": build_lfm_producer_contract(
-            generation_contract(
-                "depth", float(script_cfg["sampling"]["expected_model_dz_m"])
-            ),
-            producer_schema=SCHEMA_VERSION,
-            variant_selection={
-                "selected": "controlled_default",
-                "available": ["canonical", "controlled_default"],
-            },
-        ),
         "depth_basis": "tvdss",
         "generator_family": GENERATOR_FAMILY,
         "suite": "field_conditioned",
@@ -1152,7 +1136,7 @@ def run_depth_generation(
             ),
         },
         "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
-        "canonical_enabled": False,
+        "seismic_views": dict(script_cfg["seismic_views"]),
         "geometry_filters": sorted({str(value) for value in geometry_families})
         if geometry_families
         else sorted(
@@ -1161,8 +1145,6 @@ def run_depth_generation(
         "acceptance_qc": acceptance_qc,
         "preflight": preflight_summary,
         "sampling": dict(script_cfg["sampling"]),
-        "lfm": dict(script_cfg["lfm"]),
-        "seismic_mismatch": dict(script_cfg["seismic_mismatch"]),
         "source_runs": {
             key: repo_relative_path(path, root=repo_root)
             for key, path in sources.items()
@@ -1231,8 +1213,7 @@ def run_depth_generation(
                 "coefficient_<name>",
                 "coefficient_lateral",
                 "thickness_lateral",
-                "lfm_degradation/<component coefficient name>",
-                "seismic_mismatch/<variant id>/<component coefficient name>",
+                "seismic_view/<view id>/<operator id>",
             ],
         },
         "quality_warnings": (

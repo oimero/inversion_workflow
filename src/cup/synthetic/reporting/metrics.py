@@ -97,8 +97,7 @@ def metric_row(
         "probe_lateral_shape",
         "probe_amplitude_multiplier",
         "paired_zero_sample_id",
-        "seismic_variant_id",
-        "seismic_mismatch_family",
+        "view_id",
     ]
     row = {key: sample_row.get(key, "") for key in keys}
     row["baseline_id"] = baseline_id

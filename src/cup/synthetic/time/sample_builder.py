@@ -109,9 +109,7 @@ def build_time_field_sample(
             random_namespace=namespace,
             realization_id=realization_id,
             horizon_coordinates=section.horizon_twt_s,
-            controlled_degraded=script_cfg["lfm"]["controlled_degraded"],
             zone_id_model=None,
-            degradation_variant_id="controlled_default",
         ),
         build_policy=BenchmarkBuildPolicy(
             require_forward_support=True,

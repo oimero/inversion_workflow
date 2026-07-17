@@ -18,7 +18,7 @@ from cup.synthetic.schemas import (
     require_science_contract,
 )
 from cup.synthetic.readers.depth import DepthBenchmark, DepthSyntheticSample
-from cup.synthetic.readers.time import TimeBenchmark, TimeSyntheticSample
+from cup.synthetic.readers.time import TimeBenchmark, TimeSyntheticSample, V5SeismicView
 from cup.synthetic.core.protocols import SyntheticSampleProtocol
 
 
@@ -52,12 +52,12 @@ class SynthoseisBenchmark:
 
         if schema == LEGACY_BENCHMARK_SCHEMA_VERSION:
             raise ValueError(
-                "Legacy Synthoseis artifacts are not accepted by the v4 reader."
+                "Legacy Synthoseis artifacts are not accepted by the v5 reader."
             )
         if schema == FROZEN_BENCHMARK_SCHEMA_VERSION:
             raise ValueError(
                 "Frozen Synthoseis v3 artifacts are baseline-only and are not accepted "
-                "by the v4 canonical-increment reader."
+                "by the v5 canonical-increment reader."
             )
         if schema == BENCHMARK_SCHEMA_VERSION:
             require_science_contract(manifest, label="Synthoseis benchmark manifest")
@@ -100,6 +100,18 @@ class SynthoseisBenchmark:
     def load_sample(self, sample_id: str) -> SyntheticSample:
         return self._reader.load_sample(sample_id)
 
+    def realization_ids(self, **kwargs: Any) -> list[str]:
+        return self._reader.realization_ids(**kwargs)
+
+    def load_realization(self, realization_id: str) -> SyntheticSample:
+        return self._reader.load_realization(realization_id)
+
+    def available_view_ids(self, realization_id: str) -> list[str]:
+        return self._reader.available_view_ids(realization_id)
+
+    def load_seismic_view(self, realization_id: str, view_id: str) -> V5SeismicView:
+        return self._reader.load_seismic_view(realization_id, view_id)
+
 
 __all__ = [
     "DepthSyntheticSample",
@@ -109,4 +121,5 @@ __all__ = [
     "SynthoseisBenchmark",
     "TimeBenchmark",
     "TimeSyntheticSample",
+    "V5SeismicView",
 ]

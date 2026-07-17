@@ -42,10 +42,8 @@ class DepthGeneratedSection:
     seismic_observed: np.ndarray
     seismic_model_consistent: np.ndarray
     subgrid_forward_residual: np.ndarray
-    lfm_ideal: np.ndarray
-    lfm_controlled_degraded: np.ndarray
-    residual_vs_lfm_ideal: np.ndarray
-    residual_vs_lfm_controlled_degraded: np.ndarray
+    canonical_background_log_ai: np.ndarray
+    target_increment_log_ai: np.ndarray
     valid_mask_model: np.ndarray
     categorical: dict[str, np.ndarray]
     object_catalog: list[dict[str, Any]]

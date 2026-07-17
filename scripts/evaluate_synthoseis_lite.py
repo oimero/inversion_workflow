@@ -36,7 +36,7 @@ from cup.utils.io import (
 )
 
 
-BASELINES = ("lfm_controlled_degraded", "lfm_ideal", "oracle_target")
+BASELINES = ("canonical_background_log_ai", "oracle_target")
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,13 +45,13 @@ def parse_args() -> argparse.Namespace:
         "--benchmark-dir",
         type=Path,
         required=True,
-        help="Directory containing synthetic_benchmark.h5 and sample_index.csv.",
+        help="Directory containing the v5 HDF5 benchmark and parent/view indexes.",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument(
         "--sample-kind",
         action="append",
-        choices=("base", "seismic_variant"),
+        choices=("base", "seismic_view"),
         default=None,
         help="Restrict evaluation to one or more sample kinds.",
     )
@@ -137,7 +137,7 @@ def main() -> None:
         if args.sample_kind
         else {
             "base",
-            "seismic_variant",
+            "seismic_view",
         }
     )
     baselines = list(dict.fromkeys(args.baseline or BASELINES))
@@ -180,8 +180,7 @@ def main() -> None:
         "baseline_aggregate": aggregate_metric_rows(sample_rows),
         "semantics": {
             "oracle_target": "pipeline self-check only, not a model baseline",
-            "lfm_ideal": "ideal lowpass prior copied from benchmark",
-            "lfm_controlled_degraded": "field-like degraded LFM prior copied from benchmark",
+            "canonical_background_log_ai": "canonical background shared by every parent/view",
         },
     }
     report_path = output_dir / "model_report_card.json"

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
+import json
 from typing import Any, Iterable, Mapping
 
 import numpy as np
@@ -29,7 +30,7 @@ class PatchSpec:
 def default_eval_kinds() -> set[str]:
     return {
         "base",
-        "seismic_variant",
+        "seismic_view",
     }
 
 
@@ -55,7 +56,7 @@ def _parent_id(row: Mapping[str, Any]) -> str:
         value = _clean_text(row.get(key))
         if value:
             return value
-    raise ValueError("Cannot derive parent realization id from sample_index row.")
+    raise ValueError("Cannot derive parent realization id from benchmark patch row.")
 
 
 def _derive_split(
@@ -117,7 +118,7 @@ def _aligned_arrays(
         )
     if seismic.shape != target.shape:
         raise ValueError(
-            f"{sample_domain.capitalize()} v4 requires N-point seismic/target alignment "
+            f"{sample_domain.capitalize()} v5 requires N-point seismic/target alignment "
             f"for {sample.sample_id}: {seismic.shape} vs {target.shape}"
         )
     if (
@@ -179,9 +180,34 @@ def build_patch_index(
     test_fraction: float = 0.15,
     max_patches: int | None = None,
     min_valid_samples: int = 1,
+    split_assignment: Mapping[str, str] | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    sample_ids = benchmark.sample_ids(kinds=sample_kinds, status="ok")
+    requested_kinds = {str(value) for value in sample_kinds}
+    if not requested_kinds:
+        raise ValueError("sample_kinds must contain at least one benchmark kind.")
+    if not requested_kinds.issubset({"base", "seismic_view"}):
+        raise ValueError(
+            "Synthoseis v5 patch catalogs accept only base and seismic_view kinds."
+        )
+    # A v5 patch catalog is parent-owned.  Views are selected by the sampler
+    # after a parent/window has been selected and are therefore never copied
+    # into the catalog as additional rows.
+    sample_ids = benchmark.sample_ids(kinds={"base"}, status="ok")
+    if getattr(benchmark, "schema", "") == "synthoseis_lite_v5" and split_assignment is None:
+        raise ValueError(
+            "Synthoseis v5 patch catalogs require a GINN-owned split_assignment."
+        )
+    if split_assignment is not None:
+        assignment_keys = {str(key) for key in split_assignment}
+        benchmark_keys = {str(value) for value in sample_ids}
+        missing = sorted(benchmark_keys - assignment_keys)
+        extra = sorted(assignment_keys - benchmark_keys)
+        if missing or extra:
+            raise ValueError(
+                "split_assignment must contain exactly the benchmark parent IDs; "
+                f"missing={missing[:5]}, extra={extra[:5]}"
+            )
     held_out_geometry_family = str(
         dict(getattr(benchmark, "manifest", {}).get("split_policy") or {}).get(
             "held_out_geometry_family"
@@ -201,14 +227,19 @@ def build_patch_index(
         if not lateral_starts or not twt_starts:
             continue
         row = sample.row
-        split = _row_split(
-            row,
-            split_policy=split_policy,
-            validation_fraction=validation_fraction,
-            test_fraction=test_fraction,
-            held_out_geometry_family=held_out_geometry_family,
-        )
         parent = _parent_id(row)
+        if split_assignment is not None:
+            split = str(split_assignment.get(parent) or "")
+            if split not in SPLIT_VALUES - {"benchmark"}:
+                raise ValueError(f"split_assignment lacks parent {parent!r} or contains an invalid split.")
+        else:
+            split = _row_split(
+                row,
+                split_policy=split_policy,
+                validation_fraction=validation_fraction,
+                test_fraction=test_fraction,
+                held_out_geometry_family=held_out_geometry_family,
+            )
         for lateral_start in lateral_starts:
             for twt_start in twt_starts:
                 patch_mask = valid[
@@ -220,15 +251,16 @@ def build_patch_index(
                     continue
                 valid_fraction = float(np.mean(patch_mask))
                 patch_id = (
-                    f"{sample_id}__l{lateral_start:04d}_{lateral_start + patch_spec.lateral_samples:04d}"
+                    f"{parent}__l{lateral_start:04d}_{lateral_start + patch_spec.lateral_samples:04d}"
                     f"__t{twt_start:04d}_{twt_start + patch_spec.twt_samples:04d}"
                 )
                 rows.append(
                     {
                         "patch_id": patch_id,
-                        "sample_id": sample_id,
-                        "source_sample_id": row.get("source_sample_id", ""),
-                        "sample_kind": row.get("sample_kind", "base"),
+                        "sample_id": parent,
+                        "source_sample_id": "",
+                        "sample_kind": "base",
+                        "catalog_role": "parent_patch",
                         "parent_realization_id": parent,
                         "split": split,
                         "evaluation_role": row.get("evaluation_role", ""),
@@ -244,11 +276,8 @@ def build_patch_index(
                         "patch_twt_samples": patch_spec.twt_samples,
                         "valid_fraction": valid_fraction,
                         "valid_samples": valid_count,
-                        "paired_zero_sample_id": row.get("paired_zero_sample_id", ""),
-                        "seismic_variant_id": row.get("seismic_variant_id", ""),
-                        "seismic_mismatch_family": row.get(
-                            "seismic_mismatch_family", ""
-                        ),
+                        "paired_zero_sample_id": "",
+                        "view_id": "",
                         "suite": row.get("suite", ""),
                         "section_id": row.get("section_id", ""),
                         "scenario_id": row.get("scenario_id", ""),
@@ -280,9 +309,9 @@ def _attach_paired_zero_patch_ids(frame: pd.DataFrame) -> pd.DataFrame:
         key = (str(row.get("sample_id", "")), *window)
         keys[key] = str(row["patch_id"])
         source_sample = _clean_text(row.get("source_sample_id"))
-        seismic_variant = _clean_text(row.get("seismic_variant_id"))
-        if source_sample and seismic_variant:
-            variant_keys[(source_sample, seismic_variant, *window)] = str(
+        view_id = _clean_text(row.get("view_id"))
+        if source_sample and view_id:
+            variant_keys[(source_sample, view_id, *window)] = str(
                 row["patch_id"]
             )
     paired = []
@@ -301,8 +330,8 @@ def _attach_paired_zero_patch_ids(frame: pd.DataFrame) -> pd.DataFrame:
         if direct:
             paired.append(direct)
             continue
-        seismic_variant = _clean_text(row.get("seismic_variant_id"))
-        paired.append(variant_keys.get((pair_sample, seismic_variant, *window), ""))
+        view_id = _clean_text(row.get("view_id"))
+        paired.append(variant_keys.get((pair_sample, view_id, *window), ""))
     frame["paired_zero_patch_id"] = paired
     return frame
 
@@ -312,43 +341,59 @@ def _finite_values(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return np.asarray(values, dtype=np.float64)[valid]
 
 
+def _parent_uniform_mean_std(chunks: Mapping[str, np.ndarray]) -> tuple[float, float]:
+    """Compute moments with equal total weight for every parent realization."""
+    usable = [np.asarray(values, dtype=np.float64) for values in chunks.values() if np.asarray(values).size]
+    if not usable:
+        raise ValueError("No finite parent values are available for normalization.")
+    means = np.asarray([float(np.mean(values)) for values in usable], dtype=np.float64)
+    second = np.asarray([float(np.mean(np.square(values))) for values in usable], dtype=np.float64)
+    mean = float(np.mean(means))
+    variance = max(0.0, float(np.mean(second)) - mean * mean)
+    return mean, float(np.sqrt(variance))
+
+
 def compute_normalization(
     benchmark: SynthoseisBenchmark,
     patch_index: pd.DataFrame,
 ) -> dict[str, Any]:
-    train = patch_index[patch_index["split"].eq("train")]
+    train = patch_index[
+        patch_index["split"].eq("train")
+        & patch_index["sample_kind"].astype(str).eq("base")
+    ]
     if train.empty:
         raise ValueError("Cannot compute normalization without train patches.")
-    buckets = {"seismic": [], "lfm": []}
+    buckets: dict[str, dict[str, np.ndarray]] = {"seismic": {}, "lfm": {}}
     samples: dict[str, Any] = {}
-    for _, row in train.iterrows():
-        sample_id = str(row["sample_id"])
+    for sample_id in sorted(set(train["sample_id"].astype(str))):
         if sample_id not in samples:
             samples[sample_id] = benchmark.load_sample(sample_id)
         sample = samples[sample_id]
         target, seismic, lfm, valid = _aligned_arrays(sample)
-        sl = _row_slice(row)
-        patch_valid = valid[sl]
-        patch_target = target[sl]
-        patch_seismic = seismic[sl]
-        patch_lfm = lfm[sl]
-        input_valid = np.isfinite(patch_seismic) & np.isfinite(patch_lfm)
-        buckets["seismic"].append(_finite_values(patch_seismic, input_valid))
-        buckets["lfm"].append(_finite_values(patch_lfm, input_valid))
+        input_valid = valid & np.isfinite(seismic) & np.isfinite(lfm)
+        buckets["seismic"][sample_id] = _finite_values(seismic, input_valid)
+        buckets["lfm"][sample_id] = _finite_values(lfm, input_valid)
     stats = {
         "normalization_scope": "train_only",
         "normalization_mask": "finite_non_padding",
         "time_alignment": "explicit_lower_interface_N_point_operator",
+        "seismic_reference": "base_only",
+        "lfm_reference": "canonical_background",
+        "parent_weighting": "uniform",
+        "split": "train",
     }
     for key, chunks in buckets.items():
-        values = np.concatenate([chunk for chunk in chunks if chunk.size])
-        if values.size < 2:
+        values = [chunk for chunk in chunks.values() if chunk.size]
+        if sum(chunk.size for chunk in values) < 2:
             raise ValueError(
                 f"Insufficient finite train values for normalization: {key}"
             )
-        mean = float(np.mean(values))
-        std = float(np.std(values))
+        mean, std = _parent_uniform_mean_std(chunks)
         stats[key] = {"mean": mean, "std": std if std > 0.0 else 1.0}
+    stats["normalization_contract"] = "base_only_parent_uniform_v1"
+    stats["parent_count"] = len(buckets["seismic"])
+    identity_payload = json.dumps(stats, sort_keys=True, separators=(",", ":"))
+    stats["identity_sha256"] = hashlib.sha256(identity_payload.encode("utf-8")).hexdigest()
     return stats
 
 
@@ -358,25 +403,26 @@ def compute_input_reference_stats(
     *,
     input_name: str = "seismic",
 ) -> dict[str, Any]:
-    train = patch_index[patch_index["split"].eq("train")]
+    train = patch_index[
+        patch_index["split"].eq("train")
+        & patch_index["sample_kind"].astype(str).eq("base")
+    ]
     if train.empty:
         raise ValueError("Cannot compute input reference stats without train patches.")
     chunks: list[np.ndarray] = []
     samples: dict[str, Any] = {}
-    for _, row in train.iterrows():
-        sample_id = str(row["sample_id"])
+    for sample_id in sorted(set(train["sample_id"].astype(str))):
         if sample_id not in samples:
             samples[sample_id] = benchmark.load_sample(sample_id)
         sample = samples[sample_id]
         target, seismic, lfm, valid = _aligned_arrays(sample)
-        sl = _row_slice(row)
-        patch_valid = np.isfinite(seismic[sl]) & np.isfinite(lfm[sl])
+        patch_valid = valid & np.isfinite(seismic) & np.isfinite(lfm)
         if input_name == "seismic":
-            chunks.append(_finite_values(seismic[sl], patch_valid))
+            chunks.append(_finite_values(seismic, patch_valid))
         elif input_name == "lfm":
-            chunks.append(_finite_values(lfm[sl], patch_valid))
+            chunks.append(_finite_values(lfm, patch_valid))
         elif input_name == "target":
-            chunks.append(_finite_values(target[sl], patch_valid))
+            chunks.append(_finite_values(target, patch_valid))
         else:
             raise ValueError(
                 f"Unsupported input reference stats input_name: {input_name}"
@@ -449,9 +495,29 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             self._sample_cache.popitem(last=False)
         return cached
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+    def get_item_for_view(
+        self, index: int, view_id: str = "base"
+    ) -> dict[str, torch.Tensor | str]:
+        """Materialize one parent patch with the requested seismic view.
+
+        The catalog stores one row per parent/window.  A view is selected at
+        sampling time and resolved to the reader's parent-owned view sample.
+        This keeps the patch catalog independent of the number of materialized
+        views while preserving the existing tensor contract.
+        """
         row = self.frame.iloc[int(index)].to_dict()
-        sample = self._load_sample(str(row["sample_id"]))
+        requested_view = str(view_id or "base")
+        row_view = str(row.get("view_id") or "")
+        if requested_view == "base" and str(row.get("sample_kind") or "") == "seismic_view":
+            requested_view = row_view or "base"
+        parent = _parent_id(row)
+        if requested_view == "base":
+            sample_id = str(row["sample_id"])
+            sample_kind = "base"
+        else:
+            sample_id = f"{parent}__view__{requested_view}"
+            sample_kind = "seismic_view"
+        sample = self._load_sample(sample_id)
         target, seismic, lfm, valid = _aligned_arrays(sample)
         sl = _row_slice(row)
         target_patch = target[sl]
@@ -563,10 +629,15 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
             "forward_lfm": torch.from_numpy(forward_lfm_patch)[None, :, :],
             "valid_mask": torch.from_numpy(valid_patch.astype(np.float32))[None, :, :],
             "patch_id": str(row["patch_id"]),
-            "sample_id": str(row["sample_id"]),
-            "sample_kind": str(row.get("sample_kind", "")),
+            "sample_id": sample_id,
+            "sample_kind": sample_kind,
+            "view_id": requested_view,
             "sample_domain": sample_domain,
         }
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+        row = self.frame.iloc[int(index)]
+        return self.get_item_for_view(int(index), str(row.get("view_id") or "base"))
 
 
 def _norm(values: np.ndarray, stats: Mapping[str, Any]) -> np.ndarray:

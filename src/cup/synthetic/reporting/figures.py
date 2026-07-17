@@ -345,21 +345,25 @@ def _plot_section_geometry(output_dir: Path, generated: list[str], skipped: list
 def _select_base_sample(index: pd.DataFrame, config: Mapping[str, Any]) -> pd.Series | None:
     if index.empty:
         return None
-    base = index[index["sample_kind"].eq("base") & index["status"].eq("ok")].copy()
+    base = index.copy()
+    if "sample_kind" in base:
+        base = base[base["sample_kind"].eq("base")]
+    if "status" in base:
+        base = base[base["status"].eq("ok")]
     if base.empty:
         return None
     examples = dict(config.get("report_examples") or {})
     section_id = str(examples.get("section_id") or "").strip()
     geometry_family = str(examples.get("geometry_family") or "").strip()
-    if section_id:
+    if section_id and "section_id" in base:
         selected = base[base["section_id"].eq(section_id)]
         if not selected.empty:
             base = selected
-    if geometry_family:
+    if geometry_family and "geometry_family" in base:
         selected = base[base["geometry_family"].eq(geometry_family)]
         if not selected.empty:
             base = selected
-    else:
+    elif "geometry_family" in base:
         selected = base[base["geometry_family"].eq("none")]
         if not selected.empty:
             base = selected
@@ -402,7 +406,11 @@ def _plot_hdf5_examples(
     generated: list[str],
     skipped: list[dict[str, Any]],
 ) -> None:
-    index = _read_csv(output_dir / "sample_index.csv")
+    index_path = output_dir / "realization_index.csv"
+    if not index_path.is_file():
+        skipped.append({"figure": "generation examples", "reason": "missing realization_index.csv"})
+        return
+    index = _read_csv(index_path)
     row = _select_base_sample(index, config)
     if row is None:
         skipped.append({"figure": "generation examples", "reason": "no accepted base sample"})
@@ -434,7 +442,7 @@ def _plot_hdf5_examples(
             highres_axis_name = model_axis_name
         model_axis = group[f"axes/{model_axis_name}"][()]
         highres_axis = group[f"axes/{highres_axis_name}"][()]
-        # v4 observed/model-consistent seismic fields are materialized on the
+        # v5 observed/model-consistent seismic fields are materialized on the
         # model axis.  Reflectivity keeps its separate N-1 forward-interface
         # axis, but this figure is for the seismic field itself.
         seismic_axis = model_axis

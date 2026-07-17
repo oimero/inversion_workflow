@@ -1,4 +1,4 @@
-"""Pure serialization of materialized Benchmark samples and variants to v4 HDF5."""
+"""Pure serialization of materialized Synthoseis v5 parent/view artifacts."""
 
 from __future__ import annotations
 
@@ -12,11 +12,11 @@ import numpy as np
 from cup.synthetic.core.artifacts import write_dataset
 from cup.synthetic.core.records import (
     BenchmarkSample,
-    BenchmarkVariant,
+    BenchmarkView,
     DepthForwardExtras,
     TimeForwardExtras,
 )
-from cup.synthetic.schemas import SEISMIC_VARIANT_CONTRACT_VERSION
+from cup.synthetic.schemas import SEISMIC_VIEW_CONTRACT_VERSION
 
 
 @dataclass(frozen=True)
@@ -43,15 +43,9 @@ def _common_dataset_plan(
     return (
         DatasetPlanItem("priors", "canonical_background_log_ai", sample.canonical_background_log_ai, "ln(m/s*g/cm3)"),
         DatasetPlanItem("targets", "target_increment_log_ai", sample.target_increment_log_ai, "ln(m/s*g/cm3)"),
-        DatasetPlanItem("priors", "lfm_ideal", sample.input_lfm_canonical_log_ai, "ln(m/s*g/cm3)"),
-        DatasetPlanItem("priors", "lfm_controlled_degraded", sample.input_lfm_controlled_degraded_log_ai, "ln(m/s*g/cm3)"),
-        DatasetPlanItem("priors/input_lfm_variants/canonical", "log_ai", sample.input_lfm_canonical_log_ai, "ln(m/s*g/cm3)"),
-        DatasetPlanItem("priors/input_lfm_variants/controlled_default", "log_ai", sample.input_lfm_controlled_degraded_log_ai, "ln(m/s*g/cm3)"),
         DatasetPlanItem("seismic", "seismic_observed", forward.seismic_observed, amplitude_unit),
         DatasetPlanItem("seismic", "seismic_model_consistent", forward.seismic_model_consistent, amplitude_unit, model_consistent_dtype),
         DatasetPlanItem("seismic", "subgrid_forward_residual", forward.subgrid_forward_residual, amplitude_unit),
-        DatasetPlanItem("residuals", "residual_vs_lfm_ideal", sample.residuals.residual_vs_lfm_ideal, "ln(m/s*g/cm3)"),
-        DatasetPlanItem("residuals", "residual_vs_lfm_controlled_degraded", sample.residuals.residual_vs_lfm_controlled_degraded, "ln(m/s*g/cm3)"),
         DatasetPlanItem("masks", "valid_mask", sample.valid_mask, "bool", None),
     )
 
@@ -370,49 +364,66 @@ def write_benchmark_sample(h5: h5py.File, sample: BenchmarkSample) -> ArtifactRe
     raise ValueError(f"Unsupported Benchmark sample domain: {sample.truth.sample_domain}")
 
 
-def write_benchmark_variant(
+def write_benchmark_view(
     h5: h5py.File,
-    variant: BenchmarkVariant,
+    view: BenchmarkView,
 ) -> ArtifactReference:
-    owner_path = f"/realizations/{variant.owner_realization_id}"
+    owner_path = f"/realizations/{view.owner_realization_id}"
     owner = h5[owner_path]
-    variants = owner.require_group("seismic_variants")
-    group = variants.create_group(variant.variant_id)
-    metadata = dict(variant.metadata)
-    group.attrs["variant_id"] = variant.variant_id
-    group.attrs["contract_version"] = SEISMIC_VARIANT_CONTRACT_VERSION
-    group.attrs["mismatch_family"] = str(metadata["mismatch_family"])
-    group.attrs["operator_source"] = str(metadata["operator_source"])
-    group.attrs["parameters_json"] = json.dumps(
-        dict(metadata.get("parameters") or {}), sort_keys=True
+    views = owner.require_group("seismic_views")
+    group = views.create_group(view.view_id)
+    metadata = dict(view.metadata)
+    group.attrs["view_id"] = view.view_id
+    group.attrs["contract_version"] = SEISMIC_VIEW_CONTRACT_VERSION
+    group.attrs["view_spec_canonical_json"] = str(metadata["view_spec_canonical_json"])
+    group.attrs["view_spec_sha256"] = str(metadata["view_spec_sha256"])
+    group.attrs["operator_ids_json"] = json.dumps(metadata["operator_ids"], sort_keys=True)
+    group.attrs["operator_kinds_json"] = json.dumps(metadata["operator_kinds"], sort_keys=True)
+    group.attrs["operator_contract_versions_json"] = json.dumps(
+        metadata["operator_contract_versions"], sort_keys=True
     )
-    if variant.sample_domain == "time":
+    for key in ("operator_parameters", "random_stream_identity"):
+        value = metadata.get(key, {})
+        group.attrs[f"{key}_json"] = json.dumps(value, sort_keys=True)
+    if view.sample_domain == "time":
         axis_path = f"{owner_path}/axes/twt_model_s"
         axis_order: str | list[str] = ["lateral", "twt"]
         amplitude_unit = "normalized_amplitude"
-    elif variant.sample_domain == "depth":
+    elif view.sample_domain == "depth":
         axis_path = f"{owner_path}/axes/tvdss_model_m"
         axis_order = "lateral,tvdss"
         amplitude_unit = "amplitude"
     else:
-        raise ValueError(f"Unsupported variant domain: {variant.sample_domain!r}")
+        raise ValueError(f"Unsupported view domain: {view.sample_domain!r}")
     for name, values, unit in (
-        ("seismic_observed", variant.seismic_observed, amplitude_unit),
-        ("positive_gain", variant.positive_gain, "ratio"),
-        ("additive_noise", variant.additive_noise, amplitude_unit),
+        ("seismic_observed", view.seismic_observed, amplitude_unit),
+        ("positive_gain", view.positive_gain, "ratio"),
+        ("additive_noise", view.additive_noise, amplitude_unit),
     ):
         _dataset(
             group,
             name,
             np.asarray(values, dtype=np.float32),
             unit=unit,
-            sample_domain=variant.sample_domain,
+            sample_domain=view.sample_domain,
             axis_path=axis_path,
             axis_order=axis_order,
         )
+    operator_trace = metadata.get("operator_trace_json", "[]")
+    if not isinstance(operator_trace, str):
+        operator_trace = json.dumps(operator_trace, sort_keys=True)
+    _dataset(
+        group,
+        "operator_trace_json",
+        np.asarray(operator_trace.encode("utf-8"), dtype=f"S{max(1, len(operator_trace))}"),
+        unit="json",
+        sample_domain=view.sample_domain,
+        axis_path="",
+        axis_order="scalar",
+    )
     qc = group.create_group("qc")
-    _write_qc_attributes(qc, variant.qc)
-    path = f"{owner_path}/seismic_variants/{variant.variant_id}"
+    _write_qc_attributes(qc, view.qc)
+    path = f"{owner_path}/seismic_views/{view.view_id}"
     return ArtifactReference(
         hdf5_group=path,
         seismic_input_dataset=f"{path}/seismic_observed",
@@ -425,5 +436,5 @@ __all__ = [
     "ArtifactReference",
     "serialize_qc_attributes",
     "write_benchmark_sample",
-    "write_benchmark_variant",
+    "write_benchmark_view",
 ]

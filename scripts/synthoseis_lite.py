@@ -162,7 +162,7 @@ def _load_time_config(experiment_raw: dict, *, experiment_path: Path) -> tuple[d
     composed["synthoseis_lite"] = dict(experiment_raw.get("synthoseis_lite") or {})
     workflow = WorkflowConfig.from_mapping(composed)
     if workflow.seismic.domain != "time":
-        raise ValueError("Time Synthoseis-lite v4 requires seismic.domain='time'.")
+        raise ValueError("Time Synthoseis-lite v5 requires seismic.domain='time'.")
     provenance = {
         "experiment_file": str(experiment_path),
         "workflow_config": str(common_path),
@@ -194,10 +194,10 @@ def main() -> None:
 
     if (sample_domain, benchmark_schema) == ("depth", BENCHMARK_SCHEMA_VERSION):
         if "workflow_config" not in experiment_raw:
-            raise ValueError("Depth Synthoseis-lite v4 requires workflow_config.")
+            raise ValueError("Depth Synthoseis-lite v5 requires workflow_config.")
         raw, workflow, config_provenance = load_composed_config(config_path, repo_root=REPO_ROOT)
         if workflow.seismic.domain != "depth":
-            raise ValueError("Composed Synthoseis-lite v4 currently implements the depth branch only.")
+            raise ValueError("Composed Synthoseis-lite v5 currently implements the depth branch only.")
         script_cfg = parse_depth_config(raw)
         sources, source_provenance, forward_inputs = resolve_depth_sources(
             script_cfg, workflow=workflow, repo_root=REPO_ROOT
@@ -228,7 +228,7 @@ def main() -> None:
                 geometry_families=args.geometry_family,
                 qc_only=args.qc_only,
             )
-        print("=== synthoseis-lite v4 (depth) ===")
+        print("=== synthoseis-lite v5 (depth) ===")
         print(f"Command: {args.command}")
         print(f"Output: {output_dir}")
         print(f"Status: {summary.get('status', 'success')}")

@@ -241,11 +241,6 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     target_increment = arrays["target_increment_log_ai"]
     mask = arrays["valid_mask"].astype(bool)
     lfm = arrays["input_lfm_log_ai"]
-    lfm_ideal = (
-        arrays["lfm_ideal"]
-        if "lfm_ideal" in arrays
-        else _load_lfm_ideal_patches(prediction_dir, index, target.shape)
-    )
     closure = canonical_closure_arrays(
         target_log_ai=target,
         target_increment_log_ai=target_increment,
@@ -256,7 +251,6 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     canonical_background = closure["canonical_background_log_ai"]
     rows = []
     lfm_rows = []
-    lfm_ideal_rows = []
     oracle_rows = []
     increment_rows = []
     canonical_rows = []
@@ -279,9 +273,6 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
         )
         lfm_metrics = regression_metrics(target[i], lfm[i], valid_mask=mask[i])
         lfm_rows.append({**row.to_dict(), "series_id": "input_lfm_log_ai", **lfm_metrics})
-        if lfm_ideal is not None:
-            lfm_ideal_metrics = regression_metrics(target[i], lfm_ideal[i], valid_mask=mask[i])
-            lfm_ideal_rows.append({**row.to_dict(), "series_id": "lfm_ideal", **lfm_ideal_metrics})
         oracle_metrics = regression_metrics(target[i], target[i], valid_mask=mask[i])
         oracle_rows.append({**row.to_dict(), "series_id": "oracle_target", **oracle_metrics})
     metrics_frame = pd.DataFrame.from_records(rows)
@@ -309,8 +300,8 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     )
     geometry_path = output_dir / "model_patch_metrics_by_geometry.csv"
     _grouped_patch_metrics(metrics_frame, ["geometry_family"]).to_csv(geometry_path, index=False)
-    mismatch_path = output_dir / "model_patch_metrics_by_mismatch_family.csv"
-    _grouped_patch_metrics(metrics_frame, ["seismic_mismatch_family"]).to_csv(mismatch_path, index=False)
+    view_path = output_dir / "model_patch_metrics_by_seismic_view.csv"
+    _grouped_patch_metrics(metrics_frame, ["view_id"]).to_csv(view_path, index=False)
     holdout_role = metrics_frame.get("evaluation_role", pd.Series("", index=metrics_frame.index)).astype(str).str.casefold()
     holdout_geometry = metrics_frame.get("geometry_family", pd.Series("", index=metrics_frame.index)).astype(str).str.casefold()
     holdout_frame = metrics_frame[holdout_role.eq("geometry_holdout") | holdout_geometry.eq("pinchout")].copy()
@@ -334,15 +325,11 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     lfm_frame = pd.DataFrame.from_records(lfm_rows)
     lfm_path = output_dir / "lfm_patch_metrics.csv"
     lfm_frame.to_csv(lfm_path, index=False)
-    lfm_ideal_frame = pd.DataFrame.from_records(lfm_ideal_rows)
-    lfm_ideal_path = output_dir / "lfm_ideal_patch_metrics.csv"
-    lfm_ideal_frame.to_csv(lfm_ideal_path, index=False)
     oracle_frame = pd.DataFrame.from_records(oracle_rows)
     oracle_path = output_dir / "oracle_patch_metrics.csv"
     oracle_frame.to_csv(oracle_path, index=False)
     model_aggregate = _aggregate(metrics_frame)
     lfm_aggregate = _aggregate(lfm_frame)
-    lfm_ideal_aggregate = _aggregate(lfm_ideal_frame)
     oracle_aggregate = _aggregate(oracle_frame)
     report = {
         "schema_version": PATCH_SMOKE_REPORT_SCHEMA_VERSION,
@@ -358,7 +345,6 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
             "n_rows": int(len(lowpass_frame)),
         },
         "lfm_aggregate": lfm_aggregate,
-        "lfm_ideal_aggregate": lfm_ideal_aggregate,
         "oracle_aggregate": oracle_aggregate,
         "rmse_improvement_pct_vs_lfm": _rmse_improvement_pct(model_aggregate, lfm_aggregate),
         "geometry_aggregate": _aggregate_geometry(geometry_detail_frame),
@@ -383,7 +369,7 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
         "increment_lowpass_qc": lowpass_path,
         "model_patch_metrics_by_sample_kind": sample_kind_path,
         "model_patch_metrics_by_geometry": geometry_path,
-        "model_patch_metrics_by_mismatch_family": mismatch_path,
+        "model_patch_metrics_by_seismic_view": view_path,
         "model_patch_metrics_geometry_holdout": holdout_path,
         "model_patch_metrics_geometry_holdout_by_family": holdout_geometry_path,
         "model_geometry_patch_metrics": geometry_detail_path,
@@ -391,7 +377,6 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
         "model_realization_metrics_uniform": stitched_uniform_path,
         "model_realization_metrics_center_crop": stitched_center_path,
         "lfm_patch_metrics": lfm_path,
-        "lfm_ideal_patch_metrics": lfm_ideal_path,
         "oracle_patch_metrics": oracle_path,
         "model_report_card": report_path,
     }
@@ -432,35 +417,6 @@ def _grouped_patch_metrics(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame
         row.update(_aggregate(group))
         rows.append(row)
     return pd.DataFrame.from_records(rows)
-
-
-def _load_lfm_ideal_patches(
-    prediction_dir: Path,
-    index: pd.DataFrame,
-    expected_shape: tuple[int, ...],
-) -> np.ndarray | None:
-    benchmark_dir = _benchmark_dir_from_prediction(prediction_dir)
-    if benchmark_dir is None:
-        return None
-    benchmark = SynthoseisBenchmark(benchmark_dir)
-    patches: list[np.ndarray] = []
-    for _, row in index.iterrows():
-        sample = benchmark.load_sample(str(row["sample_id"]))
-        target, _, _, _ = _aligned_arrays(sample)
-        try:
-            lfm_ideal = np.asarray(sample.priors["lfm_ideal"], dtype=np.float32)
-        except (AttributeError, KeyError, TypeError):
-            return None
-        if lfm_ideal.shape != target.shape:
-            raise ValueError(
-                f"lfm_ideal/target shape mismatch for {sample.sample_id}: "
-                f"{lfm_ideal.shape} vs {target.shape}"
-            )
-        patches.append(lfm_ideal[_patch_slice(row, offset=0)].astype(np.float32))
-    result = np.stack(patches, axis=0)
-    if result.shape != expected_shape:
-        raise ValueError(f"lfm_ideal patch shape mismatch: {result.shape} vs {expected_shape}")
-    return result
 
 
 def _increment_lowpass_qc(
@@ -639,7 +595,7 @@ def _root_from_group_path(group_path: str) -> str:
     group_path = str(group_path).strip()
     if not group_path:
         return ""
-    for marker in ("/seismic_variants/",):
+    for marker in ("/seismic_views/",):
         if marker in group_path:
             return group_path.split(marker, maxsplit=1)[0]
     return group_path

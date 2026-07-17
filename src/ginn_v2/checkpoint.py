@@ -38,6 +38,34 @@ def load_checkpoint(
     ).as_dict()
     if not isinstance(checkpoint.get("training_sources"), dict):
         raise ValueError(f"GINN-v2 checkpoint in {path} lacks training_sources provenance.")
+    for key in (
+        "benchmark_identity",
+        "synthetic_sampling_contract",
+        "split_assignment_contract",
+        "normalization_identity",
+        "sampling_statistics",
+    ):
+        if key not in checkpoint:
+            raise ValueError(f"GINN-v2 checkpoint in {path} lacks {key} provenance.")
+    if not isinstance(checkpoint.get("benchmark_identity"), dict):
+        raise ValueError(f"GINN-v2 checkpoint in {path} has invalid benchmark identity provenance.")
+    sampling_contract = checkpoint.get("synthetic_sampling_contract")
+    if not isinstance(sampling_contract, list):
+        raise ValueError(f"GINN-v2 checkpoint in {path} has invalid synthetic sampling provenance.")
+    for item in sampling_contract:
+        if not isinstance(item, dict):
+            raise ValueError(f"GINN-v2 checkpoint in {path} has a malformed synthetic sampling contract.")
+        parent_weights = dict(item.get("parent_weights") or {})
+        view_weights = dict(item.get("view_weights") or {})
+        if set(parent_weights) != {"base", "variant"}:
+            raise ValueError(f"GINN-v2 checkpoint in {path} has incomplete parent weights provenance.")
+        if not isinstance(item.get("validation"), dict):
+            raise ValueError(f"GINN-v2 checkpoint in {path} lacks validation weight provenance.")
+        validation_views = dict(item["validation"].get("seismic_views") or {})
+        if not validation_views:
+            raise ValueError(f"GINN-v2 checkpoint in {path} lacks validation seismic-view provenance.")
+        if set(dict(validation_views.get("parent_weights") or {})) != {"base", "variant"}:
+            raise ValueError(f"GINN-v2 checkpoint in {path} has incomplete validation parent weights.")
     if not isinstance(checkpoint.get("stage_lineage"), list):
         raise ValueError(f"GINN-v2 checkpoint in {path} lacks stage_lineage provenance.")
     run_mode = str(checkpoint.get("run_mode") or "")
@@ -75,6 +103,12 @@ def load_checkpoint(
                 f"GINN-v2 checkpoint in {path} has incomplete stage_loss_blocks metadata; "
                 "weight and update_interval are required."
             )
+        if str(item.get("sampling", {}).get("kind") or "") == "parent_balanced_seismic_view":
+            sampling = item["sampling"]
+            if set(dict(sampling.get("parent_weights") or {})) != {"base", "variant"}:
+                raise ValueError(
+                    f"GINN-v2 checkpoint in {path} has incomplete parent/view sampling provenance."
+                )
     if not isinstance(checkpoint.get("stage_selection_metric"), str):
         raise ValueError(f"GINN-v2 checkpoint in {path} lacks stage_selection_metric metadata.")
     stage_kinds = {str(item.get("kind") or "") for item in stage_loss_blocks}
@@ -87,7 +121,10 @@ def load_checkpoint(
             and int(item.get("update_interval", 0)) == 1
         }
         safe_physics_selection = any(
-            str(checkpoint["stage_selection_metric"]) == f"{block_id}.mse"
+            str(checkpoint["stage_selection_metric"]) in {
+                f"{block_id}.mse",
+                f"{block_id}.weighted_mse",
+            }
             for block_id in dense_ids
         ) and "real_well_supervised" not in stage_kinds
         expected_eligible = safe_physics_selection and str(checkpoint.get("checkpoint_kind")) == "best"

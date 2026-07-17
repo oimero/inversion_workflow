@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import hashlib
 import logging
 from pathlib import Path
 import time
@@ -12,7 +13,7 @@ from typing import Any, Iterator, Mapping
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Subset, default_collate
 
 from cup.impedance import validate_increment_contract
 from cup.synthetic.benchmark import SynthoseisBenchmark
@@ -144,8 +145,8 @@ class DeterministicCycler:
         return next(iter(DataLoader(Subset(self.dataset, indices), batch_size=len(indices), shuffle=False)))
 
 
-class DeterministicSampleKindCycler:
-    """Deterministically balance synthetic sample kinds at epoch scope."""
+class DeterministicParentBalancedViewCycler:
+    """Choose parent, base/view family, view, then patch in that order."""
 
     def __init__(
         self,
@@ -154,6 +155,8 @@ class DeterministicSampleKindCycler:
         batch_size: int,
         num_batches: int,
         seed: int,
+        parent_weights: Mapping[str, float],
+        view_weights: Mapping[str, float],
     ) -> None:
         if len(dataset) == 0:
             raise ValueError("Loss block dataset is empty.")
@@ -161,59 +164,158 @@ class DeterministicSampleKindCycler:
             raise ValueError("Balanced sampler batch_size and num_batches must be positive.")
         frame = getattr(dataset, "frame", None)
         if not isinstance(frame, pd.DataFrame) or "sample_kind" not in frame:
-            raise ValueError("balanced_sample_kind requires a patch dataset with sample_kind metadata.")
-        groups: dict[str, list[int]] = {}
-        for index, value in enumerate(frame["sample_kind"].astype(str)):
-            groups.setdefault(value, []).append(int(index))
-        groups = {kind: indices for kind, indices in sorted(groups.items()) if indices}
-        if not groups:
-            raise ValueError("balanced_sample_kind found no sample-kind groups.")
-        if len(groups) > 2:
+            raise ValueError("parent_balanced_seismic_view requires patch metadata.")
+        if "parent_realization_id" not in frame or "sample_kind" not in frame:
+            raise ValueError("parent_balanced_seismic_view requires parent and sample-kind columns.")
+        parent_weights = {str(key): float(value) for key, value in parent_weights.items()}
+        view_weights = {str(key): float(value) for key, value in view_weights.items()}
+        if set(parent_weights) != {"base", "variant"}:
+            raise ValueError("parent_balanced_seismic_view requires explicit base/variant weights.")
+        if any(value < 0.0 for value in parent_weights.values()) or not np.isclose(
+            sum(parent_weights.values()), 1.0, rtol=0.0, atol=1.0e-12
+        ):
+            raise ValueError("parent_balanced_seismic_view parent weights must be nonnegative and sum to one.")
+        if "base" in view_weights:
+            raise ValueError("parent_balanced_seismic_view view weights must not contain base.")
+        if parent_weights["variant"] > 0.0 and (
+            any(value <= 0.0 for value in view_weights.values())
+            or not view_weights
+            or not np.isclose(sum(view_weights.values()), 1.0, rtol=0.0, atol=1.0e-12)
+        ):
+            raise ValueError("parent_balanced_seismic_view view weights must be positive and sum to one.")
+        if parent_weights["variant"] == 0.0 and view_weights:
+            raise ValueError("parent_balanced_seismic_view view weights must be empty for clean-only training.")
+        dynamic_views = callable(getattr(dataset, "get_item_for_view", None))
+        parents: dict[str, dict[str, list[int]]] = {}
+        for index, raw in frame.iterrows():
+            parent = str(raw["parent_realization_id"])
+            kind = "base" if str(raw["sample_kind"]) == "base" else "variant"
+            view_id = "base" if kind == "base" else str(raw.get("view_id") or "")
+            parents.setdefault(parent, {}).setdefault(view_id, []).append(int(index))
+        if dynamic_views:
+            # Every configured view reuses the same parent/window rows.  The
+            # view is materialized only after the sampler has selected it.
+            for parent, views in parents.items():
+                base_indices = list(views.get("base", []))
+                if not base_indices:
+                    raise ValueError(
+                        f"parent_balanced_seismic_view requires a base patch for parent {parent!r}."
+                    )
+                benchmark = getattr(dataset, "benchmark", None)
+                available_view_reader = getattr(benchmark, "available_view_ids", None)
+                if not callable(available_view_reader):
+                    # Keep the sampler useful for small in-memory contract
+                    # tests and adapters which expose view materialization but
+                    # deliberately do not expose a reader object.  Production
+                    # PatchDataset takes the strict reader path above.
+                    available = [
+                        str(view_id)
+                        for view_id in views
+                        if str(view_id) != "base"
+                    ]
+                else:
+                    available = [
+                        str(value)
+                        for value in available_view_reader(parent)
+                    ]
+                for view_id in available:
+                    views.setdefault(view_id, list(base_indices))
+        if not parents:
+            raise ValueError("parent_balanced_seismic_view found no parent realizations.")
+        if parent_weights["variant"] > 0.0 and not any(
+            any(key != "base" for key in views) for views in parents.values()
+        ):
+            raise ValueError("variant parent weight is positive but benchmark has no seismic views.")
+        requested_view_ids = {key for key, value in view_weights.items() if value > 0.0}
+        available_view_ids = {view_id for views in parents.values() for view_id in views if view_id != "base"}
+        if not requested_view_ids.issubset(available_view_ids):
             raise ValueError(
-                "balanced_sample_kind only supports base and seismic_variant groups; "
-                f"found {sorted(groups)}."
+                "Configured seismic view weights reference views absent from benchmark: "
+                f"{sorted(requested_view_ids - available_view_ids)}"
             )
+        if parent_weights["variant"] > 0.0:
+            incomplete = sorted(
+                parent for parent, views in parents.items()
+                if not requested_view_ids.issubset({key for key in views if key != "base"})
+            )
+            if incomplete:
+                raise ValueError(
+                    "Configured seismic view weights are not available for every parent: "
+                    f"{incomplete[:5]}"
+                )
         self.dataset = dataset
         self.batch_size = int(batch_size)
         self.num_batches = int(num_batches)
-        self.sample_kinds = tuple(groups)
-        self.degenerated = len(groups) == 1
+        self.parent_weights = parent_weights
+        self.view_weights = view_weights
+        self.parents = parents
+        self.parent_ids = tuple(sorted(parents))
         rng = np.random.default_rng(int(seed))
         total_items = self.batch_size * self.num_batches
-        if self.degenerated:
-            schedule = [self.sample_kinds[0]] * total_items
-        else:
-            half = total_items // 2
-            extra_to_first = int(rng.integers(0, 2)) if total_items % 2 else 0
-            counts = [half + extra_to_first, total_items - half - extra_to_first]
-            schedule = [self.sample_kinds[0]] * counts[0] + [self.sample_kinds[1]] * counts[1]
-            rng.shuffle(schedule)
-        self._schedule = schedule
+        self._schedule = list(range(total_items))
         self._cursor = 0
         self._rng = rng
-        self._orders = {
-            kind: rng.permutation(indices).tolist() for kind, indices in groups.items()
-        }
-        self._positions = {kind: 0 for kind in groups}
+        self._patch_rngs = {}
+        self._patch_orders = {}
+        for parent, views in parents.items():
+            for view_id, indices in views.items():
+                key_digest = hashlib.sha256(
+                    f"parent_balanced_seismic_view\0{seed}\0{parent}\0{view_id}".encode("utf-8")
+                ).digest()
+                key_seed = int.from_bytes(key_digest[:8], "big", signed=False)
+                key_rng = np.random.default_rng(key_seed)
+                self._patch_rngs[(parent, view_id)] = key_rng
+                self._patch_orders[(parent, view_id)] = key_rng.permutation(indices).tolist()
+        self._patch_positions = {key: 0 for key in self._patch_orders}
         self.last_batch_counts: dict[str, int] = {}
+        self.last_batch_view_counts: dict[str, int] = {}
 
     def next(self) -> Any:
         if self._cursor + self.batch_size > len(self._schedule):
             raise RuntimeError("Balanced sampler exhausted its configured epoch batch count.")
         indices: list[int] = []
+        selected_keys: list[tuple[str, str]] = []
         counts: dict[str, int] = {}
-        for kind in self._schedule[self._cursor : self._cursor + self.batch_size]:
-            position = self._positions[kind]
-            order = self._orders[kind]
+        view_counts: dict[str, int] = {}
+        for _ in self._schedule[self._cursor : self._cursor + self.batch_size]:
+            parent = self.parent_ids[int(self._rng.integers(0, len(self.parent_ids)))]
+            family = str(self._rng.choice(["base", "variant"], p=np.asarray([self.parent_weights["base"], self.parent_weights["variant"]]) / sum(self.parent_weights.values())))
+            available = self.parents[parent]
+            if family == "base":
+                view_id = "base"
+            else:
+                choices = [key for key in self.view_weights if key in available and self.view_weights[key] > 0.0]
+                if not choices:
+                    raise ValueError(f"No configured seismic view is available for parent {parent!r}.")
+                else:
+                    weights = np.asarray([self.view_weights[key] for key in choices], dtype=float)
+                    weights /= weights.sum()
+                    view_id = str(self._rng.choice(choices, p=weights))
+            key = (parent, view_id)
+            order = self._patch_orders[key]
+            position = self._patch_positions[key]
             if position >= len(order):
-                order = self._rng.permutation(order).tolist()
-                self._orders[kind] = order
+                order = self._patch_rngs[key].permutation(order).tolist()
+                self._patch_orders[key] = order
                 position = 0
             indices.append(order[position])
-            self._positions[kind] = position + 1
-            counts[kind] = counts.get(kind, 0) + 1
+            selected_keys.append((parent, view_id))
+            self._patch_positions[key] = position + 1
+            kind_label = "base" if view_id == "base" else "seismic_view"
+            counts[kind_label] = counts.get(kind_label, 0) + 1
+            view_counts[view_id] = view_counts.get(view_id, 0) + 1
         self._cursor += self.batch_size
         self.last_batch_counts = counts
+        self.last_batch_view_counts = view_counts
+        if callable(getattr(self.dataset, "get_item_for_view", None)):
+            items = [
+                self.dataset.get_item_for_view(
+                    index,
+                    view_id,
+                )
+                for index, (_, view_id) in zip(indices, selected_keys)
+            ]
+            return default_collate(items)
         return next(iter(DataLoader(Subset(self.dataset, indices), batch_size=len(indices), shuffle=False)))
 
 
@@ -309,7 +411,7 @@ def _resolve_auto_benchmark(root: Path) -> Path:
         path / "generate_field_conditioned"
         for path in results.glob("*")
         if (path / "generate_field_conditioned" / "benchmark_manifest.json").is_file()
-        and (path / "generate_field_conditioned" / "sample_index.csv").is_file()
+        and (path / "generate_field_conditioned" / "realization_index.csv").is_file()
         and (path / "generate_field_conditioned" / "synthetic_benchmark.h5").is_file()
     ]
     if not candidates:
@@ -343,12 +445,61 @@ def _source_path(value: Any, root: Path) -> Path:
 
 
 def _synthetic_sample_kinds(source: Mapping[str, Any]) -> set[str]:
-    variant = str(source.get("input_seismic_variant") or "nominal")
-    if variant == "nominal":
-        return {"base"}
-    if variant == "observed_mismatch":
-        return {"base", "seismic_variant"}
-    raise ValueError(f"Unsupported input_seismic_variant: {variant!r}")
+    """The v5 patch catalog is parent-owned; views are selected dynamically."""
+    return {"base"}
+
+
+def _materialize_parent_split_assignment(
+    benchmark: SynthoseisBenchmark, *, path: Path,
+) -> dict[str, str]:
+    """Materialize the GINN-owned parent split with a versioned hash contract."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, str]] = []
+    seed = 20260714
+    split_contract = {
+        "version": "parent_hash_split_v1",
+        "owner": "ginn_v2_experiment_suite",
+        "seed": seed,
+        "hash_algorithm": "sha256",
+        "validation_fraction": 0.15,
+        "test_fraction": 0.15,
+        "geometry_holdout_role": "test",
+    }
+    split_identity = hashlib.sha256(
+        json.dumps(split_contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    seen: set[str] = set()
+    for _, raw in benchmark.realizations.iterrows():
+        parent = str(raw["realization_id"])
+        if not parent or parent in seen:
+            raise ValueError(f"Benchmark realization IDs must be unique and non-empty: {parent!r}")
+        seen.add(parent)
+        role = str(raw.get("evaluation_role") or "")
+        if role == "geometry_holdout":
+            split = "test"
+            hash_value = ""
+        else:
+            digest = hashlib.sha256(
+                f"parent_hash_split_v1\0{seed}\0{parent}".encode("utf-8")
+            ).digest()
+            value = int.from_bytes(digest[:8], "big", signed=False) / float(2**64)
+            hash_value = f"{value:.17g}"
+            split = "test" if value < 0.15 else "validation" if value < 0.30 else "train"
+        rows.append({
+            "realization_id": parent,
+            "evaluation_role": role,
+            "hash_value": hash_value,
+            "split": split,
+            "split_contract": "parent_hash_split_v1",
+            "split_contract_identity": split_identity,
+            "seed": str(seed),
+            "hash_algorithm": "sha256",
+            "validation_fraction": "0.15",
+            "test_fraction": "0.15",
+        })
+    frame = pd.DataFrame.from_records(rows).sort_values("realization_id")
+    frame.to_csv(path, index=False)
+    return {str(row["realization_id"]): str(row["split"]) for _, row in frame.iterrows()}
 
 
 def _prepare_synthetic_indices(
@@ -357,6 +508,9 @@ def _prepare_synthetic_indices(
     allow_smoke_validation_duplication: bool = False,
 ) -> dict[str, pd.DataFrame]:
     result = {}
+    split_assignment = _materialize_parent_split_assignment(
+        benchmark, path=output_dir / "split_assignment.csv"
+    )
     for block in blocks:
         block_id = str(block["block_id"])
         build_started = time.perf_counter()
@@ -368,6 +522,7 @@ def _prepare_synthetic_indices(
             sample_kinds=_synthetic_sample_kinds(source),
             min_valid_samples=(1 if block["kind"] == "physics" else int(block["min_valid_samples"])),
             max_patches=(int(source["max_patches"]) if source.get("max_patches") is not None else None),
+            split_assignment=split_assignment,
         )
         if logger is not None:
             logger.info(
@@ -824,8 +979,49 @@ def _checkpoint_payload(
     stage_deployment_eligibility_reason: str,
     physics_closures: list[Mapping[str, Any]],
     stage_loss_blocks: list[Mapping[str, Any]],
+    sampling_statistics: Mapping[str, Any] | None = None,
     forward_model_inputs_path: str = "",
 ) -> dict[str, Any]:
+    synthetic_sampling_contract: list[dict[str, Any]] = []
+    for stage in config.stages:
+        for block in stage.get("loss_blocks", []):
+            if str(block.get("sampling", {}).get("kind") or "") != "parent_balanced_seismic_view":
+                continue
+            synthetic_sampling_contract.append({
+                "stage_id": str(stage.get("stage_id") or ""),
+                "block_id": str(block.get("block_id") or ""),
+                "source": str(block.get("source") or ""),
+                "parent_weights": dict(block["sampling"]["parent_weights"]),
+                "view_weights": dict(block["sampling"]["view_weights"]),
+                "validation": dict(stage.get("validation", {}).get("seismic_views") or {}),
+            })
+    benchmark_identity = {
+        source_id: {
+            key: source.get(key, "")
+            for key in (
+                "benchmark_dir", "schema_version", "science_revision",
+                "projection_contract_version", "seismic_view_contract_version",
+                "seismic_operator_contract_version", "random_stream_contract_version",
+                "contract_fingerprint_sha256", "materialized_view_ids",
+                "materialized_view_spec_hashes",
+            )
+            if key in source
+        }
+        for source_id, source in training_sources.items()
+        if str(source.get("kind") or "") == "synthoseis_lite"
+    }
+    split_contract = {
+        "version": "parent_hash_split_v1",
+        "owner": "ginn_v2_experiment_suite",
+        "seed": 20260714,
+        "hash_algorithm": "sha256",
+        "validation_fraction": 0.15,
+        "test_fraction": 0.15,
+        "geometry_holdout_role": "test",
+    }
+    split_identity = hashlib.sha256(
+        json.dumps(split_contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     payload = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "experiment_id": config.experiment_id,
@@ -841,6 +1037,10 @@ def _checkpoint_payload(
         "normalization": dict(normalization),
         "increment_contract": validate_increment_contract(increment_contract).as_dict(),
         "training_sources": {key: dict(value) for key, value in training_sources.items()},
+        "benchmark_identity": benchmark_identity,
+        "synthetic_sampling_contract": synthetic_sampling_contract,
+        "split_assignment_contract": split_contract | {"identity_sha256": split_identity},
+        "normalization_identity": str(normalization.get("identity_sha256") or ""),
         "stage_lineage": [dict(value) for value in stage_lineage],
         "run_mode": config.run_mode,
         "development_limited": config.development_limited,
@@ -856,9 +1056,11 @@ def _checkpoint_payload(
                 "source": str(value.get("source") or ""),
                 "weight": float(value.get("weight", 0.0)),
                 "update_interval": int(value.get("update_interval", 0)),
+                "sampling": dict(value.get("sampling") or {}),
             }
             for value in stage_loss_blocks
         ],
+        "sampling_statistics": dict(sampling_statistics or {}),
         "stage_selection_metric": metric_name,
         "sample_axis_contract": dict(sample_axis),
         "patch_deployment_contract": config.patching.as_dict() | {
@@ -900,6 +1102,22 @@ def _evaluate(
             losses.append(torch.mean((prediction - target) ** 2))
         return {"mse": float(torch.stack(losses).mean().cpu())}
     assert prepared.validation_dataset is not None
+    validation_views = dict(
+        dict(prepared.config.get("validation") or {}).get("seismic_views") or {}
+    )
+    if (
+        str(prepared.config.get("source_kind") or "") == "synthoseis_lite"
+        and validation_views
+        and str(prepared.config.get("kind") or "") in {"synthetic_supervised", "physics"}
+    ):
+        return _evaluate_synthetic_view_weighted(
+            prepared=prepared,
+            model=model,
+            device=device,
+            normalization=normalization,
+            steps=steps,
+            validation_views=validation_views,
+        )
     batch_size = int(prepared.config["batch_size"])
     if steps is None:
         batches: Iterator[Any] = iter(DataLoader(
@@ -931,6 +1149,121 @@ def _evaluate(
         "valid_sample_count": waveform_count,
         "skipped_item_count": float(np.sum([row["skipped_item_count"] for row in rows])),
     }
+
+
+def _evaluate_synthetic_view_weighted(
+    *,
+    prepared: PreparedBlock,
+    model: torch.nn.Module,
+    device: torch.device,
+    normalization: Mapping[str, Any],
+    steps: int | None,
+    validation_views: Mapping[str, Any],
+) -> dict[str, float]:
+    """Aggregate validation by explicit parent/view weights, never row counts."""
+    dataset = prepared.validation_dataset
+    if dataset is None:
+        raise ValueError("Synthetic view validation requires a validation dataset.")
+    parent_weights = {
+        str(key): float(value)
+        for key, value in dict(validation_views.get("parent_weights") or {}).items()
+    }
+    view_weights = {
+        str(key): float(value)
+        for key, value in dict(validation_views.get("view_weights") or {}).items()
+    }
+    if set(parent_weights) != {"base", "variant"}:
+        raise ValueError("Validation parent weights must contain base and variant.")
+    if not np.isclose(sum(parent_weights.values()), 1.0):
+        raise ValueError("Validation parent weights must sum to one.")
+    if parent_weights["variant"] > 0.0 and (
+        not view_weights or not np.isclose(sum(view_weights.values()), 1.0)
+    ):
+        raise ValueError("Validation seismic view weights must sum to one.")
+    metric_name = (
+        "mse"
+        if str(prepared.config.get("kind") or "") == "synthetic_supervised"
+        else str(dict(prepared.config.get("validation") or {}).get("selection_metric") or "").split(".", 1)[-1]
+    )
+    if metric_name == "":
+        metric_name = "total"
+    values: dict[str, list[float]] = {}
+    patch_values: dict[tuple[str, str], float] = {}
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        dynamic = callable(getattr(dataset, "get_item_for_view", None))
+        if dynamic:
+            frame = dataset.frame.reset_index(drop=True)
+            patch_indices = list(range(len(frame)))
+            if steps is not None:
+                patch_indices = patch_indices[: int(steps)]
+            requested_views = ["base", *sorted(view_weights)]
+            for view_id in requested_views:
+                for row_index in patch_indices:
+                    item = dataset.get_item_for_view(row_index, view_id)
+                    batch = default_collate([item])
+                    loss, diagnostics = _block_loss(
+                        prepared,
+                        batch,
+                        model,
+                        device=device,
+                        normalization=normalization,
+                    )
+                    value = float(diagnostics.get(metric_name, float(loss.detach().cpu())))
+                    patch_id = str(item["patch_id"])
+                    values.setdefault(view_id, []).append(value)
+                    patch_values[(patch_id, view_id)] = value
+        else:
+            loader = DataLoader(dataset, batch_size=1, shuffle=False)
+            for index, batch in enumerate(loader):
+                if steps is not None and index >= int(steps):
+                    break
+                loss, diagnostics = _block_loss(
+                    prepared, batch, model, device=device, normalization=normalization
+                )
+                view_values = batch.get("view_id", ["base"])
+                view_id = str(view_values[0] if isinstance(view_values, (list, tuple)) else view_values)
+                value = float(
+                    diagnostics.get(metric_name, float(loss.detach().cpu()))
+                )
+                values.setdefault(view_id, []).append(value)
+                patch_values[(str(batch.get("patch_id", [""])[0]), view_id)] = value
+    if was_training:
+        model.train()
+    if not values:
+        raise ValueError("Synthetic view validation produced no batches.")
+    means = {view: float(np.mean(items)) for view, items in values.items()}
+    if parent_weights["base"] > 0.0 and "base" not in means:
+        raise ValueError("Validation benchmark lacks the configured base view.")
+    missing = sorted(view for view, weight in view_weights.items() if weight > 0.0 and view not in means)
+    if missing:
+        raise ValueError(f"Validation benchmark lacks configured seismic views: {missing}")
+    weighted = parent_weights["base"] * means.get("base", 0.0)
+    weighted += parent_weights["variant"] * sum(
+        view_weights[view] * means[view] for view in view_weights
+    )
+    result: dict[str, float] = {
+        metric_name: float(weighted),
+        f"weighted_{metric_name}": float(weighted),
+        "validation_parent_count": float(len({str(v) for v in dataset.frame["parent_realization_id"]})),
+    }
+    for view_id, value in sorted(means.items()):
+        result[f"view_{view_id}_{metric_name}"] = float(value)
+        result[f"view_{view_id}_count"] = float(len(values[view_id]))
+    for view_id in sorted(view_weights):
+        paired: list[float] = []
+        for (patch_id, current_view), current in patch_values.items():
+            if current_view != view_id:
+                continue
+            base_id = patch_id.replace(f"__view__{view_id}", "")
+            base_value = patch_values.get((base_id, "base"))
+            if base_value is not None:
+                paired.append(current - base_value)
+        if paired:
+            result[f"paired_{view_id}_delta_{metric_name}"] = float(np.mean(paired))
+            result[f"paired_{view_id}_count"] = float(len(paired))
+    return result
 
 
 def _collect_validation_increment_predictions(
@@ -1059,14 +1392,56 @@ def run_experiment(
                 "schema_version": manifest.get("schema_version"),
                 "science_revision": manifest.get("science_revision"),
                 "projection_contract_version": manifest.get("projection_contract_version"),
-                "lfm_degradation_contract_version": manifest.get("lfm_degradation_contract_version"),
-                "seismic_variant_contract_version": manifest.get("seismic_variant_contract_version"),
+                "seismic_view_contract_version": manifest.get("seismic_view_contract_version"),
+                "seismic_operator_contract_version": manifest.get("seismic_operator_contract_version"),
                 "random_stream_contract_version": manifest.get("random_stream_contract_version"),
                 "contract_fingerprint_sha256": manifest.get("contract_fingerprint_sha256", ""),
+                "realization_index_path": repo_relative_path(
+                    benchmark_dir / "realization_index.csv", root=root
+                ),
+                "seismic_view_index_path": repo_relative_path(
+                    benchmark_dir / "seismic_view_index.csv", root=root
+                ),
                 "increment_contract": benchmark_increment_contract,
                 "sample_axis_contract": dict(source_contracts[source_id]),
-                "input_seismic_variant": source.get("input_seismic_variant", "nominal"),
                 "physics_target_variant": source.get("physics_target_variant", "model_consistent"),
+                "configured_seismic_view_weights": dict(
+                    next(
+                        (block.get("sampling", {}).get("view_weights", {})
+                         for stage in config.stages
+                         for block in stage.get("loss_blocks", [])
+                         if block.get("source") == source_id and block.get("sampling", {}).get("kind") == "parent_balanced_seismic_view"),
+                        {}
+                    )
+                ),
+                "configured_seismic_parent_weights": dict(
+                    next(
+                        (block.get("sampling", {}).get("parent_weights", {})
+                         for stage in config.stages
+                         for block in stage.get("loss_blocks", [])
+                         if block.get("source") == source_id and block.get("sampling", {}).get("kind") == "parent_balanced_seismic_view"),
+                        {}
+                    )
+                ),
+                "configured_validation_seismic_view_weights": dict(
+                    next(
+                        (stage.get("validation", {}).get("seismic_views", {}).get("view_weights", {})
+                         for stage in config.stages
+                         if any(block.get("source") == source_id for block in stage.get("loss_blocks", []))
+                         and stage.get("validation", {}).get("seismic_views")),
+                        {}
+                    )
+                ),
+                "materialized_view_ids": sorted(
+                    str(value) for value in synthetic[source_id][0].views.get("view_id", pd.Series(dtype=str)).tolist()
+                ),
+                "materialized_view_spec_hashes": sorted(
+                    str(value)
+                    for value in synthetic[source_id][0].views.get(
+                        "view_spec_sha256", pd.Series(dtype=str)
+                    ).tolist()
+                    if str(value).strip()
+                ),
             }
             if forward_inputs_path is not None:
                 forward_model_inputs_by_source[source_id] = forward_inputs_path
@@ -1169,6 +1544,10 @@ def run_experiment(
     reference_rows: pd.DataFrame | None = None
     if config.normalization_reference in synthetic:
         reference_benchmark, _ = synthetic[config.normalization_reference]
+        reference_split_assignment = _materialize_parent_split_assignment(
+            reference_benchmark,
+            path=output_dir / "split_assignment.csv",
+        )
         reference_index = build_patch_index(
             reference_benchmark,
             patch_spec=patch_spec,
@@ -1179,6 +1558,7 @@ def run_experiment(
                 if config.sources[config.normalization_reference].get("max_patches") is not None
                 else None
             ),
+            split_assignment=reference_split_assignment,
         )
         input_reference_stats = compute_input_reference_stats(
             reference_benchmark, reference_index, input_name="seismic"
@@ -1256,7 +1636,10 @@ def run_experiment(
             block_started = time.perf_counter()
             source_id = str(block["source"])
             source = config.sources[source_id]
-            cfg = dict(block) | {"source_kind": source["kind"]}
+            cfg = dict(block) | {
+                "source_kind": source["kind"],
+                "validation": dict(stage.get("validation") or {}),
+            }
             logger.info(
                 "block_prepare_start stage_id=%s block_id=%s kind=%s source=%s",
                 stage_id,
@@ -1404,24 +1787,21 @@ def run_experiment(
                 num_batches = (steps_per_epoch + interval - 1) // interval
                 sampling_kind = str(dict(block.config.get("sampling") or {}).get("kind") or "uniform_patch")
                 seed = _seed(config.seed, stage_index, index, epoch)
-                if sampling_kind == "balanced_sample_kind":
+                if sampling_kind == "parent_balanced_seismic_view":
                     if str(block.config.get("source_kind")) != "synthoseis_lite":
                         raise ValueError(
-                            f"Loss block {block.config['block_id']} uses balanced_sample_kind "
+                            f"Loss block {block.config['block_id']} uses parent_balanced_seismic_view "
                             "with a non-synthetic source."
                         )
-                    cycler = DeterministicSampleKindCycler(
+                    sampling = dict(block.config.get("sampling") or {})
+                    cycler = DeterministicParentBalancedViewCycler(
                         block.train_dataset,
                         batch_size=batch_size,
                         num_batches=num_batches,
                         seed=seed,
+                        parent_weights=dict(sampling["parent_weights"]),
+                        view_weights=dict(sampling["view_weights"]),
                     )
-                    if cycler.degenerated:
-                        logger.info(
-                            "block=%s sampling=balanced_sample_kind "
-                            "balanced_sample_kind_degenerated_to_single_group",
-                            block.config["block_id"],
-                        )
                 elif sampling_kind == "uniform_patch":
                     cycler = DeterministicCycler(
                         block.train_dataset,
@@ -1442,6 +1822,9 @@ def run_experiment(
             sampled_kind_counts: dict[str, dict[str, int]] = {
                 str(block.config["block_id"]): {} for block in prepared_blocks
             }
+            sampled_view_counts: dict[str, dict[str, int]] = {
+                str(block.config["block_id"]): {} for block in prepared_blocks
+            }
             progress_interval = max(1, steps_per_epoch // 10)
             last_combined = float("nan")
             for step in range(steps_per_epoch):
@@ -1457,6 +1840,10 @@ def run_experiment(
                         block_counts = sampled_kind_counts[str(prepared.config["block_id"])]
                         for sample_kind, count in cycler.last_batch_counts.items():
                             block_counts[sample_kind] = block_counts.get(sample_kind, 0) + int(count)
+                        if hasattr(cycler, "last_batch_view_counts"):
+                            view_counts = sampled_view_counts[str(prepared.config["block_id"])]
+                            for view_id, count in cycler.last_batch_view_counts.items():
+                                view_counts[view_id] = view_counts.get(view_id, 0) + int(count)
                     elif isinstance(batch, dict) and "sample_kind" in batch:
                         block_counts = sampled_kind_counts[str(prepared.config["block_id"])]
                         values = batch["sample_kind"]
@@ -1566,12 +1953,15 @@ def run_experiment(
                 for block_id, value in physics_drift_blocks.items():
                     row[f"{block_id}.increment_drift_after_mse"] = float(value)
             for block_id, kind_counts in sampled_kind_counts.items():
-                for sample_kind in ("base", "seismic_variant"):
+                for sample_kind in ("base", "seismic_view"):
                     row[f"{block_id}.sampled_{sample_kind}_count"] = int(kind_counts.get(sample_kind, 0))
                 row[f"{block_id}.sampled_other_kind_count"] = int(
                     sum(count for sample_kind, count in kind_counts.items()
-                        if sample_kind not in {"base", "seismic_variant"})
+                        if sample_kind not in {"base", "seismic_view"})
                 )
+            for block_id, view_counts in sampled_view_counts.items():
+                for view_id, count in view_counts.items():
+                    row[f"{block_id}.sampled_view_{view_id}_count"] = int(count)
             history.append(row)
             logger.info(
                 "epoch_end stage_id=%s epoch=%d/%d last_train_loss=%.6g selected_metric=%s selected_value=%.6g training=%s validation=%s sampled_kind_counts=%s elapsed_s=%.1f",
@@ -1589,7 +1979,7 @@ def run_experiment(
             if selected < best_value:
                 best_value, best_epoch = selected, epoch
                 path = stage_dir / "checkpoint_best.pt"
-                torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="best", epoch=epoch, metric_name=metric_name, metric_value=selected, sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, stage_deployment_eligible=bool(stage.get("deployment_eligible", False)), stage_deployment_eligibility_reason=str(stage.get("deployment_eligibility_reason") or ""), physics_closures=list(stage.get("physics_closures") or []), stage_loss_blocks=list(stage.get("loss_blocks") or []), forward_model_inputs_path=forward_model_inputs_path), path)
+                torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="best", epoch=epoch, metric_name=metric_name, metric_value=selected, sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, stage_deployment_eligible=bool(stage.get("deployment_eligible", False)), stage_deployment_eligibility_reason=str(stage.get("deployment_eligibility_reason") or ""), physics_closures=list(stage.get("physics_closures") or []), stage_loss_blocks=list(stage.get("loss_blocks") or []), sampling_statistics={"epoch": epoch, "kind_counts": sampled_kind_counts, "view_counts": sampled_view_counts}, forward_model_inputs_path=forward_model_inputs_path), path)
                 checkpoints[(stage_id, "best")] = path
                 logger.info(
                     "checkpoint_best stage_id=%s epoch=%d metric=%s value=%.6g path=%s",
@@ -1607,7 +1997,7 @@ def run_experiment(
             if final_has_physics
             else str(stage.get("deployment_eligibility_reason") or "")
         )
-        torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="final", epoch=int(stage["epochs"]), metric_name=metric_name, metric_value=float(history[-1]["selection_metric_value"]), sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, stage_deployment_eligible=final_eligible, stage_deployment_eligibility_reason=final_reason, physics_closures=list(stage.get("physics_closures") or []), stage_loss_blocks=list(stage.get("loss_blocks") or []), forward_model_inputs_path=forward_model_inputs_path), final_path)
+        torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="final", epoch=int(stage["epochs"]), metric_name=metric_name, metric_value=float(history[-1]["selection_metric_value"]), sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, stage_deployment_eligible=final_eligible, stage_deployment_eligibility_reason=final_reason, physics_closures=list(stage.get("physics_closures") or []), stage_loss_blocks=list(stage.get("loss_blocks") or []), sampling_statistics={"epoch": int(stage["epochs"]), "kind_counts": sampled_kind_counts, "view_counts": sampled_view_counts}, forward_model_inputs_path=forward_model_inputs_path), final_path)
         checkpoints[(stage_id, "final")] = final_path
         pd.DataFrame(history).to_csv(stage_dir / "training_history.csv", index=False)
         logger.info(
@@ -1661,6 +2051,8 @@ def run_experiment(
         "normalization_reference": {"source": config.normalization_reference},
         "normalization": normalization,
         "normalization_path": repo_relative_path(output_dir / "normalization.json", root=root),
+        "split_assignment": repo_relative_path(output_dir / "split_assignment.csv", root=root),
+        "patch_catalog_role": "parent_window_without_view_replication",
         "sources": resolved_sources,
         "increment_contract": experiment_increment_contract,
         "patching": config.patching.as_dict(),

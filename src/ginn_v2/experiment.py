@@ -21,7 +21,7 @@ LOSS_SOURCE_KINDS = {
 }
 SOURCE_KEYS = {
     "synthoseis_lite": {
-        "kind", "benchmark_dir", "input_seismic_variant", "physics_target_variant",
+        "kind", "benchmark_dir", "physics_target_variant",
         "max_patches",
     },
     "real_field": {
@@ -52,7 +52,7 @@ LOSS_KEYS = {
     },
 }
 VALIDATION_METRICS = {
-    "synthetic_supervised": {"mse"},
+    "synthetic_supervised": {"mse", "weighted_mse"},
     "physics": {"waveform_mse", "increment_l2", "total"},
     "real_well_supervised": {"mse"},
 }
@@ -130,6 +130,36 @@ def _finite(value: Any, label: str, *, positive: bool = False, nonnegative: bool
     return result
 
 
+def _parse_parent_view_weights(value: Any, label: str) -> dict[str, Any]:
+    """Validate the explicit parent/family/view probability contract."""
+    raw = _mapping(value, label)
+    _reject_extra(raw, {"kind", "parent_weights", "view_weights"}, label)
+    parent = _mapping(raw.get("parent_weights"), f"{label}.parent_weights")
+    if set(parent) != {"base", "variant"}:
+        raise ValueError(f"{label}.parent_weights must explicitly contain base and variant.")
+    parent = {
+        str(key): _finite(item, f"{label}.parent_weights.{key}", nonnegative=True)
+        for key, item in parent.items()
+    }
+    if not math.isclose(sum(parent.values()), 1.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(f"{label}.parent_weights must sum to one.")
+    view = _mapping(raw.get("view_weights"), f"{label}.view_weights")
+    if "base" in view:
+        raise ValueError(f"{label}.view_weights must contain seismic view IDs, not base.")
+    view = {
+        str(key): _finite(item, f"{label}.view_weights.{key}", positive=True)
+        for key, item in view.items()
+    }
+    if parent["variant"] > 0.0:
+        if not view:
+            raise ValueError(f"{label}.view_weights is required when variant weight is positive.")
+        if not math.isclose(sum(view.values()), 1.0, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(f"{label}.view_weights must sum to one.")
+    elif view:
+        raise ValueError(f"{label}.view_weights must be empty when variant weight is zero.")
+    return {"parent_weights": parent, "view_weights": view}
+
+
 def _reject_extra(mapping: Mapping[str, Any], allowed: set[str], label: str) -> None:
     extra = sorted(set(mapping) - allowed)
     if extra:
@@ -184,7 +214,8 @@ def _stage_deployment_eligibility(
         return False, "physics_diagnostic_only"
     metric = str(dict(stage.get("validation") or {}).get("selection_metric") or "")
     synthetic_ids = {str(block.get("block_id") or "") for block in synthetic_blocks}
-    if metric.split(".", 1)[0] not in synthetic_ids or not metric.endswith(".mse"):
+    metric_name = metric.rsplit(".", 1)[-1]
+    if metric.split(".", 1)[0] not in synthetic_ids or metric_name not in {"mse", "weighted_mse"}:
         return False, "physics_requires_dense_synthetic_mse_selection"
     if "real_well_supervised" in kinds:
         return False, "real_well_supervised_plus_physics_experimental"
@@ -385,19 +416,25 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
                         block.get("sampling") or {"kind": "uniform_patch"},
                         f"{block_id}.sampling",
                     )
-                    _reject_extra(sampling, {"kind"}, f"{block_id}.sampling")
+                    _reject_extra(
+                        sampling,
+                        {"kind", "parent_weights", "view_weights"},
+                        f"{block_id}.sampling",
+                    )
                     sampling_kind = str(sampling.get("kind") or "")
-                    if sampling_kind not in {"uniform_patch", "balanced_sample_kind"}:
+                    if sampling_kind != "parent_balanced_seismic_view":
                         raise ValueError(
-                            f"{block_id}.sampling.kind must be uniform_patch or "
-                            "balanced_sample_kind."
+                            f"{block_id}.sampling.kind must be parent_balanced_seismic_view "
+                            "for Synthoseis-lite v5."
                         )
-                    block["sampling"] = {"kind": sampling_kind}
-                    if sampling_kind == "balanced_sample_kind":
-                        block["sampling"]["groups"] = {
-                            "base": 0.5,
-                            "seismic_variant": 0.5,
-                        }
+                    weights = _parse_parent_view_weights(
+                        sampling,
+                        f"{block_id}.sampling",
+                    )
+                    block["sampling"] = {
+                        "kind": sampling_kind,
+                        **weights,
+                    }
                 elif "sampling" in block:
                     raise ValueError(
                         f"{block_id}.sampling is only supported for synthoseis_lite blocks."
@@ -448,6 +485,11 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         if not any(block["update_interval"] == 1 and block["weight"] > 0 for block in blocks):
             raise ValueError(f"Stage {stage_id} requires a positive-weight loss block with update_interval=1.")
         validation = _mapping(stage.get("validation"), f"stages[{stage_index}].validation")
+        _reject_extra(
+            validation,
+            {"selection_metric", "mode", "seismic_views"},
+            f"stages[{stage_index}].validation",
+        )
         metric = str(validation.get("selection_metric") or "")
         metric_parts = metric.split(".", 1)
         if len(metric_parts) != 2 or metric_parts[0] not in block_ids:
@@ -457,6 +499,24 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
             raise ValueError(
                 f"Stage {stage_id} selection_metric {metric!r} is not exported by "
                 f"{metric_block['kind']}."
+            )
+        synthetic_validation_blocks = [
+            block
+            for block in blocks
+            if sources[str(block["source"])]["kind"] == "synthoseis_lite"
+        ]
+        if synthetic_validation_blocks:
+            if "seismic_views" not in validation:
+                raise ValueError(
+                    f"Stage {stage_id} requires validation.seismic_views for synthetic blocks."
+                )
+            validation["seismic_views"] = _parse_parent_view_weights(
+                validation["seismic_views"],
+                f"stages[{stage_index}].validation.seismic_views",
+            )
+        elif "seismic_views" in validation:
+            raise ValueError(
+                f"Stage {stage_id}.validation.seismic_views requires a synthoseis_lite block."
             )
         mode = str(validation.get("mode") or "full")
         if mode != "full":

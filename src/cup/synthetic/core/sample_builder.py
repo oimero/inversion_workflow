@@ -10,7 +10,6 @@ import numpy as np
 from cup.synthetic.core.lfm import LfmPolicy, build_lfm_products
 from cup.synthetic.core.projection import project_truth_to_model_grid
 from cup.synthetic.core.records import (
-    BenchmarkResiduals,
     BenchmarkSample,
     DomainPreparation,
     ForwardResult,
@@ -96,7 +95,7 @@ class BenchmarkBuilder:
             "target_log_ai": projected.model_target_log_ai,
             "canonical_background_log_ai": lfm.canonical_background_log_ai,
             "target_increment_log_ai": lfm.target_increment_log_ai,
-            "input_lfm_log_ai": lfm.controlled_degraded_log_ai,
+            "input_lfm_log_ai": lfm.canonical_background_log_ai,
             "seismic_observed": forward.seismic_observed,
             "seismic_model_consistent": forward.seismic_model_consistent,
         }
@@ -119,13 +118,6 @@ class BenchmarkBuilder:
             canonical_background_log_ai=lfm.canonical_background_log_ai,
             target_increment_log_ai=lfm.target_increment_log_ai,
             input_lfm_canonical_log_ai=lfm.canonical_background_log_ai,
-            input_lfm_controlled_degraded_log_ai=lfm.controlled_degraded_log_ai,
-            residuals=BenchmarkResiduals(
-                residual_vs_lfm_ideal=lfm.residual_vs_lfm_ideal,
-                residual_vs_lfm_controlled_degraded=(
-                    lfm.residual_vs_lfm_controlled_degraded
-                ),
-            ),
             valid_mask=valid,
             qc={
                 **dict(truth.diagnostics),

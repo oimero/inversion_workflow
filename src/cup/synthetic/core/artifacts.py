@@ -91,7 +91,10 @@ def write_dataset(
     axis_order: str | Sequence[str],
 ) -> h5py.Dataset:
     data = np.asarray(values)
-    dataset = group.create_dataset(name, data=data, compression="gzip", shuffle=True)
+    if data.ndim == 0:
+        dataset = group.create_dataset(name, data=data)
+    else:
+        dataset = group.create_dataset(name, data=data, compression="gzip", shuffle=True)
     dataset.attrs["unit"] = unit
     dataset.attrs["sample_domain"] = str(sample_domain)
     dataset.attrs["axis_path"] = str(axis_path)
@@ -125,6 +128,10 @@ def validate_dataset_metadata(value: h5py.Dataset, *, sample_domain: str) -> Non
     if str(value.attrs["dtype"]) != str(value.dtype):
         raise ValueError(f"HDF5 dataset {value.name} dtype metadata is stale.")
     axis_path = str(value.attrs["axis_path"])
+    if value.ndim == 0 and str(value.attrs.get("unit")) == "json":
+        if axis_path:
+            raise ValueError(f"JSON metadata dataset {value.name} must not reference an axis")
+        return
     if not axis_path:
         if Path(value.parent.name).name.casefold() != "axes":
             raise ValueError(
@@ -176,13 +183,13 @@ def validate_training_manifest(
         "development_limited",
     }:
         raise ValueError(
-            f"Synthoseis v4 {sample_domain} manifest is not consumable: status={status!r}."
+            f"Synthoseis v5 {sample_domain} manifest is not consumable: status={status!r}."
         )
     if bool(manifest.get("qc_only", False)) or manifest.get(
         "training_consumable"
     ) is False:
         raise ValueError(
-            "Synthoseis v4 qc-only benchmark is not training-consumable; "
+            "Synthoseis v5 qc-only benchmark is not training-consumable; "
             "regenerate without --qc-only."
         )
 

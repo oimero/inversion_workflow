@@ -109,12 +109,6 @@ class ForwardResult:
 
 
 @dataclass(frozen=True)
-class BenchmarkResiduals:
-    residual_vs_lfm_ideal: np.ndarray
-    residual_vs_lfm_controlled_degraded: np.ndarray
-
-
-@dataclass(frozen=True)
 class BenchmarkSample:
     truth: SyntheticTruth
     projected: ProjectedTruth
@@ -122,8 +116,6 @@ class BenchmarkSample:
     canonical_background_log_ai: np.ndarray
     target_increment_log_ai: np.ndarray
     input_lfm_canonical_log_ai: np.ndarray
-    input_lfm_controlled_degraded_log_ai: np.ndarray
-    residuals: BenchmarkResiduals
     valid_mask: np.ndarray
     qc: Mapping[str, Any] = field(default_factory=dict)
     domain_metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -134,10 +126,9 @@ class BenchmarkSample:
 
 
 @dataclass(frozen=True)
-class BenchmarkVariant:
+class BenchmarkView:
     owner_realization_id: str
-    variant_id: str
-    sample_kind: str
+    view_id: str
     seismic_observed: np.ndarray
     positive_gain: np.ndarray
     additive_noise: np.ndarray
@@ -146,20 +137,18 @@ class BenchmarkVariant:
     sample_domain: str = "time"
 
     def __post_init__(self) -> None:
-        if not self.owner_realization_id.strip() or not self.variant_id.strip():
-            raise ValueError("Benchmark variant owner and variant id must be non-empty.")
-        if self.sample_kind != "seismic_variant":
-            raise ValueError("Benchmark variant sample_kind must be 'seismic_variant'.")
+        if not self.owner_realization_id.strip() or not self.view_id.strip():
+            raise ValueError("Benchmark view owner and view id must be non-empty.")
         domain = self.sample_domain.strip().casefold()
         if domain not in {"time", "depth"}:
-            raise ValueError("Benchmark variant domain must be time or depth.")
+            raise ValueError("Benchmark view domain must be time or depth.")
         observed = np.asarray(self.seismic_observed, dtype=np.float64)
         gain = np.asarray(self.positive_gain, dtype=np.float64)
         noise = np.asarray(self.additive_noise, dtype=np.float64)
         if observed.ndim != 2 or gain.shape != observed.shape or noise.shape != observed.shape:
-            raise ValueError("Benchmark variant arrays must share one 2-D shape.")
+            raise ValueError("Benchmark view arrays must share one 2-D shape.")
         if np.any(~np.isfinite(gain)) or np.any(gain <= 0.0):
-            raise ValueError("Benchmark variant positive_gain must be finite and positive.")
+            raise ValueError("Benchmark view positive_gain must be finite and positive.")
         object.__setattr__(self, "sample_domain", domain)
         object.__setattr__(self, "seismic_observed", observed)
         object.__setattr__(self, "positive_gain", gain)
@@ -169,9 +158,8 @@ class BenchmarkVariant:
 
 
 __all__ = [
-    "BenchmarkResiduals",
     "BenchmarkSample",
-    "BenchmarkVariant",
+    "BenchmarkView",
     "DepthForwardExtras",
     "DomainPreparation",
     "ForwardResult",

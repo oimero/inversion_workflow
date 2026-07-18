@@ -25,6 +25,7 @@ SAMPLED_SEISMIC_KINDS = frozenset(
         "global_gain",
         "tracewise_gain",
         "axis_lateral_gain",
+        "rgt_lateral_gain",
         "additive_white_noise",
         "additive_colored_noise",
     }
@@ -179,6 +180,39 @@ def _validate_operator_parameters(operator_id: str, spec: Mapping[str, Any]) -> 
             value = finite_number("axis_correlation_fraction", positive=True)
             if value > 1.0:
                 raise ValueError(f"seismic operator {operator_id!r}.axis_correlation_fraction must be <= 1")
+    elif kind == "rgt_lateral_gain":
+        sigma_keys = (
+            "rgt_log_sigma",
+            "lateral_log_sigma",
+            "interaction_log_sigma",
+        )
+        sigma_values = [finite_number(key) for key in sigma_keys]
+        if any(value < 0.0 for value in sigma_values):
+            raise ValueError(
+                f"seismic operator {operator_id!r} gain sigmas must be non-negative"
+            )
+        if not any(value > 0.0 for value in sigma_values):
+            raise ValueError(
+                f"seismic operator {operator_id!r} requires at least one positive gain sigma"
+            )
+        for key in (
+            "rgt_correlation_length",
+            "lateral_correlation_length_m",
+            "interaction_rgt_correlation_length",
+            "interaction_lateral_correlation_length_m",
+            "max_abs_log_gain",
+        ):
+            finite_number(key, positive=True)
+        try:
+            rank = int(spec["interaction_rank"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"seismic operator {operator_id!r}.interaction_rank must be an integer"
+            ) from exc
+        if isinstance(spec["interaction_rank"], bool) or rank != spec["interaction_rank"] or rank < 1:
+            raise ValueError(
+                f"seismic operator {operator_id!r}.interaction_rank must be a positive integer"
+            )
     elif kind == "additive_white_noise":
         finite_number("rms_fraction", positive=True)
     elif kind == "additive_colored_noise":
@@ -297,6 +331,14 @@ def resolve_view_specs(config: Mapping[str, Any]) -> tuple[SeismicViewSpec, ...]
             "global_gain": {"kind", "log_sigma"},
             "tracewise_gain": {"kind", "log_sigma", "lateral_correlation_fraction"},
             "axis_lateral_gain": {"kind", "log_sigma", "lateral_correlation_fraction", "axis_correlation_fraction"},
+            "rgt_lateral_gain": {
+                "kind", "rgt_log_sigma", "rgt_correlation_length",
+                "lateral_log_sigma", "lateral_correlation_length_m",
+                "interaction_log_sigma", "interaction_rank",
+                "interaction_rgt_correlation_length",
+                "interaction_lateral_correlation_length_m",
+                "max_abs_log_gain",
+            },
             "additive_white_noise": {"kind", "rms_fraction"},
             "additive_colored_noise": {"kind", "rms_fraction", "axis_correlation"},
         }
@@ -310,6 +352,14 @@ def resolve_view_specs(config: Mapping[str, Any]) -> tuple[SeismicViewSpec, ...]
             "global_gain": {"log_sigma"},
             "tracewise_gain": {"log_sigma", "lateral_correlation_fraction"},
             "axis_lateral_gain": {"log_sigma", "lateral_correlation_fraction", "axis_correlation_fraction"},
+            "rgt_lateral_gain": {
+                "rgt_log_sigma", "rgt_correlation_length",
+                "lateral_log_sigma", "lateral_correlation_length_m",
+                "interaction_log_sigma", "interaction_rank",
+                "interaction_rgt_correlation_length",
+                "interaction_lateral_correlation_length_m",
+                "max_abs_log_gain",
+            },
             "additive_white_noise": {"rms_fraction"},
             "additive_colored_noise": {"rms_fraction", "axis_correlation"},
         }

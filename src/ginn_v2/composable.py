@@ -900,7 +900,7 @@ def masked_centered_rms(
 
 def _block_loss(
     prepared: PreparedBlock, batch: Any, model: torch.nn.Module, *, device: torch.device,
-    normalization: Mapping[str, Any],
+    normalization: Mapping[str, Any], prediction: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     cfg = prepared.config
     kind = str(cfg["kind"])
@@ -914,7 +914,8 @@ def _block_loss(
             )
         return loss, {"mse": float(loss.detach().cpu()), **{key: float(value) for key, value in counts.items()}}
     x = batch["input"].to(device)
-    prediction = model(x)
+    if prediction is None:
+        prediction = model(x)
     if kind == "synthetic_supervised":
         supervised_mask = batch["valid_mask"].to(device)
         loss = masked_mse(
@@ -1208,7 +1209,7 @@ def _synthetic_view_family(benchmark: SynthoseisBenchmark, view_id: str) -> str:
     if len(set(kinds_by_row)) != 1:
         raise ValueError(f"Validation view {view_id!r} has inconsistent operator kinds.")
     kinds = set(kinds_by_row[0])
-    if kinds and kinds.issubset({"global_gain", "tracewise_gain", "axis_lateral_gain"}):
+    if kinds and kinds.issubset({"global_gain", "tracewise_gain", "axis_lateral_gain", "rgt_lateral_gain"}):
         return "amplitude"
     if kinds and kinds.issubset({"additive_white_noise", "additive_colored_noise"}):
         return "noise"
@@ -1292,6 +1293,9 @@ def _evaluate_synthetic_view_weighted(
 
     # Records are retained at parent/window granularity for exact paired QC.
     records: list[dict[str, Any]] = []
+    gain_cache: dict[tuple[str, str], np.ndarray] = {}
+    base_prediction_cache: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
+    paired_prediction_patch_records: list[dict[str, Any]] = []
     was_training = model.training
     model.eval()
     try:
@@ -1305,14 +1309,60 @@ def _evaluate_synthetic_view_weighted(
                     for row_index in patch_indices:
                         item = dataset.get_item_for_view(row_index, view_id)
                         batch = default_collate([item])
+                        prediction = model(batch["input"].to(device))
                         loss, diagnostics = _block_loss(
-                            prepared, batch, model, device=device, normalization=normalization
+                            prepared, batch, model, device=device,
+                            normalization=normalization, prediction=prediction,
                         )
                         value = float(diagnostics.get(metric_name, float(loss.detach().cpu())))
                         row = frame.iloc[int(row_index)]
+                        parent = str(row["parent_realization_id"])
+                        gain_patch: np.ndarray | None = None
+                        if view_id != "base" and callable(
+                            getattr(benchmark, "load_seismic_view", None)
+                        ):
+                            cache_key = (parent, view_id)
+                            if cache_key not in gain_cache:
+                                gain_cache[cache_key] = np.asarray(
+                                    benchmark.load_seismic_view(parent, view_id).positive_gain,
+                                    dtype=np.float64,
+                                )
+                            gain_patch = gain_cache[cache_key][
+                                int(row["lateral_start"]):int(row["lateral_stop"]),
+                                int(row["twt_start"]):int(row["twt_stop"]),
+                            ]
+                        prediction_array = prediction.detach().cpu().numpy()
+                        valid_mask_array = batch["valid_mask"].detach().cpu().numpy() > 0.5
+                        patch_id = str(item["patch_id"])
+                        if view_id == "base":
+                            base_prediction_cache[(parent, patch_id)] = (
+                                prediction_array, valid_mask_array,
+                            )
+                        else:
+                            base_pair = base_prediction_cache.get((parent, patch_id))
+                            if base_pair is not None:
+                                patch_metrics = _paired_prediction_metrics(
+                                    [
+                                        {
+                                            "parent": parent, "patch_id": patch_id,
+                                            "view_id": "base", "prediction": base_pair[0],
+                                            "valid_mask": base_pair[1], "positive_gain": None,
+                                        },
+                                        {
+                                            "parent": parent, "patch_id": patch_id,
+                                            "view_id": view_id, "prediction": prediction_array,
+                                            "valid_mask": valid_mask_array,
+                                            "positive_gain": gain_patch,
+                                        },
+                                    ],
+                                    view_ids=[view_id],
+                                )
+                                paired_prediction_patch_records.append(
+                                    {"parent": parent, **patch_metrics}
+                                )
                         records.append({
-                            "parent": str(row["parent_realization_id"]),
-                            "patch_id": str(item["patch_id"]),
+                            "parent": parent,
+                            "patch_id": patch_id,
                             "view_id": view_id,
                             "value": value,
                         })
@@ -1398,6 +1448,120 @@ def _evaluate_synthetic_view_weighted(
         if paired:
             result[f"paired_{view_id}_delta_{metric_name}"] = float(np.mean(paired))
             result[f"paired_{view_id}_count"] = float(len(paired))
+    paired_metric_names = sorted({
+        key
+        for record in paired_prediction_patch_records
+        for key in record
+        if key != "parent"
+    })
+    for name in paired_metric_names:
+        by_parent: dict[str, list[float]] = {}
+        for record in paired_prediction_patch_records:
+            if name in record:
+                by_parent.setdefault(str(record["parent"]), []).append(float(record[name]))
+        result[name] = float(np.mean([np.mean(values) for values in by_parent.values()]))
+    return result
+
+
+def _paired_prediction_metrics(
+    records: list[dict[str, Any]], *, view_ids: list[str],
+) -> dict[str, float]:
+    """Summarize same-parent/window prediction drift with parent-uniform weights.
+
+    Gain-quintile diagnostics are emitted only when a patch contains a genuinely
+    varying positive gain.  Constant-gain and non-gain views therefore retain the
+    paired whole-patch metrics without inventing arbitrary quantile buckets.
+    """
+    lookup = {
+        (str(record["view_id"]), str(record["parent"]), str(record["patch_id"])): record
+        for record in records
+        if record.get("prediction") is not None and record.get("valid_mask") is not None
+    }
+    result: dict[str, float] = {}
+
+    def parent_uniform(values: list[tuple[str, float]]) -> float:
+        by_parent: dict[str, list[float]] = {}
+        for parent, value in values:
+            by_parent.setdefault(parent, []).append(float(value))
+        return float(np.mean([np.mean(items) for items in by_parent.values()]))
+
+    quantile_edges = np.linspace(0.0, 1.0, 6)
+    for view_id in view_ids:
+        drift_values: list[tuple[str, float]] = []
+        correlation_values: list[tuple[str, float]] = []
+        quantile_values: dict[int, list[tuple[str, float]]] = {
+            index: [] for index in range(len(quantile_edges) - 1)
+        }
+        for (current_view, parent, patch_id), current in lookup.items():
+            if current_view != view_id:
+                continue
+            base = lookup.get(("base", parent, patch_id))
+            if base is None:
+                continue
+            current_prediction = np.asarray(current["prediction"], dtype=np.float64)
+            base_prediction = np.asarray(base["prediction"], dtype=np.float64)
+            current_mask = np.asarray(current["valid_mask"], dtype=bool)
+            base_mask = np.asarray(base["valid_mask"], dtype=bool)
+            if current_prediction.shape != base_prediction.shape:
+                raise ValueError("Paired validation prediction shapes differ.")
+            if current_mask.shape != current_prediction.shape or not np.array_equal(
+                current_mask, base_mask
+            ):
+                raise ValueError("Paired validation masks differ.")
+            valid = current_mask & np.isfinite(current_prediction) & np.isfinite(base_prediction)
+            if not np.any(valid):
+                continue
+            current_values = current_prediction[valid]
+            base_values = base_prediction[valid]
+            squared_drift = np.square(current_values - base_values)
+            drift_values.append((parent, float(np.mean(squared_drift))))
+            if np.std(current_values) > 0.0 and np.std(base_values) > 0.0:
+                correlation_values.append(
+                    (parent, float(np.corrcoef(current_values, base_values)[0, 1]))
+                )
+
+            gain = current.get("positive_gain")
+            if gain is None:
+                continue
+            gain_values_full = np.asarray(gain, dtype=np.float64)
+            squeezed_mask = valid.reshape(valid.shape[-2:])
+            if gain_values_full.shape != squeezed_mask.shape:
+                raise ValueError("Positive-gain patch shape differs from paired prediction mask.")
+            gain_values = gain_values_full[squeezed_mask]
+            if np.any(~np.isfinite(gain_values)) or np.any(gain_values <= 0.0):
+                raise ValueError("Paired validation positive gain must be finite and positive.")
+            if np.ptp(gain_values) <= np.finfo(np.float64).eps * max(
+                1.0, float(np.max(np.abs(gain_values)))
+            ):
+                continue
+            boundaries = np.quantile(gain_values, quantile_edges)
+            for index in range(len(quantile_edges) - 1):
+                if boundaries[index + 1] <= boundaries[index]:
+                    continue
+                selected = gain_values >= boundaries[index]
+                if index + 1 == len(quantile_edges) - 1:
+                    selected &= gain_values <= boundaries[index + 1]
+                else:
+                    selected &= gain_values < boundaries[index + 1]
+                if np.any(selected):
+                    quantile_values[index].append(
+                        (parent, float(np.mean(squared_drift[selected])))
+                    )
+
+        prefix = f"paired_{view_id}"
+        if drift_values:
+            result[f"{prefix}_prediction_drift_mse"] = parent_uniform(drift_values)
+        if correlation_values:
+            result[f"{prefix}_prediction_correlation"] = parent_uniform(
+                correlation_values
+            )
+        for index, values in quantile_values.items():
+            if values:
+                lower = int(round(100 * quantile_edges[index]))
+                upper = int(round(100 * quantile_edges[index + 1]))
+                result[
+                    f"{prefix}_gain_q{lower:02d}_q{upper:02d}_prediction_drift_mse"
+                ] = parent_uniform(values)
     return result
 
 

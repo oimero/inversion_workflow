@@ -194,6 +194,7 @@ sampled_seismic_operator
   global_gain
   tracewise_gain
   axis_lateral_gain
+  rgt_lateral_gain
   additive_white_noise
   additive_colored_noise
 ```
@@ -219,7 +220,7 @@ benchmark schema: synthoseis_lite_v5
 science revision: synthoseis_lite_science_v3
 projection contract: finite_support_projection_v1
 seismic view contract: seismic_views_v1
-seismic operator contract: seismic_operators_v1
+seismic operator contract: seismic_operators_v2
 random stream contract: synthoseis_random_v3
 ```
 

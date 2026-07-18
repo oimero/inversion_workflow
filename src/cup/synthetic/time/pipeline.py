@@ -283,6 +283,7 @@ class TimeGenerationSession:
                     operator_source_support=np.asarray(sample.forward.support.observed, dtype=bool),
                     lateral_m=sample.truth.lateral_m,
                     sample_axis=sample.projected.model_axis.coordinates,
+                    rgt_model=sample.projected.rgt_model,
                 ),
                 lambda phase_degrees, shift_s: _time_perturbed_wavelet_forward(
                     wrapped,

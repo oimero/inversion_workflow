@@ -259,6 +259,7 @@ class SeismicViewContext:
     operator_source_support: np.ndarray
     lateral_m: np.ndarray
     sample_axis: np.ndarray
+    rgt_model: np.ndarray
 
 
 class SeismicViewPipeline:
@@ -295,6 +296,7 @@ class SeismicViewPipeline:
             operator_source_support=context.operator_source_support,
             lateral_m=context.lateral_m,
             sample_axis=axis,
+            rgt_model=context.rgt_model,
             view_specs=self.specs,
             global_seed=self.global_seed,
             generator_family=self.generator_family,

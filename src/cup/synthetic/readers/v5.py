@@ -419,14 +419,10 @@ class V5Benchmark:
             increment = np.asarray(h5[f"{root}/targets/target_increment_log_ai"][()], dtype=np.float64)
             vp_path = f"{root}/truth/vp_model_mps"
             vp = np.asarray(h5[vp_path][()], dtype=np.float64) if vp_path in h5 else np.full_like(target, np.nan)
-            seismic_path = row.get("seismic_observed_dataset") or row.get("base_seismic_dataset")
-            consistent_path = row.get("model_consistent_seismic_dataset")
-            if not seismic_path or not consistent_path:
-                raise ValueError(
-                    f"v5 realization row lacks canonical seismic dataset paths: {sample_id}"
-                )
-            seismic = np.asarray(h5[str(seismic_path)][()], dtype=np.float64)
-            consistent = np.asarray(h5[str(consistent_path)][()], dtype=np.float64)
+            seismic = np.asarray(h5[row["seismic_observed_dataset"]][()], dtype=np.float64)
+            consistent = np.asarray(
+                h5[row["model_consistent_seismic_dataset"]][()], dtype=np.float64
+            )
             valid = np.asarray(h5[row["valid_mask_dataset"]][()], dtype=bool)
             lateral = np.asarray(h5[f"{root}/axes/lateral_m"][()], dtype=np.float64)
             axis_name = "tvdss_model_m" if self.sample_domain == "depth" else "twt_model_s"

@@ -740,6 +740,8 @@ validation 必须在相同父实现、相同 patch 上评估 base 和每个 view
 - 每个 view 相对同 patch base 的 paired 指标变化；
 - 父实现级和 patch 级样本计数。
 
+amplitude/noise/operator 的分组由 view index 的 `operator_kinds_json` 解析；`view_id` 只用于标识 view，不参与分组猜测。
+
 不得用索引行平均代替显式权重聚合。
 
 ### 7.6 checkpoint provenance

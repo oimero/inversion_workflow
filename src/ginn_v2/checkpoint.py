@@ -14,13 +14,11 @@ from ginn_v2.models import build_model
 
 
 def _validate_probability_contract(
-    value: object, *, label: str, allow_empty: bool = False,
+    value: object, *, label: str,
 ) -> dict[str, float]:
     if not isinstance(value, dict):
         raise ValueError(f"GINN-v2 checkpoint {label} must be a mapping.")
     result = {str(key): float(item) for key, item in value.items()}
-    if not result and allow_empty:
-        return result
     if not result or any(not math.isfinite(item) or item < 0.0 for item in result.values()):
         raise ValueError(f"GINN-v2 checkpoint {label} contains invalid weights.")
     if not math.isclose(sum(result.values()), 1.0, rel_tol=0.0, abs_tol=1e-12):

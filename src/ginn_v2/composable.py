@@ -430,7 +430,7 @@ def _resolve_auto_benchmark(root: Path) -> Path:
 
 
 def _benchmark_forward_model_inputs_path(
-    benchmark: SynthoseisBenchmark, benchmark_dir: Path, *, root: Path,
+    benchmark: SynthoseisBenchmark, *, root: Path,
 ) -> Path | None:
     if str(benchmark.manifest.get("sample_domain") or "") != "depth":
         return None
@@ -441,21 +441,11 @@ def _benchmark_forward_model_inputs_path(
             "R0/R1 require the frozen depth forward contract."
         )
     path = Path(raw_path)
-    if path.is_absolute():
-        candidates = [path]
-    else:
-        # Published manifests use repository-relative paths.  A hand-built
-        # benchmark may still use a path relative to its own run directory;
-        # accept that only when it is the path that actually exists.
-        candidates = [root / path, benchmark_dir / path]
-    for candidate in candidates:
-        resolved = candidate.resolve()
-        if resolved.is_file():
-            return resolved
-    raise FileNotFoundError(
-        "Depth forward_model_inputs_path not found: "
-        f"{', '.join(str(candidate.resolve()) for candidate in candidates)}"
-    )
+    resolved = path if path.is_absolute() else root / path
+    resolved = resolved.resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Depth forward_model_inputs_path not found: {resolved}")
+    return resolved
 
 
 def _source_path(value: Any, root: Path) -> Path:
@@ -480,8 +470,7 @@ def _materialize_parent_split_assignment(
     benchmark: SynthoseisBenchmark, *, path: Path,
 ) -> dict[str, str]:
     """Materialize the GINN-owned parent split with a versioned hash contract."""
-    benchmark_schema = getattr(benchmark, "schema", None)
-    if benchmark_schema is not None and str(benchmark_schema) != "synthoseis_lite_v5":
+    if str(benchmark.schema) != "synthoseis_lite_v5":
         raise ValueError(
             "GINN-v2 parent split assignment requires a synthoseis_lite_v5 benchmark."
         )
@@ -1194,28 +1183,43 @@ def _evaluate(
     }
 
 
-def _synthetic_view_family(benchmark: Any, view_id: str) -> str:
-    """Resolve the diagnostic family without affecting the sampling contract."""
+def _synthetic_view_family(benchmark: SynthoseisBenchmark, view_id: str) -> str:
+    """Resolve a view family from its canonical operator metadata."""
     if view_id == "base":
         return "base"
-    frame = getattr(benchmark, "views", None)
-    kinds: list[str] = []
-    if isinstance(frame, pd.DataFrame) and not frame.empty and "view_id" in frame:
-        matches = frame[frame["view_id"].astype(str).eq(view_id)]
-        if len(matches) == 1:
-            raw = matches.iloc[0].get("operator_kinds_json", "")
-            try:
-                parsed = json.loads(str(raw))
-                if isinstance(parsed, list):
-                    kinds = [str(value).casefold() for value in parsed]
-            except json.JSONDecodeError:
-                kinds = []
-    token = " ".join([view_id.casefold(), *kinds])
-    if "gain" in token:
+    frame = benchmark.views
+    matches = frame.loc[frame["view_id"].astype(str).eq(view_id)]
+    if matches.empty:
+        raise ValueError(f"Validation view {view_id!r} is absent from the benchmark.")
+    spec_ids = set(matches["view_spec_sha256"].astype(str))
+    if len(spec_ids) != 1:
+        raise ValueError(f"Validation view {view_id!r} has inconsistent view specs.")
+    kinds_by_row: list[tuple[str, ...]] = []
+    for raw in matches["operator_kinds_json"]:
+        try:
+            parsed = json.loads(str(raw))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Validation view {view_id!r} has invalid operator metadata."
+            ) from exc
+        if not isinstance(parsed, list) or not parsed:
+            raise ValueError(f"Validation view {view_id!r} has no operator kinds.")
+        kinds_by_row.append(tuple(str(value).casefold() for value in parsed))
+    if len(set(kinds_by_row)) != 1:
+        raise ValueError(f"Validation view {view_id!r} has inconsistent operator kinds.")
+    kinds = set(kinds_by_row[0])
+    if kinds and kinds.issubset({"global_gain", "tracewise_gain", "axis_lateral_gain"}):
         return "amplitude"
-    if "noise" in token:
+    if kinds and kinds.issubset({"additive_white_noise", "additive_colored_noise"}):
         return "noise"
-    return "operator"
+    if kinds and kinds.issubset(
+        {"wavelet_phase_rotation", "wavelet_time_shift", "axis_static"}
+    ):
+        return "operator"
+    raise ValueError(
+        f"Validation view {view_id!r} mixes or uses unsupported operator families: "
+        f"{sorted(kinds)}"
+    )
 
 
 def _evaluate_synthetic_view_weighted(
@@ -1515,7 +1519,7 @@ def run_experiment(
                     "ginn_v2.increment_contract."
                 )
             forward_inputs_path = _benchmark_forward_model_inputs_path(
-                synthetic[source_id][0], benchmark_dir, root=root,
+                synthetic[source_id][0], root=root,
             )
             resolved_sources[source_id] = {
                 "kind": "synthoseis_lite",

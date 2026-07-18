@@ -48,6 +48,10 @@ from cup.synthetic.time.config import (  # noqa: E402
     resolve_sources,
 )
 from cup.synthetic.time.pipeline import run_generation  # noqa: E402
+from cup.synthetic.time.amplitude_calibration import (  # noqa: E402
+    run_time_amplitude_calibration,
+    run_time_amplitude_pilot,
+)
 from cup.utils.io import (  # noqa: E402
     load_yaml_config,
     repo_relative_path,
@@ -250,6 +254,7 @@ def main() -> None:
             summary = run_depth_amplitude_calibration(
                 workflow=workflow,
                 script_cfg=script_cfg,
+                forward_inputs=forward_inputs,
                 calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
                 pilot_benchmark_dir=resolve_relative_path(args.pilot_benchmark, root=REPO_ROOT),
                 repo_root=REPO_ROOT,
@@ -297,6 +302,26 @@ def main() -> None:
             repo_root=REPO_ROOT,
             output_dir=output_dir,
         )
+    elif args.command == "generate-amplitude-pilot":
+        summary = run_time_amplitude_pilot(
+            workflow=workflow,
+            script_cfg=script_cfg,
+            sources=sources,
+            config_provenance=config_provenance,
+            calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
+            repo_root=REPO_ROOT,
+            output_dir=output_dir,
+        )
+    elif args.command == "calibrate-amplitude":
+        summary = run_time_amplitude_calibration(
+            workflow=workflow,
+            script_cfg=script_cfg,
+            sources=sources,
+            calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
+            pilot_benchmark_dir=resolve_relative_path(args.pilot_benchmark, root=REPO_ROOT),
+            repo_root=REPO_ROOT,
+            output_dir=output_dir,
+        )
     else:
         calibration = resolve_relative_path(args.impedance_calibration, root=REPO_ROOT)
         summary = run_generation(
@@ -305,14 +330,17 @@ def main() -> None:
             sources=sources,
             config_provenance=config_provenance,
             calibration_path=calibration,
+            amplitude_calibration_path=(
+                None
+                if args.seismic_amplitude_calibration is None
+                else resolve_relative_path(args.seismic_amplitude_calibration, root=REPO_ROOT)
+            ),
             repo_root=REPO_ROOT,
             output_dir=output_dir,
             debug_attempt_limit=args.debug_attempt_limit,
             geometry_families=args.geometry_family,
             qc_only=args.qc_only,
         )
-    if args.command not in {"calibrate", "generate"}:
-        raise ValueError(f"{args.command} is currently implemented for the depth-domain branch only.")
     print("=== synthoseis-lite ===")
     print(f"Command: {args.command}")
     print(f"Output: {output_dir}")

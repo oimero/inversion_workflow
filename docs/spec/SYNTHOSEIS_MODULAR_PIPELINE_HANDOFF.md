@@ -90,8 +90,8 @@ L_{\mathrm{external}}
 - v4 reader、旧训练字段或旧产物的兼容路径。
 
 > **2026-07-19 增补：** 上述“不新增空间变增益”是本轮共享 Pipeline
-> 重构的原始范围说明。重构完成后，`rgt_lateral_gain` 已作为
-> `seismic_operators_v2` 的第 12 个正式原子视图加入活动 benchmark。
+> 重构的原始范围说明。第一轮重构完成后，`rgt_lateral_gain` 作为
+> `seismic_operators_v2` 的第 12 个正式原子视图进入了当时的 benchmark。
 > 它是零中心的随机 RGT—横向非平稳增益增强，不代表真实工区 gain
 > 已完成统计校准；活动训练和统一 validation 均将它纳入 amplitude family。
 
@@ -226,7 +226,7 @@ benchmark schema: synthoseis_lite_v5
 science revision: synthoseis_lite_science_v3
 projection contract: finite_support_projection_v1
 seismic view contract: seismic_views_v1
-seismic operator contract: seismic_operators_v2
+seismic operator contract: seismic_operators_v3
 random stream contract: synthoseis_random_v3
 ```
 
@@ -738,21 +738,23 @@ validation:
   seismic_views:
     parent_weights: {base: 0.5, variant: 0.5}
     view_weights:
-      white_noise: 0.08333333333333333
-      colored_noise: 0.08333333333333333
-      global_gain: 0.08333333333333333
-      tracewise_gain: 0.08333333333333333
-      axis_lateral_gain: 0.08333333333333333
-      rgt_lateral_gain: 0.08333333333333333
-      phase_rotation_m10deg: 0.08333333333333333
-      phase_rotation_p10deg: 0.08333333333333333
-      wavelet_time_shift_m0p001s: 0.08333333333333333
-      wavelet_time_shift_p0p001s: 0.08333333333333333
-      axis_static_m2p5: 0.08333333333333333
-      axis_static_p2p5: 0.08333333333333333
+      phase_minus: 0.07142857142857142
+      phase_plus: 0.07142857142857142
+      shift_minus: 0.07142857142857142
+      shift_plus: 0.07142857142857142
+      static_minus: 0.07142857142857142
+      static_plus: 0.07142857142857142
+      global_gain: 0.07142857142857142
+      tracewise_gain: 0.07142857142857142
+      axis_lateral_gain: 0.07142857142857142
+      rgt_lateral_gain: 0.07142857142857142
+      empirical_rgt_gain: 0.07142857142857142
+      empirical_rgt_plus_random_gain: 0.07142857142857142
+      white_noise: 0.07142857142857142
+      colored_noise: 0.07142857142857142
 ```
 
-该 checkpoint objective 明确定义为 **view-uniform objective**：variant 总权重中的 12 个视图逐 view 等权，因此 amplitude/noise/operator 三个家族的权重分别为 `4/12`、`2/12`、`6/12`。这不是 family-uniform objective。三个家族另行报告等家族权重的诊断指标，但不参与 checkpoint 选择。
+该 checkpoint objective 明确定义为 **view-uniform objective**：variant 总权重中的 14 个视图逐 view 等权，因此 amplitude/noise/operator 三个家族的权重分别为 `6/14`、`2/14`、`6/14`。这不是 family-uniform objective。三个家族另行报告等家族权重的诊断指标，但不参与 checkpoint 选择。
 
 validation 必须在相同父实现、相同 patch 上评估 base 和每个 view，输出：
 
@@ -1026,7 +1028,8 @@ validation views 与权重
 本轮已落地的 Implementation 包括：
 
 - Synthoseis-lite v5/science-v3 schema、canonical-only LFM、原子 operator grammar、规范化 view fingerprint 和命名随机流；
-- 独立的无视图分层 pilot 与真实减 pilot 的 RGT 振幅标定合同，以及确定性经验模板和经验模板叠加随机残差两个视图；
+- 时间域与深度域共用的无视图分层 pilot 配置、RGT 曲线估计、分层聚合、振幅标定合同、原子发布、严格加载和视图解析；两个域只在真实剖面读取、层位轴与本域正演处使用各自 Adapter；
+- 确定性经验模板和经验模板叠加通用随机残差两个视图；
 - 共享 `SeismicViewPipeline`、真正拥有完整父实现事务的 `SyntheticBenchmarkPipeline`、时间/深度 domain Adapter、成功父实现/视图双索引和严格 v5 reader；入口只负责加载域输入、构造 Adapter 并调用共享 Pipeline；
 - 共享 Pipeline 统一拥有 calibrate/generate 的临时目录、preflight、父实现循环、视图物化、HDF5、双索引、QC、接受率、manifest、summary 和最终目录发布；任一父实现视图失败时整组事务回滚；
 - 本轮没有新增 `core` 过渡模块，并将样本协议与 reader header 合并到既有公共模块，`src/cup/synthetic/core` 文件数由 23 个收敛为 21 个；

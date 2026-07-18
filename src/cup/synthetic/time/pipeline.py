@@ -182,6 +182,7 @@ class TimeGenerationSession:
         sources: Mapping[str, Path],
         config_provenance: Mapping[str, str],
         calibration_path: Path,
+        amplitude_calibration_path: Path | None = None,
         repo_root: Path,
         debug_attempt_limit: int | None = None,
         geometry_families: Sequence[str] | None = None,
@@ -194,6 +195,25 @@ class TimeGenerationSession:
             sources=sources,
             repo_root=repo_root,
         )
+        from cup.synthetic.core.amplitude_calibration import resolve_empirical_seismic_views
+        from cup.synthetic.time.amplitude_calibration import time_pilot_compatibility
+
+        resolved_views, amplitude_provenance = resolve_empirical_seismic_views(
+            script_cfg["seismic_views"],
+            calibration_path=amplitude_calibration_path,
+            repo_root=repo_root,
+            sample_domain="time",
+            ordered_horizons=[str(item["name"]) for item in script_cfg["horizons"]],
+        )
+        if amplitude_provenance is not None:
+            input_contracts["seismic_amplitude_calibration"] = {
+                "path": str(amplitude_provenance["path"]),
+                "contract_fingerprint_sha256": str(
+                    amplitude_provenance["contract_fingerprint_sha256"]
+                ),
+                "artifact_sha256": str(amplitude_provenance["artifact_sha256"]),
+                "template_sha256": str(amplitude_provenance["template_sha256"]),
+            }
         wavelet_time, wavelet = load_wavelet_csv(
             sources["wavelet_generation_dir"] / "selected_wavelet.csv"
         )
@@ -327,6 +347,16 @@ class TimeGenerationSession:
             "increment_contract": generation_contract("time", output_dt).as_dict(),
             "seismic_input_contract": build_seismic_input_contract("time", operator="time_forward_highres_wavelet_antialias"),
             "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
+            "benchmark_purpose": str(
+                script_cfg.get("benchmark_purpose") or "field_conditioned_benchmark"
+            ),
+            "amplitude_pilot_compatibility": time_pilot_compatibility(
+                workflow=workflow,
+                script_cfg=script_cfg,
+                sources=sources,
+                calibration_path=calibration_path,
+                repo_root=repo_root,
+            ),
             "output_dt_s": output_dt,
             "truth_dt_s": calibration.truth_sample_interval,
             "n_sections": len(sections),
@@ -363,6 +393,7 @@ class TimeGenerationSession:
             build_attempt=build_parent,
             view_context=view_context,
             write_domain_outputs=write_domain_outputs,
+            resolved_seismic_views=resolved_views,
         )
 # Public entrypoint: source loading and Adapter construction only.
 def run_generation(
@@ -372,6 +403,7 @@ def run_generation(
     sources: Mapping[str, Path],
     config_provenance: Mapping[str, str],
     calibration_path: Path,
+    amplitude_calibration_path: Path | None = None,
     repo_root: Path,
     output_dir: Path,
     debug_attempt_limit: int | None = None,
@@ -386,6 +418,7 @@ def run_generation(
             "sources": sources,
             "config_provenance": config_provenance,
             "calibration_path": calibration_path,
+            "amplitude_calibration_path": amplitude_calibration_path,
             "repo_root": repo_root,
         }
     )
@@ -400,5 +433,6 @@ def run_generation(
         sources=sources,
         config_provenance=config_provenance,
         calibration_path=calibration_path,
+        amplitude_calibration_path=amplitude_calibration_path,
         repo_root=repo_root,
     )

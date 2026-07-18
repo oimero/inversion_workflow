@@ -396,12 +396,14 @@ class DepthGenerationSession:
                 "contract_fingerprint_sha256": str(forward_inputs["_contract_fingerprint_sha256"]),
             },
         }
-        from cup.synthetic.depth.amplitude_calibration import resolve_empirical_seismic_views
+        from cup.synthetic.core.amplitude_calibration import resolve_empirical_seismic_views
+        from cup.synthetic.depth.amplitude_calibration import depth_pilot_compatibility
 
         resolved_views, amplitude_provenance = resolve_empirical_seismic_views(
             script_cfg["seismic_views"],
             calibration_path=amplitude_calibration_path,
             repo_root=repo_root,
+            sample_domain="depth",
             ordered_horizons=[str(item["name"]) for item in script_cfg["horizons"]],
         )
         if amplitude_provenance is not None:
@@ -560,6 +562,13 @@ class DepthGenerationSession:
             "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
             "benchmark_purpose": str(
                 script_cfg.get("benchmark_purpose") or "field_conditioned_benchmark"
+            ),
+            "amplitude_pilot_compatibility": depth_pilot_compatibility(
+                workflow=workflow,
+                script_cfg=script_cfg,
+                calibration_path=calibration_path,
+                forward_inputs=forward_inputs,
+                repo_root=repo_root,
             ),
             "depth_basis": "tvdss",
             "n_sections": len(sections),

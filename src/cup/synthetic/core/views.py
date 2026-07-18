@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import statistics
 from typing import Any, Mapping, Sequence
 
 from cup.synthetic.schemas import (
@@ -221,7 +222,11 @@ def _validate_operator_parameters(operator_id: str, spec: Mapping[str, Any]) -> 
                 f"seismic operator {operator_id!r}.parameter_source must be "
                 "'seismic_amplitude_calibration'"
             )
-        finite_number("mean_pattern_scale", positive=True)
+        scale = finite_number("mean_pattern_scale", positive=True)
+        if scale > 1.0:
+            raise ValueError(
+                f"seismic operator {operator_id!r}.mean_pattern_scale must be <= 1"
+            )
         resolved_keys = {
             "calibration_schema_version",
             "calibration_artifact_sha256",
@@ -250,7 +255,7 @@ def _validate_operator_parameters(operator_id: str, spec: Mapping[str, Any]) -> 
                 raise ValueError(
                     f"seismic operator {operator_id!r}.rgt_knots must be strictly increasing"
                 )
-            if abs(float(sorted(template)[len(template) // 2])) > 5e-3:
+            if abs(float(statistics.median(template))) > 1e-10:
                 raise ValueError(
                     f"seismic operator {operator_id!r} resolved template violates its zero-median gauge"
                 )

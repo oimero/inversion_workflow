@@ -21,6 +21,8 @@ from cup.synthetic.core.views import (
     validate_seismic_view_metadata,
 )
 from cup.synthetic.core.pipeline import (
+    GenerationAttempt,
+    GenerationSession,
     SeismicViewContext,
     SeismicViewPipeline,
     SyntheticBenchmarkPipeline,
@@ -41,6 +43,8 @@ __all__ = [
     "build_seismic_view_metadata",
     "validate_seismic_view_metadata",
     "SeismicViewContext",
+    "GenerationAttempt",
+    "GenerationSession",
     "SeismicViewPipeline",
     "SyntheticBenchmarkPipeline",
     "SyntheticDomainAdapter",

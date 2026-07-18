@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import time
 from typing import Any, Mapping, Sequence
 
 import h5py
@@ -26,35 +25,27 @@ from cup.synthetic.core.calibration import (
 from cup.synthetic.time.config import DATA_SCHEMA, IMPLEMENTATION_SCOPE
 from cup.impedance import generation_contract
 from cup.synthetic.core import (
-    build_attempt_plan,
     build_seismic_input_contract,
     build_mask_contract,
     geometry_feasibility_rows,
-    limit_attempt_plan,
-    rejection_reason_summary,
-    validate_debug_attempt_limit,
 )
 from cup.synthetic.core.field_runner import (
-    AttemptProgressLog,
-    acceptance_enforcement,
-    build_acceptance_catalog,
-    configure_generation_logger,
-    run_attempt_preflight,
     stable_records_frame,
 )
 from cup.synthetic.time.forward import (
     resample_wavelet_to_highres,
 )
-from cup.synthetic.reporting.figures import write_generation_figures
-from cup.synthetic.core.rejections import StagedRejection
-from cup.synthetic.core.records import BenchmarkView
 from cup.synthetic.core.scenarios import GenerationScenario, generation_scenarios
-from cup.synthetic.core.writer import write_benchmark_sample, write_benchmark_view
 from cup.synthetic.time.geometry import build_section_geometries
 from cup.synthetic.time.sample_builder import (
     build_time_field_sample,
 )
-from cup.synthetic.core.pipeline import SeismicViewContext
+from cup.synthetic.time.model import TimeBenchmarkSample
+from cup.synthetic.core.pipeline import (
+    GenerationAttempt,
+    GenerationSession,
+    SeismicViewContext,
+)
 from cup.synthetic.adapters import TimeSyntheticDomainAdapter
 from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
 from cup.synthetic.schemas import SCIENCE_CONTRACT, require_science_contract
@@ -67,7 +58,6 @@ from cup.utils.io import (
     repo_relative_path,
     require_contract_fingerprint,
     resolve_relative_path,
-    write_json,
 )
 
 
@@ -173,100 +163,207 @@ def _time_perturbed_wavelet_forward(
     return observed, support
 
 
-def _seismic_view_records_for_sample(
-    *,
-    h5: h5py.File,
-    owner_path: str,
-    source_index_record: Mapping[str, Any],
-    seismic_input: np.ndarray,
-    valid_mask: np.ndarray,
-    operator_source_support: np.ndarray,
-    seismic_model_consistent_dataset: str,
-    lateral_m: np.ndarray,
-    sample_axis: np.ndarray,
-    script_cfg: Mapping[str, Any],
-    qc_only: bool,
-    perturbed_wavelet_forward=None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    adapter = TimeSyntheticDomainAdapter(forward_callback=perturbed_wavelet_forward)
-    view_pipeline = SyntheticBenchmarkPipeline(adapter).build_view_pipeline(
-        {
-            "sample_domain": "time",
-            "seismic_views": script_cfg["seismic_views"],
-            "global_seed": int(script_cfg["global_seed"]),
-            "generator_family": GENERATOR_FAMILY,
-        }
-    )
-    results = view_pipeline.generate(
-        SeismicViewContext(
-            realization_id=str(source_index_record["parent_realization_id"]),
-            base_seismic=seismic_input,
-            public_valid_mask=valid_mask,
-            operator_source_support=operator_source_support,
-            lateral_m=lateral_m,
-            sample_axis=sample_axis,
-        ),
-        perturbed_forward=perturbed_wavelet_forward,
-    )
-    index_records: list[dict[str, Any]] = []
-    result_records: list[dict[str, Any]] = []
-    source_sample_id = str(source_index_record["sample_id"])
-    for result in results:
-        view_metadata = dict(result.metadata)
-        view_group = (
-            ""
-            if qc_only
-            else write_benchmark_view(
-                h5,
-                BenchmarkView(
-                    owner_realization_id=str(
-                        source_index_record["parent_realization_id"]
-                    ),
-                    view_id=result.view_id,
-                    seismic_observed=result.seismic_observed,
-                    positive_gain=result.positive_gain,
-                    additive_noise=result.additive_noise,
-                    metadata=view_metadata,
-                    qc=result.qc,
-                    sample_domain="time",
-                ),
-            ).hdf5_group
+class TimeGenerationSession:
+    """Prepare time-domain science for the shared generation lifecycle.
+
+    This class deliberately stops at an in-memory :class:`BenchmarkSample`.
+    HDF5, view-index and acceptance publication are performed by
+    ``SyntheticBenchmarkPipeline``.
+    """
+
+    @classmethod
+    def prepare(
+        cls,
+        script_cfg: Mapping[str, Any],
+        calibration: ImpedanceCalibration,
+        *,
+        output_dir: Path,
+        workflow: WorkflowConfig,
+        sources: Mapping[str, Path],
+        config_provenance: Mapping[str, str],
+        calibration_path: Path,
+        repo_root: Path,
+        debug_attempt_limit: int | None = None,
+        geometry_families: Sequence[str] | None = None,
+        qc_only: bool = False,
+        **_: Any,
+    ) -> GenerationSession:
+        _validate_calibration_horizon_contract(calibration, script_cfg)
+        input_contracts = _generation_input_contracts(
+            calibration_path=calibration_path,
+            sources=sources,
+            repo_root=repo_root,
         )
-        sample_id = f"{source_sample_id}__view__{result.view_id}"
-        record = {
-            **dict(source_index_record),
-            "sample_id": sample_id,
-            "realization_id": sample_id,
-            "source_sample_id": source_sample_id,
-            "source_sample_kind": str(source_index_record.get("sample_kind", "base")),
-            "sample_kind": "seismic_view",
-            "hdf5_group": view_group,
-            "view_id": result.view_id,
-            "view_spec_sha256": view_metadata["view_spec_sha256"],
-            "view_spec_canonical_json": view_metadata["view_spec_canonical_json"],
-            "operator_ids_json": json.dumps(view_metadata["operator_ids"], sort_keys=True),
-            "operator_kinds_json": json.dumps(view_metadata["operator_kinds"], sort_keys=True),
-            "operator_parameters_json": json.dumps(view_metadata.get("operator_parameters", {}), sort_keys=True),
-            "operator_contract_versions_json": json.dumps(view_metadata.get("operator_contract_versions", {}), sort_keys=True),
-            "random_stream_identity_json": json.dumps(view_metadata.get("random_stream_identity", {}), sort_keys=True),
-            "operator_trace_dataset": "" if not view_group else f"{view_group}/operator_trace_json",
-            "seismic_input_dataset": (
-                "" if not view_group else f"{view_group}/seismic_observed"
-            ),
-            "seismic_model_consistent_dataset": seismic_model_consistent_dataset,
-            "valid_mask_dataset": source_index_record.get("valid_mask_dataset", ""),
-            "positive_gain_dataset": (
-                "" if not view_group else f"{view_group}/positive_gain"
-            ),
-            "additive_noise_dataset": (
-                "" if not view_group else f"{view_group}/additive_noise"
-            ),
+        wavelet_time, wavelet = load_wavelet_csv(
+            sources["wavelet_generation_dir"] / "selected_wavelet.csv"
+        )
+        wavelet, wavelet_qc = validate_wavelet_normalization(
+            wavelet_time,
+            wavelet,
+            expected_l2_energy=1.0,
+            l2_energy_tolerance=1e-5,
+            max_center_abs_time_s=1e-9,
+            allow_small_renormalization=True,
+        )
+        if wavelet_qc.status != "ok":
+            raise ValueError(f"invalid_wavelet:{wavelet_qc.reasons}")
+        output_dt = infer_wavelet_dt(wavelet_time)
+        sections = build_section_geometries(
+            workflow=workflow, script_cfg=script_cfg, repo_root=repo_root
+        )
+        pd.DataFrame.from_records(
+            [row for section in sections for row in section.qc_rows]
+        ).to_csv(output_dir / "section_geometry_qc.csv", index=False)
+        scenarios = generation_scenarios(script_cfg)
+        if geometry_families:
+            selected = {str(value) for value in geometry_families}
+            unknown = selected.difference({"none", "wedge", "pinchout"})
+            if unknown:
+                raise ValueError(f"Unsupported geometry filters: {sorted(unknown)}")
+            scenarios = [item for item in scenarios if item.geometry_family in selected]
+            if not scenarios:
+                raise ValueError("No generation scenarios remain after geometry filtering.")
+        acceptance_qc = dict(script_cfg["generation"]["acceptance_qc"])
+        sections_by_id = {str(section.section_id): section for section in sections}
+        scenarios_by_id = {str(item.scenario_id): item for item in scenarios}
+        feasibility_path = output_dir / "section_geometry_feasibility_qc.csv"
+        pd.DataFrame.from_records(
+            geometry_feasibility_rows(
+                sections=sections,
+                ordered_horizons=[str(item["name"]) for item in script_cfg["horizons"]],
+                vertical_axis_name="twt_s",
+                minimum_highres_cells=int(script_cfg["impedance"]["minimum_highres_cells"]),
+                highres_step=calibration.truth_sample_interval,
+                duration_reference="minimum",
+            )
+        ).to_csv(feasibility_path, index=False)
+
+        def build_parent(
+            row: Mapping[str, Any],
+            h5: h5py.File | None = None,
+            qc_only_value: bool = False,
+            *,
+            preflight_only: bool = False,
+        ) -> GenerationAttempt:
+            section = sections_by_id[str(row["section_id"])]
+            scenario = scenarios_by_id[str(row["scenario_id"])]
+            parent_id = str(row["parent_realization_id"])
+            generated = build_time_field_sample(
+                calibration,
+                realization_id=parent_id,
+                scenario=scenario,
+                section=section,
+                script_cfg=script_cfg,
+                wavelet_time_s=wavelet_time,
+                wavelet=wavelet,
+                preflight_only=preflight_only,
+            )
+            if preflight_only:
+                return GenerationAttempt(parent_id, None)
+            if generated is None:
+                raise RuntimeError("time production builder returned no sample")
+            sample = generated.sample
+            return GenerationAttempt(
+                parent_id,
+                sample,
+                qc_row={**dict(sample.qc), "sample_id": parent_id, "sample_kind": "base", "status": "ok"},
+                domain_rows={
+                    "object_catalog": [dict(item) for item in generated.object_catalog],
+                    "object_lateral_coefficients": [dict(item) for item in generated.object_lateral_coefficients],
+                },
+            )
+
+        def view_context(sample: Any, parent_id: str):
+            wrapped = TimeBenchmarkSample(sample)
+            return (
+                SeismicViewContext(
+                    realization_id=parent_id,
+                    base_seismic=sample.forward.seismic_observed,
+                    public_valid_mask=sample.valid_mask,
+                    operator_source_support=np.asarray(sample.forward.support.observed, dtype=bool),
+                    lateral_m=sample.truth.lateral_m,
+                    sample_axis=sample.projected.model_axis.coordinates,
+                ),
+                lambda phase_degrees, shift_s: _time_perturbed_wavelet_forward(
+                    wrapped,
+                    wavelet_time=wavelet_time,
+                    wavelet=wavelet,
+                    phase_degrees=phase_degrees,
+                    shift_s=shift_s,
+                    factor=int(script_cfg["sampling"]["vertical_oversampling_factor"]),
+                ),
+            )
+
+        def validate(row: Mapping[str, Any]) -> None:
+            build_parent(row, preflight_only=True)
+
+        def write_domain_outputs(directory: Path, rows: Mapping[str, list[dict[str, Any]]]) -> None:
+            object_columns = [
+                "realization_id", "scenario_id", "zone_id", "object_id", "state", "state_id",
+                "base_duration_fraction", "event_target", "duration_fraction_start", "duration_fraction_end",
+                "minimum_duration_fraction", "maximum_duration_fraction", "minimum_duration_s", "maximum_duration_s",
+                "minimum_truth_samples", "maximum_truth_samples", "event_multiplier_start", "event_multiplier_end",
+                "minimum_event_multiplier", "maximum_event_multiplier", "reversal_fraction", "clipping_fraction",
+                "profile_violation_fraction", "profile_projection_fraction", "mean_profile_projection_scale",
+                "minimum_profile_projection_scale", "c0_conditioning_fraction", "mean_c0_conditioning_adjustment",
+                "maximum_c0_conditioning_adjustment",
+            ]
+            stable_records_frame(rows.get("object_catalog", []), columns=object_columns, sort_by=("realization_id", "zone_id", "object_id")).to_csv(directory / "object_catalog.csv", index=False)
+            lateral_columns = [
+                "realization_id", "scenario_id", "zone_id", "local_object_index", "calibration_object_id", "object_id",
+                "state", "state_id", "event_target", "lateral_index", "lateral_m", "c0", "c1", "c2",
+                "thickness_fraction", "object_top_s", "object_bottom_s", "profile_projection_scale", "c0_conditioning_adjustment",
+            ]
+            stable_records_frame(rows.get("object_lateral_coefficients", []), columns=lateral_columns, sort_by=("realization_id", "zone_id", "object_id", "lateral_index")).to_csv(directory / "object_lateral_coefficients.csv", index=False)
+
+        manifest_fields = {
+            **SCIENCE_CONTRACT,
+            "implementation_scope": IMPLEMENTATION_SCOPE,
+            "generator_family": calibration.generator_family,
+            "source_runs": {key: repo_relative_path(path, root=repo_root) for key, path in sources.items()},
+            "config_provenance": dict(config_provenance),
+            "mask_contract": build_mask_contract(),
+            "increment_contract": generation_contract("time", output_dt).as_dict(),
+            "seismic_input_contract": build_seismic_input_contract("time", operator="time_forward_highres_wavelet_antialias"),
+            "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
+            "output_dt_s": output_dt,
+            "truth_dt_s": calibration.truth_sample_interval,
+            "n_sections": len(sections),
+            "geometry_filters": sorted({item.geometry_family for item in scenarios}),
+            "field_geometry": {
+                "section_geometry_qc": repo_relative_path(output_dir / "section_geometry_qc.csv", root=repo_root),
+                "section_geometry_feasibility_qc": repo_relative_path(feasibility_path, root=repo_root),
+            },
+            "random_stream": {
+                "algorithm": "SHA-256/PCG64DXSM",
+                "benchmark_version": DATA_SCHEMA,
+                "science_revision": SCIENCE_CONTRACT["science_revision"],
+                "random_stream_contract_version": SCIENCE_CONTRACT["random_stream_contract_version"],
+            },
         }
-        index_records.append(record)
-        result_records.append({**record, **view_metadata, **result.qc})
-    return index_records, result_records
-
-
+        return GenerationSession(
+            plan=None,
+            acceptance_qc=acceptance_qc,
+            development_limited=debug_attempt_limit is not None,
+            sample_domain="time",
+            sample_unit="s",
+            depth_basis=None,
+            schema_version=DATA_SCHEMA,
+            generator_family=calibration.generator_family,
+            hdf5_attributes={"implementation_scope": IMPLEMENTATION_SCOPE},
+            section_ids=tuple(str(section.section_id) for section in sections),
+            scenarios=tuple(scenarios),
+            attempts_per_scenario=int(script_cfg["generation"]["attempts_per_scenario"]),
+            held_out_geometry_family=str(script_cfg["splits"]["held_out_geometry_family"]),
+            debug_attempt_limit=debug_attempt_limit,
+            input_contracts=input_contracts,
+            manifest_fields=manifest_fields,
+            validate_attempt=validate,
+            build_attempt=build_parent,
+            view_context=view_context,
+            write_domain_outputs=write_domain_outputs,
+        )
+# Public entrypoint: source loading and Adapter construction only.
 def run_generation(
     *,
     workflow: WorkflowConfig,
@@ -280,780 +377,27 @@ def run_generation(
     geometry_families: Sequence[str] | None = None,
     qc_only: bool = False,
 ) -> dict[str, Any]:
-    debug_attempt_limit = validate_debug_attempt_limit(debug_attempt_limit)
     calibration = load_calibration(calibration_path)
-    _validate_calibration_horizon_contract(calibration, script_cfg)
-    input_contracts = _generation_input_contracts(
-        calibration_path=calibration_path,
-        sources=sources,
-        repo_root=repo_root,
-    )
-    output_dir.mkdir(parents=True, exist_ok=False)
-    logger = configure_generation_logger(output_dir, sample_domain="time")
-    logger.info("Synthoseis field-conditioned generation started")
-    wavelet_time, wavelet = load_wavelet_csv(
-        sources["wavelet_generation_dir"] / "selected_wavelet.csv"
-    )
-    wavelet, qc = validate_wavelet_normalization(
-        wavelet_time,
-        wavelet,
-        expected_l2_energy=1.0,
-        l2_energy_tolerance=1e-5,
-        max_center_abs_time_s=1e-9,
-        allow_small_renormalization=True,
-    )
-    if qc.status != "ok":
-        raise ValueError(f"invalid_wavelet:{qc.reasons}")
-    output_dt = infer_wavelet_dt(wavelet_time)
-    sections = build_section_geometries(
-        workflow=workflow,
-        script_cfg=script_cfg,
-        repo_root=repo_root,
-    )
-    section_geometry_qc_path = output_dir / "section_geometry_qc.csv"
-    section_geometry_qc = pd.DataFrame.from_records(
-        [row for section in sections for row in section.qc_rows]
-    )
-    section_geometry_qc.to_csv(section_geometry_qc_path, index=False)
-    scenarios = generation_scenarios(script_cfg)
-    if geometry_families:
-        selected = {str(value) for value in geometry_families}
-        unknown = selected.difference({"none", "wedge", "pinchout"})
-        if unknown:
-            raise ValueError(f"Unsupported geometry filters: {sorted(unknown)}")
-        scenarios = [
-            scenario for scenario in scenarios if scenario.geometry_family in selected
-        ]
-        if not scenarios:
-            raise ValueError("No generation scenarios remain after geometry filtering.")
-    development_limited = debug_attempt_limit is not None
-    configured_attempts = int(script_cfg["generation"]["attempts_per_scenario"])
-    held_out_geometry_family = str(script_cfg["splits"]["held_out_geometry_family"])
-    attempt_plan = build_attempt_plan(
-        section_ids=[str(section.section_id) for section in sections],
-        scenarios=scenarios,
-        attempts_per_scenario=configured_attempts,
-        held_out_geometry_family=held_out_geometry_family,
-    )
-    attempt_plan = limit_attempt_plan(attempt_plan, debug_attempt_limit)
-    attempts = min(configured_attempts, int(debug_attempt_limit or configured_attempts))
-    attempt_plan.to_csv(output_dir / "attempt_plan.csv", index=False)
-    sections_by_id = {str(section.section_id): section for section in sections}
-    scenarios_by_id = {str(scenario.scenario_id): scenario for scenario in scenarios}
-    feasibility_path = output_dir / "section_geometry_feasibility_qc.csv"
-    pd.DataFrame.from_records(
-        geometry_feasibility_rows(
-            sections=sections,
-            ordered_horizons=[str(item["name"]) for item in script_cfg["horizons"]],
-            vertical_axis_name="twt_s",
-            minimum_highres_cells=int(script_cfg["impedance"]["minimum_highres_cells"]),
-            highres_step=calibration.truth_sample_interval,
-            duration_reference="minimum",
-        )
-    ).to_csv(feasibility_path, index=False)
-    acceptance_qc = dict(script_cfg["generation"]["acceptance_qc"])
-
-    def validate_attempt(plan_row: Mapping[str, Any]) -> None:
-        section = sections_by_id[str(plan_row["section_id"])]
-        scenario = scenarios_by_id[str(plan_row["scenario_id"])]
-        build_time_field_sample(
-            calibration,
-            realization_id=str(plan_row["parent_realization_id"]),
-            scenario=scenario,
-            section=section,
-            script_cfg=script_cfg,
-            wavelet_time_s=wavelet_time,
-            wavelet=wavelet,
-            preflight_only=True,
-        )
-
-    preflight = run_attempt_preflight(
-        attempt_plan,
-        validator=validate_attempt,
-        rejection_exceptions=(
-            StagedRejection,
-            ValueError,
-            FloatingPointError,
-        ),
-        qc_config=acceptance_qc,
-        output_dir=output_dir,
-        logger=logger,
-        development_limited=development_limited,
-    )
-    enforcement = acceptance_enforcement(acceptance_qc)
-    preflight_summary = {
-        "sample_domain": "time",
-        "status": "failed" if not preflight.failed.empty else "ok",
-        "enforcement": enforcement,
-        "planned_attempts": int(len(attempt_plan)),
-        "accepted_attempts": int(len(preflight.accepted_plan)),
-        "rejected_attempts": int(len(attempt_plan) - len(preflight.accepted_plan)),
-        "failed_scenario_count": int(len(preflight.failed)),
-    }
-    write_json(output_dir / "preflight_summary.json", preflight_summary)
-    if preflight.accepted_plan.empty:
-        raise RuntimeError("field_conditioned_preflight_no_accepted_realizations")
-    if enforcement == "fail_fast" and not preflight.failed.empty:
-        failed = preflight.failed[
-            ["section_id", "scenario_id", "acceptance_status"]
-        ].to_dict(orient="records")
-        raise RuntimeError(f"field_conditioned_preflight_acceptance_qc_failed:{failed}")
-    if not preflight.failed.empty:
-        logger.warning(
-            "preflight acceptance QC has %d failed scenarios; enforcement=warn, "
-            "generation will preserve accepted realizations",
-            len(preflight.failed),
-        )
-    index_records: list[dict[str, Any]] = []
-    object_records: list[dict[str, Any]] = []
-    object_lateral_records: list[dict[str, Any]] = []
-    qc_records: list[dict[str, Any]] = []
-    rejection_records: list[dict[str, Any]] = list(preflight.rejection_details)
-    seismic_view_records: list[dict[str, Any]] = []
-    realization_rows: list[dict[str, Any]] = []
-    view_rows: list[dict[str, Any]] = []
-    highres_wavelet = (
-        resample_wavelet_to_highres(
-            wavelet_time,
-            wavelet,
-            factor=int(script_cfg["sampling"]["vertical_oversampling_factor"]),
-        )
-        if bool(script_cfg["forward_qc"]["highres_forward_enabled"])
-        else None
-    )
-    h5_path = output_dir / "synthetic_benchmark.h5"
-    with AttemptProgressLog(
-        output_dir / "attempt_progress.csv",
-        phase="generation",
-        plan=preflight.accepted_plan,
-        qc_config=acceptance_qc,
-        logger=logger,
-        append=True,
-    ) as production_progress, h5py.File(h5_path, "w") as h5:
-        h5.attrs["schema"] = DATA_SCHEMA
-        h5.attrs["schema_version"] = DATA_SCHEMA
-        for key, value in SCIENCE_CONTRACT.items():
-            h5.attrs[key] = value
-        h5.attrs["sample_domain"] = "time"
-        h5.attrs["sample_unit"] = "s"
-        h5.attrs["generator_family"] = calibration.generator_family
-        h5.attrs["implementation_scope"] = IMPLEMENTATION_SCOPE
-        h5.attrs["suite"] = "field_conditioned"
-        h5.attrs["global_seed"] = int(script_cfg["global_seed"])
-        h5.attrs["qc_only"] = bool(qc_only)
-        for sequence_index, plan_row in enumerate(
-            preflight.accepted_plan.to_dict(orient="records"), start=1
-        ):
-            attempt_started = time.perf_counter()
-            section = sections_by_id[str(plan_row["section_id"])]
-            scenario = scenarios_by_id[str(plan_row["scenario_id"])]
-            attempt_id = int(plan_row["attempt_id"])
-            realization_id = str(plan_row["parent_realization_id"])
-            evaluation_role = str(plan_row["evaluation_role"])
-            hdf5_group = ""
-            seismic_view_records_local: list[dict[str, Any]] = []
-            view_rows_local: list[dict[str, Any]] = []
-            base_canonical_index: dict[str, Any] = {}
-            try:
-                generated = build_time_field_sample(
-                    calibration,
-                    realization_id=realization_id,
-                    scenario=scenario,
-                    section=section,
-                    script_cfg=script_cfg,
-                    wavelet_time_s=wavelet_time,
-                    wavelet=wavelet,
-                )
-                if generated is None:
-                    raise RuntimeError("time production builder returned no sample")
-                reference = (
-                    None
-                    if qc_only
-                    else write_benchmark_sample(h5, generated.sample)
-                )
-                hdf5_group = "" if reference is None else reference.hdf5_group
-                base_canonical_index = _benchmark_canonical_records(
-                    generated, base_path=hdf5_group
-                )
-                base_record_for_views = {
-                    "sample_id": realization_id,
-                    "realization_id": realization_id,
-                    "parent_realization_id": realization_id,
-                    "suite": "field_conditioned",
-                    "section_id": section.section_id,
-                    "scenario_id": scenario.scenario_id,
-                    "geometry_family": scenario.geometry_family,
-                    "duration_mode": scenario.duration_mode,
-                    "split": "",
-                    "evaluation_role": evaluation_role,
-                    "hdf5_group": hdf5_group,
-                    "attempt_id": attempt_id,
-                    "status": "ok",
-                    "reasons": "",
-                    "sample_kind": "base",
-                    "seismic_input_dataset": (
-                        ""
-                        if not hdf5_group
-                        else f"{hdf5_group}/seismic/seismic_observed"
-                    ),
-                    "seismic_model_consistent_dataset": (
-                        ""
-                        if not hdf5_group
-                        else f"{hdf5_group}/seismic/seismic_model_consistent"
-                    ),
-                    "valid_mask_dataset": (
-                        ""
-                        if not hdf5_group
-                        else f"{hdf5_group}/masks/valid_mask"
-                    ),
-                    "valid_sample_count": int(np.count_nonzero(generated.valid_mask_model)),
-                    **base_canonical_index,
-                }
-                (
-                    base_seismic_index,
-                    base_seismic_results,
-                ) = _seismic_view_records_for_sample(
-                    h5=h5,
-                    owner_path=(
-                        hdf5_group
-                        if hdf5_group
-                        else f"/realizations/{generated.realization_id}"
-                    ),
-                    source_index_record=base_record_for_views,
-                    seismic_input=generated.seismic_observed,
-                    valid_mask=np.asarray(generated.valid_mask_model, dtype=bool),
-                    operator_source_support=np.asarray(
-                        generated.sample.forward.support.observed,
-                        dtype=bool,
-                    ),
-                    seismic_model_consistent_dataset=(
-                        ""
-                        if not hdf5_group
-                        else f"{hdf5_group}/seismic/seismic_model_consistent"
-                    ),
-                    lateral_m=generated.lateral_m,
-                    sample_axis=generated.sample.projected.model_axis.coordinates,
-                    script_cfg=script_cfg,
-                    qc_only=qc_only,
-                    perturbed_wavelet_forward=(
-                        lambda phase_degrees, shift_s, generated=generated: _time_perturbed_wavelet_forward(
-                            generated,
-                            wavelet_time=wavelet_time,
-                            wavelet=wavelet,
-                            phase_degrees=phase_degrees,
-                            shift_s=shift_s,
-                            factor=int(script_cfg["sampling"]["vertical_oversampling_factor"]),
-                        )
-                    ),
-                )
-                view_rows_local.extend(
-                    {
-                        "parent_realization_id": realization_id,
-                        "realization_id": realization_id,
-                        "view_id": row["view_id"],
-                        "sample_domain": "time",
-                        "sample_unit": "s",
-                        "evaluation_role": evaluation_role,
-                        "hdf5_group": row["hdf5_group"],
-                        "seismic_input_dataset": row["seismic_input_dataset"],
-                        "seismic_model_consistent_dataset": row["seismic_model_consistent_dataset"],
-                        "valid_mask_dataset": row["valid_mask_dataset"],
-                        "view_spec_sha256": row["view_spec_sha256"],
-                        "view_spec_canonical_json": row["view_spec_canonical_json"],
-                        "operator_ids_json": row["operator_ids_json"],
-                        "operator_kinds_json": row["operator_kinds_json"],
-                        "operator_parameters_json": row.get("operator_parameters_json", ""),
-                        "operator_contract_versions_json": row.get("operator_contract_versions_json", ""),
-                        "random_stream_identity_json": row.get("random_stream_identity_json", ""),
-                        "operator_trace_dataset": row["operator_trace_dataset"],
-                        "seismic_observed_dataset": row["seismic_input_dataset"],
-                        "n_valid": row.get("valid_sample_count", ""),
-                    }
-                    for row in base_seismic_index
-                )
-                seismic_view_records_local.extend(base_seismic_results)
-                object_records.extend(generated.object_catalog)
-                object_lateral_records.extend(generated.object_lateral_coefficients)
-                status = "ok"
-                reasons = ""
-                qc_payload = generated.qc
-            except StagedRejection as exc:
-                if hdf5_group and hdf5_group in h5:
-                    del h5[hdf5_group]
-                hdf5_group = ""
-                status = "rejected"
-                reasons = ";".join(exc.reasons)
-                qc_payload = exc.diagnostics
-                rejection_records.extend(
-                    {
-                        "realization_id": realization_id,
-                        "section_id": section.section_id,
-                        "scenario_id": scenario.scenario_id,
-                        "geometry_family": scenario.geometry_family,
-                        "attempt_id": attempt_id,
-                        **detail,
-                    }
-                    for detail in exc.details
-                )
-            except (ValueError, FloatingPointError) as exc:
-                if str(exc).startswith(
-                    (
-                        "highres_forward_qc_failed",
-                        "invalid_model_grid_forward",
-                    )
-                ):
-                    raise
-                if hdf5_group and hdf5_group in h5:
-                    del h5[hdf5_group]
-                hdf5_group = ""
-                status = "rejected"
-                reasons = f"{type(exc).__name__}:{exc}"
-                qc_payload = {}
-            record = {
-                "sample_id": realization_id,
-                "realization_id": realization_id,
-                "parent_realization_id": realization_id,
-                "suite": "field_conditioned",
-                "section_id": section.section_id,
-                "scenario_id": scenario.scenario_id,
-                "geometry_family": scenario.geometry_family,
-                "duration_mode": scenario.duration_mode,
-                "split": "",
-                "evaluation_role": evaluation_role,
-                "hdf5_group": hdf5_group,
-                "attempt_id": attempt_id,
-                "status": status,
-                "reasons": reasons,
-                "sample_kind": "base",
-                "seismic_input_dataset": (
-                    ""
-                    if not hdf5_group
-                    else f"{hdf5_group}/seismic/seismic_observed"
-                ),
-                "seismic_model_consistent_dataset": (
-                    ""
-                    if not hdf5_group
-                    else f"{hdf5_group}/seismic/seismic_model_consistent"
-                ),
-                "valid_mask_dataset": (
-                    ""
-                    if not hdf5_group
-                    else f"{hdf5_group}/masks/valid_mask"
-                ),
-                "valid_sample_count": int(np.count_nonzero(generated.valid_mask_model)) if status == "ok" else "",
-                **base_canonical_index,
-            }
-            index_records.append(record)
-            if status == "ok":
-                index_records.extend(base_seismic_index)
-                realization_rows.append(
-                    {
-                        "realization_id": realization_id,
-                        "sample_domain": "time",
-                        "sample_unit": "s",
-                        "depth_basis": "",
-                        "section_id": section.section_id,
-                        "scenario_id": scenario.scenario_id,
-                        "geometry_family": scenario.geometry_family,
-                        "duration_mode": scenario.duration_mode,
-                        "suite": "field_conditioned",
-                        "evaluation_role": evaluation_role,
-                        "parent_realization_id": realization_id,
-                        "hdf5_group": hdf5_group,
-                        "base_seismic_dataset": record["seismic_input_dataset"],
-                        "seismic_model_consistent_dataset": record["seismic_model_consistent_dataset"],
-                        "valid_mask_dataset": record["valid_mask_dataset"],
-                        "target_dataset": f"{hdf5_group}/truth/model_target_log_ai" if hdf5_group else "",
-                        "canonical_background_dataset": f"{hdf5_group}/priors/canonical_background_log_ai" if hdf5_group else "",
-                        "target_increment_dataset": f"{hdf5_group}/targets/target_increment_log_ai" if hdf5_group else "",
-                        "n_valid": record["valid_sample_count"],
-                    }
-                )
-                view_rows.extend(view_rows_local)
-                seismic_view_records.extend(seismic_view_records_local)
-            qc_records.append(
-                {
-                    **record,
-                    **{
-                        key: value
-                        for key, value in qc_payload.items()
-                        if key != "field_qc"
-                    },
-                }
-            )
-            production_progress.record(
-                plan_row,
-                sequence_index=sequence_index,
-                status="accepted" if status == "ok" else "rejected",
-                reason=reasons,
-                elapsed_s=time.perf_counter() - attempt_started,
-            )
-    index = stable_records_frame(
-        index_records,
-        sort_by=("section_id", "scenario_id", "attempt_id", "sample_kind", "sample_id"),
-    )
-    SyntheticBenchmarkPipeline(TimeSyntheticDomainAdapter()).publish_indexes(
-        output_dir, realization_rows, view_rows
-    )
-    object_columns = [
-        "realization_id",
-        "scenario_id",
-        "zone_id",
-        "object_id",
-        "state",
-        "state_id",
-        "base_duration_fraction",
-        "event_target",
-        "duration_fraction_start",
-        "duration_fraction_end",
-        "minimum_duration_fraction",
-        "maximum_duration_fraction",
-        "minimum_duration_s",
-        "maximum_duration_s",
-        "minimum_truth_samples",
-        "maximum_truth_samples",
-        "event_multiplier_start",
-        "event_multiplier_end",
-        "minimum_event_multiplier",
-        "maximum_event_multiplier",
-        "reversal_fraction",
-        "clipping_fraction",
-        "profile_violation_fraction",
-        "profile_projection_fraction",
-        "mean_profile_projection_scale",
-        "minimum_profile_projection_scale",
-        "c0_conditioning_fraction",
-        "mean_c0_conditioning_adjustment",
-        "maximum_c0_conditioning_adjustment",
-    ]
-    stable_records_frame(
-        object_records,
-        columns=object_columns,
-        sort_by=("realization_id", "zone_id", "object_id"),
-    ).to_csv(
-        output_dir / "object_catalog.csv",
-        index=False,
-    )
-    object_lateral_columns = [
-        "realization_id",
-        "scenario_id",
-        "zone_id",
-        "local_object_index",
-        "calibration_object_id",
-        "object_id",
-        "state",
-        "state_id",
-        "event_target",
-        "lateral_index",
-        "lateral_m",
-        "c0",
-        "c1",
-        "c2",
-        "thickness_fraction",
-        "object_top_s",
-        "object_bottom_s",
-        "profile_projection_scale",
-        "c0_conditioning_adjustment",
-    ]
-    stable_records_frame(
-        object_lateral_records,
-        columns=object_lateral_columns,
-        sort_by=("realization_id", "zone_id", "object_id", "lateral_index"),
-    ).to_csv(output_dir / "object_lateral_coefficients.csv", index=False)
-    stable_records_frame(
-        qc_records,
-        sort_by=("section_id", "scenario_id", "attempt_id", "sample_kind", "sample_id"),
-    ).to_csv(
-        output_dir / "generation_qc.csv", index=False
-    )
-    stable_records_frame(
-        seismic_view_records,
-        sort_by=("parent_realization_id", "view_id"),
-    ).to_csv(
-        output_dir / "seismic_view_results.csv",
-        index=False,
-    )
-    rejection_columns = [
-        "realization_id",
-        "section_id",
-        "scenario_id",
-        "geometry_family",
-        "attempt_id",
-        "reason",
-        "zone_id",
-        "object_id",
-        "state",
-        "event_target",
-        "count",
-        "denominator",
-        "fraction",
-        "threshold",
-        "metric",
-        "value",
-        "lower",
-        "upper",
-        "excess_ratio",
-        "lateral_index",
-    ]
-    stable_records_frame(
-        rejection_records,
-        columns=rejection_columns,
-        sort_by=("section_id", "scenario_id", "attempt_id", "reason", "zone_id", "object_id"),
-    ).to_csv(
-        output_dir / "generation_rejection_details.csv",
-        index=False,
-    )
-    rejection_summary = rejection_reason_summary(
-        stable_records_frame(
-            rejection_records,
-            columns=rejection_columns,
-            sort_by=("section_id", "scenario_id", "attempt_id", "reason", "zone_id", "object_id"),
-        ),
-        index,
-    )
-    rejection_summary_path = output_dir / "rejection_reason_summary.csv"
-    rejection_summary.to_csv(rejection_summary_path, index=False)
-    successful_parent_ids = index.loc[
-        index["sample_kind"].eq("base") & index["status"].eq("ok"),
-        "parent_realization_id",
-    ].astype(str)
-    catalog = build_acceptance_catalog(
-        attempt_plan,
-        accepted_parent_ids=successful_parent_ids,
-        qc_config=acceptance_qc,
-        development_limited=development_limited,
-    )
-    catalog.to_csv(output_dir / "scenario_catalog.csv", index=False)
-    failure_statuses = {"failed", "insufficient_attempts"}
-    failed_scenarios = catalog["acceptance_status"].isin(failure_statuses)
-    failure_reason = (
-        "field_conditioned_no_accepted_realizations"
-        if successful_parent_ids.empty
-        else ""
-    )
-    if (
-        not failure_reason
-        and not development_limited
-        and enforcement == "fail_fast"
-        and bool(failed_scenarios.any())
-    ):
-        failure_reason = "field_conditioned_acceptance_qc_failed"
-    completed_with_warnings = (
-        not development_limited
-        and not failure_reason
-        and bool(failed_scenarios.any())
-    )
-    figure_summary = write_generation_figures(
-        output_dir,
-        script_cfg.get("figures", {}),
-        suite="field_conditioned",
-        qc_only=qc_only,
-    )
-    contract_fields: dict[str, str] = {}
-    if not failure_reason:
-        contract_fields = {
-            "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
-            "contract_fingerprint_sha256": contract_fingerprint_sha256(
-                contract_schema_version=DATA_SCHEMA,
-                semantics={
-                    **SCIENCE_CONTRACT,
-                    "sample_domain": "time",
-                    "suite": "field_conditioned",
-                    "output_dt_s": output_dt,
-                    "truth_dt_s": calibration.truth_sample_interval,
-                    "generator_family": calibration.generator_family,
-                },
-                business_config={
-                    "global_seed": int(script_cfg["global_seed"]),
-                    "sampling": dict(script_cfg["sampling"]),
-                    "generation": dict(script_cfg["generation"]),
-                    "seismic_input": dict(script_cfg["seismic_input"]),
-                    "mask_contract": build_mask_contract(),
-                    "forward_qc": dict(script_cfg["forward_qc"]),
-                    "seismic_views": dict(script_cfg["seismic_views"]),
-                },
-                input_contracts=input_contracts,
-                primary_artifacts={
-                    "synthetic_benchmark": h5_path,
-                    "realization_index": output_dir / "realization_index.csv",
-                    "seismic_view_index": output_dir / "seismic_view_index.csv",
-                },
-            ),
+    adapter = TimeSyntheticDomainAdapter(
+        generator_family=calibration.generator_family,
+        runtime={
+            "workflow": workflow,
+            "sources": sources,
+            "config_provenance": config_provenance,
+            "calibration_path": calibration_path,
+            "repo_root": repo_root,
         }
-    manifest = {
-        "schema": DATA_SCHEMA,
-        "schema_version": DATA_SCHEMA,
-        **SCIENCE_CONTRACT,
-        "status": (
-            "failed"
-            if failure_reason
-            else (
-                "development_limited"
-                if development_limited
-                else ("completed_with_warnings" if completed_with_warnings else "success")
-            )
-        ),
-        **contract_fields,
-        "failure_reason": failure_reason,
-        "input_contracts": input_contracts,
-        "generator_family": calibration.generator_family,
-        "implementation_scope": IMPLEMENTATION_SCOPE,
-        "development_limited": development_limited,
-        "qc_only": bool(qc_only),
-        "training_consumable": not bool(qc_only),
-        "suite": "field_conditioned",
-        "source_runs": {
-            key: repo_relative_path(path, root=repo_root)
-            for key, path in sources.items()
-        },
-        "config_provenance": dict(config_provenance),
-        "sample_domain": "time",
-        "sample_unit": "s",
-        "mask_contract": build_mask_contract(),
-        "increment_contract": generation_contract("time", output_dt).as_dict(),
-        "seismic_input_contract": build_seismic_input_contract(
-            "time", operator="time_forward_highres_wavelet_antialias"
-        ),
-        "seismic_views": dict(script_cfg["seismic_views"]),
-        "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
-        "global_seed": int(script_cfg["global_seed"]),
-        "random_stream": {
-            "algorithm": "SHA-256/PCG64DXSM",
-            "benchmark_version": DATA_SCHEMA,
-            "science_revision": SCIENCE_CONTRACT["science_revision"],
-            "random_stream_contract_version": SCIENCE_CONTRACT[
-                "random_stream_contract_version"
-            ],
-            "stream_purpose_registry": [
-                "state_sequence", "duration", "zone_background",
-                "coefficient_<name>", "coefficient_lateral", "thickness_lateral",
-                "seismic_view/<view id>/<operator id>",
-            ],
-        },
-        "output_dt_s": output_dt,
-        "truth_dt_s": calibration.truth_sample_interval,
-        "n_sections": len(sections),
-        "n_scenarios": len(scenarios),
-        "attempts_per_scenario": attempts,
-        "accepted_parent_realizations": int(len(successful_parent_ids)),
-        "rejected_parent_realizations": int(
-            len(attempt_plan) - len(successful_parent_ids)
-        ),
-        "acceptance_qc": acceptance_qc,
-        "preflight": preflight_summary,
-        "geometry_filters": sorted(
-            {scenario.geometry_family for scenario in scenarios}
-        ),
-        "field_geometry": {
-            "mode": str(
-                script_cfg.get("target_zone", {}).get("mode", "filled_target_zone")
-            ),
-            "target_zone": dict(script_cfg.get("target_zone") or {}),
-            "section_geometry_qc": repo_relative_path(
-                section_geometry_qc_path, root=repo_root
-            ),
-            "section_geometry_feasibility_qc": repo_relative_path(
-                feasibility_path, root=repo_root
-            ),
-        },
-        "seismic_view_count": len(seismic_view_records),
-        "forward_qc": dict(script_cfg["forward_qc"]),
-        "highres_wavelet": (
-            {}
-            if highres_wavelet is None
-            else {
-                "dt_s": float(highres_wavelet.time_s[1] - highres_wavelet.time_s[0]),
-                "n_samples": int(highres_wavelet.amplitude.size),
-                "l2_energy": float(np.linalg.norm(highres_wavelet.amplitude)),
-            }
-        ),
-        "antialias_filter": {
-            "implementation": "finite_support_projection_v1",
-            "scipy_version": scipy.__version__,
-            "factor": int(script_cfg["sampling"]["vertical_oversampling_factor"]),
-            "numtaps": int(
-                finite_support_fir(
-                    int(script_cfg["sampling"]["vertical_oversampling_factor"])
-                ).size
-            ),
-            "cutoff_output_nyquist_fraction": 0.9,
-            "kaiser_beta": 8.6,
-        },
-        "not_yet_implemented": [],
-        "split_policy": {
-            "assignment_unit": "parent_realization",
-            "held_out_geometry_family": held_out_geometry_family,
-            "split_assignment_owner": "training",
-        },
-        "rejection_reason_summary": (
-            []
-            if rejection_summary.empty
-            else rejection_summary.to_dict(orient="records")
-        ),
-        "quality_warnings": (
-            []
-            if not completed_with_warnings
-            else ["scenario_acceptance_qc_failed"]
-        ),
-        "sample_counts": {
-            "by_evaluation_role": {
-                str(key): int(value)
-                for key, value in index[
-                    index["sample_kind"].astype(str).eq("base")
-                    & index["status"].astype(str).eq("ok")
-                ]
-                .groupby("evaluation_role")
-                .size()
-                .items()
-            }
-            if not index.empty and "evaluation_role" in index
-            else {},
-        },
-        "figures": {
-            "generated_count": int(figure_summary.get("generated_count", 0)),
-            "skipped_count": int(figure_summary.get("skipped_count", 0)),
-            "figure_manifest": repo_relative_path(
-                Path(
-                    str(
-                        figure_summary.get(
-                            "figure_manifest",
-                            output_dir / "figures" / "figure_manifest.json",
-                        )
-                    )
-                ),
-                root=repo_root,
-            ),
-        },
-    }
-    write_json(output_dir / "benchmark_manifest.json", manifest)
-    summary = {
-        **manifest,
-        "status": manifest["status"],
-        "accepted_realizations": int(
-            (index["sample_kind"].eq("base") & index["status"].eq("ok")).sum()
-        ),
-        "rejected_realizations": int(len(attempt_plan) - len(successful_parent_ids)),
-        "failed_scenario_count": int(failed_scenarios.sum()),
-        "quality_warnings": (
-            []
-            if not completed_with_warnings
-            else ["scenario_acceptance_qc_failed"]
-        ),
-        "seismic_view_count": len(seismic_view_records),
-    }
-    write_json(output_dir / "run_summary.json", summary)
-    if failure_reason == "field_conditioned_no_accepted_realizations":
-        raise RuntimeError(failure_reason)
-    if failure_reason == "field_conditioned_acceptance_qc_failed":
-        failed = catalog.loc[
-            failed_scenarios,
-            ["section_id", "scenario_id", "acceptance_status"],
-        ].to_dict(orient="records")
-        raise RuntimeError(f"field_conditioned_acceptance_qc_failed:{failed}")
-    logger.info(
-        "Synthoseis generation finished: status=%s accepted=%d rejected=%d",
-        summary["status"],
-        summary["accepted_realizations"],
-        summary["rejected_realizations"],
     )
-    return summary
+    return SyntheticBenchmarkPipeline(adapter).generate(
+        script_cfg,
+        calibration,
+        output_dir=output_dir,
+        debug_attempt_limit=debug_attempt_limit,
+        geometry_families=geometry_families,
+        qc_only=qc_only,
+        workflow=workflow,
+        sources=sources,
+        config_provenance=config_provenance,
+        calibration_path=calibration_path,
+        repo_root=repo_root,
+    )

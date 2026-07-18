@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import time
 from typing import Any, Mapping, Sequence
 
 import h5py
 import numpy as np
 import pandas as pd
-import scipy
 from scipy.signal import hilbert
 
 from cup.impedance import generation_contract
@@ -19,33 +17,26 @@ from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.wavelet import load_wavelet_csv
 from cup.synthetic.core.calibration import ImpedanceCalibration
-from cup.synthetic.core import build_attempt_plan as build_core_attempt_plan
 from cup.synthetic.core import (
     build_seismic_input_contract,
     build_mask_contract,
     geometry_feasibility_rows,
-    limit_attempt_plan,
-    rejection_reason_summary,
-    validate_debug_attempt_limit,
 )
 from cup.synthetic.core.field_runner import (
-    AttemptProgressLog,
-    acceptance_enforcement,
-    build_acceptance_catalog,
-    configure_generation_logger,
-    run_attempt_preflight,
     stable_records_frame,
 )
-from cup.synthetic.reporting.figures import write_generation_figures
 from cup.synthetic.core.lfm import LfmPolicy
 from cup.synthetic.core.geometry import resample_section_path, validate_line_geometry
 from cup.synthetic.core.signal import finite_support_fir, valid_filter_decimate
-from cup.synthetic.core.pipeline import SeismicViewContext
+from cup.synthetic.core.pipeline import (
+    GenerationAttempt,
+    GenerationSession,
+    SeismicViewContext,
+)
 from cup.synthetic.adapters import DepthSyntheticDomainAdapter
 from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
 from cup.synthetic.core.random import RandomNamespace
-from cup.synthetic.core.records import BenchmarkView, DepthForwardExtras
-from cup.synthetic.core.rejections import StagedRejection, frozen_external_reason
+from cup.synthetic.core.records import DepthForwardExtras
 from cup.synthetic.core.sample_builder import (
     BenchmarkBuildPolicy,
     BenchmarkBuilder,
@@ -53,7 +44,6 @@ from cup.synthetic.core.sample_builder import (
 )
 from cup.synthetic.core.scenarios import GenerationScenario, generation_scenarios
 from cup.synthetic.core.truth import TruthGenerationRequest, generate_field_conditioned_truth
-from cup.synthetic.core.writer import write_benchmark_sample, write_benchmark_view
 from cup.synthetic.depth.config import CALIBRATION_SCHEMA, GENERATOR_FAMILY, SCHEMA_VERSION
 from cup.synthetic.depth.model import DepthGeneratedSection, DepthSectionGeometry
 from cup.synthetic.depth.calibration_adapter import (
@@ -74,7 +64,6 @@ from cup.utils.io import (
     repo_relative_path,
     require_contract_fingerprint,
     resolve_relative_path,
-    write_json,
 )
 
 
@@ -352,130 +341,246 @@ def generate_depth_realization(
     )
 
 
-def build_attempt_plan(
-    script_cfg: Mapping[str, Any],
-    sections: Sequence[DepthSectionGeometry],
-    *,
-    geometry_families: Sequence[str] | None = None,
-) -> pd.DataFrame:
-    scenarios = generation_scenarios(script_cfg)
-    if geometry_families:
-        selected = {str(value) for value in geometry_families}
-        configured = {
-            str(value) for value in script_cfg["generation"]["geometry_families"]
+class DepthGenerationSession:
+    """Prepare depth-domain science for the shared parent lifecycle."""
+
+    @classmethod
+    def prepare(
+        cls,
+        script_cfg: Mapping[str, Any],
+        calibration: ImpedanceCalibration,
+        *,
+        output_dir: Path,
+        workflow: Any,
+        sources: Mapping[str, Path],
+        forward_inputs: Mapping[str, Any],
+        config_provenance: Mapping[str, str],
+        calibration_path: Path,
+        repo_root: Path,
+        debug_attempt_limit: int | None = None,
+        geometry_families: Sequence[str] | None = None,
+        qc_only: bool = False,
+        **_: Any,
+    ) -> GenerationSession:
+        calibration_payload = json.loads(calibration_path.read_text(encoding="utf-8"))
+        calibration_summary_path = calibration_path.parent / "run_summary.json"
+        calibration_summary = json.loads(calibration_summary_path.read_text(encoding="utf-8"))
+        require_science_contract(calibration_summary, label="depth calibration run summary")
+        if calibration_summary.get("schema_version") != CALIBRATION_SCHEMA or calibration_summary.get("status") != "success":
+            raise ValueError(f"Depth calibration run is not a successful {CALIBRATION_SCHEMA} contract.")
+        recorded_calibration_path = resolve_relative_path(
+            str(dict(calibration_summary.get("outputs") or {}).get("impedance_calibration") or ""),
+            root=repo_root,
+        )
+        if recorded_calibration_path.resolve() != calibration_path.resolve():
+            raise ValueError("Depth calibration run summary points to a different impedance_calibration.json.")
+        calibration_contract_fingerprint = require_contract_fingerprint(
+            calibration_summary, label=f"depth calibration {calibration_summary_path.parent}"
+        )
+        if str(dict(calibration.input_contracts.get("rock_physics_analysis") or {}).get("contract_fingerprint_sha256") or "") != str(forward_inputs["_rock_physics_contract_fingerprint_sha256"]):
+            raise ValueError("impedance calibration and forward inputs use different rock-physics contracts.")
+        if str(dict(calibration.input_contracts.get("depth_forward_model_inputs") or {}).get("contract_fingerprint_sha256") or "") != str(forward_inputs["_contract_fingerprint_sha256"]):
+            raise ValueError("impedance calibration and generation use different depth forward-model inputs.")
+        input_contracts = {
+            "calibration": {
+                "path": repo_relative_path(calibration_summary_path, root=repo_root),
+                "contract_fingerprint_sha256": calibration_contract_fingerprint,
+            },
+            "rock_physics_analysis": {
+                "path": repo_relative_path(sources["rock_physics_analysis_dir"] / "run_summary.json", root=repo_root),
+                "contract_fingerprint_sha256": str(forward_inputs["_rock_physics_contract_fingerprint_sha256"]),
+            },
+            "depth_forward_model_inputs": {
+                "path": repo_relative_path(sources["depth_forward_model_inputs_dir"] / "run_summary.json", root=repo_root),
+                "contract_fingerprint_sha256": str(forward_inputs["_contract_fingerprint_sha256"]),
+            },
         }
-        unknown = sorted(selected - configured)
-        if unknown:
-            raise ValueError(f"Unsupported depth geometry filters: {unknown}")
-        scenarios = [
-            scenario for scenario in scenarios if scenario.geometry_family in selected
-        ]
-        if not scenarios:
-            raise ValueError(
-                "No depth generation scenarios remain after geometry filtering."
+        if list(calibration_payload.get("horizon_contract") or []) != list(script_cfg["horizons"]):
+            raise ValueError("impedance calibration horizon contract differs from current common config.")
+        expected_truth_dz = float(script_cfg["sampling"]["expected_model_dz_m"]) / int(script_cfg["sampling"]["vertical_oversampling_factor"])
+        if not np.isclose(float(calibration_payload["truth_dz_m"]), expected_truth_dz, rtol=0.0, atol=1e-12):
+            raise ValueError("impedance calibration truth_dz_m differs from current sampling config.")
+        forward_executor = DepthForwardExecutor(script_cfg["seismic_forward"])
+        view_wavelet_time, view_wavelet = load_wavelet_csv(
+            resolve_relative_path(forward_inputs["wavelet"]["path"], root=repo_root)
+        )
+        view_factor = int(script_cfg["sampling"]["vertical_oversampling_factor"])
+        view_taps = finite_support_fir(view_factor)
+        sections, survey = build_depth_sections(workflow=workflow, script_cfg=script_cfg, repo_root=repo_root)
+        pd.DataFrame([row for section in sections for row in section.qc_rows]).to_csv(output_dir / "section_geometry_qc.csv", index=False)
+        feasibility_path = output_dir / "section_geometry_feasibility_qc.csv"
+        pd.DataFrame.from_records(
+            geometry_feasibility_rows(
+                sections=sections,
+                ordered_horizons=[str(item["name"]) for item in script_cfg["horizons"]],
+                vertical_axis_name="tvdss_m",
+                minimum_highres_cells=int(script_cfg["impedance"]["minimum_highres_cells"]),
+                highres_step=expected_truth_dz,
+                duration_reference="minimum",
             )
-    return build_core_attempt_plan(
-        section_ids=[str(section.section_id) for section in sections],
-        scenarios=scenarios,
-        attempts_per_scenario=int(script_cfg["generation"]["attempts_per_scenario"]),
-        held_out_geometry_family=str(script_cfg["splits"]["held_out_geometry_family"]),
-        geometry_families=geometry_families,
-    )
+        ).to_csv(feasibility_path, index=False)
+        scenarios_list = generation_scenarios(script_cfg)
+        if geometry_families:
+            selected = {str(value) for value in geometry_families}
+            configured = {
+                str(value) for value in script_cfg["generation"]["geometry_families"]
+            }
+            unknown = sorted(selected - configured)
+            if unknown:
+                raise ValueError(f"Unsupported depth geometry filters: {unknown}")
+            scenarios_list = [
+                item for item in scenarios_list if item.geometry_family in selected
+            ]
+            if not scenarios_list:
+                raise ValueError(
+                    "No depth generation scenarios remain after geometry filtering."
+                )
+        scenarios = {item.scenario_id: item for item in scenarios_list}
+        sections_by_id = {item.section_id: item for item in sections}
+        acceptance_qc = dict(script_cfg["generation"]["acceptance_qc"])
 
-
-def _write_views(
-    h5: h5py.File | None,
-    section: DepthGeneratedSection,
-    *,
-    script_cfg: Mapping[str, Any],
-    forward_inputs: Mapping[str, Any],
-    repo_root: Path,
-    forward_executor: DepthForwardExecutor,
-) -> list[dict[str, Any]]:
-    """Depth Adapter seam for the shared v5 seismic-view Module."""
-    view_pipeline = SyntheticBenchmarkPipeline(
-        DepthSyntheticDomainAdapter()
-    ).build_view_pipeline(
-        {
-            "sample_domain": "depth",
-            "seismic_views": script_cfg["seismic_views"],
-            "global_seed": int(script_cfg["global_seed"]),
-            "generator_family": GENERATOR_FAMILY,
-        }
-    )
-    if not view_pipeline.specs:
-        return []
-    if section.benchmark_sample is None:
-        raise RuntimeError("depth view generation requires the shared benchmark sample support")
-    wavelet_time, wavelet = load_wavelet_csv(
-        resolve_relative_path(forward_inputs["wavelet"]["path"], root=repo_root)
-    )
-    factor = int(script_cfg["sampling"]["vertical_oversampling_factor"])
-    taps = finite_support_fir(factor)
-
-    def perturbed_forward(
-        phase_degrees: float, shift_s: float
-    ) -> tuple[np.ndarray, np.ndarray]:
-        rotated = _phase_rotate(wavelet, phase_degrees)
-        perturbed = _shift_wavelet(wavelet_time, rotated, shift_s)
-        highres = forward_executor(
-            section.log_ai_highres,
-            section.vp_highres_mps,
-            section.tvdss_highres_m,
-            wavelet_time,
-            perturbed,
-        )
-        observed, support_1d = valid_filter_decimate(
-            highres, factor=factor, taps=taps
-        )
-        observed = observed[..., : section.seismic_observed.shape[-1]]
-        support = np.broadcast_to(
-            support_1d[: observed.shape[-1]], observed.shape
-        )
-        base_mask = np.asarray(section.valid_mask_model, dtype=bool)
-        if np.any(base_mask & ~support):
-            raise ValueError(
-                "invalid_seismic_view:perturbed_wavelet_support_incomplete"
+        def build_parent(
+            row: Mapping[str, Any],
+            h5: h5py.File | None = None,
+            qc_only_value: bool = False,
+            *,
+            preflight_only: bool = False,
+        ) -> GenerationAttempt:
+            section = sections_by_id[str(row["section_id"])]
+            scenario = scenarios[str(row["scenario_id"])]
+            base_id = str(row["parent_realization_id"])
+            generated = generate_depth_realization(
+                calibration,
+                calibration_payload,
+                section=section,
+                scenario=scenario,
+                attempt_id=int(row["attempt_id"]),
+                script_cfg=script_cfg,
+                forward_inputs=forward_inputs,
+                survey=survey,
+                repo_root=repo_root,
+                forward_executor=forward_executor,
+                preflight_only=preflight_only,
             )
-        return observed, support
+            if preflight_only:
+                return GenerationAttempt(base_id, None)
+            if generated is None or generated.benchmark_sample is None:
+                raise RuntimeError("depth_generation_missing_benchmark_sample")
+            return GenerationAttempt(
+                base_id,
+                generated.benchmark_sample,
+                qc_row={**dict(generated.qc), "sample_id": base_id, "sample_kind": "base", "status": "ok"},
+                domain_rows={
+                    "object_catalog": [dict(item) for item in generated.object_catalog],
+                    "object_lateral_coefficients": [dict(item) for item in generated.object_lateral_coefficients],
+                    "highres_forward_qc": [{"parent_realization_id": base_id, **{key: generated.qc.get(key) for key in ("physics_halo_m", "antialias_filter_half_width_m", "context_m", "antialias_numtaps")}}],
+                    "subgrid_forward_qc": [{"parent_realization_id": base_id, **{key: generated.qc.get(key) for key in ("seismic_observed_rms", "seismic_model_consistent_rms", "subgrid_residual_rms", "subgrid_residual_nrmse", "subgrid_observed_model_correlation", "subgrid_amplitude_scale_ratio")}}],
+                },
+            )
 
-    results = view_pipeline.generate(
-        SeismicViewContext(
-            realization_id=section.realization_id,
-            base_seismic=section.seismic_observed,
-            public_valid_mask=section.valid_mask_model,
-            operator_source_support=np.asarray(
-                section.benchmark_sample.forward.support.observed,
-                dtype=bool,
-            ),
-            lateral_m=section.geometry.lateral_m,
-            sample_axis=section.tvdss_model_m,
-        ),
-        perturbed_forward=perturbed_forward,
-    )
-    rows: list[dict[str, Any]] = []
-    for result in results:
-        if h5 is not None:
-            write_benchmark_view(
-                h5,
-                BenchmarkView(
-                    owner_realization_id=section.realization_id,
-                    view_id=result.view_id,
-                    seismic_observed=result.seismic_observed,
-                    positive_gain=result.positive_gain,
-                    additive_noise=result.additive_noise,
-                    metadata=dict(result.metadata),
-                    qc=result.qc,
-                    sample_domain="depth",
+        def view_context(sample: Any, parent_id: str):
+            extras = sample.forward.extras
+            if not isinstance(extras, DepthForwardExtras):
+                raise TypeError("depth view context requires DepthForwardExtras")
+
+            def perturbed_forward(phase_degrees: float, shift_s: float):
+                rotated = _phase_rotate(view_wavelet, phase_degrees)
+                perturbed = _shift_wavelet(view_wavelet_time, rotated, shift_s)
+                highres = forward_executor(
+                    sample.truth.log_ai_highres,
+                    extras.vp_highres_mps,
+                    sample.truth.highres_axis,
+                    view_wavelet_time,
+                    perturbed,
+                )
+                observed, support_1d = valid_filter_decimate(
+                    highres, factor=view_factor, taps=view_taps
+                )
+                observed = observed[..., : sample.forward.seismic_observed.shape[-1]]
+                support = np.broadcast_to(support_1d[: observed.shape[-1]], observed.shape)
+                if np.any(np.asarray(sample.valid_mask, dtype=bool) & ~support):
+                    raise ValueError("invalid_seismic_view:perturbed_wavelet_support_incomplete")
+                return observed, support
+
+            return (
+                SeismicViewContext(
+                    realization_id=parent_id,
+                    base_seismic=sample.forward.seismic_observed,
+                    public_valid_mask=sample.valid_mask,
+                    operator_source_support=np.asarray(sample.forward.support.observed, dtype=bool),
+                    lateral_m=sample.truth.lateral_m,
+                    sample_axis=sample.projected.model_axis.coordinates,
                 ),
+                perturbed_forward,
             )
-        rows.append({
-            **dict(result.metadata),
-            "view_id": result.view_id,
-            **result.qc,
-        })
-    return rows
 
+        def validate(row: Mapping[str, Any]) -> None:
+            build_parent(row, preflight_only=True)
+
+        def write_domain_outputs(directory: Path, rows: Mapping[str, list[dict[str, Any]]]) -> None:
+            for name, sort_by in (
+                ("object_catalog", ("realization_id", "zone_id", "object_id")),
+                ("object_lateral_coefficients", ("realization_id", "zone_id", "object_id", "lateral_index")),
+                ("highres_forward_qc", ("parent_realization_id",)),
+                ("subgrid_forward_qc", ("parent_realization_id",)),
+            ):
+                stable_records_frame(rows.get(name, []), sort_by=sort_by).to_csv(directory / f"{name}.csv", index=False)
+
+        manifest_fields = {
+            **SCIENCE_CONTRACT,
+            "generator_family": GENERATOR_FAMILY,
+            "source_runs": {key: repo_relative_path(path, root=repo_root) for key, path in sources.items()},
+            "config_provenance": dict(config_provenance),
+            "mask_contract": build_mask_contract(),
+            "increment_contract": generation_contract("depth", float(script_cfg["sampling"]["expected_model_dz_m"])).as_dict(),
+            "seismic_input_contract": build_seismic_input_contract("depth", operator="depth_ai_vp_highres_forward_antialias"),
+            "seismic_forward": forward_executor.manifest_fields,
+            "forward_model_inputs_path": repo_relative_path(
+                Path(str(forward_inputs["_path"])), root=repo_root
+            ),
+            "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
+            "depth_basis": "tvdss",
+            "n_sections": len(sections),
+            "geometry_filters": sorted({str(value) for value in geometry_families}) if geometry_families else sorted({str(value) for value in script_cfg["generation"]["geometry_families"]}),
+            "field_geometry": {
+                "section_geometry_qc": repo_relative_path(output_dir / "section_geometry_qc.csv", root=repo_root),
+                "section_geometry_feasibility_qc": repo_relative_path(feasibility_path, root=repo_root),
+            },
+            "random_stream": {
+                "algorithm": "SHA-256/PCG64DXSM",
+                "benchmark_version": SCHEMA_VERSION,
+                "science_revision": SCIENCE_REVISION,
+                "random_stream_contract_version": RANDOM_STREAM_CONTRACT_VERSION,
+            },
+        }
+        return GenerationSession(
+            plan=None,
+            acceptance_qc=acceptance_qc,
+            development_limited=debug_attempt_limit is not None,
+            sample_domain="depth",
+            sample_unit="m",
+            depth_basis="tvdss",
+            schema_version=SCHEMA_VERSION,
+            generator_family=GENERATOR_FAMILY,
+            hdf5_attributes={"depth_basis": "tvdss", "axis_positive_direction": "down"},
+            section_ids=tuple(str(section.section_id) for section in sections),
+            scenarios=tuple(scenarios_list),
+            attempts_per_scenario=int(script_cfg["generation"]["attempts_per_scenario"]),
+            held_out_geometry_family=str(script_cfg["splits"]["held_out_geometry_family"]),
+            geometry_families=None,
+            debug_attempt_limit=debug_attempt_limit,
+            input_contracts=input_contracts,
+            manifest_fields=manifest_fields,
+            validate_attempt=validate,
+            build_attempt=build_parent,
+            view_context=view_context,
+            write_domain_outputs=write_domain_outputs,
+        )
+
+
+# Public entrypoint for the v5 branch.  The shared Pipeline owns the parent,
+# view, acceptance and publication lifecycle; this function only loads the
+# domain calibration and constructs its Adapter.
 def run_depth_generation(
     *,
     workflow: Any,
@@ -490,761 +595,32 @@ def run_depth_generation(
     geometry_families: Sequence[str] | None = None,
     qc_only: bool = False,
 ) -> dict[str, Any]:
-    debug_attempt_limit = validate_debug_attempt_limit(debug_attempt_limit)
-    calibration, calibration_payload = load_depth_calibration_for_object_core(
-        calibration_path
-    )
-    calibration_summary_path = calibration_path.parent / "run_summary.json"
-    with calibration_summary_path.open("r", encoding="utf-8") as handle:
-        calibration_summary = json.load(handle)
-    require_science_contract(calibration_summary, label="depth calibration run summary")
-    if (
-        calibration_summary.get("schema_version") != CALIBRATION_SCHEMA
-        or calibration_summary.get("status") != "success"
-    ):
-        raise ValueError(
-            f"Depth calibration run is not a successful {CALIBRATION_SCHEMA} contract."
-        )
-    recorded_calibration_path = resolve_relative_path(
-        str(
-            dict(calibration_summary.get("outputs") or {}).get(
-                "impedance_calibration"
-            )
-            or ""
-        ),
-        root=repo_root,
-    )
-    if recorded_calibration_path.resolve() != calibration_path.resolve():
-        raise ValueError(
-            "Depth calibration run summary points to a different impedance_calibration.json."
-        )
-    calibration_contract_fingerprint = require_contract_fingerprint(
-        calibration_summary, label=f"depth calibration {calibration_summary_path.parent}"
-    )
-    recorded_rock_contract = dict(
-        calibration.input_contracts.get("rock_physics_analysis") or {}
-    )
-    if str(recorded_rock_contract.get("contract_fingerprint_sha256") or "") != str(
-        forward_inputs["_rock_physics_contract_fingerprint_sha256"]
-    ):
-        raise ValueError("impedance calibration and forward inputs use different rock-physics contracts.")
-    recorded_forward_contract = dict(
-        calibration.input_contracts.get("depth_forward_model_inputs") or {}
-    )
-    if str(recorded_forward_contract.get("contract_fingerprint_sha256") or "") != str(
-        forward_inputs["_contract_fingerprint_sha256"]
-    ):
-        raise ValueError(
-            "impedance calibration and generation use different depth forward-model inputs."
-        )
-    input_contracts = {
-        "calibration": {
-            "path": repo_relative_path(calibration_summary_path, root=repo_root),
-            "contract_fingerprint_sha256": calibration_contract_fingerprint,
-        },
-        "rock_physics_analysis": {
-            "path": repo_relative_path(
-                sources["rock_physics_analysis_dir"] / "run_summary.json",
-                root=repo_root,
-            ),
-            "contract_fingerprint_sha256": str(
-                forward_inputs["_rock_physics_contract_fingerprint_sha256"]
-            ),
-        },
-        "depth_forward_model_inputs": {
-            "path": repo_relative_path(
-                sources["depth_forward_model_inputs_dir"] / "run_summary.json",
-                root=repo_root,
-            ),
-            "contract_fingerprint_sha256": str(
-                forward_inputs["_contract_fingerprint_sha256"]
-            ),
-        },
-    }
-    if list(calibration_payload.get("horizon_contract") or []) != list(
-        script_cfg["horizons"]
-    ):
-        raise ValueError(
-            "impedance calibration horizon contract differs from current common config."
-        )
-    expected_truth_dz = float(script_cfg["sampling"]["expected_model_dz_m"]) / int(
-        script_cfg["sampling"]["vertical_oversampling_factor"]
-    )
-    if not np.isclose(
-        float(calibration_payload["truth_dz_m"]),
-        expected_truth_dz,
-        rtol=0.0,
-        atol=1e-12,
-    ):
-        raise ValueError(
-            "impedance calibration truth_dz_m differs from current sampling config."
-        )
-    output_dir.mkdir(parents=True, exist_ok=False)
-    logger = configure_generation_logger(output_dir, sample_domain="depth")
-    logger.info("Depth Synthoseis generation started")
-    forward_executor = DepthForwardExecutor(script_cfg["seismic_forward"])
-    logger.info(
-        "Depth forward backend: requested=%s resolved=%s dtype=%s",
-        forward_executor.requested,
-        forward_executor.resolved,
-        forward_executor.dtype,
-    )
-    sections, survey = build_depth_sections(
-        workflow=workflow, script_cfg=script_cfg, repo_root=repo_root
-    )
-    pd.DataFrame([row for section in sections for row in section.qc_rows]).to_csv(
-        output_dir / "section_geometry_qc.csv", index=False
-    )
-    feasibility_path = output_dir / "section_geometry_feasibility_qc.csv"
-    pd.DataFrame.from_records(
-        geometry_feasibility_rows(
-            sections=sections,
-            ordered_horizons=[str(item["name"]) for item in script_cfg["horizons"]],
-            vertical_axis_name="tvdss_m",
-            minimum_highres_cells=int(script_cfg["impedance"]["minimum_highres_cells"]),
-            highres_step=expected_truth_dz,
-            duration_reference="minimum",
-        )
-    ).to_csv(feasibility_path, index=False)
-    plan = build_attempt_plan(script_cfg, sections, geometry_families=geometry_families)
-    plan = limit_attempt_plan(plan, debug_attempt_limit)
-    plan.to_csv(output_dir / "attempt_plan.csv", index=False)
-    scenarios = {item.scenario_id: item for item in generation_scenarios(script_cfg)}
-    sections_by_id = {item.section_id: item for item in sections}
-    development = debug_attempt_limit is not None
-    acceptance_qc = dict(script_cfg["generation"]["acceptance_qc"])
-
-    def validate_attempt(row: Mapping[str, Any]) -> None:
-        generate_depth_realization(
-            calibration,
-            calibration_payload,
-            section=sections_by_id[str(row["section_id"])],
-            scenario=scenarios[str(row["scenario_id"])],
-            attempt_id=int(row["attempt_id"]),
-            script_cfg=script_cfg,
-            forward_inputs=forward_inputs,
-            survey=survey,
-            repo_root=repo_root,
-            forward_executor=forward_executor,
-            preflight_only=True,
-        )
-
-    preflight = run_attempt_preflight(
-        plan,
-        validator=validate_attempt,
-        rejection_exceptions=(StagedRejection, ValueError, FloatingPointError),
-        qc_config=acceptance_qc,
-        output_dir=output_dir,
-        logger=logger,
-        development_limited=development,
-        rejection_formatter=lambda exc: frozen_external_reason(
-            exc, sample_domain="depth"
-        ),
-    )
-    enforcement = acceptance_enforcement(acceptance_qc)
-    preflight_summary = {
-        "sample_domain": "depth",
-        "status": "failed" if not preflight.failed.empty else "ok",
-        "enforcement": enforcement,
-        "planned_attempts": int(len(plan)),
-        "accepted_attempts": int(len(preflight.accepted_plan)),
-        "rejected_attempts": int(len(plan) - len(preflight.accepted_plan)),
-        "failed_scenario_count": int(len(preflight.failed)),
-    }
-    write_json(output_dir / "preflight_summary.json", preflight_summary)
-    if preflight.accepted_plan.empty:
-        raise RuntimeError("depth_generation_preflight_no_accepted_realizations")
-    if enforcement == "fail_fast" and not preflight.failed.empty:
-        failed = preflight.failed[
-            ["section_id", "scenario_id", "acceptance_status"]
-        ].to_dict(orient="records")
-        raise RuntimeError(f"depth_generation_preflight_acceptance_qc_failed:{failed}")
-    if not preflight.failed.empty:
-        logger.warning(
-            "preflight acceptance QC has %d failed scenarios; enforcement=warn, "
-            "generation will preserve accepted realizations",
-            len(preflight.failed),
-        )
-    index_rows: list[dict[str, Any]] = []
-    rejection_rows: list[dict[str, Any]] = list(preflight.rejection_details)
-    object_rows: list[dict[str, Any]] = []
-    coefficient_rows: list[dict[str, Any]] = []
-    highres_rows: list[dict[str, Any]] = []
-    subgrid_rows: list[dict[str, Any]] = []
-    view_result_rows: list[dict[str, Any]] = []
-    realization_rows: list[dict[str, Any]] = []
-    view_rows: list[dict[str, Any]] = []
-    generation_qc_rows: list[dict[str, Any]] = []
-    h5_path = output_dir / "synthetic_benchmark.h5"
-    with AttemptProgressLog(
-        output_dir / "attempt_progress.csv",
-        phase="generation",
-        plan=preflight.accepted_plan,
-        qc_config=acceptance_qc,
-        logger=logger,
-        append=True,
-    ) as production_progress, h5py.File(h5_path, "w") as h5:
-        h5.attrs["schema"] = SCHEMA_VERSION
-        h5.attrs["schema_version"] = SCHEMA_VERSION
-        for key, value in SCIENCE_CONTRACT.items():
-            h5.attrs[key] = value
-        h5.attrs["sample_domain"] = "depth"
-        h5.attrs["sample_unit"] = "m"
-        h5.attrs["depth_basis"] = "tvdss"
-        h5.attrs["axis_positive_direction"] = "down"
-        h5.attrs["generator_family"] = GENERATOR_FAMILY
-        h5.attrs["suite"] = "field_conditioned"
-        h5.attrs["global_seed"] = int(script_cfg["global_seed"])
-        h5.attrs["qc_only"] = bool(qc_only)
-        for sequence_index, row in enumerate(
-            preflight.accepted_plan.to_dict(orient="records"), start=1
-        ):
-            attempt_started = time.perf_counter()
-            section = sections_by_id[str(row["section_id"])]
-            scenario = scenarios[str(row["scenario_id"])]
-            base_id = str(row["parent_realization_id"])
-            common = {
-                "sample_domain": "depth",
-                "depth_basis": "tvdss",
-                "suite": "field_conditioned",
-                "parent_realization_id": base_id,
-                "section_id": section.section_id,
-                "scenario_id": scenario.scenario_id,
-                "geometry_family": scenario.geometry_family,
-                "geometry_direction": scenario.geometry_direction,
-                "duration_mode": scenario.duration_mode,
-                "attempt_id": int(row["attempt_id"]),
-                "evaluation_role": row["evaluation_role"],
-                "held_out_geometry_family": script_cfg["splits"][
-                    "held_out_geometry_family"
-                ],
-            }
-            progress_status = "rejected"
-            progress_reason = ""
-            try:
-                generated = generate_depth_realization(
-                    calibration,
-                    calibration_payload,
-                    section=section,
-                    scenario=scenario,
-                    attempt_id=int(row["attempt_id"]),
-                    script_cfg=script_cfg,
-                    forward_inputs=forward_inputs,
-                    survey=survey,
-                    repo_root=repo_root,
-                    forward_executor=forward_executor,
-                )
-                if generated is None:
-                    raise RuntimeError("depth_generation_returned_no_realization")
-                if qc_only:
-                    group_path = ""
-                else:
-                    if generated.benchmark_sample is None:
-                        raise RuntimeError("depth_generation_missing_benchmark_sample")
-                    group_path = write_benchmark_sample(
-                        h5, generated.benchmark_sample
-                    ).hdf5_group
-                if generated.realization_id != base_id:
-                    raise RuntimeError("depth_generation_parent_identity_changed")
-                common.update({
-                    "status": "ok",
-                    "model_sample_count": generated.tvdss_model_m.size,
-                    "model_dz_m": float(np.diff(generated.tvdss_model_m[:2])[0]),
-                    "physics_halo_m": generated.qc["physics_halo_m"],
-                    "physics_halo_samples": generated.qc["physics_halo_samples"],
-                    "canonical_background_dataset": (
-                        "" if qc_only else f"{group_path}/priors/canonical_background_log_ai"
-                    ),
-                })
-                local_index_rows = [
-                    {
-                        **common,
-                        "sample_id": base_id,
-                        "sample_kind": "base",
-                        "source_sample_id": "",
-                        "hdf5_group": group_path,
-                        "seismic_input_dataset": ""
-                        if qc_only
-                        else f"{group_path}/seismic/seismic_observed",
-                        "seismic_model_consistent_dataset": ""
-                        if qc_only
-                        else f"{group_path}/seismic/seismic_model_consistent",
-                        "valid_mask_dataset": ""
-                        if qc_only
-                        else f"{group_path}/masks/valid_mask",
-                        "valid_sample_count": int(np.count_nonzero(generated.valid_mask_model)),
-                    }
-                ]
-                local_view_result_rows = []
-                local_view_rows = []
-                generated_views = _write_views(
-                    None if qc_only else h5,
-                    generated,
-                    script_cfg=script_cfg,
-                    forward_inputs=forward_inputs,
-                    repo_root=repo_root,
-                    forward_executor=forward_executor,
-                )
-                for view in generated_views:
-                    view_id = str(view["view_id"])
-                    view_sample_id = f"{base_id}__view__{view_id}"
-                    view_path = (
-                        ""
-                        if qc_only
-                        else f"{group_path}/seismic_views/{view_id}"
-                    )
-                    local_index_rows.append(
-                        {
-                            **common,
-                            "sample_id": view_sample_id,
-                            "sample_kind": "seismic_view",
-                            "view_id": view_id,
-                            "view_spec_sha256": view["view_spec_sha256"],
-                            "view_spec_canonical_json": view["view_spec_canonical_json"],
-                            "operator_ids_json": json.dumps(view["operator_ids"], sort_keys=True),
-                            "operator_kinds_json": json.dumps(view["operator_kinds"], sort_keys=True),
-                            "operator_parameters_json": json.dumps(view.get("operator_parameters", {}), sort_keys=True),
-                            "operator_contract_versions_json": json.dumps(view.get("operator_contract_versions", {}), sort_keys=True),
-                            "random_stream_identity_json": json.dumps(view.get("random_stream_identity", {}), sort_keys=True),
-                            "operator_trace_dataset": "" if qc_only else f"{view_path}/operator_trace_json",
-                            "source_sample_id": base_id,
-                            "hdf5_group": view_path,
-                            "seismic_input_dataset": ""
-                            if qc_only
-                            else f"{view_path}/seismic_observed",
-                            "seismic_model_consistent_dataset": ""
-                            if qc_only
-                            else f"{group_path}/seismic/seismic_model_consistent",
-                            "valid_mask_dataset": ""
-                            if qc_only
-                            else f"{group_path}/masks/valid_mask",
-                            "valid_sample_count": int(np.count_nonzero(generated.valid_mask_model)),
-                        }
-                    )
-                    local_view_result_rows.append(
-                        {"parent_realization_id": base_id, **view}
-                    )
-                    local_view_rows.append(
-                        {
-                            "parent_realization_id": base_id,
-                            "realization_id": base_id,
-                            "view_id": view_id,
-                            "sample_domain": "depth",
-                            "sample_unit": "m",
-                            "evaluation_role": row["evaluation_role"],
-                            "hdf5_group": view_path,
-                            "seismic_input_dataset": "" if qc_only else f"{view_path}/seismic_observed",
-                            "seismic_model_consistent_dataset": "" if qc_only else f"{group_path}/seismic/seismic_model_consistent",
-                            "valid_mask_dataset": "" if qc_only else f"{group_path}/masks/valid_mask",
-                            "view_spec_sha256": view["view_spec_sha256"],
-                            "view_spec_canonical_json": view["view_spec_canonical_json"],
-                            "operator_ids_json": json.dumps(view["operator_ids"], sort_keys=True),
-                            "operator_kinds_json": json.dumps(view["operator_kinds"], sort_keys=True),
-                            "operator_parameters_json": json.dumps(view.get("operator_parameters", {}), sort_keys=True),
-                            "operator_contract_versions_json": json.dumps(view.get("operator_contract_versions", {}), sort_keys=True),
-                            "random_stream_identity_json": json.dumps(view.get("random_stream_identity", {}), sort_keys=True),
-                            "operator_trace_dataset": "" if qc_only else f"{view_path}/operator_trace_json",
-                            "seismic_observed_dataset": "" if qc_only else f"{view_path}/seismic_observed",
-                            "n_valid": int(np.count_nonzero(generated.valid_mask_model)),
-                        }
-                    )
-                local_highres_row = {
-                    "parent_realization_id": base_id,
-                    "physics_halo_m": generated.qc["physics_halo_m"],
-                    "antialias_filter_half_width_m": generated.qc[
-                        "antialias_filter_half_width_m"
-                    ],
-                    "context_m": generated.qc["context_m"],
-                    "vertical_oversampling_factor": int(
-                        script_cfg["sampling"]["vertical_oversampling_factor"]
-                    ),
-                    "highres_dz_m": float(np.diff(generated.tvdss_highres_m[:2])[0]),
-                    "model_dz_m": float(np.diff(generated.tvdss_model_m[:2])[0]),
-                    "antialias_numtaps": generated.qc["antialias_numtaps"],
-                }
-                local_subgrid_row = {
-                    "parent_realization_id": base_id,
-                    "seismic_observed_rms": generated.qc["seismic_observed_rms"],
-                    "seismic_model_consistent_rms": generated.qc[
-                        "seismic_model_consistent_rms"
-                    ],
-                    "subgrid_residual_rms": generated.qc["subgrid_residual_rms"],
-                    "subgrid_residual_nrmse": generated.qc["subgrid_residual_nrmse"],
-                    "subgrid_observed_model_correlation": generated.qc[
-                        "subgrid_observed_model_correlation"
-                    ],
-                    "subgrid_amplitude_scale_ratio": generated.qc[
-                        "subgrid_amplitude_scale_ratio"
-                    ],
-                }
-                local_generation_qc_row = {
-                    **common,
-                    "sample_id": base_id,
-                    "sample_kind": "base",
-                    "reasons": "",
-                    **generated.qc,
-                }
-                # Commit tabular records only after the complete HDF5 parent,
-                # including every configured view and QC row, is ready.
-                index_rows.extend(local_index_rows)
-                realization_rows.append(
-                    {
-                        "realization_id": base_id,
-                        "sample_domain": "depth",
-                        "sample_unit": "m",
-                        "depth_basis": "tvdss",
-                        "section_id": section.section_id,
-                        "scenario_id": scenario.scenario_id,
-                        "geometry_family": scenario.geometry_family,
-                        "duration_mode": scenario.duration_mode,
-                        "suite": "field_conditioned",
-                        "evaluation_role": row["evaluation_role"],
-                        "parent_realization_id": base_id,
-                        "hdf5_group": group_path,
-                        "base_seismic_dataset": "" if qc_only else f"{group_path}/seismic/seismic_observed",
-                        "seismic_model_consistent_dataset": "" if qc_only else f"{group_path}/seismic/seismic_model_consistent",
-                        "valid_mask_dataset": "" if qc_only else f"{group_path}/masks/valid_mask",
-                        "target_dataset": "" if qc_only else f"{group_path}/truth/model_target_log_ai",
-                        "canonical_background_dataset": "" if qc_only else f"{group_path}/priors/canonical_background_log_ai",
-                        "target_increment_dataset": "" if qc_only else f"{group_path}/targets/target_increment_log_ai",
-                        "n_valid": int(np.count_nonzero(generated.valid_mask_model)),
-                    }
-                )
-                view_rows.extend(local_view_rows)
-                view_result_rows.extend(local_view_result_rows)
-                object_rows.extend(generated.object_catalog)
-                coefficient_rows.extend(generated.object_lateral_coefficients)
-                highres_rows.append(local_highres_row)
-                subgrid_rows.append(local_subgrid_row)
-                generation_qc_rows.append(local_generation_qc_row)
-                progress_status = "accepted"
-            except (StagedRejection, ValueError, FloatingPointError) as exc:
-                failed_group = f"/realizations/{base_id}"
-                if (not qc_only) and failed_group in h5:
-                    del h5[failed_group]
-                reason = frozen_external_reason(exc, sample_domain="depth")
-                index_rows.append(
-                    {
-                        **common,
-                        "sample_id": base_id,
-                        "sample_kind": "base",
-                        "source_sample_id": "",
-                        "hdf5_group": "",
-                        "seismic_input_dataset": "",
-                        "seismic_model_consistent_dataset": "",
-                        "valid_mask_dataset": "",
-                        "valid_sample_count": "",
-                        "status": "rejected",
-                        "reasons": reason,
-                    }
-                )
-                rejection_rows.append(
-                    {
-                        **row,
-                        "status": "rejected",
-                        "reason": reason,
-                    }
-                )
-                generation_qc_rows.append(
-                    {
-                        **common,
-                        "sample_id": base_id,
-                        "sample_kind": "base",
-                        "status": "rejected",
-                        "reasons": reason,
-                    }
-                )
-                progress_reason = reason
-            production_progress.record(
-                row,
-                sequence_index=sequence_index,
-                status=progress_status,
-                reason=progress_reason,
-                elapsed_s=time.perf_counter() - attempt_started,
-            )
-
-    index = stable_records_frame(
-        index_rows,
-        sort_by=("section_id", "scenario_id", "attempt_id", "sample_kind", "sample_id"),
-    )
-    SyntheticBenchmarkPipeline(DepthSyntheticDomainAdapter()).publish_indexes(
-        output_dir, realization_rows, view_rows
-    )
-    stable_records_frame(
-        object_rows,
-        sort_by=("realization_id", "zone_id", "object_id"),
-    ).to_csv(
-        output_dir / "object_catalog.csv", index=False
-    )
-    stable_records_frame(
-        coefficient_rows,
-        sort_by=("realization_id", "zone_id", "object_id", "lateral_index"),
-    ).to_csv(
-        output_dir / "object_lateral_coefficients.csv", index=False
-    )
-    stable_records_frame(
-        rejection_rows,
-        sort_by=("section_id", "scenario_id", "attempt_id", "reason"),
-    ).to_csv(
-        output_dir / "generation_rejection_details.csv", index=False
-    )
-    stable_records_frame(
-        highres_rows,
-        sort_by=("parent_realization_id",),
-    ).to_csv(
-        output_dir / "highres_forward_qc.csv", index=False
-    )
-    stable_records_frame(
-        subgrid_rows,
-        sort_by=("parent_realization_id",),
-    ).to_csv(
-        output_dir / "subgrid_forward_qc.csv", index=False
-    )
-    stable_records_frame(
-        view_result_rows,
-        sort_by=("parent_realization_id", "view_id"),
-    ).to_csv(
-        output_dir / "seismic_view_results.csv", index=False
-    )
-    stable_records_frame(
-        generation_qc_rows,
-        sort_by=("section_id", "scenario_id", "attempt_id", "sample_kind", "sample_id"),
-    ).to_csv(
-        output_dir / "generation_qc.csv", index=False
-    )
-    rejection_summary = rejection_reason_summary(
-        stable_records_frame(
-            rejection_rows,
-            sort_by=("section_id", "scenario_id", "attempt_id", "reason"),
-        ),
-        index,
-    )
-    rejection_summary_path = output_dir / "rejection_reason_summary.csv"
-    rejection_summary.to_csv(rejection_summary_path, index=False)
-    base = (
-        index[
-            index.get("sample_kind", pd.Series(dtype=str)).eq("base")
-            & index.get("status", pd.Series(dtype=str)).eq("ok")
-        ].copy()
-        if not index.empty
-        else index
-    )
-    successful_parent_ids = (
-        base["parent_realization_id"].astype(str)
-        if not base.empty
-        else pd.Series(dtype=str)
-    )
-    catalog = build_acceptance_catalog(
-        plan,
-        accepted_parent_ids=successful_parent_ids,
-        qc_config=acceptance_qc,
-        development_limited=development,
-    )
-    catalog.to_csv(output_dir / "scenario_catalog.csv", index=False)
-    failed_scenarios = catalog["acceptance_status"].isin(
-        {"failed", "insufficient_attempts"}
-    )
-    failure_reason = "depth_generation_no_accepted_realizations" if base.empty else ""
-    if (
-        not failure_reason
-        and not development
-        and enforcement == "fail_fast"
-        and bool(failed_scenarios.any())
-    ):
-        failure_reason = "depth_generation_acceptance_qc_failed"
-    completed_with_warnings = (
-        (not development)
-        and not failure_reason
-        and bool(failed_scenarios.any())
-    )
-
-    figure_summary = write_generation_figures(
-        output_dir,
-        script_cfg.get("figures", {}),
-        suite="field_conditioned",
-        qc_only=qc_only,
-    )
-
-    contract_fields: dict[str, str] = {}
-    if not failure_reason:
-        contract_fields = {
-            "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
-            "contract_fingerprint_sha256": contract_fingerprint_sha256(
-                contract_schema_version=SCHEMA_VERSION,
-                semantics={
-                    **SCIENCE_CONTRACT,
-                    "sample_domain": "depth",
-                    "sample_unit": "m",
-                    "depth_basis": "tvdss",
-                    "suite": "field_conditioned",
-                    "generator_family": GENERATOR_FAMILY,
-                    "sampling": dict(script_cfg["sampling"]),
-                },
-                business_config={
-                    "global_seed": int(script_cfg["global_seed"]),
-                    "generation": dict(script_cfg["generation"]),
-                    "seismic_input": dict(script_cfg["seismic_input"]),
-                    "seismic_forward": dict(script_cfg["seismic_forward"]),
-                    "seismic_views": dict(script_cfg["seismic_views"]),
-                    "mask_contract": build_mask_contract(),
-                },
-                input_contracts=input_contracts,
-                primary_artifacts={
-                    "synthetic_benchmark": h5_path,
-                    "realization_index": output_dir / "realization_index.csv",
-                    "seismic_view_index": output_dir / "seismic_view_index.csv",
-                },
-            ),
+    calibration, _ = load_depth_calibration_for_object_core(calibration_path)
+    adapter = DepthSyntheticDomainAdapter(
+        generator_family=GENERATOR_FAMILY,
+        runtime={
+            "workflow": workflow,
+            "sources": sources,
+            "forward_inputs": forward_inputs,
+            "config_provenance": config_provenance,
+            "calibration_path": calibration_path,
+            "repo_root": repo_root,
         }
-    manifest = {
-        "schema": SCHEMA_VERSION,
-        "schema_version": SCHEMA_VERSION,
-        **SCIENCE_CONTRACT,
-        "status": "failed"
-        if failure_reason
-        else (
-            "development_limited"
-            if development
-            else ("completed_with_warnings" if completed_with_warnings else "success")
-        ),
-        **contract_fields,
-        "failure_reason": failure_reason,
-        "input_contracts": input_contracts,
-        "sample_domain": "depth",
-        "sample_unit": "m",
-        "mask_contract": build_mask_contract(),
-        "increment_contract": generation_contract("depth", float(script_cfg["sampling"]["expected_model_dz_m"])).as_dict(),
-        "seismic_input_contract": build_seismic_input_contract(
-            "depth", operator="depth_ai_vp_highres_forward_antialias"
-        ),
-        "seismic_forward": forward_executor.manifest_fields,
-        "depth_basis": "tvdss",
-        "generator_family": GENERATOR_FAMILY,
-        "suite": "field_conditioned",
-        "development_limited": development,
-        "qc_only": bool(qc_only),
-        "training_consumable": not bool(qc_only),
-        "forward_model_inputs_path": str(forward_inputs["_path"]),
-        "global_seed": int(script_cfg["global_seed"]),
-        "n_sections": len(sections),
-        "n_scenarios": int(plan["scenario_id"].nunique()),
-        "attempts_per_scenario": min(
-            int(script_cfg["generation"]["attempts_per_scenario"]),
-            int(debug_attempt_limit or script_cfg["generation"]["attempts_per_scenario"]),
-        ),
-        "accepted_parent_realizations": int(len(base)),
-        "rejected_parent_realizations": int(len(plan) - len(base)),
-        "forward_inputs": {
-            "wavelet_path": forward_inputs["wavelet"]["path"],
-            "ai_velocity_relation_path": forward_inputs["ai_velocity_relation"]["path"],
-            "shifted_las_sources": list(
-                calibration_payload.get("shifted_las_sources") or []
-            ),
-        },
-        "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
-        "seismic_views": dict(script_cfg["seismic_views"]),
-        "geometry_filters": sorted({str(value) for value in geometry_families})
-        if geometry_families
-        else sorted(
-            {str(value) for value in script_cfg["generation"]["geometry_families"]}
-        ),
-        "acceptance_qc": acceptance_qc,
-        "preflight": preflight_summary,
-        "sampling": dict(script_cfg["sampling"]),
-        "source_runs": {
-            key: repo_relative_path(path, root=repo_root)
-            for key, path in sources.items()
-        },
-        "config_provenance": dict(config_provenance),
-        "rejection_reason_summary": (
-            []
-            if rejection_summary.empty
-            else rejection_summary.to_dict(orient="records")
-        ),
-        "figures": {
-            "generated_count": int(figure_summary.get("generated_count", 0)),
-            "skipped_count": int(figure_summary.get("skipped_count", 0)),
-            "figure_manifest": repo_relative_path(
-                Path(
-                    str(
-                        figure_summary.get(
-                            "figure_manifest",
-                            output_dir / "figures" / "figure_manifest.json",
-                        )
-                    )
-                ),
-                root=repo_root,
-            ),
-        },
-        "split_policy": {
-            "assignment_unit": "parent_realization",
-            "held_out_geometry_family": script_cfg["splits"][
-                "held_out_geometry_family"
-            ],
-            "split_assignment_owner": "training",
-        },
-        "sample_counts": {
-            "by_evaluation_role": {
-                str(key): int(value)
-                for key, value in base.groupby("evaluation_role").size().items()
-            }
-            if not base.empty
-            else {},
-            "seen_parent_realizations": int(
-                (
-                    ~base["geometry_family"].eq(
-                        script_cfg["splits"]["held_out_geometry_family"]
-                    )
-                ).sum()
-            )
-            if not base.empty
-            else 0,
-            "held_out_parent_realizations": int(
-                base["geometry_family"]
-                .eq(script_cfg["splits"]["held_out_geometry_family"])
-                .sum()
-            )
-            if not base.empty
-            else 0,
-        },
-        "random_stream": {
-            "algorithm": "SHA-256/PCG64DXSM",
-            "benchmark_version": SCHEMA_VERSION,
-            "science_revision": SCIENCE_REVISION,
-            "random_stream_contract_version": RANDOM_STREAM_CONTRACT_VERSION,
-            "stream_purpose_registry": [
-                "state_sequence",
-                "duration",
-                "zone_background",
-                "coefficient_<name>",
-                "coefficient_lateral",
-                "thickness_lateral",
-                "seismic_view/<view id>/<operator id>",
-            ],
-        },
-        "quality_warnings": (
-            []
-            if not completed_with_warnings
-            else ["scenario_acceptance_qc_failed"]
-        ),
-    }
-    write_json(output_dir / "benchmark_manifest.json", manifest)
-    summary = {
-        **manifest,
-        "accepted_parent_realizations": int(len(base)),
-        "rejected_parent_realizations": int(len(plan) - len(base)),
-        "failed_scenario_count": int(failed_scenarios.sum()),
-    }
-    write_json(output_dir / "run_summary.json", summary)
-    if failure_reason:
-        raise RuntimeError(failure_reason)
-    logger.info(
-        "Depth Synthoseis generation finished: status=%s accepted=%d rejected=%d",
-        summary["status"],
-        summary["accepted_parent_realizations"],
-        summary["rejected_parent_realizations"],
     )
-    return summary
+    return SyntheticBenchmarkPipeline(adapter).generate(
+        script_cfg,
+        calibration,
+        output_dir=output_dir,
+        debug_attempt_limit=debug_attempt_limit,
+        geometry_families=geometry_families,
+        qc_only=qc_only,
+        workflow=workflow,
+        sources=sources,
+        forward_inputs=forward_inputs,
+        config_provenance=config_provenance,
+        calibration_path=calibration_path,
+        repo_root=repo_root,
+    )
 
 
-__all__ = ["build_attempt_plan", "build_depth_sections", "run_depth_generation"]
+__all__ = ["build_depth_sections", "run_depth_generation"]

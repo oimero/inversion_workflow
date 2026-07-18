@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+
+import numpy as np
 
 from cup.synthetic.schemas import (
     BENCHMARK_SCHEMA_VERSION,
@@ -19,7 +21,30 @@ from cup.synthetic.schemas import (
 )
 from cup.synthetic.readers.depth import DepthBenchmark, DepthSyntheticSample
 from cup.synthetic.readers.time import TimeBenchmark, TimeSyntheticSample, V5SeismicView
-from cup.synthetic.core.protocols import SyntheticSampleProtocol
+
+
+class SyntheticSampleProtocol(Protocol):
+    """Fields consumed by domain-independent training/evaluation code."""
+
+    sample_id: str
+    sample_kind: str
+    sample_domain: str
+    target_log_ai: np.ndarray
+    canonical_background_log_ai: np.ndarray
+    target_increment_log_ai: np.ndarray
+    input_lfm_log_ai: np.ndarray
+    seismic_input: np.ndarray
+    seismic_model_consistent: np.ndarray
+    valid_mask: np.ndarray
+    lateral_m: np.ndarray
+
+    @property
+    def sample_axis(self) -> np.ndarray:
+        ...
+
+    @property
+    def row(self) -> dict[str, Any]:
+        ...
 
 
 SyntheticSample = TimeSyntheticSample | DepthSyntheticSample

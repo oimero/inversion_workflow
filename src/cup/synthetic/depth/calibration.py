@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -29,6 +30,8 @@ from cup.utils.io import (
     resolve_relative_path,
     write_json,
 )
+from cup.synthetic.adapters import DepthSyntheticDomainAdapter
+from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
 from cup.utils.statistics import radius_connected_components
 from cup.well.assets import normalize_well_name
 from cup.well.las import read_las_curve
@@ -204,7 +207,7 @@ def _survey_and_target_zone(
     return survey, zone, paths
 
 
-def run_depth_calibration(
+def _legacy_run_depth_calibration(
     *,
     workflow: Any,
     script_cfg: Mapping[str, Any],
@@ -547,6 +550,66 @@ def run_depth_calibration(
     }
     write_json(output_dir / "run_summary.json", summary)
     return summary
+
+
+@dataclass(frozen=True)
+class DepthCalibrationResult:
+    """Adapter-owned depth fit consumed by the shared calibrate publisher."""
+
+    config: Mapping[str, Any]
+    runtime: Mapping[str, Any]
+
+    @classmethod
+    def prepare(cls, config: Mapping[str, Any], *, output_dir: Path, **runtime: Any) -> "DepthCalibrationResult":
+        return cls(dict(config), {**runtime, "prepared_output_dir": output_dir})
+
+    def publish(self, output_dir: Path, *, repo_root: Path | None = None) -> Mapping[str, Any]:
+        values = dict(self.runtime)
+        values.pop("prepared_output_dir", None)
+        output_dir.rmdir()
+        return _legacy_run_depth_calibration(
+            workflow=values["workflow"],
+            script_cfg=self.config,
+            sources=values["sources"],
+            source_provenance=values["source_provenance"],
+            forward_inputs=values["forward_inputs"],
+            config_provenance=values["config_provenance"],
+            repo_root=repo_root or values["repo_root"],
+            output_dir=output_dir,
+        )
+
+
+def run_depth_calibration(
+    *,
+    workflow: Any,
+    script_cfg: Mapping[str, Any],
+    sources: Mapping[str, Path],
+    source_provenance: Mapping[str, Any],
+    forward_inputs: Mapping[str, Any],
+    config_provenance: Mapping[str, str],
+    repo_root: Path,
+    output_dir: Path,
+) -> dict[str, Any]:
+    adapter = DepthSyntheticDomainAdapter(
+        runtime={
+            "workflow": workflow,
+            "sources": sources,
+            "source_provenance": source_provenance,
+            "forward_inputs": forward_inputs,
+            "config_provenance": config_provenance,
+            "repo_root": repo_root,
+        }
+    )
+    return SyntheticBenchmarkPipeline(adapter).calibrate(
+        script_cfg,
+        output_dir=output_dir,
+        workflow=workflow,
+        sources=sources,
+        source_provenance=source_provenance,
+        forward_inputs=forward_inputs,
+        config_provenance=config_provenance,
+        repo_root=repo_root,
+    )
 
 
 __all__ = ["run_depth_calibration"]

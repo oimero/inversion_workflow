@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -20,6 +21,8 @@ from cup.synthetic.core.calibration import (
     calibrate_impedance,
 )
 from cup.synthetic.time.config import IMPLEMENTATION_SCOPE
+from cup.synthetic.adapters import TimeSyntheticDomainAdapter
+from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
 from cup.synthetic.reporting.figures import write_calibration_figures
 from cup.synthetic.schemas import SCIENCE_CONTRACT
 from cup.config.workflow import WorkflowConfig
@@ -351,7 +354,7 @@ def build_calibration_inputs(
     }
 
 
-def run_calibration(
+def _legacy_run_calibration(
     *,
     workflow: WorkflowConfig,
     script_cfg: Mapping[str, Any],
@@ -523,3 +526,57 @@ def run_calibration(
     }
     write_json(output_dir / "run_summary.json", summary)
     return summary
+
+
+@dataclass(frozen=True)
+class TimeCalibrationResult:
+    """Adapter-owned scientific calibration with shared publication entry."""
+
+    config: Mapping[str, Any]
+    runtime: Mapping[str, Any]
+
+    @classmethod
+    def prepare(cls, config: Mapping[str, Any], *, output_dir: Path, **runtime: Any) -> "TimeCalibrationResult":
+        return cls(dict(config), {**runtime, "prepared_output_dir": output_dir})
+
+    def publish(self, output_dir: Path, *, repo_root: Path | None = None) -> Mapping[str, Any]:
+        values = dict(self.runtime)
+        values.pop("prepared_output_dir", None)
+        # The shared Pipeline owns the staging directory; the legacy scientific
+        # publisher expects to create its destination itself.
+        output_dir.rmdir()
+        return _legacy_run_calibration(
+            workflow=values["workflow"],
+            script_cfg=self.config,
+            sources=values["sources"],
+            config_provenance=values["config_provenance"],
+            repo_root=repo_root or values["repo_root"],
+            output_dir=output_dir,
+        )
+
+
+def run_calibration(
+    *,
+    workflow: WorkflowConfig,
+    script_cfg: Mapping[str, Any],
+    sources: Mapping[str, Path],
+    config_provenance: Mapping[str, str],
+    repo_root: Path,
+    output_dir: Path,
+) -> dict[str, Any]:
+    adapter = TimeSyntheticDomainAdapter(
+        runtime={
+            "workflow": workflow,
+            "sources": sources,
+            "config_provenance": config_provenance,
+            "repo_root": repo_root,
+        }
+    )
+    return SyntheticBenchmarkPipeline(adapter).calibrate(
+        script_cfg,
+        output_dir=output_dir,
+        workflow=workflow,
+        sources=sources,
+        config_provenance=config_provenance,
+        repo_root=repo_root,
+    )

@@ -5,6 +5,8 @@ from cup.synthetic.adapters import (
     TimeSyntheticDomainAdapter,
 )
 from cup.synthetic.core.pipeline import (
+    GenerationAttempt,
+    GenerationSession,
     SeismicViewContext,
     SeismicViewPipeline,
     SyntheticBenchmarkPipeline,
@@ -13,6 +15,8 @@ from cup.synthetic.core.pipeline import (
 
 __all__ = [
     "DepthSyntheticDomainAdapter",
+    "GenerationAttempt",
+    "GenerationSession",
     "SeismicViewContext",
     "SeismicViewPipeline",
     "SyntheticBenchmarkPipeline",

@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import h5py
 import numpy as np
@@ -19,7 +19,6 @@ import pandas as pd
 from cup.impedance import CanonicalIncrementContract
 from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION, require_science_contract
 from cup.synthetic.core import validate_dataset_metadata, validate_training_manifest
-from cup.synthetic.core.reader_contract import validate_benchmark_header
 from cup.synthetic.core.views import sha256_text, validate_seismic_view_metadata
 from cup.synthetic.core.v5_artifacts import REALIZATION_INDEX_COLUMNS, VIEW_INDEX_COLUMNS
 
@@ -43,6 +42,22 @@ def _text(value: Any) -> str:
     except (TypeError, ValueError):
         pass
     return str(value).strip()
+
+
+def validate_benchmark_header(
+    value: Mapping[str, Any], *, sample_domain: str, label: str
+) -> None:
+    """Validate the shared v5 manifest header before opening HDF5."""
+    schema = str(value.get("schema") or value.get("schema_version") or "")
+    if schema != BENCHMARK_SCHEMA_VERSION:
+        raise ValueError(
+            f"{label} schema {schema!r} does not match {BENCHMARK_SCHEMA_VERSION!r}"
+        )
+    if str(value.get("sample_domain") or "").casefold() != sample_domain:
+        raise ValueError(f"{label} requires sample_domain={sample_domain}")
+    if sample_domain == "depth" and value.get("depth_basis") != "tvdss":
+        raise ValueError(f"{label} requires depth_basis=tvdss")
+    require_science_contract(value, label=label)
 
 
 _LEGACY_FIELD_NAMES = frozenset(

@@ -444,9 +444,6 @@ def run_predict(args: argparse.Namespace) -> None:
                 twt_stride=int(spec_cfg["vertical_stride"]),
             ),
             sample_kinds=sample_kinds,
-            split_policy=str(manifest.get("split_policy", "derive")),
-            validation_fraction=float(manifest.get("validation_fraction", 0.15)),
-            test_fraction=float(manifest.get("test_fraction", 0.15)),
             min_valid_samples=1,
             split_assignment=split_assignment,
         )

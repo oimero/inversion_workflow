@@ -59,49 +59,6 @@ def _parent_id(row: Mapping[str, Any]) -> str:
     raise ValueError("Cannot derive parent realization id from benchmark patch row.")
 
 
-def _derive_split(
-    parent: str, *, validation_fraction: float, test_fraction: float
-) -> str:
-    digest = hashlib.sha256(parent.encode("utf-8")).digest()
-    value = int.from_bytes(digest[:8], "little") / float(2**64)
-    if value < test_fraction:
-        return "test"
-    if value < test_fraction + validation_fraction:
-        return "validation"
-    return "train"
-
-
-def _row_split(
-    row: Mapping[str, Any],
-    *,
-    split_policy: str,
-    validation_fraction: float,
-    test_fraction: float,
-    held_out_geometry_family: str = "",
-) -> str:
-    text = _clean_text(row.get("split")).lower()
-    if split_policy == "strict":
-        if text in SPLIT_VALUES:
-            return text
-        raise ValueError(
-            f"Sample {row.get('sample_id')} has non-training split {text!r}; "
-            "use --split-policy derive to create a research split."
-        )
-    if split_policy != "derive":
-        raise ValueError(f"Unsupported split_policy: {split_policy}")
-    evaluation_role = _clean_text(row.get("evaluation_role")).lower()
-    geometry_family = _clean_text(row.get("geometry_family"))
-    if evaluation_role == "geometry_holdout" or (
-        held_out_geometry_family and geometry_family == held_out_geometry_family
-    ):
-        return "test"
-    return _derive_split(
-        _parent_id(row),
-        validation_fraction=validation_fraction,
-        test_fraction=test_fraction,
-    )
-
-
 def _aligned_arrays(
     sample: Any,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -175,9 +132,6 @@ def build_patch_index(
     *,
     patch_spec: PatchSpec,
     sample_kinds: set[str],
-    split_policy: str = "derive",
-    validation_fraction: float = 0.15,
-    test_fraction: float = 0.15,
     max_patches: int | None = None,
     min_valid_samples: int = 1,
     split_assignment: Mapping[str, str] | None = None,
@@ -194,26 +148,19 @@ def build_patch_index(
     # after a parent/window has been selected and are therefore never copied
     # into the catalog as additional rows.
     sample_ids = benchmark.sample_ids(kinds={"base"}, status="ok")
-    if getattr(benchmark, "schema", "") == "synthoseis_lite_v5" and split_assignment is None:
+    if split_assignment is None:
         raise ValueError(
-            "Synthoseis v5 patch catalogs require a GINN-owned split_assignment."
+            "Patch catalogs require a GINN-owned split_assignment."
         )
-    if split_assignment is not None:
-        assignment_keys = {str(key) for key in split_assignment}
-        benchmark_keys = {str(value) for value in sample_ids}
-        missing = sorted(benchmark_keys - assignment_keys)
-        extra = sorted(assignment_keys - benchmark_keys)
-        if missing or extra:
-            raise ValueError(
-                "split_assignment must contain exactly the benchmark parent IDs; "
-                f"missing={missing[:5]}, extra={extra[:5]}"
-            )
-    held_out_geometry_family = str(
-        dict(getattr(benchmark, "manifest", {}).get("split_policy") or {}).get(
-            "held_out_geometry_family"
+    assignment_keys = {str(key) for key in split_assignment}
+    benchmark_keys = {str(value) for value in sample_ids}
+    missing = sorted(benchmark_keys - assignment_keys)
+    extra = sorted(assignment_keys - benchmark_keys)
+    if missing or extra:
+        raise ValueError(
+            "split_assignment must contain exactly the benchmark parent IDs; "
+            f"missing={missing[:5]}, extra={extra[:5]}"
         )
-        or ""
-    )
     for sample_id in sample_ids:
         sample = benchmark.load_sample(sample_id)
         target, _, _, valid = _aligned_arrays(sample)
@@ -228,18 +175,9 @@ def build_patch_index(
             continue
         row = sample.row
         parent = _parent_id(row)
-        if split_assignment is not None:
-            split = str(split_assignment.get(parent) or "")
-            if split not in SPLIT_VALUES - {"benchmark"}:
-                raise ValueError(f"split_assignment lacks parent {parent!r} or contains an invalid split.")
-        else:
-            split = _row_split(
-                row,
-                split_policy=split_policy,
-                validation_fraction=validation_fraction,
-                test_fraction=test_fraction,
-                held_out_geometry_family=held_out_geometry_family,
-            )
+        split = str(split_assignment.get(parent) or "")
+        if split not in SPLIT_VALUES - {"benchmark"}:
+            raise ValueError(f"split_assignment lacks parent {parent!r} or contains an invalid split.")
         for lateral_start in lateral_starts:
             for twt_start in twt_starts:
                 patch_mask = valid[

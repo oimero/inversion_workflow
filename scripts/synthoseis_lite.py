@@ -3,8 +3,13 @@
 Usage::
 
     python scripts/synthoseis_lite.py --config <file> calibrate
-    python scripts/synthoseis_lite.py --config <file> generate \
+    python scripts/synthoseis_lite.py --config <file> generate-amplitude-pilot \
         --impedance-calibration <file>
+    python scripts/synthoseis_lite.py --config <file> calibrate-amplitude \
+        --impedance-calibration <file> --pilot-benchmark <run-dir>
+    python scripts/synthoseis_lite.py --config <file> generate \
+        --impedance-calibration <file> \
+        --seismic-amplitude-calibration <file>
 
 The ``synthoseis_lite.sample_domain`` and ``benchmark_schema`` keys explicitly
 select the primary time-domain or depth-domain extension branch.
@@ -33,6 +38,10 @@ from cup.synthetic.depth.config import (  # noqa: E402
     resolve_depth_sources,
 )
 from cup.synthetic.depth.generation import run_depth_generation  # noqa: E402
+from cup.synthetic.depth.amplitude_calibration import (  # noqa: E402
+    run_depth_amplitude_calibration,
+    run_depth_amplitude_pilot,
+)
 from cup.synthetic.time.calibration_pipeline import run_calibration  # noqa: E402
 from cup.synthetic.time.config import (  # noqa: E402
     parse_synthoseis_config,
@@ -64,8 +73,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("calibrate", help="Freeze impedance calibration from authoritative source runs.")
+    pilot = subparsers.add_parser(
+        "generate-amplitude-pilot",
+        help="Generate a stratified base-only pilot for empirical amplitude calibration.",
+    )
+    pilot.add_argument("--impedance-calibration", type=Path, required=True)
+    amplitude = subparsers.add_parser(
+        "calibrate-amplitude",
+        help="Calibrate the shared real-minus-pilot RGT amplitude pattern.",
+    )
+    amplitude.add_argument("--impedance-calibration", type=Path, required=True)
+    amplitude.add_argument("--pilot-benchmark", type=Path, required=True)
     generate = subparsers.add_parser("generate", help="Generate one configured benchmark suite.")
     generate.add_argument("--impedance-calibration", type=Path, required=True)
+    generate.add_argument("--seismic-amplitude-calibration", type=Path, default=None)
     generate.add_argument(
         "--debug-attempt-limit",
         type=_positive_int_arg,
@@ -214,6 +235,26 @@ def main() -> None:
                 repo_root=REPO_ROOT,
                 output_dir=output_dir,
             )
+        elif args.command == "generate-amplitude-pilot":
+            summary = run_depth_amplitude_pilot(
+                workflow=workflow,
+                script_cfg=script_cfg,
+                sources=sources,
+                forward_inputs=forward_inputs,
+                config_provenance=config_provenance,
+                calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
+                repo_root=REPO_ROOT,
+                output_dir=output_dir,
+            )
+        elif args.command == "calibrate-amplitude":
+            summary = run_depth_amplitude_calibration(
+                workflow=workflow,
+                script_cfg=script_cfg,
+                calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
+                pilot_benchmark_dir=resolve_relative_path(args.pilot_benchmark, root=REPO_ROOT),
+                repo_root=REPO_ROOT,
+                output_dir=output_dir,
+            )
         else:
             summary = run_depth_generation(
                 workflow=workflow,
@@ -222,6 +263,11 @@ def main() -> None:
                 forward_inputs=forward_inputs,
                 config_provenance=config_provenance,
                 calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
+                amplitude_calibration_path=(
+                    None
+                    if args.seismic_amplitude_calibration is None
+                    else resolve_relative_path(args.seismic_amplitude_calibration, root=REPO_ROOT)
+                ),
                 repo_root=REPO_ROOT,
                 output_dir=output_dir,
                 debug_attempt_limit=args.debug_attempt_limit,
@@ -265,6 +311,8 @@ def main() -> None:
             geometry_families=args.geometry_family,
             qc_only=args.qc_only,
         )
+    if args.command not in {"calibrate", "generate"}:
+        raise ValueError(f"{args.command} is currently implemented for the depth-domain branch only.")
     print("=== synthoseis-lite ===")
     print(f"Command: {args.command}")
     print(f"Output: {output_dir}")

@@ -113,7 +113,11 @@ def _coordinate_field(
         return output, {
             "coordinate_min": lower,
             "coordinate_max": upper,
+            "coordinate_span": span,
+            "node_count": 1,
+            "node_spacing": float("nan"),
             "requested_correlation_length": length,
+            "requested_to_node_spacing_ratio": float("nan"),
             "empirical_correlation_length": float("nan"),
         }
     node_count = int(np.clip(np.ceil(8.0 * span / length) + 1, 65, 4097))
@@ -123,7 +127,11 @@ def _coordinate_field(
     return output, {
         "coordinate_min": lower,
         "coordinate_max": upper,
+        "coordinate_span": span,
+        "node_count": node_count,
+        "node_spacing": float(nodes[1] - nodes[0]),
         "requested_correlation_length": length,
+        "requested_to_node_spacing_ratio": float(length / (nodes[1] - nodes[0])),
         "empirical_correlation_length": float(
             qc.get("empirical_correlation_length_m", np.nan)
         ),
@@ -164,22 +172,25 @@ def _rgt_lateral_gain(
             coefficient_name=name,
         )
 
+    public_rgt = np.where(mask, rgt, np.nan)
+    active_lateral = np.any(mask, axis=1)
     rgt_component, rgt_qc = _coordinate_field(
-        rgt,
+        public_rgt,
         correlation_length=float(operator["rgt_correlation_length"]),
         rng=rng("rgt_lateral_gain:rgt"),
     )
-    if lateral.size < 2:
-        lateral_component = np.zeros(lateral.size, dtype=np.float64)
+    lateral_component = np.zeros(lateral.size, dtype=np.float64)
+    if np.count_nonzero(active_lateral) < 2:
         lateral_qc: dict[str, float] = {
             "empirical_correlation_length_m": float("nan")
         }
     else:
-        lateral_component, lateral_qc = ar1_irregular(
-            lateral,
+        active_component, lateral_qc = ar1_irregular(
+            lateral[active_lateral],
             correlation_length_m=float(operator["lateral_correlation_length_m"]),
             rng=rng("rgt_lateral_gain:lateral"),
         )
+        lateral_component[active_lateral] = active_component
 
     log_gain = (
         float(operator["rgt_log_sigma"]) * rgt_component
@@ -191,22 +202,23 @@ def _rgt_lateral_gain(
     interaction_lateral_empirical: list[float] = []
     for index in range(rank):
         rgt_factor, factor_qc = _coordinate_field(
-            rgt,
+            public_rgt,
             correlation_length=float(operator["interaction_rgt_correlation_length"]),
             rng=rng(f"rgt_lateral_gain:interaction:{index}:rgt"),
         )
         interaction_rgt_qc.append(factor_qc)
-        if lateral.size < 2:
-            lateral_factor = np.zeros(lateral.size, dtype=np.float64)
+        lateral_factor = np.zeros(lateral.size, dtype=np.float64)
+        if np.count_nonzero(active_lateral) < 2:
             empirical = float("nan")
         else:
-            lateral_factor, factor_lateral_qc = ar1_irregular(
-                lateral,
+            active_factor, factor_lateral_qc = ar1_irregular(
+                lateral[active_lateral],
                 correlation_length_m=float(
                     operator["interaction_lateral_correlation_length_m"]
                 ),
                 rng=rng(f"rgt_lateral_gain:interaction:{index}:lateral"),
             )
+            lateral_factor[active_lateral] = active_factor
             empirical = float(
                 factor_lateral_qc.get("empirical_correlation_length_m", np.nan)
             )
@@ -216,7 +228,7 @@ def _rgt_lateral_gain(
         float(operator["interaction_log_sigma"]) * interaction / np.sqrt(float(rank))
     )
 
-    finite_rgt = np.isfinite(rgt)
+    finite_rgt = mask
     center = float(np.median(log_gain[mask]))
     log_gain -= center
     maximum = float(operator["max_abs_log_gain"])
@@ -226,6 +238,12 @@ def _rgt_lateral_gain(
     gain[finite_rgt] = np.exp(log_gain[finite_rgt])
     return gain, {
         "rgt_correlation_length": float(operator["rgt_correlation_length"]),
+        "rgt_span": float(rgt_qc["coordinate_span"]),
+        "rgt_node_count": int(rgt_qc["node_count"]),
+        "rgt_node_spacing": float(rgt_qc["node_spacing"]),
+        "rgt_requested_to_node_spacing_ratio": float(
+            rgt_qc["requested_to_node_spacing_ratio"]
+        ),
         "rgt_empirical_correlation_length": float(
             rgt_qc["empirical_correlation_length"]
         ),
@@ -256,7 +274,7 @@ def _gain_operator(
     realization_id: str,
     lateral: np.ndarray,
     shape: tuple[int, int],
-    rgt_model: np.ndarray,
+    rgt_model: np.ndarray | None,
     valid_mask: np.ndarray,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     kind = str(operator["kind"])
@@ -324,6 +342,8 @@ def _gain_operator(
             raw /= rms
         return np.exp(sigma * raw), qc
     if kind == "rgt_lateral_gain":
+        if rgt_model is None:
+            raise ValueError("rgt_lateral_gain requires rgt_model")
         return _rgt_lateral_gain(
             operator_id=operator_id,
             operator=operator,
@@ -335,6 +355,36 @@ def _gain_operator(
             rgt_model=rgt_model,
             valid_mask=valid_mask,
         )
+    if kind == "empirical_rgt_gain":
+        if rgt_model is None:
+            raise ValueError("empirical_rgt_gain requires rgt_model")
+        rgt = np.asarray(rgt_model, dtype=np.float64)
+        mask = np.asarray(valid_mask, dtype=bool)
+        knots = np.asarray(operator.get("rgt_knots"), dtype=np.float64)
+        template = np.asarray(operator.get("mean_log_gain_rgt"), dtype=np.float64)
+        if knots.ndim != 1 or template.shape != knots.shape or knots.size < 2:
+            raise ValueError("empirical_rgt_gain requires a resolved aligned amplitude template")
+        if np.any(np.diff(knots) <= 0.0) or np.any(~np.isfinite(knots)) or np.any(~np.isfinite(template)):
+            raise ValueError("empirical_rgt_gain requires finite, strictly increasing RGT knots")
+        public_rgt = rgt[mask]
+        tolerance = 1e-9
+        if public_rgt.size == 0 or float(np.min(public_rgt)) < float(knots[0]) - tolerance or float(np.max(public_rgt)) > float(knots[-1]) + tolerance:
+            raise ValueError("empirical_rgt_gain public RGT lies outside calibrated support")
+        scale = float(operator["mean_pattern_scale"])
+        log_gain = np.zeros_like(rgt)
+        log_gain[mask] = scale * np.interp(public_rgt, knots, template)
+        gain = np.ones_like(rgt)
+        gain[mask] = np.exp(log_gain[mask])
+        return gain, {
+            "calibration_artifact_sha256": str(operator["calibration_artifact_sha256"]),
+            "template_sha256": str(operator["template_sha256"]),
+            "mean_pattern_scale": scale,
+            "public_rgt_min": float(np.min(public_rgt)),
+            "public_rgt_max": float(np.max(public_rgt)),
+            "template_log_gain_min": float(np.min(log_gain[mask])),
+            "template_log_gain_max": float(np.max(log_gain[mask])),
+            "template_log_gain_rms": float(np.sqrt(np.mean(log_gain[mask] ** 2))),
+        }
     raise ValueError(f"operator {operator_id!r} is not a gain operator")
 
 
@@ -345,7 +395,7 @@ def generate_seismic_views(
     operator_source_support: np.ndarray,
     lateral_m: np.ndarray,
     sample_axis: np.ndarray,
-    rgt_model: np.ndarray,
+    rgt_model: np.ndarray | None = None,
     view_specs: Sequence[SeismicViewSpec],
     global_seed: int,
     generator_family: str,
@@ -360,22 +410,28 @@ def generate_seismic_views(
     source_support = np.asarray(operator_source_support, dtype=bool)
     axis = np.asarray(sample_axis, dtype=np.float64).reshape(-1)
     lateral = np.asarray(lateral_m, dtype=np.float64).reshape(-1)
-    rgt = np.asarray(rgt_model, dtype=np.float64)
+    requires_rgt = any(
+        bool({"rgt_lateral_gain", "empirical_rgt_gain"}.intersection(spec.operator_kinds))
+        for spec in view_specs
+    )
+    rgt = None if rgt_model is None else np.asarray(rgt_model, dtype=np.float64)
     if (
         base.ndim != 2
         or mask.shape != base.shape
         or source_support.shape != base.shape
-        or rgt.shape != base.shape
         or base.shape != (lateral.size, axis.size)
     ):
         raise ValueError(
-            "base seismic, public mask, operator source support, RGT, lateral axis "
+            "base seismic, public mask, operator source support, lateral axis "
             "and sample axis are misaligned"
         )
     if np.any(mask & ~np.isfinite(base)):
         raise ValueError("base seismic has non-finite valid samples")
-    if np.any(mask & ~np.isfinite(rgt)):
-        raise ValueError("RGT has non-finite public samples")
+    if requires_rgt:
+        if rgt is None or rgt.shape != base.shape:
+            raise ValueError("configured RGT gain requires RGT aligned with base seismic")
+        if np.any(mask & ~np.isfinite(rgt)):
+            raise ValueError("configured RGT gain requires finite RGT on public samples")
     if np.any(mask & ~source_support):
         raise ValueError("public valid mask is outside operator source support")
     results: list[SeismicViewResult] = []
@@ -438,7 +494,7 @@ def generate_seismic_views(
                         f"view {spec.view_id!r} axis_static auxiliary support differs"
                     )
                 state_source_support = support
-            elif kind in {"global_gain", "tracewise_gain", "axis_lateral_gain", "rgt_lateral_gain"}:
+            elif kind in {"global_gain", "tracewise_gain", "axis_lateral_gain", "rgt_lateral_gain", "empirical_rgt_gain"}:
                 gain, gain_qc = _gain_operator(
                     operator_id=operator_id,
                     operator=operator,

@@ -1209,7 +1209,7 @@ def _synthetic_view_family(benchmark: SynthoseisBenchmark, view_id: str) -> str:
     if len(set(kinds_by_row)) != 1:
         raise ValueError(f"Validation view {view_id!r} has inconsistent operator kinds.")
     kinds = set(kinds_by_row[0])
-    if kinds and kinds.issubset({"global_gain", "tracewise_gain", "axis_lateral_gain", "rgt_lateral_gain"}):
+    if kinds and kinds.issubset({"global_gain", "tracewise_gain", "axis_lateral_gain", "rgt_lateral_gain", "empirical_rgt_gain"}):
         return "amplitude"
     if kinds and kinds.issubset({"additive_white_noise", "additive_colored_noise"}):
         return "noise"

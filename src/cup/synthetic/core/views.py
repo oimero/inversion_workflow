@@ -26,6 +26,7 @@ SAMPLED_SEISMIC_KINDS = frozenset(
         "tracewise_gain",
         "axis_lateral_gain",
         "rgt_lateral_gain",
+        "empirical_rgt_gain",
         "additive_white_noise",
         "additive_colored_noise",
     }
@@ -213,6 +214,46 @@ def _validate_operator_parameters(operator_id: str, spec: Mapping[str, Any]) -> 
             raise ValueError(
                 f"seismic operator {operator_id!r}.interaction_rank must be a positive integer"
             )
+    elif kind == "empirical_rgt_gain":
+        source = str(spec.get("parameter_source") or "")
+        if source != "seismic_amplitude_calibration":
+            raise ValueError(
+                f"seismic operator {operator_id!r}.parameter_source must be "
+                "'seismic_amplitude_calibration'"
+            )
+        finite_number("mean_pattern_scale", positive=True)
+        resolved_keys = {
+            "calibration_schema_version",
+            "calibration_artifact_sha256",
+            "calibration_contract_fingerprint_sha256",
+            "template_sha256",
+            "rgt_knots",
+            "mean_log_gain_rgt",
+        }
+        present = resolved_keys.intersection(spec)
+        if present and present != resolved_keys:
+            raise ValueError(
+                f"seismic operator {operator_id!r} has an incomplete resolved amplitude template"
+            )
+        if present:
+            knots = [float(value) for value in spec["rgt_knots"]]
+            template = [float(value) for value in spec["mean_log_gain_rgt"]]
+            if len(knots) < 2 or len(knots) != len(template):
+                raise ValueError(
+                    f"seismic operator {operator_id!r} resolved template arrays are misaligned"
+                )
+            if any(not math.isfinite(value) for value in knots + template):
+                raise ValueError(
+                    f"seismic operator {operator_id!r} resolved template must be finite"
+                )
+            if any(right <= left for left, right in zip(knots, knots[1:])):
+                raise ValueError(
+                    f"seismic operator {operator_id!r}.rgt_knots must be strictly increasing"
+                )
+            if abs(float(sorted(template)[len(template) // 2])) > 5e-3:
+                raise ValueError(
+                    f"seismic operator {operator_id!r} resolved template violates its zero-median gauge"
+                )
     elif kind == "additive_white_noise":
         finite_number("rms_fraction", positive=True)
     elif kind == "additive_colored_noise":
@@ -339,6 +380,12 @@ def resolve_view_specs(config: Mapping[str, Any]) -> tuple[SeismicViewSpec, ...]
                 "interaction_lateral_correlation_length_m",
                 "max_abs_log_gain",
             },
+            "empirical_rgt_gain": {
+                "kind", "parameter_source", "mean_pattern_scale",
+                "calibration_schema_version", "calibration_artifact_sha256",
+                "calibration_contract_fingerprint_sha256", "template_sha256",
+                "rgt_knots", "mean_log_gain_rgt",
+            },
             "additive_white_noise": {"kind", "rms_fraction"},
             "additive_colored_noise": {"kind", "rms_fraction", "axis_correlation"},
         }
@@ -360,6 +407,7 @@ def resolve_view_specs(config: Mapping[str, Any]) -> tuple[SeismicViewSpec, ...]
                 "interaction_lateral_correlation_length_m",
                 "max_abs_log_gain",
             },
+            "empirical_rgt_gain": {"parameter_source", "mean_pattern_scale"},
             "additive_white_noise": {"rms_fraction"},
             "additive_colored_noise": {"rms_fraction", "axis_correlation"},
         }

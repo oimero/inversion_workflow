@@ -259,7 +259,7 @@ class SeismicViewContext:
     operator_source_support: np.ndarray
     lateral_m: np.ndarray
     sample_axis: np.ndarray
-    rgt_model: np.ndarray
+    rgt_model: np.ndarray | None = None
 
 
 class SeismicViewPipeline:
@@ -361,6 +361,7 @@ class GenerationSession:
         ],
     ] | None = None
     write_domain_outputs: Callable[[Path, Mapping[str, list[dict[str, Any]]]], None] | None = None
+    resolved_seismic_views: Mapping[str, Any] | None = None
 
     def resolve_plan(self, debug_attempt_limit: int | None) -> pd.DataFrame:
         """Build the neutral attempt plan exactly once in the shared Pipeline."""
@@ -580,7 +581,10 @@ class SyntheticBenchmarkPipeline:
             raise RuntimeError(f"{session.sample_domain}_generation_preflight_acceptance_qc_failed:{failed}")
 
         h5_path = output_dir / "synthetic_benchmark.h5"
-        view_pipeline = self.build_view_pipeline(config)
+        resolved_config = dict(config)
+        if session.resolved_seismic_views is not None:
+            resolved_config["seismic_views"] = dict(session.resolved_seismic_views)
+        view_pipeline = self.build_view_pipeline(resolved_config)
         if view_pipeline.specs and session.view_context is None:
             raise TypeError(
                 "generation session must provide view_context when views are configured"
@@ -864,7 +868,7 @@ class SyntheticBenchmarkPipeline:
             "rejected_parent_realizations": int(len(plan) - len(successful_parent_ids)),
             "acceptance_qc": acceptance_qc,
             "preflight": preflight_summary,
-            "seismic_views": dict(config.get("seismic_views") or {}),
+            "seismic_views": dict(resolved_config.get("seismic_views") or {}),
             "seismic_view_count": int(len(view_rows)),
             "rejection_reason_summary": [] if rejection_summary.empty else rejection_summary.to_dict(orient="records"),
             "quality_warnings": [] if not completed_with_warnings else ["scenario_acceptance_qc_failed"],

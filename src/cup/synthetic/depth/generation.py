@@ -356,6 +356,7 @@ class DepthGenerationSession:
         forward_inputs: Mapping[str, Any],
         config_provenance: Mapping[str, str],
         calibration_path: Path,
+        amplitude_calibration_path: Path | None = None,
         repo_root: Path,
         debug_attempt_limit: int | None = None,
         geometry_families: Sequence[str] | None = None,
@@ -395,6 +396,23 @@ class DepthGenerationSession:
                 "contract_fingerprint_sha256": str(forward_inputs["_contract_fingerprint_sha256"]),
             },
         }
+        from cup.synthetic.depth.amplitude_calibration import resolve_empirical_seismic_views
+
+        resolved_views, amplitude_provenance = resolve_empirical_seismic_views(
+            script_cfg["seismic_views"],
+            calibration_path=amplitude_calibration_path,
+            repo_root=repo_root,
+            ordered_horizons=[str(item["name"]) for item in script_cfg["horizons"]],
+        )
+        if amplitude_provenance is not None:
+            input_contracts["seismic_amplitude_calibration"] = {
+                "path": str(amplitude_provenance["path"]),
+                "contract_fingerprint_sha256": str(
+                    amplitude_provenance["contract_fingerprint_sha256"]
+                ),
+                "artifact_sha256": str(amplitude_provenance["artifact_sha256"]),
+                "template_sha256": str(amplitude_provenance["template_sha256"]),
+            }
         if list(calibration_payload.get("horizon_contract") or []) != list(script_cfg["horizons"]):
             raise ValueError("impedance calibration horizon contract differs from current common config.")
         expected_truth_dz = float(script_cfg["sampling"]["expected_model_dz_m"]) / int(script_cfg["sampling"]["vertical_oversampling_factor"])
@@ -540,6 +558,9 @@ class DepthGenerationSession:
                 Path(str(forward_inputs["_path"])), root=repo_root
             ),
             "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
+            "benchmark_purpose": str(
+                script_cfg.get("benchmark_purpose") or "field_conditioned_benchmark"
+            ),
             "depth_basis": "tvdss",
             "n_sections": len(sections),
             "geometry_filters": sorted({str(value) for value in geometry_families}) if geometry_families else sorted({str(value) for value in script_cfg["generation"]["geometry_families"]}),
@@ -576,6 +597,7 @@ class DepthGenerationSession:
             build_attempt=build_parent,
             view_context=view_context,
             write_domain_outputs=write_domain_outputs,
+            resolved_seismic_views=resolved_views,
         )
 
 
@@ -590,6 +612,7 @@ def run_depth_generation(
     forward_inputs: Mapping[str, Any],
     config_provenance: Mapping[str, str],
     calibration_path: Path,
+    amplitude_calibration_path: Path | None = None,
     repo_root: Path,
     output_dir: Path,
     debug_attempt_limit: int | None = None,
@@ -605,6 +628,7 @@ def run_depth_generation(
             "forward_inputs": forward_inputs,
             "config_provenance": config_provenance,
             "calibration_path": calibration_path,
+            "amplitude_calibration_path": amplitude_calibration_path,
             "repo_root": repo_root,
         }
     )
@@ -620,6 +644,7 @@ def run_depth_generation(
         forward_inputs=forward_inputs,
         config_provenance=config_provenance,
         calibration_path=calibration_path,
+        amplitude_calibration_path=amplitude_calibration_path,
         repo_root=repo_root,
     )
 

@@ -127,7 +127,7 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     allowed_root = {
         "sample_domain", "benchmark_schema", "science_revision", "global_seed", "source_runs", "sampling", "geometry", "sections",
         "calibration", "impedance_attribute_generator", "generation", "splits",
-        "seismic_input", "seismic_forward", "seismic_views", "figures",
+        "seismic_input", "seismic_forward", "seismic_views", "amplitude_calibration", "figures",
     }
     if "probe_selection" in root:
         raise ValueError(
@@ -258,6 +258,37 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if calibration.get("background_estimator") != "per_well_zone_huber":
         raise ValueError("calibration.background_estimator must be per_well_zone_huber.")
 
+    amplitude = _mapping(
+        root.get("amplitude_calibration"),
+        path="synthoseis_lite.amplitude_calibration",
+    )
+    _reject_unknown(
+        amplitude,
+        {
+            "pilot_attempts_per_scenario", "rgt_node_count",
+            "minimum_samples_per_node", "smoothing_sigma_nodes",
+            "shrinkage", "max_abs_log_gain",
+        },
+        path="synthoseis_lite.amplitude_calibration",
+    )
+    pilot_attempts = _positive_int(
+        amplitude.get("pilot_attempts_per_scenario"),
+        path="amplitude_calibration.pilot_attempts_per_scenario",
+    )
+    rgt_node_count = _positive_int(
+        amplitude.get("rgt_node_count"),
+        path="amplitude_calibration.rgt_node_count",
+    )
+    if rgt_node_count < 5:
+        raise ValueError("amplitude_calibration.rgt_node_count must be at least 5.")
+    smoothing_sigma = _positive_float(
+        amplitude.get("smoothing_sigma_nodes"),
+        path="amplitude_calibration.smoothing_sigma_nodes",
+    )
+    shrinkage = float(amplitude.get("shrinkage"))
+    if not np.isfinite(shrinkage) or not 0.0 < shrinkage <= 1.0:
+        raise ValueError("amplitude_calibration.shrinkage must be in (0, 1].")
+
     impedance = _mapping(root.get("impedance_attribute_generator"), path="synthoseis_lite.impedance_attribute_generator")
     _reject_unknown(
         impedance,
@@ -363,6 +394,20 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "splits": {"assignment_unit": "parent_realization", "held_out_geometry_family": held_out},
         "seismic_input": {"policy": "observed_highres_forward"},
         "seismic_forward": {"backend": backend, "dtype": "float64"},
+        "amplitude_calibration": {
+            "pilot_attempts_per_scenario": pilot_attempts,
+            "rgt_node_count": rgt_node_count,
+            "minimum_samples_per_node": _positive_int(
+                amplitude.get("minimum_samples_per_node"),
+                path="amplitude_calibration.minimum_samples_per_node",
+            ),
+            "smoothing_sigma_nodes": smoothing_sigma,
+            "shrinkage": shrinkage,
+            "max_abs_log_gain": _positive_float(
+                amplitude.get("max_abs_log_gain"),
+                path="amplitude_calibration.max_abs_log_gain",
+            ),
+        },
         "seismic_views": view_config,
         "figures": {
             "enabled": bool(figures["enabled"]),

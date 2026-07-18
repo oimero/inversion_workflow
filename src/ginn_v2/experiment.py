@@ -150,6 +150,11 @@ def _parse_parent_view_weights(value: Any, label: str) -> dict[str, Any]:
         str(key): _finite(item, f"{label}.view_weights.{key}", positive=True)
         for key, item in view.items()
     }
+    invalid_view_ids = sorted(key for key in view if not _ID.fullmatch(key))
+    if invalid_view_ids:
+        raise ValueError(
+            f"{label}.view_weights contains invalid view IDs: {invalid_view_ids}"
+        )
     if parent["variant"] > 0.0:
         if not view:
             raise ValueError(f"{label}.view_weights is required when variant weight is positive.")

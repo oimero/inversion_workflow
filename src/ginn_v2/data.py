@@ -506,8 +506,8 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
         views while preserving the existing tensor contract.
         """
         row = self.frame.iloc[int(index)].to_dict()
-        requested_view = str(view_id or "base")
-        row_view = str(row.get("view_id") or "")
+        requested_view = _clean_text(view_id) or "base"
+        row_view = _clean_text(row.get("view_id"))
         if requested_view == "base" and str(row.get("sample_kind") or "") == "seismic_view":
             requested_view = row_view or "base"
         parent = _parent_id(row)
@@ -637,7 +637,9 @@ class PatchDataset(Dataset[dict[str, torch.Tensor | str]]):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         row = self.frame.iloc[int(index)]
-        return self.get_item_for_view(int(index), str(row.get("view_id") or "base"))
+        return self.get_item_for_view(
+            int(index), _clean_text(row.get("view_id")) or "base"
+        )
 
 
 def _norm(values: np.ndarray, stats: Mapping[str, Any]) -> np.ndarray:

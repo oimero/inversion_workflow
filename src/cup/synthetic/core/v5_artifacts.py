@@ -12,7 +12,7 @@ import pandas as pd
 REALIZATION_INDEX_COLUMNS = (
     "realization_id", "sample_domain", "sample_unit", "depth_basis",
     "section_id", "scenario_id", "geometry_family", "duration_mode",
-    "suite", "evaluation_role", "parent_realization_id", "hdf5_group",
+    "suite", "evaluation_role", "hdf5_group",
     "base_seismic_dataset", "model_consistent_seismic_dataset",
     "target_log_ai_dataset", "canonical_background_dataset",
     "target_increment_dataset", "valid_mask_dataset", "n_valid",
@@ -20,8 +20,7 @@ REALIZATION_INDEX_COLUMNS = (
 VIEW_INDEX_COLUMNS = (
     "realization_id", "parent_realization_id", "view_id", "sample_domain", "sample_unit",
     "evaluation_role", "hdf5_group", "seismic_observed_dataset",
-    "seismic_input_dataset", "model_consistent_seismic_dataset",
-    "seismic_model_consistent_dataset", "valid_mask_dataset",
+    "model_consistent_seismic_dataset", "valid_mask_dataset",
     "operator_ids_json", "operator_kinds_json", "operator_parameters_json",
     "operator_contract_versions_json", "view_spec_canonical_json",
     "view_spec_sha256", "random_stream_identity_json",
@@ -38,12 +37,7 @@ def _frame(rows: Iterable[Mapping[str, Any]], columns: tuple[str, ...], sort_by:
         if not str(row.get("sample_unit") or "").strip():
             raise ValueError("v5 index rows require sample_unit")
         row.setdefault("realization_id", row.get("parent_realization_id", ""))
-        row.setdefault("model_consistent_seismic_dataset", row.get("seismic_model_consistent_dataset", ""))
-        row.setdefault("seismic_model_consistent_dataset", row.get("model_consistent_seismic_dataset", ""))
-        row.setdefault("target_log_ai_dataset", row.get("target_dataset", ""))
-        row.setdefault("seismic_observed_dataset", row.get("seismic_input_dataset", ""))
-        row.setdefault("seismic_input_dataset", row.get("seismic_observed_dataset", ""))
-        row.setdefault("n_valid", row.get("valid_sample_count", ""))
+        row.setdefault("n_valid", "")
         row.setdefault("operator_parameters_json", row.get("operator_parameters", ""))
         if isinstance(row.get("operator_parameters_json"), Mapping):
             row["operator_parameters_json"] = json.dumps(row["operator_parameters_json"], sort_keys=True)

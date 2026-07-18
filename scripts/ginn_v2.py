@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -166,23 +167,44 @@ def _benchmark_contract_payload(benchmark: SynthoseisBenchmark) -> dict[str, obj
         "axis_regularity": "regular",
     }
     return {
+        "benchmark_dir": repo_relative_path(benchmark.run_dir, root=REPO_ROOT),
         "schema_version": str(benchmark.schema),
         "sample_domain": str(benchmark.sample_domain),
+        "science_revision": str(benchmark.manifest.get("science_revision") or ""),
+        "projection_contract_version": str(
+            benchmark.manifest.get("projection_contract_version") or ""
+        ),
+        "seismic_view_contract_version": str(
+            benchmark.manifest.get("seismic_view_contract_version") or ""
+        ),
+        "seismic_operator_contract_version": str(
+            benchmark.manifest.get("seismic_operator_contract_version") or ""
+        ),
+        "random_stream_contract_version": str(
+            benchmark.manifest.get("random_stream_contract_version") or ""
+        ),
         "increment_contract": contract,
         "sample_axis_contract": sample_axis_contract,
         "contract_fingerprint_sha256": require_contract_fingerprint(
             benchmark.manifest, label=f"benchmark {benchmark.run_dir}"
         ),
         "materialized_view_ids": sorted(
-            str(value)
-            for value in benchmark.views.get("view_id", pd.Series(dtype=str)).tolist()
+            {
+                str(value)
+                for value in benchmark.views.get(
+                    "view_id", pd.Series(dtype=str)
+                ).tolist()
+                if str(value).strip()
+            }
         ),
         "materialized_view_spec_hashes": sorted(
-            str(value)
-            for value in benchmark.views.get(
-                "view_spec_sha256", pd.Series(dtype=str)
-            ).tolist()
-            if str(value).strip()
+            {
+                str(value)
+                for value in benchmark.views.get(
+                    "view_spec_sha256", pd.Series(dtype=str)
+                ).tolist()
+                if str(value).strip()
+            }
         ),
     }
 
@@ -210,7 +232,7 @@ def _validate_checkpoint_benchmark_compatibility(
         dict(value)
         for value in benchmark_identity.values()
         if isinstance(value, Mapping)
-        and str(value.get("schema_version") or "") == actual["schema_version"]
+        and str(value.get("benchmark_dir") or "") == actual["benchmark_dir"]
     ]
     if len(matching) != 1:
         raise ValueError(
@@ -218,8 +240,14 @@ def _validate_checkpoint_benchmark_compatibility(
         )
     expected = matching[0]
     for key in (
+        "benchmark_dir",
         "schema_version",
         "sample_domain",
+        "science_revision",
+        "projection_contract_version",
+        "seismic_view_contract_version",
+        "seismic_operator_contract_version",
+        "random_stream_contract_version",
         "contract_fingerprint_sha256",
         "materialized_view_ids",
         "materialized_view_spec_hashes",
@@ -229,6 +257,58 @@ def _validate_checkpoint_benchmark_compatibility(
                 f"Prediction benchmark {key} does not match checkpoint provenance."
             )
     return actual
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_checkpoint_split_compatibility(
+    checkpoint: Mapping[str, object],
+    manifest: Mapping[str, object],
+    benchmark_dir: Path,
+) -> None:
+    assignments = manifest.get("split_assignments")
+    if not isinstance(assignments, Mapping):
+        raise ValueError("GINN-v2 model run lacks per-source split_assignments provenance.")
+    sources = manifest.get("sources")
+    if not isinstance(sources, Mapping):
+        raise ValueError("GINN-v2 model run lacks source provenance for split assignments.")
+    matching_source_ids = []
+    for source_id, raw_source in sources.items():
+        if not isinstance(raw_source, Mapping):
+            continue
+        if str(raw_source.get("kind") or "") != "synthoseis_lite":
+            continue
+        raw_benchmark = str(raw_source.get("benchmark_dir") or "")
+        if raw_benchmark and resolve_relative_path(raw_benchmark, root=REPO_ROOT).resolve() == benchmark_dir.resolve():
+            matching_source_ids.append(str(source_id))
+    if len(matching_source_ids) != 1:
+        raise ValueError(
+            "GINN-v2 model run does not identify exactly one synthetic source for split validation."
+        )
+    source_id = matching_source_ids[0]
+    raw_assignment = assignments.get(source_id)
+    if not raw_assignment:
+        raise ValueError(f"GINN-v2 model run lacks split assignment for source {source_id!r}.")
+    assignment_path = resolve_relative_path(str(raw_assignment), root=REPO_ROOT)
+    if not assignment_path.is_file():
+        raise FileNotFoundError(f"GINN-v2 split assignment not found: {assignment_path}")
+    actual_digest = _sha256_file(assignment_path)
+    benchmark_identity = dict(checkpoint.get("benchmark_identity") or {})
+    identity = benchmark_identity.get(source_id)
+    if not isinstance(identity, Mapping):
+        raise ValueError(
+            f"GINN-v2 checkpoint lacks benchmark identity for source {source_id!r}."
+        )
+    if str(identity.get("split_assignment_sha256") or "") != actual_digest:
+        raise ValueError(
+            "GINN-v2 split assignment does not match checkpoint provenance."
+        )
 
 
 def run_train(args: argparse.Namespace) -> None:
@@ -281,9 +361,17 @@ def run_predict(args: argparse.Namespace) -> None:
     output_dir = _resolve_output_dir("ginn_v2_predict", args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
     benchmark = SynthoseisBenchmark(benchmark_dir)
+    checkpoint_payload = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False
+    )
     benchmark_contract = _validate_checkpoint_benchmark_compatibility(
-        checkpoint=torch.load(checkpoint_path, map_location="cpu", weights_only=False),
+        checkpoint=checkpoint_payload,
         benchmark=benchmark,
+    )
+    _validate_checkpoint_split_compatibility(
+        checkpoint_payload,
+        manifest,
+        benchmark_dir,
     )
     if args.eval_patch_index is not None:
         patch_index_source_path = resolve_relative_path(args.eval_patch_index, root=REPO_ROOT)

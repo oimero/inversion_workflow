@@ -198,7 +198,7 @@ class DeterministicParentBalancedViewCycler:
             kind = "base" if str(raw["sample_kind"]) == "base" else "variant"
             view_id = "base" if kind == "base" else str(raw.get("view_id") or "")
             parents.setdefault(parent, {}).setdefault(view_id, []).append(int(index))
-        if dynamic_views:
+        if dynamic_views and parent_weights["variant"] > 0.0:
             # Every configured view reuses the same parent/window rows.  The
             # view is materialized only after the sampler has selected it.
             for parent, views in parents.items():
@@ -275,6 +275,7 @@ class DeterministicParentBalancedViewCycler:
         self._patch_positions = {key: 0 for key in self._patch_orders}
         self.last_batch_counts: dict[str, int] = {}
         self.last_batch_view_counts: dict[str, int] = {}
+        self.last_batch_parent_counts: dict[str, int] = {}
 
     def next(self) -> Any:
         if self._cursor + self.batch_size > len(self._schedule):
@@ -283,6 +284,7 @@ class DeterministicParentBalancedViewCycler:
         selected_keys: list[tuple[str, str]] = []
         counts: dict[str, int] = {}
         view_counts: dict[str, int] = {}
+        parent_counts: dict[str, int] = {}
         for _ in self._schedule[self._cursor : self._cursor + self.batch_size]:
             parent = self.parent_ids[int(self._rng.integers(0, len(self.parent_ids)))]
             family = str(self._rng.choice(["base", "variant"], p=np.asarray([self.parent_weights["base"], self.parent_weights["variant"]]) / sum(self.parent_weights.values())))
@@ -310,9 +312,11 @@ class DeterministicParentBalancedViewCycler:
             kind_label = "base" if view_id == "base" else "seismic_view"
             counts[kind_label] = counts.get(kind_label, 0) + 1
             view_counts[view_id] = view_counts.get(view_id, 0) + 1
+            parent_counts[parent] = parent_counts.get(parent, 0) + 1
         self._cursor += self.batch_size
         self.last_batch_counts = counts
         self.last_batch_view_counts = view_counts
+        self.last_batch_parent_counts = parent_counts
         if callable(getattr(self.dataset, "get_item_for_view", None)):
             items = [
                 self.dataset.get_item_for_view(
@@ -426,7 +430,7 @@ def _resolve_auto_benchmark(root: Path) -> Path:
 
 
 def _benchmark_forward_model_inputs_path(
-    benchmark: SynthoseisBenchmark, benchmark_dir: Path,
+    benchmark: SynthoseisBenchmark, benchmark_dir: Path, *, root: Path,
 ) -> Path | None:
     if str(benchmark.manifest.get("sample_domain") or "") != "depth":
         return None
@@ -437,17 +441,34 @@ def _benchmark_forward_model_inputs_path(
             "R0/R1 require the frozen depth forward contract."
         )
     path = Path(raw_path)
-    if not path.is_absolute():
-        path = benchmark_dir / path
-    path = path.resolve()
-    if not path.is_file():
-        raise FileNotFoundError(f"Depth forward_model_inputs_path not found: {path}")
-    return path
+    if path.is_absolute():
+        candidates = [path]
+    else:
+        # Published manifests use repository-relative paths.  A hand-built
+        # benchmark may still use a path relative to its own run directory;
+        # accept that only when it is the path that actually exists.
+        candidates = [root / path, benchmark_dir / path]
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.is_file():
+            return resolved
+    raise FileNotFoundError(
+        "Depth forward_model_inputs_path not found: "
+        f"{', '.join(str(candidate.resolve()) for candidate in candidates)}"
+    )
 
 
 def _source_path(value: Any, root: Path) -> Path:
     path = Path(str(value))
     return path if path.is_absolute() else root / path
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _synthetic_sample_kinds(source: Mapping[str, Any]) -> set[str]:
@@ -459,6 +480,18 @@ def _materialize_parent_split_assignment(
     benchmark: SynthoseisBenchmark, *, path: Path,
 ) -> dict[str, str]:
     """Materialize the GINN-owned parent split with a versioned hash contract."""
+    benchmark_schema = getattr(benchmark, "schema", None)
+    if benchmark_schema is not None and str(benchmark_schema) != "synthoseis_lite_v5":
+        raise ValueError(
+            "GINN-v2 parent split assignment requires a synthoseis_lite_v5 benchmark."
+        )
+    required_columns = {"realization_id", "evaluation_role"}
+    missing_columns = sorted(required_columns - set(benchmark.realizations.columns))
+    if missing_columns:
+        raise ValueError(
+            "Synthoseis v5 realization index is missing split columns: "
+            f"{missing_columns}"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, str]] = []
     seed = 20260714
@@ -511,6 +544,7 @@ def _materialize_parent_split_assignment(
 def _prepare_synthetic_indices(
     *, benchmark: SynthoseisBenchmark, source: Mapping[str, Any], patch_spec: PatchSpec,
     blocks: list[Mapping[str, Any]], split_assignment: Mapping[str, str],
+    output_dir: Path,
     logger: logging.Logger | None = None,
     allow_smoke_validation_duplication: bool = False,
 ) -> dict[str, pd.DataFrame]:
@@ -997,17 +1031,22 @@ def _checkpoint_payload(
                 "source": str(block.get("source") or ""),
                 "parent_weights": dict(block["sampling"]["parent_weights"]),
                 "view_weights": dict(block["sampling"]["view_weights"]),
-                "validation": dict(stage.get("validation", {}).get("seismic_views") or {}),
+                "validation": {
+                    "seismic_views": dict(
+                        stage.get("validation", {}).get("seismic_views") or {}
+                    )
+                },
             })
     benchmark_identity = {
         source_id: {
             key: source.get(key, "")
             for key in (
-                "benchmark_dir", "schema_version", "science_revision",
+                "benchmark_dir", "schema_version", "sample_domain", "science_revision",
                 "projection_contract_version", "seismic_view_contract_version",
                 "seismic_operator_contract_version", "random_stream_contract_version",
                 "contract_fingerprint_sha256", "materialized_view_ids",
                 "materialized_view_spec_hashes", "split_assignment_path",
+                "split_assignment_sha256",
             )
             if key in source
         }
@@ -1155,6 +1194,30 @@ def _evaluate(
     }
 
 
+def _synthetic_view_family(benchmark: Any, view_id: str) -> str:
+    """Resolve the diagnostic family without affecting the sampling contract."""
+    if view_id == "base":
+        return "base"
+    frame = getattr(benchmark, "views", None)
+    kinds: list[str] = []
+    if isinstance(frame, pd.DataFrame) and not frame.empty and "view_id" in frame:
+        matches = frame[frame["view_id"].astype(str).eq(view_id)]
+        if len(matches) == 1:
+            raw = matches.iloc[0].get("operator_kinds_json", "")
+            try:
+                parsed = json.loads(str(raw))
+                if isinstance(parsed, list):
+                    kinds = [str(value).casefold() for value in parsed]
+            except json.JSONDecodeError:
+                kinds = []
+    token = " ".join([view_id.casefold(), *kinds])
+    if "gain" in token:
+        return "amplitude"
+    if "noise" in token:
+        return "noise"
+    return "operator"
+
+
 def _evaluate_synthetic_view_weighted(
     *,
     prepared: PreparedBlock,
@@ -1164,7 +1227,14 @@ def _evaluate_synthetic_view_weighted(
     steps: int | None,
     validation_views: Mapping[str, Any],
 ) -> dict[str, float]:
-    """Aggregate validation by explicit parent/view weights, never row counts."""
+    """Aggregate validation by explicit parent/view weights, never row counts.
+
+    The validation catalog remains one row per parent/window.  We evaluate
+    every requested view on that same catalog, reduce patches uniformly inside
+    each parent, then reduce parents uniformly inside each view.  This keeps a
+    geometry with more windows from silently changing the fixed view objective
+    and makes the paired base/view diagnostics an exact same-parent operation.
+    """
     dataset = prepared.validation_dataset
     if dataset is None:
         raise ValueError("Synthetic view validation requires a validation dataset.")
@@ -1178,66 +1248,110 @@ def _evaluate_synthetic_view_weighted(
     }
     if set(parent_weights) != {"base", "variant"}:
         raise ValueError("Validation parent weights must contain base and variant.")
-    if not np.isclose(sum(parent_weights.values()), 1.0):
-        raise ValueError("Validation parent weights must sum to one.")
-    if parent_weights["variant"] > 0.0 and (
-        not view_weights or not np.isclose(sum(view_weights.values()), 1.0)
+    if any(value < 0.0 for value in parent_weights.values()) or not np.isclose(
+        sum(parent_weights.values()), 1.0, rtol=0.0, atol=1.0e-12
     ):
-        raise ValueError("Validation seismic view weights must sum to one.")
+        raise ValueError("Validation parent weights must be nonnegative and sum to one.")
+    if parent_weights["variant"] > 0.0 and (
+        not view_weights
+        or any(value <= 0.0 for value in view_weights.values())
+        or not np.isclose(sum(view_weights.values()), 1.0, rtol=0.0, atol=1.0e-12)
+    ):
+        raise ValueError("Validation seismic view weights must be positive and sum to one.")
+    if parent_weights["variant"] == 0.0 and view_weights:
+        raise ValueError("Validation seismic view weights must be empty when variant weight is zero.")
     metric_name = (
         "mse"
         if str(prepared.config.get("kind") or "") == "synthetic_supervised"
         else str(dict(prepared.config.get("validation") or {}).get("selection_metric") or "").split(".", 1)[-1]
-    )
-    if metric_name == "":
-        metric_name = "total"
-    values: dict[str, list[float]] = {}
-    patch_values: dict[tuple[str, str], float] = {}
+    ) or "total"
+    frame = getattr(dataset, "frame", None)
+    if not isinstance(frame, pd.DataFrame) or "parent_realization_id" not in frame:
+        raise ValueError("Synthetic view validation requires parent-owned patch metadata.")
+    frame = frame.reset_index(drop=True)
+    parents = sorted(frame["parent_realization_id"].astype(str).unique())
+    benchmark = getattr(dataset, "benchmark", None)
+    available_view_reader = getattr(benchmark, "available_view_ids", None)
+    if callable(available_view_reader) and view_weights:
+        missing_by_parent = {
+            parent: sorted(set(view_weights) - set(map(str, available_view_reader(parent))))
+            for parent in parents
+        }
+        missing_by_parent = {
+            parent: missing for parent, missing in missing_by_parent.items() if missing
+        }
+        if missing_by_parent:
+            raise ValueError(
+                "Validation seismic views are not available for every parent: "
+                f"{missing_by_parent}"
+            )
+
+    # Records are retained at parent/window granularity for exact paired QC.
+    records: list[dict[str, Any]] = []
     was_training = model.training
     model.eval()
-    with torch.no_grad():
-        dynamic = callable(getattr(dataset, "get_item_for_view", None))
-        if dynamic:
-            frame = dataset.frame.reset_index(drop=True)
-            patch_indices = list(range(len(frame)))
-            if steps is not None:
-                patch_indices = patch_indices[: int(steps)]
-            requested_views = ["base", *sorted(view_weights)]
-            for view_id in requested_views:
-                for row_index in patch_indices:
-                    item = dataset.get_item_for_view(row_index, view_id)
-                    batch = default_collate([item])
+    try:
+        with torch.no_grad():
+            dynamic = callable(getattr(dataset, "get_item_for_view", None))
+            if dynamic:
+                patch_indices = list(range(len(frame)))
+                if steps is not None:
+                    patch_indices = patch_indices[: int(steps)]
+                for view_id in ["base", *sorted(view_weights)]:
+                    for row_index in patch_indices:
+                        item = dataset.get_item_for_view(row_index, view_id)
+                        batch = default_collate([item])
+                        loss, diagnostics = _block_loss(
+                            prepared, batch, model, device=device, normalization=normalization
+                        )
+                        value = float(diagnostics.get(metric_name, float(loss.detach().cpu())))
+                        row = frame.iloc[int(row_index)]
+                        records.append({
+                            "parent": str(row["parent_realization_id"]),
+                            "patch_id": str(item["patch_id"]),
+                            "view_id": view_id,
+                            "value": value,
+                        })
+            else:
+                loader = DataLoader(dataset, batch_size=1, shuffle=False)
+                for index, batch in enumerate(loader):
+                    if steps is not None and index >= int(steps):
+                        break
                     loss, diagnostics = _block_loss(
-                        prepared,
-                        batch,
-                        model,
-                        device=device,
-                        normalization=normalization,
+                        prepared, batch, model, device=device, normalization=normalization
                     )
-                    value = float(diagnostics.get(metric_name, float(loss.detach().cpu())))
-                    patch_id = str(item["patch_id"])
-                    values.setdefault(view_id, []).append(value)
-                    patch_values[(patch_id, view_id)] = value
-        else:
-            loader = DataLoader(dataset, batch_size=1, shuffle=False)
-            for index, batch in enumerate(loader):
-                if steps is not None and index >= int(steps):
-                    break
-                loss, diagnostics = _block_loss(
-                    prepared, batch, model, device=device, normalization=normalization
-                )
-                view_values = batch.get("view_id", ["base"])
-                view_id = str(view_values[0] if isinstance(view_values, (list, tuple)) else view_values)
-                value = float(
-                    diagnostics.get(metric_name, float(loss.detach().cpu()))
-                )
-                values.setdefault(view_id, []).append(value)
-                patch_values[(str(batch.get("patch_id", [""])[0]), view_id)] = value
-    if was_training:
-        model.train()
-    if not values:
+                    view_values = batch.get("view_id", ["base"])
+                    view_id = str(view_values[0] if isinstance(view_values, (list, tuple)) else view_values)
+                    row = frame.iloc[index]
+                    patch_values = batch.get("patch_id", [row.get("patch_id", "")])
+                    patch_id = str(patch_values[0] if isinstance(patch_values, (list, tuple)) else patch_values)
+                    records.append({
+                        "parent": str(row["parent_realization_id"]),
+                        "patch_id": patch_id,
+                        "view_id": view_id,
+                        "value": float(diagnostics.get(metric_name, float(loss.detach().cpu()))),
+                    })
+    finally:
+        if was_training:
+            model.train()
+    if not records:
         raise ValueError("Synthetic view validation produced no batches.")
-    means = {view: float(np.mean(items)) for view, items in values.items()}
+
+    by_view_parent: dict[tuple[str, str], list[float]] = {}
+    by_view_patch: dict[tuple[str, str, str], float] = {}
+    for record in records:
+        view_id = str(record["view_id"])
+        parent = str(record["parent"])
+        patch_id = str(record["patch_id"])
+        by_view_parent.setdefault((view_id, parent), []).append(float(record["value"]))
+        by_view_patch[(view_id, parent, patch_id)] = float(record["value"])
+    parent_means: dict[tuple[str, str], float] = {
+        key: float(np.mean(values)) for key, values in by_view_parent.items()
+    }
+    means: dict[str, float] = {}
+    for view_id in sorted({str(record["view_id"]) for record in records}):
+        values = [value for (current_view, _), value in parent_means.items() if current_view == view_id]
+        means[view_id] = float(np.mean(values))
     if parent_weights["base"] > 0.0 and "base" not in means:
         raise ValueError("Validation benchmark lacks the configured base view.")
     missing = sorted(view for view, weight in view_weights.items() if weight > 0.0 and view not in means)
@@ -1250,18 +1364,31 @@ def _evaluate_synthetic_view_weighted(
     result: dict[str, float] = {
         metric_name: float(weighted),
         f"weighted_{metric_name}": float(weighted),
-        "validation_parent_count": float(len({str(v) for v in dataset.frame["parent_realization_id"]})),
+        "validation_parent_count": float(len(parents)),
     }
     for view_id, value in sorted(means.items()):
         result[f"view_{view_id}_{metric_name}"] = float(value)
-        result[f"view_{view_id}_count"] = float(len(values[view_id]))
+        result[f"view_{view_id}_patch_count"] = float(
+            sum(1 for record in records if str(record["view_id"]) == view_id)
+        )
+        result[f"view_{view_id}_parent_count"] = float(
+            sum(1 for current_view, _ in parent_means if current_view == view_id)
+        )
+    family_views: dict[str, list[str]] = {}
+    for view_id in sorted(view_weights):
+        family_views.setdefault(_synthetic_view_family(benchmark, view_id), []).append(view_id)
+    for family, view_ids in sorted(family_views.items()):
+        available = [means[view_id] for view_id in view_ids if view_id in means]
+        if available:
+            result[f"group_{family}_{metric_name}"] = float(np.mean(available))
+            result[f"group_{family}_view_count"] = float(len(available))
+
     for view_id in sorted(view_weights):
         paired: list[float] = []
-        for (patch_id, current_view), current in patch_values.items():
+        for (current_view, parent, patch_id), current in by_view_patch.items():
             if current_view != view_id:
                 continue
-            base_id = patch_id.replace(f"__view__{view_id}", "")
-            base_value = patch_values.get((base_id, "base"))
+            base_value = by_view_patch.get(("base", parent, patch_id))
             if base_value is not None:
                 paired.append(current - base_value)
         if paired:
@@ -1388,12 +1515,13 @@ def run_experiment(
                     "ginn_v2.increment_contract."
                 )
             forward_inputs_path = _benchmark_forward_model_inputs_path(
-                synthetic[source_id][0], benchmark_dir,
+                synthetic[source_id][0], benchmark_dir, root=root,
             )
             resolved_sources[source_id] = {
                 "kind": "synthoseis_lite",
                 "benchmark_dir": repo_relative_path(benchmark_dir, root=root),
                 "schema_version": manifest.get("schema_version"),
+                "sample_domain": manifest.get("sample_domain"),
                 "science_revision": manifest.get("science_revision"),
                 "projection_contract_version": manifest.get("projection_contract_version"),
                 "seismic_view_contract_version": manifest.get("seismic_view_contract_version"),
@@ -1437,14 +1565,22 @@ def run_experiment(
                     )
                 ),
                 "materialized_view_ids": sorted(
-                    str(value) for value in synthetic[source_id][0].views.get("view_id", pd.Series(dtype=str)).tolist()
+                    {
+                        str(value)
+                        for value in synthetic[source_id][0].views.get(
+                            "view_id", pd.Series(dtype=str)
+                        ).tolist()
+                        if str(value).strip()
+                    }
                 ),
                 "materialized_view_spec_hashes": sorted(
-                    str(value)
-                    for value in synthetic[source_id][0].views.get(
-                        "view_spec_sha256", pd.Series(dtype=str)
-                    ).tolist()
-                    if str(value).strip()
+                    {
+                        str(value)
+                        for value in synthetic[source_id][0].views.get(
+                            "view_spec_sha256", pd.Series(dtype=str)
+                        ).tolist()
+                        if str(value).strip()
+                    }
                 ),
             }
             if forward_inputs_path is not None:
@@ -1554,6 +1690,9 @@ def run_experiment(
         split_assignment_paths[source_id] = assignment_path
         resolved_sources[source_id]["split_assignment_path"] = repo_relative_path(
             assignment_path, root=root
+        )
+        resolved_sources[source_id]["split_assignment_sha256"] = _sha256_file(
+            assignment_path
         )
         if source_id in training_sources:
             training_sources[source_id] = dict(resolved_sources[source_id])
@@ -1670,6 +1809,7 @@ def run_experiment(
                     benchmark=benchmark, source=source, patch_spec=patch_spec,
                     blocks=[block],
                     split_assignment=split_assignments[source_id],
+                    output_dir=stage_dir,
                     logger=logger,
                     allow_smoke_validation_duplication=(
                         config.run_mode == "smoke"
@@ -1788,6 +1928,7 @@ def run_experiment(
         best_value = float("inf")
         best_epoch = 0
         history: list[dict[str, Any]] = []
+        sampling_history: list[dict[str, Any]] = []
         metric_name = str(stage["validation"]["selection_metric"])
         steps_per_epoch = int(stage["steps_per_epoch"])
         for epoch in range(1, int(stage["epochs"]) + 1):
@@ -1841,6 +1982,9 @@ def run_experiment(
             sampled_view_counts: dict[str, dict[str, int]] = {
                 str(block.config["block_id"]): {} for block in prepared_blocks
             }
+            sampled_parent_counts: dict[str, dict[str, int]] = {
+                str(block.config["block_id"]): {} for block in prepared_blocks
+            }
             progress_interval = max(1, steps_per_epoch // 10)
             last_combined = float("nan")
             for step in range(steps_per_epoch):
@@ -1860,6 +2004,10 @@ def run_experiment(
                             view_counts = sampled_view_counts[str(prepared.config["block_id"])]
                             for view_id, count in cycler.last_batch_view_counts.items():
                                 view_counts[view_id] = view_counts.get(view_id, 0) + int(count)
+                        if hasattr(cycler, "last_batch_parent_counts"):
+                            parent_counts = sampled_parent_counts[str(prepared.config["block_id"])]
+                            for parent_id, count in cycler.last_batch_parent_counts.items():
+                                parent_counts[parent_id] = parent_counts.get(parent_id, 0) + int(count)
                     elif isinstance(batch, dict) and "sample_kind" in batch:
                         block_counts = sampled_kind_counts[str(prepared.config["block_id"])]
                         values = batch["sample_kind"]
@@ -1978,6 +2126,24 @@ def run_experiment(
             for block_id, view_counts in sampled_view_counts.items():
                 for view_id, count in view_counts.items():
                     row[f"{block_id}.sampled_view_{view_id}_count"] = int(count)
+            for block_id, parent_counts in sampled_parent_counts.items():
+                for parent_id, count in parent_counts.items():
+                    row[f"{block_id}.sampled_parent_{parent_id}_count"] = int(count)
+            sampling_history.append({
+                "epoch": int(epoch),
+                "kind_counts": {
+                    block_id: dict(counts)
+                    for block_id, counts in sampled_kind_counts.items()
+                },
+                "view_counts": {
+                    block_id: dict(counts)
+                    for block_id, counts in sampled_view_counts.items()
+                },
+                "parent_counts": {
+                    block_id: dict(counts)
+                    for block_id, counts in sampled_parent_counts.items()
+                },
+            })
             history.append(row)
             logger.info(
                 "epoch_end stage_id=%s epoch=%d/%d last_train_loss=%.6g selected_metric=%s selected_value=%.6g training=%s validation=%s sampled_kind_counts=%s elapsed_s=%.1f",
@@ -1995,7 +2161,7 @@ def run_experiment(
             if selected < best_value:
                 best_value, best_epoch = selected, epoch
                 path = stage_dir / "checkpoint_best.pt"
-                torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="best", epoch=epoch, metric_name=metric_name, metric_value=selected, sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, stage_deployment_eligible=bool(stage.get("deployment_eligible", False)), stage_deployment_eligibility_reason=str(stage.get("deployment_eligibility_reason") or ""), physics_closures=list(stage.get("physics_closures") or []), stage_loss_blocks=list(stage.get("loss_blocks") or []), sampling_statistics={"epoch": epoch, "kind_counts": sampled_kind_counts, "view_counts": sampled_view_counts}, forward_model_inputs_path=forward_model_inputs_path), path)
+                torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="best", epoch=epoch, metric_name=metric_name, metric_value=selected, sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, stage_deployment_eligible=bool(stage.get("deployment_eligible", False)), stage_deployment_eligibility_reason=str(stage.get("deployment_eligibility_reason") or ""), physics_closures=list(stage.get("physics_closures") or []), stage_loss_blocks=list(stage.get("loss_blocks") or []), sampling_statistics={"epoch": epoch, "kind_counts": sampled_kind_counts, "view_counts": sampled_view_counts, "parent_counts": sampled_parent_counts, "history": list(sampling_history)}, forward_model_inputs_path=forward_model_inputs_path), path)
                 checkpoints[(stage_id, "best")] = path
                 logger.info(
                     "checkpoint_best stage_id=%s epoch=%d metric=%s value=%.6g path=%s",
@@ -2013,7 +2179,7 @@ def run_experiment(
             if final_has_physics
             else str(stage.get("deployment_eligibility_reason") or "")
         )
-        torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="final", epoch=int(stage["epochs"]), metric_name=metric_name, metric_value=float(history[-1]["selection_metric_value"]), sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, stage_deployment_eligible=final_eligible, stage_deployment_eligibility_reason=final_reason, physics_closures=list(stage.get("physics_closures") or []), stage_loss_blocks=list(stage.get("loss_blocks") or []), sampling_statistics={"epoch": int(stage["epochs"]), "kind_counts": sampled_kind_counts, "view_counts": sampled_view_counts}, forward_model_inputs_path=forward_model_inputs_path), final_path)
+        torch.save(_checkpoint_payload(model=model, config=config, model_info=info.__dict__, normalization=normalization, stage_id=stage_id, kind="final", epoch=int(stage["epochs"]), metric_name=metric_name, metric_value=float(history[-1]["selection_metric_value"]), sample_axis=sample_axis_contract, increment_contract=experiment_increment_contract, training_sources=training_sources, stage_lineage=stage_lineage, stage_deployment_eligible=final_eligible, stage_deployment_eligibility_reason=final_reason, physics_closures=list(stage.get("physics_closures") or []), stage_loss_blocks=list(stage.get("loss_blocks") or []), sampling_statistics={"epoch": int(stage["epochs"]), "kind_counts": sampled_kind_counts, "view_counts": sampled_view_counts, "parent_counts": sampled_parent_counts, "history": list(sampling_history)}, forward_model_inputs_path=forward_model_inputs_path), final_path)
         checkpoints[(stage_id, "final")] = final_path
         pd.DataFrame(history).to_csv(stage_dir / "training_history.csv", index=False)
         logger.info(
@@ -2158,6 +2324,6 @@ def run_experiment(
 
 
 __all__ = [
-    "DeterministicCycler", "DeterministicSampleKindCycler", "masked_centered_rms", "run_experiment",
+    "DeterministicCycler", "DeterministicParentBalancedViewCycler", "masked_centered_rms", "run_experiment",
     "validate_source_axis_contracts",
 ]

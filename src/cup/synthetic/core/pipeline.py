@@ -195,6 +195,21 @@ def _portable_figure_summary(
     return result
 
 
+def _validate_published_v5_artifact(directory: Path, *, qc_only: bool) -> None:
+    """Run the strict reader as the last generation publication gate.
+
+    The reader is intentionally imported here, rather than at module import
+    time, so the shared pipeline keeps the writer/reader dependency one-way.
+    QC-only runs deliberately do not satisfy the training-consumable v5
+    artifact contract and therefore retain their separate publication path.
+    """
+    if qc_only:
+        return
+    from cup.synthetic.benchmark import SynthoseisBenchmark
+
+    SynthoseisBenchmark(directory)
+
+
 class SyntheticDomainAdapter(Protocol):
     """The small set of domain-dependent operations at the shared seam."""
 
@@ -300,12 +315,7 @@ class GenerationAttempt:
 
     parent_realization_id: str
     sample: BenchmarkSample | None
-    index_rows: list[dict[str, Any]] = field(default_factory=list)
-    realization_row: dict[str, Any] | None = None
-    view_rows: list[dict[str, Any]] = field(default_factory=list)
-    view_result_rows: list[dict[str, Any]] = field(default_factory=list)
     qc_row: dict[str, Any] = field(default_factory=dict)
-    rejection_rows: list[dict[str, Any]] = field(default_factory=list)
     domain_rows: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     reason: str = ""
 
@@ -742,7 +752,7 @@ class SyntheticBenchmarkPipeline:
                             "hdf5_group": view_path,
                             "seismic_observed_dataset": "" if not view_path else f"{view_path}/seismic_observed",
                             "seismic_input_dataset": "" if not view_path else f"{view_path}/seismic_observed",
-                            "seismic_model_consistent_dataset": base_record["seismic_model_consistent_dataset"],
+                            "model_consistent_seismic_dataset": base_record["seismic_model_consistent_dataset"],
                             "valid_mask_dataset": base_record["valid_mask_dataset"],
                             "view_spec_sha256": metadata["view_spec_sha256"],
                             "view_spec_canonical_json": metadata["view_spec_canonical_json"],
@@ -877,6 +887,12 @@ class SyntheticBenchmarkPipeline:
         _write_json(output_dir / "run_summary.json", summary)
         if failure_reason:
             raise RuntimeError(failure_reason)
+        try:
+            _validate_published_v5_artifact(output_dir, qc_only=qc_only)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{session.sample_domain}_generation_final_v5_artifact_validation_failed: {exc}"
+            ) from exc
         logger.info("Synthoseis generation finished: status=%s accepted=%d rejected=%d", summary["status"], summary["accepted_realizations"], summary["rejected_realizations"])
         for handler in list(logger.handlers):
             handler.flush()

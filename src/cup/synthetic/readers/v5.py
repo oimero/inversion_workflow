@@ -72,6 +72,8 @@ _LEGACY_FIELD_NAMES = frozenset(
         "controlled_degraded",
         "controlled_default",
         "combined_moderate",
+        "seismic_input_dataset",
+        "seismic_model_consistent_dataset",
     }
 )
 
@@ -200,8 +202,8 @@ class V5Benchmark:
                 "status": "ok",
                 "source_sample_id": "",
                 "hdf5_group": f"/realizations/{rid}",
-                "seismic_input_dataset": f"/realizations/{rid}/seismic/seismic_observed",
-                "seismic_model_consistent_dataset": f"/realizations/{rid}/seismic/seismic_model_consistent",
+                "seismic_observed_dataset": f"/realizations/{rid}/seismic/seismic_observed",
+                "model_consistent_seismic_dataset": f"/realizations/{rid}/seismic/seismic_model_consistent",
                 "valid_mask_dataset": f"/realizations/{rid}/masks/valid_mask",
             }
         for _, raw in self.views.iterrows():
@@ -216,8 +218,8 @@ class V5Benchmark:
                 "status": "ok",
                 "source_sample_id": rid,
                 "hdf5_group": f"/realizations/{rid}/seismic_views/{view_id}",
-                "seismic_input_dataset": f"/realizations/{rid}/seismic_views/{view_id}/seismic_observed",
-                "seismic_model_consistent_dataset": f"/realizations/{rid}/seismic/seismic_model_consistent",
+                "seismic_observed_dataset": f"/realizations/{rid}/seismic_views/{view_id}/seismic_observed",
+                "model_consistent_seismic_dataset": f"/realizations/{rid}/seismic/seismic_model_consistent",
                 "valid_mask_dataset": f"/realizations/{rid}/masks/valid_mask",
             }
         self.index = pd.DataFrame.from_records(list(self._rows.values()))
@@ -237,6 +239,10 @@ class V5Benchmark:
         if legacy_columns:
             raise ValueError(
                 f"v5 indexes contain legacy columns: {legacy_columns}"
+            )
+        if "parent_realization_id" in self.realizations.columns:
+            raise ValueError(
+                "realization_index.csv must not contain the parent_realization_id alias column"
             )
         if self.realizations.empty:
             raise ValueError("realization_index.csv must contain at least one parent realization")
@@ -334,8 +340,6 @@ class V5Benchmark:
                 expected_view_paths = {
                     "hdf5_group": path,
                     "seismic_observed_dataset": f"{path}/seismic_observed",
-                    "seismic_input_dataset": f"{path}/seismic_observed",
-                    "seismic_model_consistent_dataset": f"/realizations/{parent_id}/seismic/seismic_model_consistent",
                     "model_consistent_seismic_dataset": f"/realizations/{parent_id}/seismic/seismic_model_consistent",
                     "valid_mask_dataset": f"/realizations/{parent_id}/masks/valid_mask",
                     "operator_trace_dataset": f"{path}/operator_trace_json",
@@ -407,7 +411,7 @@ class V5Benchmark:
 
     def load_sample(self, sample_id: str) -> V5SyntheticSample:
         row = self.row(sample_id)
-        rid = _text(row["parent_realization_id"] or row["realization_id"])
+        rid = _text(row.get("parent_realization_id") or row.get("realization_id"))
         root = f"/realizations/{rid}"
         with h5py.File(self.h5_path, "r") as h5:
             target = np.asarray(h5[f"{root}/truth/model_target_log_ai"][()], dtype=np.float64)
@@ -415,8 +419,14 @@ class V5Benchmark:
             increment = np.asarray(h5[f"{root}/targets/target_increment_log_ai"][()], dtype=np.float64)
             vp_path = f"{root}/truth/vp_model_mps"
             vp = np.asarray(h5[vp_path][()], dtype=np.float64) if vp_path in h5 else np.full_like(target, np.nan)
-            seismic = np.asarray(h5[row["seismic_input_dataset"]][()], dtype=np.float64)
-            consistent = np.asarray(h5[row["seismic_model_consistent_dataset"]][()], dtype=np.float64)
+            seismic_path = row.get("seismic_observed_dataset") or row.get("base_seismic_dataset")
+            consistent_path = row.get("model_consistent_seismic_dataset")
+            if not seismic_path or not consistent_path:
+                raise ValueError(
+                    f"v5 realization row lacks canonical seismic dataset paths: {sample_id}"
+                )
+            seismic = np.asarray(h5[str(seismic_path)][()], dtype=np.float64)
+            consistent = np.asarray(h5[str(consistent_path)][()], dtype=np.float64)
             valid = np.asarray(h5[row["valid_mask_dataset"]][()], dtype=bool)
             lateral = np.asarray(h5[f"{root}/axes/lateral_m"][()], dtype=np.float64)
             axis_name = "tvdss_model_m" if self.sample_domain == "depth" else "twt_model_s"

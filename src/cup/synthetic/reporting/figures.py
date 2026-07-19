@@ -523,20 +523,44 @@ def _plot_hdf5_examples(
 
 def _plot_acceptance(output_dir: Path, generated: list[str], skipped: list[dict[str, Any]]) -> None:
     catalog = _read_csv(output_dir / "scenario_catalog.csv")
-    if catalog.empty or "acceptance_fraction" not in catalog:
+    required = {"section_id", "scenario_id", "acceptance_fraction"}
+    if catalog.empty or not required.issubset(catalog.columns):
         skipped.append({"figure": "scenario_acceptance_summary", "reason": "empty scenario_catalog.csv"})
         return
     frame = catalog.copy()
-    frame["label"] = frame["scenario_id"].astype(str)
-    frame = frame.sort_values("acceptance_fraction")
-    fig, ax = plt.subplots(figsize=(max(7.0, 0.18 * len(frame)), 4.2))
-    ax.bar(np.arange(len(frame)), frame["acceptance_fraction"], color="#2b6cb0")
-    ax.set_ylim(0.0, 1.05)
-    ax.set_ylabel("acceptance fraction")
-    ax.set_title("Scenario acceptance summary")
-    ax.set_xticks(np.arange(len(frame)), frame["label"], rotation=90, fontsize=6)
-    ax.grid(True, axis="y", alpha=0.25)
-    generated.append(_finish(fig, output_dir / "figures" / "qc" / "scenario_acceptance_summary.png"))
+    sections = list(dict.fromkeys(frame["section_id"].astype(str)))
+    scenarios = list(dict.fromkeys(frame["scenario_id"].astype(str)))
+    matrix = frame.pivot(
+        index="section_id", columns="scenario_id", values="acceptance_fraction"
+    ).reindex(index=sections, columns=scenarios)
+    values = np.ma.masked_invalid(matrix.to_numpy(dtype=np.float64))
+    cmap = plt.get_cmap("RdYlGn").copy()
+    cmap.set_bad("#d1d5db")
+    fig, ax = plt.subplots(
+        figsize=(
+            max(10.0, 0.34 * len(scenarios)),
+            max(4.2, 0.55 * len(sections)),
+        )
+    )
+    image = ax.imshow(
+        values,
+        aspect="auto",
+        interpolation="nearest",
+        cmap=cmap,
+        vmin=0.0,
+        vmax=1.0,
+    )
+    ax.set_title("Scenario acceptance by section")
+    ax.set_xlabel("scenario")
+    ax.set_ylabel("section")
+    ax.set_xticks(np.arange(len(scenarios)), scenarios, rotation=90, fontsize=6)
+    ax.set_yticks(np.arange(len(sections)), sections, fontsize=7)
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.025, pad=0.02)
+    colorbar.set_label("acceptance fraction")
+    generated.append(_finish(
+        fig,
+        output_dir / "figures" / "generation" / "scenario_acceptance_summary.png",
+    ))
 
 
 def write_generation_figures(

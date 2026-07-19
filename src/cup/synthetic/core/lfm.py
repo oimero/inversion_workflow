@@ -88,8 +88,16 @@ def build_lfm_products(
         raise ValueError("canonical LFM target has non-finite valid samples")
 
     resolved_contract = validate_increment_contract(canonical_contract)
+    # The canonical background is an operator on the complete model context,
+    # not on the public target ROI.  The forward adapters deliberately prepare
+    # context above and below the interpreted interval so that both the
+    # canonical low-pass and the seismic forward operator have their required
+    # support.  Applying ``valid`` here would discard that context and reject
+    # structurally thin target intervals even when the complete target trace is
+    # perfectly filterable.
+    filter_support = np.isfinite(target)
     short_segment_diagnostics = _canonical_segment_diagnostics(
-        valid, minimum_samples=resolved_contract.minimum_segment_samples
+        filter_support, minimum_samples=resolved_contract.minimum_segment_samples
     )
     if short_segment_diagnostics is not None:
         reason = "canonical_lfm_segment_too_short"
@@ -103,7 +111,6 @@ def build_lfm_products(
         target,
         axis,
         resolved_contract,
-        valid_mask=valid,
     )
     background = np.asarray(background, dtype=np.float64)
     increment = np.asarray(increment, dtype=np.float64)
@@ -120,6 +127,12 @@ def build_lfm_products(
         target_increment_log_ai=increment,
         qc={
             "lfm_status": "canonical",
+            "lfm_filter_support_policy": (
+                "complete_finite_model_context_then_public_mask"
+            ),
+            "lfm_filter_support_sample_count": int(
+                np.count_nonzero(filter_support)
+            ),
             "lfm_valid_sample_count": int(np.count_nonzero(valid)),
             "lfm_canonical_background_rms": centered_rms(background, valid),
             "lfm_target_increment_rms": centered_rms(increment, valid),

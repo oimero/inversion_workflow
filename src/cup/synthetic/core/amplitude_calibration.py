@@ -754,7 +754,21 @@ def fit_amplitude_prior(
         pilot_sections, knots, source="pilot", **field_options
     )
     if not real_fields or not pilot_fields:
-        raise ValueError("amplitude calibration has no usable real or pilot fields")
+        def exclusion_examples(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+            return [
+                str(row.get("warning") or "unknown exclusion")
+                for row in rows
+                if str(row.get("status")) != "used"
+            ][:3]
+
+        raise ValueError(
+            "amplitude calibration has no computable real-minus-pilot field set: "
+            f"real usable={len(real_fields)}/{len(real_sections)}, "
+            f"examples={exclusion_examples(real_qc)}; "
+            f"pilot usable={len(pilot_fields)}/{len(pilot_sections)}, "
+            f"examples={exclusion_examples(pilot_qc)}; "
+            "review amplitude_calibration coarse-grid support controls"
+        )
     real_weights, _ = _stratified_field_weights(real_fields)
     pilot_weights, stratum_qc = _stratified_field_weights(pilot_fields)
     real_location = _weighted_location(real_fields, real_weights)

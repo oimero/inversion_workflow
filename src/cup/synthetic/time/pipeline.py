@@ -203,12 +203,20 @@ class TimeGenerationSession:
         from cup.synthetic.core.amplitude_calibration import resolve_calibrated_seismic_views
         from cup.synthetic.time.amplitude_calibration import time_pilot_compatibility
 
+        amplitude_pilot_compatibility = time_pilot_compatibility(
+            workflow=workflow,
+            script_cfg=script_cfg,
+            sources=sources,
+            calibration_path=calibration_path,
+            repo_root=repo_root,
+        )
         resolved_views, amplitude_provenance = resolve_calibrated_seismic_views(
             script_cfg["seismic_views"],
             prior_path=amplitude_prior_path,
             repo_root=repo_root,
             sample_domain="time",
             ordered_horizons=[str(item["name"]) for item in script_cfg["horizons"]],
+            expected_pilot_compatibility=amplitude_pilot_compatibility,
         )
         if amplitude_provenance is not None:
             input_contracts["seismic_amplitude_prior"] = {
@@ -218,6 +226,9 @@ class TimeGenerationSession:
                 ),
                 "artifact_sha256": str(amplitude_provenance["artifact_sha256"]),
                 "prior_sha256": str(amplitude_provenance["prior_sha256"]),
+                "pilot_compatibility_sha256": str(
+                    amplitude_provenance["pilot_compatibility_sha256"]
+                ),
             }
         wavelet_time, wavelet = load_wavelet_csv(
             sources["wavelet_generation_dir"] / "selected_wavelet.csv"
@@ -355,13 +366,7 @@ class TimeGenerationSession:
             "benchmark_purpose": str(
                 script_cfg.get("benchmark_purpose") or "field_conditioned_benchmark"
             ),
-            "amplitude_pilot_compatibility": time_pilot_compatibility(
-                workflow=workflow,
-                script_cfg=script_cfg,
-                sources=sources,
-                calibration_path=calibration_path,
-                repo_root=repo_root,
-            ),
+            "amplitude_pilot_compatibility": amplitude_pilot_compatibility,
             "output_dt_s": output_dt,
             "truth_dt_s": calibration.truth_sample_interval,
             "n_sections": len(sections),

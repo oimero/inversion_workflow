@@ -51,7 +51,7 @@ def parse_amplitude_calibration_controls(
     allowed = {
         "pilot_attempts_per_scenario", "rgt_node_count", "lateral_node_count",
         "minimum_samples_per_cell", "smoothing_sigma_nodes",
-        "mean_shrinkage", "max_abs_mean_log_gain",
+        "mean_shrinkage", "max_abs_mean_log_gain", "max_abs_total_log_gain",
         "interaction_explained_variance", "maximum_interaction_rank",
     }
     unknown = sorted(set(value) - allowed)
@@ -77,6 +77,7 @@ def parse_amplitude_calibration_controls(
         key: float(value[key])
         for key in (
             "smoothing_sigma_nodes", "mean_shrinkage", "max_abs_mean_log_gain",
+            "max_abs_total_log_gain",
             "interaction_explained_variance",
         )
     }
@@ -86,6 +87,11 @@ def parse_amplitude_calibration_controls(
         raise ValueError("amplitude_calibration.mean_shrinkage must be at most 1")
     if floats["interaction_explained_variance"] > 1.0:
         raise ValueError("amplitude_calibration.interaction_explained_variance must be at most 1")
+    if floats["max_abs_total_log_gain"] < floats["max_abs_mean_log_gain"]:
+        raise ValueError(
+            "amplitude_calibration.max_abs_total_log_gain must be at least "
+            "max_abs_mean_log_gain"
+        )
     return {**integers, **floats}
 
 
@@ -155,6 +161,17 @@ def build_pilot_compatibility_contract(
         "base_seismic_contract": dict(base_seismic_contract),
     }
     return {"contract": payload, "sha256": canonical_sha256(payload)}
+
+
+def _validated_compatibility_sha(value: Mapping[str, Any], *, label: str) -> str:
+    contract = value.get("contract")
+    recorded = str(value.get("sha256") or "")
+    if not isinstance(contract, Mapping) or not recorded:
+        raise ValueError(f"{label} compatibility contract is incomplete")
+    actual = canonical_sha256(contract)
+    if recorded != actual:
+        raise ValueError(f"{label} compatibility SHA-256 is stale")
+    return recorded
 
 
 def build_amplitude_pilot_config(script_cfg: Mapping[str, Any]) -> dict[str, Any]:
@@ -247,17 +264,39 @@ def _smooth(values: np.ndarray, sigma: float) -> np.ndarray:
     return np.convolve(np.pad(values, radius, mode="edge"), kernel, mode="valid")
 
 
-def _robust_sigma(values: np.ndarray) -> float:
-    finite = np.asarray(values, dtype=np.float64)
-    finite = finite[np.isfinite(finite)]
-    if finite.size == 0:
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    weights = np.asarray(weights, dtype=np.float64).reshape(-1)
+    valid = np.isfinite(values) & np.isfinite(weights) & (weights > 0.0)
+    if not np.any(valid):
         return float("nan")
-    center = float(np.median(finite))
-    return float(1.4826 * np.median(np.abs(finite - center)))
+    values = values[valid]
+    weights = weights[valid]
+    order = np.argsort(values, kind="stable")
+    values = values[order]
+    weights = weights[order]
+    cutoff = 0.5 * float(np.sum(weights))
+    return float(values[np.searchsorted(np.cumsum(weights), cutoff, side="left")])
+
+
+def _weighted_robust_sigma(values: np.ndarray, weights: np.ndarray) -> float:
+    center = _weighted_median(values, weights)
+    if not np.isfinite(center):
+        return float("nan")
+    return float(1.4826 * _weighted_median(np.abs(values - center), weights))
+
+
+def _fill_vector(values: np.ndarray) -> np.ndarray:
+    output = np.asarray(values, dtype=np.float64).copy()
+    finite = np.flatnonzero(np.isfinite(output))
+    if finite.size < 2:
+        raise ValueError("amplitude statistic has disconnected support")
+    return np.interp(np.arange(output.size), finite, output[finite])
 
 
 def _fill_coarse_field(values: np.ndarray) -> np.ndarray:
     output = np.asarray(values, dtype=np.float64).copy()
+    original_support = np.isfinite(output)
     for _ in range(2):
         for row in range(output.shape[0]):
             finite = np.flatnonzero(np.isfinite(output[row]))
@@ -273,7 +312,7 @@ def _fill_coarse_field(values: np.ndarray) -> np.ndarray:
                 )
     if np.any(~np.isfinite(output)):
         raise ValueError("coarse amplitude field has disconnected support")
-    output -= float(np.median(output))
+    output -= float(np.median(output[original_support]))
     return output
 
 
@@ -349,6 +388,7 @@ def _coarse_log_rms_field(
         "rgt_knots": rgt_knots,
         "values": _fill_coarse_field(values),
         "counts": counts,
+        "support_mask": supported_cells,
     }
 
 
@@ -389,6 +429,9 @@ def _coarse_fields(
             "scenario_id": section.scenario_id,
             "status": "used",
             "warning": "",
+            "supported_cell_count": int(np.count_nonzero(field["support_mask"])),
+            "total_cell_count": int(np.asarray(field["support_mask"]).size),
+            "supported_cell_fraction": float(np.mean(field["support_mask"])),
         })
         rows.extend(
             {
@@ -400,64 +443,64 @@ def _coarse_fields(
                 "rgt": float(rgt),
                 "centered_log_rms": float(value),
                 "sample_count": int(count),
+                "supported": bool(supported),
             }
-            for lateral, value_row, count_row in zip(
-                field["lateral_m"], field["values"], field["counts"]
+            for lateral, value_row, count_row, support_row in zip(
+                field["lateral_m"], field["values"], field["counts"],
+                field["support_mask"],
             )
-            for rgt, value, count in zip(rgt_knots, value_row, count_row)
+            for rgt, value, count, supported in zip(
+                rgt_knots, value_row, count_row, support_row
+            )
         )
     return fields, rows, qc
 
 
 def _field_curve(field: Mapping[str, Any]) -> np.ndarray:
-    return np.median(np.asarray(field["values"], dtype=np.float64), axis=0)
+    values = np.asarray(field["values"], dtype=np.float64)
+    support = np.asarray(field["support_mask"], dtype=bool)
+    return np.asarray([
+        np.median(values[support[:, index], index])
+        if np.any(support[:, index]) else np.nan
+        for index in range(values.shape[1])
+    ])
 
 
-def _real_location(fields: Sequence[Mapping[str, Any]]) -> np.ndarray:
-    by_section: dict[str, list[np.ndarray]] = {}
-    for field in fields:
-        by_section.setdefault(str(field["section_id"]), []).append(_field_curve(field))
-    return np.median(
-        np.vstack([
-            np.median(np.vstack(values), axis=0)
-            for _, values in sorted(by_section.items())
-        ]),
-        axis=0,
-    )
-
-
-def _pilot_location(
+def _stratified_field_weights(
     fields: Sequence[Mapping[str, Any]],
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    by_stratum: dict[tuple[str, str], list[np.ndarray]] = {}
-    for field in fields:
-        key = (str(field["section_id"]), str(field["scenario_id"]))
-        by_stratum.setdefault(key, []).append(_field_curve(field))
-    by_section: dict[str, list[np.ndarray]] = {}
+    by_section: dict[str, dict[str, list[int]]] = {}
+    for index, field in enumerate(fields):
+        section = str(field["section_id"])
+        scenario = str(field["scenario_id"])
+        by_section.setdefault(section, {}).setdefault(scenario, []).append(index)
+    weights = np.zeros(len(fields), dtype=np.float64)
     qc: list[dict[str, Any]] = []
-    for (section_id, scenario_id), values in sorted(by_stratum.items()):
-        location = np.median(np.vstack(values), axis=0)
-        by_section.setdefault(section_id, []).append(location)
-        qc.append({
-            "section_id": section_id,
-            "scenario_id": scenario_id,
-            "accepted_realizations": len(values),
-            "stratum_weight_within_section": 0.0,
-            "section_weight": 0.0,
-        })
-    for section_id, values in by_section.items():
-        for row in qc:
-            if row["section_id"] == section_id:
-                row["stratum_weight_within_section"] = 1.0 / len(values)
-                row["section_weight"] = 1.0 / len(by_section)
-    survey = np.median(
-        np.vstack([
-            np.median(np.vstack(values), axis=0)
-            for _, values in sorted(by_section.items())
-        ]),
-        axis=0,
-    )
-    return survey, qc
+    section_weight = 1.0 / len(by_section)
+    for section, strata in sorted(by_section.items()):
+        stratum_weight = 1.0 / len(strata)
+        for scenario, indices in sorted(strata.items()):
+            field_weight = section_weight * stratum_weight / len(indices)
+            weights[indices] = field_weight
+            qc.append({
+                "section_id": section,
+                "scenario_id": scenario,
+                "accepted_realizations": len(indices),
+                "stratum_weight_within_section": stratum_weight,
+                "section_weight": section_weight,
+                "field_weight": field_weight,
+            })
+    return weights, qc
+
+
+def _weighted_location(
+    fields: Sequence[Mapping[str, Any]], weights: np.ndarray
+) -> np.ndarray:
+    curves = np.vstack([_field_curve(field) for field in fields])
+    return _fill_vector(np.asarray([
+        _weighted_median(curves[:, index], weights)
+        for index in range(curves.shape[1])
+    ]))
 
 
 def _decompose_fields(
@@ -467,14 +510,23 @@ def _decompose_fields(
     lateral_components: list[np.ndarray] = []
     interactions: list[np.ndarray] = []
     for field in fields:
-        residual = np.asarray(field["values"], dtype=np.float64) - source_mean[None, :]
-        rgt = np.median(residual, axis=0)
+        values = np.asarray(field["values"], dtype=np.float64)
+        support = np.asarray(field["support_mask"], dtype=bool)
+        residual = np.where(support, values - source_mean[None, :], np.nan)
+        rgt = _fill_vector(np.asarray([
+            np.median(residual[np.isfinite(residual[:, index]), index])
+            if np.any(np.isfinite(residual[:, index])) else np.nan
+            for index in range(residual.shape[1])
+        ]))
         rgt -= float(np.median(rgt))
         remainder = residual - rgt[None, :]
-        lateral = np.median(remainder, axis=1)
+        lateral = _fill_vector(np.asarray([
+            np.median(row[np.isfinite(row)]) if np.any(np.isfinite(row)) else np.nan
+            for row in remainder
+        ]))
         lateral -= float(np.median(lateral))
-        interaction = remainder - lateral[:, None]
-        interaction -= float(np.median(interaction))
+        interaction = np.where(support, remainder - lateral[:, None], np.nan)
+        interaction -= float(np.median(interaction[np.isfinite(interaction)]))
         rgt_components.append(rgt)
         lateral_components.append(lateral)
         interactions.append(interaction)
@@ -485,34 +537,95 @@ def _decompose_fields(
     )
 
 
-def _correlation_length(values: np.ndarray, coordinates: Sequence[np.ndarray]) -> float:
+def _correlation_length(
+    values: np.ndarray, coordinates: Sequence[np.ndarray], field_weights: np.ndarray
+) -> float:
     estimates: list[float] = []
+    estimate_weights: list[float] = []
     threshold = float(np.exp(-1.0))
-    for vector, axis in zip(np.asarray(values, dtype=np.float64), coordinates):
+    for vector, axis, weight in zip(
+        np.asarray(values, dtype=np.float64), coordinates, field_weights
+    ):
+        finite = np.isfinite(vector)
+        vector = vector[finite]
+        coordinate = np.asarray(axis, dtype=np.float64)[finite]
         centered = vector - float(np.mean(vector))
         variance = float(np.mean(centered * centered))
-        coordinate = np.asarray(axis, dtype=np.float64)
         if vector.size < 4 or variance <= np.finfo(np.float64).eps:
             continue
         for lag in range(1, vector.size):
             correlation = float(np.mean(centered[:-lag] * centered[lag:]) / variance)
             if correlation <= threshold:
                 estimates.append(float(np.median(coordinate[lag:] - coordinate[:-lag])))
+                estimate_weights.append(float(weight))
                 break
-    return float(np.median(estimates)) if estimates else float("nan")
+    return (
+        _weighted_median(np.asarray(estimates), np.asarray(estimate_weights))
+        if estimates else float("nan")
+    )
 
 
-def _extra_sigma(real: np.ndarray, pilot: np.ndarray) -> tuple[float, float, float]:
-    real_sigma = _robust_sigma(real)
-    pilot_sigma = _robust_sigma(pilot)
+def _extra_sigma(
+    real: np.ndarray,
+    pilot: np.ndarray,
+    real_weights: np.ndarray,
+    pilot_weights: np.ndarray,
+) -> tuple[float, float, float]:
+    real_sample_weights = np.broadcast_to(
+        real_weights.reshape((-1,) + (1,) * (real.ndim - 1)), real.shape
+    ).copy()
+    pilot_sample_weights = np.broadcast_to(
+        pilot_weights.reshape((-1,) + (1,) * (pilot.ndim - 1)), pilot.shape
+    ).copy()
+    for index in range(real.shape[0]):
+        finite_count = np.count_nonzero(np.isfinite(real[index]))
+        if finite_count:
+            real_sample_weights[index] /= finite_count
+    for index in range(pilot.shape[0]):
+        finite_count = np.count_nonzero(np.isfinite(pilot[index]))
+        if finite_count:
+            pilot_sample_weights[index] /= finite_count
+    real_sigma = _weighted_robust_sigma(real, real_sample_weights)
+    pilot_sigma = _weighted_robust_sigma(pilot, pilot_sample_weights)
     extra = float(np.sqrt(max(0.0, real_sigma * real_sigma - pilot_sigma * pilot_sigma)))
     return real_sigma, pilot_sigma, extra
+
+
+def _weighted_pairwise_covariance(
+    rows: np.ndarray, field_weights: np.ndarray, *, rows_per_field: int
+) -> np.ndarray:
+    rows = np.asarray(rows, dtype=np.float64)
+    field_weights = np.asarray(field_weights, dtype=np.float64)
+    if rows.shape[0] != field_weights.size * rows_per_field:
+        raise ValueError("interaction rows do not align with field weights")
+    field_index = np.repeat(np.arange(field_weights.size), rows_per_field)
+    covariance = np.zeros((rows.shape[1], rows.shape[1]), dtype=np.float64)
+    for left in range(rows.shape[1]):
+        for right in range(left, rows.shape[1]):
+            valid = (
+                np.isfinite(rows[:, left]) & np.isfinite(rows[:, right])
+            )
+            if np.count_nonzero(valid) < 2:
+                continue
+            valid_field_index = field_index[valid]
+            valid_counts = np.bincount(
+                valid_field_index, minlength=field_weights.size
+            )
+            w = field_weights[valid_field_index] / valid_counts[valid_field_index]
+            w /= np.sum(w)
+            x = rows[valid, left]
+            y = rows[valid, right]
+            value = float(np.sum(w * (x - np.sum(w * x)) * (y - np.sum(w * y))))
+            covariance[left, right] = covariance[right, left] = value
+    return covariance
 
 
 def _interaction_prior(
     real: np.ndarray,
     pilot: np.ndarray,
     fields: Sequence[Mapping[str, Any]],
+    real_weights: np.ndarray,
+    pilot_weights: np.ndarray,
     rgt_knots: np.ndarray,
     *,
     explained_variance: float,
@@ -520,8 +633,12 @@ def _interaction_prior(
 ) -> dict[str, Any]:
     real_rows = real.reshape(-1, real.shape[-1])
     pilot_rows = pilot.reshape(-1, pilot.shape[-1])
-    real_cov = np.cov(real_rows, rowvar=False)
-    pilot_cov = np.cov(pilot_rows, rowvar=False)
+    real_cov = _weighted_pairwise_covariance(
+        real_rows, real_weights, rows_per_field=real.shape[1]
+    )
+    pilot_cov = _weighted_pairwise_covariance(
+        pilot_rows, pilot_weights, rows_per_field=pilot.shape[1]
+    )
     covariance = 0.5 * ((real_cov - pilot_cov) + (real_cov - pilot_cov).T)
     eigenvalues, eigenvectors = np.linalg.eigh(covariance)
     positive = np.maximum(eigenvalues, 0.0)
@@ -545,10 +662,19 @@ def _interaction_prior(
     modes = eigenvectors[:, :rank].T
     lateral_lengths: list[float] = []
     for mode in modes:
-        scores = np.stack([matrix @ mode for matrix in real])
+        scores = np.stack([
+            np.asarray([
+                float(np.sum(row[finite] * mode[finite]) / np.sum(mode[finite] ** 2))
+                if np.any(finite := np.isfinite(row)) and np.sum(mode[finite] ** 2) > 0.0
+                else np.nan
+                for row in matrix
+            ])
+            for matrix in real
+        ])
         length = _correlation_length(
             scores,
             [np.asarray(field["lateral_m"]) for field in fields],
+            real_weights,
         )
         lateral_lengths.append(length)
     finite = np.isfinite(lateral_lengths) & (np.asarray(lateral_lengths) > 0.0)
@@ -559,7 +685,10 @@ def _interaction_prior(
             "rgt_modes": [],
             "eigenvalues": [],
             "lateral_correlation_lengths_m": [],
-            "log_sigma": float(np.sqrt(total / rgt_knots.size)),
+            "log_sigma": 0.0,
+            "estimated_log_sigma_before_disable": float(
+                np.sqrt(total / rgt_knots.size)
+            ),
             "disabled_reason": "unstable_lateral_correlation_estimate",
         }
     return {
@@ -596,8 +725,10 @@ def fit_amplitude_prior(
     )
     if not real_fields or not pilot_fields:
         raise ValueError("amplitude calibration has no usable real or pilot fields")
-    real_location = _real_location(real_fields)
-    pilot_location, stratum_qc = _pilot_location(pilot_fields)
+    real_weights, _ = _stratified_field_weights(real_fields)
+    pilot_weights, stratum_qc = _stratified_field_weights(pilot_fields)
+    real_location = _weighted_location(real_fields, real_weights)
+    pilot_location = _weighted_location(pilot_fields, pilot_weights)
     for row in stratum_qc:
         row["planned_realizations"] = int(controls["pilot_attempts_per_scenario"])
         row["acceptance_fraction"] = (
@@ -620,18 +751,19 @@ def fit_amplitude_prior(
         pilot_fields, pilot_location
     )
     rgt_real_sigma, rgt_pilot_sigma, rgt_extra_sigma = _extra_sigma(
-        real_rgt, pilot_rgt
+        real_rgt, pilot_rgt, real_weights, pilot_weights
     )
     rgt_length = _correlation_length(
-        real_rgt, [knots for _ in range(real_rgt.shape[0])]
+        real_rgt, [knots for _ in range(real_rgt.shape[0])], real_weights
     )
     rgt_enabled = bool(rgt_extra_sigma > 0.0 and np.isfinite(rgt_length) and rgt_length > 0.0)
     lateral_real_sigma, lateral_pilot_sigma, lateral_extra_sigma = _extra_sigma(
-        real_lateral, pilot_lateral
+        real_lateral, pilot_lateral, real_weights, pilot_weights
     )
     lateral_length = _correlation_length(
         real_lateral,
         [np.asarray(field["lateral_m"]) for field in real_fields],
+        real_weights,
     )
     lateral_enabled = bool(
         lateral_extra_sigma > 0.0
@@ -642,6 +774,8 @@ def fit_amplitude_prior(
         real_interaction,
         pilot_interaction,
         real_fields,
+        real_weights,
+        pilot_weights,
         knots,
         explained_variance=float(controls["interaction_explained_variance"]),
         maximum_rank=int(controls["maximum_interaction_rank"]),
@@ -665,14 +799,33 @@ def fit_amplitude_prior(
         },
         "interaction_component": interaction,
     }
-    total_extra_sigma = float(np.sqrt(
+    uncapped_total_extra_sigma = float(np.sqrt(
         (rgt_extra_sigma if rgt_enabled else 0.0) ** 2
         + (lateral_extra_sigma if lateral_enabled else 0.0) ** 2
         + float(interaction["log_sigma"]) ** 2
     ))
+    mean_maximum = float(np.max(np.abs(template)))
+    uncapped_maximum = mean_maximum + 3.0 * uncapped_total_extra_sigma
+    total_limit = float(controls["max_abs_total_log_gain"])
+    residual_shrinkage = 1.0
+    if uncapped_maximum > total_limit and uncapped_total_extra_sigma > 0.0:
+        residual_shrinkage = float(np.clip(
+            (total_limit - mean_maximum) / (3.0 * uncapped_total_extra_sigma),
+            0.0,
+            1.0,
+        ))
+        for component_name in ("rgt_component", "lateral_component"):
+            component = residual_model[component_name]
+            component["log_sigma"] = float(component["log_sigma"]) * residual_shrinkage
+        interaction["log_sigma"] = float(interaction["log_sigma"]) * residual_shrinkage
+        interaction["eigenvalues"] = (
+            np.asarray(interaction["eigenvalues"], dtype=np.float64)
+            * residual_shrinkage ** 2
+        ).tolist()
+    total_extra_sigma = uncapped_total_extra_sigma * residual_shrinkage
     max_abs_log_gain = float(max(
         np.finfo(np.float64).eps,
-        np.max(np.abs(template)) + 3.0 * total_extra_sigma,
+        min(total_limit, mean_maximum + 3.0 * total_extra_sigma),
     ))
     mean_model = {
         "rgt_knots": knots.tolist(),
@@ -697,6 +850,30 @@ def fit_amplitude_prior(
             "n_real_fields": len(real_fields),
             "n_pilot_fields": len(pilot_fields),
             "total_extra_log_sigma": total_extra_sigma,
+            "uncapped_total_extra_log_sigma": uncapped_total_extra_sigma,
+            "uncapped_max_abs_log_gain": uncapped_maximum,
+            "max_abs_total_log_gain": total_limit,
+            "residual_shrinkage": residual_shrinkage,
+            "real_weighted_supported_cell_fraction": float(np.sum(
+                real_weights * np.asarray([
+                    np.mean(field["support_mask"]) for field in real_fields
+                ])
+            )),
+            "pilot_weighted_supported_cell_fraction": float(np.sum(
+                pilot_weights * np.asarray([
+                    np.mean(field["support_mask"]) for field in pilot_fields
+                ])
+            )),
+            "common_supported_cell_fraction": float(np.mean(
+                np.any(np.stack([
+                    np.asarray(field["support_mask"], dtype=bool)
+                    for field in real_fields
+                ]), axis=0)
+                & np.any(np.stack([
+                    np.asarray(field["support_mask"], dtype=bool)
+                    for field in pilot_fields
+                ]), axis=0)
+            )),
         },
     }
     summary = pd.DataFrame({
@@ -853,6 +1030,13 @@ def _validate_calibration_payload(payload: Mapping[str, Any], *, expected_domain
     for name in ("rgt_component", "lateral_component", "interaction_component"):
         if not isinstance(residual_model.get(name), Mapping):
             raise ValueError(f"amplitude prior lacks residual component {name!r}")
+    for name in ("rgt_component", "lateral_component"):
+        component = dict(residual_model[name])
+        sigma = float(component.get("log_sigma", np.nan))
+        if not np.isfinite(sigma) or sigma < 0.0:
+            raise ValueError(f"amplitude prior {name} log_sigma is invalid")
+        if not bool(component.get("enabled")) and sigma != 0.0:
+            raise ValueError(f"disabled amplitude prior {name} must have zero log_sigma")
     maximum = float(payload.get("max_abs_log_gain"))
     if not np.isfinite(maximum) or maximum <= 0.0:
         raise ValueError("amplitude prior max_abs_log_gain must be positive and finite")
@@ -875,6 +1059,21 @@ def _validate_calibration_payload(payload: Mapping[str, Any], *, expected_domain
         or np.any(lengths <= 0.0)
     ):
         raise ValueError("amplitude prior interaction component is invalid")
+    if not bool(interaction.get("enabled")) and (
+        rank != 0
+        or modes.size != 0
+        or eigenvalues.size != 0
+        or lengths.size != 0
+        or float(interaction.get("log_sigma", np.nan)) != 0.0
+    ):
+        raise ValueError("disabled amplitude prior interaction component is invalid")
+    estimator = dict(payload.get("estimator") or {})
+    total_limit = float(estimator.get("max_abs_total_log_gain", np.nan))
+    if not np.isfinite(total_limit) or total_limit <= 0.0 or maximum > total_limit + 1e-12:
+        raise ValueError("amplitude prior exceeds its total log-gain limit")
+    _validated_compatibility_sha(
+        dict(payload.get("pilot_compatibility") or {}), label="amplitude prior"
+    )
     expected_sha = canonical_sha256({
         "mean_model": mean_model,
         "residual_model": residual_model,
@@ -922,6 +1121,7 @@ def resolve_calibrated_seismic_views(
     repo_root: Path,
     sample_domain: str,
     ordered_horizons: Sequence[str],
+    expected_pilot_compatibility: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     resolved = json.loads(json.dumps(dict(view_config)))
     operators = dict(resolved.get("operators") or {})
@@ -938,6 +1138,16 @@ def resolve_calibrated_seismic_views(
     payload, provenance = load_seismic_amplitude_prior(
         prior_path, repo_root=repo_root, expected_domain=sample_domain
     )
+    expected_compatibility_sha = _validated_compatibility_sha(
+        expected_pilot_compatibility, label="generation"
+    )
+    prior_compatibility_sha = _validated_compatibility_sha(
+        dict(payload.get("pilot_compatibility") or {}), label="amplitude prior"
+    )
+    if prior_compatibility_sha != expected_compatibility_sha:
+        raise ValueError(
+            "amplitude prior Pilot compatibility differs from current generation"
+        )
     if list(payload.get("ordered_horizons") or []) != list(ordered_horizons):
         raise ValueError("amplitude prior horizon contract differs from generation")
     mean_model = dict(payload["mean_model"])
@@ -963,6 +1173,7 @@ def resolve_calibrated_seismic_views(
         **provenance,
         "schema_version": SCHEMA_VERSION,
         "prior_sha256": payload["prior_sha256"],
+        "pilot_compatibility_sha256": prior_compatibility_sha,
     }
 
 

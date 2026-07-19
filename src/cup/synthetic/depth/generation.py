@@ -401,12 +401,20 @@ class DepthGenerationSession:
         from cup.synthetic.core.amplitude_calibration import resolve_calibrated_seismic_views
         from cup.synthetic.depth.amplitude_calibration import depth_pilot_compatibility
 
+        amplitude_pilot_compatibility = depth_pilot_compatibility(
+            workflow=workflow,
+            script_cfg=script_cfg,
+            calibration_path=calibration_path,
+            forward_inputs=forward_inputs,
+            repo_root=repo_root,
+        )
         resolved_views, amplitude_provenance = resolve_calibrated_seismic_views(
             script_cfg["seismic_views"],
             prior_path=amplitude_prior_path,
             repo_root=repo_root,
             sample_domain="depth",
             ordered_horizons=[str(item["name"]) for item in script_cfg["horizons"]],
+            expected_pilot_compatibility=amplitude_pilot_compatibility,
         )
         if amplitude_provenance is not None:
             input_contracts["seismic_amplitude_prior"] = {
@@ -416,6 +424,9 @@ class DepthGenerationSession:
                 ),
                 "artifact_sha256": str(amplitude_provenance["artifact_sha256"]),
                 "prior_sha256": str(amplitude_provenance["prior_sha256"]),
+                "pilot_compatibility_sha256": str(
+                    amplitude_provenance["pilot_compatibility_sha256"]
+                ),
             }
         if list(calibration_payload.get("horizon_contract") or []) != list(script_cfg["horizons"]):
             raise ValueError("impedance calibration horizon contract differs from current common config.")
@@ -568,13 +579,7 @@ class DepthGenerationSession:
             "benchmark_purpose": str(
                 script_cfg.get("benchmark_purpose") or "field_conditioned_benchmark"
             ),
-            "amplitude_pilot_compatibility": depth_pilot_compatibility(
-                workflow=workflow,
-                script_cfg=script_cfg,
-                calibration_path=calibration_path,
-                forward_inputs=forward_inputs,
-                repo_root=repo_root,
-            ),
+            "amplitude_pilot_compatibility": amplitude_pilot_compatibility,
             "depth_basis": "tvdss",
             "n_sections": len(sections),
             "geometry_filters": sorted({str(value) for value in geometry_families}) if geometry_families else sorted({str(value) for value in script_cfg["generation"]["geometry_families"]}),

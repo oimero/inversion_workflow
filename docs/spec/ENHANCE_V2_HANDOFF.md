@@ -1,5 +1,10 @@
 # Enhance v2 深度域微纹理增强 Handoff
 
+> **状态：冻结的替代路线。** 当前研究主线转为
+> [Structured GINN 纵向原型](STRUCTURED_GINN_HANDOFF.md)。本规格保留用于比较
+> “井统计条件微纹理补全”与“对象级结构化后验”两种方法，不属于首轮实施范围，
+> 也不与 Structured GINN 串联。
+
 ## 1. 目标与定位
 
 Enhance v2 是位于 GINN v2 R0 之后的独立微纹理补全阶段。GINN v2 负责恢复由当前合成先验和地震有效频带支持的中频规范阻抗增量；Enhance v2 在固定的 R0 结果上补充由井统计约束的薄层纹理。

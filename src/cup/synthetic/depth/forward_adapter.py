@@ -19,6 +19,7 @@ from cup.synthetic.core.records import (
     ProjectedTruth,
     SampleAxis,
 )
+from cup.synthetic.core.rejections import ForwardRejected
 from cup.synthetic.core.truth import SyntheticTruth
 
 
@@ -86,7 +87,19 @@ class DepthForwardAdapter:
         if np.any(survey_indices >= survey_axis.size) or not np.allclose(
             survey_axis[survey_indices], model_axis, rtol=0.0, atol=1e-9
         ):
-            raise ValueError("section_context_outside_survey_axis")
+            reason = "section_context_outside_survey_axis"
+            diagnostics = {
+                "survey_axis_min_m": float(survey_axis[0]),
+                "survey_axis_max_m": float(survey_axis[-1]),
+                "requested_axis_min_m": float(model_axis[0]),
+                "requested_axis_max_m": float(model_axis[-1]),
+                "required_context_m": float(context),
+            }
+            raise ForwardRejected(
+                [reason],
+                diagnostics=diagnostics,
+                details=[{"reason": reason, **diagnostics}],
+            )
         return DomainPreparation(
             model_axis=SampleAxis(
                 sample_domain="depth",

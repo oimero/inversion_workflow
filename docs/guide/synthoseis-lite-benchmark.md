@@ -2,7 +2,7 @@
 
 Synthoseis-lite 是时间域、深度域共用的合成基准旁路。入口根据配置选择域 Adapter；校准、场景计划、父实现事务、视图编排、接受率、索引和 manifest 由同一共享 Pipeline 完成。
 
-当前产物合同为 `synthoseis_lite_v5`，科学合同为 `synthoseis_lite_science_v3`。配置和产物只接受这一版合同。
+当前产物合同为第五版，科学合同为第四版。配置和产物只接受当前合同。
 
 ## 快速开始
 
@@ -15,10 +15,10 @@ python scripts/synthoseis_lite.py --config <config-yaml> calibrate-amplitude `
   --pilot-benchmark <pilot-run>
 python scripts/synthoseis_lite.py --config <config-yaml> generate `
   --impedance-calibration <calibration-run>/impedance_calibration.json `
-  --seismic-amplitude-calibration <amplitude-run>/seismic_amplitude_calibration.json
+  --seismic-amplitude-prior <amplitude-run>/seismic_amplitude_prior.json
 ```
 
-经验振幅视图启用时执行完整的四段流程；未配置该视图时仍可只运行阻抗标定和正式生成。深度域和时间域使用相同命令；域、单位和正演执行由配置与 Adapter 决定。
+标定振幅视图启用时执行完整的四段流程；未配置该视图时仍可只运行阻抗标定和正式生成。深度域和时间域使用相同命令；域、单位和正演执行由配置与 Adapter 决定。
 
 调试参数可使用 `--debug-attempt-limit <N>`、`--geometry-family <name>`、`--qc-only` 和 `--output-dir <path>`。
 
@@ -32,7 +32,7 @@ python scripts/synthoseis_lite.py --config <config-yaml> generate `
 synthoseis_lite:
   sample_domain: time       # 或 depth
   benchmark_schema: synthoseis_lite_v5
-  science_revision: synthoseis_lite_science_v3
+  science_revision: synthoseis_lite_science_v4
   seismic_input:
     policy: observed_highres_forward
   seismic_views:
@@ -64,15 +64,17 @@ seismic_views:
       operator_ids: [gain, noise]
 ```
 
-允许的算子包括相位旋转、子波时移、轴向静校正、全局/逐道/横向增益、层序坐标随机增益、层序坐标经验增益、白噪声和有色噪声。前向参数算子必须连续位于列表开头；随后才是采样地震算子。前向参数汇总后只重新正演一次，再按列表顺序施加采样算子。
+允许的算子包括相位旋转、子波时移、轴向静校正、全局增益、逐道增益、标定层序增益、白噪声和有色噪声。沿原始垂向轴变化的增益实现只保留为非地质坐标压力测试，不进入默认 benchmark。前向参数算子必须连续位于列表开头；随后才是采样地震算子。前向参数汇总后只重新正演一次，再按列表顺序施加采样算子。
 
-## 经验振幅标定
+## 地震振幅先验
 
-时间域和深度域共用同一个曲线估计、分层聚合、平滑收缩、产物发布、加载校验和视图解析实现。域适配层只负责读取本域真实剖面、把层位映射到无量纲层序坐标，以及调用本域正演生成无视图 pilot。
+时间域和深度域共用同一个二维粗振幅场估计、残差分解、先验发布、加载校验和视图解析实现。域适配层只负责读取本域真实剖面、提供横向距离、把层位映射到无量纲层序坐标，以及调用本域正演生成无视图 pilot。
 
-真实侧按剖面等权，pilot 侧依次按“父实现、剖面与场景、剖面、工区”聚合，避免不同接受率改变标定权重。标定只匹配沿层序坐标的相对振幅模式，不匹配绝对增益。经验均值与随机层序增益组合时，随机部分仍是通用稳健性增强，不解释为真实残差分布的估计。
+真实侧按剖面等权，pilot 侧依次按“父实现、剖面与场景、剖面、工区”聚合，避免不同接受率改变标定权重。每张剖面先形成横向距离与层序坐标上的粗尺度对数均方根场，并去掉整体中位数，因此先验不恢复绝对地震增益。
 
-pilot 保存完整兼容合同，覆盖域和轴、工区地震身份、层位内容、剖面路径、采样、场景、正演输入及阻抗标定身份。振幅标定只接受与当前配置完全一致的 pilot，并使用临时目录完成自校验后原子发布。
+共享估计把粗振幅残差分为层序分量、横向分量和二者的交互分量。前两项的随机强度由真实方差减去 pilot 方差后取非负平方根；交互项对真实与 pilot 的协方差差做正半定截断，并由解释方差确定模式数。相关长度估计不稳定或额外方差为零的分量会在先验中禁用。默认 benchmark 包含均值、随机残差和完整先验三个可归因视图；三者通过同一个算子完成一次规范校正、裁剪和指数映射。
+
+pilot 保存完整兼容合同，覆盖域和轴、工区地震身份、层位内容、剖面路径、采样、场景、正演输入及阻抗标定身份。振幅先验只接受与当前配置完全一致的 pilot，并使用临时目录完成自校验后原子发布。
 
 空算子目录和空视图列表表示只生成 base。未声明的视图不计算，也不写入 HDF5。视图身份由规范化配置、科学合同和随机流合同共同计算 `view_spec_sha256`；随机系数不依赖视图列表顺序或其他视图是否存在。
 
@@ -104,6 +106,8 @@ HDF5 的主要结构为：
 `realization_index.csv` 一行一个成功父实现；`seismic_view_index.csv` 一行一个成功物化视图，base 不进入视图索引。索引只记录完整发布的行，失败 attempt 进入拒绝记录。
 
 父实现的 base 和全部声明视图在一个事务中提交。任一视图失败，当前父实现整体拒绝且不保留半成品；其他 attempt 可以继续。reader 按 v5 合同提供父实现和视图两层读取接口。
+
+单个实现无法获得完整正演上下文、随机层序无法成立、有效正演样点不足，或者某个视图无法覆盖该实现的公共有效区时，均作为当前实现的拒绝原因记录。此类情况不终止预检或生成循环。
 
 ## 评估与检查
 

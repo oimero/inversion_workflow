@@ -15,7 +15,7 @@ from cup.synthetic.core.amplitude_calibration import (
     build_amplitude_pilot_config,
     build_pilot_compatibility_contract,
     load_pilot_sections,
-    publish_amplitude_calibration,
+    publish_amplitude_prior,
     rgt_from_horizons,
     validate_amplitude_pilot,
 )
@@ -153,11 +153,12 @@ def _real_sections(
         axis, seismic = _bulk_bilinear_section(survey, geometry.inline_float, geometry.xline_float)
         rgt, valid = rgt_from_horizons(axis, geometry.horizon_twt_s)
         result.append(AmplitudeCalibrationSection(
-            curve_id=str(geometry.section_id),
+            field_id=str(geometry.section_id),
             section_id=str(geometry.section_id),
             seismic=seismic,
             rgt=rgt,
             valid_mask=valid,
+            lateral_m=geometry.lateral_m,
         ))
     return result
 
@@ -204,7 +205,7 @@ def run_time_amplitude_calibration(
     }
     data_root = resolve_relative_path(workflow.data_root, root=repo_root)
     seismic_path = resolve_relative_path(workflow.seismic.file, root=data_root)
-    return publish_amplitude_calibration(
+    return publish_amplitude_prior(
         output_dir=output_dir,
         repo_root=repo_root,
         sample_domain="time",

@@ -9,7 +9,7 @@ Usage::
         --impedance-calibration <file> --pilot-benchmark <run-dir>
     python scripts/synthoseis_lite.py --config <file> generate \
         --impedance-calibration <file> \
-        --seismic-amplitude-calibration <file>
+        --seismic-amplitude-prior <file>
 
 The ``synthoseis_lite.sample_domain`` and ``benchmark_schema`` keys explicitly
 select the primary time-domain or depth-domain extension branch.
@@ -84,13 +84,13 @@ def parse_args() -> argparse.Namespace:
     pilot.add_argument("--impedance-calibration", type=Path, required=True)
     amplitude = subparsers.add_parser(
         "calibrate-amplitude",
-        help="Calibrate the shared real-minus-pilot RGT amplitude pattern.",
+        help="Calibrate the shared real-minus-pilot seismic amplitude prior.",
     )
     amplitude.add_argument("--impedance-calibration", type=Path, required=True)
     amplitude.add_argument("--pilot-benchmark", type=Path, required=True)
     generate = subparsers.add_parser("generate", help="Generate one configured benchmark suite.")
     generate.add_argument("--impedance-calibration", type=Path, required=True)
-    generate.add_argument("--seismic-amplitude-calibration", type=Path, default=None)
+    generate.add_argument("--seismic-amplitude-prior", type=Path, default=None)
     generate.add_argument(
         "--debug-attempt-limit",
         type=_positive_int_arg,
@@ -268,10 +268,10 @@ def main() -> None:
                 forward_inputs=forward_inputs,
                 config_provenance=config_provenance,
                 calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
-                amplitude_calibration_path=(
+                amplitude_prior_path=(
                     None
-                    if args.seismic_amplitude_calibration is None
-                    else resolve_relative_path(args.seismic_amplitude_calibration, root=REPO_ROOT)
+                    if args.seismic_amplitude_prior is None
+                    else resolve_relative_path(args.seismic_amplitude_prior, root=REPO_ROOT)
                 ),
                 repo_root=REPO_ROOT,
                 output_dir=output_dir,
@@ -330,10 +330,10 @@ def main() -> None:
             sources=sources,
             config_provenance=config_provenance,
             calibration_path=calibration,
-            amplitude_calibration_path=(
+            amplitude_prior_path=(
                 None
-                if args.seismic_amplitude_calibration is None
-                else resolve_relative_path(args.seismic_amplitude_calibration, root=REPO_ROOT)
+                if args.seismic_amplitude_prior is None
+                else resolve_relative_path(args.seismic_amplitude_prior, root=REPO_ROOT)
             ),
             repo_root=REPO_ROOT,
             output_dir=output_dir,

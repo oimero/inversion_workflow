@@ -260,12 +260,12 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if calibration.get("background_estimator") != "per_well_zone_huber":
         raise ValueError("calibration.background_estimator must be per_well_zone_huber.")
 
-    has_empirical = any(
-        isinstance(item, Mapping) and item.get("kind") == "empirical_rgt_gain"
+    has_calibrated = any(
+        isinstance(item, Mapping) and item.get("kind") == "calibrated_rgt_gain"
         for item in dict(view_config.get("operators") or {}).values()
     )
     amplitude = parse_amplitude_calibration_controls(
-        root.get("amplitude_calibration"), required=has_empirical
+        root.get("amplitude_calibration"), required=has_calibrated
     )
 
     impedance = _mapping(root.get("impedance_attribute_generator"), path="synthoseis_lite.impedance_attribute_generator")

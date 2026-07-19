@@ -188,12 +188,12 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     views = _mapping(root.get("seismic_views"), path="seismic_views")
     resolve_view_specs(views)
     validate_view_units(views, axis_unit="s")
-    has_empirical = any(
-        isinstance(item, Mapping) and item.get("kind") == "empirical_rgt_gain"
+    has_calibrated = any(
+        isinstance(item, Mapping) and item.get("kind") == "calibrated_rgt_gain"
         for item in dict(views.get("operators") or {}).values()
     )
     amplitude = parse_amplitude_calibration_controls(
-        root.get("amplitude_calibration"), required=has_empirical
+        root.get("amplitude_calibration"), required=has_calibrated
     )
     figures = _mapping(root.get("figures"), path="figures")
     _reject_unknown(figures, {"enabled", "max_example_objects_per_zone_state", "report_examples"}, path="figures")

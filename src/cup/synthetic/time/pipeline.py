@@ -187,7 +187,7 @@ class TimeGenerationSession:
         sources: Mapping[str, Path],
         config_provenance: Mapping[str, str],
         calibration_path: Path,
-        amplitude_calibration_path: Path | None = None,
+        amplitude_prior_path: Path | None = None,
         repo_root: Path,
         debug_attempt_limit: int | None = None,
         geometry_families: Sequence[str] | None = None,
@@ -200,24 +200,24 @@ class TimeGenerationSession:
             sources=sources,
             repo_root=repo_root,
         )
-        from cup.synthetic.core.amplitude_calibration import resolve_empirical_seismic_views
+        from cup.synthetic.core.amplitude_calibration import resolve_calibrated_seismic_views
         from cup.synthetic.time.amplitude_calibration import time_pilot_compatibility
 
-        resolved_views, amplitude_provenance = resolve_empirical_seismic_views(
+        resolved_views, amplitude_provenance = resolve_calibrated_seismic_views(
             script_cfg["seismic_views"],
-            calibration_path=amplitude_calibration_path,
+            prior_path=amplitude_prior_path,
             repo_root=repo_root,
             sample_domain="time",
             ordered_horizons=[str(item["name"]) for item in script_cfg["horizons"]],
         )
         if amplitude_provenance is not None:
-            input_contracts["seismic_amplitude_calibration"] = {
+            input_contracts["seismic_amplitude_prior"] = {
                 "path": str(amplitude_provenance["path"]),
                 "contract_fingerprint_sha256": str(
                     amplitude_provenance["contract_fingerprint_sha256"]
                 ),
                 "artifact_sha256": str(amplitude_provenance["artifact_sha256"]),
-                "template_sha256": str(amplitude_provenance["template_sha256"]),
+                "prior_sha256": str(amplitude_provenance["prior_sha256"]),
             }
         wavelet_time, wavelet = load_wavelet_csv(
             sources["wavelet_generation_dir"] / "selected_wavelet.csv"
@@ -408,7 +408,7 @@ def run_generation(
     sources: Mapping[str, Path],
     config_provenance: Mapping[str, str],
     calibration_path: Path,
-    amplitude_calibration_path: Path | None = None,
+    amplitude_prior_path: Path | None = None,
     repo_root: Path,
     output_dir: Path,
     debug_attempt_limit: int | None = None,
@@ -423,7 +423,7 @@ def run_generation(
             "sources": sources,
             "config_provenance": config_provenance,
             "calibration_path": calibration_path,
-            "amplitude_calibration_path": amplitude_calibration_path,
+            "amplitude_prior_path": amplitude_prior_path,
             "repo_root": repo_root,
         }
     )
@@ -438,6 +438,6 @@ def run_generation(
         sources=sources,
         config_provenance=config_provenance,
         calibration_path=calibration_path,
-        amplitude_calibration_path=amplitude_calibration_path,
+        amplitude_prior_path=amplitude_prior_path,
         repo_root=repo_root,
     )

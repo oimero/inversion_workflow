@@ -99,7 +99,7 @@ def operator_rng(
     return named_rng(
         global_seed=global_seed,
         benchmark_version="synthoseis_lite_v5",
-        science_revision="synthoseis_lite_science_v3",
+        science_revision="synthoseis_lite_science_v4",
         random_stream_contract_version="synthoseis_random_v3",
         generator_family=generator_family,
         stream_purpose="seismic_view_operator",

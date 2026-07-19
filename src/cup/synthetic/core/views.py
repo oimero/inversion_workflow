@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 from cup.synthetic.schemas import (
     RANDOM_STREAM_CONTRACT_VERSION,
     SCIENCE_REVISION,
+    SEISMIC_AMPLITUDE_PRIOR_SCHEMA_VERSION,
     SEISMIC_OPERATOR_CONTRACT_VERSION,
     SEISMIC_VIEW_CONTRACT_VERSION,
 )
@@ -26,8 +27,7 @@ SAMPLED_SEISMIC_KINDS = frozenset(
         "global_gain",
         "tracewise_gain",
         "axis_lateral_gain",
-        "rgt_lateral_gain",
-        "empirical_rgt_gain",
+        "calibrated_rgt_gain",
         "additive_white_noise",
         "additive_colored_noise",
     }
@@ -182,74 +182,41 @@ def _validate_operator_parameters(operator_id: str, spec: Mapping[str, Any]) -> 
             value = finite_number("axis_correlation_fraction", positive=True)
             if value > 1.0:
                 raise ValueError(f"seismic operator {operator_id!r}.axis_correlation_fraction must be <= 1")
-    elif kind == "rgt_lateral_gain":
-        sigma_keys = (
-            "rgt_log_sigma",
-            "lateral_log_sigma",
-            "interaction_log_sigma",
-        )
-        sigma_values = [finite_number(key) for key in sigma_keys]
-        if any(value < 0.0 for value in sigma_values):
-            raise ValueError(
-                f"seismic operator {operator_id!r} gain sigmas must be non-negative"
-            )
-        if not any(value > 0.0 for value in sigma_values):
-            raise ValueError(
-                f"seismic operator {operator_id!r} requires at least one positive gain sigma"
-            )
-        for key in (
-            "rgt_correlation_length",
-            "lateral_correlation_length_m",
-            "interaction_rgt_correlation_length",
-            "interaction_lateral_correlation_length_m",
-            "max_abs_log_gain",
-        ):
-            finite_number(key, positive=True)
-        try:
-            rank = int(spec["interaction_rank"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"seismic operator {operator_id!r}.interaction_rank must be an integer"
-            ) from exc
-        if isinstance(spec["interaction_rank"], bool) or rank != spec["interaction_rank"] or rank < 1:
-            raise ValueError(
-                f"seismic operator {operator_id!r}.interaction_rank must be a positive integer"
-            )
-    elif kind == "empirical_rgt_gain":
+    elif kind == "calibrated_rgt_gain":
         source = str(spec.get("parameter_source") or "")
-        if source != "seismic_amplitude_calibration":
+        if source != "seismic_amplitude_prior":
             raise ValueError(
                 f"seismic operator {operator_id!r}.parameter_source must be "
-                "'seismic_amplitude_calibration'"
+                "'seismic_amplitude_prior'"
             )
-        scale = finite_number("mean_pattern_scale", positive=True)
-        if scale > 1.0:
-            raise ValueError(
-                f"seismic operator {operator_id!r}.mean_pattern_scale must be <= 1"
-            )
+        scales = [finite_number(key) for key in ("mean_scale", "residual_scale")]
+        if any(value < 0.0 or value > 1.0 for value in scales) or not any(value > 0.0 for value in scales):
+            raise ValueError(f"seismic operator {operator_id!r} scales must lie in [0, 1] with one positive")
         resolved_keys = {
-            "calibration_schema_version",
-            "calibration_artifact_sha256",
-            "calibration_contract_fingerprint_sha256",
-            "template_sha256",
-            "rgt_knots",
-            "mean_log_gain_rgt",
+            "prior_schema_version", "prior_artifact_sha256",
+            "prior_contract_fingerprint_sha256", "prior_sha256",
+            "mean_model", "residual_model", "max_abs_log_gain",
         }
         present = resolved_keys.intersection(spec)
         if present and present != resolved_keys:
             raise ValueError(
-                f"seismic operator {operator_id!r} has an incomplete resolved amplitude template"
+                f"seismic operator {operator_id!r} has an incomplete resolved amplitude prior"
             )
         if present:
-            knots = [float(value) for value in spec["rgt_knots"]]
-            template = [float(value) for value in spec["mean_log_gain_rgt"]]
+            if spec["prior_schema_version"] != SEISMIC_AMPLITUDE_PRIOR_SCHEMA_VERSION:
+                raise ValueError(
+                    f"seismic operator {operator_id!r} resolved prior schema is unsupported"
+                )
+            mean_model = dict(spec["mean_model"])
+            knots = [float(value) for value in mean_model["rgt_knots"]]
+            template = [float(value) for value in mean_model["mean_log_gain_rgt"]]
             if len(knots) < 2 or len(knots) != len(template):
                 raise ValueError(
-                    f"seismic operator {operator_id!r} resolved template arrays are misaligned"
+                    f"seismic operator {operator_id!r} resolved prior arrays are misaligned"
                 )
             if any(not math.isfinite(value) for value in knots + template):
                 raise ValueError(
-                    f"seismic operator {operator_id!r} resolved template must be finite"
+                    f"seismic operator {operator_id!r} resolved prior must be finite"
                 )
             if any(right <= left for left, right in zip(knots, knots[1:])):
                 raise ValueError(
@@ -257,7 +224,81 @@ def _validate_operator_parameters(operator_id: str, spec: Mapping[str, Any]) -> 
                 )
             if abs(float(statistics.median(template))) > 1e-10:
                 raise ValueError(
-                    f"seismic operator {operator_id!r} resolved template violates its zero-median gauge"
+                    f"seismic operator {operator_id!r} resolved prior violates its zero-median gauge"
+                )
+            finite_number("max_abs_log_gain", positive=True)
+            residual_model = dict(spec["residual_model"])
+            if set(residual_model) != {
+                "rgt_component", "lateral_component", "interaction_component"
+            }:
+                raise ValueError(
+                    f"seismic operator {operator_id!r} residual prior is incomplete"
+                )
+            for component_name, length_name in (
+                ("rgt_component", "correlation_length_rgt"),
+                ("lateral_component", "correlation_length_m"),
+            ):
+                component = dict(residual_model[component_name])
+                enabled = component.get("enabled")
+                if not isinstance(enabled, bool):
+                    raise ValueError(
+                        f"seismic operator {operator_id!r}.{component_name}.enabled must be boolean"
+                    )
+                sigma = float(component.get("log_sigma"))
+                length = component.get(length_name)
+                if not math.isfinite(sigma) or sigma < 0.0:
+                    raise ValueError(
+                        f"seismic operator {operator_id!r}.{component_name}.log_sigma is invalid"
+                    )
+                if enabled and (
+                    sigma <= 0.0
+                    or length is None
+                    or not math.isfinite(float(length))
+                    or float(length) <= 0.0
+                ):
+                    raise ValueError(
+                        f"seismic operator {operator_id!r}.{component_name} enabled parameters are invalid"
+                    )
+                if not enabled and sigma != 0.0:
+                    raise ValueError(
+                        f"seismic operator {operator_id!r}.{component_name} disabled sigma must be zero"
+                    )
+            interaction = dict(residual_model["interaction_component"])
+            enabled = interaction.get("enabled")
+            if not isinstance(enabled, bool):
+                raise ValueError(
+                    f"seismic operator {operator_id!r}.interaction_component.enabled must be boolean"
+                )
+            rank = int(interaction.get("rank", -1))
+            modes = interaction.get("rgt_modes")
+            eigenvalues = interaction.get("eigenvalues")
+            lengths = interaction.get("lateral_correlation_lengths_m")
+            if not all(isinstance(item, Sequence) for item in (modes, eigenvalues, lengths)):
+                raise ValueError(
+                    f"seismic operator {operator_id!r} interaction arrays are invalid"
+                )
+            if enabled:
+                if (
+                    rank < 1
+                    or len(modes) != rank
+                    or len(eigenvalues) != rank
+                    or len(lengths) != rank
+                    or any(len(mode) != len(knots) for mode in modes)
+                    or any(
+                        not math.isfinite(float(value))
+                        for mode in modes for value in mode
+                    )
+                    or any(
+                        not math.isfinite(float(value)) or float(value) <= 0.0
+                        for value in [*eigenvalues, *lengths]
+                    )
+                ):
+                    raise ValueError(
+                        f"seismic operator {operator_id!r} enabled interaction prior is invalid"
+                    )
+            elif rank != 0 or modes or eigenvalues or lengths:
+                raise ValueError(
+                    f"seismic operator {operator_id!r} disabled interaction prior must be empty"
                 )
     elif kind == "additive_white_noise":
         finite_number("rms_fraction", positive=True)
@@ -319,14 +360,21 @@ class SeismicViewSpec:
         operator_parameters = {
             item: dict(self.operators[item]) for item in self.operator_ids
         }
-        random_identity = {
-            item: {
-                "operator_id": item,
-                "operator_spec_sha256": self.operator_spec_sha256(item),
-                "coefficient_namespace": "seismic_view_operator",
-            }
-            for item in self.operator_ids
-        }
+        random_identity = {}
+        for item in self.operator_ids:
+            operator = self.operators[item]
+            if operator["kind"] == "calibrated_rgt_gain":
+                random_identity[item] = {
+                    "operator_id": "calibrated_rgt_gain_prior",
+                    "operator_spec_sha256": operator.get("prior_sha256"),
+                    "coefficient_namespace": "paired_calibrated_rgt_gain_prior",
+                }
+            else:
+                random_identity[item] = {
+                    "operator_id": item,
+                    "operator_spec_sha256": self.operator_spec_sha256(item),
+                    "coefficient_namespace": "seismic_view_operator",
+                }
         return {
             "view_id": self.view_id,
             "operator_ids": list(self.operator_ids),
@@ -377,19 +425,11 @@ def resolve_view_specs(config: Mapping[str, Any]) -> tuple[SeismicViewSpec, ...]
             "global_gain": {"kind", "log_sigma"},
             "tracewise_gain": {"kind", "log_sigma", "lateral_correlation_fraction"},
             "axis_lateral_gain": {"kind", "log_sigma", "lateral_correlation_fraction", "axis_correlation_fraction"},
-            "rgt_lateral_gain": {
-                "kind", "rgt_log_sigma", "rgt_correlation_length",
-                "lateral_log_sigma", "lateral_correlation_length_m",
-                "interaction_log_sigma", "interaction_rank",
-                "interaction_rgt_correlation_length",
-                "interaction_lateral_correlation_length_m",
-                "max_abs_log_gain",
-            },
-            "empirical_rgt_gain": {
-                "kind", "parameter_source", "mean_pattern_scale",
-                "calibration_schema_version", "calibration_artifact_sha256",
-                "calibration_contract_fingerprint_sha256", "template_sha256",
-                "rgt_knots", "mean_log_gain_rgt",
+            "calibrated_rgt_gain": {
+                "kind", "parameter_source", "mean_scale", "residual_scale",
+                "prior_schema_version", "prior_artifact_sha256",
+                "prior_contract_fingerprint_sha256", "prior_sha256",
+                "mean_model", "residual_model", "max_abs_log_gain",
             },
             "additive_white_noise": {"kind", "rms_fraction"},
             "additive_colored_noise": {"kind", "rms_fraction", "axis_correlation"},
@@ -404,15 +444,7 @@ def resolve_view_specs(config: Mapping[str, Any]) -> tuple[SeismicViewSpec, ...]
             "global_gain": {"log_sigma"},
             "tracewise_gain": {"log_sigma", "lateral_correlation_fraction"},
             "axis_lateral_gain": {"log_sigma", "lateral_correlation_fraction", "axis_correlation_fraction"},
-            "rgt_lateral_gain": {
-                "rgt_log_sigma", "rgt_correlation_length",
-                "lateral_log_sigma", "lateral_correlation_length_m",
-                "interaction_log_sigma", "interaction_rank",
-                "interaction_rgt_correlation_length",
-                "interaction_lateral_correlation_length_m",
-                "max_abs_log_gain",
-            },
-            "empirical_rgt_gain": {"parameter_source", "mean_pattern_scale"},
+            "calibrated_rgt_gain": {"parameter_source", "mean_scale", "residual_scale"},
             "additive_white_noise": {"rms_fraction"},
             "additive_colored_noise": {"rms_fraction", "axis_correlation"},
         }

@@ -10,6 +10,7 @@ from scipy.signal import resample_poly
 
 from cup.physics.numpy_backend import forward_time
 from cup.synthetic.core.signal import finite_support_fir, valid_filter_decimate
+from cup.synthetic.core.rejections import ForwardRejected
 
 
 def antialias_taps(
@@ -155,7 +156,13 @@ def highres_forward_to_model_grid(
         raise ValueError("invalid_highres_forward_alignment")
     mask = valid & decimation_support[None, :] & np.isfinite(reference) & np.isfinite(downsampled)
     if np.count_nonzero(mask) < 3:
-        raise ValueError("insufficient_highres_forward_qc_samples")
+        reason = "insufficient_highres_forward_qc_samples"
+        diagnostics = {"valid_sample_count": int(np.count_nonzero(mask))}
+        raise ForwardRejected(
+            [reason],
+            diagnostics=diagnostics,
+            details=[{"reason": reason, **diagnostics}],
+        )
     ref_values = reference[mask]
     test_values = downsampled[mask]
     difference = test_values - ref_values

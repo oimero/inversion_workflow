@@ -253,7 +253,12 @@ def _sample_object_sequence(
         consumed += duration
         state = int(initial_rng.choice(3, p=transition[state]))
     if not objects or not np.isclose(sum(item["base_duration"] for item in objects), 1.0, atol=1e-8):
-        raise ValueError(f"invalid_state_sequence:{zone_id}")
+        reason = f"invalid_state_sequence:{zone_id}"
+        raise TruthGenerationRejected(
+            [reason],
+            diagnostics={"zone_id": zone_id},
+            details=[{"reason": reason, "zone_id": zone_id}],
+        )
     return objects
 
 

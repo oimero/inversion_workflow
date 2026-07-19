@@ -12,7 +12,6 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
-import shutil
 from typing import Any, Mapping, Sequence
 import uuid
 
@@ -28,6 +27,7 @@ from cup.synthetic.schemas import (
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
+    is_consumable_contract_status,
     repo_relative_path,
     require_contract_fingerprint,
     resolve_relative_path,
@@ -191,8 +191,14 @@ def validate_amplitude_pilot(
 ) -> dict[str, Any]:
     summary = json.loads((pilot_dir / "run_summary.json").read_text(encoding="utf-8"))
     require_science_contract(summary, label="amplitude pilot benchmark")
-    if summary.get("status") != "success" or summary.get("sample_domain") != sample_domain:
-        raise ValueError(f"amplitude pilot must be a successful formal {sample_domain} benchmark")
+    status = str(summary.get("status") or "")
+    if status not in {"success", "completed_with_warnings"}:
+        raise ValueError(
+            "amplitude pilot must be a completed formal benchmark; "
+            f"got status={status!r}"
+        )
+    if summary.get("sample_domain") != sample_domain:
+        raise ValueError(f"amplitude pilot sample domain must be {sample_domain!r}")
     if int(summary.get("seismic_view_count", -1)) != 0:
         raise ValueError("amplitude pilot must contain no views")
     if dict(summary.get("amplitude_pilot_compatibility") or {}) != dict(expected_compatibility):
@@ -258,14 +264,34 @@ def _curves(
     knots: np.ndarray,
     minimum_samples: int,
     source: str,
-) -> tuple[dict[str, np.ndarray], list[dict[str, Any]]]:
+) -> tuple[dict[str, np.ndarray], list[dict[str, Any]], list[dict[str, Any]]]:
     curves: dict[str, np.ndarray] = {}
     rows: list[dict[str, Any]] = []
+    qc_rows: list[dict[str, Any]] = []
     for section in sections:
-        curve, counts = _coarse_log_rms_curve(
-            section, knots, minimum_samples=minimum_samples
-        )
+        try:
+            curve, counts = _coarse_log_rms_curve(
+                section, knots, minimum_samples=minimum_samples
+            )
+        except ValueError as exc:
+            qc_rows.append({
+                "source": source,
+                "curve_id": section.curve_id,
+                "section_id": section.section_id,
+                "scenario_id": section.scenario_id,
+                "status": "warning_excluded_from_fit",
+                "warning": str(exc),
+            })
+            continue
         curves[section.curve_id] = curve
+        qc_rows.append({
+            "source": source,
+            "curve_id": section.curve_id,
+            "section_id": section.section_id,
+            "scenario_id": section.scenario_id,
+            "status": "used",
+            "warning": "",
+        })
         rows.extend(
             {
                 "source": source,
@@ -278,7 +304,7 @@ def _curves(
             }
             for knot, value, count in zip(knots, curve, counts)
         )
-    return curves, rows
+    return curves, rows, qc_rows
 
 
 def _stratified_pilot_location(
@@ -320,21 +346,25 @@ def fit_amplitude_template(
     pilot_sections: Sequence[AmplitudeCalibrationSection],
     n_zones: int,
     controls: Mapping[str, Any],
-) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if not real_sections or not pilot_sections:
         raise ValueError("amplitude calibration requires real and pilot sections")
     knots = np.linspace(0.0, float(n_zones), int(controls["rgt_node_count"]))
     minimum = int(controls["minimum_samples_per_node"])
-    real_curves, real_rows = _curves(real_sections, knots, minimum, "real")
-    pilot_curves, pilot_rows = _curves(pilot_sections, knots, minimum, "pilot")
+    real_curves, real_rows, real_qc = _curves(real_sections, knots, minimum, "real")
+    pilot_curves, pilot_rows, pilot_qc = _curves(pilot_sections, knots, minimum, "pilot")
+    if not real_curves or not pilot_curves:
+        raise ValueError("amplitude calibration has no usable real or pilot curves")
+    usable_real_sections = [item for item in real_sections if item.curve_id in real_curves]
+    usable_pilot_sections = [item for item in pilot_sections if item.curve_id in pilot_curves]
     real_by_section: dict[str, list[np.ndarray]] = {}
-    for section in real_sections:
+    for section in usable_real_sections:
         real_by_section.setdefault(section.section_id, []).append(real_curves[section.curve_id])
     real_location = np.median(
         np.vstack([np.median(np.vstack(values), axis=0) for _, values in sorted(real_by_section.items())]),
         axis=0,
     )
-    pilot_location, stratum_qc = _stratified_pilot_location(pilot_sections, pilot_curves)
+    pilot_location, stratum_qc = _stratified_pilot_location(usable_pilot_sections, pilot_curves)
     for row in stratum_qc:
         row["planned_realizations"] = int(controls["pilot_attempts_per_scenario"])
         row["acceptance_fraction"] = (
@@ -366,7 +396,7 @@ def fit_amplitude_template(
                 1.4826 * np.median(np.abs(residual - np.median(residual)))
             ),
             "n_real_sections": len(real_by_section),
-            "n_pilot_realizations": len(pilot_sections),
+            "n_pilot_realizations": len(usable_pilot_sections),
         },
     }
     summary = pd.DataFrame({
@@ -377,7 +407,13 @@ def fit_amplitude_template(
         "smoothed_mean_log_gain": smoothed,
         "mean_log_gain": template,
     })
-    return result, pd.DataFrame(real_rows + pilot_rows), summary, pd.DataFrame(stratum_qc)
+    return (
+        result,
+        pd.DataFrame(real_rows + pilot_rows),
+        summary,
+        pd.DataFrame(stratum_qc),
+        pd.DataFrame(real_qc + pilot_qc),
+    )
 
 
 def publish_amplitude_calibration(
@@ -402,7 +438,7 @@ def publish_amplitude_calibration(
     staging = output_dir.with_name(f".{output_dir.name}.staging-{uuid.uuid4().hex}")
     staging.mkdir(parents=True, exist_ok=False)
     try:
-        fit, curves, summary_frame, strata = fit_amplitude_template(
+        fit, curves, summary_frame, strata, curve_qc = fit_amplitude_template(
             real_sections=real_sections,
             pilot_sections=pilot_sections,
             n_zones=len(ordered_horizons) - 1,
@@ -428,10 +464,12 @@ def publish_amplitude_calibration(
         curves_path = staging / "amplitude_curves_by_source.csv"
         summary_path = staging / "rgt_amplitude_summary.csv"
         strata_path = staging / "pilot_stratum_weights.csv"
+        curve_qc_path = staging / "amplitude_curve_qc.csv"
         write_json(artifact, payload)
         curves.to_csv(curves_path, index=False)
         summary_frame.to_csv(summary_path, index=False)
         strata.to_csv(strata_path, index=False)
+        curve_qc.to_csv(curve_qc_path, index=False)
         fingerprint = contract_fingerprint_sha256(
             contract_schema_version=SCHEMA_VERSION,
             semantics={
@@ -450,13 +488,18 @@ def publish_amplitude_calibration(
                 "amplitude_curves_by_source": curves_path,
                 "rgt_amplitude_summary": summary_path,
                 "pilot_stratum_weights": strata_path,
+                "amplitude_curve_qc": curve_qc_path,
             },
         )
         published_artifact = output_dir / artifact.name
+        excluded_curve_count = int((curve_qc["status"] != "used").sum())
         run_summary = {
             "schema_version": SCHEMA_VERSION,
             **SCIENCE_CONTRACT,
-            "status": "success",
+            "status": "completed_with_warnings" if excluded_curve_count else "success",
+            "usable": True,
+            "quality_warnings": [] if not excluded_curve_count else ["amplitude_curves_excluded_for_insufficient_support"],
+            "excluded_curve_count": excluded_curve_count,
             "sample_domain": sample_domain,
             "sample_unit": sample_unit,
             "axis_basis": axis_basis,
@@ -470,14 +513,20 @@ def publish_amplitude_calibration(
                 "amplitude_curves_by_source": repo_relative_path(output_dir / curves_path.name, root=repo_root),
                 "rgt_amplitude_summary": repo_relative_path(output_dir / summary_path.name, root=repo_root),
                 "pilot_stratum_weights": repo_relative_path(output_dir / strata_path.name, root=repo_root),
+                "amplitude_curve_qc": repo_relative_path(output_dir / curve_qc_path.name, root=repo_root),
             },
         }
         write_json(staging / "run_summary.json", run_summary)
         _validate_calibration_payload(payload, expected_domain=sample_domain)
         staging.replace(output_dir)
         return run_summary
-    except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
+    except Exception as exc:
+        write_json(staging / "run_failure.json", {
+            "status": "failed",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "staging_preserved": True,
+        })
         raise
 
 
@@ -520,8 +569,8 @@ def load_seismic_amplitude_calibration(
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     _validate_calibration_payload(payload, expected_domain=expected_domain)
     require_science_contract(summary, label="seismic amplitude calibration summary")
-    if summary.get("schema_version") != SCHEMA_VERSION or summary.get("status") != "success":
-        raise ValueError("seismic amplitude calibration summary is not successful")
+    if summary.get("schema_version") != SCHEMA_VERSION or not is_consumable_contract_status(summary.get("status")):
+        raise ValueError("seismic amplitude calibration summary is not consumable")
     recorded = resolve_relative_path(
         str(dict(summary.get("outputs") or {}).get("seismic_amplitude_calibration") or ""),
         root=repo_root,

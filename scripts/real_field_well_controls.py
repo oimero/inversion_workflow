@@ -26,7 +26,12 @@ if str(SRC_DIR) not in sys.path:
 from cup.config.sources import resolve_source_file_from_run
 from cup.config.workflow import WorkflowConfig, deep_merge_dict
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.utils.io import latest_checked_run, load_yaml_config, resolve_relative_path
+from cup.utils.io import (
+    is_consumable_contract_status,
+    latest_checked_run,
+    load_yaml_config,
+    resolve_relative_path,
+)
 from cup.well.real_field_controls import (
     DEPTH_SOURCE_SCHEMA,
     TIME_SOURCE_SCHEMA,
@@ -62,7 +67,7 @@ def _source_validator(*, source_run_type: str, domain: str, depth_basis: str | N
             raise ValueError(f"schema_version is not {expected_schema}")
         if summary.get("sample_domain") != domain or summary.get("depth_basis") != depth_basis:
             raise ValueError("source domain/depth_basis does not match workflow seismic")
-        if summary.get("status") not in {"ok", "success"}:
+        if not is_consumable_contract_status(summary.get("status")):
             raise ValueError("source run is not successful")
 
     return validate

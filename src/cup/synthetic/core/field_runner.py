@@ -37,7 +37,7 @@ PROGRESS_COLUMNS = (
     "scenario_rejected_count",
     "scenario_acceptance_fraction",
     "scenario_max_possible_acceptance_fraction",
-    "failure_threshold_reachable",
+    "severe_warning_threshold_reachable",
     "warning_threshold_reachable",
 )
 
@@ -86,7 +86,7 @@ class AttemptProgressLog:
             key: {"completed": 0, "accepted": 0, "rejected": 0}
             for key in self.scenario_totals
         }
-        self._failure_unreachable_reported: set[tuple[str, str]] = set()
+        self._severe_warning_unreachable_reported: set[tuple[str, str]] = set()
         self._warning_unreachable_reported: set[tuple[str, str]] = set()
         mode = "a" if append else "w"
         write_header = (not append) or (not self.path.exists()) or self.path.stat().st_size == 0
@@ -128,7 +128,7 @@ class AttemptProgressLog:
         total = self.scenario_totals[key]
         acceptance = counts["accepted"] / counts["completed"]
         maximum = (counts["accepted"] + total - counts["completed"]) / total
-        failure = float(self.qc["failure_fraction"])
+        severe_warning = float(self.qc["severe_warning_fraction"])
         warning = float(self.qc["warning_fraction"])
         payload = {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -151,7 +151,7 @@ class AttemptProgressLog:
             "scenario_rejected_count": counts["rejected"],
             "scenario_acceptance_fraction": acceptance,
             "scenario_max_possible_acceptance_fraction": maximum,
-            "failure_threshold_reachable": bool(maximum >= failure),
+            "severe_warning_threshold_reachable": bool(maximum >= severe_warning),
             "warning_threshold_reachable": bool(maximum >= warning),
         }
         self._writer.writerow(payload)
@@ -171,15 +171,15 @@ class AttemptProgressLog:
             counts["completed"],
             maximum,
         )
-        if maximum < failure and key not in self._failure_unreachable_reported:
-            self._failure_unreachable_reported.add(key)
+        if maximum < severe_warning and key not in self._severe_warning_unreachable_reported:
+            self._severe_warning_unreachable_reported.add(key)
             self.logger.warning(
-                "%s scenario can no longer reach failure threshold: "
+                "%s scenario can no longer reach severe-warning threshold: "
                 "scenario=%s max_possible=%.3f threshold=%.3f",
                 self.phase,
                 key[1],
                 maximum,
-                failure,
+                severe_warning,
             )
         if maximum < warning and key not in self._warning_unreachable_reported:
             self._warning_unreachable_reported.add(key)
@@ -231,14 +231,14 @@ def build_acceptance_catalog(
         catalog["acceptance_status"] = "development_limit_no_verdict"
         return catalog
     minimum = int(qc_config["minimum_attempts_per_scenario"])
-    failure = float(qc_config["failure_fraction"])
+    severe_warning = float(qc_config["severe_warning_fraction"])
     warning = float(qc_config["warning_fraction"])
     catalog["acceptance_status"] = np.where(
         catalog["attempt_count"] < minimum,
-        "insufficient_attempts",
+        "insufficient_coverage",
         np.where(
-            catalog["acceptance_fraction"] < failure,
-            "failed",
+            catalog["acceptance_fraction"] < severe_warning,
+            "severe_warning",
             np.where(
                 catalog["acceptance_fraction"] < warning,
                 "warning",
@@ -257,10 +257,10 @@ class PreflightResult:
     rejection_details: list[dict[str, Any]]
 
     @property
-    def failed(self) -> pd.DataFrame:
+    def warnings(self) -> pd.DataFrame:
         return self.catalog[
             self.catalog["acceptance_status"].isin(
-                {"failed", "insufficient_attempts"}
+                {"severe_warning", "insufficient_coverage"}
             )
         ].copy()
 
@@ -335,14 +335,14 @@ def run_attempt_preflight(
     accepted_plan = plan[
         plan["parent_realization_id"].astype(str).isin(set(accepted_ids))
     ].reset_index(drop=True)
-    failed_count = int(
-        catalog["acceptance_status"].isin({"failed", "insufficient_attempts"}).sum()
+    severe_warning_count = int(
+        catalog["acceptance_status"].isin({"severe_warning", "insufficient_coverage"}).sum()
     )
     logger.info(
-        "preflight finished: accepted=%d rejected=%d failed_scenarios=%d",
+        "preflight finished: accepted=%d rejected=%d severe_warning_scenarios=%d",
         len(accepted_plan),
         len(plan) - len(accepted_plan),
-        failed_count,
+        severe_warning_count,
     )
     return PreflightResult(
         accepted_plan=accepted_plan,
@@ -350,13 +350,6 @@ def run_attempt_preflight(
         catalog=catalog,
         rejection_details=rejection_details,
     )
-
-
-def acceptance_enforcement(qc_config: Mapping[str, Any]) -> str:
-    value = str(qc_config.get("enforcement", "warn"))
-    if value not in {"warn", "fail_fast"}:
-        raise ValueError("acceptance_qc.enforcement must be warn or fail_fast.")
-    return value
 
 
 def stable_records_frame(
@@ -378,7 +371,6 @@ def stable_records_frame(
 __all__ = [
     "AttemptProgressLog",
     "PreflightResult",
-    "acceptance_enforcement",
     "build_acceptance_catalog",
     "configure_generation_logger",
     "run_attempt_preflight",

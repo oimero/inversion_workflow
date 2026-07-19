@@ -373,7 +373,11 @@ def _condition_c0_to_ai_bounds(
     elif state == "low_impedance":
         upper = min(upper, -float(np.mean(shape)) - state_epsilon)
     if lower > upper:
-        raise ValueError("invalid_object_profile:no_feasible_c0")
+        raise TruthGenerationRejected(
+            ["invalid_object_profile:no_feasible_c0"],
+            diagnostics={},
+            details=[{"reason": "invalid_object_profile:no_feasible_c0"}],
+        )
     original = float(output[0])
     output[0] = float(np.clip(original, lower, upper))
     return output, abs(float(output[0]) - original)
@@ -562,7 +566,11 @@ def _apply_geometry_event(
     others = np.delete(weights, target, axis=0)
     other_sum = np.sum(others, axis=0)
     if np.any(other_sum <= 0.0):
-        raise ValueError("invalid_layer_duration")
+        raise TruthGenerationRejected(
+            ["invalid_layer_duration"],
+            diagnostics={},
+            details=[{"reason": "invalid_layer_duration"}],
+        )
     result = weights.copy()
     result[target] = target_weight
     for index in range(result.shape[0]):
@@ -583,7 +591,11 @@ def _enforce_minimum_thickness(
     source = np.asarray(weights, dtype=np.float64)
     floor = np.asarray(minimum_fraction, dtype=np.float64).reshape(-1)
     if source.ndim != 2 or source.shape[1] != floor.size:
-        raise ValueError("invalid_layer_duration")
+        raise TruthGenerationRejected(
+            ["invalid_layer_duration"],
+            diagnostics={},
+            details=[{"reason": "invalid_layer_duration"}],
+        )
     output = np.empty_like(source)
     included = [index for index in range(source.shape[0]) if index != exempt_index]
     for lateral_index in range(source.shape[1]):
@@ -619,7 +631,11 @@ def _enforce_minimum_thickness(
         raw = source[included, lateral_index]
         raw_sum = float(np.sum(raw))
         if raw_sum <= 0.0:
-            raise ValueError("invalid_layer_duration")
+            raise TruthGenerationRejected(
+                ["invalid_layer_duration"],
+                diagnostics={},
+                details=[{"reason": "invalid_layer_duration"}],
+            )
         residual = max(available - required, 0.0)
         output[included, lateral_index] = float(floor[lateral_index]) + residual * raw / raw_sum
         if exempt_index is not None:
@@ -701,6 +717,7 @@ def generate_field_conditioned_truth(
     object_lateral_coefficients: list[dict[str, Any]] = []
     field_qc: list[dict[str, Any]] = []
     rejection_details: list[dict[str, Any]] = []
+    quality_warning_details: list[dict[str, Any]] = []
     next_global_object_id = 0
     total_clipping_count = 0
     total_truth_sample_count = 0
@@ -961,7 +978,7 @@ def generate_field_conditioned_truth(
                     }
                 )
             if object_reversal > max_object_reversal_fraction:
-                rejection_details.append(
+                quality_warning_details.append(
                     {
                         "reason": "excessive_object_reversal_fraction",
                         "zone_id": zone_id,
@@ -975,7 +992,7 @@ def generate_field_conditioned_truth(
                     }
                 )
             if object_clipping > max_object_clipping_fraction:
-                rejection_details.append(
+                quality_warning_details.append(
                     {
                         "reason": "excessive_object_clipping_fraction",
                         "zone_id": zone_id,
@@ -1061,7 +1078,11 @@ def generate_field_conditioned_truth(
     for lateral_index in range(n_lateral):
         valid = np.isfinite(log_ai[lateral_index])
         if not np.any(valid):
-            raise ValueError("invalid_impedance")
+            raise TruthGenerationRejected(
+                ["invalid_impedance"],
+                diagnostics={},
+                details=[{"reason": "invalid_impedance"}],
+            )
         first, last = np.flatnonzero(valid)[[0, -1]]
         log_ai[lateral_index, :first] = log_ai[lateral_index, first]
         log_ai[lateral_index, last + 1 :] = log_ai[lateral_index, last]
@@ -1070,7 +1091,7 @@ def generate_field_conditioned_truth(
     global_reversal = total_reversal_count / max(total_reversal_column_count, 1)
     global_clipping = total_clipping_count / max(total_truth_sample_count, 1)
     if global_reversal > max_global_reversal_fraction:
-        rejection_details.append(
+        quality_warning_details.append(
             {
                 "reason": "excessive_global_reversal_fraction",
                 "zone_id": "",
@@ -1084,7 +1105,7 @@ def generate_field_conditioned_truth(
             }
         )
     if global_clipping > max_global_clipping_fraction:
-        rejection_details.append(
+        quality_warning_details.append(
             {
                 "reason": "excessive_global_clipping_fraction",
                 "zone_id": "",
@@ -1183,6 +1204,8 @@ def generate_field_conditioned_truth(
         object_lateral_coefficients=tuple(object_lateral_coefficients),
         diagnostics={
             "status": "ok",
+            "quality_warning_count": len(quality_warning_details) + len(correlation_warnings),
+            "quality_warning_details": quality_warning_details,
             "global_reversal_fraction": global_reversal,
             "global_clipping_fraction": global_clipping,
             "maximum_object_reversal_fraction": max(

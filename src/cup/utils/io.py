@@ -257,6 +257,11 @@ CONSUMABLE_CONTRACT_STATUSES = frozenset(
     }
 )
 
+
+def is_consumable_contract_status(value: Any) -> bool:
+    """Return whether a published run may be consumed downstream."""
+    return str(value or "") in CONSUMABLE_CONTRACT_STATUSES
+
 _NON_BUSINESS_CONFIG_KEYS = {
     "created_at",
     "completed_at",

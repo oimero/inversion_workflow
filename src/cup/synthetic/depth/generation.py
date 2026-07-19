@@ -37,6 +37,7 @@ from cup.synthetic.adapters import DepthSyntheticDomainAdapter
 from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
 from cup.synthetic.core.random import RandomNamespace
 from cup.synthetic.core.records import DepthForwardExtras
+from cup.synthetic.core.rejections import ForwardRejected
 from cup.synthetic.core.sample_builder import (
     BenchmarkBuildPolicy,
     BenchmarkBuilder,
@@ -61,6 +62,7 @@ from cup.physics.execution import DepthForwardExecutor
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
+    is_consumable_contract_status,
     repo_relative_path,
     require_contract_fingerprint,
     resolve_relative_path,
@@ -367,8 +369,8 @@ class DepthGenerationSession:
         calibration_summary_path = calibration_path.parent / "run_summary.json"
         calibration_summary = json.loads(calibration_summary_path.read_text(encoding="utf-8"))
         require_science_contract(calibration_summary, label="depth calibration run summary")
-        if calibration_summary.get("schema_version") != CALIBRATION_SCHEMA or calibration_summary.get("status") != "success":
-            raise ValueError(f"Depth calibration run is not a successful {CALIBRATION_SCHEMA} contract.")
+        if calibration_summary.get("schema_version") != CALIBRATION_SCHEMA or not is_consumable_contract_status(calibration_summary.get("status")):
+            raise ValueError(f"Depth calibration run is not a consumable {CALIBRATION_SCHEMA} contract.")
         recorded_calibration_path = resolve_relative_path(
             str(dict(calibration_summary.get("outputs") or {}).get("impedance_calibration") or ""),
             root=repo_root,
@@ -519,7 +521,10 @@ class DepthGenerationSession:
                 observed = observed[..., : sample.forward.seismic_observed.shape[-1]]
                 support = np.broadcast_to(support_1d[: observed.shape[-1]], observed.shape)
                 if np.any(np.asarray(sample.valid_mask, dtype=bool) & ~support):
-                    raise ValueError("invalid_seismic_view:perturbed_wavelet_support_incomplete")
+                    reason = "invalid_seismic_view:perturbed_wavelet_support_incomplete"
+                    raise ForwardRejected(
+                        [reason], diagnostics={}, details=[{"reason": reason}]
+                    )
                 return observed, support
 
             return (

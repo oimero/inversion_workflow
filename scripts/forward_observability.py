@@ -1111,8 +1111,9 @@ def main() -> None:
             "source_run_mismatch: fifth-step evaluation clusters and batch metrics contain "
             "different well sets."
         )
+    source_quality_warnings: list[str] = []
     if not batch_metrics["status"].astype(str).str.casefold().eq("ok").all():
-        raise ValueError("source_run_mismatch: fifth-step batch metrics contain failed evaluation wells.")
+        source_quality_warnings.append("fifth_step_batch_contains_failed_evaluation_wells")
 
     wells = clusters.merge(
         metrics,
@@ -1315,7 +1316,7 @@ def main() -> None:
         nominal.time_s,
         nominal.amplitude,
     )
-    warnings: list[str] = []
+    warnings: list[str] = list(source_quality_warnings)
     if float(script_cfg["frequency"]["max_hz"]) > 1.5 * half_right_hz:
         warnings.append("configured_max_beyond_wavelet_support")
     rejection_counts = (
@@ -1328,7 +1329,8 @@ def main() -> None:
     )
     summary = {
         "schema_version": SCHEMA_VERSION,
-        "status": "success",
+        "status": "completed_with_warnings" if warnings else "success",
+        "usable": True,
         "config_file": repo_relative_path(config_path, root=REPO_ROOT),
         "source_runs": {
             key: repo_relative_path(path, root=REPO_ROOT) for key, path in sources.items()

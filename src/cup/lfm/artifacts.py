@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from cup.lfm.contracts import RUN_SCHEMA, VARIANT_SCHEMA
-from cup.utils.io import require_contract_fingerprint, resolve_relative_path
+from cup.utils.io import is_consumable_contract_status, require_contract_fingerprint, resolve_relative_path
 from cup.well.real_field_controls import SCHEMA_VERSION as WELL_CONTROL_SCHEMA
 
 
@@ -58,7 +58,7 @@ def resolve_lfm_variant(inputs: Mapping[str, Any], *, repo_root: Path) -> Resolv
         raise FileNotFoundError(f"Incomplete unified LFM run: {run_dir}")
     with run_summary_path.open("r", encoding="utf-8") as handle:
         summary = json.load(handle)
-    if summary.get("schema_version") != RUN_SCHEMA or summary.get("status") != "ok":
+    if summary.get("schema_version") != RUN_SCHEMA or not is_consumable_contract_status(summary.get("status")):
         raise ValueError(f"R0 accepts only successful {RUN_SCHEMA} runs.")
     require_contract_fingerprint(summary, label=f"LFM run {run_dir}")
 
@@ -85,7 +85,7 @@ def resolve_lfm_variant(inputs: Mapping[str, Any], *, repo_root: Path) -> Resolv
     if missing:
         raise ValueError(f"variant_manifest.csv is missing columns: {missing}")
     manifest_ids = manifest["variant_id"].astype(str)
-    if manifest_ids.duplicated().any() or not manifest["status"].astype(str).eq("ok").all():
+    if manifest_ids.duplicated().any() or not manifest["status"].map(is_consumable_contract_status).all():
         raise ValueError("Published variant manifest must contain unique, all-successful variants.")
     requested_ids = [str(value) for value in summary.get("requested_variant_ids") or []]
     if set(manifest_ids) != set(requested_ids) or len(manifest_ids) != len(requested_ids):
@@ -102,7 +102,7 @@ def resolve_lfm_variant(inputs: Mapping[str, Any], *, repo_root: Path) -> Resolv
         variant_summary = json.load(handle)
     if (
         variant_summary.get("schema_version") != VARIANT_SCHEMA
-        or variant_summary.get("status") != "ok"
+        or not is_consumable_contract_status(variant_summary.get("status"))
         or variant_summary.get("variant_id") != variant_id
     ):
         raise ValueError(f"Selected variant summary is invalid: {variant_id}")
@@ -204,7 +204,7 @@ def resolve_lfm_variant(inputs: Mapping[str, Any], *, repo_root: Path) -> Resolv
         raise FileNotFoundError(controls_summary_path)
     with controls_summary_path.open("r", encoding="utf-8") as handle:
         controls_summary = json.load(handle)
-    if controls_summary.get("schema_version") != WELL_CONTROL_SCHEMA or controls_summary.get("status") != "ok":
+    if controls_summary.get("schema_version") != WELL_CONTROL_SCHEMA or not is_consumable_contract_status(controls_summary.get("status")):
         raise ValueError(f"Configured well_control_run_dir is not a successful {WELL_CONTROL_SCHEMA} run.")
     controls_fingerprint = require_contract_fingerprint(
         controls_summary, label=f"WellControlSet {well_control_run}"

@@ -165,13 +165,10 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not geometry_directions or not set(geometry_directions) <= {"left_to_right", "right_to_left"}:
         raise ValueError("generation.geometry_directions contains unsupported values")
     acceptance = _mapping(generation.get("acceptance_qc"), path="generation.acceptance_qc")
-    _reject_unknown(acceptance, {"minimum_attempts_per_scenario", "warning_fraction", "failure_fraction", "enforcement"}, path="generation.acceptance_qc")
-    warning = float(acceptance["warning_fraction"]); failure = float(acceptance["failure_fraction"])
-    if not 0.0 <= failure < warning <= 1.0:
-        raise ValueError("generation acceptance fractions must satisfy 0 <= failure < warning <= 1")
-    enforcement = str(acceptance.get("enforcement", "warn"))
-    if enforcement not in {"warn", "fail_fast"}:
-        raise ValueError("generation.acceptance_qc.enforcement must be warn or fail_fast")
+    _reject_unknown(acceptance, {"minimum_attempts_per_scenario", "warning_fraction", "severe_warning_fraction"}, path="generation.acceptance_qc")
+    warning = float(acceptance["warning_fraction"]); severe_warning = float(acceptance["severe_warning_fraction"])
+    if not 0.0 <= severe_warning < warning <= 1.0:
+        raise ValueError("generation acceptance fractions must satisfy 0 <= severe_warning < warning <= 1")
 
     splits = _mapping(root.get("splits"), path="splits")
     _reject_unknown(splits, {"assignment_unit", "held_out_geometry_family"}, path="splits")
@@ -208,7 +205,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "lateral_sample_interval_m": _positive(geometry.get("lateral_sample_interval_m"), path="geometry.lateral_sample_interval_m"),
         "target_zone": {key: target_zone.get(key) for key in ("mode", "nearest_distance_limit", "outlier_threshold", "outlier_min_neighbor_count", "min_thickness_s")},
         "impedance": _parse_impedance(root),
-        "generation": {"attempts_per_scenario": int(_positive(generation.get("attempts_per_scenario"), path="generation.attempts_per_scenario")), "duration_modes": duration_modes, "geometry_families": geometry_families, "geometry_directions": geometry_directions, "acceptance_qc": {"minimum_attempts_per_scenario": int(_positive(acceptance.get("minimum_attempts_per_scenario"), path="acceptance.minimum_attempts_per_scenario")), "warning_fraction": warning, "failure_fraction": failure, "enforcement": enforcement}},
+        "generation": {"attempts_per_scenario": int(_positive(generation.get("attempts_per_scenario"), path="generation.attempts_per_scenario")), "duration_modes": duration_modes, "geometry_families": geometry_families, "geometry_directions": geometry_directions, "acceptance_qc": {"minimum_attempts_per_scenario": int(_positive(acceptance.get("minimum_attempts_per_scenario"), path="acceptance.minimum_attempts_per_scenario")), "warning_fraction": warning, "severe_warning_fraction": severe_warning}},
         "splits": {"assignment_unit": "parent_realization", "held_out_geometry_family": str(splits["held_out_geometry_family"])},
         "seismic_input": {"policy": "observed_highres_forward"},
         "forward_qc": {"highres_forward_enabled": True, "highres_forward_required": True},

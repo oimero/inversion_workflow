@@ -22,6 +22,7 @@ from cup.synthetic.core.config import parse_object_core_controls
 from cup.synthetic.core.amplitude_calibration import parse_amplitude_calibration_controls
 from cup.synthetic.core.views import resolve_view_specs, validate_view_units
 from cup.utils.io import (
+    is_consumable_contract_status,
     load_yaml_config,
     require_contract_fingerprint,
     resolve_artifact_path,
@@ -300,14 +301,11 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not directions or not set(directions) <= {"left_to_right", "right_to_left"}:
         raise ValueError("generation.geometry_directions contains unsupported values.")
     acceptance = _mapping(generation.get("acceptance_qc"), path="generation.acceptance_qc")
-    _reject_unknown(acceptance, {"minimum_attempts_per_scenario", "warning_fraction", "failure_fraction", "enforcement"}, path="generation.acceptance_qc")
+    _reject_unknown(acceptance, {"minimum_attempts_per_scenario", "warning_fraction", "severe_warning_fraction"}, path="generation.acceptance_qc")
     warning = float(acceptance.get("warning_fraction"))
-    failure = float(acceptance.get("failure_fraction"))
-    if not 0.0 <= failure < warning <= 1.0:
-        raise ValueError("generation acceptance fractions must satisfy 0 <= failure < warning <= 1.")
-    enforcement = str(acceptance.get("enforcement", "warn"))
-    if enforcement not in {"warn", "fail_fast"}:
-        raise ValueError("generation.acceptance_qc.enforcement must be warn or fail_fast.")
+    severe_warning = float(acceptance.get("severe_warning_fraction"))
+    if not 0.0 <= severe_warning < warning <= 1.0:
+        raise ValueError("generation acceptance fractions must satisfy 0 <= severe_warning < warning <= 1.")
 
     splits = _mapping(root.get("splits"), path="synthoseis_lite.splits")
     _reject_unknown(splits, {"assignment_unit", "held_out_geometry_family"}, path="synthoseis_lite.splits")
@@ -368,7 +366,7 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
             ),
             **object_core_controls,
         },
-        "generation": {"attempts_per_scenario": _positive_int(generation.get("attempts_per_scenario"), path="generation.attempts_per_scenario"), "duration_modes": ["standard"], "geometry_families": geometry_families, "geometry_directions": directions, "acceptance_qc": {"minimum_attempts_per_scenario": _positive_int(acceptance.get("minimum_attempts_per_scenario"), path="generation.acceptance_qc.minimum_attempts_per_scenario"), "warning_fraction": warning, "failure_fraction": failure, "enforcement": enforcement}},
+        "generation": {"attempts_per_scenario": _positive_int(generation.get("attempts_per_scenario"), path="generation.attempts_per_scenario"), "duration_modes": ["standard"], "geometry_families": geometry_families, "geometry_directions": directions, "acceptance_qc": {"minimum_attempts_per_scenario": _positive_int(acceptance.get("minimum_attempts_per_scenario"), path="generation.acceptance_qc.minimum_attempts_per_scenario"), "warning_fraction": warning, "severe_warning_fraction": severe_warning}},
         "splits": {"assignment_unit": "parent_realization", "held_out_geometry_family": held_out},
         "seismic_input": {"policy": "observed_highres_forward"},
         "seismic_forward": {"backend": backend, "dtype": "float64"},
@@ -444,28 +442,28 @@ def resolve_depth_sources(
     rock_summary = _load_json(resolved["rock_physics_analysis_dir"] / "run_summary.json")
     if (
         rock_summary.get("schema") != ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION
-        or rock_summary.get("status") != "success"
+        or not is_consumable_contract_status(rock_summary.get("status"))
         or rock_summary.get("sample_domain") != "depth"
         or rock_summary.get("depth_basis") != "tvdss"
     ):
         raise ValueError(
-            "rock_physics_analysis source is not a successful contracted run."
+            "rock_physics_analysis source is not a consumable contracted run."
         )
     wavelet_batch_summary = _load_json(resolved["wavelet_batch_synthetic_depth_dir"] / "run_summary.json")
-    if wavelet_batch_summary.get("status") != "success":
-        raise ValueError("wavelet_batch_synthetic_depth run is not successful.")
+    if not is_consumable_contract_status(wavelet_batch_summary.get("status")):
+        raise ValueError("wavelet_batch_synthetic_depth run is not consumable.")
     forward_run_summary = _load_json(
         resolved["depth_forward_model_inputs_dir"] / "run_summary.json"
     )
     if (
         forward_run_summary.get("schema")
         != DEPTH_FORWARD_MODEL_INPUTS_RUN_SCHEMA_VERSION
-        or forward_run_summary.get("status") != "success"
+        or not is_consumable_contract_status(forward_run_summary.get("status"))
         or forward_run_summary.get("sample_domain") != "depth"
         or forward_run_summary.get("depth_basis") != "tvdss"
     ):
         raise ValueError(
-            "depth_forward_model_inputs source is not a successful depth/TVDSS run."
+            "depth_forward_model_inputs source is not a consumable depth/TVDSS run."
         )
     forward_path = (
         resolved["depth_forward_model_inputs_dir"] / "forward_model_inputs.json"

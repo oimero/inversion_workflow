@@ -48,6 +48,7 @@ from cup.synthetic.core.pipeline import (
 )
 from cup.synthetic.adapters import TimeSyntheticDomainAdapter
 from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
+from cup.synthetic.core.rejections import ForwardRejected
 from cup.synthetic.schemas import SCIENCE_CONTRACT, require_science_contract
 from cup.physics.numpy_backend import forward_time
 from cup.synthetic.core.signal import finite_support_fir, valid_filter_decimate
@@ -55,6 +56,7 @@ from cup.config.workflow import WorkflowConfig
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
+    is_consumable_contract_status,
     repo_relative_path,
     require_contract_fingerprint,
     resolve_relative_path,
@@ -85,7 +87,7 @@ def _generation_input_contracts(
     require_science_contract(calibration_summary, label="time calibration run summary")
     if (
         calibration_summary.get("schema_version") != CALIBRATION_SCHEMA
-        or calibration_summary.get("status") != "success"
+        or not is_consumable_contract_status(calibration_summary.get("status"))
     ):
         raise ValueError(
             f"Calibration run is not a successful {CALIBRATION_SCHEMA} contract."
@@ -159,7 +161,10 @@ def _time_perturbed_wavelet_forward(
     support = np.broadcast_to(support_1d[: observed.shape[-1]], observed.shape)
     mask = np.asarray(generated.valid_mask_model, dtype=bool)
     if np.any(mask & ~support):
-        raise ValueError("invalid_seismic_view:perturbed_wavelet_support_incomplete")
+        reason = "invalid_seismic_view:perturbed_wavelet_support_incomplete"
+        raise ForwardRejected(
+            [reason], diagnostics={}, details=[{"reason": reason}]
+        )
     return observed, support
 
 

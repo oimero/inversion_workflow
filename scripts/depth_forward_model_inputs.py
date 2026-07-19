@@ -30,6 +30,7 @@ from cup.synthetic.schemas import (
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
+    is_consumable_contract_status,
     load_yaml_config,
     repo_relative_path,
     require_contract_fingerprint,
@@ -208,13 +209,13 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
     rock_summary = _load_json(rock_summary_path)
     if (
         rock_summary.get("schema") != ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION
-        or rock_summary.get("status") != "success"
+        or not is_consumable_contract_status(rock_summary.get("status"))
         or rock_summary.get("sample_domain") != "depth"
         or rock_summary.get("depth_basis") != "tvdss"
     ):
         raise ValueError("Rock-physics source is not a successful depth/TVDSS run.")
     module_summary = dict(dict(rock_summary.get("modules") or {}).get("ai_vp_linear") or {})
-    if module_summary.get("status") != "success":
+    if not is_consumable_contract_status(module_summary.get("status")):
         raise ValueError("Rock-physics AI–Vp module did not succeed.")
     relation_path = rock_dir / "modules" / "ai_vp_linear" / "rock_physics_relation.json"
     recorded_relation_path = resolve_artifact_path(
@@ -232,7 +233,7 @@ def run(config_path: Path, output_dir_arg: Path | None = None) -> Path:
     auto_tie_summary = _load_json(auto_tie_summary_path)
     if (
         auto_tie_summary.get("schema_version") != DEPTH_VERTICAL_AUTO_TIE_SCHEMA_VERSION
-        or auto_tie_summary.get("status") != "success"
+        or not is_consumable_contract_status(auto_tie_summary.get("status"))
         or str(auto_tie_summary.get("well_name") or "") != source_well_name
     ):
         raise ValueError("Depth auto-tie source does not match the configured source well.")

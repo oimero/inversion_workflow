@@ -384,7 +384,7 @@ truth → projection → base forward → canonical decomposition
 - attempt 进度写入 `attempt_progress.csv`，拒绝明细写入 `generation_rejection_details.csv`，原因汇总写入 `rejection_reason_summary.csv`；
 - 其他 attempt 继续执行。
 
-整个 run 仅在配置或程序错误、acceptance contract 不满足、最终 artifact 校验失败时失败。run 在临时目录构建，所有 HDF5、双索引、manifest 和 acceptance 校验通过后才发布成功 summary。
+整个 run 仅在配置或程序错误、数据结构或身份合同不满足、没有任何可计算父实现、最终 artifact 校验失败时失败。接受率与覆盖率属于科学质量证据，只能形成 warning；`completed_with_warnings` 是可消费的正式发布状态。run 在 staging 目录构建，完整父实现持续落盘；意外失败时 staging 与失败记录保留以供检查或恢复。
 
 ## 6. 地震视图配置
 

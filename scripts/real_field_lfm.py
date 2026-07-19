@@ -28,7 +28,7 @@ if str(SRC_DIR) not in sys.path:
 from cup.config.workflow import WorkflowConfig, deep_merge_dict
 from cup.lfm.pipeline import build_lfm_context, run_lfm_pipeline
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.utils.io import latest_checked_run, load_yaml_config, repo_relative_path, resolve_relative_path
+from cup.utils.io import is_consumable_contract_status, latest_checked_run, load_yaml_config, repo_relative_path, resolve_relative_path
 from cup.well.real_field_controls import SCHEMA_VERSION as WELL_CONTROL_SCHEMA, load_well_control_set
 
 
@@ -52,7 +52,7 @@ def _load_composed_config(path: Path) -> dict[str, Any]:
 def _validate_control_run(path: Path, *, domain: str, depth_basis: str | None) -> None:
     with (path / "run_summary.json").open("r", encoding="utf-8") as handle:
         summary = json.load(handle)
-    if summary.get("schema_version") != WELL_CONTROL_SCHEMA or summary.get("status") != "ok":
+    if summary.get("schema_version") != WELL_CONTROL_SCHEMA or not is_consumable_contract_status(summary.get("status")):
         raise ValueError(f"not a successful {WELL_CONTROL_SCHEMA} run")
     axis = dict(summary.get("sample_axis") or {})
     if axis.get("sample_domain") != domain or summary.get("depth_basis") != depth_basis:

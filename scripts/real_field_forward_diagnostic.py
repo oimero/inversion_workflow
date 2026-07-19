@@ -504,7 +504,7 @@ def _load_zero_shot_summary(zero_shot_dir: Path) -> dict:
     return load_summary(
         zero_shot_dir / "real_field_zero_shot_summary.json",
         schema_version=ZERO_SHOT_SUMMARY_SCHEMA_VERSION,
-        allowed_status={"needs_forward_diagnostic", "ok"},
+        allowed_status={"needs_forward_diagnostic", "ok", "success", "completed_with_warnings"},
         label="real_field_zero_shot_summary.json",
     )
 
@@ -519,7 +519,7 @@ def _resolve_zero_shot_dir(run_cfg: dict, *, output_root: Path, cli_value: Path 
         label="real_field_zero_shot",
         summary_file="real_field_zero_shot_summary.json",
         schema_version=ZERO_SHOT_SUMMARY_SCHEMA_VERSION,
-        allowed_status={"needs_forward_diagnostic", "ok"},
+        allowed_status={"needs_forward_diagnostic", "ok", "success", "completed_with_warnings"},
     )
 
 

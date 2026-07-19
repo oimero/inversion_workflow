@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-import shutil
 import uuid
 import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -34,7 +33,6 @@ from cup.synthetic.core.artifacts import (
 )
 from cup.synthetic.core.field_runner import (
     AttemptProgressLog,
-    acceptance_enforcement,
     build_acceptance_catalog,
     configure_generation_logger,
     run_attempt_preflight,
@@ -63,6 +61,19 @@ def _new_staging_directory(directory: Path) -> Path:
         except FileExistsError:
             continue
     raise RuntimeError(f"unable to allocate staging directory beside {directory}")
+
+
+def _record_staging_failure(staging: Path, exc: BaseException) -> None:
+    """Best-effort failure provenance; completed staging artifacts stay inspectable."""
+    try:
+        _write_json(staging / "run_failure.json", {
+            "status": "failed",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "staging_preserved": True,
+        })
+    except Exception:
+        pass
 
 
 def _rewrite_published_paths(
@@ -478,8 +489,8 @@ class SyntheticBenchmarkPipeline:
             )
             staging.replace(directory)
             return dict(summary)
-        except Exception:
-            shutil.rmtree(staging, ignore_errors=True)
+        except Exception as exc:
+            _record_staging_failure(staging, exc)
             raise
 
     def generate(
@@ -529,9 +540,9 @@ class SyntheticBenchmarkPipeline:
             )
             staging.replace(directory)
             return summary
-        except Exception:
+        except Exception as exc:
             self._close_generation_logger()
-            shutil.rmtree(staging, ignore_errors=True)
+            _record_staging_failure(staging, exc)
             raise
 
     def _run_generation_session(
@@ -556,29 +567,31 @@ class SyntheticBenchmarkPipeline:
         preflight = run_attempt_preflight(
             plan,
             validator=session.validate,
-            rejection_exceptions=(StagedRejection, ValueError, FloatingPointError),
+            rejection_exceptions=(StagedRejection,),
             qc_config=acceptance_qc,
             output_dir=output_dir,
             logger=logger,
             development_limited=development_limited,
         )
-        enforcement = acceptance_enforcement(acceptance_qc)
+        preflight_warnings = preflight.warnings
+        preflight_has_usable_parent = not preflight.accepted_plan.empty
         preflight_summary = {
             **dict(session.preflight_summary_prefix),
             "sample_domain": session.sample_domain,
-            "status": "failed" if not preflight.failed.empty else "ok",
-            "enforcement": enforcement,
+            "status": (
+                "failed"
+                if not preflight_has_usable_parent
+                else ("completed_with_warnings" if not preflight_warnings.empty else "success")
+            ),
+            "usable": preflight_has_usable_parent,
             "planned_attempts": int(len(plan)),
             "accepted_attempts": int(len(preflight.accepted_plan)),
             "rejected_attempts": int(len(plan) - len(preflight.accepted_plan)),
-            "failed_scenario_count": int(len(preflight.failed)),
+            "severe_warning_scenario_count": int(len(preflight_warnings)),
         }
         _write_json(output_dir / "preflight_summary.json", preflight_summary)
-        if preflight.accepted_plan.empty:
+        if not preflight_has_usable_parent:
             raise RuntimeError(f"{session.sample_domain}_generation_preflight_no_accepted_realizations")
-        if enforcement == "fail_fast" and not preflight.failed.empty:
-            failed = preflight.failed[["section_id", "scenario_id", "acceptance_status"]].to_dict(orient="records")
-            raise RuntimeError(f"{session.sample_domain}_generation_preflight_acceptance_qc_failed:{failed}")
 
         h5_path = output_dir / "synthetic_benchmark.h5"
         resolved_config = dict(config)
@@ -779,13 +792,19 @@ class SyntheticBenchmarkPipeline:
                     for name, rows in result.domain_rows.items():
                         domain_rows.setdefault(str(name), []).extend(rows)
                     status = "accepted"
-                except (StagedRejection, ValueError, FloatingPointError, RuntimeError) as exc:
+                    h5.flush()
+                except StagedRejection as exc:
                     failed_group = f"/realizations/{parent_id}"
                     if failed_group in h5:
                         del h5[failed_group]
                     reason = f"{type(exc).__name__}:{exc}"
                     rejection_rows.append({**dict(row), "status": "rejected", "reason": reason})
                     qc_rows.append({**dict(row), "sample_id": parent_id, "status": "rejected", "reasons": reason})
+                except Exception:
+                    failed_group = f"/realizations/{parent_id}"
+                    if failed_group in h5:
+                        del h5[failed_group]
+                    raise
                 progress.record(
                     row,
                     sequence_index=sequence_index,
@@ -806,13 +825,20 @@ class SyntheticBenchmarkPipeline:
         rejection_summary = rejection_reason_summary(rejection_frame, index)
         rejection_summary.to_csv(output_dir / "rejection_reason_summary.csv", index=False)
         successful_parent_ids = [str(row.get("realization_id") or row.get("parent_realization_id")) for row in realization_rows]
+        parent_quality_warning_count = int(sum(
+            int(row.get("quality_warning_count") or 0)
+            for row in qc_rows
+            if str(row.get("status") or "") != "rejected"
+        ))
         catalog = build_acceptance_catalog(plan, accepted_parent_ids=successful_parent_ids, qc_config=acceptance_qc, development_limited=development_limited)
         catalog.to_csv(output_dir / "scenario_catalog.csv", index=False)
-        failed_scenarios = catalog["acceptance_status"].isin({"failed", "insufficient_attempts"})
+        warning_scenarios = catalog["acceptance_status"].isin({"severe_warning", "insufficient_coverage"})
         failure_reason = f"{session.sample_domain}_generation_no_accepted_realizations" if not successful_parent_ids else ""
-        if not failure_reason and not development_limited and enforcement == "fail_fast" and bool(failed_scenarios.any()):
-            failure_reason = f"{session.sample_domain}_generation_acceptance_qc_failed"
-        completed_with_warnings = bool(not development_limited and not failure_reason and failed_scenarios.any())
+        completed_with_warnings = bool(
+            not development_limited
+            and not failure_reason
+            and (warning_scenarios.any() or parent_quality_warning_count > 0)
+        )
         if session.write_domain_outputs is not None:
             session.write_domain_outputs(output_dir, domain_rows)
         figure_summary = write_generation_figures(
@@ -871,7 +897,12 @@ class SyntheticBenchmarkPipeline:
             "seismic_views": dict(resolved_config.get("seismic_views") or {}),
             "seismic_view_count": int(len(view_rows)),
             "rejection_reason_summary": [] if rejection_summary.empty else rejection_summary.to_dict(orient="records"),
-            "quality_warnings": [] if not completed_with_warnings else ["scenario_acceptance_qc_failed"],
+            "usable": not bool(failure_reason),
+            "quality_warnings": (
+                ([] if not bool(warning_scenarios.any()) else ["scenario_acceptance_qc_warning"])
+                + ([] if not parent_quality_warning_count else ["parent_scientific_qc_warning"])
+            ),
+            "parent_quality_warning_count": parent_quality_warning_count,
             "figures": _portable_figure_summary(
                 figure_summary,
                 repo_root=repo_root,
@@ -888,7 +919,7 @@ class SyntheticBenchmarkPipeline:
             **manifest,
             "accepted_realizations": int(len(successful_parent_ids)),
             "rejected_realizations": int(len(plan) - len(successful_parent_ids)),
-            "failed_scenario_count": int(failed_scenarios.sum()),
+            "severe_warning_scenario_count": int(warning_scenarios.sum()),
         }
         _write_json(output_dir / "run_summary.json", summary)
         if failure_reason:

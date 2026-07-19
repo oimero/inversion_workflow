@@ -19,6 +19,7 @@ from cup.seismic.geometry import SampleAxis, SurveyLineGeometry
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
+    is_consumable_contract_status,
     repo_relative_path,
     require_contract_fingerprint,
     resolve_artifact_path,
@@ -182,7 +183,7 @@ def _load_summary(source_run_dir: Path, *, source_run_type: str, domain: str, de
         raise ValueError("Depth well controls require source and seismic depth_basis='tvdss'.")
     if expected_domain == "time" and summary_basis not in (None, ""):
         raise ValueError("Time source summary must not declare a depth_basis.")
-    if str(summary.get("status") or "") not in {"ok", "success"}:
+    if not is_consumable_contract_status(summary.get("status")):
         raise ValueError(f"Source run is not consumable: status={summary.get('status')!r}.")
     return path, summary
 
@@ -763,7 +764,7 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
         raise FileNotFoundError(f"Incomplete well-control run: {run_dir}")
     with summary_path.open("r", encoding="utf-8") as handle:
         summary = json.load(handle)
-    if summary.get("schema_version") != SCHEMA_VERSION or summary.get("status") != "ok":
+    if summary.get("schema_version") != SCHEMA_VERSION or not is_consumable_contract_status(summary.get("status")):
         raise ValueError(f"Unsupported or unsuccessful well-control run: {run_dir}")
     require_contract_fingerprint(summary, label=f"WellControlSet {run_dir}")
     outputs = dict(summary.get("outputs") or {})

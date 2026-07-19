@@ -152,6 +152,7 @@ def _write_depth_sample(h5: h5py.File, sample: BenchmarkSample) -> ArtifactRefer
     for name, values, unit, axis_path in (
         ("log_ai_highres", truth_record.log_ai_highres, "ln(m/s*g/cm3)", high_axis_path),
         ("vp_highres_mps", forward.extras.vp_highres_mps, "m/s", high_axis_path),
+        ("rgt_highres", truth_record.rgt_highres, "normalized_zone", high_axis_path),
         (
             "model_target_log_ai",
             projected.model_target_log_ai,
@@ -159,6 +160,7 @@ def _write_depth_sample(h5: h5py.File, sample: BenchmarkSample) -> ArtifactRefer
             model_axis_path,
         ),
         ("vp_model_mps", forward.extras.vp_model_mps, "m/s", model_axis_path),
+        ("rgt_model", projected.rgt_model, "normalized_zone", model_axis_path),
     ):
         _dataset(
             truth,

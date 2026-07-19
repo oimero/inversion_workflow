@@ -24,6 +24,7 @@ from cup.synthetic.schemas import (
     SEISMIC_AMPLITUDE_PRIOR_SCHEMA_VERSION,
     require_science_contract,
 )
+from cup.synthetic.core.v5_artifacts import REALIZATION_INDEX_COLUMNS
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
@@ -195,24 +196,53 @@ def build_amplitude_pilot_config(script_cfg: Mapping[str, Any]) -> dict[str, Any
 
 def load_pilot_sections(pilot_dir: Path) -> list[AmplitudeCalibrationSection]:
     """Load the domain-neutral seismic/RGT/mask seam from a v5 pilot."""
-    index = pd.read_csv(pilot_dir / "realization_index.csv")
-    required = {"realization_id", "section_id", "scenario_id", "status", "valid_mask_dataset"}
+    index = pd.read_csv(
+        pilot_dir / "realization_index.csv", dtype=str, keep_default_na=False
+    )
+    required = set(REALIZATION_INDEX_COLUMNS)
     missing = sorted(required - set(index))
     if missing:
         raise ValueError(f"amplitude pilot realization index lacks columns: {missing}")
+    if index.empty:
+        raise ValueError("amplitude pilot realization index contains no successful parents")
+    if index["realization_id"].duplicated().any():
+        raise ValueError("amplitude pilot realization index contains duplicate parents")
     result: list[AmplitudeCalibrationSection] = []
     with h5py.File(pilot_dir / "synthetic_benchmark.h5", "r") as h5:
-        for row in index[index["status"].eq("ok")].to_dict(orient="records"):
+        for row in index.to_dict(orient="records"):
             rid = str(row["realization_id"])
             root = f"/realizations/{rid}"
+            expected_mask_path = f"{root}/masks/valid_mask"
+            if str(row["valid_mask_dataset"]) != expected_mask_path:
+                raise ValueError(
+                    f"amplitude pilot parent {rid!r} has a non-v5 mask path"
+                )
+            required_datasets = {
+                "seismic": f"{root}/seismic/seismic_observed",
+                "rgt": f"{root}/truth/rgt_model",
+                "valid_mask": expected_mask_path,
+                "lateral_axis": f"{root}/axes/lateral_m",
+            }
+            missing_datasets = sorted(
+                label for label, path in required_datasets.items() if path not in h5
+            )
+            if missing_datasets:
+                raise ValueError(
+                    f"amplitude pilot parent {rid!r} lacks required datasets: "
+                    f"{missing_datasets}"
+                )
             result.append(AmplitudeCalibrationSection(
                 field_id=rid,
                 section_id=str(row["section_id"]),
                 scenario_id=str(row["scenario_id"]),
-                seismic=np.asarray(h5[f"{root}/seismic/seismic_observed"][()]),
-                rgt=np.asarray(h5[f"{root}/truth/rgt_model"][()]),
-                valid_mask=np.asarray(h5[str(row["valid_mask_dataset"])][()], dtype=bool),
-                lateral_m=np.asarray(h5[f"{root}/axes/lateral_m"][()], dtype=np.float64),
+                seismic=np.asarray(h5[required_datasets["seismic"]][()]),
+                rgt=np.asarray(h5[required_datasets["rgt"]][()]),
+                valid_mask=np.asarray(
+                    h5[required_datasets["valid_mask"]][()], dtype=bool
+                ),
+                lateral_m=np.asarray(
+                    h5[required_datasets["lateral_axis"]][()], dtype=np.float64
+                ),
             ))
     return result
 

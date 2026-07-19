@@ -7,8 +7,9 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from cup.impedance import decompose_log_ai
+from cup.impedance import decompose_log_ai, validate_increment_contract
 from cup.synthetic.core.random import RandomNamespace
+from cup.synthetic.core.rejections import BenchmarkBuildRejected
 from cup.utils.statistics import centered_rms
 
 
@@ -34,6 +35,30 @@ class LfmProducts:
     canonical_background_log_ai: np.ndarray
     target_increment_log_ai: np.ndarray
     qc: Mapping[str, Any]
+
+
+def _canonical_segment_diagnostics(
+    valid_mask: np.ndarray, *, minimum_samples: int
+) -> dict[str, int] | None:
+    short_lengths: list[int] = []
+    affected_traces = 0
+    for row in np.asarray(valid_mask, dtype=bool).reshape(-1, valid_mask.shape[-1]):
+        padded = np.concatenate(([False], row, [False]))
+        starts = np.flatnonzero(~padded[:-1] & padded[1:])
+        stops = np.flatnonzero(padded[:-1] & ~padded[1:])
+        lengths = stops - starts
+        short = lengths[lengths < minimum_samples]
+        if short.size:
+            affected_traces += 1
+            short_lengths.extend(int(value) for value in short)
+    if not short_lengths:
+        return None
+    return {
+        "minimum_segment_samples": int(minimum_samples),
+        "shortest_segment_samples": min(short_lengths),
+        "short_segment_count": len(short_lengths),
+        "affected_trace_count": affected_traces,
+    }
 
 
 def build_lfm_products(
@@ -62,10 +87,22 @@ def build_lfm_products(
     if np.any(valid & ~np.isfinite(target)):
         raise ValueError("canonical LFM target has non-finite valid samples")
 
+    resolved_contract = validate_increment_contract(canonical_contract)
+    short_segment_diagnostics = _canonical_segment_diagnostics(
+        valid, minimum_samples=resolved_contract.minimum_segment_samples
+    )
+    if short_segment_diagnostics is not None:
+        reason = "canonical_lfm_segment_too_short"
+        raise BenchmarkBuildRejected(
+            [reason],
+            diagnostics=short_segment_diagnostics,
+            details=[{"reason": reason, **short_segment_diagnostics}],
+        )
+
     background, increment = decompose_log_ai(
         target,
         axis,
-        canonical_contract,
+        resolved_contract,
         valid_mask=valid,
     )
     background = np.asarray(background, dtype=np.float64)

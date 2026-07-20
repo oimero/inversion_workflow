@@ -1,9 +1,6 @@
 # Enhance v2 深度域微纹理增强 Handoff
 
-> **状态：冻结的替代路线。** 当前研究主线转为
-> [Structured GINN 纵向原型](STRUCTURED_GINN_HANDOFF.md)。本规格保留用于比较
-> “井统计条件微纹理补全”与“对象级结构化后验”两种方法，不属于首轮实施范围，
-> 也不与 Structured GINN 串联。
+> **状态：暂时冻结路线。**
 
 ## 1. 目标与定位
 

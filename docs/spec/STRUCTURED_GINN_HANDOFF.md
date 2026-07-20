@@ -1,5 +1,7 @@
 # Structured GINN 纵向原型 Handoff
 
+> **状态：暂时冻结路线。**
+
 ## 1. 状态与定位
 
 本文是 Structured GINN 纵向原型的活动实施规格。目标是把 Synthoseis-lite

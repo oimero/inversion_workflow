@@ -1123,7 +1123,7 @@ def _evaluate(
             raise ValueError("real_well_supervised validation has no held-out well samples.")
         groups = [group.sort_values("sample_index") for _, group in held_out.groupby("well_name", sort=True)]
         with torch.no_grad():
-            predictions = support.predictor.predict_delta_n_groups(
+            predictions = support.predictor.predict_increment_n_groups(
                 model, groups, device=device, canonical_full_patch=support.canonical_full_patch,
             )
         losses = []

@@ -119,6 +119,6 @@ HDF5 的主要结构为：
 
 接受率、覆盖率、裁剪比例和经验指标只产生质量告警。低接受率或某个场景没有成功父实现时，其他完整父实现仍然发布；带告警完成的正式产物可供后续标定、训练和评估消费。只有配置、数据结构、域与单位、版本身份、文件引用、有限性或数学可计算性不成立时，整次运行才失败。意外失败会保留临时运行目录和失败记录，已完成父实现不会因末尾质量判断被删除。
 
-## 与 GINN v2 的连接
+## 与 ablation 的连接
 
-GINN v2 读取父实现和视图双索引。训练配置在具体 synthetic loss block 内声明父实现权重、base/variant 权重和 view 权重；新增未被引用的视图不会改变既有父实现概率。训练与验证的 split、normalization 和 checkpoint provenance 由 GINN 实验套件单独拥有。
+ablation 读取父实现和视图双索引。训练配置在具体 synthetic loss block 内声明父实现权重、base/variant 权重和 view 权重；新增未被引用的视图不会改变既有父实现概率。训练与验证的 split、normalization 和 checkpoint provenance 由 GINN 实验套件单独拥有。

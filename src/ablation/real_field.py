@@ -1,4 +1,4 @@
-"""Real-field zero-shot prediction and forward diagnostics for GINN-v2."""
+"""Real-field zero-shot prediction and forward diagnostics for ablation."""
 
 from __future__ import annotations
 
@@ -27,12 +27,12 @@ from cup.utils.io import (
     resolve_relative_path,
     write_json,
 )
-from ginn_v2.contracts import (
+from ablation.contracts import (
     MODEL_RUN_SCHEMA_VERSION,
     ZERO_SHOT_MODEL_SCHEMA_VERSION,
 )
-from ginn_v2.checkpoint import load_checkpoint
-from ginn_v2.runtime import resolve_device
+from ablation.checkpoint import load_checkpoint
+from ablation.runtime import resolve_device
 
 
 @dataclass(frozen=True)
@@ -112,7 +112,7 @@ def load_model_manifest(model_cfg: Mapping[str, Any], *, root: Path) -> dict[str
     if str(manifest.get("schema_version") or "") != MODEL_RUN_SCHEMA_VERSION:
         raise ValueError(f"Unsupported model run manifest schema: {manifest_path}")
     if not str(manifest.get("experiment_id") or ""):
-        raise ValueError("GINN-v2 experiment manifest lacks experiment_id.")
+        raise ValueError("ablation experiment manifest lacks experiment_id.")
     return manifest
 
 
@@ -132,7 +132,7 @@ def _model_manifest_and_dir(model_cfg: Mapping[str, Any], *, root: Path) -> tupl
     if str(manifest.get("schema_version") or "") != MODEL_RUN_SCHEMA_VERSION:
         raise ValueError(f"Unsupported model run manifest schema: {manifest_path}")
     if not str(manifest.get("experiment_id") or ""):
-        raise ValueError("GINN-v2 experiment manifest lacks experiment_id.")
+        raise ValueError("ablation experiment manifest lacks experiment_id.")
     return model_run_dir, manifest
 
 
@@ -166,7 +166,7 @@ def _validate_model_sample_axis(
 def _manifest_experiment_id(manifest: Mapping[str, Any]) -> str:
     experiment_id = str(manifest.get("experiment_id") or "").strip()
     if not experiment_id:
-        raise ValueError("GINN-v2 manifest must contain experiment_id.")
+        raise ValueError("ablation manifest must contain experiment_id.")
     return experiment_id
 
 
@@ -177,10 +177,10 @@ def _primary_checkpoint_path(
 ) -> Path:
     record = manifest.get("deployment_checkpoint")
     if not isinstance(record, Mapping):
-        raise ValueError("GINN-v2 experiment manifest lacks resolved deployment_checkpoint.")
+        raise ValueError("ablation experiment manifest lacks resolved deployment_checkpoint.")
     if manifest.get("deployment_eligible") is not True or record.get("eligible") is not True:
         raise ValueError(
-            "GINN-v2 model run is marked deployment_eligible=false; "
+            "ablation model run is marked deployment_eligible=false; "
             "R0 requires a standard training run with an eligible checkpoint."
         )
     path = resolve_relative_path(str(record.get("path") or ""), root=root)
@@ -563,7 +563,7 @@ def run_zero_shot_model(
     stitch_strategy: str,
 ) -> dict[str, Any]:
     if stitch_strategy != "uniform":
-        raise ValueError("GINN-v2 R0 production stitching is fixed to uniform.")
+        raise ValueError("ablation R0 production stitching is fixed to uniform.")
     model_run_dir, manifest = _model_manifest_and_dir(model_cfg, root=root)
     experiment_id = _manifest_experiment_id(manifest)
     architecture_id = _required_text(_mapping(manifest.get("architecture"), "architecture"), "id")
@@ -744,7 +744,7 @@ def run_zero_shot_volume_model(
     stitch_strategy: str,
 ) -> dict[str, Any]:
     if stitch_strategy != "uniform":
-        raise ValueError("GINN-v2 R0 production stitching is fixed to uniform.")
+        raise ValueError("ablation R0 production stitching is fixed to uniform.")
     model_run_dir, manifest = _model_manifest_and_dir(model_cfg, root=root)
     experiment_id = _manifest_experiment_id(manifest)
     architecture_id = _required_text(_mapping(manifest.get("architecture"), "architecture"), "id")

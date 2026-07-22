@@ -591,6 +591,6 @@ def denormalize_increment(
 ) -> np.ndarray:
     if "delta" in normalization:
         raise ValueError(
-            "Normalized-increment checkpoints are obsolete; GINN-v2 v5 outputs physical predicted_increment_log_ai."
+            "Normalized-increment checkpoints are obsolete; ablation v5 outputs physical predicted_increment_log_ai."
         )
     return np.asarray(values, dtype=np.float32)

@@ -1,14 +1,14 @@
-"""Composable GINN-v2 inversion experiments."""
+"""Composable ablation inversion experiments."""
 
-from ginn_v2.data import (
+from ablation.data import (
     PatchDataset,
     PatchSpec,
     build_patch_index,
     compute_input_reference_stats,
     compute_normalization,
 )
-from ginn_v2.models import build_model
-from ginn_v2.experiment import parse_experiment_config
+from ablation.models import build_model
+from ablation.experiment import parse_experiment_config
 
 __all__ = [
     "PatchDataset",

@@ -176,7 +176,7 @@ class Trace1DTCNShallowLateralMixer(nn.Module):
 
 def _zero_initialize(layer: nn.Module) -> None:
     if not isinstance(layer, (nn.Conv1d, nn.Conv2d)):
-        raise TypeError("GINN-v2 output layer must be convolutional.")
+        raise TypeError("ablation output layer must be convolutional.")
     nn.init.zeros_(layer.weight)
     if layer.bias is not None:
         nn.init.zeros_(layer.bias)
@@ -199,7 +199,7 @@ def build_model(
 ) -> tuple[nn.Module, ModelInfo]:
     if architecture_id not in ARCHITECTURE_IDS:
         raise ValueError(
-            f"Unsupported GINN-v2 architecture id {architecture_id!r}. "
+            f"Unsupported ablation architecture id {architecture_id!r}. "
             f"Use one of {list(ARCHITECTURE_IDS)}; legacy model IDs are not accepted."
         )
     if architecture_id == "patch_conv2d":

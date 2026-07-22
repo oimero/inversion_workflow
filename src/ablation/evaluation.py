@@ -1,4 +1,4 @@
-"""Synthetic patch prediction and reporting for GINN-v2.
+"""Synthetic patch prediction and reporting for ablation.
 
 The composable runner owns training; this module owns benchmark patch evaluation.
 """
@@ -20,10 +20,10 @@ from cup.synthetic.benchmark import SynthoseisBenchmark
 from cup.impedance import canonical_lowpass
 from cup.synthetic.reporting.metrics import regression_metrics
 from cup.utils.io import write_json
-from ginn_v2.checkpoint import load_checkpoint
-from ginn_v2.contracts import PATCH_SMOKE_REPORT_SCHEMA_VERSION, PREDICTION_SCHEMA_VERSION
-from ginn_v2.data import PatchDataset, _aligned_arrays
-from ginn_v2.runtime import resolve_device
+from ablation.checkpoint import load_checkpoint
+from ablation.contracts import PATCH_SMOKE_REPORT_SCHEMA_VERSION, PREDICTION_SCHEMA_VERSION
+from ablation.data import PatchDataset, _aligned_arrays
+from ablation.runtime import resolve_device
 
 
 def canonical_closure_arrays(
@@ -93,12 +93,12 @@ def predict_patches(
     model, checkpoint = load_checkpoint(checkpoint_path)
     if str(checkpoint.get("output_semantics") or "") != "predicted_increment_log_ai":
         raise ValueError(
-            "GINN-v2 checkpoint does not use predicted_increment_log_ai output semantics."
+            "ablation checkpoint does not use predicted_increment_log_ai output semantics."
         )
     if list(checkpoint.get("input_channels") or []) != [
         "seismic", "input_lfm_log_ai", "valid_mask"
     ]:
-        raise ValueError("GINN-v2 checkpoint input channel contract is not canonical.")
+        raise ValueError("ablation checkpoint input channel contract is not canonical.")
     device, device_metadata = resolve_device(device_name)
     model.to(device)
     model.eval()
@@ -224,13 +224,13 @@ def report_predictions(*, prediction_dir: Path, output_dir: Path) -> dict[str, A
     summary_path = prediction_dir / "prediction_summary.json"
     if not summary_path.is_file():
         raise FileNotFoundError(
-            f"Canonical GINN-v2 prediction summary not found: {summary_path}"
+            f"Canonical ablation prediction summary not found: {summary_path}"
         )
     with summary_path.open("r", encoding="utf-8") as handle:
         summary = json.load(handle)
     if str(summary.get("schema_version") or "") != PREDICTION_SCHEMA_VERSION:
         raise ValueError(
-            f"Unsupported GINN-v2 prediction schema {summary.get('schema_version')!r}; "
+            f"Unsupported ablation prediction schema {summary.get('schema_version')!r}; "
             f"expected {PREDICTION_SCHEMA_VERSION}."
         )
     index = pd.read_csv(prediction_dir / "prediction_index.csv")

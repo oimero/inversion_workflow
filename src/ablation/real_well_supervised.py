@@ -1,4 +1,4 @@
-"""Sparse real-well canonical-increment supervision for GINN-v2."""
+"""Sparse real-well canonical-increment supervision for ablation."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from cup.lfm.artifacts import resolve_lfm_variant
 from cup.seismic.viz import plot_well_waveform_qc, waveform_qc_metrics
 from cup.utils.io import repo_relative_path, resolve_relative_path
 from cup.well.anchor import build_well_anchor_samples, sample_volume_trilinear
-from ginn_v2.real_field import (
+from ablation.real_field import (
     RealFieldVolume,
     build_real_field_patch_index,
     load_real_field_volume,
@@ -1456,7 +1456,7 @@ def _write_well_figures(
     axes[0].set_xlabel("logAI")
     axes[1].set_xlabel("canonical increment logAI")
     fig.suptitle(
-        f"GINN-v2 real-well QC | {well_name} | cluster {cluster} | {checkpoint_name}"
+        f"ablation real-well QC | {well_name} | cluster {cluster} | {checkpoint_name}"
     )
     fig.savefig(ai_path, dpi=180)
     plt.close(fig)
@@ -1465,7 +1465,7 @@ def _write_well_figures(
     status, waveform = _write_forward_figure(
         path=forward_path,
         title=(
-            f"GINN-v2 real-well forward QC | {well_name} | "
+            f"ablation real-well forward QC | {well_name} | "
             f"cluster {cluster} | {checkpoint_name}"
         ),
         pred_log_ai=pred_ai,

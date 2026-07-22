@@ -1,4 +1,4 @@
-"""Train, predict, and report GINN-v2 composable experiments."""
+"""Train, predict, and report ablation composable experiments."""
 
 from __future__ import annotations
 
@@ -31,18 +31,18 @@ from cup.utils.io import (
     resolve_relative_path,
     write_json,
 )
-from ginn_v2.contracts import (
+from ablation.contracts import (
     ABLATION_REPORT_CARD_SCHEMA_VERSION,
     ABLATION_SUMMARY_SCHEMA_VERSION,
     MODEL_RUN_SCHEMA_VERSION,
     PATCH_SMOKE_REPORT_SCHEMA_VERSION,
     PREDICTION_SCHEMA_VERSION,
 )
-from ginn_v2.data import PatchSpec, build_patch_index, default_eval_kinds
-from ginn_v2.evaluation import predict_patches, report_predictions
-from ginn_v2.composable import run_experiment
-from ginn_v2.experiment import parse_experiment_config
-from ginn_v2.runtime import configure_training_logger
+from ablation.data import PatchSpec, build_patch_index, default_eval_kinds
+from ablation.evaluation import predict_patches, report_predictions
+from ablation.composable import run_experiment
+from ablation.experiment import parse_experiment_config
+from ablation.runtime import configure_training_logger
 
 
 def parse_args() -> argparse.Namespace:
@@ -122,7 +122,7 @@ def _split_assignment_path_for_benchmark(
     raw_path = str(manifest.get("split_assignment") or "").strip()
     if not raw_path:
         raise ValueError(
-            "GINN-v2 prediction requires the model run's split_assignment contract "
+            "ablation prediction requires the model run's split_assignment contract "
             "when rebuilding a v5 patch catalog."
         )
     return resolve_relative_path(raw_path, root=REPO_ROOT)
@@ -134,10 +134,10 @@ def _resolve_checkpoint_from_manifest(
     selection: str,
 ) -> tuple[str, Path]:
     if str(manifest.get("schema_version") or "") != MODEL_RUN_SCHEMA_VERSION:
-        raise ValueError(f"GINN-v2 model run must use schema {MODEL_RUN_SCHEMA_VERSION}.")
+        raise ValueError(f"ablation model run must use schema {MODEL_RUN_SCHEMA_VERSION}.")
     deployment = manifest.get("deployment_checkpoint")
     if not isinstance(deployment, Mapping):
-        raise ValueError("GINN-v2 experiment manifest lacks deployment_checkpoint.")
+        raise ValueError("ablation experiment manifest lacks deployment_checkpoint.")
     resolved_name = str(deployment.get("kind")) if selection == "primary" else selection
     if resolved_name == str(deployment.get("kind")):
         record = deployment
@@ -227,7 +227,7 @@ def _validate_checkpoint_benchmark_compatibility(
         )
     benchmark_identity = dict(checkpoint.get("benchmark_identity") or {})
     if not benchmark_identity:
-        raise ValueError("GINN-v2 checkpoint lacks benchmark identity provenance.")
+        raise ValueError("ablation checkpoint lacks benchmark identity provenance.")
     matching = [
         dict(value)
         for value in benchmark_identity.values()
@@ -274,10 +274,10 @@ def _validate_checkpoint_split_compatibility(
 ) -> None:
     assignments = manifest.get("split_assignments")
     if not isinstance(assignments, Mapping):
-        raise ValueError("GINN-v2 model run lacks per-source split_assignments provenance.")
+        raise ValueError("ablation model run lacks per-source split_assignments provenance.")
     sources = manifest.get("sources")
     if not isinstance(sources, Mapping):
-        raise ValueError("GINN-v2 model run lacks source provenance for split assignments.")
+        raise ValueError("ablation model run lacks source provenance for split assignments.")
     matching_source_ids = []
     for source_id, raw_source in sources.items():
         if not isinstance(raw_source, Mapping):
@@ -289,41 +289,41 @@ def _validate_checkpoint_split_compatibility(
             matching_source_ids.append(str(source_id))
     if len(matching_source_ids) != 1:
         raise ValueError(
-            "GINN-v2 model run does not identify exactly one synthetic source for split validation."
+            "ablation model run does not identify exactly one synthetic source for split validation."
         )
     source_id = matching_source_ids[0]
     raw_assignment = assignments.get(source_id)
     if not raw_assignment:
-        raise ValueError(f"GINN-v2 model run lacks split assignment for source {source_id!r}.")
+        raise ValueError(f"ablation model run lacks split assignment for source {source_id!r}.")
     assignment_path = resolve_relative_path(str(raw_assignment), root=REPO_ROOT)
     if not assignment_path.is_file():
-        raise FileNotFoundError(f"GINN-v2 split assignment not found: {assignment_path}")
+        raise FileNotFoundError(f"ablation split assignment not found: {assignment_path}")
     actual_digest = _sha256_file(assignment_path)
     benchmark_identity = dict(checkpoint.get("benchmark_identity") or {})
     identity = benchmark_identity.get(source_id)
     if not isinstance(identity, Mapping):
         raise ValueError(
-            f"GINN-v2 checkpoint lacks benchmark identity for source {source_id!r}."
+            f"ablation checkpoint lacks benchmark identity for source {source_id!r}."
         )
     if str(identity.get("split_assignment_sha256") or "") != actual_digest:
         raise ValueError(
-            "GINN-v2 split assignment does not match checkpoint provenance."
+            "ablation split assignment does not match checkpoint provenance."
         )
 
 
 def run_train(args: argparse.Namespace) -> None:
     if args.config is None:
         raise ValueError(
-            "GINN-v2 training now requires --config with the ginn_v2_experiment_v2 root. "
+            "ablation training now requires --config with the ablation_experiment_v2 root. "
             "Legacy training flags are not accepted; see "
-            "docs/spec/GINN_V2_COMPOSABLE_TRAINING_DESIGN.md."
+            "experiments/ablation/train.yaml."
         )
     config_path = resolve_relative_path(args.config, root=REPO_ROOT)
     experiment = parse_experiment_config(load_yaml_config(config_path))
     output_dir = (
         resolve_relative_path(args.output_dir, root=REPO_ROOT)
         if args.output_dir is not None
-        else REPO_ROOT / "experiments" / "ginn_v2" / "results" / experiment.experiment_id
+        else REPO_ROOT / "experiments" / "ablation" / "results" / experiment.experiment_id
     )
     logger = configure_training_logger(output_dir)
     manifest = run_experiment(
@@ -332,7 +332,7 @@ def run_train(args: argparse.Namespace) -> None:
         output_dir=output_dir,
         logger=logger,
     )
-    print("=== GINN-v2 composable experiment ===")
+    print("=== ablation composable experiment ===")
     print(f"Output: {output_dir}")
     print(f"Experiment: {experiment.experiment_id}")
     deployment = dict(manifest["deployment_checkpoint"])
@@ -358,7 +358,7 @@ def run_predict(args: argparse.Namespace) -> None:
         if args.benchmark_dir is not None
         else resolve_relative_path(manifest["benchmark_dir"], root=REPO_ROOT)
     )
-    output_dir = _resolve_output_dir("ginn_v2_predict", args.output_dir)
+    output_dir = _resolve_output_dir("ablation_predict", args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
     benchmark = SynthoseisBenchmark(benchmark_dir)
     checkpoint_payload = torch.load(
@@ -530,14 +530,14 @@ def run_predict(args: argparse.Namespace) -> None:
         summary["contract_fingerprint_sha256"] = prediction_contract_fingerprint
     write_json(output_dir / "prediction_summary.json", summary)
     write_json(output_dir / "prediction_manifest.json", summary)
-    print("=== GINN-v2 model ablation predict ===")
+    print("=== ablation model predict ===")
     print(f"Output: {output_dir}")
     print(f"Predictions: {result['n_predictions']}")
 
 
 def run_report(args: argparse.Namespace) -> None:
     prediction_dir = resolve_relative_path(args.prediction_dir, root=REPO_ROOT)
-    output_dir = _resolve_output_dir("ginn_v2_report", args.output_dir)
+    output_dir = _resolve_output_dir("ablation_report", args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
     result = report_predictions(prediction_dir=prediction_dir, output_dir=output_dir)
     summary = {
@@ -553,12 +553,12 @@ def run_report(args: argparse.Namespace) -> None:
         },
     }
     write_json(output_dir / "report_summary.json", summary)
-    print("=== GINN-v2 model ablation report ===")
+    print("=== ablation model report ===")
     print(f"Output: {output_dir}")
 
 
 def run_summarize(args: argparse.Namespace) -> None:
-    output_dir = _resolve_output_dir("ginn_v2_summary", args.output_dir)
+    output_dir = _resolve_output_dir("ablation_summary", args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
     rows: list[dict[str, object]] = []
     for spec in args.report:
@@ -643,7 +643,7 @@ def run_summarize(args: argparse.Namespace) -> None:
         "reports": rows,
     }
     write_json(output_dir / "run_summary.json", run_summary)
-    print("=== GINN-v2 model ablation summarize ===")
+    print("=== ablation model summarize ===")
     print(f"Output: {output_dir}")
     print(f"Reports: {len(rows)}")
 
@@ -823,7 +823,7 @@ def _best_row(frame: pd.DataFrame, *, metric: str, ascending: bool) -> dict[str,
 
 def _format_ablation_markdown(report_card: Mapping[str, object]) -> str:
     lines = [
-        "# GINN-v2 Model Ablation Report",
+        "# Ablation Model Report",
         "",
         f"Status: `{report_card['status']}`",
         "",

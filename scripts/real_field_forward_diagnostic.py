@@ -40,8 +40,8 @@ from cup.well.anchor import sample_volume_trilinear
 from cup.well.real_field_controls import load_well_control_set
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.utils.statistics import radius_connected_components
-from ginn_v2.contracts import FORWARD_DIAGNOSTIC_SCHEMA_VERSION, ZERO_SHOT_SUMMARY_SCHEMA_VERSION
-from ginn_v2.real_field import (
+from ablation.contracts import FORWARD_DIAGNOSTIC_SCHEMA_VERSION, ZERO_SHOT_SUMMARY_SCHEMA_VERSION
+from ablation.real_field import (
     diagnostic_metrics,
     load_selected_wavelet,
     load_zero_shot_predictions,

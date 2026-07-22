@@ -54,8 +54,8 @@ python scripts/real_field_zero_shot.py --output-dir scripts/output/real_field_ze
 # --- 必填 ---
 real_field_zero_shot:
   models:
-    - experiment_dir: experiments/ginn_v2/results/<experiment_id_a>
-    - experiment_dir: experiments/ginn_v2/results/<experiment_id_b>
+    - experiment_dir: experiments/ablation/results/<experiment_id_a>
+    - experiment_dir: experiments/ablation/results/<experiment_id_b>
 
 # --- 可选（有默认值）---
 real_field_zero_shot:
@@ -375,7 +375,7 @@ Status: needs_forward_diagnostic
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
 | variant 不存在或契约身份不一致 | Step 7 未完整发布，或 Step 6/7 配错 | 检查 `variant_manifest.csv` 并显式绑定同一 WellControlSet；旧 run 需重建 |
-| manifest 缺少 `experiment_id` | 模型使用了旧版训练产物 | 用当前版 `ginn_v2.py train` 重新训练 |
+| manifest 缺少 `experiment_id` | 模型使用了旧版训练产物 | 用当前版 `ablation.py train` 重新训练 |
 | `input_reference_stats.json` 缺失 | 模型训练时未生成参考统计文件 | 用当前版重新训练一次 |
 | `model_run_manifest.json` 缺少 experiment_id | 旧 manifest schema | 重新训练当前实验 |
 | `input_distribution_ood` 告警 | 真实地震数据分布显著偏离训练分布 | 检查 `seismic_value_transform` 是否正确；考虑是否需要重新训练以匹配真实数据分布 |

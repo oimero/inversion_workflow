@@ -1,4 +1,4 @@
-"""Device, loss, wavelet, and differentiable forward primitives for GINN-v2."""
+"""Device, loss, wavelet, and differentiable forward primitives for ablation."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def configure_training_logger(output_dir: Path) -> logging.Logger:
     """Create the logger shared by the composable runner and CLI."""
     return configure_run_logger(
         output_dir,
-        logger_name="ginn_v2",
+        logger_name="ablation",
         file_name="training.log",
     )
 
@@ -71,7 +71,7 @@ def load_benchmark_wavelet(
     manifest_path = Path(benchmark_dir) / "benchmark_manifest.json"
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    require_science_contract(manifest, label="GINN v2 Synthoseis benchmark")
+    require_science_contract(manifest, label="ablation Synthoseis benchmark")
     domain = str(manifest.get("sample_domain") or "")
     if domain == "depth":
         with _required_file(

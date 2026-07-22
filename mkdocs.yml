@@ -58,7 +58,6 @@ nav:
       - 06 真实工区井控数据集: guide/6-real-field-well-controls.md
       - 旁路 正演可观测性分析: guide/forward-observability.md
       - 旁路 合成基准生成与评估: guide/synthoseis-lite-benchmark.md
-      - 旁路 模型消融训练与评估: guide/ginn-v2-ablation.md
       - 07 真实工区低频模型: guide/7-real-field-lfm.md
       - 08 R0 真实工区零样本预测: guide/8-r0-real-field-zero-shot.md
       - 08 R1 真实工区正演闭环诊断: guide/8-r1-real-field-forward-diagnostic.md

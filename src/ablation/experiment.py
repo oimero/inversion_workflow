@@ -1,4 +1,4 @@
-"""Strict configuration contracts for composable GINN-v2 experiments."""
+"""Strict configuration contracts for composable ablation experiments."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ import re
 from typing import Any, Mapping
 
 from cup.impedance import validate_increment_contract
-from ginn_v2.contracts import EXPERIMENT_SCHEMA_VERSION
-from ginn_v2.models import ARCHITECTURE_IDS
+from ablation.contracts import EXPERIMENT_SCHEMA_VERSION
+from ablation.models import ARCHITECTURE_IDS
 
 
 SOURCE_KINDS = {"synthoseis_lite", "real_field", "real_wells"}
@@ -229,19 +229,19 @@ def _stage_deployment_eligibility(
 
 def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
     root = dict(payload)
-    if "ginn_v2" not in root:
+    if "ablation" not in root:
         legacy = sorted(set(root).intersection(LEGACY_KEYS))
         detail = f" Legacy fields found: {legacy}." if legacy else ""
         raise ValueError(
-            "GINN-v2 requires the ginn_v2_experiment_v2 configuration root 'ginn_v2'."
+            "ablation requires the ablation_experiment_v2 configuration root 'ablation'."
             + detail
-            + " See docs/spec/GINN_V2_COMPOSABLE_TRAINING_DESIGN.md."
+            + " See experiments/ablation/train.yaml for the active configuration."
         )
-    cfg = _mapping(root["ginn_v2"], "ginn_v2")
+    cfg = _mapping(root["ablation"], "ablation")
     legacy = sorted(set(cfg).intersection(LEGACY_KEYS))
     if legacy:
         raise ValueError(
-            f"Legacy GINN-v2 fields are not accepted: {legacy}. "
+            f"Legacy ablation fields are not accepted: {legacy}. "
             "Use architecture, sources, stages and experiment_id."
         )
     _reject_extra(cfg, {
@@ -249,28 +249,28 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         "normalization_reference", "patching", "stages", "deployment_checkpoint",
         "device", "increment_contract", "run_mode", "development_limited",
         "validation_semantics",
-    }, "ginn_v2")
+    }, "ablation")
     schema = str(cfg.get("schema_version") or EXPERIMENT_SCHEMA_VERSION)
     if schema != EXPERIMENT_SCHEMA_VERSION:
-        raise ValueError(f"Unsupported GINN-v2 experiment schema {schema!r}; expected {EXPERIMENT_SCHEMA_VERSION}.")
+        raise ValueError(f"Unsupported ablation experiment schema {schema!r}; expected {EXPERIMENT_SCHEMA_VERSION}.")
     increment_contract = validate_increment_contract(
-        _mapping(cfg.get("increment_contract"), "ginn_v2.increment_contract")
+        _mapping(cfg.get("increment_contract"), "ablation.increment_contract")
     ).as_dict()
     run_mode = str(cfg.get("run_mode") or "standard").strip().lower()
     if run_mode not in {"standard", "smoke"}:
-        raise ValueError("ginn_v2.run_mode must be standard or smoke.")
+        raise ValueError("ablation.run_mode must be standard or smoke.")
     development_limited = cfg.get("development_limited", run_mode == "smoke")
     if not isinstance(development_limited, bool):
-        raise ValueError("ginn_v2.development_limited must be boolean.")
+        raise ValueError("ablation.development_limited must be boolean.")
     if run_mode == "smoke" and not development_limited:
-        raise ValueError("ginn_v2 smoke runs must set development_limited=true.")
+        raise ValueError("ablation smoke runs must set development_limited=true.")
     validation_semantics = str(
         cfg.get("validation_semantics")
         or ("duplicated_training_patch" if run_mode == "smoke" else "independent_parent")
     ).strip()
     if validation_semantics not in {"independent_parent", "duplicated_training_patch"}:
         raise ValueError(
-            "ginn_v2.validation_semantics must be independent_parent or "
+            "ablation.validation_semantics must be independent_parent or "
             "duplicated_training_patch."
         )
     if run_mode == "standard" and validation_semantics == "duplicated_training_patch":
@@ -279,10 +279,10 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         )
     experiment_id = str(cfg.get("experiment_id") or "").strip()
     if not _ID.fullmatch(experiment_id):
-        raise ValueError("ginn_v2.experiment_id must be a non-empty directory-safe identifier.")
+        raise ValueError("ablation.experiment_id must be a non-empty directory-safe identifier.")
 
-    arch_raw = _mapping(cfg.get("architecture"), "ginn_v2.architecture")
-    _reject_extra(arch_raw, {"id", "hidden_channels", "depth", "lateral_kernel"}, "ginn_v2.architecture")
+    arch_raw = _mapping(cfg.get("architecture"), "ablation.architecture")
+    _reject_extra(arch_raw, {"id", "hidden_channels", "depth", "lateral_kernel"}, "ablation.architecture")
     architecture_id = str(arch_raw.get("id") or "")
     if architecture_id not in ARCHITECTURE_IDS:
         raise ValueError(f"architecture.id must be one of {list(ARCHITECTURE_IDS)}; legacy model IDs are rejected.")
@@ -300,9 +300,9 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         lateral_kernel,
     )
 
-    sources_raw = _mapping(cfg.get("sources"), "ginn_v2.sources")
+    sources_raw = _mapping(cfg.get("sources"), "ablation.sources")
     if not sources_raw:
-        raise ValueError("ginn_v2.sources must not be empty.")
+        raise ValueError("ablation.sources must not be empty.")
     sources: dict[str, dict[str, Any]] = {}
     for source_id, value in sources_raw.items():
         if not _ID.fullmatch(str(source_id)):
@@ -357,16 +357,16 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
                 )
         sources[str(source_id)] = source
 
-    norm = _mapping(cfg.get("normalization_reference"), "ginn_v2.normalization_reference")
-    _reject_extra(norm, {"source"}, "ginn_v2.normalization_reference")
+    norm = _mapping(cfg.get("normalization_reference"), "ablation.normalization_reference")
+    _reject_extra(norm, {"source"}, "ablation.normalization_reference")
     norm_source = str(norm.get("source") or "")
     if norm_source not in sources or sources[norm_source]["kind"] == "real_wells":
         raise ValueError("normalization_reference.source must reference a seismic/LFM source.")
 
-    patch_raw = _mapping(cfg.get("patching"), "ginn_v2.patching")
+    patch_raw = _mapping(cfg.get("patching"), "ablation.patching")
     if "min_valid_fraction" in patch_raw:
         raise ValueError("patching.min_valid_fraction is obsolete; configure min_valid_samples per loss block.")
-    _reject_extra(patch_raw, {"lateral_samples", "vertical_samples", "lateral_stride", "vertical_stride"}, "ginn_v2.patching")
+    _reject_extra(patch_raw, {"lateral_samples", "vertical_samples", "lateral_stride", "vertical_stride"}, "ablation.patching")
     patching = PatchingConfig(**{
         key: _positive_int(patch_raw.get(key), f"patching.{key}")
         for key in ("lateral_samples", "vertical_samples", "lateral_stride", "vertical_stride")
@@ -374,7 +374,7 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
 
     stages_value = cfg.get("stages")
     if not isinstance(stages_value, list) or not stages_value:
-        raise ValueError("ginn_v2.stages must be a non-empty list.")
+        raise ValueError("ablation.stages must be a non-empty list.")
     stages: list[dict[str, Any]] = []
     stage_ids: list[str] = []
     stage_has_supervised_ancestor: dict[str, bool] = {}
@@ -392,7 +392,7 @@ def parse_experiment_config(payload: Mapping[str, Any]) -> ExperimentConfig:
         optimizer = _mapping(stage.get("optimizer"), f"stages[{stage_index}].optimizer")
         _reject_extra(optimizer, {"kind", "learning_rate", "weight_decay"}, f"stages[{stage_index}].optimizer")
         if optimizer.get("kind") != "adamw":
-            raise ValueError("GINN-v2 v2 only supports optimizer.kind=adamw.")
+            raise ValueError("ablation only supports optimizer.kind=adamw.")
         optimizer["learning_rate"] = _finite(optimizer.get("learning_rate"), "optimizer.learning_rate", positive=True)
         optimizer["weight_decay"] = _finite(optimizer.get("weight_decay", 0.0), "optimizer.weight_decay", nonnegative=True)
         blocks_value = stage.get("loss_blocks")

@@ -25,7 +25,7 @@ flowchart TB
 | 旁路 · rock_physics_analysis | `experiments/common/common.yaml` |
 | 旁路 · forward_observability | `experiments/common/common.yaml` |
 | 旁路 · synthoseis_lite | `experiments/synthoseis_lite/synthoseis_lite.yaml` |
-| 旁路 · ginn_v2 | `experiments/ginn_v2/train.yaml` |
+| 旁路 · ablation | `experiments/ablation/train.yaml` |
 | 08 R0-R1 | `experiments/common/common.yaml` |
 
 ## 深度域工作流

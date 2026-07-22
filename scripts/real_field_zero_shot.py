@@ -1,4 +1,4 @@
-"""Run R0 real-field zero-shot prediction for frozen GINN-v2 candidates.
+"""Run R0 real-field zero-shot prediction for frozen ablation candidates.
 
 Usage::
 
@@ -49,9 +49,9 @@ from cup.utils.io import (
     write_json,
 )
 from cup.seismic.volume_export import export_volume_like_source, log_ai_to_ai_volume
-from ginn_v2.contracts import ZERO_SHOT_SUMMARY_SCHEMA_VERSION
-from ginn_v2.contracts import ZERO_SHOT_MODEL_SCHEMA_VERSION
-from ginn_v2.real_field import (
+from ablation.contracts import ZERO_SHOT_SUMMARY_SCHEMA_VERSION
+from ablation.contracts import ZERO_SHOT_MODEL_SCHEMA_VERSION
+from ablation.real_field import (
     input_qc_frame,
     load_real_field_section,
     load_real_field_volume,
@@ -273,7 +273,7 @@ def _load_seismic_reference_payload(*, run_cfg: dict, models: list[dict]) -> dic
         raise FileNotFoundError(
             "seismic_value_transform requires frozen input reference stats. "
             f"Expected {stats_path}. Re-run the training command with the current "
-            "scripts/ginn_v2.py so input_reference_stats.json is produced next to "
+            "scripts/ablation.py so input_reference_stats.json is produced next to "
             "normalization.json and the best/final checkpoints."
         )
     with stats_path.open("r", encoding="utf-8") as handle:

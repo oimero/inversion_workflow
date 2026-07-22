@@ -185,7 +185,7 @@ wavelet_batch_synthetic_depth:
 
 ## 旁路：深度域正演输入冻结
 
-`depth_forward_model_inputs.py` 将岩石物理分析产出的 AI–Vp 关系与深度域第 4 步产出的固定子波组装为统一的 `forward_model_inputs.json`，供 Synthoseis-lite 深度域、GINN v2 和 R1 正演诊断使用。
+`depth_forward_model_inputs.py` 将岩石物理分析产出的 AI–Vp 关系与深度域第 4 步产出的固定子波组装为统一的 `forward_model_inputs.json`，供 Synthoseis-lite 深度域、ablation 和 R1 正演诊断使用。
 
 岩石物理分析和子波提取各自独立重跑，本旁路只在子波或关系发生变化时才需要重跑，避免更新子波时必须重跑整个岩石物理拟合。
 
@@ -278,7 +278,7 @@ depth_forward_model_inputs:
                          ↓                        ↓
                     rock_physics ──────→ depth_forward_model_inputs
                                               ↓
-                                              synthoseis_lite depth v4 → GINN v2
+                                              synthoseis_lite depth v4 → ablation
                                                                           ↓
                                                    统一井控 → LFM v3 → R0 → R1(TVDSS)
 ```

@@ -1,16 +1,16 @@
-"""Schema versions for persisted GINN-v2 artifacts."""
+"""Schema versions for persisted ablation artifacts."""
 
 from __future__ import annotations
 
 
-EXPERIMENT_SCHEMA_VERSION = "ginn_v2_experiment_v2"
+EXPERIMENT_SCHEMA_VERSION = "ablation_experiment_v2"
 MODEL_RUN_SCHEMA_VERSION = EXPERIMENT_SCHEMA_VERSION
 INPUT_REFERENCE_STATS_SCHEMA_VERSION = "real_field_input_reference_stats_v1"
-PREDICTION_SCHEMA_VERSION = "ginn_v2_prediction_v3"
-CHECKPOINT_SCHEMA_VERSION = "ginn_v2_checkpoint_v5"
-PATCH_SMOKE_REPORT_SCHEMA_VERSION = "ginn_v2_patch_smoke_report_v1"
-ABLATION_SUMMARY_SCHEMA_VERSION = "ginn_v2_ablation_summary_v1"
-ABLATION_REPORT_CARD_SCHEMA_VERSION = "ginn_v2_ablation_report_card_v1"
+PREDICTION_SCHEMA_VERSION = "ablation_prediction_v3"
+CHECKPOINT_SCHEMA_VERSION = "ablation_checkpoint_v5"
+PATCH_SMOKE_REPORT_SCHEMA_VERSION = "ablation_patch_smoke_report_v1"
+ABLATION_SUMMARY_SCHEMA_VERSION = "ablation_summary_v1"
+ABLATION_REPORT_CARD_SCHEMA_VERSION = "ablation_report_card_v1"
 ZERO_SHOT_MODEL_SCHEMA_VERSION = "real_field_zero_shot_model_v5"
 ZERO_SHOT_SUMMARY_SCHEMA_VERSION = "real_field_zero_shot_summary_v5"
 FORWARD_DIAGNOSTIC_SCHEMA_VERSION = "real_field_forward_diagnostic_summary_v6"

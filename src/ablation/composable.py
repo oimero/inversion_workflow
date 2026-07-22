@@ -1,4 +1,4 @@
-"""Composable sources, losses, and stage runner for GINN-v2 experiments."""
+"""Composable sources, losses, and stage runner for ablation experiments."""
 
 from __future__ import annotations
 
@@ -24,19 +24,19 @@ from cup.utils.io import (
     repo_relative_path,
     write_json,
 )
-from ginn_v2.contracts import CHECKPOINT_SCHEMA_VERSION, EXPERIMENT_SCHEMA_VERSION
-from ginn_v2.data import (
+from ablation.contracts import CHECKPOINT_SCHEMA_VERSION, EXPERIMENT_SCHEMA_VERSION
+from ablation.data import (
     PatchDataset, PatchSpec, build_patch_index, compute_input_reference_stats,
     compute_normalization,
 )
-from ginn_v2.experiment import ExperimentConfig
-from ginn_v2.models import build_model
-from ginn_v2.real_field import (
+from ablation.experiment import ExperimentConfig
+from ablation.models import build_model
+from ablation.real_field import (
     RealFieldVolume, build_real_field_patch_index, finite_summary_stats,
     load_real_field_volume,
 )
-from ginn_v2.real_well_supervised import prepare_real_well_supervised_support
-from ginn_v2.runtime import forward_physics_batch, load_benchmark_wavelet, masked_mse, resolve_device
+from ablation.real_well_supervised import prepare_real_well_supervised_support
+from ablation.runtime import forward_physics_batch, load_benchmark_wavelet, masked_mse, resolve_device
 
 
 @dataclass
@@ -344,7 +344,7 @@ def validate_source_axis_contracts(
     if len(contracts) != 1:
         details = {source_id: dict(source_contracts[source_id]) for source_id in sorted(consumed_sources)}
         raise ValueError(
-            "A GINN-v2 experiment cannot mix time/depth or incompatible sample-axis contracts "
+            "A ablation experiment cannot mix time/depth or incompatible sample-axis contracts "
             f"without an explicit resampling adapter: {details}"
         )
     return dict(source_contracts[next(iter(consumed_sources))])
@@ -359,7 +359,7 @@ def _sample_axis_contract(
     differences = np.diff(axis)
     step = float(differences[0])
     if step <= 0 or not np.allclose(differences, step, rtol=0.0, atol=max(1e-12, abs(step) * 1e-9)):
-        raise ValueError("GINN-v2 requires a regular increasing sample axis.")
+        raise ValueError("ablation requires a regular increasing sample axis.")
     return {
         "sample_domain": domain,
         "sample_unit": unit,
@@ -472,7 +472,7 @@ def _materialize_parent_split_assignment(
     """Materialize the GINN-owned parent split with a versioned hash contract."""
     if str(benchmark.schema) != "synthoseis_lite_v5":
         raise ValueError(
-            "GINN-v2 parent split assignment requires a synthoseis_lite_v5 benchmark."
+            "ablation parent split assignment requires a synthoseis_lite_v5 benchmark."
         )
     required_columns = {"realization_id", "evaluation_role"}
     missing_columns = sorted(required_columns - set(benchmark.realizations.columns))
@@ -486,7 +486,7 @@ def _materialize_parent_split_assignment(
     seed = 20260714
     split_contract = {
         "version": "parent_hash_split_v1",
-        "owner": "ginn_v2_experiment_suite",
+        "owner": "ablation_experiment_suite",
         "seed": seed,
         "hash_algorithm": "sha256",
         "validation_fraction": 0.15,
@@ -1045,7 +1045,7 @@ def _checkpoint_payload(
     }
     split_contract = {
         "version": "parent_hash_split_v1",
-        "owner": "ginn_v2_experiment_suite",
+        "owner": "ablation_experiment_suite",
         "seed": 20260714,
         "hash_algorithm": "sha256",
         "validation_fraction": 0.15,
@@ -1634,7 +1634,7 @@ def run_experiment(
     """Run a strict canonical-increment experiment."""
     output_dir.mkdir(parents=True, exist_ok=True)
     if (output_dir / "experiment_manifest.json").exists() or (output_dir / "stages").exists():
-        raise FileExistsError(f"GINN-v2 experiment outputs already exist: {output_dir}")
+        raise FileExistsError(f"ablation experiment outputs already exist: {output_dir}")
     device, device_metadata = resolve_device(config.device)
     model, info = build_model(**({
         "architecture_id": config.architecture.id,
@@ -1680,7 +1680,7 @@ def run_experiment(
             if benchmark_increment_contract != experiment_increment_contract:
                 raise ValueError(
                     f"Synthetic source {source_id} increment_contract does not exactly match "
-                    "ginn_v2.increment_contract."
+                    "ablation.increment_contract."
                 )
             forward_inputs_path = _benchmark_forward_model_inputs_path(
                 synthetic[source_id][0], root=root,
@@ -1842,7 +1842,7 @@ def run_experiment(
     }
     if len(forward_model_inputs_paths) > 1:
         raise ValueError(
-            "A GINN-v2 experiment must use one depth forward_model_inputs contract."
+            "A ablation experiment must use one depth forward_model_inputs contract."
         )
     forward_model_inputs_path = (
         repo_relative_path(next(iter(forward_model_inputs_paths)), root=root)

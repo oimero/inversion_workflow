@@ -4,7 +4,7 @@
 
 ## 1. 目标与定位
 
-Enhance v2 是位于 GINN v2 R0 之后的独立微纹理补全阶段。GINN v2 负责恢复由当前合成先验和地震有效频带支持的中频规范阻抗增量；Enhance v2 在固定的 R0 结果上补充由井统计约束的薄层纹理。
+Enhance v2 是位于 ablation R0 之后的独立微纹理补全阶段。ablation 负责恢复由当前合成先验和地震有效频带支持的中频规范阻抗增量；Enhance v2 在固定的 R0 结果上补充由井统计约束的薄层纹理。
 
 定义：
 
@@ -22,7 +22,7 @@ m_{\mathrm{base}}+\widehat h_{\mathrm{microtexture}}
 
 其中：
 
-- `base_log_ai`：纯合成监督 GINN v2 在真实工区的 `predicted_log_ai`；
+- `base_log_ai`：纯合成监督 ablation 在真实工区的 `predicted_log_ai`；
 - `predicted_microtexture_log_ai`：Enhance v2 输出的井统计条件微纹理；
 - `enhanced_log_ai`：二者之和；
 - `enhanced_ai`：`exp(enhanced_log_ai)`。
@@ -40,11 +40,11 @@ m_{\mathrm{base}}+\widehat h_{\mathrm{microtexture}}
 
 - 仅支持深度域 TVDSS，纵向单位为米；
 - 使用单道 1D 网络；
-- base 来自纯合成监督 GINN v2 的真实工区 R0；
+- base 来自纯合成监督 ablation 的真实工区 R0；
 - 真实井只用于全目标层纹理统计标定；
 - 训练不包含真实井监督和 physics 反向传播；
 - 训练数据由 Enhance v2 在线生成；
-- Synthoseis-lite 和 GINN v2 不生成或学习同一套薄层纹理；
+- Synthoseis-lite 和 ablation 不生成或学习同一套薄层纹理；
 - A/B/C 先跑覆盖全部井的剖面，剖面审查后才允许完整体；
 - B/C 首轮各跑一个 seed，C 通过机制审查后再跑三个 seed。
 
@@ -84,7 +84,7 @@ experiments/enhance_v2/run_enhance_v2.ps1
 
 - `enhance_v2` 可依赖 `cup.physics`、R0 物化产物和井控 reader；
 - `enhance_v2` 不依赖 `cup.synthetic`、`ginn_depth` 或旧 `enhance`；
-- GINN v2、R0 和 R1 不导入 `enhance_v2`；
+- ablation、R0 和 R1 不导入 `enhance_v2`；
 - A 是物化的 base 对照，不创建伪 checkpoint；
 - B/C 共享 generator 和验证 catalog，只替换 loss；
 - v2 最小垂直切片通过后删除 `src/enhance`，历史实现由 Git 保存。
@@ -110,7 +110,7 @@ depth_basis            tvdss
 同时读取：
 
 - R0 summary；
-- GINN v2 model manifest；
+- ablation model manifest；
 - `forward_model_inputs.json`；
 - 该文件声明的时间子波和 AI–Vp 关系。
 
@@ -135,7 +135,7 @@ manifest 只记录以下可读路径和 schema：
 
 - R0 summary；
 - R0 predictions；
-- GINN v2 model manifest；
+- ablation model manifest；
 - well-control summary；
 - forward-model inputs；
 - 配置快照。
@@ -426,7 +426,7 @@ C 的首个 seed 通过机制审查后，使用相同数据合同再运行两个
 
 ### 阶段 0：冻结中频 base
 
-- [ ] 建立只包含 `synthetic_supervised` 的专用 GINN v2 实验；
+- [ ] 建立只包含 `synthetic_supervised` 的专用 ablation 实验；
 - [ ] 完成覆盖全部井的 section R0；
 - [ ] 完成 volume R0；
 - [ ] 确认 R0 manifest、checkpoint 和 closure 均为纯监督；

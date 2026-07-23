@@ -19,8 +19,44 @@ class SectionGeometry:
     horizon_coordinates: np.ndarray
     sample_domain: str
     axis_unit: str
+    xline_step: float
     depth_basis: str | None = None
     qc_rows: tuple[dict[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        domain = str(self.sample_domain).strip().casefold()
+        expected_unit = {"time": "s", "depth": "m"}.get(domain)
+        if expected_unit != str(self.axis_unit):
+            raise ValueError("SectionGeometry domain and unit are inconsistent.")
+        if domain == "depth" and self.depth_basis != "tvdss":
+            raise ValueError("depth SectionGeometry requires depth_basis='tvdss'.")
+        if domain == "time" and self.depth_basis is not None:
+            raise ValueError("time SectionGeometry must not define depth_basis.")
+        lateral = np.asarray(self.lateral_m, dtype=np.float64).reshape(-1)
+        horizons = np.asarray(self.horizon_coordinates, dtype=np.float64)
+        if horizons.ndim != 2 or horizons.shape[0] != lateral.size:
+            raise ValueError("SectionGeometry horizon_coordinates must be [lateral, horizon].")
+        if lateral.size < 2 or np.any(~np.isfinite(lateral)) or np.any(np.diff(lateral) <= 0.0):
+            raise ValueError("SectionGeometry lateral_m must be finite and increasing.")
+        if not np.isfinite(float(self.xline_step)) or float(self.xline_step) == 0.0:
+            raise ValueError("SectionGeometry xline_step must be finite and non-zero.")
+        object.__setattr__(self, "sample_domain", domain)
+        object.__setattr__(self, "axis_unit", str(self.axis_unit))
+        object.__setattr__(self, "lateral_m", lateral)
+        object.__setattr__(self, "horizon_coordinates", horizons)
+        object.__setattr__(self, "xline_step", float(self.xline_step))
+
+    @property
+    def horizon_twt_s(self) -> np.ndarray:
+        if self.sample_domain != "time":
+            raise AttributeError("depth SectionGeometry has no horizon_twt_s field")
+        return self.horizon_coordinates
+
+    @property
+    def horizon_tvdss_m(self) -> np.ndarray:
+        if self.sample_domain != "depth":
+            raise AttributeError("time SectionGeometry has no horizon_tvdss_m field")
+        return self.horizon_coordinates
 
 
 def validate_line_geometry(geometry: Any) -> None:

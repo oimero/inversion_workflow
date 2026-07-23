@@ -203,12 +203,27 @@ def geometry_feasibility_rows(
     highres_step: float,
     duration_reference: str,
 ) -> list[dict[str, Any]]:
+    axis_domains = {
+        "twt_s": "time",
+        "tvdss_m": "depth",
+    }
+    if vertical_axis_name not in axis_domains:
+        raise ValueError(
+            "vertical_axis_name must be one of 'twt_s' or 'tvdss_m'."
+        )
+    expected_domain = axis_domains[vertical_axis_name]
     rows: list[dict[str, Any]] = []
     for section in sections:
-        if hasattr(section, "horizon_twt_s"):
-            raw_horizons = getattr(section, "horizon_twt_s")
-        else:
-            raw_horizons = getattr(section, "horizon_tvdss_m")
+        if str(getattr(section, "sample_domain", "")).casefold() != expected_domain:
+            raise ValueError(
+                "section sample_domain does not match vertical_axis_name"
+            )
+        try:
+            raw_horizons = section.horizon_coordinates
+        except AttributeError as exc:
+            raise ValueError(
+                "section does not expose the shared horizon_coordinates field"
+            ) from exc
         horizons = np.asarray(raw_horizons, dtype=np.float64)
         for zone_index, (top, bottom) in enumerate(
             zip(ordered_horizons[:-1], ordered_horizons[1:])

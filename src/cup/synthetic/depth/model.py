@@ -12,20 +12,9 @@ from typing import Any
 
 import numpy as np
 
+from cup.synthetic.core.geometry import SectionGeometry as DepthSectionGeometry
 from cup.synthetic.core.records import BenchmarkSample
 from cup.synthetic.core.scenarios import GenerationScenario
-
-
-@dataclass(frozen=True)
-class DepthSectionGeometry:
-    section_id: str
-    lateral_m: np.ndarray
-    inline_float: np.ndarray
-    xline_float: np.ndarray
-    x_m: np.ndarray
-    y_m: np.ndarray
-    horizon_tvdss_m: np.ndarray
-    qc_rows: tuple[dict[str, Any], ...]
 
 
 @dataclass(frozen=True)

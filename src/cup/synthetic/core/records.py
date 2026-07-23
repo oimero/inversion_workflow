@@ -109,6 +109,92 @@ class ForwardResult:
 
 
 @dataclass(frozen=True)
+class LfmObservation:
+    """A low-frequency observation with its axis and provenance."""
+
+    values: np.ndarray
+    sample_axis: SampleAxis
+    valid_mask: np.ndarray
+    source_identity: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sample_axis, SampleAxis):
+            raise TypeError("LfmObservation.sample_axis must be SampleAxis.")
+        values = np.asarray(self.values, dtype=np.float64)
+        valid = np.asarray(self.valid_mask, dtype=bool)
+        expected = (values.shape[0], self.sample_axis.coordinates.size)
+        if values.ndim != 2 or values.shape != expected or valid.shape != expected:
+            raise ValueError(
+                "LfmObservation values and valid_mask must be [lateral, sample]."
+            )
+        if np.any(valid & ~np.isfinite(values)):
+            raise ValueError("LfmObservation valid values must be finite.")
+        if not isinstance(self.source_identity, Mapping) or not self.source_identity:
+            raise ValueError("LfmObservation.source_identity must be explicit.")
+        object.__setattr__(self, "values", values.copy())
+        object.__setattr__(self, "valid_mask", valid.copy())
+        object.__setattr__(self, "source_identity", MappingProxyType(dict(self.source_identity)))
+
+
+@dataclass(frozen=True)
+class StructuredSampleRecord:
+    """Producer-owned sample record without increment semantics."""
+
+    truth: SyntheticTruth
+    projected: ProjectedTruth
+    forward: ForwardResult
+    lfm: LfmObservation
+    valid_mask: np.ndarray
+    qc: Mapping[str, Any] = field(default_factory=dict)
+    domain_metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        valid = np.asarray(self.valid_mask, dtype=bool)
+        expected = (
+            self.truth.lateral_m.size,
+            self.projected.model_axis.coordinates.size,
+        )
+        if valid.shape != expected:
+            raise ValueError("StructuredSampleRecord.valid_mask does not match model grid.")
+        if self.lfm.sample_axis is not self.projected.model_axis and not np.array_equal(
+            self.lfm.sample_axis.coordinates,
+            self.projected.model_axis.coordinates,
+        ):
+            raise ValueError("StructuredSampleRecord LFM axis differs from model axis.")
+        if not np.array_equal(self.lfm.valid_mask, valid):
+            raise ValueError("StructuredSampleRecord LFM mask differs from valid_mask.")
+        for name, values in (
+            ("lfm", self.lfm.values),
+            ("seismic_observed", self.forward.seismic_observed),
+        ):
+            if np.asarray(values).shape != expected:
+                raise ValueError(f"StructuredSampleRecord {name} shape is invalid.")
+        object.__setattr__(self, "valid_mask", valid.copy())
+        object.__setattr__(self, "qc", MappingProxyType(dict(self.qc)))
+        object.__setattr__(self, "domain_metadata", MappingProxyType(dict(self.domain_metadata)))
+
+    @classmethod
+    def from_benchmark_sample(cls, sample: "BenchmarkSample") -> "StructuredSampleRecord":
+        """Strip the legacy benchmark decomposition at the new seam."""
+        if not isinstance(sample, BenchmarkSample):
+            raise TypeError("StructuredSampleRecord requires a BenchmarkSample source.")
+        return cls(
+            truth=sample.truth,
+            projected=sample.projected,
+            forward=sample.forward,
+            lfm=LfmObservation(
+                values=sample.input_lfm_canonical_log_ai,
+                sample_axis=sample.projected.model_axis,
+                valid_mask=sample.valid_mask,
+                source_identity=dict(sample.domain_metadata["lfm_source_identity"]),
+            ),
+            valid_mask=sample.valid_mask,
+            qc=sample.qc,
+            domain_metadata=sample.domain_metadata,
+        )
+
+
+@dataclass(frozen=True)
 class BenchmarkSample:
     truth: SyntheticTruth
     projected: ProjectedTruth
@@ -123,6 +209,9 @@ class BenchmarkSample:
     def __post_init__(self) -> None:
         object.__setattr__(self, "qc", MappingProxyType(dict(self.qc)))
         object.__setattr__(self, "domain_metadata", MappingProxyType(dict(self.domain_metadata)))
+
+    def to_structured_record(self) -> StructuredSampleRecord:
+        return StructuredSampleRecord.from_benchmark_sample(self)
 
 
 @dataclass(frozen=True)
@@ -164,7 +253,9 @@ __all__ = [
     "DomainPreparation",
     "ForwardResult",
     "ForwardSupport",
+    "LfmObservation",
     "ProjectedTruth",
     "SampleAxis",
+    "StructuredSampleRecord",
     "TimeForwardExtras",
 ]

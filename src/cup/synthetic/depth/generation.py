@@ -173,7 +173,11 @@ def build_depth_sections(
                 xline_float=xl,
                 x_m=x,
                 y_m=y,
-                horizon_tvdss_m=values,
+                horizon_coordinates=values,
+                sample_domain="depth",
+                axis_unit="m",
+                depth_basis="tvdss",
+                xline_step=float(survey.line_geometry.xline_axis.step),
                 qc_rows=tuple(qc),
             )
         )
@@ -297,6 +301,31 @@ def generate_depth_realization(
                 "sample_domain": "depth",
                 "depth_basis": "tvdss",
                 "increment_contract": canonical_contract.as_dict(),
+                "xline_step": float(section.xline_step),
+                "lfm_source_identity": {
+                    "kind": "synthetic_target_derived_lfm",
+                    "construction": "canonical_background_component_of_target_decomposition",
+                    "target_dependency": True,
+                    "contract": canonical_contract.as_dict(),
+                },
+                "structured_identity": {
+                    "producer": {
+                        "name": "synthoseis_lite",
+                        "artifact_type": "structured_truth_v1",
+                    },
+                    "calibration": {
+                        "generator_family": calibration.generator_family,
+                    },
+                    "projection": {
+                        "name": "cup.synthetic.core.projection",
+                        "operator": "finite_support_fir_decimate",
+                    },
+                    "forward": {
+                        "sample_domain": "depth",
+                        "depth_basis": "tvdss",
+                        "operator": "cup.physics.execution.DepthForwardExecutor",
+                    },
+                },
             }
         ),
     )

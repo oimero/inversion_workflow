@@ -122,6 +122,9 @@ class SyntheticTruth:
     boundary_mask_highres: np.ndarray
     object_catalog: tuple[Mapping[str, Any], ...]
     object_lateral_coefficients: tuple[Mapping[str, Any], ...]
+    structured_zone_truth: tuple[Mapping[str, Any], ...]
+    structured_segment_truth: tuple[Mapping[str, Any], ...]
+    clipping_mask_highres: np.ndarray
     diagnostics: Mapping[str, Any]
 
     def __post_init__(self) -> None:
@@ -135,6 +138,23 @@ class SyntheticTruth:
             "object_lateral_coefficients",
             tuple(MappingProxyType(dict(row)) for row in self.object_lateral_coefficients),
         )
+        object.__setattr__(
+            self,
+            "structured_zone_truth",
+            tuple(MappingProxyType(dict(row)) for row in self.structured_zone_truth),
+        )
+        object.__setattr__(
+            self,
+            "structured_segment_truth",
+            tuple(MappingProxyType(dict(row)) for row in self.structured_segment_truth),
+        )
+        clipping = np.asarray(self.clipping_mask_highres, dtype=bool)
+        log_ai = np.asarray(self.log_ai_highres)
+        if clipping.shape != log_ai.shape:
+            raise ValueError(
+                "SyntheticTruth.clipping_mask_highres must match log_ai_highres."
+            )
+        object.__setattr__(self, "clipping_mask_highres", clipping.copy())
         object.__setattr__(self, "diagnostics", MappingProxyType(dict(self.diagnostics)))
 
 
@@ -718,8 +738,11 @@ def generate_field_conditioned_truth(
     zone_id_grid = np.full((n_lateral, n_highres), -1, dtype=np.int16)
     geometry_event_mask = np.zeros((n_lateral, n_highres), dtype=bool)
     boundary = np.zeros((n_lateral, n_highres), dtype=bool)
+    clipping_mask = np.zeros((n_lateral, n_highres), dtype=bool)
     object_catalog: list[dict[str, Any]] = []
     object_lateral_coefficients: list[dict[str, Any]] = []
+    structured_zone_truth: list[dict[str, Any]] = []
+    structured_segment_truth: list[dict[str, Any]] = []
     field_qc: list[dict[str, Any]] = []
     rejection_details: list[dict[str, Any]] = []
     quality_warning_details: list[dict[str, Any]] = []
@@ -787,6 +810,24 @@ def generate_field_conditioned_truth(
             global_seed=global_seed,
             variant_id=scenario.geometry_variant_id,
         )
+        for lateral_index in range(n_lateral):
+            top = float(horizons[lateral_index, zone_index])
+            bottom = float(horizons[lateral_index, zone_index + 1])
+            structured_zone_truth.append(
+                {
+                    "realization_id": realization_id,
+                    "scenario_id": scenario.scenario_id,
+                    "zone_id": zone_id,
+                    "zone_grid_value": int(zone_index),
+                    "lateral_index": int(lateral_index),
+                    "lateral_m": float(lateral[lateral_index]),
+                    "top": top,
+                    "bottom": bottom,
+                    "background_a": float(a),
+                    "background_b": float(b),
+                    "zone_valid": True,
+                }
+            )
         cumulative = np.vstack((np.zeros(n_lateral), np.cumsum(thickness_weights, axis=0)))
         for local_object_index, item in enumerate(objects):
             global_object_id = next_global_object_id
@@ -847,14 +888,18 @@ def generate_field_conditioned_truth(
                     qc_zeta = (qc_coordinate - top) / max(
                         bottom - top, highres_interval
                     )
-                projected, projection = _project_profile_coefficients(
+                raw_parameters = np.asarray(
                     coefficients[local_object_index, lateral_index],
+                    dtype=np.float64,
+                ).copy()
+                projected, projection = _project_profile_coefficients(
+                    raw_parameters,
                     xi=qc_xi,
                     state_model=calibration.zone_models[zone_id]["states"][item["state"]],
                 )
                 background = a + b * (2.0 * zeta - 1.0)
                 background_qc = a + b * (2.0 * qc_zeta - 1.0)
-                projected, c0_adjustment = _condition_c0_to_ai_bounds(
+                effective, c0_adjustment = _condition_c0_to_ai_bounds(
                     projected,
                     xi=qc_xi,
                     background=background_qc,
@@ -862,7 +907,44 @@ def generate_field_conditioned_truth(
                     state_model=calibration.zone_models[zone_id]["states"][item["state"]],
                     ai_bounds=calibration.zone_models[zone_id]["ai_bounds"],
                 )
-                c0, c1, c2 = projected
+                c0, c1, c2 = effective
+                structured_segment_truth.append(
+                    {
+                        "realization_id": realization_id,
+                        "scenario_id": scenario.scenario_id,
+                        "zone_id": zone_id,
+                        "zone_grid_value": int(zone_index),
+                        "local_object_index": int(local_object_index),
+                        "calibration_object_id": item["object_id"],
+                        "object_id": int(global_object_id),
+                        "state": item["state"],
+                        "state_id": int(item["state_id"]),
+                        "event_target": bool(local_object_index == event_target),
+                        "lateral_index": int(lateral_index),
+                        "lateral_m": float(lateral[lateral_index]),
+                        "top": float(object_top),
+                        "bottom": float(object_bottom),
+                        "duration_fraction": float(
+                            thickness_weights[local_object_index, lateral_index]
+                        ),
+                        "duration_samples": int(indices.size),
+                        "c0_raw": float(raw_parameters[0]),
+                        "c1_raw": float(raw_parameters[1]),
+                        "c2_raw": float(raw_parameters[2]),
+                        "c0_projected": float(projected[0]),
+                        "c1_projected": float(projected[1]),
+                        "c2_projected": float(projected[2]),
+                        "c0_effective": float(effective[0]),
+                        "c1_effective": float(effective[1]),
+                        "c2_effective": float(effective[2]),
+                        "segment_supervision_valid": bool(
+                            indices.size > 0
+                            and np.all(np.isfinite(raw_parameters))
+                            and np.all(np.isfinite(projected))
+                            and np.all(np.isfinite(effective))
+                        ),
+                    }
+                )
                 object_lateral_coefficients.append(
                     {
                         "realization_id": realization_id,
@@ -933,6 +1015,9 @@ def generate_field_conditioned_truth(
                 ai_upper = float(bounds["p99"])
                 ai_tolerance = 1e-10 * max(1.0, abs(ai_lower), abs(ai_upper))
                 clipped = np.clip(values, ai_lower, ai_upper)
+                clipping_mask[lateral_index, indices] = (
+                    np.abs(values - clipped) > 0.0
+                )
                 clipping_count += int(
                     np.count_nonzero(
                         (values < ai_lower - ai_tolerance)
@@ -1207,6 +1292,9 @@ def generate_field_conditioned_truth(
         boundary_mask_highres=boundary,
         object_catalog=tuple(object_catalog),
         object_lateral_coefficients=tuple(object_lateral_coefficients),
+        structured_zone_truth=tuple(structured_zone_truth),
+        structured_segment_truth=tuple(structured_segment_truth),
+        clipping_mask_highres=clipping_mask,
         diagnostics={
             "status": "ok",
             "quality_warning_count": len(quality_warning_details) + len(correlation_warnings),

@@ -116,6 +116,30 @@ def build_time_field_sample(
             domain_metadata={
                 "sample_domain": "time",
                 "increment_contract": contract.as_dict(),
+                "xline_step": float(section.xline_step),
+                "lfm_source_identity": {
+                    "kind": "synthetic_target_derived_lfm",
+                    "construction": "canonical_background_component_of_target_decomposition",
+                    "target_dependency": True,
+                    "contract": contract.as_dict(),
+                },
+                "structured_identity": {
+                    "producer": {
+                        "name": "synthoseis_lite",
+                        "artifact_type": "structured_truth_v1",
+                    },
+                    "calibration": {
+                        "generator_family": calibration.generator_family,
+                    },
+                    "projection": {
+                        "name": "cup.synthetic.core.projection",
+                        "operator": "finite_support_fir_decimate",
+                    },
+                    "forward": {
+                        "sample_domain": "time",
+                        "operator": "cup.physics.numpy_backend.forward_time",
+                    },
+                },
             },
         ),
     )

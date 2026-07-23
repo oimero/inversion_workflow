@@ -40,6 +40,7 @@ from cup.synthetic.core.field_runner import (
 )
 from cup.synthetic.core.rejections import StagedRejection
 from cup.synthetic.core.writer import write_benchmark_sample, write_benchmark_view
+from cup.synthetic.core.structured_artifact import write_structured_truth_v1
 from cup.synthetic.core.records import BenchmarkSample, BenchmarkView
 from cup.synthetic.reporting.figures import write_generation_figures
 from cup.utils.io import (
@@ -654,6 +655,12 @@ class SyntheticBenchmarkPipeline:
                     if sample is None:
                         raise RuntimeError("accepted generation attempt has no BenchmarkSample")
                     reference = None if qc_only else write_benchmark_sample(h5, sample)
+                    structured_artifacts = ()
+                    if not qc_only:
+                        structured_artifacts = write_structured_truth_v1(
+                            sample.to_structured_record(),
+                            output_dir / "structured_truth_v1",
+                        )
                     owner_path = "" if reference is None else reference.hdf5_group
                     scenario = sample.truth.scenario
                     local_index_rows: list[dict[str, Any]] = []
@@ -682,6 +689,15 @@ class SyntheticBenchmarkPipeline:
                         "seismic_model_consistent_dataset": "" if not owner_path else f"{owner_path}/seismic/seismic_model_consistent",
                         "valid_mask_dataset": "" if not owner_path else f"{owner_path}/masks/valid_mask",
                         "valid_sample_count": int(np.count_nonzero(sample.valid_mask)),
+                        "structured_truth_artifact_root": (
+                            ""
+                            if not structured_artifacts
+                            else str(
+                                Path(structured_artifacts[0])
+                                .relative_to(output_dir)
+                                .parent.parent.parent
+                            )
+                        ),
                     }
                     local_index_rows.append(base_record)
                     local_realization_rows.append({
@@ -702,6 +718,9 @@ class SyntheticBenchmarkPipeline:
                         "target_log_ai_dataset": "" if not owner_path else f"{owner_path}/truth/model_target_log_ai",
                         "canonical_background_dataset": "" if not owner_path else f"{owner_path}/priors/canonical_background_log_ai",
                         "target_increment_dataset": "" if not owner_path else f"{owner_path}/targets/target_increment_log_ai",
+                        "structured_truth_artifact_root": base_record[
+                            "structured_truth_artifact_root"
+                        ],
                         "valid_mask_dataset": base_record["valid_mask_dataset"],
                         "n_valid": base_record["valid_sample_count"],
                     })
@@ -870,6 +889,9 @@ class SyntheticBenchmarkPipeline:
                         "synthetic_benchmark": h5_path,
                         "realization_index": output_dir / "realization_index.csv",
                         "seismic_view_index": output_dir / "seismic_view_index.csv",
+                        "structured_truth_v1": str(
+                            output_dir / "structured_truth_v1"
+                        ),
                     },
                 ),
             }
@@ -896,6 +918,11 @@ class SyntheticBenchmarkPipeline:
             "preflight": preflight_summary,
             "seismic_views": dict(resolved_config.get("seismic_views") or {}),
             "seismic_view_count": int(len(view_rows)),
+            "structured_truth_root": (
+                str(output_dir / "structured_truth_v1")
+                if not qc_only
+                else ""
+            ),
             "rejection_reason_summary": [] if rejection_summary.empty else rejection_summary.to_dict(orient="records"),
             "usable": not bool(failure_reason),
             "quality_warnings": (

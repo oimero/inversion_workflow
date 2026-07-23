@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -15,18 +14,7 @@ from cup.seismic.target_zone import TargetZone
 from cup.config.workflow import WorkflowConfig
 from cup.utils.io import resolve_relative_path
 from cup.synthetic.core.geometry import resample_section_path
-
-
-@dataclass(frozen=True)
-class SectionGeometry:
-    section_id: str
-    lateral_m: np.ndarray
-    inline_float: np.ndarray
-    xline_float: np.ndarray
-    x_m: np.ndarray
-    y_m: np.ndarray
-    horizon_twt_s: np.ndarray
-    qc_rows: tuple[dict[str, Any], ...] = ()
+from cup.synthetic.core.geometry import SectionGeometry
 
 def _resample_section_path(
     points: Sequence[Mapping[str, float]],
@@ -185,7 +173,10 @@ def build_section_geometries(
                 xline_float=xline,
                 x_m=x,
                 y_m=y,
-                horizon_twt_s=horizon_values,
+                horizon_coordinates=horizon_values,
+                sample_domain="time",
+                axis_unit="s",
+                xline_step=float(survey.line_geometry.xline_axis.step),
                 qc_rows=tuple(qc_rows),
             )
         )

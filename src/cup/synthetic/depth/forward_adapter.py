@@ -216,7 +216,16 @@ class DepthForwardAdapter:
                 "subgrid_amplitude_scale_ratio": observed_rms
                 / max(model_rms, np.finfo(np.float64).eps),
             },
-            metadata={"sample_domain": "depth", "depth_basis": "tvdss"},
+            metadata={
+                "sample_domain": "depth",
+                "depth_basis": "tvdss",
+                "structured_forward_context": {
+                    "wavelet_time_s": config.wavelet_time_s.tolist(),
+                    "wavelet_amplitude": config.wavelet.tolist(),
+                    "ai_velocity_relation": dict(config.ai_velocity_relation),
+                    "output_chunk_size": int(config.executor.batch_size),
+                },
+            },
             extras=DepthForwardExtras(
                 vp_highres_mps=vp_high,
                 vp_model_mps=vp_model,

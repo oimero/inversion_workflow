@@ -30,7 +30,11 @@ from cup.synthetic.core.pipeline import (
     SyntheticDomainAdapter,
 )
 from cup.synthetic.core.records import LfmObservation, StructuredSampleRecord
-from cup.synthetic.core.structured_artifact import write_structured_truth_v1
+from cup.synthetic.core.structured_artifact import (
+    remove_structured_truth_v1,
+    validate_structured_truth_v1,
+    write_structured_truth_v1,
+)
 
 __all__ = [
     "build_attempt_plan",
@@ -54,6 +58,8 @@ __all__ = [
     "SectionGeometry",
     "LfmObservation",
     "StructuredSampleRecord",
+    "remove_structured_truth_v1",
+    "validate_structured_truth_v1",
     "write_structured_truth_v1",
     "validate_training_manifest",
     "write_dataset",

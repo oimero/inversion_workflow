@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import shutil
@@ -22,6 +22,7 @@ _IDENTITY_KEYS = ("producer", "calibration", "projection", "forward")
 _ARRAY_NAMES = (
     "observed_axis",
     "observed_seismic",
+    "model_consistent_seismic",
     "observed_lfm",
     "observed_valid",
     "latent_axis",
@@ -158,20 +159,37 @@ class ObservedTrace:
     lfm: np.ndarray
     observed_valid: np.ndarray
     lfm_source_identity: Mapping[str, Any]
+    model_consistent_seismic: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.sample_axis, SampleAxis):
             raise TypeError("ObservedTrace.sample_axis must be SampleAxis.")
         size = self.sample_axis.coordinates.size
         seismic = _float_array(self.seismic, label="ObservedTrace.seismic")
+        model_consistent = _float_array(
+            seismic if self.model_consistent_seismic is None else self.model_consistent_seismic,
+            label="ObservedTrace.model_consistent_seismic",
+        )
         lfm = _float_array(self.lfm, label="ObservedTrace.lfm")
         valid = _bool_array(self.observed_valid, label="ObservedTrace.observed_valid")
-        for name, array in (("seismic", seismic), ("lfm", lfm), ("observed_valid", valid)):
+        for name, array in (
+            ("seismic", seismic),
+            ("model_consistent_seismic", model_consistent),
+            ("lfm", lfm),
+            ("observed_valid", valid),
+        ):
             if array.shape != (size,):
                 raise ValueError(
                     f"ObservedTrace.{name} shape {array.shape} does not match axis {(size,)}."
                 )
-        if np.any(valid & (~np.isfinite(seismic) | ~np.isfinite(lfm))):
+        if np.any(
+            valid
+            & (
+                ~np.isfinite(seismic)
+                | ~np.isfinite(model_consistent)
+                | ~np.isfinite(lfm)
+            )
+        ):
             raise ValueError("ObservedTrace valid samples must be finite.")
         if not isinstance(self.lfm_source_identity, Mapping) or not self.lfm_source_identity:
             raise ValueError("ObservedTrace.lfm_source_identity must be explicit.")
@@ -180,6 +198,7 @@ class ObservedTrace:
         except (TypeError, ValueError) as exc:
             raise TypeError("ObservedTrace.lfm_source_identity must be JSON serializable.") from exc
         object.__setattr__(self, "seismic", seismic)
+        object.__setattr__(self, "model_consistent_seismic", model_consistent)
         object.__setattr__(self, "lfm", lfm)
         object.__setattr__(self, "observed_valid", valid)
         object.__setattr__(self, "lfm_source_identity", dict(self.lfm_source_identity))
@@ -412,6 +431,7 @@ class StructuredSample:
     zone: ZoneTruth
     segments: tuple[SegmentTruth, ...]
     identity: Mapping[str, Any]
+    forward_context: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         realization_id = str(self.realization_id).strip()
@@ -439,6 +459,12 @@ class StructuredSample:
         if not segments or not all(isinstance(item, SegmentTruth) for item in segments):
             raise TypeError("StructuredSample.segments must be a non-empty tuple of SegmentTruth.")
         _assert_identity(self.identity)
+        if not isinstance(self.forward_context, Mapping):
+            raise TypeError("StructuredSample.forward_context must be a mapping.")
+        try:
+            json.dumps(dict(self.forward_context), allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("StructuredSample.forward_context must be JSON serializable.") from exc
         _axis_nested(self.latent.latent_axis, self.observed.sample_axis)
         if self.zone.zone_valid.shape != self.latent.latent_valid.shape:
             raise ValueError("ZoneTruth.zone_valid must match latent axis length.")
@@ -483,6 +509,7 @@ class StructuredSample:
         object.__setattr__(self, "xline_step", geometry["xline_step"])
         object.__setattr__(self, "segments", segments)
         object.__setattr__(self, "identity", dict(self.identity))
+        object.__setattr__(self, "forward_context", dict(self.forward_context))
 
 
 class StructuredTruthAdapter:
@@ -504,6 +531,8 @@ class StructuredTruthAdapter:
         segments: Sequence[Mapping[str, Any]],
         identity: Mapping[str, Any],
         xline_step: float,
+        model_consistent_seismic: Any | None = None,
+        forward_context: Mapping[str, Any] | None = None,
     ) -> StructuredSample:
         if not isinstance(truth, SyntheticTruth):
             raise TypeError("StructuredTruthAdapter requires cup.synthetic.core.truth.SyntheticTruth.")
@@ -632,6 +661,7 @@ class StructuredTruthAdapter:
                 lfm=lfm,
                 observed_valid=observed_valid,
                 lfm_source_identity=lfm_source_identity,
+                model_consistent_seismic=model_consistent_seismic,
             ),
             latent=LatentTrace(
                 latent_axis=highres_axis,
@@ -653,6 +683,7 @@ class StructuredTruthAdapter:
             ),
             segments=tuple(segment_rows),
             identity=_assert_identity(identity),
+            forward_context={} if forward_context is None else dict(forward_context),
         )
 
     @classmethod
@@ -722,6 +753,9 @@ class StructuredTruthAdapter:
             lateral_index=lateral_index,
             model_axis=record.projected.model_axis,
             seismic=np.asarray(record.forward.seismic_observed)[lateral_index],
+            model_consistent_seismic=np.asarray(
+                record.forward.seismic_model_consistent
+            )[lateral_index],
             lfm=np.asarray(record.lfm.values)[lateral_index],
             observed_valid=np.asarray(record.valid_mask, dtype=bool)[lateral_index],
             lfm_source_identity=record.lfm.source_identity,
@@ -733,6 +767,9 @@ class StructuredTruthAdapter:
             segments=segment_rows,
             identity=resolved_identity,
             xline_step=resolved_xline_step,
+            forward_context=dict(
+                record.forward.metadata.get("structured_forward_context") or {}
+            ),
         )
 
 
@@ -772,6 +809,7 @@ class StructuredTruthArtifactWriter:
         arrays = {
             "observed_axis": sample.observed.sample_axis.coordinates,
             "observed_seismic": sample.observed.seismic,
+            "model_consistent_seismic": sample.observed.model_consistent_seismic,
             "observed_lfm": sample.observed.lfm,
             "observed_valid": sample.observed.observed_valid,
             "latent_axis": sample.latent.latent_axis.coordinates,
@@ -796,6 +834,7 @@ class StructuredTruthArtifactWriter:
                 "xline_step": sample.xline_step,
             },
             "identity": dict(sample.identity),
+            "forward_context": dict(sample.forward_context),
             "lfm": {
                 "source_identity": dict(sample.observed.lfm_source_identity),
             },
@@ -860,6 +899,9 @@ class StructuredTruthArtifactReader:
             ("lateral_m", "inline", "xline", "xline_step"),
             label="structured artifact geometry",
         )
+        forward_context = manifest.get("forward_context")
+        if not isinstance(forward_context, Mapping):
+            raise TypeError("structured artifact forward_context must be a mapping.")
         zone_data = _required_mapping(
             manifest.get("zone"),
             ("zone_id", "top", "bottom", "background_a", "background_b"),
@@ -910,6 +952,7 @@ class StructuredTruthArtifactReader:
                     label="structured artifact observed_axis",
                 ),
                 seismic=arrays["observed_seismic"],
+                model_consistent_seismic=arrays["model_consistent_seismic"],
                 lfm=arrays["observed_lfm"],
                 observed_valid=arrays["observed_valid"],
                 lfm_source_identity=lfm_data["source_identity"],
@@ -960,6 +1003,7 @@ class StructuredTruthArtifactReader:
                 for row in segments
             ),
             identity=_assert_identity(manifest.get("identity")),
+            forward_context=dict(forward_context),
         )
         return sample
 
@@ -991,6 +1035,8 @@ def assert_structured_sample_equal(
             raise AssertionError(f"structured sample field differs: {name}")
     if expected.identity != actual.identity:
         raise AssertionError("structured sample identity differs.")
+    if expected.forward_context != actual.forward_context:
+        raise AssertionError("structured forward context differs.")
     if expected.observed.lfm_source_identity != actual.observed.lfm_source_identity:
         raise AssertionError("structured LFM source identity differs.")
     for name in ("zone_id",):
@@ -1010,7 +1056,7 @@ def assert_structured_sample_equal(
         (
             expected.observed,
             actual.observed,
-            ("seismic", "lfm", "observed_valid"),
+            ("seismic", "model_consistent_seismic", "lfm", "observed_valid"),
         ),
         (
             expected.latent,

@@ -109,6 +109,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run full generation and acceptance QC without persisting realization arrays.",
     )
+    generate.add_argument(
+        "--run-structured-oracle",
+        action="store_true",
+        help="Reread structured_truth_v1 from disk and require the Stage 1 Oracle to pass.",
+    )
     return parser.parse_args()
 
 
@@ -118,6 +123,16 @@ def _resolve_output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> P
     root = resolve_relative_path(workflow.output_root, root=REPO_ROOT)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return root / f"synthoseis_lite_{args.command}_{timestamp}"
+
+
+def _structured_artifact_oracle(root: Path, calibration: object, parent_ids: list[str]):
+    from ginn_v2.oracle import run_artifact_oracle
+
+    return run_artifact_oracle(
+        str(root),
+        calibration,
+        expected_parent_ids=parent_ids,
+    )
 
 
 def _recorded_time_source_runs_from_wavelet(workflow: WorkflowConfig) -> dict[str, str]:
@@ -278,6 +293,11 @@ def main() -> None:
                 debug_attempt_limit=args.debug_attempt_limit,
                 geometry_families=args.geometry_family,
                 qc_only=args.qc_only,
+                structured_artifact_oracle=(
+                    _structured_artifact_oracle
+                    if args.run_structured_oracle
+                    else None
+                ),
             )
         print("=== synthoseis-lite v5 (depth) ===")
         print(f"Command: {args.command}")
@@ -340,6 +360,11 @@ def main() -> None:
             debug_attempt_limit=args.debug_attempt_limit,
             geometry_families=args.geometry_family,
             qc_only=args.qc_only,
+            structured_artifact_oracle=(
+                _structured_artifact_oracle
+                if args.run_structured_oracle
+                else None
+            ),
         )
     print("=== synthoseis-lite ===")
     print(f"Command: {args.command}")

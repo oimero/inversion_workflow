@@ -140,7 +140,15 @@ class TimeForwardAdapter:
                 physics=physics_support,
             ),
             qc=qc,
-            metadata={"sample_domain": "time"},
+            metadata={
+                "sample_domain": "time",
+                "structured_forward_context": {
+                    "wavelet_time_s": config.wavelet_time_s.tolist(),
+                    "wavelet_amplitude": config.wavelet.tolist(),
+                    "ai_velocity_relation": None,
+                    "output_chunk_size": 64,
+                },
+            },
             extras=TimeForwardExtras(
                 reflectivity_highres=reflectivity_from_log_ai(truth.log_ai_highres),
                 reflectivity_model=reflectivity_from_log_ai(model_target),

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import h5py
 import numpy as np
@@ -419,6 +419,7 @@ def run_generation(
     debug_attempt_limit: int | None = None,
     geometry_families: Sequence[str] | None = None,
     qc_only: bool = False,
+    structured_artifact_oracle: Callable[[Path, Any, Sequence[str]], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     calibration = load_calibration(calibration_path)
     adapter = TimeSyntheticDomainAdapter(
@@ -445,4 +446,5 @@ def run_generation(
         calibration_path=calibration_path,
         amplitude_prior_path=amplitude_prior_path,
         repo_root=repo_root,
+        structured_artifact_oracle=structured_artifact_oracle,
     )

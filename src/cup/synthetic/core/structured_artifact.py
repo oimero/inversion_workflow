@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+import csv
 import json
 from pathlib import Path
 import shutil
@@ -19,6 +20,7 @@ ARTIFACT_VERSION = 1
 ARRAY_NAMES = (
     "observed_axis",
     "observed_seismic",
+    "model_consistent_seismic",
     "observed_lfm",
     "observed_valid",
     "latent_axis",
@@ -32,6 +34,20 @@ ARRAY_NAMES = (
     "zone_valid",
 )
 IDENTITY_KEYS = ("producer", "calibration", "projection", "forward")
+STRUCTURED_SAMPLE_INDEX_COLUMNS = (
+    "realization_id",
+    "scenario_id",
+    "sample_domain",
+    "sample_unit",
+    "depth_basis",
+    "lateral_index",
+    "zone_id",
+    "artifact_path",
+    "lateral_m",
+    "inline",
+    "xline",
+    "xline_step",
+)
 
 
 def _safe_component(value: Any) -> str:
@@ -116,6 +132,274 @@ def _segment_manifest(row: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _validate_forward_context(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            "structured artifact requires explicit forward context metadata"
+        )
+    result = dict(value)
+    required = {"wavelet_time_s", "wavelet_amplitude", "ai_velocity_relation", "output_chunk_size"}
+    missing = sorted(required.difference(result))
+    if missing:
+        raise ValueError(f"structured forward context is missing fields: {missing}")
+    wavelet_time = np.asarray(result["wavelet_time_s"], dtype=np.float64).reshape(-1)
+    wavelet_amplitude = np.asarray(result["wavelet_amplitude"], dtype=np.float64).reshape(-1)
+    if (
+        wavelet_time.size < 3
+        or wavelet_time.size != wavelet_amplitude.size
+        or wavelet_time.size % 2 == 0
+        or np.any(~np.isfinite(wavelet_time))
+        or np.any(~np.isfinite(wavelet_amplitude))
+    ):
+        raise ValueError("structured forward context wavelet is invalid")
+    relation = result["ai_velocity_relation"]
+    if relation is not None and not isinstance(relation, Mapping):
+        raise TypeError("structured forward context ai_velocity_relation must be a mapping or null")
+    result["wavelet_time_s"] = wavelet_time.tolist()
+    result["wavelet_amplitude"] = wavelet_amplitude.tolist()
+    result["ai_velocity_relation"] = None if relation is None else dict(relation)
+    result["output_chunk_size"] = int(result["output_chunk_size"])
+    if result["output_chunk_size"] <= 0:
+        raise ValueError("structured forward context output_chunk_size must be positive")
+    json.dumps(result, allow_nan=False)
+    return result
+
+
+def _forward_context_manifest(record: StructuredSampleRecord) -> dict[str, Any]:
+    return _validate_forward_context(
+        record.forward.metadata.get("structured_forward_context")
+    )
+
+
+def _remove_exact_directory(path: Path) -> None:
+    """Remove one known artifact directory without following a directory link."""
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+        return
+    shutil.rmtree(path)
+
+
+def remove_structured_truth_v1(
+    root: str | Path,
+    realization_id: str,
+) -> None:
+    """Rollback exactly one published structured realization.
+
+    The shared pipeline calls this when a later seismic-view operation rejects
+    a parent after the structured writer has already committed its own
+    realization directory.  The target is validated to remain directly under
+    ``root/realizations`` before removal.
+    """
+    realizations = (Path(root) / "realizations").resolve()
+    target = realizations / _safe_component(realization_id)
+    if target.parent != realizations:
+        raise ValueError("structured realization rollback escaped its artifact root")
+    _remove_exact_directory(target)
+
+
+def _read_json(path: Path, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read structured {label}: {path}") from exc
+    if not isinstance(value, dict):
+        raise TypeError(f"structured {label} must contain a JSON object: {path}")
+    return value
+
+
+def validate_structured_truth_v1(
+    root: str | Path,
+    *,
+    expected_realization_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Audit the published structured tree from disk and write its sample index.
+
+    This is deliberately kept in ``cup.synthetic`` and does not import the
+    inversion package.  It closes the producer-side persistence boundary:
+    accepted parents must have exactly one realization manifest, every listed
+    trace must exist, and no rejected/orphan parent may be published.
+    """
+    root_path = Path(root)
+    realizations = root_path / "realizations"
+    if not realizations.is_dir():
+        raise FileNotFoundError(f"structured truth realizations directory is missing: {realizations}")
+
+    expected = {_safe_component(value) for value in expected_realization_ids}
+    actual_dirs = {
+        path.name
+        for path in realizations.iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    }
+    orphan_ids = sorted(actual_dirs.difference(expected))
+    missing_ids = sorted(expected.difference(actual_dirs))
+    if missing_ids or orphan_ids:
+        raise ValueError(
+            "structured truth parent set differs from accepted parent set: "
+            f"missing={missing_ids}, orphan={orphan_ids}"
+        )
+
+    rows: list[dict[str, Any]] = []
+    primary_keys: set[tuple[str, int, str]] = set()
+    duplicate_count = 0
+    for realization_dir in sorted(realizations.iterdir(), key=lambda path: path.name):
+        if not realization_dir.is_dir() or realization_dir.name.startswith("."):
+            continue
+        realization_manifest = _read_json(
+            realization_dir / "realization_manifest.json",
+            label="realization manifest",
+        )
+        if realization_manifest.get("artifact_type") != ARTIFACT_TYPE:
+            raise ValueError(f"unsupported structured realization artifact: {realization_dir}")
+        if int(realization_manifest.get("artifact_version", -1)) != ARTIFACT_VERSION:
+            raise ValueError(f"structured realization version mismatch: {realization_dir}")
+        realization_id = str(realization_manifest.get("realization_id") or "")
+        if _safe_component(realization_id) != realization_dir.name:
+            raise ValueError(f"structured realization identity disagrees with its path: {realization_dir}")
+        trace_artifacts = realization_manifest.get("trace_artifacts")
+        if not isinstance(trace_artifacts, list) or not trace_artifacts:
+            raise ValueError(f"structured realization has no trace artifacts: {realization_dir}")
+        for relative in trace_artifacts:
+            trace_path = realization_dir / str(relative)
+            try:
+                trace_path.resolve().relative_to(realization_dir.resolve())
+            except ValueError as exc:
+                raise ValueError(
+                    f"structured trace path escapes its realization: {trace_path}"
+                ) from exc
+            trace_manifest = _read_json(trace_path / "manifest.json", label="trace manifest")
+            array_path = trace_path / "arrays.npz"
+            if not array_path.is_file():
+                raise FileNotFoundError(f"structured trace arrays are missing: {trace_path}")
+            if trace_manifest.get("artifact_type") != ARTIFACT_TYPE:
+                raise ValueError(f"unsupported structured trace artifact: {trace_path}")
+            if int(trace_manifest.get("artifact_version", -1)) != ARTIFACT_VERSION:
+                raise ValueError(f"structured trace version mismatch: {trace_path}")
+            if str(trace_manifest.get("realization_id")) != realization_id:
+                raise ValueError(f"structured trace parent identity mismatch: {trace_path}")
+            if list(trace_manifest.get("array_names") or []) != list(ARRAY_NAMES):
+                raise ValueError(f"structured trace array contract is invalid: {trace_path}")
+            _required_identity(
+                trace_manifest.get("identity"),
+            )
+            _validate_forward_context(trace_manifest.get("forward_context"))
+            with np.load(array_path, allow_pickle=False) as data:
+                if set(data.files) != set(ARRAY_NAMES):
+                    raise ValueError(f"structured trace arrays do not match its manifest: {trace_path}")
+                observed_axis = np.asarray(data["observed_axis"], dtype=np.float64)
+                for name in (
+                    "observed_seismic",
+                    "model_consistent_seismic",
+                    "observed_lfm",
+                    "observed_valid",
+                ):
+                    if np.asarray(data[name]).shape != observed_axis.shape:
+                        raise ValueError(f"structured trace array shape mismatch: {trace_path}/{name}")
+            geometry = _required_mapping(
+                trace_manifest.get("geometry"),
+                ("lateral_m", "inline", "xline", "xline_step"),
+                label="structured trace geometry",
+            )
+            observed_axis = _required_mapping(
+                trace_manifest.get("observed_axis"),
+                (
+                    "sample_domain",
+                    "unit",
+                    "sample_interval",
+                    "positive_direction",
+                    "depth_basis",
+                ),
+                label="structured trace observed axis",
+            )
+            latent_axis = _required_mapping(
+                trace_manifest.get("latent_axis"),
+                (
+                    "sample_domain",
+                    "unit",
+                    "sample_interval",
+                    "positive_direction",
+                    "depth_basis",
+                ),
+                label="structured trace latent axis",
+            )
+            if (
+                observed_axis["sample_domain"] != latent_axis["sample_domain"]
+                or observed_axis["unit"] != latent_axis["unit"]
+                or observed_axis["depth_basis"] != latent_axis["depth_basis"]
+            ):
+                raise ValueError(f"structured trace axis identity mismatch: {trace_path}")
+            zone = _required_mapping(
+                trace_manifest.get("zone"),
+                ("zone_id", "top", "bottom", "background_a", "background_b"),
+                label="structured trace zone",
+            )
+            segments = trace_manifest.get("segments")
+            if not isinstance(segments, list) or not segments:
+                raise ValueError(f"structured trace has no segment truth: {trace_path}")
+            for segment in segments:
+                _segment_manifest(segment)
+            producer_fields = _required_mapping(
+                trace_manifest.get("producer_fields"),
+                (
+                    "raw_projected_effective_coefficients",
+                    "realization_zone_background",
+                    "clipping_mask_available_in_producer_record",
+                ),
+                label="structured trace producer fields",
+            )
+            if not all(bool(value) for value in producer_fields.values()):
+                raise ValueError(f"structured trace producer fields are incomplete: {trace_path}")
+            lateral_index = int(trace_manifest.get("lateral_index"))
+            zone_id = str(zone["zone_id"])
+            key = (realization_id, lateral_index, zone_id)
+            if key in primary_keys:
+                duplicate_count += 1
+            primary_keys.add(key)
+            rows.append(
+                {
+                    "realization_id": realization_id,
+                    "scenario_id": str(trace_manifest.get("scenario_id") or ""),
+                    "sample_domain": str(observed_axis["sample_domain"]),
+                    "sample_unit": str(observed_axis["unit"]),
+                    "depth_basis": str(observed_axis["depth_basis"] or ""),
+                    "lateral_index": lateral_index,
+                    "zone_id": zone_id,
+                    "artifact_path": str(trace_path.relative_to(root_path)).replace("\\", "/"),
+                    "lateral_m": float(geometry["lateral_m"]),
+                    "inline": float(geometry["inline"]),
+                    "xline": float(geometry["xline"]),
+                    "xline_step": float(geometry["xline_step"]),
+                }
+            )
+    if duplicate_count:
+        raise ValueError(f"structured truth contains {duplicate_count} duplicate primary keys")
+    if not rows:
+        raise ValueError("structured truth contains no trace artifacts")
+
+    rows.sort(key=lambda row: (row["realization_id"], row["lateral_index"], row["zone_id"]))
+    index_path = root_path / "sample_index.csv"
+    temporary_index = root_path / f".{index_path.name}.{uuid.uuid4().hex}.staging"
+    with temporary_index.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=STRUCTURED_SAMPLE_INDEX_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary_index.replace(index_path)
+    return {
+        "schema": "structured_truth_v1_publication_report",
+        "artifact_type": ARTIFACT_TYPE,
+        "artifact_version": ARTIFACT_VERSION,
+        "passed": True,
+        "expected_parent_count": len(expected),
+        "structured_parent_count": len(actual_dirs),
+        "structured_trace_count": len(rows),
+        "orphan_parent_count": len(orphan_ids),
+        "missing_parent_count": len(missing_ids),
+        "duplicate_primary_key_count": duplicate_count,
+        "sample_index": "sample_index.csv",
+    }
+
+
 def _write_trace(
     record: StructuredSampleRecord,
     *,
@@ -187,11 +471,22 @@ def _write_trace(
             raise ValueError("structured segment endpoints are not contiguous")
 
     seismic = np.asarray(record.forward.seismic_observed, dtype=np.float64)[lateral_index]
+    model_consistent_seismic = np.asarray(
+        record.forward.seismic_model_consistent,
+        dtype=np.float64,
+    )[lateral_index]
     lfm = np.asarray(record.lfm.values, dtype=np.float64)[lateral_index]
     observed_valid = np.asarray(record.valid_mask, dtype=bool)[lateral_index].copy()
     if observed_valid.shape != model_axis.coordinates.shape:
         raise ValueError("structured observed mask does not match model axis")
-    if np.any(observed_valid & (~np.isfinite(seismic) | ~np.isfinite(lfm))):
+    if np.any(
+        observed_valid
+        & (
+            ~np.isfinite(seismic)
+            | ~np.isfinite(model_consistent_seismic)
+            | ~np.isfinite(lfm)
+        )
+    ):
         raise ValueError("structured observed valid samples must be finite")
 
     identity = _required_identity(record.domain_metadata.get("structured_identity"))
@@ -207,6 +502,7 @@ def _write_trace(
     arrays = {
         "observed_axis": model_axis.coordinates,
         "observed_seismic": seismic,
+        "model_consistent_seismic": model_consistent_seismic,
         "observed_lfm": lfm,
         "observed_valid": observed_valid,
         "latent_axis": np.asarray(truth.highres_axis, dtype=np.float64),
@@ -227,6 +523,7 @@ def _write_trace(
         "lateral_index": int(lateral_index),
         "geometry": geometry,
         "identity": identity,
+        "forward_context": _forward_context_manifest(record),
         "lfm": {
             "source_identity": dict(record.lfm.source_identity),
         },
@@ -379,5 +676,8 @@ __all__ = [
     "ARTIFACT_TYPE",
     "ARTIFACT_VERSION",
     "ARRAY_NAMES",
+    "STRUCTURED_SAMPLE_INDEX_COLUMNS",
+    "remove_structured_truth_v1",
+    "validate_structured_truth_v1",
     "write_structured_truth_v1",
 ]

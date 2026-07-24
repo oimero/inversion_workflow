@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +18,7 @@ from ginn_v2.forward import ForwardContext, forward_numpy, forward_torch
 from ginn_v2.truth import (
     RawSegmentParameters,
     StructuredSample,
+    StructuredTruthArtifactReader,
 )
 
 
@@ -328,17 +329,18 @@ def run_oracle(
         projection.model_log_ai,
     )
     forward_mask = sample.observed.observed_valid & projection.support_model
+    expected_forward = sample.observed.model_consistent_seismic
     forward_max_abs, forward_max_relative = _allclose_oracle(
         forward_seismic,
-        sample.observed.seismic,
+        expected_forward,
         mask=forward_mask,
         rtol=forward_rtol,
         atol=forward_atol,
-        label="forward/observed finite support",
+        label="forward/model-consistent finite support",
     )
-    observed = sample.observed.seismic[forward_mask]
+    observed = expected_forward[forward_mask]
     predicted = np.asarray(forward_seismic)[forward_mask]
-    correlation = _correlation(forward_seismic, sample.observed.seismic, forward_mask)
+    correlation = _correlation(forward_seismic, expected_forward, forward_mask)
     try:
         import torch
 
@@ -402,10 +404,129 @@ def run_oracle(
     )
 
 
+def _forward_context_from_sample(sample: StructuredSample) -> ForwardContext:
+    contract = sample.forward_context
+    required = (
+        "wavelet_time_s",
+        "wavelet_amplitude",
+        "ai_velocity_relation",
+        "output_chunk_size",
+    )
+    missing = sorted(set(required).difference(contract))
+    if missing:
+        raise OracleContractError(
+            f"structured artifact forward_context is missing fields: {missing}"
+        )
+    return ForwardContext(
+        sample_axis=sample.observed.sample_axis,
+        wavelet_time_s=np.asarray(contract["wavelet_time_s"], dtype=np.float64),
+        wavelet_amplitude=np.asarray(contract["wavelet_amplitude"], dtype=np.float64),
+        ai_velocity_relation=contract["ai_velocity_relation"],
+        output_chunk_size=int(contract["output_chunk_size"]),
+        lateral_m=sample.lateral_m,
+        inline=sample.inline,
+        xline=sample.xline,
+        xline_step=sample.xline_step,
+    )
+
+
+def run_artifact_oracle(
+    root: str,
+    calibration: Any,
+    *,
+    expected_parent_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Run Stage 1 Oracle after rereading every trace from disk."""
+    from pathlib import Path
+
+    artifact_root = Path(root)
+    trace_paths = sorted(
+        (
+            path
+            for path in artifact_root.glob("realizations/*/traces/*/zone_*")
+            if path.is_dir()
+        ),
+        key=lambda path: str(path),
+    )
+    reader = StructuredTruthArtifactReader()
+    failures: list[dict[str, str]] = []
+    reports: list[dict[str, Any]] = []
+    parent_ids: set[str] = set()
+    for trace_path in trace_paths:
+        try:
+            sample = reader.read(trace_path)
+            parent_ids.add(sample.realization_id)
+            report = run_oracle(
+                sample,
+                calibration,
+                _forward_context_from_sample(sample),
+            )
+            reports.append(
+                {
+                    "artifact_path": str(trace_path),
+                    "realization_id": sample.realization_id,
+                    "lateral_index": sample.lateral_index,
+                    "zone_id": sample.zone.zone_id,
+                    "metrics": dict(report.metrics),
+                }
+            )
+        except Exception as exc:
+            failures.append(
+                {
+                    "artifact_path": str(trace_path),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+    expected = None if expected_parent_ids is None else {str(value) for value in expected_parent_ids}
+    if expected is not None and parent_ids != expected:
+        failures.append(
+            {
+                "artifact_path": str(artifact_root),
+                "error_type": "OracleContractError",
+                "error": (
+                    "artifact parent set differs from expected parent set: "
+                    f"expected={sorted(expected)}, actual={sorted(parent_ids)}"
+                ),
+            }
+        )
+    if not reports and not failures:
+        failures.append(
+            {
+                "artifact_path": str(artifact_root),
+                "error_type": "OracleContractError",
+                "error": "structured artifact root contains no trace artifacts",
+            }
+        )
+    aggregated: dict[str, float] = {}
+    metric_names = sorted(
+        {name for report in reports for name in report["metrics"]}
+    )
+    for name in metric_names:
+        values = [float(report["metrics"][name]) for report in reports]
+        if name == "forward_waveform_correlation":
+            aggregated[name] = float(np.min(values))
+        elif name.endswith("sample_count"):
+            aggregated[name] = float(np.sum(values))
+        else:
+            aggregated[name] = float(np.max(values))
+    return {
+        "schema": "structured_truth_v1_oracle_report",
+        "passed": not failures,
+        "trace_count": len(reports),
+        "parent_count": len(parent_ids),
+        "failure_count": len(failures),
+        "metrics": aggregated,
+        "failures": failures,
+        "traces": reports,
+    }
+
+
 __all__ = [
     "OracleContractError",
     "OracleReport",
     "ProjectionResult",
     "project_log_ai_to_model_grid",
+    "run_artifact_oracle",
     "run_oracle",
 ]

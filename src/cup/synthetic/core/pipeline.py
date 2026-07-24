@@ -40,7 +40,11 @@ from cup.synthetic.core.field_runner import (
 )
 from cup.synthetic.core.rejections import StagedRejection
 from cup.synthetic.core.writer import write_benchmark_sample, write_benchmark_view
-from cup.synthetic.core.structured_artifact import write_structured_truth_v1
+from cup.synthetic.core.structured_artifact import (
+    remove_structured_truth_v1,
+    validate_structured_truth_v1,
+    write_structured_truth_v1,
+)
 from cup.synthetic.core.records import BenchmarkSample, BenchmarkView
 from cup.synthetic.reporting.figures import write_generation_figures
 from cup.utils.io import (
@@ -374,6 +378,9 @@ class GenerationSession:
     ] | None = None
     write_domain_outputs: Callable[[Path, Mapping[str, list[dict[str, Any]]]], None] | None = None
     resolved_seismic_views: Mapping[str, Any] | None = None
+    structured_artifact_oracle: Callable[
+        [Path, Any, Sequence[str]], Mapping[str, Any]
+    ] | None = None
 
     def resolve_plan(self, debug_attempt_limit: int | None) -> pd.DataFrame:
         """Build the neutral attempt plan exactly once in the shared Pipeline."""
@@ -529,6 +536,11 @@ class SyntheticBenchmarkPipeline:
             )
             if not isinstance(session, GenerationSession):
                 raise TypeError("prepare_generation must return GenerationSession")
+            oracle_callback = runtime.get("structured_artifact_oracle")
+            if oracle_callback is not None:
+                if not callable(oracle_callback):
+                    raise TypeError("structured_artifact_oracle must be callable")
+                session.structured_artifact_oracle = oracle_callback
             summary = self._run_generation_session(
                 config,
                 session,
@@ -816,6 +828,11 @@ class SyntheticBenchmarkPipeline:
                     failed_group = f"/realizations/{parent_id}"
                     if failed_group in h5:
                         del h5[failed_group]
+                    if not qc_only:
+                        remove_structured_truth_v1(
+                            output_dir / "structured_truth_v1",
+                            parent_id,
+                        )
                     reason = f"{type(exc).__name__}:{exc}"
                     rejection_rows.append({**dict(row), "status": "rejected", "reason": reason})
                     qc_rows.append({**dict(row), "sample_id": parent_id, "status": "rejected", "reasons": reason})
@@ -823,6 +840,11 @@ class SyntheticBenchmarkPipeline:
                     failed_group = f"/realizations/{parent_id}"
                     if failed_group in h5:
                         del h5[failed_group]
+                    if not qc_only:
+                        remove_structured_truth_v1(
+                            output_dir / "structured_truth_v1",
+                            parent_id,
+                        )
                     raise
                 progress.record(
                     row,
@@ -843,7 +865,67 @@ class SyntheticBenchmarkPipeline:
         rejection_frame.to_csv(output_dir / "generation_rejection_details.csv", index=False)
         rejection_summary = rejection_reason_summary(rejection_frame, index)
         rejection_summary.to_csv(output_dir / "rejection_reason_summary.csv", index=False)
-        successful_parent_ids = [str(row.get("realization_id") or row.get("parent_realization_id")) for row in realization_rows]
+        successful_parent_ids = sorted(
+            {
+                str(row.get("realization_id") or row.get("parent_realization_id"))
+                for row in realization_rows
+                if str(row.get("realization_id") or row.get("parent_realization_id"))
+            }
+        )
+        structured_publication_report: dict[str, Any] = {}
+        structured_oracle_report: dict[str, Any] = {}
+        if not qc_only and successful_parent_ids:
+            structured_publication_report = validate_structured_truth_v1(
+                output_dir / "structured_truth_v1",
+                expected_realization_ids=successful_parent_ids,
+            )
+            _write_json(
+                output_dir / "structured_truth_v1" / "publication_report.json",
+                structured_publication_report,
+            )
+            if session.structured_artifact_oracle is not None:
+                try:
+                    candidate_report = session.structured_artifact_oracle(
+                        output_dir / "structured_truth_v1",
+                        calibration,
+                        successful_parent_ids,
+                    )
+                    if not isinstance(candidate_report, Mapping):
+                        raise TypeError("structured artifact Oracle must return a mapping")
+                    structured_oracle_report = dict(candidate_report)
+                except Exception as exc:
+                    structured_oracle_report = {
+                        "schema": "structured_truth_v1_oracle_report",
+                        "passed": False,
+                        "trace_count": 0,
+                        "parent_count": 0,
+                        "failure_count": 1,
+                        "metrics": {},
+                        "failures": [{
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }],
+                    }
+                _write_json(
+                    output_dir / "structured_truth_v1" / "oracle_report.json",
+                    structured_oracle_report,
+                )
+                if not bool(structured_oracle_report.get("passed", False)):
+                    raise RuntimeError(
+                        "structured_truth_v1_oracle_failed: "
+                        f"{structured_oracle_report.get('failures', [])[:3]}"
+                    )
+            else:
+                structured_oracle_report = {
+                    "schema": "structured_truth_v1_oracle_report",
+                    "requested": False,
+                    "passed": None,
+                    "reason": "oracle callback was not requested",
+                }
+                _write_json(
+                    output_dir / "structured_truth_v1" / "oracle_report.json",
+                    structured_oracle_report,
+                )
         parent_quality_warning_count = int(sum(
             int(row.get("quality_warning_count") or 0)
             for row in qc_rows
@@ -892,6 +974,15 @@ class SyntheticBenchmarkPipeline:
                         "structured_truth_v1": str(
                             output_dir / "structured_truth_v1"
                         ),
+                        "structured_truth_sample_index": str(
+                            output_dir / "structured_truth_v1" / "sample_index.csv"
+                        ),
+                        "structured_truth_publication_report": str(
+                            output_dir / "structured_truth_v1" / "publication_report.json"
+                        ),
+                        "structured_truth_oracle_report": str(
+                            output_dir / "structured_truth_v1" / "oracle_report.json"
+                        ),
                     },
                 ),
             }
@@ -922,6 +1013,34 @@ class SyntheticBenchmarkPipeline:
                 str(output_dir / "structured_truth_v1")
                 if not qc_only
                 else ""
+            ),
+            "structured_truth_sample_index": (
+                str(output_dir / "structured_truth_v1" / "sample_index.csv")
+                if not qc_only
+                else ""
+            ),
+            "structured_truth_publication_report": (
+                str(output_dir / "structured_truth_v1" / "publication_report.json")
+                if not qc_only
+                else ""
+            ),
+            "structured_truth_publication_passed": (
+                bool(structured_publication_report.get("passed", False))
+                if not qc_only
+                else False
+            ),
+            "structured_truth_oracle_report": (
+                str(output_dir / "structured_truth_v1" / "oracle_report.json")
+                if not qc_only
+                else ""
+            ),
+            "structured_truth_oracle_requested": bool(
+                not qc_only and session.structured_artifact_oracle is not None
+            ),
+            "structured_truth_oracle_passed": (
+                structured_oracle_report.get("passed")
+                if not qc_only
+                else None
             ),
             "rejection_reason_summary": [] if rejection_summary.empty else rejection_summary.to_dict(orient="records"),
             "usable": not bool(failure_reason),

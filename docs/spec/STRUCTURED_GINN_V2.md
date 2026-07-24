@@ -182,6 +182,9 @@ producer writer 发布一个自包含的 `structured_truth_v1` artifact，而不
 - time/depth 使用同一字段名、同一主键、同一 mask 语义和同一 writer/reader；
 - 历史 artifact 只作为外部 provenance 或人工数值对照，不承担字段补全；
 - producer 内存 payload 与写出再读回的 payload 必须逐字段一致。
+- `structured_truth_v1/sample_index.csv` 是结构化样本索引，包含 realization、lateral、zone 和 geometry 字段；legacy v5 的 `realization_index.csv` 继续服务于 HDF5 兼容发布，两个索引有明确边界。
+- `structured_truth_v1/publication_report.json` 记录 accepted parent、trace、主键和 orphan 审计；发布前该报告必须通过。
+- trace artifact 同时保存观测 seismic、model-consistent seismic 和 forward context，供磁盘 round-trip Oracle 重建同一垂向 forward。
 
 阶段 0 的小型运行至少生成一个 depth dev artifact，并执行一个 time artifact 的 schema/axis symmetry smoke check。完整数据生成放在阶段 1 Oracle 通过之后。
 
@@ -209,6 +212,8 @@ src/ginn_v2/
 5. depth 的 TVDSS、xline step=4、`lateral_m` 和 forward seam 通过检查；
 6. NumPy/Torch forward 输出一致且梯度有限；
 7. 缺字段、轴错位、非有限值、主键歧义或域语义猜测直接失败。
+
+结构化发布审计从磁盘读取 `structured_truth_v1`，检查 accepted parent 集合、trace 文件、数组合同、axis identity、raw/projected/effective segment 字段和 primary key；sample index 仅包含 accepted parent。
 
 阶段 0 未通过时不进入阶段 1；不在旧 artifact 上继续补 adapter。
 
@@ -239,8 +244,9 @@ producer in-memory payload
 StructuredSample
 ├── ObservedTrace
 │   ├── sample_axis, sample_domain, sample_unit, depth_basis
-│   ├── seismic, lfm, observed_valid
-│   └── lateral_m, inline, xline, xline_step
+│   ├── seismic, model_consistent_seismic, lfm, observed_valid
+│   ├── lateral_m, inline, xline, xline_step
+│   └── forward_context
 ├── LatentTrace
 │   ├── latent_axis, latent_valid, log_ai_highres_truth
 │   └── state/object/xi/zone high-resolution grids
@@ -324,6 +330,8 @@ time/depth schema symmetry report
 Oracle contract round-trip report
 forward identity and support report
 ```
+
+生成命令提供 `--run-structured-oracle` 开关。打开后，producer 写出 artifact，重新从磁盘读取每条 trace，执行 decoder、projection、model-consistent forward 和 Torch gradient checks；Oracle report 未通过时，run 不发布为成功数据集。
 
 Oracle 未通过时，修复 producer、writer/reader、decoder 或 forward seam，并重新生成 dev artifact；不进入模型训练。Oracle 通过后，按同一 producer 合同生成完整 depth 训练集，并保留 time 结构化样本作为公共 schema 回归样本。
 

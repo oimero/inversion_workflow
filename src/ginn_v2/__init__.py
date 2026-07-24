@@ -16,6 +16,7 @@ from ginn_v2.oracle import (
     OracleReport,
     ProjectionResult,
     project_log_ai_to_model_grid,
+    run_artifact_oracle,
     run_oracle,
 )
 from ginn_v2.runtime import configure_training_logger, resolve_device
@@ -56,5 +57,6 @@ __all__ = [
     "forward_torch",
     "project_log_ai_to_model_grid",
     "resolve_device",
+    "run_artifact_oracle",
     "run_oracle",
 ]

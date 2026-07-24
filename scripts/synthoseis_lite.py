@@ -18,6 +18,7 @@ select the primary time-domain or depth-domain extension branch.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -114,6 +115,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Reread structured_truth_v1 from disk and require the Stage 1 Oracle to pass.",
     )
+    generate.add_argument(
+        "--structured-smoke",
+        action="store_true",
+        help=(
+            "Run one wedge attempt without seismic views or amplitude prior, "
+            "then require the disk-backed Stage 1 Oracle."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -132,6 +141,88 @@ def _structured_artifact_oracle(root: Path, calibration: object, parent_ids: lis
         str(root),
         calibration,
         expected_parent_ids=parent_ids,
+    )
+
+
+def _resolve_generation_options(
+    args: argparse.Namespace,
+    script_cfg: dict,
+) -> tuple[dict, Path | None, int | None, list[str] | None, bool]:
+    if not args.structured_smoke:
+        return (
+            script_cfg,
+            args.seismic_amplitude_prior,
+            args.debug_attempt_limit,
+            args.geometry_family,
+            bool(args.run_structured_oracle),
+        )
+    if args.seismic_amplitude_prior is not None:
+        raise ValueError("--structured-smoke does not accept --seismic-amplitude-prior")
+    smoke_cfg = deepcopy(script_cfg)
+    smoke_cfg["seismic_views"] = {"operators": {}, "views": []}
+    sections = list(smoke_cfg.get("sections") or [])
+    if not sections:
+        raise ValueError("--structured-smoke requires at least one configured section")
+    smoke_section = deepcopy(sections[0])
+    section_path = list(smoke_section.get("path") or [])
+    if len(section_path) < 2:
+        raise ValueError("--structured-smoke requires a section path with two points")
+    start = dict(section_path[0])
+    end = dict(section_path[1])
+    smoke_section["path"] = [
+        start,
+        {
+            "inline": float(start["inline"])
+            + 0.05 * (float(end["inline"]) - float(start["inline"])),
+            "xline": float(start["xline"])
+            + 0.05 * (float(end["xline"]) - float(start["xline"])),
+        },
+    ]
+    smoke_cfg["sections"] = [smoke_section]
+    generation = dict(smoke_cfg.get("generation") or {})
+    duration_modes = list(generation.get("duration_modes") or [])
+    geometry_directions = list(generation.get("geometry_directions") or [])
+    if not duration_modes or not geometry_directions:
+        raise ValueError(
+            "--structured-smoke requires duration_modes and geometry_directions"
+        )
+    selected_geometry = list(args.geometry_family or ["wedge"])
+    generation.update(
+        {
+            "duration_modes": [duration_modes[0]],
+            "geometry_families": [selected_geometry[0]],
+            "geometry_directions": [geometry_directions[0]],
+        }
+    )
+    smoke_cfg["generation"] = generation
+    impedance_key = (
+        "impedance"
+        if "impedance" in smoke_cfg
+        else "impedance_attribute_generator"
+    )
+    impedance = dict(smoke_cfg.get(impedance_key) or {})
+    nested_lateral = isinstance(impedance.get("lateral"), dict)
+    lateral = dict(impedance["lateral"]) if nested_lateral else impedance
+    for key in (
+        "correlation_length_section_fractions",
+        "coefficient_sigma_multipliers",
+        "thickness_log_sigma_values",
+    ):
+        values = list(lateral.get(key) or [])
+        if not values:
+            raise ValueError(f"--structured-smoke requires impedance lateral {key}")
+        lateral[key] = [values[0]]
+    if nested_lateral:
+        impedance["lateral"] = lateral
+    else:
+        impedance = lateral
+    smoke_cfg[impedance_key] = impedance
+    return (
+        smoke_cfg,
+        None,
+        1,
+        selected_geometry[:1],
+        True,
     )
 
 
@@ -276,26 +367,33 @@ def main() -> None:
                 output_dir=output_dir,
             )
         else:
+            (
+                generation_cfg,
+                amplitude_prior_arg,
+                debug_attempt_limit,
+                geometry_families,
+                run_structured_oracle,
+            ) = _resolve_generation_options(args, script_cfg)
             summary = run_depth_generation(
                 workflow=workflow,
-                script_cfg=script_cfg,
+                script_cfg=generation_cfg,
                 sources=sources,
                 forward_inputs=forward_inputs,
                 config_provenance=config_provenance,
                 calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
                 amplitude_prior_path=(
                     None
-                    if args.seismic_amplitude_prior is None
-                    else resolve_relative_path(args.seismic_amplitude_prior, root=REPO_ROOT)
+                    if amplitude_prior_arg is None
+                    else resolve_relative_path(amplitude_prior_arg, root=REPO_ROOT)
                 ),
                 repo_root=REPO_ROOT,
                 output_dir=output_dir,
-                debug_attempt_limit=args.debug_attempt_limit,
-                geometry_families=args.geometry_family,
+                debug_attempt_limit=debug_attempt_limit,
+                geometry_families=geometry_families,
                 qc_only=args.qc_only,
                 structured_artifact_oracle=(
                     _structured_artifact_oracle
-                    if args.run_structured_oracle
+                    if run_structured_oracle
                     else None
                 ),
             )
@@ -343,26 +441,33 @@ def main() -> None:
             output_dir=output_dir,
         )
     else:
+        (
+            generation_cfg,
+            amplitude_prior_arg,
+            debug_attempt_limit,
+            geometry_families,
+            run_structured_oracle,
+        ) = _resolve_generation_options(args, script_cfg)
         calibration = resolve_relative_path(args.impedance_calibration, root=REPO_ROOT)
         summary = run_generation(
             workflow=workflow,
-            script_cfg=script_cfg,
+            script_cfg=generation_cfg,
             sources=sources,
             config_provenance=config_provenance,
             calibration_path=calibration,
             amplitude_prior_path=(
                 None
-                if args.seismic_amplitude_prior is None
-                else resolve_relative_path(args.seismic_amplitude_prior, root=REPO_ROOT)
+                if amplitude_prior_arg is None
+                else resolve_relative_path(amplitude_prior_arg, root=REPO_ROOT)
             ),
             repo_root=REPO_ROOT,
             output_dir=output_dir,
-            debug_attempt_limit=args.debug_attempt_limit,
-            geometry_families=args.geometry_family,
+            debug_attempt_limit=debug_attempt_limit,
+            geometry_families=geometry_families,
             qc_only=args.qc_only,
             structured_artifact_oracle=(
                 _structured_artifact_oracle
-                if args.run_structured_oracle
+                if run_structured_oracle
                 else None
             ),
         )

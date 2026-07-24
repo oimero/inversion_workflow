@@ -7,6 +7,7 @@ import csv
 import json
 from pathlib import Path
 import shutil
+import time
 from typing import Any
 import uuid
 
@@ -171,6 +172,54 @@ def _forward_context_manifest(record: StructuredSampleRecord) -> dict[str, Any]:
     )
 
 
+def _write_trace_directory(
+    target: Path,
+    *,
+    arrays: Mapping[str, np.ndarray],
+    manifest: Mapping[str, Any],
+) -> None:
+    """Write one trace below an unpublished realization staging directory."""
+    if target.exists():
+        raise FileExistsError(f"structured trace artifact already exists: {target}")
+    target.mkdir(parents=True, exist_ok=False)
+    try:
+        np.savez_compressed(target / "arrays.npz", **arrays)
+        (target / "manifest.json").write_text(
+            json.dumps(dict(manifest), ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except BaseException:
+        if target.exists():
+            shutil.rmtree(target)
+        raise
+
+
+def _commit_staging_directory(
+    staging: Path,
+    target: Path,
+    *,
+    attempts: int = 8,
+    initial_delay_s: float = 0.05,
+) -> None:
+    """Commit one unpublished directory despite transient Windows file locks."""
+    if attempts <= 0:
+        raise ValueError("staging commit attempts must be positive")
+    if target.exists():
+        raise FileExistsError(f"structured artifact target already exists: {target}")
+    for attempt in range(attempts):
+        try:
+            staging.replace(target)
+            return
+        except PermissionError:
+            if target.exists():
+                raise FileExistsError(
+                    f"structured artifact target appeared during publication: {target}"
+                )
+            if attempt + 1 == attempts:
+                raise
+            time.sleep(initial_delay_s * (attempt + 1))
+
+
 def _remove_exact_directory(path: Path) -> None:
     """Remove one known artifact directory without following a directory link."""
     if not path.exists() and not path.is_symlink():
@@ -207,6 +256,20 @@ def _read_json(path: Path, *, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError(f"structured {label} must contain a JSON object: {path}")
     return value
+
+
+def _required_mapping(
+    value: Any,
+    required: Sequence[str],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be a mapping")
+    missing = sorted(set(required).difference(value))
+    if missing:
+        raise ValueError(f"{label} is missing required fields: {missing}")
+    return dict(value)
 
 
 def validate_structured_truth_v1(
@@ -440,14 +503,19 @@ def _write_trace(
     )
     if not segment_rows:
         raise ValueError("structured truth zone has no segment rows")
-    if any(
-        int(row["duration_samples"]) <= 0
-        or not bool(row["segment_supervision_valid"])
-        for row in segment_rows
-    ):
-        raise ValueError(
-            "structured truth contains a segment without complete supervision"
-        )
+    for row in segment_rows:
+        duration_samples = int(row["duration_samples"])
+        supervision_valid = bool(row["segment_supervision_valid"])
+        if duration_samples < 0:
+            raise ValueError("structured truth segment duration_samples must be non-negative")
+        if duration_samples == 0 and supervision_valid:
+            raise ValueError(
+                "zero-sample structured segment cannot be supervision-valid"
+            )
+        if duration_samples > 0 and not supervision_valid:
+            raise ValueError(
+                "sampled structured segment requires complete supervision"
+            )
     tolerance = max(float(truth.highres_sample_interval) * 1e-6, 1e-9)
     if not np.isclose(
         float(segment_rows[0]["top"]),
@@ -558,19 +626,7 @@ def _write_trace(
         },
     }
     json.dumps(manifest, allow_nan=False)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = target.parent / f".{target.name}.{uuid.uuid4().hex}.staging"
-    temporary_path.mkdir(parents=True, exist_ok=False)
-    try:
-        np.savez_compressed(temporary_path / "arrays.npz", **arrays)
-        (temporary_path / "manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        temporary_path.replace(target)
-    finally:
-        if temporary_path.exists():
-            shutil.rmtree(temporary_path)
+    _write_trace_directory(target, arrays=arrays, manifest=manifest)
 
 
 def write_structured_truth_v1(
@@ -610,23 +666,8 @@ def write_structured_truth_v1(
                 raise ValueError(
                     f"structured {zone_id!r} {name} is not realization-zone constant"
                 )
-        segment_keys_by_lateral = {
-            lateral_index: tuple(
-                sorted(
-                    int(row["object_id"])
-                    for row in record.truth.structured_segment_truth
-                    if str(row.get("zone_id")) == zone_id
-                    and int(row.get("lateral_index", -1)) == lateral_index
-                )
-            )
-            for lateral_index in range(record.truth.lateral_m.size)
-        }
-        if len(set(segment_keys_by_lateral.values())) != 1:
-            raise ValueError(
-                f"structured {zone_id!r} segment/object keys differ across lateral traces"
-            )
     written: list[Path] = []
-    staging = realizations / f".{realization_target.name}.{uuid.uuid4().hex}.staging"
+    staging = realizations / f".r-{uuid.uuid4().hex}.staging"
     staging.mkdir(parents=True, exist_ok=False)
     try:
         for lateral_index in range(record.truth.lateral_m.size):
@@ -665,7 +706,7 @@ def write_structured_truth_v1(
             json.dumps(realization_manifest, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
-        staging.replace(realization_target)
+        _commit_staging_directory(staging, realization_target)
     finally:
         if staging.exists():
             shutil.rmtree(staging)

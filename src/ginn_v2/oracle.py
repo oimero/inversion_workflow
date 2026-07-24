@@ -212,6 +212,8 @@ def run_oracle(
     forward_context: ForwardContext,
     *,
     source_truth: SyntheticTruth | None = None,
+    assembled_highres_log_ai: Any | None = None,
+    decoder_mask: Any | None = None,
     decoder_rtol: float = 1e-4,
     decoder_atol: float = 1e-5,
     forward_rtol: float = 1e-4,
@@ -233,7 +235,13 @@ def run_oracle(
         sample.latent.latent_axis,
         calibration,
     )
-    latent_mask = sample.latent.latent_valid
+    latent_mask = (
+        sample.latent.latent_valid
+        if decoder_mask is None
+        else np.asarray(decoder_mask, dtype=bool)
+    )
+    if latent_mask.shape != sample.latent.latent_valid.shape:
+        raise OracleContractError("decoder comparison mask differs from the latent axis.")
     decoder_max_abs, decoder_max_relative = _allclose_oracle(
         decoded.log_ai,
         sample.latent.log_ai_highres_truth,
@@ -287,8 +295,27 @@ def run_oracle(
         max(float(np.max(np.abs(value))) for value in effective_expected),
     ):
         raise OracleContractError("decoder effective parameters disagree with structured truth.")
+    projection_input = (
+        np.asarray(decoded.log_ai, dtype=np.float64)
+        if assembled_highres_log_ai is None
+        else np.asarray(assembled_highres_log_ai, dtype=np.float64)
+    )
+    if projection_input.shape != sample.latent.log_ai_highres_truth.shape:
+        raise OracleContractError("assembled decoder trace differs from the latent axis.")
+    assembled_max_abs = float("nan")
+    assembled_max_relative = float("nan")
+    if assembled_highres_log_ai is not None:
+        assembled_mask = np.isfinite(sample.latent.log_ai_highres_truth)
+        assembled_max_abs, assembled_max_relative = _allclose_oracle(
+            projection_input,
+            sample.latent.log_ai_highres_truth,
+            mask=assembled_mask,
+            rtol=decoder_rtol,
+            atol=decoder_atol,
+            label="assembled decoder/high-resolution truth",
+        )
     projection = project_log_ai_to_model_grid(
-        decoded.log_ai,
+        projection_input,
         sample.latent.latent_axis,
         sample.observed.sample_axis,
     )
@@ -382,6 +409,8 @@ def run_oracle(
         "decoder_max_relative_error": decoder_max_relative,
         "projected_parameter_max_abs_error": projected_parameter_error,
         "effective_parameter_max_abs_error": effective_parameter_error,
+        "assembled_decoder_max_abs_error": assembled_max_abs,
+        "assembled_decoder_max_relative_error": assembled_max_relative,
         "projection_max_abs_error": projection_max_abs,
         "projection_max_relative_error": projection_max_relative,
         "source_projection_max_abs_error": source_projection_max_abs,
@@ -396,7 +425,7 @@ def run_oracle(
         "torch_forward_gradients_finite": 1.0,
     }
     return OracleReport(
-        decoded_highres_log_ai=np.asarray(decoded.log_ai, dtype=np.float64),
+        decoded_highres_log_ai=projection_input,
         projected_log_ai=np.asarray(projection.model_log_ai, dtype=np.float64),
         forward_seismic=np.asarray(forward_seismic, dtype=np.float64),
         projection=projection,
@@ -440,6 +469,13 @@ def run_artifact_oracle(
     from pathlib import Path
 
     artifact_root = Path(root)
+
+    def report_path(path: Path) -> str:
+        try:
+            return path.relative_to(artifact_root).as_posix() or "."
+        except ValueError:
+            return str(path)
+
     trace_paths = sorted(
         (
             path
@@ -452,28 +488,108 @@ def run_artifact_oracle(
     failures: list[dict[str, str]] = []
     reports: list[dict[str, Any]] = []
     parent_ids: set[str] = set()
+    grouped: dict[
+        tuple[str, int],
+        list[tuple[Any, StructuredSample]],
+    ] = {}
     for trace_path in trace_paths:
         try:
             sample = reader.read(trace_path)
             parent_ids.add(sample.realization_id)
-            report = run_oracle(
-                sample,
-                calibration,
-                _forward_context_from_sample(sample),
-            )
-            reports.append(
-                {
-                    "artifact_path": str(trace_path),
-                    "realization_id": sample.realization_id,
-                    "lateral_index": sample.lateral_index,
-                    "zone_id": sample.zone.zone_id,
-                    "metrics": dict(report.metrics),
-                }
+            grouped.setdefault(
+                (sample.realization_id, sample.lateral_index),
+                [],
+            ).append(
+                (trace_path, sample)
             )
         except Exception as exc:
             failures.append(
                 {
-                    "artifact_path": str(trace_path),
+                    "artifact_path": report_path(trace_path),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+    for (realization_id, lateral_index), items in sorted(grouped.items()):
+        group_path = items[0][0].parent
+        try:
+            reference = items[0][1]
+            truth = np.asarray(
+                reference.latent.log_ai_highres_truth,
+                dtype=np.float64,
+            )
+            assembled = np.full(truth.shape, np.nan, dtype=np.float64)
+            coverage = np.zeros(truth.shape, dtype=bool)
+            zone_ids: set[str] = set()
+            for _, sample in items:
+                if sample.zone.zone_id in zone_ids:
+                    raise OracleContractError(
+                        f"trace contains duplicate zone {sample.zone.zone_id!r}."
+                    )
+                zone_ids.add(sample.zone.zone_id)
+                if not np.array_equal(
+                    sample.latent.latent_axis.coordinates,
+                    reference.latent.latent_axis.coordinates,
+                ):
+                    raise OracleContractError("trace zones use different latent axes.")
+                if not np.array_equal(
+                    sample.observed.sample_axis.coordinates,
+                    reference.observed.sample_axis.coordinates,
+                ):
+                    raise OracleContractError("trace zones use different observed axes.")
+                if not np.array_equal(
+                    sample.latent.log_ai_highres_truth,
+                    truth,
+                    equal_nan=True,
+                ):
+                    raise OracleContractError(
+                        "trace zones disagree on high-resolution truth."
+                    )
+                zone_mask = np.asarray(sample.zone.zone_valid, dtype=bool)
+                if np.any(coverage & zone_mask):
+                    raise OracleContractError("trace zone masks overlap.")
+                decoded = decode_numpy(
+                    sample.zone,
+                    sample.segments,
+                    sample.latent.latent_axis,
+                    calibration,
+                )
+                assembled[zone_mask] = np.asarray(decoded.log_ai)[zone_mask]
+                coverage |= zone_mask
+            truth_mask = np.isfinite(truth)
+            latent_zone_id = np.asarray(reference.latent.zone_id)
+            context_mask = truth_mask & (latent_zone_id < 0)
+            missing_structured = truth_mask & ~coverage & ~context_mask
+            if np.any(missing_structured):
+                raise OracleContractError(
+                    "trace zones do not cover all finite structured-zone truth."
+                )
+            if np.any(coverage & ~truth_mask):
+                raise OracleContractError(
+                    "trace zone coverage extends beyond finite high-resolution truth."
+                )
+            assembled[context_mask] = truth[context_mask]
+            for trace_path, sample in items:
+                report = run_oracle(
+                    sample,
+                    calibration,
+                    _forward_context_from_sample(sample),
+                    assembled_highres_log_ai=assembled,
+                    decoder_mask=sample.zone.zone_valid,
+                )
+                reports.append(
+                    {
+                        "artifact_path": report_path(trace_path),
+                        "realization_id": realization_id,
+                        "lateral_index": lateral_index,
+                        "zone_id": sample.zone.zone_id,
+                        "metrics": dict(report.metrics),
+                    }
+                )
+        except Exception as exc:
+            failures.append(
+                {
+                    "artifact_path": report_path(group_path),
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                 }
@@ -482,7 +598,7 @@ def run_artifact_oracle(
     if expected is not None and parent_ids != expected:
         failures.append(
             {
-                "artifact_path": str(artifact_root),
+                "artifact_path": ".",
                 "error_type": "OracleContractError",
                 "error": (
                     "artifact parent set differs from expected parent set: "
@@ -493,7 +609,7 @@ def run_artifact_oracle(
     if not reports and not failures:
         failures.append(
             {
-                "artifact_path": str(artifact_root),
+                "artifact_path": ".",
                 "error_type": "OracleContractError",
                 "error": "structured artifact root contains no trace artifacts",
             }

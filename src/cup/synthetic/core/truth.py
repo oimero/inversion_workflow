@@ -862,13 +862,20 @@ def generate_field_conditioned_truth(
                 )
                 indices = np.flatnonzero(mask)
                 if indices.size == 0:
-                    if local_object_index == event_target:
-                        minimum_object_truth_samples = 0
-                    continue
-                minimum_object_truth_samples = min(
-                    minimum_object_truth_samples,
-                    int(indices.size),
-                )
+                    minimum_object_truth_samples = 0
+                    geometric_duration = float(object_bottom - object_top)
+                    geometric_tolerance = max(
+                        highres_interval * 1e-12,
+                        np.finfo(np.float64).eps
+                        * max(1.0, abs(float(object_top)), abs(float(object_bottom))),
+                    )
+                    if geometric_duration <= geometric_tolerance:
+                        continue
+                else:
+                    minimum_object_truth_samples = min(
+                        minimum_object_truth_samples,
+                        int(indices.size),
+                    )
                 maximum_object_truth_samples = max(
                     maximum_object_truth_samples,
                     int(indices.size),
@@ -1033,14 +1040,15 @@ def generate_field_conditioned_truth(
                 zone_id_grid[lateral_index, indices] = zone_index
                 if local_object_index == event_target:
                     geometry_event_mask[lateral_index, indices] = True
-                boundary[lateral_index, indices[0]] = True
-                mean_value = float(np.mean(clipped))
-                mean_background = float(np.mean(background))
-                if item["state"] == "high_impedance" and mean_value <= mean_background:
-                    reversal_count += 1
-                if item["state"] == "low_impedance" and mean_value >= mean_background:
-                    reversal_count += 1
-                valid_columns += 1
+                if indices.size > 0:
+                    boundary[lateral_index, indices[0]] = True
+                    mean_value = float(np.mean(clipped))
+                    mean_background = float(np.mean(background))
+                    if item["state"] == "high_impedance" and mean_value <= mean_background:
+                        reversal_count += 1
+                    if item["state"] == "low_impedance" and mean_value >= mean_background:
+                        reversal_count += 1
+                    valid_columns += 1
             object_reversal = reversal_count / max(valid_columns, 1)
             object_clipping = clipping_count / max(sample_count, 1)
             object_profile_violation = profile_violation_count / max(valid_columns, 1)

@@ -272,7 +272,9 @@ mask 分开记录：
 - padding mask：只用于 batch 对齐；
 - mask 不进入 encoder channel，也不与 zone mask 合并。
 
-高分辨率 axis 必须覆盖 decoder 和 forward 所需的完整 support。单 zone 可以裁成 zone 加明确的 forward context；保留 zone 外 context 时，producer 发布 context extension 和 mask。未知区域不使用边缘填充值冒充 truth。
+几何事件可产生“正几何厚度、零高分辨率采样”的 sub-grid segment。该 segment 保留完整端点和三套系数，`duration_samples=0` 且 `segment_supervision_valid=false`；真正零厚度对象不进入单道 segment 列表。
+
+高分辨率 axis 必须覆盖 decoder 和 forward 所需的完整 support。单 zone 可以裁成 zone 加明确的 forward context；保留 zone 外 context 时，producer 发布 context extension 和 mask。当前整道 artifact 用负的 zone grid id 标识固定 forward context：该位置可以参与 projection/forward，但不参与 decoder parity 或参数监督。未知区域不使用边缘填充值冒充 truth。
 
 ### 4.3 strict reader / adapter
 
@@ -310,9 +312,11 @@ NumPy/Torch 共享字段、参数顺序、endpoint 规则、输出形状和 clip
 
 ### 4.5 Oracle 检查
 
+Oracle 先按 realization 和 lateral 对磁盘 artifact 分组，分别解码各 zone，再与显式固定 context 组装成完整 high-resolution trace；projection 和 forward 只接收这条完整 trace。任何非负 zone grid 样本未被某个 zone artifact 覆盖、zone mask 重叠或各 zone 的轴/truth 不一致均直接失败。
+
 Oracle 从发布 truth 复现 high-resolution log AI、model-grid log AI 和 forward seismic，检查：
 
-1. decoder 与 producer truth 在 `latent_valid` 上一致，raw/projected/effective 逐字段一致；
+1. decoder 与 producer truth 在各自 `zone_valid` 上一致，raw/projected/effective 逐字段一致；组装结果与完整有限 high-resolution truth 一致；
 2. axis nesting、factor、endpoint、support mask 和 `cup.synthetic.core.projection` 一致；
 3. time/depth 使用各自 adapter，但共享同一 structured 输入/输出合同；
 4. NumPy/Torch decoder parity、Torch decoder/forward 有限梯度；

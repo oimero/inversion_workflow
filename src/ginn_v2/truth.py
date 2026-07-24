@@ -354,9 +354,13 @@ class SegmentTruth:
         if (
             isinstance(self.duration_samples, bool)
             or int(self.duration_samples) != self.duration_samples
-            or int(self.duration_samples) <= 0
+            or int(self.duration_samples) < 0
         ):
-            raise ValueError("SegmentTruth.duration_samples must be a positive integer.")
+            raise ValueError("SegmentTruth.duration_samples must be a non-negative integer.")
+        if int(self.duration_samples) == 0 and bool(self.segment_supervision_valid):
+            raise ValueError(
+                "Zero-sample SegmentTruth cannot be supervision-valid."
+            )
         arrays = []
         for name in (
             "c0_raw",
@@ -611,12 +615,23 @@ class StructuredTruthAdapter:
             data = _required_mapping(row, required_segment, label="structured segment sidecar")
             object_id = data["object_id"]
             object_mask = zone_valid & (object_grid == object_id)
-            if not np.any(object_mask):
+            duration_samples = int(data["duration_samples"])
+            supervision_valid = bool(data["segment_supervision_valid"])
+            if duration_samples == 0:
+                if supervision_valid:
+                    raise ValueError(
+                        "zero-sample structured segment cannot be supervision-valid."
+                    )
+                if np.any(object_mask):
+                    raise ValueError(
+                        "zero-sample structured segment is present on the latent grid."
+                    )
+            elif not np.any(object_mask):
                 raise ValueError(
                     f"structured object_id {object_id!r} is absent from the selected SyntheticTruth trace."
                 )
             state_id = int(data["state_id"])
-            if np.any(state_grid[object_mask] != state_id):
+            if np.any(object_mask) and np.any(state_grid[object_mask] != state_id):
                 raise ValueError("structured segment state_id disagrees with SyntheticTruth state grid.")
             xi = np.asarray(object_xi_grid[object_mask], dtype=np.float64)
             if np.any(~np.isfinite(xi)) or np.any((xi < -tolerance) | (xi > 1.0 + tolerance)):
@@ -635,7 +650,7 @@ class StructuredTruthAdapter:
                     top=top,
                     bottom=bottom,
                     duration_fraction=float(data["duration_fraction"]),
-                    duration_samples=int(data["duration_samples"]),
+                    duration_samples=duration_samples,
                     c0_raw=data["c0_raw"],
                     c1_raw=data["c1_raw"],
                     c2_raw=data["c2_raw"],
@@ -645,7 +660,7 @@ class StructuredTruthAdapter:
                     c0_effective=data["c0_effective"],
                     c1_effective=data["c1_effective"],
                     c2_effective=data["c2_effective"],
-                    segment_supervision_valid=bool(data["segment_supervision_valid"]),
+                    segment_supervision_valid=supervision_valid,
                 )
             )
         return StructuredSample(
@@ -928,11 +943,22 @@ class StructuredTruthArtifactReader:
                 object_mask = zone_mask & (
                     arrays["latent_object_id"] == int(row["object_id"])
                 )
-                if not np.any(object_mask):
+                duration_samples = int(row["duration_samples"])
+                supervision_valid = bool(row["segment_supervision_valid"])
+                if duration_samples == 0:
+                    if supervision_valid:
+                        raise ValueError(
+                            "zero-sample structured artifact segment cannot be supervision-valid."
+                        )
+                    if np.any(object_mask):
+                        raise ValueError(
+                            f"zero-sample structured artifact object {row['object_id']!r} is present."
+                        )
+                elif not np.any(object_mask):
                     raise ValueError(
                         f"structured artifact object {row['object_id']!r} is absent."
                     )
-                if np.any(
+                if np.any(object_mask) and np.any(
                     arrays["latent_state_id"][object_mask] != int(row["state_id"])
                 ):
                     raise ValueError(

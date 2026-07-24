@@ -59,7 +59,7 @@ def _new_staging_directory(directory: Path) -> Path:
     """Create a writable sibling without tempfile's restrictive Windows ACL."""
     directory.parent.mkdir(parents=True, exist_ok=True)
     for _ in range(32):
-        candidate = directory.parent / f".{directory.name}.{uuid.uuid4().hex}.staging"
+        candidate = directory.parent / f".run-{uuid.uuid4().hex}.staging"
         try:
             candidate.mkdir()
             return candidate
@@ -971,9 +971,6 @@ class SyntheticBenchmarkPipeline:
                         "synthetic_benchmark": h5_path,
                         "realization_index": output_dir / "realization_index.csv",
                         "seismic_view_index": output_dir / "seismic_view_index.csv",
-                        "structured_truth_v1": str(
-                            output_dir / "structured_truth_v1"
-                        ),
                         "structured_truth_sample_index": str(
                             output_dir / "structured_truth_v1" / "sample_index.csv"
                         ),

@@ -493,7 +493,7 @@ def _condition_torch(
     lower = torch.maximum(
         lower,
         torch.as_tensor(ai_bounds[0], dtype=parameters.dtype, device=parameters.device)
-        - torch.max(background + shape),
+        - torch.min(background + shape),
     )
     upper = torch.as_tensor(
         c0_upper,
@@ -512,7 +512,7 @@ def _condition_torch(
     upper = torch.minimum(
         upper,
         torch.as_tensor(ai_bounds[1], dtype=parameters.dtype, device=parameters.device)
-        - torch.min(background + shape),
+        - torch.max(background + shape),
     )
     epsilon = 32.0 * np.finfo(np.float64).eps
     if state == "high_impedance":

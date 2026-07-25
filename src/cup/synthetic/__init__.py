@@ -1,5 +1,17 @@
-"""Stable Synthoseis-lite benchmark consumption Interface."""
+"""Stable structured synthetic benchmark consumption interface."""
 
-from cup.synthetic.benchmark import SyntheticSample, SyntheticSampleProtocol, SynthoseisBenchmark
+from cup.synthetic.benchmark import (
+    ParentIdentity,
+    StructuredParent,
+    StructuredSyntheticBenchmark,
+    SynthoseisBenchmark,
+    SyntheticSample,
+)
 
-__all__ = ["SyntheticSample", "SyntheticSampleProtocol", "SynthoseisBenchmark"]
+__all__ = [
+    "ParentIdentity",
+    "StructuredParent",
+    "StructuredSyntheticBenchmark",
+    "SynthoseisBenchmark",
+    "SyntheticSample",
+]

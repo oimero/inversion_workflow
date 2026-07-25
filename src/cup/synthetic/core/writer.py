@@ -1,22 +1,21 @@
-"""Pure serialization of materialized Synthoseis v5 parent/view artifacts."""
+"""Single-artifact HDF5 writer for structured synthetic samples."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import json
 from typing import Any, Mapping
+import uuid
 
 import h5py
 import numpy as np
 
 from cup.synthetic.core.artifacts import write_dataset
 from cup.synthetic.core.records import (
-    BenchmarkSample,
-    BenchmarkView,
     DepthForwardExtras,
+    StructuredSampleRecord,
     TimeForwardExtras,
 )
-from cup.synthetic.schemas import SEISMIC_VIEW_CONTRACT_VERSION
 
 
 @dataclass(frozen=True)
@@ -25,46 +24,8 @@ class ArtifactReference:
     seismic_input_dataset: str
     seismic_model_consistent_dataset: str
     valid_mask_dataset: str
-
-
-@dataclass(frozen=True)
-class DatasetPlanItem:
-    group_path: str
-    name: str
-    values: np.ndarray
-    unit: str
-    dtype: object | None = np.float32
-
-
-def _common_dataset_plan(
-    sample: BenchmarkSample, *, amplitude_unit: str, model_consistent_dtype: object | None
-) -> tuple[DatasetPlanItem, ...]:
-    forward = sample.forward
-    return (
-        DatasetPlanItem("priors", "canonical_background_log_ai", sample.canonical_background_log_ai, "ln(m/s*g/cm3)"),
-        DatasetPlanItem("targets", "target_increment_log_ai", sample.target_increment_log_ai, "ln(m/s*g/cm3)"),
-        DatasetPlanItem("seismic", "seismic_observed", forward.seismic_observed, amplitude_unit),
-        DatasetPlanItem("seismic", "seismic_model_consistent", forward.seismic_model_consistent, amplitude_unit, model_consistent_dtype),
-        DatasetPlanItem("seismic", "subgrid_forward_residual", forward.subgrid_forward_residual, amplitude_unit),
-        DatasetPlanItem("masks", "valid_mask", sample.valid_mask, "bool", None),
-    )
-
-
-def _write_common_dataset_plan(
-    root: h5py.Group, sample: BenchmarkSample, *, sample_domain: str,
-    model_axis_path: str, axis_order: str | list[str], amplitude_unit: str,
-    model_consistent_dtype: object | None,
-) -> None:
-    for item in _common_dataset_plan(
-        sample, amplitude_unit=amplitude_unit,
-        model_consistent_dtype=model_consistent_dtype,
-    ):
-        group = root.require_group(item.group_path)
-        values = np.asarray(item.values, dtype=item.dtype) if item.dtype is not None else np.asarray(item.values)
-        _dataset(
-            group, item.name, values, unit=item.unit, sample_domain=sample_domain,
-            axis_path=model_axis_path, axis_order=axis_order,
-        )
+    lfm_dataset: str
+    model_log_ai_dataset: str
 
 
 def _dataset(
@@ -76,11 +37,13 @@ def _dataset(
     sample_domain: str,
     axis_path: str,
     axis_order: str | list[str],
+    dtype: object | None = None,
 ) -> h5py.Dataset:
+    array = np.asarray(values, dtype=dtype) if dtype is not None else np.asarray(values)
     return write_dataset(
         group,
         name,
-        values,
+        array,
         unit=unit,
         sample_domain=sample_domain,
         axis_path=axis_path,
@@ -88,8 +51,11 @@ def _dataset(
     )
 
 
+def _json_attribute(group: h5py.Group, name: str, value: Any) -> None:
+    group.attrs[name] = json.dumps(value, allow_nan=False, sort_keys=True)
+
+
 def serialize_qc_attributes(qc_values: Mapping[str, Any]) -> dict[str, Any]:
-    """Select the domain-neutral scalar QC surface persisted in HDF5."""
     return {
         str(key): value
         for key, value in qc_values.items()
@@ -102,341 +68,504 @@ def _write_qc_attributes(group: h5py.Group, qc_values: Mapping[str, Any]) -> Non
         group.attrs[key] = value
 
 
-def _write_depth_sample(h5: h5py.File, sample: BenchmarkSample) -> ArtifactReference:
-    truth_record = sample.truth
-    projected = sample.projected
-    forward = sample.forward
-    if not isinstance(forward.extras, DepthForwardExtras):
-        raise TypeError("depth Benchmark sample requires DepthForwardExtras.")
-    path = f"/realizations/{truth_record.realization_id}"
-    root = h5.create_group(path)
-    root.attrs["sample_domain"] = "depth"
-    root.attrs["depth_basis"] = "tvdss"
-    increment_contract = sample.domain_metadata.get("increment_contract")
-    if increment_contract is not None:
-        root.attrs["increment_contract_json"] = json.dumps(
-            increment_contract, sort_keys=True
-        )
+def _string_column(group: h5py.Group, name: str, values: list[str]) -> None:
+    dtype = h5py.string_dtype(encoding="utf-8")
+    group.create_dataset(name, data=np.asarray(values, dtype=object), dtype=dtype)
 
-    axes = root.create_group("axes")
-    axis_values = {
-        "lateral_m": truth_record.lateral_m,
-        "tvdss_highres_m": truth_record.highres_axis,
-        "tvdss_model_m": projected.model_axis.coordinates,
-        "inline_float": truth_record.inline_float,
-        "xline_float": truth_record.xline_float,
-        "x_m": truth_record.x_m,
-        "y_m": truth_record.y_m,
-    }
-    for name, values in axis_values.items():
-        if name == "tvdss_highres_m":
-            axis_path, axis_order, unit = f"{path}/axes/{name}", "tvdss_highres", "m"
-        elif name == "tvdss_model_m":
-            axis_path, axis_order, unit = f"{path}/axes/{name}", "tvdss_model", "m"
+
+def _columnar_table(
+    parent: h5py.Group,
+    name: str,
+    rows: tuple[Mapping[str, Any], ...],
+    *,
+    columns: tuple[str, ...],
+) -> h5py.Group:
+    if not rows:
+        raise ValueError(f"structured truth requires non-empty {name} table")
+    missing = [
+        (index, column)
+        for index, row in enumerate(rows)
+        for column in columns
+        if column not in row
+    ]
+    if missing:
+        raise ValueError(f"structured {name} table is missing fields: {missing[:5]}")
+    group = parent.create_group(name)
+    group.attrs["row_count"] = len(rows)
+    for column in columns:
+        values = [row[column] for row in rows]
+        if all(isinstance(value, (str, bytes, np.str_)) for value in values):
+            _string_column(group, column, [str(value) for value in values])
+        elif all(isinstance(value, (bool, np.bool_)) for value in values):
+            group.create_dataset(column, data=np.asarray(values, dtype=np.bool_))
+        elif all(isinstance(value, (int, np.integer)) for value in values):
+            group.create_dataset(column, data=np.asarray(values, dtype=np.int64))
         else:
-            axis_path, axis_order = f"{path}/axes/lateral_m", "lateral"
-            unit = "line" if "line" in name else "m"
-        _dataset(
-            axes,
-            name,
-            np.asarray(values, dtype=np.float64),
-            unit=unit,
-            sample_domain="depth",
-            axis_path=axis_path,
-            axis_order=axis_order,
-        )
+            array = np.asarray(values, dtype=np.float64)
+            if np.any(~np.isfinite(array)):
+                raise ValueError(f"structured {name}.{column} contains non-finite values")
+            group.create_dataset(column, data=array)
+    return group
 
-    truth = root.create_group("truth")
-    high_axis_path = f"{path}/axes/tvdss_highres_m"
-    model_axis_path = f"{path}/axes/tvdss_model_m"
-    for name, values, unit, axis_path in (
-        ("log_ai_highres", truth_record.log_ai_highres, "ln(m/s*g/cm3)", high_axis_path),
-        ("vp_highres_mps", forward.extras.vp_highres_mps, "m/s", high_axis_path),
-        ("rgt_highres", truth_record.rgt_highres, "normalized_zone", high_axis_path),
-        (
-            "model_target_log_ai",
-            projected.model_target_log_ai,
-            "ln(m/s*g/cm3)",
-            model_axis_path,
-        ),
-        ("vp_model_mps", forward.extras.vp_model_mps, "m/s", model_axis_path),
-        ("rgt_model", projected.rgt_model, "normalized_zone", model_axis_path),
-    ):
-        _dataset(
-            truth,
-            name,
-            np.asarray(values, dtype=np.float32),
-            unit=unit,
-            sample_domain="depth",
-            axis_path=axis_path,
-            axis_order="lateral,tvdss",
-        )
 
-    categorical_values = {
-        "state_id_highres": truth_record.state_id_highres,
-        "object_id_highres": truth_record.object_id_highres,
-        "object_xi_highres": truth_record.object_xi_highres,
-        "zone_id_highres": truth_record.zone_id_highres,
-        "geometry_event_mask_highres": truth_record.geometry_event_mask_highres,
-        "boundary_mask_highres": truth_record.boundary_mask_highres,
-        "boundary_fraction_model": projected.boundary_fraction_model,
-        "boundary_mask_model": projected.boundary_mask_model,
-        "state_fraction_model": projected.state_fraction_model,
-        "dominant_object_id_model": projected.dominant_object_id_model,
-        "zone_id_model": projected.zone_id_model,
+def _validate_structured_tables(record: StructuredSampleRecord) -> None:
+    truth = record.truth
+    zone_rows = truth.structured_zone_truth
+    segment_rows = truth.structured_segment_truth
+    if not zone_rows or not segment_rows:
+        raise ValueError("structured sample requires explicit zone and segment truth")
+    n_lateral = truth.lateral_m.size
+    zone_keys = {
+        (int(row["lateral_index"]), str(row["zone_id"])) for row in zone_rows
     }
-    _dataset(
-        truth,
-        "geometry_event_mask_highres",
-        truth_record.geometry_event_mask_highres,
-        unit="bool",
-        sample_domain="depth",
-        axis_path=high_axis_path,
-        axis_order="lateral,tvdss",
-    )
-    _dataset(
-        truth,
-        "boundary_mask_model",
-        projected.boundary_mask_model,
-        unit="bool",
-        sample_domain="depth",
-        axis_path=model_axis_path,
-        axis_order="lateral,tvdss",
-    )
-    categorical = truth.create_group("categorical")
-    for name, values in categorical_values.items():
-        highres = np.asarray(values).shape[1] == truth_record.highres_axis.size
-        _dataset(
-            categorical,
-            name,
-            np.asarray(values),
-            unit="category",
-            sample_domain="depth",
-            axis_path=high_axis_path if highres else model_axis_path,
-            axis_order=("lateral,tvdss,state" if np.asarray(values).ndim == 3 else "lateral,tvdss"),
+    if len(zone_keys) != len(zone_rows):
+        raise ValueError("structured zone table contains duplicate lateral/zone keys")
+    if {key[0] for key in zone_keys} != set(range(n_lateral)):
+        raise ValueError("structured zone table does not cover every lateral trace")
+    tolerance = max(float(truth.highres_sample_interval) * 1e-6, 1e-9)
+    for lateral_index, zone_id in sorted(zone_keys):
+        zone = next(
+            row
+            for row in zone_rows
+            if int(row["lateral_index"]) == lateral_index
+            and str(row["zone_id"]) == zone_id
         )
-
-    _write_common_dataset_plan(
-        root,
-        sample,
-        sample_domain="depth",
-        model_axis_path=model_axis_path,
-        axis_order="lateral,tvdss",
-        amplitude_unit="amplitude",
-        model_consistent_dtype=np.float32,
-    )
-    qc = root.create_group("qc")
-    _write_qc_attributes(qc, sample.qc)
-    return ArtifactReference(
-        hdf5_group=path,
-        seismic_input_dataset=f"{path}/seismic/seismic_observed",
-        seismic_model_consistent_dataset=(
-            f"{path}/seismic/seismic_model_consistent"
-        ),
-        valid_mask_dataset=f"{path}/masks/valid_mask",
-    )
-
-
-def _write_time_sample(h5: h5py.File, sample: BenchmarkSample) -> ArtifactReference:
-    truth_record = sample.truth
-    projected = sample.projected
-    forward = sample.forward
-    if not isinstance(forward.extras, TimeForwardExtras):
-        raise TypeError("time Benchmark sample requires TimeForwardExtras.")
-    path = f"/realizations/{truth_record.realization_id}"
-    root = h5.create_group(path)
-    root.attrs["scenario_id"] = truth_record.scenario.scenario_id
-    root.attrs["status"] = str(sample.qc.get("status", "ok"))
-    root.attrs["suite"] = str(sample.qc.get("suite", "field_conditioned"))
-    increment_contract = sample.domain_metadata.get("increment_contract")
-    if increment_contract is not None:
-        root.attrs["increment_contract_json"] = json.dumps(
-            increment_contract, sort_keys=True
+        selected = sorted(
+            (
+                row
+                for row in segment_rows
+                if int(row["lateral_index"]) == lateral_index
+                and str(row["zone_id"]) == zone_id
+            ),
+            key=lambda row: (float(row["top"]), int(row["object_id"])),
         )
+        if not selected:
+            raise ValueError(f"structured zone {zone_id!r} has no segments")
+        if not np.isclose(
+            float(selected[0]["top"]), float(zone["top"]), rtol=0.0, atol=tolerance
+        ) or not np.isclose(
+            float(selected[-1]["bottom"]),
+            float(zone["bottom"]),
+            rtol=0.0,
+            atol=tolerance,
+        ):
+            raise ValueError("structured segment endpoints do not cover their zone")
+        for previous, current in zip(selected, selected[1:], strict=False):
+            if not np.isclose(
+                float(previous["bottom"]),
+                float(current["top"]),
+                rtol=0.0,
+                atol=tolerance,
+            ):
+                raise ValueError("structured segment endpoints are not contiguous")
+    for zone_id in sorted({str(row["zone_id"]) for row in zone_rows}):
+        rows = [row for row in zone_rows if str(row["zone_id"]) == zone_id]
+        for name in ("background_a", "background_b"):
+            values = np.asarray([row[name] for row in rows], dtype=np.float64)
+            if not np.all(np.isfinite(values)) or not np.allclose(
+                values, values[0], rtol=0.0, atol=1e-12
+            ):
+                raise ValueError(
+                    f"structured {zone_id!r} {name} must be realization-zone constant"
+                )
 
+
+def _write_axes(
+    root: h5py.Group,
+    record: StructuredSampleRecord,
+    *,
+    published_path: str,
+) -> tuple[str, str]:
+    truth = record.truth
+    domain = truth.sample_domain
+    path = published_path
     axes = root.create_group("axes")
-    axis_values = (
-        ("lateral_m", truth_record.lateral_m, "m", ["lateral"], ""),
-        ("inline_float", truth_record.inline_float, "line", ["lateral"], ""),
-        ("xline_float", truth_record.xline_float, "line", ["lateral"], ""),
-        ("x_m", truth_record.x_m, "m", ["lateral"], ""),
-        ("y_m", truth_record.y_m, "m", ["lateral"], ""),
-        ("twt_highres_s", truth_record.highres_axis, "s", ["twt"], ""),
-        ("twt_model_s", projected.model_axis.coordinates, "s", ["twt"], ""),
-        ("twt_forward_highres_s", truth_record.highres_axis[1:], "s", ["twt_forward"], ""),
+    high_name = "tvdss_highres_m" if domain == "depth" else "twt_highres_s"
+    model_name = "tvdss_model_m" if domain == "depth" else "twt_model_s"
+    high_path = f"{path}/axes/{high_name}"
+    model_path = f"{path}/axes/{model_name}"
+    for name, values, unit, axis_path, axis_order in (
+        ("lateral_m", truth.lateral_m, "m", f"{path}/axes/lateral_m", "lateral"),
+        ("inline_float", truth.inline_float, "line", f"{path}/axes/lateral_m", "lateral"),
+        ("xline_float", truth.xline_float, "line", f"{path}/axes/lateral_m", "lateral"),
+        ("x_m", truth.x_m, "m", f"{path}/axes/lateral_m", "lateral"),
+        ("y_m", truth.y_m, "m", f"{path}/axes/lateral_m", "lateral"),
+        (high_name, truth.highres_axis, truth.axis_unit, high_path, "sample"),
         (
-            "twt_forward_model_s",
-            projected.model_axis.coordinates[1:],
-            "s",
-            ["twt_forward"],
-            "",
+            model_name,
+            record.projected.model_axis.coordinates,
+            record.projected.model_axis.unit,
+            model_path,
+            "sample",
         ),
-    )
-    for name, values, unit, axis_order, axis_path in axis_values:
+    ):
         _dataset(
             axes,
             name,
-            np.asarray(values, dtype=np.float64),
+            values,
             unit=unit,
-            sample_domain="time",
+            sample_domain=domain,
             axis_path=axis_path,
             axis_order=axis_order,
+            dtype=np.float64,
         )
-
-    high_axis = f"{path}/axes/twt_highres_s"
-    model_axis = f"{path}/axes/twt_model_s"
-    high_forward_axis = f"{path}/axes/twt_forward_highres_s"
-    model_forward_axis = f"{path}/axes/twt_forward_model_s"
-    truth = root.create_group("truth")
-    truth_values = (
-        ("truth_log_ai_highres", truth_record.log_ai_highres, "ln(m/s*g/cm3)", high_axis),
-        ("model_target_log_ai", projected.model_target_log_ai, "ln(m/s*g/cm3)", model_axis),
-        ("rgt_highres", truth_record.rgt_highres, "normalized_zone", high_axis),
-        ("rgt_model", projected.rgt_model, "normalized_zone", model_axis),
-        ("state_id_highres", truth_record.state_id_highres, "category", high_axis),
-        ("object_id_highres", truth_record.object_id_highres, "category", high_axis),
-        ("object_xi_highres", truth_record.object_xi_highres, "normalized_object", high_axis),
-        ("zone_id_highres", truth_record.zone_id_highres, "category", high_axis),
-        ("geometry_event_mask_highres", truth_record.geometry_event_mask_highres, "bool", high_axis),
-        ("boundary_mask_highres", truth_record.boundary_mask_highres, "bool", high_axis),
-        ("boundary_fraction_model", projected.boundary_fraction_model, "fraction", model_axis),
-        ("boundary_mask_model", projected.boundary_mask_model, "bool", model_axis),
-        ("dominant_object_id_model", projected.dominant_object_id_model, "category", model_axis),
-        ("zone_id_model", projected.zone_id_model, "category", model_axis),
-    )
-    for name, values, unit, axis_path in truth_values:
-        _dataset(
-            truth,
-            name,
-            np.asarray(values),
-            unit=unit,
-            sample_domain="time",
-            axis_path=axis_path,
-            axis_order=["lateral", "twt"],
-        )
-    _dataset(
-        truth,
-        "state_fraction_model",
-        projected.state_fraction_model,
-        unit="fraction",
-        sample_domain="time",
-        axis_path=model_axis,
-        axis_order=["lateral", "twt", "state"],
-    )
-    for name, values, axis_path in (
-        ("reflectivity_highres", forward.extras.reflectivity_highres, high_forward_axis),
-        ("reflectivity_model", forward.extras.reflectivity_model, model_forward_axis),
-        ("forward_valid_mask_highres", forward.extras.forward_valid_mask_highres, high_forward_axis),
-        ("forward_valid_mask_model", forward.extras.forward_valid_mask_model, model_forward_axis),
-    ):
-        _dataset(
-            truth,
-            name,
-            np.asarray(values),
-            unit="bool" if "mask" in name else "ratio",
-            sample_domain="time",
-            axis_path=axis_path,
-            axis_order=["lateral", "twt_forward"],
-        )
-
-    _write_common_dataset_plan(
-        root,
-        sample,
-        sample_domain="time",
-        model_axis_path=model_axis,
-        axis_order=["lateral", "twt"],
-        amplitude_unit="normalized_amplitude",
-        model_consistent_dtype=None,
-    )
-    qc = root.create_group("qc")
-    _write_qc_attributes(qc, sample.qc)
-    return ArtifactReference(
-        hdf5_group=path,
-        seismic_input_dataset=f"{path}/seismic/seismic_observed",
-        seismic_model_consistent_dataset=f"{path}/seismic/seismic_model_consistent",
-        valid_mask_dataset=f"{path}/masks/valid_mask",
-    )
+    if domain == "time":
+        for name, values in (
+            ("twt_forward_highres_s", truth.highres_axis[1:]),
+            (
+                "twt_forward_model_s",
+                record.projected.model_axis.coordinates[1:],
+            ),
+        ):
+            axis_path = f"{path}/axes/{name}"
+            _dataset(
+                axes,
+                name,
+                values,
+                unit="s",
+                sample_domain=domain,
+                axis_path=axis_path,
+                axis_order="sample",
+                dtype=np.float64,
+            )
+    return high_path, model_path
 
 
-def write_benchmark_sample(h5: h5py.File, sample: BenchmarkSample) -> ArtifactReference:
-    if sample.truth.sample_domain == "depth":
-        return _write_depth_sample(h5, sample)
-    if sample.truth.sample_domain == "time":
-        return _write_time_sample(h5, sample)
-    raise ValueError(f"Unsupported Benchmark sample domain: {sample.truth.sample_domain}")
+def _write_identity(root: h5py.Group, record: StructuredSampleRecord) -> None:
+    truth = record.truth
+    group = root.create_group("identity")
+    group.attrs["realization_id"] = truth.realization_id
+    group.attrs["scenario_id"] = truth.scenario.scenario_id
+    group.attrs["geometry_family"] = truth.scenario.geometry_family
+    group.attrs["duration_mode"] = truth.scenario.duration_mode
+    identity = record.domain_metadata.get("structured_identity")
+    if not isinstance(identity, Mapping) or not identity:
+        raise ValueError("structured sample requires structured_identity metadata")
+    _json_attribute(group, "structured_identity_json", dict(identity))
+    _json_attribute(group, "lfm_source_identity_json", dict(record.lfm.source_identity))
+    xline_step = float(record.domain_metadata.get("xline_step"))
+    if not np.isfinite(xline_step) or xline_step == 0.0:
+        raise ValueError("structured sample requires finite non-zero xline_step")
+    group.attrs["xline_step"] = xline_step
 
 
-def write_benchmark_view(
-    h5: h5py.File,
-    view: BenchmarkView,
-) -> ArtifactReference:
-    owner_path = f"/realizations/{view.owner_realization_id}"
-    owner = h5[owner_path]
-    views = owner.require_group("seismic_views")
-    group = views.create_group(view.view_id)
-    metadata = dict(view.metadata)
-    group.attrs["view_id"] = view.view_id
-    group.attrs["contract_version"] = SEISMIC_VIEW_CONTRACT_VERSION
-    group.attrs["view_spec_canonical_json"] = str(metadata["view_spec_canonical_json"])
-    group.attrs["view_spec_sha256"] = str(metadata["view_spec_sha256"])
-    group.attrs["operator_ids_json"] = json.dumps(metadata["operator_ids"], sort_keys=True)
-    group.attrs["operator_kinds_json"] = json.dumps(metadata["operator_kinds"], sort_keys=True)
-    group.attrs["operator_contract_versions_json"] = json.dumps(
-        metadata["operator_contract_versions"], sort_keys=True
-    )
-    for key in ("operator_parameters", "random_stream_identity"):
-        value = metadata.get(key, {})
-        group.attrs[f"{key}_json"] = json.dumps(value, sort_keys=True)
-    if view.sample_domain == "time":
-        axis_path = f"{owner_path}/axes/twt_model_s"
-        axis_order: str | list[str] = ["lateral", "twt"]
-        amplitude_unit = "normalized_amplitude"
-    elif view.sample_domain == "depth":
-        axis_path = f"{owner_path}/axes/tvdss_model_m"
-        axis_order = "lateral,tvdss"
-        amplitude_unit = "amplitude"
-    else:
-        raise ValueError(f"Unsupported view domain: {view.sample_domain!r}")
-    for name, values, unit in (
-        ("seismic_observed", view.seismic_observed, amplitude_unit),
-        ("positive_gain", view.positive_gain, "ratio"),
-        ("additive_noise", view.additive_noise, amplitude_unit),
+def _write_observed(
+    root: h5py.Group,
+    record: StructuredSampleRecord,
+    *,
+    model_axis_path: str,
+) -> None:
+    domain = record.truth.sample_domain
+    amplitude_unit = "amplitude" if domain == "depth" else "normalized_amplitude"
+    group = root.create_group("observed")
+    for name, values, unit, dtype in (
+        ("seismic", record.forward.seismic_observed, amplitude_unit, np.float32),
+        ("lfm", record.lfm.values, "ln(m/s*g/cm3)", np.float32),
+        ("valid", record.valid_mask, "bool", None),
     ):
         _dataset(
             group,
             name,
-            np.asarray(values, dtype=np.float32),
+            values,
             unit=unit,
-            sample_domain=view.sample_domain,
-            axis_path=axis_path,
-            axis_order=axis_order,
+            sample_domain=domain,
+            axis_path=model_axis_path,
+            axis_order="lateral,sample",
+            dtype=dtype,
         )
-    operator_trace = metadata.get("operator_trace_json", "[]")
-    if not isinstance(operator_trace, str):
-        operator_trace = json.dumps(operator_trace, sort_keys=True)
+
+
+def _write_truth(
+    root: h5py.Group,
+    record: StructuredSampleRecord,
+    *,
+    high_axis_path: str,
+    model_axis_path: str,
+) -> None:
+    truth = record.truth
+    projected = record.projected
+    domain = truth.sample_domain
+    group = root.create_group("truth")
+    highres = (
+        ("log_ai_highres", truth.log_ai_highres, "ln(m/s*g/cm3)"),
+        ("rgt_highres", truth.rgt_highres, "normalized_zone"),
+        ("state_id_highres", truth.state_id_highres, "category"),
+        ("object_id_highres", truth.object_id_highres, "category"),
+        ("object_xi_highres", truth.object_xi_highres, "normalized_object"),
+        ("zone_id_highres", truth.zone_id_highres, "category"),
+        ("geometry_event_mask_highres", truth.geometry_event_mask_highres, "bool"),
+        ("boundary_mask_highres", truth.boundary_mask_highres, "bool"),
+        ("truth_valid_highres", np.isfinite(truth.log_ai_highres), "bool"),
+        ("clipping_mask_highres", truth.clipping_mask_highres, "bool"),
+    )
+    model = (
+        ("model_log_ai", projected.model_target_log_ai, "ln(m/s*g/cm3)"),
+        ("rgt_model", projected.rgt_model, "normalized_zone"),
+        ("state_fraction_model", projected.state_fraction_model, "fraction"),
+        ("dominant_object_id_model", projected.dominant_object_id_model, "category"),
+        ("zone_id_model", projected.zone_id_model, "category"),
+        ("boundary_fraction_model", projected.boundary_fraction_model, "fraction"),
+        ("boundary_mask_model", projected.boundary_mask_model, "bool"),
+        ("geometric_valid_mask_model", projected.geometric_valid_mask_model, "bool"),
+        ("categorical_valid_mask_model", projected.categorical_valid_mask_model, "bool"),
+        ("projection_support_highres", projected.projection_support_highres, "bool"),
+        ("projection_support_model", projected.projection_support_model, "bool"),
+    )
+    for name, values, unit in highres:
+        _dataset(
+            group,
+            name,
+            values,
+            unit=unit,
+            sample_domain=domain,
+            axis_path=high_axis_path,
+            axis_order="lateral,sample",
+        )
+    for name, values, unit in model:
+        order = "lateral,sample,state" if np.asarray(values).ndim == 3 else "lateral,sample"
+        _dataset(
+            group,
+            name,
+            values,
+            unit=unit,
+            sample_domain=domain,
+            axis_path=model_axis_path,
+            axis_order=order,
+        )
+    zone_columns = (
+        "zone_id",
+        "zone_grid_value",
+        "lateral_index",
+        "top",
+        "bottom",
+        "background_a",
+        "background_b",
+        "zone_valid",
+    )
+    segment_columns = (
+        "zone_id",
+        "zone_grid_value",
+        "object_id",
+        "state",
+        "state_id",
+        "lateral_index",
+        "top",
+        "bottom",
+        "duration_fraction",
+        "duration_samples",
+        "c0_raw",
+        "c1_raw",
+        "c2_raw",
+        "c0_projected",
+        "c1_projected",
+        "c2_projected",
+        "c0_effective",
+        "c1_effective",
+        "c2_effective",
+        "segment_supervision_valid",
+    )
+    _columnar_table(
+        group,
+        "zones",
+        truth.structured_zone_truth,
+        columns=zone_columns,
+    )
+    _columnar_table(
+        group,
+        "segments",
+        truth.structured_segment_truth,
+        columns=segment_columns,
+    )
+
+
+def _write_forward(
+    root: h5py.Group,
+    record: StructuredSampleRecord,
+    *,
+    high_axis_path: str,
+    model_axis_path: str,
+) -> None:
+    domain = record.truth.sample_domain
+    amplitude_unit = "amplitude" if domain == "depth" else "normalized_amplitude"
+    forward = record.forward
+    group = root.create_group("forward")
     _dataset(
         group,
-        "operator_trace_json",
-        np.asarray(operator_trace.encode("utf-8"), dtype=f"S{max(1, len(operator_trace))}"),
-        unit="json",
-        sample_domain=view.sample_domain,
-        axis_path="",
-        axis_order="scalar",
+        "model_consistent_seismic",
+        forward.seismic_model_consistent,
+        unit=amplitude_unit,
+        sample_domain=domain,
+        axis_path=model_axis_path,
+        axis_order="lateral,sample",
+        dtype=np.float32,
     )
-    qc = group.create_group("qc")
-    _write_qc_attributes(qc, view.qc)
-    path = f"{owner_path}/seismic_views/{view.view_id}"
+    _dataset(
+        group,
+        "subgrid_residual",
+        forward.subgrid_forward_residual,
+        unit=amplitude_unit,
+        sample_domain=domain,
+        axis_path=model_axis_path,
+        axis_order="lateral,sample",
+        dtype=np.float32,
+    )
+    support = group.create_group("support")
+    for name, values, axis_path in (
+        ("highres", forward.support.highres, high_axis_path),
+        ("model", forward.support.model, model_axis_path),
+        ("observed", forward.support.observed, model_axis_path),
+        ("physics", forward.support.physics, model_axis_path),
+    ):
+        _dataset(
+            support,
+            name,
+            values,
+            unit="bool",
+            sample_domain=domain,
+            axis_path=axis_path,
+            axis_order="lateral,sample",
+        )
+    context = forward.metadata.get("structured_forward_context")
+    if not isinstance(context, Mapping):
+        raise ValueError("structured sample requires structured_forward_context metadata")
+    context_group = group.create_group("context")
+    wavelet_time = np.asarray(context.get("wavelet_time_s"), dtype=np.float64)
+    wavelet_amplitude = np.asarray(context.get("wavelet_amplitude"), dtype=np.float64)
+    if (
+        wavelet_time.ndim != 1
+        or wavelet_time.size < 3
+        or wavelet_time.size != wavelet_amplitude.size
+        or np.any(~np.isfinite(wavelet_time))
+        or np.any(~np.isfinite(wavelet_amplitude))
+    ):
+        raise ValueError("structured forward context wavelet is invalid")
+    context_group.create_dataset("wavelet_time_s", data=wavelet_time)
+    context_group.create_dataset("wavelet_amplitude", data=wavelet_amplitude)
+    context_group.attrs["output_chunk_size"] = int(context["output_chunk_size"])
+    _json_attribute(
+        context_group,
+        "ai_velocity_relation_json",
+        context.get("ai_velocity_relation"),
+    )
+    extras = group.create_group("domain_extras")
+    if isinstance(forward.extras, DepthForwardExtras):
+        for name, values, axis_path in (
+            ("vp_highres_mps", forward.extras.vp_highres_mps, high_axis_path),
+            ("vp_model_mps", forward.extras.vp_model_mps, model_axis_path),
+        ):
+            _dataset(
+                extras,
+                name,
+                values,
+                unit="m/s",
+                sample_domain=domain,
+                axis_path=axis_path,
+                axis_order="lateral,sample",
+                dtype=np.float32,
+            )
+    elif isinstance(forward.extras, TimeForwardExtras):
+        parent_path = model_axis_path.rsplit("/axes/", 1)[0]
+        for name, values, axis_path, unit in (
+            (
+                "reflectivity_highres",
+                forward.extras.reflectivity_highres,
+                f"{parent_path}/axes/twt_forward_highres_s",
+                "ratio",
+            ),
+            (
+                "reflectivity_model",
+                forward.extras.reflectivity_model,
+                f"{parent_path}/axes/twt_forward_model_s",
+                "ratio",
+            ),
+            (
+                "forward_valid_mask_highres",
+                forward.extras.forward_valid_mask_highres,
+                f"{parent_path}/axes/twt_forward_highres_s",
+                "bool",
+            ),
+            (
+                "forward_valid_mask_model",
+                forward.extras.forward_valid_mask_model,
+                f"{parent_path}/axes/twt_forward_model_s",
+                "bool",
+            ),
+        ):
+            _dataset(
+                extras,
+                name,
+                values,
+                unit=unit,
+                sample_domain=domain,
+                axis_path=axis_path,
+                axis_order="lateral,sample",
+            )
+    else:
+        raise TypeError("structured sample has unsupported forward extras")
+
+
+def write_structured_sample(
+    h5: h5py.File,
+    sample: StructuredSampleRecord,
+) -> ArtifactReference:
+    """Write, validate and commit one complete parent realization."""
+    if not isinstance(sample, StructuredSampleRecord):
+        raise TypeError("write_structured_sample requires StructuredSampleRecord")
+    _validate_structured_tables(sample)
+    realization_id = sample.truth.realization_id
+    final_path = f"/realizations/{realization_id}"
+    if final_path in h5:
+        raise FileExistsError(f"structured realization already exists: {realization_id}")
+    staging_root = h5.require_group("/__staging__")
+    staging_name = uuid.uuid4().hex
+    root = staging_root.create_group(staging_name)
+    try:
+        root.attrs["complete"] = False
+        root.attrs["sample_domain"] = sample.truth.sample_domain
+        root.attrs["sample_unit"] = sample.truth.axis_unit
+        if sample.truth.sample_domain == "depth":
+            root.attrs["depth_basis"] = "tvdss"
+        _write_identity(root, sample)
+        high_axis_path, model_axis_path = _write_axes(
+            root,
+            sample,
+            published_path=final_path,
+        )
+        _write_observed(root, sample, model_axis_path=model_axis_path)
+        _write_truth(
+            root,
+            sample,
+            high_axis_path=high_axis_path,
+            model_axis_path=model_axis_path,
+        )
+        _write_forward(
+            root,
+            sample,
+            high_axis_path=high_axis_path,
+            model_axis_path=model_axis_path,
+        )
+        qc = root.create_group("qc")
+        _write_qc_attributes(qc, sample.qc)
+        root.attrs["complete"] = True
+        h5.require_group("/realizations")
+        h5.move(root.name, final_path)
+    except Exception:
+        if root.name in h5:
+            del h5[root.name]
+        raise
+    path = final_path
     return ArtifactReference(
         hdf5_group=path,
-        seismic_input_dataset=f"{path}/seismic_observed",
-        seismic_model_consistent_dataset=f"{owner_path}/seismic/seismic_model_consistent",
-        valid_mask_dataset=f"{owner_path}/masks/valid_mask",
+        seismic_input_dataset=f"{path}/observed/seismic",
+        seismic_model_consistent_dataset=f"{path}/forward/model_consistent_seismic",
+        valid_mask_dataset=f"{path}/observed/valid",
+        lfm_dataset=f"{path}/observed/lfm",
+        model_log_ai_dataset=f"{path}/truth/model_log_ai",
     )
 
 
 __all__ = [
     "ArtifactReference",
     "serialize_qc_attributes",
-    "write_benchmark_sample",
-    "write_benchmark_view",
+    "write_structured_sample",
 ]

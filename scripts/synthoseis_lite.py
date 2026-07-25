@@ -3,13 +3,8 @@
 Usage::
 
     python scripts/synthoseis_lite.py --config <file> calibrate
-    python scripts/synthoseis_lite.py --config <file> generate-amplitude-pilot \
-        --impedance-calibration <file>
-    python scripts/synthoseis_lite.py --config <file> calibrate-amplitude \
-        --impedance-calibration <file> --pilot-benchmark <run-dir>
     python scripts/synthoseis_lite.py --config <file> generate \
-        --impedance-calibration <file> \
-        --seismic-amplitude-prior <file>
+        --impedance-calibration <file>
 
 The ``synthoseis_lite.sample_domain`` and ``benchmark_schema`` keys explicitly
 select the primary time-domain or depth-domain extension branch.
@@ -39,20 +34,12 @@ from cup.synthetic.depth.config import (  # noqa: E402
     resolve_depth_sources,
 )
 from cup.synthetic.depth.generation import run_depth_generation  # noqa: E402
-from cup.synthetic.depth.amplitude_calibration import (  # noqa: E402
-    run_depth_amplitude_calibration,
-    run_depth_amplitude_pilot,
-)
 from cup.synthetic.time.calibration_pipeline import run_calibration  # noqa: E402
 from cup.synthetic.time.config import (  # noqa: E402
     parse_synthoseis_config,
     resolve_sources,
 )
 from cup.synthetic.time.pipeline import run_generation  # noqa: E402
-from cup.synthetic.time.amplitude_calibration import (  # noqa: E402
-    run_time_amplitude_calibration,
-    run_time_amplitude_pilot,
-)
 from cup.utils.io import (  # noqa: E402
     load_yaml_config,
     repo_relative_path,
@@ -78,20 +65,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("calibrate", help="Freeze impedance calibration from authoritative source runs.")
-    pilot = subparsers.add_parser(
-        "generate-amplitude-pilot",
-        help="Generate a stratified base-only pilot for empirical amplitude calibration.",
-    )
-    pilot.add_argument("--impedance-calibration", type=Path, required=True)
-    amplitude = subparsers.add_parser(
-        "calibrate-amplitude",
-        help="Calibrate the shared real-minus-pilot seismic amplitude prior.",
-    )
-    amplitude.add_argument("--impedance-calibration", type=Path, required=True)
-    amplitude.add_argument("--pilot-benchmark", type=Path, required=True)
     generate = subparsers.add_parser("generate", help="Generate one configured benchmark suite.")
     generate.add_argument("--impedance-calibration", type=Path, required=True)
-    generate.add_argument("--seismic-amplitude-prior", type=Path, default=None)
     generate.add_argument(
         "--debug-attempt-limit",
         type=_positive_int_arg,
@@ -113,14 +88,13 @@ def parse_args() -> argparse.Namespace:
     generate.add_argument(
         "--run-structured-oracle",
         action="store_true",
-        help="Reread structured_truth_v1 from disk and require the Stage 1 Oracle to pass.",
+        help="Reread the canonical HDF5 artifact and require the Oracle to pass.",
     )
     generate.add_argument(
         "--structured-smoke",
         action="store_true",
         help=(
-            "Run one wedge attempt without seismic views or amplitude prior, "
-            "then require the disk-backed Stage 1 Oracle."
+            "Run one wedge attempt and require the disk-backed Oracle."
         ),
     )
     return parser.parse_args()
@@ -147,19 +121,15 @@ def _structured_artifact_oracle(root: Path, calibration: object, parent_ids: lis
 def _resolve_generation_options(
     args: argparse.Namespace,
     script_cfg: dict,
-) -> tuple[dict, Path | None, int | None, list[str] | None, bool]:
+) -> tuple[dict, int | None, list[str] | None, bool]:
     if not args.structured_smoke:
         return (
             script_cfg,
-            args.seismic_amplitude_prior,
             args.debug_attempt_limit,
             args.geometry_family,
             bool(args.run_structured_oracle),
         )
-    if args.seismic_amplitude_prior is not None:
-        raise ValueError("--structured-smoke does not accept --seismic-amplitude-prior")
     smoke_cfg = deepcopy(script_cfg)
-    smoke_cfg["seismic_views"] = {"operators": {}, "views": []}
     sections = list(smoke_cfg.get("sections") or [])
     if not sections:
         raise ValueError("--structured-smoke requires at least one configured section")
@@ -219,7 +189,6 @@ def _resolve_generation_options(
     smoke_cfg[impedance_key] = impedance
     return (
         smoke_cfg,
-        None,
         1,
         selected_geometry[:1],
         True,
@@ -345,31 +314,9 @@ def main() -> None:
                 repo_root=REPO_ROOT,
                 output_dir=output_dir,
             )
-        elif args.command == "generate-amplitude-pilot":
-            summary = run_depth_amplitude_pilot(
-                workflow=workflow,
-                script_cfg=script_cfg,
-                sources=sources,
-                forward_inputs=forward_inputs,
-                config_provenance=config_provenance,
-                calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
-                repo_root=REPO_ROOT,
-                output_dir=output_dir,
-            )
-        elif args.command == "calibrate-amplitude":
-            summary = run_depth_amplitude_calibration(
-                workflow=workflow,
-                script_cfg=script_cfg,
-                forward_inputs=forward_inputs,
-                calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
-                pilot_benchmark_dir=resolve_relative_path(args.pilot_benchmark, root=REPO_ROOT),
-                repo_root=REPO_ROOT,
-                output_dir=output_dir,
-            )
         else:
             (
                 generation_cfg,
-                amplitude_prior_arg,
                 debug_attempt_limit,
                 geometry_families,
                 run_structured_oracle,
@@ -381,11 +328,6 @@ def main() -> None:
                 forward_inputs=forward_inputs,
                 config_provenance=config_provenance,
                 calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
-                amplitude_prior_path=(
-                    None
-                    if amplitude_prior_arg is None
-                    else resolve_relative_path(amplitude_prior_arg, root=REPO_ROOT)
-                ),
                 repo_root=REPO_ROOT,
                 output_dir=output_dir,
                 debug_attempt_limit=debug_attempt_limit,
@@ -397,7 +339,7 @@ def main() -> None:
                     else None
                 ),
             )
-        print("=== synthoseis-lite v5 (depth) ===")
+        print("=== structured synthoseis-lite (depth) ===")
         print(f"Command: {args.command}")
         print(f"Output: {output_dir}")
         print(f"Status: {summary.get('status', 'success')}")
@@ -420,30 +362,9 @@ def main() -> None:
             repo_root=REPO_ROOT,
             output_dir=output_dir,
         )
-    elif args.command == "generate-amplitude-pilot":
-        summary = run_time_amplitude_pilot(
-            workflow=workflow,
-            script_cfg=script_cfg,
-            sources=sources,
-            config_provenance=config_provenance,
-            calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
-            repo_root=REPO_ROOT,
-            output_dir=output_dir,
-        )
-    elif args.command == "calibrate-amplitude":
-        summary = run_time_amplitude_calibration(
-            workflow=workflow,
-            script_cfg=script_cfg,
-            sources=sources,
-            calibration_path=resolve_relative_path(args.impedance_calibration, root=REPO_ROOT),
-            pilot_benchmark_dir=resolve_relative_path(args.pilot_benchmark, root=REPO_ROOT),
-            repo_root=REPO_ROOT,
-            output_dir=output_dir,
-        )
     else:
         (
             generation_cfg,
-            amplitude_prior_arg,
             debug_attempt_limit,
             geometry_families,
             run_structured_oracle,
@@ -455,11 +376,6 @@ def main() -> None:
             sources=sources,
             config_provenance=config_provenance,
             calibration_path=calibration,
-            amplitude_prior_path=(
-                None
-                if amplitude_prior_arg is None
-                else resolve_relative_path(amplitude_prior_arg, root=REPO_ROOT)
-            ),
             repo_root=REPO_ROOT,
             output_dir=output_dir,
             debug_attempt_limit=debug_attempt_limit,

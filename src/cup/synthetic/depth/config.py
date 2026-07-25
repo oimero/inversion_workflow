@@ -1,4 +1,4 @@
-"""Strict configuration and source contracts for Synthoseis-lite v5."""
+"""Strict configuration and source contracts for structured Synthoseis-lite."""
 
 from __future__ import annotations
 
@@ -19,8 +19,6 @@ from cup.synthetic.schemas import (
     SCIENCE_REVISION,
 )
 from cup.synthetic.core.config import parse_object_core_controls
-from cup.synthetic.core.amplitude_calibration import parse_amplitude_calibration_controls
-from cup.synthetic.core.views import resolve_view_specs, validate_view_units
 from cup.utils.io import (
     is_consumable_contract_status,
     load_yaml_config,
@@ -115,21 +113,14 @@ def load_composed_config(
 
 def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     root = _mapping(config.get("synthoseis_lite"), path="synthoseis_lite")
-    if "seismic_views" not in root:
-        raise ValueError(
-            "Depth Synthoseis-lite requires v5 seismic_views configuration; v4 configuration is not accepted."
-        )
     if "seismic_mismatch" in root or "lfm" in root:
         raise ValueError(
             "Synthoseis-lite v5 does not accept legacy mismatch or LFM degradation fields."
         )
-    view_config = _mapping(root["seismic_views"], path="synthoseis_lite.seismic_views")
-    resolve_view_specs(view_config)
-    validate_view_units(view_config, axis_unit="m")
     allowed_root = {
         "sample_domain", "benchmark_schema", "science_revision", "global_seed", "source_runs", "sampling", "geometry", "sections",
         "calibration", "impedance_attribute_generator", "generation", "splits",
-        "seismic_input", "seismic_forward", "seismic_views", "amplitude_calibration", "figures",
+        "seismic_input", "seismic_forward", "figures",
     }
     if "probe_selection" in root:
         raise ValueError(
@@ -138,7 +129,7 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     _reject_unknown(root, allowed_root, path="synthoseis_lite")
     if str(root.get("sample_domain") or "").casefold() != "depth" or str(root.get("benchmark_schema") or "") != SCHEMA_VERSION:
         raise ValueError(
-            "Depth Synthoseis-lite v5 requires "
+        "Depth Synthoseis-lite requires "
             f"synthoseis_lite.sample_domain='depth' and benchmark_schema={SCHEMA_VERSION!r}."
         )
     if str(root.get("science_revision") or "") != SCIENCE_REVISION:
@@ -260,14 +251,6 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if calibration.get("background_estimator") != "per_well_zone_huber":
         raise ValueError("calibration.background_estimator must be per_well_zone_huber.")
 
-    has_calibrated = any(
-        isinstance(item, Mapping) and item.get("kind") == "calibrated_rgt_gain"
-        for item in dict(view_config.get("operators") or {}).values()
-    )
-    amplitude = parse_amplitude_calibration_controls(
-        root.get("amplitude_calibration"), required=has_calibrated
-    )
-
     impedance = _mapping(root.get("impedance_attribute_generator"), path="synthoseis_lite.impedance_attribute_generator")
     _reject_unknown(
         impedance,
@@ -370,8 +353,6 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "splits": {"assignment_unit": "parent_realization", "held_out_geometry_family": held_out},
         "seismic_input": {"policy": "observed_highres_forward"},
         "seismic_forward": {"backend": backend, "dtype": "float64"},
-        "amplitude_calibration": amplitude,
-        "seismic_views": view_config,
         "figures": {
             "enabled": bool(figures["enabled"]),
             "max_example_objects_per_zone_state": max_examples,

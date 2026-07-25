@@ -1,4 +1,4 @@
-"""Strict time-domain Synthoseis-lite v5 configuration and source contracts."""
+"""Strict time-domain structured Synthoseis-lite configuration."""
 
 from __future__ import annotations
 
@@ -11,14 +11,12 @@ import numpy as np
 from cup.config.sources import assert_recorded_source_matches, require_source_files
 from cup.synthetic.core.calibration import GENERATOR_FAMILY
 from cup.synthetic.core.config import parse_object_core_controls
-from cup.synthetic.core.amplitude_calibration import parse_amplitude_calibration_controls
-from cup.synthetic.core.views import resolve_view_specs, validate_view_units
 from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION, SCIENCE_REVISION
 from cup.utils.io import resolve_relative_path
 
 
 DATA_SCHEMA = BENCHMARK_SCHEMA_VERSION
-IMPLEMENTATION_SCOPE = "impedance_truth_forward_qc_seismic_views"
+IMPLEMENTATION_SCOPE = "structured_truth_forward_qc"
 
 
 def _mapping(value: Any, *, path: str) -> dict[str, Any]:
@@ -128,7 +126,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     allowed = {
         "sample_domain", "benchmark_schema", "science_revision", "global_seed",
         "source_runs", "sampling", "geometry", "sections", "impedance_attribute_generator",
-        "generation", "splits", "seismic_input", "forward_qc", "seismic_views", "amplitude_calibration", "figures",
+        "generation", "splits", "seismic_input", "forward_qc", "figures",
     }
     _reject_unknown(root, allowed, path="synthoseis_lite")
     if str(root.get("sample_domain") or "").casefold() != "time":
@@ -185,16 +183,6 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if highres.get("enabled") is not True or highres.get("required") is not True:
         raise ValueError("forward_qc.highres_forward.enabled and required must be true")
 
-    views = _mapping(root.get("seismic_views"), path="seismic_views")
-    resolve_view_specs(views)
-    validate_view_units(views, axis_unit="s")
-    has_calibrated = any(
-        isinstance(item, Mapping) and item.get("kind") == "calibrated_rgt_gain"
-        for item in dict(views.get("operators") or {}).values()
-    )
-    amplitude = parse_amplitude_calibration_controls(
-        root.get("amplitude_calibration"), required=has_calibrated
-    )
     figures = _mapping(root.get("figures"), path="figures")
     _reject_unknown(figures, {"enabled", "max_example_objects_per_zone_state", "report_examples"}, path="figures")
     return {
@@ -209,8 +197,6 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "splits": {"assignment_unit": "parent_realization", "held_out_geometry_family": str(splits["held_out_geometry_family"])},
         "seismic_input": {"policy": "observed_highres_forward"},
         "forward_qc": {"highres_forward_enabled": True, "highres_forward_required": True},
-        "amplitude_calibration": amplitude,
-        "seismic_views": views,
         "figures": {"enabled": bool(figures.get("enabled", True)), "max_example_objects_per_zone_state": int(figures.get("max_example_objects_per_zone_state", 1)), "report_examples": dict(figures.get("report_examples") or {})},
     }
 

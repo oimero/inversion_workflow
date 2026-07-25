@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 
 from cup.synthetic.core.geometry import SectionGeometry as DepthSectionGeometry
-from cup.synthetic.core.records import BenchmarkSample
+from cup.synthetic.core.records import StructuredSampleRecord
 from cup.synthetic.core.scenarios import GenerationScenario
 
 
@@ -31,14 +31,13 @@ class DepthGeneratedSection:
     seismic_observed: np.ndarray
     seismic_model_consistent: np.ndarray
     subgrid_forward_residual: np.ndarray
-    canonical_background_log_ai: np.ndarray
-    target_increment_log_ai: np.ndarray
+    lfm_log_ai: np.ndarray
     valid_mask_model: np.ndarray
     categorical: dict[str, np.ndarray]
     object_catalog: list[dict[str, Any]]
     object_lateral_coefficients: list[dict[str, Any]]
     qc: dict[str, Any]
-    benchmark_sample: BenchmarkSample | None = None
+    structured_sample: StructuredSampleRecord | None = None
 
 
 __all__ = ["DepthGeneratedSection", "DepthSectionGeometry"]

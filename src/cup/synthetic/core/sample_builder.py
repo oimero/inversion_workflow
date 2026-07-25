@@ -1,4 +1,4 @@
-"""Ordered construction of a complete in-memory base Benchmark sample."""
+"""Ordered construction of one complete structured synthetic sample."""
 
 from __future__ import annotations
 
@@ -10,10 +10,11 @@ import numpy as np
 from cup.synthetic.core.lfm import LfmPolicy, build_lfm_products
 from cup.synthetic.core.projection import project_truth_to_model_grid
 from cup.synthetic.core.records import (
-    BenchmarkSample,
     DomainPreparation,
     ForwardResult,
+    LfmObservation,
     ProjectedTruth,
+    StructuredSampleRecord,
 )
 from cup.synthetic.core.rejections import BenchmarkBuildRejected
 from cup.synthetic.core.truth import SyntheticTruth
@@ -29,7 +30,7 @@ class ForwardAdapter(Protocol):
 
 
 @dataclass(frozen=True)
-class CanonicalIncrementPolicy:
+class LfmConstructionPolicy:
     contract: object
 
 
@@ -47,10 +48,10 @@ class BenchmarkBuilder:
         truth: SyntheticTruth,
         preparation: DomainPreparation,
         forward_adapter: ForwardAdapter,
-        canonical_policy: CanonicalIncrementPolicy,
+        lfm_construction_policy: LfmConstructionPolicy,
         lfm_policy: LfmPolicy,
         build_policy: BenchmarkBuildPolicy,
-    ) -> BenchmarkSample:
+    ) -> StructuredSampleRecord:
         projected = project_truth_to_model_grid(
             truth,
             preparation.model_axis,
@@ -86,16 +87,14 @@ class BenchmarkBuilder:
         lfm = build_lfm_products(
             projected.model_target_log_ai,
             preparation.model_axis.coordinates,
-            canonical_policy.contract,
+            lfm_construction_policy.contract,
             lateral_coordinates=truth.lateral_m,
             valid_mask=valid,
             policy=lfm_policy,
         )
         required = {
             "target_log_ai": projected.model_target_log_ai,
-            "canonical_background_log_ai": lfm.canonical_background_log_ai,
-            "target_increment_log_ai": lfm.target_increment_log_ai,
-            "input_lfm_log_ai": lfm.canonical_background_log_ai,
+            "lfm": lfm.values,
             "seismic_observed": forward.seismic_observed,
             "seismic_model_consistent": forward.seismic_model_consistent,
         }
@@ -111,26 +110,30 @@ class BenchmarkBuilder:
                         }
                     ],
                 )
-        return BenchmarkSample(
+        metadata = dict(build_policy.domain_metadata)
+        return StructuredSampleRecord(
             truth=truth,
             projected=projected,
             forward=forward,
-            canonical_background_log_ai=lfm.canonical_background_log_ai,
-            target_increment_log_ai=lfm.target_increment_log_ai,
-            input_lfm_canonical_log_ai=lfm.canonical_background_log_ai,
+            lfm=LfmObservation(
+                values=lfm.values,
+                sample_axis=preparation.model_axis,
+                valid_mask=valid,
+                source_identity=dict(metadata["lfm_source_identity"]),
+            ),
             valid_mask=valid,
             qc={
                 **dict(truth.diagnostics),
                 **dict(forward.qc),
                 **dict(lfm.qc),
             },
-            domain_metadata=dict(build_policy.domain_metadata),
+            domain_metadata=metadata,
         )
 
 
 __all__ = [
     "BenchmarkBuildPolicy",
     "BenchmarkBuilder",
-    "CanonicalIncrementPolicy",
+    "LfmConstructionPolicy",
     "ForwardAdapter",
 ]

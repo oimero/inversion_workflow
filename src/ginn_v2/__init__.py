@@ -21,20 +21,16 @@ from ginn_v2.oracle import (
 )
 from ginn_v2.runtime import configure_training_logger, resolve_device
 from ginn_v2.truth import (
-    ARTIFACT_TYPE,
     LatentTrace,
     ObservedTrace,
     SegmentTruth,
     StructuredSample,
-    StructuredTruthArtifactReader,
-    StructuredTruthArtifactWriter,
     StructuredTruthAdapter,
     ZoneTruth,
     assert_structured_sample_equal,
 )
 
 __all__ = [
-    "ARTIFACT_TYPE",
     "DecoderResult",
     "ForwardContext",
     "LatentTrace",
@@ -46,8 +42,6 @@ __all__ = [
     "SegmentTruth",
     "StructuredSample",
     "StructuredTruthAdapter",
-    "StructuredTruthArtifactReader",
-    "StructuredTruthArtifactWriter",
     "ZoneTruth",
     "assert_structured_sample_equal",
     "configure_training_logger",

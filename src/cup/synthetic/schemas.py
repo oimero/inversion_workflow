@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 
-BENCHMARK_SCHEMA_VERSION = "synthoseis_lite_v5"
+BENCHMARK_SCHEMA_VERSION = "structured_synthetic_benchmark_v1"
+STRUCTURED_ARTIFACT_TYPE = "structured_synthetic_benchmark"
+STRUCTURED_ARTIFACT_VERSION = 1
 SCIENCE_REVISION = "synthoseis_lite_science_v4"
 PROJECTION_CONTRACT_VERSION = "finite_support_projection_v1"
-SEISMIC_VIEW_CONTRACT_VERSION = "seismic_views_v1"
-SEISMIC_OPERATOR_CONTRACT_VERSION = "seismic_operators_v4"
-SEISMIC_AMPLITUDE_PRIOR_SCHEMA_VERSION = "synthoseis_seismic_amplitude_prior_v1"
 RANDOM_STREAM_CONTRACT_VERSION = "synthoseis_random_v3"
 FROZEN_BENCHMARK_SCHEMA_VERSION = "synthoseis_lite_v3"
 LEGACY_BENCHMARK_SCHEMA_VERSION = "synthoseis_lite_v1"
@@ -20,11 +19,10 @@ FORWARD_MODEL_INPUTS_SCHEMA_VERSION = "forward_model_inputs_v3"
 
 __all__ = [
     "BENCHMARK_SCHEMA_VERSION",
+    "STRUCTURED_ARTIFACT_TYPE",
+    "STRUCTURED_ARTIFACT_VERSION",
     "SCIENCE_REVISION",
     "PROJECTION_CONTRACT_VERSION",
-    "SEISMIC_VIEW_CONTRACT_VERSION",
-    "SEISMIC_OPERATOR_CONTRACT_VERSION",
-    "SEISMIC_AMPLITUDE_PRIOR_SCHEMA_VERSION",
     "RANDOM_STREAM_CONTRACT_VERSION",
     "DEPTH_FORWARD_MODEL_INPUTS_RUN_SCHEMA_VERSION",
     "FROZEN_BENCHMARK_SCHEMA_VERSION",
@@ -38,8 +36,6 @@ __all__ = [
 SCIENCE_CONTRACT = {
     "science_revision": SCIENCE_REVISION,
     "projection_contract_version": PROJECTION_CONTRACT_VERSION,
-    "seismic_view_contract_version": SEISMIC_VIEW_CONTRACT_VERSION,
-    "seismic_operator_contract_version": SEISMIC_OPERATOR_CONTRACT_VERSION,
     "random_stream_contract_version": RANDOM_STREAM_CONTRACT_VERSION,
 }
 

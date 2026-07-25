@@ -1,4 +1,4 @@
-"""Canonical low-frequency background products for Synthoseis v5."""
+"""Low-frequency observations for structured synthetic inversion."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from cup.impedance import decompose_log_ai, validate_increment_contract
+from cup.impedance import canonical_lowpass, validate_increment_contract
 from cup.synthetic.core.random import RandomNamespace
 from cup.synthetic.core.rejections import BenchmarkBuildRejected
 from cup.utils.statistics import centered_rms
@@ -32,8 +32,7 @@ class LfmPolicy:
 
 @dataclass(frozen=True)
 class LfmProducts:
-    canonical_background_log_ai: np.ndarray
-    target_increment_log_ai: np.ndarray
+    values: np.ndarray
     qc: Mapping[str, Any]
 
 
@@ -70,7 +69,7 @@ def build_lfm_products(
     valid_mask: np.ndarray,
     policy: LfmPolicy,
 ) -> LfmProducts:
-    """Build canonical background and increment without a degraded LFM."""
+    """Build the low-frequency observation from the complete model context."""
 
     domain = str(policy.sample_domain).casefold()
     expected_unit = {"time": "s", "depth": "m"}.get(domain)
@@ -107,26 +106,21 @@ def build_lfm_products(
             details=[{"reason": reason, **short_segment_diagnostics}],
         )
 
-    background, increment = decompose_log_ai(
+    background = canonical_lowpass(
         target,
         axis,
         resolved_contract,
     )
     background = np.asarray(background, dtype=np.float64)
-    increment = np.asarray(increment, dtype=np.float64)
-    if background.shape != target.shape or increment.shape != target.shape:
-        raise ValueError("canonical LFM decomposition changed target shape")
-    if np.any(valid & (~np.isfinite(background) | ~np.isfinite(increment))):
-        raise ValueError("canonical LFM decomposition has non-finite valid samples")
-    if np.any(valid & (np.abs(target - background - increment) > 1e-7)):
-        raise ValueError("canonical LFM decomposition violates target closure")
+    if background.shape != target.shape:
+        raise ValueError("LFM construction changed target shape")
+    if np.any(valid & ~np.isfinite(background)):
+        raise ValueError("LFM construction has non-finite valid samples")
     background[~valid] = np.nan
-    increment[~valid] = np.nan
     return LfmProducts(
-        canonical_background_log_ai=background,
-        target_increment_log_ai=increment,
+        values=background,
         qc={
-            "lfm_status": "canonical",
+            "lfm_status": "synthetic_target_derived",
             "lfm_filter_support_policy": (
                 "complete_finite_model_context_then_public_mask"
             ),
@@ -134,8 +128,7 @@ def build_lfm_products(
                 np.count_nonzero(filter_support)
             ),
             "lfm_valid_sample_count": int(np.count_nonzero(valid)),
-            "lfm_canonical_background_rms": centered_rms(background, valid),
-            "lfm_target_increment_rms": centered_rms(increment, valid),
+            "lfm_rms": centered_rms(background, valid),
         },
     )
 

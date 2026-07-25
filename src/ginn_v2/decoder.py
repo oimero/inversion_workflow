@@ -240,8 +240,11 @@ def _projection_xi_numpy(
     *,
     top: float,
     bottom: float,
+    include_bottom: bool,
 ) -> np.ndarray:
-    coordinates = axis[(axis >= top) & (axis <= bottom)]
+    mask = axis >= top
+    mask &= axis <= bottom if include_bottom else axis < bottom
+    coordinates = axis[mask]
     if coordinates.size < 2:
         return np.linspace(0.0, 1.0, 5, dtype=np.float64)
     return (coordinates - top) / (bottom - top)
@@ -277,7 +280,7 @@ def decode_numpy(
     projection_scales: list[float] = []
     c0_adjustments: list[float] = []
     segment_values: list[RawSegmentParameters] = []
-    for item in segments:
+    for index, item in enumerate(segments):
         segment = _raw_segment(item)
         if segment.zone_id != zone.zone_id:
             raise ValueError("decode_numpy segments must belong to the supplied zone.")
@@ -298,7 +301,12 @@ def decode_numpy(
             ],
             dtype=np.float64,
         )
-        xi_projection = _projection_xi_numpy(coordinates, top=top, bottom=bottom)
+        xi_projection = _projection_xi_numpy(
+            coordinates,
+            top=top,
+            bottom=bottom,
+            include_bottom=index == len(segments) - 1,
+        )
         projected, scale = _project_numpy(
             raw,
             xi=xi_projection,
@@ -338,7 +346,10 @@ def decode_numpy(
     for index, segment in enumerate(segment_values):
         top = float(segment.top)
         bottom = float(segment.bottom)
-        xi = (coordinates - top) / (bottom - top)
+        xi = (coordinates - top) / max(
+            bottom - top,
+            float(axis.sample_interval),
+        )
         profile = _profile_numpy(
             np.asarray([segment.c0, segment.c1, segment.c2], dtype=np.float64),
             xi,
@@ -533,10 +544,18 @@ def _condition_torch(
     return torch.stack((c0, parameters[1], parameters[2])), torch.abs(c0 - parameters[0])
 
 
-def _projection_xi_torch(axis: Any, *, top: Any, bottom: Any):
+def _projection_xi_torch(
+    axis: Any,
+    *,
+    top: Any,
+    bottom: Any,
+    include_bottom: bool,
+):
     import torch
 
-    coordinates = axis[(axis >= top) & (axis <= bottom)]
+    mask = axis >= top
+    mask = mask & ((axis <= bottom) if include_bottom else (axis < bottom))
+    coordinates = axis[mask]
     if coordinates.numel() < 2:
         return torch.linspace(
             0.0,
@@ -593,7 +612,7 @@ def decode_torch(
     projection_scales: list[float] = []
     c0_adjustments: list[Any] = []
     segment_values: list[RawSegmentParameters] = []
-    for item in segments:
+    for index, item in enumerate(segments):
         segment = _raw_segment(item)
         if segment.zone_id != zone.zone_id:
             raise ValueError("decode_torch segments must belong to the supplied zone.")
@@ -613,7 +632,12 @@ def decode_torch(
                 _torch_scalar(segment.c2, reference=axis, label="decoder c2"),
             ]
         )
-        xi_projection = _projection_xi_torch(axis, top=top, bottom=bottom)
+        xi_projection = _projection_xi_torch(
+            axis,
+            top=top,
+            bottom=bottom,
+            include_bottom=index == len(segments) - 1,
+        )
         projected, scale = _project_torch(
             raw,
             xi=xi_projection,
@@ -650,7 +674,8 @@ def decode_torch(
     for index, segment in enumerate(segment_values):
         top = _torch_scalar(segment.top, reference=axis, label="decoder segment top")
         bottom = _torch_scalar(segment.bottom, reference=axis, label="decoder segment bottom")
-        xi = (axis - top) / (bottom - top)
+        interval = torch.abs(axis[1] - axis[0])
+        xi = (axis - top) / torch.maximum(bottom - top, interval)
         parameters = torch.stack((segment.c0, segment.c1, segment.c2))
         profile = _profile_torch(parameters, xi)
         mask = zone_mask & (axis >= top)

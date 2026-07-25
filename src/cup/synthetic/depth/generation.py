@@ -1,4 +1,4 @@
-"""Depth field-conditioned pipeline and domain-specific view orchestration."""
+"""Depth field-conditioned structured generation."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from typing import Any, Callable, Mapping, Sequence
 import h5py
 import numpy as np
 import pandas as pd
-from scipy.signal import hilbert
 
 from cup.impedance import generation_contract
 from cup.petrel.load import import_interpretation_petrel
@@ -27,21 +26,18 @@ from cup.synthetic.core.field_runner import (
 )
 from cup.synthetic.core.lfm import LfmPolicy
 from cup.synthetic.core.geometry import resample_section_path, validate_line_geometry
-from cup.synthetic.core.signal import finite_support_fir, valid_filter_decimate
 from cup.synthetic.core.pipeline import (
     GenerationAttempt,
     GenerationSession,
-    SeismicViewContext,
 )
 from cup.synthetic.adapters import DepthSyntheticDomainAdapter
 from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
 from cup.synthetic.core.random import RandomNamespace
 from cup.synthetic.core.records import DepthForwardExtras
-from cup.synthetic.core.rejections import ForwardRejected
 from cup.synthetic.core.sample_builder import (
     BenchmarkBuildPolicy,
     BenchmarkBuilder,
-    CanonicalIncrementPolicy,
+    LfmConstructionPolicy,
 )
 from cup.synthetic.core.scenarios import GenerationScenario, generation_scenarios
 from cup.synthetic.core.truth import TruthGenerationRequest, generate_field_conditioned_truth
@@ -184,17 +180,6 @@ def build_depth_sections(
     return sections, survey
 
 
-def _phase_rotate(wavelet: np.ndarray, degrees: float) -> np.ndarray:
-    analytic = hilbert(np.asarray(wavelet, dtype=np.float64))
-    return np.real(analytic * np.exp(1j * np.deg2rad(float(degrees))))
-
-
-def _shift_wavelet(
-    time_s: np.ndarray, amplitude: np.ndarray, shift_s: float
-) -> np.ndarray:
-    return np.interp(time_s - float(shift_s), time_s, amplitude, left=0.0, right=0.0)
-
-
 def generate_depth_realization(
     calibration: ImpedanceCalibration,
     calibration_payload: Mapping[str, Any],
@@ -287,7 +272,7 @@ def generate_depth_realization(
         truth=truth,
         preparation=preparation,
         forward_adapter=adapter,
-        canonical_policy=CanonicalIncrementPolicy(contract=canonical_contract),
+        lfm_construction_policy=LfmConstructionPolicy(contract=canonical_contract),
         lfm_policy=LfmPolicy(
             sample_domain="depth",
             axis_unit="m",
@@ -300,18 +285,19 @@ def generate_depth_realization(
             domain_metadata={
                 "sample_domain": "depth",
                 "depth_basis": "tvdss",
-                "increment_contract": canonical_contract.as_dict(),
+                "lfm_construction_contract": canonical_contract.as_dict(),
                 "xline_step": float(section.xline_step),
                 "lfm_source_identity": {
                     "kind": "synthetic_target_derived_lfm",
-                    "construction": "canonical_background_component_of_target_decomposition",
+                    "construction": "fixed_lowpass_of_synthetic_model_log_ai",
                     "target_dependency": True,
                     "contract": canonical_contract.as_dict(),
                 },
                 "structured_identity": {
                     "producer": {
                         "name": "synthoseis_lite",
-                        "artifact_type": "structured_truth_v1",
+                        "artifact_type": "structured_synthetic_benchmark",
+                        "artifact_version": 1,
                     },
                     "calibration": {
                         "generator_family": calibration.generator_family,
@@ -359,8 +345,7 @@ def generate_depth_realization(
         seismic_observed=forward.seismic_observed,
         seismic_model_consistent=forward.seismic_model_consistent,
         subgrid_forward_residual=forward.subgrid_forward_residual,
-        canonical_background_log_ai=sample.input_lfm_canonical_log_ai,
-        target_increment_log_ai=sample.target_increment_log_ai,
+        lfm_log_ai=sample.lfm.values,
         valid_mask_model=sample.valid_mask,
         categorical=categorical,
         object_catalog=depth_catalog_from_synthetic_truth(truth.object_catalog),
@@ -368,7 +353,7 @@ def generate_depth_realization(
             truth.object_lateral_coefficients
         ),
         qc={key: value for key, value in sample.qc.items() if key != "field_qc"},
-        benchmark_sample=sample,
+        structured_sample=sample,
     )
 
 
@@ -387,7 +372,6 @@ class DepthGenerationSession:
         forward_inputs: Mapping[str, Any],
         config_provenance: Mapping[str, str],
         calibration_path: Path,
-        amplitude_prior_path: Path | None = None,
         repo_root: Path,
         debug_attempt_limit: int | None = None,
         geometry_families: Sequence[str] | None = None,
@@ -427,47 +411,12 @@ class DepthGenerationSession:
                 "contract_fingerprint_sha256": str(forward_inputs["_contract_fingerprint_sha256"]),
             },
         }
-        from cup.synthetic.core.amplitude_calibration import resolve_calibrated_seismic_views
-        from cup.synthetic.depth.amplitude_calibration import depth_pilot_compatibility
-
-        amplitude_pilot_compatibility = depth_pilot_compatibility(
-            workflow=workflow,
-            script_cfg=script_cfg,
-            calibration_path=calibration_path,
-            forward_inputs=forward_inputs,
-            repo_root=repo_root,
-        )
-        resolved_views, amplitude_provenance = resolve_calibrated_seismic_views(
-            script_cfg["seismic_views"],
-            prior_path=amplitude_prior_path,
-            repo_root=repo_root,
-            sample_domain="depth",
-            ordered_horizons=[str(item["name"]) for item in script_cfg["horizons"]],
-            expected_pilot_compatibility=amplitude_pilot_compatibility,
-        )
-        if amplitude_provenance is not None:
-            input_contracts["seismic_amplitude_prior"] = {
-                "path": str(amplitude_provenance["path"]),
-                "contract_fingerprint_sha256": str(
-                    amplitude_provenance["contract_fingerprint_sha256"]
-                ),
-                "artifact_sha256": str(amplitude_provenance["artifact_sha256"]),
-                "prior_sha256": str(amplitude_provenance["prior_sha256"]),
-                "pilot_compatibility_sha256": str(
-                    amplitude_provenance["pilot_compatibility_sha256"]
-                ),
-            }
         if list(calibration_payload.get("horizon_contract") or []) != list(script_cfg["horizons"]):
             raise ValueError("impedance calibration horizon contract differs from current common config.")
         expected_truth_dz = float(script_cfg["sampling"]["expected_model_dz_m"]) / int(script_cfg["sampling"]["vertical_oversampling_factor"])
         if not np.isclose(float(calibration_payload["truth_dz_m"]), expected_truth_dz, rtol=0.0, atol=1e-12):
             raise ValueError("impedance calibration truth_dz_m differs from current sampling config.")
         forward_executor = DepthForwardExecutor(script_cfg["seismic_forward"])
-        view_wavelet_time, view_wavelet = load_wavelet_csv(
-            resolve_relative_path(forward_inputs["wavelet"]["path"], root=repo_root)
-        )
-        view_factor = int(script_cfg["sampling"]["vertical_oversampling_factor"])
-        view_taps = finite_support_fir(view_factor)
         sections, survey = build_depth_sections(workflow=workflow, script_cfg=script_cfg, repo_root=repo_root)
         pd.DataFrame([row for section in sections for row in section.qc_rows]).to_csv(output_dir / "section_geometry_qc.csv", index=False)
         feasibility_path = output_dir / "section_geometry_feasibility_qc.csv"
@@ -526,11 +475,11 @@ class DepthGenerationSession:
             )
             if preflight_only:
                 return GenerationAttempt(base_id, None)
-            if generated is None or generated.benchmark_sample is None:
-                raise RuntimeError("depth_generation_missing_benchmark_sample")
+            if generated is None or generated.structured_sample is None:
+                raise RuntimeError("depth_generation_missing_structured_sample")
             return GenerationAttempt(
                 base_id,
-                generated.benchmark_sample,
+                generated.structured_sample,
                 qc_row={**dict(generated.qc), "sample_id": base_id, "sample_kind": "base", "status": "ok"},
                 domain_rows={
                     "object_catalog": [dict(item) for item in generated.object_catalog],
@@ -538,46 +487,6 @@ class DepthGenerationSession:
                     "highres_forward_qc": [{"parent_realization_id": base_id, **{key: generated.qc.get(key) for key in ("physics_halo_m", "antialias_filter_half_width_m", "context_m", "antialias_numtaps")}}],
                     "subgrid_forward_qc": [{"parent_realization_id": base_id, **{key: generated.qc.get(key) for key in ("seismic_observed_rms", "seismic_model_consistent_rms", "subgrid_residual_rms", "subgrid_residual_nrmse", "subgrid_observed_model_correlation", "subgrid_amplitude_scale_ratio")}}],
                 },
-            )
-
-        def view_context(sample: Any, parent_id: str):
-            extras = sample.forward.extras
-            if not isinstance(extras, DepthForwardExtras):
-                raise TypeError("depth view context requires DepthForwardExtras")
-
-            def perturbed_forward(phase_degrees: float, shift_s: float):
-                rotated = _phase_rotate(view_wavelet, phase_degrees)
-                perturbed = _shift_wavelet(view_wavelet_time, rotated, shift_s)
-                highres = forward_executor(
-                    sample.truth.log_ai_highres,
-                    extras.vp_highres_mps,
-                    sample.truth.highres_axis,
-                    view_wavelet_time,
-                    perturbed,
-                )
-                observed, support_1d = valid_filter_decimate(
-                    highres, factor=view_factor, taps=view_taps
-                )
-                observed = observed[..., : sample.forward.seismic_observed.shape[-1]]
-                support = np.broadcast_to(support_1d[: observed.shape[-1]], observed.shape)
-                if np.any(np.asarray(sample.valid_mask, dtype=bool) & ~support):
-                    reason = "invalid_seismic_view:perturbed_wavelet_support_incomplete"
-                    raise ForwardRejected(
-                        [reason], diagnostics={}, details=[{"reason": reason}]
-                    )
-                return observed, support
-
-            return (
-                SeismicViewContext(
-                    realization_id=parent_id,
-                    base_seismic=sample.forward.seismic_observed,
-                    public_valid_mask=sample.valid_mask,
-                    operator_source_support=np.asarray(sample.forward.support.observed, dtype=bool),
-                    lateral_m=sample.truth.lateral_m,
-                    sample_axis=sample.projected.model_axis.coordinates,
-                    rgt_model=sample.projected.rgt_model,
-                ),
-                perturbed_forward,
             )
 
         def validate(row: Mapping[str, Any]) -> None:
@@ -598,7 +507,9 @@ class DepthGenerationSession:
             "source_runs": {key: repo_relative_path(path, root=repo_root) for key, path in sources.items()},
             "config_provenance": dict(config_provenance),
             "mask_contract": build_mask_contract(),
-            "increment_contract": generation_contract("depth", float(script_cfg["sampling"]["expected_model_dz_m"])).as_dict(),
+            "lfm_construction_contract": generation_contract(
+                "depth", float(script_cfg["sampling"]["expected_model_dz_m"])
+            ).as_dict(),
             "seismic_input_contract": build_seismic_input_contract("depth", operator="depth_ai_vp_highres_forward_antialias"),
             "seismic_forward": forward_executor.manifest_fields,
             "forward_model_inputs_path": repo_relative_path(
@@ -608,7 +519,6 @@ class DepthGenerationSession:
             "benchmark_purpose": str(
                 script_cfg.get("benchmark_purpose") or "field_conditioned_benchmark"
             ),
-            "amplitude_pilot_compatibility": amplitude_pilot_compatibility,
             "depth_basis": "tvdss",
             "n_sections": len(sections),
             "geometry_filters": sorted({str(value) for value in geometry_families}) if geometry_families else sorted({str(value) for value in script_cfg["generation"]["geometry_families"]}),
@@ -643,9 +553,7 @@ class DepthGenerationSession:
             manifest_fields=manifest_fields,
             validate_attempt=validate,
             build_attempt=build_parent,
-            view_context=view_context,
             write_domain_outputs=write_domain_outputs,
-            resolved_seismic_views=resolved_views,
         )
 
 
@@ -660,7 +568,6 @@ def run_depth_generation(
     forward_inputs: Mapping[str, Any],
     config_provenance: Mapping[str, str],
     calibration_path: Path,
-    amplitude_prior_path: Path | None = None,
     repo_root: Path,
     output_dir: Path,
     debug_attempt_limit: int | None = None,
@@ -677,7 +584,6 @@ def run_depth_generation(
             "forward_inputs": forward_inputs,
             "config_provenance": config_provenance,
             "calibration_path": calibration_path,
-            "amplitude_prior_path": amplitude_prior_path,
             "repo_root": repo_root,
         }
     )
@@ -693,7 +599,6 @@ def run_depth_generation(
         forward_inputs=forward_inputs,
         config_provenance=config_provenance,
         calibration_path=calibration_path,
-        amplitude_prior_path=amplitude_prior_path,
         repo_root=repo_root,
         structured_artifact_oracle=structured_artifact_oracle,
     )

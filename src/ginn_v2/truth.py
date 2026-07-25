@@ -5,10 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import json
-from pathlib import Path
-import shutil
 from typing import Any
-import uuid
 
 import numpy as np
 
@@ -16,25 +13,7 @@ from cup.synthetic.core.records import SampleAxis
 from cup.synthetic.core.truth import SyntheticTruth
 
 
-ARTIFACT_TYPE = "structured_truth_v1"
-ARTIFACT_VERSION = 1
 _IDENTITY_KEYS = ("producer", "calibration", "projection", "forward")
-_ARRAY_NAMES = (
-    "observed_axis",
-    "observed_seismic",
-    "model_consistent_seismic",
-    "observed_lfm",
-    "observed_valid",
-    "latent_axis",
-    "latent_log_ai_highres_truth",
-    "latent_valid",
-    "latent_state_id",
-    "latent_object_id",
-    "latent_object_xi",
-    "latent_zone_id",
-    "latent_clipping_mask",
-    "zone_valid",
-)
 
 
 def _required_mapping(
@@ -787,251 +766,111 @@ class StructuredTruthAdapter:
             ),
         )
 
+    @classmethod
+    def from_structured_parent(
+        cls,
+        parent: Any,
+        *,
+        zone_id: str,
+        lateral_index: int,
+    ) -> StructuredSample:
+        """Adapt one canonical HDF5 parent slice into the model interface."""
+        from cup.synthetic.readers.structured import StructuredParent
 
-def _segment_manifest(segment: SegmentTruth) -> dict[str, Any]:
-    return {
-        "zone_id": segment.zone_id,
-        "object_id": segment.object_id,
-        "state": segment.state,
-        "state_id": segment.state_id,
-        "top": segment.top,
-        "bottom": segment.bottom,
-        "duration_fraction": segment.duration_fraction,
-        "duration_samples": segment.duration_samples,
-        "c0_raw": float(segment.c0_raw[0]),
-        "c1_raw": float(segment.c1_raw[0]),
-        "c2_raw": float(segment.c2_raw[0]),
-        "c0_projected": float(segment.c0_projected[0]),
-        "c1_projected": float(segment.c1_projected[0]),
-        "c2_projected": float(segment.c2_projected[0]),
-        "c0_effective": float(segment.c0_effective[0]),
-        "c1_effective": float(segment.c1_effective[0]),
-        "c2_effective": float(segment.c2_effective[0]),
-        "segment_supervision_valid": segment.segment_supervision_valid,
-    }
-
-
-class StructuredTruthArtifactWriter:
-    """Write one explicit structured_truth_v1 directory without overwriting."""
-
-    def write(self, sample: StructuredSample, path: str | Path) -> Path:
-        if not isinstance(sample, StructuredSample):
-            raise TypeError("StructuredTruthArtifactWriter.write requires StructuredSample.")
-        target = Path(path)
-        if target.exists():
-            raise FileExistsError(f"Structured truth artifact already exists: {target}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        arrays = {
-            "observed_axis": sample.observed.sample_axis.coordinates,
-            "observed_seismic": sample.observed.seismic,
-            "model_consistent_seismic": sample.observed.model_consistent_seismic,
-            "observed_lfm": sample.observed.lfm,
-            "observed_valid": sample.observed.observed_valid,
-            "latent_axis": sample.latent.latent_axis.coordinates,
-            "latent_log_ai_highres_truth": sample.latent.log_ai_highres_truth,
-            "latent_valid": sample.latent.latent_valid,
-            "latent_state_id": sample.latent.state_id,
-            "latent_object_id": sample.latent.object_id,
-            "latent_object_xi": sample.latent.object_xi,
-            "latent_zone_id": sample.latent.zone_id,
-            "latent_clipping_mask": sample.latent.clipping_mask,
-            "zone_valid": sample.zone.zone_valid,
-        }
-        manifest = {
-            "artifact_type": ARTIFACT_TYPE,
-            "artifact_version": ARTIFACT_VERSION,
-            "realization_id": sample.realization_id,
-            "lateral_index": sample.lateral_index,
-            "geometry": {
-                "lateral_m": sample.lateral_m,
-                "inline": sample.inline,
-                "xline": sample.xline,
-                "xline_step": sample.xline_step,
-            },
-            "identity": dict(sample.identity),
-            "forward_context": dict(sample.forward_context),
-            "lfm": {
-                "source_identity": dict(sample.observed.lfm_source_identity),
-            },
-            "observed_axis": _axis_manifest(sample.observed.sample_axis),
-            "latent_axis": _axis_manifest(sample.latent.latent_axis),
-            "zone": {
-                "zone_id": sample.zone.zone_id,
-                "top": sample.zone.top,
-                "bottom": sample.zone.bottom,
-                "background_a": sample.zone.background_a,
-                "background_b": sample.zone.background_b,
-            },
-            "segments": [_segment_manifest(item) for item in sample.segments],
-            "array_file": "arrays.npz",
-            "array_names": list(_ARRAY_NAMES),
-        }
-        try:
-            json.dumps(manifest, allow_nan=False)
-        except (TypeError, ValueError) as exc:
-            raise TypeError("Structured truth manifest is not JSON serializable.") from exc
-        temporary_path = target.parent / f".{target.name}.{uuid.uuid4().hex}.staging"
-        temporary_path.mkdir(parents=True, exist_ok=False)
-        try:
-            np.savez_compressed(temporary_path / "arrays.npz", **arrays)
-            (temporary_path / "manifest.json").write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
-                encoding="utf-8",
+        if not isinstance(parent, StructuredParent):
+            raise TypeError("from_structured_parent requires StructuredParent")
+        lateral_index = int(lateral_index)
+        if lateral_index < 0 or lateral_index >= parent.lateral_m.size:
+            raise IndexError("lateral_index is outside the parent")
+        selected_zone = str(zone_id)
+        zone_rows = [
+            row
+            for row in parent.zones
+            if str(row["zone_id"]) == selected_zone
+            and int(row["lateral_index"]) == lateral_index
+        ]
+        if len(zone_rows) != 1:
+            raise ValueError("canonical parent requires exactly one selected zone row")
+        zone_row = zone_rows[0]
+        segment_rows = sorted(
+            (
+                row
+                for row in parent.segments
+                if str(row["zone_id"]) == selected_zone
+                and int(row["lateral_index"]) == lateral_index
+                and float(row["bottom"]) > float(row["top"])
+                and float(row["duration_fraction"]) > 0.0
+            ),
+            key=lambda row: (float(row["top"]), int(row["object_id"])),
+        )
+        if not segment_rows:
+            raise ValueError("canonical parent selected zone has no segments")
+        zone_valid = (
+            np.asarray(parent.zone_id_highres[lateral_index])
+            == int(zone_row["zone_grid_value"])
+        )
+        segments = tuple(
+            SegmentTruth(
+                zone_id=str(row["zone_id"]),
+                object_id=int(row["object_id"]),
+                state=str(row["state"]),
+                state_id=int(row["state_id"]),
+                top=float(row["top"]),
+                bottom=float(row["bottom"]),
+                duration_fraction=float(row["duration_fraction"]),
+                duration_samples=int(row["duration_samples"]),
+                c0_raw=np.asarray([row["c0_raw"]]),
+                c1_raw=np.asarray([row["c1_raw"]]),
+                c2_raw=np.asarray([row["c2_raw"]]),
+                c0_projected=np.asarray([row["c0_projected"]]),
+                c1_projected=np.asarray([row["c1_projected"]]),
+                c2_projected=np.asarray([row["c2_projected"]]),
+                c0_effective=np.asarray([row["c0_effective"]]),
+                c1_effective=np.asarray([row["c1_effective"]]),
+                c2_effective=np.asarray([row["c2_effective"]]),
+                segment_supervision_valid=bool(row["segment_supervision_valid"]),
             )
-            temporary_path.replace(target)
-        finally:
-            if temporary_path.exists():
-                shutil.rmtree(temporary_path)
-        return target
-
-
-class StructuredTruthArtifactReader:
-    """Read and fully validate one structured_truth_v1 directory."""
-
-    def read(self, path: str | Path) -> StructuredSample:
-        root = Path(path)
-        manifest_path = root / "manifest.json"
-        array_path = root / "arrays.npz"
-        if not manifest_path.is_file() or not array_path.is_file():
-            raise FileNotFoundError(
-                f"Structured truth artifact requires {manifest_path} and {array_path}."
-            )
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("artifact_type") != ARTIFACT_TYPE:
-            raise ValueError("Structured truth artifact_type is unsupported.")
-        if manifest.get("artifact_version") != ARTIFACT_VERSION:
-            raise ValueError("Structured truth artifact_version is unsupported.")
-        if manifest.get("array_file") != "arrays.npz":
-            raise ValueError("Structured truth artifact must use arrays.npz.")
-        if list(manifest.get("array_names") or []) != list(_ARRAY_NAMES):
-            raise ValueError("Structured truth artifact array contract is invalid.")
-        with np.load(array_path, allow_pickle=False) as data:
-            if set(data.files) != set(_ARRAY_NAMES):
-                raise ValueError("Structured truth artifact arrays do not match its manifest.")
-            arrays = {name: np.array(data[name], copy=True) for name in _ARRAY_NAMES}
-        geometry = _required_mapping(
-            manifest.get("geometry"),
-            ("lateral_m", "inline", "xline", "xline_step"),
-            label="structured artifact geometry",
+            for row in segment_rows
         )
-        forward_context = manifest.get("forward_context")
-        if not isinstance(forward_context, Mapping):
-            raise TypeError("structured artifact forward_context must be a mapping.")
-        zone_data = _required_mapping(
-            manifest.get("zone"),
-            ("zone_id", "top", "bottom", "background_a", "background_b"),
-            label="structured artifact zone",
-        )
-        lfm_data = _required_mapping(
-            manifest.get("lfm"),
-            ("source_identity",),
-            label="structured artifact lfm",
-        )
-        segments = manifest.get("segments")
-        if not isinstance(segments, list):
-            raise TypeError("structured artifact segments must be a list.")
-        zone_grid_value = zone_data.get("zone_grid_value")
-        if zone_grid_value is not None:
-            zone_grid_value = int(zone_grid_value)
-            zone_mask = arrays["zone_valid"].astype(bool)
-            latent_zone = arrays["latent_zone_id"]
-            if np.any(zone_mask & (latent_zone != zone_grid_value)):
-                raise ValueError(
-                    "structured artifact zone_valid disagrees with latent_zone_id."
-                )
-            for row in segments:
-                object_mask = zone_mask & (
-                    arrays["latent_object_id"] == int(row["object_id"])
-                )
-                duration_samples = int(row["duration_samples"])
-                supervision_valid = bool(row["segment_supervision_valid"])
-                if duration_samples == 0:
-                    if supervision_valid:
-                        raise ValueError(
-                            "zero-sample structured artifact segment cannot be supervision-valid."
-                        )
-                    if np.any(object_mask):
-                        raise ValueError(
-                            f"zero-sample structured artifact object {row['object_id']!r} is present."
-                        )
-                elif not np.any(object_mask):
-                    raise ValueError(
-                        f"structured artifact object {row['object_id']!r} is absent."
-                    )
-                if np.any(object_mask) and np.any(
-                    arrays["latent_state_id"][object_mask] != int(row["state_id"])
-                ):
-                    raise ValueError(
-                        "structured artifact segment state disagrees with latent grid."
-                    )
-        sample = StructuredSample(
-            realization_id=str(manifest["realization_id"]),
-            lateral_index=int(manifest["lateral_index"]),
-            lateral_m=float(geometry["lateral_m"]),
-            inline=float(geometry["inline"]),
-            xline=float(geometry["xline"]),
-            xline_step=float(geometry["xline_step"]),
+        return StructuredSample(
+            realization_id=parent.identity.realization_id,
+            lateral_index=lateral_index,
+            lateral_m=float(parent.lateral_m[lateral_index]),
+            inline=float(parent.inline[lateral_index]),
+            xline=float(parent.xline[lateral_index]),
+            xline_step=float(parent.xline_step),
             observed=ObservedTrace(
-                sample_axis=_axis_from_manifest(
-                    manifest["observed_axis"],
-                    arrays["observed_axis"],
-                    label="structured artifact observed_axis",
-                ),
-                seismic=arrays["observed_seismic"],
-                model_consistent_seismic=arrays["model_consistent_seismic"],
-                lfm=arrays["observed_lfm"],
-                observed_valid=arrays["observed_valid"],
-                lfm_source_identity=lfm_data["source_identity"],
+                sample_axis=parent.model_axis,
+                seismic=parent.seismic[lateral_index],
+                model_consistent_seismic=parent.model_consistent_seismic[
+                    lateral_index
+                ],
+                lfm=parent.lfm[lateral_index],
+                observed_valid=parent.observed_valid[lateral_index],
+                lfm_source_identity=parent.lfm_source_identity,
             ),
             latent=LatentTrace(
-                latent_axis=_axis_from_manifest(
-                    manifest["latent_axis"],
-                    arrays["latent_axis"],
-                    label="structured artifact latent_axis",
-                ),
-                latent_valid=arrays["latent_valid"],
-                log_ai_highres_truth=arrays["latent_log_ai_highres_truth"],
-                state_id=arrays["latent_state_id"],
-                object_id=arrays["latent_object_id"],
-                object_xi=arrays["latent_object_xi"],
-                zone_id=arrays["latent_zone_id"],
-                clipping_mask=arrays["latent_clipping_mask"],
+                latent_axis=parent.highres_axis,
+                latent_valid=parent.truth_valid_highres[lateral_index],
+                log_ai_highres_truth=parent.log_ai_highres[lateral_index],
+                state_id=parent.state_id_highres[lateral_index],
+                object_id=parent.object_id_highres[lateral_index],
+                object_xi=parent.object_xi_highres[lateral_index],
+                zone_id=parent.zone_id_highres[lateral_index],
+                clipping_mask=parent.clipping_mask_highres[lateral_index],
             ),
             zone=ZoneTruth(
-                zone_id=str(zone_data["zone_id"]),
-                top=float(zone_data["top"]),
-                bottom=float(zone_data["bottom"]),
-                background_a=float(zone_data["background_a"]),
-                background_b=float(zone_data["background_b"]),
-                zone_valid=arrays["zone_valid"],
+                zone_id=selected_zone,
+                top=float(zone_row["top"]),
+                bottom=float(zone_row["bottom"]),
+                background_a=float(zone_row["background_a"]),
+                background_b=float(zone_row["background_b"]),
+                zone_valid=zone_valid,
             ),
-            segments=tuple(
-                SegmentTruth(
-                    zone_id=str(row["zone_id"]),
-                    object_id=row["object_id"],
-                    state=str(row["state"]),
-                    state_id=int(row["state_id"]),
-                    top=float(row["top"]),
-                    bottom=float(row["bottom"]),
-                    duration_fraction=float(row["duration_fraction"]),
-                    duration_samples=int(row["duration_samples"]),
-                    c0_raw=[row["c0_raw"]],
-                    c1_raw=[row["c1_raw"]],
-                    c2_raw=[row["c2_raw"]],
-                    c0_projected=[row["c0_projected"]],
-                    c1_projected=[row["c1_projected"]],
-                    c2_projected=[row["c2_projected"]],
-                    c0_effective=[row["c0_effective"]],
-                    c1_effective=[row["c1_effective"]],
-                    c2_effective=[row["c2_effective"]],
-                    segment_supervision_valid=bool(row["segment_supervision_valid"]),
-                )
-                for row in segments
-            ),
-            identity=_assert_identity(manifest.get("identity")),
-            forward_context=dict(forward_context),
+            segments=segments,
+            identity=parent.structured_identity,
+            forward_context=parent.forward_context,
         )
-        return sample
 
 
 def assert_structured_sample_equal(
@@ -1154,16 +993,12 @@ def assert_structured_sample_equal(
 
 
 __all__ = [
-    "ARTIFACT_TYPE",
-    "ARTIFACT_VERSION",
     "LatentTrace",
     "ObservedTrace",
     "RawSegmentParameters",
     "SegmentTruth",
     "StructuredSample",
     "StructuredTruthAdapter",
-    "StructuredTruthArtifactReader",
-    "StructuredTruthArtifactWriter",
     "ZoneTruth",
     "assert_structured_sample_equal",
 ]

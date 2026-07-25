@@ -1,22 +1,13 @@
-"""Domain-specific Synthoseis-lite artifact readers."""
+"""Canonical structured synthetic artifact reader."""
 
-from typing import Any
-
-from cup.synthetic.readers.depth import DepthBenchmark, DepthSyntheticSample
-from cup.synthetic.readers.time import TimeBenchmark, TimeSyntheticSample
+from cup.synthetic.readers.structured import (
+    ParentIdentity,
+    StructuredParent,
+    StructuredSyntheticBenchmark,
+)
 
 __all__ = [
-    "DepthSyntheticSample",
-    "DepthBenchmark",
-    "TimeBenchmark",
-    "TimeSyntheticSample",
-    "SyntheticSampleProtocol",
+    "ParentIdentity",
+    "StructuredParent",
+    "StructuredSyntheticBenchmark",
 ]
-
-
-def __getattr__(name: str) -> Any:
-    if name == "SyntheticSampleProtocol":
-        from cup.synthetic.benchmark import SyntheticSampleProtocol
-
-        return SyntheticSampleProtocol
-    raise AttributeError(name)

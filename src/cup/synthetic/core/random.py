@@ -81,35 +81,6 @@ def named_rng(**keys: Any) -> np.random.Generator:
     return np.random.Generator(np.random.PCG64DXSM(named_seed(**keys)))
 
 
-def operator_rng(
-    *,
-    global_seed: int,
-    generator_family: str,
-    realization_id: str,
-    operator_id: str,
-    operator_spec_sha256: str,
-    coefficient_name: str,
-) -> np.random.Generator:
-    """Return the v5 random stream for one operator coefficient.
-
-    The view name and its position are intentionally absent. Reusing the same
-    operator ID/spec in two views therefore reuses the same coefficient field.
-    """
-
-    return named_rng(
-        global_seed=global_seed,
-        benchmark_version="synthoseis_lite_v5",
-        science_revision="synthoseis_lite_science_v4",
-        random_stream_contract_version="synthoseis_random_v3",
-        generator_family=generator_family,
-        stream_purpose="seismic_view_operator",
-        realization_id=realization_id,
-        operator_id=operator_id,
-        operator_spec_sha256=operator_spec_sha256,
-        coefficient_name=coefficient_name,
-    )
-
-
 def ar1_irregular(
     distance_m: np.ndarray,
     *,

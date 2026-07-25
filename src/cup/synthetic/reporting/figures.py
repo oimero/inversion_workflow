@@ -442,15 +442,13 @@ def _plot_hdf5_examples(
             highres_axis_name = model_axis_name
         model_axis = group[f"axes/{model_axis_name}"][()]
         highres_axis = group[f"axes/{highres_axis_name}"][()]
-        # v5 observed/model-consistent seismic fields are materialized on the
-        # model axis.  Reflectivity keeps its separate N-1 forward-interface
-        # axis, but this figure is for the seismic field itself.
+        # Canonical observed and model-consistent seismic share the model axis.
         seismic_axis = model_axis
         model_axis_label = _axis_label(model_axis_name)
         seismic_axis_label = model_axis_label
         generated.append(
             _imshow_section(
-                group["truth/model_target_log_ai"][()],
+                group["truth/model_log_ai"][()],
                 lateral=lateral,
                 vertical=model_axis,
                 vertical_label=model_axis_label,
@@ -461,7 +459,7 @@ def _plot_hdf5_examples(
         )
         generated.append(
             _imshow_section(
-                group["seismic/seismic_model_consistent"][()],
+                group["forward/model_consistent_seismic"][()],
                 lateral=lateral,
                 vertical=seismic_axis,
                 vertical_label=seismic_axis_label,

@@ -1,4 +1,4 @@
-"""Time-domain view of a materialized shared Benchmark sample."""
+"""Time-domain view of a structured synthetic sample."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from cup.synthetic.core.records import BenchmarkSample
+from cup.synthetic.core.records import StructuredSampleRecord
 
 
 def _time_catalog(records: tuple[Mapping[str, Any], ...]) -> list[dict[str, Any]]:
@@ -25,7 +25,7 @@ def _time_catalog(records: tuple[Mapping[str, Any], ...]) -> list[dict[str, Any]
 
 @dataclass(frozen=True)
 class TimeBenchmarkSample:
-    sample: BenchmarkSample
+    sample: StructuredSampleRecord
 
     @property
     def realization_id(self) -> str:

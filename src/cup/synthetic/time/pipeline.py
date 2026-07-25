@@ -9,7 +9,6 @@ from typing import Any, Callable, Mapping, Sequence
 import h5py
 import numpy as np
 import pandas as pd
-import scipy
 
 from cup.seismic.wavelet import (
     infer_wavelet_dt,
@@ -32,26 +31,18 @@ from cup.synthetic.core import (
 from cup.synthetic.core.field_runner import (
     stable_records_frame,
 )
-from cup.synthetic.time.forward import (
-    resample_wavelet_to_highres,
-)
 from cup.synthetic.core.scenarios import GenerationScenario, generation_scenarios
 from cup.synthetic.time.geometry import build_section_geometries
 from cup.synthetic.time.sample_builder import (
     build_time_field_sample,
 )
-from cup.synthetic.time.model import TimeBenchmarkSample
 from cup.synthetic.core.pipeline import (
     GenerationAttempt,
     GenerationSession,
-    SeismicViewContext,
 )
 from cup.synthetic.adapters import TimeSyntheticDomainAdapter
 from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
-from cup.synthetic.core.rejections import ForwardRejected
 from cup.synthetic.schemas import SCIENCE_CONTRACT, require_science_contract
-from cup.physics.numpy_backend import forward_time
-from cup.synthetic.core.signal import finite_support_fir, valid_filter_decimate
 from cup.config.workflow import WorkflowConfig
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
@@ -129,51 +120,11 @@ def _generation_input_contracts(
     return contracts
 
 
-def _benchmark_canonical_records(generated: Any, *, base_path: str) -> dict[str, Any]:
-    return {
-        **{key: value for key, value in generated.qc.items() if key.startswith("lfm_")},
-        "canonical_background_dataset": (
-            "" if not base_path else f"{base_path}/priors/canonical_background_log_ai"
-        ),
-    }
-
-
-def _time_perturbed_wavelet_forward(
-    generated: Any, *, wavelet_time: np.ndarray, wavelet: np.ndarray,
-    phase_degrees: float, shift_s: float, factor: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Time Forward Adapter for a physically perturbed wavelet."""
-    analytic = scipy.signal.hilbert(np.asarray(wavelet, dtype=np.float64))
-    rotated = np.real(analytic * np.exp(1j * np.deg2rad(float(phase_degrees))))
-    perturbed = np.interp(
-        wavelet_time - float(shift_s), wavelet_time, rotated, left=0.0, right=0.0
-    )
-    highres_wavelet = resample_wavelet_to_highres(wavelet_time, perturbed, factor=factor)
-    seismic_highres = forward_time(
-        generated.sample.truth.log_ai_highres,
-        highres_wavelet.time_s,
-        highres_wavelet.amplitude,
-    )
-    observed, support_1d = valid_filter_decimate(
-        seismic_highres, factor=factor, taps=highres_wavelet.filter_taps
-    )
-    observed = observed[..., : generated.seismic_observed.shape[-1]]
-    support = np.broadcast_to(support_1d[: observed.shape[-1]], observed.shape)
-    mask = np.asarray(generated.valid_mask_model, dtype=bool)
-    if np.any(mask & ~support):
-        reason = "invalid_seismic_view:perturbed_wavelet_support_incomplete"
-        raise ForwardRejected(
-            [reason], diagnostics={}, details=[{"reason": reason}]
-        )
-    return observed, support
-
-
 class TimeGenerationSession:
     """Prepare time-domain science for the shared generation lifecycle.
 
-    This class deliberately stops at an in-memory :class:`BenchmarkSample`.
-    HDF5, view-index and acceptance publication are performed by
-    ``SyntheticBenchmarkPipeline``.
+    This class stops at an in-memory structured sample. HDF5 publication is
+    performed by ``SyntheticBenchmarkPipeline``.
     """
 
     @classmethod
@@ -187,7 +138,6 @@ class TimeGenerationSession:
         sources: Mapping[str, Path],
         config_provenance: Mapping[str, str],
         calibration_path: Path,
-        amplitude_prior_path: Path | None = None,
         repo_root: Path,
         debug_attempt_limit: int | None = None,
         geometry_families: Sequence[str] | None = None,
@@ -200,36 +150,6 @@ class TimeGenerationSession:
             sources=sources,
             repo_root=repo_root,
         )
-        from cup.synthetic.core.amplitude_calibration import resolve_calibrated_seismic_views
-        from cup.synthetic.time.amplitude_calibration import time_pilot_compatibility
-
-        amplitude_pilot_compatibility = time_pilot_compatibility(
-            workflow=workflow,
-            script_cfg=script_cfg,
-            sources=sources,
-            calibration_path=calibration_path,
-            repo_root=repo_root,
-        )
-        resolved_views, amplitude_provenance = resolve_calibrated_seismic_views(
-            script_cfg["seismic_views"],
-            prior_path=amplitude_prior_path,
-            repo_root=repo_root,
-            sample_domain="time",
-            ordered_horizons=[str(item["name"]) for item in script_cfg["horizons"]],
-            expected_pilot_compatibility=amplitude_pilot_compatibility,
-        )
-        if amplitude_provenance is not None:
-            input_contracts["seismic_amplitude_prior"] = {
-                "path": str(amplitude_provenance["path"]),
-                "contract_fingerprint_sha256": str(
-                    amplitude_provenance["contract_fingerprint_sha256"]
-                ),
-                "artifact_sha256": str(amplitude_provenance["artifact_sha256"]),
-                "prior_sha256": str(amplitude_provenance["prior_sha256"]),
-                "pilot_compatibility_sha256": str(
-                    amplitude_provenance["pilot_compatibility_sha256"]
-                ),
-            }
         wavelet_time, wavelet = load_wavelet_csv(
             sources["wavelet_generation_dir"] / "selected_wavelet.csv"
         )
@@ -309,28 +229,6 @@ class TimeGenerationSession:
                 },
             )
 
-        def view_context(sample: Any, parent_id: str):
-            wrapped = TimeBenchmarkSample(sample)
-            return (
-                SeismicViewContext(
-                    realization_id=parent_id,
-                    base_seismic=sample.forward.seismic_observed,
-                    public_valid_mask=sample.valid_mask,
-                    operator_source_support=np.asarray(sample.forward.support.observed, dtype=bool),
-                    lateral_m=sample.truth.lateral_m,
-                    sample_axis=sample.projected.model_axis.coordinates,
-                    rgt_model=sample.projected.rgt_model,
-                ),
-                lambda phase_degrees, shift_s: _time_perturbed_wavelet_forward(
-                    wrapped,
-                    wavelet_time=wavelet_time,
-                    wavelet=wavelet,
-                    phase_degrees=phase_degrees,
-                    shift_s=shift_s,
-                    factor=int(script_cfg["sampling"]["vertical_oversampling_factor"]),
-                ),
-            )
-
         def validate(row: Mapping[str, Any]) -> None:
             build_parent(row, preflight_only=True)
 
@@ -360,13 +258,14 @@ class TimeGenerationSession:
             "source_runs": {key: repo_relative_path(path, root=repo_root) for key, path in sources.items()},
             "config_provenance": dict(config_provenance),
             "mask_contract": build_mask_contract(),
-            "increment_contract": generation_contract("time", output_dt).as_dict(),
+            "lfm_construction_contract": generation_contract(
+                "time", output_dt
+            ).as_dict(),
             "seismic_input_contract": build_seismic_input_contract("time", operator="time_forward_highres_wavelet_antialias"),
             "impedance_calibration": repo_relative_path(calibration_path, root=repo_root),
             "benchmark_purpose": str(
                 script_cfg.get("benchmark_purpose") or "field_conditioned_benchmark"
             ),
-            "amplitude_pilot_compatibility": amplitude_pilot_compatibility,
             "output_dt_s": output_dt,
             "truth_dt_s": calibration.truth_sample_interval,
             "n_sections": len(sections),
@@ -401,9 +300,7 @@ class TimeGenerationSession:
             manifest_fields=manifest_fields,
             validate_attempt=validate,
             build_attempt=build_parent,
-            view_context=view_context,
             write_domain_outputs=write_domain_outputs,
-            resolved_seismic_views=resolved_views,
         )
 # Public entrypoint: source loading and Adapter construction only.
 def run_generation(
@@ -413,7 +310,6 @@ def run_generation(
     sources: Mapping[str, Path],
     config_provenance: Mapping[str, str],
     calibration_path: Path,
-    amplitude_prior_path: Path | None = None,
     repo_root: Path,
     output_dir: Path,
     debug_attempt_limit: int | None = None,
@@ -429,7 +325,6 @@ def run_generation(
             "sources": sources,
             "config_provenance": config_provenance,
             "calibration_path": calibration_path,
-            "amplitude_prior_path": amplitude_prior_path,
             "repo_root": repo_root,
         }
     )
@@ -444,7 +339,6 @@ def run_generation(
         sources=sources,
         config_provenance=config_provenance,
         calibration_path=calibration_path,
-        amplitude_prior_path=amplitude_prior_path,
         repo_root=repo_root,
         structured_artifact_oracle=structured_artifact_oracle,
     )

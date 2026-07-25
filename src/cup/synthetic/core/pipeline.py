@@ -3,9 +3,7 @@
 The scientific differences between the time and depth workflows are exposed
 by the two domain adapters.  Everything which gives a benchmark its identity
 or its lifecycle lives here: attempt planning, preflight, parent transactions,
-view materialisation, publication and acceptance reporting.  Keeping this
-module as the only owner of that lifecycle is deliberate; a new seismic view
-must not require a second time/depth orchestration implementation.
+publication and acceptance reporting.
 """
 
 from __future__ import annotations
@@ -22,9 +20,7 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from cup.synthetic.core.view_runner import SeismicViewResult, generate_seismic_views
-from cup.synthetic.core.views import SeismicViewSpec, resolve_view_specs
-from cup.synthetic.core.v5_artifacts import publish_v5_indexes
+from cup.synthetic.core.canonical_artifact import publish_realization_index
 from cup.synthetic.core.artifacts import (
     build_attempt_plan,
     limit_attempt_plan,
@@ -39,13 +35,8 @@ from cup.synthetic.core.field_runner import (
     stable_records_frame,
 )
 from cup.synthetic.core.rejections import StagedRejection
-from cup.synthetic.core.writer import write_benchmark_sample, write_benchmark_view
-from cup.synthetic.core.structured_artifact import (
-    remove_structured_truth_v1,
-    validate_structured_truth_v1,
-    write_structured_truth_v1,
-)
-from cup.synthetic.core.records import BenchmarkSample, BenchmarkView
+from cup.synthetic.core.writer import write_structured_sample
+from cup.synthetic.core.records import StructuredSampleRecord
 from cup.synthetic.reporting.figures import write_generation_figures
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
@@ -211,8 +202,8 @@ def _portable_figure_summary(
     return result
 
 
-def _validate_published_v5_artifact(directory: Path, *, qc_only: bool) -> None:
-    """Run the strict reader as the last generation publication gate.
+def _validate_published_artifact(directory: Path, *, qc_only: bool) -> None:
+    """Run the canonical reader as the last generation publication gate.
 
     The reader is intentionally imported here, rather than at module import
     time, so the shared pipeline keeps the writer/reader dependency one-way.
@@ -221,9 +212,9 @@ def _validate_published_v5_artifact(directory: Path, *, qc_only: bool) -> None:
     """
     if qc_only:
         return
-    from cup.synthetic.benchmark import SynthoseisBenchmark
+    from cup.synthetic.readers.structured import StructuredSyntheticBenchmark
 
-    SynthoseisBenchmark(directory)
+    StructuredSyntheticBenchmark(directory)
 
 
 class SyntheticDomainAdapter(Protocol):
@@ -236,11 +227,6 @@ class SyntheticDomainAdapter(Protocol):
 
     def validate_axis(self, sample_axis: np.ndarray) -> None:
         """Validate the regular axis consumed by the shared view pipeline."""
-
-    def forward_with_parameters(
-        self, phase_degrees: float, shift: float
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Re-run domain forward modelling for one forward-parameter prefix."""
 
     # The following methods are the deep lifecycle seam.  They are intentionally
     # methods on the adapter rather than callbacks supplied by each entrypoint.
@@ -265,63 +251,6 @@ class SyntheticDomainAdapter(Protocol):
         """Prepare one domain calibration result for the shared publisher."""
 
 
-@dataclass(frozen=True)
-class SeismicViewContext:
-    """Parent-realization data needed by :class:`SeismicViewPipeline`."""
-
-    realization_id: str
-    base_seismic: np.ndarray
-    public_valid_mask: np.ndarray
-    operator_source_support: np.ndarray
-    lateral_m: np.ndarray
-    sample_axis: np.ndarray
-    rgt_model: np.ndarray | None = None
-
-
-class SeismicViewPipeline:
-    """Shared ordered operator registry and materialization implementation."""
-
-    def __init__(
-        self,
-        config: Mapping[str, Any],
-        *,
-        global_seed: int,
-        generator_family: str,
-        domain_adapter: SyntheticDomainAdapter,
-    ) -> None:
-        self.specs: tuple[SeismicViewSpec, ...] = resolve_view_specs(config)
-        self.global_seed = int(global_seed)
-        self.generator_family = str(generator_family)
-        self.domain_adapter = domain_adapter
-
-    def generate(
-        self,
-        context: SeismicViewContext,
-        *,
-        perturbed_forward: Callable[[float, float], tuple[np.ndarray, np.ndarray]]
-        | None = None,
-    ) -> list[SeismicViewResult]:
-        axis = np.asarray(context.sample_axis, dtype=np.float64)
-        self.domain_adapter.validate_axis(axis)
-        callback = perturbed_forward
-        if callback is None and any(spec.forward_operator_ids for spec in self.specs):
-            callback = getattr(self.domain_adapter, "forward_with_parameters", None)
-        return generate_seismic_views(
-            base_seismic=context.base_seismic,
-            valid_mask=context.public_valid_mask,
-            operator_source_support=context.operator_source_support,
-            lateral_m=context.lateral_m,
-            sample_axis=axis,
-            rgt_model=context.rgt_model,
-            view_specs=self.specs,
-            global_seed=self.global_seed,
-            generator_family=self.generator_family,
-            realization_id=str(context.realization_id),
-            axis_unit=str(self.domain_adapter.sample_unit),
-            perturbed_forward=callback,
-        )
-
-
 @dataclass
 class GenerationAttempt:
     """Result returned by a domain adapter for one parent attempt.
@@ -332,7 +261,7 @@ class GenerationAttempt:
     """
 
     parent_realization_id: str
-    sample: BenchmarkSample | None
+    sample: StructuredSampleRecord | None
     qc_row: dict[str, Any] = field(default_factory=dict)
     domain_rows: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     reason: str = ""
@@ -369,15 +298,7 @@ class GenerationSession:
     manifest_fields: Mapping[str, Any] = field(default_factory=dict)
     validate_attempt: Callable[[Mapping[str, Any]], Any] | None = None
     build_attempt: Callable[[Mapping[str, Any], h5py.File | None, bool], GenerationAttempt] | None = None
-    view_context: Callable[
-        [BenchmarkSample, str],
-        tuple[
-            SeismicViewContext,
-            Callable[[float, float], tuple[np.ndarray, np.ndarray]] | None,
-        ],
-    ] | None = None
     write_domain_outputs: Callable[[Path, Mapping[str, list[dict[str, Any]]]], None] | None = None
-    resolved_seismic_views: Mapping[str, Any] | None = None
     structured_artifact_oracle: Callable[
         [Path, Any, Sequence[str]], Mapping[str, Any]
     ] | None = None
@@ -513,9 +434,6 @@ class SyntheticBenchmarkPipeline:
         **runtime: Any,
     ) -> Any:
         self._validate_config(config)
-        views = config.get("seismic_views")
-        if not isinstance(views, Mapping):
-            raise ValueError("Synthoseis v5 requires seismic_views configuration.")
         parsed_limit = validate_debug_attempt_limit(debug_attempt_limit)
         directory = Path(output_dir)
         if directory.exists():
@@ -607,15 +525,9 @@ class SyntheticBenchmarkPipeline:
             raise RuntimeError(f"{session.sample_domain}_generation_preflight_no_accepted_realizations")
 
         h5_path = output_dir / "synthetic_benchmark.h5"
-        resolved_config = dict(config)
-        if session.resolved_seismic_views is not None:
-            resolved_config["seismic_views"] = dict(session.resolved_seismic_views)
-        view_pipeline = self.build_view_pipeline(resolved_config)
-        if view_pipeline.specs and session.view_context is None:
-            raise TypeError(
-                "generation session must provide view_context when views are configured"
-            )
         h5_attrs = {
+            "artifact_type": "structured_synthetic_benchmark",
+            "artifact_version": 1,
             "schema": session.schema_version,
             "schema_version": session.schema_version,
             "sample_domain": session.sample_domain,
@@ -628,16 +540,18 @@ class SyntheticBenchmarkPipeline:
         if session.depth_basis:
             h5_attrs["depth_basis"] = session.depth_basis
         h5_attrs.update(dict(session.hdf5_attributes))
-        for key in ("science_revision", "projection_contract_version", "seismic_view_contract_version", "seismic_operator_contract_version", "random_stream_contract_version"):
+        for key in (
+            "science_revision",
+            "projection_contract_version",
+            "random_stream_contract_version",
+        ):
             value = session.manifest_fields.get(key)
             if value is not None:
                 h5_attrs[key] = value
 
         index_rows: list[dict[str, Any]] = []
         realization_rows: list[dict[str, Any]] = []
-        view_rows: list[dict[str, Any]] = []
         qc_rows: list[dict[str, Any]] = []
-        view_result_rows: list[dict[str, Any]] = []
         rejection_rows: list[dict[str, Any]] = list(preflight.rejection_details)
         domain_rows: dict[str, list[dict[str, Any]]] = {}
         with AttemptProgressLog(
@@ -665,20 +579,14 @@ class SyntheticBenchmarkPipeline:
                         raise RuntimeError(result.reason or "generation attempt rejected")
                     sample = result.sample
                     if sample is None:
-                        raise RuntimeError("accepted generation attempt has no BenchmarkSample")
-                    reference = None if qc_only else write_benchmark_sample(h5, sample)
-                    structured_artifacts = ()
-                    if not qc_only:
-                        structured_artifacts = write_structured_truth_v1(
-                            sample.to_structured_record(),
-                            output_dir / "structured_truth_v1",
+                        raise RuntimeError(
+                            "accepted generation attempt has no StructuredSampleRecord"
                         )
+                    reference = None if qc_only else write_structured_sample(h5, sample)
                     owner_path = "" if reference is None else reference.hdf5_group
                     scenario = sample.truth.scenario
                     local_index_rows: list[dict[str, Any]] = []
                     local_realization_rows: list[dict[str, Any]] = []
-                    local_view_rows: list[dict[str, Any]] = []
-                    local_view_result_rows: list[dict[str, Any]] = []
                     base_record = {
                         "sample_id": parent_id,
                         "realization_id": parent_id,
@@ -697,19 +605,18 @@ class SyntheticBenchmarkPipeline:
                         "reasons": "",
                         "sample_kind": "base",
                         "hdf5_group": owner_path,
-                        "seismic_input_dataset": "" if not owner_path else f"{owner_path}/seismic/seismic_observed",
-                        "seismic_model_consistent_dataset": "" if not owner_path else f"{owner_path}/seismic/seismic_model_consistent",
-                        "valid_mask_dataset": "" if not owner_path else f"{owner_path}/masks/valid_mask",
-                        "valid_sample_count": int(np.count_nonzero(sample.valid_mask)),
-                        "structured_truth_artifact_root": (
-                            ""
-                            if not structured_artifacts
-                            else str(
-                                Path(structured_artifacts[0])
-                                .relative_to(output_dir)
-                                .parent.parent.parent
-                            )
+                        "seismic_input_dataset": (
+                            "" if reference is None else reference.seismic_input_dataset
                         ),
+                        "seismic_model_consistent_dataset": (
+                            ""
+                            if reference is None
+                            else reference.seismic_model_consistent_dataset
+                        ),
+                        "valid_mask_dataset": (
+                            "" if reference is None else reference.valid_mask_dataset
+                        ),
+                        "valid_sample_count": int(np.count_nonzero(sample.valid_mask)),
                     }
                     local_index_rows.append(base_record)
                     local_realization_rows.append({
@@ -724,101 +631,19 @@ class SyntheticBenchmarkPipeline:
                         "suite": "field_conditioned",
                         "evaluation_role": base_record["evaluation_role"],
                         "parent_realization_id": parent_id,
+                        "attempt_id": base_record["attempt_id"],
                         "hdf5_group": owner_path,
-                        "base_seismic_dataset": base_record["seismic_input_dataset"],
+                        "seismic_dataset": base_record["seismic_input_dataset"],
+                        "lfm_dataset": "" if reference is None else reference.lfm_dataset,
                         "model_consistent_seismic_dataset": base_record["seismic_model_consistent_dataset"],
-                        "target_log_ai_dataset": "" if not owner_path else f"{owner_path}/truth/model_target_log_ai",
-                        "canonical_background_dataset": "" if not owner_path else f"{owner_path}/priors/canonical_background_log_ai",
-                        "target_increment_dataset": "" if not owner_path else f"{owner_path}/targets/target_increment_log_ai",
-                        "structured_truth_artifact_root": base_record[
-                            "structured_truth_artifact_root"
-                        ],
+                        "model_log_ai_dataset": (
+                            "" if reference is None else reference.model_log_ai_dataset
+                        ),
                         "valid_mask_dataset": base_record["valid_mask_dataset"],
                         "n_valid": base_record["valid_sample_count"],
                     })
-                    if view_pipeline.specs:
-                        if session.view_context is None:
-                            raise TypeError(
-                                "generation session must provide view_context when views are configured"
-                            )
-                        view_context, perturbed_forward = session.view_context(sample, parent_id)
-                        view_results = view_pipeline.generate(
-                            view_context, perturbed_forward=perturbed_forward
-                        )
-                    else:
-                        view_results = []
-                    for view in view_results:
-                        view_path = "" if not owner_path else f"{owner_path}/seismic_views/{view.view_id}"
-                        if not qc_only:
-                            public_mask = np.asarray(view_context.public_valid_mask, dtype=bool)
-                            positive_gain = np.where(
-                                public_mask,
-                                np.asarray(view.positive_gain, dtype=np.float64),
-                                1.0,
-                            )
-                            additive_noise = np.where(
-                                public_mask,
-                                np.asarray(view.additive_noise, dtype=np.float64),
-                                0.0,
-                            )
-                            write_benchmark_view(
-                                h5,
-                                BenchmarkView(
-                                    owner_realization_id=parent_id,
-                                    view_id=view.view_id,
-                                    seismic_observed=view.seismic_observed,
-                                    positive_gain=positive_gain,
-                                    additive_noise=additive_noise,
-                                    metadata=dict(view.metadata),
-                                    qc=view.qc,
-                                    sample_domain=session.sample_domain,
-                                ),
-                            )
-                        metadata = dict(view.metadata)
-                        local_index_rows.append({
-                            **base_record,
-                            "sample_id": f"{parent_id}__view__{view.view_id}",
-                            "realization_id": parent_id,
-                            "sample_kind": "seismic_view",
-                            "view_id": view.view_id,
-                            "hdf5_group": view_path,
-                            "seismic_input_dataset": "" if not view_path else f"{view_path}/seismic_observed",
-                            "operator_trace_dataset": "" if not view_path else f"{view_path}/operator_trace_json",
-                            "view_spec_sha256": metadata["view_spec_sha256"],
-                            "view_spec_canonical_json": metadata["view_spec_canonical_json"],
-                            "operator_ids_json": json.dumps(metadata["operator_ids"], sort_keys=True),
-                            "operator_kinds_json": json.dumps(metadata["operator_kinds"], sort_keys=True),
-                            "operator_parameters_json": json.dumps(metadata.get("operator_parameters", {}), sort_keys=True),
-                            "operator_contract_versions_json": json.dumps(metadata.get("operator_contract_versions", {}), sort_keys=True),
-                            "random_stream_identity_json": json.dumps(metadata.get("random_stream_identity", {}), sort_keys=True),
-                        })
-                        local_view_rows.append({
-                            "realization_id": parent_id,
-                            "parent_realization_id": parent_id,
-                            "view_id": view.view_id,
-                            "sample_domain": session.sample_domain,
-                            "sample_unit": session.sample_unit,
-                            "evaluation_role": base_record["evaluation_role"],
-                            "hdf5_group": view_path,
-                            "seismic_observed_dataset": "" if not view_path else f"{view_path}/seismic_observed",
-                            "seismic_input_dataset": "" if not view_path else f"{view_path}/seismic_observed",
-                            "model_consistent_seismic_dataset": base_record["seismic_model_consistent_dataset"],
-                            "valid_mask_dataset": base_record["valid_mask_dataset"],
-                            "view_spec_sha256": metadata["view_spec_sha256"],
-                            "view_spec_canonical_json": metadata["view_spec_canonical_json"],
-                            "operator_ids_json": json.dumps(metadata["operator_ids"], sort_keys=True),
-                            "operator_kinds_json": json.dumps(metadata["operator_kinds"], sort_keys=True),
-                            "operator_parameters_json": json.dumps(metadata.get("operator_parameters", {}), sort_keys=True),
-                            "operator_contract_versions_json": json.dumps(metadata.get("operator_contract_versions", {}), sort_keys=True),
-                            "random_stream_identity_json": json.dumps(metadata.get("random_stream_identity", {}), sort_keys=True),
-                            "operator_trace_dataset": "" if not view_path else f"{view_path}/operator_trace_json",
-                            "n_valid": base_record["valid_sample_count"],
-                        })
-                        local_view_result_rows.append({"parent_realization_id": parent_id, **metadata, **dict(view.qc)})
                     index_rows.extend(local_index_rows)
                     realization_rows.extend(local_realization_rows)
-                    view_rows.extend(local_view_rows)
-                    view_result_rows.extend(local_view_result_rows)
                     qc_rows.append({**base_record, **dict(result.qc_row), **dict(sample.qc)})
                     for name, rows in result.domain_rows.items():
                         domain_rows.setdefault(str(name), []).extend(rows)
@@ -828,11 +653,6 @@ class SyntheticBenchmarkPipeline:
                     failed_group = f"/realizations/{parent_id}"
                     if failed_group in h5:
                         del h5[failed_group]
-                    if not qc_only:
-                        remove_structured_truth_v1(
-                            output_dir / "structured_truth_v1",
-                            parent_id,
-                        )
                     reason = f"{type(exc).__name__}:{exc}"
                     rejection_rows.append({**dict(row), "status": "rejected", "reason": reason})
                     qc_rows.append({**dict(row), "sample_id": parent_id, "status": "rejected", "reasons": reason})
@@ -840,11 +660,6 @@ class SyntheticBenchmarkPipeline:
                     failed_group = f"/realizations/{parent_id}"
                     if failed_group in h5:
                         del h5[failed_group]
-                    if not qc_only:
-                        remove_structured_truth_v1(
-                            output_dir / "structured_truth_v1",
-                            parent_id,
-                        )
                     raise
                 progress.record(
                     row,
@@ -858,9 +673,8 @@ class SyntheticBenchmarkPipeline:
             index_rows,
             sort_by=("section_id", "scenario_id", "attempt_id", "sample_kind", "sample_id"),
         )
-        self.publish_indexes(output_dir, realization_rows, view_rows)
+        publish_realization_index(output_dir, realization_rows)
         stable_records_frame(qc_rows, sort_by=("section_id", "scenario_id", "attempt_id", "sample_kind", "sample_id")).to_csv(output_dir / "generation_qc.csv", index=False)
-        stable_records_frame(view_result_rows, sort_by=("parent_realization_id", "view_id")).to_csv(output_dir / "seismic_view_results.csv", index=False)
         rejection_frame = stable_records_frame(rejection_rows, sort_by=("section_id", "scenario_id", "attempt_id", "reason"))
         rejection_frame.to_csv(output_dir / "generation_rejection_details.csv", index=False)
         rejection_summary = rejection_reason_summary(rejection_frame, index)
@@ -872,21 +686,13 @@ class SyntheticBenchmarkPipeline:
                 if str(row.get("realization_id") or row.get("parent_realization_id"))
             }
         )
-        structured_publication_report: dict[str, Any] = {}
         structured_oracle_report: dict[str, Any] = {}
         if not qc_only and successful_parent_ids:
-            structured_publication_report = validate_structured_truth_v1(
-                output_dir / "structured_truth_v1",
-                expected_realization_ids=successful_parent_ids,
-            )
-            _write_json(
-                output_dir / "structured_truth_v1" / "publication_report.json",
-                structured_publication_report,
-            )
+            _validate_published_artifact(output_dir, qc_only=False)
             if session.structured_artifact_oracle is not None:
                 try:
                     candidate_report = session.structured_artifact_oracle(
-                        output_dir / "structured_truth_v1",
+                        output_dir,
                         calibration,
                         successful_parent_ids,
                     )
@@ -895,7 +701,7 @@ class SyntheticBenchmarkPipeline:
                     structured_oracle_report = dict(candidate_report)
                 except Exception as exc:
                     structured_oracle_report = {
-                        "schema": "structured_truth_v1_oracle_report",
+                        "schema": "structured_synthetic_benchmark_oracle_report_v1",
                         "passed": False,
                         "trace_count": 0,
                         "parent_count": 0,
@@ -907,23 +713,23 @@ class SyntheticBenchmarkPipeline:
                         }],
                     }
                 _write_json(
-                    output_dir / "structured_truth_v1" / "oracle_report.json",
+                    output_dir / "oracle_report.json",
                     structured_oracle_report,
                 )
                 if not bool(structured_oracle_report.get("passed", False)):
                     raise RuntimeError(
-                        "structured_truth_v1_oracle_failed: "
+                        "structured_synthetic_benchmark_oracle_failed: "
                         f"{structured_oracle_report.get('failures', [])[:3]}"
                     )
             else:
                 structured_oracle_report = {
-                    "schema": "structured_truth_v1_oracle_report",
+                    "schema": "structured_synthetic_benchmark_oracle_report_v1",
                     "requested": False,
                     "passed": None,
                     "reason": "oracle callback was not requested",
                 }
                 _write_json(
-                    output_dir / "structured_truth_v1" / "oracle_report.json",
+                    output_dir / "oracle_report.json",
                     structured_oracle_report,
                 )
         parent_quality_warning_count = int(sum(
@@ -957,8 +763,6 @@ class SyntheticBenchmarkPipeline:
                     semantics={
                         "science_revision": session.manifest_fields.get("science_revision", ""),
                         "projection_contract_version": session.manifest_fields.get("projection_contract_version", ""),
-                        "seismic_view_contract_version": session.manifest_fields.get("seismic_view_contract_version", ""),
-                        "seismic_operator_contract_version": session.manifest_fields.get("seismic_operator_contract_version", ""),
                         "random_stream_contract_version": session.manifest_fields.get("random_stream_contract_version", ""),
                         "sample_domain": session.sample_domain,
                         "sample_unit": session.sample_unit,
@@ -970,16 +774,7 @@ class SyntheticBenchmarkPipeline:
                     primary_artifacts={
                         "synthetic_benchmark": h5_path,
                         "realization_index": output_dir / "realization_index.csv",
-                        "seismic_view_index": output_dir / "seismic_view_index.csv",
-                        "structured_truth_sample_index": str(
-                            output_dir / "structured_truth_v1" / "sample_index.csv"
-                        ),
-                        "structured_truth_publication_report": str(
-                            output_dir / "structured_truth_v1" / "publication_report.json"
-                        ),
-                        "structured_truth_oracle_report": str(
-                            output_dir / "structured_truth_v1" / "oracle_report.json"
-                        ),
+                        "oracle_report": output_dir / "oracle_report.json",
                     },
                 ),
             }
@@ -1004,37 +799,15 @@ class SyntheticBenchmarkPipeline:
             "rejected_parent_realizations": int(len(plan) - len(successful_parent_ids)),
             "acceptance_qc": acceptance_qc,
             "preflight": preflight_summary,
-            "seismic_views": dict(resolved_config.get("seismic_views") or {}),
-            "seismic_view_count": int(len(view_rows)),
-            "structured_truth_root": (
-                str(output_dir / "structured_truth_v1")
+            "oracle_report": (
+                str(output_dir / "oracle_report.json")
                 if not qc_only
                 else ""
             ),
-            "structured_truth_sample_index": (
-                str(output_dir / "structured_truth_v1" / "sample_index.csv")
-                if not qc_only
-                else ""
-            ),
-            "structured_truth_publication_report": (
-                str(output_dir / "structured_truth_v1" / "publication_report.json")
-                if not qc_only
-                else ""
-            ),
-            "structured_truth_publication_passed": (
-                bool(structured_publication_report.get("passed", False))
-                if not qc_only
-                else False
-            ),
-            "structured_truth_oracle_report": (
-                str(output_dir / "structured_truth_v1" / "oracle_report.json")
-                if not qc_only
-                else ""
-            ),
-            "structured_truth_oracle_requested": bool(
+            "oracle_requested": bool(
                 not qc_only and session.structured_artifact_oracle is not None
             ),
-            "structured_truth_oracle_passed": (
+            "oracle_passed": (
                 structured_oracle_report.get("passed")
                 if not qc_only
                 else None
@@ -1068,10 +841,10 @@ class SyntheticBenchmarkPipeline:
         if failure_reason:
             raise RuntimeError(failure_reason)
         try:
-            _validate_published_v5_artifact(output_dir, qc_only=qc_only)
+            _validate_published_artifact(output_dir, qc_only=qc_only)
         except Exception as exc:
             raise RuntimeError(
-                f"{session.sample_domain}_generation_final_v5_artifact_validation_failed: {exc}"
+                f"{session.sample_domain}_generation_final_artifact_validation_failed: {exc}"
             ) from exc
         logger.info("Synthoseis generation finished: status=%s accepted=%d rejected=%d", summary["status"], summary["accepted_realizations"], summary["rejected_realizations"])
         for handler in list(logger.handlers):
@@ -1080,41 +853,9 @@ class SyntheticBenchmarkPipeline:
             logger.removeHandler(handler)
         return summary
 
-    def build_view_pipeline(self, config: Mapping[str, Any]) -> SeismicViewPipeline:
-        """Build the shared view seam after validating domain-level identity."""
-        if str(config.get("sample_domain") or "").casefold() != str(
-            self.domain_adapter.sample_domain
-        ).casefold():
-            raise ValueError("Synthetic config and domain adapter sample_domain differ.")
-        views = config.get("seismic_views")
-        if not isinstance(views, Mapping):
-            raise ValueError("Synthoseis v5 requires seismic_views configuration.")
-        return SeismicViewPipeline(
-            views,
-            global_seed=int(config.get("global_seed")),
-            generator_family=str(
-                config.get("generator_family")
-                or getattr(self.domain_adapter, "generator_family", "")
-                or ""
-            ),
-            domain_adapter=self.domain_adapter,
-        )
-
-    def publish_indexes(
-        self,
-        output_dir: str,
-        realization_rows: Sequence[Mapping[str, Any]],
-        view_rows: Sequence[Mapping[str, Any]],
-    ):
-        """Publish the same successful-only dual indexes for either domain."""
-        return publish_v5_indexes(output_dir, realization_rows, view_rows)
-
-
 __all__ = [
     "GenerationAttempt",
     "GenerationSession",
-    "SeismicViewContext",
-    "SeismicViewPipeline",
     "SyntheticBenchmarkPipeline",
     "SyntheticDomainAdapter",
 ]

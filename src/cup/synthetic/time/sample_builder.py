@@ -14,7 +14,7 @@ from cup.synthetic.core.records import DomainPreparation, SampleAxis
 from cup.synthetic.core.sample_builder import (
     BenchmarkBuildPolicy,
     BenchmarkBuilder,
-    CanonicalIncrementPolicy,
+    LfmConstructionPolicy,
 )
 from cup.synthetic.core.scenarios import GenerationScenario
 from cup.synthetic.core.truth import TruthGenerationRequest, generate_field_conditioned_truth
@@ -101,7 +101,7 @@ def build_time_field_sample(
         truth=truth,
         preparation=preparation,
         forward_adapter=adapter,
-        canonical_policy=CanonicalIncrementPolicy(contract=contract),
+        lfm_construction_policy=LfmConstructionPolicy(contract=contract),
         lfm_policy=LfmPolicy(
             sample_domain="time",
             axis_unit="s",
@@ -115,18 +115,19 @@ def build_time_field_sample(
             require_forward_support=True,
             domain_metadata={
                 "sample_domain": "time",
-                "increment_contract": contract.as_dict(),
+                "lfm_construction_contract": contract.as_dict(),
                 "xline_step": float(section.xline_step),
                 "lfm_source_identity": {
                     "kind": "synthetic_target_derived_lfm",
-                    "construction": "canonical_background_component_of_target_decomposition",
+                    "construction": "fixed_lowpass_of_synthetic_model_log_ai",
                     "target_dependency": True,
                     "contract": contract.as_dict(),
                 },
                 "structured_identity": {
                     "producer": {
                         "name": "synthoseis_lite",
-                        "artifact_type": "structured_truth_v1",
+                        "artifact_type": "structured_synthetic_benchmark",
+                        "artifact_version": 1,
                     },
                     "calibration": {
                         "generator_family": calibration.generator_family,

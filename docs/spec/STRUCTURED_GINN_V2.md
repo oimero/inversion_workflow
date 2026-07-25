@@ -1,14 +1,11 @@
 # Structured GINN V2 实施规格
 
-> 状态：路线规划。本文定义从结构化 truth 生产到物理排序的最小可验证路径。
+> 状态：路线规划。本文定义从结构化 truth 生产到监督反演和真实工区推理的最小可验证路径。
 > 当前优先级是先统一 `cup.synthetic` 的 producer 合同，再让 Oracle 闭环成立。
 
 ## 1. 目标与路线决策
 
-Structured GINN V2 首先验证两件事：
-
-1. 网络能否从 seismic + LFM 恢复三状态半马尔科夫对象的状态、持续时间、zone background 和对象内部三参数 profile；
-2. 深度域物理正演能否在多个结构化候选之间提供有效排序。
+Structured GINN V2 第一版只验证一件事：网络能否从 seismic + LFM 恢复三状态半马尔科夫对象的状态、持续时间、zone background 和对象内部三参数 profile。
 
 目标变量是对象级 structured latent，而不是逐采样自由 increment：
 
@@ -20,10 +17,10 @@ seismic + LFM
     -> deterministic decoder
     -> high-resolution log AI
     -> projection
-    -> depth-domain forward seismic
+    -> model-grid log AI
 ```
 
-结构化残差相对于生成器的 zone background 定义；LFM 是输入和诊断信息，不替代生成器内部的 `a/b`。真实工区输出解释为由 seismic、LFM 和标定地质先验共同约束的候选集合，不解释为唯一地下真值。
+结构化残差相对于生成器的 zone background 定义；LFM 是输入和诊断信息，不替代生成器内部的 `a/b`。真实工区输出解释为由 seismic、LFM 和标定地质先验共同约束的结构化估计，不解释为唯一地下真值。
 
 首轮模型固定为深度域、单 zone、单 trace。`cup.synthetic` 的生产合同和 forward seam 必须同时支持 time/depth；模型首轮只在 depth 上训练不改变这个公共合同。
 
@@ -66,10 +63,9 @@ increment 语义属于历史实验路线，不属于当前 `cup.synthetic`、`gi
 | 0 | canonical structured producer、time/depth 对称 seam 与 forward 骨架 | 900–1400 行 |
 | 1 | structured reader、decoder 与 Oracle 闭环 | 800–1300 行 |
 | 2 | 单 zone 监督模型与 exact HSMM | 1500–2500 行 |
-| 3 | 候选生成与合成物理排序 | 500–900 行 |
-| 4 | 真实工区冻结候选排序 | 400–700 行 |
+| 3 | 真实工区冻结模型推理与诊断 | 500–900 行 |
 
-代码量不含测试、配置、数据生成运行时间和文档。阶段保持五个顶层垂直切片；阶段内部按实现顺序推进，不再拆出 1A、2A 等子阶段。
+代码量不含测试、配置、数据生成运行时间和文档。阶段保持四个顶层垂直切片；阶段内部按实现顺序推进，不再拆出 1A、2A 等子阶段。
 
 ## 2. time/depth 对称性合同
 
@@ -343,35 +339,31 @@ Oracle 未通过时，修复 producer、writer/reader、decoder 或 forward seam
 
 阶段 2 只实现 depth、单 zone、单 trace、clean seismic/LFM 双通道、三状态 emission、固定 calibration transition/duration prior、exact HSMM、zone `a/b` head 和 segment `c0/c1/c2` head。
 
-训练顺序是 teacher-forced segmentation，小范围 boundary jitter，再验证 predicted MAP segmentation 下的参数 head。首轮使用 deterministic MAP；posterior sampling、backward sampling、多样本候选、多 zone、lateral pooling 和 time 模型留到后续讨论。
+训练顺序是 teacher-forced segmentation，小范围 boundary jitter，再验证 predicted MAP segmentation 下的参数 head。首轮使用 deterministic MAP；posterior sampling、backward sampling、多样本输出、多 zone、lateral pooling 和 time 模型留到后续讨论。
 
-科学对照固定使用同一 parent split：no-seismic control、seismic+LFM 主模型、parent-shuffled seismic 和 LFM-only baseline。进入阶段 3 的条件是主模型相对 no-seismic 在结构化指标上有配对改善，parent shuffle 后改善明显减弱，且改善不是只体现在 forward closure。
+科学对照固定使用同一 parent split：no-seismic control、seismic+LFM 主模型、parent-shuffled seismic 和 LFM-only baseline。进入阶段 3 的条件是主模型相对 no-seismic 在 state、boundary、duration、`a/b`、`c0/c1/c2` 和 decoded log AI 指标上有配对改善，且 parent shuffle 后改善明显减弱。
 
-## 6. 阶段 3：候选生成与合成物理排序
+## 6. 阶段 3：真实工区冻结模型推理与诊断
 
-阶段 3 让模型输出多个 structured candidate。每个候选包含 state sequence、object boundary、duration、zone `a/b`、object `c0/c1/c2`、decoded high-resolution log AI、projected log AI 和 forward seismic。
+阶段 3 使用冻结的 Structured 模型处理真实深度域剖面。输入保持 seismic/LFM 双通道，输出 deterministic MAP state sequence、object boundary、duration、zone `a/b`、object `c0/c1/c2`、decoded high-resolution log AI 和 projected model-grid log AI。
 
-物理排序先作为独立 selector，不作为训练 loss。在合成 holdout 上比较 MAP candidate、physics-best candidate、oracle-best-of-K、Calibration-prior 和 LFM-only baseline。
+真实推理沿用阶段 2 冻结的 normalization、calibration、HSMM transition/duration prior 和 decoder，不使用真实无标签数据更新模型。输出同时记录输入支持、模型置信度、参数越界、空 segment、横向跳变和分布外诊断。
 
-oracle-best 不能覆盖 truth 时检查 posterior coverage/表示能力；oracle 可行但 physics-best 错时检查 forward、wavelet、nuisance 和评分函数；只有 physics-best 稳定优于 MAP，才进入真实工区。
+真实工区评估优先使用高质量井和人工地质检查；低质量井只作诊断。井上误差、横向连续性和置信度用于描述模型行为，不作为真实参数已经唯一恢复的证明。
 
-## 7. 阶段 4：真实工区冻结候选排序
+阶段 3 的停止条件是：合成 holdout 门禁已通过，真实输入合同完整，模型能够稳定输出结构化结果及诊断报告。若出现系统性分布外、参数越界或横向跳变，返回阶段 2 检查训练覆盖和模型设计。
 
-阶段 4 使用冻结 Structured 模型生成真实剖面候选，固定 wavelet 和 depth forward，允许受限的全局 gain、小范围 shift/phase nuisance，输出候选排序、分数分解和井震诊断。
+## 7. 当前代码审计结论与实施边界
 
-真实阶段保持模型和候选生成规则冻结。候选共享受限 nuisance 参数；低质量井只作诊断，井震相关性只作为一致性证据。合成排序门禁通过后，才研究固定 segmentation 下的连续参数小范围 refinement；边界搜索、soft HSMM 和真实 posterior adaptation 属于更晚的研究方向。
-
-## 8. 当前代码审计结论与实施边界
-
-### 8.1 已经对称、可以保留的核心能力
+### 7.1 已经对称、可以保留的核心能力
 
 - `SampleAxis` 对 time/depth 的 domain、unit、basis 和 regular sampling 做统一校验；
 - `generate_field_conditioned_truth()`、`project_truth_to_model_grid()`、finite-support signal 和 lateral `m` 逻辑是公共能力；
 - `core.pipeline` 已经提供共享的 attempt plan、发布事务和 seismic view seam；
 - `core.amplitude_calibration` 在 aligned seismic/RGT/valid-mask seam 之后是公共实现；
-- time/depth forward 的物理差异已经集中在各自 forward adapter，属于合理差异。
+- time/depth forward 的 domain 差异已经集中在各自 forward adapter，属于合理差异。
 
-### 8.2 当前需要在阶段 0 修复的非对称或历史耦合
+### 7.2 当前需要在阶段 0 修复的非对称或历史耦合
 
 1. `core.geometry.SectionGeometry` 是通用 record，但当前 time/depth 各自定义 section record，通用 record 没有成为实际 seam；
 2. `core.artifacts.geometry_feasibility_rows()` 通过 `hasattr` 在 TWT/TVDSS 字段之间选择，公共实现缺少显式 axis interface；
@@ -381,9 +373,9 @@ oracle-best 不能覆盖 truth 时检查 posterior coverage/表示能力；oracl
 6. `core.pipeline.py`、`core/sample_builder.py`、`core/lfm.py`、`core/records.py`、`benchmark.py`、`readers/v5.py` 和 v5 index/schema 共同绑定历史 increment 合同，阶段 0 需要成组迁移；
 7. time/depth 的 section QC 字段集合不同，保留差异时必须放入显式 domain extension，不能让共享报告通过字段存在性猜语义。
 
-这些问题是架构重构事项，不是要求把 time/depth 的 forward 物理强行写成同一实现。当前代码没有发现 `xline_step=4` 在 `core.geometry.resample_section_path()` 或 depth survey index 中被当作单位步长；新 structured artifact 仍必须持久化该几何属性并用 `lateral_m` 做物理距离。
+这些问题是架构重构事项，不要求把 time/depth 的 forward 强行写成同一实现。当前代码没有发现 `xline_step=4` 在 `core.geometry.resample_section_path()` 或 depth survey index 中被当作单位步长；新 structured artifact 仍必须持久化该几何属性并用 `lateral_m` 表示横向距离。
 
-### 8.3 版本与停止条件
+### 7.3 版本与停止条件
 
 建议产物版本：
 
@@ -397,6 +389,6 @@ structured_ginn_v2_report_v1
 
 每个产物记录 sample axis、domain、calibration、projection、forward、parent split、normalization 和 source identity。
 
-全局停止条件：阶段 0 的 producer/artifact/对称 seam 未通过时不进入阶段 1；阶段 1 Oracle 未闭合时不训练网络；阶段 2 的结构化监督和 parent-shuffle 门禁失败时不做物理排序；阶段 3 的 physics-best 没有稳定优于 MAP 时真实阶段只保留合成诊断。
+全局停止条件：阶段 0 的 producer/artifact/对称 seam 未通过时不进入阶段 1；阶段 1 Oracle 未闭合时不训练网络；阶段 2 的结构化监督和 parent-shuffle 门禁失败时不进入真实工区；阶段 3 出现系统性分布外、参数越界或横向跳变时返回阶段 2。
 
-本文不展开 posterior schema、32 samples、复杂 mixture/diffusion、真实联合微调或完整报告字段；这些内容等到阶段 1/2 的实际结果出现后再决定。
+本文不展开 posterior schema、多样本预测、复杂 mixture/diffusion、真实联合微调或完整报告字段；这些内容等到第一版监督反演结果出现后再决定。

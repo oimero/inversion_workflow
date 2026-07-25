@@ -91,213 +91,155 @@ positive_direction = increasing_time
 
 状态：代码已落地，depth smoke 已通过。
 
-预计生产代码量：700–1100 行。
-
-### 3.1 单一产物
-
-一个 generation run 的 canonical 数据产物为：
-
-```text
-synthetic_benchmark.h5
-```
-
-CSV、JSON 和 figures 是索引与报告。
-
-HDF5 root 声明：
-
-```text
-artifact_type = structured_synthetic_benchmark
-artifact_version = 1
-schema = structured_synthetic_benchmark_v1
-sample_domain = time | depth
-sample_unit = s | m
-depth_basis = null | tvdss
-```
-
-### 3.2 Parent layout
-
-```text
-/realizations/<realization_id>/
-├── identity/
-├── axes/
-│   ├── lateral_m
-│   ├── inline_float / xline_float
-│   ├── x_m / y_m
-│   ├── highres axis
-│   └── model axis
-├── observed/
-│   ├── seismic
-│   ├── lfm
-│   └── valid
-├── truth/
-│   ├── log_ai_highres
-│   ├── state_id_highres
-│   ├── object_id_highres
-│   ├── object_xi_highres
-│   ├── zone_id_highres
-│   ├── truth_valid_highres
-│   ├── clipping_mask_highres
-│   ├── model_log_ai
-│   ├── projection/categorical arrays
-│   ├── zones/
-│   └── segments/
-├── forward/
-│   ├── model_consistent_seismic
-│   ├── subgrid_residual
-│   ├── support/
-│   ├── context/
-│   └── domain_extras/
-└── qc/
-```
-
-`zones/` 和 `segments/` 是 columnar datasets。zone 主键为 `(lateral_index, zone_id)`；segment 主键由 `(lateral_index, zone_id, object_id)` 给出。
-
-segment 保存：
-
-- state、state id；
-- top、bottom；
-- duration fraction、duration samples；
-- raw/projected/effective 三套 `c0/c1/c2`；
-- `segment_supervision_valid`。
-
-### 3.3 In-memory seam
-
-generation 的唯一 sample interface 是：
-
-```text
-StructuredSampleRecord
-├── SyntheticTruth
-├── ProjectedTruth
-├── ForwardResult
-├── LfmObservation
-├── valid_mask
-├── qc
-└── domain_metadata
-```
-
-time/depth builder 直接构造该 record。pipeline 每个 parent 只调用：
-
-```text
-write_structured_sample(h5, record) -> ArtifactReference
-```
-
-writer 在 HDF5 staging group 中完成字段、shape、axis、mask、zone/segment 主键和端点校验，随后将 complete parent 移入 `/realizations`。
-
-### 3.4 Reader seam
-
-`StructuredSyntheticBenchmark` 暴露：
-
-```text
-list_parents(split) -> ParentIdentity[]
-read_parent(parent_id) -> StructuredParent
-```
-
-`StructuredTruthAdapter.from_structured_parent()` 将一个 parent 的 `(lateral, zone)` slice 转换为模型和 Oracle 使用的 `StructuredSample`。
-
-reader 根据 root artifact type/version 判断合同。HDF5 group 名和 columnar table 实现不进入模型代码。
-
-### 3.5 已通过 smoke
-
-depth smoke 使用一个短 section、一个 wedge parent，并执行：
-
-```text
-generation
-→ parent transaction
-→ close HDF5
-→ reopen reader
-→ disk Oracle
-→ figures
-→ final publication gate
-```
-
-结果：
-
-- parent count：1；
-- Oracle trace count：14；
-- Oracle passed：true；
-- parent group 只有 `identity/axes/observed/truth/forward/qc`；
-- HDF5 中没有 materialized seismic views；
-- run 中没有第二套 truth tree。
-
-迁移 smoke 另外覆盖了普通 parent 和 pinchout parent。pinchout smoke 暴露并修正了单 high-resolution sample segment 的 decoder 约定：profile 求值分母为 `max(segment thickness, highres sample interval)`，与 producer 一致。
-
 ## 4. 一次性迁移：20260725
-
-迁移源：
-
-```text
-experiments/synthoseis_lite/results/20260725/generate_field_conditioned
-```
-
-迁移输出建议：
-
-```text
-experiments/synthoseis_lite/results/20260725/generate_field_conditioned_structured
-```
-
-迁移器：
-
-```text
-scripts/migrate_synthoseis_structured_v1.py
-```
-
-它按 parent 流式执行：
-
-1. 从旧 HDF5 读取 axes、clean seismic、LFM、dense truth 和 forward arrays；
-2. 从 realization manifest 和 trace manifest 读取 zone/segment truth；
-3. 每个 lateral 读取一份 NPZ，校验 seismic、LFM、truth、mask parity，并取得 clipping mask；
-4. 组装 `StructuredSampleRecord`；
-5. 调用正式 `write_structured_sample()`；
-6. flush complete parent；
-7. 更新 realization index；
-8. 完成后用正式 reader 校验 parent 集合并抽样运行 Oracle。
-
-sidecar 读取按 parent 内最多 8 个 worker 并行。迁移不会复制 materialized seismic views。
-
-完整迁移命令：
-
-```powershell
-$env:PYTHONPATH = (Join-Path (Get-Location) "src")
-python scripts\migrate_synthoseis_structured_v1.py `
-  --source-run experiments\synthoseis_lite\results\20260725\generate_field_conditioned `
-  --output-dir experiments\synthoseis_lite\results\20260725\generate_field_conditioned_structured `
-  --oracle-parent-count 3
-```
-
-中断后恢复：
-
-```powershell
-$env:PYTHONPATH = (Join-Path (Get-Location) "src")
-python scripts\migrate_synthoseis_structured_v1.py `
-  --source-run experiments\synthoseis_lite\results\20260725\generate_field_conditioned `
-  --output-dir experiments\synthoseis_lite\results\20260725\generate_field_conditioned_structured `
-  --resume `
-  --oracle-parent-count 3
-```
-
-迁移门禁：
-
-- parent 数为 1360；
-- source HDF5 与 sidecar 的字段级 parity 全部通过；
-- realization index 与 HDF5 parent 集合一致；
-- 每个 parent 标记 complete；
-- 新 HDF5 不含 `seismic_views`；
-- 抽样 Oracle 通过；
-- reader 只读取迁移后的 HDF5 和 realization index。
-
-2026-07-25 迁移结果：1360 个 parent 全部提交，realization index 与
-HDF5 parent 集合一致，staging group 为空，抽样 3 个 parent 的 Oracle
-通过。阶段 1 以
-`experiments/synthoseis_lite/results/20260725/generate_field_conditioned_structured`
-为训练 artifact。
 
 ## 5. 阶段 1：合成监督结构化模型
 
-状态：阶段 0、完整迁移和 sampled Oracle 已通过，可以开始实现。
+状态：阶段 0、完整迁移和 sampled Oracle 已通过；第一步代码与 CPU smoke 已落地。
 
 预计生产代码量：2200–3500 行。
 
 阶段 1 在同一个阶段内完成单道闭环、exact HSMM、横向模型和 dirty holdout，不增加子阶段编号。
+
+阶段 1 建议正好拆成三次实现，不再细分成 1A/1B。这三步是工程落地顺序，不是新的科学阶段。
+
+| 实现步骤 | 闭环目标 | 预计代码量 |
+|---|---|---:|
+| 1 | LFM 换基 + dataset + teacher forcing | 700–1000 行 |
+| 2 | 单道 exact HSMM 完整推理 | 800–1200 行 |
+| 3 | 横向模型 + dirty calibration + 最终门禁 | 800–1300 行 |
+
+总计约 2300–3500 行，与当前规格基本一致。
+
+### 第一步：先证明“三参数真的能学”
+
+实现位于 `src/ginn_v2/anchor.py`、`data.py`、`model.py` 和
+`training.py`。运行入口为
+`scripts/structured_ginn_v2_stage1_step1.py`，配置为
+`experiments/ginn_v2/stage1_step1.yaml`。
+
+最小 smoke：
+
+```powershell
+python scripts\structured_ginn_v2_stage1_step1.py `
+  --config experiments\ginn_v2\stage1_step1.yaml `
+  --output-dir tmp\ginn_v2_stage1_step1_smoke `
+  --smoke
+```
+
+范围：
+
+- `anchor_to_lfm()` 离散精确换基；
+- basis rank、condition、clipping 和监督 mask；
+- parent-level split manifest；
+- 单道 dataset；
+- truth segment + boundary jitter；
+- 最小垂向 encoder 和 parameter head；
+- LFM-anchored Torch decoder；
+- teacher-forcing 训练与评价。
+
+这一轮不实现 HSMM，不预测边界，也不做横向 patch。
+
+闭环是：
+
+```text
+seismic + full LFM
+→ vertical encoder
+→ truth/jitter segments 上 pooling
+→ c0/c1/c2 distributions
+→ LFM-anchored decoder
+→ high-resolution / projected AI
+```
+
+验收：
+
+- 换基和 decoder parity 通过；
+- singleton、rank-2、clipping segment 正确切换为 profile-only supervision；
+- split 不泄漏；
+- tiny batch 可以过拟合；
+- teacher-forced 模型在可识别参数和 decoded AI 上明显优于 anchor-only。
+
+这一步回答最基础的问题：在分段已知时，输入里有没有足够信息恢复三参数。如果这里都学不好，没必要先写 HSMM。
+
+### 第二步：完成单道 Structured 模型
+
+范围：
+
+- emission/boundary head；
+- exact HSMM MAP；
+- forward-backward marginals；
+- zone-fraction duration prior；
+- `encode_patch()` 与 `parameterize_segments()` 两遍 interface；
+- predicted MAP segmentation 的端到端验证；
+- full model 与配对 no-seismic control；
+- single-trace clean holdout 报告。
+
+patch interface 此时可以使用宽度 1，避免以后更改模型入口。
+
+闭环是：
+
+```text
+single trace
+→ emission/boundary potentials
+→ exact HSMM
+→ unique predicted segments
+→ parameter head
+→ decoded structured AI
+```
+
+验收：
+
+- 小序列与 brute-force HSMM 完全一致；
+- MAP、marginals 和 duration prior 正确；
+- parameter head 仍只用 truth+jitter 训练；
+- predicted segments 可以生成唯一、合法的参数表；
+- full model 相对 no-seismic 出现明确的正向趋势；
+- segment count、boundary F1、segment IoU 和 projected AI 没有结构性异常。
+
+这一步结束后，已经有一个真正可运行的单道三参数半马尔科夫网络。
+
+### 第三步：加入横向能力和 sim-to-real 防线
+
+范围：
+
+- 21 道、米制距离 patch；
+- masked lateral mixer；
+- event identity 与 topology mask；
+- 横向 consistency；
+- observation augmentation profile；
+- clean/dirty 固定配对；
+- matched center、neighbor、parent shuffle；
+- posterior/variance/evidence calibration；
+- full-LFM、anchor、no-seismic、single-trace、lateral 全部 baseline；
+- geometry holdout 最终门禁；
+- 冻结供阶段 2 使用的 full/no-seismic checkpoints。
+
+闭环是：
+
+```text
+21-trace clean/dirty patch
+→ lateral Structured model
+→ calibration
+→ geometry holdout
+→ frozen real-field checkpoints
+```
+
+验收就是文档目前规定的完整阶段 1 门禁：
+
+- AI 增量价值通过；
+- seismic contribution 通过；
+- lateral contribution 通过；
+- dirty 输入不引起系统性合并或过度切分；
+- 不增加 pinchout false-bridging；
+- 不确定性和 `seismic_support_score` 完成冻结校准。
+
+这样切的好处是每一步都有完整可运行产物：
+
+1. 三参数恢复器；
+2. 单道 Structured 反演器；
+3. 可进入真实工区的横向冻结模型。
+
+我不建议把 augmentation 单独拆成第四步，因为它和横向模型、calibration、最终门禁高度耦合；单独实现只会产生一套暂时无法科学验收的中间合同。
 
 ### 5.1 Zone-linear LFM anchor 与离散换基
 

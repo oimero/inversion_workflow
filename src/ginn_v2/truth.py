@@ -690,7 +690,7 @@ class StructuredTruthAdapter:
         xline_step: float | None = None,
         identity: Mapping[str, Any] | None = None,
     ) -> StructuredSample:
-        """Build Stage 1 truth from the producer-owned no-increment record."""
+        """Build Stage 1 truth from the producer-owned structured record."""
         from cup.synthetic.core.records import StructuredSampleRecord
 
         if not isinstance(record, StructuredSampleRecord):

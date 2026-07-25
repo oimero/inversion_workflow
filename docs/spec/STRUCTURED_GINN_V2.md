@@ -140,6 +140,15 @@ python scripts\structured_ginn_v2_stage1_step1.py `
 
 这一轮不实现 HSMM，不预测边界，也不做横向 patch。
 
+训练的独立覆盖单位是 parent。每个 epoch 遍历全部 training parents，但每个
+parent 在每个 zone 只分层抽取 8 条 lateral traces；抽样位置随 epoch 轮换。
+tuning validation 使用冻结 identity。默认最多训练 10 epochs，至少训练
+3 epochs，连续 2 epochs 未改善后 early stop。最佳 checkpoint 最后在全部
+tuning lateral traces 上运行一次完整评价。
+
+训练日志每 10 个 parents 报告 batch/sample 数、数据准备时间、模型计算时间、
+累计耗时和 ETA，不等待完整 epoch 才刷新。
+
 闭环是：
 
 ```text

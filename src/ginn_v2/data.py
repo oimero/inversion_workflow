@@ -385,6 +385,7 @@ class TeacherForcingDataModule:
         parent_id: str,
         *,
         rng: np.random.Generator,
+        samples_per_zone: int | None,
         maximum_samples: int | None,
     ) -> list[LfmAnchoredStructuredSample]:
         parent = self.benchmark.read_parent(parent_id)
@@ -395,6 +396,27 @@ class TeacherForcingDataModule:
                 if bool(row.get("zone_valid", True))
             }
         )
+        if samples_per_zone is not None:
+            selected_by_zone: list[tuple[int, str]] = []
+            zone_ids = sorted({zone_id for _, zone_id in keys})
+            for zone_id in zone_ids:
+                zone_keys = [
+                    key for key in keys if key[1] == zone_id
+                ]
+                count = min(int(samples_per_zone), len(zone_keys))
+                if count == len(zone_keys):
+                    selected_by_zone.extend(zone_keys)
+                    continue
+                phase = float(rng.random())
+                positions = np.floor(
+                    (np.arange(count, dtype=np.float64) + phase)
+                    * len(zone_keys)
+                    / count
+                ).astype(np.int64)
+                if np.unique(positions).size != count:
+                    raise RuntimeError("stratified lateral sampling produced duplicates.")
+                selected_by_zone.extend(zone_keys[int(index)] for index in positions)
+            keys = sorted(selected_by_zone)
         if maximum_samples is not None and len(keys) > maximum_samples:
             selected = rng.choice(len(keys), size=int(maximum_samples), replace=False)
             keys = [keys[int(index)] for index in sorted(selected)]
@@ -422,9 +444,14 @@ class TeacherForcingDataModule:
         shuffle: bool,
         seed: int,
         maximum_parents: int | None = None,
+        samples_per_zone_per_parent: int | None = None,
         maximum_samples_per_parent: int | None = None,
         boundary_jitter_samples: int = 0,
     ) -> Iterator[TeacherForcingBatch]:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if samples_per_zone_per_parent is not None and samples_per_zone_per_parent <= 0:
+            raise ValueError("samples_per_zone_per_parent must be positive when supplied.")
         parent_ids = list(self.split_manifest.parent_ids(split))
         rng = np.random.default_rng(int(seed))
         if maximum_parents is not None:
@@ -435,6 +462,7 @@ class TeacherForcingDataModule:
             samples = self._parent_samples(
                 parent_id,
                 rng=rng,
+                samples_per_zone=samples_per_zone_per_parent,
                 maximum_samples=maximum_samples_per_parent,
             )
             if shuffle:

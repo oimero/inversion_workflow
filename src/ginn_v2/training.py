@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import logging
 from pathlib import Path
 import random
+import time
 from typing import Any, Mapping
 
 import numpy as np
@@ -34,13 +36,17 @@ RUN_SCHEMA = "structured_ginn_v2_stage1_step1_v1"
 @dataclass(frozen=True)
 class TeacherForcingTrainingConfig:
     seed: int = 20260725
-    epochs: int = 20
+    epochs: int = 10
+    minimum_epochs: int = 3
+    early_stopping_patience: int = 2
     batch_size: int = 16
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     gradient_clip_norm: float = 5.0
     boundary_jitter_samples: int = 2
     condition_limit: float = 100.0
+    samples_per_zone_per_parent: int | None = 8
+    progress_log_every_parents: int = 10
     device: str = "auto"
     maximum_training_parents: int | None = None
     maximum_validation_parents: int | None = None
@@ -49,9 +55,22 @@ class TeacherForcingTrainingConfig:
     maximum_validation_batches: int | None = None
 
     def __post_init__(self) -> None:
-        for name in ("epochs", "batch_size"):
+        for name in (
+            "epochs",
+            "minimum_epochs",
+            "early_stopping_patience",
+            "batch_size",
+            "progress_log_every_parents",
+        ):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive.")
+        if self.minimum_epochs > self.epochs:
+            raise ValueError("minimum_epochs cannot exceed epochs.")
+        if (
+            self.samples_per_zone_per_parent is not None
+            and int(self.samples_per_zone_per_parent) <= 0
+        ):
+            raise ValueError("samples_per_zone_per_parent must be positive when supplied.")
         for name in (
             "maximum_training_parents",
             "maximum_validation_parents",
@@ -147,6 +166,9 @@ def _run_epoch(
     device: torch.device,
     epoch: int,
     optimizer: torch.optim.Optimizer | None,
+    logger: logging.Logger,
+    samples_per_zone_per_parent: int | None,
+    phase_name: str,
 ) -> dict[str, float | int | list[float]]:
     training = optimizer is not None
     model.train(training)
@@ -176,6 +198,11 @@ def _run_epoch(
     parameter_targets: list[list[float]] = [[], [], []]
     parameter_predictions: list[list[float]] = [[], [], []]
     fixed_debug_identity = training and options.maximum_training_batches is not None
+    available_parents = len(data.split_manifest.parent_ids(split))
+    expected_parents = min(
+        available_parents,
+        available_parents if maximum_parents is None else int(maximum_parents),
+    )
     iterator = data.iter_batches(
         split,
         batch_size=options.batch_size,
@@ -188,17 +215,62 @@ def _run_epoch(
             else options.seed + 500_000
         ),
         maximum_parents=maximum_parents,
+        samples_per_zone_per_parent=samples_per_zone_per_parent,
         maximum_samples_per_parent=options.maximum_samples_per_parent,
         boundary_jitter_samples=(
             options.boundary_jitter_samples if training else 0
         ),
     )
+    wall_start = time.perf_counter()
+    previous_batch_end = wall_start
+    data_prepare_seconds = 0.0
+    model_step_seconds = 0.0
+    completed_parents = 0
+    current_parent: str | None = None
+    sample_count = 0
+
+    def log_progress(*, force: bool = False) -> None:
+        if completed_parents == 0:
+            return
+        interval = options.progress_log_every_parents
+        if not force and completed_parents % interval != 0:
+            return
+        elapsed = time.perf_counter() - wall_start
+        rate = completed_parents / max(elapsed, np.finfo(np.float64).eps)
+        remaining = max(expected_parents - completed_parents, 0)
+        eta = remaining / max(rate, np.finfo(np.float64).eps)
+        logger.info(
+            "%s epoch %d | parents=%d/%d | batches=%d | samples=%d | "
+            "data=%.1fs | model=%.1fs | elapsed=%.1fs | eta=%.1fs",
+            phase_name,
+            epoch + 1,
+            completed_parents,
+            expected_parents,
+            totals["batch_count"],
+            sample_count,
+            data_prepare_seconds,
+            model_step_seconds,
+            elapsed,
+            eta,
+        )
+
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
         for batch_index, numpy_batch in enumerate(iterator):
+            batch_ready = time.perf_counter()
+            data_prepare_seconds += batch_ready - previous_batch_end
             if _batch_limit_reached(batch_index, maximum_batches):
                 break
+            parent_id = numpy_batch.sample_keys[0].rsplit("|", 2)[0]
+            if current_parent is None:
+                current_parent = parent_id
+            elif parent_id != current_parent:
+                completed_parents += 1
+                log_progress()
+                current_parent = parent_id
+            step_start = time.perf_counter()
             batch = batch_to_torch(numpy_batch, device=device)
+            sample_count += numpy_batch.batch_size
             if training:
                 optimizer.zero_grad(set_to_none=True)
             output = model(batch)
@@ -257,6 +329,11 @@ def _run_epoch(
                     .cpu()
                     .tolist()
                 )
+            model_step_seconds += time.perf_counter() - step_start
+            previous_batch_end = time.perf_counter()
+    if current_parent is not None:
+        completed_parents += 1
+        log_progress(force=True)
     if totals["batch_count"] == 0:
         raise ValueError(f"split {split!r} produced no teacher-forcing batches.")
     correlations: list[float] = []
@@ -298,6 +375,11 @@ def _run_epoch(
         "highres_count": totals["highres_count"],
         "projected_count": totals["projected_count"],
         "batch_count": totals["batch_count"],
+        "parent_count": completed_parents,
+        "sample_count": sample_count,
+        "data_prepare_seconds": data_prepare_seconds,
+        "model_step_seconds": model_step_seconds,
+        "elapsed_seconds": time.perf_counter() - wall_start,
         "parameter_mae": parameter_mae,
         "parameter_correlation": correlations,
     }
@@ -335,10 +417,13 @@ def run_stage1_step1(
     )
     device, runtime = resolve_device(config.training.device)
     logger.info(
-        "stage1 step1 start | device=%s | training_parents=%d | tuning_parents=%d",
+        "stage1 step1 start | device=%s | training_parents=%d | "
+        "tuning_parents=%d | samples_per_zone_parent=%s | max_epochs=%d",
         device,
         len(split_manifest.training),
         len(split_manifest.tuning_validation),
+        config.training.samples_per_zone_per_parent,
+        config.training.epochs,
     )
     model = TeacherForcedParameterModel(config.model).to(device)
     optimizer = torch.optim.AdamW(
@@ -349,6 +434,8 @@ def run_stage1_step1(
     history: list[dict[str, Any]] = []
     best_loss = float("inf")
     best_epoch = -1
+    epochs_without_improvement = 0
+    stopped_early = False
     checkpoint_path = output / "stage1_step1_checkpoint.pt"
     for epoch in range(config.training.epochs):
         training_metrics = _run_epoch(
@@ -359,6 +446,11 @@ def run_stage1_step1(
             device=device,
             epoch=epoch,
             optimizer=optimizer,
+            logger=logger,
+            samples_per_zone_per_parent=(
+                config.training.samples_per_zone_per_parent
+            ),
+            phase_name="training",
         )
         validation_metrics = _run_epoch(
             model,
@@ -368,6 +460,11 @@ def run_stage1_step1(
             device=device,
             epoch=epoch,
             optimizer=None,
+            logger=logger,
+            samples_per_zone_per_parent=(
+                config.training.samples_per_zone_per_parent
+            ),
+            phase_name="tuning",
         )
         history.append(
             {
@@ -390,6 +487,7 @@ def run_stage1_step1(
         if validation_loss < best_loss:
             best_loss = validation_loss
             best_epoch = epoch + 1
+            epochs_without_improvement = 0
             _atomic_torch_save(
                 {
                     "schema": RUN_SCHEMA,
@@ -402,6 +500,44 @@ def run_stage1_step1(
                 },
                 checkpoint_path,
             )
+        else:
+            epochs_without_improvement += 1
+        if (
+            epoch + 1 >= config.training.minimum_epochs
+            and epochs_without_improvement
+            >= config.training.early_stopping_patience
+        ):
+            stopped_early = True
+            logger.info(
+                "early stopping | epoch=%d | best_epoch=%d | "
+                "epochs_without_improvement=%d",
+                epoch + 1,
+                best_epoch,
+                epochs_without_improvement,
+            )
+            break
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=True,
+    )
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    logger.info(
+        "full tuning evaluation start | best_epoch=%d | all lateral traces",
+        best_epoch,
+    )
+    full_tuning_metrics = _run_epoch(
+        model,
+        data,
+        split="tuning_validation",
+        config=config,
+        device=device,
+        epoch=best_epoch - 1,
+        optimizer=None,
+        logger=logger,
+        samples_per_zone_per_parent=None,
+        phase_name="tuning-full",
+    )
     report = {
         "schema": RUN_SCHEMA,
         "status": "complete",
@@ -411,7 +547,10 @@ def run_stage1_step1(
         "impedance_calibration": str(config.impedance_calibration),
         "best_epoch": best_epoch,
         "best_tuning_validation_loss": best_loss,
+        "stopped_early": stopped_early,
+        "epochs_completed": len(history),
         "history": history,
+        "full_tuning_evaluation": full_tuning_metrics,
         "model": config.model.to_dict(),
         "loss": asdict(config.loss),
         "training": asdict(config.training),

@@ -68,8 +68,11 @@ def main() -> None:
             training=replace(
                 config.training,
                 epochs=2,
+                minimum_epochs=2,
+                early_stopping_patience=1,
                 batch_size=2,
                 boundary_jitter_samples=1,
+                progress_log_every_parents=1,
                 device="cpu",
                 maximum_training_parents=1,
                 maximum_validation_parents=1,

@@ -418,10 +418,12 @@ def run_stage1_step1(
     device, runtime = resolve_device(config.training.device)
     logger.info(
         "stage1 step1 start | device=%s | training_parents=%d | "
-        "tuning_parents=%d | samples_per_zone_parent=%s | max_epochs=%d",
+        "tuning_parents=%d | use_seismic=%s | "
+        "samples_per_zone_parent=%s | max_epochs=%d",
         device,
         len(split_manifest.training),
         len(split_manifest.tuning_validation),
+        config.model.use_seismic,
         config.training.samples_per_zone_per_parent,
         config.training.epochs,
     )

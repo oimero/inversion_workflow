@@ -97,78 +97,6 @@ positive_direction = increasing_time
 
 状态：阶段 0、完整迁移和 sampled Oracle 已通过；第一步代码与 CPU smoke 已落地。
 
-预计生产代码量：2200–3500 行。
-
-阶段 1 在同一个阶段内完成单道闭环、exact HSMM、横向模型和 dirty holdout，不增加子阶段编号。
-
-阶段 1 建议正好拆成三次实现，不再细分成 1A/1B。这三步是工程落地顺序，不是新的科学阶段。
-
-| 实现步骤 | 闭环目标 | 预计代码量 |
-|---|---|---:|
-| 1 | LFM 换基 + dataset + teacher forcing | 700–1000 行 |
-| 2 | 单道 exact HSMM 完整推理 | 800–1200 行 |
-| 3 | 横向模型 + dirty calibration + 最终门禁 | 800–1300 行 |
-
-总计约 2300–3500 行，与当前规格基本一致。
-
-### 第一步：先证明“三参数真的能学”
-
-实现位于 `src/ginn_v2/anchor.py`、`data.py`、`model.py` 和
-`training.py`。运行入口为
-`scripts/structured_ginn_v2_stage1_step1.py`，配置为
-`experiments/ginn_v2/stage1_step1.yaml`。
-
-最小 smoke：
-
-```powershell
-python scripts\structured_ginn_v2_stage1_step1.py `
-  --config experiments\ginn_v2\stage1_step1.yaml `
-  --output-dir tmp\ginn_v2_stage1_step1_smoke `
-  --smoke
-```
-
-范围：
-
-- `anchor_to_lfm()` 离散精确换基；
-- basis rank、condition、clipping 和监督 mask；
-- parent-level split manifest；
-- 单道 dataset；
-- truth segment + boundary jitter；
-- 最小垂向 encoder 和 parameter head；
-- LFM-anchored Torch decoder；
-- teacher-forcing 训练与评价。
-
-这一轮不实现 HSMM，不预测边界，也不做横向 patch。
-
-训练的独立覆盖单位是 parent。每个 epoch 遍历全部 training parents，但每个
-parent 在每个 zone 只分层抽取 8 条 lateral traces；抽样位置随 epoch 轮换。
-tuning validation 使用冻结 identity。默认最多训练 10 epochs，至少训练
-3 epochs，连续 2 epochs 未改善后 early stop。最佳 checkpoint 最后在全部
-tuning lateral traces 上运行一次完整评价。
-
-训练日志每 10 个 parents 报告 batch/sample 数、数据准备时间、模型计算时间、
-累计耗时和 ETA，不等待完整 epoch 才刷新。
-
-闭环是：
-
-```text
-seismic + full LFM
-→ vertical encoder
-→ truth/jitter segments 上 pooling
-→ c0/c1/c2 distributions
-→ LFM-anchored decoder
-→ high-resolution / projected AI
-```
-
-验收：
-
-- 换基和 decoder parity 通过；
-- singleton、rank-2、clipping segment 正确切换为 profile-only supervision；
-- split 不泄漏；
-- tiny batch 可以过拟合；
-- teacher-forced 模型在可识别参数和 decoded AI 上明显优于 anchor-only。
-
-这一步回答最基础的问题：在分段已知时，输入里有没有足够信息恢复三参数。如果这里都学不好，没必要先写 HSMM。
 
 ### 第二步：完成单道 Structured 模型
 
@@ -180,7 +108,7 @@ seismic + full LFM
 - zone-fraction duration prior；
 - `encode_patch()` 与 `parameterize_segments()` 两遍 interface；
 - predicted MAP segmentation 的端到端验证；
-- full model 与配对 no-seismic control；
+- 继承第一步冻结的 full/no-seismic checkpoints；
 - single-trace clean holdout 报告。
 
 patch interface 此时可以使用宽度 1，避免以后更改模型入口。

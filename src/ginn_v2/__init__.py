@@ -16,6 +16,11 @@ from ginn_v2.data import (
     collate_teacher_forcing_samples,
     freeze_parent_split_manifest,
 )
+from ginn_v2.controls import (
+    StateDurationBaseline,
+    fit_state_duration_baseline,
+    run_stage1_step1_controls,
+)
 from ginn_v2.decoder import (
     DecoderResult,
     RawSegmentParameters,
@@ -66,6 +71,7 @@ __all__ = [
     "ProjectionResult",
     "RawSegmentParameters",
     "SegmentTruth",
+    "StateDurationBaseline",
     "StructuredSample",
     "StructuredTruthAdapter",
     "TeacherForcedParameterModel",
@@ -86,11 +92,13 @@ __all__ = [
     "decode_torch",
     "forward_numpy",
     "forward_torch",
+    "fit_state_duration_baseline",
     "freeze_parent_split_manifest",
     "load_zone_ai_bounds",
     "project_log_ai_to_model_grid",
     "resolve_device",
     "run_artifact_oracle",
     "run_oracle",
+    "run_stage1_step1_controls",
     "teacher_forcing_loss",
 ]

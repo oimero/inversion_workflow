@@ -10,6 +10,11 @@ Usage::
         --config experiments/ginn_v2/stage1_step1.yaml \
         --output-dir experiments/ginn_v2/results/smoke \
         --smoke
+
+    python scripts/structured_ginn_v2_stage1_step1.py \
+        --config experiments/ginn_v2/stage1_step1.yaml \
+        --output-dir experiments/ginn_v2/results/no_seismic \
+        --input-mode no-seismic
 """
 
 from __future__ import annotations
@@ -38,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
+        "--input-mode",
+        choices=("full", "no-seismic"),
+        default="full",
+        help="Train the full input model or the paired LFM-only control.",
+    )
+    parser.add_argument(
         "--smoke",
         action="store_true",
         help="Run two tiny CPU epochs over one parent and four samples.",
@@ -61,6 +72,13 @@ def main() -> None:
     config = Stage1Step1Config.from_mapping(
         section["stage1_step1"],
         root=REPO_ROOT,
+    )
+    config = replace(
+        config,
+        model=replace(
+            config.model,
+            use_seismic=args.input_mode == "full",
+        ),
     )
     if args.smoke:
         config = replace(

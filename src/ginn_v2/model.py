@@ -26,8 +26,11 @@ class TeacherForcingModelConfig:
     lfm_residual_scale: float = 0.1
     minimum_parameter_std: float = 1e-3
     maximum_parameter_std: float = 0.5
+    use_seismic: bool = True
 
     def __post_init__(self) -> None:
+        if not isinstance(self.use_seismic, bool):
+            raise TypeError("use_seismic must be boolean.")
         for name in (
             "feature_channels",
             "encoder_blocks",
@@ -214,9 +217,14 @@ class TeacherForcedParameterModel(nn.Module):
 
     def encode_trace(self, batch: TorchTeacherForcingBatch) -> torch.Tensor:
         mask = batch.observed_valid.unsqueeze(1)
+        seismic = (
+            batch.seismic
+            if self.config.use_seismic
+            else torch.zeros_like(batch.seismic)
+        )
         inputs = torch.stack(
             (
-                batch.seismic / self.config.seismic_scale,
+                seismic / self.config.seismic_scale,
                 batch.lfm_residual / self.config.lfm_residual_scale,
                 batch.observed_valid.to(dtype=batch.seismic.dtype),
             ),

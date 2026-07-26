@@ -24,13 +24,14 @@ from ginn_v2.model import (
     TeacherForcingLossConfig,
     TeacherForcingModelConfig,
     batch_to_torch,
+    interface_polarity_classes,
     project_highres_torch,
     teacher_forcing_loss,
 )
 from ginn_v2.runtime import configure_training_logger, resolve_device
 
 
-RUN_SCHEMA = "structured_ginn_v2_stage1_step1_v1"
+RUN_SCHEMA = "structured_ginn_v2_stage1_step1_v2"
 
 
 @dataclass(frozen=True)
@@ -169,7 +170,7 @@ def _run_epoch(
     logger: logging.Logger,
     samples_per_zone_per_parent: int | None,
     phase_name: str,
-) -> dict[str, float | int | list[float]]:
+) -> dict[str, Any]:
     training = optimizer is not None
     model.train(training)
     options = config.training
@@ -191,12 +192,19 @@ def _run_epoch(
         "parameter_count": 0,
         "highres_count": 0,
         "projected_count": 0,
+        "interface_jump_nll": 0.0,
+        "interface_polarity_loss": 0.0,
+        "interface_jump_count": 0,
+        "interface_polarity_correct": 0,
+        "decoded_interface_jump_absolute_error": 0.0,
         "batch_count": 0,
         "anchor_squared_error": 0.0,
         "anchor_count": 0,
     }
     parameter_targets: list[list[float]] = [[], [], []]
     parameter_predictions: list[list[float]] = [[], [], []]
+    interface_jump_targets: list[float] = []
+    interface_jump_predictions: list[float] = []
     fixed_debug_identity = training and options.maximum_training_batches is not None
     available_parents = len(data.split_manifest.parent_ids(split))
     expected_parents = min(
@@ -297,6 +305,15 @@ def _run_epoch(
             totals["parameter_count"] += losses.parameter_count
             totals["highres_count"] += losses.highres_count
             totals["projected_count"] += losses.projected_count
+            totals["interface_jump_nll"] += (
+                float(losses.interface_jump_nll.detach().cpu())
+                * losses.interface_jump_count
+            )
+            totals["interface_polarity_loss"] += (
+                float(losses.interface_polarity_loss.detach().cpu())
+                * losses.interface_jump_count
+            )
+            totals["interface_jump_count"] += losses.interface_jump_count
             totals["batch_count"] += 1
             anchor_projected, anchor_support = project_highres_torch(
                 torch.where(
@@ -329,6 +346,42 @@ def _run_epoch(
                     .cpu()
                     .tolist()
                 )
+            if (
+                output.interface_jump_mean is not None
+                and output.interface_polarity_logits is not None
+            ):
+                jump_valid = batch.interface_jump_valid
+                interface_jump_targets.extend(
+                    batch.interface_jump_target[jump_valid].detach().cpu().tolist()
+                )
+                interface_jump_predictions.extend(
+                    output.interface_jump_mean[jump_valid].detach().cpu().tolist()
+                )
+                target_polarity = interface_polarity_classes(
+                    batch.interface_jump_target,
+                    zero_tolerance=config.loss.interface_jump_zero_tolerance,
+                )
+                predicted_polarity = torch.argmax(
+                    output.interface_polarity_logits,
+                    dim=1,
+                )
+                totals["interface_polarity_correct"] += int(
+                    torch.count_nonzero(
+                        (predicted_polarity == target_polarity) & jump_valid
+                    ).item()
+                )
+                previous = torch.roll(output.decoded_highres, shifts=1, dims=1)
+                decoded_jump = output.decoded_highres - previous
+                totals["decoded_interface_jump_absolute_error"] += float(
+                    torch.sum(
+                        torch.abs(
+                            decoded_jump[jump_valid]
+                            - batch.interface_jump_target[jump_valid]
+                        )
+                    )
+                    .detach()
+                    .cpu()
+                )
             model_step_seconds += time.perf_counter() - step_start
             previous_batch_end = time.perf_counter()
     if current_parent is not None:
@@ -338,6 +391,9 @@ def _run_epoch(
         raise ValueError(f"split {split!r} produced no teacher-forcing batches.")
     correlations: list[float] = []
     parameter_mae: list[float] = []
+    parameter_rmse: list[float] = []
+    parameter_r_squared: list[float] = []
+    parameter_sign_accuracy: list[float] = []
     for targets, predictions in zip(
         parameter_targets, parameter_predictions, strict=True
     ):
@@ -346,11 +402,44 @@ def _run_epoch(
         parameter_mae.append(
             float(np.mean(np.abs(left - right))) if left.size else float("nan")
         )
+        squared_error = float(np.sum((left - right) ** 2))
+        parameter_rmse.append(
+            float(np.sqrt(squared_error / left.size))
+            if left.size
+            else float("nan")
+        )
+        target_variance_mass = float(np.sum((left - np.mean(left)) ** 2))
+        parameter_r_squared.append(
+            1.0 - squared_error / target_variance_mass
+            if target_variance_mass > 0.0
+            else float("nan")
+        )
+        sign_mask = np.abs(left) > 1e-6
+        parameter_sign_accuracy.append(
+            float(np.mean(np.sign(left[sign_mask]) == np.sign(right[sign_mask])))
+            if np.any(sign_mask)
+            else float("nan")
+        )
         correlations.append(
             float(np.corrcoef(left, right)[0, 1])
             if left.size >= 2 and np.std(left) > 0.0 and np.std(right) > 0.0
             else float("nan")
         )
+    jump_target = np.asarray(interface_jump_targets, dtype=np.float64)
+    jump_prediction = np.asarray(interface_jump_predictions, dtype=np.float64)
+    jump_mae: float | None = None
+    jump_correlation: float | None = None
+    if jump_target.size:
+        jump_mae = float(np.mean(np.abs(jump_target - jump_prediction)))
+        if (
+            jump_target.size >= 2
+            and np.std(jump_target) > 0.0
+            and np.std(jump_prediction) > 0.0
+        ):
+            jump_correlation = float(
+                np.corrcoef(jump_target, jump_prediction)[0, 1]
+            )
+    jump_count = int(totals["interface_jump_count"])
     return {
         "loss": totals["loss"] / totals["batch_count"],
         "parameter_nll": totals["parameter_nll"]
@@ -374,6 +463,27 @@ def _run_epoch(
         "parameter_count": totals["parameter_count"],
         "highres_count": totals["highres_count"],
         "projected_count": totals["projected_count"],
+        "interface_jump_count": jump_count,
+        "interface_jump_nll": (
+            totals["interface_jump_nll"] / jump_count if jump_count else None
+        ),
+        "interface_polarity_loss": (
+            totals["interface_polarity_loss"] / jump_count
+            if jump_count
+            else None
+        ),
+        "interface_jump_mae": jump_mae,
+        "interface_jump_correlation": jump_correlation,
+        "interface_polarity_accuracy": (
+            totals["interface_polarity_correct"] / jump_count
+            if jump_count
+            else None
+        ),
+        "decoded_interface_jump_mae": (
+            totals["decoded_interface_jump_absolute_error"] / jump_count
+            if jump_count
+            else None
+        ),
         "batch_count": totals["batch_count"],
         "parent_count": completed_parents,
         "sample_count": sample_count,
@@ -381,7 +491,10 @@ def _run_epoch(
         "model_step_seconds": model_step_seconds,
         "elapsed_seconds": time.perf_counter() - wall_start,
         "parameter_mae": parameter_mae,
+        "parameter_rmse": parameter_rmse,
+        "parameter_r_squared": parameter_r_squared,
         "parameter_correlation": correlations,
+        "parameter_sign_accuracy": parameter_sign_accuracy,
     }
 
 
@@ -477,12 +590,17 @@ def run_stage1_step1(
         )
         logger.info(
             "epoch %d/%d | train_loss=%.6g | tuning_loss=%.6g | "
-            "tuning_projected_rmse=%.6g | anchor_rmse=%.6g",
+            "tuning_projected_rmse=%.6g | jump_mae=%s | anchor_rmse=%.6g",
             epoch + 1,
             config.training.epochs,
             float(training_metrics["loss"]),
             float(validation_metrics["loss"]),
             float(validation_metrics["projected_rmse"]),
+            (
+                f"{float(validation_metrics['interface_jump_mae']):.6g}"
+                if validation_metrics["interface_jump_mae"] is not None
+                else "n/a"
+            ),
             float(validation_metrics["anchor_projected_rmse"]),
         )
         validation_loss = float(validation_metrics["loss"])

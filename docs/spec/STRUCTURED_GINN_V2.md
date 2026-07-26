@@ -4,13 +4,15 @@
 
 第一版只回答一个问题：
 
-> 网络能否在完整 LFM 提供低频输入、zone-linear LFM anchor 提供 decoder 背景的前提下，通过三参数半马尔科夫表示和横向上下文，恢复连续、高分辨率且可标记证据来源的结构化 AI？
+> 网络能否在完整 LFM 提供低频输入、zone-linear LFM anchor 提供 decoder 背景的前提下，通过半马尔科夫结构、界面证据和横向上下文，恢复连续、高分辨率且可标记证据来源的结构化 AI？
 
 三参数对象表示为：
 
 ```text
 profile = c0 + c1 * (2ξ - 1) + c2 * sin(πξ)
 ```
+
+三参数是 generator、truth artifact 和 decoder 的精确坐标，不预设三个系数对带限地震具有相同可识别性。阶段 1 的主要交付是 state、boundary、interface jump 和 decoded profile；单系数只在证据支持时解释为可恢复参数。
 
 zone 背景表示为：
 
@@ -35,10 +37,12 @@ log_ai = background + profile
 - 21 道一维横向 patch；
 - clean seismic 和 LFM 两个输入通道；
 - 三状态 emission；
-- segment `c0/c1/c2` 监督；
-- MAP、state/boundary posterior 和参数方差。
+- boundary 与 signed interface jump 监督；
+- segment decoded profile 监督；
+- identifiable subset 的 `c0/c1/c2` 监督；
+- MAP、state/boundary posterior 和 jump/profile 方差。
 
-第一版的结果是参数恢复、状态恢复、持续时间恢复、横向连续性和证据来源诊断。真实工区只使用冻结模型推理。
+第一版的结果是结构恢复、界面变化、decoded profile、可识别参数、横向连续性和证据来源诊断。真实工区只使用冻结模型推理。
 
 波形 augmentation 属于模型训练侧。canonical dataset 保存 clean observation；训练时按显式随机 identity 在线生成 phase、shift、gain、static 和 noise 扰动。
 
@@ -95,88 +99,149 @@ positive_direction = increasing_time
 
 ## 5. 阶段 1：合成监督结构化模型
 
-状态：阶段 0、完整迁移和 sampled Oracle 已通过；第一步代码与 CPU smoke 已落地。
+状态：阶段 0、完整迁移和 sampled Oracle 已通过。2026-07-25 至 2026-07-26 的最小 teacher-forcing 审计已冻结；该审计不是新的实施步骤。
 
+前置审计使用 truth segment/state/duration 和 segment mean pooling。full model 相对 no-seismic 在 projected log-AI 上稳定改善，但参数恢复呈现明显分化：
 
-### 第二步：完成单道 Structured 模型
+```text
+c0 R² = 0.831
+c1 R² = 0.010
+c2 R² = 0.040
+```
 
-范围：
+这个结果证明 seismic 对 decoded profile 有贡献，也暴露了 mean pooling 与三参数 basis 不匹配。它不证明 `c1/c2` 对地震必然不可观测，因为：
 
-- emission/boundary head；
+- `2ξ-1` 在 segment 内均值为零，mean pooling 天然削弱 `c1` 证据；
+- `sin(πξ)` 的均值与常值项混合，mean pooling 难以分离 `c0/c2`；
+- truth state 已经提供了很强的 `c0` 条件信息。
+
+阶段 1 后续只分三步。
+
+### 第一步：可观测性对齐的单道 profile head
+
+预计新增生产代码 700–1100 行。
+
+使用宽度 1 的 `StructuredPatch`、truth segments 和合法 boundary jitter，建立 boundary-aware、basis-aware 的 segment parameterization。保留冻结的 mean-pooling full/no-seismic 结果作为旧实现对照，不把旧 checkpoint 直接视为新 head 的验收结果。
+
+segment evidence 至少包含：
+
+- segment interior mean feature；
+- top/bottom 的 inside/outside feature；
+- segment center feature；
+- 按 `1`、`2ξ-1` 和 `sin(πξ)` 加权的 feature moments；
+- state embedding、duration fraction 和 extent。
+
+top/bottom signed log-AI jump truth 与 polarity 由 structured truth 派生，只作为辅助监督和评价目标，绝不作为 parameter head 的输入。
+
+parameter head 继续输出 decoder 所需的 `c0/c1/c2` 分布，但主要监督和报告对象调整为：
+
+- decoded high-resolution profile；
+- projected 5 m log-AI；
+- top/bottom interface jump；
+- interface polarity；
+- identifiable subset 的单系数 likelihood。
+
+state 与 `c0` 采用层级关系：state 描述离散地质类别和序列拓扑，`c0` 描述给定 state 后的连续幅度。禁止并行生成互不约束的 state 与 `c0` 结论。
+
+第一步固定比较：
+
+- frozen mean-pooling full model；
+- boundary-aware full model；
+- 配对的 boundary-aware no-seismic；
+- state-duration analytic baseline。
+
+第一步验收要求：
+
+- boundary-aware full model 的 decoded profile 和 projected log-AI 不劣于 frozen mean-pooling full model；
+- full model 相对 no-seismic 的 profile、projected AI 或 interface jump 改善具有正的 parent-bootstrap 置信区间；
+- `c1/c2` 的结果按 R²、相关性、符号一致率、NLL 和 shuffle sensitivity 分别报告，不用三参数平均值汇总；
+- state/profile sign conflict、endpoint jump residual 和 decoder parity 没有结构性异常。
+
+如果 `c1/c2` 仍接近不可恢复，第一步内部增加一次 truth-boundary Oracle 可观测性诊断：
+
+```text
+truth boundaries + truth LFM
+→ 多初值优化 c0/c1/c2
+→ differentiable depth forward
+→ 参数、profile、projected AI 和多解离散度
+```
+
+该诊断只判断在结构完全正确时地震是否能区分三参数，不进入训练 loss，不产生候选排序，也不用于真实工区推理。诊断结论写入冻结 decision manifest：
+
+- Oracle 能恢复而网络不能恢复：保留三参数目标，继续改进证据汇聚或训练；
+- Oracle 也不能恢复：阶段 1 后续以 state、boundary、interface jump 和 decoded profile 为主输出，`c1/c2` 只保留为 generator/decoder 审计坐标；
+- 不允许仅根据一次神经网络回归失败直接删除三参数 truth 或 decoder。
+
+### 第二步：单道结构提案与 exact HSMM
+
+预计新增生产代码 1000–1600 行。
+
+在第一步冻结的 profile head interface 上增加：
+
+- 三状态 emission head；
+- boundary 与 interface polarity/jump evidence head；
 - exact HSMM MAP；
 - forward-backward marginals；
 - zone-fraction duration prior；
-- `encode_patch()` 与 `parameterize_segments()` 两遍 interface；
-- predicted MAP segmentation 的端到端验证；
-- 继承第一步冻结的 full/no-seismic checkpoints；
-- single-trace clean holdout 报告。
+- predicted MAP segmentation 的端到端验证。
 
-patch interface 此时可以使用宽度 1，避免以后更改模型入口。
-
-闭环是：
+单道闭环固定为：
 
 ```text
-single trace
-→ emission/boundary potentials
-→ exact HSMM
+single-trace StructuredPatch
+→ DirectionalEvidence
+→ exact HSMM MAP + marginals
 → unique predicted segments
-→ parameter head
-→ decoded structured AI
+→ boundary-aware parameterize_segments()
+→ LFM-anchored decoder
+→ CenterTracePosterior
 ```
 
-验收：
+parameter head 仍只使用 truth segments 和合法 boundary jitter 训练。predicted segments 只进入端到端验证，不实现 predicted/truth split/merge matching，也不让梯度穿过 MAP segmentation。
 
-- 小序列与 brute-force HSMM 完全一致；
-- MAP、marginals 和 duration prior 正确；
-- parameter head 仍只用 truth+jitter 训练；
-- predicted segments 可以生成唯一、合法的参数表；
-- full model 相对 no-seismic 出现明确的正向趋势；
-- segment count、boundary F1、segment IoU 和 projected AI 没有结构性异常。
+第一版只输出唯一 MAP segments 和 posterior marginals，不实现 top-K HSMM、beam search、物理排序或局部边界优化。只有当 MAP 失败主要来自明确的多峰结构 posterior 时，才在阶段 1 完成后重新讨论候选集合。
 
-这一步结束后，已经有一个真正可运行的单道三参数半马尔科夫网络。
+第二步验收要求：
 
-### 第三步：加入横向能力和 sim-to-real 防线
+- 小序列 MAP 与 brute-force 枚举完全一致；
+- forward-backward marginals 归一且与 brute-force 对照一致；
+- zone-fraction duration prior 在不同采样间隔下保持物理一致；
+- predicted segments 能生成唯一、合法的 segment/profile 表；
+- boundary F1、segment IoU、duration error、segment count bias 和 projected AI 没有结构性异常；
+- full model 相对 no-seismic 出现稳定的结构或 profile 增益。
 
-范围：
+### 第三步：横向能力和 sim-to-real 防线
 
-- 21 道、米制距离 patch；
+预计新增生产代码 1200–2000 行。
+
+将同一 interface 扩展到 21 道米制 patch，完成：
+
 - masked lateral mixer；
 - event identity 与 topology mask；
-- 横向 consistency；
+- topology-aware lateral consistency；
 - observation augmentation profile；
 - clean/dirty 固定配对；
-- matched center、neighbor、parent shuffle；
-- posterior/variance/evidence calibration；
-- full-LFM、anchor、no-seismic、single-trace、lateral 全部 baseline；
+- matched center、neighbor 和 parent shuffle；
+- posterior、variance 和 evidence calibration；
+- full-LFM、anchor、no-seismic、single-trace 和 lateral baseline；
 - geometry holdout 最终门禁；
-- 冻结供阶段 2 使用的 full/no-seismic checkpoints。
+- 供阶段 2 使用的冻结 full/no-seismic checkpoints。
 
-闭环是：
+闭环固定为：
 
 ```text
-21-trace clean/dirty patch
-→ lateral Structured model
+21-trace clean/dirty StructuredPatch
+→ lateral DirectionalEvidence
+→ exact HSMM
+→ boundary-aware segment profile
 → calibration
 → geometry holdout
 → frozen real-field checkpoints
 ```
 
-验收就是文档目前规定的完整阶段 1 门禁：
+第三步验收使用 5.6 节完整阶段 1 门禁：AI/profile 增量价值、seismic contribution、lateral contribution 和 clean/dirty 对称门禁分别通过；不增加 pinchout false-bridging；state/boundary posterior、profile variance 和 `seismic_support_score` 完成冻结校准。
 
-- AI 增量价值通过；
-- seismic contribution 通过；
-- lateral contribution 通过；
-- dirty 输入不引起系统性合并或过度切分；
-- 不增加 pinchout false-bridging；
-- 不确定性和 `seismic_support_score` 完成冻结校准。
-
-这样切的好处是每一步都有完整可运行产物：
-
-1. 三参数恢复器；
-2. 单道 Structured 反演器；
-3. 可进入真实工区的横向冻结模型。
-
-我不建议把 augmentation 单独拆成第四步，因为它和横向模型、calibration、最终门禁高度耦合；单独实现只会产生一套暂时无法科学验收的中间合同。
+augmentation、calibration 和 geometry holdout 属于同一个最终实施切片，不再拆出额外步骤。
 
 ### 5.1 Zone-linear LFM anchor 与离散换基
 
@@ -321,8 +386,18 @@ encode_patch(StructuredPatch) -> DirectionalEvidence
 DirectionalEvidence
 ├── emission_log_potential
 ├── boundary_log_potential
+├── interface_polarity_log_potential
+├── interface_jump_mean / log_scale
 └── center_feature_sequence
 ```
+
+`interface_jump` 的正方向固定为深度增加方向上的：
+
+```text
+q[j] = log_ai[j+] - log_ai[j-]
+```
+
+它只在界面两侧 truth 均合法、endpoint identity 明确时监督。polarity 分为 `increase/decrease/no_resolved_jump`；`no_resolved_jump` 是观测标签，不是额外 HSMM state。interface jump 是局部观测证据，state 是 segment 级序列变量，两者分别保留。
 
 参数化是独立的第二层 interface：
 
@@ -333,12 +408,16 @@ parameterize_segments(
 ) -> SegmentParameterDistributions
 ```
 
-`externally_supplied_segments` 必须包含 state、duration fraction 和 segment extent。parameter head 对每个 segment pooling feature，并显式接收：
+`externally_supplied_segments` 必须包含 state、duration fraction 和 segment extent。parameterization module 在内部构造 boundary-aware、basis-aware segment evidence，调用者不需要了解 pooling 实现。它至少使用：
 
 - state embedding；
 - duration fraction；
 - segment extent；
-- pooled feature。
+- interior mean、center feature；
+- top/bottom inside/outside feature；
+- 按 `1`、`2ξ-1` 和 `sin(πξ)` 加权的 feature moments。
+
+禁止只用无位置的 segment mean 作为 profile head 的唯一地震摘要。basis-aware moments 使用 segment 的实际离散 basis、endpoint convention 和 valid mask；top/bottom context 不越过 zone 或 observation support。
 
 完整单方向推理组合两个 interface：
 
@@ -355,9 +434,9 @@ implementation 包含：
 
 - 共享的逐道垂向编码器；
 - 使用相对米制距离和 lateral mask 的横向 mixer；
-- high-resolution 三状态 emission 与边界 head；
+- high-resolution 三状态 emission、boundary、interface polarity/jump head；
 - exact HSMM MAP 和 posterior marginals；
-- segment 三参数均值与受限方差 head；
+- boundary-aware segment 三参数均值与受限方差 head；
 - LFM-anchored Torch decoder。
 
 parameter head 训练只使用 truth segments 和合法 boundary jitter。对 `parameter_supervision_valid` segment 使用三参数 likelihood；对只有 `profile_supervision_valid` 的 segment，只通过 LFM-anchored decoder 监督离散 profile。predicted MAP 或 fused segments 只用于端到端验证和推理。第一版不实现 predicted/truth segment matching，不对 MAP segmentation 反向传播。
@@ -384,8 +463,9 @@ segment thickness / zone thickness
 首版没有 merge、unknown 或“低证据时删除薄层”的特殊状态。地震证据不足主要表现为：
 
 - state/boundary posterior 展宽；
-- 参数均值幅度减弱；
-- 参数方差增大；
+- interface jump evidence 变弱；
+- decoded profile 幅度减弱；
+- profile/参数方差增大；
 - matched-seismic intervention sensitivity 降低。
 
 在一个 parent 内，`(zone_id, object_id)` 是跨 lateral 的生成事件 identity。`object_id` 在 lateral loop 前分配，不是逐道重新编号；`lateral_index` 只标识该事件在某道上的实例。
@@ -400,20 +480,17 @@ dataset 在施加横向 consistency 前必须验证：
 
 ### 5.4 训练课程
 
-阶段 1 按以下顺序推进：
+训练课程与阶段 1 的三个实施步骤完全一致：
 
-1. 单道、true segmentation teacher forcing，验证换基参数和 decoder；
-2. 接入 exact HSMM，验证 MAP、forward-backward 和 posterior marginals；
-3. 在 truth segments 上训练 state-conditioned parameter head，并按 basis identifiability 区分参数 likelihood 与 profile loss；
-4. 加入保持顺序、state 和 supervision validity 的合法 boundary jitter；
-5. 加入横向 patch、邻道上下文和拓扑感知连续性目标；
-6. 加入真实工区统计约束的在线 waveform augmentation；
-7. 冻结 clean holdout 和固定随机 identity 的 dirty holdout。
+- 第一步只使用单道 truth+jitter segments，完成 boundary-aware profile、interface jump/polarity 和参数可观测性决策；
+- 第二步加入 state/boundary sequence supervision、exact HSMM 和 predicted-segment 端到端验证；
+- 第三步加入 lateral patch、topology-aware consistency、在线 waveform augmentation，并冻结 clean/dirty/calibration/geometry 合同。
 
 损失只作用于合法 mask，至少包含：
 
 - 三状态 emission 与 semi-Markov sequence likelihood；
 - boundary supervision；
+- interface jump likelihood 与 polarity supervision；
 - duration prior；
 - rebased `c0/c1/c2` 参数 likelihood，仅作用于 `parameter_supervision_valid`；
 - decoded high-resolution log-AI/profile loss，作用于 `profile_supervision_valid`；
@@ -422,7 +499,7 @@ dataset 在施加横向 consistency 前必须验证：
 
 横向一致性只约束具有相同 event identity 且 supervision-valid 的对象、状态和边界。pinchout、对象产生/消失和显式 topology transition 不施加跨事件平滑。
 
-阶段 1 不使用 forward seismic loss。
+阶段 1 训练不使用 forward seismic loss。第一步按需触发的 truth-boundary Oracle 只是一项可观测性诊断，不改变训练合同。
 
 ### 5.5 真实统计约束的观测扰动
 
@@ -484,9 +561,10 @@ evidence classification threshold 只在 dirty calibration set 上冻结。它�
 至少报告：
 
 - state accuracy、segment IoU 和 duration error；
-- identifiable subset 的 `c0/c1/c2` MAE、相关性、符号一致率、NLL 和区间 coverage；
+- boundary polarity accuracy、signed interface jump error 和 jump interval coverage；
 - 全部 `profile_supervision_valid` segment 的 decoded profile error；
 - decoded high-resolution 与 projected 5 m log-AI error；
+- identifiable subset 的 `c0/c1/c2` MAE、R²、相关性、符号一致率、NLL 和区间 coverage；
 - clean/dirty 配对性能差；
 - segment count bias；
 - false-positive/false-negative boundary rate；
@@ -495,7 +573,7 @@ evidence classification threshold 只在 dirty calibration set 上冻结。它�
 - pinchout false-bridging；
 - 横向粗糙度相对 truth 的偏差；
 - state/boundary posterior calibration；
-- 参数区间 calibration。
+- profile、jump 和 identifiable-parameter interval calibration。
 
 所有主模型与 baseline 的比较使用 parent 配对 bootstrap，并报告置信区间。
 
@@ -504,7 +582,9 @@ evidence classification threshold 只在 dirty calibration set 上冻结。它�
 - projected 5 m log-AI RMSE；
 - boundary F1；
 - segment IoU；
-- identifiable-parameter NLL。
+- decoded segment profile RMSE。
+
+interface jump/polarity 是观测对齐诊断；单系数指标只用于判断 decoder 坐标的可识别性。二者均完整报告，但不替代上述四个主门禁。
 
 baseline 按输出能力分工，不要求每个 baseline 在不具备的输出上参与比较：
 
@@ -516,7 +596,7 @@ baseline 按输出能力分工，不要求每个 baseline 在不具备的输出�
 **地震贡献**
 
 - 主模型相对 no-seismic control 在四个主门禁指标上的预先声明聚合结论为正；
-- matched center-seismic shuffle 后，主模型相对 no-seismic 的结构或参数收益下降；
+- matched center-seismic shuffle 后，主模型相对 no-seismic 的结构、interface jump 或 profile 收益下降；
 - parent-shuffle 后，地震贡献下降。
 
 **横向贡献**
@@ -534,9 +614,9 @@ baseline 按输出能力分工，不要求每个 baseline 在不具备的输出�
 - dirty 输入不会系统性增加 false-positive 或 false-negative boundary；
 - `non_seismic_supported` segment rate 不超过 calibration set 冻结上限；
 - dirty 输入不会增加 high-confidence wrong segment；
-- 证据变弱时 posterior 展宽且参数方差增大；
-- identifiable subset 的 `c0/c1/c2` 相关性不能全部为负；
-- dirty holdout 上的 posterior 与参数区间完成校准；
+- 证据变弱时 posterior 展宽，jump/profile 方差增大；
+- 第一步的参数可观测性 decision manifest 已冻结，阶段门禁对 `c1/c2` 的解释与该决定一致；
+- dirty holdout 上的 state/boundary posterior、jump/profile 区间和适用的参数区间完成校准；
 - geometry holdout 不出现与 development validation 相反的结论。
 
 如果模型在弱反射 dirty holdout 上通过系统性合并或过度切分 segment 获得更低误差，阶段 1 失败，不进入真实工区。
@@ -588,12 +668,12 @@ xline patch  → encode_patch() → xline DirectionalEvidence
 → 唯一 fused state sequence 和 fused segments
 ```
 
-第二遍只在 fused segments 上预测参数：
+第二遍只在 fused segments 上预测 profile：
 
 ```text
 parameterize_segments(inline features, fused segments)
 parameterize_segments(xline features, fused segments)
-→ directional parameter mixtures
+→ directional profile/parameter mixtures
 ```
 
 两个方向各自的 MAP segments 不进入参数融合，也不按 segment index 对齐。
@@ -638,7 +718,9 @@ directional_total_variance
 - MAP state sequence；
 - segment table；
 - state/boundary posterior；
-- zone-linear LFM anchor-relative `c0/c1/c2`；
+- interface polarity 与 signed interface jump；
+- decoded segment profile 及其区间；
+- zone-linear LFM anchor-relative `c0/c1/c2`，解释范围服从阶段 1 冻结的参数可观测性 decision manifest；
 - `directional_mixture_mean`；
 - `directional_total_variance`；
 - `within_direction_variance`；
@@ -653,7 +735,7 @@ directional_total_variance
 - matched-seismic intervention 的原始诊断量；
 - stitching weight、direction support 和 valid mask。
 
-`seismic_support_score` 根据 full model 相对 matched center-seismic intervention 的结构、参数和 profile 稳定性，在 synthetic dirty calibration set 上标定。`lfm_variant_sensitivity_score` 独立描述比例切片克里金 LFM 与趋势 LFM 两次推理之间的变化；两个分数不能合并为单一“先验支配度”。
+`seismic_support_score` 根据 full model 相对 matched center-seismic intervention 的结构、interface jump 和 profile 稳定性，在 synthetic dirty calibration set 上标定。`lfm_variant_sensitivity_score` 独立描述比例切片克里金 LFM 与趋势 LFM 两次推理之间的变化；两个分数不能合并为单一“先验支配度”。
 
 使用 synthetic dirty holdout 冻结的阈值，将每个 segment 保守标记为：
 
@@ -676,7 +758,7 @@ non_seismic_supported
 - 真实输入是否落在训练和 augmentation 的统计支持范围；
 - 所有有效位置是否具有 prediction support；
 - 是否存在 patch seam 或方向性条带；
-- segment 密度、duration 和参数分布是否落在 dirty synthetic 校准范围；
+- segment 密度、duration、jump/profile 及适用的参数分布是否落在 dirty synthetic 校准范围；
 - inline/xline direction disagreement 是否异常；
 - directional variance 分解是否有限且闭合；
 - `non_seismic_supported` 是否主要集中在弱反射或 OOD 区；
@@ -698,7 +780,7 @@ full model 相对 zone-linear anchor-only 的改善回答网络整体是否增�
 
 剖面门禁通过还要求：
 
-- blind section 没有明显拼接缝、方向性条带或参数爆炸；
+- blind section 没有明显拼接缝、方向性条带或 jump/profile 爆炸；
 - 高分辨率 segment 不因真实波形变弱而系统性粗化；
 - direction disagreement、LFM sensitivity 和 `non_seismic_supported` 比例均可定位并输出；
 - 主结果与敏感性结果使用同一冻结模型和推理合同。
@@ -725,6 +807,11 @@ full model 相对 zone-linear anchor-only 的改善回答网络整体是否增�
 
 ### 7.2 HSMM 与参数 head
 
+- signed interface jump 的方向、endpoint 和 valid-mask 约定；
+- boundary polarity 与 jump magnitude 的 supervision mask 分离；
+- top/bottom inside/outside feature 不越过 zone 或 observation support；
+- basis-aware moments 对 `c1` 符号翻转和 `c0/c2` 分离具有响应；
+- boundary-aware head 与 frozen mean-pooling baseline 使用相同 parent split 配对比较；
 - 小序列 brute-force MAP 对照；
 - forward-backward marginal 对照及归一化；
 - zone-fraction duration 在不同采样间隔下产生一致的物理先验；
@@ -739,7 +826,7 @@ full model 相对 zone-linear anchor-only 的改善回答网络整体是否增�
 - birth、death、pinchout 和 topology mask；
 - neighbor shuffle 只破坏邻道对应；
 - inline/xline segmentation 不同时，两遍推理仍产生唯一 fused parameter table；
-- parameter head 在 externally supplied fused extents 上 pooling；
+- parameter head 在 externally supplied fused extents 上构造相同的 boundary-aware、basis-aware evidence；
 - directional mixture variance 分解恒等式；
 - `xline_step=4` 不改变米制 patch 几何。
 
@@ -763,15 +850,10 @@ full model 相对 zone-linear anchor-only 的改善回答网络整体是否增�
 当前工作顺序固定为：
 
 ```text
-实现 LFM 精确换基与 parity
-→ 单道 teacher forcing
-→ exact HSMM MAP + marginals
-→ truth+jitter 参数恢复
-→ lateral patch
-→ real-statistics augmentation
-→ tuning validation
-→ calibration 冻结
-→ clean/dirty/geometry holdout 门禁
+阶段 1 前置 teacher-forcing audit 已冻结
+→ 第一步：boundary-aware profile head + 参数可观测性 decision
+→ 第二步：单道 evidence + exact HSMM MAP/marginals
+→ 第三步：lateral patch + augmentation + calibration + geometry holdout
 → 冻结 full/no-seismic 真实剖面推理
 → 剖面门禁
 → 冻结全体积推理

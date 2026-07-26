@@ -6,6 +6,7 @@ Usage::
         --config experiments/ginn_v2/stage1_step1.yaml \
         --full-run experiments/ginn_v2/results/<full> \
         --no-seismic-run experiments/ginn_v2/results/<no-seismic> \
+        --mean-pooling-run experiments/ginn_v2/results/20260725_v2 \
         --output-dir experiments/ginn_v2/results/<controls>
 """
 
@@ -38,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--full-run", type=Path, required=True)
     parser.add_argument("--no-seismic-run", type=Path, required=True)
+    parser.add_argument(
+        "--mean-pooling-run",
+        type=Path,
+        default=None,
+        help="Optional frozen mean-pooling full run used as the architecture reference.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--smoke",
@@ -81,6 +88,11 @@ def main() -> None:
         data=data,
         full_run_dir=full_run,
         no_seismic_run_dir=no_seismic_run,
+        mean_pooling_run_dir=(
+            _resolve(args.mean_pooling_run)
+            if args.mean_pooling_run is not None
+            else None
+        ),
         output_dir=_resolve(args.output_dir),
         device=device,
         training_samples_per_zone=config.training.samples_per_zone_per_parent or 8,

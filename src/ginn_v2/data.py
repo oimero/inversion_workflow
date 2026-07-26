@@ -187,6 +187,8 @@ class TeacherForcingBatch:
     target_parameters: np.ndarray
     parameter_supervision_valid: np.ndarray
     profile_supervision_valid: np.ndarray
+    interface_jump_target: np.ndarray
+    interface_jump_valid: np.ndarray
     ai_bounds: np.ndarray
     projected_truth: np.ndarray
     projected_support: np.ndarray
@@ -266,6 +268,8 @@ def collate_teacher_forcing_samples(
     parameters = np.zeros((batch_size, maximum_segments, 3), dtype=np.float32)
     parameter_valid = np.zeros((batch_size, maximum_segments), dtype=bool)
     profile_valid = np.zeros_like(parameter_valid)
+    interface_jump_target = np.zeros((batch_size, highres_size), dtype=np.float32)
+    interface_jump_valid = np.zeros((batch_size, highres_size), dtype=bool)
     ai_bounds = np.zeros((batch_size, 2), dtype=np.float32)
     projected_truth = np.zeros((batch_size, model_size), dtype=np.float32)
     projected_support = np.zeros((batch_size, model_size), dtype=bool)
@@ -314,6 +318,36 @@ def collate_teacher_forcing_samples(
                 segment.profile_supervision_valid
             )
         segment_count = len(sample.segments)
+        for right_segment_index in range(1, segment_count):
+            left_indices = np.asarray(
+                sample.segments[right_segment_index - 1].sample_indices,
+                dtype=np.int64,
+            )
+            right_indices = np.asarray(
+                sample.segments[right_segment_index].sample_indices,
+                dtype=np.int64,
+            )
+            if left_indices.size == 0 or right_indices.size == 0:
+                continue
+            left_endpoint = int(left_indices[-1])
+            right_endpoint = int(right_indices[0])
+            if right_endpoint != left_endpoint + 1:
+                raise ValueError(
+                    "teacher-forcing segment endpoints are not contiguous."
+                )
+            if not (
+                source.zone.zone_valid[left_endpoint]
+                and source.zone.zone_valid[right_endpoint]
+            ):
+                continue
+            left_value = float(source.latent.log_ai_highres_truth[left_endpoint])
+            right_value = float(source.latent.log_ai_highres_truth[right_endpoint])
+            if not np.isfinite(left_value) or not np.isfinite(right_value):
+                continue
+            interface_jump_target[batch_index, right_endpoint] = (
+                right_value - left_value
+            )
+            interface_jump_valid[batch_index, right_endpoint] = True
         pooling_mask[batch_index, :segment_count] = _jitter_pooling_masks(
             segment_mask[batch_index, :segment_count],
             maximum_shift=int(boundary_jitter_samples),
@@ -348,6 +382,8 @@ def collate_teacher_forcing_samples(
         target_parameters=parameters,
         parameter_supervision_valid=parameter_valid,
         profile_supervision_valid=profile_valid,
+        interface_jump_target=interface_jump_target,
+        interface_jump_valid=interface_jump_valid,
         ai_bounds=ai_bounds,
         projected_truth=projected_truth,
         projected_support=projected_support,

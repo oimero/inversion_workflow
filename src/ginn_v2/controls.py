@@ -23,11 +23,12 @@ from ginn_v2.model import (
     TeacherForcingModelConfig,
     TorchTeacherForcingBatch,
     batch_to_torch,
+    interface_polarity_classes,
     project_highres_torch,
 )
 
 
-CONTROL_REPORT_SCHEMA = "structured_ginn_v2_stage1_step1_controls_v1"
+CONTROL_REPORT_SCHEMA = "structured_ginn_v2_stage1_step1_controls_v2"
 
 
 def _descriptor_matrix(
@@ -195,6 +196,18 @@ class _MetricAccumulator:
         self.highres_count = 0
         self.projected_squared_error = 0.0
         self.projected_count = 0
+        self.interface_jump_count = 0
+        self.interface_jump_absolute_error = 0.0
+        self.interface_jump_squared_error = 0.0
+        self.interface_jump_nll = 0.0
+        self.interface_jump_target_sum = 0.0
+        self.interface_jump_target_squared_sum = 0.0
+        self.interface_jump_prediction_sum = 0.0
+        self.interface_jump_prediction_squared_sum = 0.0
+        self.interface_jump_cross_sum = 0.0
+        self.interface_polarity_correct = 0
+        self.decoded_interface_jump_absolute_error = 0.0
+        self.decoded_interface_jump_count = 0
 
     def update(
         self,
@@ -204,6 +217,11 @@ class _MetricAccumulator:
         projected: torch.Tensor,
         projection_support: torch.Tensor,
         batch: TorchTeacherForcingBatch,
+        *,
+        interface_jump_mean: torch.Tensor | None = None,
+        interface_jump_std: torch.Tensor | None = None,
+        interface_polarity_logits: torch.Tensor | None = None,
+        interface_jump_zero_tolerance: float = 1e-4,
     ) -> None:
         valid = batch.parameter_supervision_valid
         target = batch.target_parameters
@@ -257,6 +275,66 @@ class _MetricAccumulator:
             torch.sum(projected_error[projected_mask]).detach().cpu()
         )
         self.projected_count += int(torch.count_nonzero(projected_mask).item())
+        jump_valid = batch.interface_jump_valid
+        if torch.any(jump_valid):
+            previous = torch.roll(decoded, shifts=1, dims=1)
+            decoded_jump = decoded - previous
+            self.decoded_interface_jump_absolute_error += float(
+                torch.sum(
+                    torch.abs(
+                        decoded_jump[jump_valid]
+                        - batch.interface_jump_target[jump_valid]
+                    )
+                )
+                .detach()
+                .cpu()
+            )
+            self.decoded_interface_jump_count += int(
+                torch.count_nonzero(jump_valid).item()
+            )
+        if interface_jump_mean is None:
+            return
+        if interface_jump_std is None or interface_polarity_logits is None:
+            raise ValueError("interface jump outputs must be supplied together.")
+        target_jump = (
+            batch.interface_jump_target[jump_valid].detach().cpu().numpy()
+        )
+        predicted_jump = interface_jump_mean[jump_valid].detach().cpu().numpy()
+        predicted_std = interface_jump_std[jump_valid].detach().cpu().numpy()
+        if target_jump.size == 0:
+            return
+        error = predicted_jump - target_jump
+        self.interface_jump_count += target_jump.size
+        self.interface_jump_absolute_error += float(np.sum(np.abs(error)))
+        self.interface_jump_squared_error += float(np.sum(error**2))
+        self.interface_jump_nll += float(
+            np.sum(
+                0.5
+                * (
+                    error**2 / np.maximum(predicted_std**2, 1e-12)
+                    + np.log(np.maximum(predicted_std**2, 1e-12))
+                )
+            )
+        )
+        self.interface_jump_target_sum += float(np.sum(target_jump))
+        self.interface_jump_target_squared_sum += float(np.sum(target_jump**2))
+        self.interface_jump_prediction_sum += float(np.sum(predicted_jump))
+        self.interface_jump_prediction_squared_sum += float(
+            np.sum(predicted_jump**2)
+        )
+        self.interface_jump_cross_sum += float(
+            np.sum(target_jump * predicted_jump)
+        )
+        target_polarity = interface_polarity_classes(
+            batch.interface_jump_target,
+            zero_tolerance=interface_jump_zero_tolerance,
+        )
+        predicted_polarity = torch.argmax(interface_polarity_logits, dim=1)
+        self.interface_polarity_correct += int(
+            torch.count_nonzero(
+                (target_polarity == predicted_polarity) & jump_valid
+            ).item()
+        )
 
     def metrics(self, *, target_std: np.ndarray) -> dict[str, Any]:
         count = np.maximum(self.parameter_count, 1)
@@ -276,7 +354,61 @@ class _MetricAccumulator:
         r_squared = 1.0 - self.squared_error / np.maximum(
             target_variance_mass, 1e-24
         )
-        return {
+        interface_metrics: dict[str, float | int | None] = {
+            "interface_jump_count": self.interface_jump_count,
+            "interface_jump_mae": None,
+            "interface_jump_rmse": None,
+            "interface_jump_correlation": None,
+            "interface_jump_nll": None,
+            "interface_polarity_accuracy": None,
+            "decoded_interface_jump_mae": (
+                self.decoded_interface_jump_absolute_error
+                / self.decoded_interface_jump_count
+                if self.decoded_interface_jump_count
+                else None
+            ),
+        }
+        if self.interface_jump_count:
+            jump_count = self.interface_jump_count
+            target_variance_mass = (
+                self.interface_jump_target_squared_sum
+                - self.interface_jump_target_sum**2 / jump_count
+            )
+            prediction_variance_mass = (
+                self.interface_jump_prediction_squared_sum
+                - self.interface_jump_prediction_sum**2 / jump_count
+            )
+            covariance_mass = (
+                self.interface_jump_cross_sum
+                - self.interface_jump_target_sum
+                * self.interface_jump_prediction_sum
+                / jump_count
+            )
+            interface_metrics.update(
+                {
+                    "interface_jump_mae": (
+                        self.interface_jump_absolute_error / jump_count
+                    ),
+                    "interface_jump_rmse": float(
+                        np.sqrt(self.interface_jump_squared_error / jump_count)
+                    ),
+                    "interface_jump_correlation": (
+                        covariance_mass
+                        / np.sqrt(
+                            max(
+                                target_variance_mass
+                                * prediction_variance_mass,
+                                1e-24,
+                            )
+                        )
+                    ),
+                    "interface_jump_nll": self.interface_jump_nll / jump_count,
+                    "interface_polarity_accuracy": (
+                        self.interface_polarity_correct / jump_count
+                    ),
+                }
+            )
+        result = {
             "parameter_count": self.parameter_count.tolist(),
             "parameter_mae": mae.tolist(),
             "parameter_normalized_mae": (
@@ -300,6 +432,8 @@ class _MetricAccumulator:
             "highres_count": self.highres_count,
             "projected_count": self.projected_count,
         }
+        result.update(interface_metrics)
+        return result
 
 
 def _load_model(run_dir: Path, *, device: torch.device) -> tuple[
@@ -346,6 +480,12 @@ def _parent_metric(
         "projected_rmse": float(metrics["projected_rmse"]),
         "highres_rmse": float(metrics["highres_rmse"]),
     }
+    if metrics["decoded_interface_jump_mae"] is not None:
+        result["decoded_interface_jump_mae"] = float(
+            metrics["decoded_interface_jump_mae"]
+        )
+    if metrics["interface_jump_mae"] is not None:
+        result["interface_jump_mae"] = float(metrics["interface_jump_mae"])
     for index, name in enumerate(("c0", "c1", "c2")):
         result[f"{name}_mae"] = float(metrics["parameter_mae"][index])
     return result
@@ -360,7 +500,11 @@ def _paired_bootstrap(
     samples: int,
 ) -> dict[str, Any]:
     parents = sorted(parent_metrics)
-    metric_names = sorted(parent_metrics[parents[0]][reference])
+    metric_names = sorted(
+        set(parent_metrics[parents[0]][reference]).intersection(
+            parent_metrics[parents[0]][candidate]
+        )
+    )
     rng = np.random.default_rng(int(seed))
     result: dict[str, Any] = {}
     for metric in metric_names:
@@ -390,6 +534,7 @@ def run_stage1_step1_controls(
     data: TeacherForcingDataModule,
     full_run_dir: str | Path,
     no_seismic_run_dir: str | Path,
+    mean_pooling_run_dir: str | Path | None = None,
     output_dir: str | Path,
     device: torch.device,
     training_samples_per_zone: int,
@@ -406,6 +551,17 @@ def run_stage1_step1_controls(
         raise FileExistsError(f"control output directory already exists: {output}")
     full_model, full_report = _load_model(Path(full_run_dir), device=device)
     no_model, no_report = _load_model(Path(no_seismic_run_dir), device=device)
+    mean_model: TeacherForcedParameterModel | None = None
+    mean_report: Mapping[str, Any] | None = None
+    if mean_pooling_run_dir is not None:
+        mean_model, mean_report = _load_model(
+            Path(mean_pooling_run_dir),
+            device=device,
+        )
+        if not mean_model.config.use_seismic:
+            raise ValueError("mean-pooling reference declares use_seismic=false.")
+        if mean_model.config.segment_evidence_mode != "mean":
+            raise ValueError("mean-pooling reference is not a mean-pooling model.")
     if not full_model.config.use_seismic:
         raise ValueError("full checkpoint declares use_seismic=false.")
     if no_model.config.use_seismic:
@@ -427,6 +583,14 @@ def run_stage1_step1_controls(
     )["fingerprint_sha256"]
     if full_fingerprint != no_fingerprint:
         raise ValueError("full/no-seismic split manifest fingerprints differ.")
+    if mean_pooling_run_dir is not None:
+        mean_fingerprint = json.loads(
+            (
+                Path(mean_pooling_run_dir) / "parent_split_manifest.json"
+            ).read_text(encoding="utf-8")
+        )["fingerprint_sha256"]
+        if mean_fingerprint != full_fingerprint:
+            raise ValueError("mean-pooling reference split fingerprint differs.")
     output.mkdir(parents=True)
     logger = configure_run_logger(
         output,
@@ -460,6 +624,8 @@ def run_stage1_step1_controls(
         "within_parent_zone_shuffle": _MetricAccumulator(),
         "state_duration": _MetricAccumulator(),
     }
+    if mean_model is not None:
+        aggregate["frozen_mean_pooling"] = _MetricAccumulator()
     parent_metrics: dict[str, dict[str, dict[str, float]]] = {}
     iterator = data.iter_batches(
         "tuning_validation",
@@ -507,6 +673,8 @@ def run_stage1_step1_controls(
                 "no_seismic": no_model(batch),
                 "within_parent_zone_shuffle": full_model(shuffled_batch),
             }
+            if mean_model is not None:
+                outputs["frozen_mean_pooling"] = mean_model(batch)
             baseline_mean_np, baseline_std_np = baseline.predict_numpy(
                 numpy_batch.state_id,
                 numpy_batch.duration_fraction,
@@ -542,6 +710,9 @@ def run_stage1_step1_controls(
                     outputs["full"].decoded_highres,
                     outputs["full"].projected_log_ai,
                     outputs["full"].projection_support,
+                    outputs["full"].interface_jump_mean,
+                    outputs["full"].interface_jump_std,
+                    outputs["full"].interface_polarity_logits,
                 ),
                 "no_seismic": (
                     outputs["no_seismic"].parameter_mean,
@@ -549,6 +720,9 @@ def run_stage1_step1_controls(
                     outputs["no_seismic"].decoded_highres,
                     outputs["no_seismic"].projected_log_ai,
                     outputs["no_seismic"].projection_support,
+                    outputs["no_seismic"].interface_jump_mean,
+                    outputs["no_seismic"].interface_jump_std,
+                    outputs["no_seismic"].interface_polarity_logits,
                 ),
                 "within_parent_zone_shuffle": (
                     outputs["within_parent_zone_shuffle"].parameter_mean,
@@ -556,6 +730,15 @@ def run_stage1_step1_controls(
                     outputs["within_parent_zone_shuffle"].decoded_highres,
                     outputs["within_parent_zone_shuffle"].projected_log_ai,
                     outputs["within_parent_zone_shuffle"].projection_support,
+                    outputs[
+                        "within_parent_zone_shuffle"
+                    ].interface_jump_mean,
+                    outputs[
+                        "within_parent_zone_shuffle"
+                    ].interface_jump_std,
+                    outputs[
+                        "within_parent_zone_shuffle"
+                    ].interface_polarity_logits,
                 ),
                 "state_duration": (
                     baseline_mean,
@@ -563,11 +746,63 @@ def run_stage1_step1_controls(
                     baseline_decoded,
                     baseline_projected,
                     baseline_support,
+                    None,
+                    None,
+                    None,
                 ),
             }
+            if mean_model is not None:
+                mean_output = outputs["frozen_mean_pooling"]
+                values["frozen_mean_pooling"] = (
+                    mean_output.parameter_mean,
+                    mean_output.parameter_std,
+                    mean_output.decoded_highres,
+                    mean_output.projected_log_ai,
+                    mean_output.projection_support,
+                    mean_output.interface_jump_mean,
+                    mean_output.interface_jump_std,
+                    mean_output.interface_polarity_logits,
+                )
             for name, tensors in values.items():
-                aggregate[name].update(*tensors, batch)
-                current[name].update(*tensors, batch)
+                (
+                    mean,
+                    std,
+                    decoded,
+                    projected,
+                    projection_support,
+                    jump_mean,
+                    jump_std,
+                    polarity_logits,
+                ) = tensors
+                update_options = {
+                    "interface_jump_mean": jump_mean,
+                    "interface_jump_std": jump_std,
+                    "interface_polarity_logits": polarity_logits,
+                    "interface_jump_zero_tolerance": float(
+                        full_report["loss"].get(
+                            "interface_jump_zero_tolerance",
+                            1e-4,
+                        )
+                    ),
+                }
+                aggregate[name].update(
+                    mean,
+                    std,
+                    decoded,
+                    projected,
+                    projection_support,
+                    batch,
+                    **update_options,
+                )
+                current[name].update(
+                    mean,
+                    std,
+                    decoded,
+                    projected,
+                    projection_support,
+                    batch,
+                    **update_options,
+                )
     if current_parent is not None:
         parent_metrics[current_parent] = {
             name: _parent_metric(accumulator, target_std=baseline.target_std)
@@ -578,38 +813,62 @@ def run_stage1_step1_controls(
         name: accumulator.metrics(target_std=baseline.target_std)
         for name, accumulator in aggregate.items()
     }
+    paired_bootstrap = {
+        "full_vs_no_seismic": _paired_bootstrap(
+            parent_metrics,
+            reference="no_seismic",
+            candidate="full",
+            seed=seed,
+            samples=bootstrap_samples,
+        ),
+        "full_vs_state_duration": _paired_bootstrap(
+            parent_metrics,
+            reference="state_duration",
+            candidate="full",
+            seed=seed + 1,
+            samples=bootstrap_samples,
+        ),
+        "full_vs_within_parent_zone_shuffle": _paired_bootstrap(
+            parent_metrics,
+            reference="within_parent_zone_shuffle",
+            candidate="full",
+            seed=seed + 2,
+            samples=bootstrap_samples,
+        ),
+    }
+    if mean_model is not None:
+        paired_bootstrap["boundary_aware_vs_frozen_mean_pooling"] = (
+            _paired_bootstrap(
+                parent_metrics,
+                reference="frozen_mean_pooling",
+                candidate="full",
+                seed=seed + 3,
+                samples=bootstrap_samples,
+            )
+        )
+    source_best_epochs = {
+        "full": int(full_report["best_epoch"]),
+        "no_seismic": int(no_report["best_epoch"]),
+    }
+    if mean_report is not None:
+        source_best_epochs["frozen_mean_pooling"] = int(
+            mean_report["best_epoch"]
+        )
     report = {
         "schema": CONTROL_REPORT_SCHEMA,
         "status": "complete",
         "full_run_dir": str(Path(full_run_dir).resolve()),
         "no_seismic_run_dir": str(Path(no_seismic_run_dir).resolve()),
+        "mean_pooling_run_dir": (
+            str(Path(mean_pooling_run_dir).resolve())
+            if mean_pooling_run_dir is not None
+            else None
+        ),
         "split_manifest_fingerprint": full_fingerprint,
         "parent_count": completed,
         "state_duration_baseline": baseline.to_dict(),
         "metrics": metrics,
-        "paired_bootstrap": {
-            "full_vs_no_seismic": _paired_bootstrap(
-                parent_metrics,
-                reference="no_seismic",
-                candidate="full",
-                seed=seed,
-                samples=bootstrap_samples,
-            ),
-            "full_vs_state_duration": _paired_bootstrap(
-                parent_metrics,
-                reference="state_duration",
-                candidate="full",
-                seed=seed + 1,
-                samples=bootstrap_samples,
-            ),
-            "full_vs_within_parent_zone_shuffle": _paired_bootstrap(
-                parent_metrics,
-                reference="within_parent_zone_shuffle",
-                candidate="full",
-                seed=seed + 2,
-                samples=bootstrap_samples,
-            ),
-        },
+        "paired_bootstrap": paired_bootstrap,
         "seismic_intervention": {
             "name": "within_parent_zone_shuffle",
             "semantics": (
@@ -618,10 +877,7 @@ def run_stage1_step1_controls(
                 "matched-donor intervention"
             ),
         },
-        "source_best_epochs": {
-            "full": int(full_report["best_epoch"]),
-            "no_seismic": int(no_report["best_epoch"]),
-        },
+        "source_best_epochs": source_best_epochs,
         "baseline_fit_seconds": baseline_fit_seconds,
         "elapsed_seconds": time.perf_counter() - evaluation_start,
     }

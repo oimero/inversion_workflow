@@ -26,11 +26,22 @@ class TeacherForcingModelConfig:
     lfm_residual_scale: float = 0.1
     minimum_parameter_std: float = 1e-3
     maximum_parameter_std: float = 0.5
+    segment_evidence_mode: str = "mean"
+    predict_interface_evidence: bool = False
+    maximum_interface_jump_magnitude: float = 0.5
+    minimum_interface_jump_std: float = 1e-3
+    maximum_interface_jump_std: float = 0.5
     use_seismic: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.use_seismic, bool):
             raise TypeError("use_seismic must be boolean.")
+        if not isinstance(self.predict_interface_evidence, bool):
+            raise TypeError("predict_interface_evidence must be boolean.")
+        if self.segment_evidence_mode not in {"mean", "boundary_aware"}:
+            raise ValueError(
+                "segment_evidence_mode must be 'mean' or 'boundary_aware'."
+            )
         for name in (
             "feature_channels",
             "encoder_blocks",
@@ -49,6 +60,16 @@ class TeacherForcingModelConfig:
             or self.maximum_parameter_std <= self.minimum_parameter_std
         ):
             raise ValueError("parameter standard-deviation bounds are invalid.")
+        if (
+            not np.isfinite(self.maximum_interface_jump_magnitude)
+            or self.maximum_interface_jump_magnitude <= 0.0
+        ):
+            raise ValueError("maximum_interface_jump_magnitude must be positive.")
+        if (
+            self.minimum_interface_jump_std <= 0.0
+            or self.maximum_interface_jump_std <= self.minimum_interface_jump_std
+        ):
+            raise ValueError("interface-jump standard-deviation bounds are invalid.")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "TeacherForcingModelConfig":
@@ -67,17 +88,27 @@ class TeacherForcingLossConfig:
     parameter_nll_weight: float = 1.0
     highres_mse_weight: float = 1.0
     projected_mse_weight: float = 1.0
+    interface_jump_nll_weight: float = 0.0
+    interface_polarity_weight: float = 0.0
+    interface_jump_zero_tolerance: float = 1e-4
 
     def __post_init__(self) -> None:
         values = (
             self.parameter_nll_weight,
             self.highres_mse_weight,
             self.projected_mse_weight,
+            self.interface_jump_nll_weight,
+            self.interface_polarity_weight,
         )
         if any(not np.isfinite(value) or value < 0.0 for value in values):
             raise ValueError("teacher-forcing loss weights must be finite and non-negative.")
         if not any(value > 0.0 for value in values):
             raise ValueError("at least one teacher-forcing loss weight must be positive.")
+        if (
+            not np.isfinite(self.interface_jump_zero_tolerance)
+            or self.interface_jump_zero_tolerance < 0.0
+        ):
+            raise ValueError("interface_jump_zero_tolerance must be non-negative.")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "TeacherForcingLossConfig":
@@ -106,6 +137,8 @@ class TorchTeacherForcingBatch:
     target_parameters: torch.Tensor
     parameter_supervision_valid: torch.Tensor
     profile_supervision_valid: torch.Tensor
+    interface_jump_target: torch.Tensor
+    interface_jump_valid: torch.Tensor
     ai_bounds: torch.Tensor
     projected_truth: torch.Tensor
     projected_support: torch.Tensor
@@ -119,6 +152,9 @@ class TeacherForcingOutput:
     decoded_highres: torch.Tensor
     projected_log_ai: torch.Tensor
     projection_support: torch.Tensor
+    interface_jump_mean: torch.Tensor | None
+    interface_jump_std: torch.Tensor | None
+    interface_polarity_logits: torch.Tensor | None
 
 
 @dataclass(frozen=True)
@@ -127,9 +163,12 @@ class TeacherForcingLoss:
     parameter_nll: torch.Tensor
     highres_mse: torch.Tensor
     projected_mse: torch.Tensor
+    interface_jump_nll: torch.Tensor
+    interface_polarity_loss: torch.Tensor
     parameter_count: int
     highres_count: int
     projected_count: int
+    interface_jump_count: int
 
 
 def batch_to_torch(
@@ -160,6 +199,8 @@ def batch_to_torch(
         target_parameters=floating(batch.target_parameters),
         parameter_supervision_valid=boolean(batch.parameter_supervision_valid),
         profile_supervision_valid=boolean(batch.profile_supervision_valid),
+        interface_jump_target=floating(batch.interface_jump_target),
+        interface_jump_valid=boolean(batch.interface_jump_valid),
         ai_bounds=floating(batch.ai_bounds),
         projected_truth=floating(batch.projected_truth),
         projected_support=boolean(batch.projected_support),
@@ -202,10 +243,12 @@ class TeacherForcedParameterModel(nn.Module):
             )
         )
         self.state_embedding = nn.Embedding(3, config.state_embedding_channels)
+        if config.segment_evidence_mode == "mean":
+            segment_feature_channels = config.feature_channels
+        else:
+            segment_feature_channels = 8 * config.feature_channels + 4
         head_inputs = (
-            config.feature_channels
-            + config.state_embedding_channels
-            + 3
+            segment_feature_channels + config.state_embedding_channels + 3
         )
         self.parameter_head = nn.Sequential(
             nn.Linear(head_inputs, config.hidden_channels),
@@ -213,6 +256,11 @@ class TeacherForcedParameterModel(nn.Module):
             nn.Linear(config.hidden_channels, config.hidden_channels),
             nn.GELU(),
             nn.Linear(config.hidden_channels, 6),
+        )
+        self.interface_evidence_head = (
+            nn.Conv1d(config.feature_channels, 5, 1)
+            if config.predict_interface_evidence
+            else None
         )
 
     def encode_trace(self, batch: TorchTeacherForcingBatch) -> torch.Tensor:
@@ -245,10 +293,13 @@ class TeacherForcedParameterModel(nn.Module):
         feature_sequence: torch.Tensor,
         batch: TorchTeacherForcingBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        weights = batch.pooling_mask.to(dtype=feature_sequence.dtype)
-        denominator = torch.clamp(weights.sum(dim=-1, keepdim=True), min=1.0)
-        pooled = torch.einsum("bch,bsh->bsc", feature_sequence, weights)
-        pooled = pooled / denominator
+        if self.config.segment_evidence_mode == "mean":
+            pooled = self._mean_segment_evidence(feature_sequence, batch)
+        else:
+            pooled = self._boundary_aware_segment_evidence(
+                feature_sequence,
+                batch,
+            )
         state = self.state_embedding(torch.clamp(batch.state_id, min=0, max=2))
         descriptors = torch.cat(
             (
@@ -272,9 +323,177 @@ class TeacherForcedParameterModel(nn.Module):
             torch.where(valid, std, torch.ones_like(std)),
         )
 
+    @staticmethod
+    def _mean_segment_evidence(
+        feature_sequence: torch.Tensor,
+        batch: TorchTeacherForcingBatch,
+    ) -> torch.Tensor:
+        weights = batch.pooling_mask.to(dtype=feature_sequence.dtype)
+        denominator = torch.clamp(weights.sum(dim=-1, keepdim=True), min=1.0)
+        pooled = torch.einsum("bch,bsh->bsc", feature_sequence, weights)
+        return pooled / denominator
+
+    @staticmethod
+    def _gather_features(
+        feature_sequence: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        channels = feature_sequence.shape[1]
+        gather_index = indices.unsqueeze(1).expand(-1, channels, -1)
+        return torch.gather(feature_sequence, dim=2, index=gather_index).transpose(
+            1, 2
+        )
+
+    def _boundary_aware_segment_evidence(
+        self,
+        feature_sequence: torch.Tensor,
+        batch: TorchTeacherForcingBatch,
+    ) -> torch.Tensor:
+        mask = batch.pooling_mask
+        weights = mask.to(dtype=feature_sequence.dtype)
+        counts = weights.sum(dim=-1, keepdim=True)
+        safe_counts = torch.clamp(counts, min=1.0)
+        mean = torch.einsum("bch,bsh->bsc", feature_sequence, weights)
+        mean = mean / safe_counts
+
+        ranks = torch.cumsum(weights, dim=-1) - 1.0
+        denominator = torch.clamp(counts - 1.0, min=1.0)
+        xi = ranks / denominator
+        singleton = counts <= 1.0
+        xi = torch.where(singleton, torch.full_like(xi, 0.5), xi)
+        xi = torch.where(mask, xi, torch.zeros_like(xi))
+
+        linear = (2.0 * xi - 1.0) * weights
+        linear_norm = torch.clamp(
+            torch.sum(linear.square(), dim=-1, keepdim=True),
+            min=1.0,
+        )
+        linear_moment = (
+            torch.einsum("bch,bsh->bsc", feature_sequence, linear)
+            / linear_norm
+        )
+
+        sine = torch.sin(torch.pi * xi) * weights
+        sine_mean = torch.sum(sine, dim=-1, keepdim=True) / safe_counts
+        centered_sine = sine - sine_mean * weights
+        linear_projection = (
+            torch.sum(centered_sine * linear, dim=-1, keepdim=True)
+            / linear_norm
+        )
+        orthogonal_sine = centered_sine - linear_projection * linear
+        sine_norm = torch.clamp(
+            torch.sum(orthogonal_sine.square(), dim=-1, keepdim=True),
+            min=1.0,
+        )
+        sine_moment = (
+            torch.einsum("bch,bsh->bsc", feature_sequence, orthogonal_sine)
+            / sine_norm
+        )
+
+        highres_size = mask.shape[-1]
+        valid = batch.segment_valid
+        first = torch.argmax(mask.to(dtype=torch.int64), dim=-1)
+        last = highres_size - 1 - torch.argmax(
+            torch.flip(mask, dims=(-1,)).to(dtype=torch.int64),
+            dim=-1,
+        )
+        center = torch.round(0.5 * (first + last).to(dtype=torch.float32)).to(
+            dtype=torch.long
+        )
+        top_outside_index = torch.clamp(first - 1, min=0)
+        bottom_outside_index = torch.clamp(last + 1, max=highres_size - 1)
+
+        top_inside = self._gather_features(feature_sequence, first)
+        bottom_inside = self._gather_features(feature_sequence, last)
+        center_feature = self._gather_features(feature_sequence, center)
+        top_outside = self._gather_features(
+            feature_sequence,
+            top_outside_index,
+        )
+        bottom_outside = self._gather_features(
+            feature_sequence,
+            bottom_outside_index,
+        )
+
+        top_outside_valid = valid & (first > 0)
+        bottom_outside_valid = valid & (last + 1 < highres_size)
+        top_zone_valid = torch.gather(
+            batch.zone_valid,
+            dim=1,
+            index=top_outside_index,
+        )
+        bottom_zone_valid = torch.gather(
+            batch.zone_valid,
+            dim=1,
+            index=bottom_outside_index,
+        )
+        top_outside_valid &= top_zone_valid
+        bottom_outside_valid &= bottom_zone_valid
+        top_outside = torch.where(
+            top_outside_valid.unsqueeze(-1),
+            top_outside,
+            torch.zeros_like(top_outside),
+        )
+        bottom_outside = torch.where(
+            bottom_outside_valid.unsqueeze(-1),
+            bottom_outside,
+            torch.zeros_like(bottom_outside),
+        )
+        inside_valid = valid.unsqueeze(-1)
+        summaries = (
+            mean,
+            linear_moment,
+            sine_moment,
+            center_feature,
+            torch.where(inside_valid, top_inside, torch.zeros_like(top_inside)),
+            top_outside,
+            torch.where(
+                inside_valid,
+                bottom_inside,
+                torch.zeros_like(bottom_inside),
+            ),
+            bottom_outside,
+        )
+        validity = torch.stack(
+            (
+                valid,
+                top_outside_valid,
+                valid,
+                bottom_outside_valid,
+            ),
+            dim=-1,
+        ).to(dtype=feature_sequence.dtype)
+        return torch.cat((*summaries, validity), dim=-1)
+
+    def _interface_evidence(
+        self,
+        feature_sequence: torch.Tensor,
+        batch: TorchTeacherForcingBatch,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        if self.interface_evidence_head is None:
+            return None, None, None
+        raw = self.interface_evidence_head(feature_sequence)
+        mean = self.config.maximum_interface_jump_magnitude * torch.tanh(raw[:, 0])
+        fraction = torch.sigmoid(raw[:, 1])
+        std = self.config.minimum_interface_jump_std + fraction * (
+            self.config.maximum_interface_jump_std
+            - self.config.minimum_interface_jump_std
+        )
+        logits = raw[:, 2:5]
+        valid = batch.zone_valid
+        return (
+            torch.where(valid, mean, torch.zeros_like(mean)),
+            torch.where(valid, std, torch.ones_like(std)),
+            torch.where(valid.unsqueeze(1), logits, torch.zeros_like(logits)),
+        )
+
     def forward(self, batch: TorchTeacherForcingBatch) -> TeacherForcingOutput:
         features = self.encode_trace(batch)
         mean, std = self.parameterize_segments(features, batch)
+        jump_mean, jump_std, polarity_logits = self._interface_evidence(
+            features,
+            batch,
+        )
         decoded = decode_lfm_anchored_torch(
             batch.background_highres,
             batch.segment_basis,
@@ -294,6 +513,9 @@ class TeacherForcedParameterModel(nn.Module):
             decoded_highres=decoded,
             projected_log_ai=projected,
             projection_support=support,
+            interface_jump_mean=jump_mean,
+            interface_jump_std=jump_std,
+            interface_polarity_logits=polarity_logits,
         )
 
 
@@ -334,6 +556,21 @@ def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor
     return torch.mean(values[mask]), count
 
 
+def interface_polarity_classes(
+    jump: torch.Tensor,
+    *,
+    zero_tolerance: float,
+) -> torch.Tensor:
+    """Map signed downward log-AI jumps to decrease/neutral/increase classes."""
+    target = torch.ones_like(jump, dtype=torch.long)
+    target = torch.where(jump < -float(zero_tolerance), torch.zeros_like(target), target)
+    return torch.where(
+        jump > float(zero_tolerance),
+        torch.full_like(target, 2),
+        target,
+    )
+
+
 def teacher_forcing_loss(
     output: TeacherForcingOutput,
     batch: TorchTeacherForcingBatch,
@@ -366,19 +603,65 @@ def teacher_forcing_loss(
         output.projected_log_ai - batch.projected_truth
     ).square()
     projected_mse, projected_count = _masked_mean(projected_terms, projection_mask)
+    jump_nll = output.decoded_highres.sum() * 0.0
+    polarity_loss = output.decoded_highres.sum() * 0.0
+    jump_count = (
+        int(torch.count_nonzero(batch.interface_jump_valid).item())
+        if output.interface_jump_mean is not None
+        else 0
+    )
+    if (
+        config.interface_jump_nll_weight > 0.0
+        or config.interface_polarity_weight > 0.0
+    ):
+        if (
+            output.interface_jump_mean is None
+            or output.interface_jump_std is None
+            or output.interface_polarity_logits is None
+        ):
+            raise ValueError(
+                "interface evidence loss requires predict_interface_evidence=true."
+            )
+        jump_variance = output.interface_jump_std.square()
+        jump_terms = 0.5 * (
+            (
+                output.interface_jump_mean - batch.interface_jump_target
+            ).square()
+            / jump_variance
+            + torch.log(jump_variance)
+        )
+        jump_nll, _ = _masked_mean(jump_terms, batch.interface_jump_valid)
+        polarity_target = interface_polarity_classes(
+            batch.interface_jump_target,
+            zero_tolerance=config.interface_jump_zero_tolerance,
+        )
+        polarity_terms = F.cross_entropy(
+            output.interface_polarity_logits,
+            polarity_target,
+            reduction="none",
+        )
+        polarity_loss, _ = _masked_mean(
+            polarity_terms,
+            batch.interface_jump_valid,
+        )
     total = (
         config.parameter_nll_weight * parameter_nll
         + config.highres_mse_weight * highres_mse
         + config.projected_mse_weight * projected_mse
+        + config.interface_jump_nll_weight * jump_nll
+        + config.interface_polarity_weight * polarity_loss
     )
     return TeacherForcingLoss(
         total=total,
         parameter_nll=parameter_nll,
         highres_mse=highres_mse,
         projected_mse=projected_mse,
+        interface_jump_nll=jump_nll,
+        interface_polarity_loss=polarity_loss,
         parameter_count=parameter_count,
         highres_count=highres_count,
         projected_count=projected_count,
+        interface_jump_count=jump_count,
     )
 
 
@@ -390,6 +673,7 @@ __all__ = [
     "TeacherForcingOutput",
     "TorchTeacherForcingBatch",
     "batch_to_torch",
+    "interface_polarity_classes",
     "project_highres_torch",
     "teacher_forcing_loss",
 ]

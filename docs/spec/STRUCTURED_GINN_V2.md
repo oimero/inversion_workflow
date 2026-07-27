@@ -99,7 +99,7 @@ positive_direction = increasing_time
 
 ## 5. 阶段 1：合成监督结构化模型
 
-状态：阶段 0、完整迁移、sampled Oracle 和阶段 1 第一步均已完成。mean-pooling 前置审计以及 boundary-aware full、no-seismic、controls evaluator、truth-boundary observability Oracle 已冻结。当前实施项是第二步：单道结构提案与 exact HSMM。
+状态：阶段 0、完整迁移、sampled Oracle 和阶段 1 第一步均已完成。mean-pooling 前置审计以及 boundary-aware full、no-seismic、controls evaluator、truth-boundary observability Oracle 已冻结。第二步第一次 full run 暴露 joint MAP 长序列欠分段和 raw boundary logit 重复计入先验的问题；posterior-consensus 解码、平衡 boundary 监督和 emission-only HSMM 修订已落地，尚待修订版 full/no-seismic 实验验收。
 
 前置审计使用 truth segment/state/duration 和 segment mean pooling。full model 相对 no-seismic 在 projected log-AI 上稳定改善，但参数恢复呈现明显分化：
 
@@ -186,31 +186,36 @@ truth boundaries + truth LFM
 
 - 三状态 emission head；
 - boundary 与 interface polarity/jump evidence head；
-- exact HSMM MAP；
+- exact HSMM joint MAP 审计；
 - forward-backward marginals；
+- posterior-count consensus segmentation；
 - zone-fraction duration prior；
-- predicted MAP segmentation 的端到端验证。
+- predicted consensus segmentation 的端到端验证。
 
 单道闭环固定为：
 
 ```text
 single-trace StructuredPatch
 → DirectionalEvidence
-→ exact HSMM MAP + marginals
+→ exact HSMM joint MAP + marginals
+→ posterior-count consensus
 → unique predicted segments
 → boundary-aware parameterize_segments()
 → LFM-anchored decoder
 → CenterTracePosterior
 ```
 
-parameter head 仍只使用 truth segments 和合法 boundary jitter 训练。predicted segments 只进入端到端验证，不实现 predicted/truth split/merge matching，也不让梯度穿过 MAP segmentation。
+parameter head 仍只使用 truth segments 和合法 boundary jitter 训练。predicted segments 只进入端到端验证，不实现 predicted/truth split/merge matching，也不让梯度穿过 consensus segmentation。
 
-第一版只输出唯一 MAP segments 和 posterior marginals，不实现 top-K HSMM、beam search、物理排序或局部边界优化。只有当 MAP 失败主要来自明确的多峰结构 posterior 时，才在阶段 1 完成后重新讨论候选集合。
+长 semi-Markov 序列的 joint path MAP 会系统性偏向少量长段，因此只作为审计输出。第一版的唯一生产 segment 表采用 posterior-count consensus：目标段数取 exact boundary marginal 的期望，随后通过 segment-count reward 的 Lagrangian search 找到段数最接近期望的合法 Viterbi path。第一版不实现 top-K HSMM、beam search、物理排序或局部边界优化。
+
+boundary head 使用正负类等权的平衡监督，并继续发布局部界面证据。未经 calibration set 证明可作为 likelihood ratio 前，raw boundary logit 不进入 HSMM path score；HSMM 首版只消费 emission evidence 与固定 transition/duration prior。边界主指标同时发布 exact-sample F1 和一个 model-grid interval 容差的 F1。
 
 第二步验收要求：
 
 - 小序列 MAP 与 brute-force 枚举完全一致；
 - forward-backward marginals 归一且与 brute-force 对照一致；
+- posterior consensus 的段数接近 posterior expected segment count，且输出合法连续 path；
 - zone-fraction duration prior 在不同采样间隔下保持物理一致；
 - predicted segments 能生成唯一、合法的 segment/profile 表；
 - boundary F1、segment IoU、duration error、segment count bias 和 projected AI 没有结构性异常；
@@ -429,7 +434,8 @@ parameterize_segments(
 
 ```text
 DirectionalEvidence
-→ exact HSMM MAP + marginals
+→ exact HSMM joint MAP + marginals
+→ posterior-count consensus
 → unique segments
 → parameterize_segments()
 → LFM-anchored decoder
@@ -441,11 +447,11 @@ implementation 包含：
 - 共享的逐道垂向编码器；
 - 使用相对米制距离和 lateral mask 的横向 mixer；
 - high-resolution 三状态 emission、boundary、interface polarity/jump head；
-- exact HSMM MAP 和 posterior marginals；
+- exact HSMM joint MAP、posterior marginals 和 posterior-count consensus；
 - boundary-aware segment 三参数均值与受限方差 head；
 - LFM-anchored Torch decoder。
 
-parameter head 训练只使用 truth segments 和合法 boundary jitter。对 `parameter_supervision_valid` segment 使用三参数 likelihood；对只有 `profile_supervision_valid` 的 segment，只通过 LFM-anchored decoder 监督离散 profile。predicted MAP 或 fused segments 只用于端到端验证和推理。第一版不实现 predicted/truth segment matching，不对 MAP segmentation 反向传播。
+parameter head 训练只使用 truth segments 和合法 boundary jitter。对 `parameter_supervision_valid` segment 使用三参数 likelihood；对只有 `profile_supervision_valid` 的 segment，只通过 LFM-anchored decoder 监督离散 profile。predicted consensus 或 fused segments 只用于端到端验证和推理。第一版不实现 predicted/truth segment matching，不对 consensus segmentation 反向传播。
 
 parameter head 在推理时仍为每个合法 segment 输出完整三参数分布，但 rank 不足或病态 segment 的单系数结果不声明为可识别参数，也不进入单系数门禁。
 
@@ -682,7 +688,7 @@ parameterize_segments(xline features, fused segments)
 → directional profile/parameter mixtures
 ```
 
-两个方向各自的 MAP segments 不进入参数融合，也不按 segment index 对齐。
+两个方向各自的 segment 表不进入参数融合，也不按 segment index 对齐。
 
 融合规则固定为：
 
@@ -858,7 +864,7 @@ full model 相对 zone-linear anchor-only 的改善回答网络整体是否增�
 ```text
 阶段 1 前置 teacher-forcing audit 已冻结
 → 第一步：boundary-aware profile head + 参数可观测性 decision 已冻结
-→ 第二步：单道 evidence + exact HSMM MAP/marginals
+→ 第二步：单道 evidence + exact HSMM marginals + posterior-count consensus
 → 第三步：lateral patch + augmentation + calibration + geometry holdout
 → 冻结 full/no-seismic 真实剖面推理
 → 剖面门禁

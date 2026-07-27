@@ -177,6 +177,7 @@ class TeacherForcingBatch:
     background_highres: np.ndarray
     truth_highres: np.ndarray
     zone_valid: np.ndarray
+    truth_state_highres: np.ndarray
     segment_basis: np.ndarray
     segment_mask: np.ndarray
     pooling_mask: np.ndarray
@@ -194,6 +195,7 @@ class TeacherForcingBatch:
     projected_support: np.ndarray
     projection_factor: int
     sample_keys: tuple[str, ...]
+    zone_ids: tuple[str, ...]
 
     @property
     def batch_size(self) -> int:
@@ -258,6 +260,7 @@ def collate_teacher_forcing_samples(
     background = np.zeros((batch_size, highres_size), dtype=np.float32)
     truth = np.zeros_like(background)
     zone_valid = np.zeros_like(background, dtype=bool)
+    truth_state = np.full((batch_size, highres_size), -1, dtype=np.int64)
     basis = np.zeros((batch_size, maximum_segments, highres_size, 3), dtype=np.float32)
     segment_mask = np.zeros(basis.shape[:-1], dtype=bool)
     pooling_mask = np.zeros_like(segment_mask)
@@ -274,6 +277,7 @@ def collate_teacher_forcing_samples(
     projected_truth = np.zeros((batch_size, model_size), dtype=np.float32)
     projected_support = np.zeros((batch_size, model_size), dtype=bool)
     keys: list[str] = []
+    zone_ids: list[str] = []
     rng = np.random.default_rng(int(random_seed))
     for batch_index, sample in enumerate(samples):
         source = sample.source
@@ -294,6 +298,11 @@ def collate_teacher_forcing_samples(
             nan=0.0,
         )
         zone_valid[batch_index] = source.zone.zone_valid
+        truth_state[batch_index] = np.where(
+            source.zone.zone_valid,
+            source.latent.state_id,
+            -1,
+        )
         ai_bounds[batch_index] = sample.ai_bounds
         for segment_index, segment in enumerate(sample.segments):
             indices = segment.sample_indices
@@ -365,6 +374,7 @@ def collate_teacher_forcing_samples(
         keys.append(
             f"{source.realization_id}|{source.lateral_index}|{source.zone.zone_id}"
         )
+        zone_ids.append(source.zone.zone_id)
     return TeacherForcingBatch(
         seismic=seismic,
         lfm_residual=lfm_residual,
@@ -372,6 +382,7 @@ def collate_teacher_forcing_samples(
         background_highres=background,
         truth_highres=truth,
         zone_valid=zone_valid,
+        truth_state_highres=truth_state,
         segment_basis=basis,
         segment_mask=segment_mask,
         pooling_mask=pooling_mask,
@@ -389,6 +400,7 @@ def collate_teacher_forcing_samples(
         projected_support=projected_support,
         projection_factor=factor,
         sample_keys=tuple(keys),
+        zone_ids=tuple(zone_ids),
     )
 
 

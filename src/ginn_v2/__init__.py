@@ -28,11 +28,32 @@ from ginn_v2.decoder import (
     decode_torch,
 )
 from ginn_v2.model import (
+    DirectionalEvidence,
+    SingleTraceStructuredModel,
     TeacherForcedParameterModel,
     TeacherForcingLossConfig,
     TeacherForcingModelConfig,
     batch_to_torch,
     teacher_forcing_loss,
+)
+from ginn_v2.hsmm import (
+    HsmmPrior,
+    HsmmResult,
+    HsmmSegment,
+    ZoneHsmmPrior,
+    exact_hsmm,
+    fit_hsmm_prior,
+    freeze_hsmm_prior,
+)
+from ginn_v2.structure import (
+    CenterTracePosterior,
+    StructuredLossConfig,
+    infer_center_trace,
+    structured_training_loss,
+)
+from ginn_v2.structure_training import (
+    Stage1Step2Config,
+    run_stage1_step2,
 )
 from ginn_v2.forward import (
     ForwardContext,
@@ -66,7 +87,11 @@ from ginn_v2.truth import (
 __all__ = [
     "AnchoredSegment",
     "DecoderResult",
+    "DirectionalEvidence",
     "ForwardContext",
+    "HsmmPrior",
+    "HsmmResult",
+    "HsmmSegment",
     "LfmAnchoredStructuredSample",
     "LatentTrace",
     "ObservedTrace",
@@ -77,7 +102,9 @@ __all__ = [
     "RawSegmentParameters",
     "SegmentTruth",
     "StateDurationBaseline",
+    "Stage1Step2Config",
     "StructuredSample",
+    "StructuredLossConfig",
     "StructuredTruthAdapter",
     "TeacherForcedParameterModel",
     "TeacherForcingBatch",
@@ -85,6 +112,9 @@ __all__ = [
     "TeacherForcingLossConfig",
     "TeacherForcingModelConfig",
     "TruthBoundaryOracleConfig",
+    "SingleTraceStructuredModel",
+    "CenterTracePosterior",
+    "ZoneHsmmPrior",
     "ZoneTruth",
     "anchor_to_lfm",
     "assert_structured_sample_equal",
@@ -96,17 +126,23 @@ __all__ = [
     "decode_lfm_anchored_torch",
     "decode_numpy",
     "decode_torch",
+    "exact_hsmm",
+    "fit_hsmm_prior",
     "forward_numpy",
     "forward_torch",
     "fit_state_duration_baseline",
     "forward_context_from_sample",
     "freeze_parent_split_manifest",
+    "freeze_hsmm_prior",
     "load_zone_ai_bounds",
     "project_log_ai_to_model_grid",
     "resolve_device",
     "run_artifact_oracle",
     "run_oracle",
     "run_stage1_step1_controls",
+    "run_stage1_step2",
     "run_truth_boundary_oracle",
     "teacher_forcing_loss",
+    "infer_center_trace",
+    "structured_training_loss",
 ]

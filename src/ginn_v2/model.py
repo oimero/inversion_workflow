@@ -127,6 +127,7 @@ class TorchTeacherForcingBatch:
     background_highres: torch.Tensor
     truth_highres: torch.Tensor
     zone_valid: torch.Tensor
+    truth_state_highres: torch.Tensor
     segment_basis: torch.Tensor
     segment_mask: torch.Tensor
     pooling_mask: torch.Tensor
@@ -143,6 +144,8 @@ class TorchTeacherForcingBatch:
     projected_truth: torch.Tensor
     projected_support: torch.Tensor
     projection_factor: int
+    sample_keys: tuple[str, ...]
+    zone_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -155,6 +158,18 @@ class TeacherForcingOutput:
     interface_jump_mean: torch.Tensor | None
     interface_jump_std: torch.Tensor | None
     interface_polarity_logits: torch.Tensor | None
+
+
+@dataclass(frozen=True)
+class DirectionalEvidence:
+    """Calibratable zone evidence produced before structured inference."""
+
+    emission_log_potential: torch.Tensor
+    boundary_log_potential: torch.Tensor
+    interface_polarity_log_potential: torch.Tensor
+    interface_jump_mean: torch.Tensor
+    interface_jump_std: torch.Tensor
+    center_feature_sequence: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -189,6 +204,11 @@ def batch_to_torch(
         background_highres=floating(batch.background_highres),
         truth_highres=floating(batch.truth_highres),
         zone_valid=boolean(batch.zone_valid),
+        truth_state_highres=torch.as_tensor(
+            batch.truth_state_highres,
+            dtype=torch.long,
+            device=device,
+        ),
         segment_basis=floating(batch.segment_basis),
         segment_mask=boolean(batch.segment_mask),
         pooling_mask=boolean(batch.pooling_mask),
@@ -205,6 +225,8 @@ def batch_to_torch(
         projected_truth=floating(batch.projected_truth),
         projected_support=boolean(batch.projected_support),
         projection_factor=int(batch.projection_factor),
+        sample_keys=tuple(batch.sample_keys),
+        zone_ids=tuple(batch.zone_ids),
     )
 
 
@@ -519,6 +541,55 @@ class TeacherForcedParameterModel(nn.Module):
         )
 
 
+class SingleTraceStructuredModel(TeacherForcedParameterModel):
+    """Step-2 model: encode one trace, then expose evidence and segment heads."""
+
+    def __init__(self, config: TeacherForcingModelConfig) -> None:
+        if not config.predict_interface_evidence:
+            raise ValueError(
+                "SingleTraceStructuredModel requires predict_interface_evidence=true."
+            )
+        super().__init__(config)
+        self.emission_head = nn.Conv1d(config.feature_channels, 3, 1)
+        self.boundary_head = nn.Conv1d(config.feature_channels, 1, 1)
+
+    def encode_patch(
+        self,
+        batch: TorchTeacherForcingBatch,
+    ) -> DirectionalEvidence:
+        """Encode a width-one StructuredPatch into HSMM-ready evidence."""
+        features = self.encode_trace(batch)
+        emission = self.emission_head(features).transpose(1, 2)
+        boundary = self.boundary_head(features).squeeze(1)
+        jump_mean, jump_std, polarity_logits = self._interface_evidence(
+            features,
+            batch,
+        )
+        if jump_mean is None or jump_std is None or polarity_logits is None:
+            raise RuntimeError("structured model did not produce interface evidence.")
+        valid = batch.zone_valid
+        return DirectionalEvidence(
+            emission_log_potential=torch.where(
+                valid.unsqueeze(-1),
+                emission,
+                torch.zeros_like(emission),
+            ),
+            boundary_log_potential=torch.where(
+                valid,
+                boundary,
+                torch.zeros_like(boundary),
+            ),
+            interface_polarity_log_potential=torch.where(
+                valid.unsqueeze(-1),
+                polarity_logits.transpose(1, 2),
+                torch.zeros_like(polarity_logits.transpose(1, 2)),
+            ),
+            interface_jump_mean=jump_mean,
+            interface_jump_std=jump_std,
+            center_feature_sequence=features,
+        )
+
+
 def project_highres_torch(
     values: torch.Tensor,
     valid: torch.Tensor,
@@ -552,7 +623,7 @@ def project_highres_torch(
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, int]:
     count = int(torch.count_nonzero(mask).item())
     if count == 0:
-        return values.sum() * 0.0, 0
+        return torch.zeros((), dtype=values.dtype, device=values.device), 0
     return torch.mean(values[mask]), count
 
 
@@ -603,8 +674,12 @@ def teacher_forcing_loss(
         output.projected_log_ai - batch.projected_truth
     ).square()
     projected_mse, projected_count = _masked_mean(projected_terms, projection_mask)
-    jump_nll = output.decoded_highres.sum() * 0.0
-    polarity_loss = output.decoded_highres.sum() * 0.0
+    jump_nll = torch.zeros(
+        (),
+        dtype=output.decoded_highres.dtype,
+        device=output.decoded_highres.device,
+    )
+    polarity_loss = torch.zeros_like(jump_nll)
     jump_count = (
         int(torch.count_nonzero(batch.interface_jump_valid).item())
         if output.interface_jump_mean is not None
@@ -666,6 +741,8 @@ def teacher_forcing_loss(
 
 
 __all__ = [
+    "DirectionalEvidence",
+    "SingleTraceStructuredModel",
     "TeacherForcedParameterModel",
     "TeacherForcingLoss",
     "TeacherForcingLossConfig",

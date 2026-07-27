@@ -433,7 +433,8 @@ def run_oracle(
     )
 
 
-def _forward_context_from_sample(sample: StructuredSample) -> ForwardContext:
+def forward_context_from_sample(sample: StructuredSample) -> ForwardContext:
+    """Rebuild the strict forward interface published with one structured sample."""
     contract = sample.forward_context
     required = (
         "wavelet_time_s",
@@ -552,7 +553,7 @@ def run_artifact_oracle(
                     report = run_oracle(
                         sample,
                         calibration,
-                        _forward_context_from_sample(sample),
+                        forward_context_from_sample(sample),
                         assembled_highres_log_ai=assembled,
                         decoder_mask=sample.zone.zone_valid,
                     )
@@ -627,6 +628,7 @@ __all__ = [
     "OracleContractError",
     "OracleReport",
     "ProjectionResult",
+    "forward_context_from_sample",
     "project_log_ai_to_model_grid",
     "run_artifact_oracle",
     "run_oracle",

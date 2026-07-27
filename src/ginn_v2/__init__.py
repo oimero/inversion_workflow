@@ -43,9 +43,14 @@ from ginn_v2.oracle import (
     OracleContractError,
     OracleReport,
     ProjectionResult,
+    forward_context_from_sample,
     project_log_ai_to_model_grid,
     run_artifact_oracle,
     run_oracle,
+)
+from ginn_v2.observability import (
+    TruthBoundaryOracleConfig,
+    run_truth_boundary_oracle,
 )
 from ginn_v2.runtime import configure_training_logger, resolve_device
 from ginn_v2.truth import (
@@ -79,6 +84,7 @@ __all__ = [
     "TeacherForcingDataModule",
     "TeacherForcingLossConfig",
     "TeacherForcingModelConfig",
+    "TruthBoundaryOracleConfig",
     "ZoneTruth",
     "anchor_to_lfm",
     "assert_structured_sample_equal",
@@ -93,6 +99,7 @@ __all__ = [
     "forward_numpy",
     "forward_torch",
     "fit_state_duration_baseline",
+    "forward_context_from_sample",
     "freeze_parent_split_manifest",
     "load_zone_ai_bounds",
     "project_log_ai_to_model_grid",
@@ -100,5 +107,6 @@ __all__ = [
     "run_artifact_oracle",
     "run_oracle",
     "run_stage1_step1_controls",
+    "run_truth_boundary_oracle",
     "teacher_forcing_loss",
 ]

@@ -4,7 +4,7 @@
 
 第一版只回答一个问题：
 
-> 网络能否在完整 LFM 提供低频输入、zone-linear LFM anchor 提供 decoder 背景的前提下，通过半马尔科夫结构、界面证据和横向上下文，恢复连续、高分辨率且可标记证据来源的结构化 AI？
+> 网络能否在完整 LFM 提供低频输入、zone-linear LFM anchor 提供 decoder 背景的前提下，通过半马尔科夫结构、界面证据和横向上下文，在结构化生成族内推断连续、高分辨率、可验证且可标记证据来源的 AI 解？
 
 三参数对象表示为：
 
@@ -12,7 +12,7 @@
 profile = c0 + c1 * (2ξ - 1) + c2 * sin(πξ)
 ```
 
-三参数是 generator、truth artifact 和 decoder 的精确坐标，不预设三个系数对带限地震具有相同可识别性。阶段 1 的主要交付是 state、boundary、interface jump 和 decoded profile；单系数只在证据支持时解释为可恢复参数。
+三参数是 generator、truth artifact 和 decoder 的精确坐标。冻结的 truth-boundary observability decision 已证明逐 segment 三参数在当前带限地震下不具有唯一可识别性；网络输出的三参数解释为由 seismic、LFM 和结构先验共同选择的 `prior-selected latent`。阶段 1 的主要交付是 state、boundary、interface jump、decoded profile 和 projected log-AI，单系数作为 generator/decoder 审计坐标完整保留。
 
 zone 背景表示为：
 
@@ -39,14 +39,14 @@ log_ai = background + profile
 - 三状态 emission；
 - boundary 与 signed interface jump 监督；
 - segment decoded profile 监督；
-- identifiable subset 的 `c0/c1/c2` 监督；
+- identifiable subset 的 state-conditioned `c0/c1/c2` 辅助监督；
 - MAP、state/boundary posterior 和 jump/profile 方差。
 
-第一版的结果是结构恢复、界面变化、decoded profile、可识别参数、横向连续性和证据来源诊断。真实工区只使用冻结模型推理。
+第一版的结果是结构提案、界面变化、decoded profile、projected log-AI、prior-selected latent、横向连续性和证据来源诊断。真实工区只使用冻结模型推理。
 
 波形 augmentation 属于模型训练侧。canonical dataset 保存 clean observation；训练时按显式随机 identity 在线生成 phase、shift、gain、static 和 noise 扰动。
 
-第一版不加入可微 forward loss、物理排序或真实无标签微调。这里的约束是结构化 decoder、HSMM、已知 zone、zone-linear LFM anchor 和横向一致性；高分辨率先验输出不等同于地震直接分辨。
+第一版不加入可微 forward loss、物理排序或真实无标签微调。这里的约束是结构化 decoder、HSMM、已知 zone、zone-linear LFM anchor 和横向一致性；高分辨率先验输出不等同于地震直接分辨。深度域 differentiable forward seam 继续作为诊断基础设施保留，是否升级为训练约束只根据第一版结果重新规划。
 
 ## 2. 固定数据与坐标约定
 
@@ -99,7 +99,7 @@ positive_direction = increasing_time
 
 ## 5. 阶段 1：合成监督结构化模型
 
-状态：阶段 0、完整迁移和 sampled Oracle 已通过。2026-07-25 至 2026-07-26 的最小 teacher-forcing 审计已冻结；该审计不是新的实施步骤。
+状态：阶段 0、完整迁移、sampled Oracle 和阶段 1 第一步均已完成。mean-pooling 前置审计以及 boundary-aware full、no-seismic、controls evaluator、truth-boundary observability Oracle 已冻结。当前实施项是第二步：单道结构提案与 exact HSMM。
 
 前置审计使用 truth segment/state/duration 和 segment mean pooling。full model 相对 no-seismic 在 projected log-AI 上稳定改善，但参数恢复呈现明显分化：
 
@@ -109,17 +109,26 @@ c1 R² = 0.010
 c2 R² = 0.040
 ```
 
-这个结果证明 seismic 对 decoded profile 有贡献，也暴露了 mean pooling 与三参数 basis 不匹配。它不证明 `c1/c2` 对地震必然不可观测，因为：
+这个结果证明 seismic 对 decoded profile 有贡献，也暴露了 mean pooling 与三参数 basis 不匹配：
 
 - `2ξ-1` 在 segment 内均值为零，mean pooling 天然削弱 `c1` 证据；
 - `sin(πξ)` 的均值与常值项混合，mean pooling 难以分离 `c0/c2`；
 - truth state 已经提供了很强的 `c0` 条件信息。
 
+boundary-aware 第一步随后完成。82 个 tuning parents 上，full model 相对 no-seismic 的 projected log-AI RMSE 从 0.05404 降至 0.03566，high-resolution log-AI RMSE 从 0.06449 降至 0.04600；within-parent-zone seismic shuffle 使两项指标稳定退化，证明模型使用了中心道 seismic 与目标之间的对应关系。
+
+truth-boundary Oracle 固定 truth segmentation、LFM anchor、zone 外 truth 和深度域 forward context，只优化合法 segment 的三参数。truth-init 最大 seismic normalized RMSE 为 0.000039；随机初值可将该误差压至中位 0.01422，但 profile RMSE 中位仍为 0.08196。每个样本的连续参数数中位为 118.5，有效 seismic 样点数中位为 68.5。冻结结论为：
+
+- state、boundary、interface jump、decoded profile 和 projected log-AI 是后续主要输出与门禁；
+- `c0/c1/c2` 保持为 decoder 所需的 `prior-selected latent` 和审计坐标；
+- 单系数恢复不构成阶段推进条件，也不解释为 seismic 唯一分辨；
+- 第一步完整证据位于 `note/summary/final_audit/20260726_structured_ginn_v2_boundary_observability/`。
+
 阶段 1 后续只分三步。
 
 ### 第一步：可观测性对齐的单道 profile head
 
-预计新增生产代码 700–1100 行。
+状态：完成并冻结。
 
 使用宽度 1 的 `StructuredPatch`、truth segments 和合法 boundary jitter，建立 boundary-aware、basis-aware 的 segment parameterization。保留冻结的 mean-pooling full/no-seismic 结果作为旧实现对照，不把旧 checkpoint 直接视为新 head 的验收结果。
 
@@ -150,14 +159,15 @@ state 与 `c0` 采用层级关系：state 描述离散地质类别和序列拓�
 - 配对的 boundary-aware no-seismic；
 - state-duration analytic baseline。
 
-第一步验收要求：
+第一步验收结果：
 
-- boundary-aware full model 的 decoded profile 和 projected log-AI 不劣于 frozen mean-pooling full model；
-- full model 相对 no-seismic 的 profile、projected AI 或 interface jump 改善具有正的 parent-bootstrap 置信区间；
-- `c1/c2` 的结果按 R²、相关性、符号一致率、NLL 和 shuffle sensitivity 分别报告，不用三参数平均值汇总；
-- state/profile sign conflict、endpoint jump residual 和 decoder parity 没有结构性异常。
+- boundary-aware full model 相对 frozen mean-pooling full model 的 projected log-AI RMSE 平均降低 0.00904，95% CI 为 [0.00813, 0.00998]；
+- full model 相对 no-seismic 的 projected log-AI、high-resolution log-AI 和 interface jump 改善在全部 tuning parents 上为正；
+- seismic shuffle 后 profile、projected AI、interface jump 和三个单系数指标均退化，其中 profile/AI 退化最稳定；
+- `c0` 是最容易学习的系数，`c1/c2` 只有弱的 seismic-sensitive signal；truth-boundary Oracle 进一步证明三参数整体不具有唯一可识别性；
+- decoder、projection、depth forward 和 truth-init 数值闭环通过。
 
-如果 `c1/c2` 仍接近不可恢复，第一步内部增加一次 truth-boundary Oracle 可观测性诊断：
+第一步使用以下 truth-boundary Oracle 可观测性诊断：
 
 ```text
 truth boundaries + truth LFM
@@ -166,11 +176,7 @@ truth boundaries + truth LFM
 → 参数、profile、projected AI 和多解离散度
 ```
 
-该诊断只判断在结构完全正确时地震是否能区分三参数，不进入训练 loss，不产生候选排序，也不用于真实工区推理。诊断结论写入冻结 decision manifest：
-
-- Oracle 能恢复而网络不能恢复：保留三参数目标，继续改进证据汇聚或训练；
-- Oracle 也不能恢复：阶段 1 后续以 state、boundary、interface jump 和 decoded profile 为主输出，`c1/c2` 只保留为 generator/decoder 审计坐标；
-- 不允许仅根据一次神经网络回归失败直接删除三参数 truth 或 decoder。
+该诊断只判断在结构完全正确时地震是否能区分三参数，不进入训练 loss，不产生候选排序，也不用于真实工区推理。冻结 decision manifest 的结论为 `profile_primary_coefficients_audit_only`：阶段 1 后续以 state、boundary、interface jump、decoded profile 和 projected log-AI 为主输出；完整三参数 truth、辅助监督、posterior 和 decoder 继续保留，但不承担唯一参数恢复的科学声明。
 
 ### 第二步：单道结构提案与 exact HSMM
 
@@ -615,7 +621,7 @@ baseline 按输出能力分工，不要求每个 baseline 在不具备的输出�
 - `non_seismic_supported` segment rate 不超过 calibration set 冻结上限；
 - dirty 输入不会增加 high-confidence wrong segment；
 - 证据变弱时 posterior 展宽，jump/profile 方差增大；
-- 第一步的参数可观测性 decision manifest 已冻结，阶段门禁对 `c1/c2` 的解释与该决定一致；
+- 第一步的参数可观测性 decision manifest 已冻结，阶段门禁将完整 `c0/c1/c2` 解释为 `prior-selected latent` 和审计坐标；
 - dirty holdout 上的 state/boundary posterior、jump/profile 区间和适用的参数区间完成校准；
 - geometry holdout 不出现与 development validation 相反的结论。
 
@@ -851,7 +857,7 @@ full model 相对 zone-linear anchor-only 的改善回答网络整体是否增�
 
 ```text
 阶段 1 前置 teacher-forcing audit 已冻结
-→ 第一步：boundary-aware profile head + 参数可观测性 decision
+→ 第一步：boundary-aware profile head + 参数可观测性 decision 已冻结
 → 第二步：单道 evidence + exact HSMM MAP/marginals
 → 第三步：lateral patch + augmentation + calibration + geometry holdout
 → 冻结 full/no-seismic 真实剖面推理
@@ -861,4 +867,4 @@ full model 相对 zone-linear anchor-only 的改善回答网络整体是否增�
 
 阶段 1 门禁未通过时不进入真实工区。真实剖面门禁未通过时不运行全体积。
 
-后续是否加入可微 forward、物理排序、二维 synthetic training 或真实 adaptation，只根据阶段 1 和阶段 2 的结果重新规划，不预先进入第一版 implementation。
+后续是否加入可微 forward、物理排序、二维 synthetic training、井监督 adaptation 或真实无标签 adaptation，只根据阶段 1 和阶段 2 的结果重新规划，不预先进入第一版 implementation。

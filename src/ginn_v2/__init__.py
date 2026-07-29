@@ -55,6 +55,10 @@ from ginn_v2.structure_training import (
     Stage1Step2Config,
     run_stage1_step2,
 )
+from ginn_v2.structure_controls import (
+    matched_parent_zone_seismic_shuffle,
+    run_stage1_step2_controls,
+)
 from ginn_v2.forward import (
     ForwardContext,
     forward_numpy,
@@ -141,8 +145,10 @@ __all__ = [
     "run_oracle",
     "run_stage1_step1_controls",
     "run_stage1_step2",
+    "run_stage1_step2_controls",
     "run_truth_boundary_oracle",
     "teacher_forcing_loss",
     "infer_center_trace",
+    "matched_parent_zone_seismic_shuffle",
     "structured_training_loss",
 ]

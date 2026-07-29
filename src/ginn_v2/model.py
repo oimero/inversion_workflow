@@ -19,6 +19,7 @@ from ginn_v2.data import TeacherForcingBatch
 class TeacherForcingModelConfig:
     feature_channels: int = 48
     encoder_blocks: int = 4
+    structure_encoder_blocks: int = 2
     state_embedding_channels: int = 8
     hidden_channels: int = 96
     kernel_size: int = 7
@@ -45,6 +46,7 @@ class TeacherForcingModelConfig:
         for name in (
             "feature_channels",
             "encoder_blocks",
+            "structure_encoder_blocks",
             "state_embedding_channels",
             "hidden_channels",
             "kernel_size",
@@ -542,7 +544,7 @@ class TeacherForcedParameterModel(nn.Module):
 
 
 class SingleTraceStructuredModel(TeacherForcedParameterModel):
-    """Step-2 model: encode one trace, then expose evidence and segment heads."""
+    """Step-2 structure branch on top of a frozen Step-1 profile backbone."""
 
     def __init__(self, config: TeacherForcingModelConfig) -> None:
         if not config.predict_interface_evidence:
@@ -550,8 +552,37 @@ class SingleTraceStructuredModel(TeacherForcedParameterModel):
                 "SingleTraceStructuredModel requires predict_interface_evidence=true."
             )
         super().__init__(config)
+        self.structure_encoder = nn.Sequential(
+            *(
+                _ResidualBlock(
+                    config.feature_channels,
+                    config.kernel_size,
+                    dilation=2 ** (index % 4),
+                )
+                for index in range(config.structure_encoder_blocks)
+            )
+        )
         self.emission_head = nn.Conv1d(config.feature_channels, 3, 1)
-        self.boundary_head = nn.Conv1d(config.feature_channels, 1, 1)
+        # Signed jump mean/std plus three polarity probabilities are stable,
+        # already-supervised interface cues from the frozen Step-1 model.
+        self.boundary_head = nn.Sequential(
+            nn.Conv1d(config.feature_channels + 5, config.feature_channels, 1),
+            nn.GELU(),
+            nn.Conv1d(config.feature_channels, 1, 1),
+        )
+
+    def freeze_teacher_forcing_modules(self) -> None:
+        """Freeze the profile solution while leaving only structure modules trainable."""
+        for module in (
+            self.input_projection,
+            self.encoder,
+            self.state_embedding,
+            self.parameter_head,
+            self.interface_evidence_head,
+        ):
+            if module is None:
+                continue
+            module.requires_grad_(False)
 
     def encode_patch(
         self,
@@ -559,14 +590,29 @@ class SingleTraceStructuredModel(TeacherForcedParameterModel):
     ) -> DirectionalEvidence:
         """Encode a width-one StructuredPatch into HSMM-ready evidence."""
         features = self.encode_trace(batch)
-        emission = self.emission_head(features).transpose(1, 2)
-        boundary = self.boundary_head(features).squeeze(1)
         jump_mean, jump_std, polarity_logits = self._interface_evidence(
             features,
             batch,
         )
         if jump_mean is None or jump_std is None or polarity_logits is None:
             raise RuntimeError("structured model did not produce interface evidence.")
+        structure_features = self.structure_encoder(features)
+        emission = self.emission_head(structure_features).transpose(1, 2)
+        interface_cues = torch.cat(
+            (
+                (
+                    jump_mean / self.config.maximum_interface_jump_magnitude
+                ).unsqueeze(1),
+                (
+                    jump_std / self.config.maximum_interface_jump_std
+                ).unsqueeze(1),
+                torch.softmax(polarity_logits, dim=1),
+            ),
+            dim=1,
+        )
+        boundary = self.boundary_head(
+            torch.cat((structure_features, interface_cues), dim=1)
+        ).squeeze(1)
         valid = batch.zone_valid
         return DirectionalEvidence(
             emission_log_potential=torch.where(

@@ -32,7 +32,7 @@ from ginn_v2.structure import (
 from ginn_v2.training import TeacherForcingTrainingConfig
 
 
-RUN_SCHEMA = "structured_ginn_v2_stage1_step2_v2"
+RUN_SCHEMA = "structured_ginn_v2_stage1_step2_v3"
 
 
 @dataclass(frozen=True)
@@ -127,6 +127,7 @@ class Stage1Step2Config:
             "emission_weight",
             "boundary_weight",
             "hsmm_nll_weight",
+            "teacher_forcing_weight",
             "teacher_forcing",
         }
         loss_missing = sorted(required_loss.difference(loss_value))
@@ -149,6 +150,9 @@ class Stage1Step2Config:
                 emission_weight=float(loss_value["emission_weight"]),
                 boundary_weight=float(loss_value["boundary_weight"]),
                 hsmm_nll_weight=float(loss_value["hsmm_nll_weight"]),
+                teacher_forcing_weight=float(
+                    loss_value["teacher_forcing_weight"]
+                ),
                 teacher_forcing=TeacherForcingLossConfig.from_mapping(
                     loss_value["teacher_forcing"]
                 ),
@@ -191,16 +195,15 @@ def _load_initial_model(
         checkpoint["model_state_dict"],
         strict=False,
     )
-    expected_missing = {
-        "emission_head.weight",
-        "emission_head.bias",
-        "boundary_head.weight",
-        "boundary_head.bias",
-    }
-    if set(missing) != expected_missing or unexpected:
+    allowed_prefixes = ("structure_encoder.", "emission_head.", "boundary_head.")
+    invalid_missing = [
+        name for name in missing if not name.startswith(allowed_prefixes)
+    ]
+    if invalid_missing or unexpected:
         raise ValueError(
             f"Step-1 checkpoint mismatch; missing={missing}, unexpected={unexpected}"
         )
+    model.freeze_teacher_forcing_modules()
     return model, checkpoint
 
 
@@ -219,12 +222,14 @@ def _truth_boundaries(
     }
 
 
-def _predicted_metrics(
+def predicted_metric_totals(
     posterior: Any,
     batch: Any,
 ) -> dict[str, float]:
     state_correct = 0
     state_count = 0
+    state_correct_by_class = [0, 0, 0]
+    state_count_by_class = [0, 0, 0]
     boundary_tp = 0
     boundary_fp = 0
     boundary_fn = 0
@@ -246,6 +251,14 @@ def _predicted_metrics(
         predicted_state = posterior.map_state_highres[batch_index, zone]
         state_correct += int(torch.count_nonzero(truth_state == predicted_state).item())
         state_count += int(zone.numel())
+        for state_id in range(3):
+            state_mask = truth_state == state_id
+            state_count_by_class[state_id] += int(
+                torch.count_nonzero(state_mask).item()
+            )
+            state_correct_by_class[state_id] += int(
+                torch.count_nonzero(state_mask & (predicted_state == state_id)).item()
+            )
         truth_boundary = _truth_boundaries(batch, batch_index)
         first = int(zone[0].item())
         predicted_boundary = {
@@ -312,7 +325,7 @@ def _predicted_metrics(
         posterior.predicted_profile.decoded_highres - batch.truth_highres
     ).square()
     highres_mask = batch.zone_valid
-    return {
+    metrics = {
         "state_correct": float(state_correct),
         "state_count": float(state_count),
         "boundary_tp": float(boundary_tp),
@@ -335,14 +348,23 @@ def _predicted_metrics(
         "highres_count": float(torch.count_nonzero(highres_mask).item()),
         "sample_count": float(batch.seismic.shape[0]),
     }
+    for state_id in range(3):
+        metrics[f"state_{state_id}_correct"] = float(
+            state_correct_by_class[state_id]
+        )
+        metrics[f"state_{state_id}_count"] = float(state_count_by_class[state_id])
+    return metrics
 
 
-def _merge_numeric(target: dict[str, float], source: Mapping[str, float]) -> None:
+def merge_metric_totals(
+    target: dict[str, float],
+    source: Mapping[str, float],
+) -> None:
     for key, value in source.items():
         target[key] = target.get(key, 0.0) + float(value)
 
 
-def _finalize_predicted_metrics(values: Mapping[str, float]) -> dict[str, Any]:
+def finalize_predicted_metrics(values: Mapping[str, float]) -> dict[str, Any]:
     if not values:
         return {"sample_count": 0}
     tp = values["boundary_tp"]
@@ -355,9 +377,22 @@ def _finalize_predicted_metrics(values: Mapping[str, float]) -> dict[str, Any]:
     tolerant_fn = values["tolerant_boundary_fn"]
     tolerant_precision = tolerant_tp / max(tolerant_tp + tolerant_fp, 1.0)
     tolerant_recall = tolerant_tp / max(tolerant_tp + tolerant_fn, 1.0)
+    state_recalls = [
+        values[f"state_{state_id}_correct"]
+        / max(values[f"state_{state_id}_count"], 1.0)
+        for state_id in range(3)
+    ]
+    majority_baseline = max(
+        values[f"state_{state_id}_count"] for state_id in range(3)
+    ) / max(values["state_count"], 1.0)
+    state_accuracy = values["state_correct"] / max(values["state_count"], 1.0)
     return {
         "sample_count": int(values["sample_count"]),
-        "state_accuracy": values["state_correct"] / max(values["state_count"], 1.0),
+        "state_accuracy": state_accuracy,
+        "state_balanced_accuracy": float(np.mean(state_recalls)),
+        "state_recall_by_class": state_recalls,
+        "state_majority_baseline": majority_baseline,
+        "state_accuracy_over_majority": state_accuracy - majority_baseline,
         "boundary_precision": precision,
         "boundary_recall": recall,
         "boundary_f1": 2.0 * precision * recall / max(precision + recall, 1e-12),
@@ -512,9 +547,9 @@ def _run_epoch(
                     prior,
                     evidence=evidence,
                 )
-                _merge_numeric(
+                merge_metric_totals(
                     predicted_totals,
-                    _predicted_metrics(posterior, batch),
+                    predicted_metric_totals(posterior, batch),
                 )
     if previous_parent is not None:
         completed_parents += 1
@@ -531,7 +566,7 @@ def _run_epoch(
         "sample_count": int(totals["sample_count"]),
         "parent_count": completed_parents,
         "elapsed_seconds": time.perf_counter() - started,
-        "predicted_map": _finalize_predicted_metrics(predicted_totals),
+        "predicted_map": finalize_predicted_metrics(predicted_totals),
     }
 
 
@@ -606,8 +641,23 @@ def run_stage1_step2(
         len(manifest.tuning_validation),
         initial_checkpoint.get("epoch"),
     )
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    trainable_count = sum(parameter.numel() for parameter in trainable_parameters)
+    frozen_count = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if not parameter.requires_grad
+    )
+    logger.info(
+        "structure-only optimization | trainable_parameters=%d | "
+        "frozen_profile_parameters=%d",
+        trainable_count,
+        frozen_count,
+    )
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_parameters,
         lr=options.learning_rate,
         weight_decay=options.weight_decay,
     )
@@ -652,12 +702,19 @@ def run_stage1_step2(
         predicted = validation_metrics["predicted_map"]
         logger.info(
             "epoch %d/%d | train_loss=%.6g | tuning_loss=%.6g | "
-            "state_acc=%s | boundary_f1_5m=%s | segment_iou=%s | projected_rmse=%s",
+            "state_acc=%s | balanced_state_acc=%s | vs_majority=%s | "
+            "boundary_f1_5m=%s | segment_iou=%s | projected_rmse=%s",
             epoch + 1,
             options.epochs,
             training_metrics["loss"],
             validation_metrics["loss"],
             f"{predicted['state_accuracy']:.4f}"
+            if predicted["sample_count"]
+            else "n/a",
+            f"{predicted['state_balanced_accuracy']:.4f}"
+            if predicted["sample_count"]
+            else "n/a",
+            f"{predicted['state_accuracy_over_majority']:+.4f}"
             if predicted["sample_count"]
             else "n/a",
             f"{predicted['boundary_tolerant_f1']:.4f}"
@@ -741,6 +798,7 @@ def run_stage1_step2(
             "emission_weight": config.loss.emission_weight,
             "boundary_weight": config.loss.boundary_weight,
             "hsmm_nll_weight": config.loss.hsmm_nll_weight,
+            "teacher_forcing_weight": config.loss.teacher_forcing_weight,
             "teacher_forcing": asdict(config.loss.teacher_forcing),
         },
         "training": {
@@ -774,5 +832,8 @@ __all__ = [
     "RUN_SCHEMA",
     "Stage1Step2Config",
     "Step2TrainingConfig",
+    "finalize_predicted_metrics",
+    "merge_metric_totals",
+    "predicted_metric_totals",
     "run_stage1_step2",
 ]

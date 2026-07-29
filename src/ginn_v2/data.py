@@ -522,6 +522,47 @@ class TeacherForcingDataModule:
                     random_seed=int(rng.integers(0, np.iinfo(np.int32).max)),
                 )
 
+    def iter_parent_batches(
+        self,
+        split: str,
+        *,
+        seed: int,
+        maximum_parents: int | None = None,
+        samples_per_zone_per_parent: int | None = None,
+        maximum_samples_per_parent: int | None = None,
+    ) -> Iterator[TeacherForcingBatch]:
+        """Yield one complete, unjittered batch per parent for paired controls."""
+        if (
+            samples_per_zone_per_parent is not None
+            and int(samples_per_zone_per_parent) <= 0
+        ):
+            raise ValueError("samples_per_zone_per_parent must be positive.")
+        if maximum_parents is not None and int(maximum_parents) <= 0:
+            raise ValueError("maximum_parents must be positive.")
+        if (
+            maximum_samples_per_parent is not None
+            and int(maximum_samples_per_parent) <= 0
+        ):
+            raise ValueError("maximum_samples_per_parent must be positive.")
+        parent_ids = self.split_manifest.parent_ids(split)
+        if maximum_parents is not None:
+            parent_ids = parent_ids[: int(maximum_parents)]
+        rng = np.random.default_rng(int(seed))
+        for parent_id in parent_ids:
+            samples = self._parent_samples(
+                parent_id,
+                rng=rng,
+                samples_per_zone=samples_per_zone_per_parent,
+                maximum_samples=maximum_samples_per_parent,
+            )
+            if not samples:
+                raise ValueError(f"parent {parent_id!r} produced no control samples.")
+            yield collate_teacher_forcing_samples(
+                samples,
+                boundary_jitter_samples=0,
+                random_seed=int(rng.integers(0, np.iinfo(np.int32).max)),
+            )
+
 
 __all__ = [
     "ParentSplitManifest",

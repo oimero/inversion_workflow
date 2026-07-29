@@ -37,10 +37,16 @@ class StructuredLossConfig:
     emission_weight: float = 1.0
     boundary_weight: float = 0.5
     hsmm_nll_weight: float = 1.0
+    teacher_forcing_weight: float = 0.0
     teacher_forcing: TeacherForcingLossConfig = TeacherForcingLossConfig()
 
     def __post_init__(self) -> None:
-        for name in ("emission_weight", "boundary_weight", "hsmm_nll_weight"):
+        for name in (
+            "emission_weight",
+            "boundary_weight",
+            "hsmm_nll_weight",
+            "teacher_forcing_weight",
+        ):
             value = float(getattr(self, name))
             if not np.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative.")
@@ -63,7 +69,7 @@ class StructuredLoss:
 
 @dataclass(frozen=True)
 class CenterTracePosterior:
-    """One batch's unique MAP structures and their profile parameterization."""
+    """One batch's posterior-consensus structures and profile parameterization."""
 
     evidence: DirectionalEvidence
     hsmm_results: tuple[HsmmResult, ...]
@@ -158,6 +164,62 @@ def _teacher_output_from_evidence(
     )
 
 
+def balanced_emission_cross_entropy(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    """Give each state present in the batch equal weight."""
+    if logits.ndim != 3 or logits.shape[-1] != 3:
+        raise ValueError("emission logits must have shape [batch, sample, 3].")
+    if target.shape != logits.shape[:2] or valid.shape != target.shape:
+        raise ValueError("emission target/mask shapes do not match logits.")
+    terms = F.cross_entropy(
+        logits.transpose(1, 2),
+        torch.clamp(target, min=0, max=2),
+        reduction="none",
+    )
+    state_losses: list[torch.Tensor] = []
+    for state_id in range(3):
+        state_mask = valid & (target == state_id)
+        if bool(torch.any(state_mask).item()):
+            state_losses.append(torch.mean(terms[state_mask]))
+    if not state_losses:
+        raise ValueError("balanced emission supervision has no valid state samples.")
+    return torch.mean(torch.stack(state_losses))
+
+
+def soft_boundary_supervision(
+    batch: TorchTeacherForcingBatch,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build triangular boundary targets over one model-grid interval."""
+    target = torch.zeros_like(batch.background_highres)
+    valid = batch.zone_valid.clone()
+    radius = int(batch.projection_factor)
+    if radius <= 0:
+        raise ValueError("projection_factor must be positive.")
+    for batch_index in range(batch.background_highres.shape[0]):
+        zone_indices = _zone_indices(batch.zone_valid[batch_index])
+        for segment in truth_hsmm_segments(batch, batch_index)[1:]:
+            center = int(zone_indices[segment.start].item())
+            for offset in range(-radius, radius + 1):
+                sample = center + offset
+                if (
+                    sample < 0
+                    or sample >= target.shape[1]
+                    or not bool(batch.zone_valid[batch_index, sample].item())
+                ):
+                    continue
+                weight = 1.0 - abs(offset) / float(radius + 1)
+                target[batch_index, sample] = torch.maximum(
+                    target[batch_index, sample],
+                    target.new_tensor(weight),
+                )
+        # The first sample is a forced zone start, not an interior boundary.
+        valid[batch_index, int(zone_indices[0].item())] = False
+    return target, valid
+
+
 def structured_training_loss(
     model: SingleTraceStructuredModel,
     batch: TorchTeacherForcingBatch,
@@ -173,24 +235,17 @@ def structured_training_loss(
         config.teacher_forcing,
     )
     state_mask = batch.zone_valid & (batch.truth_state_highres >= 0)
-    emission_terms = F.cross_entropy(
-        evidence.emission_log_potential.transpose(1, 2),
-        torch.clamp(batch.truth_state_highres, min=0, max=2),
-        reduction="none",
+    emission_loss = balanced_emission_cross_entropy(
+        evidence.emission_log_potential,
+        batch.truth_state_highres,
+        state_mask,
     )
-    emission_loss = torch.mean(emission_terms[state_mask])
 
-    boundary_target = torch.zeros_like(evidence.boundary_log_potential)
-    boundary_valid = batch.zone_valid.clone()
+    boundary_target, boundary_valid = soft_boundary_supervision(batch)
     zone_losses: list[torch.Tensor] = []
     for batch_index, zone_id in enumerate(batch.zone_ids):
         zone_indices = _zone_indices(batch.zone_valid[batch_index])
         truth_segments = truth_hsmm_segments(batch, batch_index)
-        for segment in truth_segments[1:]:
-            boundary_target[
-                batch_index,
-                int(zone_indices[segment.start].item()),
-            ] = 1.0
         local_emission = evidence.emission_log_potential[
             batch_index, zone_indices
         ]
@@ -215,22 +270,21 @@ def structured_training_loss(
             )
             / float(zone_indices.numel())
         )
-        # The first sample is a forced zone start, not a learned interior boundary.
-        boundary_valid[batch_index, int(zone_indices[0].item())] = False
-    positive = boundary_valid & (boundary_target > 0.5)
-    negative = boundary_valid & ~positive
+    positive = boundary_valid & (boundary_target > 0.0)
+    negative = boundary_valid & (boundary_target == 0.0)
     if not bool(torch.any(positive).item()) or not bool(torch.any(negative).item()):
         raise ValueError("balanced boundary supervision requires both classes.")
-    positive_loss = F.softplus(
-        -evidence.boundary_log_potential[positive]
-    ).mean()
-    negative_loss = F.softplus(
-        evidence.boundary_log_potential[negative]
-    ).mean()
+    boundary_terms = F.binary_cross_entropy_with_logits(
+        evidence.boundary_log_potential,
+        boundary_target,
+        reduction="none",
+    )
+    positive_loss = boundary_terms[positive].mean()
+    negative_loss = boundary_terms[negative].mean()
     boundary_loss = 0.5 * (positive_loss + negative_loss)
     hsmm_nll = torch.mean(torch.stack(zone_losses))
     total = (
-        teacher_loss.total
+        config.teacher_forcing_weight * teacher_loss.total
         + config.emission_weight * emission_loss
         + config.boundary_weight * boundary_loss
         + config.hsmm_nll_weight * hsmm_nll
@@ -430,11 +484,13 @@ def infer_center_trace(
 
 
 __all__ = [
+    "balanced_emission_cross_entropy",
     "CenterTracePosterior",
     "StructuredLoss",
     "StructuredLossConfig",
     "build_predicted_segment_batch",
     "infer_center_trace",
+    "soft_boundary_supervision",
     "structured_training_loss",
     "truth_hsmm_segments",
 ]

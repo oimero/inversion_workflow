@@ -99,7 +99,7 @@ positive_direction = increasing_time
 
 ## 5. 阶段 1：合成监督结构化模型
 
-状态：阶段 0、完整迁移、sampled Oracle 和阶段 1 第一步均已完成。mean-pooling 前置审计以及 boundary-aware full、no-seismic、controls evaluator、truth-boundary observability Oracle 已冻结。第二步第一次 full run 暴露 joint MAP 长序列欠分段和 raw boundary logit 重复计入先验的问题；posterior-consensus 解码、平衡 boundary 监督和 emission-only HSMM 修订已落地，尚待修订版 full/no-seismic 实验验收。
+状态：阶段 0、完整迁移、sampled Oracle 和阶段 1 第一步均已完成。mean-pooling 前置审计以及 boundary-aware full、no-seismic、controls evaluator、truth-boundary observability Oracle 已冻结。第二步 v2 full run 暴露背景多数类捷径；v3 采用冻结 profile backbone、独立 structure encoder、类别均衡 emission 和软边界监督。v3 full/no-seismic 已完成：balanced state accuracy 为 0.561/0.344，segment IoU 为 0.279/0.208，projected log-AI RMSE 为 0.0656/0.1332。结果证明 seismic 对 state、profile 和 AI 有实质贡献；5 m boundary F1 为 0.669/0.659，说明边界位置仍主要受 duration prior 和 posterior-count consensus 支配。Step 2 matched seismic controls evaluator 已落地，等待配对干预门禁。
 
 前置审计使用 truth segment/state/duration 和 segment mean pooling。full model 相对 no-seismic 在 projected log-AI 上稳定改善，但参数恢复呈现明显分化：
 
@@ -182,7 +182,7 @@ truth boundaries + truth LFM
 
 预计新增生产代码 1000–1600 行。
 
-在第一步冻结的 profile head interface 上增加：
+第二步冻结第一步已经验收的 profile encoder、interface evidence head 和 parameter head，并在其特征之上训练独立 structure encoder。结构训练只更新 structure encoder、emission head 和 boundary head，teacher-forcing profile loss 保留为只读回归指标。新增：
 
 - 三状态 emission head；
 - boundary 与 interface polarity/jump evidence head；
@@ -209,7 +209,9 @@ parameter head 仍只使用 truth segments 和合法 boundary jitter 训练。pr
 
 长 semi-Markov 序列的 joint path MAP 会系统性偏向少量长段，因此只作为审计输出。第一版的唯一生产 segment 表采用 posterior-count consensus：目标段数取 exact boundary marginal 的期望，随后通过 segment-count reward 的 Lagrangian search 找到段数最接近期望的合法 Viterbi path。第一版不实现 top-K HSMM、beam search、物理排序或局部边界优化。
 
-boundary head 使用正负类等权的平衡监督，并继续发布局部界面证据。未经 calibration set 证明可作为 likelihood ratio 前，raw boundary logit 不进入 HSMM path score；HSMM 首版只消费 emission evidence 与固定 transition/duration prior。边界主指标同时发布 exact-sample F1 和一个 model-grid interval 容差的 F1。
+emission loss 按三类分别求均值后等权聚合，训练报告同时发布普通 state accuracy、balanced state accuracy、逐类 recall、背景多数类基线以及相对多数类基线的增益。
+
+boundary head 接收独立 structure feature，并显式使用冻结的 signed interface jump mean/std 和 polarity probability 作为界面线索。boundary truth 在一个 model-grid interval 内使用以真实边界为峰值的三角软标签，正支持区域与非边界区域等权聚合。raw boundary logit 当前只作为辅助证据发布；HSMM 消费 emission evidence 与固定 transition/duration prior。边界主指标同时发布 exact-sample F1 和一个 model-grid interval 容差的 F1。
 
 第二步验收要求：
 
@@ -218,6 +220,7 @@ boundary head 使用正负类等权的平衡监督，并继续发布局部界面
 - posterior consensus 的段数接近 posterior expected segment count，且输出合法连续 path；
 - zone-fraction duration prior 在不同采样间隔下保持物理一致；
 - predicted segments 能生成唯一、合法的 segment/profile 表；
+- balanced state accuracy 和逐类 recall 明确排除背景多数类捷径；
 - boundary F1、segment IoU、duration error、segment count bias 和 projected AI 没有结构性异常；
 - full model 相对 no-seismic 出现稳定的结构或 profile 增益。
 

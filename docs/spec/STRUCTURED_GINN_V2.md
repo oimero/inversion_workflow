@@ -99,7 +99,7 @@ positive_direction = increasing_time
 
 ## 5. 阶段 1：合成监督结构化模型
 
-状态：阶段 0、完整迁移、sampled Oracle 和阶段 1 第一步均已完成。mean-pooling 前置审计以及 boundary-aware full、no-seismic、controls evaluator、truth-boundary observability Oracle 已冻结。第二步 v2 full run 暴露背景多数类捷径；v3 采用冻结 profile backbone、独立 structure encoder、类别均衡 emission 和软边界监督。v3 full/no-seismic 已完成：balanced state accuracy 为 0.561/0.344，segment IoU 为 0.279/0.208，projected log-AI RMSE 为 0.0656/0.1332。结果证明 seismic 对 state、profile 和 AI 有实质贡献；5 m boundary F1 为 0.669/0.659，说明边界位置仍主要受 duration prior 和 posterior-count consensus 支配。Step 2 matched seismic controls evaluator 已落地，等待配对干预门禁。
+状态：阶段 0、完整迁移、sampled Oracle、阶段 1 第一步和第二步均已完成。mean-pooling 前置审计、boundary-aware full/no-seismic、truth-boundary observability Oracle 以及 Step 2 matched seismic controls 已冻结。Step 2 v3 full/no-seismic 的 balanced state accuracy 为 0.561/0.344，segment IoU 为 0.279/0.208，projected log-AI RMSE 为 0.0656/0.1332；正式 controls 证明 seismic 对 state、profile 和 AI 有实质贡献，但边界位置仍主要受 duration prior 和 posterior-count consensus 支配。第三步的 patch/event identity、masked lateral mixer、clean/dirty augmentation、controls 和 calibration/geometry 报告入口已落地，CPU smoke 已通过；正式训练和阶段门禁尚未运行。
 
 前置审计使用 truth segment/state/duration 和 segment mean pooling。full model 相对 no-seismic 在 projected log-AI 上稳定改善，但参数恢复呈现明显分化：
 
@@ -207,6 +207,8 @@ single-trace StructuredPatch
 
 parameter head 仍只使用 truth segments 和合法 boundary jitter 训练。predicted segments 只进入端到端验证，不实现 predicted/truth split/merge matching，也不让梯度穿过 consensus segmentation。
 
+HSMM 的监督路径使用 canonical state runs，而不是强制保留每个 event row 的边界。若 pinchout 使一个 trace 上两个连续 event row 具有相同 `state_id`，送入 HSMM 的路径合并该连续同状态 run；原始 event rows 仍保留给 profile supervision、参数审计和横向 event identity。
+
 长 semi-Markov 序列的 joint path MAP 会系统性偏向少量长段，因此只作为审计输出。第一版的唯一生产 segment 表采用 posterior-count consensus：目标段数取 exact boundary marginal 的期望，随后通过 segment-count reward 的 Lagrangian search 找到段数最接近期望的合法 Viterbi path。第一版不实现 top-K HSMM、beam search、物理排序或局部边界优化。
 
 emission loss 按三类分别求均值后等权聚合，训练报告同时发布普通 state accuracy、balanced state accuracy、逐类 recall、背景多数类基线以及相对多数类基线的增益。
@@ -228,6 +230,8 @@ boundary head 接收独立 structure feature，并显式使用冻结的 signed i
 
 预计新增生产代码 1200–2000 行。
 
+实现状态：Step 3 代码已落地。当前实现包括 parent-atomic 21 道 patch、实际 `lateral_m` masked mixer、跨 lateral event identity/topology 校验、在线 clean/dirty augmentation、full/no-seismic 训练入口、geometry holdout 报告和 matched/neighbor/parent controls；正式训练、真实观测统计 profile 冻结和最终门禁待执行。
+
 将同一 interface 扩展到 21 道米制 patch，完成：
 
 - masked lateral mixer；
@@ -240,6 +244,8 @@ boundary head 接收独立 structure feature，并显式使用冻结的 signed i
 - full-LFM、anchor、no-seismic、single-trace 和 lateral baseline；
 - geometry holdout 最终门禁；
 - 供阶段 2 使用的冻结 full/no-seismic checkpoints。
+
+横向 mixer 只改变 structure/HSMM evidence。冻结的 Step 2 profile/parameter head 继续读取原始中心道 encoder feature；横向混合 feature 不直接进入 profile head，以保持单道 profile 坐标合同。
 
 闭环固定为：
 
@@ -484,6 +490,8 @@ segment thickness / zone thickness
 - matched-seismic intervention sensitivity 降低。
 
 在一个 parent 内，`(zone_id, object_id)` 是跨 lateral 的生成事件 identity。`object_id` 在 lateral loop 前分配，不是逐道重新编号；`lateral_index` 只标识该事件在某道上的实例。
+
+event order 使用 producer 的 `object_id` 顺序。不能用 event 在所有 lateral 上的最小 `top` 重新推断顺序，因为横向起伏会让不同 event 的坐标范围交叠。
 
 dataset 在施加横向 consistency 前必须验证：
 
@@ -868,7 +876,8 @@ full model 相对 zone-linear anchor-only 的改善回答网络整体是否增�
 阶段 1 前置 teacher-forcing audit 已冻结
 → 第一步：boundary-aware profile head + 参数可观测性 decision 已冻结
 → 第二步：单道 evidence + exact HSMM marginals + posterior-count consensus
-→ 第三步：lateral patch + augmentation + calibration + geometry holdout
+→ 第三步代码已落地：lateral patch + augmentation + calibration + geometry holdout
+→ 第三步正式 full/no-seismic 训练与 controls 门禁
 → 冻结 full/no-seismic 真实剖面推理
 → 剖面门禁
 → 冻结全体积推理

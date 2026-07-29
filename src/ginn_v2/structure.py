@@ -14,6 +14,7 @@ from ginn_v2.hsmm import (
     HsmmPrior,
     HsmmResult,
     HsmmSegment,
+    canonicalize_hsmm_segments,
     exact_hsmm,
     hsmm_log_partition,
     hsmm_path_score,
@@ -98,7 +99,13 @@ def truth_hsmm_segments(
     batch: TorchTeacherForcingBatch,
     batch_index: int,
 ) -> tuple[HsmmSegment, ...]:
-    """Convert the canonical truth masks to one zone-local half-open path."""
+    """Convert truth masks to one canonical zone-local HSMM state path.
+
+    Event rows remain separate in the teacher-forcing tensors.  When a
+    pinchout removes an intervening event on one trace, two adjacent event
+    rows can have the same state; the HSMM path merges that run because it
+    models state runs rather than event identity.
+    """
     zone = _zone_indices(batch.zone_valid[batch_index])
     first_zone = int(zone[0].item())
     output: list[HsmmSegment] = []
@@ -123,9 +130,10 @@ def truth_hsmm_segments(
         )
     if not output:
         raise ValueError("truth batch contains no valid structured segments.")
-    if output[0].start != 0 or output[-1].stop != zone.numel():
+    canonical = canonicalize_hsmm_segments(output)
+    if canonical[0].start != 0 or canonical[-1].stop != zone.numel():
         raise ValueError("truth segments do not cover the complete HSMM zone.")
-    return tuple(output)
+    return canonical
 
 
 def _teacher_output_from_evidence(

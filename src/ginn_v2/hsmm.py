@@ -273,18 +273,18 @@ def fit_hsmm_prior(
                     ),
                 }
             counts = grouped[zone_id]
-            states = [int(row["state_id"]) for row in rows]
+            canonical_rows = _canonicalize_duration_rows(rows)
+            states = [state for state, _, _, _ in canonical_rows]
             if not states:
                 continue
             counts["initial"][states[0]] += 1.0
             for left, right in zip(states[:-1], states[1:], strict=True):
                 if left == right:
                     raise ValueError(
-                        f"producer emitted adjacent equal states in zone {zone_id!r}."
+                        f"producer emitted non-contiguous repeated state in zone {zone_id!r}."
                     )
                 counts["transition"][left, right] += 1.0
-            for row, state in zip(rows, states, strict=True):
-                fraction = float(row["duration_fraction"])
+            for state, fraction, _, _ in canonical_rows:
                 if not 0.0 < fraction <= 1.0:
                     raise ValueError("training duration fraction lies outside (0, 1].")
                 index = min(
@@ -401,6 +401,74 @@ class HsmmSegment:
     @property
     def duration_samples(self) -> int:
         return int(self.stop) - int(self.start)
+
+
+def canonicalize_hsmm_segments(
+    segments: Sequence[HsmmSegment],
+) -> tuple[HsmmSegment, ...]:
+    """Merge contiguous equal-state runs into the HSMM state-path form.
+
+    Structured event rows may contain two adjacent objects with the same
+    producer state when an event between them pinches out on the current
+    trace.  The event rows remain separate for profile supervision and
+    lateral identity, but an HSMM state path cannot represent that event
+    boundary.  This helper keeps the state path canonical without changing
+    the artifact's event table.
+    """
+    if not segments:
+        raise ValueError("HSMM segment path cannot be empty.")
+    canonical: list[HsmmSegment] = []
+    for segment in segments:
+        if canonical:
+            previous = canonical[-1]
+            if int(segment.start) != int(previous.stop):
+                raise ValueError("HSMM segment path must be contiguous.")
+            if int(segment.state_id) == int(previous.state_id):
+                canonical[-1] = HsmmSegment(
+                    state_id=previous.state_id,
+                    start=previous.start,
+                    stop=segment.stop,
+                )
+                continue
+        canonical.append(segment)
+    return tuple(canonical)
+
+
+def _canonicalize_duration_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[int, float, float, float], ...]:
+    """Canonicalize contiguous same-state prior observations.
+
+    ``duration_fraction`` is a zone fraction, so merging two adjacent
+    same-state event rows adds their fractions.  Non-contiguous repeated
+    states remain visible to the caller and are rejected as an invalid
+    state-path topology.
+    """
+    canonical: list[tuple[int, float, float, float]] = []
+    for row in rows:
+        state = int(row["state_id"])
+        fraction = float(row["duration_fraction"])
+        top = float(row["top"])
+        bottom = float(row["bottom"])
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError("training duration fraction lies outside (0, 1].")
+        if not np.isfinite(top) or not np.isfinite(bottom) or bottom <= top:
+            raise ValueError("training duration endpoints must be finite and increasing.")
+        if canonical:
+            previous_state, previous_fraction, previous_top, previous_bottom = canonical[-1]
+            if (
+                state == previous_state
+                and np.isclose(previous_bottom, top, rtol=1e-10, atol=1e-8)
+            ):
+                canonical[-1] = (
+                    previous_state,
+                    previous_fraction + fraction,
+                    previous_top,
+                    bottom,
+                )
+                continue
+        canonical.append((state, fraction, top, bottom))
+    return tuple(canonical)
 
 
 @dataclass(frozen=True)
@@ -896,6 +964,7 @@ __all__ = [
     "HsmmResult",
     "HsmmSegment",
     "ZoneHsmmPrior",
+    "canonicalize_hsmm_segments",
     "exact_hsmm",
     "fit_hsmm_prior",
     "freeze_hsmm_prior",

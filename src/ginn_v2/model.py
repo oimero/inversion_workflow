@@ -164,7 +164,13 @@ class TeacherForcingOutput:
 
 @dataclass(frozen=True)
 class DirectionalEvidence:
-    """Calibratable zone evidence produced before structured inference."""
+    """Calibratable zone evidence produced before structured inference.
+
+    ``center_feature_sequence`` is the feature sequence consumed by the
+    profile parameter head.  A lateral implementation may expose a separate
+    mixed representation through ``lateral_feature_sequence`` for structure
+    evidence, but must preserve the center profile feature contract.
+    """
 
     emission_log_potential: torch.Tensor
     boundary_log_potential: torch.Tensor
@@ -172,6 +178,8 @@ class DirectionalEvidence:
     interface_jump_mean: torch.Tensor
     interface_jump_std: torch.Tensor
     center_feature_sequence: torch.Tensor
+    lateral_feature_sequence: torch.Tensor | None = None
+    lateral_valid: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)

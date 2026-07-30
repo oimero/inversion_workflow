@@ -25,6 +25,7 @@ from cup.synthetic.core.field_runner import (
     stable_records_frame,
 )
 from cup.synthetic.core.lfm import LfmPolicy
+from cup.synthetic.core.corpus import CorpusBudget
 from cup.synthetic.core.geometry import resample_section_path, validate_line_geometry
 from cup.synthetic.core.pipeline import (
     GenerationAttempt,
@@ -52,6 +53,7 @@ from cup.synthetic.schemas import (
     RANDOM_STREAM_CONTRACT_VERSION,
     SCIENCE_CONTRACT,
     SCIENCE_REVISION,
+    STRUCTURED_ARTIFACT_VERSION,
     require_science_contract,
 )
 from cup.physics.execution import DepthForwardExecutor
@@ -186,6 +188,7 @@ def generate_depth_realization(
     *,
     section: DepthSectionGeometry,
     scenario: GenerationScenario,
+    realization_id: str,
     attempt_id: int,
     script_cfg: Mapping[str, Any],
     forward_inputs: Mapping[str, Any],
@@ -195,7 +198,9 @@ def generate_depth_realization(
     preflight_only: bool = False,
 ) -> DepthGeneratedSection | None:
     """Build one depth realization through the shared truth and base-sample Seam."""
-    realization_id = f"{section.section_id}__{scenario.scenario_id}__a{attempt_id:03d}"
+    realization_id = str(realization_id).strip()
+    if not realization_id:
+        raise ValueError("realization_id must be explicit.")
     wavelet_path = resolve_relative_path(
         forward_inputs["wavelet"]["path"], root=repo_root
     )
@@ -297,7 +302,7 @@ def generate_depth_realization(
                     "producer": {
                         "name": "synthoseis_lite",
                         "artifact_type": "structured_synthetic_benchmark",
-                        "artifact_version": 1,
+                        "artifact_version": STRUCTURED_ARTIFACT_VERSION,
                     },
                     "calibration": {
                         "generator_family": calibration.generator_family,
@@ -393,10 +398,18 @@ class DepthGenerationSession:
         calibration_contract_fingerprint = require_contract_fingerprint(
             calibration_summary, label=f"depth calibration {calibration_summary_path.parent}"
         )
-        if str(dict(calibration.input_contracts.get("rock_physics_analysis") or {}).get("contract_fingerprint_sha256") or "") != str(forward_inputs["_rock_physics_contract_fingerprint_sha256"]):
-            raise ValueError("impedance calibration and forward inputs use different rock-physics contracts.")
-        if str(dict(calibration.input_contracts.get("depth_forward_model_inputs") or {}).get("contract_fingerprint_sha256") or "") != str(forward_inputs["_contract_fingerprint_sha256"]):
-            raise ValueError("impedance calibration and generation use different depth forward-model inputs.")
+        for label, reference in (
+            (
+                "rock_physics_analysis",
+                calibration.input_contracts.get("rock_physics_analysis"),
+            ),
+            (
+                "depth_forward_model_inputs",
+                calibration.input_contracts.get("depth_forward_model_inputs"),
+            ),
+        ):
+            if not str(dict(reference or {}).get("contract_fingerprint_sha256") or ""):
+                raise ValueError(f"impedance calibration lacks {label} provenance.")
         input_contracts = {
             "calibration": {
                 "path": repo_relative_path(calibration_summary_path, root=repo_root),
@@ -465,6 +478,7 @@ class DepthGenerationSession:
                 calibration_payload,
                 section=section,
                 scenario=scenario,
+                realization_id=base_id,
                 attempt_id=int(row["attempt_id"]),
                 script_cfg=script_cfg,
                 forward_inputs=forward_inputs,
@@ -544,10 +558,12 @@ class DepthGenerationSession:
             generator_family=GENERATOR_FAMILY,
             hdf5_attributes={"depth_basis": "tvdss", "axis_positive_direction": "down"},
             section_ids=tuple(str(section.section_id) for section in sections),
+            section_roles={
+                str(item["section_id"]): str(item["corpus_role"])
+                for item in script_cfg["sections"]
+            },
             scenarios=tuple(scenarios_list),
-            attempts_per_scenario=int(script_cfg["generation"]["attempts_per_scenario"]),
-            held_out_geometry_family=str(script_cfg["splits"]["held_out_geometry_family"]),
-            geometry_families=None,
+            corpus_budget=CorpusBudget.from_mapping(script_cfg["corpus"]),
             debug_attempt_limit=debug_attempt_limit,
             input_contracts=input_contracts,
             manifest_fields=manifest_fields,
@@ -557,8 +573,8 @@ class DepthGenerationSession:
         )
 
 
-# Public entrypoint for the v5 branch.  The shared Pipeline owns the parent,
-# view, acceptance and publication lifecycle; this function only loads the
+# Public entrypoint for the depth adapter. The shared Pipeline owns the parent,
+# acceptance and publication lifecycle; this function only loads the
 # domain calibration and constructs its Adapter.
 def run_depth_generation(
     *,

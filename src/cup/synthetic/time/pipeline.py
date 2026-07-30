@@ -32,6 +32,7 @@ from cup.synthetic.core.field_runner import (
     stable_records_frame,
 )
 from cup.synthetic.core.scenarios import GenerationScenario, generation_scenarios
+from cup.synthetic.core.corpus import CorpusBudget
 from cup.synthetic.time.geometry import build_section_geometries
 from cup.synthetic.time.sample_builder import (
     build_time_field_sample,
@@ -292,9 +293,12 @@ class TimeGenerationSession:
             generator_family=calibration.generator_family,
             hdf5_attributes={"implementation_scope": IMPLEMENTATION_SCOPE},
             section_ids=tuple(str(section.section_id) for section in sections),
+            section_roles={
+                str(item["section_id"]): str(item["corpus_role"])
+                for item in script_cfg["sections"]
+            },
             scenarios=tuple(scenarios),
-            attempts_per_scenario=int(script_cfg["generation"]["attempts_per_scenario"]),
-            held_out_geometry_family=str(script_cfg["splits"]["held_out_geometry_family"]),
+            corpus_budget=CorpusBudget.from_mapping(script_cfg["corpus"]),
             debug_attempt_limit=debug_attempt_limit,
             input_contracts=input_contracts,
             manifest_fields=manifest_fields,

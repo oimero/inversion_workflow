@@ -10,6 +10,10 @@ synthetic_benchmark.h5
 
 表格、清单和图片是该产物的索引与报告。
 
+校准阶段在 `figures/calibration/wells/` 下为每口井输出背景与残差、profile 拟合和
+对象参数图。生成阶段在 `figures/generation/scenarios/` 下为每个成功场景输出一张
+波阻抗、地震和状态组合图。绘图失败记录在图件清单中，不中断数据生成。
+
 ## 快速开始
 
 先冻结阻抗校准：
@@ -50,8 +54,8 @@ python scripts\synthoseis_lite.py `
 ```yaml
 synthoseis_lite:
   sample_domain: depth
-  benchmark_schema: structured_synthetic_benchmark_v1
-  science_revision: synthoseis_lite_science_v4
+  benchmark_schema: structured_synthetic_corpus_v2
+  science_revision: synthoseis_lite_science_v5
   seismic_input:
     policy: observed_highres_forward
 ```
@@ -131,6 +135,11 @@ realization_index.csv
 - staging group 为空；
 - root artifact identity 正确；
 - disk Oracle 按请求通过。
+
+preflight 负责在正演前确认各配额桶有足够的 truth-valid candidate。正式生成中的
+单个 projection、forward 或 benchmark-build 拒绝会记录 warning，并由同配额桶的
+备用 candidate 接替。备用耗尽后的短缺记录在 `quota_report.csv`，不会丢弃此前已
+生成的有效 parent；artifact schema、采样轴、HDF5 事务和 Oracle 错误仍阻止发布。
 
 ## 波形扰动
 

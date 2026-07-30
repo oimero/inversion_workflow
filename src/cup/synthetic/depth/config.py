@@ -19,6 +19,7 @@ from cup.synthetic.schemas import (
     SCIENCE_REVISION,
 )
 from cup.synthetic.core.config import parse_object_core_controls
+from cup.synthetic.core.corpus import CorpusBudget
 from cup.utils.io import (
     is_consumable_contract_status,
     load_yaml_config,
@@ -115,16 +116,16 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     root = _mapping(config.get("synthoseis_lite"), path="synthoseis_lite")
     if "seismic_mismatch" in root or "lfm" in root:
         raise ValueError(
-            "Synthoseis-lite v5 does not accept legacy mismatch or LFM degradation fields."
+            "Synthoseis-lite accepts only canonical observation fields."
         )
     allowed_root = {
         "sample_domain", "benchmark_schema", "science_revision", "global_seed", "source_runs", "sampling", "geometry", "sections",
-        "calibration", "impedance_attribute_generator", "generation", "splits",
+        "calibration", "impedance_attribute_generator", "generation", "corpus",
         "seismic_input", "seismic_forward", "figures",
     }
     if "probe_selection" in root:
         raise ValueError(
-            "synthoseis_lite.probe_selection is not part of the v5 canonical benchmark."
+            "synthoseis_lite.probe_selection is not part of the canonical benchmark."
         )
     _reject_unknown(root, allowed_root, path="synthoseis_lite")
     if str(root.get("sample_domain") or "").casefold() != "depth" or str(root.get("benchmark_schema") or "") != SCHEMA_VERSION:
@@ -144,7 +145,7 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     )
     if set(seismic_input) != {"policy"} or str(seismic_input.get("policy")) != "observed_highres_forward":
         raise ValueError(
-            "Depth Synthoseis v5 requires "
+            "Depth Synthoseis requires "
             "seismic_input.policy='observed_highres_forward'."
         )
     seismic_forward = _mapping(
@@ -165,9 +166,9 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("Depth Synthoseis forward dtype is fixed to float64.")
     seismic = _mapping(config.get("seismic"), path="seismic")
     if str(seismic.get("domain", "")).casefold() != "depth":
-        raise ValueError("Depth Synthoseis v5 requires seismic.domain='depth'.")
+        raise ValueError("Depth Synthoseis requires seismic.domain='depth'.")
     if str(seismic.get("depth_basis", "")).casefold() != "tvdss":
-        raise ValueError("Depth Synthoseis v5 requires seismic.depth_basis='tvdss'.")
+        raise ValueError("Depth Synthoseis requires seismic.depth_basis='tvdss'.")
 
     target = _mapping(config.get("target_interval"), path="target_interval")
     raw_horizons = target.get("horizons")
@@ -214,20 +215,18 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     model_dz = _positive_float(sampling.get("expected_model_dz_m"), path="sampling.expected_model_dz_m")
     oversampling = _positive_int(sampling.get("vertical_oversampling_factor"), path="sampling.vertical_oversampling_factor")
     if model_dz != 5.0 or oversampling != 8:
-        raise ValueError("Depth v5 is frozen to 5 m model sampling and 8x oversampling.")
+        raise ValueError("The depth benchmark uses 5 m model sampling and 8x oversampling.")
 
     geometry = _mapping(root.get("geometry"), path="synthoseis_lite.geometry")
     _reject_unknown(geometry, {"lateral_sample_interval_m", "field_conditioned"}, path="synthoseis_lite.geometry")
     field = _mapping(geometry.get("field_conditioned"), path="synthoseis_lite.geometry.field_conditioned")
     _reject_unknown(field, {"enabled", "target_zone"}, path="synthoseis_lite.geometry.field_conditioned")
     if field.get("enabled") is not True:
-        raise ValueError("Depth v5 requires geometry.field_conditioned.enabled=true.")
+        raise ValueError("Depth generation requires geometry.field_conditioned.enabled=true.")
     target_zone = _mapping(field.get("target_zone"), path="synthoseis_lite.geometry.field_conditioned.target_zone")
     if target_zone != {"mode": "filled_target_zone"}:
-        raise ValueError("Depth v5 target_zone must be exactly mode=filled_target_zone.")
+        raise ValueError("Depth target_zone must use mode=filled_target_zone.")
     lateral_interval = _positive_float(geometry.get("lateral_sample_interval_m"), path="geometry.lateral_sample_interval_m")
-    if lateral_interval != 25.0:
-        raise ValueError("Depth v5 uses a frozen 25 m lateral sample interval.")
 
     raw_sections = root.get("sections")
     if not isinstance(raw_sections, list) or not raw_sections:
@@ -235,7 +234,12 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     sections: list[dict[str, Any]] = []
     for index, raw in enumerate(raw_sections):
         item = _mapping(raw, path=f"synthoseis_lite.sections[{index}]")
-        _reject_unknown(item, {"section_id", "path"}, path=f"synthoseis_lite.sections[{index}]")
+        _reject_unknown(item, {"section_id", "corpus_role", "path"}, path=f"synthoseis_lite.sections[{index}]")
+        corpus_role = str(item.get("corpus_role") or "")
+        if corpus_role not in {"short_patch", "full_section"}:
+            raise ValueError(
+                f"synthoseis_lite.sections[{index}].corpus_role is invalid."
+            )
         points = item.get("path")
         if not isinstance(points, list) or len(points) < 2:
             raise ValueError(f"synthoseis_lite.sections[{index}].path needs at least two points.")
@@ -244,7 +248,16 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
             point = _mapping(raw_point, path=f"sections[{index}].path[{point_index}]")
             _reject_unknown(point, {"inline", "xline"}, path=f"sections[{index}].path[{point_index}]")
             parsed_points.append({"inline": float(point["inline"]), "xline": float(point["xline"])})
-        sections.append({"section_id": _required_text(item, "section_id", path=f"sections[{index}]"), "path": parsed_points})
+        sections.append({
+            "section_id": _required_text(item, "section_id", path=f"sections[{index}]"),
+            "corpus_role": corpus_role,
+            "path": parsed_points,
+        })
+    if {item["corpus_role"] for item in sections} != {"short_patch", "full_section"}:
+        raise ValueError("sections must include short_patch and full_section paths.")
+
+    corpus_raw = _mapping(root.get("corpus"), path="synthoseis_lite.corpus")
+    corpus_budget = CorpusBudget.from_mapping(corpus_raw)
 
     calibration = _mapping(root.get("calibration"), path="synthoseis_lite.calibration")
     _reject_unknown(calibration, {"background_estimator", "huber_delta_sigma", "minimum_valid_cells_per_well_zone"}, path="synthoseis_lite.calibration")
@@ -269,12 +282,12 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     object_core_controls = parse_object_core_controls(impedance)
     duration_models = _mapping(impedance.get("duration_modes"), path="impedance_attribute_generator.duration_modes")
     if set(duration_models) != {"standard"}:
-        raise ValueError("Depth v5 supports only the standard duration mode.")
+        raise ValueError("Depth generation supports only the standard duration mode.")
     standard_mode = _mapping(duration_models["standard"], path="duration_modes.standard")
     _reject_unknown(standard_mode, {"minimum_highres_cells"}, path="duration_modes.standard")
 
     generation = _mapping(root.get("generation"), path="synthoseis_lite.generation")
-    _reject_unknown(generation, {"attempts_per_scenario", "duration_modes", "geometry_families", "geometry_directions", "acceptance_qc"}, path="synthoseis_lite.generation")
+    _reject_unknown(generation, {"duration_modes", "geometry_families", "geometry_directions", "acceptance_qc"}, path="synthoseis_lite.generation")
     if list(generation.get("duration_modes") or []) != ["standard"]:
         raise ValueError("generation.duration_modes must be [standard].")
     geometry_families = [str(value) for value in generation.get("geometry_families") or []]
@@ -284,19 +297,11 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not directions or not set(directions) <= {"left_to_right", "right_to_left"}:
         raise ValueError("generation.geometry_directions contains unsupported values.")
     acceptance = _mapping(generation.get("acceptance_qc"), path="generation.acceptance_qc")
-    _reject_unknown(acceptance, {"minimum_attempts_per_scenario", "warning_fraction", "severe_warning_fraction"}, path="generation.acceptance_qc")
+    _reject_unknown(acceptance, {"warning_fraction", "severe_warning_fraction"}, path="generation.acceptance_qc")
     warning = float(acceptance.get("warning_fraction"))
     severe_warning = float(acceptance.get("severe_warning_fraction"))
     if not 0.0 <= severe_warning < warning <= 1.0:
         raise ValueError("generation acceptance fractions must satisfy 0 <= severe_warning < warning <= 1.")
-
-    splits = _mapping(root.get("splits"), path="synthoseis_lite.splits")
-    _reject_unknown(splits, {"assignment_unit", "held_out_geometry_family"}, path="synthoseis_lite.splits")
-    if splits.get("assignment_unit") != "parent_realization":
-        raise ValueError("splits.assignment_unit must be parent_realization.")
-    held_out = str(splits.get("held_out_geometry_family") or "")
-    if held_out not in geometry_families:
-        raise ValueError("held_out_geometry_family must be one configured geometry family.")
 
     figures = _mapping(root.get("figures"), path="synthoseis_lite.figures")
     _reject_unknown(
@@ -330,6 +335,7 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
         },
         "horizons": horizons,
         "sections": sections,
+        "corpus": dict(corpus_budget.__dict__),
         "sampling": {
             "expected_model_dz_m": model_dz,
             "vertical_oversampling_factor": oversampling,
@@ -349,8 +355,7 @@ def parse_depth_config(config: Mapping[str, Any]) -> dict[str, Any]:
             ),
             **object_core_controls,
         },
-        "generation": {"attempts_per_scenario": _positive_int(generation.get("attempts_per_scenario"), path="generation.attempts_per_scenario"), "duration_modes": ["standard"], "geometry_families": geometry_families, "geometry_directions": directions, "acceptance_qc": {"minimum_attempts_per_scenario": _positive_int(acceptance.get("minimum_attempts_per_scenario"), path="generation.acceptance_qc.minimum_attempts_per_scenario"), "warning_fraction": warning, "severe_warning_fraction": severe_warning}},
-        "splits": {"assignment_unit": "parent_realization", "held_out_geometry_family": held_out},
+        "generation": {"duration_modes": ["standard"], "geometry_families": geometry_families, "geometry_directions": directions, "acceptance_qc": {"warning_fraction": warning, "severe_warning_fraction": severe_warning}},
         "seismic_input": {"policy": "observed_highres_forward"},
         "seismic_forward": {"backend": backend, "dtype": "float64"},
         "figures": {
@@ -479,12 +484,8 @@ def resolve_depth_sources(
         dict(forward.get("input_contracts") or {}).get("rock_physics_analysis")
         or {}
     )
-    if str(recorded_rock_contract.get("contract_fingerprint_sha256") or "") != str(
-        rock_fingerprint
-    ):
-        raise ValueError(
-            "forward_model_inputs and selected rock_physics_analysis have different contracts."
-        )
+    if not str(recorded_rock_contract.get("contract_fingerprint_sha256") or ""):
+        raise ValueError("forward_model_inputs lacks rock-physics provenance.")
     relation_path = resolve_relative_path(
         str(dict(forward.get("ai_velocity_relation") or {}).get("path") or ""),
         root=repo_root,

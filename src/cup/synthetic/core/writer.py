@@ -108,7 +108,8 @@ def _columnar_table(
     return group
 
 
-def _validate_structured_tables(record: StructuredSampleRecord) -> None:
+def validate_structured_truth_tables(record: StructuredSampleRecord) -> None:
+    """Validate parent-local zone/segment topology before HDF5 publication."""
     truth = record.truth
     zone_rows = truth.structured_zone_truth
     segment_rows = truth.structured_segment_truth
@@ -256,7 +257,7 @@ def _write_observed(
     model_axis_path: str,
 ) -> None:
     domain = record.truth.sample_domain
-    amplitude_unit = "amplitude" if domain == "depth" else "normalized_amplitude"
+    amplitude_unit = "arbitrary_amplitude"
     group = root.create_group("observed")
     for name, values, unit, dtype in (
         ("seismic", record.forward.seismic_observed, amplitude_unit, np.float32),
@@ -287,31 +288,33 @@ def _write_truth(
     domain = truth.sample_domain
     group = root.create_group("truth")
     highres = (
-        ("log_ai_highres", truth.log_ai_highres, "ln(m/s*g/cm3)"),
-        ("rgt_highres", truth.rgt_highres, "normalized_zone"),
-        ("state_id_highres", truth.state_id_highres, "category"),
-        ("object_id_highres", truth.object_id_highres, "category"),
-        ("object_xi_highres", truth.object_xi_highres, "normalized_object"),
-        ("zone_id_highres", truth.zone_id_highres, "category"),
-        ("geometry_event_mask_highres", truth.geometry_event_mask_highres, "bool"),
-        ("boundary_mask_highres", truth.boundary_mask_highres, "bool"),
-        ("truth_valid_highres", np.isfinite(truth.log_ai_highres), "bool"),
-        ("clipping_mask_highres", truth.clipping_mask_highres, "bool"),
+        ("log_ai_highres", truth.log_ai_highres, "ln(m/s*g/cm3)", np.float32),
+        ("state_id_highres", truth.state_id_highres, "category", np.int8),
+        ("object_id_highres", truth.object_id_highres, "category", np.int32),
+        (
+            "object_xi_highres",
+            truth.object_xi_highres,
+            "normalized_object",
+            np.float32,
+        ),
+        ("zone_id_highres", truth.zone_id_highres, "category", np.int16),
+        (
+            "truth_valid_highres",
+            np.isfinite(truth.log_ai_highres),
+            "bool",
+            None,
+        ),
+        ("clipping_mask_highres", truth.clipping_mask_highres, "bool", None),
     )
     model = (
-        ("model_log_ai", projected.model_target_log_ai, "ln(m/s*g/cm3)"),
-        ("rgt_model", projected.rgt_model, "normalized_zone"),
-        ("state_fraction_model", projected.state_fraction_model, "fraction"),
-        ("dominant_object_id_model", projected.dominant_object_id_model, "category"),
-        ("zone_id_model", projected.zone_id_model, "category"),
-        ("boundary_fraction_model", projected.boundary_fraction_model, "fraction"),
-        ("boundary_mask_model", projected.boundary_mask_model, "bool"),
-        ("geometric_valid_mask_model", projected.geometric_valid_mask_model, "bool"),
-        ("categorical_valid_mask_model", projected.categorical_valid_mask_model, "bool"),
-        ("projection_support_highres", projected.projection_support_highres, "bool"),
-        ("projection_support_model", projected.projection_support_model, "bool"),
+        (
+            "model_log_ai",
+            projected.model_target_log_ai,
+            "ln(m/s*g/cm3)",
+            np.float32,
+        ),
     )
-    for name, values, unit in highres:
+    for name, values, unit, dtype in highres:
         _dataset(
             group,
             name,
@@ -320,8 +323,9 @@ def _write_truth(
             sample_domain=domain,
             axis_path=high_axis_path,
             axis_order="lateral,sample",
+            dtype=dtype,
         )
-    for name, values, unit in model:
+    for name, values, unit, dtype in model:
         order = "lateral,sample,state" if np.asarray(values).ndim == 3 else "lateral,sample"
         _dataset(
             group,
@@ -331,6 +335,7 @@ def _write_truth(
             sample_domain=domain,
             axis_path=model_axis_path,
             axis_order=order,
+            dtype=dtype,
         )
     zone_columns = (
         "zone_id",
@@ -386,7 +391,7 @@ def _write_forward(
     model_axis_path: str,
 ) -> None:
     domain = record.truth.sample_domain
-    amplitude_unit = "amplitude" if domain == "depth" else "normalized_amplitude"
+    amplitude_unit = "arbitrary_amplitude"
     forward = record.forward
     group = root.create_group("forward")
     _dataset(
@@ -399,32 +404,6 @@ def _write_forward(
         axis_order="lateral,sample",
         dtype=np.float32,
     )
-    _dataset(
-        group,
-        "subgrid_residual",
-        forward.subgrid_forward_residual,
-        unit=amplitude_unit,
-        sample_domain=domain,
-        axis_path=model_axis_path,
-        axis_order="lateral,sample",
-        dtype=np.float32,
-    )
-    support = group.create_group("support")
-    for name, values, axis_path in (
-        ("highres", forward.support.highres, high_axis_path),
-        ("model", forward.support.model, model_axis_path),
-        ("observed", forward.support.observed, model_axis_path),
-        ("physics", forward.support.physics, model_axis_path),
-    ):
-        _dataset(
-            support,
-            name,
-            values,
-            unit="bool",
-            sample_domain=domain,
-            axis_path=axis_path,
-            axis_order="lateral,sample",
-        )
     context = forward.metadata.get("structured_forward_context")
     if not isinstance(context, Mapping):
         raise ValueError("structured sample requires structured_forward_context metadata")
@@ -447,60 +426,7 @@ def _write_forward(
         "ai_velocity_relation_json",
         context.get("ai_velocity_relation"),
     )
-    extras = group.create_group("domain_extras")
-    if isinstance(forward.extras, DepthForwardExtras):
-        for name, values, axis_path in (
-            ("vp_highres_mps", forward.extras.vp_highres_mps, high_axis_path),
-            ("vp_model_mps", forward.extras.vp_model_mps, model_axis_path),
-        ):
-            _dataset(
-                extras,
-                name,
-                values,
-                unit="m/s",
-                sample_domain=domain,
-                axis_path=axis_path,
-                axis_order="lateral,sample",
-                dtype=np.float32,
-            )
-    elif isinstance(forward.extras, TimeForwardExtras):
-        parent_path = model_axis_path.rsplit("/axes/", 1)[0]
-        for name, values, axis_path, unit in (
-            (
-                "reflectivity_highres",
-                forward.extras.reflectivity_highres,
-                f"{parent_path}/axes/twt_forward_highres_s",
-                "ratio",
-            ),
-            (
-                "reflectivity_model",
-                forward.extras.reflectivity_model,
-                f"{parent_path}/axes/twt_forward_model_s",
-                "ratio",
-            ),
-            (
-                "forward_valid_mask_highres",
-                forward.extras.forward_valid_mask_highres,
-                f"{parent_path}/axes/twt_forward_highres_s",
-                "bool",
-            ),
-            (
-                "forward_valid_mask_model",
-                forward.extras.forward_valid_mask_model,
-                f"{parent_path}/axes/twt_forward_model_s",
-                "bool",
-            ),
-        ):
-            _dataset(
-                extras,
-                name,
-                values,
-                unit=unit,
-                sample_domain=domain,
-                axis_path=axis_path,
-                axis_order="lateral,sample",
-            )
-    else:
+    if not isinstance(forward.extras, (DepthForwardExtras, TimeForwardExtras)):
         raise TypeError("structured sample has unsupported forward extras")
 
 
@@ -511,7 +437,7 @@ def write_structured_sample(
     """Write, validate and commit one complete parent realization."""
     if not isinstance(sample, StructuredSampleRecord):
         raise TypeError("write_structured_sample requires StructuredSampleRecord")
-    _validate_structured_tables(sample)
+    validate_structured_truth_tables(sample)
     realization_id = sample.truth.realization_id
     final_path = f"/realizations/{realization_id}"
     if final_path in h5:
@@ -567,5 +493,6 @@ def write_structured_sample(
 __all__ = [
     "ArtifactReference",
     "serialize_qc_attributes",
+    "validate_structured_truth_tables",
     "write_structured_sample",
 ]

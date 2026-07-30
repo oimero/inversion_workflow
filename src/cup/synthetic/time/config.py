@@ -11,6 +11,7 @@ import numpy as np
 from cup.config.sources import assert_recorded_source_matches, require_source_files
 from cup.synthetic.core.calibration import GENERATOR_FAMILY
 from cup.synthetic.core.config import parse_object_core_controls
+from cup.synthetic.core.corpus import CorpusBudget
 from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION, SCIENCE_REVISION
 from cup.utils.io import resolve_relative_path
 
@@ -79,7 +80,10 @@ def _parse_sections(root: Mapping[str, Any]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     for index, value in enumerate(raw):
         item = _mapping(value, path=f"synthoseis_lite.sections[{index}]")
-        _reject_unknown(item, {"section_id", "path"}, path=f"synthoseis_lite.sections[{index}]")
+        _reject_unknown(item, {"section_id", "corpus_role", "path"}, path=f"synthoseis_lite.sections[{index}]")
+        corpus_role = str(item.get("corpus_role") or "")
+        if corpus_role not in {"short_patch", "full_section"}:
+            raise ValueError(f"sections[{index}].corpus_role is invalid")
         section_id = _required_text(item, "section_id", path=f"sections[{index}]")
         if section_id in seen:
             raise ValueError(f"duplicate section_id: {section_id}")
@@ -92,7 +96,13 @@ def _parse_sections(root: Mapping[str, Any]) -> list[dict[str, Any]]:
             point = _mapping(value, path=f"sections[{index}].path[{point_index}]")
             _reject_unknown(point, {"inline", "xline"}, path=f"sections[{index}].path[{point_index}]")
             parsed_points.append({"inline": float(point["inline"]), "xline": float(point["xline"])})
-        result.append({"section_id": section_id, "path": parsed_points})
+        result.append({
+            "section_id": section_id,
+            "corpus_role": corpus_role,
+            "path": parsed_points,
+        })
+    if {item["corpus_role"] for item in result} != {"short_patch", "full_section"}:
+        raise ValueError("sections must include short_patch and full_section paths")
     return result
 
 
@@ -126,7 +136,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     allowed = {
         "sample_domain", "benchmark_schema", "science_revision", "global_seed",
         "source_runs", "sampling", "geometry", "sections", "impedance_attribute_generator",
-        "generation", "splits", "seismic_input", "forward_qc", "figures",
+        "generation", "seismic_input", "forward_qc", "figures", "corpus",
     }
     _reject_unknown(root, allowed, path="synthoseis_lite")
     if str(root.get("sample_domain") or "").casefold() != "time":
@@ -152,7 +162,7 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("time target_zone.mode must be filled_target_zone")
 
     generation = _mapping(root.get("generation"), path="generation")
-    _reject_unknown(generation, {"attempts_per_scenario", "duration_modes", "geometry_families", "geometry_directions", "acceptance_qc"}, path="generation")
+    _reject_unknown(generation, {"duration_modes", "geometry_families", "geometry_directions", "acceptance_qc"}, path="generation")
     duration_modes = [str(value) for value in generation.get("duration_modes") or []]
     geometry_families = [str(value) for value in generation.get("geometry_families") or []]
     geometry_directions = [str(value) for value in generation.get("geometry_directions") or []]
@@ -163,15 +173,11 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not geometry_directions or not set(geometry_directions) <= {"left_to_right", "right_to_left"}:
         raise ValueError("generation.geometry_directions contains unsupported values")
     acceptance = _mapping(generation.get("acceptance_qc"), path="generation.acceptance_qc")
-    _reject_unknown(acceptance, {"minimum_attempts_per_scenario", "warning_fraction", "severe_warning_fraction"}, path="generation.acceptance_qc")
+    _reject_unknown(acceptance, {"warning_fraction", "severe_warning_fraction"}, path="generation.acceptance_qc")
     warning = float(acceptance["warning_fraction"]); severe_warning = float(acceptance["severe_warning_fraction"])
     if not 0.0 <= severe_warning < warning <= 1.0:
         raise ValueError("generation acceptance fractions must satisfy 0 <= severe_warning < warning <= 1")
 
-    splits = _mapping(root.get("splits"), path="splits")
-    _reject_unknown(splits, {"assignment_unit", "held_out_geometry_family"}, path="splits")
-    if splits.get("assignment_unit") != "parent_realization" or str(splits.get("held_out_geometry_family")) not in geometry_families:
-        raise ValueError("splits must assign parent_realization and name a configured held-out geometry family")
     seismic_input = _mapping(root.get("seismic_input"), path="seismic_input")
     _reject_unknown(seismic_input, {"policy"}, path="seismic_input")
     if seismic_input.get("policy") != "observed_highres_forward":
@@ -183,6 +189,9 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if highres.get("enabled") is not True or highres.get("required") is not True:
         raise ValueError("forward_qc.highres_forward.enabled and required must be true")
 
+    corpus = CorpusBudget.from_mapping(
+        _mapping(root.get("corpus"), path="synthoseis_lite.corpus")
+    )
     figures = _mapping(root.get("figures"), path="figures")
     _reject_unknown(figures, {"enabled", "max_example_objects_per_zone_state", "report_examples"}, path="figures")
     return {
@@ -190,11 +199,11 @@ def parse_synthoseis_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "global_seed": int(root.get("global_seed")), "source_runs": _parse_sources(root),
         "sampling": {"expected_output_dt_s": output_dt, "vertical_oversampling_factor": factor},
         "horizons": _parse_horizons(config), "sections": _parse_sections(root),
+        "corpus": dict(corpus.__dict__),
         "lateral_sample_interval_m": _positive(geometry.get("lateral_sample_interval_m"), path="geometry.lateral_sample_interval_m"),
         "target_zone": {key: target_zone.get(key) for key in ("mode", "nearest_distance_limit", "outlier_threshold", "outlier_min_neighbor_count", "min_thickness_s")},
         "impedance": _parse_impedance(root),
-        "generation": {"attempts_per_scenario": int(_positive(generation.get("attempts_per_scenario"), path="generation.attempts_per_scenario")), "duration_modes": duration_modes, "geometry_families": geometry_families, "geometry_directions": geometry_directions, "acceptance_qc": {"minimum_attempts_per_scenario": int(_positive(acceptance.get("minimum_attempts_per_scenario"), path="acceptance.minimum_attempts_per_scenario")), "warning_fraction": warning, "severe_warning_fraction": severe_warning}},
-        "splits": {"assignment_unit": "parent_realization", "held_out_geometry_family": str(splits["held_out_geometry_family"])},
+        "generation": {"duration_modes": duration_modes, "geometry_families": geometry_families, "geometry_directions": geometry_directions, "acceptance_qc": {"warning_fraction": warning, "severe_warning_fraction": severe_warning}},
         "seismic_input": {"policy": "observed_highres_forward"},
         "forward_qc": {"highres_forward_enabled": True, "highres_forward_required": True},
         "figures": {"enabled": bool(figures.get("enabled", True)), "max_example_objects_per_zone_state": int(figures.get("max_example_objects_per_zone_state", 1)), "report_examples": dict(figures.get("report_examples") or {})},

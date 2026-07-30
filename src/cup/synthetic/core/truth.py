@@ -424,7 +424,7 @@ def _object_lateral_parameters(
     coefficients = np.empty((n_objects, n_lateral, 3), dtype=np.float64)
     thickness_weights = np.empty((n_objects, n_lateral), dtype=np.float64)
     field_qc: list[dict[str, Any]] = []
-    requested_lx = float(scenario.correlation_length_fraction * lateral_m[-1])
+    requested_lx = float(scenario.correlation_length_m)
     spacing = float(np.median(np.diff(lateral_m)))
     effective_lx = max(requested_lx, 4.0 * spacing)
     for object_index, item in enumerate(objects):

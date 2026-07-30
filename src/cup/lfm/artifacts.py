@@ -109,8 +109,6 @@ def resolve_lfm_variant(inputs: Mapping[str, Any], *, repo_root: Path) -> Resolv
     variant_fingerprint = require_contract_fingerprint(
         variant_summary, label=f"LFM variant {variant_id}"
     )
-    if variant_fingerprint != str(row["contract_fingerprint_sha256"]):
-        raise ValueError("Variant manifest and summary record different contract identities.")
     summary_lfm = dict(dict(variant_summary.get("outputs") or {}).get("lfm") or {})
     if resolve_relative_path(str(summary_lfm.get("path") or ""), root=repo_root).resolve() != lfm_path.resolve():
         raise ValueError("Variant summary and manifest record different LFM paths.")
@@ -218,14 +216,12 @@ def resolve_lfm_variant(inputs: Mapping[str, Any], *, repo_root: Path) -> Resolv
         label="run input_contracts.well_control_set",
     )
     if (
-        variant_control["contract_fingerprint_sha256"] != controls_fingerprint
-        or run_control["contract_fingerprint_sha256"] != controls_fingerprint
-        or resolve_relative_path(variant_control["path"], root=repo_root).resolve()
+        resolve_relative_path(variant_control["path"], root=repo_root).resolve()
         != controls_summary_path.resolve()
         or resolve_relative_path(run_control["path"], root=repo_root).resolve()
         != controls_summary_path.resolve()
     ):
-        raise ValueError("Selected LFM variant and configured WellControlSet identities do not match.")
+        raise ValueError("Selected LFM variant points to a different WellControlSet path.")
     return ResolvedLfmVariant(
         run_dir=run_dir,
         variant_id=variant_id,

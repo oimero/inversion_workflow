@@ -14,7 +14,7 @@ class GenerationScenario:
     duration_mode: str
     geometry_family: str
     geometry_direction: str
-    correlation_length_fraction: float
+    correlation_length_m: float
     coefficient_sigma_multiplier: float
     thickness_log_sigma: float
     geometry_variant_id: str = ""
@@ -50,7 +50,7 @@ class GenerationScenario:
         elif self.geometry_variant_id:
             raise ValueError("geometry_variant_id is only valid for pinchout scenarios.")
         for name in (
-            "correlation_length_fraction",
+            "correlation_length_m",
             "coefficient_sigma_multiplier",
             "thickness_log_sigma",
         ):
@@ -65,7 +65,7 @@ def generation_scenarios(script_cfg: Mapping[str, Any]) -> list[GenerationScenar
     impedance = script_cfg["impedance"]
     scenarios: list[GenerationScenario] = []
     for duration_mode in generation["duration_modes"]:
-        for correlation in impedance["correlation_length_section_fractions"]:
+        for correlation in impedance["correlation_length_m"]:
             pairs = zip(
                 impedance["coefficient_sigma_multipliers"],
                 impedance["thickness_log_sigma_values"],
@@ -79,7 +79,7 @@ def generation_scenarios(script_cfg: Mapping[str, Any]) -> list[GenerationScenar
                     for direction in directions:
                         for geometry_variant_id in variants:
                             scenario_id = (
-                                f"{duration_mode}__lx{correlation:g}__a{coefficient_sigma:g}"
+                                f"{duration_mode}__lx{correlation:g}m__a{coefficient_sigma:g}"
                                 f"__t{thickness_sigma:g}__{family}__{direction}"
                                 + (
                                     f"__{geometry_variant_id}"
@@ -93,7 +93,7 @@ def generation_scenarios(script_cfg: Mapping[str, Any]) -> list[GenerationScenar
                                     duration_mode=str(duration_mode),
                                     geometry_family=str(family),
                                     geometry_direction=str(direction),
-                                    correlation_length_fraction=float(correlation),
+                                    correlation_length_m=float(correlation),
                                     coefficient_sigma_multiplier=float(coefficient_sigma),
                                     thickness_log_sigma=float(thickness_sigma),
                                     geometry_variant_id=geometry_variant_id,

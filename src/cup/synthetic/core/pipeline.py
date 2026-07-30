@@ -21,8 +21,15 @@ import numpy as np
 import pandas as pd
 
 from cup.synthetic.core.canonical_artifact import publish_realization_index
+from cup.synthetic.core.corpus import (
+    CorpusBudget,
+    FAMILIES,
+    build_corpus_v2_plan,
+    published_quota_report,
+    required_quota_counts,
+    select_accepted_quota,
+)
 from cup.synthetic.core.artifacts import (
-    build_attempt_plan,
     limit_attempt_plan,
     rejection_reason_summary,
     validate_debug_attempt_limit,
@@ -34,10 +41,17 @@ from cup.synthetic.core.field_runner import (
     run_attempt_preflight,
     stable_records_frame,
 )
-from cup.synthetic.core.rejections import StagedRejection
-from cup.synthetic.core.writer import write_structured_sample
+from cup.synthetic.core.rejections import BenchmarkBuildRejected, StagedRejection
+from cup.synthetic.core.writer import (
+    validate_structured_truth_tables,
+    write_structured_sample,
+)
 from cup.synthetic.core.records import StructuredSampleRecord
-from cup.synthetic.reporting.figures import write_generation_figures
+from cup.synthetic.reporting.figures import (
+    write_figure_failure_manifest,
+    write_generation_figures,
+)
+from cup.synthetic.schemas import STRUCTURED_ARTIFACT_VERSION
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
@@ -207,7 +221,7 @@ def _validate_published_artifact(directory: Path, *, qc_only: bool) -> None:
 
     The reader is intentionally imported here, rather than at module import
     time, so the shared pipeline keeps the writer/reader dependency one-way.
-    QC-only runs deliberately do not satisfy the training-consumable v5
+    QC-only runs deliberately do not satisfy the training-consumable
     artifact contract and therefore retain their separate publication path.
     """
     if qc_only:
@@ -226,7 +240,7 @@ class SyntheticDomainAdapter(Protocol):
     generator_family: str
 
     def validate_axis(self, sample_axis: np.ndarray) -> None:
-        """Validate the regular axis consumed by the shared view pipeline."""
+        """Validate the regular axis consumed by the shared pipeline."""
 
     # The following methods are the deep lifecycle seam.  They are intentionally
     # methods on the adapter rather than callbacks supplied by each entrypoint.
@@ -288,10 +302,9 @@ class GenerationSession:
     generator_family: str
     hdf5_attributes: Mapping[str, Any]
     section_ids: Sequence[str] = field(default_factory=tuple)
+    section_roles: Mapping[str, str] = field(default_factory=dict)
     scenarios: Sequence[Any] = field(default_factory=tuple)
-    attempts_per_scenario: int | None = None
-    held_out_geometry_family: str | None = None
-    geometry_families: Sequence[str] | None = None
+    corpus_budget: CorpusBudget | None = None
     debug_attempt_limit: int | None = None
     input_contracts: Mapping[str, Any] = field(default_factory=dict)
     preflight_summary_prefix: Mapping[str, Any] = field(default_factory=dict)
@@ -306,20 +319,30 @@ class GenerationSession:
     def resolve_plan(self, debug_attempt_limit: int | None) -> pd.DataFrame:
         """Build the neutral attempt plan exactly once in the shared Pipeline."""
         if self.plan is None:
-            if (
-                not self.section_ids
-                or not self.scenarios
-                or self.attempts_per_scenario is None
-                or self.held_out_geometry_family is None
-            ):
-                raise RuntimeError("generation session lacks attempt-plan inputs")
-            plan = build_attempt_plan(
-                section_ids=tuple(str(value) for value in self.section_ids),
-                scenarios=self.scenarios,
-                attempts_per_scenario=int(self.attempts_per_scenario),
-                held_out_geometry_family=str(self.held_out_geometry_family),
-                geometry_families=self.geometry_families,
-            )
+            if self.corpus_budget is not None:
+                short_ids = tuple(
+                    section_id
+                    for section_id in self.section_ids
+                    if self.section_roles.get(section_id) == "short_patch"
+                )
+                full_ids = tuple(
+                    section_id
+                    for section_id in self.section_ids
+                    if self.section_roles.get(section_id) == "full_section"
+                )
+                plan = build_corpus_v2_plan(
+                    short_section_ids=short_ids,
+                    full_section_ids=full_ids,
+                    scenarios=self.scenarios,
+                    budget=self.corpus_budget,
+                )
+                return limit_attempt_plan(
+                    plan,
+                    debug_attempt_limit
+                    if debug_attempt_limit is not None
+                    else self.debug_attempt_limit,
+                )
+            raise RuntimeError("generation session lacks canonical V2 corpus budget")
         else:
             plan = self.plan
         return limit_attempt_plan(
@@ -351,7 +374,7 @@ class SyntheticBenchmarkPipeline:
     Adapters prepare domain science and return a :class:`GenerationSession`;
     this class owns every public benchmark transition after that point.  In
     particular, it owns the parent transaction which includes the base sample
-    and all declared views, so a failed view cannot leave a partial parent.
+    and all declared outputs, so a failure cannot leave a partial parent.
     """
 
     def __init__(self, domain_adapter: SyntheticDomainAdapter) -> None:
@@ -523,11 +546,23 @@ class SyntheticBenchmarkPipeline:
         _write_json(output_dir / "preflight_summary.json", preflight_summary)
         if not preflight_has_usable_parent:
             raise RuntimeError(f"{session.sample_domain}_generation_preflight_no_accepted_realizations")
+        generation_plan = preflight.accepted_plan
+        expected_quota: dict[str, int] = {}
+        if session.corpus_budget is not None and not development_limited:
+            # This is the final hard preflight gate: every bucket must have
+            # enough truth-valid candidates before expensive forward work.
+            # Formal generation keeps all accepted reserves so a later staged
+            # scientific rejection can consume the next candidate in-bucket.
+            select_accepted_quota(
+                preflight.accepted_plan,
+                session.corpus_budget,
+            )
+            expected_quota = required_quota_counts(session.corpus_budget)
 
         h5_path = output_dir / "synthetic_benchmark.h5"
         h5_attrs = {
             "artifact_type": "structured_synthetic_benchmark",
-            "artifact_version": 1,
+            "artifact_version": STRUCTURED_ARTIFACT_VERSION,
             "schema": session.schema_version,
             "schema_version": session.schema_version,
             "sample_domain": session.sample_domain,
@@ -554,17 +589,33 @@ class SyntheticBenchmarkPipeline:
         qc_rows: list[dict[str, Any]] = []
         rejection_rows: list[dict[str, Any]] = list(preflight.rejection_details)
         domain_rows: dict[str, list[dict[str, Any]]] = {}
+        generated_trace_count = 0
+        generation_elapsed_s = 0.0
+        generation_attempt_count = 0
+        attempted_generation_rows: list[dict[str, Any]] = []
+        accepted_quota = {bucket: 0 for bucket in expected_quota}
         with AttemptProgressLog(
             output_dir / "attempt_progress.csv",
             phase="generation",
-            plan=preflight.accepted_plan,
+            plan=generation_plan,
             qc_config=acceptance_qc,
             logger=logger,
             append=True,
         ) as progress, h5py.File(h5_path, "w") as h5:
             for key, value in h5_attrs.items():
                 h5.attrs[key] = value
-            for sequence_index, row in enumerate(preflight.accepted_plan.to_dict(orient="records"), start=1):
+            for row in generation_plan.to_dict(orient="records"):
+                quota_bucket = str(row.get("quota_bucket") or "")
+                if expected_quota:
+                    if quota_bucket not in expected_quota:
+                        raise ValueError(
+                            f"generation candidate has unknown quota bucket: {quota_bucket}"
+                        )
+                    if accepted_quota[quota_bucket] >= expected_quota[quota_bucket]:
+                        continue
+                generation_attempt_count += 1
+                sequence_index = generation_attempt_count
+                attempted_generation_rows.append(dict(row))
                 started = time.perf_counter()
                 parent_id = str(row["parent_realization_id"])
                 status = "rejected"
@@ -576,12 +627,56 @@ class SyntheticBenchmarkPipeline:
                     if result.parent_realization_id != parent_id:
                         raise ValueError("generation parent identity changed")
                     if not result.accepted:
-                        raise RuntimeError(result.reason or "generation attempt rejected")
+                        rejection_reason = (
+                            result.reason or "generation attempt returned no sample"
+                        )
+                        raise BenchmarkBuildRejected(
+                            [rejection_reason],
+                            diagnostics={"parent_realization_id": parent_id},
+                            details=[{"reason": rejection_reason}],
+                        )
                     sample = result.sample
                     if sample is None:
                         raise RuntimeError(
                             "accepted generation attempt has no StructuredSampleRecord"
                         )
+                    corpus_role = str(row.get("corpus_role") or "")
+                    if session.corpus_budget is not None:
+                        expected_width = {
+                            "short_patch": 25,
+                            "full_section": 121,
+                        }.get(corpus_role)
+                        if expected_width is None:
+                            raise ValueError("canonical V2 parent has no corpus_role.")
+                        lateral = np.asarray(sample.truth.lateral_m, dtype=np.float64)
+                        if not development_limited and (
+                            lateral.size != expected_width or (
+                            lateral.size > 1
+                            and not np.allclose(
+                                np.diff(lateral),
+                                25.0,
+                                rtol=0.0,
+                                atol=1.0e-6,
+                            )
+                            )
+                        ):
+                            raise ValueError(
+                                f"{corpus_role} requires {expected_width} traces at 25 m."
+                            )
+                    try:
+                        validate_structured_truth_tables(sample)
+                    except ValueError as exc:
+                        raise BenchmarkBuildRejected(
+                            ["invalid_structured_truth_tables"],
+                            diagnostics={
+                                "parent_realization_id": parent_id,
+                                "validation_error": str(exc),
+                            },
+                            details=[{
+                                "reason": "invalid_structured_truth_tables",
+                                "validation_error": str(exc),
+                            }],
+                        ) from exc
                     reference = None if qc_only else write_structured_sample(h5, sample)
                     owner_path = "" if reference is None else reference.hdf5_group
                     scenario = sample.truth.scenario
@@ -599,7 +694,11 @@ class SyntheticBenchmarkPipeline:
                         "scenario_id": str(row.get("scenario_id", scenario.scenario_id)),
                         "geometry_family": str(row.get("geometry_family", scenario.geometry_family)),
                         "duration_mode": str(row.get("duration_mode", scenario.duration_mode)),
-                        "evaluation_role": str(row.get("evaluation_role", "")),
+                        "corpus_role": str(row.get("corpus_role", "")),
+                        "split_role": str(row.get("split_role", "")),
+                        "generalization_role": str(
+                            row.get("generalization_role", "")
+                        ),
                         "attempt_id": int(row.get("attempt_id", 0)),
                         "status": "ok",
                         "reasons": "",
@@ -629,7 +728,9 @@ class SyntheticBenchmarkPipeline:
                         "geometry_family": base_record["geometry_family"],
                         "duration_mode": base_record["duration_mode"],
                         "suite": "field_conditioned",
-                        "evaluation_role": base_record["evaluation_role"],
+                        "corpus_role": base_record["corpus_role"],
+                        "split_role": base_record["split_role"],
+                        "generalization_role": base_record["generalization_role"],
                         "parent_realization_id": parent_id,
                         "attempt_id": base_record["attempt_id"],
                         "hdf5_group": owner_path,
@@ -648,6 +749,10 @@ class SyntheticBenchmarkPipeline:
                     for name, rows in result.domain_rows.items():
                         domain_rows.setdefault(str(name), []).extend(rows)
                     status = "accepted"
+                    if expected_quota:
+                        accepted_quota[quota_bucket] += 1
+                    generated_trace_count += int(sample.truth.lateral_m.size)
+                    generation_elapsed_s += time.perf_counter() - started
                     h5.flush()
                 except StagedRejection as exc:
                     failed_group = f"/realizations/{parent_id}"
@@ -656,6 +761,13 @@ class SyntheticBenchmarkPipeline:
                     reason = f"{type(exc).__name__}:{exc}"
                     rejection_rows.append({**dict(row), "status": "rejected", "reason": reason})
                     qc_rows.append({**dict(row), "sample_id": parent_id, "status": "rejected", "reasons": reason})
+                    logger.warning(
+                        "generation candidate rejected; trying the next in quota bucket "
+                        "%s | parent=%s | %s",
+                        quota_bucket,
+                        parent_id,
+                        reason,
+                    )
                 except Exception:
                     failed_group = f"/realizations/{parent_id}"
                     if failed_group in h5:
@@ -668,11 +780,76 @@ class SyntheticBenchmarkPipeline:
                     reason=reason,
                     elapsed_s=time.perf_counter() - started,
                 )
+                if expected_quota and all(
+                    accepted_quota[bucket] >= required
+                    for bucket, required in expected_quota.items()
+                ):
+                    break
+
+        corpus_estimate: dict[str, Any] = {}
+        if (
+            development_limited
+            and session.corpus_budget is not None
+            and generated_trace_count > 0
+            and h5_path.is_file()
+        ):
+            budget = session.corpus_budget
+            full_trace_count = len(FAMILIES) * (
+                budget.short_per_family * 25
+                + budget.full_section_per_family * 121
+            )
+            estimated_bytes = int(
+                h5_path.stat().st_size
+                / generated_trace_count
+                * full_trace_count
+            )
+            estimated_seconds = (
+                generation_elapsed_s
+                / generated_trace_count
+                * full_trace_count
+            )
+            corpus_estimate = {
+                "schema": "structured_synthetic_corpus_estimate_v2",
+                "smoke_hdf5_bytes": int(h5_path.stat().st_size),
+                "smoke_trace_count": generated_trace_count,
+                "estimated_full_hdf5_bytes": estimated_bytes,
+                "estimated_full_hdf5_gib": estimated_bytes / 1024**3,
+                "estimated_generation_seconds": estimated_seconds,
+                "estimated_generation_hours": estimated_seconds / 3600.0,
+                "size_limit_gib": 3.5,
+                "runtime_limit_hours": 5.0,
+                "within_limits": (
+                    estimated_bytes <= int(3.5 * 1024**3)
+                    and estimated_seconds <= 5.0 * 3600.0
+                ),
+            }
+            _write_json(output_dir / "corpus_estimate.json", corpus_estimate)
 
         index = stable_records_frame(
             index_rows,
             sort_by=("section_id", "scenario_id", "attempt_id", "sample_kind", "sample_id"),
         )
+        realization_frame = stable_records_frame(
+            realization_rows,
+            sort_by=("corpus_role", "split_role", "realization_id"),
+        )
+        quota_report = pd.DataFrame()
+        quota_shortfall_count = 0
+        if session.corpus_budget is not None and not development_limited:
+            quota_report = published_quota_report(
+                realization_frame,
+                session.corpus_budget,
+            )
+            quota_report.to_csv(output_dir / "quota_report.csv", index=False)
+            quota_shortfall_count = int(quota_report["shortfall"].sum())
+            if quota_shortfall_count:
+                short = quota_report.loc[quota_report["shortfall"].gt(0)]
+                logger.warning(
+                    "generation exhausted available candidates with %d missing parents "
+                    "across %d quota buckets; publishing the usable corpus with warnings",
+                    quota_shortfall_count,
+                    len(short),
+                )
         publish_realization_index(output_dir, realization_rows)
         stable_records_frame(qc_rows, sort_by=("section_id", "scenario_id", "attempt_id", "sample_kind", "sample_id")).to_csv(output_dir / "generation_qc.csv", index=False)
         rejection_frame = stable_records_frame(rejection_rows, sort_by=("section_id", "scenario_id", "attempt_id", "reason"))
@@ -737,25 +914,86 @@ class SyntheticBenchmarkPipeline:
             for row in qc_rows
             if str(row.get("status") or "") != "rejected"
         ))
-        catalog = build_acceptance_catalog(plan, accepted_parent_ids=successful_parent_ids, qc_config=acceptance_qc, development_limited=development_limited)
+        attempted_ids = {
+            str(row["parent_realization_id"])
+            for row in attempted_generation_rows
+        }
+        preflight_rejected_ids = set(
+            preflight.attempts.loc[
+                preflight.attempts["status"].eq("rejected"),
+                "parent_realization_id",
+            ].astype(str)
+        )
+        catalog_plan = plan.loc[
+            plan["parent_realization_id"].astype(str).isin(
+                attempted_ids | preflight_rejected_ids
+            )
+        ].reset_index(drop=True)
+        catalog = build_acceptance_catalog(
+            catalog_plan,
+            accepted_parent_ids=successful_parent_ids,
+            qc_config=acceptance_qc,
+            development_limited=development_limited,
+        )
         catalog.to_csv(output_dir / "scenario_catalog.csv", index=False)
-        warning_scenarios = catalog["acceptance_status"].isin({"severe_warning", "insufficient_coverage"})
+        warning_scenarios = catalog["acceptance_status"].eq("severe_warning")
         failure_reason = f"{session.sample_domain}_generation_no_accepted_realizations" if not successful_parent_ids else ""
         completed_with_warnings = bool(
             not development_limited
             and not failure_reason
-            and (warning_scenarios.any() or parent_quality_warning_count > 0)
+            and (
+                warning_scenarios.any()
+                or parent_quality_warning_count > 0
+                or quota_shortfall_count > 0
+            )
         )
+        diagnostic_warnings: list[dict[str, str]] = []
         if session.write_domain_outputs is not None:
-            session.write_domain_outputs(output_dir, domain_rows)
-        figure_summary = write_generation_figures(
-            output_dir,
-            config.get("figures", {}),
-            suite="field_conditioned",
-            qc_only=qc_only,
-        )
+            try:
+                session.write_domain_outputs(output_dir, domain_rows)
+            except Exception as exc:
+                diagnostic_warnings.append({
+                    "diagnostic": "domain_outputs",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                })
+                logger.warning(
+                    "optional domain diagnostic outputs failed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+        try:
+            figure_summary = write_generation_figures(
+                output_dir,
+                config.get("figures", {}),
+                suite="field_conditioned",
+                qc_only=qc_only,
+            )
+        except Exception as exc:
+            diagnostic_warnings.append({
+                "diagnostic": "figures",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            })
+            logger.warning(
+                "optional generation figures failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            figure_summary = write_figure_failure_manifest(
+                output_dir,
+                scope="generation",
+                exc=exc,
+            )
+        if diagnostic_warnings:
+            _write_json(output_dir / "diagnostic_warnings.json", {
+                "schema": "synthetic_diagnostic_warnings_v1",
+                "warnings": diagnostic_warnings,
+            })
+            if not development_limited and not failure_reason:
+                completed_with_warnings = True
         contract_fields: dict[str, Any] = {}
-        if not failure_reason:
+        if not failure_reason and not qc_only:
             contract_fields = {
                 "contract_fingerprint_schema": CONTRACT_FINGERPRINT_SCHEMA,
                 "contract_fingerprint_sha256": contract_fingerprint_sha256(
@@ -794,9 +1032,25 @@ class SyntheticBenchmarkPipeline:
             "training_consumable": not bool(qc_only),
             "global_seed": int(config["global_seed"]),
             "n_scenarios": int(plan["scenario_id"].nunique()) if "scenario_id" in plan else 0,
-            "attempts_per_scenario": int(plan.groupby(["section_id", "scenario_id"], sort=False).size().min()) if not plan.empty else 0,
+            "candidate_attempts": int(len(plan)),
+            "selected_parent_attempts": int(generation_attempt_count),
             "accepted_parent_realizations": int(len(successful_parent_ids)),
-            "rejected_parent_realizations": int(len(plan) - len(successful_parent_ids)),
+            "rejected_parent_realizations": int(
+                len(preflight_rejected_ids)
+                + generation_attempt_count
+                - len(successful_parent_ids)
+            ),
+            "unused_candidate_attempts": int(
+                len(plan)
+                - len(preflight_rejected_ids)
+                - generation_attempt_count
+            ),
+            "quota_shortfall_count": quota_shortfall_count,
+            "quota_report": (
+                str(output_dir / "quota_report.csv")
+                if not quota_report.empty
+                else ""
+            ),
             "acceptance_qc": acceptance_qc,
             "preflight": preflight_summary,
             "oracle_report": (
@@ -817,7 +1071,11 @@ class SyntheticBenchmarkPipeline:
             "quality_warnings": (
                 ([] if not bool(warning_scenarios.any()) else ["scenario_acceptance_qc_warning"])
                 + ([] if not parent_quality_warning_count else ["parent_scientific_qc_warning"])
+                + ([] if not quota_shortfall_count else ["canonical_quota_shortfall"])
+                + ([] if not diagnostic_warnings else ["optional_diagnostic_failure"])
             ),
+            "diagnostic_warnings": diagnostic_warnings,
+            "corpus_estimate": corpus_estimate,
             "parent_quality_warning_count": parent_quality_warning_count,
             "figures": _portable_figure_summary(
                 figure_summary,
@@ -834,7 +1092,11 @@ class SyntheticBenchmarkPipeline:
         summary = {
             **manifest,
             "accepted_realizations": int(len(successful_parent_ids)),
-            "rejected_realizations": int(len(plan) - len(successful_parent_ids)),
+            "rejected_realizations": int(
+                len(preflight_rejected_ids)
+                + generation_attempt_count
+                - len(successful_parent_ids)
+            ),
             "severe_warning_scenario_count": int(warning_scenarios.sum()),
         }
         _write_json(output_dir / "run_summary.json", summary)

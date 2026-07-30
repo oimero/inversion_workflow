@@ -1,7 +1,6 @@
 """Explicit stable exports for shared Synthoseis benchmark contracts."""
 
 from cup.synthetic.core.artifacts import (
-    build_attempt_plan,
     geometry_feasibility_rows,
     limit_attempt_plan,
     rejection_reason_summary,
@@ -26,7 +25,6 @@ from cup.synthetic.core.pipeline import (
 from cup.synthetic.core.records import LfmObservation, StructuredSampleRecord
 
 __all__ = [
-    "build_attempt_plan",
     "build_mask_contract",
     "build_seismic_input_contract",
     "geometry_feasibility_rows",

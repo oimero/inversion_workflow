@@ -4,60 +4,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping
 
 import h5py
 import numpy as np
 import pandas as pd
-
-
-
-def evaluation_role(geometry_family: str, held_out_geometry_family: str) -> str:
-    return (
-        "geometry_holdout"
-        if str(geometry_family) == str(held_out_geometry_family)
-        else "development_pool"
-    )
-
-
-def build_attempt_plan(
-    *,
-    section_ids: Sequence[str],
-    scenarios: Sequence[Any],
-    attempts_per_scenario: int,
-    held_out_geometry_family: str,
-    geometry_families: Iterable[str] | None = None,
-) -> pd.DataFrame:
-    selected = (
-        None
-        if geometry_families is None
-        else {str(value) for value in geometry_families}
-    )
-    rows: list[dict[str, Any]] = []
-    for section_id in section_ids:
-        for scenario in scenarios:
-            family = str(getattr(scenario, "geometry_family"))
-            if selected is not None and family not in selected:
-                continue
-            for attempt_id in range(int(attempts_per_scenario)):
-                parent = f"{section_id}__{scenario.scenario_id}__a{attempt_id:03d}"
-                rows.append(
-                    {
-                        "section_id": str(section_id),
-                        "scenario_id": str(scenario.scenario_id),
-                        "duration_mode": str(getattr(scenario, "duration_mode", "")),
-                        "geometry_family": family,
-                        "geometry_direction": str(
-                            getattr(scenario, "geometry_direction", "")
-                        ),
-                        "attempt_id": int(attempt_id),
-                        "parent_realization_id": parent,
-                        "evaluation_role": evaluation_role(
-                            family, held_out_geometry_family
-                        ),
-                    }
-                )
-    return pd.DataFrame.from_records(rows)
 
 
 def validate_debug_attempt_limit(limit: int | None) -> int | None:
@@ -183,13 +134,13 @@ def validate_training_manifest(
         "development_limited",
     }:
         raise ValueError(
-            f"Synthoseis v5 {sample_domain} manifest is not consumable: status={status!r}."
+            f"Synthoseis {sample_domain} manifest is not consumable: status={status!r}."
         )
     if bool(manifest.get("qc_only", False)) or manifest.get(
         "training_consumable"
     ) is False:
         raise ValueError(
-            "Synthoseis v5 qc-only benchmark is not training-consumable; "
+            "Synthoseis qc-only benchmark is not training-consumable; "
             "regenerate without --qc-only."
         )
 
@@ -290,8 +241,6 @@ def rejection_reason_summary(
 
 
 __all__ = [
-    "build_attempt_plan",
-    "evaluation_role",
     "geometry_feasibility_rows",
     "limit_attempt_plan",
     "rejection_reason_summary",

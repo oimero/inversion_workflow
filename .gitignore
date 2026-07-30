@@ -1,4 +1,5 @@
 .conda/*
+.codex-smoke/*
 .ref/*
 .vscode/*
 data/*

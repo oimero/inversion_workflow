@@ -22,6 +22,7 @@ from cup.synthetic.schemas import (
     BENCHMARK_SCHEMA_VERSION,
     RANDOM_STREAM_CONTRACT_VERSION,
     SCIENCE_REVISION,
+    STRUCTURED_ARTIFACT_VERSION,
 )
 from cup.synthetic.time.forward_adapter import TimeForwardAdapter
 from cup.synthetic.time.forward_adapter import TimeForwardConfiguration
@@ -127,7 +128,7 @@ def build_time_field_sample(
                     "producer": {
                         "name": "synthoseis_lite",
                         "artifact_type": "structured_synthetic_benchmark",
-                        "artifact_version": 1,
+                        "artifact_version": STRUCTURED_ARTIFACT_VERSION,
                     },
                     "calibration": {
                         "generator_family": calibration.generator_family,

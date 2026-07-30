@@ -8,7 +8,7 @@ import numpy as np
 
 
 LATERAL_KEYS = {
-    "correlation_length_section_fractions",
+    "correlation_length_m",
     "coefficient_sigma_multipliers",
     "thickness_log_sigma_values",
 }
@@ -69,8 +69,8 @@ def parse_object_core_controls(
     )
 
     correlations = _finite_list(
-        lateral["correlation_length_section_fractions"],
-        path=f"{path}.lateral.correlation_length_section_fractions",
+        lateral["correlation_length_m"],
+        path=f"{path}.lateral.correlation_length_m",
         nonnegative=False,
     )
     coefficient_sigmas = _finite_list(
@@ -111,7 +111,7 @@ def parse_object_core_controls(
         )
 
     return {
-        "correlation_length_section_fractions": correlations,
+        "correlation_length_m": correlations,
         "coefficient_sigma_multipliers": coefficient_sigmas,
         "thickness_log_sigma_values": thickness_sigmas,
         **parsed_qc,

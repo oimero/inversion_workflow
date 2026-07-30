@@ -18,7 +18,9 @@ REALIZATION_INDEX_COLUMNS = (
     "geometry_family",
     "duration_mode",
     "suite",
-    "evaluation_role",
+    "corpus_role",
+    "split_role",
+    "generalization_role",
     "attempt_id",
     "hdf5_group",
     "seismic_dataset",
@@ -42,7 +44,8 @@ def publish_realization_index(
     frame = frame.loc[:, list(REALIZATION_INDEX_COLUMNS)]
     if not frame.empty:
         frame = frame.sort_values(
-            ["sample_domain", "realization_id"], kind="mergesort"
+            ["corpus_role", "split_role", "sample_domain", "realization_id"],
+            kind="mergesort",
         ).reset_index(drop=True)
     if frame["realization_id"].duplicated().any():
         raise ValueError("realization index contains duplicate realization_id")

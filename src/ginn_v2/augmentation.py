@@ -1,4 +1,4 @@
-"""Frozen, label-free seismic observation augmentation for Stage 1 Step 3.
+"""Frozen, label-free seismic observation augmentation.
 
 The canonical synthetic artifact remains clean.  This module owns the seam
 between that artifact and an online dirty observation.  It deliberately
@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
@@ -33,7 +34,7 @@ class ObservationAugmentationProfile:
 
     phase_degrees: float = 8.0
     wavelet_shift_samples: int = 1
-    depth_static_samples: int = 1
+    vertical_static_samples: int = 1
     global_gain_log: float = 0.10
     trace_gain_log: float = 0.05
     lateral_attenuation_fraction: float = 0.10
@@ -60,7 +61,7 @@ class ObservationAugmentationProfile:
             value = _finite(getattr(self, name), label=name)
             if name.endswith("fraction") and value > 1.0:
                 raise ValueError(f"{name} must be <= 1.")
-        for name in ("wavelet_shift_samples", "depth_static_samples"):
+        for name in ("wavelet_shift_samples", "vertical_static_samples"):
             value = getattr(self, name)
             if isinstance(value, bool) or int(value) != value or int(value) < 0:
                 raise ValueError(f"{name} must be a non-negative integer.")
@@ -74,7 +75,11 @@ class ObservationAugmentationProfile:
             raise TypeError("source_summary must be JSON serializable.") from exc
         object.__setattr__(self, "phase_degrees", phase)
         object.__setattr__(self, "wavelet_shift_samples", int(self.wavelet_shift_samples))
-        object.__setattr__(self, "depth_static_samples", int(self.depth_static_samples))
+        object.__setattr__(
+            self,
+            "vertical_static_samples",
+            int(self.vertical_static_samples),
+        )
         object.__setattr__(self, "colored_noise_kernel", kernel)
         object.__setattr__(self, "source_summary", summary)
 
@@ -168,6 +173,21 @@ def stable_random_identity(*parts: object) -> int:
     return int.from_bytes(digest[:8], "little", signed=False)
 
 
+def load_observation_augmentation_profile(
+    path: str | Path,
+) -> ObservationAugmentationProfile:
+    source = Path(path)
+    with source.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, Mapping):
+        raise ValueError("observation augmentation profile must be a JSON object.")
+    if payload.get("schema") != AUGMENTATION_PROFILE_SCHEMA:
+        raise ValueError("unsupported observation augmentation profile schema.")
+    values = dict(payload)
+    values.pop("schema")
+    return ObservationAugmentationProfile.from_mapping(values)
+
+
 def _analytic_signal(values: np.ndarray) -> np.ndarray:
     size = values.shape[-1]
     spectrum = np.fft.fft(values, axis=-1)
@@ -253,8 +273,8 @@ def apply_observation_augmentation(
     )
     work_2d = _fractional_shift(work_2d, shift)
     static = rng.uniform(
-        -profile.depth_static_samples,
-        profile.depth_static_samples,
+        -profile.vertical_static_samples,
+        profile.vertical_static_samples,
         size=work_2d.shape[0],
     )
     if np.any(static != 0.0):
@@ -320,7 +340,7 @@ def apply_observation_augmentation(
         "seed": int(rng.bit_generator.state["state"]["state"]),
         "phase_degrees": phase,
         "wavelet_shift_samples": shift,
-        "depth_static_samples": static.tolist(),
+        "vertical_static_samples": static.tolist(),
         "global_gain_log": global_gain,
         "white_noise_std": white_std,
         "colored_noise_std": colored_std,
@@ -337,5 +357,6 @@ __all__ = [
     "AugmentedSeismic",
     "ObservationAugmentationProfile",
     "apply_observation_augmentation",
+    "load_observation_augmentation_profile",
     "stable_random_identity",
 ]

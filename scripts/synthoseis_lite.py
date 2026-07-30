@@ -109,9 +109,9 @@ def _resolve_output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> P
 
 
 def _structured_artifact_oracle(root: Path, calibration: object, parent_ids: list[str]):
-    from ginn_v2.oracle import run_artifact_oracle
+    from cup.synthetic.core.oracle import run_canonical_oracle
 
-    return run_artifact_oracle(
+    return run_canonical_oracle(
         str(root),
         calibration,
         expected_parent_ids=parent_ids,
@@ -133,22 +133,32 @@ def _resolve_generation_options(
     sections = list(smoke_cfg.get("sections") or [])
     if not sections:
         raise ValueError("--structured-smoke requires at least one configured section")
-    smoke_section = deepcopy(sections[0])
-    section_path = list(smoke_section.get("path") or [])
-    if len(section_path) < 2:
-        raise ValueError("--structured-smoke requires a section path with two points")
-    start = dict(section_path[0])
-    end = dict(section_path[1])
-    smoke_section["path"] = [
-        start,
-        {
-            "inline": float(start["inline"])
-            + 0.05 * (float(end["inline"]) - float(start["inline"])),
-            "xline": float(start["xline"])
-            + 0.05 * (float(end["xline"]) - float(start["xline"])),
-        },
-    ]
-    smoke_cfg["sections"] = [smoke_section]
+    smoke_sections = []
+    for role in ("short_patch", "full_section"):
+        matches = [
+            deepcopy(item)
+            for item in sections
+            if str(item.get("corpus_role") or "") == role
+        ]
+        if not matches:
+            raise ValueError(f"--structured-smoke requires one {role} section")
+        smoke_section = matches[0]
+        section_path = list(smoke_section.get("path") or [])
+        if len(section_path) < 2:
+            raise ValueError("--structured-smoke requires two-point section paths")
+        start = dict(section_path[0])
+        end = dict(section_path[1])
+        smoke_section["path"] = [
+            start,
+            {
+                "inline": float(start["inline"])
+                + 0.05 * (float(end["inline"]) - float(start["inline"])),
+                "xline": float(start["xline"])
+                + 0.05 * (float(end["xline"]) - float(start["xline"])),
+            },
+        ]
+        smoke_sections.append(smoke_section)
+    smoke_cfg["sections"] = smoke_sections
     generation = dict(smoke_cfg.get("generation") or {})
     duration_modes = list(generation.get("duration_modes") or [])
     geometry_directions = list(generation.get("geometry_directions") or [])
@@ -156,12 +166,12 @@ def _resolve_generation_options(
         raise ValueError(
             "--structured-smoke requires duration_modes and geometry_directions"
         )
-    selected_geometry = list(args.geometry_family or ["wedge"])
+    selected_geometry = ["none", "wedge", "pinchout"]
     generation.update(
         {
             "duration_modes": [duration_modes[0]],
-            "geometry_families": [selected_geometry[0]],
-            "geometry_directions": [geometry_directions[0]],
+            "geometry_families": selected_geometry,
+            "geometry_directions": geometry_directions,
         }
     )
     smoke_cfg["generation"] = generation
@@ -174,14 +184,20 @@ def _resolve_generation_options(
     nested_lateral = isinstance(impedance.get("lateral"), dict)
     lateral = dict(impedance["lateral"]) if nested_lateral else impedance
     for key in (
-        "correlation_length_section_fractions",
+        "correlation_length_m",
         "coefficient_sigma_multipliers",
         "thickness_log_sigma_values",
     ):
         values = list(lateral.get(key) or [])
         if not values:
             raise ValueError(f"--structured-smoke requires impedance lateral {key}")
-        lateral[key] = [values[0]]
+        if key == "correlation_length_m":
+            selected = [values[0]]
+            if 900.0 not in selected:
+                selected.append(900.0)
+            lateral[key] = selected
+        else:
+            lateral[key] = [values[0], values[-1]]
     if nested_lateral:
         impedance["lateral"] = lateral
     else:
@@ -190,7 +206,7 @@ def _resolve_generation_options(
     return (
         smoke_cfg,
         1,
-        selected_geometry[:1],
+        selected_geometry,
         True,
     )
 
@@ -262,7 +278,7 @@ def _load_time_config(experiment_raw: dict, *, experiment_path: Path) -> tuple[d
     composed["synthoseis_lite"] = dict(experiment_raw.get("synthoseis_lite") or {})
     workflow = WorkflowConfig.from_mapping(composed)
     if workflow.seismic.domain != "time":
-        raise ValueError("Time Synthoseis-lite v5 requires seismic.domain='time'.")
+        raise ValueError("Time Synthoseis-lite requires seismic.domain='time'.")
     provenance = {
         "experiment_file": str(experiment_path),
         "workflow_config": str(common_path),
@@ -294,10 +310,10 @@ def main() -> None:
 
     if (sample_domain, benchmark_schema) == ("depth", BENCHMARK_SCHEMA_VERSION):
         if "workflow_config" not in experiment_raw:
-            raise ValueError("Depth Synthoseis-lite v5 requires workflow_config.")
+            raise ValueError("Depth Synthoseis-lite requires workflow_config.")
         raw, workflow, config_provenance = load_composed_config(config_path, repo_root=REPO_ROOT)
         if workflow.seismic.domain != "depth":
-            raise ValueError("Composed Synthoseis-lite v5 currently implements the depth branch only.")
+            raise ValueError("Composed Synthoseis-lite currently implements the depth branch only.")
         script_cfg = parse_depth_config(raw)
         sources, source_provenance, forward_inputs = resolve_depth_sources(
             script_cfg, workflow=workflow, repo_root=REPO_ROOT

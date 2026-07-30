@@ -57,7 +57,9 @@ class ParentIdentity:
     realization_id: str
     scenario_id: str
     section_id: str
-    evaluation_role: str
+    corpus_role: str
+    split_role: str
+    generalization_role: str
 
 
 @dataclass(frozen=True)
@@ -109,7 +111,9 @@ class StructuredSyntheticBenchmark:
             "realization_id",
             "section_id",
             "scenario_id",
-            "evaluation_role",
+            "corpus_role",
+            "split_role",
+            "generalization_role",
             "hdf5_group",
         }
         missing = sorted(required.difference(self.index.columns))
@@ -143,13 +147,15 @@ class StructuredSyntheticBenchmark:
     def list_parents(self, split: str | None = None) -> list[ParentIdentity]:
         rows = self.index
         if split is not None:
-            rows = rows.loc[rows["evaluation_role"] == str(split)]
+            rows = rows.loc[rows["split_role"] == str(split)]
         return [
             ParentIdentity(
                 realization_id=str(row.realization_id),
                 scenario_id=str(row.scenario_id),
                 section_id=str(row.section_id),
-                evaluation_role=str(row.evaluation_role),
+                corpus_role=str(row.corpus_role),
+                split_role=str(row.split_role),
+                generalization_role=str(row.generalization_role),
             )
             for row in rows.itertuples(index=False)
         ]
@@ -193,7 +199,9 @@ class StructuredSyntheticBenchmark:
                     realization_id=str(row["realization_id"]),
                     scenario_id=str(row["scenario_id"]),
                     section_id=str(row["section_id"]),
-                    evaluation_role=str(row["evaluation_role"]),
+                    corpus_role=str(row["corpus_role"]),
+                    split_role=str(row["split_role"]),
+                    generalization_role=str(row["generalization_role"]),
                 ),
                 sample_domain=domain,
                 sample_unit=unit,

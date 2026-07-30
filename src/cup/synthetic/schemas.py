@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 
-BENCHMARK_SCHEMA_VERSION = "structured_synthetic_benchmark_v1"
+BENCHMARK_SCHEMA_VERSION = "structured_synthetic_corpus_v2"
 STRUCTURED_ARTIFACT_TYPE = "structured_synthetic_benchmark"
-STRUCTURED_ARTIFACT_VERSION = 1
-SCIENCE_REVISION = "synthoseis_lite_science_v4"
+STRUCTURED_ARTIFACT_VERSION = 2
+SCIENCE_REVISION = "synthoseis_lite_science_v5"
 PROJECTION_CONTRACT_VERSION = "finite_support_projection_v1"
 RANDOM_STREAM_CONTRACT_VERSION = "synthoseis_random_v3"
 FROZEN_BENCHMARK_SCHEMA_VERSION = "synthoseis_lite_v3"

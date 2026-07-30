@@ -1,4 +1,4 @@
-"""Depth-domain calibration adapters for Synthoseis-lite v5."""
+"""Depth-domain calibration adapters for canonical Synthoseis-lite."""
 
 from __future__ import annotations
 
@@ -13,7 +13,10 @@ import pandas as pd
 from cup.petrel.load import import_interpretation_petrel, import_well_tops_petrel
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
-from cup.synthetic.reporting.figures import write_calibration_figures
+from cup.synthetic.reporting.figures import (
+    write_calibration_figures,
+    write_figure_failure_manifest,
+)
 from cup.synthetic.schemas import SCIENCE_CONTRACT
 from cup.synthetic.depth.config import CALIBRATION_SCHEMA, GENERATOR_FAMILY
 from cup.synthetic.depth.calibration_adapter import (
@@ -519,7 +522,21 @@ def _legacy_run_depth_calibration(
         },
     )
 
-    figure_summary = write_calibration_figures(output_dir, script_cfg.get("figures", {}))
+    try:
+        figure_summary = write_calibration_figures(
+            output_dir,
+            script_cfg.get("figures", {}),
+        )
+    except Exception as exc:
+        print(
+            "WARNING | optional calibration figures failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        figure_summary = write_figure_failure_manifest(
+            output_dir,
+            scope="calibration",
+            exc=exc,
+        )
 
     summary = {
         "schema_version": CALIBRATION_SCHEMA,

@@ -56,7 +56,7 @@ def _first_existing_column(frame: pd.DataFrame, candidates: tuple[str, ...]) -> 
 
 
 def _axis_label(axis_name: str) -> str:
-    if axis_name.startswith("tvdss") or "depth" in axis_name:
+    if "tvdss" in axis_name or "depth" in axis_name:
         return "TVDSS (m)"
     return "TWT (s)"
 
@@ -86,6 +86,23 @@ def _write_figure_manifest(output_dir: Path, generated: list[str], skipped: list
         "generated_count": len(generated),
         "skipped_count": len(skipped),
     }
+
+
+def write_figure_failure_manifest(
+    output_dir: Path,
+    *,
+    scope: str,
+    exc: BaseException,
+) -> dict[str, Any]:
+    """Publish a diagnostic warning record when optional plotting fails."""
+    return _write_figure_manifest(
+        Path(output_dir),
+        [],
+        [{
+            "figure": str(scope),
+            "reason": f"{type(exc).__name__}: {exc}",
+        }],
+    )
 
 
 def _pick_well_zone(samples: pd.DataFrame, config: Mapping[str, Any], zone_id: str) -> tuple[str, str] | None:
@@ -188,6 +205,146 @@ def _plot_object_profile(profile_samples: pd.DataFrame, obj: pd.Series, out_dir:
     return _finish(fig, out_dir / "examples" / f"object_profile_fit_{safe}.png")
 
 
+def _plot_well_calibration_group(
+    *,
+    well_name: str,
+    samples: pd.DataFrame,
+    objects: pd.DataFrame,
+    profile_samples: pd.DataFrame,
+    out_dir: Path,
+) -> list[str]:
+    """Write a compact, repeatable calibration report for one source well."""
+    well_samples = samples.loc[samples["well_name"].eq(well_name)].copy()
+    well_objects = objects.loc[objects["well_name"].eq(well_name)].copy()
+    well_profiles = profile_samples.loc[
+        profile_samples["well_name"].eq(well_name)
+    ].copy()
+    if well_samples.empty or well_objects.empty:
+        return []
+    axis_col = _first_existing_column(well_samples, ("twt_s", "tvdss_m"))
+    if axis_col is None:
+        return []
+    safe_well = _sanitize(well_name)
+    well_dir = out_dir / "wells" / safe_well
+    generated: list[str] = []
+
+    fig, axes = plt.subplots(1, 2, figsize=(9.2, 6.4), sharey=True)
+    for zone_id, zone in well_samples.groupby("zone_id", sort=False):
+        zone = zone.sort_values(axis_col)
+        axes[0].plot(
+            zone["full_log_ai"],
+            zone[axis_col],
+            linewidth=1.0,
+            alpha=0.75,
+            label=f"{zone_id}: full",
+        )
+        axes[0].plot(
+            zone["background_log_ai"],
+            zone[axis_col],
+            linewidth=1.5,
+            linestyle="--",
+            alpha=0.9,
+            label=f"{zone_id}: background",
+        )
+        axes[1].plot(
+            zone["residual"],
+            zone[axis_col],
+            linewidth=1.0,
+            label=str(zone_id),
+        )
+    axes[0].set_xlabel("log(AI)")
+    axes[0].set_ylabel(_axis_label(axis_col))
+    axes[0].set_title("Well log and zone-linear background")
+    axes[1].axvline(0.0, color="black", linewidth=0.8)
+    axes[1].set_xlabel("full log(AI) - background")
+    axes[1].set_title("Calibrated residual")
+    axes[0].invert_yaxis()
+    for ax in axes:
+        ax.grid(True, alpha=0.22)
+        ax.legend(loc="best", fontsize=6)
+    fig.suptitle(f"Calibration overview: {well_name}")
+    generated.append(_finish(fig, well_dir / "background_and_residual.png"))
+
+    if not well_profiles.empty:
+        valid = well_profiles[
+            np.isfinite(well_profiles["residual"])
+            & np.isfinite(well_profiles["fitted_residual"])
+        ]
+        if not valid.empty:
+            fig, axes = plt.subplots(1, 2, figsize=(9.2, 4.0))
+            for state, group in valid.groupby("state", sort=False):
+                axes[0].scatter(
+                    group["residual"],
+                    group["fitted_residual"],
+                    s=5,
+                    alpha=0.35,
+                    color=STATE_COLORS.get(str(state), "#718096"),
+                    label=str(state),
+                )
+            bounds = np.nanpercentile(
+                np.concatenate([
+                    valid["residual"].to_numpy(dtype=np.float64),
+                    valid["fitted_residual"].to_numpy(dtype=np.float64),
+                ]),
+                [0.5, 99.5],
+            )
+            axes[0].plot(bounds, bounds, color="black", linestyle="--", linewidth=1.0)
+            axes[0].set_xlabel("calibration residual")
+            axes[0].set_ylabel("three-parameter fitted residual")
+            axes[0].set_title("Profile parity")
+            axes[0].legend(loc="best", fontsize=7)
+            fit_error = (
+                valid["residual"].to_numpy(dtype=np.float64)
+                - valid["fitted_residual"].to_numpy(dtype=np.float64)
+            )
+            axes[1].hist(
+                fit_error,
+                bins=min(50, max(15, int(np.sqrt(fit_error.size)))),
+                color="#2b6cb0",
+                alpha=0.75,
+            )
+            axes[1].axvline(0.0, color="black", linewidth=1.0)
+            axes[1].set_xlabel("profile fit residual")
+            axes[1].set_ylabel("sample count")
+            axes[1].set_title("Profile fit error")
+            for ax in axes:
+                ax.grid(True, alpha=0.22)
+            fig.suptitle(f"Three-parameter profile fit: {well_name}")
+            generated.append(_finish(fig, well_dir / "profile_fit.png"))
+
+    coordinate = (
+        well_objects["zone_id"].astype("category").cat.codes.to_numpy(dtype=float)
+        + 0.5
+        * (
+            well_objects["zeta_top"].to_numpy(dtype=np.float64)
+            + well_objects["zeta_bottom"].to_numpy(dtype=np.float64)
+        )
+    )
+    fig, axes = plt.subplots(1, 3, figsize=(11.5, 5.0), sharey=True)
+    for ax, coefficient in zip(axes, ("c0", "c1", "c2")):
+        for state, color in STATE_COLORS.items():
+            mask = well_objects["state"].eq(state).to_numpy()
+            if np.any(mask):
+                ax.scatter(
+                    well_objects.loc[mask, coefficient],
+                    coordinate[mask],
+                    s=10,
+                    alpha=0.65,
+                    color=color,
+                    label=state,
+                )
+        ax.axvline(0.0, color="black", linewidth=0.8)
+        ax.set_xlabel(coefficient)
+        ax.set_title(f"{coefficient} by object position")
+        ax.grid(True, alpha=0.22)
+    axes[0].set_ylabel("zone order + normalized position")
+    axes[0].invert_yaxis()
+    axes[-1].legend(loc="best", fontsize=7)
+    fig.suptitle(f"Object parameter calibration: {well_name}")
+    generated.append(_finish(fig, well_dir / "object_parameters.png"))
+    return generated
+
+
 def write_calibration_figures(output_dir: Path, config: Mapping[str, Any]) -> dict[str, Any]:
     if not bool(config.get("enabled", True)):
         return _write_figure_manifest(
@@ -206,6 +363,33 @@ def write_calibration_figures(output_dir: Path, config: Mapping[str, Any]) -> di
     if objects.empty:
         skipped.append({"figure": "calibration", "reason": "empty well_object_catalog.csv"})
         return _write_figure_manifest(output_dir, generated, skipped)
+
+    well_names = sorted(
+        set(objects["well_name"].dropna().astype(str))
+        | set(samples.get("well_name", pd.Series(dtype=str)).dropna().astype(str))
+    )
+    for well_name in well_names:
+        try:
+            paths = _plot_well_calibration_group(
+                well_name=well_name,
+                samples=samples,
+                objects=objects,
+                profile_samples=profile_samples,
+                out_dir=figures_dir,
+            )
+            if paths:
+                generated.extend(paths)
+            else:
+                skipped.append({
+                    "figure": f"well_calibration:{well_name}",
+                    "reason": "well has no complete calibration rows",
+                })
+        except Exception as exc:
+            plt.close("all")
+            skipped.append({
+                "figure": f"well_calibration:{well_name}",
+                "reason": f"{type(exc).__name__}: {exc}",
+            })
 
     for zone_id, zone_objects in objects.groupby("zone_id", sort=False):
         safe_zone = _sanitize(zone_id)
@@ -328,7 +512,13 @@ def _plot_section_geometry(output_dir: Path, generated: list[str], skipped: list
             if "trace_valid_control" in group:
                 filled = group[~group["trace_valid_control"].astype(bool)]
             elif "support_status" in group:
-                filled = group[~group["support_status"].astype(str).str.casefold().eq("ok")]
+                supported = (
+                    group["support_status"]
+                    .astype(str)
+                    .str.casefold()
+                    .isin({"ok", "supported"})
+                )
+                filled = group[~supported]
             else:
                 filled = group.iloc[0:0]
             if not filled.empty:
@@ -519,6 +709,174 @@ def _plot_hdf5_examples(
     generated.append(_finish(fig, figures_dir / f"c0_lateral_{safe}_object_{_sanitize(object_id)}.png"))
 
 
+def _plot_scenario_examples(
+    output_dir: Path,
+    generated: list[str],
+    skipped: list[dict[str, Any]],
+) -> None:
+    """Write one compact visual summary for every accepted generation scenario."""
+    index = _read_csv(output_dir / "realization_index.csv")
+    if index.empty or "scenario_id" not in index:
+        skipped.append({
+            "figure": "scenario_examples",
+            "reason": "realization index has no accepted scenarios",
+        })
+        return
+    base = index.copy()
+    if "status" in base:
+        base = base.loc[base["status"].eq("ok")]
+    if "sample_kind" in base:
+        base = base.loc[base["sample_kind"].eq("base")]
+    base = base.loc[base["hdf5_group"].fillna("").astype(str).ne("")]
+    if base.empty:
+        skipped.append({
+            "figure": "scenario_examples",
+            "reason": "no accepted HDF5-backed realization",
+        })
+        return
+    sort_cols = [
+        name
+        for name in (
+            "scenario_id",
+            "corpus_role",
+            "section_id",
+            "attempt_id",
+            "realization_id",
+        )
+        if name in base
+    ]
+    base = base.sort_values(sort_cols, kind="mergesort")
+    selected = base.groupby("scenario_id", sort=True, as_index=False).head(1)
+    h5_path = output_dir / "synthetic_benchmark.h5"
+    if not h5_path.is_file():
+        skipped.append({
+            "figure": "scenario_examples",
+            "reason": "synthetic_benchmark.h5 not written",
+        })
+        return
+    figures_dir = output_dir / "figures" / "generation" / "scenarios"
+    with h5py.File(h5_path, "r") as h5:
+        for scenario_index, (_, row) in enumerate(
+            selected.iterrows(),
+            start=1,
+        ):
+            scenario_id = str(row["scenario_id"])
+            group_path = str(row["hdf5_group"])
+            try:
+                if group_path not in h5:
+                    raise KeyError(f"missing HDF5 group {group_path}")
+                group = h5[group_path]
+                lateral = np.asarray(group["axes/lateral_m"][()], dtype=np.float64)
+                model_name = (
+                    "twt_model_s"
+                    if "axes/twt_model_s" in group
+                    else "tvdss_model_m"
+                )
+                high_name = (
+                    "twt_highres_s"
+                    if "axes/twt_highres_s" in group
+                    else "tvdss_highres_m"
+                )
+                model_axis = np.asarray(
+                    group[f"axes/{model_name}"][()],
+                    dtype=np.float64,
+                )
+                high_axis = np.asarray(
+                    group[f"axes/{high_name}"][()],
+                    dtype=np.float64,
+                )
+                log_ai = np.asarray(
+                    group["truth/model_log_ai"][()],
+                    dtype=np.float64,
+                )
+                seismic = np.asarray(
+                    group["forward/model_consistent_seismic"][()],
+                    dtype=np.float64,
+                )
+                state_path = (
+                    "truth/state_id_highres"
+                    if "truth/state_id_highres" in group
+                    else "truth/categorical/state_id_highres"
+                )
+                if state_path not in group:
+                    raise KeyError("missing high-resolution state dataset")
+                state = np.asarray(group[state_path][()], dtype=np.float64)
+                state[state < 0] = np.nan
+
+                fig, axes = plt.subplots(
+                    1,
+                    3,
+                    figsize=(15.0, 5.0),
+                    constrained_layout=True,
+                )
+                model_extent = [
+                    float(lateral[0]),
+                    float(lateral[-1]),
+                    float(model_axis[-1]),
+                    float(model_axis[0]),
+                ]
+                high_extent = [
+                    float(lateral[0]),
+                    float(lateral[-1]),
+                    float(high_axis[-1]),
+                    float(high_axis[0]),
+                ]
+                lo, hi = np.nanpercentile(log_ai, [1.0, 99.0])
+                image = axes[0].imshow(
+                    log_ai.T,
+                    aspect="auto",
+                    extent=model_extent,
+                    cmap="viridis",
+                    vmin=lo,
+                    vmax=hi,
+                )
+                fig.colorbar(image, ax=axes[0], fraction=0.046, pad=0.04)
+                limit = max(
+                    float(np.nanpercentile(np.abs(seismic), 99.0)),
+                    np.finfo(np.float64).eps,
+                )
+                axes[1].imshow(
+                    seismic.T,
+                    aspect="auto",
+                    extent=model_extent,
+                    cmap="seismic",
+                    vmin=-limit,
+                    vmax=limit,
+                )
+                axes[2].imshow(
+                    state.T,
+                    aspect="auto",
+                    extent=high_extent,
+                    cmap="coolwarm",
+                    vmin=0,
+                    vmax=2,
+                    interpolation="nearest",
+                )
+                axes[0].set_title("Projected log(AI)")
+                axes[1].set_title("Model-consistent seismic")
+                axes[2].set_title("High-resolution state")
+                for ax in axes:
+                    ax.set_xlabel("lateral distance (m)")
+                axes[0].set_ylabel(_axis_label(model_name))
+                axes[1].set_ylabel(_axis_label(model_name))
+                axes[2].set_ylabel(_axis_label(high_name))
+                fig.suptitle(
+                    f"Scenario {scenario_index:03d}: {scenario_id}\n"
+                    f"example={_sample_label(row)}",
+                    fontsize=10,
+                )
+                generated.append(_finish(
+                    fig,
+                    figures_dir / f"scenario_{scenario_index:03d}.png",
+                ))
+            except Exception as exc:
+                plt.close("all")
+                skipped.append({
+                    "figure": f"scenario_example:{scenario_id}",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                })
+
+
 def _plot_acceptance(output_dir: Path, generated: list[str], skipped: list[dict[str, Any]]) -> None:
     catalog = _read_csv(output_dir / "scenario_catalog.csv")
     required = {"section_id", "scenario_id", "acceptance_fraction"}
@@ -578,12 +936,41 @@ def write_generation_figures(
     generated: list[str] = []
     skipped: list[dict[str, Any]] = []
     if suite == "field_conditioned":
-        _plot_section_geometry(output_dir, generated, skipped)
-    _plot_acceptance(output_dir, generated, skipped)
+        try:
+            _plot_section_geometry(output_dir, generated, skipped)
+        except Exception as exc:
+            plt.close("all")
+            skipped.append({
+                "figure": "section_geometry",
+                "reason": f"{type(exc).__name__}: {exc}",
+            })
+    try:
+        _plot_acceptance(output_dir, generated, skipped)
+    except Exception as exc:
+        plt.close("all")
+        skipped.append({
+            "figure": "scenario_acceptance",
+            "reason": f"{type(exc).__name__}: {exc}",
+        })
     if qc_only:
         skipped.append({"figure": "hdf5 generation examples", "reason": "qc_only run"})
     else:
-        _plot_hdf5_examples(output_dir, config, generated, skipped)
+        try:
+            _plot_hdf5_examples(output_dir, config, generated, skipped)
+        except Exception as exc:
+            plt.close("all")
+            skipped.append({
+                "figure": "selected_generation_example",
+                "reason": f"{type(exc).__name__}: {exc}",
+            })
+        try:
+            _plot_scenario_examples(output_dir, generated, skipped)
+        except Exception as exc:
+            plt.close("all")
+            skipped.append({
+                "figure": "scenario_examples",
+                "reason": f"{type(exc).__name__}: {exc}",
+            })
     result = _write_figure_manifest(output_dir, generated, skipped)
     result["generated"] = generated
     result["skipped"] = skipped

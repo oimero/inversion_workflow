@@ -23,7 +23,10 @@ from cup.synthetic.core.calibration import (
 from cup.synthetic.time.config import IMPLEMENTATION_SCOPE
 from cup.synthetic.adapters import TimeSyntheticDomainAdapter
 from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
-from cup.synthetic.reporting.figures import write_calibration_figures
+from cup.synthetic.reporting.figures import (
+    write_calibration_figures,
+    write_figure_failure_manifest,
+)
 from cup.synthetic.schemas import SCIENCE_CONTRACT
 from cup.config.workflow import WorkflowConfig
 from cup.utils.io import (
@@ -465,10 +468,21 @@ def _legacy_run_calibration(
             "well_object_profile_samples": profile_samples_path,
         },
     )
-    figure_summary = write_calibration_figures(
-        output_dir,
-        script_cfg.get("figures", {}),
-    )
+    try:
+        figure_summary = write_calibration_figures(
+            output_dir,
+            script_cfg.get("figures", {}),
+        )
+    except Exception as exc:
+        print(
+            "WARNING | optional calibration figures failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        figure_summary = write_figure_failure_manifest(
+            output_dir,
+            scope="calibration",
+            exc=exc,
+        )
     summary = {
         "schema_version": CALIBRATION_SCHEMA,
         **SCIENCE_CONTRACT,

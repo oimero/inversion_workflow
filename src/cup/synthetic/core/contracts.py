@@ -22,7 +22,7 @@ SEISMIC_INPUT_OPERATORS = {
 
 
 def build_mask_contract() -> dict[str, str]:
-    """Build the v5 single-mask contract shared by both domain readers."""
+    """Build the canonical single-mask contract shared by both domain readers."""
     return {
         "id": MASK_CONTRACT_ID,
         "semantics": MASK_CONTRACT_SEMANTICS,
@@ -31,14 +31,14 @@ def build_mask_contract() -> dict[str, str]:
 
 
 def validate_mask_contract(value: Mapping[str, Any]) -> dict[str, str]:
-    """Validate the strict v5 mask contract."""
+    """Validate the strict canonical mask contract."""
     if not isinstance(value, Mapping):
         raise ValueError("mask_contract must be a mapping.")
     expected = build_mask_contract()
     missing = sorted(set(expected) - set(value))
     if missing:
         raise ValueError(
-            "Synthoseis v5 requires mask_contract fields: " + ", ".join(missing)
+            "Synthoseis requires mask_contract fields: " + ", ".join(missing)
         )
     for key, expected_value in expected.items():
         if str(value.get(key)) != expected_value:
@@ -101,7 +101,7 @@ def validate_seismic_input_contract(
         )
     if str(value["policy"]) != SEISMIC_INPUT_POLICY:
         raise ValueError(
-            "Synthoseis v5 requires "
+            "Synthoseis requires "
             f"seismic_input_contract.policy={SEISMIC_INPUT_POLICY!r}."
         )
     if str(value["sample_domain"]).casefold() != expected_domain:

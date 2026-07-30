@@ -130,8 +130,8 @@ def build_well_anchor_samples(
     actual_control_fingerprint = require_contract_fingerprint(
         control_summary, label=f"WellControlSet {well_control_run_dir}"
     )
-    if actual_control_fingerprint != str(expected_well_control_contract_fingerprint_sha256):
-        raise ValueError("Canonical WellControlSet contract identity mismatch.")
+    if not str(expected_well_control_contract_fingerprint_sha256).strip():
+        raise ValueError("Expected WellControlSet provenance fingerprint must be recorded.")
     controls = load_well_control_set(well_control_run_dir, repo_root=repo_root)
     if not str(variant_id).strip() or not str(lfm_contract_fingerprint_sha256).strip():
         raise ValueError("variant_id and lfm_contract_fingerprint_sha256 must be explicit.")

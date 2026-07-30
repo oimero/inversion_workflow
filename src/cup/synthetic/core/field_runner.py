@@ -230,20 +230,15 @@ def build_acceptance_catalog(
     if development_limited:
         catalog["acceptance_status"] = "development_limit_no_verdict"
         return catalog
-    minimum = int(qc_config["minimum_attempts_per_scenario"])
     severe_warning = float(qc_config["severe_warning_fraction"])
     warning = float(qc_config["warning_fraction"])
     catalog["acceptance_status"] = np.where(
-        catalog["attempt_count"] < minimum,
-        "insufficient_coverage",
+        catalog["acceptance_fraction"] < severe_warning,
+        "severe_warning",
         np.where(
-            catalog["acceptance_fraction"] < severe_warning,
-            "severe_warning",
-            np.where(
-                catalog["acceptance_fraction"] < warning,
-                "warning",
-                "ok",
-            ),
+            catalog["acceptance_fraction"] < warning,
+            "warning",
+            "ok",
         ),
     )
     return catalog
@@ -259,9 +254,7 @@ class PreflightResult:
     @property
     def warnings(self) -> pd.DataFrame:
         return self.catalog[
-            self.catalog["acceptance_status"].isin(
-                {"severe_warning", "insufficient_coverage"}
-            )
+            self.catalog["acceptance_status"].eq("severe_warning")
         ].copy()
 
 
@@ -336,7 +329,7 @@ def run_attempt_preflight(
         plan["parent_realization_id"].astype(str).isin(set(accepted_ids))
     ].reset_index(drop=True)
     severe_warning_count = int(
-        catalog["acceptance_status"].isin({"severe_warning", "insufficient_coverage"}).sum()
+        catalog["acceptance_status"].eq("severe_warning").sum()
     )
     logger.info(
         "preflight finished: accepted=%d rejected=%d severe_warning_scenarios=%d",

@@ -15,13 +15,11 @@ import torch
 
 from cup.synthetic.readers.structured import StructuredSyntheticBenchmark
 from ginn_v2.augmentation import ObservationAugmentationProfile
-from ginn_v2.data import ParentSplitManifest, freeze_parent_split_manifest
+from ginn_v2.data import freeze_parent_split_manifest
 from ginn_v2.hsmm import HsmmPrior
 from ginn_v2.lateral import (
     LATERAL_RUN_SCHEMA,
-    LateralLoss,
     LateralLossConfig,
-    LateralModelConfig,
     LateralPatchDataModule,
     LateralStructuredModel,
     center_trace_batch,
@@ -74,8 +72,6 @@ class Step3ModelOptions:
 class Step3TrainingConfig:
     base: TeacherForcingTrainingConfig
     exact_validation_batches_per_epoch: int = 8
-    final_exact_validation_batches: int | None = 32
-    final_dirty_validation_batches: int | None = 32
     training_condition: str = "mixed"
     validation_condition: str = "clean"
 
@@ -83,10 +79,6 @@ class Step3TrainingConfig:
         for name in ("exact_validation_batches_per_epoch",):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive.")
-        for name in ("final_exact_validation_batches", "final_dirty_validation_batches"):
-            value = getattr(self, name)
-            if value is not None and int(value) <= 0:
-                raise ValueError(f"{name} must be positive when supplied.")
         if self.training_condition not in {"clean", "dirty", "mixed"}:
             raise ValueError("training_condition must be clean, dirty or mixed.")
         if self.validation_condition not in {"clean", "dirty"}:
@@ -97,8 +89,6 @@ class Step3TrainingConfig:
         required = {"base"}
         allowed = required | {
             "exact_validation_batches_per_epoch",
-            "final_exact_validation_batches",
-            "final_dirty_validation_batches",
             "training_condition",
             "validation_condition",
         }
@@ -109,16 +99,6 @@ class Step3TrainingConfig:
         return cls(
             base=TeacherForcingTrainingConfig.from_mapping(value["base"]),
             exact_validation_batches_per_epoch=int(value.get("exact_validation_batches_per_epoch", 8)),
-            final_exact_validation_batches=(
-                None
-                if value.get("final_exact_validation_batches", 32) is None
-                else int(value.get("final_exact_validation_batches", 32))
-            ),
-            final_dirty_validation_batches=(
-                None
-                if value.get("final_dirty_validation_batches", 32) is None
-                else int(value.get("final_dirty_validation_batches", 32))
-            ),
             training_condition=str(value.get("training_condition", "mixed")),
             validation_condition=str(value.get("validation_condition", "clean")),
         )
@@ -504,73 +484,7 @@ def run_stage1_step3(
             stopped_early = True
             logger.info("early stopping | epoch=%d | best_epoch=%d", epoch + 1, best_epoch)
             break
-    checkpoint = torch.load(checkpoint_output, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-    final_clean = _run_epoch(
-        model,
-        data,
-        prior,
-        config,
-        split="tuning_validation",
-        condition="clean",
-        device=device,
-        epoch=max(best_epoch - 1, 0),
-        optimizer=None,
-        logger=logger,
-        exact_batch_limit=config.training.final_exact_validation_batches,
-    )
-    final_dirty = _run_epoch(
-        model,
-        data,
-        prior,
-        config,
-        split="tuning_validation",
-        condition="dirty",
-        device=device,
-        epoch=max(best_epoch - 1, 0),
-        optimizer=None,
-        logger=logger,
-        exact_batch_limit=config.training.final_dirty_validation_batches,
-    )
-    calibration_clean = _run_epoch(
-        model,
-        data,
-        prior,
-        config,
-        split="calibration",
-        condition="clean",
-        device=device,
-        epoch=max(best_epoch - 1, 0),
-        optimizer=None,
-        logger=logger,
-        exact_batch_limit=None,
-    )
-    calibration_dirty = _run_epoch(
-        model,
-        data,
-        prior,
-        config,
-        split="calibration",
-        condition="dirty",
-        device=device,
-        epoch=max(best_epoch - 1, 0),
-        optimizer=None,
-        logger=logger,
-        exact_batch_limit=None,
-    )
-    geometry_clean = _run_epoch(
-        model,
-        data,
-        prior,
-        config,
-        split="geometry_holdout",
-        condition="clean",
-        device=device,
-        epoch=max(best_epoch - 1, 0),
-        optimizer=None,
-        logger=logger,
-        exact_batch_limit=None,
-    )
+    best_tuning_validation = history[best_epoch - 1]["tuning_validation"]
     report = {
         "schema": LATERAL_RUN_SCHEMA,
         "status": "complete",
@@ -585,11 +499,8 @@ def run_stage1_step3(
         "stopped_early": stopped_early,
         "epochs_completed": len(history),
         "history": history,
-        "final_tuning_clean": final_clean,
-        "final_tuning_dirty": final_dirty,
-        "calibration_clean": calibration_clean,
-        "calibration_dirty": calibration_dirty,
-        "geometry_holdout_clean": geometry_clean,
+        "best_tuning_validation": best_tuning_validation,
+        "frozen_evaluation_status": "pending_preflight_and_separate_evaluator",
         "model": model.config.to_dict(),
         "loss": {
             "structure": asdict(config.loss.structure),
@@ -614,192 +525,10 @@ def run_stage1_step3(
         encoding="utf-8",
     )
     logger.info(
-        "stage1 step3 complete | best_epoch=%d | clean_projected_rmse=%.6g | dirty_projected_rmse=%.6g",
+        "stage1 step3 training complete | best_epoch=%d | "
+        "best_tuning_loss=%.6g | frozen_evaluation=pending",
         best_epoch,
-        final_clean["predicted_map"]["projected_rmse"],
-        final_dirty["predicted_map"]["projected_rmse"],
-    )
-    return report
-
-
-def evaluate_stage1_step3_checkpoint(
-    config: Stage1Step3Config,
-    *,
-    checkpoint_path: str | Path,
-    output_dir: str | Path,
-    split_manifest_path: str | Path,
-    input_mode: str,
-) -> dict[str, Any]:
-    """Evaluate a frozen Step-3 checkpoint without updating its weights.
-
-    The split manifest is an explicit input so a repaired inference seam can
-    re-evaluate an interrupted run without silently generating a new split.
-    """
-    if input_mode not in {"full", "no-seismic"}:
-        raise ValueError("input_mode must be full or no-seismic.")
-    output = Path(output_dir)
-    if output.exists():
-        raise FileExistsError(f"output directory already exists: {output}")
-    output.mkdir(parents=True)
-    logger = configure_training_logger(output)
-    _seed_everything(config.training.base.seed)
-
-    benchmark = StructuredSyntheticBenchmark(config.benchmark_dir)
-    manifest = ParentSplitManifest.from_dict(
-        json.loads(Path(split_manifest_path).read_text(encoding="utf-8"))
-    )
-    (output / "parent_split_manifest.json").write_text(
-        json.dumps(
-            manifest.to_dict(),
-            indent=2,
-            ensure_ascii=False,
-            allow_nan=False,
-        ),
-        encoding="utf-8",
-    )
-    split_fingerprint = manifest.to_dict()["fingerprint_sha256"]
-    device, runtime = resolve_device(config.training.base.device)
-    model, checkpoint = LateralStructuredModel.from_step3_checkpoint(
-        checkpoint_path,
-        device=device,
-    )
-    checkpoint_mode = str(checkpoint.get("input_mode", ""))
-    if checkpoint_mode != input_mode:
-        raise ValueError(
-            f"checkpoint input mode {checkpoint_mode!r} differs from requested {input_mode!r}."
-        )
-    prior = _load_prior(checkpoint, str(split_fingerprint))
-    checkpoint_profile = checkpoint.get("augmentation_profile")
-    if checkpoint_profile is not None and checkpoint_profile != config.augmentation.to_dict():
-        raise ValueError(
-            "evaluation augmentation profile differs from the checkpoint profile."
-        )
-    data = LateralPatchDataModule(
-        config.benchmark_dir,
-        config.impedance_calibration,
-        manifest,
-        patch_width=int(model.config.patch_width),
-        augmentation_profile=config.augmentation,
-        dirty_probability=config.dirty_probability,
-        condition_limit=config.training.base.condition_limit,
-    )
-    logger.info(
-        "stage1 step3 evaluation start | device=%s | input_mode=%s | checkpoint_epoch=%s | "
-        "tuning_parents=%d | calibration_parents=%d | geometry_parents=%d",
-        device,
-        input_mode,
-        checkpoint.get("epoch", "unknown"),
-        len(manifest.tuning_validation),
-        len(manifest.calibration),
-        len(manifest.geometry_holdout),
-    )
-    epoch = max(int(checkpoint.get("epoch", 1)) - 1, 0)
-    final_clean = _run_epoch(
-        model,
-        data,
-        prior,
-        config,
-        split="tuning_validation",
-        condition="clean",
-        device=device,
-        epoch=epoch,
-        optimizer=None,
-        logger=logger,
-        exact_batch_limit=config.training.final_exact_validation_batches,
-    )
-    final_dirty = _run_epoch(
-        model,
-        data,
-        prior,
-        config,
-        split="tuning_validation",
-        condition="dirty",
-        device=device,
-        epoch=epoch,
-        optimizer=None,
-        logger=logger,
-        exact_batch_limit=config.training.final_dirty_validation_batches,
-    )
-    calibration_clean = _run_epoch(
-        model,
-        data,
-        prior,
-        config,
-        split="calibration",
-        condition="clean",
-        device=device,
-        epoch=epoch,
-        optimizer=None,
-        logger=logger,
-        exact_batch_limit=None,
-    )
-    calibration_dirty = _run_epoch(
-        model,
-        data,
-        prior,
-        config,
-        split="calibration",
-        condition="dirty",
-        device=device,
-        epoch=epoch,
-        optimizer=None,
-        logger=logger,
-        exact_batch_limit=None,
-    )
-    geometry_clean = _run_epoch(
-        model,
-        data,
-        prior,
-        config,
-        split="geometry_holdout",
-        condition="clean",
-        device=device,
-        epoch=epoch,
-        optimizer=None,
-        logger=logger,
-        exact_batch_limit=None,
-    )
-    report = {
-        "schema": LATERAL_RUN_SCHEMA,
-        "status": "complete",
-        "evaluation_only": True,
-        "input_mode": input_mode,
-        "device": str(device),
-        "runtime": runtime,
-        "benchmark_dir": str(config.benchmark_dir),
-        "impedance_calibration": str(config.impedance_calibration),
-        "checkpoint": str(Path(checkpoint_path)),
-        "checkpoint_epoch": int(checkpoint.get("epoch", -1)),
-        "split_manifest": str(Path(split_manifest_path)),
-        "split_manifest_fingerprint": str(split_fingerprint),
-        "final_tuning_clean": final_clean,
-        "final_tuning_dirty": final_dirty,
-        "calibration_clean": calibration_clean,
-        "calibration_dirty": calibration_dirty,
-        "geometry_holdout_clean": geometry_clean,
-        "model": model.config.to_dict(),
-        "training": asdict(config.training),
-        "augmentation_profile": config.augmentation.to_dict(),
-        "split_counts": {
-            name: len(manifest.parent_ids(name))
-            for name in ("training", "tuning_validation", "calibration", "geometry_holdout")
-        },
-        "hsmm_prior": {
-            "duration_bin_count": prior.duration_bin_count,
-            "smoothing": prior.smoothing,
-            "zones": sorted(prior.zones),
-        },
-    }
-    (output / "evaluation_report.json").write_text(
-        json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False),
-        encoding="utf-8",
-    )
-    logger.info(
-        "stage1 step3 evaluation complete | checkpoint_epoch=%d | "
-        "clean_projected_rmse=%.6g | dirty_projected_rmse=%.6g",
-        int(checkpoint.get("epoch", -1)),
-        final_clean["predicted_map"]["projected_rmse"],
-        final_dirty["predicted_map"]["projected_rmse"],
+        best_loss,
     )
     return report
 
@@ -809,7 +538,6 @@ __all__ = [
     "Stage1Step3Config",
     "Step3ModelOptions",
     "Step3TrainingConfig",
-    "evaluate_stage1_step3_checkpoint",
     "run_stage1_step3",
 ]
 

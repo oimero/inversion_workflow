@@ -83,8 +83,6 @@ def main() -> None:
                 config.training,
                 base=base,
                 exact_validation_batches_per_epoch=1,
-                final_exact_validation_batches=1,
-                final_dirty_validation_batches=1,
             ),
         )
     output_dir = resolve_relative_path(args.output_dir, root=REPO_ROOT)

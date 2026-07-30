@@ -8,7 +8,6 @@ creates a second HSMM or a second segmentation for a neighbour direction.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-import json
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -32,14 +31,19 @@ from ginn_v2.augmentation import (
 from ginn_v2.data import (
     ParentSplitManifest,
     TeacherForcingBatch,
-    TeacherForcingDataModule,
     collate_teacher_forcing_samples,
 )
-from ginn_v2.hsmm import HsmmPrior, HsmmResult, HsmmSegment, exact_hsmm, hsmm_log_partition, hsmm_path_score
+from ginn_v2.hsmm import (
+    HsmmPrior,
+    HsmmResult,
+    HsmmSegment,
+    exact_hsmm,
+    hsmm_log_partition,
+    hsmm_path_score,
+)
 from ginn_v2.model import (
     DirectionalEvidence,
     SingleTraceStructuredModel,
-    TeacherForcingLoss,
     TeacherForcingModelConfig,
     TeacherForcingOutput,
     TorchTeacherForcingBatch,
@@ -772,6 +776,80 @@ class LateralPatchDataModule:
                 if group:
                     yield collate_lateral_patches(group)
 
+    def build_parent_batch(
+        self,
+        parent: StructuredParent,
+        *,
+        split: str,
+        seed: int,
+        condition: str = "clean",
+        samples_per_zone_per_parent: int | None = 1,
+        maximum_patches_per_parent: int | None = None,
+        validate_event_identity: bool = True,
+    ) -> LateralPatchBatch:
+        """Build one deterministic, parent-atomic evaluation batch.
+
+        Parent-local randomness makes this result invariant to shard order.
+        Callers performing a staged preflight may validate event identity
+        separately and set ``validate_event_identity=False``.
+        """
+        if split not in {"training", "tuning_validation", "calibration", "geometry_holdout"}:
+            raise KeyError(f"unknown lateral split {split!r}")
+        if condition not in {"clean", "dirty", "mixed"}:
+            raise ValueError("condition must be clean, dirty or mixed.")
+        if (
+            maximum_patches_per_parent is not None
+            and int(maximum_patches_per_parent) <= 0
+        ):
+            raise ValueError("maximum_patches_per_parent must be positive when supplied.")
+        parent_id = str(parent.identity.realization_id)
+        if parent_id not in set(self.split_manifest.parent_ids(split)):
+            raise ValueError(f"parent {parent_id!r} does not belong to split {split!r}.")
+        if validate_event_identity:
+            validate_parent_event_identity(parent)
+        parent_seed = stable_random_identity(
+            int(seed),
+            parent_id,
+            split,
+            condition,
+            "parent_batch",
+        )
+        rng = np.random.default_rng(int(parent_seed))
+        keys = self._center_keys(
+            parent,
+            rng=rng,
+            samples_per_zone=samples_per_zone_per_parent,
+        )
+        if maximum_patches_per_parent is not None:
+            keys = keys[: int(maximum_patches_per_parent)]
+        patches: list[LateralPatch] = []
+        for lateral_index, zone_id in keys:
+            patch_condition = condition
+            if condition == "mixed":
+                patch_condition = (
+                    "dirty" if rng.random() < self.dirty_probability else "clean"
+                )
+            patch_seed = stable_random_identity(
+                int(seed),
+                parent_id,
+                zone_id,
+                lateral_index,
+                patch_condition,
+            )
+            patches.append(
+                self._patch(
+                    parent,
+                    center_lateral_index=lateral_index,
+                    zone_id=zone_id,
+                    condition=patch_condition,
+                    random_seed=patch_seed,
+                    boundary_jitter_samples=0,
+                )
+            )
+        if not patches:
+            raise ValueError(f"parent {parent_id!r} produced no constructable patches.")
+        return collate_lateral_patches(patches)
+
     def iter_parent_batches(
         self,
         split: str,
@@ -781,6 +859,7 @@ class LateralPatchDataModule:
         samples_per_zone_per_parent: int | None = 1,
         maximum_parents: int | None = None,
         maximum_patches_per_parent: int | None = None,
+        parent_ids: Sequence[str] | None = None,
     ) -> Iterator[LateralPatchBatch]:
         """Yield one complete patch batch per parent for paired interventions."""
         if split not in {"training", "tuning_validation", "calibration", "geometry_holdout"}:
@@ -790,40 +869,31 @@ class LateralPatchDataModule:
             and int(maximum_patches_per_parent) <= 0
         ):
             raise ValueError("maximum_patches_per_parent must be positive when supplied.")
-        parent_ids = list(self.split_manifest.parent_ids(split))
+        allowed_parent_ids = set(self.split_manifest.parent_ids(split))
+        if parent_ids is None:
+            selected_parent_ids = list(self.split_manifest.parent_ids(split))
+        else:
+            selected_parent_ids = [str(value) for value in parent_ids]
+            if len(selected_parent_ids) != len(set(selected_parent_ids)):
+                raise ValueError("explicit parent_ids must not contain duplicates.")
+            unexpected = sorted(set(selected_parent_ids).difference(allowed_parent_ids))
+            if unexpected:
+                raise ValueError(
+                    f"explicit parent_ids do not belong to split {split!r}: "
+                    f"{unexpected[:3]}"
+                )
         if maximum_parents is not None:
-            parent_ids = parent_ids[: int(maximum_parents)]
-        rng = np.random.default_rng(int(seed))
-        for parent_id in parent_ids:
+            selected_parent_ids = selected_parent_ids[: int(maximum_parents)]
+        for parent_id in selected_parent_ids:
             parent = self.benchmark.read_parent(parent_id)
-            validate_parent_event_identity(parent)
-            keys = self._center_keys(
+            yield self.build_parent_batch(
                 parent,
-                rng=rng,
+                split=split,
+                seed=seed,
+                condition=condition,
                 samples_per_zone=samples_per_zone_per_parent,
+                maximum_patches_per_parent=maximum_patches_per_parent,
             )
-            if maximum_patches_per_parent is not None:
-                keys = keys[: int(maximum_patches_per_parent)]
-            patches: list[LateralPatch] = []
-            for lateral_index, zone_id in keys:
-                patch_condition = condition
-                if condition == "mixed":
-                    patch_condition = "dirty" if rng.random() < self.dirty_probability else "clean"
-                patch_seed = stable_random_identity(
-                    int(seed), parent_id, zone_id, lateral_index, patch_condition
-                )
-                patches.append(
-                    self._patch(
-                        parent,
-                        center_lateral_index=lateral_index,
-                        zone_id=zone_id,
-                        condition=patch_condition,
-                        random_seed=patch_seed,
-                        boundary_jitter_samples=0,
-                    )
-                )
-            if patches:
-                yield collate_lateral_patches(patches)
 
 
 @dataclass(frozen=True)
@@ -1199,7 +1269,6 @@ def lateral_structured_training_loss(
         zone_count=len(zone_losses),
     )
     topology = patch.topology_mask
-    center_state = center.truth_state_highres.unsqueeze(1).expand_as(topology)
     topology_any = topology.any(dim=1)
     state_terms = F.cross_entropy(
         evidence.emission_log_potential.transpose(1, 2),
@@ -1256,8 +1325,12 @@ def infer_lateral_patch(
         boundary_marginal[batch_index, zone] = result.boundary_marginal
         for segment in result.consensus_segments:
             map_state[batch_index, zone[segment.start : segment.stop]] = segment.state_id
-    predicted_batch = build_predicted_segment_batch(center, [result.consensus_segments for result in results])
-    predicted_output = _teacher_output_from_lateral_evidence(model, directional, predicted_batch)
+    predicted_batch, predicted_output = parameterize_lateral_segments(
+        model,
+        patch,
+        directional,
+        [result.consensus_segments for result in results],
+    )
     return CenterTracePosterior(
         evidence=directional,
         hsmm_results=tuple(results),
@@ -1267,6 +1340,28 @@ def infer_lateral_patch(
         predicted_segment_batch=predicted_batch,
         predicted_profile=predicted_output,
     )
+
+
+def parameterize_lateral_segments(
+    model: LateralStructuredModel,
+    patch: TorchLateralPatchBatch,
+    evidence: DirectionalEvidence,
+    segmentations: Sequence[Sequence[HsmmSegment]],
+) -> tuple[TorchTeacherForcingBatch, TeacherForcingOutput]:
+    """Decode externally supplied center-trace segments with the frozen head.
+
+    This is the second pass of the structured inference interface.  It keeps
+    diagnostic, directional-fusion, and production callers on the same
+    parameterization seam without requiring them to manufacture a posterior.
+    """
+    center = center_trace_batch(patch)
+    predicted_batch = build_predicted_segment_batch(center, segmentations)
+    predicted_output = _teacher_output_from_lateral_evidence(
+        model,
+        evidence,
+        predicted_batch,
+    )
+    return predicted_batch, predicted_output
 
 
 __all__ = [
@@ -1286,5 +1381,6 @@ __all__ = [
     "infer_lateral_patch",
     "lateral_patch_to_torch",
     "lateral_structured_training_loss",
+    "parameterize_lateral_segments",
     "validate_parent_event_identity",
 ]

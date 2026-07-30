@@ -99,7 +99,7 @@ positive_direction = increasing_time
 
 ## 5. 阶段 1：合成监督结构化模型
 
-状态：阶段 0、完整迁移、sampled Oracle、阶段 1 第一步和第二步均已完成。mean-pooling 前置审计、boundary-aware full/no-seismic、truth-boundary observability Oracle 以及 Step 2 matched seismic controls 已冻结。Step 2 v3 full/no-seismic 的 balanced state accuracy 为 0.561/0.344，segment IoU 为 0.279/0.208，projected log-AI RMSE 为 0.0656/0.1332；正式 controls 证明 seismic 对 state、profile 和 AI 有实质贡献，但边界位置仍主要受 duration prior 和 posterior-count consensus 支配。第三步的 patch/event identity、masked lateral mixer、clean/dirty augmentation、controls 和 calibration/geometry 报告入口已落地，CPU smoke 已通过；正式训练和阶段门禁尚未运行。
+状态：阶段 0、完整迁移、sampled Oracle、阶段 1 第一步和第二步均已完成。mean-pooling 前置审计、boundary-aware full/no-seismic、truth-boundary observability Oracle 以及 Step 2 matched seismic controls 已冻结。Step 2 v3 full/no-seismic 的 balanced state accuracy 为 0.561/0.344，segment IoU 为 0.279/0.208，projected log-AI RMSE 为 0.0656/0.1332；正式 controls 证明 seismic 对 state、profile 和 AI 有实质贡献，但边界位置仍主要受 duration prior 和 posterior-count consensus 支配。第三步的横向模型已训练，clean/dirty tuning、calibration 和 geometry evaluation 已完成。geometry clean 的 balanced state accuracy 为 0.5402，5 m boundary F1 为 0.7160，segment IoU 为 0.2933，projected log-AI RMSE 为 0.0721；平均 segment count bias 为 -4.23，表明当前结果存在系统性欠分段，阶段 1 门禁尚未通过。
 
 前置审计使用 truth segment/state/duration 和 segment mean pooling。full model 相对 no-seismic 在 projected log-AI 上稳定改善，但参数恢复呈现明显分化：
 
@@ -230,7 +230,36 @@ boundary head 接收独立 structure feature，并显式使用冻结的 signed i
 
 预计新增生产代码 1200–2000 行。
 
-实现状态：Step 3 代码已落地。当前实现包括 parent-atomic 21 道 patch、实际 `lateral_m` masked mixer、跨 lateral event identity/topology 校验、在线 clean/dirty augmentation、full/no-seismic 训练入口、geometry holdout 报告和 matched/neighbor/parent controls；正式训练、真实观测统计 profile 冻结和最终门禁待执行。
+实现状态：Step 3 代码已落地。当前实现包括 parent-atomic 21 道 patch、实际 `lateral_m` masked mixer、跨 lateral event identity/topology 校验、在线 clean/dirty augmentation、full/no-seismic 训练入口、preflight-first 可恢复 evaluator 和 matched/neighbor/parent controls。训练结束只冻结 checkpoint 与 tuning 报告；calibration 和 geometry holdout 由独立 evaluator 执行。真实观测统计 profile 冻结和最终门禁待执行。
+
+当前冻结 checkpoint 的完整 evaluator 已运行。模型在 clean/dirty 与 calibration/geometry 间数值稳定，宽容到一个 5 m model-grid interval 的 boundary F1 约为 0.72，但 consensus segment count 系统性偏低。进入任何新训练前，先在 tuning validation 的少量分层 parents 上运行冻结 checkpoint 欠分段诊断：
+
+```text
+current posterior-count consensus
+current joint Viterbi MAP
+raw boundary evidence + current prior
+current emission + flat transition/duration prior
+truth boundaries + predicted state evidence
+truth state evidence + current prior
+```
+
+六种结果共用同一批 parent、同一 parameter head 和 LFM-anchored decoder，报告 0/1/3/5 m boundary F1、segment count、segment IoU、duration error、high-resolution RMSE 和 projected RMSE；同时报告 posterior expected segment count。诊断只读取 tuning validation，不重复运行 calibration 或 geometry holdout。结果用于区分 consensus decoding、boundary evidence、state emission 和固定 prior 四类瓶颈，再决定是修改 decoder、训练目标还是先验。
+
+冻结 checkpoint 的首轮欠分段诊断已完成。posterior-count consensus 将 joint Viterbi MAP 的平均段数从 9.4 恢复到 32.3，但 truth 平均为 37.2；flat prior 和未校准 raw boundary potential 都进一步恶化段数与定位。truth boundaries 下 predicted state 的 balanced accuracy 为 0.816、segment IoU 为 0.791，说明当前主要瓶颈位于边界定位和段数证据，而不是 profile decoder。
+
+下一项 tuning-only 诊断在每道 truth segment count 固定相同的条件下比较 boundary scales。`scale=0` 是仅使用 emission 与固定 prior 的定位基线；正尺度判断 raw boundary logit 是否包含可校准的定位排序，负尺度只检查极性是否反转。该诊断只报告 state、0/1/3/5 m boundary、segment IoU、duration 和 count-matching 指标，不运行 parameter head。正式结果决定后续采用 boundary potential 标定还是重训 boundary objective。
+
+matched-count 正式诊断中，所有 scale 均严格使用 truth count。`scale=0` 的 5 m boundary F1 为 0.77；raw boundary score 的 pairwise AUC 为 0.554，正负尺度均未改善定位，因此当前 boundary head 不具有稳定可用的边界排序信息。该结论同时表明：truth count 能改善定位，但强制模型恢复全部 generator boundary 仍缺少可观测性依据。
+
+在修改 boundary head 或增加 count head 前，先运行 clean-synthetic boundary observability audit。审计从冻结子波、AI--Vp relation、projection 和 depth/time forward 自动推导 quarter-wavelength tuning scale；对每个 canonical truth boundary 生成局部连续桥接 counterfactual，并批量计算模型一致 seismic 的响应变化。输出标签固定为：
+
+```text
+clean_forward_sensitive_isolated
+clean_forward_sensitive_tuned
+clean_forward_weak
+```
+
+`clean_forward_sensitive` 只表示在 clean、model-consistent synthetic 中产生足够 forward response，是迁移到真实工区的必要非充分条件；真实地震中的可见性只会更差。审计按 1/2/4/8 个 model-grid samples 发布现有 checkpoint 的分层 boundary recall。后续 boundary/count 训练只以 isolated clean-sensitive 边界作为严格定位门禁；tuned group 使用组级事件、状态比例和 profile 指标；clean-weak 边界保留为 prior-selected latent，不要求逐边界恢复。
 
 将同一 interface 扩展到 21 道米制 patch，完成：
 
@@ -254,14 +283,16 @@ boundary head 接收独立 structure feature，并显式使用冻结的 signed i
 → lateral DirectionalEvidence
 → exact HSMM
 → boundary-aware segment profile
+→ 全量数据合同 preflight
+→ development diagnostic
 → calibration
-→ geometry holdout
+→ 单次 geometry holdout final gate
 → frozen real-field checkpoints
 ```
 
 第三步验收使用 5.6 节完整阶段 1 门禁：AI/profile 增量价值、seismic contribution、lateral contribution 和 clean/dirty 对称门禁分别通过；不增加 pinchout false-bridging；state/boundary posterior、profile variance 和 `seismic_support_score` 完成冻结校准。
 
-augmentation、calibration 和 geometry holdout 属于同一个最终实施切片，不再拆出额外步骤。
+评估先对 tuning、calibration 和 geometry parents 做无模型合同预检。默认 diagnostic 只运行少量分层 development parents，不读取 geometry 指标；只有通过 development 与 calibration 门禁的冻结候选才能显式启动 final scope。评估按 parent 原子写入 shard 和进度文件，中断后使用同一 evaluation plan 续跑；artifact、topology、patch、HSMM、数值和运行时错误分别报告，任何 blocking contract error 均在推理前终止。
 
 ### 5.1 Zone-linear LFM anchor 与离散换基
 
@@ -380,6 +411,8 @@ background_lfm_linear + rebased effective profile
 - evidence threshold 冻结。
 
 training、tuning validation、calibration 和 geometry holdout 的 parent 集合必须两两不相交。
+
+geometry holdout 解封前，evaluation manifest 必须固定 checkpoint、split fingerprint、augmentation profile、scope 和 parent 清单。每个 parent 的推理结果先原子发布，再进入聚合；最终报告不以一次长进程完整存活为前提。diagnostic scope 不产生 geometry 指标，preflight 扫描不用于模型或阈值选择。
 
 ### 5.3 模型 interface
 
@@ -876,8 +909,10 @@ full model 相对 zone-linear anchor-only 的改善回答网络整体是否增�
 阶段 1 前置 teacher-forcing audit 已冻结
 → 第一步：boundary-aware profile head + 参数可观测性 decision 已冻结
 → 第二步：单道 evidence + exact HSMM marginals + posterior-count consensus
-→ 第三步代码已落地：lateral patch + augmentation + calibration + geometry holdout
-→ 第三步正式 full/no-seismic 训练与 controls 门禁
+→ 第三步代码已落地：lateral patch + augmentation + preflight-first resumable evaluation
+→ 第三步 full/no-seismic diagnostic 与 controls 门禁
+→ calibration 冻结
+→ 单次 geometry holdout final gate
 → 冻结 full/no-seismic 真实剖面推理
 → 剖面门禁
 → 冻结全体积推理

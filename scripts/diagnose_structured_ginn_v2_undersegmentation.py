@@ -1,18 +1,13 @@
-"""Preflight and resumably evaluate a frozen Stage 1 Step 3 checkpoint.
+"""Diagnose Stage 1 Step 3 under-segmentation without retraining.
 
-Usage::
+Example::
 
-    python scripts/evaluate_structured_ginn_v2_stage1_step3.py \
+    python scripts/diagnose_structured_ginn_v2_undersegmentation.py \
         --config experiments/ginn_v2/stage1_step3.yaml \
         --checkpoint experiments/ginn_v2/results/<run>/stage1_step3_checkpoint.pt \
         --split-manifest experiments/ginn_v2/results/<run>/parent_split_manifest.json \
-        --output-dir experiments/ginn_v2/results/<run>_diagnostic \
-        --input-mode full \
-        --scope diagnostic
-
-The default diagnostic scope never evaluates geometry holdout.  Use
-``--scope final`` only for a checkpoint that has passed development and
-calibration gates.  Interrupted runs continue with ``--resume``.
+        --output-dir experiments/ginn_v2/results/<run>_undersegmentation_audit \
+        --input-mode full
 """
 
 from __future__ import annotations
@@ -22,6 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 import sys
 
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -29,11 +25,11 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.utils.io import load_yaml_config, resolve_relative_path  # noqa: E402
-from ginn_v2.lateral_evaluation import (  # noqa: E402
-    Step3EvaluationOptions,
-    evaluate_stage1_step3_checkpoint,
-)
 from ginn_v2.lateral_training import Stage1Step3Config  # noqa: E402
+from ginn_v2.undersegmentation import (  # noqa: E402
+    UndersegmentationAuditOptions,
+    run_undersegmentation_audit,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,39 +48,18 @@ def parse_args() -> argparse.Namespace:
         required=True,
     )
     parser.add_argument(
-        "--scope",
-        choices=("diagnostic", "final"),
-        default="diagnostic",
-        help=(
-            "diagnostic evaluates small development subsets; final evaluates "
-            "all tuning/calibration parents and unlocks geometry holdout"
-        ),
+        "--condition",
+        choices=("clean", "dirty"),
+        default="clean",
     )
-    parser.add_argument(
-        "--diagnostic-parents-per-split",
-        type=int,
-        default=8,
-        help="Stratified parent count for each development split in diagnostic scope.",
-    )
-    parser.add_argument(
-        "--progress-every-parents",
-        type=int,
-        default=5,
-    )
-    parser.add_argument(
-        "--preflight-only",
-        action="store_true",
-        help="Scan evaluation contracts without loading the model on GPU.",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume an output directory created by this evaluator.",
-    )
+    parser.add_argument("--maximum-parents", type=int, default=16)
+    parser.add_argument("--oracle-logit", type=float, default=12.0)
+    parser.add_argument("--progress-every-parents", type=int, default=2)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--smoke",
         action="store_true",
-        help="Preflight and evaluate one parent per development split on CPU.",
+        help="Run one tuning parent on CPU.",
     )
     return parser.parse_args()
 
@@ -103,37 +78,39 @@ def main() -> None:
         root=REPO_ROOT,
     )
     if args.smoke:
-        base = replace(
-            config.training.base,
-            device="cpu",
-            maximum_samples_per_parent=1,
-            progress_log_every_parents=1,
-        )
         config = replace(
             config,
-            training=replace(config.training, base=base),
+            training=replace(
+                config.training,
+                base=replace(
+                    config.training.base,
+                    device="cpu",
+                    maximum_samples_per_parent=1,
+                    progress_log_every_parents=1,
+                ),
+            ),
         )
-    options = Step3EvaluationOptions(
-        scope=str(args.scope),
-        diagnostic_parents_per_split=(
-            1 if args.smoke else int(args.diagnostic_parents_per_split)
-        ),
+    options = UndersegmentationAuditOptions(
+        maximum_parents=1 if args.smoke else int(args.maximum_parents),
+        condition=str(args.condition),
+        oracle_logit=float(args.oracle_logit),
         progress_every_parents=(
             1 if args.smoke else int(args.progress_every_parents)
         ),
-        preflight_only=bool(args.preflight_only),
         resume=bool(args.resume),
-        preflight_parent_limit_per_split=1 if args.smoke else None,
     )
-    evaluate_stage1_step3_checkpoint(
+    run_undersegmentation_audit(
         config,
-        checkpoint_path=resolve_relative_path(args.checkpoint, root=REPO_ROOT),
+        checkpoint_path=resolve_relative_path(
+            args.checkpoint,
+            root=REPO_ROOT,
+        ),
         split_manifest_path=resolve_relative_path(
             args.split_manifest,
             root=REPO_ROOT,
         ),
         output_dir=resolve_relative_path(args.output_dir, root=REPO_ROOT),
-        input_mode=args.input_mode,
+        input_mode=str(args.input_mode),
         options=options,
     )
 

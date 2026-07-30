@@ -571,6 +571,117 @@ def posterior_consensus_segments(
     return min(candidates, key=lambda item: (item[0], item[1]))[2]
 
 
+def count_targeted_viterbi_segments(
+    emission_log_potential: torch.Tensor,
+    boundary_log_potential: torch.Tensor,
+    prior: ZoneHsmmPrior,
+    *,
+    target_count: int,
+) -> tuple[HsmmSegment, ...]:
+    """Decode the exact best legal path with an external segment count.
+
+    This non-differentiable diagnostic seam runs the count-constrained dynamic
+    program on CPU. It does not alter posterior consensus production decoding.
+    """
+    _validate_potentials(emission_log_potential, boundary_log_potential)
+    sample_count = int(emission_log_potential.shape[0])
+    target_count = int(target_count)
+    if target_count < 1 or target_count > sample_count:
+        raise ValueError("target_count must be within [1, sample_count].")
+    emission = (
+        emission_log_potential.detach()
+        .to(device="cpu", dtype=torch.float64)
+        .numpy()
+    )
+    boundary = (
+        boundary_log_potential.detach()
+        .to(device="cpu", dtype=torch.float64)
+        .numpy()
+    )
+    duration = (
+        prior.duration_scores(
+            sample_count,
+            device=torch.device("cpu"),
+            dtype=torch.float64,
+        )
+        .numpy()
+    )
+    initial = np.asarray(prior.initial_log_probability, dtype=np.float64)
+    transition = np.asarray(
+        prior.transition_log_probability,
+        dtype=np.float64,
+    )
+    emission_prefix = np.concatenate(
+        (
+            np.zeros((1, STATE_COUNT), dtype=np.float64),
+            np.cumsum(emission, axis=0),
+        ),
+        axis=0,
+    )
+    scores = np.full(
+        (target_count + 1, sample_count + 1, STATE_COUNT),
+        -np.inf,
+        dtype=np.float64,
+    )
+    back_start = np.full(scores.shape, -1, dtype=np.int64)
+    back_state = np.full(scores.shape, -1, dtype=np.int64)
+    for stop in range(1, sample_count + 1):
+        segment = (
+            emission_prefix[stop]
+            - emission_prefix[0]
+            + duration[:, stop - 1]
+        )
+        scores[1, stop] = initial + segment
+        back_start[1, stop] = 0
+    for count in range(2, target_count + 1):
+        for stop in range(count, sample_count + 1):
+            starts = np.arange(count - 1, stop, dtype=np.int64)
+            previous = (
+                scores[count - 1, starts, :, None]
+                + transition[None, :, :]
+            )
+            previous_score = np.max(previous, axis=1)
+            previous_state = np.argmax(previous, axis=1)
+            duration_indices = stop - starts - 1
+            segment = (
+                emission_prefix[stop][None, :]
+                - emission_prefix[starts]
+                + duration[:, duration_indices].T
+                + boundary[starts, None]
+            )
+            values = previous_score + segment
+            selected = np.argmax(values, axis=0)
+            states = np.arange(STATE_COUNT)
+            scores[count, stop] = values[selected, states]
+            back_start[count, stop] = starts[selected]
+            back_state[count, stop] = previous_state[selected, states]
+    final_scores = scores[target_count, sample_count]
+    if not np.any(np.isfinite(final_scores)):
+        raise ValueError(
+            "target_count has no legal HSMM path under the supplied prior."
+        )
+    state = int(np.argmax(final_scores))
+    stop = sample_count
+    segments: list[HsmmSegment] = []
+    for count in range(target_count, 0, -1):
+        start = int(back_start[count, stop, state])
+        if start < 0:
+            raise RuntimeError(
+                "count-constrained Viterbi encountered an invalid pointer."
+            )
+        segments.append(
+            HsmmSegment(state_id=state, start=start, stop=stop)
+        )
+        state = int(back_state[count, stop, state])
+        stop = start
+    if stop != 0:
+        raise RuntimeError(
+            "count-constrained Viterbi did not cover the complete zone."
+        )
+    segments.reverse()
+    return tuple(segments)
+
+
 def _validate_potentials(
     emission_log_potential: torch.Tensor,
     boundary_log_potential: torch.Tensor,
@@ -965,6 +1076,7 @@ __all__ = [
     "HsmmSegment",
     "ZoneHsmmPrior",
     "canonicalize_hsmm_segments",
+    "count_targeted_viterbi_segments",
     "exact_hsmm",
     "fit_hsmm_prior",
     "freeze_hsmm_prior",

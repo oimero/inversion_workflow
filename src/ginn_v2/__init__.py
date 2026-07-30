@@ -55,9 +55,14 @@ from ginn_v2.lateral import (
     infer_lateral_patch,
     lateral_patch_to_torch,
     lateral_structured_training_loss,
+    parameterize_lateral_segments,
     validate_parent_event_identity,
 )
 from ginn_v2.lateral_training import Stage1Step3Config, run_stage1_step3
+from ginn_v2.lateral_evaluation import (
+    Step3EvaluationOptions,
+    evaluate_stage1_step3_checkpoint,
+)
 from ginn_v2.lateral_controls import (
     matched_center_seismic_shuffle,
     neighbor_seismic_shuffle,
@@ -69,6 +74,7 @@ from ginn_v2.hsmm import (
     HsmmResult,
     HsmmSegment,
     ZoneHsmmPrior,
+    count_targeted_viterbi_segments,
     exact_hsmm,
     fit_hsmm_prior,
     freeze_hsmm_prior,
@@ -105,6 +111,18 @@ from ginn_v2.observability import (
     TruthBoundaryOracleConfig,
     run_truth_boundary_oracle,
 )
+from ginn_v2.undersegmentation import (
+    UndersegmentationAuditOptions,
+    run_undersegmentation_audit,
+)
+from ginn_v2.boundary_localization import (
+    BoundaryLocalizationAuditOptions,
+    run_boundary_localization_audit,
+)
+from ginn_v2.boundary_observability import (
+    BoundaryObservabilityAuditOptions,
+    run_boundary_observability_audit,
+)
 from ginn_v2.runtime import configure_training_logger, resolve_device
 from ginn_v2.truth import (
     LatentTrace,
@@ -119,6 +137,8 @@ from ginn_v2.truth import (
 __all__ = [
     "AnchoredSegment",
     "AugmentedSeismic",
+    "BoundaryLocalizationAuditOptions",
+    "BoundaryObservabilityAuditOptions",
     "DecoderResult",
     "DirectionalEvidence",
     "ForwardContext",
@@ -144,6 +164,7 @@ __all__ = [
     "StateDurationBaseline",
     "Stage1Step2Config",
     "Stage1Step3Config",
+    "Step3EvaluationOptions",
     "StructuredSample",
     "StructuredLossConfig",
     "StructuredTruthAdapter",
@@ -154,6 +175,7 @@ __all__ = [
     "TeacherForcingModelConfig",
     "TorchLateralPatchBatch",
     "TruthBoundaryOracleConfig",
+    "UndersegmentationAuditOptions",
     "SingleTraceStructuredModel",
     "CenterTracePosterior",
     "ZoneHsmmPrior",
@@ -165,6 +187,7 @@ __all__ = [
     "build_parent_split_manifest",
     "collate_teacher_forcing_samples",
     "collate_lateral_patches",
+    "count_targeted_viterbi_segments",
     "configure_training_logger",
     "decode_lfm_anchored_numpy",
     "decode_lfm_anchored_torch",
@@ -182,17 +205,21 @@ __all__ = [
     "project_log_ai_to_model_grid",
     "resolve_device",
     "run_artifact_oracle",
+    "run_boundary_localization_audit",
+    "run_boundary_observability_audit",
     "run_oracle",
     "run_stage1_step1_controls",
     "run_stage1_step2",
     "run_stage1_step2_controls",
     "run_stage1_step3",
+    "evaluate_stage1_step3_checkpoint",
     "run_truth_boundary_oracle",
     "teacher_forcing_loss",
     "infer_center_trace",
     "infer_lateral_patch",
     "lateral_patch_to_torch",
     "lateral_structured_training_loss",
+    "parameterize_lateral_segments",
     "matched_parent_zone_seismic_shuffle",
     "matched_center_seismic_shuffle",
     "neighbor_seismic_shuffle",
@@ -202,4 +229,5 @@ __all__ = [
     "center_trace_batch",
     "validate_parent_event_identity",
     "run_stage1_step3_controls",
+    "run_undersegmentation_audit",
 ]

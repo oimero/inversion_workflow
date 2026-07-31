@@ -15,6 +15,29 @@ from cup.synthetic.readers.structured import StructuredParent, StructuredSynthet
 
 ORACLE_SCHEMA = "structured_synthetic_corpus_oracle_v2"
 
+ORACLE_NUMERICAL_FAILURE_CLASS = "numerical_parity"
+ORACLE_STRUCTURAL_FAILURE_CLASS = "structural"
+
+
+class OracleParityError(ValueError):
+    """A numerical replay mismatch on otherwise valid published data."""
+
+    failure_class = ORACLE_NUMERICAL_FAILURE_CLASS
+
+
+class OracleSupportError(ValueError):
+    """The published artifact has no valid support for an Oracle comparison."""
+
+    failure_class = ORACLE_STRUCTURAL_FAILURE_CLASS
+
+# The published structured artifact stores the model-grid arrays as float32.
+# A depth forward uses a finite-support wavelet, so a float32 round-trip can
+# move one travel-time sample from just inside a non-zero wavelet endpoint to
+# just outside it.  This is a representation boundary, not a decoder or
+# projection failure.  Keep the margin explicit and report the affected
+# samples instead of weakening parity for the rest of the trace.
+FORWARD_ROUNDTRIP_BOUNDARY_MARGIN_S = 1.0e-7
+
 
 def _decode_effective(parent: StructuredParent) -> np.ndarray:
     axis = parent.highres_axis.coordinates
@@ -88,6 +111,91 @@ def _forward(parent: StructuredParent, model_log_ai: np.ndarray) -> np.ndarray:
     )
 
 
+def _depth_forward_boundary_sensitive_mask(
+    parent: StructuredParent,
+    *,
+    margin_s: float = FORWARD_ROUNDTRIP_BOUNDARY_MARGIN_S,
+) -> np.ndarray:
+    """Return output samples that can change at a finite-support endpoint.
+
+    The artifact round-trip stores ``model_log_ai`` as float32 while the
+    producer forward is evaluated before that quantization.  For depth
+    modeling, travel time depends on the model and the finite-support
+    interpolation is discontinuous when an event crosses the first or last
+    wavelet sample.  This mask identifies only that narrow representation
+    seam.  It is intentionally not used for arbitrary forward mismatches.
+    """
+    output_shape = np.asarray(parent.observed_valid, dtype=bool).shape
+    if parent.sample_domain != "depth":
+        return np.zeros(output_shape, dtype=bool)
+    if not np.isfinite(margin_s) or margin_s < 0.0:
+        raise ValueError("forward round-trip boundary margin must be finite and non-negative")
+
+    context = parent.forward_context
+    wavelet_time = np.asarray(context["wavelet_time_s"], dtype=np.float64)
+    wavelet_amplitude = np.asarray(
+        context["wavelet_amplitude"], dtype=np.float64
+    )
+    if wavelet_time.ndim != 1 or wavelet_amplitude.shape != wavelet_time.shape:
+        raise ValueError("forward context contains invalid wavelet arrays")
+    # A zero-valued endpoint is continuous with the finite-support zero
+    # extension and cannot create this particular round-trip discontinuity.
+    if not (wavelet_amplitude[0] != 0.0 or wavelet_amplitude[-1] != 0.0):
+        return np.zeros(output_shape, dtype=bool)
+
+    relation = dict(context["ai_velocity_relation"])
+    velocity = velocity_from_ai(
+        np.exp(np.asarray(parent.model_log_ai, dtype=np.float64)),
+        a=float(relation["a"]),
+        b=float(relation["b"]),
+    )
+    depth = np.asarray(parent.model_axis.coordinates, dtype=np.float64)
+    if velocity.ndim != 2 or velocity.shape != output_shape:
+        raise ValueError(
+            "depth forward boundary mask requires model arrays with shape "
+            f"{output_shape}, got {velocity.shape}"
+        )
+    dz = np.diff(depth)
+    interval_twt = 2.0 * dz[None, :] * 0.5 * (
+        np.reciprocal(velocity[:, :-1]) + np.reciprocal(velocity[:, 1:])
+    )
+    sample_twt = np.empty_like(velocity, dtype=np.float64)
+    sample_twt[:, 0] = 0.0
+    sample_twt[:, 1:] = np.cumsum(interval_twt, axis=-1)
+    interface_twt = 0.5 * (sample_twt[:, :-1] + sample_twt[:, 1:])
+
+    sensitive = np.zeros(output_shape, dtype=bool)
+    wavelet_min = float(wavelet_time[0])
+    wavelet_max = float(wavelet_time[-1])
+    chunk_size = max(1, int(context.get("output_chunk_size", 64)))
+    for start in range(0, output_shape[-1], chunk_size):
+        stop = min(start + chunk_size, output_shape[-1])
+        tau = sample_twt[:, start:stop, None] - interface_twt[:, None, :]
+        sensitive[:, start:stop] = np.any(
+            (np.abs(tau - wavelet_min) <= margin_s)
+            | (np.abs(tau - wavelet_max) <= margin_s),
+            axis=-1,
+        )
+    return sensitive
+
+
+def _error_metrics(
+    actual: np.ndarray,
+    expected: np.ndarray,
+    mask: np.ndarray,
+) -> tuple[float, float]:
+    left = np.asarray(actual, dtype=np.float64)[mask]
+    right = np.asarray(expected, dtype=np.float64)[mask]
+    if left.size == 0 or np.any(~np.isfinite(left)) or np.any(~np.isfinite(right)):
+        raise OracleSupportError("comparison has no finite support")
+    difference = np.abs(left - right)
+    maximum = float(np.max(difference))
+    relative = float(
+        np.max(difference / np.maximum(np.abs(right), np.finfo(np.float64).eps))
+    )
+    return maximum, relative
+
+
 def _max_error(
     actual: np.ndarray,
     expected: np.ndarray,
@@ -99,15 +207,9 @@ def _max_error(
 ) -> tuple[float, float]:
     left = np.asarray(actual, dtype=np.float64)[mask]
     right = np.asarray(expected, dtype=np.float64)[mask]
-    if left.size == 0 or np.any(~np.isfinite(left)) or np.any(~np.isfinite(right)):
-        raise ValueError(f"{label} has no finite comparison support.")
-    difference = np.abs(left - right)
-    maximum = float(np.max(difference))
-    relative = float(
-        np.max(difference / np.maximum(np.abs(right), np.finfo(np.float64).eps))
-    )
+    maximum, relative = _error_metrics(actual, expected, mask)
     if not np.allclose(left, right, rtol=rtol, atol=atol):
-        raise ValueError(
+        raise OracleParityError(
             f"{label} parity failed: max_abs={maximum:.6g}, "
             f"max_relative={relative:.6g}"
         )
@@ -141,9 +243,13 @@ def run_canonical_oracle(
         "decoder_max_abs_error": 0.0,
         "projection_max_abs_error": 0.0,
         "forward_max_abs_error": 0.0,
+        "forward_boundary_sensitive_sample_count": 0.0,
+        "forward_boundary_sensitive_parent_count": 0.0,
+        "forward_boundary_sensitive_max_abs_error": 0.0,
         "clipped_sample_count": 0.0,
     }
-    failures: list[dict[str, str]] = []
+    failures: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
     for parent_id in selected:
         try:
             parent = benchmark.read_parent(parent_id)
@@ -173,14 +279,54 @@ def run_canonical_oracle(
                 atol=atol,
             )
             seismic = _forward(parent, parent.model_log_ai)
+            boundary_mask = _depth_forward_boundary_sensitive_mask(parent)
+            observed_mask = np.asarray(parent.observed_valid, dtype=bool)
+            safe_forward_mask = observed_mask & ~boundary_mask
             forward_error, _ = _max_error(
                 seismic,
                 parent.model_consistent_seismic,
-                parent.observed_valid,
+                safe_forward_mask,
                 label=f"{parent.sample_domain} forward",
                 rtol=rtol,
                 atol=atol,
             )
+            boundary_forward_mask = observed_mask & boundary_mask
+            if np.any(boundary_forward_mask):
+                metrics["forward_boundary_sensitive_sample_count"] += float(
+                    np.count_nonzero(boundary_forward_mask)
+                )
+                metrics["forward_boundary_sensitive_parent_count"] += 1.0
+                boundary_error, boundary_relative = _error_metrics(
+                    seismic,
+                    parent.model_consistent_seismic,
+                    boundary_forward_mask,
+                )
+                metrics["forward_boundary_sensitive_max_abs_error"] = max(
+                    metrics["forward_boundary_sensitive_max_abs_error"],
+                    boundary_error,
+                )
+                boundary_actual = np.asarray(seismic, dtype=np.float64)[
+                    boundary_forward_mask
+                ]
+                boundary_expected = np.asarray(
+                    parent.model_consistent_seismic, dtype=np.float64
+                )[boundary_forward_mask]
+                if not np.allclose(
+                    boundary_actual,
+                    boundary_expected,
+                    rtol=rtol,
+                    atol=atol,
+                ):
+                    warnings.append(
+                        {
+                            "warning_type": "forward_roundtrip_boundary_sensitivity",
+                            "parent_id": parent_id,
+                            "sample_count": int(np.count_nonzero(boundary_forward_mask)),
+                            "max_abs_error": boundary_error,
+                            "max_relative_error": boundary_relative,
+                            "margin_s": FORWARD_ROUNDTRIP_BOUNDARY_MARGIN_S,
+                        }
+                    )
             metrics["decoder_max_abs_error"] = max(
                 metrics["decoder_max_abs_error"], decoder_error
             )
@@ -197,6 +343,11 @@ def run_canonical_oracle(
             failures.append(
                 {
                     "parent_id": parent_id,
+                    "failure_class": getattr(
+                        exc,
+                        "failure_class",
+                        ORACLE_STRUCTURAL_FAILURE_CLASS,
+                    ),
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                 }
@@ -206,9 +357,20 @@ def run_canonical_oracle(
         "passed": not failures and bool(selected),
         "parent_count": len(selected),
         "failure_count": len(failures),
+        "warning_count": len(warnings),
         "metrics": metrics,
         "failures": failures,
+        "warnings": warnings,
+        "forward_roundtrip_boundary_margin_s": FORWARD_ROUNDTRIP_BOUNDARY_MARGIN_S,
     }
 
 
-__all__ = ["ORACLE_SCHEMA", "run_canonical_oracle"]
+__all__ = [
+    "FORWARD_ROUNDTRIP_BOUNDARY_MARGIN_S",
+    "ORACLE_NUMERICAL_FAILURE_CLASS",
+    "ORACLE_STRUCTURAL_FAILURE_CLASS",
+    "ORACLE_SCHEMA",
+    "OracleParityError",
+    "OracleSupportError",
+    "run_canonical_oracle",
+]

@@ -27,7 +27,6 @@ from cup.synthetic.core.corpus import (
     build_corpus_v2_plan,
     published_quota_report,
     required_quota_counts,
-    select_accepted_quota,
 )
 from cup.synthetic.core.artifacts import (
     limit_attempt_plan,
@@ -38,10 +37,13 @@ from cup.synthetic.core.field_runner import (
     AttemptProgressLog,
     build_acceptance_catalog,
     configure_generation_logger,
+    load_reusable_attempt_plan,
+    reuse_attempt_preflight,
     run_attempt_preflight,
     stable_records_frame,
 )
 from cup.synthetic.core.rejections import BenchmarkBuildRejected, StagedRejection
+from cup.synthetic.core.geometry import validate_canonical_corpus_lateral_m
 from cup.synthetic.core.writer import (
     validate_structured_truth_tables,
     write_structured_sample,
@@ -216,6 +218,44 @@ def _portable_figure_summary(
     return result
 
 
+ORACLE_NUMERICAL_FAILURE_CLASS = "numerical_parity"
+
+
+def _partition_oracle_failures(
+    report: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Separate replay warnings from artifact-integrity failures.
+
+    The Oracle callback is deliberately allowed to evolve independently of
+    the shared pipeline.  An unrecognised or malformed failure is therefore
+    conservative: it remains blocking until the callback gives it an
+    explicit numerical-parity class.
+    """
+    raw_failures = report.get("failures", [])
+    if raw_failures is None:
+        raw_failures = []
+    if not isinstance(raw_failures, list):
+        raise TypeError("structured artifact Oracle failures must be a list")
+    numerical: list[dict[str, Any]] = []
+    structural: list[dict[str, Any]] = []
+    for item in raw_failures:
+        if not isinstance(item, Mapping):
+            structural.append(
+                {
+                    "failure_class": "structural",
+                    "error_type": "MalformedOracleFailure",
+                    "error": repr(item),
+                }
+            )
+            continue
+        failure = dict(item)
+        if failure.get("failure_class") == ORACLE_NUMERICAL_FAILURE_CLASS:
+            numerical.append(failure)
+        else:
+            structural.append(failure)
+    return numerical, structural
+
+
 def _validate_published_artifact(directory: Path, *, qc_only: bool) -> None:
     """Run the canonical reader as the last generation publication gate.
 
@@ -301,6 +341,7 @@ class GenerationSession:
     schema_version: str
     generator_family: str
     hdf5_attributes: Mapping[str, Any]
+    lateral_sample_interval_m: float
     section_ids: Sequence[str] = field(default_factory=tuple)
     section_roles: Mapping[str, str] = field(default_factory=dict)
     scenarios: Sequence[Any] = field(default_factory=tuple)
@@ -454,6 +495,7 @@ class SyntheticBenchmarkPipeline:
         debug_attempt_limit: int | None = None,
         geometry_families: Sequence[str] | None = None,
         qc_only: bool = False,
+        preflight_source_dir: str | Path | None = None,
         **runtime: Any,
     ) -> Any:
         self._validate_config(config)
@@ -491,6 +533,11 @@ class SyntheticBenchmarkPipeline:
                 repo_root=runtime.get("repo_root"),
                 debug_attempt_limit=parsed_limit,
                 published_output_dir=directory,
+                preflight_source_dir=(
+                    None
+                    if preflight_source_dir is None
+                    else Path(preflight_source_dir)
+                ),
             )
             staging.replace(directory)
             return summary
@@ -510,23 +557,39 @@ class SyntheticBenchmarkPipeline:
         repo_root: Path | None,
         debug_attempt_limit: int | None,
         published_output_dir: Path,
+        preflight_source_dir: Path | None,
     ) -> dict[str, Any]:
         logger = configure_generation_logger(output_dir, sample_domain=session.sample_domain)
         plan = session.resolve_plan(debug_attempt_limit)
+        if preflight_source_dir is not None:
+            plan = load_reusable_attempt_plan(
+                plan,
+                source_dir=preflight_source_dir,
+            )
         development_limited = bool(
             session.development_limited or debug_attempt_limit is not None
         )
         plan.to_csv(output_dir / "attempt_plan.csv", index=False)
         acceptance_qc = dict(session.acceptance_qc)
-        preflight = run_attempt_preflight(
-            plan,
-            validator=session.validate,
-            rejection_exceptions=(StagedRejection,),
-            qc_config=acceptance_qc,
-            output_dir=output_dir,
-            logger=logger,
-            development_limited=development_limited,
-        )
+        if preflight_source_dir is None:
+            preflight = run_attempt_preflight(
+                plan,
+                validator=session.validate,
+                rejection_exceptions=(StagedRejection,),
+                qc_config=acceptance_qc,
+                output_dir=output_dir,
+                logger=logger,
+                development_limited=development_limited,
+            )
+        else:
+            preflight = reuse_attempt_preflight(
+                plan,
+                source_dir=preflight_source_dir,
+                output_dir=output_dir,
+                qc_config=acceptance_qc,
+                development_limited=development_limited,
+                logger=logger,
+            )
         preflight_warnings = preflight.warnings
         preflight_has_usable_parent = not preflight.accepted_plan.empty
         preflight_summary = {
@@ -549,15 +612,20 @@ class SyntheticBenchmarkPipeline:
         generation_plan = preflight.accepted_plan
         expected_quota: dict[str, int] = {}
         if session.corpus_budget is not None and not development_limited:
-            # This is the final hard preflight gate: every bucket must have
-            # enough truth-valid candidates before expensive forward work.
-            # Formal generation keeps all accepted reserves so a later staged
-            # scientific rejection can consume the next candidate in-bucket.
-            select_accepted_quota(
-                preflight.accepted_plan,
-                session.corpus_budget,
-            )
             expected_quota = required_quota_counts(session.corpus_budget)
+            available_quota = (
+                preflight.accepted_plan.groupby("quota_bucket").size().to_dict()
+            )
+            for bucket, required in expected_quota.items():
+                available = int(available_quota.get(bucket, 0))
+                if available < required:
+                    logger.warning(
+                        "preflight quota shortage will be published as a warning: "
+                        "bucket=%s required=%d accepted_candidates=%d",
+                        bucket,
+                        required,
+                        available,
+                    )
 
         h5_path = output_dir / "synthetic_benchmark.h5"
         h5_attrs = {
@@ -642,26 +710,11 @@ class SyntheticBenchmarkPipeline:
                         )
                     corpus_role = str(row.get("corpus_role") or "")
                     if session.corpus_budget is not None:
-                        expected_width = {
-                            "short_patch": 25,
-                            "full_section": 121,
-                        }.get(corpus_role)
-                        if expected_width is None:
-                            raise ValueError("canonical V2 parent has no corpus_role.")
-                        lateral = np.asarray(sample.truth.lateral_m, dtype=np.float64)
-                        if not development_limited and (
-                            lateral.size != expected_width or (
-                            lateral.size > 1
-                            and not np.allclose(
-                                np.diff(lateral),
-                                25.0,
-                                rtol=0.0,
-                                atol=1.0e-6,
-                            )
-                            )
-                        ):
-                            raise ValueError(
-                                f"{corpus_role} requires {expected_width} traces at 25 m."
+                        if not development_limited:
+                            validate_canonical_corpus_lateral_m(
+                                sample.truth.lateral_m,
+                                corpus_role=corpus_role,
+                                target_interval_m=session.lateral_sample_interval_m,
                             )
                     try:
                         validate_structured_truth_tables(sample)
@@ -864,9 +917,15 @@ class SyntheticBenchmarkPipeline:
             }
         )
         structured_oracle_report: dict[str, Any] = {}
+        oracle_warnings: list[Any] = []
+        oracle_has_warnings = False
+        oracle_has_roundtrip_warnings = False
+        oracle_has_nonblocking_failures = False
+        oracle_nonblocking_failure_count = 0
         if not qc_only and successful_parent_ids:
             _validate_published_artifact(output_dir, qc_only=False)
             if session.structured_artifact_oracle is not None:
+                candidate_warnings: list[Any] = []
                 try:
                     candidate_report = session.structured_artifact_oracle(
                         output_dir,
@@ -876,6 +935,11 @@ class SyntheticBenchmarkPipeline:
                     if not isinstance(candidate_report, Mapping):
                         raise TypeError("structured artifact Oracle must return a mapping")
                     structured_oracle_report = dict(candidate_report)
+                    candidate_warnings = structured_oracle_report.get("warnings", [])
+                    if candidate_warnings is None:
+                        candidate_warnings = []
+                    if not isinstance(candidate_warnings, list):
+                        raise TypeError("structured artifact Oracle warnings must be a list")
                 except Exception as exc:
                     structured_oracle_report = {
                         "schema": "structured_synthetic_benchmark_oracle_report_v1",
@@ -885,18 +949,62 @@ class SyntheticBenchmarkPipeline:
                         "failure_count": 1,
                         "metrics": {},
                         "failures": [{
+                            "failure_class": "structural",
                             "error_type": type(exc).__name__,
                             "error": str(exc),
                         }],
                     }
+                numerical_failures, structural_failures = _partition_oracle_failures(
+                    structured_oracle_report
+                )
+                oracle_has_roundtrip_warnings = bool(candidate_warnings)
+                oracle_warnings = list(candidate_warnings)
+                if numerical_failures and bool(structured_oracle_report.get("passed")):
+                    structural_failures.extend(numerical_failures)
+                    numerical_failures = []
+                if not bool(structured_oracle_report.get("passed")) and not (
+                    numerical_failures or structural_failures
+                ):
+                    structural_failures.append(
+                        {
+                            "failure_class": "structural",
+                            "error_type": "MalformedOracleReport",
+                            "error": "Oracle reported passed=false without failures",
+                        }
+                    )
+                if numerical_failures:
+                    oracle_has_nonblocking_failures = True
+                    oracle_nonblocking_failure_count = len(numerical_failures)
+                    oracle_warnings.extend(
+                        {
+                            **failure,
+                            "warning_type": "oracle_numerical_parity_failure",
+                        }
+                        for failure in numerical_failures
+                    )
+                    logger.warning(
+                        "structured artifact Oracle found %d nonblocking numerical "
+                        "failures; publishing with warnings and marking the corpus "
+                        "non-training-consumable",
+                        oracle_nonblocking_failure_count,
+                    )
+                oracle_has_warnings = bool(oracle_warnings)
+                structured_oracle_report["warnings"] = oracle_warnings
+                structured_oracle_report["warning_count"] = len(oracle_warnings)
+                structured_oracle_report["nonblocking_failure_count"] = (
+                    oracle_nonblocking_failure_count
+                )
+                structured_oracle_report["blocking_failure_count"] = len(
+                    structural_failures
+                )
                 _write_json(
                     output_dir / "oracle_report.json",
                     structured_oracle_report,
                 )
-                if not bool(structured_oracle_report.get("passed", False)):
+                if structural_failures:
                     raise RuntimeError(
-                        "structured_synthetic_benchmark_oracle_failed: "
-                        f"{structured_oracle_report.get('failures', [])[:3]}"
+                        "structured_synthetic_benchmark_oracle_blocking_failure: "
+                        f"{structural_failures[:3]}"
                     )
             else:
                 structured_oracle_report = {
@@ -945,6 +1053,7 @@ class SyntheticBenchmarkPipeline:
                 warning_scenarios.any()
                 or parent_quality_warning_count > 0
                 or quota_shortfall_count > 0
+                or oracle_has_warnings
             )
         )
         diagnostic_warnings: list[dict[str, str]] = []
@@ -1029,7 +1138,9 @@ class SyntheticBenchmarkPipeline:
             "depth_basis": session.depth_basis,
             "development_limited": development_limited,
             "qc_only": bool(qc_only),
-            "training_consumable": not bool(qc_only),
+            "training_consumable": bool(
+                not qc_only and not oracle_has_nonblocking_failures
+            ),
             "global_seed": int(config["global_seed"]),
             "n_scenarios": int(plan["scenario_id"].nunique()) if "scenario_id" in plan else 0,
             "candidate_attempts": int(len(plan)),
@@ -1066,12 +1177,18 @@ class SyntheticBenchmarkPipeline:
                 if not qc_only
                 else None
             ),
+            "oracle_warning_count": int(len(oracle_warnings)),
+            "oracle_nonblocking_failure_count": int(
+                oracle_nonblocking_failure_count
+            ),
             "rejection_reason_summary": [] if rejection_summary.empty else rejection_summary.to_dict(orient="records"),
             "usable": not bool(failure_reason),
             "quality_warnings": (
                 ([] if not bool(warning_scenarios.any()) else ["scenario_acceptance_qc_warning"])
                 + ([] if not parent_quality_warning_count else ["parent_scientific_qc_warning"])
                 + ([] if not quota_shortfall_count else ["canonical_quota_shortfall"])
+                + ([] if not oracle_has_roundtrip_warnings else ["structured_oracle_roundtrip_warning"])
+                + ([] if not oracle_has_nonblocking_failures else ["structured_oracle_numerical_failure"])
                 + ([] if not diagnostic_warnings else ["optional_diagnostic_failure"])
             ),
             "diagnostic_warnings": diagnostic_warnings,

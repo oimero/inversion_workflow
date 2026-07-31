@@ -63,6 +63,7 @@ synthoseis_lite:
 时间域使用秒制采样轴和时间正演。深度域使用 TVDSS 米制采样轴、冻结的阻抗—速度关系和深度正演。
 
 inline 和 xline 表示几何身份。横向物理距离使用米制的 lateral axis。工区 xline 步长从 survey geometry 读取。
+横向配置给出目标采样间隔；路径重采样保留真实 XY 端点，末端间隔可以略短于目标值。
 
 ## 数据内容
 
@@ -134,12 +135,18 @@ realization_index.csv
 - 每个 parent 标记 complete；
 - staging group 为空；
 - root artifact identity 正确；
-- disk Oracle 按请求通过。
+- disk Oracle 按请求运行并发布审计结果。
 
-preflight 负责在正演前确认各配额桶有足够的 truth-valid candidate。正式生成中的
-单个 projection、forward 或 benchmark-build 拒绝会记录 warning，并由同配额桶的
-备用 candidate 接替。备用耗尽后的短缺记录在 `quota_report.csv`，不会丢弃此前已
-生成的有效 parent；artifact schema、采样轴、HDF5 事务和 Oracle 错误仍阻止发布。
+preflight 在正演前记录各配额桶的 truth-valid candidate 数量。单桶不足写为 warning，
+其他桶继续生成。正式生成中的单个 projection、forward 或 benchmark-build 拒绝由
+同配额桶的备用 candidate 接替。备用耗尽后的短缺记录在 `quota_report.csv`，不会
+丢弃此前已生成的有效 parent；artifact schema、采样轴、HDF5 事务和结构性 Oracle
+完整性错误仍阻止发布。数值 forward parity 失败会在 `oracle_report.json` 中记录
+为 warning，产物以 `completed_with_warnings` 发布并标记为不可直接训练消费；
+深度域有限支撑子波在非零端点附近若因 artifact 的 float32 往返改变一个权重，
+则记录 `forward_roundtrip_boundary_sensitivity` warning，并保留其余 forward parity
+的严格校验。完整 preflight 可通过 `--reuse-preflight-from <staging-dir>` 复用，入口会
+逐字段核对当前 attempt plan 和全部 parent 状态。
 
 ## 波形扰动
 

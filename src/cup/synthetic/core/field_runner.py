@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
+import shutil
 import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -258,6 +259,161 @@ class PreflightResult:
         ].copy()
 
 
+def load_reusable_attempt_plan(
+    current_plan: pd.DataFrame,
+    *,
+    source_dir: Path,
+) -> pd.DataFrame:
+    """Load a cached plan while requiring the canonical primary rows to match."""
+    path = Path(source_dir).resolve() / "attempt_plan.csv"
+    if not path.is_file():
+        raise FileNotFoundError(f"reusable preflight has no attempt_plan.csv: {path}")
+    cached_plan = pd.read_csv(path)
+    if list(cached_plan.columns) != list(current_plan.columns):
+        raise ValueError("reusable preflight plan columns differ from current plan.")
+    if len(cached_plan) != len(current_plan):
+        raise ValueError("reusable preflight candidate count differs from current plan.")
+    for name, frame in (
+        ("current", current_plan),
+        ("reusable", cached_plan),
+    ):
+        identities = frame["parent_realization_id"].astype(str)
+        if identities.duplicated().any():
+            raise ValueError(f"{name} attempt plan contains duplicate parent identities.")
+    current_primary = current_plan.loc[
+        ~current_plan["parent_realization_id"].astype(str).str.startswith("reserve__")
+    ].reset_index(drop=True)
+    cached_primary = cached_plan.loc[
+        ~cached_plan["parent_realization_id"].astype(str).str.startswith("reserve__")
+    ].reset_index(drop=True)
+    if not (
+        current_primary.fillna("").astype(str)
+        .equals(cached_primary.fillna("").astype(str))
+    ):
+        raise ValueError(
+            "reusable preflight canonical primary plan differs from current plan."
+        )
+    known_buckets = set(current_plan["quota_bucket"].astype(str))
+    cached_buckets = set(cached_plan["quota_bucket"].astype(str))
+    if not cached_buckets <= known_buckets:
+        raise ValueError("reusable preflight contains unknown quota buckets.")
+    return cached_plan
+
+
+def reuse_attempt_preflight(
+    plan: pd.DataFrame,
+    *,
+    source_dir: Path,
+    output_dir: Path,
+    qc_config: Mapping[str, Any],
+    development_limited: bool,
+    logger: logging.Logger,
+) -> PreflightResult:
+    """Reuse a complete preflight after validating its full semantic plan."""
+    source_dir = Path(source_dir).resolve()
+    output_dir = Path(output_dir).resolve()
+    required_files = {
+        "plan": source_dir / "attempt_plan.csv",
+        "attempts": source_dir / "preflight_attempts.csv",
+    }
+    missing = [
+        name for name, path in required_files.items() if not path.is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"reusable preflight is missing required files: {missing}"
+        )
+    cached_plan = pd.read_csv(required_files["plan"])
+    if list(cached_plan.columns) != list(plan.columns):
+        raise ValueError("reusable preflight plan columns differ from current plan.")
+    cached_semantics = cached_plan.fillna("").astype(str).reset_index(drop=True)
+    current_semantics = plan.fillna("").astype(str).reset_index(drop=True)
+    if not cached_semantics.equals(current_semantics):
+        raise ValueError("reusable preflight plan differs from current plan.")
+
+    attempts = pd.read_csv(required_files["attempts"])
+    missing_attempt_columns = sorted(
+        {"parent_realization_id", "status", "reason"}.difference(attempts.columns)
+    )
+    if missing_attempt_columns:
+        raise ValueError(
+            "reusable preflight attempts lack columns: "
+            f"{missing_attempt_columns}"
+        )
+    if len(attempts) != len(plan):
+        raise ValueError(
+            "reusable preflight attempts do not cover the complete plan."
+        )
+    identities = attempts["parent_realization_id"].astype(str)
+    if identities.duplicated().any():
+        raise ValueError("reusable preflight contains duplicate parent identities.")
+    planned_identities = plan["parent_realization_id"].astype(str)
+    if set(identities) != set(planned_identities):
+        raise ValueError("reusable preflight parent identities differ from current plan.")
+    statuses = set(attempts["status"].astype(str))
+    if not statuses <= {"accepted", "rejected"}:
+        raise ValueError(
+            f"reusable preflight contains unsupported statuses: {sorted(statuses)}"
+        )
+
+    accepted_ids = set(
+        attempts.loc[
+            attempts["status"].eq("accepted"),
+            "parent_realization_id",
+        ].astype(str)
+    )
+    accepted_plan = plan.loc[
+        plan["parent_realization_id"].astype(str).isin(accepted_ids)
+    ].reset_index(drop=True)
+    catalog_path = source_dir / "preflight_scenario_catalog.csv"
+    if catalog_path.is_file():
+        catalog = pd.read_csv(catalog_path)
+    else:
+        catalog = build_acceptance_catalog(
+            plan,
+            accepted_parent_ids=accepted_ids,
+            qc_config=qc_config,
+            development_limited=development_limited,
+        )
+    rejected = attempts.loc[attempts["status"].eq("rejected"), [
+        "parent_realization_id",
+        "reason",
+    ]]
+    rejected_reason = {
+        str(row.parent_realization_id): str(row.reason)
+        for row in rejected.itertuples(index=False)
+    }
+    rejection_details = [
+        {
+            **dict(row),
+            "realization_id": str(row["parent_realization_id"]),
+            "status": "rejected",
+            "reason": rejected_reason[str(row["parent_realization_id"])],
+        }
+        for row in plan.to_dict(orient="records")
+        if str(row["parent_realization_id"]) in rejected_reason
+    ]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    attempts.to_csv(output_dir / "preflight_attempts.csv", index=False)
+    catalog.to_csv(output_dir / "preflight_scenario_catalog.csv", index=False)
+    progress_source = source_dir / "attempt_progress.csv"
+    if progress_source.is_file() and progress_source != output_dir / "attempt_progress.csv":
+        shutil.copy2(progress_source, output_dir / "attempt_progress.csv")
+    logger.info(
+        "reused complete preflight: source=%s accepted=%d rejected=%d",
+        source_dir,
+        len(accepted_plan),
+        len(plan) - len(accepted_plan),
+    )
+    return PreflightResult(
+        accepted_plan=accepted_plan,
+        attempts=attempts,
+        catalog=catalog,
+        rejection_details=rejection_details,
+    )
+
+
 def run_attempt_preflight(
     plan: pd.DataFrame,
     *,
@@ -366,6 +522,8 @@ __all__ = [
     "PreflightResult",
     "build_acceptance_catalog",
     "configure_generation_logger",
+    "load_reusable_attempt_plan",
+    "reuse_attempt_preflight",
     "run_attempt_preflight",
     "stable_records_frame",
 ]

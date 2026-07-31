@@ -119,7 +119,8 @@ Synthoseis-lite 的 NumPy structured decoder 和 publication Oracle 位于
 短 patch corpus：
 
 - accepted parents：2400；
-- 每个 parent：25 道、25 m 间隔、600 m 跨度；
+- 每个 parent：25 道、目标间隔 25 m、约 600 m 跨度；
+- 横向重采样保留真实路径端点，因此最后一个间隔可以略短于目标间隔；
 - 模型完整上下文：21 道、约 ±250 m；
 - none/wedge/pinchout 各 800；
 - training/tuning/calibration 为 1680/360/360；
@@ -148,12 +149,17 @@ correlation_length_m = 300 / 900 / 3000
 
 单独的 family、direction、correlation 和 variability 值均在训练中出现。
 
-最多规划 4000 个 candidate attempts。preflight 在正式正演前验证每个配额桶具有
-足够的 truth-valid candidate；正式生成遇到单个 realization 的 projection、forward
-或 benchmark-build 拒绝时记录 warning，并继续消耗同一配额桶的备用 candidate。
-备用 candidate 耗尽后仍存在的配额短缺写入 `quota_report.csv`，已生成语料以
-`completed_with_warnings` 发布。schema、axis、HDF5、writer/reader 和 Oracle
-完整性错误仍然终止发布。
+最多规划 4000 个 candidate attempts。小规模 full-section 配额桶优先获得最低备用
+容量，其余 reserve 按 parent 配额比例分配。preflight 记录每个桶的 truth-valid
+candidate 数量；数量不足是发布 warning，不丢弃其他桶。正式生成遇到单个
+realization 的 projection、forward 或 benchmark-build 拒绝时记录 warning，并继续
+消耗同一配额桶的备用 candidate。最终配额短缺写入 `quota_report.csv`，已生成语料
+以 `completed_with_warnings` 发布。schema、axis、HDF5、writer/reader 和结构性 Oracle
+完整性错误仍然终止发布。数值 forward parity 失败写入 Oracle warning，并将
+`training_consumable` 设为 `false`；深度域有限支撑子波在非零端点附近若受 artifact
+的 float32 往返影响，Oracle 将把 `forward_roundtrip_boundary_sensitivity` 写入 warning，
+不放宽其余 forward parity。完整 preflight 可通过 `--reuse-preflight-from` 在严格核对
+当前 attempt plan 后复用。
 
 smoke 与正式生成是两个独立命令。smoke 只估算吞吐和体积并报告是否超过约 5 小时
 或 3.5 GB，不替正式命令作自动启停决定。

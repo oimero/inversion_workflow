@@ -71,6 +71,56 @@ def validate_line_geometry(geometry: Any) -> None:
                 raise ValueError("survey line/XY round-trip failed")
 
 
+def validate_canonical_corpus_lateral_m(
+    lateral_m: np.ndarray,
+    *,
+    corpus_role: str,
+    target_interval_m: float,
+) -> None:
+    """Validate one canonical parent against its declared lateral geometry."""
+    expected_width = {
+        "short_patch": 25,
+        "full_section": 121,
+    }.get(str(corpus_role))
+    if expected_width is None:
+        raise ValueError("canonical V2 parent has no corpus_role.")
+    lateral = np.asarray(lateral_m, dtype=np.float64).reshape(-1)
+    interval = float(target_interval_m)
+    if not np.isfinite(interval) or interval <= 0.0:
+        raise ValueError("canonical lateral target interval must be positive.")
+    if lateral.size != expected_width:
+        raise ValueError(
+            f"{corpus_role} requires {expected_width} traces; "
+            f"observed={lateral.size}."
+        )
+    if (
+        np.any(~np.isfinite(lateral))
+        or not np.isclose(lateral[0], 0.0, rtol=0.0, atol=1.0e-9)
+    ):
+        raise ValueError(f"{corpus_role} lateral_m must be finite and start at zero.")
+    steps = np.diff(lateral)
+    tolerance = max(1.0e-6, interval * 1.0e-9)
+    if np.any(steps <= 0.0):
+        raise ValueError(f"{corpus_role} lateral_m must be strictly increasing.")
+    if not np.allclose(
+        steps[:-1],
+        interval,
+        rtol=0.0,
+        atol=tolerance,
+    ):
+        raise ValueError(
+            f"{corpus_role} interior lateral spacing differs from the "
+            f"{interval:g} m target."
+        )
+    # ``resample_section_path`` keeps the physical path endpoint.  The terminal
+    # interval can therefore be slightly shorter than the target interval.
+    if steps[-1] > interval + tolerance:
+        raise ValueError(
+            f"{corpus_role} terminal lateral spacing exceeds the "
+            f"{interval:g} m target."
+        )
+
+
 def resample_section_path(
     points: Sequence[Mapping[str, float]], *, geometry: Any, sample_interval_m: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -93,4 +143,9 @@ def resample_section_path(
     return lateral, samples[:, 0], samples[:, 1], x, y
 
 
-__all__ = ["SectionGeometry", "resample_section_path", "validate_line_geometry"]
+__all__ = [
+    "SectionGeometry",
+    "resample_section_path",
+    "validate_canonical_corpus_lateral_m",
+    "validate_line_geometry",
+]

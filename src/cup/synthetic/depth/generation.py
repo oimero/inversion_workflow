@@ -557,6 +557,9 @@ class DepthGenerationSession:
             schema_version=SCHEMA_VERSION,
             generator_family=GENERATOR_FAMILY,
             hdf5_attributes={"depth_basis": "tvdss", "axis_positive_direction": "down"},
+            lateral_sample_interval_m=float(
+                script_cfg["lateral_sample_interval_m"]
+            ),
             section_ids=tuple(str(section.section_id) for section in sections),
             section_roles={
                 str(item["section_id"]): str(item["corpus_role"])
@@ -589,6 +592,7 @@ def run_depth_generation(
     debug_attempt_limit: int | None = None,
     geometry_families: Sequence[str] | None = None,
     qc_only: bool = False,
+    preflight_source_dir: Path | None = None,
     structured_artifact_oracle: Callable[[Path, Any, Sequence[str]], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     calibration, _ = load_depth_calibration_for_object_core(calibration_path)
@@ -610,6 +614,7 @@ def run_depth_generation(
         debug_attempt_limit=debug_attempt_limit,
         geometry_families=geometry_families,
         qc_only=qc_only,
+        preflight_source_dir=preflight_source_dir,
         workflow=workflow,
         sources=sources,
         forward_inputs=forward_inputs,

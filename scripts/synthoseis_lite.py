@@ -88,13 +88,25 @@ def parse_args() -> argparse.Namespace:
     generate.add_argument(
         "--run-structured-oracle",
         action="store_true",
-        help="Reread the canonical HDF5 artifact and require the Oracle to pass.",
+        help=(
+            "Reread the canonical HDF5 artifact; structural failures stop "
+            "publication and numerical parity failures are published as warnings."
+        ),
     )
     generate.add_argument(
         "--structured-smoke",
         action="store_true",
         help=(
-            "Run one wedge attempt and require the disk-backed Oracle."
+            "Run one wedge attempt and record the disk-backed Oracle audit."
+        ),
+    )
+    generate.add_argument(
+        "--reuse-preflight-from",
+        type=Path,
+        default=None,
+        help=(
+            "Reuse a complete attempt_plan/preflight_attempts pair after strict "
+            "semantic validation; generation is written to a new output directory."
         ),
     )
     return parser.parse_args()
@@ -349,6 +361,14 @@ def main() -> None:
                 debug_attempt_limit=debug_attempt_limit,
                 geometry_families=geometry_families,
                 qc_only=args.qc_only,
+                preflight_source_dir=(
+                    None
+                    if args.reuse_preflight_from is None
+                    else resolve_relative_path(
+                        args.reuse_preflight_from,
+                        root=REPO_ROOT,
+                    )
+                ),
                 structured_artifact_oracle=(
                     _structured_artifact_oracle
                     if run_structured_oracle
@@ -397,6 +417,14 @@ def main() -> None:
             debug_attempt_limit=debug_attempt_limit,
             geometry_families=geometry_families,
             qc_only=args.qc_only,
+            preflight_source_dir=(
+                None
+                if args.reuse_preflight_from is None
+                else resolve_relative_path(
+                    args.reuse_preflight_from,
+                    root=REPO_ROOT,
+                )
+            ),
             structured_artifact_oracle=(
                 _structured_artifact_oracle
                 if run_structured_oracle

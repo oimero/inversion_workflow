@@ -180,24 +180,10 @@ def build_corpus_v2_plan(
     for row in required_rows:
         rows_by_bucket.setdefault(str(row["quota_bucket"]), []).append(row)
     reserve_buckets = tuple(sorted(rows_by_bucket))
-    exact_reserve = {
-        bucket: reserve_count * len(rows_by_bucket[bucket]) / len(required_rows)
-        for bucket in reserve_buckets
-    }
-    reserve_allocation = {
-        bucket: int(exact_reserve[bucket])
-        for bucket in reserve_buckets
-    }
-    unallocated = reserve_count - sum(reserve_allocation.values())
-    remainder_order = sorted(
-        reserve_buckets,
-        key=lambda bucket: (
-            -(exact_reserve[bucket] - reserve_allocation[bucket]),
-            bucket,
-        ),
+    reserve_allocation = _allocate_reserves(
+        rows_by_bucket,
+        reserve_count=reserve_count,
     )
-    for bucket in remainder_order[:unallocated]:
-        reserve_allocation[bucket] += 1
 
     reserve_index = 0
     for bucket in reserve_buckets:
@@ -224,6 +210,61 @@ def build_corpus_v2_plan(
     return frame
 
 
+def _allocate_reserves(
+    rows_by_bucket: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    reserve_count: int,
+) -> dict[str, int]:
+    """Protect small section buckets before proportional reserve allocation."""
+    buckets = tuple(sorted(rows_by_bucket))
+    allocation = {bucket: 0 for bucket in buckets}
+    remaining = int(reserve_count)
+    if remaining >= len(buckets):
+        for bucket in buckets:
+            allocation[bucket] = 1
+        remaining -= len(buckets)
+
+    full_buckets = tuple(
+        bucket for bucket in buckets if bucket.startswith("full_section:")
+    )
+    full_targets = {
+        bucket: max(16, 2 * len(rows_by_bucket[bucket]))
+        for bucket in full_buckets
+    }
+    while remaining > 0 and any(
+        allocation[bucket] < full_targets[bucket]
+        for bucket in full_buckets
+    ):
+        for bucket in full_buckets:
+            if remaining <= 0:
+                break
+            if allocation[bucket] < full_targets[bucket]:
+                allocation[bucket] += 1
+                remaining -= 1
+
+    if remaining <= 0:
+        return allocation
+    total_weight = sum(len(rows_by_bucket[bucket]) for bucket in buckets)
+    exact = {
+        bucket: remaining * len(rows_by_bucket[bucket]) / total_weight
+        for bucket in buckets
+    }
+    proportional = {bucket: int(exact[bucket]) for bucket in buckets}
+    remainder = remaining - sum(proportional.values())
+    remainder_order = sorted(
+        buckets,
+        key=lambda bucket: (
+            -(exact[bucket] - proportional[bucket]),
+            bucket,
+        ),
+    )
+    for bucket in remainder_order[:remainder]:
+        proportional[bucket] += 1
+    for bucket in buckets:
+        allocation[bucket] += proportional[bucket]
+    return allocation
+
+
 def _quota_bucket(row: Mapping[str, Any]) -> str:
     if row["corpus_role"] == "short_patch":
         return (
@@ -233,31 +274,6 @@ def _quota_bucket(row: Mapping[str, Any]) -> str:
         f"full_section:{row['geometry_family']}:"
         f"{row['generalization_role']}"
     )
-
-
-def select_accepted_quota(
-    accepted_plan: pd.DataFrame,
-    budget: CorpusBudget,
-) -> pd.DataFrame:
-    expected = required_quota_counts(budget)
-    selected: list[pd.DataFrame] = []
-    for bucket, count in expected.items():
-        candidates = accepted_plan.loc[
-            accepted_plan["quota_bucket"].eq(bucket)
-        ].sort_values("candidate_rank", kind="mergesort")
-        if len(candidates) < count:
-            raise RuntimeError(
-                f"canonical_v2_quota_unreachable:{bucket}: "
-                f"required={count}, accepted_candidates={len(candidates)}"
-            )
-        selected.append(candidates.head(count))
-    result = pd.concat(selected, ignore_index=True)
-    if len(result) != budget.planned_parents:
-        raise RuntimeError("canonical V2 accepted selection has wrong size.")
-    return result.sort_values(
-        ["corpus_role", "geometry_family", "split_role", "candidate_rank"],
-        kind="mergesort",
-    ).reset_index(drop=True)
 
 
 def required_quota_counts(budget: CorpusBudget) -> dict[str, int]:
@@ -352,6 +368,5 @@ __all__ = [
     "build_corpus_v2_plan",
     "published_quota_report",
     "required_quota_counts",
-    "select_accepted_quota",
     "validate_published_quota",
 ]

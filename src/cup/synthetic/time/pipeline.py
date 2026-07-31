@@ -292,6 +292,9 @@ class TimeGenerationSession:
             schema_version=DATA_SCHEMA,
             generator_family=calibration.generator_family,
             hdf5_attributes={"implementation_scope": IMPLEMENTATION_SCOPE},
+            lateral_sample_interval_m=float(
+                script_cfg["lateral_sample_interval_m"]
+            ),
             section_ids=tuple(str(section.section_id) for section in sections),
             section_roles={
                 str(item["section_id"]): str(item["corpus_role"])
@@ -319,6 +322,7 @@ def run_generation(
     debug_attempt_limit: int | None = None,
     geometry_families: Sequence[str] | None = None,
     qc_only: bool = False,
+    preflight_source_dir: Path | None = None,
     structured_artifact_oracle: Callable[[Path, Any, Sequence[str]], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     calibration = load_calibration(calibration_path)
@@ -339,6 +343,7 @@ def run_generation(
         debug_attempt_limit=debug_attempt_limit,
         geometry_families=geometry_families,
         qc_only=qc_only,
+        preflight_source_dir=preflight_source_dir,
         workflow=workflow,
         sources=sources,
         config_provenance=config_provenance,

@@ -292,9 +292,11 @@ def save_checkpoint(
     *,
     training_state: Mapping[str, Any],
     corpus_provenance: Mapping[str, Any],
+    runtime_state: Mapping[str, Any] | None = None,
+    overwrite: bool = False,
 ) -> Path:
     target = Path(path)
-    if target.exists():
+    if target.exists() and not overwrite:
         raise FileExistsError(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -302,6 +304,7 @@ def save_checkpoint(
         "generator": generator.state_dict_payload(),
         "training_state": dict(training_state),
         "corpus_provenance": dict(corpus_provenance),
+        "runtime_state": dict(runtime_state or {}),
     }
     temporary = target.with_name(f".{target.name}.staging")
     try:
@@ -325,8 +328,32 @@ def load_checkpoint(
     metadata = {
         "training_state": dict(payload.get("training_state") or {}),
         "corpus_provenance": dict(payload.get("corpus_provenance") or {}),
+        "runtime_state": dict(payload.get("runtime_state") or {}),
     }
     return generator, metadata
+
+
+def public_checkpoint_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the JSON-facing subset of checkpoint metadata.
+
+    Checkpoints also carry optimizer and RNG state so interrupted training can
+    resume exactly.  Those fields contain tensors and are deliberately kept
+    out of evaluation reports; they are operational state, not public model
+    provenance.
+    """
+    training_state = dict(metadata.get("training_state") or {})
+    corpus_provenance = dict(metadata.get("corpus_provenance") or {})
+    runtime = dict(metadata.get("runtime_state") or {})
+    public_runtime = {
+        key: runtime[key]
+        for key in ("epoch", "best_tuning_loss", "best_epoch", "history")
+        if key in runtime
+    }
+    return {
+        "training_state": training_state,
+        "corpus_provenance": corpus_provenance,
+        "runtime_state": public_runtime,
+    }
 
 
 def save_section_prediction(
@@ -397,6 +424,7 @@ __all__ = [
     "CORPUS_MANIFEST_SCHEMA",
     "Corpus",
     "load_checkpoint",
+    "public_checkpoint_metadata",
     "load_corpus",
     "calibrate_semi_markov_prior",
     "iter_evidence_batches",

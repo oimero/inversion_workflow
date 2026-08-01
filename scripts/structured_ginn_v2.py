@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+from typing import Any, Mapping
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,7 @@ from ginn_v2.artifacts import (
     iter_paired_evidence_batches,
     load_checkpoint,
     load_corpus,
+    public_checkpoint_metadata,
     save_checkpoint,
 )
 from ginn_v2.augmentation import load_observation_augmentation_profile
@@ -43,6 +45,12 @@ def parse_args() -> argparse.Namespace:
     train = subparsers.add_parser("train")
     train.add_argument("--corpus", type=Path, required=True)
     train.add_argument("--output-dir", type=Path, required=True)
+    train.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="resume from an epoch checkpoint, normally the output directory's last.pt",
+    )
     evaluate = subparsers.add_parser("evaluate")
     evaluate.add_argument("--corpus", type=Path, required=True)
     evaluate.add_argument("--checkpoint", type=Path, required=True)
@@ -93,22 +101,113 @@ def main() -> None:
     device, runtime = resolve_device(str(config.get("device") or "auto"))
     corpus = load_corpus(resolve_relative_path(args.corpus, root=REPO_ROOT))
     output = resolve_relative_path(args.output_dir, root=REPO_ROOT)
-    if output.exists():
-        raise FileExistsError(output)
-    output.mkdir(parents=True)
+    resume_path: Path | None = None
+    if args.command == "train" and args.resume is not None:
+        resume_path = resolve_relative_path(args.resume, root=REPO_ROOT)
+        if not output.is_dir():
+            raise FileNotFoundError(
+                f"resume output directory does not exist: {output}"
+            )
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"resume checkpoint does not exist: {resume_path}")
+    else:
+        if output.exists():
+            raise FileExistsError(output)
+        output.mkdir(parents=True)
     logger = configure_training_logger(output)
     augmentation_profile = _augmentation_profile(config)
     if args.command == "train":
-        network = BandlimitedEvidenceNetwork(
-            EvidenceNetworkConfig.from_mapping(config.get("network") or {})
-        )
-        generator = ConditionalGenerator(
-            network,
-            prior=calibrate_semi_markov_prior(corpus),
-            dominant_frequency_hz=_dominant_frequency(corpus),
-            sample_domain=corpus.benchmark.sample_domain,
-            device=device,
-        )
+        resume_metadata: Mapping[str, Any] = {}
+        if resume_path is None:
+            network = BandlimitedEvidenceNetwork(
+                EvidenceNetworkConfig.from_mapping(config.get("network") or {})
+            )
+            generator = ConditionalGenerator(
+                network,
+                prior=calibrate_semi_markov_prior(corpus),
+                dominant_frequency_hz=_dominant_frequency(corpus),
+                sample_domain=corpus.benchmark.sample_domain,
+                device=device,
+            )
+        else:
+            generator, resume_metadata = load_checkpoint(
+                resume_path,
+                device=device,
+            )
+            if not resume_metadata.get("runtime_state"):
+                raise ValueError(
+                    "resume checkpoint has no runtime_state; use a new training run."
+                )
+
+        corpus_provenance = {
+            "root": str(corpus.root),
+            "recorded_contract_fingerprint_sha256": str(
+                corpus.manifest.get("contract_fingerprint_sha256") or ""
+            ),
+        }
+
+        def checkpoint_callback(
+            epoch: int,
+            checkpoint_generator: ConditionalGenerator,
+            runtime_state: Mapping[str, Any],
+            is_best: bool,
+        ) -> None:
+            training_state = {
+                "epoch": int(epoch),
+                "best_tuning_loss": float(runtime_state["best_tuning_loss"]),
+                "best_epoch": int(runtime_state["best_epoch"]),
+                "history": list(runtime_state["history"]),
+            }
+            epoch_path = output / f"epoch_{epoch:04d}.pt"
+            save_checkpoint(
+                epoch_path,
+                checkpoint_generator,
+                training_state=training_state,
+                runtime_state=runtime_state,
+                corpus_provenance=corpus_provenance,
+            )
+            last_path = output / "last.pt"
+            save_checkpoint(
+                last_path,
+                checkpoint_generator,
+                training_state=training_state,
+                runtime_state=runtime_state,
+                corpus_provenance=corpus_provenance,
+                overwrite=True,
+            )
+            best_path = output / "best.pt"
+            if is_best:
+                save_checkpoint(
+                    best_path,
+                    checkpoint_generator,
+                    training_state=training_state,
+                    runtime_state=runtime_state,
+                    corpus_provenance=corpus_provenance,
+                    overwrite=True,
+                )
+            write_json(
+                output / "training_progress.json",
+                {
+                    "schema": "structured_ginn_v2_training_progress_v1",
+                    "status": "running",
+                    "epoch": int(epoch),
+                    "target_epochs": int(learning_config.epochs),
+                    "best_epoch": int(runtime_state["best_epoch"]),
+                    "best_tuning_loss": float(runtime_state["best_tuning_loss"]),
+                    "last_checkpoint": str(last_path),
+                    "best_checkpoint": str(best_path),
+                    "epoch_checkpoint": str(epoch_path),
+                    "history": list(runtime_state["history"]),
+                },
+            )
+            logger.info(
+                "checkpoint saved | epoch=%d | last=%s | best=%s",
+                epoch,
+                last_path.name,
+                best_path.name if is_best else "unchanged",
+            )
+
+        learning_config = LearningConfig(**dict(config.get("learning") or {}))
         result = train_generator(
             generator,
             (
@@ -125,18 +224,41 @@ def main() -> None:
             (
                 lambda: iter_evidence_batches(corpus, "tuning")
             ),
-            config=LearningConfig(**dict(config.get("learning") or {})),
+            config=learning_config,
             logger=logger,
+            resume_state=(
+                resume_metadata.get("runtime_state")
+                if resume_path is not None
+                else None
+            ),
+            checkpoint_callback=checkpoint_callback,
         )
+
+        best_path = output / "best.pt"
+        if not best_path.is_file():
+            raise RuntimeError("training completed without a best checkpoint.")
+        best_generator, best_metadata = load_checkpoint(best_path, device=device)
         checkpoint = save_checkpoint(
             output / "generator.pt",
-            generator,
-            training_state=result,
-            corpus_provenance={
-                "root": str(corpus.root),
-                "recorded_contract_fingerprint_sha256": str(
-                    corpus.manifest.get("contract_fingerprint_sha256") or ""
-                ),
+            best_generator,
+            training_state=best_metadata["training_state"],
+            runtime_state=best_metadata.get("runtime_state"),
+            corpus_provenance=best_metadata["corpus_provenance"],
+            overwrite=True,
+        )
+        write_json(
+            output / "training_progress.json",
+            {
+                "schema": "structured_ginn_v2_training_progress_v1",
+                "status": "completed",
+                "epoch": int(result["epochs_completed"]),
+                "target_epochs": int(learning_config.epochs),
+                "best_epoch": int(result["best_epoch"]),
+                "best_tuning_loss": float(result["best_tuning_loss"]),
+                "last_checkpoint": str(output / "last.pt"),
+                "best_checkpoint": str(best_path),
+                "final_checkpoint": str(checkpoint),
+                "history": list(result["history"]),
             },
         )
         write_json(
@@ -151,6 +273,9 @@ def main() -> None:
                     else ["clean", "dirty"]
                 ),
                 "checkpoint": str(checkpoint),
+                "last_checkpoint": str(output / "last.pt"),
+                "best_checkpoint": str(best_path),
+                "resumed_from": str(resume_path) if resume_path else None,
                 **result,
             },
         )
@@ -183,7 +308,7 @@ def main() -> None:
             "status": "success",
             "split": args.split,
             "runtime": runtime,
-            "checkpoint_metadata": metadata,
+            "checkpoint_metadata": public_checkpoint_metadata(metadata),
             "metrics": {
                 "clean": clean_metrics,
                 "dirty": dirty_metrics,

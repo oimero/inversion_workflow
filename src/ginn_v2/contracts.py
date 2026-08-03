@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -152,16 +152,101 @@ class ObservationTile:
 
 
 @dataclass(frozen=True)
-class BandlimitedEvidence:
-    """Model-grid evidence that is allowed to condition the structured generator."""
+class ObservableTargetContract:
+    """Passed L0-L2 target admission contract embedded in every checkpoint."""
+
+    sample_domain: str
+    sample_unit: str
+    depth_basis: str | None
+    targets: tuple[str, ...]
+    global_scales: Mapping[str, float]
+    audit_report: str
+
+    SCHEMA = "structured_ginn_v2_observable_target_contract_v1"
+    REQUIRED_TARGETS = (
+        "projected_log_ai_increment",
+        "signed_reflectivity",
+        "state_emission",
+    )
+    REQUIRED_SCALES = (
+        "seismic",
+        "lfm_residual",
+        "projected_log_ai_increment",
+        "signed_reflectivity",
+    )
+
+    def __post_init__(self) -> None:
+        domain = str(self.sample_domain).strip().casefold()
+        unit = str(self.sample_unit).strip()
+        basis = None if self.depth_basis in {None, ""} else str(self.depth_basis)
+        targets = tuple(str(value) for value in self.targets)
+        if domain not in {"time", "depth"}:
+            raise InputContractError("target contract domain must be time or depth.")
+        if not unit:
+            raise InputContractError("target contract sample_unit cannot be empty.")
+        if domain == "time" and basis is not None:
+            raise InputContractError("time target contract cannot declare depth_basis.")
+        if domain == "depth" and basis is None:
+            raise InputContractError("depth target contract requires depth_basis.")
+        if targets != self.REQUIRED_TARGETS:
+            raise InputContractError(
+                "target contract must contain the three audited targets in order."
+            )
+        scales = {str(key): float(value) for key, value in self.global_scales.items()}
+        if set(scales) != set(self.REQUIRED_SCALES):
+            raise InputContractError(
+                "target contract global_scales do not match the audited interface."
+            )
+        if any(not np.isfinite(value) or value <= 0.0 for value in scales.values()):
+            raise InputContractError("target contract scales must be finite and positive.")
+        report = str(self.audit_report).strip()
+        if not report:
+            raise InputContractError("target contract must identify its audit report.")
+        object.__setattr__(self, "sample_domain", domain)
+        object.__setattr__(self, "sample_unit", unit)
+        object.__setattr__(self, "depth_basis", basis)
+        object.__setattr__(self, "targets", targets)
+        object.__setattr__(self, "global_scales", scales)
+        object.__setattr__(self, "audit_report", report)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ObservableTargetContract":
+        if value.get("schema") != cls.SCHEMA or value.get("status") != "passed":
+            raise InputContractError("observable target contract has not passed L0-L2.")
+        return cls(
+            sample_domain=str(value.get("sample_domain") or ""),
+            sample_unit=str(value.get("sample_unit") or ""),
+            depth_basis=value.get("depth_basis"),
+            targets=tuple(value.get("targets") or ()),
+            global_scales=dict(value.get("global_scales") or {}),
+            audit_report=str(value.get("audit_report") or ""),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema": self.SCHEMA,
+            "status": "passed",
+            "sample_domain": self.sample_domain,
+            "sample_unit": self.sample_unit,
+            "depth_basis": self.depth_basis,
+            "targets": list(self.targets),
+            "global_scales": dict(self.global_scales),
+            "audit_report": self.audit_report,
+        }
+
+
+@dataclass(frozen=True)
+class ObservableEvidence:
+    """Audited model-grid evidence; no micro-boundary probability is exposed."""
 
     model_axis: SampleAxis
     highres_axis: SampleAxis
     background_lfm_linear: np.ndarray
-    bandlimited_increment_mean: np.ndarray
-    bandlimited_increment_scale: np.ndarray
-    state_occupancy: np.ndarray
-    interface_activity: np.ndarray
+    projected_log_ai_increment_mean: np.ndarray
+    projected_log_ai_increment_scale: np.ndarray
+    signed_reflectivity_mean: np.ndarray
+    signed_reflectivity_scale: np.ndarray
+    state_log_potential: np.ndarray
     local_tuning_scale: np.ndarray
     support: np.ndarray
     lateral_m: np.ndarray
@@ -192,10 +277,10 @@ class BandlimitedEvidence:
         ):
             raise InputContractError("evidence model axis must nest in highres_axis.")
         mean = _array(
-            self.bandlimited_increment_mean,
+            self.projected_log_ai_increment_mean,
             dtype=np.float64,
             ndim=2,
-            name="bandlimited_increment_mean",
+            name="projected_log_ai_increment_mean",
         )
         shape = mean.shape
         if shape[1] != self.model_axis.coordinates.size:
@@ -207,16 +292,22 @@ class BandlimitedEvidence:
             name="background_lfm_linear",
         )
         scale = _array(
-            self.bandlimited_increment_scale,
+            self.projected_log_ai_increment_scale,
             dtype=np.float64,
             ndim=2,
-            name="bandlimited_increment_scale",
+            name="projected_log_ai_increment_scale",
         )
-        activity = _array(
-            self.interface_activity,
+        reflectivity = _array(
+            self.signed_reflectivity_mean,
             dtype=np.float64,
             ndim=2,
-            name="interface_activity",
+            name="signed_reflectivity_mean",
+        )
+        reflectivity_scale = _array(
+            self.signed_reflectivity_scale,
+            dtype=np.float64,
+            ndim=2,
+            name="signed_reflectivity_scale",
         )
         tuning = _array(
             self.local_tuning_scale,
@@ -225,31 +316,45 @@ class BandlimitedEvidence:
             name="local_tuning_scale",
         )
         support = _array(self.support, dtype=bool, ndim=2, name="support")
-        occupancy = _array(
-            self.state_occupancy,
+        state_log_potential = _array(
+            self.state_log_potential,
             dtype=np.float64,
             ndim=3,
-            name="state_occupancy",
+            name="state_log_potential",
         )
-        if any(item.shape != shape for item in (background, scale, activity, tuning, support)):
+        if any(
+            item.shape != shape
+            for item in (
+                background,
+                scale,
+                reflectivity,
+                reflectivity_scale,
+                tuning,
+                support,
+            )
+        ):
             raise InputContractError("all scalar evidence fields must share one shape.")
-        if occupancy.shape != shape + (3,):
-            raise InputContractError("state_occupancy must have shape [lateral, sample, 3].")
+        if state_log_potential.shape != shape + (3,):
+            raise InputContractError(
+                "state_log_potential must have shape [lateral, sample, 3]."
+            )
         if np.any(support & ~np.isfinite(mean)) or np.any(
             support & (~np.isfinite(scale) | (scale <= 0.0))
         ):
             raise NumericalFailure("supported evidence mean/scale must be finite and positive.")
-        if np.any(support & (~np.isfinite(activity) | (activity < 0.0) | (activity > 1.0))):
-            raise InputContractError("interface_activity must be in [0, 1].")
+        if np.any(support & ~np.isfinite(reflectivity)) or np.any(
+            support & (~np.isfinite(reflectivity_scale) | (reflectivity_scale <= 0.0))
+        ):
+            raise NumericalFailure(
+                "supported reflectivity mean/scale must be finite and positive."
+            )
         if np.any(support & (~np.isfinite(tuning) | (tuning <= 0.0))):
             raise InputContractError("local_tuning_scale must be finite and positive.")
-        sums = np.sum(occupancy, axis=-1)
-        if np.any(support & ~np.all(np.isfinite(occupancy), axis=-1)) or np.any(
-            support & ~np.isclose(sums, 1.0, rtol=1.0e-5, atol=1.0e-6)
-        ):
-            raise InputContractError("supported state_occupancy must be finite and sum to one.")
-        if np.any(occupancy[support] < 0.0):
-            raise InputContractError("state_occupancy cannot be negative.")
+        if np.any(support & ~np.all(np.isfinite(state_log_potential), axis=-1)):
+            raise NumericalFailure("supported state_log_potential must be finite.")
+        log_normalizer = np.logaddexp.reduce(state_log_potential, axis=-1)
+        if np.any(support & ~np.isclose(log_normalizer, 0.0, rtol=0.0, atol=1.0e-5)):
+            raise InputContractError("state_log_potential must be log-normalized.")
         lateral = _array(self.lateral_m, dtype=np.float64, ndim=1, name="lateral_m")
         if (
             lateral.shape != (shape[0],)
@@ -272,10 +377,11 @@ class BandlimitedEvidence:
             raise InputContractError("x_m and y_m must both be present or absent.")
 
         object.__setattr__(self, "background_lfm_linear", background)
-        object.__setattr__(self, "bandlimited_increment_mean", mean)
-        object.__setattr__(self, "bandlimited_increment_scale", scale)
-        object.__setattr__(self, "state_occupancy", occupancy)
-        object.__setattr__(self, "interface_activity", activity)
+        object.__setattr__(self, "projected_log_ai_increment_mean", mean)
+        object.__setattr__(self, "projected_log_ai_increment_scale", scale)
+        object.__setattr__(self, "signed_reflectivity_mean", reflectivity)
+        object.__setattr__(self, "signed_reflectivity_scale", reflectivity_scale)
+        object.__setattr__(self, "state_log_potential", state_log_potential)
         object.__setattr__(self, "local_tuning_scale", tuning)
         object.__setattr__(self, "support", support)
         object.__setattr__(self, "lateral_m", lateral)
@@ -335,7 +441,7 @@ class GenerationPolicy:
 
 @dataclass(frozen=True)
 class StructuredPrediction:
-    evidence: BandlimitedEvidence
+    evidence: ObservableEvidence
     representative: StructuredRealization
     summary: EnsembleSummary
     realization_identities: tuple[int, ...]
@@ -360,12 +466,13 @@ class VolumeInferenceResult:
 
 
 __all__ = [
-    "BandlimitedEvidence",
     "DomainMismatchError",
     "EnsembleSummary",
     "GenerationPolicy",
     "InputContractError",
     "NumericalFailure",
+    "ObservableEvidence",
+    "ObservableTargetContract",
     "ObservationTile",
     "Segment",
     "StructuredPrediction",

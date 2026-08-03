@@ -6,16 +6,16 @@ only and are never recomputed or compared as an admission condition.
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass, replace
 import json
 from pathlib import Path
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any, Mapping
 
 import numpy as np
 import torch
 
-from cup.physics.numpy_backend import velocity_from_ai
 from cup.synthetic.readers.structured import StructuredSyntheticBenchmark
 from cup.synthetic.schemas import STRUCTURED_ARTIFACT_VERSION
 
@@ -25,14 +25,14 @@ from ginn_v2.augmentation import (
     apply_observation_augmentation,
     stable_random_identity,
 )
-from ginn_v2.contracts import ObservationTile
-from ginn_v2.evidence import build_tuning_targets
-from ginn_v2.representation import build_lfm_anchor
+from ginn_v2.contracts import ObservableTargetContract, ObservationTile
+from ginn_v2.evidence import build_observable_targets
+from ginn_v2.representation import build_lfm_anchor, lfm_residual_from_anchor
 from ginn_v2.semi_markov import SemiMarkovPrior
 
 
 CORPUS_MANIFEST_SCHEMA = "structured_synthetic_corpus_v2"
-CHECKPOINT_SCHEMA = "structured_ginn_v2_checkpoint_v1"
+CHECKPOINT_SCHEMA = "structured_ginn_v2_checkpoint_v3"
 SPLIT_NAMES = ("training", "tuning", "calibration", "section_gate")
 
 
@@ -100,6 +100,25 @@ def load_corpus(root: str | Path) -> Corpus:
     )
 
 
+def load_observable_target_contract(
+    path: str | Path,
+    *,
+    corpus: Corpus,
+) -> ObservableTargetContract:
+    contract = ObservableTargetContract.from_mapping(_read_json(Path(path)))
+    benchmark = corpus.benchmark
+    if (
+        contract.sample_domain != benchmark.sample_domain
+        or contract.sample_unit != benchmark.sample_unit
+        or contract.depth_basis != benchmark.depth_basis
+    ):
+        raise ValueError(
+            "observable target contract domain, unit, or depth basis differs "
+            "from the canonical corpus."
+        )
+    return contract
+
+
 def parent_observation_tiles(
     corpus: Corpus,
     parent_id: str,
@@ -143,51 +162,53 @@ def iter_evidence_batches(
     *,
     condition: str = "clean",
     augmentation_profile: ObservationAugmentationProfile | None = None,
-) -> Iterator[Mapping[str, np.ndarray]]:
+    parent_limit: int | None = None,
+    parent_ids: Sequence[str] | None = None,
+) -> Iterator[Mapping[str, Any]]:
     if split not in {"training", "tuning", "calibration"}:
         raise ValueError("evidence batches require a development split.")
     if condition not in {"clean", "dirty"}:
         raise ValueError("condition must be clean or dirty.")
     if condition == "dirty" and augmentation_profile is None:
         raise ValueError("dirty evidence requires a frozen augmentation profile.")
-    for parent_id in corpus.splits[split]:
-        parent = corpus.benchmark.read_parent(parent_id)
-        wavelet_time = np.asarray(
-            parent.forward_context["wavelet_time_s"], dtype=np.float64
-        )
-        wavelet = np.asarray(
-            parent.forward_context["wavelet_amplitude"], dtype=np.float64
-        )
-        vp = None
-        if parent.sample_domain == "depth":
-            relation = dict(parent.forward_context["ai_velocity_relation"])
-            vp = velocity_from_ai(
-                np.exp(parent.model_log_ai),
-                a=float(relation["a"]),
-                b=float(relation["b"]),
+    if parent_limit is not None and parent_limit <= 0:
+        raise ValueError("parent_limit must be positive when provided.")
+    if parent_limit is not None and parent_ids is not None:
+        raise ValueError("parent_limit and parent_ids are mutually exclusive.")
+    selected = corpus.splits[split]
+    if parent_ids is not None:
+        selected = tuple(str(value) for value in parent_ids)
+        if len(set(selected)) != len(selected):
+            raise ValueError("parent_ids cannot contain duplicates.")
+        invalid = sorted(set(selected).difference(corpus.splits[split]))
+        if invalid:
+            raise ValueError(
+                f"parent_ids do not belong to split {split!r}: {invalid[:5]}"
             )
+    elif parent_limit is not None:
+        selected = selected[:parent_limit]
+    for parent_id in selected:
+        parent = corpus.benchmark.read_parent(parent_id)
         for tile in parent_observation_tiles(corpus, parent_id):
             anchor = build_lfm_anchor(tile)
-            targets = build_tuning_targets(
+            lfm_residual = lfm_residual_from_anchor(tile, anchor)
+            targets = build_observable_targets(
                 tile,
-                log_ai_highres=parent.log_ai_highres,
+                model_log_ai=parent.model_log_ai,
                 state_highres=parent.state_id_highres,
-                background_lfm_highres=anchor.highres,
-                wavelet_time_s=wavelet_time,
-                wavelet_amplitude=wavelet,
-                vp_model_mps=vp,
+                background_lfm_linear=anchor.model,
+                anchor_support=anchor.model_support,
             )
-            supervised_trace = np.zeros(tile.width, dtype=bool)
-            context_radius = 10
-            if tile.width < 2 * context_radius + 1:
-                raise ValueError(
-                    "training parent must provide at least 21 lateral traces."
-                )
-            supervised_trace[
-                context_radius : tile.width - context_radius
-            ] = tile.lateral_valid[
-                context_radius : tile.width - context_radius
-            ]
+            ratio = tile.model_axis.sample_interval / tile.highres_axis.sample_interval
+            factor = int(round(ratio))
+            object_id_model = np.asarray(parent.object_id_highres[:, ::factor])
+            if object_id_model.shape != targets.support.shape:
+                raise ValueError("model-grid object identity changed shape.")
+            object_id_model = np.where(
+                targets.support,
+                object_id_model,
+                -1,
+            ).astype(np.int64)
             training_tile = tile
             if condition == "dirty":
                 random_identity = stable_random_identity(
@@ -209,21 +230,25 @@ def iter_evidence_batches(
                     observed_valid=augmented.observed_valid,
                 )
             yield {
+                "parent_id": parent_id,
+                "tile_id": tile.identity,
+                "condition": condition,
                 "seismic": training_tile.seismic[None].astype(np.float32),
                 "lfm": training_tile.lfm[None].astype(np.float32),
+                "lfm_residual": lfm_residual[None].astype(np.float32),
+                "background_lfm_linear": anchor.model[None].astype(np.float32),
                 "observed_valid": training_tile.observed_valid[None],
                 "lateral_m": training_tile.lateral_m[None].astype(np.float32),
                 "lateral_valid": training_tile.lateral_valid[None],
-                "increment": targets.increment[None].astype(np.float32),
-                "state_occupancy": targets.state_occupancy[None].astype(
-                    np.float32
+                "projected_log_ai_increment": (
+                    targets.projected_log_ai_increment[None].astype(np.float32)
                 ),
-                "interface_activity": targets.interface_activity[None].astype(
-                    np.float32
+                "signed_reflectivity": (
+                    targets.signed_reflectivity[None].astype(np.float32)
                 ),
-                "support": (
-                    targets.support & supervised_trace[:, None]
-                )[None],
+                "state_emission": targets.state_id[None].astype(np.int64),
+                "truth_object_id": object_id_model[None],
+                "support": targets.support[None],
             }
 
 
@@ -232,14 +257,21 @@ def iter_paired_evidence_batches(
     split: str,
     *,
     augmentation_profile: ObservationAugmentationProfile,
-) -> Iterator[Mapping[str, np.ndarray]]:
+    parent_limit: int | None = None,
+) -> Iterator[Mapping[str, Any]]:
     """Yield each clean parent-zone batch immediately followed by its dirty pair."""
-    clean = iter_evidence_batches(corpus, split, condition="clean")
+    clean = iter_evidence_batches(
+        corpus,
+        split,
+        condition="clean",
+        parent_limit=parent_limit,
+    )
     dirty = iter_evidence_batches(
         corpus,
         split,
         condition="dirty",
         augmentation_profile=augmentation_profile,
+        parent_limit=parent_limit,
     )
     for clean_batch, dirty_batch in zip(clean, dirty, strict=True):
         yield clean_batch
@@ -247,30 +279,77 @@ def iter_paired_evidence_batches(
 
 
 def calibrate_semi_markov_prior(corpus: Corpus) -> SemiMarkovPrior:
+    """Calibrate an event-level zone-fraction prior from the canonical catalog.
+
+    The catalog contains one ordered geological event per parent and zone, so
+    this avoids loading the large HDF5 arrays for every training parent.  It is
+    still truth from training parents; lateral endpoint durations provide the
+    within-event duration variation.
+    """
+
+    catalog = corpus.root / "object_catalog.csv"
+    if not catalog.is_file():
+        raise FileNotFoundError(catalog)
+    training = set(corpus.splits["training"])
+    groups: dict[tuple[str, str], list[tuple[int, int, tuple[float, ...]]]] = {}
+    with catalog.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {
+            "realization_id",
+            "zone_id",
+            "object_id",
+            "state_id",
+            "base_duration_fraction",
+            "duration_fraction_start",
+            "duration_fraction_end",
+        }
+        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+            missing = sorted(required.difference(reader.fieldnames or ()))
+            raise ValueError(f"object catalog lacks semi-Markov fields: {missing}")
+        for row in reader:
+            parent_id = str(row["realization_id"])
+            if parent_id not in training:
+                continue
+            values: list[float] = []
+            for name in ("duration_fraction_start", "duration_fraction_end"):
+                text = str(row[name]).strip()
+                if text:
+                    value = float(text)
+                    if not np.isfinite(value) or value < 0.0:
+                        raise ValueError(
+                            "object catalog duration fractions must be finite "
+                            "and non-negative."
+                        )
+                    if value > 0.0:
+                        values.append(value)
+            if not values:
+                values.append(float(row["base_duration_fraction"]))
+            if any(not np.isfinite(value) or value <= 0.0 for value in values):
+                raise ValueError("object catalog duration fractions must be positive.")
+            key = (parent_id, str(row["zone_id"]))
+            groups.setdefault(key, []).append(
+                (
+                    int(row["object_id"]),
+                    int(row["state_id"]),
+                    tuple(values),
+                )
+            )
+    if not groups:
+        raise ValueError("object catalog contains no training events.")
+
     initial = np.ones(3, dtype=np.float64)
     transition = np.ones((3, 3), dtype=np.float64)
     durations: list[list[float]] = [[], [], []]
-    for parent_id in corpus.splits["training"]:
-        parent = corpus.benchmark.read_parent(parent_id)
-        groups: dict[tuple[int, str], list[Mapping[str, Any]]] = {}
-        for row in parent.segments:
-            if int(row["duration_samples"]) <= 0:
-                continue
-            key = (int(row["lateral_index"]), str(row["zone_id"]))
-            groups.setdefault(key, []).append(row)
-        for rows in groups.values():
-            ordered = sorted(rows, key=lambda row: (float(row["top"]), int(row["object_id"])))
-            states = [int(row["state_id"]) for row in ordered]
-            if not states or any(state not in {0, 1, 2} for state in states):
-                raise ValueError("training segment states must be 0, 1, or 2.")
-            initial[states[0]] += 1.0
-            for previous, current in zip(states[:-1], states[1:]):
-                transition[previous, current] += 1.0
-            for row, state in zip(ordered, states):
-                duration = float(row["duration_fraction"])
-                if not np.isfinite(duration) or duration <= 0.0:
-                    raise ValueError("duration_fraction must be finite and positive.")
-                durations[state].append(duration)
+    for rows in groups.values():
+        ordered = sorted(rows, key=lambda row: row[0])
+        states = [row[1] for row in ordered]
+        if not states or any(state not in {0, 1, 2} for state in states):
+            raise ValueError("training event states must be 0, 1, or 2.")
+        initial[states[0]] += 1.0
+        for previous, current in zip(states[:-1], states[1:]):
+            transition[previous, current] += 1.0
+        for (_, state, values) in ordered:
+            durations[state].extend(values)
     if any(not values for values in durations):
         raise ValueError("training corpus does not cover every state duration.")
     return SemiMarkovPrior(
@@ -328,6 +407,7 @@ def load_checkpoint(
     metadata = {
         "training_state": dict(payload.get("training_state") or {}),
         "corpus_provenance": dict(payload.get("corpus_provenance") or {}),
+        "target_contract": generator.target_contract.to_mapping(),
         "runtime_state": dict(payload.get("runtime_state") or {}),
     }
     return generator, metadata
@@ -352,6 +432,7 @@ def public_checkpoint_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "training_state": training_state,
         "corpus_provenance": corpus_provenance,
+        "target_contract": dict(metadata.get("target_contract") or {}),
         "runtime_state": public_runtime,
     }
 
@@ -374,10 +455,19 @@ def save_section_prediction(
     if realizations is None:
         raise ValueError("section publication requires retained realizations.")
     arrays = {
-        "evidence_increment_mean": prediction.evidence.bandlimited_increment_mean,
-        "evidence_increment_scale": prediction.evidence.bandlimited_increment_scale,
-        "evidence_state_occupancy": prediction.evidence.state_occupancy,
-        "evidence_interface_activity": prediction.evidence.interface_activity,
+        "evidence_projected_increment_mean": (
+            prediction.evidence.projected_log_ai_increment_mean
+        ),
+        "evidence_projected_increment_scale": (
+            prediction.evidence.projected_log_ai_increment_scale
+        ),
+        "evidence_signed_reflectivity_mean": (
+            prediction.evidence.signed_reflectivity_mean
+        ),
+        "evidence_signed_reflectivity_scale": (
+            prediction.evidence.signed_reflectivity_scale
+        ),
+        "evidence_state_log_potential": prediction.evidence.state_log_potential,
         "evidence_support": prediction.evidence.support,
         "ensemble_highres_mean": prediction.summary.log_ai_highres_mean,
         "ensemble_highres_std": prediction.summary.log_ai_highres_std,
@@ -424,6 +514,7 @@ __all__ = [
     "CORPUS_MANIFEST_SCHEMA",
     "Corpus",
     "load_checkpoint",
+    "load_observable_target_contract",
     "public_checkpoint_metadata",
     "load_corpus",
     "calibrate_semi_markov_prior",

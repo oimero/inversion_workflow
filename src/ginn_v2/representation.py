@@ -91,6 +91,21 @@ def build_lfm_anchor(tile: ObservationTile) -> LfmAnchor:
     )
 
 
+def lfm_residual_from_anchor(
+    tile: ObservationTile,
+    anchor: LfmAnchor,
+) -> np.ndarray:
+    """Return a finite model-grid LFM residual on the anchor support."""
+
+    if anchor.model.shape != tile.lfm.shape or anchor.model_support.shape != tile.lfm.shape:
+        raise InputContractError("LFM anchor shape differs from the observation tile.")
+    support = anchor.model_support & tile.observed_valid
+    values = np.asarray(tile.lfm, dtype=np.float64) - anchor.model
+    if np.any(~np.isfinite(values[support])):
+        raise InputContractError("LFM residual contains non-finite supported samples.")
+    return np.where(support, values, 0.0)
+
+
 def profile_basis(sample_count: int) -> np.ndarray:
     if isinstance(sample_count, bool) or sample_count <= 0:
         raise ValueError("sample_count must be positive.")
@@ -231,6 +246,7 @@ def project_highres_to_model(
 __all__ = [
     "LfmAnchor",
     "build_lfm_anchor",
+    "lfm_residual_from_anchor",
     "decode_segments_numpy",
     "decode_segments_torch",
     "fit_profile_coefficients",

@@ -6,9 +6,10 @@ from dataclasses import replace
 from typing import Callable, Iterable, Mapping
 
 import numpy as np
+from scipy.special import logsumexp
 
 from ginn_v2.contracts import (
-    BandlimitedEvidence,
+    ObservableEvidence,
     GenerationPolicy,
     ObservationTile,
     StructuredPrediction,
@@ -18,9 +19,9 @@ from ginn_v2.generator import ConditionalGenerator
 
 
 def fuse_directional_evidence(
-    inline: BandlimitedEvidence,
-    xline: BandlimitedEvidence,
-) -> BandlimitedEvidence:
+    inline: ObservableEvidence,
+    xline: ObservableEvidence,
+) -> ObservableEvidence:
     """Fuse calibrated band-limited evidence before generating microstructure."""
     coordinates_differ = (
         (inline.x_m is None) != (xline.x_m is None)
@@ -58,51 +59,52 @@ def fuse_directional_evidence(
             divisor = denominator
         return (left * weights + right * other) / divisor
 
-    mean = average(
-        inline.bandlimited_increment_mean,
-        xline.bandlimited_increment_mean,
+    def mixture(
+        left_mean: np.ndarray,
+        left_scale: np.ndarray,
+        right_mean: np.ndarray,
+        right_scale: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        mean = average(left_mean, right_mean)
+        within = average(left_scale**2, right_scale**2)
+        between = average((left_mean - mean) ** 2, (right_mean - mean) ** 2)
+        return mean, np.sqrt(np.maximum(within + between, 1.0e-12))
+
+    increment_mean, increment_scale = mixture(
+        inline.projected_log_ai_increment_mean,
+        inline.projected_log_ai_increment_scale,
+        xline.projected_log_ai_increment_mean,
+        xline.projected_log_ai_increment_scale,
     )
-    within = average(
-        inline.bandlimited_increment_scale**2,
-        xline.bandlimited_increment_scale**2,
+    reflectivity_mean, reflectivity_scale = mixture(
+        inline.signed_reflectivity_mean,
+        inline.signed_reflectivity_scale,
+        xline.signed_reflectivity_mean,
+        xline.signed_reflectivity_scale,
     )
-    between = average(
-        (
-            inline.bandlimited_increment_mean
-            - 0.5
-            * (
-                inline.bandlimited_increment_mean
-                + xline.bandlimited_increment_mean
-            )
-        )
-        ** 2,
-        (
-            xline.bandlimited_increment_mean
-            - 0.5
-            * (
-                inline.bandlimited_increment_mean
-                + xline.bandlimited_increment_mean
-            )
-        )
-        ** 2,
-    )
-    scale = np.sqrt(np.maximum(within + between, 1.0e-8))
     background = average(
         inline.background_lfm_linear,
         xline.background_lfm_linear,
     )
-    occupancy = average(inline.state_occupancy, xline.state_occupancy)
-    occupancy /= np.maximum(np.sum(occupancy, axis=-1, keepdims=True), 1.0e-12)
-    activity = average(inline.interface_activity, xline.interface_activity)
+    state_log_potential = average(
+        inline.state_log_potential,
+        xline.state_log_potential,
+    )
+    state_log_potential -= logsumexp(
+        state_log_potential,
+        axis=-1,
+        keepdims=True,
+    )
     tuning = average(inline.local_tuning_scale, xline.local_tuning_scale)
-    return BandlimitedEvidence(
+    return ObservableEvidence(
         model_axis=inline.model_axis,
         highres_axis=inline.highres_axis,
         background_lfm_linear=background,
-        bandlimited_increment_mean=mean,
-        bandlimited_increment_scale=scale,
-        state_occupancy=occupancy,
-        interface_activity=activity,
+        projected_log_ai_increment_mean=increment_mean,
+        projected_log_ai_increment_scale=increment_scale,
+        signed_reflectivity_mean=reflectivity_mean,
+        signed_reflectivity_scale=reflectivity_scale,
+        state_log_potential=state_log_potential,
         local_tuning_scale=tuning,
         support=support,
         lateral_m=inline.lateral_m,
@@ -112,22 +114,27 @@ def fuse_directional_evidence(
 
 
 def _center_evidence(
-    evidence: BandlimitedEvidence,
+    evidence: ObservableEvidence,
     center_index: int | None,
-) -> BandlimitedEvidence:
+) -> ObservableEvidence:
     width = evidence.lateral_m.size
     index = width // 2 if center_index is None else int(center_index)
     if index < 0 or index >= width:
         raise IndexError("directional center index is outside the evidence tile.")
     selection = slice(index, index + 1)
-    return BandlimitedEvidence(
+    return ObservableEvidence(
         model_axis=evidence.model_axis,
         highres_axis=evidence.highres_axis,
         background_lfm_linear=evidence.background_lfm_linear[selection],
-        bandlimited_increment_mean=evidence.bandlimited_increment_mean[selection],
-        bandlimited_increment_scale=evidence.bandlimited_increment_scale[selection],
-        state_occupancy=evidence.state_occupancy[selection],
-        interface_activity=evidence.interface_activity[selection],
+        projected_log_ai_increment_mean=(
+            evidence.projected_log_ai_increment_mean[selection]
+        ),
+        projected_log_ai_increment_scale=(
+            evidence.projected_log_ai_increment_scale[selection]
+        ),
+        signed_reflectivity_mean=evidence.signed_reflectivity_mean[selection],
+        signed_reflectivity_scale=evidence.signed_reflectivity_scale[selection],
+        state_log_potential=evidence.state_log_potential[selection],
         local_tuning_scale=evidence.local_tuning_scale[selection],
         support=evidence.support[selection],
         lateral_m=np.asarray([0.0], dtype=np.float64),
@@ -177,8 +184,8 @@ def infer_fused_section(
         np.sqrt(
             np.mean(
                 (
-                    inline.bandlimited_increment_mean[shared]
-                    - xline.bandlimited_increment_mean[shared]
+                    inline.projected_log_ai_increment_mean[shared]
+                    - xline.projected_log_ai_increment_mean[shared]
                 )
                 ** 2
             )

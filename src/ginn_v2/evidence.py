@@ -1,4 +1,4 @@
-"""Tuning-window supervision and the band-limited evidence network."""
+"""Audited observable targets and their formal evidence network."""
 
 from __future__ import annotations
 
@@ -10,16 +10,92 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ginn_v2.contracts import InputContractError, ObservationTile
+from cup.physics.numpy_backend import reflectivity_from_log_ai
+from ginn_v2.contracts import (
+    InputContractError,
+    ObservableTargetContract,
+    ObservationTile,
+)
 
 
 @dataclass(frozen=True)
-class TuningTargets:
-    increment: np.ndarray
-    state_occupancy: np.ndarray
-    interface_activity: np.ndarray
-    local_tuning_scale: np.ndarray
+class ObservableTargets:
+    """Physically defined model-grid targets used by the audit seam."""
+
+    projected_log_ai_increment: np.ndarray
+    signed_reflectivity: np.ndarray
+    state_id: np.ndarray
     support: np.ndarray
+
+
+def build_observable_targets(
+    tile: ObservationTile,
+    *,
+    model_log_ai: np.ndarray,
+    state_highres: np.ndarray,
+    background_lfm_linear: np.ndarray,
+    anchor_support: np.ndarray,
+) -> ObservableTargets:
+    """Build targets without per-trace normalization or invented activity labels.
+
+    Reflectivity follows the same lower-interface convention as ``cup.physics``:
+    target sample ``j`` represents the interface between samples ``j-1`` and
+    ``j``; sample zero has no lower-interface predecessor and is unsupported.
+    """
+
+    log_ai = np.asarray(model_log_ai, dtype=np.float64)
+    state = np.asarray(state_highres)
+    background = np.asarray(background_lfm_linear, dtype=np.float64)
+    support = np.asarray(anchor_support, dtype=bool)
+    if log_ai.shape != tile.seismic.shape:
+        raise InputContractError("model_log_ai must match the observation tile.")
+    if background.shape != log_ai.shape or support.shape != log_ai.shape:
+        raise InputContractError("LFM anchor arrays must match model_log_ai.")
+    expected_highres = (tile.width, tile.highres_axis.coordinates.size)
+    if state.shape != expected_highres:
+        raise InputContractError("state_highres must match the high-resolution axis.")
+
+    ratio = tile.model_axis.sample_interval / tile.highres_axis.sample_interval
+    factor = int(round(ratio))
+    if factor < 1 or not np.isclose(ratio, factor, rtol=0.0, atol=1.0e-10):
+        raise InputContractError("observable targets require integer-nested axes.")
+    nested_coordinates = tile.highres_axis.coordinates[::factor]
+    if nested_coordinates.shape != tile.model_axis.coordinates.shape or not np.allclose(
+        nested_coordinates,
+        tile.model_axis.coordinates,
+        rtol=0.0,
+        atol=1.0e-8,
+    ):
+        raise InputContractError(
+            "observable targets require coincident model/high-resolution axes."
+        )
+    state_model = state[:, ::factor]
+    if state_model.shape != log_ai.shape:
+        raise InputContractError("model-grid state sampling changed the target shape.")
+
+    base_support = (
+        support
+        & tile.observed_valid
+        & tile.lateral_valid[:, None]
+        & np.isfinite(log_ai)
+        & np.isfinite(background)
+        & (state_model >= 0)
+        & (state_model <= 2)
+    )
+    increment = np.where(base_support, log_ai - background, 0.0)
+    reflectivity = np.zeros_like(log_ai)
+    reflectivity[:, 1:] = reflectivity_from_log_ai(log_ai)
+    reflectivity_support = base_support.copy()
+    reflectivity_support[:, 0] = False
+    reflectivity_support[:, 1:] &= base_support[:, :-1]
+    common_support = base_support & reflectivity_support
+    state_model = np.where(common_support, state_model, -1).astype(np.int64)
+    return ObservableTargets(
+        projected_log_ai_increment=np.where(common_support, increment, 0.0),
+        signed_reflectivity=np.where(common_support, reflectivity, 0.0),
+        state_id=state_model,
+        support=common_support,
+    )
 
 
 def dominant_frequency_hz(
@@ -73,188 +149,244 @@ def tuning_scale_on_model_axis(
     return velocity / (4.0 * dominant_frequency)
 
 
-def _gaussian_average(
-    source_axis: np.ndarray,
-    values: np.ndarray,
-    target_axis: np.ndarray,
-    fwhm: np.ndarray,
-    source_valid: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    source = np.asarray(source_axis, dtype=np.float64)
-    target = np.asarray(target_axis, dtype=np.float64)
-    result = np.zeros(target.size, dtype=np.float64)
-    support = np.zeros(target.size, dtype=bool)
-    for index, center in enumerate(target):
-        sigma = float(fwhm[index]) / 2.354820045
-        if not np.isfinite(sigma) or sigma <= 0.0:
-            raise InputContractError("tuning-window FWHM must be finite and positive.")
-        within = source_valid & (np.abs(source - center) <= 3.0 * sigma)
-        if not np.any(within):
-            continue
-        weight = np.exp(-0.5 * ((source[within] - center) / sigma) ** 2)
-        total = float(np.sum(weight))
-        if total <= 0.0:
-            continue
-        result[index] = float(np.sum(weight * values[within]) / total)
-        support[index] = True
-    return result, support
-
-
-def build_tuning_targets(
-    tile: ObservationTile,
-    *,
-    log_ai_highres: np.ndarray,
-    state_highres: np.ndarray,
-    background_lfm_highres: np.ndarray,
-    wavelet_time_s: np.ndarray,
-    wavelet_amplitude: np.ndarray,
-    vp_model_mps: np.ndarray | None = None,
-) -> TuningTargets:
-    """Build domain-neutral tuning-window targets on the model grid."""
-    log_ai = np.asarray(log_ai_highres, dtype=np.float64)
-    state = np.asarray(state_highres)
-    background = np.asarray(background_lfm_highres, dtype=np.float64)
-    expected = (tile.width, tile.highres_axis.coordinates.size)
-    if log_ai.shape != expected or state.shape != expected or background.shape != expected:
-        raise InputContractError("high-resolution truth arrays must match the tile axes.")
-    frequency = dominant_frequency_hz(wavelet_time_s, wavelet_amplitude)
-    tuning = tuning_scale_on_model_axis(
-        tile,
-        dominant_frequency=frequency,
-        vp_model_mps=vp_model_mps,
-    )
-    increment = np.zeros(tile.seismic.shape, dtype=np.float64)
-    occupancy = np.full(tile.seismic.shape + (3,), 1.0 / 3.0, dtype=np.float64)
-    activity = np.zeros(tile.seismic.shape, dtype=np.float64)
-    support = np.zeros(tile.seismic.shape, dtype=bool)
-    high_axis = tile.highres_axis.coordinates
-    model_axis = tile.model_axis.coordinates
-    for trace in range(tile.width):
-        valid = np.isfinite(log_ai[trace]) & np.isfinite(background[trace])
-        if not np.any(valid):
-            continue
-        residual = log_ai[trace] - background[trace]
-        target, target_support = _gaussian_average(
-            high_axis,
-            residual,
-            model_axis,
-            tuning[trace],
-            valid,
-        )
-        increment[trace] = target
-        support[trace] = target_support & tile.observed_valid[trace]
-        state_columns: list[np.ndarray] = []
-        for state_id in range(3):
-            value, _ = _gaussian_average(
-                high_axis,
-                (state[trace] == state_id).astype(np.float64),
-                model_axis,
-                tuning[trace],
-                valid & (state[trace] >= 0),
-            )
-            state_columns.append(value)
-        stacked = np.stack(state_columns, axis=-1)
-        total = np.sum(stacked, axis=-1, keepdims=True)
-        good = total[..., 0] > 0.0
-        stacked[good] /= total[good]
-        stacked[~good] = 1.0 / 3.0
-        occupancy[trace] = stacked
-
-        jump = np.zeros(high_axis.size, dtype=np.float64)
-        pair_valid = valid[1:] & valid[:-1]
-        jump_indices = np.flatnonzero(pair_valid) + 1
-        jump[jump_indices] = np.abs(np.diff(log_ai[trace])[pair_valid])
-        smoothed_jump, _ = _gaussian_average(
-            high_axis,
-            jump,
-            model_axis,
-            tuning[trace],
-            valid,
-        )
-        robust = float(np.quantile(smoothed_jump[support[trace]], 0.95)) if np.any(
-            support[trace]
-        ) else 0.0
-        if robust > 0.0:
-            activity[trace] = np.clip(smoothed_jump / robust, 0.0, 1.0)
-    return TuningTargets(
-        increment=increment,
-        state_occupancy=occupancy,
-        interface_activity=activity,
-        local_tuning_scale=tuning,
-        support=support,
-    )
-
-
 @dataclass(frozen=True)
 class EvidenceNetworkConfig:
     hidden_channels: int = 48
     vertical_layers: int = 3
     lateral_distance_scale_m: float = 250.0
+    use_lateral_context: bool = False
     input_mode: str = "full"
+    minimum_scale_fraction: float = 0.05
+    seismic_scale: float = 1.0
+    lfm_residual_scale: float = 1.0
+    projected_log_ai_increment_scale: float = 1.0
+    signed_reflectivity_scale: float = 1.0
 
     def __post_init__(self) -> None:
         if self.hidden_channels <= 0 or self.vertical_layers <= 0:
             raise ValueError("network dimensions must be positive.")
         if self.lateral_distance_scale_m <= 0.0:
             raise ValueError("lateral_distance_scale_m must be positive.")
-        if self.input_mode not in {"full", "no_seismic", "single_trace"}:
-            raise ValueError("input_mode must be full, no_seismic, or single_trace.")
+        if not isinstance(self.use_lateral_context, bool):
+            raise TypeError("use_lateral_context must be boolean.")
+        if self.input_mode not in {"full", "no_seismic"}:
+            raise ValueError("input_mode must be full or no_seismic.")
+        for name in (
+            "minimum_scale_fraction",
+            "seismic_scale",
+            "lfm_residual_scale",
+            "projected_log_ai_increment_scale",
+            "signed_reflectivity_scale",
+        ):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, object]) -> "EvidenceNetworkConfig":
-        return cls(**dict(value))
-
-
-class BandlimitedEvidenceNetwork(nn.Module):
-    """Variable-width 1D lateral model with an explicit evidence bottleneck."""
-
-    def __init__(self, config: EvidenceNetworkConfig) -> None:
-        super().__init__()
-        self.config = config
-        layers: list[nn.Module] = []
-        channels = 2
-        for _ in range(config.vertical_layers):
-            layers.extend(
-                (
-                    nn.Conv1d(channels, config.hidden_channels, kernel_size=5, padding=2),
-                    nn.GELU(),
+    def from_mapping(
+        cls,
+        value: Mapping[str, object],
+        *,
+        target_contract: ObservableTargetContract | None = None,
+    ) -> "EvidenceNetworkConfig":
+        payload = dict(value)
+        if target_contract is not None:
+            protected = {
+                "seismic_scale",
+                "lfm_residual_scale",
+                "projected_log_ai_increment_scale",
+                "signed_reflectivity_scale",
+            }
+            configured = sorted(protected.intersection(payload))
+            if configured:
+                raise ValueError(
+                    "network scales come from the passed target contract, not config: "
+                    f"{configured}"
                 )
+            scales = target_contract.global_scales
+            payload.update(
+                {
+                    "seismic_scale": scales["seismic"],
+                    "lfm_residual_scale": scales["lfm_residual"],
+                    "projected_log_ai_increment_scale": scales[
+                        "projected_log_ai_increment"
+                    ],
+                    "signed_reflectivity_scale": scales["signed_reflectivity"],
+                }
             )
-            channels = config.hidden_channels
-        self.vertical = nn.Sequential(*layers)
-        self.fuse = nn.Sequential(
-            nn.Conv1d(2 * config.hidden_channels, config.hidden_channels, 1),
-            nn.GELU(),
+        return cls(**payload)
+
+
+class _ResidualBlock(nn.Module):
+    def __init__(self, channels: int, *, dilation: int) -> None:
+        super().__init__()
+        self.convolution = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=5,
+            padding=2 * dilation,
+            dilation=dilation,
         )
-        self.increment_mean = nn.Conv1d(config.hidden_channels, 1, 1)
-        self.increment_scale = nn.Conv1d(config.hidden_channels, 1, 1)
-        self.state_logits = nn.Conv1d(config.hidden_channels, 3, 1)
-        self.interface_logit = nn.Conv1d(config.hidden_channels, 1, 1)
+        self.normalization = nn.GroupNorm(1, channels)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        update = self.normalization(self.convolution(values))
+        return values + F.gelu(update)
+
+
+class ObservableTargetProbe(nn.Module):
+    """Small single-target network used only by L1/L2 information probes."""
+
+    def __init__(
+        self,
+        target_name: str,
+        *,
+        hidden_channels: int = 24,
+        layers: int = 3,
+    ) -> None:
+        super().__init__()
+        if target_name not in {
+            "projected_log_ai_increment",
+            "signed_reflectivity",
+            "state_emission",
+        }:
+            raise ValueError(f"unsupported observable target: {target_name}")
+        if hidden_channels <= 0 or layers <= 0:
+            raise ValueError("probe dimensions must be positive.")
+        self.target_name = target_name
+        self.input_projection = nn.Conv1d(3, hidden_channels, kernel_size=5, padding=2)
+        self.encoder = nn.Sequential(
+            *(
+                _ResidualBlock(hidden_channels, dilation=2 ** (index % 3))
+                for index in range(layers)
+            )
+        )
+        channels = 3 if target_name == "state_emission" else 1
+        self.head = nn.Conv1d(hidden_channels, channels, kernel_size=1)
+        if channels == 1:
+            nn.init.zeros_(self.head.weight)
+            nn.init.zeros_(self.head.bias)
 
     def forward(
         self,
         seismic: torch.Tensor,
-        lfm: torch.Tensor,
+        lfm_residual: torch.Tensor,
+        observed_valid: torch.Tensor,
+        *,
+        input_mode: str,
+        seismic_scale: float,
+        lfm_residual_scale: float,
+    ) -> torch.Tensor:
+        if seismic.ndim != 2 or lfm_residual.shape != seismic.shape:
+            raise ValueError("probe observations must have shape [batch, sample].")
+        if observed_valid.shape != seismic.shape:
+            raise ValueError("probe validity must match observations.")
+        if input_mode not in {"full", "no_seismic"}:
+            raise ValueError("probe input_mode must be full or no_seismic.")
+        if seismic_scale <= 0.0 or lfm_residual_scale <= 0.0:
+            raise ValueError("probe input scales must be positive.")
+        valid = observed_valid.to(dtype=seismic.dtype)
+        seismic_input = seismic / float(seismic_scale)
+        if input_mode == "no_seismic":
+            seismic_input = torch.zeros_like(seismic_input)
+        values = torch.stack(
+            (
+                seismic_input * valid,
+                lfm_residual / float(lfm_residual_scale) * valid,
+                valid,
+            ),
+            dim=1,
+        )
+        output = self.head(self.encoder(F.gelu(self.input_projection(values))))
+        if self.target_name == "state_emission":
+            return output.transpose(1, 2)
+        return output[:, 0]
+
+
+class ObservableEvidenceNetwork(nn.Module):
+    """Single-trace audited evidence model with an optional later lateral mixer."""
+
+    def __init__(self, config: EvidenceNetworkConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.input_projection = nn.Conv1d(3, config.hidden_channels, 1)
+        self.vertical = nn.Sequential(
+            *(
+                _ResidualBlock(
+                    config.hidden_channels,
+                    dilation=2 ** (index % 4),
+                )
+                for index in range(config.vertical_layers)
+            )
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv1d(2 * config.hidden_channels, config.hidden_channels, 1),
+            nn.GroupNorm(1, config.hidden_channels),
+            nn.GELU(),
+        )
+        self.increment_mean = nn.Conv1d(config.hidden_channels, 1, 1)
+        self.increment_raw_scale = nn.Conv1d(config.hidden_channels, 1, 1)
+        self.reflectivity_mean = nn.Conv1d(config.hidden_channels, 1, 1)
+        self.reflectivity_raw_scale = nn.Conv1d(config.hidden_channels, 1, 1)
+        self.state_logits = nn.Conv1d(config.hidden_channels, 3, 1)
+        for head in (self.increment_mean, self.reflectivity_mean):
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+        initial_ratio = max(0.5 - config.minimum_scale_fraction, 1.0e-4)
+        raw_bias = float(np.log(np.expm1(initial_ratio)))
+        for head in (self.increment_raw_scale, self.reflectivity_raw_scale):
+            nn.init.zeros_(head.weight)
+            nn.init.constant_(head.bias, raw_bias)
+
+    def _positive_scale(self, raw: torch.Tensor, global_scale: float) -> torch.Tensor:
+        ratio = self.config.minimum_scale_fraction + F.softplus(raw)
+        return ratio * float(global_scale)
+
+    def forward(
+        self,
+        seismic: torch.Tensor,
+        lfm_residual: torch.Tensor,
         observed_valid: torch.Tensor,
         lateral_m: torch.Tensor,
         lateral_valid: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        if seismic.ndim != 3 or lfm.shape != seismic.shape or observed_valid.shape != seismic.shape:
+        if (
+            seismic.ndim != 3
+            or lfm_residual.shape != seismic.shape
+            or observed_valid.shape != seismic.shape
+        ):
             raise ValueError("observations must have shape [batch, lateral, sample].")
         batch, width, samples = seismic.shape
         if lateral_m.shape != (batch, width) or lateral_valid.shape != (batch, width):
             raise ValueError("lateral geometry must match [batch, lateral].")
-        seismic_input = (
-            torch.zeros_like(seismic)
-            if self.config.input_mode == "no_seismic"
-            else seismic
+        seismic_scaled = torch.where(
+            observed_valid,
+            seismic / self.config.seismic_scale,
+            torch.zeros_like(seismic),
         )
-        values = torch.stack((seismic_input, lfm), dim=2).reshape(
+        lfm_residual_scaled = torch.where(
+            observed_valid,
+            lfm_residual / self.config.lfm_residual_scale,
+            torch.zeros_like(lfm_residual),
+        )
+        seismic_input = (
+            torch.zeros_like(seismic_scaled)
+            if self.config.input_mode == "no_seismic"
+            else seismic_scaled
+        )
+        values = torch.stack(
+            (
+                seismic_input,
+                lfm_residual_scaled,
+                observed_valid.to(dtype=seismic.dtype),
+            ),
+            dim=2,
+        ).reshape(
             batch * width,
-            2,
+            3,
             samples,
         )
-        feature = self.vertical(values).reshape(
+        feature = self.vertical(self.input_projection(values)).reshape(
             batch,
             width,
             self.config.hidden_channels,
@@ -264,14 +396,11 @@ class BandlimitedEvidenceNetwork(nn.Module):
         weight = torch.exp(-distance / self.config.lateral_distance_scale_m)
         pair_valid = lateral_valid[:, :, None] & lateral_valid[:, None, :]
         weight = weight * pair_valid.to(weight.dtype)
-        if self.config.input_mode == "single_trace":
-            weight = torch.eye(width, device=weight.device, dtype=weight.dtype)[None].expand(
-                batch,
-                -1,
-                -1,
-            )
-        weight = weight / weight.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
-        mixed = torch.einsum("bij,bjcn->bicn", weight, feature)
+        if self.config.use_lateral_context:
+            weight = weight / weight.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+            mixed = torch.einsum("bij,bjcn->bicn", weight, feature)
+        else:
+            mixed = feature
         combined = torch.cat((feature, mixed), dim=2).reshape(
             batch * width,
             2 * self.config.hidden_channels,
@@ -279,23 +408,26 @@ class BandlimitedEvidenceNetwork(nn.Module):
         )
         hidden = self.fuse(combined)
         support = observed_valid & lateral_valid[:, :, None]
+        increment_mean = self.increment_mean(hidden).reshape(batch, width, samples)
+        reflectivity_mean = self.reflectivity_mean(hidden).reshape(
+            batch, width, samples
+        )
+        state_logits = self.state_logits(hidden).reshape(
+            batch, width, 3, samples
+        ).permute(0, 1, 3, 2)
         return {
-            "increment_mean": self.increment_mean(hidden).reshape(batch, width, samples),
-            "increment_scale": (
-                F.softplus(self.increment_scale(hidden)) + 1.0e-4
-            ).reshape(batch, width, samples),
-            "state_occupancy": torch.softmax(
-                self.state_logits(hidden).reshape(batch, width, 3, samples).permute(
-                    0,
-                    1,
-                    3,
-                    2,
-                ),
-                dim=-1,
+            "projected_log_ai_increment_mean": increment_mean,
+            "projected_log_ai_increment_scale": self._positive_scale(
+                self.increment_raw_scale(hidden).reshape(batch, width, samples),
+                self.config.projected_log_ai_increment_scale,
             ),
-            "interface_activity": torch.sigmoid(
-                self.interface_logit(hidden).reshape(batch, width, samples)
+            "signed_reflectivity_mean": reflectivity_mean,
+            "signed_reflectivity_scale": self._positive_scale(
+                self.reflectivity_raw_scale(hidden).reshape(batch, width, samples),
+                self.config.signed_reflectivity_scale,
             ),
+            "state_logits": state_logits,
+            "state_log_potential": F.log_softmax(state_logits, dim=-1),
             "support": support,
         }
 
@@ -303,38 +435,91 @@ class BandlimitedEvidenceNetwork(nn.Module):
 def evidence_loss(
     output: Mapping[str, torch.Tensor],
     targets: Mapping[str, torch.Tensor],
+    *,
+    config: EvidenceNetworkConfig,
+    increment_weight: float,
+    reflectivity_weight: float,
+    state_weight: float,
+    scale_weight: float,
 ) -> dict[str, torch.Tensor]:
     support = targets["support"].bool() & output["support"].bool()
     if not torch.any(support):
         raise ValueError("evidence loss has no supported samples.")
-    residual = output["increment_mean"] - targets["increment"]
-    scale = output["increment_scale"]
-    increment_nll = (
-        0.5 * (residual / scale).square() + torch.log(scale)
-    )[support].mean()
-    state_target = targets["state_occupancy"]
-    state_ce = -(
-        state_target
-        * torch.log(output["state_occupancy"].clamp_min(1.0e-8))
-    ).sum(dim=-1)[support].mean()
-    interface = F.binary_cross_entropy(
-        output["interface_activity"][support],
-        targets["interface_activity"][support],
+    increment_residual = (
+        output["projected_log_ai_increment_mean"]
+        - targets["projected_log_ai_increment"]
+    ) / config.projected_log_ai_increment_scale
+    increment_mean_huber = F.smooth_l1_loss(
+        increment_residual[support],
+        torch.zeros_like(increment_residual[support]),
+        beta=1.0,
     )
-    total = increment_nll + state_ce + interface
+    increment_scale_target = (
+        torch.abs(increment_residual.detach()) + config.minimum_scale_fraction
+    )
+    increment_scale_ratio = (
+        output["projected_log_ai_increment_scale"]
+        / config.projected_log_ai_increment_scale
+    )
+    increment_scale_huber = F.smooth_l1_loss(
+        torch.log(increment_scale_ratio[support]),
+        torch.log(increment_scale_target[support]),
+    )
+
+    reflectivity_residual = (
+        output["signed_reflectivity_mean"] - targets["signed_reflectivity"]
+    ) / config.signed_reflectivity_scale
+    reflectivity_mean_huber = F.smooth_l1_loss(
+        reflectivity_residual[support],
+        torch.zeros_like(reflectivity_residual[support]),
+        beta=1.0,
+    )
+    reflectivity_scale_target = (
+        torch.abs(reflectivity_residual.detach()) + config.minimum_scale_fraction
+    )
+    reflectivity_scale_ratio = (
+        output["signed_reflectivity_scale"] / config.signed_reflectivity_scale
+    )
+    reflectivity_scale_huber = F.smooth_l1_loss(
+        torch.log(reflectivity_scale_ratio[support]),
+        torch.log(reflectivity_scale_target[support]),
+    )
+
+    state_target = targets["state_emission"].long()
+    represented = state_target[support]
+    counts = torch.bincount(represented, minlength=3).to(dtype=torch.float32)
+    present = counts > 0.0
+    class_weight = torch.zeros_like(counts)
+    class_weight[present] = counts[present].sum() / (
+        present.sum() * counts[present]
+    )
+    state_cross_entropy = F.cross_entropy(
+        output["state_logits"][support],
+        represented,
+        weight=class_weight,
+    )
+    total = (
+        increment_weight * increment_mean_huber
+        + reflectivity_weight * reflectivity_mean_huber
+        + state_weight * state_cross_entropy
+        + scale_weight * (increment_scale_huber + reflectivity_scale_huber)
+    )
     return {
         "loss": total,
-        "increment_nll": increment_nll,
-        "state_cross_entropy": state_ce,
-        "interface_bce": interface,
+        "increment_mean_huber": increment_mean_huber,
+        "increment_scale_huber": increment_scale_huber,
+        "reflectivity_mean_huber": reflectivity_mean_huber,
+        "reflectivity_scale_huber": reflectivity_scale_huber,
+        "state_cross_entropy": state_cross_entropy,
     }
 
 
 __all__ = [
-    "BandlimitedEvidenceNetwork",
+    "ObservableEvidenceNetwork",
     "EvidenceNetworkConfig",
-    "TuningTargets",
-    "build_tuning_targets",
+    "ObservableTargetProbe",
+    "ObservableTargets",
+    "build_observable_targets",
     "dominant_frequency_hz",
     "evidence_loss",
     "tuning_scale_on_model_axis",

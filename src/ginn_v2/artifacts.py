@@ -6,7 +6,6 @@ only and are never recomputed or compared as an admission condition.
 
 from __future__ import annotations
 
-import csv
 from dataclasses import dataclass, replace
 import json
 from pathlib import Path
@@ -28,7 +27,7 @@ from ginn_v2.augmentation import (
 from ginn_v2.contracts import ObservableTargetContract, ObservationTile
 from ginn_v2.evidence import build_observable_targets
 from ginn_v2.representation import build_lfm_anchor, lfm_residual_from_anchor
-from ginn_v2.semi_markov import SemiMarkovPrior
+from ginn_v2.semi_markov import SemiMarkovConditioning, SemiMarkovPrior
 
 
 CORPUS_MANIFEST_SCHEMA = "structured_synthetic_corpus_v2"
@@ -187,7 +186,15 @@ def iter_evidence_batches(
             )
     elif parent_limit is not None:
         selected = selected[:parent_limit]
+    index_by_parent = (
+        corpus.benchmark.index.set_index("realization_id", drop=False)
+    )
     for parent_id in selected:
+        if parent_id not in index_by_parent.index:
+            raise ValueError(f"canonical index cannot resolve parent {parent_id!r}.")
+        index_row = index_by_parent.loc[parent_id]
+        if getattr(index_row, "ndim", 1) != 1:
+            raise ValueError(f"canonical index contains duplicate parent {parent_id!r}.")
         parent = corpus.benchmark.read_parent(parent_id)
         for tile in parent_observation_tiles(corpus, parent_id):
             anchor = build_lfm_anchor(tile)
@@ -231,6 +238,7 @@ def iter_evidence_batches(
                 )
             yield {
                 "parent_id": parent_id,
+                "geometry_family": str(index_row["geometry_family"]),
                 "tile_id": tile.identity,
                 "condition": condition,
                 "seismic": training_tile.seismic[None].astype(np.float32),
@@ -278,78 +286,216 @@ def iter_paired_evidence_batches(
         yield dirty_batch
 
 
-def calibrate_semi_markov_prior(corpus: Corpus) -> SemiMarkovPrior:
-    """Calibrate an event-level zone-fraction prior from the canonical catalog.
+def iter_segment_profile_batches(
+    corpus: Corpus,
+    split: str,
+    *,
+    parent_limit: int | None = None,
+    parent_ids: Sequence[str] | None = None,
+) -> Iterator[Mapping[str, Any]]:
+    """Yield clean evidence batches with explicit high-resolution truth segments."""
 
-    The catalog contains one ordered geological event per parent and zone, so
-    this avoids loading the large HDF5 arrays for every training parent.  It is
-    still truth from training parents; lateral endpoint durations provide the
-    within-event duration variation.
+    cached_parent_id: str | None = None
+    parent = None
+    tile_by_identity: dict[str, ObservationTile] = {}
+    for source in iter_evidence_batches(
+        corpus,
+        split,
+        parent_limit=parent_limit,
+        parent_ids=parent_ids,
+    ):
+        parent_id = str(source["parent_id"])
+        if parent_id != cached_parent_id:
+            parent = corpus.benchmark.read_parent(parent_id)
+            tile_by_identity = {
+                tile.identity: tile
+                for tile in parent_observation_tiles(corpus, parent_id)
+            }
+            cached_parent_id = parent_id
+        if parent is None:
+            raise RuntimeError("segment profile parent cache is empty.")
+        tile_id = str(source["tile_id"])
+        if tile_id not in tile_by_identity:
+            raise ValueError("segment profile batch cannot resolve its observation tile.")
+        tile = tile_by_identity[tile_id]
+        zone_id = tile_id.rsplit(":", maxsplit=1)[-1]
+        anchor = build_lfm_anchor(tile)
+        truth_increment = parent.log_ai_highres - anchor.highres
+        truth_support = (
+            parent.truth_valid_highres
+            & anchor.highres_support
+            & np.isfinite(truth_increment)
+        )
+
+        trace_index: list[int] = []
+        state_id: list[int] = []
+        start_index: list[int] = []
+        stop_index: list[int] = []
+        duration_fraction: list[float] = []
+        clipping_fraction: list[float] = []
+        for row in parent.segments:
+            if str(row["zone_id"]) != zone_id or not bool(
+                row["segment_supervision_valid"]
+            ):
+                continue
+            trace = int(row["lateral_index"])
+            selected = (
+                truth_support[trace]
+                & (parent.zone_id_highres[trace] == int(row["zone_grid_value"]))
+                & (parent.object_id_highres[trace] == int(row["object_id"]))
+            )
+            indices = np.flatnonzero(selected)
+            if indices.size == 0:
+                continue
+            start = int(indices[0])
+            stop = int(indices[-1]) + 1
+            if indices.size != stop - start:
+                raise ValueError("truth segment support is not contiguous.")
+            trace_index.append(trace)
+            state_id.append(int(row["state_id"]))
+            start_index.append(start)
+            stop_index.append(stop)
+            duration_fraction.append(float(row["duration_fraction"]))
+            clipping_fraction.append(
+                float(np.mean(parent.clipping_mask_highres[trace, start:stop]))
+            )
+        if not trace_index:
+            raise ValueError("segment profile batch contains no supervised segments.")
+        result = dict(source)
+        result.update(
+            {
+                "observation_tile": tile,
+                "lfm_anchor_highres": anchor.highres,
+                "highres_log_ai_increment": truth_increment,
+                "highres_truth_support": truth_support,
+                "segment_trace_index": np.asarray(trace_index, dtype=np.int64),
+                "segment_state_id": np.asarray(state_id, dtype=np.int64),
+                "segment_start_index": np.asarray(start_index, dtype=np.int64),
+                "segment_stop_index": np.asarray(stop_index, dtype=np.int64),
+                "segment_duration_fraction": np.asarray(
+                    duration_fraction, dtype=np.float64
+                ),
+                "segment_clipping_fraction": np.asarray(
+                    clipping_fraction, dtype=np.float64
+                ),
+                "ai_velocity_relation": dict(
+                    parent.forward_context["ai_velocity_relation"] or {}
+                ),
+            }
+        )
+        yield result
+
+
+def load_semi_markov_contract(
+    directory: str | Path,
+) -> tuple[SemiMarkovPrior, SemiMarkovConditioning, Mapping[str, Any]]:
+    """Load the selected HSMM prior and conditioning from one publication."""
+
+    root = Path(directory)
+    prior_path = root / "semi_markov_prior.json"
+    calibration_path = root / "hsmm_calibration.json"
+    if not prior_path.is_file():
+        raise FileNotFoundError(prior_path)
+    if not calibration_path.is_file():
+        raise FileNotFoundError(calibration_path)
+    prior_payload = _read_json(prior_path)
+    calibration = _read_json(calibration_path)
+    if calibration.get("schema") not in {
+        "structured_ginn_v2_hsmm_calibration_v2",
+        "structured_ginn_v2_hsmm_calibration_v3",
+        "structured_ginn_v2_hsmm_calibration_v4",
+    } or calibration.get("status") != "success":
+        raise ValueError("HSMM calibration is not a successful V2/V3/V4 publication.")
+    selected = calibration.get("selected")
+    if not isinstance(selected, Mapping) or not isinstance(
+        selected.get("conditioning"), Mapping
+    ):
+        raise ValueError("HSMM calibration lacks selected conditioning.")
+    return (
+        SemiMarkovPrior.from_mapping(prior_payload),
+        SemiMarkovConditioning.from_mapping(selected["conditioning"]),
+        {
+            "schema": calibration["schema"],
+            "status": calibration["status"],
+            "split": calibration.get("split"),
+            "mode": calibration.get("mode"),
+            "selected_conditioning": dict(selected["conditioning"]),
+            "prior_path": str(prior_path),
+            "calibration_path": str(calibration_path),
+        },
+    )
+
+
+def calibrate_semi_markov_prior(
+    corpus: Corpus,
+    *,
+    parent_ids: Sequence[str],
+) -> SemiMarkovPrior:
+    """Calibrate the model-grid prior from trace-local training truth paths.
+
+    Birth, death, and model-grid coarsening can remove an intermediate event
+    on one trace and thereby create a same-state renewal.  The event catalog
+    cannot represent that local adjacency, so the prior is calibrated through
+    the same model-grid reader used by HSMM training and evaluation.
     """
 
-    catalog = corpus.root / "object_catalog.csv"
-    if not catalog.is_file():
-        raise FileNotFoundError(catalog)
-    training = set(corpus.splits["training"])
-    groups: dict[tuple[str, str], list[tuple[int, int, tuple[float, ...]]]] = {}
-    with catalog.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        required = {
-            "realization_id",
-            "zone_id",
-            "object_id",
-            "state_id",
-            "base_duration_fraction",
-            "duration_fraction_start",
-            "duration_fraction_end",
-        }
-        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
-            missing = sorted(required.difference(reader.fieldnames or ()))
-            raise ValueError(f"object catalog lacks semi-Markov fields: {missing}")
-        for row in reader:
-            parent_id = str(row["realization_id"])
-            if parent_id not in training:
-                continue
-            values: list[float] = []
-            for name in ("duration_fraction_start", "duration_fraction_end"):
-                text = str(row[name]).strip()
-                if text:
-                    value = float(text)
-                    if not np.isfinite(value) or value < 0.0:
-                        raise ValueError(
-                            "object catalog duration fractions must be finite "
-                            "and non-negative."
-                        )
-                    if value > 0.0:
-                        values.append(value)
-            if not values:
-                values.append(float(row["base_duration_fraction"]))
-            if any(not np.isfinite(value) or value <= 0.0 for value in values):
-                raise ValueError("object catalog duration fractions must be positive.")
-            key = (parent_id, str(row["zone_id"]))
-            groups.setdefault(key, []).append(
-                (
-                    int(row["object_id"]),
-                    int(row["state_id"]),
-                    tuple(values),
-                )
-            )
-    if not groups:
-        raise ValueError("object catalog contains no training events.")
-
+    selected = tuple(str(value) for value in parent_ids)
+    if not selected or len(set(selected)) != len(selected):
+        raise ValueError("semi-Markov prior parent_ids must be unique and non-empty.")
+    invalid = sorted(set(selected).difference(corpus.splits["training"]))
+    if invalid:
+        raise ValueError(
+            f"semi-Markov prior parents are outside training: {invalid[:5]}"
+        )
     initial = np.ones(3, dtype=np.float64)
     transition = np.ones((3, 3), dtype=np.float64)
     durations: list[list[float]] = [[], [], []]
-    for rows in groups.values():
-        ordered = sorted(rows, key=lambda row: row[0])
-        states = [row[1] for row in ordered]
-        if not states or any(state not in {0, 1, 2} for state in states):
-            raise ValueError("training event states must be 0, 1, or 2.")
-        initial[states[0]] += 1.0
-        for previous, current in zip(states[:-1], states[1:]):
-            transition[previous, current] += 1.0
-        for (_, state, values) in ordered:
-            durations[state].extend(values)
+    trace_count = 0
+    for source in iter_evidence_batches(
+        corpus,
+        "training",
+        parent_ids=selected,
+    ):
+        support = np.asarray(source["support"], dtype=bool)
+        state = np.asarray(source["state_emission"], dtype=np.int64)
+        object_id = np.asarray(source["truth_object_id"], dtype=np.int64)
+        if support.shape != state.shape or support.shape != object_id.shape:
+            raise ValueError("model-grid prior truth arrays must share one shape.")
+        if support.ndim != 3 or support.shape[0] != 1:
+            raise ValueError("model-grid prior expects one parent-zone per batch.")
+        for trace in range(support.shape[1]):
+            selected_indices = np.flatnonzero(support[0, trace])
+            if selected_indices.size == 0:
+                continue
+            if np.any(np.diff(selected_indices) != 1):
+                raise ValueError("model-grid prior zone support must be contiguous.")
+            local_state = state[0, trace, selected_indices]
+            local_object = object_id[0, trace, selected_indices]
+            if np.any((local_state < 0) | (local_state > 2)) or np.any(
+                local_object < 0
+            ):
+                raise ValueError("model-grid prior truth path is invalid.")
+            starts = np.r_[
+                0,
+                1 + np.flatnonzero(local_object[1:] != local_object[:-1]),
+            ]
+            stops = np.r_[starts[1:], local_state.size]
+            states: list[int] = []
+            for start, stop in zip(starts, stops, strict=True):
+                local = local_state[start:stop]
+                if np.any(local != local[0]):
+                    raise ValueError("one model-grid truth object has multiple states.")
+                state_id = int(local[0])
+                states.append(state_id)
+                durations[state_id].append(
+                    float((stop - start) / local_state.size)
+                )
+            initial[states[0]] += 1.0
+            for previous, current in zip(states[:-1], states[1:]):
+                transition[previous, current] += 1.0
+            trace_count += 1
+    if trace_count == 0:
+        raise ValueError("semi-Markov prior calibration has no supported traces.")
     if any(not values for values in durations):
         raise ValueError("training corpus does not cover every state duration.")
     return SemiMarkovPrior(
@@ -471,6 +617,7 @@ def save_section_prediction(
         "evidence_support": prediction.evidence.support,
         "ensemble_highres_mean": prediction.summary.log_ai_highres_mean,
         "ensemble_highres_std": prediction.summary.log_ai_highres_std,
+        "ensemble_projected_support": prediction.summary.projected_support,
         "representative_highres_log_ai": prediction.representative.log_ai_highres,
         "representative_projected_log_ai": (
             prediction.representative.projected_log_ai
@@ -514,12 +661,14 @@ __all__ = [
     "CORPUS_MANIFEST_SCHEMA",
     "Corpus",
     "load_checkpoint",
+    "load_semi_markov_contract",
     "load_observable_target_contract",
     "public_checkpoint_metadata",
     "load_corpus",
     "calibrate_semi_markov_prior",
     "iter_evidence_batches",
     "iter_paired_evidence_batches",
+    "iter_segment_profile_batches",
     "parent_observation_tiles",
     "save_section_prediction",
     "save_checkpoint",

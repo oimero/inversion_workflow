@@ -242,6 +242,7 @@ class ObservableEvidence:
     model_axis: SampleAxis
     highres_axis: SampleAxis
     background_lfm_linear: np.ndarray
+    background_lfm_linear_highres: np.ndarray
     projected_log_ai_increment_mean: np.ndarray
     projected_log_ai_increment_scale: np.ndarray
     signed_reflectivity_mean: np.ndarray
@@ -249,9 +250,11 @@ class ObservableEvidence:
     state_log_potential: np.ndarray
     local_tuning_scale: np.ndarray
     support: np.ndarray
+    highres_support: np.ndarray
     lateral_m: np.ndarray
     x_m: np.ndarray | None = None
     y_m: np.ndarray | None = None
+    identity: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_axis, SampleAxis) or not isinstance(
@@ -291,6 +294,12 @@ class ObservableEvidence:
             ndim=2,
             name="background_lfm_linear",
         )
+        background_highres = _array(
+            self.background_lfm_linear_highres,
+            dtype=np.float64,
+            ndim=2,
+            name="background_lfm_linear_highres",
+        )
         scale = _array(
             self.projected_log_ai_increment_scale,
             dtype=np.float64,
@@ -316,6 +325,12 @@ class ObservableEvidence:
             name="local_tuning_scale",
         )
         support = _array(self.support, dtype=bool, ndim=2, name="support")
+        highres_support = _array(
+            self.highres_support,
+            dtype=bool,
+            ndim=2,
+            name="highres_support",
+        )
         state_log_potential = _array(
             self.state_log_potential,
             dtype=np.float64,
@@ -337,6 +352,18 @@ class ObservableEvidence:
         if state_log_potential.shape != shape + (3,):
             raise InputContractError(
                 "state_log_potential must have shape [lateral, sample, 3]."
+            )
+        highres_shape = (shape[0], self.highres_axis.coordinates.size)
+        if (
+            background_highres.shape != highres_shape
+            or highres_support.shape != highres_shape
+        ):
+            raise InputContractError(
+                "high-resolution anchor/support must be [lateral, highres_sample]."
+            )
+        if np.any(highres_support & ~np.isfinite(background_highres)):
+            raise InputContractError(
+                "supported high-resolution LFM anchor must be finite."
             )
         if np.any(support & ~np.isfinite(mean)) or np.any(
             support & (~np.isfinite(scale) | (scale <= 0.0))
@@ -375,8 +402,14 @@ class ObservableEvidence:
             parsed_coordinates.append(parsed)
         if (parsed_coordinates[0] is None) != (parsed_coordinates[1] is None):
             raise InputContractError("x_m and y_m must both be present or absent.")
+        identity = str(self.identity).strip()
+        if not identity:
+            raise InputContractError("observable evidence identity must be non-empty.")
 
         object.__setattr__(self, "background_lfm_linear", background)
+        object.__setattr__(
+            self, "background_lfm_linear_highres", background_highres
+        )
         object.__setattr__(self, "projected_log_ai_increment_mean", mean)
         object.__setattr__(self, "projected_log_ai_increment_scale", scale)
         object.__setattr__(self, "signed_reflectivity_mean", reflectivity)
@@ -384,9 +417,102 @@ class ObservableEvidence:
         object.__setattr__(self, "state_log_potential", state_log_potential)
         object.__setattr__(self, "local_tuning_scale", tuning)
         object.__setattr__(self, "support", support)
+        object.__setattr__(self, "highres_support", highres_support)
         object.__setattr__(self, "lateral_m", lateral)
         object.__setattr__(self, "x_m", parsed_coordinates[0])
         object.__setattr__(self, "y_m", parsed_coordinates[1])
+        object.__setattr__(self, "identity", identity)
+
+
+@dataclass(frozen=True)
+class SegmentExtent:
+    """One externally supplied high-resolution segment extent."""
+
+    trace_index: int
+    state_id: int
+    start_index: int
+    stop_index: int
+    duration_fraction: float
+
+    def __post_init__(self) -> None:
+        if self.trace_index < 0:
+            raise InputContractError("segment trace_index cannot be negative.")
+        if self.state_id not in {0, 1, 2}:
+            raise InputContractError("segment state_id must be 0, 1, or 2.")
+        if self.start_index < 0 or self.stop_index <= self.start_index:
+            raise InputContractError("segment extent must be non-empty and ordered.")
+        if (
+            not np.isfinite(self.duration_fraction)
+            or self.duration_fraction <= 0.0
+            or self.duration_fraction > 1.0
+        ):
+            raise InputContractError(
+                "segment duration_fraction must be finite in (0, 1]."
+            )
+
+
+@dataclass(frozen=True)
+class CoefficientVarianceCalibration:
+    """Post-hoc diagonal scale temperature for c0/c1/c2 sampling."""
+
+    SCHEMA = "structured_ginn_v2_coefficient_variance_calibration_v1"
+
+    temperature: tuple[float, float, float]
+
+    def __post_init__(self) -> None:
+        values = np.asarray(self.temperature, dtype=np.float64)
+        if values.shape != (3,) or np.any(~np.isfinite(values)) or np.any(values <= 0.0):
+            raise InputContractError(
+                "coefficient variance temperatures must be three finite positive values."
+            )
+        object.__setattr__(self, "temperature", tuple(float(value) for value in values))
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema": self.SCHEMA,
+            "temperature": list(self.temperature),
+        }
+
+    @classmethod
+    def from_mapping(
+        cls, value: Mapping[str, Any]
+    ) -> "CoefficientVarianceCalibration":
+        if value.get("schema") != cls.SCHEMA:
+            raise InputContractError(
+                "unsupported coefficient variance calibration schema."
+            )
+        temperature = tuple(value.get("temperature") or ())
+        if len(temperature) != 3:
+            raise InputContractError(
+                "coefficient variance calibration requires c0/c1/c2 temperatures."
+            )
+        return cls(temperature=temperature)
+
+
+@dataclass(frozen=True)
+class SegmentParameterDistribution:
+    """Diagonal coefficient distribution for one supplied segment extent."""
+
+    extent: SegmentExtent
+    mean: tuple[float, float, float]
+    scale: tuple[float, float, float]
+    parameter_identifiability_rank: int
+    parameter_basis_condition: float
+
+    def __post_init__(self) -> None:
+        mean = np.asarray(self.mean, dtype=np.float64)
+        scale = np.asarray(self.scale, dtype=np.float64)
+        if mean.shape != (3,) or scale.shape != (3,):
+            raise InputContractError("segment parameter mean/scale must have length 3.")
+        if np.any(~np.isfinite(mean)) or np.any(~np.isfinite(scale)) or np.any(scale <= 0.0):
+            raise NumericalFailure("segment parameter distribution must be finite.")
+        if self.parameter_identifiability_rank not in {1, 2, 3}:
+            raise InputContractError("parameter identifiability rank must be 1, 2, or 3.")
+        if (
+            not np.isfinite(self.parameter_basis_condition)
+            and not np.isinf(self.parameter_basis_condition)
+        ) or self.parameter_basis_condition <= 0.0:
+            raise InputContractError("parameter basis condition must be positive.")
 
 
 @dataclass(frozen=True)
@@ -417,6 +543,7 @@ class EnsembleSummary:
     log_ai_highres_std: np.ndarray
     projected_log_ai_mean: np.ndarray
     projected_log_ai_std: np.ndarray
+    projected_support: np.ndarray
     state_occupancy_highres: np.ndarray
     interface_density_highres: np.ndarray
     segment_count_mean: np.ndarray
@@ -466,6 +593,7 @@ class VolumeInferenceResult:
 
 
 __all__ = [
+    "CoefficientVarianceCalibration",
     "DomainMismatchError",
     "EnsembleSummary",
     "GenerationPolicy",
@@ -475,6 +603,8 @@ __all__ = [
     "ObservableTargetContract",
     "ObservationTile",
     "Segment",
+    "SegmentExtent",
+    "SegmentParameterDistribution",
     "StructuredPrediction",
     "StructuredRealization",
     "VolumeInferenceResult",

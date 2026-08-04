@@ -86,6 +86,24 @@ def fuse_directional_evidence(
         inline.background_lfm_linear,
         xline.background_lfm_linear,
     )
+    highres_support_count = (
+        inline.highres_support.astype(np.float64)
+        + xline.highres_support.astype(np.float64)
+    )
+    highres_support = highres_support_count > 0.0
+    background_highres = (
+        np.where(
+            inline.highres_support,
+            inline.background_lfm_linear_highres,
+            0.0,
+        )
+        + np.where(
+            xline.highres_support,
+            xline.background_lfm_linear_highres,
+            0.0,
+        )
+    ) / np.maximum(highres_support_count, 1.0)
+    background_highres[~highres_support] = np.nan
     state_log_potential = average(
         inline.state_log_potential,
         xline.state_log_potential,
@@ -100,6 +118,7 @@ def fuse_directional_evidence(
         model_axis=inline.model_axis,
         highres_axis=inline.highres_axis,
         background_lfm_linear=background,
+        background_lfm_linear_highres=background_highres,
         projected_log_ai_increment_mean=increment_mean,
         projected_log_ai_increment_scale=increment_scale,
         signed_reflectivity_mean=reflectivity_mean,
@@ -107,9 +126,11 @@ def fuse_directional_evidence(
         state_log_potential=state_log_potential,
         local_tuning_scale=tuning,
         support=support,
+        highres_support=highres_support,
         lateral_m=inline.lateral_m,
         x_m=inline.x_m,
         y_m=inline.y_m,
+        identity=f"fused:{inline.identity}|{xline.identity}",
     )
 
 
@@ -126,6 +147,9 @@ def _center_evidence(
         model_axis=evidence.model_axis,
         highres_axis=evidence.highres_axis,
         background_lfm_linear=evidence.background_lfm_linear[selection],
+        background_lfm_linear_highres=(
+            evidence.background_lfm_linear_highres[selection]
+        ),
         projected_log_ai_increment_mean=(
             evidence.projected_log_ai_increment_mean[selection]
         ),
@@ -137,9 +161,11 @@ def _center_evidence(
         state_log_potential=evidence.state_log_potential[selection],
         local_tuning_scale=evidence.local_tuning_scale[selection],
         support=evidence.support[selection],
+        highres_support=evidence.highres_support[selection],
         lateral_m=np.asarray([0.0], dtype=np.float64),
         x_m=None if evidence.x_m is None else evidence.x_m[selection],
         y_m=None if evidence.y_m is None else evidence.y_m[selection],
+        identity=evidence.identity,
     )
 
 
@@ -225,7 +251,7 @@ def infer_volume(
         )
         if prediction.realizations is None:
             raise RuntimeError("first volume pass did not retain ensemble members.")
-        support = prediction.evidence.support
+        support = prediction.summary.projected_support
         count = int(np.count_nonzero(support))
         if count == 0:
             raise ValueError(f"volume tile {identity!r} has no supported samples.")
@@ -234,7 +260,12 @@ def infer_volume(
                 np.sum(
                     (
                         member.projected_log_ai[support]
-                        - prediction.summary.projected_log_ai_mean[support]
+                        - (
+                            prediction.evidence.background_lfm_linear[support]
+                            + prediction.evidence.projected_log_ai_increment_mean[
+                                support
+                            ]
+                        )
                     )
                     ** 2
                 )

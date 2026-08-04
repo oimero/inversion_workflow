@@ -130,6 +130,10 @@ training/tuning/calibration 按 parent 原子划分为 1680/360/360，section pa
 `observable_target_contract.json`。正式 evidence 训练只接受该合同声明的三个目标与全局
 尺度；checkpoint schema 为 V3。
 
+当前 V3 evidence checkpoint 保持可读取。接入 segment profile head 后 generator payload
+升级为 V4；V4 只新增 profile head 配置、权重和 feature normalization，不复制 evidence
+网络或另建诊断 checkpoint 体系。
+
 ## 5. 阶段 1：合成监督条件生成器
 
 阶段 1 最多分三步。每一步都先使用廉价探针，再决定是否进入正式训练。
@@ -276,8 +280,9 @@ structured_ginn_v2.py train \
 epoch 发布 epoch checkpoint、`last.pt` 和当前 `best.pt`。统一 evaluator 同时报告
 full、no-seismic、matched within-parent shuffle、full-LFM 和 zone-linear anchor。
 
-当前 `ConditionalGenerator.observe()` 已发布 `ObservableEvidence`；`realize()` 在第二步
-HSMM 合同落地前明确暂停，防止将 signed reflectivity 临时转换成未经审计的微边界概率。
+`ConditionalGenerator.observe()` 发布 `ObservableEvidence`；`realize()` 消费冻结的
+HSMM、profile head 和 coefficient variance 合同，生成完整结构化 ensemble。signed
+reflectivity 不被临时转换成未经审计的微边界概率。
 
 正式单道门禁以少数主指标固定：
 
@@ -307,9 +312,11 @@ HSMM 与 profile generator 只消费公开 `ObservableEvidence`：
 head 只有在新的 target audit 证明可观测增量后才能进入 interface。相邻 segment 允许
 state 相同，一次 posterior recursion 支持默认 `K=16` 的 backward sampling。
 
-参数 head 使用 truth segments 和合法 boundary jitter 训练，并显式接收 state、duration、
-extent 和公开 evidence。推理时在 sampled segments 上参数化。decoder 同时产生
-high-resolution 和 projected AI；`c0/c1/c2` 是 prior-selected latent。
+参数 head 显式接收 state、duration、extent 和公开 evidence。第一道廉价门禁只使用 truth
+segments，并冻结 evidence 网络；它不让梯度穿过 segmentation，也不把 truth segment 信息
+泄漏进 evidence head。只有这道门禁通过后才加入合法 boundary jitter，推理时则在 sampled
+segments 上参数化。decoder 同时产生 high-resolution 和 projected AI；`c0/c1/c2` 是
+prior-selected latent。
 
 第二步先运行短 truth-substitution：
 
@@ -329,22 +336,25 @@ structured_ginn_v2.py evaluate-hsmm \
   --checkpoint .../generator.pt \
   --output-dir ... \
   --split tuning \
-  --parents-per-family 4 [--smoke]
+  --parents-per-family 4 \
+  --prior-parents-per-family 32 [--smoke]
 ```
 
-该命令从 training parents 的 canonical object catalog 标定 zone-fraction transition/duration
-prior；formal 固定抽取 none、wedge、pinchout 各 4 个 parents，smoke 各取 1 个。网络证据
-只前向一次。随后扫描 `state_evidence_weight = 0.5/1/2/4`、
-`duration_temperature = 0.5/1/2` 和 `transition_temperature = 1/2/4` 的 36 个组合。
-候选阶段使用每个 parent-zone 中具有完整上下文的中央 5 道，只运行 Viterbi；所选组合
-再在全部道上运行完整 posterior recursion 与 marginals。报告同时标记所选值是否落在
-搜索边界，供后续判断是否需要扩展范围。
+该命令从每类 32 个 training parents 的 trace-local model-grid truth path 标定
+zone-fraction transition/duration prior。birth/death、pinchout 和 model-grid coarsening 删除
+中间事件后形成的 same-state renewal 因而进入 transition prior；event catalog 不承担局部
+trace adjacency 的统计。formal 固定抽取 none、wedge、pinchout 各 4 个 tuning parents，
+smoke 各取 1 个。网络证据
+只前向一次。随后扫描 `state_evidence_weight = 0.25/0.5/1/2/4`、
+`duration_temperature = 0.25/0.5/1/2` 和
+`transition_temperature = 0.5/1/2/4` 的 80 个组合。候选阶段使用每个
+parent-zone 中具有完整上下文的中央 5 道，并对每个候选运行 exact posterior marginals；
+所选组合再在全部道上运行完整 Oracle。报告同时标记所选值是否落在搜索边界。
 
-固定基线为 `(1, 1, 1)`。候选必须同时满足：state balanced accuracy 不低于基线、MAP
-segment-count bias 的绝对值不大于基线、truth-amplitude profile RMSE 不大于基线。合格
-候选中，profile RMSE 位于最优值 `max(1%, 1e-5)` 容差内视为实际等价；再保留
-segment-count bias 绝对值距最优值不超过 `0.25` 段的候选，最终选择 balanced accuracy
-最高者。没有其他合格候选时保留基线。这一选择只校准公开证据与已标定 prior 的相对强度。
+固定基线为 `(1, 1, 1)`。MAP balanced accuracy、MAP segment-count bias 和
+truth-amplitude profile RMSE 只作为防止退化的 guard；候选的主要选择分数由 state Brier、
+renewal Brier 和 posterior expected segment-count bias 组成。这样 calibration 直接服务于
+K-member sampling，不再用 MAP accuracy 代替 posterior calibration。
 
 命令发布 `semi_markov_prior.json`、`hsmm_calibration.json` 和所选组合对应的
 `hsmm_oracle.json`。Oracle 在 model grid 上复用同一个 exact HSMM，并报告：
@@ -359,9 +369,173 @@ renewal observation likelihood 固定为中性的 `0.5`。此时每条完整路�
 reflectivity 保留给后续 learned segment parameter head；它不会被临时转换成 micro-boundary
 likelihood。Oracle 中的 segment-wise 三参数拟合是参数 head 之前的确定性上限诊断。
 
-exact HSMM 当前同时发布全局 MAP、state marginal、renewal marginal 和 same-state renewal
-marginal；一次 forward recursion 继续支持后续 K 次 backward sampling。`realize()` 在 learned
-segment parameter head 和 high-resolution decoder 接入后发布完整 `StructuredPrediction`。
+formal truth-substitution 已把瓶颈定位到 profile amplitude：所选 HSMM 的 MAP segment
+count 与 truth 基本一致；predicted-state + truth-amplitude 明显优于使用 predicted-amplitude
+的组合。因此 profile 路线优先于继续搜索微边界精度。
+
+profile head 使用 LFM-relative high-resolution truth。每个 segment 按 decoder 的实际离散
+basis 发布 rank 和 condition number，并把完整 profile 压缩成 Gram、cross 与平方均值三个
+充分统计量：
+
+- 所有 supervision-valid segment 进入 decoded profile likelihood；
+- 仅 rank=3、condition 不大于 100 且未 clipping 的 segment 进入单系数 likelihood；
+- rank=1/2 或病态 segment 不进入 `c0/c1/c2` correlation、NLL 和 coverage 门禁；
+- evidence 网络冻结，head 只消费公开 increment、reflectivity、state occupancy、state、
+  duration、extent 和预测 scale。
+
+固定比较三种方法：
+
+```text
+segment 内 deterministic evidence fit
+training truth 标定的 state-conditioned parameter prior
+learned segment/profile head
+```
+
+正式命令为：
+
+```text
+structured_ginn_v2.py train-profiles \
+  --corpus ... \
+  --checkpoint .../generator.pt \
+  --output-dir ... [--smoke]
+```
+
+命令每个 epoch 发布 `last.pt` 和当前 `best.pt`，结束后发布 V4 `generator.pt`、
+`profile_prior.json` 和 `profile_evaluation.json`。smoke 只验证数据、训练、V3→V4 checkpoint
+和推理 interface。正式科学门禁要求 learned profile RMSE 同时低于 deterministic fit 和
+state-conditioned prior；只胜过其中一个不算通过。未通过时不把 learned head接入 ensemble，
+而是根据最强 baseline 判断公开 evidence pooling 是否仍有增量空间。
+
+当前 formal profile gate 使用 384 个 training parents、96 个 tuning parents 和 150509 个
+training segments。learned profile RMSE 为 `0.05206`，优于 state-conditioned prior 的
+`0.06555` 和 deterministic fit 的 `0.09943`；V4 head 因此保留。该结果是在 truth state
+与 truth extent 条件下成立，不能替代完整 MAP reconstruction。
+
+第一次完整 MAP reconstruction 通过同一个 CLI 实现：
+
+```text
+structured_ginn_v2.py evaluate-reconstruction \
+  --corpus ... \
+  --checkpoint .../generator.pt \
+  --hsmm-contract-dir .../stage1_hsmm_calibration \
+  --output-dir ... \
+  --split calibration \
+  --parents-per-family 4 [--smoke]
+```
+
+该命令固定执行：
+
+```text
+ObservableEvidence
+→ selected HSMM MAP path
+→ model-grid endpoint midpoint mapping
+→ high-resolution SegmentExtent
+→ V4 profile parameterization
+→ LFM-anchored high-resolution decoder
+→ parent 内全部 zone 合并
+→ complete-support finite projection
+```
+
+model-grid 内部端点映射到相邻样点中心的中点；zone 首末端点扩展到完整
+high-resolution zone support。projection 只评价 FIR 窗口完全落入已重建 zone union 的
+model samples，避免用零填充或 truth halo制造边缘假象。
+
+固定对照包括 deterministic evidence fit、state-conditioned prior、anchor-only、直接
+bandlimited evidence，以及两个定位用 Oracle：同一 MAP extent 替换为 truth-majority state，
+和同一 calibration parents 的 truth-segment profile control。正式门禁要求 learned MAP
+同时改善 high-resolution 与 projected log-AI 的最强非 Oracle baseline；失败时由两个
+Oracle 对照区分 state 错误、extent 分布偏移和 profile head 本身失效。
+
+当前 12-parent calibration 结果中，truth-segment learned profile RMSE 为 `0.05257`，但
+完整 MAP high-resolution RMSE 为 `0.09957`，弱于 deterministic MAP 的 `0.08357`；
+truth-majority state 可将 learned MAP 改善到 `0.08948`。projected learned RMSE 为
+`0.06948`，也弱于 deterministic MAP 的 `0.05673` 和 direct evidence 的 `0.05603`。
+因此 teacher-forced profile 成绩不能直接进入 ensemble；瓶颈同时包含 state 错误以及
+MAP extent 相对 truth extent 的分布偏移。
+
+固定 MAP profile 探针通过统一 CLI 运行：
+
+```text
+structured_ginn_v2.py probe-map-profiles \
+  --corpus ... \
+  --checkpoint .../segment_profiles/generator.pt \
+  --hsmm-contract-dir .../stage1_hsmm_calibration \
+  --output-dir ... [--smoke]
+```
+
+探针冻结 evidence network 和所选 HSMM，先在 training parents 上生成固定 MAP extents，
+再创建一个零残差 profile head。初始均值严格等于 deterministic evidence fit；优化目标
+直接由完整 LFM-anchored high-resolution log-AI 与 complete-support finite projection
+组成。truth-segment profile/可识别系数只提供弱的非负辅助损失，MAP segments 不执行
+predicted-to-truth split/merge matching，也不接受逐段系数 NLL。每个 epoch 发布 checkpoint，
+结束后在独立 calibration parents 上执行完整 MAP reconstruction。
+
+formal 默认使用每类 64/16/4 个 training/tuning/calibration parents、中央 5 道和 2 epochs。
+探针通过要求：learned high-resolution RMSE 低于 deterministic MAP；learned projected RMSE
+不高于 direct bandlimited evidence；任一 geometry family 不能在两个分辨率上同时退化。
+未通过时 K-member ensemble 使用 deterministic evidence fit，learned profile head 只作为
+失败审计产物；通过后再单独校准 sampled coefficient variance。
+
+coefficient variance 使用 calibration split 做闭式 post-hoc temperature calibration：
+
+```text
+structured_ginn_v2.py calibrate-profile-variance \
+  --corpus ... \
+  --checkpoint .../map_profile_probe/generator.pt \
+  --output-dir ... [--smoke]
+```
+
+该命令冻结 evidence、HSMM 和 coefficient mean。正式预算为每类 32 个 calibration parents
+及中央 5 道；只有 rank=3、condition 不大于 100 且未 clipping 的 truth segments 用于拟合
+三个全局正 temperature。每个 temperature 是固定均值、对角 Gaussian coefficient NLL 的
+闭式最优解，使对应 standardized coefficient residual 的 RMS 为 1。报告同时发布校准前后
+50/80/95% coverage、Gaussian NLL 和按 state 分解；短段继续保留 prior-selected latent
+语义，不用于单系数校准。
+
+校准结果写入 V5 generator checkpoint，`parameterize_segments()` 返回乘过 temperature 的
+`c0/c1/c2` scale。该 scale 只表示给定 segment state/extent 后的系数不确定性；segment
+数量、state 和 boundary 的不确定性由 exact HSMM backward sampling 单独提供。校准过程
+不改变均值，也不重新运行优化 epoch。geometry holdout 负责后续 ensemble coverage 的独立
+最终门禁。
+
+校准后的 V5 checkpoint 通过以下命令接入冻结 HSMM 并评价完整 ensemble：
+
+```text
+structured_ginn_v2.py evaluate-ensemble \
+  --corpus ... \
+  --checkpoint .../coefficient_variance/generator.pt \
+  --hsmm-contract-dir .../hsmm_calibration \
+  --output-dir ... \
+  --split calibration \
+  --parents-per-family 4 \
+  --realization-count 16 \
+  --figures-per-family 2 [--smoke]
+```
+
+命令只通过 `ConditionalGenerator.realize()` 运行生成链。每条有效 trace 执行一次 exact
+posterior forward recursion，再执行 K 次 backward sampling；每个 sampled segment 从经过
+temperature 校准的 `c0/c1/c2` 分布取样。decoder 生成 high-resolution AI，并使用完整支持
+的有限 FIR 投影到 model grid。evaluator 先合并同一 parent 的全部 zone，再做一次有限支持
+投影，避免在内部 zone 接缝丢失样点。state occupancy、renewal、segment count 和 duration
+全部在 model grid 上与同尺度 truth 比较；raw high-resolution segment table 不作为
+model-grid HSMM 的 count target。报告发布 high-resolution/projected ensemble mean RMSE、
+代表解 RMSE、CRPS、50/80/95% coverage 及上述结构 posterior proper scores。
+
+`--figures-per-family N` 使用同一评估数据流为每个 geometry family 的前 N 个 parent
+发布横向连续性六联图：输入地震、high-resolution truth、固定 member、代表 member、
+ensemble mean，以及叠加代表 segment 起点的 ensemble standard deviation。固定 member
+和代表 member 是合法 realization；ensemble mean 只用于汇总，不作为结构化解释结果。
+
+命令同时发布 V6 generator checkpoint。V6 在 V5 上只增加冻结的 semi-Markov prior 与
+conditioning，推理时无需再次拼接实验目录。代表解按 projected AI 到 observable
+bandlimited evidence 的距离，从 K 个完整成员中整体选取；并列时选择 conditional score
+更高者。section/volume 的全局成员选择使用同一准则。
+
+exact HSMM 同时发布全局 MAP、state marginal、renewal marginal 和 same-state renewal
+marginal；K sampling 复用同一 forward table。`StructuredPrediction` 保存 realization
+identities、可选的完整 K members、ensemble summary、真实成员代表解和 recursion 诊断。
+最小 smoke 已验证 25 条有效 trace 对应 25 次 forward recursion 与 `25 × K` 次 backward
+sampling；smoke 的 K=2 coverage 只验证接口，不作为科学结论。
 
 正式门禁为：
 

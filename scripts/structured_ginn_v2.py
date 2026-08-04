@@ -19,9 +19,11 @@ from ginn_v2.artifacts import (
     calibrate_semi_markov_prior,
     iter_evidence_batches,
     iter_paired_evidence_batches,
+    iter_segment_profile_batches,
     load_observable_target_contract,
     load_checkpoint,
     load_corpus,
+    load_semi_markov_contract,
     public_checkpoint_metadata,
     save_checkpoint,
 )
@@ -31,15 +33,25 @@ from ginn_v2.evidence import (
     ObservableEvidenceNetwork,
     dominant_frequency_hz,
 )
-from ginn_v2.generator import ConditionalGenerator
+from ginn_v2.contracts import GenerationPolicy
+from ginn_v2.generator import ConditionalGenerator, SegmentProfileHeadConfig
 from ginn_v2.learning import (
+    CoefficientVarianceCalibrationConfig,
     LearningConfig,
+    MapProfileProbeConfig,
+    SegmentProfileLearningConfig,
     TargetAuditConfig,
     audit_observable_targets,
+    calibrate_coefficient_variance,
     calibrate_semi_markov_fusion,
     evaluate_generator,
+    evaluate_map_reconstruction,
+    evaluate_segment_profile_head,
+    evaluate_structured_ensemble,
     seed_training_random_streams,
     train_generator,
+    train_map_profile_probe,
+    train_segment_profile_head,
 )
 from ginn_v2.runtime import configure_training_logger, resolve_device
 
@@ -106,9 +118,80 @@ def parse_args() -> argparse.Namespace:
         help="fixed parent budget for each of none/wedge/pinchout",
     )
     hsmm.add_argument(
+        "--prior-parents-per-family",
+        type=int,
+        default=32,
+        help="training-parent budget per family for the model-grid HSMM prior",
+    )
+    hsmm.add_argument(
         "--smoke",
         action="store_true",
         help="evaluate one parent per geometry family",
+    )
+    profiles = subparsers.add_parser("train-profiles")
+    profiles.add_argument("--corpus", type=Path, required=True)
+    profiles.add_argument("--checkpoint", type=Path, required=True)
+    profiles.add_argument("--output-dir", type=Path, required=True)
+    profiles.add_argument(
+        "--smoke",
+        action="store_true",
+        help="train and evaluate on one parent per geometry family",
+    )
+    reconstruction = subparsers.add_parser("evaluate-reconstruction")
+    reconstruction.add_argument("--corpus", type=Path, required=True)
+    reconstruction.add_argument("--checkpoint", type=Path, required=True)
+    reconstruction.add_argument("--hsmm-contract-dir", type=Path, required=True)
+    reconstruction.add_argument("--output-dir", type=Path, required=True)
+    reconstruction.add_argument(
+        "--split", choices=("tuning", "calibration"), default="calibration"
+    )
+    reconstruction.add_argument("--parents-per-family", type=int, default=4)
+    reconstruction.add_argument(
+        "--smoke",
+        action="store_true",
+        help="evaluate one parent per geometry family",
+    )
+    map_profiles = subparsers.add_parser("probe-map-profiles")
+    map_profiles.add_argument("--corpus", type=Path, required=True)
+    map_profiles.add_argument("--checkpoint", type=Path, required=True)
+    map_profiles.add_argument("--hsmm-contract-dir", type=Path, required=True)
+    map_profiles.add_argument("--output-dir", type=Path, required=True)
+    map_profiles.add_argument(
+        "--smoke",
+        action="store_true",
+        help="exercise one training/tuning/calibration parent per geometry family",
+    )
+    variance = subparsers.add_parser("calibrate-profile-variance")
+    variance.add_argument("--corpus", type=Path, required=True)
+    variance.add_argument("--checkpoint", type=Path, required=True)
+    variance.add_argument("--output-dir", type=Path, required=True)
+    variance.add_argument(
+        "--smoke",
+        action="store_true",
+        help="calibrate on one parent per geometry family",
+    )
+    ensemble = subparsers.add_parser("evaluate-ensemble")
+    ensemble.add_argument("--corpus", type=Path, required=True)
+    ensemble.add_argument("--checkpoint", type=Path, required=True)
+    ensemble.add_argument("--hsmm-contract-dir", type=Path, required=True)
+    ensemble.add_argument("--output-dir", type=Path, required=True)
+    ensemble.add_argument(
+        "--split", choices=("tuning", "calibration"), default="calibration"
+    )
+    ensemble.add_argument("--parents-per-family", type=int, default=4)
+    ensemble.add_argument("--realization-count", type=int, default=16)
+    ensemble.add_argument("--random-identity", type=int, default=20260804)
+    ensemble.add_argument("--lateral-correlation-m", type=float, default=900.0)
+    ensemble.add_argument(
+        "--figures-per-family",
+        type=int,
+        default=0,
+        help="publish continuity cards for the first N parents in each geometry family",
+    )
+    ensemble.add_argument(
+        "--smoke",
+        action="store_true",
+        help="evaluate one parent per geometry family with K=2",
     )
     audit = subparsers.add_parser("audit-targets")
     audit.add_argument("--corpus", type=Path, required=True)
@@ -133,6 +216,10 @@ def _config(path: Path) -> dict:
         "network",
         "learning",
         "target_audit",
+        "profile_head",
+        "profile_learning",
+        "map_profile_probe",
+        "coefficient_variance_calibration",
         "augmentation_profile",
     }
     unknown = sorted(set(root).difference(allowed))
@@ -219,6 +306,616 @@ def main() -> None:
         report["runtime"] = runtime
         write_json(output / "target_audit.json", report)
         logger.info("observable target audit finished | status=%s", report["status"])
+        return
+    if args.command == "train-profiles":
+        generator, source_metadata = load_checkpoint(
+            resolve_relative_path(args.checkpoint, root=REPO_ROOT),
+            device=device,
+        )
+        if generator.network_config.input_mode != "full":
+            raise ValueError("segment profile training requires a full checkpoint.")
+        if generator.profile_head is not None:
+            raise ValueError("source checkpoint already contains a profile head.")
+        profile_config = SegmentProfileLearningConfig.from_mapping(
+            config.get("profile_learning") or {},
+            smoke=bool(args.smoke),
+        )
+        head_config = SegmentProfileHeadConfig.from_mapping(
+            config.get("profile_head") or {}
+        )
+        training_ids = _balanced_parent_ids(
+            corpus,
+            "training",
+            profile_config.training_parents_per_family,
+        )
+        tuning_ids = _balanced_parent_ids(
+            corpus,
+            "tuning",
+            profile_config.tuning_parents_per_family,
+        )
+        corpus_provenance = dict(
+            source_metadata.get("corpus_provenance") or {}
+        )
+        corpus_provenance.update(
+            {
+                "profile_training_parent_ids": list(training_ids),
+                "profile_tuning_parent_ids": list(tuning_ids),
+            }
+        )
+
+        def save_profile_epoch(
+            epoch: int,
+            current: ConditionalGenerator,
+            state: Mapping[str, Any],
+            is_best: bool,
+        ) -> None:
+            training_state = {
+                "schema": "structured_ginn_v2_segment_profile_training_v1",
+                "source_checkpoint_metadata": public_checkpoint_metadata(
+                    source_metadata
+                ),
+                **dict(state),
+            }
+            save_checkpoint(
+                output / "last.pt",
+                current,
+                training_state=training_state,
+                corpus_provenance=corpus_provenance,
+                overwrite=True,
+            )
+            if is_best:
+                save_checkpoint(
+                    output / "best.pt",
+                    current,
+                    training_state=training_state,
+                    corpus_provenance=corpus_provenance,
+                    overwrite=True,
+                )
+            logger.info(
+                "profile checkpoint saved | epoch=%d | best=%s",
+                epoch,
+                is_best,
+            )
+
+        result = train_segment_profile_head(
+            generator,
+            iter_segment_profile_batches(
+                corpus,
+                "training",
+                parent_ids=training_ids,
+            ),
+            iter_segment_profile_batches(
+                corpus,
+                "tuning",
+                parent_ids=tuning_ids,
+            ),
+            head_config=head_config,
+            config=profile_config,
+            logger=logger,
+            checkpoint_callback=save_profile_epoch,
+        )
+        best_generator, best_metadata = load_checkpoint(
+            output / "best.pt",
+            device=device,
+        )
+        evaluation = evaluate_segment_profile_head(
+            best_generator,
+            iter_segment_profile_batches(
+                corpus,
+                "tuning",
+                parent_ids=tuning_ids,
+            ),
+            prior=result["profile_prior"],
+            config=profile_config,
+            logger=logger,
+        )
+        evaluation.update(
+            {
+                "mode": "smoke" if args.smoke else "formal",
+                "runtime": runtime,
+                "checkpoint_metadata": public_checkpoint_metadata(best_metadata),
+                "training_parent_ids": list(training_ids),
+                "tuning_parent_ids": list(tuning_ids),
+            }
+        )
+        write_json(output / "profile_prior.json", result["profile_prior"])
+        write_json(output / "profile_evaluation.json", evaluation)
+        save_checkpoint(
+            output / "generator.pt",
+            best_generator,
+            training_state=best_metadata["training_state"],
+            corpus_provenance=best_metadata["corpus_provenance"],
+        )
+        write_json(
+            output / "run_summary.json",
+            {
+                "schema": "structured_ginn_v2_segment_profile_run_v1",
+                "status": "success",
+                "mode": "smoke" if args.smoke else "formal",
+                "runtime": runtime,
+                "profile_head_config": asdict(head_config),
+                "profile_learning_config": asdict(profile_config),
+                **result,
+                "evaluation": {
+                    "learned_beats_deterministic": evaluation[
+                        "learned_beats_deterministic"
+                    ],
+                    "learned_beats_state_conditioned_prior": evaluation[
+                        "learned_beats_state_conditioned_prior"
+                    ],
+                    "learned_beats_strongest_baseline": evaluation[
+                        "learned_beats_strongest_baseline"
+                    ],
+                    "learned_minus_deterministic_profile_rmse": evaluation[
+                        "learned_minus_deterministic_profile_rmse"
+                    ],
+                    "learned_minus_state_conditioned_prior_profile_rmse": evaluation[
+                        "learned_minus_state_conditioned_prior_profile_rmse"
+                    ],
+                },
+            },
+        )
+        logger.info(
+            "segment profile training finished | best_epoch=%d | "
+            "learned_beats_strongest_baseline=%s",
+            result["best_epoch"],
+            evaluation["learned_beats_strongest_baseline"],
+        )
+        return
+    if args.command == "probe-map-profiles":
+        generator, source_metadata = load_checkpoint(
+            resolve_relative_path(args.checkpoint, root=REPO_ROOT),
+            device=device,
+        )
+        if generator.network_config.input_mode != "full":
+            raise ValueError("MAP profile probe requires a full checkpoint.")
+        if generator.profile_head is None:
+            raise ValueError("MAP profile probe requires a V4 profile checkpoint.")
+        source_training_state = dict(source_metadata.get("training_state") or {})
+        profile_prior = source_training_state.get("profile_prior")
+        if not isinstance(profile_prior, Mapping):
+            raise ValueError("profile checkpoint metadata lacks profile_prior.")
+        prior, conditioning, hsmm_metadata = load_semi_markov_contract(
+            resolve_relative_path(args.hsmm_contract_dir, root=REPO_ROOT)
+        )
+        probe_config = MapProfileProbeConfig.from_mapping(
+            config.get("map_profile_probe") or {},
+            smoke=bool(args.smoke),
+        )
+        head_config = SegmentProfileHeadConfig.from_mapping(
+            config.get("profile_head") or {}
+        )
+        training_ids = _balanced_parent_ids(
+            corpus,
+            "training",
+            probe_config.training_parents_per_family,
+        )
+        tuning_ids = _balanced_parent_ids(
+            corpus,
+            "tuning",
+            probe_config.tuning_parents_per_family,
+        )
+        calibration_ids = _balanced_parent_ids(
+            corpus,
+            "calibration",
+            probe_config.calibration_parents_per_family,
+        )
+        corpus_provenance = dict(source_metadata.get("corpus_provenance") or {})
+        corpus_provenance.update(
+            {
+                "map_profile_training_parent_ids": list(training_ids),
+                "map_profile_tuning_parent_ids": list(tuning_ids),
+                "map_profile_calibration_parent_ids": list(calibration_ids),
+            }
+        )
+
+        def save_map_profile_epoch(
+            epoch: int,
+            current: ConditionalGenerator,
+            state: Mapping[str, Any],
+            is_best: bool,
+        ) -> None:
+            training_state = {
+                "schema": "structured_ginn_v2_map_profile_probe_training_v1",
+                "source_checkpoint_metadata": public_checkpoint_metadata(
+                    source_metadata
+                ),
+                "profile_prior": dict(profile_prior),
+                "hsmm_contract": dict(hsmm_metadata),
+                **dict(state),
+            }
+            save_checkpoint(
+                output / f"epoch_{epoch:04d}.pt",
+                current,
+                training_state=training_state,
+                corpus_provenance=corpus_provenance,
+            )
+            save_checkpoint(
+                output / "last.pt",
+                current,
+                training_state=training_state,
+                corpus_provenance=corpus_provenance,
+                overwrite=True,
+            )
+            if is_best:
+                save_checkpoint(
+                    output / "best.pt",
+                    current,
+                    training_state=training_state,
+                    corpus_provenance=corpus_provenance,
+                    overwrite=True,
+                )
+            logger.info(
+                "MAP profile checkpoint saved | epoch=%d | best=%s",
+                epoch,
+                is_best,
+            )
+
+        logger.info(
+            "MAP profile probe start | training_parents=%d | tuning_parents=%d | "
+            "calibration_parents=%d",
+            len(training_ids),
+            len(tuning_ids),
+            len(calibration_ids),
+        )
+        training_result = train_map_profile_probe(
+            generator,
+            iter_segment_profile_batches(
+                corpus, "training", parent_ids=training_ids
+            ),
+            iter_segment_profile_batches(
+                corpus, "tuning", parent_ids=tuning_ids
+            ),
+            iter_segment_profile_batches(
+                corpus, "training", parent_ids=training_ids
+            ),
+            prior=prior,
+            conditioning=conditioning,
+            head_config=head_config,
+            config=probe_config,
+            logger=logger,
+            checkpoint_callback=save_map_profile_epoch,
+        )
+        best_generator, best_metadata = load_checkpoint(
+            output / "best.pt", device=device
+        )
+        reconstruction = evaluate_map_reconstruction(
+            best_generator,
+            iter_segment_profile_batches(
+                corpus, "calibration", parent_ids=calibration_ids
+            ),
+            prior=prior,
+            conditioning=conditioning,
+            profile_prior=profile_prior,
+            logger=logger,
+            log_every_parents=1 if args.smoke else 3,
+        )
+        aggregate = reconstruction["aggregate"]
+        highres = aggregate["highres_log_ai"]
+        projected = aggregate["projected_log_ai"]
+        family_regression: dict[str, bool] = {}
+        for family, row in reconstruction["by_geometry_family"].items():
+            family_highres = row["highres_log_ai"]
+            family_projected = row["projected_log_ai"]
+            family_regression[str(family)] = bool(
+                family_highres["learned_profile_head"]["rmse"]
+                > family_highres["deterministic_evidence_fit"]["rmse"]
+                and family_projected["learned_profile_head"]["rmse"]
+                > family_projected["direct_bandlimited_evidence"]["rmse"]
+            )
+        gate = {
+            "learned_beats_deterministic_highres": bool(
+                highres["learned_profile_head"]["rmse"]
+                < highres["deterministic_evidence_fit"]["rmse"]
+            ),
+            "learned_not_worse_than_direct_projected": bool(
+                projected["learned_profile_head"]["rmse"]
+                <= projected["direct_bandlimited_evidence"]["rmse"]
+            ),
+            "no_family_regresses_both_resolutions": bool(
+                not any(family_regression.values())
+            ),
+            "family_regresses_both_resolutions": family_regression,
+        }
+        gate["passed"] = bool(
+            gate["learned_beats_deterministic_highres"]
+            and gate["learned_not_worse_than_direct_projected"]
+            and gate["no_family_regresses_both_resolutions"]
+        )
+        reconstruction["map_profile_probe_gate"] = gate
+        write_json(output / "map_reconstruction.json", reconstruction)
+        save_checkpoint(
+            output / "generator.pt",
+            best_generator,
+            training_state=best_metadata["training_state"],
+            corpus_provenance=best_metadata["corpus_provenance"],
+        )
+        summary = {
+            **training_result,
+            "mode": "smoke" if args.smoke else "formal",
+            "runtime": runtime,
+            "map_profile_probe_config": asdict(probe_config),
+            "profile_head_config": asdict(head_config),
+            "training_parent_ids": list(training_ids),
+            "tuning_parent_ids": list(tuning_ids),
+            "calibration_parent_ids": list(calibration_ids),
+            "calibration_gate": gate,
+            "calibration_metrics": {
+                "learned_highres_rmse": highres["learned_profile_head"]["rmse"],
+                "deterministic_highres_rmse": highres[
+                    "deterministic_evidence_fit"
+                ]["rmse"],
+                "learned_projected_rmse": projected["learned_profile_head"][
+                    "rmse"
+                ],
+                "direct_projected_rmse": projected[
+                    "direct_bandlimited_evidence"
+                ]["rmse"],
+            },
+        }
+        write_json(output / "probe_summary.json", summary)
+        logger.info(
+            "MAP profile probe finished | best_epoch=%d | highres=%.6f vs %.6f | "
+            "projected=%.6f vs direct %.6f | gate=%s",
+            training_result["best_epoch"],
+            summary["calibration_metrics"]["learned_highres_rmse"],
+            summary["calibration_metrics"]["deterministic_highres_rmse"],
+            summary["calibration_metrics"]["learned_projected_rmse"],
+            summary["calibration_metrics"]["direct_projected_rmse"],
+            gate["passed"],
+        )
+        return
+    if args.command == "calibrate-profile-variance":
+        generator, source_metadata = load_checkpoint(
+            resolve_relative_path(args.checkpoint, root=REPO_ROOT),
+            device=device,
+        )
+        if generator.network_config.input_mode != "full":
+            raise ValueError("coefficient variance calibration requires a full checkpoint.")
+        if generator.profile_head is None:
+            raise ValueError("coefficient variance calibration requires a profile head.")
+        if generator.coefficient_variance_calibration is not None:
+            raise ValueError("source checkpoint already contains variance calibration.")
+        variance_config = CoefficientVarianceCalibrationConfig.from_mapping(
+            config.get("coefficient_variance_calibration") or {},
+            smoke=bool(args.smoke),
+        )
+        calibration_ids = _balanced_parent_ids(
+            corpus,
+            "calibration",
+            variance_config.parents_per_family,
+        )
+        logger.info(
+            "coefficient variance calibration start | parents=%d | per_family=%d",
+            len(calibration_ids),
+            variance_config.parents_per_family,
+        )
+        report = calibrate_coefficient_variance(
+            generator,
+            iter_segment_profile_batches(
+                corpus,
+                "calibration",
+                parent_ids=calibration_ids,
+            ),
+            config=variance_config,
+            logger=logger,
+        )
+        report.update(
+            {
+                "mode": "smoke" if args.smoke else "formal",
+                "runtime": runtime,
+                "config": asdict(variance_config),
+                "calibration_parent_ids": list(calibration_ids),
+                "source_checkpoint_metadata": public_checkpoint_metadata(
+                    source_metadata
+                ),
+            }
+        )
+        training_state = {
+            **dict(source_metadata.get("training_state") or {}),
+            "coefficient_variance_calibration": report["calibration"],
+            "coefficient_variance_calibration_config": asdict(variance_config),
+            "coefficient_variance_calibration_parent_ids": list(calibration_ids),
+        }
+        corpus_provenance = dict(source_metadata.get("corpus_provenance") or {})
+        corpus_provenance["coefficient_variance_calibration_parent_ids"] = list(
+            calibration_ids
+        )
+        save_checkpoint(
+            output / "generator.pt",
+            generator,
+            training_state=training_state,
+            corpus_provenance=corpus_provenance,
+        )
+        write_json(output / "coefficient_variance_calibration.json", report)
+        write_json(
+            output / "run_summary.json",
+            {
+                "schema": "structured_ginn_v2_coefficient_variance_run_v1",
+                "status": "success",
+                "mode": report["mode"],
+                "parent_count": report["parent_count"],
+                "identifiable_segment_count": report[
+                    "identifiable_segment_count"
+                ],
+                "calibration": report["calibration"],
+                "coverage_before": report["before"]["aggregate"],
+                "coverage_after": report["after"]["aggregate"],
+                "generator": str(output / "generator.pt"),
+            },
+        )
+        logger.info(
+            "coefficient variance calibration finished | generator=%s",
+            output / "generator.pt",
+        )
+        return
+    if args.command == "evaluate-reconstruction":
+        generator, metadata = load_checkpoint(
+            resolve_relative_path(args.checkpoint, root=REPO_ROOT),
+            device=device,
+        )
+        if generator.network_config.input_mode != "full":
+            raise ValueError("MAP reconstruction requires a full checkpoint.")
+        if generator.profile_head is None:
+            raise ValueError("MAP reconstruction requires a V4 profile checkpoint.")
+        training_state = dict(metadata.get("training_state") or {})
+        profile_prior = training_state.get("profile_prior")
+        if not isinstance(profile_prior, Mapping):
+            raise ValueError("profile checkpoint metadata lacks profile_prior.")
+        prior, conditioning, hsmm_metadata = load_semi_markov_contract(
+            resolve_relative_path(args.hsmm_contract_dir, root=REPO_ROOT)
+        )
+        per_family = 1 if args.smoke else int(args.parents_per_family)
+        parent_ids = _balanced_parent_ids(corpus, args.split, per_family)
+        logger.info(
+            "MAP reconstruction start | split=%s | parents=%d | per_family=%d",
+            args.split,
+            len(parent_ids),
+            per_family,
+        )
+        result = evaluate_map_reconstruction(
+            generator,
+            iter_segment_profile_batches(
+                corpus,
+                args.split,
+                parent_ids=parent_ids,
+            ),
+            prior=prior,
+            conditioning=conditioning,
+            profile_prior=profile_prior,
+            logger=logger,
+            log_every_parents=1 if args.smoke else 3,
+        )
+        profile_config = SegmentProfileLearningConfig.from_mapping(
+            config.get("profile_learning") or {},
+            smoke=bool(args.smoke),
+        )
+        result["truth_segment_profile_control"] = evaluate_segment_profile_head(
+            generator,
+            iter_segment_profile_batches(
+                corpus,
+                args.split,
+                parent_ids=parent_ids,
+            ),
+            prior=profile_prior,
+            config=profile_config,
+            logger=logger,
+        )
+        result.update(
+            {
+                "mode": "smoke" if args.smoke else "formal",
+                "split": args.split,
+                "parent_ids": list(parent_ids),
+                "runtime": runtime,
+                "checkpoint_metadata": public_checkpoint_metadata(metadata),
+                "hsmm_contract": dict(hsmm_metadata),
+            }
+        )
+        write_json(output / "map_reconstruction.json", result)
+        logger.info(
+            "MAP reconstruction finished | highres_rmse=%.6f | "
+            "projected_rmse=%.6f | beats_highres=%s | beats_projected=%s",
+            result["aggregate"]["highres_log_ai"]["learned_profile_head"]["rmse"],
+            result["aggregate"]["projected_log_ai"]["learned_profile_head"]["rmse"],
+            result["gate"]["learned_beats_strongest_highres_baseline"],
+            result["gate"]["learned_beats_strongest_projected_baseline"],
+        )
+        return
+    if args.command == "evaluate-ensemble":
+        generator, metadata = load_checkpoint(
+            resolve_relative_path(args.checkpoint, root=REPO_ROOT),
+            device=device,
+        )
+        if generator.network_config.input_mode != "full":
+            raise ValueError("ensemble evaluation requires a full checkpoint.")
+        if generator.profile_head is None:
+            raise ValueError("ensemble evaluation requires a profile head.")
+        if generator.coefficient_variance_calibration is None:
+            raise ValueError(
+                "ensemble evaluation requires calibrated coefficient variance."
+            )
+        if generator.semi_markov_prior is not None:
+            raise ValueError("source checkpoint already contains a semi-Markov contract.")
+        prior, conditioning, hsmm_metadata = load_semi_markov_contract(
+            resolve_relative_path(args.hsmm_contract_dir, root=REPO_ROOT)
+        )
+        generator.set_semi_markov_contract(prior, conditioning)
+        per_family = 1 if args.smoke else int(args.parents_per_family)
+        parent_ids = _balanced_parent_ids(corpus, args.split, per_family)
+        policy = GenerationPolicy(
+            realization_count=(2 if args.smoke else int(args.realization_count)),
+            random_identity=int(args.random_identity),
+            retain_realizations=True,
+            lateral_correlation_m=float(args.lateral_correlation_m),
+        )
+        logger.info(
+            "ensemble evaluation start | split=%s | parents=%d | K=%d",
+            args.split,
+            len(parent_ids),
+            policy.realization_count,
+        )
+        result = evaluate_structured_ensemble(
+            generator,
+            iter_segment_profile_batches(
+                corpus,
+                args.split,
+                parent_ids=parent_ids,
+            ),
+            policy=policy,
+            logger=logger,
+            log_every_zones=1 if args.smoke else 3,
+            figure_output_dir=output / "figures" / "ensemble",
+            figures_per_family=int(args.figures_per_family),
+        )
+        training_state = {
+            **dict(metadata.get("training_state") or {}),
+            "semi_markov_contract": dict(hsmm_metadata),
+            "ensemble_policy": asdict(policy),
+        }
+        corpus_provenance = dict(metadata.get("corpus_provenance") or {})
+        corpus_provenance["ensemble_evaluation_parent_ids"] = list(parent_ids)
+        checkpoint = save_checkpoint(
+            output / "generator.pt",
+            generator,
+            training_state=training_state,
+            runtime_state=metadata.get("runtime_state"),
+            corpus_provenance=corpus_provenance,
+        )
+        result.update(
+            {
+                "mode": "smoke" if args.smoke else "formal",
+                "split": args.split,
+                "parent_ids": list(parent_ids),
+                "runtime": runtime,
+                "source_checkpoint_metadata": public_checkpoint_metadata(metadata),
+                "hsmm_contract": dict(hsmm_metadata),
+                "generator": str(checkpoint),
+            }
+        )
+        write_json(output / "ensemble_evaluation.json", result)
+        write_json(
+            output / "run_summary.json",
+            {
+                "schema": "structured_ginn_v2_ensemble_run_v2",
+                "status": "success",
+                "mode": result["mode"],
+                "parent_count": result["aggregate"]["parent_count"],
+                "zone_count": result["aggregate"]["zone_count"],
+                "realization_count": policy.realization_count,
+                "highres_log_ai": result["aggregate"]["highres_log_ai"],
+                "projected_log_ai": result["aggregate"]["projected_log_ai"],
+                "figure_count": len(result["figures"]),
+                "figure_errors": result["figure_errors"],
+                "generator": str(checkpoint),
+            },
+        )
+        logger.info(
+            "ensemble evaluation finished | highres_rmse=%.6f | "
+            "projected_rmse=%.6f | highres_coverage95=%.4f",
+            result["aggregate"]["highres_log_ai"]["ensemble_mean_rmse"],
+            result["aggregate"]["projected_log_ai"]["ensemble_mean_rmse"],
+            result["aggregate"]["highres_log_ai"]["coverage_95"],
+        )
         return
     if args.command == "train":
         learning_config = LearningConfig(**dict(config.get("learning") or {}))
@@ -439,13 +1136,26 @@ def main() -> None:
             raise ValueError("HSMM oracle requires a full evidence checkpoint.")
         per_family = 1 if args.smoke else int(args.parents_per_family)
         parent_ids = _balanced_parent_ids(corpus, args.split, per_family)
+        prior_per_family = (
+            1 if args.smoke else int(args.prior_parents_per_family)
+        )
+        prior_parent_ids = _balanced_parent_ids(
+            corpus,
+            "training",
+            prior_per_family,
+        )
         logger.info(
-            "HSMM calibration start | split=%s | parents=%d | per_family=%d",
+            "HSMM calibration start | split=%s | parents=%d | per_family=%d | "
+            "prior_training_parents=%d",
             args.split,
             len(parent_ids),
             per_family,
+            len(prior_parent_ids),
         )
-        prior = calibrate_semi_markov_prior(corpus)
+        prior = calibrate_semi_markov_prior(
+            corpus,
+            parent_ids=prior_parent_ids,
+        )
         write_json(output / "semi_markov_prior.json", prior.to_mapping())
         result = calibrate_semi_markov_fusion(
             generator,
@@ -463,6 +1173,7 @@ def main() -> None:
             "split": args.split,
             "mode": "smoke" if args.smoke else "formal",
             "parent_ids": list(parent_ids),
+            "prior_training_parent_ids": list(prior_parent_ids),
             "checkpoint_metadata": public_checkpoint_metadata(metadata),
         }
         oracle = dict(result["oracle"])

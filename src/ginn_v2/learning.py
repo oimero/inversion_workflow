@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, replace as dataclass_replace
 from itertools import product
 import logging
 from pathlib import Path
@@ -17,6 +17,7 @@ from scipy.stats import wasserstein_distance
 from torch.nn import functional as F
 
 from cup.physics.numpy_backend import forward_depth, forward_time, velocity_from_ai
+from cup.synthetic.core.signal import finite_support_fir, valid_filter_decimate
 from cup.utils.io import write_json
 from ginn_v2.artifacts import Corpus, parent_observation_tiles
 from ginn_v2.evidence import (
@@ -24,16 +25,36 @@ from ginn_v2.evidence import (
     build_observable_targets,
     evidence_loss,
 )
-from ginn_v2.generator import ConditionalGenerator
+from ginn_v2.contracts import (
+    CoefficientVarianceCalibration,
+    GenerationPolicy,
+    ObservableEvidence,
+    ObservationTile,
+    Segment,
+    SegmentExtent,
+    StructuredPrediction,
+)
+from ginn_v2.generator import (
+    ConditionalGenerator,
+    SegmentProfileHead,
+    SegmentProfileHeadConfig,
+)
 from ginn_v2.representation import (
+    SEGMENT_PROFILE_FEATURES,
     build_lfm_anchor,
+    build_segment_profile_features,
+    decode_segments_numpy,
+    decode_segments_torch,
     fit_profile_coefficients,
     lfm_residual_from_anchor,
     profile_basis,
+    profile_sufficient_statistics,
+    project_supported_highres_to_model,
 )
 from ginn_v2.semi_markov import (
     SampledPath,
     SemiMarkovConditioning,
+    SemiMarkovMarginals,
     SemiMarkovPrior,
     exact_semi_markov_posterior,
     viterbi_semi_markov_path,
@@ -91,6 +112,182 @@ class LearningConfig:
                 raise ValueError(f"{name} must be finite and positive.")
         if not isinstance(self.random_seed, int) or not 0 <= self.random_seed < 2**32:
             raise ValueError("random_seed must be an integer in [0, 2**32).")
+
+
+@dataclass(frozen=True)
+class SegmentProfileLearningConfig:
+    epochs: int = 4
+    batch_size: int = 1024
+    learning_rate: float = 1.0e-3
+    weight_decay: float = 1.0e-4
+    gradient_clip_norm: float = 5.0
+    parameter_nll_weight: float = 0.25
+    identifiability_condition_max: float = 100.0
+    central_trace_count: int = 5
+    training_parents_per_family: int = 128
+    tuning_parents_per_family: int = 32
+    random_seed: int = 20260803
+
+    def __post_init__(self) -> None:
+        for name in (
+            "epochs",
+            "batch_size",
+            "central_trace_count",
+            "training_parents_per_family",
+            "tuning_parents_per_family",
+        ):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive.")
+        for name in (
+            "learning_rate",
+            "gradient_clip_norm",
+            "identifiability_condition_max",
+        ):
+            if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
+        if self.weight_decay < 0.0 or self.parameter_nll_weight < 0.0:
+            raise ValueError("profile optimizer weights cannot be negative.")
+        if self.central_trace_count % 2 == 0:
+            raise ValueError("central_trace_count must be odd.")
+        if not isinstance(self.random_seed, int) or not 0 <= self.random_seed < 2**32:
+            raise ValueError("random_seed must be an integer in [0, 2**32).")
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        smoke: bool = False,
+    ) -> "SegmentProfileLearningConfig":
+        allowed = {field.name for field in fields(cls)}
+        unknown = sorted(set(value).difference(allowed))
+        if unknown:
+            raise ValueError(f"unknown segment profile learning keys: {unknown}")
+        config = cls(**dict(value))
+        if not smoke:
+            return config
+        return dataclass_replace(
+            config,
+            epochs=1,
+            training_parents_per_family=1,
+            tuning_parents_per_family=1,
+        )
+
+
+@dataclass(frozen=True)
+class MapProfileProbeConfig:
+    """Small fixed-MAP probe for the segment-profile residual head."""
+
+    epochs: int = 2
+    parents_per_batch: int = 4
+    teacher_batch_size: int = 1024
+    learning_rate: float = 5.0e-4
+    weight_decay: float = 1.0e-4
+    gradient_clip_norm: float = 5.0
+    highres_weight: float = 1.0
+    projected_weight: float = 1.0
+    teacher_weight: float = 0.05
+    residual_weight: float = 0.01
+    central_trace_count: int = 5
+    training_parents_per_family: int = 64
+    tuning_parents_per_family: int = 16
+    calibration_parents_per_family: int = 4
+    identifiability_condition_max: float = 100.0
+    random_seed: int = 20260803
+
+    def __post_init__(self) -> None:
+        for name in (
+            "epochs",
+            "parents_per_batch",
+            "teacher_batch_size",
+            "central_trace_count",
+            "training_parents_per_family",
+            "tuning_parents_per_family",
+            "calibration_parents_per_family",
+        ):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive.")
+        for name in (
+            "learning_rate",
+            "gradient_clip_norm",
+            "highres_weight",
+            "projected_weight",
+            "identifiability_condition_max",
+        ):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
+        for name in ("weight_decay", "teacher_weight", "residual_weight"):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative.")
+        if self.central_trace_count % 2 == 0:
+            raise ValueError("central_trace_count must be odd.")
+        if not isinstance(self.random_seed, int) or not 0 <= self.random_seed < 2**32:
+            raise ValueError("random_seed must be an integer in [0, 2**32).")
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        smoke: bool = False,
+    ) -> "MapProfileProbeConfig":
+        allowed = {field.name for field in fields(cls)}
+        unknown = sorted(set(value).difference(allowed))
+        if unknown:
+            raise ValueError(f"unknown MAP profile probe keys: {unknown}")
+        config = cls(**dict(value))
+        if not smoke:
+            return config
+        return dataclass_replace(
+            config,
+            epochs=1,
+            parents_per_batch=1,
+            training_parents_per_family=1,
+            tuning_parents_per_family=1,
+            calibration_parents_per_family=1,
+        )
+
+
+@dataclass(frozen=True)
+class CoefficientVarianceCalibrationConfig:
+    parents_per_family: int = 32
+    batch_size: int = 2048
+    central_trace_count: int = 5
+    identifiability_condition_max: float = 100.0
+
+    def __post_init__(self) -> None:
+        for name in ("parents_per_family", "batch_size", "central_trace_count"):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive.")
+        if self.central_trace_count % 2 == 0:
+            raise ValueError("central_trace_count must be odd.")
+        if (
+            not np.isfinite(self.identifiability_condition_max)
+            or self.identifiability_condition_max <= 0.0
+        ):
+            raise ValueError(
+                "identifiability_condition_max must be finite and positive."
+            )
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        smoke: bool = False,
+    ) -> "CoefficientVarianceCalibrationConfig":
+        allowed = {field.name for field in fields(cls)}
+        unknown = sorted(set(value).difference(allowed))
+        if unknown:
+            raise ValueError(
+                f"unknown coefficient variance calibration keys: {unknown}"
+            )
+        config = cls(**dict(value))
+        if not smoke:
+            return config
+        return dataclass_replace(config, parents_per_family=1)
 
 
 @dataclass(frozen=True)
@@ -2695,12 +2892,16 @@ def evaluate_semi_markov_oracle(
 def _new_hsmm_calibration_statistics() -> dict[str, Any]:
     return {
         "sample_count": 0,
+        "renewal_sample_count": 0,
+        "state_brier": 0.0,
+        "renewal_brier": 0.0,
         "state_correct": 0,
         "state_class_count": np.zeros(3, dtype=np.int64),
         "state_class_correct": np.zeros(3, dtype=np.int64),
         "trace_count": 0,
         "truth_segment_count": 0.0,
         "map_segment_count": 0.0,
+        "expected_segment_count": 0.0,
         "truth_same_state_renewal_count": 0.0,
         "map_same_state_renewal_count": 0.0,
         "profile": _new_profile_statistics(),
@@ -2711,13 +2912,33 @@ def _update_hsmm_calibration_statistics(
     statistics: dict[str, Any],
     case: _HsmmOracleCase,
     path: SampledPath,
+    marginals: SemiMarkovMarginals,
 ) -> None:
     target = case.truth_path.state.astype(np.int64)
+    probability = np.asarray(marginals.state_probability, dtype=np.float64)
+    if probability.shape != (target.size, 3):
+        raise ValueError("HSMM calibration marginal shape differs from truth.")
+    truth_probability = np.eye(3, dtype=np.float64)[target]
     statistics["sample_count"] += target.size
+    statistics["state_brier"] += float(
+        np.sum((probability - truth_probability) ** 2)
+    )
     statistics["state_correct"] += int(np.count_nonzero(path.state == target))
     statistics["trace_count"] += 1
     statistics["truth_segment_count"] += len(case.truth_path.segments)
     statistics["map_segment_count"] += len(path.segments)
+    statistics["expected_segment_count"] += float(
+        marginals.expected_segment_count
+    )
+    truth_renewal = np.zeros(target.size, dtype=np.float64)
+    truth_renewal[[segment[1] for segment in case.truth_path.segments[1:]]] = 1.0
+    if target.size > 1:
+        renewal_error = (
+            np.asarray(marginals.renewal_probability, dtype=np.float64)[1:]
+            - truth_renewal[1:]
+        )
+        statistics["renewal_brier"] += float(np.sum(renewal_error**2))
+        statistics["renewal_sample_count"] += target.size - 1
     statistics["truth_same_state_renewal_count"] += sum(
         left[0] == right[0]
         for left, right in zip(
@@ -2751,16 +2972,24 @@ def _finalize_hsmm_calibration_statistics(
     profile = _finalize_profile_statistics(statistics["profile"])
     truth_segments = float(statistics["truth_segment_count"] / traces)
     map_segments = float(statistics["map_segment_count"] / traces)
+    expected_segments = float(statistics["expected_segment_count"] / traces)
     return {
         "supported_samples": samples,
         "trace_count": traces,
         "state_accuracy": float(statistics["state_correct"] / samples),
+        "state_brier": float(statistics["state_brier"] / samples),
+        "renewal_brier": float(
+            statistics["renewal_brier"]
+            / max(int(statistics["renewal_sample_count"]), 1)
+        ),
         "state_balanced_accuracy": float(
             np.mean(class_correct[class_count > 0] / class_count[class_count > 0])
         ),
         "truth_segment_count_mean": truth_segments,
         "map_segment_count_mean": map_segments,
         "map_segment_count_bias": map_segments - truth_segments,
+        "posterior_expected_segment_count_mean": expected_segments,
+        "posterior_expected_segment_count_bias": expected_segments - truth_segments,
         "truth_same_state_renewal_count_mean": float(
             statistics["truth_same_state_renewal_count"] / traces
         ),
@@ -2776,85 +3005,110 @@ def _select_hsmm_calibration_candidate(
     candidates: list[dict[str, Any]],
     baseline: dict[str, Any],
     *,
-    profile_relative_tolerance: float = 0.01,
+    balanced_accuracy_tolerance: float = 0.02,
+    profile_relative_tolerance: float = 0.02,
     profile_absolute_tolerance: float = 1.0e-5,
-    segment_count_tolerance: float = 0.25,
+    map_segment_count_tolerance: float = 1.0,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Select a candidate using practical equivalence before state skill."""
+    """Select a calibrated posterior using proper scores behind MAP guards."""
 
     if not candidates:
         raise ValueError("HSMM calibration requires at least one candidate.")
-    if profile_relative_tolerance < 0.0 or profile_absolute_tolerance < 0.0:
-        raise ValueError("profile equivalence tolerances must be non-negative.")
-    if segment_count_tolerance < 0.0:
-        raise ValueError("segment_count_tolerance must be non-negative.")
+    for value in (
+        balanced_accuracy_tolerance,
+        profile_relative_tolerance,
+        profile_absolute_tolerance,
+        map_segment_count_tolerance,
+    ):
+        if value < 0.0:
+            raise ValueError("HSMM selection tolerances must be non-negative.")
     baseline_metrics = baseline["metrics"]
+    required = {
+        "state_balanced_accuracy",
+        "state_brier",
+        "renewal_brier",
+        "map_segment_count_bias",
+        "posterior_expected_segment_count_bias",
+        "truth_amplitude_profile_rmse",
+    }
+    for row in candidates:
+        missing = required.difference(row["metrics"])
+        if missing:
+            raise ValueError(
+                f"HSMM calibration candidate lacks metrics: {sorted(missing)}"
+            )
+    maximum_profile = max(
+        baseline_metrics["truth_amplitude_profile_rmse"]
+        * (1.0 + profile_relative_tolerance),
+        baseline_metrics["truth_amplitude_profile_rmse"]
+        + profile_absolute_tolerance,
+    )
     admissible = [
         row
         for row in candidates
         if (
             row["metrics"]["state_balanced_accuracy"]
-            >= baseline_metrics["state_balanced_accuracy"]
+            >= (
+                baseline_metrics["state_balanced_accuracy"]
+                - balanced_accuracy_tolerance
+            )
             and abs(row["metrics"]["map_segment_count_bias"])
-            <= abs(baseline_metrics["map_segment_count_bias"])
+            <= (
+                abs(baseline_metrics["map_segment_count_bias"])
+                + map_segment_count_tolerance
+            )
             and row["metrics"]["truth_amplitude_profile_rmse"]
-            <= baseline_metrics["truth_amplitude_profile_rmse"]
+            <= maximum_profile
         )
     ]
     if not admissible:
         return baseline, {
             "admissible_candidate_count": 0,
-            "profile_equivalent_candidate_count": 0,
-            "segment_count_equivalent_candidate_count": 0,
             "fallback_to_baseline": True,
+            "balanced_accuracy_tolerance": balanced_accuracy_tolerance,
             "profile_relative_tolerance": profile_relative_tolerance,
             "profile_absolute_tolerance": profile_absolute_tolerance,
-            "segment_count_tolerance": segment_count_tolerance,
+            "map_segment_count_tolerance": map_segment_count_tolerance,
         }
 
-    best_profile = min(
-        row["metrics"]["truth_amplitude_profile_rmse"]
-        for row in admissible
+    state_scale = max(float(baseline_metrics["state_brier"]), 1.0e-8)
+    renewal_scale = max(float(baseline_metrics["renewal_brier"]), 1.0e-8)
+    count_scale = max(
+        abs(float(baseline_metrics["posterior_expected_segment_count_bias"])),
+        1.0,
     )
-    profile_tolerance = max(
-        profile_absolute_tolerance,
-        profile_relative_tolerance * abs(best_profile),
-    )
-    profile_equivalent = [
-        row
-        for row in admissible
-        if row["metrics"]["truth_amplitude_profile_rmse"]
-        <= best_profile + profile_tolerance
-    ]
-    best_count_bias = min(
-        abs(row["metrics"]["map_segment_count_bias"])
-        for row in profile_equivalent
-    )
-    count_equivalent = [
-        row
-        for row in profile_equivalent
-        if abs(row["metrics"]["map_segment_count_bias"])
-        <= best_count_bias + segment_count_tolerance
-    ]
-    selected = max(
-        count_equivalent,
+
+    def proper_score(row: Mapping[str, Any]) -> float:
+        metrics = row["metrics"]
+        return float(
+            metrics["state_brier"] / state_scale
+            + metrics["renewal_brier"] / renewal_scale
+            + abs(metrics["posterior_expected_segment_count_bias"]) / count_scale
+        )
+
+    selected = min(
+        admissible,
         key=lambda row: (
-            row["metrics"]["state_balanced_accuracy"],
-            -row["metrics"]["truth_amplitude_profile_rmse"],
-            -abs(row["metrics"]["map_segment_count_bias"]),
+            proper_score(row),
+            row["metrics"]["state_brier"],
+            row["metrics"]["renewal_brier"],
+            abs(row["metrics"]["posterior_expected_segment_count_bias"]),
+            -row["metrics"]["state_balanced_accuracy"],
         ),
     )
     return selected, {
         "admissible_candidate_count": len(admissible),
-        "profile_equivalent_candidate_count": len(profile_equivalent),
-        "segment_count_equivalent_candidate_count": len(count_equivalent),
         "fallback_to_baseline": False,
-        "best_profile_rmse": best_profile,
-        "effective_profile_absolute_tolerance": profile_tolerance,
-        "best_absolute_segment_count_bias": best_count_bias,
+        "selected_proper_score": proper_score(selected),
+        "baseline_proper_score": proper_score(baseline),
+        "proper_score_terms": (
+            "state_brier/baseline + renewal_brier/baseline + "
+            "abs(expected_count_bias)/max(abs(baseline_bias),1)"
+        ),
+        "balanced_accuracy_tolerance": balanced_accuracy_tolerance,
         "profile_relative_tolerance": profile_relative_tolerance,
         "profile_absolute_tolerance": profile_absolute_tolerance,
-        "segment_count_tolerance": segment_count_tolerance,
+        "map_segment_count_tolerance": map_segment_count_tolerance,
     }
 
 
@@ -2879,9 +3133,9 @@ def calibrate_semi_markov_fusion(
     )
     calibration_cases = _central_hsmm_calibration_cases(cases)
     candidates: list[dict[str, Any]] = []
-    state_weights = (0.5, 1.0, 2.0, 4.0)
-    duration_temperatures = (0.5, 1.0, 2.0)
-    transition_temperatures = (1.0, 2.0, 4.0)
+    state_weights = (0.25, 0.5, 1.0, 2.0, 4.0)
+    duration_temperatures = (0.25, 0.5, 1.0, 2.0)
+    transition_temperatures = (0.5, 1.0, 2.0, 4.0)
     search = tuple(
         SemiMarkovConditioning(*values)
         for values in product(
@@ -2894,13 +3148,18 @@ def calibrate_semi_markov_fusion(
     for index, conditioning in enumerate(search, start=1):
         statistics = _new_hsmm_calibration_statistics()
         for case in calibration_cases:
-            path = viterbi_semi_markov_path(
+            posterior = exact_semi_markov_posterior(
                 case.predicted_probability,
                 np.full(case.predicted_probability.shape[0], 0.5),
                 prior,
                 conditioning,
             )
-            _update_hsmm_calibration_statistics(statistics, case, path)
+            _update_hsmm_calibration_statistics(
+                statistics,
+                case,
+                posterior.map_path(),
+                posterior.marginals(),
+            )
         candidates.append(
             {
                 "conditioning": conditioning.to_mapping(),
@@ -2944,7 +3203,7 @@ def calibrate_semi_markov_fusion(
         truth_state_confidence=truth_state_confidence,
     )
     return {
-        "schema": "structured_ginn_v2_hsmm_calibration_v2",
+        "schema": "structured_ginn_v2_hsmm_calibration_v4",
         "status": "success",
         "audit_resolution": "model_grid",
         "parent_count": parent_count,
@@ -2966,11 +3225,9 @@ def calibrate_semi_markov_fusion(
             "any": any(boundary_flags.values()),
         },
         "selection_rule": (
-            "no regression versus (1,1,1) in state balanced accuracy, absolute "
-            "MAP segment-count bias, or truth-amplitude profile RMSE; retain "
-            "profile RMSE within max(1%, 1e-5) of the best; retain absolute "
-            "segment-count bias within 0.25 of the best; then maximize state "
-            "balanced accuracy"
+            "guard MAP balanced accuracy, segment-count bias, and truth-amplitude "
+            "profile RMSE near the (1,1,1) baseline; then minimize normalized "
+            "state Brier, renewal Brier, and posterior expected count bias"
         ),
         "selection_diagnostics": selection_diagnostics,
         "direct_evidence": {"predicted_state": _direct_state_metrics(cases)},
@@ -2979,6 +3236,2940 @@ def calibrate_semi_markov_fusion(
         "candidates": candidates,
         "oracle": oracle,
     }
+
+
+@dataclass(frozen=True)
+class _SegmentProfileDataset:
+    features: np.ndarray
+    target_coefficient: np.ndarray
+    gram: np.ndarray
+    cross: np.ndarray
+    target_square_mean: np.ndarray
+    identifiability_rank: np.ndarray
+    basis_condition: np.ndarray
+    clipping_fraction: np.ndarray
+    state_id: np.ndarray
+    parent_ids: tuple[str, ...]
+
+    @property
+    def segment_count(self) -> int:
+        return int(self.features.shape[0])
+
+
+def _observable_evidence_from_batch(
+    generator: ConditionalGenerator,
+    source: Mapping[str, object],
+    output: Mapping[str, np.ndarray],
+) -> ObservableEvidence:
+    tile = source.get("observation_tile")
+    if not isinstance(tile, ObservationTile):
+        raise TypeError("segment profile batch requires an ObservationTile.")
+    support = np.asarray(source["support"], dtype=bool)[0]
+    support &= np.asarray(output["support"], dtype=bool)[0]
+    background = np.asarray(source["background_lfm_linear"], dtype=np.float64)[0]
+    tuning = np.full(background.shape, tile.model_axis.sample_interval, dtype=np.float64)
+    if tile.sample_domain == "time":
+        tuning[support] = 1.0 / (2.0 * generator.dominant_frequency_hz)
+    else:
+        relation = dict(source.get("ai_velocity_relation") or {})
+        if "a" not in relation or "b" not in relation:
+            raise ValueError("depth profile evidence requires the AI-Vp relation.")
+        impedance = np.exp(background[support])
+        velocity = velocity_from_ai(
+            impedance,
+            a=float(relation["a"]),
+            b=float(relation["b"]),
+        )
+        tuning[support] = velocity / (4.0 * generator.dominant_frequency_hz)
+    return ObservableEvidence(
+        model_axis=tile.model_axis,
+        highres_axis=tile.highres_axis,
+        background_lfm_linear=background,
+        background_lfm_linear_highres=np.asarray(
+            source["lfm_anchor_highres"], dtype=np.float64
+        ),
+        projected_log_ai_increment_mean=np.asarray(
+            output["projected_log_ai_increment_mean"], dtype=np.float64
+        )[0],
+        projected_log_ai_increment_scale=np.asarray(
+            output["projected_log_ai_increment_scale"], dtype=np.float64
+        )[0],
+        signed_reflectivity_mean=np.asarray(
+            output["signed_reflectivity_mean"], dtype=np.float64
+        )[0],
+        signed_reflectivity_scale=np.asarray(
+            output["signed_reflectivity_scale"], dtype=np.float64
+        )[0],
+        state_log_potential=np.asarray(
+            output["state_log_potential"], dtype=np.float64
+        )[0],
+        local_tuning_scale=tuning,
+        support=support,
+        highres_support=np.asarray(
+            source["highres_truth_support"], dtype=bool
+        ),
+        lateral_m=tile.lateral_m,
+        x_m=tile.x_m,
+        y_m=tile.y_m,
+        identity=tile.identity,
+    )
+
+
+def _collect_segment_profile_dataset(
+    generator: ConditionalGenerator,
+    batches: Iterable[Mapping[str, object]],
+    *,
+    central_trace_count: int,
+    logger: logging.Logger,
+) -> _SegmentProfileDataset:
+    generator.network.eval()
+    feature_rows: list[np.ndarray] = []
+    coefficient_rows: list[np.ndarray] = []
+    gram_rows: list[np.ndarray] = []
+    cross_rows: list[np.ndarray] = []
+    square_rows: list[float] = []
+    rank_rows: list[int] = []
+    condition_rows: list[float] = []
+    clipping_rows: list[float] = []
+    state_rows: list[int] = []
+    parents: set[str] = set()
+    batch_count = 0
+    start_time = time.perf_counter()
+    with torch.no_grad():
+        for batch_count, source in enumerate(batches, start=1):
+            parent_id = str(source.get("parent_id") or "")
+            if not parent_id:
+                raise ValueError("segment profile batch requires parent_id.")
+            parents.add(parent_id)
+            output = _network_output(generator, source)
+            evidence = _observable_evidence_from_batch(generator, source, output)
+            width = evidence.support.shape[0]
+            count = min(central_trace_count, width)
+            start_trace = (width - count) // 2
+            selected_traces = set(range(start_trace, start_trace + count))
+            trace = np.asarray(source["segment_trace_index"], dtype=np.int64)
+            state = np.asarray(source["segment_state_id"], dtype=np.int64)
+            start = np.asarray(source["segment_start_index"], dtype=np.int64)
+            stop = np.asarray(source["segment_stop_index"], dtype=np.int64)
+            duration = np.asarray(
+                source["segment_duration_fraction"], dtype=np.float64
+            )
+            clipping = np.asarray(
+                source["segment_clipping_fraction"], dtype=np.float64
+            )
+            if not (
+                trace.shape
+                == state.shape
+                == start.shape
+                == stop.shape
+                == duration.shape
+                == clipping.shape
+            ):
+                raise ValueError("segment profile arrays must share one shape.")
+            indices = [
+                index
+                for index, trace_index in enumerate(trace.tolist())
+                if trace_index in selected_traces
+            ]
+            extents = tuple(
+                SegmentExtent(
+                    trace_index=int(trace[index]),
+                    state_id=int(state[index]),
+                    start_index=int(start[index]),
+                    stop_index=int(stop[index]),
+                    duration_fraction=float(duration[index]),
+                )
+                for index in indices
+            )
+            if not extents:
+                continue
+            features = build_segment_profile_features(evidence, extents)
+            truth = np.asarray(
+                source["highres_log_ai_increment"], dtype=np.float64
+            )
+            truth_support = np.asarray(
+                source["highres_truth_support"], dtype=bool
+            )
+            for local_index, (source_index, extent) in enumerate(
+                zip(indices, extents, strict=True)
+            ):
+                profile = truth[
+                    extent.trace_index,
+                    extent.start_index : extent.stop_index,
+                ]
+                valid = truth_support[
+                    extent.trace_index,
+                    extent.start_index : extent.stop_index,
+                ]
+                if not np.all(valid) or np.any(~np.isfinite(profile)):
+                    continue
+                statistics = profile_sufficient_statistics(profile)
+                feature_rows.append(features[local_index])
+                coefficient_rows.append(statistics.coefficient)
+                gram_rows.append(statistics.gram)
+                cross_rows.append(statistics.cross)
+                square_rows.append(statistics.target_square_mean)
+                rank_rows.append(statistics.identifiability_rank)
+                condition_rows.append(statistics.basis_condition)
+                clipping_rows.append(float(clipping[source_index]))
+                state_rows.append(extent.state_id)
+            if batch_count % 20 == 0:
+                logger.info(
+                    "profile dataset | batches=%d | parents=%d | segments=%d | elapsed=%.1fs",
+                    batch_count,
+                    len(parents),
+                    len(feature_rows),
+                    time.perf_counter() - start_time,
+                )
+    if batch_count == 0 or not feature_rows:
+        raise ValueError("segment profile dataset is empty.")
+    return _SegmentProfileDataset(
+        features=np.asarray(feature_rows, dtype=np.float32),
+        target_coefficient=np.asarray(coefficient_rows, dtype=np.float32),
+        gram=np.asarray(gram_rows, dtype=np.float32),
+        cross=np.asarray(cross_rows, dtype=np.float32),
+        target_square_mean=np.asarray(square_rows, dtype=np.float32),
+        identifiability_rank=np.asarray(rank_rows, dtype=np.int8),
+        basis_condition=np.asarray(condition_rows, dtype=np.float32),
+        clipping_fraction=np.asarray(clipping_rows, dtype=np.float32),
+        state_id=np.asarray(state_rows, dtype=np.int8),
+        parent_ids=tuple(sorted(parents)),
+    )
+
+
+def _profile_prior(
+    dataset: _SegmentProfileDataset,
+    *,
+    condition_max: float,
+) -> dict[str, Any]:
+    identifiable = (
+        (dataset.identifiability_rank == 3)
+        & (dataset.basis_condition <= condition_max)
+        & (dataset.clipping_fraction == 0.0)
+    )
+    mean = np.empty((3, 3), dtype=np.float64)
+    scale = np.empty((3, 3), dtype=np.float64)
+    counts = np.empty(3, dtype=np.int64)
+    for state in range(3):
+        selected = identifiable & (dataset.state_id == state)
+        counts[state] = np.count_nonzero(selected)
+        if counts[state] == 0:
+            raise ValueError(f"state {state} has no identifiable profile segments.")
+        values = dataset.target_coefficient[selected].astype(np.float64)
+        mean[state] = np.mean(values, axis=0)
+        scale[state] = np.maximum(np.std(values, axis=0), 1.0e-3)
+    return {
+        "schema": "structured_ginn_v2_segment_profile_prior_v1",
+        "mean": mean.tolist(),
+        "scale": scale.tolist(),
+        "identifiable_segment_count_by_state": counts.tolist(),
+        "identifiability_condition_max": float(condition_max),
+    }
+
+
+def _profile_mse_tensor(
+    coefficient: torch.Tensor,
+    gram: torch.Tensor,
+    cross: torch.Tensor,
+    target_square_mean: torch.Tensor,
+) -> torch.Tensor:
+    value = (
+        torch.einsum("bi,bij,bj->b", coefficient, gram, coefficient)
+        - 2.0 * torch.einsum("bi,bi->b", coefficient, cross)
+        + target_square_mean
+    )
+    return torch.clamp(value, min=0.0)
+
+
+def _profile_loss(
+    head: torch.nn.Module,
+    dataset: _SegmentProfileDataset,
+    indices: np.ndarray,
+    *,
+    device: torch.device,
+    config: SegmentProfileLearningConfig,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    selected = np.asarray(indices, dtype=np.int64)
+    features = torch.as_tensor(
+        dataset.features[selected], dtype=torch.float32, device=device
+    )
+    target = torch.as_tensor(
+        dataset.target_coefficient[selected], dtype=torch.float32, device=device
+    )
+    gram = torch.as_tensor(dataset.gram[selected], dtype=torch.float32, device=device)
+    cross = torch.as_tensor(dataset.cross[selected], dtype=torch.float32, device=device)
+    target_square = torch.as_tensor(
+        dataset.target_square_mean[selected], dtype=torch.float32, device=device
+    )
+    output = head(features)
+    profile_mse = _profile_mse_tensor(
+        output["mean"], gram, cross, target_square
+    )
+    diagonal = torch.diagonal(gram, dim1=1, dim2=2)
+    profile_variance = torch.clamp(
+        torch.sum(diagonal * output["scale"] ** 2, dim=1),
+        min=1.0e-8,
+    )
+    profile_nll = 0.5 * (
+        profile_mse / profile_variance + torch.log(profile_variance)
+    )
+    identifiable_numpy = (
+        (dataset.identifiability_rank[selected] == 3)
+        & (dataset.basis_condition[selected] <= config.identifiability_condition_max)
+        & (dataset.clipping_fraction[selected] == 0.0)
+    )
+    identifiable = torch.as_tensor(
+        identifiable_numpy, dtype=torch.bool, device=device
+    )
+    if torch.any(identifiable):
+        residual = (
+            output["mean"][identifiable] - target[identifiable]
+        ) / output["scale"][identifiable]
+        parameter_nll = 0.5 * torch.mean(
+            residual**2 + 2.0 * torch.log(output["scale"][identifiable])
+        )
+    else:
+        parameter_nll = torch.zeros((), dtype=features.dtype, device=device)
+    loss = torch.mean(profile_nll) + config.parameter_nll_weight * parameter_nll
+    return loss, {
+        "loss": float(loss.detach().cpu()),
+        "profile_rmse": float(torch.sqrt(torch.mean(profile_mse)).detach().cpu()),
+        "profile_nll": float(torch.mean(profile_nll).detach().cpu()),
+        "parameter_nll": float(parameter_nll.detach().cpu()),
+    }
+
+
+def _profile_mean_auxiliary_loss(
+    head: torch.nn.Module,
+    dataset: _SegmentProfileDataset,
+    indices: np.ndarray,
+    *,
+    device: torch.device,
+    condition_max: float,
+) -> torch.Tensor:
+    """Non-negative weak teacher loss used by the fixed-MAP mean probe."""
+
+    selected = np.asarray(indices, dtype=np.int64)
+    features = torch.as_tensor(
+        dataset.features[selected], dtype=torch.float32, device=device
+    )
+    output = head(features)
+    gram = torch.as_tensor(dataset.gram[selected], dtype=torch.float32, device=device)
+    cross = torch.as_tensor(dataset.cross[selected], dtype=torch.float32, device=device)
+    target_square = torch.as_tensor(
+        dataset.target_square_mean[selected], dtype=torch.float32, device=device
+    )
+    profile_mse = torch.mean(
+        _profile_mse_tensor(output["mean"], gram, cross, target_square)
+    )
+    identifiable_numpy = (
+        (dataset.identifiability_rank[selected] == 3)
+        & (dataset.basis_condition[selected] <= condition_max)
+        & (dataset.clipping_fraction[selected] == 0.0)
+    )
+    if np.any(identifiable_numpy):
+        identifiable = torch.as_tensor(
+            identifiable_numpy, dtype=torch.bool, device=device
+        )
+        target = torch.as_tensor(
+            dataset.target_coefficient[selected],
+            dtype=torch.float32,
+            device=device,
+        )
+        coefficient_mse = torch.mean(
+            (output["mean"][identifiable] - target[identifiable]) ** 2
+        )
+    else:
+        coefficient_mse = torch.zeros((), dtype=features.dtype, device=device)
+    return profile_mse + 0.25 * coefficient_mse
+
+
+def _coefficient_correlation(
+    predicted: np.ndarray,
+    truth: np.ndarray,
+) -> list[float | None]:
+    result: list[float | None] = []
+    for index in range(3):
+        left = predicted[:, index]
+        right = truth[:, index]
+        if np.std(left) <= 0.0 or np.std(right) <= 0.0:
+            result.append(None)
+        else:
+            result.append(float(np.corrcoef(left, right)[0, 1]))
+    return result
+
+
+def _profile_method_metrics(
+    dataset: _SegmentProfileDataset,
+    coefficient: np.ndarray,
+    *,
+    scale: np.ndarray | None,
+    condition_max: float,
+) -> dict[str, Any]:
+    values = np.asarray(coefficient, dtype=np.float64)
+    mse = (
+        np.einsum("bi,bij,bj->b", values, dataset.gram, values)
+        - 2.0 * np.einsum("bi,bi->b", values, dataset.cross)
+        + dataset.target_square_mean
+    )
+    mse = np.maximum(mse, 0.0)
+    identifiable = (
+        (dataset.identifiability_rank == 3)
+        & (dataset.basis_condition <= condition_max)
+        & (dataset.clipping_fraction == 0.0)
+    )
+    error = values[identifiable] - dataset.target_coefficient[identifiable]
+    result: dict[str, Any] = {
+        "segment_count": dataset.segment_count,
+        "profile_rmse": float(np.sqrt(np.mean(mse))),
+        "identifiable_segment_count": int(np.count_nonzero(identifiable)),
+        "identifiable_coefficient_rmse": np.sqrt(np.mean(error**2, axis=0)).tolist(),
+        "identifiable_coefficient_mae": np.mean(np.abs(error), axis=0).tolist(),
+        "identifiable_coefficient_correlation": _coefficient_correlation(
+            values[identifiable], dataset.target_coefficient[identifiable]
+        ),
+    }
+    if scale is not None:
+        spread = np.asarray(scale, dtype=np.float64)
+        diagonal = np.diagonal(dataset.gram, axis1=1, axis2=2)
+        profile_variance = np.maximum(
+            np.sum(diagonal * spread**2, axis=1), 1.0e-8
+        )
+        result["profile_gaussian_nll"] = float(
+            np.mean(0.5 * (mse / profile_variance + np.log(profile_variance)))
+        )
+        absolute = np.abs(error)
+        for label, z_value in (("50", 0.67449), ("80", 1.28155), ("95", 1.95996)):
+            result[f"identifiable_parameter_coverage_{label}"] = float(
+                np.mean(absolute <= z_value * spread[identifiable])
+            )
+    return result
+
+
+def _predict_profile_head(
+    generator: ConditionalGenerator,
+    dataset: _SegmentProfileDataset,
+    *,
+    batch_size: int,
+    apply_variance_calibration: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    if generator.profile_head is None:
+        raise RuntimeError("generator has no segment profile head.")
+    generator.profile_head.eval()
+    mean_rows: list[np.ndarray] = []
+    scale_rows: list[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, dataset.segment_count, batch_size):
+            stop = min(start + batch_size, dataset.segment_count)
+            output = generator.profile_head(
+                torch.as_tensor(
+                    dataset.features[start:stop],
+                    dtype=torch.float32,
+                    device=generator.device,
+                )
+            )
+            mean_rows.append(output["mean"].cpu().numpy())
+            scale_rows.append(output["scale"].cpu().numpy())
+    mean = np.concatenate(mean_rows)
+    scale = np.concatenate(scale_rows)
+    if (
+        apply_variance_calibration
+        and generator.coefficient_variance_calibration is not None
+    ):
+        scale *= np.asarray(
+            generator.coefficient_variance_calibration.temperature,
+            dtype=np.float64,
+        )
+    return mean, scale
+
+
+def _fit_coefficient_scale_temperature(
+    residual: np.ndarray,
+    base_scale: np.ndarray,
+) -> np.ndarray:
+    """Closed-form diagonal Gaussian temperature for fixed means."""
+
+    error = np.asarray(residual, dtype=np.float64)
+    scale = np.asarray(base_scale, dtype=np.float64)
+    if error.ndim != 2 or error.shape[1] != 3 or scale.shape != error.shape:
+        raise ValueError("coefficient residual and scale must have shape [segment, 3].")
+    if error.shape[0] == 0:
+        raise ValueError("coefficient variance calibration received no segments.")
+    if np.any(~np.isfinite(error)) or np.any(~np.isfinite(scale)) or np.any(scale <= 0.0):
+        raise ValueError("coefficient variance calibration inputs must be finite.")
+    temperature = np.sqrt(np.mean((error / scale) ** 2, axis=0))
+    if np.any(~np.isfinite(temperature)) or np.any(temperature <= 0.0):
+        raise FloatingPointError(
+            "coefficient variance calibration produced invalid temperatures."
+        )
+    return temperature
+
+
+def _coefficient_uncertainty_metrics(
+    residual: np.ndarray,
+    scale: np.ndarray,
+    state_id: np.ndarray,
+) -> dict[str, Any]:
+    error = np.asarray(residual, dtype=np.float64)
+    spread = np.asarray(scale, dtype=np.float64)
+    state = np.asarray(state_id, dtype=np.int64)
+    if error.shape != spread.shape or error.ndim != 2 or error.shape[1] != 3:
+        raise ValueError("coefficient uncertainty arrays must have shape [segment, 3].")
+    if state.shape != (error.shape[0],):
+        raise ValueError("coefficient uncertainty state array has the wrong shape.")
+    standardized = error / spread
+
+    def metrics(selected: np.ndarray) -> dict[str, Any]:
+        if not np.any(selected):
+            raise ValueError("coefficient uncertainty metrics require selected segments.")
+        local_error = error[selected]
+        local_scale = spread[selected]
+        local_standardized = standardized[selected]
+        result: dict[str, Any] = {
+            "segment_count": int(np.count_nonzero(selected)),
+            "coefficient_bias": np.mean(local_error, axis=0).tolist(),
+            "coefficient_rmse": np.sqrt(np.mean(local_error**2, axis=0)).tolist(),
+            "mean_scale": np.mean(local_scale, axis=0).tolist(),
+            "standardized_rmse": np.sqrt(
+                np.mean(local_standardized**2, axis=0)
+            ).tolist(),
+            "gaussian_nll": np.mean(
+                0.5 * (local_standardized**2 + 2.0 * np.log(local_scale)),
+                axis=0,
+            ).tolist(),
+        }
+        absolute = np.abs(local_standardized)
+        for label, z_value in (("50", 0.67449), ("80", 1.28155), ("95", 1.95996)):
+            result[f"coverage_{label}"] = np.mean(
+                absolute <= z_value, axis=0
+            ).tolist()
+            result[f"coverage_{label}_overall"] = float(
+                np.mean(absolute <= z_value)
+            )
+        return result
+
+    all_selected = np.ones(error.shape[0], dtype=bool)
+    return {
+        "aggregate": metrics(all_selected),
+        "by_state": {
+            str(state_value): metrics(state == state_value)
+            for state_value in range(3)
+        },
+    }
+
+
+def calibrate_coefficient_variance(
+    generator: ConditionalGenerator,
+    batches: Iterable[Mapping[str, object]],
+    *,
+    config: CoefficientVarianceCalibrationConfig,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any]:
+    """Calibrate c0/c1/c2 scale temperatures with fixed means."""
+
+    if generator.profile_head is None:
+        raise ValueError("coefficient variance calibration requires a profile head.")
+    if generator.coefficient_variance_calibration is not None:
+        raise ValueError("checkpoint already contains coefficient variance calibration.")
+    log = logger or logging.getLogger(__name__)
+    dataset = _collect_segment_profile_dataset(
+        generator,
+        batches,
+        central_trace_count=config.central_trace_count,
+        logger=log,
+    )
+    mean, raw_scale = _predict_profile_head(
+        generator,
+        dataset,
+        batch_size=config.batch_size,
+        apply_variance_calibration=False,
+    )
+    identifiable = (
+        (dataset.identifiability_rank == 3)
+        & (dataset.basis_condition <= config.identifiability_condition_max)
+        & (dataset.clipping_fraction == 0.0)
+    )
+    identifiable_count = int(np.count_nonzero(identifiable))
+    if identifiable_count == 0:
+        raise ValueError("calibration split has no identifiable profile segments.")
+    residual = (
+        dataset.target_coefficient[identifiable].astype(np.float64)
+        - mean[identifiable].astype(np.float64)
+    )
+    base_scale = raw_scale[identifiable].astype(np.float64)
+    state = dataset.state_id[identifiable]
+    temperature = _fit_coefficient_scale_temperature(residual, base_scale)
+    calibrated_scale = base_scale * temperature[None, :]
+    before = _coefficient_uncertainty_metrics(residual, base_scale, state)
+    after = _coefficient_uncertainty_metrics(residual, calibrated_scale, state)
+    calibration = CoefficientVarianceCalibration(
+        temperature=tuple(float(value) for value in temperature)
+    )
+    generator.set_coefficient_variance_calibration(calibration)
+    raw_profile = _profile_method_metrics(
+        dataset,
+        mean,
+        scale=raw_scale,
+        condition_max=config.identifiability_condition_max,
+    )
+    calibrated_profile = _profile_method_metrics(
+        dataset,
+        mean,
+        scale=raw_scale * temperature[None, :],
+        condition_max=config.identifiability_condition_max,
+    )
+    log.info(
+        "coefficient variance calibrated | parents=%d | identifiable=%d | "
+        "temperature=(%.4f, %.4f, %.4f) | standardized_rmse=(%.3f, %.3f, %.3f)",
+        len(dataset.parent_ids),
+        identifiable_count,
+        *temperature.tolist(),
+        *after["aggregate"]["standardized_rmse"],
+    )
+    return {
+        "schema": "structured_ginn_v2_coefficient_variance_report_v1",
+        "status": "success",
+        "method": "closed_form_identifiable_truth_segment_diagonal_temperature",
+        "uncertainty_decomposition": {
+            "coefficient_scale": "conditional_on_supplied_segment_extent_and_state",
+            "segmentation": "reserved_for_hsmm_backward_sampling",
+        },
+        "parent_count": len(dataset.parent_ids),
+        "segment_count": dataset.segment_count,
+        "identifiable_segment_count": identifiable_count,
+        "identifiability_condition_max": config.identifiability_condition_max,
+        "calibration": calibration.to_mapping(),
+        "before": before,
+        "after": after,
+        "profile_distribution_before": raw_profile,
+        "profile_distribution_after": calibrated_profile,
+        "mean_unchanged": True,
+    }
+
+
+def evaluate_segment_profile_head(
+    generator: ConditionalGenerator,
+    batches: Iterable[Mapping[str, object]],
+    *,
+    prior: Mapping[str, Any],
+    config: SegmentProfileLearningConfig,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any]:
+    log = logger or logging.getLogger(__name__)
+    dataset = _collect_segment_profile_dataset(
+        generator,
+        batches,
+        central_trace_count=config.central_trace_count,
+        logger=log,
+    )
+    learned_mean, learned_scale = _predict_profile_head(
+        generator, dataset, batch_size=config.batch_size
+    )
+    prior_mean = np.asarray(prior["mean"], dtype=np.float64)[dataset.state_id]
+    prior_scale = np.asarray(prior["scale"], dtype=np.float64)[dataset.state_id]
+    deterministic = dataset.features[:, :3].astype(np.float64)
+    methods = {
+        "deterministic_evidence_fit": _profile_method_metrics(
+            dataset,
+            deterministic,
+            scale=None,
+            condition_max=config.identifiability_condition_max,
+        ),
+        "learned_profile_head": _profile_method_metrics(
+            dataset,
+            learned_mean,
+            scale=learned_scale,
+            condition_max=config.identifiability_condition_max,
+        ),
+        "state_conditioned_prior": _profile_method_metrics(
+            dataset,
+            prior_mean,
+            scale=prior_scale,
+            condition_max=config.identifiability_condition_max,
+        ),
+    }
+    learned_rmse = methods["learned_profile_head"]["profile_rmse"]
+    deterministic_rmse = methods["deterministic_evidence_fit"]["profile_rmse"]
+    prior_rmse = methods["state_conditioned_prior"]["profile_rmse"]
+    strongest_baseline_rmse = min(deterministic_rmse, prior_rmse)
+    return {
+        "schema": "structured_ginn_v2_segment_profile_evaluation_v1",
+        "status": "success",
+        "parent_count": len(dataset.parent_ids),
+        "segment_count": dataset.segment_count,
+        "identifiability": {
+            "rank_1": int(np.count_nonzero(dataset.identifiability_rank == 1)),
+            "rank_2": int(np.count_nonzero(dataset.identifiability_rank == 2)),
+            "rank_3": int(np.count_nonzero(dataset.identifiability_rank == 3)),
+            "clipped": int(np.count_nonzero(dataset.clipping_fraction > 0.0)),
+            "condition_max": config.identifiability_condition_max,
+        },
+        "methods": methods,
+        "learned_minus_deterministic_profile_rmse": float(
+            learned_rmse - deterministic_rmse
+        ),
+        "learned_minus_state_conditioned_prior_profile_rmse": float(
+            learned_rmse - prior_rmse
+        ),
+        "learned_minus_strongest_baseline_profile_rmse": float(
+            learned_rmse - strongest_baseline_rmse
+        ),
+        "learned_beats_deterministic": bool(learned_rmse < deterministic_rmse),
+        "learned_beats_state_conditioned_prior": bool(learned_rmse < prior_rmse),
+        "learned_beats_strongest_baseline": bool(
+            learned_rmse < strongest_baseline_rmse
+        ),
+    }
+
+
+def train_segment_profile_head(
+    generator: ConditionalGenerator,
+    training_batches: Iterable[Mapping[str, object]],
+    tuning_batches: Iterable[Mapping[str, object]],
+    *,
+    head_config: SegmentProfileHeadConfig,
+    config: SegmentProfileLearningConfig,
+    logger: logging.Logger | None = None,
+    checkpoint_callback: CheckpointCallback | None = None,
+) -> dict[str, Any]:
+    """Freeze observable evidence and train one segment-profile residual head."""
+
+    log = logger or logging.getLogger(__name__)
+    seed_training_random_streams(config.random_seed)
+    training = _collect_segment_profile_dataset(
+        generator,
+        training_batches,
+        central_trace_count=config.central_trace_count,
+        logger=log,
+    )
+    tuning = _collect_segment_profile_dataset(
+        generator,
+        tuning_batches,
+        central_trace_count=config.central_trace_count,
+        logger=log,
+    )
+    head = generator.attach_profile_head(head_config)
+    feature_mean = np.mean(training.features, axis=0)
+    feature_scale = np.maximum(np.std(training.features, axis=0), 1.0e-6)
+    head.set_feature_normalization(feature_mean, feature_scale)
+    for parameter in generator.network.parameters():
+        parameter.requires_grad_(False)
+    prior = _profile_prior(
+        training, condition_max=config.identifiability_condition_max
+    )
+    optimizer = torch.optim.AdamW(
+        head.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    rng = np.random.default_rng(config.random_seed)
+    history: list[dict[str, float]] = []
+    best_loss = float("inf")
+    best_epoch = 0
+    all_tuning = np.arange(tuning.segment_count)
+    for epoch in range(1, config.epochs + 1):
+        head.train()
+        permutation = rng.permutation(training.segment_count)
+        running = 0.0
+        batches_seen = 0
+        for start in range(0, training.segment_count, config.batch_size):
+            indices = permutation[start : start + config.batch_size]
+            optimizer.zero_grad(set_to_none=True)
+            loss, _ = _profile_loss(
+                head,
+                training,
+                indices,
+                device=generator.device,
+                config=config,
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                head.parameters(), config.gradient_clip_norm
+            )
+            optimizer.step()
+            running += float(loss.detach().cpu())
+            batches_seen += 1
+        head.eval()
+        tuning_totals = {"loss": 0.0, "profile_rmse": 0.0, "profile_nll": 0.0, "parameter_nll": 0.0}
+        tuning_batches_seen = 0
+        with torch.no_grad():
+            for start in range(0, tuning.segment_count, config.batch_size):
+                indices = all_tuning[start : start + config.batch_size]
+                _, metrics = _profile_loss(
+                    head,
+                    tuning,
+                    indices,
+                    device=generator.device,
+                    config=config,
+                )
+                for name, value in metrics.items():
+                    tuning_totals[name] += value
+                tuning_batches_seen += 1
+        row = {
+            "epoch": float(epoch),
+            "train_loss": running / batches_seen,
+            **{
+                f"tuning_{name}": value / tuning_batches_seen
+                for name, value in tuning_totals.items()
+            },
+        }
+        history.append(row)
+        is_best = row["tuning_profile_rmse"] < best_loss
+        if is_best:
+            best_loss = row["tuning_profile_rmse"]
+            best_epoch = epoch
+        log.info(
+            "profile epoch %d/%d | train_loss=%.6f | tuning_loss=%.6f | tuning_profile_rmse=%.6f%s",
+            epoch,
+            config.epochs,
+            row["train_loss"],
+            row["tuning_loss"],
+            row["tuning_profile_rmse"],
+            " | best" if is_best else "",
+        )
+        if checkpoint_callback is not None:
+            checkpoint_callback(
+                epoch,
+                generator,
+                {
+                    "epoch": epoch,
+                    "best_epoch": best_epoch,
+                    "best_tuning_profile_rmse": best_loss,
+                    "history": history,
+                    "profile_prior": prior,
+                    "profile_learning_config": asdict(config),
+                    "profile_head_config": asdict(head_config),
+                },
+                is_best,
+            )
+    return {
+        "best_epoch": best_epoch,
+        "best_tuning_profile_rmse": best_loss,
+        "history": history,
+        "profile_prior": prior,
+        "training_parent_count": len(training.parent_ids),
+        "training_segment_count": training.segment_count,
+        "tuning_parent_count": len(tuning.parent_ids),
+        "tuning_segment_count": tuning.segment_count,
+    }
+
+
+@dataclass(frozen=True)
+class _MapProfileParentExample:
+    parent_id: str
+    geometry_family: str
+    features: np.ndarray
+    trace_index: np.ndarray
+    start_index: np.ndarray
+    stop_index: np.ndarray
+    background_highres: np.ndarray
+    highres_truth: np.ndarray
+    highres_support: np.ndarray
+    projection_trace_index: np.ndarray
+    projection_convolution_index: np.ndarray
+    projected_truth: np.ndarray
+    direct_projected_prediction: np.ndarray
+    projection_taps: np.ndarray
+
+
+@dataclass
+class _MapProfileParentBuilder:
+    parent_id: str
+    geometry_family: str
+    selected_traces: tuple[int, ...]
+    model_interval: float
+    highres_interval: float
+    background_highres: np.ndarray
+    highres_truth: np.ndarray
+    highres_support: np.ndarray
+    model_truth: np.ndarray
+    direct_model_prediction: np.ndarray
+    model_support: np.ndarray
+    feature_rows: list[np.ndarray]
+    trace_rows: list[int]
+    start_rows: list[int]
+    stop_rows: list[int]
+
+
+def _new_map_profile_parent_builder(
+    source: Mapping[str, object],
+    *,
+    central_trace_count: int,
+) -> _MapProfileParentBuilder:
+    tile = source.get("observation_tile")
+    if not isinstance(tile, ObservationTile):
+        raise TypeError("MAP profile source requires an ObservationTile.")
+    high_shape = np.asarray(source["highres_log_ai_increment"]).shape
+    model_shape = np.asarray(source["support"])[0].shape
+    if len(high_shape) != 2 or len(model_shape) != 2 or high_shape[0] != model_shape[0]:
+        raise ValueError("MAP profile source has inconsistent lateral shapes.")
+    count = min(central_trace_count, high_shape[0])
+    start = (high_shape[0] - count) // 2
+    selected = tuple(range(start, start + count))
+    local_high_shape = (count, high_shape[1])
+    local_model_shape = (count, model_shape[1])
+    return _MapProfileParentBuilder(
+        parent_id=str(source["parent_id"]),
+        geometry_family=str(source["geometry_family"]),
+        selected_traces=selected,
+        model_interval=float(tile.model_axis.sample_interval),
+        highres_interval=float(tile.highres_axis.sample_interval),
+        background_highres=np.full(local_high_shape, np.nan, dtype=np.float64),
+        highres_truth=np.full(local_high_shape, np.nan, dtype=np.float64),
+        highres_support=np.zeros(local_high_shape, dtype=bool),
+        model_truth=np.full(local_model_shape, np.nan, dtype=np.float64),
+        direct_model_prediction=np.full(local_model_shape, np.nan, dtype=np.float64),
+        model_support=np.zeros(local_model_shape, dtype=bool),
+        feature_rows=[],
+        trace_rows=[],
+        start_rows=[],
+        stop_rows=[],
+    )
+
+
+def _add_map_profile_zone(
+    builder: _MapProfileParentBuilder,
+    generator: ConditionalGenerator,
+    source: Mapping[str, object],
+    *,
+    prior: SemiMarkovPrior,
+    conditioning: SemiMarkovConditioning,
+) -> None:
+    if str(source["parent_id"]) != builder.parent_id:
+        raise ValueError("MAP profile parent identity changed within a group.")
+    output = _network_output(generator, source)
+    evidence = _observable_evidence_from_batch(generator, source, output)
+    tile = source.get("observation_tile")
+    if not isinstance(tile, ObservationTile):
+        raise TypeError("MAP profile source requires an ObservationTile.")
+    zone_support = np.asarray(source["highres_truth_support"], dtype=bool)
+    anchor_highres = np.asarray(source["lfm_anchor_highres"], dtype=np.float64)
+    truth_highres = anchor_highres + np.asarray(
+        source["highres_log_ai_increment"], dtype=np.float64
+    )
+    projected_truth = evidence.background_lfm_linear + np.asarray(
+        source["projected_log_ai_increment"], dtype=np.float64
+    )[0]
+    direct_projected = (
+        evidence.background_lfm_linear
+        + evidence.projected_log_ai_increment_mean
+    )
+    local_by_source = {
+        source_trace: local_trace
+        for local_trace, source_trace in enumerate(builder.selected_traces)
+    }
+    for source_trace, local_trace in local_by_source.items():
+        local_zone_support = zone_support[source_trace]
+        if np.any(builder.highres_support[local_trace] & local_zone_support):
+            raise ValueError("MAP profile high-resolution zone supports overlap.")
+        model_support = evidence.support[source_trace]
+        if np.any(builder.model_support[local_trace] & model_support):
+            raise ValueError("MAP profile model-grid zone supports overlap.")
+        runs = _contiguous_runs(model_support)
+        if len(runs) != 1:
+            raise ValueError("MAP profile requires one support run per zone trace.")
+        model_start, model_stop = runs[0]
+        model_indices = np.arange(model_start, model_stop, dtype=np.int64)
+        probability = np.exp(
+            evidence.state_log_potential[source_trace, model_indices]
+        )
+        path = viterbi_semi_markov_path(
+            probability,
+            np.full(model_indices.size, 0.5, dtype=np.float64),
+            prior,
+            conditioning,
+        )
+        highres_indices = np.flatnonzero(local_zone_support)
+        source_extents = _path_to_highres_extents(
+            path,
+            trace_index=source_trace,
+            model_indices=model_indices,
+            model_coordinates=tile.model_axis.coordinates,
+            highres_indices=highres_indices,
+            highres_coordinates=tile.highres_axis.coordinates,
+        )
+        features = build_segment_profile_features(evidence, source_extents)
+        for feature, extent in zip(features, source_extents, strict=True):
+            builder.feature_rows.append(feature)
+            builder.trace_rows.append(local_trace)
+            builder.start_rows.append(extent.start_index)
+            builder.stop_rows.append(extent.stop_index)
+        builder.background_highres[local_trace, local_zone_support] = (
+            anchor_highres[source_trace, local_zone_support]
+        )
+        builder.highres_truth[local_trace, local_zone_support] = (
+            truth_highres[source_trace, local_zone_support]
+        )
+        builder.highres_support[local_trace] |= local_zone_support
+        builder.model_truth[local_trace, model_support] = projected_truth[
+            source_trace, model_support
+        ]
+        builder.direct_model_prediction[local_trace, model_support] = (
+            direct_projected[source_trace, model_support]
+        )
+        builder.model_support[local_trace] |= model_support
+
+
+def _finalize_map_profile_parent(
+    builder: _MapProfileParentBuilder,
+) -> _MapProfileParentExample:
+    if not builder.feature_rows or not np.any(builder.highres_support):
+        raise ValueError("MAP profile parent contains no reconstructed support.")
+    coverage = np.zeros(builder.highres_support.shape, dtype=bool)
+    for trace, start, stop in zip(
+        builder.trace_rows,
+        builder.start_rows,
+        builder.stop_rows,
+        strict=True,
+    ):
+        if np.any(coverage[trace, start:stop]):
+            raise ValueError("MAP profile extents overlap within a parent trace.")
+        coverage[trace, start:stop] = True
+    if not np.array_equal(coverage, builder.highres_support):
+        raise ValueError("MAP profile extents do not cover the complete parent support.")
+    if np.any(~np.isfinite(builder.highres_truth[builder.highres_support])):
+        raise ValueError("MAP profile high-resolution truth is non-finite.")
+    ratio = builder.model_interval / builder.highres_interval
+    factor = int(round(ratio))
+    if factor < 1 or not np.isclose(ratio, factor, rtol=0.0, atol=1.0e-10):
+        raise ValueError("MAP profile axes are not integer nested.")
+    taps = finite_support_fir(factor)
+    _, complete_support = _project_complete_highres_support(
+        np.where(builder.highres_support, builder.background_highres, 0.0),
+        builder.highres_support,
+        highres_interval=builder.highres_interval,
+        model_interval=builder.model_interval,
+    )
+    complete_support &= builder.model_support
+    projection_trace, projection_model = np.nonzero(complete_support)
+    if projection_trace.size == 0:
+        raise ValueError("MAP profile parent has no complete projection support.")
+    convolution_index = projection_model * factor - taps.size // 2
+    if np.any(convolution_index < 0):
+        raise RuntimeError("MAP profile projection index is negative.")
+    projected_truth = builder.model_truth[projection_trace, projection_model]
+    direct_projected = builder.direct_model_prediction[
+        projection_trace, projection_model
+    ]
+    if np.any(~np.isfinite(projected_truth)) or np.any(~np.isfinite(direct_projected)):
+        raise ValueError("MAP profile projected targets are non-finite.")
+    return _MapProfileParentExample(
+        parent_id=builder.parent_id,
+        geometry_family=builder.geometry_family,
+        features=np.asarray(builder.feature_rows, dtype=np.float32),
+        trace_index=np.asarray(builder.trace_rows, dtype=np.int64),
+        start_index=np.asarray(builder.start_rows, dtype=np.int64),
+        stop_index=np.asarray(builder.stop_rows, dtype=np.int64),
+        background_highres=builder.background_highres.astype(np.float32),
+        highres_truth=builder.highres_truth.astype(np.float32),
+        highres_support=builder.highres_support,
+        projection_trace_index=projection_trace.astype(np.int64),
+        projection_convolution_index=convolution_index.astype(np.int64),
+        projected_truth=projected_truth.astype(np.float32),
+        direct_projected_prediction=direct_projected.astype(np.float32),
+        projection_taps=taps.astype(np.float32),
+    )
+
+
+def _collect_map_profile_examples(
+    generator: ConditionalGenerator,
+    batches: Iterable[Mapping[str, object]],
+    *,
+    prior: SemiMarkovPrior,
+    conditioning: SemiMarkovConditioning,
+    central_trace_count: int,
+    logger: logging.Logger,
+) -> tuple[_MapProfileParentExample, ...]:
+    generator.network.eval()
+    examples: list[_MapProfileParentExample] = []
+    current: _MapProfileParentBuilder | None = None
+    start_time = time.perf_counter()
+    with torch.no_grad():
+        for source in batches:
+            parent_id = str(source["parent_id"])
+            if current is None:
+                current = _new_map_profile_parent_builder(
+                    source, central_trace_count=central_trace_count
+                )
+            elif parent_id != current.parent_id:
+                examples.append(_finalize_map_profile_parent(current))
+                if len(examples) % 12 == 0:
+                    logger.info(
+                        "MAP profile dataset | parents=%d | elapsed=%.1fs",
+                        len(examples),
+                        time.perf_counter() - start_time,
+                    )
+                current = _new_map_profile_parent_builder(
+                    source, central_trace_count=central_trace_count
+                )
+            _add_map_profile_zone(
+                current,
+                generator,
+                source,
+                prior=prior,
+                conditioning=conditioning,
+            )
+    if current is None:
+        raise ValueError("MAP profile dataset is empty.")
+    examples.append(_finalize_map_profile_parent(current))
+    logger.info(
+        "MAP profile dataset complete | parents=%d | segments=%d | elapsed=%.1fs",
+        len(examples),
+        sum(item.features.shape[0] for item in examples),
+        time.perf_counter() - start_time,
+    )
+    return tuple(examples)
+
+
+def _map_profile_prediction_vectors(
+    head: SegmentProfileHead,
+    example: _MapProfileParentExample,
+    *,
+    device: torch.device,
+    deterministic: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    features = torch.as_tensor(example.features, dtype=torch.float32, device=device)
+    coefficient = features[:, :3] if deterministic else head(features)["mean"]
+    background = torch.as_tensor(
+        example.background_highres, dtype=torch.float32, device=device
+    )
+    decoded = decode_segments_torch(
+        background,
+        torch.as_tensor(example.trace_index, dtype=torch.long, device=device),
+        torch.as_tensor(example.start_index, dtype=torch.long, device=device),
+        torch.as_tensor(example.stop_index, dtype=torch.long, device=device),
+        coefficient,
+    )
+    support = torch.as_tensor(example.highres_support, dtype=torch.bool, device=device)
+    highres_prediction = decoded[support]
+    filled = torch.where(support, decoded, torch.zeros_like(decoded))
+    taps = torch.as_tensor(
+        example.projection_taps, dtype=torch.float32, device=device
+    ).reshape(1, 1, -1)
+    convolution = F.conv1d(filled[:, None, :], taps)[:, 0, :]
+    projection_trace = torch.as_tensor(
+        example.projection_trace_index, dtype=torch.long, device=device
+    )
+    projection_index = torch.as_tensor(
+        example.projection_convolution_index, dtype=torch.long, device=device
+    )
+    projected_prediction = convolution[projection_trace, projection_index]
+    residual = coefficient - features[:, :3]
+    return highres_prediction, projected_prediction, residual
+
+
+def _map_profile_batch_loss(
+    head: SegmentProfileHead,
+    examples: tuple[_MapProfileParentExample, ...],
+    *,
+    device: torch.device,
+    config: MapProfileProbeConfig,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    highres_squared = torch.zeros((), dtype=torch.float32, device=device)
+    projected_squared = torch.zeros((), dtype=torch.float32, device=device)
+    residual_squared = torch.zeros((), dtype=torch.float32, device=device)
+    highres_count = 0
+    projected_count = 0
+    residual_count = 0
+    for example in examples:
+        highres, projected, residual = _map_profile_prediction_vectors(
+            head, example, device=device, deterministic=False
+        )
+        highres_truth = torch.as_tensor(
+            example.highres_truth[example.highres_support],
+            dtype=torch.float32,
+            device=device,
+        )
+        projected_truth = torch.as_tensor(
+            example.projected_truth, dtype=torch.float32, device=device
+        )
+        highres_squared = highres_squared + torch.sum((highres - highres_truth) ** 2)
+        projected_squared = projected_squared + torch.sum(
+            (projected - projected_truth) ** 2
+        )
+        residual_squared = residual_squared + torch.sum(residual**2)
+        highres_count += int(highres_truth.numel())
+        projected_count += int(projected_truth.numel())
+        residual_count += int(residual.numel())
+    highres_mse = highres_squared / highres_count
+    projected_mse = projected_squared / projected_count
+    residual_mse = residual_squared / residual_count
+    loss = (
+        config.highres_weight * highres_mse
+        + config.projected_weight * projected_mse
+        + config.residual_weight * residual_mse
+    )
+    return loss, {
+        "map_loss": float(loss.detach().cpu()),
+        "highres_rmse": float(torch.sqrt(highres_mse).detach().cpu()),
+        "projected_rmse": float(torch.sqrt(projected_mse).detach().cpu()),
+        "residual_rms": float(torch.sqrt(residual_mse).detach().cpu()),
+    }
+
+
+def _map_profile_probe_evaluation(
+    head: SegmentProfileHead,
+    examples: tuple[_MapProfileParentExample, ...],
+    *,
+    device: torch.device,
+) -> dict[str, Any]:
+    def empty_statistics() -> dict[str, Any]:
+        return {
+            "parent_count": 0,
+            "highres_squared": {"learned": 0.0, "deterministic": 0.0},
+            "highres_count": 0,
+            "projected_squared": {
+                "learned": 0.0,
+                "deterministic": 0.0,
+                "direct_evidence": 0.0,
+            },
+            "projected_count": 0,
+        }
+
+    def update(statistics: dict[str, Any], example: _MapProfileParentExample) -> None:
+        learned_highres, learned_projected, _ = _map_profile_prediction_vectors(
+            head, example, device=device, deterministic=False
+        )
+        deterministic_highres, deterministic_projected, _ = (
+            _map_profile_prediction_vectors(
+                head, example, device=device, deterministic=True
+            )
+        )
+        highres_truth = torch.as_tensor(
+            example.highres_truth[example.highres_support],
+            dtype=torch.float32,
+            device=device,
+        )
+        projected_truth = torch.as_tensor(
+            example.projected_truth, dtype=torch.float32, device=device
+        )
+        direct = torch.as_tensor(
+            example.direct_projected_prediction,
+            dtype=torch.float32,
+            device=device,
+        )
+        statistics["parent_count"] += 1
+        statistics["highres_count"] += int(highres_truth.numel())
+        statistics["projected_count"] += int(projected_truth.numel())
+        statistics["highres_squared"]["learned"] += float(
+            torch.sum((learned_highres - highres_truth) ** 2).cpu()
+        )
+        statistics["highres_squared"]["deterministic"] += float(
+            torch.sum((deterministic_highres - highres_truth) ** 2).cpu()
+        )
+        statistics["projected_squared"]["learned"] += float(
+            torch.sum((learned_projected - projected_truth) ** 2).cpu()
+        )
+        statistics["projected_squared"]["deterministic"] += float(
+            torch.sum((deterministic_projected - projected_truth) ** 2).cpu()
+        )
+        statistics["projected_squared"]["direct_evidence"] += float(
+            torch.sum((direct - projected_truth) ** 2).cpu()
+        )
+
+    def finalize(statistics: Mapping[str, Any]) -> dict[str, Any]:
+        highres_count = int(statistics["highres_count"])
+        projected_count = int(statistics["projected_count"])
+        return {
+            "parent_count": int(statistics["parent_count"]),
+            "highres_log_ai_rmse": {
+                name: float(np.sqrt(value / highres_count))
+                for name, value in statistics["highres_squared"].items()
+            },
+            "projected_log_ai_rmse": {
+                name: float(np.sqrt(value / projected_count))
+                for name, value in statistics["projected_squared"].items()
+            },
+        }
+
+    head.eval()
+    aggregate_statistics = empty_statistics()
+    family_statistics: dict[str, dict[str, Any]] = {}
+    with torch.no_grad():
+        for example in examples:
+            update(aggregate_statistics, example)
+            update(
+                family_statistics.setdefault(
+                    example.geometry_family, empty_statistics()
+                ),
+                example,
+            )
+    aggregate = finalize(aggregate_statistics)
+    by_family = {
+        name: finalize(statistics)
+        for name, statistics in sorted(family_statistics.items())
+    }
+
+    def regresses_both(row: Mapping[str, Any]) -> bool:
+        highres = row["highres_log_ai_rmse"]
+        projected = row["projected_log_ai_rmse"]
+        return bool(
+            highres["learned"] > highres["deterministic"]
+            and projected["learned"] > projected["direct_evidence"]
+        )
+
+    highres = aggregate["highres_log_ai_rmse"]
+    projected = aggregate["projected_log_ai_rmse"]
+    gate = {
+        "learned_beats_deterministic_highres": bool(
+            highres["learned"] < highres["deterministic"]
+        ),
+        "learned_not_worse_than_direct_projected": bool(
+            projected["learned"] <= projected["direct_evidence"]
+        ),
+        "no_family_regresses_both_resolutions": bool(
+            not any(regresses_both(row) for row in by_family.values())
+        ),
+    }
+    gate["passed"] = bool(all(gate.values()))
+    return {
+        "aggregate": aggregate,
+        "by_geometry_family": by_family,
+        "gate": gate,
+    }
+
+
+def train_map_profile_probe(
+    generator: ConditionalGenerator,
+    training_batches: Iterable[Mapping[str, object]],
+    tuning_batches: Iterable[Mapping[str, object]],
+    teacher_batches: Iterable[Mapping[str, object]],
+    *,
+    prior: SemiMarkovPrior,
+    conditioning: SemiMarkovConditioning,
+    head_config: SegmentProfileHeadConfig,
+    config: MapProfileProbeConfig,
+    logger: logging.Logger | None = None,
+    checkpoint_callback: CheckpointCallback | None = None,
+) -> dict[str, Any]:
+    """Train a zero-residual profile head on fixed MAP segment extents."""
+
+    log = logger or logging.getLogger(__name__)
+    seed_training_random_streams(config.random_seed)
+    training = _collect_map_profile_examples(
+        generator,
+        training_batches,
+        prior=prior,
+        conditioning=conditioning,
+        central_trace_count=config.central_trace_count,
+        logger=log,
+    )
+    tuning = _collect_map_profile_examples(
+        generator,
+        tuning_batches,
+        prior=prior,
+        conditioning=conditioning,
+        central_trace_count=config.central_trace_count,
+        logger=log,
+    )
+    teacher = _collect_segment_profile_dataset(
+        generator,
+        teacher_batches,
+        central_trace_count=config.central_trace_count,
+        logger=log,
+    )
+    generator.profile_head = SegmentProfileHead(head_config).to(generator.device)
+    head = generator.profile_head
+    map_features = np.concatenate([item.features for item in training], axis=0)
+    head.set_feature_normalization(
+        np.mean(map_features, axis=0),
+        np.maximum(np.std(map_features, axis=0), 1.0e-6),
+    )
+    for parameter in generator.network.parameters():
+        parameter.requires_grad_(False)
+    optimizer = torch.optim.AdamW(
+        head.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    rng = np.random.default_rng(config.random_seed)
+    initial = _map_profile_probe_evaluation(
+        head, tuning, device=generator.device
+    )
+    log.info(
+        "MAP profile zero-residual baseline | highres_rmse=%.6f | projected_rmse=%.6f",
+        initial["aggregate"]["highres_log_ai_rmse"]["learned"],
+        initial["aggregate"]["projected_log_ai_rmse"]["learned"],
+    )
+    history: list[dict[str, float]] = []
+    best_score = float("inf")
+    best_epoch = 0
+    for epoch in range(1, config.epochs + 1):
+        head.train()
+        permutation = rng.permutation(len(training))
+        running = {
+            "loss": 0.0,
+            "map_loss": 0.0,
+            "teacher_loss": 0.0,
+            "highres_rmse": 0.0,
+            "projected_rmse": 0.0,
+            "residual_rms": 0.0,
+        }
+        batch_count = 0
+        for start in range(0, len(training), config.parents_per_batch):
+            selected = permutation[start : start + config.parents_per_batch]
+            parent_batch = tuple(training[int(index)] for index in selected)
+            teacher_count = min(config.teacher_batch_size, teacher.segment_count)
+            teacher_indices = rng.choice(
+                teacher.segment_count,
+                size=teacher_count,
+                replace=False,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            map_loss, map_metrics = _map_profile_batch_loss(
+                head,
+                parent_batch,
+                device=generator.device,
+                config=config,
+            )
+            teacher_loss = _profile_mean_auxiliary_loss(
+                head,
+                teacher,
+                teacher_indices,
+                device=generator.device,
+                condition_max=config.identifiability_condition_max,
+            )
+            loss = map_loss + config.teacher_weight * teacher_loss
+            if not torch.isfinite(loss):
+                raise FloatingPointError("MAP profile probe produced non-finite loss.")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                head.parameters(), config.gradient_clip_norm
+            )
+            optimizer.step()
+            running["loss"] += float(loss.detach().cpu())
+            running["map_loss"] += map_metrics["map_loss"]
+            running["teacher_loss"] += float(teacher_loss.detach().cpu())
+            for name in ("highres_rmse", "projected_rmse", "residual_rms"):
+                running[name] += map_metrics[name]
+            batch_count += 1
+        tuning_metrics = _map_profile_probe_evaluation(
+            head, tuning, device=generator.device
+        )
+        tuning_highres = tuning_metrics["aggregate"]["highres_log_ai_rmse"][
+            "learned"
+        ]
+        tuning_projected = tuning_metrics["aggregate"]["projected_log_ai_rmse"][
+            "learned"
+        ]
+        score = float(
+            config.highres_weight * tuning_highres**2
+            + config.projected_weight * tuning_projected**2
+        )
+        row = {
+            "epoch": float(epoch),
+            **{
+                f"train_{name}": value / batch_count
+                for name, value in running.items()
+            },
+            "tuning_highres_rmse": float(tuning_highres),
+            "tuning_projected_rmse": float(tuning_projected),
+            "tuning_selection_score": score,
+        }
+        history.append(row)
+        is_best = score < best_score
+        if is_best:
+            best_score = score
+            best_epoch = epoch
+        log.info(
+            "MAP profile epoch %d/%d | train_loss=%.6f | highres=%.6f | "
+            "projected=%.6f | tuning_highres=%.6f | tuning_projected=%.6f%s",
+            epoch,
+            config.epochs,
+            row["train_loss"],
+            row["train_highres_rmse"],
+            row["train_projected_rmse"],
+            tuning_highres,
+            tuning_projected,
+            " | best" if is_best else "",
+        )
+        if checkpoint_callback is not None:
+            checkpoint_callback(
+                epoch,
+                generator,
+                {
+                    "epoch": epoch,
+                    "best_epoch": best_epoch,
+                    "best_tuning_selection_score": best_score,
+                    "history": history,
+                    "map_profile_probe_config": asdict(config),
+                    "initial_tuning": initial,
+                    "current_tuning": tuning_metrics,
+                },
+                is_best,
+            )
+    return {
+        "schema": "structured_ginn_v2_map_profile_probe_training_v1",
+        "status": "success",
+        "best_epoch": best_epoch,
+        "best_tuning_selection_score": best_score,
+        "history": history,
+        "initial_tuning": initial,
+        "training_parent_count": len(training),
+        "tuning_parent_count": len(tuning),
+        "teacher_segment_count": teacher.segment_count,
+    }
+
+
+_RECONSTRUCTION_PROFILE_METHODS = (
+    "learned_profile_head",
+    "deterministic_evidence_fit",
+    "state_conditioned_prior",
+    "anchor_only",
+)
+_RECONSTRUCTION_ORACLE_METHODS = (
+    "learned_profile_head_oracle_state",
+)
+_RECONSTRUCTION_HIGHRES_METHODS = (
+    *_RECONSTRUCTION_PROFILE_METHODS,
+    *_RECONSTRUCTION_ORACLE_METHODS,
+)
+_RECONSTRUCTION_MODEL_METHODS = (
+    *_RECONSTRUCTION_HIGHRES_METHODS,
+    "direct_bandlimited_evidence",
+)
+
+
+@dataclass
+class _MapReconstructionParent:
+    parent_id: str
+    geometry_family: str
+    highres_truth: np.ndarray
+    highres_support: np.ndarray
+    highres_prediction: dict[str, np.ndarray]
+    model_truth: np.ndarray
+    model_support: np.ndarray
+    direct_model_prediction: np.ndarray
+    model_interval: float
+    highres_interval: float
+    state_class_count: np.ndarray
+    state_class_correct: np.ndarray
+    truth_segment_count: int = 0
+    map_segment_count: int = 0
+    trace_count: int = 0
+    zone_count: int = 0
+
+
+def _new_map_reconstruction_parent(
+    source: Mapping[str, object],
+) -> _MapReconstructionParent:
+    tile = source.get("observation_tile")
+    if not isinstance(tile, ObservationTile):
+        raise TypeError("MAP reconstruction requires an ObservationTile.")
+    high_shape = np.asarray(source["highres_log_ai_increment"]).shape
+    model_shape = np.asarray(source["support"])[0].shape
+    return _MapReconstructionParent(
+        parent_id=str(source["parent_id"]),
+        geometry_family=str(source["geometry_family"]),
+        highres_truth=np.full(high_shape, np.nan, dtype=np.float64),
+        highres_support=np.zeros(high_shape, dtype=bool),
+        highres_prediction={
+            name: np.full(high_shape, np.nan, dtype=np.float64)
+            for name in _RECONSTRUCTION_HIGHRES_METHODS
+        },
+        model_truth=np.full(model_shape, np.nan, dtype=np.float64),
+        model_support=np.zeros(model_shape, dtype=bool),
+        direct_model_prediction=np.full(model_shape, np.nan, dtype=np.float64),
+        model_interval=float(tile.model_axis.sample_interval),
+        highres_interval=float(tile.highres_axis.sample_interval),
+        state_class_count=np.zeros(3, dtype=np.int64),
+        state_class_correct=np.zeros(3, dtype=np.int64),
+    )
+
+
+def _path_to_highres_extents(
+    path: SampledPath,
+    *,
+    trace_index: int,
+    model_indices: np.ndarray,
+    model_coordinates: np.ndarray,
+    highres_indices: np.ndarray,
+    highres_coordinates: np.ndarray,
+) -> tuple[SegmentExtent, ...]:
+    """Map model-grid MAP boundaries to one complete high-resolution zone."""
+
+    model = np.asarray(model_indices, dtype=np.int64).reshape(-1)
+    highres = np.asarray(highres_indices, dtype=np.int64).reshape(-1)
+    if model.size != path.state.size or model.size == 0:
+        raise ValueError("HSMM path and model support must share one non-empty axis.")
+    if highres.size < len(path.segments) or np.any(np.diff(highres) != 1):
+        raise ValueError("high-resolution zone support must be contiguous and sufficient.")
+    if np.any(np.diff(model) != 1):
+        raise ValueError("model-grid HSMM support must be contiguous.")
+    high_start = int(highres[0])
+    high_stop = int(highres[-1]) + 1
+    boundaries = [high_start]
+    segment_count = len(path.segments)
+    for segment_index, (_, _, local_stop) in enumerate(path.segments[:-1], start=1):
+        if local_stop <= 0 or local_stop >= model.size:
+            raise ValueError("HSMM path contains an invalid internal endpoint.")
+        left = float(model_coordinates[model[local_stop - 1]])
+        right = float(model_coordinates[model[local_stop]])
+        coordinate = 0.5 * (left + right)
+        candidate = int(np.searchsorted(highres_coordinates, coordinate, side="left"))
+        minimum = boundaries[-1] + 1
+        remaining = segment_count - segment_index
+        maximum = high_stop - remaining
+        boundaries.append(int(np.clip(candidate, minimum, maximum)))
+    boundaries.append(high_stop)
+    extents = tuple(
+        SegmentExtent(
+            trace_index=trace_index,
+            state_id=int(state),
+            start_index=int(boundaries[index]),
+            stop_index=int(boundaries[index + 1]),
+            duration_fraction=float((stop - start) / model.size),
+        )
+        for index, (state, start, stop) in enumerate(path.segments)
+    )
+    if extents[0].start_index != high_start or extents[-1].stop_index != high_stop:
+        raise RuntimeError("mapped high-resolution segments do not cover the zone.")
+    return extents
+
+
+def _project_complete_highres_support(
+    values: np.ndarray,
+    support: np.ndarray,
+    *,
+    highres_interval: float,
+    model_interval: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    data = np.asarray(values, dtype=np.float64)
+    valid = np.asarray(support, dtype=bool)
+    if data.shape != valid.shape or data.ndim != 2:
+        raise ValueError("supported projection requires matching 2D arrays.")
+    ratio = model_interval / highres_interval
+    factor = int(round(ratio))
+    if factor < 1 or not np.isclose(ratio, factor, rtol=0.0, atol=1.0e-10):
+        raise ValueError("high-resolution and model intervals are not nested.")
+    taps = finite_support_fir(factor)
+    projected, finite_support = valid_filter_decimate(
+        np.where(valid, data, 0.0),
+        factor=factor,
+        taps=taps,
+    )
+    projected_support = np.zeros(projected.shape, dtype=bool)
+    half = taps.size // 2
+    centers = np.arange(projected.shape[-1], dtype=np.int64) * factor
+    selected_centers = centers[finite_support]
+    convolution_indices = selected_centers - half
+    window = np.ones(taps.size, dtype=np.int64)
+    for trace in range(data.shape[0]):
+        count = np.convolve(valid[trace].astype(np.int64), window, mode="valid")
+        projected_support[trace, finite_support] = (
+            count[convolution_indices] == taps.size
+        )
+    return projected, projected_support
+
+
+def _segments_with_coefficients(
+    extents: tuple[SegmentExtent, ...],
+    coefficient: np.ndarray,
+) -> tuple[Segment, ...]:
+    values = np.asarray(coefficient, dtype=np.float64)
+    if values.shape != (len(extents), 3):
+        raise ValueError("segment coefficients must have shape [segment, 3].")
+    return tuple(
+        Segment(
+            trace_index=extent.trace_index,
+            state_id=extent.state_id,
+            start_index=extent.start_index,
+            stop_index=extent.stop_index,
+            c0=float(values[index, 0]),
+            c1=float(values[index, 1]),
+            c2=float(values[index, 2]),
+        )
+        for index, extent in enumerate(extents)
+    )
+
+
+def _reconstruction_metric(
+    prediction: np.ndarray,
+    truth: np.ndarray,
+    support: np.ndarray,
+) -> dict[str, float | int | None]:
+    valid = np.asarray(support, dtype=bool)
+    predicted = np.asarray(prediction, dtype=np.float64)[valid]
+    target = np.asarray(truth, dtype=np.float64)[valid]
+    if predicted.size == 0 or np.any(~np.isfinite(predicted)) or np.any(~np.isfinite(target)):
+        raise ValueError("reconstruction metric requires finite supported samples.")
+    error = predicted - target
+    correlation = None
+    if np.std(predicted) > 0.0 and np.std(target) > 0.0:
+        correlation = float(np.corrcoef(predicted, target)[0, 1])
+    return {
+        "supported_samples": int(target.size),
+        "rmse": float(np.sqrt(np.mean(error * error))),
+        "mae": float(np.mean(np.abs(error))),
+        "correlation": correlation,
+    }
+
+
+def _new_reconstruction_statistics() -> dict[str, Any]:
+    return {
+        "highres": {
+            name: _new_profile_statistics()
+            for name in _RECONSTRUCTION_HIGHRES_METHODS
+        },
+        "model": {
+            name: _new_profile_statistics()
+            for name in _RECONSTRUCTION_MODEL_METHODS
+        },
+        "state_class_count": np.zeros(3, dtype=np.int64),
+        "state_class_correct": np.zeros(3, dtype=np.int64),
+        "truth_segment_count": 0,
+        "map_segment_count": 0,
+        "trace_count": 0,
+        "parent_count": 0,
+    }
+
+
+def _project_parent_methods(
+    parent: _MapReconstructionParent,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    projected: dict[str, np.ndarray] = {}
+    common_support: np.ndarray | None = None
+    for name in _RECONSTRUCTION_HIGHRES_METHODS:
+        values, support = _project_complete_highres_support(
+            parent.highres_prediction[name],
+            parent.highres_support,
+            highres_interval=parent.highres_interval,
+            model_interval=parent.model_interval,
+        )
+        projected[name] = values
+        common_support = support if common_support is None else common_support & support
+    if common_support is None:
+        raise RuntimeError("reconstruction has no projected methods.")
+    common_support &= parent.model_support
+    if not np.any(common_support):
+        raise ValueError("reconstruction has no complete projection support.")
+    projected["direct_bandlimited_evidence"] = parent.direct_model_prediction
+    return projected, common_support
+
+
+def _update_reconstruction_statistics(
+    statistics: dict[str, Any],
+    parent: _MapReconstructionParent,
+    projected: Mapping[str, np.ndarray],
+    model_support: np.ndarray,
+) -> None:
+    for name in _RECONSTRUCTION_HIGHRES_METHODS:
+        _update_profile_statistics(
+            statistics["highres"][name],
+            parent.highres_prediction[name][parent.highres_support],
+            parent.highres_truth[parent.highres_support],
+        )
+    for name in _RECONSTRUCTION_MODEL_METHODS:
+        _update_profile_statistics(
+            statistics["model"][name],
+            np.asarray(projected[name])[model_support],
+            parent.model_truth[model_support],
+        )
+    statistics["state_class_count"] += parent.state_class_count
+    statistics["state_class_correct"] += parent.state_class_correct
+    statistics["truth_segment_count"] += parent.truth_segment_count
+    statistics["map_segment_count"] += parent.map_segment_count
+    statistics["trace_count"] += parent.trace_count
+    statistics["parent_count"] += 1
+
+
+def _finalize_reconstruction_statistics(
+    statistics: Mapping[str, Any],
+) -> dict[str, Any]:
+    def metrics(values: Mapping[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for name, row in values.items():
+            finalized = _finalize_profile_statistics(row)
+            result[name] = {
+                "supported_samples": finalized["supported_samples"],
+                "rmse": finalized["increment_rmse"],
+                "mae": finalized["increment_mae"],
+                "correlation": finalized["increment_correlation"],
+            }
+        return result
+
+    count = np.asarray(statistics["state_class_count"], dtype=np.int64)
+    correct = np.asarray(statistics["state_class_correct"], dtype=np.int64)
+    present = count > 0
+    traces = int(statistics["trace_count"])
+    return {
+        "parent_count": int(statistics["parent_count"]),
+        "highres_log_ai": metrics(statistics["highres"]),
+        "projected_log_ai": metrics(statistics["model"]),
+        "hsmm": {
+            "supported_samples": int(np.sum(count)),
+            "state_accuracy": float(np.sum(correct) / np.sum(count)),
+            "state_balanced_accuracy": float(np.mean(correct[present] / count[present])),
+            "state_class_count": count.tolist(),
+            "trace_count": traces,
+            "truth_segment_count_mean": float(
+                statistics["truth_segment_count"] / traces
+            ),
+            "map_segment_count_mean": float(
+                statistics["map_segment_count"] / traces
+            ),
+            "map_segment_count_bias": float(
+                (statistics["map_segment_count"] - statistics["truth_segment_count"])
+                / traces
+            ),
+        },
+    }
+
+
+def _add_reconstruction_zone(
+    parent: _MapReconstructionParent,
+    generator: ConditionalGenerator,
+    source: Mapping[str, object],
+    *,
+    prior: SemiMarkovPrior,
+    conditioning: SemiMarkovConditioning,
+    profile_prior: Mapping[str, Any],
+) -> None:
+    if str(source["parent_id"]) != parent.parent_id:
+        raise ValueError("reconstruction parent identity changed within a group.")
+    output = _network_output(generator, source)
+    evidence = _observable_evidence_from_batch(generator, source, output)
+    tile = source["observation_tile"]
+    if not isinstance(tile, ObservationTile):
+        raise TypeError("reconstruction source lacks ObservationTile.")
+    zone_support = np.asarray(source["highres_truth_support"], dtype=bool)
+    if np.any(parent.highres_support & zone_support):
+        raise ValueError("high-resolution zone supports overlap within a parent.")
+    extents: list[SegmentExtent] = []
+    oracle_state_extents: list[SegmentExtent] = []
+    truth_state = np.asarray(source["state_emission"], dtype=np.int64)[0]
+    truth_object = np.asarray(source["truth_object_id"], dtype=np.int64)[0]
+    for trace in range(evidence.support.shape[0]):
+        runs = _contiguous_runs(evidence.support[trace])
+        if len(runs) != 1:
+            raise ValueError("clean MAP reconstruction requires one support run per zone trace.")
+        model_start, model_stop = runs[0]
+        model_indices = np.arange(model_start, model_stop, dtype=np.int64)
+        probability = np.exp(evidence.state_log_potential[trace, model_indices])
+        path = viterbi_semi_markov_path(
+            probability,
+            np.full(model_indices.size, 0.5, dtype=np.float64),
+            prior,
+            conditioning,
+        )
+        local_truth_state = truth_state[trace, model_indices]
+        local_truth_path = _truth_path(
+            local_truth_state,
+            truth_object[trace, model_indices],
+        )
+        prediction = path.state.astype(np.int64)
+        for state in range(3):
+            selected = local_truth_state == state
+            parent.state_class_count[state] += int(np.count_nonzero(selected))
+            parent.state_class_correct[state] += int(
+                np.count_nonzero(prediction[selected] == state)
+            )
+        parent.truth_segment_count += len(local_truth_path.segments)
+        parent.map_segment_count += len(path.segments)
+        parent.trace_count += 1
+        highres_indices = np.flatnonzero(zone_support[trace])
+        mapped = _path_to_highres_extents(
+            path,
+            trace_index=trace,
+            model_indices=model_indices,
+            model_coordinates=tile.model_axis.coordinates,
+            highres_indices=highres_indices,
+            highres_coordinates=tile.highres_axis.coordinates,
+        )
+        extents.extend(mapped)
+        oracle_state_extents.extend(
+            dataclass_replace(
+                extent,
+                state_id=int(
+                    np.argmax(
+                        np.bincount(
+                            local_truth_state[start:stop], minlength=3
+                        )
+                    )
+                ),
+            )
+            for extent, (_, start, stop) in zip(
+                mapped, path.segments, strict=True
+            )
+        )
+    extent_tuple = tuple(extents)
+    oracle_extent_tuple = tuple(oracle_state_extents)
+    distributions = generator.parameterize_segments(evidence, extent_tuple)
+    oracle_distributions = generator.parameterize_segments(
+        evidence, oracle_extent_tuple
+    )
+    learned = np.asarray([item.mean for item in distributions], dtype=np.float64)
+    features = build_segment_profile_features(evidence, extent_tuple)
+    deterministic = features[:, :3]
+    prior_mean = np.asarray(profile_prior["mean"], dtype=np.float64)
+    if prior_mean.shape != (3, 3):
+        raise ValueError("state-conditioned profile prior mean must be [3, 3].")
+    state_prior = prior_mean[[extent.state_id for extent in extent_tuple]]
+    coefficients = {
+        "learned_profile_head": learned,
+        "deterministic_evidence_fit": deterministic,
+        "state_conditioned_prior": state_prior,
+        "anchor_only": np.zeros_like(learned),
+        "learned_profile_head_oracle_state": np.asarray(
+            [item.mean for item in oracle_distributions], dtype=np.float64
+        ),
+    }
+    background = np.where(
+        zone_support,
+        np.asarray(source["lfm_anchor_highres"], dtype=np.float64),
+        np.nan,
+    )
+    for name, values in coefficients.items():
+        method_extents = (
+            oracle_extent_tuple
+            if name in _RECONSTRUCTION_ORACLE_METHODS
+            else extent_tuple
+        )
+        decoded, _ = decode_segments_numpy(
+            background,
+            _segments_with_coefficients(method_extents, values),
+        )
+        parent.highres_prediction[name][zone_support] = decoded[zone_support]
+    truth_highres = (
+        np.asarray(source["lfm_anchor_highres"], dtype=np.float64)
+        + np.asarray(source["highres_log_ai_increment"], dtype=np.float64)
+    )
+    parent.highres_truth[zone_support] = truth_highres[zone_support]
+    parent.highres_support |= zone_support
+
+    model_support = evidence.support
+    if np.any(parent.model_support & model_support):
+        raise ValueError("model-grid zone supports overlap within a parent.")
+    background_model = evidence.background_lfm_linear
+    truth_model = background_model + np.asarray(
+        source["projected_log_ai_increment"], dtype=np.float64
+    )[0]
+    direct_model = background_model + evidence.projected_log_ai_increment_mean
+    parent.model_truth[model_support] = truth_model[model_support]
+    parent.direct_model_prediction[model_support] = direct_model[model_support]
+    parent.model_support |= model_support
+    parent.zone_count += 1
+
+
+def evaluate_map_reconstruction(
+    generator: ConditionalGenerator,
+    batches: Iterable[Mapping[str, object]],
+    *,
+    prior: SemiMarkovPrior,
+    conditioning: SemiMarkovConditioning,
+    profile_prior: Mapping[str, Any],
+    logger: logging.Logger | None = None,
+    log_every_parents: int = 3,
+) -> dict[str, Any]:
+    """Evaluate the first complete MAP HSMM/profile/decoder reconstruction."""
+
+    if generator.profile_head is None:
+        raise ValueError("MAP reconstruction requires a V4 profile-head checkpoint.")
+    if profile_prior.get("schema") != "structured_ginn_v2_segment_profile_prior_v1":
+        raise ValueError("unsupported state-conditioned profile prior.")
+    if log_every_parents <= 0:
+        raise ValueError("log_every_parents must be positive.")
+    log = logger or logging.getLogger(__name__)
+    global_statistics = _new_reconstruction_statistics()
+    family_statistics: dict[str, dict[str, Any]] = {}
+    parent_rows: list[dict[str, Any]] = []
+    current: _MapReconstructionParent | None = None
+    start_time = time.perf_counter()
+
+    def finalize(parent: _MapReconstructionParent) -> None:
+        projected, model_support = _project_parent_methods(parent)
+        _update_reconstruction_statistics(
+            global_statistics, parent, projected, model_support
+        )
+        family = family_statistics.setdefault(
+            parent.geometry_family, _new_reconstruction_statistics()
+        )
+        _update_reconstruction_statistics(family, parent, projected, model_support)
+        parent_rows.append(
+            {
+                "parent_id": parent.parent_id,
+                "geometry_family": parent.geometry_family,
+                "zone_count": parent.zone_count,
+                "highres_log_ai": {
+                    name: _reconstruction_metric(
+                        parent.highres_prediction[name],
+                        parent.highres_truth,
+                        parent.highres_support,
+                    )
+                    for name in _RECONSTRUCTION_HIGHRES_METHODS
+                },
+                "projected_log_ai": {
+                    name: _reconstruction_metric(
+                        projected[name], parent.model_truth, model_support
+                    )
+                    for name in _RECONSTRUCTION_MODEL_METHODS
+                },
+                "truth_segment_count_mean": (
+                    parent.truth_segment_count / parent.trace_count
+                ),
+                "map_segment_count_mean": (
+                    parent.map_segment_count / parent.trace_count
+                ),
+            }
+        )
+        if len(parent_rows) % log_every_parents == 0:
+            log.info(
+                "MAP reconstruction | parents=%d | elapsed=%.1fs",
+                len(parent_rows),
+                time.perf_counter() - start_time,
+            )
+
+    for source in batches:
+        parent_id = str(source["parent_id"])
+        if current is None:
+            current = _new_map_reconstruction_parent(source)
+        elif parent_id != current.parent_id:
+            finalize(current)
+            current = _new_map_reconstruction_parent(source)
+        _add_reconstruction_zone(
+            current,
+            generator,
+            source,
+            prior=prior,
+            conditioning=conditioning,
+            profile_prior=profile_prior,
+        )
+    if current is None:
+        raise ValueError("MAP reconstruction received no batches.")
+    finalize(current)
+    aggregate = _finalize_reconstruction_statistics(global_statistics)
+    highres = aggregate["highres_log_ai"]
+    model = aggregate["projected_log_ai"]
+    strongest_highres = min(
+        highres[name]["rmse"]
+        for name in _RECONSTRUCTION_PROFILE_METHODS
+        if name != "learned_profile_head"
+    )
+    strongest_model = min(
+        model[name]["rmse"]
+        for name in _RECONSTRUCTION_MODEL_METHODS
+        if (
+            name != "learned_profile_head"
+            and name not in _RECONSTRUCTION_ORACLE_METHODS
+        )
+    )
+    return {
+        "schema": "structured_ginn_v2_map_reconstruction_v1",
+        "status": "success",
+        "resolution": {
+            "segmentation": "model_grid_map_hsmm",
+            "profile": "high_resolution_three_basis_mean",
+            "projection": "finite_support_complete_zone_union",
+        },
+        "conditioning": conditioning.to_mapping(),
+        "profile_prior_schema": profile_prior["schema"],
+        "aggregate": aggregate,
+        "by_geometry_family": {
+            name: _finalize_reconstruction_statistics(statistics)
+            for name, statistics in sorted(family_statistics.items())
+        },
+        "gate": {
+            "learned_minus_strongest_highres_baseline_rmse": float(
+                highres["learned_profile_head"]["rmse"] - strongest_highres
+            ),
+            "learned_minus_strongest_projected_baseline_rmse": float(
+                model["learned_profile_head"]["rmse"] - strongest_model
+            ),
+            "learned_beats_strongest_highres_baseline": bool(
+                highres["learned_profile_head"]["rmse"] < strongest_highres
+            ),
+            "learned_beats_strongest_projected_baseline": bool(
+                model["learned_profile_head"]["rmse"] < strongest_model
+            ),
+        },
+        "parents": parent_rows,
+    }
+
+
+def _new_ensemble_statistics() -> dict[str, Any]:
+    return {
+        "zone_count": 0,
+        "parent_ids": set(),
+        "highres_count": 0,
+        "highres_mean_squared_error": 0.0,
+        "highres_representative_squared_error": 0.0,
+        "highres_crps": 0.0,
+        "highres_coverage": np.zeros(3, dtype=np.int64),
+        "projected_count": 0,
+        "projected_mean_squared_error": 0.0,
+        "projected_representative_squared_error": 0.0,
+        "projected_crps": 0.0,
+        "projected_coverage": np.zeros(3, dtype=np.int64),
+        "state_count": 0,
+        "state_brier": 0.0,
+        "interface_count": 0,
+        "interface_truth_count": 0,
+        "interface_brier": 0.0,
+        "segment_count_samples": 0,
+        "truth_segment_count": 0.0,
+        "ensemble_segment_count": 0.0,
+        "segment_count_error": 0.0,
+        "segment_count_absolute_error": 0.0,
+        "duration_count": 0,
+        "duration_squared_error": 0.0,
+        "forward_recursions": 0,
+        "backward_samples": 0,
+    }
+
+
+def _ensemble_crps(members: np.ndarray, truth: np.ndarray) -> np.ndarray:
+    """Return empirical CRPS without materializing a K-by-K pair matrix."""
+
+    values = np.asarray(members, dtype=np.float64)
+    target = np.asarray(truth, dtype=np.float64).reshape(-1)
+    if values.ndim != 2 or values.shape[1] != target.size or values.shape[0] < 2:
+        raise ValueError("ensemble CRPS requires [member, sample] with K >= 2.")
+    ordered = np.sort(values, axis=0)
+    count = values.shape[0]
+    weights = 2.0 * np.arange(1, count + 1, dtype=np.float64) - count - 1.0
+    pair_term = np.sum(weights[:, None] * ordered, axis=0) / (count * count)
+    return np.mean(np.abs(values - target[None, :]), axis=0) - pair_term
+
+
+def _update_ensemble_continuous_statistics(
+    statistics: dict[str, Any],
+    *,
+    prefix: str,
+    members: np.ndarray,
+    mean: np.ndarray,
+    representative: np.ndarray,
+    truth: np.ndarray,
+) -> None:
+    values = np.asarray(members, dtype=np.float64)
+    target = np.asarray(truth, dtype=np.float64).reshape(-1)
+    average = np.asarray(mean, dtype=np.float64).reshape(-1)
+    selected = np.asarray(representative, dtype=np.float64).reshape(-1)
+    if (
+        values.ndim != 2
+        or values.shape[1] != target.size
+        or average.shape != target.shape
+        or selected.shape != target.shape
+        or np.any(~np.isfinite(values))
+        or np.any(~np.isfinite(target))
+        or np.any(~np.isfinite(average))
+        or np.any(~np.isfinite(selected))
+    ):
+        raise ValueError("ensemble metrics require finite aligned values.")
+    statistics[f"{prefix}_count"] += target.size
+    statistics[f"{prefix}_mean_squared_error"] += float(
+        np.sum((average - target) ** 2)
+    )
+    statistics[f"{prefix}_representative_squared_error"] += float(
+        np.sum((selected - target) ** 2)
+    )
+    statistics[f"{prefix}_crps"] += float(
+        np.sum(_ensemble_crps(values, target))
+    )
+    for index, interval in enumerate((0.50, 0.80, 0.95)):
+        tail = (1.0 - interval) / 2.0
+        lower, upper = np.quantile(values, (tail, 1.0 - tail), axis=0)
+        statistics[f"{prefix}_coverage"][index] += int(
+            np.count_nonzero((target >= lower) & (target <= upper))
+        )
+
+
+@dataclass
+class _EnsembleParentBuilder:
+    parent_id: str
+    geometry_family: str
+    lateral_m: np.ndarray
+    model_coordinates: np.ndarray
+    highres_coordinates: np.ndarray
+    sample_domain: str
+    sample_unit: str
+    model_interval: float
+    highres_interval: float
+    member_identities: tuple[int, ...]
+    seismic: np.ndarray
+    observed_valid: np.ndarray
+    highres_anchor: np.ndarray
+    highres_truth: np.ndarray
+    highres_support: np.ndarray
+    highres_members: np.ndarray
+    highres_interfaces: np.ndarray
+    model_truth: np.ndarray
+    model_evidence_target: np.ndarray
+    model_support: np.ndarray
+    zone_count: int = 0
+    state_count: int = 0
+    state_brier: float = 0.0
+    interface_count: int = 0
+    interface_truth_count: int = 0
+    interface_brier: float = 0.0
+    segment_count_samples: int = 0
+    truth_segment_count: float = 0.0
+    ensemble_segment_count: float = 0.0
+    segment_count_error: float = 0.0
+    segment_count_absolute_error: float = 0.0
+    duration_count: int = 0
+    duration_squared_error: float = 0.0
+    forward_recursions: int = 0
+    backward_samples: int = 0
+
+
+@dataclass(frozen=True)
+class _EnsembleParentResult:
+    parent_id: str
+    geometry_family: str
+    zone_count: int
+    representative_member_index: int
+    highres_members: np.ndarray
+    highres_mean: np.ndarray
+    highres_representative: np.ndarray
+    highres_truth: np.ndarray
+    projected_members: np.ndarray
+    projected_mean: np.ndarray
+    projected_representative: np.ndarray
+    projected_truth: np.ndarray
+    projected_supported_samples: int
+    state_count: int
+    state_brier: float
+    interface_count: int
+    interface_truth_count: int
+    interface_brier: float
+    segment_count_samples: int
+    truth_segment_count: float
+    ensemble_segment_count: float
+    segment_count_error: float
+    segment_count_absolute_error: float
+    duration_count: int
+    duration_squared_error: float
+    forward_recursions: int
+    backward_samples: int
+
+
+def _new_ensemble_parent_builder(
+    source: Mapping[str, object],
+    prediction: StructuredPrediction,
+    *,
+    realization_count: int,
+) -> _EnsembleParentBuilder:
+    tile = source.get("observation_tile")
+    if not isinstance(tile, ObservationTile):
+        raise TypeError("ensemble parent source requires an ObservationTile.")
+    if prediction.realizations is None:
+        raise ValueError("ensemble evaluation requires retained realizations.")
+    high_shape = np.asarray(source["highres_truth_support"]).shape
+    model_shape = np.asarray(source["support"])[0].shape
+    return _EnsembleParentBuilder(
+        parent_id=str(source["parent_id"]),
+        geometry_family=str(source["geometry_family"]),
+        lateral_m=tile.lateral_m.copy(),
+        model_coordinates=tile.model_axis.coordinates.copy(),
+        highres_coordinates=tile.highres_axis.coordinates.copy(),
+        sample_domain=tile.model_axis.sample_domain,
+        sample_unit=tile.model_axis.unit,
+        model_interval=float(tile.model_axis.sample_interval),
+        highres_interval=float(tile.highres_axis.sample_interval),
+        member_identities=prediction.realization_identities,
+        seismic=tile.seismic.copy(),
+        observed_valid=tile.observed_valid.copy(),
+        highres_anchor=np.full(high_shape, np.nan, dtype=np.float64),
+        highres_truth=np.full(high_shape, np.nan, dtype=np.float64),
+        highres_support=np.zeros(high_shape, dtype=bool),
+        highres_members=np.full(
+            (realization_count,) + high_shape, np.nan, dtype=np.float64
+        ),
+        highres_interfaces=np.zeros(
+            (realization_count,) + high_shape, dtype=bool
+        ),
+        model_truth=np.full(model_shape, np.nan, dtype=np.float64),
+        model_evidence_target=np.full(model_shape, np.nan, dtype=np.float64),
+        model_support=np.zeros(model_shape, dtype=bool),
+    )
+
+
+def _model_center_highres_indices(
+    builder: _EnsembleParentBuilder,
+    model_indices: np.ndarray,
+) -> np.ndarray:
+    coordinates = builder.model_coordinates[np.asarray(model_indices, dtype=np.int64)]
+    indices = np.searchsorted(builder.highres_coordinates, coordinates, side="left")
+    if np.any(indices >= builder.highres_coordinates.size) or not np.allclose(
+        builder.highres_coordinates[indices],
+        coordinates,
+        rtol=0.0,
+        atol=max(builder.highres_interval * 1.0e-8, 1.0e-10),
+    ):
+        raise ValueError("model-grid centers are not nested on the high-resolution axis.")
+    return indices.astype(np.int64)
+
+
+def _member_model_renewal(
+    segments: tuple[Segment, ...],
+    *,
+    trace_index: int,
+    local_model_coordinates: np.ndarray,
+    highres_coordinates: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    selected = sorted(
+        (item for item in segments if item.trace_index == trace_index),
+        key=lambda item: item.start_index,
+    )
+    if not selected:
+        raise ValueError("sampled realization lacks a supported trace path.")
+    renewal = np.zeros(local_model_coordinates.size, dtype=np.float64)
+    for segment in selected[1:]:
+        coordinate = float(highres_coordinates[segment.start_index])
+        local_index = int(
+            np.searchsorted(local_model_coordinates, coordinate, side="right")
+        )
+        if local_index <= 0 or local_index >= local_model_coordinates.size:
+            raise ValueError("sampled segment endpoint cannot map to a model boundary.")
+        if renewal[local_index] != 0.0:
+            raise ValueError("two sampled endpoints map to one model boundary.")
+        renewal[local_index] = 1.0
+    starts = np.r_[0, np.flatnonzero(renewal[1:]) + 1]
+    stops = np.r_[starts[1:], local_model_coordinates.size]
+    duration = (stops - starts).astype(np.float64) / local_model_coordinates.size
+    if duration.size != len(selected):
+        raise RuntimeError("sampled model-grid durations lost a segment endpoint.")
+    return renewal, duration
+
+
+def _add_ensemble_zone(
+    builder: _EnsembleParentBuilder,
+    source: Mapping[str, object],
+    evidence: ObservableEvidence,
+    prediction: StructuredPrediction,
+    *,
+    policy: GenerationPolicy,
+) -> dict[str, Any]:
+    if str(source["parent_id"]) != builder.parent_id:
+        raise ValueError("ensemble parent identity changed within a builder.")
+    if str(source["geometry_family"]) != builder.geometry_family:
+        raise ValueError("ensemble geometry family changed within a parent.")
+    if prediction.realizations is None or len(prediction.realizations) != policy.realization_count:
+        raise ValueError("ensemble zone returned the wrong retained member count.")
+    if prediction.realization_identities != builder.member_identities:
+        raise RuntimeError("ensemble member identities changed between parent zones.")
+
+    highres_support = evidence.highres_support
+    model_support = evidence.support
+    if np.any(builder.highres_support & highres_support):
+        raise ValueError("ensemble high-resolution zone supports overlap.")
+    if np.any(builder.model_support & model_support):
+        raise ValueError("ensemble model-grid zone supports overlap.")
+    truth_highres = (
+        np.asarray(source["lfm_anchor_highres"], dtype=np.float64)
+        + np.asarray(source["highres_log_ai_increment"], dtype=np.float64)
+    )
+    builder.highres_anchor[highres_support] = np.asarray(
+        source["lfm_anchor_highres"], dtype=np.float64
+    )[highres_support]
+    builder.highres_truth[highres_support] = truth_highres[highres_support]
+    for member_index, member in enumerate(prediction.realizations):
+        builder.highres_members[member_index, highres_support] = (
+            member.log_ai_highres[highres_support]
+        )
+        for segment in member.segments:
+            if segment.start_index < 0 or segment.start_index >= highres_support.shape[1]:
+                raise ValueError("sampled segment start is outside the high-resolution axis.")
+            if highres_support[segment.trace_index, segment.start_index]:
+                builder.highres_interfaces[
+                    member_index,
+                    segment.trace_index,
+                    segment.start_index,
+                ] = True
+    builder.highres_support |= highres_support
+    truth_model = evidence.background_lfm_linear + np.asarray(
+        source["projected_log_ai_increment"], dtype=np.float64
+    )[0]
+    evidence_target = (
+        evidence.background_lfm_linear
+        + evidence.projected_log_ai_increment_mean
+    )
+    builder.model_truth[model_support] = truth_model[model_support]
+    builder.model_evidence_target[model_support] = evidence_target[model_support]
+    builder.model_support |= model_support
+
+    truth_state = np.asarray(source["state_emission"], dtype=np.int64)[0]
+    truth_object = np.asarray(source["truth_object_id"], dtype=np.int64)[0]
+    for trace in range(model_support.shape[0]):
+        runs = _contiguous_runs(model_support[trace])
+        if not runs:
+            continue
+        if len(runs) != 1:
+            raise ValueError("ensemble zone requires one model support run per trace.")
+        start, stop = runs[0]
+        model_indices = np.arange(start, stop, dtype=np.int64)
+        highres_indices = _model_center_highres_indices(builder, model_indices)
+        truth_path = _truth_path(
+            truth_state[trace, model_indices],
+            truth_object[trace, model_indices],
+        )
+        member_state = np.stack(
+            [
+                member.state_highres[trace, highres_indices]
+                for member in prediction.realizations
+            ]
+        ).astype(np.int64)
+        if np.any((member_state < 0) | (member_state > 2)):
+            raise ValueError("sampled state is invalid at a model-grid center.")
+        occupancy = np.stack(
+            [np.mean(member_state == state, axis=0) for state in range(3)],
+            axis=-1,
+        )
+        one_hot = np.eye(3, dtype=np.float64)[truth_path.state.astype(np.int64)]
+        builder.state_count += model_indices.size
+        builder.state_brier += float(np.sum((occupancy - one_hot) ** 2))
+
+        truth_renewal = np.zeros(model_indices.size, dtype=np.float64)
+        truth_renewal[[item[1] for item in truth_path.segments[1:]]] = 1.0
+        member_renewal: list[np.ndarray] = []
+        member_duration: list[np.ndarray] = []
+        for member in prediction.realizations:
+            renewal, duration = _member_model_renewal(
+                member.segments,
+                trace_index=trace,
+                local_model_coordinates=builder.model_coordinates[model_indices],
+                highres_coordinates=builder.highres_coordinates,
+            )
+            member_renewal.append(renewal)
+            member_duration.append(duration)
+        renewal_probability = np.mean(np.stack(member_renewal), axis=0)
+        if model_indices.size > 1:
+            builder.interface_count += model_indices.size - 1
+            builder.interface_truth_count += int(np.count_nonzero(truth_renewal[1:]))
+            builder.interface_brier += float(
+                np.sum((renewal_probability[1:] - truth_renewal[1:]) ** 2)
+            )
+        predicted_count = float(
+            np.mean([duration.size for duration in member_duration])
+        )
+        truth_count = float(len(truth_path.segments))
+        count_error = predicted_count - truth_count
+        builder.segment_count_samples += 1
+        builder.truth_segment_count += truth_count
+        builder.ensemble_segment_count += predicted_count
+        builder.segment_count_error += count_error
+        builder.segment_count_absolute_error += abs(count_error)
+        predicted_duration_mean = float(
+            np.mean(np.concatenate(member_duration))
+        )
+        truth_duration_mean = float(
+            np.mean(
+                [
+                    (item[2] - item[1]) / truth_path.state.size
+                    for item in truth_path.segments
+                ]
+            )
+        )
+        builder.duration_count += 1
+        builder.duration_squared_error += (
+            predicted_duration_mean - truth_duration_mean
+        ) ** 2
+
+    builder.zone_count += 1
+    builder.forward_recursions += int(
+        prediction.diagnostics["semi_markov_forward_recursions"]
+    )
+    builder.backward_samples += int(
+        prediction.diagnostics["semi_markov_backward_samples"]
+    )
+    return {
+        "parent_id": builder.parent_id,
+        "tile_id": str(source["tile_id"]),
+        "geometry_family": builder.geometry_family,
+        "supported_traces": int(np.count_nonzero(np.any(model_support, axis=1))),
+        "forward_recursions": int(
+            prediction.diagnostics["semi_markov_forward_recursions"]
+        ),
+        "backward_samples": int(
+            prediction.diagnostics["semi_markov_backward_samples"]
+        ),
+    }
+
+
+def _finalize_ensemble_parent(
+    builder: _EnsembleParentBuilder,
+) -> _EnsembleParentResult:
+    if not np.any(builder.highres_support) or not np.any(builder.model_support):
+        raise ValueError("ensemble parent has no complete support.")
+    if np.any(~np.isfinite(builder.highres_truth[builder.highres_support])) or np.any(
+        ~np.isfinite(builder.highres_members[:, builder.highres_support])
+    ):
+        raise ValueError("ensemble parent high-resolution values are incomplete.")
+    projected_members: list[np.ndarray] = []
+    projected_support: np.ndarray | None = None
+    for member in builder.highres_members:
+        projected, support = project_supported_highres_to_model(
+            member,
+            builder.highres_support,
+            highres_interval=builder.highres_interval,
+            model_interval=builder.model_interval,
+        )
+        support &= builder.model_support
+        if projected_support is None:
+            projected_support = support
+        elif not np.array_equal(projected_support, support):
+            raise RuntimeError("parent ensemble members produced different support.")
+        projected_members.append(projected)
+    if projected_support is None or not np.any(projected_support):
+        raise ValueError("ensemble parent has no complete projected support.")
+    projected_stack = np.stack(projected_members)
+    if np.any(~np.isfinite(builder.model_truth[projected_support])) or np.any(
+        ~np.isfinite(builder.model_evidence_target[projected_support])
+    ):
+        raise ValueError("ensemble parent model targets are incomplete.")
+    evidence_error = np.mean(
+        (
+            projected_stack[:, projected_support]
+            - builder.model_evidence_target[projected_support][None, :]
+        )
+        ** 2,
+        axis=1,
+    )
+    representative_index = int(np.argmin(evidence_error))
+    return _EnsembleParentResult(
+        parent_id=builder.parent_id,
+        geometry_family=builder.geometry_family,
+        zone_count=builder.zone_count,
+        representative_member_index=representative_index,
+        highres_members=builder.highres_members[:, builder.highres_support],
+        highres_mean=np.mean(
+            builder.highres_members[:, builder.highres_support], axis=0
+        ),
+        highres_representative=builder.highres_members[
+            representative_index, builder.highres_support
+        ],
+        highres_truth=builder.highres_truth[builder.highres_support],
+        projected_members=projected_stack[:, projected_support],
+        projected_mean=np.mean(projected_stack[:, projected_support], axis=0),
+        projected_representative=projected_stack[
+            representative_index, projected_support
+        ],
+        projected_truth=builder.model_truth[projected_support],
+        projected_supported_samples=int(np.count_nonzero(projected_support)),
+        state_count=builder.state_count,
+        state_brier=builder.state_brier,
+        interface_count=builder.interface_count,
+        interface_truth_count=builder.interface_truth_count,
+        interface_brier=builder.interface_brier,
+        segment_count_samples=builder.segment_count_samples,
+        truth_segment_count=builder.truth_segment_count,
+        ensemble_segment_count=builder.ensemble_segment_count,
+        segment_count_error=builder.segment_count_error,
+        segment_count_absolute_error=builder.segment_count_absolute_error,
+        duration_count=builder.duration_count,
+        duration_squared_error=builder.duration_squared_error,
+        forward_recursions=builder.forward_recursions,
+        backward_samples=builder.backward_samples,
+    )
+
+
+def _update_ensemble_parent_statistics(
+    statistics: dict[str, Any],
+    parent: _EnsembleParentResult,
+) -> None:
+    _update_ensemble_continuous_statistics(
+        statistics,
+        prefix="highres",
+        members=parent.highres_members,
+        mean=parent.highres_mean,
+        representative=parent.highres_representative,
+        truth=parent.highres_truth,
+    )
+    _update_ensemble_continuous_statistics(
+        statistics,
+        prefix="projected",
+        members=parent.projected_members,
+        mean=parent.projected_mean,
+        representative=parent.projected_representative,
+        truth=parent.projected_truth,
+    )
+    statistics["parent_ids"].add(parent.parent_id)
+    statistics["zone_count"] += parent.zone_count
+    for name in (
+        "state_count",
+        "state_brier",
+        "interface_count",
+        "interface_truth_count",
+        "interface_brier",
+        "segment_count_samples",
+        "truth_segment_count",
+        "ensemble_segment_count",
+        "segment_count_error",
+        "segment_count_absolute_error",
+        "duration_count",
+        "duration_squared_error",
+        "forward_recursions",
+        "backward_samples",
+    ):
+        statistics[name] += getattr(parent, name)
+
+
+def _finalize_ensemble_statistics(statistics: Mapping[str, Any]) -> dict[str, Any]:
+    def continuous(prefix: str) -> dict[str, Any]:
+        count = int(statistics[f"{prefix}_count"])
+        if count <= 0:
+            raise ValueError(f"ensemble evaluation has no {prefix} support.")
+        return {
+            "supported_samples": count,
+            "ensemble_mean_rmse": float(
+                np.sqrt(float(statistics[f"{prefix}_mean_squared_error"]) / count)
+            ),
+            "representative_rmse": float(
+                np.sqrt(
+                    float(statistics[f"{prefix}_representative_squared_error"])
+                    / count
+                )
+            ),
+            "crps": float(statistics[f"{prefix}_crps"]) / count,
+            "coverage_50": float(statistics[f"{prefix}_coverage"][0]) / count,
+            "coverage_80": float(statistics[f"{prefix}_coverage"][1]) / count,
+            "coverage_95": float(statistics[f"{prefix}_coverage"][2]) / count,
+        }
+
+    segment_count_samples = int(statistics["segment_count_samples"])
+    duration_count = int(statistics["duration_count"])
+    state_count = int(statistics["state_count"])
+    interface_count = int(statistics["interface_count"])
+    forward = int(statistics["forward_recursions"])
+    backward = int(statistics["backward_samples"])
+    return {
+        "parent_count": len(statistics["parent_ids"]),
+        "zone_count": int(statistics["zone_count"]),
+        "highres_log_ai": continuous("highres"),
+        "projected_log_ai": continuous("projected"),
+        "state_occupancy_brier": float(statistics["state_brier"]) / state_count,
+        "interface_density_brier": float(statistics["interface_brier"])
+        / interface_count,
+        "interface_truth_rate": float(statistics["interface_truth_count"])
+        / interface_count,
+        "truth_segment_count_mean": float(statistics["truth_segment_count"])
+        / segment_count_samples,
+        "ensemble_segment_count_mean": float(
+            statistics["ensemble_segment_count"]
+        )
+        / segment_count_samples,
+        "segment_count_bias": float(statistics["segment_count_error"])
+        / segment_count_samples,
+        "segment_count_mae": float(statistics["segment_count_absolute_error"])
+        / segment_count_samples,
+        "duration_fraction_mean_rmse": float(
+            np.sqrt(float(statistics["duration_squared_error"]) / duration_count)
+        ),
+        "forward_recursions": forward,
+        "backward_samples": backward,
+    }
+
+
+def _finite_absolute_limit(*arrays: np.ndarray, quantile: float = 0.99) -> float:
+    finite = [
+        np.abs(np.asarray(array, dtype=np.float64)[np.isfinite(array)])
+        for array in arrays
+    ]
+    populated = [item for item in finite if item.size]
+    if not populated:
+        return 1.0e-8
+    return max(float(np.quantile(np.concatenate(populated), quantile)), 1.0e-8)
+
+
+def _write_ensemble_parent_figure(
+    builder: _EnsembleParentBuilder,
+    parent: _EnsembleParentResult,
+    output_dir: Path,
+) -> Path:
+    """Publish one evidence-aware lateral continuity card for a parent."""
+
+    import matplotlib.pyplot as plt
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    support = builder.highres_support
+    if not np.any(support):
+        raise ValueError("ensemble figure parent has no high-resolution support.")
+    if np.any(~np.isfinite(builder.highres_anchor[support])):
+        raise ValueError("ensemble figure requires a complete high-resolution anchor.")
+
+    truth_increment = np.where(
+        support,
+        builder.highres_truth - builder.highres_anchor,
+        np.nan,
+    )
+    member_increment = np.where(
+        support[None, ...],
+        builder.highres_members - builder.highres_anchor[None, ...],
+        np.nan,
+    )
+    fixed_increment = member_increment[0]
+    representative_increment = member_increment[parent.representative_member_index]
+    ensemble_mean = np.full(builder.highres_truth.shape, np.nan, dtype=np.float64)
+    ensemble_std = np.full(builder.highres_truth.shape, np.nan, dtype=np.float64)
+    ensemble_mean[support] = np.mean(member_increment[:, support], axis=0)
+    ensemble_std[support] = np.std(member_increment[:, support], axis=0)
+    representative_interfaces = builder.highres_interfaces[
+        parent.representative_member_index
+    ] & support
+
+    seismic = np.where(builder.observed_valid, builder.seismic, np.nan)
+    seismic_limit = _finite_absolute_limit(seismic)
+    increment_limit = _finite_absolute_limit(
+        truth_increment,
+        fixed_increment,
+        representative_increment,
+        ensemble_mean,
+    )
+    std_limit = _finite_absolute_limit(ensemble_std)
+    model_extent = (
+        float(builder.lateral_m[0]),
+        float(builder.lateral_m[-1]),
+        float(builder.model_coordinates[-1]),
+        float(builder.model_coordinates[0]),
+    )
+    highres_extent = (
+        float(builder.lateral_m[0]),
+        float(builder.lateral_m[-1]),
+        float(builder.highres_coordinates[-1]),
+        float(builder.highres_coordinates[0]),
+    )
+
+    figure, axes = plt.subplots(2, 3, figsize=(17, 10), sharex=True)
+    panels = (
+        (
+            seismic,
+            "Input clean seismic",
+            "seismic",
+            model_extent,
+            -seismic_limit,
+            seismic_limit,
+        ),
+        (
+            truth_increment,
+            "Truth: log-AI - linear LFM anchor",
+            "coolwarm",
+            highres_extent,
+            -increment_limit,
+            increment_limit,
+        ),
+        (
+            fixed_increment,
+            f"Fixed member 0 | identity={builder.member_identities[0]}",
+            "coolwarm",
+            highres_extent,
+            -increment_limit,
+            increment_limit,
+        ),
+        (
+            representative_increment,
+            f"Representative member {parent.representative_member_index}",
+            "coolwarm",
+            highres_extent,
+            -increment_limit,
+            increment_limit,
+        ),
+        (
+            ensemble_mean,
+            "Ensemble mean (not a structured member)",
+            "coolwarm",
+            highres_extent,
+            -increment_limit,
+            increment_limit,
+        ),
+        (
+            ensemble_std,
+            "Ensemble std + representative segment starts",
+            "magma",
+            highres_extent,
+            0.0,
+            std_limit,
+        ),
+    )
+    for axis, (values, title, color_map, extent, lower, upper) in zip(
+        axes.flat, panels
+    ):
+        image = axis.imshow(
+            np.ma.masked_invalid(values).T,
+            aspect="auto",
+            origin="upper",
+            extent=extent,
+            cmap=color_map,
+            vmin=lower,
+            vmax=upper,
+            interpolation="nearest",
+        )
+        axis.set_title(title, fontsize=9)
+        axis.set_ylabel(f"{builder.sample_domain} [{builder.sample_unit}]")
+        figure.colorbar(image, ax=axis, fraction=0.046, pad=0.03)
+    for axis in axes[-1, :]:
+        axis.set_xlabel("lateral distance [m]")
+
+    vertical_index, lateral_index = np.nonzero(representative_interfaces.T)
+    if vertical_index.size:
+        axes[1, 2].scatter(
+            builder.lateral_m[lateral_index],
+            builder.highres_coordinates[vertical_index],
+            s=2.5,
+            c="cyan",
+            marker=".",
+            linewidths=0.0,
+            alpha=0.8,
+            label="segment start",
+        )
+        axes[1, 2].legend(loc="upper right", fontsize=7)
+    figure.suptitle(
+        "Structured GINN V2 ensemble continuity | "
+        f"{parent.geometry_family} | {parent.parent_id}",
+        fontsize=11,
+    )
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    safe_parent = "".join(
+        character if character.isalnum() or character in "-_." else "_"
+        for character in parent.parent_id
+    )
+    path = output_dir / f"{parent.geometry_family}__{safe_parent}.png"
+    figure.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(figure)
+    return path
+
+
+def evaluate_structured_ensemble(
+    generator: ConditionalGenerator,
+    batches: Iterable[Mapping[str, object]],
+    *,
+    policy: GenerationPolicy = GenerationPolicy(),
+    logger: logging.Logger | None = None,
+    log_every_zones: int = 3,
+    figure_output_dir: Path | None = None,
+    figures_per_family: int = 0,
+) -> dict[str, Any]:
+    """Evaluate exact-HSMM K sampling through the public realize seam."""
+
+    if policy.realization_count < 2 or not policy.retain_realizations:
+        raise ValueError("ensemble evaluation requires K >= 2 retained realizations.")
+    if log_every_zones <= 0:
+        raise ValueError("log_every_zones must be positive.")
+    if figures_per_family < 0:
+        raise ValueError("figures_per_family cannot be negative.")
+    if figures_per_family > 0 and figure_output_dir is None:
+        raise ValueError("figure_output_dir is required when figures are requested.")
+    log = logger or logging.getLogger(__name__)
+    aggregate = _new_ensemble_statistics()
+    by_family = {
+        family: _new_ensemble_statistics()
+        for family in ("none", "wedge", "pinchout")
+    }
+    zone_rows: list[dict[str, Any]] = []
+    parent_rows: list[dict[str, Any]] = []
+    figure_paths: list[str] = []
+    figure_errors: list[dict[str, str]] = []
+    figure_counts = {family: 0 for family in by_family}
+    started = time.perf_counter()
+    generator.network.eval()
+    if generator.profile_head is not None:
+        generator.profile_head.eval()
+    current: _EnsembleParentBuilder | None = None
+    completed: set[str] = set()
+
+    def finalize_current() -> None:
+        nonlocal current
+        if current is None:
+            return
+        parent = _finalize_ensemble_parent(current)
+        _update_ensemble_parent_statistics(aggregate, parent)
+        _update_ensemble_parent_statistics(
+            by_family[parent.geometry_family], parent
+        )
+        if figure_counts[parent.geometry_family] < figures_per_family:
+            try:
+                figure_path = _write_ensemble_parent_figure(
+                    current,
+                    parent,
+                    figure_output_dir,
+                )
+            except Exception as error:
+                log.warning(
+                    "ensemble figure failed | parent=%s | error=%s",
+                    parent.parent_id,
+                    error,
+                )
+                figure_errors.append(
+                    {
+                        "parent_id": parent.parent_id,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    }
+                )
+            else:
+                figure_paths.append(str(figure_path))
+                figure_counts[parent.geometry_family] += 1
+        parent_rows.append(
+            {
+                "parent_id": parent.parent_id,
+                "geometry_family": parent.geometry_family,
+                "zone_count": parent.zone_count,
+                "projected_supported_samples": parent.projected_supported_samples,
+                "representative_member_index": parent.representative_member_index,
+            }
+        )
+        completed.add(parent.parent_id)
+        current = None
+
+    with torch.no_grad():
+        for source in batches:
+            family = str(source["geometry_family"])
+            if family not in by_family:
+                raise ValueError(f"unsupported geometry family {family!r}.")
+            parent_id = str(source["parent_id"])
+            output = _network_output(generator, source)
+            evidence = _observable_evidence_from_batch(generator, source, output)
+            prediction = generator.realize(evidence, policy)
+            if current is None or current.parent_id != parent_id:
+                finalize_current()
+                if parent_id in completed:
+                    raise ValueError("ensemble parent batches are not contiguous.")
+                current = _new_ensemble_parent_builder(
+                    source,
+                    prediction,
+                    realization_count=policy.realization_count,
+                )
+            zone_rows.append(
+                _add_ensemble_zone(
+                    current,
+                    source,
+                    evidence,
+                    prediction,
+                    policy=policy,
+                )
+            )
+            if len(zone_rows) % log_every_zones == 0:
+                visible_parent_count = len(completed) + int(current is not None)
+                log.info(
+                    "ensemble evaluation | zones=%d | parents=%d | elapsed=%.1fs",
+                    len(zone_rows),
+                    visible_parent_count,
+                    time.perf_counter() - started,
+                )
+        finalize_current()
+    if not parent_rows:
+        raise ValueError("ensemble evaluation received no zones.")
+    result = {
+        "schema": "structured_ginn_v2_ensemble_evaluation_v2",
+        "status": "success",
+        "realization_count": policy.realization_count,
+        "policy": asdict(policy),
+        "aggregate": _finalize_ensemble_statistics(aggregate),
+        "geometry_families": {
+            family: _finalize_ensemble_statistics(statistics)
+            for family, statistics in by_family.items()
+        },
+        "parents": parent_rows,
+        "zones": zone_rows,
+        "figures": figure_paths,
+        "figure_errors": figure_errors,
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+    expected_backward = (
+        result["aggregate"]["forward_recursions"] * policy.realization_count
+    )
+    if result["aggregate"]["backward_samples"] != expected_backward:
+        raise RuntimeError("K sampling reran or skipped a posterior backward sample.")
+    return result
 
 
 def train_generator(
@@ -3160,12 +6351,20 @@ def train_generator(
 
 __all__ = [
     "CheckpointCallback",
+    "CoefficientVarianceCalibrationConfig",
     "LearningConfig",
+    "MapProfileProbeConfig",
+    "SegmentProfileLearningConfig",
     "TargetAuditConfig",
     "audit_observable_targets",
+    "calibrate_coefficient_variance",
     "calibrate_semi_markov_fusion",
     "evaluate_generator",
+    "evaluate_map_reconstruction",
+    "evaluate_segment_profile_head",
     "evaluate_semi_markov_oracle",
     "seed_training_random_streams",
     "train_generator",
+    "train_map_profile_probe",
+    "train_segment_profile_head",
 ]

@@ -509,6 +509,8 @@ structured_ginn_v2.py evaluate-ensemble \
   --split calibration \
   --parents-per-family 4 \
   --realization-count 16 \
+  --path-coupling-strength 1 \
+  --profile-coupling-strength 1 \
   --figures-per-family 2 [--smoke]
 ```
 
@@ -522,12 +524,13 @@ model-grid HSMM 的 count target。报告发布 high-resolution/projected ensemb
 代表解 RMSE、CRPS、50/80/95% coverage 及上述结构 posterior proper scores。
 
 `--figures-per-family N` 使用同一评估数据流为每个 geometry family 的前 N 个 parent
-发布横向连续性六联图：输入地震、high-resolution truth、固定 member、代表 member、
-ensemble mean，以及叠加代表 segment 起点的 ensemble standard deviation。固定 member
+发布横向连续性八联图：输入地震、high-resolution truth、固定 member、代表 member、
+ensemble mean、叠加代表 segment 起点的 ensemble standard deviation，以及 truth/代表解的
+event-track 图。固定 member
 和代表 member 是合法 realization；ensemble mean 只用于汇总，不作为结构化解释结果。
 
-命令同时发布 V7 generator checkpoint。V7 包含冻结的 semi-Markov prior、conditioning
-和 coordinate-aligned spatial random-key contract，推理时无需再次拼接实验目录。代表解按 projected AI 到 observable
+命令使用 V6 generator checkpoint，其中包含冻结的 semi-Markov prior 和 conditioning；
+coordinate-aligned random-key 与横向耦合强度属于显式 generation policy。代表解按 projected AI 到 observable
 bandlimited evidence 的距离，从 K 个完整成员中整体选取；并列时选择 conditional score
 更高者。section/volume 的全局成员选择使用同一准则。
 
@@ -552,19 +555,23 @@ sampling；smoke 的 K=2 coverage 只验证接口，不作为科学结论。
 ### 5.3 第三步：横向、dirty 与 section 门禁
 
 单道 clean 门禁通过后接入 21 道、米制距离和显式 mask。横向收益通过 single-trace
-与 neighbor-shuffle 证明。微结构连续性使用由 XY、zone identity 和 realization
-identity 决定的 coordinate-stable correlated random fields。
+与 neighbor-shuffle 证明。微结构连续性同时使用由 XY、zone identity 和 realization identity
+决定的 coordinate-stable correlated random fields，以及基于相邻道单调 event alignment 的
+soft conditional coupling。
 
 随机场的垂向 identity 使用 zone-relative 坐标：HSMM backward sampling 按当前 endpoint
 取随机数，profile coefficient 按 segment 中点、state 和 coefficient 类型取随机数。
-因此相邻道发生 split/merge 时，其余 segment 的随机身份保持稳定；每道使用的随机变量
-仍为均匀分布，单道 exact posterior 与 coefficient marginal 保持不变。
+因此相邻道发生 split/merge 时，其余 segment 的随机身份保持稳定。每道先从 exact posterior
+抽取 K 个合法候选，再在保持中心道 member identity 的条件下，以 path score 和相邻事件
+位置、厚度、state 的组合代价选择 K 套横向路径。profile mean 与随机残差只在匹配到的同一
+event track 内按米制距离耦合；birth、death 和 pinchout 不跨拓扑断点平滑。
 
-短 patch 首先报告三项横向门禁：anchor-relative high-resolution increment 的 normalized-zone
+短 patch 报告两组横向门禁。第一组是 anchor-relative high-resolution increment 的 normalized-zone
 横向梯度、normalized-zone state neighbor agreement，以及相邻道 renewal-position
 Wasserstein distance。每项同时报告 truth、representative 和 ensemble-members summary，
-并按 geometry family 分层。coordinate-aligned random key 未达到门禁时，再引入相邻路径的
-soft conditional coupling。
+并按 geometry family 分层。第二组直接在单调匹配的 segment event 上报告 matched fraction、
+中点偏移、厚度 log-ratio、state mismatch、profile RMS log-ratio 和 profile mean jump。
+event-track 图与第二组指标共同作为横向连续性的主要判据；第一组保留为边际粗糙度诊断。
 
 真实观测统计 profile 在此步冻结，覆盖 phase、shift、gain、频带、振幅衰减和噪声等
 nuisance。它只要求 synthetic observation 覆盖真实统计支持，不要求合成与真实波形

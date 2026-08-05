@@ -558,12 +558,21 @@ class GenerationPolicy:
     random_identity: int = 0
     retain_realizations: bool = True
     lateral_correlation_m: float = 900.0
+    path_coupling_strength: float = 1.0
+    profile_coupling_strength: float = 1.0
 
     def __post_init__(self) -> None:
         if isinstance(self.realization_count, bool) or self.realization_count <= 0:
             raise ValueError("realization_count must be positive.")
         if not np.isfinite(self.lateral_correlation_m) or self.lateral_correlation_m <= 0:
             raise ValueError("lateral_correlation_m must be finite and positive.")
+        if (
+            not np.isfinite(self.path_coupling_strength)
+            or self.path_coupling_strength < 0.0
+            or not np.isfinite(self.profile_coupling_strength)
+            or self.profile_coupling_strength < 0.0
+        ):
+            raise ValueError("lateral coupling strengths must be finite and non-negative.")
 
 
 @dataclass(frozen=True)

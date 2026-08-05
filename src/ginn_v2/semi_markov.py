@@ -192,6 +192,246 @@ class SampledPath:
 
 
 @dataclass(frozen=True)
+class EventAlignment:
+    """Monotone segment correspondence between two neighboring paths."""
+
+    matched_pairs: tuple[tuple[int, int], ...]
+    unmatched_left: tuple[int, ...]
+    unmatched_right: tuple[int, ...]
+    normalized_cost: float
+    matched_fraction: float
+    midpoint_distance_mean: float
+    thickness_log_ratio_mean: float
+    state_mismatch_rate: float
+
+
+def _normalized_path_segments(
+    path: SampledPath,
+) -> tuple[tuple[int, float, float], ...]:
+    sample_count = int(np.asarray(path.state).size)
+    if sample_count <= 0 or not path.segments:
+        raise ValueError("event alignment requires a non-empty sampled path.")
+    normalized: list[tuple[int, float, float]] = []
+    expected_start = 0
+    for state, start, stop in path.segments:
+        if start != expected_start or stop <= start or stop > sample_count:
+            raise ValueError("sampled path segments do not form a contiguous partition.")
+        normalized.append((int(state), start / sample_count, stop / sample_count))
+        expected_start = stop
+    if expected_start != sample_count:
+        raise ValueError("sampled path does not cover its complete sample axis.")
+    return tuple(normalized)
+
+
+def align_path_events(
+    left: SampledPath,
+    right: SampledPath,
+) -> EventAlignment:
+    """Align ordered events without assuming equal segment counts."""
+
+    left_segments = _normalized_path_segments(left)
+    right_segments = _normalized_path_segments(right)
+    left_count = len(left_segments)
+    right_count = len(right_segments)
+    gap_cost = 0.75
+    match_cost = np.empty((left_count, right_count), dtype=np.float64)
+    midpoint_distance = np.empty_like(match_cost)
+    thickness_log_ratio = np.empty_like(match_cost)
+    state_mismatch = np.empty_like(match_cost)
+    for left_index, (left_state, left_start, left_stop) in enumerate(left_segments):
+        left_midpoint = 0.5 * (left_start + left_stop)
+        left_thickness = left_stop - left_start
+        for right_index, (right_state, right_start, right_stop) in enumerate(
+            right_segments
+        ):
+            right_midpoint = 0.5 * (right_start + right_stop)
+            right_thickness = right_stop - right_start
+            midpoint = abs(left_midpoint - right_midpoint)
+            thickness = abs(np.log(left_thickness / right_thickness))
+            mismatch = float(left_state != right_state)
+            midpoint_distance[left_index, right_index] = midpoint
+            thickness_log_ratio[left_index, right_index] = thickness
+            state_mismatch[left_index, right_index] = mismatch
+            match_cost[left_index, right_index] = (
+                2.0 * midpoint + 0.25 * thickness + 1.25 * mismatch
+            )
+
+    dynamic = np.full((left_count + 1, right_count + 1), np.inf)
+    action = np.zeros((left_count + 1, right_count + 1), dtype=np.int8)
+    dynamic[0, 0] = 0.0
+    for left_index in range(1, left_count + 1):
+        dynamic[left_index, 0] = left_index * gap_cost
+        action[left_index, 0] = 2
+    for right_index in range(1, right_count + 1):
+        dynamic[0, right_index] = right_index * gap_cost
+        action[0, right_index] = 3
+    for left_index in range(1, left_count + 1):
+        for right_index in range(1, right_count + 1):
+            candidates = (
+                dynamic[left_index - 1, right_index - 1]
+                + match_cost[left_index - 1, right_index - 1],
+                dynamic[left_index - 1, right_index] + gap_cost,
+                dynamic[left_index, right_index - 1] + gap_cost,
+            )
+            selected = int(np.argmin(candidates))
+            dynamic[left_index, right_index] = candidates[selected]
+            action[left_index, right_index] = selected + 1
+
+    matched: list[tuple[int, int]] = []
+    unmatched_left: list[int] = []
+    unmatched_right: list[int] = []
+    left_index = left_count
+    right_index = right_count
+    while left_index > 0 or right_index > 0:
+        selected = int(action[left_index, right_index])
+        if selected == 1:
+            matched.append((left_index - 1, right_index - 1))
+            left_index -= 1
+            right_index -= 1
+        elif selected == 2:
+            unmatched_left.append(left_index - 1)
+            left_index -= 1
+        elif selected == 3:
+            unmatched_right.append(right_index - 1)
+            right_index -= 1
+        else:
+            raise RuntimeError("event alignment backtrack is incomplete.")
+    matched.reverse()
+    unmatched_left.reverse()
+    unmatched_right.reverse()
+    if matched:
+        pairs = np.asarray(matched, dtype=np.int64)
+        midpoint_mean = float(np.mean(midpoint_distance[pairs[:, 0], pairs[:, 1]]))
+        thickness_mean = float(
+            np.mean(thickness_log_ratio[pairs[:, 0], pairs[:, 1]])
+        )
+        mismatch_rate = float(np.mean(state_mismatch[pairs[:, 0], pairs[:, 1]]))
+    else:
+        midpoint_mean = 1.0
+        thickness_mean = 0.0
+        mismatch_rate = 1.0
+    return EventAlignment(
+        matched_pairs=tuple(matched),
+        unmatched_left=tuple(unmatched_left),
+        unmatched_right=tuple(unmatched_right),
+        normalized_cost=float(dynamic[left_count, right_count] / max(left_count, right_count)),
+        matched_fraction=float(2 * len(matched) / (left_count + right_count)),
+        midpoint_distance_mean=midpoint_mean,
+        thickness_log_ratio_mean=thickness_mean,
+        state_mismatch_rate=mismatch_rate,
+    )
+
+
+def couple_lateral_path_candidates(
+    candidates_by_trace: Mapping[int, Sequence[SampledPath]],
+    lateral_m: np.ndarray,
+    *,
+    coupling_strength: float,
+) -> tuple[dict[int, SampledPath], ...]:
+    """Select K coherent path assemblies from K exact per-trace candidates."""
+
+    if not np.isfinite(coupling_strength) or coupling_strength < 0.0:
+        raise ValueError("coupling_strength must be finite and non-negative.")
+    traces = sorted(int(trace) for trace in candidates_by_trace)
+    if not traces:
+        raise ValueError("lateral path coupling requires supported traces.")
+    candidate_count = len(candidates_by_trace[traces[0]])
+    if candidate_count <= 0 or any(
+        len(candidates_by_trace[trace]) != candidate_count for trace in traces
+    ):
+        raise ValueError("every supported trace must provide the same candidate count.")
+    lateral = np.asarray(lateral_m, dtype=np.float64).reshape(-1)
+    if max(traces) >= lateral.size or np.any(~np.isfinite(lateral[traces])):
+        raise ValueError("path candidates require finite physical lateral coordinates.")
+    if coupling_strength == 0.0:
+        return tuple(
+            {
+                trace: candidates_by_trace[trace][member_index]
+                for trace in traces
+            }
+            for member_index in range(candidate_count)
+        )
+
+    components: list[list[int]] = []
+    for trace in traces:
+        if not components or trace != components[-1][-1] + 1:
+            components.append([trace])
+        else:
+            components[-1].append(trace)
+    selected_members = [dict() for _ in range(candidate_count)]
+    for component in components:
+        unary = np.asarray(
+            [
+                [
+                    -float(path.log_score) / max(int(path.state.size), 1)
+                    for path in candidates_by_trace[trace]
+                ]
+                for trace in component
+            ],
+            dtype=np.float64,
+        )
+        unary -= np.min(unary, axis=1, keepdims=True)
+        spacings = np.diff(lateral[component])
+        reference_spacing = float(np.median(spacings)) if spacings.size else 1.0
+        pair_costs: list[np.ndarray] = []
+        for position in range(1, len(component)):
+            left_trace = component[position - 1]
+            right_trace = component[position]
+            spacing_weight = reference_spacing / float(
+                lateral[right_trace] - lateral[left_trace]
+            )
+            pair_costs.append(
+                np.asarray(
+                    [
+                        [
+                            align_path_events(left, right).normalized_cost
+                            * spacing_weight
+                            for right in candidates_by_trace[right_trace]
+                        ]
+                        for left in candidates_by_trace[left_trace]
+                    ],
+                    dtype=np.float64,
+                )
+            )
+        anchor_position = int(
+            np.argmin(
+                np.abs(
+                    lateral[component]
+                    - 0.5 * (lateral[component[0]] + lateral[component[-1]])
+                )
+            )
+        )
+        for member_index in range(candidate_count):
+            dynamic = np.full((len(component), candidate_count), np.inf)
+            previous = np.full(
+                (len(component), candidate_count), -1, dtype=np.int16
+            )
+            dynamic[0] = unary[0]
+            if anchor_position == 0:
+                dynamic[0, np.arange(candidate_count) != member_index] = np.inf
+            for position in range(1, len(component)):
+                cost = (
+                    dynamic[position - 1, :, None]
+                    + coupling_strength * pair_costs[position - 1]
+                )
+                previous[position] = np.argmin(cost, axis=0).astype(np.int16)
+                dynamic[position] = unary[position] + np.min(cost, axis=0)
+                if position == anchor_position:
+                    dynamic[position, np.arange(candidate_count) != member_index] = np.inf
+            chosen = np.empty(len(component), dtype=np.int64)
+            chosen[-1] = int(np.argmin(dynamic[-1]))
+            for position in range(len(component) - 1, 0, -1):
+                chosen[position - 1] = previous[position, chosen[position]]
+            if chosen[anchor_position] != member_index:
+                raise RuntimeError("lateral path coupling lost its anchor candidate.")
+            for position, trace in enumerate(component):
+                selected_members[member_index][trace] = candidates_by_trace[trace][
+                    int(chosen[position])
+                ]
+    return tuple(selected_members)
+
+
+@dataclass(frozen=True)
 class SemiMarkovMarginals:
     state_probability: np.ndarray
     renewal_probability: np.ndarray
@@ -672,11 +912,14 @@ def coordinate_stable_uniforms(
 
 
 __all__ = [
+    "EventAlignment",
     "SampledPath",
     "SemiMarkovConditioning",
     "SemiMarkovMarginals",
     "SemiMarkovPosterior",
     "SemiMarkovPrior",
+    "align_path_events",
+    "couple_lateral_path_candidates",
     "coordinate_stable_uniforms",
     "exact_semi_markov_posterior",
     "viterbi_semi_markov_path",

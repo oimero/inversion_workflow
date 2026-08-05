@@ -42,9 +42,12 @@ from ginn_v2.representation import (
     project_supported_highres_to_model,
 )
 from ginn_v2.semi_markov import (
+    SampledPath,
     SemiMarkovConditioning,
     SemiMarkovPrior,
+    align_path_events,
     coordinate_stable_uniforms,
+    couple_lateral_path_candidates,
     exact_semi_markov_posterior,
 )
 
@@ -144,27 +147,120 @@ def _endpoint_aligned_path_uniforms(
     return aligned
 
 
-def _segment_vertical_bin(
-    extent: SegmentExtent,
-    highres_indices: np.ndarray,
-    *,
-    canonical_sample_count: int,
-) -> int:
-    """Return a zone-fraction bin stable to neighboring split/merge events."""
+@dataclass(frozen=True)
+class _MemberPlan:
+    paths: Mapping[int, SampledPath]
+    extents: tuple[SegmentExtent, ...]
+    distributions: tuple[SegmentParameterDistribution, ...]
+    track_ids: np.ndarray
+    track_count: int
+    path_score: float
+    segment_count: np.ndarray
+    durations: list[list[float]]
+    interface: np.ndarray
 
-    indices = np.asarray(highres_indices, dtype=np.int64).reshape(-1)
-    if indices.size == 0 or canonical_sample_count <= 0:
-        raise ValueError("segment random key requires a supported canonical grid.")
-    zone_start = int(indices[0])
-    zone_stop = int(indices[-1]) + 1
-    midpoint = 0.5 * (extent.start_index + extent.stop_index)
-    fraction = (midpoint - zone_start) / (zone_stop - zone_start)
-    if not np.isfinite(fraction) or fraction < 0.0 or fraction > 1.0:
-        raise ValueError("segment midpoint is outside its supported zone.")
-    return min(
-        int(np.floor(fraction * canonical_sample_count)),
-        canonical_sample_count - 1,
+
+def _event_track_ids(
+    paths: Mapping[int, SampledPath],
+    extents: tuple[SegmentExtent, ...],
+) -> tuple[np.ndarray, int]:
+    """Assign monotone event identities across adjacent supported traces."""
+
+    indices_by_trace: dict[int, list[int]] = {}
+    for index, extent in enumerate(extents):
+        indices_by_trace.setdefault(extent.trace_index, []).append(index)
+    traces = sorted(paths)
+    track_ids = np.full(len(extents), -1, dtype=np.int64)
+    next_track = 0
+    previous_trace: int | None = None
+    for trace in traces:
+        local_indices = indices_by_trace.get(trace, [])
+        if len(local_indices) != len(paths[trace].segments):
+            raise RuntimeError("event tracking path/extent counts differ.")
+        if previous_trace is None or trace != previous_trace + 1:
+            for index in local_indices:
+                track_ids[index] = next_track
+                next_track += 1
+        else:
+            previous_indices = indices_by_trace[previous_trace]
+            alignment = align_path_events(paths[previous_trace], paths[trace])
+            matched_right: set[int] = set()
+            for left_local, right_local in alignment.matched_pairs:
+                track_ids[local_indices[right_local]] = track_ids[
+                    previous_indices[left_local]
+                ]
+                matched_right.add(right_local)
+            for right_local, index in enumerate(local_indices):
+                if right_local not in matched_right:
+                    track_ids[index] = next_track
+                    next_track += 1
+        previous_trace = trace
+    if np.any(track_ids < 0):
+        raise RuntimeError("event tracking left unassigned segment identities.")
+    return track_ids, next_track
+
+
+def _coupled_profile_means(
+    distributions: tuple[SegmentParameterDistribution, ...],
+    track_ids: np.ndarray,
+    lateral_m: np.ndarray,
+    *,
+    correlation_length_m: float,
+    coupling_strength: float,
+) -> np.ndarray:
+    base = np.stack(
+        [np.asarray(distribution.mean, dtype=np.float64) for distribution in distributions]
     )
+    if coupling_strength == 0.0:
+        return base
+    blend = coupling_strength / (1.0 + coupling_strength)
+    lateral = np.asarray(lateral_m, dtype=np.float64)
+    coupled = base.copy()
+    for track_id in np.unique(track_ids):
+        indices = np.flatnonzero(track_ids == track_id)
+        coordinates = np.asarray(
+            [lateral[distributions[index].extent.trace_index] for index in indices],
+            dtype=np.float64,
+        )
+        for local_index, distribution_index in enumerate(indices):
+            distance = coordinates - coordinates[local_index]
+            weights = np.exp(-0.5 * (distance / correlation_length_m) ** 2)
+            average = np.sum(base[indices] * weights[:, None], axis=0) / np.sum(weights)
+            coupled[distribution_index] = (
+                (1.0 - blend) * base[distribution_index] + blend * average
+            )
+    return coupled
+
+
+def _path_assembly_metrics(
+    paths: Mapping[int, SampledPath],
+) -> dict[str, float]:
+    alignments = [
+        align_path_events(paths[left], paths[right])
+        for left, right in zip(sorted(paths)[:-1], sorted(paths)[1:])
+        if right == left + 1
+    ]
+    if not alignments:
+        return {
+            "matched_fraction": 0.0,
+            "midpoint_distance": 1.0,
+            "thickness_log_ratio": 0.0,
+            "state_mismatch_rate": 1.0,
+        }
+    return {
+        "matched_fraction": float(
+            np.mean([alignment.matched_fraction for alignment in alignments])
+        ),
+        "midpoint_distance": float(
+            np.mean([alignment.midpoint_distance_mean for alignment in alignments])
+        ),
+        "thickness_log_ratio": float(
+            np.mean([alignment.thickness_log_ratio_mean for alignment in alignments])
+        ),
+        "state_mismatch_rate": float(
+            np.mean([alignment.state_mismatch_rate for alignment in alignments])
+        ),
+    }
 
 
 class ConditionalGenerator:
@@ -306,7 +402,7 @@ class ConditionalGenerator:
         evidence: ObservableEvidence,
         policy: GenerationPolicy = GenerationPolicy(),
     ) -> StructuredPrediction:
-        """Sample one exact per-trace HSMM posterior and decoded K-member ensemble."""
+        """Sample exact per-trace candidates and assemble a decoded K-member ensemble."""
 
         if self.profile_head is None:
             raise RuntimeError("structured realization requires a profile head.")
@@ -349,19 +445,17 @@ class ConditionalGenerator:
         x_m = evidence.lateral_m if evidence.x_m is None else evidence.x_m
         y_m = np.zeros_like(evidence.lateral_m) if evidence.y_m is None else evidence.y_m
         path_draw_count = maximum_model_samples + 2
-        coefficient_draw_offset = path_draw_count
-        draw_count = path_draw_count + 9 * maximum_model_samples
-        random_field_identity = stable_random_identity(
-            "structured_ginn_v2_realize",
+        path_random_identity = stable_random_identity(
+            "structured_ginn_v2_path_candidates",
             policy.random_identity,
             evidence.identity,
         )
-        uniforms = coordinate_stable_uniforms(
+        path_uniform_fields = coordinate_stable_uniforms(
             x_m,
             y_m,
             realization_count=policy.realization_count,
-            draw_count=draw_count,
-            random_identity=random_field_identity,
+            draw_count=path_draw_count,
+            random_identity=path_random_identity,
             correlation_length_m=policy.lateral_correlation_m,
         )
         member_identities = tuple(
@@ -377,12 +471,26 @@ class ConditionalGenerator:
         segment_count_rows: list[np.ndarray] = []
         duration_rows: list[list[list[float]]] = []
         projection_support: np.ndarray | None = None
-        trace_highres_indices = {
-            trace: highres_indices
-            for trace, _, highres_indices, _ in posteriors
+        candidates_by_trace: dict[int, list[SampledPath]] = {
+            trace: [] for trace, _, _, _ in posteriors
         }
-
-        for member_index, member_identity in enumerate(member_identities):
+        for candidate_index in range(policy.realization_count):
+            for trace, model_indices, _, posterior_object in posteriors:
+                path_uniforms = _endpoint_aligned_path_uniforms(
+                    path_uniform_fields[candidate_index, trace],
+                    sample_count=model_indices.size,
+                    canonical_sample_count=maximum_model_samples,
+                )
+                candidates_by_trace[trace].append(
+                    posterior_object.sample(path_uniforms)
+                )
+        path_assemblies = couple_lateral_path_candidates(
+            candidates_by_trace,
+            evidence.lateral_m,
+            coupling_strength=policy.path_coupling_strength,
+        )
+        plans: list[_MemberPlan] = []
+        for paths in path_assemblies:
             extents: list[SegmentExtent] = []
             path_score = 0.0
             member_durations: list[list[float]] = [
@@ -394,14 +502,8 @@ class ConditionalGenerator:
             member_interface = np.zeros(
                 evidence.highres_support.shape, dtype=np.float64
             )
-            for trace, model_indices, highres_indices, posterior_object in posteriors:
-                posterior = posterior_object
-                path_uniforms = _endpoint_aligned_path_uniforms(
-                    uniforms[member_index, trace, :path_draw_count],
-                    sample_count=model_indices.size,
-                    canonical_sample_count=maximum_model_samples,
-                )
-                path = posterior.sample(path_uniforms)
+            for trace, model_indices, highres_indices, _ in posteriors:
+                path = paths[trace]
                 mapped = path_to_highres_extents(
                     path,
                     trace_index=trace,
@@ -421,31 +523,64 @@ class ConditionalGenerator:
                     if item.start_index != zone_start:
                         member_interface[trace, item.start_index] = 1.0
             extent_tuple = tuple(extents)
-            distributions = self.parameterize_segments(evidence, extent_tuple)
+            distributions = tuple(self.parameterize_segments(evidence, extent_tuple))
             if len(distributions) != len(extent_tuple):
                 raise RuntimeError("segment parameterization changed the path length.")
+            track_ids, track_count = _event_track_ids(paths, extent_tuple)
+            plans.append(
+                _MemberPlan(
+                    paths=paths,
+                    extents=extent_tuple,
+                    distributions=distributions,
+                    track_ids=track_ids,
+                    track_count=track_count,
+                    path_score=path_score,
+                    segment_count=member_segment_count,
+                    durations=member_durations,
+                    interface=member_interface,
+                )
+            )
+
+        maximum_track_count = max(plan.track_count for plan in plans)
+        profile_uniform_fields = coordinate_stable_uniforms(
+            x_m,
+            y_m,
+            realization_count=policy.realization_count,
+            draw_count=3 * maximum_track_count,
+            random_identity=stable_random_identity(
+                "structured_ginn_v2_event_tracks",
+                policy.random_identity,
+                evidence.identity,
+            ),
+            correlation_length_m=policy.lateral_correlation_m,
+        )
+        path_metric_rows: list[dict[str, float]] = []
+        for member_index, (member_identity, plan) in enumerate(
+            zip(member_identities, plans)
+        ):
+            coupled_means = _coupled_profile_means(
+                plan.distributions,
+                plan.track_ids,
+                evidence.lateral_m,
+                correlation_length_m=policy.lateral_correlation_m,
+                coupling_strength=policy.profile_coupling_strength,
+            )
             sampled_segments: list[Segment] = []
-            for distribution in distributions:
+            for distribution_index, distribution in enumerate(plan.distributions):
                 extent = distribution.extent
                 if extent.state_id < 0 or extent.state_id >= 3:
                     raise ValueError("segment state is outside the three-state contract.")
-                vertical_bin = _segment_vertical_bin(
-                    extent,
-                    trace_highres_indices[extent.trace_index],
-                    canonical_sample_count=maximum_model_samples,
-                )
-                draw_start = coefficient_draw_offset + 3 * (
-                    extent.state_id * maximum_model_samples + vertical_bin
-                )
+                track_id = int(plan.track_ids[distribution_index])
+                draw_start = 3 * track_id
                 gaussian = ndtri(
-                    uniforms[
+                    profile_uniform_fields[
                         member_index,
                         extent.trace_index,
                         draw_start : draw_start + 3,
                     ]
                 )
                 coefficient = (
-                    np.asarray(distribution.mean, dtype=np.float64)
+                    coupled_means[distribution_index]
                     + np.asarray(distribution.scale, dtype=np.float64) * gaussian
                 )
                 sampled_segments.append(
@@ -482,12 +617,13 @@ class ConditionalGenerator:
                     state_highres=state_highres,
                     projected_log_ai=projected,
                     segments=tuple(sampled_segments),
-                    conditional_log_score=float(path_score),
+                    conditional_log_score=float(plan.path_score),
                 )
             )
-            interface_rows.append(member_interface)
-            segment_count_rows.append(member_segment_count)
-            duration_rows.append(member_durations)
+            interface_rows.append(plan.interface)
+            segment_count_rows.append(plan.segment_count)
+            duration_rows.append(plan.durations)
+            path_metric_rows.append(_path_assembly_metrics(plan.paths))
 
         if projection_support is None or not np.any(projection_support):
             raise InputContractError(
@@ -589,7 +725,23 @@ class ConditionalGenerator:
                 "projection_supported_samples": float(
                     np.count_nonzero(projection_support)
                 ),
-                "spatial_random_key_version": 2.0,
+                "spatial_random_key_version": 3.0,
+                "path_coupling_strength": float(policy.path_coupling_strength),
+                "profile_coupling_strength": float(
+                    policy.profile_coupling_strength
+                ),
+                "event_track_matched_fraction": float(
+                    np.mean([row["matched_fraction"] for row in path_metric_rows])
+                ),
+                "event_track_midpoint_distance": float(
+                    np.mean([row["midpoint_distance"] for row in path_metric_rows])
+                ),
+                "event_track_thickness_log_ratio": float(
+                    np.mean([row["thickness_log_ratio"] for row in path_metric_rows])
+                ),
+                "event_track_state_mismatch_rate": float(
+                    np.mean([row["state_mismatch_rate"] for row in path_metric_rows])
+                ),
             },
         )
 

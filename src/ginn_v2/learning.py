@@ -56,6 +56,7 @@ from ginn_v2.semi_markov import (
     SemiMarkovConditioning,
     SemiMarkovMarginals,
     SemiMarkovPrior,
+    align_path_events,
     exact_semi_markov_posterior,
     viterbi_semi_markov_path,
 )
@@ -5286,6 +5287,16 @@ def evaluate_map_reconstruction(
     }
 
 
+_EVENT_CONTINUITY_NAMES = (
+    "matched_fraction",
+    "midpoint_distance_mean",
+    "thickness_log_ratio_mean",
+    "state_mismatch_rate",
+    "profile_rms_log_ratio_mean",
+    "profile_mean_jump_mean",
+)
+
+
 def _new_ensemble_statistics() -> dict[str, Any]:
     return {
         "zone_count": 0,
@@ -5324,6 +5335,16 @@ def _new_ensemble_statistics() -> dict[str, Any]:
         "truth_boundary_neighbor_wasserstein": 0.0,
         "representative_boundary_neighbor_wasserstein": 0.0,
         "ensemble_boundary_neighbor_wasserstein": 0.0,
+        "event_continuity_parent_count": 0,
+        "truth_event_continuity": {
+            name: 0.0 for name in _EVENT_CONTINUITY_NAMES
+        },
+        "representative_event_continuity": {
+            name: 0.0 for name in _EVENT_CONTINUITY_NAMES
+        },
+        "ensemble_event_continuity": {
+            name: 0.0 for name in _EVENT_CONTINUITY_NAMES
+        },
     }
 
 
@@ -5402,6 +5423,7 @@ class _EnsembleParentBuilder:
     highres_support: np.ndarray
     highres_members: np.ndarray
     highres_interfaces: np.ndarray
+    model_anchor: np.ndarray
     model_truth: np.ndarray
     model_evidence_target: np.ndarray
     model_support: np.ndarray
@@ -5464,6 +5486,9 @@ class _EnsembleParentResult:
     truth_boundary_neighbor_wasserstein: float
     representative_boundary_neighbor_wasserstein: float
     ensemble_boundary_neighbor_wasserstein: float
+    truth_event_continuity: Mapping[str, float]
+    representative_event_continuity: Mapping[str, float]
+    ensemble_event_continuity: Mapping[str, float]
 
 
 def _new_ensemble_parent_builder(
@@ -5501,6 +5526,7 @@ def _new_ensemble_parent_builder(
         highres_interfaces=np.zeros(
             (realization_count,) + high_shape, dtype=bool
         ),
+        model_anchor=np.full(model_shape, np.nan, dtype=np.float64),
         model_truth=np.full(model_shape, np.nan, dtype=np.float64),
         model_evidence_target=np.full(model_shape, np.nan, dtype=np.float64),
         model_support=np.zeros(model_shape, dtype=bool),
@@ -5690,6 +5716,136 @@ def _normalized_boundary_neighbor_wasserstein(
     return float(np.mean(distances))
 
 
+def _path_from_state_and_renewal(
+    state: np.ndarray,
+    renewal: np.ndarray,
+    support: np.ndarray,
+) -> SampledPath | None:
+    valid = np.asarray(support, dtype=bool).reshape(-1)
+    if not np.any(valid):
+        return None
+    state_values = np.asarray(state, dtype=np.int64).reshape(-1)[valid]
+    renewal_values = np.asarray(renewal, dtype=bool).reshape(-1)[valid]
+    if np.any((state_values < 0) | (state_values > 2)):
+        raise ValueError("event continuity state is outside the three-state contract.")
+    starts = np.unique(np.r_[0, np.flatnonzero(renewal_values[1:]) + 1])
+    stops = np.r_[starts[1:], state_values.size]
+    segments: list[tuple[int, int, int]] = []
+    for start, stop in zip(starts, stops):
+        segment_state = state_values[start:stop]
+        if not np.all(segment_state == segment_state[0]):
+            raise ValueError("event continuity renewal does not partition constant states.")
+        segments.append((int(segment_state[0]), int(start), int(stop)))
+    return SampledPath(
+        segments=tuple(segments),
+        state=state_values,
+        log_score=0.0,
+    )
+
+
+def _event_continuity_metrics(
+    state: np.ndarray,
+    renewal: np.ndarray,
+    increment: np.ndarray,
+    support: np.ndarray,
+) -> dict[str, float]:
+    states = np.asarray(state)
+    renewals = np.asarray(renewal, dtype=bool)
+    profiles = np.asarray(increment, dtype=np.float64)
+    valid = np.asarray(support, dtype=bool)
+    if states.shape != valid.shape or renewals.shape != valid.shape or profiles.shape != valid.shape:
+        raise ValueError("event continuity arrays must share [lateral, sample] shape.")
+    if np.any(~np.isfinite(profiles[valid])):
+        raise ValueError("event continuity profiles must be finite on support.")
+    paths = [
+        _path_from_state_and_renewal(states[trace], renewals[trace], valid[trace])
+        for trace in range(valid.shape[0])
+    ]
+    profile_rows = [profiles[trace, valid[trace]] for trace in range(valid.shape[0])]
+    rows: list[dict[str, float]] = []
+    for trace in range(valid.shape[0] - 1):
+        left = paths[trace]
+        right = paths[trace + 1]
+        if left is None or right is None:
+            continue
+        alignment = align_path_events(left, right)
+        rms_ratios: list[float] = []
+        mean_jumps: list[float] = []
+        for left_index, right_index in alignment.matched_pairs:
+            _, left_start, left_stop = left.segments[left_index]
+            _, right_start, right_stop = right.segments[right_index]
+            left_values = profile_rows[trace][left_start:left_stop]
+            right_values = profile_rows[trace + 1][right_start:right_stop]
+            left_rms = float(np.sqrt(np.mean(left_values**2)))
+            right_rms = float(np.sqrt(np.mean(right_values**2)))
+            rms_ratios.append(abs(np.log((left_rms + 1.0e-4) / (right_rms + 1.0e-4))))
+            mean_jumps.append(abs(float(np.mean(left_values) - np.mean(right_values))))
+        rows.append(
+            {
+                "matched_fraction": alignment.matched_fraction,
+                "midpoint_distance_mean": alignment.midpoint_distance_mean,
+                "thickness_log_ratio_mean": alignment.thickness_log_ratio_mean,
+                "state_mismatch_rate": alignment.state_mismatch_rate,
+                "profile_rms_log_ratio_mean": float(np.mean(rms_ratios))
+                if rms_ratios
+                else 0.0,
+                "profile_mean_jump_mean": float(np.mean(mean_jumps))
+                if mean_jumps
+                else 0.0,
+            }
+        )
+    if not rows:
+        raise ValueError("event continuity found no adjacent supported traces.")
+    return {
+        name: float(np.mean([row[name] for row in rows]))
+        for name in _EVENT_CONTINUITY_NAMES
+    }
+
+
+def _event_track_label_grid(
+    state: np.ndarray,
+    renewal: np.ndarray,
+    support: np.ndarray,
+) -> np.ndarray:
+    states = np.asarray(state)
+    renewals = np.asarray(renewal, dtype=bool)
+    valid = np.asarray(support, dtype=bool)
+    paths = [
+        _path_from_state_and_renewal(states[trace], renewals[trace], valid[trace])
+        for trace in range(valid.shape[0])
+    ]
+    labels = np.full(valid.shape, np.nan, dtype=np.float64)
+    track_ids_by_trace: dict[int, list[int]] = {}
+    next_track = 0
+    previous_trace: int | None = None
+    for trace, path in enumerate(paths):
+        if path is None:
+            previous_trace = None
+            continue
+        if previous_trace is None:
+            local_tracks = list(range(next_track, next_track + len(path.segments)))
+            next_track += len(path.segments)
+        else:
+            previous_path = paths[previous_trace]
+            if previous_path is None:
+                raise RuntimeError("event track predecessor disappeared.")
+            alignment = align_path_events(previous_path, path)
+            local_tracks = [-1] * len(path.segments)
+            previous_tracks = track_ids_by_trace[previous_trace]
+            for left_index, right_index in alignment.matched_pairs:
+                local_tracks[right_index] = previous_tracks[left_index]
+            for index, value in enumerate(local_tracks):
+                if value < 0:
+                    local_tracks[index] = next_track
+                    next_track += 1
+        track_ids_by_trace[trace] = local_tracks
+        model_indices = np.flatnonzero(valid[trace])
+        for track_id, (_, start, stop) in zip(local_tracks, path.segments):
+            labels[trace, model_indices[start:stop]] = track_id
+        previous_trace = trace
+    return labels
+
+
 def _add_ensemble_zone(
     builder: _EnsembleParentBuilder,
     source: Mapping[str, object],
@@ -5742,6 +5898,7 @@ def _add_ensemble_zone(
         evidence.background_lfm_linear
         + evidence.projected_log_ai_increment_mean
     )
+    builder.model_anchor[model_support] = evidence.background_lfm_linear[model_support]
     builder.model_truth[model_support] = truth_model[model_support]
     builder.model_evidence_target[model_support] = evidence_target[model_support]
     builder.model_support |= model_support
@@ -5803,6 +5960,8 @@ def _add_ensemble_zone(
         builder.model_member_renewal[:, trace, model_indices] = np.stack(
             member_renewal
         ).astype(bool)
+        builder.model_truth_renewal[trace, model_indices[0]] = True
+        builder.model_member_renewal[:, trace, model_indices[0]] = True
         if model_indices.size > 1:
             builder.interface_count += model_indices.size - 1
             builder.interface_truth_count += int(np.count_nonzero(truth_renewal[1:]))
@@ -5943,6 +6102,34 @@ def _finalize_ensemble_parent(
         ],
         dtype=np.float64,
     )
+    if np.any(~np.isfinite(builder.model_anchor[projected_support])):
+        raise ValueError("ensemble parent model anchor is incomplete.")
+    truth_model_increment = builder.model_truth - builder.model_anchor
+    member_model_increment = projected_stack - builder.model_anchor[None, ...]
+    truth_event_continuity = _event_continuity_metrics(
+        builder.model_truth_state,
+        builder.model_truth_renewal,
+        truth_model_increment,
+        projected_support,
+    )
+    member_event_continuity = tuple(
+        _event_continuity_metrics(
+            builder.model_member_state[member_index],
+            builder.model_member_renewal[member_index],
+            member_model_increment[member_index],
+            projected_support,
+        )
+        for member_index in range(projected_stack.shape[0])
+    )
+    representative_event_continuity = member_event_continuity[
+        representative_index
+    ]
+    ensemble_event_continuity = {
+        name: float(
+            np.mean([member[name] for member in member_event_continuity])
+        )
+        for name in _EVENT_CONTINUITY_NAMES
+    }
     return _EnsembleParentResult(
         parent_id=builder.parent_id,
         geometry_family=builder.geometry_family,
@@ -5996,6 +6183,9 @@ def _finalize_ensemble_parent(
         ensemble_boundary_neighbor_wasserstein=float(
             np.mean(member_boundary_distance)
         ),
+        truth_event_continuity=truth_event_continuity,
+        representative_event_continuity=representative_event_continuity,
+        ensemble_event_continuity=ensemble_event_continuity,
     )
 
 
@@ -6048,6 +6238,17 @@ def _update_ensemble_parent_statistics(
     ):
         statistics[name] += getattr(parent, name)
     statistics["continuity_parent_count"] += 1
+    for name in _EVENT_CONTINUITY_NAMES:
+        statistics["truth_event_continuity"][name] += float(
+            parent.truth_event_continuity[name]
+        )
+        statistics["representative_event_continuity"][name] += float(
+            parent.representative_event_continuity[name]
+        )
+        statistics["ensemble_event_continuity"][name] += float(
+            parent.ensemble_event_continuity[name]
+        )
+    statistics["event_continuity_parent_count"] += 1
 
 
 def _finalize_ensemble_statistics(statistics: Mapping[str, Any]) -> dict[str, Any]:
@@ -6079,8 +6280,11 @@ def _finalize_ensemble_statistics(statistics: Mapping[str, Any]) -> dict[str, An
     forward = int(statistics["forward_recursions"])
     backward = int(statistics["backward_samples"])
     continuity_count = int(statistics["continuity_parent_count"])
+    event_continuity_count = int(statistics["event_continuity_parent_count"])
     if continuity_count <= 0:
         raise ValueError("ensemble evaluation has no continuity parents.")
+    if event_continuity_count <= 0:
+        raise ValueError("ensemble evaluation has no event continuity parents.")
 
     def continuity_mean(name: str) -> float:
         return float(statistics[name]) / continuity_count
@@ -6106,6 +6310,32 @@ def _finalize_ensemble_statistics(statistics: Mapping[str, Any]) -> dict[str, An
     ensemble_boundary_distance = continuity_mean(
         "ensemble_boundary_neighbor_wasserstein"
     )
+    event_directions = {
+        "matched_fraction": "higher_is_better",
+        "midpoint_distance_mean": "lower_is_better",
+        "thickness_log_ratio_mean": "lower_is_better",
+        "state_mismatch_rate": "lower_is_better",
+        "profile_rms_log_ratio_mean": "lower_is_better",
+        "profile_mean_jump_mean": "lower_is_better",
+    }
+    event_tracks = {}
+    for name in _EVENT_CONTINUITY_NAMES:
+        truth_value = float(statistics["truth_event_continuity"][name]) / (
+            event_continuity_count
+        )
+        representative_value = float(
+            statistics["representative_event_continuity"][name]
+        ) / event_continuity_count
+        ensemble_value = float(
+            statistics["ensemble_event_continuity"][name]
+        ) / event_continuity_count
+        event_tracks[name] = {
+            "direction": event_directions[name],
+            "truth": truth_value,
+            "representative": representative_value,
+            "ensemble_members_mean": ensemble_value,
+            "representative_minus_truth": representative_value - truth_value,
+        }
     return {
         "parent_count": len(statistics["parent_ids"]),
         "zone_count": int(statistics["zone_count"]),
@@ -6152,6 +6382,10 @@ def _finalize_ensemble_statistics(statistics: Mapping[str, Any]) -> dict[str, An
                 "representative_minus_truth": representative_boundary_distance
                 - truth_boundary_distance,
             },
+        },
+        "event_tracks": {
+            "parent_count": event_continuity_count,
+            **event_tracks,
         },
         "forward_recursions": forward,
         "backward_samples": backward,
@@ -6204,6 +6438,21 @@ def _write_ensemble_parent_figure(
     representative_interfaces = builder.highres_interfaces[
         parent.representative_member_index
     ] & support
+    truth_event_tracks = _event_track_label_grid(
+        builder.model_truth_state,
+        builder.model_truth_renewal,
+        builder.model_support,
+    )
+    representative_event_tracks = _event_track_label_grid(
+        builder.model_member_state[parent.representative_member_index],
+        builder.model_member_renewal[parent.representative_member_index],
+        builder.model_support,
+    )
+    event_track_upper = max(
+        _finite_absolute_limit(truth_event_tracks, quantile=1.0),
+        _finite_absolute_limit(representative_event_tracks, quantile=1.0),
+        1.0,
+    )
 
     seismic = np.where(builder.observed_valid, builder.seismic, np.nan)
     seismic_limit = _finite_absolute_limit(seismic)
@@ -6227,7 +6476,7 @@ def _write_ensemble_parent_figure(
         float(builder.highres_coordinates[0]),
     )
 
-    figure, axes = plt.subplots(2, 3, figsize=(17, 10), sharex=True)
+    figure, axes = plt.subplots(2, 4, figsize=(22, 10), sharex=True)
     panels = (
         (
             seismic,
@@ -6277,6 +6526,22 @@ def _write_ensemble_parent_figure(
             0.0,
             std_limit,
         ),
+        (
+            truth_event_tracks,
+            "Truth event tracks",
+            "turbo",
+            model_extent,
+            0.0,
+            event_track_upper,
+        ),
+        (
+            representative_event_tracks,
+            "Representative event tracks",
+            "turbo",
+            model_extent,
+            0.0,
+            event_track_upper,
+        ),
     )
     for axis, (values, title, color_map, extent, lower, upper) in zip(
         axes.flat, panels
@@ -6299,7 +6564,7 @@ def _write_ensemble_parent_figure(
 
     vertical_index, lateral_index = np.nonzero(representative_interfaces.T)
     if vertical_index.size:
-        axes[1, 2].scatter(
+        axes.flat[5].scatter(
             builder.lateral_m[lateral_index],
             builder.highres_coordinates[vertical_index],
             s=2.5,
@@ -6309,7 +6574,7 @@ def _write_ensemble_parent_figure(
             alpha=0.8,
             label="segment start",
         )
-        axes[1, 2].legend(loc="upper right", fontsize=7)
+        axes.flat[5].legend(loc="upper right", fontsize=7)
     figure.suptitle(
         "Structured GINN V2 ensemble continuity | "
         f"{parent.geometry_family} | {parent.parent_id}",
@@ -6432,6 +6697,15 @@ def evaluate_structured_ensemble(
                         parent.ensemble_boundary_neighbor_wasserstein
                     ),
                 },
+                "event_tracks": {
+                    "truth": dict(parent.truth_event_continuity),
+                    "representative": dict(
+                        parent.representative_event_continuity
+                    ),
+                    "ensemble_members_mean": dict(
+                        parent.ensemble_event_continuity
+                    ),
+                },
             }
         )
         completed.add(parent.parent_id)
@@ -6476,7 +6750,7 @@ def evaluate_structured_ensemble(
     if not parent_rows:
         raise ValueError("ensemble evaluation received no zones.")
     result = {
-        "schema": "structured_ginn_v2_ensemble_evaluation_v3",
+        "schema": "structured_ginn_v2_ensemble_evaluation_v4",
         "status": "success",
         "realization_count": policy.realization_count,
         "policy": asdict(policy),

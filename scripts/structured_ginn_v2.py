@@ -182,6 +182,8 @@ def parse_args() -> argparse.Namespace:
     ensemble.add_argument("--realization-count", type=int, default=16)
     ensemble.add_argument("--random-identity", type=int, default=20260804)
     ensemble.add_argument("--lateral-correlation-m", type=float, default=900.0)
+    ensemble.add_argument("--path-coupling-strength", type=float, default=1.0)
+    ensemble.add_argument("--profile-coupling-strength", type=float, default=1.0)
     ensemble.add_argument(
         "--figures-per-family",
         type=int,
@@ -847,6 +849,8 @@ def main() -> None:
             random_identity=int(args.random_identity),
             retain_realizations=True,
             lateral_correlation_m=float(args.lateral_correlation_m),
+            path_coupling_strength=float(args.path_coupling_strength),
+            profile_coupling_strength=float(args.profile_coupling_strength),
         )
         logger.info(
             "ensemble evaluation start | split=%s | parents=%d | K=%d",
@@ -871,7 +875,7 @@ def main() -> None:
             **dict(metadata.get("training_state") or {}),
             "semi_markov_contract": dict(hsmm_metadata),
             "ensemble_policy": asdict(policy),
-            "spatial_random_key_version": 2,
+            "spatial_random_key_version": 3,
         }
         corpus_provenance = dict(metadata.get("corpus_provenance") or {})
         corpus_provenance["ensemble_evaluation_parent_ids"] = list(parent_ids)
@@ -897,7 +901,7 @@ def main() -> None:
         write_json(
             output / "run_summary.json",
             {
-                "schema": "structured_ginn_v2_ensemble_run_v3",
+                "schema": "structured_ginn_v2_ensemble_run_v4",
                 "status": "success",
                 "mode": result["mode"],
                 "parent_count": result["aggregate"]["parent_count"],

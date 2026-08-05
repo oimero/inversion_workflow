@@ -526,8 +526,8 @@ model-grid HSMM 的 count target。报告发布 high-resolution/projected ensemb
 ensemble mean，以及叠加代表 segment 起点的 ensemble standard deviation。固定 member
 和代表 member 是合法 realization；ensemble mean 只用于汇总，不作为结构化解释结果。
 
-命令同时发布 V6 generator checkpoint。V6 在 V5 上只增加冻结的 semi-Markov prior 与
-conditioning，推理时无需再次拼接实验目录。代表解按 projected AI 到 observable
+命令同时发布 V7 generator checkpoint。V7 包含冻结的 semi-Markov prior、conditioning
+和 coordinate-aligned spatial random-key contract，推理时无需再次拼接实验目录。代表解按 projected AI 到 observable
 bandlimited evidence 的距离，从 K 个完整成员中整体选取；并列时选择 conditional score
 更高者。section/volume 的全局成员选择使用同一准则。
 
@@ -554,6 +554,17 @@ sampling；smoke 的 K=2 coverage 只验证接口，不作为科学结论。
 单道 clean 门禁通过后接入 21 道、米制距离和显式 mask。横向收益通过 single-trace
 与 neighbor-shuffle 证明。微结构连续性使用由 XY、zone identity 和 realization
 identity 决定的 coordinate-stable correlated random fields。
+
+随机场的垂向 identity 使用 zone-relative 坐标：HSMM backward sampling 按当前 endpoint
+取随机数，profile coefficient 按 segment 中点、state 和 coefficient 类型取随机数。
+因此相邻道发生 split/merge 时，其余 segment 的随机身份保持稳定；每道使用的随机变量
+仍为均匀分布，单道 exact posterior 与 coefficient marginal 保持不变。
+
+短 patch 首先报告三项横向门禁：anchor-relative high-resolution increment 的 normalized-zone
+横向梯度、normalized-zone state neighbor agreement，以及相邻道 renewal-position
+Wasserstein distance。每项同时报告 truth、representative 和 ensemble-members summary，
+并按 geometry family 分层。coordinate-aligned random key 未达到门禁时，再引入相邻路径的
+soft conditional coupling。
 
 真实观测统计 profile 在此步冻结，覆盖 phase、shift、gain、频带、振幅衰减和噪声等
 nuisance。它只要求 synthetic observation 覆盖真实统计支持，不要求合成与真实波形

@@ -120,6 +120,53 @@ class SegmentProfileHead(nn.Module):
         }
 
 
+def _endpoint_aligned_path_uniforms(
+    random_field_values: np.ndarray,
+    *,
+    sample_count: int,
+    canonical_sample_count: int,
+) -> np.ndarray:
+    """Map canonical zone-fraction fields onto one local endpoint grid."""
+
+    values = np.asarray(random_field_values, dtype=np.float64).reshape(-1)
+    if sample_count <= 0 or canonical_sample_count < sample_count:
+        raise ValueError("path uniform grids require 0 < local <= canonical samples.")
+    if values.size < canonical_sample_count + 2:
+        raise ValueError("canonical path random field is incomplete.")
+    endpoint_bins = np.rint(
+        np.arange(sample_count + 1, dtype=np.float64)
+        * canonical_sample_count
+        / sample_count
+    ).astype(np.int64)
+    aligned = np.empty(sample_count + 2, dtype=np.float64)
+    aligned[0] = values[0]
+    aligned[1:] = values[1 + endpoint_bins]
+    return aligned
+
+
+def _segment_vertical_bin(
+    extent: SegmentExtent,
+    highres_indices: np.ndarray,
+    *,
+    canonical_sample_count: int,
+) -> int:
+    """Return a zone-fraction bin stable to neighboring split/merge events."""
+
+    indices = np.asarray(highres_indices, dtype=np.int64).reshape(-1)
+    if indices.size == 0 or canonical_sample_count <= 0:
+        raise ValueError("segment random key requires a supported canonical grid.")
+    zone_start = int(indices[0])
+    zone_stop = int(indices[-1]) + 1
+    midpoint = 0.5 * (extent.start_index + extent.stop_index)
+    fraction = (midpoint - zone_start) / (zone_stop - zone_start)
+    if not np.isfinite(fraction) or fraction < 0.0 or fraction > 1.0:
+        raise ValueError("segment midpoint is outside its supported zone.")
+    return min(
+        int(np.floor(fraction * canonical_sample_count)),
+        canonical_sample_count - 1,
+    )
+
+
 class ConditionalGenerator:
     """Observe audited evidence; structured realization is the next stage seam."""
 
@@ -301,9 +348,9 @@ class ConditionalGenerator:
 
         x_m = evidence.lateral_m if evidence.x_m is None else evidence.x_m
         y_m = np.zeros_like(evidence.lateral_m) if evidence.y_m is None else evidence.y_m
-        path_draw_count = maximum_model_samples + 1
+        path_draw_count = maximum_model_samples + 2
         coefficient_draw_offset = path_draw_count
-        draw_count = path_draw_count + 3 * maximum_model_samples
+        draw_count = path_draw_count + 9 * maximum_model_samples
         random_field_identity = stable_random_identity(
             "structured_ginn_v2_realize",
             policy.random_identity,
@@ -330,10 +377,13 @@ class ConditionalGenerator:
         segment_count_rows: list[np.ndarray] = []
         duration_rows: list[list[list[float]]] = []
         projection_support: np.ndarray | None = None
+        trace_highres_indices = {
+            trace: highres_indices
+            for trace, _, highres_indices, _ in posteriors
+        }
 
         for member_index, member_identity in enumerate(member_identities):
             extents: list[SegmentExtent] = []
-            local_segment_order: list[int] = []
             path_score = 0.0
             member_durations: list[list[float]] = [
                 [] for _ in range(evidence.support.shape[0])
@@ -346,7 +396,12 @@ class ConditionalGenerator:
             )
             for trace, model_indices, highres_indices, posterior_object in posteriors:
                 posterior = posterior_object
-                path = posterior.sample(uniforms[member_index, trace, :path_draw_count])
+                path_uniforms = _endpoint_aligned_path_uniforms(
+                    uniforms[member_index, trace, :path_draw_count],
+                    sample_count=model_indices.size,
+                    canonical_sample_count=maximum_model_samples,
+                )
+                path = posterior.sample(path_uniforms)
                 mapped = path_to_highres_extents(
                     path,
                     trace_index=trace,
@@ -356,7 +411,6 @@ class ConditionalGenerator:
                     highres_coordinates=evidence.highres_axis.coordinates,
                 )
                 extents.extend(mapped)
-                local_segment_order.extend(range(len(mapped)))
                 path_score += float(path.log_score)
                 member_segment_count[trace] = len(mapped)
                 member_durations[trace].extend(
@@ -368,17 +422,21 @@ class ConditionalGenerator:
                         member_interface[trace, item.start_index] = 1.0
             extent_tuple = tuple(extents)
             distributions = self.parameterize_segments(evidence, extent_tuple)
-            if len(distributions) != len(local_segment_order):
+            if len(distributions) != len(extent_tuple):
                 raise RuntimeError("segment parameterization changed the path length.")
-            trace_segment_cursor = np.zeros(
-                evidence.support.shape[0], dtype=np.int64
-            )
             sampled_segments: list[Segment] = []
             for distribution in distributions:
                 extent = distribution.extent
-                local_order = int(trace_segment_cursor[extent.trace_index])
-                trace_segment_cursor[extent.trace_index] += 1
-                draw_start = coefficient_draw_offset + 3 * local_order
+                if extent.state_id < 0 or extent.state_id >= 3:
+                    raise ValueError("segment state is outside the three-state contract.")
+                vertical_bin = _segment_vertical_bin(
+                    extent,
+                    trace_highres_indices[extent.trace_index],
+                    canonical_sample_count=maximum_model_samples,
+                )
+                draw_start = coefficient_draw_offset + 3 * (
+                    extent.state_id * maximum_model_samples + vertical_bin
+                )
                 gaussian = ndtri(
                     uniforms[
                         member_index,
@@ -531,6 +589,7 @@ class ConditionalGenerator:
                 "projection_supported_samples": float(
                     np.count_nonzero(projection_support)
                 ),
+                "spatial_random_key_version": 2.0,
             },
         )
 

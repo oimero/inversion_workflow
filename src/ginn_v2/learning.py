@@ -5314,6 +5314,16 @@ def _new_ensemble_statistics() -> dict[str, Any]:
         "duration_squared_error": 0.0,
         "forward_recursions": 0,
         "backward_samples": 0,
+        "continuity_parent_count": 0,
+        "truth_increment_lateral_gradient_rms": 0.0,
+        "representative_increment_lateral_gradient_rms": 0.0,
+        "ensemble_mean_increment_lateral_gradient_rms": 0.0,
+        "truth_state_neighbor_agreement": 0.0,
+        "representative_state_neighbor_agreement": 0.0,
+        "ensemble_state_neighbor_agreement": 0.0,
+        "truth_boundary_neighbor_wasserstein": 0.0,
+        "representative_boundary_neighbor_wasserstein": 0.0,
+        "ensemble_boundary_neighbor_wasserstein": 0.0,
     }
 
 
@@ -5395,6 +5405,10 @@ class _EnsembleParentBuilder:
     model_truth: np.ndarray
     model_evidence_target: np.ndarray
     model_support: np.ndarray
+    model_truth_state: np.ndarray
+    model_member_state: np.ndarray
+    model_truth_renewal: np.ndarray
+    model_member_renewal: np.ndarray
     zone_count: int = 0
     state_count: int = 0
     state_brier: float = 0.0
@@ -5441,6 +5455,15 @@ class _EnsembleParentResult:
     duration_squared_error: float
     forward_recursions: int
     backward_samples: int
+    truth_increment_lateral_gradient_rms: float
+    representative_increment_lateral_gradient_rms: float
+    ensemble_mean_increment_lateral_gradient_rms: float
+    truth_state_neighbor_agreement: float
+    representative_state_neighbor_agreement: float
+    ensemble_state_neighbor_agreement: float
+    truth_boundary_neighbor_wasserstein: float
+    representative_boundary_neighbor_wasserstein: float
+    ensemble_boundary_neighbor_wasserstein: float
 
 
 def _new_ensemble_parent_builder(
@@ -5481,6 +5504,14 @@ def _new_ensemble_parent_builder(
         model_truth=np.full(model_shape, np.nan, dtype=np.float64),
         model_evidence_target=np.full(model_shape, np.nan, dtype=np.float64),
         model_support=np.zeros(model_shape, dtype=bool),
+        model_truth_state=np.full(model_shape, -1, dtype=np.int8),
+        model_member_state=np.full(
+            (realization_count,) + model_shape, -1, dtype=np.int8
+        ),
+        model_truth_renewal=np.zeros(model_shape, dtype=bool),
+        model_member_renewal=np.zeros(
+            (realization_count,) + model_shape, dtype=bool
+        ),
     )
 
 
@@ -5530,6 +5561,133 @@ def _member_model_renewal(
     if duration.size != len(selected):
         raise RuntimeError("sampled model-grid durations lost a segment endpoint.")
     return renewal, duration
+
+
+def _normalized_continuous_rows(
+    values: np.ndarray,
+    support: np.ndarray,
+    *,
+    bins: int = 128,
+) -> list[np.ndarray | None]:
+    if bins < 2:
+        raise ValueError("normalized continuity grid requires at least two bins.")
+    parsed = np.asarray(values, dtype=np.float64)
+    valid = np.asarray(support, dtype=bool)
+    if parsed.shape != valid.shape or parsed.ndim != 2:
+        raise ValueError("normalized continuity values/support must be aligned 2D arrays.")
+    target = np.linspace(0.0, 1.0, bins)
+    rows: list[np.ndarray | None] = []
+    for trace in range(parsed.shape[0]):
+        selected = parsed[trace, valid[trace]]
+        if selected.size == 0:
+            rows.append(None)
+            continue
+        if np.any(~np.isfinite(selected)):
+            raise ValueError("supported continuity values must be finite.")
+        if selected.size == 1:
+            rows.append(np.full(bins, selected[0], dtype=np.float64))
+            continue
+        rows.append(
+            np.interp(
+                target,
+                np.linspace(0.0, 1.0, selected.size),
+                selected,
+            )
+        )
+    return rows
+
+
+def _normalized_discrete_rows(
+    values: np.ndarray,
+    support: np.ndarray,
+    *,
+    bins: int = 128,
+) -> list[np.ndarray | None]:
+    parsed = np.asarray(values)
+    valid = np.asarray(support, dtype=bool)
+    if parsed.shape != valid.shape or parsed.ndim != 2 or bins < 2:
+        raise ValueError("normalized discrete continuity arrays are invalid.")
+    rows: list[np.ndarray | None] = []
+    normalized = np.linspace(0.0, 1.0, bins)
+    for trace in range(parsed.shape[0]):
+        selected = parsed[trace, valid[trace]]
+        if selected.size == 0:
+            rows.append(None)
+            continue
+        indices = np.rint(normalized * (selected.size - 1)).astype(np.int64)
+        rows.append(selected[indices])
+    return rows
+
+
+def _normalized_increment_lateral_gradient_rms(
+    values: np.ndarray,
+    support: np.ndarray,
+    lateral_m: np.ndarray,
+) -> float:
+    rows = _normalized_continuous_rows(values, support)
+    lateral = np.asarray(lateral_m, dtype=np.float64).reshape(-1)
+    if lateral.size != len(rows):
+        raise ValueError("lateral coordinates do not match continuity rows.")
+    squared_sum = 0.0
+    sample_count = 0
+    for trace in range(len(rows) - 1):
+        left, right = rows[trace], rows[trace + 1]
+        if left is None or right is None:
+            continue
+        spacing = float(lateral[trace + 1] - lateral[trace])
+        if not np.isfinite(spacing) or spacing <= 0.0:
+            raise ValueError("continuity requires increasing metric lateral coordinates.")
+        gradient = (right - left) / spacing
+        squared_sum += float(np.sum(gradient**2))
+        sample_count += gradient.size
+    if sample_count == 0:
+        raise ValueError("continuity metric found no adjacent supported traces.")
+    return float(np.sqrt(squared_sum / sample_count))
+
+
+def _normalized_state_neighbor_agreement(
+    values: np.ndarray,
+    support: np.ndarray,
+) -> float:
+    rows = _normalized_discrete_rows(values, support)
+    agreements: list[float] = []
+    for left, right in zip(rows[:-1], rows[1:]):
+        if left is not None and right is not None:
+            agreements.append(float(np.mean(left == right)))
+    if not agreements:
+        raise ValueError("state continuity found no adjacent supported traces.")
+    return float(np.mean(agreements))
+
+
+def _normalized_boundary_neighbor_wasserstein(
+    renewal: np.ndarray,
+    support: np.ndarray,
+) -> float:
+    parsed = np.asarray(renewal, dtype=bool)
+    valid = np.asarray(support, dtype=bool)
+    if parsed.shape != valid.shape or parsed.ndim != 2:
+        raise ValueError("boundary continuity arrays must be aligned and 2D.")
+    positions: list[np.ndarray | None] = []
+    for trace in range(parsed.shape[0]):
+        selected = parsed[trace, valid[trace]]
+        if selected.size == 0:
+            positions.append(None)
+            continue
+        coordinate = np.linspace(0.0, 1.0, selected.size)
+        positions.append(coordinate[selected])
+    distances: list[float] = []
+    for left, right in zip(positions[:-1], positions[1:]):
+        if left is None or right is None:
+            continue
+        if left.size == 0 and right.size == 0:
+            distances.append(0.0)
+        elif left.size == 0 or right.size == 0:
+            distances.append(1.0)
+        else:
+            distances.append(float(wasserstein_distance(left, right)))
+    if not distances:
+        raise ValueError("boundary continuity found no adjacent supported traces.")
+    return float(np.mean(distances))
 
 
 def _add_ensemble_zone(
@@ -5616,6 +5774,12 @@ def _add_ensemble_zone(
             axis=-1,
         )
         one_hot = np.eye(3, dtype=np.float64)[truth_path.state.astype(np.int64)]
+        builder.model_truth_state[trace, model_indices] = truth_path.state.astype(
+            np.int8
+        )
+        builder.model_member_state[:, trace, model_indices] = member_state.astype(
+            np.int8
+        )
         builder.state_count += model_indices.size
         builder.state_brier += float(np.sum((occupancy - one_hot) ** 2))
 
@@ -5633,6 +5797,12 @@ def _add_ensemble_zone(
             member_renewal.append(renewal)
             member_duration.append(duration)
         renewal_probability = np.mean(np.stack(member_renewal), axis=0)
+        builder.model_truth_renewal[trace, model_indices] = truth_renewal.astype(
+            bool
+        )
+        builder.model_member_renewal[:, trace, model_indices] = np.stack(
+            member_renewal
+        ).astype(bool)
         if model_indices.size > 1:
             builder.interface_count += model_indices.size - 1
             builder.interface_truth_count += int(np.count_nonzero(truth_renewal[1:]))
@@ -5726,6 +5896,53 @@ def _finalize_ensemble_parent(
         axis=1,
     )
     representative_index = int(np.argmin(evidence_error))
+    if np.any(builder.model_truth_state[builder.model_support] < 0) or np.any(
+        builder.model_member_state[:, builder.model_support] < 0
+    ):
+        raise ValueError("ensemble parent continuity states are incomplete.")
+    truth_increment = builder.highres_truth - builder.highres_anchor
+    member_increment = builder.highres_members - builder.highres_anchor[None, ...]
+    ensemble_increment_mean = np.full_like(builder.highres_truth, np.nan)
+    ensemble_increment_mean[builder.highres_support] = np.mean(
+        member_increment[:, builder.highres_support], axis=0
+    )
+    truth_increment_gradient = _normalized_increment_lateral_gradient_rms(
+        truth_increment,
+        builder.highres_support,
+        builder.lateral_m,
+    )
+    representative_increment_gradient = _normalized_increment_lateral_gradient_rms(
+        member_increment[representative_index],
+        builder.highres_support,
+        builder.lateral_m,
+    )
+    ensemble_mean_increment_gradient = _normalized_increment_lateral_gradient_rms(
+        ensemble_increment_mean,
+        builder.highres_support,
+        builder.lateral_m,
+    )
+    truth_state_agreement = _normalized_state_neighbor_agreement(
+        builder.model_truth_state,
+        builder.model_support,
+    )
+    member_state_agreement = np.asarray(
+        [
+            _normalized_state_neighbor_agreement(member, builder.model_support)
+            for member in builder.model_member_state
+        ],
+        dtype=np.float64,
+    )
+    truth_boundary_distance = _normalized_boundary_neighbor_wasserstein(
+        builder.model_truth_renewal,
+        builder.model_support,
+    )
+    member_boundary_distance = np.asarray(
+        [
+            _normalized_boundary_neighbor_wasserstein(member, builder.model_support)
+            for member in builder.model_member_renewal
+        ],
+        dtype=np.float64,
+    )
     return _EnsembleParentResult(
         parent_id=builder.parent_id,
         geometry_family=builder.geometry_family,
@@ -5760,6 +5977,25 @@ def _finalize_ensemble_parent(
         duration_squared_error=builder.duration_squared_error,
         forward_recursions=builder.forward_recursions,
         backward_samples=builder.backward_samples,
+        truth_increment_lateral_gradient_rms=truth_increment_gradient,
+        representative_increment_lateral_gradient_rms=(
+            representative_increment_gradient
+        ),
+        ensemble_mean_increment_lateral_gradient_rms=(
+            ensemble_mean_increment_gradient
+        ),
+        truth_state_neighbor_agreement=truth_state_agreement,
+        representative_state_neighbor_agreement=float(
+            member_state_agreement[representative_index]
+        ),
+        ensemble_state_neighbor_agreement=float(np.mean(member_state_agreement)),
+        truth_boundary_neighbor_wasserstein=truth_boundary_distance,
+        representative_boundary_neighbor_wasserstein=float(
+            member_boundary_distance[representative_index]
+        ),
+        ensemble_boundary_neighbor_wasserstein=float(
+            np.mean(member_boundary_distance)
+        ),
     )
 
 
@@ -5800,8 +6036,18 @@ def _update_ensemble_parent_statistics(
         "duration_squared_error",
         "forward_recursions",
         "backward_samples",
+        "truth_increment_lateral_gradient_rms",
+        "representative_increment_lateral_gradient_rms",
+        "ensemble_mean_increment_lateral_gradient_rms",
+        "truth_state_neighbor_agreement",
+        "representative_state_neighbor_agreement",
+        "ensemble_state_neighbor_agreement",
+        "truth_boundary_neighbor_wasserstein",
+        "representative_boundary_neighbor_wasserstein",
+        "ensemble_boundary_neighbor_wasserstein",
     ):
         statistics[name] += getattr(parent, name)
+    statistics["continuity_parent_count"] += 1
 
 
 def _finalize_ensemble_statistics(statistics: Mapping[str, Any]) -> dict[str, Any]:
@@ -5832,6 +6078,34 @@ def _finalize_ensemble_statistics(statistics: Mapping[str, Any]) -> dict[str, An
     interface_count = int(statistics["interface_count"])
     forward = int(statistics["forward_recursions"])
     backward = int(statistics["backward_samples"])
+    continuity_count = int(statistics["continuity_parent_count"])
+    if continuity_count <= 0:
+        raise ValueError("ensemble evaluation has no continuity parents.")
+
+    def continuity_mean(name: str) -> float:
+        return float(statistics[name]) / continuity_count
+
+    truth_gradient = continuity_mean("truth_increment_lateral_gradient_rms")
+    representative_gradient = continuity_mean(
+        "representative_increment_lateral_gradient_rms"
+    )
+    ensemble_mean_gradient = continuity_mean(
+        "ensemble_mean_increment_lateral_gradient_rms"
+    )
+    truth_state_agreement = continuity_mean("truth_state_neighbor_agreement")
+    representative_state_agreement = continuity_mean(
+        "representative_state_neighbor_agreement"
+    )
+    ensemble_state_agreement = continuity_mean("ensemble_state_neighbor_agreement")
+    truth_boundary_distance = continuity_mean(
+        "truth_boundary_neighbor_wasserstein"
+    )
+    representative_boundary_distance = continuity_mean(
+        "representative_boundary_neighbor_wasserstein"
+    )
+    ensemble_boundary_distance = continuity_mean(
+        "ensemble_boundary_neighbor_wasserstein"
+    )
     return {
         "parent_count": len(statistics["parent_ids"]),
         "zone_count": int(statistics["zone_count"]),
@@ -5855,6 +6129,30 @@ def _finalize_ensemble_statistics(statistics: Mapping[str, Any]) -> dict[str, An
         "duration_fraction_mean_rmse": float(
             np.sqrt(float(statistics["duration_squared_error"]) / duration_count)
         ),
+        "lateral_continuity": {
+            "parent_count": continuity_count,
+            "normalized_increment_gradient_rms_per_m": {
+                "truth": truth_gradient,
+                "representative": representative_gradient,
+                "ensemble_mean": ensemble_mean_gradient,
+                "representative_minus_truth": representative_gradient
+                - truth_gradient,
+            },
+            "normalized_state_neighbor_agreement": {
+                "truth": truth_state_agreement,
+                "representative": representative_state_agreement,
+                "ensemble_members_mean": ensemble_state_agreement,
+                "representative_minus_truth": representative_state_agreement
+                - truth_state_agreement,
+            },
+            "normalized_boundary_neighbor_wasserstein": {
+                "truth": truth_boundary_distance,
+                "representative": representative_boundary_distance,
+                "ensemble_members_mean": ensemble_boundary_distance,
+                "representative_minus_truth": representative_boundary_distance
+                - truth_boundary_distance,
+            },
+        },
         "forward_recursions": forward,
         "backward_samples": backward,
     }
@@ -6105,6 +6403,35 @@ def evaluate_structured_ensemble(
                 "zone_count": parent.zone_count,
                 "projected_supported_samples": parent.projected_supported_samples,
                 "representative_member_index": parent.representative_member_index,
+                "lateral_continuity": {
+                    "truth_increment_gradient_rms_per_m": (
+                        parent.truth_increment_lateral_gradient_rms
+                    ),
+                    "representative_increment_gradient_rms_per_m": (
+                        parent.representative_increment_lateral_gradient_rms
+                    ),
+                    "ensemble_mean_increment_gradient_rms_per_m": (
+                        parent.ensemble_mean_increment_lateral_gradient_rms
+                    ),
+                    "truth_state_neighbor_agreement": (
+                        parent.truth_state_neighbor_agreement
+                    ),
+                    "representative_state_neighbor_agreement": (
+                        parent.representative_state_neighbor_agreement
+                    ),
+                    "ensemble_state_neighbor_agreement": (
+                        parent.ensemble_state_neighbor_agreement
+                    ),
+                    "truth_boundary_neighbor_wasserstein": (
+                        parent.truth_boundary_neighbor_wasserstein
+                    ),
+                    "representative_boundary_neighbor_wasserstein": (
+                        parent.representative_boundary_neighbor_wasserstein
+                    ),
+                    "ensemble_boundary_neighbor_wasserstein": (
+                        parent.ensemble_boundary_neighbor_wasserstein
+                    ),
+                },
             }
         )
         completed.add(parent.parent_id)
@@ -6149,7 +6476,7 @@ def evaluate_structured_ensemble(
     if not parent_rows:
         raise ValueError("ensemble evaluation received no zones.")
     result = {
-        "schema": "structured_ginn_v2_ensemble_evaluation_v2",
+        "schema": "structured_ginn_v2_ensemble_evaluation_v3",
         "status": "success",
         "realization_count": policy.realization_count,
         "policy": asdict(policy),

@@ -461,14 +461,21 @@ class SemiMarkovPosterior:
         )
 
     def sample(self, uniforms: Sequence[float]) -> SampledPath:
+        """Draw one exact path using endpoint-indexed random values.
+
+        ``uniforms[0]`` selects the final state.  ``uniforms[1 + stop]``
+        selects the predecessor/duration at the current exclusive endpoint.
+        Endpoint indexing preserves the single-trace posterior while allowing
+        callers to couple equivalent vertical decisions across lateral traces.
+        """
+
         random_values = np.asarray(uniforms, dtype=np.float64).reshape(-1)
-        if random_values.size < self.sample_count + 1:
-            raise ValueError("sampling requires at least sample_count + 1 uniforms.")
+        if random_values.size < self.sample_count + 2:
+            raise ValueError("sampling requires at least sample_count + 2 uniforms.")
         final_state = self._draw(self.alpha[self.sample_count], random_values[0])
         stop = self.sample_count
         state = final_state
         reversed_segments: list[tuple[int, int, int]] = []
-        cursor = 1
         while stop > 0:
             maximum = min(stop, self.duration_log_probability.shape[1] - 1)
             labels: list[tuple[int, int | None]] = []
@@ -491,8 +498,7 @@ class SemiMarkovPosterior:
                                 + segment_score
                             )
                         )
-            choice = self._draw(np.asarray(scores), random_values[cursor])
-            cursor += 1
+            choice = self._draw(np.asarray(scores), random_values[1 + stop])
             duration, previous = labels[choice]
             start = stop - duration
             reversed_segments.append((state, start, stop))

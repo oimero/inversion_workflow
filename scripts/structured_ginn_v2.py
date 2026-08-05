@@ -871,6 +871,7 @@ def main() -> None:
             **dict(metadata.get("training_state") or {}),
             "semi_markov_contract": dict(hsmm_metadata),
             "ensemble_policy": asdict(policy),
+            "spatial_random_key_version": 2,
         }
         corpus_provenance = dict(metadata.get("corpus_provenance") or {})
         corpus_provenance["ensemble_evaluation_parent_ids"] = list(parent_ids)
@@ -896,7 +897,7 @@ def main() -> None:
         write_json(
             output / "run_summary.json",
             {
-                "schema": "structured_ginn_v2_ensemble_run_v2",
+                "schema": "structured_ginn_v2_ensemble_run_v3",
                 "status": "success",
                 "mode": result["mode"],
                 "parent_count": result["aggregate"]["parent_count"],
@@ -904,6 +905,7 @@ def main() -> None:
                 "realization_count": policy.realization_count,
                 "highres_log_ai": result["aggregate"]["highres_log_ai"],
                 "projected_log_ai": result["aggregate"]["projected_log_ai"],
+                "lateral_continuity": result["aggregate"]["lateral_continuity"],
                 "figure_count": len(result["figures"]),
                 "figure_errors": result["figure_errors"],
                 "generator": str(checkpoint),

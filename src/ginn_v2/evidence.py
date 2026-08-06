@@ -1,4 +1,4 @@
-"""Audited observable targets and their formal evidence network."""
+"""Observable evidence construction and the reusable vertical encoder."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from torch.nn import functional as F
 from cup.physics.numpy_backend import reflectivity_from_log_ai
 from ginn_v2.contracts import (
     InputContractError,
-    ObservableTargetContract,
     ObservationTile,
 )
 
@@ -186,34 +185,8 @@ class EvidenceNetworkConfig:
     def from_mapping(
         cls,
         value: Mapping[str, object],
-        *,
-        target_contract: ObservableTargetContract | None = None,
     ) -> "EvidenceNetworkConfig":
         payload = dict(value)
-        if target_contract is not None:
-            protected = {
-                "seismic_scale",
-                "lfm_residual_scale",
-                "projected_log_ai_increment_scale",
-                "signed_reflectivity_scale",
-            }
-            configured = sorted(protected.intersection(payload))
-            if configured:
-                raise ValueError(
-                    "network scales come from the passed target contract, not config: "
-                    f"{configured}"
-                )
-            scales = target_contract.global_scales
-            payload.update(
-                {
-                    "seismic_scale": scales["seismic"],
-                    "lfm_residual_scale": scales["lfm_residual"],
-                    "projected_log_ai_increment_scale": scales[
-                        "projected_log_ai_increment"
-                    ],
-                    "signed_reflectivity_scale": scales["signed_reflectivity"],
-                }
-            )
         return cls(**payload)
 
 
@@ -232,75 +205,6 @@ class _ResidualBlock(nn.Module):
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         update = self.normalization(self.convolution(values))
         return values + F.gelu(update)
-
-
-class ObservableTargetProbe(nn.Module):
-    """Small single-target network used only by L1/L2 information probes."""
-
-    def __init__(
-        self,
-        target_name: str,
-        *,
-        hidden_channels: int = 24,
-        layers: int = 3,
-    ) -> None:
-        super().__init__()
-        if target_name not in {
-            "projected_log_ai_increment",
-            "signed_reflectivity",
-            "state_emission",
-        }:
-            raise ValueError(f"unsupported observable target: {target_name}")
-        if hidden_channels <= 0 or layers <= 0:
-            raise ValueError("probe dimensions must be positive.")
-        self.target_name = target_name
-        self.input_projection = nn.Conv1d(3, hidden_channels, kernel_size=5, padding=2)
-        self.encoder = nn.Sequential(
-            *(
-                _ResidualBlock(hidden_channels, dilation=2 ** (index % 3))
-                for index in range(layers)
-            )
-        )
-        channels = 3 if target_name == "state_emission" else 1
-        self.head = nn.Conv1d(hidden_channels, channels, kernel_size=1)
-        if channels == 1:
-            nn.init.zeros_(self.head.weight)
-            nn.init.zeros_(self.head.bias)
-
-    def forward(
-        self,
-        seismic: torch.Tensor,
-        lfm_residual: torch.Tensor,
-        observed_valid: torch.Tensor,
-        *,
-        input_mode: str,
-        seismic_scale: float,
-        lfm_residual_scale: float,
-    ) -> torch.Tensor:
-        if seismic.ndim != 2 or lfm_residual.shape != seismic.shape:
-            raise ValueError("probe observations must have shape [batch, sample].")
-        if observed_valid.shape != seismic.shape:
-            raise ValueError("probe validity must match observations.")
-        if input_mode not in {"full", "no_seismic"}:
-            raise ValueError("probe input_mode must be full or no_seismic.")
-        if seismic_scale <= 0.0 or lfm_residual_scale <= 0.0:
-            raise ValueError("probe input scales must be positive.")
-        valid = observed_valid.to(dtype=seismic.dtype)
-        seismic_input = seismic / float(seismic_scale)
-        if input_mode == "no_seismic":
-            seismic_input = torch.zeros_like(seismic_input)
-        values = torch.stack(
-            (
-                seismic_input * valid,
-                lfm_residual / float(lfm_residual_scale) * valid,
-                valid,
-            ),
-            dim=1,
-        )
-        output = self.head(self.encoder(F.gelu(self.input_projection(values))))
-        if self.target_name == "state_emission":
-            return output.transpose(1, 2)
-        return output[:, 0]
 
 
 class ObservableEvidenceNetwork(nn.Module):
@@ -517,7 +421,6 @@ def evidence_loss(
 __all__ = [
     "ObservableEvidenceNetwork",
     "EvidenceNetworkConfig",
-    "ObservableTargetProbe",
     "ObservableTargets",
     "build_observable_targets",
     "dominant_frequency_hz",

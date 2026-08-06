@@ -1,4 +1,9 @@
-"""Public scientific contracts for Structured GINN V2."""
+"""Small public contracts for the Structured GINN V2 generator.
+
+The public seam carries axes, physical geometry, observable evidence, and
+complete section results.  Event decoding, semi-Markov scoring, and sampling
+remain implementation details of the generator.
+"""
 
 from __future__ import annotations
 
@@ -15,33 +20,62 @@ class InputContractError(ValueError):
 
 
 class DomainMismatchError(InputContractError):
-    """Raised when a checkpoint and an observation use different vertical domains."""
+    """Raised when two vertical objects use different sample domains."""
 
 
 class NumericalFailure(FloatingPointError):
-    """Raised when a numerical operation produces non-finite scientific output."""
+    """Raised when a scientific result is non-finite on declared support."""
 
 
 def _array(value: object, *, dtype: object, ndim: int, name: str) -> np.ndarray:
-    result = np.asarray(value, dtype=dtype)
-    if result.ndim != ndim:
+    parsed = np.asarray(value, dtype=dtype)
+    if parsed.ndim != ndim:
         raise InputContractError(f"{name} must have {ndim} dimensions.")
-    return result
+    return parsed
 
 
-def _same_axis(left: SampleAxis, right: SampleAxis) -> bool:
-    return (
-        left.sample_domain == right.sample_domain
-        and left.unit == right.unit
-        and left.depth_basis == right.depth_basis
-        and left.coordinates.shape == right.coordinates.shape
-        and np.allclose(left.coordinates, right.coordinates, rtol=0.0, atol=1.0e-10)
-    )
+def _validate_nested_axes(model: SampleAxis, highres: SampleAxis) -> None:
+    if not isinstance(model, SampleAxis) or not isinstance(highres, SampleAxis):
+        raise TypeError("model and high-resolution axes must be SampleAxis objects.")
+    if (
+        model.sample_domain != highres.sample_domain
+        or model.unit != highres.unit
+        or model.depth_basis != highres.depth_basis
+    ):
+        raise DomainMismatchError("model and high-resolution axes must share domain.")
+    ratio = model.sample_interval / highres.sample_interval
+    factor = int(round(ratio))
+    if factor < 1 or not np.isclose(ratio, factor, rtol=0.0, atol=1.0e-10):
+        raise InputContractError("model and high-resolution axes must be integer nested.")
+    nested = highres.coordinates[::factor]
+    if nested.shape != model.coordinates.shape or not np.allclose(
+        nested, model.coordinates, rtol=0.0, atol=1.0e-9
+    ):
+        raise InputContractError("model axis must be nested in high-resolution axis.")
+
+
+def _validate_xy(
+    lateral: np.ndarray,
+    x_m: np.ndarray | None,
+    y_m: np.ndarray | None,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    parsed: list[np.ndarray | None] = []
+    for name, value in (("x_m", x_m), ("y_m", y_m)):
+        if value is None:
+            parsed.append(None)
+            continue
+        item = _array(value, dtype=np.float64, ndim=1, name=name)
+        if item.shape != lateral.shape or np.any(~np.isfinite(item)):
+            raise InputContractError(f"{name} must be finite and match lateral_m.")
+        parsed.append(item)
+    if (parsed[0] is None) != (parsed[1] is None):
+        raise InputContractError("x_m and y_m must either both be present or absent.")
+    return parsed[0], parsed[1]
 
 
 @dataclass(frozen=True)
 class ObservationTile:
-    """One 1D lateral tile with explicit vertical and physical geometry."""
+    """A lateral tile with explicit vertical and physical geometry."""
 
     model_axis: SampleAxis
     highres_axis: SampleAxis
@@ -57,59 +91,28 @@ class ObservationTile:
     identity: str = ""
 
     def __post_init__(self) -> None:
-        if not isinstance(self.model_axis, SampleAxis) or not isinstance(
-            self.highres_axis, SampleAxis
-        ):
-            raise TypeError("model_axis and highres_axis must be SampleAxis objects.")
-        if (
-            self.model_axis.sample_domain != self.highres_axis.sample_domain
-            or self.model_axis.unit != self.highres_axis.unit
-            or self.model_axis.depth_basis != self.highres_axis.depth_basis
-        ):
-            raise DomainMismatchError("model and high-resolution axes must share domain.")
-        ratio = self.model_axis.sample_interval / self.highres_axis.sample_interval
-        factor = int(round(ratio))
-        if factor < 1 or not np.isclose(ratio, factor, rtol=0.0, atol=1.0e-10):
-            raise InputContractError("model and high-resolution axes must be integer nested.")
-        nested = self.highres_axis.coordinates[::factor]
-        if nested.shape != self.model_axis.coordinates.shape or not np.allclose(
-            nested,
-            self.model_axis.coordinates,
-            rtol=0.0,
-            atol=1.0e-9,
-        ):
-            raise InputContractError("model axis must be nested in high-resolution axis.")
-
+        _validate_nested_axes(self.model_axis, self.highres_axis)
         seismic = _array(self.seismic, dtype=np.float64, ndim=2, name="seismic")
         lfm = _array(self.lfm, dtype=np.float64, ndim=2, name="lfm")
-        valid = _array(
-            self.observed_valid,
-            dtype=bool,
-            ndim=2,
-            name="observed_valid",
+        observed_valid = _array(
+            self.observed_valid, dtype=bool, ndim=2, name="observed_valid"
         )
         expected = (seismic.shape[0], self.model_axis.coordinates.size)
-        if seismic.shape != expected or lfm.shape != expected or valid.shape != expected:
+        if lfm.shape != expected or observed_valid.shape != expected or seismic.shape != expected:
             raise InputContractError(
                 "seismic, lfm, and observed_valid must be [lateral, model_sample]."
             )
-        if np.any(valid & (~np.isfinite(seismic) | ~np.isfinite(lfm))):
+        if np.any(observed_valid & (~np.isfinite(seismic) | ~np.isfinite(lfm))):
             raise InputContractError("valid observation samples must be finite.")
 
         lateral = _array(self.lateral_m, dtype=np.float64, ndim=1, name="lateral_m")
         lateral_valid = _array(
-            self.lateral_valid,
-            dtype=bool,
-            ndim=1,
-            name="lateral_valid",
+            self.lateral_valid, dtype=bool, ndim=1, name="lateral_valid"
         )
         top = _array(self.zone_top, dtype=np.float64, ndim=1, name="zone_top")
         bottom = _array(self.zone_bottom, dtype=np.float64, ndim=1, name="zone_bottom")
-        if any(
-            item.shape != (seismic.shape[0],)
-            for item in (lateral, lateral_valid, top, bottom)
-        ):
-            raise InputContractError("lateral geometry must match the tile width.")
+        if any(item.shape != (seismic.shape[0],) for item in (lateral, lateral_valid, top, bottom)):
+            raise InputContractError("lateral geometry must match tile width.")
         if np.any(~np.isfinite(lateral)) or (
             lateral.size > 1 and np.any(np.diff(lateral) <= 0.0)
         ):
@@ -118,29 +121,17 @@ class ObservationTile:
             raise InputContractError("valid zone coordinates must be finite.")
         if np.any(lateral_valid & (bottom <= top)):
             raise InputContractError("valid zone bottoms must be greater than tops.")
-
-        coordinates: list[np.ndarray | None] = [self.x_m, self.y_m]
-        parsed_coordinates: list[np.ndarray | None] = []
-        for name, value in zip(("x_m", "y_m"), coordinates):
-            if value is None:
-                parsed_coordinates.append(None)
-                continue
-            parsed = _array(value, dtype=np.float64, ndim=1, name=name)
-            if parsed.shape != lateral.shape or np.any(~np.isfinite(parsed)):
-                raise InputContractError(f"{name} must be finite and match lateral_m.")
-            parsed_coordinates.append(parsed)
-        if (parsed_coordinates[0] is None) != (parsed_coordinates[1] is None):
-            raise InputContractError("x_m and y_m must either both be present or absent.")
+        x_m, y_m = _validate_xy(lateral, self.x_m, self.y_m)
 
         object.__setattr__(self, "seismic", seismic)
         object.__setattr__(self, "lfm", lfm)
-        object.__setattr__(self, "observed_valid", valid)
+        object.__setattr__(self, "observed_valid", observed_valid)
         object.__setattr__(self, "lateral_m", lateral)
         object.__setattr__(self, "lateral_valid", lateral_valid)
         object.__setattr__(self, "zone_top", top)
         object.__setattr__(self, "zone_bottom", bottom)
-        object.__setattr__(self, "x_m", parsed_coordinates[0])
-        object.__setattr__(self, "y_m", parsed_coordinates[1])
+        object.__setattr__(self, "x_m", x_m)
+        object.__setattr__(self, "y_m", y_m)
 
     @property
     def sample_domain(self) -> str:
@@ -152,92 +143,8 @@ class ObservationTile:
 
 
 @dataclass(frozen=True)
-class ObservableTargetContract:
-    """Passed L0-L2 target admission contract embedded in every checkpoint."""
-
-    sample_domain: str
-    sample_unit: str
-    depth_basis: str | None
-    targets: tuple[str, ...]
-    global_scales: Mapping[str, float]
-    audit_report: str
-
-    SCHEMA = "structured_ginn_v2_observable_target_contract_v1"
-    REQUIRED_TARGETS = (
-        "projected_log_ai_increment",
-        "signed_reflectivity",
-        "state_emission",
-    )
-    REQUIRED_SCALES = (
-        "seismic",
-        "lfm_residual",
-        "projected_log_ai_increment",
-        "signed_reflectivity",
-    )
-
-    def __post_init__(self) -> None:
-        domain = str(self.sample_domain).strip().casefold()
-        unit = str(self.sample_unit).strip()
-        basis = None if self.depth_basis in {None, ""} else str(self.depth_basis)
-        targets = tuple(str(value) for value in self.targets)
-        if domain not in {"time", "depth"}:
-            raise InputContractError("target contract domain must be time or depth.")
-        if not unit:
-            raise InputContractError("target contract sample_unit cannot be empty.")
-        if domain == "time" and basis is not None:
-            raise InputContractError("time target contract cannot declare depth_basis.")
-        if domain == "depth" and basis is None:
-            raise InputContractError("depth target contract requires depth_basis.")
-        if targets != self.REQUIRED_TARGETS:
-            raise InputContractError(
-                "target contract must contain the three audited targets in order."
-            )
-        scales = {str(key): float(value) for key, value in self.global_scales.items()}
-        if set(scales) != set(self.REQUIRED_SCALES):
-            raise InputContractError(
-                "target contract global_scales do not match the audited interface."
-            )
-        if any(not np.isfinite(value) or value <= 0.0 for value in scales.values()):
-            raise InputContractError("target contract scales must be finite and positive.")
-        report = str(self.audit_report).strip()
-        if not report:
-            raise InputContractError("target contract must identify its audit report.")
-        object.__setattr__(self, "sample_domain", domain)
-        object.__setattr__(self, "sample_unit", unit)
-        object.__setattr__(self, "depth_basis", basis)
-        object.__setattr__(self, "targets", targets)
-        object.__setattr__(self, "global_scales", scales)
-        object.__setattr__(self, "audit_report", report)
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "ObservableTargetContract":
-        if value.get("schema") != cls.SCHEMA or value.get("status") != "passed":
-            raise InputContractError("observable target contract has not passed L0-L2.")
-        return cls(
-            sample_domain=str(value.get("sample_domain") or ""),
-            sample_unit=str(value.get("sample_unit") or ""),
-            depth_basis=value.get("depth_basis"),
-            targets=tuple(value.get("targets") or ()),
-            global_scales=dict(value.get("global_scales") or {}),
-            audit_report=str(value.get("audit_report") or ""),
-        )
-
-    def to_mapping(self) -> dict[str, Any]:
-        return {
-            "schema": self.SCHEMA,
-            "status": "passed",
-            "sample_domain": self.sample_domain,
-            "sample_unit": self.sample_unit,
-            "depth_basis": self.depth_basis,
-            "targets": list(self.targets),
-            "global_scales": dict(self.global_scales),
-            "audit_report": self.audit_report,
-        }
-
-
-@dataclass(frozen=True)
 class ObservableEvidence:
-    """Audited model-grid evidence; no micro-boundary probability is exposed."""
+    """Band-limited evidence exposed to the event generator."""
 
     model_axis: SampleAxis
     highres_axis: SampleAxis
@@ -256,29 +163,14 @@ class ObservableEvidence:
     y_m: np.ndarray | None = None
     identity: str = ""
 
+    @property
+    def sample_domain(self) -> str:
+        """Return the vertical domain carried by the model axis."""
+
+        return self.model_axis.sample_domain
+
     def __post_init__(self) -> None:
-        if not isinstance(self.model_axis, SampleAxis) or not isinstance(
-            self.highres_axis, SampleAxis
-        ):
-            raise TypeError("model_axis and highres_axis must be SampleAxis objects.")
-        if (
-            self.model_axis.sample_domain != self.highres_axis.sample_domain
-            or self.model_axis.unit != self.highres_axis.unit
-            or self.model_axis.depth_basis != self.highres_axis.depth_basis
-        ):
-            raise DomainMismatchError("evidence axes must share domain, unit, and basis.")
-        ratio = self.model_axis.sample_interval / self.highres_axis.sample_interval
-        factor = int(round(ratio))
-        if factor < 1 or not np.isclose(ratio, factor, rtol=0.0, atol=1.0e-10):
-            raise InputContractError("evidence axes must be integer nested.")
-        nested = self.highres_axis.coordinates[::factor]
-        if nested.shape != self.model_axis.coordinates.shape or not np.allclose(
-            nested,
-            self.model_axis.coordinates,
-            rtol=0.0,
-            atol=1.0e-9,
-        ):
-            raise InputContractError("evidence model axis must nest in highres_axis.")
+        _validate_nested_axes(self.model_axis, self.highres_axis)
         mean = _array(
             self.projected_log_ai_increment_mean,
             dtype=np.float64,
@@ -286,237 +178,129 @@ class ObservableEvidence:
             name="projected_log_ai_increment_mean",
         )
         shape = mean.shape
-        if shape[1] != self.model_axis.coordinates.size:
-            raise InputContractError("evidence sample dimension must match model_axis.")
-        background = _array(
-            self.background_lfm_linear,
-            dtype=np.float64,
-            ndim=2,
-            name="background_lfm_linear",
+        fields = {
+            "background_lfm_linear": _array(
+                self.background_lfm_linear, dtype=np.float64, ndim=2, name="background_lfm_linear"
+            ),
+            "projected_log_ai_increment_scale": _array(
+                self.projected_log_ai_increment_scale, dtype=np.float64, ndim=2, name="projected_log_ai_increment_scale"
+            ),
+            "signed_reflectivity_mean": _array(
+                self.signed_reflectivity_mean, dtype=np.float64, ndim=2, name="signed_reflectivity_mean"
+            ),
+            "signed_reflectivity_scale": _array(
+                self.signed_reflectivity_scale, dtype=np.float64, ndim=2, name="signed_reflectivity_scale"
+            ),
+            "local_tuning_scale": _array(
+                self.local_tuning_scale, dtype=np.float64, ndim=2, name="local_tuning_scale"
+            ),
+            "support": _array(self.support, dtype=bool, ndim=2, name="support"),
+        }
+        if any(value.shape != shape for value in fields.values()):
+            raise InputContractError("model-grid evidence fields must share one shape.")
+        state_log_potential = _array(
+            self.state_log_potential, dtype=np.float64, ndim=3, name="state_log_potential"
         )
+        if state_log_potential.shape != shape + (3,):
+            raise InputContractError("state_log_potential must be [lateral, sample, 3].")
+        highres_shape = (shape[0], self.highres_axis.coordinates.size)
         background_highres = _array(
             self.background_lfm_linear_highres,
             dtype=np.float64,
             ndim=2,
             name="background_lfm_linear_highres",
         )
-        scale = _array(
-            self.projected_log_ai_increment_scale,
-            dtype=np.float64,
-            ndim=2,
-            name="projected_log_ai_increment_scale",
-        )
-        reflectivity = _array(
-            self.signed_reflectivity_mean,
-            dtype=np.float64,
-            ndim=2,
-            name="signed_reflectivity_mean",
-        )
-        reflectivity_scale = _array(
-            self.signed_reflectivity_scale,
-            dtype=np.float64,
-            ndim=2,
-            name="signed_reflectivity_scale",
-        )
-        tuning = _array(
-            self.local_tuning_scale,
-            dtype=np.float64,
-            ndim=2,
-            name="local_tuning_scale",
-        )
-        support = _array(self.support, dtype=bool, ndim=2, name="support")
         highres_support = _array(
-            self.highres_support,
-            dtype=bool,
-            ndim=2,
-            name="highres_support",
+            self.highres_support, dtype=bool, ndim=2, name="highres_support"
         )
-        state_log_potential = _array(
-            self.state_log_potential,
-            dtype=np.float64,
-            ndim=3,
-            name="state_log_potential",
-        )
-        if any(
-            item.shape != shape
-            for item in (
-                background,
-                scale,
-                reflectivity,
-                reflectivity_scale,
-                tuning,
-                support,
-            )
+        if background_highres.shape != highres_shape or highres_support.shape != highres_shape:
+            raise InputContractError("high-resolution fields must match [lateral, sample].")
+        support = fields["support"]
+        if np.any(support & ~np.isfinite(mean)):
+            raise NumericalFailure("supported evidence mean must be finite.")
+        for name in (
+            "projected_log_ai_increment_scale",
+            "signed_reflectivity_scale",
+            "local_tuning_scale",
         ):
-            raise InputContractError("all scalar evidence fields must share one shape.")
-        if state_log_potential.shape != shape + (3,):
-            raise InputContractError(
-                "state_log_potential must have shape [lateral, sample, 3]."
-            )
-        highres_shape = (shape[0], self.highres_axis.coordinates.size)
-        if (
-            background_highres.shape != highres_shape
-            or highres_support.shape != highres_shape
-        ):
-            raise InputContractError(
-                "high-resolution anchor/support must be [lateral, highres_sample]."
-            )
+            value = fields[name]
+            if np.any(support & (~np.isfinite(value) | (value <= 0.0))):
+                raise NumericalFailure(f"supported {name} must be finite and positive.")
         if np.any(highres_support & ~np.isfinite(background_highres)):
-            raise InputContractError(
-                "supported high-resolution LFM anchor must be finite."
-            )
-        if np.any(support & ~np.isfinite(mean)) or np.any(
-            support & (~np.isfinite(scale) | (scale <= 0.0))
-        ):
-            raise NumericalFailure("supported evidence mean/scale must be finite and positive.")
-        if np.any(support & ~np.isfinite(reflectivity)) or np.any(
-            support & (~np.isfinite(reflectivity_scale) | (reflectivity_scale <= 0.0))
-        ):
-            raise NumericalFailure(
-                "supported reflectivity mean/scale must be finite and positive."
-            )
-        if np.any(support & (~np.isfinite(tuning) | (tuning <= 0.0))):
-            raise InputContractError("local_tuning_scale must be finite and positive.")
-        if np.any(support & ~np.all(np.isfinite(state_log_potential), axis=-1)):
-            raise NumericalFailure("supported state_log_potential must be finite.")
-        log_normalizer = np.logaddexp.reduce(state_log_potential, axis=-1)
-        if np.any(support & ~np.isclose(log_normalizer, 0.0, rtol=0.0, atol=1.0e-5)):
+            raise NumericalFailure("supported high-resolution anchor must be finite.")
+        normalized = np.logaddexp.reduce(state_log_potential, axis=-1)
+        if np.any(support & ~np.isclose(normalized, 0.0, rtol=0.0, atol=1.0e-5)):
             raise InputContractError("state_log_potential must be log-normalized.")
         lateral = _array(self.lateral_m, dtype=np.float64, ndim=1, name="lateral_m")
-        if (
-            lateral.shape != (shape[0],)
-            or np.any(~np.isfinite(lateral))
-            or (lateral.size > 1 and np.any(np.diff(lateral) <= 0.0))
+        if lateral.shape != (shape[0],) or np.any(~np.isfinite(lateral)) or (
+            lateral.size > 1 and np.any(np.diff(lateral) <= 0.0)
         ):
-            raise InputContractError(
-                "lateral_m must be finite, increasing, and match evidence width."
-            )
-        parsed_coordinates: list[np.ndarray | None] = []
-        for name, value in (("x_m", self.x_m), ("y_m", self.y_m)):
-            if value is None:
-                parsed_coordinates.append(None)
-                continue
-            parsed = _array(value, dtype=np.float64, ndim=1, name=name)
-            if parsed.shape != lateral.shape or np.any(~np.isfinite(parsed)):
-                raise InputContractError(f"{name} must be finite and match lateral_m.")
-            parsed_coordinates.append(parsed)
-        if (parsed_coordinates[0] is None) != (parsed_coordinates[1] is None):
-            raise InputContractError("x_m and y_m must both be present or absent.")
+            raise InputContractError("evidence lateral_m must be finite and increasing.")
+        x_m, y_m = _validate_xy(lateral, self.x_m, self.y_m)
         identity = str(self.identity).strip()
         if not identity:
             raise InputContractError("observable evidence identity must be non-empty.")
 
-        object.__setattr__(self, "background_lfm_linear", background)
-        object.__setattr__(
-            self, "background_lfm_linear_highres", background_highres
-        )
+        object.__setattr__(self, "background_lfm_linear", fields["background_lfm_linear"])
+        object.__setattr__(self, "background_lfm_linear_highres", background_highres)
         object.__setattr__(self, "projected_log_ai_increment_mean", mean)
-        object.__setattr__(self, "projected_log_ai_increment_scale", scale)
-        object.__setattr__(self, "signed_reflectivity_mean", reflectivity)
-        object.__setattr__(self, "signed_reflectivity_scale", reflectivity_scale)
+        for name in (
+            "projected_log_ai_increment_scale",
+            "signed_reflectivity_mean",
+            "signed_reflectivity_scale",
+            "local_tuning_scale",
+            "support",
+        ):
+            object.__setattr__(self, name, fields[name])
         object.__setattr__(self, "state_log_potential", state_log_potential)
-        object.__setattr__(self, "local_tuning_scale", tuning)
-        object.__setattr__(self, "support", support)
         object.__setattr__(self, "highres_support", highres_support)
         object.__setattr__(self, "lateral_m", lateral)
-        object.__setattr__(self, "x_m", parsed_coordinates[0])
-        object.__setattr__(self, "y_m", parsed_coordinates[1])
+        object.__setattr__(self, "x_m", x_m)
+        object.__setattr__(self, "y_m", y_m)
         object.__setattr__(self, "identity", identity)
 
 
 @dataclass(frozen=True)
-class SegmentExtent:
-    """One externally supplied high-resolution segment extent."""
+class EventTrack:
+    """One ordered event and its lateral fields."""
 
-    trace_index: int
+    event_id: str
     state_id: int
-    start_index: int
-    stop_index: int
-    duration_fraction: float
+    presence: np.ndarray
+    duration_fraction: np.ndarray
+    coefficients: np.ndarray
 
     def __post_init__(self) -> None:
-        if self.trace_index < 0:
-            raise InputContractError("segment trace_index cannot be negative.")
         if self.state_id not in {0, 1, 2}:
-            raise InputContractError("segment state_id must be 0, 1, or 2.")
-        if self.start_index < 0 or self.stop_index <= self.start_index:
-            raise InputContractError("segment extent must be non-empty and ordered.")
-        if (
-            not np.isfinite(self.duration_fraction)
-            or self.duration_fraction <= 0.0
-            or self.duration_fraction > 1.0
-        ):
-            raise InputContractError(
-                "segment duration_fraction must be finite in (0, 1]."
-            )
-
-
-@dataclass(frozen=True)
-class CoefficientVarianceCalibration:
-    """Post-hoc diagonal scale temperature for c0/c1/c2 sampling."""
-
-    SCHEMA = "structured_ginn_v2_coefficient_variance_calibration_v1"
-
-    temperature: tuple[float, float, float]
-
-    def __post_init__(self) -> None:
-        values = np.asarray(self.temperature, dtype=np.float64)
-        if values.shape != (3,) or np.any(~np.isfinite(values)) or np.any(values <= 0.0):
-            raise InputContractError(
-                "coefficient variance temperatures must be three finite positive values."
-            )
-        object.__setattr__(self, "temperature", tuple(float(value) for value in values))
-
-    def to_mapping(self) -> dict[str, Any]:
-        return {
-            "schema": self.SCHEMA,
-            "temperature": list(self.temperature),
-        }
-
-    @classmethod
-    def from_mapping(
-        cls, value: Mapping[str, Any]
-    ) -> "CoefficientVarianceCalibration":
-        if value.get("schema") != cls.SCHEMA:
-            raise InputContractError(
-                "unsupported coefficient variance calibration schema."
-            )
-        temperature = tuple(value.get("temperature") or ())
-        if len(temperature) != 3:
-            raise InputContractError(
-                "coefficient variance calibration requires c0/c1/c2 temperatures."
-            )
-        return cls(temperature=temperature)
-
-
-@dataclass(frozen=True)
-class SegmentParameterDistribution:
-    """Diagonal coefficient distribution for one supplied segment extent."""
-
-    extent: SegmentExtent
-    mean: tuple[float, float, float]
-    scale: tuple[float, float, float]
-    parameter_identifiability_rank: int
-    parameter_basis_condition: float
-
-    def __post_init__(self) -> None:
-        mean = np.asarray(self.mean, dtype=np.float64)
-        scale = np.asarray(self.scale, dtype=np.float64)
-        if mean.shape != (3,) or scale.shape != (3,):
-            raise InputContractError("segment parameter mean/scale must have length 3.")
-        if np.any(~np.isfinite(mean)) or np.any(~np.isfinite(scale)) or np.any(scale <= 0.0):
-            raise NumericalFailure("segment parameter distribution must be finite.")
-        if self.parameter_identifiability_rank not in {1, 2, 3}:
-            raise InputContractError("parameter identifiability rank must be 1, 2, or 3.")
-        if (
-            not np.isfinite(self.parameter_basis_condition)
-            and not np.isinf(self.parameter_basis_condition)
-        ) or self.parameter_basis_condition <= 0.0:
-            raise InputContractError("parameter basis condition must be positive.")
+            raise InputContractError("event state_id must be 0, 1, or 2.")
+        presence = _array(self.presence, dtype=bool, ndim=1, name="presence")
+        duration = _array(
+            self.duration_fraction, dtype=np.float64, ndim=1, name="duration_fraction"
+        )
+        coefficients = _array(
+            self.coefficients, dtype=np.float64, ndim=2, name="coefficients"
+        )
+        if duration.shape != presence.shape or coefficients.shape != (presence.size, 3):
+            raise InputContractError("event lateral fields have inconsistent shapes.")
+        if np.any(~np.isfinite(duration)) or np.any(duration < 0.0):
+            raise NumericalFailure("event duration_fraction must be finite and non-negative.")
+        if np.any(presence & (duration <= 0.0)):
+            raise InputContractError("present events must have positive duration.")
+        if np.any(~np.isfinite(coefficients[presence])):
+            raise NumericalFailure("present event coefficients must be finite.")
+        identity = str(self.event_id).strip()
+        if not identity:
+            raise InputContractError("event_id cannot be empty.")
+        object.__setattr__(self, "event_id", identity)
+        object.__setattr__(self, "presence", presence)
+        object.__setattr__(self, "duration_fraction", duration)
+        object.__setattr__(self, "coefficients", coefficients)
 
 
 @dataclass(frozen=True)
 class Segment:
+    """Internal rasterized view of one event on one trace."""
+
     trace_index: int
     state_id: int
     start_index: int
@@ -524,32 +308,15 @@ class Segment:
     c0: float
     c1: float
     c2: float
-    log_score: float = 0.0
 
-
-@dataclass(frozen=True)
-class StructuredRealization:
-    identity: int
-    log_ai_highres: np.ndarray
-    state_highres: np.ndarray
-    projected_log_ai: np.ndarray
-    segments: tuple[Segment, ...]
-    conditional_log_score: float
-
-
-@dataclass(frozen=True)
-class EnsembleSummary:
-    log_ai_highres_mean: np.ndarray
-    log_ai_highres_std: np.ndarray
-    projected_log_ai_mean: np.ndarray
-    projected_log_ai_std: np.ndarray
-    projected_support: np.ndarray
-    state_occupancy_highres: np.ndarray
-    interface_density_highres: np.ndarray
-    segment_count_mean: np.ndarray
-    segment_count_std: np.ndarray
-    segment_duration_fraction_mean: np.ndarray
-    segment_duration_fraction_std: np.ndarray
+    def __post_init__(self) -> None:
+        if self.trace_index < 0 or self.state_id not in {0, 1, 2}:
+            raise InputContractError("segment trace and state identifiers are invalid.")
+        if self.start_index < 0 or self.stop_index <= self.start_index:
+            raise InputContractError("segment extent must be non-empty and ordered.")
+        coefficients = np.asarray((self.c0, self.c1, self.c2), dtype=np.float64)
+        if np.any(~np.isfinite(coefficients)):
+            raise NumericalFailure("segment coefficients must be finite.")
 
 
 @dataclass(frozen=True)
@@ -558,38 +325,32 @@ class GenerationPolicy:
     random_identity: int = 0
     retain_realizations: bool = True
     lateral_correlation_m: float = 900.0
-    path_coupling_strength: float = 1.0
-    profile_coupling_strength: float = 1.0
 
     def __post_init__(self) -> None:
-        if isinstance(self.realization_count, bool) or self.realization_count <= 0:
-            raise ValueError("realization_count must be positive.")
-        if not np.isfinite(self.lateral_correlation_m) or self.lateral_correlation_m <= 0:
-            raise ValueError("lateral_correlation_m must be finite and positive.")
         if (
-            not np.isfinite(self.path_coupling_strength)
-            or self.path_coupling_strength < 0.0
-            or not np.isfinite(self.profile_coupling_strength)
-            or self.profile_coupling_strength < 0.0
+            isinstance(self.realization_count, bool)
+            or not isinstance(self.realization_count, (int, np.integer))
+            or self.realization_count <= 0
         ):
-            raise ValueError("lateral coupling strengths must be finite and non-negative.")
+            raise InputContractError("realization_count must be a positive integer.")
+        if not np.isfinite(self.lateral_correlation_m) or self.lateral_correlation_m <= 0.0:
+            raise InputContractError("lateral_correlation_m must be finite and positive.")
 
 
 @dataclass(frozen=True)
-class StructuredPrediction:
+class StructuredEnsemble:
+    """Complete section result returned by the generator seam."""
+
     evidence: ObservableEvidence
-    representative: StructuredRealization
-    summary: EnsembleSummary
-    realization_identities: tuple[int, ...]
-    realizations: tuple[StructuredRealization, ...] | None
+    representative: Mapping[str, Any]
+    realizations: tuple[Mapping[str, Any], ...]
+    summary: Mapping[str, Any]
     diagnostics: Mapping[str, float]
 
 
 @dataclass(frozen=True)
 class VolumeInferenceResult:
-    """Two-pass volume result using one member identity for every tile."""
-
-    tiles: Mapping[str, StructuredPrediction]
+    tiles: Mapping[str, StructuredEnsemble]
     representative_member_index: int
     representative_identity: int
 
@@ -602,19 +363,14 @@ class VolumeInferenceResult:
 
 
 __all__ = [
-    "CoefficientVarianceCalibration",
     "DomainMismatchError",
-    "EnsembleSummary",
+    "EventTrack",
     "GenerationPolicy",
     "InputContractError",
     "NumericalFailure",
     "ObservableEvidence",
-    "ObservableTargetContract",
     "ObservationTile",
     "Segment",
-    "SegmentExtent",
-    "SegmentParameterDistribution",
-    "StructuredPrediction",
-    "StructuredRealization",
+    "StructuredEnsemble",
     "VolumeInferenceResult",
 ]

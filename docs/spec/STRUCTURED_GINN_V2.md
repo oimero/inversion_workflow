@@ -1,638 +1,687 @@
-# Structured GINN V2 实施规格
+# Structured GINN V2 最终实施规格
 
-## 1. 目标
+## 1. 项目目标
 
-Structured GINN V2 是一个由 seismic、LFM 和结构先验共同条件化的高分辨率生成器：
+Structured GINN V2 是一个：
 
-```text
-seismic + full LFM + lateral context
-→ observable-scale evidence
-→ conditional semi-Markov generator
-→ K 个横向连续的 high-resolution realizations
-→ representative realization + ensemble summary
-```
+> 地震带限证据指导下、具有横向连续性的高分辨率地质生成器。
 
-LFM 提供低频背景。网络恢复当前频带能够支持的阻抗增量、状态和有符号反射证据。
-半马尔科夫先验补全亚调谐尺度的 duration、微边界和三参数 latent。
-
-高分辨率 realization 表示观测与先验共同允许的一种地下模型，不表示地震逐层分辨了
-全部微层。第一版回答：
-
-> 在 LFM 提供低频背景的前提下，seismic 是否对状态、反射极性/幅度和阻抗剖面提供
-> 可重复验证的增量信息，并能否据此生成连续、高分辨率且具有合理 coverage 的结构化
-> AI ensemble？
-
-第一版包含合成监督、横向 ensemble 和冻结 zero-shot。可微 forward loss、物理排序、
-井监督和真实无标签 adaptation 在 zero-shot 结果之后规划。forward 只承担 producer
-Oracle、目标物理闭环和诊断。
-
-## 2. 已有证据与架构决定
-
-目标和 head 只能由已发布证据或新的廉价目标审计支持。
-
-### 2.1 Seismic 能恢复什么
-
-冻结的 truth-segmentation、boundary-aware 实验表明，full 相对 no-seismic：
-
-| 指标 | full | no-seismic |
-| --- | ---: | ---: |
-| projected log-AI RMSE | 0.03566 | 0.05404 |
-| high-resolution log-AI RMSE | 0.04600 | 0.06449 |
-| interface jump MAE | 0.14121 | 0.16227 |
-| interface polarity accuracy | 0.64854 | 0.50261 |
-
-within-parent seismic shuffle 会稳定破坏 AI 结果。随后 predicted-segmentation 实验中，
-full 的 balanced state accuracy 为 0.5509，no-seismic 为 0.3437；projected log-AI RMSE
-分别为 0.06981 和 0.13393。
-
-因此第一版保留以下可验证目标：
-
-- projected/model-grid log-AI increment；
-- state emission；
-- 有符号反射或 interface jump 的幅度与极性；
-- decoded profile 和 high-resolution log-AI。
-
-### 2.2 Seismic 不能证明什么
-
-boundary observability audit 覆盖 16 个 parents 和 1157 个 truth boundaries：
-
-- 调谐尺度中位数约 49.8 m；
-- 最近边界间距中位数为 5 m；
-- 没有一个边界同时属于 clean-forward-sensitive 和 isolated；
-- raw boundary score 的 pairwise AUC 为 0.5535；
-- boundary score 没有改善固定 segment-count 下的容差 F1。
-
-三参数 Oracle 还表明，低 seismic mismatch 可以对应明显不同的 profile 和
-`c0/c1/c2`。因此：
-
-- exact micro-boundary、segment count 和单个三参数系数是 latent 审计坐标；
-- micro-renewal 主要由 duration/transition prior 和 ensemble uncertainty 表达；
-- boundary 指标不能单独证明 seismic 分辨了薄层。
-
-### 2.3 当前 evidence target 的失败证据
-
-2026-08-02 对 calibration 数据的无训练抽查发现：
+完整计算链为：
 
 ```text
-抽查 zone batches                         8
-interface_activity 均值                  0.833
-interface_activity > 0.5 的样点比例      97.1%
-与 clean seismic envelope 的相关性       0.049
-训练后 interface correlation             0.021
-increment 相对 anchor-only RMSE 改善      2.17%
+seismic + full LFM + physical lateral geometry
+→ BandlimitedEvidence
+→ producer-calibrated structured prior
+→ section-level ordered EventFields
+→ K 个合法 high-resolution realizations
+→ representative member + ensemble summary + evidence diagnostics
 ```
 
-失败目标使用 `smooth(abs(diff(log_ai))) / trace_q95`。它把 segment 内连续 profile
-梯度也计入活动，丢失反射极性和薄层相消/相长，并通过逐道归一化抹平绝对幅度。该目标
-未通过标签健康度和观测对齐审计，不属于正式 evidence contract。
+三类信息具有不同职责：
 
-这项失败固定了一条实施原则：
+- LFM 提供 zone 内低频背景；
+- 地震提供当前频带与调谐尺度能够支持的阻抗增量、反射极性和状态占据证据；
+- 由真实井标定的 producer prior 补全亚调谐事件、持续时间、profile 和横向演化。
 
-> 全量训练用于估计模型能力，不用于发现标签是否退化。标签退化、物理错位和明显捷径
-> 必须由训练前数据审计与短探针发现。
+“高分辨率”表示生成器能够输出高分辨率、满足结构合同的条件 realization。它不表示地震
+逐层分辨了全部微层。弱地震证据下，多个高分辨率 realization 可以具有近似相同的带限
+响应；这种非唯一性必须由 ensemble 保留，而不是由一个过度确定的预测隐藏。
 
-## 3. 固定数据与坐标合同
+第一版的科学问题是：
 
-垂向数据使用 `SampleAxis`：
+> 在 LFM 负责低频背景的前提下，地震能否为井标定结构先验提供稳定的带限条件，使生成器
+> 输出横向连续的高分辨率地质 realization，并在合成基准与真实井上证明地震带来了增量
+> 信息？
+
+首版范围包括合成监督、冻结 zero-shot 真实剖面和后续二维体扩展。可微正演 loss、物理
+排序、井监督和真实无标签适配属于 zero-shot 结果之后的独立研究决策。
+
+## 2. 已知证据与固定科学边界
+
+### 2.1 既有实验已经证明的内容
+
+冻结实验支持以下结论：
+
+- full model 相对 no-seismic 能改善 projected log-AI、state 和反射极性；
+- matched/within-parent seismic shuffle 会破坏上述改善，地震没有被 LFM 完全取代；
+- exact micro-boundary、精确 segment count 和单个 `c0/c1/c2` 不是可靠的地震直接监督量；
+- projected AI、tuning-scale evidence 和 decoded profile 是更稳定的训练与评价对象；
+- profile coefficient 只在离散 basis 可识别时适合单独评价，短段应评价 decoded profile；
+- 逐道生成候选再做横向匹配，只能减少局部跳变，不能建立稳定的跨道事件身份；
+- ensemble mean 的平滑来自平均，不证明任一合法 member 具有横向连续性。
+
+详细数值和图件保存在：
+
+- `note/summary/final_audit/20260803_structured_ginn_v2_observable_hsmm/`；
+- `note/summary/final_audit/20260804_structured_ginn_v2_profiles_ensemble/`；
+- `note/summary/final_audit/20260806_structured_ginn_v2_event_track_generation/`。
+
+### 2.2 地震峰数不是地质事件密度
+
+同样厚度的 zone 中，合成地震可能显示十余个波峰波谷，真实地震只显示四五个；这首先
+说明真实观测压低或混叠了更多反射，并不能直接推出真实地下事件更少。
+
+地质密度正式使用：
+
+- event count per zone；
+- duration as zone fraction；
+- event survival/birth/death over physical lateral distance。
+
+波峰数只属于观测域诊断。生成器不能把“可见峰更少”直接翻译成“高分辨率事件更少”。
+在弱证据下，事件密度应回归同一真实井标定的 producer prior，同时扩大条件不确定性。
+
+第一版不设置独立的 `density_multiplier`，也不建立第二套拍脑袋的真实工区微结构先验。
+若 zero-shot 井结果证明 producer prior 的事件密度系统失配，再以井证据重新标定 producer
+prior，并将其作为新的版本化科学合同。
+
+### 2.3 投影塌缩不等于同状态续生
+
+当前 producer 的高分辨率状态转移矩阵对角线为零。原始 event sequence 因此没有可供训练
+的独立同状态续生过程。
+
+对 24 个 canonical parents 的直接抽查得到：高分辨率相邻同状态 event edge 为 0，而
+model grid 上“dominant state 相同、dominant object 不同”的 edge 为 2750。这个数量差异
+直接证明两种语义不能混用。
+
+有限支撑投影到 model grid 后，薄的中间状态可能不再成为任何 model sample 的 dominant
+state。例如：
+
+```text
+high resolution: state 0 / object 19
+                 state 1 / object 20  ← 薄层
+                 state 0 / object 21
+
+model grid:      dominant state 0 / object 19
+                 dominant state 0 / object 21
+```
+
+这是 `projection_collapse`：中间事件仍存在于高分辨率 truth，只是在 5 m 或对应时间采样
+网格上被混合。它不是同状态续生，也不是应当拒绝的坏样本。此类样本正是本项目希望表达的
+亚调谐非唯一性。
+
+固定合同为：
+
+- EventField truth 只由 high-resolution `(zone_id, object_id)` 构造；
+- model-grid state 使用三状态 fraction/occupancy，不使用 argmax state 反推事件；
+- model-grid object change 只作 projection-collapse 诊断，不作 renewal label；
+- 第一版 prior 遵守 producer 的异状态转移合同；
+- topology 使非相邻全局事件在局部接触时，保留其全局事件身份并单独标记；
+- 真实同状态续生只有在 producer 和高分辨率语料都发布显式监督后才成为研究扩展。
+
+当前 canonical corpus 不因投影塌缩重新生成，也不拒绝这些 parent。
+
+### 2.4 真实观测覆盖
+
+sim-to-real 在本项目中指真实观测扰动覆盖，不指把合成地震改造成与真实地震无法区分。
+处理范围是：
+
+- wavelet 频带、相位和小幅 shift；
+- vertical static；
+- 正增益与平滑振幅衰减；
+- white、colored 和 coherent noise；
+- 弱反射压低及可见峰数量下降。
+
+这些扰动保持同一 synthetic truth。它们用于覆盖 `p(x | z)` 的合理变化，不修改地质标签，
+也不宣称解决合成地质先验与真实地下之间的全部差异。
+
+## 3. 单一公开生成接口
+
+### 3.1 深模块边界
+
+包根只暴露：
+
+```python
+ConditionalGenerator
+ObservationTile
+GenerationPolicy
+BandlimitedEvidence
+StructuredEnsemble
+train_generator(...)
+evaluate_generator(...)
+infer_section(...)
+```
+
+核心接口为：
+
+```python
+ensemble = generator.generate(observation_tile, generation_policy)
+```
+
+调用者不运行 HSMM、不匹配逐道 segment、不平滑 coefficient、不拼接成员，也不负责选择
+代表解。带限证据、结构先验、EventField 生成、栅格化和 ensemble 选择全部由
+`ConditionalGenerator` 内部拥有。
+
+### 3.2 ObservationTile
+
+```text
+ObservationTile
+├── model_axis / highres_axis
+├── seismic[lateral, model_sample]
+├── full_lfm[lateral, model_sample]
+├── observed_valid
+├── zone_top / zone_bottom
+├── lateral_m
+├── optional x_m / y_m
+└── identity
+```
+
+输入必须携带 sample domain、unit 和 depth basis。横向网络只使用物理米制距离；
+`inline/xline` 只承担寻址，工区 `xline_step=4` 不表示四倍或单位横向距离。
+
+### 3.3 BandlimitedEvidence
+
+公开证据只包含地震频带可以合理监督的量：
+
+```text
+BandlimitedEvidence
+├── background_lfm_linear
+├── projected_log_ai_increment_mean / scale
+├── signed_reflectivity_mean / scale
+├── state_fraction[..., 3]
+├── local_tuning_scale
+├── model/highres support
+├── model/highres axes
+└── physical lateral geometry
+```
+
+`state_fraction` 表示一个 model-grid 支持窗口内三种高分辨率状态的占据比例。它不是硬状态，
+也不是事件边界。`signed_reflectivity` 使用与 projection/tuning operator 一致的带限反射目标，
+不把每个微边界都标成独立可见界面。
+
+证据网络的 hidden feature 不属于生成器的隐式捷径。结构生成器只消费已发布的
+`BandlimitedEvidence`，从而可以独立审计“网络看见了什么”和“先验补了什么”。
+
+### 3.4 ProducerPrior
+
+`ProducerPrior` 是 Synthoseis-lite producer 与 GINN 生成器共享的单一版本化合同：
+
+```text
+ProducerPrior
+├── zone-conditioned initial state
+├── zero-diagonal state transition
+├── duration distribution in zone fraction
+├── event/profile distribution
+├── identifiable coefficient statistics
+├── lateral correlation and survival statistics
+├── topology family contract
+└── calibration provenance
+```
+
+它由真实井标定结果、合成配置和 producer 科学合同共同发布。GINN consumer 不重新拟合一套
+含义不同的先验，也不从 model-grid argmax state 估计转移。
+
+producer 和 generator 使用同一个 prior identity。fingerprint 只记录 provenance 和稳定随机
+identity；consumer 不重算上游文件 SHA，也不因已保存 fingerprint 不一致拒绝输入。
+
+### 3.5 EventField
+
+高分辨率结构使用有序的 `EventField`：
+
+```text
+EventField
+├── zone_id
+├── event_id
+├── state_id
+├── presence over physical locations
+├── duration_fraction over physical locations
+├── c0/c1/c2 or decoded-profile latent
+├── identifiability mask
+└── topology mask
+```
+
+一维剖面上的 EventField 是 EventTrack；二维体上的 EventField 是 EventSurface。两者共享：
+
+- 事件按垂向顺序具有全局身份；
+- 每个位置的有效 duration 非负且总和为一；
+- top/bottom 由 duration 累积得到，边界不会交叉；
+- birth、death 和 pinchout 通过 presence/topology 表达；
+- profile 和 duration 在物理坐标上连续，但不跨 topology transition 强制平滑；
+- 每个 realization 先生成完整 EventField，再栅格化为各位置的 segment。
+
+横向连续性因此是 latent representation 的性质，而不是逐道候选生成后的修补结果。
+
+### 3.6 StructuredEnsemble
+
+```text
+StructuredEnsemble
+├── BandlimitedEvidence
+├── K 个完整 EventField realizations
+├── K 个 high-resolution / model-grid log-AI
+├── state occupancy / event presence summaries
+├── high-resolution / projected mean、std、coverage
+├── representative realization
+└── evidence、prior、topology 与 support diagnostics
+```
+
+代表解必须是 K 个完整 realization 中的真实成员。它按完整 section 的冻结条件分数选择，
+不逐道挑选，也不把逐点 ensemble mean 当作合法地质 realization。
+
+## 4. 数据、坐标与当前基础
+
+### 4.1 Canonical corpus V2
+
+当前 depth/TVDSS corpus 可继续作为正式开发语料：
+
+- 2400 个 25 道 short-patch parents；
+- 训练、调参与 calibration 分别为 1680、360、360；
+- none、wedge、pinchout 在每个 split 内均衡；
+- 47 个 full-section parents，仅用于最终横向门禁；
+- 其中 24 个 IID sections，23 个 combination holdout sections；
+- 每个 parent 内 `(zone_id, object_id)` 是稳定的 high-resolution event identity；
+- artifact 只有一套 canonical HDF5、索引和 manifest；
+- clean seismic 持久化，dirty observation 在线生成。
+
+短 patch 中的 25 道是一个联合训练样本。21 道是模型的完整上下文窗口；两侧道用于显式
+mask 与边缘行为。full sections 不参加参数训练、模型选择或不确定性 calibration。
+
+样本量只按独立 parent 报告，不把同一 parent 派生的 25 道或 dirty views 计成新的独立样本。
+阶段 1 在固定模型与训练预算下发布 420、840、1680 training parents 的学习曲线。只有验证
+误差仍随 parent 数稳定下降，且失败不能由模型容量或标签退化解释时，才扩充 synthetic
+corpus；47 个 full sections 不转入训练集。
+
+现有语料的 47/48 section 配额缺口是已发布 warning，不影响开发。新增语料只由明确的科学
+缺口触发，不为追求整数配额重新运行数小时 benchmark。
+
+### 4.2 投影语义补充
+
+训练 adapter 必须从 high-resolution truth 确定性生成：
+
+```text
+state_fraction_model
+boundary_mass_model             # diagnostic only
+dominant_object_id_model        # diagnostic only
+projection_collapse_count
+projection_collapse_fraction
+hidden_transition_count
+```
+
+这些字段优先由当前 HDF5 和 object tables 在线派生，使现有 GB 级结果继续可用。未来 producer
+版本可以把相同字段写入 canonical HDF5，但不能增加第二套 truth 旁路。
+
+### 4.3 时深对称
+
+所有垂向语义来自 `SampleAxis`：
 
 ```text
 depth: domain=depth, unit=m, depth_basis=tvdss
 time:  domain=time,  unit=s, depth_basis=null
 ```
 
-同一个 checkpoint 服务一种 domain；time/depth 使用同一 interface、各自权重和对应
-forward adapter。固定约定为：
+统一规则为：
 
-- `inline/xline` 负责几何寻址；
-- 横向物理距离使用 `lateral_m` 或实际 XY；
-- 工区 `xline_step=4` 只参与几何索引；
-- 垂向 metrics 使用 sample、axis unit 或 tuning-scale fraction；
-- canonical artifact 保存 clean seismic；
-- dirty waveform 位于 reader 与模型之间并与 parent identity 原子绑定；
-- schema、identity、domain、unit、axis、shape、dtype、mask 和几何严格校验。
+- metrics 使用 sample 数、axis unit 或 tuning-scale fraction；
+- augmentation 使用 `vertical_static_samples`；
+- tuning scale 在 time 中为 `1 / (2 f_dom)`，在 depth 中为 `Vp / (4 f_dom)`；
+- depth 的 `Vp` 是显式域适配输入；
+- time/depth 共享 writer、reader、target、loss、generation 和 diagnostic interface；
+- 正式 benchmark 当前运行 depth/TVDSS，time fixture 负责接口对称性门禁。
 
-canonical V2 包含 2400 个短 patch parents 和 47 个 section parents。
-training/tuning/calibration 按 parent 原子划分为 1680/360/360，section parents 只参与
-最终横向门禁。
+## 5. 阶段 0：补齐 producer prior 与 projection 合同
 
-## 4. 阶段 0：已完成的基础合同
+### 5.1 实施内容
 
-阶段 0 已完成：
+仓库清理已经完成，`src/ginn_v2` 当前保持 10 个深模块。阶段 0 的剩余工作集中在科学合同：
 
-- canonical V2 单一 HDF5/index/manifest 发布；
-- NumPy structured decoder、projection 和 forward Oracle；
-- time/depth 同 interface smoke；
-- SHA fingerprint 只作 provenance，不作 consumer 准入；
-- `ConditionalGenerator.observe()` / `realize()` 深 interface；
-- checkpoint、augmentation、section/volume inference 的基础实现。
+1. 在 `cup.synthetic` 发布 `ProducerPrior` writer/reader；
+2. 允许 transition 矩阵合法地包含零对角线；
+3. 从 high-resolution object catalog 构造 EventField truth；
+4. 增加 state fraction、boundary mass 和 projection-collapse 派生器；
+5. 将 producer decoder、projection 和 Oracle 保持在 `cup.synthetic`；
+6. 使 GINN Torch decoder 与同一 producer contract 做 parity；
+7. 将当前 evidence seam 收敛为公开的 `BandlimitedEvidence` 合同；
+8. 为相同 truth 构造 clean、普通 dirty 和 peak-poor dirty 配对 fixture。
 
-阶段 1 的 L0–L2 observable target audit 已通过，并发布
-`observable_target_contract.json`。正式 evidence 训练只接受该合同声明的三个目标与全局
-尺度；checkpoint schema 为 V3。
+当前 corpus 已包含完成这些工作的必要 high-resolution identity 和 profile 字段，因此阶段 0
+不要求重跑 Synthoseis-lite。只有正式 producer schema 被改到无法由现有 artifact 无歧义派生时，
+才发布新 corpus 版本。
 
-当前 V3 evidence checkpoint 保持可读取。接入 segment profile head 后 generator payload
-升级为 V4；V4 只新增 profile head 配置、权重和 feature normalization，不复制 evidence
-网络或另建诊断 checkpoint 体系。
+### 5.2 门禁
 
-## 5. 阶段 1：合成监督条件生成器
+- EventField truth 栅格化后严格重建 high-resolution log-AI；
+- finite-support projection 与 canonical model-grid truth 一致；
+- 全量 parent 中 high-resolution event identity、顺序、state 和 topology 通过审计；
+- true high-resolution same-state adjacency 与 projection-collapse 分开计数；
+- model-grid argmax state 不进入 EventField truth；
+- `ProducerPrior` 与 producer calibration/config 的数值合同一致；
+- clean/dirty/peak-poor 三者共享同一 truth identity；
+- time/depth fixture 使用同一 adapter 和 public types；
+- SHA fingerprint mismatch 不构成 consumer 拒绝条件。
 
-阶段 1 最多分三步。每一步都先使用廉价探针，再决定是否进入正式训练。
+阶段 0 通过后冻结 prior、target 与 split manifest；后续阶段不得在训练结果不理想时静默改
+标签定义。
 
-### 5.1 第一步：可观测目标审计与单道模型
+## 6. 阶段 1：学习 BandlimitedEvidence
 
-#### 目标候选
+### 6.1 标签进入训练前的证据门禁
 
-首轮只审计三个具有现成证据的目标族：
+任何新监督 head 必须先通过固定 target preflight：
 
-1. `projected_log_ai_increment`
-   - truth 为 model-grid log-AI 减 zone-linear LFM anchor；
-   - old full/no-seismic 与 shuffle 已证明该目标存在 seismic 增量。
-2. `signed_reflectivity`
-   - truth 来自 published projected AI 进入 forward 前的有符号反射序列；
-   - 保留全语料统一的物理幅度和极性；
-   - time/depth adapter 必须复用各自正式 forward 的反射定义。
-3. `state_emission`
-   - truth 为 generator 的 low/background/high state；
-   - 使用类别均衡监督；
-   - 它是 HSMM emission，不等同于可独立观测的逐层分类结果。
+1. 从 high-resolution truth 和冻结 operator 确定性产生；
+2. 轴、support、数值范围和 mask 闭合；
+3. 标签分布不退化为全零、全一或全 zone 高活跃；
+4. 简单常数、LFM-only 和局部滤波 baseline 被记录；
+5. 固定 mini-corpus 可以过拟合；
+6. matched seismic shuffle 能破坏预期可观测信息；
+7. clean/dirty 配对不会改变 truth target。
 
-`c0/c1/c2` 继续由完整 profile 和 decoder 监督。短 segment 或病态 basis 只监督 decoded
-profile；单系数不作为目标选择门禁。
+preflight 是 `train_generator()` 的固定前置步骤，不建立另一套长期诊断旁路。失败时在训练前
+停止，而不是训练数小时后再解释 head 为什么没有信息。
 
-#### 训练前目标审计
+### 6.2 模型
 
-目标构造由一个深模块承担：
+证据网络读取完整 short patch，并为所有有效道输出带限证据。模型由：
 
-```python
-report = audit_observable_targets(corpus, output_dir, config=audit_budget)
-```
+- 逐道垂向 encoder；
+- 使用 `lateral_m`、相对距离和显式 mask 的 lateral mixer；
+- projected increment、signed reflectivity、state fraction 和 scale heads；
+- support-aware uncertainty calibration。
 
-调用者只提供 corpus、domain-aware target contract 和预算。模块内部完成抽样、forward
-闭环、baseline、短探针、配对统计和图件。time/depth 是该 seam 的两个真实 adapter。
+固定训练三个同预算模型：
 
-当前实现由 `audit_observable_targets()` 统一执行，并通过同一个 CLI 暴露：
+- full：seismic + full LFM；
+- no-seismic：full LFM；
+- single-trace：中心道 seismic + full LFM。
 
-```text
-structured_ginn_v2.py audit-targets --corpus ... --output-dir ... [--smoke]
-```
+训练目标只作用于带限量：
 
-输出目录包含 `target_audit.json`、L0 对照图和日志。formal L0–L2 全部通过时才发布
-`observable_target_contract.json`；smoke 会执行三个 level 的 interface，但不发布可供
-正式训练使用的 target contract。科学门禁失败属于有效审计结果，报告照常完成。
+- projected log-AI increment Gaussian NLL/RMSE；
+- signed reflectivity NLL/相关性/极性一致率；
+- state fraction proper score；
+- scale calibration 与 coverage。
 
-每个候选必须发布：
+exact micro-boundary、event count 和单个 profile coefficient 作为后续结构审计，不作为本阶段
+的主要证据 head。
 
-- finite/support/axis/unit 检查；
-- mean、std、分位数、符号比例、零值比例和动态范围；
-- categorical target 的类别比例、entropy 和 constant-prior score；
-- 按 geometry family、zone 和 parent 分组的同类统计；
-- target 经正式 forward adapter 重建 clean seismic 的误差、相关性和 lag；
-- full-LFM、zone-linear anchor 和 constant/marginal baseline；
-- 至少 12 组 seismic、LFM、truth target 和 forward reconstruction 对照图。
+### 6.3 观测扰动课程
 
-目标使用 training split 的全局 robust scale 只做数值缩放。逐道、逐 zone 或逐 parent
-归一化不得改变目标的物理幅度排序。
+训练同时保留 clean 和在线 dirty 配对。真实观测 profile 从真实地震、冻结子波和可信井震
+标定中提取振幅、频谱、相位、shift 与噪声支持范围。
 
-#### 训练预算闸门
+必须包含一组 peak-poor 配对：逐步压低弱反射、收窄有效频带并增加相干噪声，使可见峰数
+下降，但 high-resolution truth 和 ProducerPrior identity 保持不变。该配对专门检查模型是否
+错误地把观测复杂度当成地质事件密度。
 
-预算按以下顺序执行，前一层失败时停止：
+### 6.4 门禁
 
-```text
-L0  无训练 target audit       统计抽样，目标 < 2 分钟
-L1  tiny overfit              4–8 parents，目标 < 5 分钟
-L2  information probe        48 train + 24 tuning parents，目标 < 20 分钟
-L3  formal training          只有 L0/L1/L2 全部通过后运行
-```
+- full 相对 no-seismic 在 projected increment 和 signed reflectivity 上具有正的 parent-paired
+  改善；
+- full 相对 full-LFM 与 zone-linear anchor 具有 AI 增量价值；
+- full 的 state-fraction proper score 优于 no-seismic；
+- matched center-seismic shuffle 和 parent shuffle 破坏地震收益；
+- neighbor shuffle 破坏 lateral model 相对 single-trace 的收益；
+- dirty 与 peak-poor 输入增加合理 uncertainty，不制造系统性虚假反射；
+- evidence 输出在 projection-collapse 与普通样本上分别报告；
+- calibration split 冻结 scale/temperature，full sections 不参与调参。
 
-L0 要求 target 具有非退化动态范围，物理闭环正确，且图件中 target 与 forward response
-语义一致。L1 要求小网络能够明显拟合目标；失败优先解释为 loss、support 或实现错误。
+本阶段只证明“地震提供了什么带限信息”，不生成高分辨率事件。
 
-L2 对每个 head 独立训练或评估：
+## 7. 阶段 2：section-level EventTrack 条件生成器
 
-```text
-full
-no-seismic
-matched within-parent seismic shuffle
-constant / anchor / full-LFM baseline
-```
+### 7.1 生成语义
 
-matched shuffle 在同一 parent、同一 zone 的邻道间循环选择 donor，只替换双方共同有效区，
-recipient 的 support 保持不变；报告共同有效覆盖率、实际改动比例和波形差异 RMS。
-
-每个正式 L2 探针至少执行与 L1 相同的更新步数；epoch 换算不足时采用 L1 步数下限，
-同时服从 20 分钟总预算。
-
-进入 L3 要求：
-
-- full 相对 no-seismic 的 parent-paired 主指标改善 95% CI 方向正确；
-- matched shuffle 使该改善显著下降；
-- full 的收益不是由少数 parent 或单一 geometry family 提供；
-- target baseline 与模型指标之间存在足够可解释的改进空间；
-- 单 head 通过后才进入多任务模型，避免总 loss 掩盖失效 head。
-
-未通过 L2 的 target 从正式 interface 中移除。它不会通过增加 epoch、增大网络或修改
-loss 权重进入 L3。
-
-#### 正式 evidence interface
-
-通过 L2 后冻结：
+EventTrack decoder 消费 `BandlimitedEvidence` 和冻结 `ProducerPrior`，一次生成一个 zone 的
+完整横向事件系统：
 
 ```text
-ObservableEvidence
-├── background_lfm_linear
-├── projected_log_ai_increment_mean / scale
-├── signed_reflectivity_mean / scale
-├── state_log_potential[..., 3]
-├── local_tuning_scale
-├── support
-├── model/highres axes
-└── physical lateral geometry
+ProducerPrior renewal/duration process
++ bounded bandlimited evidence potentials
+→ ordered event identities and states
+→ lateral presence / birth / death / pinchout
+→ duration-fraction fields
+→ profile fields
+→ cumulative non-crossing boundaries
+→ high-resolution section
 ```
 
-网络输入为固定语义通道：
+事件数量由 zone-fraction duration/renewal process 自然产生。模型不设置“一个波峰对应几个
+事件”的 head，也不使用可见峰数作为 stop condition。地震 evidence 只能通过冻结范围内的
+条件 potential 调整 prior，弱 evidence 下回归 ProducerPrior。
 
-```text
-scaled seismic
-scaled (full_lfm - background_lfm_linear)
-observed validity
-```
+event state 遵守 producer transition。第一版不采样独立同状态续生。projection collapse 通过
+隐藏的异状态中间事件表达，而不是生成两个相邻同状态段。
 
-输入 scale 来自 training split 全局统计并写入 checkpoint。full/no-seismic 使用同一
-初始化、split、训练顺序和预算。
+duration 和 profile 是 event-level 横向场。其随机性以 event identity 与物理坐标为单位；
+每道独立采样再匹配不属于合法实现。
 
-当前 L3 实现采用单道编码，即一个 batch 可以包含多道，但每道 feature 不做横向混合。
-网络分别输出两个连续 mean/scale head 和一个 log-normalized state potential head。训练
-loss 的默认权重为 projected increment `1.0`、signed reflectivity `0.5`、state
-`0.25`，两个 scale calibration 项合计使用 `0.1` 权重；日志逐项报告，不以总 loss
-代替单 head 指标。
+### 7.2 训练
 
-训练命令必须显式提供通过审计的 target contract：
+EventTrack truth 直接来自 high-resolution object catalog，训练使用 teacher forcing 和逐步减少
+teacher forcing 的课程：
 
-```text
-structured_ginn_v2.py train \
-  --corpus ... \
-  --target-contract .../observable_target_contract.json \
-  --output-dir ... \
-  --input-mode full|no_seismic [--smoke]
-```
+- ordered event/state likelihood；
+- lateral presence、birth/death 与 topology；
+- duration simplex 和 thickness field；
+- state/duration-conditioned profile distribution；
+- identifiable coefficient likelihood；
+- 所有 event 的 decoded-profile loss；
+- rasterized high-resolution reconstruction；
+- projected/tuning-scale consistency with BandlimitedEvidence。
 
-`--smoke` 固定使用 3 个 training parents、3 个 tuning parents 和 1 epoch。正式训练每个
-epoch 发布 epoch checkpoint、`last.pt` 和当前 `best.pt`。统一 evaluator 同时报告
-full、no-seismic、matched within-parent shuffle、full-LFM 和 zone-linear anchor。
+短段或病态 basis 不进入单系数门禁。它们通过 decoded profile 与 ensemble coverage 监督。
+梯度不需要穿过离散代表解选择。
 
-`ConditionalGenerator.observe()` 发布 `ObservableEvidence`；`realize()` 消费冻结的
-HSMM、profile head 和 coefficient variance 合同，生成完整结构化 ensemble。signed
-reflectivity 不被临时转换成未经审计的微边界概率。
+### 7.3 横向连续性合同
 
-正式单道门禁以少数主指标固定：
+横向连续性至少满足：
 
-- projected log-AI increment RMSE；
-- signed reflectivity MAE、correlation 和 polarity accuracy；
-- balanced state accuracy / state proper score；
-- decoded projected/high-resolution log-AI；
-- full-no-seismic 与 matched-shuffle 的 parent 配对差值。
+- 同一 event 在邻道保持 event identity；
+- thickness 和 profile 随米制距离连续变化；
+- event 可以在允许的 topology 位置 birth、death 或 pinchout；
+- state、duration 和 profile 不跨 topology mask 被强制平滑；
+- direction reversal 不改变统计结果；
+- section 宽度变化不改变局部生成语义。
 
-### 5.2 第二步：Conditional HSMM 与 ensemble
+评价以 EventTrack 为主，不以像素梯度代替。固定指标包括：
 
-核心 interface 保持：
-
-```python
-evidence = generator.observe(observation_tile)
-prediction = generator.realize(evidence, generation_policy)
-```
-
-HSMM 与 profile generator 只消费公开 `ObservableEvidence`：
-
-- `state_log_potential` 条件化 state path；
-- signed reflectivity 为 segment 端点与 profile amplitude 提供有符号证据；
-- projected increment 约束 decoded model-grid AI；
-- transition/duration prior 来自 training parents，duration 单位为 zone fraction。
-
-第一版 micro-renewal 由 duration prior 与 state evidence 共同决定。独立 micro-boundary
-head 只有在新的 target audit 证明可观测增量后才能进入 interface。相邻 segment 允许
-state 相同，一次 posterior recursion 支持默认 `K=16` 的 backward sampling。
-
-参数 head 显式接收 state、duration、extent 和公开 evidence。第一道廉价门禁只使用 truth
-segments，并冻结 evidence 网络；它不让梯度穿过 segmentation，也不把 truth segment 信息
-泄漏进 evidence head。只有这道门禁通过后才加入合法 boundary jitter，推理时则在 sampled
-segments 上参数化。decoder 同时产生 high-resolution 和 projected AI；`c0/c1/c2` 是
-prior-selected latent。
-
-第二步先运行短 truth-substitution：
-
-```text
-predicted state evidence + predicted amplitude evidence
-truth state evidence     + predicted amplitude evidence
-predicted state evidence + truth amplitude evidence
-truth state evidence     + truth amplitude evidence
-prior-only
-```
-
-当前 state-duration 校准与 Oracle 通过统一 CLI 落地：
-
-```text
-structured_ginn_v2.py evaluate-hsmm \
-  --corpus ... \
-  --checkpoint .../generator.pt \
-  --output-dir ... \
-  --split tuning \
-  --parents-per-family 4 \
-  --prior-parents-per-family 32 [--smoke]
-```
-
-该命令从每类 32 个 training parents 的 trace-local model-grid truth path 标定
-zone-fraction transition/duration prior。birth/death、pinchout 和 model-grid coarsening 删除
-中间事件后形成的 same-state renewal 因而进入 transition prior；event catalog 不承担局部
-trace adjacency 的统计。formal 固定抽取 none、wedge、pinchout 各 4 个 tuning parents，
-smoke 各取 1 个。网络证据
-只前向一次。随后扫描 `state_evidence_weight = 0.25/0.5/1/2/4`、
-`duration_temperature = 0.25/0.5/1/2` 和
-`transition_temperature = 0.5/1/2/4` 的 80 个组合。候选阶段使用每个
-parent-zone 中具有完整上下文的中央 5 道，并对每个候选运行 exact posterior marginals；
-所选组合再在全部道上运行完整 Oracle。报告同时标记所选值是否落在搜索边界。
-
-固定基线为 `(1, 1, 1)`。MAP balanced accuracy、MAP segment-count bias 和
-truth-amplitude profile RMSE 只作为防止退化的 guard；候选的主要选择分数由 state Brier、
-renewal Brier 和 posterior expected segment-count bias 组成。这样 calibration 直接服务于
-K-member sampling，不再用 MAP accuracy 代替 posterior calibration。
-
-命令发布 `semi_markov_prior.json`、`hsmm_calibration.json` 和所选组合对应的
-`hsmm_oracle.json`。Oracle 在 model grid 上复用同一个 exact HSMM，并报告：
-
-- truth-state、predicted-state 和 prior-only 的 MAP state、state marginal、renewal marginal；
-- same-state renewal、segment count 和 duration-fraction distribution；
-- truth/predicted state 与 truth/predicted amplitude 的四格 substitution；
-- 每个 MAP segment 内三参数 basis 拟合后的 projected increment。
-
-renewal observation likelihood 固定为中性的 `0.5`。此时每条完整路径的 boundary/no-boundary
-观测项相同，micro-renewal 只由 training prior 与 state evidence 条件化。signed
-reflectivity 保留给后续 learned segment parameter head；它不会被临时转换成 micro-boundary
-likelihood。Oracle 中的 segment-wise 三参数拟合是参数 head 之前的确定性上限诊断。
-
-formal truth-substitution 已把瓶颈定位到 profile amplitude：所选 HSMM 的 MAP segment
-count 与 truth 基本一致；predicted-state + truth-amplitude 明显优于使用 predicted-amplitude
-的组合。因此 profile 路线优先于继续搜索微边界精度。
-
-profile head 使用 LFM-relative high-resolution truth。每个 segment 按 decoder 的实际离散
-basis 发布 rank 和 condition number，并把完整 profile 压缩成 Gram、cross 与平方均值三个
-充分统计量：
-
-- 所有 supervision-valid segment 进入 decoded profile likelihood；
-- 仅 rank=3、condition 不大于 100 且未 clipping 的 segment 进入单系数 likelihood；
-- rank=1/2 或病态 segment 不进入 `c0/c1/c2` correlation、NLL 和 coverage 门禁；
-- evidence 网络冻结，head 只消费公开 increment、reflectivity、state occupancy、state、
-  duration、extent 和预测 scale。
-
-固定比较三种方法：
-
-```text
-segment 内 deterministic evidence fit
-training truth 标定的 state-conditioned parameter prior
-learned segment/profile head
-```
-
-正式命令为：
-
-```text
-structured_ginn_v2.py train-profiles \
-  --corpus ... \
-  --checkpoint .../generator.pt \
-  --output-dir ... [--smoke]
-```
-
-命令每个 epoch 发布 `last.pt` 和当前 `best.pt`，结束后发布 V4 `generator.pt`、
-`profile_prior.json` 和 `profile_evaluation.json`。smoke 只验证数据、训练、V3→V4 checkpoint
-和推理 interface。正式科学门禁要求 learned profile RMSE 同时低于 deterministic fit 和
-state-conditioned prior；只胜过其中一个不算通过。未通过时不把 learned head接入 ensemble，
-而是根据最强 baseline 判断公开 evidence pooling 是否仍有增量空间。
-
-当前 formal profile gate 使用 384 个 training parents、96 个 tuning parents 和 150509 个
-training segments。learned profile RMSE 为 `0.05206`，优于 state-conditioned prior 的
-`0.06555` 和 deterministic fit 的 `0.09943`；V4 head 因此保留。该结果是在 truth state
-与 truth extent 条件下成立，不能替代完整 MAP reconstruction。
-
-第一次完整 MAP reconstruction 通过同一个 CLI 实现：
-
-```text
-structured_ginn_v2.py evaluate-reconstruction \
-  --corpus ... \
-  --checkpoint .../generator.pt \
-  --hsmm-contract-dir .../stage1_hsmm_calibration \
-  --output-dir ... \
-  --split calibration \
-  --parents-per-family 4 [--smoke]
-```
-
-该命令固定执行：
-
-```text
-ObservableEvidence
-→ selected HSMM MAP path
-→ model-grid endpoint midpoint mapping
-→ high-resolution SegmentExtent
-→ V4 profile parameterization
-→ LFM-anchored high-resolution decoder
-→ parent 内全部 zone 合并
-→ complete-support finite projection
-```
-
-model-grid 内部端点映射到相邻样点中心的中点；zone 首末端点扩展到完整
-high-resolution zone support。projection 只评价 FIR 窗口完全落入已重建 zone union 的
-model samples，避免用零填充或 truth halo制造边缘假象。
-
-固定对照包括 deterministic evidence fit、state-conditioned prior、anchor-only、直接
-bandlimited evidence，以及两个定位用 Oracle：同一 MAP extent 替换为 truth-majority state，
-和同一 calibration parents 的 truth-segment profile control。正式门禁要求 learned MAP
-同时改善 high-resolution 与 projected log-AI 的最强非 Oracle baseline；失败时由两个
-Oracle 对照区分 state 错误、extent 分布偏移和 profile head 本身失效。
-
-当前 12-parent calibration 结果中，truth-segment learned profile RMSE 为 `0.05257`，但
-完整 MAP high-resolution RMSE 为 `0.09957`，弱于 deterministic MAP 的 `0.08357`；
-truth-majority state 可将 learned MAP 改善到 `0.08948`。projected learned RMSE 为
-`0.06948`，也弱于 deterministic MAP 的 `0.05673` 和 direct evidence 的 `0.05603`。
-因此 teacher-forced profile 成绩不能直接进入 ensemble；瓶颈同时包含 state 错误以及
-MAP extent 相对 truth extent 的分布偏移。
-
-固定 MAP profile 探针通过统一 CLI 运行：
-
-```text
-structured_ginn_v2.py probe-map-profiles \
-  --corpus ... \
-  --checkpoint .../segment_profiles/generator.pt \
-  --hsmm-contract-dir .../stage1_hsmm_calibration \
-  --output-dir ... [--smoke]
-```
-
-探针冻结 evidence network 和所选 HSMM，先在 training parents 上生成固定 MAP extents，
-再创建一个零残差 profile head。初始均值严格等于 deterministic evidence fit；优化目标
-直接由完整 LFM-anchored high-resolution log-AI 与 complete-support finite projection
-组成。truth-segment profile/可识别系数只提供弱的非负辅助损失，MAP segments 不执行
-predicted-to-truth split/merge matching，也不接受逐段系数 NLL。每个 epoch 发布 checkpoint，
-结束后在独立 calibration parents 上执行完整 MAP reconstruction。
-
-formal 默认使用每类 64/16/4 个 training/tuning/calibration parents、中央 5 道和 2 epochs。
-探针通过要求：learned high-resolution RMSE 低于 deterministic MAP；learned projected RMSE
-不高于 direct bandlimited evidence；任一 geometry family 不能在两个分辨率上同时退化。
-未通过时 K-member ensemble 使用 deterministic evidence fit，learned profile head 只作为
-失败审计产物；通过后再单独校准 sampled coefficient variance。
-
-coefficient variance 使用 calibration split 做闭式 post-hoc temperature calibration：
-
-```text
-structured_ginn_v2.py calibrate-profile-variance \
-  --corpus ... \
-  --checkpoint .../map_profile_probe/generator.pt \
-  --output-dir ... [--smoke]
-```
-
-该命令冻结 evidence、HSMM 和 coefficient mean。正式预算为每类 32 个 calibration parents
-及中央 5 道；只有 rank=3、condition 不大于 100 且未 clipping 的 truth segments 用于拟合
-三个全局正 temperature。每个 temperature 是固定均值、对角 Gaussian coefficient NLL 的
-闭式最优解，使对应 standardized coefficient residual 的 RMS 为 1。报告同时发布校准前后
-50/80/95% coverage、Gaussian NLL 和按 state 分解；短段继续保留 prior-selected latent
-语义，不用于单系数校准。
-
-校准结果写入 V5 generator checkpoint，`parameterize_segments()` 返回乘过 temperature 的
-`c0/c1/c2` scale。该 scale 只表示给定 segment state/extent 后的系数不确定性；segment
-数量、state 和 boundary 的不确定性由 exact HSMM backward sampling 单独提供。校准过程
-不改变均值，也不重新运行优化 epoch。geometry holdout 负责后续 ensemble coverage 的独立
-最终门禁。
-
-校准后的 V5 checkpoint 通过以下命令接入冻结 HSMM 并评价完整 ensemble：
-
-```text
-structured_ginn_v2.py evaluate-ensemble \
-  --corpus ... \
-  --checkpoint .../coefficient_variance/generator.pt \
-  --hsmm-contract-dir .../hsmm_calibration \
-  --output-dir ... \
-  --split calibration \
-  --parents-per-family 4 \
-  --realization-count 16 \
-  --path-coupling-strength 1 \
-  --profile-coupling-strength 1 \
-  --figures-per-family 2 [--smoke]
-```
-
-命令只通过 `ConditionalGenerator.realize()` 运行生成链。每条有效 trace 执行一次 exact
-posterior forward recursion，再执行 K 次 backward sampling；每个 sampled segment 从经过
-temperature 校准的 `c0/c1/c2` 分布取样。decoder 生成 high-resolution AI，并使用完整支持
-的有限 FIR 投影到 model grid。evaluator 先合并同一 parent 的全部 zone，再做一次有限支持
-投影，避免在内部 zone 接缝丢失样点。state occupancy、renewal、segment count 和 duration
-全部在 model grid 上与同尺度 truth 比较；raw high-resolution segment table 不作为
-model-grid HSMM 的 count target。报告发布 high-resolution/projected ensemble mean RMSE、
-代表解 RMSE、CRPS、50/80/95% coverage 及上述结构 posterior proper scores。
-
-`--figures-per-family N` 使用同一评估数据流为每个 geometry family 的前 N 个 parent
-发布横向连续性八联图：输入地震、high-resolution truth、固定 member、代表 member、
-ensemble mean、叠加代表 segment 起点的 ensemble standard deviation，以及 truth/代表解的
-event-track 图。固定 member
-和代表 member 是合法 realization；ensemble mean 只用于汇总，不作为结构化解释结果。
-
-命令使用 V6 generator checkpoint，其中包含冻结的 semi-Markov prior 和 conditioning；
-coordinate-aligned random-key 与横向耦合强度属于显式 generation policy。代表解按 projected AI 到 observable
-bandlimited evidence 的距离，从 K 个完整成员中整体选取；并列时选择 conditional score
-更高者。section/volume 的全局成员选择使用同一准则。
-
-exact HSMM 同时发布全局 MAP、state marginal、renewal marginal 和 same-state renewal
-marginal；K sampling 复用同一 forward table。`StructuredPrediction` 保存 realization
-identities、可选的完整 K members、ensemble summary、真实成员代表解和 recursion 诊断。
-最小 smoke 已验证 25 条有效 trace 对应 25 次 forward recursion 与 `25 × K` 次 backward
-sampling；smoke 的 K=2 coverage 只验证接口，不作为科学结论。
-
-正式门禁为：
-
-- full ensemble 相对 no-seismic/prior-only 改善 projected AI、state 和 profile；
-- matched shuffle 破坏上述收益；
-- bandlimited/projected truth 的 coverage 与 CRPS/energy score合理；
-- segment count、duration 和 state occupancy 分布得到校准；
-- truth-substitution 能定位剩余瓶颈；
-- coefficient 与 exact micro-boundary 指标只作审计。
-
-代表解必须是 K 个完整 realization 中的真实成员。逐道拼接和逐点 ensemble mean 不是
-结构化代表解。
-
-### 5.3 第三步：横向、dirty 与 section 门禁
-
-单道 clean 门禁通过后接入 21 道、米制距离和显式 mask。横向收益通过 single-trace
-与 neighbor-shuffle 证明。微结构连续性同时使用由 XY、zone identity 和 realization identity
-决定的 coordinate-stable correlated random fields，以及基于相邻道单调 event alignment 的
-soft conditional coupling。
-
-随机场的垂向 identity 使用 zone-relative 坐标：HSMM backward sampling 按当前 endpoint
-取随机数，profile coefficient 按 segment 中点、state 和 coefficient 类型取随机数。
-因此相邻道发生 split/merge 时，其余 segment 的随机身份保持稳定。每道先从 exact posterior
-抽取 K 个合法候选，再在保持中心道 member identity 的条件下，以 path score 和相邻事件
-位置、厚度、state 的组合代价选择 K 套横向路径。profile mean 与随机残差只在匹配到的同一
-event track 内按米制距离耦合；birth、death 和 pinchout 不跨拓扑断点平滑。
-
-短 patch 报告两组横向门禁。第一组是 anchor-relative high-resolution increment 的 normalized-zone
-横向梯度、normalized-zone state neighbor agreement，以及相邻道 renewal-position
-Wasserstein distance。每项同时报告 truth、representative 和 ensemble-members summary，
-并按 geometry family 分层。第二组直接在单调匹配的 segment event 上报告 matched fraction、
-中点偏移、厚度 log-ratio、state mismatch、profile RMS log-ratio 和 profile mean jump。
-event-track 图与第二组指标共同作为横向连续性的主要判据；第一组保留为边际粗糙度诊断。
-
-真实观测统计 profile 在此步冻结，覆盖 phase、shift、gain、频带、振幅衰减和噪声等
-nuisance。它只要求 synthetic observation 覆盖真实统计支持，不要求合成与真实波形
-不可区分，也不改变地下 truth。
-
-执行顺序仍采用 L0/L1/L2 小预算探针；clean 结论成立后才训练 dirty。最终一次运行
-section benchmark，检查：
-
-- full 相对 no-seismic、single-trace 和 neighbor-shuffle 的收益；
-- clean/dirty 配对退化与不确定性变化；
-- variogram、roughness、event continuity 和 birth/death；
+- event matched/survival fraction；
+- thickness log-ratio 与沿轨迹 variation；
+- profile mean/RMS jump；
+- birth/death localization；
 - pinchout false bridging；
-- direction reversal 与 tile/halo/stitching invariance；
-- IID seed 与 combination holdout 结论一致性。
+- high-resolution 与 projected reconstruction；
+- projection-collapse recovery by track identity。
 
-## 6. 阶段 2：真实工区冻结 zero-shot
+固定图件展示 seismic、truth、predicted EventTracks、high-resolution AI、projected AI 和
+topology mask。横向门禁必须同时通过数值与图件审查。
 
-先运行 6 口可信井剖面、3 口低质量井诊断剖面和至少 2 条 blind sections。full 与
-no-seismic checkpoint 同时运行。inline/xline 分别生成 observable evidence，融合
-calibrated evidence 后只生成一套微结构 ensemble。
+### 7.4 deterministic 门禁
 
-section 保存 K 个完整成员。全体积保存：
+- truth EventTracks 经同一 rasterizer 完整闭环；
+- 固定 mini-corpus 可以过拟合 event identity、duration 和 profile；
+- deterministic/MAP 结果优于 prior-only EventTracks；
+- full 相对 no-seismic 改善 projected AI 与可识别 event/profile 指标；
+- lateral model 相对 single-trace 改善 event survival 与 thickness/profile continuity；
+- wedge/pinchout 不增加 false bridging；
+- peak-poor 输入不造成 event count 系统性坍缩；
+- weak evidence 区域的结果回归 prior，而不是输出重复的确定性微段。
 
-- projected increment、signed reflectivity 和 state evidence；
-- high-resolution ensemble mean/std；
-- representative high-resolution log-AI 和 segment table；
-- direction disagreement、seismic support 和 LFM sensitivity；
-- support/stitching mask 与可局部重生成的 realization identities。
+deterministic 门禁通过后，才实现 K-member sampling。
 
-真实井门禁：
+## 8. 阶段 3：联合 ensemble 与 full-section 合成门禁
+
+### 8.1 Ensemble sampling
+
+默认 `K=16`。一个 member 的采样单位是完整 section EventTracks：
+
+```text
+sample ordered events once per zone
+→ sample each event's lateral presence and duration field
+→ sample each event's lateral profile field
+→ condition on BandlimitedEvidence
+→ rasterize all traces together
+→ decode one complete section realization
+```
+
+随机 identity 由 run、parent/section、zone、event、member 和物理坐标共同决定。tile 大小、
+执行顺序和 GPU batch 不改变结果。每个 member 都必须满足 EventField、axis、support、duration
+和 topology 合同。
+
+representative 以完整 section 的冻结 joint conditional score 从 K 个 member 中选择。ensemble
+mean 只作为统计摘要。
+
+### 8.2 不确定性与证据归因
+
+calibration split 冻结：
+
+- evidence scale；
+- event count/duration dispersion；
+- profile variance；
+- high-resolution/projected coverage；
+- full 与 no-seismic 的 paired sensitivity threshold。
+
+输出使用两个独立诊断量：
+
+- `seismic_conditioning_sensitivity`：full 与 matched/no-seismic 条件结果的差异；
+- `sub_tuning_prior_uncertainty`：在带限证据近似不变时，高分辨率 members 的分歧。
+
+它们不被压缩成“地震支持/先验支配”的过强单标签。亚调谐事件可以输出，但必须伴随其
+ensemble 不确定性和带限不可区分性。
+
+### 8.3 Full-section 门禁
+
+calibration 完成后只运行一次当前 47-parent full-section benchmark。检查：
+
+- K members 和 representative 都具有连续 event identity；
+- ensemble mean 的平滑不掩盖 member 跳变；
+- event count、duration、state occupancy 和 profile distribution coverage；
+- high-resolution/projected CRPS 与 coverage；
+- event survival、thickness/profile variation 和 topology；
+- projection-collapse 子集的 hidden-event coverage；
+- clean、dirty、peak-poor 的配对稳定性；
+- peak-poor 条件下可见峰数下降，而 posterior event density 不系统性欠分；
+- matched seismic shuffle 破坏地震收益，neighbor shuffle 破坏横向收益；
+- IID 与 combination holdout 结论一致；
+- tile/halo/stitching 与 random identity invariance。
+
+每个 geometry family 固定输出 truth、representative、两个固定 members、ensemble summary、
+EventTracks 和 topology 图件。合法 member 的视觉连续性是正式验收项。
+
+## 9. 阶段 4：真实工区冻结 zero-shot 剖面
+
+阶段 4 固定运行：
+
+- 6 口可信井剖面；
+- 3 口低质量井震标定诊断剖面；
+- 至少 2 条 blind sections；
+- full 与 no-seismic 两个冻结 checkpoint；
+- 比例切片克里金主 LFM 与趋势 LFM 敏感性对照。
+
+每条剖面输出：
+
+- BandlimitedEvidence 与统计支持检查；
+- K 个完整 EventTrack realizations；
+- representative high-resolution AI 与 event table；
+- ensemble high-resolution/projected mean、std 和 coverage；
+- event presence、duration 和 profile summary；
+- seismic conditioning sensitivity；
+- sub-tuning prior uncertainty；
+- LFM variant sensitivity；
+- support、topology 和 stitching mask。
+
+可信井门禁为：
 
 - full 相对 no-seismic 在井上对应频带的配对改善为正；
 - full 相对 full-LFM 和 zone-linear anchor 有整体增量价值；
 - high-resolution ensemble 对井曲线具有合理 coverage；
-- 代表解在多数可信井上不相对 LFM 退化；
-- 低质量井只作逐井诊断；
-- blind sections 无 seam、方向条带或微结构随机跳变。
+- representative 在多数可信井上不相对 LFM 退化；
+- 井上 event density 与 ProducerPrior 的失配被单独报告；
+- blind sections 不出现 event identity 跳变、随机块状纹理或 seam。
 
-剖面门禁通过后才运行全体积。zero-shot 结果发布后再规划井监督、物理约束和真实
-adaptation。
+3 口低质量井只作逐井诊断。若 full 不优于 no-seismic，结论是地震条件没有成功迁移；若
+带限指标通过而高分辨率井 coverage 失败，结论是 producer prior 或 profile distribution 需要
+重新标定。两类失败不能互相替代解释。
 
-## 7. 验证与运行纪律
+## 10. 阶段 5：二维 EventSurface 与全体积
 
-实现至少覆盖：
+真实 1D 剖面通过后，使用同一 EventField 语义扩展二维空间：
 
-- target audit 的统计、图件、forward closure 和 family 分层；
-- L0/L1/L2 失败能够阻止 formal training；
-- full/no-seismic 使用相同随机合同；
-- matched shuffle 只破坏 seismic-target 对应；
-- target 全局 scale 不改变 parent 间幅度排序；
-- time/depth target adapter 与正式 forward 一致；
-- canonical V2 split 和 parent 原子隔离；
-- small-sequence HSMM 与 brute-force posterior/sampling 对照；
-- same-state renewal 与一次 recursion 的 K sampling；
-- truth-substitution 对照；
-- representative 是 ensemble 真实成员；
-- spatial sampling 的 tile/order/batch determinism；
-- inline/xline evidence 先融合、微结构只生成一次；
-- section continuity、pinchout 和 false bridging；
-- full/no-seismic 真实井配对报告。
+```text
+inline/xline observations
+→ one fused BandlimitedEvidence field
+→ one ordered EventSurface generator
+→ one set of 2D event identities
+→ volume realizations
+```
 
-正式训练命令必须在启动前读取通过的 target-audit artifact。训练按 batch 固定频率记录
-每个 head 的独立 loss 和 baseline-relative metric；总 loss 只用于优化，不作为科学
-验收指标。
+inline 和 xline 可以分别编码带限证据，但在微结构生成前融合。禁止分别生成两套 EventTracks
+再按 segment 对齐或平均。
+
+二维实施前，Synthoseis-lite 增加小型 2D EventSurface fixture 和 holdout，用于验证 surface
+ordering、birth/death、pinchout、tile/halo 和方向不变性。它复用同一 ProducerPrior，不建立
+新的地质语义。
+
+全体积采用可重生成的流式 ensemble：第一遍累计 summary 与全局代表分数，第二遍按选定
+member identity 重生成代表解。chunk 顺序不改变结果。
+
+全体积只在以下条件满足后发布：
+
+- 2D synthetic EventSurface 门禁通过；
+- 真实固定剖面门禁通过；
+- inline/xline evidence disagreement 在 calibration 支持范围内；
+- 体内没有方向性条带、tile seam、event-surface 断裂或 false bridging；
+- 局部重生成与全体积结果身份一致。
+
+## 11. 风险与停止条件
+
+### 11.1 P0 风险
+
+**观测复杂度泄漏为事件密度。** 模型可能学到“峰少即层少”。peak-poor paired gate 若失败，
+停止 EventTrack 训练并修正 evidence/augmentation，不通过调高结构 loss 掩盖。
+
+**横向连续性只存在于 ensemble mean。** 任一 member 仍逐道跳变时，停止 full-section 发布并
+修正 EventField decoder，不增加事后平滑或候选匹配。
+
+**ProducerPrior 与真实井失配。** real well high-resolution coverage 系统失败时，重新审计井
+标定、duration 和 profile prior；不把失败归咎于地震噪声后继续全体积。
+
+**LFM 取代地震。** full 不优于 no-seismic 时，zero-shot 地震增量门禁失败。
+
+### 11.2 P1 风险
+
+- none/wedge/pinchout 不能覆盖断层、盐边界等真实 topology；
+- 25 道短 patch 对长距离事件生存的监督有限；
+- K=16 可能低估多峰 posterior；
+- 一维 EventTrack 成功不能自动证明二维 EventSurface 成功；
+- coefficient 看似准确可能来自 producer 偏好，而非地震可辨识性；
+-真实输入可能落在 observation profile 的统计支持之外。
+
+这些风险必须在对应 gate 中形成可见报告。报告缺失本身视为门禁未完成。
+
+## 12. 运行与发布纪律
+
+- schema、status、ID、domain、unit、axis、shape、dtype、mask 和 geometry 在长任务前严格
+  preflight；
+- 标签退化、truth closure 和 mini-corpus overfit 在正式训练前完成；
+- 每个 epoch 原子发布 `last` 与 `best` checkpoint；
+- 日志按固定 batch/parent 频率报告进度和剩余规模；
+- 单个随机 realization 或诊断图失败写入 warning，并发布已完成结果；
+- producer Oracle 的数值边界告警写入 report，不使数小时生成在末尾丢失；
+- fingerprint 记录 provenance，不作为 consumer equality gate；
+- full-section、真实剖面和全体积各有独立输出目录与 manifest；
+- 所有科学阈值在 calibration split 冻结，geometry holdout 和真实井不得用于静默调参。
+
+## 13. 当前状态与下一步
+
+当前已经完成：
+
+- canonical corpus V2：2400 个 short patches 和 47 个 full sections；
+- producer Oracle、decoder/projection parity 与 time/depth smoke；
+- SHA consumer gate 清理；
+- `src/ginn_v2` 历史实验链清理，包收敛为 10 个深模块；
+- `ObservationTile`、证据 seam、EventTrack 基础类型和 `ConditionalGenerator` 外壳；
+- 全量 parent event identity/topology 审计；
+- 既有带限 evidence、profile、ensemble 和横向失败路线的冻结审计。
+
+当前尚未完成的是新的 section-level EventField generator。实施顺序固定为：
+
+```text
+ProducerPrior + projection-collapse contract
+→ BandlimitedEvidence 正式训练与 controls
+→ deterministic EventTrack generator
+→ K-member section ensemble
+→ real zero-shot sections
+→ 2D EventSurface / full volume
+```
+
+下一次代码实施从阶段 0 的 `ProducerPrior` 与 projection target 开始。当前 corpus 继续使用，
+无需因 model-grid 同状态现象重跑合成 benchmark。

@@ -2,11 +2,11 @@
 
 from ginn_v2.contracts import (
     DomainMismatchError,
+    BandlimitedEvidence,
     EventTrack,
     GenerationPolicy,
     InputContractError,
     NumericalFailure,
-    ObservableEvidence,
     ObservationTile,
     StructuredEnsemble,
     VolumeInferenceResult,
@@ -22,13 +22,13 @@ from ginn_v2.learning import (
 
 __all__ = [
     "ConditionalGenerator",
+    "BandlimitedEvidence",
     "DomainMismatchError",
     "EventTrack",
     "GenerationPolicy",
     "InputContractError",
     "LearningConfig",
     "NumericalFailure",
-    "ObservableEvidence",
     "ObservationTile",
     "StructuredEnsemble",
     "VolumeInferenceResult",

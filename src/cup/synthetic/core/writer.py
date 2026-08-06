@@ -298,6 +298,7 @@ def _write_truth(
             np.float32,
         ),
         ("zone_id_highres", truth.zone_id_highres, "category", np.int16),
+        ("boundary_mask_highres", truth.boundary_mask_highres, "bool", None),
         (
             "truth_valid_highres",
             np.isfinite(truth.log_ai_highres),
@@ -312,6 +313,54 @@ def _write_truth(
             projected.model_target_log_ai,
             "ln(m/s*g/cm3)",
             np.float32,
+        ),
+        (
+            "state_fraction_model",
+            projected.state_fraction_model,
+            "fraction",
+            np.float32,
+        ),
+        (
+            "dominant_object_id_model",
+            projected.dominant_object_id_model,
+            "category",
+            np.int32,
+        ),
+        (
+            "zone_id_model",
+            projected.zone_id_model,
+            "category",
+            np.int16,
+        ),
+        (
+            "boundary_fraction_model",
+            projected.boundary_fraction_model,
+            "fraction",
+            np.float32,
+        ),
+        (
+            "boundary_mask_model",
+            projected.boundary_mask_model,
+            "bool",
+            None,
+        ),
+        (
+            "categorical_valid_model",
+            projected.categorical_valid_mask_model,
+            "bool",
+            None,
+        ),
+        (
+            "hidden_transition_count_model",
+            projected.hidden_transition_count_model,
+            "count",
+            np.int16,
+        ),
+        (
+            "projection_collapse_mask_model",
+            projected.projection_collapse_mask_model,
+            "bool",
+            None,
         ),
     )
     for name, values, unit, dtype in highres:

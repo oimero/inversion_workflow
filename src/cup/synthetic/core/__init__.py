@@ -23,6 +23,7 @@ from cup.synthetic.core.pipeline import (
     SyntheticDomainAdapter,
 )
 from cup.synthetic.core.records import LfmObservation, StructuredSampleRecord
+from cup.synthetic.core.prior import ProducerPrior, load_producer_prior
 
 __all__ = [
     "build_mask_contract",
@@ -40,7 +41,9 @@ __all__ = [
     "SyntheticDomainAdapter",
     "SectionGeometry",
     "LfmObservation",
+    "ProducerPrior",
     "StructuredSampleRecord",
+    "load_producer_prior",
     "validate_training_manifest",
     "write_dataset",
 ]

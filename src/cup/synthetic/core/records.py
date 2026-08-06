@@ -45,6 +45,17 @@ class SampleAxis:
 
 
 @dataclass(frozen=True)
+class CategoricalProjection:
+    state_fraction_model: np.ndarray
+    dominant_object_id_model: np.ndarray
+    zone_id_model: np.ndarray
+    boundary_fraction_model: np.ndarray
+    categorical_valid_mask_model: np.ndarray
+    hidden_transition_count_model: np.ndarray
+    projection_collapse_mask_model: np.ndarray
+
+
+@dataclass(frozen=True)
 class ProjectedTruth:
     model_axis: SampleAxis
     model_target_log_ai: np.ndarray
@@ -56,6 +67,8 @@ class ProjectedTruth:
     boundary_mask_model: np.ndarray
     geometric_valid_mask_model: np.ndarray
     categorical_valid_mask_model: np.ndarray
+    hidden_transition_count_model: np.ndarray
+    projection_collapse_mask_model: np.ndarray
     projection_support_highres: np.ndarray
     projection_support_model: np.ndarray
 
@@ -174,6 +187,7 @@ class StructuredSampleRecord:
         object.__setattr__(self, "domain_metadata", MappingProxyType(dict(self.domain_metadata)))
 
 __all__ = [
+    "CategoricalProjection",
     "DepthForwardExtras",
     "DomainPreparation",
     "ForwardResult",

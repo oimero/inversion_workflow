@@ -43,6 +43,7 @@ from cup.synthetic.core.pipeline import (
 )
 from cup.synthetic.adapters import TimeSyntheticDomainAdapter
 from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
+from cup.synthetic.core.prior import build_producer_prior
 from cup.synthetic.schemas import SCIENCE_CONTRACT, require_science_contract
 from cup.config.workflow import WorkflowConfig
 from cup.utils.io import (
@@ -281,6 +282,12 @@ class TimeGenerationSession:
                 "science_revision": SCIENCE_CONTRACT["science_revision"],
                 "random_stream_contract_version": SCIENCE_CONTRACT["random_stream_contract_version"],
             },
+            "producer_prior": build_producer_prior(
+                calibration,
+                object_core_controls=script_cfg["impedance"],
+                geometry_families=script_cfg["generation"]["geometry_families"],
+                geometry_directions=script_cfg["generation"]["geometry_directions"],
+            ).to_mapping(),
         }
         return GenerationSession(
             plan=None,

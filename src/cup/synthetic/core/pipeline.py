@@ -383,7 +383,7 @@ class GenerationSession:
                     if debug_attempt_limit is not None
                     else self.debug_attempt_limit,
                 )
-            raise RuntimeError("generation session lacks canonical V2 corpus budget")
+            raise RuntimeError("generation session lacks canonical V3 corpus budget")
         else:
             plan = self.plan
         return limit_attempt_plan(

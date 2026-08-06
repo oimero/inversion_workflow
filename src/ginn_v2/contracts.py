@@ -143,7 +143,7 @@ class ObservationTile:
 
 
 @dataclass(frozen=True)
-class ObservableEvidence:
+class BandlimitedEvidence:
     """Band-limited evidence exposed to the event generator."""
 
     model_axis: SampleAxis
@@ -154,7 +154,7 @@ class ObservableEvidence:
     projected_log_ai_increment_scale: np.ndarray
     signed_reflectivity_mean: np.ndarray
     signed_reflectivity_scale: np.ndarray
-    state_log_potential: np.ndarray
+    state_fraction: np.ndarray
     local_tuning_scale: np.ndarray
     support: np.ndarray
     highres_support: np.ndarray
@@ -198,11 +198,11 @@ class ObservableEvidence:
         }
         if any(value.shape != shape for value in fields.values()):
             raise InputContractError("model-grid evidence fields must share one shape.")
-        state_log_potential = _array(
-            self.state_log_potential, dtype=np.float64, ndim=3, name="state_log_potential"
+        state_fraction = _array(
+            self.state_fraction, dtype=np.float64, ndim=3, name="state_fraction"
         )
-        if state_log_potential.shape != shape + (3,):
-            raise InputContractError("state_log_potential must be [lateral, sample, 3].")
+        if state_fraction.shape != shape + (3,):
+            raise InputContractError("state_fraction must be [lateral, sample, 3].")
         highres_shape = (shape[0], self.highres_axis.coordinates.size)
         background_highres = _array(
             self.background_lfm_linear_highres,
@@ -228,9 +228,18 @@ class ObservableEvidence:
                 raise NumericalFailure(f"supported {name} must be finite and positive.")
         if np.any(highres_support & ~np.isfinite(background_highres)):
             raise NumericalFailure("supported high-resolution anchor must be finite.")
-        normalized = np.logaddexp.reduce(state_log_potential, axis=-1)
-        if np.any(support & ~np.isclose(normalized, 0.0, rtol=0.0, atol=1.0e-5)):
-            raise InputContractError("state_log_potential must be log-normalized.")
+        state_sum = np.sum(state_fraction, axis=-1)
+        if np.any(
+            support
+            & (
+                np.any(~np.isfinite(state_fraction), axis=-1)
+                | np.any(state_fraction < 0.0, axis=-1)
+                | ~np.isclose(state_sum, 1.0, rtol=0.0, atol=1.0e-5)
+            )
+        ):
+            raise InputContractError(
+                "supported state_fraction must be finite probabilities summing to one."
+            )
         lateral = _array(self.lateral_m, dtype=np.float64, ndim=1, name="lateral_m")
         if lateral.shape != (shape[0],) or np.any(~np.isfinite(lateral)) or (
             lateral.size > 1 and np.any(np.diff(lateral) <= 0.0)
@@ -239,7 +248,7 @@ class ObservableEvidence:
         x_m, y_m = _validate_xy(lateral, self.x_m, self.y_m)
         identity = str(self.identity).strip()
         if not identity:
-            raise InputContractError("observable evidence identity must be non-empty.")
+            raise InputContractError("band-limited evidence identity must be non-empty.")
 
         object.__setattr__(self, "background_lfm_linear", fields["background_lfm_linear"])
         object.__setattr__(self, "background_lfm_linear_highres", background_highres)
@@ -252,7 +261,7 @@ class ObservableEvidence:
             "support",
         ):
             object.__setattr__(self, name, fields[name])
-        object.__setattr__(self, "state_log_potential", state_log_potential)
+        object.__setattr__(self, "state_fraction", state_fraction)
         object.__setattr__(self, "highres_support", highres_support)
         object.__setattr__(self, "lateral_m", lateral)
         object.__setattr__(self, "x_m", x_m)
@@ -295,6 +304,85 @@ class EventTrack:
         object.__setattr__(self, "presence", presence)
         object.__setattr__(self, "duration_fraction", duration)
         object.__setattr__(self, "coefficients", coefficients)
+
+
+@dataclass(frozen=True)
+class EventTrackTruth:
+    """One producer-owned high-resolution event across a lateral zone tile."""
+
+    zone_id: str
+    event_id: int
+    state_id: int
+    presence: np.ndarray
+    top: np.ndarray
+    bottom: np.ndarray
+    duration_fraction: np.ndarray
+    raw_coefficients: np.ndarray
+    projected_coefficients: np.ndarray
+    effective_coefficients: np.ndarray
+    segment_supervision_valid: np.ndarray
+
+    def __post_init__(self) -> None:
+        zone_id = str(self.zone_id).strip()
+        if not zone_id or self.event_id < 0 or self.state_id not in {0, 1, 2}:
+            raise InputContractError("event truth identity or state is invalid.")
+        presence = _array(self.presence, dtype=bool, ndim=1, name="presence")
+        width = presence.size
+        one_dimensional = {
+            "top": _array(self.top, dtype=np.float64, ndim=1, name="top"),
+            "bottom": _array(self.bottom, dtype=np.float64, ndim=1, name="bottom"),
+            "duration_fraction": _array(
+                self.duration_fraction,
+                dtype=np.float64,
+                ndim=1,
+                name="duration_fraction",
+            ),
+            "segment_supervision_valid": _array(
+                self.segment_supervision_valid,
+                dtype=bool,
+                ndim=1,
+                name="segment_supervision_valid",
+            ),
+        }
+        if any(value.shape != (width,) for value in one_dimensional.values()):
+            raise InputContractError("event truth lateral fields have inconsistent shapes.")
+        coefficient_fields = {
+            "raw_coefficients": _array(
+                self.raw_coefficients, dtype=np.float64, ndim=2, name="raw_coefficients"
+            ),
+            "projected_coefficients": _array(
+                self.projected_coefficients,
+                dtype=np.float64,
+                ndim=2,
+                name="projected_coefficients",
+            ),
+            "effective_coefficients": _array(
+                self.effective_coefficients,
+                dtype=np.float64,
+                ndim=2,
+                name="effective_coefficients",
+            ),
+        }
+        if any(value.shape != (width, 3) for value in coefficient_fields.values()):
+            raise InputContractError("event truth coefficients must be [lateral, 3].")
+        top = one_dimensional["top"]
+        bottom = one_dimensional["bottom"]
+        duration = one_dimensional["duration_fraction"]
+        if np.any(presence & (~np.isfinite(top) | ~np.isfinite(bottom) | (bottom <= top))):
+            raise InputContractError("present event truth extents must be finite and positive.")
+        if np.any(presence & (~np.isfinite(duration) | (duration <= 0.0))):
+            raise InputContractError("present event truth durations must be finite and positive.")
+        if np.any(~presence & (np.isfinite(top) | np.isfinite(bottom) | (duration != 0.0))):
+            raise InputContractError("absent event truth must not carry extents or duration.")
+        for name, values in coefficient_fields.items():
+            if np.any(~np.isfinite(values[presence])) or np.any(np.isfinite(values[~presence])):
+                raise InputContractError(
+                    f"{name} must be finite exactly where the event is present."
+                )
+        object.__setattr__(self, "zone_id", zone_id)
+        object.__setattr__(self, "presence", presence)
+        for name, value in {**one_dimensional, **coefficient_fields}.items():
+            object.__setattr__(self, name, value)
 
 
 @dataclass(frozen=True)
@@ -341,7 +429,7 @@ class GenerationPolicy:
 class StructuredEnsemble:
     """Complete section result returned by the generator seam."""
 
-    evidence: ObservableEvidence
+    evidence: BandlimitedEvidence
     representative: Mapping[str, Any]
     realizations: tuple[Mapping[str, Any], ...]
     summary: Mapping[str, Any]
@@ -363,12 +451,13 @@ class VolumeInferenceResult:
 
 
 __all__ = [
+    "BandlimitedEvidence",
     "DomainMismatchError",
     "EventTrack",
+    "EventTrackTruth",
     "GenerationPolicy",
     "InputContractError",
     "NumericalFailure",
-    "ObservableEvidence",
     "ObservationTile",
     "Segment",
     "StructuredEnsemble",

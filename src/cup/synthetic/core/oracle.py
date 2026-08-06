@@ -1,4 +1,4 @@
-"""Producer-owned decoder, projection, and forward Oracle for canonical V2."""
+"""Producer-owned decoder, projection, and forward Oracle for the canonical corpus."""
 
 from __future__ import annotations
 

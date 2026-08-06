@@ -83,7 +83,7 @@ def validate_canonical_corpus_lateral_m(
         "full_section": 121,
     }.get(str(corpus_role))
     if expected_width is None:
-        raise ValueError("canonical V2 parent has no corpus_role.")
+        raise ValueError("canonical V3 parent has no corpus_role.")
     lateral = np.asarray(lateral_m, dtype=np.float64).reshape(-1)
     interval = float(target_interval_m)
     if not np.isfinite(interval) or interval <= 0.0:

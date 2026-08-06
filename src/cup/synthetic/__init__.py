@@ -7,11 +7,14 @@ from cup.synthetic.benchmark import (
     SynthoseisBenchmark,
     SyntheticSample,
 )
+from cup.synthetic.core.prior import ProducerPrior, load_producer_prior
 
 __all__ = [
     "ParentIdentity",
+    "ProducerPrior",
     "StructuredParent",
     "StructuredSyntheticBenchmark",
     "SynthoseisBenchmark",
     "SyntheticSample",
+    "load_producer_prior",
 ]

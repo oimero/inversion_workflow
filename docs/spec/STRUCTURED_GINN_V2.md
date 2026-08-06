@@ -258,9 +258,9 @@ StructuredEnsemble
 
 ## 4. 数据、坐标与当前基础
 
-### 4.1 Canonical corpus V2
+### 4.1 Canonical corpus V3
 
-当前 depth/TVDSS corpus 可继续作为正式开发语料：
+正式 depth/TVDSS corpus 使用 V3 合同：
 
 - 2400 个 25 道 short-patch parents；
 - 训练、调参与 calibration 分别为 1680、360、360；
@@ -279,12 +279,12 @@ mask 与边缘行为。full sections 不参加参数训练、模型选择或不�
 误差仍随 parent 数稳定下降，且失败不能由模型容量或标签退化解释时，才扩充 synthetic
 corpus；47 个 full sections 不转入训练集。
 
-现有语料的 47/48 section 配额缺口是已发布 warning，不影响开发。新增语料只由明确的科学
-缺口触发，不为追求整数配额重新运行数小时 benchmark。
+V3 由 producer 直接发布 model-grid categorical targets、projection-collapse diagnostics 和
+`ProducerPrior`。旧 V2 artifact 缺少这些发布合同，不进入新训练链。
 
 ### 4.2 投影语义补充
 
-训练 adapter 必须从 high-resolution truth 确定性生成：
+V3 producer 从 high-resolution truth 确定性生成并直接发布：
 
 ```text
 state_fraction_model
@@ -295,8 +295,8 @@ projection_collapse_fraction
 hidden_transition_count
 ```
 
-这些字段优先由当前 HDF5 和 object tables 在线派生，使现有 GB 级结果继续可用。未来 producer
-版本可以把相同字段写入 canonical HDF5，但不能增加第二套 truth 旁路。
+GINN reader 只接受 V3，并直接读取、校验 producer 发布的 categorical projection 与
+`ProducerPrior`。categorical projection 的唯一实现在 `cup.synthetic`。
 
 ### 4.3 时深对称
 
@@ -316,11 +316,11 @@ time:  domain=time,  unit=s, depth_basis=null
 - time/depth 共享 writer、reader、target、loss、generation 和 diagnostic interface；
 - 正式 benchmark 当前运行 depth/TVDSS，time fixture 负责接口对称性门禁。
 
-## 5. 阶段 0：补齐 producer prior 与 projection 合同
+## 5. 阶段 0：producer prior 与 projection 合同
 
 ### 5.1 实施内容
 
-仓库清理已经完成，`src/ginn_v2` 当前保持 10 个深模块。阶段 0 的剩余工作集中在科学合同：
+仓库清理已经完成，`src/ginn_v2` 当前保持 10 个深模块。阶段 0 已落地以下科学合同：
 
 1. 在 `cup.synthetic` 发布 `ProducerPrior` writer/reader；
 2. 允许 transition 矩阵合法地包含零对角线；
@@ -331,9 +331,8 @@ time:  domain=time,  unit=s, depth_basis=null
 7. 将当前 evidence seam 收敛为公开的 `BandlimitedEvidence` 合同；
 8. 为相同 truth 构造 clean、普通 dirty 和 peak-poor dirty 配对 fixture。
 
-当前 corpus 已包含完成这些工作的必要 high-resolution identity 和 profile 字段，因此阶段 0
-不要求重跑 Synthoseis-lite。只有正式 producer schema 被改到无法由现有 artifact 无歧义派生时，
-才发布新 corpus 版本。
+artifact schema 为 V3，因此阶段 0 完成后重新运行 Synthoseis-lite。GINN 训练输入固定为 V3
+producer publication。
 
 ### 5.2 门禁
 
@@ -347,8 +346,8 @@ time:  domain=time,  unit=s, depth_basis=null
 - time/depth fixture 使用同一 adapter 和 public types；
 - SHA fingerprint mismatch 不构成 consumer 拒绝条件。
 
-阶段 0 通过后冻结 prior、target 与 split manifest；后续阶段不得在训练结果不理想时静默改
-标签定义。
+V3 全量 corpus 发布后冻结 prior、target 与 split manifest；后续阶段不得在训练结果不理想时
+静默改标签定义。
 
 ## 6. 阶段 1：学习 BandlimitedEvidence
 
@@ -664,15 +663,21 @@ member identity 重生成代表解。chunk 顺序不改变结果。
 
 当前已经完成：
 
-- canonical corpus V2：2400 个 short patches 和 47 个 full sections；
+- canonical corpus V2 的科学审计：2400 个 short patches 和 47 个 full sections；
 - producer Oracle、decoder/projection parity 与 time/depth smoke；
 - SHA consumer gate 清理；
 - `src/ginn_v2` 历史实验链清理，包收敛为 10 个深模块；
 - `ObservationTile`、证据 seam、EventTrack 基础类型和 `ConditionalGenerator` 外壳；
 - 全量 parent event identity/topology 审计；
 - 既有带限 evidence、profile、ensemble 和横向失败路线的冻结审计。
+- canonical artifact V3 writer/reader、producer-owned categorical projection 与
+  projection-collapse diagnostics；
+- 由 calibration 和 producer 配置发布的零对角线 `ProducerPrior`；
+- high-resolution object catalog 到有序 EventTrack truth 的单一 reader；
+- 公开 `BandlimitedEvidence`、soft state-fraction target 和 clean/dirty/peak-poor 配对 fixture。
 
-当前尚未完成的是新的 section-level EventField generator。实施顺序固定为：
+当前需要先发布新的 canonical V3 corpus。随后实施新的 section-level EventField generator，
+顺序固定为：
 
 ```text
 ProducerPrior + projection-collapse contract
@@ -683,5 +688,5 @@ ProducerPrior + projection-collapse contract
 → 2D EventSurface / full volume
 ```
 
-下一次代码实施从阶段 0 的 `ProducerPrior` 与 projection target 开始。当前 corpus 继续使用，
-无需因 model-grid 同状态现象重跑合成 benchmark。
+Synthoseis-lite 必须重跑一次以发布 canonical corpus V3。重跑的原因是 producer 发布合同升级，
+而不是拒绝 model-grid 投影塌缩样本；这些样本在 V3 中继续保留并得到显式诊断。

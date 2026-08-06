@@ -1,14 +1,11 @@
-"""Training seams for the section-level event-track generator.
-
-The previous file mixed target audits, probes, calibration, controls, and
-ensemble bookkeeping.  Stage 0 leaves one small seam; Stage 1 supplies its
-event-track implementation.
-"""
+"""Training seams for the section-level event-track generator."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
+
+import numpy as np
 
 from ginn_v2.contracts import GenerationPolicy, ObservationTile
 from ginn_v2.generator import ConditionalGenerator
@@ -31,6 +28,8 @@ class LearningConfig:
 def validate_observation_contract(
     generator: ConditionalGenerator,
     tiles: Iterable[ObservationTile],
+    *,
+    vp_model_mps_by_identity: Mapping[str, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     """Run the cheap stage-0 evidence seam check over supplied tiles."""
 
@@ -38,7 +37,14 @@ def validate_observation_contract(
     domains: set[str] = set()
     widths: list[int] = []
     for tile in tiles:
-        evidence = generator.observe(tile)
+        vp_model_mps = None
+        if tile.sample_domain == "depth":
+            if vp_model_mps_by_identity is None or tile.identity not in vp_model_mps_by_identity:
+                raise ValueError(
+                    f"depth tile {tile.identity!r} requires explicit model-grid Vp."
+                )
+            vp_model_mps = vp_model_mps_by_identity[tile.identity]
+        evidence = generator.observe(tile, vp_model_mps=vp_model_mps)
         count += 1
         domains.add(evidence.model_axis.sample_domain)
         widths.append(tile.width)

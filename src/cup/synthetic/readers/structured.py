@@ -86,13 +86,88 @@ class StructuredParent:
     object_id_highres: np.ndarray
     object_xi_highres: np.ndarray
     zone_id_highres: np.ndarray
+    boundary_mask_highres: np.ndarray
     clipping_mask_highres: np.ndarray
     model_log_ai: np.ndarray
+    state_fraction_model: np.ndarray
+    dominant_object_id_model: np.ndarray
+    zone_id_model: np.ndarray
+    boundary_fraction_model: np.ndarray
+    boundary_mask_model: np.ndarray
+    categorical_valid_model: np.ndarray
+    hidden_transition_count_model: np.ndarray
+    projection_collapse_mask_model: np.ndarray
     zones: tuple[Mapping[str, Any], ...]
     segments: tuple[Mapping[str, Any], ...]
     structured_identity: Mapping[str, Any]
     lfm_source_identity: Mapping[str, Any]
     forward_context: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        width = self.lateral_m.size
+        model_shape = (width, self.model_axis.coordinates.size)
+        highres_shape = (width, self.highres_axis.coordinates.size)
+        for name in (
+            "seismic",
+            "model_consistent_seismic",
+            "lfm",
+            "observed_valid",
+            "model_log_ai",
+            "dominant_object_id_model",
+            "zone_id_model",
+            "boundary_fraction_model",
+            "boundary_mask_model",
+            "categorical_valid_model",
+            "hidden_transition_count_model",
+            "projection_collapse_mask_model",
+        ):
+            if np.asarray(getattr(self, name)).shape != model_shape:
+                raise ValueError(f"structured parent {name} has an invalid model shape")
+        if self.state_fraction_model.shape != model_shape + (3,):
+            raise ValueError("structured parent state_fraction_model shape is invalid")
+        for name in (
+            "log_ai_highres",
+            "truth_valid_highres",
+            "state_id_highres",
+            "object_id_highres",
+            "object_xi_highres",
+            "zone_id_highres",
+            "boundary_mask_highres",
+            "clipping_mask_highres",
+        ):
+            if np.asarray(getattr(self, name)).shape != highres_shape:
+                raise ValueError(f"structured parent {name} has an invalid highres shape")
+        categorical = self.categorical_valid_model
+        state_sum = np.sum(self.state_fraction_model, axis=-1)
+        if np.any(
+            categorical
+            & (
+                np.any(~np.isfinite(self.state_fraction_model), axis=-1)
+                | np.any(self.state_fraction_model < 0.0, axis=-1)
+                | ~np.isclose(state_sum, 1.0, rtol=0.0, atol=1.0e-5)
+            )
+        ):
+            raise ValueError("structured parent state fractions are invalid")
+        if not np.array_equal(
+            self.boundary_mask_model,
+            self.boundary_fraction_model > 0.0,
+        ):
+            raise ValueError("structured parent boundary mask differs from its fraction")
+        if np.any(
+            self.projection_collapse_mask_model
+            & (self.hidden_transition_count_model < 2)
+        ):
+            raise ValueError("projection collapse requires at least two hidden transitions")
+        expected_boundary = np.zeros(highres_shape, dtype=bool)
+        expected_boundary[:, 0] = self.object_id_highres[:, 0] >= 0
+        expected_boundary[:, 1:] = (
+            (self.object_id_highres[:, 1:] >= 0)
+            & (self.object_id_highres[:, 1:] != self.object_id_highres[:, :-1])
+        )
+        if not np.array_equal(self.boundary_mask_highres, expected_boundary):
+            raise ValueError("structured parent high-resolution boundary identity is invalid")
+        if not np.isfinite(self.xline_step) or self.xline_step <= 0.0:
+            raise ValueError("structured parent xline_step must be finite and positive")
 
 
 class StructuredSyntheticBenchmark:
@@ -242,10 +317,35 @@ class StructuredSyntheticBenchmark:
                 object_id_highres=np.asarray(truth["object_id_highres"]),
                 object_xi_highres=np.asarray(truth["object_xi_highres"]),
                 zone_id_highres=np.asarray(truth["zone_id_highres"]),
+                boundary_mask_highres=np.asarray(
+                    truth["boundary_mask_highres"], dtype=bool
+                ),
                 clipping_mask_highres=np.asarray(
                     truth["clipping_mask_highres"], dtype=bool
                 ),
                 model_log_ai=np.asarray(truth["model_log_ai"], dtype=np.float64),
+                state_fraction_model=np.asarray(
+                    truth["state_fraction_model"], dtype=np.float64
+                ),
+                dominant_object_id_model=np.asarray(
+                    truth["dominant_object_id_model"], dtype=np.int32
+                ),
+                zone_id_model=np.asarray(truth["zone_id_model"], dtype=np.int16),
+                boundary_fraction_model=np.asarray(
+                    truth["boundary_fraction_model"], dtype=np.float64
+                ),
+                boundary_mask_model=np.asarray(
+                    truth["boundary_mask_model"], dtype=bool
+                ),
+                categorical_valid_model=np.asarray(
+                    truth["categorical_valid_model"], dtype=bool
+                ),
+                hidden_transition_count_model=np.asarray(
+                    truth["hidden_transition_count_model"], dtype=np.int16
+                ),
+                projection_collapse_mask_model=np.asarray(
+                    truth["projection_collapse_mask_model"], dtype=bool
+                ),
                 zones=_table(truth["zones"]),
                 segments=_table(truth["segments"]),
                 structured_identity=_json_attr(

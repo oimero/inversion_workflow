@@ -7,15 +7,15 @@ import torch
 
 from ginn_v2.contracts import (
     DomainMismatchError,
+    BandlimitedEvidence,
     GenerationPolicy,
     InputContractError,
-    ObservableEvidence,
     ObservationTile,
     StructuredEnsemble,
 )
 from ginn_v2.evidence import (
     EvidenceNetworkConfig,
-    ObservableEvidenceNetwork,
+    BandlimitedEvidenceNetwork,
     tuning_scale_on_model_axis,
 )
 from ginn_v2.representation import build_lfm_anchor, lfm_residual_from_anchor
@@ -31,7 +31,7 @@ class ConditionalGenerator:
 
     def __init__(
         self,
-        network: ObservableEvidenceNetwork,
+        network: BandlimitedEvidenceNetwork,
         *,
         dominant_frequency_hz: float,
         sample_domain: str,
@@ -59,7 +59,7 @@ class ConditionalGenerator:
         tile: ObservationTile,
         *,
         vp_model_mps: np.ndarray | None = None,
-    ) -> ObservableEvidence:
+    ) -> BandlimitedEvidence:
         """Convert one tile into the public band-limited evidence contract."""
 
         if tile.sample_domain != self.sample_domain:
@@ -87,17 +87,17 @@ class ConditionalGenerator:
         increment_scale = output["projected_log_ai_increment_scale"][0].cpu().numpy().astype(np.float64)
         reflectivity_mean = output["signed_reflectivity_mean"][0].cpu().numpy().astype(np.float64)
         reflectivity_scale = output["signed_reflectivity_scale"][0].cpu().numpy().astype(np.float64)
-        state_log_potential = output["state_log_potential"][0].cpu().numpy().astype(np.float64)
+        state_fraction = torch.softmax(output["state_logits"], dim=-1)[0].cpu().numpy().astype(np.float64)
 
         increment_mean[~support] = 0.0
         increment_scale[~support] = self.network_config.projected_log_ai_increment_scale
         reflectivity_mean[~support] = 0.0
         reflectivity_scale[~support] = self.network_config.signed_reflectivity_scale
-        state_log_potential[~support] = -np.log(3.0)
+        state_fraction[~support] = 1.0 / 3.0
         tuning[~support] = tile.model_axis.sample_interval
         background = anchor.model.copy()
         background[~support] = 0.0
-        return ObservableEvidence(
+        return BandlimitedEvidence(
             model_axis=tile.model_axis,
             highres_axis=tile.highres_axis,
             background_lfm_linear=background,
@@ -106,7 +106,7 @@ class ConditionalGenerator:
             projected_log_ai_increment_scale=increment_scale,
             signed_reflectivity_mean=reflectivity_mean,
             signed_reflectivity_scale=reflectivity_scale,
-            state_log_potential=state_log_potential,
+            state_fraction=state_fraction,
             local_tuning_scale=tuning,
             support=support,
             highres_support=anchor.highres_support,

@@ -67,19 +67,33 @@ def build_lfm_anchor(tile: ObservationTile) -> LfmAnchor:
             & (model_axis >= top)
             & (model_axis <= bottom)
         )
-        if np.count_nonzero(inside) < 2:
+        valid_sample_count = int(np.count_nonzero(inside))
+        if valid_sample_count == 0:
             raise InputContractError(
-                f"trace {trace} has fewer than two valid LFM samples inside the zone."
+                f"{tile.identity}: trace {trace} has {valid_sample_count} valid "
+                f"model-grid LFM samples inside zone [{top:.6g}, {bottom:.6g}]."
             )
         coordinate = _zone_coordinate(model_axis[inside], top, bottom)
-        design = np.column_stack((np.ones(coordinate.size), coordinate))
-        coefficients, _, rank, _ = np.linalg.lstsq(
-            design,
-            tile.lfm[trace, inside],
-            rcond=None,
-        )
-        if rank != 2 or np.any(~np.isfinite(coefficients)):
-            raise InputContractError(f"trace {trace} LFM anchor is rank deficient.")
+        if valid_sample_count == 1:
+            coefficients = np.asarray(
+                (float(tile.lfm[trace, inside][0]), 0.0),
+                dtype=np.float64,
+            )
+        else:
+            design = np.column_stack((np.ones(coordinate.size), coordinate))
+            coefficients, _, rank, _ = np.linalg.lstsq(
+                design,
+                tile.lfm[trace, inside],
+                rcond=None,
+            )
+            if rank != 2 or np.any(~np.isfinite(coefficients)):
+                raise InputContractError(
+                    f"{tile.identity}: trace {trace} LFM anchor is rank deficient."
+                )
+        if np.any(~np.isfinite(coefficients)):
+            raise InputContractError(
+                f"{tile.identity}: trace {trace} LFM anchor is non-finite."
+            )
         intercept[trace], slope[trace] = coefficients
         model_coordinate = _zone_coordinate(model_axis, top, bottom)
         high_coordinate = _zone_coordinate(highres_axis, top, bottom)

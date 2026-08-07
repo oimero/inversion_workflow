@@ -30,9 +30,7 @@ def forward_diagnostic(
 ) -> Mapping[str, float]:
     """Evaluate a selected result without training or changing its ranking."""
 
-    representative = prediction.representative.get("projected_log_ai")
-    if representative is None:
-        raise ValueError("representative result has no projected_log_ai field.")
+    representative = prediction.representative.model_log_ai
     predicted = np.asarray(forward(np.asarray(representative)), dtype=np.float64)
     observed = np.asarray(observed_seismic, dtype=np.float64)
     valid = np.asarray(support, dtype=bool)

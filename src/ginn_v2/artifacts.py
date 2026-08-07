@@ -13,6 +13,7 @@ import torch
 from cup.synthetic.readers.structured import StructuredSyntheticBenchmark
 from cup.synthetic.core.prior import ProducerPrior, load_producer_prior
 from cup.synthetic.schemas import BENCHMARK_SCHEMA_VERSION, STRUCTURED_ARTIFACT_VERSION
+from cup.physics.numpy_backend import velocity_from_ai
 
 from ginn_v2.contracts import EventTrackTruth, InputContractError, ObservationTile
 
@@ -38,6 +39,7 @@ class StructuredTrainingTile:
     model_log_ai: np.ndarray
     log_ai_highres: np.ndarray
     truth_valid_highres: np.ndarray
+    object_id_highres: np.ndarray
     state_fraction_model: np.ndarray
     boundary_fraction_model: np.ndarray
     categorical_valid_model: np.ndarray
@@ -45,6 +47,7 @@ class StructuredTrainingTile:
     projection_collapse_mask_model: np.ndarray
     model_zone_support: np.ndarray
     highres_zone_support: np.ndarray
+    vp_model_mps: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         model_shape = self.observation.seismic.shape
@@ -74,7 +77,12 @@ class StructuredTrainingTile:
         state_fraction = np.asarray(self.state_fraction_model, dtype=np.float64)
         if state_fraction.shape != model_shape + (3,):
             raise InputContractError("state_fraction_model must be [lateral, sample, 3].")
-        for name in ("log_ai_highres", "truth_valid_highres", "highres_zone_support"):
+        for name in (
+            "log_ai_highres",
+            "truth_valid_highres",
+            "object_id_highres",
+            "highres_zone_support",
+        ):
             parsed = np.asarray(getattr(self, name))
             if parsed.shape != highres_shape:
                 raise InputContractError(f"{name} shape differs from the high-resolution grid.")
@@ -84,6 +92,18 @@ class StructuredTrainingTile:
         if any(track.presence.size != self.observation.width for track in self.event_tracks):
             raise InputContractError("event-track width differs from the observation tile.")
         object.__setattr__(self, "state_fraction_model", state_fraction)
+        if self.observation.sample_domain == "depth":
+            if self.vp_model_mps is None:
+                raise InputContractError("depth training tiles require model-grid Vp.")
+            velocity = np.asarray(self.vp_model_mps, dtype=np.float64)
+            if velocity.shape != model_shape or np.any(
+                self.observation.observed_valid
+                & (~np.isfinite(velocity) | (velocity <= 0.0))
+            ):
+                raise InputContractError("depth training-tile Vp is invalid.")
+            object.__setattr__(self, "vp_model_mps", velocity)
+        elif self.vp_model_mps is not None:
+            raise InputContractError("time training tiles cannot carry model-grid Vp.")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -189,6 +209,17 @@ def parent_observation_tiles(corpus: Corpus, parent_id: str) -> tuple[Observatio
 
 def _event_tracks(parent: Any, zone_id: str) -> tuple[EventTrackTruth, ...]:
     rows = [row for row in parent.segments if str(row["zone_id"]) == zone_id]
+    zone_values = {int(row["zone_grid_value"]) for row in rows}
+    if len(zone_values) != 1:
+        raise InputContractError("producer zone rows have ambiguous grid identity.")
+    zone_value = zone_values.pop()
+    zone_support = (
+        (np.asarray(parent.zone_id_highres) == zone_value)
+        & np.asarray(parent.truth_valid_highres, dtype=bool)
+    )
+    object_id_highres = np.asarray(parent.object_id_highres)
+    if object_id_highres.shape != zone_support.shape:
+        raise InputContractError("producer object and zone high-resolution grids differ.")
     event_ids = sorted({int(row["object_id"]) for row in rows})
     if not event_ids:
         raise InputContractError(f"zone {zone_id!r} has no producer events.")
@@ -208,14 +239,27 @@ def _event_tracks(parent: Any, zone_id: str) -> tuple[EventTrackTruth, ...]:
             name: np.full((width, 3), np.nan, dtype=np.float64)
             for name in ("raw", "projected", "effective")
         }
+        seen_rows: set[int] = set()
         for row in selected:
             trace = int(row["lateral_index"])
-            if trace < 0 or trace >= width or presence[trace]:
+            if trace < 0 or trace >= width or trace in seen_rows:
                 raise InputContractError("producer event has duplicate or invalid lateral rows.")
+            seen_rows.add(trace)
+            event_support = zone_support[trace] & (object_id_highres[trace] == event_id)
+            event_samples = int(np.count_nonzero(event_support))
+            if event_samples == 0:
+                if int(row.get("duration_samples", 0)) != 0:
+                    raise InputContractError(
+                        "zero-sample producer event disagrees with duration_samples."
+                    )
+                continue
+            zone_samples = int(np.count_nonzero(zone_support[trace]))
+            if zone_samples <= 0:
+                raise InputContractError("producer event is present outside zone support.")
             presence[trace] = True
             top[trace] = float(row["top"])
             bottom[trace] = float(row["bottom"])
-            duration[trace] = float(row["duration_fraction"])
+            duration[trace] = event_samples / zone_samples
             supervision[trace] = bool(row["segment_supervision_valid"])
             for name in coefficients:
                 coefficients[name][trace] = [
@@ -223,6 +267,13 @@ def _event_tracks(parent: Any, zone_id: str) -> tuple[EventTrackTruth, ...]:
                     float(row[f"c1_{name}"]),
                     float(row[f"c2_{name}"]),
                 ]
+        raster_presence = np.any(
+            zone_support & (object_id_highres == event_id), axis=1
+        )
+        if not np.array_equal(presence, raster_presence):
+            raise InputContractError(
+                "producer catalog and high-resolution event presence differ."
+            )
         tracks.append(
             EventTrackTruth(
                 zone_id=zone_id,
@@ -248,14 +299,21 @@ def _event_tracks(parent: Any, zone_id: str) -> tuple[EventTrackTruth, ...]:
         & ~np.isclose(np.sum(duration_stack, axis=0), 1.0, rtol=0.0, atol=1.0e-6)
     ):
         raise InputContractError("producer event durations do not fill their zone.")
-    tolerance = max(float(parent.highres_axis.sample_interval) * 1.0e-6, 1.0e-9)
     for trace in range(width):
-        present = [track for track in tracks if track.presence[trace]]
-        for previous, current in zip(present, present[1:], strict=False):
-            if not np.isclose(
-                previous.bottom[trace], current.top[trace], rtol=0.0, atol=tolerance
-            ):
-                raise InputContractError("producer event tracks are not vertically contiguous.")
+        grid_ids = object_id_highres[trace, zone_support[trace]].astype(np.int64)
+        if grid_ids.size == 0:
+            continue
+        if np.any(grid_ids < 0):
+            raise InputContractError("producer events do not cover high-resolution zone support.")
+        event_order = {track.event_id: index for index, track in enumerate(tracks)}
+        try:
+            ordered = np.asarray([event_order[int(item)] for item in grid_ids])
+        except KeyError as error:
+            raise InputContractError(
+                "high-resolution event identity is absent from the producer catalog."
+            ) from error
+        if np.any(np.diff(ordered) < 0):
+            raise InputContractError("producer event order reverses on the high-resolution grid.")
     return tuple(tracks)
 
 
@@ -266,6 +324,20 @@ def parent_training_tiles(
     """Read one parent through the complete Stage-0 training seam."""
 
     parent = corpus.benchmark.read_parent(parent_id)
+    if parent.sample_domain == "depth":
+        relation = parent.forward_context.get("ai_velocity_relation")
+        if not isinstance(relation, Mapping):
+            raise InputContractError("depth parent lacks its AI-Vp relation.")
+        lfm = np.asarray(parent.lfm, dtype=np.float64)
+        finite_lfm = np.isfinite(lfm)
+        vp_model_mps = np.full(lfm.shape, np.nan, dtype=np.float64)
+        vp_model_mps[finite_lfm] = velocity_from_ai(
+            np.exp(lfm[finite_lfm]),
+            a=float(relation["a"]),
+            b=float(relation["b"]),
+        )
+    else:
+        vp_model_mps = None
     observations = _observation_tiles(parent)
     zone_rows = {str(row["zone_id"]): int(row["zone_grid_value"]) for row in parent.zones}
     results: list[StructuredTrainingTile] = []
@@ -281,6 +353,7 @@ def parent_training_tiles(
                 model_log_ai=parent.model_log_ai,
                 log_ai_highres=parent.log_ai_highres,
                 truth_valid_highres=parent.truth_valid_highres,
+                object_id_highres=parent.object_id_highres,
                 state_fraction_model=parent.state_fraction_model,
                 boundary_fraction_model=parent.boundary_fraction_model,
                 categorical_valid_model=parent.categorical_valid_model,
@@ -288,6 +361,7 @@ def parent_training_tiles(
                 projection_collapse_mask_model=parent.projection_collapse_mask_model,
                 model_zone_support=model_zone & parent.observed_valid,
                 highres_zone_support=highres_zone & parent.truth_valid_highres,
+                vp_model_mps=vp_model_mps,
             )
         )
     return tuple(results)
@@ -299,6 +373,7 @@ def save_checkpoint(
     model_state: Mapping[str, Any],
     model_config: Mapping[str, Any],
     metadata: Mapping[str, Any],
+    training_state: Mapping[str, Any] | None = None,
     overwrite: bool = False,
 ) -> Path:
     """Publish one current-format checkpoint without upstream fingerprint gates."""
@@ -313,6 +388,8 @@ def save_checkpoint(
         "model_state": dict(model_state),
         "metadata": dict(metadata),
     }
+    if training_state is not None:
+        payload["training_state"] = dict(training_state)
     temporary = target.with_suffix(target.suffix + ".staging")
     torch.save(payload, temporary)
     temporary.replace(target)
@@ -324,7 +401,7 @@ def load_checkpoint(path: str | Path) -> dict[str, Any]:
 
     payload = torch.load(Path(path), map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or payload.get("schema") != CHECKPOINT_SCHEMA:
-        raise InputContractError("checkpoint does not use the current V2 schema.")
+        raise InputContractError("checkpoint does not use the current schema.")
     for name in ("model_config", "model_state", "metadata"):
         if name not in payload:
             raise InputContractError(f"checkpoint lacks {name}.")

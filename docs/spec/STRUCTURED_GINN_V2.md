@@ -191,6 +191,11 @@ BandlimitedEvidence
 证据网络的 hidden feature 不属于生成器的隐式捷径。结构生成器只消费已发布的
 `BandlimitedEvidence`，从而可以独立审计“网络看见了什么”和“先验补了什么”。
 
+`background_lfm_linear` 按道、按已知 zone 拟合。zone 内有至少两个有效 model-grid LFM
+样点时使用离散线性最小二乘；合法薄 zone 只有一个有效样点时使用显式 singleton 合同：
+截距取该样点值、斜率固定为零，再展开到 high-resolution support。有效 zone 没有任何
+model-grid LFM 样点时合同失败。singleton 表示斜率不可识别，不从 zone 外样点或邻道猜测趋势。
+
 ### 3.4 ProducerPrior
 
 `ProducerPrior` 是 Synthoseis-lite producer 与 GINN 生成器共享的单一版本化合同：
@@ -265,7 +270,7 @@ StructuredEnsemble
 - 2400 个 25 道 short-patch parents；
 - 训练、调参与 calibration 分别为 1680、360、360；
 - none、wedge、pinchout 在每个 split 内均衡；
-- 47 个 full-section parents，仅用于最终横向门禁；
+- 48 个 full-section parents，仅用于最终横向门禁；
 - 其中 24 个 IID sections，23 个 combination holdout sections；
 - 每个 parent 内 `(zone_id, object_id)` 是稳定的 high-resolution event identity；
 - artifact 只有一套 canonical HDF5、索引和 manifest；
@@ -277,7 +282,7 @@ mask 与边缘行为。full sections 不参加参数训练、模型选择或不�
 样本量只按独立 parent 报告，不把同一 parent 派生的 25 道或 dirty views 计成新的独立样本。
 阶段 1 在固定模型与训练预算下发布 420、840、1680 training parents 的学习曲线。只有验证
 误差仍随 parent 数稳定下降，且失败不能由模型容量或标签退化解释时，才扩充 synthetic
-corpus；47 个 full sections 不转入训练集。
+corpus；48 个 full sections 不转入训练集。
 
 V3 由 producer 直接发布 model-grid categorical targets、projection-collapse diagnostics 和
 `ProducerPrior`。旧 V2 artifact 缺少这些发布合同，不进入新训练链。
@@ -297,6 +302,12 @@ hidden_transition_count
 
 GINN reader 只接受 V3，并直接读取、校验 producer 发布的 categorical projection 与
 `ProducerPrior`。categorical projection 的唯一实现在 `cup.synthetic`。
+
+EventTrack 的离散 `presence` 由 `object_id_highres` 的实际占据决定。catalog 中仍有物理厚度、
+但在当前 high-resolution axis 上为零样本的行，表示该 event 在该 lateral location 的
+pinchout/absence；该位置的 duration 为零且不携带 coefficient supervision。非零 event 的
+duration 使用其 high-resolution sample count 占 zone sample count 的比例，因此每道严格形成
+duration simplex。catalog identity 仍负责维持跨道全局事件身份。
 
 ### 4.3 时深对称
 
@@ -366,6 +377,18 @@ V3 全量 corpus 发布后冻结 prior、target 与 split manifest；后续阶�
 preflight 是 `train_generator()` 的固定前置步骤，不建立另一套长期诊断旁路。失败时在训练前
 停止，而不是训练数小时后再解释 head 为什么没有信息。
 
+当前实现通过统一命令发布 `target_preflight_report.json`。报告固定包含：
+
+- 按 none、wedge、pinchout 轮转抽取的 training parents；
+- increment、signed reflectivity、soft state fraction 和 projection-collapse 的标签统计；
+- clean、dirty、peak-poor 三种观测视图的 target identity 检查；
+- training mean、zone-linear anchor、full LFM 和局部垂向滤波 baseline；
+- held-out parent 上的 matched seismic donor 干预；
+- 同一 mini-corpus 上 full 与 no-seismic 网络的固定步数过拟合。
+
+正式训练只读取 `status=passed` 的报告。预检报告记录诊断数值，不保存模型 checkpoint，也不
+改变 canonical corpus 或标签定义。
+
 ### 6.2 模型
 
 证据网络读取完整 short patch，并为所有有效道输出带限证据。模型由：
@@ -379,7 +402,19 @@ preflight 是 `train_generator()` 的固定前置步骤，不建立另一套长�
 
 - full：seismic + full LFM；
 - no-seismic：full LFM；
-- single-trace：中心道 seismic + full LFM。
+- single-trace：逐道 seismic + full LFM，不进行 lateral mixing。
+
+训练从已通过的 `target_preflight_report.json` 进入，按 parent 原子读取 training/tuning split。
+当前第一档学习曲线使用 420 个 training parents 和 120 个 tuning parents；三种模式共享 parent、
+随机种子、损失权重、epoch 和观测扰动预算。每个 epoch 原子更新：
+
+- `last.pt`：当前网络与 optimizer 状态；
+- `best.pt`：clean/dirty tuning 平均 loss 最低的 checkpoint；
+- `training_report.json`：逐 epoch train、clean、dirty、peak-poor 指标和选择依据。
+
+独立 evaluator 从冻结 checkpoint 运行 clean、dirty、peak-poor；含 seismic 的模型同时运行同 zone、
+跨 parent 的 matched seismic donor 干预。指标包括 increment/reflectivity RMSE、相关性和 scale
+coverage，以及 state-fraction Brier score 和 cross entropy。
 
 训练目标只作用于带限量：
 
@@ -407,7 +442,9 @@ exact micro-boundary、event count 和单个 profile coefficient 作为后续结
 - full 相对 full-LFM 与 zone-linear anchor 具有 AI 增量价值；
 - full 的 state-fraction proper score 优于 no-seismic；
 - matched center-seismic shuffle 和 parent shuffle 破坏地震收益；
-- neighbor shuffle 破坏 lateral model 相对 single-trace 的收益；
+- full 与 single-trace 固定比较横向证据的边际收益；当前 V3 short patches 的邻道证据高度
+  冗余时，二者近似等价记录为 evidence-level lateral contribution 不可识别，不阻塞
+  EventTrack 阶段；最终横向连续性由共享事件轨道门禁负责；
 - dirty 与 peak-poor 输入增加合理 uncertainty，不制造系统性虚假反射；
 - evidence 输出在 projection-collapse 与普通样本上分别报告；
 - calibration split 冻结 scale/temperature，full sections 不参与调参。
@@ -432,9 +469,12 @@ ProducerPrior renewal/duration process
 → high-resolution section
 ```
 
-事件数量由 zone-fraction duration/renewal process 自然产生。模型不设置“一个波峰对应几个
-事件”的 head，也不使用可见峰数作为 stop condition。地震 evidence 只能通过冻结范围内的
-条件 potential 调整 prior，弱 evidence 下回归 ProducerPrior。
+decoder 沿 zone-fraction 累计坐标逐事件展开 renewal。每一步根据当前累计顶界面和 prior
+duration 形成查询位置，将 zone 内坐标严格映射到完整 model axis 后读取局部
+`BandlimitedEvidence`，再输出 state potential、横向 presence、duration 和 profile 条件量。
+事件数由所有有效道是否铺满 zone 决定；`maximum_events` 只是防止非法展开的容量上限。
+地震 evidence 只能通过冻结范围内的条件 potential 调整 prior，弱 evidence 下回归
+`ProducerPrior`。
 
 event state 遵守 producer transition。第一版不采样独立同状态续生。projection collapse 通过
 隐藏的异状态中间事件表达，而不是生成两个相邻同状态段。
@@ -444,8 +484,8 @@ duration 和 profile 是 event-level 横向场。其随机性以 event identity 
 
 ### 7.2 训练
 
-EventTrack truth 直接来自 high-resolution object catalog，训练使用 teacher forcing 和逐步减少
-teacher forcing 的课程：
+EventTrack truth 直接来自 high-resolution object catalog。训练从 truth-conditioned query
+逐 epoch 过渡到 soft self-conditioned query，模型选择后使用完整 deterministic rollout 评价：
 
 - ordered event/state likelihood；
 - lateral presence、birth/death 与 topology；
@@ -455,9 +495,37 @@ teacher forcing 的课程：
 - 所有 event 的 decoded-profile loss；
 - rasterized high-resolution reconstruction；
 - projected/tuning-scale consistency with BandlimitedEvidence。
+- predicted cumulative boundary 与 truth cumulative boundary 的 zone-fraction 误差；
+- truth event budget 结束时的 renewal fill error，用于约束整体细分密度。
 
 短段或病态 basis 不进入单系数门禁。它们通过 decoded profile 与 ensemble coverage 监督。
 梯度不需要穿过离散代表解选择。
+
+self-conditioning fraction 从 0.25 线性增加到 0.75。上一事件 state 使用 truth one-hot 与模型
+hard state 的确定性混合，累计坐标使用 truth center 与模型累计 duration 的确定性混合；hard
+state 采用 straight-through gradient。训练和 tuning 不使用随机 scheduled sampling，因此结果不
+依赖 batch 执行顺序。tuning 始终使用 0.75，保证各 epoch 的模型选择目标一致。
+
+训练 loss 同时优化局部 duration 和累计边界。renewal fill loss 直接检查：在 truth event 数量
+下，模型的 hard-state duration 是否已经铺满 zone。该约束调整 duration/renewal rate，不设置
+可见波峰到 event count 的回归 head。
+
+state potential 叠加在 producer initial/transition probability 上；duration 与 profile 以当前
+renewal event 为单位同时预测全部 lateral traces。横向 presence 在 deterministic rollout 中
+保持单个连续 extent，duration 累计后形成不交叉边界。
+
+训练入口在 epoch 前完成以下快速检查：
+
+- 扫描本次 training/tuning parents 的 event count，确保 renewal 展开容量充分；
+- 将 producer event profile 离散精确换基到 `background_lfm_linear`；
+- 以离散 high-resolution sample fraction 形成 duration target；
+- 用同一 rasterizer 重建 high-resolution/model-grid truth，并发布最大 round-trip error；
+- 报告 short patch 中 partial-presence track 数量，避免把未出现的 topology supervision
+  误写成已经学习。
+
+训练固定读取冻结 full evidence checkpoint。每个 epoch 原子发布 `last.pt`、`best.pt` 和
+`event_training_report.json`；checkpoint 保存 evidence provenance，但 consumer 不执行 SHA
+equality gate。
 
 ### 7.3 横向连续性合同
 
@@ -487,14 +555,17 @@ topology mask。横向门禁必须同时通过数值与图件审查。
 
 - truth EventTracks 经同一 rasterizer 完整闭环；
 - 固定 mini-corpus 可以过拟合 event identity、duration 和 profile；
-- deterministic/MAP 结果优于 prior-only EventTracks；
+- deterministic/MAP projected log-AI 优于 prior-only EventTracks；
+- deterministic/MAP 相对 `BandlimitedEvidence` 的 projected log-AI 退化作为单成员诊断；
 - full 相对 no-seismic 改善 projected AI 与可识别 event/profile 指标；
 - lateral model 相对 single-trace 改善 event survival 与 thickness/profile continuity；
 - wedge/pinchout 不增加 false bridging；
 - peak-poor 输入不造成 event count 系统性坍缩；
 - weak evidence 区域的结果回归 prior，而不是输出重复的确定性微段。
 
-deterministic 门禁通过后，才实现 K-member sampling。
+deterministic rollout 用于验证 EventTrack 合法性、prior/evidence 贡献和单成员失效模式。
+单个 MAP member 与带限 evidence mean 之间存在结构化离散化误差，因此最终 evidence-preservation
+门禁同时在 K-member representative 和 ensemble summary 上评价。
 
 ## 8. 阶段 3：联合 ensemble 与 full-section 合成门禁
 
@@ -515,8 +586,19 @@ sample ordered events once per zone
 执行顺序和 GPU batch 不改变结果。每个 member 都必须满足 EventField、axis、support、duration
 和 topology 合同。
 
-representative 以完整 section 的冻结 joint conditional score 从 K 个 member 中选择。ensemble
-mean 只作为统计摘要。
+状态从 ProducerPrior transition 与 bounded evidence potential 的条件 categorical 中采样。
+duration 和 profile 使用物理 XY 坐标上的 coordinate-stable random Fourier field；相关尺度使用
+`lateral_correlation_m`。log-duration 采样包含解析 lognormal 均值修正，避免随机扰动本身改变
+事件密度。每道 present event 的 duration 下限为一个 high-resolution sample 占当前 zone support
+的比例，保证连续 duration realization 能在离散时深网格上合法实现。`event_density_multiplier`
+是显式的地质密度控制量，默认值 1.0 对应 producer-calibrated
+密度。`structure_sampling_temperature` 只控制 state、presence 和 duration 的结构随机性；
+`profile_sampling_temperature` 只控制固定结构上的三参数 profile 离散度。结构温度在当前
+calibration 中冻结为 0.65，profile 温度由 calibration split 调整。
+
+representative 的候选集合先限制在 event count 距 ensemble 中位数最近的一半完整 members，
+再按完整 section 的 bandlimited-evidence score 选择。该规则让 ProducerPrior 控制可接受的细分
+密度，并阻止高密度尾部仅靠增加界面数碰撞地震证据。ensemble mean 只作为统计摘要。
 
 ### 8.2 不确定性与证据归因
 
@@ -528,6 +610,15 @@ calibration split 冻结：
 - high-resolution/projected coverage；
 - full 与 no-seismic 的 paired sensitivity threshold。
 
+generation policy 使用两遍小预算校准。第一遍固定结构温度和基准 profile 温度，以
+event-count mean bias、MAE、projected CRPS 的词典序选择 `event_density_multiplier`；第二遍
+固定密度与结构温度，以 projected CRPS、high-resolution CRPS、90% coverage 偏差的词典序
+选择 `profile_sampling_temperature`。CRPS 是正式选择依据，coverage 用于识别欠覆盖及误差来源，
+不通过无界放大 profile variance 强行追平名义覆盖率。候选共享 parent 集合与 random identity。
+第二遍各候选的 ensemble event-count mean bias 必须完全一致，用于验证 profile dispersion
+没有反向改变事件密度。校准发布独立
+`event_generation_policy.json`，后续 evaluator 和真实推理只读取该 artifact。
+
 输出使用两个独立诊断量：
 
 - `seismic_conditioning_sensitivity`：full 与 matched/no-seismic 条件结果的差异；
@@ -538,7 +629,10 @@ ensemble 不确定性和带限不可区分性。
 
 ### 8.3 Full-section 门禁
 
-calibration 完成后只运行一次当前 47-parent full-section benchmark。检查：
+calibration 完成后只运行一次当前 48-parent full-section benchmark。检查：
+
+- 生成开始前扫描全部 section tiles 的 LFM anchor、singleton 数量和逐道 high-resolution
+  sample capacity，静态输入合同在 K-member 长任务前一次性失败；
 
 - K members 和 representative 都具有连续 event identity；
 - ensemble mean 的平滑不掩盖 member 跳变；
@@ -663,7 +757,6 @@ member identity 重生成代表解。chunk 顺序不改变结果。
 
 当前已经完成：
 
-- canonical corpus V2 的科学审计：2400 个 short patches 和 47 个 full sections；
 - producer Oracle、decoder/projection parity 与 time/depth smoke；
 - SHA consumer gate 清理；
 - `src/ginn_v2` 历史实验链清理，包收敛为 10 个深模块；
@@ -675,12 +768,39 @@ member identity 重生成代表解。chunk 顺序不改变结果。
 - 由 calibration 和 producer 配置发布的零对角线 `ProducerPrior`；
 - high-resolution object catalog 到有序 EventTrack truth 的单一 reader；
 - 公开 `BandlimitedEvidence`、soft state-fraction target 和 clean/dirty/peak-poor 配对 fixture。
+- canonical corpus V3：2400 个 short patches、48 个 section-gate parents、冻结
+  `ProducerPrior` 和 projection-collapse 合同；
+- 阶段 1 target preflight 的统一入口、标签分布审计、简单 baseline、matched seismic donor
+  干预和 fixed mini-corpus overfit。
+- BandlimitedEvidence 的 parent-atomic training/evaluation 接口、full/no-seismic/single-trace 模式、
+  clean/dirty/peak-poor 配对、逐 epoch best/last checkpoint 和统一指标报告。
+- 第一档 420-parent evidence 结果：full 在 tuning clean 上的 increment correlation 为 0.749，
+  matched seismic shuffle 后降至 0.013；no-seismic 为 0.151，确认地震提供显著带限增量。
+- full 与 single-trace 的 clean/dirty/peak-poor 指标近似等价；当前 short-patch corpus 中
+  evidence lateral mixer 的边际贡献不可识别，最终横向连续性转由 EventTrack 表示承担。
+- deterministic EventTrack 的累计坐标 autoregressive renewal network、ProducerPrior
+  state/duration/profile base potential、LFM-relative discrete rebasing、teacher-forced loss、
+  完整 MAP rollout、prior/evidence/anchor baselines 与 checkpoint publication 已通过接口 smoke；
+- self-conditioned checkpoint 在 tuning clean 上得到 event-count bias 0.23、projected log-AI
+  RMSE 0.10077；evidence-balanced checkpoint 得到 event-count bias 3.58、projected log-AI
+  RMSE 0.09576，并优于 anchor/prior，但两者均未满足单成员 evidence-gap 0.02；
+- K-member sampling、coordinate-stable 横向随机场、显式 density/temperature policy、ensemble
+  summary、密度约束 representative 和统一 evaluator 已通过接口 smoke；
+- tuning K=16 的 representative projected RMSE 为 0.09441，优于 anchor/prior；ensemble mean
+  projected RMSE 为 0.08399，相对 evidence 的退化为 0.01952，通过 0.02 带限门禁。90% coverage
+  约为 70%，event-count mean bias 为 +3.77，因此进入 generation-policy calibration；
+- 第一版单温度 calibration 证明同一温度会同时改变事件密度和 profile coverage：温度从 0.5
+  增至 0.8 时 coverage 上升，但 event-count bias 同时由 -1.83 变为 +2.34，且 0.8 位于候选网格
+  上界。双温度校准确认 profile 温度不改变 event count；正式 12-parent 结果中，profile 温度由
+  0.5 增至 2.0 时 projected coverage 从 0.637 增至 0.825，但 projected CRPS 从 0.05348 恶化至
+  0.05729，ensemble evidence gap 也从 0.02139 增至 0.02737。当前 policy schema v3 因此固定以
+  proper score 选择 profile 温度，并把 coverage 未达标解释为仍含结构/均值误差。
 
-当前需要先发布新的 canonical V3 corpus。随后实施新的 section-level EventField generator，
-顺序固定为：
+当前顺序固定为：
 
 ```text
 ProducerPrior + projection-collapse contract
+→ target_preflight_report.json
 → BandlimitedEvidence 正式训练与 controls
 → deterministic EventTrack generator
 → K-member section ensemble
@@ -688,5 +808,102 @@ ProducerPrior + projection-collapse contract
 → 2D EventSurface / full volume
 ```
 
-Synthoseis-lite 必须重跑一次以发布 canonical corpus V3。重跑的原因是 producer 发布合同升级，
-而不是拒绝 model-grid 投影塌缩样本；这些样本在 V3 中继续保留并得到显式诊断。
+阶段 1 target preflight 的正式命令为：
+
+```powershell
+python scripts\structured_ginn_v2.py `
+  --config experiments\ginn_v2\ginn_v2.yaml `
+  target-preflight `
+  --corpus experiments\synthoseis_lite\results\20260806_structured_v3\generate_field_conditioned `
+  --output-dir experiments\ginn_v2\results\20260806_stage1_target_preflight
+```
+
+第一档 full model 训练与评估命令为：
+
+```powershell
+python scripts\structured_ginn_v2.py `
+  --config experiments\ginn_v2\ginn_v2.yaml `
+  train `
+  --corpus experiments\synthoseis_lite\results\20260806_structured_v3\generate_field_conditioned `
+  --preflight-report experiments\ginn_v2\results\20260806_stage1_target_preflight\target_preflight_report.json `
+  --output-dir experiments\ginn_v2\results\20260806_stage1_evidence_full_420 `
+  --input-mode full
+
+python scripts\structured_ginn_v2.py `
+  --config experiments\ginn_v2\ginn_v2.yaml `
+  evaluate `
+  --corpus experiments\synthoseis_lite\results\20260806_structured_v3\generate_field_conditioned `
+  --checkpoint experiments\ginn_v2\results\20260806_stage1_evidence_full_420\best.pt `
+  --output-dir experiments\ginn_v2\results\20260806_stage1_evidence_full_420_tuning `
+  --split tuning
+```
+
+阶段 2 deterministic EventTrack 的正式训练与评估命令为：
+
+```powershell
+python scripts\structured_ginn_v2.py `
+  --config experiments\ginn_v2\ginn_v2.yaml `
+  train-events `
+  --corpus experiments\synthoseis_lite\results\20260806_structured_v3\generate_field_conditioned `
+  --evidence-checkpoint experiments\ginn_v2\results\20260806_stage1_evidence_full_420\best.pt `
+  --initial-checkpoint experiments\ginn_v2\results\20260807_stage2_event_tracks_self_conditioned_120\best.pt `
+  --output-dir experiments\ginn_v2\results\20260807_stage2_event_tracks_evidence_balanced_120
+
+python scripts\structured_ginn_v2.py `
+  --config experiments\ginn_v2\ginn_v2.yaml `
+  evaluate-events `
+  --corpus experiments\synthoseis_lite\results\20260806_structured_v3\generate_field_conditioned `
+  --evidence-checkpoint experiments\ginn_v2\results\20260806_stage1_evidence_full_420\best.pt `
+  --event-checkpoint experiments\ginn_v2\results\20260807_stage2_event_tracks_evidence_balanced_120\best.pt `
+  --output-dir experiments\ginn_v2\results\20260807_stage2_event_tracks_evidence_balanced_120_tuning `
+  --split tuning
+```
+
+阶段 3 的 K-member tuning 评估复用同一个 evaluator：
+
+```powershell
+python scripts\structured_ginn_v2.py `
+  --config experiments\ginn_v2\ginn_v2.yaml `
+  evaluate-events `
+  --corpus experiments\synthoseis_lite\results\20260806_structured_v3\generate_field_conditioned `
+  --evidence-checkpoint experiments\ginn_v2\results\20260806_stage1_evidence_full_420\best.pt `
+  --event-checkpoint experiments\ginn_v2\results\20260807_stage2_event_tracks_evidence_balanced_120\best.pt `
+  --output-dir experiments\ginn_v2\results\20260807_stage3_event_ensemble_k16_tuning `
+  --split tuning `
+  --realization-count 16
+```
+
+generation policy calibration、完整 calibration 复核和 section gate 命令为：
+
+```powershell
+python scripts\structured_ginn_v2.py `
+  --config experiments\ginn_v2\ginn_v2.yaml `
+  calibrate-events `
+  --corpus experiments\synthoseis_lite\results\20260806_structured_v3\generate_field_conditioned `
+  --evidence-checkpoint experiments\ginn_v2\results\20260806_stage1_evidence_full_420\best.pt `
+  --event-checkpoint experiments\ginn_v2\results\20260807_stage2_event_tracks_evidence_balanced_120\best.pt `
+  --reuse-candidates-from experiments\ginn_v2\results\20260807_stage3_event_policy_calibration_split\event_policy_calibration_report.json `
+  --output-dir experiments\ginn_v2\results\20260807_stage3_event_policy_crps_selected
+
+python scripts\structured_ginn_v2.py `
+  --config experiments\ginn_v2\ginn_v2.yaml `
+  evaluate-events `
+  --corpus experiments\synthoseis_lite\results\20260806_structured_v3\generate_field_conditioned `
+  --evidence-checkpoint experiments\ginn_v2\results\20260806_stage1_evidence_full_420\best.pt `
+  --event-checkpoint experiments\ginn_v2\results\20260807_stage2_event_tracks_evidence_balanced_120\best.pt `
+  --generation-policy experiments\ginn_v2\results\20260807_stage3_event_policy_crps_selected\event_generation_policy.json `
+  --output-dir experiments\ginn_v2\results\20260807_stage3_event_ensemble_k16_calibration `
+  --split calibration `
+  --parent-count 60
+
+python scripts\structured_ginn_v2.py `
+  --config experiments\ginn_v2\ginn_v2.yaml `
+  evaluate-events `
+  --corpus experiments\synthoseis_lite\results\20260806_structured_v3\generate_field_conditioned `
+  --evidence-checkpoint experiments\ginn_v2\results\20260806_stage1_evidence_full_420\best.pt `
+  --event-checkpoint experiments\ginn_v2\results\20260807_stage2_event_tracks_evidence_balanced_120\best.pt `
+  --generation-policy experiments\ginn_v2\results\20260807_stage3_event_policy_crps_selected\event_generation_policy.json `
+  --output-dir experiments\ginn_v2\results\20260807_stage3_event_ensemble_section_gate `
+  --split section_gate `
+  --parent-count 48
+```

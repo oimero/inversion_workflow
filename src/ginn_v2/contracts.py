@@ -413,6 +413,9 @@ class GenerationPolicy:
     random_identity: int = 0
     retain_realizations: bool = True
     lateral_correlation_m: float = 900.0
+    event_density_multiplier: float = 1.0
+    structure_sampling_temperature: float = 0.65
+    profile_sampling_temperature: float = 0.5
 
     def __post_init__(self) -> None:
         if (
@@ -421,8 +424,72 @@ class GenerationPolicy:
             or self.realization_count <= 0
         ):
             raise InputContractError("realization_count must be a positive integer.")
+        if isinstance(self.random_identity, bool) or not isinstance(
+            self.random_identity, (int, np.integer)
+        ):
+            raise InputContractError("random_identity must be an integer.")
+        if not isinstance(self.retain_realizations, (bool, np.bool_)):
+            raise InputContractError("retain_realizations must be boolean.")
         if not np.isfinite(self.lateral_correlation_m) or self.lateral_correlation_m <= 0.0:
             raise InputContractError("lateral_correlation_m must be finite and positive.")
+        if (
+            not np.isfinite(self.event_density_multiplier)
+            or self.event_density_multiplier <= 0.0
+        ):
+            raise InputContractError(
+                "event_density_multiplier must be finite and positive."
+            )
+        for name in (
+            "structure_sampling_temperature",
+            "profile_sampling_temperature",
+        ):
+            value = getattr(self, name)
+            if not np.isfinite(value) or value <= 0.0:
+                raise InputContractError(f"{name} must be finite and positive.")
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "GenerationPolicy":
+        return cls(**dict(value))
+
+
+@dataclass(frozen=True)
+class EventTrackRealization:
+    """One legal ordered EventTrack system rasterized on both vertical axes."""
+
+    zone_id: str
+    tracks: tuple[EventTrack, ...]
+    log_ai_highres: np.ndarray
+    state_highres: np.ndarray
+    model_log_ai: np.ndarray
+    model_support: np.ndarray
+    identity: str
+
+    def __post_init__(self) -> None:
+        zone_id = str(self.zone_id).strip()
+        identity = str(self.identity).strip()
+        if not zone_id or not identity or not self.tracks:
+            raise InputContractError("event realization requires zone, identity, and tracks.")
+        highres = _array(
+            self.log_ai_highres, dtype=np.float64, ndim=2, name="log_ai_highres"
+        )
+        state = _array(self.state_highres, dtype=np.int8, ndim=2, name="state_highres")
+        model = _array(self.model_log_ai, dtype=np.float64, ndim=2, name="model_log_ai")
+        support = _array(self.model_support, dtype=bool, ndim=2, name="model_support")
+        if state.shape != highres.shape or support.shape != model.shape:
+            raise InputContractError("event realization raster fields have inconsistent shapes.")
+        if any(track.presence.size != highres.shape[0] for track in self.tracks):
+            raise InputContractError("event realization track width differs from its raster.")
+        if np.any(np.isfinite(highres) & ~np.isin(state, (0, 1, 2))):
+            raise InputContractError("finite high-resolution realization samples require a state.")
+        if np.any(support & ~np.isfinite(model)):
+            raise NumericalFailure("supported projected realization samples must be finite.")
+        object.__setattr__(self, "zone_id", zone_id)
+        object.__setattr__(self, "identity", identity)
+        object.__setattr__(self, "tracks", tuple(self.tracks))
+        object.__setattr__(self, "log_ai_highres", highres)
+        object.__setattr__(self, "state_highres", state)
+        object.__setattr__(self, "model_log_ai", model)
+        object.__setattr__(self, "model_support", support)
 
 
 @dataclass(frozen=True)
@@ -430,10 +497,26 @@ class StructuredEnsemble:
     """Complete section result returned by the generator seam."""
 
     evidence: BandlimitedEvidence
-    representative: Mapping[str, Any]
-    realizations: tuple[Mapping[str, Any], ...]
+    representative: EventTrackRealization
+    realizations: tuple[EventTrackRealization, ...]
     summary: Mapping[str, Any]
     diagnostics: Mapping[str, float]
+
+    def __post_init__(self) -> None:
+        realizations = tuple(self.realizations)
+        if realizations and self.representative.identity not in {
+            item.identity for item in realizations
+        }:
+            raise InputContractError(
+                "representative must be one of the retained complete realizations."
+            )
+        summary = dict(self.summary)
+        diagnostics = {str(name): float(value) for name, value in self.diagnostics.items()}
+        if any(not np.isfinite(value) for value in diagnostics.values()):
+            raise NumericalFailure("ensemble diagnostics must be finite.")
+        object.__setattr__(self, "realizations", realizations)
+        object.__setattr__(self, "summary", summary)
+        object.__setattr__(self, "diagnostics", diagnostics)
 
 
 @dataclass(frozen=True)
@@ -454,6 +537,7 @@ __all__ = [
     "BandlimitedEvidence",
     "DomainMismatchError",
     "EventTrack",
+    "EventTrackRealization",
     "EventTrackTruth",
     "GenerationPolicy",
     "InputContractError",

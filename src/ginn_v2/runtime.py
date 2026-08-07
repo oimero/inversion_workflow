@@ -11,12 +11,16 @@ import torch
 from cup.utils.logging import configure_run_logger
 
 
-def configure_training_logger(output_dir: Path) -> logging.Logger:
+def configure_training_logger(
+    output_dir: Path,
+    *,
+    file_name: str = "training.log",
+) -> logging.Logger:
     """Create the logger used by a Structured GINN V2 run."""
     return configure_run_logger(
         Path(output_dir),
         logger_name="ginn_v2",
-        file_name="training.log",
+        file_name=file_name,
     )
 
 

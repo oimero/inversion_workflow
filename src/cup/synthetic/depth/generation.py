@@ -33,7 +33,6 @@ from cup.synthetic.core.pipeline import (
 )
 from cup.synthetic.adapters import DepthSyntheticDomainAdapter
 from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
-from cup.synthetic.core.prior import build_producer_prior
 from cup.synthetic.core.random import RandomNamespace
 from cup.synthetic.core.records import DepthForwardExtras
 from cup.synthetic.core.sample_builder import (
@@ -547,12 +546,6 @@ class DepthGenerationSession:
                 "science_revision": SCIENCE_REVISION,
                 "random_stream_contract_version": RANDOM_STREAM_CONTRACT_VERSION,
             },
-            "producer_prior": build_producer_prior(
-                calibration,
-                object_core_controls=script_cfg["impedance"],
-                geometry_families=script_cfg["generation"]["geometry_families"],
-                geometry_directions=script_cfg["generation"]["geometry_directions"],
-            ).to_mapping(),
         }
         return GenerationSession(
             plan=None,

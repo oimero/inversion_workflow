@@ -95,7 +95,7 @@ def build_corpus_v2_plan(
     budget: CorpusBudget,
 ) -> pd.DataFrame:
     if not short_section_ids or not full_section_ids:
-        raise ValueError("canonical V3 requires short-patch and full-section paths.")
+        raise ValueError("canonical V2 requires short-patch and full-section paths.")
     by_family = {
         family: [
             scenario
@@ -306,7 +306,7 @@ def published_quota_report(
     }
     missing = sorted(required.difference(index.columns))
     if missing:
-        raise ValueError(f"canonical V3 quota index lacks columns: {missing}")
+        raise ValueError(f"canonical V2 quota index lacks columns: {missing}")
     expected = required_quota_counts(budget)
     actual = {bucket: 0 for bucket in expected}
     for row in index.to_dict(orient="records"):
@@ -360,7 +360,7 @@ def validate_published_quota(index: pd.DataFrame, budget: CorpusBudget) -> None:
             f"{row.quota_bucket} expected={row.expected} actual={row.actual}"
             for row in incomplete.itertuples(index=False)
         )
-        raise ValueError(f"canonical V3 quota mismatch: {details}")
+        raise ValueError(f"canonical V2 quota mismatch: {details}")
 
 
 __all__ = [

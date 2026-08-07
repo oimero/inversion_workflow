@@ -3,48 +3,22 @@
 from __future__ import annotations
 
 import numpy as np
-from cup.synthetic.core.records import CategoricalProjection, ProjectedTruth, SampleAxis
+from cup.synthetic.core.records import ProjectedTruth, SampleAxis
 from cup.synthetic.core.rejections import ProjectionRejected
 from cup.synthetic.core.signal import finite_support_fir, valid_filter_decimate
 from cup.synthetic.core.truth import SyntheticTruth
 
 
-def project_categorical_truth(
-    state_id_highres: np.ndarray,
-    object_id_highres: np.ndarray,
-    zone_id_highres: np.ndarray,
+def _categorical_model_grids(
+    truth: SyntheticTruth,
     *,
     factor: int,
     n_model: int,
-    boundary_mask_highres: np.ndarray | None = None,
-) -> CategoricalProjection:
-    """Project categorical truth and expose hidden-transition diagnostics."""
-
-    state_highres = np.asarray(state_id_highres)
-    object_highres = np.asarray(object_id_highres)
-    zone_highres = np.asarray(zone_id_highres)
-    if (
-        state_highres.ndim != 2
-        or object_highres.shape != state_highres.shape
-        or zone_highres.shape != state_highres.shape
-    ):
-        raise ValueError("categorical high-resolution grids must share [lateral, sample].")
-    if isinstance(factor, bool) or factor <= 0 or isinstance(n_model, bool) or n_model <= 0:
-        raise ValueError("categorical projection factor and model size must be positive.")
-    expected_model = (state_highres.shape[1] - 1) // int(factor) + 1
-    if expected_model != int(n_model):
-        raise ValueError("categorical projection model size differs from nested axes.")
-    if boundary_mask_highres is None:
-        boundary_highres = np.zeros(state_highres.shape, dtype=bool)
-        boundary_highres[:, 0] = object_highres[:, 0] >= 0
-        boundary_highres[:, 1:] = (
-            (object_highres[:, 1:] >= 0)
-            & (object_highres[:, 1:] != object_highres[:, :-1])
-        )
-    else:
-        boundary_highres = np.asarray(boundary_mask_highres, dtype=bool)
-        if boundary_highres.shape != state_highres.shape:
-            raise ValueError("boundary_mask_highres must match categorical truth.")
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    state_highres = truth.state_id_highres
+    object_highres = truth.object_id_highres
+    zone_highres = truth.zone_id_highres
+    boundary_highres = truth.boundary_mask_highres
     n_lateral, n_highres = state_highres.shape
     fractions = np.zeros((n_lateral, n_model, 3), dtype=np.float32)
     dominant = np.full((n_lateral, n_model), -1, dtype=np.int32)
@@ -74,35 +48,7 @@ def project_categorical_truth(
             boundary_fraction[lateral_index, model_index] = float(
                 np.mean(boundary_highres[lateral_index, start:end])
             )
-    hidden_transition_count = np.zeros((n_lateral, n_model), dtype=np.int16)
-    for model_index in range(1, n_model):
-        previous_center = (model_index - 1) * factor
-        center = model_index * factor
-        objects = object_highres[:, previous_center : center + 1]
-        pair_valid = (objects[:, 1:] >= 0) & (objects[:, :-1] >= 0)
-        hidden_transition_count[:, model_index] = np.sum(
-            pair_valid & (objects[:, 1:] != objects[:, :-1]),
-            axis=1,
-            dtype=np.int16,
-        )
-    dominant_state = np.argmax(fractions, axis=-1).astype(np.int8)
-    projection_collapse = np.zeros((n_lateral, n_model), dtype=bool)
-    projection_collapse[:, 1:] = (
-        valid[:, 1:]
-        & valid[:, :-1]
-        & (dominant_state[:, 1:] == dominant_state[:, :-1])
-        & (dominant[:, 1:] != dominant[:, :-1])
-        & (hidden_transition_count[:, 1:] >= 2)
-    )
-    return CategoricalProjection(
-        state_fraction_model=fractions,
-        dominant_object_id_model=dominant,
-        zone_id_model=zone_model,
-        boundary_fraction_model=boundary_fraction,
-        categorical_valid_mask_model=valid,
-        hidden_transition_count_model=hidden_transition_count,
-        projection_collapse_mask_model=projection_collapse,
-    )
+    return fractions, dominant, zone_model, boundary_fraction, valid
 
 
 def _projection_factor(truth: SyntheticTruth, model_axis: SampleAxis) -> int:
@@ -154,28 +100,21 @@ def project_truth_to_model_grid(
     high_support_1d = np.zeros(truth.highres_axis.size, dtype=bool)
     high_support_1d[half : truth.highres_axis.size - half] = True
 
-    categorical = project_categorical_truth(
-        truth.state_id_highres,
-        truth.object_id_highres,
-        truth.zone_id_highres,
-        factor=factor,
-        n_model=n_model,
-        boundary_mask_highres=truth.boundary_mask_highres,
+    fractions, dominant, zones, boundary_fraction, categorical_valid = (
+        _categorical_model_grids(truth, factor=factor, n_model=n_model)
     )
     geometric_valid = truth.state_id_highres[:, ::factor] >= 0
     return ProjectedTruth(
         model_axis=axis,
         model_target_log_ai=model_log_ai,
         rgt_model=rgt_model,
-        state_fraction_model=categorical.state_fraction_model,
-        dominant_object_id_model=categorical.dominant_object_id_model,
-        zone_id_model=categorical.zone_id_model,
-        boundary_fraction_model=categorical.boundary_fraction_model,
-        boundary_mask_model=categorical.boundary_fraction_model > 0.0,
+        state_fraction_model=fractions,
+        dominant_object_id_model=dominant,
+        zone_id_model=zones,
+        boundary_fraction_model=boundary_fraction,
+        boundary_mask_model=boundary_fraction > 0.0,
         geometric_valid_mask_model=geometric_valid,
-        categorical_valid_mask_model=categorical.categorical_valid_mask_model,
-        hidden_transition_count_model=categorical.hidden_transition_count_model,
-        projection_collapse_mask_model=categorical.projection_collapse_mask_model,
+        categorical_valid_mask_model=categorical_valid,
         projection_support_highres=np.broadcast_to(
             high_support_1d, (n_lateral, high_support_1d.size)
         ),
@@ -186,6 +125,5 @@ def project_truth_to_model_grid(
 
 
 __all__ = [
-    "project_categorical_truth",
     "project_truth_to_model_grid",
 ]

@@ -54,7 +54,7 @@ python scripts\synthoseis_lite.py `
 ```yaml
 synthoseis_lite:
   sample_domain: depth
-  benchmark_schema: structured_synthetic_corpus_v3
+  benchmark_schema: structured_synthetic_corpus_v2
   science_revision: synthoseis_lite_science_v5
   seismic_input:
     policy: observed_highres_forward
@@ -74,8 +74,6 @@ inline 和 xline 表示几何身份。横向物理距离使用米制的 lateral 
 - model-grid valid mask；
 - high-resolution impedance truth；
 - state、object、zone 和 boundary 网格；
-- model-grid state fraction、boundary fraction 和 categorical valid mask；
-- hidden transition count 与 projection-collapse mask；
 - zone 背景参数；
 - segment 的三阶段对象系数；
 - 投影结果；
@@ -96,9 +94,6 @@ background = a + b * (2ζ - 1)
 
 LFM 是带采样轴、合法 mask 和来源身份的 observation。
 
-`benchmark_manifest.json` 发布与该批数据一致的 `ProducerPrior`，包括 zone 状态转移、
-duration/profile 分布和米制横向控制。下游直接读取该合同，不从 model-grid 标签重新拟合。
-
 ## HDF5 结构
 
 ```text
@@ -112,10 +107,6 @@ duration/profile 分布和米制横向控制。下游直接读取该合同，不
   truth/
     log_ai_highres
     model_log_ai
-    state_fraction_model
-    boundary_fraction_model
-    hidden_transition_count_model
-    projection_collapse_mask_model
     zones/
     segments/
   forward/
@@ -151,8 +142,7 @@ preflight 在正演前记录各配额桶的 truth-valid candidate 数量。单�
 同配额桶的备用 candidate 接替。备用耗尽后的短缺记录在 `quota_report.csv`，不会
 丢弃此前已生成的有效 parent；artifact schema、采样轴、HDF5 事务和结构性 Oracle
 完整性错误仍阻止发布。数值 forward parity 失败会在 `oracle_report.json` 中记录
-为 warning，产物以 `completed_with_warnings` 发布；consumer 继续严格校验 schema、axis、
-shape、mask 和结构完整性，并在实验报告中保留数值 warning；
+为 warning，产物以 `completed_with_warnings` 发布并标记为不可直接训练消费；
 深度域有限支撑子波在非零端点附近若因 artifact 的 float32 往返改变一个权重，
 则记录 `forward_roundtrip_boundary_sensitivity` warning，并保留其余 forward parity
 的严格校验。完整 preflight 可通过 `--reuse-preflight-from <staging-dir>` 复用，入口会
@@ -163,3 +153,23 @@ shape、mask 和结构完整性，并在实验报告中保留数值 warning；
 canonical benchmark 保存 clean seismic。训练时的相位、时移、静校正、增益和噪声扰动由模型实验配置在线生成。
 
 在线扰动必须记录算子规格和随机身份，并保持 LFM、truth、采样轴和 mask 语义不变。
+
+## 20260725 数据迁移
+
+一次性迁移使用：
+
+```powershell
+$env:PYTHONPATH = (Join-Path (Get-Location) "src")
+python scripts\migrate_synthoseis_structured_v1.py `
+  --source-run experiments\synthoseis_lite\results\20260725\generate_field_conditioned `
+  --output-dir experiments\synthoseis_lite\results\20260725\generate_field_conditioned_structured `
+  --oracle-parent-count 3
+```
+
+中断后在相同命令中增加：
+
+```text
+--resume
+```
+
+迁移按 parent 提交，并对旧 HDF5 与结构化 sidecar 做字段级一致性检查。

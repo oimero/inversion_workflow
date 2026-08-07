@@ -1,9 +1,8 @@
-"""Observable evidence construction and the reusable vertical encoder."""
+"""Audited observable targets and their formal evidence network."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 from typing import Mapping
 
 import numpy as np
@@ -14,71 +13,29 @@ from torch.nn import functional as F
 from cup.physics.numpy_backend import reflectivity_from_log_ai
 from ginn_v2.contracts import (
     InputContractError,
+    ObservableTargetContract,
     ObservationTile,
 )
 
 
 @dataclass(frozen=True)
-class BandlimitedTargets:
-    """Producer-published model-grid targets used by the evidence seam."""
+class ObservableTargets:
+    """Physically defined model-grid targets used by the audit seam."""
 
     projected_log_ai_increment: np.ndarray
     signed_reflectivity: np.ndarray
-    state_fraction: np.ndarray
+    state_id: np.ndarray
     support: np.ndarray
 
 
-@dataclass(frozen=True)
-class ObservationPerturbationProfile:
-    """Domain-neutral sample-space nuisance ranges for paired observations."""
-
-    maximum_vertical_static_samples: int = 1
-    gain_log_sigma: float = 0.10
-    white_noise_rms_fraction: float = 0.03
-    colored_noise_rms_fraction: float = 0.05
-    colored_noise_correlation_samples: int = 3
-    peak_poor_amplitude_quantile: float = 0.65
-    peak_poor_smoothing_samples: int = 5
-
-    def __post_init__(self) -> None:
-        if (
-            isinstance(self.maximum_vertical_static_samples, bool)
-            or self.maximum_vertical_static_samples < 0
-            or isinstance(self.colored_noise_correlation_samples, bool)
-            or self.colored_noise_correlation_samples <= 0
-            or isinstance(self.peak_poor_smoothing_samples, bool)
-            or self.peak_poor_smoothing_samples <= 0
-        ):
-            raise ValueError("observation perturbation sample counts are invalid.")
-        for name in (
-            "gain_log_sigma",
-            "white_noise_rms_fraction",
-            "colored_noise_rms_fraction",
-        ):
-            value = float(getattr(self, name))
-            if not np.isfinite(value) or value < 0.0:
-                raise ValueError(f"{name} must be finite and nonnegative.")
-        quantile = float(self.peak_poor_amplitude_quantile)
-        if not np.isfinite(quantile) or not 0.0 < quantile < 1.0:
-            raise ValueError("peak_poor_amplitude_quantile must lie in (0, 1).")
-
-
-@dataclass(frozen=True)
-class PairedObservationViews:
-    clean: ObservationTile
-    dirty: ObservationTile
-    peak_poor: ObservationTile
-    random_identity: int
-
-
-def build_bandlimited_targets(
+def build_observable_targets(
     tile: ObservationTile,
     *,
     model_log_ai: np.ndarray,
-    state_fraction_model: np.ndarray,
+    state_highres: np.ndarray,
     background_lfm_linear: np.ndarray,
     anchor_support: np.ndarray,
-) -> BandlimitedTargets:
+) -> ObservableTargets:
     """Build targets without per-trace normalization or invented activity labels.
 
     Reflectivity follows the same lower-interface convention as ``cup.physics``:
@@ -87,21 +44,34 @@ def build_bandlimited_targets(
     """
 
     log_ai = np.asarray(model_log_ai, dtype=np.float64)
-    state_fraction = np.asarray(state_fraction_model, dtype=np.float64)
+    state = np.asarray(state_highres)
     background = np.asarray(background_lfm_linear, dtype=np.float64)
     support = np.asarray(anchor_support, dtype=bool)
     if log_ai.shape != tile.seismic.shape:
         raise InputContractError("model_log_ai must match the observation tile.")
     if background.shape != log_ai.shape or support.shape != log_ai.shape:
         raise InputContractError("LFM anchor arrays must match model_log_ai.")
-    if state_fraction.shape != log_ai.shape + (3,):
-        raise InputContractError("state_fraction_model must be [lateral, sample, 3].")
-    state_sum = np.sum(state_fraction, axis=-1)
-    state_valid = (
-        np.all(np.isfinite(state_fraction), axis=-1)
-        & np.all(state_fraction >= 0.0, axis=-1)
-        & np.isclose(state_sum, 1.0, rtol=0.0, atol=1.0e-5)
-    )
+    expected_highres = (tile.width, tile.highres_axis.coordinates.size)
+    if state.shape != expected_highres:
+        raise InputContractError("state_highres must match the high-resolution axis.")
+
+    ratio = tile.model_axis.sample_interval / tile.highres_axis.sample_interval
+    factor = int(round(ratio))
+    if factor < 1 or not np.isclose(ratio, factor, rtol=0.0, atol=1.0e-10):
+        raise InputContractError("observable targets require integer-nested axes.")
+    nested_coordinates = tile.highres_axis.coordinates[::factor]
+    if nested_coordinates.shape != tile.model_axis.coordinates.shape or not np.allclose(
+        nested_coordinates,
+        tile.model_axis.coordinates,
+        rtol=0.0,
+        atol=1.0e-8,
+    ):
+        raise InputContractError(
+            "observable targets require coincident model/high-resolution axes."
+        )
+    state_model = state[:, ::factor]
+    if state_model.shape != log_ai.shape:
+        raise InputContractError("model-grid state sampling changed the target shape.")
 
     base_support = (
         support
@@ -109,7 +79,8 @@ def build_bandlimited_targets(
         & tile.lateral_valid[:, None]
         & np.isfinite(log_ai)
         & np.isfinite(background)
-        & state_valid
+        & (state_model >= 0)
+        & (state_model <= 2)
     )
     increment = np.where(base_support, log_ai - background, 0.0)
     reflectivity = np.zeros_like(log_ai)
@@ -118,126 +89,12 @@ def build_bandlimited_targets(
     reflectivity_support[:, 0] = False
     reflectivity_support[:, 1:] &= base_support[:, :-1]
     common_support = base_support & reflectivity_support
-    state_fraction = np.where(
-        common_support[..., None], state_fraction, 1.0 / 3.0
-    )
-    return BandlimitedTargets(
+    state_model = np.where(common_support, state_model, -1).astype(np.int64)
+    return ObservableTargets(
         projected_log_ai_increment=np.where(common_support, increment, 0.0),
         signed_reflectivity=np.where(common_support, reflectivity, 0.0),
-        state_fraction=state_fraction,
+        state_id=state_model,
         support=common_support,
-    )
-
-
-def _observation_rng(identity: str, random_identity: int, view: str) -> np.random.Generator:
-    digest = hashlib.sha256(
-        f"structured-ginn-v2:{identity}:{int(random_identity)}:{view}".encode("utf-8")
-    ).digest()
-    seed = int.from_bytes(digest[:16], byteorder="little", signed=False)
-    return np.random.Generator(np.random.PCG64DXSM(seed))
-
-
-def _moving_average(values: np.ndarray, samples: int) -> np.ndarray:
-    width = max(int(samples), 1)
-    if width == 1:
-        return np.asarray(values, dtype=np.float64).copy()
-    if width % 2 == 0:
-        width += 1
-    kernel = np.ones(width, dtype=np.float64) / width
-    return np.stack(
-        [np.convolve(trace, kernel, mode="same") for trace in np.asarray(values)],
-        axis=0,
-    )
-
-
-def _copy_tile(tile: ObservationTile, seismic: np.ndarray) -> ObservationTile:
-    return ObservationTile(
-        model_axis=tile.model_axis,
-        highres_axis=tile.highres_axis,
-        seismic=np.where(tile.observed_valid, seismic, 0.0),
-        lfm=tile.lfm,
-        observed_valid=tile.observed_valid,
-        lateral_m=tile.lateral_m,
-        lateral_valid=tile.lateral_valid,
-        zone_top=tile.zone_top,
-        zone_bottom=tile.zone_bottom,
-        x_m=tile.x_m,
-        y_m=tile.y_m,
-        identity=tile.identity,
-    )
-
-
-def build_paired_observation_views(
-    tile: ObservationTile,
-    *,
-    random_identity: int,
-    profile: ObservationPerturbationProfile = ObservationPerturbationProfile(),
-) -> PairedObservationViews:
-    """Create clean/dirty/peak-poor inputs while preserving one truth identity."""
-
-    valid = tile.observed_valid & tile.lateral_valid[:, None]
-    base = np.where(valid, tile.seismic, 0.0).astype(np.float64, copy=True)
-    supported = base[valid]
-    if supported.size == 0 or np.any(~np.isfinite(supported)):
-        raise InputContractError("paired observation fixture requires finite support.")
-    rms = float(np.sqrt(np.mean(supported**2)))
-    if not np.isfinite(rms) or rms <= 0.0:
-        raise InputContractError("paired observation fixture requires non-zero seismic RMS.")
-
-    rng = _observation_rng(tile.identity, random_identity, "dirty")
-    maximum_shift = int(profile.maximum_vertical_static_samples)
-    shift = int(rng.integers(-maximum_shift, maximum_shift + 1)) if maximum_shift else 0
-    shifted = np.zeros_like(base)
-    if shift == 0:
-        shifted[:] = base
-    elif shift > 0:
-        shifted[:, shift:] = base[:, :-shift]
-    else:
-        shifted[:, :shift] = base[:, -shift:]
-    trace_gain = np.exp(
-        rng.normal(0.0, profile.gain_log_sigma, size=(tile.width, 1))
-    )
-    dirty = shifted * trace_gain
-    dirty += rng.normal(
-        0.0,
-        profile.white_noise_rms_fraction * rms,
-        size=dirty.shape,
-    )
-    colored = rng.normal(0.0, 1.0, size=dirty.shape)
-    colored = _moving_average(colored, profile.colored_noise_correlation_samples)
-    colored_rms = float(np.sqrt(np.mean(colored[valid] ** 2)))
-    if colored_rms > 0.0:
-        dirty += colored * (profile.colored_noise_rms_fraction * rms / colored_rms)
-    dirty = np.where(valid, dirty, 0.0)
-
-    peak_rng = _observation_rng(tile.identity, random_identity, "peak-poor")
-    peak_poor = dirty.copy()
-    for trace in range(tile.width):
-        trace_valid = valid[trace]
-        if not np.any(trace_valid):
-            continue
-        threshold = float(
-            np.quantile(
-                np.abs(peak_poor[trace, trace_valid]),
-                profile.peak_poor_amplitude_quantile,
-            )
-        )
-        amplitude = np.abs(peak_poor[trace])
-        peak_poor[trace] = np.sign(peak_poor[trace]) * np.maximum(
-            amplitude - threshold, 0.0
-        )
-    peak_poor = _moving_average(peak_poor, profile.peak_poor_smoothing_samples)
-    peak_poor += peak_rng.normal(
-        0.0,
-        0.25 * profile.white_noise_rms_fraction * rms,
-        size=peak_poor.shape,
-    )
-    peak_poor = np.where(valid, peak_poor, 0.0)
-    return PairedObservationViews(
-        clean=_copy_tile(tile, base),
-        dirty=_copy_tile(tile, dirty),
-        peak_poor=_copy_tile(tile, peak_poor),
-        random_identity=int(random_identity),
     )
 
 
@@ -329,8 +186,34 @@ class EvidenceNetworkConfig:
     def from_mapping(
         cls,
         value: Mapping[str, object],
+        *,
+        target_contract: ObservableTargetContract | None = None,
     ) -> "EvidenceNetworkConfig":
         payload = dict(value)
+        if target_contract is not None:
+            protected = {
+                "seismic_scale",
+                "lfm_residual_scale",
+                "projected_log_ai_increment_scale",
+                "signed_reflectivity_scale",
+            }
+            configured = sorted(protected.intersection(payload))
+            if configured:
+                raise ValueError(
+                    "network scales come from the passed target contract, not config: "
+                    f"{configured}"
+                )
+            scales = target_contract.global_scales
+            payload.update(
+                {
+                    "seismic_scale": scales["seismic"],
+                    "lfm_residual_scale": scales["lfm_residual"],
+                    "projected_log_ai_increment_scale": scales[
+                        "projected_log_ai_increment"
+                    ],
+                    "signed_reflectivity_scale": scales["signed_reflectivity"],
+                }
+            )
         return cls(**payload)
 
 
@@ -351,7 +234,76 @@ class _ResidualBlock(nn.Module):
         return values + F.gelu(update)
 
 
-class BandlimitedEvidenceNetwork(nn.Module):
+class ObservableTargetProbe(nn.Module):
+    """Small single-target network used only by L1/L2 information probes."""
+
+    def __init__(
+        self,
+        target_name: str,
+        *,
+        hidden_channels: int = 24,
+        layers: int = 3,
+    ) -> None:
+        super().__init__()
+        if target_name not in {
+            "projected_log_ai_increment",
+            "signed_reflectivity",
+            "state_emission",
+        }:
+            raise ValueError(f"unsupported observable target: {target_name}")
+        if hidden_channels <= 0 or layers <= 0:
+            raise ValueError("probe dimensions must be positive.")
+        self.target_name = target_name
+        self.input_projection = nn.Conv1d(3, hidden_channels, kernel_size=5, padding=2)
+        self.encoder = nn.Sequential(
+            *(
+                _ResidualBlock(hidden_channels, dilation=2 ** (index % 3))
+                for index in range(layers)
+            )
+        )
+        channels = 3 if target_name == "state_emission" else 1
+        self.head = nn.Conv1d(hidden_channels, channels, kernel_size=1)
+        if channels == 1:
+            nn.init.zeros_(self.head.weight)
+            nn.init.zeros_(self.head.bias)
+
+    def forward(
+        self,
+        seismic: torch.Tensor,
+        lfm_residual: torch.Tensor,
+        observed_valid: torch.Tensor,
+        *,
+        input_mode: str,
+        seismic_scale: float,
+        lfm_residual_scale: float,
+    ) -> torch.Tensor:
+        if seismic.ndim != 2 or lfm_residual.shape != seismic.shape:
+            raise ValueError("probe observations must have shape [batch, sample].")
+        if observed_valid.shape != seismic.shape:
+            raise ValueError("probe validity must match observations.")
+        if input_mode not in {"full", "no_seismic"}:
+            raise ValueError("probe input_mode must be full or no_seismic.")
+        if seismic_scale <= 0.0 or lfm_residual_scale <= 0.0:
+            raise ValueError("probe input scales must be positive.")
+        valid = observed_valid.to(dtype=seismic.dtype)
+        seismic_input = seismic / float(seismic_scale)
+        if input_mode == "no_seismic":
+            seismic_input = torch.zeros_like(seismic_input)
+        values = torch.stack(
+            (
+                seismic_input * valid,
+                lfm_residual / float(lfm_residual_scale) * valid,
+                valid,
+            ),
+            dim=1,
+        )
+        output = self.head(self.encoder(F.gelu(self.input_projection(values))))
+        if self.target_name == "state_emission":
+            return output.transpose(1, 2)
+        return output[:, 0]
+
+
+class ObservableEvidenceNetwork(nn.Module):
     """Single-trace audited evidence model with an optional later lateral mixer."""
 
     def __init__(self, config: EvidenceNetworkConfig) -> None:
@@ -475,6 +427,7 @@ class BandlimitedEvidenceNetwork(nn.Module):
                 self.config.signed_reflectivity_scale,
             ),
             "state_logits": state_logits,
+            "state_log_potential": F.log_softmax(state_logits, dim=-1),
             "support": support,
         }
 
@@ -532,15 +485,18 @@ def evidence_loss(
         torch.log(reflectivity_scale_target[support]),
     )
 
-    state_target = targets["state_fraction"].to(dtype=output["state_logits"].dtype)
+    state_target = targets["state_emission"].long()
     represented = state_target[support]
-    if represented.ndim != 2 or represented.shape[1] != 3:
-        raise ValueError("state_fraction target must have three probabilities.")
-    state_cross_entropy = torch.mean(
-        -torch.sum(
-            represented * F.log_softmax(output["state_logits"][support], dim=-1),
-            dim=-1,
-        )
+    counts = torch.bincount(represented, minlength=3).to(dtype=torch.float32)
+    present = counts > 0.0
+    class_weight = torch.zeros_like(counts)
+    class_weight[present] = counts[present].sum() / (
+        present.sum() * counts[present]
+    )
+    state_cross_entropy = F.cross_entropy(
+        output["state_logits"][support],
+        represented,
+        weight=class_weight,
     )
     total = (
         increment_weight * increment_mean_huber
@@ -559,13 +515,11 @@ def evidence_loss(
 
 
 __all__ = [
-    "BandlimitedEvidenceNetwork",
-    "BandlimitedTargets",
-    "ObservationPerturbationProfile",
-    "PairedObservationViews",
+    "ObservableEvidenceNetwork",
     "EvidenceNetworkConfig",
-    "build_bandlimited_targets",
-    "build_paired_observation_views",
+    "ObservableTargetProbe",
+    "ObservableTargets",
+    "build_observable_targets",
     "dominant_frequency_hz",
     "evidence_loss",
     "tuning_scale_on_model_axis",

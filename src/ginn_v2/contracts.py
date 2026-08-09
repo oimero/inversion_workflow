@@ -29,14 +29,37 @@ def _array(value: object, *, dtype: object, ndim: int, name: str) -> np.ndarray:
     return result
 
 
-def _same_axis(left: SampleAxis, right: SampleAxis) -> bool:
-    return (
-        left.sample_domain == right.sample_domain
-        and left.unit == right.unit
-        and left.depth_basis == right.depth_basis
-        and left.coordinates.shape == right.coordinates.shape
-        and np.allclose(left.coordinates, right.coordinates, rtol=0.0, atol=1.0e-10)
+def zone_linear_lateral_support(
+    model_axis: SampleAxis,
+    observed_valid: np.ndarray,
+    zone_top: np.ndarray,
+    zone_bottom: np.ndarray,
+) -> np.ndarray:
+    """Return traces with rank-two support for a zone-linear anchor."""
+
+    if not isinstance(model_axis, SampleAxis):
+        raise TypeError("model_axis must be a SampleAxis object.")
+    valid = _array(
+        observed_valid,
+        dtype=bool,
+        ndim=2,
+        name="observed_valid",
     )
+    top = _array(zone_top, dtype=np.float64, ndim=1, name="zone_top")
+    bottom = _array(zone_bottom, dtype=np.float64, ndim=1, name="zone_bottom")
+    if valid.shape != (top.size, model_axis.coordinates.size) or (
+        bottom.shape != top.shape
+    ):
+        raise InputContractError(
+            "zone-linear support arrays must match lateral and model axes."
+        )
+    geometry_valid = np.isfinite(top) & np.isfinite(bottom) & (bottom > top)
+    inside = (
+        valid
+        & (model_axis.coordinates[None, :] >= top[:, None])
+        & (model_axis.coordinates[None, :] <= bottom[:, None])
+    )
+    return geometry_valid & (np.count_nonzero(inside, axis=1) >= 2)
 
 
 @dataclass(frozen=True)
@@ -52,6 +75,7 @@ class ObservationTile:
     lateral_valid: np.ndarray
     zone_top: np.ndarray
     zone_bottom: np.ndarray
+    vp_model_mps: np.ndarray | None = None
     x_m: np.ndarray | None = None
     y_m: np.ndarray | None = None
     identity: str = ""
@@ -96,6 +120,27 @@ class ObservationTile:
         if np.any(valid & (~np.isfinite(seismic) | ~np.isfinite(lfm))):
             raise InputContractError("valid observation samples must be finite.")
 
+        velocity: np.ndarray | None = None
+        if self.model_axis.sample_domain == "depth":
+            if self.vp_model_mps is None:
+                raise InputContractError(
+                    "depth observations require model-grid vp_model_mps."
+                )
+            velocity = _array(
+                self.vp_model_mps,
+                dtype=np.float64,
+                ndim=2,
+                name="vp_model_mps",
+            )
+            if velocity.shape != expected or np.any(
+                valid & (~np.isfinite(velocity) | (velocity <= 0.0))
+            ):
+                raise InputContractError(
+                    "vp_model_mps must be finite, positive, and match depth observations."
+                )
+        elif self.vp_model_mps is not None:
+            raise InputContractError("time observations cannot carry vp_model_mps.")
+
         lateral = _array(self.lateral_m, dtype=np.float64, ndim=1, name="lateral_m")
         lateral_valid = _array(
             self.lateral_valid,
@@ -118,6 +163,17 @@ class ObservationTile:
             raise InputContractError("valid zone coordinates must be finite.")
         if np.any(lateral_valid & (bottom <= top)):
             raise InputContractError("valid zone bottoms must be greater than tops.")
+        linear_support = zone_linear_lateral_support(
+            self.model_axis,
+            valid,
+            top,
+            bottom,
+        )
+        if np.any(lateral_valid & ~linear_support):
+            raise InputContractError(
+                "valid lateral traces require at least two observed model samples "
+                "inside the zone."
+            )
 
         coordinates: list[np.ndarray | None] = [self.x_m, self.y_m]
         parsed_coordinates: list[np.ndarray | None] = []
@@ -139,6 +195,7 @@ class ObservationTile:
         object.__setattr__(self, "lateral_valid", lateral_valid)
         object.__setattr__(self, "zone_top", top)
         object.__setattr__(self, "zone_bottom", bottom)
+        object.__setattr__(self, "vp_model_mps", velocity)
         object.__setattr__(self, "x_m", parsed_coordinates[0])
         object.__setattr__(self, "y_m", parsed_coordinates[1])
 
@@ -524,88 +581,146 @@ class Segment:
     c0: float
     c1: float
     c2: float
-    log_score: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.trace_index < 0 or self.state_id not in {0, 1, 2}:
+            raise InputContractError("segment trace/state identity is invalid.")
+        if self.start_index < 0 or self.stop_index <= self.start_index:
+            raise InputContractError("segment extent must be non-empty and ordered.")
+        values = np.asarray((self.c0, self.c1, self.c2), dtype=np.float64)
+        if np.any(~np.isfinite(values)):
+            raise NumericalFailure("segment coefficients must be finite.")
 
 
 @dataclass(frozen=True)
 class StructuredRealization:
-    identity: int
     log_ai_highres: np.ndarray
     state_highres: np.ndarray
     projected_log_ai: np.ndarray
     segments: tuple[Segment, ...]
     conditional_log_score: float
 
-
-@dataclass(frozen=True)
-class EnsembleSummary:
-    log_ai_highres_mean: np.ndarray
-    log_ai_highres_std: np.ndarray
-    projected_log_ai_mean: np.ndarray
-    projected_log_ai_std: np.ndarray
-    projected_support: np.ndarray
-    state_occupancy_highres: np.ndarray
-    interface_density_highres: np.ndarray
-    segment_count_mean: np.ndarray
-    segment_count_std: np.ndarray
-    segment_duration_fraction_mean: np.ndarray
-    segment_duration_fraction_std: np.ndarray
-
-
-@dataclass(frozen=True)
-class GenerationPolicy:
-    realization_count: int = 16
-    random_identity: int = 0
-    retain_realizations: bool = True
-    lateral_correlation_m: float = 900.0
-    path_coupling_strength: float = 1.0
-    profile_coupling_strength: float = 1.0
-
     def __post_init__(self) -> None:
-        if isinstance(self.realization_count, bool) or self.realization_count <= 0:
-            raise ValueError("realization_count must be positive.")
-        if not np.isfinite(self.lateral_correlation_m) or self.lateral_correlation_m <= 0:
-            raise ValueError("lateral_correlation_m must be finite and positive.")
-        if (
-            not np.isfinite(self.path_coupling_strength)
-            or self.path_coupling_strength < 0.0
-            or not np.isfinite(self.profile_coupling_strength)
-            or self.profile_coupling_strength < 0.0
-        ):
-            raise ValueError("lateral coupling strengths must be finite and non-negative.")
+        highres = _array(
+            self.log_ai_highres, dtype=np.float64, ndim=2, name="log_ai_highres"
+        )
+        state = _array(
+            self.state_highres, dtype=np.int8, ndim=2, name="state_highres"
+        )
+        projected = _array(
+            self.projected_log_ai,
+            dtype=np.float64,
+            ndim=2,
+            name="projected_log_ai",
+        )
+        segments = tuple(self.segments)
+        if state.shape != highres.shape or projected.shape[0] != highres.shape[0]:
+            raise InputContractError("structured realization grids are inconsistent.")
+        if not segments or any(not isinstance(item, Segment) for item in segments):
+            raise InputContractError("structured realization requires valid segments.")
+        if np.any(np.isinf(highres)) or np.any(np.isinf(projected)):
+            raise NumericalFailure("structured realization cannot contain infinite values.")
+        finite_highres = np.isfinite(highres)
+        if np.any(finite_highres & ((state < 0) | (state > 2))):
+            raise InputContractError("finite high-resolution samples require valid states.")
+        score = float(self.conditional_log_score)
+        if not np.isfinite(score):
+            raise NumericalFailure("conditional_log_score must be finite.")
+        object.__setattr__(self, "log_ai_highres", highres)
+        object.__setattr__(self, "state_highres", state)
+        object.__setattr__(self, "projected_log_ai", projected)
+        object.__setattr__(self, "segments", segments)
+        object.__setattr__(self, "conditional_log_score", score)
 
 
 @dataclass(frozen=True)
 class StructuredPrediction:
+    """One deterministic structured prediction for one observation tile."""
+
     evidence: ObservableEvidence
-    representative: StructuredRealization
-    summary: EnsembleSummary
-    realization_identities: tuple[int, ...]
-    realizations: tuple[StructuredRealization, ...] | None
+    realization: StructuredRealization
+    state_probability: np.ndarray
+    renewal_probability: np.ndarray
     diagnostics: Mapping[str, float]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.evidence, ObservableEvidence) or not isinstance(
+            self.realization, StructuredRealization
+        ):
+            raise TypeError("prediction requires ObservableEvidence and StructuredRealization.")
+        model_shape = self.evidence.support.shape
+        highres_shape = self.evidence.highres_support.shape
+        state_probability = _array(
+            self.state_probability,
+            dtype=np.float64,
+            ndim=3,
+            name="state_probability",
+        )
+        renewal_probability = _array(
+            self.renewal_probability,
+            dtype=np.float64,
+            ndim=2,
+            name="renewal_probability",
+        )
+        if state_probability.shape != model_shape + (3,) or (
+            renewal_probability.shape != model_shape
+        ):
+            raise InputContractError("prediction marginal shapes differ from evidence.")
+        support = self.evidence.support
+        if np.any(
+            support
+            & ~np.all(np.isfinite(state_probability), axis=-1)
+        ) or np.any(
+            support
+            & (~np.isfinite(renewal_probability))
+        ):
+            raise NumericalFailure("supported prediction marginals must be finite.")
+        if np.any(
+            support
+            & ~np.isclose(
+                np.sum(state_probability, axis=-1),
+                1.0,
+                rtol=0.0,
+                atol=1.0e-6,
+            )
+        ) or np.any(
+            support
+            & ((renewal_probability < 0.0) | (renewal_probability > 1.0))
+        ):
+            raise InputContractError("prediction marginals are not normalized probabilities.")
+        if self.realization.log_ai_highres.shape != highres_shape or (
+            self.realization.projected_log_ai.shape != model_shape
+        ):
+            raise InputContractError("prediction realization axes differ from evidence.")
+        if np.any(
+            self.evidence.highres_support
+            & ~np.isfinite(self.realization.log_ai_highres)
+        ):
+            raise NumericalFailure("supported high-resolution prediction must be finite.")
+        diagnostics = {str(key): float(value) for key, value in self.diagnostics.items()}
+        if any(not key or not np.isfinite(value) for key, value in diagnostics.items()):
+            raise NumericalFailure("prediction diagnostics must be finite named scalars.")
+        object.__setattr__(self, "state_probability", state_probability)
+        object.__setattr__(self, "renewal_probability", renewal_probability)
+        object.__setattr__(self, "diagnostics", diagnostics)
 
 
 @dataclass(frozen=True)
 class VolumeInferenceResult:
-    """Two-pass volume result using one member identity for every tile."""
+    """Deterministic predictions keyed by stable volume-tile identity."""
 
     tiles: Mapping[str, StructuredPrediction]
-    representative_member_index: int
-    representative_identity: int
 
     def __post_init__(self) -> None:
         if not self.tiles:
             raise InputContractError("volume inference must contain at least one tile.")
-        if self.representative_member_index < 0:
-            raise InputContractError("representative_member_index cannot be negative.")
         object.__setattr__(self, "tiles", dict(sorted(self.tiles.items())))
+
 
 
 __all__ = [
     "CoefficientVarianceCalibration",
     "DomainMismatchError",
-    "EnsembleSummary",
-    "GenerationPolicy",
     "InputContractError",
     "NumericalFailure",
     "ObservableEvidence",
@@ -617,4 +732,5 @@ __all__ = [
     "StructuredPrediction",
     "StructuredRealization",
     "VolumeInferenceResult",
+    "zone_linear_lateral_support",
 ]

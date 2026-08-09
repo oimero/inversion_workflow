@@ -7,14 +7,11 @@ from typing import Any, Mapping
 
 import numpy as np
 import torch
-from scipy.special import ndtri
 from torch import nn
 from torch.nn import functional as F
 
 from ginn_v2.contracts import (
     CoefficientVarianceCalibration,
-    EnsembleSummary,
-    GenerationPolicy,
     InputContractError,
     ObservableEvidence,
     ObservableTargetContract,
@@ -25,7 +22,6 @@ from ginn_v2.contracts import (
     StructuredPrediction,
     StructuredRealization,
 )
-from ginn_v2.augmentation import stable_random_identity
 from ginn_v2.evidence import (
     EvidenceNetworkConfig,
     ObservableEvidenceNetwork,
@@ -42,12 +38,8 @@ from ginn_v2.representation import (
     project_supported_highres_to_model,
 )
 from ginn_v2.semi_markov import (
-    SampledPath,
     SemiMarkovConditioning,
     SemiMarkovPrior,
-    align_path_events,
-    coordinate_stable_uniforms,
-    couple_lateral_path_candidates,
     exact_semi_markov_posterior,
 )
 
@@ -123,146 +115,6 @@ class SegmentProfileHead(nn.Module):
         }
 
 
-def _endpoint_aligned_path_uniforms(
-    random_field_values: np.ndarray,
-    *,
-    sample_count: int,
-    canonical_sample_count: int,
-) -> np.ndarray:
-    """Map canonical zone-fraction fields onto one local endpoint grid."""
-
-    values = np.asarray(random_field_values, dtype=np.float64).reshape(-1)
-    if sample_count <= 0 or canonical_sample_count < sample_count:
-        raise ValueError("path uniform grids require 0 < local <= canonical samples.")
-    if values.size < canonical_sample_count + 2:
-        raise ValueError("canonical path random field is incomplete.")
-    endpoint_bins = np.rint(
-        np.arange(sample_count + 1, dtype=np.float64)
-        * canonical_sample_count
-        / sample_count
-    ).astype(np.int64)
-    aligned = np.empty(sample_count + 2, dtype=np.float64)
-    aligned[0] = values[0]
-    aligned[1:] = values[1 + endpoint_bins]
-    return aligned
-
-
-@dataclass(frozen=True)
-class _MemberPlan:
-    paths: Mapping[int, SampledPath]
-    extents: tuple[SegmentExtent, ...]
-    distributions: tuple[SegmentParameterDistribution, ...]
-    track_ids: np.ndarray
-    track_count: int
-    path_score: float
-    segment_count: np.ndarray
-    durations: list[list[float]]
-    interface: np.ndarray
-
-
-def _event_track_ids(
-    paths: Mapping[int, SampledPath],
-    extents: tuple[SegmentExtent, ...],
-) -> tuple[np.ndarray, int]:
-    """Assign monotone event identities across adjacent supported traces."""
-
-    indices_by_trace: dict[int, list[int]] = {}
-    for index, extent in enumerate(extents):
-        indices_by_trace.setdefault(extent.trace_index, []).append(index)
-    traces = sorted(paths)
-    track_ids = np.full(len(extents), -1, dtype=np.int64)
-    next_track = 0
-    previous_trace: int | None = None
-    for trace in traces:
-        local_indices = indices_by_trace.get(trace, [])
-        if len(local_indices) != len(paths[trace].segments):
-            raise RuntimeError("event tracking path/extent counts differ.")
-        if previous_trace is None or trace != previous_trace + 1:
-            for index in local_indices:
-                track_ids[index] = next_track
-                next_track += 1
-        else:
-            previous_indices = indices_by_trace[previous_trace]
-            alignment = align_path_events(paths[previous_trace], paths[trace])
-            matched_right: set[int] = set()
-            for left_local, right_local in alignment.matched_pairs:
-                track_ids[local_indices[right_local]] = track_ids[
-                    previous_indices[left_local]
-                ]
-                matched_right.add(right_local)
-            for right_local, index in enumerate(local_indices):
-                if right_local not in matched_right:
-                    track_ids[index] = next_track
-                    next_track += 1
-        previous_trace = trace
-    if np.any(track_ids < 0):
-        raise RuntimeError("event tracking left unassigned segment identities.")
-    return track_ids, next_track
-
-
-def _coupled_profile_means(
-    distributions: tuple[SegmentParameterDistribution, ...],
-    track_ids: np.ndarray,
-    lateral_m: np.ndarray,
-    *,
-    correlation_length_m: float,
-    coupling_strength: float,
-) -> np.ndarray:
-    base = np.stack(
-        [np.asarray(distribution.mean, dtype=np.float64) for distribution in distributions]
-    )
-    if coupling_strength == 0.0:
-        return base
-    blend = coupling_strength / (1.0 + coupling_strength)
-    lateral = np.asarray(lateral_m, dtype=np.float64)
-    coupled = base.copy()
-    for track_id in np.unique(track_ids):
-        indices = np.flatnonzero(track_ids == track_id)
-        coordinates = np.asarray(
-            [lateral[distributions[index].extent.trace_index] for index in indices],
-            dtype=np.float64,
-        )
-        for local_index, distribution_index in enumerate(indices):
-            distance = coordinates - coordinates[local_index]
-            weights = np.exp(-0.5 * (distance / correlation_length_m) ** 2)
-            average = np.sum(base[indices] * weights[:, None], axis=0) / np.sum(weights)
-            coupled[distribution_index] = (
-                (1.0 - blend) * base[distribution_index] + blend * average
-            )
-    return coupled
-
-
-def _path_assembly_metrics(
-    paths: Mapping[int, SampledPath],
-) -> dict[str, float]:
-    alignments = [
-        align_path_events(paths[left], paths[right])
-        for left, right in zip(sorted(paths)[:-1], sorted(paths)[1:])
-        if right == left + 1
-    ]
-    if not alignments:
-        return {
-            "matched_fraction": 0.0,
-            "midpoint_distance": 1.0,
-            "thickness_log_ratio": 0.0,
-            "state_mismatch_rate": 1.0,
-        }
-    return {
-        "matched_fraction": float(
-            np.mean([alignment.matched_fraction for alignment in alignments])
-        ),
-        "midpoint_distance": float(
-            np.mean([alignment.midpoint_distance_mean for alignment in alignments])
-        ),
-        "thickness_log_ratio": float(
-            np.mean([alignment.thickness_log_ratio_mean for alignment in alignments])
-        ),
-        "state_mismatch_rate": float(
-            np.mean([alignment.state_mismatch_rate for alignment in alignments])
-        ),
-    }
-
-
 class ConditionalGenerator:
     """Observe audited evidence; structured realization is the next stage seam."""
 
@@ -310,8 +162,6 @@ class ConditionalGenerator:
     def observe(
         self,
         tile: ObservationTile,
-        *,
-        vp_model_mps: np.ndarray | None = None,
     ) -> ObservableEvidence:
         axis = tile.model_axis
         contract = self.target_contract
@@ -329,7 +179,6 @@ class ConditionalGenerator:
         tuning = tuning_scale_on_model_axis(
             tile,
             dominant_frequency=self.dominant_frequency_hz,
-            vp_model_mps=vp_model_mps,
         )
         self.network.eval()
         with torch.no_grad():
@@ -397,27 +246,34 @@ class ConditionalGenerator:
             identity=tile.identity,
         )
 
-    def realize(
+    def predict(self, tile: ObservationTile) -> StructuredPrediction:
+        """Observe and decode one deterministic structured MAP prediction."""
+
+        return self._decode_evidence(self.observe(tile))
+
+    def _decode_evidence(
         self,
         evidence: ObservableEvidence,
-        policy: GenerationPolicy = GenerationPolicy(),
     ) -> StructuredPrediction:
-        """Sample exact per-trace candidates and assemble a decoded K-member ensemble."""
+        """Internal seam used after directional evidence fusion."""
 
         if self.profile_head is None:
-            raise RuntimeError("structured realization requires a profile head.")
-        if self.coefficient_variance_calibration is None:
-            raise RuntimeError(
-                "structured realization requires coefficient variance calibration."
-            )
+            raise RuntimeError("structured prediction requires a profile head.")
         if self.semi_markov_prior is None or self.semi_markov_conditioning is None:
-            raise RuntimeError("structured realization requires a semi-Markov contract.")
+            raise RuntimeError("structured prediction requires a semi-Markov contract.")
         if evidence.model_axis.sample_domain != self.sample_domain:
             raise InputContractError("evidence and generator sample domains differ.")
 
-        posteriors: list[tuple[int, np.ndarray, np.ndarray, object]] = []
-        maximum_model_samples = 0
-        for trace in range(evidence.support.shape[0]):
+        model_shape = evidence.support.shape
+        state_probability = np.full(
+            model_shape + (3,), 1.0 / 3.0, dtype=np.float64
+        )
+        renewal_probability = np.zeros(model_shape, dtype=np.float64)
+        segments: list[Segment] = []
+        forward_recursions = 0
+        conditional_log_score = 0.0
+
+        for trace in range(model_shape[0]):
             model_indices = np.flatnonzero(evidence.support[trace])
             highres_indices = np.flatnonzero(evidence.highres_support[trace])
             if model_indices.size == 0 and highres_indices.size == 0:
@@ -429,7 +285,7 @@ class ConditionalGenerator:
                 or np.any(np.diff(highres_indices) != 1)
             ):
                 raise InputContractError(
-                    "each realized trace requires one contiguous model/highres zone."
+                    "each deterministic trace requires one contiguous model/highres zone."
                 )
             posterior = exact_semi_markov_posterior(
                 np.exp(evidence.state_log_potential[trace, model_indices]),
@@ -437,310 +293,74 @@ class ConditionalGenerator:
                 self.semi_markov_prior,
                 self.semi_markov_conditioning,
             )
-            posteriors.append((trace, model_indices, highres_indices, posterior))
-            maximum_model_samples = max(maximum_model_samples, model_indices.size)
-        if not posteriors:
-            raise InputContractError("structured realization has no supported traces.")
-
-        x_m = evidence.lateral_m if evidence.x_m is None else evidence.x_m
-        y_m = np.zeros_like(evidence.lateral_m) if evidence.y_m is None else evidence.y_m
-        path_draw_count = maximum_model_samples + 2
-        path_random_identity = stable_random_identity(
-            "structured_ginn_v2_path_candidates",
-            policy.random_identity,
-            evidence.identity,
-        )
-        path_uniform_fields = coordinate_stable_uniforms(
-            x_m,
-            y_m,
-            realization_count=policy.realization_count,
-            draw_count=path_draw_count,
-            random_identity=path_random_identity,
-            correlation_length_m=policy.lateral_correlation_m,
-        )
-        member_identities = tuple(
-            stable_random_identity(
-                "structured_ginn_v2_member",
-                policy.random_identity,
-                member_index,
+            marginals = posterior.marginals()
+            state_probability[trace, model_indices] = marginals.state_probability
+            renewal_probability[trace, model_indices] = marginals.renewal_probability
+            path = posterior.map_path()
+            conditional_log_score += float(path.log_score)
+            mapped = path_to_highres_extents(
+                path,
+                trace_index=trace,
+                model_indices=model_indices,
+                model_coordinates=evidence.model_axis.coordinates,
+                highres_indices=highres_indices,
+                highres_coordinates=evidence.highres_axis.coordinates,
             )
-            for member_index in range(policy.realization_count)
-        )
-        members: list[StructuredRealization] = []
-        interface_rows: list[np.ndarray] = []
-        segment_count_rows: list[np.ndarray] = []
-        duration_rows: list[list[list[float]]] = []
-        projection_support: np.ndarray | None = None
-        candidates_by_trace: dict[int, list[SampledPath]] = {
-            trace: [] for trace, _, _, _ in posteriors
-        }
-        for candidate_index in range(policy.realization_count):
-            for trace, model_indices, _, posterior_object in posteriors:
-                path_uniforms = _endpoint_aligned_path_uniforms(
-                    path_uniform_fields[candidate_index, trace],
-                    sample_count=model_indices.size,
-                    canonical_sample_count=maximum_model_samples,
-                )
-                candidates_by_trace[trace].append(
-                    posterior_object.sample(path_uniforms)
-                )
-        path_assemblies = couple_lateral_path_candidates(
-            candidates_by_trace,
-            evidence.lateral_m,
-            coupling_strength=policy.path_coupling_strength,
-        )
-        plans: list[_MemberPlan] = []
-        for paths in path_assemblies:
-            extents: list[SegmentExtent] = []
-            path_score = 0.0
-            member_durations: list[list[float]] = [
-                [] for _ in range(evidence.support.shape[0])
-            ]
-            member_segment_count = np.zeros(
-                evidence.support.shape[0], dtype=np.int32
-            )
-            member_interface = np.zeros(
-                evidence.highres_support.shape, dtype=np.float64
-            )
-            for trace, model_indices, highres_indices, _ in posteriors:
-                path = paths[trace]
-                mapped = path_to_highres_extents(
-                    path,
-                    trace_index=trace,
-                    model_indices=model_indices,
-                    model_coordinates=evidence.model_axis.coordinates,
-                    highres_indices=highres_indices,
-                    highres_coordinates=evidence.highres_axis.coordinates,
-                )
-                extents.extend(mapped)
-                path_score += float(path.log_score)
-                member_segment_count[trace] = len(mapped)
-                member_durations[trace].extend(
-                    float(item.duration_fraction) for item in mapped
-                )
-                zone_start = int(highres_indices[0])
-                for item in mapped:
-                    if item.start_index != zone_start:
-                        member_interface[trace, item.start_index] = 1.0
-            extent_tuple = tuple(extents)
-            distributions = tuple(self.parameterize_segments(evidence, extent_tuple))
-            if len(distributions) != len(extent_tuple):
-                raise RuntimeError("segment parameterization changed the path length.")
-            track_ids, track_count = _event_track_ids(paths, extent_tuple)
-            plans.append(
-                _MemberPlan(
-                    paths=paths,
-                    extents=extent_tuple,
-                    distributions=distributions,
-                    track_ids=track_ids,
-                    track_count=track_count,
-                    path_score=path_score,
-                    segment_count=member_segment_count,
-                    durations=member_durations,
-                    interface=member_interface,
-                )
-            )
-
-        maximum_track_count = max(plan.track_count for plan in plans)
-        profile_uniform_fields = coordinate_stable_uniforms(
-            x_m,
-            y_m,
-            realization_count=policy.realization_count,
-            draw_count=3 * maximum_track_count,
-            random_identity=stable_random_identity(
-                "structured_ginn_v2_event_tracks",
-                policy.random_identity,
-                evidence.identity,
-            ),
-            correlation_length_m=policy.lateral_correlation_m,
-        )
-        path_metric_rows: list[dict[str, float]] = []
-        for member_index, (member_identity, plan) in enumerate(
-            zip(member_identities, plans)
-        ):
-            coupled_means = _coupled_profile_means(
-                plan.distributions,
-                plan.track_ids,
-                evidence.lateral_m,
-                correlation_length_m=policy.lateral_correlation_m,
-                coupling_strength=policy.profile_coupling_strength,
-            )
-            sampled_segments: list[Segment] = []
-            for distribution_index, distribution in enumerate(plan.distributions):
-                extent = distribution.extent
-                if extent.state_id < 0 or extent.state_id >= 3:
-                    raise ValueError("segment state is outside the three-state contract.")
-                track_id = int(plan.track_ids[distribution_index])
-                draw_start = 3 * track_id
-                gaussian = ndtri(
-                    profile_uniform_fields[
-                        member_index,
-                        extent.trace_index,
-                        draw_start : draw_start + 3,
-                    ]
-                )
-                coefficient = (
-                    coupled_means[distribution_index]
-                    + np.asarray(distribution.scale, dtype=np.float64) * gaussian
-                )
-                sampled_segments.append(
+            distributions = self.parameterize_segments(evidence, mapped)
+            if len(distributions) != len(mapped):
+                raise RuntimeError("deterministic parameterization changed the MAP path.")
+            for extent, distribution in zip(mapped, distributions, strict=True):
+                coefficients = np.asarray(distribution.mean, dtype=np.float64)
+                segments.append(
                     Segment(
-                        trace_index=extent.trace_index,
+                        trace_index=trace,
                         state_id=extent.state_id,
                         start_index=extent.start_index,
                         stop_index=extent.stop_index,
-                        c0=float(coefficient[0]),
-                        c1=float(coefficient[1]),
-                        c2=float(coefficient[2]),
+                        c0=float(coefficients[0]),
+                        c1=float(coefficients[1]),
+                        c2=float(coefficients[2]),
                     )
                 )
-            decoded, state_highres = decode_segments_numpy(
-                evidence.background_lfm_linear_highres,
-                sampled_segments,
-            )
-            projected, current_projection_support = project_supported_highres_to_model(
-                decoded,
-                evidence.highres_support,
-                highres_interval=evidence.highres_axis.sample_interval,
-                model_interval=evidence.model_axis.sample_interval,
-            )
-            current_projection_support &= evidence.support
-            projected[~current_projection_support] = np.nan
-            if projection_support is None:
-                projection_support = current_projection_support
-            elif not np.array_equal(projection_support, current_projection_support):
-                raise RuntimeError("ensemble members produced different projection support.")
-            members.append(
-                StructuredRealization(
-                    identity=member_identity,
-                    log_ai_highres=decoded,
-                    state_highres=state_highres,
-                    projected_log_ai=projected,
-                    segments=tuple(sampled_segments),
-                    conditional_log_score=float(plan.path_score),
-                )
-            )
-            interface_rows.append(plan.interface)
-            segment_count_rows.append(plan.segment_count)
-            duration_rows.append(plan.durations)
-            path_metric_rows.append(_path_assembly_metrics(plan.paths))
+            forward_recursions += int(posterior.forward_recursions)
 
-        if projection_support is None or not np.any(projection_support):
+        if not segments:
+            raise InputContractError("deterministic prediction has no supported segments.")
+        decoded, state_highres = decode_segments_numpy(
+            evidence.background_lfm_linear_highres,
+            segments,
+        )
+        projected, projection_support = project_supported_highres_to_model(
+            decoded,
+            evidence.highres_support,
+            highres_interval=evidence.highres_axis.sample_interval,
+            model_interval=evidence.model_axis.sample_interval,
+        )
+        projection_support &= evidence.support
+        projected[~projection_support] = np.nan
+        if not np.any(projection_support):
             raise InputContractError(
-                "structured realization has no complete projection support."
+                "deterministic prediction has no complete projection support."
             )
-        highres_stack = np.stack([item.log_ai_highres for item in members])
-        projected_stack = np.stack([item.projected_log_ai for item in members])
-        state_stack = np.stack([item.state_highres for item in members])
-        highres_mean = np.full(evidence.highres_support.shape, np.nan, dtype=np.float64)
-        highres_std = np.full_like(highres_mean, np.nan)
-        highres_mean[evidence.highres_support] = np.mean(
-            highres_stack[:, evidence.highres_support], axis=0
-        )
-        highres_std[evidence.highres_support] = np.std(
-            highres_stack[:, evidence.highres_support], axis=0
-        )
-        projected_mean = np.full(evidence.support.shape, np.nan, dtype=np.float64)
-        projected_std = np.full_like(projected_mean, np.nan)
-        projected_mean[projection_support] = np.mean(
-            projected_stack[:, projection_support], axis=0
-        )
-        projected_std[projection_support] = np.std(
-            projected_stack[:, projection_support], axis=0
-        )
-        state_occupancy = np.zeros(
-            evidence.highres_support.shape + (3,), dtype=np.float64
-        )
-        for state in range(3):
-            state_occupancy[..., state] = np.mean(state_stack == state, axis=0)
-        state_occupancy[~evidence.highres_support] = 0.0
-        interface_density = np.mean(np.stack(interface_rows), axis=0)
-        segment_count = np.stack(segment_count_rows).astype(np.float64)
-        duration_mean = np.full(evidence.support.shape[0], np.nan, dtype=np.float64)
-        duration_std = np.full_like(duration_mean, np.nan)
-        for trace in range(evidence.support.shape[0]):
-            values = np.asarray(
-                [
-                    duration
-                    for member_duration in duration_rows
-                    for duration in member_duration[trace]
-                ],
-                dtype=np.float64,
-            )
-            if values.size:
-                duration_mean[trace] = float(np.mean(values))
-                duration_std[trace] = float(np.std(values))
 
-        evidence_target = (
-            evidence.background_lfm_linear
-            + evidence.projected_log_ai_increment_mean
-        )
-        squared_error = np.asarray(
-            [
-                np.mean(
-                    (member.projected_log_ai[projection_support]
-                    - evidence_target[projection_support])
-                    ** 2
-                )
-                for member in members
-            ],
-            dtype=np.float64,
-        )
-        conditional_score = np.asarray(
-            [member.conditional_log_score for member in members],
-            dtype=np.float64,
-        )
-        representative_index = int(
-            np.lexsort((-conditional_score, squared_error))[0]
-        )
-        summary = EnsembleSummary(
-            log_ai_highres_mean=highres_mean,
-            log_ai_highres_std=highres_std,
-            projected_log_ai_mean=projected_mean,
-            projected_log_ai_std=projected_std,
-            projected_support=projection_support,
-            state_occupancy_highres=state_occupancy,
-            interface_density_highres=interface_density,
-            segment_count_mean=np.mean(segment_count, axis=0),
-            segment_count_std=np.std(segment_count, axis=0),
-            segment_duration_fraction_mean=duration_mean,
-            segment_duration_fraction_std=duration_std,
+        realization = StructuredRealization(
+            log_ai_highres=decoded,
+            state_highres=state_highres,
+            projected_log_ai=projected,
+            segments=tuple(segments),
+            conditional_log_score=conditional_log_score,
         )
         return StructuredPrediction(
             evidence=evidence,
-            representative=members[representative_index],
-            summary=summary,
-            realization_identities=member_identities,
-            realizations=tuple(members) if policy.retain_realizations else None,
+            realization=realization,
+            state_probability=state_probability,
+            renewal_probability=renewal_probability,
             diagnostics={
-                "semi_markov_forward_recursions": float(len(posteriors)),
-                "semi_markov_backward_samples": float(
-                    len(posteriors) * policy.realization_count
-                ),
-                "realization_count": float(policy.realization_count),
-                "representative_member_index": float(representative_index),
-                "representative_evidence_rmse": float(
-                    np.sqrt(squared_error[representative_index])
-                ),
+                "semi_markov_forward_recursions": float(forward_recursions),
+                "deterministic_map": 1.0,
+                "map_segment_count": float(len(segments)),
                 "projection_supported_samples": float(
                     np.count_nonzero(projection_support)
-                ),
-                "spatial_random_key_version": 3.0,
-                "path_coupling_strength": float(policy.path_coupling_strength),
-                "profile_coupling_strength": float(
-                    policy.profile_coupling_strength
-                ),
-                "event_track_matched_fraction": float(
-                    np.mean([row["matched_fraction"] for row in path_metric_rows])
-                ),
-                "event_track_midpoint_distance": float(
-                    np.mean([row["midpoint_distance"] for row in path_metric_rows])
-                ),
-                "event_track_thickness_log_ratio": float(
-                    np.mean([row["thickness_log_ratio"] for row in path_metric_rows])
-                ),
-                "event_track_state_mismatch_rate": float(
-                    np.mean([row["state_mismatch_rate"] for row in path_metric_rows])
                 ),
             },
         )
@@ -769,10 +389,8 @@ class ConditionalGenerator:
         prior: SemiMarkovPrior,
         conditioning: SemiMarkovConditioning,
     ) -> None:
-        if self.coefficient_variance_calibration is None:
-            raise ValueError(
-                "semi-Markov realization contract requires calibrated coefficients."
-            )
+        if self.profile_head is None:
+            raise ValueError("semi-Markov prediction requires a profile head.")
         if self.semi_markov_prior is not None:
             raise ValueError("generator already has a semi-Markov contract.")
         self.semi_markov_prior = prior
@@ -817,7 +435,7 @@ class ConditionalGenerator:
     def state_dict_payload(self) -> dict[str, Any]:
         payload = {
             "schema": (
-                "structured_ginn_v2_generator_v6"
+                "structured_ginn_v2_generator_v7"
                 if self.semi_markov_prior is not None
                 else (
                     "structured_ginn_v2_generator_v5"
@@ -863,7 +481,7 @@ class ConditionalGenerator:
             "structured_ginn_v2_generator_v3",
             "structured_ginn_v2_generator_v4",
             "structured_ginn_v2_generator_v5",
-            "structured_ginn_v2_generator_v6",
+            "structured_ginn_v2_generator_v7",
         }:
             raise ValueError("unsupported Structured GINN V2 checkpoint schema.")
         target_contract = ObservableTargetContract.from_mapping(
@@ -876,23 +494,20 @@ class ConditionalGenerator:
         if schema in {
             "structured_ginn_v2_generator_v4",
             "structured_ginn_v2_generator_v5",
-            "structured_ginn_v2_generator_v6",
+            "structured_ginn_v2_generator_v7",
         }:
             profile_head = SegmentProfileHead(
                 SegmentProfileHeadConfig.from_mapping(payload["profile_head_config"])
             )
             profile_head.load_state_dict(payload["profile_head_state"], strict=True)
         variance_calibration = None
-        if schema in {
-            "structured_ginn_v2_generator_v5",
-            "structured_ginn_v2_generator_v6",
-        }:
+        if "coefficient_variance_calibration" in payload:
             variance_calibration = CoefficientVarianceCalibration.from_mapping(
                 payload["coefficient_variance_calibration"]
             )
         semi_markov_prior = None
         semi_markov_conditioning = None
-        if schema == "structured_ginn_v2_generator_v6":
+        if schema == "structured_ginn_v2_generator_v7":
             semi_markov_prior = SemiMarkovPrior.from_mapping(
                 payload["semi_markov_prior"]
             )

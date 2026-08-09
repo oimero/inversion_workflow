@@ -134,16 +134,15 @@ def tuning_scale_on_model_axis(
     tile: ObservationTile,
     *,
     dominant_frequency: float,
-    vp_model_mps: np.ndarray | None = None,
 ) -> np.ndarray:
     if not np.isfinite(dominant_frequency) or dominant_frequency <= 0.0:
         raise ValueError("dominant_frequency must be finite and positive.")
     shape = tile.seismic.shape
     if tile.sample_domain == "time":
         return np.full(shape, 1.0 / (2.0 * dominant_frequency), dtype=np.float64)
-    if vp_model_mps is None:
+    if tile.vp_model_mps is None:
         raise InputContractError("depth tuning scale requires vp_model_mps.")
-    velocity = np.asarray(vp_model_mps, dtype=np.float64)
+    velocity = np.asarray(tile.vp_model_mps, dtype=np.float64)
     if velocity.shape != shape or np.any(tile.observed_valid & (~np.isfinite(velocity) | (velocity <= 0.0))):
         raise InputContractError("vp_model_mps must be finite, positive, and match observations.")
     return velocity / (4.0 * dominant_frequency)

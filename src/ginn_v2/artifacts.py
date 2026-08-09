@@ -15,6 +15,7 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
+from cup.physics.numpy_backend import velocity_from_ai
 from cup.synthetic.readers.structured import StructuredSyntheticBenchmark
 from cup.synthetic.schemas import STRUCTURED_ARTIFACT_VERSION
 
@@ -24,10 +25,14 @@ from ginn_v2.augmentation import (
     apply_observation_augmentation,
     stable_random_identity,
 )
-from ginn_v2.contracts import ObservableTargetContract, ObservationTile
+from ginn_v2.contracts import (
+    ObservableTargetContract,
+    ObservationTile,
+    zone_linear_lateral_support,
+)
 from ginn_v2.evidence import build_observable_targets
 from ginn_v2.representation import build_lfm_anchor, lfm_residual_from_anchor
-from ginn_v2.semi_markov import SemiMarkovConditioning, SemiMarkovPrior
+from ginn_v2.semi_markov import SemiMarkovPrior
 
 
 CORPUS_MANIFEST_SCHEMA = "structured_synthetic_corpus_v2"
@@ -57,10 +62,11 @@ def load_corpus(root: str | Path) -> Corpus:
     if not manifest_path.is_file():
         raise FileNotFoundError(manifest_path)
     manifest = _read_json(manifest_path)
-    if manifest.get("schema_version") != CORPUS_MANIFEST_SCHEMA:
+    schema = manifest.get("schema_version")
+    if schema != CORPUS_MANIFEST_SCHEMA:
         raise ValueError(
             f"Structured GINN V2 requires {CORPUS_MANIFEST_SCHEMA}; "
-            "V1 artifacts are intentionally incompatible."
+            f"got {schema!r}."
         )
     if manifest.get("status") not in {"success", "completed_with_warnings"}:
         raise ValueError("canonical corpus is not a completed publication.")
@@ -123,6 +129,19 @@ def parent_observation_tiles(
     parent_id: str,
 ) -> tuple[ObservationTile, ...]:
     parent = corpus.benchmark.read_parent(parent_id)
+    vp_model_mps: np.ndarray | None = None
+    if parent.sample_domain == "depth":
+        relation = parent.forward_context.get("ai_velocity_relation")
+        if not isinstance(relation, Mapping):
+            raise ValueError("depth parent lacks its AI-Vp relation.")
+        lfm = np.asarray(parent.lfm, dtype=np.float64)
+        finite_lfm = np.isfinite(lfm)
+        vp_model_mps = np.full(lfm.shape, np.nan, dtype=np.float64)
+        vp_model_mps[finite_lfm] = velocity_from_ai(
+            np.exp(lfm[finite_lfm]),
+            a=float(relation["a"]),
+            b=float(relation["b"]),
+        )
     zone_ids = sorted({str(row["zone_id"]) for row in parent.zones})
     tiles: list[ObservationTile] = []
     for zone_id in zone_ids:
@@ -135,7 +154,12 @@ def parent_observation_tiles(
             trace = int(row["lateral_index"])
             top[trace] = float(row["top"])
             bottom[trace] = float(row["bottom"])
-            lateral_valid[trace] = bottom[trace] > top[trace]
+        lateral_valid[:] = zone_linear_lateral_support(
+            parent.model_axis,
+            parent.observed_valid,
+            top,
+            bottom,
+        )
         tiles.append(
             ObservationTile(
                 model_axis=parent.model_axis,
@@ -147,6 +171,7 @@ def parent_observation_tiles(
                 lateral_valid=lateral_valid,
                 zone_top=top,
                 zone_bottom=bottom,
+                vp_model_mps=vp_model_mps,
                 x_m=parent.x_m,
                 y_m=parent.y_m,
                 identity=f"{parent_id}:{zone_id}",
@@ -386,58 +411,12 @@ def iter_segment_profile_batches(
         yield result
 
 
-def load_semi_markov_contract(
-    directory: str | Path,
-) -> tuple[SemiMarkovPrior, SemiMarkovConditioning, Mapping[str, Any]]:
-    """Load the selected HSMM prior and conditioning from one publication."""
-
-    root = Path(directory)
-    prior_path = root / "semi_markov_prior.json"
-    calibration_path = root / "hsmm_calibration.json"
-    if not prior_path.is_file():
-        raise FileNotFoundError(prior_path)
-    if not calibration_path.is_file():
-        raise FileNotFoundError(calibration_path)
-    prior_payload = _read_json(prior_path)
-    calibration = _read_json(calibration_path)
-    if calibration.get("schema") not in {
-        "structured_ginn_v2_hsmm_calibration_v2",
-        "structured_ginn_v2_hsmm_calibration_v3",
-        "structured_ginn_v2_hsmm_calibration_v4",
-    } or calibration.get("status") != "success":
-        raise ValueError("HSMM calibration is not a successful V2/V3/V4 publication.")
-    selected = calibration.get("selected")
-    if not isinstance(selected, Mapping) or not isinstance(
-        selected.get("conditioning"), Mapping
-    ):
-        raise ValueError("HSMM calibration lacks selected conditioning.")
-    return (
-        SemiMarkovPrior.from_mapping(prior_payload),
-        SemiMarkovConditioning.from_mapping(selected["conditioning"]),
-        {
-            "schema": calibration["schema"],
-            "status": calibration["status"],
-            "split": calibration.get("split"),
-            "mode": calibration.get("mode"),
-            "selected_conditioning": dict(selected["conditioning"]),
-            "prior_path": str(prior_path),
-            "calibration_path": str(calibration_path),
-        },
-    )
-
-
 def calibrate_semi_markov_prior(
     corpus: Corpus,
     *,
     parent_ids: Sequence[str],
 ) -> SemiMarkovPrior:
-    """Calibrate the model-grid prior from trace-local training truth paths.
-
-    Birth, death, and model-grid coarsening can remove an intermediate event
-    on one trace and thereby create a same-state renewal.  The event catalog
-    cannot represent that local adjacency, so the prior is calibrated through
-    the same model-grid reader used by HSMM training and evaluation.
-    """
+    """Calibrate the structural prior from high-resolution producer segments."""
 
     selected = tuple(str(value) for value in parent_ids)
     if not selected or len(set(selected)) != len(selected):
@@ -447,57 +426,66 @@ def calibrate_semi_markov_prior(
         raise ValueError(
             f"semi-Markov prior parents are outside training: {invalid[:5]}"
         )
+
     initial = np.ones(3, dtype=np.float64)
-    transition = np.ones((3, 3), dtype=np.float64)
+    transition = np.ones((3, 3), dtype=np.float64) - np.eye(3, dtype=np.float64)
     durations: list[list[float]] = [[], [], []]
     trace_count = 0
-    for source in iter_evidence_batches(
-        corpus,
-        "training",
-        parent_ids=selected,
-    ):
-        support = np.asarray(source["support"], dtype=bool)
-        state = np.asarray(source["state_emission"], dtype=np.int64)
-        object_id = np.asarray(source["truth_object_id"], dtype=np.int64)
-        if support.shape != state.shape or support.shape != object_id.shape:
-            raise ValueError("model-grid prior truth arrays must share one shape.")
-        if support.ndim != 3 or support.shape[0] != 1:
-            raise ValueError("model-grid prior expects one parent-zone per batch.")
-        for trace in range(support.shape[1]):
-            selected_indices = np.flatnonzero(support[0, trace])
-            if selected_indices.size == 0:
-                continue
-            if np.any(np.diff(selected_indices) != 1):
-                raise ValueError("model-grid prior zone support must be contiguous.")
-            local_state = state[0, trace, selected_indices]
-            local_object = object_id[0, trace, selected_indices]
-            if np.any((local_state < 0) | (local_state > 2)) or np.any(
-                local_object < 0
+    for parent_id in selected:
+        parent = corpus.benchmark.read_parent(parent_id)
+        grouped: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
+        for row in parent.segments:
+            key = (str(row["zone_id"]), int(row["lateral_index"]))
+            grouped.setdefault(key, []).append(row)
+        for key, rows in grouped.items():
+            ordered = sorted(rows, key=lambda row: float(row["top"]))
+            if not ordered or not all(
+                bool(row["segment_supervision_valid"]) for row in ordered
             ):
-                raise ValueError("model-grid prior truth path is invalid.")
-            starts = np.r_[
-                0,
-                1 + np.flatnonzero(local_object[1:] != local_object[:-1]),
-            ]
-            stops = np.r_[starts[1:], local_state.size]
-            states: list[int] = []
-            for start, stop in zip(starts, stops, strict=True):
-                local = local_state[start:stop]
-                if np.any(local != local[0]):
-                    raise ValueError("one model-grid truth object has multiple states.")
-                state_id = int(local[0])
-                states.append(state_id)
-                durations[state_id].append(
-                    float((stop - start) / local_state.size)
+                continue
+            object_states = [int(row["state_id"]) for row in ordered]
+            object_fractions = [float(row["duration_fraction"]) for row in ordered]
+            if any(state not in {0, 1, 2} for state in object_states) or any(
+                not np.isfinite(value) or value <= 0.0
+                for value in object_fractions
+            ):
+                raise ValueError(
+                    f"high-resolution prior truth is invalid: {parent_id}:{key}"
                 )
+            if not np.isclose(
+                sum(object_fractions), 1.0, rtol=0.0, atol=1.0e-5
+            ):
+                raise ValueError(
+                    "high-resolution segment durations do not fill their zone: "
+                    f"{parent_id}:{key}"
+                )
+
+            # Lateral birth/death can remove an intervening producer object and
+            # bring two objects with the same state into contact.  Such an object
+            # seam is not identifiable in the deterministic state HSMM.  Its
+            # canonical segment is therefore the maximal contiguous state run.
+            states: list[int] = []
+            fractions: list[float] = []
+            for state, fraction in zip(
+                object_states, object_fractions, strict=True
+            ):
+                if states and state == states[-1]:
+                    fractions[-1] += fraction
+                else:
+                    states.append(state)
+                    fractions.append(fraction)
             initial[states[0]] += 1.0
+            for state_id, fraction in zip(states, fractions, strict=True):
+                durations[state_id].append(fraction)
             for previous, current in zip(states[:-1], states[1:]):
                 transition[previous, current] += 1.0
             trace_count += 1
+
     if trace_count == 0:
         raise ValueError("semi-Markov prior calibration has no supported traces.")
     if any(not values for values in durations):
         raise ValueError("training corpus does not cover every state duration.")
+
     return SemiMarkovPrior(
         initial_probability=initial,
         transition_probability=transition,
@@ -509,7 +497,6 @@ def calibrate_semi_markov_prior(
             dtype=np.float64,
         ),
     )
-
 
 def save_checkpoint(
     path: str | Path,
@@ -597,9 +584,7 @@ def save_section_prediction(
     if directory.exists():
         raise FileExistsError(directory)
     directory.mkdir(parents=True)
-    realizations = prediction.realizations
-    if realizations is None:
-        raise ValueError("section publication requires retained realizations.")
+    realization = prediction.realization
     arrays = {
         "evidence_projected_increment_mean": (
             prediction.evidence.projected_log_ai_increment_mean
@@ -615,37 +600,38 @@ def save_section_prediction(
         ),
         "evidence_state_log_potential": prediction.evidence.state_log_potential,
         "evidence_support": prediction.evidence.support,
-        "ensemble_highres_mean": prediction.summary.log_ai_highres_mean,
-        "ensemble_highres_std": prediction.summary.log_ai_highres_std,
-        "ensemble_projected_support": prediction.summary.projected_support,
-        "representative_highres_log_ai": prediction.representative.log_ai_highres,
-        "representative_projected_log_ai": (
-            prediction.representative.projected_log_ai
-        ),
-        "realization_highres_log_ai": np.stack(
-            [item.log_ai_highres for item in realizations]
-        ),
-        "realization_projected_log_ai": np.stack(
-            [item.projected_log_ai for item in realizations]
-        ),
+        "highres_log_ai": realization.log_ai_highres,
+        "highres_state": realization.state_highres,
+        "highres_support": prediction.evidence.highres_support,
+        "projected_log_ai": realization.projected_log_ai,
+        "projected_support": np.isfinite(realization.projected_log_ai),
+        "state_probability": prediction.state_probability,
+        "renewal_probability": prediction.renewal_probability,
+        "model_axis": prediction.evidence.model_axis.coordinates,
+        "highres_axis": prediction.evidence.highres_axis.coordinates,
+        "lateral_m": prediction.evidence.lateral_m,
     }
+    if prediction.evidence.x_m is not None:
+        arrays["x_m"] = prediction.evidence.x_m
+        arrays["y_m"] = prediction.evidence.y_m
     np.savez_compressed(directory / "section_prediction.npz", **arrays)
     segment_rows = [
         {
-            "realization_identity": item.identity,
+            "prediction_identity": prediction.evidence.identity,
             **asdict(segment),
         }
-        for item in realizations
-        for segment in item.segments
+        for segment in realization.segments
     ]
     with (directory / "segment_table.json").open("w", encoding="utf-8") as handle:
         json.dump(segment_rows, handle, ensure_ascii=False, indent=2, allow_nan=False)
     with (directory / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(
             {
-                "schema": "structured_ginn_v2_section_prediction_v1",
-                "representative_identity": prediction.representative.identity,
-                "realization_identities": list(prediction.realization_identities),
+                "schema": "structured_ginn_v2_deterministic_prediction_v1",
+                "prediction_identity": prediction.evidence.identity,
+                "sample_domain": prediction.evidence.model_axis.sample_domain,
+                "sample_unit": prediction.evidence.model_axis.unit,
+                "depth_basis": prediction.evidence.model_axis.depth_basis,
                 "diagnostics": dict(prediction.diagnostics),
             },
             handle,
@@ -656,12 +642,169 @@ def save_section_prediction(
     return directory
 
 
+def save_synthetic_section_prediction(
+    output_dir: str | Path,
+    prediction: Any,
+    *,
+    observation: ObservationTile,
+    truth_log_ai_highres: np.ndarray,
+) -> Path:
+    """Publish one deterministic section with synthetic truth diagnostics."""
+
+    from matplotlib import pyplot as plt
+
+    from ginn_v2.contracts import StructuredPrediction
+
+    if not isinstance(prediction, StructuredPrediction):
+        raise TypeError(
+            "save_synthetic_section_prediction requires StructuredPrediction."
+        )
+    if not isinstance(observation, ObservationTile):
+        raise TypeError(
+            "save_synthetic_section_prediction requires ObservationTile."
+        )
+    truth = np.asarray(truth_log_ai_highres, dtype=np.float64)
+    if truth.shape != prediction.realization.log_ai_highres.shape:
+        raise ValueError("synthetic truth and prediction shapes differ.")
+    def axes_match(left: Any, right: Any) -> bool:
+        return bool(
+            left.sample_domain == right.sample_domain
+            and left.unit == right.unit
+            and left.depth_basis == right.depth_basis
+            and np.array_equal(left.coordinates, right.coordinates)
+        )
+
+    if (
+        not axes_match(observation.model_axis, prediction.evidence.model_axis)
+        or not axes_match(observation.highres_axis, prediction.evidence.highres_axis)
+        or not np.array_equal(observation.lateral_m, prediction.evidence.lateral_m)
+    ):
+        raise ValueError("synthetic observation and prediction grids differ.")
+
+    directory = save_section_prediction(output_dir, prediction)
+    highres_support = prediction.evidence.highres_support
+    model_support = prediction.evidence.support
+    truth_zone = np.where(highres_support, truth, np.nan)
+    predicted_zone = np.where(
+        highres_support,
+        prediction.realization.log_ai_highres,
+        np.nan,
+    )
+    residual = predicted_zone - truth_zone
+    seismic = np.where(
+        model_support & observation.observed_valid,
+        observation.seismic,
+        np.nan,
+    )
+    increment = np.where(
+        model_support,
+        prediction.evidence.projected_log_ai_increment_mean,
+        np.nan,
+    )
+    renewal = np.where(model_support, prediction.renewal_probability, np.nan)
+    np.savez_compressed(
+        directory / "synthetic_reference.npz",
+        observed_seismic=seismic,
+        truth_highres_log_ai=truth_zone,
+        highres_residual=residual,
+    )
+
+    def finite_limits(
+        values: np.ndarray,
+        *,
+        symmetric: bool = False,
+    ) -> tuple[float, float]:
+        finite = np.asarray(values, dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            return (-1.0, 1.0)
+        if symmetric:
+            magnitude = max(float(np.percentile(np.abs(finite), 99.0)), 1.0e-8)
+            return (-magnitude, magnitude)
+        lower, upper = np.percentile(finite, [1.0, 99.0])
+        if not upper > lower:
+            delta = max(abs(float(lower)) * 0.01, 1.0e-8)
+            return (float(lower - delta), float(upper + delta))
+        return (float(lower), float(upper))
+
+    ai_limits = finite_limits(np.stack((truth_zone, predicted_zone)))
+    panels = (
+        (
+            seismic,
+            observation.model_axis.coordinates,
+            "Observed seismic",
+            "seismic",
+            finite_limits(seismic, symmetric=True),
+        ),
+        (
+            increment,
+            observation.model_axis.coordinates,
+            "Band-limited increment evidence",
+            "coolwarm",
+            finite_limits(increment, symmetric=True),
+        ),
+        (
+            renewal,
+            observation.model_axis.coordinates,
+            "HSMM renewal marginal",
+            "magma",
+            (0.0, 1.0),
+        ),
+        (
+            truth_zone,
+            observation.highres_axis.coordinates,
+            "Truth high-resolution log-AI",
+            "viridis",
+            ai_limits,
+        ),
+        (
+            predicted_zone,
+            observation.highres_axis.coordinates,
+            "Predicted high-resolution log-AI",
+            "viridis",
+            ai_limits,
+        ),
+        (
+            residual,
+            observation.highres_axis.coordinates,
+            "Prediction - truth",
+            "coolwarm",
+            finite_limits(residual, symmetric=True),
+        ),
+    )
+    figure, axes = plt.subplots(2, 3, figsize=(15.0, 8.5), constrained_layout=True)
+    for axis, (values, vertical, title, color_map, limits) in zip(
+        axes.flat,
+        panels,
+        strict=True,
+    ):
+        image = axis.pcolormesh(
+            observation.lateral_m,
+            vertical,
+            np.ma.masked_invalid(values).T,
+            shading="auto",
+            cmap=color_map,
+            vmin=limits[0],
+            vmax=limits[1],
+        )
+        axis.invert_yaxis()
+        axis.set_title(title, fontsize=9)
+        axis.set_xlabel("lateral distance [m]")
+        axis.set_ylabel(
+            f"{observation.sample_domain} [{observation.model_axis.unit}]"
+        )
+        figure.colorbar(image, ax=axis, fraction=0.046, pad=0.03)
+    figure.suptitle(prediction.evidence.identity, fontsize=10)
+    figure.savefig(directory / "section.png", dpi=150)
+    plt.close(figure)
+    return directory
+
+
 __all__ = [
     "CHECKPOINT_SCHEMA",
     "CORPUS_MANIFEST_SCHEMA",
     "Corpus",
     "load_checkpoint",
-    "load_semi_markov_contract",
     "load_observable_target_contract",
     "public_checkpoint_metadata",
     "load_corpus",
@@ -671,5 +814,6 @@ __all__ = [
     "iter_segment_profile_batches",
     "parent_observation_tiles",
     "save_section_prediction",
+    "save_synthetic_section_prediction",
     "save_checkpoint",
 ]

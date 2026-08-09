@@ -1,4 +1,4 @@
-"""Evidence fusion, section/volume generation, and optional forward diagnosis."""
+"""Evidence fusion, deterministic section/volume inference, and forward diagnosis."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from scipy.special import logsumexp
 
 from ginn_v2.contracts import (
     ObservableEvidence,
-    GenerationPolicy,
     ObservationTile,
     StructuredPrediction,
     VolumeInferenceResult,
@@ -18,11 +17,27 @@ from ginn_v2.contracts import (
 from ginn_v2.generator import ConditionalGenerator
 
 
+def _axes_match(left: object, right: object) -> bool:
+    return bool(
+        left.sample_domain == right.sample_domain
+        and left.unit == right.unit
+        and left.depth_basis == right.depth_basis
+        and left.coordinates.shape == right.coordinates.shape
+        and np.allclose(
+            left.coordinates,
+            right.coordinates,
+            rtol=0.0,
+            atol=1.0e-10,
+        )
+    )
+
+
 def fuse_directional_evidence(
     inline: ObservableEvidence,
     xline: ObservableEvidence,
 ) -> ObservableEvidence:
-    """Fuse calibrated band-limited evidence before generating microstructure."""
+    """Fuse calibrated evidence before one deterministic structured decode."""
+
     coordinates_differ = (
         (inline.x_m is None) != (xline.x_m is None)
         or (
@@ -34,23 +49,22 @@ def fuse_directional_evidence(
         )
     )
     if (
-        inline.model_axis.sample_domain != xline.model_axis.sample_domain
-        or inline.model_axis.unit != xline.model_axis.unit
-        or not np.array_equal(
-            inline.model_axis.coordinates,
-            xline.model_axis.coordinates,
-        )
+        not _axes_match(inline.model_axis, xline.model_axis)
+        or not _axes_match(inline.highres_axis, xline.highres_axis)
         or not np.array_equal(inline.lateral_m, xline.lateral_m)
         or coordinates_differ
     ):
         raise ValueError("directional evidence grids differ.")
-    support_count = inline.support.astype(np.float64) + xline.support.astype(np.float64)
+
+    inline_support = inline.support.astype(np.float64)
+    xline_support = xline.support.astype(np.float64)
+    support_count = inline_support + xline_support
     support = support_count > 0.0
     denominator = np.maximum(support_count, 1.0)
 
     def average(left: np.ndarray, right: np.ndarray) -> np.ndarray:
-        weights = inline.support.astype(np.float64)
-        other = xline.support.astype(np.float64)
+        weights = inline_support
+        other = xline_support
         if left.ndim == 3:
             weights = weights[..., None]
             other = other[..., None]
@@ -67,7 +81,10 @@ def fuse_directional_evidence(
     ) -> tuple[np.ndarray, np.ndarray]:
         mean = average(left_mean, right_mean)
         within = average(left_scale**2, right_scale**2)
-        between = average((left_mean - mean) ** 2, (right_mean - mean) ** 2)
+        between = average(
+            (left_mean - mean) ** 2,
+            (right_mean - mean) ** 2,
+        )
         return mean, np.sqrt(np.maximum(within + between, 1.0e-12))
 
     increment_mean, increment_scale = mixture(
@@ -172,12 +189,10 @@ def _center_evidence(
 def infer_section(
     generator: ConditionalGenerator,
     tile: ObservationTile,
-    *,
-    policy: GenerationPolicy = GenerationPolicy(),
-    vp_model_mps: np.ndarray | None = None,
 ) -> StructuredPrediction:
-    evidence = generator.observe(tile, vp_model_mps=vp_model_mps)
-    return generator.realize(evidence, policy)
+    """Run one section through the deterministic observation/decode seam."""
+
+    return generator.predict(tile)
 
 
 def infer_fused_section(
@@ -185,27 +200,25 @@ def infer_fused_section(
     inline_tile: ObservationTile,
     xline_tile: ObservationTile,
     *,
-    policy: GenerationPolicy = GenerationPolicy(),
-    inline_vp_model_mps: np.ndarray | None = None,
-    xline_vp_model_mps: np.ndarray | None = None,
     inline_center_index: int | None = None,
     xline_center_index: int | None = None,
 ) -> StructuredPrediction:
+    """Fuse inline/xline evidence, then perform one deterministic decode."""
+
     inline = _center_evidence(
-        generator.observe(inline_tile, vp_model_mps=inline_vp_model_mps),
+        generator.observe(inline_tile),
         inline_center_index,
     )
     xline = _center_evidence(
-        generator.observe(xline_tile, vp_model_mps=xline_vp_model_mps),
+        generator.observe(xline_tile),
         xline_center_index,
-    )
-    prediction = generator.realize(
-        fuse_directional_evidence(inline, xline),
-        policy,
     )
     shared = inline.support & xline.support
     if not np.any(shared):
         raise ValueError("directional evidence has no shared support.")
+    prediction = generator._decode_evidence(
+        fuse_directional_evidence(inline, xline)
+    )
     disagreement = float(
         np.sqrt(
             np.mean(
@@ -231,110 +244,24 @@ def infer_volume(
     directional_tiles: Callable[
         [], Iterable[tuple[str, ObservationTile, ObservationTile]]
     ],
-    *,
-    policy: GenerationPolicy = GenerationPolicy(),
 ) -> VolumeInferenceResult:
-    """Run order-invariant two-pass generation with one global member identity."""
-    if not callable(directional_tiles):
-        raise TypeError("two-pass volume inference requires a restartable tile factory.")
-    first_pass: dict[str, tuple[np.ndarray, np.ndarray, int, tuple[int, ...]]] = {}
-    retained_policy = replace(policy, retain_realizations=True)
-    for tile_id, inline_tile, xline_tile in directional_tiles():
-        identity = str(tile_id).strip()
-        if not identity or identity in first_pass:
-            raise ValueError("volume tile identities must be non-empty and unique.")
-        prediction = infer_fused_section(
-            generator,
-            inline_tile,
-            xline_tile,
-            policy=retained_policy,
-        )
-        if prediction.realizations is None:
-            raise RuntimeError("first volume pass did not retain ensemble members.")
-        support = prediction.summary.projected_support
-        count = int(np.count_nonzero(support))
-        if count == 0:
-            raise ValueError(f"volume tile {identity!r} has no supported samples.")
-        squared_error = np.asarray(
-            [
-                np.sum(
-                    (
-                        member.projected_log_ai[support]
-                        - (
-                            prediction.evidence.background_lfm_linear[support]
-                            + prediction.evidence.projected_log_ai_increment_mean[
-                                support
-                            ]
-                        )
-                    )
-                    ** 2
-                )
-                for member in prediction.realizations
-            ],
-            dtype=np.float64,
-        )
-        conditional_score = np.asarray(
-            [member.conditional_log_score for member in prediction.realizations],
-            dtype=np.float64,
-        )
-        first_pass[identity] = (
-            squared_error,
-            conditional_score,
-            count,
-            prediction.realization_identities,
-        )
-    if not first_pass:
-        raise ValueError("volume inference received no tiles.")
-    ordered_ids = sorted(first_pass)
-    identities = first_pass[ordered_ids[0]][3]
-    if any(first_pass[item][3] != identities for item in ordered_ids[1:]):
-        raise RuntimeError("volume tiles produced inconsistent member identities.")
-    total_error = np.zeros(policy.realization_count, dtype=np.float64)
-    total_score = np.zeros(policy.realization_count, dtype=np.float64)
-    total_count = 0
-    for tile_id in ordered_ids:
-        squared_error, conditional_score, count, _ = first_pass[tile_id]
-        total_error += squared_error
-        total_score += conditional_score
-        total_count += count
-    mean_error = total_error / float(total_count)
-    representative_index = int(np.lexsort((-total_score, mean_error))[0])
+    """Run deterministic directional fusion once per volume tile."""
 
-    second_pass: dict[str, StructuredPrediction] = {}
+    if not callable(directional_tiles):
+        raise TypeError("volume inference requires a restartable tile factory.")
+    predictions: dict[str, StructuredPrediction] = {}
     for tile_id, inline_tile, xline_tile in directional_tiles():
         identity = str(tile_id).strip()
-        if identity not in first_pass or identity in second_pass:
-            raise ValueError("volume tile factory changed between inference passes.")
-        prediction = infer_fused_section(
+        if not identity or identity in predictions:
+            raise ValueError("volume tile identities must be non-empty and unique.")
+        predictions[identity] = infer_fused_section(
             generator,
             inline_tile,
             xline_tile,
-            policy=retained_policy,
         )
-        if (
-            prediction.realizations is None
-            or prediction.realization_identities != identities
-        ):
-            raise RuntimeError("volume member regeneration is not deterministic.")
-        second_pass[identity] = replace(
-            prediction,
-            representative=prediction.realizations[representative_index],
-            realizations=None,
-            diagnostics={
-                **dict(prediction.diagnostics),
-                "volume_representative_member_index": float(
-                    representative_index
-                ),
-                "volume_two_pass": 1.0,
-            },
-        )
-    if set(second_pass) != set(first_pass):
-        raise ValueError("volume tile factory changed between inference passes.")
-    return VolumeInferenceResult(
-        tiles=second_pass,
-        representative_member_index=representative_index,
-        representative_identity=identities[representative_index],
-    )
+    if not predictions:
+        raise ValueError("volume inference received no tiles.")
+    return VolumeInferenceResult(tiles=predictions)
 
 
 def forward_diagnostic(
@@ -343,9 +270,10 @@ def forward_diagnostic(
     observed_seismic: np.ndarray,
     support: np.ndarray,
 ) -> Mapping[str, float]:
-    """Evaluate, but never train, rank, or alter, one selected prediction."""
+    """Evaluate one prediction without altering training or inference."""
+
     predicted = np.asarray(
-        forward(prediction.representative.projected_log_ai),
+        forward(prediction.realization.projected_log_ai),
         dtype=np.float64,
     )
     observed = np.asarray(observed_seismic, dtype=np.float64)

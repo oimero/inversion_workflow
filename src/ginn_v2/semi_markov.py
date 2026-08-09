@@ -1,12 +1,12 @@
-"""Conditional semi-Markov inference, sampling, and spatial random coupling."""
+"""Conditional semi-Markov inference with deterministic MAP decoding."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 import numpy as np
-from scipy.special import logsumexp, ndtr
+from scipy.special import logsumexp
 
 from ginn_v2.contracts import NumericalFailure
 
@@ -33,11 +33,19 @@ class SemiMarkovPrior:
             raise ValueError("duration statistics must have one value per state.")
         if (
             np.any(initial <= 0.0)
-            or np.any(transition <= 0.0)
+            or np.any(transition < 0.0)
             or np.any(mean <= 0.0)
             or np.any(std <= 0.0)
+            or np.any(np.sum(transition, axis=1) <= 0.0)
         ):
-            raise ValueError("semi-Markov probabilities and durations must be positive.")
+            raise ValueError(
+                "semi-Markov initial/duration probabilities must be positive; "
+                "transition rows may contain structural zeroes."
+            )
+        if np.any(np.diag(transition) != 0.0):
+            raise ValueError(
+                "high-resolution semi-Markov prior forbids adjacent equal states."
+            )
         maximum = float(self.maximum_duration_fraction)
         if not np.isfinite(maximum) or not 0.0 < maximum <= 1.0:
             raise ValueError("maximum_duration_fraction must lie in (0, 1].")
@@ -55,9 +63,9 @@ class SemiMarkovPrior:
             initial_probability=np.full(3, 1.0 / 3.0),
             transition_probability=np.asarray(
                 (
-                    (0.20, 0.45, 0.35),
-                    (0.40, 0.20, 0.40),
-                    (0.35, 0.45, 0.20),
+                    (0.0, 0.55, 0.45),
+                    (0.50, 0.0, 0.50),
+                    (0.45, 0.55, 0.0),
                 ),
                 dtype=np.float64,
             ),
@@ -112,6 +120,18 @@ class SemiMarkovPrior:
             "duration_fraction_std": self.duration_fraction_std.tolist(),
             "maximum_duration_fraction": float(self.maximum_duration_fraction),
         }
+
+
+def _log_probability_array(value: np.ndarray) -> np.ndarray:
+    """Convert probabilities to log space without warning on structural zeroes."""
+
+    probability = np.asarray(value, dtype=np.float64)
+    if np.any(~np.isfinite(probability)) or np.any(probability < 0.0):
+        raise ValueError("probability array must be finite and non-negative.")
+    result = np.full(probability.shape, -np.inf, dtype=np.float64)
+    positive = probability > 0.0
+    result[positive] = np.log(probability[positive])
+    return result
 
 
 @dataclass(frozen=True)
@@ -171,10 +191,8 @@ def _conditioned_terms(
     emission -= logsumexp(emission, axis=1, keepdims=True)
     activity = np.clip(activity, 1.0e-5, 1.0 - 1.0e-5)
 
-    transition_log = (
-        np.log(prior.transition_probability)
-        / conditioning.transition_temperature
-    )
+    transition_log = _log_probability_array(prior.transition_probability)
+    transition_log /= conditioning.transition_temperature
     transition_log -= logsumexp(transition_log, axis=1, keepdims=True)
     transition = np.exp(transition_log)
 
@@ -192,250 +210,9 @@ class SampledPath:
 
 
 @dataclass(frozen=True)
-class EventAlignment:
-    """Monotone segment correspondence between two neighboring paths."""
-
-    matched_pairs: tuple[tuple[int, int], ...]
-    unmatched_left: tuple[int, ...]
-    unmatched_right: tuple[int, ...]
-    normalized_cost: float
-    matched_fraction: float
-    midpoint_distance_mean: float
-    thickness_log_ratio_mean: float
-    state_mismatch_rate: float
-
-
-def _normalized_path_segments(
-    path: SampledPath,
-) -> tuple[tuple[int, float, float], ...]:
-    sample_count = int(np.asarray(path.state).size)
-    if sample_count <= 0 or not path.segments:
-        raise ValueError("event alignment requires a non-empty sampled path.")
-    normalized: list[tuple[int, float, float]] = []
-    expected_start = 0
-    for state, start, stop in path.segments:
-        if start != expected_start or stop <= start or stop > sample_count:
-            raise ValueError("sampled path segments do not form a contiguous partition.")
-        normalized.append((int(state), start / sample_count, stop / sample_count))
-        expected_start = stop
-    if expected_start != sample_count:
-        raise ValueError("sampled path does not cover its complete sample axis.")
-    return tuple(normalized)
-
-
-def align_path_events(
-    left: SampledPath,
-    right: SampledPath,
-) -> EventAlignment:
-    """Align ordered events without assuming equal segment counts."""
-
-    left_segments = _normalized_path_segments(left)
-    right_segments = _normalized_path_segments(right)
-    left_count = len(left_segments)
-    right_count = len(right_segments)
-    gap_cost = 0.75
-    match_cost = np.empty((left_count, right_count), dtype=np.float64)
-    midpoint_distance = np.empty_like(match_cost)
-    thickness_log_ratio = np.empty_like(match_cost)
-    state_mismatch = np.empty_like(match_cost)
-    for left_index, (left_state, left_start, left_stop) in enumerate(left_segments):
-        left_midpoint = 0.5 * (left_start + left_stop)
-        left_thickness = left_stop - left_start
-        for right_index, (right_state, right_start, right_stop) in enumerate(
-            right_segments
-        ):
-            right_midpoint = 0.5 * (right_start + right_stop)
-            right_thickness = right_stop - right_start
-            midpoint = abs(left_midpoint - right_midpoint)
-            thickness = abs(np.log(left_thickness / right_thickness))
-            mismatch = float(left_state != right_state)
-            midpoint_distance[left_index, right_index] = midpoint
-            thickness_log_ratio[left_index, right_index] = thickness
-            state_mismatch[left_index, right_index] = mismatch
-            match_cost[left_index, right_index] = (
-                2.0 * midpoint + 0.25 * thickness + 1.25 * mismatch
-            )
-
-    dynamic = np.full((left_count + 1, right_count + 1), np.inf)
-    action = np.zeros((left_count + 1, right_count + 1), dtype=np.int8)
-    dynamic[0, 0] = 0.0
-    for left_index in range(1, left_count + 1):
-        dynamic[left_index, 0] = left_index * gap_cost
-        action[left_index, 0] = 2
-    for right_index in range(1, right_count + 1):
-        dynamic[0, right_index] = right_index * gap_cost
-        action[0, right_index] = 3
-    for left_index in range(1, left_count + 1):
-        for right_index in range(1, right_count + 1):
-            candidates = (
-                dynamic[left_index - 1, right_index - 1]
-                + match_cost[left_index - 1, right_index - 1],
-                dynamic[left_index - 1, right_index] + gap_cost,
-                dynamic[left_index, right_index - 1] + gap_cost,
-            )
-            selected = int(np.argmin(candidates))
-            dynamic[left_index, right_index] = candidates[selected]
-            action[left_index, right_index] = selected + 1
-
-    matched: list[tuple[int, int]] = []
-    unmatched_left: list[int] = []
-    unmatched_right: list[int] = []
-    left_index = left_count
-    right_index = right_count
-    while left_index > 0 or right_index > 0:
-        selected = int(action[left_index, right_index])
-        if selected == 1:
-            matched.append((left_index - 1, right_index - 1))
-            left_index -= 1
-            right_index -= 1
-        elif selected == 2:
-            unmatched_left.append(left_index - 1)
-            left_index -= 1
-        elif selected == 3:
-            unmatched_right.append(right_index - 1)
-            right_index -= 1
-        else:
-            raise RuntimeError("event alignment backtrack is incomplete.")
-    matched.reverse()
-    unmatched_left.reverse()
-    unmatched_right.reverse()
-    if matched:
-        pairs = np.asarray(matched, dtype=np.int64)
-        midpoint_mean = float(np.mean(midpoint_distance[pairs[:, 0], pairs[:, 1]]))
-        thickness_mean = float(
-            np.mean(thickness_log_ratio[pairs[:, 0], pairs[:, 1]])
-        )
-        mismatch_rate = float(np.mean(state_mismatch[pairs[:, 0], pairs[:, 1]]))
-    else:
-        midpoint_mean = 1.0
-        thickness_mean = 0.0
-        mismatch_rate = 1.0
-    return EventAlignment(
-        matched_pairs=tuple(matched),
-        unmatched_left=tuple(unmatched_left),
-        unmatched_right=tuple(unmatched_right),
-        normalized_cost=float(dynamic[left_count, right_count] / max(left_count, right_count)),
-        matched_fraction=float(2 * len(matched) / (left_count + right_count)),
-        midpoint_distance_mean=midpoint_mean,
-        thickness_log_ratio_mean=thickness_mean,
-        state_mismatch_rate=mismatch_rate,
-    )
-
-
-def couple_lateral_path_candidates(
-    candidates_by_trace: Mapping[int, Sequence[SampledPath]],
-    lateral_m: np.ndarray,
-    *,
-    coupling_strength: float,
-) -> tuple[dict[int, SampledPath], ...]:
-    """Select K coherent path assemblies from K exact per-trace candidates."""
-
-    if not np.isfinite(coupling_strength) or coupling_strength < 0.0:
-        raise ValueError("coupling_strength must be finite and non-negative.")
-    traces = sorted(int(trace) for trace in candidates_by_trace)
-    if not traces:
-        raise ValueError("lateral path coupling requires supported traces.")
-    candidate_count = len(candidates_by_trace[traces[0]])
-    if candidate_count <= 0 or any(
-        len(candidates_by_trace[trace]) != candidate_count for trace in traces
-    ):
-        raise ValueError("every supported trace must provide the same candidate count.")
-    lateral = np.asarray(lateral_m, dtype=np.float64).reshape(-1)
-    if max(traces) >= lateral.size or np.any(~np.isfinite(lateral[traces])):
-        raise ValueError("path candidates require finite physical lateral coordinates.")
-    if coupling_strength == 0.0:
-        return tuple(
-            {
-                trace: candidates_by_trace[trace][member_index]
-                for trace in traces
-            }
-            for member_index in range(candidate_count)
-        )
-
-    components: list[list[int]] = []
-    for trace in traces:
-        if not components or trace != components[-1][-1] + 1:
-            components.append([trace])
-        else:
-            components[-1].append(trace)
-    selected_members = [dict() for _ in range(candidate_count)]
-    for component in components:
-        unary = np.asarray(
-            [
-                [
-                    -float(path.log_score) / max(int(path.state.size), 1)
-                    for path in candidates_by_trace[trace]
-                ]
-                for trace in component
-            ],
-            dtype=np.float64,
-        )
-        unary -= np.min(unary, axis=1, keepdims=True)
-        spacings = np.diff(lateral[component])
-        reference_spacing = float(np.median(spacings)) if spacings.size else 1.0
-        pair_costs: list[np.ndarray] = []
-        for position in range(1, len(component)):
-            left_trace = component[position - 1]
-            right_trace = component[position]
-            spacing_weight = reference_spacing / float(
-                lateral[right_trace] - lateral[left_trace]
-            )
-            pair_costs.append(
-                np.asarray(
-                    [
-                        [
-                            align_path_events(left, right).normalized_cost
-                            * spacing_weight
-                            for right in candidates_by_trace[right_trace]
-                        ]
-                        for left in candidates_by_trace[left_trace]
-                    ],
-                    dtype=np.float64,
-                )
-            )
-        anchor_position = int(
-            np.argmin(
-                np.abs(
-                    lateral[component]
-                    - 0.5 * (lateral[component[0]] + lateral[component[-1]])
-                )
-            )
-        )
-        for member_index in range(candidate_count):
-            dynamic = np.full((len(component), candidate_count), np.inf)
-            previous = np.full(
-                (len(component), candidate_count), -1, dtype=np.int16
-            )
-            dynamic[0] = unary[0]
-            if anchor_position == 0:
-                dynamic[0, np.arange(candidate_count) != member_index] = np.inf
-            for position in range(1, len(component)):
-                cost = (
-                    dynamic[position - 1, :, None]
-                    + coupling_strength * pair_costs[position - 1]
-                )
-                previous[position] = np.argmin(cost, axis=0).astype(np.int16)
-                dynamic[position] = unary[position] + np.min(cost, axis=0)
-                if position == anchor_position:
-                    dynamic[position, np.arange(candidate_count) != member_index] = np.inf
-            chosen = np.empty(len(component), dtype=np.int64)
-            chosen[-1] = int(np.argmin(dynamic[-1]))
-            for position in range(len(component) - 1, 0, -1):
-                chosen[position - 1] = previous[position, chosen[position]]
-            if chosen[anchor_position] != member_index:
-                raise RuntimeError("lateral path coupling lost its anchor candidate.")
-            for position, trace in enumerate(component):
-                selected_members[member_index][trace] = candidates_by_trace[trace][
-                    int(chosen[position])
-                ]
-    return tuple(selected_members)
-
-
-@dataclass(frozen=True)
 class SemiMarkovMarginals:
     state_probability: np.ndarray
     renewal_probability: np.ndarray
-    same_state_renewal_probability: np.ndarray
     expected_segment_count: float
 
 
@@ -453,7 +230,7 @@ def _viterbi_path(
     delta = np.full((samples + 1, states), -np.inf, dtype=np.float64)
     previous_state = np.full((samples + 1, states), -1, dtype=np.int16)
     previous_start = np.full((samples + 1, states), -1, dtype=np.int32)
-    transition_log = np.log(transition_probability)
+    transition_log = _log_probability_array(transition_probability)
     for stop in range(1, samples + 1):
         maximum = min(stop, duration_log_probability.shape[1] - 1)
         durations = np.arange(1, maximum + 1, dtype=np.int64)
@@ -583,34 +360,6 @@ class SemiMarkovPosterior:
         )
         return emission + duration + internal + renewal
 
-    @staticmethod
-    def _draw(log_weight: np.ndarray, uniform: float) -> int:
-        finite = np.isfinite(log_weight)
-        if not np.any(finite):
-            raise NumericalFailure("semi-Markov sampling has no finite candidate.")
-        normalized = np.zeros(log_weight.size, dtype=np.float64)
-        normalized[finite] = np.exp(log_weight[finite] - logsumexp(log_weight[finite]))
-        cumulative = np.cumsum(normalized)
-        index = int(
-            np.searchsorted(
-                cumulative,
-                min(max(float(uniform), 0.0), 1.0 - 1.0e-15),
-            )
-        )
-        return min(index, int(log_weight.size) - 1)
-
-    @staticmethod
-    def _state_path(
-        segments: tuple[tuple[int, int, int], ...],
-        sample_count: int,
-    ) -> np.ndarray:
-        state_values = np.full(sample_count, -1, dtype=np.int8)
-        for state_id, start, stop in segments:
-            state_values[start:stop] = int(state_id)
-        if np.any(state_values < 0):
-            raise NumericalFailure("semi-Markov path does not cover every sample.")
-        return state_values
-
     def map_path(self) -> SampledPath:
         """Return the globally optimal complete path under this posterior."""
         return _viterbi_path(
@@ -627,7 +376,7 @@ class SemiMarkovPosterior:
 
         samples = self.sample_count
         states = self.state_count
-        transition_log = np.log(self.transition_probability)
+        transition_log = _log_probability_array(self.transition_probability)
         beta = np.full((samples + 1, states), -np.inf, dtype=np.float64)
         beta[samples] = 0.0
         for start in range(samples - 1, 0, -1):
@@ -650,7 +399,6 @@ class SemiMarkovPosterior:
 
         state_difference = np.zeros((samples + 1, states), dtype=np.float64)
         renewal = np.zeros(samples, dtype=np.float64)
-        same_state_renewal = np.zeros(samples, dtype=np.float64)
         maximum_duration = self.duration_log_probability.shape[1] - 1
         for start in range(samples):
             maximum = min(samples - start, maximum_duration)
@@ -677,9 +425,6 @@ class SemiMarkovPosterior:
                     transition_probability = np.exp(log_weights)
                     probability = np.sum(transition_probability, axis=1)
                     renewal[start] += float(np.sum(probability))
-                    same_state_renewal[start] += float(
-                        np.sum(transition_probability[:, state])
-                    )
                 state_difference[start, state] += float(np.sum(probability))
                 np.add.at(state_difference[:, state], stops, -probability)
 
@@ -690,85 +435,12 @@ class SemiMarkovPosterior:
             raise NumericalFailure("semi-Markov state marginals are non-finite.")
         state_probability /= normalizer
         renewal[0] = 1.0
-        same_state_renewal[0] = 0.0
         renewal = np.clip(renewal, 0.0, 1.0)
-        same_state_renewal = np.clip(same_state_renewal, 0.0, renewal)
         return SemiMarkovMarginals(
             state_probability=state_probability,
             renewal_probability=renewal,
-            same_state_renewal_probability=same_state_renewal,
             expected_segment_count=float(1.0 + np.sum(renewal[1:])),
         )
-
-    def sample(self, uniforms: Sequence[float]) -> SampledPath:
-        """Draw one exact path using endpoint-indexed random values.
-
-        ``uniforms[0]`` selects the final state.  ``uniforms[1 + stop]``
-        selects the predecessor/duration at the current exclusive endpoint.
-        Endpoint indexing preserves the single-trace posterior while allowing
-        callers to couple equivalent vertical decisions across lateral traces.
-        """
-
-        random_values = np.asarray(uniforms, dtype=np.float64).reshape(-1)
-        if random_values.size < self.sample_count + 2:
-            raise ValueError("sampling requires at least sample_count + 2 uniforms.")
-        final_state = self._draw(self.alpha[self.sample_count], random_values[0])
-        stop = self.sample_count
-        state = final_state
-        reversed_segments: list[tuple[int, int, int]] = []
-        while stop > 0:
-            maximum = min(stop, self.duration_log_probability.shape[1] - 1)
-            labels: list[tuple[int, int | None]] = []
-            scores: list[float] = []
-            for duration in range(1, maximum + 1):
-                start = stop - duration
-                segment_score = self._segment_score(state, start, stop)
-                if start == 0:
-                    labels.append((duration, None))
-                    scores.append(
-                        float(np.log(self.prior.initial_probability[state]) + segment_score)
-                    )
-                else:
-                    for previous in range(self.state_count):
-                        labels.append((duration, previous))
-                        scores.append(
-                            float(
-                                self.alpha[start, previous]
-                                + np.log(self.transition_probability[previous, state])
-                                + segment_score
-                            )
-                        )
-            choice = self._draw(np.asarray(scores), random_values[1 + stop])
-            duration, previous = labels[choice]
-            start = stop - duration
-            reversed_segments.append((state, start, stop))
-            stop = start
-            if previous is None:
-                break
-            state = previous
-        if stop != 0:
-            raise NumericalFailure("sampled semi-Markov path does not reach the zone top.")
-        segments = tuple(reversed(reversed_segments))
-        state_values = self._state_path(segments, self.sample_count)
-        total_score = 0.0
-        for state_id, start, stop in segments:
-            segment_score = self._segment_score(state_id, start, stop)
-            if start == 0:
-                total_score += float(
-                    np.log(self.prior.initial_probability[state_id]) + segment_score
-                )
-            else:
-                previous_state = int(state_values[start - 1])
-                total_score += float(
-                    np.log(self.transition_probability[previous_state, state_id])
-                    + segment_score
-                )
-        return SampledPath(
-            segments=segments,
-            state=state_values,
-            log_score=float(total_score),
-        )
-
 
 def viterbi_semi_markov_path(
     state_probability: np.ndarray,
@@ -821,7 +493,7 @@ def exact_semi_markov_posterior(
     no_boundary[0] = 0.0
     internal_prefix = np.r_[0.0, np.cumsum(no_boundary)]
     alpha = np.full((samples + 1, states), -np.inf, dtype=np.float64)
-    transition_log = np.log(transition)
+    transition_log = _log_probability_array(transition)
 
     for stop in range(1, samples + 1):
         maximum = min(stop, duration.shape[1] - 1)
@@ -868,59 +540,12 @@ def exact_semi_markov_posterior(
     )
 
 
-def coordinate_stable_uniforms(
-    x_m: np.ndarray,
-    y_m: np.ndarray,
-    *,
-    realization_count: int,
-    draw_count: int,
-    random_identity: int,
-    correlation_length_m: float,
-    modes: int = 24,
-) -> np.ndarray:
-    """Evaluate deterministic spatial random Fourier fields at survey coordinates."""
-    x = np.asarray(x_m, dtype=np.float64).reshape(-1)
-    y = np.asarray(y_m, dtype=np.float64).reshape(-1)
-    if x.shape != y.shape or np.any(~np.isfinite(x)) or np.any(~np.isfinite(y)):
-        raise ValueError("x_m and y_m must be finite and share one shape.")
-    if realization_count <= 0 or draw_count <= 0 or modes <= 0:
-        raise ValueError("random field dimensions must be positive.")
-    if not np.isfinite(correlation_length_m) or correlation_length_m <= 0.0:
-        raise ValueError("correlation_length_m must be positive.")
-    output = np.empty((realization_count, x.size, draw_count), dtype=np.float64)
-    coordinates = np.column_stack((x, y))
-    for realization in range(realization_count):
-        for draw in range(draw_count):
-            sequence = np.random.SeedSequence(
-                [int(random_identity), int(realization), int(draw)]
-            )
-            rng = np.random.default_rng(sequence)
-            frequency = rng.normal(
-                0.0,
-                1.0 / correlation_length_m,
-                size=(modes, 2),
-            )
-            phase = rng.uniform(0.0, 2.0 * np.pi, size=modes)
-            projection = coordinates @ frequency.T + phase
-            field = np.sqrt(2.0 / modes) * np.sum(np.cos(projection), axis=1)
-            output[realization, :, draw] = np.clip(
-                ndtr(field),
-                1.0e-12,
-                1.0 - 1.0e-12,
-            )
-    return output
-
-
 __all__ = [
-    "EventAlignment",
     "SampledPath",
     "SemiMarkovConditioning",
     "SemiMarkovMarginals",
     "SemiMarkovPosterior",
     "SemiMarkovPrior",
-    "align_path_events",
-    "couple_lateral_path_candidates",
-    "coordinate_stable_uniforms",
     "exact_semi_markov_posterior",
     "viterbi_semi_markov_path",
 ]

@@ -45,9 +45,12 @@ from ginn_v2.representation import (
 from ginn_v2.semi_markov import (
     SampledPath,
     SemiMarkovConditioning,
+    SemiMarkovDecodePolicy,
     SemiMarkovMarginals,
     SemiMarkovPrior,
     exact_semi_markov_posterior,
+    prior_with_same_state_renewal,
+    renewal_probability_from_reflectivity,
 )
 
 
@@ -2310,12 +2313,8 @@ def _truth_path(state: np.ndarray, object_id: np.ndarray) -> SampledPath:
         if np.any(state_values[start:stop] != state_values[start]):
             raise ValueError("one truth object contains more than one state.")
 
-    # Model-grid projection can hide an intervening state and leave two producer
-    # objects with the same dominant state.  That is projection collapse, not a
-    # high-resolution same-state renewal, so the HSMM audit path changes only
-    # where the state itself changes.
-    starts = np.r_[0, 1 + np.flatnonzero(state_values[1:] != state_values[:-1])]
-    stops = np.r_[starts[1:], state_values.size]
+    starts = object_starts
+    stops = object_stops
     segments: list[tuple[int, int, int]] = []
     for start, stop in zip(starts, stops, strict=True):
         local = state_values[start:stop]
@@ -2502,6 +2501,7 @@ class _HsmmOracleCase:
     truth_path: SampledPath
     truth_probability: np.ndarray
     predicted_probability: np.ndarray
+    renewal_evidence: np.ndarray
     truth_amplitude: np.ndarray
     predicted_amplitude: np.ndarray
 
@@ -2540,6 +2540,12 @@ def _collect_hsmm_oracle_cases(
             predicted_state = np.exp(
                 np.asarray(output["state_log_potential"], dtype=np.float64)
             )
+            predicted_reflectivity = np.asarray(
+                output["signed_reflectivity_mean"], dtype=np.float64
+            )
+            predicted_reflectivity_scale = np.asarray(
+                output["signed_reflectivity_scale"], dtype=np.float64
+            )
             if support.ndim != 3 or support.shape[0] != 1:
                 raise ValueError("HSMM evaluation expects one parent-zone per batch.")
             for trace in range(support.shape[1]):
@@ -2565,6 +2571,11 @@ def _collect_hsmm_oracle_cases(
                                 confidence=truth_state_confidence,
                             ),
                             predicted_probability=predicted_probability,
+                            renewal_evidence=renewal_probability_from_reflectivity(
+                                predicted_reflectivity[0, trace, start:stop],
+                                predicted_reflectivity_scale[0, trace, start:stop],
+                                generator.decode_policy,
+                            ),
                             truth_amplitude=truth_increment[0, trace, start:stop],
                             predicted_amplitude=(
                                 predicted_increment[0, trace, start:stop]
@@ -2644,6 +2655,7 @@ def _evaluate_hsmm_cases(
     batch_count: int,
     prior: SemiMarkovPrior,
     conditioning: SemiMarkovConditioning,
+    decode_policy: SemiMarkovDecodePolicy,
     truth_state_confidence: float,
 ) -> dict[str, Any]:
     state_statistics = {
@@ -2664,6 +2676,10 @@ def _evaluate_hsmm_cases(
         "predicted_amplitude": _new_profile_statistics(),
         "prior_only": _new_profile_statistics(),
     }
+    decoding_prior = prior_with_same_state_renewal(
+        prior,
+        decode_policy.same_state_renewal_probability,
+    )
     for case in cases:
         probability_by_condition = {
             "truth_state": case.truth_probability,
@@ -2674,8 +2690,8 @@ def _evaluate_hsmm_cases(
         for name, probability in probability_by_condition.items():
             posterior = exact_semi_markov_posterior(
                 probability,
-                np.full(probability.shape[0], 0.5, dtype=np.float64),
-                prior,
+                case.renewal_evidence,
+                decoding_prior,
                 conditioning,
             )
             path = posterior.map_path()
@@ -2729,7 +2745,7 @@ def _evaluate_hsmm_cases(
         "parent_count": parent_count,
         "batch_count": batch_count,
         "truth_state_confidence": float(truth_state_confidence),
-        "neutral_renewal_probability": 0.5,
+        "decode_policy": decode_policy.to_mapping(),
         "prior": prior.to_mapping(),
         "conditioning": conditioning.to_mapping(),
         "direct_evidence": {"predicted_state": _direct_state_metrics(cases)},
@@ -2739,8 +2755,8 @@ def _evaluate_hsmm_cases(
                 "segment-wise three-basis diagnostic upper bound"
             ),
             "signed_reflectivity_mean": (
-                "reserved for the learned segment parameter head; it does not "
-                "create an unaudited micro-boundary likelihood"
+                "creates bounded renewal evidence and also enters the learned "
+                "segment parameter head"
             ),
         },
         "state_duration_conditions": {
@@ -3010,13 +3026,17 @@ def calibrate_semi_markov_fusion(
     if not any(value.to_mapping() == baseline_mapping for value in search):
         raise ValueError("conditioning_candidates must include the default baseline.")
     start_time = time.perf_counter()
+    decoding_prior = prior_with_same_state_renewal(
+        prior,
+        generator.decode_policy.same_state_renewal_probability,
+    )
     for index, conditioning in enumerate(search, start=1):
         statistics = _new_hsmm_calibration_statistics()
         for case in calibration_cases:
             posterior = exact_semi_markov_posterior(
                 case.predicted_probability,
-                np.full(case.predicted_probability.shape[0], 0.5),
-                prior,
+                case.renewal_evidence,
+                decoding_prior,
                 conditioning,
             )
             _update_hsmm_calibration_statistics(
@@ -3084,6 +3104,7 @@ def calibrate_semi_markov_fusion(
         batch_count=batch_count,
         prior=prior,
         conditioning=selected_conditioning,
+        decode_policy=generator.decode_policy,
         truth_state_confidence=truth_state_confidence,
     )
     return {

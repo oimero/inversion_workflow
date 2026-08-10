@@ -26,6 +26,8 @@ from ginn_v2.artifacts import (
     load_corpus,
     public_checkpoint_metadata,
     save_checkpoint,
+    save_decode_policy_sensitivity,
+    save_real_section_prediction,
     save_synthetic_section_prediction,
     parent_observation_tiles,
 )
@@ -36,7 +38,8 @@ from ginn_v2.evidence import (
     dominant_frequency_hz,
 )
 from ginn_v2.generator import ConditionalGenerator, SegmentProfileHeadConfig
-from ginn_v2.inference import infer_section
+from ginn_v2.inference import infer_section, run_decode_policy_sensitivity
+from ginn_v2.real_field import load_real_section_observations
 from ginn_v2.learning import (
     CoefficientVarianceCalibrationConfig,
     LearningConfig,
@@ -52,7 +55,7 @@ from ginn_v2.learning import (
     train_segment_profile_head,
 )
 from ginn_v2.runtime import configure_training_logger, resolve_device
-from ginn_v2.semi_markov import SemiMarkovConditioning
+from ginn_v2.semi_markov import SemiMarkovConditioning, SemiMarkovDecodePolicy
 
 
 def parse_args() -> argparse.Namespace:
@@ -162,6 +165,54 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="generate one full section from each geometry family",
     )
+    real_sections = subparsers.add_parser("generate-real-section")
+    real_sections.add_argument(
+        "--workflow-config",
+        type=Path,
+        default=Path("experiments/common/common.yaml"),
+    )
+    real_sections.add_argument("--checkpoint", type=Path, required=True)
+    real_sections.add_argument("--lfm-run", type=Path, required=True)
+    real_sections.add_argument("--variant-id", required=True)
+    real_sections.add_argument("--well-control-run", type=Path, required=True)
+    real_sections.add_argument("--forward-model-inputs", type=Path, required=True)
+    real_sections.add_argument("--output-dir", type=Path, required=True)
+    real_sections.add_argument(
+        "--highres-interval",
+        type=float,
+        default=1.0,
+        help="high-resolution vertical interval in the workflow axis unit",
+    )
+    sensitivity = subparsers.add_parser("sweep-real-decode-policy")
+    sensitivity.add_argument(
+        "--workflow-config",
+        type=Path,
+        default=Path("experiments/common/common.yaml"),
+    )
+    sensitivity.add_argument("--checkpoint", type=Path, required=True)
+    sensitivity.add_argument("--lfm-run", type=Path, required=True)
+    sensitivity.add_argument("--variant-id", required=True)
+    sensitivity.add_argument("--well-control-run", type=Path, required=True)
+    sensitivity.add_argument("--forward-model-inputs", type=Path, required=True)
+    sensitivity.add_argument("--output-dir", type=Path, required=True)
+    sensitivity.add_argument(
+        "--highres-interval",
+        type=float,
+        default=1.0,
+        help="high-resolution vertical interval in the workflow axis unit",
+    )
+    sensitivity.add_argument(
+        "--trace-start",
+        type=int,
+        default=0,
+        help="first trace of the contiguous sensitivity subsection",
+    )
+    sensitivity.add_argument(
+        "--trace-count",
+        type=int,
+        default=120,
+        help="number of contiguous traces used by the bounded sensitivity run",
+    )
     return parser.parse_args()
 
 
@@ -180,12 +231,28 @@ def _config(path: Path) -> dict:
         "profile_head",
         "profile_learning",
         "coefficient_variance_calibration",
+        "deterministic_decoding",
+        "decode_policy_sensitivity",
         "augmentation_profile",
     }
     unknown = sorted(set(root).difference(allowed))
     if unknown:
         raise ValueError(f"unknown Structured GINN V2 config keys: {unknown}")
     return root
+
+
+def _decode_policy(config: Mapping[str, Any]) -> SemiMarkovDecodePolicy:
+    value = config.get("deterministic_decoding")
+    if not isinstance(value, Mapping):
+        raise ValueError("deterministic_decoding must be an explicit mapping.")
+    return SemiMarkovDecodePolicy.from_mapping(value)
+
+
+def _decode_policy_sensitivity(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    value = config.get("decode_policy_sensitivity")
+    if not isinstance(value, Mapping):
+        raise ValueError("decode_policy_sensitivity must be an explicit mapping.")
+    return value
 
 
 def _augmentation_profile(config: dict):
@@ -259,7 +326,12 @@ def main() -> None:
     args = parse_args()
     config = _config(args.config)
     device, runtime = resolve_device(str(config.get("device") or "auto"))
-    corpus = load_corpus(resolve_relative_path(args.corpus, root=REPO_ROOT))
+    real_commands = {"generate-real-section", "sweep-real-decode-policy"}
+    corpus = (
+        None
+        if args.command in real_commands
+        else load_corpus(resolve_relative_path(args.corpus, root=REPO_ROOT))
+    )
     output = resolve_relative_path(args.output_dir, root=REPO_ROOT)
     resume_path: Path | None = None
     if args.command == "train" and args.resume is not None:
@@ -276,11 +348,312 @@ def main() -> None:
         output.mkdir(parents=True)
     logger = configure_training_logger(output)
     augmentation_profile = _augmentation_profile(config)
+    if args.command == "sweep-real-decode-policy":
+        generator, checkpoint_metadata = load_checkpoint(
+            resolve_relative_path(args.checkpoint, root=REPO_ROOT),
+            device=device,
+        )
+        generator.set_decode_policy(_decode_policy(config))
+        if generator.network_config.input_mode != "full":
+            raise ValueError("real decode sensitivity requires a full checkpoint.")
+        if generator.profile_head is None or generator.semi_markov_prior is None:
+            raise ValueError(
+                "real decode sensitivity requires a complete profile/HSMM checkpoint."
+            )
+        if generator.network_config.use_lateral_context:
+            raise ValueError(
+                "real decode sensitivity requires the frozen single-trace checkpoint."
+            )
+        started = time.perf_counter()
+        logger.info(
+            "real decode sensitivity assembly start | variant=%s | device=%s",
+            args.variant_id,
+            device,
+        )
+        observations = load_real_section_observations(
+            workflow_config=args.workflow_config,
+            lfm_run_dir=args.lfm_run,
+            variant_id=args.variant_id,
+            well_control_run_dir=args.well_control_run,
+            forward_model_inputs=args.forward_model_inputs,
+            target_seismic_scale=generator.network_config.seismic_scale,
+            target_lfm_residual_scale=generator.network_config.lfm_residual_scale,
+            highres_interval=float(args.highres_interval),
+            repo_root=REPO_ROOT,
+        ).select_traces(int(args.trace_start), int(args.trace_count))
+        logger.info(
+            "real decode sensitivity assembled | traces=%d | samples=%d | zones=%d | "
+            "elapsed=%.1fs",
+            observations.full_lfm.shape[0],
+            observations.full_lfm.shape[1],
+            len(observations.tiles),
+            time.perf_counter() - started,
+        )
+        specification = _decode_policy_sensitivity(config)
+        zone_reports: list[dict[str, Any]] = []
+        published_cases: list[dict[str, Any]] | None = None
+        for zone_number, (zone_id, tile) in enumerate(
+            zip(observations.zone_ids, observations.tiles, strict=True),
+            start=1,
+        ):
+            zone_started = time.perf_counter()
+            evidence = generator.observe(tile)
+            logger.info(
+                "decode sensitivity evidence frozen | zone=%d/%d | id=%s | "
+                "elapsed=%.1fs",
+                zone_number,
+                len(observations.tiles),
+                zone_id,
+                time.perf_counter() - zone_started,
+            )
+
+            def log_case(index, total, case, prediction):
+                logger.info(
+                    "decode sensitivity case | zone=%d/%d | case=%d/%d | id=%s | "
+                    "segments=%d | projection_rmse=%.6g | elapsed=%.1fs",
+                    zone_number,
+                    len(observations.tiles),
+                    index,
+                    total,
+                    case.case_id,
+                    len(prediction.realization.segments),
+                    prediction.diagnostics["projection_consistency_rmse"],
+                    time.perf_counter() - zone_started,
+                )
+
+            result = run_decode_policy_sensitivity(
+                generator,
+                evidence,
+                specification,
+                on_case_complete=log_case,
+            )
+            zone_output = output / f"zone_{zone_number:02d}_{zone_id}"
+            sensitivity_payload = save_decode_policy_sensitivity(
+                zone_output,
+                result,
+                observation=tile,
+            )
+            reference = result.predictions["reference"]
+            save_real_section_prediction(
+                zone_output / "reference",
+                reference,
+                observation=tile,
+                raw_seismic=observations.raw_seismic,
+                full_lfm=observations.full_lfm,
+                ilines=observations.ilines,
+                xlines=observations.xlines,
+                input_metadata={
+                    **dict(observations.metadata),
+                    "zone_id": zone_id,
+                    "lfm_run": str(observations.lfm_variant.run_dir),
+                    "lfm_variant_id": observations.lfm_variant.variant_id,
+                    "experiment": "decode_policy_sensitivity",
+                },
+            )
+            cases = list(sensitivity_payload["cases"])
+            if published_cases is None:
+                published_cases = [
+                    {
+                        "case_id": case["case_id"],
+                        "changed_parameter": case["changed_parameter"],
+                        "changed_value": case["changed_value"],
+                        "decode_policy": case["decode_policy"],
+                        "conditioning": case["conditioning"],
+                    }
+                    for case in cases
+                ]
+            zone_reports.append(
+                {
+                    "zone_id": zone_id,
+                    "output": str(zone_output.relative_to(output)),
+                    "case_metrics": {
+                        case["case_id"]: case["metrics"] for case in cases
+                    },
+                    "elapsed_seconds": time.perf_counter() - zone_started,
+                }
+            )
+        write_json(
+            output / "run_summary.json",
+            {
+                "schema": "structured_ginn_v2_real_decode_policy_sensitivity_v1",
+                "status": "success",
+                "runtime": runtime,
+                "checkpoint": str(
+                    resolve_relative_path(args.checkpoint, root=REPO_ROOT)
+                ),
+                "checkpoint_source_training_schema": dict(
+                    checkpoint_metadata.get("training_state") or {}
+                ).get("schema"),
+                "lfm_run": str(observations.lfm_variant.run_dir),
+                "lfm_variant_id": observations.lfm_variant.variant_id,
+                "trace_selection": dict(observations.metadata["trace_selection"]),
+                "highres_interval": float(args.highres_interval),
+                "evidence_reused_across_cases": True,
+                "one_at_a_time": True,
+                "cases": published_cases,
+                "zones": zone_reports,
+                "elapsed_seconds": time.perf_counter() - started,
+            },
+        )
+        logger.info(
+            "real decode sensitivity finished | zones=%d | cases=%d | "
+            "elapsed=%.1fs | output=%s",
+            len(zone_reports),
+            len(published_cases or ()),
+            time.perf_counter() - started,
+            output,
+        )
+        return
+    if args.command == "generate-real-section":
+        generator, checkpoint_metadata = load_checkpoint(
+            resolve_relative_path(args.checkpoint, root=REPO_ROOT),
+            device=device,
+        )
+        generator.set_decode_policy(_decode_policy(config))
+        if generator.network_config.input_mode != "full":
+            raise ValueError("real section generation requires a full checkpoint.")
+        if generator.profile_head is None or generator.semi_markov_prior is None:
+            raise ValueError(
+                "real section generation requires a complete profile/HSMM checkpoint."
+            )
+        if generator.network_config.use_lateral_context:
+            raise ValueError(
+                "the initial real section gate expects the frozen single-trace checkpoint."
+            )
+        logger.info(
+            "real section assembly start | variant=%s | device=%s",
+            args.variant_id,
+            device,
+        )
+        started = time.perf_counter()
+        observations = load_real_section_observations(
+            workflow_config=args.workflow_config,
+            lfm_run_dir=args.lfm_run,
+            variant_id=args.variant_id,
+            well_control_run_dir=args.well_control_run,
+            forward_model_inputs=args.forward_model_inputs,
+            target_seismic_scale=generator.network_config.seismic_scale,
+            target_lfm_residual_scale=generator.network_config.lfm_residual_scale,
+            highres_interval=float(args.highres_interval),
+            repo_root=REPO_ROOT,
+        )
+        logger.info(
+            "real section assembled | traces=%d | samples=%d | zones=%d | "
+            "seismic_scale_factor=%.7g | elapsed=%.1fs",
+            observations.full_lfm.shape[0],
+            observations.full_lfm.shape[1],
+            len(observations.tiles),
+            observations.seismic_scale_factor,
+            time.perf_counter() - started,
+        )
+        for zone_id, scales in dict(
+            observations.metadata["zone_input_scales"]
+        ).items():
+            logger.info(
+                "real input scale | zone=%s | lfm_residual_abs_p95=%.6g | "
+                "checkpoint_p95=%.6g | ratio=%.3f",
+                zone_id,
+                scales["lfm_residual_abs_p95"],
+                scales["checkpoint_lfm_residual_abs_p95"],
+                scales["lfm_residual_scale_ratio"],
+            )
+        zone_reports: list[dict[str, Any]] = []
+        for zone_number, (zone_id, tile) in enumerate(
+            zip(observations.zone_ids, observations.tiles, strict=True),
+            start=1,
+        ):
+            zone_started = time.perf_counter()
+            prediction = infer_section(generator, tile)
+            zone_output = save_real_section_prediction(
+                output / f"zone_{zone_number:02d}_{zone_id}",
+                prediction,
+                observation=tile,
+                raw_seismic=observations.raw_seismic,
+                full_lfm=observations.full_lfm,
+                ilines=observations.ilines,
+                xlines=observations.xlines,
+                input_metadata={
+                    **dict(observations.metadata),
+                    "zone_id": zone_id,
+                    "lfm_run": str(observations.lfm_variant.run_dir),
+                    "lfm_variant_id": observations.lfm_variant.variant_id,
+                },
+            )
+            zone_report = {
+                "zone_id": zone_id,
+                "output": str(zone_output.relative_to(output)),
+                "supported_traces": int(tile.lateral_valid.sum()),
+                "total_traces": int(tile.width),
+                "segment_count": len(prediction.realization.segments),
+                "conditional_log_score": prediction.realization.conditional_log_score,
+                "diagnostics": dict(prediction.diagnostics),
+            }
+            zone_reports.append(zone_report)
+            logger.info(
+                "real section zone generated | zone=%d/%d | id=%s | "
+                "supported=%d/%d | segments=%d | elapsed=%.1fs",
+                zone_number,
+                len(observations.tiles),
+                zone_id,
+                zone_report["supported_traces"],
+                zone_report["total_traces"],
+                zone_report["segment_count"],
+                time.perf_counter() - zone_started,
+            )
+        write_json(
+            output / "run_summary.json",
+            {
+                "schema": "structured_ginn_v2_real_section_v1",
+                "status": "success",
+                "runtime": runtime,
+                "checkpoint": str(
+                    resolve_relative_path(args.checkpoint, root=REPO_ROOT)
+                ),
+                "checkpoint_contract": {
+                    "target_contract": generator.target_contract.to_mapping(),
+                    "network_config": asdict(generator.network_config),
+                    "has_profile_head": generator.profile_head is not None,
+                    "has_semi_markov_contract": (
+                        generator.semi_markov_prior is not None
+                    ),
+                    "source_training_schema": dict(
+                        checkpoint_metadata.get("training_state") or {}
+                    ).get("schema"),
+                },
+                "workflow_config": str(
+                    resolve_relative_path(args.workflow_config, root=REPO_ROOT)
+                ),
+                "lfm_run": str(observations.lfm_variant.run_dir),
+                "lfm_variant_id": observations.lfm_variant.variant_id,
+                "well_control_run": str(
+                    observations.lfm_variant.well_control_run_dir
+                ),
+                "highres_interval": float(args.highres_interval),
+                "input_metadata": dict(observations.metadata),
+                "trace_count": int(observations.full_lfm.shape[0]),
+                "sample_count": int(observations.full_lfm.shape[1]),
+                "zones": zone_reports,
+                "elapsed_seconds": time.perf_counter() - started,
+                "scientific_scope": {
+                    "learned_lateral_context": False,
+                    "no_seismic_attribution": False,
+                    "purpose": "frozen_single_trace_real_section_feasibility",
+                },
+            },
+        )
+        logger.info(
+            "real section generation finished | zones=%d | elapsed=%.1fs | output=%s",
+            len(zone_reports),
+            time.perf_counter() - started,
+            output,
+        )
+        return
     if args.command == "generate-sections":
         generator, checkpoint_metadata = load_checkpoint(
             resolve_relative_path(args.checkpoint, root=REPO_ROOT),
             device=device,
         )
+        generator.set_decode_policy(_decode_policy(config))
         if generator.network_config.input_mode != "full":
             raise ValueError("section generation requires a full checkpoint.")
         if generator.profile_head is None:
@@ -913,6 +1286,7 @@ def main() -> None:
             resolve_relative_path(args.checkpoint, root=REPO_ROOT),
             device=device,
         )
+        generator.set_decode_policy(_decode_policy(config))
         if generator.network_config.input_mode != "full":
             raise ValueError("HSMM oracle requires a full evidence checkpoint.")
         if generator.profile_head is None:
@@ -1012,6 +1386,7 @@ def main() -> None:
                 "prior_parent_count": len(prior_parent_ids),
                 "calibration_parent_count": len(parent_ids),
                 "conditioning": conditioning.to_mapping(),
+                "decode_policy": generator.decode_policy.to_mapping(),
                 "generator": str(output / "generator.pt"),
             },
         )

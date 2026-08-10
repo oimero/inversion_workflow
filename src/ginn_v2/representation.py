@@ -303,6 +303,73 @@ def decode_segments_numpy(
     return output, state
 
 
+def canonicalize_same_state_segments(
+    evidence: ObservableEvidence,
+    segments: Iterable[Segment],
+    *,
+    merge_scale_fraction: float,
+) -> tuple[tuple[Segment, ...], int]:
+    """Merge adjacent same-state profiles unresolved by public evidence scale."""
+
+    fraction = float(merge_scale_fraction)
+    if not np.isfinite(fraction) or fraction <= 0.0:
+        raise ValueError("merge_scale_fraction must be finite and positive.")
+    ordered = tuple(segments)
+    if not ordered:
+        raise InputContractError("same-state canonicalization requires segments.")
+    model_axis = evidence.model_axis.coordinates
+    highres_axis = evidence.highres_axis.coordinates
+    published: list[Segment] = []
+    merge_count = 0
+
+    def profile(segment: Segment) -> np.ndarray:
+        return profile_basis(segment.stop_index - segment.start_index) @ np.asarray(
+            (segment.c0, segment.c1, segment.c2),
+            dtype=np.float64,
+        )
+
+    for current in ordered:
+        if published:
+            previous = published[-1]
+            if (
+                previous.trace_index == current.trace_index
+                and previous.state_id == current.state_id
+                and previous.stop_index == current.start_index
+            ):
+                values = np.r_[profile(previous), profile(current)]
+                coefficients = np.asarray(
+                    fit_profile_coefficients(values),
+                    dtype=np.float64,
+                )
+                fitted = profile_basis(values.size) @ coefficients
+                rmse = float(np.sqrt(np.mean((fitted - values) ** 2)))
+                trace = current.trace_index
+                support = evidence.support[trace]
+                coordinates = highres_axis[
+                    previous.start_index : current.stop_index
+                ]
+                local_scale = np.interp(
+                    coordinates,
+                    model_axis[support],
+                    evidence.projected_log_ai_increment_scale[trace, support],
+                )
+                threshold = fraction * float(np.mean(local_scale))
+                if rmse <= threshold:
+                    published[-1] = Segment(
+                        trace_index=trace,
+                        state_id=current.state_id,
+                        start_index=previous.start_index,
+                        stop_index=current.stop_index,
+                        c0=float(coefficients[0]),
+                        c1=float(coefficients[1]),
+                        c2=float(coefficients[2]),
+                    )
+                    merge_count += 1
+                    continue
+        published.append(current)
+    return tuple(published), merge_count
+
+
 def decode_segments_torch(
     background_highres: torch.Tensor,
     trace_index: torch.Tensor,
@@ -472,6 +539,7 @@ __all__ = [
     "SEGMENT_PROFILE_FEATURES",
     "build_lfm_anchor",
     "build_segment_profile_features",
+    "canonicalize_same_state_segments",
     "lfm_residual_from_anchor",
     "decode_segments_numpy",
     "decode_segments_torch",

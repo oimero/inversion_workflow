@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 import numpy as np
-from scipy.special import logsumexp
+from scipy.special import expit, logsumexp
 
 from ginn_v2.contracts import NumericalFailure
 
@@ -41,10 +41,6 @@ class SemiMarkovPrior:
             raise ValueError(
                 "semi-Markov initial/duration probabilities must be positive; "
                 "transition rows may contain structural zeroes."
-            )
-        if np.any(np.diag(transition) != 0.0):
-            raise ValueError(
-                "high-resolution semi-Markov prior forbids adjacent equal states."
             )
         maximum = float(self.maximum_duration_fraction)
         if not np.isfinite(maximum) or not 0.0 < maximum <= 1.0:
@@ -98,7 +94,11 @@ class SemiMarkovPrior:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "SemiMarkovPrior":
         if (
-            value.get("schema") != "structured_ginn_v2_semi_markov_prior_v1"
+            value.get("schema")
+            not in {
+                "structured_ginn_v2_semi_markov_prior_v1",
+                "structured_ginn_v2_semi_markov_prior_v2",
+            }
             or value.get("duration_unit") != "zone_fraction"
         ):
             raise ValueError("unsupported semi-Markov prior schema.")
@@ -112,7 +112,7 @@ class SemiMarkovPrior:
 
     def to_mapping(self) -> dict[str, Any]:
         return {
-            "schema": "structured_ginn_v2_semi_markov_prior_v1",
+            "schema": "structured_ginn_v2_semi_markov_prior_v2",
             "duration_unit": "zone_fraction",
             "initial_probability": self.initial_probability.tolist(),
             "transition_probability": self.transition_probability.tolist(),
@@ -120,6 +120,142 @@ class SemiMarkovPrior:
             "duration_fraction_std": self.duration_fraction_std.tolist(),
             "maximum_duration_fraction": float(self.maximum_duration_fraction),
         }
+
+
+@dataclass(frozen=True)
+class SemiMarkovDecodePolicy:
+    """Versioned evidence-to-renewal and renewal-state semantics."""
+
+    renewal_snr_threshold: float = 0.75
+    renewal_snr_temperature: float = 0.35
+    minimum_renewal_probability: float = 0.05
+    maximum_renewal_probability: float = 0.95
+    same_state_renewal_probability: float = 0.50
+    same_state_merge_scale_fraction: float = 0.25
+
+    def __post_init__(self) -> None:
+        positive = ("renewal_snr_temperature",)
+        finite = (
+            "renewal_snr_threshold",
+            "renewal_snr_temperature",
+            "minimum_renewal_probability",
+            "maximum_renewal_probability",
+            "same_state_renewal_probability",
+            "same_state_merge_scale_fraction",
+        )
+        for name in finite:
+            value = float(getattr(self, name))
+            if not np.isfinite(value):
+                raise ValueError(f"{name} must be finite.")
+            object.__setattr__(self, name, value)
+        for name in positive:
+            if getattr(self, name) <= 0.0:
+                raise ValueError(f"{name} must be positive.")
+        if self.renewal_snr_threshold < 0.0:
+            raise ValueError("renewal_snr_threshold cannot be negative.")
+        if not (
+            0.0 < self.minimum_renewal_probability
+            < self.maximum_renewal_probability
+            < 1.0
+        ):
+            raise ValueError(
+                "renewal probability limits must satisfy 0 < minimum < maximum < 1."
+            )
+        if not 0.0 < self.same_state_renewal_probability < 1.0:
+            raise ValueError(
+                "same_state_renewal_probability must lie strictly between 0 and 1."
+            )
+        if self.same_state_merge_scale_fraction <= 0.0:
+            raise ValueError("same_state_merge_scale_fraction must be positive.")
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "SemiMarkovDecodePolicy":
+        parsed = dict(value)
+        schema = parsed.pop("schema", None)
+        if schema not in {
+            None,
+            "structured_ginn_v2_semi_markov_decode_policy_v1",
+        }:
+            raise ValueError("unsupported semi-Markov decode policy schema.")
+        allowed = {
+            "renewal_snr_threshold",
+            "renewal_snr_temperature",
+            "minimum_renewal_probability",
+            "maximum_renewal_probability",
+            "same_state_renewal_probability",
+            "same_state_merge_scale_fraction",
+        }
+        unknown = sorted(set(parsed).difference(allowed))
+        if unknown:
+            raise ValueError(f"unknown semi-Markov decode policy keys: {unknown}")
+        return cls(**parsed)
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema": "structured_ginn_v2_semi_markov_decode_policy_v1",
+            "renewal_snr_threshold": self.renewal_snr_threshold,
+            "renewal_snr_temperature": self.renewal_snr_temperature,
+            "minimum_renewal_probability": self.minimum_renewal_probability,
+            "maximum_renewal_probability": self.maximum_renewal_probability,
+            "same_state_renewal_probability": self.same_state_renewal_probability,
+            "same_state_merge_scale_fraction": (
+                self.same_state_merge_scale_fraction
+            ),
+        }
+
+
+def renewal_probability_from_reflectivity(
+    mean: np.ndarray,
+    scale: np.ndarray,
+    policy: SemiMarkovDecodePolicy,
+) -> np.ndarray:
+    """Map public signed-reflectivity evidence to bounded renewal activity."""
+
+    location = np.asarray(mean, dtype=np.float64)
+    uncertainty = np.asarray(scale, dtype=np.float64)
+    if location.shape != uncertainty.shape or location.ndim != 1:
+        raise ValueError("reflectivity mean/scale must share one sample vector.")
+    if (
+        np.any(~np.isfinite(location))
+        or np.any(~np.isfinite(uncertainty))
+        or np.any(uncertainty <= 0.0)
+    ):
+        raise ValueError("reflectivity evidence must be finite with positive scale.")
+    signal_to_noise = np.abs(location) / uncertainty
+    probability = expit(
+        (signal_to_noise - policy.renewal_snr_threshold)
+        / policy.renewal_snr_temperature
+    )
+    return np.clip(
+        probability,
+        policy.minimum_renewal_probability,
+        policy.maximum_renewal_probability,
+    )
+
+
+def prior_with_same_state_renewal(
+    prior: SemiMarkovPrior,
+    probability: float,
+) -> SemiMarkovPrior:
+    """Separate renewal-state persistence from conditional state changes."""
+
+    persistence = float(probability)
+    if not np.isfinite(persistence) or not 0.0 < persistence < 1.0:
+        raise ValueError("same-state renewal probability must lie in (0, 1).")
+    change = np.asarray(prior.transition_probability, dtype=np.float64).copy()
+    np.fill_diagonal(change, 0.0)
+    total = np.sum(change, axis=1, keepdims=True)
+    if np.any(total <= 0.0):
+        raise ValueError("state-change prior must support an off-diagonal transition.")
+    transition = (1.0 - persistence) * change / total
+    np.fill_diagonal(transition, persistence)
+    return SemiMarkovPrior(
+        initial_probability=prior.initial_probability,
+        transition_probability=transition,
+        duration_fraction_mean=prior.duration_fraction_mean,
+        duration_fraction_std=prior.duration_fraction_std,
+        maximum_duration_fraction=prior.maximum_duration_fraction,
+    )
 
 
 def _log_probability_array(value: np.ndarray) -> np.ndarray:
@@ -543,9 +679,12 @@ def exact_semi_markov_posterior(
 __all__ = [
     "SampledPath",
     "SemiMarkovConditioning",
+    "SemiMarkovDecodePolicy",
     "SemiMarkovMarginals",
     "SemiMarkovPosterior",
     "SemiMarkovPrior",
     "exact_semi_markov_posterior",
+    "prior_with_same_state_renewal",
+    "renewal_probability_from_reflectivity",
     "viterbi_semi_markov_path",
 ]

@@ -31,6 +31,7 @@ from ginn_v2.representation import (
     SEGMENT_PROFILE_FEATURES,
     build_lfm_anchor,
     build_segment_profile_features,
+    canonicalize_same_state_segments,
     decode_segments_numpy,
     lfm_residual_from_anchor,
     path_to_highres_extents,
@@ -39,8 +40,11 @@ from ginn_v2.representation import (
 )
 from ginn_v2.semi_markov import (
     SemiMarkovConditioning,
+    SemiMarkovDecodePolicy,
     SemiMarkovPrior,
     exact_semi_markov_posterior,
+    prior_with_same_state_renewal,
+    renewal_probability_from_reflectivity,
 )
 
 
@@ -129,6 +133,7 @@ class ConditionalGenerator:
         coefficient_variance_calibration: CoefficientVarianceCalibration | None = None,
         semi_markov_prior: SemiMarkovPrior | None = None,
         semi_markov_conditioning: SemiMarkovConditioning | None = None,
+        decode_policy: SemiMarkovDecodePolicy = SemiMarkovDecodePolicy(),
         device: str | torch.device = "cpu",
     ) -> None:
         if not np.isfinite(dominant_frequency_hz) or dominant_frequency_hz <= 0.0:
@@ -154,6 +159,9 @@ class ConditionalGenerator:
             raise ValueError("semi-Markov prior and conditioning must be supplied together.")
         self.semi_markov_prior = semi_markov_prior
         self.semi_markov_conditioning = semi_markov_conditioning
+        if not isinstance(decode_policy, SemiMarkovDecodePolicy):
+            raise TypeError("decode_policy must be SemiMarkovDecodePolicy.")
+        self.decode_policy = decode_policy
 
     @property
     def network_config(self) -> EvidenceNetworkConfig:
@@ -249,13 +257,41 @@ class ConditionalGenerator:
     def predict(self, tile: ObservationTile) -> StructuredPrediction:
         """Observe and decode one deterministic structured MAP prediction."""
 
-        return self._decode_evidence(self.observe(tile))
+        return self.decode(self.observe(tile))
+
+    def decode(
+        self,
+        evidence: ObservableEvidence,
+        *,
+        policy: SemiMarkovDecodePolicy | None = None,
+        conditioning: SemiMarkovConditioning | None = None,
+    ) -> StructuredPrediction:
+        """Decode cached evidence under one explicit deterministic policy."""
+
+        resolved_policy = self.decode_policy if policy is None else policy
+        resolved_conditioning = (
+            self.semi_markov_conditioning
+            if conditioning is None
+            else conditioning
+        )
+        if not isinstance(resolved_policy, SemiMarkovDecodePolicy):
+            raise TypeError("policy must be SemiMarkovDecodePolicy.")
+        if not isinstance(resolved_conditioning, SemiMarkovConditioning):
+            raise TypeError("conditioning must be SemiMarkovConditioning.")
+        return self._decode_evidence(
+            evidence,
+            policy=resolved_policy,
+            conditioning=resolved_conditioning,
+        )
 
     def _decode_evidence(
         self,
         evidence: ObservableEvidence,
+        *,
+        policy: SemiMarkovDecodePolicy,
+        conditioning: SemiMarkovConditioning,
     ) -> StructuredPrediction:
-        """Internal seam used after directional evidence fusion."""
+        """Implementation behind the cached-evidence decode interface."""
 
         if self.profile_head is None:
             raise RuntimeError("structured prediction requires a profile head.")
@@ -272,6 +308,14 @@ class ConditionalGenerator:
         segments: list[Segment] = []
         forward_recursions = 0
         conditional_log_score = 0.0
+        renewal_evidence_sum = 0.0
+        renewal_evidence_count = 0
+        same_state_renewal_count = 0
+        state_change_count = 0
+        decoding_prior = prior_with_same_state_renewal(
+            self.semi_markov_prior,
+            policy.same_state_renewal_probability,
+        )
 
         for trace in range(model_shape[0]):
             model_indices = np.flatnonzero(evidence.support[trace])
@@ -287,16 +331,28 @@ class ConditionalGenerator:
                 raise InputContractError(
                     "each deterministic trace requires one contiguous model/highres zone."
                 )
+            renewal_evidence = renewal_probability_from_reflectivity(
+                evidence.signed_reflectivity_mean[trace, model_indices],
+                evidence.signed_reflectivity_scale[trace, model_indices],
+                policy,
+            )
             posterior = exact_semi_markov_posterior(
                 np.exp(evidence.state_log_potential[trace, model_indices]),
-                np.full(model_indices.size, 0.5, dtype=np.float64),
-                self.semi_markov_prior,
-                self.semi_markov_conditioning,
+                renewal_evidence,
+                decoding_prior,
+                conditioning,
             )
             marginals = posterior.marginals()
             state_probability[trace, model_indices] = marginals.state_probability
             renewal_probability[trace, model_indices] = marginals.renewal_probability
             path = posterior.map_path()
+            for previous, current in zip(path.segments[:-1], path.segments[1:]):
+                if previous[0] == current[0]:
+                    same_state_renewal_count += 1
+                else:
+                    state_change_count += 1
+            renewal_evidence_sum += float(np.sum(renewal_evidence))
+            renewal_evidence_count += int(renewal_evidence.size)
             conditional_log_score += float(path.log_score)
             mapped = path_to_highres_extents(
                 path,
@@ -326,6 +382,13 @@ class ConditionalGenerator:
 
         if not segments:
             raise InputContractError("deterministic prediction has no supported segments.")
+        latent_segment_count = len(segments)
+        canonical_segments, canonical_merge_count = canonicalize_same_state_segments(
+            evidence,
+            segments,
+            merge_scale_fraction=policy.same_state_merge_scale_fraction,
+        )
+        segments = list(canonical_segments)
         decoded, state_highres = decode_segments_numpy(
             evidence.background_lfm_linear_highres,
             segments,
@@ -343,6 +406,14 @@ class ConditionalGenerator:
                 "deterministic prediction has no complete projection support."
             )
 
+        bandlimited = (
+            evidence.background_lfm_linear
+            + evidence.projected_log_ai_increment_mean
+        )
+        consistency = projection_support & np.isfinite(bandlimited)
+        projection_consistency_rmse = float(
+            np.sqrt(np.mean((projected[consistency] - bandlimited[consistency]) ** 2))
+        )
         realization = StructuredRealization(
             log_ai_highres=decoded,
             state_highres=state_highres,
@@ -358,7 +429,30 @@ class ConditionalGenerator:
             diagnostics={
                 "semi_markov_forward_recursions": float(forward_recursions),
                 "deterministic_map": 1.0,
-                "map_segment_count": float(len(segments)),
+                "map_segment_count": float(latent_segment_count),
+                "published_segment_count": float(len(segments)),
+                "canonical_same_state_merge_count": float(
+                    canonical_merge_count
+                ),
+                "map_same_state_renewal_count": float(same_state_renewal_count),
+                "map_state_change_count": float(state_change_count),
+                "renewal_evidence_mean": float(
+                    renewal_evidence_sum / max(renewal_evidence_count, 1)
+                ),
+                "same_state_renewal_probability": float(
+                    policy.same_state_renewal_probability
+                ),
+                "renewal_snr_threshold": float(policy.renewal_snr_threshold),
+                "same_state_merge_scale_fraction": float(
+                    policy.same_state_merge_scale_fraction
+                ),
+                "duration_temperature": float(
+                    conditioning.duration_temperature
+                ),
+                "transition_temperature": float(
+                    conditioning.transition_temperature
+                ),
+                "projection_consistency_rmse": projection_consistency_rmse,
                 "projection_supported_samples": float(
                     np.count_nonzero(projection_support)
                 ),
@@ -395,6 +489,13 @@ class ConditionalGenerator:
             raise ValueError("generator already has a semi-Markov contract.")
         self.semi_markov_prior = prior
         self.semi_markov_conditioning = conditioning
+
+    def set_decode_policy(self, policy: SemiMarkovDecodePolicy) -> None:
+        """Set one versioned deterministic decode policy before inference."""
+
+        if not isinstance(policy, SemiMarkovDecodePolicy):
+            raise TypeError("decode policy must be SemiMarkovDecodePolicy.")
+        self.decode_policy = policy
 
     def parameterize_segments(
         self,
@@ -435,7 +536,7 @@ class ConditionalGenerator:
     def state_dict_payload(self) -> dict[str, Any]:
         payload = {
             "schema": (
-                "structured_ginn_v2_generator_v7"
+                "structured_ginn_v2_generator_v8"
                 if self.semi_markov_prior is not None
                 else (
                     "structured_ginn_v2_generator_v5"
@@ -452,6 +553,7 @@ class ConditionalGenerator:
             "target_contract": self.target_contract.to_mapping(),
             "dominant_frequency_hz": self.dominant_frequency_hz,
             "sample_domain": self.sample_domain,
+            "decode_policy": self.decode_policy.to_mapping(),
         }
         if self.profile_head is not None:
             payload["profile_head_config"] = asdict(self.profile_head.config)
@@ -482,6 +584,7 @@ class ConditionalGenerator:
             "structured_ginn_v2_generator_v4",
             "structured_ginn_v2_generator_v5",
             "structured_ginn_v2_generator_v7",
+            "structured_ginn_v2_generator_v8",
         }:
             raise ValueError("unsupported Structured GINN V2 checkpoint schema.")
         target_contract = ObservableTargetContract.from_mapping(
@@ -495,6 +598,7 @@ class ConditionalGenerator:
             "structured_ginn_v2_generator_v4",
             "structured_ginn_v2_generator_v5",
             "structured_ginn_v2_generator_v7",
+            "structured_ginn_v2_generator_v8",
         }:
             profile_head = SegmentProfileHead(
                 SegmentProfileHeadConfig.from_mapping(payload["profile_head_config"])
@@ -507,13 +611,21 @@ class ConditionalGenerator:
             )
         semi_markov_prior = None
         semi_markov_conditioning = None
-        if schema == "structured_ginn_v2_generator_v7":
+        if schema in {
+            "structured_ginn_v2_generator_v7",
+            "structured_ginn_v2_generator_v8",
+        }:
             semi_markov_prior = SemiMarkovPrior.from_mapping(
                 payload["semi_markov_prior"]
             )
             semi_markov_conditioning = SemiMarkovConditioning.from_mapping(
                 payload["semi_markov_conditioning"]
             )
+        decode_policy = (
+            SemiMarkovDecodePolicy.from_mapping(payload["decode_policy"])
+            if "decode_policy" in payload
+            else SemiMarkovDecodePolicy()
+        )
         return cls(
             network,
             target_contract=target_contract,
@@ -523,6 +635,7 @@ class ConditionalGenerator:
             coefficient_variance_calibration=variance_calibration,
             semi_markov_prior=semi_markov_prior,
             semi_markov_conditioning=semi_markov_conditioning,
+            decode_policy=decode_policy,
             device=device,
         )
 

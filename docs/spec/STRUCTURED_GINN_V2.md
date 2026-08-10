@@ -9,23 +9,26 @@ Structured GINN V2 的目标是：
 第一版采用确定性条件生成：
 
 ```text
-seismic + full LFM + 1D lateral context
+seismic + full LFM
 → ObservableEvidence
-→ deterministic exact HSMM MAP
-→ deterministic segment profile
+→ evidence-guided renewal + deterministic exact HSMM MAP
+→ macro state bodies + same-state sub-resolution renewals
+→ canonical deterministic segment profile
 → high-resolution log-AI
 ```
 
-LFM 负责 zone 内低频背景；地震网络只恢复当前频带和调谐尺度能够约束的增量、状态与
-有符号反射证据；半马尔科夫先验负责亚调谐 segment 的状态转移、持续时间和微边界。
+LFM 负责 zone 内低频背景；地震网络恢复当前频带和调谐尺度能够约束的增量、状态与
+有符号反射证据。结构解码先用反射证据定位宏观地质体变化，再用显式亚调谐先验
+填充高分辨率细节。状态持续与 segment renewal 是两个独立变量：renewal 不强制状态变化。
 最终交付是一个完整、合法、可复现的结构化预测。
 
 高分辨率表示生成器能够依据观测与井标定先验构造细网格地质模型。它不表示地震逐层
 分辨了所有微层。每个预测同时发布证据强度、方向分歧和先验敏感性，区分地震支持的
 带限结构与先验补全的亚调谐细节。
 
-第一版的最高空间复杂度是一维横向模型。真实三维体由同一个模型沿 inline 和 xline
-分别提取证据，融合证据后执行一次确定性结构解码。
+当前 checkpoint 是逐道模型，同一剖面上各道共享 LFM、层位、HSMM prior 和确定性
+解码合同。先在真实固定剖面上验证 zero-shot 可行性，再根据真实失败形式决定是否
+训练一维横向模型。
 
 ## 2. 已有证据与固定决定
 
@@ -72,15 +75,30 @@ ensemble mean 的平滑来自成员平均，不代表任一合法成员具有连
 
 ### 2.4 相邻同状态 segment
 
-producer 的基础状态转移矩阵不包含对角转移；横向 birth/death 或 pinchout 移除中间对象后，
-两个同状态 producer objects 仍可能在一条道上接触。确定性路线将连续同状态样点规范为一个
-最大 state run：接触处的 object seam 不构成 HSMM renewal。
+producer 的基础状态转移矩阵表达“发生状态变化时转向哪一类”。segment renewal
+单独表达 profile 参数、厚度或地层事件开始新周期。一次 renewal 可以保持原状态，
+因此高阻、背景或低阻地质体可以跨越多个亚调谐 segment 持续存在。
 
-transition 和 duration prior 从这些 high-resolution 最大 state runs 标定，主对角线固定为零；
-model-grid 审计也只在状态实际变化处建立 renewal。这样可以避免在弱证据真实数据上产生
-数值近似、地震上不可区分的连续同状态段。
+same-state renewal probability 是独立、版本化的亚调谐生成先验。V3 producer 的
+直接对象转移不包含同状态；横向 birth/death 后实际同状态接触约占 `0.49%`。
+这一统计只负责 provenance，不代替真实工区的细分密度先验。
 
-### 2.5 不确定性范围
+相邻同状态 segment 参数化后，若合并成一个 profile 的误差低于公开 evidence scale
+规定的阈值，则发布为一个 canonical segment。只有参数差异能够形成可审计的 profile
+变化时，same-state seam 才保留在 segment table 中。
+
+### 2.5 真实剖面暴露的解码缺口
+
+首轮真实剖面表明 band-limited increment evidence 具有可读性，但结构解码存在先验驱动
+周期条带。直接原因是 renewal evidence 使用中性常数，duration prior 频繁切段，
+同时零对角 transition 强制低/高阻段回到背景态。真实结果中约 `80%` 的段厚不超过
+`10 m`，而 state evidence 中位最大概率仅为 `0.482`。
+
+该结果将 band-limited evidence 标记为有效阶段产物，将当前 high-resolution deterministic
+realization 标记为未通过真实剖面门禁。结构解码需要先完成 evidence-guided renewal、
+same-state renewal 和带限投影一致性，再进入真实井解释。
+
+### 2.6 不确定性范围
 
 第一版发布以下确定性诊断：
 
@@ -139,10 +157,12 @@ pinchout 道标记为 unsupported，不使用单点常数拟合或 zone 外插�
 
 `SemiMarkovPrior` 是独立、版本化的科学合同：
 
-- transition 和 initial probability 从 training parents 的 high-resolution truth 标定；
+- initial probability 和 conditional state-change transition 从 training parents 的 high-resolution truth 标定；
+- renewal 的 state persistence mass 与 conditional state-change transition 分开发布；
 - duration 单位为 segment thickness / zone thickness；
 - 运行时依据当前 SampleAxis 离散为合法 duration bins；
 - density 由 duration prior 控制，不焊接在网络停止概率中；
+- renewal likelihood 由 signed reflectivity 的均值/尺度构造，弱证据不为微边界提供高置信度；
 - 主 prior 在 tuning/calibration 后冻结；
 - 真实工区的 dense-prior sensitivity 作为独立结果发布。
 
@@ -168,9 +188,11 @@ evidence = generator.observe(observation_tile)  # 诊断与对照
 ```text
 input normalization
 → ObservableEvidence
+→ reflectivity-to-renewal calibration
 → exact forward-backward + Viterbi MAP
 → segment extents
 → deterministic profile means
+→ equivalent same-state canonicalization
 → high-resolution decoder
 → finite-support projection
 ```
@@ -211,11 +233,13 @@ StructuredPrediction
 
 - `ConditionalGenerator.observe()` 与 `ConditionalGenerator.predict()` 构成唯一结构解码入口；
 - exact semi-Markov forward-backward、marginals 和 Viterbi 保留，MAP 是生产输出；
-- HSMM prior calibration 读取 canonical high-resolution segment table，将接触的同状态对象
-  规范为最大 state run，再以 zone fraction 统计 duration；
+- HSMM prior calibration 读取 canonical high-resolution segment table，以 producer object
+  为 duration 统计单位，并将非对角接触归一化为 conditional state-change transition；
+- same-state renewal mass 由独立、版本化的 decode policy 提供，不从 producer 中稀少的
+  偶发同状态接触反推；
 - segment profile head 输出确定性 mean，系数 variance 作为诊断校准量；
-- HSMM calibration 将 prior、选定 conditioning 和 profile head 一并发布为 V7
-  deterministic generator checkpoint；
+- HSMM calibration 将 prior、选定 conditioning、decode policy 和 profile head 一并发布为
+  V8 deterministic generator checkpoint；
 - 随机候选、ensemble summary、空间随机耦合和成员选择代码已从生产链移除；
 - section/volume inference 先融合 evidence，再执行一次结构解码；
 - 结构化 artifact 只保存一个确定性预测、marginals、segment table 和 support；
@@ -259,22 +283,28 @@ scaled (full_lfm - background_lfm_linear)
 observed validity
 ```
 
-固定训练 full model 和 no-seismic control；matched within-parent seismic shuffle 作为推理
-干预。每个 head 独立报告指标，总 loss 只用于优化。
+当前已冻结 full model。no-seismic control 和 matched within-parent seismic shuffle 用于后续
+地震归因审计，不是首轮真实剖面生成的运行依赖。每个 head 独立报告指标，
+总 loss 只用于优化。
 
 ### 6.2 Deterministic HSMM MAP
 
 每道、每个 zone 执行：
 
 ```text
-state log potential + frozen transition/duration prior
+state log potential + signed-reflectivity renewal evidence
++ state-persistence/change transition + frozen duration prior
 → exact forward-backward
 → state/renewal marginals
 → deterministic Viterbi MAP
 ```
 
-Viterbi 的并列规则固定并写入合同。MAP 必须覆盖整个 zone，segment duration 合法，相邻状态
-符合 transition prior。证据权重和 prior temperature 只在 tuning/calibration 上选择一次。
+renewal probability 使用 `abs(reflectivity_mean) / reflectivity_scale` 的版本化单调变换。
+阈值、温度、上下限和 same-state renewal mass 是显式 decode policy，随每次预测产物发布。
+
+Viterbi 的并列规则固定并写入合同。MAP 必须覆盖整个 zone，segment duration 合法，
+相邻 segment 可以具有同一状态。证据权重、prior temperature 和 decode policy 只在
+tuning/calibration 上选择一次，真实剖面不逐道调参。
 
 HSMM 首轮使用冻结 evidence，不让梯度穿过 MAP。参数 head 先用 truth segments 与合法
 boundary jitter 训练；随后仅用 MAP segments 做端到端评价。
@@ -290,7 +320,9 @@ parameter head 接收：
 
 输出为 LFM-relative `c0/c1/c2` mean。普通 segment 同时监督 decoded profile 和可识别系数；
 rank 不足或病态 segment 只监督 decoded profile。最终 decoder 在 high-resolution axis 上生成
-log-AI，再以正式 finite-support projection 返回 model grid。
+log-AI。相邻同状态 profile 经过 evidence-scale canonicalization，将观测上不可区分的 seam 合并。
+带限主结果为 `background_lfm_linear + projected_log_ai_increment_mean`；high-resolution
+realization 的 finite-support projection 是一致性诊断，完整垂向预测组装后统一执行。
 
 ### 6.4 阶段门禁
 
@@ -311,84 +343,78 @@ log-AI，再以正式 finite-support projection 返回 model grid。
 - matched seismic shuffle；
 - prior-only HSMM。
 
-进入阶段 2 要求：
+进入真实固定剖面要求：
 
-- full 相对 no-seismic 的 projected/high-resolution AI 配对改善置信区间为正；
-- matched shuffle 后地震收益下降；
+- full model 的 evidence、HSMM、profile 和 projection 在合成 calibration/section 上数值闭合；
 - MAP reconstruction 不显著破坏带限 evidence；
-- segment count 和 duration 不因 dirty 输入产生系统偏移；
+- renewal 相对普通位置在反射 evidence 峰值上显著富集；
+- prior-only 路径与 full evidence 路径在宏观 state body 上存在明确差异；
+- same-state policy 不产生周期性背景插入，canonicalization 不改变带限结果；
+- 冻结 checkpoint 可在同一公开 interface 上处理深度域真实 `ObservationTile`；
 - exact one-sample micro-boundary 不作为推进条件。
 
-## 7. 阶段 2：一维横向连续性
+## 7. 阶段 2：真实工区冻结剖面可行性
 
-### 7.1 横向模型
+### 7.1 目标与输入
 
-模型读取 21 道、约 `±250 m` 的一维横向 patch，只预测中心道 evidence。逐道垂向 encoder
-后接使用 `lateral_m` 和显式 mask 的 lateral mixer。
+该阶段先回答：
 
-训练短 patch 保留 25 道，使内侧 5 道具有完整上下文；边缘道只验证 mask 行为。横向 loss
-作用在 synthetic truth 中可比较的对象上：
+> 冻结的单道条件生成器在真实深度域剖面上，能否生成数值合法、视觉可读、
+> 与 LFM 和层位合同一致的高分辨率结构化 log-AI？
 
-- tuning-scale evidence；
-- state potential/occupancy；
-- projected log-AI；
-- 可对应 segment 的 duration/profile。
+首轮使用真实深度域 seismic、TVDSS `SampleAxis`、已解释 zone 顶底层位、
+比例切片克里金 full LFM 和冻结 full deterministic generator checkpoint。趋势 LFM
+作为第二次敏感性输入。深度域 AI–Vp relation 只用于 tuning-scale 与 forward 诊断。
 
-pinchout、birth/death 和 topology transition 通过 producer event identity mask 排除强制平滑。
+real-field adapter 只负责把 seismic、LFM、层位、XY 和纵向轴组装为
+`ObservationTile`。结构解码继续调用 `ConditionalGenerator.predict()`。
 
-### 7.2 Section 推理
+### 7.2 展开顺序
 
-完整 section 以滑动 patch 运行，每个中心道只产生一套 evidence。全部 evidence 组装完成后，
-每道执行一次相同的 deterministic HSMM 和 profile decoder。
+先运行少量固定剖面：
 
-横向连续性来自：
+- 2 条穿可信井剖面；
+- 1 条穿低质量井震标定剖面；
+- 1 条不穿井 blind section。
 
-1. 邻道上下文改变中心道 evidence；
-2. 横向一致性监督约束 evidence 与 profile；
-3. 所有道共享同一冻结 prior 和确定性并列规则。
+每个已知 zone 独立组装 tile 并解码。`lateral_m` 由实际 XY 路径累计，
+`xline_step=4` 只用于从线号解析 SEG-Y 几何。模型不额外平滑预测。
 
-segment alignment 只用于评价，不进入推理，也不修改最终预测。
+### 7.3 输出与诚实边界
 
-### 7.3 三维体的双方向融合
+每个 zone 保存：
 
-同一个一维模型沿 inline 和 xline 分别运行：
+- 原始 seismic、full LFM 与 zone-linear anchor；
+- projected increment evidence、signed reflectivity 和 state potential；
+- deterministic state path 与 segment table；
+- band-limited evidence log-AI、high-resolution log-AI 与完整垂向 projected consistency；
+- state/renewal marginals 与 entropy；
+- support mask、输入尺度统计与完整剖面图件。
 
-```text
-inline ObservableEvidence
-+ xline ObservableEvidence
-→ calibrated evidence fusion
-→ one deterministic HSMM/profile decode
-```
+真实剖面首先判断带限 evidence 是否可读，再判断 high-resolution decoder 是否通过。
+带限结果通过不自动使高分辨率结果通过。
 
-连续 mean 采用校准精度加权；state log potentials 在统一 temperature 后融合；scale 同时包含
-方向内尺度和方向间分歧。survey 边缘只有一个合法方向时使用该方向。
+### 7.4 剖面门禁
 
-微结构在 evidence 融合后只生成一次。首版三维推理不训练 inline-xline 二维输入网络。
+报告和人工图件审查至少检查：
 
-### 7.4 Section 门禁
+- 真实 seismic 和 LFM 有效区的 robust scale 是否落在 target contract 支持范围；
+- 线性 anchor、evidence、projected/high-resolution prediction 是否有限且轴对齐；
+- segment density、duration 和 state occupancy 是否明显偏离合成 calibration；
+- 是否存在逐道随机跳段、层位附近伪边界、周期性条带或支持缝隙；
+- 同状态续生是否形成可读地质体，而非数值近似的碎段表；
+- projected high-resolution 在有效 FIR 支持内是否与 band-limited evidence 一致；
+- 主 LFM 与趋势 LFM 下的带限结构是否稳定；
+- 穿井剖面上 prediction、full LFM、zone-linear anchor 与井 log-AI 的分频带对比。
 
-calibration 完成后，固定 section parents 只运行一次最终门禁。报告必须包含每类 geometry 的
-truth、evidence、prediction、increment 和 residual 图件；人工图件审查是正式验收的一部分。
+前 4 条剖面中出现非有限输出、大范围 unsupported、明显周期条带或密度崩塌时，
+停止全剖面/全体积展开，先定位输入支持、sim-to-real 或 prior 问题。
 
-数值检查包括：
+real-field adapter 和 `generate-real-section` 已完成 478 道 interface smoke。带限 evidence
+通过可读性审查；零对角 transition + neutral renewal 生成的 high-resolution realization
+未通过周期条带门禁。修订 decode policy 必须在同一剖面与合成 section 上对照验证。
 
-- projected/high-resolution lateral roughness 与 variogram；
-- 相邻道 segment-count jump；
-- tuning-scale boundary displacement consistency；
-- event survival、birth/death 和 pinchout false bridging；
-- direction reversal invariance；
-- patch/halo/stitching invariance；
-- neighbor shuffle 后横向收益下降；
-- 输出相对带限 evidence 的退化量。
-
-进入真实工区要求：
-
-- lateral model 相对 single-trace 改善横向连续性；
-- pinchout false bridging 没有增加；
-- prediction 保留阶段 1 的地震增量价值；
-- none、wedge、pinchout 的固定图件不存在明显条带、跳段和 stitching seam。
-
-## 8. 阶段 3：真实观测覆盖与冻结 zero-shot
+## 8. 阶段 3：横向能力与全体积
 
 ### 8.1 真实观测统计 profile
 
@@ -404,34 +430,29 @@ wavelet，覆盖：
 augmentation 保持同一 synthetic truth，并在 calibration 前冻结 profile 和 dirty identity。
 clean/dirty 成对评价，检查真实输入是否落入训练支持范围。
 
-### 8.2 固定剖面
+### 8.2 横向能力决策
 
-使用冻结的 full 与 no-seismic checkpoint，先运行：
+阶段 2 的真实结果决定实现路径：
 
-- 6 口可信井剖面；
-- 3 口低质量井震标定诊断剖面；
-- 至少 2 条不穿井 blind section。
+- 若单道结果已经满足业务剖面连续性，先补齐 no-seismic/干预归因和真实观测覆盖；
+- 若出现明显逐道跳段，训练 21 道、约 `±250 m` 的一维 lateral evidence model，
+  使用米制距离和显式 mask；
+- 若主要失败是 seismic/LFM OOD，先做 clean/dirty 配对训练；
+- 若主要失败是 segment 密度，优先校准版本化 duration prior，不改动 evidence 网络。
 
-比例切片克里金 LFM 是主输入，趋势 LFM 是敏感性输入。每条剖面保存：
+需要 lateral model 时，中心道 evidence 一次产生，pinchout/topology mask 不施加
+强制平滑。真实三维推理先融合 inline/xline evidence，然后只执行一次确定性
+结构解码。横向模型只有在连续性改善且不增加 pinchout false bridging 时才取代
+single-trace checkpoint。
 
-- deterministic state path 和 segment table；
-- high-resolution 与 projected log-AI；
-- state/renewal entropy；
-- inline/xline direction disagreement；
-- full-no-seismic seismic contribution；
-- LFM variant sensitivity；
-- support/stitching/OOD masks。
+### 8.3 全体积门禁
 
-### 8.3 真实井门禁
+全体积前补齐 no-seismic checkpoint 与 matched seismic intervention。可信井上要求 full
+相对 no-seismic 的对应频带配对改善为正，并同时报告 full LFM 和 zone-linear
+anchor。低质量井只进入逐井诊断。
 
-- full 相对 no-seismic 在井上对应频带的配对改善为正；
-- full 相对 full LFM 和 zone-linear anchor 具有整体增量价值；
-- deterministic prediction 在多数可信井上不相对主 LFM 退化；
-- 高分辨率井对比按 tuning scale 与更细诊断尺度分别报告；
-- 低质量井只进入逐井诊断；
-- blind section 不出现 seam、方向条带或 segment 随机跳变。
-
-剖面门禁通过后，使用完全相同的 checkpoint、prior、标准化、LFM 和融合参数运行全体积。
+固定剖面、LFM sensitivity、真实观测支持和井上归因门禁通过后，使用完全
+相同的 checkpoint、prior、标准化、LFM 和推理参数运行全体积。
 
 ## 9. 全体积输出
 
@@ -470,7 +491,9 @@ chunk、GPU batch 和执行顺序不改变结果。体推理通过重叠 halo �
 - high-resolution truth 到 decoder/projector 的 NumPy/Torch parity；
 - discrete LFM rebasing parity；
 - 小序列 exact HSMM marginals/Viterbi 与 brute force 对照；
-- high-resolution 最大 state run 的 transition diagonal 为零；
+- renewal/state-change 语义分离，exact HSMM 支持对角 transition；
+- reflectivity SNR 到 renewal probability 的变换单调、有界且时深无关；
+- 相邻同状态 profile 的 canonical merge 只移除 evidence-scale 下不可区分的 seam；
 - duration zone fraction 在不同采样间隔下语义一致；
 - 短 segment identifiability mask；
 - prediction 重复运行逐位一致；

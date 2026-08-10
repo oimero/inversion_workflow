@@ -428,7 +428,7 @@ def calibrate_semi_markov_prior(
         )
 
     initial = np.ones(3, dtype=np.float64)
-    transition = np.ones((3, 3), dtype=np.float64) - np.eye(3, dtype=np.float64)
+    transition = np.ones((3, 3), dtype=np.float64)
     durations: list[list[float]] = [[], [], []]
     trace_count = 0
     for parent_id in selected:
@@ -460,24 +460,14 @@ def calibrate_semi_markov_prior(
                     f"{parent_id}:{key}"
                 )
 
-            # Lateral birth/death can remove an intervening producer object and
-            # bring two objects with the same state into contact.  Such an object
-            # seam is not identifiable in the deterministic state HSMM.  Its
-            # canonical segment is therefore the maximal contiguous state run.
-            states: list[int] = []
-            fractions: list[float] = []
-            for state, fraction in zip(
-                object_states, object_fractions, strict=True
+            initial[object_states[0]] += 1.0
+            for state_id, fraction in zip(
+                object_states,
+                object_fractions,
+                strict=True,
             ):
-                if states and state == states[-1]:
-                    fractions[-1] += fraction
-                else:
-                    states.append(state)
-                    fractions.append(fraction)
-            initial[states[0]] += 1.0
-            for state_id, fraction in zip(states, fractions, strict=True):
                 durations[state_id].append(fraction)
-            for previous, current in zip(states[:-1], states[1:]):
+            for previous, current in zip(object_states[:-1], object_states[1:]):
                 transition[previous, current] += 1.0
             trace_count += 1
 
@@ -600,6 +590,12 @@ def save_section_prediction(
         ),
         "evidence_state_log_potential": prediction.evidence.state_log_potential,
         "evidence_support": prediction.evidence.support,
+        "bandlimited_log_ai": np.where(
+            prediction.evidence.support,
+            prediction.evidence.background_lfm_linear
+            + prediction.evidence.projected_log_ai_increment_mean,
+            np.nan,
+        ),
         "highres_log_ai": realization.log_ai_highres,
         "highres_state": realization.state_highres,
         "highres_support": prediction.evidence.highres_support,
@@ -800,6 +796,370 @@ def save_synthetic_section_prediction(
     return directory
 
 
+def save_real_section_prediction(
+    output_dir: str | Path,
+    prediction: Any,
+    *,
+    observation: ObservationTile,
+    raw_seismic: np.ndarray,
+    full_lfm: np.ndarray,
+    ilines: np.ndarray,
+    xlines: np.ndarray,
+    input_metadata: Mapping[str, Any],
+) -> Path:
+    """Publish one real-field deterministic prediction and its input audit."""
+
+    from matplotlib import pyplot as plt
+
+    from ginn_v2.contracts import StructuredPrediction
+
+    if not isinstance(prediction, StructuredPrediction):
+        raise TypeError("save_real_section_prediction requires StructuredPrediction.")
+    if not isinstance(observation, ObservationTile):
+        raise TypeError("save_real_section_prediction requires ObservationTile.")
+    raw = np.asarray(raw_seismic, dtype=np.float64)
+    lfm = np.asarray(full_lfm, dtype=np.float64)
+    inline = np.asarray(ilines, dtype=np.float64)
+    xline = np.asarray(xlines, dtype=np.float64)
+    if raw.shape != observation.seismic.shape or lfm.shape != raw.shape:
+        raise ValueError("real input arrays must match the observation tile.")
+    if inline.shape != (observation.width,) or xline.shape != inline.shape:
+        raise ValueError("real section line coordinates must match tile width.")
+    if not np.array_equal(
+        observation.model_axis.coordinates,
+        prediction.evidence.model_axis.coordinates,
+    ):
+        raise ValueError("real observation and prediction model axes differ.")
+    if not np.array_equal(observation.lateral_m, prediction.evidence.lateral_m):
+        raise ValueError("real observation and prediction lateral geometry differ.")
+
+    directory = save_section_prediction(output_dir, prediction)
+    support = prediction.evidence.support
+    highres_support = prediction.evidence.highres_support
+    np.savez_compressed(
+        directory / "real_input.npz",
+        raw_seismic=raw,
+        transformed_seismic=observation.seismic,
+        full_lfm=lfm,
+        observed_valid=observation.observed_valid,
+        zone_top=observation.zone_top,
+        zone_bottom=observation.zone_bottom,
+        lateral_valid=observation.lateral_valid,
+        ilines=inline,
+        xlines=xline,
+    )
+    with (directory / "input_metadata.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            dict(input_metadata),
+            handle,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
+
+    def finite_limits(
+        values: np.ndarray,
+        *,
+        symmetric: bool = False,
+    ) -> tuple[float, float]:
+        finite = np.asarray(values, dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            return (-1.0, 1.0)
+        if symmetric:
+            magnitude = max(float(np.percentile(np.abs(finite), 99.0)), 1.0e-8)
+            return (-magnitude, magnitude)
+        lower, upper = np.percentile(finite, [1.0, 99.0])
+        if not upper > lower:
+            delta = max(abs(float(lower)) * 0.01, 1.0e-8)
+            return (float(lower - delta), float(upper + delta))
+        return (float(lower), float(upper))
+
+    transformed = np.where(
+        support & observation.observed_valid,
+        observation.seismic,
+        np.nan,
+    )
+    full_lfm_zone = np.where(support, lfm, np.nan)
+    anchor = np.where(
+        support,
+        prediction.evidence.background_lfm_linear,
+        np.nan,
+    )
+    increment = np.where(
+        support,
+        prediction.evidence.projected_log_ai_increment_mean,
+        np.nan,
+    )
+    bandlimited = np.where(
+        support,
+        prediction.evidence.background_lfm_linear
+        + prediction.evidence.projected_log_ai_increment_mean,
+        np.nan,
+    )
+    highres = np.where(
+        highres_support,
+        prediction.realization.log_ai_highres,
+        np.nan,
+    )
+    ai_limits = finite_limits(np.concatenate((full_lfm_zone, bandlimited), axis=0))
+    panels = (
+        (
+            transformed,
+            observation.model_axis.coordinates,
+            "Seismic (checkpoint scale)",
+            "seismic",
+            finite_limits(transformed, symmetric=True),
+        ),
+        (
+            full_lfm_zone,
+            observation.model_axis.coordinates,
+            "Full LFM",
+            "viridis",
+            ai_limits,
+        ),
+        (
+            anchor,
+            observation.model_axis.coordinates,
+            "Zone-linear LFM anchor",
+            "viridis",
+            ai_limits,
+        ),
+        (
+            increment,
+            observation.model_axis.coordinates,
+            "Band-limited increment evidence",
+            "coolwarm",
+            finite_limits(increment, symmetric=True),
+        ),
+        (
+            bandlimited,
+            observation.model_axis.coordinates,
+            "Band-limited evidence log-AI",
+            "viridis",
+            ai_limits,
+        ),
+        (
+            highres,
+            observation.highres_axis.coordinates,
+            "High-resolution deterministic log-AI",
+            "viridis",
+            ai_limits,
+        ),
+    )
+    figure, axes = plt.subplots(2, 3, figsize=(15.0, 8.5), constrained_layout=True)
+    for axis, (values, vertical, title, color_map, limits) in zip(
+        axes.flat,
+        panels,
+        strict=True,
+    ):
+        image = axis.pcolormesh(
+            observation.lateral_m,
+            vertical,
+            np.ma.masked_invalid(values).T,
+            shading="auto",
+            cmap=color_map,
+            vmin=limits[0],
+            vmax=limits[1],
+        )
+        axis.plot(
+            observation.lateral_m,
+            observation.zone_top,
+            color="black",
+            linewidth=0.7,
+        )
+        axis.plot(
+            observation.lateral_m,
+            observation.zone_bottom,
+            color="black",
+            linewidth=0.7,
+        )
+        axis.invert_yaxis()
+        axis.set_title(title, fontsize=9)
+        axis.set_xlabel("lateral distance [m]")
+        axis.set_ylabel(
+            f"{observation.sample_domain} [{observation.model_axis.unit}]"
+        )
+        figure.colorbar(image, ax=axis, fraction=0.046, pad=0.03)
+    figure.suptitle(prediction.evidence.identity, fontsize=10)
+    figure.savefig(directory / "section.png", dpi=150)
+    plt.close(figure)
+    return directory
+
+
+def save_decode_policy_sensitivity(
+    output_dir: str | Path,
+    result: Any,
+    *,
+    observation: ObservationTile,
+) -> dict[str, Any]:
+    """Publish one compact visual/metric comparison over frozen evidence."""
+
+    from matplotlib import pyplot as plt
+
+    from ginn_v2.inference import (
+        DecodeSensitivityResult,
+        summarize_structured_prediction,
+    )
+
+    if not isinstance(result, DecodeSensitivityResult):
+        raise TypeError(
+            "save_decode_policy_sensitivity requires DecodeSensitivityResult."
+        )
+    if not isinstance(observation, ObservationTile):
+        raise TypeError("decode sensitivity observation must be ObservationTile.")
+    directory = Path(output_dir)
+    if directory.exists():
+        raise FileExistsError(directory)
+    directory.mkdir(parents=True)
+
+    predictions = [result.predictions[case.case_id] for case in result.cases]
+    reference = predictions[0]
+    support = reference.evidence.highres_support
+    for prediction in predictions:
+        if (
+            not np.array_equal(prediction.evidence.lateral_m, observation.lateral_m)
+            or not np.array_equal(
+                prediction.evidence.highres_axis.coordinates,
+                observation.highres_axis.coordinates,
+            )
+            or not np.array_equal(prediction.evidence.highres_support, support)
+        ):
+            raise ValueError("decode sensitivity cases do not share one evidence grid.")
+
+    metrics = {
+        case.case_id: summarize_structured_prediction(prediction)
+        for case, prediction in zip(result.cases, predictions, strict=True)
+    }
+    payload = {
+        "schema": "structured_ginn_v2_decode_policy_sensitivity_v1",
+        "sample_domain": observation.sample_domain,
+        "sample_unit": observation.model_axis.unit,
+        "depth_basis": observation.model_axis.depth_basis,
+        "trace_count": observation.width,
+        "cases": [
+            {
+                **case.to_mapping(),
+                "metrics": metrics[case.case_id],
+            }
+            for case in result.cases
+        ],
+    }
+    with (directory / "sensitivity.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            payload,
+            handle,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
+    np.savez_compressed(
+        directory / "highres_predictions.npz",
+        case_id=np.asarray([case.case_id for case in result.cases]),
+        highres_log_ai=np.stack(
+            [prediction.realization.log_ai_highres for prediction in predictions]
+        ),
+        highres_state=np.stack(
+            [prediction.realization.state_highres for prediction in predictions]
+        ),
+        highres_support=support,
+        highres_axis=observation.highres_axis.coordinates,
+        lateral_m=observation.lateral_m,
+    )
+
+    supported_values = np.concatenate(
+        [prediction.realization.log_ai_highres[support] for prediction in predictions]
+    )
+    supported_rows = np.flatnonzero(np.any(support, axis=0))
+    if supported_rows.size == 0:
+        raise ValueError("decode sensitivity evidence has no supported high-resolution rows.")
+    row_start = max(int(supported_rows[0]) - 1, 0)
+    row_stop = min(
+        int(supported_rows[-1]) + 2,
+        observation.highres_axis.coordinates.size,
+    )
+    plot_vertical = observation.highres_axis.coordinates[row_start:row_stop]
+    plot_support = support[:, row_start:row_stop]
+    lower, upper = np.percentile(supported_values, [1.0, 99.0])
+    if not upper > lower:
+        delta = max(abs(float(lower)) * 0.01, 1.0e-8)
+        lower, upper = float(lower - delta), float(upper + delta)
+    columns = 2
+    rows = int(np.ceil(len(predictions) / columns))
+    figure, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=(15.0, 3.8 * rows),
+        constrained_layout=True,
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+    )
+    image = None
+    for axis, case, prediction in zip(
+        axes.flat,
+        result.cases,
+        predictions,
+        strict=False,
+    ):
+        values = np.where(
+            plot_support,
+            prediction.realization.log_ai_highres[:, row_start:row_stop],
+            np.nan,
+        )
+        image = axis.pcolormesh(
+            observation.lateral_m,
+            plot_vertical,
+            np.ma.masked_invalid(values).T,
+            shading="auto",
+            cmap="viridis",
+            vmin=float(lower),
+            vmax=float(upper),
+        )
+        axis.plot(
+            observation.lateral_m,
+            observation.zone_top,
+            color="black",
+            linewidth=0.6,
+        )
+        axis.plot(
+            observation.lateral_m,
+            observation.zone_bottom,
+            color="black",
+            linewidth=0.6,
+        )
+        case_metrics = metrics[case.case_id]
+        label = (
+            "reference"
+            if case.changed_parameter is None
+            else f"{case.changed_parameter}={case.changed_value:g}"
+        )
+        axis.set_title(
+            f"{label}\n"
+            f"segments/trace={case_metrics['segments_per_trace_median']:.0f}, "
+            f"thickness p50={case_metrics['segment_thickness_median']:.3g}, "
+            "ABA="
+            f"{case_metrics['extreme_background_extreme_triplet_fraction']:.3f}",
+            fontsize=8,
+        )
+        axis.set_ylim(float(np.max(plot_vertical)), float(np.min(plot_vertical)))
+        axis.set_xlabel("lateral distance [m]")
+        axis.set_ylabel(
+            f"{observation.sample_domain} [{observation.model_axis.unit}]"
+        )
+    for axis in axes.flat[len(predictions) :]:
+        axis.set_visible(False)
+    if image is not None:
+        figure.colorbar(image, ax=axes, fraction=0.025, pad=0.02, label="log-AI")
+    figure.suptitle(
+        f"Decode-policy sensitivity: {reference.evidence.identity}",
+        fontsize=10,
+    )
+    figure.savefig(directory / "comparison.png", dpi=150)
+    plt.close(figure)
+    return payload
+
+
 __all__ = [
     "CHECKPOINT_SCHEMA",
     "CORPUS_MANIFEST_SCHEMA",
@@ -814,6 +1174,8 @@ __all__ = [
     "iter_segment_profile_batches",
     "parent_observation_tiles",
     "save_section_prediction",
+    "save_real_section_prediction",
     "save_synthetic_section_prediction",
     "save_checkpoint",
+    "save_decode_policy_sensitivity",
 ]

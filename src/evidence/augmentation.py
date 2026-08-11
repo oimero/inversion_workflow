@@ -18,7 +18,7 @@ from typing import Any, Mapping
 import numpy as np
 
 
-AUGMENTATION_PROFILE_SCHEMA = "structured_ginn_v2_observation_profile_v1"
+AUGMENTATION_PROFILE_SCHEMA = "bandlimited_evidence_observation_profile_v1"
 
 
 def _finite(value: Any, *, label: str, minimum: float = 0.0) -> float:

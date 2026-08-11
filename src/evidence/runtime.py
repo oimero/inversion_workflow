@@ -1,4 +1,4 @@
-"""Small runtime helpers for the independent Structured GINN V2 package."""
+"""Runtime helpers for evidence training and evaluation."""
 
 from __future__ import annotations
 
@@ -12,10 +12,10 @@ from cup.utils.logging import configure_run_logger
 
 
 def configure_training_logger(output_dir: Path) -> logging.Logger:
-    """Create the logger used by a Structured GINN V2 run."""
+    """Create the logger used by an evidence run."""
     return configure_run_logger(
         Path(output_dir),
-        logger_name="ginn_v2",
+        logger_name="evidence",
         file_name="training.log",
     )
 

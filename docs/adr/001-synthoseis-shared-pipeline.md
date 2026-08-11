@@ -15,7 +15,7 @@
 - `SeismicViewPipeline` 使用原子算子目录和有序视图列表，base 独立于 view；
 - benchmark 使用 v5 双索引：父实现索引与 seismic view 索引；
 - 每个父实现只物化一份 canonical background，训练输入直接引用该背景；
-- ablation 由实验套件拥有 split，按父实现先抽样再抽样视图，训练和验证权重显式记录。
+- 下游训练模块按 parent 原子 split 读取 canonical corpus，训练和验证权重显式记录。
 
 ## 结果
 

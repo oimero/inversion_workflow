@@ -2,7 +2,7 @@
 
 ```mermaid
 flowchart TB
-    S1["01 井资产盘点"] --> S2["02 LAS 曲线筛选与导出"] --> S3["03 测井预处理"] --> S4["04 井震自动标定"] --> S5["05 全局共识子波生成"] --> S6["06 真实工区井控数据集"] --> S7["07 真实工区低频模型"] --> R0["08 R0 实际工区零样本预测"] --> R1["08 R1 正演闭环诊断"]
+    S1["01 井资产盘点"] --> S2["02 LAS 曲线筛选与导出"] --> S3["03 测井预处理"] --> S4["04 井震自动标定"] --> S5["05 全局共识子波生成"] --> S6["06 真实工区井控数据集"] --> S7["07 真实工区低频模型"]
 
     WT["旁路 井轨迹 QC"]
     S1 -.-> WT -.-> S4
@@ -10,9 +10,8 @@ flowchart TB
     RP["旁路 岩石物理分析"]
     S3 -.-> RP
 
-    FO["旁路 正演可观测性分析"] --> SL["旁路 合成基准生成与评估"] --> GV["旁路 模型消融训练与评估"]
+    FO["旁路 正演可观测性分析"] --> SL["旁路 合成基准生成与评估"] --> EV["旁路 带限证据训练与评估"]
     S6 -.-> FO
-    GV -.-> R0
 ```
 
 ## 配置文件
@@ -25,8 +24,7 @@ flowchart TB
 | 旁路 · rock_physics_analysis | `experiments/common/common.yaml` |
 | 旁路 · forward_observability | `experiments/common/common.yaml` |
 | 旁路 · synthoseis_lite | `experiments/synthoseis_lite/synthoseis_lite.yaml` |
-| 旁路 · ablation | `experiments/ablation/train.yaml` |
-| 08 R0-R1 | `experiments/common/common.yaml` |
+| 旁路 · 带限证据 | `experiments/evidence/evidence.yaml` |
 
 ## 深度域工作流
 

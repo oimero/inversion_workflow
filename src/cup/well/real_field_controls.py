@@ -33,7 +33,7 @@ from cup.well.trajectory import WellTrajectory
 from wtie.processing import grid
 
 
-SCHEMA_VERSION = "real_field_well_controls_v3"
+SCHEMA_VERSION = "real_field_well_controls_v5"
 TIME_SOURCE_SCHEMA = WELL_AUTO_TIE_SCHEMA_VERSION
 DEPTH_SOURCE_SCHEMA = DEPTH_WAVELET_BATCH_SCHEMA_VERSION
 LINEAR_AI_UNIT = "m/s*g/cm3"
@@ -54,6 +54,10 @@ MANIFEST_COLUMNS = [
     "sampling_mode",
     "n_samples",
     "n_valid_samples",
+    "n_observed_samples",
+    "n_interpolated_samples",
+    "n_native_samples",
+    "n_valid_native_samples",
     "sample_min",
     "sample_max",
     "well_npz_path",
@@ -70,10 +74,12 @@ class WellControl:
     x_m_by_sample: np.ndarray
     y_m_by_sample: np.ndarray
     valid_mask: np.ndarray
+    observed_valid_mask: np.ndarray
     wellbore_class: str
     sampling_mode: str
     source_run_type: str
     provenance: Mapping[str, Any]
+    native: "NativeWellControl"
 
     def __post_init__(self) -> None:
         n = self.sample_axis.values.size
@@ -84,6 +90,7 @@ class WellControl:
             "x_m_by_sample": np.asarray(self.x_m_by_sample, dtype=np.float64),
             "y_m_by_sample": np.asarray(self.y_m_by_sample, dtype=np.float64),
             "valid_mask": np.asarray(self.valid_mask, dtype=bool),
+            "observed_valid_mask": np.asarray(self.observed_valid_mask, dtype=bool),
         }
         if values.shape != (n,) or not np.array_equal(self.log_ai.basis, self.sample_axis.values):
             raise ValueError(f"{self.well_name}: log_ai must be aligned to the canonical SampleAxis.")
@@ -95,13 +102,55 @@ class WellControl:
                 raise ValueError(f"{self.well_name}: {name} must have shape ({n},).")
             object.__setattr__(self, name, array)
         valid = arrays["valid_mask"]
+        observed = arrays["observed_valid_mask"]
         finite = np.isfinite(values)
         for name in ("inline_by_sample", "xline_by_sample", "x_m_by_sample", "y_m_by_sample"):
             finite &= np.isfinite(arrays[name])
         if not np.array_equal(valid, finite):
             raise ValueError(f"{self.well_name}: valid_mask must exactly describe finite logAI and positions.")
+        if np.any(observed & ~valid):
+            raise ValueError(f"{self.well_name}: observed_valid_mask must be a subset of valid_mask.")
         if not np.any(valid):
             raise ValueError(f"{self.well_name}: canonical control has no valid samples.")
+        if self.native.well_name.casefold() != self.well_name.casefold():
+            raise ValueError(f"{self.well_name}: native/model control well names differ.")
+        if self.native.sample_domain != self.sample_axis.domain:
+            raise ValueError(f"{self.well_name}: native/model control sample domains differ.")
+
+
+@dataclass(frozen=True)
+class NativeWellControl:
+    """Aligned full-band well log on its native vertical sampling."""
+
+    well_name: str
+    coordinates: np.ndarray
+    full_log_ai: np.ndarray
+    valid_mask: np.ndarray
+    sample_domain: str
+    sample_unit: str
+    depth_basis: str | None
+    provenance: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        coordinates = np.asarray(self.coordinates, dtype=np.float64)
+        values = np.asarray(self.full_log_ai, dtype=np.float64)
+        valid = np.asarray(self.valid_mask, dtype=bool)
+        if coordinates.ndim != 1 or coordinates.size < 2 or values.shape != coordinates.shape or valid.shape != coordinates.shape:
+            raise ValueError(f"{self.well_name}: native arrays must be matching 1D arrays with at least two samples.")
+        if np.any(~np.isfinite(coordinates)) or np.any(np.diff(coordinates) <= 0.0):
+            raise ValueError(f"{self.well_name}: native coordinates must be finite and strictly increasing.")
+        if not np.array_equal(valid, np.isfinite(values)):
+            raise ValueError(f"{self.well_name}: native valid_mask must exactly describe finite log-AI values.")
+        expected_unit = "s" if self.sample_domain == "time" else "m" if self.sample_domain == "depth" else None
+        if expected_unit is None or self.sample_unit != expected_unit:
+            raise ValueError(f"{self.well_name}: native sample domain/unit is invalid.")
+        if (self.sample_domain == "depth" and self.depth_basis != "tvdss") or (
+            self.sample_domain == "time" and self.depth_basis is not None
+        ):
+            raise ValueError(f"{self.well_name}: native depth_basis is inconsistent with sample_domain.")
+        object.__setattr__(self, "coordinates", coordinates)
+        object.__setattr__(self, "full_log_ai", values)
+        object.__setattr__(self, "valid_mask", valid)
 
 
 @dataclass(frozen=True)
@@ -242,6 +291,77 @@ def _interp_finite_runs(x: np.ndarray, xp: np.ndarray, fp: np.ndarray) -> np.nda
     return output
 
 
+def interpolate_bounded_internal_gaps(
+    values: np.ndarray,
+    coordinates: np.ndarray,
+    *,
+    max_gap_axis_units: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fill only short internal gaps and return the original observed support.
+
+    Gap width is the number of missing samples multiplied by the regular axis
+    interval.  Leading/trailing gaps are never extrapolated.
+    """
+
+    array = np.asarray(values, dtype=np.float64)
+    axis = np.asarray(coordinates, dtype=np.float64)
+    if array.ndim != 1 or axis.shape != array.shape or axis.size < 2:
+        raise ValueError("Internal-gap interpolation requires matching 1D arrays.")
+    steps = np.diff(axis)
+    if np.any(~np.isfinite(axis)) or np.any(steps <= 0.0) or not np.allclose(
+        steps, steps[0], rtol=1e-9, atol=1e-12
+    ):
+        raise ValueError("Internal-gap interpolation requires a regular increasing axis.")
+    maximum = float(max_gap_axis_units)
+    if not np.isfinite(maximum) or maximum < 0.0:
+        raise ValueError("max_gap_axis_units must be finite and non-negative.")
+    observed = np.isfinite(array)
+    output = array.copy()
+    missing = ~observed
+    padded = np.r_[False, missing, False]
+    runs = np.flatnonzero(padded[1:] != padded[:-1]).reshape(-1, 2)
+    interval = float(steps[0])
+    for start, stop in runs:
+        if start == 0 or stop == array.size:
+            continue
+        gap_width = float(stop - start) * interval
+        if gap_width <= maximum + 1e-12:
+            output[start:stop] = np.interp(
+                axis[start:stop],
+                [axis[start - 1], axis[stop]],
+                [output[start - 1], output[stop]],
+            )
+    return output, observed
+
+
+def _native_control(
+    *,
+    well_name: str,
+    coordinates: np.ndarray,
+    full_log_ai: np.ndarray,
+    sample_domain: str,
+    depth_basis: str | None,
+    provenance: Mapping[str, Any],
+) -> NativeWellControl:
+    coordinates = np.asarray(coordinates, dtype=np.float64)
+    values = np.asarray(full_log_ai, dtype=np.float64)
+    support = np.isfinite(coordinates)
+    coordinates = coordinates[support]
+    values = values[support]
+    if coordinates.size < 2 or np.any(np.diff(coordinates) <= 0.0):
+        raise ValueError(f"{well_name}: aligned native coordinates are not strictly increasing.")
+    return NativeWellControl(
+        well_name=well_name,
+        coordinates=coordinates,
+        full_log_ai=values,
+        valid_mask=np.isfinite(values),
+        sample_domain=sample_domain,
+        sample_unit="s" if sample_domain == "time" else "m",
+        depth_basis=depth_basis,
+        provenance=dict(provenance),
+    )
+
+
 def _control_from_arrays(
     *,
     well_name: str,
@@ -251,13 +371,19 @@ def _control_from_arrays(
     xline: np.ndarray,
     x_m: np.ndarray,
     y_m: np.ndarray,
+    observed_valid_mask: np.ndarray,
     wellbore_class: str,
     sampling_mode: str,
     source_run_type: str,
     provenance: Mapping[str, Any],
+    native: NativeWellControl,
 ) -> WellControl:
     arrays = [np.asarray(value, dtype=np.float64).copy() for value in (log_ai, inline, xline, x_m, y_m)]
     valid = np.logical_and.reduce([np.isfinite(value) for value in arrays])
+    observed = np.asarray(observed_valid_mask, dtype=bool)
+    if observed.shape != valid.shape:
+        raise ValueError(f"{well_name}: observed_valid_mask shape differs from the model axis.")
+    observed &= valid
     for value in arrays:
         value[~valid] = np.nan
     basis_type = "twt" if sample_axis.domain == "time" else "tvdss"
@@ -271,10 +397,12 @@ def _control_from_arrays(
         x_m_by_sample=arrays[3],
         y_m_by_sample=arrays[4],
         valid_mask=valid,
+        observed_valid_mask=observed,
         wellbore_class=wellbore_class,
         sampling_mode=sampling_mode,
         source_run_type=source_run_type,
         provenance=dict(provenance),
+        native=native,
     )
 
 
@@ -297,25 +425,22 @@ def _validate_control_geometry(control: WellControl, line_geometry: SurveyLineGe
 def _time_control(
     *,
     source_row: Mapping[str, Any],
+    plan_row: Mapping[str, Any],
     inventory_row: Mapping[str, Any],
     sample_axis: SampleAxis,
     source_run_dir: Path,
     repo_root: Path,
+    max_internal_gap_s: float,
 ) -> WellControl:
     well_name = str(source_row["well_name"]).strip()
-    las_path = resolve_artifact_path(source_row.get("filtered_las_file"), root=repo_root, run_dir=source_run_dir)
     tdt_path = resolve_artifact_path(source_row.get("optimized_tdt_file"), root=repo_root, run_dir=source_run_dir)
-    if las_path is None or not las_path.is_file() or tdt_path is None or not tdt_path.is_file():
-        raise FileNotFoundError(f"{well_name}: filtered LAS or optimized TDT is missing.")
-    md, log_ai_md = _read_ai_las(las_path)
+    if tdt_path is None or not tdt_path.is_file():
+        raise FileNotFoundError(f"{well_name}: optimized TDT is missing.")
     table = load_workflow_time_depth_table_csv(tdt_path)
     if not table.is_md_domain:
         raise ValueError(f"{well_name}: optimized TDT must use MD domain.")
     twt = np.asarray(table.twt, dtype=np.float64)
     table_md = np.asarray(table.md, dtype=np.float64)
-    md_at_twt = _interp_no_extrapolation(sample_axis.values, twt, table_md)
-    log_ai = _interp_finite_runs(md_at_twt, md, log_ai_md)
-
     plan_path = resolve_artifact_path(
         source_row.get("optimized_trace_sample_plan_file"), root=repo_root, run_dir=source_run_dir
     )
@@ -346,6 +471,35 @@ def _time_control(
         transform_path = tdt_path
     else:
         raise ValueError(f"{well_name}: unsupported/unknown wellbore_class={wellbore_class!r}.")
+    native_las_path = resolve_artifact_path(
+        plan_row.get("input_las"), root=repo_root, run_dir=source_run_dir
+    )
+    if native_las_path is None or not native_las_path.is_file():
+        raise FileNotFoundError(f"{well_name}: aligned preprocessed LAS is missing.")
+    native_md, native_log_ai = _read_ai_las(native_las_path)
+    native = _native_control(
+        well_name=well_name,
+        coordinates=_interp_no_extrapolation(native_md, table_md, twt),
+        full_log_ai=native_log_ai,
+        sample_domain="time",
+        depth_basis=None,
+        provenance={
+            "source_las_path": str(native_las_path),
+            "alignment_transform_path": str(tdt_path),
+            "source_vertical_coordinate": "md_m",
+            "aligned_vertical_coordinate": "twt_s",
+        },
+    )
+    model_log_ai = _interp_finite_runs(
+        sample_axis.values,
+        native.coordinates,
+        native.full_log_ai,
+    )
+    log_ai, observed_valid = interpolate_bounded_internal_gaps(
+        model_log_ai,
+        sample_axis.values,
+        max_gap_axis_units=max_internal_gap_s,
+    )
     return _control_from_arrays(
         well_name=well_name,
         sample_axis=sample_axis,
@@ -354,14 +508,17 @@ def _time_control(
         xline=positions[1],
         x_m=positions[2],
         y_m=positions[3],
+        observed_valid_mask=observed_valid,
         wellbore_class=wellbore_class,
         sampling_mode=sampling_mode,
         source_run_type="well_auto_tie",
         provenance={
-            "source_las_path": str(las_path),
+            "source_las_path": str(native_las_path),
+            "native_source_las_path": str(native_las_path),
             "source_transform_path": str(transform_path),
             "optimized_tdt_path": str(tdt_path),
         },
+        native=native,
     )
 
 
@@ -374,24 +531,28 @@ def _depth_control(
     source_run_dir: Path,
     repo_root: Path,
     trace_lookup: Mapping[str, Path],
+    max_internal_gap_m: float,
 ) -> WellControl:
     well_name = str(source_row["well_name"]).strip()
-    las_path = resolve_artifact_path(source_row.get("shifted_filtered_las_path"), root=repo_root, run_dir=source_run_dir)
-    if las_path is None or not las_path.is_file():
-        raise FileNotFoundError(f"{well_name}: shifted filtered LAS is missing.")
-    md, log_ai_md = _read_ai_las(las_path)
+    native_las_path = resolve_artifact_path(
+        source_row.get("shifted_preprocessed_las_path"), root=repo_root, run_dir=source_run_dir
+    )
+    if native_las_path is None or not native_las_path.is_file():
+        raise FileNotFoundError(f"{well_name}: shifted preprocessed LAS is missing.")
+    native_md, native_log_ai = _read_ai_las(native_las_path)
     wellbore_class = str(inventory_row.get("wellbore_class") or "unknown").strip().casefold()
     trace_path = trace_lookup.get(normalize_well_name(well_name))
     if wellbore_class == "deviated":
         if trace_path is None:
             raise FileNotFoundError(f"{well_name}: deviated well lacks a project trajectory file.")
         trajectory = WellTrajectory.from_petrel_trace(trace_path).with_well_name(well_name)
-        tvdss_at_md = _interp_no_extrapolation(md, trajectory.md_m, trajectory.tvdss_m)
+        tvdss_at_md = _interp_no_extrapolation(native_md, trajectory.md_m, trajectory.tvdss_m)
         valid = np.isfinite(tvdss_at_md)
         if np.count_nonzero(valid) < 2 or np.any(np.diff(tvdss_at_md[valid]) <= 0.0):
             raise ValueError(f"{well_name}: trajectory TVDSS support for shifted LAS is not strictly increasing.")
-        md_at_sample = _interp_no_extrapolation(sample_axis.values, tvdss_at_md[valid], md[valid])
-        log_ai = _interp_finite_runs(md_at_sample, md, log_ai_md)
+        md_at_sample = _interp_no_extrapolation(
+            sample_axis.values, tvdss_at_md[valid], native_md[valid]
+        )
         x_m = _interp_no_extrapolation(md_at_sample, trajectory.md_m, trajectory.x_m)
         y_m = _interp_no_extrapolation(md_at_sample, trajectory.md_m, trajectory.y_m)
         inline = np.full(sample_axis.values.shape, np.nan)
@@ -404,10 +565,9 @@ def _depth_control(
         sampling_mode = "trajectory_tvdss"
         transform_path = trace_path
         transform_metadata = {"tvdss_source": "cup.well.trajectory.WellTrajectory"}
+        native_tvdss = _interp_no_extrapolation(native_md, trajectory.md_m, trajectory.tvdss_m)
     elif wellbore_class == "vertical":
         kb_m = _finite_number(inventory_row.get("kb_m"), label=f"{well_name}.kb_m")
-        tvdss_las = md - kb_m
-        log_ai = _interp_finite_runs(sample_axis.values, tvdss_las, log_ai_md)
         inline_value = _finite_number(inventory_row.get("inline_float"), label=f"{well_name}.inline_float")
         xline_value = _finite_number(inventory_row.get("xline_float"), label=f"{well_name}.xline_float")
         x_value = _finite_number(inventory_row.get("surface_x"), label=f"{well_name}.surface_x")
@@ -419,8 +579,33 @@ def _depth_control(
         sampling_mode = "vertical_md_minus_kb"
         transform_path = None
         transform_metadata = {"kb_m": kb_m, "tvdss_formula": "shifted_md_m-kb_m"}
+        native_tvdss = native_md - kb_m
     else:
         raise ValueError(f"{well_name}: unsupported/unknown wellbore_class={wellbore_class!r}.")
+    native = _native_control(
+        well_name=well_name,
+        coordinates=native_tvdss,
+        full_log_ai=native_log_ai,
+        sample_domain="depth",
+        depth_basis="tvdss",
+        provenance={
+            "source_las_path": str(native_las_path),
+            "alignment_transform_path": "" if transform_path is None else str(transform_path),
+            "source_vertical_coordinate": "shifted_md_m",
+            "aligned_vertical_coordinate": "tvdss_m",
+            **transform_metadata,
+        },
+    )
+    model_log_ai = _interp_finite_runs(
+        sample_axis.values,
+        native.coordinates,
+        native.full_log_ai,
+    )
+    log_ai, observed_valid = interpolate_bounded_internal_gaps(
+        model_log_ai,
+        sample_axis.values,
+        max_gap_axis_units=max_internal_gap_m,
+    )
     return _control_from_arrays(
         well_name=well_name,
         sample_axis=sample_axis,
@@ -429,14 +614,17 @@ def _depth_control(
         xline=xline,
         x_m=x_m,
         y_m=y_m,
+        observed_valid_mask=observed_valid,
         wellbore_class=wellbore_class,
         sampling_mode=sampling_mode,
         source_run_type="wavelet_batch_synthetic_depth",
         provenance={
-            "source_las_path": str(las_path),
+            "source_las_path": str(native_las_path),
+            "native_source_las_path": str(native_las_path),
             "source_transform_path": "" if transform_path is None else str(transform_path),
             **transform_metadata,
         },
+        native=native,
     )
 
 
@@ -453,7 +641,13 @@ def build_well_control_set(
 ) -> tuple[WellControlSet, pd.DataFrame]:
     """Build canonical controls and a manifest frame without reading any LFM."""
 
-    allowed_config = {"source_run_type", "source_run_dir", "well_inventory_file", "well_trace_dir"}
+    allowed_config = {
+        "source_run_type",
+        "source_run_dir",
+        "well_inventory_file",
+        "well_trace_dir",
+        "max_internal_gap_axis_units",
+    }
     if set(config) != allowed_config:
         raise ValueError(f"real_field_well_controls must contain exactly {sorted(allowed_config)}.")
     _validate_sample_axis(sample_axis)
@@ -463,6 +657,12 @@ def build_well_control_set(
     source_run_type = str(config.get("source_run_type") or "").strip()
     if source_run_type not in {"well_auto_tie", "wavelet_batch_synthetic_depth"}:
         raise ValueError("real_field_well_controls.source_run_type must be explicit and supported.")
+    maximum_gap = _finite_number(
+        config.get("max_internal_gap_axis_units"),
+        label="real_field_well_controls.max_internal_gap_axis_units",
+    )
+    if maximum_gap < 0.0:
+        raise ValueError("real_field_well_controls.max_internal_gap_axis_units must be non-negative.")
     source_run_dir = resolve_relative_path(str(config.get("source_run_dir") or ""), root=repo_root)
     if not source_run_dir.is_dir():
         raise FileNotFoundError(source_run_dir)
@@ -499,15 +699,35 @@ def build_well_control_set(
     if recorded_metrics_path is None or recorded_metrics_path.resolve() != metrics_path.resolve():
         raise ValueError("Source run summary metrics path does not match the selected source run.")
     metrics = pd.read_csv(metrics_path)
+    plan_index: dict[str, Mapping[str, Any]] = {}
     if source_run_type == "well_auto_tie":
         _required_columns(
             metrics,
-            {"well_name", "tie_status", "filtered_las_file", "optimized_tdt_file", "optimized_trace_sample_plan_file"},
+            {"well_name", "tie_status", "optimized_tdt_file", "optimized_trace_sample_plan_file"},
             path=metrics_path,
         )
         success = metrics["tie_status"].astype(str).str.casefold().eq("success")
+        plan_path = source_run_dir / "well_tie_plan.csv"
+        if not plan_path.is_file():
+            raise FileNotFoundError(plan_path)
+        plan = pd.read_csv(plan_path)
+        _required_columns(plan, {"well_name", "input_las"}, path=plan_path)
+        plan_names = [normalize_well_name(value) for value in plan["well_name"]]
+        if any(name.casefold() in invalid_names for name in plan_names) or len(plan_names) != len(set(plan_names)):
+            raise ValueError(f"Well-tie plan names must be non-empty and unique after normalization: {plan_path}")
+        plan_index = {
+            normalize_well_name(row["well_name"]): row for _, row in plan.iterrows()
+        }
     else:
-        _required_columns(metrics, {"well_name", "status", "shifted_filtered_las_path"}, path=metrics_path)
+        _required_columns(
+            metrics,
+            {
+                "well_name",
+                "status",
+                "shifted_preprocessed_las_path",
+            },
+            path=metrics_path,
+        )
         success = metrics["status"].astype(str).str.casefold().eq("ok")
     metric_names = [normalize_well_name(value) for value in metrics["well_name"]]
     if any(name.casefold() in invalid_names for name in metric_names) or len(metric_names) != len(set(metric_names)):
@@ -546,6 +766,10 @@ def build_well_control_set(
             "sampling_mode": "",
             "n_samples": int(sample_axis.values.size),
             "n_valid_samples": 0,
+            "n_observed_samples": 0,
+            "n_interpolated_samples": 0,
+            "n_native_samples": 0,
+            "n_valid_native_samples": 0,
             "sample_min": float(sample_axis.values[0]),
             "sample_max": float(sample_axis.values[-1]),
             "well_npz_path": "",
@@ -560,12 +784,17 @@ def build_well_control_set(
             continue
         try:
             if source_run_type == "well_auto_tie":
+                plan_row = plan_index.get(normalize_well_name(well_name))
+                if plan_row is None:
+                    raise ValueError(f"{well_name}: missing well_tie_plan row.")
                 control = _time_control(
                     source_row=source_row,
+                    plan_row=plan_row,
                     inventory_row=inventory_row,
                     sample_axis=sample_axis,
                     source_run_dir=source_run_dir,
                     repo_root=repo_root,
+                    max_internal_gap_s=maximum_gap,
                 )
             else:
                 control = _depth_control(
@@ -576,6 +805,7 @@ def build_well_control_set(
                     source_run_dir=source_run_dir,
                     repo_root=repo_root,
                     trace_lookup=trace_lookup,
+                    max_internal_gap_m=maximum_gap,
                 )
         except (FileNotFoundError, ValueError) as exc:
             base["reason"] = f"{type(exc).__name__}: {exc}"
@@ -601,6 +831,12 @@ def build_well_control_set(
                 "wellbore_class": control.wellbore_class,
                 "sampling_mode": control.sampling_mode,
                 "n_valid_samples": int(np.count_nonzero(control.valid_mask)),
+                "n_observed_samples": int(np.count_nonzero(control.observed_valid_mask)),
+                "n_interpolated_samples": int(
+                    np.count_nonzero(control.valid_mask & ~control.observed_valid_mask)
+                ),
+                "n_native_samples": int(control.native.coordinates.size),
+                "n_valid_native_samples": int(np.count_nonzero(control.native.valid_mask)),
             }
         )
         rows.append(base)
@@ -651,7 +887,7 @@ def write_well_control_set(
         return out
 
     if list(manifest.columns) != MANIFEST_COLUMNS:
-        raise ValueError("Well-control manifest columns do not match the frozen v3 contract.")
+        raise ValueError("Well-control manifest columns do not match the frozen v5 contract.")
     manifest_names = [normalize_well_name(value) for value in manifest["well_name"]]
     if len(manifest_names) != len(set(manifest_names)):
         raise ValueError("Well-control manifest well names must be unique after normalization.")
@@ -689,7 +925,19 @@ def write_well_control_set(
             "sampling_mode": control.sampling_mode,
             "linear_ai_unit": LINEAR_AI_UNIT,
             "value_domain": "log(AI)",
+            "model_axis_value_key": "log_ai",
+            "model_axis_valid_mask_key": "valid_mask",
+            "model_axis_observed_valid_mask_key": "observed_valid_mask",
+            "native_value_key": "native_full_log_ai",
             "provenance": portable_provenance(control.provenance),
+            "native": {
+                "sample_domain": control.native.sample_domain,
+                "sample_unit": control.native.sample_unit,
+                "depth_basis": control.native.depth_basis,
+                "coordinate_key": "native_coordinates",
+                "valid_mask_key": "native_valid_mask",
+                "provenance": portable_provenance(control.native.provenance),
+            },
         }
         np.savez_compressed(
             path,
@@ -700,6 +948,10 @@ def write_well_control_set(
             x_m=control.x_m_by_sample.astype(np.float64),
             y_m=control.y_m_by_sample.astype(np.float64),
             valid_mask=control.valid_mask.astype(bool),
+            observed_valid_mask=control.observed_valid_mask.astype(bool),
+            native_coordinates=control.native.coordinates.astype(np.float64),
+            native_full_log_ai=control.native.full_log_ai.astype(np.float32),
+            native_valid_mask=control.native.valid_mask.astype(bool),
             metadata_json=np.asarray(json.dumps(metadata, ensure_ascii=False, sort_keys=True)),
         )
         match = manifest_out["well_name"].astype(str).str.casefold().eq(control.well_name.casefold())
@@ -722,6 +974,8 @@ def write_well_control_set(
             "depth_basis": control_set.depth_basis,
             "value_domain": "log(AI)",
             "linear_ai_unit": LINEAR_AI_UNIT,
+            "well_control_layers": ["model_axis", "native"],
+            "model_axis_masks": ["valid_mask", "observed_valid_mask"],
         },
         business_config=resolved_config,
         input_contracts=input_contracts,
@@ -742,6 +996,18 @@ def write_well_control_set(
             "successful_wells": int((manifest_out["status"] == "ok").sum()),
             "failed_wells": int((manifest_out["status"] != "ok").sum()),
             "valid_samples": int(sum(np.count_nonzero(item.valid_mask) for item in control_set.controls)),
+            "observed_samples": int(
+                sum(np.count_nonzero(item.observed_valid_mask) for item in control_set.controls)
+            ),
+            "interpolated_samples": int(
+                sum(
+                    np.count_nonzero(item.valid_mask & ~item.observed_valid_mask)
+                    for item in control_set.controls
+                )
+            ),
+            "valid_native_samples": int(
+                sum(np.count_nonzero(item.native.valid_mask) for item in control_set.controls)
+            ),
         },
         "provenance": portable_provenance(control_set.provenance),
         "outputs": {
@@ -798,6 +1064,7 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
         values=first_samples,
         domain=str(axis_info["sample_domain"]),
         unit=str(axis_info["sample_unit"]),
+        depth_basis=summary.get("depth_basis"),
     )
     described_axis = axis.describe()
     for key in ("n_sample", "sample_min", "sample_max", "sample_step", "sample_domain", "sample_unit"):
@@ -819,14 +1086,39 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
     for _, row in successful.iterrows():
         path = resolve_relative_path(str(row["well_npz_path"]), root=repo_root)
         with np.load(path, allow_pickle=False) as data:
-            if set(data.files) != {"samples", "log_ai", "inline", "xline", "x_m", "y_m", "valid_mask", "metadata_json"}:
+            if set(data.files) != {
+                "samples",
+                "log_ai",
+                "inline",
+                "xline",
+                "x_m",
+                "y_m",
+                "valid_mask",
+                "observed_valid_mask",
+                "native_coordinates",
+                "native_full_log_ai",
+                "native_valid_mask",
+                "metadata_json",
+            }:
                 raise ValueError(f"Unexpected well-control NPZ keys: {path}")
             if data["samples"].dtype != np.dtype("float64") or any(
                 data[key].dtype != np.dtype("float64") for key in ("inline", "xline", "x_m", "y_m")
             ):
                 raise ValueError(f"Well-control sample/position arrays must be float64: {path}")
-            if data["log_ai"].dtype != np.dtype("float32") or data["valid_mask"].dtype != np.dtype("bool"):
-                raise ValueError(f"Well-control log_ai/valid_mask dtypes must be float32/bool: {path}")
+            if (
+                data["log_ai"].dtype != np.dtype("float32")
+                or data["valid_mask"].dtype != np.dtype("bool")
+                or data["observed_valid_mask"].dtype != np.dtype("bool")
+            ):
+                raise ValueError(
+                    f"Well-control log_ai/valid/observed mask dtypes must be float32/bool: {path}"
+                )
+            if (
+                data["native_coordinates"].dtype != np.dtype("float64")
+                or data["native_full_log_ai"].dtype != np.dtype("float32")
+                or data["native_valid_mask"].dtype != np.dtype("bool")
+            ):
+                raise ValueError(f"Native well-control coordinate/log/mask dtypes are invalid: {path}")
             metadata_array = np.asarray(data["metadata_json"])
             if metadata_array.ndim != 0 or metadata_array.dtype.kind not in {"U", "S"}:
                 raise ValueError(f"Well-control metadata_json must be a scalar string: {path}")
@@ -840,6 +1132,10 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
                 "depth_basis": summary.get("depth_basis"),
                 "linear_ai_unit": LINEAR_AI_UNIT,
                 "value_domain": "log(AI)",
+                "model_axis_value_key": "log_ai",
+                "model_axis_valid_mask_key": "valid_mask",
+                "model_axis_observed_valid_mask_key": "observed_valid_mask",
+                "native_value_key": "native_full_log_ai",
             }
             for key, expected in expected_metadata.items():
                 if metadata.get(key) != expected:
@@ -849,6 +1145,25 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
                     )
             if normalize_well_name(metadata.get("well_name")) != normalize_well_name(row["well_name"]):
                 raise ValueError(f"Well-control manifest/NPZ well_name mismatch: {path}")
+            native_metadata = dict(metadata.get("native") or {})
+            if (
+                native_metadata.get("sample_domain") != axis.domain
+                or native_metadata.get("sample_unit") != axis.unit
+                or native_metadata.get("depth_basis") != summary.get("depth_basis")
+                or native_metadata.get("coordinate_key") != "native_coordinates"
+                or native_metadata.get("valid_mask_key") != "native_valid_mask"
+            ):
+                raise ValueError(f"Native well-control metadata is inconsistent: {path}")
+            native = NativeWellControl(
+                well_name=str(metadata["well_name"]),
+                coordinates=np.asarray(data["native_coordinates"], dtype=np.float64),
+                full_log_ai=np.asarray(data["native_full_log_ai"], dtype=np.float64),
+                valid_mask=np.asarray(data["native_valid_mask"], dtype=bool),
+                sample_domain=axis.domain,
+                sample_unit=axis.unit,
+                depth_basis=summary.get("depth_basis"),
+                provenance=dict(native_metadata.get("provenance") or {}),
+            )
             file_axis = np.asarray(data["samples"], dtype=np.float64)
             if not np.array_equal(file_axis, axis.values):
                 raise ValueError(f"Well-control SampleAxis mismatch: {path}")
@@ -860,13 +1175,20 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
                 xline=np.asarray(data["xline"], dtype=np.float64),
                 x_m=np.asarray(data["x_m"], dtype=np.float64),
                 y_m=np.asarray(data["y_m"], dtype=np.float64),
+                observed_valid_mask=np.asarray(data["observed_valid_mask"], dtype=bool),
                 wellbore_class=str(metadata["wellbore_class"]),
                 sampling_mode=str(metadata["sampling_mode"]),
                 source_run_type=str(metadata["source_run_type"]),
                 provenance=dict(metadata["provenance"]),
+                native=native,
             )
             if not np.array_equal(control.valid_mask, np.asarray(data["valid_mask"], dtype=bool)):
                 raise ValueError(f"Well-control NPZ valid_mask disagrees with finite values: {path}")
+            if not np.array_equal(
+                control.observed_valid_mask,
+                np.asarray(data["observed_valid_mask"], dtype=bool),
+            ):
+                raise ValueError(f"Well-control NPZ observed_valid_mask changed during loading: {path}")
             controls.append(control)
     return WellControlSet(
         sample_axis=axis,
@@ -884,9 +1206,11 @@ __all__ = [
     "MANIFEST_COLUMNS",
     "SCHEMA_VERSION",
     "TIME_SOURCE_SCHEMA",
+    "NativeWellControl",
     "WellControl",
     "WellControlSet",
     "build_well_control_set",
+    "interpolate_bounded_internal_gaps",
     "load_well_control_set",
     "write_well_control_set",
 ]

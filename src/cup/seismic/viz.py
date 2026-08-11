@@ -46,7 +46,7 @@ def _plot_trace(
 
 
 def _plot_reflectivity(
-    reflectivity: grid.Reflectivity,
+    reflectivity: grid.Reflectivity | grid.Log,
     figsize: tuple = (3, 5),
     fig_axes: tuple | None = None,
 ) -> tuple:
@@ -171,7 +171,7 @@ def _align_impedance_traces_to_basis(
     selected: grid.Log,
     target_basis: np.ndarray,
 ) -> tuple[list[grid.Log], grid.Log]:
-    """Interpolate TWT impedance traces onto the exact seismic tie window."""
+    """Interpolate impedance traces onto the exact seismic tie window."""
     target = np.asarray(target_basis, dtype=np.float64)
     if target.ndim != 1 or target.size < 2 or np.any(~np.isfinite(target)) or np.any(np.diff(target) <= 0.0):
         raise ValueError("Waveform QC target basis must be finite and strictly increasing.")
@@ -181,8 +181,14 @@ def _align_impedance_traces_to_basis(
 
     aligned: list[grid.Log] = []
     for trace in traces:
-        if not trace.is_twt:
-            raise ValueError("Waveform QC impedance traces must use a TWT basis.")
+        if trace.is_twt:
+            basis_type = "twt"
+        elif trace.is_tvdss:
+            basis_type = "tvdss"
+        else:
+            raise ValueError("Waveform QC impedance traces must use a TWT or TVDSS basis.")
+        if basis_type != ("twt" if selected.is_twt else "tvdss" if selected.is_tvdss else ""):
+            raise ValueError("Waveform QC impedance traces must share one basis type.")
         source_basis = np.asarray(trace.basis, dtype=np.float64)
         source_values = np.asarray(trace.values, dtype=np.float64)
         tolerance = max(abs(float(trace.sampling_rate)) * 0.5, 1e-9)
@@ -196,7 +202,7 @@ def _align_impedance_traces_to_basis(
             grid.Log(
                 values,
                 target,
-                "twt",
+                basis_type,
                 name=trace.name,
                 unit=trace.unit,
                 allow_nan=trace.allow_nan,
@@ -299,8 +305,13 @@ def _plot_dynamic_xcorr(
     else:
         fig, ax = fig_axes
 
-    # basis in seconds, lags in ms
-    extent = [1000 * dxcorr.lags_basis[0], 1000 * dxcorr.lags_basis[-1], dxcorr.basis[-1], dxcorr.basis[0]]
+    lag_scale = 1000.0 if dxcorr.is_twt else 1.0
+    extent = [
+        lag_scale * dxcorr.lags_basis[0],
+        lag_scale * dxcorr.lags_basis[-1],
+        dxcorr.basis[-1],
+        dxcorr.basis[0],
+    ]
 
     if im_params is None:
         im_params = dict(cmap="RdYlBu_r", vmin=-0.85, vmax=0.85)
@@ -324,7 +335,7 @@ def _plot_dynamic_xcorr(
 
 def plot_well_waveform_qc(
     logset: grid.LogSet | grid.Log | Sequence[grid.Log],
-    reflectivity: grid.Reflectivity,
+    reflectivity: grid.Reflectivity | grid.Log,
     synthetic_seismic: grid.Seismic,
     real_seismic: grid.Seismic,
     xcorr: grid.XCorr,

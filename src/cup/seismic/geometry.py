@@ -93,6 +93,8 @@ class SampleAxis:
     values: np.ndarray
     domain: str
     unit: str
+    depth_basis: str | None = None
+    positive_direction: str = "increasing"
 
     def __post_init__(self) -> None:
         values = np.asarray(self.values, dtype=np.float64)
@@ -105,12 +107,24 @@ class SampleAxis:
             raise ValueError(
                 "SampleAxis values must be a finite, strictly increasing 1D array."
             )
-        expected_unit = "s" if self.domain == "time" else "m" if self.domain == "depth" else None
-        if expected_unit is None or self.unit != expected_unit:
+        domain = str(self.domain).strip().casefold()
+        unit = str(self.unit).strip().casefold()
+        expected_unit = "s" if domain == "time" else "m" if domain == "depth" else None
+        if expected_unit is None or unit != expected_unit:
             raise ValueError(
                 f"Unsupported SampleAxis domain/unit: {self.domain!r}/{self.unit!r}."
             )
+        depth_basis = None if self.depth_basis in (None, "") else str(self.depth_basis).strip().casefold()
+        if domain == "depth" and depth_basis not in (None, "tvdss"):
+            raise ValueError("Depth SampleAxis depth_basis must be 'tvdss'.")
+        if domain == "time" and depth_basis is not None:
+            raise ValueError("Time SampleAxis must not define depth_basis.")
+        if self.positive_direction != "increasing":
+            raise ValueError("SampleAxis positive_direction must be 'increasing'.")
         object.__setattr__(self, "values", values)
+        object.__setattr__(self, "domain", domain)
+        object.__setattr__(self, "unit", unit)
+        object.__setattr__(self, "depth_basis", "tvdss" if domain == "depth" else None)
 
     @property
     def step(self) -> float:
@@ -118,6 +132,26 @@ class SampleAxis:
         if self.values.size == 1:
             return 0.0
         return float(self.values[1] - self.values[0])
+
+    @property
+    def sample_domain(self) -> str:
+        """返回跨模块合同使用的采样域名称。"""
+        return self.domain
+
+    @property
+    def sample_unit(self) -> str:
+        """返回跨模块合同使用的采样单位。"""
+        return self.unit
+
+    @property
+    def coordinates(self) -> np.ndarray:
+        """返回只读语义下的采样坐标。"""
+        return self.values
+
+    @property
+    def sample_interval(self) -> float:
+        """返回规则采样间隔。"""
+        return self.step
 
     def describe(self) -> dict[str, Any]:
         """按历史几何字典字段描述采样轴。"""
@@ -128,6 +162,8 @@ class SampleAxis:
             "sample_step": float(self.step),
             "sample_domain": self.domain,
             "sample_unit": self.unit,
+            "positive_direction": self.positive_direction,
+            "depth_basis": self.depth_basis,
         }
 
     def window_indices(self, start: float | None, end: float | None) -> tuple[int, int]:

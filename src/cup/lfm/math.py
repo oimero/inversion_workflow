@@ -109,8 +109,6 @@ def apply_lfm_lowpass(log: grid.Log, spec: LowpassSpec) -> grid.Log:
             crop = slice(None)
         else:
             mode = "reflect" if spec.buffer_mode == "reflect" else "edge"
-            if mode == "reflect" and pad_samples >= segment.size:
-                raise ValueError("Reflect buffer is not smaller than the finite log run.")
             padded = np.pad(segment, pad_samples, mode=mode)
             crop = slice(pad_samples, pad_samples + segment.size)
         output[start:stop] = sosfiltfilt(sos, padded, padtype=None)[crop]

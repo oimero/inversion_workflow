@@ -1,6 +1,6 @@
 # 06 真实工区井控数据集
 
-`real_field_well_controls.py` 是工作流的第六步。它只做一件事：**把第四步标定产物的波阻抗对数统一转换成相同的井控事实。**
+`real_field_well_controls.py` 是工作流的第六步。它把预处理后的完整井曲线统一到地震采样轴，同时保留原生采样井曲线，并为每口成功井生成正演质控图。
 
 > 深度域工区使用第五步（`wavelet_batch_synthetic_depth`）作为上游，配置方式见文末。
 
@@ -24,7 +24,7 @@ python scripts/real_field_well_controls.py --output-dir scripts/output/well_cont
 |------|------|------|
 | 第四步 | `run_summary.json` | schema/domain 校验和直接上游契约身份 |
 | 第四步 | `well_tie_metrics.csv` | 成功井清单和产物路径 |
-| 第四步 | 每井 filtered LAS | `AI [m/s*g/cm3]` 曲线 |
+| 第三步与第四步 | 每井预处理 LAS | 原生 `AI [m/s*g/cm3]` 曲线 |
 | 第四步 | 每井优化 TDT | MD→TWT 映射 |
 | 第四步 | 每井 trace sample plan | 斜井逐样点 inline/xline/XY（仅斜井） |
 | 第一步 | `well_inventory.csv` | 井口坐标、KB 高程、井型 |
@@ -42,6 +42,14 @@ real_field_well_controls:
   source_run_dir: scripts/output/well_auto_tie_<timestamp>
   well_inventory_file: scripts/output/well_inventory_<timestamp>/well_inventory.csv
   well_trace_dir: all_well_trace
+  max_internal_gap_axis_units: 0.008
+
+real_field_well_controls_qc:
+  forward_model_inputs_run_dir:
+  body_smoothing_fwhm_m: 15.0
+  dynamic_correlation_window_m: 75.0
+  event_threshold_fraction: 0.10
+  max_event_windows_per_well: 4
 ```
 
 ### `source_run_type`
@@ -50,13 +58,13 @@ real_field_well_controls:
 
 | 值 | 目标域 | 上游 |
 |---|---|---|
-| `well_auto_tie` | time + s | 第四步 `well_tie_metrics.csv`，每井 filtered LAS + 优化 TDT |
-| `wavelet_batch_synthetic_depth` | depth + tvdss + m | 深度域第五步 `wavelet_batch_metrics.csv`，每井 shifted filtered LAS |
+| `well_auto_tie` | time + s | 第四步成功井、预处理 LAS 和优化 TDT |
+| `wavelet_batch_synthetic_depth` | depth + tvdss + m | 深度域第五步成功井和平移后的预处理 LAS |
 
 输入要求：
 
 - 只接受第四步 `tie_status=success` 的井。
-- 每井必须有 filtered LAS（含 AI 曲线，单位 `m/s*g/cm3`）和优化 TDT 表。
+- 每井必须有预处理 LAS（含 AI 曲线，单位 `m/s*g/cm3`）和对应的域转换信息。
 - 斜井还需要优化轨迹采样计划文件。
 
 ### `source_run_dir`
@@ -69,13 +77,17 @@ real_field_well_controls:
 
 ### `well_trace_dir`
 
-当前未使用。配置段必须存在，可为空路径。
+深度域斜井使用该目录中的轨迹文件；直井不读取轨迹文件。
+
+### 内部缺口
+
+`max_internal_gap_axis_units` 的单位由采样轴决定：时间域为秒，深度域为米。脚本只线性内插不超过该宽度的内部缺口；曲线两端和更长缺口保持为空。当前深度域主配置使用 10 m。
 
 ---
 
 ## 脚本在做什么
 
-脚本的核心任务很简单：**把上游 LAS 里的波阻抗对数，从测深域投影到目标地震的采样轴上，并为每个有效样点附上空间坐标。** 分三个阶段：适配 → 域转换 → 写入。
+脚本发布同一口井的两层事实：模型轴上的完整井控服务于低频模型和后续训练，原生采样上的完整井曲线服务于主体监督和高频残差。处理顺序为适配、域转换、写入和正演质控。
 
 ### 第一阶段：适配
 
@@ -87,7 +99,7 @@ real_field_well_controls:
 
 对每口井，通过优化 TDT 表把每个 TWT 采样点映射到 MD 轴上的一个位置，再从 LAS 的 MD 轴上读出该位置的 ln(AI) 值。空间位置方面，直井直接把井口的固定线号道号广播到所有样点；斜井从第四步产出的轨迹采样计划读取逐样点的线号、道号和 XY。
 
-关键约束：**LAS 中连续有限段之间的空值间隙不会被填补**。每个连续数据段独立插值，缺口处严格保留空值。这保证了井控事实不引入人为插值。
+模型轴记录两个掩码：`observed_valid_mask` 表示直接由原生有限段投影得到的样点，`valid_mask` 表示可供低频模型使用的样点，其中可以包含配置允许的短内部缺口内插。两端缺口和长缺口在两个掩码中都保持无效。
 
 ### 第三阶段：校验与写入
 
@@ -95,9 +107,19 @@ real_field_well_controls:
 
 然后写入三类产物：
 
-1. **逐井 NPZ。** `wells/<well>.npz`，固定包含采样轴、ln(AI)、线号、道号、XY、有效掩码和元数据 JSON。无效样点对应数组值为 NaN。
-2. **Manifest CSV。** 每口候选井一行，记录状态、井型、采样模式、有效样点数和 NPZ 路径。失败的井也保留行，但 NPZ 路径为空。
+1. **逐井 NPZ。** `wells/<well>.npz` 同时包含模型轴井控和原生完整井控。两层各自携带采样坐标、波阻抗对数和有效掩码；模型轴层同时携带线号、道号和米制坐标。
+2. **Manifest CSV。** 每口候选井一行，分别记录两层数据的总样点数、有效样点数和 NPZ 路径。失败的井也保留行，但 NPZ 路径为空。
 3. **运行摘要 JSON。** 记录来源适配器、采样轴、上游契约指纹、井数统计和产物路径。
+
+### 第四阶段：每井正演质控
+
+深度域运行读取第五步发布的冻结子波和 AI–Vp 关系。每口成功井生成三张目的层图件：
+
+1. 完整井曲线的六联正演质控图；
+2. 15 m 主体曲线的六联正演质控图；
+3. 若干真实地震波瓣窗口中的完整曲线、主体曲线及两套合成波形对比图。
+
+完整曲线与主体曲线使用同一个由完整曲线估计的振幅系数，因此第三张图保留两套合成波形之间的真实振幅差异。井曲线覆盖不完整时，图件显示目的层内最长的共同有效区间。
 
 ---
 
@@ -107,9 +129,16 @@ real_field_well_controls:
 real_field_well_controls_<timestamp>/
 ├── run_summary.json
 ├── well_control_manifest.csv
-└── wells/
-    ├── <well_a>.npz
-    └── <well_b>.npz
+├── wells/
+│   ├── <well_a>.npz
+│   └── <well_b>.npz
+└── qc/
+    ├── manifest.json
+    ├── metrics.csv
+    └── figures/<well_name>/
+        ├── full_waveform_qc.png
+        ├── body_waveform_qc.png
+        └── event_waveform_comparison.png
 ```
 
 ### `well_control_manifest.csv`
@@ -125,13 +154,15 @@ real_field_well_controls_<timestamp>/
 | `wellbore_class` | `vertical` 或 `deviated` |
 | `sampling_mode` | 具体采样方式 |
 | `n_samples` / `n_valid_samples` | 总样点数 / 有效样点数 |
+| `n_observed_samples` / `n_interpolated_samples` | 原始观测样点数 / 短缺口内插样点数 |
+| `n_native_samples` / `n_valid_native_samples` | 原生完整井曲线总样点数 / 有效样点数 |
 | `well_npz_path` | NPZ 路径（失败时为空）；消费者不再重算逐井文件哈希 |
 
-`run_summary.json` 使用 `real_field_well_controls_v3`，通过 `input_contracts` 记录直接上游，并只发布一个 `contract_fingerprint_sha256`。
+`run_summary.json` 使用 `real_field_well_controls_v5`，通过 `input_contracts` 记录直接上游，并发布一个生产者契约指纹。
 
 ### `wells/<well_name>.npz`
 
-每井固定包含八个数组：
+每井固定包含模型轴、原生井轴和元数据字段：
 
 | 键 | dtype | 形状 | 含义 |
 |------|------|------|------|
@@ -142,6 +173,10 @@ real_field_well_controls_<timestamp>/
 | `x_m` | float64 | [N] | 逐样点 X 米制坐标 |
 | `y_m` | float64 | [N] | 逐样点 Y 米制坐标 |
 | `valid_mask` | bool | [N] | 有效掩码 |
+| `observed_valid_mask` | bool | [N] | 未经缺口内插的观测支撑 |
+| `native_coordinates` | float64 | [M] | 对齐后的原生 TWT 或 TVDSS 坐标 |
+| `native_full_log_ai` | float32 | [M] | 原生采样的完整 ln(AI)，无效处为 NaN |
+| `native_valid_mask` | bool | [M] | 原生完整井曲线有效掩码 |
 | `metadata_json` | 标量字符串 | — | 井名、schema、provenance |
 
 ### `run_summary.json`
@@ -158,9 +193,10 @@ real_field_well_controls_<timestamp>/
 === Real-field Well Controls ===
 Output: scripts/output/real_field_well_controls_<timestamp>
 Successful wells: 12
+QC figures: scripts/output/real_field_well_controls_<timestamp>/qc/figures
 ```
 
-成功井数至少为 1 即表示第六步完成。具体哪些基线模型能建模是第七步的事。
+成功井数和图件目录均打印后，第六步完成。
 
 ### 第二步：看 `well_control_manifest.csv`
 
@@ -175,6 +211,12 @@ Successful wells: 12
 
 - 检查有效掩码对应的波阻抗对数值范围是否合理（波阻抗对数值通常在 8~10 左右，对应线性 AI 约 3000~22000 m/s*g/cm3）。
 - 检查直井的线号和道号是否为常数，斜井是否随样点变化。
+
+### 第四步：检查三张图件
+
+- `full_waveform_qc.png` 检查完整井曲线正演与真实地震的相位、振幅和局部相关性。
+- `body_waveform_qc.png` 检查 15 m 主体尺度是否保留主要地震响应。
+- `event_waveform_comparison.png` 直接观察几个地震波瓣内 full 与 body 合成响应的差异。
 
 ---
 
@@ -191,10 +233,4 @@ Successful wells: 12
 | XY 与线号不一致 | 井的 physical XY 与 survey geometry 反算的线号不匹配 | 检查 inventory 中井口坐标或斜井轨迹是否正确 |
 | 有效样点为零 | 井的 LAS 覆盖范围与目标 SampleAxis 完全不重叠 | 检查目标窗口是否设得合理 |
 
----
-
-## 留到第二轮
-
-- 是否在 manifest 中增加逐井目标窗口覆盖率的百分比指标。
-- 是否对斜井轨迹做更精细的 QC（如轨迹点间距检查、狗腿度告警）。
-- 是否在 Step 6 中直接输出每井的 TDT 转换质量图。
+失败井保留在 manifest 中，并记录明确原因。

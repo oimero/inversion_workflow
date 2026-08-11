@@ -26,12 +26,16 @@ if str(SRC_DIR) not in sys.path:
 from cup.config.sources import resolve_source_file_from_run
 from cup.config.workflow import WorkflowConfig, deep_merge_dict
 from cup.seismic.survey import open_survey, segy_options_from_config
+from cup.seismic.target_zone_io import build_workflow_target_zone
 from cup.utils.io import (
     is_consumable_contract_status,
     latest_checked_run,
     load_yaml_config,
+    repo_relative_path,
     resolve_relative_path,
+    write_json,
 )
+from cup.well.real_field_control_qc import write_depth_well_control_qc
 from cup.well.real_field_controls import (
     DEPTH_SOURCE_SCHEMA,
     TIME_SOURCE_SCHEMA,
@@ -120,6 +124,33 @@ def _resolved_config(raw: dict[str, Any], workflow: WorkflowConfig) -> dict[str,
     return config
 
 
+def _resolve_forward_inputs_run(raw: dict[str, Any], workflow: WorkflowConfig) -> tuple[Path, dict[str, Any]]:
+    config = dict(raw.get("real_field_well_controls_qc") or {})
+    if not config:
+        raise ValueError("Config lacks real_field_well_controls_qc section.")
+    explicit = str(config.pop("forward_model_inputs_run_dir", "") or "").strip()
+    if explicit:
+        run_dir = resolve_relative_path(explicit, root=REPO_ROOT)
+    else:
+        def validate(path: Path) -> None:
+            with (path / "forward_model_inputs.json").open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if (
+                payload.get("schema") != "forward_model_inputs_v3"
+                or payload.get("sample_domain") != workflow.seismic.domain
+                or payload.get("depth_basis") != workflow.seismic.depth_basis
+            ):
+                raise ValueError("forward model inputs do not match the workflow seismic domain")
+
+        run_dir = latest_checked_run(
+            resolve_relative_path(workflow.output_root, root=REPO_ROOT),
+            "depth_forward_model_inputs",
+            required_files=["forward_model_inputs.json"],
+            validator=validate,
+        )
+    return run_dir, config
+
+
 def _resolve_output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> Path:
     if args.output_dir is not None:
         return resolve_relative_path(args.output_dir, root=REPO_ROOT)
@@ -160,9 +191,36 @@ def main() -> None:
         repo_root=REPO_ROOT,
         resolved_config=config,
     )
+    qc_dir = None
+    if workflow.seismic.domain == "depth":
+        target_zone, _horizon_sources = build_workflow_target_zone(
+            raw_config=raw,
+            survey=survey,
+            data_root=data_root,
+            repo_root=REPO_ROOT,
+        )
+        forward_inputs_run, qc_config = _resolve_forward_inputs_run(raw, workflow)
+        qc_dir = output_dir / "qc"
+        qc_manifest = write_depth_well_control_qc(
+            controls,
+            survey=survey,
+            target_zone=target_zone,
+            forward_inputs_run_dir=forward_inputs_run,
+            output_dir=qc_dir,
+            repo_root=REPO_ROOT,
+            config=qc_config,
+        )
+        summary["outputs"]["qc_manifest"] = repo_relative_path(
+            qc_dir / "manifest.json",
+            root=REPO_ROOT,
+        )
+        summary["qc"] = qc_manifest
+        write_json(output_dir / "run_summary.json", summary)
     print("=== Real-field Well Controls ===")
     print(f"Output: {output_dir}")
     print(f"Successful wells: {summary['counts']['successful_wells']}")
+    if qc_dir is not None:
+        print(f"QC figures: {qc_dir / 'figures'}")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from cup.lfm.contracts import RUN_SCHEMA, VARIANT_SCHEMA
+from cup.seismic.geometry import SampleAxis
 from cup.utils.io import is_consumable_contract_status, require_contract_fingerprint, resolve_relative_path
 from cup.well.real_field_controls import SCHEMA_VERSION as WELL_CONTROL_SCHEMA
 
@@ -27,6 +28,21 @@ class ResolvedLfmVariant:
     variant_metadata: Mapping[str, Any]
     well_control_run_dir: Path
     well_control_contract_fingerprint_sha256: str
+
+
+@dataclass(frozen=True)
+class LfmInput:
+    """Numerical LFM input with explicit scale, support, and variant identity."""
+
+    variant: ResolvedLfmVariant
+    log_ai: np.ndarray
+    valid_mask: np.ndarray
+    sample_axis: SampleAxis
+    ilines: np.ndarray
+    xlines: np.ndarray
+    baseline_method: str
+    lowpass_value: float
+    lowpass_unit: str
 
 
 def _required_text(config: Mapping[str, Any], key: str) -> str:
@@ -236,4 +252,52 @@ def resolve_lfm_variant(inputs: Mapping[str, Any], *, repo_root: Path) -> Resolv
     )
 
 
-__all__ = ["ResolvedLfmVariant", "resolve_lfm_variant"]
+def load_lfm_input(inputs: Mapping[str, Any], *, repo_root: Path) -> LfmInput:
+    """Load one selected low-pass variant with explicit axes and support."""
+    variant = resolve_lfm_variant(inputs, repo_root=repo_root)
+    with np.load(variant.lfm_path, allow_pickle=False) as data:
+        log_ai = np.asarray(data["log_ai"], dtype=np.float32)
+        valid_mask = np.asarray(data["valid_mask_model"], dtype=bool)
+        samples = np.asarray(data["samples"], dtype=np.float64)
+        ilines = np.asarray(data["ilines"], dtype=np.float64)
+        xlines = np.asarray(data["xlines"], dtype=np.float64)
+    metadata = dict(variant.variant_metadata)
+    domain = str(metadata["sample_domain"])
+    axis = SampleAxis(
+        values=samples,
+        domain=domain,
+        unit=str(metadata["sample_unit"]),
+        depth_basis=metadata.get("depth_basis"),
+    )
+    baseline = dict(metadata.get("resolved_baseline_config") or {})
+    filter_config = dict(baseline.get("filter") or {})
+    if filter_config.get("enabled") is not True:
+        raise ValueError("Selected LFM input must record an explicitly enabled low-pass filter.")
+    if domain == "depth":
+        key, unit = "cutoff_wavelength_m", "m"
+    else:
+        key, unit = "cutoff_hz", "Hz"
+    if key not in filter_config:
+        raise ValueError(f"Selected LFM does not record its actual {key}.")
+    cutoff = float(filter_config[key])
+    if not np.isfinite(cutoff) or cutoff <= 0.0:
+        raise ValueError(f"Selected LFM {key} must be finite and positive.")
+    return LfmInput(
+        variant=variant,
+        log_ai=log_ai,
+        valid_mask=valid_mask,
+        sample_axis=axis,
+        ilines=ilines,
+        xlines=xlines,
+        baseline_method=str(metadata["baseline_method"]),
+        lowpass_value=cutoff,
+        lowpass_unit=unit,
+    )
+
+
+__all__ = [
+    "LfmInput",
+    "ResolvedLfmVariant",
+    "load_lfm_input",
+    "resolve_lfm_variant",
+]

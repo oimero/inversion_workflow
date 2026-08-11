@@ -37,7 +37,7 @@ residual = full - body
 
 FWHM 表示连续高斯核的物理宽度，而不是三个采样点的滑动平均。`15 m` 在 `5 m` 网格上对应约 `1.27` 个采样点的高斯标准差：它强烈抑制约 `15 m` 波长的振荡，同时仍会部分衰减约 `30 m` 波长的结构。因此该参数承担明确的主体/残差尺度分工，而不单独承担训练正则化职责。
 
-第七步 LFM 的滤波尺度独立记录为 `lfm_cutoff_wavelength_m`。当前深度域工作值为 `400 m`，其职责是提供低频初始模型，不参与主体/残差分界。
+第七步 LFM 的滤波尺度独立记录为 `lfm_cutoff_wavelength_m`。当前深度域工作值为 `150 m`，其职责是提供低频初始模型，不参与主体/残差分界。
 
 ## 3. Wtie 标定资产
 
@@ -50,7 +50,7 @@ Wtie 独立完成：
 
 Wtie 的测井滤波参数服务于井震标定。GINN V2 的 `body_smoothing_fwhm_m` 服务于反演尺度控制，两者分别配置。
 
-Wtie 向后续模块提供冻结的子波、对齐测井、采样轴和有效支持，不参与 GINN V2 或 Enhance V2 的参数优化。
+Wtie 向后续模块提供冻结的子波、对齐测井、采样轴和有效支持，不参与 GINN V2 或 Enhance V2 的参数优化。冻结子波的相位和极性进入物理正演；其整体振幅在进入 GINN V2 前做单位能量归一化。
 
 ## 4. 第六步与第七步适配
 
@@ -63,18 +63,19 @@ model-axis control
 ├── target SampleAxis
 ├── filtered log-AI
 ├── inline/xline/XY
-└── valid mask
+├── observed_valid_mask
+└── valid_mask
 
 native well control
 ├── aligned preprocessed full log-AI
 ├── native vertical coordinates
-├── valid mask
+├── native_valid_mask
 └── alignment provenance
 ```
 
 `model-axis control` 延续当前第六步合同，服务于第七步 LFM。`native well control` 从时间域对齐后的 preprocessed LAS 或深度域 `shifted_preprocessed_las` 读取，服务于 GINN V2 和 Enhance V2。
 
-第六步同时携带上游井震标定的相关性、误差、状态和有效支持。井数据能否进入 GINN 井监督、Enhance 残差库或仅作诊断，由各实验配置显式选择。
+第六步同时携带上游井震标定的相关性、误差、状态和有效支持。所有成功发布的井控用于第七步 LFM；GINN 井监督和 Enhance 残差库分别使用训练前冻结的显式井名单。native 尺度运算只使用 `native_valid_mask`；投影到模型轴后的神经网络监督只使用 `observed_valid_mask`。包含短缺口插值的 `valid_mask` 服务于连续曲线、正演和 LFM 准备。其余井只作诊断。
 
 第六步发布井事实和 provenance。主体目标与残差由下游按当前 `body_smoothing_fwhm_m` 计算：
 
@@ -100,7 +101,7 @@ proportional_slice_baseline -> GINN V2 主 LFM
 trend_baseline              -> LFM 敏感性对照
 ```
 
-LFM artifact 向 GINN V2 提供 `log_ai`、SampleAxis、有效掩码、variant 身份和实际低通尺度。当前深度域 `lfm_cutoff_wavelength_m=400 m`，与 `body_smoothing_fwhm_m=15 m` 分别配置。
+LFM artifact 向 GINN V2 提供 `log_ai`、SampleAxis、有效掩码、variant 身份和实际低通尺度。当前深度域 `lfm_cutoff_wavelength_m=150 m`，与 `body_smoothing_fwhm_m=15 m` 分别配置。
 
 GINN 的 LFM 锚定在第七步 variant 的实际低通尺度上比较：
 
@@ -124,6 +125,29 @@ x_body = gaussian_smooth(u, fwhm_m=body_smoothing_fwhm_m)
 
 物理正演、井监督和最终交付都使用 `x_body`。固定且可微的主体尺度平滑层位于网络输出与正演算子之间，使更细尺度振荡无法用于降低地震拟合损失。
 
+物理闭环只约束冻结子波能够表达的波形形状。井震图件已经表明，不同井位存在无法由同一个 AI—子波模型解释的整体及局部振幅差异；因此地震振幅包含处理增益、局部可见度和正演模型误差等 nuisance，不能直接作为绝对 AI 对比度。
+
+第一版统一使用以下振幅合同：
+
+```text
+w_unit = wavelet / sqrt(sum(wavelet ** 2))
+y_syn  = forward(x_body, w_unit)
+
+normalize_support(y)
+    = (y - mean_support(y)) / max(rms_support(y), epsilon)
+
+L_seismic_shape
+    = 1 - corr_support(y_obs, y_syn)
+    + lambda_shape * smooth_l1(
+          normalize_support(y_obs),
+          normalize_support(y_syn)
+      )
+```
+
+`normalize_support` 只在当前比较道的上游观测有效样点上计算。所有可见输入道分别使用自身支持做同类归一化；真实中心道可以在损失侧参与自身的归一化，但不进入网络输入、输入特征或输入归一化统计。该损失保留极性、波瓣位置和归一化后的相对形状，同时消除任意直流偏置和整道正比例缩放。
+
+每道同时解析并报告一个非负最小二乘增益及其 raw-amplitude residual，作为观测振幅差异诊断。该解析增益不反向传播，不改变 `x_body`，也不扩展为逐样点、逐窗口或空间自由增益场。第一版 checkpoint 目标不包含原始振幅 MSE。
+
 ### 5.2 自监督预训练
 
 自监督阶段使用真实地震体，不要求井标签：
@@ -133,21 +157,23 @@ x_body = gaussian_smooth(u, fwhm_m=body_smoothing_fwhm_m)
     -> 将完整中心道替换为固定缺失值，并提供显式 missing-trace mask
     -> 保留邻道地震、中心道 LFM 和横向米制几何
     -> GINN V2 只输出中心道 x_body
-    -> 冻结子波正演中心道
-    -> 在中心道的上游有效样点重建原始地震
+    -> 归一化冻结子波正演中心道
+    -> 在中心道的上游有效样点比较振幅不变的波形形状
 ```
 
 主要损失：
 
 ```text
 L_self
-    = masked seismic reconstruction
+    = masked center-trace seismic-shape loss
     + Step-7-scale LFM anchor
 ```
 
 第一版只使用完整中心道掩码。训练、验证和 checkpoint 选择共享同一套冻结中心道 identity。输入归一化只使用可见邻道，中心道原始地震不参与任何输入特征或归一化统计。
 
-重建 support 直接使用上游发布的中心道观测有效掩码。输入准备、正演和损失之间不派生 halo、erode、taper 或垂向窗口；中心道全部有效样点采用一致权重。这样每个被监督样点都具有相同的输入可见性和损失语义。
+该阶段只预训练波形形状与横向上下文的映射。其输出具有 LFM 约束的绝对背景，但 body 对比度的整体尺度仍是未校准自由度，因此自监督 checkpoint 只作为半监督初始化，不作为最终定量 AI 交付。
+
+波形比较 support 直接使用上游发布的中心道观测有效掩码。输入准备、正演和损失之间不派生 halo、erode、taper 或垂向窗口；中心道全部有效样点采用一致权重。这样每个被监督样点都具有相同的输入可见性和损失语义。
 
 第一版使用 inline/xline 二维剖面共享网络权重。横向位置由实际米制坐标表达，xline 步长只用于几何寻址。
 
@@ -157,7 +183,7 @@ L_self
 
 ```text
 L_finetune
-    = full seismic physics loss
+    = seismic-shape physics loss
     + well body-scale loss
     + Step-7-scale LFM anchor
 ```
@@ -168,7 +194,11 @@ L_finetune
 gaussian_smooth(aligned full well log-AI, body_smoothing_fwhm_m)
 ```
 
-低频锚定在所选第七步 variant 的实际低通尺度上比较预测与 LFM，控制背景漂移。高频井残差不进入 GINN V2 的监督目标。
+井损失在 log-AI 物理单位中比较预测与目标，默认使用受原始观测有效掩码约束的 Smooth L1。可信井名单由第六步井震质量报告显式冻结；低质量井不参与 loss 聚合。
+
+低频锚定在所选第七步 variant 的实际低通尺度上比较预测与 LFM，控制背景漂移。LFM 使用全部成功井控，可信井 body loss 提供绝对主体对比度，地震闭环提供波瓣位置、极性和形状约束。高频井残差不进入 GINN V2 的监督目标。
+
+可信井之外的绝对 body 对比度属于模型从 LFM、地震形状与井锚联合外推的结果；交付时必须同时发布井锚支持。物理闭环相关性不能单独证明绝对振幅正确。
 
 ### 5.4 早停与 checkpoint 选择
 
@@ -176,24 +206,25 @@ gaussian_smooth(aligned full well log-AI, body_smoothing_fwhm_m)
 
 训练每个 epoch 保存可独立推理的 checkpoint，并分别记录：
 
-- 留出空间块上的波形误差和相关性；
+- 留出空间块上的归一化波形形状损失和相关性；
+- 非负解析增益及 raw-amplitude residual 的分布诊断；
 - 可信井上的 body-scale log-AI 误差；
 - 预测 body 的短波能量和垂向粗糙度；
 - 相对所选 LFM 的低频漂移。
 
 正式 checkpoint 使用“最早可接受”规则选择：
 
-1. 留出波形拟合达到预先冻结的可接受区间或进入平台；
+1. 留出波形形状拟合达到预先冻结的可接受区间或进入平台；
 2. 可信井 body-scale 指标处于已达到的最佳容差范围内；
 3. 短波能量、粗糙度和低频漂移保持在冻结上限内。
 
-自监督预训练以冻结 validation center traces 的整道重建平台触发早停。半监督微调同时使用留出地震和可信井 body-scale 指标。波形相关性是闭环充分性指标，不单独决定最佳 checkpoint；同等满足条件时选择 epoch 更早的模型。
+自监督预训练以冻结 validation center traces 的波形形状拟合平台触发早停。半监督微调同时使用留出地震形状和可信井 body-scale 指标。解析增益与 raw-amplitude residual 只揭示观测振幅 gap，不参与 checkpoint 排序。波形相关性是闭环充分性指标，不单独决定最佳 checkpoint；同等满足条件时选择 epoch 更早的模型。
 
 ### 5.5 GINN V2 交付
 
 - body-scale high-resolution log-AI；
 - model-grid log-AI；
-- 正演地震及其与真实地震的闭环指标；
+- 正演地震、归一化波形形状闭环指标和观测振幅诊断；
 - 有效支持与井锚支持；
 - inline/xline 推理结果及方向分歧。
 
@@ -324,25 +355,26 @@ EnhancedResult = ResidualEnhancer.enhance(
 
 ## 9. 实施顺序
 
-1. 建立共同采样轴、common batch、time/depth forward adapter 和 vertical-scale adapter。
-2. 扩展第六步 native well control，并锁定第七步主 LFM 与敏感性 LFM 的 artifact 合同。
-3. 固定 `body_smoothing_fwhm_m` 和可微高斯算子，建立 GINN V2 的 body-scale 正演闭环。
-4. 冻结波形充分性、井尺度误差、短波能量、粗糙度和低频漂移的 checkpoint 选择合同。
-5. 使用真实地震剖面完成掩码物理自监督预训练，并按最早可接受规则早停。
-6. 加入可信井 body-scale 监督，完成半监督微调与确定性真实工区推理。
-7. 从对齐井建立高频残差样本库，复刻并简化残差增强训练链。
-8. 训练 Enhance V2，输出完整剖面的连续高频 residual field。
-9. 联合报告 body、residual、最终 log-AI 和正演闭环结果。
+实施按人工检查和长时间运行分成五个阶段：
+
+0. 基础合同与输入资产：依次运行第六步 `scripts/real_field_well_controls.py` 和第七步 `scripts/real_field_lfm.py`，由其正式产物提供双层井控与 LFM；同时完成时深 adapter、主体平滑和正演闭环。阶段 0 不设置额外的生产脚本。
+1. GINN V2 自监督预训练：完成完整中心道掩码、归一化子波和振幅不变波形形状训练；以一次正式预训练及 checkpoint 人工选择结束。
+2. GINN V2 半监督与剖面门禁：加入可信井主体尺度的绝对 log-AI 监督并生成固定真实剖面；以一次正式微调和剖面人工检查结束。
+3. Enhance V2 残差学习：建立井残差库并训练完整剖面 residual field；以一次正式训练和增强图件人工检查结束。
+4. 联合真实工区交付：冻结两个模型，完成确定性全体积推理及 body/residual/最终结果报告。
+
+各阶段的连续实现范围、交接条件和人工职责见 `PHYSICS_CONSTRAINED_RESIDUAL_LEARNING_HANDOFF.md`。
 
 ## 10. 第一版判断标准
 
 ### GINN V2
 
-- 真实地震闭环相关性和误差达到当前物理反演基线；
+- 真实地震的归一化波形形状闭环达到当前物理反演基线；
 - 输出中无明显小于 `body_smoothing_fwhm_m` 的锯齿；
 - 可信井上的 body-scale AI 优于 LFM；
 - 掩码预训练后横向连续性优于直接半监督训练。
-- 最终交付来自满足波形、井尺度、粗糙度和低频漂移合同的最早 checkpoint。
+- 原始振幅失配作为 nuisance 诊断发布，不驱动 AI 对比度；
+- 最终交付来自满足波形形状、井尺度、粗糙度和低频漂移合同的最早 checkpoint。
 
 ### Enhance V2
 

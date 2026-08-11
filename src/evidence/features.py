@@ -7,8 +7,6 @@ from dataclasses import dataclass
 import numpy as np
 
 from cup.physics.numpy_backend import reflectivity_from_log_ai
-from cup.synthetic.core.records import SampleAxis
-
 from evidence.contracts import EvidenceInput, InputContractError
 
 
@@ -24,8 +22,18 @@ class LfmAnchor:
 class EvidenceTargets:
     projected_log_ai_increment: np.ndarray
     signed_reflectivity: np.ndarray
-    state_id: np.ndarray
     support: np.ndarray
+
+
+def common_evidence_support(base_support: np.ndarray) -> np.ndarray:
+    """Require both samples that define a lower-interface reflectivity."""
+
+    base = np.asarray(base_support, dtype=bool)
+    if base.ndim != 2:
+        raise InputContractError("base evidence support must be two-dimensional.")
+    support = np.zeros_like(base)
+    support[:, 1:] = base[:, 1:] & base[:, :-1]
+    return support
 
 
 def _zone_coordinate(axis: np.ndarray, top: float, bottom: float) -> np.ndarray:
@@ -95,60 +103,27 @@ def build_evidence_targets(
     observation: EvidenceInput,
     *,
     model_log_ai: np.ndarray,
-    state_highres: np.ndarray,
-    highres_axis: SampleAxis,
     anchor: LfmAnchor,
 ) -> EvidenceTargets:
-    """Build the three supervised targets on the observation sample axis."""
+    """Build the two continuous targets on the observation sample axis."""
 
     log_ai = np.asarray(model_log_ai, dtype=np.float64)
-    state = np.asarray(state_highres)
     if log_ai.shape != observation.seismic.shape:
         raise InputContractError("model_log_ai must match the observation.")
-    if not isinstance(highres_axis, SampleAxis):
-        raise TypeError("highres_axis must be a SampleAxis object.")
-    if (
-        highres_axis.sample_domain != observation.sample_axis.sample_domain
-        or highres_axis.unit != observation.sample_axis.unit
-        or highres_axis.depth_basis != observation.sample_axis.depth_basis
-    ):
-        raise InputContractError("target axes must share domain, unit, and depth basis.")
-    expected_highres = (observation.width, highres_axis.coordinates.size)
-    if state.shape != expected_highres:
-        raise InputContractError("state_highres must match the high-resolution axis.")
-    ratio = observation.sample_axis.sample_interval / highres_axis.sample_interval
-    factor = int(round(ratio))
-    if factor < 1 or not np.isclose(ratio, factor, rtol=0.0, atol=1.0e-10):
-        raise InputContractError("target axes must be integer nested.")
-    nested = highres_axis.coordinates[::factor]
-    if nested.shape != observation.sample_axis.coordinates.shape or not np.allclose(
-        nested,
-        observation.sample_axis.coordinates,
-        rtol=0.0,
-        atol=1.0e-8,
-    ):
-        raise InputContractError("high-resolution samples do not nest on the model axis.")
-    state_model = state[:, ::factor]
     base_support = (
         anchor.support
         & observation.observed_valid
         & observation.lateral_valid[:, None]
         & np.isfinite(log_ai)
         & np.isfinite(anchor.values)
-        & (state_model >= 0)
-        & (state_model <= 2)
     )
     increment = np.where(base_support, log_ai - anchor.values, 0.0)
     reflectivity = np.zeros_like(log_ai)
     reflectivity[:, 1:] = reflectivity_from_log_ai(log_ai)
-    interface_support = base_support.copy()
-    interface_support[:, 0] = False
-    interface_support[:, 1:] &= base_support[:, :-1]
-    support = base_support & interface_support
+    support = common_evidence_support(base_support)
     return EvidenceTargets(
         projected_log_ai_increment=np.where(support, increment, 0.0),
         signed_reflectivity=np.where(support, reflectivity, 0.0),
-        state_id=np.where(support, state_model, -1).astype(np.int64),
         support=support,
     )
 
@@ -158,5 +133,6 @@ __all__ = [
     "LfmAnchor",
     "build_evidence_targets",
     "build_lfm_anchor",
+    "common_evidence_support",
     "lfm_residual_from_anchor",
 ]

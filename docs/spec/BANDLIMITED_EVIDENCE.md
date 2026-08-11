@@ -8,7 +8,6 @@
 seismic + full LFM + validity + lateral geometry
 → projected log-AI increment mean/scale
 → signed reflectivity mean/scale
-→ three-state log potential
 ```
 
 这些输出描述当前地震频带能够支持的阻抗变化，不承担高分辨率地质体生成、微边界定位或唯一反射系数恢复的语义。
@@ -19,7 +18,7 @@ seismic + full LFM + validity + lateral geometry
 
 - `EvidenceInput`：带采样轴、有效性和米制横向几何的输入；
 - `EvidenceModel.predict()`：生成一份 `BandlimitedEvidence`；
-- `train_evidence_model()`：训练三个证据 head；
+- `train_evidence_model()`：训练两个连续证据 head；
 - `evaluate_evidence_model()`：评价证据、基线和地震干预；
 - `EvidenceNetworkConfig` 与 `EvidenceLearningConfig`。
 
@@ -28,7 +27,6 @@ seismic + full LFM + validity + lateral geometry
 - zone-linear LFM anchor；
 - projected log-AI increment mean/scale；
 - signed reflectivity mean/scale；
-- 三状态归一化 log potential；
 - local tuning scale；
 - sample support；
 - `lateral_m` 和可选 XY 坐标。
@@ -56,13 +54,12 @@ background_lfm_linear = a + b * (2ζ - 1)
 
 ## 监督目标
 
-canonical synthetic corpus 为每个 parent-zone 生成三个模型网格目标：
+canonical synthetic corpus 为每个 parent-zone 生成两个模型网格目标：
 
 1. `projected_log_ai_increment`：模型网格 log-AI 相对线性 anchor 的增量；
-2. `signed_reflectivity`：与 `cup.physics` 一致的下界面反射率；
-3. `state_emission`：高分辨率状态在嵌套模型网格上的取值。
+2. `signed_reflectivity`：与 `cup.physics` 一致的下界面反射率。
 
-三个目标共享严格 support。反射率首样点以及缺少上一个有效样点的位置不参与监督。
+两个目标共享严格 support。反射率首样点以及缺少上一个有效样点的位置不参与监督。
 
 ## 训练与 checkpoint
 
@@ -71,10 +68,7 @@ canonical synthetic corpus 为每个 parent-zone 生成三个模型网格目标�
 ```text
 experiments/evidence/evidence.yaml
 experiments/evidence/target_contract.json
-experiments/evidence/checkpoints/evidence_full_v1.pt
 ```
-
-其中 `evidence_full_v1.pt` 是当前 8-epoch full-input 权重按本规格 checkpoint schema 发布的版本。
 
 训练命令：
 
@@ -106,7 +100,6 @@ python scripts/evidence.py `
 
 - increment RMSE、MAE、相关性和区间 coverage；
 - reflectivity RMSE、相关性、极性准确率和区间 coverage；
-- state cross-entropy、Brier、accuracy 和 balanced accuracy；
 - zone-linear anchor 与 full-LFM baseline；
 - matched within-parent seismic shuffle；
 - 可选的独立 no-seismic checkpoint；

@@ -219,7 +219,7 @@ def _train(
         write_json(
             output / "training_progress.json",
             {
-                "schema": "evidence_training_progress_v1",
+                "schema": "evidence_training_progress_v2",
                 "status": "running",
                 "epoch": epoch,
                 "target_epochs": learning_config.epochs,
@@ -275,7 +275,7 @@ def _train(
     write_json(
         output / "training_progress.json",
         {
-            "schema": "evidence_training_progress_v1",
+            "schema": "evidence_training_progress_v2",
             "status": "completed",
             "epoch": int(result["epochs_completed"]),
             "target_epochs": learning_config.epochs,
@@ -290,7 +290,7 @@ def _train(
     write_json(
         output / "run_summary.json",
         {
-            "schema": "evidence_training_v1",
+            "schema": "evidence_training_v2",
             "status": "success",
             "mode": "smoke" if args.smoke else "formal",
             "runtime": dict(runtime),
@@ -360,7 +360,7 @@ def _evaluate(
     write_json(
         output / "evaluation.json",
         {
-            "schema": "evidence_evaluation_v1",
+            "schema": "evidence_evaluation_v2",
             "status": "success",
             "split": args.split,
             "runtime": dict(runtime),

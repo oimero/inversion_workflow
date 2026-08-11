@@ -222,8 +222,6 @@ def iter_evidence_batches(
             targets = build_evidence_targets(
                 observation,
                 model_log_ai=parent.model_log_ai,
-                state_highres=parent.state_id_highres,
-                highres_axis=parent.highres_axis,
                 anchor=anchor,
             )
             training_input = observation
@@ -264,7 +262,6 @@ def iter_evidence_batches(
                 "signed_reflectivity": targets.signed_reflectivity[None].astype(
                     np.float32
                 ),
-                "state_emission": targets.state_id[None].astype(np.int64),
                 "support": targets.support[None],
             }
 

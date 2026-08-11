@@ -16,7 +16,11 @@ from evidence.contracts import (
     EvidenceTargetContract,
     InputContractError,
 )
-from evidence.features import build_lfm_anchor, lfm_residual_from_anchor
+from evidence.features import (
+    build_lfm_anchor,
+    common_evidence_support,
+    lfm_residual_from_anchor,
+)
 
 
 def dominant_frequency_hz(
@@ -174,7 +178,6 @@ class BandlimitedEvidenceNetwork(nn.Module):
         self.increment_raw_scale = nn.Conv1d(config.hidden_channels, 1, 1)
         self.reflectivity_mean = nn.Conv1d(config.hidden_channels, 1, 1)
         self.reflectivity_raw_scale = nn.Conv1d(config.hidden_channels, 1, 1)
-        self.state_logits = nn.Conv1d(config.hidden_channels, 3, 1)
         for head in (self.increment_mean, self.reflectivity_mean):
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
@@ -246,12 +249,6 @@ class BandlimitedEvidenceNetwork(nn.Module):
         support = observed_valid & lateral_valid[:, :, None]
         increment_mean = self.increment_mean(hidden).reshape(batch, width, samples)
         reflectivity_mean = self.reflectivity_mean(hidden).reshape(batch, width, samples)
-        state_logits = self.state_logits(hidden).reshape(
-            batch,
-            width,
-            3,
-            samples,
-        ).permute(0, 1, 3, 2)
         return {
             "projected_log_ai_increment_mean": increment_mean,
             "projected_log_ai_increment_scale": self._positive_scale(
@@ -263,8 +260,6 @@ class BandlimitedEvidenceNetwork(nn.Module):
                 self.reflectivity_raw_scale(hidden).reshape(batch, width, samples),
                 self.config.signed_reflectivity_scale,
             ),
-            "state_logits": state_logits,
-            "state_log_potential": F.log_softmax(state_logits, dim=-1),
             "support": support,
         }
 
@@ -272,7 +267,7 @@ class BandlimitedEvidenceNetwork(nn.Module):
 class EvidenceModel:
     """Deep module for converting one observation tile into band-limited evidence."""
 
-    PAYLOAD_SCHEMA = "bandlimited_evidence_model_v1"
+    PAYLOAD_SCHEMA = "bandlimited_evidence_model_v2"
 
     def __init__(
         self,
@@ -324,17 +319,17 @@ class EvidenceModel:
                 torch.as_tensor(observation.lateral_m[None], dtype=torch.float32, device=self.device),
                 torch.as_tensor(observation.lateral_valid[None], dtype=torch.bool, device=self.device),
             )
-        support = output["support"][0].cpu().numpy().astype(bool) & anchor.support
+        support = common_evidence_support(
+            output["support"][0].cpu().numpy().astype(bool) & anchor.support
+        )
         increment_mean = output["projected_log_ai_increment_mean"][0].cpu().numpy().astype(np.float64)
         increment_scale = output["projected_log_ai_increment_scale"][0].cpu().numpy().astype(np.float64)
         reflectivity_mean = output["signed_reflectivity_mean"][0].cpu().numpy().astype(np.float64)
         reflectivity_scale = output["signed_reflectivity_scale"][0].cpu().numpy().astype(np.float64)
-        state_log_potential = output["state_log_potential"][0].cpu().numpy().astype(np.float64)
         increment_mean[~support] = 0.0
         increment_scale[~support] = self.network_config.projected_log_ai_increment_scale
         reflectivity_mean[~support] = 0.0
         reflectivity_scale[~support] = self.network_config.signed_reflectivity_scale
-        state_log_potential[~support] = -np.log(3.0)
         tuning[~support] = axis.sample_interval
         background = np.where(support, anchor.values, 0.0)
         return BandlimitedEvidence(
@@ -344,7 +339,6 @@ class EvidenceModel:
             projected_log_ai_increment_scale=increment_scale,
             signed_reflectivity_mean=reflectivity_mean,
             signed_reflectivity_scale=reflectivity_scale,
-            state_log_potential=state_log_potential,
             local_tuning_scale=tuning,
             support=support,
             lateral_m=observation.lateral_m,
@@ -390,7 +384,6 @@ def evidence_loss(
     config: EvidenceNetworkConfig,
     increment_weight: float,
     reflectivity_weight: float,
-    state_weight: float,
     scale_weight: float,
 ) -> dict[str, torch.Tensor]:
     support = targets["support"].bool() & output["support"].bool()
@@ -430,20 +423,9 @@ def evidence_loss(
         torch.log(reflectivity_scale_ratio[support]),
         torch.log(reflectivity_scale_target[support]),
     )
-    represented = targets["state_emission"].long()[support]
-    counts = torch.bincount(represented, minlength=3).to(dtype=torch.float32)
-    present = counts > 0.0
-    class_weight = torch.zeros_like(counts)
-    class_weight[present] = counts[present].sum() / (present.sum() * counts[present])
-    state_cross_entropy = F.cross_entropy(
-        output["state_logits"][support],
-        represented,
-        weight=class_weight,
-    )
     total = (
         increment_weight * increment_mean_huber
         + reflectivity_weight * reflectivity_mean_huber
-        + state_weight * state_cross_entropy
         + scale_weight * (increment_scale_huber + reflectivity_scale_huber)
     )
     return {
@@ -452,7 +434,6 @@ def evidence_loss(
         "increment_scale_huber": increment_scale_huber,
         "reflectivity_mean_huber": reflectivity_mean_huber,
         "reflectivity_scale_huber": reflectivity_scale_huber,
-        "state_cross_entropy": state_cross_entropy,
     }
 
 

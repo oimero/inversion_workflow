@@ -10,7 +10,7 @@ import torch
 from evidence.network import EvidenceModel
 
 
-CHECKPOINT_SCHEMA = "bandlimited_evidence_checkpoint_v1"
+CHECKPOINT_SCHEMA = "bandlimited_evidence_checkpoint_v2"
 
 
 def save_checkpoint(

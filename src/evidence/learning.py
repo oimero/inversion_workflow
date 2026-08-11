@@ -25,7 +25,6 @@ _TENSOR_BATCH_KEYS = frozenset(
         "lateral_valid",
         "projected_log_ai_increment",
         "signed_reflectivity",
-        "state_emission",
         "support",
     }
 )
@@ -40,7 +39,6 @@ class EvidenceLearningConfig:
     gradient_clip_norm: float = 5.0
     increment_weight: float = 1.0
     reflectivity_weight: float = 0.5
-    state_weight: float = 0.25
     scale_weight: float = 0.1
     random_seed: int = 20260808
 
@@ -54,7 +52,6 @@ class EvidenceLearningConfig:
         for name in (
             "increment_weight",
             "reflectivity_weight",
-            "state_weight",
             "scale_weight",
         ):
             value = float(getattr(self, name))
@@ -83,11 +80,7 @@ def _to_device(
             continue
         result[key] = torch.as_tensor(
             value,
-            dtype=(
-                torch.bool
-                if key in boolean
-                else torch.long if key == "state_emission" else torch.float32
-            ),
+            dtype=torch.bool if key in boolean else torch.float32,
             device=device,
         )
     return result
@@ -111,7 +104,6 @@ def _forward_loss(
         config=model.network_config,
         increment_weight=config.increment_weight,
         reflectivity_weight=config.reflectivity_weight,
-        state_weight=config.state_weight,
         scale_weight=config.scale_weight,
     )
 
@@ -216,7 +208,6 @@ def train_evidence_model(
         "increment_scale_huber",
         "reflectivity_mean_huber",
         "reflectivity_scale_huber",
-        "state_cross_entropy",
     )
     for epoch in range(start_epoch, config.epochs + 1):
         model.network.train()
@@ -243,7 +234,7 @@ def train_evidence_model(
             if batch_index % config.log_every_batches == 0:
                 log.info(
                     "epoch %d/%d | batch %d | current_loss=%.6f | mean_loss=%.6f | "
-                    "increment=%.6f | reflectivity=%.6f | state_ce=%.6f",
+                    "increment=%.6f | reflectivity=%.6f",
                     epoch,
                     config.epochs,
                     batch_index,
@@ -251,7 +242,6 @@ def train_evidence_model(
                     running["loss"] / batch_index,
                     current["increment_mean_huber"],
                     current["reflectivity_mean_huber"],
-                    current["state_cross_entropy"],
                 )
         if batch_count == 0:
             raise ValueError("training received no batches.")
@@ -316,11 +306,6 @@ def _new_statistics() -> dict[str, Any]:
         "reflectivity_pair": np.zeros(5, dtype=np.float64),
         "reflectivity_polarity_count": 0,
         "reflectivity_polarity_correct": 0,
-        "state_cross_entropy": 0.0,
-        "state_brier": 0.0,
-        "state_correct": 0,
-        "state_class_count": np.zeros(3, dtype=np.int64),
-        "state_class_correct": np.zeros(3, dtype=np.int64),
     }
 
 
@@ -417,22 +402,6 @@ def _update_statistics(
         )
     )
 
-    target_state = np.asarray(source["state_emission"], dtype=np.int64)[support]
-    state_log_potential = np.asarray(output["state_log_potential"], dtype=np.float64)[support]
-    state_probability = np.exp(state_log_potential)
-    prediction_state = np.argmax(state_log_potential, axis=-1)
-    statistics["state_cross_entropy"] += float(
-        np.sum(-state_log_potential[np.arange(target_state.size), target_state])
-    )
-    one_hot = np.eye(3, dtype=np.float64)[target_state]
-    statistics["state_brier"] += float(np.sum((state_probability - one_hot) ** 2))
-    statistics["state_correct"] += int(np.count_nonzero(prediction_state == target_state))
-    statistics["state_class_count"] += np.bincount(target_state, minlength=3)
-    statistics["state_class_correct"] += np.bincount(
-        target_state[prediction_state == target_state],
-        minlength=3,
-    )
-
 
 def _update_increment_statistics(
     statistics: dict[str, Any],
@@ -453,9 +422,6 @@ def _finalize_statistics(statistics: Mapping[str, Any]) -> dict[str, Any]:
     count = int(statistics["count"])
     if count <= 0:
         raise ValueError("cannot finalize empty evidence statistics.")
-    state_count = np.asarray(statistics["state_class_count"], dtype=np.float64)
-    state_correct = np.asarray(statistics["state_class_correct"], dtype=np.float64)
-    represented = state_count > 0.0
     polarity_count = int(statistics["reflectivity_polarity_count"])
     return {
         "supported_samples": count,
@@ -478,13 +444,6 @@ def _finalize_statistics(statistics: Mapping[str, Any]) -> dict[str, Any]:
             if polarity_count > 0
             else None
         ),
-        "state_cross_entropy": float(statistics["state_cross_entropy"]) / count,
-        "state_brier": float(statistics["state_brier"]) / count,
-        "state_accuracy": float(statistics["state_correct"]) / count,
-        "state_balanced_accuracy": float(
-            np.mean(state_correct[represented] / state_count[represented])
-        ),
-        "state_class_count": [int(value) for value in state_count],
     }
 
 
@@ -678,8 +637,6 @@ def evaluate_evidence_model(
         for metric in (
             "increment_rmse",
             "reflectivity_rmse",
-            "state_brier",
-            "state_balanced_accuracy",
         ):
             values = np.asarray(
                 [row["models"]["full"][metric] - row["models"][control][metric] for row in parent_rows],
@@ -689,7 +646,7 @@ def evaluate_evidence_model(
                 values,
                 seed=bootstrap_seed + index,
                 replicates=bootstrap_replicates,
-                lower_is_better=metric != "state_balanced_accuracy",
+                lower_is_better=True,
             )
             index += 1
     for control in overall_baselines:

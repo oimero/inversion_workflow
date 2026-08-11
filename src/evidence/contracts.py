@@ -180,11 +180,10 @@ class EvidenceTargetContract:
     global_scales: Mapping[str, float]
     source: str
 
-    SCHEMA = "bandlimited_evidence_target_contract_v1"
+    SCHEMA = "bandlimited_evidence_target_contract_v2"
     TARGETS = (
         "projected_log_ai_increment",
         "signed_reflectivity",
-        "state_emission",
     )
     REQUIRED_SCALES = (
         "seismic",
@@ -257,7 +256,6 @@ class BandlimitedEvidence:
     projected_log_ai_increment_scale: np.ndarray
     signed_reflectivity_mean: np.ndarray
     signed_reflectivity_scale: np.ndarray
-    state_log_potential: np.ndarray
     local_tuning_scale: np.ndarray
     support: np.ndarray
     lateral_m: np.ndarray
@@ -291,14 +289,6 @@ class BandlimitedEvidence:
         support = _array(self.support, dtype=bool, ndim=2, name="support")
         if support.shape != shape or any(value.shape != shape for value in parsed.values()):
             raise InputContractError("all scalar evidence fields must share one shape.")
-        state = _array(
-            self.state_log_potential,
-            dtype=np.float64,
-            ndim=3,
-            name="state_log_potential",
-        )
-        if state.shape != shape + (3,):
-            raise InputContractError("state_log_potential must be [lateral, sample, 3].")
         if np.any(support & ~np.isfinite(mean)):
             raise InputContractError("supported increment means must be finite.")
         for name in (
@@ -311,11 +301,6 @@ class BandlimitedEvidence:
         for name in ("background_lfm_linear", "signed_reflectivity_mean"):
             if np.any(support & ~np.isfinite(parsed[name])):
                 raise InputContractError(f"supported {name} must be finite.")
-        if np.any(support & ~np.all(np.isfinite(state), axis=-1)):
-            raise InputContractError("supported state_log_potential must be finite.")
-        normalizer = np.logaddexp.reduce(state, axis=-1)
-        if np.any(support & ~np.isclose(normalizer, 0.0, rtol=0.0, atol=1.0e-5)):
-            raise InputContractError("state_log_potential must be log-normalized.")
         lateral = _array(self.lateral_m, dtype=np.float64, ndim=1, name="lateral_m")
         if lateral.shape != (shape[0],) or np.any(~np.isfinite(lateral)) or (
             lateral.size > 1 and np.any(np.diff(lateral) <= 0.0)
@@ -339,7 +324,6 @@ class BandlimitedEvidence:
         object.__setattr__(self, "projected_log_ai_increment_mean", mean)
         for name, value in parsed.items():
             object.__setattr__(self, name, value)
-        object.__setattr__(self, "state_log_potential", state)
         object.__setattr__(self, "support", support)
         object.__setattr__(self, "lateral_m", lateral)
         object.__setattr__(self, "x_m", coordinates[0])

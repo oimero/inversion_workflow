@@ -103,18 +103,40 @@ class DepthDomainAdapter(DomainAdapter):
         velocity = batch.domain_extras.get("velocity_mps")
         if velocity is None or velocity.shape != body_log_ai.shape:
             raise ValueError("Depth adapter requires velocity_mps matching body_log_ai.")
+        if not torch.is_floating_point(velocity) or bool(torch.any(torch.isinf(velocity)).item()):
+            raise ValueError("Depth adapter velocity_mps must be floating without infinite values.")
         depth = torch.as_tensor(
             batch.sample_axis.values,
             device=body_log_ai.device,
             dtype=body_log_ai.dtype,
         )
-        return forward_depth(
-            body_log_ai,
-            velocity.to(device=body_log_ai.device, dtype=body_log_ai.dtype),
-            depth,
-            self.wavelet_time_s.to(device=body_log_ai.device, dtype=body_log_ai.dtype),
-            self.wavelet_amplitude.to(device=body_log_ai.device, dtype=body_log_ai.dtype),
-        )
+        velocity = velocity.to(device=body_log_ai.device, dtype=body_log_ai.dtype)
+        output = torch.zeros_like(body_log_ai)
+        for row in range(body_log_ai.shape[0]):
+            finite = torch.isfinite(velocity[row])
+            padded = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.bool, device=finite.device),
+                    finite,
+                    torch.zeros(1, dtype=torch.bool, device=finite.device),
+                )
+            )
+            changes = torch.nonzero(padded[1:] != padded[:-1], as_tuple=False).reshape(-1, 2)
+            for start, stop in changes.tolist():
+                if not bool(finite[start].item()):
+                    continue
+                if stop - start < 2:
+                    raise ValueError("Depth adapter finite velocity support contains a run shorter than two samples.")
+                output[row, start:stop] = forward_depth(
+                    body_log_ai[row, start:stop],
+                    velocity[row, start:stop],
+                    depth[start:stop],
+                    self.wavelet_time_s.to(device=body_log_ai.device, dtype=body_log_ai.dtype),
+                    self.wavelet_amplitude.to(device=body_log_ai.device, dtype=body_log_ai.dtype),
+                )
+        if not bool(torch.any(torch.isfinite(velocity)).item()):
+            raise ValueError("Depth adapter velocity_mps has no finite support.")
+        return output
 
 
 __all__ = ["DepthDomainAdapter", "DomainAdapter", "TimeDomainAdapter"]

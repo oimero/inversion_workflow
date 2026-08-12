@@ -1,4 +1,4 @@
-"""GINN V2 body-inversion curriculum, evaluation, and trial orchestration."""
+"""GINN V2 body-inversion curriculum, evaluation, and run orchestration."""
 
 from __future__ import annotations
 
@@ -26,7 +26,6 @@ from ginn_v2.evaluation import (
     GateReport,
     GateThresholds,
     evaluate_gates,
-    gate_improved,
 )
 from ginn_v2.losses import (
     analytic_gain_diagnostic,
@@ -36,6 +35,8 @@ from ginn_v2.losses import (
     waveform_shape_loss,
 )
 from ginn_v2.model import BodyNetworkConfig, CenterTraceBodyNet
+from ginn_v2.projector import BodyScaleProjector
+from ginn_v2.qc import write_well_waveform_qc
 from ginn_v2.split import (
     SpatialSplit,
     WellPatchTarget,
@@ -61,6 +62,7 @@ class BodyInversionLossWeights:
     seismic_shape: float = 1.0
     lfm_anchor: float = 1.0
     trusted_well_body: float = 1.0
+    trusted_well_derivative: float = 0.5
     lambda_shape: float = 0.25
 
     def __post_init__(self) -> None:
@@ -70,15 +72,31 @@ class BodyInversionLossWeights:
 
 
 @dataclass(frozen=True)
+class CheckpointSelectionWeights:
+    well_rmse: float
+    roughness: float
+    short_wave: float
+
+    def __post_init__(self) -> None:
+        for name, value in asdict(self).items():
+            if not np.isfinite(float(value)) or float(value) < 0.0:
+                raise ValueError(f"Checkpoint selection weight {name} must be finite and non-negative.")
+        if not any(float(value) > 0.0 for value in asdict(self).values()):
+            raise ValueError("At least one checkpoint selection weight must be positive.")
+
+
+@dataclass(frozen=True)
 class BodyInversionConfig:
     """Frozen body-inversion business and training configuration."""
 
-    body_smoothing_fwhm_m: float = 15.0
+    body_smoothing_fwhm_m: float
+    selection_weights: CheckpointSelectionWeights
+    waveform_qc_dynamic_window_m: float
+    gates: GateThresholds
     patch_radius: int = 8
     batch_size: int = 8
     pretrain_epochs: int = 1
-    finetune_epochs: int = 2
-    max_trials: int = 3
+    finetune_epochs: int = 3
     pretrain_learning_rate: float = 1e-3
     finetune_learning_rate: float = 2e-4
     weight_decay: float = 0.0
@@ -88,7 +106,7 @@ class BodyInversionConfig:
     review_fraction: float = 0.04
     validation_gap_m: float = 300.0
     validation_anchor: str = "maxmin"
-    well_validation_fraction: float = 0.20
+    well_batch_multiplier: int = 2
     trusted_well_names: tuple[str, ...] = ()
     orientations: tuple[str, ...] = ("inline", "xline")
     device: str = "cpu"
@@ -96,30 +114,34 @@ class BodyInversionConfig:
     cache_size: int = 256
     log_every_batches: int = 20
     loss_weights: BodyInversionLossWeights = BodyInversionLossWeights()
-    gates: GateThresholds = GateThresholds()
     network: BodyNetworkConfig = BodyNetworkConfig()
 
     def __post_init__(self) -> None:
-        for name in ("body_smoothing_fwhm_m", "pretrain_learning_rate", "finetune_learning_rate", "weight_decay", "gradient_clip_norm", "validation_gap_m", "well_validation_fraction"):
+        for name in (
+            "body_smoothing_fwhm_m",
+            "pretrain_learning_rate",
+            "finetune_learning_rate",
+            "weight_decay",
+            "gradient_clip_norm",
+            "validation_gap_m",
+            "waveform_qc_dynamic_window_m",
+        ):
             value = float(getattr(self, name))
             if not np.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative.")
         if self.body_smoothing_fwhm_m <= 0.0 or self.pretrain_learning_rate <= 0.0 or self.finetune_learning_rate <= 0.0:
             raise ValueError("Body scale and learning rates must be positive.")
-        if not np.isclose(self.body_smoothing_fwhm_m, 15.0, rtol=0.0, atol=1e-12):
-            raise ValueError("Body inversion body_smoothing_fwhm_m is fixed at 15 m.")
+        if self.waveform_qc_dynamic_window_m <= 0.0:
+            raise ValueError("waveform_qc_dynamic_window_m must be positive.")
         _positive_int(self.patch_radius, name="patch_radius")
         _positive_int(self.batch_size, name="batch_size")
         _positive_int(self.max_train_centers, name="max_train_centers")
         _positive_int(self.max_validation_centers, name="max_validation_centers")
         if not 1 <= int(self.pretrain_epochs) <= 3 or not 1 <= int(self.finetune_epochs) <= 3:
             raise ValueError("pretrain_epochs and finetune_epochs must be within [1, 3].")
-        if not 1 <= int(self.max_trials) <= 3:
-            raise ValueError("max_trials must be within [1, 3].")
+        _positive_int(self.well_batch_multiplier, name="well_batch_multiplier")
         if not 0.0 < float(self.review_fraction) < 1.0:
             raise ValueError("review_fraction must be within (0, 1).")
-        if not 0.0 < float(self.well_validation_fraction) < 1.0:
-            raise ValueError("well_validation_fraction must be within (0, 1).")
         if self.validation_anchor not in {"maxmax", "maxmin", "minmax", "minmin", "center"}:
             raise ValueError("Unsupported validation_anchor.")
         if not self.trusted_well_names:
@@ -139,8 +161,14 @@ class BodyInversionConfig:
         loss_value = config.pop("loss_weights", config.pop("loss", {}))
         gate_value = config.pop("gates", {})
         network_value = config.pop("network", {})
-        if not isinstance(loss_value, Mapping) or not isinstance(gate_value, Mapping) or not isinstance(network_value, Mapping):
-            raise ValueError("ginn_v2_body_inversion loss/gates/network must be mappings.")
+        selection_value = config.pop("selection_weights", {})
+        if (
+            not isinstance(loss_value, Mapping)
+            or not isinstance(gate_value, Mapping)
+            or not isinstance(network_value, Mapping)
+            or not isinstance(selection_value, Mapping)
+        ):
+            raise ValueError("ginn_v2_body_inversion loss/gates/network/selection_weights must be mappings.")
         if "trusted_well_names" in config:
             config["trusted_well_names"] = tuple(config["trusted_well_names"])
         if "orientations" in config:
@@ -150,16 +178,17 @@ class BodyInversionConfig:
             loss_weights=BodyInversionLossWeights(**dict(loss_value)),
             gates=GateThresholds(**dict(gate_value)),
             network=BodyNetworkConfig(**dict(network_value)),
+            selection_weights=CheckpointSelectionWeights(**dict(selection_value)),
         )
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
             "body_smoothing_fwhm_m": self.body_smoothing_fwhm_m,
+            "selection_weights": asdict(self.selection_weights),
             "patch_radius": self.patch_radius,
             "batch_size": self.batch_size,
             "pretrain_epochs": self.pretrain_epochs,
             "finetune_epochs": self.finetune_epochs,
-            "max_trials": self.max_trials,
             "pretrain_learning_rate": self.pretrain_learning_rate,
             "finetune_learning_rate": self.finetune_learning_rate,
             "weight_decay": self.weight_decay,
@@ -169,7 +198,8 @@ class BodyInversionConfig:
             "review_fraction": self.review_fraction,
             "validation_gap_m": self.validation_gap_m,
             "validation_anchor": self.validation_anchor,
-            "well_validation_fraction": self.well_validation_fraction,
+            "well_batch_multiplier": self.well_batch_multiplier,
+            "waveform_qc_dynamic_window_m": self.waveform_qc_dynamic_window_m,
             "trusted_well_names": list(self.trusted_well_names),
             "orientations": list(self.orientations),
             "device": self.device,
@@ -188,8 +218,7 @@ class BodyInversionData:
     spatial_split: SpatialSplit
     well_targets: Mapping[str, WellTarget]
     well_splits: tuple[WellSampleSplit, ...]
-    train_well_patches: tuple[WellPatchTarget, ...]
-    validation_well_patches: tuple[WellPatchTarget, ...]
+    trusted_well_patches: tuple[WellPatchTarget, ...]
     trusted_well_names: tuple[str, ...]
 
     def split_description(self) -> dict[str, Any]:
@@ -233,6 +262,7 @@ def build_body_inversion_data(
     controls: WellControlSet,
     *,
     config: BodyInversionConfig,
+    lfm_lowpass_spec: LowpassSpec,
     candidate_keys: Iterable[PatchKey],
     target_zone_mask: np.ndarray,
 ) -> BodyInversionData:
@@ -254,6 +284,11 @@ def build_body_inversion_data(
         source_run_type=controls.source_run_type,
         provenance=controls.provenance,
     )
+    projector = BodyScaleProjector(
+        smoothing_fwhm_m=config.body_smoothing_fwhm_m,
+        sample_step=float(reader.sample_axis.step),
+        lowpass_spec=lfm_lowpass_spec,
+    )
     targets = {
         control.well_name: build_well_body_target(
             control,
@@ -263,13 +298,16 @@ def build_body_inversion_data(
                 geometry=reader.geometry,
                 target_zone_mask=target_zone_mask,
             ),
+            lfm_log_ai=reader.lfm_log_ai,
+            lfm_valid_mask=reader.lfm_valid_mask,
+            geometry=reader.geometry,
+            projector=projector,
         )
         for control in trusted
     }
     well_splits = build_well_splits(
         trusted_set,
         targets,
-        validation_fraction=config.well_validation_fraction,
     )
     full_spatial = make_spatial_split(
         tuple(candidate_keys),
@@ -297,7 +335,7 @@ def build_body_inversion_data(
         gap_m=full_spatial.gap_m,
         anchor=full_spatial.anchor,
     )
-    train_well_patches = build_well_patch_targets(
+    trusted_well_patches = build_well_patch_targets(
         trusted_set,
         targets,
         well_splits,
@@ -305,21 +343,12 @@ def build_body_inversion_data(
         subset="train",
         orientations=config.orientations,  # type: ignore[arg-type]
     )
-    validation_well_patches = build_well_patch_targets(
-        trusted_set,
-        targets,
-        well_splits,
-        geometry=reader.geometry,
-        subset="validation",
-        orientations=config.orientations,  # type: ignore[arg-type]
-    )
     return BodyInversionData(
         reader=reader,
         spatial_split=spatial,
         well_targets=targets,
         well_splits=well_splits,
-        train_well_patches=train_well_patches,
-        validation_well_patches=validation_well_patches,
+        trusted_well_patches=trusted_well_patches,
         trusted_well_names=tuple(config.trusted_well_names),
     )
 
@@ -327,8 +356,6 @@ def build_body_inversion_data(
 @dataclass(frozen=True)
 class TrialAdjustment:
     trial_id: int
-    parent_trial_id: int | None
-    target_gate: str | None
     action: str
     learning_rate: float
     loss_weights: BodyInversionLossWeights
@@ -336,8 +363,6 @@ class TrialAdjustment:
     def to_json_dict(self) -> dict[str, Any]:
         return {
             "trial_id": self.trial_id,
-            "parent_trial_id": self.parent_trial_id,
-            "target_gate": self.target_gate,
             "action": self.action,
             "learning_rate": self.learning_rate,
             "loss_weights": asdict(self.loss_weights),
@@ -354,7 +379,6 @@ class TrialResult:
     metrics: EvaluationMetrics
     gate: GateReport
     stop_reason: str
-    target_gate_improved: bool | None
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -366,7 +390,6 @@ class TrialResult:
             "metrics": self.metrics.to_json_dict(),
             "gate": self.gate.to_json_dict(),
             "stop_reason": self.stop_reason,
-            "target_gate_improved": self.target_gate_improved,
         }
 
 
@@ -404,13 +427,20 @@ class BodyInversionTrainer:
         config: BodyInversionConfig,
         lfm_lowpass_spec: LowpassSpec,
         output_dir: Path,
+        artifact_root: Path | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.data = data
         self.adapter = adapter
         self.config = config
         self.lfm_lowpass_spec = lfm_lowpass_spec
+        self.projector = BodyScaleProjector(
+            smoothing_fwhm_m=config.body_smoothing_fwhm_m,
+            sample_step=float(data.reader.sample_axis.step),
+            lowpass_spec=lfm_lowpass_spec,
+        )
         self.output_dir = Path(output_dir)
+        self.artifact_root = Path(artifact_root) if artifact_root is not None else self.output_dir
         self.log = logger or logging.getLogger(__name__)
         self.device = torch.device(config.device)
         if self.device.type == "cuda" and not torch.cuda.is_available():
@@ -441,26 +471,26 @@ class BodyInversionTrainer:
     ) -> tuple[Tensor, Tensor, CommonObservationBatch]:
         common = self._common(batch)
         if model is None:
-            # Keep the LFM-only reference on the same body-scale and forward
-            # path as a trained checkpoint. Comparing raw LFM directly with a
-            # 15 m-smoothed prediction biases the well and short-wave gates.
             closure = self.adapter.close_body(
                 batch.lfm_log_ai,
                 common,
-                body_smoothing_fwhm_m=self.config.body_smoothing_fwhm_m,
             )
             body = closure.body_log_ai
             synthetic = closure.synthetic_seismic
         else:
-            body_raw = model(
+            raw_correction = model(
                 batch.features,
                 center_index=self.data.reader.patch_radius,
-                center_lfm_log_ai=batch.lfm_log_ai,
             )
+            body_correction = self.projector.project(
+                raw_correction,
+                self._coordinates(common),
+                batch.lfm_valid_mask,
+            )
+            body = batch.lfm_log_ai + body_correction
             closure = self.adapter.close_body(
-                body_raw,
+                body,
                 common,
-                body_smoothing_fwhm_m=self.config.body_smoothing_fwhm_m,
             )
             body = closure.body_log_ai
             synthetic = closure.synthetic_seismic
@@ -486,14 +516,18 @@ class BodyInversionTrainer:
                 common.observed_valid_mask,
                 lambda_shape=weights.lambda_shape,
             ).loss
-        anchor = lfm_anchor_loss(
-            body,
-            common.lfm_log_ai,
-            common.lfm_valid_mask,
-            sample_step=float(common.sample_axis.step),
-            lowpass_spec=self.lfm_lowpass_spec,
-        )
+        if weights.lfm_anchor > 0.0:
+            anchor = lfm_anchor_loss(
+                body,
+                common.lfm_log_ai,
+                common.lfm_valid_mask,
+                sample_step=float(common.sample_axis.step),
+                lowpass_spec=self.lfm_lowpass_spec,
+            )
+        else:
+            anchor = torch.zeros((), dtype=body.dtype, device=body.device)
         well_loss = torch.zeros((), dtype=body.dtype, device=body.device)
+        well_derivative_loss = torch.zeros((), dtype=body.dtype, device=body.device)
         if well_items:
             target = torch.zeros_like(body)
             target_mask = torch.zeros_like(body, dtype=torch.bool)
@@ -508,10 +542,39 @@ class BodyInversionTrainer:
                 target[target_mask] / per_sample_scale[target_mask],
                 reduction="mean",
             )
-        total = weights.seismic_shape * shape_loss + weights.lfm_anchor * anchor + weights.trusted_well_body * well_loss
+            coordinates = self._coordinates(common)
+            if coordinates.ndim == 1:
+                coordinates = coordinates[None, :].expand_as(body)
+            pair_mask = target_mask[:, 1:] & target_mask[:, :-1]
+            if bool(torch.any(pair_mask).item()):
+                spacing = coordinates[:, 1:] - coordinates[:, :-1]
+                if bool(torch.any(spacing <= 0.0).item()):
+                    raise ValueError("Well derivative coordinates must be strictly increasing.")
+                body_derivative = (body[:, 1:] - body[:, :-1]) / spacing
+                target_derivative = (target[:, 1:] - target[:, :-1]) / spacing
+                derivative_scale = per_sample_scale[:, 1:] / torch.clamp(
+                    torch.abs(spacing),
+                    min=torch.finfo(body.dtype).eps,
+                )
+                well_derivative_loss = F.smooth_l1_loss(
+                    body_derivative[pair_mask] / derivative_scale[pair_mask],
+                    target_derivative[pair_mask] / derivative_scale[pair_mask],
+                    reduction="mean",
+                )
+        total = (
+            weights.seismic_shape * shape_loss
+            + weights.lfm_anchor * anchor
+            + weights.trusted_well_body * well_loss
+            + weights.trusted_well_derivative * well_derivative_loss
+        )
         if not bool(torch.isfinite(total).item()):
             raise ValueError("Body-inversion loss is non-finite.")
-        return total, {"seismic_shape": shape_loss.detach(), "lfm_anchor": anchor.detach(), "trusted_well_body": well_loss.detach()}
+        return total, {
+            "seismic_shape": shape_loss.detach(),
+            "lfm_anchor": anchor.detach(),
+            "trusted_well_body": well_loss.detach(),
+            "trusted_well_derivative": well_derivative_loss.detach(),
+        }
 
     def _scheduled_batches(
         self,
@@ -524,7 +587,7 @@ class BodyInversionTrainer:
         masked = _chunks(self.data.spatial_split.train_keys, self.config.batch_size, seed=base_seed)
         visible = _chunks(self.data.spatial_split.train_keys, self.config.batch_size, seed=base_seed + 1)
         by_well: dict[str, list[WellPatchTarget]] = {}
-        for item in self.data.train_well_patches:
+        for item in self.data.trusted_well_patches:
             by_well.setdefault(item.well_name, []).append(item)
         if not by_well:
             raise ValueError("Trusted-well training has no patch targets.")
@@ -541,7 +604,8 @@ class BodyInversionTrainer:
         for step in range(n_steps):
             yield "masked", masked[step % len(masked)], False
             yield "visible_center", visible[step % len(visible)], True
-            yield "trusted_well", wells[step % len(wells)], True
+            for _ in range(self.config.well_batch_multiplier):
+                yield "trusted_well", wells[step % len(wells)], True
 
     def train_epoch(
         self,
@@ -554,7 +618,13 @@ class BodyInversionTrainer:
         pretrain: bool = False,
     ) -> dict[str, float]:
         model.train()
-        totals: dict[str, list[Tensor]] = {"total": [], "seismic_shape": [], "lfm_anchor": [], "trusted_well_body": []}
+        totals: dict[str, list[Tensor]] = {
+            "total": [],
+            "seismic_shape": [],
+            "lfm_anchor": [],
+            "trusted_well_body": [],
+            "trusted_well_derivative": [],
+        }
         started = time.monotonic()
         schedule: Iterable[tuple[str, tuple[Any, ...], bool]]
         if pretrain:
@@ -590,9 +660,9 @@ class BodyInversionTrainer:
                 include_seismic=kind != "trusted_well",
             )
             total.backward()
-            for parameter in model.parameters():
+            for parameter_name, parameter in model.named_parameters():
                 if parameter.grad is not None and not bool(torch.all(torch.isfinite(parameter.grad)).item()):
-                    raise ValueError("Body-inversion gradient contains non-finite values.")
+                    raise ValueError(f"Body-inversion gradient contains non-finite values: {kind} {parameter_name}.")
             if self.config.gradient_clip_norm > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), self.config.gradient_clip_norm)
             optimizer.step()
@@ -601,7 +671,7 @@ class BodyInversionTrainer:
                 totals[name].append(value)
             if batch_index % self.config.log_every_batches == 0:
                 self.log.info(
-                    "trial %d | epoch %d/%d | batch %d | kind=%s | loss=%.6f | elapsed=%.1fs",
+                    "run %d | epoch %d/%d | batch %d | kind=%s | loss=%.6f | elapsed=%.1fs",
                     trial_id,
                     epoch,
                     self.config.pretrain_epochs if pretrain else self.config.finetune_epochs,
@@ -657,8 +727,8 @@ class BodyInversionTrainer:
         values: dict[str, dict[int, list[float]]] = {}
         targets: dict[str, dict[int, float]] = {}
         with torch.no_grad():
-            for start in range(0, len(self.data.validation_well_patches), self.config.batch_size):
-                items = self.data.validation_well_patches[start : start + self.config.batch_size]
+            for start in range(0, len(self.data.trusted_well_patches), self.config.batch_size):
+                items = self.data.trusted_well_patches[start : start + self.config.batch_size]
                 batch = self.data.reader.batch(
                     tuple(item.patch_key for item in items),
                     center_visible=True,
@@ -674,8 +744,9 @@ class BodyInversionTrainer:
                         targets.setdefault(item.well_name, {})[index] = float(item.target_values[index])
         rmse_by_well: dict[str, float] = {}
         bias_by_well: dict[str, float] = {}
+        correlation_by_well: dict[str, float] = {}
         all_residuals: list[float] = []
-        roughness_ratios: list[float] = []
+        roughness_by_well: dict[str, float] = {}
         axis = np.asarray(self.data.reader.sample_axis.values, dtype=np.float64)
         for name in sorted(values):
             indices = sorted(values[name])
@@ -684,26 +755,32 @@ class BodyInversionTrainer:
             residual = predicted - target
             rmse_by_well[name] = float(np.sqrt(np.mean(np.square(residual))))
             bias_by_well[name] = float(np.mean(residual))
+            correlation = float(np.corrcoef(target, predicted)[0, 1])
+            if not np.isfinite(correlation):
+                raise ValueError(f"Well body correlation is non-finite: {name}")
+            correlation_by_well[name] = correlation
             all_residuals.extend(residual.tolist())
             if len(indices) >= 3:
                 coords = axis[np.asarray(indices)]
                 differences = np.diff(coords)
                 contiguous = np.isclose(differences, np.median(differences), rtol=0.0, atol=1e-8)
-                if not np.all(contiguous):
-                    raise ValueError(f"Validation well interval is not continuous: {name}")
-                predicted_rough = float(np.sqrt(np.mean(np.square(np.diff(predicted) / differences))))
-                target_rough = float(np.sqrt(np.mean(np.square(np.diff(target) / differences))))
+                if not np.any(contiguous):
+                    raise ValueError(f"Well target has no adjacent physical samples: {name}")
+                predicted_rough = float(np.sqrt(np.mean(np.square(np.diff(predicted)[contiguous] / differences[contiguous]))))
+                target_rough = float(np.sqrt(np.mean(np.square(np.diff(target)[contiguous] / differences[contiguous]))))
                 if target_rough <= 0.0:
-                    raise ValueError(f"Validation body target has zero roughness: {name}")
-                roughness_ratios.append(predicted_rough / target_rough)
-        if not all_residuals or not roughness_ratios:
+                    raise ValueError(f"Well body target has zero roughness: {name}")
+                roughness_by_well[name] = predicted_rough / target_rough
+        if not all_residuals or set(roughness_by_well) != set(rmse_by_well):
             raise ValueError("Well evaluation did not produce residual and roughness support.")
         return {
             "rmse_by_well": rmse_by_well,
             "bias_by_well": bias_by_well,
+            "correlation_by_well": correlation_by_well,
             "pooled_rmse": float(np.sqrt(np.mean(np.square(all_residuals)))),
             "pooled_bias": float(np.mean(all_residuals)),
-            "roughness_ratio": float(max(roughness_ratios)),
+            "roughness_by_well": roughness_by_well,
+            "roughness_ratio": float(np.median(np.asarray(list(roughness_by_well.values()), dtype=np.float64))),
         }
 
     def _lfm_drift(self, trace_eval: Mapping[str, Any], keys: tuple[PatchKey, ...]) -> float:
@@ -908,13 +985,26 @@ class BodyInversionTrainer:
                 )
                 support_array = np.stack([model_eval["supports"][key] for key in local])
                 support = torch.as_tensor(support_array, device=self.device, dtype=torch.bool)
+                body_short_wave = short_wave_energy_ratio(
+                    body,
+                    coordinates,
+                    support,
+                    body_smoothing_fwhm_m=self.config.body_smoothing_fwhm_m,
+                )
+                lfm_short_wave = short_wave_energy_ratio(
+                    torch.as_tensor(
+                        np.stack([model_eval["lfm"][key] for key in local]),
+                        device=self.device,
+                        dtype=torch.float32,
+                    ),
+                    coordinates,
+                    support,
+                    body_smoothing_fwhm_m=self.config.body_smoothing_fwhm_m,
+                )
                 short_wave_values.append(
-                    short_wave_energy_ratio(
-                        body,
-                        coordinates,
-                        support,
-                        body_smoothing_fwhm_m=self.config.body_smoothing_fwhm_m,
-                    ).cpu().numpy()
+                    (body_short_wave / torch.clamp(lfm_short_wave, min=torch.finfo(body_short_wave.dtype).eps))
+                    .cpu()
+                    .numpy()
                 )
                 for row in support_array:
                     indices = np.flatnonzero(row)
@@ -932,9 +1022,11 @@ class BodyInversionTrainer:
             well_bias_by_well=wells["bias_by_well"],
             well_pooled_rmse=wells["pooled_rmse"],
             well_pooled_bias=wells["pooled_bias"],
+            well_body_correlation_by_well=wells["correlation_by_well"],
             lfm_drift_rmse=self._lfm_drift(model_eval, validation_keys),
             short_wave_energy_fraction=float(np.mean(np.concatenate(short_wave_values))),
             roughness_ratio=wells["roughness_ratio"],
+            roughness_ratio_by_well=wells["roughness_by_well"],
             analytic_gain_mean=float(np.mean(model_eval["gain"])),
             raw_amplitude_residual_mean=float(np.mean(model_eval["raw_residual"])),
             support_contiguous_fraction=float(np.mean(support_is_contiguous)),
@@ -971,8 +1063,6 @@ class BodyInversionTrainer:
         )
         adjustment = TrialAdjustment(
             trial_id=0,
-            parent_trial_id=None,
-            target_gate=None,
             action="masked_pretraining",
             learning_rate=self.config.pretrain_learning_rate,
             loss_weights=self.config.loss_weights,
@@ -1012,6 +1102,12 @@ class BodyInversionTrainer:
                 trial_id=0,
                 epoch=epoch,
             )
+            write_well_waveform_qc(
+                self,
+                model,
+                self.output_dir / f"trial_{adjustment.trial_id:02d}" / "validation" / f"epoch_{epoch:03d}" / "well_waveform_qc",
+                root=self.artifact_root,
+            )
             self.log.info(
                 "pretraining | epoch %d complete | train_loss=%.6f | masked_corr=%.4f | well_rmse=%.5f | checkpoint=%s",
                 epoch,
@@ -1027,22 +1123,26 @@ class BodyInversionTrainer:
         shutil.copyfile(final_path, shared_path)
         return shared_path, final_metrics
 
-    def run_trial(
+    def run_finetuning(
         self,
-        adjustment: TrialAdjustment,
         *,
         baseline: EvaluationMetrics,
-        resume_checkpoint: Path | None = None,
+        resume_checkpoint: Path,
+        adjustment: TrialAdjustment | None = None,
     ) -> TrialResult:
-        if resume_checkpoint is None:
-            raise ValueError("Every fine-tuning trial must start from the shared pretraining checkpoint.")
+        """Run one fixed semi-supervised finetune and select its best epoch."""
+
+        if adjustment is None:
+            adjustment = TrialAdjustment(
+                trial_id=1,
+                action="single_semi_supervised_finetune",
+                learning_rate=self.config.finetune_learning_rate,
+                loss_weights=self.config.loss_weights,
+            )
         model, optimizer = self._model_and_optimizer(adjustment.learning_rate)
-        trial_dir = self.output_dir / f"trial_{adjustment.trial_id:02d}" / "checkpoints"
-        trial_dir.mkdir(parents=True, exist_ok=True)
-        start_epoch = 1
-        previous_metrics: EvaluationMetrics | None = None
-        previous_gate: GateReport | None = None
-        previous_checkpoint_path: Path | None = None
+        trial_dir = self.output_dir / f"trial_{adjustment.trial_id:02d}"
+        checkpoint_dir = trial_dir / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
         payload = load_checkpoint(
             resume_checkpoint,
             model=model,
@@ -1053,19 +1153,13 @@ class BodyInversionTrainer:
             raise ValueError("Pretraining checkpoint run configuration differs from the current body-inversion configuration.")
         if dict(payload["split"]) != self.data.split_description():
             raise ValueError("Pretraining checkpoint split differs from the current fixed body-inversion split.")
-        checkpoints: list[str] = []
-        selected_path: Path | None = None
-        selected_epoch: int | None = None
-        stop_reason = "finetune_epochs_exhausted"
-        last_metrics: EvaluationMetrics | None = None
-        last_gate: GateReport | None = None
-        selected_metrics: EvaluationMetrics | None = None
-        selected_gate: GateReport | None = None
         pretrain_metrics = EvaluationMetrics.from_json_dict(payload["metrics"])
-        for epoch in range(start_epoch, self.config.finetune_epochs + 1):
+        checkpoints: list[Path] = []
+        metrics_by_epoch: dict[int, EvaluationMetrics] = {}
+        gates_by_epoch: dict[int, GateReport] = {}
+        for epoch in range(1, self.config.finetune_epochs + 1):
             self.log.info(
-                "trial %d | epoch %d/%d start | action=%s | lr=%.6g",
-                adjustment.trial_id,
+                "finetune | epoch %d/%d start | action=%s | lr=%.6g",
                 epoch,
                 self.config.finetune_epochs,
                 adjustment.action,
@@ -1078,7 +1172,6 @@ class BodyInversionTrainer:
                 trial_id=adjustment.trial_id,
                 adjustment=adjustment,
             )
-            self.log.info("trial %d | epoch %d evaluation start", adjustment.trial_id, epoch)
             metrics = self.evaluate(model)
             gate = evaluate_gates(
                 metrics,
@@ -1087,7 +1180,7 @@ class BodyInversionTrainer:
                 thresholds=self.config.gates,
             )
             checkpoint_path = save_epoch_checkpoint(
-                trial_dir / f"epoch_{epoch:03d}.pt",
+                checkpoint_dir / f"epoch_{epoch:03d}.pt",
                 model=model,
                 optimizer=optimizer,
                 epoch=epoch,
@@ -1105,143 +1198,68 @@ class BodyInversionTrainer:
                 trial_id=adjustment.trial_id,
                 epoch=epoch,
             )
-            checkpoints.append(str(checkpoint_path))
+            write_well_waveform_qc(
+                self,
+                model,
+                self.output_dir / f"trial_{adjustment.trial_id:02d}" / "validation" / f"epoch_{epoch:03d}" / "well_waveform_qc",
+                root=self.artifact_root,
+            )
+            checkpoints.append(checkpoint_path)
+            metrics_by_epoch[epoch] = metrics
+            gates_by_epoch[epoch] = gate
             self.log.info(
-                "trial %d | epoch %d complete | train_loss=%.6f | seismic_shape=%.6f | lfm_anchor=%.6f | well_loss=%.6f | masked_corr=%.4f | visible_corr=%.4f | well_rmse=%.5f | lfm_drift=%.5f | failed=%s | checkpoint=%s",
-                adjustment.trial_id,
+                "finetune | epoch %d complete | train_loss=%.6f | seismic_shape=%.6f | lfm_anchor=%.6f | well_loss=%.6f | well_derivative=%.6f | masked_corr=%.4f | visible_corr=%.4f | well_rmse=%.5f | lfm_drift=%.5f | roughness_median=%.4f | short_wave_ratio=%.4f | failed=%s | checkpoint=%s",
                 epoch,
                 train_metrics["total"],
                 train_metrics["seismic_shape"],
                 train_metrics["lfm_anchor"],
                 train_metrics["trusted_well_body"],
+                train_metrics["trusted_well_derivative"],
                 float(np.median(metrics.masked_correlation)),
                 float(np.median(metrics.visible_correlation)),
                 metrics.well_pooled_rmse,
                 metrics.lfm_drift_rmse,
+                metrics.roughness_ratio,
+                metrics.short_wave_energy_fraction,
                 ",".join(gate.failed_gates) if gate.failed_gates else "none",
                 checkpoint_path.name,
             )
-            last_metrics, last_gate = metrics, gate
-            if gate.passed:
-                selected_path = checkpoint_path
-                selected_epoch = epoch
-                selected_metrics = metrics
-                selected_gate = gate
-                stop_reason = "first_acceptable_checkpoint"
-                break
-            if previous_metrics is not None and previous_gate is not None:
-                waveform_rising = float(np.median(metrics.visible_correlation)) > float(np.median(previous_metrics.visible_correlation))
-                degraded = (
-                    metrics.well_pooled_rmse > self.config.gates.degradation_ratio * previous_metrics.well_pooled_rmse
-                    or metrics.lfm_drift_rmse > self.config.gates.degradation_ratio * previous_metrics.lfm_drift_rmse
-                    or metrics.roughness_ratio > self.config.gates.degradation_ratio * previous_metrics.roughness_ratio
-                )
-                if waveform_rising and degraded:
-                    stop_reason = "quality_degradation_keep_previous_checkpoint"
-                    if previous_checkpoint_path is None:
-                        raise ValueError("Quality degradation has no preceding checkpoint to retain.")
-                    selected_path = previous_checkpoint_path
-                    selected_epoch = epoch - 1
-                    if previous_metrics is None or previous_gate is None:
-                        raise ValueError("Quality degradation has no preceding checkpoint metrics to retain.")
-                    selected_metrics = previous_metrics
-                    selected_gate = previous_gate
-                    break
-                if gate.first_failed_gate is not None and not gate_improved(
-                    metrics,
-                    previous_metrics,
-                    gate.first_failed_gate,
-                    threshold=self.config.gates.platform_improvement,
-                ):
-                    stop_reason = "failed_gate_platform"
-                    break
-            previous_metrics, previous_gate = metrics, gate
-            previous_checkpoint_path = checkpoint_path
-        if last_metrics is None or last_gate is None:
-            raise ValueError("Trial produced no evaluation checkpoint.")
-        if selected_path is not None and (selected_metrics is None or selected_gate is None):
-            raise ValueError("Selected checkpoint is missing its evaluation metadata.")
-        if selected_path is not None:
-            selected_copy = trial_dir.parent / "selected_checkpoint.pt"
-            shutil.copyfile(selected_path, selected_copy)
-            selected_path = selected_copy
+
+        if not checkpoints:
+            raise ValueError("Fine-tuning produced no evaluation checkpoint.")
+        safe_epochs = [
+            epoch
+            for epoch, metrics in metrics_by_epoch.items()
+            if float(np.median(metrics.masked_correlation))
+            >= float(np.median(pretrain_metrics.masked_correlation)) - self.config.gates.masked_corr_drop_tolerance
+        ]
+        candidate_epochs = safe_epochs or list(metrics_by_epoch)
+        selected_epoch = min(
+            candidate_epochs,
+            key=lambda epoch: (
+                self.config.selection_weights.well_rmse
+                * metrics_by_epoch[epoch].well_pooled_rmse
+                / max(abs(pretrain_metrics.well_pooled_rmse), torch.finfo(torch.float32).eps)
+                + self.config.selection_weights.roughness
+                * abs(metrics_by_epoch[epoch].roughness_ratio - 1.0)
+                + self.config.selection_weights.short_wave
+                * abs(metrics_by_epoch[epoch].short_wave_energy_fraction - 1.0),
+                epoch,
+            ),
+        )
+        selected_checkpoint = trial_dir / "selected_checkpoint.pt"
+        shutil.copyfile(checkpoints[selected_epoch - 1], selected_checkpoint)
+        selected_gate = gates_by_epoch[selected_epoch]
         return TrialResult(
             trial_id=adjustment.trial_id,
             adjustment=adjustment,
-            checkpoints=tuple(checkpoints),
-            selected_checkpoint=None if selected_path is None else str(selected_path),
+            checkpoints=tuple(str(path) for path in checkpoints),
+            selected_checkpoint=str(selected_checkpoint),
             selected_epoch=selected_epoch,
-            metrics=selected_metrics if selected_metrics is not None else last_metrics,
-            gate=selected_gate if selected_gate is not None else last_gate,
-            stop_reason=stop_reason,
-            target_gate_improved=None,
+            metrics=metrics_by_epoch[selected_epoch],
+            gate=selected_gate,
+            stop_reason="all_finetune_epochs_completed_best_quality_checkpoint",
         )
-
-
-def make_trial_adjustment(
-    config: BodyInversionConfig,
-    *,
-    trial_id: int,
-    previous: TrialResult | None,
-    failure_counts: Mapping[str, int],
-) -> TrialAdjustment:
-    """Return the one allowed change for the next limited trial."""
-
-    if previous is None:
-        return TrialAdjustment(
-            trial_id=trial_id,
-            parent_trial_id=None,
-            target_gate=None,
-            action="shared_pretrain_finetune",
-            learning_rate=config.finetune_learning_rate,
-            loss_weights=config.loss_weights,
-        )
-    gate = previous.gate.first_failed_gate
-    if gate in {"orientation_support"}:
-        raise RuntimeError("Orientation/support failure is an implementation error and cannot be tuned away.")
-    count = int(failure_counts.get(str(gate), 0))
-    weights = previous.adjustment.loss_weights
-    learning_rate = previous.adjustment.learning_rate
-    if gate == "masked_shape":
-        learning_rate *= 0.5
-        action = "learning_rate_half_after_masked_shape"
-    elif gate == "visible_center_shape":
-        weights = BodyInversionLossWeights(
-            seismic_shape=weights.seismic_shape * 2.0,
-            lfm_anchor=weights.lfm_anchor,
-            trusted_well_body=weights.trusted_well_body,
-            lambda_shape=weights.lambda_shape,
-        )
-        action = "seismic_shape_weight_double"
-    elif gate == "trusted_well_body":
-        weights = BodyInversionLossWeights(
-            seismic_shape=weights.seismic_shape,
-            lfm_anchor=weights.lfm_anchor,
-            trusted_well_body=weights.trusted_well_body * 2.0,
-            lambda_shape=weights.lambda_shape,
-        )
-        action = "trusted_well_body_weight_double"
-    elif gate == "lfm_drift":
-        weights = BodyInversionLossWeights(
-            seismic_shape=weights.seismic_shape,
-            lfm_anchor=weights.lfm_anchor * 2.0,
-            trusted_well_body=weights.trusted_well_body,
-            lambda_shape=weights.lambda_shape,
-        )
-        action = "lfm_anchor_weight_double"
-    elif gate == "roughness":
-        learning_rate *= 0.5
-        action = "learning_rate_half_prefer_early_checkpoint"
-    else:
-        raise RuntimeError(f"No constrained trial action exists for failed gate {gate!r}.")
-    return TrialAdjustment(
-        trial_id=trial_id,
-        parent_trial_id=previous.trial_id,
-        target_gate=gate,
-        action=action,
-        learning_rate=learning_rate,
-        loss_weights=weights,
-    )
 
 
 __all__ = [
@@ -1252,5 +1270,4 @@ __all__ = [
     "TrialAdjustment",
     "TrialResult",
     "build_body_inversion_data",
-    "make_trial_adjustment",
 ]

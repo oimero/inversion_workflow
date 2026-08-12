@@ -10,7 +10,7 @@ from torch import Tensor
 from cup.physics.torch_backend import forward_depth, forward_time
 from cup.seismic.geometry import SampleAxis
 from ginn_v2.contracts import CommonObservationBatch, ForwardClosureResult
-from ginn_v2.scales import BODY_SMOOTHING_FWHM_M, depth_coordinates_from_twt, gaussian_smooth_torch
+from ginn_v2.scales import depth_coordinates_from_twt
 
 
 class DomainAdapter(ABC):
@@ -35,22 +35,19 @@ class DomainAdapter(ABC):
 
     def close_body(
         self,
-        raw_log_ai: Tensor,
+        body_log_ai: Tensor,
         batch: CommonObservationBatch,
-        *,
-        body_smoothing_fwhm_m: float = BODY_SMOOTHING_FWHM_M,
     ) -> ForwardClosureResult:
-        """Apply the fixed body scale then the frozen acoustic forward."""
+        """Forward an already body-scale log-AI trace through the frozen physics."""
         self._require_domain(batch.sample_axis)
-        if raw_log_ai.shape != batch.observed_seismic.shape:
-            raise ValueError("raw_log_ai must match the common batch trace shape.")
-        body = gaussian_smooth_torch(
-            raw_log_ai,
-            self.vertical_coordinates_m(batch),
-            fwhm_m=body_smoothing_fwhm_m,
-        )
-        synthetic = self.forward(body, batch)
-        return ForwardClosureResult(body, synthetic, batch.observed_valid_mask)
+        if not isinstance(body_log_ai, Tensor) or not torch.is_floating_point(body_log_ai):
+            raise TypeError("body_log_ai must be a floating torch.Tensor.")
+        if body_log_ai.shape != batch.observed_seismic.shape:
+            raise ValueError("body_log_ai must match the common batch trace shape.")
+        if not bool(torch.all(torch.isfinite(body_log_ai)).item()):
+            raise ValueError("body_log_ai must contain only finite values.")
+        synthetic = self.forward(body_log_ai, batch)
+        return ForwardClosureResult(body_log_ai, synthetic, batch.observed_valid_mask)
 
 
 class TimeDomainAdapter(DomainAdapter):

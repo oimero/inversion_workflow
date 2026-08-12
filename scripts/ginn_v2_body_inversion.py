@@ -1,4 +1,4 @@
-"""Train the GINN V2 body inversion with a limited trial loop.
+"""Train the GINN V2 body inversion with one controlled fine-tuning run.
 
 The command requires explicit Step-6, Step-7, and frozen-forward inputs.  A
 configuration section named ``ginn_v2_body_inversion`` carries the settings;
@@ -35,22 +35,21 @@ from cup.lfm.math import parse_lowpass_spec
 from cup.physics.calibration import AIVelocityRelation
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.wavelet import load_wavelet_csv, validate_wavelet_normalization
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.logging import configure_run_logger
 from cup.well.real_field_controls import load_well_control_set
 from ginn_v2.adapters import DepthDomainAdapter, TimeDomainAdapter
 from ginn_v2.checkpoint import load_checkpoint
 from ginn_v2.data import PatchReader, SurveyTraceSource, candidate_patch_keys, fit_lfm_normalization
-from ginn_v2.evaluation import gate_improved
 from ginn_v2.trainer import (
     BodyInversionConfig,
     BodyInversionTrainer,
     TrialResult,
     build_body_inversion_data,
-    make_trial_adjustment,
 )
 from cup.lfm.artifacts import load_lfm_input
 from ginn_v2.model import CenterTraceBodyNet
+from ginn_v2.qc import write_well_waveform_qc as write_well_waveform_qc_artifact
 
 
 def parse_args() -> argparse.Namespace:
@@ -172,7 +171,7 @@ def _write_review_package(trainer: BodyInversionTrainer, model: CenterTraceBodyN
     well_targets: dict[str, dict[int, float]] = {}
     well_patch_keys: dict[str, dict[int, Any]] = {}
     with torch.no_grad():
-        items = trainer.data.validation_well_patches
+        items = trainer.data.trusted_well_patches
         for start in range(0, len(items), trainer.config.batch_size):
             local = items[start : start + trainer.config.batch_size]
             batch = trainer.data.reader.batch(
@@ -213,7 +212,7 @@ def _write_review_package(trainer: BodyInversionTrainer, model: CenterTraceBodyN
         current_axis.invert_yaxis()
         current_axis.legend(loc="best", fontsize=8)
     figure.tight_layout()
-    well_figure = profiles_dir / "trusted_well_holdout_profiles.png"
+    well_figure = profiles_dir / "trusted_well_profiles.png"
     figure.savefig(well_figure, dpi=150)
     plt.close(figure)
 
@@ -251,9 +250,11 @@ def _write_review_package(trainer: BodyInversionTrainer, model: CenterTraceBodyN
         figure.savefig(path, dpi=150)
         plt.close(figure)
         section_files.append(repo_relative_path(path, root=REPO_ROOT))
+    well_waveform_qc = _write_well_waveform_qc(trainer, model, output_dir)
     manifest = {
         "fixed_well_profile": repo_relative_path(well_figure, root=REPO_ROOT),
         "blind_sections": section_files,
+        "well_waveform_qc": well_waveform_qc,
         "validation_patch_key_count": len(trainer.data.spatial_split.review_keys),
         "validation_centers": [list(item) for item in trainer.data.spatial_split.validation_centers],
     }
@@ -261,15 +262,25 @@ def _write_review_package(trainer: BodyInversionTrainer, model: CenterTraceBodyN
     return manifest
 
 
+def _write_well_waveform_qc(
+    trainer: BodyInversionTrainer,
+    model: CenterTraceBodyNet,
+    output_dir: Path,
+) -> dict[str, Any]:
+    return write_well_waveform_qc_artifact(
+        trainer,
+        model,
+        output_dir / "review_package" / "well_waveform_qc",
+        root=REPO_ROOT,
+    )
+
+
 def _write_trial_comparison(path: Path, results: list[TrialResult]) -> None:
-    """Write the fixed limited-loop comparison as a human-readable table."""
+    """Write the fine-tuning checkpoint comparison as a human-readable table."""
 
     fieldnames = (
         "trial_id",
-        "parent_trial_id",
         "action",
-        "target_gate",
-        "target_gate_improved",
         "selected_epoch",
         "stop_reason",
         "gate_passed",
@@ -280,9 +291,11 @@ def _write_trial_comparison(path: Path, results: list[TrialResult]) -> None:
         "visible_shape_median",
         "well_pooled_rmse",
         "well_pooled_bias",
+        "well_body_correlation_by_well",
         "lfm_drift_rmse",
         "short_wave_energy_fraction",
         "roughness_ratio",
+        "roughness_ratio_by_well",
         "orientation_disagreement_rms_ratio",
     )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -295,10 +308,7 @@ def _write_trial_comparison(path: Path, results: list[TrialResult]) -> None:
             writer.writerow(
                 {
                     "trial_id": result.trial_id,
-                    "parent_trial_id": "" if result.adjustment.parent_trial_id is None else result.adjustment.parent_trial_id,
                     "action": result.adjustment.action,
-                    "target_gate": result.adjustment.target_gate or "",
-                    "target_gate_improved": "" if result.target_gate_improved is None else result.target_gate_improved,
                     "selected_epoch": "" if result.selected_epoch is None else result.selected_epoch,
                     "stop_reason": result.stop_reason,
                     "gate_passed": result.gate.passed,
@@ -309,9 +319,11 @@ def _write_trial_comparison(path: Path, results: list[TrialResult]) -> None:
                     "visible_shape_median": float(np.median(metrics.visible_shape_loss)),
                     "well_pooled_rmse": metrics.well_pooled_rmse,
                     "well_pooled_bias": metrics.well_pooled_bias,
+                    "well_body_correlation_by_well": json.dumps(metrics.well_body_correlation_by_well, ensure_ascii=False, sort_keys=True),
                     "lfm_drift_rmse": metrics.lfm_drift_rmse,
                     "short_wave_energy_fraction": metrics.short_wave_energy_fraction,
                     "roughness_ratio": metrics.roughness_ratio,
+                    "roughness_ratio_by_well": json.dumps(metrics.roughness_ratio_by_well, ensure_ascii=False, sort_keys=True),
                     "orientation_disagreement_rms_ratio": metrics.orientation_disagreement_rms_ratio,
                 }
             )
@@ -407,15 +419,15 @@ def main() -> None:
         reader,
         controls,
         config=config,
+        lfm_lowpass_spec=lfm_lowpass_spec,
         candidate_keys=candidates,
         target_zone_mask=target_zone_mask,
     )
     logger.info(
-        "data ready | train_patches=%d | validation_patches=%d | train_well_samples=%d | validation_well_samples=%d",
+        "data ready | train_patches=%d | validation_patches=%d | trusted_well_samples=%d",
         len(data.spatial_split.train_keys),
         len(data.spatial_split.validation_keys),
-        sum(int(np.count_nonzero(item.target_mask)) for item in data.train_well_patches),
-        sum(int(np.count_nonzero(item.target_mask)) for item in data.validation_well_patches),
+        sum(int(np.count_nonzero(item.target_mask)) for item in data.trusted_well_patches),
     )
     trainer = BodyInversionTrainer(
         data,
@@ -423,6 +435,7 @@ def main() -> None:
         config=config,
         lfm_lowpass_spec=lfm_lowpass_spec,
         output_dir=output_dir,
+        artifact_root=REPO_ROOT,
         logger=logger,
     )
     logger.info("LFM-only baseline evaluation start")
@@ -501,81 +514,24 @@ def main() -> None:
         )
         raise RuntimeError("Shared masked pretraining did not improve the LFM-only masked reconstruction.")
 
-    results: list[TrialResult] = []
-    failure_counts: dict[str, int] = {}
-    previous: TrialResult | None = None
-    selected: TrialResult | None = None
-    for trial_id in range(1, config.max_trials + 1):
-        adjustment = make_trial_adjustment(
-            config,
-            trial_id=trial_id,
-            previous=previous,
-            failure_counts=failure_counts,
-        )
-        logger.info(
-            "trial %d/%d prepared | action=%s | target_gate=%s",
-            trial_id,
-            config.max_trials,
-            adjustment.action,
-            adjustment.target_gate or "none",
-        )
-        result = trainer.run_trial(
-            adjustment,
-            baseline=baseline,
-            resume_checkpoint=shared_pretrain_checkpoint,
-        )
-        if previous is not None and adjustment.target_gate is not None and result.target_gate_improved is None:
-            result = TrialResult(
-                trial_id=result.trial_id,
-                adjustment=result.adjustment,
-                checkpoints=result.checkpoints,
-                selected_checkpoint=result.selected_checkpoint,
-                selected_epoch=result.selected_epoch,
-                metrics=result.metrics,
-                gate=result.gate,
-                stop_reason=result.stop_reason,
-                target_gate_improved=gate_improved(
-                    result.metrics,
-                    previous.metrics,
-                    adjustment.target_gate,
-                    threshold=0.0,
-                ),
-            )
-        results.append(result)
-        if result.gate.passed and result.selected_checkpoint is not None:
-            selected = result
-            break
-        gate = result.gate.first_failed_gate
-        if gate is None:
-            break
-        failure_counts[gate] = failure_counts.get(gate, 0) + 1
-        if previous is not None and adjustment.target_gate is not None and result.target_gate_improved is False:
-            break
-        previous = result
+    logger.info("single semi-supervised finetune start")
+    selected = trainer.run_finetuning(
+        baseline=baseline,
+        resume_checkpoint=shared_pretrain_checkpoint,
+    )
+    results = [selected]
     write_json(output_dir / "trial_results.json", {"trials": [item.to_json_dict() for item in results]})
     _write_trial_comparison(output_dir / "trial_comparison.csv", results)
-    if selected is None:
-        write_json(
-            output_dir / "body_inversion_status.json",
-            {
-                "status": "not_accepted",
-                "reason": "limited_trial_loop_exhausted_or_retracted",
-                "trial_count": len(results),
-            },
-        )
-        raise RuntimeError(
-            f"GINN V2 body inversion did not produce an accepted checkpoint within {config.max_trials} trials."
-        )
     selected_path = output_dir / "selected_checkpoint.pt"
     shutil.copyfile(selected.selected_checkpoint, selected_path)
     write_json(
         output_dir / "selected_checkpoint.json",
         {
-            "status": "ok",
+            "status": "accepted" if selected.gate.passed else "completed_not_accepted",
             "selected_checkpoint": repo_relative_path(selected_path, root=REPO_ROOT),
             "trial_id": selected.trial_id,
             "epoch": selected.selected_epoch,
-            "selection_rule": "earliest_acceptable_checkpoint",
+            "selection_rule": "earliest_quality_checkpoint_with_masked_seismic_constraint",
             "gate": selected.gate.to_json_dict(),
         },
     )
@@ -590,16 +546,17 @@ def main() -> None:
     write_json(
         output_dir / "body_inversion_status.json",
         {
-            "status": "ok",
+            "status": "accepted" if selected.gate.passed else "completed_not_accepted",
             "selected_checkpoint": repo_relative_path(selected_path, root=REPO_ROOT),
             "review_package": review,
-            "trial_count": len(results),
+            "finetune_epochs": config.finetune_epochs,
+            "gate": selected.gate.to_json_dict(),
         },
     )
     print("=== GINN V2 body inversion ===")
     print(f"Output: {output_dir}")
     print(f"Selected checkpoint: {selected_path}")
-    print(f"Trial: {selected.trial_id}, epoch: {selected.selected_epoch}")
+    print(f"Run: {selected.trial_id}, epoch: {selected.selected_epoch}")
 
 
 if __name__ == "__main__":

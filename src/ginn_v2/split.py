@@ -11,6 +11,7 @@ from cup.seismic.geometry import SurveyLineGeometry
 from cup.well.real_field_controls import WellControl, WellControlSet
 from cup.well.scale_separation import gaussian_smooth_finite_runs_numpy
 from ginn_v2.data import Orientation, PatchKey
+from ginn_v2.projector import BodyScaleProjector, project_well_target
 
 
 ValidationAnchor = Literal["maxmax", "maxmin", "minmax", "minmin", "center"]
@@ -51,8 +52,8 @@ class WellSampleSplit:
     def __post_init__(self) -> None:
         train = set(self.train_indices)
         validation = set(self.validation_indices)
-        if not train or not validation or train & validation:
-            raise ValueError("Well split requires disjoint non-empty train and validation indices.")
+        if not train or train & validation:
+            raise ValueError("Well split requires non-empty training indices and disjoint validation indices.")
 
 
 @dataclass(frozen=True)
@@ -180,6 +181,44 @@ def _finite_runs(mask: np.ndarray) -> list[tuple[int, int]]:
     return [tuple(item) for item in np.flatnonzero(padded[1:] != padded[:-1]).reshape(-1, 2)]
 
 
+def sample_lfm_trace(
+    control: WellControl,
+    *,
+    lfm_log_ai: np.ndarray,
+    lfm_valid_mask: np.ndarray,
+    geometry: SurveyLineGeometry,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample the volume LFM at the nearest physical survey center per well sample."""
+
+    values = np.asarray(lfm_log_ai, dtype=np.float64)
+    support = np.asarray(lfm_valid_mask, dtype=bool)
+    expected = (
+        geometry.inline_axis.count,
+        geometry.xline_axis.count,
+        control.sample_axis.values.size,
+    )
+    if values.shape != expected or support.shape != expected:
+        raise ValueError(f"lfm_log_ai and lfm_valid_mask must have shape {expected}.")
+    result = np.full(control.sample_axis.values.shape, np.nan, dtype=np.float64)
+    result_mask = np.zeros(control.sample_axis.values.shape, dtype=bool)
+    for sample_index, (x_m, y_m) in enumerate(zip(control.x_m_by_sample, control.y_m_by_sample)):
+        if not np.isfinite(x_m) or not np.isfinite(y_m):
+            continue
+        i_float, j_float = geometry.coord_to_index(float(x_m), float(y_m))
+        i, j = int(round(i_float)), int(round(j_float))
+        if (
+            0 <= i < geometry.inline_axis.count
+            and 0 <= j < geometry.xline_axis.count
+            and abs(i_float - i) <= 0.5
+            and abs(j_float - j) <= 0.5
+            and support[i, j, sample_index]
+            and np.isfinite(values[i, j, sample_index])
+        ):
+            result[sample_index] = values[i, j, sample_index]
+            result_mask[sample_index] = True
+    return result, result_mask
+
+
 def well_target_zone_mask(
     control: WellControl,
     *,
@@ -217,8 +256,12 @@ def build_well_body_target(
     *,
     body_smoothing_fwhm_m: float,
     target_zone_support: np.ndarray,
+    lfm_log_ai: np.ndarray,
+    lfm_valid_mask: np.ndarray,
+    geometry: SurveyLineGeometry,
+    projector: BodyScaleProjector,
 ) -> WellTarget:
-    """Smooth native full-band observations, then sample only observed model points."""
+    """Build a trusted-well target in the model's configured body band."""
 
     native_coordinates = np.asarray(control.native.coordinates, dtype=np.float64)
     native_values = np.asarray(control.native.full_log_ai, dtype=np.float64)
@@ -240,10 +283,24 @@ def build_well_body_target(
     zone_support = np.asarray(target_zone_support, dtype=bool)
     if zone_support.shape != observed.shape:
         raise ValueError("target_zone_support must match the well model axis.")
-    valid_target = observed & zone_support & np.isfinite(model_target)
+    well_lfm, well_lfm_valid = sample_lfm_trace(
+        control,
+        lfm_log_ai=lfm_log_ai,
+        lfm_valid_mask=lfm_valid_mask,
+        geometry=geometry,
+    )
+    valid_target = observed & zone_support & well_lfm_valid & np.isfinite(model_target)
     model_target[~valid_target] = np.nan
     if np.count_nonzero(valid_target) < 4:
         raise ValueError(f"{control.well_name}: native body target has fewer than four observed model samples.")
+    model_target = project_well_target(
+        model_target,
+        valid_target,
+        well_lfm,
+        well_lfm_valid,
+        model_axis,
+        projector,
+    )
     return WellTarget(
         well_name=control.well_name,
         model_axis_target=model_target,
@@ -255,14 +312,9 @@ def build_well_body_target(
 def build_well_splits(
     controls: WellControlSet,
     targets: Mapping[str, WellTarget],
-    *,
-    validation_fraction: float,
 ) -> tuple[WellSampleSplit, ...]:
-    """Hold out one continuous observed interval per trusted well."""
+    """Use every trusted observed target sample as an anchor sample."""
 
-    fraction = float(validation_fraction)
-    if not 0.0 < fraction < 1.0 or not np.isfinite(fraction):
-        raise ValueError("well validation fraction must be finite and within (0, 1).")
     result: list[WellSampleSplit] = []
     for control in controls.controls:
         target = targets.get(control.well_name)
@@ -272,23 +324,12 @@ def build_well_splits(
         runs = _finite_runs(observed)
         if not runs:
             raise ValueError(f"{control.well_name}: no observed body-target run for the well split.")
-        start, stop = max(runs, key=lambda item: item[1] - item[0])
-        run_length = stop - start
-        holdout_length = min(run_length - 1, max(2, int(round(run_length * fraction))))
-        if holdout_length < 2 or run_length - holdout_length < 2:
-            raise ValueError(f"{control.well_name}: observed run is too short for a continuous holdout.")
-        holdout_start = start + (run_length - holdout_length) // 2
-        validation_indices = tuple(range(holdout_start, holdout_start + holdout_length))
-        train_indices = tuple(
-            int(index)
-            for index in np.flatnonzero(observed)
-            if index not in set(validation_indices)
-        )
+        train_indices = tuple(int(index) for index in np.flatnonzero(observed))
         result.append(
             WellSampleSplit(
                 well_name=control.well_name,
                 train_indices=train_indices,
-                validation_indices=validation_indices,
+                validation_indices=(),
             )
         )
     return tuple(result)
@@ -365,6 +406,7 @@ __all__ = [
     "build_well_body_target",
     "build_well_patch_targets",
     "build_well_splits",
+    "sample_lfm_trace",
     "well_target_zone_mask",
     "make_spatial_split",
 ]

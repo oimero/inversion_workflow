@@ -149,7 +149,7 @@ def fit_lfm_normalization(
     *,
     geometry: SurveyLineGeometry,
 ) -> InputNormalization:
-    """Fit the one frozen LFM statistic used by all trials.
+    """Fit the one frozen LFM statistic used by the inversion run.
 
     The statistic is computed only on finite LFM support.  Geometry scale is
     the median physical inline/xline spacing, never a line-number step.

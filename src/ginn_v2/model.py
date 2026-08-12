@@ -86,8 +86,8 @@ class CenterTraceBodyNet(nn.Module):
             padding=(0, cfg.sample_kernel // 2),
         )
 
-        # A zero correction starts from the LFM skip connection.  This makes
-        # the LFM-only baseline an explicit model state in the same network.
+        # A zero raw correction starts from the LFM-only state after the
+        # body-scale projector is applied by the training/inference module.
         nn.init.zeros_(self.output_layer.weight)
         nn.init.zeros_(self.output_layer.bias)
 
@@ -96,7 +96,6 @@ class CenterTraceBodyNet(nn.Module):
         features: Tensor,
         *,
         center_index: int,
-        center_lfm_log_ai: Tensor | None = None,
     ) -> Tensor:
         if features.ndim != 4:
             raise ValueError("features must have shape (batch, channels, lateral, samples).")
@@ -111,13 +110,7 @@ class CenterTraceBodyNet(nn.Module):
             raise ValueError("center_index must address a feature lateral row.")
         value = self.output_layer(self.blocks(self.input_layer(features)))
         correction = value[:, 0, int(center_index), :]
-        if center_lfm_log_ai is None:
-            return correction
-        if center_lfm_log_ai.shape != correction.shape:
-            raise ValueError("center_lfm_log_ai must match the predicted center trace shape.")
-        if not torch.is_floating_point(center_lfm_log_ai) or not bool(torch.all(torch.isfinite(center_lfm_log_ai)).item()):
-            raise ValueError("center_lfm_log_ai must be finite and floating.")
-        return center_lfm_log_ai + correction
+        return correction
 
 
 __all__ = ["BodyNetworkConfig", "CenterTraceBodyNet"]

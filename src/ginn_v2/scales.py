@@ -7,7 +7,6 @@ import torch
 from torch import Tensor
 
 from cup.well.scale_separation import (
-    BODY_SMOOTHING_FWHM_M,
     gaussian_smooth_finite_runs_numpy,
     gaussian_smooth_numpy,
 )
@@ -15,7 +14,7 @@ from cup.well.scale_separation import (
 _FWHM_TO_SIGMA = 1.0 / (2.0 * math.sqrt(2.0 * math.log(2.0)))
 
 
-def gaussian_smooth_torch(values: Tensor, coordinates_m: Tensor, *, fwhm_m: float = BODY_SMOOTHING_FWHM_M) -> Tensor:
+def gaussian_smooth_torch(values: Tensor, coordinates_m: Tensor, *, fwhm_m: float) -> Tensor:
     """Differentiable Torch equivalent of :func:`gaussian_smooth_numpy`."""
     if not isinstance(values, Tensor) or not torch.is_floating_point(values) or values.ndim < 1:
         raise TypeError("values must be a floating tensor with shape [..., samples].")
@@ -65,7 +64,6 @@ def depth_coordinates_from_twt(velocity_mps: Tensor, twt_s: Tensor) -> Tensor:
 
 
 __all__ = [
-    "BODY_SMOOTHING_FWHM_M",
     "depth_coordinates_from_twt",
     "gaussian_smooth_finite_runs_numpy",
     "gaussian_smooth_numpy",

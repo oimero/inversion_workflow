@@ -11,6 +11,7 @@ from ginn_v2.adapters import DomainAdapter
 from ginn_v2.contracts import CommonObservationBatch
 from ginn_v2.data import PatchKey, PatchReader
 from ginn_v2.model import CenterTraceBodyNet
+from ginn_v2.projector import BodyScaleProjector
 
 
 @dataclass(frozen=True)
@@ -30,7 +31,7 @@ class BodyInverter:
         reader: PatchReader,
         adapter: DomainAdapter,
         *,
-        body_smoothing_fwhm_m: float,
+        projector: BodyScaleProjector,
         device: torch.device | str = "cpu",
         batch_size: int = 8,
     ) -> None:
@@ -39,9 +40,7 @@ class BodyInverter:
         self.model = model.to(device)
         self.reader = reader
         self.adapter = adapter
-        self.body_smoothing_fwhm_m = float(body_smoothing_fwhm_m)
-        if self.body_smoothing_fwhm_m <= 0.0:
-            raise ValueError("body_smoothing_fwhm_m must be positive.")
+        self.projector = projector
         self.device = torch.device(device)
         self.batch_size = int(batch_size)
 
@@ -72,12 +71,15 @@ class BodyInverter:
             raw = self.model(
                 batch.features,
                 center_index=self.reader.patch_radius,
-                center_lfm_log_ai=batch.lfm_log_ai,
+            )
+            correction = self.projector.project(
+                raw,
+                self.adapter.vertical_coordinates_m(common),
+                batch.lfm_valid_mask,
             )
             closure = self.adapter.close_body(
-                raw,
+                batch.lfm_log_ai + correction,
                 common,
-                body_smoothing_fwhm_m=self.body_smoothing_fwhm_m,
             )
             bodies.append(closure.body_log_ai)
             synthetics.append(closure.synthetic_seismic)

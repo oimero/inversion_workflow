@@ -15,8 +15,8 @@ from ginn_v2.data import (
 from ginn_v2.evaluation import EvaluationMetrics, GateReport, GateThresholds, evaluate_gates
 from ginn_v2.inverter import BodyInverter, BodyResult
 from ginn_v2.model import BodyNetworkConfig, CenterTraceBodyNet
+from ginn_v2.projector import BodyScaleProjector
 from ginn_v2.scales import (
-    BODY_SMOOTHING_FWHM_M,
     gaussian_smooth_numpy,
     gaussian_smooth_torch,
 )
@@ -28,11 +28,11 @@ from ginn_v2.trainer import (
 )
 
 __all__ = [
-    "BODY_SMOOTHING_FWHM_M",
     "ArrayTraceSource",
     "BodyNetworkConfig",
     "BodyInverter",
     "BodyResult",
+    "BodyScaleProjector",
     "CommonObservationBatch",
     "CenterTraceBodyNet",
     "DepthDomainAdapter",

@@ -22,7 +22,7 @@ GINN V2 恢复地震能够稳定约束的主体结构。Enhance V2 在主体结�
 使用一个米制参数定义 GINN V2 与 Enhance V2 的职责分界：
 
 ```text
-body_smoothing_fwhm_m = 15.0
+body_smoothing_fwhm_m = <configured physical FWHM>
 
 body     = gaussian_smooth(full, fwhm_m=body_smoothing_fwhm_m)
 residual = full - body
@@ -30,14 +30,14 @@ residual = full - body
 
 `body_smoothing_fwhm_m` 表示主体尺度高斯平滑核的半高全宽：
 
-- GINN V2 输出 `body`，固定平滑层定义主体尺度的最细表达范围，并作为输出尺度保险丝；
+- GINN V2 输出与配置 body target 同尺度的 `body`；
 - Enhance V2 输出 `residual`，补充井中存在的高频地质纹理。
 
-第一版工作值为 `15 m`。最终数值由现有井尺度分解结果、正演保持程度和主体结构图件共同确定。该尺度以米制物理厚度表达，再由域 adapter 依据采样轴和速度/TDT 离散化。
+该尺度由训练配置显式提供。数值由现有井尺度分解结果、正演保持程度和主体结构图件共同确定。该尺度以米制物理厚度表达，在 native 井坐标上离散化，预测输出遵循同一 body-scale 合同。
 
-FWHM 表示连续高斯核的物理宽度，而不是三个采样点的滑动平均。`15 m` 在 `5 m` 网格上对应约 `1.27` 个采样点的高斯标准差：它强烈抑制约 `15 m` 波长的振荡，同时仍会部分衰减约 `30 m` 波长的结构。因此该参数承担明确的主体/残差尺度分工，而不单独承担训练正则化职责。
+FWHM 表示连续高斯核的物理宽度，而不是按采样点数量指定的滑动平均。因此该参数承担明确的主体/残差尺度分工，而不单独承担训练正则化职责。
 
-第七步 LFM 的滤波尺度独立记录为 `lfm_cutoff_wavelength_m`。当前深度域工作值为 `150 m`，其职责是提供低频初始模型，不参与主体/残差分界。
+第七步 LFM 的滤波尺度独立记录为 `lfm_cutoff_wavelength_m`，其职责是提供低频初始模型，不参与主体/残差分界。
 
 ## 3. Wtie 标定资产
 
@@ -101,7 +101,7 @@ proportional_slice_baseline -> GINN V2 主 LFM
 trend_baseline              -> LFM 敏感性对照
 ```
 
-LFM artifact 向 GINN V2 提供 `log_ai`、SampleAxis、有效掩码、variant 身份和实际低通尺度。当前深度域 `lfm_cutoff_wavelength_m=150 m`，与 `body_smoothing_fwhm_m=15 m` 分别配置。
+LFM artifact 向 GINN V2 提供 `log_ai`、SampleAxis、有效掩码、variant 身份和实际低通尺度。`lfm_cutoff_wavelength_m` 与 `body_smoothing_fwhm_m` 分别配置。
 
 GINN 的 LFM 锚定在第七步 variant 的实际低通尺度上比较：
 
@@ -119,11 +119,12 @@ Enhance V2 以 GINN V2 的 body AI 和第六步井残差为输入，不直接消
 GINN V2 输出确定性的 body-scale log-AI：
 
 ```text
-u = network(seismic, LFM, lateral context)
-x_body = gaussian_smooth(u, fwhm_m=body_smoothing_fwhm_m)
+raw_correction = network(seismic, LFM, lateral context)
+body_correction = BodyScaleProjector(raw_correction, physical_sample_coordinates)
+x_body = LFM + body_correction
 ```
 
-物理正演、井监督和最终交付都使用 `x_body`。固定且可微的主体尺度平滑层位于网络输出与正演算子之间，使更细尺度振荡无法用于降低地震拟合损失。
+`BodyScaleProjector` 先按配置的 `body_smoothing_fwhm_m` 做物理坐标高斯平滑，再减去第七步实际低通响应。井目标先从 native full log-AI 构建 body target，再通过同一个 projector 映射为 `x_body` 可表达的目标空间。物理正演、井监督和最终交付都使用 `x_body`；短波能量与垂向粗糙度门禁约束主体尺度之外的细节表达。
 
 物理闭环只约束冻结子波能够表达的波形形状。井震图件已经表明，不同井位存在无法由同一个 AI—子波模型解释的整体及局部振幅差异；因此地震振幅包含处理增益、局部可见度和正演模型误差等 nuisance，不能直接作为绝对 AI 对比度。
 
@@ -183,10 +184,11 @@ L_self
 
 ```text
 masked/visible batch:
-    seismic-shape physics loss + Step-7-scale LFM anchor
+    seismic-shape physics loss + optional Step-7-scale LFM anchor
 
 trusted-well batch:
-    normalized well body-scale loss + Step-7-scale LFM anchor
+    normalized well body-scale loss
+    + physical derivative loss
 ```
 
 自监督预训练与生产推理使用同一个支持 missing-trace mask 的网络。自监督 batch 将完整中心道隐藏；半监督 batch 和生产推理将中心道恢复为可见输入。半监督训练保留固定比例的掩码 batch，避免网络遗忘横向上下文，同时使用中心道可见 batch 对齐最终推理语义。网络输入始终显式携带中心道是否可见，不能依靠固定通道值猜测训练模式。
@@ -194,20 +196,22 @@ trusted-well batch:
 井监督目标为：
 
 ```text
-gaussian_smooth(aligned full well log-AI, body_smoothing_fwhm_m)
+LFM + BodyScaleProjector(
+    gaussian_smooth(aligned full well log-AI, body_smoothing_fwhm_m) - LFM
+)
 ```
 
-井损失以每口井目的层 body 标准差归一化后比较预测与目标，使用 Smooth L1。可信井名单由第六步井震质量报告显式冻结；低质量井不参与 loss 聚合。
+井损失以每口井目的层 body 标准差归一化后比较预测与目标，使用 Smooth L1，并以物理坐标上的一阶导数匹配局部形态。五口可信井的全部有效目的层样点用于监督。可信井名单由第六步井震质量报告显式冻结；低质量井不参与 loss 聚合。
 
 低频锚定在所选第七步 variant 的实际低通尺度上比较预测与 LFM，控制背景漂移。LFM 使用全部成功井控，可信井 body loss 提供绝对主体对比度，地震闭环提供波瓣位置、极性和形状约束。高频井残差不进入 GINN V2 的监督目标。
 
 可信井之外的绝对 body 对比度属于模型从 LFM、地震形状与井锚联合外推的结果；交付时同时发布井锚支持。物理闭环相关性不能单独证明绝对振幅正确。五口 body 监督井为 `2-ANP-2A-RJS`、`L1-NW1`、`L5-NW5`、`L9-NW4A`、`NW11`；`NW8` 在目的层只作诊断。
 
-训练输入保留完整时窗，所有 loss、指标和解释输出使用第七步 LFM 的目的层 mask；mask 不扩张也不侵蚀。masked pretraining 只运行一次，半监督候选从同一 checkpoint 分支。井 batch 使用归一化 body loss 与 LFM anchor，不使用该井地震 shape loss。LFM anchor 采用第七步 variant 的实际 Butterworth 滤波响应。
+训练输入保留完整时窗，所有 loss、指标和解释输出使用第七步 LFM 的目的层 mask；mask 不扩张也不侵蚀。masked pretraining 只运行一次，半监督 finetune 从同一 checkpoint 单次运行，batch 比例为 `masked : visible : well = 1 : 1 : 2`。井 batch 不使用该井地震 shape loss。LFM anchor（如配置启用）采用第七步 variant 的实际 Butterworth 滤波响应。
 
-### 5.4 早停与 checkpoint 选择
+### 5.4 Checkpoint 选择
 
-早停是 GINN V2 抑制正演多解性过拟合的主要训练机制。固定主体平滑层提供表达尺度保险，早停负责在网络开始利用剩余自由度追逐正演模型误差之前结束训练。
+有限的微调 epoch、主体尺度投影、短波能量门禁和垂向粗糙度门禁共同限定表达尺度。训练完成后，从满足地震形状保持约束的候选 checkpoint 中按配置权重选择质量最好的最早 epoch。
 
 训练每个 epoch 保存可独立推理的 checkpoint，并分别记录：
 
@@ -217,13 +221,13 @@ gaussian_smooth(aligned full well log-AI, body_smoothing_fwhm_m)
 - 预测 body 的短波能量和垂向粗糙度；
 - 相对所选 LFM 的低频漂移。
 
-正式 checkpoint 使用“最早可接受”规则选择：
+正式 checkpoint 使用固定一次 finetune 的质量排序规则选择：
 
-1. 留出波形形状拟合达到预先冻结的可接受区间或进入平台；
-2. 可信井 body-scale 指标处于已达到的最佳容差范围内；
-3. 短波能量、粗糙度和低频漂移保持在冻结上限内。
+1. 留出波形形状相对 masked-pretrain 不发生超过配置容差的下降；
+2. 可信井 body-scale 误差与体内细节尺度按配置权重共同排序；
+3. 短波能量按相对 LFM 的比例、粗糙度按逐井中位数、低频漂移按相对 masked-pretrain 的比例作为门禁和诊断发布。
 
-自监督预训练以冻结 validation center traces 的波形形状拟合平台触发早停。半监督微调同时使用留出地震形状和可信井 body-scale 指标。解析增益与 raw-amplitude residual 只揭示观测振幅 gap，不参与 checkpoint 排序。波形相关性是闭环充分性指标，不单独决定最佳 checkpoint；同等满足条件时选择 epoch 更早的模型。
+自监督预训练运行一次。半监督微调按配置的有限 epoch 数运行并逐 epoch 保存 checkpoint 与五口井 waveform QC；训练未满足全部门禁时，正常发布 `completed_not_accepted` 和最佳诊断 checkpoint，不抛出训练异常。解析增益与 raw-amplitude residual 只揭示观测振幅 gap，不参与 checkpoint 排序。
 
 ### 5.5 GINN V2 交付
 
@@ -325,9 +329,8 @@ body_smoothing_fwhm_m + Vp/TDT -> 时间轴上的局部 TWT 平滑宽度
 ```text
 domain adapter.prepare(raw inputs)
     -> common observation batch
-    -> shared neural network
-    -> vertical scale adapter.smooth_body()
-    -> shared body/residual composition
+    -> shared neural network raw correction
+    -> shared physical body-scale projection and LFM composition
     -> forward adapter.forward()
     -> shared loss and reporting
 ```
@@ -363,7 +366,7 @@ EnhancedResult = ResidualEnhancer.enhance(
 实施按人工检查和长时间运行分成四个阶段：
 
 0. 基础合同与输入资产：依次运行第六步 `scripts/real_field_well_controls.py` 和第七步 `scripts/real_field_lfm.py`，由其正式产物提供双层井控与 LFM；同时完成时深 adapter、主体平滑和正演闭环。阶段 0 不设置额外的生产脚本。
-1. GINN V2 主体反演：同一训练入口依次完成完整中心道掩码预训练、中心道可见的半监督校准和固定真实剖面验收；执行代理在冻结搜索范围内逐 epoch 选择最早可接受 checkpoint。
+1. GINN V2 主体反演：同一训练入口依次完成完整中心道掩码预训练、中心道可见的单次半监督校准和固定真实剖面验收；执行代理逐 epoch 保存并按配置权重选择 checkpoint。
 2. Enhance V2 残差学习：建立井残差库并训练完整剖面 residual field；以一次正式训练和增强图件人工检查结束。
 3. 联合真实工区交付：冻结两个模型，完成确定性全体积推理及 body/residual/最终结果报告。
 
@@ -376,7 +379,7 @@ EnhancedResult = ResidualEnhancer.enhance(
 - 真实地震的归一化波形形状闭环达到当前物理反演基线；
 - 输出中无明显小于 `body_smoothing_fwhm_m` 的锯齿；
 - 可信井上的 body-scale AI 优于共同 masked-pretrain checkpoint，且相对 LFM 不发生灾难性退化；
-- masked validation 和 visible-center validation 同时通过冻结门禁，生产推理使用中心道可见输入；
+- masked validation 相对 masked-pretrain 不发生超过配置容差的下降，visible-center validation 作为辅助指标，生产推理使用中心道可见输入；
 - 原始振幅失配作为 nuisance 诊断发布，不驱动 AI 对比度；
 - 最终交付来自满足波形形状、井尺度、粗糙度和低频漂移合同的最早 checkpoint。
 

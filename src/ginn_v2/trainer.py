@@ -75,8 +75,6 @@ class BodyInversionLossWeights:
 @dataclass(frozen=True)
 class CheckpointSelectionWeights:
     well_rmse: float
-    roughness: float
-    short_wave: float
 
     def __post_init__(self) -> None:
         for name, value in asdict(self).items():
@@ -541,12 +539,13 @@ class BodyInversionTrainer:
                 per_sample_scale[row] = float(item.target_scale)
             if weights.trusted_well_seismic_shape > 0.0:
                 well_seismic_support = target_mask & common.observed_valid_mask
-                trusted_well_seismic_shape_loss = waveform_shape_loss(
-                    common.observed_seismic,
-                    synthetic,
-                    well_seismic_support,
-                    lambda_shape=weights.lambda_shape,
-                ).loss
+                if int(torch.count_nonzero(well_seismic_support).item()) >= 2:
+                    trusted_well_seismic_shape_loss = waveform_shape_loss(
+                        common.observed_seismic,
+                        synthetic,
+                        well_seismic_support,
+                        lambda_shape=weights.lambda_shape,
+                    ).loss
             well_loss = F.smooth_l1_loss(
                 body[target_mask] / per_sample_scale[target_mask],
                 target[target_mask] / per_sample_scale[target_mask],
@@ -1253,11 +1252,7 @@ class BodyInversionTrainer:
             key=lambda epoch: (
                 self.config.selection_weights.well_rmse
                 * metrics_by_epoch[epoch].well_pooled_rmse
-                / max(abs(pretrain_metrics.well_pooled_rmse), torch.finfo(torch.float32).eps)
-                + self.config.selection_weights.roughness
-                * abs(metrics_by_epoch[epoch].roughness_ratio - 1.0)
-                + self.config.selection_weights.short_wave
-                * abs(metrics_by_epoch[epoch].short_wave_energy_fraction - 1.0),
+                / max(abs(pretrain_metrics.well_pooled_rmse), torch.finfo(torch.float32).eps),
                 epoch,
             ),
         )

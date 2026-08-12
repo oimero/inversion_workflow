@@ -224,7 +224,7 @@ LFM + BodyScaleProjector(
 
 正式 checkpoint 使用固定一次 finetune 的质量排序规则选择：
 
-1. 留出波形形状相对 masked-pretrain 不发生超过配置容差的下降；
+1. masked validation 相关性相对 masked-pretrain 不发生超过配置容差的下降；
 2. 可信井 body-scale 误差与体内细节尺度按配置权重共同排序；
 3. 短波能量按相对 LFM 的比例、粗糙度按逐井中位数、低频漂移按相对 masked-pretrain 的比例作为诊断发布。
 
@@ -284,7 +284,7 @@ x_full_pred = body AI + r_pred
 
 ## 7. 时深统一管线
 
-GINN V2 和 Enhance V2 均采用一套时深统一实现。训练循环、网络、损失、井监督、checkpoint 结构、指标和推理 interface 在两个域中保持一致，域差异集中在内部 adapter。
+GINN V2 和 Enhance V2 均采用一套时深统一实现。训练循环、网络、损失、井监督、checkpoint 结构、指标和推理 interface 在两个域中保持一致，域差异集中在内部 adapter。当前正式生产路径为深度域（TVDSS）；时间域保留为 fixture 预留路径。
 
 共同采样轴合同至少包含：
 
@@ -382,7 +382,7 @@ EnhancedResult = ResidualEnhancer.enhance(
 - 可信井上的 body-scale AI 优于共同 masked-pretrain checkpoint，且相对 LFM 不发生灾难性退化；
 - masked validation 相对 masked-pretrain 不发生超过配置容差的下降，visible-center validation 作为辅助指标，生产推理使用中心道可见输入；
 - 原始振幅失配作为 nuisance 诊断发布，不驱动 AI 对比度；
-- 最终交付来自满足掩码波形形状保持与井尺度改善验收门禁的最早 checkpoint；粗糙度与低频漂移按诊断发布。
+- 最终交付来自满足掩码相关性保持与井尺度改善验收门禁的最早 checkpoint；粗糙度与低频漂移按诊断发布。
 
 ### Enhance V2
 

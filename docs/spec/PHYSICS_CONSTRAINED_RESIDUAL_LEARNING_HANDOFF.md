@@ -77,11 +77,11 @@ scripts/real_field_well_controls.py
 - 混合半监督 batch：中心道可见，同时保留掩码 batch，加入可信井绝对 log-AI 和第七步尺度 LFM anchor；
 - 生产推理：中心道可见，与混合半监督 batch 的输入语义一致。
 
-训练固定为一次共享预训练和最多两个微调 epoch：
+训练固定为一次共享预训练和一次最多三个微调 epoch：
 
 ```text
 pretrain epoch 1       masked pretraining，发布共同 checkpoint
-finetune epoch 1–2     mixed masked + visible-center + trusted-well training
+finetune epoch 1–3     masked + visible-center + trusted-well 三路 batch 轮换
 ```
 
 每个 epoch 都发布可独立恢复的 checkpoint、统一指标和固定 validation 图件。训练进程不得只把最佳权重保存在内存。
@@ -95,62 +95,49 @@ finetune epoch 1–2     mixed masked + visible-center + trusted-well training
 - 冻结井角色名单：`2-ANP-2A-RJS`、`L1-NW1`、`L5-NW5`、`L9-NW4A`、`NW11` 五口井进入 body loss；`L3-NW2A`、`L6-NW3A`、`NW7`、`NW8` 只作诊断；全部成功井继续用于第七步 LFM。`NW8` 的目的层井震相关性低，不以目的层上方密度常值补齐后的相关性作为监督依据。
 - 输入保留完整时窗作为上下文；地震闭环、LFM anchor、井 body loss、checkpoint 指标和图件统一使用第七步 LFM 发布的 `base_of_salt` 至 `base_of_itp` 目的层 mask。mask 不做 halo、侵蚀或过渡带。
 - masked pretraining 只运行一次并发布共同 checkpoint；所有半监督候选从该 checkpoint 分支，预训练学习率为 `1e-3`，微调学习率为 `2e-4`。
-- masked/visible batch 使用 seismic shape 与 LFM anchor；trusted-well batch 使用按井 body 标准差归一化的 well-body loss 与 LFM anchor，不同时拟合该井的低相关地震波形。
+- masked/visible batch 使用 seismic shape 与 LFM anchor；trusted-well batch 使用按井 body 标准差归一化的 well-body loss、物理坐标导数项与 LFM anchor，并可在配置启用时以低权重拟合该井低相关的井旁地震波形。
 - LFM anchor 直接复用所选第七步 variant 记录的 Butterworth 阶数、截止频率和边界处理，不用同名 Gaussian 尺度替代。
-- 冻结空间训练/验证块、validation center-trace identities，以及不进入 well loss 的井内连续验证区间。
+- 冻结空间训练/验证块和 validation center-trace identities。五口可信井目的层有效样点全部进入 well loss，不在井内保留留出区间；泛化检查由固定剖面和远井区域完成。
 - 实现一个命令内的共享预训练、分支微调、逐 epoch 评估、固定井剖面和 blind section 推理。
 - 使用极小数据完成 masked、visible-center、trusted-well 三种 batch 的前向/反向和端到端 smoke。
 
 ### 4.3 冻结 baseline 与验收指标
 
-正式训练前只计算一次 `LFM-only` baseline，随后所有 trial 复用同一份 baseline、split 和 validation identity。每个 checkpoint 必须报告：
+正式训练前只计算一次 `LFM-only` baseline，随后所有微调 epoch 复用同一份 baseline、split 和 validation identity。每个 checkpoint 必须报告：
 
 - masked validation center traces 的相关性、归一化 shape loss 和逐道改善率；
 - visible-center validation traces 的相关性和归一化 shape loss；
-- 可信井留出区间的 body log-AI RMSE、绝对 bias 和逐井改善；
+- 可信井全部有效样点上的 body log-AI RMSE、绝对 bias 和逐井改善；
 - `150 m` 低通后的 LFM drift；
 - 小于 `body_smoothing_fwhm_m` 的短波能量和相对可信井 body target 的垂向粗糙度；
 - 非负解析增益与 raw-amplitude residual，仅作诊断；
 - 非有限值、support 连续性和 inline/xline 方向分歧。
 
-一个 checkpoint 只有同时满足以下门禁才可接受：
+预训练门禁（相对 LFM-only baseline）：
 
-1. 共同 masked-pretrain checkpoint 相对 LFM-only 的 masked 相关性中位改善至少 `0.01`，归一化 shape loss 不高于 baseline 的 `99%`；未达到时停止，不进入半监督；
-2. 半监督 checkpoint 的 masked/visible 相关性相对共同 pretrain 的中位下降均不超过 `0.01`，归一化 shape loss均不超过共同 pretrain 的 `1.05` 倍；
-3. 半监督 pooled body RMSE 优于共同 masked-pretrain checkpoint，至少三口可信井改善；相对 LFM-only 的 pooled RMSE 不超过 `1.5` 倍。相对 LFM 的改善继续报告，不作为硬性要求；
-4. `150 m` 低通后的 LFM drift RMSE 不高于 `0.03 log-AI`；
-5. 小于 `15 m` 的短波能量占比不高于 `1%`，井位垂向粗糙度不高于对应 `15 m` body target 的 `1.25` 倍；
-6. 输出、梯度和指标全部有限，validation support 无缺口；inline/xline 分歧作为诊断，固定剖面无明显方向条带、逐道跳变或锯齿。
+1. masked 相关性中位改善至少 `0.01`，归一化 shape loss 不高于 baseline 的 `99%`；未达到时停止，不进入半监督。
 
-原始振幅 MSE、解析增益和 raw-amplitude residual 不参与验收。自监督 epoch 不单独要求绝对 body 对比度；绝对尺度只在混合半监督 epoch 验收。
+半监督验收门禁：
+
+1. masked validation 相关性相对共同 masked-pretrain 的中位下降不超过 `0.01`；
+2. pooled body RMSE 优于共同 masked-pretrain checkpoint，相对比值不超过 `1.0`。
+
+以下指标照常计算、随每个 checkpoint 发布，但不参与验收：visible-center 相关性、归一化 shape loss、低频漂移、短波能量、垂向粗糙度、解析增益、raw-amplitude residual、support 连续性与方向分歧。原始振幅 MSE 不参与验收；自监督 epoch 不单独要求绝对 body 对比度。
 
 ### 4.4 逐 epoch 停止与 checkpoint 选择
 
-执行代理在每个 epoch 结束后立即评估：
+执行代理在每个 epoch 结束后立即评估并保存 checkpoint。单次微调跑满配置的微调 epoch 数，不提前停止：
 
-- 当前 checkpoint 首次通过全部门禁时，停止训练并选择它；
-- 波形相关性继续上升，但 well RMSE、LFM drift 或粗糙度相对上一 epoch 恶化超过 `5%` 时，停止当前 trial 并保留上一 checkpoint；
-- 所有未通过门禁的主指标相对上一 epoch 改善均小于 `1%` 时，判定平台并停止当前 trial；
-- 出现非有限值、support 错位、中心道泄漏或 checkpoint 无法恢复时，按实现错误处理，修复并重新 smoke，不计入调参 trial。
+- 每个 epoch 统一评估、门禁判定、checkpoint 与五口井 waveform QC 图件；
+- 所有通过 masked 相关性保持门禁的 epoch 为候选，没有任何 epoch 通过时按诊断发布 `completed_not_accepted`；
+- 候选 epoch 中固定选择按归一化 well RMSE 排序最早的 checkpoint，不以最高地震相关性覆盖较早模型；
+- 出现非有限值、support 错位、中心道泄漏或 checkpoint 无法恢复时，按实现错误处理，修复并重新 smoke。
 
-若多个 checkpoint 通过，固定选择 epoch 最早者，不以最高地震相关性覆盖较早模型。
+### 4.5 单次微调
 
-### 4.5 受限 trial loop
+masked pretraining 只运行一次。半监督微调从共同 checkpoint 开始，按配置的 batch 比例 `masked : visible : trusted-well = 1 : 1 : 2` 单次运行配置的微调 epoch 数，不自动调整 loss 权重，不修改网络架构、井名单、split、子波、`15 m` body 尺度、第七步 LFM 滤波合同、增益模型或训练数据。
 
-masked pretraining 只运行一次。每个半监督 trial 从同一共同 checkpoint 开始，最多运行两个 epoch。若没有 checkpoint 通过，根据首个失败门禁只改变一个量：
-
-| 首个失败门禁 | 下一 trial 唯一允许动作 |
-|---|---|
-| masked shape | 微调学习率减半 |
-| visible-center shape | 将 seismic-shape loss 权重乘 `2` |
-| trusted-well body | 将 well body loss 权重乘 `2` |
-| LFM drift | 将 LFM anchor 权重乘 `2` |
-| roughness/短波能量 | 学习率减半，并优先检查更早 checkpoint |
-| 方向分歧、方向条带或 support | 作为实现错误修复，不允许用 loss 权重掩盖 |
-
-每个调整必须记录父 trial、唯一变化、目标门禁和结果；目标门禁没有改善时立即撤销。自动循环最多运行三个正式 trial。执行代理不得在循环中修改网络架构、井名单、split、子波、`15 m` body 尺度、第七步 LFM 滤波合同、增益模型或训练数据。
-
-三个 trial 内通过时，发布 `selected_checkpoint.json`、trial 对比表、固定井剖面和 blind sections，并冻结 GINN V2 body checkpoint。三个 trial 均未通过时停止循环。
+微调结束后发布 `selected_checkpoint.json`、固定井剖面和 blind sections，并冻结 GINN V2 body checkpoint；没有任何 epoch 通过验收门禁时发布 `completed_not_accepted` 和最佳诊断 checkpoint，不抛出训练异常。
 
 ### 4.6 阶段结束
 

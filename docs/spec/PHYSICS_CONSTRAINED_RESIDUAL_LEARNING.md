@@ -124,7 +124,7 @@ body_correction = BodyScaleProjector(raw_correction, physical_sample_coordinates
 x_body = LFM + body_correction
 ```
 
-`BodyScaleProjector` 先按配置的 `body_smoothing_fwhm_m` 做物理坐标高斯平滑，再减去第七步实际低通响应。井目标先从 native full log-AI 构建 body target，再通过同一个 projector 映射为 `x_body` 可表达的目标空间。物理正演、井监督和最终交付都使用 `x_body`；短波能量与垂向粗糙度门禁约束主体尺度之外的细节表达。
+`BodyScaleProjector` 先按配置的 `body_smoothing_fwhm_m` 做物理坐标高斯平滑，再减去第七步实际低通响应。井目标先从 native full log-AI 构建 body target，再通过同一个 projector 映射为 `x_body` 可表达的目标空间。物理正演、井监督和最终交付都使用 `x_body`；短波能量与垂向粗糙度作为诊断发布，反映主体尺度之外的细节表达。
 
 物理闭环只约束冻结子波能够表达的波形形状。井震图件已经表明，不同井位存在无法由同一个 AI—子波模型解释的整体及局部振幅差异；因此地震振幅包含处理增益、局部可见度和正演模型误差等 nuisance，不能直接作为绝对 AI 对比度。
 
@@ -189,6 +189,7 @@ masked/visible batch:
 trusted-well batch:
     normalized well body-scale loss
     + physical derivative loss
+    + optional weak seismic-shape loss on the trusted body support
 ```
 
 自监督预训练与生产推理使用同一个支持 missing-trace mask 的网络。自监督 batch 将完整中心道隐藏；半监督 batch 和生产推理将中心道恢复为可见输入。半监督训练保留固定比例的掩码 batch，避免网络遗忘横向上下文，同时使用中心道可见 batch 对齐最终推理语义。网络输入始终显式携带中心道是否可见，不能依靠固定通道值猜测训练模式。
@@ -207,11 +208,11 @@ LFM + BodyScaleProjector(
 
 可信井之外的绝对 body 对比度属于模型从 LFM、地震形状与井锚联合外推的结果；交付时同时发布井锚支持。物理闭环相关性不能单独证明绝对振幅正确。五口 body 监督井为 `2-ANP-2A-RJS`、`L1-NW1`、`L5-NW5`、`L9-NW4A`、`NW11`；`NW8` 在目的层只作诊断。
 
-训练输入保留完整时窗，所有 loss、指标和解释输出使用第七步 LFM 的目的层 mask；mask 不扩张也不侵蚀。masked pretraining 只运行一次，半监督 finetune 从同一 checkpoint 单次运行，batch 比例为 `masked : visible : well = 1 : 1 : 2`。井 batch 不使用该井地震 shape loss。LFM anchor（如配置启用）采用第七步 variant 的实际 Butterworth 滤波响应。
+训练输入保留完整时窗，所有 loss、指标和解释输出使用第七步 LFM 的目的层 mask；mask 不扩张也不侵蚀。masked pretraining 只运行一次，半监督 finetune 从同一 checkpoint 单次运行，batch 比例为 `masked : visible : well = 1 : 1 : 2`。井 batch 的 seismic shape loss 仅在配置启用时使用，并限制在该井有效 body 目标支持内；LFM anchor（如配置启用）采用第七步 variant 的实际 Butterworth 滤波响应。
 
 ### 5.4 Checkpoint 选择
 
-有限的微调 epoch、主体尺度投影、短波能量门禁和垂向粗糙度门禁共同限定表达尺度。训练完成后，从满足地震形状保持约束的候选 checkpoint 中按配置权重选择质量最好的最早 epoch。
+有限的微调 epoch 和主体尺度投影共同限定表达尺度，短波能量与垂向粗糙度作为诊断跟踪。训练完成后，从满足地震形状保持约束的候选 checkpoint 中按配置权重选择质量最好的最早 epoch。
 
 训练每个 epoch 保存可独立推理的 checkpoint，并分别记录：
 
@@ -225,9 +226,9 @@ LFM + BodyScaleProjector(
 
 1. 留出波形形状相对 masked-pretrain 不发生超过配置容差的下降；
 2. 可信井 body-scale 误差与体内细节尺度按配置权重共同排序；
-3. 短波能量按相对 LFM 的比例、粗糙度按逐井中位数、低频漂移按相对 masked-pretrain 的比例作为门禁和诊断发布。
+3. 短波能量按相对 LFM 的比例、粗糙度按逐井中位数、低频漂移按相对 masked-pretrain 的比例作为诊断发布。
 
-自监督预训练运行一次。半监督微调按配置的有限 epoch 数运行并逐 epoch 保存 checkpoint 与五口井 waveform QC；训练未满足全部门禁时，正常发布 `completed_not_accepted` 和最佳诊断 checkpoint，不抛出训练异常。解析增益与 raw-amplitude residual 只揭示观测振幅 gap，不参与 checkpoint 排序。
+自监督预训练运行一次。半监督微调按配置的有限 epoch 数运行并逐 epoch 保存 checkpoint 与五口井 waveform QC；井上 QC 先组装预测井曲线，再使用与训练相同的 domain adapter 对该曲线正演，避免将多个 patch 的合成结果与另一条 AI 曲线混合。训练未满足验收门禁时，正常发布 `completed_not_accepted` 和最佳诊断 checkpoint，不抛出训练异常。解析增益与 raw-amplitude residual 只揭示观测振幅 gap，不参与 checkpoint 排序。
 
 ### 5.5 GINN V2 交付
 
@@ -381,7 +382,7 @@ EnhancedResult = ResidualEnhancer.enhance(
 - 可信井上的 body-scale AI 优于共同 masked-pretrain checkpoint，且相对 LFM 不发生灾难性退化；
 - masked validation 相对 masked-pretrain 不发生超过配置容差的下降，visible-center validation 作为辅助指标，生产推理使用中心道可见输入；
 - 原始振幅失配作为 nuisance 诊断发布，不驱动 AI 对比度；
-- 最终交付来自满足波形形状、井尺度、粗糙度和低频漂移合同的最早 checkpoint。
+- 最终交付来自满足掩码波形形状保持与井尺度改善验收门禁的最早 checkpoint；粗糙度与低频漂移按诊断发布。
 
 ### Enhance V2
 

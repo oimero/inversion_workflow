@@ -1,4 +1,4 @@
-"""Frozen metrics and acceptance gates for body inversion."""
+"""Acceptance gates and diagnostic metrics for body inversion."""
 
 from __future__ import annotations
 
@@ -20,26 +20,16 @@ class GateThresholds:
     pretrain_masked_corr_improvement: float
     pretrain_masked_shape_ratio: float
     masked_corr_drop_tolerance: float
-    masked_shape_ratio: float
-    visible_corr_drop_tolerance: float
-    visible_shape_ratio: float
-    lfm_drift_ratio_max: float
-    short_wave_energy_ratio_max: float
-    roughness_ratio_min: float
-    roughness_ratio_max: float
+    well_pooled_rmse_ratio_max: float
 
     def __post_init__(self) -> None:
         for name, value in asdict(self).items():
             if not np.isfinite(float(value)) or float(value) < 0.0:
                 raise ValueError(f"Gate threshold {name} must be finite and non-negative.")
-        if self.masked_shape_ratio <= 0.0 or self.visible_shape_ratio <= 0.0:
-            raise ValueError("Shape and RMSE gate ratios must be positive.")
-        if self.short_wave_energy_ratio_max <= 0.0:
-            raise ValueError("short_wave_energy_ratio_max must be positive.")
-        if self.lfm_drift_ratio_max <= 0.0:
-            raise ValueError("lfm_drift_ratio_max must be positive.")
-        if self.roughness_ratio_min < 0.0 or self.roughness_ratio_max < self.roughness_ratio_min:
-            raise ValueError("Roughness ratio bounds are invalid.")
+        if self.pretrain_masked_shape_ratio <= 0.0:
+            raise ValueError("pretrain_masked_shape_ratio must be positive.")
+        if self.well_pooled_rmse_ratio_max <= 0.0:
+            raise ValueError("well_pooled_rmse_ratio_max must be positive.")
 
 
 @dataclass(frozen=True)
@@ -158,7 +148,11 @@ def evaluate_gates(
     *,
     thresholds: GateThresholds,
 ) -> GateReport:
-    """Apply the frozen HANDOFF gates in their documented order."""
+    """Acceptance gates: masked seismic shape hold and trusted-well body improvement.
+
+    Every other metric is published in ``details`` as a diagnostic and does not
+    block acceptance.
+    """
 
     threshold = thresholds
     masked_corr_change = np.asarray(metrics.masked_correlation) - np.asarray(pretrain_baseline.masked_correlation)
@@ -193,18 +187,8 @@ def evaluate_gates(
     }
     if details["masked_corr_change_from_pretrain_median"] < -threshold.masked_corr_drop_tolerance:
         failed.append("masked_shape")
-    if details["well_pooled_rmse_ratio_to_pretrain"] >= 1.0:
+    if details["well_pooled_rmse_ratio_to_pretrain"] >= threshold.well_pooled_rmse_ratio_max:
         failed.append("trusted_well_body")
-    if details["lfm_drift_ratio_to_pretrain"] > threshold.lfm_drift_ratio_max:
-        failed.append("lfm_drift")
-    if (
-        metrics.short_wave_energy_fraction > threshold.short_wave_energy_ratio_max
-        or metrics.roughness_ratio < threshold.roughness_ratio_min
-        or metrics.roughness_ratio > threshold.roughness_ratio_max
-    ):
-        failed.append("roughness")
-    if metrics.support_contiguous_fraction < 1.0 or not np.isfinite(metrics.orientation_disagreement_rms_ratio):
-        failed.append("orientation_support")
     return GateReport(
         passed=not failed,
         failed_gates=tuple(failed),

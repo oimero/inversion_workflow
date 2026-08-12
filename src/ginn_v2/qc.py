@@ -9,10 +9,56 @@ from typing import Any
 import numpy as np
 import torch
 
+from cup.seismic.geometry import SampleAxis
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.utils.io import repo_relative_path, sanitize_filename, write_json
 from cup.well.real_field_control_qc import _waveform_objects
+from ginn_v2.contracts import CommonObservationBatch
 from wtie.processing import grid
+
+
+def _longest_contiguous_run(indices: np.ndarray) -> np.ndarray:
+    values = np.asarray(indices, dtype=np.int64)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("indices must be a non-empty one-dimensional integer array.")
+    if np.any(np.diff(values) <= 0):
+        raise ValueError("indices must be strictly increasing.")
+    breaks = np.flatnonzero(np.diff(values) > 1) + 1
+    bounds = np.column_stack((np.r_[0, breaks], np.r_[breaks, values.size]))
+    start, stop = max(bounds, key=lambda item: int(item[1] - item[0]))
+    return values[int(start) : int(stop)]
+
+
+def _forward_well_curve(
+    trainer: Any,
+    *,
+    axis: SampleAxis,
+    body_log_ai: np.ndarray,
+    observed_seismic: np.ndarray,
+    observed_valid_mask: np.ndarray,
+    lfm_log_ai: np.ndarray,
+    lfm_valid_mask: np.ndarray,
+    xy_m: np.ndarray,
+    domain_extras: dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Forward one assembled well curve through the same adapter as training."""
+
+    body = torch.as_tensor(body_log_ai, device=trainer.device, dtype=torch.float32)[None, :]
+    common = CommonObservationBatch(
+        sample_axis=axis,
+        observed_seismic=torch.as_tensor(observed_seismic, device=trainer.device, dtype=torch.float32)[None, :],
+        observed_valid_mask=torch.as_tensor(observed_valid_mask, device=trainer.device, dtype=torch.bool)[None, :],
+        lfm_log_ai=torch.as_tensor(lfm_log_ai, device=trainer.device, dtype=torch.float32)[None, :],
+        lfm_valid_mask=torch.as_tensor(lfm_valid_mask, device=trainer.device, dtype=torch.bool)[None, :],
+        xy_m=torch.as_tensor(xy_m, device=trainer.device, dtype=torch.float32)[None, :],
+        domain_extras={
+            name: torch.as_tensor(value, device=trainer.device, dtype=torch.float32)[None, :]
+            for name, value in domain_extras.items()
+        },
+    )
+    with torch.no_grad():
+        closure = trainer.adapter.close_body(body, common)
+    return closure.synthetic_seismic[0].cpu().numpy(), common.observed_seismic[0].cpu().numpy()
 
 
 def write_well_waveform_qc(
@@ -29,7 +75,7 @@ def write_well_waveform_qc(
     if trainer.data.reader.sample_axis.domain != "depth" or trainer.data.reader.sample_axis.depth_basis != "tvdss":
         raise ValueError("GINN V2 well waveform QC currently requires a depth/TVDSS SampleAxis.")
 
-    predictions: dict[str, dict[int, dict[str, list[float]]]] = {}
+    predictions: dict[str, dict[int, dict[str, list[float] | dict[str, list[float]]]]] = {}
     with torch.no_grad():
         items = trainer.data.trusted_well_patches
         for start in range(0, len(items), trainer.config.batch_size):
@@ -39,21 +85,40 @@ def write_well_waveform_qc(
                 center_visible=True,
                 device=trainer.device,
             )
-            body, synthetic, common = trainer._predict(model, batch)
+            body, _synthetic, common = trainer._predict(model, batch)
             for row, item in enumerate(local):
                 observed = batch.observed_seismic[row].cpu().numpy()
                 observed_mask = common.observed_valid_mask[row].cpu().numpy()
                 body_values = body[row].cpu().numpy()
-                synthetic_values = synthetic[row].cpu().numpy()
-                for sample_index in np.flatnonzero(item.target_mask & observed_mask):
+                lfm_values = batch.lfm_log_ai[row].cpu().numpy()
+                lfm_mask = batch.lfm_valid_mask[row].cpu().numpy()
+                xy = batch.xy_m[row].cpu().numpy()
+                domain_values = {
+                    name: value[row].cpu().numpy()
+                    for name, value in batch.domain_extras.items()
+                }
+                for sample_index in np.flatnonzero(item.target_mask):
                     index = int(sample_index)
                     sample = predictions.setdefault(item.well_name, {}).setdefault(
                         index,
-                        {"body_log_ai": [], "synthetic": [], "observed": []},
+                        {
+                            "body_log_ai": [],
+                            "observed": [],
+                            "lfm_log_ai": [],
+                            "xy_m": [],
+                            "domain_extras": {},
+                        },
                     )
-                    sample["body_log_ai"].append(float(body_values[index]))
-                    sample["synthetic"].append(float(synthetic_values[index]))
-                    sample["observed"].append(float(observed[index]))
+                    sample["body_log_ai"].append(float(body_values[index]))  # type: ignore[union-attr]
+                    if observed_mask[index]:
+                        sample["observed"].append(float(observed[index]))  # type: ignore[union-attr]
+                    if lfm_mask[index]:
+                        sample["lfm_log_ai"].append(float(lfm_values[index]))  # type: ignore[union-attr]
+                    sample["xy_m"].append(xy.tolist())  # type: ignore[union-attr]
+                    extras = sample["domain_extras"]  # type: ignore[assignment]
+                    for name, values in domain_values.items():
+                        if np.isfinite(values[index]):
+                            extras.setdefault(name, []).append(float(values[index]))
 
     qc_dir = Path(qc_dir)
     qc_dir.mkdir(parents=True, exist_ok=True)
@@ -62,32 +127,74 @@ def write_well_waveform_qc(
     figures: list[str] = []
     for well_name in sorted(predictions):
         by_sample = predictions[well_name]
-        indices = np.asarray(sorted(by_sample), dtype=np.int64)
-        breaks = np.flatnonzero(np.diff(indices) > 1) + 1
-        runs = np.column_stack((np.r_[0, breaks], np.r_[breaks, indices.size]))
-        start, stop = max(runs, key=lambda item: int(item[1] - item[0]))
-        indices = indices[start:stop]
+        available = np.asarray(
+            [
+                index
+                for index in sorted(by_sample)
+                if by_sample[index]["body_log_ai"]
+                and by_sample[index]["observed"]
+                and by_sample[index]["lfm_log_ai"]
+                and all(by_sample[index]["domain_extras"].get(name) for name in trainer.data.reader.domain_extras)
+            ],
+            dtype=np.int64,
+        )
+        indices = _longest_contiguous_run(available)
         if indices.size < 8:
             raise ValueError(f"{well_name}: longest predicted well QC support run has fewer than eight samples.")
-        target = trainer.data.well_targets[well_name]
-        reference_log_ai = np.asarray(target.model_axis_target[indices], dtype=np.float64)
+
+        record = lambda index: by_sample[int(index)]
         predicted_log_ai = np.asarray(
-            [np.mean(by_sample[index]["body_log_ai"]) for index in indices],
+            [np.mean(record(index)["body_log_ai"]) for index in indices],
             dtype=np.float64,
         )
         observed = np.asarray(
-            [np.mean(by_sample[index]["observed"]) for index in indices],
+            [np.mean(record(index)["observed"]) for index in indices],
             dtype=np.float64,
         )
-        synthetic = np.asarray(
-            [np.mean(by_sample[index]["synthetic"]) for index in indices],
+        lfm_values = np.asarray(
+            [np.mean(record(index)["lfm_log_ai"]) for index in indices],
             dtype=np.float64,
         )
+        lfm_mask = np.ones(indices.size, dtype=bool)
+        xy_values = np.asarray(
+            [np.mean(np.asarray(record(index)["xy_m"], dtype=np.float64), axis=0) for index in indices],
+            dtype=np.float64,
+        )
+        xy_m = np.mean(xy_values, axis=0)
+        domain_extras = {
+            name: np.asarray(
+                [np.mean(record(index)["domain_extras"][name]) for index in indices],
+                dtype=np.float64,
+            )
+            for name in trainer.data.reader.domain_extras
+        }
+        target = trainer.data.well_targets[well_name]
+        reference_log_ai = np.asarray(target.model_axis_target[indices], dtype=np.float64)
+        observed_valid_mask = np.ones(indices.size, dtype=bool)
         if any(
             np.any(~np.isfinite(values))
-            for values in (reference_log_ai, predicted_log_ai, observed, synthetic)
+            for values in (reference_log_ai, predicted_log_ai, observed, lfm_values, xy_m, *domain_extras.values())
         ):
-            raise ValueError(f"{well_name}: predicted well QC arrays contain non-finite values.")
+            raise ValueError(f"{well_name}: assembled well QC arrays contain non-finite values.")
+
+        local_axis = np.asarray(axis[indices], dtype=np.float64)
+        local_sample_axis = SampleAxis(
+            local_axis,
+            trainer.data.reader.sample_axis.domain,
+            trainer.data.reader.sample_axis.unit,
+            trainer.data.reader.sample_axis.depth_basis,
+        )
+        synthetic, observed = _forward_well_curve(
+            trainer,
+            axis=local_sample_axis,
+            body_log_ai=predicted_log_ai,
+            observed_seismic=observed,
+            observed_valid_mask=observed_valid_mask,
+            lfm_log_ai=lfm_values,
+            lfm_valid_mask=lfm_mask,
+            xy_m=xy_m,
+            domain_extras=domain_extras,
+        )
 
         observed_centered = observed - float(np.mean(observed))
         observed_scale = float(np.std(observed_centered))
@@ -106,7 +213,6 @@ def write_well_waveform_qc(
         if not np.isfinite(correlation):
             raise ValueError(f"{well_name}: predicted well waveform correlation is non-finite.")
 
-        local_axis = axis[indices]
         predicted_objects = _waveform_objects(
             axis=local_axis,
             log_ai=predicted_log_ai,
@@ -131,7 +237,7 @@ def write_well_waveform_qc(
             predicted_objects[5],
             figsize=(13.0, 7.5),
             synthetic_ai=predicted_objects[0],
-            title=f"GINN V2 predicted body forward QC | {well_name} | corr={correlation:.3f}",
+            title=f"GINN V2 well-curve forward QC | {well_name} | corr={correlation:.3f}",
         )
         for line in axes[0].lines:
             if line.get_label() == body_reference.name:
@@ -162,7 +268,7 @@ def write_well_waveform_qc(
                 "support_stop_m": float(local_axis[-1]),
                 "support_samples": int(indices.size),
                 "signed_forward_gain": signed_gain,
-                "corr": correlation,
+                "well_curve_forward_corr": correlation,
                 "predicted_vs_body_rmse_log_ai": float(np.sqrt(np.mean(np.square(body_residual)))),
                 "predicted_vs_body_corr": float(np.corrcoef(reference_log_ai, predicted_log_ai)[0, 1]),
                 "figure": repo_relative_path(figure_path, root=root),
@@ -178,6 +284,8 @@ def write_well_waveform_qc(
     manifest = {
         "status": "ok",
         "plot_function": "cup.seismic.viz.plot_well_waveform_qc",
+        "correlation_metric": "well_curve_forward_corr",
+        "correlation_definition": "Assemble the predicted AI curve on the well support, then forward it with the same domain adapter used by training.",
         "dynamic_correlation_window_m": float(trainer.config.waveform_qc_dynamic_window_m),
         "figures": figures,
         "metrics": repo_relative_path(metrics_path, root=root),

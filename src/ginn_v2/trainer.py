@@ -64,6 +64,7 @@ class BodyInversionLossWeights:
     trusted_well_body: float = 1.0
     trusted_well_derivative: float = 0.5
     lambda_shape: float = 0.25
+    trusted_well_seismic_shape: float = 0.0
 
     def __post_init__(self) -> None:
         for name, value in asdict(self).items():
@@ -528,6 +529,7 @@ class BodyInversionTrainer:
             anchor = torch.zeros((), dtype=body.dtype, device=body.device)
         well_loss = torch.zeros((), dtype=body.dtype, device=body.device)
         well_derivative_loss = torch.zeros((), dtype=body.dtype, device=body.device)
+        trusted_well_seismic_shape_loss = torch.zeros((), dtype=body.dtype, device=body.device)
         if well_items:
             target = torch.zeros_like(body)
             target_mask = torch.zeros_like(body, dtype=torch.bool)
@@ -537,6 +539,14 @@ class BodyInversionTrainer:
             per_sample_scale = torch.ones_like(body)
             for row, item in enumerate(well_items):
                 per_sample_scale[row] = float(item.target_scale)
+            if weights.trusted_well_seismic_shape > 0.0:
+                well_seismic_support = target_mask & common.observed_valid_mask
+                trusted_well_seismic_shape_loss = waveform_shape_loss(
+                    common.observed_seismic,
+                    synthetic,
+                    well_seismic_support,
+                    lambda_shape=weights.lambda_shape,
+                ).loss
             well_loss = F.smooth_l1_loss(
                 body[target_mask] / per_sample_scale[target_mask],
                 target[target_mask] / per_sample_scale[target_mask],
@@ -566,6 +576,7 @@ class BodyInversionTrainer:
             + weights.lfm_anchor * anchor
             + weights.trusted_well_body * well_loss
             + weights.trusted_well_derivative * well_derivative_loss
+            + weights.trusted_well_seismic_shape * trusted_well_seismic_shape_loss
         )
         if not bool(torch.isfinite(total).item()):
             raise ValueError("Body-inversion loss is non-finite.")
@@ -574,6 +585,7 @@ class BodyInversionTrainer:
             "lfm_anchor": anchor.detach(),
             "trusted_well_body": well_loss.detach(),
             "trusted_well_derivative": well_derivative_loss.detach(),
+            "trusted_well_seismic_shape": trusted_well_seismic_shape_loss.detach(),
         }
 
     def _scheduled_batches(
@@ -624,6 +636,7 @@ class BodyInversionTrainer:
             "lfm_anchor": [],
             "trusted_well_body": [],
             "trusted_well_derivative": [],
+            "trusted_well_seismic_shape": [],
         }
         started = time.monotonic()
         schedule: Iterable[tuple[str, tuple[Any, ...], bool]]
@@ -1208,13 +1221,14 @@ class BodyInversionTrainer:
             metrics_by_epoch[epoch] = metrics
             gates_by_epoch[epoch] = gate
             self.log.info(
-                "finetune | epoch %d complete | train_loss=%.6f | seismic_shape=%.6f | lfm_anchor=%.6f | well_loss=%.6f | well_derivative=%.6f | masked_corr=%.4f | visible_corr=%.4f | well_rmse=%.5f | lfm_drift=%.5f | roughness_median=%.4f | short_wave_ratio=%.4f | failed=%s | checkpoint=%s",
+                "finetune | epoch %d complete | train_loss=%.6f | seismic_shape=%.6f | lfm_anchor=%.6f | well_loss=%.6f | well_derivative=%.6f | well_seismic_shape=%.6f | masked_corr=%.4f | visible_corr=%.4f | well_rmse=%.5f | lfm_drift=%.5f | roughness_median=%.4f | short_wave_ratio=%.4f | failed=%s | checkpoint=%s",
                 epoch,
                 train_metrics["total"],
                 train_metrics["seismic_shape"],
                 train_metrics["lfm_anchor"],
                 train_metrics["trusted_well_body"],
                 train_metrics["trusted_well_derivative"],
+                train_metrics["trusted_well_seismic_shape"],
                 float(np.median(metrics.masked_correlation)),
                 float(np.median(metrics.visible_correlation)),
                 metrics.well_pooled_rmse,

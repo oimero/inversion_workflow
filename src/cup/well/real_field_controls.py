@@ -33,7 +33,7 @@ from cup.well.trajectory import WellTrajectory
 from wtie.processing import grid
 
 
-SCHEMA_VERSION = "real_field_well_controls_v5"
+SCHEMA_VERSION = "real_field_well_controls_v6"
 TIME_SOURCE_SCHEMA = WELL_AUTO_TIE_SCHEMA_VERSION
 DEPTH_SOURCE_SCHEMA = DEPTH_WAVELET_BATCH_SCHEMA_VERSION
 LINEAR_AI_UNIT = "m/s*g/cm3"
@@ -120,7 +120,7 @@ class WellControl:
 
 @dataclass(frozen=True)
 class NativeWellControl:
-    """Aligned full-band well log on its native vertical sampling."""
+    """Aligned filtered full-band well log on its native vertical sampling."""
 
     well_name: str
     coordinates: np.ndarray
@@ -299,8 +299,12 @@ def interpolate_bounded_internal_gaps(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Fill only short internal gaps and return the original observed support.
 
+    This remains a generic utility for callers that explicitly need bounded
+    interpolation.  The Step 6 adapters do not call it: gap ownership stays
+    with the upstream filtered LAS contract.
+
     Gap width is the number of missing samples multiplied by the regular axis
-    interval.  Leading/trailing gaps are never extrapolated.
+    interval. Leading/trailing gaps are never extrapolated.
     """
 
     array = np.asarray(values, dtype=np.float64)
@@ -425,12 +429,10 @@ def _validate_control_geometry(control: WellControl, line_geometry: SurveyLineGe
 def _time_control(
     *,
     source_row: Mapping[str, Any],
-    plan_row: Mapping[str, Any],
     inventory_row: Mapping[str, Any],
     sample_axis: SampleAxis,
     source_run_dir: Path,
     repo_root: Path,
-    max_internal_gap_s: float,
 ) -> WellControl:
     well_name = str(source_row["well_name"]).strip()
     tdt_path = resolve_artifact_path(source_row.get("optimized_tdt_file"), root=repo_root, run_dir=source_run_dir)
@@ -472,10 +474,10 @@ def _time_control(
     else:
         raise ValueError(f"{well_name}: unsupported/unknown wellbore_class={wellbore_class!r}.")
     native_las_path = resolve_artifact_path(
-        plan_row.get("input_las"), root=repo_root, run_dir=source_run_dir
+        source_row.get("filtered_las_file"), root=repo_root, run_dir=source_run_dir
     )
     if native_las_path is None or not native_las_path.is_file():
-        raise FileNotFoundError(f"{well_name}: aligned preprocessed LAS is missing.")
+        raise FileNotFoundError(f"{well_name}: filtered LAS is missing.")
     native_md, native_log_ai = _read_ai_las(native_las_path)
     native = _native_control(
         well_name=well_name,
@@ -486,6 +488,8 @@ def _time_control(
         provenance={
             "source_las_path": str(native_las_path),
             "alignment_transform_path": str(tdt_path),
+            "source_las_role": "filtered",
+            "gap_policy": "upstream_filtered_only",
             "source_vertical_coordinate": "md_m",
             "aligned_vertical_coordinate": "twt_s",
         },
@@ -495,26 +499,23 @@ def _time_control(
         native.coordinates,
         native.full_log_ai,
     )
-    log_ai, observed_valid = interpolate_bounded_internal_gaps(
-        model_log_ai,
-        sample_axis.values,
-        max_gap_axis_units=max_internal_gap_s,
-    )
     return _control_from_arrays(
         well_name=well_name,
         sample_axis=sample_axis,
-        log_ai=log_ai,
+        log_ai=model_log_ai,
         inline=positions[0],
         xline=positions[1],
         x_m=positions[2],
         y_m=positions[3],
-        observed_valid_mask=observed_valid,
+        observed_valid_mask=np.isfinite(model_log_ai),
         wellbore_class=wellbore_class,
         sampling_mode=sampling_mode,
         source_run_type="well_auto_tie",
         provenance={
             "source_las_path": str(native_las_path),
             "native_source_las_path": str(native_las_path),
+            "source_las_role": "filtered",
+            "gap_policy": "upstream_filtered_only",
             "source_transform_path": str(transform_path),
             "optimized_tdt_path": str(tdt_path),
         },
@@ -531,14 +532,13 @@ def _depth_control(
     source_run_dir: Path,
     repo_root: Path,
     trace_lookup: Mapping[str, Path],
-    max_internal_gap_m: float,
 ) -> WellControl:
     well_name = str(source_row["well_name"]).strip()
     native_las_path = resolve_artifact_path(
-        source_row.get("shifted_preprocessed_las_path"), root=repo_root, run_dir=source_run_dir
+        source_row.get("shifted_filtered_las_path"), root=repo_root, run_dir=source_run_dir
     )
     if native_las_path is None or not native_las_path.is_file():
-        raise FileNotFoundError(f"{well_name}: shifted preprocessed LAS is missing.")
+        raise FileNotFoundError(f"{well_name}: shifted filtered LAS is missing.")
     native_md, native_log_ai = _read_ai_las(native_las_path)
     wellbore_class = str(inventory_row.get("wellbore_class") or "unknown").strip().casefold()
     trace_path = trace_lookup.get(normalize_well_name(well_name))
@@ -591,6 +591,8 @@ def _depth_control(
         provenance={
             "source_las_path": str(native_las_path),
             "alignment_transform_path": "" if transform_path is None else str(transform_path),
+            "source_las_role": "filtered",
+            "gap_policy": "upstream_filtered_only",
             "source_vertical_coordinate": "shifted_md_m",
             "aligned_vertical_coordinate": "tvdss_m",
             **transform_metadata,
@@ -601,26 +603,23 @@ def _depth_control(
         native.coordinates,
         native.full_log_ai,
     )
-    log_ai, observed_valid = interpolate_bounded_internal_gaps(
-        model_log_ai,
-        sample_axis.values,
-        max_gap_axis_units=max_internal_gap_m,
-    )
     return _control_from_arrays(
         well_name=well_name,
         sample_axis=sample_axis,
-        log_ai=log_ai,
+        log_ai=model_log_ai,
         inline=inline,
         xline=xline,
         x_m=x_m,
         y_m=y_m,
-        observed_valid_mask=observed_valid,
+        observed_valid_mask=np.isfinite(model_log_ai),
         wellbore_class=wellbore_class,
         sampling_mode=sampling_mode,
         source_run_type="wavelet_batch_synthetic_depth",
         provenance={
             "source_las_path": str(native_las_path),
             "native_source_las_path": str(native_las_path),
+            "source_las_role": "filtered",
+            "gap_policy": "upstream_filtered_only",
             "source_transform_path": "" if transform_path is None else str(transform_path),
             **transform_metadata,
         },
@@ -646,7 +645,6 @@ def build_well_control_set(
         "source_run_dir",
         "well_inventory_file",
         "well_trace_dir",
-        "max_internal_gap_axis_units",
     }
     if set(config) != allowed_config:
         raise ValueError(f"real_field_well_controls must contain exactly {sorted(allowed_config)}.")
@@ -657,12 +655,6 @@ def build_well_control_set(
     source_run_type = str(config.get("source_run_type") or "").strip()
     if source_run_type not in {"well_auto_tie", "wavelet_batch_synthetic_depth"}:
         raise ValueError("real_field_well_controls.source_run_type must be explicit and supported.")
-    maximum_gap = _finite_number(
-        config.get("max_internal_gap_axis_units"),
-        label="real_field_well_controls.max_internal_gap_axis_units",
-    )
-    if maximum_gap < 0.0:
-        raise ValueError("real_field_well_controls.max_internal_gap_axis_units must be non-negative.")
     source_run_dir = resolve_relative_path(str(config.get("source_run_dir") or ""), root=repo_root)
     if not source_run_dir.is_dir():
         raise FileNotFoundError(source_run_dir)
@@ -699,32 +691,26 @@ def build_well_control_set(
     if recorded_metrics_path is None or recorded_metrics_path.resolve() != metrics_path.resolve():
         raise ValueError("Source run summary metrics path does not match the selected source run.")
     metrics = pd.read_csv(metrics_path)
-    plan_index: dict[str, Mapping[str, Any]] = {}
     if source_run_type == "well_auto_tie":
         _required_columns(
             metrics,
-            {"well_name", "tie_status", "optimized_tdt_file", "optimized_trace_sample_plan_file"},
+            {
+                "well_name",
+                "tie_status",
+                "filtered_las_file",
+                "optimized_tdt_file",
+                "optimized_trace_sample_plan_file",
+            },
             path=metrics_path,
         )
         success = metrics["tie_status"].astype(str).str.casefold().eq("success")
-        plan_path = source_run_dir / "well_tie_plan.csv"
-        if not plan_path.is_file():
-            raise FileNotFoundError(plan_path)
-        plan = pd.read_csv(plan_path)
-        _required_columns(plan, {"well_name", "input_las"}, path=plan_path)
-        plan_names = [normalize_well_name(value) for value in plan["well_name"]]
-        if any(name.casefold() in invalid_names for name in plan_names) or len(plan_names) != len(set(plan_names)):
-            raise ValueError(f"Well-tie plan names must be non-empty and unique after normalization: {plan_path}")
-        plan_index = {
-            normalize_well_name(row["well_name"]): row for _, row in plan.iterrows()
-        }
     else:
         _required_columns(
             metrics,
             {
                 "well_name",
                 "status",
-                "shifted_preprocessed_las_path",
+                "shifted_filtered_las_path",
             },
             path=metrics_path,
         )
@@ -784,17 +770,12 @@ def build_well_control_set(
             continue
         try:
             if source_run_type == "well_auto_tie":
-                plan_row = plan_index.get(normalize_well_name(well_name))
-                if plan_row is None:
-                    raise ValueError(f"{well_name}: missing well_tie_plan row.")
                 control = _time_control(
                     source_row=source_row,
-                    plan_row=plan_row,
                     inventory_row=inventory_row,
                     sample_axis=sample_axis,
                     source_run_dir=source_run_dir,
                     repo_root=repo_root,
-                    max_internal_gap_s=maximum_gap,
                 )
             else:
                 control = _depth_control(
@@ -805,7 +786,6 @@ def build_well_control_set(
                     source_run_dir=source_run_dir,
                     repo_root=repo_root,
                     trace_lookup=trace_lookup,
-                    max_internal_gap_m=maximum_gap,
                 )
         except (FileNotFoundError, ValueError) as exc:
             base["reason"] = f"{type(exc).__name__}: {exc}"
@@ -856,6 +836,8 @@ def build_well_control_set(
             "metrics_path": str(metrics_path),
             "well_inventory_path": str(inventory_path),
             "target_seismic_path": str(seismic_path),
+            "native_source_role": "filtered",
+            "gap_policy": "upstream_filtered_only",
             "input_contracts": {
                 "source_run": {
                     "path": repo_relative_path(summary_path, root=repo_root),
@@ -887,7 +869,7 @@ def write_well_control_set(
         return out
 
     if list(manifest.columns) != MANIFEST_COLUMNS:
-        raise ValueError("Well-control manifest columns do not match the frozen v5 contract.")
+        raise ValueError("Well-control manifest columns do not match the frozen v6 contract.")
     manifest_names = [normalize_well_name(value) for value in manifest["well_name"]]
     if len(manifest_names) != len(set(manifest_names)):
         raise ValueError("Well-control manifest well names must be unique after normalization.")
@@ -929,6 +911,8 @@ def write_well_control_set(
             "model_axis_valid_mask_key": "valid_mask",
             "model_axis_observed_valid_mask_key": "observed_valid_mask",
             "native_value_key": "native_full_log_ai",
+            "native_source_role": "filtered",
+            "gap_policy": "upstream_filtered_only",
             "provenance": portable_provenance(control.provenance),
             "native": {
                 "sample_domain": control.native.sample_domain,
@@ -976,6 +960,8 @@ def write_well_control_set(
             "linear_ai_unit": LINEAR_AI_UNIT,
             "well_control_layers": ["model_axis", "native"],
             "model_axis_masks": ["valid_mask", "observed_valid_mask"],
+            "native_source_role": "filtered",
+            "gap_policy": "upstream_filtered_only",
         },
         business_config=resolved_config,
         input_contracts=input_contracts,
@@ -991,6 +977,8 @@ def write_well_control_set(
         "source_adapter": control_set.source_run_type,
         "sample_axis": control_set.sample_axis.describe(),
         "depth_basis": control_set.depth_basis,
+        "native_source_role": "filtered",
+        "gap_policy": "upstream_filtered_only",
         "counts": {
             "candidate_wells": int(len(manifest_out)),
             "successful_wells": int((manifest_out["status"] == "ok").sum()),
@@ -1032,6 +1020,8 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
         summary = json.load(handle)
     if summary.get("schema_version") != SCHEMA_VERSION or not is_consumable_contract_status(summary.get("status")):
         raise ValueError(f"Unsupported or unsuccessful well-control run: {run_dir}")
+    if summary.get("native_source_role") != "filtered" or summary.get("gap_policy") != "upstream_filtered_only":
+        raise ValueError(f"Well-control run does not use the filtered-LAS/upstream-gap contract: {run_dir}")
     require_contract_fingerprint(summary, label=f"WellControlSet {run_dir}")
     outputs = dict(summary.get("outputs") or {})
     recorded_manifest_path = resolve_relative_path(
@@ -1136,6 +1126,8 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
                 "model_axis_valid_mask_key": "valid_mask",
                 "model_axis_observed_valid_mask_key": "observed_valid_mask",
                 "native_value_key": "native_full_log_ai",
+                "native_source_role": "filtered",
+                "gap_policy": "upstream_filtered_only",
             }
             for key, expected in expected_metadata.items():
                 if metadata.get(key) != expected:

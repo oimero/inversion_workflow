@@ -303,8 +303,8 @@ def _plot_event_comparison(
         raise ValueError(f"{well_name}: no target-interval waveform events passed the threshold.")
     fig, axes = plt.subplots(
         len(events),
-        3,
-        figsize=(12.0, max(3.2, 2.6 * len(events))),
+        4,
+        figsize=(14.5, max(3.2, 2.6 * len(events))),
         squeeze=False,
         constrained_layout=True,
     )
@@ -326,14 +326,26 @@ def _plot_event_comparison(
         if row == 0:
             axes[row, 1].legend(fontsize=8)
 
-        axes[row, 2].plot(real[local], local_axis, color="black", lw=1.5, label="real")
-        axes[row, 2].plot(full_synthetic[local], local_axis, color="tab:blue", lw=1.2, label="full forward")
-        axes[row, 2].plot(body_synthetic[local], local_axis, color="tab:orange", lw=1.2, label="body forward")
-        axes[row, 2].set_title("Shared-gain forward" if row == 0 else "")
+        residual = full_log_ai[local] - body_log_ai[local]
+        axes[row, 2].plot(
+            residual,
+            local_axis,
+            color="tab:purple",
+            lw=1.2,
+            label="full − 15 m body",
+        )
+        axes[row, 2].axvline(0.0, color="black", lw=0.8, alpha=0.6)
+        axes[row, 2].set_title("log-AI residual" if row == 0 else "")
         if row == 0:
             axes[row, 2].legend(fontsize=8)
 
-        for column in range(3):
+        axes[row, 3].plot(full_synthetic[local], local_axis, color="tab:blue", lw=1.2, label="full forward")
+        axes[row, 3].plot(body_synthetic[local], local_axis, color="tab:orange", lw=1.2, label="body forward")
+        axes[row, 3].set_title("Shared-gain synthetic" if row == 0 else "")
+        if row == 0:
+            axes[row, 3].legend(fontsize=8)
+
+        for column in range(4):
             axes[row, column].set_ylim(float(local_axis[-1]), float(local_axis[0]))
             axes[row, column].grid(alpha=0.2)
             axes[row, column].set_ylabel("TVDSS [m]" if column == 0 else "")
@@ -354,7 +366,7 @@ def write_depth_well_control_qc(
     repo_root: Path,
     config: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Write three target-interval QC figures for every successful Step 6 well."""
+    """Write the target-interval QC figures for every successful Step 6 well."""
 
     expected = {
         "body_smoothing_fwhm_m",

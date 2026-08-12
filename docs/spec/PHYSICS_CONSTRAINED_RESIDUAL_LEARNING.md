@@ -67,15 +67,15 @@ model-axis control
 └── valid_mask
 
 native well control
-├── aligned preprocessed full log-AI
+├── aligned filtered full log-AI
 ├── native vertical coordinates
 ├── native_valid_mask
 └── alignment provenance
 ```
 
-`model-axis control` 延续当前第六步合同，服务于第七步 LFM。`native well control` 从时间域对齐后的 preprocessed LAS 或深度域 `shifted_preprocessed_las` 读取，服务于 GINN V2 和 Enhance V2。
+`model-axis control` 延续当前第六步合同，服务于第七步 LFM。`native well control` 从时间域的 `filtered_las_file` 或深度域 `shifted_filtered_las_path` 读取，服务于 GINN V2 和 Enhance V2。第六步不跨 filtered LAS 缺口重新插值。
 
-第六步同时携带上游井震标定的相关性、误差、状态和有效支持。所有成功发布的井控用于第七步 LFM；GINN 井监督和 Enhance 残差库分别使用训练前冻结的显式井名单。native 尺度运算只使用 `native_valid_mask`；投影到模型轴后的神经网络监督只使用 `observed_valid_mask`。包含短缺口插值的 `valid_mask` 服务于连续曲线、正演和 LFM 准备。其余井只作诊断。
+第六步同时携带上游井震标定的相关性、误差、状态和有效支持。所有成功发布的井控用于第七步 LFM；GINN 井监督和 Enhance 残差库分别使用训练前冻结的显式井名单。native 尺度运算只使用 `native_valid_mask`；投影到模型轴后的神经网络监督只使用 `observed_valid_mask`。`valid_mask` 只描述投影后有限 log-AI 和空间位置的共同支持；缺口处理由上游 filtered LAS 合同负责。其余井只作诊断。
 
 第六步发布井事实和 provenance。主体目标与残差由下游按当前 `body_smoothing_fwhm_m` 计算：
 

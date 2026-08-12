@@ -1,6 +1,6 @@
 # 06 真实工区井控数据集
 
-`real_field_well_controls.py` 是工作流的第六步。它把预处理后的完整井曲线统一到地震采样轴，同时保留原生采样井曲线，并为每口成功井生成正演质控图。
+`real_field_well_controls.py` 是工作流的第六步。它把上游 filtered LAS 统一到地震采样轴，同时保留 filtered LAS 的原生采样曲线，并为每口成功井生成正演质控图。
 
 > 深度域工区使用第五步（`wavelet_batch_synthetic_depth`）作为上游，配置方式见文末。
 
@@ -22,11 +22,12 @@ python scripts/real_field_well_controls.py --output-dir scripts/output/well_cont
 
 | 来源 | 文件 | 用途 |
 |------|------|------|
-| 第四步 | `run_summary.json` | schema/domain 校验和直接上游契约身份 |
-| 第四步 | `well_tie_metrics.csv` | 成功井清单和产物路径 |
-| 第三步与第四步 | 每井预处理 LAS | 原生 `AI [m/s*g/cm3]` 曲线 |
-| 第四步 | 每井优化 TDT | MD→TWT 映射 |
-| 第四步 | 每井 trace sample plan | 斜井逐样点 inline/xline/XY（仅斜井） |
+| 来源运行 | `run_summary.json` | schema/domain 校验和直接上游契约身份 |
+| 时间域第四步 | `well_tie_metrics.csv` | 成功井清单、filtered LAS 和优化 TDT 路径 |
+| 时间域第四步 | 每井 filtered LAS | 原生 `AI [m/s*g/cm3]` 曲线 |
+| 时间域第四步 | 每井优化 TDT | MD→TWT 映射 |
+| 时间域第四步 | 每井 trace sample plan | 斜井逐样点 inline/xline/XY（仅斜井） |
+| 深度域第五步 | `wavelet_batch_metrics.csv` | 成功井清单和平移 filtered LAS 路径 |
 | 第一步 | `well_inventory.csv` | 井口坐标、KB 高程、井型 |
 | 数据目录 | 地震体 | 目标 SampleAxis 和 survey geometry |
 
@@ -42,7 +43,6 @@ real_field_well_controls:
   source_run_dir: scripts/output/well_auto_tie_<timestamp>
   well_inventory_file: scripts/output/well_inventory_<timestamp>/well_inventory.csv
   well_trace_dir: all_well_trace
-  max_internal_gap_axis_units: 0.008
 
 real_field_well_controls_qc:
   forward_model_inputs_run_dir:
@@ -58,18 +58,18 @@ real_field_well_controls_qc:
 
 | 值 | 目标域 | 上游 |
 |---|---|---|
-| `well_auto_tie` | time + s | 第四步成功井、预处理 LAS 和优化 TDT |
-| `wavelet_batch_synthetic_depth` | depth + tvdss + m | 深度域第五步成功井和平移后的预处理 LAS |
+| `well_auto_tie` | time + s | 第四步成功井、filtered LAS 和优化 TDT |
+| `wavelet_batch_synthetic_depth` | depth + tvdss + m | 深度域第五步成功井和平移后的 filtered LAS |
 
 输入要求：
 
-- 只接受第四步 `tie_status=success` 的井。
-- 每井必须有预处理 LAS（含 AI 曲线，单位 `m/s*g/cm3`）和对应的域转换信息。
+- 时间域只接受第四步 `tie_status=success` 的井；深度域只接受第五步 `status=ok` 的井。
+- 每井必须有 filtered LAS（含 AI 曲线，单位 `m/s*g/cm3`）和对应的域转换信息。
 - 斜井还需要优化轨迹采样计划文件。
 
 ### `source_run_dir`
 
-指向第四步的运行目录。留空时脚本按 `source_run_type` 前缀在输出目录下自动发现最新的成功运行。显式填路径则固定使用该目录，适合复现。
+指向当前 `source_run_type` 对应的上游运行目录。留空时脚本按来源前缀在输出目录下自动发现最新的成功运行。显式填路径则固定使用该目录，适合复现。
 
 ### `well_inventory_file`
 
@@ -79,27 +79,27 @@ real_field_well_controls_qc:
 
 深度域斜井使用该目录中的轨迹文件；直井不读取轨迹文件。
 
-### 内部缺口
+### 缺口
 
-`max_internal_gap_axis_units` 的单位由采样轴决定：时间域为秒，深度域为米。脚本只线性内插不超过该宽度的内部缺口；曲线两端和更长缺口保持为空。当前深度域主配置使用 10 m。
+缺口处理由上游 filtered LAS 负责。第六步只在各个有限段内投影到目标 SampleAxis，不跨缺口插值，也不在模型轴上重新填补。`observed_valid_mask` 表示投影后的上游有效支撑，缺口样点在 `log_ai` 和掩码中保持无效。
 
 ---
 
 ## 脚本在做什么
 
-脚本发布同一口井的两层事实：模型轴上的完整井控服务于低频模型和后续训练，原生采样上的完整井曲线服务于主体监督和高频残差。处理顺序为适配、域转换、写入和正演质控。
+脚本发布同一口井的两层事实：模型轴上的 filtered 井控服务于低频模型和后续训练，原生采样上的 filtered full log-AI 服务于主体监督和高频残差。处理顺序为适配、域转换、写入和正演质控。
 
 ### 第一阶段：适配
 
 1. 读取上游 `run_summary.json`，确认 schema、domain、status 匹配当前配置的 `source_run_type`。
-2. 读取 `well_tie_metrics.csv`，只保留 `tie_status=success` 的井。
+2. 读取来源 metrics，按来源适配器只保留成功井，并读取其 filtered LAS 路径。
 3. 读取 `well_inventory.csv`，与上游成功井做井名匹配。上游成功但 inventory 中不存在的井被拒绝。
 
 ### 第二阶段：域转换
 
-对每口井，通过优化 TDT 表把每个 TWT 采样点映射到 MD 轴上的一个位置，再从 LAS 的 MD 轴上读出该位置的 ln(AI) 值。空间位置方面，直井直接把井口的固定线号道号广播到所有样点；斜井从第四步产出的轨迹采样计划读取逐样点的线号、道号和 XY。
+对每口井，通过优化 TDT 表把每个 TWT 采样点映射到 MD 轴上的一个位置，再从 filtered LAS 的 MD 轴上读出该位置的 ln(AI) 值。深度域则将 shifted filtered LAS 的平移 MD 转为 TVDSS。空间位置方面，直井直接把井口的固定线号道号广播到所有样点；斜井从上游产出的轨迹采样计划或轨迹文件读取逐样点的位置。
 
-模型轴记录两个掩码：`observed_valid_mask` 表示直接由原生有限段投影得到的样点，`valid_mask` 表示可供低频模型使用的样点，其中可以包含配置允许的短内部缺口内插。两端缺口和长缺口在两个掩码中都保持无效。
+模型轴记录两个掩码：`observed_valid_mask` 表示直接由 filtered LAS 有限段投影得到的样点，`valid_mask` 表示同时具有有限 log-AI 和有限空间位置的样点。第六步不添加新的缺口样点。
 
 ### 第三阶段：校验与写入
 
@@ -115,11 +115,11 @@ real_field_well_controls_qc:
 
 深度域运行读取第五步发布的冻结子波和 AI–Vp 关系。每口成功井生成三张目的层图件：
 
-1. 完整井曲线的六联正演质控图；
+1. filtered full log-AI 的六联正演质控图；
 2. 15 m 主体曲线的六联正演质控图；
-3. 若干真实地震波瓣窗口中的完整曲线、主体曲线及两套合成波形对比图。
+3. 若干真实地震波瓣窗口中的 real seismic、full/body log-AI、full-body 残差及两套合成波形对比图。合成波形子图只显示 full 和 body 两套合成地震。
 
-完整曲线与主体曲线使用同一个由完整曲线估计的振幅系数，因此第三张图保留两套合成波形之间的真实振幅差异。井曲线覆盖不完整时，图件显示目的层内最长的共同有效区间。
+完整曲线与主体曲线使用同一个由完整曲线估计的振幅系数，因此事件图的合成地震子图保留两套合成波形之间的真实振幅差异。井曲线覆盖不完整时，图件显示目的层内最长的共同有效区间。
 
 ---
 
@@ -154,11 +154,11 @@ real_field_well_controls_<timestamp>/
 | `wellbore_class` | `vertical` 或 `deviated` |
 | `sampling_mode` | 具体采样方式 |
 | `n_samples` / `n_valid_samples` | 总样点数 / 有效样点数 |
-| `n_observed_samples` / `n_interpolated_samples` | 原始观测样点数 / 短缺口内插样点数 |
+| `n_observed_samples` / `n_interpolated_samples` | filtered LAS 投影有效样点数 / 第六步新增样点数（当前合同为 0） |
 | `n_native_samples` / `n_valid_native_samples` | 原生完整井曲线总样点数 / 有效样点数 |
 | `well_npz_path` | NPZ 路径（失败时为空）；消费者不再重算逐井文件哈希 |
 
-`run_summary.json` 使用 `real_field_well_controls_v5`，通过 `input_contracts` 记录直接上游，并发布一个生产者契约指纹。
+`run_summary.json` 使用 `real_field_well_controls_v6`，声明 `native_source_role=filtered` 和 `gap_policy=upstream_filtered_only`，通过 `input_contracts` 记录直接上游，并发布一个生产者契约指纹。
 
 ### `wells/<well_name>.npz`
 
@@ -175,7 +175,7 @@ real_field_well_controls_<timestamp>/
 | `valid_mask` | bool | [N] | 有效掩码 |
 | `observed_valid_mask` | bool | [N] | 未经缺口内插的观测支撑 |
 | `native_coordinates` | float64 | [M] | 对齐后的原生 TWT 或 TVDSS 坐标 |
-| `native_full_log_ai` | float32 | [M] | 原生采样的完整 ln(AI)，无效处为 NaN |
+| `native_full_log_ai` | float32 | [M] | filtered LAS 原生采样的完整 ln(AI)，无效处为 NaN |
 | `native_valid_mask` | bool | [M] | 原生完整井曲线有效掩码 |
 | `metadata_json` | 标量字符串 | — | 井名、schema、provenance |
 
@@ -214,9 +214,9 @@ QC figures: scripts/output/real_field_well_controls_<timestamp>/qc/figures
 
 ### 第四步：检查三张图件
 
-- `full_waveform_qc.png` 检查完整井曲线正演与真实地震的相位、振幅和局部相关性。
+- `full_waveform_qc.png` 检查 filtered full log-AI 正演与真实地震的相位、振幅和局部相关性。
 - `body_waveform_qc.png` 检查 15 m 主体尺度是否保留主要地震响应。
-- `event_waveform_comparison.png` 直接观察几个地震波瓣内 full 与 body 合成响应的差异。
+- `event_waveform_comparison.png` 依次观察 real seismic、full/body log-AI、full-body 残差，以及只包含 full/body 合成地震的波形差异。
 
 ---
 

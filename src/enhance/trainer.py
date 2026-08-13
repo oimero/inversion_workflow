@@ -17,9 +17,16 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from cup.utils.io import to_json_compatible, write_json
-from enhance.config import EnhancementConfig
+from enhance.config import EnhanceV2Config, EnhancementConfig
 from enhance.loss import EnhancementLoss, _moving_average_1d, compose_enhanced_ai
 from enhance.model import DilatedResNet1D
+from enhance.real_field import (
+    PairedResidualDataset,
+    RealFieldRuntime,
+    ResidualLibrary,
+    infer_body_trace,
+    read_seismic_trace,
+)
 
 logger = logging.getLogger(__name__)
 

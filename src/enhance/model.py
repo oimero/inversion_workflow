@@ -84,6 +84,13 @@ class DilatedResNet1D(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.tail = nn.Conv1d(hidden_channels, out_channels, kernel_size=1)
+        # This network predicts a correction to an already acceptable body.
+        # Starting from an exact zero correction keeps the untrained model at
+        # the frozen-body baseline and lets the residual branch learn its
+        # amplitude from the paired examples instead of from initialization.
+        nn.init.zeros_(self.tail.weight)
+        if self.tail.bias is not None:
+            nn.init.zeros_(self.tail.bias)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.head(x)

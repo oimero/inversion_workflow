@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import replace
 from datetime import datetime
 import json
@@ -340,6 +341,227 @@ def _plot_temperature_sweep(
     plt.close(figure)
 
 
+def _section_observations(
+    reader: PatchReader,
+    keys: tuple[Any, ...],
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    observed: list[np.ndarray] = []
+    lfm: list[np.ndarray] = []
+    support: list[np.ndarray] = []
+    for start in range(0, len(keys), batch_size):
+        batch = reader.batch(keys[start : start + batch_size], center_visible=True, device=device)
+        observed.append(batch.observed_seismic.detach().cpu().numpy().astype(np.float64))
+        lfm.append(batch.lfm_log_ai.detach().cpu().numpy().astype(np.float64))
+        support.append(
+            (
+                batch.observed_valid_mask
+                & batch.lfm_valid_mask
+            ).detach().cpu().numpy().astype(bool)
+        )
+    return np.concatenate(observed), np.concatenate(lfm), np.concatenate(support)
+
+
+def _finite_runs(mask: np.ndarray) -> tuple[tuple[int, int], ...]:
+    padded = np.r_[False, np.asarray(mask, dtype=bool), False]
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return tuple((int(start), int(stop)) for start, stop in edges.reshape(-1, 2))
+
+
+def _rolling_standard_deviation(
+    values: np.ndarray,
+    support: np.ndarray,
+    *,
+    window_samples: int,
+) -> np.ndarray:
+    data = np.asarray(values, dtype=np.float64)
+    valid = np.asarray(support, dtype=bool) & np.isfinite(data)
+    if data.ndim != 2 or valid.shape != data.shape:
+        raise ValueError("rolling standard deviation expects matching (traces, samples) arrays.")
+    if isinstance(window_samples, bool) or int(window_samples) < 3:
+        raise ValueError("window_samples must be at least three.")
+    width = int(window_samples)
+    kernel = np.ones(width, dtype=np.float64)
+    result = np.full(data.shape, np.nan, dtype=np.float64)
+    for trace_index in range(data.shape[0]):
+        for start, stop in _finite_runs(valid[trace_index]):
+            local = data[trace_index, start:stop]
+            if local.size < 3:
+                continue
+            count = np.convolve(np.ones(local.size), kernel, mode="same")
+            total = np.convolve(local, kernel, mode="same")
+            total_square = np.convolve(np.square(local), kernel, mode="same")
+            variance = np.maximum(total_square / count - np.square(total / count), 0.0)
+            result[trace_index, start:stop] = np.sqrt(variance)
+    return result
+
+
+def _pearson(first: np.ndarray, second: np.ndarray) -> float:
+    x = np.asarray(first, dtype=np.float64)
+    y = np.asarray(second, dtype=np.float64)
+    if x.size < 3 or y.size != x.size or np.std(x) <= 0.0 or np.std(y) <= 0.0:
+        return float("nan")
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _ordinal_ranks(values: np.ndarray) -> np.ndarray:
+    order = np.argsort(np.asarray(values, dtype=np.float64), kind="mergesort")
+    ranks = np.empty(order.size, dtype=np.float64)
+    ranks[order] = np.arange(order.size, dtype=np.float64)
+    return ranks
+
+
+def _amplitude_body_statistics(
+    seismic_scale: np.ndarray,
+    body_scale: np.ndarray,
+    support: np.ndarray,
+) -> tuple[dict[str, Any], list[dict[str, float]]]:
+    valid = (
+        np.asarray(support, dtype=bool)
+        & np.isfinite(seismic_scale)
+        & np.isfinite(body_scale)
+        & (seismic_scale > 0.0)
+        & (body_scale > 0.0)
+    )
+    seismic = np.asarray(seismic_scale, dtype=np.float64)[valid]
+    body = np.asarray(body_scale, dtype=np.float64)[valid]
+    if seismic.size < 100:
+        raise ValueError("amplitude/body diagnostic has fewer than 100 valid samples.")
+    seismic_median = float(np.median(seismic))
+    body_median = float(np.median(body))
+    low_absolute = seismic <= 0.5 * seismic_median
+    low_quartile = seismic <= np.quantile(seismic, 0.25)
+    high_quartile = seismic >= np.quantile(seismic, 0.75)
+    low_body = float(np.median(body[low_quartile]))
+    high_body = float(np.median(body[high_quartile]))
+    edges = np.quantile(seismic, np.linspace(0.0, 1.0, 11))
+    rows: list[dict[str, float]] = []
+    for index in range(10):
+        selected = (seismic >= edges[index]) & (
+            seismic <= edges[index + 1] if index == 9 else seismic < edges[index + 1]
+        )
+        rows.append(
+            {
+                "decile": float(index + 1),
+                "seismic_rms_median": float(np.median(seismic[selected])),
+                "body_increment_std_q25": float(np.quantile(body[selected], 0.25)),
+                "body_increment_std_median": float(np.median(body[selected])),
+                "body_increment_std_q75": float(np.quantile(body[selected], 0.75)),
+                "sample_count": float(np.count_nonzero(selected)),
+            }
+        )
+    summary = {
+        "sample_count": int(seismic.size),
+        "seismic_rms_median": seismic_median,
+        "body_increment_std_median": body_median,
+        "log_scale_pearson": _pearson(np.log10(seismic), np.log10(body)),
+        "spearman": _pearson(_ordinal_ranks(seismic), _ordinal_ranks(body)),
+        "low_amplitude_area_fraction_below_half_median": float(np.mean(low_absolute)),
+        "low_amplitude_body_increment_std_median": (
+            float(np.median(body[low_absolute])) if np.any(low_absolute) else float("nan")
+        ),
+        "low_quartile_body_increment_std_median": low_body,
+        "high_quartile_body_increment_std_median": high_body,
+        "high_to_low_quartile_body_variation_ratio": high_body / low_body,
+        "lowest_to_highest_decile_body_variation_ratio": (
+            rows[-1]["body_increment_std_median"] / rows[0]["body_increment_std_median"]
+        ),
+    }
+    return summary, rows
+
+
+def _plot_amplitude_body_relation(
+    observed: np.ndarray,
+    body_increment: np.ndarray,
+    seismic_scale: np.ndarray,
+    body_scale: np.ndarray,
+    support: np.ndarray,
+    distance_m: np.ndarray,
+    sample_axis: np.ndarray,
+    horizons: Mapping[str, np.ndarray],
+    path: Path,
+    *,
+    dpi: int,
+    window_m: float,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    crop = _finite_crop(support)
+    seismic_limit = max(float(np.quantile(np.abs(observed[support]), 0.995)), 1.0e-9)
+    increment_limit = max(float(np.quantile(np.abs(body_increment[support]), 0.995)), 1.0e-6)
+    seismic_scale_limit = max(float(np.nanquantile(seismic_scale[support], 0.99)), 1.0e-9)
+    body_scale_limit = max(float(np.nanquantile(body_scale[support], 0.99)), 1.0e-6)
+    figure, axes = plt.subplots(2, 2, figsize=(14.0, 9.0), sharex=True, sharey=True)
+    images = (
+        _plot_field(
+            axes[0, 0], observed, support, distance_m, sample_axis, crop,
+            cmap="RdBu_r", vmin=-seismic_limit, vmax=seismic_limit, title="observed seismic amplitude",
+        ),
+        _plot_field(
+            axes[0, 1], seismic_scale, support, distance_m, sample_axis, crop,
+            cmap="magma", vmin=0.0, vmax=seismic_scale_limit,
+            title=f"local seismic standard deviation ({window_m:g} m window)",
+        ),
+        _plot_field(
+            axes[1, 0], body_increment, support, distance_m, sample_axis, crop,
+            cmap="RdBu_r", vmin=-increment_limit, vmax=increment_limit,
+            title="GINN body minus input LFM (log-AI)",
+        ),
+        _plot_field(
+            axes[1, 1], body_scale, support, distance_m, sample_axis, crop,
+            cmap="magma", vmin=0.0, vmax=body_scale_limit,
+            title=f"local body-increment standard deviation ({window_m:g} m window)",
+        ),
+    )
+    for axis in axes.ravel():
+        for horizon in horizons.values():
+            axis.plot(distance_m / 1000.0, horizon, color="black", linewidth=0.8, alpha=0.75)
+    labels = ("seismic amplitude", "seismic local std", "log-AI increment", "log-AI local std")
+    for axis, image, label in zip(axes.ravel(), images, labels):
+        figure.colorbar(image, ax=axis, fraction=0.045, pad=0.025, label=label)
+    figure.suptitle("Observed amplitude and GINN body-variation correspondence")
+    figure.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _plot_amplitude_body_scatter(
+    seismic_scale: np.ndarray,
+    body_scale: np.ndarray,
+    support: np.ndarray,
+    deciles: list[dict[str, float]],
+    path: Path,
+    *,
+    dpi: int,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    valid = support & np.isfinite(seismic_scale) & np.isfinite(body_scale) & (seismic_scale > 0.0) & (body_scale > 0.0)
+    x = seismic_scale[valid]
+    y = body_scale[valid]
+    figure, axes = plt.subplots(1, 2, figsize=(13.5, 5.3))
+    image = axes[0].hexbin(np.log10(x), np.log10(y), gridsize=48, mincnt=1, bins="log", cmap="viridis")
+    axes[0].set_xlabel("log10 local seismic standard deviation")
+    axes[0].set_ylabel("log10 local body-increment standard deviation")
+    axes[0].set_title("all supported samples")
+    figure.colorbar(image, ax=axes[0], label="log10 sample count")
+    decile_x = np.asarray([row["seismic_rms_median"] for row in deciles])
+    median = np.asarray([row["body_increment_std_median"] for row in deciles])
+    lower = np.asarray([row["body_increment_std_q25"] for row in deciles])
+    upper = np.asarray([row["body_increment_std_q75"] for row in deciles])
+    axes[1].fill_between(decile_x, lower, upper, color="tab:blue", alpha=0.2, label="body IQR")
+    axes[1].plot(decile_x, median, color="tab:blue", marker="o", label="body median")
+    axes[1].set_xscale("log")
+    axes[1].set_yscale("log")
+    axes[1].set_xlabel("seismic local standard deviation (decile median)")
+    axes[1].set_ylabel("body-increment local standard deviation")
+    axes[1].set_title("seismic-amplitude deciles")
+    axes[1].legend()
+    figure.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(figure)
+
+
 def main() -> None:
     args = parse_args()
     config_path = resolve_relative_path(args.config, root=REPO_ROOT)
@@ -472,6 +694,7 @@ def main() -> None:
         "library": library_summary(library),
         "sections": {},
     }
+    relation_summary_rows: list[dict[str, Any]] = []
     for orientation in orientations:
         section_dir = output_dir / orientation
         section_dir.mkdir(parents=True)
@@ -483,6 +706,65 @@ def main() -> None:
         geometry, distance_m, horizons = _section_geometry(
             keys, body, valid_mask, reader=reader, target_zone=target_zone, orientation=orientation
         )
+        observed, center_lfm, observation_support = _section_observations(
+            reader,
+            keys,
+            batch_size=ginn_config.batch_size,
+            device=trainer.device,
+        )
+        relation_support = (
+            np.asarray(geometry.support, dtype=bool)
+            & observation_support
+            & np.isfinite(body)
+            & np.isfinite(center_lfm)
+        )
+        body_increment = body - center_lfm
+        window_m = float(ginn_config.waveform_qc_dynamic_window_m)
+        window_samples = max(3, int(round(window_m / float(sample_axis.step))))
+        if window_samples % 2 == 0:
+            window_samples += 1
+        seismic_scale = _rolling_standard_deviation(
+            observed,
+            relation_support,
+            window_samples=window_samples,
+        )
+        body_scale = _rolling_standard_deviation(
+            body_increment,
+            relation_support,
+            window_samples=window_samples,
+        )
+        relation_summary, relation_deciles = _amplitude_body_statistics(
+            seismic_scale,
+            body_scale,
+            relation_support,
+        )
+        _plot_amplitude_body_relation(
+            observed,
+            body_increment,
+            seismic_scale,
+            body_scale,
+            relation_support,
+            distance_m,
+            sample_axis.values,
+            horizons,
+            section_dir / "amplitude_body_relation.png",
+            dpi=dpi,
+            window_m=window_m,
+        )
+        _plot_amplitude_body_scatter(
+            seismic_scale,
+            body_scale,
+            relation_support,
+            relation_deciles,
+            section_dir / "amplitude_body_scatter.png",
+            dpi=dpi,
+        )
+        write_json(section_dir / "amplitude_body_summary.json", relation_summary)
+        with (section_dir / "amplitude_body_deciles.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(relation_deciles[0]))
+            writer.writeheader()
+            writer.writerows(relation_deciles)
+        relation_summary_rows.append({"orientation": orientation, **relation_summary})
         temperature_results: dict[float, Any] = {}
         for multiplier in policy.temperature_multipliers:
             logger.info("%s transfer | temperature_multiplier=%.3f", orientation, multiplier)
@@ -513,6 +795,12 @@ def main() -> None:
             "hard_nearest_residual": result.hard_nearest_residual,
             "effective_dictionary_count": result.effective_dictionary_count,
             "support": result.support,
+            "observed_seismic": observed,
+            "input_lfm": center_lfm,
+            "body_increment": body_increment,
+            "local_seismic_std": seismic_scale,
+            "local_body_increment_std": body_scale,
+            "amplitude_body_support": relation_support,
         }
         for multiplier, temperature_result in temperature_results.items():
             arrays[f"temperature_{multiplier:g}_residual"] = temperature_result.predicted_residual
@@ -528,9 +816,16 @@ def main() -> None:
                 str(multiplier): result_summary(item)
                 for multiplier, item in temperature_results.items()
             },
+            "amplitude_body_relation": relation_summary,
             "figures": [
                 str((section_dir / name).relative_to(REPO_ROOT))
-                for name in ("comparison.png", "weights_and_continuity.png", "temperature_sweep.png")
+                for name in (
+                    "comparison.png",
+                    "weights_and_continuity.png",
+                    "temperature_sweep.png",
+                    "amplitude_body_relation.png",
+                    "amplitude_body_scatter.png",
+                )
             ],
         }
         logger.info(
@@ -539,10 +834,14 @@ def main() -> None:
             result.summary["residual_rms"],
             result.summary["effective_dictionary_count_median"],
         )
+    with (output_dir / "amplitude_body_summary.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(relation_summary_rows[0]))
+        writer.writeheader()
+        writer.writerows(relation_summary_rows)
     write_json(output_dir / "run_summary.json", run_summary)
     print("=== Enhance V2 conditional residual texture prototype ===")
     print(f"Output: {output_dir}")
-    print("Figures: comparison.png, weights_and_continuity.png, temperature_sweep.png")
+    print("Figures include: comparison.png, amplitude_body_relation.png, amplitude_body_scatter.png")
 
 
 if __name__ == "__main__":

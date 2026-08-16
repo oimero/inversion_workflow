@@ -3,8 +3,8 @@
 The public interface in this module is deliberately expressed in array indices
 and :class:`~cup.seismic.geometry.SurveyLineGeometry` coordinates separately.
 An array index addresses a trace; a line number is only converted at the
-geometry seam.  This keeps a survey whose xline step is four identical to one
-whose xline step is one while all lateral features remain in physical metres.
+geometry seam.  This keeps line-number spacing independent from array-index
+semantics while all lateral features remain in physical metres.
 """
 
 from __future__ import annotations

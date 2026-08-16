@@ -21,6 +21,7 @@ class GateThresholds:
     pretrain_masked_shape_ratio: float
     masked_corr_drop_tolerance: float
     well_pooled_rmse_ratio_max: float
+    seismic_body_amplitude_spearman_max: float = 1.0
 
     def __post_init__(self) -> None:
         for name, value in asdict(self).items():
@@ -30,6 +31,8 @@ class GateThresholds:
             raise ValueError("pretrain_masked_shape_ratio must be positive.")
         if self.well_pooled_rmse_ratio_max <= 0.0:
             raise ValueError("well_pooled_rmse_ratio_max must be positive.")
+        if self.seismic_body_amplitude_spearman_max > 1.0:
+            raise ValueError("seismic_body_amplitude_spearman_max cannot exceed one.")
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,10 @@ class EvaluationMetrics:
     roughness_ratio_by_well: Mapping[str, float]
     analytic_gain_mean: float
     raw_amplitude_residual_mean: float
+    compensated_amplitude_residual_mean: float
+    visibility_standard_deviation: float
+    seismic_body_amplitude_spearman: float
+    seismic_body_log_amplitude_pearson: float
     support_contiguous_fraction: float
     orientation_disagreement_rms_ratio: float
     sample_count: int
@@ -68,6 +75,10 @@ class EvaluationMetrics:
             "roughness_ratio",
             "analytic_gain_mean",
             "raw_amplitude_residual_mean",
+            "compensated_amplitude_residual_mean",
+            "visibility_standard_deviation",
+            "seismic_body_amplitude_spearman",
+            "seismic_body_log_amplitude_pearson",
             "support_contiguous_fraction",
             "orientation_disagreement_rms_ratio",
         ):
@@ -184,11 +195,17 @@ def evaluate_gates(
         "roughness_ratio_median": float(metrics.roughness_ratio),
         "support_contiguous_fraction": float(metrics.support_contiguous_fraction),
         "orientation_disagreement_rms_ratio": float(metrics.orientation_disagreement_rms_ratio),
+        "seismic_body_amplitude_spearman": float(metrics.seismic_body_amplitude_spearman),
+        "seismic_body_log_amplitude_pearson": float(metrics.seismic_body_log_amplitude_pearson),
+        "visibility_standard_deviation": float(metrics.visibility_standard_deviation),
+        "compensated_amplitude_residual_mean": float(metrics.compensated_amplitude_residual_mean),
     }
     if details["masked_corr_change_from_pretrain_median"] < -threshold.masked_corr_drop_tolerance:
         failed.append("masked_shape")
     if details["well_pooled_rmse_ratio_to_pretrain"] >= threshold.well_pooled_rmse_ratio_max:
         failed.append("trusted_well_body")
+    if abs(details["seismic_body_amplitude_spearman"]) > threshold.seismic_body_amplitude_spearman_max:
+        failed.append("seismic_body_amplitude_mapping")
     return GateReport(
         passed=not failed,
         failed_gates=tuple(failed),

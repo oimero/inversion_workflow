@@ -22,6 +22,15 @@ class BodyResult:
     valid_mask: Tensor
 
 
+@dataclass(frozen=True)
+class BodyPrediction:
+    """Body-only prediction used when no forward diagnostic is requested."""
+
+    keys: tuple[PatchKey, ...]
+    body_log_ai: Tensor
+    valid_mask: Tensor
+
+
 class BodyInverter:
     """Small inference interface hiding patch batching and the domain adapter."""
 
@@ -55,6 +64,48 @@ class BodyInverter:
             domain_extras=batch.domain_extras,
         )
 
+    def _predict_body_batch(self, batch) -> tuple[Tensor, Tensor, CommonObservationBatch]:
+        common = self._common(batch)
+        raw = self.model(
+            batch.features,
+            center_index=self.reader.patch_radius,
+        )
+        correction = self.projector.project(
+            raw,
+            self.adapter.vertical_coordinates_m(common),
+            batch.lfm_valid_mask,
+        )
+        support = common.observed_valid_mask & batch.lfm_valid_mask
+        body = torch.where(support, batch.lfm_log_ai + correction, batch.lfm_log_ai)
+        return body, support, common
+
+    @torch.no_grad()
+    def predict_body(
+        self,
+        keys: tuple[PatchKey, ...] | list[PatchKey],
+        *,
+        center_visible: bool = True,
+    ) -> BodyPrediction:
+        """Predict body-scale log-AI without paying for a forward diagnostic."""
+
+        selected = tuple(keys)
+        if not selected:
+            raise ValueError("BodyInverter.predict_body requires at least one PatchKey.")
+        self.model.eval()
+        bodies: list[Tensor] = []
+        supports: list[Tensor] = []
+        for start in range(0, len(selected), self.batch_size):
+            local = selected[start : start + self.batch_size]
+            batch = self.reader.batch(local, center_visible=center_visible, device=self.device)
+            body, support, _common = self._predict_body_batch(batch)
+            bodies.append(body)
+            supports.append(support)
+        return BodyPrediction(
+            keys=selected,
+            body_log_ai=torch.cat(bodies, dim=0),
+            valid_mask=torch.cat(supports, dim=0),
+        )
+
     @torch.no_grad()
     def predict(self, keys: tuple[PatchKey, ...] | list[PatchKey], *, center_visible: bool = True) -> BodyResult:
         selected = tuple(keys)
@@ -67,23 +118,14 @@ class BodyInverter:
         for start in range(0, len(selected), self.batch_size):
             local = selected[start : start + self.batch_size]
             batch = self.reader.batch(local, center_visible=center_visible, device=self.device)
-            common = self._common(batch)
-            raw = self.model(
-                batch.features,
-                center_index=self.reader.patch_radius,
-            )
-            correction = self.projector.project(
-                raw,
-                self.adapter.vertical_coordinates_m(common),
-                batch.lfm_valid_mask,
-            )
+            body, support, common = self._predict_body_batch(batch)
             closure = self.adapter.close_body(
-                batch.lfm_log_ai + correction,
+                body,
                 common,
             )
             bodies.append(closure.body_log_ai)
             synthetics.append(closure.synthetic_seismic)
-            supports.append(closure.valid_mask)
+            supports.append(support & closure.valid_mask)
         return BodyResult(
             keys=selected,
             body_log_ai=torch.cat(bodies, dim=0),
@@ -92,4 +134,4 @@ class BodyInverter:
         )
 
 
-__all__ = ["BodyInverter", "BodyResult"]
+__all__ = ["BodyInverter", "BodyPrediction", "BodyResult"]

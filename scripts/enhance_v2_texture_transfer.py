@@ -418,6 +418,9 @@ def main() -> None:
         patch_radius=ginn_config.patch_radius,
         domain_extras={"velocity_mps": velocity},
         cache_size=ginn_config.cache_size,
+        seismic_feature_mode=ginn_config.seismic_feature_mode,
+        seismic_balance_window_samples=ginn_config.seismic_balance_window_samples,
+        seismic_balance_floor_fraction=ginn_config.seismic_balance_floor_fraction,
     )
     candidates = candidate_patch_keys(
         lfm.log_ai, lfm.valid_mask, patch_radius=ginn_config.patch_radius, orientations=ginn_config.orientations

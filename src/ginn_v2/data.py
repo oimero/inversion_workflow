@@ -21,6 +21,33 @@ from cup.seismic.geometry import SampleAxis, SurveyLineGeometry
 
 
 Orientation = Literal["inline", "xline"]
+SeismicFeatureMode = Literal["global_trace_normalized", "local_amplitude_balanced"]
+
+
+def _local_amplitude_balanced_trace(
+    trace: np.ndarray,
+    support: np.ndarray,
+    *,
+    window_samples: int,
+    floor_fraction: float,
+) -> np.ndarray:
+    values = np.asarray(trace, dtype=np.float64)
+    valid = np.asarray(support, dtype=bool)
+    kernel = np.ones(int(window_samples), dtype=np.float64)
+    weights = valid.astype(np.float64)
+    count = np.convolve(weights, kernel, mode="same")
+    total = np.convolve(np.where(valid, values, 0.0), kernel, mode="same")
+    total_square = np.convolve(np.where(valid, np.square(values), 0.0), kernel, mode="same")
+    mean = np.divide(total, count, out=np.zeros_like(total), where=count > 0.0)
+    variance = np.maximum(
+        np.divide(total_square, count, out=np.zeros_like(total_square), where=count > 0.0) - np.square(mean),
+        0.0,
+    )
+    global_scale = float(np.sqrt(np.mean(np.square(values[valid] - np.mean(values[valid])))))
+    denominator = np.maximum(np.sqrt(variance), float(floor_fraction) * global_scale)
+    output = np.zeros(values.shape, dtype=np.float32)
+    output[valid] = ((values[valid] - mean[valid]) / denominator[valid]).astype(np.float32)
+    return output
 
 
 def _finite_float_array(value: object, *, name: str, ndim: int | None = None) -> np.ndarray:
@@ -263,17 +290,35 @@ class PatchReader:
         patch_radius: int,
         domain_extras: Mapping[str, np.ndarray] | None = None,
         cache_size: int = 256,
+        seismic_feature_mode: SeismicFeatureMode = "global_trace_normalized",
+        seismic_balance_window_samples: int = 61,
+        seismic_balance_floor_fraction: float = 0.10,
     ) -> None:
         if isinstance(patch_radius, bool) or int(patch_radius) != patch_radius or patch_radius < 1:
             raise ValueError("patch_radius must be a positive integer.")
         if isinstance(cache_size, bool) or int(cache_size) < 0:
             raise ValueError("cache_size must be a non-negative integer.")
+        if seismic_feature_mode not in {"global_trace_normalized", "local_amplitude_balanced"}:
+            raise ValueError("Unsupported seismic_feature_mode.")
+        if (
+            isinstance(seismic_balance_window_samples, bool)
+            or int(seismic_balance_window_samples) < 3
+            or int(seismic_balance_window_samples) % 2 == 0
+        ):
+            raise ValueError("seismic_balance_window_samples must be an odd integer of at least three.")
+        if not 0.0 < float(seismic_balance_floor_fraction) < 1.0:
+            raise ValueError("seismic_balance_floor_fraction must be within (0, 1).")
+        if int(seismic_balance_window_samples) > sample_axis.values.size:
+            raise ValueError("seismic_balance_window_samples exceeds the SampleAxis length.")
         self.source = source
         self.geometry = source.geometry
         self.sample_axis = sample_axis
         self.patch_radius = int(patch_radius)
         self.width = 2 * self.patch_radius + 1
         self.normalization = normalization
+        self.seismic_feature_mode = seismic_feature_mode
+        self.seismic_balance_window_samples = int(seismic_balance_window_samples)
+        self.seismic_balance_floor_fraction = float(seismic_balance_floor_fraction)
         self.ilines = _finite_float_array(ilines, name="ilines", ndim=1)
         self.xlines = _finite_float_array(xlines, name="xlines", ndim=1)
         self.lfm_log_ai = np.asarray(lfm_log_ai, dtype=np.float64)
@@ -304,6 +349,9 @@ class PatchReader:
                 raise ValueError(f"domain_extras[{name!r}] has no finite support.")
         self._cache_size = int(cache_size)
         self._trace_cache: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
+        self._normalized_trace_cache: OrderedDict[
+            tuple[int, int], tuple[np.ndarray, np.ndarray]
+        ] = OrderedDict()
 
     def _trace(self, index: tuple[int, int]) -> np.ndarray:
         if index in self._trace_cache:
@@ -334,6 +382,37 @@ class PatchReader:
         if not radius <= i < self.ilines.size - radius:
             raise ValueError(f"Xline-oriented PatchKey is too close to an inline edge: {key}")
         return [(i + offset, j) for offset in range(-radius, radius + 1)]
+
+    def _normalized_trace(
+        self,
+        index: tuple[int, int],
+        trace: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        cached = self._normalized_trace_cache.pop(index, None)
+        if cached is not None:
+            self._normalized_trace_cache[index] = cached
+            return cached[0].copy(), cached[1].copy()
+        support = np.isfinite(trace)
+        if np.count_nonzero(support) < 2:
+            raise ValueError(f"Trace {index} has fewer than two finite samples for normalization.")
+        mean = float(np.mean(trace[support]))
+        scale = float(np.sqrt(np.mean(np.square(trace[support] - mean))))
+        if not np.isfinite(scale) or scale <= 0.0:
+            raise ValueError(f"Trace {index} has no positive variance for normalization.")
+        normalized = np.zeros(trace.shape, dtype=np.float32)
+        normalized[support] = ((trace[support] - mean) / scale).astype(np.float32)
+        if self.seismic_feature_mode == "local_amplitude_balanced":
+            normalized = _local_amplitude_balanced_trace(
+                trace,
+                support,
+                window_samples=self.seismic_balance_window_samples,
+                floor_fraction=self.seismic_balance_floor_fraction,
+            )
+        if self._cache_size:
+            self._normalized_trace_cache[index] = (normalized.copy(), support.copy())
+            while len(self._normalized_trace_cache) > self._cache_size:
+                self._normalized_trace_cache.popitem(last=False)
+        return normalized, support
 
     def _xy(self, indices: list[tuple[int, int]]) -> np.ndarray:
         return np.asarray(
@@ -373,19 +452,16 @@ class PatchReader:
             ],
             axis=0,
         )
-        trace_valid = np.isfinite(traces)
-        normalized = np.zeros_like(traces, dtype=np.float32)
-        for row in range(self.width):
-            if row == self.patch_radius and not center_visible:
-                continue
-            support = trace_valid[row]
-            if np.count_nonzero(support) < 2:
-                raise ValueError(f"Trace {indices[row]} has fewer than two finite samples for normalization.")
-            mean = float(np.mean(traces[row, support]))
-            scale = float(np.sqrt(np.mean(np.square(traces[row, support] - mean))))
-            if not np.isfinite(scale) or scale <= 0.0:
-                raise ValueError(f"Trace {indices[row]} has no positive variance for normalization.")
-            normalized[row, support] = ((traces[row, support] - mean) / scale).astype(np.float32)
+        normalized_rows: list[np.ndarray] = []
+        valid_rows: list[np.ndarray] = []
+        for index, trace in zip(indices, traces):
+            normalized_trace, trace_support = self._normalized_trace(index, trace)
+            normalized_rows.append(normalized_trace)
+            valid_rows.append(trace_support)
+        normalized = np.stack(normalized_rows)
+        trace_valid = np.stack(valid_rows)
+        if not center_visible:
+            normalized[self.patch_radius] = 0.0
 
         lfm_patch = np.asarray(self.lfm_log_ai[tuple(np.asarray(indices).T)], dtype=np.float64)
         lfm_valid_patch = np.asarray(self.lfm_valid_mask[tuple(np.asarray(indices).T)], dtype=bool)

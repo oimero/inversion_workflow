@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import asdict
 from datetime import datetime
 import json
 from pathlib import Path
@@ -408,6 +409,9 @@ def main() -> None:
         patch_radius=config.patch_radius,
         domain_extras=domain_extras,
         cache_size=config.cache_size,
+        seismic_feature_mode=config.seismic_feature_mode,
+        seismic_balance_window_samples=config.seismic_balance_window_samples,
+        seismic_balance_floor_fraction=config.seismic_balance_floor_fraction,
     )
     candidates = candidate_patch_keys(
         lfm.log_ai,
@@ -466,6 +470,12 @@ def main() -> None:
             "sample_axis": sample_axis.describe(),
             "depth_basis": workflow.seismic.depth_basis,
             "body_smoothing_fwhm_m": config.body_smoothing_fwhm_m,
+            "visibility_compensation": asdict(config.visibility),
+            "seismic_feature": {
+                "mode": config.seismic_feature_mode,
+                "balance_window_samples": config.seismic_balance_window_samples,
+                "balance_floor_fraction": config.seismic_balance_floor_fraction,
+            },
             "lfm_input_normalization": {
                 "lfm_mean": normalization.lfm_mean,
                 "lfm_scale": normalization.lfm_scale,

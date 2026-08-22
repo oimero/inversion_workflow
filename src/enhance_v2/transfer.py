@@ -10,6 +10,7 @@ import numpy as np
 from cup.seismic.geometry import LineAxis, SampleAxis, SurveyLineGeometry
 
 from .contracts import (
+    ResidualFieldResult,
     ResidualTextureLibrary,
     ResidualTransferPolicy,
     ResidualTransferResult,
@@ -642,6 +643,103 @@ def solve_spatial_weight_field(
     return weights
 
 
+def _sparsify_weights(weights: np.ndarray, *, top_k: int) -> np.ndarray:
+    """Keep the strongest ``top_k`` atoms in each already-coupled weight row."""
+
+    values = np.asarray(weights, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] == 0:
+        raise ValueError("weights must be a non-empty 2-D array.")
+    if isinstance(top_k, bool) or int(top_k) != top_k or int(top_k) < 1:
+        raise ValueError("top_k must be a positive integer.")
+    count = min(int(top_k), values.shape[1])
+    if count == 1:
+        selected = np.argmax(values, axis=1)
+        result = np.zeros_like(values)
+        result[np.arange(values.shape[0]), selected] = 1.0
+        return result
+    selected = np.argpartition(values, -count, axis=1)[:, -count:]
+    result = np.zeros_like(values)
+    rows = np.arange(values.shape[0])[:, None]
+    result[rows, selected] = values[rows, selected]
+    row_sum = np.sum(result, axis=1, keepdims=True)
+    if np.any(row_sum <= 0.0):
+        raise ValueError("Sparse dictionary rows must retain positive weight.")
+    return result / row_sum
+
+
+def _lateral_label_switch_fraction(
+    labels: np.ndarray,
+    edges: list[tuple[int, int, float, str]],
+) -> float:
+    lateral = [(left, right) for left, right, _weight, kind in edges if kind == "lateral"]
+    if not lateral:
+        return 0.0
+    switches = sum(int(labels[left] != labels[right]) for left, right in lateral)
+    return float(switches / len(lateral))
+
+
+def solve_spatial_label_field(
+    initial_weights: np.ndarray,
+    edges: list[tuple[int, int, float, str]],
+    nodes: list[_QueryNode],
+    library: ResidualTextureLibrary,
+    *,
+    continuity_strength: float,
+    iterations: int,
+) -> np.ndarray:
+    """Select one atom per node with a lateral Potts continuity term.
+
+    The unary term remains the body-key dictionary likelihood.  Only lateral
+    graph edges receive the same-label preference; vertically adjacent
+    windows retain independent labels and are joined by partition-of-unity
+    stitching.
+    """
+
+    weights = np.asarray(initial_weights, dtype=np.float64)
+    if weights.ndim != 2 or weights.shape != (len(nodes), len(library.atoms)):
+        raise ValueError("initial_weights shape differs from nodes/library.")
+    strength = float(continuity_strength)
+    if not np.isfinite(strength) or strength <= 0.0:
+        raise ValueError("continuity_strength must be finite and positive.")
+    if isinstance(iterations, bool) or int(iterations) != iterations or int(iterations) < 1:
+        raise ValueError("iterations must be a positive integer.")
+
+    labels = np.argmax(weights, axis=1).astype(np.int64)
+    unary = -np.log(np.maximum(weights, np.finfo(np.float64).tiny))
+    neighbors: list[list[tuple[int, float]]] = [[] for _ in nodes]
+    for left, right, edge_weight, kind in edges:
+        if kind != "lateral":
+            continue
+        coefficient = strength * float(edge_weight)
+        if coefficient <= 0.0:
+            continue
+        neighbors[left].append((right, coefficient))
+        neighbors[right].append((left, coefficient))
+
+    zone_indices = {
+        zone_id: library.atom_indices_for_zone(zone_id)
+        for zone_id in library.zone_ids
+    }
+    for iteration in range(int(iterations)):
+        changed = 0
+        order = range(len(nodes)) if iteration % 2 == 0 else range(len(nodes) - 1, -1, -1)
+        for row in order:
+            candidates = zone_indices[nodes[row].zone_id]
+            costs = unary[row, candidates].copy()
+            for neighbor, coefficient in neighbors[row]:
+                costs += coefficient
+                same = np.flatnonzero(candidates == labels[neighbor])
+                if same.size:
+                    costs[int(same[0])] -= coefficient
+            selected = int(candidates[int(np.argmin(costs))])
+            if selected != int(labels[row]):
+                labels[row] = selected
+                changed += 1
+        if changed == 0:
+            break
+    return labels
+
+
 def _vertical_residual_terms(
     edges: list[tuple[int, int, float, str]],
     nodes: list[_QueryNode],
@@ -713,6 +811,9 @@ def _node_values_and_transforms(
     weights: np.ndarray,
     library: ResidualTextureLibrary,
     axis: np.ndarray,
+    *,
+    collect_details: bool = True,
+    preserve_mixture_energy: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float], dict[str, float]]:
     local_axis = axis[node.sample_indices]
     residual = np.zeros(local_axis.shape, dtype=np.float64)
@@ -720,6 +821,8 @@ def _node_values_and_transforms(
     active_weight_square = np.zeros(local_axis.shape, dtype=np.float64)
     transform_values = {"shift": 0.0, "stretch": 0.0, "amplitude": 0.0}
     source_weight: dict[str, float] = {}
+    component_rms_weighted = 0.0
+    component_weight = 0.0
     for atom_index, weight in enumerate(weights):
         if weight <= 0.0:
             continue
@@ -735,12 +838,23 @@ def _node_values_and_transforms(
         residual[valid] += float(weight) * transformed[valid]
         active_weight[valid] += float(weight)
         active_weight_square[valid] += float(weight) ** 2
-        transform_values["shift"] += float(weight) * params.shift
-        transform_values["stretch"] += float(weight) * params.stretch
-        transform_values["amplitude"] += float(weight) * params.amplitude
-        source_weight[atom.source_well] = source_weight.get(atom.source_well, 0.0) + float(weight)
+        if preserve_mixture_energy and np.any(valid):
+            component_rms_weighted += float(weight) * float(
+                np.sqrt(np.mean(np.square(transformed[valid])))
+            )
+            component_weight += float(weight)
+        if collect_details:
+            transform_values["shift"] += float(weight) * params.shift
+            transform_values["stretch"] += float(weight) * params.stretch
+            transform_values["amplitude"] += float(weight) * params.amplitude
+            source_weight[atom.source_well] = source_weight.get(atom.source_well, 0.0) + float(weight)
     occupied = active_weight > np.finfo(np.float64).tiny
     residual[occupied] /= active_weight[occupied]
+    if preserve_mixture_energy and component_weight > 0.0 and np.any(occupied):
+        target_rms = component_rms_weighted / component_weight
+        mixed_rms = float(np.sqrt(np.mean(np.square(residual[occupied]))))
+        if mixed_rms > library.scale_contract.denominator_floor:
+            residual[occupied] *= target_rms / mixed_rms
     effective = np.zeros(local_axis.shape, dtype=np.float64)
     effective[occupied] = np.square(active_weight[occupied]) / np.maximum(
         active_weight_square[occupied], np.finfo(np.float64).tiny
@@ -756,6 +870,8 @@ def _stitch_nodes(
     half_width: float,
     *,
     project: bool,
+    collect_node_details: bool = True,
+    preserve_mixture_energy: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], list[dict[str, float]], list[dict[str, float]]]:
     values = np.zeros((target.n_lateral, target.n_sample), dtype=np.float64)
     denominator = np.zeros_like(values)
@@ -765,11 +881,17 @@ def _stitch_nodes(
     source_summaries: list[dict[str, float]] = []
     for node, weights in zip(nodes, node_weights):
         local, local_effective, transform_summary, source_summary = _node_values_and_transforms(
-            node, weights, library, target.axis.values
+            node,
+            weights,
+            library,
+            target.axis.values,
+            collect_details=collect_node_details,
+            preserve_mixture_energy=preserve_mixture_energy,
         )
-        local_values.append(local)
-        transform_summaries.append(transform_summary)
-        source_summaries.append(source_summary)
+        if collect_node_details:
+            local_values.append(local)
+            transform_summaries.append(transform_summary)
+            source_summaries.append(source_summary)
         distances = np.abs(target.axis.values[node.sample_indices] - node.center_m)
         window_weight = 0.5 * (1.0 + np.cos(np.pi * distances / max(half_width, np.finfo(np.float64).tiny)))
         window_weight = np.where(distances <= half_width + 1.0e-10, window_weight, 0.0)
@@ -1016,6 +1138,84 @@ def _amplitude_diagnostics(
     }
 
 
+def transfer_residual_field(
+    ginn_body: Any,
+    geometry: Any,
+    library: ResidualTextureLibrary,
+    policy: ResidualTransferPolicy | Mapping[str, Any] | None = None,
+) -> ResidualFieldResult:
+    """Transfer only the production residual field and effective count.
+
+    This interface shares the exact key, graph, analytic transform, spatial
+    solver, stitching, and residual projection used by
+    :func:`transfer_residual_texture`. It omits prototype-only baselines,
+    temperature sweeps, per-node records, and donor diagnostics so a survey
+    can be processed section by section without multiplying runtime or memory.
+    """
+
+    if not isinstance(library, ResidualTextureLibrary):
+        raise TypeError("library must be a ResidualTextureLibrary.")
+    transfer_policy = ResidualTransferPolicy.from_any(policy)
+    if (
+        transfer_policy.section_orientation is not None
+        and _field(geometry, "orientation", "section_orientation", default=None) is None
+    ):
+        if isinstance(geometry, Mapping):
+            geometry = dict(geometry)
+            geometry["orientation"] = transfer_policy.section_orientation
+        else:
+            geometry = TransferGeometry(
+                sample_axis=_field(geometry, "sample_axis", default=None),
+                line_geometry=_as_line_geometry(geometry),
+                orientation=transfer_policy.section_orientation,
+            )
+    target = _prepare_target(ginn_body, geometry, library, transfer_policy)
+    nodes, _encoder, half_width, spacing = _build_query_nodes(
+        target,
+        library,
+        transfer_policy,
+    )
+    edges = _node_edges(nodes, target, library, transfer_policy, half_width, spacing)
+    initial_weights = _initial_weights(
+        nodes,
+        library,
+        temperature_multiplier=transfer_policy.temperature_multiplier,
+    )
+    if transfer_policy.spatial_coupling:
+        vertical_residual_terms = (
+            _vertical_residual_terms(edges, nodes, target, library)
+            if transfer_policy.lambda_vertical > 0.0
+            else None
+        )
+        spatial_weights = solve_spatial_weight_field(
+            initial_weights,
+            edges,
+            lambda_lateral=transfer_policy.lambda_lateral,
+            lambda_vertical=transfer_policy.lambda_vertical,
+            iterations=transfer_policy.spatial_iterations,
+            vertical_residual_terms=vertical_residual_terms,
+        )
+    else:
+        spatial_weights = initial_weights
+    predicted_flat, effective_flat, _local, _transforms, _sources = _stitch_nodes(
+        nodes,
+        spatial_weights,
+        target,
+        library,
+        half_width,
+        project=True,
+        collect_node_details=False,
+    )
+    predicted_flat[~target.flat_support] = 0.0
+    return ResidualFieldResult(
+        predicted_residual=_field_from_flat(predicted_flat, target),
+        effective_dictionary_count=_field_from_flat(effective_flat, target),
+        support=_field_from_flat(target.flat_support, target).astype(bool),
+        node_count=len(nodes),
+        graph_edge_count=len(edges),
+    )
+
+
 def transfer_residual_texture(
     ginn_body: Any,
     geometry: Any,
@@ -1103,6 +1303,62 @@ def transfer_residual_texture(
         half_width,
         project=True,
     )
+    hard_unprojected_flat, _hard_raw_effective, _hard_raw_local, _hard_raw_transforms, _hard_raw_sources = _stitch_nodes(
+        nodes,
+        hard_weights,
+        target,
+        library,
+        half_width,
+        project=False,
+    )
+    spatial_sparse_weights = _sparsify_weights(spatial_weights, top_k=2)
+    spatial_sparse_flat, _sparse_effective, _sparse_local, _sparse_transforms, _sparse_sources = _stitch_nodes(
+        nodes,
+        spatial_sparse_weights,
+        target,
+        library,
+        half_width,
+        project=False,
+    )
+    spatial_sparse_energy_flat, _energy_effective, _energy_local, _energy_transforms, _energy_sources = _stitch_nodes(
+        nodes,
+        spatial_sparse_weights,
+        target,
+        library,
+        half_width,
+        project=False,
+        preserve_mixture_energy=True,
+    )
+    spatial_dominant_weights = _sparsify_weights(spatial_weights, top_k=1)
+    spatial_dominant_flat, _dominant_effective, _dominant_local, _dominant_transforms, _dominant_sources = _stitch_nodes(
+        nodes,
+        spatial_dominant_weights,
+        target,
+        library,
+        half_width,
+        project=False,
+    )
+    graph_labels = solve_spatial_label_field(
+        initial_weights,
+        edges,
+        nodes,
+        library,
+        continuity_strength=(
+            transfer_policy.lambda_lateral
+            * transfer_policy.label_continuity_strength
+        ),
+        iterations=transfer_policy.label_iterations,
+    )
+    graph_dominant_weights = np.zeros_like(initial_weights)
+    graph_dominant_weights[np.arange(graph_dominant_weights.shape[0]), graph_labels] = 1.0
+    graph_dominant_flat, _graph_effective, _graph_local, _graph_transforms, _graph_sources = _stitch_nodes(
+        nodes,
+        graph_dominant_weights,
+        target,
+        library,
+        half_width,
+        project=False,
+    )
     uniform_weights = np.zeros_like(initial_weights)
     for row, node in enumerate(nodes):
         indices = library.atom_indices_for_zone(node.zone_id)
@@ -1119,6 +1375,11 @@ def transfer_residual_texture(
     predicted_flat[~target.flat_support] = 0.0
     soft_flat[~target.flat_support] = 0.0
     hard_flat[~target.flat_support] = 0.0
+    hard_unprojected_flat[~target.flat_support] = 0.0
+    spatial_sparse_flat[~target.flat_support] = 0.0
+    spatial_sparse_energy_flat[~target.flat_support] = 0.0
+    spatial_dominant_flat[~target.flat_support] = 0.0
+    graph_dominant_flat[~target.flat_support] = 0.0
     uniform_flat[~target.flat_support] = 0.0
     enhanced_flat = target.flat_body.copy()
     enhanced_flat[target.flat_support] += predicted_flat[target.flat_support]
@@ -1189,6 +1450,18 @@ def transfer_residual_texture(
         "node_zone_id": np.asarray([node.zone_id for node in nodes], dtype=object),
         "node_records": node_records,
         "n_graph_edges": int(len(edges)),
+        "initial_hard_lateral_label_switch_fraction": _lateral_label_switch_fraction(
+            np.argmax(initial_weights, axis=1),
+            edges,
+        ),
+        "spatial_dominant_lateral_label_switch_fraction": _lateral_label_switch_fraction(
+            np.argmax(spatial_weights, axis=1),
+            edges,
+        ),
+        "graph_dominant_lateral_label_switch_fraction": _lateral_label_switch_fraction(
+            graph_labels,
+            edges,
+        ),
         "initial_weight_uniform_variance": _weight_uniform_variance(initial_weights, nodes, library),
         "temperature_sweep": _summary_temperature_sweep(
             nodes,
@@ -1212,7 +1485,22 @@ def transfer_residual_texture(
         soft_residual=_field_from_flat(soft_flat, target),
         hard_nearest_residual=_field_from_flat(hard_flat, target),
         uniform_residual=_field_from_flat(uniform_flat, target),
+        residual_variants={
+            "hard_nearest_unprojected": _field_from_flat(hard_unprojected_flat, target),
+            "spatial_top2_unprojected": _field_from_flat(spatial_sparse_flat, target),
+            "spatial_top2_energy_preserved_unprojected": _field_from_flat(
+                spatial_sparse_energy_flat,
+                target,
+            ),
+            "spatial_dominant_unprojected": _field_from_flat(spatial_dominant_flat, target),
+            "graph_dominant_unprojected": _field_from_flat(graph_dominant_flat, target),
+        },
     )
 
 
-__all__ = ["solve_spatial_weight_field", "transfer_residual_texture"]
+__all__ = [
+    "solve_spatial_label_field",
+    "solve_spatial_weight_field",
+    "transfer_residual_field",
+    "transfer_residual_texture",
+]

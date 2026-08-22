@@ -29,11 +29,12 @@ from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.target_zone_io import build_workflow_target_zone
 from cup.utils.io import load_yaml_config, resolve_relative_path, write_json
 from cup.utils.logging import configure_run_logger
-from cup.well.real_field_controls import WellControl, WellControlSet, load_well_control_set
+from cup.well.real_field_controls import load_well_control_set
 from enhance_v2.artifacts import library_summary, result_summary
 from enhance_v2.contracts import ResidualTransferPolicy, ScaleContract, TransferGeometry
 from enhance_v2.library import build_residual_library
 from enhance_v2.transfer import transfer_residual_texture
+from enhance_v2.workflow import select_controls, well_zone_intervals
 from ginn_v2.adapters import DepthDomainAdapter, TimeDomainAdapter
 from ginn_v2.checkpoint import load_checkpoint
 from ginn_v2.data import PatchReader, SurveyTraceSource, candidate_patch_keys, fit_lfm_normalization
@@ -48,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--max-traces", type=int, default=None)
     parser.add_argument("--orientations", nargs="+", choices=("inline", "xline"), default=None)
+    parser.add_argument("--single-temperature", action="store_true")
     return parser.parse_args()
 
 
@@ -62,56 +64,6 @@ def _resolve_output_dir(value: Path | None) -> Path:
         return resolve_relative_path(value, root=REPO_ROOT)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return REPO_ROOT / "experiments" / "enhance_v2" / "results" / timestamp
-
-
-def _trusted_controls(controls: WellControlSet, names: tuple[str, ...]) -> WellControlSet:
-    by_name = {item.well_name.casefold(): item for item in controls.controls}
-    selected: list[WellControl] = []
-    for name in names:
-        control = by_name.get(name.casefold())
-        if control is None:
-            raise ValueError(f"Trusted GINN well is absent from WellControlSet: {name}")
-        selected.append(control)
-    return WellControlSet(
-        sample_axis=controls.sample_axis,
-        controls=tuple(selected),
-        sample_domain=controls.sample_domain,
-        sample_unit=controls.sample_unit,
-        depth_basis=controls.depth_basis,
-        source_run_type=controls.source_run_type,
-        provenance=controls.provenance,
-    )
-
-
-def _well_zone_intervals(
-    controls: WellControlSet,
-    target_zone: Any,
-) -> dict[str, dict[str, tuple[float, float]]]:
-    intervals_by_well: dict[str, dict[str, tuple[float, float]]] = {}
-    for control in controls.controls:
-        axis = np.asarray(control.sample_axis.values, dtype=np.float64)
-        position_valid = np.isfinite(control.inline_by_sample) & np.isfinite(control.xline_by_sample)
-        markers: list[tuple[str, float]] = []
-        for horizon_name in target_zone.horizon_names:
-            local_horizon = np.full(axis.shape, np.nan, dtype=np.float64)
-            for index in np.flatnonzero(position_valid):
-                local_horizon[index] = target_zone.get_horizon_interpretation_at_location(
-                    horizon_name,
-                    float(control.inline_by_sample[index]),
-                    float(control.xline_by_sample[index]),
-                )
-            candidates = np.flatnonzero(np.isfinite(local_horizon))
-            if candidates.size == 0:
-                raise ValueError(f"{control.well_name}: horizon {horizon_name!r} has no well-path support.")
-            selected = int(candidates[np.argmin(np.abs(axis[candidates] - local_horizon[candidates]))])
-            markers.append((horizon_name, float(axis[selected])))
-        if any(markers[index + 1][1] <= markers[index][1] for index in range(len(markers) - 1)):
-            raise ValueError(f"{control.well_name}: target horizons are not ordered along the well path.")
-        intervals_by_well[control.well_name] = {
-            f"{top_name}__to__{bottom_name}": (top, bottom)
-            for (top_name, top), (bottom_name, bottom) in zip(markers[:-1], markers[1:])
-        }
-    return intervals_by_well
 
 
 def _section_geometry(
@@ -252,6 +204,99 @@ def _plot_comparison(
     plt.close(figure)
 
 
+def _residual_field_metrics(values: np.ndarray, support: np.ndarray) -> dict[str, float]:
+    selected = np.asarray(support, dtype=bool)
+    residual = np.asarray(values, dtype=np.float64)
+    local = residual[selected]
+    paired = selected[:-1] & selected[1:]
+    differences = (residual[1:] - residual[:-1])[paired]
+    return {
+        "rms": float(np.sqrt(np.mean(np.square(local)))) if local.size else 0.0,
+        "absolute_p95": float(np.quantile(np.abs(local), 0.95)) if local.size else 0.0,
+        "lateral_difference_rms": (
+            float(np.sqrt(np.mean(np.square(differences)))) if differences.size else 0.0
+        ),
+    }
+
+
+def _plot_amplitude_continuity_comparison(
+    result: Any,
+    distance_m: np.ndarray,
+    sample_axis: np.ndarray,
+    horizons: Mapping[str, np.ndarray],
+    path: Path,
+    *,
+    dpi: int,
+) -> dict[str, dict[str, float]]:
+    import matplotlib.pyplot as plt
+
+    support = np.asarray(result.support, dtype=bool)
+    crop = _finite_crop(support)
+    variants = [
+        ("current spatial soft\nprojected", np.asarray(result.predicted_residual)),
+        ("local hard-nearest\nunprojected", np.asarray(result.residual_variants["hard_nearest_unprojected"])),
+        ("spatial top-2\nunprojected", np.asarray(result.residual_variants["spatial_top2_unprojected"])),
+        (
+            "spatial top-2 energy-preserved\nunprojected",
+            np.asarray(result.residual_variants["spatial_top2_energy_preserved_unprojected"]),
+        ),
+    ]
+    metrics = {
+        label.replace("\n", " "): _residual_field_metrics(values, support)
+        for label, values in variants
+    }
+    residual_values = np.concatenate([np.abs(values[support]) for _label, values in variants])
+    residual_limit = max(float(np.quantile(residual_values, 0.995)), 1.0e-6)
+    enhanced = [np.asarray(result.ginn_body) + values for _label, values in variants]
+    body_values = np.concatenate(
+        [np.asarray(result.ginn_body)[support], *[values[support] for values in enhanced]]
+    )
+    body_min, body_max = np.quantile(body_values, [0.01, 0.99]).astype(float)
+
+    figure, axes = plt.subplots(2, 4, figsize=(19.0, 9.0), sharex=True, sharey=True)
+    for column, ((label, residual), enhanced_field) in enumerate(zip(variants, enhanced)):
+        local_metrics = metrics[label.replace("\n", " ")]
+        residual_image = _plot_field(
+            axes[0, column], residual, support, distance_m, sample_axis, crop,
+            cmap="RdBu_r", vmin=-residual_limit, vmax=residual_limit,
+            title=(
+                f"{label}\nRMS={local_metrics['rms']:.4f}, "
+                f"lateral Δ={local_metrics['lateral_difference_rms']:.4f}"
+            ),
+        )
+        body_image = _plot_field(
+            axes[1, column], enhanced_field, support, distance_m, sample_axis, crop,
+            cmap="viridis", vmin=body_min, vmax=body_max, title="body + residual",
+        )
+        for current in (axes[0, column], axes[1, column]):
+            for horizon in horizons.values():
+                current.plot(
+                    distance_m / 1000.0,
+                    horizon,
+                    color="black",
+                    linewidth=0.8,
+                    alpha=0.75,
+                )
+    figure.colorbar(
+        residual_image,
+        ax=axes[0, :].tolist(),
+        fraction=0.015,
+        pad=0.015,
+        label="residual log-AI",
+    )
+    figure.colorbar(
+        body_image,
+        ax=axes[1, :].tolist(),
+        fraction=0.015,
+        pad=0.015,
+        label="log-AI",
+    )
+    figure.suptitle("Residual amplitude versus lateral continuity")
+    figure.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(figure)
+    return metrics
+
+
 def _plot_weights(
     result: Any,
     distance_m: np.ndarray,
@@ -373,7 +418,7 @@ def main() -> None:
         raise FileNotFoundError(checkpoint_path)
 
     controls = load_well_control_set(well_control_run_dir, repo_root=REPO_ROOT)
-    selected_controls = _trusted_controls(controls, tuple(ginn_config.trusted_well_names))
+    selected_controls = select_controls(controls, tuple(ginn_config.trusted_well_names))
     lfm = load_lfm_input(
         {"lfm_run_dir": str(lfm_run_dir), "variant_id": variant_id, "well_control_run_dir": str(well_control_run_dir)},
         repo_root=REPO_ROOT,
@@ -448,7 +493,7 @@ def main() -> None:
         model, reader, adapter, projector=trainer.projector, device=trainer.device, batch_size=ginn_config.batch_size
     )
 
-    zone_intervals_by_well = _well_zone_intervals(selected_controls, target_zone)
+    zone_intervals_by_well = well_zone_intervals(selected_controls, target_zone)
     scale_contract = ScaleContract.from_any(
         {
             **dict(dictionary_config),
@@ -487,7 +532,12 @@ def main() -> None:
             keys, body, valid_mask, reader=reader, target_zone=target_zone, orientation=orientation
         )
         temperature_results: dict[float, Any] = {}
-        for multiplier in policy.temperature_multipliers:
+        multipliers = (
+            (policy.temperature_multiplier,)
+            if args.single_temperature
+            else policy.temperature_multipliers
+        )
+        for multiplier in multipliers:
             logger.info("%s transfer | temperature_multiplier=%.3f", orientation, multiplier)
             temperature_results[float(multiplier)] = transfer_residual_texture(
                 body,
@@ -499,12 +549,25 @@ def main() -> None:
         _plot_comparison(
             result, distance_m, sample_axis.values, horizons, section_dir / "comparison.png", dpi=dpi
         )
+        sparse_variant_metrics = _plot_amplitude_continuity_comparison(
+            result,
+            distance_m,
+            sample_axis.values,
+            horizons,
+            section_dir / "amplitude_continuity_comparison.png",
+            dpi=dpi,
+        )
         _plot_weights(
             result, distance_m, sample_axis.values, section_dir / "weights_and_continuity.png", dpi=dpi
         )
-        _plot_temperature_sweep(
-            temperature_results, distance_m, sample_axis.values, section_dir / "temperature_sweep.png", dpi=dpi
-        )
+        if len(temperature_results) > 1:
+            _plot_temperature_sweep(
+                temperature_results,
+                distance_m,
+                sample_axis.values,
+                section_dir / "temperature_sweep.png",
+                dpi=dpi,
+            )
         arrays: dict[str, Any] = {
             "sample_axis": sample_axis.values,
             "lateral_distance_m": distance_m,
@@ -517,6 +580,8 @@ def main() -> None:
             "effective_dictionary_count": result.effective_dictionary_count,
             "support": result.support,
         }
+        for name, values in result.residual_variants.items():
+            arrays[f"variant_{name}"] = values
         for multiplier, temperature_result in temperature_results.items():
             arrays[f"temperature_{multiplier:g}_residual"] = temperature_result.predicted_residual
         for name, values in horizons.items():
@@ -531,9 +596,31 @@ def main() -> None:
                 str(multiplier): result_summary(item)
                 for multiplier, item in temperature_results.items()
             },
+            "amplitude_continuity_variants": sparse_variant_metrics,
+            "initial_hard_lateral_label_switch_fraction": float(
+                result.dictionary_weight_summary[
+                    "initial_hard_lateral_label_switch_fraction"
+                ]
+            ),
+            "spatial_dominant_lateral_label_switch_fraction": float(
+                result.dictionary_weight_summary[
+                    "spatial_dominant_lateral_label_switch_fraction"
+                ]
+            ),
+            "graph_dominant_lateral_label_switch_fraction": float(
+                result.dictionary_weight_summary[
+                    "graph_dominant_lateral_label_switch_fraction"
+                ]
+            ),
             "figures": [
-                str((section_dir / name).relative_to(REPO_ROOT))
-                for name in ("comparison.png", "weights_and_continuity.png", "temperature_sweep.png")
+                str(path.relative_to(REPO_ROOT))
+                for path in (
+                    section_dir / "comparison.png",
+                    section_dir / "amplitude_continuity_comparison.png",
+                    section_dir / "weights_and_continuity.png",
+                    section_dir / "temperature_sweep.png",
+                )
+                if path.is_file()
             ],
         }
         logger.info(
@@ -545,7 +632,9 @@ def main() -> None:
     write_json(output_dir / "run_summary.json", run_summary)
     print("=== Enhance V2 conditional residual texture prototype ===")
     print(f"Output: {output_dir}")
-    print("Figures: comparison.png, weights_and_continuity.png, temperature_sweep.png")
+    print("Figures: comparison.png, amplitude_continuity_comparison.png, weights_and_continuity.png")
+    if not args.single_temperature:
+        print("Temperature figure: temperature_sweep.png")
 
 
 if __name__ == "__main__":

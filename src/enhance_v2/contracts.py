@@ -193,6 +193,8 @@ class ResidualTransferPolicy:
     lambda_vertical: float = 0.25
     spatial_iterations: int = 12
     spatial_coupling: bool = True
+    label_continuity_strength: float = 2.0
+    label_iterations: int = 8
     window_half_width_m: float | None = None
     window_center_spacing_m: float | None = None
     min_window_samples: int | None = None
@@ -208,6 +210,14 @@ class ResidualTransferPolicy:
         object.__setattr__(self, "temperature_multipliers", multipliers)
         object.__setattr__(self, "lateral_correlation_length_m", _finite_positive(self.lateral_correlation_length_m, name="lateral_correlation_length_m"))
         object.__setattr__(self, "key_edge_scale", _finite_positive(self.key_edge_scale, name="key_edge_scale"))
+        object.__setattr__(
+            self,
+            "label_continuity_strength",
+            _finite_positive(
+                self.label_continuity_strength,
+                name="label_continuity_strength",
+            ),
+        )
         for name in ("lambda_lateral", "lambda_vertical"):
             value = float(getattr(self, name))
             if not np.isfinite(value) or value < 0.0:
@@ -216,6 +226,13 @@ class ResidualTransferPolicy:
         if isinstance(self.spatial_iterations, bool) or int(self.spatial_iterations) != self.spatial_iterations or int(self.spatial_iterations) < 0:
             raise ValueError("spatial_iterations must be a non-negative integer.")
         object.__setattr__(self, "spatial_iterations", int(self.spatial_iterations))
+        if (
+            isinstance(self.label_iterations, bool)
+            or int(self.label_iterations) != self.label_iterations
+            or int(self.label_iterations) < 1
+        ):
+            raise ValueError("label_iterations must be a positive integer.")
+        object.__setattr__(self, "label_iterations", int(self.label_iterations))
         for name in ("window_half_width_m", "window_center_spacing_m", "edge_key_distance_max"):
             value = getattr(self, name)
             if value is not None:
@@ -410,6 +427,7 @@ class ResidualTransferResult:
     soft_residual: np.ndarray | None = None
     hard_nearest_residual: np.ndarray | None = None
     uniform_residual: np.ndarray | None = None
+    residual_variants: Mapping[str, np.ndarray] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         body = np.asarray(self.ginn_body, dtype=np.float64)
@@ -445,6 +463,19 @@ class ResidualTransferResult:
             if uniform.shape != body.shape:
                 raise ValueError("uniform_residual must match ginn_body shape.")
             object.__setattr__(self, "uniform_residual", uniform)
+        variants: dict[str, np.ndarray] = {}
+        for name, raw_values in self.residual_variants.items():
+            values = np.asarray(raw_values, dtype=np.float64)
+            if values.shape != body.shape or np.any(~np.isfinite(values)):
+                raise ValueError(
+                    f"residual_variants[{name!r}] must be finite and match ginn_body shape."
+                )
+            if np.any(values[~support] != 0.0):
+                raise ValueError(
+                    f"residual_variants[{name!r}] must be zero outside transfer support."
+                )
+            variants[str(name)] = values
+        object.__setattr__(self, "residual_variants", variants)
 
     @property
     def summary(self) -> dict[str, Any]:
@@ -462,8 +493,60 @@ class ResidualTransferResult:
         }
 
 
+@dataclass(frozen=True)
+class ResidualFieldResult:
+    """Compact transfer result used by section and volume production runs."""
+
+    predicted_residual: np.ndarray
+    effective_dictionary_count: np.ndarray
+    support: np.ndarray
+    node_count: int
+    graph_edge_count: int
+
+    def __post_init__(self) -> None:
+        residual = np.asarray(self.predicted_residual, dtype=np.float64)
+        effective = np.asarray(self.effective_dictionary_count, dtype=np.float64)
+        support = np.asarray(self.support, dtype=bool)
+        if residual.shape != effective.shape or residual.shape != support.shape:
+            raise ValueError("ResidualFieldResult arrays must have matching shapes.")
+        if np.any(~np.isfinite(residual)) or np.any(~np.isfinite(effective[support])):
+            raise ValueError("ResidualFieldResult contains non-finite values.")
+        if np.any(residual[~support] != 0.0) or np.any(effective[support] < 0.0):
+            raise ValueError("ResidualFieldResult support or effective-count contract is invalid.")
+        for name in ("node_count", "graph_edge_count"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or int(value) != value or int(value) < 0:
+                raise ValueError(f"{name} must be a non-negative integer.")
+        object.__setattr__(self, "predicted_residual", residual)
+        object.__setattr__(self, "effective_dictionary_count", effective)
+        object.__setattr__(self, "support", support)
+        object.__setattr__(self, "node_count", int(self.node_count))
+        object.__setattr__(self, "graph_edge_count", int(self.graph_edge_count))
+
+    @property
+    def summary(self) -> dict[str, Any]:
+        selected = self.support
+        return {
+            "shape": [int(value) for value in self.predicted_residual.shape],
+            "support_count": int(np.count_nonzero(selected)),
+            "node_count": int(self.node_count),
+            "graph_edge_count": int(self.graph_edge_count),
+            "residual_rms": (
+                float(np.sqrt(np.mean(np.square(self.predicted_residual[selected]))))
+                if np.any(selected)
+                else 0.0
+            ),
+            "effective_dictionary_count_median": (
+                float(np.median(self.effective_dictionary_count[selected]))
+                if np.any(selected)
+                else 0.0
+            ),
+        }
+
+
 __all__ = [
     "DictionaryAtom",
+    "ResidualFieldResult",
     "ResidualTextureLibrary",
     "ResidualTransferPolicy",
     "ResidualTransferResult",

@@ -40,7 +40,7 @@ def _safe_corr(first: np.ndarray, second: np.ndarray) -> float:
     return float(np.corrcoef(a[valid], b[valid])[0, 1])
 
 
-def _load_depth_forward_inputs(
+def load_depth_forward_inputs(
     run_dir: Path,
     *,
     repo_root: Path,
@@ -74,7 +74,7 @@ def _load_depth_forward_inputs(
     return time_s, amplitude, a, b, path
 
 
-def _forward_finite_runs(
+def forward_depth_finite_runs(
     log_ai: np.ndarray,
     depth_m: np.ndarray,
     *,
@@ -103,7 +103,7 @@ def _forward_finite_runs(
     return output
 
 
-def _sample_seismic_along_control(control: WellControl, survey: Any) -> np.ndarray:
+def sample_seismic_along_control(control: WellControl, survey: Any) -> np.ndarray:
     """Bilinearly sample one seismic value at every well-path/sample intersection."""
 
     needed: set[tuple[int, int]] = set()
@@ -151,7 +151,10 @@ def _sample_seismic_along_control(control: WellControl, survey: Any) -> np.ndarr
     return output
 
 
-def _horizon_markers(control: WellControl, target_zone: TargetZone) -> list[tuple[float, str]]:
+def horizon_markers_along_control(
+    control: WellControl,
+    target_zone: TargetZone,
+) -> list[tuple[float, str]]:
     axis = control.sample_axis.values
     position_valid = np.isfinite(control.inline_by_sample) & np.isfinite(control.xline_by_sample)
     markers: list[tuple[float, str]] = []
@@ -385,7 +388,7 @@ def write_depth_well_control_qc(
     if body_fwhm <= 0.0 or dynamic_window <= 0.0 or not 0.0 < threshold_fraction <= 1.0 or maximum_events < 1:
         raise ValueError("Step 6 QC numeric settings are invalid.")
     wavelet_time, wavelet_amp, relation_a, relation_b, forward_inputs_path = (
-        _load_depth_forward_inputs(forward_inputs_run_dir, repo_root=repo_root)
+        load_depth_forward_inputs(forward_inputs_run_dir, repo_root=repo_root)
     )
 
     figures_root = output_dir / "figures"
@@ -401,8 +404,8 @@ def write_depth_well_control_qc(
             axis,
             fwhm_m=body_fwhm,
         )
-        real = _sample_seismic_along_control(control, survey)
-        full_forward = _forward_finite_runs(
+        real = sample_seismic_along_control(control, survey)
+        full_forward = forward_depth_finite_runs(
             full_log_ai,
             axis,
             wavelet_time_s=wavelet_time,
@@ -410,7 +413,7 @@ def write_depth_well_control_qc(
             relation_a=relation_a,
             relation_b=relation_b,
         )
-        body_forward = _forward_finite_runs(
+        body_forward = forward_depth_finite_runs(
             body_log_ai,
             axis,
             wavelet_time_s=wavelet_time,
@@ -418,7 +421,7 @@ def write_depth_well_control_qc(
             relation_a=relation_a,
             relation_b=relation_b,
         )
-        markers = _horizon_markers(control, target_zone)
+        markers = horizon_markers_along_control(control, target_zone)
         common = (
             control.valid_mask
             & np.isfinite(real)
@@ -542,4 +545,11 @@ def write_depth_well_control_qc(
     return manifest
 
 
-__all__ = ["QC_SCHEMA_VERSION", "write_depth_well_control_qc"]
+__all__ = [
+    "QC_SCHEMA_VERSION",
+    "forward_depth_finite_runs",
+    "horizon_markers_along_control",
+    "load_depth_forward_inputs",
+    "sample_seismic_along_control",
+    "write_depth_well_control_qc",
+]

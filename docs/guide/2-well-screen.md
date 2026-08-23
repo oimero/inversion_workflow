@@ -78,7 +78,7 @@ well_screen:
 
 #### `curve_schema_file`
 
-自定义分类规则的 YAML 文件。不填则使用 `cup.well.mnemonics.CURVE_CATEGORY_MNEMONICS` 内置规则。格式：
+自定义分类规则的 YAML 文件。不填则使用 `cup.well.curves.CURVE_CATEGORY_MNEMONICS` 内置规则。格式：
 
 ```yaml
 categories:

@@ -11,7 +11,6 @@ import sys
 from typing import Any, Mapping
 
 import numpy as np
-import torch
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -21,26 +20,17 @@ for path in (SRC_DIR, SCRIPT_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-import ginn_v2_body_inversion as ginn_entry
-from cup.config.workflow import WorkflowConfig
-from cup.lfm.artifacts import load_lfm_input
-from cup.lfm.math import parse_lowpass_spec
-from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.target_zone_io import build_workflow_target_zone
 from cup.utils.io import load_yaml_config, resolve_relative_path, write_json
 from cup.utils.logging import configure_run_logger
-from cup.well.real_field_controls import load_well_control_set
+from cup.well.controls import load_well_control_set
 from enhance_v2.artifacts import library_summary, result_summary
 from enhance_v2.contracts import ResidualTransferPolicy, ScaleContract, TransferGeometry
 from enhance_v2.library import build_residual_library
 from enhance_v2.transfer import transfer_residual_texture
 from enhance_v2.workflow import select_controls, well_zone_intervals
-from ginn_v2.adapters import DepthDomainAdapter, TimeDomainAdapter
-from ginn_v2.checkpoint import load_checkpoint
-from ginn_v2.data import PatchReader, SurveyTraceSource, candidate_patch_keys, fit_lfm_normalization
-from ginn_v2.inverter import BodyInverter
-from ginn_v2.model import CenterTraceBodyNet
-from ginn_v2.trainer import BodyInversionConfig, BodyInversionTrainer, build_body_inversion_data
+from ginn_v2 import load_body
+from ginn_v2.workflow import load_config
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,7 +61,7 @@ def _section_geometry(
     body: np.ndarray,
     valid_mask: np.ndarray,
     *,
-    reader: PatchReader,
+    reader: Any,
     target_zone: Any,
     orientation: str,
 ) -> tuple[TransferGeometry, np.ndarray, dict[str, np.ndarray]]:
@@ -403,31 +393,21 @@ def main() -> None:
     output_dir.mkdir(parents=True)
     logger = configure_run_logger(output_dir, logger_name="enhance_v2_prototype", file_name="prototype.log")
 
-    raw = ginn_entry._load_composed_config(ginn_config_path)
-    workflow = WorkflowConfig.from_mapping(raw)
-    ginn_section = _required_mapping(raw.get("ginn_v2_body_inversion"), name="ginn_v2_body_inversion")
-    ginn_inputs = _required_mapping(ginn_section.get("inputs"), name="ginn_v2_body_inversion.inputs")
-    ginn_config = BodyInversionConfig.from_mapping(_required_mapping(ginn_section.get("training"), name="ginn training"))
-    lfm_run_dir = resolve_relative_path(str(ginn_inputs["lfm_run_dir"]), root=REPO_ROOT)
-    well_control_run_dir = resolve_relative_path(str(ginn_inputs["well_control_run_dir"]), root=REPO_ROOT)
-    forward_inputs_path = resolve_relative_path(str(ginn_inputs["forward_model_inputs"]), root=REPO_ROOT)
-    variant_id = str(ginn_inputs["variant_id"])
+    raw = load_config(ginn_config_path)
     ginn_run_dir = resolve_relative_path(str(inputs.get("ginn_run_dir") or ""), root=REPO_ROOT)
     checkpoint_path = ginn_run_dir / "selected_checkpoint.pt"
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
-
-    controls = load_well_control_set(well_control_run_dir, repo_root=REPO_ROOT)
+    loaded = load_body(ginn_config_path, checkpoint=checkpoint_path)
+    workflow = loaded.workflow
+    ginn_config = loaded.training_config
+    lfm = loaded.lfm
+    survey = loaded.survey
+    sample_axis = loaded.sample_axis
+    reader = loaded.reader
+    controls = load_well_control_set(loaded.well_control_run_dir, repo_root=REPO_ROOT)
     selected_controls = select_controls(controls, tuple(ginn_config.trusted_well_names))
-    lfm = load_lfm_input(
-        {"lfm_run_dir": str(lfm_run_dir), "variant_id": variant_id, "well_control_run_dir": str(well_control_run_dir)},
-        repo_root=REPO_ROOT,
-    )
     data_root = resolve_relative_path(workflow.data_root, root=REPO_ROOT)
-    seismic_path = resolve_relative_path(workflow.seismic.file, root=data_root)
-    survey_options = segy_options_from_config(workflow.seismic.as_dict()) if workflow.seismic.type == "segy" else {}
-    survey = open_survey(seismic_path, workflow.seismic.type, segy_options=survey_options or None)
-    sample_axis = survey.sample_axis(workflow.seismic.domain)
     if sample_axis.domain != "depth" or sample_axis.depth_basis != "tvdss":
         raise ValueError("The first Enhance V2 prototype requires the current depth/TVDSS workflow.")
     target_zone, horizon_sources = build_workflow_target_zone(
@@ -435,63 +415,6 @@ def main() -> None:
     )
     if not np.array_equal(sample_axis.values, lfm.sample_axis.values) or not np.array_equal(sample_axis.values, controls.sample_axis.values):
         raise ValueError("Seismic, LFM and well-control SampleAxis values differ.")
-
-    baseline_config = dict(lfm.variant.variant_metadata.get("resolved_baseline_config") or {})
-    lfm_lowpass_spec = parse_lowpass_spec(dict(baseline_config.get("filter") or {}), sample_axis)
-    wavelet_time_s, wavelet_amplitude, relation, _forward_payload = ginn_entry._load_forward_inputs(
-        forward_inputs_path, domain=workflow.seismic.domain, depth_basis=workflow.seismic.depth_basis
-    )
-    if relation is None:
-        raise ValueError("Depth prototype requires the frozen AI--Vp relation.")
-    valid = np.asarray(lfm.valid_mask, dtype=bool)
-    velocity = np.full(lfm.log_ai.shape, np.nan, dtype=np.float64)
-    velocity[valid] = relation.velocity_from_ai(np.exp(np.asarray(lfm.log_ai[valid], dtype=np.float64)))
-    adapter = DepthDomainAdapter(
-        torch.as_tensor(wavelet_time_s, dtype=torch.float32),
-        torch.as_tensor(wavelet_amplitude, dtype=torch.float32),
-    )
-    normalization = fit_lfm_normalization(lfm.log_ai, lfm.valid_mask, geometry=survey.line_geometry)
-    source = SurveyTraceSource(survey=survey, sample_axis=sample_axis, geometry=survey.line_geometry)
-    reader = PatchReader(
-        source,
-        lfm_log_ai=lfm.log_ai,
-        lfm_valid_mask=lfm.valid_mask,
-        ilines=lfm.ilines,
-        xlines=lfm.xlines,
-        sample_axis=sample_axis,
-        normalization=normalization,
-        patch_radius=ginn_config.patch_radius,
-        domain_extras={"velocity_mps": velocity},
-        cache_size=ginn_config.cache_size,
-        seismic_feature_mode=ginn_config.seismic_feature_mode,
-        seismic_balance_window_samples=ginn_config.seismic_balance_window_samples,
-        seismic_balance_floor_fraction=ginn_config.seismic_balance_floor_fraction,
-    )
-    candidates = candidate_patch_keys(
-        lfm.log_ai, lfm.valid_mask, patch_radius=ginn_config.patch_radius, orientations=ginn_config.orientations
-    )
-    data = build_body_inversion_data(
-        reader,
-        controls,
-        config=ginn_config,
-        lfm_lowpass_spec=lfm_lowpass_spec,
-        candidate_keys=candidates,
-        target_zone_mask=np.asarray(lfm.valid_mask, dtype=bool),
-    )
-    trainer = BodyInversionTrainer(
-        data,
-        adapter=adapter,
-        config=ginn_config,
-        lfm_lowpass_spec=lfm_lowpass_spec,
-        output_dir=output_dir / "_ginn_runtime",
-        artifact_root=REPO_ROOT,
-        logger=logger,
-    )
-    model = CenterTraceBodyNet(ginn_config.network).to(trainer.device)
-    load_checkpoint(checkpoint_path, model=model, expected_network_config=ginn_config.network, map_location=trainer.device)
-    inverter = BodyInverter(
-        model, reader, adapter, projector=trainer.projector, device=trainer.device, batch_size=ginn_config.batch_size
-    )
 
     zone_intervals_by_well = well_zone_intervals(selected_controls, target_zone)
     scale_contract = ScaleContract.from_any(
@@ -523,9 +446,9 @@ def main() -> None:
     for orientation in orientations:
         section_dir = output_dir / orientation
         section_dir.mkdir(parents=True)
-        keys = trainer.validation_section_keys(orientation, max_traces=max_traces)
+        keys = loaded.validation_section_keys(orientation, max_traces=max_traces)
         logger.info("%s section inference start | traces=%d", orientation, len(keys))
-        body_result = inverter.predict(keys, center_visible=True)
+        body_result = loaded.predict_traces(keys)
         body = body_result.body_log_ai.detach().cpu().numpy().astype(np.float64)
         valid_mask = body_result.valid_mask.detach().cpu().numpy().astype(bool)
         geometry, distance_m, horizons = _section_geometry(

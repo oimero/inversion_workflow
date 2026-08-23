@@ -8,7 +8,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from cup.seismic.geometry import SampleAxis
-from cup.well.scale_separation import gaussian_smooth_numpy
+from cup.well.scale import gaussian_smooth_numpy
 
 from .contracts import DictionaryAtom, ResidualTextureLibrary, ScaleContract
 from .keys import BodyKeyEncoder, compute_feature_scales, compute_zone_temperature_bases
@@ -196,7 +196,7 @@ def build_residual_library(
 ) -> ResidualTextureLibrary:
     """Build a paired finite-run residual dictionary.
 
-    ``well_controls`` is normally a ``cup.well.real_field_controls.WellControlSet``.
+    ``well_controls`` is normally a ``cup.well.controls.WellControlSet``.
     A mapping or iterable of native records with ``coordinates`` and
     ``full_log_ai`` fields is also accepted for small deterministic smoke runs.
     Native filtered values are used directly; the model-axis log is never

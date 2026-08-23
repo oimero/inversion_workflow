@@ -25,7 +25,7 @@ from cup.seismic.target_zone_io import build_workflow_target_zone
 from cup.seismic.volume_export import export_volume_like_source, log_ai_to_ai_volume
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.utils.logging import configure_run_logger
-from cup.well.real_field_controls import load_well_control_set
+from cup.well.controls import load_well_control_set
 from enhance_v2.artifacts import library_summary
 from enhance_v2.contracts import ResidualTransferPolicy, ScaleContract
 from enhance_v2.library import build_residual_library

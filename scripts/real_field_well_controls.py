@@ -35,8 +35,8 @@ from cup.utils.io import (
     resolve_relative_path,
     write_json,
 )
-from cup.well.real_field_control_qc import write_depth_well_control_qc
-from cup.well.real_field_controls import (
+from cup.well.controls import write_depth_well_control_qc
+from cup.well.controls import (
     DEPTH_SOURCE_SCHEMA,
     TIME_SOURCE_SCHEMA,
     build_well_control_set,

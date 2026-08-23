@@ -397,3 +397,63 @@ def assemble_bilinear_trace_from_plan(
 
 def trace_index_set(rows: Iterable[tuple[int, int]]) -> set[tuple[int, int]]:
     return {(int(i), int(j)) for i, j in rows}
+
+
+def sample_volume_trilinear(
+    volume: np.ndarray,
+    *,
+    ilines: np.ndarray,
+    xlines: np.ndarray,
+    twt_s: np.ndarray,
+    inline_values: np.ndarray,
+    xline_values: np.ndarray,
+    sample_twt_s: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample an ``[inline, xline, sample]`` volume without extrapolation."""
+
+    data = np.asarray(volume, dtype=np.float64)
+    axes = [np.asarray(axis, dtype=np.float64) for axis in (ilines, xlines, twt_s)]
+    coords = [
+        np.asarray(values, dtype=np.float64).reshape(-1)
+        for values in (inline_values, xline_values, sample_twt_s)
+    ]
+    if data.ndim != 3 or data.shape != tuple(axis.size for axis in axes):
+        raise ValueError(f"Volume/axis shape mismatch: volume={data.shape}, axes={[axis.size for axis in axes]}")
+    if len({values.size for values in coords}) != 1:
+        raise ValueError("Point coordinate arrays must have the same size.")
+    for name, axis in zip(("inline", "xline", "sample"), axes):
+        if axis.size < 2 or not np.all(np.diff(axis) > 0.0):
+            raise ValueError(f"{name} axis must be strictly increasing with at least two samples.")
+    fractional = [
+        np.interp(values, axis, np.arange(axis.size), left=np.nan, right=np.nan)
+        for values, axis in zip(coords, axes)
+    ]
+    out = np.full(coords[0].shape, np.nan, dtype=np.float64)
+    inside = np.ones(coords[0].shape, dtype=bool)
+    for values, axis, frac in zip(coords, axes, fractional):
+        inside &= np.isfinite(values) & np.isfinite(frac) & (values >= axis[0]) & (values <= axis[-1])
+    for point in np.flatnonzero(inside):
+        positions = [float(frac[point]) for frac in fractional]
+        lower = [min(int(np.floor(value)), data.shape[dim] - 2) for dim, value in enumerate(positions)]
+        weights = [value - index for value, index in zip(positions, lower)]
+        total = 0.0
+        total_weight = 0.0
+        for di in (0, 1):
+            for dj in (0, 1):
+                for dk in (0, 1):
+                    weight = (
+                        (weights[0] if di else 1.0 - weights[0])
+                        * (weights[1] if dj else 1.0 - weights[1])
+                        * (weights[2] if dk else 1.0 - weights[2])
+                    )
+                    if weight <= 0.0:
+                        continue
+                    value = data[lower[0] + di, lower[1] + dj, lower[2] + dk]
+                    if np.isfinite(value):
+                        total += weight * float(value)
+                        total_weight += weight
+        if total_weight > 0.0:
+            out[point] = total / total_weight
+        else:
+            inside[point] = False
+    return out, inside & np.isfinite(out)

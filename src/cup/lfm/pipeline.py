@@ -31,8 +31,8 @@ from cup.utils.io import (
     resolve_relative_path,
     write_json,
 )
-from cup.well.anchor import sample_volume_trilinear
-from cup.well.real_field_controls import WellControlSet
+from cup.seismic.trace_sampling import sample_volume_trilinear
+from cup.well.controls import WellControlSet
 
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")

@@ -34,7 +34,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cup.config.workflow import WorkflowConfig
-from cup.well.contracts import DEPTH_VERTICAL_AUTO_TIE_SCHEMA_VERSION
+from cup.well.tie import DEPTH_VERTICAL_AUTO_TIE_SCHEMA_VERSION
 from cup.config.sources import resolve_source_run
 from cup.seismic.survey import segy_options_from_config
 from cup.utils.io import (

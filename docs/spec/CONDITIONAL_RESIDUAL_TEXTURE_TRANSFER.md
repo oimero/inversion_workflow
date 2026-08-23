@@ -24,7 +24,7 @@ seismic + LFM
 ## 2. 尺度分工
 
 设 `S_body` 为按物理垂向尺度定义的 Gaussian 平滑算子，当前深度域
-`body_smoothing_fwhm_m = 15 m`：
+`body_smoothing_fwhm_m = 25 m`：
 
 ```text
 well_body     = S_body(filtered_full_well_log_ai)
@@ -57,7 +57,7 @@ DictionaryAtom
 └── source_interval
 ```
 
-这里的 residual 是 `15 m` body 以下、上游 filtered log-AI 有效频带以内的亚主体尺度纹理，
+这里的 residual 是 `25 m` body 以下、上游 filtered log-AI 有效频带以内的亚主体尺度纹理，
 不是未经滤波的测井全频高频。字典的振幅和锐度均以 native filtered log-AI 为统计口径。
 
 `S_body` 在每个 native 有效 finite run 内独立计算；卷积核只在 run 内归一化，不跨缺口或

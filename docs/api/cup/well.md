@@ -1,21 +1,17 @@
 # cup.well
 
-::: cup.well.assets
+::: cup.well.inventory
 
 ::: cup.well.curves
 
 ::: cup.well.las
 
-::: cup.well.mnemonics
-
 ::: cup.well.preprocess
 
-::: cup.well.gaps
+::: cup.well.controls
+
+::: cup.well.scale
 
 ::: cup.well.tie
 
-::: cup.well.td
-
 ::: cup.well.trajectory
-
-::: cup.well.real_field_controls

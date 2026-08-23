@@ -10,7 +10,7 @@ import pandas as pd
 
 from cup.seismic.geometry import SampleAxis, SurveyLineGeometry
 from cup.seismic.target_zone import TargetZone
-from cup.well.real_field_controls import WellControlSet
+from cup.well.controls import WellControlSet
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,4 @@
-"""GINN V2 body-inversion curriculum, evaluation, and run orchestration."""
+"""GINN training configuration, diagnostics, checkpoints, and curriculum."""
 
 from __future__ import annotations
 
@@ -14,35 +14,14 @@ from typing import Any, Iterable, Literal, Mapping
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
 from cup.lfm.math import LowpassSpec
-from ginn_v2.adapters import DomainAdapter
-from ginn_v2.checkpoint import load_checkpoint, save_epoch_checkpoint
-from ginn_v2.contracts import CommonObservationBatch
-from ginn_v2.data import PatchBatch, PatchKey, PatchReader
-from ginn_v2.evaluation import (
-    EvaluationMetrics,
-    GateReport,
-    GateThresholds,
-    evaluate_gates,
-)
-from ginn_v2.losses import (
-    analytic_gain_diagnostic,
-    lfm_anchor_loss,
-    masked_lfm_lowpass,
-    short_wave_energy_ratio,
-    waveform_shape_loss,
-)
-from ginn_v2.model import BodyNetworkConfig, CenterTraceBodyNet
-from ginn_v2.projector import BodyScaleProjector
-from ginn_v2.qc import write_well_waveform_qc
-from ginn_v2.visibility import (
-    VerticalVisibilityCompensator,
-    VisibilityCompensationConfig,
-    local_standard_deviation,
-)
-from ginn_v2.split import (
+from cup.well.controls import WellControlSet
+from ginn_v2.data import (
+    PatchBatch,
+    PatchKey,
+    PatchReader,
     SpatialSplit,
     WellPatchTarget,
     WellSampleSplit,
@@ -53,7 +32,259 @@ from ginn_v2.split import (
     make_spatial_split,
     well_target_zone_mask,
 )
-from cup.well.real_field_controls import WellControlSet
+from ginn_v2.diagnose import write_well_waveform_qc
+from ginn_v2.loss import (
+    VerticalVisibilityCompensator,
+    VisibilityCompensationConfig,
+    analytic_gain_diagnostic,
+    lfm_anchor_loss,
+    local_standard_deviation,
+    masked_lfm_lowpass,
+    short_wave_energy_ratio,
+    waveform_shape_loss,
+)
+from ginn_v2.model import BodyNetworkConfig, BodyScaleProjector, CenterTraceBodyNet
+from ginn_v2.physics import CommonObservationBatch, DomainAdapter
+
+
+def _finite_scalar(value: float, *, name: str) -> float:
+    result = float(value)
+    if not np.isfinite(result):
+        raise ValueError(f"{name} must be finite.")
+    return result
+
+
+@dataclass(frozen=True)
+class WarningThresholds:
+    pretrain_masked_corr_improvement: float
+    pretrain_masked_shape_ratio: float
+    masked_corr_drop_tolerance: float
+    well_pooled_rmse_ratio_max: float
+    seismic_body_amplitude_spearman_max: float = 1.0
+
+    def __post_init__(self) -> None:
+        for name, value in asdict(self).items():
+            if not np.isfinite(float(value)) or float(value) < 0.0:
+                raise ValueError(f"Warning threshold {name} must be finite and non-negative.")
+        if self.pretrain_masked_shape_ratio <= 0.0:
+            raise ValueError("pretrain_masked_shape_ratio must be positive.")
+        if self.well_pooled_rmse_ratio_max <= 0.0:
+            raise ValueError("well_pooled_rmse_ratio_max must be positive.")
+        if self.seismic_body_amplitude_spearman_max > 1.0:
+            raise ValueError("seismic_body_amplitude_spearman_max cannot exceed one.")
+
+
+@dataclass(frozen=True)
+class EvaluationMetrics:
+    masked_correlation: np.ndarray
+    masked_shape_loss: np.ndarray
+    visible_correlation: np.ndarray
+    visible_shape_loss: np.ndarray
+    well_rmse_by_well: Mapping[str, float]
+    well_bias_by_well: Mapping[str, float]
+    well_body_correlation_by_well: Mapping[str, float]
+    well_pooled_rmse: float
+    well_pooled_bias: float
+    lfm_drift_rmse: float
+    short_wave_energy_fraction: float
+    roughness_ratio: float
+    roughness_ratio_by_well: Mapping[str, float]
+    analytic_gain_mean: float
+    raw_amplitude_residual_mean: float
+    compensated_amplitude_residual_mean: float
+    visibility_standard_deviation: float
+    seismic_body_amplitude_spearman: float
+    seismic_body_log_amplitude_pearson: float
+    support_contiguous_fraction: float
+    orientation_disagreement_rms_ratio: float
+    sample_count: int
+
+    def __post_init__(self) -> None:
+        arrays = (self.masked_correlation, self.masked_shape_loss, self.visible_correlation, self.visible_shape_loss)
+        if any(np.asarray(value).ndim != 1 or np.asarray(value).size == 0 for value in arrays):
+            raise ValueError("Validation trace metrics must be non-empty one-dimensional arrays.")
+        for value in arrays:
+            if np.any(~np.isfinite(value)):
+                raise ValueError("Validation trace metrics must be finite.")
+        for name in (
+            "well_pooled_rmse",
+            "well_pooled_bias",
+            "lfm_drift_rmse",
+            "short_wave_energy_fraction",
+            "roughness_ratio",
+            "analytic_gain_mean",
+            "raw_amplitude_residual_mean",
+            "compensated_amplitude_residual_mean",
+            "visibility_standard_deviation",
+            "seismic_body_amplitude_spearman",
+            "seismic_body_log_amplitude_pearson",
+            "support_contiguous_fraction",
+            "orientation_disagreement_rms_ratio",
+        ):
+            _finite_scalar(getattr(self, name), name=name)
+        well_names = set(self.well_rmse_by_well)
+        if not self.well_rmse_by_well or well_names != set(self.well_bias_by_well):
+            raise ValueError("Well metrics must contain matching non-empty well identities.")
+        for name, values in (
+            ("well_rmse_by_well", self.well_rmse_by_well),
+            ("well_bias_by_well", self.well_bias_by_well),
+            ("well_body_correlation_by_well", self.well_body_correlation_by_well),
+            ("roughness_ratio_by_well", self.roughness_ratio_by_well),
+        ):
+            if set(values) != well_names:
+                raise ValueError(f"{name} must use the trusted well identities.")
+            if any(not np.isfinite(float(value)) for value in values.values()):
+                raise ValueError(f"{name} must contain only finite values.")
+        if self.sample_count <= 0:
+            raise ValueError("sample_count must be positive.")
+
+    def to_json_dict(self) -> dict[str, object]:
+        payload = asdict(self)
+        for key in ("masked_correlation", "masked_shape_loss", "visible_correlation", "visible_shape_loss"):
+            payload[key] = np.asarray(payload[key], dtype=np.float64).tolist()
+        payload["well_rmse_by_well"] = dict(self.well_rmse_by_well)
+        payload["well_bias_by_well"] = dict(self.well_bias_by_well)
+        payload["well_body_correlation_by_well"] = dict(self.well_body_correlation_by_well)
+        payload["roughness_ratio_by_well"] = dict(self.roughness_ratio_by_well)
+        return payload
+
+@dataclass(frozen=True)
+class WarningReport:
+    warnings: tuple[str, ...]
+    details: Mapping[str, float | int | bool]
+
+    def to_json_dict(self) -> dict[str, object]:
+        return {
+            "warnings": list(self.warnings),
+            "details": dict(self.details),
+        }
+
+def _median(array: np.ndarray) -> float:
+    return float(np.median(np.asarray(array, dtype=np.float64)))
+
+
+def evaluate_warnings(
+    metrics: EvaluationMetrics,
+    lfm_baseline: EvaluationMetrics,
+    pretrain_baseline: EvaluationMetrics,
+    *,
+    thresholds: WarningThresholds,
+) -> WarningReport:
+    """Compare metrics with research preferences and return warning flags."""
+
+    threshold = thresholds
+    masked_corr_change = np.asarray(metrics.masked_correlation) - np.asarray(pretrain_baseline.masked_correlation)
+    masked_shape_ratio = _median(metrics.masked_shape_loss) / max(_median(pretrain_baseline.masked_shape_loss), 1e-12)
+    visible_corr_change = np.asarray(metrics.visible_correlation) - np.asarray(pretrain_baseline.visible_correlation)
+    visible_shape_ratio = _median(metrics.visible_shape_loss) / max(_median(pretrain_baseline.visible_shape_loss), 1e-12)
+    baseline_wells = dict(pretrain_baseline.well_rmse_by_well)
+    lfm_wells = dict(lfm_baseline.well_rmse_by_well)
+    current_wells = dict(metrics.well_rmse_by_well)
+    common_wells = sorted(set(baseline_wells) & set(current_wells))
+    if common_wells != sorted(baseline_wells) or common_wells != sorted(lfm_wells):
+        raise ValueError("LFM, pretrain, and current well metric identities differ.")
+    pretrain_well_ratios = np.asarray(
+        [current_wells[name] / max(abs(baseline_wells[name]), 1e-12) for name in common_wells], dtype=np.float64
+    )
+    warnings: list[str] = []
+    details: dict[str, float | int | bool] = {
+        "masked_corr_change_from_pretrain_median": _median(masked_corr_change),
+        "masked_shape_ratio": float(masked_shape_ratio),
+        "visible_corr_median": _median(metrics.visible_correlation),
+        "visible_corr_change_from_pretrain_median": _median(visible_corr_change),
+        "visible_shape_ratio": float(visible_shape_ratio),
+        "well_pooled_rmse_ratio_to_pretrain": metrics.well_pooled_rmse / max(abs(pretrain_baseline.well_pooled_rmse), 1e-12),
+        "well_pooled_abs_bias": abs(metrics.well_pooled_bias),
+        "well_fraction_improved_from_pretrain": float(np.mean(pretrain_well_ratios < 1.0)),
+        "lfm_drift_rmse": float(metrics.lfm_drift_rmse),
+        "lfm_drift_ratio_to_pretrain": metrics.lfm_drift_rmse / max(abs(pretrain_baseline.lfm_drift_rmse), 1e-12),
+        "short_wave_energy_ratio": float(metrics.short_wave_energy_fraction),
+        "roughness_ratio_median": float(metrics.roughness_ratio),
+        "support_contiguous_fraction": float(metrics.support_contiguous_fraction),
+        "orientation_disagreement_rms_ratio": float(metrics.orientation_disagreement_rms_ratio),
+        "seismic_body_amplitude_spearman": float(metrics.seismic_body_amplitude_spearman),
+        "seismic_body_log_amplitude_pearson": float(metrics.seismic_body_log_amplitude_pearson),
+        "visibility_standard_deviation": float(metrics.visibility_standard_deviation),
+        "compensated_amplitude_residual_mean": float(metrics.compensated_amplitude_residual_mean),
+    }
+    if details["masked_corr_change_from_pretrain_median"] < -threshold.masked_corr_drop_tolerance:
+        warnings.append("masked_shape")
+    if details["well_pooled_rmse_ratio_to_pretrain"] >= threshold.well_pooled_rmse_ratio_max:
+        warnings.append("trusted_well_body")
+    if abs(details["seismic_body_amplitude_spearman"]) > threshold.seismic_body_amplitude_spearman_max:
+        warnings.append("seismic_body_amplitude_mapping")
+    return WarningReport(
+        warnings=tuple(warnings),
+        details=details,
+    )
+
+
+CHECKPOINT_SCHEMA = "ginn_v2_body_inversion_checkpoint_v2"
+
+
+def save_epoch_checkpoint(
+    path: str | Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    network_config: BodyNetworkConfig,
+    run_config: Mapping[str, Any],
+    split_description: Mapping[str, Any],
+    metrics: EvaluationMetrics,
+    warnings: WarningReport,
+) -> Path:
+    """Write a self-contained recovery checkpoint, including optimizer state."""
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(epoch, bool) or int(epoch) <= 0:
+        raise ValueError("epoch must be a positive integer.")
+    payload = {
+        "schema": CHECKPOINT_SCHEMA,
+        "epoch": int(epoch),
+        "network_config": dict(network_config.__dict__),
+        "run_config": dict(run_config),
+        "split": dict(split_description),
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "metrics": metrics.to_json_dict(),
+        "warnings": warnings.to_json_dict(),
+    }
+    torch.save(payload, destination)
+    return destination
+
+
+def load_checkpoint(
+    path: str | Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer | None = None,
+    expected_network_config: BodyNetworkConfig | None = None,
+    map_location: torch.device | str = "cpu",
+) -> dict[str, Any]:
+    """Restore model and optional optimizer state without changing contracts."""
+
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    try:
+        payload = torch.load(source, map_location=map_location, weights_only=False)
+    except TypeError:
+        payload = torch.load(source, map_location=map_location)
+    if not isinstance(payload, Mapping) or payload.get("schema") != CHECKPOINT_SCHEMA:
+        raise ValueError(f"Unsupported GINN V2 checkpoint schema: {source}")
+    required = {"epoch", "network_config", "run_config", "split", "model_state", "optimizer_state", "metrics", "warnings"}
+    missing = sorted(required - set(payload))
+    if missing:
+        raise ValueError(f"GINN V2 checkpoint is missing fields: {missing}")
+    recorded_config = BodyNetworkConfig(**dict(payload["network_config"]))
+    if expected_network_config is not None and recorded_config != expected_network_config:
+        raise ValueError("Checkpoint network contract differs from the requested network configuration.")
+    model.load_state_dict(payload["model_state"], strict=True)
+    if optimizer is not None:
+        optimizer.load_state_dict(payload["optimizer_state"])
+    return dict(payload)
 
 
 def _positive_int(value: object, *, name: str) -> int:
@@ -98,7 +329,7 @@ class BodyInversionConfig:
     body_smoothing_fwhm_m: float
     selection_weights: CheckpointSelectionWeights
     waveform_qc_dynamic_window_m: float
-    gates: GateThresholds
+    warnings: WarningThresholds
     patch_radius: int = 8
     batch_size: int = 8
     pretrain_epochs: int = 1
@@ -147,8 +378,8 @@ class BodyInversionConfig:
         _positive_int(self.batch_size, name="batch_size")
         _positive_int(self.max_train_centers, name="max_train_centers")
         _positive_int(self.max_validation_centers, name="max_validation_centers")
-        if not 1 <= int(self.pretrain_epochs) <= 3 or not 1 <= int(self.finetune_epochs) <= 3:
-            raise ValueError("pretrain_epochs and finetune_epochs must be within [1, 3].")
+        _positive_int(self.pretrain_epochs, name="pretrain_epochs")
+        _positive_int(self.finetune_epochs, name="finetune_epochs")
         _positive_int(self.well_batch_multiplier, name="well_batch_multiplier")
         if not 0.0 < float(self.review_fraction) < 1.0:
             raise ValueError("review_fraction must be within (0, 1).")
@@ -175,18 +406,18 @@ class BodyInversionConfig:
     def from_mapping(cls, value: Mapping[str, Any]) -> "BodyInversionConfig":
         config = dict(value)
         loss_value = config.pop("loss_weights", config.pop("loss", {}))
-        gate_value = config.pop("gates", {})
+        warning_value = config.pop("warnings", {})
         network_value = config.pop("network", {})
         selection_value = config.pop("selection_weights", {})
         visibility_value = config.pop("visibility", {})
         if (
             not isinstance(loss_value, Mapping)
-            or not isinstance(gate_value, Mapping)
+            or not isinstance(warning_value, Mapping)
             or not isinstance(network_value, Mapping)
             or not isinstance(selection_value, Mapping)
             or not isinstance(visibility_value, Mapping)
         ):
-            raise ValueError("ginn_v2_body_inversion loss/gates/network/selection_weights must be mappings.")
+            raise ValueError("ginn_v2_body_inversion loss/warnings/network/selection_weights must be mappings.")
         if "trusted_well_names" in config:
             config["trusted_well_names"] = tuple(config["trusted_well_names"])
         if "orientations" in config:
@@ -194,7 +425,7 @@ class BodyInversionConfig:
         return cls(
             **config,
             loss_weights=BodyInversionLossWeights(**dict(loss_value)),
-            gates=GateThresholds(**dict(gate_value)),
+            warnings=WarningThresholds(**dict(warning_value)),
             network=BodyNetworkConfig(**dict(network_value)),
             selection_weights=CheckpointSelectionWeights(**dict(selection_value)),
             visibility=VisibilityCompensationConfig(**dict(visibility_value)),
@@ -229,7 +460,27 @@ class BodyInversionConfig:
             "seismic_balance_window_samples": self.seismic_balance_window_samples,
             "seismic_balance_floor_fraction": self.seismic_balance_floor_fraction,
             "loss_weights": asdict(self.loss_weights),
-            "gates": asdict(self.gates),
+            "warnings": asdict(self.warnings),
+            "network": asdict(self.network),
+            "visibility": asdict(self.visibility),
+        }
+
+    def pretrain_json_dict(self) -> dict[str, Any]:
+        """Return only the model semantics required to reuse pretraining."""
+
+        return {
+            "body_smoothing_fwhm_m": self.body_smoothing_fwhm_m,
+            "patch_radius": self.patch_radius,
+            "orientations": list(self.orientations),
+            "seismic_feature_mode": self.seismic_feature_mode,
+            "seismic_balance_window_samples": self.seismic_balance_window_samples,
+            "seismic_balance_floor_fraction": self.seismic_balance_floor_fraction,
+            "loss_weights": {
+                "seismic_shape": self.loss_weights.seismic_shape,
+                "seismic_amplitude": self.loss_weights.seismic_amplitude,
+                "lfm_anchor": self.loss_weights.lfm_anchor,
+                "lambda_shape": self.loss_weights.lambda_shape,
+            },
             "network": asdict(self.network),
             "visibility": asdict(self.visibility),
         }
@@ -377,41 +628,21 @@ def build_body_inversion_data(
 
 
 @dataclass(frozen=True)
-class TrialAdjustment:
-    trial_id: int
-    action: str
-    learning_rate: float
-    loss_weights: BodyInversionLossWeights
-
-    def to_json_dict(self) -> dict[str, Any]:
-        return {
-            "trial_id": self.trial_id,
-            "action": self.action,
-            "learning_rate": self.learning_rate,
-            "loss_weights": asdict(self.loss_weights),
-        }
-
-
-@dataclass(frozen=True)
-class TrialResult:
-    trial_id: int
-    adjustment: TrialAdjustment
+class FinetuneResult:
     checkpoints: tuple[str, ...]
-    selected_checkpoint: str | None
-    selected_epoch: int | None
+    selected_checkpoint: str
+    selected_epoch: int
     metrics: EvaluationMetrics
-    gate: GateReport
+    warnings: WarningReport
     stop_reason: str
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
-            "trial_id": self.trial_id,
-            "adjustment": self.adjustment.to_json_dict(),
             "checkpoints": list(self.checkpoints),
             "selected_checkpoint": self.selected_checkpoint,
             "selected_epoch": self.selected_epoch,
             "metrics": self.metrics.to_json_dict(),
-            "gate": self.gate.to_json_dict(),
+            "warnings": self.warnings.to_json_dict(),
             "stop_reason": self.stop_reason,
         }
 
@@ -665,10 +896,8 @@ class BodyInversionTrainer:
         self,
         *,
         epoch: int,
-        trial_id: int,
-        adjustment: TrialAdjustment,
     ) -> Iterable[tuple[str, tuple[Any, ...], bool]]:
-        base_seed = self.config.seed + 1000 * trial_id + epoch
+        base_seed = self.config.seed + 1000 + epoch
         masked = _chunks(self.data.spatial_split.train_keys, self.config.batch_size, seed=base_seed)
         visible = _chunks(self.data.spatial_split.train_keys, self.config.batch_size, seed=base_seed + 1)
         by_well: dict[str, list[WellPatchTarget]] = {}
@@ -698,8 +927,6 @@ class BodyInversionTrainer:
         optimizer: torch.optim.Optimizer,
         *,
         epoch: int,
-        trial_id: int,
-        adjustment: TrialAdjustment,
         pretrain: bool = False,
     ) -> dict[str, float]:
         model.train()
@@ -724,7 +951,7 @@ class BodyInversionTrainer:
                 )
             )
         else:
-            schedule = self._scheduled_batches(epoch=epoch, trial_id=trial_id, adjustment=adjustment)
+            schedule = self._scheduled_batches(epoch=epoch)
         for batch_index, (kind, values, center_visible) in enumerate(
             schedule,
             start=1,
@@ -743,7 +970,7 @@ class BodyInversionTrainer:
                 synthetic,
                 common,
                 well_items=well_items,
-                weights=adjustment.loss_weights,
+                weights=self.config.loss_weights,
                 include_seismic=kind != "trusted_well",
             )
             total.backward()
@@ -758,8 +985,8 @@ class BodyInversionTrainer:
                 totals[name].append(value)
             if batch_index % self.config.log_every_batches == 0:
                 self.log.info(
-                    "run %d | epoch %d/%d | batch %d | kind=%s | loss=%.6f | elapsed=%.1fs",
-                    trial_id,
+                    "%s | epoch %d/%d | batch %d | kind=%s | loss=%.6f | elapsed=%.1fs",
+                    "pretrain" if pretrain else "finetune",
                     epoch,
                     self.config.pretrain_epochs if pretrain else self.config.finetune_epochs,
                     batch_index,
@@ -1059,8 +1286,8 @@ class BodyInversionTrainer:
         model: CenterTraceBodyNet,
         *,
         metrics: EvaluationMetrics,
-        gate: GateReport,
-        trial_id: int,
+        warnings: WarningReport,
+        stage: str,
         epoch: int,
     ) -> None:
         """Publish fixed-identity metrics and figures beside each checkpoint."""
@@ -1070,12 +1297,11 @@ class BodyInversionTrainer:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        stage_dir = "pretraining" if trial_id == 0 else f"trial_{trial_id:02d}"
-        epoch_dir = self.output_dir / stage_dir / "validation" / f"epoch_{epoch:03d}"
+        epoch_dir = self.output_dir / stage / "validation" / f"epoch_{epoch:03d}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
         with (epoch_dir / "metrics.json").open("w", encoding="utf-8") as handle:
             json.dump(
-                {"metrics": metrics.to_json_dict(), "gate": gate.to_json_dict()},
+                {"metrics": metrics.to_json_dict(), "warnings": warnings.to_json_dict()},
                 handle,
                 ensure_ascii=False,
                 indent=2,
@@ -1243,17 +1469,9 @@ class BodyInversionTrainer:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         final_path: Path | None = None
         final_metrics: EvaluationMetrics | None = None
-        diagnostic_gate = GateReport(
-            passed=True,
-            failed_gates=(),
-            first_failed_gate=None,
+        diagnostic_warnings = WarningReport(
+            warnings=(),
             details={"stage": 0},
-        )
-        adjustment = TrialAdjustment(
-            trial_id=0,
-            action="masked_pretraining",
-            learning_rate=self.config.pretrain_learning_rate,
-            loss_weights=self.config.loss_weights,
         )
         for epoch in range(1, self.config.pretrain_epochs + 1):
             self.log.info(
@@ -1266,8 +1484,6 @@ class BodyInversionTrainer:
                 model,
                 optimizer,
                 epoch=epoch,
-                trial_id=0,
-                adjustment=adjustment,
                 pretrain=True,
             )
             metrics = self.evaluate(model)
@@ -1276,24 +1492,23 @@ class BodyInversionTrainer:
                 model=model,
                 optimizer=optimizer,
                 epoch=epoch,
-                trial_id=1,
                 network_config=self.config.network,
-                run_config=self.config.to_json_dict(),
+                run_config=self.config.pretrain_json_dict(),
                 split_description=self.data.split_description(),
                 metrics=metrics,
-                gate=diagnostic_gate,
+                warnings=diagnostic_warnings,
             )
             self._write_epoch_validation_artifacts(
                 model,
                 metrics=metrics,
-                gate=diagnostic_gate,
-                trial_id=0,
+                warnings=diagnostic_warnings,
+                stage="pretraining",
                 epoch=epoch,
             )
             write_well_waveform_qc(
                 self,
                 model,
-                self.output_dir / f"trial_{adjustment.trial_id:02d}" / "validation" / f"epoch_{epoch:03d}" / "well_waveform_qc",
+                self.output_dir / "pretraining" / "validation" / f"epoch_{epoch:03d}" / "well_waveform_qc",
                 root=self.artifact_root,
             )
             self.log.info(
@@ -1316,20 +1531,12 @@ class BodyInversionTrainer:
         *,
         baseline: EvaluationMetrics,
         resume_checkpoint: Path,
-        adjustment: TrialAdjustment | None = None,
-    ) -> TrialResult:
+    ) -> FinetuneResult:
         """Run one fixed semi-supervised finetune and select its best epoch."""
 
-        if adjustment is None:
-            adjustment = TrialAdjustment(
-                trial_id=1,
-                action="single_semi_supervised_finetune",
-                learning_rate=self.config.finetune_learning_rate,
-                loss_weights=self.config.loss_weights,
-            )
-        model, optimizer = self._model_and_optimizer(adjustment.learning_rate)
-        trial_dir = self.output_dir / f"trial_{adjustment.trial_id:02d}"
-        checkpoint_dir = trial_dir / "checkpoints"
+        model, optimizer = self._model_and_optimizer(self.config.finetune_learning_rate)
+        finetune_dir = self.output_dir / "finetuning"
+        checkpoint_dir = finetune_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         payload = load_checkpoint(
             resume_checkpoint,
@@ -1337,66 +1544,60 @@ class BodyInversionTrainer:
             expected_network_config=self.config.network,
             map_location=self.device,
         )
-        if dict(payload["run_config"]) != self.config.to_json_dict():
-            raise ValueError("Pretraining checkpoint run configuration differs from the current body-inversion configuration.")
-        if dict(payload["split"]) != self.data.split_description():
-            raise ValueError("Pretraining checkpoint split differs from the current fixed body-inversion split.")
-        pretrain_metrics = EvaluationMetrics.from_json_dict(payload["metrics"])
+        if dict(payload["run_config"]) != self.config.pretrain_json_dict():
+            raise ValueError("Pretraining checkpoint model semantics differ from the current body-inversion configuration.")
+        pretrain_metrics = self.evaluate(model)
         checkpoints: list[Path] = []
         metrics_by_epoch: dict[int, EvaluationMetrics] = {}
-        gates_by_epoch: dict[int, GateReport] = {}
+        warnings_by_epoch: dict[int, WarningReport] = {}
         for epoch in range(1, self.config.finetune_epochs + 1):
             self.log.info(
-                "finetune | epoch %d/%d start | action=%s | lr=%.6g",
+                "finetune | epoch %d/%d start | lr=%.6g",
                 epoch,
                 self.config.finetune_epochs,
-                adjustment.action,
-                adjustment.learning_rate,
+                self.config.finetune_learning_rate,
             )
             train_metrics = self.train_epoch(
                 model,
                 optimizer,
                 epoch=epoch,
-                trial_id=adjustment.trial_id,
-                adjustment=adjustment,
             )
             metrics = self.evaluate(model)
-            gate = evaluate_gates(
+            warning_report = evaluate_warnings(
                 metrics,
                 baseline,
                 pretrain_metrics,
-                thresholds=self.config.gates,
+                thresholds=self.config.warnings,
             )
             checkpoint_path = save_epoch_checkpoint(
                 checkpoint_dir / f"epoch_{epoch:03d}.pt",
                 model=model,
                 optimizer=optimizer,
                 epoch=epoch,
-                trial_id=adjustment.trial_id,
                 network_config=self.config.network,
                 run_config=self.config.to_json_dict(),
                 split_description=self.data.split_description(),
                 metrics=metrics,
-                gate=gate,
+                warnings=warning_report,
             )
             self._write_epoch_validation_artifacts(
                 model,
                 metrics=metrics,
-                gate=gate,
-                trial_id=adjustment.trial_id,
+                warnings=warning_report,
+                stage="finetuning",
                 epoch=epoch,
             )
             write_well_waveform_qc(
                 self,
                 model,
-                self.output_dir / f"trial_{adjustment.trial_id:02d}" / "validation" / f"epoch_{epoch:03d}" / "well_waveform_qc",
+                self.output_dir / "finetuning" / "validation" / f"epoch_{epoch:03d}" / "well_waveform_qc",
                 root=self.artifact_root,
             )
             checkpoints.append(checkpoint_path)
             metrics_by_epoch[epoch] = metrics
-            gates_by_epoch[epoch] = gate
+            warnings_by_epoch[epoch] = warning_report
             self.log.info(
-                "finetune | epoch %d complete | train_loss=%.6f | seismic_shape=%.6f | seismic_amplitude=%.6f | lfm_anchor=%.6f | well_loss=%.6f | well_derivative=%.6f | well_seismic_shape=%.6f | masked_corr=%.4f | visible_corr=%.4f | well_rmse=%.5f | amplitude_mapping=%.4f | visibility_std=%.4f | lfm_drift=%.5f | roughness_median=%.4f | short_wave_ratio=%.4f | failed=%s | checkpoint=%s",
+                "finetune | epoch %d complete | train_loss=%.6f | seismic_shape=%.6f | seismic_amplitude=%.6f | lfm_anchor=%.6f | well_loss=%.6f | well_derivative=%.6f | well_seismic_shape=%.6f | masked_corr=%.4f | visible_corr=%.4f | well_rmse=%.5f | amplitude_mapping=%.4f | visibility_std=%.4f | lfm_drift=%.5f | roughness_median=%.4f | short_wave_ratio=%.4f | warnings=%s | checkpoint=%s",
                 epoch,
                 train_metrics["total"],
                 train_metrics["seismic_shape"],
@@ -1413,21 +1614,14 @@ class BodyInversionTrainer:
                 metrics.lfm_drift_rmse,
                 metrics.roughness_ratio,
                 metrics.short_wave_energy_fraction,
-                ",".join(gate.failed_gates) if gate.failed_gates else "none",
+                ",".join(warning_report.warnings) if warning_report.warnings else "none",
                 checkpoint_path.name,
             )
 
         if not checkpoints:
             raise ValueError("Fine-tuning produced no evaluation checkpoint.")
-        safe_epochs = [
-            epoch
-            for epoch, metrics in metrics_by_epoch.items()
-            if float(np.median(metrics.masked_correlation))
-            >= float(np.median(pretrain_metrics.masked_correlation)) - self.config.gates.masked_corr_drop_tolerance
-        ]
-        candidate_epochs = safe_epochs or list(metrics_by_epoch)
         selected_epoch = min(
-            candidate_epochs,
+            metrics_by_epoch,
             key=lambda epoch: (
                 (
                     self.config.selection_weights.well_rmse
@@ -1439,17 +1633,15 @@ class BodyInversionTrainer:
                 epoch,
             ),
         )
-        selected_checkpoint = trial_dir / "selected_checkpoint.pt"
+        selected_checkpoint = finetune_dir / "selected_checkpoint.pt"
         shutil.copyfile(checkpoints[selected_epoch - 1], selected_checkpoint)
-        selected_gate = gates_by_epoch[selected_epoch]
-        return TrialResult(
-            trial_id=adjustment.trial_id,
-            adjustment=adjustment,
+        selected_warnings = warnings_by_epoch[selected_epoch]
+        return FinetuneResult(
             checkpoints=tuple(str(path) for path in checkpoints),
             selected_checkpoint=str(selected_checkpoint),
             selected_epoch=selected_epoch,
             metrics=metrics_by_epoch[selected_epoch],
-            gate=selected_gate,
+            warnings=selected_warnings,
             stop_reason="all_finetune_epochs_completed_best_quality_checkpoint",
         )
 
@@ -1459,7 +1651,13 @@ __all__ = [
     "BodyInversionData",
     "BodyInversionLossWeights",
     "BodyInversionTrainer",
-    "TrialAdjustment",
-    "TrialResult",
+    "CHECKPOINT_SCHEMA",
+    "EvaluationMetrics",
+    "FinetuneResult",
+    "WarningReport",
+    "WarningThresholds",
     "build_body_inversion_data",
+    "evaluate_warnings",
+    "load_checkpoint",
+    "save_epoch_checkpoint",
 ]

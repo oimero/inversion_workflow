@@ -44,7 +44,7 @@ from cup.utils.io import (
     sanitize_filename,
     write_json,
 )
-from cup.well.assets import normalize_well_name
+from cup.well.inventory import normalize_well_name
 from cup.well.curves import exact_mnemonic, normalize_mnemonic
 from cup.well.las import _header_value, export_logset_to_las
 from cup.well.preprocess import (

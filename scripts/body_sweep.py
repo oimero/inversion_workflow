@@ -1,10 +1,10 @@
-"""Sweep the GINN V2 body/residual Gaussian FWHM boundary on trusted wells.
+"""Sweep the GINN v2 body/residual Gaussian FWHM boundary on trusted wells.
 
 Usage::
 
-    python scripts/ginn_v2_body_fwhm_sweep.py
-    python scripts/ginn_v2_body_fwhm_sweep.py --smoke
-    python scripts/ginn_v2_body_fwhm_sweep.py --output-dir experiments/ginn_v2/results/body_fwhm_sweep_manual
+    python scripts/body_sweep.py
+    python scripts/body_sweep.py --smoke
+    python scripts/body_sweep.py --output-dir experiments/ginn_v2/results/body_fwhm_sweep_manual
 """
 
 from __future__ import annotations
@@ -31,10 +31,8 @@ from cup.utils.io import (
     resolve_timestamped_output_dir,
 )
 from cup.utils.logging import configure_run_logger
-from cup.well.body_fwhm_sweep import BodyFwhmSweepPolicy, run_body_fwhm_sweep
-from cup.well.body_fwhm_sweep_artifacts import write_body_fwhm_sweep_artifacts
-from cup.well.real_field_control_qc import load_depth_forward_inputs
-from cup.well.real_field_controls import load_well_control_set
+from ginn_v2.diagnose import BodyFwhmSweepPolicy, run_body_fwhm_sweep, write_body_fwhm_sweep_artifacts
+from cup.well.controls import load_depth_forward_inputs, load_well_control_set
 
 
 def parse_args() -> argparse.Namespace:

@@ -13,7 +13,7 @@ import pandas as pd
 from cup.lfm.contracts import RUN_SCHEMA, VARIANT_SCHEMA
 from cup.seismic.geometry import SampleAxis
 from cup.utils.io import is_consumable_contract_status, require_contract_fingerprint, resolve_relative_path
-from cup.well.real_field_controls import SCHEMA_VERSION as WELL_CONTROL_SCHEMA
+from cup.well.controls import SCHEMA_VERSION as WELL_CONTROL_SCHEMA
 
 
 @dataclass(frozen=True)

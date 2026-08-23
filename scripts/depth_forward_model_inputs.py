@@ -39,7 +39,7 @@ from cup.utils.io import (
     resolve_timestamped_output_dir,
     write_json,
 )
-from cup.well.contracts import DEPTH_VERTICAL_AUTO_TIE_SCHEMA_VERSION
+from cup.well.tie import DEPTH_VERTICAL_AUTO_TIE_SCHEMA_VERSION
 
 
 DEFAULT_COMMON_CONFIG = Path("experiments/common/common.yaml")

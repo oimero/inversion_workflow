@@ -1,66 +1,19 @@
-"""Shared domain-neutral contracts for the GINN V2 workflow."""
+"""GINN v2 body-inversion workflow."""
 
-from ginn_v2.adapters import DepthDomainAdapter, TimeDomainAdapter
-from ginn_v2.contracts import CommonObservationBatch, ForwardClosureResult
-from ginn_v2.data import (
-    ArrayTraceSource,
-    InputNormalization,
-    PatchBatch,
-    PatchKey,
-    PatchReader,
-    SurveyTraceSource,
-    candidate_patch_keys,
-    fit_lfm_normalization,
+from ginn_v2.workflow import (
+    BodyRun,
+    LoadedBody,
+    finetune_body,
+    load_body,
+    pretrain_body,
+    train_body,
 )
-from ginn_v2.evaluation import EvaluationMetrics, GateReport, GateThresholds, evaluate_gates
-from ginn_v2.inverter import BodyInverter, BodyPrediction, BodyResult
-from ginn_v2.model import BodyNetworkConfig, CenterTraceBodyNet
-from ginn_v2.projector import BodyScaleProjector
-from ginn_v2.scales import (
-    gaussian_smooth_numpy,
-    gaussian_smooth_torch,
-)
-from ginn_v2.trainer import (
-    BodyInversionConfig,
-    BodyInversionData,
-    BodyInversionTrainer,
-    build_body_inversion_data,
-)
-from ginn_v2.visibility import VerticalVisibilityCompensator, VisibilityCompensationConfig
-from ginn_v2.volume import BodyVolumeInverter, BodyVolumeResult, VolumeInferenceConfig
 
 __all__ = [
-    "ArrayTraceSource",
-    "BodyNetworkConfig",
-    "BodyInverter",
-    "BodyPrediction",
-    "BodyResult",
-    "BodyVolumeInverter",
-    "BodyVolumeResult",
-    "BodyScaleProjector",
-    "CommonObservationBatch",
-    "CenterTraceBodyNet",
-    "DepthDomainAdapter",
-    "EvaluationMetrics",
-    "ForwardClosureResult",
-    "GateReport",
-    "GateThresholds",
-    "InputNormalization",
-    "PatchBatch",
-    "PatchKey",
-    "PatchReader",
-    "BodyInversionConfig",
-    "BodyInversionData",
-    "BodyInversionTrainer",
-    "SurveyTraceSource",
-    "TimeDomainAdapter",
-    "VerticalVisibilityCompensator",
-    "VisibilityCompensationConfig",
-    "VolumeInferenceConfig",
-    "build_body_inversion_data",
-    "candidate_patch_keys",
-    "evaluate_gates",
-    "fit_lfm_normalization",
-    "gaussian_smooth_numpy",
-    "gaussian_smooth_torch",
+    "BodyRun",
+    "LoadedBody",
+    "finetune_body",
+    "load_body",
+    "pretrain_body",
+    "train_body",
 ]

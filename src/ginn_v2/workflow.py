@@ -1,70 +1,224 @@
-"""Train the GINN V2 body inversion with one controlled fine-tuning run.
+"""Compose GINN v2 training stages behind one workflow interface.
 
 The command requires explicit Step-6, Step-7, and frozen-forward inputs.  A
 configuration section named ``ginn_v2_body_inversion`` carries the settings;
 the input identities can also be supplied as command-line overrides.
 
-Example::
-
-    python scripts/ginn_v2_body_inversion.py --config experiments/ginn_v2/ginn_v2.yaml
 """
 
 from __future__ import annotations
 
-import argparse
-import csv
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 import json
 from pathlib import Path
 import shutil
-import sys
 from typing import Any, Mapping
 
 import numpy as np
 import torch
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
-SRC_DIR = REPO_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
 from cup.config.workflow import WorkflowConfig, deep_merge_dict
 from cup.lfm.math import parse_lowpass_spec
 from cup.physics.calibration import AIVelocityRelation
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.wavelet import load_wavelet_csv, validate_wavelet_normalization
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, sanitize_filename, write_json
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.utils.logging import configure_run_logger
-from cup.well.real_field_controls import load_well_control_set
-from ginn_v2.adapters import DepthDomainAdapter, TimeDomainAdapter
-from ginn_v2.checkpoint import load_checkpoint
-from ginn_v2.data import PatchReader, SurveyTraceSource, candidate_patch_keys, fit_lfm_normalization
-from ginn_v2.trainer import (
+from cup.well.controls import load_well_control_set
+from ginn_v2.physics import DepthDomainAdapter, TimeDomainAdapter
+from ginn_v2.data import PatchKey, PatchReader, SurveyTraceSource, candidate_patch_keys, fit_lfm_normalization
+from ginn_v2.train import (
     BodyInversionConfig,
     BodyInversionTrainer,
-    TrialResult,
     build_body_inversion_data,
+    load_checkpoint,
 )
 from cup.lfm.artifacts import load_lfm_input
 from ginn_v2.model import CenterTraceBodyNet
-from ginn_v2.qc import write_well_waveform_qc as write_well_waveform_qc_artifact
+from ginn_v2.model import BodyScaleProjector
+from ginn_v2.infer import (
+    BodyInverter,
+    BodyVolumeInverter,
+    BodyVolumeResult,
+    VolumeInferenceConfig,
+    centered_tile_bounds,
+)
+from ginn_v2.diagnose import write_well_waveform_qc as write_well_waveform_qc_artifact
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+Stage = str
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("experiments/ginn_v2/ginn_v2.yaml"))
-    parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--lfm-run-dir", type=Path, default=None)
-    parser.add_argument("--variant-id", type=str, default=None)
-    parser.add_argument("--well-control-run-dir", type=Path, default=None)
-    parser.add_argument("--forward-model-inputs", type=Path, default=None)
-    return parser.parse_args()
+@dataclass(frozen=True)
+class BodyRun:
+    """Paths produced by one body-inversion workflow invocation."""
+
+    output_dir: Path
+    pretrain_checkpoint: Path
+    selected_checkpoint: Path | None
+    warnings: tuple[str, ...]
 
 
-def _load_composed_config(path: Path) -> dict[str, Any]:
+@dataclass(frozen=True)
+class LoadedBody:
+    """Loaded body model with trace-reader and volume scheduling hidden inside."""
+
+    checkpoint: Path
+    checkpoint_payload: Mapping[str, Any]
+    lfm_run_dir: Path
+    well_control_run_dir: Path
+    forward_model_inputs: Path
+    workflow: WorkflowConfig
+    training_config: BodyInversionConfig
+    inference_config: Mapping[str, Any]
+    lfm: Any
+    survey: Any
+    sample_axis: Any
+    seismic_path: Path
+    reader: PatchReader
+    model: CenterTraceBodyNet
+    adapter: DepthDomainAdapter | TimeDomainAdapter
+    lfm_lowpass_spec: Any
+
+    def _inverter(self, batch_size: int | None = None) -> BodyInverter:
+        resolved_batch_size = int(
+            batch_size
+            or self.inference_config.get("batch_size")
+            or self.training_config.batch_size
+        )
+        return BodyInverter(
+            self.model,
+            self.reader,
+            self.adapter,
+            projector=BodyScaleProjector(
+                smoothing_fwhm_m=self.training_config.body_smoothing_fwhm_m,
+                sample_step=float(self.sample_axis.step),
+                lowpass_spec=self.lfm_lowpass_spec,
+            ),
+            device=next(self.model.parameters()).device,
+            batch_size=resolved_batch_size,
+        )
+
+    def predict_traces(self, keys: tuple[PatchKey, ...], *, batch_size: int | None = None) -> Any:
+        """Predict body traces on explicit patch keys."""
+
+        return self._inverter(batch_size).predict_body(keys, center_visible=True)
+
+    def validation_section_keys(
+        self,
+        orientation: str,
+        *,
+        max_traces: int = 128,
+    ) -> tuple[PatchKey, ...]:
+        """Return the longest contiguous section recorded in the checkpoint split."""
+
+        if orientation not in {"inline", "xline"}:
+            raise ValueError("orientation must be inline or xline.")
+        split = self.checkpoint_payload.get("split")
+        if not isinstance(split, Mapping):
+            raise ValueError("Checkpoint split description must be a mapping.")
+        raw_keys = split.get("review_patch_keys")
+        if not isinstance(raw_keys, list):
+            raise ValueError("Checkpoint split lacks review_patch_keys.")
+        grouped: dict[int, list[PatchKey]] = {}
+        for value in raw_keys:
+            if not isinstance(value, Mapping) or value.get("orientation") != orientation:
+                continue
+            key = PatchKey(
+                int(value["inline_index"]),
+                int(value["xline_index"]),
+                orientation,
+            )
+            fixed = key.inline_index if orientation == "inline" else key.xline_index
+            grouped.setdefault(fixed, []).append(key)
+        runs: list[tuple[PatchKey, ...]] = []
+        for values in grouped.values():
+            ordered = sorted(
+                values,
+                key=(
+                    (lambda item: item.xline_index)
+                    if orientation == "inline"
+                    else (lambda item: item.inline_index)
+                ),
+            )
+            current: list[PatchKey] = []
+            previous: int | None = None
+            for key in ordered:
+                varying = key.xline_index if orientation == "inline" else key.inline_index
+                if previous is not None and varying != previous + 1:
+                    runs.append(tuple(current))
+                    current = []
+                current.append(key)
+                previous = varying
+            if current:
+                runs.append(tuple(current))
+        if not runs:
+            raise ValueError(f"Checkpoint review split has no {orientation} section.")
+        selected = max(
+            runs,
+            key=lambda item: (len(item), -item[0].inline_index, -item[0].xline_index),
+        )
+        if len(selected) > int(max_traces):
+            start = (len(selected) - int(max_traces)) // 2
+            selected = selected[start : start + int(max_traces)]
+        return selected
+
+    def predict_volume(
+        self,
+        *,
+        batch_size: int | None = None,
+        smoke_tile_size: int | None = None,
+        smoke_tile_origin: str = "center",
+        logger: Any = None,
+    ) -> BodyVolumeResult:
+        """Predict a smoke tile or full survey and fill the complete target zone."""
+
+        resolved_batch_size = int(
+            batch_size
+            or self.inference_config.get("batch_size")
+            or self.training_config.batch_size
+        )
+        inverter = self._inverter(resolved_batch_size)
+        orientations = tuple(
+            self.inference_config.get("orientations")
+            or self.training_config.orientations
+        )
+        volume = BodyVolumeInverter(
+            inverter,
+            VolumeInferenceConfig(
+                batch_size=resolved_batch_size,
+                log_every_sections=int(self.inference_config.get("log_every_sections") or 10),
+                min_lfm_support=int(self.inference_config.get("min_lfm_support") or 8),
+                orientations=orientations,
+            ),
+            logger=logger,
+        )
+        inline_bounds = None
+        xline_bounds = None
+        if smoke_tile_size is not None:
+            if smoke_tile_origin == "northwest":
+                inline_bounds = (0, min(int(smoke_tile_size), int(self.lfm.ilines.size)))
+                xline_bounds = (0, min(int(smoke_tile_size), int(self.lfm.xlines.size)))
+            elif smoke_tile_origin == "center":
+                inline_bounds = centered_tile_bounds(self.lfm.ilines.size, smoke_tile_size)
+                xline_bounds = centered_tile_bounds(self.lfm.xlines.size, smoke_tile_size)
+            else:
+                raise ValueError("smoke_tile_origin must be 'center' or 'northwest'.")
+        return volume.predict(inline_bounds=inline_bounds, xline_bounds=xline_bounds)
+
+
+@dataclass(frozen=True)
+class _BodyOptions:
+    output_dir: Path | None = None
+    lfm_run_dir: Path | None = None
+    variant_id: str | None = None
+    well_control_run_dir: Path | None = None
+    forward_model_inputs: Path | None = None
+
+
+def load_config(path: Path) -> dict[str, Any]:
     experiment = load_yaml_config(path)
     workflow_config = str(experiment.get("workflow_config") or "").strip()
     if not workflow_config:
@@ -87,7 +241,7 @@ def _required_input(stage_config: Mapping[str, Any], key: str, override: object)
     return value
 
 
-def _load_forward_inputs(path: Path, *, domain: str, depth_basis: str | None) -> tuple[np.ndarray, np.ndarray, AIVelocityRelation | None, dict[str, Any]]:
+def load_forward_inputs(path: Path, *, domain: str, depth_basis: str | None) -> tuple[np.ndarray, np.ndarray, AIVelocityRelation | None, dict[str, Any]]:
     if not path.is_file():
         raise FileNotFoundError(path)
     with path.open("r", encoding="utf-8") as handle:
@@ -124,7 +278,7 @@ def _resolve_output_dir(value: Path | None, workflow: WorkflowConfig) -> Path:
     return resolve_relative_path(workflow.output_root, root=REPO_ROOT) / f"ginn_v2_body_inversion_{timestamp}"
 
 
-def _build_runtime(raw: Mapping[str, Any], args: argparse.Namespace) -> tuple[WorkflowConfig, BodyInversionConfig, Path, Path, Path, Path, str]:
+def _build_runtime(raw: Mapping[str, Any], args: _BodyOptions) -> tuple[WorkflowConfig, BodyInversionConfig, Path, Path, Path, Path, str]:
     workflow = WorkflowConfig.from_mapping(raw)
     section = raw.get("ginn_v2_body_inversion")
     if not isinstance(section, Mapping):
@@ -276,64 +430,32 @@ def _write_well_waveform_qc(
     )
 
 
-def _write_trial_comparison(path: Path, results: list[TrialResult]) -> None:
-    """Write the fine-tuning checkpoint comparison as a human-readable table."""
+def train_body(
+    config_path: str | Path = "experiments/ginn_v2/ginn_v2.yaml",
+    *,
+    stage: Stage = "all",
+    pretrain_checkpoint: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    lfm_run_dir: str | Path | None = None,
+    variant_id: str | None = None,
+    well_control_run_dir: str | Path | None = None,
+    forward_model_inputs: str | Path | None = None,
+) -> BodyRun:
+    """Run reusable self-supervised pretraining, semi-supervised finetuning, or both."""
 
-    fieldnames = (
-        "trial_id",
-        "action",
-        "selected_epoch",
-        "stop_reason",
-        "gate_passed",
-        "first_failed_gate",
-        "masked_corr_change_from_pretrain_median",
-        "masked_shape_median",
-        "visible_corr_median",
-        "visible_shape_median",
-        "well_pooled_rmse",
-        "well_pooled_bias",
-        "well_body_correlation_by_well",
-        "lfm_drift_rmse",
-        "short_wave_energy_fraction",
-        "roughness_ratio",
-        "roughness_ratio_by_well",
-        "orientation_disagreement_rms_ratio",
+    if stage not in {"all", "pretrain", "finetune"}:
+        raise ValueError("stage must be 'all', 'pretrain', or 'finetune'.")
+    if stage == "finetune" and pretrain_checkpoint is None:
+        raise ValueError("finetune requires an explicit pretrain_checkpoint.")
+    args = _BodyOptions(
+        output_dir=None if output_dir is None else Path(output_dir),
+        lfm_run_dir=None if lfm_run_dir is None else Path(lfm_run_dir),
+        variant_id=variant_id,
+        well_control_run_dir=None if well_control_run_dir is None else Path(well_control_run_dir),
+        forward_model_inputs=None if forward_model_inputs is None else Path(forward_model_inputs),
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for result in results:
-            metrics = result.metrics
-            details = result.gate.details
-            writer.writerow(
-                {
-                    "trial_id": result.trial_id,
-                    "action": result.adjustment.action,
-                    "selected_epoch": "" if result.selected_epoch is None else result.selected_epoch,
-                    "stop_reason": result.stop_reason,
-                    "gate_passed": result.gate.passed,
-                    "first_failed_gate": result.gate.first_failed_gate or "",
-                    "masked_corr_change_from_pretrain_median": details.get("masked_corr_change_from_pretrain_median", ""),
-                    "masked_shape_median": float(np.median(metrics.masked_shape_loss)),
-                    "visible_corr_median": float(np.median(metrics.visible_correlation)),
-                    "visible_shape_median": float(np.median(metrics.visible_shape_loss)),
-                    "well_pooled_rmse": metrics.well_pooled_rmse,
-                    "well_pooled_bias": metrics.well_pooled_bias,
-                    "well_body_correlation_by_well": json.dumps(metrics.well_body_correlation_by_well, ensure_ascii=False, sort_keys=True),
-                    "lfm_drift_rmse": metrics.lfm_drift_rmse,
-                    "short_wave_energy_fraction": metrics.short_wave_energy_fraction,
-                    "roughness_ratio": metrics.roughness_ratio,
-                    "roughness_ratio_by_well": json.dumps(metrics.roughness_ratio_by_well, ensure_ascii=False, sort_keys=True),
-                    "orientation_disagreement_rms_ratio": metrics.orientation_disagreement_rms_ratio,
-                }
-            )
-
-
-def main() -> None:
-    args = parse_args()
-    config_path = resolve_relative_path(args.config, root=REPO_ROOT)
-    raw = _load_composed_config(config_path)
+    config_path = resolve_relative_path(config_path, root=REPO_ROOT)
+    raw = load_config(config_path)
     workflow, config, lfm_run_dir, well_control_run_dir, forward_inputs_path, output_dir, variant_id = _build_runtime(raw, args)
     if output_dir.exists():
         raise FileExistsError(f"Body-inversion output directory already exists: {output_dir}; use a new output directory.")
@@ -374,7 +496,7 @@ def main() -> None:
         dict(baseline_config.get("filter") or {}),
         sample_axis,
     )
-    wavelet_time_s, wavelet_amplitude, relation, forward_payload = _load_forward_inputs(
+    wavelet_time_s, wavelet_amplitude, relation, forward_payload = load_forward_inputs(
         forward_inputs_path,
         domain=workflow.seismic.domain,
         depth_basis=workflow.seismic.depth_basis,
@@ -502,47 +624,59 @@ def main() -> None:
         },
     )
 
-    logger.info("shared masked pretraining start")
-    shared_pretrain_checkpoint, pretrain_metrics = trainer.run_pretraining()
-    write_json(output_dir / "pretrain_metrics.json", pretrain_metrics.to_json_dict())
-    logger.info(
-        "shared masked pretraining ready | checkpoint=%s | masked_corr=%.4f | well_rmse=%.5f",
-        shared_pretrain_checkpoint,
-        float(np.median(pretrain_metrics.masked_correlation)),
-        pretrain_metrics.well_pooled_rmse,
-    )
-
-    if (
-        float(np.median(pretrain_metrics.masked_correlation))
-        < float(np.median(baseline.masked_correlation)) + config.gates.pretrain_masked_corr_improvement
-        or float(np.median(pretrain_metrics.masked_shape_loss))
-        > config.gates.pretrain_masked_shape_ratio * float(np.median(baseline.masked_shape_loss))
-    ):
-        write_json(
-            output_dir / "body_inversion_status.json",
-            {"status": "pretraining_not_accepted", "checkpoint": repo_relative_path(shared_pretrain_checkpoint, root=REPO_ROOT)},
+    warnings: list[str] = []
+    if stage in {"all", "pretrain"}:
+        logger.info("shared masked pretraining start")
+        shared_pretrain_checkpoint, pretrain_metrics = trainer.run_pretraining()
+        write_json(output_dir / "pretrain_metrics.json", pretrain_metrics.to_json_dict())
+        logger.info(
+            "shared masked pretraining ready | checkpoint=%s | masked_corr=%.4f | well_rmse=%.5f",
+            shared_pretrain_checkpoint,
+            float(np.median(pretrain_metrics.masked_correlation)),
+            pretrain_metrics.well_pooled_rmse,
         )
-        raise RuntimeError("Shared masked pretraining did not improve the LFM-only masked reconstruction.")
+        if float(np.median(pretrain_metrics.masked_correlation)) < (
+            float(np.median(baseline.masked_correlation)) + config.warnings.pretrain_masked_corr_improvement
+        ):
+            warnings.append("pretrain_masked_correlation_below_reference")
+        if float(np.median(pretrain_metrics.masked_shape_loss)) > (
+            config.warnings.pretrain_masked_shape_ratio * float(np.median(baseline.masked_shape_loss))
+        ):
+            warnings.append("pretrain_masked_shape_above_reference")
+        if stage == "pretrain":
+            write_json(
+                output_dir / "body_inversion_status.json",
+                {
+                    "status": "completed_with_warnings" if warnings else "completed",
+                    "stage": "pretrain",
+                    "warnings": warnings,
+                    "checkpoint": repo_relative_path(shared_pretrain_checkpoint, root=REPO_ROOT),
+                },
+            )
+            return BodyRun(output_dir, shared_pretrain_checkpoint, None, tuple(warnings))
+    else:
+        shared_pretrain_checkpoint = resolve_relative_path(pretrain_checkpoint, root=REPO_ROOT)
+        if not shared_pretrain_checkpoint.is_file():
+            raise FileNotFoundError(shared_pretrain_checkpoint)
 
     logger.info("single semi-supervised finetune start")
     selected = trainer.run_finetuning(
         baseline=baseline,
         resume_checkpoint=shared_pretrain_checkpoint,
     )
-    results = [selected]
-    write_json(output_dir / "trial_results.json", {"trials": [item.to_json_dict() for item in results]})
-    _write_trial_comparison(output_dir / "trial_comparison.csv", results)
+    write_json(output_dir / "finetune_result.json", selected.to_json_dict())
     selected_path = output_dir / "selected_checkpoint.pt"
     shutil.copyfile(selected.selected_checkpoint, selected_path)
+    warnings.extend(f"finetune_{name}" for name in selected.warnings.warnings)
     write_json(
         output_dir / "selected_checkpoint.json",
         {
-            "status": "accepted" if selected.gate.passed else "completed_not_accepted",
+            "status": "completed_with_warnings" if warnings else "completed",
+            "warnings": warnings,
             "selected_checkpoint": repo_relative_path(selected_path, root=REPO_ROOT),
-            "trial_id": selected.trial_id,
             "epoch": selected.selected_epoch,
-            "selection_rule": "earliest_quality_checkpoint_with_masked_seismic_constraint",
-            "gate": selected.gate.to_json_dict(),
+            "selection_rule": "best_recorded_finetune_checkpoint",
+            "quality_warnings": selected.warnings.to_json_dict(),
         },
     )
     selected_model = CenterTraceBodyNet(config.network).to(trainer.device)
@@ -556,18 +690,197 @@ def main() -> None:
     write_json(
         output_dir / "body_inversion_status.json",
         {
-            "status": "accepted" if selected.gate.passed else "completed_not_accepted",
+            "status": "completed_with_warnings" if warnings else "completed",
+            "stage": stage,
+            "warnings": warnings,
             "selected_checkpoint": repo_relative_path(selected_path, root=REPO_ROOT),
             "review_package": review,
             "finetune_epochs": config.finetune_epochs,
-            "gate": selected.gate.to_json_dict(),
+            "quality_warnings": selected.warnings.to_json_dict(),
         },
     )
-    print("=== GINN V2 body inversion ===")
-    print(f"Output: {output_dir}")
-    print(f"Selected checkpoint: {selected_path}")
-    print(f"Run: {selected.trial_id}, epoch: {selected.selected_epoch}")
+    return BodyRun(output_dir, shared_pretrain_checkpoint, selected_path, tuple(warnings))
 
 
-if __name__ == "__main__":
-    main()
+def load_body(
+    config_path: str | Path = "experiments/ginn_v2/ginn_v2.yaml",
+    *,
+    checkpoint: str | Path | None = None,
+    lfm_run_dir: str | Path | None = None,
+    variant_id: str | None = None,
+    well_control_run_dir: str | Path | None = None,
+    forward_model_inputs: str | Path | None = None,
+    batch_size: int | None = None,
+) -> LoadedBody:
+    """Load a trained body facade without exposing its internal assembly."""
+
+    config_path = resolve_relative_path(config_path, root=REPO_ROOT)
+    raw = load_config(config_path)
+    workflow = WorkflowConfig.from_mapping(raw)
+    section = raw.get("ginn_v2_body_inversion")
+    if not isinstance(section, Mapping):
+        raise ValueError("Config lacks explicit ginn_v2_body_inversion section.")
+    inputs = section.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise ValueError("ginn_v2_body_inversion.inputs must be a mapping.")
+    training = section.get("training")
+    if not isinstance(training, Mapping):
+        raise ValueError("ginn_v2_body_inversion.training must be a mapping.")
+    config = BodyInversionConfig.from_mapping(training)
+    inference = raw.get("ginn_v2_volume_inference")
+    if not isinstance(inference, Mapping):
+        raise ValueError("ginn_v2_volume_inference must be a mapping.")
+    checkpoint_path = resolve_relative_path(
+        checkpoint if checkpoint is not None else str(inference.get("checkpoint") or ""),
+        root=REPO_ROOT,
+    )
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(checkpoint_path)
+    lfm_path = resolve_relative_path(
+        lfm_run_dir if lfm_run_dir is not None else str(inputs.get("lfm_run_dir") or ""),
+        root=REPO_ROOT,
+    )
+    well_path = resolve_relative_path(
+        well_control_run_dir
+        if well_control_run_dir is not None
+        else str(inputs.get("well_control_run_dir") or ""),
+        root=REPO_ROOT,
+    )
+    forward_path = resolve_relative_path(
+        forward_model_inputs
+        if forward_model_inputs is not None
+        else str(inputs.get("forward_model_inputs") or ""),
+        root=REPO_ROOT,
+    )
+    selected_variant = str(variant_id or inputs.get("variant_id") or "").strip()
+    if not selected_variant:
+        raise ValueError("ginn_v2_body_inversion.inputs.variant_id must be explicit.")
+    lfm = load_lfm_input(
+        {
+            "lfm_run_dir": str(lfm_path),
+            "variant_id": selected_variant,
+            "well_control_run_dir": str(well_path),
+        },
+        repo_root=REPO_ROOT,
+    )
+    data_root = resolve_relative_path(workflow.data_root, root=REPO_ROOT)
+    seismic_path = resolve_relative_path(workflow.seismic.file, root=data_root)
+    survey_options = (
+        segy_options_from_config(workflow.seismic.as_dict())
+        if workflow.seismic.type == "segy"
+        else {}
+    )
+    survey = open_survey(
+        seismic_path,
+        workflow.seismic.type,
+        segy_options=survey_options or None,
+    )
+    sample_axis = survey.sample_axis(workflow.seismic.domain)
+    if not np.array_equal(sample_axis.values, lfm.sample_axis.values):
+        raise ValueError("Seismic and LFM SampleAxis values differ.")
+    baseline = dict(lfm.variant.variant_metadata.get("resolved_baseline_config") or {})
+    lowpass = parse_lowpass_spec(dict(baseline.get("filter") or {}), sample_axis)
+    wavelet_time_s, wavelet_amplitude, _relation, _payload = load_forward_inputs(
+        forward_path,
+        domain=workflow.seismic.domain,
+        depth_basis=workflow.seismic.depth_basis,
+    )
+    adapter: DepthDomainAdapter | TimeDomainAdapter
+    if workflow.seismic.domain == "depth":
+        adapter = DepthDomainAdapter(
+            torch.as_tensor(wavelet_time_s, dtype=torch.float32),
+            torch.as_tensor(wavelet_amplitude, dtype=torch.float32),
+        )
+    else:
+        adapter = TimeDomainAdapter(
+            torch.as_tensor(wavelet_time_s, dtype=torch.float32),
+            torch.as_tensor(wavelet_amplitude, dtype=torch.float32),
+        )
+    normalization = fit_lfm_normalization(
+        lfm.log_ai,
+        lfm.valid_mask,
+        geometry=survey.line_geometry,
+    )
+    reader = PatchReader(
+        SurveyTraceSource(survey=survey, sample_axis=sample_axis, geometry=survey.line_geometry),
+        lfm_log_ai=lfm.log_ai,
+        lfm_valid_mask=lfm.valid_mask,
+        ilines=lfm.ilines,
+        xlines=lfm.xlines,
+        sample_axis=sample_axis,
+        normalization=normalization,
+        patch_radius=config.patch_radius,
+        cache_size=max(config.cache_size, 4 * config.patch_radius + 2),
+        seismic_feature_mode=config.seismic_feature_mode,
+        seismic_balance_window_samples=config.seismic_balance_window_samples,
+        seismic_balance_floor_fraction=config.seismic_balance_floor_fraction,
+    )
+    device = torch.device(str(inference.get("device") or config.device))
+    model = CenterTraceBodyNet(config.network).to(device)
+    payload = load_checkpoint(
+        checkpoint_path,
+        model=model,
+        expected_network_config=config.network,
+        map_location=device,
+    )
+    if dict(payload["run_config"]) != config.to_json_dict():
+        raise ValueError("Checkpoint model semantics differ from the current GINN configuration.")
+    resolved_inference = dict(inference)
+    if batch_size is not None:
+        resolved_inference["batch_size"] = int(batch_size)
+    return LoadedBody(
+        checkpoint=checkpoint_path,
+        checkpoint_payload=payload,
+        lfm_run_dir=lfm_path,
+        well_control_run_dir=well_path,
+        forward_model_inputs=forward_path,
+        workflow=workflow,
+        training_config=config,
+        inference_config=resolved_inference,
+        lfm=lfm,
+        survey=survey,
+        sample_axis=sample_axis,
+        seismic_path=seismic_path,
+        reader=reader,
+        model=model,
+        adapter=adapter,
+        lfm_lowpass_spec=lowpass,
+    )
+
+
+def pretrain_body(
+    config_path: str | Path = "experiments/ginn_v2/ginn_v2.yaml",
+    **kwargs: Any,
+) -> BodyRun:
+    """Create a reusable self-supervised body checkpoint."""
+
+    return train_body(config_path, stage="pretrain", **kwargs)
+
+
+def finetune_body(
+    config_path: str | Path = "experiments/ginn_v2/ginn_v2.yaml",
+    *,
+    pretrained: BodyRun | str | Path,
+    **kwargs: Any,
+) -> BodyRun:
+    """Apply well supervision to a reusable self-supervised checkpoint."""
+
+    checkpoint = pretrained.pretrain_checkpoint if isinstance(pretrained, BodyRun) else pretrained
+    return train_body(
+        config_path,
+        stage="finetune",
+        pretrain_checkpoint=checkpoint,
+        **kwargs,
+    )
+
+
+__all__ = [
+    "BodyRun",
+    "LoadedBody",
+    "finetune_body",
+    "load_config",
+    "load_body",
+    "load_forward_inputs",
+    "pretrain_body",
+    "train_body",
+]

@@ -6,9 +6,10 @@ import math
 from typing import Any
 
 import numpy as np
+from cup.utils.masks import true_runs
 
 
-BODY_SMOOTHING_FWHM_M = 15.0
+BODY_SMOOTHING_FWHM_M = 25.0
 _FWHM_TO_SIGMA = 1.0 / (2.0 * math.sqrt(2.0 * math.log(2.0)))
 _GAUSSIAN_TRUNCATE_SIGMA = 8.0
 
@@ -99,8 +100,7 @@ def gaussian_smooth_finite_runs_numpy(
     if np.any(~np.isfinite(coordinates)) or np.any(np.diff(coordinates) <= 0.0):
         raise ValueError("coordinates_m must be finite and strictly increasing.")
     output = np.full(array.shape, np.nan, dtype=array.dtype)
-    padded = np.r_[False, np.isfinite(array), False]
-    for start, stop in np.flatnonzero(padded[1:] != padded[:-1]).reshape((-1, 2)):
+    for start, stop in true_runs(np.isfinite(array)):
         output[start:stop] = gaussian_smooth_numpy(
             array[start:stop],
             coordinates[start:stop],

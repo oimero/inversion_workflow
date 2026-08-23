@@ -47,7 +47,7 @@ from cup.utils.io import (
 )
 from cup.utils.statistics import aggregate_cluster_then_global
 from cup.seismic.viz import plot_well_waveform_qc
-from cup.well.assets import normalize_well_name
+from cup.well.inventory import normalize_well_name
 from cup.well.tie import (
     TieEvaluationWell,
     WaveletCandidate,

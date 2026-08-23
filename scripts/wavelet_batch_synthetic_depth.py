@@ -45,7 +45,7 @@ from cup.utils.io import (
 )
 from cup.config.sources import resolve_source_run
 from cup.config.workflow import WorkflowConfig
-from cup.well.contracts import DEPTH_WAVELET_BATCH_SCHEMA_VERSION
+from cup.well.tie import DEPTH_WAVELET_BATCH_SCHEMA_VERSION
 from cup.seismic.survey import segy_options_from_config
 
 matplotlib.use("Agg")

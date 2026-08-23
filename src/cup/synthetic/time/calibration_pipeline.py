@@ -38,9 +38,9 @@ from cup.utils.io import (
     resolve_relative_path,
     write_json,
 )
-from cup.well.assets import normalize_well_name
+from cup.well.inventory import normalize_well_name
 from cup.well.las import read_las_curve
-from cup.well.td import find_well_top_md, load_workflow_time_depth_table_csv
+from cup.well.trajectory import find_well_top_md, load_workflow_time_depth_table_csv
 
 
 def _piecewise_cell_average(

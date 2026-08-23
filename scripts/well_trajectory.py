@@ -43,7 +43,7 @@ from cup.utils.io import (
     sanitize_filename,
     write_json,
 )
-from cup.well.assets import build_file_lookup, normalize_well_name
+from cup.well.inventory import build_file_lookup, normalize_well_name
 from cup.well.trajectory import WellTrajectory, trajectory_summary, z_tvd_residual_m
 
 SCHEMA_VERSION = "well_trajectory_v2"

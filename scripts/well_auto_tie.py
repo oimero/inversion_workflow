@@ -42,7 +42,7 @@ from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.trace_sampling import assemble_bilinear_trace_from_plan, build_bilinear_trace_sample_plan
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.config.workflow import WorkflowConfig, merge_dict_defaults
-from cup.well.contracts import WELL_AUTO_TIE_SCHEMA_VERSION
+from cup.well.tie import WELL_AUTO_TIE_SCHEMA_VERSION
 from cup.config.sources import resolve_source_run
 from cup.utils.io import (
     CONTRACT_FINGERPRINT_SCHEMA,
@@ -56,10 +56,10 @@ from cup.utils.io import (
 )
 from cup.utils.coerce import as_bool
 from cup.utils.masks import true_runs
-from cup.well.assets import build_file_lookup
-from cup.well.gaps import fill_short_joint_gaps, prepare_continuous_tie_logs
+from cup.well.inventory import build_file_lookup
+from cup.well.tie import fill_short_joint_gaps, prepare_continuous_tie_logs
 from cup.well.las import export_logset_to_las, load_standard_vp_rho_logs
-from cup.well.td import (
+from cup.well.trajectory import (
     PreparedTieWindow,
     TargetTieWindow,
     build_tdt_from_anchor,

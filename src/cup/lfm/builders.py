@@ -15,7 +15,7 @@ from cup.lfm.math import (
     values_are_constant,
 )
 from cup.lfm.types import LfmContext, LfmVariantResult
-from cup.well.real_field_controls import WellControl, WellControlSet
+from cup.well.controls import WellControl, WellControlSet
 
 
 def _required_mapping(config: Mapping[str, Any], key: str, *, path: str) -> dict[str, Any]:

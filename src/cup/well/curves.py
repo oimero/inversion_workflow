@@ -1,20 +1,4 @@
-"""cup.well.curves: LAS 曲线分类与主曲线选择。
-
-本模块提供第二步 LAS 曲线筛选的核心逻辑：曲线简称规范化、按 mnemonic
-规则进行类别归属、以及每个类别中选择主曲线的优先级算法。
-
-边界说明
---------
-- 本模块不读取 LAS 文件，不进行曲线数值处理。
-- LLM 分类为预留接入点，当前实现基于纯规则匹配。
-
-核心公开对象
-------------
-1. CurveInfo / CurveClassification / CurveSelection: 曲线分类数据结构。
-2. classify_curves_by_rules: 按 mnemonic 规则对曲线进行类别归属。
-3. select_primary_curves: 从分类结果中选择每类的主曲线。
-4. normalize_mnemonic / exact_mnemonic: 曲线简称规范化。
-"""
+"""LAS curve mnemonic rules, classification, and primary selection."""
 
 from __future__ import annotations
 
@@ -22,8 +6,202 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
-from cup.well.mnemonics import CURVE_CATEGORY_MNEMONICS, CURVE_CATEGORY_PRIORITY
+CURVE_CATEGORY_MNEMONICS = {
+    "caliper": (
+        "CAL",
+        "CALI",
+        "BS",
+        "HCAL",
+        "HDAR",
+    ),
+    "gamma_ray": (
+        "GR",
+        "GR-NORM",
+        "GR_CAL",
+        "GAMMARAY",
+    ),
+    "p_sonic": (
+        "DT",
+        "DTC",
+        "DTCO",
+        "DT_USM",
+        "AC",
+        "CALIBRATEDSONICLOG",
+        "VP",
+        "VP_MPS",
+        "VPMS",
+    ),
+    "s_sonic": (
+        "DTS",
+        "DTSM",
+        "DTSH",
+        "DTSM_FAST",
+        "DTSM_SLOW",
+        "DTS_USM",
+        "VS",
+        "VS_MPS",
+        "VSMS",
+    ),
+    "density": (
+        "DEN",
+        "RHOB",
+        "RHOZ",
+        "HDRA",
+        "RHO",
+        "RHO_GCC",
+    ),
+    "resistivity": (
+        "RT",
+        "LLD",
+        "LLD1",
+        "LLS",
+        "MSFL",
+        "ILD",
+        "AT90",
+        "RD",
+        "RS",
+        "RXO",
+        "RLA1",
+        "RLA2",
+        "RLA3",
+        "RLA4",
+        "RLA5",
+        "A40H",
+        "P16H",
+        "P28H",
+        "P34H",
+        "P40H",
+    ),
+    "spontaneous_potential": ("SP",),
+    "porosity": (
+        "POR",
+        "PHIE",
+        "PHIT",
+        "PHIE_HILT",
+        "BFV",
+        "CN",
+    ),
+    "permeability": (
+        "PERM",
+        "PERM_COATES_FFI",
+    ),
+    "water_saturation": (
+        "SW",
+        "SWE",
+        "SWT",
+        "SW_HILT",
+    ),
+}
 
+
+CURVE_CATEGORY_PRIORITY = {
+    "caliper": (
+        "CAL",
+        "CALI",
+        "BS",
+        "HCAL",
+        "HDAR",
+    ),
+    "gamma_ray": (
+        "GR",
+        "GR1",
+        "GR-NORM",
+        "GR_CAL",
+        "GAMMARAY",
+    ),
+    "p_sonic": (
+        "DT",
+        "DTC",
+        "DTCO",
+        "AC",
+        "VP",
+        "VP_MPS",
+        "VPMS",
+    ),
+    "s_sonic": (
+        "DTS",
+        "DTSM",
+        "DTSH",
+        "VS",
+        "VS_MPS",
+        "VSMS",
+    ),
+    "density": (
+        "DEN",
+        "RHOB",
+        "RHOZ",
+        "HDRA",
+        "RHO",
+        "RHO_GCC",
+    ),
+    "resistivity": (
+        "RT",
+        "LLD",
+        "LLD1",
+        "LLS",
+        "MSFL",
+        "ILD",
+        "AT90",
+        "RD",
+        "RS",
+        "RXO",
+    ),
+    "spontaneous_potential": ("SP",),
+    "porosity": (
+        "POR",
+        "PHIE",
+        "PHIT",
+        "PHIE_HILT",
+        "CN",
+        "BFV",
+    ),
+    "permeability": (
+        "PERM",
+        "PERM_COATES_FFI",
+    ),
+    "water_saturation": (
+        "SW",
+        "SWE",
+        "SWT",
+        "SW_HILT",
+    ),
+}
+
+
+DERIVED_OR_AUXILIARY_MNEMONICS = (
+    "AI",
+    "RC",
+    "DRIFT",
+    "RESAMPLEDAI",
+    "RESIDUALDRIFTLOG",
+    "TWTPICKED",
+    "TWTPICKED2",
+    "ONE-WAYTIME",
+    "SESMIC",
+    "SESMIC2",
+    "INPEFA",
+    "PEFA",
+    "D-INPEFA_GR",
+    "GRINPEFA",
+    "FACIES",
+    "FLUIDS",
+    "LITH",
+    "LITH_SHOW",
+    "BOOL_POR",
+    "VSH",
+    "SAND??SHADIBI",
+    "AMP",
+)
+
+
+_CALI_MNEMONICS = CURVE_CATEGORY_MNEMONICS["caliper"]
+_VP_MNEMONICS = ("DT", "AC", "DTC", "DTCO", "VP", "VP_MPS", "VPMS")
+_VS_MNEMONICS = ("DTS", "DTSM", "DTSH")
+_RHO_MNEMONICS = CURVE_CATEGORY_MNEMONICS["density"]
+_GR_MNEMONICS = CURVE_CATEGORY_MNEMONICS["gamma_ray"]
+_POR_MNEMONICS = CURVE_CATEGORY_MNEMONICS["porosity"]
+_PERM_MNEMONICS = CURVE_CATEGORY_MNEMONICS["permeability"]
+_SW_MNEMONICS = CURVE_CATEGORY_MNEMONICS["water_saturation"]
 
 def normalize_mnemonic(mnemonic: object) -> str:
     """为规则匹配规范化 LAS 曲线简称。"""

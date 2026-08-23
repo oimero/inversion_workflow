@@ -1,16 +1,98 @@
-"""Time/depth adapters behind one GINN V2 forward-and-scale interface."""
+"""Domain-neutral observations and time/depth physics adapters."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Mapping
 
 import torch
 from torch import Tensor
 
 from cup.physics.torch_backend import forward_depth, forward_time
 from cup.seismic.geometry import SampleAxis
-from ginn_v2.contracts import CommonObservationBatch, ForwardClosureResult
-from ginn_v2.scales import depth_coordinates_from_twt
+
+
+def _trace_batch(value: Tensor, *, name: str, batch: int | None = None, samples: int | None = None) -> Tensor:
+    if not isinstance(value, Tensor) or not torch.is_floating_point(value):
+        raise TypeError(f"{name} must be a floating torch.Tensor.")
+    if value.ndim != 2:
+        raise ValueError(f"{name} must have shape (batch, samples).")
+    if batch is not None and value.shape[0] != batch:
+        raise ValueError(f"{name} batch dimension differs from observed_seismic.")
+    if samples is not None and value.shape[1] != samples:
+        raise ValueError(f"{name} sample dimension differs from SampleAxis.")
+    return value
+
+
+@dataclass(frozen=True)
+class CommonObservationBatch:
+    """Domain-neutral center-trace batch passed through the shared workflow.
+
+    Domain-specific arrays such as ``velocity_mps`` live in ``domain_extras``.
+    The trace arrays all use ``(batch, samples)`` so training code has no domain
+    branches and no implicit channel convention.
+    """
+
+    sample_axis: SampleAxis
+    observed_seismic: Tensor
+    observed_valid_mask: Tensor
+    lfm_log_ai: Tensor
+    lfm_valid_mask: Tensor
+    xy_m: Tensor
+    domain_extras: Mapping[str, Tensor]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sample_axis, SampleAxis):
+            raise TypeError("sample_axis must be cup.seismic.geometry.SampleAxis.")
+        observed = _trace_batch(
+            self.observed_seismic,
+            name="observed_seismic",
+            samples=self.sample_axis.values.size,
+        )
+        batch, samples = observed.shape
+        _trace_batch(self.lfm_log_ai, name="lfm_log_ai", batch=batch, samples=samples)
+        for name, value in (
+            ("observed_valid_mask", self.observed_valid_mask),
+            ("lfm_valid_mask", self.lfm_valid_mask),
+        ):
+            if not isinstance(value, Tensor) or value.dtype != torch.bool or value.shape != observed.shape:
+                raise ValueError(f"{name} must be a bool tensor matching observed_seismic.")
+        if not isinstance(self.xy_m, Tensor) or not torch.is_floating_point(self.xy_m):
+            raise TypeError("xy_m must be a floating torch.Tensor.")
+        if self.xy_m.shape != (batch, 2):
+            raise ValueError("xy_m must contain actual metre coordinates with shape (batch, 2).")
+        if not isinstance(self.domain_extras, Mapping):
+            raise TypeError("domain_extras must be a mapping.")
+
+
+@dataclass(frozen=True)
+class ForwardClosureResult:
+    """Body-scale prediction and its frozen-forward reconstruction."""
+
+    body_log_ai: Tensor
+    synthetic_seismic: Tensor
+    valid_mask: Tensor
+
+    def __post_init__(self) -> None:
+        if self.body_log_ai.shape != self.synthetic_seismic.shape:
+            raise ValueError("body_log_ai and synthetic_seismic must have matching shapes.")
+        if self.valid_mask.dtype != torch.bool or self.valid_mask.shape != self.body_log_ai.shape:
+            raise ValueError("valid_mask must be boolean and match the closure outputs.")
+
+
+def depth_coordinates_from_twt(velocity_mps: Tensor, twt_s: Tensor) -> Tensor:
+    """Integrate fixed velocity along TWT to physical depth coordinates."""
+    if velocity_mps.ndim != 2 or twt_s.ndim != 1 or velocity_mps.shape[-1] != twt_s.numel():
+        raise ValueError("velocity_mps/twt_s must have shapes (batch, samples)/(samples,).")
+    if not bool(torch.all(torch.isfinite(velocity_mps)).item()) or not bool(
+        torch.all(torch.isfinite(twt_s)).item()
+    ):
+        raise ValueError("velocity and TWT must contain only finite values.")
+    if bool(torch.any(velocity_mps <= 0.0).item()) or bool(torch.any(torch.diff(twt_s) <= 0.0).item()):
+        raise ValueError("velocity must be positive and TWT must be strictly increasing.")
+    dz = 0.25 * (velocity_mps[:, :-1] + velocity_mps[:, 1:]) * torch.diff(twt_s)[None, :]
+    return torch.cat((torch.zeros_like(velocity_mps[:, :1]), torch.cumsum(dz, dim=-1)), dim=-1)
 
 
 class DomainAdapter(ABC):
@@ -136,4 +218,11 @@ class DepthDomainAdapter(DomainAdapter):
         return output
 
 
-__all__ = ["DepthDomainAdapter", "DomainAdapter", "TimeDomainAdapter"]
+__all__ = [
+    "CommonObservationBatch",
+    "DepthDomainAdapter",
+    "DomainAdapter",
+    "ForwardClosureResult",
+    "TimeDomainAdapter",
+    "depth_coordinates_from_twt",
+]

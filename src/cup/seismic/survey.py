@@ -327,18 +327,37 @@ class SegySurveyContext:
 
         import cigsegy
 
+        flat_items = sorted(
+            (self.trace_flat_index(*key), key)
+            for key in unique_indices
+        )
+        runs: list[list[tuple[int, tuple[int, int]]]] = []
+        for item in flat_items:
+            if not runs or item[0] != runs[-1][-1][0] + 1:
+                runs.append([item])
+            else:
+                runs[-1].append(item)
+
         out: dict[tuple[int, int], grid.Seismic] = {}
         segy = cigsegy.Pysegy(str(self.seismic_file))
         try:
-            for key in unique_indices:
-                flat_idx = self.trace_flat_index(*key)
-                values = segy.collect(flat_idx, flat_idx + 1, sample_idx_start, sample_idx_end).squeeze()
-                out[key] = grid.Seismic(
-                    np.atleast_1d(np.asarray(values, dtype=np.float64)),
-                    trace_axis,
-                    basis_type,
-                    name=trace_name,
-                )
+            for run in runs:
+                block = np.asarray(
+                    segy.collect(
+                        run[0][0],
+                        run[-1][0] + 1,
+                        sample_idx_start,
+                        sample_idx_end,
+                    ),
+                    dtype=np.float64,
+                ).reshape((len(run), trace_axis.size))
+                for row, (_flat_idx, key) in enumerate(run):
+                    out[key] = grid.Seismic(
+                        block[row],
+                        trace_axis,
+                        basis_type,
+                        name=trace_name,
+                    )
         finally:
             segy.close()
         return out

@@ -1,4 +1,4 @@
-"""Run deterministic GINN V2 body inference over a depth/time survey volume."""
+"""Run deterministic GINN v2 body inference over a depth/time survey volume."""
 
 from __future__ import annotations
 
@@ -7,35 +7,22 @@ from datetime import datetime
 import json
 from pathlib import Path
 import sys
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
-import torch
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
-for path in (SRC_DIR, SCRIPT_DIR):
+for path in (SRC_DIR,):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-import ginn_v2_body_inversion as training_entry
-from cup.config.workflow import WorkflowConfig
-from cup.lfm.artifacts import load_lfm_input
-from cup.lfm.math import parse_lowpass_spec
-from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.volume_export import export_volume_like_source, log_ai_to_ai_volume
 from cup.utils.io import repo_relative_path, resolve_relative_path, write_json
 from cup.utils.logging import configure_run_logger
-from ginn_v2.adapters import DepthDomainAdapter, TimeDomainAdapter
-from ginn_v2.checkpoint import load_checkpoint
-from ginn_v2.data import PatchReader, SurveyTraceSource, fit_lfm_normalization
-from ginn_v2.inverter import BodyInverter
-from ginn_v2.model import CenterTraceBodyNet
-from ginn_v2.projector import BodyScaleProjector
-from ginn_v2.trainer import BodyInversionConfig
-from ginn_v2.volume import BodyVolumeInverter, VolumeInferenceConfig, centered_tile_bounds
+from ginn_v2 import load_body
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,6 +30,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path("experiments/ginn_v2/ginn_v2.yaml"))
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--lfm-run-dir", type=Path, default=None)
+    parser.add_argument("--variant-id", type=str, default=None)
+    parser.add_argument("--well-control-run-dir", type=Path, default=None)
+    parser.add_argument("--forward-model-inputs", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--smoke-tile-size", type=int, default=None)
     parser.add_argument(
@@ -53,12 +44,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-segy-export", action="store_true")
     return parser.parse_args()
-
-
-def _required_mapping(value: Any, *, name: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{name} must be a mapping.")
-    return value
 
 
 def _output_dir(value: Path | None) -> Path:
@@ -203,128 +188,46 @@ def _plot_sections(
 def main() -> None:
     args = parse_args()
     config_path = resolve_relative_path(args.config, root=REPO_ROOT)
-    raw = training_entry._load_composed_config(config_path)
-    workflow = WorkflowConfig.from_mapping(raw)
-    training_section = _required_mapping(raw.get("ginn_v2_body_inversion"), name="ginn_v2_body_inversion")
-    training_inputs = _required_mapping(training_section.get("inputs"), name="ginn_v2_body_inversion.inputs")
-    training_config = BodyInversionConfig.from_mapping(
-        _required_mapping(training_section.get("training"), name="ginn_v2_body_inversion.training")
+    loaded = load_body(
+        config_path,
+        checkpoint=args.checkpoint,
+        lfm_run_dir=args.lfm_run_dir,
+        variant_id=args.variant_id,
+        well_control_run_dir=args.well_control_run_dir,
+        forward_model_inputs=args.forward_model_inputs,
+        batch_size=args.batch_size,
     )
-    inference_section = _required_mapping(raw.get("ginn_v2_volume_inference"), name="ginn_v2_volume_inference")
-    checkpoint = resolve_relative_path(
-        args.checkpoint or str(inference_section.get("checkpoint") or ""),
-        root=REPO_ROOT,
-    )
-    if not checkpoint.is_file():
-        raise FileNotFoundError(checkpoint)
+    workflow = loaded.workflow
+    training_config = loaded.training_config
+    inference_section = loaded.inference_config
+    checkpoint = loaded.checkpoint
+    lfm = loaded.lfm
+    survey = loaded.survey
+    sample_axis = loaded.sample_axis
+    seismic_path = loaded.seismic_path
+    checkpoint_payload = loaded.checkpoint_payload
     output_dir = _output_dir(args.output_dir)
     if output_dir.exists():
         raise FileExistsError(f"Volume inference output already exists: {output_dir}")
     output_dir.mkdir(parents=True)
     log = configure_run_logger(output_dir, logger_name="ginn_v2_volume", file_name="volume_inference.log")
 
-    lfm_run_dir = resolve_relative_path(str(training_inputs["lfm_run_dir"]), root=REPO_ROOT)
-    well_control_run_dir = resolve_relative_path(str(training_inputs["well_control_run_dir"]), root=REPO_ROOT)
-    forward_inputs_path = resolve_relative_path(str(training_inputs["forward_model_inputs"]), root=REPO_ROOT)
-    variant_id = str(training_inputs["variant_id"])
-    lfm = load_lfm_input(
-        {
-            "lfm_run_dir": str(lfm_run_dir),
-            "variant_id": variant_id,
-            "well_control_run_dir": str(well_control_run_dir),
-        },
-        repo_root=REPO_ROOT,
-    )
-    data_root = resolve_relative_path(workflow.data_root, root=REPO_ROOT)
-    seismic_path = resolve_relative_path(workflow.seismic.file, root=data_root)
-    seismic_options = segy_options_from_config(workflow.seismic.as_dict()) if workflow.seismic.type == "segy" else {}
-    survey = open_survey(seismic_path, workflow.seismic.type, segy_options=seismic_options or None)
-    sample_axis = survey.sample_axis(workflow.seismic.domain)
-    if not np.array_equal(sample_axis.values, lfm.sample_axis.values):
-        raise ValueError("Seismic and LFM SampleAxis values differ.")
-
-    baseline_config = dict(lfm.variant.variant_metadata.get("resolved_baseline_config") or {})
-    lfm_lowpass_spec = parse_lowpass_spec(dict(baseline_config.get("filter") or {}), sample_axis)
-    wavelet_time_s, wavelet_amplitude, _relation, _payload = training_entry._load_forward_inputs(
-        forward_inputs_path,
-        domain=workflow.seismic.domain,
-        depth_basis=workflow.seismic.depth_basis,
-    )
-    if workflow.seismic.domain == "depth":
-        adapter = DepthDomainAdapter(
-            torch.as_tensor(wavelet_time_s, dtype=torch.float32),
-            torch.as_tensor(wavelet_amplitude, dtype=torch.float32),
-        )
-    else:
-        adapter = TimeDomainAdapter(
-            torch.as_tensor(wavelet_time_s, dtype=torch.float32),
-            torch.as_tensor(wavelet_amplitude, dtype=torch.float32),
-        )
-    normalization = fit_lfm_normalization(lfm.log_ai, lfm.valid_mask, geometry=survey.line_geometry)
-    reader = PatchReader(
-        SurveyTraceSource(survey=survey, sample_axis=sample_axis, geometry=survey.line_geometry),
-        lfm_log_ai=lfm.log_ai,
-        lfm_valid_mask=lfm.valid_mask,
-        ilines=lfm.ilines,
-        xlines=lfm.xlines,
-        sample_axis=sample_axis,
-        normalization=normalization,
-        patch_radius=training_config.patch_radius,
-        cache_size=max(training_config.cache_size, 4 * training_config.patch_radius + 2),
-        seismic_feature_mode=training_config.seismic_feature_mode,
-        seismic_balance_window_samples=training_config.seismic_balance_window_samples,
-        seismic_balance_floor_fraction=training_config.seismic_balance_floor_fraction,
-    )
     batch_size = int(args.batch_size or inference_section.get("batch_size") or training_config.batch_size)
-    device = torch.device(str(inference_section.get("device") or training_config.device))
-    model = CenterTraceBodyNet(training_config.network).to(device)
-    checkpoint_payload = load_checkpoint(
-        checkpoint,
-        model=model,
-        expected_network_config=training_config.network,
-        map_location=device,
-    )
-    if dict(checkpoint_payload["run_config"]) != training_config.to_json_dict():
-        raise ValueError("Checkpoint training/input contract differs from the current GINN configuration.")
-    projector = BodyScaleProjector(
-        smoothing_fwhm_m=training_config.body_smoothing_fwhm_m,
-        sample_step=float(sample_axis.step),
-        lowpass_spec=lfm_lowpass_spec,
-    )
-    inverter = BodyInverter(
-        model,
-        reader,
-        adapter,
-        projector=projector,
-        device=device,
-        batch_size=batch_size,
-    )
     orientations = tuple(inference_section.get("orientations") or training_config.orientations)
-    volume_config = VolumeInferenceConfig(
-        batch_size=batch_size,
-        log_every_sections=int(inference_section.get("log_every_sections") or 10),
-        min_lfm_support=int(inference_section.get("min_lfm_support") or 8),
-        orientations=orientations,
-    )
-    volume_inverter = BodyVolumeInverter(inverter, volume_config, logger=log)
-    inline_bounds = None
-    xline_bounds = None
-    if args.smoke_tile_size is not None:
-        if args.smoke_tile_origin == "northwest":
-            inline_bounds = (0, min(int(args.smoke_tile_size), int(lfm.ilines.size)))
-            xline_bounds = (0, min(int(args.smoke_tile_size), int(lfm.xlines.size)))
-        else:
-            inline_bounds = centered_tile_bounds(lfm.ilines.size, args.smoke_tile_size)
-            xline_bounds = centered_tile_bounds(lfm.xlines.size, args.smoke_tile_size)
     log.info(
-        "volume inference start | checkpoint=%s | batch_size=%d | orientations=%s | inline_bounds=%s | xline_bounds=%s",
+        "volume inference start | checkpoint=%s | batch_size=%d | orientations=%s | smoke_tile_size=%s | smoke_tile_origin=%s",
         checkpoint,
         batch_size,
         ",".join(orientations),
-        inline_bounds,
-        xline_bounds,
+        args.smoke_tile_size,
+        args.smoke_tile_origin,
     )
-    result = volume_inverter.predict(inline_bounds=inline_bounds, xline_bounds=xline_bounds)
+    result = loaded.predict_volume(
+        batch_size=batch_size,
+        smoke_tile_size=args.smoke_tile_size,
+        smoke_tile_origin=args.smoke_tile_origin,
+        logger=log,
+    )
     local_ilines = np.asarray(lfm.ilines[result.inline_indices], dtype=np.float64)
     local_xlines = np.asarray(lfm.xlines[result.xline_indices], dtype=np.float64)
     local_lfm = np.asarray(
@@ -346,7 +249,7 @@ def main() -> None:
     )
 
     exports: dict[str, Any] = {}
-    full_volume = inline_bounds is None and xline_bounds is None
+    full_volume = args.smoke_tile_size is None
     if not args.skip_segy_export:
         if not full_volume:
             raise ValueError("SEG-Y export requires full-volume inference; use --skip-segy-export for a smoke tile.")

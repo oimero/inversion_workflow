@@ -1,37 +1,33 @@
 """cup.well.las: LAS 文件通用 I/O、标准曲线读取与工作流导出。
 
 本模块分三层：通用 LAS 物理 I/O、项目标准曲线读取、工作流专用 LAS
-导出。同时保留旧深度域从原始 LAS 直接抽取 Vp/Rho/Vs 的兼容入口。
+导出。
 
 边界说明
 --------
 - 本模块不负责曲线分类与主曲线选择，这些由 ``cup.well.curves`` 处理。
 - 通用读取不做单位转换、不做曲线语义推断、不做标准命名。
-- ``old_*`` 入口只服务旧深度域原始 LAS 直读流程，时间域主链应读取
-  含 ``DT_USM`` 与 ``RHO_GCC`` 的标准 LAS。
 
 核心公开对象
 ------------
-1. scan_las_curves / scan_las_header: 扫描 LAS 元数据。
+1. scan_las_curves: 扫描 LAS 元数据。
 2. read_las_curve / read_las_curves: 按用户指定 mnemonic 读取通用曲线。
 3. load_vp_rho_logset_from_standard_las: 从标准 LAS 构建 Vp/Rho LogSet。
-4. export_selected_curves_to_las / export_logset_to_las / export_logsets_to_las: LAS 导出。
-5. old_load_vp_rho_logset_from_las: 旧深度域 Vp/Rho 兼容 Adapter。
+4. export_selected_curves_to_las / export_logset_to_las: LAS 导出。
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import Any, Mapping, Protocol, Sequence
 
 import lasio
 import numpy as np
 
+from cup.utils.coerce import optional_float
 from cup.well.curves import CurveInfo, exact_mnemonic, normalize_mnemonic
-from cup.well.mnemonics import _RHO_MNEMONICS, _VP_MNEMONICS, _VS_MNEMONICS
 from wtie.processing import grid
-from wtie.processing.logs import interpolate_nans
 
 _SENTINEL_VALUES = (-999.0, -999.25, -9999.0, -99999.0)
 
@@ -229,7 +225,7 @@ def _resolved_las_curve(
 
 
 def _las_null_value(las: lasio.LASFile) -> float | None:
-    return _optional_float(_header_value(las, "well", "NULL"))
+    return optional_float(_header_value(las, "well", "NULL"))
 
 
 def _las_data_array(las: lasio.LASFile, *, source: str | Path | None = None) -> np.ndarray:
@@ -363,149 +359,6 @@ def read_las_curves(
     return logs
 
 
-def _convert_velocity_input_to_mps(values: object, unit: str, property_name: str) -> np.ndarray:
-    """将速度或时差曲线转换为 m/s。"""
-    curve_values = _replace_sentinel_values(values)
-    curve_values[curve_values <= 0] = np.nan
-
-    unit_norm = _normalize_unit(unit)
-    if unit_norm == "us/ft":
-        velocity = 0.3048 * 1e6 / curve_values
-    elif unit_norm == "us/m":
-        velocity = 1e6 / curve_values
-    elif unit_norm in {"m/s", "mps", "m/sec", "meter/s", "meters/s"}:
-        velocity = curve_values
-    else:
-        raise ValueError(f"{property_name} 曲线单位不受支持: '{unit}'. 当前仅支持 us/ft、us/m 或 m/s。")
-
-    if np.all(np.isnan(velocity)):
-        raise ValueError(f"{property_name} 曲线在异常值处理与单位转换后全部为 NaN。")
-    return velocity
-
-
-def _convert_density_to_g_cm3(density_values: object, unit: str) -> np.ndarray:
-    """将密度曲线转换为 g/cm3。"""
-    density = _replace_sentinel_values(density_values)
-    unit_norm = _normalize_unit(unit)
-    if unit_norm in {"g/cm3", "g/cc", "g/cm^3"}:
-        density_g_cm3 = density
-    elif unit_norm in {"kg/m3", "kg/m^3"}:
-        density_g_cm3 = density / 1000.0
-    else:
-        raise ValueError(f"Rho 曲线单位不受支持: '{unit}'. 当前仅支持 g/cm3、g/cc 或 kg/m3。")
-
-    if np.all(np.isnan(density_g_cm3)):
-        raise ValueError("Rho 曲线在异常值处理与单位转换后全部为 NaN。")
-    return density_g_cm3
-
-
-def _finite_positive(values: np.ndarray, *, label: str) -> np.ndarray:
-    arr = np.asarray(values, dtype=np.float64).reshape(-1)
-    arr[~np.isfinite(arr)] = np.nan
-    arr[arr <= 0.0] = np.nan
-    if np.all(np.isnan(arr)):
-        raise ValueError(f"{label} contains no positive finite samples.")
-    return arr
-
-
-def _read_legacy_candidate_log(
-    las_file: lasio.LASFile,
-    candidate_mnemonics: Tuple[str, ...],
-    property_name: str,
-    curve_mnemonic: Optional[str] = None,
-) -> grid.Log:
-    if curve_mnemonic is not None:
-        return _read_las_curve_from_lasio(las_file, curve_mnemonic, source=f"legacy {property_name} reader")
-
-    lookup = build_las_curve_lookup(las_file)
-    matched: dict[int, grid.Log] = {}
-    for candidate in candidate_mnemonics:
-        resolved = resolve_las_curve_index(
-            las_file,
-            candidate,
-            match_policy="exact_then_normalized",
-            lookup=lookup,
-            source=f"legacy {property_name} reader",
-        )
-        if resolved is not None and resolved != 0:
-            matched[resolved] = _read_las_curve_from_lasio(
-                las_file,
-                str(las_file.curves[resolved].mnemonic),
-                match_policy="exact",
-                lookup=lookup,
-                source=f"legacy {property_name} reader",
-            )
-
-    if not matched:
-        raise ValueError(
-            f"未找到 {property_name} 曲线。候选简称: {list(candidate_mnemonics)}. 请检查是否存在其他可用简称？"
-        )
-    if len(matched) > 1:
-        names = [log.name for log in matched.values()]
-        raise ValueError(
-            f"检测到多个 {property_name} 候选曲线: {names}. 请通过 curve_mnemonic 显式指定要使用的简称。"
-        )
-    return next(iter(matched.values()))
-
-
-def old_extract_vp_log_from_las(
-    las_file: lasio.LASFile,
-    unit: str,
-    curve_mnemonic: Optional[str] = None,
-) -> grid.Log:
-    """旧深度域兼容入口：从原始 LAS 文件中提取纵波速度曲线（Vp）。"""
-    source_log = _read_legacy_candidate_log(las_file, _VP_MNEMONICS, "Vp", curve_mnemonic)
-    vp = _convert_velocity_input_to_mps(source_log.values, unit, "Vp")
-    vp = interpolate_nans(vp, method="linear")
-    return grid.Log(vp, source_log.basis, "md", name="Vp", unit="m/s", allow_nan=False)
-
-
-def old_extract_vs_log_from_las(
-    las_file: lasio.LASFile,
-    unit: str,
-    curve_mnemonic: Optional[str] = None,
-) -> grid.Log:
-    """旧深度域兼容入口：从原始 LAS 文件中提取横波速度曲线（Vs）。"""
-    source_log = _read_legacy_candidate_log(las_file, _VS_MNEMONICS, "Vs", curve_mnemonic)
-    vs = _convert_velocity_input_to_mps(source_log.values, unit, "Vs")
-    vs = interpolate_nans(vs, method="linear")
-    return grid.Log(vs, source_log.basis, "md", name="Vs", unit="m/s", allow_nan=False)
-
-
-def old_extract_rho_log_from_las(
-    las_file: lasio.LASFile,
-    unit: str,
-    curve_mnemonic: Optional[str] = None,
-) -> grid.Log:
-    """旧深度域兼容入口：从原始 LAS 文件中提取密度曲线（Rho）。"""
-    source_log = _read_legacy_candidate_log(las_file, _RHO_MNEMONICS, "Rho", curve_mnemonic)
-    rho = _convert_density_to_g_cm3(source_log.values, unit)
-    rho = interpolate_nans(rho, method="linear")
-    return grid.Log(rho, source_log.basis, "md", name="Rho", unit="g/cm3", allow_nan=False)
-
-
-def old_load_vp_rho_logset_from_las(
-    las_file_path: Path,
-    vp_mnemonic: Optional[str] = None,
-    rho_mnemonic: Optional[str] = None,
-    vp_unit: Optional[str] = "us/m",
-    rho_unit: Optional[str] = "g/cm3",
-) -> grid.LogSet:
-    """旧深度域兼容入口：从原始 LAS 文件路径读取 Vp/Rho 并组装为 ``grid.LogSet``。"""
-    las_file_path = Path(las_file_path)
-    if not las_file_path.exists():
-        raise FileNotFoundError(f"LAS 文件不存在: {las_file_path}")
-
-    las_file = lasio.read(las_file_path)
-    vp_log = old_extract_vp_log_from_las(
-        las_file, curve_mnemonic=vp_mnemonic, unit=vp_unit if vp_unit is not None else "us/m"
-    )
-    rho_log = old_extract_rho_log_from_las(
-        las_file, curve_mnemonic=rho_mnemonic, unit=rho_unit if rho_unit is not None else "g/cm3"
-    )
-    return grid.LogSet({"Vp": vp_log, "Rho": rho_log})
-
-
 def load_standard_vp_rho_logs(path: str | Path) -> StandardVpRhoLogs:
     """Read standard DT/Rho curves without filling missing samples."""
     try:
@@ -588,14 +441,6 @@ def _header_value(las: lasio.LASFile, section: str, mnemonic: str) -> Any:
         return None
 
 
-def _optional_float(value: Any) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if np.isfinite(number) else None
-
-
 def _estimated_sample_count(start: float | None, stop: float | None, step: float | None) -> int | None:
     if start is None or stop is None or step is None or step == 0.0:
         return None
@@ -611,10 +456,10 @@ def _index_is_monotonic(start: float | None, stop: float | None, step: float | N
 
 def _build_las_header(las: lasio.LASFile, *, fallback_well_name: str) -> LasHeader:
     index_curve = las.curves[0] if las.curves else None
-    start = _optional_float(_header_value(las, "well", "STRT"))
-    stop = _optional_float(_header_value(las, "well", "STOP"))
-    step = _optional_float(_header_value(las, "well", "STEP"))
-    null_value = _optional_float(_header_value(las, "well", "NULL"))
+    start = optional_float(_header_value(las, "well", "STRT"))
+    stop = optional_float(_header_value(las, "well", "STOP"))
+    step = optional_float(_header_value(las, "well", "STEP"))
+    null_value = optional_float(_header_value(las, "well", "NULL"))
     well_name = str(_header_value(las, "well", "WELL") or fallback_well_name).strip()
     return LasHeader(
         well_name=well_name,
@@ -628,23 +473,6 @@ def _build_las_header(las: lasio.LASFile, *, fallback_well_name: str) -> LasHead
         estimated_sample_count=_estimated_sample_count(start, stop, step),
         index_is_monotonic=_index_is_monotonic(start, stop, step),
     )
-
-
-def scan_las_header(path: Path) -> LasHeader:
-    """不加载数据样点，仅读取 LAS 元数据。
-
-    Parameters
-    ----------
-    path : Path
-        LAS 文件路径。
-
-    Returns
-    -------
-    LasHeader
-        LAS 文件头摘要。
-    """
-    las = lasio.read(str(path), ignore_data=True)
-    return _build_las_header(las, fallback_well_name=Path(path).stem)
 
 
 def scan_las_curves(path: Path) -> tuple[LasHeader, list[CurveInfo]]:
@@ -805,78 +633,6 @@ def _build_las_from_well_data(
         las.append_curve(curve_name, values, unit=unit, descr=curve_name)
 
     return las
-
-
-def export_logsets_to_las(
-    logsets: dict[str, LogsetInput],
-    output_dir: Path,
-    curve_names: list[str] | None = None,
-    null_value: float = -999.25,
-    write_fmt: str = "%.6f",
-) -> dict[str, Any]:
-    """按井批量导出 MD 域 LogSet/Log 映射到 LAS 文件。
-
-    Parameters
-    ----------
-    logsets : dict[str, LogsetInput]
-        键为井名，值为 ``grid.LogSet``、曲线映射或具有 ``logs`` 映射的对象。
-    output_dir : Path
-        输出目录。
-    curve_names : list[str] | None, optional
-        要导出的曲线名列表，为 None 时导出全部。
-    null_value : float, default=-999.25
-        LAS 文件缺失值。
-    write_fmt : str, default="%.6f"
-        数值写入格式。
-
-    Returns
-    -------
-    dict[str, Any]
-        含 ``exported_files``、``skipped_wells``、``skipped_curves`` 的结果字典。
-    """
-    _validate_write_format(write_fmt)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    exported_files: list[Path] = []
-    skipped_wells: list[dict[str, str]] = []
-    skipped_curves: list[dict[str, str]] = []
-
-    for well_name, well_data in logsets.items():
-        try:
-            logs_mapping = _extract_logs_mapping(well_data)
-            requested_curve_names = list(logs_mapping.keys()) if curve_names is None else list(curve_names)
-
-            available_curve_names: list[str] = []
-            for curve_name in requested_curve_names:
-                try:
-                    _resolve_export_curve(well_data, curve_name)
-                    available_curve_names.append(curve_name)
-                except Exception as exc:
-                    skipped_curves.append({"well": well_name, "curve": curve_name, "reason": str(exc)})
-
-            if not available_curve_names:
-                skipped_wells.append({"well": well_name, "reason": "无可导出曲线"})
-                continue
-
-            las = _build_las_from_well_data(
-                well_name=well_name,
-                well_data=well_data,
-                selected_curve_names=available_curve_names,
-                null_value=null_value,
-            )
-            output_file = output_dir / f"{well_name}.las"
-            las.write(str(output_file), version=2.0, wrap=False, fmt=write_fmt)
-            exported_files.append(output_file)
-
-        except Exception as exc:
-            skipped_wells.append({"well": well_name, "reason": str(exc)})
-
-    return {
-        "exported_files": exported_files,
-        "skipped_wells": skipped_wells,
-        "skipped_curves": skipped_curves,
-    }
 
 
 def export_logset_to_las(

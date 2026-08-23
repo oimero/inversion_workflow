@@ -12,7 +12,7 @@
 
 ## 井名
 
-- 井名匹配键入口：`cup.well.assets.normalize_well_name(name)`。
+- 井名匹配键入口：`cup.well.inventory.normalize_well_name(name)`。
     - 处理等价于 `str(name).strip().casefold()`：转字符串、去首尾空白、做大小写折叠。
     - 简单理解：`" A1 "`、`"A1"`、`"a1"` 会被当成同一口井。
 - 文件查找、DataFrame join、lookup dict 都用规范化键；输出 CSV 保留原始显示井名。
@@ -27,7 +27,7 @@
     - 标准 LAS 必须含 `DT_USM`（`us/m`）和 `RHO_GCC`（`g/cm3`），且 MD 轴有限、严格递增、规则采样。
     - 入口只读取这两条基础曲线并转换成允许 NaN 的 `Vp/Rho` `grid.LogSet`；不会静默插值缺失值，即使 LAS 含 `AI`，也不会读取或校验旧 AI。
     - 需要原始联合观测 mask 时使用 `cup.well.las.load_standard_vp_rho_logs(path)`。
-    - 基于 TDT 判断短缺口时长、填补短缺口或裁取连续标定窗，统一使用 `cup.well.gaps`。
+    - 基于 TDT 判断短缺口时长、填补短缺口或裁取连续标定窗，统一使用 `cup.well.tie`。
 - 时间域第三、四步成功导出的 LAS 固定含 `AI`：
     - 第三步 `AI` 来自清洗后的全频 `DT_USM/RHO_GCC`；任一源曲线无效时对应 AI 样点保持缺失。
     - 第四步 `AI` 来自 auto-tie 最优滤波后的 `Vp/Rho`，会重新计算，不沿用第三步或人工处理中遗留的 AI。
@@ -35,7 +35,7 @@
 
 ## 时深表
 
-- 读取入口：`cup.well.td.load_petrel_time_depth_table(path, domain="md" | "tvdss")`。
+- 读取入口：`cup.well.trajectory.load_petrel_time_depth_table(path, domain="md" | "tvdss")`。
 - Petrel 导出的时深表常见口径：
     - `TWT`：文件中为负毫秒。
     - `MD`：文件中为正米，向下为正。

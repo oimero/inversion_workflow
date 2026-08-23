@@ -38,7 +38,7 @@ from cup.utils.io import (
     resolve_relative_path,
     write_json,
 )
-from cup.well.assets import (
+from cup.well.inventory import (
     WellHead,
     WellInventory,
     WellInventoryRecord,

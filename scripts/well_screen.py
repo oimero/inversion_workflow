@@ -40,7 +40,7 @@ from cup.utils.io import (
     sanitize_filename,
     write_json,
 )
-from cup.well.assets import build_file_lookup, normalize_well_name
+from cup.well.inventory import build_file_lookup, normalize_well_name
 from cup.well.curves import (
     CurveSelection,
     classify_curves_by_rules,
@@ -49,7 +49,7 @@ from cup.well.curves import (
     select_primary_curves,
 )
 from cup.well.las import export_selected_curves_to_las, scan_las_curves
-from cup.well.mnemonics import CURVE_CATEGORY_MNEMONICS, CURVE_CATEGORY_PRIORITY
+from cup.well.curves import CURVE_CATEGORY_MNEMONICS, CURVE_CATEGORY_PRIORITY
 
 SCHEMA_VERSION = "well_screen_v2"
 

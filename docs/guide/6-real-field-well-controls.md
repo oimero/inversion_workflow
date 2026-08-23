@@ -46,7 +46,7 @@ real_field_well_controls:
 
 real_field_well_controls_qc:
   forward_model_inputs_run_dir:
-  body_smoothing_fwhm_m: 15.0
+  body_smoothing_fwhm_m: 25.0
   dynamic_correlation_window_m: 75.0
   event_threshold_fraction: 0.10
   max_event_windows_per_well: 4
@@ -116,7 +116,7 @@ real_field_well_controls_qc:
 深度域运行读取第五步发布的冻结子波和 AI–Vp 关系。每口成功井生成三张目的层图件：
 
 1. filtered full log-AI 的六联正演质控图；
-2. 15 m 主体曲线的六联正演质控图；
+2. 25 m 主体曲线的六联正演质控图；
 3. 若干真实地震波瓣窗口中的 real seismic、full/body log-AI、full-body 残差及两套合成波形对比图。合成波形子图只显示 full 和 body 两套合成地震。
 
 完整曲线与主体曲线使用同一个由完整曲线估计的振幅系数，因此事件图的合成地震子图保留两套合成波形之间的真实振幅差异。井曲线覆盖不完整时，图件显示目的层内最长的共同有效区间。
@@ -215,7 +215,7 @@ QC figures: scripts/output/real_field_well_controls_<timestamp>/qc/figures
 ### 第四步：检查三张图件
 
 - `full_waveform_qc.png` 检查 filtered full log-AI 正演与真实地震的相位、振幅和局部相关性。
-- `body_waveform_qc.png` 检查 15 m 主体尺度是否保留主要地震响应。
+- `body_waveform_qc.png` 检查 25 m 主体尺度是否保留主要地震响应。
 - `event_waveform_comparison.png` 依次观察 real seismic、full/body log-AI、full-body 残差，以及只包含 full/body 合成地震的波形差异。
 
 ---

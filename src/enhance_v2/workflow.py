@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from cup.well.real_field_controls import WellControl, WellControlSet
+from cup.well.controls import WellControl, WellControlSet
 
 
 def select_controls(controls: WellControlSet, names: tuple[str, ...]) -> WellControlSet:

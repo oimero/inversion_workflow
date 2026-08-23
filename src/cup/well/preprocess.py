@@ -427,23 +427,6 @@ def with_acoustic_impedance(curve_set: WellCurveSet) -> WellCurveSet:
     return curve_set.with_log("AI", derive_acoustic_impedance(curve_set))
 
 
-def select_curves_by_category(
-    curve_set: WellCurveSet,
-    category_to_mnemonic: Mapping[str, str],
-    categories: Sequence[str],
-) -> dict[str, grid.Log]:
-    """按类别到 mnemonic 的映射从曲线集合中选择曲线。"""
-    selected: dict[str, grid.Log] = {}
-    for category in categories:
-        mnemonic = category_to_mnemonic.get(category)
-        if mnemonic is None:
-            continue
-        log = curve_set.get(mnemonic)
-        if log is not None:
-            selected[category] = log
-    return selected
-
-
 def standard_mnemonic_for_category(category: str) -> str:
     """返回指定曲线类别在工作流中的标准 mnemonic。"""
     try:

@@ -36,9 +36,9 @@ from cup.utils.io import (
 from cup.synthetic.adapters import DepthSyntheticDomainAdapter
 from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
 from cup.utils.statistics import radius_connected_components
-from cup.well.assets import normalize_well_name
+from cup.well.inventory import normalize_well_name
 from cup.well.las import read_las_curve
-from cup.well.td import find_well_top_md
+from cup.well.trajectory import find_well_top_md
 
 
 def _required_file(path_value: Any, *, repo_root: Path, label: str) -> Path:

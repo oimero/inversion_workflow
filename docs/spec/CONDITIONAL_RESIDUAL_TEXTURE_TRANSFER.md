@@ -146,10 +146,9 @@ temperature(zone)      = temperature_multiplier * temperature_base(zone)
 ```
 
 每个 zone 必须至少有四个有效 atom，并且来自至少两口井；`temperature_base(zone)` 必须有限
-且大于零。字典构建时发布每个 zone 的 atom 数、来源井数和 temperature；不满足合同则列出
-对应 zone 并停止建库。第一轮固定输出 `temperature_multiplier = 0.75 / 1.0 / 1.5` 三组
-结果，正式默认值为 `1.0`。同一 zone 的所有 query 使用同一个 temperature，不逐道拟合
-bandwidth。
+且大于零。字典构建时发布每个 zone 的 atom 数、来源井数和 temperature。正式推理使用
+`temperature_multiplier = 1.0`；诊断分支比较 `0.75 / 1.0 / 1.5`。同一 zone 的所有 query
+使用同一个 temperature。
 
 `T_i` 由 query body 与 atom body 的连续形态统计解析得到。定义：
 
@@ -184,18 +183,21 @@ query 物理轴，再乘 `amplitude_i`。shift、stretch 和 amplitude 均由连
 变换后的 donor 只在其真实 finite support 内参与混合。某个 donor 在 query 边缘或缺口处
 无支持时，该样点对剩余 donor 权重重新归一化；无支持不能按数值零参与平均并压低振幅。
 
-### 4.2 连续性硬合同
+### 4.2 正式稀疏化
 
-横向连续性首先由映射本身保证：
+全字典 softmax 是局部 unary evidence，空间联合求解得到连续权重场 `W*`。正式推理随后在
+每个 query 保留 `W*` 中权重最大的两个 atom，并重新归一化：
 
-- 使用全字典 softmax 或固定的公共原型字典；
-- 不使用逐道最近邻 `argmin`；
-- 不使用随 query 改变成员集合的硬 `top-k`；
-- 不随机抽取 donor；
-- 同一个 query 始终产生同一组权重和同一 residual；
-- 相近 key 的权重差异必须连续。
+```text
+W_production = normalize(top2(W*))
+r_local      = sum_i W_production_i * T_i(residual_value_i)
+```
 
-对任意两个有效 query `q1/q2`，实现需要报告：
+正式输出直接使用该 residual，不执行 RMS 恢复。这样每个窗口最多变换两个 donor，避免大量
+异相残差平均相消，并保留 spatial solver 形成的横向选择结构。
+
+诊断分支同时计算 spatial soft projected、local hard-nearest unprojected 和 spatial top-2
+energy-preserved unprojected。对任意两个有效 query `q1/q2`，诊断报告：
 
 ```text
 key_distance(q1, q2)
@@ -203,11 +205,8 @@ weight_distance(W(q1), W(q2))
 residual_distance(r(q1), r(q2))
 ```
 
-这些距离随 key 扰动平滑变化。实现同时报告 temperature multiplier、逐 zone atom/来源井
-覆盖率和有效字典数，三档 temperature 使用同一字典、同一 query 和同一后续空间参数。
-
-字典较大时，先离线构建固定公共原型。所有 query 始终对同一组原型求权重，不能逐道运行
-近邻搜索后只保留不同的候选集合。
+实现同时报告 temperature multiplier、逐 zone atom/来源井覆盖率和有效字典数，三档
+temperature 使用同一字典、同一 query 和同一后续空间参数。
 
 ## 5. 空间联合权重场
 
@@ -253,9 +252,9 @@ g_uv
 - body 出现明确横向界面、pinchout 或 zone 支持终止：降低或断开耦合；
 - 不跨无效支持和不同 zone 传播纹理。
 
-固定剖面使用相应米制一维图；全体积使用 inline/xline 最近合法邻道构成的稀疏二维物理
-邻接图，只求一次权重场和一次 residual。线号步长只影响 trace 寻址；`distance_m` 来自
-实际坐标，因此两个方向的不同采样密度自然进入图边权重。
+固定剖面使用相应米制一维图。全体积逐条处理 inline 和 xline 剖面，每个方向独立建立
+一维物理图并求 residual；同一样点的两方向结果等权融合。线号步长只影响 trace 寻址，
+`distance_m` 来自实际坐标，因此两个方向的不同采样密度自然进入图边权重。
 
 ## 6. 重叠相加生成
 
@@ -281,16 +280,8 @@ window_weight_c(z)
 重叠区构成 partition of unity，并保证 finite-run 边界也有非零支撑。该步骤避免垂向 patch
 接缝。目的层外 residual 严格为零；目的层 mask 不派生 halo、侵蚀或过渡带。
 
-最终 residual 再经过一次亚主体尺度投影：
-
-```text
-predicted_residual
-    <- predicted_residual - S_body(predicted_residual)
-```
-
-`S_body` 在每个有效 finite run 内归一化计算，目的层外和缺口处不参与卷积。投影后再将
-目的层外设为零。该投影只维持 body/residual 的尺度分账，不修正 GINN body，也不会因硬零
-填充在目的层边缘制造高频环。
+正式 residual 是 spatial top-2 窗口重叠相加的直接结果。`projected` 分支仅用于诊断：它在
+混合结果上再次计算 `r - S_body(r)`，用于观察重复尺度投影造成的振幅变化。
 
 ## 7. 振幅合同
 
@@ -316,32 +307,48 @@ predicted_residual
 
 ```python
 library = build_residual_library(well_controls, scale_contract)
-result = transfer_residual_texture(ginn_body, geometry, library, policy)
+transfer = ResidualTransfer(library, policy)
+result = transfer.predict(ginn_body, geometry)
 ```
 
-`transfer_residual_texture()` 内部完成：
+`ResidualTransfer.predict()` 内部完成：
 
 - body key 编码；
-- 连续字典权重；
+- 全字典 unary 权重；
 - 变换参数；
 - 米制空间邻接图与权重场求解；
+- spatial top-2 稀疏化；
 - residual window 生成与重叠相加；
-- 亚主体尺度投影；
-- summary 与诊断字段。
+- 正式 residual summary。
 
 结果 interface：
 
 ```text
-ResidualTransferResult
-├── ginn_body
+ResidualResult
 ├── predicted_residual
-├── enhanced_log_ai
-├── dictionary_weight_summary
 ├── effective_dictionary_count
-├── transform_summary
-├── lateral_continuity_metrics
-└── support
+├── support
+├── node_count
+└── graph_edge_count
 ```
+
+研究图件通过 `ResidualTransfer.diagnose()` 获取 `ResidualDiagnostics`。诊断结果包含正式
+residual、各对照 residual、字典权重、变换统计和连续性指标。正式体推理只调用 `predict()`。
+
+全体积入口使用：
+
+```python
+result = VolumeTransfer(library, policy, volume_config).transfer(
+    body_log_ai,
+    sample_axis=sample_axis,
+    line_geometry=line_geometry,
+    ilines=ilines,
+    xlines=xlines,
+    zones=zones,
+)
+```
+
+`VolumeTransfer` 隐藏逐剖面调度、worker 字典复用、inline/xline 融合和体结果汇总。
 
 实现使用独立源码包 `src/enhance_v2`。该模块完整拥有残差字典、检索键、纹理迁移和产物
 合同；以第六步 native filtered well controls、冻结的 GINN body 和物理几何为输入，发布
@@ -355,13 +362,14 @@ src/enhance_v2/
 ├── contracts.py       # library、policy 和 result interface
 ├── library.py         # finite-run residual library
 ├── keys.py            # BodyKey 与连续 transform
-├── transfer.py        # 软字典回归、空间权重场、重叠相加
-├── artifacts.py       # 正式产物和图件
-└── runtime.py         # 设备、日志和批处理
+├── transfer.py        # 正式 predict 与研究 diagnose
+├── volume.py          # 全体积剖面调度与双方向融合
+├── artifacts.py       # 诊断摘要和图件
+└── workflow.py        # 工区井与层段适配
 ```
 
-包根只暴露 `build_residual_library()` 和 `transfer_residual_texture()`。第一版是解析的字典回归
-与空间权重求解，不训练 residual 回归网络。
+包根暴露 `build_residual_library()`、`ResidualTransfer` 和 `VolumeTransfer`。实现采用解析的
+字典回归与空间权重求解。
 
 ## 9. 第一轮原型
 
@@ -374,13 +382,13 @@ src/enhance_v2/
 5. 生成 residual 与 enhanced log-AI；
 6. 输出冻结正演对比。
 
-对照只需要四组：
+振幅—连续性对照使用四组：
 
 ```text
-hard nearest atom                # 展示逐道跳变反例
-uniform weights by zone          # 展示未使用 BodyKey 的平均纹理基线
-soft dictionary only             # 检查 key-space 连续映射
-soft dictionary + spatial field  # 正式方案
+spatial soft projected                 # 稠密混合与重复尺度投影诊断
+local hard-nearest unprojected          # 单 donor 跳变诊断
+spatial top-2 unprojected               # 正式方案
+spatial top-2 energy-preserved          # RMS 恢复诊断
 ```
 
 图件必须使用相同色标并包含：
@@ -401,23 +409,43 @@ soft dictionary + spatial field  # 正式方案
 第一轮由图件和少量直接指标共同判断：
 
 - 两个相近 body key 的 residual 不发生离散跳变；
-- soft 方案相对 hard nearest 明显减少横向接缝；
-- 空间耦合后 residual 仍保留垂向纹理，不退化成横向模糊带；
+- spatial top-2 相对 hard nearest 明显减少横向接缝；
+- 空间耦合后 residual 仍保留垂向纹理；
 - 记录 predicted residual 相对加权 donor 的一阶导数 RMS 比值，首轮以 `0.70` 为参考线；
 - 记录 predicted residual 相对加权 donor 的自相关半宽比值，首轮以 `1.50` 为参考线；
 - 相邻道字典权重连续，明确 body 界面处允许变化；
 - 对 query key 施加小扰动时，权重、变换和输出 residual 均连续变化；
-- soft dictionary 相对逐 zone 均匀权重呈现与 BodyKey 对应的空间组织，而不是全区固定混合；
+- spatial 权重相对逐 zone 均匀权重呈现与 BodyKey 对应的空间组织；
 - 不出现整段被单口井纹理统治或规则周期复制；
 - residual 振幅落在井残差可见范围；
 - 增强结果保持 GINN body 的主体结构和主要正演波瓣。
 
-若 soft dictionary 本身仍产生明显跳变，先检查 key 标准化、公共原型和三档 temperature。
-若输出相对 donor 明显变糊，优先比较较低 temperature，并检查对应 zone 的 atom 覆盖和
-解析变换对齐；第一轮不增加事后锐化。若 soft dictionary 连续而 section 仍有接缝，调整空间
-权重场和重叠窗口。第一轮不新增神经网络、随机 realization 或全体积训练。
+跳变诊断主要比较 spatial top-2 与 energy-preserved 分支；振幅诊断同时查看 residual RMS 和
+相邻道差分 RMS。temperature 诊断使用同一字典和空间参数。
 
-## 11. 解释边界
+## 11. 全体积执行
+
+正式体推理由 `VolumeTransfer` 逐条调度 inline 和 xline 剖面。每个 worker 在初始化时构建一次
+向量化字典表示，后续剖面复用：
+
+- 六组 BodyKey 距离按 zone 组成矩阵计算；
+- donor 的原生不规则深度轴保留在字典中；
+- 同一 query 的 donor 变换使用批量线性插值；
+- spatial solver 完成后只变换 top-2 donor；
+- inline/xline residual 在同一样点等权融合。
+
+当前机器实测：
+
+| 范围 | worker | node 数 | 迁移耗时 |
+|---|---:|---:|---:|
+| 16 × 16 | 1 | 6,860 | 21.3 s |
+| 64 × 64 | 8 | 133,980 | 125.5 s |
+
+64 × 64 的前约 61 s 是 Windows worker 启动，后续 118 条剖面约 63 s。按该阶段吞吐和正式体
+目的层支持规模外推，601 × 801 全体积的迁移计算约为 2.5–3.5 小时；层位构建、输入读取、
+中心剖面绘图和 SEG-Y 导出在迁移之外执行。
+
+## 12. 解释边界
 
 交付结果解释为：
 

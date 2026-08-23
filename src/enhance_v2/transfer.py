@@ -10,13 +10,13 @@ import numpy as np
 from cup.seismic.geometry import LineAxis, SampleAxis, SurveyLineGeometry
 
 from .contracts import (
-    ResidualFieldResult,
+    ResidualDiagnostics,
+    ResidualResult,
     ResidualTextureLibrary,
     ResidualTransferPolicy,
-    ResidualTransferResult,
     TransferGeometry,
 )
-from .keys import BodyKey, BodyKeyEncoder, transform_residual, weighted_key_distance
+from .keys import BodyKey, BodyKeyEncoder, weighted_key_distance
 from .library import gaussian_smooth_finite_run
 
 
@@ -51,6 +51,196 @@ class _QueryNode:
     sample_indices: np.ndarray
     zone_id: str
     key: BodyKey
+
+
+@dataclass(frozen=True)
+class _DictionaryArrays:
+    """Vectorized dictionary representation shared by every target section."""
+
+    profile: np.ndarray
+    first_derivative: np.ndarray
+    second_derivative: np.ndarray
+    contrast: np.ndarray
+    thickness: np.ndarray
+    position: np.ndarray
+    mu: np.ndarray
+    center_m: np.ndarray
+    residual_axis: np.ndarray
+    residual: np.ndarray
+    residual_size: np.ndarray
+    zone_indices: Mapping[str, np.ndarray]
+
+    @classmethod
+    def from_library(cls, library: ResidualTextureLibrary) -> "_DictionaryArrays":
+        atoms = library.atoms
+        max_samples = max(atom.physical_axis.size for atom in atoms)
+        residual_axis = np.full((len(atoms), max_samples), np.inf, dtype=np.float64)
+        residual = np.zeros((len(atoms), max_samples), dtype=np.float64)
+        sizes = np.empty(len(atoms), dtype=np.int64)
+        for index, atom in enumerate(atoms):
+            if not np.all(atom.valid_support):
+                raise ValueError("Residual dictionary atoms must come from one continuous finite run.")
+            size = atom.physical_axis.size
+            residual_axis[index, :size] = atom.physical_axis
+            residual[index, :size] = atom.residual_value
+            sizes[index] = size
+        return cls(
+            profile=np.stack([atom.body_key.profile for atom in atoms]),
+            first_derivative=np.stack([atom.body_key.first_derivative for atom in atoms]),
+            second_derivative=np.stack([atom.body_key.second_derivative for atom in atoms]),
+            contrast=np.asarray([atom.body_key.contrast for atom in atoms], dtype=np.float64),
+            thickness=np.asarray([atom.body_key.thickness for atom in atoms], dtype=np.float64),
+            position=np.asarray(
+                [atom.body_key.normalized_zone_position for atom in atoms],
+                dtype=np.float64,
+            ),
+            mu=np.asarray([atom.body_key.mu for atom in atoms], dtype=np.float64),
+            center_m=np.asarray([atom.body_key.center_m for atom in atoms], dtype=np.float64),
+            residual_axis=residual_axis,
+            residual=residual,
+            residual_size=sizes,
+            zone_indices={
+                zone_id: library.atom_indices_for_zone(zone_id)
+                for zone_id in library.zone_ids
+            },
+        )
+
+    def initial_weights(
+        self,
+        nodes: list[_QueryNode],
+        library: ResidualTextureLibrary,
+        *,
+        temperature_multiplier: float,
+    ) -> np.ndarray:
+        weights = np.zeros((len(nodes), len(library.atoms)), dtype=np.float64)
+        scales = library.feature_scales
+
+        def profile_distance_square(query: np.ndarray, atoms: np.ndarray) -> np.ndarray:
+            size = float(query.shape[1])
+            square = (
+                np.sum(np.square(query), axis=1)[:, None]
+                + np.sum(np.square(atoms), axis=1)[None, :]
+                - 2.0 * (query @ atoms.T)
+            ) / size
+            return np.maximum(square, 0.0)
+
+        for zone_id, atom_indices in self.zone_indices.items():
+            node_indices = np.asarray(
+                [index for index, node in enumerate(nodes) if node.zone_id == zone_id],
+                dtype=np.int64,
+            )
+            if node_indices.size == 0:
+                continue
+            keys = [nodes[index].key for index in node_indices]
+            profile = np.stack([key.profile for key in keys])
+            first = np.stack([key.first_derivative for key in keys])
+            second = np.stack([key.second_derivative for key in keys])
+            distance_square = (
+                profile_distance_square(profile, self.profile[atom_indices])
+                / np.square(float(scales["profile"]))
+            )
+            distance_square += (
+                profile_distance_square(first, self.first_derivative[atom_indices])
+                / np.square(float(scales["first_derivative"]))
+            )
+            distance_square += (
+                profile_distance_square(second, self.second_derivative[atom_indices])
+                / np.square(float(scales["second_derivative"]))
+            )
+            for query_values, atom_values, name in (
+                (
+                    np.asarray([key.contrast for key in keys], dtype=np.float64),
+                    self.contrast,
+                    "contrast",
+                ),
+                (
+                    np.asarray([key.thickness for key in keys], dtype=np.float64),
+                    self.thickness,
+                    "thickness",
+                ),
+                (
+                    np.asarray(
+                        [key.normalized_zone_position for key in keys],
+                        dtype=np.float64,
+                    ),
+                    self.position,
+                    "position",
+                ),
+            ):
+                distance_square += np.square(
+                    (query_values[:, None] - atom_values[atom_indices][None, :])
+                    / float(scales[name])
+                )
+            distances = np.sqrt(distance_square / 6.0)
+            temperature = (
+                float(temperature_multiplier)
+                * float(library.zone_stats[zone_id]["temperature_base"])
+            )
+            logits = -np.square(distances / temperature)
+            logits -= np.max(logits, axis=1, keepdims=True)
+            local = np.exp(logits)
+            local /= np.sum(local, axis=1, keepdims=True)
+            weights[np.ix_(node_indices, atom_indices)] = local
+        return weights
+
+    def transform(
+        self,
+        node: _QueryNode,
+        atom_indices: np.ndarray,
+        query_axis: np.ndarray,
+        *,
+        denominator_floor: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        indices = np.asarray(atom_indices, dtype=np.int64)
+        axis = np.asarray(query_axis, dtype=np.float64)
+        stretch = np.clip(
+            node.key.thickness
+            / np.maximum(self.thickness[indices], float(denominator_floor)),
+            0.75,
+            1.33,
+        )
+        amplitude = np.clip(
+            np.sqrt(
+                node.key.contrast
+                / np.maximum(self.contrast[indices], float(denominator_floor))
+            ),
+            0.75,
+            1.33,
+        )
+        shift = node.key.mu - self.mu[indices]
+        source = (
+            self.center_m[indices, None]
+            + self.mu[indices, None]
+            + (axis[None, :] - node.key.center_m - node.key.mu) / stretch[:, None]
+        )
+        source_axes = self.residual_axis[indices]
+        upper = self.residual_size[indices, None] - 1
+        valid = (
+            (source >= source_axes[:, :1])
+            & (source <= np.take_along_axis(source_axes, upper, axis=1))
+        )
+        right = np.sum(
+            source_axes[:, :, None] < source[:, None, :],
+            axis=1,
+        )
+        right = np.minimum(right, upper)
+        left = np.maximum(right - 1, 0)
+        rows = indices[:, None]
+        left_axis = self.residual_axis[rows, left]
+        right_axis = self.residual_axis[rows, right]
+        interval = right_axis - left_axis
+        fraction = np.zeros(source.shape, dtype=np.float64)
+        interpolated = interval > 0.0
+        fraction[interpolated] = (
+            (source - left_axis)[interpolated] / interval[interpolated]
+        )
+        values = (
+            (1.0 - fraction) * self.residual[rows, left]
+            + fraction * self.residual[rows, right]
+        )
+        values *= amplitude[:, None]
+        values[~valid] = 0.0
+        return values, valid, shift, stretch, amplitude
 
 
 def _field(source: Any, *names: str, default: Any = None) -> Any:
@@ -443,32 +633,15 @@ def _build_query_nodes(
 def _initial_weights(
     nodes: list[_QueryNode],
     library: ResidualTextureLibrary,
+    dictionary: _DictionaryArrays,
     *,
     temperature_multiplier: float,
 ) -> np.ndarray:
-    weights = np.zeros((len(nodes), len(library.atoms)), dtype=np.float64)
-    for row, node in enumerate(nodes):
-        indices = library.atom_indices_for_zone(node.zone_id)
-        if indices.size == 0:
-            raise ValueError(f"Query zone {node.zone_id!r} has no dictionary atoms.")
-        base = float(library.zone_stats[node.zone_id]["temperature_base"])
-        temperature = float(temperature_multiplier) * base
-        if not np.isfinite(temperature) or temperature <= 0.0:
-            raise ValueError(f"Zone {node.zone_id!r} has invalid transfer temperature={temperature!r}.")
-        distances = np.asarray(
-            [weighted_key_distance(node.key, library.atoms[index].body_key, library.feature_scales) for index in indices],
-            dtype=np.float64,
-        )
-        if np.any(~np.isfinite(distances)):
-            raise ValueError(f"Query zone {node.zone_id!r} produced non-finite dictionary distances.")
-        logits = -np.square(distances / temperature)
-        logits -= float(np.max(logits))
-        local = np.exp(logits)
-        denominator = float(np.sum(local))
-        if not np.isfinite(denominator) or denominator <= 0.0:
-            raise ValueError(f"Query zone {node.zone_id!r} produced invalid softmax weights.")
-        weights[row, indices] = local / denominator
-    return weights
+    return dictionary.initial_weights(
+        nodes,
+        library,
+        temperature_multiplier=temperature_multiplier,
+    )
 
 
 def _node_edges(
@@ -587,7 +760,7 @@ def solve_spatial_weight_field(
     lambda_lateral: float,
     lambda_vertical: float,
     iterations: int,
-    vertical_residual_terms: list[tuple[int, int, float, np.ndarray, np.ndarray]] | None = None,
+    vertical_residual_terms: list["_VerticalTerm"] | None = None,
 ) -> np.ndarray:
     """Solve the non-negative simplex weight field by deterministic steps.
 
@@ -627,11 +800,19 @@ def solve_spatial_weight_field(
             updated[row] = numerator / denominator
         if vertical_residual_terms:
             gradients = np.zeros_like(updated)
-            for left, right, value, left_matrix, right_matrix in vertical_residual_terms:
-                difference = updated[left] @ left_matrix - updated[right] @ right_matrix
-                coefficient = float(value) * float(lambda_vertical)
-                gradients[left] += coefficient * (left_matrix @ difference)
-                gradients[right] -= coefficient * (right_matrix @ difference)
+            for term in vertical_residual_terms:
+                indices = term.atom_indices
+                difference = (
+                    updated[term.left, indices] @ term.left_matrix
+                    - updated[term.right, indices] @ term.right_matrix
+                )
+                coefficient = float(term.weight) * float(lambda_vertical)
+                gradients[term.left, indices] += coefficient * (
+                    term.left_matrix @ difference
+                )
+                gradients[term.right, indices] -= coefficient * (
+                    term.right_matrix @ difference
+                )
             # Residual windows carry the same log-AI units as the body and are
             # typically small compared with the unary key fit.  A fixed small
             # step keeps the projected simplex iteration deterministic and
@@ -740,13 +921,40 @@ def solve_spatial_label_field(
     return labels
 
 
+@dataclass(frozen=True)
+class _VerticalTerm:
+    left: int
+    right: int
+    weight: float
+    atom_indices: np.ndarray
+    left_matrix: np.ndarray
+    right_matrix: np.ndarray
+
+
 def _vertical_residual_terms(
     edges: list[tuple[int, int, float, str]],
     nodes: list[_QueryNode],
     target: _TargetGrid,
     library: ResidualTextureLibrary,
-) -> list[tuple[int, int, float, np.ndarray, np.ndarray]]:
-    terms: list[tuple[int, int, float, np.ndarray, np.ndarray]] = []
+    dictionary: _DictionaryArrays,
+) -> list[_VerticalTerm]:
+    terms: list[_VerticalTerm] = []
+    transformed: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+    def node_matrix(node: _QueryNode) -> tuple[np.ndarray, np.ndarray]:
+        cached = transformed.get(node.index)
+        if cached is not None:
+            return cached
+        atom_indices = dictionary.zone_indices[node.zone_id]
+        values, valid, _shift, _stretch, _amplitude = dictionary.transform(
+            node,
+            atom_indices,
+            target.axis.values[node.sample_indices],
+            denominator_floor=library.scale_contract.denominator_floor,
+        )
+        transformed[node.index] = (values, valid)
+        return values, valid
+
     for left_index, right_index, edge_weight, kind in edges:
         if kind != "vertical":
             continue
@@ -759,48 +967,23 @@ def _vertical_residual_terms(
         )
         if common.size < 2:
             continue
-        left_axis = target.axis.values[left.sample_indices]
-        right_axis = target.axis.values[right.sample_indices]
-        left_matrix = np.zeros((len(library.atoms), common.size), dtype=np.float64)
-        right_matrix = np.zeros_like(left_matrix)
-        left_valid_matrix = np.zeros_like(left_matrix, dtype=bool)
-        right_valid_matrix = np.zeros_like(right_matrix, dtype=bool)
-        zone_atom_indices: list[int] = []
-        for atom_index, atom in enumerate(library.atoms):
-            if atom.zone_id != left.zone_id:
-                continue
-            zone_atom_indices.append(atom_index)
-            left_values, left_valid, _ = transform_residual(
-                atom,
-                left.key,
-                left_axis,
-                denominator_floor=library.scale_contract.denominator_floor,
-            )
-            right_values, right_valid, _ = transform_residual(
-                atom,
-                right.key,
-                right_axis,
-                denominator_floor=library.scale_contract.denominator_floor,
-            )
-            left_valid_matrix[atom_index] = left_valid[left_positions]
-            right_valid_matrix[atom_index] = right_valid[right_positions]
-            left_matrix[atom_index] = left_values[left_positions]
-            right_matrix[atom_index] = right_values[right_positions]
-        if not zone_atom_indices:
-            continue
+        atom_indices = dictionary.zone_indices[left.zone_id]
+        left_values, left_valid = node_matrix(left)
+        right_values, right_valid = node_matrix(right)
         common_valid = np.all(
-            left_valid_matrix[zone_atom_indices] & right_valid_matrix[zone_atom_indices],
+            left_valid[:, left_positions] & right_valid[:, right_positions],
             axis=0,
         )
         if np.count_nonzero(common_valid) < 2:
             continue
         terms.append(
-            (
-                left_index,
-                right_index,
-                float(edge_weight),
-                left_matrix[:, common_valid],
-                right_matrix[:, common_valid],
+            _VerticalTerm(
+                left=left_index,
+                right=right_index,
+                weight=float(edge_weight),
+                atom_indices=atom_indices,
+                left_matrix=left_values[:, left_positions][:, common_valid],
+                right_matrix=right_values[:, right_positions][:, common_valid],
             )
         )
     return terms
@@ -810,6 +993,7 @@ def _node_values_and_transforms(
     node: _QueryNode,
     weights: np.ndarray,
     library: ResidualTextureLibrary,
+    dictionary: _DictionaryArrays,
     axis: np.ndarray,
     *,
     collect_details: bool = True,
@@ -823,31 +1007,37 @@ def _node_values_and_transforms(
     source_weight: dict[str, float] = {}
     component_rms_weighted = 0.0
     component_weight = 0.0
-    for atom_index, weight in enumerate(weights):
-        if weight <= 0.0:
-            continue
-        atom = library.atoms[atom_index]
-        if atom.zone_id != node.zone_id:
-            continue
-        transformed, valid, params = transform_residual(
-            atom,
-            node.key,
-            local_axis,
-            denominator_floor=library.scale_contract.denominator_floor,
+    atom_indices = np.flatnonzero(weights > 0.0)
+    transformed, valid, shifts, stretches, amplitudes = dictionary.transform(
+        node,
+        atom_indices,
+        local_axis,
+        denominator_floor=library.scale_contract.denominator_floor,
+    )
+    local_weights = np.asarray(weights[atom_indices], dtype=np.float64)
+    weighted = local_weights[:, None] * valid
+    residual = np.sum(weighted * transformed, axis=0)
+    active_weight = np.sum(weighted, axis=0)
+    active_weight_square = np.sum(np.square(local_weights[:, None]) * valid, axis=0)
+    if preserve_mixture_energy:
+        valid_count = np.sum(valid, axis=1)
+        component_rms = np.zeros(atom_indices.size, dtype=np.float64)
+        occupied_components = valid_count > 0
+        component_rms[occupied_components] = np.sqrt(
+            np.sum(np.square(transformed), axis=1)[occupied_components]
+            / valid_count[occupied_components]
         )
-        residual[valid] += float(weight) * transformed[valid]
-        active_weight[valid] += float(weight)
-        active_weight_square[valid] += float(weight) ** 2
-        if preserve_mixture_energy and np.any(valid):
-            component_rms_weighted += float(weight) * float(
-                np.sqrt(np.mean(np.square(transformed[valid])))
-            )
-            component_weight += float(weight)
-        if collect_details:
-            transform_values["shift"] += float(weight) * params.shift
-            transform_values["stretch"] += float(weight) * params.stretch
-            transform_values["amplitude"] += float(weight) * params.amplitude
-            source_weight[atom.source_well] = source_weight.get(atom.source_well, 0.0) + float(weight)
+        component_rms_weighted = float(np.sum(local_weights * component_rms))
+        component_weight = float(np.sum(local_weights[occupied_components]))
+    if collect_details:
+        transform_values = {
+            "shift": float(local_weights @ shifts),
+            "stretch": float(local_weights @ stretches),
+            "amplitude": float(local_weights @ amplitudes),
+        }
+        for atom_index, weight in zip(atom_indices, local_weights):
+            source_well = library.atoms[int(atom_index)].source_well
+            source_weight[source_well] = source_weight.get(source_well, 0.0) + float(weight)
     occupied = active_weight > np.finfo(np.float64).tiny
     residual[occupied] /= active_weight[occupied]
     if preserve_mixture_energy and component_weight > 0.0 and np.any(occupied):
@@ -867,6 +1057,7 @@ def _stitch_nodes(
     node_weights: np.ndarray,
     target: _TargetGrid,
     library: ResidualTextureLibrary,
+    dictionary: _DictionaryArrays,
     half_width: float,
     *,
     project: bool,
@@ -884,6 +1075,7 @@ def _stitch_nodes(
             node,
             weights,
             library,
+            dictionary,
             target.axis.values,
             collect_details=collect_node_details,
             preserve_mixture_energy=preserve_mixture_energy,
@@ -960,13 +1152,19 @@ def _weight_uniform_variance(weights: np.ndarray, nodes: list[_QueryNode], libra
 def _summary_temperature_sweep(
     nodes: list[_QueryNode],
     library: ResidualTextureLibrary,
+    dictionary: _DictionaryArrays,
     policy: ResidualTransferPolicy,
     edges: list[tuple[int, int, float, str]],
-    vertical_residual_terms: list[tuple[int, int, float, np.ndarray, np.ndarray]] | None = None,
+    vertical_residual_terms: list[_VerticalTerm] | None = None,
 ) -> dict[str, dict[str, float]]:
     result: dict[str, dict[str, float]] = {}
     for multiplier in policy.temperature_multipliers:
-        initial = _initial_weights(nodes, library, temperature_multiplier=multiplier)
+        initial = _initial_weights(
+            nodes,
+            library,
+            dictionary,
+            temperature_multiplier=multiplier,
+        )
         spatial = (
             solve_spatial_weight_field(
                 initial,
@@ -1138,24 +1336,15 @@ def _amplitude_diagnostics(
     }
 
 
-def transfer_residual_field(
+def _transfer_residual(
     ginn_body: Any,
     geometry: Any,
     library: ResidualTextureLibrary,
-    policy: ResidualTransferPolicy | Mapping[str, Any] | None = None,
-) -> ResidualFieldResult:
-    """Transfer only the production residual field and effective count.
+    transfer_policy: ResidualTransferPolicy,
+    dictionary: _DictionaryArrays,
+) -> ResidualResult:
+    """Run the production spatial top-2, unprojected transfer."""
 
-    This interface shares the exact key, graph, analytic transform, spatial
-    solver, stitching, and residual projection used by
-    :func:`transfer_residual_texture`. It omits prototype-only baselines,
-    temperature sweeps, per-node records, and donor diagnostics so a survey
-    can be processed section by section without multiplying runtime or memory.
-    """
-
-    if not isinstance(library, ResidualTextureLibrary):
-        raise TypeError("library must be a ResidualTextureLibrary.")
-    transfer_policy = ResidualTransferPolicy.from_any(policy)
     if (
         transfer_policy.section_orientation is not None
         and _field(geometry, "orientation", "section_orientation", default=None) is None
@@ -1179,11 +1368,12 @@ def transfer_residual_field(
     initial_weights = _initial_weights(
         nodes,
         library,
+        dictionary,
         temperature_multiplier=transfer_policy.temperature_multiplier,
     )
     if transfer_policy.spatial_coupling:
         vertical_residual_terms = (
-            _vertical_residual_terms(edges, nodes, target, library)
+            _vertical_residual_terms(edges, nodes, target, library, dictionary)
             if transfer_policy.lambda_vertical > 0.0
             else None
         )
@@ -1197,17 +1387,19 @@ def transfer_residual_field(
         )
     else:
         spatial_weights = initial_weights
+    production_weights = _sparsify_weights(spatial_weights, top_k=2)
     predicted_flat, effective_flat, _local, _transforms, _sources = _stitch_nodes(
         nodes,
-        spatial_weights,
+        production_weights,
         target,
         library,
+        dictionary,
         half_width,
-        project=True,
+        project=False,
         collect_node_details=False,
     )
     predicted_flat[~target.flat_support] = 0.0
-    return ResidualFieldResult(
+    return ResidualResult(
         predicted_residual=_field_from_flat(predicted_flat, target),
         effective_dictionary_count=_field_from_flat(effective_flat, target),
         support=_field_from_flat(target.flat_support, target).astype(bool),
@@ -1216,13 +1408,14 @@ def transfer_residual_field(
     )
 
 
-def transfer_residual_texture(
+def _diagnose_residual(
     ginn_body: Any,
     geometry: Any,
     library: ResidualTextureLibrary,
-    policy: ResidualTransferPolicy | Mapping[str, Any] | None = None,
-) -> ResidualTransferResult:
-    """Transfer one deterministic residual realization onto a GINN body grid.
+    transfer_policy: ResidualTransferPolicy,
+    dictionary: _DictionaryArrays,
+) -> ResidualDiagnostics:
+    """Run production transfer plus research-only comparison branches.
 
     The function accepts a 1-D trace, a section, or a full volume.  A full
     volume should be accompanied by ``SurveyLineGeometry`` (or a
@@ -1231,9 +1424,6 @@ def transfer_residual_texture(
     locate the corresponding trace coordinate through ``SurveyLineGeometry``.
     """
 
-    if not isinstance(library, ResidualTextureLibrary):
-        raise TypeError("library must be a ResidualTextureLibrary.")
-    transfer_policy = ResidualTransferPolicy.from_any(policy)
     # A policy-level section orientation is useful when the geometry object is
     # just a SurveyLineGeometry, while an explicit geometry orientation wins.
     if transfer_policy.section_orientation is not None and _field(geometry, "orientation", "section_orientation", default=None) is None:
@@ -1249,11 +1439,18 @@ def transfer_residual_texture(
     target = _prepare_target(ginn_body, geometry, library, transfer_policy)
     nodes, _encoder, half_width, spacing = _build_query_nodes(target, library, transfer_policy)
     edges = _node_edges(nodes, target, library, transfer_policy, half_width, spacing)
-    vertical_residual_terms = _vertical_residual_terms(edges, nodes, target, library)
+    vertical_residual_terms = _vertical_residual_terms(
+        edges,
+        nodes,
+        target,
+        library,
+        dictionary,
+    )
 
     initial_weights = _initial_weights(
         nodes,
         library,
+        dictionary,
         temperature_multiplier=transfer_policy.temperature_multiplier,
     )
     if transfer_policy.spatial_coupling:
@@ -1273,14 +1470,16 @@ def transfer_residual_texture(
         initial_weights,
         target,
         library,
+        dictionary,
         half_width,
         project=True,
     )
-    predicted_flat, effective_flat, final_local_values, final_transforms, final_sources = _stitch_nodes(
+    spatial_soft_projected_flat, _spatial_soft_effective, _spatial_soft_local, _spatial_soft_transforms, _spatial_soft_sources = _stitch_nodes(
         nodes,
         spatial_weights,
         target,
         library,
+        dictionary,
         half_width,
         project=True,
     )
@@ -1289,6 +1488,7 @@ def transfer_residual_texture(
         spatial_weights,
         target,
         library,
+        dictionary,
         half_width,
         project=False,
     )
@@ -1300,6 +1500,7 @@ def transfer_residual_texture(
         hard_weights,
         target,
         library,
+        dictionary,
         half_width,
         project=True,
     )
@@ -1308,15 +1509,17 @@ def transfer_residual_texture(
         hard_weights,
         target,
         library,
+        dictionary,
         half_width,
         project=False,
     )
     spatial_sparse_weights = _sparsify_weights(spatial_weights, top_k=2)
-    spatial_sparse_flat, _sparse_effective, _sparse_local, _sparse_transforms, _sparse_sources = _stitch_nodes(
+    spatial_sparse_flat, effective_flat, final_local_values, final_transforms, final_sources = _stitch_nodes(
         nodes,
         spatial_sparse_weights,
         target,
         library,
+        dictionary,
         half_width,
         project=False,
     )
@@ -1325,6 +1528,7 @@ def transfer_residual_texture(
         spatial_sparse_weights,
         target,
         library,
+        dictionary,
         half_width,
         project=False,
         preserve_mixture_energy=True,
@@ -1335,6 +1539,7 @@ def transfer_residual_texture(
         spatial_dominant_weights,
         target,
         library,
+        dictionary,
         half_width,
         project=False,
     )
@@ -1356,6 +1561,7 @@ def transfer_residual_texture(
         graph_dominant_weights,
         target,
         library,
+        dictionary,
         half_width,
         project=False,
     )
@@ -1368,11 +1574,14 @@ def transfer_residual_texture(
         uniform_weights,
         target,
         library,
+        dictionary,
         half_width,
         project=True,
     )
 
+    predicted_flat = spatial_sparse_flat
     predicted_flat[~target.flat_support] = 0.0
+    spatial_soft_projected_flat[~target.flat_support] = 0.0
     soft_flat[~target.flat_support] = 0.0
     hard_flat[~target.flat_support] = 0.0
     hard_unprojected_flat[~target.flat_support] = 0.0
@@ -1384,11 +1593,11 @@ def transfer_residual_texture(
     enhanced_flat = target.flat_body.copy()
     enhanced_flat[target.flat_support] += predicted_flat[target.flat_support]
 
-    source_wells, source_matrix = _node_source_weight_matrix(spatial_weights, library)
+    source_wells, source_matrix = _node_source_weight_matrix(spatial_sparse_weights, library)
     source_totals = np.sum(source_matrix, axis=0)
     source_totals /= max(float(np.sum(source_totals)), np.finfo(np.float64).tiny)
     zone_weight_totals: dict[str, float] = {}
-    for node, row in zip(nodes, spatial_weights):
+    for node, row in zip(nodes, spatial_sparse_weights):
         zone_weight_totals[node.zone_id] = zone_weight_totals.get(node.zone_id, 0.0) + float(np.sum(row))
     zone_total = max(float(sum(zone_weight_totals.values())), np.finfo(np.float64).tiny)
     zone_weight_totals = {key: float(value / zone_total) for key, value in zone_weight_totals.items()}
@@ -1423,7 +1632,14 @@ def transfer_residual_texture(
         }
         for index, node in enumerate(nodes)
     ]
-    continuity = _continuity_metrics(edges, nodes, spatial_weights, final_local_values, library, target.axis.values)
+    continuity = _continuity_metrics(
+        edges,
+        nodes,
+        spatial_sparse_weights,
+        final_local_values,
+        library,
+        target.axis.values,
+    )
     amplitude_diagnostics = _amplitude_diagnostics(predicted_flat, weighted_donor_flat, target, library)
     dictionary_summary: dict[str, Any] = {
         "atom_count": int(len(library.atoms)),
@@ -1445,6 +1661,7 @@ def transfer_residual_texture(
         },
         "initial_weights": initial_weights,
         "spatial_weights": spatial_weights,
+        "production_weights": spatial_sparse_weights,
         "node_lateral_index": np.asarray([node.lateral_index for node in nodes], dtype=np.int64),
         "node_center_m": np.asarray([node.center_m for node in nodes], dtype=np.float64),
         "node_zone_id": np.asarray([node.zone_id for node in nodes], dtype=object),
@@ -1466,6 +1683,7 @@ def transfer_residual_texture(
         "temperature_sweep": _summary_temperature_sweep(
             nodes,
             library,
+            dictionary,
             transfer_policy,
             edges,
             vertical_residual_terms,
@@ -1473,7 +1691,7 @@ def transfer_residual_texture(
         "amplitude_diagnostics": amplitude_diagnostics,
     }
 
-    return ResidualTransferResult(
+    return ResidualDiagnostics(
         ginn_body=target.body,
         predicted_residual=_field_from_flat(predicted_flat, target),
         enhanced_log_ai=_field_from_flat(enhanced_flat, target),
@@ -1486,8 +1704,11 @@ def transfer_residual_texture(
         hard_nearest_residual=_field_from_flat(hard_flat, target),
         uniform_residual=_field_from_flat(uniform_flat, target),
         residual_variants={
+            "spatial_soft_projected": _field_from_flat(
+                spatial_soft_projected_flat,
+                target,
+            ),
             "hard_nearest_unprojected": _field_from_flat(hard_unprojected_flat, target),
-            "spatial_top2_unprojected": _field_from_flat(spatial_sparse_flat, target),
             "spatial_top2_energy_preserved_unprojected": _field_from_flat(
                 spatial_sparse_energy_flat,
                 target,
@@ -1498,9 +1719,49 @@ def transfer_residual_texture(
     )
 
 
+class ResidualTransfer:
+    """Transfer one residual dictionary through the production or diagnostic path.
+
+    ``predict`` is the formal spatial top-2, unprojected method. ``diagnose``
+    evaluates that same method together with research-only alternatives.
+    """
+
+    def __init__(
+        self,
+        library: ResidualTextureLibrary,
+        policy: ResidualTransferPolicy | Mapping[str, Any] | None = None,
+    ) -> None:
+        if not isinstance(library, ResidualTextureLibrary):
+            raise TypeError("library must be a ResidualTextureLibrary.")
+        self.library = library
+        self.policy = ResidualTransferPolicy.from_any(policy)
+        self._dictionary = _DictionaryArrays.from_library(library)
+
+    def predict(self, ginn_body: Any, geometry: Any) -> ResidualResult:
+        """Return only the formal spatial top-2, unprojected residual."""
+
+        return _transfer_residual(
+            ginn_body,
+            geometry,
+            self.library,
+            self.policy,
+            self._dictionary,
+        )
+
+    def diagnose(self, ginn_body: Any, geometry: Any) -> ResidualDiagnostics:
+        """Return the formal residual plus all research comparison branches."""
+
+        return _diagnose_residual(
+            ginn_body,
+            geometry,
+            self.library,
+            self.policy,
+            self._dictionary,
+        )
+
+
 __all__ = [
+    "ResidualTransfer",
     "solve_spatial_label_field",
     "solve_spatial_weight_field",
-    "transfer_residual_field",
-    "transfer_residual_texture",
 ]

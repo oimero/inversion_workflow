@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from .contracts import ResidualTextureLibrary, ResidualTransferResult
+from .contracts import ResidualDiagnostics, ResidualTextureLibrary
 
 
 def _jsonable(value: Any) -> Any:
@@ -33,15 +33,15 @@ def library_summary(library: ResidualTextureLibrary) -> dict[str, Any]:
     return _jsonable(library.describe())
 
 
-def result_summary(result: ResidualTransferResult) -> dict[str, Any]:
+def result_summary(result: ResidualDiagnostics) -> dict[str, Any]:
     """Return compact scalar/metadata diagnostics without embedding fields."""
 
-    if not isinstance(result, ResidualTransferResult):
-        raise TypeError("result must be a ResidualTransferResult.")
+    if not isinstance(result, ResidualDiagnostics):
+        raise TypeError("result must be ResidualDiagnostics.")
     return _jsonable(result.summary)
 
 
-def write_result_summary(result: ResidualTransferResult, path: str | Path) -> Path:
+def write_result_summary(result: ResidualDiagnostics, path: str | Path) -> Path:
     """Write a compact result summary; numerical fields remain in memory/arrays."""
 
     output = Path(path)
@@ -51,15 +51,15 @@ def write_result_summary(result: ResidualTransferResult, path: str | Path) -> Pa
 
 
 def plot_transfer_diagnostics(
-    result: ResidualTransferResult,
+    result: ResidualDiagnostics,
     output_dir: str | Path,
     *,
     prefix: str = "residual_transfer",
 ) -> tuple[Path, ...]:
     """Create the compact first-round comparison figures when matplotlib is available."""
 
-    if not isinstance(result, ResidualTransferResult):
-        raise TypeError("result must be a ResidualTransferResult.")
+    if not isinstance(result, ResidualDiagnostics):
+        raise TypeError("result must be ResidualDiagnostics.")
     import matplotlib.pyplot as plt
 
     directory = Path(output_dir)

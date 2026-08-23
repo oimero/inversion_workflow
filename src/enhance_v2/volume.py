@@ -13,7 +13,7 @@ import numpy as np
 from cup.seismic.geometry import SampleAxis, SurveyLineGeometry
 
 from .contracts import ResidualTextureLibrary, ResidualTransferPolicy, TransferGeometry
-from .transfer import transfer_residual_field
+from .transfer import ResidualTransfer
 
 
 @dataclass(frozen=True)
@@ -64,7 +64,7 @@ class VolumeTransferResult:
     predicted_residual_log_ai: np.ndarray
     enhanced_log_ai: np.ndarray
     direction_count: np.ndarray
-    summary: Mapping[str, float | int | list[int]]
+    summary: Mapping[str, float | int | str | list[int]]
 
     def __post_init__(self) -> None:
         residual = np.asarray(self.predicted_residual_log_ai, dtype=np.float32)
@@ -141,8 +141,7 @@ def _section_zone_geometry(
     )
 
 
-_WORKER_LIBRARY: ResidualTextureLibrary | None = None
-_WORKER_POLICY: ResidualTransferPolicy | None = None
+_WORKER_TRANSFER: ResidualTransfer | None = None
 _WORKER_SAMPLE_AXIS: SampleAxis | None = None
 _WORKER_LINE_GEOMETRY: SurveyLineGeometry | None = None
 _WORKER_ILINES: np.ndarray | None = None
@@ -159,15 +158,13 @@ def _initialize_section_worker(
     xlines: np.ndarray,
     zones: tuple[ZoneSurface, ...],
 ) -> None:
-    global _WORKER_LIBRARY
-    global _WORKER_POLICY
+    global _WORKER_TRANSFER
     global _WORKER_SAMPLE_AXIS
     global _WORKER_LINE_GEOMETRY
     global _WORKER_ILINES
     global _WORKER_XLINES
     global _WORKER_ZONES
-    _WORKER_LIBRARY = library
-    _WORKER_POLICY = policy
+    _WORKER_TRANSFER = ResidualTransfer(library, policy)
     _WORKER_SAMPLE_AXIS = sample_axis
     _WORKER_LINE_GEOMETRY = line_geometry
     _WORKER_ILINES = np.asarray(ilines, dtype=np.float64)
@@ -180,8 +177,7 @@ def _transfer_section_worker(
 ) -> tuple[str, int, np.ndarray, np.ndarray, int, int]:
     orientation, fixed_index, section_body = task
     if (
-        _WORKER_LIBRARY is None
-        or _WORKER_POLICY is None
+        _WORKER_TRANSFER is None
         or _WORKER_SAMPLE_AXIS is None
         or _WORKER_LINE_GEOMETRY is None
         or _WORKER_ILINES is None
@@ -199,12 +195,7 @@ def _transfer_section_worker(
         ilines=_WORKER_ILINES,
         xlines=_WORKER_XLINES,
     )
-    result = transfer_residual_field(
-        section_body,
-        geometry,
-        _WORKER_LIBRARY,
-        _WORKER_POLICY,
-    )
+    result = _WORKER_TRANSFER.predict(section_body, geometry)
     return (
         orientation,
         int(fixed_index),
@@ -215,7 +206,7 @@ def _transfer_section_worker(
     )
 
 
-class ResidualTextureVolumeTransfer:
+class VolumeTransfer:
     """Run the 1-D spatial dictionary solver along both survey directions."""
 
     def __init__(
@@ -367,7 +358,8 @@ class ResidualTextureVolumeTransfer:
         enhanced = np.full(body.shape, np.nan, dtype=np.float32)
         enhanced[expected_support] = body[expected_support] + residual[expected_support]
         selected = residual[expected_support]
-        summary: dict[str, float | int | list[int]] = {
+        summary: dict[str, float | int | str | list[int]] = {
+            "method": "spatial_top2_unprojected",
             "shape": [int(value) for value in body.shape],
             "section_count": int(total_sections),
             "node_count": int(node_count),
@@ -400,7 +392,7 @@ class ResidualTextureVolumeTransfer:
 
 
 __all__ = [
-    "ResidualTextureVolumeTransfer",
+    "VolumeTransfer",
     "VolumeTransferConfig",
     "VolumeTransferResult",
     "ZoneSurface",

@@ -30,7 +30,7 @@ from enhance_v2.artifacts import library_summary
 from enhance_v2.contracts import ResidualTransferPolicy, ScaleContract
 from enhance_v2.library import build_residual_library
 from enhance_v2.volume import (
-    ResidualTextureVolumeTransfer,
+    VolumeTransfer,
     VolumeTransferConfig,
     ZoneSurface,
 )
@@ -293,7 +293,7 @@ def main() -> None:
         body.shape,
         ",".join(config.orientations),
     )
-    result = ResidualTextureVolumeTransfer(library, policy, config, logger=log).transfer(
+    result = VolumeTransfer(library, policy, config, logger=log).transfer(
         body,
         sample_axis=sample_axis,
         line_geometry=source_survey.line_geometry,
@@ -329,6 +329,7 @@ def main() -> None:
             details=[
                 f"ginn_body={repo_relative_path(ginn_body_path, root=REPO_ROOT)}",
                 "enhanced_log_ai=ginn_body_log_ai+predicted_residual_log_ai",
+                "transfer=spatial_top2_unprojected",
                 "orientation_fusion=equal_mean",
             ],
             seismic_options=workflow.seismic.as_dict(),
@@ -349,7 +350,11 @@ def main() -> None:
                 source_seismic_file=source_seismic_path,
                 source_seismic_type=workflow.seismic.type,
                 title="Enhance V2 predicted residual log-AI",
-                details=["unit=log-AI", "orientation_fusion=equal_mean"],
+                details=[
+                    "unit=log-AI",
+                    "transfer=spatial_top2_unprojected",
+                    "orientation_fusion=equal_mean",
+                ],
                 seismic_options=workflow.seismic.as_dict(),
                 nan_fill=None,
             )

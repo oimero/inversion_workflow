@@ -2,7 +2,7 @@
 
 The transfer implementation deliberately keeps the data contracts small.  A
 ``ResidualTextureLibrary`` owns the native well dictionary, while a
-``ResidualTransferResult`` owns one deterministic realization on the target
+``ResidualDiagnostics`` owns one diagnostic comparison on the target
 body grid.  No neural-network or serialization details are part of these
 interfaces.
 """
@@ -93,7 +93,7 @@ class ScaleContract:
     which every control truly shares the same vertical interval.
     """
 
-    body_smoothing_fwhm_m: float = 15.0
+    body_smoothing_fwhm_m: float = 25.0
     window_half_width_m: float | None = None
     window_center_spacing_m: float | None = None
     normalized_profile_samples: int = 33
@@ -394,7 +394,7 @@ class ResidualTextureLibrary:
 
 @dataclass(frozen=True)
 class TransferGeometry:
-    """Optional explicit geometry bundle accepted by ``transfer_residual_texture``.
+    """Optional explicit geometry bundle accepted by ``ResidualTransfer``.
 
     Most callers can pass a ``SurveyLineGeometry`` directly.  This bundle is
     useful when a section or a target mask has already been assembled.
@@ -413,8 +413,8 @@ class TransferGeometry:
 
 
 @dataclass
-class ResidualTransferResult:
-    """Output of one deterministic conditional residual transfer."""
+class ResidualDiagnostics:
+    """Formal residual plus research-only comparison branches."""
 
     ginn_body: np.ndarray
     predicted_residual: np.ndarray
@@ -436,13 +436,13 @@ class ResidualTransferResult:
         effective = np.asarray(self.effective_dictionary_count, dtype=np.float64)
         support = np.asarray(self.support, dtype=bool)
         if residual.shape != body.shape or enhanced.shape != body.shape or effective.shape != body.shape or support.shape != body.shape:
-            raise ValueError("ResidualTransferResult arrays must all match ginn_body shape.")
+            raise ValueError("ResidualDiagnostics arrays must all match ginn_body shape.")
         if np.any(~np.isfinite(residual)) or np.any(~np.isfinite(effective[support])):
-            raise ValueError("ResidualTransferResult residual/effective count must be finite.")
+            raise ValueError("ResidualDiagnostics residual/effective count must be finite.")
         if np.any(residual[~support] != 0.0):
-            raise ValueError("ResidualTransferResult predicted_residual must be zero outside support.")
+            raise ValueError("ResidualDiagnostics predicted_residual must be zero outside support.")
         if np.any(effective[support] < 0.0):
-            raise ValueError("ResidualTransferResult effective_dictionary_count must be non-negative.")
+            raise ValueError("ResidualDiagnostics effective_dictionary_count must be non-negative.")
         object.__setattr__(self, "ginn_body", body)
         object.__setattr__(self, "predicted_residual", residual)
         object.__setattr__(self, "enhanced_log_ai", enhanced)
@@ -494,8 +494,8 @@ class ResidualTransferResult:
 
 
 @dataclass(frozen=True)
-class ResidualFieldResult:
-    """Compact transfer result used by section and volume production runs."""
+class ResidualResult:
+    """Compact formal result used by section and volume production runs."""
 
     predicted_residual: np.ndarray
     effective_dictionary_count: np.ndarray
@@ -508,11 +508,11 @@ class ResidualFieldResult:
         effective = np.asarray(self.effective_dictionary_count, dtype=np.float64)
         support = np.asarray(self.support, dtype=bool)
         if residual.shape != effective.shape or residual.shape != support.shape:
-            raise ValueError("ResidualFieldResult arrays must have matching shapes.")
+            raise ValueError("ResidualResult arrays must have matching shapes.")
         if np.any(~np.isfinite(residual)) or np.any(~np.isfinite(effective[support])):
-            raise ValueError("ResidualFieldResult contains non-finite values.")
+            raise ValueError("ResidualResult contains non-finite values.")
         if np.any(residual[~support] != 0.0) or np.any(effective[support] < 0.0):
-            raise ValueError("ResidualFieldResult support or effective-count contract is invalid.")
+            raise ValueError("ResidualResult support or effective-count contract is invalid.")
         for name in ("node_count", "graph_edge_count"):
             value = getattr(self, name)
             if isinstance(value, bool) or int(value) != value or int(value) < 0:
@@ -546,10 +546,10 @@ class ResidualFieldResult:
 
 __all__ = [
     "DictionaryAtom",
-    "ResidualFieldResult",
+    "ResidualDiagnostics",
+    "ResidualResult",
     "ResidualTextureLibrary",
     "ResidualTransferPolicy",
-    "ResidualTransferResult",
     "ScaleContract",
     "TransferGeometry",
 ]

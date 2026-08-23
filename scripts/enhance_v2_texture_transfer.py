@@ -27,7 +27,7 @@ from cup.well.controls import load_well_control_set
 from enhance_v2.artifacts import library_summary, result_summary
 from enhance_v2.contracts import ResidualTransferPolicy, ScaleContract, TransferGeometry
 from enhance_v2.library import build_residual_library
-from enhance_v2.transfer import transfer_residual_texture
+from enhance_v2.transfer import ResidualTransfer
 from enhance_v2.workflow import select_controls, well_zone_intervals
 from ginn_v2 import load_body
 from ginn_v2.workflow import load_config
@@ -166,7 +166,7 @@ def _plot_comparison(
         ("hard nearest", result.hard_nearest_residual),
         ("uniform zone mixture", result.uniform_residual),
         ("local soft dictionary", result.soft_residual),
-        ("spatial soft dictionary", result.predicted_residual),
+        ("formal spatial top-2", result.predicted_residual),
     ]
     residual_values = np.concatenate([np.abs(np.asarray(values)[support]) for _, values in residuals])
     residual_limit = max(float(np.quantile(residual_values, 0.995)), 1.0e-6)
@@ -223,9 +223,12 @@ def _plot_amplitude_continuity_comparison(
     support = np.asarray(result.support, dtype=bool)
     crop = _finite_crop(support)
     variants = [
-        ("current spatial soft\nprojected", np.asarray(result.predicted_residual)),
+        (
+            "diagnostic spatial soft\nprojected",
+            np.asarray(result.residual_variants["spatial_soft_projected"]),
+        ),
         ("local hard-nearest\nunprojected", np.asarray(result.residual_variants["hard_nearest_unprojected"])),
-        ("spatial top-2\nunprojected", np.asarray(result.residual_variants["spatial_top2_unprojected"])),
+        ("formal spatial top-2\nunprojected", np.asarray(result.predicted_residual)),
         (
             "spatial top-2 energy-preserved\nunprojected",
             np.asarray(result.residual_variants["spatial_top2_energy_preserved_unprojected"]),
@@ -386,6 +389,10 @@ def main() -> None:
     inputs = _required_mapping(section.get("inputs"), name="enhance_v2.inputs")
     dictionary_config = _required_mapping(section.get("dictionary"), name="enhance_v2.dictionary")
     transfer_config = _required_mapping(section.get("transfer"), name="enhance_v2.transfer")
+    diagnostics_config = _required_mapping(
+        section.get("diagnostics") or {},
+        name="enhance_v2.diagnostics",
+    )
     prototype_config = _required_mapping(section.get("prototype"), name="enhance_v2.prototype")
     output_dir = _resolve_output_dir(args.output_dir)
     if output_dir.exists():
@@ -431,7 +438,9 @@ def main() -> None:
         len(library.atoms), len(library.zone_ids), len(library.source_wells),
     )
 
-    policy = ResidualTransferPolicy.from_any(transfer_config)
+    policy = ResidualTransferPolicy.from_any(
+        {**dict(transfer_config), **dict(diagnostics_config)}
+    )
     orientations = tuple(args.orientations or prototype_config.get("orientations") or ("inline", "xline"))
     max_traces = int(args.max_traces or prototype_config.get("max_traces") or 64)
     dpi = int(prototype_config.get("figure_dpi") or 180)
@@ -462,12 +471,10 @@ def main() -> None:
         )
         for multiplier in multipliers:
             logger.info("%s transfer | temperature_multiplier=%.3f", orientation, multiplier)
-            temperature_results[float(multiplier)] = transfer_residual_texture(
-                body,
-                geometry,
+            temperature_results[float(multiplier)] = ResidualTransfer(
                 library,
                 replace(policy, temperature_multiplier=float(multiplier)),
-            )
+            ).diagnose(body, geometry)
         result = temperature_results[float(policy.temperature_multiplier)]
         _plot_comparison(
             result, distance_m, sample_axis.values, horizons, section_dir / "comparison.png", dpi=dpi

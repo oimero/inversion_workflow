@@ -313,7 +313,7 @@ def write_well_waveform_qc(
     return manifest
 
 
-SCHEMA_VERSION = "ginn_v2_body_fwhm_sweep_v1"
+SCHEMA_VERSION = "ginn_v2_body_fwhm_sweep_v2"
 
 
 @dataclass(frozen=True)
@@ -415,10 +415,10 @@ class CandidateSweepResult:
 class WellBodyFwhmSweep:
     well_name: str
     native_axis_m: np.ndarray
-    native_full_log_ai: np.ndarray
+    native_filtered_log_ai: np.ndarray
     native_target_support: np.ndarray
     model_axis_m: np.ndarray
-    model_full_log_ai: np.ndarray
+    model_grid_filtered_log_ai: np.ndarray
     model_target_support: np.ndarray
     real_seismic: np.ndarray
     full_forward: np.ndarray
@@ -741,13 +741,13 @@ def _candidate_for_well(
     policy: BodyFwhmSweepPolicy,
 ) -> tuple[CandidateSweepResult, dict[str, Any], list[dict[str, Any]]]:
     native_axis = np.asarray(control.native.coordinates, dtype=np.float64)
-    native_full = np.asarray(control.native.full_log_ai, dtype=np.float64)
+    native_filtered = np.asarray(control.native.native_filtered_log_ai, dtype=np.float64)
     native_body = _gaussian_smooth_for_sweep(
-        native_full,
+        native_filtered,
         native_axis,
         fwhm_m=fwhm_m,
     )
-    native_residual = native_full - native_body
+    native_residual = native_filtered - native_body
     native_support = native_target & np.isfinite(native_body) & np.isfinite(native_residual)
     negative_curvature = _negative_curvature(native_axis, native_body, native_support)
     curvature_corr, curvature_r2, curvature_gain, curvature_intercept = _template_fit(
@@ -757,9 +757,9 @@ def _candidate_for_well(
     )
 
     model_axis = np.asarray(control.sample_axis.values, dtype=np.float64)
-    model_full = np.asarray(control.log_ai.values, dtype=np.float64)
+    model_grid_filtered = np.asarray(control.model_grid_filtered_log_ai.values, dtype=np.float64)
     model_body = _interpolate_finite_runs(native_axis, native_body, model_axis)
-    model_residual = model_full - model_body
+    model_residual = model_grid_filtered - model_body
     twice_smoothed_body = _gaussian_smooth_for_sweep(
         model_body,
         model_axis,
@@ -768,7 +768,7 @@ def _candidate_for_well(
     sharpening_template = model_body - twice_smoothed_body
     model_support = (
         model_target
-        & np.isfinite(model_full)
+        & np.isfinite(model_grid_filtered)
         & np.isfinite(model_body)
         & np.isfinite(model_residual)
         & np.isfinite(sharpening_template)
@@ -829,7 +829,7 @@ def _candidate_for_well(
         "model_residual_rms": _rms(model_residual[model_support]),
         "model_residual_unsharp_corr": sharpening_corr,
         "model_residual_unsharp_r2": sharpening_r2,
-        "model_body_full_corr": _safe_corr(model_full, model_body, model_support),
+        "model_body_full_corr": _safe_corr(model_grid_filtered, model_body, model_support),
         "full_real_forward_corr": _safe_corr(
             real_seismic,
             full_forward,
@@ -954,14 +954,14 @@ def run_body_fwhm_sweep(
         target_top = float(markers[0][0])
         target_bottom = float(markers[-1][0])
         native_axis = np.asarray(control.native.coordinates, dtype=np.float64)
-        native_full = np.asarray(control.native.full_log_ai, dtype=np.float64)
+        native_filtered = np.asarray(control.native.native_filtered_log_ai, dtype=np.float64)
         native_target = (
             np.asarray(control.native.valid_mask, dtype=bool)
             & (native_axis >= target_top)
             & (native_axis <= target_bottom)
         )
         model_axis = np.asarray(control.sample_axis.values, dtype=np.float64)
-        model_full = np.asarray(control.log_ai.values, dtype=np.float64)
+        model_grid_filtered = np.asarray(control.model_grid_filtered_log_ai.values, dtype=np.float64)
         model_target = (
             np.asarray(control.observed_valid_mask, dtype=bool)
             & (model_axis >= target_top)
@@ -969,7 +969,7 @@ def run_body_fwhm_sweep(
         )
         real_seismic = sample_seismic_along_control(control, survey)
         full_forward = forward_depth_finite_runs(
-            model_full,
+            model_grid_filtered,
             model_axis,
             wavelet_time_s=wavelet_time_s,
             wavelet_amplitude=wavelet_amplitude,
@@ -1009,10 +1009,10 @@ def run_body_fwhm_sweep(
             WellBodyFwhmSweep(
                 well_name=control.well_name,
                 native_axis_m=native_axis,
-                native_full_log_ai=native_full,
+                native_filtered_log_ai=native_filtered,
                 native_target_support=native_target,
                 model_axis_m=model_axis,
-                model_full_log_ai=model_full,
+                model_grid_filtered_log_ai=model_grid_filtered,
                 model_target_support=model_target,
                 real_seismic=real_seismic,
                 full_forward=full_forward,
@@ -1091,11 +1091,11 @@ def _plot_window_comparison(
     if not np.any(native_view) or not np.any(model_view):
         raise ValueError(f"{well.well_name}: comparison window has no native/model support.")
     body_scale = _finite_scale(
-        [well.native_full_log_ai[native_view]]
+        [well.native_filtered_log_ai[native_view]]
         + [item.native_body_log_ai[native_view] for item in well.candidates]
     )
     body_values = np.concatenate(
-        [well.native_full_log_ai[native_view]]
+        [well.native_filtered_log_ai[native_view]]
         + [item.native_body_log_ai[native_view] for item in well.candidates]
     )
     body_finite = body_values[np.isfinite(body_values)]
@@ -1132,7 +1132,7 @@ def _plot_window_comparison(
             linewidth=1.0,
         )
         axes[row, 1].plot(
-            well.native_full_log_ai,
+            well.native_filtered_log_ai,
             well.native_axis_m,
             color="0.25",
             linewidth=0.65,
@@ -1207,10 +1207,10 @@ def _plot_window_comparison(
 def _write_well_artifact(well: WellBodyFwhmSweep, path: Path) -> None:
     payload: dict[str, np.ndarray] = {
         "native_axis_m": well.native_axis_m,
-        "native_full_log_ai": well.native_full_log_ai,
+        "native_filtered_log_ai": well.native_filtered_log_ai,
         "native_target_support": well.native_target_support,
         "model_axis_m": well.model_axis_m,
-        "model_full_log_ai": well.model_full_log_ai,
+        "model_grid_filtered_log_ai": well.model_grid_filtered_log_ai,
         "model_target_support": well.model_target_support,
         "real_seismic": well.real_seismic,
         "full_forward": well.full_forward,

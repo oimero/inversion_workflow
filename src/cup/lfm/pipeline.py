@@ -633,7 +633,7 @@ def _comparison_well_metrics(
             inside = left_inside & right_inside & left_mask_inside & right_mask_inside
             left_mask = left_mask_float > 0.5
             right_mask = right_mask_float > 0.5
-        well = np.asarray(control.log_ai.values, dtype=np.float64)
+        well = np.asarray(control.model_grid_filtered_log_ai.values, dtype=np.float64)
         valid = control.valid_mask & inside & left_mask & right_mask & np.isfinite(left_values) & np.isfinite(right_values)
         rows.append(
             {

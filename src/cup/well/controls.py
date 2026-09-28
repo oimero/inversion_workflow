@@ -38,7 +38,7 @@ from wtie.optimize.similarity import normalized_xcorr
 from wtie.processing import grid
 
 
-SCHEMA_VERSION = "real_field_well_controls_v6"
+SCHEMA_VERSION = "real_field_well_controls_v7"
 TIME_SOURCE_SCHEMA = WELL_AUTO_TIE_SCHEMA_VERSION
 DEPTH_SOURCE_SCHEMA = DEPTH_WAVELET_BATCH_SCHEMA_VERSION
 LINEAR_AI_UNIT = "m/s*g/cm3"
@@ -71,9 +71,11 @@ MANIFEST_COLUMNS = [
 
 @dataclass(frozen=True)
 class WellControl:
+    """Aligned filtered well log sampled on the seismic model grid."""
+
     well_name: str
     sample_axis: SampleAxis
-    log_ai: grid.Log
+    model_grid_filtered_log_ai: grid.Log
     inline_by_sample: np.ndarray
     xline_by_sample: np.ndarray
     x_m_by_sample: np.ndarray
@@ -88,7 +90,7 @@ class WellControl:
 
     def __post_init__(self) -> None:
         n = self.sample_axis.values.size
-        values = np.asarray(self.log_ai.values, dtype=np.float64)
+        values = np.asarray(self.model_grid_filtered_log_ai.values, dtype=np.float64)
         arrays = {
             "inline_by_sample": np.asarray(self.inline_by_sample, dtype=np.float64),
             "xline_by_sample": np.asarray(self.xline_by_sample, dtype=np.float64),
@@ -97,11 +99,11 @@ class WellControl:
             "valid_mask": np.asarray(self.valid_mask, dtype=bool),
             "observed_valid_mask": np.asarray(self.observed_valid_mask, dtype=bool),
         }
-        if values.shape != (n,) or not np.array_equal(self.log_ai.basis, self.sample_axis.values):
-            raise ValueError(f"{self.well_name}: log_ai must be aligned to the canonical SampleAxis.")
+        if values.shape != (n,) or not np.array_equal(self.model_grid_filtered_log_ai.basis, self.sample_axis.values):
+            raise ValueError(f"{self.well_name}: model_grid_filtered_log_ai must be aligned to the canonical SampleAxis.")
         expected_basis = "twt" if self.sample_axis.domain == "time" else "tvdss"
-        if not getattr(self.log_ai, f"is_{expected_basis}"):
-            raise ValueError(f"{self.well_name}: log_ai basis is inconsistent with {self.sample_axis.domain}.")
+        if not getattr(self.model_grid_filtered_log_ai, f"is_{expected_basis}"):
+            raise ValueError(f"{self.well_name}: model_grid_filtered_log_ai basis is inconsistent with {self.sample_axis.domain}.")
         for name, array in arrays.items():
             if array.shape != (n,):
                 raise ValueError(f"{self.well_name}: {name} must have shape ({n},).")
@@ -125,11 +127,11 @@ class WellControl:
 
 @dataclass(frozen=True)
 class NativeWellControl:
-    """Aligned filtered full-band well log on its native vertical sampling."""
+    """Aligned filtered well log on its native vertical sampling."""
 
     well_name: str
     coordinates: np.ndarray
-    full_log_ai: np.ndarray
+    native_filtered_log_ai: np.ndarray
     valid_mask: np.ndarray
     sample_domain: str
     sample_unit: str
@@ -138,7 +140,7 @@ class NativeWellControl:
 
     def __post_init__(self) -> None:
         coordinates = np.asarray(self.coordinates, dtype=np.float64)
-        values = np.asarray(self.full_log_ai, dtype=np.float64)
+        values = np.asarray(self.native_filtered_log_ai, dtype=np.float64)
         valid = np.asarray(self.valid_mask, dtype=bool)
         if coordinates.ndim != 1 or coordinates.size < 2 or values.shape != coordinates.shape or valid.shape != coordinates.shape:
             raise ValueError(f"{self.well_name}: native arrays must be matching 1D arrays with at least two samples.")
@@ -154,7 +156,7 @@ class NativeWellControl:
         ):
             raise ValueError(f"{self.well_name}: native depth_basis is inconsistent with sample_domain.")
         object.__setattr__(self, "coordinates", coordinates)
-        object.__setattr__(self, "full_log_ai", values)
+        object.__setattr__(self, "native_filtered_log_ai", values)
         object.__setattr__(self, "valid_mask", valid)
 
 
@@ -262,9 +264,9 @@ def _read_ai_las(path: Path) -> tuple[np.ndarray, np.ndarray]:
     valid = np.isfinite(ai) & (ai > 0.0)
     if np.count_nonzero(valid) < 2:
         raise ValueError(f"AI LAS has fewer than two valid positive samples: {path}")
-    log_ai = np.full(ai.shape, np.nan, dtype=np.float64)
-    log_ai[valid] = np.log(ai[valid])
-    return md, log_ai
+    filtered_log_ai = np.full(ai.shape, np.nan, dtype=np.float64)
+    filtered_log_ai[valid] = np.log(ai[valid])
+    return md, filtered_log_ai
 
 
 def _interp_no_extrapolation(x: np.ndarray, xp: np.ndarray, fp: np.ndarray) -> np.ndarray:
@@ -300,13 +302,13 @@ def _native_control(
     *,
     well_name: str,
     coordinates: np.ndarray,
-    full_log_ai: np.ndarray,
+    native_filtered_log_ai: np.ndarray,
     sample_domain: str,
     depth_basis: str | None,
     provenance: Mapping[str, Any],
 ) -> NativeWellControl:
     coordinates = np.asarray(coordinates, dtype=np.float64)
-    values = np.asarray(full_log_ai, dtype=np.float64)
+    values = np.asarray(native_filtered_log_ai, dtype=np.float64)
     support = np.isfinite(coordinates)
     coordinates = coordinates[support]
     values = values[support]
@@ -315,7 +317,7 @@ def _native_control(
     return NativeWellControl(
         well_name=well_name,
         coordinates=coordinates,
-        full_log_ai=values,
+        native_filtered_log_ai=values,
         valid_mask=np.isfinite(values),
         sample_domain=sample_domain,
         sample_unit="s" if sample_domain == "time" else "m",
@@ -328,7 +330,7 @@ def _control_from_arrays(
     *,
     well_name: str,
     sample_axis: SampleAxis,
-    log_ai: np.ndarray,
+    model_grid_filtered_log_ai: np.ndarray,
     inline: np.ndarray,
     xline: np.ndarray,
     x_m: np.ndarray,
@@ -340,7 +342,7 @@ def _control_from_arrays(
     provenance: Mapping[str, Any],
     native: NativeWellControl,
 ) -> WellControl:
-    arrays = [np.asarray(value, dtype=np.float64).copy() for value in (log_ai, inline, xline, x_m, y_m)]
+    arrays = [np.asarray(value, dtype=np.float64).copy() for value in (model_grid_filtered_log_ai, inline, xline, x_m, y_m)]
     valid = np.logical_and.reduce([np.isfinite(value) for value in arrays])
     observed = np.asarray(observed_valid_mask, dtype=bool)
     if observed.shape != valid.shape:
@@ -349,11 +351,11 @@ def _control_from_arrays(
     for value in arrays:
         value[~valid] = np.nan
     basis_type = "twt" if sample_axis.domain == "time" else "tvdss"
-    log = grid.Log(arrays[0], sample_axis.values.copy(), basis_type, name="log_ai", unit="ln(m/s*g/cm3)")
+    log = grid.Log(arrays[0], sample_axis.values.copy(), basis_type, name="model_grid_filtered_log_ai", unit="ln(m/s*g/cm3)")
     return WellControl(
         well_name=well_name,
         sample_axis=sample_axis,
-        log_ai=log,
+        model_grid_filtered_log_ai=log,
         inline_by_sample=arrays[1],
         xline_by_sample=arrays[2],
         x_m_by_sample=arrays[3],
@@ -436,11 +438,11 @@ def _time_control(
     )
     if native_las_path is None or not native_las_path.is_file():
         raise FileNotFoundError(f"{well_name}: filtered LAS is missing.")
-    native_md, native_log_ai = _read_ai_las(native_las_path)
+    native_md, native_filtered_log_ai = _read_ai_las(native_las_path)
     native = _native_control(
         well_name=well_name,
         coordinates=_interp_no_extrapolation(native_md, table_md, twt),
-        full_log_ai=native_log_ai,
+        native_filtered_log_ai=native_filtered_log_ai,
         sample_domain="time",
         depth_basis=None,
         provenance={
@@ -452,20 +454,20 @@ def _time_control(
             "aligned_vertical_coordinate": "twt_s",
         },
     )
-    model_log_ai = _interp_finite_runs(
+    model_grid_filtered_log_ai = _interp_finite_runs(
         sample_axis.values,
         native.coordinates,
-        native.full_log_ai,
+        native.native_filtered_log_ai,
     )
     return _control_from_arrays(
         well_name=well_name,
         sample_axis=sample_axis,
-        log_ai=model_log_ai,
+        model_grid_filtered_log_ai=model_grid_filtered_log_ai,
         inline=positions[0],
         xline=positions[1],
         x_m=positions[2],
         y_m=positions[3],
-        observed_valid_mask=np.isfinite(model_log_ai),
+        observed_valid_mask=np.isfinite(model_grid_filtered_log_ai),
         wellbore_class=wellbore_class,
         sampling_mode=sampling_mode,
         source_run_type="well_auto_tie",
@@ -497,7 +499,7 @@ def _depth_control(
     )
     if native_las_path is None or not native_las_path.is_file():
         raise FileNotFoundError(f"{well_name}: shifted filtered LAS is missing.")
-    native_md, native_log_ai = _read_ai_las(native_las_path)
+    native_md, native_filtered_log_ai = _read_ai_las(native_las_path)
     wellbore_class = str(inventory_row.get("wellbore_class") or "unknown").strip().casefold()
     trace_path = trace_lookup.get(normalize_well_name(well_name))
     if wellbore_class == "deviated":
@@ -543,7 +545,7 @@ def _depth_control(
     native = _native_control(
         well_name=well_name,
         coordinates=native_tvdss,
-        full_log_ai=native_log_ai,
+        native_filtered_log_ai=native_filtered_log_ai,
         sample_domain="depth",
         depth_basis="tvdss",
         provenance={
@@ -556,20 +558,20 @@ def _depth_control(
             **transform_metadata,
         },
     )
-    model_log_ai = _interp_finite_runs(
+    model_grid_filtered_log_ai = _interp_finite_runs(
         sample_axis.values,
         native.coordinates,
-        native.full_log_ai,
+        native.native_filtered_log_ai,
     )
     return _control_from_arrays(
         well_name=well_name,
         sample_axis=sample_axis,
-        log_ai=model_log_ai,
+        model_grid_filtered_log_ai=model_grid_filtered_log_ai,
         inline=inline,
         xline=xline,
         x_m=x_m,
         y_m=y_m,
-        observed_valid_mask=np.isfinite(model_log_ai),
+        observed_valid_mask=np.isfinite(model_grid_filtered_log_ai),
         wellbore_class=wellbore_class,
         sampling_mode=sampling_mode,
         source_run_type="wavelet_batch_synthetic_depth",
@@ -865,10 +867,10 @@ def write_well_control_set(
             "sampling_mode": control.sampling_mode,
             "linear_ai_unit": LINEAR_AI_UNIT,
             "value_domain": "log(AI)",
-            "model_axis_value_key": "log_ai",
+            "model_axis_value_key": "model_grid_filtered_log_ai",
             "model_axis_valid_mask_key": "valid_mask",
             "model_axis_observed_valid_mask_key": "observed_valid_mask",
-            "native_value_key": "native_full_log_ai",
+            "native_value_key": "native_filtered_log_ai",
             "native_source_role": "filtered",
             "gap_policy": "upstream_filtered_only",
             "provenance": portable_provenance(control.provenance),
@@ -884,7 +886,7 @@ def write_well_control_set(
         np.savez_compressed(
             path,
             samples=control.sample_axis.values.astype(np.float64),
-            log_ai=np.asarray(control.log_ai.values, dtype=np.float32),
+            model_grid_filtered_log_ai=np.asarray(control.model_grid_filtered_log_ai.values, dtype=np.float32),
             inline=control.inline_by_sample.astype(np.float64),
             xline=control.xline_by_sample.astype(np.float64),
             x_m=control.x_m_by_sample.astype(np.float64),
@@ -892,7 +894,7 @@ def write_well_control_set(
             valid_mask=control.valid_mask.astype(bool),
             observed_valid_mask=control.observed_valid_mask.astype(bool),
             native_coordinates=control.native.coordinates.astype(np.float64),
-            native_full_log_ai=control.native.full_log_ai.astype(np.float32),
+            native_filtered_log_ai=control.native.native_filtered_log_ai.astype(np.float32),
             native_valid_mask=control.native.valid_mask.astype(bool),
             metadata_json=np.asarray(json.dumps(metadata, ensure_ascii=False, sort_keys=True)),
         )
@@ -977,7 +979,10 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
     with summary_path.open("r", encoding="utf-8") as handle:
         summary = json.load(handle)
     if summary.get("schema_version") != SCHEMA_VERSION or not is_consumable_contract_status(summary.get("status")):
-        raise ValueError(f"Unsupported or unsuccessful well-control run: {run_dir}")
+        raise ValueError(
+            f"Unsupported or unsuccessful well-control run: {run_dir}; "
+            f"regenerate Step 6 with schema {SCHEMA_VERSION}."
+        )
     if summary.get("native_source_role") != "filtered" or summary.get("gap_policy") != "upstream_filtered_only":
         raise ValueError(f"Well-control run does not use the filtered-LAS/upstream-gap contract: {run_dir}")
     require_contract_fingerprint(summary, label=f"WellControlSet {run_dir}")
@@ -1036,7 +1041,7 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
         with np.load(path, allow_pickle=False) as data:
             if set(data.files) != {
                 "samples",
-                "log_ai",
+                "model_grid_filtered_log_ai",
                 "inline",
                 "xline",
                 "x_m",
@@ -1044,7 +1049,7 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
                 "valid_mask",
                 "observed_valid_mask",
                 "native_coordinates",
-                "native_full_log_ai",
+                "native_filtered_log_ai",
                 "native_valid_mask",
                 "metadata_json",
             }:
@@ -1054,16 +1059,16 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
             ):
                 raise ValueError(f"Well-control sample/position arrays must be float64: {path}")
             if (
-                data["log_ai"].dtype != np.dtype("float32")
+                data["model_grid_filtered_log_ai"].dtype != np.dtype("float32")
                 or data["valid_mask"].dtype != np.dtype("bool")
                 or data["observed_valid_mask"].dtype != np.dtype("bool")
             ):
                 raise ValueError(
-                    f"Well-control log_ai/valid/observed mask dtypes must be float32/bool: {path}"
+                    f"Well-control model_grid_filtered_log_ai/valid/observed mask dtypes must be float32/bool: {path}"
                 )
             if (
                 data["native_coordinates"].dtype != np.dtype("float64")
-                or data["native_full_log_ai"].dtype != np.dtype("float32")
+                or data["native_filtered_log_ai"].dtype != np.dtype("float32")
                 or data["native_valid_mask"].dtype != np.dtype("bool")
             ):
                 raise ValueError(f"Native well-control coordinate/log/mask dtypes are invalid: {path}")
@@ -1080,10 +1085,10 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
                 "depth_basis": summary.get("depth_basis"),
                 "linear_ai_unit": LINEAR_AI_UNIT,
                 "value_domain": "log(AI)",
-                "model_axis_value_key": "log_ai",
+                "model_axis_value_key": "model_grid_filtered_log_ai",
                 "model_axis_valid_mask_key": "valid_mask",
                 "model_axis_observed_valid_mask_key": "observed_valid_mask",
-                "native_value_key": "native_full_log_ai",
+                "native_value_key": "native_filtered_log_ai",
                 "native_source_role": "filtered",
                 "gap_policy": "upstream_filtered_only",
             }
@@ -1107,7 +1112,7 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
             native = NativeWellControl(
                 well_name=str(metadata["well_name"]),
                 coordinates=np.asarray(data["native_coordinates"], dtype=np.float64),
-                full_log_ai=np.asarray(data["native_full_log_ai"], dtype=np.float64),
+                native_filtered_log_ai=np.asarray(data["native_filtered_log_ai"], dtype=np.float64),
                 valid_mask=np.asarray(data["native_valid_mask"], dtype=bool),
                 sample_domain=axis.domain,
                 sample_unit=axis.unit,
@@ -1120,7 +1125,7 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
             control = _control_from_arrays(
                 well_name=str(metadata["well_name"]),
                 sample_axis=axis,
-                log_ai=np.asarray(data["log_ai"], dtype=np.float64),
+                model_grid_filtered_log_ai=np.asarray(data["model_grid_filtered_log_ai"], dtype=np.float64),
                 inline=np.asarray(data["inline"], dtype=np.float64),
                 xline=np.asarray(data["xline"], dtype=np.float64),
                 x_m=np.asarray(data["x_m"], dtype=np.float64),
@@ -1411,7 +1416,7 @@ def _plot_event_comparison(
     output_path: Path,
     well_name: str,
     axis: np.ndarray,
-    full_log_ai: np.ndarray,
+    model_grid_filtered_log_ai: np.ndarray,
     body_log_ai: np.ndarray,
     real: np.ndarray,
     full_synthetic: np.ndarray,
@@ -1446,7 +1451,7 @@ def _plot_event_comparison(
         axes[row, 0].axhspan(axis[event_start], axis[event_stop - 1], color="tab:blue", alpha=0.12)
         axes[row, 0].set_title("Real seismic" if row == 0 else "")
 
-        axes[row, 1].plot(full_log_ai[local], local_axis, color="black", lw=1.1, label="full")
+        axes[row, 1].plot(model_grid_filtered_log_ai[local], local_axis, color="black", lw=1.1, label="full")
         axes[row, 1].plot(
             body_log_ai[local],
             local_axis,
@@ -1458,7 +1463,7 @@ def _plot_event_comparison(
         if row == 0:
             axes[row, 1].legend(fontsize=8)
 
-        residual = full_log_ai[local] - body_log_ai[local]
+        residual = model_grid_filtered_log_ai[local] - body_log_ai[local]
         axes[row, 2].plot(
             residual,
             local_axis,
@@ -1527,15 +1532,15 @@ def write_depth_well_control_qc(
         well_dir = figures_root / sanitize_filename(control.well_name)
         well_dir.mkdir()
         axis = control.sample_axis.values
-        full_log_ai = np.asarray(control.log_ai.values, dtype=np.float64)
+        model_grid_filtered_log_ai = np.asarray(control.model_grid_filtered_log_ai.values, dtype=np.float64)
         body_log_ai = gaussian_smooth_finite_runs_numpy(
-            full_log_ai,
+            model_grid_filtered_log_ai,
             axis,
             fwhm_m=body_fwhm,
         )
         real = sample_seismic_along_control(control, survey)
         full_forward = forward_depth_finite_runs(
-            full_log_ai,
+            model_grid_filtered_log_ai,
             axis,
             wavelet_time_s=wavelet_time,
             wavelet_amplitude=wavelet_amp,
@@ -1579,7 +1584,7 @@ def write_depth_well_control_qc(
 
         full_objects = _waveform_objects(
             axis=local_axis,
-            log_ai=full_log_ai[selected],
+            log_ai=model_grid_filtered_log_ai[selected],
             synthetic=local_full_forward,
             real=local_real,
             dynamic_window_m=dynamic_window,
@@ -1632,7 +1637,7 @@ def write_depth_well_control_qc(
             output_path=comparison_path,
             well_name=control.well_name,
             axis=local_axis,
-            full_log_ai=full_log_ai[selected],
+            model_grid_filtered_log_ai=model_grid_filtered_log_ai[selected],
             body_log_ai=body_log_ai[selected],
             real=local_real,
             full_synthetic=local_full_forward,

@@ -42,7 +42,7 @@ def _filtered_controls(controls: WellControlSet, config: Mapping[str, Any]) -> t
     spec = parse_lowpass_spec(_required_mapping(config, "filter", path="baseline"), controls.sample_axis)
     out = []
     for control in controls.controls:
-        filtered = apply_lfm_lowpass(control.log_ai, spec)
+        filtered = apply_lfm_lowpass(control.model_grid_filtered_log_ai, spec)
         valid = control.valid_mask & np.isfinite(filtered.values)
         values = np.asarray(filtered.values, dtype=np.float64).copy()
         positions = [
@@ -60,7 +60,7 @@ def _filtered_controls(controls: WellControlSet, config: Mapping[str, Any]) -> t
         out.append(
             replace(
                 control,
-                log_ai=filtered,
+                model_grid_filtered_log_ai=filtered,
                 inline_by_sample=positions[0],
                 xline_by_sample=positions[1],
                 x_m_by_sample=positions[2],
@@ -236,7 +236,7 @@ class TrendBuilder:
                 )
                 continue
             x = 2.0 * u[valid] - 1.0
-            y = np.asarray(control.log_ai.values, dtype=np.float64)[valid]
+            y = np.asarray(control.model_grid_filtered_log_ai.values, dtype=np.float64)[valid]
             try:
                 a, b = _huber_fit(x, y, f_scale=float(fit_config["huber_f_scale_log_ai"]))
             except ValueError as exc:
@@ -375,7 +375,15 @@ class ProportionalKrigingBuilder:
                     )
                     if indices.size == 0 or target_u < u_values[0] or target_u > u_values[-1]:
                         continue
-                    values.append(float(np.interp(target_u, u_values, control.log_ai.values[indices])))
+                    values.append(
+                        float(
+                            np.interp(
+                                target_u,
+                                u_values,
+                                control.model_grid_filtered_log_ai.values[indices],
+                            )
+                        )
+                    )
                     x_values.append(float(np.interp(target_u, u_values, control.x_m_by_sample[indices])))
                     y_values.append(float(np.interp(target_u, u_values, control.y_m_by_sample[indices])))
                     well_names.append(control.well_name)

@@ -475,7 +475,7 @@ Status: ok
 
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
-| WellControlSet schema 不是 v2 | 第六步未完成或用旧版脚本生成 | 重建第六步 |
+| WellControlSet schema 不是 v7 | 第六步未完成或产物不符合当前井控契约 | 重建第六步 |
 | WellControlSet 几何/采样轴不一致 | 第六步使用了不同的地震契约 | 用当前地震重建第六步；不要靠文件哈希替代轴语义校验 |
 | 配置段缺少必要字段 | baseline/modifier/variant 配置不完整 | 对照配置参考补全 |
 | variant ID 使用 `M0`/`M1` | 禁止编号式命名 | 使用描述性 ID |

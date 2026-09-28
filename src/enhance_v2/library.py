@@ -43,10 +43,10 @@ def _as_native_view(control: Any, *, fallback_name: str | None = None) -> _Nativ
     if name is None:
         raise ValueError("Each residual dictionary control requires a well_name.")
     coordinates = get_value("coordinates", "native_coordinates", "samples", "axis")
-    values = get_value("full_log_ai", "native_full_log_ai", "log_ai", "values")
+    values = get_value("native_filtered_log_ai", "values")
     valid = get_value("valid_mask", "native_valid_mask")
     if coordinates is None or values is None:
-        raise ValueError(f"{name}: native control requires coordinates and full_log_ai values.")
+        raise ValueError(f"{name}: native control requires coordinates and native_filtered_log_ai values.")
     if hasattr(values, "values") and not isinstance(values, np.ndarray):
         values = values.values
     coordinates = np.asarray(coordinates, dtype=np.float64)
@@ -198,7 +198,7 @@ def build_residual_library(
 
     ``well_controls`` is normally a ``cup.well.controls.WellControlSet``.
     A mapping or iterable of native records with ``coordinates`` and
-    ``full_log_ai`` fields is also accepted for small deterministic smoke runs.
+    ``native_filtered_log_ai`` fields is also accepted for small deterministic smoke runs.
     Native filtered values are used directly; the model-axis log is never
     silently substituted when a native layer is available.
     """

@@ -1,6 +1,6 @@
 # 06 真实工区井控数据集
 
-`real_field_well_controls.py` 是工作流的第六步。它把上游 filtered LAS 统一到地震采样轴，同时保留 filtered LAS 的原生采样曲线，并为每口成功井生成正演质控图。
+`real_field_well_controls.py` 是工作流的第六步。它把上游 filtered LAS 统一到地震采样轴，同时保留 filtered LAS 的原生采样曲线，并为每口成功井生成正演质控图。模型轴和原生采样轴上的阻抗字段都明确标注了 filtered 来源。
 
 > 深度域工区使用第五步（`wavelet_batch_synthetic_depth`）作为上游，配置方式见文末。
 
@@ -81,13 +81,13 @@ real_field_well_controls_qc:
 
 ### 缺口
 
-缺口处理由上游 filtered LAS 负责。第六步只在各个有限段内投影到目标 SampleAxis，不跨缺口插值，也不在模型轴上重新填补。`observed_valid_mask` 表示投影后的上游有效支撑，缺口样点在 `log_ai` 和掩码中保持无效。
+缺口处理由上游 filtered LAS 负责。第六步只在各个有限段内投影到目标 SampleAxis，不跨缺口插值，也不在模型轴上重新填补。观测支撑掩码表示投影后的上游有效支撑，缺口样点在模型轴阻抗字段和掩码中保持无效。
 
 ---
 
 ## 脚本在做什么
 
-脚本发布同一口井的两层事实：模型轴上的 filtered 井控服务于低频模型和后续训练，原生采样上的 filtered full log-AI 服务于主体监督和高频残差。处理顺序为适配、域转换、写入和正演质控。
+脚本发布同一口井的两层事实：模型轴上的 filtered 井控服务于低频模型和后续训练，原生采样上的 filtered log-AI 服务于主体监督和高频残差。处理顺序为适配、域转换、写入和正演质控。
 
 ### 第一阶段：适配
 
@@ -107,7 +107,7 @@ real_field_well_controls_qc:
 
 然后写入三类产物：
 
-1. **逐井 NPZ。** `wells/<well>.npz` 同时包含模型轴井控和原生完整井控。两层各自携带采样坐标、波阻抗对数和有效掩码；模型轴层同时携带线号、道号和米制坐标。
+1. **逐井 NPZ。** `wells/<well>.npz` 同时包含模型轴井控和原生采样井控。两层各自携带采样坐标、波阻抗对数和有效掩码；模型轴层同时携带线号、道号和米制坐标。
 2. **Manifest CSV。** 每口候选井一行，分别记录两层数据的总样点数、有效样点数和 NPZ 路径。失败的井也保留行，但 NPZ 路径为空。
 3. **运行摘要 JSON。** 记录来源适配器、采样轴、上游契约指纹、井数统计和产物路径。
 
@@ -115,7 +115,7 @@ real_field_well_controls_qc:
 
 深度域运行读取第五步发布的冻结子波和 AI–Vp 关系。每口成功井生成三张目的层图件：
 
-1. filtered full log-AI 的六联正演质控图；
+1. 模型轴 filtered log-AI 的六联正演质控图；
 2. 25 m 主体曲线的六联正演质控图；
 3. 若干真实地震波瓣窗口中的 real seismic、full/body log-AI、full-body 残差及两套合成波形对比图。合成波形子图只显示 full 和 body 两套合成地震。
 
@@ -155,10 +155,12 @@ real_field_well_controls_<timestamp>/
 | `sampling_mode` | 具体采样方式 |
 | `n_samples` / `n_valid_samples` | 总样点数 / 有效样点数 |
 | `n_observed_samples` / `n_interpolated_samples` | filtered LAS 投影有效样点数 / 第六步新增样点数（当前合同为 0） |
-| `n_native_samples` / `n_valid_native_samples` | 原生完整井曲线总样点数 / 有效样点数 |
+| `n_native_samples` / `n_valid_native_samples` | filtered LAS 原生采样曲线总样点数 / 有效样点数 |
 | `well_npz_path` | NPZ 路径（失败时为空）；消费者不再重算逐井文件哈希 |
 
-`run_summary.json` 使用 `real_field_well_controls_v6`，声明 `native_source_role=filtered` 和 `gap_policy=upstream_filtered_only`，通过 `input_contracts` 记录直接上游，并发布一个生产者契约指纹。
+`run_summary.json` 使用 `real_field_well_controls_v7`，声明 `native_source_role=filtered` 和 `gap_policy=upstream_filtered_only`，通过 `input_contracts` 记录直接上游，并发布一个生产者契约指纹。
+
+第七步和训练读取这一版本的逐井文件。生成井控后，将下游配置中的井控目录指向本次输出，并基于这份井控生成相应的低频模型。
 
 ### `wells/<well_name>.npz`
 
@@ -167,7 +169,7 @@ real_field_well_controls_<timestamp>/
 | 键 | dtype | 形状 | 含义 |
 |------|------|------|------|
 | `samples` | float64 | [N] | SampleAxis 采样值 |
-| `log_ai` | float32 | [N] | ln(AI)，无效处为 NaN |
+| `model_grid_filtered_log_ai` | float32 | [N] | 目标 SampleAxis 上的 filtered LAS ln(AI)，无效处为 NaN |
 | `inline` | float64 | [N] | 逐样点 inline 线号 |
 | `xline` | float64 | [N] | 逐样点 xline 线号 |
 | `x_m` | float64 | [N] | 逐样点 X 米制坐标 |
@@ -175,8 +177,8 @@ real_field_well_controls_<timestamp>/
 | `valid_mask` | bool | [N] | 有效掩码 |
 | `observed_valid_mask` | bool | [N] | 未经缺口内插的观测支撑 |
 | `native_coordinates` | float64 | [M] | 对齐后的原生 TWT 或 TVDSS 坐标 |
-| `native_full_log_ai` | float32 | [M] | filtered LAS 原生采样的完整 ln(AI)，无效处为 NaN |
-| `native_valid_mask` | bool | [M] | 原生完整井曲线有效掩码 |
+| `native_filtered_log_ai` | float32 | [M] | filtered LAS 原生采样的 ln(AI)，无效处为 NaN |
+| `native_valid_mask` | bool | [M] | filtered LAS 原生采样曲线有效掩码 |
 | `metadata_json` | 标量字符串 | — | 井名、schema、provenance |
 
 ### `run_summary.json`
@@ -214,7 +216,7 @@ QC figures: scripts/output/real_field_well_controls_<timestamp>/qc/figures
 
 ### 第四步：检查三张图件
 
-- `full_waveform_qc.png` 检查 filtered full log-AI 正演与真实地震的相位、振幅和局部相关性。
+- `full_waveform_qc.png` 检查模型轴 filtered log-AI 正演与真实地震的相位、振幅和局部相关性。
 - `body_waveform_qc.png` 检查 25 m 主体尺度是否保留主要地震响应。
 - `event_waveform_comparison.png` 依次观察 real seismic、full/body log-AI、full-body 残差，以及只包含 full/body 合成地震的波形差异。
 
@@ -224,7 +226,7 @@ QC figures: scripts/output/real_field_well_controls_<timestamp>/qc/figures
 
 | 原因 | 含义 | 怎么处理 |
 |------|------|---------|
-| schema_version 不匹配 | 上游 run summary 不是 v2 schema | 用当前版脚本重建上游 run |
+| schema_version 不匹配 | 上游运行摘要的格式与当前读取接口不匹配 | 用当前版脚本重新生成对应步骤的产物 |
 | source adapter/domain 不一致 | `source_run_type` 与上游 summary 的 domain 不匹配 | 时间域用 `well_auto_tie` |
 | AI 单位不是 `m/s*g/cm3` | LAS 中 AI 曲线单位错误或缺失 | 检查上游 LAS 导出配置 |
 | AI 包含非正值 | LAS 中有零或负的 AI 值 | 检查上游测井曲线质量 |

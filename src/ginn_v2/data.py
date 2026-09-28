@@ -818,7 +818,7 @@ def build_well_body_target(
     """Build a trusted-well target in the model's configured body band."""
 
     native_coordinates = np.asarray(control.native.coordinates, dtype=np.float64)
-    native_values = np.asarray(control.native.full_log_ai, dtype=np.float64)
+    native_values = np.asarray(control.native.native_filtered_log_ai, dtype=np.float64)
     native_body = gaussian_smooth_finite_runs_numpy(
         native_values,
         native_coordinates,

@@ -34,16 +34,12 @@ from ginn_v2.data import (
 )
 from ginn_v2.diagnose import write_well_waveform_qc
 from ginn_v2.loss import (
-    VerticalVisibilityCompensator,
-    VisibilityCompensationConfig,
-    analytic_gain_diagnostic,
-    lfm_anchor_loss,
     local_standard_deviation,
     masked_lfm_lowpass,
     short_wave_energy_ratio,
     waveform_shape_loss,
 )
-from ginn_v2.model import BodyNetworkConfig, BodyScaleProjector, CenterTraceBodyNet
+from ginn_v2.model import BodyNetworkConfig, BodySmoother, CenterTraceBodyNet
 from ginn_v2.physics import CommonObservationBatch, DomainAdapter
 
 
@@ -89,10 +85,7 @@ class EvaluationMetrics:
     short_wave_energy_fraction: float
     roughness_ratio: float
     roughness_ratio_by_well: Mapping[str, float]
-    analytic_gain_mean: float
     raw_amplitude_residual_mean: float
-    compensated_amplitude_residual_mean: float
-    visibility_standard_deviation: float
     seismic_body_amplitude_spearman: float
     seismic_body_log_amplitude_pearson: float
     support_contiguous_fraction: float
@@ -112,10 +105,7 @@ class EvaluationMetrics:
             "lfm_drift_rmse",
             "short_wave_energy_fraction",
             "roughness_ratio",
-            "analytic_gain_mean",
             "raw_amplitude_residual_mean",
-            "compensated_amplitude_residual_mean",
-            "visibility_standard_deviation",
             "seismic_body_amplitude_spearman",
             "seismic_body_log_amplitude_pearson",
             "support_contiguous_fraction",
@@ -204,8 +194,6 @@ def evaluate_warnings(
         "orientation_disagreement_rms_ratio": float(metrics.orientation_disagreement_rms_ratio),
         "seismic_body_amplitude_spearman": float(metrics.seismic_body_amplitude_spearman),
         "seismic_body_log_amplitude_pearson": float(metrics.seismic_body_log_amplitude_pearson),
-        "visibility_standard_deviation": float(metrics.visibility_standard_deviation),
-        "compensated_amplitude_residual_mean": float(metrics.compensated_amplitude_residual_mean),
     }
     if details["masked_corr_change_from_pretrain_median"] < -threshold.masked_corr_drop_tolerance:
         warnings.append("masked_shape")
@@ -219,7 +207,7 @@ def evaluate_warnings(
     )
 
 
-CHECKPOINT_SCHEMA = "ginn_v2_body_inversion_checkpoint_v2"
+CHECKPOINT_SCHEMA = "ginn_v2_body_inversion_checkpoint_v4_final_curve"
 
 
 def save_epoch_checkpoint(
@@ -296,8 +284,6 @@ def _positive_int(value: object, *, name: str) -> int:
 @dataclass(frozen=True)
 class BodyInversionLossWeights:
     seismic_shape: float = 1.0
-    seismic_amplitude: float = 0.25
-    lfm_anchor: float = 1.0
     trusted_well_body: float = 1.0
     trusted_well_derivative: float = 0.5
     lambda_shape: float = 0.25
@@ -355,8 +341,6 @@ class BodyInversionConfig:
     seismic_balance_floor_fraction: float = 0.10
     loss_weights: BodyInversionLossWeights = BodyInversionLossWeights()
     network: BodyNetworkConfig = BodyNetworkConfig()
-    visibility: VisibilityCompensationConfig = VisibilityCompensationConfig()
-
     def __post_init__(self) -> None:
         for name in (
             "body_smoothing_fwhm_m",
@@ -409,13 +393,11 @@ class BodyInversionConfig:
         warning_value = config.pop("warnings", {})
         network_value = config.pop("network", {})
         selection_value = config.pop("selection_weights", {})
-        visibility_value = config.pop("visibility", {})
         if (
             not isinstance(loss_value, Mapping)
             or not isinstance(warning_value, Mapping)
             or not isinstance(network_value, Mapping)
             or not isinstance(selection_value, Mapping)
-            or not isinstance(visibility_value, Mapping)
         ):
             raise ValueError("ginn_v2_body_inversion loss/warnings/network/selection_weights must be mappings.")
         if "trusted_well_names" in config:
@@ -428,7 +410,6 @@ class BodyInversionConfig:
             warnings=WarningThresholds(**dict(warning_value)),
             network=BodyNetworkConfig(**dict(network_value)),
             selection_weights=CheckpointSelectionWeights(**dict(selection_value)),
-            visibility=VisibilityCompensationConfig(**dict(visibility_value)),
         )
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -462,7 +443,6 @@ class BodyInversionConfig:
             "loss_weights": asdict(self.loss_weights),
             "warnings": asdict(self.warnings),
             "network": asdict(self.network),
-            "visibility": asdict(self.visibility),
         }
 
     def pretrain_json_dict(self) -> dict[str, Any]:
@@ -477,12 +457,9 @@ class BodyInversionConfig:
             "seismic_balance_floor_fraction": self.seismic_balance_floor_fraction,
             "loss_weights": {
                 "seismic_shape": self.loss_weights.seismic_shape,
-                "seismic_amplitude": self.loss_weights.seismic_amplitude,
-                "lfm_anchor": self.loss_weights.lfm_anchor,
                 "lambda_shape": self.loss_weights.lambda_shape,
             },
             "network": asdict(self.network),
-            "visibility": asdict(self.visibility),
         }
 
 
@@ -558,11 +535,7 @@ def build_body_inversion_data(
         source_run_type=controls.source_run_type,
         provenance=controls.provenance,
     )
-    projector = BodyScaleProjector(
-        smoothing_fwhm_m=config.body_smoothing_fwhm_m,
-        sample_step=float(reader.sample_axis.step),
-        lowpass_spec=lfm_lowpass_spec,
-    )
+    smoother = BodySmoother(smoothing_fwhm_m=config.body_smoothing_fwhm_m)
     targets = {
         control.well_name: build_well_body_target(
             control,
@@ -572,10 +545,8 @@ def build_body_inversion_data(
                 geometry=reader.geometry,
                 target_zone_mask=target_zone_mask,
             ),
-            lfm_log_ai=reader.lfm_log_ai,
-            lfm_valid_mask=reader.lfm_valid_mask,
             geometry=reader.geometry,
-            projector=projector,
+            smoother=smoother,
         )
         for control in trusted
     }
@@ -717,12 +688,7 @@ class BodyInversionTrainer:
         self.adapter = adapter
         self.config = config
         self.lfm_lowpass_spec = lfm_lowpass_spec
-        self.projector = BodyScaleProjector(
-            smoothing_fwhm_m=config.body_smoothing_fwhm_m,
-            sample_step=float(data.reader.sample_axis.step),
-            lowpass_spec=lfm_lowpass_spec,
-        )
-        self.visibility = VerticalVisibilityCompensator(config.visibility)
+        self.smoother = BodySmoother(smoothing_fwhm_m=config.body_smoothing_fwhm_m)
         self.output_dir = Path(output_dir)
         self.artifact_root = Path(artifact_root) if artifact_root is not None else self.output_dir
         self.log = logger or logging.getLogger(__name__)
@@ -755,8 +721,14 @@ class BodyInversionTrainer:
     ) -> tuple[Tensor, Tensor, CommonObservationBatch]:
         common = self._common(batch)
         if model is None:
-            closure = self.adapter.close_body(
+            body = self.smoother.smooth(
                 batch.lfm_log_ai,
+                self._coordinates(common),
+                batch.lfm_valid_mask,
+            )
+            body = torch.where(batch.lfm_valid_mask, body, batch.lfm_log_ai)
+            closure = self.adapter.close_body(
+                body,
                 common,
             )
             body = closure.body_log_ai
@@ -766,12 +738,12 @@ class BodyInversionTrainer:
                 batch.features,
                 center_index=self.data.reader.patch_radius,
             )
-            body_correction = self.projector.project(
-                raw_correction,
+            body = self.smoother.smooth(
+                batch.lfm_log_ai + raw_correction,
                 self._coordinates(common),
                 batch.lfm_valid_mask,
             )
-            body = batch.lfm_log_ai + body_correction
+            body = torch.where(batch.lfm_valid_mask, body, batch.lfm_log_ai)
             closure = self.adapter.close_body(
                 body,
                 common,
@@ -793,31 +765,13 @@ class BodyInversionTrainer:
         include_seismic: bool = True,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         shape_loss = torch.zeros((), dtype=body.dtype, device=body.device)
-        amplitude_loss = torch.zeros((), dtype=body.dtype, device=body.device)
         if include_seismic:
-            visibility = self.visibility.compensate(
+            shape_loss = waveform_shape_loss(
                 common.observed_seismic,
                 synthetic,
                 common.observed_valid_mask,
-                self._coordinates(common),
-            )
-            shape_loss = waveform_shape_loss(
-                visibility.balanced_observed,
-                visibility.balanced_synthetic,
-                visibility.support_mask,
                 lambda_shape=weights.lambda_shape,
             ).loss
-            amplitude_loss = self.visibility.amplitude_loss(visibility, common.observed_seismic)
-        if weights.lfm_anchor > 0.0:
-            anchor = lfm_anchor_loss(
-                body,
-                common.lfm_log_ai,
-                common.lfm_valid_mask,
-                sample_step=float(common.sample_axis.step),
-                lowpass_spec=self.lfm_lowpass_spec,
-            )
-        else:
-            anchor = torch.zeros((), dtype=body.dtype, device=body.device)
         well_loss = torch.zeros((), dtype=body.dtype, device=body.device)
         well_derivative_loss = torch.zeros((), dtype=body.dtype, device=body.device)
         trusted_well_seismic_shape_loss = torch.zeros((), dtype=body.dtype, device=body.device)
@@ -834,21 +788,13 @@ class BodyInversionTrainer:
                 well_seismic_support = target_mask & common.observed_valid_mask
                 selected_rows = torch.count_nonzero(well_seismic_support, dim=-1) >= 3
                 if bool(torch.any(selected_rows).item()):
-                    well_coordinates = self._coordinates(common)
-                    if well_coordinates.ndim == 2:
-                        well_coordinates = well_coordinates[selected_rows]
-                    well_visibility = self.visibility.compensate(
+                    well_shape = waveform_shape_loss(
                         common.observed_seismic[selected_rows],
                         synthetic[selected_rows],
                         well_seismic_support[selected_rows],
-                        well_coordinates,
-                    )
-                    trusted_well_seismic_shape_loss = waveform_shape_loss(
-                        well_visibility.balanced_observed,
-                        well_visibility.balanced_synthetic,
-                        well_visibility.support_mask,
                         lambda_shape=weights.lambda_shape,
-                    ).loss
+                    )
+                    trusted_well_seismic_shape_loss = well_shape.loss
             well_loss = F.smooth_l1_loss(
                 body[target_mask] / per_sample_scale[target_mask],
                 target[target_mask] / per_sample_scale[target_mask],
@@ -875,8 +821,6 @@ class BodyInversionTrainer:
                 )
         total = (
             weights.seismic_shape * shape_loss
-            + weights.seismic_amplitude * amplitude_loss
-            + weights.lfm_anchor * anchor
             + weights.trusted_well_body * well_loss
             + weights.trusted_well_derivative * well_derivative_loss
             + weights.trusted_well_seismic_shape * trusted_well_seismic_shape_loss
@@ -885,8 +829,6 @@ class BodyInversionTrainer:
             raise ValueError("Body-inversion loss is non-finite.")
         return total, {
             "seismic_shape": shape_loss.detach(),
-            "seismic_amplitude": amplitude_loss.detach(),
-            "lfm_anchor": anchor.detach(),
             "trusted_well_body": well_loss.detach(),
             "trusted_well_derivative": well_derivative_loss.detach(),
             "trusted_well_seismic_shape": trusted_well_seismic_shape_loss.detach(),
@@ -933,8 +875,6 @@ class BodyInversionTrainer:
         totals: dict[str, list[Tensor]] = {
             "total": [],
             "seismic_shape": [],
-            "seismic_amplitude": [],
-            "lfm_anchor": [],
             "trusted_well_body": [],
             "trusted_well_derivative": [],
             "trusted_well_seismic_shape": [],
@@ -1007,16 +947,12 @@ class BodyInversionTrainer:
             raise ValueError("Trace evaluation requires non-empty fixed identities.")
         correlations: list[np.ndarray] = []
         shape_losses: list[np.ndarray] = []
-        gains: list[np.ndarray] = []
         raw_residuals: list[np.ndarray] = []
-        compensated_residuals: list[np.ndarray] = []
-        visibility_values: list[np.ndarray] = []
         seismic_amplitude_values: list[np.ndarray] = []
         body_amplitude_values: list[np.ndarray] = []
         bodies: dict[PatchKey, np.ndarray] = {}
         lfm_values: dict[PatchKey, np.ndarray] = {}
         supports: dict[PatchKey, np.ndarray] = {}
-        visibility_by_key: dict[PatchKey, np.ndarray] = {}
         seismic_amplitude_by_key: dict[PatchKey, np.ndarray] = {}
         body_amplitude_by_key: dict[PatchKey, np.ndarray] = {}
         with torch.no_grad():
@@ -1025,14 +961,12 @@ class BodyInversionTrainer:
                 batch = self.data.reader.batch(local_keys, center_visible=center_visible, device=self.device)
                 body, synthetic, common = self._predict(model, batch)
                 shape = waveform_shape_loss(common.observed_seismic, synthetic, common.observed_valid_mask)
-                diagnostic = analytic_gain_diagnostic(common.observed_seismic, synthetic, common.observed_valid_mask)
-                coordinates = self._coordinates(common)
-                visibility = self.visibility.compensate(
-                    common.observed_seismic,
-                    synthetic,
-                    common.observed_valid_mask,
-                    coordinates,
+                support = common.observed_valid_mask.to(dtype=common.observed_seismic.dtype)
+                raw_residual = torch.sqrt(
+                    torch.sum(torch.square(common.observed_seismic - synthetic) * support, dim=-1)
+                    / torch.sum(support, dim=-1)
                 )
+                coordinates = self._coordinates(common)
                 seismic_amplitude, seismic_support = local_standard_deviation(
                     common.observed_seismic,
                     coordinates,
@@ -1046,34 +980,15 @@ class BodyInversionTrainer:
                     smoothing_fwhm_m=self.config.waveform_qc_dynamic_window_m,
                 )
                 amplitude_support = seismic_support & body_support & (seismic_amplitude > 0.0) & (body_amplitude > 0.0)
-                normalized_residual = (
-                    common.observed_seismic - visibility.compensated_synthetic
-                ) / torch.clamp(
-                    visibility.observed_trace_rms[:, None],
-                    min=torch.finfo(common.observed_seismic.dtype).eps,
-                )
                 correlations.append(shape.correlation.cpu().numpy())
                 shape_losses.append(shape.normalized_shape_loss.cpu().numpy())
-                gains.append(diagnostic.gain.cpu().numpy())
-                raw_residuals.append(diagnostic.raw_amplitude_residual.cpu().numpy())
-                compensated_residuals.append(
-                    torch.sqrt(
-                        torch.sum(
-                            torch.square(normalized_residual)
-                            * visibility.support_mask.to(dtype=normalized_residual.dtype),
-                            dim=-1,
-                        )
-                        / torch.sum(visibility.support_mask.to(dtype=normalized_residual.dtype), dim=-1)
-                    ).cpu().numpy()
-                )
-                visibility_values.append(visibility.vertical_visibility[visibility.support_mask].cpu().numpy())
+                raw_residuals.append(raw_residual.cpu().numpy())
                 seismic_amplitude_values.append(seismic_amplitude[amplitude_support].cpu().numpy())
                 body_amplitude_values.append(body_amplitude[amplitude_support].cpu().numpy())
                 for row, key in enumerate(local_keys):
                     bodies[key] = body[row].cpu().numpy()
                     lfm_values[key] = batch.lfm_log_ai[row].cpu().numpy()
                     supports[key] = common.observed_valid_mask[row].cpu().numpy()
-                    visibility_by_key[key] = visibility.vertical_visibility[row].cpu().numpy()
                     seismic_amplitude_by_key[key] = seismic_amplitude[row].cpu().numpy()
                     body_amplitude_by_key[key] = body_amplitude[row].cpu().numpy()
         seismic_amplitude_array = np.concatenate(seismic_amplitude_values) if seismic_amplitude_values else np.asarray([])
@@ -1081,10 +996,7 @@ class BodyInversionTrainer:
         return {
             "correlation": np.concatenate(correlations),
             "shape_loss": np.concatenate(shape_losses),
-            "gain": np.concatenate(gains),
             "raw_residual": np.concatenate(raw_residuals),
-            "compensated_residual": np.concatenate(compensated_residuals),
-            "visibility_standard_deviation": float(np.std(np.concatenate(visibility_values))),
             "seismic_body_amplitude_spearman": _pearson(
                 _average_ranks(seismic_amplitude_array),
                 _average_ranks(body_amplitude_array),
@@ -1096,7 +1008,6 @@ class BodyInversionTrainer:
             "bodies": bodies,
             "lfm": lfm_values,
             "supports": supports,
-            "visibility": visibility_by_key,
             "seismic_amplitude": seismic_amplitude_by_key,
             "body_amplitude": body_amplitude_by_key,
         }
@@ -1345,14 +1256,12 @@ class BodyInversionTrainer:
 
             seismic_amplitude = np.stack([trace_eval["seismic_amplitude"][item] for item in keys])
             body_amplitude = np.stack([trace_eval["body_amplitude"][item] for item in keys])
-            visibility = np.stack([trace_eval["visibility"][item] for item in keys])
-            diagnostic_values = (seismic_amplitude, body_amplitude, visibility)
+            diagnostic_values = (seismic_amplitude, body_amplitude)
             titles = (
                 f"Seismic local variation ({self.config.waveform_qc_dynamic_window_m:g} m)",
                 "Body-increment local variation",
-                "Estimated vertical visibility",
             )
-            figure, axes = plt.subplots(1, 3, figsize=(15, 5), sharex=True, sharey=True)
+            figure, axes = plt.subplots(1, 2, figsize=(10, 5), sharex=True, sharey=True)
             for axis, values, title in zip(axes, diagnostic_values, titles):
                 finite_values = values[support & np.isfinite(values)]
                 if finite_values.size == 0:
@@ -1373,7 +1282,7 @@ class BodyInversionTrainer:
                 figure.colorbar(image, ax=axis, fraction=0.045, pad=0.025)
             axes[0].set_ylabel(self.data.reader.sample_axis.unit)
             figure.tight_layout()
-            figure.savefig(epoch_dir / f"fixed_visibility_{orientation}.png", dpi=120)
+            figure.savefig(epoch_dir / f"fixed_amplitude_{orientation}.png", dpi=120)
             plt.close(figure)
 
     def evaluate(self, model: CenterTraceBodyNet | None) -> EvaluationMetrics:
@@ -1437,10 +1346,7 @@ class BodyInversionTrainer:
             short_wave_energy_fraction=float(np.mean(np.concatenate(short_wave_values))),
             roughness_ratio=wells["roughness_ratio"],
             roughness_ratio_by_well=wells["roughness_by_well"],
-            analytic_gain_mean=float(np.mean(model_eval["gain"])),
             raw_amplitude_residual_mean=float(np.mean(model_eval["raw_residual"])),
-            compensated_amplitude_residual_mean=float(np.mean(model_eval["compensated_residual"])),
-            visibility_standard_deviation=float(model_eval["visibility_standard_deviation"]),
             seismic_body_amplitude_spearman=float(model_eval["seismic_body_amplitude_spearman"]),
             seismic_body_log_amplitude_pearson=float(model_eval["seismic_body_log_amplitude_pearson"]),
             support_contiguous_fraction=float(np.mean(support_is_contiguous)),
@@ -1597,12 +1503,10 @@ class BodyInversionTrainer:
             metrics_by_epoch[epoch] = metrics
             warnings_by_epoch[epoch] = warning_report
             self.log.info(
-                "finetune | epoch %d complete | train_loss=%.6f | seismic_shape=%.6f | seismic_amplitude=%.6f | lfm_anchor=%.6f | well_loss=%.6f | well_derivative=%.6f | well_seismic_shape=%.6f | masked_corr=%.4f | visible_corr=%.4f | well_rmse=%.5f | amplitude_mapping=%.4f | visibility_std=%.4f | lfm_drift=%.5f | roughness_median=%.4f | short_wave_ratio=%.4f | warnings=%s | checkpoint=%s",
+                "finetune | epoch %d complete | train_loss=%.6f | seismic_shape=%.6f | well_loss=%.6f | well_derivative=%.6f | well_seismic_shape=%.6f | masked_corr=%.4f | visible_corr=%.4f | well_rmse=%.5f | amplitude_mapping=%.4f | lfm_drift=%.5f | roughness_median=%.4f | short_wave_ratio=%.4f | warnings=%s | checkpoint=%s",
                 epoch,
                 train_metrics["total"],
                 train_metrics["seismic_shape"],
-                train_metrics["seismic_amplitude"],
-                train_metrics["lfm_anchor"],
                 train_metrics["trusted_well_body"],
                 train_metrics["trusted_well_derivative"],
                 train_metrics["trusted_well_seismic_shape"],
@@ -1610,7 +1514,6 @@ class BodyInversionTrainer:
                 float(np.median(metrics.visible_correlation)),
                 metrics.well_pooled_rmse,
                 metrics.seismic_body_amplitude_spearman,
-                metrics.visibility_standard_deviation,
                 metrics.lfm_drift_rmse,
                 metrics.roughness_ratio,
                 metrics.short_wave_energy_fraction,

@@ -1,4 +1,4 @@
-"""Center-trace body network and physical-scale projection."""
+"""Center-trace body network and final-curve physical smoothing."""
 
 from __future__ import annotations
 
@@ -9,8 +9,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from cup.lfm.math import LowpassSpec
-from ginn_v2.loss import _gaussian_weights, masked_lfm_lowpass
+from ginn_v2.loss import _gaussian_weights
 
 @dataclass(frozen=True)
 class BodyNetworkConfig:
@@ -90,8 +89,8 @@ class CenterTraceBodyNet(nn.Module):
             padding=(0, cfg.sample_kernel // 2),
         )
 
-        # A zero raw correction starts from the LFM-only state after the
-        # body-scale projector is applied by the training/inference module.
+        # A zero raw correction starts from the initial-model state after the
+        # final-curve smoother is applied by the training/inference module.
         nn.init.zeros_(self.output_layer.weight)
         nn.init.zeros_(self.output_layer.bias)
 
@@ -118,155 +117,96 @@ class CenterTraceBodyNet(nn.Module):
 
 
 @dataclass(frozen=True)
-class BodyScaleProjector:
-    """Keep a correction between the configured body and LFM scales.
+class BodySmoother:
+    """Apply one normalized physical-coordinate Gaussian to a complete curve.
 
-    The interface deliberately accepts the physical sample coordinates and
-    the support mask at each call.  This keeps the module independent of the
-    time/depth adapter while using the same operation for network outputs and
-    well targets.
+    The smoother deliberately has no Step-7 low-pass dependency.  A network
+    correction is first added to the initial model and this operation is then
+    applied to the resulting curve::
+
+        body = G_fwhm(initial_log_ai + raw_network_correction)
+
+    ``support_mask`` identifies both source samples allowed into the Gaussian
+    and output samples for which a smoothed value is requested.  Samples
+    outside support are returned as zero by :meth:`smooth` and as NaN by
+    :meth:`smooth_numpy`, matching the tensor/array conventions of the
+    training and well-target paths.
     """
 
     smoothing_fwhm_m: float
-    sample_step: float
-    lowpass_spec: LowpassSpec
 
     def __post_init__(self) -> None:
         width = float(self.smoothing_fwhm_m)
-        step = float(self.sample_step)
         if not math.isfinite(width) or width <= 0.0:
             raise ValueError("smoothing_fwhm_m must be finite and positive.")
-        if not math.isfinite(step) or step <= 0.0:
-            raise ValueError("sample_step must be finite and positive.")
-        spec = self.lowpass_spec
-        if (
-            not spec.enabled
-            or spec.cutoff_cycles_per_axis_unit is None
-            or spec.order is None
-            or spec.buffer_mode is None
-            or spec.buffer_axis_units is None
-        ):
-            raise ValueError("BodyScaleProjector requires a complete enabled low-pass specification.")
 
-    def project(
+    def smooth(
         self,
-        raw_correction: Tensor,
+        values: Tensor,
         coordinates_m: Tensor,
         support_mask: Tensor,
     ) -> Tensor:
-        """Project a finite correction tensor into the configured body band."""
+        """Smooth a batch of curves and return zeros outside ``support_mask``."""
 
-        if raw_correction.ndim != 2 or not torch.is_floating_point(raw_correction):
-            raise ValueError("raw_correction must be a floating (batch, samples) tensor.")
+        if values.ndim != 2 or not torch.is_floating_point(values):
+            raise ValueError("values must be a floating (batch, samples) tensor.")
+        if not bool(torch.all(torch.isfinite(values)).item()):
+            raise ValueError("values must contain only finite values.")
         if coordinates_m.ndim not in {1, 2} or not torch.is_floating_point(coordinates_m):
             raise ValueError("coordinates_m must be a floating one- or two-dimensional tensor.")
-        if support_mask.shape != raw_correction.shape or support_mask.dtype != torch.bool:
-            raise ValueError("support_mask must be boolean and match raw_correction.")
-        if coordinates_m.ndim == 1 and coordinates_m.shape[0] != raw_correction.shape[1]:
-            raise ValueError("coordinates_m sample count differs from raw_correction.")
-        if coordinates_m.ndim == 2 and coordinates_m.shape != raw_correction.shape:
-            raise ValueError("coordinates_m batch shape differs from raw_correction.")
-        coordinates = coordinates_m.to(device=raw_correction.device, dtype=raw_correction.dtype)
-        if coordinates.ndim == 1:
-            weights = _gaussian_weights(coordinates, fwhm_m=self.smoothing_fwhm_m)[0].to(
-                device=raw_correction.device,
-                dtype=raw_correction.dtype,
-            )
-            support_float = support_mask.to(dtype=raw_correction.dtype)
-            denominator = torch.matmul(support_float, weights.T)
-            numerator = torch.matmul(raw_correction * support_float, weights.T)
-            smooth_support = denominator > 0.0
-            smoothed = torch.where(
-                smooth_support,
-                numerator / torch.clamp(denominator, min=torch.finfo(raw_correction.dtype).eps),
-                torch.zeros_like(raw_correction),
-            )
-        else:
-            smooth_rows: list[Tensor] = []
-            support_rows: list[Tensor] = []
-            for row in range(raw_correction.shape[0]):
-                weights = _gaussian_weights(
-                    coordinates[row],
-                    fwhm_m=self.smoothing_fwhm_m,
-                )[0].to(device=raw_correction.device, dtype=raw_correction.dtype)
-                support_float = support_mask[row].to(dtype=raw_correction.dtype)
-                denominator = torch.matmul(weights, support_float)
-                numerator = torch.matmul(weights, raw_correction[row] * support_float)
-                valid = denominator > 0.0
-                smooth_rows.append(
-                    torch.where(
-                        valid,
-                        numerator / torch.clamp(denominator, min=torch.finfo(raw_correction.dtype).eps),
-                        torch.zeros_like(raw_correction[row]),
-                    )
-                )
-                support_rows.append(valid)
-            smoothed = torch.stack(smooth_rows)
-            smooth_support = torch.stack(support_rows)
-        low, low_support = masked_lfm_lowpass(
-            smoothed,
-            smooth_support,
-            sample_step=self.sample_step,
-            spec=self.lowpass_spec,
+        if support_mask.shape != values.shape or support_mask.dtype != torch.bool:
+            raise ValueError("support_mask must be boolean and match values.")
+        if coordinates_m.ndim == 1 and coordinates_m.shape[0] != values.shape[1]:
+            raise ValueError("coordinates_m sample count differs from values.")
+        if coordinates_m.ndim == 2 and coordinates_m.shape != values.shape:
+            raise ValueError("coordinates_m batch shape differs from values.")
+        coordinates = coordinates_m.to(device=values.device, dtype=values.dtype)
+        if not bool(torch.all(torch.isfinite(coordinates)).item()):
+            raise ValueError("coordinates_m must contain only finite values.")
+        weights = _gaussian_weights(coordinates, fwhm_m=self.smoothing_fwhm_m).to(
+            device=values.device,
+            dtype=values.dtype,
         )
-        valid = support_mask & smooth_support & low_support
-        return torch.where(valid, smoothed - low, torch.zeros_like(raw_correction))
+        if weights.shape[0] == 1 and values.shape[0] != 1:
+            weights = weights.expand(values.shape[0], -1, -1)
+        support_float = support_mask.to(dtype=values.dtype)
+        weighted = weights * support_float[:, None, :]
+        denominator = torch.sum(weighted, dim=-1)
+        numerator = torch.bmm(weighted, values.unsqueeze(-1)).squeeze(-1)
+        valid = support_mask & (denominator > torch.finfo(values.dtype).eps)
+        output = torch.zeros_like(values)
+        output[valid] = numerator[valid] / denominator[valid]
+        return output
 
-    def project_numpy(
+    def smooth_numpy(
         self,
-        raw_correction: np.ndarray,
+        values: np.ndarray,
         coordinates_m: np.ndarray,
         support_mask: np.ndarray,
     ) -> np.ndarray:
-        """Apply :meth:`project` to one NumPy trace without changing its axis."""
+        """Smooth one NumPy curve and return NaN outside ``support_mask``."""
 
-        values = np.asarray(raw_correction, dtype=np.float64)
+        array = np.asarray(values, dtype=np.float64)
         coordinates = np.asarray(coordinates_m, dtype=np.float64)
         support = np.asarray(support_mask, dtype=bool)
-        if values.ndim != 1 or coordinates.ndim != 1 or support.shape != values.shape:
-            raise ValueError("NumPy projector inputs must be matching one-dimensional arrays.")
+        if array.ndim != 1 or coordinates.ndim != 1 or support.shape != array.shape:
+            raise ValueError("NumPy smoother inputs must be matching one-dimensional arrays.")
+        if np.any(~np.isfinite(coordinates)) or np.any(support & ~np.isfinite(array)):
+            raise ValueError("Supported NumPy smoother values and coordinates must be finite.")
+        safe = np.where(support, array, 0.0)
         with torch.no_grad():
-            result = self.project(
-                torch.as_tensor(values, dtype=torch.float64)[None, :],
+            result = self.smooth(
+                torch.as_tensor(safe, dtype=torch.float64)[None, :],
                 torch.as_tensor(coordinates, dtype=torch.float64),
                 torch.as_tensor(support, dtype=torch.bool)[None, :],
-            )
-        return result[0].cpu().numpy()
-
-
-def project_well_target(
-    model_axis_target: np.ndarray,
-    target_mask: np.ndarray,
-    lfm_log_ai: np.ndarray,
-    lfm_valid_mask: np.ndarray,
-    coordinates_m: np.ndarray,
-    projector: BodyScaleProjector,
-) -> np.ndarray:
-    """Map a smoothed well target into the same body-band space as the model."""
-
-    target = np.asarray(model_axis_target, dtype=np.float64)
-    mask = np.asarray(target_mask, dtype=bool)
-    lfm = np.asarray(lfm_log_ai, dtype=np.float64)
-    lfm_mask = np.asarray(lfm_valid_mask, dtype=bool)
-    coordinates = np.asarray(coordinates_m, dtype=np.float64)
-    if any(value.ndim != 1 for value in (target, mask, lfm, lfm_mask, coordinates)):
-        raise ValueError("Well projector inputs must be one-dimensional.")
-    if not (target.shape == mask.shape == lfm.shape == lfm_mask.shape == coordinates.shape):
-        raise ValueError("Well projector inputs must have matching shapes.")
-    valid = mask & lfm_mask & np.isfinite(target) & np.isfinite(lfm)
-    if not np.any(valid):
-        raise ValueError("Well projector has no joint finite target/LFM support.")
-    correction = np.zeros_like(target)
-    correction[valid] = target[valid] - lfm[valid]
-    projected = projector.project_numpy(correction, coordinates, valid)
-    result = np.full(target.shape, np.nan, dtype=np.float64)
-    result[valid] = lfm[valid] + projected[valid]
-    return result
+            )[0].cpu().numpy()
+        result = np.asarray(result, dtype=np.float64)
+        result[~support] = np.nan
+        return result
 
 
 __all__ = [
     "BodyNetworkConfig",
-    "BodyScaleProjector",
+    "BodySmoother",
     "CenterTraceBodyNet",
-    "project_well_target",
 ]

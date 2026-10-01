@@ -1,4 +1,4 @@
-"""GINN waveform, anchor, and visibility objectives."""
+"""GINN waveform objectives and diagnostics."""
 
 from __future__ import annotations
 
@@ -23,12 +23,6 @@ class ShapeLossResult:
     support_count: Tensor
 
 
-@dataclass(frozen=True)
-class GainDiagnostic:
-    gain: Tensor
-    raw_amplitude_residual: Tensor
-
-
 def _validate_trace_pair(observed: Tensor, predicted: Tensor, mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     if observed.shape != predicted.shape or observed.shape != mask.shape or observed.ndim != 2:
         raise ValueError("observed, predicted, and support mask must have matching shape (batch, samples).")
@@ -46,7 +40,9 @@ def _validate_trace_pair(observed: Tensor, predicted: Tensor, mask: Tensor) -> t
     return observed, predicted, mask
 
 
-def normalize_support(values: Tensor, support_mask: Tensor, *, epsilon: float = 1e-8) -> Tensor:
+def normalize_support(
+    values: Tensor, support_mask: Tensor, *, epsilon: float = 1e-8, allow_constant: bool = False
+) -> Tensor:
     """Normalize each trace on its own upstream valid support."""
 
     if values.ndim != 2 or support_mask.shape != values.shape or support_mask.dtype != torch.bool:
@@ -59,9 +55,12 @@ def normalize_support(values: Tensor, support_mask: Tensor, *, epsilon: float = 
     weights = support_mask.to(dtype=values.dtype)
     mean = torch.sum(values * weights, dim=-1, keepdim=True) / count.to(dtype=values.dtype)
     centered = values - mean
-    rms = torch.sqrt(torch.sum(torch.square(centered) * weights, dim=-1, keepdim=True) / count.to(dtype=values.dtype))
-    if bool(torch.any(rms <= float(epsilon)).item()):
+    variance = torch.sum(torch.square(centered) * weights, dim=-1, keepdim=True) / count.to(dtype=values.dtype)
+    if not allow_constant and bool(torch.any(variance <= float(epsilon) ** 2).item()):
         raise ValueError("A supported trace has zero variance and cannot be shape-normalized.")
+    # Zero reflection is a valid predicted waveform at constant-model startup.
+    # Clamp before sqrt so both normalization and its derivative remain finite.
+    rms = torch.sqrt(torch.clamp(variance, min=float(epsilon) ** 2))
     return centered / rms
 
 
@@ -80,7 +79,7 @@ def waveform_shape_loss(
     support = support_mask.to(dtype=observed.dtype)
     count = torch.sum(support, dim=-1)
     observed_norm = normalize_support(observed, support_mask)
-    predicted_norm = normalize_support(predicted, support_mask)
+    predicted_norm = normalize_support(predicted, support_mask, allow_constant=True)
     correlation = torch.sum(observed_norm * predicted_norm * support, dim=-1) / count
     normalized_error = F.smooth_l1_loss(
         predicted_norm,
@@ -95,26 +94,6 @@ def waveform_shape_loss(
         normalized_shape_loss=normalized_error,
         support_count=count,
     )
-
-
-def analytic_gain_diagnostic(
-    observed: Tensor,
-    predicted: Tensor,
-    support_mask: Tensor,
-) -> GainDiagnostic:
-    """Return non-negative least-squares gain and raw residual without grad."""
-
-    observed, predicted, support_mask = _validate_trace_pair(observed, predicted, support_mask)
-    with torch.no_grad():
-        support = support_mask.to(dtype=observed.dtype)
-        numerator = torch.sum(observed * predicted * support, dim=-1)
-        denominator = torch.sum(torch.square(predicted) * support, dim=-1)
-        if bool(torch.any(denominator <= 0.0).item()):
-            raise ValueError("Analytic gain requires non-zero predicted energy on every support.")
-        gain = torch.clamp(numerator / denominator, min=0.0)
-        residual = observed - gain[:, None] * predicted
-        raw = torch.sqrt(torch.sum(torch.square(residual) * support, dim=-1) / torch.sum(support, dim=-1))
-        return GainDiagnostic(gain=gain.detach(), raw_amplitude_residual=raw.detach())
 
 
 def _gaussian_weights(coordinates_m: Tensor, *, fwhm_m: float) -> Tensor:
@@ -264,34 +243,6 @@ def masked_lfm_lowpass(
     return output, valid
 
 
-def lfm_anchor_loss(
-    predicted_body: Tensor,
-    lfm_log_ai: Tensor,
-    lfm_valid_mask: Tensor,
-    *,
-    sample_step: float,
-    lowpass_spec: LowpassSpec,
-) -> Tensor:
-    """Suppress drift using the exact low-pass response selected in Step 7."""
-
-    if predicted_body.shape != lfm_log_ai.shape or predicted_body.shape != lfm_valid_mask.shape:
-        raise ValueError("predicted_body, lfm_log_ai, and lfm_valid_mask must have matching shapes.")
-    residual_low, residual_support = masked_lfm_lowpass(
-        predicted_body - lfm_log_ai,
-        lfm_valid_mask,
-        sample_step=sample_step,
-        spec=lowpass_spec,
-    )
-    support = residual_support & lfm_valid_mask
-    if not torch.any(support):
-        raise ValueError("LFM anchor has no valid support.")
-    return F.smooth_l1_loss(
-        residual_low[support],
-        torch.zeros_like(residual_low[support]),
-        reduction="mean",
-    )
-
-
 def short_wave_energy_ratio(
     values: Tensor,
     coordinates_m: Tensor,
@@ -344,7 +295,7 @@ def _masked_gaussian_smooth(
     for row in range(values.shape[0]):
         differences = torch.diff(coordinates[row])
         if bool(torch.any(differences <= 0.0).item()):
-            raise ValueError("visibility coordinates must be strictly increasing.")
+            raise ValueError("smoothing coordinates must be strictly increasing.")
         step = torch.median(differences)
         regular = bool(
             torch.allclose(
@@ -386,208 +337,6 @@ def _masked_gaussian_smooth(
     return torch.stack(outputs), torch.stack(supports)
 
 
-@dataclass(frozen=True)
-class VisibilityCompensationConfig:
-    """Configuration for separating trace gain and slow vertical visibility."""
-
-    vertical_smoothing_fwhm_m: float = 300.0
-    envelope_floor_fraction: float = 0.10
-    minimum_visibility: float = 0.25
-    maximum_visibility: float = 4.0
-
-    def __post_init__(self) -> None:
-        for name in (
-            "vertical_smoothing_fwhm_m",
-            "envelope_floor_fraction",
-            "minimum_visibility",
-            "maximum_visibility",
-        ):
-            if not math.isfinite(float(getattr(self, name))) or float(getattr(self, name)) <= 0.0:
-                raise ValueError(f"{name} must be finite and positive.")
-        if self.envelope_floor_fraction >= 1.0:
-            raise ValueError("envelope_floor_fraction must be below one.")
-        if self.minimum_visibility >= 1.0 or self.maximum_visibility <= 1.0:
-            raise ValueError("visibility bounds must straddle one.")
-        if self.minimum_visibility >= self.maximum_visibility:
-            raise ValueError("minimum_visibility must be below maximum_visibility.")
-
-
-@dataclass(frozen=True)
-class VisibilityCompensation:
-    """Waveforms and nuisance fields produced by one compensation call."""
-
-    balanced_observed: Tensor
-    balanced_synthetic: Tensor
-    compensated_synthetic: Tensor
-    support_mask: Tensor
-    trace_gain: Tensor
-    vertical_visibility: Tensor
-    observed_envelope: Tensor
-    synthetic_envelope: Tensor
-    observed_trace_rms: Tensor
-
-    def __post_init__(self) -> None:
-        shape = self.balanced_observed.shape
-        for name in (
-            "balanced_synthetic",
-            "compensated_synthetic",
-            "vertical_visibility",
-            "observed_envelope",
-            "synthetic_envelope",
-        ):
-            if getattr(self, name).shape != shape:
-                raise ValueError(f"{name} must match the waveform shape.")
-        if self.support_mask.shape != shape or self.support_mask.dtype != torch.bool:
-            raise ValueError("support_mask must be boolean and match the waveforms.")
-        if self.trace_gain.shape != (shape[0],) or self.observed_trace_rms.shape != (shape[0],):
-            raise ValueError("trace_gain and observed_trace_rms must have one value per trace.")
-
-
-class VerticalVisibilityCompensator:
-    """Estimate a detached slow visibility field and expose compensated waveforms.
-
-    The caller supplies physical vertical coordinates.  A scalar least-squares
-    gain handles acquisition scale, while a unit-geometric-mean visibility field
-    handles slow within-trace amplitude variation.  Both nuisance estimates are
-    detached; gradients only update the predicted seismic waveform.
-    """
-
-    def __init__(self, config: VisibilityCompensationConfig) -> None:
-        self.config = config
-
-    @staticmethod
-    def _validate(observed: Tensor, synthetic: Tensor, support_mask: Tensor, coordinates_m: Tensor) -> None:
-        if observed.ndim != 2 or synthetic.shape != observed.shape:
-            raise ValueError("observed and synthetic must have matching (batch, samples) shapes.")
-        if support_mask.shape != observed.shape or support_mask.dtype != torch.bool:
-            raise ValueError("support_mask must be boolean and match the waveforms.")
-        if not torch.is_floating_point(observed) or not torch.is_floating_point(synthetic):
-            raise TypeError("observed and synthetic must be floating tensors.")
-        if not bool(torch.all(torch.isfinite(observed)).item()) or not bool(torch.all(torch.isfinite(synthetic)).item()):
-            raise ValueError("observed and synthetic must be finite.")
-        if coordinates_m.ndim == 1:
-            valid_coordinates = coordinates_m.shape[0] == observed.shape[1]
-        elif coordinates_m.ndim == 2:
-            valid_coordinates = coordinates_m.shape == observed.shape
-        else:
-            valid_coordinates = False
-        if not valid_coordinates or not torch.is_floating_point(coordinates_m):
-            raise ValueError("coordinates_m must match the waveform sample axis.")
-        if bool(torch.any(torch.count_nonzero(support_mask, dim=-1) < 3).item()):
-            raise ValueError("Visibility compensation needs at least three supported samples per trace.")
-
-    def compensate(
-        self,
-        observed: Tensor,
-        synthetic: Tensor,
-        support_mask: Tensor,
-        coordinates_m: Tensor,
-    ) -> VisibilityCompensation:
-        self._validate(observed, synthetic, support_mask, coordinates_m)
-        dtype = synthetic.dtype
-        device = synthetic.device
-        observed = observed.to(device=device, dtype=dtype)
-        coordinates = coordinates_m.to(device=device, dtype=dtype)
-        support = support_mask.to(device=device)
-        support_float = support.to(dtype=dtype)
-        epsilon = torch.finfo(dtype).eps
-
-        with torch.no_grad():
-            detached_synthetic = synthetic.detach()
-            numerator = torch.sum(observed * detached_synthetic * support_float, dim=-1)
-            denominator = torch.sum(torch.square(detached_synthetic) * support_float, dim=-1)
-            if bool(torch.any(denominator <= epsilon).item()):
-                raise ValueError("Visibility compensation encountered a zero-energy synthetic trace.")
-            trace_gain = torch.clamp(numerator / denominator, min=epsilon)
-            scaled_synthetic = trace_gain[:, None] * detached_synthetic
-
-            observed_power, observed_support = _masked_gaussian_smooth(
-                torch.square(observed),
-                coordinates,
-                support,
-                fwhm_m=self.config.vertical_smoothing_fwhm_m,
-            )
-            synthetic_power, synthetic_support = _masked_gaussian_smooth(
-                torch.square(scaled_synthetic),
-                coordinates,
-                support,
-                fwhm_m=self.config.vertical_smoothing_fwhm_m,
-            )
-            envelope_support = support & observed_support & synthetic_support
-            count = torch.sum(support_float, dim=-1)
-            observed_trace_rms = torch.sqrt(
-                torch.sum(torch.square(observed) * support_float, dim=-1) / count
-            )
-            synthetic_trace_rms = torch.sqrt(
-                torch.sum(torch.square(scaled_synthetic) * support_float, dim=-1) / count
-            )
-            observed_floor = self.config.envelope_floor_fraction * observed_trace_rms[:, None]
-            synthetic_floor = self.config.envelope_floor_fraction * synthetic_trace_rms[:, None]
-            observed_envelope = torch.maximum(torch.sqrt(torch.clamp(observed_power, min=0.0)), observed_floor)
-            synthetic_envelope = torch.maximum(torch.sqrt(torch.clamp(synthetic_power, min=0.0)), synthetic_floor)
-
-            log_ratio = torch.log(torch.clamp(observed_envelope, min=epsilon)) - torch.log(
-                torch.clamp(synthetic_envelope, min=epsilon)
-            )
-            smooth_log_ratio, ratio_support = _masked_gaussian_smooth(
-                log_ratio,
-                coordinates,
-                envelope_support,
-                fwhm_m=self.config.vertical_smoothing_fwhm_m,
-            )
-            final_support = envelope_support & ratio_support
-            final_float = final_support.to(dtype=dtype)
-            final_count = torch.sum(final_float, dim=-1, keepdim=True)
-            if bool(torch.any(final_count < 3).item()):
-                raise ValueError("Visibility compensation produced insufficient envelope support.")
-            centered_log_visibility = smooth_log_ratio - (
-                torch.sum(smooth_log_ratio * final_float, dim=-1, keepdim=True) / final_count
-            )
-            centered_log_visibility = torch.clamp(
-                centered_log_visibility,
-                min=math.log(self.config.minimum_visibility),
-                max=math.log(self.config.maximum_visibility),
-            )
-            visibility = torch.where(final_support, torch.exp(centered_log_visibility), torch.ones_like(observed))
-            balanced_observed = torch.where(
-                final_support,
-                observed / torch.clamp(observed_envelope, min=epsilon),
-                torch.zeros_like(observed),
-            )
-            balanced_synthetic_detached_scale = trace_gain[:, None] / torch.clamp(synthetic_envelope, min=epsilon)
-
-        balanced_synthetic = torch.where(
-            final_support,
-            balanced_synthetic_detached_scale * synthetic,
-            torch.zeros_like(synthetic),
-        )
-        compensated_synthetic = trace_gain[:, None] * visibility * synthetic
-        return VisibilityCompensation(
-            balanced_observed=balanced_observed,
-            balanced_synthetic=balanced_synthetic,
-            compensated_synthetic=compensated_synthetic,
-            support_mask=final_support,
-            trace_gain=trace_gain,
-            vertical_visibility=visibility,
-            observed_envelope=observed_envelope,
-            synthetic_envelope=synthetic_envelope,
-            observed_trace_rms=observed_trace_rms,
-        )
-
-    @staticmethod
-    def amplitude_loss(result: VisibilityCompensation, observed: Tensor) -> Tensor:
-        support = result.support_mask
-        scale = torch.clamp(
-            result.observed_trace_rms[:, None],
-            min=torch.finfo(observed.dtype).eps,
-        )
-        return F.smooth_l1_loss(
-            (result.compensated_synthetic / scale)[support],
-            (observed / scale)[support],
-            reduction="mean",
-        )
-
-
 def local_standard_deviation(
     values: Tensor,
     coordinates_m: Tensor,
@@ -615,13 +364,7 @@ def local_standard_deviation(
 
 
 __all__ = [
-    "GainDiagnostic",
     "ShapeLossResult",
-    "VerticalVisibilityCompensator",
-    "VisibilityCompensation",
-    "VisibilityCompensationConfig",
-    "analytic_gain_diagnostic",
-    "lfm_anchor_loss",
     "local_standard_deviation",
     "masked_lfm_lowpass",
     "masked_physical_lowpass",

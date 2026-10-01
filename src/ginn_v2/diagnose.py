@@ -220,22 +220,17 @@ def write_well_waveform_qc(
         if observed_scale <= 0.0 or not np.isfinite(observed_scale):
             raise ValueError(f"{well_name}: observed well seismic has zero variance in the QC interval.")
         observed_normalized = observed_centered / observed_scale
-        synthetic_denominator = float(np.dot(synthetic, synthetic))
-        signed_gain = (
-            float(np.dot(observed_normalized, synthetic) / synthetic_denominator)
-            if synthetic_denominator > 0.0
-            else 1.0
-        )
-        gain = abs(signed_gain)
-        synthetic_scaled = gain * synthetic
-        correlation = float(np.corrcoef(observed_normalized, synthetic_scaled)[0, 1])
+        synthetic_energy = float(np.sqrt(np.mean(np.square(synthetic))))
+        if synthetic_energy <= 0.0 or not np.isfinite(synthetic_energy):
+            raise ValueError(f"{well_name}: forward synthetic has zero energy.")
+        correlation = float(np.corrcoef(observed_normalized, synthetic)[0, 1])
         if not np.isfinite(correlation):
             raise ValueError(f"{well_name}: predicted well waveform correlation is non-finite.")
 
         predicted_objects = _waveform_objects(
             axis=local_axis,
             log_ai=predicted_log_ai,
-            synthetic=synthetic_scaled,
+            synthetic=synthetic,
             real=observed_normalized,
             dynamic_window_m=float(trainer.config.waveform_qc_dynamic_window_m),
             name="GINN V2 predicted body",
@@ -286,7 +281,6 @@ def write_well_waveform_qc(
                 "support_start_m": float(local_axis[0]),
                 "support_stop_m": float(local_axis[-1]),
                 "support_samples": int(indices.size),
-                "signed_forward_gain": signed_gain,
                 "well_curve_forward_corr": correlation,
                 "predicted_vs_body_rmse_log_ai": float(np.sqrt(np.mean(np.square(body_residual)))),
                 "predicted_vs_body_corr": float(np.corrcoef(reference_log_ai, predicted_log_ai)[0, 1]),
@@ -304,7 +298,7 @@ def write_well_waveform_qc(
         "status": "ok",
         "plot_function": "cup.seismic.viz.plot_well_waveform_qc",
         "correlation_metric": "well_curve_forward_corr",
-        "correlation_definition": "Assemble the predicted AI curve on the well support, then forward it with the same domain adapter used by training.",
+        "correlation_definition": "Assemble the predicted AI curve on the well support, then forward it with the same domain adapter used by training; no gain or vertical compensation is applied.",
         "dynamic_correlation_window_m": float(trainer.config.waveform_qc_dynamic_window_m),
         "figures": figures,
         "metrics": repo_relative_path(metrics_path, root=root),

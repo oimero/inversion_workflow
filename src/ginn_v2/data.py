@@ -14,7 +14,7 @@ from cup.seismic.geometry import SampleAxis, SurveyLineGeometry
 from cup.utils.masks import true_runs as _finite_runs
 from cup.well.controls import WellControl, WellControlSet
 from cup.well.scale import gaussian_smooth_finite_runs_numpy
-from ginn_v2.model import BodyScaleProjector, project_well_target
+from ginn_v2.model import BodySmoother
 
 
 Orientation = Literal["inline", "xline"]
@@ -471,7 +471,12 @@ class PatchReader:
             missing[self.patch_radius, :] = 1.0
         center_index = indices[self.patch_radius]
         center_seismic = traces[self.patch_radius].copy()
-        center_lfm = np.asarray(self.lfm_log_ai[center_index[0], center_index[1], :], dtype=np.float64)
+        # ``lfm_log_ai`` may be a read-only memmap.  The invalid-support
+        # fallback below must therefore operate on a private writable copy.
+        center_lfm = np.asarray(
+            self.lfm_log_ai[center_index[0], center_index[1], :],
+            dtype=np.float64,
+        ).copy()
         center_lfm_valid = np.asarray(self.lfm_valid_mask[center_index[0], center_index[1], :], dtype=bool)
         center_valid = trace_valid[self.patch_radius].copy() & center_lfm_valid
         for value in self.domain_extras.values():
@@ -810,51 +815,67 @@ def build_well_body_target(
     *,
     body_smoothing_fwhm_m: float,
     target_zone_support: np.ndarray,
-    lfm_log_ai: np.ndarray,
-    lfm_valid_mask: np.ndarray,
     geometry: SurveyLineGeometry,
-    projector: BodyScaleProjector,
+    smoother: BodySmoother,
+    lfm_log_ai: np.ndarray | None = None,
+    lfm_valid_mask: np.ndarray | None = None,
 ) -> WellTarget:
-    """Build a trusted-well target in the model's configured body band."""
+    """Build a trusted-well target by smoothing the complete model-axis curve once.
+
+    The native filtered curve is first interpolated without smoothing onto the
+    model sample axis.  The same physical Gaussian used on the network's
+    complete initial-plus-correction curve is then applied once to that model
+    axis.  The low-frequency model contributes only its support mask here; its
+    values are deliberately not used to redefine the well target.
+    """
 
     native_coordinates = np.asarray(control.native.coordinates, dtype=np.float64)
     native_values = np.asarray(control.native.native_filtered_log_ai, dtype=np.float64)
+    # Keep this historical diagnostic for QC/reporting.  It is not used as
+    # the training target; the actual target below starts from unsmoothed
+    # native_filtered_log_ai and smooths once after model-axis interpolation.
     native_body = gaussian_smooth_finite_runs_numpy(
         native_values,
         native_coordinates,
         fwhm_m=body_smoothing_fwhm_m,
     )
     model_axis = np.asarray(control.sample_axis.values, dtype=np.float64)
-    model_target = np.full(model_axis.shape, np.nan, dtype=np.float64)
-    for start, stop in _finite_runs(np.isfinite(native_body)):
+    model_target_raw = np.full(model_axis.shape, np.nan, dtype=np.float64)
+    for start, stop in _finite_runs(np.isfinite(native_values)):
         inside = (model_axis >= native_coordinates[start]) & (model_axis <= native_coordinates[stop - 1])
-        model_target[inside] = np.interp(
+        model_target_raw[inside] = np.interp(
             model_axis[inside],
             native_coordinates[start:stop],
-            native_body[start:stop],
+            native_values[start:stop],
         )
+    native_model_support = np.isfinite(model_target_raw)
+    model_target = smoother.smooth_numpy(
+        model_target_raw,
+        model_axis,
+        native_model_support,
+    )
     observed = np.asarray(control.observed_valid_mask, dtype=bool)
     zone_support = np.asarray(target_zone_support, dtype=bool)
     if zone_support.shape != observed.shape:
         raise ValueError("target_zone_support must match the well model axis.")
-    well_lfm, well_lfm_valid = sample_lfm_trace(
-        control,
-        lfm_log_ai=lfm_log_ai,
-        lfm_valid_mask=lfm_valid_mask,
-        geometry=geometry,
-    )
+    if (lfm_log_ai is None) != (lfm_valid_mask is None):
+        raise ValueError("lfm_log_ai and lfm_valid_mask must be provided together.")
+    if lfm_log_ai is None:
+        # The workflow's target-zone support already carries the LFM support
+        # mask.  Keep the optional volume arguments for callers that want an
+        # independent support cross-check, but never use their values.
+        well_lfm_valid = np.ones_like(observed, dtype=bool)
+    else:
+        _well_lfm, well_lfm_valid = sample_lfm_trace(
+            control,
+            lfm_log_ai=lfm_log_ai,
+            lfm_valid_mask=lfm_valid_mask,
+            geometry=geometry,
+        )
     valid_target = observed & zone_support & well_lfm_valid & np.isfinite(model_target)
     model_target[~valid_target] = np.nan
     if np.count_nonzero(valid_target) < 4:
         raise ValueError(f"{control.well_name}: native body target has fewer than four observed model samples.")
-    model_target = project_well_target(
-        model_target,
-        valid_target,
-        well_lfm,
-        well_lfm_valid,
-        model_axis,
-        projector,
-    )
     return WellTarget(
         well_name=control.well_name,
         model_axis_target=model_target,

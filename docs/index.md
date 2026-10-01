@@ -36,3 +36,5 @@ Step 4/5 使用独立脚本，详见
 ## GINN V2 主体反演
 
 [运行指南](guide/ginn-v2-body-inversion.md)
+
+[完整曲线平滑与新实验](guide/ginn-v2-final-curve.md)

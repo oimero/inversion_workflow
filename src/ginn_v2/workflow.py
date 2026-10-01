@@ -37,7 +37,7 @@ from ginn_v2.train import (
 )
 from cup.lfm.artifacts import load_lfm_input
 from ginn_v2.model import CenterTraceBodyNet
-from ginn_v2.model import BodyScaleProjector
+from ginn_v2.model import BodySmoother
 from ginn_v2.infer import (
     BodyInverter,
     BodyVolumeInverter,
@@ -92,10 +92,8 @@ class LoadedBody:
             self.model,
             self.reader,
             self.adapter,
-            projector=BodyScaleProjector(
+            smoother=BodySmoother(
                 smoothing_fwhm_m=self.training_config.body_smoothing_fwhm_m,
-                sample_step=float(self.sample_axis.step),
-                lowpass_spec=self.lfm_lowpass_spec,
             ),
             device=next(self.model.parameters()).device,
             batch_size=resolved_batch_size,
@@ -592,7 +590,9 @@ def train_body(
             "sample_axis": sample_axis.describe(),
             "depth_basis": workflow.seismic.depth_basis,
             "body_smoothing_fwhm_m": config.body_smoothing_fwhm_m,
-            "visibility_compensation": asdict(config.visibility),
+            "prediction_definition": "gaussian_smooth(log_ai_initial + raw_network_correction)",
+            "well_target_definition": "native_filtered_log_ai resampled then gaussian_smooth once",
+            "seismic_objective": "normalized waveform shape",
             "seismic_feature": {
                 "mode": config.seismic_feature_mode,
                 "balance_window_samples": config.seismic_balance_window_samples,
@@ -780,13 +780,22 @@ def load_body(
         raise ValueError("Seismic and LFM SampleAxis values differ.")
     baseline = dict(lfm.variant.variant_metadata.get("resolved_baseline_config") or {})
     lowpass = parse_lowpass_spec(dict(baseline.get("filter") or {}), sample_axis)
-    wavelet_time_s, wavelet_amplitude, _relation, _payload = load_forward_inputs(
+    wavelet_time_s, wavelet_amplitude, relation, _payload = load_forward_inputs(
         forward_path,
         domain=workflow.seismic.domain,
         depth_basis=workflow.seismic.depth_basis,
     )
     adapter: DepthDomainAdapter | TimeDomainAdapter
+    domain_extras: dict[str, np.ndarray] = {}
     if workflow.seismic.domain == "depth":
+        if relation is None:
+            raise ValueError("Depth inference requires the frozen AI--Vp relation.")
+        velocity = np.full(lfm.log_ai.shape, np.nan, dtype=np.float64)
+        for start in range(0, lfm.log_ai.shape[0], 8):
+            valid = lfm.valid_mask[start:start + 8]
+            block = velocity[start:start + 8]
+            block[valid] = relation.velocity_from_ai(np.exp(lfm.log_ai[start:start + 8][valid].astype(np.float64)))
+        domain_extras["velocity_mps"] = velocity
         adapter = DepthDomainAdapter(
             torch.as_tensor(wavelet_time_s, dtype=torch.float32),
             torch.as_tensor(wavelet_amplitude, dtype=torch.float32),
@@ -811,6 +820,7 @@ def load_body(
         normalization=normalization,
         patch_radius=config.patch_radius,
         cache_size=max(config.cache_size, 4 * config.patch_radius + 2),
+        domain_extras=domain_extras,
         seismic_feature_mode=config.seismic_feature_mode,
         seismic_balance_window_samples=config.seismic_balance_window_samples,
         seismic_balance_floor_fraction=config.seismic_balance_floor_fraction,

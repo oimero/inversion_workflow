@@ -13,7 +13,7 @@ from scipy.ndimage import distance_transform_edt
 from torch import Tensor
 
 from ginn_v2.data import Orientation, PatchKey, PatchReader
-from ginn_v2.model import BodyScaleProjector, CenterTraceBodyNet
+from ginn_v2.model import BodySmoother, CenterTraceBodyNet
 from ginn_v2.physics import CommonObservationBatch, DomainAdapter
 
 
@@ -43,7 +43,7 @@ class BodyInverter:
         reader: PatchReader,
         adapter: DomainAdapter,
         *,
-        projector: BodyScaleProjector,
+        smoother: BodySmoother,
         device: torch.device | str = "cpu",
         batch_size: int = 8,
     ) -> None:
@@ -52,7 +52,7 @@ class BodyInverter:
         self.model = model.to(device)
         self.reader = reader
         self.adapter = adapter
-        self.projector = projector
+        self.smoother = smoother
         self.device = torch.device(device)
         self.batch_size = int(batch_size)
 
@@ -68,18 +68,29 @@ class BodyInverter:
         )
 
     def _predict_body_batch(self, batch) -> tuple[Tensor, Tensor, CommonObservationBatch]:
+        raw_body, support, common = self._predict_raw_body_batch(batch)
+        body = self.smoother.smooth(
+            raw_body,
+            self.adapter.vertical_coordinates_m(common),
+            batch.lfm_valid_mask,
+        )
+        # Keep a finite initial-model fallback where the LFM itself is not
+        # supported.  Direct prediction support remains observation-limited
+        # and is used by volume fusion/fill logic.
+        body = torch.where(batch.lfm_valid_mask, body, batch.lfm_log_ai)
+        return body, support, common
+
+    def _predict_raw_body_batch(self, batch) -> tuple[Tensor, Tensor, CommonObservationBatch]:
+        """Return the unsmoothed initial-plus-correction curve for volume fusion."""
+
         common = self._common(batch)
         raw = self.model(
             batch.features,
             center_index=self.reader.patch_radius,
         )
-        correction = self.projector.project(
-            raw,
-            self.adapter.vertical_coordinates_m(common),
-            batch.lfm_valid_mask,
-        )
+        body = batch.lfm_log_ai + raw
+        body = torch.where(batch.lfm_valid_mask, body, batch.lfm_log_ai)
         support = common.observed_valid_mask & batch.lfm_valid_mask
-        body = torch.where(support, batch.lfm_log_ai + correction, batch.lfm_log_ai)
         return body, support, common
 
     @torch.no_grad()
@@ -101,6 +112,33 @@ class BodyInverter:
             local = selected[start : start + self.batch_size]
             batch = self.reader.batch(local, center_visible=center_visible, device=self.device)
             body, support, _common = self._predict_body_batch(batch)
+            bodies.append(body)
+            supports.append(support)
+        return BodyPrediction(
+            keys=selected,
+            body_log_ai=torch.cat(bodies, dim=0),
+            valid_mask=torch.cat(supports, dim=0),
+        )
+
+    @torch.no_grad()
+    def predict_raw_body(
+        self,
+        keys: tuple[PatchKey, ...] | list[PatchKey],
+        *,
+        center_visible: bool = True,
+    ) -> BodyPrediction:
+        """Predict unsmoothed initial-plus-correction curves for volume fusion."""
+
+        selected = tuple(keys)
+        if not selected:
+            raise ValueError("BodyInverter.predict_raw_body requires at least one PatchKey.")
+        self.model.eval()
+        bodies: list[Tensor] = []
+        supports: list[Tensor] = []
+        for start in range(0, len(selected), self.batch_size):
+            local = selected[start : start + self.batch_size]
+            batch = self.reader.batch(local, center_visible=center_visible, device=self.device)
+            body, support, _common = self._predict_raw_body_batch(batch)
             bodies.append(body)
             supports.append(support)
         return BodyPrediction(
@@ -162,8 +200,9 @@ class BodyVolumeResult:
     """Fused body volume plus direct-prediction and fill provenance.
 
     ``fill_code`` values are 0 outside the target zone, 1 for a direct network
-    prediction, 2 for a nearest spatial increment fill, and 3 for an LFM-only
-    fill used when an entire target depth slice has no direct prediction.
+    prediction, 2 for a nearest spatial increment fill, and 3 for a smoothed
+    initial-model fill used when an entire target depth slice has no direct
+    prediction.
     """
 
     body_log_ai: np.ndarray
@@ -314,6 +353,46 @@ def _fill_target_zone(
     return body, fill_code, float(mean_distance), float(distance_max)
 
 
+def _smooth_volume_curves(
+    body_log_ai: np.ndarray,
+    target_mask: np.ndarray,
+    *,
+    inverter: BodyInverter,
+    inline_start: int,
+    xline_start: int,
+) -> np.ndarray:
+    """Smooth complete fused/filled curves once using physical coordinates."""
+    body = np.asarray(body_log_ai, dtype=np.float32)
+    target = np.asarray(target_mask, dtype=bool)
+    flat_body = body.reshape((-1, body.shape[-1]))
+    flat_target = target.reshape((-1, target.shape[-1]))
+    columns = np.flatnonzero(np.any(flat_target, axis=1))
+    reader = inverter.reader
+    device = inverter.device
+    with torch.no_grad():
+        for start in range(0, len(columns), inverter.batch_size):
+            selected = columns[start:start + inverter.batch_size]
+            li, lj = np.unravel_index(selected, body.shape[:2])
+            gi, gj = li + inline_start, lj + xline_start
+            support = torch.as_tensor(flat_target[selected], device=device)
+            values = torch.as_tensor(np.where(flat_target[selected], flat_body[selected], 0.0),
+                                     device=device, dtype=torch.float32)
+            common = CommonObservationBatch(
+                sample_axis=reader.sample_axis,
+                observed_seismic=torch.zeros_like(values), observed_valid_mask=support,
+                lfm_log_ai=values, lfm_valid_mask=support,
+                xy_m=torch.as_tensor(reader._xy(list(zip(gi, gj))), device=device, dtype=torch.float32),
+                domain_extras={name: torch.as_tensor(volume[gi, gj], device=device, dtype=torch.float32)
+                               for name, volume in reader.domain_extras.items()},
+            )
+            smoothed = inverter.smoother.smooth(
+                values, inverter.adapter.vertical_coordinates_m(common), support,
+            ).cpu().numpy()
+            flat_body[selected] = np.where(flat_target[selected], smoothed, np.nan)
+    body[~target] = np.nan
+    return body
+
+
 class BodyVolumeInverter:
     """Predict a spatial tile or full survey and fuse available directions once."""
 
@@ -396,7 +475,7 @@ class BodyVolumeInverter:
                     xline_bounds=(xl_start, xl_stop),
                 )
                 if keys:
-                    prediction = self.inverter.predict_body(keys, center_visible=True)
+                    prediction = self.inverter.predict_raw_body(keys, center_visible=True)
                     bodies = prediction.body_log_ai.detach().cpu().numpy().astype(np.float32, copy=False)
                     supports = prediction.valid_mask.detach().cpu().numpy().astype(bool, copy=False)
                     for row, key in enumerate(prediction.keys):
@@ -407,7 +486,7 @@ class BodyVolumeInverter:
                         if np.any(previous_count[support] > 1):
                             raise ValueError("A volume sample received more than two orientation predictions.")
                         paired = support & (previous_count == 1)
-                        disagreement[local_i, local_j, paired] = np.abs(
+                        disagreement[local_i, local_j, paired] = (
                             bodies[row, paired] - body_sum[local_i, local_j, paired]
                         )
                         body_sum[local_i, local_j, support] += bodies[row, support]
@@ -444,6 +523,14 @@ class BodyVolumeInverter:
             inline_spacing_m=float(spacing["inline_spacing_m"]),
             xline_spacing_m=float(spacing["xline_spacing_m"]),
         )
+        body_sum = _smooth_volume_curves(
+            body_sum, target_mask, inverter=self.inverter,
+            inline_start=il_start, xline_start=xl_start,
+        )
+        disagreement = np.abs(_smooth_volume_curves(
+            disagreement, direction_count == 2, inverter=self.inverter,
+            inline_start=il_start, xline_start=xl_start,
+        ))
         return BodyVolumeResult(
             body_log_ai=body_sum,
             direction_count=direction_count,

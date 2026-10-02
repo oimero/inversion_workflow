@@ -9,9 +9,6 @@ flowchart TB
 
     RP["旁路 岩石物理分析"]
     S3 -.-> RP
-
-    FO["旁路 正演可观测性分析"] --> SL["旁路 合成基准生成与评估"] --> EV["旁路 带限证据训练与评估"]
-    S6 -.-> FO
 ```
 
 ## 配置文件
@@ -22,7 +19,6 @@ flowchart TB
 | 07 · modifier 实验 | `experiments/real_field_lfm/real_field_lfm.yaml` |
 | 旁路 · well_trajectory | `experiments/common/common.yaml` |
 | 旁路 · rock_physics_analysis | `experiments/common/common.yaml` |
-| 旁路 · forward_observability | `experiments/common/common.yaml` |
 | 旁路 · synthoseis_lite | `experiments/synthoseis_lite/synthoseis_lite.yaml` |
 | 旁路 · 带限证据 | `experiments/evidence/evidence.yaml` |
 | GINN V2 主体反演 | `experiments/ginn_v2/ginn_v2.yaml` |

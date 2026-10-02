@@ -14,6 +14,4 @@
 
 ::: cup.seismic.trace_sampling
 
-::: cup.seismic.observability
-
 ::: cup.seismic.viz

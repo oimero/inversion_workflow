@@ -685,7 +685,7 @@ def main() -> None:
 
     # ── Import heavy dependencies ──
 
-    from cup.petrel.load import import_well_heads_petrel
+    from cup.utils.petrel import import_well_heads_petrel
     from cup.seismic.survey import open_survey
     from wtie.utils.datasets import tutorial as tutorial_mod
 

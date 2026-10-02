@@ -12,6 +12,7 @@ import torch
 from scipy.ndimage import distance_transform_edt
 from torch import Tensor
 
+from cup.lfm.math import LowpassSpec
 from ginn_v2.data import Orientation, PatchKey, PatchReader
 from ginn_v2.model import BodySmoother, CenterTraceBodyNet
 from ginn_v2.physics import CommonObservationBatch, DomainAdapter
@@ -44,6 +45,7 @@ class BodyInverter:
         adapter: DomainAdapter,
         *,
         smoother: BodySmoother,
+        lfm_lowpass_spec: LowpassSpec,
         device: torch.device | str = "cpu",
         batch_size: int = 8,
     ) -> None:
@@ -53,6 +55,9 @@ class BodyInverter:
         self.reader = reader
         self.adapter = adapter
         self.smoother = smoother
+        if not isinstance(lfm_lowpass_spec, LowpassSpec):
+            raise TypeError("lfm_lowpass_spec must be a LowpassSpec.")
+        self.lfm_lowpass_spec = lfm_lowpass_spec
         self.device = torch.device(device)
         self.batch_size = int(batch_size)
 
@@ -69,15 +74,18 @@ class BodyInverter:
 
     def _predict_body_batch(self, batch) -> tuple[Tensor, Tensor, CommonObservationBatch]:
         raw_body, support, common = self._predict_raw_body_batch(batch)
-        body = self.smoother.smooth(
-            raw_body,
+        construction = self.smoother.construct(
+            batch.lfm_log_ai,
+            raw_body - batch.lfm_log_ai,
             self.adapter.vertical_coordinates_m(common),
             batch.lfm_valid_mask,
+            sample_step=float(self.reader.sample_axis.step),
+            lfm_lowpass_spec=self.lfm_lowpass_spec,
         )
         # Keep a finite initial-model fallback where the LFM itself is not
         # supported.  Direct prediction support remains observation-limited
         # and is used by volume fusion/fill logic.
-        body = torch.where(batch.lfm_valid_mask, body, batch.lfm_log_ai)
+        body = torch.where(batch.lfm_valid_mask, construction.body_log_ai, batch.lfm_log_ai)
         return body, support, common
 
     def _predict_raw_body_batch(self, batch) -> tuple[Tensor, Tensor, CommonObservationBatch]:
@@ -360,12 +368,17 @@ def _smooth_volume_curves(
     inverter: BodyInverter,
     inline_start: int,
     xline_start: int,
+    initial_log_ai: np.ndarray,
 ) -> np.ndarray:
-    """Smooth complete fused/filled curves once using physical coordinates."""
+    """Construct complete fused/filled curves using the shared body output."""
     body = np.asarray(body_log_ai, dtype=np.float32)
     target = np.asarray(target_mask, dtype=bool)
+    initial = np.asarray(initial_log_ai, dtype=np.float32)
+    if initial.shape != body.shape:
+        raise ValueError("initial_log_ai must match body_log_ai for volume construction.")
     flat_body = body.reshape((-1, body.shape[-1]))
     flat_target = target.reshape((-1, target.shape[-1]))
+    flat_initial = initial.reshape((-1, initial.shape[-1]))
     columns = np.flatnonzero(np.any(flat_target, axis=1))
     reader = inverter.reader
     device = inverter.device
@@ -377,17 +390,29 @@ def _smooth_volume_curves(
             support = torch.as_tensor(flat_target[selected], device=device)
             values = torch.as_tensor(np.where(flat_target[selected], flat_body[selected], 0.0),
                                      device=device, dtype=torch.float32)
+            initial_values = torch.as_tensor(
+                np.where(flat_target[selected], flat_initial[selected], 0.0),
+                device=device,
+                dtype=torch.float32,
+            )
             common = CommonObservationBatch(
                 sample_axis=reader.sample_axis,
                 observed_seismic=torch.zeros_like(values), observed_valid_mask=support,
-                lfm_log_ai=values, lfm_valid_mask=support,
+                lfm_log_ai=initial_values, lfm_valid_mask=support,
                 xy_m=torch.as_tensor(reader._xy(list(zip(gi, gj))), device=device, dtype=torch.float32),
                 domain_extras={name: torch.as_tensor(volume[gi, gj], device=device, dtype=torch.float32)
                                for name, volume in reader.domain_extras.items()},
             )
-            smoothed = inverter.smoother.smooth(
-                values, inverter.adapter.vertical_coordinates_m(common), support,
-            ).cpu().numpy()
+            construction = inverter.smoother.construct(
+                initial_values,
+                values - initial_values,
+                inverter.adapter.vertical_coordinates_m(common),
+                support,
+                sample_step=float(reader.sample_axis.step),
+                lfm_lowpass_spec=inverter.lfm_lowpass_spec,
+            )
+            smoothed = construction.body_log_ai
+            smoothed = smoothed.cpu().numpy()
             flat_body[selected] = np.where(flat_target[selected], smoothed, np.nan)
     body[~target] = np.nan
     return body
@@ -526,10 +551,12 @@ class BodyVolumeInverter:
         body_sum = _smooth_volume_curves(
             body_sum, target_mask, inverter=self.inverter,
             inline_start=il_start, xline_start=xl_start,
+            initial_log_ai=local_lfm,
         )
         disagreement = np.abs(_smooth_volume_curves(
             disagreement, direction_count == 2, inverter=self.inverter,
             inline_start=il_start, xline_start=xl_start,
+            initial_log_ai=np.zeros_like(disagreement),
         ))
         return BodyVolumeResult(
             body_log_ai=body_sum,

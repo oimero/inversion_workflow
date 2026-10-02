@@ -8,7 +8,7 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from cup.petrel.load import import_interpretation_petrel
+from cup.utils.petrel import import_interpretation_petrel
 from cup.seismic.horizon import normalize_interpretation_unit_for_geometry
 from cup.seismic.target_zone import TargetZone
 from cup.utils.io import repo_relative_path, resolve_relative_path

@@ -34,7 +34,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.petrel.load import import_well_tops_petrel
+from cup.utils.petrel import import_well_tops_petrel
 from cup.seismic.contracts import FORWARD_OBSERVABILITY_SCHEMA_VERSION
 from cup.seismic.observability import (
     ObservabilityWindow,

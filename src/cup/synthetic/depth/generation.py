@@ -10,8 +10,8 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from cup.impedance import generation_contract
-from cup.petrel.load import import_interpretation_petrel
+from cup.physics import generation_contract
+from cup.utils.petrel import import_interpretation_petrel
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.wavelet import load_wavelet_csv

@@ -8,7 +8,7 @@ import math
 import numpy as np
 from scipy.signal import butter, sosfiltfilt
 
-from cup.impedance.contracts import (
+from cup.physics.contracts import (
     CanonicalIncrementContract,
     validate_increment_contract,
     validate_sample_axis,

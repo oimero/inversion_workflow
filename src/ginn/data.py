@@ -22,7 +22,7 @@ import torch
 from scipy.signal import butter, sosfiltfilt
 from torch.utils.data import Dataset
 
-from cup.petrel.load import import_interpretation_petrel, import_seismic
+from cup.utils.petrel import import_interpretation_petrel, import_seismic
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.utils.io import resolve_relative_path

@@ -19,7 +19,7 @@ for path in (SRC_DIR, SCRIPT_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from cup.config.workflow import WorkflowConfig, deep_merge_dict
+from cup.config.workflow import WorkflowConfig, load_workflow_config
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.target_zone_io import build_workflow_target_zone
 from cup.seismic.volume_export import export_volume_like_source, log_ai_to_ai_volume
@@ -51,16 +51,6 @@ def _required_mapping(value: Any, *, name: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{name} must be a mapping.")
     return value
-
-
-def _load_composed_config(path: Path) -> dict[str, Any]:
-    experiment = load_yaml_config(path)
-    workflow_config = str(experiment.get("workflow_config") or "").strip()
-    if not workflow_config:
-        return experiment
-    common = load_yaml_config(resolve_relative_path(workflow_config, root=REPO_ROOT))
-    overlay = {key: value for key, value in experiment.items() if key != "workflow_config"}
-    return deep_merge_dict(common, overlay)
 
 
 def _output_dir(value: Path | None) -> Path:
@@ -210,7 +200,7 @@ def main() -> None:
     output_dir.mkdir(parents=True)
     log = configure_run_logger(output_dir, logger_name="enhance_v2_volume", file_name="volume_transfer.log")
 
-    raw = _load_composed_config(ginn_config_path)
+    raw = load_workflow_config(ginn_config_path, repo_root=REPO_ROOT)
     workflow = WorkflowConfig.from_mapping(raw)
     ginn_section = _required_mapping(raw.get("ginn_v2_body_inversion"), name="ginn_v2_body_inversion")
     ginn_inputs = _required_mapping(ginn_section.get("inputs"), name="ginn_v2_body_inversion.inputs")
@@ -325,6 +315,7 @@ def main() -> None:
             samples=sample_axis.values,
             source_seismic_file=source_seismic_path,
             source_seismic_type=workflow.seismic.type,
+            sample_domain=sample_axis.domain,
             title="Enhance V2 conditional residual texture linear AI",
             details=[
                 f"ginn_body={repo_relative_path(ginn_body_path, root=REPO_ROOT)}",
@@ -349,6 +340,7 @@ def main() -> None:
                 samples=sample_axis.values,
                 source_seismic_file=source_seismic_path,
                 source_seismic_type=workflow.seismic.type,
+                sample_domain=sample_axis.domain,
                 title="Enhance V2 predicted residual log-AI",
                 details=[
                     "unit=log-AI",

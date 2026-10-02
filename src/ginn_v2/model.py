@@ -9,7 +9,9 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from ginn_v2.loss import _gaussian_weights
+from cup.lfm.math import LowpassSpec
+from cup.utils.masks import true_runs
+from ginn_v2.loss import _gaussian_weights, masked_lfm_lowpass
 
 @dataclass(frozen=True)
 class BodyNetworkConfig:
@@ -163,19 +165,38 @@ class BodySmoother:
         coordinates = coordinates_m.to(device=values.device, dtype=values.dtype)
         if not bool(torch.all(torch.isfinite(coordinates)).item()):
             raise ValueError("coordinates_m must contain only finite values.")
-        weights = _gaussian_weights(coordinates, fwhm_m=self.smoothing_fwhm_m).to(
-            device=values.device,
-            dtype=values.dtype,
-        )
-        if weights.shape[0] == 1 and values.shape[0] != 1:
-            weights = weights.expand(values.shape[0], -1, -1)
-        support_float = support_mask.to(dtype=values.dtype)
-        weighted = weights * support_float[:, None, :]
-        denominator = torch.sum(weighted, dim=-1)
-        numerator = torch.bmm(weighted, values.unsqueeze(-1)).squeeze(-1)
-        valid = support_mask & (denominator > torch.finfo(values.dtype).eps)
         output = torch.zeros_like(values)
-        output[valid] = numerator[valid] / denominator[valid]
+        support_cpu = support_mask.detach().cpu().numpy()
+        runs: dict[tuple[int, int], list[int]] = {}
+        for row, row_support in enumerate(support_cpu):
+            for start, stop in true_runs(row_support):
+                runs.setdefault((start, stop), []).append(row)
+        # A 601-sample trace needs a 601x601 exact Gaussian matrix.  Reuse it
+        # for identical 1-D axes, and keep the 2-D case in small batches so
+        # variable per-row physical coordinates do not materialize a whole
+        # volume-sized matrix at once.
+        max_coordinate_rows = 16
+        for (start, stop), row_values in runs.items():
+            if coordinates.ndim == 1:
+                weights = _gaussian_weights(
+                    coordinates[start:stop],
+                    fwhm_m=self.smoothing_fwhm_m,
+                )[0].to(device=values.device, dtype=values.dtype)
+                row_indices = torch.as_tensor(row_values, device=values.device, dtype=torch.long)
+                output[row_indices, start:stop] = values[row_indices, start:stop] @ weights.T
+                continue
+            for batch_start in range(0, len(row_values), max_coordinate_rows):
+                selected = row_values[batch_start : batch_start + max_coordinate_rows]
+                row_indices = torch.as_tensor(selected, device=values.device, dtype=torch.long)
+                segment_coordinates = coordinates[row_indices, start:stop]
+                weights = _gaussian_weights(
+                    segment_coordinates,
+                    fwhm_m=self.smoothing_fwhm_m,
+                ).to(device=values.device, dtype=values.dtype)
+                output[row_indices, start:stop] = torch.bmm(
+                    weights,
+                    values[row_indices, start:stop].unsqueeze(-1),
+                ).squeeze(-1)
         return output
 
     def smooth_numpy(
@@ -204,8 +225,100 @@ class BodySmoother:
         result[~support] = np.nan
         return result
 
+    def construct(
+        self,
+        initial_log_ai: Tensor,
+        raw_correction: Tensor,
+        coordinates_m: Tensor,
+        support_mask: Tensor,
+        *,
+        sample_step: float,
+        lfm_lowpass_spec: LowpassSpec,
+    ) -> "BodyConstruction":
+        """Construct the shared body output from one raw network correction.
+
+        The model always has a smoothed initial baseline ``b0``.  The raw
+        correction is smoothed once, differenced against that baseline, and
+        only its low-frequency part is removed with the exact upstream LFM
+        operator::
+
+            b0 = G(initial)
+            d = G(initial + raw) - b0
+            body = b0 + (I - L)d
+
+        Keeping this operation here makes training, direct trace inference,
+        and volume fusion use the same output semantics.  ``support_mask``
+        describes the complete finite LFM run used by both physical filters.
+        """
+
+        if initial_log_ai.ndim != 2 or not torch.is_floating_point(initial_log_ai):
+            raise ValueError("initial_log_ai must be a floating (batch, samples) tensor.")
+        if raw_correction.shape != initial_log_ai.shape or not torch.is_floating_point(raw_correction):
+            raise ValueError("raw_correction must be a floating tensor matching initial_log_ai.")
+        if not bool(torch.all(torch.isfinite(initial_log_ai)).item()) or not bool(
+            torch.all(torch.isfinite(raw_correction)).item()
+        ):
+            raise ValueError("initial_log_ai and raw_correction must contain only finite values.")
+        if support_mask.shape != initial_log_ai.shape or support_mask.dtype != torch.bool:
+            raise ValueError("support_mask must be boolean and match initial_log_ai.")
+        step = float(sample_step)
+        if not math.isfinite(step) or step <= 0.0:
+            raise ValueError("sample_step must be finite and positive.")
+        if not isinstance(lfm_lowpass_spec, LowpassSpec):
+            raise TypeError("lfm_lowpass_spec must be a LowpassSpec.")
+        baseline = self.smooth(initial_log_ai, coordinates_m, support_mask)
+        smoothed_raw = self.smooth(initial_log_ai + raw_correction, coordinates_m, support_mask)
+        correction = smoothed_raw - baseline
+        if lfm_lowpass_spec.enabled:
+            low_frequency, low_support = masked_lfm_lowpass(
+                correction,
+                support_mask,
+                sample_step=step,
+                spec=lfm_lowpass_spec,
+            )
+        else:
+            low_frequency = torch.zeros_like(correction)
+            low_support = support_mask
+        body = baseline + correction - low_frequency
+        valid = support_mask & low_support
+        return BodyConstruction(
+            baseline_log_ai=baseline,
+            smoothed_raw_log_ai=smoothed_raw,
+            correction_log_ai=correction,
+            low_frequency_increment=low_frequency,
+            body_log_ai=body,
+            valid_mask=valid,
+        )
+
+
+@dataclass(frozen=True)
+class BodyConstruction:
+    """Shared baseline/correction decomposition for a body prediction."""
+
+    baseline_log_ai: Tensor
+    smoothed_raw_log_ai: Tensor
+    correction_log_ai: Tensor
+    low_frequency_increment: Tensor
+    body_log_ai: Tensor
+    valid_mask: Tensor
+
+    def __post_init__(self) -> None:
+        shape = self.body_log_ai.shape
+        for name in (
+            "baseline_log_ai",
+            "smoothed_raw_log_ai",
+            "correction_log_ai",
+            "low_frequency_increment",
+        ):
+            value = getattr(self, name)
+            if value.shape != shape or not torch.is_floating_point(value):
+                raise ValueError(f"{name} must be a floating tensor matching body_log_ai.")
+        if self.valid_mask.dtype != torch.bool or self.valid_mask.shape != shape:
+            raise ValueError("valid_mask must be boolean and match body_log_ai.")
+
 
 __all__ = [
+    "BodyConstruction",
     "BodyNetworkConfig",
     "BodySmoother",
     "CenterTraceBodyNet",

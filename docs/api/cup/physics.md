@@ -12,4 +12,10 @@ NumPy 后端是默认公共 API；PyTorch 后端需显式导入，避免基础 `
 
 ::: cup.physics.calibration
 
+::: cup.physics.execution
+
 ::: cup.physics.rock_physics
+
+::: cup.physics.canonical
+
+::: cup.physics.contracts

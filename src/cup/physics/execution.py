@@ -1,13 +1,57 @@
-"""Execution policy for non-differentiable depth-domain forward modeling."""
+"""Frozen forward-input loading and non-differentiable depth execution policy."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+import json
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from cup.physics.calibration import AIVelocityRelation
 from cup.physics.numpy_backend import forward_depth as numpy_forward_depth
+from cup.seismic.wavelet import load_wavelet_csv, validate_wavelet_normalization
+from cup.utils.io import resolve_relative_path
+
+
+def load_forward_inputs(
+    path: Path,
+    *,
+    repo_root: Path,
+    domain: str,
+    depth_basis: str | None,
+) -> tuple[np.ndarray, np.ndarray, AIVelocityRelation | None, dict[str, Any]]:
+    """Load and strictly validate one frozen forward-model input artifact."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("schema") != "forward_model_inputs_v3":
+        raise ValueError("Body inversion requires forward_model_inputs_v3.")
+    if payload.get("sample_domain") != domain or payload.get("depth_basis") != depth_basis:
+        raise ValueError("Frozen forward inputs do not match the seismic SampleAxis domain.")
+    wavelet_info = payload.get("wavelet")
+    if not isinstance(wavelet_info, Mapping):
+        raise ValueError("forward_model_inputs.wavelet must be a mapping.")
+    wavelet_path = resolve_relative_path(
+        str(wavelet_info.get("path") or ""),
+        root=Path(repo_root),
+    )
+    time_s, amplitude = load_wavelet_csv(wavelet_path)
+    amplitude, qc = validate_wavelet_normalization(
+        time_s,
+        amplitude,
+        allow_small_renormalization=False,
+    )
+    if qc.status != "ok":
+        raise ValueError(f"Frozen wavelet failed normalization QC: {qc.reasons}")
+    relation_info = payload.get("ai_velocity_relation")
+    if domain == "depth" and not isinstance(relation_info, Mapping):
+        raise ValueError("Depth forward inputs must contain ai_velocity_relation.")
+    relation = AIVelocityRelation.from_mapping(relation_info) if relation_info is not None else None
+    return time_s, amplitude, relation, payload
 
 
 class DepthForwardExecutor:
@@ -107,4 +151,4 @@ class DepthForwardExecutor:
         return np.concatenate(chunks, axis=0).reshape(original_shape)
 
 
-__all__ = ["DepthForwardExecutor"]
+__all__ = ["DepthForwardExecutor", "load_forward_inputs"]

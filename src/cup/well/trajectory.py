@@ -10,7 +10,7 @@ from typing import Any, Literal, Mapping, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 
-from cup.petrel.load import import_petrel_checkshots_dataframe
+from cup.utils.petrel import import_petrel_checkshots_dataframe
 from cup.well.inventory import normalize_well_name
 from wtie.processing import grid
 

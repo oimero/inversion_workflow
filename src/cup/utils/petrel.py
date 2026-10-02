@@ -1,4 +1,4 @@
-"""cup.petrel.load: Petrel 相关文本与地震数据加载工具。
+"""cup.utils.petrel: Petrel 相关文本与地震数据加载工具。
 
 本模块负责读取 SEG-Y/ZGY 地震体，以及 Petrel 导出的
 checkshots / well heads / well tops / interpretation 文本，
@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 import warnings
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd

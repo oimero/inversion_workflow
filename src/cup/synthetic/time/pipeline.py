@@ -22,7 +22,7 @@ from cup.synthetic.core.calibration import (
     load_calibration,
 )
 from cup.synthetic.time.config import DATA_SCHEMA, IMPLEMENTATION_SCOPE
-from cup.impedance import generation_contract
+from cup.physics import generation_contract
 from cup.synthetic.core import (
     build_seismic_input_contract,
     build_mask_contract,

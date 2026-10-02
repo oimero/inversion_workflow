@@ -30,10 +30,12 @@ from ginn_v2.data import (
     build_well_patch_targets,
     build_well_splits,
     make_spatial_split,
+    well_smoothing_coordinates,
     well_target_zone_mask,
 )
 from ginn_v2.diagnose import write_well_waveform_qc
 from ginn_v2.loss import (
+    lfm_anchor_loss,
     local_standard_deviation,
     masked_lfm_lowpass,
     short_wave_energy_ratio,
@@ -207,7 +209,7 @@ def evaluate_warnings(
     )
 
 
-CHECKPOINT_SCHEMA = "ginn_v2_body_inversion_checkpoint_v4_final_curve"
+CHECKPOINT_SCHEMA = "ginn_v2_body_inversion_checkpoint_v5_shared_body_output"
 
 
 def save_epoch_checkpoint(
@@ -288,6 +290,7 @@ class BodyInversionLossWeights:
     trusted_well_derivative: float = 0.5
     lambda_shape: float = 0.25
     trusted_well_seismic_shape: float = 0.0
+    lfm_anchor: float = 1.0
 
     def __post_init__(self) -> None:
         for name, value in asdict(self).items():
@@ -458,6 +461,7 @@ class BodyInversionConfig:
             "loss_weights": {
                 "seismic_shape": self.loss_weights.seismic_shape,
                 "lambda_shape": self.loss_weights.lambda_shape,
+                "lfm_anchor": self.loss_weights.lfm_anchor,
             },
             "network": asdict(self.network),
         }
@@ -536,8 +540,14 @@ def build_body_inversion_data(
         provenance=controls.provenance,
     )
     smoother = BodySmoother(smoothing_fwhm_m=config.body_smoothing_fwhm_m)
-    targets = {
-        control.well_name: build_well_body_target(
+    targets: dict[str, WellTarget] = {}
+    for control in trusted:
+        model_coordinates, native_coordinates = well_smoothing_coordinates(
+            control,
+            geometry=reader.geometry,
+            domain_extras=reader.domain_extras,
+        )
+        targets[control.well_name] = build_well_body_target(
             control,
             body_smoothing_fwhm_m=config.body_smoothing_fwhm_m,
             target_zone_support=well_target_zone_mask(
@@ -547,9 +557,9 @@ def build_body_inversion_data(
             ),
             geometry=reader.geometry,
             smoother=smoother,
+            model_smoothing_coordinates_m=model_coordinates,
+            native_smoothing_coordinates_m=native_coordinates,
         )
-        for control in trusted
-    }
     well_splits = build_well_splits(
         trusted_set,
         targets,
@@ -718,45 +728,37 @@ class BodyInversionTrainer:
         self,
         model: CenterTraceBodyNet | None,
         batch: PatchBatch,
-    ) -> tuple[Tensor, Tensor, CommonObservationBatch]:
+    ) -> tuple[Tensor, Tensor, CommonObservationBatch, Tensor]:
         common = self._common(batch)
-        if model is None:
-            body = self.smoother.smooth(
-                batch.lfm_log_ai,
-                self._coordinates(common),
-                batch.lfm_valid_mask,
-            )
-            body = torch.where(batch.lfm_valid_mask, body, batch.lfm_log_ai)
-            closure = self.adapter.close_body(
-                body,
-                common,
-            )
-            body = closure.body_log_ai
-            synthetic = closure.synthetic_seismic
-        else:
-            raw_correction = model(
+        raw_correction = (
+            torch.zeros_like(batch.lfm_log_ai)
+            if model is None
+            else model(
                 batch.features,
                 center_index=self.data.reader.patch_radius,
             )
-            body = self.smoother.smooth(
-                batch.lfm_log_ai + raw_correction,
-                self._coordinates(common),
-                batch.lfm_valid_mask,
-            )
-            body = torch.where(batch.lfm_valid_mask, body, batch.lfm_log_ai)
-            closure = self.adapter.close_body(
-                body,
-                common,
-            )
-            body = closure.body_log_ai
-            synthetic = closure.synthetic_seismic
+        )
+        construction = self.smoother.construct(
+            batch.lfm_log_ai,
+            raw_correction,
+            self._coordinates(common),
+            batch.lfm_valid_mask,
+            sample_step=float(self.data.reader.sample_axis.step),
+            lfm_lowpass_spec=self.lfm_lowpass_spec,
+        )
+        body = torch.where(batch.lfm_valid_mask, construction.body_log_ai, batch.lfm_log_ai)
+        baseline = torch.where(batch.lfm_valid_mask, construction.baseline_log_ai, batch.lfm_log_ai)
+        closure = self.adapter.close_body(body, common)
+        body = closure.body_log_ai
+        synthetic = closure.synthetic_seismic
         if not bool(torch.all(torch.isfinite(body)).item()) or not bool(torch.all(torch.isfinite(synthetic)).item()):
             raise ValueError("Body-inversion model or forward output contains non-finite values.")
-        return body, synthetic, common
+        return body, synthetic, common, baseline
 
     def _loss(
         self,
         body: Tensor,
+        baseline: Tensor,
         synthetic: Tensor,
         common: CommonObservationBatch,
         *,
@@ -775,6 +777,15 @@ class BodyInversionTrainer:
         well_loss = torch.zeros((), dtype=body.dtype, device=body.device)
         well_derivative_loss = torch.zeros((), dtype=body.dtype, device=body.device)
         trusted_well_seismic_shape_loss = torch.zeros((), dtype=body.dtype, device=body.device)
+        anchor_loss = torch.zeros((), dtype=body.dtype, device=body.device)
+        if weights.lfm_anchor > 0.0:
+            anchor_loss = lfm_anchor_loss(
+                body,
+                baseline,
+                common.lfm_valid_mask,
+                sample_step=float(self.data.reader.sample_axis.step),
+                lowpass_spec=self.lfm_lowpass_spec,
+            ) * float(weights.lfm_anchor)
         if well_items:
             target = torch.zeros_like(body)
             target_mask = torch.zeros_like(body, dtype=torch.bool)
@@ -824,6 +835,7 @@ class BodyInversionTrainer:
             + weights.trusted_well_body * well_loss
             + weights.trusted_well_derivative * well_derivative_loss
             + weights.trusted_well_seismic_shape * trusted_well_seismic_shape_loss
+            + anchor_loss
         )
         if not bool(torch.isfinite(total).item()):
             raise ValueError("Body-inversion loss is non-finite.")
@@ -832,6 +844,7 @@ class BodyInversionTrainer:
             "trusted_well_body": well_loss.detach(),
             "trusted_well_derivative": well_derivative_loss.detach(),
             "trusted_well_seismic_shape": trusted_well_seismic_shape_loss.detach(),
+            "lfm_anchor": anchor_loss.detach(),
         }
 
     def _scheduled_batches(
@@ -878,6 +891,7 @@ class BodyInversionTrainer:
             "trusted_well_body": [],
             "trusted_well_derivative": [],
             "trusted_well_seismic_shape": [],
+            "lfm_anchor": [],
         }
         started = time.monotonic()
         schedule: Iterable[tuple[str, tuple[Any, ...], bool]]
@@ -904,9 +918,10 @@ class BodyInversionTrainer:
                 keys = tuple(values)
             batch = self.data.reader.batch(keys, center_visible=center_visible, device=self.device)
             optimizer.zero_grad(set_to_none=True)
-            body, synthetic, common = self._predict(model, batch)
+            body, synthetic, common, baseline = self._predict(model, batch)
             total, components = self._loss(
                 body,
+                baseline,
                 synthetic,
                 common,
                 well_items=well_items,
@@ -951,15 +966,17 @@ class BodyInversionTrainer:
         seismic_amplitude_values: list[np.ndarray] = []
         body_amplitude_values: list[np.ndarray] = []
         bodies: dict[PatchKey, np.ndarray] = {}
+        baselines: dict[PatchKey, np.ndarray] = {}
         lfm_values: dict[PatchKey, np.ndarray] = {}
         supports: dict[PatchKey, np.ndarray] = {}
+        coordinates_by_key: dict[PatchKey, np.ndarray] = {}
         seismic_amplitude_by_key: dict[PatchKey, np.ndarray] = {}
         body_amplitude_by_key: dict[PatchKey, np.ndarray] = {}
         with torch.no_grad():
             for start in range(0, len(keys), self.config.batch_size):
                 local_keys = keys[start : start + self.config.batch_size]
                 batch = self.data.reader.batch(local_keys, center_visible=center_visible, device=self.device)
-                body, synthetic, common = self._predict(model, batch)
+                body, synthetic, common, baseline = self._predict(model, batch)
                 shape = waveform_shape_loss(common.observed_seismic, synthetic, common.observed_valid_mask)
                 support = common.observed_valid_mask.to(dtype=common.observed_seismic.dtype)
                 raw_residual = torch.sqrt(
@@ -974,7 +991,7 @@ class BodyInversionTrainer:
                     smoothing_fwhm_m=self.config.waveform_qc_dynamic_window_m,
                 )
                 body_amplitude, body_support = local_standard_deviation(
-                    body - batch.lfm_log_ai,
+                    body - baseline,
                     coordinates,
                     common.observed_valid_mask & batch.lfm_valid_mask,
                     smoothing_fwhm_m=self.config.waveform_qc_dynamic_window_m,
@@ -987,8 +1004,10 @@ class BodyInversionTrainer:
                 body_amplitude_values.append(body_amplitude[amplitude_support].cpu().numpy())
                 for row, key in enumerate(local_keys):
                     bodies[key] = body[row].cpu().numpy()
+                    baselines[key] = baseline[row].cpu().numpy()
                     lfm_values[key] = batch.lfm_log_ai[row].cpu().numpy()
                     supports[key] = common.observed_valid_mask[row].cpu().numpy()
+                    coordinates_by_key[key] = (coordinates if coordinates.ndim == 1 else coordinates[row]).cpu().numpy()
                     seismic_amplitude_by_key[key] = seismic_amplitude[row].cpu().numpy()
                     body_amplitude_by_key[key] = body_amplitude[row].cpu().numpy()
         seismic_amplitude_array = np.concatenate(seismic_amplitude_values) if seismic_amplitude_values else np.asarray([])
@@ -1006,8 +1025,10 @@ class BodyInversionTrainer:
                 np.log10(body_amplitude_array),
             ),
             "bodies": bodies,
+            "baselines": baselines,
             "lfm": lfm_values,
             "supports": supports,
+            "coordinates": coordinates_by_key,
             "seismic_amplitude": seismic_amplitude_by_key,
             "body_amplitude": body_amplitude_by_key,
         }
@@ -1015,6 +1036,7 @@ class BodyInversionTrainer:
     def _well_evaluation(self, model: CenterTraceBodyNet | None) -> dict[str, Any]:
         values: dict[str, dict[int, list[float]]] = {}
         targets: dict[str, dict[int, float]] = {}
+        coordinates_by_well: dict[str, dict[int, float]] = {}
         with torch.no_grad():
             for start in range(0, len(self.data.trusted_well_patches), self.config.batch_size):
                 items = self.data.trusted_well_patches[start : start + self.config.batch_size]
@@ -1023,7 +1045,10 @@ class BodyInversionTrainer:
                     center_visible=True,
                     device=self.device,
                 )
-                body, _, _ = self._predict(model, batch)
+                body, _, common, _ = self._predict(model, batch)
+                coordinates = self._coordinates(common)
+                if coordinates.ndim == 1:
+                    coordinates = coordinates[None, :].expand_as(body)
                 for row, item in enumerate(items):
                     for sample_index in np.flatnonzero(item.target_mask):
                         index = int(sample_index)
@@ -1031,12 +1056,12 @@ class BodyInversionTrainer:
                             float(body[row, index].cpu())
                         )
                         targets.setdefault(item.well_name, {})[index] = float(item.target_values[index])
+                        coordinates_by_well.setdefault(item.well_name, {})[index] = float(coordinates[row, index].cpu())
         rmse_by_well: dict[str, float] = {}
         bias_by_well: dict[str, float] = {}
         correlation_by_well: dict[str, float] = {}
         all_residuals: list[float] = []
         roughness_by_well: dict[str, float] = {}
-        axis = np.asarray(self.data.reader.sample_axis.values, dtype=np.float64)
         for name in sorted(values):
             indices = sorted(values[name])
             predicted = np.asarray([np.mean(values[name][index]) for index in indices], dtype=np.float64)
@@ -1050,7 +1075,7 @@ class BodyInversionTrainer:
             correlation_by_well[name] = correlation
             all_residuals.extend(residual.tolist())
             if len(indices) >= 3:
-                coords = axis[np.asarray(indices)]
+                coords = np.asarray([coordinates_by_well[name][index] for index in indices], dtype=np.float64)
                 differences = np.diff(coords)
                 contiguous = np.isclose(differences, np.median(differences), rtol=0.0, atol=1e-8)
                 if not np.any(contiguous):
@@ -1082,8 +1107,8 @@ class BodyInversionTrainer:
                     device=self.device,
                     dtype=torch.float32,
                 )
-                lfm = torch.as_tensor(
-                    np.stack([trace_eval["lfm"][key] for key in local]),
+                baseline = torch.as_tensor(
+                    np.stack([trace_eval["baselines"][key] for key in local]),
                     device=self.device,
                     dtype=torch.float32,
                 )
@@ -1102,7 +1127,7 @@ class BodyInversionTrainer:
                     dtype=torch.bool,
                 )
                 residual_low, residual_support = masked_lfm_lowpass(
-                    body - lfm,
+                    body - baseline,
                     mask,
                     sample_step=float(self.data.reader.sample_axis.step),
                     spec=self.lfm_lowpass_spec,
@@ -1232,10 +1257,10 @@ class BodyInversionTrainer:
             keys = section_keys[orientation]
             lateral_m = self.lateral_distance_m(keys)
             bodies = np.stack([trace_eval["bodies"][item] for item in keys])
-            lfm_values = np.stack([trace_eval["lfm"][item] for item in keys])
+            baselines = np.stack([trace_eval["baselines"][item] for item in keys])
             support = np.stack([trace_eval["supports"][item] for item in keys])
             body_plot = np.where(support, bodies, np.nan)
-            residual_plot = np.where(support, bodies - lfm_values, np.nan)
+            residual_plot = np.where(support, bodies - baselines, np.nan)
             vertical_support = np.any(support, axis=0)
             sample_indices = np.flatnonzero(vertical_support)
             if sample_indices.size < 2:
@@ -1289,7 +1314,6 @@ class BodyInversionTrainer:
         model_eval = self._trace_evaluation(model, self.data.spatial_split.validation_keys, center_visible=True)
         masked_eval = self._trace_evaluation(model, self.data.spatial_split.validation_keys, center_visible=False)
         wells = self._well_evaluation(model)
-        coordinates = torch.as_tensor(self.data.reader.sample_axis.values, device=self.device, dtype=torch.float32)
         short_wave_values: list[np.ndarray] = []
         support_counts: list[int] = []
         support_is_contiguous: list[bool] = []
@@ -1304,6 +1328,11 @@ class BodyInversionTrainer:
                 )
                 support_array = np.stack([model_eval["supports"][key] for key in local])
                 support = torch.as_tensor(support_array, device=self.device, dtype=torch.bool)
+                coordinates = torch.as_tensor(
+                    np.stack([model_eval["coordinates"][key] for key in local]),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
                 body_short_wave = short_wave_energy_ratio(
                     body,
                     coordinates,

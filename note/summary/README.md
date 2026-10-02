@@ -150,6 +150,9 @@ seismic + LFM
 | `20260809_structured_ginn_v2_real_field_zero_shot` | 真实高分辨率退化为 prior 纹理或带限结果 |
 | `20260810_well_prior_texture_and_decoder_failure` | 滤波给出尺度但不给地质体语义，body decoder 失败 |
 | `20260811_dynamic_gain_and_sparse_reflectivity` | Dynamic Gain 只增强可见性；高重褶积相关不等于真反射系数 |
+| `20261002_eif` | EIF 编码器重建、冻结小样本阻抗头、GRU 宽度与物理闭环实验冻结包 |
+| `20261002_smi_hybrid` | 物理主体与 SMI 高频差值混合的全体积结果、井点指标与配置快照 |
+| `20261002_ginn_curve` | 完整曲线平滑实验驱动与报告的本地历史快照；当前实现见 `ginn_v2` 原有训练推理管线 |
 
 `20260711_synthoseis_detail_diagnostic` 与 `20260715_depth_workflow_backup` 是历史数据/工作流
 快照，不作为独立科学结论入口。各项具体指标和图件以对应冻结目录中的 README 为准。

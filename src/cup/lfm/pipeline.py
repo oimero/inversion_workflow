@@ -856,6 +856,7 @@ def run_lfm_pipeline(
                     samples=context.output_geometry.samples,
                     source_seismic_file=source_seismic_file,
                     source_seismic_type=source_seismic_type,
+                    sample_domain=context.sample_axis.domain,
                     title=f"Unified LFM v3 linear AI: {variant_id}",
                     details=[
                         f"variant_id={variant_id}",

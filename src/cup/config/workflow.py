@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 
@@ -28,6 +29,18 @@ def deep_merge_dict(base: Mapping[str, Any], updates: Mapping[str, Any]) -> dict
         else:
             out[key] = value
     return out
+
+
+def load_workflow_config(path: str | Path, *, repo_root: Path) -> dict[str, Any]:
+    """Compose one local experiment overlay with its explicit workflow file."""
+    from cup.utils.io import load_yaml_config, resolve_relative_path
+
+    experiment = load_yaml_config(resolve_relative_path(path, root=repo_root))
+    common_path = str(experiment.get("workflow_config") or "").strip()
+    if not common_path:
+        return experiment
+    common = load_yaml_config(resolve_relative_path(common_path, root=repo_root))
+    return deep_merge_dict(common, {key: value for key, value in experiment.items() if key != "workflow_config"})
 
 
 def _mapping(value: Any, *, path: str) -> dict[str, Any]:

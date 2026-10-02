@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Callable, Mapping
 
 import torch
 from torch import Tensor
@@ -131,6 +131,44 @@ class DomainAdapter(ABC):
         synthetic = self.forward(body_log_ai, batch)
         return ForwardClosureResult(body_log_ai, synthetic, batch.observed_valid_mask)
 
+    def _forward_supported(
+        self,
+        body_log_ai: Tensor,
+        batch: CommonObservationBatch,
+        forward_segment: Callable[[int, int, int], Tensor],
+    ) -> Tensor:
+        """Forward each finite LFM/domain run without crossing support gaps."""
+
+        support = batch.lfm_valid_mask & torch.isfinite(body_log_ai)
+        velocity = batch.domain_extras.get("velocity_mps")
+        if velocity is not None:
+            if velocity.shape != body_log_ai.shape:
+                raise ValueError("velocity_mps must match body_log_ai when supplied.")
+            support &= torch.isfinite(velocity)
+        output = torch.zeros_like(body_log_ai)
+        for row in range(body_log_ai.shape[0]):
+            finite = support[row]
+            padded = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.bool, device=finite.device),
+                    finite,
+                    torch.zeros(1, dtype=torch.bool, device=finite.device),
+                )
+            )
+            changes = torch.nonzero(padded[1:] != padded[:-1], as_tuple=False).reshape(-1, 2)
+            for start, stop in changes.tolist():
+                if stop - start < 2:
+                    raise ValueError("Forward-model finite support contains a run shorter than two samples.")
+                segment = forward_segment(row, int(start), int(stop))
+                if segment.shape != body_log_ai[row, start:stop].shape:
+                    raise ValueError("Forward-model segment returned an unexpected shape.")
+                if not bool(torch.all(torch.isfinite(segment)).item()):
+                    raise ValueError("Forward-model segment contains non-finite values.")
+                output[row, start:stop] = segment
+        if not bool(torch.any(support).item()):
+            raise ValueError("Forward-model support is empty.")
+        return output
+
 
 class TimeDomainAdapter(DomainAdapter):
     sample_domain = "time"
@@ -157,10 +195,17 @@ class TimeDomainAdapter(DomainAdapter):
 
     def forward(self, body_log_ai: Tensor, batch: CommonObservationBatch) -> Tensor:
         self._require_domain(batch.sample_axis)
-        return forward_time(
+        wavelet_time = self.wavelet_time_s.to(device=body_log_ai.device, dtype=body_log_ai.dtype)
+        wavelet_amplitude = self.wavelet_amplitude.to(device=body_log_ai.device, dtype=body_log_ai.dtype)
+        return self._forward_supported(
             body_log_ai,
-            self.wavelet_time_s.to(device=body_log_ai.device, dtype=body_log_ai.dtype),
-            self.wavelet_amplitude.to(device=body_log_ai.device, dtype=body_log_ai.dtype),
+            batch,
+            lambda row, start, stop: forward_time(
+                body_log_ai[row, start:stop],
+                wavelet_time,
+                wavelet_amplitude,
+                sample_step_s=float(batch.sample_axis.step),
+            ),
         )
 
 
@@ -190,32 +235,19 @@ class DepthDomainAdapter(DomainAdapter):
             dtype=body_log_ai.dtype,
         )
         velocity = velocity.to(device=body_log_ai.device, dtype=body_log_ai.dtype)
-        output = torch.zeros_like(body_log_ai)
-        for row in range(body_log_ai.shape[0]):
-            finite = torch.isfinite(velocity[row])
-            padded = torch.cat(
-                (
-                    torch.zeros(1, dtype=torch.bool, device=finite.device),
-                    finite,
-                    torch.zeros(1, dtype=torch.bool, device=finite.device),
-                )
-            )
-            changes = torch.nonzero(padded[1:] != padded[:-1], as_tuple=False).reshape(-1, 2)
-            for start, stop in changes.tolist():
-                if not bool(finite[start].item()):
-                    continue
-                if stop - start < 2:
-                    raise ValueError("Depth adapter finite velocity support contains a run shorter than two samples.")
-                output[row, start:stop] = forward_depth(
-                    body_log_ai[row, start:stop],
-                    velocity[row, start:stop],
-                    depth[start:stop],
-                    self.wavelet_time_s.to(device=body_log_ai.device, dtype=body_log_ai.dtype),
-                    self.wavelet_amplitude.to(device=body_log_ai.device, dtype=body_log_ai.dtype),
-                )
-        if not bool(torch.any(torch.isfinite(velocity)).item()):
-            raise ValueError("Depth adapter velocity_mps has no finite support.")
-        return output
+        wavelet_time = self.wavelet_time_s.to(device=body_log_ai.device, dtype=body_log_ai.dtype)
+        wavelet_amplitude = self.wavelet_amplitude.to(device=body_log_ai.device, dtype=body_log_ai.dtype)
+        return self._forward_supported(
+            body_log_ai,
+            batch,
+            lambda row, start, stop: forward_depth(
+                body_log_ai[row, start:stop],
+                velocity[row, start:stop],
+                depth[start:stop],
+                wavelet_time,
+                wavelet_amplitude,
+            ),
+        )
 
 
 __all__ = [

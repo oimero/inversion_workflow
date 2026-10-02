@@ -19,12 +19,12 @@ import numpy as np
 import torch
 
 
-from cup.config.workflow import WorkflowConfig, deep_merge_dict
+from cup.config.workflow import WorkflowConfig, load_workflow_config
 from cup.lfm.math import parse_lowpass_spec
 from cup.physics.calibration import AIVelocityRelation
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.seismic.wavelet import load_wavelet_csv, validate_wavelet_normalization
-from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
+from cup.physics.execution import load_forward_inputs as load_physics_inputs
+from cup.utils.io import repo_relative_path, resolve_relative_path, write_json
 from cup.utils.logging import configure_run_logger
 from cup.well.controls import load_well_control_set
 from ginn_v2.physics import DepthDomainAdapter, TimeDomainAdapter
@@ -95,6 +95,7 @@ class LoadedBody:
             smoother=BodySmoother(
                 smoothing_fwhm_m=self.training_config.body_smoothing_fwhm_m,
             ),
+            lfm_lowpass_spec=self.lfm_lowpass_spec,
             device=next(self.model.parameters()).device,
             batch_size=resolved_batch_size,
         )
@@ -217,13 +218,7 @@ class _BodyOptions:
 
 
 def load_config(path: Path) -> dict[str, Any]:
-    experiment = load_yaml_config(path)
-    workflow_config = str(experiment.get("workflow_config") or "").strip()
-    if not workflow_config:
-        return experiment
-    common = load_yaml_config(resolve_relative_path(workflow_config, root=REPO_ROOT))
-    overlay = {key: value for key, value in experiment.items() if key != "workflow_config"}
-    return deep_merge_dict(common, overlay)
+    return load_workflow_config(path, repo_root=REPO_ROOT)
 
 
 def _required_input(stage_config: Mapping[str, Any], key: str, override: object) -> str:
@@ -240,33 +235,55 @@ def _required_input(stage_config: Mapping[str, Any], key: str, override: object)
 
 
 def load_forward_inputs(path: Path, *, domain: str, depth_basis: str | None) -> tuple[np.ndarray, np.ndarray, AIVelocityRelation | None, dict[str, Any]]:
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if payload.get("schema") != "forward_model_inputs_v3":
-        raise ValueError("Body inversion requires forward_model_inputs_v3.")
-    if payload.get("sample_domain") != domain or payload.get("depth_basis") != depth_basis:
-        raise ValueError("Frozen forward inputs do not match the seismic SampleAxis domain.")
-    wavelet_info = payload.get("wavelet")
-    if not isinstance(wavelet_info, Mapping):
-        raise ValueError("forward_model_inputs.wavelet must be a mapping.")
-    wavelet_path = resolve_relative_path(str(wavelet_info.get("path") or ""), root=REPO_ROOT)
-    time_s, amplitude = load_wavelet_csv(wavelet_path)
-    amplitude, qc = validate_wavelet_normalization(
-        time_s,
-        amplitude,
-        allow_small_renormalization=False,
+    return load_physics_inputs(path, repo_root=REPO_ROOT, domain=domain, depth_basis=depth_basis)
+
+
+def _domain_runtime(
+    raw: Mapping[str, Any], lfm: Any, sample_axis: Any,
+    wavelet_time_s: np.ndarray, wavelet_amplitude: np.ndarray,
+    relation: AIVelocityRelation | None,
+) -> tuple[DepthDomainAdapter | TimeDomainAdapter, dict[str, np.ndarray]]:
+    """Build the same frozen coordinate and forward inputs for train and infer."""
+
+    inputs = raw["ginn_v2_body_inversion"].get("inputs", {})
+    if not isinstance(inputs, Mapping):
+        raise ValueError("ginn_v2_body_inversion.inputs must be a mapping.")
+    velocity_path = inputs.get("velocity_volume")
+    if velocity_path is not None:
+        velocity = np.load(resolve_relative_path(velocity_path, root=REPO_ROOT), mmap_mode="r", allow_pickle=False)
+        if velocity.shape != lfm.log_ai.shape:
+            raise ValueError("velocity_volume must match the complete LFM volume shape.")
+        if np.any(~np.isfinite(velocity)) or np.any(velocity <= 0.0):
+            raise ValueError("velocity_volume must contain finite positive velocities in m/s.")
+    elif relation is not None:
+        if sample_axis.domain == "time" and np.any(~np.isfinite(lfm.log_ai)):
+            raise ValueError("Time metre coordinates require a complete velocity_volume when the LFM has gaps.")
+        velocity = np.full(lfm.log_ai.shape, np.nan, dtype=np.float64)
+        for start in range(0, lfm.log_ai.shape[0], 8):
+            valid = lfm.valid_mask[start:start + 8]
+            block = velocity[start:start + 8]
+            block[valid] = relation.velocity_from_ai(np.exp(lfm.log_ai[start:start + 8][valid].astype(np.float64)))
+        if sample_axis.domain == "time" and np.any(~np.isfinite(velocity)):
+            raise ValueError("Time metre coordinates require velocity over the complete sampling axis.")
+    else:
+        raise ValueError("Metre smoothing requires inputs.velocity_volume or a frozen ai_velocity_relation.")
+    adapter_type = DepthDomainAdapter if sample_axis.domain == "depth" else TimeDomainAdapter
+    adapter = adapter_type(
+        torch.as_tensor(wavelet_time_s, dtype=torch.float32),
+        torch.as_tensor(wavelet_amplitude, dtype=torch.float32),
     )
-    if qc.status != "ok":
-        raise ValueError(f"Frozen wavelet failed normalization QC: {qc.reasons}")
-    relation = None
-    if domain == "depth":
-        relation_info = payload.get("ai_velocity_relation")
-        if not isinstance(relation_info, Mapping):
-            raise ValueError("Depth forward inputs must contain ai_velocity_relation.")
-        relation = AIVelocityRelation.from_mapping(relation_info)
-    return time_s, amplitude, relation, payload
+    return adapter, {"velocity_mps": velocity}
+
+
+def _require_matching_axes(sample_axis: Any, *other_axes: Any) -> None:
+    """Compare coordinate values together with their sampling-domain meaning."""
+    for other in other_axes:
+        if (
+            (sample_axis.domain, sample_axis.unit, sample_axis.depth_basis)
+            != (other.domain, other.unit, other.depth_basis)
+            or not np.array_equal(sample_axis.values, other.values)
+        ):
+            raise ValueError("Body workflow SampleAxis domain, unit, depth basis and values must match.")
 
 
 def _resolve_output_dir(value: Path | None, workflow: WorkflowConfig) -> Path:
@@ -321,6 +338,7 @@ def _write_review_package(trainer: BodyInversionTrainer, model: CenterTraceBodyN
     blind_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
     well_rows: dict[str, dict[int, list[float]]] = {}
+    well_baselines: dict[str, dict[int, list[float]]] = {}
     well_targets: dict[str, dict[int, float]] = {}
     well_patch_keys: dict[str, dict[int, Any]] = {}
     with torch.no_grad():
@@ -332,12 +350,15 @@ def _write_review_package(trainer: BodyInversionTrainer, model: CenterTraceBodyN
                 center_visible=True,
                 device=trainer.device,
             )
-            body, _, _ = trainer._predict(model, batch)
+            body, _, _, baseline = trainer._predict(model, batch)
             for row, item in enumerate(local):
                 for sample_index in np.flatnonzero(item.target_mask):
                     index = int(sample_index)
                     well_rows.setdefault(item.well_name, {}).setdefault(index, []).append(
                         float(body[row, index].cpu())
+                    )
+                    well_baselines.setdefault(item.well_name, {}).setdefault(index, []).append(
+                        float(baseline[row, index].cpu())
                     )
                     well_targets.setdefault(item.well_name, {})[index] = float(item.target_values[index])
                     well_patch_keys.setdefault(item.well_name, {}).setdefault(index, item.patch_key)
@@ -359,6 +380,8 @@ def _write_review_package(trainer: BodyInversionTrainer, model: CenterTraceBodyN
         current_axis.plot(target, axis_values[indices], label="well body target")
         current_axis.plot(predicted, axis_values[indices], label="GINN body")
         current_axis.plot(lfm, axis_values[indices], label="LFM")
+        current_axis.plot([np.mean(well_baselines[name][index]) for index in indices], axis_values[indices],
+                          label="smoothed initial model", linestyle="--")
         current_axis.set_title(name)
         current_axis.set_xlabel("log-AI")
         current_axis.set_ylabel(trainer.data.reader.sample_axis.unit)
@@ -380,10 +403,10 @@ def _write_review_package(trainer: BodyInversionTrainer, model: CenterTraceBodyN
         keys = section_keys[orientation]
         lateral_m = trainer.lateral_distance_m(keys)
         values = np.stack([trace_eval["bodies"][item] for item in keys])
-        lfm_values = np.stack([trace_eval["lfm"][item] for item in keys])
+        baseline_values = np.stack([trace_eval["baselines"][item] for item in keys])
         support = np.stack([trace_eval["supports"][item] for item in keys])
         values = np.where(support, values, np.nan)
-        residual = np.where(support, values - lfm_values, np.nan)
+        residual = np.where(support, values - baseline_values, np.nan)
         vertical_support = np.any(support, axis=0)
         sample_indices = np.flatnonzero(vertical_support)
         if sample_indices.size < 2:
@@ -395,7 +418,7 @@ def _write_review_package(trainer: BodyInversionTrainer, model: CenterTraceBodyN
         axes[0].set_title(f"Blind validation section — {orientation}")
         axes[0].set_ylabel(trainer.data.reader.sample_axis.unit)
         axes[1].imshow(residual[:, sample_start : sample_stop + 1].T, aspect="auto", origin="upper", extent=extent, cmap="RdBu_r")
-        axes[1].set_title("GINN body minus LFM")
+        axes[1].set_title("GINN body minus smoothed initial model")
         axes[1].set_xlabel("lateral distance (m)")
         axes[1].set_ylabel(trainer.data.reader.sample_axis.unit)
         figure.tight_layout()
@@ -482,8 +505,7 @@ def train_body(
     survey_options = segy_options_from_config(workflow.seismic.as_dict()) if workflow.seismic.type == "segy" else {}
     survey = open_survey(seismic_path, workflow.seismic.type, segy_options=survey_options or None)
     sample_axis = survey.sample_axis(workflow.seismic.domain)
-    if not np.array_equal(sample_axis.values, lfm.sample_axis.values) or not np.array_equal(sample_axis.values, controls.sample_axis.values):
-        raise ValueError("Body-inversion seismic, LFM, and WellControlSet SampleAxis values differ.")
+    _require_matching_axes(sample_axis, lfm.sample_axis, controls.sample_axis)
     if lfm.log_ai.ndim != 3:
         raise ValueError("Body inversion requires a volume LFM variant, not a section variant.")
     if lfm.log_ai.shape != (survey.line_geometry.inline_axis.count, survey.line_geometry.xline_axis.count, sample_axis.values.size):
@@ -499,23 +521,9 @@ def train_body(
         domain=workflow.seismic.domain,
         depth_basis=workflow.seismic.depth_basis,
     )
-    domain_extras: dict[str, np.ndarray] = {}
-    if workflow.seismic.domain == "depth":
-        if relation is None:
-            raise ValueError("Depth body inversion requires a frozen AI--Vp relation.")
-        valid = np.asarray(lfm.valid_mask, dtype=bool)
-        velocity = np.full(lfm.log_ai.shape, np.nan, dtype=np.float64)
-        velocity[valid] = relation.velocity_from_ai(np.exp(np.asarray(lfm.log_ai[valid], dtype=np.float64)))
-        domain_extras["velocity_mps"] = velocity
-        adapter = DepthDomainAdapter(
-            torch.as_tensor(wavelet_time_s, dtype=torch.float32),
-            torch.as_tensor(wavelet_amplitude, dtype=torch.float32),
-        )
-    else:
-        adapter = TimeDomainAdapter(
-            torch.as_tensor(wavelet_time_s, dtype=torch.float32),
-            torch.as_tensor(wavelet_amplitude, dtype=torch.float32),
-        )
+    adapter, domain_extras = _domain_runtime(
+        raw, lfm, sample_axis, wavelet_time_s, wavelet_amplitude, relation,
+    )
     normalization = fit_lfm_normalization(lfm.log_ai, lfm.valid_mask, geometry=survey.line_geometry)
     source = SurveyTraceSource(survey=survey, sample_axis=sample_axis, geometry=survey.line_geometry)
     reader = PatchReader(
@@ -590,7 +598,9 @@ def train_body(
             "sample_axis": sample_axis.describe(),
             "depth_basis": workflow.seismic.depth_basis,
             "body_smoothing_fwhm_m": config.body_smoothing_fwhm_m,
-            "prediction_definition": "gaussian_smooth(log_ai_initial + raw_network_correction)",
+            "prediction_definition": "b0 + (I - L)(gaussian_smooth(initial + correction) - b0); b0 = gaussian_smooth(initial)",
+            "lfm_anchor_weight": config.loss_weights.lfm_anchor,
+            "low_frequency_baseline": "gaussian_smooth(initial)",
             "well_target_definition": "native_filtered_log_ai resampled then gaussian_smooth once",
             "seismic_objective": "normalized waveform shape",
             "seismic_feature": {
@@ -776,8 +786,7 @@ def load_body(
         segy_options=survey_options or None,
     )
     sample_axis = survey.sample_axis(workflow.seismic.domain)
-    if not np.array_equal(sample_axis.values, lfm.sample_axis.values):
-        raise ValueError("Seismic and LFM SampleAxis values differ.")
+    _require_matching_axes(sample_axis, lfm.sample_axis)
     baseline = dict(lfm.variant.variant_metadata.get("resolved_baseline_config") or {})
     lowpass = parse_lowpass_spec(dict(baseline.get("filter") or {}), sample_axis)
     wavelet_time_s, wavelet_amplitude, relation, _payload = load_forward_inputs(
@@ -785,26 +794,9 @@ def load_body(
         domain=workflow.seismic.domain,
         depth_basis=workflow.seismic.depth_basis,
     )
-    adapter: DepthDomainAdapter | TimeDomainAdapter
-    domain_extras: dict[str, np.ndarray] = {}
-    if workflow.seismic.domain == "depth":
-        if relation is None:
-            raise ValueError("Depth inference requires the frozen AI--Vp relation.")
-        velocity = np.full(lfm.log_ai.shape, np.nan, dtype=np.float64)
-        for start in range(0, lfm.log_ai.shape[0], 8):
-            valid = lfm.valid_mask[start:start + 8]
-            block = velocity[start:start + 8]
-            block[valid] = relation.velocity_from_ai(np.exp(lfm.log_ai[start:start + 8][valid].astype(np.float64)))
-        domain_extras["velocity_mps"] = velocity
-        adapter = DepthDomainAdapter(
-            torch.as_tensor(wavelet_time_s, dtype=torch.float32),
-            torch.as_tensor(wavelet_amplitude, dtype=torch.float32),
-        )
-    else:
-        adapter = TimeDomainAdapter(
-            torch.as_tensor(wavelet_time_s, dtype=torch.float32),
-            torch.as_tensor(wavelet_amplitude, dtype=torch.float32),
-        )
+    adapter, domain_extras = _domain_runtime(
+        raw, lfm, sample_axis, wavelet_time_s, wavelet_amplitude, relation,
+    )
     normalization = fit_lfm_normalization(
         lfm.log_ai,
         lfm.valid_mask,

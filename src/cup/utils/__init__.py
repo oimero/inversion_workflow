@@ -1,1 +1,1 @@
-"""cup.utils: shared I/O, coercion, config, and statistics utilities."""
+"""cup.utils: shared I/O, Petrel adapters, coercion, and statistics utilities."""

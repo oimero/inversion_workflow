@@ -14,6 +14,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from cup.physics.execution import load_forward_inputs
 from cup.physics.numpy_backend import forward_depth, reflectivity_from_log_ai
 from cup.seismic.geometry import SampleAxis, SurveyLineGeometry
 from cup.seismic.target_zone import TargetZone
@@ -1173,32 +1174,15 @@ def load_depth_forward_inputs(
     repo_root: Path,
 ) -> tuple[np.ndarray, np.ndarray, float, float, Path]:
     path = run_dir / "forward_model_inputs.json"
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if (
-        payload.get("schema") != "forward_model_inputs_v3"
-        or payload.get("sample_domain") != "depth"
-        or payload.get("depth_basis") != "tvdss"
-    ):
-        raise ValueError("Step 6 depth QC requires TVDSS forward_model_inputs_v3.")
-    wavelet_path = resolve_relative_path(str(payload["wavelet"]["path"]), root=repo_root)
-    if not wavelet_path.is_file():
-        raise FileNotFoundError(wavelet_path)
-    frame = pd.read_csv(wavelet_path)
-    if set(frame.columns) != {"time_s", "amplitude"}:
-        raise ValueError(f"Unexpected wavelet columns: {wavelet_path}")
-    time_s = frame["time_s"].to_numpy(dtype=np.float64)
-    amplitude = frame["amplitude"].to_numpy(dtype=np.float64)
-    relation = dict(payload["ai_velocity_relation"])
-    if relation.get("formula") != "AI = a * Vp + b":
-        raise ValueError("Unsupported AI-Vp relation in depth forward inputs.")
-    a = float(relation["a"])
-    b = float(relation["b"])
-    if not np.isfinite(a) or a <= 0.0 or not np.isfinite(b):
-        raise ValueError("AI-Vp relation coefficients are invalid.")
-    return time_s, amplitude, a, b, path
+    time_s, amplitude, relation, _payload = load_forward_inputs(
+        path,
+        repo_root=repo_root,
+        domain="depth",
+        depth_basis="tvdss",
+    )
+    if relation is None:
+        raise ValueError("Depth forward inputs must contain ai_velocity_relation.")
+    return time_s, amplitude, relation.a, relation.b, path
 
 
 def forward_depth_finite_runs(
@@ -1341,8 +1325,8 @@ def _dynamic_xcorr(
     return grid.DynamicXCorr(
         np.asarray(rows, dtype=np.float64),
         np.asarray(real.basis, dtype=np.float64),
-        "tvdss",
-        name="Local lag [m]",
+        "twt" if real.is_twt else "tvdss",
+        name="Local lag [s]" if real.is_twt else "Local lag [m]",
     )
 
 
@@ -1354,11 +1338,17 @@ def _waveform_objects(
     real: np.ndarray,
     dynamic_window_m: float,
     name: str,
+    basis_type: str = "tvdss",
+    dynamic_window_axis_units: float | None = None,
 ) -> tuple[grid.Log, grid.Log, grid.Seismic, grid.Seismic, grid.XCorr, grid.DynamicXCorr]:
+    if basis_type not in {"twt", "tvdss"}:
+        raise ValueError("Waveform objects require an explicit TWT or TVDSS basis.")
+    if basis_type == "twt" and dynamic_window_axis_units is None:
+        raise ValueError("Time waveform objects require the dynamic correlation window in seconds.")
     linear_ai = grid.Log(
         np.exp(log_ai),
         axis,
-        "tvdss",
+        basis_type,
         name=name,
         unit="m/s*g/cm3",
     )
@@ -1366,18 +1356,18 @@ def _waveform_objects(
     reflectivity = grid.Log(
         reflectivity_values,
         axis,
-        "tvdss",
+        basis_type,
         name="Reflectivity",
     )
-    synthetic_trace = grid.Seismic(synthetic, axis, "tvdss", name="Synthetic")
-    real_trace = grid.Seismic(real, axis, "tvdss", name="Seismic")
+    synthetic_trace = grid.Seismic(synthetic, axis, basis_type, name="Synthetic")
+    real_trace = grid.Seismic(real, axis, basis_type, name="Seismic")
     xcorr_values = normalized_xcorr(real, synthetic)
     lags = float(axis[1] - axis[0]) * np.arange(-(axis.size - 1), axis.size)
-    xcorr = grid.XCorr(xcorr_values, lags, "zlag", name="XCorr")
+    xcorr = grid.XCorr(xcorr_values, lags, "tlag" if basis_type == "twt" else "zlag", name="XCorr")
     dynamic = _dynamic_xcorr(
         real_trace,
         synthetic_trace,
-        window_axis_units=dynamic_window_m,
+        window_axis_units=dynamic_window_m if dynamic_window_axis_units is None else dynamic_window_axis_units,
     )
     return linear_ai, reflectivity, synthetic_trace, real_trace, xcorr, dynamic
 

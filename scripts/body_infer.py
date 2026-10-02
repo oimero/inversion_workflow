@@ -262,6 +262,7 @@ def main() -> None:
             samples=sample_axis.values,
             source_seismic_file=seismic_path,
             source_seismic_type=workflow.seismic.type,
+            sample_domain=sample_axis.domain,
             title="GINN V2 body-scale linear AI",
             details=[
                 f"checkpoint={repo_relative_path(checkpoint, root=REPO_ROOT)}",
@@ -286,6 +287,7 @@ def main() -> None:
                 samples=sample_axis.values,
                 source_seismic_file=seismic_path,
                 source_seismic_type=workflow.seismic.type,
+                sample_domain=sample_axis.domain,
                 title="GINN V2 body increment relative to LFM",
                 details=["unit=log-AI", "orientation_fusion=equal_mean"],
                 seismic_options=workflow.seismic.as_dict(),
@@ -300,6 +302,7 @@ def main() -> None:
                 samples=sample_axis.values,
                 source_seismic_file=seismic_path,
                 source_seismic_type=workflow.seismic.type,
+                sample_domain=sample_axis.domain,
                 title="GINN V2 inline-xline disagreement",
                 details=["unit=absolute log-AI difference"],
                 seismic_options=workflow.seismic.as_dict(),

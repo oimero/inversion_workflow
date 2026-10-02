@@ -47,6 +47,7 @@ def export_volume_like_source(
     samples: Sequence[float],
     source_seismic_file: Path,
     source_seismic_type: str,
+    sample_domain: str,
     title: str,
     details: Sequence[str] | None = None,
     seismic_options: Mapping[str, Any] | None = None,
@@ -62,15 +63,22 @@ def export_volume_like_source(
     volume:
         Regular volume with shape ``[n_inline, n_xline, n_sample]``.
     ilines, xlines, samples:
-        Explicit physical axes.  ``samples`` is in seconds for time-domain ZGY
-        and is passed through as sample coordinates for SEG-Y header sharing.
+        Explicit physical axes.  ``samples`` is in seconds for the time domain
+        and metres for the depth domain.
     source_seismic_file, source_seismic_type:
         Source seismic used for geometry/header provenance.
+    sample_domain:
+        Explicit sample domain, either ``"time"`` or ``"depth"``.  It is
+        required for both output formats so ZGY header units cannot be inferred
+        from the file type.
     nan_fill:
         Optional replacement for non-finite samples.  ``None`` preserves NaN.
     """
 
     source_type = str(source_seismic_type).casefold()
+    domain = str(sample_domain).strip().casefold()
+    if domain not in {"time", "depth"}:
+        raise ValueError("sample_domain must be 'time' or 'depth'.")
     output_base = Path(output_base)
     if source_type == "zgy":
         target = output_base.with_suffix(".zgy")
@@ -80,6 +88,7 @@ def export_volume_like_source(
             ilines=ilines,
             xlines=xlines,
             samples=samples,
+            sample_domain=domain,
             source_seismic_file=Path(source_seismic_file),
             inline_chunk_size=int(inline_chunk_size),
             nan_fill=nan_fill,
@@ -175,11 +184,12 @@ def _write_zgy(
     ilines: Sequence[float],
     xlines: Sequence[float],
     samples: Sequence[float],
+    sample_domain: str,
     source_seismic_file: Path,
     inline_chunk_size: int,
     nan_fill: float | None,
 ) -> None:
-    from pyzgy.write import SeismicWriter
+    from openzgy.api import SampleDataType, UnitDimension, ZgyWriter
 
     export_volume = _prepared_volume(volume, nan_fill=nan_fill)
     il_axis, xl_axis, sample_axis = _validate_axes(
@@ -188,9 +198,15 @@ def _write_zgy(
         xlines=xlines,
         samples=samples,
     )
-    sample_step_s = _axis_step(sample_axis, name="samples")
+    sample_step = _axis_step(sample_axis, name="samples")
     inline_inc = _axis_step(il_axis, name="ilines") if il_axis.size > 1 else 0.0
     xline_inc = _axis_step(xl_axis, name="xlines") if xl_axis.size > 1 else 0.0
+    unit_dimension, unit_name, unit_factor = {
+        "time": (UnitDimension.time, "ms", 0.001),
+        "depth": (UnitDimension.length, "m", 1.0),
+    }.get(sample_domain, (None, None, None))
+    if unit_dimension is None:
+        raise ValueError("sample_domain must be 'time' or 'depth'.")
     survey = open_survey(source_seismic_file, seismic_type="zgy")
     corners = _zgy_corners_from_survey(survey, il_axis, xl_axis)
 
@@ -198,18 +214,22 @@ def _write_zgy(
     if path.exists():
         path.unlink()
     chunk = max(1, int(inline_chunk_size))
-    with SeismicWriter(
-        path,
-        tuple(int(v) for v in export_volume.shape),
-        float(sample_axis[0]) * 1000.0,
-        sample_step_s * 1000.0,
-        (float(il_axis[0]), float(xl_axis[0])),
-        (inline_inc, xline_inc),
+    with ZgyWriter(
+        str(path),
+        size=tuple(int(v) for v in export_volume.shape),
+        datatype=SampleDataType.float,
+        zunitdim=unit_dimension,
+        zunitname=unit_name,
+        zunitfactor=unit_factor,
+        zstart=float(sample_axis[0]) * (1000.0 if sample_domain == "time" else 1.0),
+        zinc=sample_step * (1000.0 if sample_domain == "time" else 1.0),
+        annotstart=(float(il_axis[0]), float(xl_axis[0])),
+        annotinc=(inline_inc, xline_inc),
         corners=corners,
     ) as writer:
         for il_start in range(0, export_volume.shape[0], chunk):
             il_end = min(export_volume.shape[0], il_start + chunk)
-            writer.write_subvolume(export_volume[il_start:il_end], il_start, 0, 0)
+            writer.write((il_start, 0, 0), export_volume[il_start:il_end])
 
 
 def _write_segy(

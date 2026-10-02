@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from cup.impedance import canonical_lowpass, validate_increment_contract
+from cup.physics import canonical_lowpass, validate_increment_contract
 from cup.synthetic.core.random import RandomNamespace
 from cup.synthetic.core.rejections import BenchmarkBuildRejected
 from cup.utils.statistics import centered_rms

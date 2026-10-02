@@ -1132,7 +1132,7 @@ def main() -> None:
 
     # ── Load shared resources ──
 
-    from cup.petrel.load import import_well_heads_petrel
+    from cup.utils.petrel import import_well_heads_petrel
     from cup.seismic.survey import open_survey
     from wtie.modeling.modeling import ConvModeler
 

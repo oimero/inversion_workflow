@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from cup.impedance import generation_contract
+from cup.physics import generation_contract
 from cup.synthetic.core.calibration import ImpedanceCalibration
 from cup.synthetic.core.lfm import LfmPolicy
 from cup.synthetic.core.random import RandomNamespace

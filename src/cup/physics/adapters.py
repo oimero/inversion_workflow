@@ -46,7 +46,12 @@ def forward_time_log(
 
     _require_trace(log_ai, name="log_ai")
     _require_basis(log_ai, name="log_ai", expected="twt")
-    values = forward_time(log_ai.values, wavelet_time_s, wavelet_amp)
+    values = forward_time(
+        log_ai.values,
+        wavelet_time_s,
+        wavelet_amp,
+        sample_step_s=float(log_ai.sampling_rate),
+    )
     basis = np.asarray(log_ai.basis)
     if basis.size < 2:
         raise ValueError("grid time adapter requires at least three log_ai samples.")

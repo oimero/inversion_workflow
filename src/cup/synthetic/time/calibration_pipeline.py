@@ -10,7 +10,7 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from cup.petrel.load import import_interpretation_petrel, import_well_tops_petrel
+from cup.utils.petrel import import_interpretation_petrel, import_well_tops_petrel
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.wavelet import infer_wavelet_dt, load_wavelet_csv

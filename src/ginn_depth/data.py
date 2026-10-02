@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from cup.petrel.load import import_interpretation_petrel, import_seismic
+from cup.utils.petrel import import_interpretation_petrel, import_seismic
 from cup.seismic.spatial import build_trace_xy_grids
 from cup.seismic.survey import open_survey
 from cup.seismic.target_layer import TargetLayer

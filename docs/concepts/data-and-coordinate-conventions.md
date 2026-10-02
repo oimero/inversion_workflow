@@ -8,7 +8,7 @@
 
 ## 井头、井分层、地震解释层位
 
-- Petrel 井头、井分层、地震解释层位读取入口：`cup.petrel.load.import_well_heads_petrel()`、`import_well_tops_petrel()`、`import_interpretation_petrel()`。
+- Petrel 井头、井分层、地震解释层位读取入口：`cup.utils.petrel.import_well_heads_petrel()`、`import_well_tops_petrel()`、`import_interpretation_petrel()`。
 
 ## 井名
 
@@ -61,7 +61,7 @@
 
 - 井旁道读取入口：`cup.seismic.survey.open_survey()`。
     - 返回 `SurveyContext`，用 `survey.read_trace_at_xy(x, y, domain="time" | "depth")` 读取井旁道。
-    - `cup.petrel.load.import_seismic()` 是整块 3D 数组读取入口，不属于当前稳定脚本链；井震标定和井位采样不要用它取井旁道。
+    - `cup.utils.petrel.import_seismic()` 是整块 3D 数组读取入口，不属于当前稳定脚本链；井震标定和井位采样不要用它取井旁道。
 - 工区几何入口：`survey.line_geometry`，类型为 `cup.seismic.geometry.SurveyLineGeometry`。
 - `geometry["inline_step"]` / `geometry["xline_step"]` 是线号步长，不是 XY 米制间距。物理距离必须通过 `SurveyLineGeometry.line_to_coord()` 或已构建的 XY 网格计算。
 - 最近道吸附公式：`line_min + round((line_float - line_min) / line_step) * line_step`。

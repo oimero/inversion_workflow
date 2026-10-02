@@ -243,6 +243,46 @@ def masked_lfm_lowpass(
     return output, valid
 
 
+def lfm_anchor_loss(
+    body_log_ai: Tensor,
+    baseline_log_ai: Tensor,
+    support_mask: Tensor,
+    *,
+    sample_step: float,
+    lowpass_spec: LowpassSpec,
+) -> Tensor:
+    """Softly anchor the final body's LFM increment to the smoothed baseline.
+
+    The body constructor removes ``L`` from the high-frequency correction, but
+    the remaining low-frequency increment is still constrained explicitly.
+    This loss applies the same upstream ``L`` operator to ``body - b0`` and
+    uses a zero target with Smooth-L1 distance.
+    """
+
+    if body_log_ai.ndim != 2 or not torch.is_floating_point(body_log_ai):
+        raise ValueError("body_log_ai must be a floating (batch, samples) tensor.")
+    if baseline_log_ai.shape != body_log_ai.shape or not torch.is_floating_point(baseline_log_ai):
+        raise ValueError("baseline_log_ai must be a floating tensor matching body_log_ai.")
+    if support_mask.shape != body_log_ai.shape or support_mask.dtype != torch.bool:
+        raise ValueError("support_mask must be boolean and match body_log_ai.")
+    if not bool(torch.all(torch.isfinite(body_log_ai)).item()) or not bool(
+        torch.all(torch.isfinite(baseline_log_ai)).item()
+    ):
+        raise ValueError("body_log_ai and baseline_log_ai must contain only finite values.")
+    if not lowpass_spec.enabled:
+        return torch.zeros((), dtype=body_log_ai.dtype, device=body_log_ai.device)
+    low_frequency, low_support = masked_lfm_lowpass(
+        body_log_ai - baseline_log_ai,
+        support_mask,
+        sample_step=sample_step,
+        spec=lowpass_spec,
+    )
+    support = support_mask & low_support
+    if not bool(torch.any(support).item()):
+        raise ValueError("LFM anchor has no valid support.")
+    return F.smooth_l1_loss(low_frequency[support], torch.zeros_like(low_frequency[support]), reduction="mean")
+
+
 def short_wave_energy_ratio(
     values: Tensor,
     coordinates_m: Tensor,
@@ -365,6 +405,7 @@ def local_standard_deviation(
 
 __all__ = [
     "ShapeLossResult",
+    "lfm_anchor_loss",
     "local_standard_deviation",
     "masked_lfm_lowpass",
     "masked_physical_lowpass",

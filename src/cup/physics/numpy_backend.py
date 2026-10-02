@@ -147,10 +147,19 @@ def forward_time(
     log_ai: Any,
     wavelet_time_s: Any,
     wavelet_amp: Any,
+    *,
+    sample_step_s: float | None = None,
 ) -> np.ndarray:
-    """Apply Robinson forward modeling and return ``N`` input-sample values."""
+    """Apply Robinson forward modeling on an explicitly sampled time axis."""
     values = _validate_log_ai(log_ai)
-    _, amplitude = _validate_wavelet(wavelet_time_s, wavelet_amp)
+    wavelet_time, amplitude = _validate_wavelet(wavelet_time_s, wavelet_amp)
+    if sample_step_s is not None:
+        step = float(sample_step_s)
+        if not np.isfinite(step) or step <= 0.0:
+            raise ValueError("sample_step_s must be finite and positive.")
+        wavelet_step = float(wavelet_time[1] - wavelet_time[0])
+        if not np.isclose(wavelet_step, step, rtol=1.0e-6, atol=max(1.0e-12, abs(step) * 1.0e-6)):
+            raise ValueError("wavelet sample spacing differs from the seismic sample_step_s.")
     reflectivity = reflectivity_from_log_ai(values)
     return _convolve_sample_aligned(reflectivity, amplitude)
 

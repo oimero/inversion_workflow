@@ -144,10 +144,32 @@ def forward_time(
     log_ai: Any,
     wavelet_time_s: Any,
     wavelet_amp: Any,
+    *,
+    sample_step_s: float | None = None,
 ) -> Tensor:
-    """Apply Robinson forward modeling and return ``N`` input-sample values."""
+    """Apply Robinson forward modeling on an explicitly sampled time axis.
+
+    ``sample_step_s`` is optional for low-level callers without an axis.  When
+    supplied, it is checked against the wavelet spacing so a wavelet cannot be
+    silently interpreted with the wrong seismic sampling interval.
+    """
     values = _validate_log_ai(log_ai)
-    _, amplitude = _validate_wavelet(wavelet_time_s, wavelet_amp)
+    wavelet_time, amplitude = _validate_wavelet(wavelet_time_s, wavelet_amp)
+    if sample_step_s is not None:
+        step = float(sample_step_s)
+        if not math.isfinite(step) or step <= 0.0:
+            raise ValueError("sample_step_s must be finite and positive.")
+        wavelet_step = wavelet_time[1] - wavelet_time[0]
+        tolerance = max(1.0e-12, abs(step) * 1.0e-6)
+        if not torch.allclose(
+            wavelet_step,
+            torch.as_tensor(step, device=wavelet_step.device, dtype=wavelet_step.dtype),
+            rtol=1.0e-6,
+            atol=tolerance,
+        ):
+            raise ValueError(
+                "wavelet sample spacing differs from the seismic sample_step_s."
+            )
     dtype = _promoted_dtype(values, amplitude)
     values_cast = values.to(dtype=dtype)
     amplitude_cast = amplitude.to(device=values.device, dtype=dtype)

@@ -91,9 +91,6 @@ def write_well_waveform_qc(
 
     import matplotlib.pyplot as plt
 
-    if trainer.data.reader.sample_axis.domain != "depth" or trainer.data.reader.sample_axis.depth_basis != "tvdss":
-        raise ValueError("GINN V2 well waveform QC currently requires a depth/TVDSS SampleAxis.")
-
     predictions: dict[str, dict[int, dict[str, list[float] | dict[str, list[float]]]]] = {}
     with torch.no_grad():
         items = trainer.data.trusted_well_patches
@@ -104,7 +101,7 @@ def write_well_waveform_qc(
                 center_visible=True,
                 device=trainer.device,
             )
-            body, _synthetic, common = trainer._predict(model, batch)
+            body, _synthetic, common, _baseline = trainer._predict(model, batch)
             for row, item in enumerate(local):
                 observed = batch.observed_seismic[row].cpu().numpy()
                 observed_mask = common.observed_valid_mask[row].cpu().numpy()
@@ -227,6 +224,18 @@ def write_well_waveform_qc(
         if not np.isfinite(correlation):
             raise ValueError(f"{well_name}: predicted well waveform correlation is non-finite.")
 
+        common = CommonObservationBatch(
+            sample_axis=local_sample_axis,
+            observed_seismic=torch.as_tensor(observed, dtype=torch.float64)[None, :],
+            observed_valid_mask=torch.ones((1, indices.size), dtype=torch.bool),
+            lfm_log_ai=torch.as_tensor(lfm_values, dtype=torch.float64)[None, :],
+            lfm_valid_mask=torch.ones((1, indices.size), dtype=torch.bool),
+            xy_m=torch.as_tensor(xy_m, dtype=torch.float64)[None, :],
+            domain_extras={name: torch.as_tensor(value, dtype=torch.float64)[None, :] for name, value in domain_extras.items()},
+        )
+        physical_coordinates = trainer.adapter.vertical_coordinates_m(common).cpu().numpy().reshape(-1)
+        window_axis_units = float(trainer.config.waveform_qc_dynamic_window_m) * float(np.median(np.diff(local_axis))) / float(np.median(np.diff(physical_coordinates)))
+        basis_type = "twt" if local_sample_axis.domain == "time" else "tvdss"
         predicted_objects = _waveform_objects(
             axis=local_axis,
             log_ai=predicted_log_ai,
@@ -234,11 +243,13 @@ def write_well_waveform_qc(
             real=observed_normalized,
             dynamic_window_m=float(trainer.config.waveform_qc_dynamic_window_m),
             name="GINN V2 predicted body",
+            basis_type=basis_type,
+            dynamic_window_axis_units=window_axis_units,
         )
         body_reference = grid.Log(
             np.exp(reference_log_ai),
             local_axis,
-            "tvdss",
+            basis_type,
             name=f"{trainer.config.body_smoothing_fwhm_m:g} m body reference",
             unit="m/s*g/cm3",
         )
@@ -278,8 +289,10 @@ def write_well_waveform_qc(
         rows.append(
             {
                 "well_name": well_name,
-                "support_start_m": float(local_axis[0]),
-                "support_stop_m": float(local_axis[-1]),
+                "sample_domain": local_sample_axis.domain,
+                "sample_unit": local_sample_axis.unit,
+                "support_start": float(local_axis[0]),
+                "support_stop": float(local_axis[-1]),
                 "support_samples": int(indices.size),
                 "well_curve_forward_corr": correlation,
                 "predicted_vs_body_rmse_log_ai": float(np.sqrt(np.mean(np.square(body_residual)))),

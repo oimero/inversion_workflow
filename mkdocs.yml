@@ -69,7 +69,6 @@ nav:
           - cup.config: api/cup/config.md
           - cup.lfm: api/cup/lfm.md
           - cup.physics: api/cup/physics.md
-          - cup.petrel: api/cup/petrel.md
           - cup.seismic: api/cup/seismic.md
           - cup.well: api/cup/well.md
           - cup.utils: api/cup/utils.md

@@ -5,3 +5,5 @@
 ::: cup.utils.coerce
 
 ::: cup.utils.statistics
+
+::: cup.utils.petrel

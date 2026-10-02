@@ -16,14 +16,17 @@ from cup.utils.io import resolve_relative_path
 
 
 def load_forward_inputs(
-    path: Path,
+    run_dir: Path,
     *,
     repo_root: Path,
     domain: str,
     depth_basis: str | None,
 ) -> tuple[np.ndarray, np.ndarray, AIVelocityRelation | None, dict[str, Any]]:
-    """Load and strictly validate one frozen forward-model input artifact."""
-    path = Path(path)
+    """Read ``forward_model_inputs.json`` from a forward-input run directory."""
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        raise NotADirectoryError(run_dir)
+    path = run_dir / "forward_model_inputs.json"
     if not path.is_file():
         raise FileNotFoundError(path)
     with path.open("r", encoding="utf-8") as handle:

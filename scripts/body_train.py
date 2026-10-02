@@ -24,7 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lfm-run-dir", type=Path, default=None)
     parser.add_argument("--variant-id", type=str, default=None)
     parser.add_argument("--well-control-run-dir", type=Path, default=None)
-    parser.add_argument("--forward-model-inputs", type=Path, default=None)
+    parser.add_argument("--forward-model-inputs-run-dir", type=Path, default=None,
+                        help="Forward-input run directory containing forward_model_inputs.json.")
     return parser.parse_args()
 
 
@@ -38,7 +39,7 @@ def main() -> None:
         lfm_run_dir=args.lfm_run_dir,
         variant_id=args.variant_id,
         well_control_run_dir=args.well_control_run_dir,
-        forward_model_inputs=args.forward_model_inputs,
+        forward_model_inputs_run_dir=args.forward_model_inputs_run_dir,
     )
     print("=== GINN v2 body training ===")
     print(f"Output: {result.output_dir}")

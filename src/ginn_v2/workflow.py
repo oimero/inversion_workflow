@@ -69,7 +69,7 @@ class LoadedBody:
     checkpoint_payload: Mapping[str, Any]
     lfm_run_dir: Path
     well_control_run_dir: Path
-    forward_model_inputs: Path
+    forward_model_inputs_run_dir: Path
     workflow: WorkflowConfig
     training_config: BodyInversionConfig
     inference_config: Mapping[str, Any]
@@ -214,7 +214,7 @@ class _BodyOptions:
     lfm_run_dir: Path | None = None
     variant_id: str | None = None
     well_control_run_dir: Path | None = None
-    forward_model_inputs: Path | None = None
+    forward_model_inputs_run_dir: Path | None = None
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -234,8 +234,8 @@ def _required_input(stage_config: Mapping[str, Any], key: str, override: object)
     return value
 
 
-def load_forward_inputs(path: Path, *, domain: str, depth_basis: str | None) -> tuple[np.ndarray, np.ndarray, AIVelocityRelation | None, dict[str, Any]]:
-    return load_physics_inputs(path, repo_root=REPO_ROOT, domain=domain, depth_basis=depth_basis)
+def load_forward_inputs(run_dir: Path, *, domain: str, depth_basis: str | None) -> tuple[np.ndarray, np.ndarray, AIVelocityRelation | None, dict[str, Any]]:
+    return load_physics_inputs(run_dir, repo_root=REPO_ROOT, domain=domain, depth_basis=depth_basis)
 
 
 def _domain_runtime(
@@ -304,15 +304,15 @@ def _build_runtime(raw: Mapping[str, Any], args: _BodyOptions) -> tuple[Workflow
         _required_input(section, "well_control_run_dir", args.well_control_run_dir),
         root=REPO_ROOT,
     )
-    forward_inputs = resolve_relative_path(
-        _required_input(section, "forward_model_inputs", args.forward_model_inputs),
+    forward_inputs_run_dir = resolve_relative_path(
+        _required_input(section, "forward_model_inputs_run_dir", args.forward_model_inputs_run_dir),
         root=REPO_ROOT,
     )
     if section.get("training") is None:
         training_mapping = {
             key: value
             for key, value in section.items()
-            if key not in {"inputs", "lfm_run_dir", "variant_id", "well_control_run_dir", "forward_model_inputs"}
+            if key not in {"inputs", "lfm_run_dir", "variant_id", "well_control_run_dir", "forward_model_inputs_run_dir"}
         }
     else:
         training_mapping = dict(section.get("training") or {})
@@ -320,7 +320,7 @@ def _build_runtime(raw: Mapping[str, Any], args: _BodyOptions) -> tuple[Workflow
         training_mapping["trusted_well_names"] = section["trusted_well_names"]
     config = BodyInversionConfig.from_mapping(training_mapping)
     output_dir = _resolve_output_dir(args.output_dir, workflow)
-    return workflow, config, lfm_run_dir, well_control_run_dir, forward_inputs, output_dir, variant_id
+    return workflow, config, lfm_run_dir, well_control_run_dir, forward_inputs_run_dir, output_dir, variant_id
 
 
 def _write_review_package(trainer: BodyInversionTrainer, model: CenterTraceBodyNet, output_dir: Path) -> dict[str, Any]:
@@ -460,7 +460,7 @@ def train_body(
     lfm_run_dir: str | Path | None = None,
     variant_id: str | None = None,
     well_control_run_dir: str | Path | None = None,
-    forward_model_inputs: str | Path | None = None,
+    forward_model_inputs_run_dir: str | Path | None = None,
 ) -> BodyRun:
     """Run reusable self-supervised pretraining, semi-supervised finetuning, or both."""
 
@@ -473,11 +473,11 @@ def train_body(
         lfm_run_dir=None if lfm_run_dir is None else Path(lfm_run_dir),
         variant_id=variant_id,
         well_control_run_dir=None if well_control_run_dir is None else Path(well_control_run_dir),
-        forward_model_inputs=None if forward_model_inputs is None else Path(forward_model_inputs),
+        forward_model_inputs_run_dir=None if forward_model_inputs_run_dir is None else Path(forward_model_inputs_run_dir),
     )
     config_path = resolve_relative_path(config_path, root=REPO_ROOT)
     raw = load_config(config_path)
-    workflow, config, lfm_run_dir, well_control_run_dir, forward_inputs_path, output_dir, variant_id = _build_runtime(raw, args)
+    workflow, config, lfm_run_dir, well_control_run_dir, forward_inputs_run_dir, output_dir, variant_id = _build_runtime(raw, args)
     if output_dir.exists():
         raise FileExistsError(f"Body-inversion output directory already exists: {output_dir}; use a new output directory.")
     else:
@@ -517,7 +517,7 @@ def train_body(
         sample_axis,
     )
     wavelet_time_s, wavelet_amplitude, relation, forward_payload = load_forward_inputs(
-        forward_inputs_path,
+        forward_inputs_run_dir,
         domain=workflow.seismic.domain,
         depth_basis=workflow.seismic.depth_basis,
     )
@@ -623,7 +623,7 @@ def train_body(
                 "buffer_axis_units": lfm_lowpass_spec.buffer_axis_units,
             },
             "well_control_run_dir": repo_relative_path(well_control_run_dir, root=REPO_ROOT),
-            "forward_model_inputs": repo_relative_path(forward_inputs_path, root=REPO_ROOT),
+            "forward_model_inputs_run_dir": repo_relative_path(forward_inputs_run_dir, root=REPO_ROOT),
             "forward_adapter": getattr(adapter, "adapter_id", type(adapter).__name__),
             "wavelet": forward_payload.get("wavelet"),
             "well_roles": {
@@ -719,7 +719,7 @@ def load_body(
     lfm_run_dir: str | Path | None = None,
     variant_id: str | None = None,
     well_control_run_dir: str | Path | None = None,
-    forward_model_inputs: str | Path | None = None,
+    forward_model_inputs_run_dir: str | Path | None = None,
     batch_size: int | None = None,
 ) -> LoadedBody:
     """Load a trained body facade without exposing its internal assembly."""
@@ -756,10 +756,10 @@ def load_body(
         else str(inputs.get("well_control_run_dir") or ""),
         root=REPO_ROOT,
     )
-    forward_path = resolve_relative_path(
-        forward_model_inputs
-        if forward_model_inputs is not None
-        else str(inputs.get("forward_model_inputs") or ""),
+    forward_run_dir = resolve_relative_path(
+        forward_model_inputs_run_dir
+        if forward_model_inputs_run_dir is not None
+        else str(inputs.get("forward_model_inputs_run_dir") or ""),
         root=REPO_ROOT,
     )
     selected_variant = str(variant_id or inputs.get("variant_id") or "").strip()
@@ -790,7 +790,7 @@ def load_body(
     baseline = dict(lfm.variant.variant_metadata.get("resolved_baseline_config") or {})
     lowpass = parse_lowpass_spec(dict(baseline.get("filter") or {}), sample_axis)
     wavelet_time_s, wavelet_amplitude, relation, _payload = load_forward_inputs(
-        forward_path,
+        forward_run_dir,
         domain=workflow.seismic.domain,
         depth_basis=workflow.seismic.depth_basis,
     )
@@ -835,7 +835,7 @@ def load_body(
         checkpoint_payload=payload,
         lfm_run_dir=lfm_path,
         well_control_run_dir=well_path,
-        forward_model_inputs=forward_path,
+        forward_model_inputs_run_dir=forward_run_dir,
         workflow=workflow,
         training_config=config,
         inference_config=resolved_inference,

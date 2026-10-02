@@ -1175,7 +1175,7 @@ def load_depth_forward_inputs(
 ) -> tuple[np.ndarray, np.ndarray, float, float, Path]:
     path = run_dir / "forward_model_inputs.json"
     time_s, amplitude, relation, _payload = load_forward_inputs(
-        path,
+        run_dir,
         repo_root=repo_root,
         domain="depth",
         depth_basis="tvdss",

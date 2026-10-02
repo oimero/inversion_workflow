@@ -217,9 +217,11 @@ def write_well_waveform_qc(
         if observed_scale <= 0.0 or not np.isfinite(observed_scale):
             raise ValueError(f"{well_name}: observed well seismic has zero variance in the QC interval.")
         observed_normalized = observed_centered / observed_scale
-        synthetic_energy = float(np.sqrt(np.mean(np.square(synthetic))))
-        if synthetic_energy <= 0.0 or not np.isfinite(synthetic_energy):
-            raise ValueError(f"{well_name}: forward synthetic has zero energy.")
+        synthetic_centered = synthetic - float(np.mean(synthetic))
+        synthetic_scale = float(np.std(synthetic_centered))
+        if synthetic_scale <= 0.0 or not np.isfinite(synthetic_scale):
+            raise ValueError(f"{well_name}: forward synthetic has zero variance in the QC interval.")
+        synthetic_normalized = synthetic_centered / synthetic_scale
         correlation = float(np.corrcoef(observed_normalized, synthetic)[0, 1])
         if not np.isfinite(correlation):
             raise ValueError(f"{well_name}: predicted well waveform correlation is non-finite.")
@@ -239,7 +241,7 @@ def write_well_waveform_qc(
         predicted_objects = _waveform_objects(
             axis=local_axis,
             log_ai=predicted_log_ai,
-            synthetic=synthetic,
+            synthetic=synthetic_normalized,
             real=observed_normalized,
             dynamic_window_m=float(trainer.config.waveform_qc_dynamic_window_m),
             name="GINN V2 predicted body",
@@ -264,6 +266,9 @@ def write_well_waveform_qc(
             synthetic_ai=predicted_objects[0],
             title=f"GINN V2 well-curve forward QC | {well_name} | corr={correlation:.3f}",
         )
+        axes[2].set_xlabel("Synthetic (standardized)")
+        axes[3].set_xlabel("Seismic (standardized)")
+        axes[4].set_xlabel("Residual (standardized)")
         for line in axes[0].lines:
             if line.get_label() == body_reference.name:
                 line.set_color("gray")
@@ -312,6 +317,8 @@ def write_well_waveform_qc(
         "plot_function": "cup.seismic.viz.plot_well_waveform_qc",
         "correlation_metric": "well_curve_forward_corr",
         "correlation_definition": "Assemble the predicted AI curve on the well support, then forward it with the same domain adapter used by training; no gain or vertical compensation is applied.",
+        "display_normalization": "Each waveform is centered and divided by its own standard deviation on the shared QC interval.",
+        "residual_definition": "Standardized observed seismic minus standardized forward synthetic.",
         "dynamic_correlation_window_m": float(trainer.config.waveform_qc_dynamic_window_m),
         "figures": figures,
         "metrics": repo_relative_path(metrics_path, root=root),

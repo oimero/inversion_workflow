@@ -1,10 +1,9 @@
-.conda/*
-.codex-smoke/*
-.ref/*
 .vscode/*
 data/*
 experiments/*
 note/*
+notebooks/*
+ref/*
 site/*
 tests/*
 tmp/*

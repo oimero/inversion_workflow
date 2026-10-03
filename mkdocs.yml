@@ -58,6 +58,7 @@ nav:
       - 05 全局共识子波生成: guide/5-wavelet-generation.md
       - 06 真实工区井控数据集: guide/6-real-field-well-controls.md
       - 07 真实工区低频模型: guide/7-real-field-lfm.md
+      - 08 GINN v2 主体反演: guide/8-ginn-v2-body-inversion.md
       - 平行工作流 深度域反演工作流: guide/depth-domain-workflow.md
   - API:
       - API 总览: api/index.md

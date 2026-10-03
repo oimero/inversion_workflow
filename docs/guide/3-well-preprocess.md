@@ -9,10 +9,10 @@
 ```bash
 python scripts/well_preprocess.py
 python scripts/well_preprocess.py --config experiments/my_project.yaml
-python scripts/well_preprocess.py --output-dir /tmp/preprocess_test
+python scripts/well_preprocess.py --output-dir <OUTPUT_DIR>
 ```
 
-不带参数时，脚本自动从输出目录发现最新的曲线筛选产物，在 `<output_root>/well_preprocess_<timestamp>/` 下写出结果。
+不带参数时，脚本自动从配置中的 `output_root` 发现最新的曲线筛选产物，并在 `output_root/well_preprocess_<timestamp>/` 下写出结果；未配置 `output_root` 时使用 `scripts/output`。复现实验时可以在 `source_runs.well_screen_dir` 中指定固定的上游目录。
 
 ---
 
@@ -31,9 +31,22 @@ python scripts/well_preprocess.py --output-dir /tmp/preprocess_test
 ## 配置参考
 
 ```yaml
+data_root: <DATA_ROOT>
+output_root: <OUTPUT_ROOT>
+
 well_curves:
   required_categories: [p_sonic, density]
-  selected_categories: [...]
+  selected_categories:
+    - caliper
+    - gamma_ray
+    - s_sonic
+    - p_sonic
+    - density
+    - resistivity
+    - spontaneous_potential
+    - porosity
+    - permeability
+    - water_saturation
 
 well_preprocess:
   md_resampling:
@@ -60,7 +73,7 @@ well_preprocess:
     enabled: true
     lower_quantile: 0.01
     upper_quantile: 0.99
-    range_override_file: experiments/common/well_preprocess_ranges.yaml
+    range_override_file: "<curve-range-override-file>"
     min_samples_for_auto_threshold: 1000
 
   usable_thresholds:
@@ -132,27 +145,13 @@ well_curve:
 
 ## 脚本在做什么
 
-预处理分两趟完成。
-
-### 第一趟：逐井逐曲线规范化
-
-对每口通过第二步筛选的井，从原始 LAS 中加载第二步识别出的全部曲线（不只是 primary，还包括同类 secondary），依次做：
-
-1. **缺失值识别** — 把 LAS 中常见的缺失占位符统一转为空值。
-2. **缩写规范化**（可关闭）— 把原始曲线名映射到标准名，比如原始 `DT`、`DTC`、`AC` 都映射为 `DT_USM`。
-3. **单位规范化**（可关闭）— 声波统一为 `us/m` 慢度，密度统一为 `g/cm3`。数值明显不符合单位常识的曲线会被判为不可用；疑似单位写错但还能处理的曲线会进入 QC 报告。
-4. **连续常值段替换** — 把长时间完全不变的可疑段落置为空值。井径默认跳过，避免误伤真实井径响应。
-5. **收集全局阈值样本** — 把每条通过单位硬校验的 step2-primary 曲线的清洗后数据按标准曲线名汇集。
-
-### 第二阶段：全局阈值 + 逐井复核
-
-1. **计算全局分位数** — 按标准曲线名（`DT_USM`、`RHO_GCC` 等）分别统计 q01/q99。样本量不足时跳过并标记。
-2. **阈值优先级** — 优先使用单井手动阈值，其次使用全局手动阈值，最后才使用自动分位数。
-3. **极值替换** — 超出上下限的有限值置为空值。
-4. **可用性判定** — 检查最终有效点是否满足最低数量和相对初始有效点的最低比例。
-5. **Primary 接管** — 如果某 category 的 primary 曲线不可用，按顺序尝试同类 secondary。接管只在同一 category 内发生。
-6. **测深处理** — 启用测深规则化时，对最终入选曲线统一重采样到配置的规则测深网格，只在不超过 `max_interpolation_gap_m` 的有限样点之间插值；关闭时使用原生测深轴。
-7. **派生 AI** — 在最终输出轴上的 `DT_USM` 和 `RHO_GCC` 上重新计算 AI，然后导出标准 LAS。
+1. **读取候选曲线。** 逐井读取第二步识别出的入选类别曲线，包括代表曲线和同类别备用曲线。
+2. **统一名称与单位。** 将常见缺失占位符转换为空值，统一曲线名称和支持的物理单位，并记录单位检查结果。
+3. **清理连续常值段。** 按配置识别指定类别中的长常值段，将其转换为空值。单位检查通过的代表曲线进入全局阈值统计。
+4. **确定数值范围。** 按标准曲线汇总有限样点，计算分位数范围。优先使用单井手动范围，其次使用全局手动范围，最后使用自动分位数；超出范围的样点转换为空值。
+5. **复核曲线与井的可用性。** 检查有效点数和有效比例。代表曲线失效时，按既定顺序选择同类别备用曲线，再检查每口井是否满足必需类别。
+6. **统一测深轴。** 启用规则化时，仅在相邻有限样点间距不超过允许缺口的区间插值，长缺口保持为空值；关闭规则化时使用原生测深轴。
+7. **计算声阻抗并导出。** 由纵波慢度和密度派生声阻抗，输出标准测井文件及逐井、逐曲线报告。
 
 ---
 
@@ -235,7 +234,7 @@ AI (m/s*g/cm3) = (1e6 / DT_USM) * RHO_GCC
 | `md_output_regular` | 输出 MD 规则性校验结果 |
 | `reasons` | 失败原因 |
 
-后续步骤从这里判断每口井的可用性，不再回查第二步。
+后续步骤依据这份状态表判断每口井的可用性，并读取最终导出的测井文件。
 
 ### `preprocess_summary.csv` — 每井每条曲线一行
 
@@ -284,7 +283,7 @@ primary 接管记录。每行记录：哪个 category 的哪条 primary 失效�
 ### 第一步：看终端输出
 
 ```
-Log preprocess summary: 38 step2-passed wells, 35 passed, 3 failed, 35 LAS exported.
+Log preprocess summary: <STEP2_PASSED_COUNT> step2-passed wells, <PASSED_COUNT> passed, <FAILED_COUNT> failed, <EXPORTED_COUNT> LAS exported.
 ```
 
 如果 `failed` 井数多，打开 `well_preprocess_status.csv` 看 `reasons` 列。
@@ -308,12 +307,3 @@ Log preprocess summary: 38 step2-passed wells, 35 passed, 3 failed, 35 LAS expor
 ### 第六步：抽查一口井的完整轨迹
 
 打开 `preprocess_summary.csv` 筛选某口井，检查每条曲线的 `conversion_action` → `constant_replaced_points` → `outlier_replaced_points` → `final_valid_fraction` 链条是否符合预期。
-
----
-
-## 留到第二轮
-
-- 单位错配软提示是否自动纠正还是只报告。
-- 全局阈值是否按层段、井型或工区分区细化。
-- 是否为极值处理生成直方图 QC 图。
-- 连续常值段阈值是否需要继续细化。

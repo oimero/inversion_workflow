@@ -9,7 +9,7 @@
 ```bash
 python scripts/well_trajectory.py
 python scripts/well_trajectory.py --config experiments/my_project.yaml
-python scripts/well_trajectory.py --output-dir /tmp/traj_test
+python scripts/well_trajectory.py --output-dir scripts/output/<trajectory-qc-run>
 ```
 
 不带参数时，脚本自动发现最新的井资产盘点产物，在 `<output_root>/well_trajectory_<timestamp>/` 下写出结果。
@@ -20,7 +20,7 @@ python scripts/well_trajectory.py --output-dir /tmp/traj_test
 |------|------|
 | `well_inventory.csv` | 提供井名、井头坐标、KB 和井型初分 |
 | Petrel 井轨迹目录 | 读取每口井的 MD/XY/Z/TVD 轨迹点 |
-| 时间域地震体 | 判断轨迹点是否在工区内 |
+| 地震体及其线号/道号几何 | 判断轨迹点是否在工区内 |
 
 如果工区全部是直井、且不打算复核轨迹，这一步可以跳过。但建议至少跑一次，因为井头文件里的底孔坐标可能不准。
 
@@ -30,10 +30,10 @@ python scripts/well_trajectory.py --output-dir /tmp/traj_test
 
 ```yaml
 assets:
-  well_trace_dir: all_well_trace
+  well_trace_dir: <well-trajectory-dir>
 
 seismic:
-  file: raw/your-seismic.zgy
+  file: <seismic-volume-file>
   type: zgy
   domain: time
   zgy_inline_chunk_size: 16
@@ -68,7 +68,7 @@ well_trajectory:
 | `kb_tolerance_m` | 0.5 | KB 基准面最大允许偏差 |
 | `z_tvd_tolerance_m` | 0.1 | Z 与 KB-TVD 残差最大允许值 |
 
-`vertical_max_offset_m` 和 `min_deviated_max_offset_m` 可以设成不同值，中间留出“不确定”灰色区间。两个值相等时，所有有效轨迹都会被明确分成直井或斜井。
+`vertical_max_offset_m` 和 `min_deviated_max_offset_m` 可以设成不同值，中间形成未判定区间。两个值相等时，所有有效轨迹都会被明确分成直井或斜井。
 
 ### `survey_qc`
 
@@ -76,60 +76,11 @@ well_trajectory:
 |------|--------|------|
 | `allow_partial_outside` | true | 轨迹部分在工区外时，true=警告，false=硬失败 |
 
-工区几何 QC 固定启用；逐点 CSV 默认写入固定的 `trajectory_points` 子目录。代码仍保留 `output.write_trajectory_points` 作为特殊运行覆盖，但常用配置无需展示。
+工区几何 QC 固定启用；逐点 CSV 默认写入 `trajectory_points` 子目录。`output.write_trajectory_points` 默认值为 `true`，设为 `false` 时省略逐点文件。
 
 ---
 
-## 脚本在做什么
-
-对每口井，依次做三件事：
-
-### 1. 解析轨迹文件
-
-读取 Petrel 导出的井轨迹文本，提取 `MD`、`X`、`Y`、`Z`、`TVD` 五列必要数据，以及可选的 `DX`、`DY`、`AZIM`、`INCL`、`DLS`。
-
-解析失败的硬条件：
-
-- 文件缺少 `MD/X/Y/Z/TVD` 任一列
-- 有效轨迹点少于 2 个
-- 测深不单调递增
-- XY 全为空或非有限值
-- 文件头缺少 KB 基准面
-
-以上任一触发，该井 `trajectory_status = failed`，不进入后续检查。
-
-### 2. 口径一致性 QC
-
-用轨迹文件头数据和第一步井头数据互相校验：
-
-| 检查项 | 不合格时 |
-|--------|---------|
-| 文件头井名与文件名 stem 不一致 | 硬失败 |
-| 文件头缺少井名 | 警告 |
-| 井口 XY 与第一步井头偏差超过阈值 | 警告 |
-| KB 与第一步井头偏差超过阈值 | 警告 |
-| `Z` 与 `KB - TVD` 偏差超过阈值 | 警告 |
-| MD 或 TVD 出现负值 | 警告 |
-| 必要列中存在非有限值的行被丢弃 | 警告 |
-
-警告不阻塞流程，但会写入 `qc_flags` 列供第四步路由时判断。
-
-### 3. 井型复核 + 工区落点
-
-第一步用井头底孔坐标初分直井/斜井，这里用真实轨迹复核：
-
-- **用最大水平偏移判断，不用井口-底孔偏移。** 有些井中段偏斜明显但底孔又回到井口附近，井口-底孔偏移会漏判。
-- 轨迹整体偏移很小 → 复核为直井
-- 轨迹整体偏移明显 → 复核为斜井
-- 落在两个阈值之间 → 暂时标记为不确定
-
-如果配置了地震工区，还会把每个轨迹点投影到线号/道号，统计：
-
-- 井口和井底在工区内还是工区外
-- 全部轨迹点中有多大比例在工区内
-- 部分轨迹出界的井，按 `allow_partial_outside` 决定是警告还是硬失败
-
----
+## 输入格式
 
 ### 井轨迹文件格式
 
@@ -148,7 +99,35 @@ well_trajectory:
 
 ### TVDSS 口径
 
-脚本内部按 `tvdss_m = tvd_kb_m - kb_m` 计算。这个换算只在本模块和后续时深转换模块中实现，后续脚本不要自己散写这份逻辑。
+脚本内部按 `TVDSS = TVD(KB) - KB` 计算，后续时深转换沿用同一米制定义。
+
+---
+
+## 脚本在做什么
+
+脚本把井资产清单、Petrel 轨迹文本和时间域地震体几何合并为逐井、逐点的质量控制结果。
+
+1. **解析轨迹并建立深度坐标。** 读取测深、平面坐标、高程坐标和真垂深，筛除必要数据中的非有限行，检查有效点数量和测深递增性；依据 KB 建立相对海平面垂深：
+
+   \[
+   TVDSS = TVD(KB) - KB
+   \]
+
+2. **校验井名与几何口径。** 将轨迹文件头与井资产清单的井名、井口坐标和 KB 进行核对，并按高程与真垂深残差识别异常：
+
+   \[
+   r_Z = Z - (KB - TVD)
+   \]
+
+   井名不一致形成失败原因；坐标、基准面、深度值或被丢弃数据行的异常形成质量警告。
+
+3. **复核井型并映射工区。** 以轨迹首点为参考，计算最大水平偏移
+
+   \[
+   d_{\max} = \max_i\sqrt{(X_i-X_0)^2+(Y_i-Y_0)^2}
+   \]
+
+   再依据阈值划分直井、斜井或待判定状态。对每个轨迹点转换时间域工区的浮点线号和道号，统计井口、井底及全轨迹的工区内外状态，并依据配置的部分出界策略形成警告或失败状态。
 
 ---
 
@@ -186,7 +165,7 @@ well_trajectory:
 
 ### `trajectory_points/<well>.csv` — 每口井逐轨迹点
 
-仅当 `output.write_trajectory_points: true` 时写出。每行包含该轨迹点的测深、TVD、TVDSS、Z、XY、DX/DY、井斜角、方位角、DLS、浮点线号、最近线号、工区内外。
+`output.write_trajectory_points` 为 `true` 时写出。每行包含该轨迹点的测深、TVD、TVDSS、Z、XY、DX/DY、井斜角、方位角、DLS、浮点线号、最近线号、工区内外。
 
 ### `failed_trajectories.csv`
 
@@ -203,7 +182,7 @@ well_trajectory:
 ### 第一步：看终端输出
 
 ```
-Wrote trajectory QC for 103 wells to ... ({'passed': 80, 'warning': 18, 'failed': 3, 'missing': 2}).
+Wrote trajectory QC for <N> wells to <output-dir> ({'passed': <N>, 'warning': <N>, 'failed': <N>, 'missing': <N>}).
 ```
 
 `failed` + `missing` 越少越好。`warning` 井需要检查 `qc_flags` 判断是否影响后续路由。
@@ -239,10 +218,4 @@ Wrote trajectory QC for 103 wells to ... ({'passed': 80, 'warning': 18, 'failed'
 
 ### 第五步：抽查一口井的轨迹点
 
-打开 `trajectory_points/<well>.csv`，看 `incl_deg` 列的最大值、`x_m`/`y_m` 随测深的变化趋势，对斜井形成直观印象。
-
----
-
-## 留到第二轮
-
-- 对同平台密井生成轨迹交叉/近距离诊断。
+打开 `trajectory_points/<well>.csv`，查看 `incl_deg` 列的最大值和 `x_m`/`y_m` 随测深的变化趋势，核对斜井几何。

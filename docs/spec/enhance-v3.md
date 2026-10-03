@@ -119,7 +119,6 @@ V2 已有井主体／残差码本、波形及导数等检索特征、受限伸�
 
 ## 参考
 
-- [GINN V2 当前主体构造](../guide/ginn-v2-body-inversion.md)
 - [数据与坐标约定](../concepts/data-and-coordinate-conventions.md)
 - [SMI 方法论文](https://ped.cpedm.com/article/2020/1876-3804/1876-3804-47-6-1235.shtml)：波形相似性驱动井高频信息的总体思路。
 

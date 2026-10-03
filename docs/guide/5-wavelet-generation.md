@@ -11,12 +11,12 @@ python scripts/wavelet_generation.py
 python scripts/wavelet_generation.py --config experiments/common/common.yaml
 python scripts/wavelet_generation.py --well <well-name>
 python scripts/wavelet_generation.py --debug
-python scripts/wavelet_generation.py --output-dir scripts/output/wavelet_generation_test
+python scripts/wavelet_generation.py --output-dir scripts/output/<wavelet-generation-run>
 ```
 
 不带参数时，脚本自动发现最新的第四步产物，在 `scripts/output/wavelet_generation_<timestamp>/` 下写出结果。
 
-用 `--well` 可以只在一口井上评测，方便调试——此时脚本跳过共识优化，直接选第四步来源井指标最好的候选子波。
+用 `--well` 可以把评测井限定为一口指定井，并将最小评测井数调整为 1；候选评测、共识搜索和最终选择仍按同一套流程执行。
 
 ---
 
@@ -64,7 +64,7 @@ wavelet_generation:
     optimizer:
       random_trials: 512
       max_refine_iters: 120
-      seed: 12345
+      seed: 20260529
     objective:
       corr_weight: 1.0
       p10_corr_weight: 0.5
@@ -137,7 +137,7 @@ wavelet_generation:
 | `corr_weight` × 空间去偏中位相关系数 | 奖励整体匹配好的子波 |
 | `p10_corr_weight` × 空间去偏 P10 相关系数 | 惩罚在少数井上特别差的子波 |
 | `nmae_weight` × 空间去偏中位 NMAE | 防止只靠相关性忽略振幅误差 |
-| `deviation_from_mean_weight` × 偏离均值距离 | 防止生成子波跑出候选子波族的形态范围 |
+| `deviation_from_mean_weight` × 偏离均值距离 | 约束生成子波处于候选子波族的形态范围 |
 | `roughness_weight` × 粗糙度 | 防止振铃 |
 | `bandwidth_drift_weight` × 带宽漂移 | 防止主频偏离候选子波族太远 |
 
@@ -145,7 +145,7 @@ wavelet_generation:
 
 ### `spatial_debias`
 
-密井网中，一个平台上十几口井如果各自算一票，会让该平台主导全局子波。空间去偏会先把近井归成空间簇，再按“簇”聚合评分，让一簇近井只贡献一票。半径来自顶层 `spatial_debias.cluster_radius_m`。
+密井网中，同一平台的近井数量较多时，逐井聚合会使该区域权重偏高。空间去偏先把近井归成空间簇，再按空间簇聚合评分，使每个空间簇以一个聚合结果参与全局评分。半径来自顶层 `spatial_debias.cluster_radius_m`。
 
 如果不想用空间去偏，把 `enabled` 关掉即可——此时每口井等权投票。
 
@@ -158,48 +158,13 @@ wavelet_generation:
 
 ## 脚本在做什么
 
-脚本分五个阶段：**加载 → 候选评测 → 共识生成 → 选择 → 批量合成**。
+脚本按以下五个阶段处理时间域井震标定产物：
 
-### 第一阶段：加载与 QC
-
-1. 读取第四步的 `well_tie_plan.csv`、`well_tie_metrics.csv` 和 `wavelet_inventory.csv`，建立候选子波和评测井的索引。
-2. 加载每条候选子波，校验中心位置、长度一致性、采样间隔和 L2 能量。通过校验的子波构成候选池。
-3. 加载每口评测井的 LAS、优化 TDT 和地震道，预先计算好反射系数——这些在后续所有评测中保持不变，只算一次。
-
-### 第二阶段：候选子波交叉评测
-
-对候选池中的每条子波，在所有评测井上逐一做合成记录：
-
-1. 用该井的优化 TDT 将测深域波阻抗转换到双程旅行时域，计算反射系数。
-2. 用候选子波与反射系数卷积，生成合成记录。
-3. 与地震道比较，计算相关系数和 NMAE。
-
-默认输出 `wavelet_candidate_aggregate.csv`，用于比较候选子波的空间去偏综合指标。候选 × 井的逐项指标属于 debug 明细，只有使用 `--debug` 时才写出。
-
-### 第三阶段：共识子波生成
-
-默认从这些候选子波共同定义的“合理形态范围”内搜索一条新的共识子波：
-
-1. **提取候选形态。** 从候选子波中提取主要变化方向，得到均值子波和若干形态分量。`n_components` 控制保留多少个形态方向。
-2. **限制搜索范围。** 新子波只能在候选子波附近移动，避免生成一条数学上高分、地质上陌生的波形。`coefficient_bounds` 和 `coefficient_quantiles` 控制这个附近到底有多宽。
-3. **两阶段搜索。** 先用 `random_trials` 大量随机尝试，找到高分区域；再用 `max_refine_iters` 对高分结果做局部细化。`seed` 固定随机搜索的可复现性。
-4. **每次评测都做完整交叉评测。** 每条生成子波和候选子波一样，在所有评测井上做合成记录、算空间去偏聚合指标、加上正则化项得到最终分数。
-
-使用 `--debug` 后，整个过程的试验记录会写入 `consensus_search_trials.csv`，可以追溯每一步的系数、各项指标和分数。
-
-### 第四阶段：选择
-
-比较最佳共识子波和最佳候选子波的分数：
-
-- 共识子波严格优于候选 → 输出共识子波，`selection_mode = optimized_consensus`。
-- 共识子波没有超过候选 → 输出最佳候选子波，`selection_mode = existing_candidate_wins`。
-- 候选或评测井太少 → 降级为选第四步来源井指标最好的候选，`selection_mode = insufficient_eval_fallback`。
-
-### 第五阶段：批量合成
-
-用最终选定的全局子波，对所有评测井生成统一的合成记录和 QC 数据。
-
-批量合成结束后，脚本会给每口评测井输出一张统一风格的波形 QC 图，包含波阻抗、反射系数、合成地震 wiggle、观测地震 wiggle、残差 wiggle 和互相关热力图。
+1. **加载与质量控制。** 读取第四步的路由计划、标定指标和子波清单，检查候选子波的中心、长度、采样间隔与 L2 能量，并为每口评测井预先计算波阻抗反射系数。
+2. **候选子波交叉评测。** 将测深域波阻抗依据优化时深关系转换到双程旅行时域，与候选子波卷积生成合成记录，再计算相关系数和归一化平均绝对误差；按空间簇聚合逐井指标。
+3. **共识子波搜索。** 对齐候选波形并建立 PCA 形态空间，在投影系数分位数范围内进行随机采样和局部细化；每个搜索点都重新执行全井正演、空间聚合和形态正则化评分。
+4. **全局选择。** 比较最佳共识波形与最佳候选波形的综合分数；评测井数量低于配置下限时，选择第四步来源井指标最好的候选波形。
+5. **批量合成。** 使用最终波形在全部评测井上生成合成记录、残差、批量指标和波形质量控制图，图中包含波阻抗、反射系数、合成地震、观测地震、残差和互相关结果。
 
 ---
 
@@ -211,7 +176,7 @@ wavelet_generation:
 
 | 文件 | 什么时候看 | 内容 |
 |------|------------|------|
-| `selected_wavelet.csv` | 第六、八步继续运行时 | 最终输出的全局子波 |
+| `selected_wavelet.csv` | 后续批量合成或反演流程读取时 | 最终输出的全局子波 |
 | `selected_wavelet_summary.json` | 先看 | 选择模式、分数对比、来源井、配置摘要 |
 | `wavelet_candidate_aggregate.csv` | 判断候选竞争关系时 | 候选子波的空间去偏聚合指标和综合分数 |
 | `evaluation_well_spatial_clusters.csv` | 检查密井平台是否被去偏时 | 每口评测井的空间簇编号和簇大小 |
@@ -275,7 +240,7 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 
 - 最高分的候选子波是哪口井的——它的 `spatial_debiased_median_corr` 和 `spatial_debiased_p10_corr` 是否明显优于其他候选。
 - 某个候选的 `p10_corr` 特别低——说明它在少数井上表现很差，即使中位数不错也不该选。
-- 空间去偏聚合和普通全井中位数的差异——如果某候选在去偏后分数大幅下降，说明它的高分主要靠一簇密井拉动。
+- 空间去偏聚合和普通全井中位数的差异——如果某候选在去偏后分数大幅下降，说明它的高分主要来自一个密集井簇。
 
 ### 第四步：必要时打开 debug 明细
 
@@ -290,7 +255,7 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 
 ### 第六步：抽查合成记录
 
-打开 `batch_synthetic_metrics.csv`，按 `corr` 排序，检查最低分的几口井对应的 `figures/batch_synthetic_qc/*.png`——地震和合成记录是否在关键层位附近明显错位。如果少数井拖累了全局指标，考虑把它们加入 `evaluation_wells.exclude_wells` 后重跑。
+打开 `batch_synthetic_metrics.csv`，按 `corr` 排序，检查最低分的几口井对应的 `figures/batch_synthetic_qc/*.png`，核对地震和合成记录在关键层位附近的对齐情况。如果少数井的指标明显偏低，可将其加入 `evaluation_wells.exclude_wells` 后重跑。
 
 每井 QC 图第二个子图的红线是该井单独最小二乘缩放后的合成记录，标题里的 `scale` 就是这口井使用的缩放倍数。因此这张图适合看波形、相位和残差，不用于判断全局固定振幅尺度。
 
@@ -305,11 +270,3 @@ Selected: optimized_consensus (optimized_consensus), score=0.xxxx
 | `No finite candidate wavelet metrics were produced` | 所有候选在所有井上的评测都失败了 | 检查子波采样间隔是否与地震道一致 |
 | `wavelet dt does not match seismic trace dt` | 某条子波的采样间隔和地震道不一致 | 检查第四步子波是否是用正确的地震采样间隔导出的 |
 | `insufficient_eval_fallback`（降级） | 评测井少于 `min_eval_well_count`，脚本降级为选最佳候选 | 检查第四步成功率；如果井确实少，这是预期行为 |
-
----
-
-## 留到第二轮
-
-- 是否允许按区块、层段或井型生成多个全局子波。
-- 是否允许显式相位或极性搜索；默认不做。
-- 是否在 PCA 前先做子波形态聚类；第一版先靠 PCA 系数范围和正则化控制。

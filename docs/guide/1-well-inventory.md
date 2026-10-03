@@ -8,11 +8,11 @@
 
 ```bash
 python scripts/well_inventory.py
-python scripts/well_inventory.py --config experiments/my_project.yaml
-python scripts/well_inventory.py --output-dir /tmp/inventory_test
+python scripts/well_inventory.py --config experiments/<project>.yaml
+python scripts/well_inventory.py --output-dir <OUTPUT_DIR>
 ```
 
-不带参数运行时，脚本读取 `experiments/common/common.yaml`，在 `scripts/output/well_inventory_<timestamp>/` 下写出四份文件。
+不带参数运行时，脚本读取 `experiments/common/common.yaml`，在配置中的 `output_root/well_inventory_<timestamp>/` 下写出四份文件；未配置 `output_root` 时使用 `scripts/output`。
 
 ---
 
@@ -31,13 +31,13 @@ python scripts/well_inventory.py --output-dir /tmp/inventory_test
 
 | 输入 | 格式要求 |
 |------|----------|
-| 井头文件 | Petrel `BEGIN HEADER ... END HEADER` 文本，必须包含 `Name`、`Surface X`、`Surface Y`、`Bottom hole X`、`Bottom hole Y`、`Well datum value` 列 |
+| 井头文件 | Petrel `BEGIN HEADER ... END HEADER` 文本，必须包含 `Name`、`Surface X`、`Surface Y`、`Well datum name`、`Well datum value`、`Bottom hole X`、`Bottom hole Y` 列 |
 | LAS 目录 | 文件名 stem 即为井名，扩展名 `.las` |
 | 井轨迹目录 | 文件名 stem 即为井名，不检查扩展名；本脚本仅检查文件是否存在 |
-| 井分层文件 | Petrel 格式，必须包含 `Well`、`Surface`、`MD` 列 |
+| 井分层文件 | Petrel 格式，必须包含 `Well`、`Surface`、`X`、`Y`、`Z`、`MD`、`PVD auto` 列 |
 | 时深表目录 | 文件名 stem 即为井名；本脚本仅检查文件是否存在 |
 
-**井名匹配规则：** 所有资产通过文件名 stem 或记录中的 `Name`/`Well` 字段做大小写不敏感匹配。`WellA`、`wella`、`WellA.las`、`WellA.petrel_dev` 被视为同一口井；井轨迹文件也可以没有扩展名。大小写冲突会直接报错。名为 `nan`、`none`、`null` 或空白的记录会被跳过。
+**井名匹配规则：** 所有资产通过文件名 stem 或记录中的 `Name`/`Well` 字段做大小写不敏感匹配。相同井名的不同大小写形式和同名不同扩展名会归为同一口井；井轨迹文件也可以没有扩展名。大小写冲突会直接报错。名为 `nan`、`none`、`null` 或空白的记录会被跳过。
 
 ---
 
@@ -46,21 +46,24 @@ python scripts/well_inventory.py --output-dir /tmp/inventory_test
 资产路径和地震体是整个工区的共享事实，放在顶层；第一步只保留自己的空间 QC 阈值。所有资产路径均相对于 `data_root`。
 
 ```yaml
+data_root: <DATA_ROOT>
+output_root: <OUTPUT_ROOT>
+
 assets:
-  well_heads_file: raw/well_heads
-  las_dir: all_well_las
-  well_trace_dir: all_well_trace
-  well_tops_file: raw/well_tops
-  time_depth_dir: time_depth_table
+  well_heads_file: <WELL_HEADS_FILE>
+  las_dir: <LAS_DIRECTORY>
+  well_trace_dir: <WELL_TRACE_DIRECTORY>
+  well_tops_file: <WELL_TOPS_FILE>
+  time_depth_dir: <TIME_DEPTH_DIRECTORY>
 
 seismic:
-  file: <path-to-seismic>
+  file: <SEISMIC_FILE>
   type: segy
   domain: time
   iline_byte: 189
   xline_byte: 193
   istep: 1
-  xstep: 1
+  xstep: <XLINE_STEP>
 
 
 well_inventory:
@@ -81,11 +84,7 @@ well_inventory:
 |------|------|------|
 | `file` | 是 | 地震体路径，相对于 `data_root` |
 | `type` | 是 | 地震体格式：`segy` 或 `zgy` |
-| `domain` | 是 | 采样轴域：`time` 或 `depth`。**必须显式写出** |
-
-#### `depth_basis`（深度域必填）
-
-当 `domain: depth` 时，`depth_basis` 必须设为 `tvdss`。当 `domain: time` 时，该字段不得出现，出现即报错。
+| `domain` | 是 | 时间域地震使用 `time`，需显式填写 |
 
 #### 格式相关参数
 
@@ -100,6 +99,8 @@ well_inventory:
 
 如果你的 SEG-Y 使用标准道头位置，可以省略所有 SEG-Y 字段。ZGY `zgy_inline_chunk_size` 默认 16。
 
+示例中的 `<XLINE_STEP>` 填写输入地震体的横线号步长。线号步长表示相邻道的线号间隔，米制道间距由工区几何计算。
+
 ### `spatial_qc`
 
 #### `near_survey_threshold_m`
@@ -112,11 +113,11 @@ well_inventory:
 
 #### `dense_well_neighbor_threshold_m`
 
-描述“值得警惕的近”。两口独立井相距不远时，可能在地震上落到同一条道或很近的道，后续 auto-tie、井约束、插值和反演都可能重复消费相似地震信息，所以需要统计和审计。
+用于统计井口水平距离不超过阈值的近邻井对。该阈值控制运行摘要中的近邻计数，便于了解井口的空间分布。
 
 #### `platform_cluster_threshold_m`
 
-描述“近到像同一个平台”。这类井往往是同一平台上的多个井槽或丛式井，井口极近是钻井设计造成的，不应直接当成异常冲突。脚本会先把它们聚成平台，再把同平台井对从高风险同道冲突清单里排除。
+用于按井口距离建立连通平台簇。脚本先识别同平台井，再从同道冲突清单中排除同平台井对。
 
 `dense_well_neighbor_threshold_m` 和 `platform_cluster_threshold_m` 这两个阈值的大小关系也因此应该不同：平台阈值通常很小，只识别井口几乎贴在一起的井；近邻阈值更大，用来观察密井网中可能互相影响的井对。此外，`dense_well_neighbor_threshold_m` 只影响 `run_summary.json` 中的近邻统计计数；`well_neighbor_pairs.csv` 的导出更克制：只保留落到同一最近地震道且非同平台的井对。
 
@@ -124,13 +125,11 @@ well_inventory:
 
 ## 脚本在做什么
 
-脚本把井头、LAS、轨迹、分层、时深表和地震工区几何合并成一份统一资产清单。它的核心动作是：
-
-1. 按规范化井名合并各类资产，检查大小写冲突。
-2. 根据每口井的 XY 判断它在工区的具体位置，计算它的线号（带小数点）和最近道线号。
-3. 用井口到底孔的水平偏移做直井/斜井初分。
-4. 识别同平台井和非同平台同道冲突，给密井网后续处理留出审计入口。
-5. 写出主清单、同道冲突、平台分组和运行摘要。
+1. **建立资产索引。** 读取井头、测井文件、井轨迹、井分层和时深表的井名，按大小写不敏感的匹配规则合并为井清单，并检查同名冲突。
+2. **计算井口位置。** 从地震体建立工区几何，将井口坐标换算为线号，计算最近道和到工区边界的距离，区分工区内、近边界外和远离工区的井。
+3. **初分井型。** 使用井口到底孔的水平距离判断直井和斜井；坐标不完整时保留未知状态。
+4. **统计空间关系。** 按井口米制距离形成连通平台簇，并统计近邻井对。落到同一最近地震道且属于不同平台的井对进入冲突清单。
+5. **写出盘点结果。** 输出资产主表、冲突井对、平台分组和运行摘要，供后续筛选与轨迹复核使用。
 
 ---
 
@@ -195,9 +194,9 @@ well_inventory:
 
 | JSON 路径 | 含义 |
 |-----------|------|
-| `geometry.sample_domain` / `geometry.sample_unit` | 采样轴类型和单位；时间域为 `time` / `s`，深度域为 `depth` / `m` |
+| `geometry.sample_domain` / `geometry.sample_unit` | 时间采样轴类型和单位，分别为 `time` 和 `s` |
 | `geometry.sample_min` / `geometry.sample_max` / `geometry.sample_step` | 采样轴起止值和采样间隔；查时间采样间隔就看 `geometry.sample_step` |
-| `geometry.n_sample` | 时间或深度采样点数 |
+| `geometry.n_sample` | 时间采样点数 |
 | `geometry.inline_min` / `geometry.inline_max` / `geometry.inline_step` | inline 线号范围和线号步长 |
 | `geometry.xline_min` / `geometry.xline_max` / `geometry.xline_step` | xline 线号范围和线号步长 |
 | `geometry.n_il` / `geometry.n_xl` | inline / xline 数量 |
@@ -224,15 +223,15 @@ well_inventory:
 ### 第一步：看 `run_summary.json` 的顶层计数
 
 ```
-well_count: 103
-asset_counts: {well_heads: 103, las: 102, well_trace: 103, time_depth: 10, ...}
-survey_position_counts: {inside: 61, outside: 42}
-wellbore_class_counts: {deviated: 85, vertical: 18}
+well_count: <WELL_COUNT>
+asset_counts: {well_heads: <WELL_HEAD_COUNT>, las: <LAS_COUNT>, well_trace: <TRACE_COUNT>, time_depth: <TDT_COUNT>, ...}
+survey_position_counts: {inside: <INSIDE_COUNT>, outside: <OUTSIDE_COUNT>}
+wellbore_class_counts: {deviated: <DEVIATED_COUNT>, vertical: <VERTICAL_COUNT>}
 ```
 
 这几行直接回答：有多少井？缺哪些资产？多少在工区内？多少看起来是斜井？
 
-如果要查地震几何，也从同一个 `run_summary.json` 开始。最常用的是 `geometry.sample_step`，其单位由 `geometry.sample_unit` 给出；时间域应为秒，深度域应为米。线号范围看 `geometry.inline_*` 和 `geometry.xline_*`，近似物理道间距看 `bin_spacing_m.nominal`。
+地震几何也记录在同一份 `run_summary.json` 中。时间采样间隔看 `geometry.sample_step`，单位为秒；线号范围看 `geometry.inline_*` 和 `geometry.xline_*`，近似物理道间距看 `bin_spacing_m.nominal`。
 
 ### 第二步：如果有 `las_only` 井 → 补井头
 
@@ -253,11 +252,4 @@ wellbore_class_counts: {deviated: 85, vertical: 18}
 - 按 `survey_position` 筛选 `inside`，按 `inventory_status` 筛选 `usable_for_las_screen`——这是进入第二步的候选井。
 - 关注 `wellbore_class == deviated` 且 `has_well_trace == false` 的井——斜井但没有轨迹文件，第四步无法走斜井路径。
 - 关注 `wellbore_class == unknown` 的井——井头坐标缺失或无效。
-- `reasons` 列汇总了每口井的所有警告标签。`no_time_depth` 只在时间域记录；`no_well_trace` 只对斜井或井型未知的井记录。
-
----
-
-## 留到第二轮
-
-- 斜井初分从井头底孔坐标升级为轨迹驱动的统一入口。
-- 对密井网按平台或井组生成更高层级的统计摘要。
+- `reasons` 列汇总了每口井的所有警告标签。`no_time_depth` 表示缺少时深表；`no_well_trace` 只对斜井或井型未知的井记录。

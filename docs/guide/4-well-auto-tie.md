@@ -10,7 +10,7 @@
 python scripts/well_auto_tie.py
 python scripts/well_auto_tie.py --config experiments/common/common.yaml
 python scripts/well_auto_tie.py --well <well-name>
-python scripts/well_auto_tie.py --output-dir scripts/output/well_auto_tie_test
+python scripts/well_auto_tie.py --output-dir scripts/output/<well-auto-tie-run>
 ```
 
 不带参数时，脚本自动发现最新的前三步产物，在 `scripts/output/well_auto_tie_<timestamp>/` 下写出结果。
@@ -25,12 +25,12 @@ python scripts/well_auto_tie.py --output-dir scripts/output/well_auto_tie_test
 |------|------|------|
 | 第一步 | `well_inventory.csv` | 井口坐标、资产清单、井型初分、工区位置 |
 | 第二步 | `well_screen.csv` | 曲线筛选审计、每口井有哪些可用曲线 |
-| 第三步 | `well_preprocess_status.csv`、`preprocessed_las/*.las` | 判断基础曲线是否可用；从当前 `DT_USM/RHO_GCC` 加载 `LogSet`，忽略输入 LAS 中已有的 AI |
+| 第三步 | `well_preprocess_status.csv`、`preprocessed_las/*.las` | 判断基础曲线是否可用；从 `DT_USM/RHO_GCC` 构造井震标定所需的速度、密度和波阻抗 |
 | 轨迹 QC | `well_trajectory.csv` | 优先用复核后的井型替代第一步的初分 |
 | 数据目录 | 时深表目录、井轨迹目录、井分层文件 | 时深表、Petrel 井轨迹、井分层 |
 | 地震数据 | ZGY 或 SEG-Y 体、解释层位 | 读取井旁地震道或沿轨迹道集，确定目标时间窗 |
 
-如果找不到最新的 `well_trajectory_*` 目录，脚本退回到第一步的井口/底孔初分来判定直井斜井——对直井没影响，但斜井判定可能不准。
+轨迹质检产物可用时，脚本优先采用其中的井型复核结果；缺少该产物时，井型取第一步井口/底孔坐标的初分结果。
 
 ---
 
@@ -49,6 +49,12 @@ seismic:
   zgy_inline_chunk_size: 16
 
 well_auto_tie:
+  source_runs:
+    well_inventory_dir: <well-inventory-run-dir>
+    well_screen_dir: <well-screen-run-dir>
+    well_preprocess_dir: <well-preprocess-run-dir>
+    well_trajectory_dir: <well-trajectory-qc-run-dir>
+
   target_interval:
     top_horizon: <top-horizon-file>
     bottom_horizon: <bottom-horizon-file>
@@ -61,20 +67,39 @@ well_auto_tie:
     - vertical_anchor_from_tops
     - deviated_with_tdt
 
+  tutorial_model: <wavelet-extractor-model-file>
+  tutorial_params: <wavelet-extractor-parameters-file>
+  target_crop_ms: 201.0
+
+  search_space:
+    logs_median_size_values: [51, 71, 91, 111]
+    logs_median_threshold_bounds: [0.5, 3.0]
+    logs_std_bounds: [20, 50]
+    table_t_shift_bounds: [-0.030, 0.030]
+  search_params:
+    num_iters: 60
+    similarity_std: 0.02
+  wavelet_scaling:
+    min_scale: 50000
+    max_scale: 500000
+    num_iters: 60
+
   coarse_correction:
     anchor:
       enabled: true
       apply_to_routes:
         - vertical_anchor_from_tops
-      config_file: experiments/well_auto_tie_anchors.yaml
+      config_file: <anchor-config-file>
     manual_shift:
       default_ms: 0.0
-      config_file: experiments/well_auto_tie_manual_shifts.yaml
+      by_route_ms: {}
+      config_file: <manual-shift-config-file>
 
   reject:
     allow_near_outside: false
     min_tie_samples: 64
     max_trajectory_outside_fraction: 0.05
+    max_short_log_gap_s: 0.010
 ```
 
 ### `source_runs`
@@ -85,21 +110,13 @@ well_auto_tie:
 
 ### `target_interval`
 
-定义每口井要标定的时间范围。脚本先读取顶底解释层位的双程旅行时，再在上下各留一段冗余时间，形成实际标定窗口。冗余不要太小，否则目标层边界附近的波形容易被截断；也不要太大，否则标定会被目标层外的强反射带偏。
+定义每口井要标定的时间范围。脚本先读取顶底解释层位的双程旅行时，再在上下各加入一段冗余时间，形成实际标定窗口。冗余过小时，目标层边界附近的波形可能被截断；冗余过大时，目标层外的强反射会进入标定窗口。
+
+`twt_unit` 支持 `auto`、`s`、`sec`、`second`、`seconds`、`ms`、`msec`、`millisecond` 和 `milliseconds`；默认值为 `auto`。自动模式将数值大于 20 的时间按毫秒解释，其余数值按秒解释。
 
 ### `enabled_routes`
 
-目前有三条可用的路径：
-
-| 路径 | 适合的井 | 关键资产 |
-|------|---------|---------|
-| `vertical_with_tdt` | 直井，有 Petrel 时深表 | 时深表 + 预处理 LAS |
-| `vertical_anchor_from_tops` | 直井，无时深表 | 井分层 + 解释层位 + 预处理 LAS |
-| `deviated_with_tdt` | 斜井，有 Petrel 时深表和井轨迹 | 时深表 + 井轨迹 + 预处理 LAS |
-
-脚本自身的保守默认只启用前两条。主配置 `experiments/common/common.yaml` 额外启用了 `deviated_with_tdt`。如果你暂时不想跑斜井，从配置里删掉它即可——对应井会在 `well_tie_plan.csv` 里显示为 `skipped_disabled`，不会报错。
-
-`deviated_anchor_from_tops`（斜井、无时深、有轨迹和分层）还没有落地，设计文档在 `docs/guide/deviated-well-src-cup-refactor.md`。
+脚本默认启用 `vertical_with_tdt` 和 `vertical_anchor_from_tops`。将 `deviated_with_tdt` 加入启用列表后，具备时深表和轨迹的斜井也进入执行集合。各路径的输入条件与执行支持见下方“第一步：路由”表格。
 
 ### `coarse_correction`
 
@@ -150,12 +167,16 @@ anchors:
 手动偏移规则：
 
 - `manual_shift.default_ms` 是全局默认值。
-- `manual_shift.config_file` 指向单井手动偏移文件；文件里的 `manual_shift.wells_ms.<well-name>` 覆盖单井，优先级最高。
+- `manual_shift.by_route_ms` 可按路线提供覆盖值。
+- `manual_shift.config_file` 指向单井手动偏移文件；文件里的 `manual_shift.wells_ms.<well-name>` 覆盖路线值，优先级最高。
 
 单井手动偏移文件形如：
 
 ```yaml
 manual_shift:
+  default_ms: 0.0
+  by_route_ms:
+    vertical_with_tdt: 0.0
   wells_ms:
     <well-name>: 0.0
 ```
@@ -183,49 +204,39 @@ manual_shift:
 
 ## 脚本在做什么
 
-脚本分四步：**路由 → 准备 TDT 和曲线 → 取地震道 → 细标定**。
+脚本按**路由、初始时深关系与测井窗口、地震道采样、细标定**四个阶段处理每口井。
 
 ### 第一步：路由
 
-把井资产、曲线可用性和轨迹 QC 合在一起，为每口井决定“能不能标、按哪条路径标”。结果写入 `well_tie_plan.csv`：
+合并井资产、曲线可用性、井型复核和工区位置。满足工区准入与曲线质量要求的井，按下表选择处理路径：
 
-| 条件 | 路径 | 状态 |
-|------|------|------|
-| 直井，有时深，曲线可用 | `vertical_with_tdt` | 已实现 |
-| 直井，无时深，有分层，曲线可用 | `vertical_anchor_from_tops` | 已实现 |
-| 斜井，有时深，有轨迹，曲线可用 | `deviated_with_tdt` | 已实现 |
-| 斜井，无时深，有轨迹+分层，曲线可用 | `deviated_anchor_from_tops` | 仅识别，未实现 |
-| 不满足以上任一 | `rejected` | — |
+| 输入条件 | 路由名称 | 执行支持 |
+|---------|---------|---------|
+| 直井，已有时深表 | `vertical_with_tdt` | 使用已有时深关系标定 |
+| 直井，无时深表，具备井分层 | `vertical_anchor_from_tops` | 由分层与解释层位建立锚点，再沿声波曲线积分 |
+| 斜井，具备时深表和井轨迹 | `deviated_with_tdt` | 沿轨迹采样地震，再使用已有时深关系标定 |
+| 斜井，无时深表，具备井轨迹和井分层 | `deviated_anchor_from_tops` | 计划器可以识别，执行器尚未实现 |
+| 输入或质量条件不满足 | `rejected` | 记录拒绝原因 |
 
-`route_status` 可以先粗看：`planned` 会执行，`skipped_disabled` 是路径条件满足但配置没启用，`rejected` 是资产或 QC 条件不满足。
+前三条路径在启用后执行；条件满足但路径未启用时，记录为待启用状态。路由计划同时保存选择结果、处理状态和原因，便于查看每口井的去向。
 
-### 第二步：准备初始时深表、粗校正和测井窗口
+### 第二步：准备初始时深关系、粗校正和测井窗口
 
-三条路径最终都会准备出一条”测深到双程旅行时”的初始关系：
+1. **建立初始关系。** 有时深表时读取 Petrel 时深表；无时深表时使用井分层深度与解释层位时间建立锚点，再沿声波曲线积分，得到测深到双程旅行时的关系。
+2. **应用粗校正。** 按配置把锚点校正和人工平移作用于整条时深关系；时深表只覆盖目标窗的一部分时，沿声波曲线向端点外延伸。
+3. **形成连续测井段。** 由标准声波和密度计算速度、波阻抗与反射系数，按双程旅行时长度线性填补短缺口，保留最长联合有效段，并检查地震采样轴上的最小样点数。时深表完全覆盖不到目标窗时，直井转入锚点处理，斜井记录为时深表与目标窗无重叠的失败状态。
 
-- **有时深表的路径**（`vertical_with_tdt`、`deviated_with_tdt`）：读取 Petrel 时深表；如果启用了锚点粗校正或手动偏移，先整体平移双程旅行时；如果它只覆盖了目标窗的一部分，再用声波曲线从时深表端点向上或向下补齐。
-- **锚点路径**（`vertical_anchor_from_tops`）：取一口井的某个分层测深和对应解释层位的双程旅行时作为锚点，沿声波曲线向上向下积分，建出初始 TDT；如果配置了手动偏移，再整体平移这个初始 TDT。
+### 第三步：采样地震道
 
-如果时深表完全不覆盖目标窗口，直井会自动改走锚点路径；斜井目前直接失败。
-
-### 第三步：取地震道
-
-**直井**只需要一个固定井位。脚本会把井口 XY 转成工区里的浮点线号/道号 index，读取周围四条相邻地震道，并按井口落在四邻道网格中的位置做双线性插值。这样可以避免井口刚好落在两条道之间时，被最近道选择带来阶跃误差。
-
-如果井口周围四邻道有缺失，或井口落到工区范围外，直井取道会失败；这类问题通常应回到第一步的 `survey_position` 和井口坐标检查。
-
-**斜井**不同——井眼不是垂直的，不同深度的轨迹点对应不同的地面 XY。如果还在井口读一条道，深部的标定就对不上。所以斜井需要沿轨迹逐点取道：
-
-1. 把目标窗口的双程旅行时轴上的每个样点，通过时深表转成测深，再查轨迹得到该测深处的 XY 坐标。
-2. 把每个 XY 转成工区里的浮点线号/道号 index，找到周围四条相邻地震道，按双线性插值权重加权合成该样点的地震振幅。四个邻道中有缺失的道权重为零，如果全部四个邻道都无法读取则判定该样点出界。
-3. 如果只有少量样点落到工区外面，裁剪到最长连续工区内段。
-4. 对其中用到的每条唯一地震道各读一次，再按双程旅行时样点逐点用双线性权重加权拼成一条"沿轨迹地震道"。
-
-每个样点的四个邻道索引、权重、是否在工区内，全部写进 `trace_sample_plan_<well>.csv`。`sample_method` 列标记为 `bilinear`。这种空间插值避免了井轨迹刚好落在两道之间时，最近道选择带来的阶跃误差——与直井的双线性取道逻辑一致。
+1. **直井固定位置采样。** 以井口平面位置转换时间域工区的浮点线号和道号，读取四个相邻网格位置并按双线性权重合成井旁地震道；线号间隔由地震体几何提供。
+2. **斜井沿轨迹采样。** 将每个双程旅行时样点转换为测深，再由轨迹插值得到平面位置，确定相邻地震道及其权重；每条唯一地震道只读取一次。
+3. **裁剪并保存采样计划。** 按样点权重组合沿轨迹地震道，统计工区内外比例，保留最长连续工区内区段；出界比例过高或有效样点数不足时，井进入失败状态。逐点保存相邻道索引、权重、浮点线号、浮点道号和工区内外状态，细标定后再依据优化时深关系生成对应计划。
 
 ### 第四步：细标定
 
-把准备好的曲线、地震道和初始时深关系交给自动标定模块。它会微调时深关系，让曲线正演出的合成记录尽量贴近实际地震道，并输出优化后的时深表、候选子波、合成记录和 QC 指标。
+1. **正演匹配。** 在目标时间窗内，将波阻抗反射系数与井旁或沿轨迹地震道进行卷积匹配。
+2. **联合搜索。** 同时搜索子波尺度、测井曲线滤波参数和时深整体平移，以相关系数和归一化平均绝对误差评价结果。
+3. **写出产物。** 根据最优参数生成优化时深表、能量归一化子波、合成记录、滤波后的标准曲线和逐井质量控制图。
 
 ---
 
@@ -314,11 +325,3 @@ planned_run_count / successful_tie_count
 | `trajectory_inside_tie_samples_too_few` | 裁剪后连续 inside 样点太少 | 放宽窗口 margin、检查轨迹，或暂时跳过这口井 |
 | `TWT axis outside table range` | 地震采样轴超出了 TDT 范围 | 检查声波拓延是否有足够曲线覆盖 |
 | `Seismic trace has zero standard deviation` | 读到的那段地震道完全没有振幅变化 | 检查地震体、窗口范围和道索引 |
-
----
-
-## 留到第二轮
-
-- `deviated_anchor_from_tops`：斜井无时深、有轨迹和分层的第四条路径。
-- 斜井轨迹线号/道号随双程旅行时变化的专用 QC 图。
-- 密井网下多井落到同一 trace/time 样点时的冲突诊断。

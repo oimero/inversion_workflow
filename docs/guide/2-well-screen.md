@@ -1,6 +1,6 @@
 # 02 LAS 曲线筛选与导出
 
-`well_screen.py` 是工作流的第二步。它读取第一步的 `well_inventory.csv`，对工区内且有 LAS 的每口井扫描曲线头，用本地曲线名规则把每条曲线归类，选出每类的 primary 曲线，最后把通过筛选的井导出瘦身 LAS。
+`well_screen.py` 是工作流的第二步。它读取第一步的井资产清单，按配置的位置范围筛选候选井，用本地曲线名规则分类并选择各类别的代表曲线，最后为通过筛选的井导出精简 LAS。
 
 ---
 
@@ -8,11 +8,11 @@
 
 ```bash
 python scripts/well_screen.py
-python scripts/well_screen.py --config experiments/my_project.yaml
-python scripts/well_screen.py --output-dir /tmp/screen_test
+python scripts/well_screen.py --config experiments/<project>.yaml
+python scripts/well_screen.py --output-dir <OUTPUT_DIR>
 ```
 
-不带参数运行时，脚本读取 `experiments/common/common.yaml`，自动发现最新的 `well_inventory_*/well_inventory.csv`，在 `scripts/output/well_screen_<timestamp>/` 下写出结果。
+不带参数运行时，脚本读取 `experiments/common/common.yaml`，自动发现配置中 `output_root` 下最新的井资产盘点结果，并在 `output_root/well_screen_<timestamp>/` 下写出结果；未配置 `output_root` 时使用 `scripts/output`。复现实验时可以在 `source_runs.well_inventory_dir` 中指定固定的上游目录。
 
 当前版本只使用可复现的本地曲线名规则和人工 override。
 
@@ -34,8 +34,11 @@ python scripts/well_screen.py --output-dir /tmp/screen_test
 ## 配置参考
 
 ```yaml
+data_root: <DATA_ROOT>
+output_root: <OUTPUT_ROOT>
+
 assets:
-  las_dir: all_well_las
+  las_dir: <LAS_DIRECTORY>
 
 well_curves:
   required_categories: [p_sonic, density]
@@ -57,7 +60,7 @@ well_screen:
 
   classification:
     curve_schema_file: null                  # null = 使用内置 CURVE_CATEGORY_MNEMONICS
-    curve_override_file: experiments/common/curve_alias_overrides.yaml
+    curve_override_file: "<curve-override-file>"
 ```
 
 ### `source_runs`
@@ -99,8 +102,8 @@ global_priority:                  # 覆盖全局 primary 选择优先级
   density: [RHOB, DEN, RHOZ]
 
 global_force_category:            # 工区级特殊 mnemonic → 标准类别
-  DTCO_QYZ_CLAER: p_sonic
-  RHOZ_QYZ_CLAER: density
+  <custom-sonic-curve>: p_sonic
+  <custom-density-curve>: density
 
 wells:
   <well-name>:                    # 单井配置（井名大小写不敏感）
@@ -118,6 +121,16 @@ wells:
 - `force_category`：把特殊命名但含义明确的曲线强制归入指定类别。
 
 所有 override 均可追溯：分类结果中的 `classification_source` 字段会标记 `override`，`notes` 会记录具体原因。
+
+---
+
+## 脚本在做什么
+
+1. **筛选候选井。** 从资产清单中选择同时具备井头和测井文件，且工区位置与资产状态满足要求的井。
+2. **识别曲线类别。** 读取测井文件头，依据曲线名称和可选人工规则，将曲线归入声波、密度、井径等类别。
+3. **选择代表曲线。** 同一类别有多条候选时，依次使用单井指定、全局优先顺序、内置优先顺序和原文件顺序作出选择。类别不明确或被人工禁用的曲线不参与选择。
+4. **判断井是否通过。** 检查所选曲线是否覆盖全部必需类别，记录通过、部分满足或失败的状态及原因。
+5. **导出精简测井文件。** 对通过的井保留各类别的代表曲线，并检查必需曲线是否确实写入导出文件。
 
 ---
 
@@ -217,7 +230,7 @@ lasio 读取 LAS 时，同名曲线可能被自动添加 `:1`、`:2` 等后缀�
 ### 第一步：看终端输出
 
 ```
-LAS curve screen summary: 61 candidates, 38 passed, 22 partial, 1 failed, 38 LAS exported.
+LAS curve screen summary: <CANDIDATE_COUNT> candidates, <PASSED_COUNT> passed, <PARTIAL_COUNT> partial, <FAILED_COUNT> failed, <EXPORTED_COUNT> LAS exported.
 ```
 
 四数之和应等于 candidates。如果 `partial` 比例很高（>30%），说明工区内许多井缺 density 或 p_sonic——需要检查是 LAS 数据本身缺失，还是曲线名规则没覆盖。
@@ -243,9 +256,3 @@ LAS 文件缺失、解析异常或导出异常属于运行错误，脚本会直�
 ### 第四步：抽查 `curve_classification/*.json`
 
 对任何 `failed` 或 `partial` 的井，打开对应 JSON 查看完整的曲线头和分类判断，确认是数据本身缺失还是规则需要调整。
-
----
-
-## 留到第二轮
-
-- **LLM 分类当前未实现。**

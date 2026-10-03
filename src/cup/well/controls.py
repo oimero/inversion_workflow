@@ -1333,15 +1333,15 @@ def _waveform_objects(
     log_ai: np.ndarray,
     synthetic: np.ndarray,
     real: np.ndarray,
-    dynamic_window_m: float,
+    dynamic_window_axis_units: float,
     name: str,
     basis_type: str = "tvdss",
-    dynamic_window_axis_units: float | None = None,
 ) -> tuple[grid.Log, grid.Log, grid.Seismic, grid.Seismic, grid.XCorr, grid.DynamicXCorr]:
     if basis_type not in {"twt", "tvdss"}:
         raise ValueError("Waveform objects require an explicit TWT or TVDSS basis.")
-    if basis_type == "twt" and dynamic_window_axis_units is None:
-        raise ValueError("Time waveform objects require the dynamic correlation window in seconds.")
+    window_axis_units = float(dynamic_window_axis_units)
+    if not np.isfinite(window_axis_units) or window_axis_units <= 0.0:
+        raise ValueError("dynamic_window_axis_units must be finite and positive.")
     linear_ai = grid.Log(
         np.exp(log_ai),
         axis,
@@ -1364,7 +1364,7 @@ def _waveform_objects(
     dynamic = _dynamic_xcorr(
         real_trace,
         synthetic_trace,
-        window_axis_units=dynamic_window_m if dynamic_window_axis_units is None else dynamic_window_axis_units,
+        window_axis_units=window_axis_units,
     )
     return linear_ai, reflectivity, synthetic_trace, real_trace, xcorr, dynamic
 
@@ -1574,7 +1574,7 @@ def write_depth_well_control_qc(
             log_ai=model_grid_filtered_log_ai[selected],
             synthetic=local_full_forward,
             real=local_real,
-            dynamic_window_m=dynamic_window,
+            dynamic_window_axis_units=dynamic_window,
             name="Full AI",
         )
         full_corr = _safe_corr(local_real, local_full_forward)
@@ -1599,7 +1599,7 @@ def write_depth_well_control_qc(
             log_ai=body_log_ai[selected],
             synthetic=local_body_forward,
             real=local_real,
-            dynamic_window_m=dynamic_window,
+            dynamic_window_axis_units=dynamic_window,
             name=f"{body_fwhm:g} m body AI",
         )
         body_corr = _safe_corr(local_real, local_body_forward)

@@ -96,18 +96,16 @@ def waveform_shape_loss(
     )
 
 
-def _gaussian_weights(coordinates_m: Tensor, *, fwhm_m: float) -> Tensor:
-    if coordinates_m.ndim == 1:
-        coordinates = coordinates_m[None, :]
-    elif coordinates_m.ndim == 2:
-        coordinates = coordinates_m
-    else:
-        raise ValueError("coordinates_m must have shape (samples,) or (batch, samples).")
+def _gaussian_weights(coordinates: Tensor, *, fwhm: float) -> Tensor:
+    if coordinates.ndim == 1:
+        coordinates = coordinates[None, :]
+    elif coordinates.ndim != 2:
+        raise ValueError("coordinates must have shape (samples,) or (batch, samples).")
     if not torch.is_floating_point(coordinates):
-        raise ValueError("coordinates_m must be floating.")
-    width = float(fwhm_m)
+        raise ValueError("coordinates must be floating.")
+    width = float(fwhm)
     if not math.isfinite(width) or width <= 0.0:
-        raise ValueError("fwhm_m must be finite and positive.")
+        raise ValueError("fwhm must be finite and positive.")
     sigma = width / (2.0 * math.sqrt(2.0 * math.log(2.0)))
     distance = coordinates[:, :, None] - coordinates[:, None, :]
     weights = torch.exp(-0.5 * torch.square(distance / sigma))
@@ -116,16 +114,16 @@ def _gaussian_weights(coordinates_m: Tensor, *, fwhm_m: float) -> Tensor:
 
 def masked_physical_lowpass(
     values: Tensor,
-    coordinates_m: Tensor,
+    coordinates: Tensor,
     support_mask: Tensor | None = None,
     *,
-    cutoff_wavelength_m: float,
+    cutoff_scale: float,
 ) -> tuple[Tensor, Tensor]:
     """Apply a differentiable physical-coordinate Gaussian low-pass.
 
-    The cutoff is recorded in metres and the actual weights use coordinate
-    distances.  No sample-count conversion is performed, which is important
-    for depth axes and for surveys with non-unit line steps.
+    The cutoff uses the same coordinate units as ``coordinates`` and the
+    actual weights use coordinate distances.  No sample-count conversion is
+    performed.
     """
 
     if values.ndim != 2 or not torch.is_floating_point(values):
@@ -138,11 +136,11 @@ def masked_physical_lowpass(
         if support_mask.shape != values.shape or support_mask.dtype != torch.bool:
             raise ValueError("support_mask must be boolean and match values.")
         support = support_mask
-    weights = _gaussian_weights(coordinates_m.to(device=values.device, dtype=values.dtype), fwhm_m=cutoff_wavelength_m)
+    weights = _gaussian_weights(coordinates.to(device=values.device, dtype=values.dtype), fwhm=cutoff_scale)
     if weights.shape[0] == 1 and values.shape[0] != 1:
         weights = weights.expand(values.shape[0], -1, -1)
     if weights.shape != (values.shape[0], values.shape[1], values.shape[1]):
-        raise ValueError("coordinates_m batch dimension differs from values.")
+        raise ValueError("coordinates batch dimension differs from values.")
     support_float = support.to(dtype=values.dtype)
     weighted = weights * support_float[:, None, :]
     denominator = torch.sum(weighted, dim=-1)
@@ -285,10 +283,10 @@ def lfm_anchor_loss(
 
 def short_wave_energy_ratio(
     values: Tensor,
-    coordinates_m: Tensor,
+    coordinates: Tensor,
     support_mask: Tensor | None = None,
     *,
-    body_smoothing_fwhm_m: float,
+    body_smoothing_fwhm: float,
 ) -> Tensor:
     """Return short-wave energy as a fraction of non-DC body variation."""
 
@@ -296,9 +294,9 @@ def short_wave_energy_ratio(
         support_mask = torch.ones_like(values, dtype=torch.bool)
     low, support = masked_physical_lowpass(
         values,
-        coordinates_m,
+        coordinates,
         support_mask,
-        cutoff_wavelength_m=body_smoothing_fwhm_m,
+        cutoff_scale=body_smoothing_fwhm,
     )
     usable = support & support_mask
     high = values - low
@@ -317,20 +315,20 @@ def short_wave_energy_ratio(
 
 def _masked_gaussian_smooth(
     values: Tensor,
-    coordinates_m: Tensor,
+    coordinates: Tensor,
     support_mask: Tensor,
     *,
-    fwhm_m: float,
+    fwhm: float,
 ) -> tuple[Tensor, Tensor]:
     """Smooth masked traces, using convolution on regular physical axes."""
 
-    if coordinates_m.ndim == 1:
-        coordinates = coordinates_m[None, :].expand(values.shape[0], -1)
+    if coordinates.ndim == 1:
+        coordinates = coordinates[None, :].expand(values.shape[0], -1)
     else:
-        coordinates = coordinates_m
+        coordinates = coordinates
     outputs: list[Tensor] = []
     supports: list[Tensor] = []
-    sigma = float(fwhm_m) / (2.0 * math.sqrt(2.0 * math.log(2.0)))
+    sigma = float(fwhm) / (2.0 * math.sqrt(2.0 * math.log(2.0)))
     epsilon = torch.finfo(values.dtype).eps
     for row in range(values.shape[0]):
         differences = torch.diff(coordinates[row])
@@ -368,7 +366,7 @@ def _masked_gaussian_smooth(
                 padding=half_width,
             )[0, 0]
         else:
-            weights = _gaussian_weights(coordinates[row], fwhm_m=fwhm_m)[0]
+            weights = _gaussian_weights(coordinates[row], fwhm=fwhm)[0]
             numerator = weights @ (values[row] * support_float)
             denominator = weights @ support_float
         valid = denominator > epsilon
@@ -379,24 +377,24 @@ def _masked_gaussian_smooth(
 
 def local_standard_deviation(
     values: Tensor,
-    coordinates_m: Tensor,
+    coordinates: Tensor,
     support_mask: Tensor,
     *,
-    smoothing_fwhm_m: float,
+    smoothing_fwhm: float,
 ) -> tuple[Tensor, Tensor]:
     """Return a physical-window local standard deviation on masked support."""
 
     mean, mean_support = _masked_gaussian_smooth(
         values,
-        coordinates_m,
+        coordinates,
         support_mask,
-        fwhm_m=smoothing_fwhm_m,
+        fwhm=smoothing_fwhm,
     )
     second, second_support = _masked_gaussian_smooth(
         torch.square(values),
-        coordinates_m,
+        coordinates,
         support_mask,
-        fwhm_m=smoothing_fwhm_m,
+        fwhm=smoothing_fwhm,
     )
     support = support_mask & mean_support & second_support
     standard_deviation = torch.sqrt(torch.clamp(second - torch.square(mean), min=0.0))

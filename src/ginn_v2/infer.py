@@ -78,7 +78,7 @@ class BodyInverter:
         construction = self.smoother.construct(
             batch.lfm_log_ai,
             raw_body - batch.lfm_log_ai,
-            self.adapter.vertical_coordinates_m(common),
+            self.adapter.vertical_coordinates(common),
             batch.lfm_valid_mask,
             sample_step=float(self.reader.sample_axis.step),
             lfm_lowpass_spec=self.lfm_lowpass_spec,
@@ -412,7 +412,7 @@ def _smooth_volume_curves(
             construction = inverter.smoother.construct(
                 initial_values,
                 values - initial_values,
-                inverter.adapter.vertical_coordinates_m(common),
+                inverter.adapter.vertical_coordinates(common),
                 support,
                 sample_step=float(reader.sample_axis.step),
                 lfm_lowpass_spec=inverter.lfm_lowpass_spec,

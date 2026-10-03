@@ -135,17 +135,17 @@ class BodySmoother:
     training and well-target paths.
     """
 
-    smoothing_fwhm_m: float
+    smoothing_fwhm: float
 
     def __post_init__(self) -> None:
-        width = float(self.smoothing_fwhm_m)
+        width = float(self.smoothing_fwhm)
         if not math.isfinite(width) or width <= 0.0:
-            raise ValueError("smoothing_fwhm_m must be finite and positive.")
+            raise ValueError("smoothing_fwhm must be finite and positive.")
 
     def smooth(
         self,
         values: Tensor,
-        coordinates_m: Tensor,
+        coordinates: Tensor,
         support_mask: Tensor,
     ) -> Tensor:
         """Smooth a batch of curves and return zeros outside ``support_mask``."""
@@ -154,17 +154,17 @@ class BodySmoother:
             raise ValueError("values must be a floating (batch, samples) tensor.")
         if not bool(torch.all(torch.isfinite(values)).item()):
             raise ValueError("values must contain only finite values.")
-        if coordinates_m.ndim not in {1, 2} or not torch.is_floating_point(coordinates_m):
-            raise ValueError("coordinates_m must be a floating one- or two-dimensional tensor.")
+        if coordinates.ndim not in {1, 2} or not torch.is_floating_point(coordinates):
+            raise ValueError("coordinates must be a floating one- or two-dimensional tensor.")
         if support_mask.shape != values.shape or support_mask.dtype != torch.bool:
             raise ValueError("support_mask must be boolean and match values.")
-        if coordinates_m.ndim == 1 and coordinates_m.shape[0] != values.shape[1]:
-            raise ValueError("coordinates_m sample count differs from values.")
-        if coordinates_m.ndim == 2 and coordinates_m.shape != values.shape:
-            raise ValueError("coordinates_m batch shape differs from values.")
-        coordinates = coordinates_m.to(device=values.device, dtype=values.dtype)
+        if coordinates.ndim == 1 and coordinates.shape[0] != values.shape[1]:
+            raise ValueError("coordinates sample count differs from values.")
+        if coordinates.ndim == 2 and coordinates.shape != values.shape:
+            raise ValueError("coordinates batch shape differs from values.")
+        coordinates = coordinates.to(device=values.device, dtype=values.dtype)
         if not bool(torch.all(torch.isfinite(coordinates)).item()):
-            raise ValueError("coordinates_m must contain only finite values.")
+            raise ValueError("coordinates must contain only finite values.")
         output = torch.zeros_like(values)
         support_cpu = support_mask.detach().cpu().numpy()
         runs: dict[tuple[int, int], list[int]] = {}
@@ -180,7 +180,7 @@ class BodySmoother:
             if coordinates.ndim == 1:
                 weights = _gaussian_weights(
                     coordinates[start:stop],
-                    fwhm_m=self.smoothing_fwhm_m,
+                    fwhm=self.smoothing_fwhm,
                 )[0].to(device=values.device, dtype=values.dtype)
                 row_indices = torch.as_tensor(row_values, device=values.device, dtype=torch.long)
                 output[row_indices, start:stop] = values[row_indices, start:stop] @ weights.T
@@ -191,7 +191,7 @@ class BodySmoother:
                 segment_coordinates = coordinates[row_indices, start:stop]
                 weights = _gaussian_weights(
                     segment_coordinates,
-                    fwhm_m=self.smoothing_fwhm_m,
+                    fwhm=self.smoothing_fwhm,
                 ).to(device=values.device, dtype=values.dtype)
                 output[row_indices, start:stop] = torch.bmm(
                     weights,
@@ -202,13 +202,13 @@ class BodySmoother:
     def smooth_numpy(
         self,
         values: np.ndarray,
-        coordinates_m: np.ndarray,
+        coordinates: np.ndarray,
         support_mask: np.ndarray,
     ) -> np.ndarray:
         """Smooth one NumPy curve and return NaN outside ``support_mask``."""
 
         array = np.asarray(values, dtype=np.float64)
-        coordinates = np.asarray(coordinates_m, dtype=np.float64)
+        coordinates = np.asarray(coordinates, dtype=np.float64)
         support = np.asarray(support_mask, dtype=bool)
         if array.ndim != 1 or coordinates.ndim != 1 or support.shape != array.shape:
             raise ValueError("NumPy smoother inputs must be matching one-dimensional arrays.")
@@ -229,7 +229,7 @@ class BodySmoother:
         self,
         initial_log_ai: Tensor,
         raw_correction: Tensor,
-        coordinates_m: Tensor,
+        coordinates: Tensor,
         support_mask: Tensor,
         *,
         sample_step: float,
@@ -266,8 +266,8 @@ class BodySmoother:
             raise ValueError("sample_step must be finite and positive.")
         if not isinstance(lfm_lowpass_spec, LowpassSpec):
             raise TypeError("lfm_lowpass_spec must be a LowpassSpec.")
-        baseline = self.smooth(initial_log_ai, coordinates_m, support_mask)
-        smoothed_raw = self.smooth(initial_log_ai + raw_correction, coordinates_m, support_mask)
+        baseline = self.smooth(initial_log_ai, coordinates, support_mask)
+        smoothed_raw = self.smooth(initial_log_ai + raw_correction, coordinates, support_mask)
         correction = smoothed_raw - baseline
         if lfm_lowpass_spec.enabled:
             low_frequency, low_support = masked_lfm_lowpass(

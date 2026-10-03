@@ -30,7 +30,6 @@ from ginn_v2.data import (
     build_well_patch_targets,
     build_well_splits,
     make_spatial_split,
-    well_smoothing_coordinates,
     well_target_zone_mask,
 )
 from ginn_v2.diagnose import write_well_waveform_qc
@@ -315,10 +314,12 @@ class CheckpointSelectionWeights:
 class BodyInversionConfig:
     """Frozen body-inversion business and training configuration."""
 
-    body_smoothing_fwhm_m: float
     selection_weights: CheckpointSelectionWeights
-    waveform_qc_dynamic_window_m: float
     warnings: WarningThresholds
+    body_smoothing_fwhm_m: float | None = None
+    waveform_qc_dynamic_window_m: float | None = None
+    body_smoothing_fwhm_s: float | None = None
+    waveform_qc_dynamic_window_s: float | None = None
     patch_radius: int = 8
     batch_size: int = 8
     pretrain_epochs: int = 1
@@ -344,23 +345,54 @@ class BodyInversionConfig:
     seismic_balance_floor_fraction: float = 0.10
     loss_weights: BodyInversionLossWeights = BodyInversionLossWeights()
     network: BodyNetworkConfig = BodyNetworkConfig()
+
+    @property
+    def sample_domain(self) -> str:
+        return "time" if self.body_smoothing_fwhm_s is not None else "depth"
+
+    @property
+    def sample_unit(self) -> str:
+        return "s" if self.sample_domain == "time" else "m"
+
+    @property
+    def body_smoothing_fwhm(self) -> float:
+        return float(getattr(self, f"body_smoothing_fwhm_{self.sample_unit}"))
+
+    @property
+    def waveform_qc_dynamic_window(self) -> float:
+        return float(getattr(self, f"waveform_qc_dynamic_window_{self.sample_unit}"))
+
+    def require_domain(self, sample_domain: str) -> None:
+        if self.sample_domain != sample_domain:
+            unit = "s" if sample_domain == "time" else "m"
+            raise ValueError(
+                f"{sample_domain} training requires body_smoothing_fwhm_{unit} "
+                f"and waveform_qc_dynamic_window_{unit}."
+            )
+
     def __post_init__(self) -> None:
+        metre_scales = (self.body_smoothing_fwhm_m, self.waveform_qc_dynamic_window_m)
+        second_scales = (self.body_smoothing_fwhm_s, self.waveform_qc_dynamic_window_s)
+        if all(value is not None for value in metre_scales) and all(value is None for value in second_scales):
+            scales = metre_scales
+        elif all(value is not None for value in second_scales) and all(value is None for value in metre_scales):
+            scales = second_scales
+        else:
+            raise ValueError("Provide both body/QC scales in seconds or both in metres, without mixing domains.")
+        if any(not np.isfinite(float(value)) or float(value) <= 0.0 for value in scales):
+            raise ValueError("Body smoothing and waveform QC scales must be finite and positive.")
         for name in (
-            "body_smoothing_fwhm_m",
             "pretrain_learning_rate",
             "finetune_learning_rate",
             "weight_decay",
             "gradient_clip_norm",
             "validation_gap_m",
-            "waveform_qc_dynamic_window_m",
         ):
             value = float(getattr(self, name))
             if not np.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative.")
-        if self.body_smoothing_fwhm_m <= 0.0 or self.pretrain_learning_rate <= 0.0 or self.finetune_learning_rate <= 0.0:
-            raise ValueError("Body scale and learning rates must be positive.")
-        if self.waveform_qc_dynamic_window_m <= 0.0:
-            raise ValueError("waveform_qc_dynamic_window_m must be positive.")
+        if self.pretrain_learning_rate <= 0.0 or self.finetune_learning_rate <= 0.0:
+            raise ValueError("Learning rates must be positive.")
         _positive_int(self.patch_radius, name="patch_radius")
         _positive_int(self.batch_size, name="batch_size")
         _positive_int(self.max_train_centers, name="max_train_centers")
@@ -390,7 +422,7 @@ class BodyInversionConfig:
             raise ValueError("seismic_balance_floor_fraction must be within (0, 1).")
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "BodyInversionConfig":
+    def from_mapping(cls, value: Mapping[str, Any], *, sample_domain: str) -> "BodyInversionConfig":
         config = dict(value)
         loss_value = config.pop("loss_weights", config.pop("loss", {}))
         warning_value = config.pop("warnings", {})
@@ -407,17 +439,19 @@ class BodyInversionConfig:
             config["trusted_well_names"] = tuple(config["trusted_well_names"])
         if "orientations" in config:
             config["orientations"] = tuple(config["orientations"])
-        return cls(
+        result = cls(
             **config,
             loss_weights=BodyInversionLossWeights(**dict(loss_value)),
             warnings=WarningThresholds(**dict(warning_value)),
             network=BodyNetworkConfig(**dict(network_value)),
             selection_weights=CheckpointSelectionWeights(**dict(selection_value)),
         )
+        result.require_domain(sample_domain)
+        return result
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
-            "body_smoothing_fwhm_m": self.body_smoothing_fwhm_m,
+            f"body_smoothing_fwhm_{self.sample_unit}": self.body_smoothing_fwhm,
             "selection_weights": asdict(self.selection_weights),
             "patch_radius": self.patch_radius,
             "batch_size": self.batch_size,
@@ -433,7 +467,7 @@ class BodyInversionConfig:
             "validation_gap_m": self.validation_gap_m,
             "validation_anchor": self.validation_anchor,
             "well_batch_multiplier": self.well_batch_multiplier,
-            "waveform_qc_dynamic_window_m": self.waveform_qc_dynamic_window_m,
+            f"waveform_qc_dynamic_window_{self.sample_unit}": self.waveform_qc_dynamic_window,
             "trusted_well_names": list(self.trusted_well_names),
             "orientations": list(self.orientations),
             "device": self.device,
@@ -452,7 +486,7 @@ class BodyInversionConfig:
         """Return only the model semantics required to reuse pretraining."""
 
         return {
-            "body_smoothing_fwhm_m": self.body_smoothing_fwhm_m,
+            f"body_smoothing_fwhm_{self.sample_unit}": self.body_smoothing_fwhm,
             "patch_radius": self.patch_radius,
             "orientations": list(self.orientations),
             "seismic_feature_mode": self.seismic_feature_mode,
@@ -523,6 +557,7 @@ def build_body_inversion_data(
 ) -> BodyInversionData:
     """Freeze the spatial split and trusted-well sample identities once."""
 
+    config.require_domain(reader.sample_axis.domain)
     control_by_name = {item.well_name: item for item in controls.controls}
     trusted: list[Any] = []
     for name in config.trusted_well_names:
@@ -539,17 +574,11 @@ def build_body_inversion_data(
         source_run_type=controls.source_run_type,
         provenance=controls.provenance,
     )
-    smoother = BodySmoother(smoothing_fwhm_m=config.body_smoothing_fwhm_m)
+    smoother = BodySmoother(smoothing_fwhm=config.body_smoothing_fwhm)
     targets: dict[str, WellTarget] = {}
     for control in trusted:
-        model_coordinates, native_coordinates = well_smoothing_coordinates(
-            control,
-            geometry=reader.geometry,
-            domain_extras=reader.domain_extras,
-        )
         targets[control.well_name] = build_well_body_target(
             control,
-            body_smoothing_fwhm_m=config.body_smoothing_fwhm_m,
             target_zone_support=well_target_zone_mask(
                 control,
                 geometry=reader.geometry,
@@ -557,8 +586,6 @@ def build_body_inversion_data(
             ),
             geometry=reader.geometry,
             smoother=smoother,
-            model_smoothing_coordinates_m=model_coordinates,
-            native_smoothing_coordinates_m=native_coordinates,
         )
     well_splits = build_well_splits(
         trusted_set,
@@ -698,7 +725,7 @@ class BodyInversionTrainer:
         self.adapter = adapter
         self.config = config
         self.lfm_lowpass_spec = lfm_lowpass_spec
-        self.smoother = BodySmoother(smoothing_fwhm_m=config.body_smoothing_fwhm_m)
+        self.smoother = BodySmoother(smoothing_fwhm=config.body_smoothing_fwhm)
         self.output_dir = Path(output_dir)
         self.artifact_root = Path(artifact_root) if artifact_root is not None else self.output_dir
         self.log = logger or logging.getLogger(__name__)
@@ -722,7 +749,7 @@ class BodyInversionTrainer:
         )
 
     def _coordinates(self, common: CommonObservationBatch) -> Tensor:
-        return self.adapter.vertical_coordinates_m(common)
+        return self.adapter.vertical_coordinates(common)
 
     def _predict(
         self,
@@ -988,13 +1015,13 @@ class BodyInversionTrainer:
                     common.observed_seismic,
                     coordinates,
                     common.observed_valid_mask,
-                    smoothing_fwhm_m=self.config.waveform_qc_dynamic_window_m,
+                    smoothing_fwhm=self.config.waveform_qc_dynamic_window,
                 )
                 body_amplitude, body_support = local_standard_deviation(
                     body - baseline,
                     coordinates,
                     common.observed_valid_mask & batch.lfm_valid_mask,
-                    smoothing_fwhm_m=self.config.waveform_qc_dynamic_window_m,
+                    smoothing_fwhm=self.config.waveform_qc_dynamic_window,
                 )
                 amplitude_support = seismic_support & body_support & (seismic_amplitude > 0.0) & (body_amplitude > 0.0)
                 correlations.append(shape.correlation.cpu().numpy())
@@ -1285,7 +1312,7 @@ class BodyInversionTrainer:
             body_amplitude = np.stack([trace_eval["body_amplitude"][item] for item in keys])
             diagnostic_values = (seismic_amplitude, body_amplitude)
             titles = (
-                f"Seismic local variation ({self.config.waveform_qc_dynamic_window_m:g} m)",
+                f"Seismic local variation ({self.config.waveform_qc_dynamic_window:g} {self.config.sample_unit})",
                 "Body-increment local variation",
             )
             figure, axes = plt.subplots(1, 2, figsize=(10, 5), sharex=True, sharey=True)
@@ -1339,7 +1366,7 @@ class BodyInversionTrainer:
                     body,
                     coordinates,
                     support,
-                    body_smoothing_fwhm_m=self.config.body_smoothing_fwhm_m,
+                    body_smoothing_fwhm=self.config.body_smoothing_fwhm,
                 )
                 lfm_short_wave = short_wave_energy_ratio(
                     torch.as_tensor(
@@ -1349,7 +1376,7 @@ class BodyInversionTrainer:
                     ),
                     coordinates,
                     support,
-                    body_smoothing_fwhm_m=self.config.body_smoothing_fwhm_m,
+                    body_smoothing_fwhm=self.config.body_smoothing_fwhm,
                 )
                 short_wave_values.append(
                     (body_short_wave / torch.clamp(lfm_short_wave, min=torch.finfo(body_short_wave.dtype).eps))

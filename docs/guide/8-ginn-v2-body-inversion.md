@@ -1,8 +1,8 @@
 # 08 GINN v2 主体反演
 
-`body_train.py` 是工作流的第八步。它读取第六步井控、第七步选定的低频模型和固定正演输入，先进行地震自监督预训练，再用可信井曲线微调，输出模型权重、逐轮评价和局部质检结果。
+`body_train.py` 是工作流的第八步。它读取第六步井控、第七步选定的低频模型和第五步选定子波，先进行地震自监督预训练，再用可信井曲线微调，输出模型权重、逐轮评价和局部质检结果。
 
-本文按时间域工区说明。主体输出由平滑后的初始模型与受低频约束的网络修正共同组成，平滑尺度以米表达。
+本文按时间域工区说明。主体输出由平滑后的初始模型与受低频约束的网络修正共同组成，主体平滑、井目标导数和波形质检窗口沿 TWT 轴计算，尺度以秒表达。深度域配置见[深度域工作流](depth-domain-workflow.md)。
 
 ---
 
@@ -30,6 +30,8 @@ python scripts/body_train.py --config "<body-config-yaml>" --stage finetune --pr
 
 复用预训练时，网络结构、主体尺度、补丁半径、采样方向、地震特征和预训练损失设置必须与权重中保存的配置一致。
 
+训练入口支持用命令行覆盖上游输入：`--lfm-run-dir`、`--variant-id`、`--well-control-run-dir` 和 `--wavelet-generation-run-dir`。分阶段微调还需要 `--pretrain-checkpoint`。
+
 ### 可选：全体积预测
 
 训练结束后会生成井旁与局部剖面质检。全体积预测由单独的入口执行：
@@ -46,6 +48,8 @@ python scripts/body_infer.py --config "<body-config-yaml>" --checkpoint "<select
 
 局部区域需同时使用 `--skip-segy-export`，因为地震格式导出要求完整工区体。未完成的预测运行可以用相同输出目录和 `--resume` 接续。
 
+预测入口同样支持 `--lfm-run-dir`、`--variant-id`、`--well-control-run-dir` 和 `--wavelet-generation-run-dir` 覆盖时间域上游输入。
+
 ---
 
 ## 运行前需要什么
@@ -54,16 +58,12 @@ python scripts/body_infer.py --config "<body-config-yaml>" --checkpoint "<select
 |------|------------|------|
 | 第六步 | `run_summary.json`、`well_control_manifest.csv` 和逐井 NPZ | 可信井的阻抗曲线、有效样点与逐样点位置 |
 | 第七步 | `lfm_run_summary.json`、`variant_manifest.csv` 和选定变体的 `lfm.npz` | 初始对数阻抗、有效掩码、输出轴和建模配置 |
-| 正演输入目录 | `forward_model_inputs.json` | 固定子波、采样域及正演所需信息 |
-| 子波来源 | 第五步的 `selected_wavelet.csv` 等符合正演接口的子波 | 由正演输入文件中记录的路径引用 |
+| 第五步子波目录 | `selected_wavelet.csv` | 固定子波的时间和振幅，直接由第八步读取 |
 | 工区配置 | 时间域地震体 | 网络输入与地震形态监督 |
-| 速度来源 | 完整速度 NPY，或正演输入中的阻抗—速度关系 | 将双程旅行时转换为米制坐标，用于主体平滑和曲线导数 |
 
 第六步与第七步都需要完成，第八步同时读取两者。选定的低频模型必须是三维体，并完整覆盖当前地震体的时间轴和线网，与井控集采用相同的空间几何。通常使用第七步的全工区输出模式。
 
 可信井名单需要显式填写，名单中的每口井都应存在于第六步成功井中，并具有可用的训练目标。
-
-当前入口要求显式的正演输入目录；时间域正演输入的生成入口与主线接入方式仍需补齐。
 
 ---
 
@@ -79,15 +79,14 @@ ginn_v2_body_inversion:
     lfm_run_dir: "<lfm-run-dir>"
     variant_id: "<lfm-variant-id>"
     well_control_run_dir: "<well-control-run-dir>"
-    forward_model_inputs_run_dir: "<forward-input-run-dir>"
-    velocity_volume: "<velocity-volume-npy>"
+    wavelet_generation_run_dir: "<wavelet-generation-run-dir>"
 
   training:
     trusted_well_names:
       - "<trusted-well-a>"
       - "<trusted-well-b>"
-    body_smoothing_fwhm_m: "<body-fwhm-m>"
-    waveform_qc_dynamic_window_m: "<qc-window-m>"
+    body_smoothing_fwhm_s: "<body-fwhm-s>"
+    waveform_qc_dynamic_window_s: "<qc-window-s>"
     patch_radius: 8
     orientations: [inline, xline]
     batch_size: 8
@@ -134,19 +133,18 @@ ginn_v2_body_inversion:
 | `lfm_run_dir` | 第七步运行目录 |
 | `variant_id` | 该运行中实际存在的模型变体名称 |
 | `well_control_run_dir` | 第六步运行目录 |
-| `forward_model_inputs_run_dir` | 包含固定正演输入文件的目录 |
-| `velocity_volume` | 米制坐标换算使用的完整纵波速度体，单位为 m/s |
+| `wavelet_generation_run_dir` | 第五步运行目录，直接读取其中的 `selected_wavelet.csv` |
 
-前四项必须显式填写，可以用对应的命令行参数覆盖。相对路径均从仓库根目录解析。输入目录与变体不会自动发现。
+四项上游输入必须显式填写，可以用对应的命令行参数覆盖。相对路径均从仓库根目录解析，目录与变体按配置明确解析。
 
-时间域米制坐标需要纵波速度。可以显式提供速度体；当初始模型全部有限时，也可以由正演输入中的阻抗—速度关系反算。显式速度体必须与低频模型同形状，所有样点均为有限正值。初始模型存在空值时，需要覆盖完整采样轴的速度体。
+第五步目录中的 `selected_wavelet.csv` 直接提供子波时间和振幅。子波有自己的规则时间轴，子波坐标可独立于地震体轴，正演根据地震采样步长处理子波采样。
 
 ### 主体尺度与补丁
 
 | 参数 | 含义 |
 |------|------|
-| `body_smoothing_fwhm_m` | 高斯平滑的半高全宽，以米表达，必须为正 |
-| `waveform_qc_dynamic_window_m` | 波形质检局部相关窗口的米制长度，必须为正 |
+| `body_smoothing_fwhm_s` | 高斯平滑的半高全宽，沿 TWT 轴表达，单位为秒，必须为正 |
+| `waveform_qc_dynamic_window_s` | 波形质检局部相关窗口，沿 TWT 轴表达，单位为秒，必须为正 |
 | `patch_radius` | 中心道两侧读取的道数，完整补丁宽度为两倍半径加一 |
 | `orientations` | 采样方向，可以包含 `inline`、`xline` 或两者 |
 | `seismic_feature_mode` | 地震输入的振幅处理方式 |
@@ -180,14 +178,14 @@ ginn_v2_body_inversion:
 |------|------|
 | `loss_weights.seismic_shape` | 合成地震与真实地震的波形形态匹配 |
 | `loss_weights.trusted_well_body` | 主体输出与平滑井曲线的数值匹配 |
-| `loss_weights.trusted_well_derivative` | 主体输出与井目标的米制导数匹配 |
+| `loss_weights.trusted_well_derivative` | 主体输出与井目标的 TWT 导数匹配 |
 | `loss_weights.trusted_well_seismic_shape` | 可信井批次上的地震形态匹配 |
 | `loss_weights.lfm_anchor` | 约束网络修正中的低频部分 |
 | `loss_weights.lambda_shape` | 波形形态损失中的归一化振幅误差权重 |
 | `selection_weights.well_rmse` | 模型选择时的井误差权重 |
 | `selection_weights.amplitude_mapping` | 模型选择时的地震振幅与主体局部振幅关联惩罚权重 |
 
-主体输出与低频锚定使用选定变体的低通设置，因此第七步该变体需启用低通滤波。选择权重必须非负，且至少一项大于零。
+当第七步变体的 `filter.enabled` 为真时，主体输出仍执行该低通设置定义的低频修正投影；只有在 `filter.enabled` 为假且 `loss_weights.lfm_anchor` 为零时，主体输出才只使用高斯平滑。选择权重必须非负，且至少一项大于零。
 
 微调跑完配置的全部轮次后，按“井误差相对预训练的比例”与“振幅关联绝对值”的加权和选择最低分轮次；分数相同时选择较早轮次。
 
@@ -226,13 +224,13 @@ ginn_v2_volume_inference:
 
 ### 第一阶段：准备输入与训练目标
 
-1. **建立共同采样空间。** 读取低频模型、井控和时间域地震，核对采样轴及平面几何，固定子波与纵波速度输入。
+1. **建立共同采样空间。** 读取低频模型、井控和时间域地震，核对 TWT 采样轴及平面几何，直接读取第五步的选定子波。
 2. **构造地震补丁。** 沿配置方向读取邻道地震、初始阻抗和有效性信息，建立训练区、空间验证块及两者之间的隔离区。
-3. **建立可信井目标。** 将可信井的滤波阻抗曲线按米制尺度平滑，生成主体曲线、有效样点与导数监督，并将井目标关联到对应补丁。
+3. **建立可信井目标。** 将可信井的滤波阻抗曲线插值到共同 TWT 轴，按秒制尺度平滑，生成主体曲线、有效样点与导数监督，并将井目标关联到对应补丁。
 
 ### 第二阶段：形成主体输出
 
-1. **平滑初始模型。** 利用纵波速度把双程旅行时转换为沿道米制坐标，在该坐标上对初始对数阻抗执行高斯平滑。
+1. **平滑初始模型。** 直接沿 TWT 采样坐标对初始对数阻抗执行以秒为尺度的高斯平滑。
 2. **计算网络修正。** 卷积网络读取邻道补丁，输出中心道修正；对修正后的初始模型使用同一平滑，再减去平滑初模，得到主体尺度的修正。
 3. **限制低频变化。** 使用第七步的低通设置提取修正中的低频部分，将其从修正中减去，再叠加到平滑初模上。该过程同时用于训练和推理。
 
@@ -245,7 +243,7 @@ ginn_v2_volume_inference:
 ### 第四阶段：可信井约束微调
 
 1. **交替使用三类批次。** 依次处理中心道遮挡的地震补丁、中心道可见的地震补丁和可信井补丁。可信井按井均衡采样，并按配置重复批次。
-2. **约束主体与导数。** 在地震形态和低频锚定之外，增加井主体曲线及其米制导数的匹配；需要时加入可信井位置的地震形态约束。
+2. **约束主体与导数。** 在地震形态和低频锚定之外，增加井主体曲线及其 TWT 导数的匹配；需要时加入可信井位置的地震形态约束。
 3. **逐轮评价并选择。** 记录空间验证结果、井曲线误差、波形相关性和局部振幅关联。全部微调轮次完成后，选出综合分数最低的权重。
 
 ### 第五阶段：生成质检与可选预测
@@ -354,7 +352,7 @@ ginn_v2_body_inversion_<timestamp>/
 | 输入目录或变体未填写 | 第八步要求显式选择上游成果 | 填写四项上游输入，或通过对应命令行参数覆盖 |
 | 低频模型为剖面或覆盖不完整 | 训练入口要求三维体及完整工区轴与几何 | 在第七步生成与当前地震轴一致的全工区变体 |
 | 时间轴、线网或几何不一致 | 井控、低频模型和地震来自不同采样空间 | 使用同一工区配置重建对应上游步骤 |
-| 时间域速度来源缺失或覆盖不完整 | 米制平滑无法覆盖完整时间轴 | 提供同形状、全有限且为正的速度 NPY；完整有限初模也可配合阻抗—速度关系使用 |
+| 第五步子波无法加载 | 运行目录缺少 `selected_wavelet.csv`，或子波列不满足规则采样和归一化约束 | 核对第五步运行目录、`time_s` 与 `amplitude` 列及子波质量检查结果 |
 | 可信井不存在或没有可用目标 | 名单与第六步成功井不一致，或曲线支撑不足 | 核对井名、有效曲线段与目标层覆盖 |
 | 低通未启用或曲线段过短 | 主体分解和低频锚定需要可用的上游低通设置 | 检查第七步滤波设置与有效段长度 |
 | 训练或评价集合为空 | 验证块、隔离距离或补丁范围排除了全部可用位置 | 调整空间划分或补丁半径 |

@@ -81,20 +81,6 @@ class ForwardClosureResult:
             raise ValueError("valid_mask must be boolean and match the closure outputs.")
 
 
-def depth_coordinates_from_twt(velocity_mps: Tensor, twt_s: Tensor) -> Tensor:
-    """Integrate fixed velocity along TWT to physical depth coordinates."""
-    if velocity_mps.ndim != 2 or twt_s.ndim != 1 or velocity_mps.shape[-1] != twt_s.numel():
-        raise ValueError("velocity_mps/twt_s must have shapes (batch, samples)/(samples,).")
-    if not bool(torch.all(torch.isfinite(velocity_mps)).item()) or not bool(
-        torch.all(torch.isfinite(twt_s)).item()
-    ):
-        raise ValueError("velocity and TWT must contain only finite values.")
-    if bool(torch.any(velocity_mps <= 0.0).item()) or bool(torch.any(torch.diff(twt_s) <= 0.0).item()):
-        raise ValueError("velocity must be positive and TWT must be strictly increasing.")
-    dz = 0.25 * (velocity_mps[:, :-1] + velocity_mps[:, 1:]) * torch.diff(twt_s)[None, :]
-    return torch.cat((torch.zeros_like(velocity_mps[:, :1]), torch.cumsum(dz, dim=-1)), dim=-1)
-
-
 class DomainAdapter(ABC):
     """Domain seam used by shared training and inference code."""
 
@@ -110,7 +96,7 @@ class DomainAdapter(ABC):
             raise ValueError(f"{self.adapter_id} requires a {self.sample_domain} SampleAxis.")
 
     @abstractmethod
-    def vertical_coordinates_m(self, batch: CommonObservationBatch) -> Tensor: ...
+    def vertical_coordinates(self, batch: CommonObservationBatch) -> Tensor: ...
 
     @abstractmethod
     def forward(self, body_log_ai: Tensor, batch: CommonObservationBatch) -> Tensor: ...
@@ -140,7 +126,7 @@ class DomainAdapter(ABC):
         """Forward each finite LFM/domain run without crossing support gaps."""
 
         support = batch.lfm_valid_mask & torch.isfinite(body_log_ai)
-        velocity = batch.domain_extras.get("velocity_mps")
+        velocity = batch.domain_extras.get("velocity_mps") if self.sample_domain == "depth" else None
         if velocity is not None:
             if velocity.shape != body_log_ai.shape:
                 raise ValueError("velocity_mps must match body_log_ai when supplied.")
@@ -174,23 +160,12 @@ class TimeDomainAdapter(DomainAdapter):
     sample_domain = "time"
     adapter_id = "time_twt_stationary_v1"
 
-    def vertical_coordinates_m(self, batch: CommonObservationBatch) -> Tensor:
+    def vertical_coordinates(self, batch: CommonObservationBatch) -> Tensor:
         self._require_domain(batch.sample_axis)
-        explicit = batch.domain_extras.get("depth_by_sample_m")
-        if explicit is not None:
-            if explicit.shape != batch.observed_seismic.shape:
-                raise ValueError("depth_by_sample_m must match the common trace shape.")
-            return explicit
-        velocity = batch.domain_extras.get("velocity_mps")
-        if velocity is None:
-            raise ValueError("Time adapter requires depth_by_sample_m or velocity_mps for metre smoothing.")
-        return depth_coordinates_from_twt(
-            velocity,
-            torch.as_tensor(
-                batch.sample_axis.values,
-                device=velocity.device,
-                dtype=velocity.dtype,
-            ),
+        return torch.as_tensor(
+            batch.sample_axis.values,
+            device=batch.observed_seismic.device,
+            dtype=batch.observed_seismic.dtype,
         )
 
     def forward(self, body_log_ai: Tensor, batch: CommonObservationBatch) -> Tensor:
@@ -213,7 +188,7 @@ class DepthDomainAdapter(DomainAdapter):
     sample_domain = "depth"
     adapter_id = "depth_tvdss_nonstationary_v1"
 
-    def vertical_coordinates_m(self, batch: CommonObservationBatch) -> Tensor:
+    def vertical_coordinates(self, batch: CommonObservationBatch) -> Tensor:
         self._require_domain(batch.sample_axis)
         axis = torch.as_tensor(
             batch.sample_axis.values,
@@ -256,5 +231,4 @@ __all__ = [
     "DomainAdapter",
     "ForwardClosureResult",
     "TimeDomainAdapter",
-    "depth_coordinates_from_twt",
 ]

@@ -226,33 +226,27 @@ def write_well_waveform_qc(
         if not np.isfinite(correlation):
             raise ValueError(f"{well_name}: predicted well waveform correlation is non-finite.")
 
-        common = CommonObservationBatch(
-            sample_axis=local_sample_axis,
-            observed_seismic=torch.as_tensor(observed, dtype=torch.float64)[None, :],
-            observed_valid_mask=torch.ones((1, indices.size), dtype=torch.bool),
-            lfm_log_ai=torch.as_tensor(lfm_values, dtype=torch.float64)[None, :],
-            lfm_valid_mask=torch.ones((1, indices.size), dtype=torch.bool),
-            xy_m=torch.as_tensor(xy_m, dtype=torch.float64)[None, :],
-            domain_extras={name: torch.as_tensor(value, dtype=torch.float64)[None, :] for name, value in domain_extras.items()},
-        )
-        physical_coordinates = trainer.adapter.vertical_coordinates_m(common).cpu().numpy().reshape(-1)
-        window_axis_units = float(trainer.config.waveform_qc_dynamic_window_m) * float(np.median(np.diff(local_axis))) / float(np.median(np.diff(physical_coordinates)))
+        sample_unit = str(trainer.config.sample_unit)
+        if sample_unit not in {"s", "m"}:
+            raise ValueError("Body waveform QC sample_unit must be 's' or 'm'.")
+        if local_sample_axis.unit != sample_unit:
+            raise ValueError("Body waveform QC sample_unit differs from the local SampleAxis unit.")
+        dynamic_window = float(trainer.config.waveform_qc_dynamic_window)
         basis_type = "twt" if local_sample_axis.domain == "time" else "tvdss"
         predicted_objects = _waveform_objects(
             axis=local_axis,
             log_ai=predicted_log_ai,
             synthetic=synthetic_normalized,
             real=observed_normalized,
-            dynamic_window_m=float(trainer.config.waveform_qc_dynamic_window_m),
             name="GINN V2 predicted body",
             basis_type=basis_type,
-            dynamic_window_axis_units=window_axis_units,
+            dynamic_window_axis_units=dynamic_window,
         )
         body_reference = grid.Log(
             np.exp(reference_log_ai),
             local_axis,
             basis_type,
-            name=f"{trainer.config.body_smoothing_fwhm_m:g} m body reference",
+            name=f"{trainer.config.body_smoothing_fwhm:g} {sample_unit} body reference",
             unit="m/s*g/cm3",
         )
         figure, axes = plot_well_waveform_qc(
@@ -312,6 +306,11 @@ def write_well_waveform_qc(
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+    dynamic_window_key = (
+        "dynamic_correlation_window_s"
+        if str(trainer.config.sample_unit) == "s"
+        else "dynamic_correlation_window_m"
+    )
     manifest = {
         "status": "ok",
         "plot_function": "cup.seismic.viz.plot_well_waveform_qc",
@@ -319,7 +318,8 @@ def write_well_waveform_qc(
         "correlation_definition": "Assemble the predicted AI curve on the well support, then forward it with the same domain adapter used by training; no gain or vertical compensation is applied.",
         "display_normalization": "Each waveform is centered and divided by its own standard deviation on the shared QC interval.",
         "residual_definition": "Standardized observed seismic minus standardized forward synthetic.",
-        "dynamic_correlation_window_m": float(trainer.config.waveform_qc_dynamic_window_m),
+        "dynamic_correlation_window_unit": str(trainer.config.sample_unit),
+        dynamic_window_key: float(trainer.config.waveform_qc_dynamic_window),
         "figures": figures,
         "metrics": repo_relative_path(metrics_path, root=root),
     }

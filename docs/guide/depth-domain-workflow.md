@@ -327,6 +327,8 @@ real_field_lfm:
 python scripts/body_train.py --config "<body-config-yaml>" --output-dir "<training-output-dir>"
 ```
 
+训练入口可用 `--lfm-run-dir`、`--variant-id`、`--well-control-run-dir` 和 `--forward-model-inputs-run-dir` 覆盖对应配置；分阶段微调还需要 `--pretrain-checkpoint`。
+
 在第八步配置中，将上游输入指向本次深度域成果：
 
 ```yaml
@@ -336,11 +338,41 @@ ginn_v2_body_inversion:
     variant_id: "<lfm-variant-id>"
     well_control_run_dir: "<well-control-run-dir>"
     forward_model_inputs_run_dir: "<forward-input-run-dir>"
+  training:
+    trusted_well_names:
+      - "<trusted-well-a>"
+      - "<trusted-well-b>"
+    body_smoothing_fwhm_m: <body-smoothing-fwhm-m>
+    waveform_qc_dynamic_window_m: <waveform-qc-dynamic-window-m>
+    patch_radius: 8
+    orientations: [inline, xline]
+    validation_gap_m: <validation-gap-m>
+    loss_weights:
+      seismic_shape: 1.0
+      trusted_well_body: 1.0
+      trusted_well_derivative: 0.5
+      lfm_anchor: 1.0
+    selection_weights:
+      well_rmse: 1.0
+      amplitude_mapping: 0.0
+    warnings:
+      pretrain_masked_corr_improvement: 0.01
+      pretrain_masked_shape_ratio: 0.99
+      masked_corr_drop_tolerance: 0.01
+      well_pooled_rmse_ratio_max: 1.0
+      seismic_body_amplitude_spearman_max: 1.0
 ```
 
 训练配置与这些输入放在同一个配置文件中，公共工区配置使用深度域与海平面以下垂深口径。统一正演输入沿用本篇旁路生成的子波与声阻抗—纵波速度关系，速度可由该关系和初始阻抗计算。
 
-主体平滑直接使用地震深度轴的米制坐标，低频修正沿用第七步的截止波长与缓冲设置。井控、低频模型和地震的深度轴、线网及空间几何需要一致。微调完成后生成所选权重、井曲线和局部剖面质检，全体积预测另行执行。
+| 配置 | 深度域语义 |
+|------|------------|
+| `body_smoothing_fwhm_m` | 主体高斯平滑半高全宽，沿 TVDSS 深度轴计算，单位为米且必须为正 |
+| `waveform_qc_dynamic_window_m` | 局部波形统计窗口，沿 TVDSS 深度轴计算，单位为米且必须为正 |
+| `forward_model_inputs_run_dir` | 本篇旁路生成的正演输入目录，包含固定子波和 AI–Vp 关系 |
+| `validation_gap_m` | 平面空间验证块与训练区之间的米制间隔 |
+
+主体平滑直接使用地震深度轴的米制坐标。第七步变体的 `filter.enabled` 为真时，主体输出仍执行其截止波长定义的低频修正投影；只有在该开关为假且 `loss_weights.lfm_anchor` 为零时，主体输出才只使用高斯平滑。井控、低频模型和地震的深度轴、线网及空间几何需要一致。深度轴上的损失和局部统计使用当前米制坐标，平面验证间隔也以米表示。微调完成后生成所选权重、井曲线和局部剖面质检，全体积预测另行执行。
 
 ---
 

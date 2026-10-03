@@ -1,6 +1,6 @@
 """Compose GINN v2 training stages behind one workflow interface.
 
-The command requires explicit Step-6, Step-7, and frozen-forward inputs.  A
+The command requires explicit Step-6, Step-7, and domain-specific wavelet inputs.  A
 configuration section named ``ginn_v2_body_inversion`` carries the settings;
 the input identities can also be supplied as command-line overrides.
 
@@ -25,6 +25,7 @@ from cup.lfm.math import parse_lowpass_spec
 from cup.physics.relations import AIVelocityRelation
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.forward_inputs import load_forward_inputs as load_seismic_forward_inputs
+from cup.seismic.wavelet import load_wavelet_csv, validate_wavelet_normalization
 from cup.utils.io import repo_relative_path, resolve_relative_path, write_json
 from cup.utils.logging import configure_run_logger
 from cup.well.controls import load_well_control_set
@@ -71,7 +72,8 @@ class LoadedBody:
     checkpoint_payload: Mapping[str, Any]
     lfm_run_dir: Path
     well_control_run_dir: Path
-    forward_model_inputs_run_dir: Path
+    forward_model_inputs_run_dir: Path | None
+    wavelet_generation_run_dir: Path | None
     workflow: WorkflowConfig
     training_config: BodyInversionConfig
     inference_config: Mapping[str, Any]
@@ -95,7 +97,7 @@ class LoadedBody:
             self.reader,
             self.adapter,
             smoother=BodySmoother(
-                smoothing_fwhm_m=self.training_config.body_smoothing_fwhm_m,
+                smoothing_fwhm=self.training_config.body_smoothing_fwhm,
             ),
             lfm_lowpass_spec=self.lfm_lowpass_spec,
             device=next(self.model.parameters()).device,
@@ -261,6 +263,7 @@ class _BodyOptions:
     variant_id: str | None = None
     well_control_run_dir: Path | None = None
     forward_model_inputs_run_dir: Path | None = None
+    wavelet_generation_run_dir: Path | None = None
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -273,7 +276,7 @@ def _required_input(stage_config: Mapping[str, Any], key: str, override: object)
     else:
         inputs = stage_config.get("inputs")
         if not isinstance(inputs, Mapping):
-            raise ValueError("ginn_v2_body_inversion.inputs must explicitly contain all frozen input paths.")
+            raise ValueError("ginn_v2_body_inversion.inputs must explicitly contain the required input paths.")
         value = str(inputs.get(key) or "").strip()
     if not value:
         raise ValueError(f"ginn_v2_body_inversion input {key!r} must be explicit.")
@@ -284,13 +287,56 @@ def load_forward_inputs(run_dir: Path, *, domain: str, depth_basis: str | None) 
     return load_seismic_forward_inputs(run_dir, repo_root=REPO_ROOT, domain=domain, depth_basis=depth_basis)
 
 
+def _resolve_forward_source(section: Mapping[str, Any], *, domain: str, options: _BodyOptions) -> Path:
+    inputs = section.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise ValueError("ginn_v2_body_inversion.inputs must be a mapping.")
+    if domain == "time":
+        if inputs.get("forward_model_inputs_run_dir") is not None or options.forward_model_inputs_run_dir is not None:
+            raise ValueError("Time body inversion reads wavelet_generation_run_dir, not forward_model_inputs_run_dir.")
+        if inputs.get("velocity_volume") is not None:
+            raise ValueError("Time body inversion uses TWT coordinates and does not accept velocity_volume.")
+        key = "wavelet_generation_run_dir"
+        override = options.wavelet_generation_run_dir
+    elif domain == "depth":
+        if inputs.get("wavelet_generation_run_dir") is not None or options.wavelet_generation_run_dir is not None:
+            raise ValueError("Depth body inversion requires forward_model_inputs_run_dir.")
+        key = "forward_model_inputs_run_dir"
+        override = options.forward_model_inputs_run_dir
+    else:
+        raise ValueError(f"Unsupported body inversion domain: {domain!r}.")
+    return resolve_relative_path(_required_input(section, key, override), root=REPO_ROOT)
+
+
+def _load_domain_forward_inputs(
+    source_dir: Path, *, domain: str, depth_basis: str | None,
+) -> tuple[np.ndarray, np.ndarray, AIVelocityRelation | None, dict[str, Any]]:
+    if domain == "depth":
+        return load_forward_inputs(source_dir, domain=domain, depth_basis=depth_basis)
+    if domain != "time":
+        raise ValueError(f"Unsupported body inversion domain: {domain!r}.")
+    wavelet_path = source_dir / "selected_wavelet.csv"
+    time_s, amplitude = load_wavelet_csv(wavelet_path)
+    amplitude, qc = validate_wavelet_normalization(time_s, amplitude, allow_small_renormalization=False)
+    if qc.status != "ok":
+        raise ValueError(f"Selected wavelet failed normalization QC: {qc.reasons}")
+    return time_s, amplitude, None, {"wavelet": {"path": repo_relative_path(wavelet_path, root=REPO_ROOT)}}
+
+
 def _domain_runtime(
     raw: Mapping[str, Any], lfm: Any, sample_axis: Any,
     wavelet_time_s: np.ndarray, wavelet_amplitude: np.ndarray,
     relation: AIVelocityRelation | None,
 ) -> tuple[DepthDomainAdapter | TimeDomainAdapter, dict[str, np.ndarray]]:
-    """Build the same frozen coordinate and forward inputs for train and infer."""
+    """Build domain-specific forward inputs shared by training and inference."""
 
+    if sample_axis.domain == "time":
+        return TimeDomainAdapter(
+            torch.as_tensor(wavelet_time_s, dtype=torch.float32),
+            torch.as_tensor(wavelet_amplitude, dtype=torch.float32),
+        ), {}
+    if sample_axis.domain != "depth":
+        raise ValueError(f"Unsupported body inversion domain: {sample_axis.domain!r}.")
     inputs = raw["ginn_v2_body_inversion"].get("inputs", {})
     if not isinstance(inputs, Mapping):
         raise ValueError("ginn_v2_body_inversion.inputs must be a mapping.")
@@ -302,19 +348,14 @@ def _domain_runtime(
         if np.any(~np.isfinite(velocity)) or np.any(velocity <= 0.0):
             raise ValueError("velocity_volume must contain finite positive velocities in m/s.")
     elif relation is not None:
-        if sample_axis.domain == "time" and np.any(~np.isfinite(lfm.log_ai)):
-            raise ValueError("Time metre coordinates require a complete velocity_volume when the LFM has gaps.")
         velocity = np.full(lfm.log_ai.shape, np.nan, dtype=np.float64)
         for start in range(0, lfm.log_ai.shape[0], 8):
             valid = lfm.valid_mask[start:start + 8]
             block = velocity[start:start + 8]
             block[valid] = relation.velocity_from_ai(np.exp(lfm.log_ai[start:start + 8][valid].astype(np.float64)))
-        if sample_axis.domain == "time" and np.any(~np.isfinite(velocity)):
-            raise ValueError("Time metre coordinates require velocity over the complete sampling axis.")
     else:
-        raise ValueError("Metre smoothing requires inputs.velocity_volume or a frozen ai_velocity_relation.")
-    adapter_type = DepthDomainAdapter if sample_axis.domain == "depth" else TimeDomainAdapter
-    adapter = adapter_type(
+        raise ValueError("Depth forward modelling requires velocity_volume or an ai_velocity_relation.")
+    adapter = DepthDomainAdapter(
         torch.as_tensor(wavelet_time_s, dtype=torch.float32),
         torch.as_tensor(wavelet_amplitude, dtype=torch.float32),
     )
@@ -350,23 +391,13 @@ def _build_runtime(raw: Mapping[str, Any], args: _BodyOptions) -> tuple[Workflow
         _required_input(section, "well_control_run_dir", args.well_control_run_dir),
         root=REPO_ROOT,
     )
-    forward_inputs_run_dir = resolve_relative_path(
-        _required_input(section, "forward_model_inputs_run_dir", args.forward_model_inputs_run_dir),
-        root=REPO_ROOT,
-    )
-    if section.get("training") is None:
-        training_mapping = {
-            key: value
-            for key, value in section.items()
-            if key not in {"inputs", "lfm_run_dir", "variant_id", "well_control_run_dir", "forward_model_inputs_run_dir"}
-        }
-    else:
-        training_mapping = dict(section.get("training") or {})
-    if "trusted_well_names" not in training_mapping and "trusted_well_names" in section:
-        training_mapping["trusted_well_names"] = section["trusted_well_names"]
-    config = BodyInversionConfig.from_mapping(training_mapping)
+    forward_source_dir = _resolve_forward_source(section, domain=workflow.seismic.domain, options=args)
+    training_mapping = section.get("training")
+    if not isinstance(training_mapping, Mapping):
+        raise ValueError("ginn_v2_body_inversion.training must be a mapping.")
+    config = BodyInversionConfig.from_mapping(training_mapping, sample_domain=workflow.seismic.domain)
     output_dir = _resolve_output_dir(args.output_dir, workflow)
-    return workflow, config, lfm_run_dir, well_control_run_dir, forward_inputs_run_dir, output_dir, variant_id
+    return workflow, config, lfm_run_dir, well_control_run_dir, forward_source_dir, output_dir, variant_id
 
 
 def _write_review_package(trainer: BodyInversionTrainer, model: CenterTraceBodyNet, output_dir: Path) -> dict[str, Any]:
@@ -507,6 +538,7 @@ def train_body(
     variant_id: str | None = None,
     well_control_run_dir: str | Path | None = None,
     forward_model_inputs_run_dir: str | Path | None = None,
+    wavelet_generation_run_dir: str | Path | None = None,
 ) -> BodyRun:
     """Run reusable self-supervised pretraining, semi-supervised finetuning, or both."""
 
@@ -520,10 +552,11 @@ def train_body(
         variant_id=variant_id,
         well_control_run_dir=None if well_control_run_dir is None else Path(well_control_run_dir),
         forward_model_inputs_run_dir=None if forward_model_inputs_run_dir is None else Path(forward_model_inputs_run_dir),
+        wavelet_generation_run_dir=None if wavelet_generation_run_dir is None else Path(wavelet_generation_run_dir),
     )
     config_path = resolve_relative_path(config_path, root=REPO_ROOT)
     raw = load_config(config_path)
-    workflow, config, lfm_run_dir, well_control_run_dir, forward_inputs_run_dir, output_dir, variant_id = _build_runtime(raw, args)
+    workflow, config, lfm_run_dir, well_control_run_dir, forward_source_dir, output_dir, variant_id = _build_runtime(raw, args)
     if output_dir.exists():
         raise FileExistsError(f"Body-inversion output directory already exists: {output_dir}; use a new output directory.")
     else:
@@ -562,8 +595,8 @@ def train_body(
         dict(baseline_config.get("filter") or {}),
         sample_axis,
     )
-    wavelet_time_s, wavelet_amplitude, relation, forward_payload = load_forward_inputs(
-        forward_inputs_run_dir,
+    wavelet_time_s, wavelet_amplitude, relation, forward_payload = _load_domain_forward_inputs(
+        forward_source_dir,
         domain=workflow.seismic.domain,
         depth_basis=workflow.seismic.depth_basis,
     )
@@ -643,7 +676,7 @@ def train_body(
         {
             "sample_axis": sample_axis.describe(),
             "depth_basis": workflow.seismic.depth_basis,
-            "body_smoothing_fwhm_m": config.body_smoothing_fwhm_m,
+            f"body_smoothing_fwhm_{config.sample_unit}": config.body_smoothing_fwhm,
             "prediction_definition": "b0 + (I - L)(gaussian_smooth(initial + correction) - b0); b0 = gaussian_smooth(initial)",
             "lfm_anchor_weight": config.loss_weights.lfm_anchor,
             "low_frequency_baseline": "gaussian_smooth(initial)",
@@ -669,7 +702,7 @@ def train_body(
                 "buffer_axis_units": lfm_lowpass_spec.buffer_axis_units,
             },
             "well_control_run_dir": repo_relative_path(well_control_run_dir, root=REPO_ROOT),
-            "forward_model_inputs_run_dir": repo_relative_path(forward_inputs_run_dir, root=REPO_ROOT),
+            ("wavelet_generation_run_dir" if workflow.seismic.domain == "time" else "forward_model_inputs_run_dir"): repo_relative_path(forward_source_dir, root=REPO_ROOT),
             "forward_adapter": getattr(adapter, "adapter_id", type(adapter).__name__),
             "wavelet": forward_payload.get("wavelet"),
             "well_roles": {
@@ -766,6 +799,7 @@ def load_body(
     variant_id: str | None = None,
     well_control_run_dir: str | Path | None = None,
     forward_model_inputs_run_dir: str | Path | None = None,
+    wavelet_generation_run_dir: str | Path | None = None,
     batch_size: int | None = None,
 ) -> LoadedBody:
     """Load a trained body facade without exposing its internal assembly."""
@@ -782,7 +816,7 @@ def load_body(
     training = section.get("training")
     if not isinstance(training, Mapping):
         raise ValueError("ginn_v2_body_inversion.training must be a mapping.")
-    config = BodyInversionConfig.from_mapping(training)
+    config = BodyInversionConfig.from_mapping(training, sample_domain=workflow.seismic.domain)
     inference = raw.get("ginn_v2_volume_inference")
     if not isinstance(inference, Mapping):
         raise ValueError("ginn_v2_volume_inference must be a mapping.")
@@ -792,25 +826,20 @@ def load_body(
     )
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
-    lfm_path = resolve_relative_path(
-        lfm_run_dir if lfm_run_dir is not None else str(inputs.get("lfm_run_dir") or ""),
-        root=REPO_ROOT,
-    )
+    lfm_path = resolve_relative_path(_required_input(section, "lfm_run_dir", lfm_run_dir), root=REPO_ROOT)
     well_path = resolve_relative_path(
-        well_control_run_dir
-        if well_control_run_dir is not None
-        else str(inputs.get("well_control_run_dir") or ""),
+        _required_input(section, "well_control_run_dir", well_control_run_dir),
         root=REPO_ROOT,
     )
-    forward_run_dir = resolve_relative_path(
-        forward_model_inputs_run_dir
-        if forward_model_inputs_run_dir is not None
-        else str(inputs.get("forward_model_inputs_run_dir") or ""),
-        root=REPO_ROOT,
+    forward_source_dir = _resolve_forward_source(
+        section,
+        domain=workflow.seismic.domain,
+        options=_BodyOptions(
+            forward_model_inputs_run_dir=None if forward_model_inputs_run_dir is None else Path(forward_model_inputs_run_dir),
+            wavelet_generation_run_dir=None if wavelet_generation_run_dir is None else Path(wavelet_generation_run_dir),
+        ),
     )
-    selected_variant = str(variant_id or inputs.get("variant_id") or "").strip()
-    if not selected_variant:
-        raise ValueError("ginn_v2_body_inversion.inputs.variant_id must be explicit.")
+    selected_variant = _required_input(section, "variant_id", variant_id)
     lfm = load_lfm_input(
         {
             "lfm_run_dir": str(lfm_path),
@@ -835,8 +864,8 @@ def load_body(
     _require_matching_axes(sample_axis, lfm.sample_axis)
     baseline = dict(lfm.variant.variant_metadata.get("resolved_baseline_config") or {})
     lowpass = parse_lowpass_spec(dict(baseline.get("filter") or {}), sample_axis)
-    wavelet_time_s, wavelet_amplitude, relation, _payload = load_forward_inputs(
-        forward_run_dir,
+    wavelet_time_s, wavelet_amplitude, relation, _payload = _load_domain_forward_inputs(
+        forward_source_dir,
         domain=workflow.seismic.domain,
         depth_basis=workflow.seismic.depth_basis,
     )
@@ -881,7 +910,8 @@ def load_body(
         checkpoint_payload=payload,
         lfm_run_dir=lfm_path,
         well_control_run_dir=well_path,
-        forward_model_inputs_run_dir=forward_run_dir,
+        forward_model_inputs_run_dir=forward_source_dir if workflow.seismic.domain == "depth" else None,
+        wavelet_generation_run_dir=forward_source_dir if workflow.seismic.domain == "time" else None,
         workflow=workflow,
         training_config=config,
         inference_config=resolved_inference,

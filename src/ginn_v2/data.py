@@ -13,9 +13,7 @@ from torch import Tensor
 from cup.seismic.geometry import SampleAxis, SurveyLineGeometry
 from cup.utils.masks import true_runs as _finite_runs
 from cup.well.controls import WellControl, WellControlSet
-from cup.well.scale import gaussian_smooth_finite_runs_numpy
 from ginn_v2.model import BodySmoother
-from ginn_v2.physics import depth_coordinates_from_twt
 
 
 Orientation = Literal["inline", "xline"]
@@ -869,81 +867,14 @@ def well_target_zone_mask(
     return result
 
 
-def well_smoothing_coordinates(
-    control: WellControl,
-    *,
-    geometry: SurveyLineGeometry,
-    domain_extras: Mapping[str, np.ndarray] | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return physical metre coordinates for model and native well curves.
-
-    Depth curves already use TVDSS metres.  Time curves require the frozen
-    velocity volume used by the forward workflow so the same metre Gaussian
-    window is applied to the model target and to the native diagnostic curve.
-    """
-
-    model_axis = np.asarray(control.sample_axis.values, dtype=np.float64)
-    native_axis = np.asarray(control.native.coordinates, dtype=np.float64)
-    if control.sample_axis.domain == "depth":
-        return model_axis.copy(), native_axis.copy()
-    extras = dict(domain_extras or {})
-    velocity_volume = extras.get("velocity_mps")
-    if velocity_volume is None:
-        raise ValueError("Time-domain well smoothing requires domain_extras['velocity_mps'].")
-    velocity = np.asarray(velocity_volume, dtype=np.float64)
-    expected = (
-        geometry.inline_axis.count,
-        geometry.xline_axis.count,
-        model_axis.size,
-    )
-    if velocity.shape != expected or np.any(~np.isfinite(velocity)) or np.any(velocity <= 0.0):
-        raise ValueError("Time-domain velocity volume must match the survey and be finite positive m/s.")
-    finite_positions = np.isfinite(control.x_m_by_sample) & np.isfinite(control.y_m_by_sample)
-    if not np.any(finite_positions):
-        raise ValueError(f"{control.well_name}: no finite XY position is available for time-to-depth smoothing.")
-    position_indices = np.flatnonzero(finite_positions)
-    inline_indices = np.empty(model_axis.size, dtype=np.int64)
-    xline_indices = np.empty(model_axis.size, dtype=np.int64)
-    for index in range(model_axis.size):
-        nearest_position = int(position_indices[np.argmin(np.abs(position_indices - index))])
-        i_float, j_float = geometry.coord_to_index(
-            float(control.x_m_by_sample[nearest_position]),
-            float(control.y_m_by_sample[nearest_position]),
-        )
-        i, j = int(round(i_float)), int(round(j_float))
-        if not (
-            0 <= i < geometry.inline_axis.count
-            and 0 <= j < geometry.xline_axis.count
-            and abs(i_float - i) <= 0.5
-            and abs(j_float - j) <= 0.5
-        ):
-            raise ValueError(f"{control.well_name}: well position falls outside the survey velocity grid.")
-        inline_indices[index] = i
-        xline_indices[index] = j
-    velocity_trace = velocity[inline_indices, xline_indices, np.arange(model_axis.size)]
-    model_depth = depth_coordinates_from_twt(
-        torch.as_tensor(velocity_trace[None, :], dtype=torch.float64),
-        torch.as_tensor(model_axis, dtype=torch.float64),
-    )[0].numpy()
-    native_velocity = np.interp(native_axis, model_axis, velocity_trace)
-    native_depth = depth_coordinates_from_twt(
-        torch.as_tensor(native_velocity[None, :], dtype=torch.float64),
-        torch.as_tensor(native_axis, dtype=torch.float64),
-    )[0].numpy()
-    return np.asarray(model_depth, dtype=np.float64), np.asarray(native_depth, dtype=np.float64)
-
-
 def build_well_body_target(
     control: WellControl,
     *,
-    body_smoothing_fwhm_m: float,
     target_zone_support: np.ndarray,
     geometry: SurveyLineGeometry,
     smoother: BodySmoother,
     lfm_log_ai: np.ndarray | None = None,
     lfm_valid_mask: np.ndarray | None = None,
-    model_smoothing_coordinates_m: np.ndarray | None = None,
-    native_smoothing_coordinates_m: np.ndarray | None = None,
 ) -> WellTarget:
     """Build a trusted-well target by smoothing the complete model-axis curve once.
 
@@ -954,39 +885,19 @@ def build_well_body_target(
     values are deliberately not used to redefine the well target.
     """
 
+    model_coordinates = np.asarray(control.sample_axis.values, dtype=np.float64)
     native_coordinates = np.asarray(control.native.coordinates, dtype=np.float64)
-    model_smoothing_coordinates = (
-        np.asarray(control.sample_axis.values, dtype=np.float64)
-        if model_smoothing_coordinates_m is None
-        else np.asarray(model_smoothing_coordinates_m, dtype=np.float64)
-    )
-    native_smoothing_coordinates = (
-        native_coordinates
-        if native_smoothing_coordinates_m is None
-        else np.asarray(native_smoothing_coordinates_m, dtype=np.float64)
-    )
-    if control.sample_axis.domain == "time" and (
-        model_smoothing_coordinates_m is None or native_smoothing_coordinates_m is None
-    ):
-        raise ValueError("Time-domain well targets require physical metre smoothing coordinates.")
-    if model_smoothing_coordinates.shape != control.sample_axis.values.shape:
-        raise ValueError("model_smoothing_coordinates_m must match the model SampleAxis.")
-    if native_smoothing_coordinates.shape != native_coordinates.shape:
-        raise ValueError("native_smoothing_coordinates_m must match the native curve.")
-    if np.any(~np.isfinite(model_smoothing_coordinates)) or np.any(~np.isfinite(native_smoothing_coordinates)):
+    if np.any(~np.isfinite(model_coordinates)) or np.any(~np.isfinite(native_coordinates)):
         raise ValueError("Well smoothing coordinates must be finite.")
-    if np.any(np.diff(model_smoothing_coordinates) <= 0.0) or np.any(np.diff(native_smoothing_coordinates) <= 0.0):
+    if np.any(np.diff(model_coordinates) <= 0.0) or np.any(np.diff(native_coordinates) <= 0.0):
         raise ValueError("Well smoothing coordinates must be strictly increasing.")
     native_values = np.asarray(control.native.native_filtered_log_ai, dtype=np.float64)
-    # Keep this historical diagnostic for QC/reporting.  It is not used as
-    # the training target; the actual target below starts from unsmoothed
-    # native_filtered_log_ai and smooths once after model-axis interpolation.
-    native_body = gaussian_smooth_finite_runs_numpy(
+    native_body = smoother.smooth_numpy(
         native_values,
-        native_smoothing_coordinates,
-        fwhm_m=body_smoothing_fwhm_m,
+        native_coordinates,
+        np.isfinite(native_values),
     )
-    model_axis = np.asarray(control.sample_axis.values, dtype=np.float64)
+    model_axis = model_coordinates
     model_target_raw = np.full(model_axis.shape, np.nan, dtype=np.float64)
     for start, stop in _finite_runs(np.isfinite(native_values)):
         inside = (model_axis >= native_coordinates[start]) & (model_axis <= native_coordinates[stop - 1])
@@ -998,7 +909,7 @@ def build_well_body_target(
     native_model_support = np.isfinite(model_target_raw)
     model_target = smoother.smooth_numpy(
         model_target_raw,
-        model_smoothing_coordinates,
+        model_coordinates,
         native_model_support,
     )
     observed = np.asarray(control.observed_valid_mask, dtype=bool)
@@ -1141,6 +1052,5 @@ __all__ = [
     "fit_lfm_normalization",
     "make_spatial_split",
     "sample_lfm_trace",
-    "well_smoothing_coordinates",
     "well_target_zone_mask",
 ]

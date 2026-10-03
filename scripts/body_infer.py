@@ -34,7 +34,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--variant-id", type=str, default=None)
     parser.add_argument("--well-control-run-dir", type=Path, default=None)
     parser.add_argument("--forward-model-inputs-run-dir", type=Path, default=None,
-                        help="Forward-input run directory containing forward_model_inputs.json.")
+                        help="Depth forward-input run directory containing forward_model_inputs.json.")
+    parser.add_argument("--wavelet-generation-run-dir", type=Path, default=None,
+                        help="Time-domain Step-5 run directory containing selected_wavelet.csv.")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--resume", action="store_true",
                         help="Resume an unfinished output directory from saved section predictions.")
@@ -197,6 +199,7 @@ def main() -> None:
         variant_id=args.variant_id,
         well_control_run_dir=args.well_control_run_dir,
         forward_model_inputs_run_dir=args.forward_model_inputs_run_dir,
+        wavelet_generation_run_dir=args.wavelet_generation_run_dir,
         batch_size=args.batch_size,
     )
     workflow = loaded.workflow

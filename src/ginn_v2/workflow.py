@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -46,6 +47,7 @@ from ginn_v2.infer import (
     centered_tile_bounds,
 )
 from ginn_v2.diagnose import write_well_waveform_qc as write_well_waveform_qc_artifact
+from ginn_v2.section_store import SectionPredictionStore
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 Stage = str
@@ -171,6 +173,7 @@ class LoadedBody:
         smoke_tile_size: int | None = None,
         smoke_tile_origin: str = "center",
         logger: Any = None,
+        section_cache_dir: Path | None = None,
     ) -> BodyVolumeResult:
         """Predict a smoke tile or full survey and fill the complete target zone."""
 
@@ -205,7 +208,50 @@ class LoadedBody:
                 xline_bounds = centered_tile_bounds(self.lfm.xlines.size, smoke_tile_size)
             else:
                 raise ValueError("smoke_tile_origin must be 'center' or 'northwest'.")
-        return volume.predict(inline_bounds=inline_bounds, xline_bounds=xline_bounds)
+        section_store = None
+        if section_cache_dir is not None:
+            def file_digest(path: Path) -> str:
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for block in iter(lambda: handle.read(1 << 20), b""):
+                        digest.update(block)
+                return digest.hexdigest()
+
+            extra_digests = {}
+            for name, values in self.reader.domain_extras.items():
+                digest = hashlib.sha256()
+                digest.update(str(values.dtype).encode())
+                digest.update(str(values.shape).encode())
+                with np.nditer(values, flags=["external_loop", "buffered"],
+                               op_flags=["readonly"], order="C", buffersize=1 << 18) as blocks:
+                    for block in blocks:
+                        digest.update(block.tobytes())
+                extra_digests[name] = digest.hexdigest()
+            contract = {
+                "schema": "body_raw_sections_v1",
+                "checkpoint_sha256": file_digest(self.checkpoint),
+                "seismic_sha256": file_digest(self.seismic_path),
+                "lfm_sha256": file_digest(self.lfm.variant.lfm_path),
+                "domain_extras_sha256": extra_digests,
+                "seismic_settings": self.workflow.seismic.as_dict(),
+                "training_config": self.training_config.to_json_dict(),
+                "batch_size": resolved_batch_size,
+                "sample_axis": self.sample_axis.describe(),
+                "geometry": asdict(self.survey.line_geometry),
+                "inline_bounds": inline_bounds,
+                "xline_bounds": xline_bounds,
+                "orientations": list(orientations),
+                "min_lfm_support": volume.config.min_lfm_support,
+                "implementation_sha256": {
+                    name: file_digest(Path(__file__).parent / name)
+                    for name in ("data.py", "model.py", "infer.py", "workflow.py")
+                },
+            }
+            section_store = SectionPredictionStore(
+                section_cache_dir, contract, sample_count=self.sample_axis.values.size,
+            )
+        return volume.predict(inline_bounds=inline_bounds, xline_bounds=xline_bounds,
+                              section_store=section_store)
 
 
 @dataclass(frozen=True)

@@ -16,6 +16,7 @@ from cup.lfm.math import LowpassSpec
 from ginn_v2.data import Orientation, PatchKey, PatchReader
 from ginn_v2.model import BodySmoother, CenterTraceBodyNet
 from ginn_v2.physics import CommonObservationBatch, DomainAdapter
+from ginn_v2.section_store import SectionPredictionStore
 
 
 @dataclass(frozen=True)
@@ -317,7 +318,8 @@ def _fill_target_zone(
     if np.any(target & ~np.isfinite(lfm)):
         raise ValueError("target-zone LFM must be finite before volume filling.")
 
-    direct = target & (count > 0)
+    direct = np.empty_like(target, dtype=bool)
+    np.logical_and(target, count, out=direct)
     if np.any(direct & ~np.isfinite(body)):
         raise ValueError("direct network prediction contains non-finite target samples.")
     fill_code = np.zeros(body.shape, dtype=np.uint8)
@@ -368,20 +370,24 @@ def _smooth_volume_curves(
     inverter: BodyInverter,
     inline_start: int,
     xline_start: int,
-    initial_log_ai: np.ndarray,
+    initial_log_ai: np.ndarray | None,
+    logger: logging.Logger | None = None,
+    label: str = "body",
 ) -> np.ndarray:
     """Construct complete fused/filled curves using the shared body output."""
     body = np.asarray(body_log_ai, dtype=np.float32)
     target = np.asarray(target_mask, dtype=bool)
-    initial = np.asarray(initial_log_ai, dtype=np.float32)
-    if initial.shape != body.shape:
+    initial = None if initial_log_ai is None else np.asarray(initial_log_ai, dtype=np.float32)
+    if initial is not None and initial.shape != body.shape:
         raise ValueError("initial_log_ai must match body_log_ai for volume construction.")
     flat_body = body.reshape((-1, body.shape[-1]))
     flat_target = target.reshape((-1, target.shape[-1]))
-    flat_initial = initial.reshape((-1, initial.shape[-1]))
+    flat_initial = None if initial is None else initial.reshape((-1, initial.shape[-1]))
     columns = np.flatnonzero(np.any(flat_target, axis=1))
     reader = inverter.reader
     device = inverter.device
+    if logger is not None:
+        logger.info("volume construction start | field=%s | traces=%d", label, len(columns))
     with torch.no_grad():
         for start in range(0, len(columns), inverter.batch_size):
             selected = columns[start:start + inverter.batch_size]
@@ -390,7 +396,7 @@ def _smooth_volume_curves(
             support = torch.as_tensor(flat_target[selected], device=device)
             values = torch.as_tensor(np.where(flat_target[selected], flat_body[selected], 0.0),
                                      device=device, dtype=torch.float32)
-            initial_values = torch.as_tensor(
+            initial_values = torch.zeros_like(values) if flat_initial is None else torch.as_tensor(
                 np.where(flat_target[selected], flat_initial[selected], 0.0),
                 device=device,
                 dtype=torch.float32,
@@ -414,6 +420,9 @@ def _smooth_volume_curves(
             smoothed = construction.body_log_ai
             smoothed = smoothed.cpu().numpy()
             flat_body[selected] = np.where(flat_target[selected], smoothed, np.nan)
+            if logger is not None and (start % (inverter.batch_size * 1000) == 0 or start + inverter.batch_size >= len(columns)):
+                logger.info("volume construction | field=%s | traces=%d/%d", label,
+                            min(start + inverter.batch_size, len(columns)), len(columns))
     body[~target] = np.nan
     return body
 
@@ -469,6 +478,7 @@ class BodyVolumeInverter:
         *,
         inline_bounds: tuple[int, int] | None = None,
         xline_bounds: tuple[int, int] | None = None,
+        section_store: SectionPredictionStore | None = None,
     ) -> BodyVolumeResult:
         """Predict and fuse one spatial tile; omitted bounds select the full survey."""
 
@@ -485,6 +495,7 @@ class BodyVolumeInverter:
             for orientation in self.config.orientations
         )
         started = time.perf_counter()
+        resumed_sections = 0
 
         for orientation in self.config.orientations:
             fixed_indices: Iterable[int]
@@ -500,10 +511,17 @@ class BodyVolumeInverter:
                     xline_bounds=(xl_start, xl_stop),
                 )
                 if keys:
-                    prediction = self.inverter.predict_raw_body(keys, center_visible=True)
-                    bodies = prediction.body_log_ai.detach().cpu().numpy().astype(np.float32, copy=False)
-                    supports = prediction.valid_mask.detach().cpu().numpy().astype(bool, copy=False)
-                    for row, key in enumerate(prediction.keys):
+                    cached = section_store.read(orientation, fixed_index, keys) if section_store else None
+                    if cached is None:
+                        prediction = self.inverter.predict_raw_body(keys, center_visible=True)
+                        bodies = prediction.body_log_ai.detach().cpu().numpy().astype(np.float32, copy=False)
+                        supports = prediction.valid_mask.detach().cpu().numpy().astype(bool, copy=False)
+                        if section_store is not None:
+                            section_store.write(orientation, fixed_index, keys, bodies, supports)
+                    else:
+                        bodies, supports = cached
+                        resumed_sections += 1
+                    for row, key in enumerate(keys):
                         local_i = key.inline_index - il_start
                         local_j = key.xline_index - xl_start
                         support = supports[row]
@@ -520,25 +538,29 @@ class BodyVolumeInverter:
                 if section_count % self.config.log_every_sections == 0 or section_count == total_sections:
                     elapsed = time.perf_counter() - started
                     self.log.info(
-                        "volume inference %d/%d sections | orientation=%s | fixed_index=%d | elapsed=%.1fs",
+                        "volume inference %d/%d sections | orientation=%s | fixed_index=%d | elapsed=%.1fs | resumed=%d",
                         section_count,
                         total_sections,
                         orientation,
                         fixed_index,
                         elapsed,
+                        resumed_sections,
                     )
 
-        supported = direction_count > 0
-        body_sum[supported] /= direction_count[supported].astype(np.float32)
-        body_sum[~supported] = np.nan
+        self.log.info("volume prediction complete | starting fusion and target-zone fill")
+        for start in range(0, shape[0], 8):
+            block = body_sum[start:start + 8]
+            counts = direction_count[start:start + 8]
+            supported = counts > 0
+            block[supported] /= counts[supported].astype(np.float32)
+            block[~supported] = np.nan
         local_lfm = np.asarray(
             reader.lfm_log_ai[il_start:il_stop, xl_start:xl_stop],
             dtype=np.float32,
         )
-        target_mask = np.asarray(
-            reader.lfm_valid_mask[il_start:il_stop, xl_start:xl_stop],
-            dtype=bool,
-        ) & np.isfinite(local_lfm)
+        target_mask = np.empty(local_lfm.shape, dtype=bool)
+        np.isfinite(local_lfm, out=target_mask)
+        target_mask &= reader.lfm_valid_mask[il_start:il_stop, xl_start:xl_stop]
         spacing = reader.geometry.bin_spacing_m()
         body_sum, fill_code, fill_mean_m, fill_max_m = _fill_target_zone(
             body_sum,
@@ -552,12 +574,15 @@ class BodyVolumeInverter:
             body_sum, target_mask, inverter=self.inverter,
             inline_start=il_start, xline_start=xl_start,
             initial_log_ai=local_lfm,
+            logger=self.log, label="body",
         )
-        disagreement = np.abs(_smooth_volume_curves(
+        disagreement = _smooth_volume_curves(
             disagreement, direction_count == 2, inverter=self.inverter,
             inline_start=il_start, xline_start=xl_start,
-            initial_log_ai=np.zeros_like(disagreement),
-        ))
+            initial_log_ai=None,
+            logger=self.log, label="direction_disagreement",
+        )
+        np.abs(disagreement, out=disagreement)
         return BodyVolumeResult(
             body_log_ai=body_sum,
             direction_count=direction_count,

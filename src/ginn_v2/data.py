@@ -319,7 +319,10 @@ class PatchReader:
         self.seismic_balance_floor_fraction = float(seismic_balance_floor_fraction)
         self.ilines = _finite_float_array(ilines, name="ilines", ndim=1)
         self.xlines = _finite_float_array(xlines, name="xlines", ndim=1)
-        self.lfm_log_ai = np.asarray(lfm_log_ai, dtype=np.float64)
+        # Keep the producer's floating dtype and storage.  In particular, the
+        # volume LFM may be a float32 array and the time-domain velocity may be
+        # a read-only memmap; forcing float64 here duplicates the whole volume.
+        self.lfm_log_ai = np.asanyarray(lfm_log_ai)
         self.lfm_valid_mask = np.asarray(lfm_valid_mask, dtype=bool)
         expected = (self.ilines.size, self.xlines.size, self.sample_axis.values.size)
         if self.lfm_log_ai.shape != expected or self.lfm_valid_mask.shape != expected:
@@ -334,8 +337,10 @@ class PatchReader:
             raise ValueError("LFM valid support contains non-finite values.")
         if np.any(np.isfinite(self.lfm_log_ai) & ~self.lfm_valid_mask):
             raise ValueError("LFM invalid support must be represented by non-finite values.")
+        # Domain extras use the same no-copy rule.  PatchBatch converts the
+        # small per-batch traces to float32 at the existing tensor boundary.
         self.domain_extras = {
-            str(name): np.asarray(value, dtype=np.float64)
+            str(name): np.asanyarray(value)
             for name, value in dict(domain_extras or {}).items()
         }
         for name, value in self.domain_extras.items():
@@ -367,6 +372,25 @@ class PatchReader:
             while len(self._trace_cache) > self._cache_size:
                 self._trace_cache.popitem(last=False)
         return trace
+
+    def _load_traces(self, indices: Iterable[tuple[int, int]]) -> dict[tuple[int, int], np.ndarray]:
+        """Read and validate a trace group while preserving the LRU policy."""
+
+        requested = tuple(indices)
+        if not requested:
+            return {}
+        loaded = self.source.read_traces(requested)
+        for index in requested:
+            if index not in loaded:
+                raise ValueError(f"TraceSource did not return requested trace {index}.")
+            trace = np.asarray(loaded[index], dtype=np.float64)
+            if trace.shape != self.sample_axis.values.shape:
+                raise ValueError(f"Trace {index} does not match the SampleAxis shape.")
+            if self._cache_size:
+                self._trace_cache[index] = trace.copy()
+                while len(self._trace_cache) > self._cache_size:
+                    self._trace_cache.popitem(last=False)
+        return loaded
 
     def _lateral_indices(self, key: PatchKey) -> list[tuple[int, int]]:
         i, j = key.inline_index, key.xline_index
@@ -421,26 +445,26 @@ class PatchReader:
             dtype=np.float64,
         )
 
-    def read(self, key: PatchKey, *, center_visible: bool) -> PatchSample:
-        """Read one patch with an explicit center visibility semantic."""
+    def _read_with_trace_overrides(
+        self,
+        key: PatchKey,
+        *,
+        center_visible: bool,
+        trace_overrides: Mapping[tuple[int, int], np.ndarray] | None,
+    ) -> PatchSample:
+        """Assemble one patch, optionally using a batch-local trace map."""
 
         if not isinstance(center_visible, bool):
             raise TypeError("center_visible must be boolean.")
         indices = self._lateral_indices(key)
-        missing_indices = [index for index in indices if index not in self._trace_cache]
-        loaded: dict[tuple[int, int], np.ndarray] = {}
+        loaded = dict(trace_overrides or {})
+        missing_indices = [
+            index
+            for index in indices
+            if index not in self._trace_cache and index not in loaded
+        ]
         if missing_indices:
-            loaded = self.source.read_traces(missing_indices)
-            for index in missing_indices:
-                if index not in loaded:
-                    raise ValueError(f"TraceSource did not return requested trace {index}.")
-                trace = np.asarray(loaded[index], dtype=np.float64)
-                if trace.shape != self.sample_axis.values.shape:
-                    raise ValueError(f"Trace {index} does not match the SampleAxis shape.")
-                if self._cache_size:
-                    self._trace_cache[index] = trace.copy()
-                    while len(self._trace_cache) > self._cache_size:
-                        self._trace_cache.popitem(last=False)
+            loaded.update(self._load_traces(missing_indices))
         traces = np.stack(
             [
                 np.asarray(loaded[index], dtype=np.float64)
@@ -513,10 +537,44 @@ class PatchReader:
             domain_extras=domain_extras,
         )
 
+    def read(self, key: PatchKey, *, center_visible: bool) -> PatchSample:
+        """Read one patch with an explicit center visibility semantic."""
+
+        return self._read_with_trace_overrides(
+            key,
+            center_visible=center_visible,
+            trace_overrides=None,
+        )
+
     def batch(self, keys: Iterable[PatchKey], *, center_visible: bool, device: torch.device | str) -> PatchBatch:
-        samples = tuple(self.read(key, center_visible=center_visible) for key in keys)
-        if not samples:
+        if not isinstance(center_visible, bool):
+            raise TypeError("center_visible must be boolean.")
+        selected = tuple(keys)
+        if not selected:
             raise ValueError("PatchReader.batch requires at least one PatchKey.")
+        lateral_indices = {
+            index
+            for key in selected
+            for index in self._lateral_indices(key)
+        }
+        # Snapshot all cached union members before loading missing traces can
+        # evict them from a small LRU.  The batch-local map therefore remains
+        # complete even when cache_size is smaller than the union.
+        loaded = {
+            index: self._trace_cache[index]
+            for index in lateral_indices
+            if index in self._trace_cache
+        }
+        missing_indices = sorted(index for index in lateral_indices if index not in self._trace_cache)
+        loaded.update(self._load_traces(missing_indices))
+        samples = tuple(
+            self._read_with_trace_overrides(
+                key,
+                center_visible=center_visible,
+                trace_overrides=loaded,
+            )
+            for key in selected
+        )
         features = torch.from_numpy(np.stack([item.features for item in samples])).to(device)
         observed = torch.from_numpy(np.stack([item.observed_seismic for item in samples])).to(device)
         observed_mask = torch.from_numpy(np.stack([item.observed_valid_mask for item in samples])).to(device)

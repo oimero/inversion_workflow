@@ -1077,7 +1077,9 @@ class BodyInversionTrainer:
             if len(indices) >= 3:
                 coords = np.asarray([coordinates_by_well[name][index] for index in indices], dtype=np.float64)
                 differences = np.diff(coords)
-                contiguous = np.isclose(differences, np.median(differences), rtol=0.0, atol=1e-8)
+                if np.any(~np.isfinite(differences)) or np.any(differences <= 0.0):
+                    raise ValueError(f"Well physical coordinates must be finite and strictly increasing: {name}")
+                contiguous = np.diff(np.asarray(indices, dtype=np.int64)) == 1
                 if not np.any(contiguous):
                     raise ValueError(f"Well target has no adjacent physical samples: {name}")
                 predicted_rough = float(np.sqrt(np.mean(np.square(np.diff(predicted)[contiguous] / differences[contiguous]))))

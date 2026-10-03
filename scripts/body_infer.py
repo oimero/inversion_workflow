@@ -36,6 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forward-model-inputs-run-dir", type=Path, default=None,
                         help="Forward-input run directory containing forward_model_inputs.json.")
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume an unfinished output directory from saved section predictions.")
     parser.add_argument("--smoke-tile-size", type=int, default=None)
     parser.add_argument(
         "--smoke-tile-origin",
@@ -74,7 +76,6 @@ def _plot_sections(
     fill_code = np.asarray(result.fill_code, dtype=np.uint8)
     disagreement = np.asarray(result.direction_disagreement_log_ai, dtype=np.float32)
     lfm = np.asarray(lfm_log_ai, dtype=np.float32)
-    increment = body - lfm
     files: list[str] = []
     axis = np.asarray(sample_axis.values, dtype=np.float64)
     candidates = (
@@ -85,7 +86,7 @@ def _plot_sections(
         if orientation == "inline":
             section_body = body[fixed]
             section_lfm = lfm[fixed]
-            section_increment = increment[fixed]
+            section_increment = section_body - section_lfm
             section_disagreement = disagreement[fixed]
             section_support = fill_code[fixed] > 0
             xy = np.asarray(
@@ -95,7 +96,7 @@ def _plot_sections(
         else:
             section_body = body[:, fixed]
             section_lfm = lfm[:, fixed]
-            section_increment = increment[:, fixed]
+            section_increment = section_body - section_lfm
             section_disagreement = disagreement[:, fixed]
             section_support = fill_code[:, fixed] > 0
             xy = np.asarray(
@@ -208,9 +209,13 @@ def main() -> None:
     seismic_path = loaded.seismic_path
     checkpoint_payload = loaded.checkpoint_payload
     output_dir = _output_dir(args.output_dir)
-    if output_dir.exists():
+    if output_dir.exists() and not args.resume:
         raise FileExistsError(f"Volume inference output already exists: {output_dir}")
-    output_dir.mkdir(parents=True)
+    if args.resume and not output_dir.is_dir():
+        raise FileNotFoundError(f"Resume output directory does not exist: {output_dir}")
+    if args.resume and (output_dir / "volume_inference_summary.json").exists():
+        raise ValueError("Volume inference already has a completion summary.")
+    output_dir.mkdir(parents=True, exist_ok=args.resume)
     log = configure_run_logger(output_dir, logger_name="ginn_v2_volume", file_name="volume_inference.log")
 
     batch_size = int(args.batch_size or inference_section.get("batch_size") or training_config.batch_size)
@@ -228,6 +233,7 @@ def main() -> None:
         smoke_tile_size=args.smoke_tile_size,
         smoke_tile_origin=args.smoke_tile_origin,
         logger=log,
+        section_cache_dir=output_dir / "section_predictions",
     )
     local_ilines = np.asarray(lfm.ilines[result.inline_indices], dtype=np.float64)
     local_xlines = np.asarray(lfm.xlines[result.xline_indices], dtype=np.float64)
@@ -275,11 +281,11 @@ def main() -> None:
             nan_fill=None,
         )
         if bool(export_config.get("body_increment_log_ai", True)):
-            increment = np.where(
-                result.fill_code > 0,
-                result.body_log_ai - local_lfm,
-                np.nan,
-            ).astype(np.float32)
+            increment = np.empty_like(result.body_log_ai, dtype=np.float32)
+            for start in range(0, increment.shape[0], 8):
+                block = slice(start, start + 8)
+                increment[block] = np.where(result.fill_code[block] > 0,
+                    result.body_log_ai[block] - local_lfm[block], np.nan)
             exports["body_increment_log_ai"] = export_volume_like_source(
                 output_base=output_dir / "ginn_v2_body_increment_log_ai",
                 volume=increment,

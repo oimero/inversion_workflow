@@ -18,6 +18,9 @@ from cup.lfm.types import LfmContext, LfmVariantResult
 from cup.well.controls import WellControl, WellControlSet
 
 
+_VOLUME_INLINE_BLOCK_SIZE = 8
+
+
 def _required_mapping(config: Mapping[str, Any], key: str, *, path: str) -> dict[str, Any]:
     value = config.get(key)
     if not isinstance(value, Mapping):
@@ -329,6 +332,79 @@ def _control_zone_coordinates(
     return indices, u_values
 
 
+def _write_volume_zone_blocks(
+    *,
+    volume: np.ndarray,
+    variance_volume: np.ndarray,
+    valid_mask: np.ndarray,
+    slice_fields: np.ndarray,
+    slice_variance: np.ndarray,
+    target_trace_valid: np.ndarray,
+    top: np.ndarray,
+    bottom: np.ndarray,
+    samples: np.ndarray,
+    n_slices: int,
+) -> None:
+    """Interpolate one proportional zone into a 3-D output in inline blocks."""
+    n_inline = volume.shape[0]
+    n_xline = volume.shape[1]
+    xline_index = np.arange(n_xline, dtype=np.int64)[None, :, None]
+    for inline_start in range(0, n_inline, _VOLUME_INLINE_BLOCK_SIZE):
+        inline_stop = min(inline_start + _VOLUME_INLINE_BLOCK_SIZE, n_inline)
+        top_block = top[inline_start:inline_stop, :]
+        bottom_block = bottom[inline_start:inline_stop, :]
+        u_grid = (samples[None, None, :] - top_block[:, :, None]) / (
+            bottom_block[:, :, None] - top_block[:, :, None]
+        )
+        zone_valid = target_trace_valid[inline_start:inline_stop, :, None] & np.isfinite(u_grid)
+        zone_valid &= u_grid >= 0.0
+        zone_valid &= u_grid <= 1.0
+
+        # Reuse the relative-coordinate buffer as the interpolation position;
+        # invalid traces are assigned index zero but remain masked on write.
+        np.clip(u_grid, 0.0, 1.0, out=u_grid)
+        u_grid[~zone_valid] = 0.0
+        u_grid *= n_slices - 1
+        lower = np.floor(u_grid).astype(np.int64)
+        upper = np.ceil(u_grid).astype(np.int64)
+        weight = u_grid - lower
+
+        inline_index = np.arange(inline_start, inline_stop, dtype=np.int64)[:, None, None]
+        lower_values = slice_fields[lower, inline_index, xline_index]
+        upper_values = slice_fields[upper, inline_index, xline_index]
+        lower_variance = slice_variance[lower, inline_index, xline_index]
+        upper_variance = slice_variance[upper, inline_index, xline_index]
+        zone_values = (1.0 - weight) * lower_values + weight * upper_values
+        zone_variance = (1.0 - weight) * lower_variance + weight * upper_variance
+
+        volume_block = volume[inline_start:inline_stop]
+        variance_block = variance_volume[inline_start:inline_stop]
+        valid_block = valid_mask[inline_start:inline_stop]
+        volume_block[zone_valid] = zone_values[zone_valid]
+        variance_block[zone_valid] = zone_variance[zone_valid]
+        valid_block[zone_valid] = True
+
+        # Make the block-local temporary lifetime explicit before the next
+        # block allocates its coordinate and gather arrays.
+        del (
+            u_grid,
+            zone_valid,
+            lower,
+            upper,
+            weight,
+            inline_index,
+            lower_values,
+            upper_values,
+            lower_variance,
+            upper_variance,
+            zone_values,
+            zone_variance,
+            volume_block,
+            variance_block,
+            valid_block,
+        )
+
+
 class ProportionalKrigingBuilder:
     method = "proportional_kriging"
 
@@ -467,33 +543,35 @@ class ProportionalKrigingBuilder:
             if context.output_geometry.is_section:
                 u_grid = (samples[None, :] - top[:, None]) / (bottom[:, None] - top[:, None])
                 zone_valid = target_trace_valid[:, None] & np.isfinite(u_grid) & (u_grid >= 0.0) & (u_grid <= 1.0)
-            else:
-                u_grid = (samples[None, None, :] - top[:, :, None]) / (bottom[:, :, None] - top[:, :, None])
-                zone_valid = target_trace_valid[:, :, None] & np.isfinite(u_grid) & (u_grid >= 0.0) & (u_grid <= 1.0)
-            # Invalid horizon traces remain outside the authoritative mask, but
-            # their NaN relative coordinates must never become array indices.
-            position = np.where(zone_valid, np.clip(u_grid, 0.0, 1.0) * (n_slices - 1), 0.0)
-            lower = np.floor(position).astype(np.int64)
-            upper = np.ceil(position).astype(np.int64)
-            weight = position - lower
-            if context.output_geometry.is_section:
+                # Invalid horizon traces remain outside the authoritative mask,
+                # but their NaN relative coordinates must never become indices.
+                position = np.where(zone_valid, np.clip(u_grid, 0.0, 1.0) * (n_slices - 1), 0.0)
+                lower = np.floor(position).astype(np.int64)
+                upper = np.ceil(position).astype(np.int64)
+                weight = position - lower
                 trace_index = np.arange(context.output_geometry.ilines.size)[:, None]
                 lower_values = slice_fields[lower, trace_index]
                 upper_values = slice_fields[upper, trace_index]
                 lower_variance = slice_variance[lower, trace_index]
                 upper_variance = slice_variance[upper, trace_index]
+                zone_values = (1.0 - weight) * lower_values + weight * upper_values
+                zone_variance = (1.0 - weight) * lower_variance + weight * upper_variance
+                volume[zone_valid] = zone_values[zone_valid]
+                variance_volume[zone_valid] = zone_variance[zone_valid]
+                valid_mask[zone_valid] = True
             else:
-                il_index = np.arange(context.output_geometry.ilines.size)[:, None, None]
-                xl_index = np.arange(context.output_geometry.xlines.size)[None, :, None]
-                lower_values = slice_fields[lower, il_index, xl_index]
-                upper_values = slice_fields[upper, il_index, xl_index]
-                lower_variance = slice_variance[lower, il_index, xl_index]
-                upper_variance = slice_variance[upper, il_index, xl_index]
-            zone_values = (1.0 - weight) * lower_values + weight * upper_values
-            zone_variance = (1.0 - weight) * lower_variance + weight * upper_variance
-            volume[zone_valid] = zone_values[zone_valid]
-            variance_volume[zone_valid] = zone_variance[zone_valid]
-            valid_mask[zone_valid] = True
+                _write_volume_zone_blocks(
+                    volume=volume,
+                    variance_volume=variance_volume,
+                    valid_mask=valid_mask,
+                    slice_fields=slice_fields,
+                    slice_variance=slice_variance,
+                    target_trace_valid=target_trace_valid,
+                    top=top,
+                    bottom=bottom,
+                    samples=samples,
+                    n_slices=n_slices,
+                )
 
         volume[~valid_mask] = np.nan
         variance_volume[~valid_mask] = np.nan

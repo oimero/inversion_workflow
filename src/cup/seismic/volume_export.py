@@ -19,22 +19,33 @@ from cup.utils.io import build_segy_textual_header
 
 
 def log_ai_to_ai_volume(log_ai: np.ndarray) -> np.ndarray:
-    """Convert a log(AI) export volume to finite positive linear AI."""
+    """Convert log(AI) to float32 AI with bounded float64 exponential blocks."""
 
-    values = np.asarray(log_ai, dtype=np.float64)
-    with np.errstate(over="ignore", invalid="ignore"):
-        ai = np.exp(values)
-    invalid = np.isfinite(values) & (
-        ~np.isfinite(ai)
-        | (ai <= 0.0)
-        | (ai > np.finfo(np.float32).max)
-    )
-    if np.any(invalid):
-        raise ValueError("Cannot export AI: exp(log_ai) produced non-finite or non-positive values.")
-    output = ai.astype(np.float32)
-    invalid_output = np.isfinite(values) & (~np.isfinite(output) | (output <= 0.0))
-    if np.any(invalid_output):
-        raise ValueError("Cannot export AI: exp(log_ai) is outside the float32 positive range.")
+    values = np.asarray(log_ai)
+    output = np.empty(values.shape, dtype=np.float32)
+    with np.nditer(
+        [values, output],
+        flags=["external_loop", "buffered", "zerosize_ok"],
+        op_flags=[["readonly"], ["writeonly"]],
+        op_dtypes=[np.float64, np.float32],
+        casting="unsafe",
+        buffersize=1 << 20,
+    ) as blocks:
+        for block, target in blocks:
+            with np.errstate(over="ignore", invalid="ignore"):
+                ai = np.exp(block)
+            finite = np.isfinite(block)
+            invalid = finite & (
+                ~np.isfinite(ai)
+                | (ai <= 0.0)
+                | (ai > np.finfo(np.float32).max)
+            )
+            if np.any(invalid):
+                raise ValueError("Cannot export AI: exp(log_ai) produced non-finite or non-positive values.")
+            converted = ai.astype(np.float32)
+            if np.any(finite & (~np.isfinite(converted) | (converted <= 0.0))):
+                raise ValueError("Cannot export AI: exp(log_ai) is outside the float32 positive range.")
+            target[...] = converted
     return output
 
 

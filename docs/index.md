@@ -20,15 +20,10 @@ flowchart TB
 | 旁路 · well_trajectory | `experiments/common/common.yaml` |
 | 旁路 · rock_physics_analysis | `experiments/common/common.yaml` |
 | 旁路 · synthoseis_lite | `experiments/synthoseis_lite/synthoseis_lite.yaml` |
-| 旁路 · 带限证据 | `experiments/evidence/evidence.yaml` |
-| GINN V2 主体反演 | `experiments/ginn_v2/ginn_v2.yaml` |
+| GINN V2 body 反演 | `experiments/ginn_v2/ginn_v2.yaml` |
 
 ## 深度域工作流
 
 深度域是一次性处理路径，Step 1–3、6 与时间域共享。
 Step 4/5 使用独立脚本，详见
 [深度域工作流](guide/depth-domain-workflow.md)。
-
-## GINN V2 主体反演
-
-[运行指南](guide/ginn-v2-body-inversion.md)

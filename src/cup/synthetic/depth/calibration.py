@@ -10,7 +10,8 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from cup.utils.petrel import import_interpretation_petrel, import_well_tops_petrel
+from cup.seismic.petrel import import_interpretation_petrel
+from cup.well.petrel import import_well_tops_petrel
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.synthetic.reporting.figures import (
@@ -26,13 +27,8 @@ from cup.synthetic.depth.calibration_adapter import (
     depth_well_zone_curves_for_object_core,
     load_depth_calibration_for_object_core,
 )
-from cup.utils.io import (
-    CONTRACT_FINGERPRINT_SCHEMA,
-    contract_fingerprint_sha256,
-    repo_relative_path,
-    resolve_relative_path,
-    write_json,
-)
+from cup.config.artifacts import CONTRACT_FINGERPRINT_SCHEMA, contract_fingerprint_sha256
+from cup.utils.io import repo_relative_path, resolve_relative_path, write_json
 from cup.synthetic.adapters import DepthSyntheticDomainAdapter
 from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
 from cup.utils.statistics import radius_connected_components

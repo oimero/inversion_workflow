@@ -6,4 +6,8 @@
 
 ::: cup.utils.statistics
 
-::: cup.utils.petrel
+::: cup.utils.masks
+
+::: cup.utils.logging
+
+::: cup.utils.text

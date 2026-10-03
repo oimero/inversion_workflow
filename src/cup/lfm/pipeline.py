@@ -23,14 +23,12 @@ from cup.lfm.framework import MODIFIERS
 from cup.lfm.types import LfmContext, LfmVariantResult, OutputGeometry
 from cup.seismic.target_zone_io import build_workflow_target_zone
 from cup.seismic.volume_export import export_volume_like_source, log_ai_to_ai_volume
-from cup.utils.io import (
+from cup.config.artifacts import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
-    repo_relative_path,
     require_contract_fingerprint,
-    resolve_relative_path,
-    write_json,
 )
+from cup.utils.io import repo_relative_path, resolve_relative_path, write_json
 from cup.seismic.trace_sampling import sample_volume_trilinear
 from cup.well.controls import WellControlSet
 

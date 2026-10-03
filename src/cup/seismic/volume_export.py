@@ -15,7 +15,17 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.utils.io import build_segy_textual_header
+
+
+def build_segy_textual_header(title: str, lines: list[str] | None = None) -> str:
+    """Construct the forty fixed-width rows of a SEG-Y textual header."""
+    all_lines = [title] + (lines or [])
+    rows = [f"C{i:>2d} {text}"[:80].ljust(80) for i, text in enumerate(all_lines, start=1)]
+    rows.extend([f"C{i:>2d}".ljust(80) for i in range(len(rows) + 1, 41)])
+    textual = "".join(rows)
+    if len(textual) != 3200:
+        raise ValueError(f"Expected 3200-char textual header, got {len(textual)}")
+    return textual
 
 
 def log_ai_to_ai_volume(log_ai: np.ndarray) -> np.ndarray:

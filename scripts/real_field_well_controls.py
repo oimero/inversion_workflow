@@ -27,14 +27,8 @@ from cup.config.sources import resolve_source_file_from_run
 from cup.config.workflow import WorkflowConfig, deep_merge_dict
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.target_zone_io import build_workflow_target_zone
-from cup.utils.io import (
-    is_consumable_contract_status,
-    latest_checked_run,
-    load_yaml_config,
-    repo_relative_path,
-    resolve_relative_path,
-    write_json,
-)
+from cup.config.artifacts import is_consumable_contract_status, latest_checked_run
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.well.controls import write_depth_well_control_qc
 from cup.well.controls import (
     DEPTH_SOURCE_SCHEMA,

@@ -17,6 +17,7 @@
 3. ZgySurveyContext: ZGY Adapter。
 4. open_survey: 根据文件类型打开地震体。
 5. segy_options_from_config: 从配置段构建 SEG-Y 读取参数。
+6. import_seismic: 读取完整的三维地震数组。
 """
 
 from __future__ import annotations
@@ -29,6 +30,47 @@ import numpy as np
 
 from cup.seismic.geometry import LineAxis, SampleAxis, SurveyLineGeometry
 from wtie.processing import grid
+
+
+def import_seismic(
+    seismic_file: Path,
+    seismic_type: str = "segy",
+    iline: int | None = None,
+    xline: int | None = None,
+    istep: int | None = None,
+    xstep: int | None = None,
+) -> np.ndarray:
+    """Read a complete SEG-Y or ZGY volume as ``[inline, xline, sample]``."""
+    seismic_type_lower = str(seismic_type).lower()
+    if seismic_type_lower == "segy":
+        import cigsegy
+
+        segy_kwargs = {}
+        if iline is not None:
+            segy_kwargs["iline"] = int(iline)
+        if xline is not None:
+            segy_kwargs["xline"] = int(xline)
+        if istep is not None:
+            segy_kwargs["istep"] = int(istep)
+        if xstep is not None:
+            segy_kwargs["xstep"] = int(xstep)
+        volume = cigsegy.fromfile(str(seismic_file), **segy_kwargs)
+        volume = np.asarray(volume, dtype=np.float32)
+        if volume.ndim != 3:
+            raise ValueError(f"Only 3D post-stack SEG-Y is supported, got ndim={volume.ndim}")
+        return volume
+
+    if seismic_type_lower == "zgy":
+        from pyzgy.read import SeismicReader
+
+        with SeismicReader(str(seismic_file)) as reader:
+            volume = reader.read_volume()
+        volume = np.asarray(volume, dtype=np.float32)
+        if volume.ndim != 3:
+            raise ValueError(f"Only 3D ZGY volume is supported, got ndim={volume.ndim}")
+        return volume
+
+    raise ValueError(f"Unsupported seismic_type: {seismic_type}. Expect 'segy' or 'zgy'.")
 
 
 class SurveyContext(Protocol):

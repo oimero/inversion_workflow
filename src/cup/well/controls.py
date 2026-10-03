@@ -14,22 +14,20 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from cup.physics.execution import load_forward_inputs
+from cup.seismic.forward_inputs import load_forward_inputs
 from cup.physics.numpy_backend import forward_depth, reflectivity_from_log_ai
+from cup.physics.relations import AIVelocityRelation
 from cup.seismic.geometry import SampleAxis, SurveyLineGeometry
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.viz import plot_well_waveform_qc
-from cup.utils.io import (
+from cup.config.artifacts import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
     is_consumable_contract_status,
-    repo_relative_path,
     require_contract_fingerprint,
     resolve_artifact_path,
-    resolve_relative_path,
-    sanitize_filename,
-    write_json,
 )
+from cup.utils.io import repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.masks import true_runs as _finite_runs
 from cup.well.inventory import build_file_lookup, normalize_well_name
 from cup.well.scale import gaussian_smooth_finite_runs_numpy
@@ -1197,13 +1195,12 @@ def forward_depth_finite_runs(
     values = np.asarray(log_ai, dtype=np.float64)
     depth = np.asarray(depth_m, dtype=np.float64)
     output = np.full(values.shape, np.nan, dtype=np.float64)
+    relation = AIVelocityRelation(a=relation_a, b=relation_b)
     for start, stop in _finite_runs(np.isfinite(values)):
         if stop - start < 2:
             continue
         local_log_ai = values[start:stop]
-        velocity = (np.exp(local_log_ai) - relation_b) / relation_a
-        if np.any(~np.isfinite(velocity)) or np.any(velocity <= 0.0):
-            raise ValueError("AI-Vp relation produced invalid velocity in a well-control run.")
+        velocity = relation.velocity_from_ai(np.exp(local_log_ai))
         output[start:stop] = forward_depth(
             local_log_ai,
             velocity,

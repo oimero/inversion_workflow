@@ -24,12 +24,8 @@ if str(SRC_DIR) not in sys.path:
 from cup.config.workflow import WorkflowConfig, deep_merge_dict
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.target_zone_io import build_workflow_target_zone
-from cup.utils.io import (
-    load_yaml_config,
-    repo_relative_path,
-    resolve_relative_path,
-    resolve_timestamped_output_dir,
-)
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path
+from cup.config.artifacts import resolve_timestamped_output_dir
 from cup.utils.logging import configure_run_logger
 from ginn_v2.diagnose import BodyFwhmSweepPolicy, run_body_fwhm_sweep, write_body_fwhm_sweep_artifacts
 from cup.well.controls import load_depth_forward_inputs, load_well_control_set

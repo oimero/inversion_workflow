@@ -1,6 +1,6 @@
 # cup.physics
 
-NumPy 后端是默认公共 API；PyTorch 后端需显式导入，避免基础 `cup` 用户被迫加载 PyTorch。
+物理计算通过具体后端模块调用。NumPy 后端服务数组正演，PyTorch 后端服务可微正演；物性关系由独立的关系模块表达。
 
 ::: cup.physics
 
@@ -8,14 +8,8 @@ NumPy 后端是默认公共 API；PyTorch 后端需显式导入，避免基础 `
 
 ::: cup.physics.torch_backend
 
-::: cup.physics.adapters
-
-::: cup.physics.calibration
+::: cup.physics.relations
 
 ::: cup.physics.execution
 
 ::: cup.physics.rock_physics
-
-::: cup.physics.canonical
-
-::: cup.physics.contracts

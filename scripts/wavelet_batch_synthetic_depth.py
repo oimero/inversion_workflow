@@ -34,11 +34,13 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.utils.io import (
+from cup.config.artifacts import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
-    load_yaml_config,
     published_contract_reference,
+)
+from cup.utils.io import (
+    load_yaml_config,
     repo_relative_path,
     resolve_relative_path,
     sanitize_filename,
@@ -47,6 +49,7 @@ from cup.config.sources import resolve_source_run
 from cup.config.workflow import WorkflowConfig
 from cup.well.tie import DEPTH_WAVELET_BATCH_SCHEMA_VERSION
 from cup.seismic.survey import segy_options_from_config
+from cup.utils.masks import true_runs
 
 matplotlib.use("Agg")
 
@@ -217,14 +220,6 @@ def compute_depth_shift_curve(tdt_df: pd.DataFrame, twt_s: np.ndarray, shift_s: 
     z1 = np.interp(shifted_t[valid], tdt_t, tdt_z)
     return pd.DataFrame({"twt_s": twt_s[valid], "tvdss_m": z0, "depth_shift_m": z1 - z0})
 
-def _true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
-    mask = np.asarray(mask, dtype=bool).reshape(-1)
-    if mask.size == 0:
-        return []
-    padded = np.concatenate(([False], mask, [False]))
-    changes = np.flatnonzero(padded[1:] != padded[:-1])
-    return [(int(start), int(stop)) for start, stop in zip(changes[0::2], changes[1::2])]
-
 def _source_null_value(las: Any, default: float = -999.25) -> float:
     try:
         value = float(las.well["NULL"].value)
@@ -327,7 +322,7 @@ def _interpolate_curve_preserving_gaps(
             raise ValueError(f"Curve {curve_name} has too few finite shifted samples.")
         return out
 
-    for start, stop in _true_runs(valid):
+    for start, stop in true_runs(valid):
         if stop - start < 2:
             continue
         x = shifted_md_m[start:stop]
@@ -641,7 +636,7 @@ def save_r1_style_synthetic_qc(
         & np.isfinite(seismic_norm)
         & np.isfinite(synthetic_scaled)
     )
-    runs = _true_runs(valid)
+    runs = true_runs(valid)
     if not runs:
         raise ValueError("No valid samples for R1-style synthetic QC figure.")
     start, stop = max(runs, key=lambda item: item[1] - item[0])
@@ -1132,7 +1127,7 @@ def main() -> None:
 
     # ── Load shared resources ──
 
-    from cup.utils.petrel import import_well_heads_petrel
+    from cup.well.petrel import import_well_heads_petrel
     from cup.seismic.survey import open_survey
     from wtie.modeling.modeling import ConvModeler
 

@@ -24,6 +24,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from cup.utils.coerce import optional_float as _optional_float
 from wtie.processing import grid
 
 STANDARD_MNEMONICS: dict[str, str] = {
@@ -800,14 +801,6 @@ def threshold_from_overrides(
             standard_mnemonic=standard_mnemonic, lower=None, upper=None, source="missing_threshold", sample_count=0
         ),
     )
-
-
-def _optional_float(value: Any) -> float | None:
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return None
-    return out if np.isfinite(out) else None
 
 
 def remove_outliers(values: np.ndarray, threshold: CurveThreshold) -> OutlierRemoval:

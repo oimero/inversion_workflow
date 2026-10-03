@@ -37,11 +37,13 @@ from cup.config.workflow import WorkflowConfig
 from cup.well.tie import DEPTH_VERTICAL_AUTO_TIE_SCHEMA_VERSION
 from cup.config.sources import resolve_source_run
 from cup.seismic.survey import segy_options_from_config
-from cup.utils.io import (
+from cup.config.artifacts import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
-    load_yaml_config,
     published_contract_reference,
+)
+from cup.utils.io import (
+    load_yaml_config,
     repo_relative_path,
     resolve_relative_path,
     sanitize_filename,
@@ -685,7 +687,7 @@ def main() -> None:
 
     # ── Import heavy dependencies ──
 
-    from cup.utils.petrel import import_well_heads_petrel
+    from cup.well.petrel import import_well_heads_petrel
     from cup.seismic.survey import open_survey
     from wtie.utils.datasets import tutorial as tutorial_mod
 

@@ -1,9 +1,9 @@
 """Domain-independent frozen AI--Vp relation values.
 
 Robust fitting lives in :mod:`cup.physics.rock_physics`; workflow discovery
-and artifact writing live in ``scripts/rock_physics_analysis.py``.  This module
-defines the strict relation value consumed by forward callers without file
-discovery or unit conversion.
+and artifact writing live in the workflow scripts.  This module defines the
+strict relation value consumed by forward callers without file discovery or
+unit conversion.
 """
 
 from __future__ import annotations

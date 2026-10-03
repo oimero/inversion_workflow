@@ -92,26 +92,6 @@ def _validate_depth_inputs(
     return log_values, velocity, depth
 
 
-def _validate_velocity_depth(
-    velocity_mps: Any,
-    depth_m: Any,
-) -> tuple[np.ndarray, np.ndarray]:
-    velocity = _floating_array(velocity_mps, name="velocity_mps")
-    if velocity.ndim < 1 or velocity.shape[-1] < 2:
-        raise ValueError("velocity_mps must have shape [..., N] with N >= 2.")
-    if np.any(velocity <= 0.0):
-        raise ValueError("velocity_mps must be positive everywhere.")
-    depth = _floating_array(depth_m, name="depth_m", ndim=1)
-    if depth.size != velocity.shape[-1]:
-        raise ValueError(
-            "depth_m length must match the final velocity_mps dimension, "
-            f"got {depth.size} and {velocity.shape[-1]}."
-        )
-    if np.any(np.diff(depth) <= 0.0):
-        raise ValueError("depth_m must be strictly increasing.")
-    return velocity, depth
-
-
 def reflectivity_from_log_ai(log_ai: Any) -> np.ndarray:
     """Return lower-interface acoustic reflectivity with shape ``[..., N-1]``."""
     values = _validate_log_ai(log_ai)
@@ -205,44 +185,6 @@ def _wavelet_weights(
         right=0.0,
     )
     return interpolated.reshape(tau_s.shape).astype(dtype, copy=False)
-
-
-def build_depth_operator(
-    velocity_mps: Any,
-    depth_m: Any,
-    wavelet_time_s: Any,
-    wavelet_amp: Any,
-    *,
-    output_chunk_size: int = DEFAULT_OUTPUT_CHUNK_SIZE,
-) -> np.ndarray:
-    """Build and return ``W_depth[..., N, N-1]`` in output-depth chunks."""
-    velocity, depth = _validate_velocity_depth(velocity_mps, depth_m)
-    wavelet_time, amplitude = _validate_wavelet(wavelet_time_s, wavelet_amp)
-    chunk_size = _validate_output_chunk_size(output_chunk_size)
-    dtype = np.dtype(np.result_type(velocity.dtype, depth.dtype, amplitude.dtype))
-    n_samples = velocity.shape[-1]
-    velocity_flat = velocity.astype(dtype, copy=False).reshape((-1, n_samples))
-    sample_twt, interface_twt = _relative_twt_axes(
-        velocity_flat,
-        depth.astype(dtype, copy=False),
-        dtype=dtype,
-    )
-    operator = np.empty(
-        (velocity_flat.shape[0], n_samples, n_samples - 1),
-        dtype=dtype,
-    )
-    for start in range(0, n_samples, chunk_size):
-        stop = min(start + chunk_size, n_samples)
-        operator[:, start:stop, :] = _wavelet_weights(
-            sample_twt,
-            interface_twt,
-            wavelet_time.astype(dtype, copy=False),
-            amplitude.astype(dtype, copy=False),
-            start=start,
-            stop=stop,
-            dtype=dtype,
-        )
-    return operator.reshape((*velocity.shape[:-1], n_samples, n_samples - 1))
 
 
 def forward_depth(
@@ -394,7 +336,6 @@ def velocity_from_ai(ai: Any, *, a: float, b: float) -> np.ndarray:
 __all__ = [
     "DEFAULT_OUTPUT_CHUNK_SIZE",
     "ai_from_velocity",
-    "build_depth_operator",
     "forward_depth",
     "forward_time",
     "reflectivity_from_log_ai",

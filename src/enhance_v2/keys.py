@@ -7,6 +7,8 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 
+from cup.utils.masks import true_runs
+
 from .contracts import DictionaryAtom
 
 
@@ -347,13 +349,6 @@ def analytic_transform(query: BodyKey, atom: BodyKey, *, denominator_floor: floa
     return TransformParameters(float(shift), float(stretch), float(amplitude))
 
 
-def _finite_runs(mask: np.ndarray) -> list[tuple[int, int]]:
-    mask = np.asarray(mask, dtype=bool)
-    padded = np.r_[False, mask, False]
-    changes = np.flatnonzero(padded[1:] != padded[:-1])
-    return [(int(start), int(stop)) for start, stop in changes.reshape(-1, 2)]
-
-
 def transform_residual(
     atom: DictionaryAtom,
     query: BodyKey,
@@ -370,7 +365,7 @@ def transform_residual(
     source_relative = atom.body_key.center_m + atom.body_key.mu + (axis - query.center_m - query.mu) / params.stretch
     transformed = np.zeros(axis.shape, dtype=np.float64)
     valid = np.zeros(axis.shape, dtype=bool)
-    for start, stop in _finite_runs(atom.valid_support):
+    for start, stop in true_runs(atom.valid_support):
         if stop - start < 2:
             exact = np.isclose(source_relative, source_coordinates[start], rtol=0.0, atol=1.0e-10)
             transformed[exact] = source_values[start]

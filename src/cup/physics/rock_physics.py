@@ -12,7 +12,7 @@ from typing import Mapping
 
 import numpy as np
 
-from cup.physics.calibration import AIVelocityRelation
+from cup.physics.relations import AIVelocityRelation
 
 
 @dataclass(frozen=True)

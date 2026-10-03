@@ -35,17 +35,19 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.config.workflow import WorkflowConfig, merge_dict_defaults
 from cup.config.sources import resolve_source_run
-from cup.utils.io import (
+from cup.config.artifacts import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
-    load_yaml_config,
     published_contract_reference,
+)
+from cup.utils.io import (
+    load_yaml_config,
     repo_relative_path,
     resolve_relative_path,
     sanitize_filename,
     write_json,
 )
-from cup.utils.statistics import aggregate_cluster_then_global
+from cup.seismic.wavelet_consensus import aggregate_cluster_then_global
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.well.inventory import normalize_well_name
 from cup.well.tie import (

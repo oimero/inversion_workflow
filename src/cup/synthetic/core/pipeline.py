@@ -54,12 +54,8 @@ from cup.synthetic.reporting.figures import (
     write_generation_figures,
 )
 from cup.synthetic.schemas import STRUCTURED_ARTIFACT_VERSION
-from cup.utils.io import (
-    CONTRACT_FINGERPRINT_SCHEMA,
-    contract_fingerprint_sha256,
-    repo_relative_path,
-    write_json as _write_json,
-)
+from cup.config.artifacts import CONTRACT_FINGERPRINT_SCHEMA, contract_fingerprint_sha256
+from cup.utils.io import repo_relative_path, write_json as _write_json
 
 
 def _new_staging_directory(directory: Path) -> Path:

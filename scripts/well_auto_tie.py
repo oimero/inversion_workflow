@@ -36,7 +36,8 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.utils.petrel import import_interpretation_petrel, import_well_tops_petrel
+from cup.seismic.petrel import import_interpretation_petrel
+from cup.well.petrel import import_well_tops_petrel
 from cup.seismic.horizon import HorizonSurface
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.trace_sampling import assemble_bilinear_trace_from_plan, build_bilinear_trace_sample_plan
@@ -44,11 +45,13 @@ from cup.seismic.viz import plot_well_waveform_qc
 from cup.config.workflow import WorkflowConfig, merge_dict_defaults
 from cup.well.tie import WELL_AUTO_TIE_SCHEMA_VERSION
 from cup.config.sources import resolve_source_run
-from cup.utils.io import (
+from cup.config.artifacts import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
-    load_yaml_config,
     published_contract_reference,
+)
+from cup.utils.io import (
+    load_yaml_config,
     repo_relative_path,
     resolve_relative_path,
     sanitize_filename,

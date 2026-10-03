@@ -8,5 +8,6 @@
 - `cup.lfm`
 - `cup.physics`
 - `cup.seismic`
+- `cup.synthetic`
 - `cup.utils`
 - `cup.well`

@@ -10,8 +10,8 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from cup.physics import generation_contract
-from cup.utils.petrel import import_interpretation_petrel
+from cup.synthetic.core.canonical import generation_contract
+from cup.seismic.petrel import import_interpretation_petrel
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.wavelet import load_wavelet_csv
@@ -57,14 +57,13 @@ from cup.synthetic.schemas import (
     require_science_contract,
 )
 from cup.physics.execution import DepthForwardExecutor
-from cup.utils.io import (
+from cup.config.artifacts import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
     is_consumable_contract_status,
-    repo_relative_path,
     require_contract_fingerprint,
-    resolve_relative_path,
 )
+from cup.utils.io import repo_relative_path, resolve_relative_path
 
 
 def _survey(workflow: Any, *, repo_root: Path) -> Any:

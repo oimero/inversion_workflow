@@ -7,9 +7,10 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from cup.physics import canonical_lowpass, validate_increment_contract
+from cup.synthetic.core.canonical import canonical_lowpass, validate_increment_contract
 from cup.synthetic.core.random import RandomNamespace
 from cup.synthetic.core.rejections import BenchmarkBuildRejected
+from cup.utils.masks import true_runs
 from cup.utils.statistics import centered_rms
 
 
@@ -42,10 +43,7 @@ def _canonical_segment_diagnostics(
     short_lengths: list[int] = []
     affected_traces = 0
     for row in np.asarray(valid_mask, dtype=bool).reshape(-1, valid_mask.shape[-1]):
-        padded = np.concatenate(([False], row, [False]))
-        starts = np.flatnonzero(~padded[:-1] & padded[1:])
-        stops = np.flatnonzero(padded[:-1] & ~padded[1:])
-        lengths = stops - starts
+        lengths = np.asarray([stop - start for start, stop in true_runs(row)], dtype=np.int64)
         short = lengths[lengths < minimum_samples]
         if short.size:
             affected_traces += 1

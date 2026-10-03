@@ -45,6 +45,7 @@ nav:
   - 首页: index.md
   - 快速开始:
       - 数据与单位约定: concepts/data-and-coordinate-conventions.md
+      - cup 模块职责: concepts/cup-module-responsibilities.md
       - 脚本风格指南: concepts/script-style.md
   - 教程:
       - 常见问题: guide/0-troubleshooting.md
@@ -69,6 +70,7 @@ nav:
           - cup.lfm: api/cup/lfm.md
           - cup.physics: api/cup/physics.md
           - cup.seismic: api/cup/seismic.md
+          - cup.synthetic: api/cup/synthetic.md
           - cup.well: api/cup/well.md
           - cup.utils: api/cup/utils.md
       - wtie:

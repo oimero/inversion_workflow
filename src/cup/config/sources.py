@@ -7,7 +7,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from cup.utils.io import latest_checked_run, resolve_relative_path
+from cup.config.artifacts import latest_checked_run
+from cup.utils.io import resolve_relative_path
 
 
 def _path_text(value: object) -> str:

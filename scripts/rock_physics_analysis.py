@@ -41,16 +41,13 @@ from cup.config.sources import resolve_source_run
 from cup.config.workflow import WorkflowConfig
 from cup.physics.rock_physics import WellAiVpSamples, fit_equal_well_huber, well_fit_metrics
 from cup.synthetic.schemas import ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION
-from cup.utils.io import (
+from cup.config.artifacts import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
-    load_yaml_config,
-    repo_relative_path,
     require_contract_fingerprint,
-    resolve_relative_path,
     resolve_timestamped_output_dir,
-    write_json,
 )
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 
 
 SCHEMA_VERSION = ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION

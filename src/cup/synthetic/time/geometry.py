@@ -8,7 +8,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from cup.utils.petrel import import_interpretation_petrel
+from cup.seismic.petrel import import_interpretation_petrel
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.config.workflow import WorkflowConfig

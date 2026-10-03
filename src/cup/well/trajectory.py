@@ -10,7 +10,8 @@ from typing import Any, Literal, Mapping, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 
-from cup.utils.petrel import import_petrel_checkshots_dataframe
+from cup.utils.coerce import optional_float as _optional_float
+from cup.well.petrel import import_petrel_checkshots_dataframe
 from cup.well.inventory import normalize_well_name
 from wtie.processing import grid
 
@@ -32,16 +33,6 @@ _HEADER_PATTERNS = {
     "well_head_y_m": re.compile(r"^#\s*WELL HEAD Y-COORDINATE:\s*(?P<value>[-+0-9.eE]+)", re.IGNORECASE),
     "kb_m": re.compile(r"^#\s*WELL DATUM.*?:\s*(?P<value>[-+0-9.eE]+)", re.IGNORECASE),
 }
-
-
-def _optional_float(value: object) -> float | None:
-    try:
-        number = float(value)  # type: ignore
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(number):
-        return None
-    return number
 
 
 def _read_petrel_header(path: Path) -> tuple[dict[str, Any], list[str], int]:

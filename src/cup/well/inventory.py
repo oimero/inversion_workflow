@@ -26,6 +26,9 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from cup.utils.coerce import optional_float
+from cup.utils.statistics import radius_connected_components
+
 
 def normalize_well_name(name: object) -> str:
     """返回项目统一的井名匹配键。"""
@@ -84,17 +87,7 @@ def build_file_lookup(files: Iterable[Path], *, asset_label: str) -> dict[str, P
 
 def is_finite_number(value: object) -> bool:
     """判断输入是否为有限数值。"""
-    try:
-        return bool(np.isfinite(float(value)))  # type: ignore
-    except (TypeError, ValueError):
-        return False
-
-
-def optional_float(value: object) -> float | None:
-    """将输入转为 float，非有限时返回 None。"""
-    if not is_finite_number(value):
-        return None
-    return float(value)  # type: ignore
+    return optional_float(value) is not None
 
 
 def classify_wellbore(
@@ -272,33 +265,16 @@ def build_platform_clusters(
     if not valid:
         return []
 
-    parent = list(range(len(valid)))
-
-    def find(index: int) -> int:
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
-
-    def union(left: int, right: int) -> None:
-        root_left = find(left)
-        root_right = find(right)
-        if root_left != root_right:
-            parent[root_right] = root_left
-
     threshold = float(platform_cluster_threshold_m)
-    for i, left in enumerate(valid):
-        for j in range(i + 1, len(valid)):
-            right = valid[j]
-            distance = float(
-                np.hypot(float(right.surface_x) - float(left.surface_x), float(right.surface_y) - float(left.surface_y))  # type: ignore
-            )
-            if distance <= threshold:
-                union(i, j)
+    points_xy = np.asarray(
+        [[float(record.surface_x), float(record.surface_y)] for record in valid],
+        dtype=np.float64,
+    )
+    labels = radius_connected_components(points_xy, threshold)
 
     groups: dict[int, list[WellInventoryRecord]] = {}
     for index, record in enumerate(valid):
-        groups.setdefault(find(index), []).append(record)
+        groups.setdefault(int(labels[index]), []).append(record)
 
     clusters = [group for group in groups.values() if len(group) > 1]
     clusters.sort(key=lambda group: (-len(group), group[0].well_name))

@@ -8,6 +8,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from cup.seismic.geometry import SampleAxis
+from cup.utils.masks import true_runs
 from wtie.processing import grid
 
 
@@ -73,12 +74,6 @@ def parse_lowpass_spec(config: Mapping[str, Any] | None, sample_axis: SampleAxis
     )
 
 
-def _true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
-    padded = np.r_[False, np.asarray(mask, dtype=bool), False]
-    changes = np.flatnonzero(padded[1:] != padded[:-1])
-    return [(int(start), int(stop)) for start, stop in changes.reshape(-1, 2)]
-
-
 def apply_lfm_lowpass(log: grid.Log, spec: LowpassSpec) -> grid.Log:
     """Filter every finite run independently without crossing NaN gaps."""
 
@@ -98,7 +93,7 @@ def apply_lfm_lowpass(log: grid.Log, spec: LowpassSpec) -> grid.Log:
     output = np.full(values.shape, np.nan, dtype=np.float64)
     pad_samples = int(np.ceil(float(spec.buffer_axis_units) / step))
     min_length = 3 * (2 * sos.shape[0] + 1)
-    for start, stop in _true_runs(np.isfinite(values)):
+    for start, stop in true_runs(np.isfinite(values)):
         segment = values[start:stop]
         if segment.size < min_length:
             raise ValueError(

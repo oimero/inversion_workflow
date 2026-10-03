@@ -22,9 +22,9 @@ import torch
 
 from cup.config.workflow import WorkflowConfig, load_workflow_config
 from cup.lfm.math import parse_lowpass_spec
-from cup.physics.calibration import AIVelocityRelation
+from cup.physics.relations import AIVelocityRelation
 from cup.seismic.survey import open_survey, segy_options_from_config
-from cup.physics.execution import load_forward_inputs as load_physics_inputs
+from cup.seismic.forward_inputs import load_forward_inputs as load_seismic_forward_inputs
 from cup.utils.io import repo_relative_path, resolve_relative_path, write_json
 from cup.utils.logging import configure_run_logger
 from cup.well.controls import load_well_control_set
@@ -281,7 +281,7 @@ def _required_input(stage_config: Mapping[str, Any], key: str, override: object)
 
 
 def load_forward_inputs(run_dir: Path, *, domain: str, depth_basis: str | None) -> tuple[np.ndarray, np.ndarray, AIVelocityRelation | None, dict[str, Any]]:
-    return load_physics_inputs(run_dir, repo_root=REPO_ROOT, domain=domain, depth_basis=depth_basis)
+    return load_seismic_forward_inputs(run_dir, repo_root=REPO_ROOT, domain=domain, depth_basis=depth_basis)
 
 
 def _domain_runtime(

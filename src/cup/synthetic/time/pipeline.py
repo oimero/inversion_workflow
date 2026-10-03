@@ -22,7 +22,7 @@ from cup.synthetic.core.calibration import (
     load_calibration,
 )
 from cup.synthetic.time.config import DATA_SCHEMA, IMPLEMENTATION_SCOPE
-from cup.physics import generation_contract
+from cup.synthetic.core.canonical import generation_contract
 from cup.synthetic.core import (
     build_seismic_input_contract,
     build_mask_contract,
@@ -45,14 +45,13 @@ from cup.synthetic.adapters import TimeSyntheticDomainAdapter
 from cup.synthetic.core.pipeline import SyntheticBenchmarkPipeline
 from cup.synthetic.schemas import SCIENCE_CONTRACT, require_science_contract
 from cup.config.workflow import WorkflowConfig
-from cup.utils.io import (
+from cup.config.artifacts import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
     is_consumable_contract_status,
-    repo_relative_path,
     require_contract_fingerprint,
-    resolve_relative_path,
 )
+from cup.utils.io import repo_relative_path, resolve_relative_path
 
 
 def _validate_calibration_horizon_contract(

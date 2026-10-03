@@ -33,11 +33,13 @@ from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.config.workflow import WorkflowConfig, merge_dict_defaults
 from cup.config.sources import resolve_source_run
 from cup.utils.coerce import as_bool, optional_float
-from cup.utils.io import (
+from cup.config.artifacts import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
-    load_yaml_config,
     published_contract_reference,
+)
+from cup.utils.io import (
+    load_yaml_config,
     repo_relative_path,
     resolve_relative_path,
     sanitize_filename,

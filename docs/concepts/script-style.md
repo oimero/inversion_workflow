@@ -38,19 +38,12 @@ if str(SRC_DIR) not in sys.path:
 - CLI 只暴露单次运行需要覆盖的参数。
 - 顶层工区事实通过 `cup.config.workflow.WorkflowConfig` 解析。
 - 路径使用 `cup.utils.io` 中的解析和 repo-relative 工具。
+- 运行目录、产物定位和发布状态由 `cup.config.artifacts` 处理；来源选择由 `cup.config.sources` 组织。
 - 步骤默认配置优先使用 `dict.setdefault` 或 `dict.get(key, default)`；
   复杂嵌套默认值可用 `merge_dict_defaults`。
 - 带采样轴、单位或 domain 的井曲线和地震道优先使用 `wtie.processing.grid`
   对象或项目 dataclass，不在脚本中长期传递裸 `np.ndarray`。
 - 简单保存逻辑可留在脚本内；可复用的业务计算和绘图进入 `src/cup/`。
-
-## 跨步骤契约
-
-脚本之间传递文件，不传递进程内对象。修改任何 CSV 列、路径含义或坐标语义前，
-必须同步更新：
-
-- [核心 CSV 契约](csv-contracts.md)（写得太乱了，暂时删除，等待后续在新工区运行该工作流时跑一步写一步）
-- [数据与单位约定](data-and-coordinate-conventions.md)
 
 ### 契约版本常量
 

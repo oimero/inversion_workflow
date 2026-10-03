@@ -8,6 +8,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from cup.seismic.geometry import SampleAxis
+from cup.utils.masks import true_runs
 from cup.well.scale import gaussian_smooth_numpy
 
 from .contracts import DictionaryAtom, ResidualTextureLibrary, ScaleContract
@@ -121,13 +122,6 @@ def _sample_axis_from_controls(well_controls: Any, views: tuple[_NativeControlVi
     return SampleAxis(views[0].coordinates, domain, unit, depth_basis)
 
 
-def _finite_runs(mask: np.ndarray) -> list[tuple[int, int]]:
-    finite = np.asarray(mask, dtype=bool)
-    padded = np.r_[False, finite, False]
-    changes = np.flatnonzero(padded[1:] != padded[:-1])
-    return [(int(start), int(stop)) for start, stop in changes.reshape(-1, 2)]
-
-
 def gaussian_smooth_finite_run(values: np.ndarray, coordinates: np.ndarray, *, fwhm_m: float) -> np.ndarray:
     """Apply the shared body-scale Gaussian to one already finite run."""
 
@@ -239,7 +233,7 @@ def build_residual_library(
         intervals = intervals_by_well[view.well_name]
         for zone_id, (zone_top, zone_bottom) in intervals.items():
             selected = view.valid_mask & (view.coordinates >= zone_top) & (view.coordinates <= zone_bottom)
-            for run_start, run_stop in _finite_runs(selected):
+            for run_start, run_stop in true_runs(selected):
                 run_coordinates = view.coordinates[run_start:run_stop]
                 run_values = view.values[run_start:run_stop]
                 if run_coordinates.size < contract.min_window_samples:

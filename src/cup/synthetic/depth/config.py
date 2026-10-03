@@ -20,13 +20,12 @@ from cup.synthetic.schemas import (
 )
 from cup.synthetic.core.config import parse_object_core_controls
 from cup.synthetic.core.corpus import CorpusBudget
-from cup.utils.io import (
+from cup.config.artifacts import (
     is_consumable_contract_status,
-    load_yaml_config,
     require_contract_fingerprint,
     resolve_artifact_path,
-    resolve_relative_path,
 )
+from cup.utils.io import load_yaml_config, resolve_relative_path
 
 
 SCHEMA_VERSION = BENCHMARK_SCHEMA_VERSION

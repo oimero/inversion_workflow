@@ -27,17 +27,11 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cup.utils.petrel import import_well_heads_petrel, import_well_tops_petrel
+from cup.well.petrel import import_well_heads_petrel, import_well_tops_petrel
 from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.config.workflow import WorkflowConfig
-from cup.utils.io import (
-    CONTRACT_FINGERPRINT_SCHEMA,
-    contract_fingerprint_sha256,
-    load_yaml_config,
-    repo_relative_path,
-    resolve_relative_path,
-    write_json,
-)
+from cup.config.artifacts import CONTRACT_FINGERPRINT_SCHEMA, contract_fingerprint_sha256
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.well.inventory import (
     WellHead,
     WellInventory,

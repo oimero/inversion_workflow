@@ -27,18 +27,15 @@ from cup.synthetic.schemas import (
     FORWARD_MODEL_INPUTS_SCHEMA_VERSION,
     ROCK_PHYSICS_ANALYSIS_SCHEMA_VERSION,
 )
-from cup.utils.io import (
+from cup.config.artifacts import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
     is_consumable_contract_status,
-    load_yaml_config,
-    repo_relative_path,
     require_contract_fingerprint,
     resolve_artifact_path,
-    resolve_relative_path,
     resolve_timestamped_output_dir,
-    write_json,
 )
+from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.well.tie import DEPTH_VERTICAL_AUTO_TIE_SCHEMA_VERSION
 
 

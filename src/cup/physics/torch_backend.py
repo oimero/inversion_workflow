@@ -227,43 +227,6 @@ def _wavelet_weights(
     return torch.where(outside, torch.zeros_like(values), values)
 
 
-def build_depth_operator(
-    velocity_mps: Any,
-    depth_m: Any,
-    wavelet_time_s: Any,
-    wavelet_amp: Any,
-    *,
-    output_chunk_size: int = DEFAULT_OUTPUT_CHUNK_SIZE,
-) -> Tensor:
-    """Build and return ``W_depth[..., N, N-1]`` in output-depth chunks."""
-    velocity, depth = _validate_velocity_depth(velocity_mps, depth_m)
-    wavelet_time, amplitude = _validate_wavelet(wavelet_time_s, wavelet_amp)
-    chunk_size = _validate_output_chunk_size(output_chunk_size)
-    dtype = _promoted_dtype(velocity, depth, wavelet_time, amplitude)
-    device = velocity.device
-    n_samples = velocity.shape[-1]
-    velocity_flat = velocity.to(dtype=dtype).reshape((-1, n_samples))
-    depth_cast = depth.to(device=device, dtype=dtype)
-    wavelet_time_cast = wavelet_time.to(device=device, dtype=dtype)
-    amplitude_cast = amplitude.to(device=device, dtype=dtype)
-    sample_twt, interface_twt = _relative_twt_axes(velocity_flat, depth_cast)
-    chunks = []
-    for start in range(0, n_samples, chunk_size):
-        stop = min(start + chunk_size, n_samples)
-        chunks.append(
-            _wavelet_weights(
-                sample_twt,
-                interface_twt,
-                wavelet_time_cast,
-                amplitude_cast,
-                start=start,
-                stop=stop,
-            )
-        )
-    operator = torch.cat(chunks, dim=1)
-    return operator.reshape((*velocity.shape[:-1], n_samples, n_samples - 1))
-
-
 def forward_depth(
     log_ai: Any,
     velocity_mps: Any,
@@ -272,11 +235,8 @@ def forward_depth(
     wavelet_amp: Any,
     *,
     output_chunk_size: int = DEFAULT_OUTPUT_CHUNK_SIZE,
-    return_operator: bool = False,
-) -> Tensor | tuple[Tensor, Tensor]:
+) -> Tensor:
     """Synthesize ``N`` TVDSS samples without materializing ``W_depth`` by default."""
-    if not isinstance(return_operator, bool):
-        raise TypeError("return_operator must be boolean.")
     log_values, velocity, depth = _validate_depth_inputs(log_ai, velocity_mps, depth_m)
     wavelet_time, amplitude = _validate_wavelet(wavelet_time_s, wavelet_amp)
     chunk_size = _validate_output_chunk_size(output_chunk_size)
@@ -291,7 +251,6 @@ def forward_depth(
     reflectivity = torch.tanh(0.5 * (log_flat[:, 1:] - log_flat[:, :-1]))
     sample_twt, interface_twt = _relative_twt_axes(velocity_flat, depth_cast)
     output_chunks = []
-    operator_chunks = [] if return_operator else None
     for start in range(0, n_samples, chunk_size):
         stop = min(start + chunk_size, n_samples)
         weights = _wavelet_weights(
@@ -303,63 +262,13 @@ def forward_depth(
             stop=stop,
         )
         output_chunks.append(torch.bmm(weights, reflectivity.unsqueeze(-1)).squeeze(-1))
-        if operator_chunks is not None:
-            operator_chunks.append(weights)
     output = torch.cat(output_chunks, dim=-1).reshape(log_values.shape)
-    if operator_chunks is None:
-        return output
-    operator = torch.cat(operator_chunks, dim=1).reshape(
-        (*log_values.shape[:-1], n_samples, n_samples - 1)
-    )
-    return output, operator
-
-
-def _validate_relation_coefficients(*, a: float, b: float) -> tuple[float, float]:
-    if isinstance(a, bool) or isinstance(b, bool):
-        raise TypeError("a and b must be finite real scalars.")
-    a_value = float(a)
-    b_value = float(b)
-    if not math.isfinite(a_value) or not math.isfinite(b_value):
-        raise ValueError("a and b must be finite.")
-    if a_value <= 0.0:
-        raise ValueError("a must be positive.")
-    return a_value, b_value
-
-
-def ai_from_velocity(velocity_mps: Any, *, a: float, b: float) -> Tensor:
-    """Apply ``AI = a * Vp + b`` with strict physical validation."""
-    velocity = _floating_tensor(velocity_mps, name="velocity_mps")
-    if bool(torch.any(velocity <= 0.0).item()):
-        raise ValueError("velocity_mps must be positive everywhere.")
-    a_value, b_value = _validate_relation_coefficients(a=a, b=b)
-    impedance = a_value * velocity + b_value
-    if bool(torch.any(~torch.isfinite(impedance)).item()) or bool(
-        torch.any(impedance <= 0.0).item()
-    ):
-        raise ValueError("AI derived from velocity_mps must be finite and positive.")
-    return impedance
-
-
-def velocity_from_ai(ai: Any, *, a: float, b: float) -> Tensor:
-    """Apply ``Vp = (AI - b) / a`` without clipping invalid velocities."""
-    impedance = _floating_tensor(ai, name="ai")
-    if bool(torch.any(impedance <= 0.0).item()):
-        raise ValueError("ai must be positive everywhere.")
-    a_value, b_value = _validate_relation_coefficients(a=a, b=b)
-    velocity = (impedance - b_value) / a_value
-    if bool(torch.any(~torch.isfinite(velocity)).item()) or bool(
-        torch.any(velocity <= 0.0).item()
-    ):
-        raise ValueError("velocity derived from ai must be finite and positive.")
-    return velocity
+    return output
 
 
 __all__ = [
     "DEFAULT_OUTPUT_CHUNK_SIZE",
-    "ai_from_velocity",
-    "build_depth_operator",
     "forward_depth",
     "forward_time",
     "reflectivity_from_log_ai",
-    "velocity_from_ai",
 ]

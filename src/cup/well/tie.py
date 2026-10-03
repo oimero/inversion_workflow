@@ -11,6 +11,8 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from cup.utils.coerce import as_bool as _as_bool
+from cup.utils.coerce import optional_float as _optional_float
 from cup.utils.io import sanitize_filename
 from cup.utils.masks import true_runs
 from cup.utils.statistics import radius_connected_components
@@ -344,23 +346,6 @@ class TieArtifactIndex:
 
     def evaluation_wells(self, *, status: str = "success") -> list[TieEvaluationWell]:
         return load_evaluation_wells(self, status=status)
-
-
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().casefold()
-    return text in {"true", "1", "yes", "y"}
-
-
-def _optional_float(value: Any) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(number):
-        return None
-    return number
 
 
 def _optional_int(value: Any) -> int | None:

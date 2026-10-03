@@ -2,6 +2,8 @@
 
 ::: cup.well.inventory
 
+::: cup.well.petrel
+
 ::: cup.well.curves
 
 ::: cup.well.las

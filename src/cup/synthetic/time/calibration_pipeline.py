@@ -10,7 +10,8 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from cup.utils.petrel import import_interpretation_petrel, import_well_tops_petrel
+from cup.seismic.petrel import import_interpretation_petrel
+from cup.well.petrel import import_well_tops_petrel
 from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.seismic.wavelet import infer_wavelet_dt, load_wavelet_csv
@@ -29,15 +30,13 @@ from cup.synthetic.reporting.figures import (
 )
 from cup.synthetic.schemas import SCIENCE_CONTRACT
 from cup.config.workflow import WorkflowConfig
-from cup.utils.io import (
+from cup.config.artifacts import (
     CONTRACT_FINGERPRINT_SCHEMA,
     contract_fingerprint_sha256,
-    repo_relative_path,
     require_contract_fingerprint,
     resolve_artifact_path,
-    resolve_relative_path,
-    write_json,
 )
+from cup.utils.io import repo_relative_path, resolve_relative_path, write_json
 from cup.well.inventory import normalize_well_name
 from cup.well.las import read_las_curve
 from cup.well.trajectory import find_well_top_md, load_workflow_time_depth_table_csv

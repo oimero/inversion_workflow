@@ -8,11 +8,59 @@ already aligned candidate wavelets and an evaluator callback.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
+import pandas as pd
 
 from cup.seismic.wavelet import wavelet_l2_normalize
+
+
+def aggregate_cluster_then_global(
+    df: pd.DataFrame,
+    *,
+    value_columns: list[str],
+    cluster_column: str,
+    group_columns: list[str] | None = None,
+    quantiles: list[float] | None = None,
+) -> pd.DataFrame:
+    """Summarize wavelet evaluation with equal weight for spatial clusters."""
+    group_columns = list(group_columns or [])
+    quantiles = list(quantiles or [0.1])
+    required = set(group_columns + [cluster_column] + list(value_columns))
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"aggregate input is missing columns: {sorted(missing)}")
+    for quantile in quantiles:
+        if not 0.0 <= float(quantile) <= 1.0:
+            raise ValueError(f"quantiles must be within [0, 1], got {quantile}.")
+
+    rows: list[dict[str, Any]] = []
+    grouped = [((), df)] if not group_columns else df.groupby(group_columns, dropna=False)
+    for group_key, group_df in grouped:
+        if group_columns:
+            key_values = group_key if isinstance(group_key, tuple) else (group_key,)
+            base = dict(zip(group_columns, key_values))
+        else:
+            base = {}
+        cluster_values = group_df.groupby(cluster_column, dropna=False)[value_columns].median(numeric_only=True)
+        row: dict[str, Any] = {
+            **base,
+            "n_samples": int(len(group_df)),
+            "n_clusters": int(len(cluster_values)),
+        }
+        for column in value_columns:
+            values = cluster_values[column].to_numpy(dtype=np.float64)
+            values = values[np.isfinite(values)]
+            row[f"spatial_debiased_median_{column}"] = float(np.median(values)) if values.size else np.nan
+            for quantile in quantiles:
+                q_name = f"p{int(round(float(quantile) * 100)):02d}"
+                row[f"spatial_debiased_{q_name}_{column}"] = (
+                    float(np.quantile(values, float(quantile))) if values.size else np.nan
+                )
+        rows.append(row)
+
+    return pd.DataFrame.from_records(rows)
 
 
 # Evaluators may return a scalar score or a metric mapping containing

@@ -3,6 +3,7 @@
 ```mermaid
 flowchart TB
     S1["01 井资产盘点"] --> S2["02 LAS 曲线筛选与导出"] --> S3["03 测井预处理"] --> S4["04 井震自动标定"] --> S5["05 全局共识子波生成"] --> S6["06 真实工区井控数据集"] --> S7["07 真实工区低频模型"] --> S8["08 GINN v2 主体反演"]
+    S7 --> S8P["08 GINN v3 PIAI 反演"]
 
     WT["旁路 井轨迹 QC"]
     S1 -.-> WT -.-> S4
@@ -21,9 +22,13 @@ flowchart TB
 | 旁路 · rock_physics_analysis | `experiments/common/common.yaml` |
 | 旁路 · synthoseis_lite | `experiments/synthoseis_lite/synthoseis_lite.yaml` |
 | 08 · GINN v2 主体反演 | `experiments/ginn_v2/ginn_v2.yaml` |
+| 08 · GINN v3 PIAI 反演 | `experiments/ginn_v3/ginn_v3.yaml` |
 
 ## 深度域工作流
 
 深度域复用前三步的井数据准备，以及第六至第八步的井控、低频模型与主体反演入口。
 第四、第五步使用独立脚本，正演输入按深度域组装，详见
 [深度域工作流](guide/depth-domain-workflow.md)。
+
+第八步的[PIAI反演](guide/8-ginn-v3-piai.md)消费井控数据、低频模型和子波采样轴，
+联合训练阻抗修正与子波，支持直井的时间域和固定速度深度域反演。

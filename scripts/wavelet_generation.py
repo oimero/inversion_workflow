@@ -344,12 +344,17 @@ def _score_from_aggregate(row: pd.Series, cfg: dict[str, Any], *, regularization
     return float(score)
 
 
-def _prepare_well_for_evaluation_with_ai(well: TieEvaluationWell) -> tuple[Any, Any, grid.Log]:
-    from cup.well.tie import load_continuous_tie_evaluation_inputs
+def _prepare_well_for_evaluation_with_ai(
+    well: TieEvaluationWell,
+    *,
+    dt_s: float,
+) -> tuple[Any, Any, grid.Log]:
+    from cup.well.tie import load_continuous_tie_evaluation_inputs, resample_tie_seismic_to_dt
 
     logset, table, seismic = load_continuous_tie_evaluation_inputs(well)
-    seismic_dt_s = float(np.median(np.diff(seismic.basis)))
-    logset_twt = tie_ops.convert_logs_from_md_to_twt(logset, None, table, seismic_dt_s)
+    # 候选子波按提取器网格存储（例如 2 ms），第四步保存的地震道可能更粗（例如 4 ms）。
+    seismic = resample_tie_seismic_to_dt(seismic, dt_s)
+    logset_twt = tie_ops.convert_logs_from_md_to_twt(logset, None, table, dt_s)
     reflectivity = tie_ops.compute_reflectivity(logset_twt)
     seismic_match, reflectivity_match = tie_ops.match_seismic_and_reflectivity(seismic, reflectivity)
     ai_values = np.interp(seismic_match.basis, logset_twt.AI.basis, logset_twt.AI.values, left=np.nan, right=np.nan)
@@ -633,8 +638,9 @@ def main() -> None:
     clusters_df.to_csv(output_dir / "evaluation_well_spatial_clusters.csv", index=False)
 
     modeler = ConvModeler()
+    wavelet_dt_s = infer_wavelet_dt(wavelet_time_s)
     well_cache: dict[str, tuple[Any, Any, grid.Log]] = {
-        normalize_well_name(well.well_name): _prepare_well_for_evaluation_with_ai(well)
+        normalize_well_name(well.well_name): _prepare_well_for_evaluation_with_ai(well, dt_s=wavelet_dt_s)
         for well in wells
     }
     candidate_metric_frames = []

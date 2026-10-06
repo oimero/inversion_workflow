@@ -733,17 +733,50 @@ def _regular_dt_from_basis(basis: np.ndarray, *, label: str) -> float:
     return dt_s
 
 
-def prepare_well_for_evaluation(well_artifact: TieEvaluationWell) -> tuple[Any, Any]:
+def resample_tie_seismic_to_dt(seismic: Any, dt_s: float) -> Any:
+    """把一个地震道重采样到目标采样间隔 ``dt_s``。
+
+    第四步保存的工区地震道可能比子波提取器的采样粗（例如 4 ms 与 2 ms），
+    而反射系数、子波与合成记录只定义在各自主轴上。匹配前把地震道搬到
+    子波网格，后续的卷积与相关性才是在同一套采样上比较。
+    """
+    from wtie.optimize import tie as tie_ops
+
+    target_dt_s = float(dt_s)
+    if not np.isfinite(target_dt_s) or target_dt_s <= 0.0:
+        raise ValueError("target dt_s must be finite and positive for seismic resampling.")
+    resampled = tie_ops.resample_seismic(seismic, target_dt_s)
+    actual_dt_s = _regular_dt_from_basis(resampled.basis, label="resampled seismic trace")
+    if not np.isclose(actual_dt_s, target_dt_s, rtol=1e-5, atol=1e-9):
+        raise ValueError(
+            f"resampled seismic dt {actual_dt_s:g}s does not match requested dt {target_dt_s:g}s."
+        )
+    return resampled
+
+
+def prepare_well_for_evaluation(
+    well_artifact: TieEvaluationWell,
+    *,
+    dt_s: float | None = None,
+) -> tuple[Any, Any]:
     """Load well artifacts once and return ``(seismic_match, reflectivity_match)``.
 
     The returned pair can be reused across wavelet evaluations for the same well,
     avoiding repeated LAS / TDT / seismic I/O and MD→TWT conversion.
+
+    Pass *dt_s* to evaluate on a specific sampling interval, typically the wavelet
+    sampling rate; the saved seismic trace is resampled to it first.  ``dt_s=None``
+    keeps the trace on its own sampling interval.
     """
     from wtie.optimize import tie as tie_ops
 
     logset, table, seismic = load_continuous_tie_evaluation_inputs(well_artifact)
-    seismic_dt_s = _regular_dt_from_basis(seismic.basis, label="seismic trace")
-    reflectivity = build_reflectivity_for_tie_eval(logset, table, seismic_dt_s)
+    if dt_s is None:
+        target_dt_s = _regular_dt_from_basis(seismic.basis, label="seismic trace")
+    else:
+        target_dt_s = float(dt_s)
+        seismic = resample_tie_seismic_to_dt(seismic, target_dt_s)
+    reflectivity = build_reflectivity_for_tie_eval(logset, table, target_dt_s)
     return tie_ops.match_seismic_and_reflectivity(seismic, reflectivity)
 
 
@@ -817,7 +850,7 @@ def evaluate_wavelet_on_well(
     wavelet_dt_s = _regular_dt_from_basis(wavelet_time, label="wavelet")
 
     if seismic_match is None or reflectivity_match is None:
-        seismic_match, reflectivity_match = prepare_well_for_evaluation(well_artifact)
+        seismic_match, reflectivity_match = prepare_well_for_evaluation(well_artifact, dt_s=wavelet_dt_s)
     seismic_dt_s = _regular_dt_from_basis(seismic_match.basis, label="seismic trace")
     if not np.isclose(wavelet_dt_s, seismic_dt_s, rtol=1e-5, atol=1e-9):
         raise ValueError(f"wavelet dt {wavelet_dt_s:g}s does not match seismic trace dt {seismic_dt_s:g}s.")

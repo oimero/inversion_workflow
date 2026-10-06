@@ -77,7 +77,17 @@ from cup.well.trajectory import (
     validate_time_depth_table,
     write_time_depth_table_csv,
 )
-from cup.well.tie import TieRoute, WellTiePlan, WellTieResult, build_auto_tie_search_space, build_tie_plan, plans_dataframe, results_dataframe, scaled_synthetic_metrics
+from cup.well.tie import (
+    TieRoute,
+    WellTiePlan,
+    WellTieResult,
+    build_auto_tie_search_space,
+    build_tie_plan,
+    plans_dataframe,
+    resample_tie_seismic_to_dt,
+    results_dataframe,
+    scaled_synthetic_metrics,
+)
 from cup.well.trajectory import WellTrajectory, sample_trajectory_on_twt
 from cup.seismic.wavelet import crop_wavelet_center_energy_normalize
 from wtie.processing import grid
@@ -664,9 +674,15 @@ def _save_current_figure(path: Path) -> None:
 def _compute_table_synthetic_metrics(logset_md: Any, seismic: Any, table: Any, wavelet: Any, modeler: Any, dt_s: float) -> tuple[float, float]:
     from wtie.optimize import tie as tie_ops
 
-    logset_twt = tie_ops.convert_logs_from_md_to_twt(logset_md, None, table, dt_s)
+    target_dt_s = _finite_float(dt_s, label="initial synthetic dt_s")
+    if target_dt_s <= 0.0:
+        raise ValueError("initial synthetic dt_s must be positive.")
+    logset_twt = tie_ops.convert_logs_from_md_to_twt(logset_md, None, table, target_dt_s)
     reflectivity = tie_ops.compute_reflectivity(logset_twt, angle_range=seismic.angle_range)
-    seismic_match, reflectivity_match = tie_ops.match_seismic_and_reflectivity(seismic, reflectivity)
+    # 子波与模型算子在 target_dt_s 网格上，工区地震道可以更粗（例如 4 ms），
+    # 匹配前先把地震道重采样到同一网格。
+    seismic_on_target_dt = resample_tie_seismic_to_dt(seismic, target_dt_s)
+    seismic_match, reflectivity_match = tie_ops.match_seismic_and_reflectivity(seismic_on_target_dt, reflectivity)
     _, _, corr, nmae, _ = scaled_synthetic_metrics(modeler, wavelet, reflectivity_match, seismic_match)
     return corr, nmae
 

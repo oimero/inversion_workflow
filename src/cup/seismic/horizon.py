@@ -364,8 +364,15 @@ class HorizonSurface:
         values = np.asarray(self.values, dtype=np.float64)
         if values.shape != (il.size, xl.size):
             raise ValueError("Horizon surface shape does not match inline/xline axes.")
-        if il.size < 2 or xl.size < 2:
-            raise ValueError("Horizon surface requires at least 2 inline and 2 xline samples.")
+        if il.ndim != 1 or xl.ndim != 1 or il.size == 0 or xl.size == 0:
+            raise ValueError("Horizon surface requires non-empty one-dimensional line axes.")
+        if (
+            np.any(~np.isfinite(il))
+            or np.any(~np.isfinite(xl))
+            or np.any(np.diff(il) <= 0)
+            or np.any(np.diff(xl) <= 0)
+        ):
+            raise ValueError("Horizon line axes must be finite and strictly increasing.")
         object.__setattr__(self, "inline_axis", il)
         object.__setattr__(self, "xline_axis", xl)
         object.__setattr__(self, "values", values)
@@ -450,12 +457,18 @@ class HorizonSurface:
         if not (self.xline_axis[0] <= xl <= self.xline_axis[-1]):
             raise ValueError(f"Xline {xl} is outside horizon {self.name!r} range.")
 
-        i1 = int(np.searchsorted(self.inline_axis, il, side="right"))
-        j1 = int(np.searchsorted(self.xline_axis, xl, side="right"))
-        i0 = max(0, min(i1 - 1, self.inline_axis.size - 2))
-        j0 = max(0, min(j1 - 1, self.xline_axis.size - 2))
-        i1 = i0 + 1
-        j1 = j0 + 1
+        if self.inline_axis.size == 1:
+            i0 = i1 = 0
+        else:
+            i1 = int(np.searchsorted(self.inline_axis, il, side="right"))
+            i0 = max(0, min(i1 - 1, self.inline_axis.size - 2))
+            i1 = i0 + 1
+        if self.xline_axis.size == 1:
+            j0 = j1 = 0
+        else:
+            j1 = int(np.searchsorted(self.xline_axis, xl, side="right"))
+            j0 = max(0, min(j1 - 1, self.xline_axis.size - 2))
+            j1 = j0 + 1
         il0, il1 = self.inline_axis[i0], self.inline_axis[i1]
         xl0, xl1 = self.xline_axis[j0], self.xline_axis[j1]
         values = np.array(
@@ -497,7 +510,13 @@ class HorizonSurface:
             value=value,
             inline_float=il,
             xline_float=xl,
-            method="exact" if exact else "bilinear",
+            method=(
+                "exact"
+                if exact
+                else "linear"
+                if self.inline_axis.size == 1 or self.xline_axis.size == 1
+                else "bilinear"
+            ),
             nearest_inline=il,
             nearest_xline=xl,
             nearest_line_distance=0.0,

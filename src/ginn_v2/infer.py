@@ -289,6 +289,28 @@ def _index_bounds(size: int, bounds: tuple[int, int] | None, *, name: str) -> tu
     return start, stop
 
 
+def _lateral_spacings(
+    shape: tuple[int, ...],
+    inline_spacing_m: float,
+    xline_spacing_m: float,
+) -> tuple[float, float]:
+    """Supply distance-transform sampling for a singleton horizontal axis."""
+    spacings = (float(inline_spacing_m), float(xline_spacing_m))
+    positive = [value for value in spacings if np.isfinite(value) and value > 0.0]
+    if not positive:
+        raise ValueError("At least one lateral spacing must be finite and positive.")
+    nominal = float(np.median(positive))
+    result = []
+    for value, count in zip(spacings, shape[:2]):
+        if np.isfinite(value) and value > 0.0:
+            result.append(value)
+        elif count == 1:
+            result.append(nominal)
+        else:
+            raise ValueError("A non-singleton lateral spacing must be finite and positive.")
+    return result[0], result[1]
+
+
 def _fill_target_zone(
     body_log_ai: np.ndarray,
     direction_count: np.ndarray,
@@ -311,10 +333,9 @@ def _fill_target_zone(
     target = np.asarray(target_mask, dtype=bool)
     if body.shape != count.shape or body.shape != lfm.shape or body.shape != target.shape:
         raise ValueError("body, direction_count, LFM, and target mask shapes differ.")
-    if not np.isfinite(inline_spacing_m) or inline_spacing_m <= 0.0:
-        raise ValueError("inline_spacing_m must be finite and positive.")
-    if not np.isfinite(xline_spacing_m) or xline_spacing_m <= 0.0:
-        raise ValueError("xline_spacing_m must be finite and positive.")
+    inline_spacing_m, xline_spacing_m = _lateral_spacings(
+        body.shape, inline_spacing_m, xline_spacing_m,
+    )
     if np.any(target & ~np.isfinite(lfm)):
         raise ValueError("target-zone LFM must be finite before volume filling.")
 
@@ -447,6 +468,8 @@ class BodyVolumeInverter:
             reader.lfm_valid_mask & np.isfinite(reader.lfm_log_ai),
             axis=-1,
         )
+        if reader.seismic_support_mask is not None:
+            self._lfm_support = np.where(reader.seismic_support_mask, self._lfm_support, 0)
 
     def _section_keys(
         self,
@@ -561,15 +584,24 @@ class BodyVolumeInverter:
         target_mask = np.empty(local_lfm.shape, dtype=bool)
         np.isfinite(local_lfm, out=target_mask)
         target_mask &= reader.lfm_valid_mask[il_start:il_stop, xl_start:xl_stop]
+        fill_target = target_mask
+        weak_target = None
+        if reader.seismic_support_mask is not None:
+            profile_support = reader.seismic_support_mask[il_start:il_stop, xl_start:xl_stop]
+            fill_target = target_mask & profile_support[:, :, None]
+            weak_target = target_mask & ~profile_support[:, :, None]
         spacing = reader.geometry.bin_spacing_m()
         body_sum, fill_code, fill_mean_m, fill_max_m = _fill_target_zone(
             body_sum,
             direction_count,
             local_lfm,
-            target_mask,
+            fill_target,
             inline_spacing_m=float(spacing["inline_spacing_m"]),
             xline_spacing_m=float(spacing["xline_spacing_m"]),
         )
+        if weak_target is not None:
+            body_sum[weak_target] = local_lfm[weak_target]
+            fill_code[weak_target] = np.uint8(3)
         body_sum = _smooth_volume_curves(
             body_sum, target_mask, inverter=self.inverter,
             inline_start=il_start, xline_start=xl_start,

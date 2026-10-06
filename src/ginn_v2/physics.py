@@ -163,7 +163,7 @@ class TimeDomainAdapter(DomainAdapter):
     def vertical_coordinates(self, batch: CommonObservationBatch) -> Tensor:
         self._require_domain(batch.sample_axis)
         return torch.as_tensor(
-            batch.sample_axis.values,
+            batch.sample_axis.values.copy(),
             device=batch.observed_seismic.device,
             dtype=batch.observed_seismic.dtype,
         )
@@ -191,7 +191,7 @@ class DepthDomainAdapter(DomainAdapter):
     def vertical_coordinates(self, batch: CommonObservationBatch) -> Tensor:
         self._require_domain(batch.sample_axis)
         axis = torch.as_tensor(
-            batch.sample_axis.values,
+            batch.sample_axis.values.copy(),
             device=batch.observed_seismic.device,
             dtype=batch.observed_seismic.dtype,
         )
@@ -205,7 +205,7 @@ class DepthDomainAdapter(DomainAdapter):
         if not torch.is_floating_point(velocity) or bool(torch.any(torch.isinf(velocity)).item()):
             raise ValueError("Depth adapter velocity_mps must be floating without infinite values.")
         depth = torch.as_tensor(
-            batch.sample_axis.values,
+            batch.sample_axis.values.copy(),
             device=body_log_ai.device,
             dtype=body_log_ai.dtype,
         )

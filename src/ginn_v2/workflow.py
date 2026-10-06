@@ -28,9 +28,11 @@ from cup.seismic.forward_inputs import load_forward_inputs as load_seismic_forwa
 from cup.seismic.wavelet import load_wavelet_csv, validate_wavelet_normalization
 from cup.utils.io import repo_relative_path, resolve_relative_path, write_json
 from cup.utils.logging import configure_run_logger
-from cup.well.controls import load_well_control_set
+from cup.well.controls import (
+    load_well_control_set, load_evaluation_support_for_run,
+)
 from ginn_v2.physics import DepthDomainAdapter, TimeDomainAdapter
-from ginn_v2.data import PatchKey, PatchReader, SurveyTraceSource, candidate_patch_keys, fit_lfm_normalization
+from ginn_v2.data import PatchKey, PatchReader, SurveyTraceSource, candidate_patch_keys, fit_lfm_normalization, seismic_profile_support
 from ginn_v2.train import (
     BodyInversionConfig,
     BodyInversionTrainer,
@@ -59,7 +61,7 @@ class BodyRun:
     """Paths produced by one body-inversion workflow invocation."""
 
     output_dir: Path
-    pretrain_checkpoint: Path
+    pretrain_checkpoint: Path | None
     selected_checkpoint: Path | None
     warnings: tuple[str, ...]
 
@@ -525,6 +527,7 @@ def _write_well_waveform_qc(
         model,
         output_dir / "review_package" / "well_waveform_qc",
         root=REPO_ROOT,
+        evaluation_support=trainer.evaluation_support,
     )
 
 
@@ -544,8 +547,6 @@ def train_body(
 
     if stage not in {"all", "pretrain", "finetune"}:
         raise ValueError("stage must be 'all', 'pretrain', or 'finetune'.")
-    if stage == "finetune" and pretrain_checkpoint is None:
-        raise ValueError("finetune requires an explicit pretrain_checkpoint.")
     args = _BodyOptions(
         output_dir=None if output_dir is None else Path(output_dir),
         lfm_run_dir=None if lfm_run_dir is None else Path(lfm_run_dir),
@@ -557,6 +558,10 @@ def train_body(
     config_path = resolve_relative_path(config_path, root=REPO_ROOT)
     raw = load_config(config_path)
     workflow, config, lfm_run_dir, well_control_run_dir, forward_source_dir, output_dir, variant_id = _build_runtime(raw, args)
+    if stage == "finetune" and pretrain_checkpoint is None and config.pretrain_epochs != 0:
+        raise ValueError("finetune requires a pretraining checkpoint or pretrain_epochs=0.")
+    if stage == "pretrain" and config.pretrain_epochs == 0:
+        raise ValueError("The pretrain stage requires positive pretrain_epochs.")
     if output_dir.exists():
         raise FileExistsError(f"Body-inversion output directory already exists: {output_dir}; use a new output directory.")
     else:
@@ -605,6 +610,10 @@ def train_body(
     )
     normalization = fit_lfm_normalization(lfm.log_ai, lfm.valid_mask, geometry=survey.line_geometry)
     source = SurveyTraceSource(survey=survey, sample_axis=sample_axis, geometry=survey.line_geometry)
+    profile_support = (
+        seismic_profile_support(source, relative_threshold=config.seismic_support_relative_threshold)
+        if config.seismic_support_relative_threshold is not None else None
+    )
     reader = PatchReader(
         source,
         lfm_log_ai=lfm.log_ai,
@@ -619,12 +628,14 @@ def train_body(
         seismic_feature_mode=config.seismic_feature_mode,
         seismic_balance_window_samples=config.seismic_balance_window_samples,
         seismic_balance_floor_fraction=config.seismic_balance_floor_fraction,
+        seismic_support_mask=profile_support,
     )
     candidates = candidate_patch_keys(
         lfm.log_ai,
         lfm.valid_mask,
         patch_radius=config.patch_radius,
         orientations=config.orientations,
+        seismic_support_mask=profile_support,
     )
     data = build_body_inversion_data(
         reader,
@@ -640,6 +651,9 @@ def train_body(
         len(data.spatial_split.validation_keys),
         sum(int(np.count_nonzero(item.target_mask)) for item in data.trusted_well_patches),
     )
+    evaluation_support = load_evaluation_support_for_run(
+        well_control_run_dir, sample_axis=sample_axis, repo_root=REPO_ROOT,
+    )
     trainer = BodyInversionTrainer(
         data,
         adapter=adapter,
@@ -648,6 +662,7 @@ def train_body(
         output_dir=output_dir,
         artifact_root=REPO_ROOT,
         logger=logger,
+        evaluation_support=evaluation_support,
     )
     logger.info("LFM-only baseline evaluation start")
     baseline = trainer.evaluate(None)
@@ -714,10 +729,13 @@ def train_body(
     )
 
     warnings: list[str] = []
-    if stage in {"all", "pretrain"}:
+    shared_pretrain_checkpoint = None
+    if stage in {"all", "pretrain"} and config.pretrain_epochs > 0:
         logger.info("shared masked pretraining start")
         shared_pretrain_checkpoint, pretrain_metrics = trainer.run_pretraining()
         write_json(output_dir / "pretrain_metrics.json", pretrain_metrics.to_json_dict())
+        if (trainer.last_well_qc_manifest or {}).get("incomplete_wells"):
+            warnings.append("pretrain_well_qc_evaluation_support_incomplete")
         logger.info(
             "shared masked pretraining ready | checkpoint=%s | masked_corr=%.4f | well_rmse=%.5f",
             shared_pretrain_checkpoint,
@@ -743,7 +761,7 @@ def train_body(
                 },
             )
             return BodyRun(output_dir, shared_pretrain_checkpoint, None, tuple(warnings))
-    else:
+    elif pretrain_checkpoint is not None:
         shared_pretrain_checkpoint = resolve_relative_path(pretrain_checkpoint, root=REPO_ROOT)
         if not shared_pretrain_checkpoint.is_file():
             raise FileNotFoundError(shared_pretrain_checkpoint)
@@ -764,7 +782,11 @@ def train_body(
             "warnings": warnings,
             "selected_checkpoint": repo_relative_path(selected_path, root=REPO_ROOT),
             "epoch": selected.selected_epoch,
-            "selection_rule": "best_recorded_finetune_checkpoint",
+            "selection_rule": (
+                "highest_visible_correlation_with_per_well_rmse_limits"
+                if config.selection_well_rmse_tolerance is not None
+                else "best_recorded_finetune_checkpoint"
+            ),
             "quality_warnings": selected.warnings.to_json_dict(),
         },
     )
@@ -776,6 +798,8 @@ def train_body(
         map_location=trainer.device,
     )
     review = _write_review_package(trainer, selected_model, output_dir)
+    if review["well_waveform_qc"].get("incomplete_wells"):
+        warnings.append("well_qc_prediction_support_incomplete")
     write_json(
         output_dir / "body_inversion_status.json",
         {
@@ -877,8 +901,13 @@ def load_body(
         lfm.valid_mask,
         geometry=survey.line_geometry,
     )
+    source = SurveyTraceSource(survey=survey, sample_axis=sample_axis, geometry=survey.line_geometry)
+    profile_support = (
+        seismic_profile_support(source, relative_threshold=config.seismic_support_relative_threshold)
+        if config.seismic_support_relative_threshold is not None else None
+    )
     reader = PatchReader(
-        SurveyTraceSource(survey=survey, sample_axis=sample_axis, geometry=survey.line_geometry),
+        source,
         lfm_log_ai=lfm.log_ai,
         lfm_valid_mask=lfm.valid_mask,
         ilines=lfm.ilines,
@@ -891,6 +920,7 @@ def load_body(
         seismic_feature_mode=config.seismic_feature_mode,
         seismic_balance_window_samples=config.seismic_balance_window_samples,
         seismic_balance_floor_fraction=config.seismic_balance_floor_fraction,
+        seismic_support_mask=profile_support,
     )
     device = torch.device(str(inference.get("device") or config.device))
     model = CenterTraceBodyNet(config.network).to(device)

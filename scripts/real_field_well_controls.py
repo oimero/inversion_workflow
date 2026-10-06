@@ -16,6 +16,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
+import numpy as np
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -29,13 +31,17 @@ from cup.seismic.survey import open_survey, segy_options_from_config
 from cup.seismic.target_zone_io import build_workflow_target_zone
 from cup.config.artifacts import is_consumable_contract_status, latest_checked_run
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
-from cup.well.controls import write_depth_well_control_qc
 from cup.well.controls import (
     DEPTH_SOURCE_SCHEMA,
     TIME_SOURCE_SCHEMA,
+    build_evaluation_support,
     build_well_control_set,
+    horizon_markers_along_control,
+    sample_seismic_along_control,
+    write_depth_well_control_qc,
     write_well_control_set,
 )
+from cup.well.evaluation_support import write_evaluation_support_manifest
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,6 +159,25 @@ def _resolve_output_dir(args: argparse.Namespace, workflow: WorkflowConfig) -> P
     return output_root / f"real_field_well_controls_{timestamp}"
 
 
+def _build_time_evaluation_supports(controls: Any, *, survey: Any, target_zone: Any) -> dict[str, Any]:
+    """Build and persist the current time-domain Step-6 evaluation support."""
+
+    if controls.sample_domain != "time" or controls.depth_basis is not None:
+        raise ValueError("Time evaluation support requires time-domain well controls.")
+    supports: dict[str, Any] = {}
+    for control in controls.controls:
+        real = sample_seismic_along_control(control, survey)
+        markers = horizon_markers_along_control(control, target_zone)
+        supports[control.well_name] = build_evaluation_support(
+            control,
+            target_interval=(float(markers[0][0]), float(markers[-1][0])),
+            observed_support=control.observed_valid_mask,
+            well_curve_support=control.valid_mask,
+            additional_support=(np.isfinite(real),),
+        )
+    return supports
+
+
 def main() -> None:
     args = parse_args()
     config_path = resolve_relative_path(args.config, root=REPO_ROOT)
@@ -185,14 +210,14 @@ def main() -> None:
         repo_root=REPO_ROOT,
         resolved_config=config,
     )
+    target_zone, _horizon_sources = build_workflow_target_zone(
+        raw_config=raw,
+        survey=survey,
+        data_root=data_root,
+        repo_root=REPO_ROOT,
+    )
     qc_dir = None
     if workflow.seismic.domain == "depth":
-        target_zone, _horizon_sources = build_workflow_target_zone(
-            raw_config=raw,
-            survey=survey,
-            data_root=data_root,
-            repo_root=REPO_ROOT,
-        )
         forward_inputs_run, qc_config = _resolve_forward_inputs_run(raw, workflow)
         qc_dir = output_dir / "qc"
         qc_manifest = write_depth_well_control_qc(
@@ -208,13 +233,50 @@ def main() -> None:
             qc_dir / "manifest.json",
             root=REPO_ROOT,
         )
+        summary["outputs"]["evaluation_support"] = qc_manifest["evaluation_support"]
+        summary["qc"] = qc_manifest
+        write_json(output_dir / "run_summary.json", summary)
+    else:
+        supports = _build_time_evaluation_supports(
+            controls,
+            survey=survey,
+            target_zone=target_zone,
+        )
+        qc_dir = output_dir / "qc"
+        qc_dir.mkdir(parents=True, exist_ok=False)
+        support_path = qc_dir / "evaluation_support.json"
+        write_evaluation_support_manifest(
+            support_path,
+            sample_axis=controls.sample_axis,
+            supports=supports,
+            source="real_field_well_controls_time",
+        )
+        support_relative = repo_relative_path(support_path, root=REPO_ROOT)
+        qc_manifest = {
+            "schema_version": "real_field_well_control_qc_v1",
+            "status": "ok",
+            "sample_domain": "time",
+            "depth_basis": None,
+            "evaluation_support": support_relative,
+            "outputs": {"evaluation_support": support_relative},
+            "well_count": len(supports),
+        }
+        write_json(qc_dir / "manifest.json", qc_manifest)
+        summary["outputs"]["qc_manifest"] = repo_relative_path(
+            qc_dir / "manifest.json",
+            root=REPO_ROOT,
+        )
+        summary["outputs"]["evaluation_support"] = support_relative
         summary["qc"] = qc_manifest
         write_json(output_dir / "run_summary.json", summary)
     print("=== Real-field Well Controls ===")
     print(f"Output: {output_dir}")
     print(f"Successful wells: {summary['counts']['successful_wells']}")
     if qc_dir is not None:
-        print(f"QC figures: {qc_dir / 'figures'}")
+        if workflow.seismic.domain == "depth":
+            print(f"QC figures: {qc_dir / 'figures'}")
+        else:
+            print(f"Evaluation support: {qc_dir / 'evaluation_support.json'}")
 
 
 if __name__ == "__main__":

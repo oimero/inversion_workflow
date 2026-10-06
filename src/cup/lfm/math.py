@@ -137,8 +137,14 @@ def ordinary_krige_xy(
     variogram: str,
     exact: bool,
     nugget: float,
+    range_m: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    """Ordinary kriging in physical XY metres with fully audited parameters."""
+    """Ordinary kriging in physical XY metres with fully audited parameters.
+
+    ``range_m`` overrides the default length scale, which is the median
+    nearest-neighbour control distance (or the nominal bin spacing when that is
+    larger).  The default keeps every existing caller unchanged.
+    """
 
     x = np.asarray(control_x_m, dtype=np.float64)
     y = np.asarray(control_y_m, dtype=np.float64)
@@ -156,7 +162,15 @@ def ordinary_krige_xy(
     nominal = float(nominal_bin_spacing_m)
     if not np.isfinite(nominal) or nominal <= 0.0:
         raise ValueError("nominal_bin_spacing_m must be finite and positive.")
-    range_m = float(max(nearest, nominal))
+    default_range_m = float(max(nearest, nominal))
+    if range_m is None:
+        resolved_range_m = default_range_m
+        range_source = "median_nearest_neighbour_or_nominal_bin_spacing"
+    else:
+        resolved_range_m = float(range_m)
+        if not np.isfinite(resolved_range_m) or resolved_range_m <= 0.0:
+            raise ValueError("range_m override must be finite and positive.")
+        range_source = "explicit_override"
     model_names = {"spherical": "Spherical", "exponential": "Exponential", "gaussian": "Gaussian"}
     key = str(variogram).casefold()
     if key not in model_names:
@@ -166,7 +180,7 @@ def ordinary_krige_xy(
         raise ValueError("Kriging nugget must be finite and non-negative.")
     import gstools as gs
 
-    model = getattr(gs, model_names[key])(dim=2, var=sill, len_scale=range_m, nugget=nugget_value)
+    model = getattr(gs, model_names[key])(dim=2, var=sill, len_scale=resolved_range_m, nugget=nugget_value)
     krige = gs.krige.Ordinary(model, cond_pos=[x, y], cond_val=values, exact=bool(exact))
     out_x = np.asarray(output_x_m, dtype=np.float64)
     out_y = np.asarray(output_y_m, dtype=np.float64)
@@ -178,7 +192,9 @@ def ordinary_krige_xy(
         "exact": bool(exact),
         "nugget": nugget_value,
         "sill": sill,
-        "range_m": range_m,
+        "range_m": resolved_range_m,
+        "range_m_default": default_range_m,
+        "range_m_source": range_source,
         "nearest_neighbor_distance_median_m": nearest,
         "nominal_bin_spacing_m": nominal,
         "constant_rtol": CONSTANT_RTOL,

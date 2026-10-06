@@ -268,6 +268,27 @@ class PatchBatch:
             raise ValueError("PatchBatch.xy_m must have shape (batch, 2) and floating dtype.")
 
 
+def seismic_profile_support(source: TraceSource, *, relative_threshold: float) -> np.ndarray:
+    """Select observed profiles using raw RMS relative to the survey median."""
+    threshold = float(relative_threshold)
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        raise ValueError("relative_threshold must be finite and positive.")
+    shape = (source.geometry.inline_axis.count, source.geometry.xline_axis.count)
+    rms = np.empty(shape, dtype=np.float64)
+    for offset in range(0, rms.size, 256):
+        flat_indices = range(offset, min(offset + 256, rms.size))
+        indices = tuple((index // shape[1], index % shape[1]) for index in flat_indices)
+        traces = source.read_traces(indices)
+        for index in indices:
+            values = np.asarray(traces[index], dtype=np.float64)
+            finite = np.isfinite(values)
+            rms[index] = np.sqrt(np.mean(values[finite] ** 2)) if np.any(finite) else 0.0
+    reference = float(np.median(rms))
+    if not np.isfinite(reference) or reference <= 0.0:
+        raise ValueError("Survey median trace RMS must be positive for profile selection.")
+    return rms >= threshold * reference
+
+
 class PatchReader:
     """Deep patch reader hiding line geometry, masking, and feature semantics."""
 
@@ -289,6 +310,7 @@ class PatchReader:
         seismic_feature_mode: SeismicFeatureMode = "global_trace_normalized",
         seismic_balance_window_samples: int = 61,
         seismic_balance_floor_fraction: float = 0.10,
+        seismic_support_mask: np.ndarray | None = None,
     ) -> None:
         if isinstance(patch_radius, bool) or int(patch_radius) != patch_radius or patch_radius < 1:
             raise ValueError("patch_radius must be a positive integer.")
@@ -323,6 +345,12 @@ class PatchReader:
         self.lfm_log_ai = np.asanyarray(lfm_log_ai)
         self.lfm_valid_mask = np.asarray(lfm_valid_mask, dtype=bool)
         expected = (self.ilines.size, self.xlines.size, self.sample_axis.values.size)
+        self.seismic_support_mask = None
+        if seismic_support_mask is not None:
+            profile_mask = np.asarray(seismic_support_mask)
+            if profile_mask.dtype != np.bool_ or profile_mask.shape != expected[:2]:
+                raise ValueError("seismic_support_mask must be boolean and match the lateral axes.")
+            self.seismic_support_mask = profile_mask.copy()
         if self.lfm_log_ai.shape != expected or self.lfm_valid_mask.shape != expected:
             raise ValueError(f"LFM arrays must have shape {expected}.")
         if not np.array_equal(self.ilines, self.geometry.inline_axis.values()):
@@ -408,6 +436,8 @@ class PatchReader:
         index: tuple[int, int],
         trace: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
+        if self.seismic_support_mask is not None and not self.seismic_support_mask[index]:
+            return np.zeros(trace.shape, dtype=np.float32), np.zeros(trace.shape, dtype=bool)
         cached = self._normalized_trace_cache.pop(index, None)
         if cached is not None:
             self._normalized_trace_cache[index] = cached
@@ -490,6 +520,8 @@ class PatchReader:
             (lfm_patch[lfm_valid_patch] - self.normalization.lfm_mean) / self.normalization.lfm_scale
         ).astype(np.float32)
         missing = np.zeros_like(normalized, dtype=np.float32)
+        if self.seismic_support_mask is not None:
+            missing[~trace_valid] = 1.0
         if not center_visible:
             missing[self.patch_radius, :] = 1.0
         center_index = indices[self.patch_radius]
@@ -607,6 +639,7 @@ def candidate_patch_keys(
     patch_radius: int,
     orientations: Iterable[Orientation] = ("inline", "xline"),
     min_lfm_support: int = 8,
+    seismic_support_mask: np.ndarray | None = None,
 ) -> tuple[PatchKey, ...]:
     """Return deterministic center identities with complete lateral patches."""
 
@@ -622,9 +655,16 @@ def candidate_patch_keys(
     if not selected or any(item not in {"inline", "xline"} for item in selected):
         raise ValueError("orientations must contain inline and/or xline.")
     valid_center = np.count_nonzero(mask & np.isfinite(values), axis=-1) >= int(min_lfm_support)
+    if seismic_support_mask is not None:
+        profile_mask = np.asarray(seismic_support_mask)
+        if profile_mask.dtype != np.bool_ or profile_mask.shape != values.shape[:2]:
+            raise ValueError("seismic_support_mask must be boolean and match the lateral axes.")
+        valid_center &= profile_mask
     result: list[PatchKey] = []
-    for i in range(patch_radius, values.shape[0] - patch_radius):
-        for j in range(patch_radius, values.shape[1] - patch_radius):
+    inline_centers = range(values.shape[0]) if values.shape[0] == 1 else range(patch_radius, values.shape[0] - patch_radius)
+    xline_centers = range(values.shape[1]) if values.shape[1] == 1 else range(patch_radius, values.shape[1] - patch_radius)
+    for i in inline_centers:
+        for j in xline_centers:
             if not valid_center[i, j]:
                 continue
             for orientation in selected:
@@ -749,6 +789,50 @@ def make_spatial_split(
         raise ValueError("Unsupported validation block anchor.")
     centers = tuple(sorted({(item.inline_index, item.xline_index) for item in candidates}))
     xy = np.asarray([_center_xy(PatchKey(i, j), geometry) for i, j in centers], dtype=np.float64)
+    if geometry.inline_axis.count == 1 or geometry.xline_axis.count == 1:
+        # Split a profile by physical distance along its line, including
+        # rotated lines. An area fraction belongs only to a 3-D survey.
+        direction = xy[-1] - xy[0]
+        length = float(np.linalg.norm(direction))
+        if length <= 0.0:
+            raise ValueError("A profile spatial split requires distinct physical centers.")
+        direction /= length
+        distances = (xy - xy[0]) @ direction
+        lower, upper = float(np.min(distances)), float(np.max(distances))
+        width = (upper - lower) * fraction
+        if anchor == "center":
+            start = (lower + upper - width) / 2.0
+        else:
+            component = 0 if abs(direction[0]) >= abs(direction[1]) else 1
+            world_max = anchor.startswith("max") if component == 0 else anchor.endswith("max")
+            high_end = world_max == (direction[component] > 0.0)
+            start = upper - width if high_end else lower
+        stop = start + width
+        validation_centers = {
+            center for center, distance in zip(centers, distances)
+            if start <= distance <= stop
+        }
+        train_centers = {
+            center for center, distance in zip(centers, distances)
+            if distance < start - gap or distance > stop + gap
+        }
+        if not validation_centers or not train_centers:
+            raise ValueError("Profile validation interval/gap removes a required split.")
+        endpoints = xy[0] + np.asarray([start, stop])[:, None] * direction
+        bounds_min, bounds_max = np.min(endpoints, axis=0), np.max(endpoints, axis=0)
+        spacing = geometry.bin_spacing_m()["nominal_bin_spacing_m"]
+        for component in (0, 1):
+            if np.isclose(bounds_min[component], bounds_max[component]):
+                bounds_min[component] -= spacing / 2.0
+                bounds_max[component] += spacing / 2.0
+        train_keys = tuple(item for item in candidates if (item.inline_index, item.xline_index) in train_centers)
+        validation_keys = tuple(item for item in candidates if (item.inline_index, item.xline_index) in validation_centers)
+        return SpatialSplit(
+            train_keys=train_keys, validation_keys=validation_keys, review_keys=validation_keys,
+            validation_centers=tuple(sorted(validation_centers)),
+            block_xy_m=(float(bounds_min[0]), float(bounds_max[0]), float(bounds_min[1]), float(bounds_max[1])),
+            gap_m=gap, anchor=anchor,
+        )
     x_min, y_min = np.min(xy, axis=0)
     x_max, y_max = np.max(xy, axis=0)
     x_span = max(float(x_max - x_min), geometry.bin_spacing_m()["nominal_bin_spacing_m"])
@@ -1052,5 +1136,6 @@ __all__ = [
     "fit_lfm_normalization",
     "make_spatial_split",
     "sample_lfm_trace",
+    "seismic_profile_support",
     "well_target_zone_mask",
 ]

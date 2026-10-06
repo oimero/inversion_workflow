@@ -23,6 +23,10 @@ from cup.seismic.target_zone import TargetZone
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.utils.io import repo_relative_path, sanitize_filename, write_json
 from cup.utils.masks import true_runs as _finite_runs
+from cup.well.evaluation_support import (
+    EvaluationSupport,
+    load_evaluation_support_manifest,
+)
 from cup.well.controls import (
     WellControl,
     WellControlSet,
@@ -46,6 +50,28 @@ def _longest_contiguous_run(indices: np.ndarray) -> np.ndarray:
     bounds = np.column_stack((np.r_[0, breaks], np.r_[breaks, values.size]))
     start, stop = max(bounds, key=lambda item: int(item[1] - item[0]))
     return values[int(start) : int(stop)]
+
+
+def _contiguous_run_covering(values: np.ndarray, required: np.ndarray) -> np.ndarray:
+    """Return the available contiguous run containing a required interval."""
+
+    available = np.asarray(values, dtype=np.int64)
+    needed = np.asarray(required, dtype=np.int64)
+    if available.ndim != 1 or needed.ndim != 1 or available.size == 0 or needed.size == 0:
+        raise ValueError("available and required indices must be non-empty one-dimensional arrays.")
+    if np.any(np.diff(available) <= 0) or np.any(np.diff(needed) <= 0):
+        raise ValueError("available and required indices must be strictly increasing.")
+    if needed[0] < available[0] or needed[-1] > available[-1]:
+        raise ValueError("required indices fall outside available indices.")
+    if not np.all(np.isin(needed, available)):
+        raise ValueError("required indices are not fully available.")
+    breaks = np.flatnonzero(np.diff(available) > 1) + 1
+    bounds = np.column_stack((np.r_[0, breaks], np.r_[breaks, available.size]))
+    for start, stop in bounds:
+        run = available[int(start) : int(stop)]
+        if run[0] <= needed[0] and run[-1] >= needed[-1]:
+            return run
+    raise ValueError("No contiguous available run covers the required interval.")
 
 
 def _forward_well_curve(
@@ -80,17 +106,96 @@ def _forward_well_curve(
     return closure.synthetic_seismic[0].cpu().numpy(), common.observed_seismic[0].cpu().numpy()
 
 
+def _resolve_evaluation_support(
+    value: Mapping[str, EvaluationSupport] | Path | None,
+    *,
+    sample_axis: SampleAxis,
+) -> dict[str, EvaluationSupport]:
+    if value is None:
+        raise ValueError(
+            "write_well_waveform_qc requires the fixed Step-6 evaluation_support mapping or manifest path."
+        )
+    if isinstance(value, (str, Path)):
+        supports = load_evaluation_support_manifest(Path(value), sample_axis=sample_axis)
+    elif isinstance(value, Mapping):
+        supports = {}
+        for name, support in value.items():
+            if not isinstance(support, EvaluationSupport):
+                raise TypeError("evaluation_support mapping values must be EvaluationSupport instances.")
+            support.validate_axis(sample_axis)
+            supports[str(name).casefold()] = support
+    else:
+        raise TypeError("evaluation_support must be a manifest path, a support mapping, or None.")
+    return {
+        (name.casefold() if isinstance(name, str) else str(name).casefold()): support
+        for name, support in supports.items()
+    }
+
+
+def _support_window_fields(
+    *,
+    well_name: str,
+    axis: np.ndarray,
+    expected: EvaluationSupport | None,
+    indices: np.ndarray,
+    status: str,
+    source: str,
+    missing_samples: int,
+    extra_samples: int,
+) -> dict[str, Any]:
+    """Return stable support columns for complete and incomplete QC rows."""
+
+    if expected is None:
+        target_start = float("nan")
+        target_stop = float("nan")
+        support_start = float(axis[indices[0]]) if indices.size else float("nan")
+        support_stop = float(axis[indices[-1]]) if indices.size else float("nan")
+        expected_samples = int(indices.size)
+    else:
+        target_start = float(expected.target_interval_start)
+        target_stop = float(expected.target_interval_stop)
+        support_start = float(expected.support_start)
+        support_stop = float(expected.support_stop)
+        expected_samples = int(expected.support_samples)
+    return {
+        "well_name": well_name,
+        "support_status": status,
+        "support_source": source,
+        "target_interval_start": target_start,
+        "target_interval_stop": target_stop,
+        "evaluation_support_start": support_start,
+        "evaluation_support_stop": support_stop,
+        "evaluation_support_samples": expected_samples,
+        "predicted_support_start": float(axis[indices[0]]) if indices.size else float("nan"),
+        "predicted_support_stop": float(axis[indices[-1]]) if indices.size else float("nan"),
+        "predicted_support_samples": int(indices.size),
+        "missing_evaluation_support_samples": int(missing_samples),
+        "extra_predicted_support_samples": int(extra_samples),
+    }
+
+
 def write_well_waveform_qc(
     trainer: Any,
     model: Any,
     qc_dir: Path,
     *,
     root: Path,
+    evaluation_support: Mapping[str, EvaluationSupport] | Path | None = None,
 ) -> dict[str, Any]:
-    """Write one waveform QC figure and metrics table per trusted well."""
+    """Write one waveform QC figure and metrics table per trusted well.
+
+    ``evaluation_support`` supplies the fixed Step-6 scoring interval.  A
+    prediction that does not cover that interval produces a visible
+    incomplete-support row instead of a shorter substitute metric.
+    """
 
     import matplotlib.pyplot as plt
 
+    axis = np.asarray(trainer.data.reader.sample_axis.values, dtype=np.float64)
+    supports = _resolve_evaluation_support(
+        evaluation_support,
+        sample_axis=trainer.data.reader.sample_axis,
+    )
     predictions: dict[str, dict[int, dict[str, list[float] | dict[str, list[float]]]]] = {}
     with torch.no_grad():
         items = trainer.data.trusted_well_patches
@@ -138,11 +243,36 @@ def write_well_waveform_qc(
 
     qc_dir = Path(qc_dir)
     qc_dir.mkdir(parents=True, exist_ok=True)
-    axis = np.asarray(trainer.data.reader.sample_axis.values, dtype=np.float64)
     rows: list[dict[str, Any]] = []
     figures: list[str] = []
-    for well_name in sorted(predictions):
-        by_sample = predictions[well_name]
+    trusted_names = {
+        str(name).casefold()
+        for name in getattr(trainer.data, "trusted_well_names", tuple(predictions))
+    }
+    prediction_names = {
+        str(name).casefold(): str(name)
+        for name in predictions
+    }
+    target_names = {
+        str(name).casefold(): str(name)
+        for name in trainer.data.well_targets
+    }
+    support_names = {
+        str(support.well_name).casefold(): str(support.well_name)
+        for support in supports.values()
+    }
+    well_folds = set(prediction_names)
+    well_folds.update(
+        name_fold
+        for name_fold in support_names
+        if name_fold in trusted_names
+    )
+    for well_fold in sorted(well_folds):
+        well_name = target_names.get(
+            well_fold,
+            prediction_names.get(well_fold, support_names.get(well_fold, well_fold)),
+        )
+        by_sample = predictions.get(prediction_names.get(well_fold, well_name), {})
         available = np.asarray(
             [
                 index
@@ -154,63 +284,171 @@ def write_well_waveform_qc(
             ],
             dtype=np.int64,
         )
-        indices = _longest_contiguous_run(available)
-        if indices.size < 8:
-            raise ValueError(f"{well_name}: longest predicted well QC support run has fewer than eight samples.")
+        expected = supports.get(well_name.casefold())
+        if expected is not None:
+            canonical_indices = expected.indices
+            available_set = set(int(index) for index in available)
+            missing = np.asarray(
+                [index for index in canonical_indices if int(index) not in available_set],
+                dtype=np.int64,
+            )
+            inside_available = np.asarray(
+                [index for index in available if int(index) in set(int(value) for value in canonical_indices)],
+                dtype=np.int64,
+            )
+            if missing.size:
+                predicted_run = (
+                    _longest_contiguous_run(inside_available)
+                    if inside_available.size
+                    else np.asarray([], dtype=np.int64)
+                )
+                incomplete_row = _support_window_fields(
+                    well_name=well_name,
+                    axis=axis,
+                    expected=expected,
+                    indices=predicted_run,
+                    status="prediction_support_incomplete",
+                    source="step6_evaluation_support",
+                    missing_samples=int(missing.size),
+                    extra_samples=max(0, int(available.size - inside_available.size)),
+                )
+                incomplete_row.update(
+                    {
+                        "sample_domain": trainer.data.reader.sample_axis.domain,
+                        "sample_unit": trainer.data.reader.sample_axis.unit,
+                        "support_start": float(expected.support_start),
+                        "support_stop": float(expected.support_stop),
+                        "support_samples": int(expected.support_samples),
+                        "well_curve_forward_corr": float("nan"),
+                        "predicted_vs_body_rmse_log_ai": float("nan"),
+                        "predicted_vs_body_corr": float("nan"),
+                        "figure": "",
+                    }
+                )
+                rows.append(incomplete_row)
+                continue
+            evaluation_indices = canonical_indices
+            prediction_indices = _contiguous_run_covering(available, canonical_indices)
+            support_status = "ok"
+            support_source = "step6_evaluation_support"
+            missing_samples = 0
+            extra_samples = max(0, int(prediction_indices.size - canonical_indices.size))
+        elif well_fold in trusted_names:
+            predicted_run = (
+                _longest_contiguous_run(available)
+                if available.size
+                else np.asarray([], dtype=np.int64)
+            )
+            missing_row = _support_window_fields(
+                well_name=well_name,
+                axis=axis,
+                expected=None,
+                indices=predicted_run,
+                status="evaluation_support_missing",
+                source="step6_evaluation_support",
+                missing_samples=0,
+                extra_samples=0,
+            )
+            missing_row.update(
+                {
+                    "sample_domain": trainer.data.reader.sample_axis.domain,
+                    "sample_unit": trainer.data.reader.sample_axis.unit,
+                    "support_start": float("nan"),
+                    "support_stop": float("nan"),
+                    "support_samples": 0,
+                    "well_curve_forward_corr": float("nan"),
+                    "predicted_vs_body_rmse_log_ai": float("nan"),
+                    "predicted_vs_body_corr": float("nan"),
+                    "figure": "",
+                }
+            )
+            rows.append(missing_row)
+            continue
+        else:
+            raise ValueError(f"{well_name}: fixed Step-6 evaluation support is missing.")
 
         record = lambda index: by_sample[int(index)]
-        predicted_log_ai = np.asarray(
-            [np.mean(record(index)["body_log_ai"]) for index in indices],
+        predicted_log_ai_full = np.asarray(
+            [np.mean(record(index)["body_log_ai"]) for index in prediction_indices],
             dtype=np.float64,
         )
-        observed = np.asarray(
-            [np.mean(record(index)["observed"]) for index in indices],
+        observed_full = np.asarray(
+            [np.mean(record(index)["observed"]) for index in prediction_indices],
             dtype=np.float64,
         )
-        lfm_values = np.asarray(
-            [np.mean(record(index)["lfm_log_ai"]) for index in indices],
+        lfm_values_full = np.asarray(
+            [np.mean(record(index)["lfm_log_ai"]) for index in prediction_indices],
             dtype=np.float64,
         )
-        lfm_mask = np.ones(indices.size, dtype=bool)
-        xy_values = np.asarray(
-            [np.mean(np.asarray(record(index)["xy_m"], dtype=np.float64), axis=0) for index in indices],
+        lfm_mask_full = np.ones(prediction_indices.size, dtype=bool)
+        xy_values_full = np.asarray(
+            [np.mean(np.asarray(record(index)["xy_m"], dtype=np.float64), axis=0) for index in prediction_indices],
             dtype=np.float64,
         )
-        xy_m = np.mean(xy_values, axis=0)
-        domain_extras = {
+        xy_m_full = np.mean(xy_values_full, axis=0)
+        domain_extras_full = {
             name: np.asarray(
-                [np.mean(record(index)["domain_extras"][name]) for index in indices],
+                [np.mean(record(index)["domain_extras"][name]) for index in prediction_indices],
                 dtype=np.float64,
             )
             for name in trainer.data.reader.domain_extras
         }
-        target = trainer.data.well_targets[well_name]
-        reference_log_ai = np.asarray(target.model_axis_target[indices], dtype=np.float64)
-        observed_valid_mask = np.ones(indices.size, dtype=bool)
+        target = trainer.data.well_targets[target_names.get(well_fold, well_name)]
+        reference_log_ai_full = np.asarray(target.model_axis_target[prediction_indices], dtype=np.float64)
+        observed_valid_mask_full = np.ones(prediction_indices.size, dtype=bool)
         if any(
             np.any(~np.isfinite(values))
-            for values in (reference_log_ai, predicted_log_ai, observed, lfm_values, xy_m, *domain_extras.values())
+            for values in (
+                reference_log_ai_full,
+                predicted_log_ai_full,
+                observed_full,
+                lfm_values_full,
+                xy_m_full,
+                *domain_extras_full.values(),
+            )
         ):
             raise ValueError(f"{well_name}: assembled well QC arrays contain non-finite values.")
 
-        local_axis = np.asarray(axis[indices], dtype=np.float64)
+        prediction_axis = np.asarray(axis[prediction_indices], dtype=np.float64)
+        prediction_sample_axis = SampleAxis(
+            prediction_axis,
+            trainer.data.reader.sample_axis.domain,
+            trainer.data.reader.sample_axis.unit,
+            trainer.data.reader.sample_axis.depth_basis,
+        )
+        synthetic_full, observed_full = _forward_well_curve(
+            trainer,
+            axis=prediction_sample_axis,
+            body_log_ai=predicted_log_ai_full,
+            observed_seismic=observed_full,
+            observed_valid_mask=observed_valid_mask_full,
+            lfm_log_ai=lfm_values_full,
+            lfm_valid_mask=lfm_mask_full,
+            xy_m=xy_m_full,
+            domain_extras=domain_extras_full,
+        )
+
+        score_start = int(np.searchsorted(prediction_indices, evaluation_indices[0]))
+        score_stop = score_start + int(evaluation_indices.size)
+        score_slice = slice(score_start, score_stop)
+        local_axis = np.asarray(axis[evaluation_indices], dtype=np.float64)
         local_sample_axis = SampleAxis(
             local_axis,
             trainer.data.reader.sample_axis.domain,
             trainer.data.reader.sample_axis.unit,
             trainer.data.reader.sample_axis.depth_basis,
         )
-        synthetic, observed = _forward_well_curve(
-            trainer,
-            axis=local_sample_axis,
-            body_log_ai=predicted_log_ai,
-            observed_seismic=observed,
-            observed_valid_mask=observed_valid_mask,
-            lfm_log_ai=lfm_values,
-            lfm_valid_mask=lfm_mask,
-            xy_m=xy_m,
-            domain_extras=domain_extras,
-        )
+        predicted_log_ai = predicted_log_ai_full[score_slice]
+        reference_log_ai = reference_log_ai_full[score_slice]
+        observed = observed_full[score_slice]
+        lfm_values = lfm_values_full[score_slice]
+        lfm_mask = lfm_mask_full[score_slice]
+        xy_m = xy_m_full
+        domain_extras = {
+            name: values[score_slice]
+            for name, values in domain_extras_full.items()
+        }
+        synthetic = synthetic_full[score_slice]
 
         observed_centered = observed - float(np.mean(observed))
         observed_scale = float(np.std(observed_centered))
@@ -285,20 +523,30 @@ def write_well_waveform_qc(
         figures.append(repo_relative_path(figure_path, root=root))
 
         body_residual = predicted_log_ai - reference_log_ai
-        rows.append(
+        row = _support_window_fields(
+            well_name=well_name,
+            axis=axis,
+            expected=expected,
+            indices=prediction_indices,
+            status=support_status,
+            source=support_source,
+            missing_samples=missing_samples,
+            extra_samples=extra_samples,
+        )
+        row.update(
             {
-                "well_name": well_name,
                 "sample_domain": local_sample_axis.domain,
                 "sample_unit": local_sample_axis.unit,
                 "support_start": float(local_axis[0]),
                 "support_stop": float(local_axis[-1]),
-                "support_samples": int(indices.size),
+                "support_samples": int(evaluation_indices.size),
                 "well_curve_forward_corr": correlation,
                 "predicted_vs_body_rmse_log_ai": float(np.sqrt(np.mean(np.square(body_residual)))),
                 "predicted_vs_body_corr": float(np.corrcoef(reference_log_ai, predicted_log_ai)[0, 1]),
                 "figure": repo_relative_path(figure_path, root=root),
             }
         )
+        rows.append(row)
 
     metrics_path = qc_dir / "metrics.csv"
     fieldnames = list(rows[0]) if rows else ["well_name", "figure"]
@@ -311,13 +559,33 @@ def write_well_waveform_qc(
         if str(trainer.config.sample_unit) == "s"
         else "dynamic_correlation_window_m"
     )
+    incomplete_wells = [
+        row["well_name"] for row in rows
+        if row.get("support_status")
+        in {"prediction_support_incomplete", "evaluation_support_missing"}
+    ]
+    incomplete_statuses = sorted(
+        {
+            str(row["support_status"])
+            for row in rows
+            if row.get("support_status")
+            in {"prediction_support_incomplete", "evaluation_support_missing"}
+        }
+    )
     manifest = {
-        "status": "ok",
+        "status": "evaluation_support_incomplete" if incomplete_statuses else "ok",
+        "incomplete_wells": incomplete_wells,
+        "incomplete_statuses": incomplete_statuses,
         "plot_function": "cup.seismic.viz.plot_well_waveform_qc",
         "correlation_metric": "well_curve_forward_corr",
         "correlation_definition": "Assemble the predicted AI curve on the well support, then forward it with the same domain adapter used by training; no gain or vertical compensation is applied.",
         "display_normalization": "Each waveform is centered and divided by its own standard deviation on the shared QC interval.",
         "residual_definition": "Standardized observed seismic minus standardized forward synthetic.",
+        "evaluation_support": "fixed_step6_support",
+        "forward_support_rule": (
+            "Forward on the contiguous predicted run covering the fixed support, "
+            "then score only the fixed support."
+        ),
         "dynamic_correlation_window_unit": str(trainer.config.sample_unit),
         dynamic_window_key: float(trainer.config.waveform_qc_dynamic_window),
         "figures": figures,

@@ -1,4 +1,4 @@
-"""Reusable SEG-Y/ZGY volume export helpers.
+"""Reusable SEG-Y/ZGY/NPZ volume export helpers.
 
 The functions in this module are intentionally business-agnostic: callers pass
 a regular ``[inline, xline, sample]`` volume plus explicit axes and a source
@@ -127,6 +127,27 @@ def export_volume_like_source(
             nan_fill=nan_fill,
         )
         return _export_payload(target, "segy")
+    if source_type == "npz":
+        target = output_base.with_suffix(".npz")
+        unit = _write_npz(
+            target,
+            volume=volume,
+            ilines=ilines,
+            xlines=xlines,
+            samples=samples,
+            sample_domain=domain,
+            source_seismic_file=Path(source_seismic_file),
+            nan_fill=nan_fill,
+        )
+        payload = _export_payload(target, "npz")
+        payload.update(
+            {
+                "sample_domain": domain,
+                "sample_unit": unit,
+                "shape": list(np.asarray(volume).shape),
+            }
+        )
+        return payload
     raise ValueError(f"Unsupported source seismic type for volume export: {source_seismic_type!r}")
 
 
@@ -136,6 +157,60 @@ def _export_payload(path: Path, fmt: str) -> dict[str, Any]:
         "format": fmt,
         "path": str(path),
     }
+
+
+def _write_npz(
+    path: Path,
+    *,
+    volume: np.ndarray,
+    ilines: Sequence[float],
+    xlines: Sequence[float],
+    samples: Sequence[float],
+    sample_domain: str,
+    source_seismic_file: Path,
+    nan_fill: float | None,
+) -> str:
+    """Write an explicit NPZ survey while preserving source XY geometry."""
+
+    source = open_survey(source_seismic_file, seismic_type="npz")
+    source_axis = source.sample_axis(sample_domain)
+    export_volume = _prepared_volume(volume, nan_fill=nan_fill)
+    il_axis, xl_axis, sample_axis = _validate_axes(
+        volume=export_volume,
+        ilines=ilines,
+        xlines=xlines,
+        samples=samples,
+    )
+    source_ilines = source.line_geometry.inline_axis.values()
+    source_xlines = source.line_geometry.xline_axis.values()
+    if not np.all(np.isin(il_axis, source_ilines)) or not np.all(np.isin(xl_axis, source_xlines)):
+        raise ValueError("NPZ export axes must be subsets of the source NPZ geometry axes.")
+    if not np.all(np.isin(sample_axis, source_axis.values)):
+        raise ValueError("NPZ export samples must be a subset of the source NPZ sample axis.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        seismic=export_volume,
+        sample_values=sample_axis.astype(np.float64),
+        sample_domain=np.asarray(source_axis.domain),
+        sample_unit=np.asarray(source_axis.unit),
+        depth_basis=np.asarray("" if source_axis.depth_basis is None else source_axis.depth_basis),
+        ilines=il_axis.astype(np.float64),
+        xlines=xl_axis.astype(np.float64),
+        origin_xy_m=np.asarray(
+            [source.line_geometry.x0, source.line_geometry.y0],
+            dtype=np.float64,
+        ),
+        inline_step_xy_m=np.asarray(
+            [source.line_geometry.dx_inline, source.line_geometry.dy_inline],
+            dtype=np.float64,
+        ),
+        xline_step_xy_m=np.asarray(
+            [source.line_geometry.dx_xline, source.line_geometry.dy_xline],
+            dtype=np.float64,
+        ),
+    )
+    return source_axis.unit
 
 
 def _prepared_volume(volume: np.ndarray, *, nan_fill: float | None) -> np.ndarray:

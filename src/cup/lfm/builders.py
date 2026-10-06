@@ -34,10 +34,20 @@ def _spatial_config(config: Mapping[str, Any]) -> dict[str, Any]:
     missing = sorted(required - set(spatial))
     if missing:
         raise ValueError(f"baseline.spatial is missing keys: {missing}")
-    if set(spatial) != required:
-        raise ValueError("baseline.spatial must contain exactly variogram/exact/nugget.")
+    optional = {"range_m"}
+    unknown = sorted(set(spatial) - required - optional)
+    if unknown:
+        raise ValueError(
+            f"baseline.spatial must contain exactly {sorted(required)} plus the optional "
+            f"{sorted(optional)}; got unknown keys {unknown}."
+        )
     if not isinstance(spatial["exact"], bool):
         raise ValueError("baseline.spatial.exact must be a YAML boolean.")
+    if "range_m" in spatial:
+        override = float(spatial["range_m"])
+        if not np.isfinite(override) or override <= 0.0:
+            raise ValueError("baseline.spatial.range_m must be finite and positive when present.")
+        spatial["range_m"] = override
     return spatial
 
 
@@ -192,6 +202,7 @@ def _field_from_controls(
         variogram=str(spatial["variogram"]),
         exact=bool(spatial["exact"]),
         nugget=float(spatial["nugget"]),
+        range_m=spatial.get("range_m"),
     )
     metadata["mode"] = "kriging"
     return field, variance, metadata
@@ -502,6 +513,7 @@ class ProportionalKrigingBuilder:
                         variogram=str(spatial["variogram"]),
                         exact=bool(spatial["exact"]),
                         nugget=float(spatial["nugget"]),
+                        range_m=spatial.get("range_m"),
                     )
                     metadata["mode"] = "kriging"
                 slice_fields[slice_index] = field

@@ -44,6 +44,7 @@ from cup.seismic.trace_sampling import assemble_bilinear_trace_from_plan, build_
 from cup.seismic.viz import plot_well_waveform_qc
 from cup.config.workflow import WorkflowConfig, merge_dict_defaults
 from cup.well.tie import WELL_AUTO_TIE_SCHEMA_VERSION
+from cup.well.pretrained import resolve_wtie_asset
 from cup.config.sources import resolve_source_run
 from cup.config.artifacts import (
     CONTRACT_FINGERPRINT_SCHEMA,
@@ -124,8 +125,8 @@ def _script_config(cfg: dict[str, Any]) -> dict[str, Any]:
         },
     )
     script_cfg.setdefault("enabled_routes", ["vertical_with_tdt", "vertical_anchor_from_tops"])
-    script_cfg.setdefault("tutorial_model", "tutorial/trained_net_state_dict.pt")
-    script_cfg.setdefault("tutorial_params", "tutorial/network_parameters.yaml")
+    script_cfg.setdefault("tutorial_model", None)
+    script_cfg.setdefault("tutorial_params", None)
     script_cfg.setdefault("target_crop_ms", 201.0)
     merge_dict_defaults(
         script_cfg,
@@ -1611,8 +1612,14 @@ def main() -> None:
         segy_options=segy_options_from_config(seismic_cfg) or None,
     )
 
-    model_path = _resolve_data_path(script_cfg["tutorial_model"], data_root=data_root)
-    params_path = _resolve_data_path(script_cfg["tutorial_params"], data_root=data_root)
+    model_path = resolve_wtie_asset(
+        script_cfg["tutorial_model"], filename="trained_net_state_dict.pt",
+        data_root=data_root, repo_root=REPO_ROOT,
+    )
+    params_path = resolve_wtie_asset(
+        script_cfg["tutorial_params"], filename="network_parameters.yaml",
+        data_root=data_root, repo_root=REPO_ROOT,
+    )
 
     results: list[WellTieResult] = []
     result_extras: dict[str, Any] = {}

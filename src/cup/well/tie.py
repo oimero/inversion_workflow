@@ -890,6 +890,13 @@ def evaluate_wavelet_on_well(
 
 def build_auto_tie_search_space(config: Mapping[str, Any]) -> list[dict[str, Any]]:
     """根据配置构建 auto-tie 超参数搜索空间。"""
+
+    def range_parameter(name: str, bounds: Any) -> dict[str, Any]:
+        values = list(bounds)
+        if len(values) == 2 and values[0] == values[1]:
+            return {"name": name, "type": "fixed", "value": values[0]}
+        return {"name": name, "type": "range", "bounds": values, "value_type": "float"}
+
     return [
         {
             "name": "logs_median_size",
@@ -899,19 +906,9 @@ def build_auto_tie_search_space(config: Mapping[str, Any]) -> list[dict[str, Any
             "is_ordered": True,
             "sort_values": True,
         },
-        {
-            "name": "logs_median_threshold",
-            "type": "range",
-            "bounds": list(config["logs_median_threshold_bounds"]),
-            "value_type": "float",
-        },
-        {"name": "logs_std", "type": "range", "bounds": list(config["logs_std_bounds"]), "value_type": "float"},
-        {
-            "name": "table_t_shift",
-            "type": "range",
-            "bounds": list(config["table_t_shift_bounds"]),
-            "value_type": "float",
-        },
+        range_parameter("logs_median_threshold", config["logs_median_threshold_bounds"]),
+        range_parameter("logs_std", config["logs_std_bounds"]),
+        range_parameter("table_t_shift", config["table_t_shift_bounds"]),
     ]
 
 

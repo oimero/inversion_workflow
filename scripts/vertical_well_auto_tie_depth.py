@@ -35,6 +35,7 @@ if str(SRC_DIR) not in sys.path:
 
 from cup.config.workflow import WorkflowConfig
 from cup.well.tie import DEPTH_VERTICAL_AUTO_TIE_SCHEMA_VERSION
+from cup.well.pretrained import resolve_wtie_asset
 from cup.config.sources import resolve_source_run
 from cup.seismic.survey import segy_options_from_config
 from cup.config.artifacts import (
@@ -659,8 +660,14 @@ def main() -> None:
 
     well_heads_file = resolve_relative_path(workflow.assets.well_heads_file, root=data_root)
     seismic_file = resolve_relative_path(workflow.seismic.file, root=data_root)
-    tutorial_model = resolve_relative_path(str(script_cfg["tutorial_model"]), root=data_root)
-    tutorial_params = resolve_relative_path(str(script_cfg["tutorial_params"]), root=data_root)
+    tutorial_model = resolve_wtie_asset(
+        script_cfg.get("tutorial_model"), filename="trained_net_state_dict.pt",
+        data_root=data_root, repo_root=REPO_ROOT,
+    )
+    tutorial_params = resolve_wtie_asset(
+        script_cfg.get("tutorial_params"), filename="network_parameters.yaml",
+        data_root=data_root, repo_root=REPO_ROOT,
+    )
 
     for p in [las_file, well_heads_file, seismic_file, tutorial_model, tutorial_params]:
         if not p.exists():

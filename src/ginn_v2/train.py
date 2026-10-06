@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from cup.lfm.math import LowpassSpec
+from cup.utils.io import write_json
 from cup.well.controls import WellControlSet
 from ginn_v2.data import (
     PatchBatch,
@@ -343,6 +344,12 @@ class BodyInversionConfig:
     seismic_feature_mode: str = "global_trace_normalized"
     seismic_balance_window_samples: int = 61
     seismic_balance_floor_fraction: float = 0.10
+    seismic_support_relative_threshold: float | None = None
+    finetune_strategy: str = "mvw"
+    finetune_unlabeled_steps: int | None = None
+    finetune_well_steps: int | None = None
+    visible_seismic_weight: float = 1.0
+    selection_well_rmse_tolerance: float | None = None
     loss_weights: BodyInversionLossWeights = BodyInversionLossWeights()
     network: BodyNetworkConfig = BodyNetworkConfig()
 
@@ -397,7 +404,8 @@ class BodyInversionConfig:
         _positive_int(self.batch_size, name="batch_size")
         _positive_int(self.max_train_centers, name="max_train_centers")
         _positive_int(self.max_validation_centers, name="max_validation_centers")
-        _positive_int(self.pretrain_epochs, name="pretrain_epochs")
+        if isinstance(self.pretrain_epochs, bool) or int(self.pretrain_epochs) != self.pretrain_epochs or self.pretrain_epochs < 0:
+            raise ValueError("pretrain_epochs must be a non-negative integer.")
         _positive_int(self.finetune_epochs, name="finetune_epochs")
         _positive_int(self.well_batch_multiplier, name="well_batch_multiplier")
         if not 0.0 < float(self.review_fraction) < 1.0:
@@ -420,6 +428,29 @@ class BodyInversionConfig:
             raise ValueError("seismic_balance_window_samples must be an odd integer of at least three.")
         if not 0.0 < self.seismic_balance_floor_fraction < 1.0:
             raise ValueError("seismic_balance_floor_fraction must be within (0, 1).")
+        if self.seismic_support_relative_threshold is not None:
+            if isinstance(self.seismic_support_relative_threshold, bool):
+                raise ValueError("seismic_support_relative_threshold must be numeric, not boolean.")
+            threshold = float(self.seismic_support_relative_threshold)
+            if not np.isfinite(threshold) or threshold <= 0.0:
+                raise ValueError("seismic_support_relative_threshold must be finite and positive.")
+            object.__setattr__(self, "seismic_support_relative_threshold", threshold)
+        if self.finetune_strategy not in {"vw", "mw", "mvw", "w_only"}:
+            raise ValueError("Unsupported finetune_strategy.")
+        for name in ("finetune_unlabeled_steps", "finetune_well_steps"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or int(value) != value or value < 0):
+                raise ValueError(f"{name} must be a non-negative integer when supplied.")
+        if self.finetune_well_steps == 0:
+            raise ValueError("finetune_well_steps must be positive when supplied.")
+        if self.finetune_strategy == "w_only" and self.finetune_unlabeled_steps not in {None, 0}:
+            raise ValueError("w_only requires zero unlabeled updates.")
+        if not np.isfinite(self.visible_seismic_weight) or self.visible_seismic_weight < 0.0:
+            raise ValueError("visible_seismic_weight must be finite and non-negative.")
+        if self.selection_well_rmse_tolerance is not None and (
+            not np.isfinite(self.selection_well_rmse_tolerance) or self.selection_well_rmse_tolerance < 0.0
+        ):
+            raise ValueError("selection_well_rmse_tolerance must be finite and non-negative.")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any], *, sample_domain: str) -> "BodyInversionConfig":
@@ -477,9 +508,15 @@ class BodyInversionConfig:
             "seismic_feature_mode": self.seismic_feature_mode,
             "seismic_balance_window_samples": self.seismic_balance_window_samples,
             "seismic_balance_floor_fraction": self.seismic_balance_floor_fraction,
+            "seismic_support_relative_threshold": self.seismic_support_relative_threshold,
             "loss_weights": asdict(self.loss_weights),
             "warnings": asdict(self.warnings),
             "network": asdict(self.network),
+            "finetune_strategy": self.finetune_strategy,
+            "finetune_unlabeled_steps": self.finetune_unlabeled_steps,
+            "finetune_well_steps": self.finetune_well_steps,
+            "visible_seismic_weight": self.visible_seismic_weight,
+            "selection_well_rmse_tolerance": self.selection_well_rmse_tolerance,
         }
 
     def pretrain_json_dict(self) -> dict[str, Any]:
@@ -492,6 +529,7 @@ class BodyInversionConfig:
             "seismic_feature_mode": self.seismic_feature_mode,
             "seismic_balance_window_samples": self.seismic_balance_window_samples,
             "seismic_balance_floor_fraction": self.seismic_balance_floor_fraction,
+            "seismic_support_relative_threshold": self.seismic_support_relative_threshold,
             "loss_weights": {
                 "seismic_shape": self.loss_weights.seismic_shape,
                 "lambda_shape": self.loss_weights.lambda_shape,
@@ -499,6 +537,36 @@ class BodyInversionConfig:
             },
             "network": asdict(self.network),
         }
+
+
+def select_finetune_epoch(
+    metrics_by_epoch: Mapping[int, EvaluationMetrics],
+    *,
+    pretrain_metrics: EvaluationMetrics,
+    config: BodyInversionConfig,
+) -> int:
+    """Select a checkpoint with the configured well/physics tradeoff."""
+    if not metrics_by_epoch:
+        raise ValueError("Checkpoint selection requires recorded epoch metrics.")
+    if config.selection_well_rmse_tolerance is not None:
+        reference_epoch = min(metrics_by_epoch, key=lambda epoch: (metrics_by_epoch[epoch].well_pooled_rmse, epoch))
+        reference = metrics_by_epoch[reference_epoch].well_rmse_by_well
+        tolerance = 1.0 + config.selection_well_rmse_tolerance
+        eligible = [epoch for epoch, item in metrics_by_epoch.items() if all(
+            item.well_rmse_by_well[name] <= tolerance * value
+            for name, value in reference.items()
+        )]
+        return min(eligible, key=lambda epoch: (
+            -float(np.median(metrics_by_epoch[epoch].visible_correlation)),
+            metrics_by_epoch[epoch].well_pooled_rmse, epoch,
+        ))
+    return min(metrics_by_epoch, key=lambda epoch: (
+        config.selection_weights.well_rmse * metrics_by_epoch[epoch].well_pooled_rmse
+        / max(abs(pretrain_metrics.well_pooled_rmse), torch.finfo(torch.float32).eps)
+        + config.selection_weights.amplitude_mapping
+        * abs(metrics_by_epoch[epoch].seismic_body_amplitude_spearman),
+        epoch,
+    ))
 
 
 @dataclass(frozen=True)
@@ -720,6 +788,7 @@ class BodyInversionTrainer:
         output_dir: Path,
         artifact_root: Path | None = None,
         logger: logging.Logger | None = None,
+        evaluation_support: Mapping[str, Any] | None = None,
     ) -> None:
         self.data = data
         self.adapter = adapter
@@ -729,6 +798,15 @@ class BodyInversionTrainer:
         self.output_dir = Path(output_dir)
         self.artifact_root = Path(artifact_root) if artifact_root is not None else self.output_dir
         self.log = logger or logging.getLogger(__name__)
+        self.evaluation_support = evaluation_support
+        self.last_well_qc_manifest = None
+        self.training_updates = {
+            "stages": {
+                stage: {"n_M": 0, "n_V": 0, "n_W": 0, "optimizer_steps": 0}
+                for stage in ("pretrain", "finetune")
+            },
+            "epochs": [],
+        }
         self.device = torch.device(config.device)
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("Body inversion device='cuda' was requested but CUDA is unavailable.")
@@ -792,6 +870,7 @@ class BodyInversionTrainer:
         well_items: tuple[WellPatchTarget, ...] = (),
         weights: BodyInversionLossWeights,
         include_seismic: bool = True,
+        seismic_scale: float = 1.0,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         shape_loss = torch.zeros((), dtype=body.dtype, device=body.device)
         if include_seismic:
@@ -858,7 +937,7 @@ class BodyInversionTrainer:
                     reduction="mean",
                 )
         total = (
-            weights.seismic_shape * shape_loss
+            weights.seismic_shape * float(seismic_scale) * shape_loss
             + weights.trusted_well_body * well_loss
             + weights.trusted_well_derivative * well_derivative_loss
             + weights.trusted_well_seismic_shape * trusted_well_seismic_shape_loss
@@ -897,6 +976,28 @@ class BodyInversionTrainer:
         rng.shuffle(balanced_wells)
         wells = _chunks(tuple(balanced_wells), self.config.batch_size, seed=base_seed + 3)
         n_steps = max(len(masked), len(visible), len(wells))
+        fixed_budget = any(value is not None for value in (
+            self.config.finetune_unlabeled_steps, self.config.finetune_well_steps,
+        ))
+        if self.config.finetune_strategy != "mvw" or fixed_budget:
+            unlabeled = self.config.finetune_unlabeled_steps
+            if unlabeled is None:
+                unlabeled = 0 if self.config.finetune_strategy == "w_only" else len(masked)
+            well_steps = self.config.finetune_well_steps
+            if well_steps is None:
+                well_steps = len(masked) * self.config.well_batch_multiplier
+            if self.config.finetune_strategy != "w_only" and unlabeled <= 0:
+                raise ValueError("A semi-supervised finetune requires unlabeled updates.")
+            for step in range(max(unlabeled, well_steps)):
+                if step < unlabeled:
+                    use_mask = self.config.finetune_strategy == "mw" or (
+                        self.config.finetune_strategy == "mvw" and step % 2 == 0
+                    )
+                    batches = masked if use_mask else visible
+                    yield ("masked" if use_mask else "visible_center"), batches[step % len(batches)], not use_mask
+                if step < well_steps:
+                    yield "trusted_well", wells[step % len(wells)], True
+            return
         for step in range(n_steps):
             yield "masked", masked[step % len(masked)], False
             yield "visible_center", visible[step % len(visible)], True
@@ -921,6 +1022,7 @@ class BodyInversionTrainer:
             "lfm_anchor": [],
         }
         started = time.monotonic()
+        update_counts = {"n_M": 0, "n_V": 0, "n_W": 0, "optimizer_steps": 0}
         schedule: Iterable[tuple[str, tuple[Any, ...], bool]]
         if pretrain:
             schedule = (
@@ -954,6 +1056,7 @@ class BodyInversionTrainer:
                 well_items=well_items,
                 weights=self.config.loss_weights,
                 include_seismic=kind != "trusted_well",
+                seismic_scale=self.config.visible_seismic_weight if kind == "visible_center" else 1.0,
             )
             total.backward()
             for parameter_name, parameter in model.named_parameters():
@@ -962,6 +1065,8 @@ class BodyInversionTrainer:
             if self.config.gradient_clip_norm > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), self.config.gradient_clip_norm)
             optimizer.step()
+            update_counts[{"masked": "n_M", "visible_center": "n_V", "trusted_well": "n_W"}[kind]] += 1
+            update_counts["optimizer_steps"] += 1
             totals["total"].append(total.detach())
             for name, value in components.items():
                 totals[name].append(value)
@@ -976,6 +1081,11 @@ class BodyInversionTrainer:
                     _finite_mean(totals["total"], name="running_train_total"),
                     time.monotonic() - started,
                 )
+        stage = "pretrain" if pretrain else "finetune"
+        self.training_updates["epochs"].append({"stage": stage, "epoch": epoch, **update_counts})
+        for name, count in update_counts.items():
+            self.training_updates["stages"][stage][name] += count
+        write_json(self.output_dir / "training_updates.json", self.training_updates)
         return {name: _finite_mean(values, name=f"train_{name}") for name, values in totals.items()}
 
     def _trace_evaluation(
@@ -1469,11 +1579,12 @@ class BodyInversionTrainer:
                 stage="pretraining",
                 epoch=epoch,
             )
-            write_well_waveform_qc(
+            self.last_well_qc_manifest = write_well_waveform_qc(
                 self,
                 model,
                 self.output_dir / "pretraining" / "validation" / f"epoch_{epoch:03d}" / "well_waveform_qc",
                 root=self.artifact_root,
+                evaluation_support=self.evaluation_support,
             )
             self.log.info(
                 "pretraining | epoch %d complete | train_loss=%.6f | masked_corr=%.4f | well_rmse=%.5f | checkpoint=%s",
@@ -1494,7 +1605,7 @@ class BodyInversionTrainer:
         self,
         *,
         baseline: EvaluationMetrics,
-        resume_checkpoint: Path,
+        resume_checkpoint: Path | None,
     ) -> FinetuneResult:
         """Run one fixed semi-supervised finetune and select its best epoch."""
 
@@ -1502,14 +1613,17 @@ class BodyInversionTrainer:
         finetune_dir = self.output_dir / "finetuning"
         checkpoint_dir = finetune_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        payload = load_checkpoint(
-            resume_checkpoint,
-            model=model,
-            expected_network_config=self.config.network,
-            map_location=self.device,
-        )
-        if dict(payload["run_config"]) != self.config.pretrain_json_dict():
-            raise ValueError("Pretraining checkpoint model semantics differ from the current body-inversion configuration.")
+        if resume_checkpoint is not None:
+            payload = load_checkpoint(
+                resume_checkpoint,
+                model=model,
+                expected_network_config=self.config.network,
+                map_location=self.device,
+            )
+            if dict(payload["run_config"]) != self.config.pretrain_json_dict():
+                raise ValueError("Pretraining checkpoint model semantics differ from the current body-inversion configuration.")
+        elif self.config.pretrain_epochs != 0:
+            raise ValueError("A finetune without a pretraining checkpoint requires pretrain_epochs=0.")
         pretrain_metrics = self.evaluate(model)
         checkpoints: list[Path] = []
         metrics_by_epoch: dict[int, EvaluationMetrics] = {}
@@ -1551,11 +1665,12 @@ class BodyInversionTrainer:
                 stage="finetuning",
                 epoch=epoch,
             )
-            write_well_waveform_qc(
+            self.last_well_qc_manifest = write_well_waveform_qc(
                 self,
                 model,
                 self.output_dir / "finetuning" / "validation" / f"epoch_{epoch:03d}" / "well_waveform_qc",
                 root=self.artifact_root,
+                evaluation_support=self.evaluation_support,
             )
             checkpoints.append(checkpoint_path)
             metrics_by_epoch[epoch] = metrics
@@ -1581,18 +1696,8 @@ class BodyInversionTrainer:
 
         if not checkpoints:
             raise ValueError("Fine-tuning produced no evaluation checkpoint.")
-        selected_epoch = min(
-            metrics_by_epoch,
-            key=lambda epoch: (
-                (
-                    self.config.selection_weights.well_rmse
-                    * metrics_by_epoch[epoch].well_pooled_rmse
-                    / max(abs(pretrain_metrics.well_pooled_rmse), torch.finfo(torch.float32).eps)
-                    + self.config.selection_weights.amplitude_mapping
-                    * abs(metrics_by_epoch[epoch].seismic_body_amplitude_spearman)
-                ),
-                epoch,
-            ),
+        selected_epoch = select_finetune_epoch(
+            metrics_by_epoch, pretrain_metrics=pretrain_metrics, config=self.config,
         )
         selected_checkpoint = finetune_dir / "selected_checkpoint.pt"
         shutil.copyfile(checkpoints[selected_epoch - 1], selected_checkpoint)
@@ -1603,7 +1708,11 @@ class BodyInversionTrainer:
             selected_epoch=selected_epoch,
             metrics=metrics_by_epoch[selected_epoch],
             warnings=selected_warnings,
-            stop_reason="all_finetune_epochs_completed_best_quality_checkpoint",
+            stop_reason=(
+                "all_finetune_epochs_completed_well_constrained_physics_checkpoint"
+                if self.config.selection_well_rmse_tolerance is not None
+                else "all_finetune_epochs_completed_best_quality_checkpoint"
+            ),
         )
 
 
@@ -1621,4 +1730,5 @@ __all__ = [
     "evaluate_warnings",
     "load_checkpoint",
     "save_epoch_checkpoint",
+    "select_finetune_epoch",
 ]

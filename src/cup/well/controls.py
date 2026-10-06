@@ -29,6 +29,13 @@ from cup.config.artifacts import (
 )
 from cup.utils.io import repo_relative_path, resolve_relative_path, sanitize_filename, write_json
 from cup.utils.masks import true_runs as _finite_runs
+from cup.well.evaluation_support import (
+    EvaluationSupport,
+    MIN_EVALUATION_SUPPORT_SAMPLES,
+    derive_evaluation_support,
+    load_evaluation_support_manifest,
+    write_evaluation_support_manifest,
+)
 from cup.well.inventory import build_file_lookup, normalize_well_name
 from cup.well.scale import gaussian_smooth_finite_runs_numpy
 from cup.well.tie import DEPTH_WAVELET_BATCH_SCHEMA_VERSION, WELL_AUTO_TIE_SCHEMA_VERSION
@@ -968,6 +975,48 @@ def write_well_control_set(
     return summary
 
 
+def _evaluation_support_path_from_run(run_dir: Path, *, repo_root: Path, summary: Mapping[str, Any]) -> Path | None:
+    """Resolve an explicitly recorded Step-6 support manifest, if present."""
+
+    qc = summary.get("qc")
+    recorded = qc.get("evaluation_support") if isinstance(qc, Mapping) else None
+    if not recorded and isinstance(qc, Mapping):
+        outputs = qc.get("outputs")
+        recorded = outputs.get("evaluation_support") if isinstance(outputs, Mapping) else None
+    if not recorded:
+        outputs = summary.get("outputs")
+        recorded = outputs.get("evaluation_support") if isinstance(outputs, Mapping) else None
+    if recorded:
+        path = resolve_relative_path(str(recorded), root=repo_root)
+        if not path.is_file():
+            raise FileNotFoundError(f"Recorded evaluation-support manifest is missing: {path}")
+        return path
+    conventional = Path(run_dir) / "qc" / "evaluation_support.json"
+    return conventional if conventional.is_file() else None
+
+
+def load_evaluation_support_for_run(
+    run_dir: Path,
+    *,
+    sample_axis: SampleAxis,
+    repo_root: Path,
+) -> dict[str, EvaluationSupport]:
+    """Load the required canonical support from a new Step-6 run."""
+
+    summary_path = Path(run_dir) / "run_summary.json"
+    if not summary_path.is_file():
+        raise FileNotFoundError(summary_path)
+    with summary_path.open("r", encoding="utf-8") as handle:
+        summary = json.load(handle)
+    path = _evaluation_support_path_from_run(Path(run_dir), repo_root=repo_root, summary=summary)
+    if path is None:
+        raise FileNotFoundError(
+            f"Step-6 run {run_dir} has no evaluation-support manifest; "
+            "rerun Step 6 to create qc/evaluation_support.json."
+        )
+    return load_evaluation_support_manifest(path, sample_axis=sample_axis)
+
+
 def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
     """Load and semantically validate a canonical immutable Step 6 run."""
 
@@ -1144,6 +1193,10 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
             ):
                 raise ValueError(f"Well-control NPZ observed_valid_mask changed during loading: {path}")
             controls.append(control)
+    provenance = dict(summary["provenance"])
+    support_path = _evaluation_support_path_from_run(run_dir, repo_root=repo_root, summary=summary)
+    if support_path is not None:
+        provenance["evaluation_support_path"] = str(support_path)
     return WellControlSet(
         sample_axis=axis,
         controls=tuple(controls),
@@ -1151,7 +1204,7 @@ def load_well_control_set(run_dir: Path, *, repo_root: Path) -> WellControlSet:
         sample_unit=axis.unit,
         depth_basis=summary.get("depth_basis"),
         source_run_type=str(summary["source_adapter"]),
-        provenance=dict(summary["provenance"]),
+        provenance=provenance,
     )
 
 QC_SCHEMA_VERSION = "real_field_well_control_qc_v1"
@@ -1283,6 +1336,55 @@ def horizon_markers_along_control(
     if any(markers[index + 1][0] <= markers[index][0] for index in range(len(markers) - 1)):
         raise ValueError(f"{control.well_name}: target horizons are not ordered along the well path.")
     return markers
+
+
+def build_evaluation_support(
+    control: WellControl,
+    *,
+    target_interval: tuple[float, float],
+    observed_support: np.ndarray,
+    well_curve_support: np.ndarray,
+    additional_support: tuple[np.ndarray, ...] = (),
+    minimum_samples: int = MIN_EVALUATION_SUPPORT_SAMPLES,
+) -> EvaluationSupport:
+    """Build the canonical fixed support for one well.
+
+    This small adapter is also the entry point for benchmark/pseudo-well
+    producers: they provide an explicit target interval and masks, while Step
+    6 supplies the interpreted interval and finite forward masks below.
+    """
+
+    return derive_evaluation_support(
+        well_name=control.well_name,
+        sample_axis=control.sample_axis,
+        target_interval=target_interval,
+        observed_support=observed_support,
+        well_curve_support=well_curve_support,
+        additional_support=additional_support,
+        minimum_samples=minimum_samples,
+    )
+
+
+def build_target_zone_evaluation_support(
+    control: WellControl,
+    target_zone: TargetZone,
+    *,
+    observed_support: np.ndarray,
+    well_curve_support: np.ndarray,
+    additional_support: tuple[np.ndarray, ...] = (),
+    minimum_samples: int = MIN_EVALUATION_SUPPORT_SAMPLES,
+) -> EvaluationSupport:
+    """Build support from the ordered geological target-zone markers."""
+
+    markers = horizon_markers_along_control(control, target_zone)
+    return build_evaluation_support(
+        control,
+        target_interval=(float(markers[0][0]), float(markers[-1][0])),
+        observed_support=observed_support,
+        well_curve_support=well_curve_support,
+        additional_support=additional_support,
+        minimum_samples=minimum_samples,
+    )
 
 
 def _target_support_slice(
@@ -1515,6 +1617,7 @@ def write_depth_well_control_qc(
     figures_root = output_dir / "figures"
     figures_root.mkdir(parents=True, exist_ok=False)
     rows: list[dict[str, Any]] = []
+    evaluation_supports: dict[str, EvaluationSupport] = {}
     for control in control_set.controls:
         well_dir = figures_root / sanitize_filename(control.well_name)
         well_dir.mkdir()
@@ -1543,13 +1646,20 @@ def write_depth_well_control_qc(
             relation_b=relation_b,
         )
         markers = horizon_markers_along_control(control, target_zone)
-        common = (
-            control.valid_mask
-            & np.isfinite(real)
-            & np.isfinite(full_forward)
-            & np.isfinite(body_forward)
+        support = build_evaluation_support(
+            control,
+            target_interval=(float(markers[0][0]), float(markers[-1][0])),
+            observed_support=control.observed_valid_mask,
+            well_curve_support=control.valid_mask,
+            additional_support=(
+                np.isfinite(real),
+                np.isfinite(full_forward),
+                np.isfinite(body_forward),
+            ),
         )
-        selected, support_fraction = _target_support_slice(axis, common, markers)
+        evaluation_supports[control.well_name] = support
+        selected = slice(support.start_index, support.stop_index)
+        support_fraction = support.support_fraction
         local_axis = axis[selected]
         local_real = real[selected]
         real_std = float(np.std(local_real))
@@ -1636,6 +1746,14 @@ def write_depth_well_control_qc(
         rows.append(
             {
                 "well_name": control.well_name,
+                "target_interval_start": support.target_interval_start,
+                "target_interval_stop": support.target_interval_stop,
+                "evaluation_support_start": support.support_start,
+                "evaluation_support_stop": support.support_stop,
+                "evaluation_support_start_index": support.start_index,
+                "evaluation_support_stop_index": support.stop_index,
+                "evaluation_support_samples": support.support_samples,
+                "evaluation_support_candidate_samples": support.candidate_samples,
                 "target_support_fraction": support_fraction,
                 "shared_forward_gain": gain,
                 "signed_forward_gain": signed_gain,
@@ -1650,6 +1768,13 @@ def write_depth_well_control_qc(
 
     metrics_path = output_dir / "metrics.csv"
     pd.DataFrame.from_records(rows).to_csv(metrics_path, index=False)
+    support_path = output_dir / "evaluation_support.json"
+    write_evaluation_support_manifest(
+        support_path,
+        sample_axis=control_set.sample_axis,
+        supports=evaluation_supports,
+        source="real_field_well_controls_qc",
+    )
     manifest = {
         "schema_version": QC_SCHEMA_VERSION,
         "status": "ok",
@@ -1657,10 +1782,12 @@ def write_depth_well_control_qc(
         "depth_basis": "tvdss",
         "config": dict(config),
         "forward_model_inputs": repo_relative_path(forward_inputs_path, root=repo_root),
+        "evaluation_support": repo_relative_path(support_path, root=repo_root),
         "well_count": len(rows),
         "outputs": {
             "metrics_csv": repo_relative_path(metrics_path, root=repo_root),
             "figures_dir": repo_relative_path(figures_root, root=repo_root),
+            "evaluation_support": repo_relative_path(support_path, root=repo_root),
         },
     }
     write_json(output_dir / "manifest.json", manifest)
@@ -1677,10 +1804,13 @@ __all__ = [
     "NativeWellControl",
     "WellControl",
     "WellControlSet",
+    "build_evaluation_support",
+    "build_target_zone_evaluation_support",
     "build_well_control_set",
     "forward_depth_finite_runs",
     "horizon_markers_along_control",
     "load_depth_forward_inputs",
+    "load_evaluation_support_for_run",
     "load_well_control_set",
     "sample_seismic_along_control",
     "write_depth_well_control_qc",

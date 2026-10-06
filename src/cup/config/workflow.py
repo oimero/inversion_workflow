@@ -116,8 +116,8 @@ class SeismicConfig:
     def from_mapping(cls, value: Any) -> "SeismicConfig":
         config = _mapping(value, path="seismic")
         seismic_type = _required_text(config, "type", path="seismic").casefold()
-        if seismic_type not in {"zgy", "segy"}:
-            raise ValueError("seismic.type must be 'zgy' or 'segy'.")
+        if seismic_type not in {"zgy", "segy", "npz"}:
+            raise ValueError("seismic.type must be 'zgy', 'segy', or 'npz'.")
         domain = _required_text(config, "domain", path="seismic").casefold()
         if domain not in {"time", "depth"}:
             raise ValueError("seismic.domain must be 'time' or 'depth'.")

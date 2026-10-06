@@ -138,7 +138,11 @@ def build_lfm_context(
     )
 
 
-def _variant_graph(config: Mapping[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+def _variant_graph(
+    config: Mapping[str, Any],
+    *,
+    validate_methods: bool = True,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     allowed_top = {"source_runs", "output_geometry", "baselines", "modifiers", "variants", "comparisons"}
     if set(config) != allowed_top:
         raise ValueError(f"real_field_lfm must contain exactly {sorted(allowed_top)}.")
@@ -163,10 +167,10 @@ def _variant_graph(config: Mapping[str, Any]) -> tuple[dict[str, dict[str, Any]]
     if len(baselines) != len(baselines_raw) or len(modifiers) != len(modifiers_raw):
         raise ValueError("Every baseline/modifier config must be a mapping.")
     for baseline_id, baseline in baselines.items():
-        if str(baseline.get("method") or "") not in BUILDERS:
+        if validate_methods and str(baseline.get("method") or "") not in BUILDERS:
             raise ValueError(f"Unknown method for baseline {baseline_id!r}.")
     for modifier_id, modifier in modifiers.items():
-        if str(modifier.get("method") or "") not in MODIFIERS:
+        if validate_methods and str(modifier.get("method") or "") not in MODIFIERS:
             raise ValueError(f"Unknown method for modifier {modifier_id!r}.")
     variants: list[dict[str, Any]] = []
     seen_variants: set[str] = set()
@@ -333,6 +337,81 @@ def build_lfm_variants(
         if not np.array_equal(result.valid_mask_model, first.valid_mask_model):
             raise ValueError(f"Variant {variant_id!r} valid_mask_model differs from the run-wide authoritative mask.")
     return results, comparisons
+
+
+def _validate_prepared_results(
+    *,
+    config: Mapping[str, Any],
+    prepared_results: Mapping[str, LfmVariantResult],
+    context: LfmContext,
+) -> tuple[dict[str, LfmVariantResult], list[dict[str, Any]]]:
+    """Validate externally computed variants before publishing standard artifacts."""
+
+    baselines, _modifiers, variants, comparisons = _variant_graph(
+        config,
+        validate_methods=False,
+    )
+    if comparisons:
+        raise ValueError("Prebuilt LFM publication does not support comparisons.")
+    if not isinstance(prepared_results, Mapping):
+        raise TypeError("prepared_results must be a mapping of variant_id to LfmVariantResult.")
+    expected_ids = [str(item["variant_id"]) for item in variants]
+    actual_keys = list(prepared_results.keys())
+    if any(not isinstance(key, str) for key in actual_keys):
+        raise ValueError("prepared_results keys must be variant_id strings.")
+    if set(actual_keys) != set(expected_ids) or len(actual_keys) != len(expected_ids):
+        raise ValueError(
+            "prepared_results variant IDs must exactly match config.variants: "
+            f"expected={expected_ids}, got={sorted(actual_keys)}."
+        )
+
+    ordered: dict[str, LfmVariantResult] = {}
+    reference_mask: np.ndarray | None = None
+    for variant in variants:
+        variant_id = str(variant["variant_id"])
+        if variant["modifier_ids"]:
+            raise ValueError("Prebuilt LFM publication currently requires empty modifier_ids for every variant.")
+        result = prepared_results[variant_id]
+        if not isinstance(result, LfmVariantResult):
+            raise TypeError(f"prepared_results[{variant_id!r}] must be an LfmVariantResult.")
+        baseline_id = str(variant["baseline_id"])
+        if result.baseline_id != baseline_id:
+            raise ValueError(
+                f"Prepared variant {variant_id!r} baseline_id={result.baseline_id!r} "
+                f"does not match config baseline_id={baseline_id!r}."
+            )
+        if result.baseline_method != str(baselines[baseline_id].get("method") or ""):
+            raise ValueError(f"Prepared variant {variant_id!r} baseline_method differs from its baseline config.")
+        metadata = result.metadata
+        resolved_baseline = metadata.get("resolved_baseline_config")
+        if not isinstance(resolved_baseline, Mapping) or dict(resolved_baseline) != baselines[baseline_id]:
+            raise ValueError(
+                f"Prepared variant {variant_id!r} resolved_baseline_config does not match "
+                f"config.baselines[{baseline_id!r}]."
+            )
+        modifier_chain = metadata.get("modifier_chain", [])
+        if not isinstance(modifier_chain, (list, tuple)) or list(modifier_chain):
+            raise ValueError(f"Prepared variant {variant_id!r} must have an empty modifier_chain.")
+        resolved_modifiers = metadata.get("resolved_modifier_configs")
+        if not isinstance(resolved_modifiers, Mapping) or dict(resolved_modifiers):
+            raise ValueError(
+                f"Prepared variant {variant_id!r} must have empty resolved_modifier_configs."
+            )
+        if result.modifier_fields:
+            raise ValueError(f"Prepared variant {variant_id!r} must not contain modifier_fields.")
+        recorded_variant_id = metadata.get("variant_id")
+        if recorded_variant_id is not None and str(recorded_variant_id) != variant_id:
+            raise ValueError(
+                f"Prepared variant metadata variant_id={recorded_variant_id!r} does not match {variant_id!r}."
+            )
+        result.validate(context)
+        current_mask = np.asarray(result.valid_mask_model, dtype=bool)
+        if reference_mask is None:
+            reference_mask = current_mask.copy()
+        elif not np.array_equal(current_mask, reference_mask):
+            raise ValueError(f"Prepared variant {variant_id!r} valid_mask_model differs from the run-wide mask.")
+        ordered[variant_id] = result
+    return ordered, []
 
 
 def _save_array_sidecar(path: Path, fields: Mapping[str, np.ndarray]) -> None:
@@ -794,6 +873,7 @@ def run_lfm_pipeline(
     seismic_options: Mapping[str, Any],
     output_dir: Path,
     repo_root: Path,
+    prepared_results: Mapping[str, LfmVariantResult] | None = None,
 ) -> dict[str, Any]:
     if output_dir.exists():
         raise FileExistsError(output_dir)
@@ -812,7 +892,19 @@ def run_lfm_pipeline(
         }
     }
     try:
-        results, comparisons = build_lfm_variants(config=config, controls=controls, context=context, repo_root=repo_root)
+        if prepared_results is None:
+            results, comparisons = build_lfm_variants(
+                config=config,
+                controls=controls,
+                context=context,
+                repo_root=repo_root,
+            )
+        else:
+            results, comparisons = _validate_prepared_results(
+                config=config,
+                prepared_results=prepared_results,
+                context=context,
+            )
         rows = [
             _write_variant(
                 variant_id=variant_id,

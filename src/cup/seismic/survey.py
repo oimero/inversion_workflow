@@ -1,6 +1,6 @@
-"""cup.seismic.survey: SEG-Y/ZGY 地震体 Adapter。
+"""cup.seismic.survey: SEG-Y/ZGY/NPZ 地震体 Adapter。
 
-本模块提供地震体文件的统一打开入口，负责 SEG-Y/ZGY 元数据读取、
+本模块提供地震体文件的统一打开入口，负责 SEG-Y/ZGY/NPZ 元数据读取、
 采样轴构造和井旁道双线性插值提取。inline/xline 与 XY 的几何计算由
 ``cup.seismic.geometry`` 承担。
 
@@ -15,9 +15,10 @@
 1. SurveyContext: 地震体 Adapter 协议。
 2. SegySurveyContext: SEG-Y Adapter。
 3. ZgySurveyContext: ZGY Adapter。
-4. open_survey: 根据文件类型打开地震体。
-5. segy_options_from_config: 从配置段构建 SEG-Y 读取参数。
-6. import_seismic: 读取完整的三维地震数组。
+4. NpzSurveyContext: 不复制二维横向数据的显式 NPZ Adapter。
+5. open_survey: 根据文件类型打开地震体。
+6. segy_options_from_config: 从配置段构建 SEG-Y 读取参数。
+7. import_seismic: 读取完整的三维地震数组。
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ def import_seismic(
     istep: int | None = None,
     xstep: int | None = None,
 ) -> np.ndarray:
-    """Read a complete SEG-Y or ZGY volume as ``[inline, xline, sample]``."""
+    """Read a complete SEG-Y, ZGY, or NPZ volume as ``[inline, xline, sample]``."""
     seismic_type_lower = str(seismic_type).lower()
     if seismic_type_lower == "segy":
         import cigsegy
@@ -70,7 +71,11 @@ def import_seismic(
             raise ValueError(f"Only 3D ZGY volume is supported, got ndim={volume.ndim}")
         return volume
 
-    raise ValueError(f"Unsupported seismic_type: {seismic_type}. Expect 'segy' or 'zgy'.")
+    if seismic_type_lower == "npz":
+        context = NpzSurveyContext.from_file(Path(seismic_file))
+        return np.asarray(context.seismic, dtype=np.float32).copy()
+
+    raise ValueError(f"Unsupported seismic_type: {seismic_type}. Expect 'segy', 'zgy', or 'npz'.")
 
 
 class SurveyContext(Protocol):
@@ -118,6 +123,51 @@ def _domain_to_basis_type(domain: str) -> str:
     if domain_lower == "time":
         return "twt"
     return "tvdss"
+
+
+_NPZ_SURVEY_KEYS = frozenset(
+    {
+        "seismic",
+        "sample_values",
+        "sample_domain",
+        "sample_unit",
+        "depth_basis",
+        "ilines",
+        "xlines",
+        "origin_xy_m",
+        "inline_step_xy_m",
+        "xline_step_xy_m",
+    }
+)
+
+
+def _npz_scalar_text(data: Any, *, name: str, allow_empty: bool = False) -> str:
+    """Read one scalar UTF string from an NPZ field without pickle."""
+
+    value = np.asarray(data)
+    if value.ndim != 0 or value.dtype.kind not in {"U", "S"}:
+        raise ValueError(f"NPZ {name} must be a scalar string without pickle.")
+    scalar = value.item()
+    if isinstance(scalar, bytes):
+        scalar = scalar.decode("utf-8")
+    text = str(scalar).strip()
+    if not text and not allow_empty:
+        raise ValueError(f"NPZ {name} must be a non-empty string.")
+    return text
+
+
+def _regular_axis_step(axis: np.ndarray, *, name: str) -> float:
+    if axis.ndim != 1 or axis.size == 0 or np.any(~np.isfinite(axis)):
+        raise ValueError(f"NPZ {name} must be a non-empty finite one-dimensional axis.")
+    if axis.size == 1:
+        return 0.0
+    differences = np.diff(axis)
+    if np.any(differences <= 0.0):
+        raise ValueError(f"NPZ {name} must be strictly increasing.")
+    step = float(differences[0])
+    if not np.allclose(differences, step, rtol=1.0e-6, atol=max(1.0e-12, abs(step) * 1.0e-6)):
+        raise ValueError(f"NPZ {name} must be regularly sampled.")
+    return step
 
 
 def _interpolate_trace_from_4_neighbors(
@@ -541,6 +591,254 @@ class ZgySurveyContext:
         return out
 
 
+@dataclass(frozen=True)
+class NpzSurveyContext:
+    """Explicit-array survey adapter used for synthetic and 2-D inputs.
+
+    The NPZ contract stores the volume exactly as ``[inline, xline, sample]``.
+    A two-dimensional line is represented by a singleton spatial axis; no
+    traces are copied to fabricate a second direction.  The XY basis vectors
+    remain explicit so a singleton axis still has a non-degenerate coordinate
+    transform for line-position lookup.
+    """
+
+    seismic_file: Path
+    seismic: np.ndarray
+    _sample_values: np.ndarray
+    _sample_domain: str
+    _sample_unit: str
+    _depth_basis: str | None
+    line_geometry: SurveyLineGeometry
+
+    @classmethod
+    def from_file(cls, seismic_file: Path) -> "NpzSurveyContext":
+        path = Path(seismic_file)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                if set(data.files) != _NPZ_SURVEY_KEYS:
+                    missing = sorted(_NPZ_SURVEY_KEYS - set(data.files))
+                    extra = sorted(set(data.files) - _NPZ_SURVEY_KEYS)
+                    raise ValueError(
+                        f"NPZ survey keys do not match the frozen contract; missing={missing}, extra={extra}."
+                    )
+                seismic = np.asarray(data["seismic"])
+                sample_values = np.asarray(data["sample_values"])
+                sample_domain = _npz_scalar_text(data["sample_domain"], name="sample_domain").casefold()
+                sample_unit = _npz_scalar_text(data["sample_unit"], name="sample_unit").casefold()
+                depth_basis_text = _npz_scalar_text(
+                    data["depth_basis"], name="depth_basis", allow_empty=True
+                )
+                ilines = np.asarray(data["ilines"])
+                xlines = np.asarray(data["xlines"])
+                origin_xy_m = np.asarray(data["origin_xy_m"])
+                inline_step_xy_m = np.asarray(data["inline_step_xy_m"])
+                xline_step_xy_m = np.asarray(data["xline_step_xy_m"])
+        except ValueError as exc:
+            if "Object arrays cannot be loaded" in str(exc):
+                raise ValueError("NPZ survey cannot contain object arrays; pickle loading is disabled.") from exc
+            raise
+        except Exception as exc:
+            raise ValueError(f"Failed to read NPZ survey contract: {path}") from exc
+
+        if seismic.dtype != np.dtype("float32") or seismic.ndim != 3:
+            raise ValueError("NPZ seismic must be float32 with shape [inline, xline, sample].")
+        if np.any(np.isinf(seismic)):
+            raise ValueError("NPZ seismic must not contain infinite values.")
+        for name, value in (
+            ("sample_values", sample_values),
+            ("ilines", ilines),
+            ("xlines", xlines),
+            ("origin_xy_m", origin_xy_m),
+            ("inline_step_xy_m", inline_step_xy_m),
+            ("xline_step_xy_m", xline_step_xy_m),
+        ):
+            if value.dtype != np.dtype("float64"):
+                raise ValueError(f"NPZ {name} must have dtype float64.")
+        if sample_domain not in {"time", "depth"}:
+            raise ValueError("NPZ sample_domain must be 'time' or 'depth'.")
+        expected_unit = "s" if sample_domain == "time" else "m"
+        if sample_unit != expected_unit:
+            raise ValueError(
+                f"NPZ sample_unit must be {expected_unit!r} for sample_domain={sample_domain!r}."
+            )
+        if sample_domain == "time":
+            if depth_basis_text:
+                raise ValueError("NPZ time survey must have an empty depth_basis.")
+            depth_basis = None
+        else:
+            if depth_basis_text.casefold() != "tvdss":
+                raise ValueError("NPZ depth survey must have depth_basis='tvdss'.")
+            depth_basis = "tvdss"
+
+        if any(value.ndim != 1 for value in (sample_values, ilines, xlines)):
+            raise ValueError("NPZ sample_values, ilines, and xlines must be one-dimensional arrays.")
+        sample_values = np.asarray(sample_values, dtype=np.float64)
+        ilines = np.asarray(ilines, dtype=np.float64)
+        xlines = np.asarray(xlines, dtype=np.float64)
+        _regular_axis_step(sample_values, name="sample_values")
+        # A singleton line has no observed line-number difference.  Keep a
+        # positive nominal step for downstream axis/grid contracts; the real
+        # XY spacing remains exclusively in the explicit XY basis vectors.
+        inline_step = 1.0 if ilines.size == 1 else _regular_axis_step(ilines, name="ilines")
+        xline_step = 1.0 if xlines.size == 1 else _regular_axis_step(xlines, name="xlines")
+        if seismic.shape != (ilines.size, xlines.size, sample_values.size):
+            raise ValueError(
+                "NPZ seismic shape must match ilines/xlines/sample_values: "
+                f"got {seismic.shape}, expected {(ilines.size, xlines.size, sample_values.size)}."
+            )
+        for name, value in (
+            ("origin_xy_m", origin_xy_m),
+            ("inline_step_xy_m", inline_step_xy_m),
+            ("xline_step_xy_m", xline_step_xy_m),
+        ):
+            if value.shape != (2,) or np.any(~np.isfinite(value)):
+                raise ValueError(f"NPZ {name} must be a finite float64 vector of shape (2,).")
+        determinant = float(
+            inline_step_xy_m[0] * xline_step_xy_m[1]
+            - inline_step_xy_m[1] * xline_step_xy_m[0]
+        )
+        if not np.isfinite(determinant) or abs(determinant) <= 1.0e-12:
+            raise ValueError("NPZ XY basis vectors must define a non-degenerate coordinate transform.")
+
+        sample_axis = SampleAxis(
+            values=sample_values,
+            domain=sample_domain,
+            unit=sample_unit,
+            depth_basis=depth_basis,
+        )
+        geometry = SurveyLineGeometry(
+            inline_axis=LineAxis(
+                minimum=float(ilines[0]),
+                step=inline_step,
+                count=int(ilines.size),
+                name="inline",
+            ),
+            xline_axis=LineAxis(
+                minimum=float(xlines[0]),
+                step=xline_step,
+                count=int(xlines.size),
+                name="xline",
+            ),
+            x0=float(origin_xy_m[0]),
+            y0=float(origin_xy_m[1]),
+            dx_inline=float(inline_step_xy_m[0]),
+            dy_inline=float(inline_step_xy_m[1]),
+            dx_xline=float(xline_step_xy_m[0]),
+            dy_xline=float(xline_step_xy_m[1]),
+        )
+        # Store independent copies so callers cannot mutate the loaded arrays
+        # through an external view after the contract has been validated.
+        seismic = np.asarray(seismic, dtype=np.float32).copy()
+        seismic.setflags(write=False)
+        sample_values = sample_values.copy()
+        sample_values.setflags(write=False)
+        return cls(
+            seismic_file=path,
+            seismic=seismic,
+            _sample_values=sample_values,
+            _sample_domain=sample_domain,
+            _sample_unit=sample_unit,
+            _depth_basis=depth_basis,
+            line_geometry=geometry,
+        )
+
+    def sample_axis(self, domain: Optional[str] = "time") -> SampleAxis:
+        domain_value = _normalize_domain(domain)
+        if domain_value != self._sample_domain:
+            raise ValueError(
+                f"NPZ survey stores sample_domain={self._sample_domain!r}, not {domain_value!r}."
+            )
+        return SampleAxis(
+            values=self._sample_values,
+            domain=self._sample_domain,
+            unit=self._sample_unit,
+            depth_basis=self._depth_basis,
+        )
+
+    def describe_geometry(self, domain: Optional[str] = "time") -> Dict[str, Any]:
+        return self.line_geometry.describe(sample_axis=self.sample_axis(domain))
+
+    def _interpolated_trace(self, inline: float, xline: float) -> np.ndarray:
+        i, j = self.line_geometry.line_to_index(inline, xline)
+        i_floor = int(np.floor(i))
+        j_floor = int(np.floor(j))
+        i_ceil = min(i_floor + 1, self.seismic.shape[0] - 1)
+        j_ceil = min(j_floor + 1, self.seismic.shape[1] - 1)
+        wi = float(i - i_floor)
+        wj = float(j - j_floor)
+        trace00 = self.seismic[i_floor, j_floor].astype(np.float64, copy=False)
+        trace01 = self.seismic[i_floor, j_ceil].astype(np.float64, copy=False)
+        trace10 = self.seismic[i_ceil, j_floor].astype(np.float64, copy=False)
+        trace11 = self.seismic[i_ceil, j_ceil].astype(np.float64, copy=False)
+        return (
+            (1.0 - wi) * (1.0 - wj) * trace00
+            + (1.0 - wi) * wj * trace01
+            + wi * (1.0 - wj) * trace10
+            + wi * wj * trace11
+        )
+
+    def read_trace_at_xy(
+        self,
+        well_x: float,
+        well_y: float,
+        sample_start: Optional[float] = None,
+        sample_end: Optional[float] = None,
+        domain: str = "time",
+    ) -> grid.Seismic:
+        domain_value = _normalize_domain(domain)
+        i, j = self.line_geometry.coord_to_index(float(well_x), float(well_y))
+        trace = self._interpolated_trace(
+            self.line_geometry.inline_axis.line_at_index(i),
+            self.line_geometry.xline_axis.line_at_index(j),
+        )
+        sample_axis = self.sample_axis(domain_value)
+        sample_idx_start, sample_idx_end = sample_axis.window_indices(sample_start, sample_end)
+        basis_type = _domain_to_basis_type(domain_value)
+        trace_name = "Seismic Trace" if basis_type == "twt" else "Seismic Trace (Depth)"
+        return grid.Seismic(
+            values=trace[sample_idx_start:sample_idx_end],
+            basis=sample_axis.values[sample_idx_start:sample_idx_end],
+            basis_type=basis_type,
+            name=trace_name,
+        )
+
+    def trace_flat_index(self, inline_index: int, xline_index: int) -> int:
+        i = int(inline_index)
+        j = int(xline_index)
+        if not (0 <= i < self.seismic.shape[0] and 0 <= j < self.seismic.shape[1]):
+            raise ValueError(f"Trace indices are outside survey range: {(i, j)}")
+        return i * int(self.seismic.shape[1]) + j
+
+    def read_traces_at_indices(
+        self,
+        indices: list[tuple[int, int]],
+        sample_start: Optional[float] = None,
+        sample_end: Optional[float] = None,
+        domain: str = "time",
+    ) -> dict[tuple[int, int], grid.Seismic]:
+        domain_value = _normalize_domain(domain)
+        sample_axis = self.sample_axis(domain_value)
+        sample_idx_start, sample_idx_end = sample_axis.window_indices(sample_start, sample_end)
+        trace_axis = sample_axis.values[sample_idx_start:sample_idx_end]
+        basis_type = _domain_to_basis_type(domain_value)
+        trace_name = "Seismic Trace" if basis_type == "twt" else "Seismic Trace (Depth)"
+        output: dict[tuple[int, int], grid.Seismic] = {}
+        for raw_i, raw_j in indices:
+            key = (int(raw_i), int(raw_j))
+            self.trace_flat_index(*key)
+            output[key] = grid.Seismic(
+                values=self.seismic[key[0], key[1], sample_idx_start:sample_idx_end].astype(
+                    np.float64, copy=False
+                ),
+                basis=trace_axis,
+                basis_type=basis_type,
+                name=trace_name,
+            )
+        return output
+
+
 def segy_options_from_config(seismic_cfg: dict[str, Any]) -> dict[str, int]:
     """从配置段构建 SEG-Y 读取参数字典。
 
@@ -588,4 +886,8 @@ def open_survey(
         if segy_options:
             raise ValueError("segy_options is only valid when seismic_type='segy'.")
         return ZgySurveyContext.from_file(seismic_file)
-    raise ValueError(f"Unsupported seismic_type: {seismic_type}. Expect 'segy' or 'zgy'.")
+    if seismic_type_lower == "npz":
+        if segy_options:
+            raise ValueError("segy_options is not valid when seismic_type='npz'.")
+        return NpzSurveyContext.from_file(Path(seismic_file))
+    raise ValueError(f"Unsupported seismic_type: {seismic_type}. Expect 'segy', 'zgy', or 'npz'.")

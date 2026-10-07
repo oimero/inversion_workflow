@@ -132,6 +132,10 @@ class LoadedBody:
         if np.asarray(self.lfm.log_ai).ndim != 3:
             raise ValueError("Volume inference requires a three-dimensional LFM variant.")
         shape = tuple(int(value) for value in np.asarray(self.lfm.log_ai).shape)
+        # ``None`` is not a no-op index: ``array[None]`` adds an axis, so an
+        # omitted slice must become an explicit full slice before indexing.
+        inline_slice = slice(None) if inline_slice is None else inline_slice
+        xline_slice = slice(None) if xline_slice is None else xline_slice
         ilines = np.arange(shape[0], dtype=np.int64)[inline_slice]
         xlines = np.arange(shape[1], dtype=np.int64)[xline_slice]
         if ilines.size == 0 or xlines.size == 0:

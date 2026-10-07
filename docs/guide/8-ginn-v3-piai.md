@@ -25,6 +25,16 @@
 
 配置中的训练项控制更新次数、批大小、学习率和三个同时优化的损失权重。输入目录必须指向已经完成并可读取的低频模型、井控和正演输入运行。
 
+真实工区的完整支撑示例配置为 `experiments/ginn_v3/field_aligned.yaml`。
+它使用第六步的原始评价窗口，并将层位吸附到最近模型样点来定义低频模型的闭区间覆盖，
+包含吸附后的顶、底边界样点。直井的地震、低频模型和固定速度按实际井位插值采样。
+
+```powershell
+python scripts/piai_train.py `
+  --config experiments/ginn_v3/field_aligned.yaml `
+  --output-dir experiments/ginn_v3/results/field_aligned_run
+```
+
 ## 训练
 
 ```powershell

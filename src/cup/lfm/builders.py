@@ -21,6 +21,47 @@ from cup.well.controls import WellControl, WellControlSet
 _VOLUME_INLINE_BLOCK_SIZE = 8
 
 
+def _sample_cell_support(
+    samples: np.ndarray,
+    top: np.ndarray | float,
+    bottom: np.ndarray | float,
+) -> np.ndarray:
+    """Return model-cell support using the canonical nearest-sample boundaries.
+
+    ``TargetZone.to_mask`` represents a zone by rounding the top and bottom
+    horizons to sample indices and including both boundary cells.  LFM values
+    still use the continuous relative coordinate, but their model support
+    must use the same discrete convention.  Keeping the index comparisons
+    un-clipped also leaves a zone with both horizons outside the sample axis
+    unsupported; a partially overlapping zone naturally retains its edge
+    cells.
+    """
+    axis = np.asarray(samples, dtype=np.float64)
+    if axis.ndim != 1 or axis.size < 2 or np.any(~np.isfinite(axis)):
+        raise ValueError("samples must be a finite one-dimensional axis with at least two values.")
+    steps = np.diff(axis)
+    if np.any(steps <= 0.0) or not np.allclose(steps, steps[0], rtol=1e-10, atol=1e-12):
+        raise ValueError("samples must be a regular strictly increasing axis.")
+
+    top_values, bottom_values = np.broadcast_arrays(
+        np.asarray(top, dtype=np.float64), np.asarray(bottom, dtype=np.float64)
+    )
+    step = float(steps[0])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        top_index = np.round((top_values - axis[0]) / step)
+        bottom_index = np.round((bottom_values - axis[0]) / step) + 1.0
+    sample_indices = np.arange(axis.size, dtype=np.float64)
+    support = (sample_indices >= top_index[..., None]) & (sample_indices < bottom_index[..., None])
+    valid = (
+        np.isfinite(top_values)
+        & np.isfinite(bottom_values)
+        & (bottom_values > top_values)
+        & (bottom_values >= axis[0])
+        & (top_values <= axis[-1])
+    )
+    return support & valid[..., None]
+
+
 def _required_mapping(config: Mapping[str, Any], key: str, *, path: str) -> dict[str, Any]:
     value = config.get(key)
     if not isinstance(value, Mapping):
@@ -134,7 +175,7 @@ def _target_mask(context: LfmContext) -> tuple[np.ndarray, np.ndarray, np.ndarra
     else:
         u = (samples[None, None, :] - top[:, :, None]) / (bottom[:, :, None] - top[:, :, None])
         valid = trace_valid[:, :, None] & np.isfinite(u)
-    return u, valid & (u >= 0.0) & (u <= 1.0), bottom - top
+    return u, valid & _sample_cell_support(samples, top, bottom), bottom - top
 
 
 def _target_trace_mask(context: LfmContext) -> np.ndarray:
@@ -368,8 +409,7 @@ def _write_volume_zone_blocks(
             bottom_block[:, :, None] - top_block[:, :, None]
         )
         zone_valid = target_trace_valid[inline_start:inline_stop, :, None] & np.isfinite(u_grid)
-        zone_valid &= u_grid >= 0.0
-        zone_valid &= u_grid <= 1.0
+        zone_valid &= _sample_cell_support(samples, top_block, bottom_block)
 
         # Reuse the relative-coordinate buffer as the interpolation position;
         # invalid traces are assigned index zero but remain masked on write.
@@ -554,7 +594,8 @@ class ProportionalKrigingBuilder:
             samples = context.output_geometry.samples
             if context.output_geometry.is_section:
                 u_grid = (samples[None, :] - top[:, None]) / (bottom[:, None] - top[:, None])
-                zone_valid = target_trace_valid[:, None] & np.isfinite(u_grid) & (u_grid >= 0.0) & (u_grid <= 1.0)
+                zone_valid = target_trace_valid[:, None] & np.isfinite(u_grid)
+                zone_valid &= _sample_cell_support(samples, top, bottom)
                 # Invalid horizon traces remain outside the authoritative mask,
                 # but their NaN relative coordinates must never become indices.
                 position = np.where(zone_valid, np.clip(u_grid, 0.0, 1.0) * (n_slices - 1), 0.0)

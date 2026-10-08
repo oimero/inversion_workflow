@@ -737,9 +737,10 @@ def build_well_targets(
     if np.any(masks & ~np.isfinite(values)) or np.any(np.isfinite(values) & ~masks):
         raise ValueError("lfm_mask must exactly describe finite LFM support.")
     support_by_name = {str(name).casefold(): support for name, support in evaluation_supports.items()}
-    controls_by_name = {control.well_name.casefold(): control for control in controls.controls}
     targets: dict[str, WellTarget] = {}
     for control in controls.controls:
+        if str(control.wellbore_class).strip().casefold() == "deviated":
+            continue
         key, trace_weights = _control_trace_weights(control, geometry)
         support = support_by_name.get(control.well_name.casefold())
         if support is None:

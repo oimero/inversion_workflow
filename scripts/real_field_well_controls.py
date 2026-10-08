@@ -33,6 +33,7 @@ from cup.config.artifacts import is_consumable_contract_status, latest_checked_r
 from cup.utils.io import load_yaml_config, repo_relative_path, resolve_relative_path, write_json
 from cup.well.controls import (
     DEPTH_SOURCE_SCHEMA,
+    QC_SCHEMA_VERSION,
     TIME_SOURCE_SCHEMA,
     build_evaluation_support,
     build_well_control_set,
@@ -253,7 +254,7 @@ def main() -> None:
         )
         support_relative = repo_relative_path(support_path, root=REPO_ROOT)
         qc_manifest = {
-            "schema_version": "real_field_well_control_qc_v1",
+            "schema_version": QC_SCHEMA_VERSION,
             "status": "ok",
             "sample_domain": "time",
             "depth_basis": None,

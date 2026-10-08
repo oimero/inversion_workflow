@@ -105,6 +105,7 @@ def main() -> None:
         well_qc_dir,
         next(loaded.model.parameters()).device,
         wavelet_cohort="predicted_volume_trace_mean",
+        reference_wavelet_time_s=loaded.reference_wavelet_time_s,
     )
     summary: dict[str, object] = {
         "schema": "ginn_v3_piai_inference_v1",

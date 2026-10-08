@@ -95,6 +95,7 @@ class LoadedBody:
     model: PIAINetwork
     physics: AcousticPhysics
     normalization: Normalization
+    reference_wavelet_time_s: np.ndarray
     reference_wavelet_amplitude: np.ndarray
     inference_config: InferenceConfig
     output_dir: Path | None = None
@@ -322,16 +323,30 @@ def _load_reference_wavelet(
     return time_s, amplitude, relation, payload
 
 
-def _configured_wavelet_samples(section: Mapping[str, Any]) -> int:
-    network = section.get("network")
-    if network is None:
-        return 301
+def _configured_wavelet_samples(
+    section: Mapping[str, Any], reference_time_s: np.ndarray, *, sample_axis: Any,
+) -> int:
+    """Resolve a physical kernel duration; default to the selected tie window."""
+
+    network = section.get("network", {})
     if not isinstance(network, Mapping):
         raise ValueError("ginn_v3_body_inversion.network must be a mapping.")
-    value = network.get("wavelet_samples", 301)
-    if isinstance(value, bool) or int(value) != value or int(value) < 3 or int(value) % 2 == 0:
-        raise ValueError("network.wavelet_samples must be an odd integer of at least three samples.")
-    return int(value)
+    samples = network.get("wavelet_samples")
+    duration = network.get("wavelet_duration_s")
+    if samples is not None and duration is not None:
+        raise ValueError("Specify wavelet_duration_s or wavelet_samples, rather than both.")
+    if samples is not None:
+        if isinstance(samples, bool) or int(samples) != samples or int(samples) < 3 or int(samples) % 2 == 0:
+            raise ValueError("network.wavelet_samples must be an odd integer of at least three samples.")
+        return int(samples)
+    step = float(sample_axis.step) if sample_axis.domain == "time" else float(infer_wavelet_dt(reference_time_s))
+    if duration is None:
+        duration = float(reference_time_s[-1] - reference_time_s[0])
+    if isinstance(duration, bool) or not np.isfinite(float(duration)) or float(duration) < 2.0 * step:
+        raise ValueError("network.wavelet_duration_s must be finite and cover at least two sample intervals.")
+    # Round inward: the free kernel must not exceed the requested duration.
+    half_samples = int(np.floor(float(duration) / (2.0 * step) + 1e-9))
+    return 2 * half_samples + 1
 
 
 def _canonical_wavelet(
@@ -341,7 +356,7 @@ def _canonical_wavelet(
     sample_axis: Any,
     wavelet_samples: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build the learned-wavelet axis and resample only the QC reference."""
+    """Build the learned axis while retaining the complete independent QC reference."""
 
     if getattr(sample_axis, "domain", None) == "time":
         step = float(sample_axis.step)
@@ -349,19 +364,7 @@ def _canonical_wavelet(
         step = float(infer_wavelet_dt(reference_time_s))
     center = int(wavelet_samples) // 2
     learned_time = (np.arange(int(wavelet_samples), dtype=np.float64) - center) * step
-    if learned_time[0] > reference_time_s[0] + 1e-12 or learned_time[-1] < reference_time_s[-1] - 1e-12:
-        raise ValueError("Configured wavelet window is shorter than the selected reference wavelet.")
-    # Values outside the selected reference support are only zero padding.  No
-    # amplitude normalization, clipping, or learned-wavelet initialization is
-    # performed here.
-    reference_on_axis = np.interp(
-        learned_time,
-        reference_time_s,
-        reference_amplitude,
-        left=0.0,
-        right=0.0,
-    )
-    return learned_time, reference_on_axis
+    return learned_time, reference_amplitude.copy()
 
 
 def _build_velocity(
@@ -415,6 +418,7 @@ def _normalization_from(value: Any) -> Normalization:
 def _network_config(section: Mapping[str, Any], *, sample_count: int, wavelet_samples: int) -> NetworkConfig:
     value = section.get("network")
     payload = dict(value or {}) if isinstance(value, Mapping) else {}
+    payload.pop("wavelet_duration_s", None)
     for key, expected in (("sample_count", sample_count), ("wavelet_samples", wavelet_samples)):
         if key in payload and int(payload[key]) != expected:
             raise ValueError(f"network.{key} must match the supplied data axis ({expected}).")
@@ -454,7 +458,6 @@ def _resolve_runtime(
     normalization: Normalization | None = None,
     expected_axis: Any | None = None,
     expected_wavelet_samples: int | None = None,
-    wavelet_samples: int | None = None,
 ) -> _Runtime:
     section = _section(raw)
     workflow = WorkflowConfig.from_mapping(raw)
@@ -502,7 +505,11 @@ def _resolve_runtime(
         depth_basis=workflow.seismic.depth_basis,
         sample_axis=sample_axis,
     )
-    selected_wavelet_samples = int(wavelet_samples or expected_wavelet_samples or _configured_wavelet_samples(section))
+    selected_wavelet_samples = _configured_wavelet_samples(
+        section, reference_wavelet_time_s, sample_axis=sample_axis,
+    )
+    if expected_wavelet_samples is not None and selected_wavelet_samples != expected_wavelet_samples:
+        raise ValueError("Configured learned wavelet window differs from the checkpoint.")
     wavelet_time_s, reference_wavelet_amplitude = _canonical_wavelet(
         reference_wavelet_time_s,
         reference_wavelet_amplitude_raw,
@@ -589,9 +596,8 @@ def _checkpoint_context(runtime: _Runtime, *, config_path: Path) -> dict[str, An
             "values": _axis_values(runtime.sample_axis).tolist(),
         },
         "wavelet_reference": {
-            "source_time_s": runtime.reference_wavelet_time_s.tolist(),
-            "time_s": runtime.wavelet_time_s.tolist(),
-            "amplitude_normalized": runtime.reference_wavelet_amplitude.tolist(),
+            "time_s": runtime.reference_wavelet_time_s.tolist(),
+            "amplitude_raw": runtime.reference_wavelet_amplitude.tolist(),
         },
         "velocity_source": runtime.velocity_source,
     }
@@ -633,7 +639,6 @@ def train_body(
         raw,
         overrides=overrides,
         training_config=training_config,
-        wavelet_samples=_configured_wavelet_samples(section),
     )
     network_config = _network_config(
         section,
@@ -658,7 +663,8 @@ def train_body(
             "normalization": asdict(runtime.normalization),
             "trusted_well_names": list(runtime.trusted_well_names),
             "source_reference_wavelet_time_s": runtime.reference_wavelet_time_s.tolist(),
-            "reference_wavelet_time_s": runtime.wavelet_time_s.tolist(),
+            "learned_wavelet_time_s": runtime.wavelet_time_s.tolist(),
+            "reference_wavelet_time_s": runtime.reference_wavelet_time_s.tolist(),
             "reference_wavelet_amplitude": runtime.reference_wavelet_amplitude.tolist(),
         },
     )
@@ -673,6 +679,7 @@ def train_body(
         runtime.reference_wavelet_amplitude,
         output / "well_qc",
         training_config.device,
+        reference_wavelet_time_s=runtime.reference_wavelet_time_s,
     )
     write_json(output / "well_qc" / "metrics.json", qc_metrics)
     return result
@@ -758,7 +765,6 @@ def load_body(
         normalization=normalization,
         expected_axis=checkpoint_axis,
         expected_wavelet_samples=model.config.wavelet_samples,
-        wavelet_samples=model.config.wavelet_samples,
     )
     if model.config.sample_count != _axis_values(runtime.sample_axis).size:
         raise ValueError("Checkpoint model sample_count differs from the seismic SampleAxis.")
@@ -778,6 +784,7 @@ def load_body(
         model=model,
         physics=runtime.physics,
         normalization=runtime.normalization,
+        reference_wavelet_time_s=runtime.reference_wavelet_time_s,
         reference_wavelet_amplitude=runtime.reference_wavelet_amplitude,
         inference_config=inference_config,
     )

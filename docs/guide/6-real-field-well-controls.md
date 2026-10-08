@@ -1,6 +1,6 @@
 # 06 真实工区井控数据集
 
-`real_field_well_controls.py` 是工作流的第六步。本文按时间域工区说明：脚本读取第四步滤波后的测井曲线，将其对齐到地震时间轴，同时保留原生测井样点及其对应的双程旅行时坐标。
+`real_field_well_controls.py` 是工作流的第六步。本文按时间域工区说明：脚本直接沿用第四步井震标定为每口井选出的滤波参数和曲线，将已标定的滤波曲线对齐到地震时间轴，同时保留原生测井样点及其对应的双程旅行时坐标。
 
 ---
 
@@ -21,8 +21,8 @@ python scripts/real_field_well_controls.py --output-dir <output_dir>
 | 来源 | 文件 | 用途 |
 |------|------|------|
 | 来源运行 | `run_summary.json` | schema/domain 校验和直接上游契约身份 |
-| 时间域第四步 | `well_tie_metrics.csv` | 成功井清单、滤波后的 LAS 和优化 TDT 路径 |
-| 时间域第四步 | 每井滤波后的 LAS | 原生 `AI [m/s*g/cm3]` 曲线 |
+| 时间域第四步 | `well_tie_metrics.csv` | 成功井清单、每井已标定滤波后的 LAS 和优化 TDT 路径 |
+| 时间域第四步 | 每井已标定滤波后的 LAS | 原生 `AI [m/s*g/cm3]` 曲线 |
 | 时间域第四步 | 每井优化 TDT | MD→TWT 映射 |
 | 时间域第四步 | 每井 trace sample plan | 斜井逐样点 inline/xline/XY（仅斜井） |
 | 第一步 | `well_inventory.csv` | 井口坐标、KB 高程、井型 |
@@ -72,7 +72,7 @@ real_field_well_controls:
 ## 脚本在做什么
 
 1. **确定来源与井清单。** 检查第四步运行的数据格式、时间域和成功状态，按规范化井名与井资产盘点结果匹配。缺少盘点记录的井进入失败记录。
-2. **转换测井坐标。** 读取滤波后的声阻抗并取自然对数，使用优化时深关系把原生测深样点映射为双程旅行时，保留原生曲线与有效性信息。
+2. **转换测井坐标。** 读取每井已标定滤波后的声阻抗并取自然对数，使用优化时深关系把原生测深样点映射为双程旅行时，保留原生曲线与有效性信息。
 3. **对齐到地震时间轴。** 在原生曲线的连续有效段内插值到地震时间样点。超出覆盖范围和曲线缺口的位置保持无效。
 4. **确定逐样点位置。** 直井使用固定井口坐标；斜井将优化轨迹采样计划中的位置插值到地震时间轴，仅使用计划中位于工区内的连续有效段。
 5. **建立有效性掩码。** 分别记录原生曲线和时间轴曲线的有效性。时间轴上的观测支撑来自上游有效曲线段，最终有效样点还要求阻抗值和空间位置均为有限值。
@@ -86,6 +86,9 @@ real_field_well_controls:
 real_field_well_controls_<run_timestamp>/
 ├── run_summary.json
 ├── well_control_manifest.csv
+├── qc/
+│   ├── manifest.json
+│   └── evaluation_support.json
 ├── wells/
 │   ├── <well_name_a>.npz
 │   └── <well_name_b>.npz
@@ -108,9 +111,11 @@ real_field_well_controls_<run_timestamp>/
 | `n_native_samples` / `n_valid_native_samples` | 滤波曲线原生采样总样点数 / 有效样点数 |
 | `well_npz_path` | NPZ 路径（失败时为空） |
 
-`run_summary.json` 使用 `real_field_well_controls_v7`，记录原生曲线来源和缺口处理方式，并保存直接上游与产物路径。
+`run_summary.json` 使用 `real_field_well_controls_v7`，记录原生已标定滤波曲线来源和缺口处理方式，并保存第六步固定评价支撑、直接上游与产物路径。
 
-第七步和[第八步主体反演](8-ginn-v2-body-inversion.md)读取这一版本的逐井文件。生成井控后，将下游配置中的井控目录指向本次输出，并基于这份井控生成相应的低频模型。
+`qc/evaluation_support.json` 固定每口井用于后续井标签和波形质检的共同有效区间；它由目标层位、已标定滤波曲线、地震样点和空间位置共同确定。
+
+第七步和[第八步 GINN v3 PIAI 反演](8-ginn-v3-piai.md)读取这一版本的逐井文件。生成井控后，将下游配置中的井控目录指向本次输出，并基于这份井控生成相应的低频模型。
 
 ### `wells/<well_name>.npz`
 

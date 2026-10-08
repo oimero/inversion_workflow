@@ -41,7 +41,8 @@ def write_wavelet_csv(path: Path, time_s: np.ndarray, amplitude_normalized: np.n
 
 def write_well_qc(model, data, physics, mean_wavelet_normalized,
                   reference_wavelet_amplitude, output_dir, device, *,
-                  wavelet_cohort: str = "saved_training_trace_mean") -> dict[str, Any]:
+                  wavelet_cohort: str = "saved_training_trace_mean",
+                  reference_wavelet_time_s: np.ndarray | None = None) -> dict[str, Any]:
     """Score all evaluation wells; use a single global learned wavelet for every well."""
     import matplotlib
     matplotlib.use("Agg")
@@ -53,6 +54,10 @@ def write_well_qc(model, data, physics, mean_wavelet_normalized,
     model.to(resolved_device).eval()
     mean = torch.as_tensor(mean_wavelet_normalized, dtype=torch.float32, device=resolved_device)
     reference = torch.as_tensor(reference_wavelet_amplitude, dtype=torch.float32, device=resolved_device)
+    from ginn_v3.physics import AcousticPhysics
+    reference_physics = physics if reference_wavelet_time_s is None else AcousticPhysics(
+        data.reader.sample_axis, reference_wavelet_time_s,
+    )
     axis = data.reader.sample_axis
     norm = data.reader.normalization
     write_wavelet_csv(output / "learned_wavelet.csv", physics.wavelet_time_s,
@@ -65,7 +70,7 @@ def write_well_qc(model, data, physics, mean_wavelet_normalized,
             obs = batch.observations
             prediction = model(obs.features, obs.initial_log_ai)
             learned = physics.forward(prediction.log_ai, obs, mean)
-            fixed = physics.forward(prediction.log_ai, obs, reference)
+            fixed = reference_physics.forward(prediction.log_ai, obs, reference)
         support = np.asarray(well.evaluation_mask, dtype=bool)
         if support.shape != axis.values.shape or np.count_nonzero(support) < 8:
             raise ValueError(f"{well.well_name}: Step-6 evaluation support is invalid.")

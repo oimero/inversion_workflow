@@ -84,6 +84,8 @@ seismic:
 
 5. **裁剪、归一化与评价。** 以零时刻为中心裁取目标长度的奇数样点子波，使振幅平方和为一。用裁剪子波重新生成合成记录，拟合展示用振幅尺度，计算相关系数和归一化绝对误差。输出时深关系、收敛过程、波形对比和子波频谱图。
 
+标定摘要保存每口井最终选出的去尖峰、平滑和 Gaussian 参数。这里的 Gaussian 参数属于 Wtie 标定滤波本身；第五步沿用每口井的最优滤波结果，并把对应的滤波曲线交给第六步。
+
 ### 核心输出文件
 
 | 文件 | 内容 |
@@ -173,7 +175,7 @@ wavelet_batch_synthetic_depth:
 
 ## 旁路：深度域正演输入冻结
 
-这一步将岩石物理分析的声阻抗—纵波速度关系与第四步的固定子波组装为统一正演输入，供井控质检、深度域合成基准和主体反演读取。
+这一步将岩石物理分析的声阻抗—纵波速度关系与第四步的固定子波组装为统一正演输入，供井控质检、深度域合成基准和 PIAI 反演读取。
 
 岩石物理分析和子波提取各自独立重跑，本旁路只在子波或关系发生变化时才需要重跑，避免更新子波时必须重跑整个岩石物理拟合。
 
@@ -240,33 +242,29 @@ real_field_well_controls:
 
 real_field_well_controls_qc:
   forward_model_inputs_run_dir: "<forward-input-run-dir>"
-  body_smoothing_fwhm_m: 25.0
   dynamic_correlation_window_m: 75.0
-  event_threshold_fraction: 0.10
-  max_event_windows_per_well: 4
 ```
 
-源目录留空时，脚本按批量深度平移的运行前缀查找产物。正演输入目录留空时，脚本查找与本次深度口径一致的正演输入。质检配置中的四个数值参数均需填写。
+源目录留空时，脚本按批量深度平移的运行前缀查找产物。正演输入目录留空时，脚本查找与本次深度口径一致的正演输入。质检配置中的动态相关窗口需填写正数。
 
 ### 脚本在做什么
 
 1. **读取成功井的滤波曲线。** 根据第五步汇总表选择成功井，读取平移后的滤波声阻抗，并保留原生测井轴上的曲线与有效性信息。
 2. **转换井深与位置。** 直井采用补心高程换算垂深并使用井口位置；斜井沿轨迹将测深转换为海平面以下垂深和平面位置。
 3. **对齐到地震深度轴。** 在连续有效曲线段内插值到地震的规则深度样点，保存每个样点的井位置和有效性，写出逐井数据与汇总清单。
-4. **比较两种阻抗的正演结果。** 在目标层段内，分别对滤波后的完整阻抗曲线和经高斯平滑的主体曲线做深度正演。两套合成地震共用由完整曲线拟合得到的振幅增益，计算整体与局部波形相似度。
-5. **比较地震事件窗口。** 从真实地震中选择振幅满足阈值的事件，截取局部窗口，展示两种阻抗、两者之差及对应合成地震，输出逐井图片和指标。
+4. **执行单套正演质检。** 在目标层段内，直接对第五步输出的每口井已标定滤波阻抗做深度正演，使用统一正演输入和固定第六步评价支撑，计算整体与局部波形相似度。
+5. **写出固定评价支撑。** 将目标层位、原生曲线、模型轴曲线、真实地震和单套正演的共同有限区间写入评价支撑清单，供后续井标签和波形质检使用。
 
 ### 质检输出
 
 | 文件 | 内容 |
 |---|---|
-| `qc/figures/<well>/full_waveform_qc.png` | 滤波后完整阻抗曲线的正演对比 |
-| `qc/figures/<well>/body_waveform_qc.png` | 平滑主体曲线的正演对比 |
-| `qc/figures/<well>/event_waveform_comparison.png` | 地震事件窗口中的阻抗与波形对比 |
-| `qc/metrics.csv` | 每井相关系数、共用增益和事件窗口数量 |
+| `qc/figures/<well>/full_waveform_qc.png` | 已标定滤波阻抗的单套正演对比 |
+| `qc/metrics.csv` | 每井固定评价支撑、共享增益和正演相关系数 |
+| `qc/evaluation_support.json` | 每井固定评价支撑的轴区间和样点索引 |
 | `qc/manifest.json` | 质检参数、来源和图件路径 |
 
-井控清单和逐井数组的通用结构见[第六步主教程](6-real-field-well-controls.md)。深度域中，`samples` 表示地震的海平面以下垂深样点，`native_coordinates` 表示原生测井样点转换后的海平面以下垂深，两者单位均为米。这里的完整曲线与主体曲线都以第五步的滤波测井为输入。
+井控清单和逐井数组的通用结构见[第六步主教程](6-real-field-well-controls.md)。深度域中，`samples` 表示地震的海平面以下垂深样点，`native_coordinates` 表示原生测井样点转换后的海平面以下垂深，两者单位均为米。模型轴曲线和原生曲线都来自第五步每口井的已标定滤波测井；第六步同时写出固定评价支撑，供后续 PIAI 和质检读取。
 
 ## 第 7 步：深度域低频模型
 
@@ -319,65 +317,59 @@ real_field_lfm:
 
 ---
 
-## 第 8 步：深度域主体反演
+## 第 8 步：深度域 GINN v3 PIAI 反演
 
-第八步读取第六步深度域井控、第七步低频模型与统一正演输入，依次进行地震自监督预训练和可信井约束微调。训练阶段、主体分解、模型选择与产物说明见[第八步主教程](8-ginn-v2-body-inversion.md)。
+第八步使用独立的 GINN v3 PIAI 网络，读取第六步深度域井控、第七步低频模型和统一正演输入。网络在每条道上联合学习对数阻抗修正与自由子波，最终对数阻抗由低频模型和网络修正组成；第六步固定评价支撑用于井标签和波形质检。完整说明见[第八步 PIAI 主教程](8-ginn-v3-piai.md)。
 
 ```powershell
-python scripts/body_train.py --config "<body-config-yaml>" --output-dir "<training-output-dir>"
+python scripts/piai_train.py --config "<piai-config-yaml>" --output-dir "<training-output-dir>"
 ```
 
-训练入口可用 `--lfm-run-dir`、`--variant-id`、`--well-control-run-dir` 和 `--forward-model-inputs-run-dir` 覆盖对应配置；分阶段微调还需要 `--pretrain-checkpoint`。
+训练入口可用 `--lfm-run-dir`、`--variant-id`、`--well-control-run-dir`、`--forward-model-inputs-run-dir`、`--trusted-well-name`、`--updates` 和 `--device` 覆盖对应配置。
 
 在第八步配置中，将上游输入指向本次深度域成果：
 
 ```yaml
-ginn_v2_body_inversion:
+ginn_v3_body_inversion:
   inputs:
     lfm_run_dir: "<lfm-run-dir>"
     variant_id: "<lfm-variant-id>"
     well_control_run_dir: "<well-control-run-dir>"
     forward_model_inputs_run_dir: "<forward-input-run-dir>"
+  trusted_well_names:
+    - "<trusted-well-a>"
+    - "<trusted-well-b>"
+  network:
+    wavelet_duration_s: <reference-wavelet-duration-s>  # 与 wavelet_samples 二选一
   training:
-    trusted_well_names:
-      - "<trusted-well-a>"
-      - "<trusted-well-b>"
-    body_smoothing_fwhm_m: <body-smoothing-fwhm-m>
-    waveform_qc_dynamic_window_m: <waveform-qc-dynamic-window-m>
-    patch_radius: 8
-    orientations: [inline, xline]
+    updates: 1000
+    labeled_batch_size: 6
+    unlabeled_batch_size: 32
+    learning_rate: 0.004
+    weight_decay: 0.01
     validation_gap_m: <validation-gap-m>
+    min_support_samples: 8
     loss_weights:
-      seismic_shape: 1.0
-      trusted_well_body: 1.0
-      trusted_well_derivative: 0.5
-      lfm_anchor: 1.0
-    selection_weights:
-      well_rmse: 1.0
-      amplitude_mapping: 0.0
-    warnings:
-      pretrain_masked_corr_improvement: 0.01
-      pretrain_masked_shape_ratio: 0.99
-      masked_corr_drop_tolerance: 0.01
-      well_pooled_rmse_ratio_max: 1.0
-      seismic_body_amplitude_spearman_max: 1.0
+      independent: 1.0
+      physics: 1.0
+      cross: 1.0
 ```
 
-训练配置与这些输入放在同一个配置文件中，公共工区配置使用深度域与海平面以下垂深口径。统一正演输入沿用本篇旁路生成的子波与声阻抗—纵波速度关系，速度可由该关系和初始阻抗计算。
+训练配置与这些输入放在同一个配置文件中，公共工区配置使用深度域与海平面以下垂深口径。统一正演输入沿用本篇旁路生成的子波与声阻抗—纵波速度关系，速度可由该关系和初始阻抗计算。深度 PIAI 的正演子波时间轴以秒表示，地震采样轴和井控轴仍以米表示。
 
 | 配置 | 深度域语义 |
 |------|------------|
-| `body_smoothing_fwhm_m` | 主体高斯平滑半高全宽，沿 TVDSS 深度轴计算，单位为米且必须为正 |
-| `waveform_qc_dynamic_window_m` | 局部波形统计窗口，沿 TVDSS 深度轴计算，单位为米且必须为正 |
 | `forward_model_inputs_run_dir` | 本篇旁路生成的正演输入目录，包含固定子波和 AI–Vp 关系 |
+| 学习子波窗口 | 二选一填写总物理时长或奇数样点数；总时长按采样间隔向内取整为奇数点。学习窗口可以短于参考子波，参考子波 QC 保留完整原始时间轴 |
 | `validation_gap_m` | 平面空间验证块与训练区之间的米制间隔 |
+| `min_support_samples` | 参与训练和评价的最小连续支撑样点数 |
 
-主体平滑直接使用地震深度轴的米制坐标。第七步变体的 `filter.enabled` 为真时，主体输出仍执行其截止波长定义的低频修正投影；只有在该开关为假且 `loss_weights.lfm_anchor` 为零时，主体输出才只使用高斯平滑。井控、低频模型和地震的深度轴、线网及空间几何需要一致。深度轴上的损失和局部统计使用当前米制坐标，平面验证间隔也以米表示。微调完成后生成所选权重、井曲线和局部剖面质检，全体积预测另行执行。
+PIAI 直接在低频模型上学习阻抗修正，并与固定正演输入联合计算独立、物理和跨井子波损失。井控、低频模型和地震的深度轴、线网及空间几何需要一致；深度轴上的损失和局部统计使用当前米制坐标，平面验证间隔也以米表示。训练完成后生成检查点、学习子波、井曲线质检和全体积推理所需的输入摘要。
 
 ---
 
 ## 与时间域工作流的关系
 
-前三步为两种域共享的井数据准备。时间域第四、第五步依次完成全井标定和共识子波生成；深度域第四、第五步依次完成固定子波提取和批量深度平移。两条路径的滤波测井成果分别进入第六步井控集，再用于第七步真实工区低频模型和第八步主体反演。
+前三步为两种域共享的井数据准备。时间域第四、第五步依次完成全井标定和共识子波生成；深度域第四、第五步依次完成固定子波提取和批量深度平移。两条路径的滤波测井成果分别进入第六步井控集，再用于第七步真实工区低频模型和第八步 PIAI 反演。
 
-岩石物理分析从第三步测井出发，与深度域第四步的固定子波共同组成正演输入。深度域第六步质检、合成基准与主体反演共享这份输入。
+岩石物理分析从第三步测井出发，与深度域第四步的固定子波共同组成正演输入。深度域第六步质检、合成基准与 PIAI 反演共享这份输入。

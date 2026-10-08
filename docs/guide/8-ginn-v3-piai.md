@@ -21,26 +21,26 @@
 
 ## 配置
 
-复制并修改配置文件中的输入运行目录、变体名称和可信井名称。网络的样本长度从输入地震轴读取；子波样本数默认使用三百零一个点，可以按原始实验窗口修改为其他奇数。时间域的子波采样间隔必须等于地震采样间隔，深度域使用参考子波的时间间隔建立固定正演时间轴。外部参考子波只用于时间轴和质量检查，网络不会以它初始化或归一化自由子波。
+复制并修改配置文件中的输入运行目录、变体名称和可信井名称。学习子波窗口可以按总物理时长或奇数样点数确定；当前 Xihu 配置使用 0.200 秒的学习子波总时长，时间采样间隔为 0.002 秒，对应 101 个奇数样点。
+
+```yaml
+network:
+  wavelet_duration_s: 0.200
+  # wavelet_samples: 101  # 与 wavelet_duration_s 二选一
+```
+
+深度域使用参考子波的时间间隔建立固定正演时间轴。参考子波始终保留完整原始时间轴，独立用于正演质量检查；学习子波窗口按配置的物理时长或样点数建立。网络不会以参考子波初始化或归一化学习子波。
 
 配置中的训练项控制更新次数、批大小、学习率和三个同时优化的损失权重。输入目录必须指向已经完成并可读取的低频模型、井控和正演输入运行。
 
-真实工区的完整支撑示例配置为 `experiments/ginn_v3/field_aligned.yaml`。
-它使用第六步的原始评价窗口，并将层位吸附到最近模型样点来定义低频模型的闭区间覆盖，
-包含吸附后的顶、底边界样点。直井的地震、低频模型和固定速度按实际井位插值采样。
-
-```powershell
-python scripts/piai_train.py `
-  --config experiments/ginn_v3/field_aligned.yaml `
-  --output-dir experiments/ginn_v3/results/field_aligned_run
-```
+当前 Xihu 工区使用 `experiments/ginn_v3/ginn_v3.yaml`，包含 8 口直井。第六步和第七步的配置文件分别位于 `experiments/ginn_v3/field_inputs_20261007/step6.yaml` 和 `experiments/ginn_v3/field_inputs_20261007/step7.yaml`；主配置引用对应的井控与低频模型运行目录。
 
 ## 训练
 
 ```powershell
 python scripts/piai_train.py `
   --config experiments/ginn_v3/ginn_v3.yaml `
-  --output-dir scripts/output/ginn_v3_piai_run
+  --output-dir scripts/output/xihu_ginn_v3_piai_run
 ```
 
 更新次数或计算设备可以通过命令行覆盖：
@@ -55,15 +55,14 @@ python scripts/piai_train.py `
 训练目录包含最后一次更新的检查点、训练历史和输入合同。检查点保存网络配置、采样轴、冻结的归一化量、学习子波的平均值以及参考输入信息。
 
 井上质量检查使用第六步保存的完整评价支撑段，并同时报告参考子波与学习子波的正演相关性。
-时间域公开数据示例配置位于 `experiments/ginn_v3/marmousi2_postm.yaml`。
 
 ## 体推理
 
 ```powershell
 python scripts/piai_infer.py `
   --config experiments/ginn_v3/ginn_v3.yaml `
-  --checkpoint scripts/output/ginn_v3_piai_run `
-  --output-dir scripts/output/ginn_v3_piai_infer
+  --checkpoint scripts/output/xihu_ginn_v3_piai_run `
+  --output-dir scripts/output/xihu_ginn_v3_piai_infer
 ```
 
 推理以批次读取单条道，并把结果写入连续的 `npy` 映射文件。输出包含对数阻抗、有效样本掩码和全体有效道的平均学习子波。无低频支持的道保持为缺失值，不进行邻近填充。加入 `--smoke-tile-size` 可以只处理工区中央的小方块；加入 `--skip-segy-export` 可以只保存 `npy` 结果。
@@ -71,7 +70,7 @@ python scripts/piai_infer.py `
 ```powershell
 python scripts/piai_infer.py `
   --config experiments/ginn_v3/ginn_v3.yaml `
-  --checkpoint scripts/output/ginn_v3_piai_run `
+  --checkpoint scripts/output/xihu_ginn_v3_piai_run `
   --smoke-tile-size 16 `
   --skip-segy-export
 ```

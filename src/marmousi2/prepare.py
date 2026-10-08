@@ -2,33 +2,20 @@
 
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
-import torch
 import yaml
 
-from cup.config.workflow import WorkflowConfig
-from cup.lfm.artifacts import load_lfm_input
-from cup.lfm.math import parse_lowpass_spec
 from cup.physics.numpy_backend import forward_time
 from cup.seismic.geometry import SampleAxis
-from cup.seismic.survey import open_survey
 from cup.seismic.wavelet import wavelet_l2_normalize
 from cup.utils.io import repo_relative_path, write_json
 from cup.well.controls import (
     MANIFEST_COLUMNS, NativeWellControl, WellControl, WellControlSet,
-    load_well_control_set, write_well_control_set,
+    write_well_control_set,
 )
 from cup.well.evaluation_support import derive_evaluation_support, write_evaluation_support_manifest
-from ginn_v2.data import (
-    PatchReader, SurveyTraceSource, candidate_patch_keys, fit_lfm_normalization, seismic_profile_support,
-)
-from ginn_v2.model import CenterTraceBodyNet
-from ginn_v2.train import BodyInversionConfig, BodyInversionTrainer, build_body_inversion_data
-from ginn_v2.workflow import _load_domain_forward_inputs, load_config
-from ginn_v2.physics import TimeDomainAdapter
 from marmousi2.raw import read_marmousi_models, resample_models_to_time
 from marmousi2.seismic import read_processed_time_segy, resample_processed_seismic, estimate_training_wavelet
 from wtie.processing import grid
@@ -53,12 +40,6 @@ class PrepareSettings:
     wavelet_duration_s: float = 0.16
     wavelet_ridge_fraction: float = 0.01
     wavelet_method: str = "workflow"
-    # PostM is the production-like default.  Keep the body-scale Gaussian
-    # explicit in the benchmark configuration so the benchmark exercises the
-    # same smooth-body semantics as the main workflow.
-    body_smoothing_fwhm_s: float = 0.01
-    waveform_qc_dynamic_window_s: float = 0.06
-    seismic_support_relative_threshold: float = 0.25
 
     def __post_init__(self):
         if not np.isfinite(self.dt_s) or self.dt_s <= 0:
@@ -72,12 +53,6 @@ class PrepareSettings:
             raise ValueError("LFM cutoff must be positive and below Nyquist.")
         if not 0 < self.wavelet_frequency_hz < 0.5 / self.dt_s:
             raise ValueError("Wavelet frequency must be positive and below Nyquist.")
-        if not np.isfinite(self.body_smoothing_fwhm_s) or self.body_smoothing_fwhm_s <= 0:
-            raise ValueError("body_smoothing_fwhm_s must be finite and positive.")
-        if not np.isfinite(self.waveform_qc_dynamic_window_s) or self.waveform_qc_dynamic_window_s <= 0:
-            raise ValueError("waveform_qc_dynamic_window_s must be finite and positive.")
-        if not 0 < self.seismic_support_relative_threshold <= 1:
-            raise ValueError("seismic_support_relative_threshold must lie in (0, 1].")
         if not np.isfinite(self.target_top_s) or self.target_top_s < 0:
             raise ValueError("target_top_s must be finite and non-negative.")
         if not np.isfinite(self.target_bottom_buffer_s) or self.target_bottom_buffer_s < 0:
@@ -202,25 +177,14 @@ def prepare_marmousi2(vp_path: Path, density_path: Path, output_dir: Path, *, re
     # Full labels and held-out wells are never referenced by training config.
     np.savez_compressed(output_dir / "evaluation" / "truth.npz", log_ai=truth.astype(np.float32), x_m=models.x_m, twt_s=time_model.twt_s)
     pd.DataFrame(roles).to_csv(output_dir / "evaluation" / "well_roles.csv", index=False)
-    # Keep both target semantics available to the evaluator: the original
-    # fixed model curve and the body target after the configured physical
-    # smoothing.  They are deliberately separate from the full truth file.
-    from ginn_v2.model import BodySmoother
+    # Keep original training pseudo-well curves as offline evaluation targets.
     training_roles = [role for role in roles if role["role"] == "train"]
     training_indices = np.asarray([role["profile_index"] for role in training_roles], dtype=int)
-    smoother = BodySmoother(settings.body_smoothing_fwhm_s)
-    support = np.ones(nt, dtype=bool)
-    body_targets = np.stack([
-        smoother.smooth_numpy(truth[index], time_model.twt_s, support)
-        for index in training_indices
-    ])
     np.savez_compressed(
         output_dir / "evaluation" / "well_targets.npz",
         profile_index=training_indices.astype(np.int64),
         fixed_log_ai=truth[training_indices].astype(np.float32),
-        body_log_ai=body_targets.astype(np.float32),
         twt_s=time_model.twt_s.astype(np.float64),
-        body_smoothing_fwhm_s=np.asarray(settings.body_smoothing_fwhm_s, dtype=np.float64),
     )
     spacing = float(models.x_m[1] - models.x_m[0])
     np.savez_compressed(
@@ -272,24 +236,46 @@ def prepare_marmousi2(vp_path: Path, density_path: Path, output_dir: Path, *, re
         "seismic": {"file": "seismic.npz", "type": "npz", "domain": "time"},
         "well_curves": {"required_categories": ["AI"], "selected_categories": ["AI", "VP", "RHOB"]},
         "spatial_debias": {"cluster_radius_m": spacing},
-        "ginn_v2_body_inversion": {
-            "inputs": {"lfm_run_dir": relative(lfm_dir), "variant_id": "well_huber_trend", "well_control_run_dir": relative(controls_dir),
-                       "evaluation_support_manifest": relative(controls_dir / "qc" / "evaluation_support.json"),
-                       "wavelet_generation_run_dir": relative(output_dir / "step5_wavelet_generation" if wavelet_source["method"] == "workflow_steps_4_5_pending" else wavelet_dir)},
-            "training": {"body_smoothing_fwhm_s": settings.body_smoothing_fwhm_s,
-                "waveform_qc_dynamic_window_s": settings.waveform_qc_dynamic_window_s,
-                "pretrain_epochs": 1, "finetune_epochs": 1, "patch_radius": 8, "batch_size": 8,
-                "trusted_well_names": [r["well_name"] for r in roles if r["role"] == "train"],
-                "orientations": ["inline"], "device": "cpu", "seed": settings.seed,
-                "review_fraction": 0.1, "validation_gap_m": max(300.0, 17 * spacing), "validation_anchor": "maxmin",
-                "selection_weights": {"well_rmse": 1.0, "amplitude_mapping": 0.5},
-                "seismic_support_relative_threshold": settings.seismic_support_relative_threshold,
-                "warnings": {"pretrain_masked_corr_improvement": 0.01, "pretrain_masked_shape_ratio": 0.99, "masked_corr_drop_tolerance": 0.01, "well_pooled_rmse_ratio_max": 1.0, "seismic_body_amplitude_spearman_max": 0.4},
+        "ginn_v3_body_inversion": {
+            "inputs": {
+                "lfm_run_dir": relative(lfm_dir),
+                "variant_id": "well_huber_trend",
+                "well_control_run_dir": relative(controls_dir),
+                "wavelet_generation_run_dir": relative(
+                    output_dir / "step5_wavelet_generation"
+                    if wavelet_source["method"] == "workflow_steps_4_5_pending"
+                    else wavelet_dir
+                ),
             },
+            "trusted_well_names": [r["well_name"] for r in roles if r["role"] == "train"],
+            "network": {
+                "tcn_channels": [16, 16, 16],
+                "hidden_channels": 32,
+                "kernel_size": 3,
+                "dilation": 2,
+                "gru_layers": 3,
+                "dropout": 0.0,
+            },
+            "training": {
+                "updates": 1000,
+                "labeled_batch_size": 6,
+                "unlabeled_batch_size": 32,
+                "learning_rate": 0.004,
+                "weight_decay": 0.01,
+                "seed": settings.seed,
+                "validate_every": 100,
+                "log_every": 20,
+                "max_train_traces": 4096,
+                "validation_traces": 128,
+                "validation_gap_m": max(300.0, 17 * spacing),
+                "min_support_samples": 8,
+                "device": "cpu",
+                "loss_weights": {"independent": 1.0, "physics": 1.0, "cross": 1.0},
+            },
+            "inference": {"batch_size": 32, "min_support_samples": 8},
         },
-        "ginn_v2_volume_inference": {"device": "cpu", "batch_size": 32, "orientations": ["inline"]},
     }
-    config_path = output_dir / "ginn_v2.yaml"
+    config_path = output_dir / "ginn_v3.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
     summary = {
         "schema_version": "marmousi2_prepared_v1", "status": "prepared", "settings": asdict(settings),
@@ -302,82 +288,7 @@ def prepare_marmousi2(vp_path: Path, density_path: Path, output_dir: Path, *, re
         "target_interval_s": list(target_interval),
         "lfm_source": "training pseudo-wells only; existing TrendBuilder", "training_labels": [r["well_name"] for r in roles if r["role"] == "train"],
         "held_out_labels": [r["well_name"] for r in roles if r["role"] != "train"],
-        "config_path": relative(config_path), "training_schedule": "P1 then F1; explicit benchmark configs select the F schedule",
+        "config_path": relative(config_path),
     }
     write_json(output_dir / "preparation_summary.json", summary)
     return config_path
-
-
-def check_prepared_inputs(config_path: Path, *, repo_root: Path, report_dir: Path | None = None) -> dict[str, Any]:
-    """Read standard inputs and check physics/gradients without optimizer updates."""
-    raw = load_config(config_path)
-    workflow = WorkflowConfig.from_mapping(raw)
-    section = raw["ginn_v2_body_inversion"]
-    inputs = section["inputs"]
-    config = BodyInversionConfig.from_mapping(section["training"], sample_domain="time")
-    torch.manual_seed(config.seed)
-    controls = load_well_control_set(repo_root / inputs["well_control_run_dir"], repo_root=repo_root)
-    lfm = load_lfm_input(inputs, repo_root=repo_root)
-    data_root = repo_root / workflow.data_root
-    report_dir = data_root if report_dir is None else Path(report_dir)
-    report_dir.mkdir(parents=True, exist_ok=True)
-    survey = open_survey(data_root / workflow.seismic.file, workflow.seismic.type)
-    axis = survey.sample_axis("time")
-    if not np.array_equal(axis.values, controls.sample_axis.values) or not np.array_equal(axis.values, lfm.sample_axis.values):
-        raise ValueError("Seismic, wells and LFM must share the exact sample axis.")
-    lowpass = parse_lowpass_spec(lfm.variant.variant_metadata["resolved_baseline_config"]["filter"], axis)
-    times, wavelet, _relation, _payload = _load_domain_forward_inputs(repo_root / inputs["wavelet_generation_run_dir"], domain="time", depth_basis=None)
-    adapter = TimeDomainAdapter(torch.as_tensor(times, dtype=torch.float32), torch.as_tensor(wavelet, dtype=torch.float32))
-    support_mask = (
-        seismic_profile_support(
-            SurveyTraceSource(survey=survey, sample_axis=axis, geometry=survey.line_geometry),
-            relative_threshold=config.seismic_support_relative_threshold,
-        )
-        if config.seismic_support_relative_threshold is not None else None
-    )
-    reader = PatchReader(
-        SurveyTraceSource(survey=survey, sample_axis=axis, geometry=survey.line_geometry),
-        lfm_log_ai=lfm.log_ai, lfm_valid_mask=lfm.valid_mask, ilines=lfm.ilines, xlines=lfm.xlines,
-        sample_axis=axis, normalization=fit_lfm_normalization(lfm.log_ai, lfm.valid_mask, geometry=survey.line_geometry),
-        patch_radius=config.patch_radius,
-        seismic_support_mask=support_mask,
-    )
-    candidates = candidate_patch_keys(
-        lfm.log_ai,
-        lfm.valid_mask,
-        patch_radius=config.patch_radius,
-        orientations=config.orientations,
-        seismic_support_mask=support_mask,
-    )
-    data = build_body_inversion_data(reader, controls, config=config, lfm_lowpass_spec=lowpass, candidate_keys=candidates, target_zone_mask=lfm.valid_mask)
-    trainer = BodyInversionTrainer(data, adapter=adapter, config=config, lfm_lowpass_spec=lowpass, output_dir=data_root)
-    batch = reader.batch(data.spatial_split.train_keys[:2], center_visible=False, device="cpu")
-    model = CenterTraceBodyNet(config.network)
-    body, synthetic, common, baseline = trainer._predict(model, batch)
-    loss, _parts = trainer._loss(body, baseline, synthetic, common, weights=config.loss_weights)
-    loss.backward()
-    if not all(p.grad is not None and torch.all(torch.isfinite(p.grad)) for p in model.parameters()):
-        raise ValueError("Adapter gradient check failed.")
-    gradient_norm = float(torch.sqrt(sum(torch.sum(p.grad.square()) for p in model.parameters())).item())
-    if gradient_norm <= 0:
-        raise ValueError("Adapter produced no learning signal.")
-    with np.load(data_root / "evaluation" / "truth.npz", allow_pickle=False) as saved:
-        truth = saved["log_ai"]
-    forward_keys = (candidates[0], candidates[len(candidates) // 2], candidates[-1])
-    forward_batch = reader.batch(forward_keys, center_visible=True, device="cpu")
-    true_curves = torch.as_tensor(np.stack([truth[key.xline_index] for key in forward_keys]), dtype=torch.float32)
-    reconstructed = adapter.close_body(true_curves, trainer._common(forward_batch)).synthetic_seismic
-    numpy_forward = forward_time(true_curves.numpy().astype(float), times, wavelet, sample_step_s=float(axis.step))
-    error = float(np.max(np.abs(reconstructed.detach().numpy() - numpy_forward)))
-    if error > 1e-5:
-        raise ValueError(f"NumPy/Torch forward closure differs by {error:g}.")
-    result = {"status": "ok", "config_path": str(config_path.resolve()), "candidate_patches": len(candidates),
-        "lfm_variant_id": inputs["variant_id"], "lfm_run_dir": inputs["lfm_run_dir"],
-        "training_patches": len(data.spatial_split.train_keys), "validation_patches": len(data.spatial_split.validation_keys),
-        "training_wells": [c.well_name for c in controls.controls], "tensor_shape": list(batch.features.shape),
-        "initial_loss": float(loss.detach()), "gradients_finite": True, "gradient_norm": gradient_norm,
-        "numpy_torch_forward_max_abs_error": error,
-        "checked_forward_trace_indices": [key.xline_index for key in forward_keys],
-        "optimizer_updates": 0, "single_orientation_disagreement": "not_applicable"}
-    write_json(report_dir / "adapter_check.json", result)
-    return result

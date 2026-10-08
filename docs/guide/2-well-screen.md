@@ -59,7 +59,7 @@ well_screen:
     include_survey_positions: [inside, near_outside]
 
   classification:
-    curve_schema_file: null                  # null = 使用内置 CURVE_CATEGORY_MNEMONICS
+    curve_schema_file: null                  # null = 使用内置分类规则
     curve_override_file: "<curve-override-file>"
 ```
 
@@ -81,7 +81,7 @@ well_screen:
 
 #### `curve_schema_file`
 
-自定义分类规则的 YAML 文件。不填则使用 `cup.well.curves.CURVE_CATEGORY_MNEMONICS` 内置规则。格式：
+自定义分类规则的 YAML 文件。不填则使用内置的曲线名称分类规则。格式：
 
 ```yaml
 categories:
@@ -115,12 +115,12 @@ wells:
 ```
 
 - `global_priority`：调整每类曲线的优先顺序，例如优先选原始测井曲线，少选派生产品。
-- `global_force_category`：为当前工区统一命名的特殊曲线名补充分类，不污染全局内置词典。
+- `global_force_category`：为当前项目统一命名的特殊曲线名补充分类，不改变默认分类规则。
 - `primary`：指定某口井某一类必须使用哪条曲线。
 - `disabled_curves`：跳过明确知道有问题的曲线。
 - `force_category`：把特殊命名但含义明确的曲线强制归入指定类别。
 
-所有 override 均可追溯：分类结果中的 `classification_source` 字段会标记 `override`，`notes` 会记录具体原因。
+分类结果中的 `classification_source` 字段会标记 `override`，`notes` 会记录具体原因。
 
 ---
 
@@ -150,10 +150,10 @@ lasio 读取 LAS 时，同名曲线可能被自动添加 `:1`、`:2` 等后缀�
 
 脚本区分两种曲线名概念：
 
-| 概念 | 函数 | 示例 |
+| 概念 | 处理方式 | 示例 |
 |------|------|------|
-| **精确名** | `exact_mnemonic()` | `CALIBRATEDSONICLOG:1` → `CALIBRATEDSONICLOG:1`（保留后缀） |
-| **规范化名** | `normalize_mnemonic()` | `CALIBRATEDSONICLOG:1` → `CALIBRATEDSONICLOG`（裁剪后缀） |
+| **精确名** | 保留 LAS 中的实际后缀 | `CALIBRATEDSONICLOG:1` → `CALIBRATEDSONICLOG:1` |
+| **规范化名** | 去除自动添加的后缀 | `CALIBRATEDSONICLOG:1` → `CALIBRATEDSONICLOG` |
 
 分类匹配用的是规范化名（`CALIBRATEDSONICLOG:1` 和 `:2` 都归入 `p_sonic`）。Primary 选择优先用精确名匹配，规范化名作为兜底——这样你可以 override primary 到具体的 `CALIBRATEDSONICLOG:1` 而不会误选 `:2`。
 
@@ -163,7 +163,7 @@ lasio 读取 LAS 时，同名曲线可能被自动添加 `:1`、`:2` 等后缀�
 
 1. 单井 `primary` override（精确匹配）→ 精确命中
 2. 单井 `primary` override（规范化匹配）→ 多候选时取 index 最小者
-3. `global_priority` 或 `CURVE_CATEGORY_PRIORITY` 的优先级顺序 → 第一个匹配者
+3. 全局配置或内置规则的优先级顺序 → 第一个匹配者
 4. 兜底：取 index 最小的候选曲线
 
 选出的 primary 曲线名是**精确名**（LAS 里实际出现的曲线名），可直接用于后续提取。
@@ -207,13 +207,13 @@ lasio 读取 LAS 时，同名曲线可能被自动添加 `:1`、`:2` 等后缀�
 
 ### 3. `selected_las/*.las` — 瘦身 LAS
 
-只导出 `screen_status == passed` 的井，且必须经过 `_exported_contains_required` 校验——若导出后发现 required primary（如 DT、DEN）并未写入 LAS，该井会被降级为 `failed`，不产出 LAS。
+只导出 `screen_status == passed` 的井，并在导出后再次检查必需的 primary 曲线（如 DT、DEN）是否写入 LAS；缺失时该井标记为 `failed`，不产出 LAS。
 
 导出内容：LAS 索引道 + 所有选出的 primary 曲线。保留原始曲线名（不做标准命名），NULL 值统一为 `-999.25`。
 
 ### 4. `curve_classification/*.json` — 逐井分类详情
 
-每口候选井一份 JSON，包含 header 摘要、分类结果、primary 选择、reasons。用于断点复查和人工审计。
+每口候选井一份 JSON，包含 header 摘要、分类结果、primary 选择、reasons。用于断点复查和人工复核。
 
 ### 5. `skipped_wells.csv`、`skipped_curves.csv`、`run_summary.json`
 

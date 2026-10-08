@@ -2,7 +2,7 @@
 
 `real_field_lfm.py` 是工作流的第七步。它读取第六步井控数据、当前地震体和目标层位，在指定输出网格上构建低频模型，并按配置写出基线模型、修饰结果和变体比较。
 
-完成后可将选定变体作为[第八步 GINN v3 PIAI 反演](8-ginn-v3-piai.md)的初始模型，并同时提供第六步井控。
+完成后可将选定变体作为[第八步物理约束神经网络反演](8-ginn.md)的初始模型，并同时提供第六步井控。
 
 ---
 
@@ -383,7 +383,6 @@ real_field_lfm_<run_timestamp>/
 | `modifier_chain` | 分号分隔的 modifier ID 列表 |
 | `lfm_path` | 主 NPZ 路径 |
 | `method_fields_path` | 方法 sidecar 路径 |
-| `contract_fingerprint_sha256` | 当前变体的发布标识 |
 
 ### `variants/<variant_id>/lfm.npz`
 
@@ -400,7 +399,7 @@ a/b、kriging variance、framework probability 等方法专属字段只在 sidec
 
 ### `variants/<variant_id>/variant_summary.json`
 
-完整 metadata：变体身份、基线模型/修饰器链、业务配置、直接上游契约、产物路径、体统计量（valid 样点数、波阻抗对数范围）和当前变体唯一契约指纹。
+记录模型变体、基线方法与修饰器顺序、业务配置、上游来源、产物路径、有效样点数和波阻抗对数范围。
 
 ### QC 表格
 

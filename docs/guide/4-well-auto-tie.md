@@ -24,7 +24,7 @@ python scripts/well_auto_tie.py --output-dir scripts/output/<well-auto-tie-run>
 | 来源 | 文件 | 用途 |
 |------|------|------|
 | 第一步 | `well_inventory.csv` | 井口坐标、资产清单、井型初分、工区位置 |
-| 第二步 | `well_screen.csv` | 曲线筛选审计、每口井有哪些可用曲线 |
+| 第二步 | `well_screen.csv` | 曲线筛选结果、每口井有哪些可用曲线 |
 | 第三步 | `well_preprocess_status.csv`、`preprocessed_las/*.las` | 判断基础曲线是否可用；从 `DT_USM/RHO_GCC` 构造井震标定所需的速度、密度和波阻抗 |
 | 轨迹 QC | `well_trajectory.csv` | 优先用复核后的井型替代第一步的初分 |
 | 数据目录 | 时深表目录、井轨迹目录、井分层文件 | 时深表、Petrel 井轨迹、井分层 |
@@ -260,7 +260,7 @@ manual_shift:
 | `synthetic_qc/tie_qc_<well>.csv` | 地震、反射系数、合成记录和残差 |
 | `seismic_trace/seismic_trace_<well>.csv` | 实际用于标定的地震道（直井是井旁道，斜井是沿轨迹拼接道） |
 | `trace_sample_plan/trace_sample_plan_<well>.csv` | 斜井 auto-tie 前用于取轨迹地震道的样点级落道明细；直井通常没有 |
-| `trace_sample_plan/optimized_trace_sample_plan_<well>.csv` | 斜井细标定后基于 `optimized_tdt_<well>.csv` 重新生成的样点级落道明细，供标定审计和后续研究使用 |
+| `trace_sample_plan/optimized_trace_sample_plan_<well>.csv` | 斜井细标定后基于 `optimized_tdt_<well>.csv` 重新生成的样点级落道明细，供标定结果复查和后续处理使用 |
 | `figures/<well>/*.png` | TDT 图、合成匹配图、子波图 |
 | `run_summary.json` | 输入路径、路由统计、失败统计、逐井补充信息 |
 

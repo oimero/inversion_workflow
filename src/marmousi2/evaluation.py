@@ -12,6 +12,7 @@ from wtie.processing import grid
 from cup.lfm.math import apply_lfm_lowpass, parse_lowpass_spec
 from cup.physics.numpy_backend import forward_time
 from cup.seismic.geometry import SampleAxis
+from cup.utils.masks import true_runs
 from cup.well.evaluation_support import load_evaluation_support_manifest
 
 
@@ -19,15 +20,44 @@ EVALUATION_SCOPES = ("validation", "final")
 _KNOWN_ROLES = ("train", "validation", "test")
 
 
-def _profile_time_array(value: Any, *, name: str) -> np.ndarray:
+def _profile_time_array(value: Any, *, name: str, allow_nonfinite: bool = False) -> np.ndarray:
     array = np.asarray(value, dtype=np.float64)
     if array.ndim == 3 and array.shape[0] == 1:
         array = array[0]
     if array.ndim != 2:
         raise ValueError(f"{name} must have shape [profile,time] (or [1,profile,time]).")
-    if not np.all(np.isfinite(array)):
+    if not allow_nonfinite and not np.all(np.isfinite(array)):
         raise ValueError(f"{name} contains non-finite values; evaluation requires continuous finite support.")
     return array
+
+
+def _prediction_support(prediction: np.ndarray, lfm: np.ndarray, value: Any | None) -> np.ndarray:
+    if value is None:
+        mask = np.ones(prediction.shape, dtype=bool)
+    else:
+        mask = np.asarray(value)
+        if mask.ndim == 3 and mask.shape[0] == 1:
+            mask = mask[0]
+        if mask.dtype != np.bool_ or mask.shape != prediction.shape:
+            raise ValueError("prediction_valid_mask must be boolean and match prediction [profile,time].")
+    if not np.any(mask):
+        raise ValueError("Prediction has no valid samples to evaluate.")
+    if np.any(mask & (~np.isfinite(prediction) | ~np.isfinite(lfm))):
+        raise ValueError("Prediction and LFM must be finite on declared prediction support.")
+    return mask
+
+
+def _forward_supported(values: np.ndarray, prepared: Mapping[str, Any], mask: np.ndarray) -> np.ndarray:
+    output = np.full(values.shape, np.nan, dtype=np.float64)
+    for index, row in enumerate(values):
+        for start, stop in true_runs(mask[index]):
+            if stop - start < 2:
+                raise ValueError("Physical evaluation requires continuous support of at least two samples.")
+            output[index, start:stop] = forward_time(
+                row[start:stop], prepared["wavelet_time_s"], prepared["wavelet_amp"],
+                sample_step_s=prepared["dt_s"],
+            )
+    return output
 
 
 def _safe_corr(reference: np.ndarray, candidate: np.ndarray) -> float | None:
@@ -215,26 +245,25 @@ def _load_prepared_inputs(prepared_dir: Path) -> dict[str, Any]:
 
 
 def _load_well_targets(prepared_dir: Path, truth: np.ndarray, twt_s: np.ndarray) -> dict[str, Any]:
-    """Load the two well-target semantics emitted by ``prepare.py``."""
+    """Load the original well curves emitted by ``prepare.py``."""
     path = prepared_dir / "evaluation" / "well_targets.npz"
     if not path.is_file():
         raise FileNotFoundError(path)
     with np.load(path, allow_pickle=False) as saved:
-        required = {"profile_index", "fixed_log_ai", "body_log_ai", "twt_s"}
+        required = {"profile_index", "fixed_log_ai", "twt_s"}
         missing = sorted(required - set(saved.files))
         if missing:
             raise ValueError(f"well_targets.npz is missing arrays: {missing}")
         indices = np.asarray(saved["profile_index"], dtype=np.int64)
         fixed = _profile_time_array(saved["fixed_log_ai"], name="fixed well targets")
-        body = _profile_time_array(saved["body_log_ai"], name="body well targets")
         target_axis = np.asarray(saved["twt_s"], dtype=np.float64)
-    if indices.ndim != 1 or indices.size != fixed.shape[0] or fixed.shape != body.shape:
+    if indices.ndim != 1 or indices.size != fixed.shape[0] or fixed.shape[1] != truth.shape[1]:
         raise ValueError("well_targets.npz profile and target shapes do not agree.")
     if np.any(indices < 0) or np.any(indices >= truth.shape[0]):
         raise ValueError("well_targets.npz profile indices are outside truth support.")
     if target_axis.shape != twt_s.shape or not np.array_equal(target_axis, twt_s):
         raise ValueError("well_targets.npz TWT axis differs from truth.npz.")
-    return {"path": path, "profile_index": indices, "fixed": fixed, "body": body}
+    return {"path": path, "profile_index": indices, "fixed": fixed}
 
 
 def _well_target_metrics(
@@ -248,7 +277,6 @@ def _well_target_metrics(
     selected = np.isin(targets["profile_index"], well_indices)
     indices = np.asarray(targets["profile_index"], dtype=int)[selected]
     fixed = np.where(sample_mask[indices], np.asarray(targets["fixed"])[selected], np.nan)
-    body = np.where(sample_mask[indices], np.asarray(targets["body"])[selected], np.nan)
     predicted = np.where(sample_mask[indices], prediction[indices], np.nan)
     return {
         "profile_indices": [int(value) for value in indices],
@@ -257,13 +285,6 @@ def _well_target_metrics(
             predicted,
             source=source,
             role="fixed_original_well_curve",
-            units="natural_log(AI)",
-        ),
-        "body_target": _error_metrics(
-            body,
-            predicted,
-            source=source,
-            role="smoothed_body_target",
             units="natural_log(AI)",
         ),
     }
@@ -393,7 +414,7 @@ def _waveform_metrics(
     profile_corrs = [
         _safe_corr(selected_observed[row][valid[row]], selected_synthetic[row][valid[row]])
         for row in range(selected_observed.shape[0])
-        if np.all(np.isfinite(selected_observed[row])) and np.all(np.isfinite(selected_synthetic[row]))
+        if np.count_nonzero(valid[row]) >= 2
     ]
     profile_corrs = [value for value in profile_corrs if value is not None]
     error = values_synthetic - values_observed
@@ -457,9 +478,9 @@ def _lowpass_profiles(values: np.ndarray, twt_s: np.ndarray, cutoff_hz: float) -
     spec = parse_lowpass_spec(config, axis)
     output = np.empty_like(values, dtype=np.float64)
     for index, row in enumerate(values):
-        log = grid.Log(row, twt_s, "twt", name="evaluation", allow_nan=False)
+        log = grid.Log(row, twt_s, "twt", name="evaluation", allow_nan=True)
         filtered = np.asarray(apply_lfm_lowpass(log, spec).values, dtype=np.float64)
-        if not np.all(np.isfinite(filtered)):
+        if np.any(np.isfinite(row) & ~np.isfinite(filtered)):
             raise ValueError("Low-pass evaluation produced non-finite samples.")
         output[index] = filtered
     return output
@@ -467,7 +488,8 @@ def _lowpass_profiles(values: np.ndarray, twt_s: np.ndarray, cutoff_hz: float) -
 
 def _roughness_metrics(values: np.ndarray, *, indices: np.ndarray, source: str, label: str, dt_s: float) -> dict[str, Any]:
     derivative = np.diff(values[indices], axis=-1) / float(dt_s)
-    rms = np.sqrt(np.mean(derivative * derivative, axis=-1))
+    rms = [float(np.sqrt(np.mean(row[np.isfinite(row)] ** 2)))
+           for row in derivative if np.any(np.isfinite(row))]
     return _stat_summary(rms, source=source, role=label, units="natural_log(AI)/s")
 
 
@@ -481,9 +503,14 @@ def _highfrequency_metrics(
     cutoff_hz: float,
 ) -> dict[str, Any]:
     residual = values[indices] - lowpassed[indices]
-    rms = np.sqrt(np.mean(residual * residual, axis=-1))
+    rms = [float(np.sqrt(np.mean(row[np.isfinite(row)] ** 2)))
+           for row in residual if np.any(np.isfinite(row))]
     fractions: list[float] = []
     for row, row_low in zip(values[indices], lowpassed[indices]):
+        valid = np.isfinite(row) & np.isfinite(row_low)
+        if not np.any(valid):
+            continue
+        row, row_low = row[valid], row_low[valid]
         denominator = float(np.sum((row - np.mean(row)) ** 2))
         numerator = float(np.sum((row - row_low) ** 2))
         if denominator > np.finfo(np.float64).eps:
@@ -545,6 +572,7 @@ def _structure_metrics(
     cutoff_hz: float,
     label: str,
     shortwave_cutoff_hz: float = 20.0,
+    sample_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
     # Restrict the low-pass work to the scope rows first.  Besides making the
     # validation report cheaper, this ensures that default diagnostics never
@@ -554,6 +582,11 @@ def _structure_metrics(
     selected_truth = np.asarray(truth, dtype=np.float64)[selected_indices]
     selected_prediction = np.asarray(prediction, dtype=np.float64)[selected_indices]
     selected_lfm = np.asarray(lfm, dtype=np.float64)[selected_indices]
+    if sample_mask is not None:
+        selected_mask = sample_mask[selected_indices]
+        selected_truth = np.where(selected_mask, selected_truth, np.nan)
+        selected_prediction = np.where(selected_mask, selected_prediction, np.nan)
+        selected_lfm = np.where(selected_mask, selected_lfm, np.nan)
     pred_low = _lowpass_profiles(selected_prediction, twt_s, cutoff_hz)
     lfm_low = _lowpass_profiles(selected_lfm, twt_s, cutoff_hz)
     truth_low = _lowpass_profiles(selected_truth, twt_s, cutoff_hz)
@@ -651,6 +684,7 @@ def _profile_diagnostics(
     cutoff_hz: float,
     shortwave_cutoff_hz: float,
     label: str,
+    sample_mask: np.ndarray,
 ) -> dict[str, Any]:
     """Section diagnostics over an explicit set of profiles."""
     structure = _structure_metrics(
@@ -663,6 +697,7 @@ def _profile_diagnostics(
         cutoff_hz=cutoff_hz,
         shortwave_cutoff_hz=shortwave_cutoff_hz,
         label=label,
+        sample_mask=sample_mask,
     )
     source = "prepared/evaluation/truth.npz"
     physical_metrics = {
@@ -672,6 +707,7 @@ def _profile_diagnostics(
             indices=indices,
             source="prepared/seismic.npz + selected_wavelet.csv",
             label=label,
+            sample_mask=sample_mask,
         ),
         "lfm_baseline": _waveform_metrics(
             observed,
@@ -679,6 +715,7 @@ def _profile_diagnostics(
             indices=indices,
             source="prepared/seismic.npz + selected_wavelet.csv",
             label=label,
+            sample_mask=sample_mask,
         ),
     }
     if physical_truth is not None:
@@ -688,9 +725,10 @@ def _profile_diagnostics(
             indices=indices,
             source="prepared/evaluation/truth.npz + selected_wavelet.csv (offline truth forward)",
             label=label,
+            sample_mask=sample_mask,
         )
     return {
-        "support_count": int(np.asarray(indices, dtype=int).size * truth.shape[1]),
+        "support_count": int(sample_mask[np.asarray(indices, dtype=int)].sum()),
         "impedance_metrics": {
             "prediction": _impedance_metrics(
                 truth,
@@ -698,6 +736,7 @@ def _profile_diagnostics(
                 indices=indices,
                 source=source,
                 label=label,
+                sample_mask=sample_mask,
             ),
             "lfm_baseline": _impedance_metrics(
                 truth,
@@ -705,6 +744,7 @@ def _profile_diagnostics(
                 indices=indices,
                 source=source,
                 label=label,
+                sample_mask=sample_mask,
             ),
         },
         "physical_metrics": physical_metrics,
@@ -729,7 +769,7 @@ def evaluate_marmousi2_prediction(
     shortwave_cutoff_hz: float = 20.0,
     support_relative_threshold: float = 0.25,
     fixed_well_log_ai: Any | None = None,
-    body_target_log_ai: Any | None = None,
+    prediction_valid_mask: Any | None = None,
 ) -> dict[str, Any]:
     """Evaluate one prediction against prepared truth under an explicit scope.
 
@@ -740,18 +780,21 @@ def evaluate_marmousi2_prediction(
     ``support_relative_threshold`` sets the observed-amplitude floor used by
     ``supported_profile`` / ``data_support``: a profile counts as supported when
     its trace RMS reaches that fraction of the section's median trace RMS.
+    ``prediction_valid_mask`` declares the predicted samples; all comparisons
+    use that same support. Declared well-evaluation windows must remain complete.
     """
 
     prepared_dir = Path(prepared_dir).resolve()
     scope = str(scope).casefold()
     prepared = _load_prepared_inputs(prepared_dir)
     truth = prepared["truth"]
-    prediction = _profile_time_array(prediction_log_ai, name="prediction_log_ai")
-    lfm = _profile_time_array(lfm_log_ai, name="lfm_log_ai")
+    prediction = _profile_time_array(prediction_log_ai, name="prediction_log_ai", allow_nonfinite=True)
+    lfm = _profile_time_array(lfm_log_ai, name="lfm_log_ai", allow_nonfinite=True)
     if prediction.shape != truth.shape or lfm.shape != truth.shape:
         raise ValueError(
             f"prediction and LFM shapes must match truth {truth.shape}; got {prediction.shape} and {lfm.shape}."
         )
+    prediction_mask = _prediction_support(prediction, lfm, prediction_valid_mask)
     included_roles, well_indices = _rows_for_scope(prepared["by_role"], scope, truth.shape[0])
     axis = SampleAxis(prepared["twt_s"], "time", "s")
     support_path = prepared_dir / "well_controls" / "qc" / "evaluation_support.json"
@@ -764,41 +807,23 @@ def evaluate_marmousi2_prediction(
         support = supports[str(row.well_name)]
         well_sample_mask[int(row.profile_index), support.start_index:support.stop_index] = True
         support_windows[str(row.well_name)] = support.to_mapping()
-    physical_prediction = forward_time(
-        prediction,
-        prepared["wavelet_time_s"],
-        prepared["wavelet_amp"],
-        sample_step_s=prepared["dt_s"],
-    )
-    physical_lfm = forward_time(
-        lfm,
-        prepared["wavelet_time_s"],
-        prepared["wavelet_amp"],
-        sample_step_s=prepared["dt_s"],
-    )
-    physical_truth = forward_time(
-        truth,
-        prepared["wavelet_time_s"],
-        prepared["wavelet_amp"],
-        sample_step_s=prepared["dt_s"],
-    )
+    if np.any(well_sample_mask & ~prediction_mask):
+        raise ValueError("Prediction support must include every declared well-evaluation sample.")
+    physical_prediction = _forward_supported(prediction, prepared, prediction_mask)
+    physical_lfm = _forward_supported(lfm, prepared, prediction_mask)
+    physical_truth = _forward_supported(truth, prepared, prediction_mask)
     observed = prepared["seismic"]
-    if physical_prediction.shape != observed.shape or not np.all(np.isfinite(physical_prediction)):
+    if physical_prediction.shape != observed.shape or not np.all(np.isfinite(physical_prediction[prediction_mask])):
         raise ValueError("Prediction physical forward model returned invalid seismic support.")
-    if not np.all(np.isfinite(physical_lfm)) or not np.all(np.isfinite(physical_truth)):
+    if not np.all(np.isfinite(physical_lfm[prediction_mask])) or not np.all(np.isfinite(physical_truth[prediction_mask])):
         raise ValueError("LFM/truth physical forward model returned invalid seismic support.")
 
     well_targets = _load_well_targets(prepared_dir, truth, prepared["twt_s"])
-    if fixed_well_log_ai is not None or body_target_log_ai is not None:
-        if fixed_well_log_ai is None or body_target_log_ai is None:
-            raise ValueError("fixed_well_log_ai and body_target_log_ai must be supplied together.")
+    if fixed_well_log_ai is not None:
         fixed = _profile_time_array(fixed_well_log_ai, name="fixed_well_log_ai")
-        body = _profile_time_array(body_target_log_ai, name="body_target_log_ai")
-        if well_targets is None:
-            raise ValueError("Explicit well targets require evaluation/well_targets.npz profile indices.")
-        if fixed.shape != body.shape or fixed.shape != np.asarray(well_targets["fixed"]).shape:
+        if fixed.shape != np.asarray(well_targets["fixed"]).shape:
             raise ValueError("Explicit well target arrays do not match prepared well target shape.")
-        well_targets = {**well_targets, "fixed": fixed, "body": body}
+        well_targets = {**well_targets, "fixed": fixed}
 
     prediction_impedance = _by_role_metrics(
         truth,
@@ -856,6 +881,7 @@ def evaluate_marmousi2_prediction(
             indices=unlabeled_seismic_indices,
             source="prepared/seismic.npz + selected_wavelet.csv (unlabeled seismic only)",
             label="unlabeled_seismic",
+            sample_mask=prediction_mask,
         ),
         "lfm_baseline": _waveform_metrics(
             observed,
@@ -863,6 +889,7 @@ def evaluate_marmousi2_prediction(
             indices=unlabeled_seismic_indices,
             source="prepared/seismic.npz + selected_wavelet.csv (unlabeled seismic only)",
             label="unlabeled_seismic",
+            sample_mask=prediction_mask,
         ),
     }
     if scope == "final":
@@ -870,6 +897,7 @@ def evaluate_marmousi2_prediction(
             observed, physical_truth, indices=unlabeled_seismic_indices,
             source="prepared/evaluation/truth.npz + selected_wavelet.csv (offline truth only)",
             label="unlabeled_seismic",
+            sample_mask=prediction_mask,
         )
     structure = _structure_metrics(
         truth,
@@ -881,6 +909,7 @@ def evaluate_marmousi2_prediction(
         cutoff_hz=cutoff_hz,
         shortwave_cutoff_hz=shortwave_cutoff_hz,
         label="train+validation" if scope == "validation" else "train+validation+test",
+        sample_mask=prediction_mask,
     )
     support_mask, median_trace_rms = _support_mask(
         observed,
@@ -899,6 +928,10 @@ def evaluate_marmousi2_prediction(
         "roles_excluded": [role for role in _KNOWN_ROLES if role not in included_roles],
         "well_profile_indices": [int(value) for value in well_indices],
         "support_count": int(well_sample_mask.sum()),
+        "prediction_support": {
+            "support_count": int(prediction_mask.sum()),
+            "profile_count": int(np.count_nonzero(np.any(prediction_mask, axis=1))),
+        },
         "well_evaluation_support": {"manifest": str(support_path), "wells": support_windows},
         "section_evaluation_support_s": [float(axis.values[0]), float(axis.values[-1])],
         "data_support": {
@@ -994,6 +1027,7 @@ def evaluate_marmousi2_prediction(
             cutoff_hz=cutoff_hz,
             shortwave_cutoff_hz=shortwave_cutoff_hz,
             label="full_profile_truth_final",
+            sample_mask=prediction_mask,
         )
         supported_indices = full_indices[support_mask]
         if supported_indices.size == 0:
@@ -1016,6 +1050,7 @@ def evaluate_marmousi2_prediction(
                 cutoff_hz=cutoff_hz,
                 shortwave_cutoff_hz=shortwave_cutoff_hz,
                 label="supported_profile_truth_final",
+                sample_mask=prediction_mask,
             ),
             "excluded_trace_count": int(full_indices.size - supported_indices.size),
             "relative_threshold": float(support_relative_threshold),

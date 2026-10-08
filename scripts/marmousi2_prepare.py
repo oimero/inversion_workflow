@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from marmousi2.prepare import PrepareSettings, check_prepared_inputs, prepare_marmousi2
+from marmousi2.prepare import PrepareSettings, prepare_marmousi2
 
 
 def _resolve(path: Path, *, root: Path = ROOT) -> Path:
@@ -40,24 +40,12 @@ def main() -> None:
     parser.add_argument("--dt-s", type=float, default=0.004)
     parser.add_argument("--wavelet-hz", type=float, default=30.0)
     parser.add_argument("--lfm-cutoff-hz", type=float, default=5.0)
-    parser.add_argument("--body-smoothing-fwhm-s", type=float, default=0.01)
-    parser.add_argument("--waveform-qc-window-s", type=float, default=0.06)
-    parser.add_argument("--seismic-support-relative-threshold", type=float, default=0.25)
     parser.add_argument("--train-well-fractions", type=float, nargs="+", default=None)
     parser.add_argument("--validation-well-fraction", type=float, default=None)
     parser.add_argument("--test-well-fraction", type=float, default=None)
     parser.add_argument("--target-top-s", type=float, default=0.65)
     parser.add_argument("--target-bottom-buffer-s", type=float, default=0.08)
-    parser.add_argument("--check-config", type=Path, default=None,
-                        help="Check an existing prepared config without preparing data.")
     args = parser.parse_args()
-
-    if args.check_config is not None:
-        config_path = _resolve(args.check_config)
-        result = check_prepared_inputs(config_path, repo_root=ROOT)
-        print(f"Config: {config_path}")
-        print(f"Adapter: {result['status']} | train={result['training_patches']} | validation={result['validation_patches']}")
-        return
 
     output = _resolve(args.output_dir)
     spacing = 1.249 if args.synthetic else 1.25
@@ -72,9 +60,6 @@ def main() -> None:
         "wavelet_duration_s": args.wavelet_duration_s,
         "wavelet_ridge_fraction": args.wavelet_ridge,
         "wavelet_method": args.wavelet_method,
-        "body_smoothing_fwhm_s": args.body_smoothing_fwhm_s,
-        "waveform_qc_dynamic_window_s": args.waveform_qc_window_s,
-        "seismic_support_relative_threshold": args.seismic_support_relative_threshold,
         "target_top_s": args.target_top_s,
         "target_bottom_buffer_s": args.target_bottom_buffer_s,
     }

@@ -29,6 +29,7 @@ from cup.well.tie import (
 from cup.well.las import load_standard_vp_rho_logs
 from cup.well.trajectory import PreparedTieWindow
 from cup.seismic.wavelet import wavelet_l2_normalize
+from ginn_v3.workflow import load_config
 from marmousi2.seismic import training_well_correlations
 from wtie.processing import grid
 from wtie.modeling.modeling import ConvModeler
@@ -76,7 +77,7 @@ def prepare_tie_inputs(prepared_dir: Path, *, repo_root: Path, pretrained_dir: P
     for name, value in (("top", target_top), ("bottom", target_bottom)):
         lines = [f"INLINE : 0 XLINE : {i} {position:.8g} 0 {value:.8g}" for i, position in enumerate(x)]
         (directories["interpre"] / f"{name}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    config = yaml.safe_load((prepared_dir / "ginn_v2.yaml").read_text(encoding="utf-8"))
+    config = load_config(prepared_dir / "ginn_v3.yaml")
     config["assets"]["time_depth_dir"] = str(directories["time_depth"].relative_to(prepared_dir)).replace("\\", "/")
     public_wtie_root = Path(pretrained_dir).resolve() if pretrained_dir is not None else repo_root / "opendata" / "pretrained" / "wtie"
     config["well_auto_tie"] = {
@@ -106,7 +107,7 @@ def prepare_tie_inputs(prepared_dir: Path, *, repo_root: Path, pretrained_dir: P
         "scoring": {"min_eval_well_count": 3, "on_insufficient_eval_wells": "select_best_source_tie"},
         "generation": {"optimizer": {"random_trials": 256, "max_refine_iters": 80, "seed": 20261004}},
     }
-    path = prepared_dir / "ginn_v2_steps45.yaml"
+    path = prepared_dir / "ginn_v3_steps45.yaml"
     path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return path
 
@@ -505,8 +506,8 @@ def apply_selected_wavelet(prepared_dir: Path, *, repo_root: Path):
     """Connect a completed Step 5 result to this dataset and its LFM configs."""
     prepared_dir, repo_root = Path(prepared_dir).resolve(), Path(repo_root).resolve()
     selected_dir = prepared_dir / "step5_wavelet_generation"
-    base_path = prepared_dir / "ginn_v2.yaml"
-    config = yaml.safe_load(base_path.read_text(encoding="utf-8"))
+    base_path = prepared_dir / "ginn_v3.yaml"
+    config = load_config(base_path)
     wavelet = pd.read_csv(selected_dir / "selected_wavelet.csv")
     extractor_dt = float(np.median(np.diff(wavelet.time_s)))
     with np.load(prepared_dir / "evaluation" / "truth.npz", allow_pickle=False) as saved:
@@ -520,7 +521,7 @@ def apply_selected_wavelet(prepared_dir: Path, *, repo_root: Path):
     forward_dir = prepared_dir / "wavelet"
     forward_dir.mkdir(exist_ok=True)
     pd.DataFrame({"time_s": sampled_times, "amplitude": sampled_wavelet}).to_csv(forward_dir / "selected_wavelet.csv", index=False)
-    config["ginn_v2_body_inversion"]["inputs"]["wavelet_generation_run_dir"] = repo_relative_path(forward_dir, root=repo_root)
+    config["ginn_v3_body_inversion"]["inputs"]["wavelet_generation_run_dir"] = repo_relative_path(forward_dir, root=repo_root)
     base_path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
     roles = pd.read_csv(prepared_dir / "evaluation" / "well_roles.csv")
     training = roles.loc[roles.role == "train"]
@@ -548,7 +549,7 @@ def apply_selected_wavelet(prepared_dir: Path, *, repo_root: Path):
     write_json(preparation_path, preparation)
     # Update variant configs too if the user recalibrates after creating LFMs.
     for path in (prepared_dir / "lfm_models").glob("*/configs/*.yaml"):
-        variant = yaml.safe_load(path.read_text(encoding="utf-8"))
-        variant["ginn_v2_body_inversion"]["inputs"]["wavelet_generation_run_dir"] = repo_relative_path(forward_dir, root=repo_root)
+        variant = load_config(path)
+        variant["ginn_v3_body_inversion"]["inputs"]["wavelet_generation_run_dir"] = repo_relative_path(forward_dir, root=repo_root)
         path.write_text(yaml.safe_dump(variant, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return summary

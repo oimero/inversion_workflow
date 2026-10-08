@@ -30,9 +30,8 @@ from cup.seismic.survey import open_survey
 from cup.seismic.target_zone import TargetZone
 from cup.utils.io import repo_relative_path, write_json
 from cup.well.controls import load_well_control_set
-from ginn_v2.workflow import load_config
+from ginn_v3.workflow import load_config
 from marmousi2.lfm_models import build_truth_huber_trend
-from marmousi2.prepare import check_prepared_inputs
 from marmousi2.rgt_inference import infer_rgt_section
 from marmousi2.rgt_lfm import build_rgt_lowpass_slices
 
@@ -61,7 +60,7 @@ DISPLAY_NAMES = {
 def _training_wells(base: Mapping[str, Any], controls):
     """Return the trusted, complete, stationary training pseudo-wells in x order."""
 
-    names = set(base["ginn_v2_body_inversion"]["training"]["trusted_well_names"])
+    names = set(base["ginn_v3_body_inversion"]["trusted_well_names"])
     trained = [control for control in controls.controls if control.well_name in names]
     if not names or {control.well_name for control in trained} != names:
         raise ValueError("Trusted training pseudo-wells do not match the available controls.")
@@ -75,10 +74,10 @@ def _training_wells(base: Mapping[str, Any], controls):
 
 
 def _variant_inputs(prepared_dir: Path, repo_root: Path, lowpass_config: Mapping[str, Any]):
-    base = load_config(prepared_dir / "ginn_v2.yaml")
+    base = load_config(prepared_dir / "ginn_v3.yaml")
     if (repo_root / base["data_root"]).resolve() != prepared_dir:
         raise ValueError("Prepared directory does not match the base configuration data_root.")
-    inputs = base["ginn_v2_body_inversion"]["inputs"]
+    inputs = base["ginn_v3_body_inversion"]["inputs"]
     controls_dir = repo_root / inputs["well_control_run_dir"]
     controls = load_well_control_set(controls_dir, repo_root=repo_root)
     survey_path = prepared_dir / base["seismic"]["file"]
@@ -122,7 +121,7 @@ def _training_config(runtime: Mapping[str, Any], variant_id: str, output_dir: Pa
     configs_dir = output_dir / "configs"
     configs_dir.mkdir(parents=True, exist_ok=True)
     variant_config = deepcopy(runtime["base"])
-    variant_config["ginn_v2_body_inversion"]["inputs"].update(
+    variant_config["ginn_v3_body_inversion"]["inputs"].update(
         lfm_run_dir=repo_relative_path(output_dir, root=repo_root), variant_id=variant_id,
     )
     path = configs_dir / f"{variant_id}.yaml"
@@ -137,7 +136,7 @@ def _load_published(output_dir: Path, variant_id: str) -> np.ndarray:
 
 def _row(
     *, variant_id: str, output_dir: Path, runtime: Mapping[str, Any], repo_root: Path,
-    config_path: Path, check: Mapping[str, Any], uses_full_truth: bool,
+    config_path: Path, uses_full_truth: bool,
     input_lowpass_applied: bool, training_well_names: Sequence[str], method: str,
 ) -> dict[str, Any]:
     ai = np.exp(_load_published(output_dir, variant_id))
@@ -149,7 +148,6 @@ def _row(
         "ai_min": float(ai.min()), "ai_mean": float(ai.mean()), "ai_max": float(ai.max()),
         "config": repo_relative_path(config_path, root=repo_root),
         "run": repo_relative_path(output_dir, root=repo_root),
-        "adapter_check": check,
     }
 
 
@@ -194,12 +192,9 @@ def _publish_truth_huber_trend(
         prepared_results={variant_id: result},
     )
     config_path = _training_config(runtime, variant_id, output_dir, repo_root)
-    check = check_prepared_inputs(
-        config_path, repo_root=repo_root, report_dir=output_dir / "variants" / variant_id / "qc" / "adapter",
-    )
     return _row(
         variant_id=variant_id, output_dir=output_dir, runtime=runtime, repo_root=repo_root,
-        config_path=config_path, check=check, uses_full_truth=True, input_lowpass_applied=False,
+        config_path=config_path, uses_full_truth=True, input_lowpass_applied=False,
         training_well_names=[], method=method,
     )
 
@@ -234,12 +229,9 @@ def _publish_well_huber_trend(
         seismic_options={}, output_dir=output_dir, repo_root=repo_root,
     )
     config_path = _training_config(runtime, variant_id, output_dir, repo_root)
-    check = check_prepared_inputs(
-        config_path, repo_root=repo_root, report_dir=output_dir / "variants" / variant_id / "qc" / "adapter",
-    )
     return _row(
         variant_id=variant_id, output_dir=output_dir, runtime=runtime, repo_root=repo_root,
-        config_path=config_path, check=check, uses_full_truth=False, input_lowpass_applied=False,
+        config_path=config_path, uses_full_truth=False, input_lowpass_applied=False,
         training_well_names=well_names, method=f"marmousi_{variant_id}",
     )
 
@@ -295,12 +287,9 @@ def _publish_rgt_lowpass_slices(
     if well_error > 1e-8:
         raise ValueError(f"RGT slice LFM does not preserve the low-pass training wells: {well_error:g}.")
     config_path = _training_config(runtime, variant_id, output_dir, repo_root)
-    check = check_prepared_inputs(
-        config_path, repo_root=repo_root, report_dir=output_dir / "variants" / variant_id / "qc" / "adapter",
-    )
     row = _row(
         variant_id=variant_id, output_dir=output_dir, runtime=runtime, repo_root=repo_root,
-        config_path=config_path, check=check, uses_full_truth=False, input_lowpass_applied=True,
+        config_path=config_path, uses_full_truth=False, input_lowpass_applied=True,
         training_well_names=well_names, method=method,
     )
     row["training_well_lowpass_max_abs_error_log_ai"] = well_error
@@ -422,9 +411,9 @@ def prepare_lfm_models(
     resolved_default = default_variant or ("rgt_lowpass_slices" if "rgt_lowpass_slices" in selected else selected[0])
     if resolved_default not in selected:
         raise ValueError(f"default_variant {resolved_default!r} was not built in this run.")
-    base_path = prepared_dir / "ginn_v2.yaml"
+    base_path = prepared_dir / "ginn_v3.yaml"
     base = runtime["base"]
-    base["ginn_v2_body_inversion"]["inputs"].update(
+    base["ginn_v3_body_inversion"]["inputs"].update(
         lfm_run_dir=repo_relative_path(parent / resolved_default, root=repo_root), variant_id=resolved_default,
     )
     base_path.write_text(yaml.safe_dump(base, sort_keys=False, allow_unicode=True), encoding="utf-8")

@@ -22,34 +22,12 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from marmousi2.evaluation import evaluate_marmousi2_prediction
+from marmousi2.benchmark import evaluate_prediction, save_prediction_npz
 
 
 def _resolve(path: str | Path, *, base: Path = ROOT) -> Path:
     value = Path(path)
     return value.resolve() if value.is_absolute() else (base / value).resolve()
-
-
-def _load_array(path: Path, *, preferred: tuple[str, ...] = ("body_log_ai", "log_ai", "prediction")) -> np.ndarray:
-    with np.load(path, allow_pickle=False) as data:
-        for key in preferred:
-            if key in data.files:
-                return np.asarray(data[key], dtype=np.float64)
-    raise ValueError(f"{path} does not contain one of {preferred}.")
-
-
-def _save_volume(path: Path, result: Any) -> np.ndarray:
-    values = np.asarray(result.body_log_ai, dtype=np.float32)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        path,
-        body_log_ai=values,
-        direction_count=np.asarray(result.direction_count),
-        fill_code=np.asarray(result.fill_code),
-        inline_indices=np.asarray(result.inline_indices),
-        xline_indices=np.asarray(result.xline_indices),
-    )
-    return values.astype(np.float64)
 
 
 def _flatten_metrics(label: str, result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -78,42 +56,11 @@ def _flatten_metrics(label: str, result: dict[str, Any]) -> list[dict[str, Any]]
     return rows
 
 
-def _evaluate_one(
-    prepared_dir: Path,
-    prediction_path: Path,
-    *,
-    lfm_path: Path | None,
-    lfm_log_ai: np.ndarray | None,
-    scope: str,
-    support_threshold: float,
-    cutoff_hz: float,
-    shortwave_cutoff_hz: float,
-) -> dict[str, Any]:
-    prediction = _load_array(prediction_path)
-    if lfm_path is not None:
-        lfm = _load_array(lfm_path, preferred=("log_ai", "lfm_log_ai", "prediction"))
-    elif lfm_log_ai is not None:
-        lfm = lfm_log_ai
-    else:
-        raise ValueError("An LFM array is required; pass --lfm-npz or use --checkpoint.")
-    result = evaluate_marmousi2_prediction(
-        prepared_dir,
-        prediction,
-        lfm,
-        scope=scope,
-        cutoff_hz=cutoff_hz,
-        shortwave_cutoff_hz=shortwave_cutoff_hz,
-        support_relative_threshold=support_threshold,
-    )
-    result["prediction_path"] = str(prediction_path)
-    return result
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepared-dir", type=Path, default=Path("opendata/prepared/marmousi2_postm_time"))
     parser.add_argument("--prediction-npz", type=Path, default=None,
-                        help="NPZ containing body_log_ai/log_ai/prediction.")
+                        help="NPZ containing log_ai or prediction.")
     parser.add_argument("--lfm-npz", type=Path, default=None,
                         help="NPZ containing the LFM log_ai array.")
     parser.add_argument("--prediction-manifest", type=Path, default=None,
@@ -124,62 +71,23 @@ def main() -> None:
     parser.add_argument("--support-relative-threshold", type=float, default=0.25)
     parser.add_argument("--cutoff-hz", type=float, default=5.0)
     parser.add_argument("--shortwave-cutoff-hz", type=float, default=20.0)
-    parser.add_argument("--comparison-plan", action="store_true",
-                        help="Materialize or execute the small explicit baseline/P0/MW/MVW/W-only plan.")
-    parser.add_argument("--run-training", action="store_true",
-                        help="Execute the selected comparison plan through the main GINN workflow.")
-    parser.add_argument("--candidates", nargs="+",
-                        choices=("baseline", "p0-random", "mw", "mvw-low-visible", "w-only"),
-                        default=None)
-    parser.add_argument("--seeds", nargs="+", type=int, default=(20261004,))
-    parser.add_argument("--visible-weight", type=float, default=0.25)
-    parser.add_argument("--unlabeled-steps", type=int, default=256,
-                        help="Fixed U budget for the explicit M/V/MVW candidates.")
-    parser.add_argument("--well-steps", type=int, default=256,
-                        help="Fixed W budget shared by the explicit candidates.")
     parser.add_argument("--config", type=Path, default=None,
-                        help="Optional GINN config used with --checkpoint.")
+                        help="GINN v3 workflow config used with --checkpoint.")
     parser.add_argument("--checkpoint", type=Path, default=None,
-                        help="Optional existing GINN checkpoint. Inference uses load_body/predict_volume.")
-    parser.add_argument("--inference-output", type=Path, default=None)
+                        help="Existing GINN v3 checkpoint or output directory.")
+    parser.add_argument("--inference-output", type=Path, default=None,
+                        help="NPZ path for the checkpoint prediction artifact.")
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--lfm-run-dir", type=Path, default=None)
+    parser.add_argument("--variant-id", type=str, default=None)
+    parser.add_argument("--well-control-run-dir", type=Path, default=None)
+    parser.add_argument("--forward-model-inputs-run-dir", type=Path, default=None)
+    parser.add_argument("--wavelet-generation-run-dir", type=Path, default=None)
+    parser.add_argument("--trusted-well-name", action="append", dest="trusted_well_names", default=None)
     args = parser.parse_args()
 
     prepared = _resolve(args.prepared_dir)
-    if args.comparison_plan:
-        from marmousi2.benchmark import run_comparison_plan, write_comparison_plan
-
-        if args.config is None:
-            raise ValueError("--config is required with --comparison-plan.")
-        plan_dir = _resolve(args.output_json).parent if args.output_json is not None else prepared / "benchmark"
-        if args.run_training:
-            payload = run_comparison_plan(
-                _resolve(args.config),
-                prepared,
-                plan_dir,
-                repo_root=ROOT,
-                candidates=args.candidates,
-                seeds=args.seeds,
-                visible_weight=args.visible_weight,
-                unlabeled_steps=args.unlabeled_steps,
-                well_steps=args.well_steps,
-                scope=args.scope,
-                support_relative_threshold=args.support_relative_threshold,
-            )
-            print(f"Comparison results: {plan_dir / 'results.json'}")
-        else:
-            payload = write_comparison_plan(
-                _resolve(args.config),
-                plan_dir,
-                repo_root=ROOT,
-                candidates=args.candidates,
-                seeds=args.seeds,
-                visible_weight=args.visible_weight,
-                unlabeled_steps=args.unlabeled_steps,
-                well_steps=args.well_steps,
-            )
-            print(f"Comparison plan: {payload['manifest']}")
-        return
-
     entries: list[tuple[str, Path, Path | None]] = []
     lfm_override: np.ndarray | None = None
     global_lfm_path = None if args.lfm_npz is None else _resolve(args.lfm_npz)
@@ -202,12 +110,29 @@ def main() -> None:
     elif args.checkpoint is not None:
         if args.config is None:
             raise ValueError("--config is required with --checkpoint.")
-        from ginn_v2.workflow import load_body
-        loaded = load_body(_resolve(args.config), checkpoint=_resolve(args.checkpoint))
+        from ginn_v3.workflow import load_body
+
+        loaded = load_body(
+            _resolve(args.config),
+            checkpoint=_resolve(args.checkpoint),
+            lfm_run_dir=args.lfm_run_dir,
+            variant_id=args.variant_id,
+            well_control_run_dir=args.well_control_run_dir,
+            forward_model_inputs_run_dir=args.forward_model_inputs_run_dir,
+            wavelet_generation_run_dir=args.wavelet_generation_run_dir,
+            trusted_well_names=args.trusted_well_names,
+            batch_size=args.batch_size,
+            device=args.device,
+        )
         output = _resolve(args.inference_output or (prepared / "benchmark" / "prediction.npz"))
-        values = _save_volume(output, loaded.predict_volume())
-        # The loaded contract supplies the exact selected LFM without asking
-        # callers to duplicate its path in a second argument.
+        volume_path = output.with_name(f"{output.stem}_log_ai.npy")
+        prediction = loaded.predict_volume(
+            output_path=volume_path,
+            batch_size=args.batch_size,
+        )
+        save_prediction_npz(output, prediction)
+        # The loaded v3 contract supplies the exact selected LFM without
+        # asking callers to duplicate its path in a second argument.
         lfm = np.asarray(loaded.lfm.log_ai, dtype=np.float64)
         entries.append(("checkpoint", output, None))
         lfm_override = lfm
@@ -217,13 +142,13 @@ def main() -> None:
     results: dict[str, Any] = {}
     rows: list[dict[str, Any]] = []
     for label, prediction_path, lfm_path in entries:
-        result = _evaluate_one(
+        result = evaluate_prediction(
             prepared,
             prediction_path,
             lfm_path=lfm_path or global_lfm_path,
             lfm_log_ai=lfm_override,
             scope=args.scope,
-            support_threshold=args.support_relative_threshold,
+            support_relative_threshold=args.support_relative_threshold,
             cutoff_hz=args.cutoff_hz,
             shortwave_cutoff_hz=args.shortwave_cutoff_hz,
         )

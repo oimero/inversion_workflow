@@ -1,4 +1,4 @@
-"""Run streaming PIAI v3 inference over a survey volume.
+"""Run streaming physics-constrained neural network inversion over a survey volume.
 
 Usage::
 
@@ -143,12 +143,12 @@ def main() -> None:
             source_seismic_file=seismic_path,
             source_seismic_type=workflow.seismic.type,
             sample_domain=workflow.seismic.domain,
-            title="GINN v3 PIAI log-AI inversion",
+            title="物理约束神经网络反演",
             details=["Unfiltered log-AI = LFM + raw network correction"],
             seismic_options=options,
         )
     write_json(output_dir / "inference_summary.json", summary)
-    print("=== PIAI v3 inference ===")
+    print("=== 物理约束神经网络反演：预测 ===")
     print(f"Output: {output_dir}")
     print(f"Log-AI: {result.log_ai_path}")
     print(f"Valid mask: {result.valid_mask_path}")

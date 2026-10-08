@@ -1,4 +1,4 @@
-"""Train the independent one-dimensional PIAI inversion model.
+"""Train the one-dimensional physics-constrained neural network inversion model.
 
 Usage::
 
@@ -50,7 +50,7 @@ def main() -> None:
         wavelet_generation_run_dir=args.wavelet_generation_run_dir,
         trusted_well_names=args.trusted_well_names,
     )
-    print("=== PIAI v3 training ===")
+    print("=== 物理约束神经网络反演：训练 ===")
     print(f"Output: {result.output_dir}")
     print(f"Selected checkpoint: {result.selected_checkpoint}")
     print(f"Last checkpoint: {result.last_checkpoint}")

@@ -1,13 +1,13 @@
 """Small, explicit adapters for the Marmousi2 benchmark.
 
-The benchmark package owns only data preparation and numerical evaluation.
-Model training and volume inference remain in :mod:`ginn_v2`; the prepared
-configuration emitted here points at those existing workflow entry points.
+The benchmark package owns data preparation and numerical evaluation. Model
+training and volume inference remain in the main workflow; this package only
+adapts saved predictions for the leakage-aware evaluation protocol.
 """
 
 from .lfm_models import LfmArray, build_truth_huber_trend
 from .evaluation import EVALUATION_SCOPES, evaluate_marmousi2_prediction
-from .benchmark import comparison_plan, run_comparison_plan, write_comparison_plan
+from .benchmark import evaluate_prediction, load_prediction_array, save_prediction_npz
 from .raw import MarmousiModels, TimeImpedanceModel, read_marmousi_models, resample_models_to_time
 from .seismic import (
     estimate_training_wavelet,
@@ -23,9 +23,9 @@ __all__ = [
     "build_truth_huber_trend",
     "EVALUATION_SCOPES",
     "evaluate_marmousi2_prediction",
-    "comparison_plan",
-    "run_comparison_plan",
-    "write_comparison_plan",
+    "evaluate_prediction",
+    "load_prediction_array",
+    "save_prediction_npz",
     "estimate_training_wavelet",
     "read_processed_time_segy",
     "read_marmousi_models",

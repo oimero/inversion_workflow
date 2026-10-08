@@ -51,8 +51,8 @@ well_curves:
 well_preprocess:
   md_resampling:
     enabled: true
-    step_m: 0.1
-    max_interpolation_gap_m: 0.5
+    step_m: <md-step-m>
+    max_interpolation_gap_m: <max-interpolation-gap-m>
 
   constant_runs:
     enabled: true
@@ -89,11 +89,11 @@ well_preprocess:
 
 用于控制第三步导出的标准 LAS 是否执行测深规则化。启用时，原始 LAS 可以是不规则采样，脚本会在这里显式规则化一次，后续第4步/5 读取规则测深网格。
 
-规则化之前，原生 LAS 曲线由 `IrregularMdCurveSet` 显式承载；只有生成规则测深轴后才构造 `grid.Log`。不得把 irregular 测深伪装成要求等采样的 `grid.Log`。
+规则化之前，原生 LAS 曲线沿不规则测深轴保存；生成规则测深轴后再构造等采样曲线。两类采样轴分别保留其原生坐标和采样语义。
 
 - `enabled`：是否启用测深规则化。当前公共配置为启用。关闭时，脚本按原生测深轴构造输出曲线；原生轴需要满足标准 LAS 导出的规则采样要求。
-- `step_m`：输出测深采样间隔，单位米。当前工区按原 LAS 名义 `STEP` 固定为 `0.1 m`。
-- `max_interpolation_gap_m`：允许插值的相邻有限源样点最大距离。超过该距离的缺口在规则网格上保持空值；当前配置为 `0.5 m`。
+- `step_m`：输出测深采样间隔，单位米。填写适用于当前测井资料的正数尺度，例如配置示例中的 `<md-step-m>`。
+- `max_interpolation_gap_m`：允许插值的相邻有限源样点最大距离，单位米。填写适用于当前测井资料的正数尺度，例如配置示例中的 `<max-interpolation-gap-m>`；更长的缺口在规则网格上保持空值。
 
 ### `required_categories`
 
@@ -184,13 +184,13 @@ well_curve:
 
 ### 后续需要速度怎么办
 
-预处理 LAS 里的声波始终是慢度 `DT_USM`（`us/m`）。进入井震标定或构造 `LogSet` 时需要显式转换：
+预处理 LAS 里的声波统一保存为慢度 `DT_USM`（`us/m`）。进入井震标定或构造带采样轴的井曲线时，按下式显式转换为速度：
 
 ```text
 Vp (m/s) = 1e6 / DT_USM (us/m)
 ```
 
-不要把慢度曲线直接命名为 `Vp`。
+速度曲线使用 `Vp`，慢度曲线保留为 `DT_USM`。
 
 ### 波阻抗派生
 
